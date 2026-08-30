@@ -4742,9 +4742,19 @@ if len(bws) < 4:
     print(f"phase {label}: only {len(bws)} iterations — the sustained window needs >= 4", file=sys.stderr)
     sys.exit(1)
 steady = bws[1:]
-first, last = steady[0], steady[-1]
-if last < 0.70 * first:
-    print(f"phase {label}: NOT SUSTAINED — steady iterations decay {first:.0f} -> {last:.0f} MiB/s (> 30%): a burst number that decays is a FAILED row", file=sys.stderr)
+# Flatness per the standing sustained-state law (AGENTS.md, 2026-07-29):
+# "no decay beyond noise between the first and last THIRD" of the
+# window — the mean of each third, never two single endpoint samples.
+# The endpoint form failed attempt 16's A2 on ONE 2-4 s device-side dip
+# landing on the last iteration of a phase whose steady mean sat at
+# parity with A1 (1,992 vs 1,986 MiB/s; 12 of 14 iterations >= 2,072);
+# a genuinely decaying phase (the laptop's thermal 3069 -> 1464 slide)
+# still fails the thirds comparison decisively.
+third = max(1, len(steady) // 3)
+head = sum(steady[:third]) / third
+tail = sum(steady[-third:]) / third
+if tail < 0.70 * head:
+    print(f"phase {label}: NOT SUSTAINED — the last third's mean decays {head:.0f} -> {tail:.0f} MiB/s (> 30%): a burst number that decays is a FAILED row", file=sys.stderr)
     sys.exit(1)
 print(f"{sum(steady)/len(steady):.1f}")
 PYF

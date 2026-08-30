@@ -140,6 +140,20 @@ fi
 
 if [ ! -f "src/open_by_handle" ]; then
     echo "Compiling xfstests..."
+    # xfstests' m4/package_utilies.m4 resolves its build tools with
+    # AC_PATH_PROG over HARDCODED FHS dirs (/bin:/usr/bin:...), which are
+    # empty on non-FHS hosts (NixOS) — configure then dies "make does not
+    # seem to be installed" with make plainly on PATH. AC_PATH_PROG
+    # honors preset variables verbatim: pin every tool the macro file
+    # names from the invoking PATH (absent ones stay unset — configure
+    # keeps its own verdict for genuinely missing tools).
+    for tool_var in AWK:awk ECHO:echo LIBTOOL:libtool MAKE:make \
+        MSGFMT:msgfmt MSGMERGE:msgmerge SED:sed SORT:sort TAR:tar ZIP:gzip; do
+        var="${tool_var%%:*}"
+        bin="${tool_var##*:}"
+        path="$(command -v "$bin" 2>/dev/null || true)"
+        [ -n "$path" ] && export "$var"="$path"
+    done
     make
 fi
 

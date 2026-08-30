@@ -116,12 +116,14 @@ fi
 # FHS host never enters either arm.
 if [ ! -x /bin/bash ]; then
     BASH_REAL="$(command -v bash)"
-    grep -rlIZ '^#!/bin/bash' "$XFSTESTS_DIR" 2>/dev/null |
+    # `|| true`: an already-rewritten checkout matches nothing and
+    # grep's exit-1 must not kill the runner under `set -e`.
+    { grep -rlIZ '^#!/bin/bash' "$XFSTESTS_DIR" 2>/dev/null || true; } |
         xargs -0 -r sed -i "1s|^#!/bin/bash|#!$BASH_REAL|"
 fi
 if [ ! -x /usr/bin/perl ] && command -v perl >/dev/null; then
     PERL_REAL="$(command -v perl)"
-    grep -rlIZ '^#!/usr/bin/perl' "$XFSTESTS_DIR" 2>/dev/null |
+    { grep -rlIZ '^#!/usr/bin/perl' "$XFSTESTS_DIR" 2>/dev/null || true; } |
         xargs -0 -r sed -i "1s|^#!/usr/bin/perl|#!$PERL_REAL|"
 fi
 

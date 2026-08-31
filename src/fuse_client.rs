@@ -1497,6 +1497,10 @@ struct OpSlot {
     ino: AtomicU64,
     /// Op start, ns since [`prof_epoch`] — the watchdog's overdue test.
     start_ns: AtomicU64,
+    /// Finding 37: the op's LAST-PASSED STATION (`OpStation`) — the
+    /// watchdog's parked-await attribution. One relaxed store per
+    /// station; the aligned slot line has the room for free.
+    station: std::sync::atomic::AtomicU32,
 }
 
 /// One registry shard: a slot block plus its OWN claim cursor. The former
@@ -1540,6 +1544,7 @@ impl OpRegistry {
                             kind: std::sync::atomic::AtomicU32::new(0),
                             ino: AtomicU64::new(0),
                             start_ns: AtomicU64::new(0),
+                            station: std::sync::atomic::AtomicU32::new(0),
                         })
                         .collect(),
                     cursor: Align64(std::sync::atomic::AtomicUsize::new(0)),
@@ -1581,6 +1586,7 @@ impl OpRegistry {
                     slot.kind.store(kind as u32, Ordering::Relaxed);
                     slot.ino.store(ino, Ordering::Relaxed);
                     slot.start_ns.store(start_ns, Ordering::Relaxed);
+                    slot.station.store(0, Ordering::Relaxed);
                     return Some(si * self.slots_per_shard + idx);
                 }
             }
@@ -1592,6 +1598,15 @@ impl OpRegistry {
         let si = global_idx / self.slots_per_shard;
         let idx = global_idx % self.slots_per_shard;
         self.shards[si].slots[idx].state.store(0, Ordering::Release);
+    }
+
+    /// Finding 37: the station breadcrumb store (see [`op_station`]).
+    fn station_store(&self, global_idx: usize, station: u32) {
+        let si = global_idx / self.slots_per_shard;
+        let idx = global_idx % self.slots_per_shard;
+        self.shards[si].slots[idx]
+            .station
+            .store(station, Ordering::Relaxed);
     }
 
     /// All slots across all shards — the watchdog scan / gauge surface
@@ -1711,6 +1726,41 @@ struct OpProfStamps {
 ///   stamps at the backend boundary feed the D1.a `fuse_op_phase_ns`
 ///   histograms; drop records all four phases (drop-based so error exits
 ///   record truthfully).
+/// Finding 37: the watchdog's parked-await STATIONS — the last one an
+/// overdue op stamped names the await it is parked at. Write-path
+/// vocabulary first; other handlers may join. Always-on: one relaxed
+/// store per station, no clock reads.
+pub mod op_station {
+    pub const ENTRY: u32 = 0;
+    pub const INODE_LOCK: u32 = 1;
+    pub const ORPHAN_PROBE: u32 = 2;
+    pub const LEASE: u32 = 3;
+    pub const META_FETCH: u32 = 4;
+    pub const ROUTE: u32 = 5;
+    pub const DEVICE_DMA: u32 = 6;
+    pub const PUBLISH: u32 = 7;
+    pub const REPLY: u32 = 8;
+    pub const MATERIALIZE: u32 = 9;
+    pub const DIO_COHERENCE: u32 = 10;
+
+    pub fn name(v: u32) -> &'static str {
+        match v {
+            ENTRY => "entry",
+            INODE_LOCK => "inode-lock-held",
+            ORPHAN_PROBE => "orphan-probe-done",
+            LEASE => "lease-held",
+            META_FETCH => "meta-fetched",
+            ROUTE => "route-dispatched",
+            DEVICE_DMA => "device-dma-done",
+            PUBLISH => "publish-done",
+            REPLY => "replying",
+            MATERIALIZE => "payload-materialized",
+            DIO_COHERENCE => "dio-coherence-entered",
+            _ => "?",
+        }
+    }
+}
+
 pub struct OpProf {
     kind: FuseOpKind,
     slot: Option<usize>,
@@ -1749,6 +1799,16 @@ impl OpProf {
                 backend_start_ns: AtomicU64::new(0),
                 backend_done_ns: AtomicU64::new(0),
             }),
+        }
+    }
+
+    /// Finding 37: stamp the op's last-passed STATION (always-on — one
+    /// relaxed store, no clock; the watchdog prints it for overdue ops,
+    /// naming the parked await).
+    #[inline]
+    pub fn stamp_station(&self, station: u32) {
+        if let Some(gi) = self.slot {
+            OP_PROFILE.registry.station_store(gi, station);
         }
     }
 
@@ -1863,6 +1923,8 @@ pub struct OverdueOp {
     pub ino: u64,
     /// Age at scan time, ms.
     pub age_ms: u64,
+    /// Finding 37: the op's last-passed station (`op_station::name`).
+    pub station: &'static str,
 }
 
 /// D1.b watchdog scan primitive (design-metadata-throughput §5.1): walk
@@ -1898,16 +1960,22 @@ pub fn op_watchdog_tick(threshold: Duration) -> Vec<OverdueOp> {
             .unwrap_or("unknown");
         let ino = slot.ino.load(Ordering::Relaxed);
         let age_ms = age / 1_000_000;
+        let station = op_station::name(slot.station.load(Ordering::Relaxed));
         error!(
-            "FUSE op watchdog: {op} (ino {ino}) in flight for {age_ms} ms (> {} ms) — \
-             op is NOT cancelled (D1.b semantics: no ETIMEDOUT synthesis); investigate \
-             the volume/device if this repeats",
+            "FUSE op watchdog: {op} (ino {ino}) in flight for {age_ms} ms (> {} ms), \
+             parked past station [{station}] — op is NOT cancelled (D1.b semantics: no \
+             ETIMEDOUT synthesis); investigate the volume/device if this repeats",
             threshold.as_millis()
         );
         METRICS
             .fuse_op_watchdog_overdue
             .fetch_add(1, Ordering::Relaxed);
-        overdue.push(OverdueOp { op, ino, age_ms });
+        overdue.push(OverdueOp {
+            op,
+            ino,
+            age_ms,
+            station,
+        });
     }
     overdue
 }
@@ -4356,6 +4424,11 @@ pub struct Metrics {
     /// buffered-open gate / the O_DIRECT gate); growth prices exactly the
     /// mixed buffered-read/DIO-write shape the law exists for.
     pub fuse_dio_write_invals: Align64<AtomicU64>,
+    /// Finding 37: reply-edge coherence notifies whose bounded park
+    /// expired and DETACHED (the write's invalidation ordering degraded
+    /// to the kernel's own best-effort posture). ≈ 0 in steady state;
+    /// growth marks ring-capacity pressure cycles (generic/208's shape).
+    pub fuse_dio_inval_detached: Align64<AtomicU64>,
     pub meta_updates: Align64<AtomicU64>,
     pub put_obj: Align64<AtomicU64>,
     pub get_obj: Align64<AtomicU64>,
@@ -9266,6 +9339,7 @@ impl SqueezefsFilesystem {
                 "fuse_killpriv_negotiated": METRICS.fuse_killpriv_negotiated.load(Ordering::Relaxed),
                 "fuse_killpriv_clears": METRICS.fuse_killpriv_clears.load(Ordering::Relaxed),
                 "fuse_dio_write_invals": METRICS.fuse_dio_write_invals.load(Ordering::Relaxed),
+                "fuse_dio_inval_detached": METRICS.fuse_dio_inval_detached.load(Ordering::Relaxed),
                 "meta_updates": METRICS.meta_updates.load(Ordering::Relaxed),
                 "put_obj": METRICS.put_obj.load(Ordering::Relaxed),
                 "get_obj": METRICS.get_obj.load(Ordering::Relaxed),
@@ -11466,21 +11540,68 @@ impl SqueezefsFilesystem {
         if pc.buffered_handles > 0 {
             // Live buffered readers: the per-segment ranged law,
             // verbatim (generic/451 — the racing-reader shape).
-            sink(ino, offset, written).await;
+            Self::bounded_dio_notify(ino, sink(ino, offset, written)).await;
             return;
         }
         // Quiescent: ONE whole-file invalidation ((0,0) = off..EOF in
         // the notify encoding) proves the ino page-free, then latch —
         // but only if no instantiation raced the inval (the gen was
         // captured BEFORE the await; a racer's bump refuses the latch
-        // and the next write pays again).
+        // and the next write pays again). A DETACHED (unproven) notify
+        // never latches: the next write pays the invalidation again.
         let g = pc.gen;
-        sink(ino, 0, 0).await;
+        if !Self::bounded_dio_notify(ino, sink(ino, 0, 0)).await {
+            return;
+        }
         self.page_cache_inos.update_sync(&ino, |_, v| {
             if v.gen == g && v.buffered_handles == 0 {
                 v.clean_at = Some(g);
             }
         });
+    }
+
+    /// Finding 37: the reply-edge coherence notify parks BOUNDED, never
+    /// forever. The from-zero fstests acceptance wedged 9 h in
+    /// generic/208: every ring slot's WRITE parked in this await while
+    /// the kernel's invalidation waited on folio laundering whose
+    /// writeback WRITEs needed a free ring slot — a delivery-capacity
+    /// deadlock only a reply can break (the zc serve's wider dirty-folio
+    /// window makes it near-deterministic; classical rides the same
+    /// cliff). On expiry the notify DETACHES — it completes as soon as
+    /// the acks free the ring (self-healing) — and THIS write's
+    /// invalidation ordering degrades to the kernel's own best-effort
+    /// posture (`dio_warn_stale_pagecache` parity), loud and counted.
+    /// The bound is not a knob: normal notifies complete in µs–ms, and
+    /// only a capacity cycle can hold one for a second.
+    ///
+    /// Returns `true` when the notify COMPLETED in-bound (the ordering
+    /// proof the quiescent latch requires).
+    async fn bounded_dio_notify(ino: u64, notify: futures::future::BoxFuture<'static, ()>) -> bool {
+        use futures::future::Either;
+        const DIO_INVAL_PARK_BOUND: Duration = Duration::from_secs(1);
+        match futures::future::select(
+            notify,
+            std::pin::pin!(squeezefs_ipc::sqz_time::sleep(DIO_INVAL_PARK_BOUND)),
+        )
+        .await
+        {
+            Either::Left(((), _)) => true,
+            Either::Right(((), notify)) => {
+                METRICS
+                    .fuse_dio_inval_detached
+                    .fetch_add(1, Ordering::Relaxed);
+                error!(
+                    "generic/451 DIO-write page invalidation for ino {ino} parked past \
+                     {DIO_INVAL_PARK_BOUND:?} — detaching (finding 37: the reply frees the \
+                     ring slots folio laundering needs; this write's coherence ordering \
+                     degrades to the kernel's dio_warn_stale_pagecache posture)"
+                );
+                crate::bg_admit::spawn_bg(async move {
+                    notify.await;
+                });
+                false
+            }
+        }
     }
 
     /// A buffered open/create: count the handle and bump the
@@ -21946,6 +22067,7 @@ impl Filesystem for SqueezefsFilesystem {
                 HeldWriteGuard::Exclusive { _g: g }
             };
 
+            prof.stamp_station(op_station::INODE_LOCK);
             // VL8 item 9 — the syncfs transient-ENOENT vector: with the
             // writeback cache + clean-handle FLUSH elision the kernel can
             // flush dirty pages AFTER close+unlink+FORGET destroyed the
@@ -22002,6 +22124,7 @@ impl Filesystem for SqueezefsFilesystem {
                 .await
                 .map_err(map_squeezefs_err)?;
             write_phase_record(WritePhase::LeaseAcquire, wp_lease);
+            prof.stamp_station(op_station::LEASE);
 
             // PERF-12: the layout identity is a STACK key (`inode_{ino}`
             // always fits) — the heap `String` this used to mint was one
@@ -22053,6 +22176,7 @@ impl Filesystem for SqueezefsFilesystem {
                 (meta.size, layout_class(&meta.file_type))
             };
             let is_striped = file_type == "striped";
+            prof.stamp_station(op_station::META_FETCH);
 
             let bytes_written = wlen as u32;
             let expected_new_size = std::cmp::max(old_size, offset + bytes_written as u64);
@@ -22142,6 +22266,7 @@ impl Filesystem for SqueezefsFilesystem {
             // it (the fence is the evidence the world moved).
             let mut effective_old_size = old_size;
 
+            prof.stamp_station(op_station::ROUTE);
             if use_router_write {
                 // §5.4 lease-severance boundary — the single sever route:
                 // the router's inline/staged commits retain the payload
@@ -22161,6 +22286,7 @@ impl Filesystem for SqueezefsFilesystem {
                     Errno::from(libc::EIO)
                 })?;
                 let data_bytes = sever_payload(&slot_bytes);
+                prof.stamp_station(op_station::MATERIALIZE);
                 // FIND-RW5-A face 3: one fresh-lease retry on a transient
                 // adjacent-bump fence (see the striped arm below). Shared
                 // never reaches this arm (`use_router_write` is
@@ -22247,6 +22373,7 @@ impl Filesystem for SqueezefsFilesystem {
                         Errno::from(libc::EIO)
                     })?;
                     let data_bytes = sever_payload(&slot_bytes);
+                    prof.stamp_station(op_station::MATERIALIZE);
                     self.write_shared_striped(
                         ino,
                         offset,
@@ -22369,14 +22496,17 @@ impl Filesystem for SqueezefsFilesystem {
                     debug!("FUSE Write: ino {ino} times refinement park skipped: {e}");
                 }
             }
+            prof.stamp_station(op_station::PUBLISH);
             // generic/451 — the DIO-write page-coherence law (see
             // `post_dio_write_coherence`): awaited at the reply edge, so
             // the ack itself is the coherence barrier. Strictly after the
             // data landed (whichever arm) and after every guard dropped.
             if dio_coherence {
+                prof.stamp_station(op_station::DIO_COHERENCE);
                 self.post_dio_write_coherence(ino, offset, bytes_written)
                     .await;
             }
+            prof.stamp_station(op_station::REPLY);
             Ok(ReplyWrite {
                 written: bytes_written,
             })

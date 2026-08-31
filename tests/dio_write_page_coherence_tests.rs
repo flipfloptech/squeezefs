@@ -374,3 +374,76 @@ async fn split_segments_each_invalidate_their_own_range() {
          written range (out-of-order segments are the normal case)"
     );
 }
+
+/// Finding 37 (RED pre-fix: the write future never completes — the
+/// bounded outer wait trips): the reply-edge coherence notify must
+/// never park the reply UNBOUNDEDLY. The from-zero fstests acceptance
+/// wedged 9 hours in generic/208: every ring slot's WRITE parked in
+/// this await while the kernel's invalidation waited on folio
+/// laundering whose writeback WRITEs needed a free ring slot — a
+/// delivery-capacity deadlock only a reply can break (the zc serve's
+/// wider dirty-folio window makes it near-deterministic; classical
+/// rides the same cliff edge). The law: bounded park, then DETACH the
+/// notify (it completes as soon as the acks free the ring — the
+/// self-healing order) and degrade THAT write's ordering to the
+/// kernel's own best-effort posture (`dio_warn_stale_pagecache`
+/// parity), loud and counted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_wedged_coherence_notify_never_parks_the_reply_forever() {
+    let h = make().await;
+    let ino = create_file(&h, "t37", 0).await;
+
+    // The wedged-kernel analog: a notify that never completes until
+    // released — exactly the folio-laundering cycle's shape.
+    let (release_tx, release_rx) = tokio::sync::watch::channel(false);
+    let entered = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    {
+        let entered = entered.clone();
+        let sink: DioInvalSink = std::sync::Arc::new(move |_ino, _off, _len| {
+            let entered = entered.clone();
+            let mut rx = release_rx.clone();
+            Box::pin(async move {
+                entered.fetch_add(1, Ordering::Relaxed);
+                while !*rx.borrow() {
+                    if rx.changed().await.is_err() {
+                        return;
+                    }
+                }
+            }) as futures::future::BoxFuture<'static, ()>
+        });
+        h.fs.dio_inval_sink.store(std::sync::Arc::new(Some(sink)));
+    }
+
+    // The write must ACK within a bound even though its notify is
+    // wedged (pre-fix: parks forever alongside generic/208's 32).
+    let write = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        h.fs.write(
+            h.req,
+            ino,
+            ino,
+            0,
+            bytes::Bytes::from(vec![0x37u8; 16 * 1024]),
+            0,
+            O_DIRECT,
+        ),
+    )
+    .await;
+    assert!(
+        write.is_ok(),
+        "a wedged coherence notify must never park the WRITE reply \
+         forever (finding 37: the ring-capacity deadlock — the reply is \
+         what frees the slots the kernel's laundering needs)"
+    );
+    write.unwrap().expect("the write itself succeeds");
+    assert_eq!(
+        entered.load(Ordering::Relaxed),
+        1,
+        "the notify was entered (the ordering attempt is real; only the \
+         unbounded park is forbidden)"
+    );
+
+    // The detached notify completes once released — nothing leaks.
+    release_tx.send(true).unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+}

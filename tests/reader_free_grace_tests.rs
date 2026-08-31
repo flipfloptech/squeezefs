@@ -2417,3 +2417,152 @@ fn bound_age_and_residence_follow_the_ring() {
         "the ring drained: the instrument falls to 0"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Finding 29 (residual): the write path's allocation OUTLIVES a grace storm
+// ---------------------------------------------------------------------------
+
+/// Finding 29's residual (RED — compile-blocked: the bounded form is the
+/// fix's own seam, the f30 precedent): the pressure ruling's own words
+/// promise "this wait always ends by itself, because past the deadline
+/// the laggard is fenced" — but NO CALLER performed the wait. The write
+/// ladder took the first prompt `StorageFull` as a terminal verdict and
+/// surfaced fsync EIO seconds into the storm (the f29 probe:
+/// forced_releases 0, laggard_fences 0, EIO delivered), while the fence
+/// machinery sat proven-but-unasked. The bounded form IS the promised
+/// wait: park on the plane's own numbers, re-harvest as acks land, and
+/// let the tightened deadline fence the laggard — release-or-evict,
+/// never a starved writer over reclaimable space.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_grace_storm_parks_the_bounded_allocation_until_the_fence() {
+    let _serial = serial();
+    let (clock, ticks) = manual_clock();
+    let owner = armed_owner(&clock);
+    let cycle = free_grace::ack_cycle(owner.clocks());
+    free_grace::arm_owner_plane_with(clock.clone(), cycle * 4, cycle);
+    let _reader = join(&owner, "r-f29", MemberRole::Reader);
+    owner.refresh_free_grace_bound();
+
+    let ba = allocator("grace-f29-park").await;
+    ba.set_capacity_bytes(4 * ba.chunk_size());
+    let mut offs = Vec::new();
+    for _ in 0..4 {
+        offs.push(ba.allocate_block().await.expect("allocate"));
+    }
+    for o in &offs {
+        ba.free_block(*o).await.expect("free");
+    }
+    assert_eq!(ba.grace_len(), 4, "the whole store is in grace");
+
+    // The storm's clock: the owner instant advances past the pressure
+    // deadline while the bounded allocation parks (the field shape — the
+    // reader never answers, the deadline does).
+    let advancer = {
+        let ticks = ticks.clone();
+        let step = (cycle.as_millis() as u64 / 4).max(1);
+        tokio::spawn(async move {
+            for _ in 0..64 {
+                tokio::time::sleep(Duration::from_millis(25)).await;
+                ticks.fetch_add(step, Ordering::SeqCst);
+            }
+        })
+    };
+
+    let parks0 = free_grace::pressure_parks();
+    let got = ba
+        .allocate_block_grace_bounded()
+        .await
+        .expect("the bounded allocation outlives the storm (finding 29)");
+    assert!(
+        offs.contains(&got),
+        "progress came from the grace supply, not thin air"
+    );
+    assert!(
+        free_grace::laggard_fences() >= 1,
+        "progress past the deadline is release-OR-EVICT: the laggard is \
+         fenced, never silently bypassed"
+    );
+    assert!(
+        free_grace::pressure_parks() > parks0,
+        "the park engagement is counted (free_grace_pressure_parks)"
+    );
+    advancer.abort();
+}
+
+/// The honest-exhaustion arm is UNTOUCHED: a genuinely full store (empty
+/// grace ring) refuses `StorageFull` promptly through the bounded form —
+/// the park is only ever a wait for RECLAIMABLE space.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_genuinely_full_store_refuses_promptly_through_the_bounded_form() {
+    let _serial = serial();
+    let ba = allocator("grace-f29-honest").await;
+    ba.set_capacity_bytes(2 * ba.chunk_size());
+    let _a = ba.allocate_block().await.expect("allocate");
+    let _b = ba.allocate_block().await.expect("allocate");
+    assert_eq!(
+        ba.grace_len(),
+        0,
+        "nothing is in grace — genuine exhaustion"
+    );
+
+    let t0 = std::time::Instant::now();
+    let err = ba
+        .allocate_block_grace_bounded()
+        .await
+        .expect_err("a genuinely full store refuses");
+    assert!(
+        matches!(&err, SqueezefsError::Io(io) if io.kind() == std::io::ErrorKind::StorageFull),
+        "the verdict is StorageFull, got {err:?}"
+    );
+    assert!(
+        t0.elapsed() < Duration::from_secs(2),
+        "genuine exhaustion refuses PROMPTLY — the park is only for grace-held space"
+    );
+}
+
+/// The wall backstop: a storm whose owner clock never advances (the
+/// pathological frozen-plane shape) still ends — bounded by the plane's
+/// own routine bound in wall time, loud, and the verdict stays the
+/// honest `StorageFull`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_frozen_plane_bounds_the_park_by_wall_time() {
+    let _serial = serial();
+    let (clock, _ticks) = manual_clock();
+    let owner = armed_owner(&clock);
+    // Tiny clocks: the wall backstop derives from the plane's bounds, so
+    // small bounds keep this test fast.
+    free_grace::arm_owner_plane_with(
+        clock.clone(),
+        Duration::from_millis(400),
+        Duration::from_millis(200),
+    );
+    let _reader = join(&owner, "r-f29-frozen", MemberRole::Reader);
+    owner.refresh_free_grace_bound();
+
+    let ba = allocator("grace-f29-frozen").await;
+    ba.set_capacity_bytes(2 * ba.chunk_size());
+    let a = ba.allocate_block().await.expect("allocate");
+    let b = ba.allocate_block().await.expect("allocate");
+    ba.free_block(a).await.expect("free");
+    ba.free_block(b).await.expect("free");
+    assert_eq!(ba.grace_len(), 2);
+
+    let t0 = std::time::Instant::now();
+    let err = ba
+        .allocate_block_grace_bounded()
+        .await
+        .expect_err("a frozen plane cannot fence — the backstop refuses");
+    assert!(
+        matches!(&err, SqueezefsError::Io(io) if io.kind() == std::io::ErrorKind::StorageFull),
+        "the verdict stays StorageFull, got {err:?}"
+    );
+    assert!(
+        t0.elapsed() < Duration::from_secs(10),
+        "the park is wall-bounded even when the owner clock is frozen"
+    );
+    assert_eq!(
+        ba.grace_len(),
+        2,
+        "the backstop released nothing unacknowledged"
+    );
+}

@@ -1432,3 +1432,28 @@ Rate loop running: `/tmp/f37-roll.sh` (generic/208 × 12, wedge capture
 (the `zc_bridge_cqe_wedge_tests` / `fuse_zc_write_fusion_tests`
 contract sets are the red venue), then red-first fix. The from-zero
 fstests acceptance pass restarts after the fix per the counted-run law.
+
+### Finding 37 attribution (A/B ladder, 2026-08-31): the zc serve path, ACK-early exonerated
+
+Rate: near-deterministic — 3 wedges in ~4 zc-on rolls (the from-zero
+pass, the roll loop's roll 1, the ladder's ACK_EARLY=0 roll 1). Ladder
+(each lever verified IN-DAEMON via the baked-knob mount helper +
+engagement gauges):
+
+| arm | verdict |
+|---|---|
+| zc on (default) | WEDGED (×3) |
+| `SQUEEZEFS_ZC_ACK_EARLY=0` (zc on) | WEDGED — ack-early exonerated (`overlay_ack_early_stores: 0` confirmed) |
+| `SQUEEZEFS_FUSE_ZC=0` | **CLEAN ×4** — the wedge lives in the FUSE_URING_ZERO_COPY serve path |
+
+Fresh-corpse census (`ladder-…/`, `roll-1/`): the transport's own scan
+says every zc message was taken (`zc_msgs_sent=212 taken=212`,
+`bridge_pends=0`, `scan_orphans_seen=0`, `pend_max_age_ms=2`) and the
+overdue slots are `not-fused` (classic dispatch) — yet 32 WRITE handler
+invocations (one queue depth) never completed, their payload leases
+outstanding. The loss sits between zc delivery and handler completion
+on the classic dispatch arm, under generic/208's AIO-DIO vs
+page-invalidation race. NEXT (the red loop): the fuse3 fork's
+`zc_bridge_cqe_wedge_tests` / `fuse_zc_write_fusion_tests` harnesses +
+the fresh corpse's per-slot state; mount-helper knob-baking landed for
+the ladder (`fix(tests)` commit) and serves every future A/B.

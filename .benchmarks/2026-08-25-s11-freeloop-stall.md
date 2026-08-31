@@ -1457,3 +1457,30 @@ page-invalidation race. NEXT (the red loop): the fuse3 fork's
 `zc_bridge_cqe_wedge_tests` / `fuse_zc_write_fusion_tests` harnesses +
 the fresh corpse's per-slot state; mount-helper knob-baking landed for
 the ladder (`fix(tests)` commit) and serves every future A/B.
+
+### Finding 37 CLOSED (red `443eb5fe`, fix `55f48bf1`): the reply-edge coherence park was a delivery-capacity deadlock
+
+The always-on watchdog STATION breadcrumb (new: one relaxed store per
+station in the op slot's own cache line) named the parked await in ONE
+roll after two blind corpses: `parked past station
+[dio-coherence-entered]` — every stuck WRITE sat in the generic/451
+DIO page-coherence notify at the reply edge. The cycle: all 32 ring
+slots' WRITEs park in the awaited invalidation → the kernel's
+invalidation waits on folio laundering → the laundering's writeback
+WRITEs need a ring slot → only a reply frees one. The A/B ladder
+exonerated ACK-early and zc retention (both wedge with the levers
+verified in-daemon via the new knob-baking mount helper); `FUSE_ZC=0`
+rides the same cliff without tipping (4/4 clean) — the zc serve's
+wider dirty-folio window is the frequency term, not the mechanism.
+
+Fix: the notify parks at most 1 s (µs–ms normally; only a capacity
+cycle holds one longer), then DETACHES — the reply frees the ring, the
+laundering flows, the detached notify completes: self-healing by
+construction. That write's ordering degrades to the kernel's own
+best-effort posture (`dio_warn_stale_pagecache` parity), loud and
+counted (`fuse_dio_inval_detached`); the quiescent clean-latch refuses
+unproven notifies. Field: **8/8 clean zc-on generic/208 rolls from
+zero** (pre-fix ~75 % wedge) with **320 counted detach engagements**
+across them — the cycle kept forming and kept dissolving. All 8
+coherence contracts green (the generic/451 ordering law intact
+in-bound). The from-zero fstests acceptance restarts on this binary.

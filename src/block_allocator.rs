@@ -2228,6 +2228,45 @@ impl BlockAllocator {
         Ok(offset)
     }
 
+    /// Finding 29: the WRITE PATH's allocation — [`Self::allocate_block`]
+    /// plus the wait the pressure ruling promises. A `StorageFull` whose
+    /// store still holds offsets in the freed-offset grace period is
+    /// bounded-transient BY THE RULING ("this wait always ends by itself,
+    /// because past the deadline the laggard is fenced") — but no caller
+    /// ever performed the wait, so the field's fsync ladder surfaced EIO
+    /// seconds into a storm with the fence gauges at 0 and reclaimable
+    /// space in the ring. This form parks on the plane's own numbers
+    /// (slice = [`crate::free_grace::pressure_park_slice_ms`]), re-runs
+    /// the pressure harvest each pass (whose deadline evaluation fences
+    /// the laggard past the tightened bound — release-or-evict), and
+    /// stops honestly: an EMPTY ring refuses immediately (genuine
+    /// exhaustion), and a frozen plane refuses at the wall backstop
+    /// ([`crate::free_grace::pressure_park_wall_ms`]). On every unarmed
+    /// mount the ring is structurally empty, so this is byte-identical
+    /// to [`Self::allocate_block`] — one branch.
+    pub async fn allocate_block_grace_bounded(&self) -> Result<u64> {
+        let mut waited_ms: u64 = 0;
+        loop {
+            match self.allocate_block().await {
+                Err(e) if is_storage_full(&e) && !self.grace.is_empty() => {
+                    let wall = crate::free_grace::pressure_park_wall_ms();
+                    if waited_ms >= wall {
+                        log::error!(
+                            "bounded allocation refusing StorageFull after {waited_ms} ms                              parked with {} offset(s) still in grace: the pressure deadline                              never fenced (a frozen/broken plane — the wall backstop is                              {wall} ms). The refusal is honest; investigate the membership                              plane (finding 29)",
+                            self.grace.len()
+                        );
+                        return Err(e);
+                    }
+                    let slice = crate::free_grace::pressure_park_slice_ms();
+                    crate::free_grace::note_pressure_park();
+                    squeezefs_ipc::sqz_time::sleep(std::time::Duration::from_millis(slice)).await;
+                    waited_ms = waited_ms.saturating_add(slice);
+                }
+                other => return other,
+            }
+        }
+    }
+
     pub async fn allocate_block(&self) -> Result<u64> {
         match self.allocate_block_inner().await {
             // DLM S9: the lane diagnosis is attached ONCE, here, at the

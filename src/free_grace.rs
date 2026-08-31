@@ -192,6 +192,9 @@ static MEMBERS: AtomicU64 = AtomicU64::new(0);
 static DEFERRALS: AtomicU64 = AtomicU64::new(0);
 static RELEASES: AtomicU64 = AtomicU64::new(0);
 static FORCED_RELEASES: AtomicU64 = AtomicU64::new(0);
+/// Finding 29: bounded-allocation park slices taken (see
+/// [`pressure_parks`]).
+static PRESSURE_PARKS: AtomicU64 = AtomicU64::new(0);
 static LAGGARD_FENCES: AtomicU64 = AtomicU64::new(0);
 static ALLOC_STALLS: AtomicU64 = AtomicU64::new(0);
 static HELD_OFFSETS: AtomicU64 = AtomicU64::new(0);
@@ -1755,6 +1758,39 @@ pub fn laggard_fences() -> u64 {
 }
 
 /// Allocations that refused `StorageFull` while offsets were held here.
+/// Finding 29: bounded-allocation park engagements — each is one slice a
+/// write-path allocation waited on grace-held space instead of taking
+/// the first refusal as a terminal verdict (the pre-fix shape: fsync EIO
+/// with the fence gauges at 0 and reclaimable space in the ring).
+pub fn pressure_parks() -> u64 {
+    PRESSURE_PARKS.load(Ordering::Relaxed)
+}
+
+pub(crate) fn note_pressure_park() {
+    PRESSURE_PARKS.fetch_add(1, Ordering::Relaxed);
+}
+
+/// The park slice (finding 29): how long one bounded-allocation retry
+/// sleeps before re-running the pressure harvest. Derived from the
+/// pressure bound (the deadline the park is waiting out), clamped to
+/// [10 ms, 250 ms] — responsive at small bounds, never a busy-spin at
+/// large ones. Not a knob.
+pub fn pressure_park_slice_ms() -> u64 {
+    let b = pressure_bound_ms();
+    if b == 0 {
+        return 50;
+    }
+    (b / 16).clamp(10, 250)
+}
+
+/// The park's WALL backstop (finding 29): a frozen owner clock cannot
+/// fence, so the park ends by wall time — twice the ROUTINE bound (the
+/// most patient number the plane publishes), floored at one second.
+/// Past it the refusal stands, loud: the plane is broken, not slow.
+pub fn pressure_park_wall_ms() -> u64 {
+    (bound().saturating_mul(2)).max(1_000)
+}
+
 pub fn alloc_stalls() -> u64 {
     ALLOC_STALLS.load(Ordering::Relaxed)
 }
@@ -1958,6 +1994,7 @@ pub fn stats_snapshot() -> serde_json::Value {
         "free_grace_ring_cap": derived_ring_cap(),
         "free_grace_pressure_pct": pressure_pct(),
         "free_grace_prods": prods(),
+        "free_grace_pressure_parks": pressure_parks(),
         "free_grace_prod_decays": prod_decays(),
         "free_grace_bound_tightenings": bound_tightenings(),
         "free_grace_prod_renew_ms": prod_renew_ms(),

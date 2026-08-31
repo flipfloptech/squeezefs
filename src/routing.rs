@@ -6568,7 +6568,7 @@ impl DataRouter {
                 }
             }
             let (be_id, block_allocator, nvme_writer) = self.backend_router.get_active_backend()?;
-            let offset = block_allocator.allocate_block().await?;
+            let offset = block_allocator.allocate_block_grace_bounded().await?;
             _blob_inflight = Some(block_allocator.inflight_register(offset));
             // RES-9 mint guard: any `?` between here and the layout commit
             // frees the fresh blob instead of leaking an allocated block
@@ -10586,7 +10586,7 @@ impl DataRouter {
             );
             return Ok(false);
         }
-        let offset = allocator.allocate_block().await?;
+        let offset = allocator.allocate_block_grace_bounded().await?;
         // PR VL6a: live owner registration for the allocate→commit window
         // (drops at function end, after the layout commit below).
         let _inflight = allocator.inflight_register(offset);
@@ -13097,7 +13097,7 @@ impl DataRouter {
                         block_allocator.chunk_size(),
                         "staged spill",
                     )?;
-                    let be_offset = block_allocator.allocate_block().await?;
+                    let be_offset = block_allocator.allocate_block_grace_bounded().await?;
                     // PR VL6a: in-flight until `save_metadata_to_backend`
                     // below publishes the spill layout (scope-held).
                     let _inflight = block_allocator.inflight_register(be_offset);
@@ -13221,7 +13221,7 @@ impl DataRouter {
                     }
                 };
 
-            let offset = match block_allocator.allocate_block().await {
+            let offset = match block_allocator.allocate_block_grace_bounded().await {
                 Ok(o) => o,
                 Err(e) => {
                     for k in &allocated_keys {
@@ -13468,7 +13468,7 @@ impl DataRouter {
 
                 let (be_id, block_allocator, nvme_writer) =
                     router_clone.backend_router.get_active_backend()?;
-                let offset = block_allocator.allocate_block().await?;
+                let offset = block_allocator.allocate_block_grace_bounded().await?;
                 // PR VL6a: live-owner registration rides the task result
                 // back to the caller, which holds it across the merge.
                 let inflight = block_allocator.inflight_register(offset);
@@ -15568,7 +15568,7 @@ impl DataRouter {
                     block_allocator.chunk_size(),
                     "rider-fold spill",
                 )?;
-                let be_offset = block_allocator.allocate_block().await?;
+                let be_offset = block_allocator.allocate_block_grace_bounded().await?;
                 // PR VL6a: in-flight until the layout commit below.
                 let _inflight = block_allocator.inflight_register(be_offset);
                 let stored_block_key = format!(
@@ -15869,7 +15869,7 @@ impl DataRouter {
                             block_allocator.chunk_size(),
                             "staged-clone spill",
                         )?;
-                        let be_offset = block_allocator.allocate_block().await?;
+                        let be_offset = block_allocator.allocate_block_grace_bounded().await?;
                         // PR VL6a: in-flight until the caller's dest-layout
                         // commit below publishes the mapping (scope-held —
                         // this fn commits `updated_meta` before returning).
@@ -16235,7 +16235,7 @@ impl DataRouter {
                             allocator.chunk_size(),
                             "staged truncate durable clip",
                         )?;
-                        let offset = allocator.allocate_block().await?;
+                        let offset = allocator.allocate_block_grace_bounded().await?;
                         _clip_inflight = Some(allocator.inflight_register(offset));
                         // Size-carrying mapping (`bk:0:packed_len` — see
                         // `parse_block_mapping`).

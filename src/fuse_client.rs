@@ -14625,7 +14625,7 @@ impl SqueezefsFilesystem {
                     return Ok(false);
                 }
                 write_phase(ino, offset_hint, b, WP_OV_ALLOC);
-                let dest_offset = match allocator.allocate_block().await {
+                let dest_offset = match allocator.allocate_block_grace_bounded().await {
                     Ok(o) => o,
                     // KD-B4-8, extended to BOTH shapes (round 4,
                     // 2026-08-15): a StorageFull mint DECLINES to
@@ -15852,7 +15852,7 @@ impl SqueezefsFilesystem {
                 ))
             })?;
         let (be_id, allocator, device) = self.router.backend_router.get_active_backend()?;
-        let dest_offset = allocator.allocate_block().await?;
+        let dest_offset = allocator.allocate_block_grace_bounded().await?;
         let fsck_guard = allocator.inflight_register(dest_offset);
         let mint_owner = crate::assembly_tasks::MintedBlockGuard::new(
             std::sync::Arc::clone(&allocator),
@@ -18038,7 +18038,7 @@ impl SqueezefsFilesystem {
         // Residence phase: the span deliberately includes ENOSPC-valve
         // engagements — reclaim leaking onto fresh paths shows HERE.
         let t_alloc = std::time::Instant::now();
-        let alloc_res = block_allocator.allocate_block().await;
+        let alloc_res = block_allocator.allocate_block_grace_bounded().await;
         pipeline_phase_record(PipelinePhase::Allocate, t_alloc);
         let offset = alloc_res?;
         // PR VL6a: live-owner registration across the allocate→merge
@@ -26751,7 +26751,7 @@ impl SqueezefsFilesystem {
             "staging-refusal durable escalation",
         )?;
         let pipe_t0 = std::time::Instant::now();
-        let offset = match block_allocator.allocate_block().await {
+        let offset = match block_allocator.allocate_block_grace_bounded().await {
             Ok(o) => o,
             Err(e)
                 if matches!(&e, SqueezefsError::Io(io)
@@ -26854,7 +26854,7 @@ async fn fold_upload_block(
         block_allocator.chunk_size(),
         "fold block upload",
     )?;
-    let offset = block_allocator.allocate_block().await?;
+    let offset = block_allocator.allocate_block_grace_bounded().await?;
     // RES-9 mint guard (see upload_active_block_bytes).
     let mut minted = crate::assembly_tasks::MintedBlockGuard::new(block_allocator.clone(), offset);
     // PR VL6a: live-owner registration for the allocate→merge window.
@@ -27022,7 +27022,7 @@ async fn flush_one_active_block(
         }
 
         let (be_id, block_allocator, nvme_writer) = router.backend_router.get_active_backend()?;
-        let offset = block_allocator.allocate_block().await?;
+        let offset = block_allocator.allocate_block_grace_bounded().await?;
         // RES-9 mint guard (the live-statfs ENOSPC-drift fix,
         // tests/statfs_live_accounting_tests.rs): the fsync flush fan-out
         // (`flush_due_active_blocks_for_inode`'s `buffer_unordered` +

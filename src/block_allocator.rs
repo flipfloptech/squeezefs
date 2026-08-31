@@ -2207,7 +2207,24 @@ impl BlockAllocator {
             lanes.part.writer_id(),
             lanes.part.writers()
         );
-        log::error!("{msg}");
+        // Finding 29: the bounded-allocation retries hit this refusal once
+        // per park slice — a storm wrote 30k identical lines per row. One
+        // loud line per second per allocator; the counter keeps the rate.
+        static LAST_LOG_MS: AtomicU64 = AtomicU64::new(0);
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let last = LAST_LOG_MS.load(Ordering::Relaxed);
+        if now_ms.saturating_sub(last) >= 1_000
+            && LAST_LOG_MS
+                .compare_exchange(last, now_ms, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+        {
+            log::error!("{msg}");
+        } else {
+            log::debug!("{msg}");
+        }
         crate::error::SqueezefsError::Io(std::io::Error::new(std::io::ErrorKind::StorageFull, msg))
     }
 

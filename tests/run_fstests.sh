@@ -255,7 +255,9 @@ EOF
 # mount(8) execs this helper with a SANITIZED environment: the daemon
 # never sees the invoking shell's knobs, so A/B levers silently no-op.
 # Bake every SQUEEZEFS_*/SQZ_* knob present at INSTALL time.
-env | grep -E '^(SQUEEZEFS|SQZ)_[A-Za-z0-9_]*=' | while IFS='=' read -r k v; do
+# `|| true`: a knob-less environment matches nothing and grep's exit-1
+# must not kill the runner under `set -e` (the shebang-pass lesson).
+{ env | grep -E '^(SQUEEZEFS|SQZ)_[A-Za-z0-9_]*=' || true; } | while IFS='=' read -r k v; do
     printf 'export %s=%q\n' "$k" "$v" >> $HELPER_DIR/mount.fuse.squeezefs
 done
 cat << 'EOF' >> $HELPER_DIR/mount.fuse.squeezefs

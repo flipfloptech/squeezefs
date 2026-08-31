@@ -1484,3 +1484,18 @@ zero** (pre-fix ~75 % wedge) with **320 counted detach engagements**
 across them — the cycle kept forming and kept dissolving. All 8
 coherence contracts green (the generic/451 ordering law intact
 in-bound). The from-zero fstests acceptance restarts on this binary.
+
+## THE THREE-SUITE RELEASE GATE IS COMPLETE (2026-08-31, f37-fixed binary)
+
+The from-zero fstests `-g auto` acceptance pass: **788 ran, 784 clean,
+4 expected-shape (exactly the adjudicated set — 003/192 noatime, 213
+thin provisioning, 798 write-through), 0 unexpected**, exit 0, ~5.4 h
+wall — the counted-run law's one complete from-zero pass on the
+finding-37-fixed binary (the pre-fix attempt wedged 9 h at
+generic/208; this pass sailed through it, the detach valve engaging
+silently where the capacity cycle formed). With pjdfstests (8,798, all
+pass) and full LTP (174/0/0), the release-gate trio is GREEN end to
+end on this host — the repro-port mandate satisfied along the way by
+findings 37 (the capacity deadlock, cargo-pinned red-first) and the
+generic/798 adjudication; the non-FHS harness portability ladder (17
+commits) is what made the suites runnable here at all.

@@ -1,0 +1,18 @@
+# row=s11-mpiio-shared-vs-disjoint
+# order=1
+# instrument=pinned ior 4.0.0 + mpirun (exact versions in the leg output below)
+# substrate=aws-on-demand/i4i.8xlarge/us-east-1a/pg-cluster (instance-store NVMe over nvmet-tcp, single NIC) — cloud substrate (third class — never spliced into devsub medians)
+# venue=cloud-bench-cluster/mw cluster=sqzbench-20260830-092720 cowriters=8 procs=4
+# ts=2026-08-30T13:32:51Z
+# cmd=SQZ_BIN=/opt/squeezefs-bench/squeezefs SQZ_MWMATRIX_MOUNTS=/scratch/mnt,/scratch/mnt-cw1,/scratch/mnt-cw2,/scratch/mnt-cw3,/scratch/mnt-cw4,/scratch/mnt-cw5,/scratch/mnt-cw6,/scratch/mnt-cw7,/scratch/mnt-cw8 SQZ_MWMATRIX_ROWDIR=/opt/squeezefs-bench/mw-rows bash /opt/squeezefs-bench/repo/tests/run_mw_matrix.sh s11-mpiio --procs=4
+[mwmatrix] external mounts verified: authority=/scratch/mnt (posture=writer, fence_mode=1, membership=owner) + 8 co-writers (posture=co-writer, membership=member)
+[mwmatrix] fetching pinned ior 4.0.0
+[mwmatrix] pinned ior 4.0.0 ready (/opt/squeezefs-bench/repo/target/mw-ior/ior-4.0.0/src/ior, sha256 510b7d4ad0f287375848121aa5a1f9842db077c1d81ad0dde738e96255298158)
+[mwmatrix] s11-mpiio: 8 co-writer mounts x 4 procs = 32 ranks, ONE shared file, 4 MiB-aligned block-cyclic segments (ior 4.0.0 POSIX MPMD, -G 164403131); baseline = -F file-per-proc, SAME fleet/geometry; A-B-B-A
+[mwmatrix] instrument: ior 4.0.0 (sha256 510b7d4ad0f287375848121aa5a1f9842db077c1d81ad0dde738e96255298158) + --------------------------------------------------------------------------; substrate: EXTERNAL mounts (/scratch/mnt,/scratch/mnt-cw1,/scratch/mnt-cw2,/scratch/mnt-cw3,/scratch/mnt-cw4,/scratch/mnt-cw5,/scratch/mnt-cw6,/scratch/mnt-cw7,/scratch/mnt-cw8) — the row's substrate/tier is the HARNESS's to state (a real-fabric field row is a different evidence tier from the local fleet's measured-simulated rows; docs/rc-manifest.md)
+[mwmatrix] range-custody conviction: every co-writer's ranged ledger moved across the probe pass
+[mwmatrix] self-sizer wanted 42368 MiB — CAPPED to 10240 MiB (s=80): the 10 GiB zram-budget clamp (the indirect domain COMPOSES now — the rung-20 blob-aware owner-side merge; this cap is substrate budget, not a correctness boundary). Iteration ceiling raised to 128 to preserve the sustained window.
+[mwmatrix] probe: 1927.72 MiB/s aggregate -> file 10240 MiB (s=80), 15 iterations/phase (sustained window sized >=60 s + >=3 steady iterations)
+[mwmatrix] phase A1 (shared): steady 1986.1 MiB/s over 82s wall (iters: 1977.61 2092.28 2101.81 2045.22 2094.08 2082.21 1958.44 2099.60 2088.93 863.54 1938.19 2108.19 2115.03 2116.74 2101.24 )
+[mwmatrix] phase B1 (fpp): steady 1940.5 MiB/s over 80s wall (iters: 1892.09 1942.65 1918.52 1904.27 1965.56 1937.18 1945.61 1935.28 1928.07 1937.07 1955.78 1956.73 1920.00 1958.90 1961.87 )
+[mwmatrix] phase B2 (fpp): steady 1940.6 MiB/s over 79s wall (iters: 1904.95 1956.27 1963.62 1899.53 1953.50 1925.42 1942.21 1926.85 1947.41 1980.35 1919.65 1900.88 1941.55 1952.89 1957.99 )

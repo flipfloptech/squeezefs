@@ -1,0 +1,32 @@
+# row=s11-mpiio-shared-vs-disjoint
+# order=1
+# instrument=pinned ior 4.0.0 + mpirun (exact versions in the leg output below)
+# substrate=aws-on-demand/i4i.8xlarge/us-east-1a/pg-cluster (instance-store NVMe over nvmet-tcp, single NIC) — cloud substrate (third class — never spliced into devsub medians)
+# venue=cloud-bench-cluster/mw cluster=sqzbench-20260830-092720 cowriters=8 procs=4
+# ts=2026-08-30T13:41:34Z
+# cmd=SQZ_BIN=/opt/squeezefs-bench/squeezefs SQZ_MWMATRIX_MOUNTS=/scratch/mnt,/scratch/mnt-cw1,/scratch/mnt-cw2,/scratch/mnt-cw3,/scratch/mnt-cw4,/scratch/mnt-cw5,/scratch/mnt-cw6,/scratch/mnt-cw7,/scratch/mnt-cw8 SQZ_MWMATRIX_ROWDIR=/opt/squeezefs-bench/mw-rows bash /opt/squeezefs-bench/repo/tests/run_mw_matrix.sh s11-mpiio --procs=4
+[mwmatrix] external mounts verified: authority=/scratch/mnt (posture=writer, fence_mode=1, membership=owner) + 8 co-writers (posture=co-writer, membership=member)
+[mwmatrix] s11-mpiio: 8 co-writer mounts x 4 procs = 32 ranks, ONE shared file, 4 MiB-aligned block-cyclic segments (ior 4.0.0 POSIX MPMD, -G 591523461); baseline = -F file-per-proc, SAME fleet/geometry; A-B-B-A
+[mwmatrix] instrument: ior 4.0.0 (sha256 510b7d4ad0f287375848121aa5a1f9842db077c1d81ad0dde738e96255298158) + --------------------------------------------------------------------------; substrate: EXTERNAL mounts (/scratch/mnt,/scratch/mnt-cw1,/scratch/mnt-cw2,/scratch/mnt-cw3,/scratch/mnt-cw4,/scratch/mnt-cw5,/scratch/mnt-cw6,/scratch/mnt-cw7,/scratch/mnt-cw8) — the row's substrate/tier is the HARNESS's to state (a real-fabric field row is a different evidence tier from the local fleet's measured-simulated rows; docs/rc-manifest.md)
+[mwmatrix] range-custody conviction: every co-writer's ranged ledger moved across the probe pass
+[mwmatrix] self-sizer wanted 39552 MiB — CAPPED to 10240 MiB (s=80): the 10 GiB zram-budget clamp (the indirect domain COMPOSES now — the rung-20 blob-aware owner-side merge; this cap is substrate budget, not a correctness boundary). Iteration ceiling raised to 128 to preserve the sustained window.
+[mwmatrix] probe: 1801.08 MiB/s aggregate -> file 10240 MiB (s=80), 14 iterations/phase (sustained window sized >=60 s + >=3 steady iterations)
+[mwmatrix] phase A1 (shared): steady 1853.6 MiB/s over 84s wall (iters: 2062.57 1017.74 758.20 2094.51 2107.36 2103.76 2062.77 2020.67 2021.72 1695.00 2088.46 2076.86 2028.67 2021.37 )
+[mwmatrix] phase B1 (fpp): steady 1922.9 MiB/s over 75s wall (iters: 1938.01 1923.15 1938.21 1864.30 1950.03 1928.86 1909.62 1946.83 1943.20 1921.64 1924.90 1923.79 1927.98 1894.59 )
+[mwmatrix] phase B2 (fpp): steady 1923.5 MiB/s over 75s wall (iters: 1956.90 1933.92 1883.28 1950.52 1918.15 1953.08 1966.55 1847.57 1890.22 1952.10 1969.72 1930.16 1896.51 1914.06 )
+[mwmatrix] phase A2 (shared): steady 2006.5 MiB/s over 72s wall (iters: 2122.38 1691.12 2071.66 2051.68 2084.83 2105.23 2115.41 2122.39 1996.46 1763.84 2081.13 1828.82 2085.74 2085.68 )
+A-B-B-A: shared 1854 / disjoint 1923 = 0.964; shared 2006 / disjoint 1924 = 1.043
+S11 MPI-IO GATE: shared >= 0.8x disjoint in BOTH brackets (min 0.964)
+m50: ranged acquires+extensions d=15212 publish shipped d=96887
+m51: ranged acquires+extensions d=15042 publish shipped d=96488
+m52: ranged acquires+extensions d=14899 publish shipped d=96924
+m53: ranged acquires+extensions d=15156 publish shipped d=96020
+m54: ranged acquires+extensions d=14931 publish shipped d=96608
+m55: ranged acquires+extensions d=15305 publish shipped d=97520
+m56: ranged acquires+extensions d=15146 publish shipped d=97387
+m57: ranged acquires+extensions d=15172 publish shipped d=96292
+authority: grants d=22198 cap_refusals d=0 demotions d=0 conflicts d=2 desired_trims d=194 prs d=0 ors d=0
+S11 MPI-IO engagement GREEN (ranged engaged on every mount, Issue-19 column 0, zero fabricated sharing)
+[mwmatrix] read-back exact: 41495 MiB/s aggregate reorder-read, zero data-check errors
+[mwmatrix] external mounts: WARM-authority fsck oracle (no remount owner; the local fleet leg's oracle is cold-remounted)
+[mwmatrix] s11-mpiio GREEN — the MPI-IO acceptance row over EXTERNAL mounts (outputs + snapshots + fsck in /opt/squeezefs-bench/mw-rows/s11mpiio-1788097295). Evidence tier: the HARNESS's venue states it (real-fabric field rows are a different tier from the local fleet's measured-simulated ones — docs/rc-manifest.md); oracle: warm-authority

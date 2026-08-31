@@ -1,0 +1,639 @@
+SqueezeFS version 1.1.0 (8e4a2cab2e3a / 8e4a2cab2e3a60bce4ae925e5be0f1bf06ec9de4) built 2026-08-30T12:49:36Z
+======================================================================
+  Mount Configuration Summary
+----------------------------------------------------------------------
+  Volume Name:         squeezefs
+  Capacity:            13.64 TiB
+  Block Size:          4.00 MiB
+  Compression:         none
+  Encryption:          none
+----------------------------------------------------------------------
+Metadata Volumes:
+  - [enabled] /dev/nvme3n1 (health: 1000)
+Data Volumes:
+  - [enabled] /dev/nvme4n1 (health: 1000)
+  - [enabled] /dev/nvme5n1 (health: 1000)
+  - [enabled] /dev/nvme6n1 (health: 1000)
+  - [enabled] /dev/nvme7n1 (health: 1000)
+----------------------------------------------------------------------
+Cache/Staging:
+  Memory Cache Size:   1GB
+  Disk Cache Size:     10GB
+  Staging Paths:       /scratch/cache
+----------------------------------------------------------------------
+Mount Options:
+  Mountpoint:          "/scratch/mnt"
+  Writeback Cache:     enabled
+  Allow Other:         enabled
+======================================================================
+[2026-08-30T13:30:03Z INFO  squeezefs::nvme_dev] data volume /dev/nvme4n1: write_cache=write-through (durability barrier: io_uring Fsync/DATASYNC per device, coalesced)
+[2026-08-30T13:30:03Z INFO  squeezefs] writer-scoped staging ENGAGED: client scope w_e56e47de7cb413eb.mae9dc892 (staging generation "v3:b64f617c24f940839a26804e343b329d@node:e56e47de7cb413eb.mae9dc892") — staging keys carry the scope and this client's staging roots are bound to it
+[2026-08-30T13:30:03Z INFO  squeezefs::cache::gds] GPU Direct Storage: No discrete GPU environment found. GDS bypassed.
+[2026-08-30T13:30:03Z INFO  squeezefs] Registering data volume 'nvme4n1' at path /dev/nvme4n1 (state active)
+[2026-08-30T13:30:03Z INFO  squeezefs] Registering data volume 'nvme5n1' at path /dev/nvme5n1 (state active)
+[2026-08-30T13:30:03Z INFO  squeezefs::nvme_dev] data volume /dev/nvme5n1: write_cache=write-through (durability barrier: io_uring Fsync/DATASYNC per device, coalesced)
+[2026-08-30T13:30:03Z INFO  squeezefs] Registering data volume 'nvme6n1' at path /dev/nvme6n1 (state active)
+[2026-08-30T13:30:03Z INFO  squeezefs::nvme_dev] data volume /dev/nvme6n1: write_cache=write-through (durability barrier: io_uring Fsync/DATASYNC per device, coalesced)
+[2026-08-30T13:30:03Z INFO  squeezefs] Registering data volume 'nvme7n1' at path /dev/nvme7n1 (state active)
+[2026-08-30T13:30:03Z INFO  squeezefs::nvme_dev] data volume /dev/nvme7n1: write_cache=write-through (durability barrier: io_uring Fsync/DATASYNC per device, coalesced)
+[2026-08-30T13:30:03Z INFO  squeezefs::dlm] fencing: durable writer term 1 adopted (was 0); every token this process mints now dominates every earlier era's (spec §6.7 decision 4)
+[2026-08-30T13:30:03Z INFO  squeezefs::meta_backend::kv::backend] meta volume /dev/nvme3n1: writer claim taken (id=a661d01e-6f29-4cb7-a340-5ef09842f057, term=1, mode=flock+pr)
+[2026-08-30T13:30:03Z INFO  squeezefs] meta volume /dev/nvme3n1: format=3 ledger_seq=1 replay_entries=0 replay_dropped_torn=0 replay_ms=36 free_extents=14304967 next_ino=2 meta_volume_atomicity=cow-checksummed meta_volume_atomicity_physical=unknown writer_guard_mode=flock+pr
+[2026-08-30T13:30:03Z INFO  squeezefs::fuse_client] Dynamic reclaim concurrency limit configured: 4
+[2026-08-30T13:30:03Z INFO  squeezefs::routing] block-key incarnations engaged (spec §6.2 item 6): era 1, appender 0/1 — persisted block keys now name the lifetime of their device offset
+[2026-08-30T13:30:03Z INFO  squeezefs::data_custody] data-plane WERO (rtype 3) acquired on 4 namespace(s), key 0xfbfc7b1d0ee2093f — guarantee class pr: an unregistered (fenced) host's writes are rejected by the device
+[2026-08-30T13:30:03Z INFO  squeezefs::routing] durable block-reference ledger is EMPTY — declining to treat it as                  authoritative (an un-backfilled stamp reads every live block as free):                  falling back to the layout walk, which then backfills
+[2026-08-30T13:30:03Z INFO  squeezefs] Running block allocator recovery for data volume...
+[2026-08-30T13:30:03Z INFO  squeezefs::block_allocator] Recovery scan summary (v3): checked=1, valid_inodes=1, layouts_found=0
+[2026-08-30T13:30:03Z INFO  squeezefs] Running block allocator recovery for data volume...
+[2026-08-30T13:30:03Z INFO  squeezefs::block_allocator] Recovery scan summary (v3): checked=1, valid_inodes=1, layouts_found=0
+[2026-08-30T13:30:03Z INFO  squeezefs] Running block allocator recovery for data volume...
+[2026-08-30T13:30:03Z INFO  squeezefs::block_allocator] Recovery scan summary (v3): checked=1, valid_inodes=1, layouts_found=0
+[2026-08-30T13:30:03Z INFO  squeezefs] Running block allocator recovery for data volume...
+[2026-08-30T13:30:03Z INFO  squeezefs::block_allocator] Recovery scan summary (v3): checked=1, valid_inodes=1, layouts_found=0
+[2026-08-30T13:30:03Z WARN  squeezefs::job_wire] job wire: listener 0.0.0.0:36455 is PLAINTEXT TCP (no ClusterSecurityConfig) — sessions are AUTHENTICATED (storage-trust challenge proof + per-frame session MAC, S3 cluster_wire) but not private, so mutating publishes pay mandatory-100 % verify-reads (Issue-30; ≈2× device reads on remote-mutated bytes). Set SQUEEZEFS_JOB_WIRE_CA_KEY (+ optional SQUEEZEFS_JOB_WIRE_CA_CERT) for CA-pinned mTLS + sampled verification, or SQUEEZEFS_JOB_WIRE_BIND to narrow/disable the listener.
+[2026-08-30T13:30:03Z INFO  squeezefs::job_wire] job wire: bounds — max 64 concurrent connections, 8192 pre-enrollment frame cap, handshake deadline 10s, challenge freshness 30s
+[2026-08-30T13:30:03Z INFO  squeezefs] job wire: endpoint 172.31.21.141:36455 (published via the mount registration)
+[2026-08-30T13:30:03Z INFO  squeezefs::free_grace] freed-offset grace period armed (spec §6.8 item 3): a terminally-freed offset is not reallocatable until every live reader has acknowledged passing it. Grace bound 76.045s (under space pressure 38.0225s), ring cap 841785 offsets per volume — past the bound a laggard is FENCED, not waited on
+[2026-08-30T13:30:03Z INFO  squeezefs::membership] membership owner '373328da-b177-4442-81d9-6edb5afea7c8' armed in term 1 (was 0): lease TTL 45s, member deadline T_self 42.955s, renewal cadence 10s, grace 45s — liveness is RAM state renewed over cluster_wire and costs ZERO journal transactions (DLM S6, spec §6.5 item 3)
+[2026-08-30T13:30:03Z INFO  squeezefs::cluster_wire] cluster wire: listener 0.0.0.0:34205 (plaintext) — thread-per-connection, max 64 connections, 8192 B pre-authn frame cap, handshake deadline 10s, challenge freshness 30s; every admitted frame carries a session MAC derived from the shared volume's job:enroll secret
+[2026-08-30T13:30:03Z INFO  squeezefs::membership_wire] membership plane listening on 0.0.0.0:34205 (owner '373328da-b177-4442-81d9-6edb5afea7c8', term 1) — liveness for every member is RAM state renewed over this wire, so a beat costs ZERO journal transactions (DLM S6)
+[2026-08-30T13:30:03Z INFO  squeezefs::membership] claim set on /dev/nvme3n1: writer 'node_e56e47de7cb413eb.mae9dc892' is a durable member in term 1 (1 member(s),          registrant key 0xfbfc7b1d0ee2093f) — §6.2 item 7
+[2026-08-30T13:30:03Z INFO  squeezefs::membership] membership OWNER armed on 172.31.21.141:34205 (id '373328da-b177-4442-81d9-6edb5afea7c8', term 1, superseding 0): members hold RAM leases renewed over cluster_wire, so liveness costs ZERO journal transactions and `squeezefs clients` reads ONE record plus a paged census instead of one getxattr per client (DLM S6, spec §6.5 item 3)
+[2026-08-30T13:30:03Z INFO  squeezefs::data_custody] data-plane WERO: joining the standing hold on 4 namespace(s) (key 0xfbfc7b1d0ee2093f) — a second reservation would conflict at the device
+[2026-08-30T13:30:03Z INFO  squeezefs::data_grant] write-custody authority 'mw-c97ebe53-311a-4719-8068-66e90ee4b601' armed in era 1 (superseding 0): client lease TTL 45s, member deadline T_self 42.955s, renewal cadence 10s, grace 45s. Only CUSTODY travels here — a co-writer's bytes go straight to the device (DLM S9, spec §6.9)
+[2026-08-30T13:30:03Z WARN  squeezefs::data_grant] S9: custody authority 'mw-c97ebe53-311a-4719-8068-66e90ee4b601' runs era 1 with a 1-way data-plane allocation partition (0 enrolled co-writer lane(s); this node is lane 0). Every member's lane travels on its lease — no knob can put two writers in one residue class
+[2026-08-30T13:30:03Z INFO  squeezefs::cluster_wire] cluster wire: listener 0.0.0.0:45999 (plaintext) — thread-per-connection, max 64 connections, 8192 B pre-authn frame cap, handshake deadline 10s, challenge freshness 30s; every admitted frame carries a session MAC derived from the shared volume's job:enroll secret
+[2026-08-30T13:30:03Z WARN  squeezefs::meta_ship::owners] metadata function shipping ARMED (DLM S8): 1 of 1 volumes owned locally, 0 shipped to 0 peer(s) []; 65536 slots home locally. Metadata verbs on a foreign volume now travel to its owner; the DATA plane still refuses foreign-home custody loud (S9 ships that half)
+[2026-08-30T13:30:03Z WARN  squeezefs::multi_writer] MULTI-WRITER ARMED (DLM S9) on 172.31.21.141:45999: era 1, custody authority 'mw-c97ebe53-311a-4719-8068-66e90ee4b601', data-plane fence class pr, 0 of 1 metadata volume(s) owned elsewhere. Peers may now acquire write custody here and DMA directly to the shared namespaces — only custody travels, never data (spec §6.9 S9)
+Mounting Squeezefs at "/scratch/mnt"...
+[2026-08-30T13:30:03Z INFO  squeezefs::fuse_client] Transport payload-buffer cap: 2466 MiB (memory budget 19729 MiB)
+[2026-08-30T13:30:03Z WARN  squeezefs::ipc_host] SQUEEZEFS_IPC_ALLOW_DEV is set — the KD-7 build-commit skew gate is RELAXED for this mount (degenerate `unknown`/`-dirty` identities will be admitted, counted in ipc_binds_dev_override). Dev boxes only: a mismatched daemon/shim pair is undefined behavior.
+[2026-08-30T13:30:03Z INFO  squeezefs::ipc_host] ipc host: path ctl socket at /run/squeezefs/sqz-il0-2928-6869c37a.sock
+[2026-08-30T13:30:03Z INFO  squeezefs::fuse_client] IPC session host armed (socket sqz-il0-2928-6869c37a, session shm cap 2466 MiB)
+[2026-08-30T13:30:03Z INFO  squeezefs::fuse_client] SqueezeFS version 1.1.0 (8e4a2cab2e3a / 8e4a2cab2e3a60bce4ae925e5be0f1bf06ec9de4) built 2026-08-30T12:49:36Z initializing mount
+[2026-08-30T13:30:03Z INFO  squeezefs::fuse_client] FUSE Daemon: Mounting squeezefs at "/scratch/mnt"...
+[2026-08-30T13:30:03Z INFO  squeezefs::fuse_client] FUSE Daemon: Metadata connection active.
+[2026-08-30T13:30:03Z INFO  squeezefs::fuse_client] device-overlay armed: transport streaming holds enabled (SQUEEZEFS_DEVICE_OVERLAY)
+[92mOK[0m Squeezefs is ready at "/scratch/mnt"
+[2026-08-30T13:30:03Z INFO  squeezefs::fuse_client] IPC session host: mount st_dev resolved (56)
+[2026-08-30T13:30:03Z INFO  squeezefs::fuse_client] FUSE Daemon: Initialized Squeezefs Filesystem mount (version 1.1.0 (8e4a2cab2e3a / 8e4a2cab2e3a60bce4ae925e5be0f1bf06ec9de4) built 2026-08-30T12:49:36Z).
+squeezefs: mount ready (version 1.1.0 (8e4a2cab2e3a / 8e4a2cab2e3a60bce4ae925e5be0f1bf06ec9de4) built 2026-08-30T12:49:36Z, exe hint: rebuild target/release and reinstall)
+[2026-08-30T13:30:03Z INFO  squeezefs::fuse_client] FUSE kernel protocol 7.45 (init flags 0x5ff73fffffb): FOPEN_NOFLUSH advertised + honored on non-writeback opens (kernel ≥ 7.35) (D2.a; under writeback cache the elision switch is the clean-FLUSH ENOSYS latch — uapi: NOFLUSH applies 'unless FUSE_WRITEBACK_CACHE'); UNKNOWN init capability bits 0x40000000000 advertised — investigate whether an atomic-open-class capability is among them (D2.d adoption follow-up)
+squeezefs: FUSE kernel 7.45 — FOPEN_NOFLUSH advertised (wb-cache elision = clean-FLUSH ENOSYS latch); UNKNOWN init capability bits 0x40000000000 advertised — investigate whether an atomic-open-class capability is among them (D2.d adoption follow-up)
+[2026-08-30T13:30:03Z INFO  squeezefs::fuse_client] FUSE_HANDLE_KILLPRIV_V2 negotiated (kernel killpriv probe deleted; daemon owns suid/sgid/caps clearing) for this mount
+[2026-08-30T13:30:03Z INFO  fuse3::raw::connection::fuse_over_uring] enabled kernel fuse.enable_uring=Y
+[2026-08-30T13:30:03Z WARN  fuse3::raw::connection::kmbuf] SQUEEZEFS_FUSE_ZC=1 declined: the kmbuf/zc io_uring surface is Absent on this kernel — continuing on the userspace-ent path (fuse3_zc_replies stays 0; the sqz kernel series carries the surface)
+[2026-08-30T13:30:03Z INFO  fuse3::raw::connection::fuse_over_uring] fuse-over-uring queue-ring setup probe: SINGLE_ISSUER+DEFER_TASKRUN available
+FUSE-over-io_uring registered: queues=32 depth=32 payload_sz=1048576 max_write=1048576 max_pages=256 buffers=user-ents kmbuf_ops=absent fd=71 sqpoll=off drain_groups=4(width<=8)
+[2026-08-30T13:30:03Z INFO  fuse3::raw::connection::fuse_over_uring] FUSE-over-io_uring registered: queues=32 depth=32 payload_sz=1048576 max_write=1048576 max_pages=256 buffers=user-ents kmbuf_ops=absent fd=71 sqpoll=off drain_groups=4(width<=8)
+FUSE-over-io_uring session path armed (ready=true, queues=32)
+FUSE-over-io_uring transport armed for this session
+[2026-08-30T13:30:03Z INFO  fuse3::raw::session] FUSE-over-io_uring transport armed for this session
+FUSE-over-io_uring: classical sideband servicer armed (primary session; FORGET/INTERRUPT/resend + switchover stragglers)
+[SIG] Received SIGTERM (or signal watcher exited); shutting down.
+[SIG] Shutdown resolved. Running shutdown logic...
+[2026-08-30T13:31:05Z INFO  squeezefs::fuse_client] Received shutdown signal. Force flushing memory buffers to staging...
+[2026-08-30T13:31:05Z INFO  squeezefs::fuse_client] FUSE Daemon: Force flushing all in-memory write buffers to local NVMe staging...
+[2026-08-30T13:31:05Z INFO  squeezefs::fuse_client] FUSE Daemon: All in-memory write buffers flushed to local NVMe staging.
+[2026-08-30T13:31:05Z INFO  squeezefs::fuse_client] FUSE Daemon: Destroying mount. Force flushing all staged and memory data...
+[2026-08-30T13:31:05Z INFO  squeezefs::fuse_client] FUSE Daemon: Force flushing all in-memory write buffers to local NVMe staging...
+[2026-08-30T13:31:05Z INFO  squeezefs::fuse_client] FUSE Daemon: All in-memory write buffers flushed to local NVMe staging.
+[2026-08-30T13:31:05Z INFO  squeezefs::fuse_client] FUSE Daemon: Force flushing all staged active blocks to NVMe-oF backend...
+[2026-08-30T13:31:05Z INFO  squeezefs::fuse_client] FUSE Daemon: No staged active blocks to flush.
+[2026-08-30T13:31:05Z INFO  squeezefs::fuse_client] FUSE Daemon: Dismount clean. All write staged blocks successfully flushed to backend.
+[2026-08-30T13:31:16Z INFO  fuse3::raw::connection::fuse_over_uring] fuse-over-uring qid=0 ent=0: disconnect CQE err=107; shutting down
+[2026-08-30T13:31:16Z INFO  fuse3::raw::connection::fuse_over_uring] FUSE-over-io_uring shutting down (fd=71)
+[2026-08-30T13:31:16Z INFO  fuse3::raw::connection::fuse_over_uring] fuse-over-uring watch: /dev/fuse revents=0x8 (abort/unmount); shutting down
+[2026-08-30T13:31:16Z WARN  squeezefs::meta_ship::owners] metadata function shipping DISARMED (DLM S8): solo authority restored
+[2026-08-30T13:31:16Z WARN  squeezefs::multi_writer] multi-writer DISARMED: solo authority restored, no custody is granted to peers, and the data-namespace WERO hold is released
+[2026-08-30T13:31:17Z WARN  squeezefs::membership] membership: could not withdraw writer 'node_e56e47de7cb413eb.mae9dc892' from the claim set on                          /dev/nvme3n1: I/O error: meta volume /dev/nvme3n1: volume is shutting down (a stale member entry classifies by its own liveness, so                          this is honest residue rather than a lie)
+[2026-08-30T13:31:17Z WARN  squeezefs::membership] membership: could not remove the rendezvous record from /dev/nvme3n1: I/O error: meta volume /dev/nvme3n1: volume is shutting down (a stale record names an endpoint that no longer answers, which the next reader detects on its first renewal)
+SqueezeFS version 1.1.0 (8e4a2cab2e3a / 8e4a2cab2e3a60bce4ae925e5be0f1bf06ec9de4) built 2026-08-30T12:49:36Z
+======================================================================
+  Mount Configuration Summary
+----------------------------------------------------------------------
+  Volume Name:         squeezefs
+  Capacity:            13.64 TiB
+  Block Size:          4.00 MiB
+  Compression:         none
+  Encryption:          none
+----------------------------------------------------------------------
+Metadata Volumes:
+  - [enabled] /dev/nvme3n1 (health: 1000)
+Data Volumes:
+  - [enabled] /dev/nvme4n1 (health: 1000)
+  - [enabled] /dev/nvme5n1 (health: 1000)
+  - [enabled] /dev/nvme6n1 (health: 1000)
+  - [enabled] /dev/nvme7n1 (health: 1000)
+----------------------------------------------------------------------
+Cache/Staging:
+  Memory Cache Size:   1GB
+  Disk Cache Size:     10GB
+  Staging Paths:       /scratch/cache
+----------------------------------------------------------------------
+Mount Options:
+  Mountpoint:          "/scratch/mnt"
+  Writeback Cache:     enabled
+  Allow Other:         enabled
+======================================================================
+[2026-08-30T13:31:17Z INFO  squeezefs::nvme_dev] data volume /dev/nvme4n1: write_cache=write-through (durability barrier: io_uring Fsync/DATASYNC per device, coalesced)
+[2026-08-30T13:31:17Z INFO  squeezefs] writer-scoped staging ENGAGED: client scope w_e56e47de7cb413eb.mae9dc892 (staging generation "v3:b64f617c24f940839a26804e343b329d@node:e56e47de7cb413eb.mae9dc892") — staging keys carry the scope and this client's staging roots are bound to it
+[2026-08-30T13:31:34Z INFO  squeezefs::cache::gds] GPU Direct Storage: No discrete GPU environment found. GDS bypassed.
+[2026-08-30T13:31:34Z INFO  squeezefs::cache::nvme] staging init: discarded 16 read-cache segment file(s) (5368709120 B) from a previous session — read cache starts cold (block-key offsets are not incarnation-stable across mounts)
+[2026-08-30T13:31:35Z INFO  squeezefs] Registering data volume 'nvme4n1' at path /dev/nvme4n1 (state active)
+[2026-08-30T13:31:35Z INFO  squeezefs] Registering data volume 'nvme5n1' at path /dev/nvme5n1 (state active)
+[2026-08-30T13:31:35Z INFO  squeezefs::nvme_dev] data volume /dev/nvme5n1: write_cache=write-through (durability barrier: io_uring Fsync/DATASYNC per device, coalesced)
+[2026-08-30T13:31:35Z INFO  squeezefs] Registering data volume 'nvme6n1' at path /dev/nvme6n1 (state active)
+[2026-08-30T13:31:35Z INFO  squeezefs::nvme_dev] data volume /dev/nvme6n1: write_cache=write-through (durability barrier: io_uring Fsync/DATASYNC per device, coalesced)
+[2026-08-30T13:31:35Z INFO  squeezefs] Registering data volume 'nvme7n1' at path /dev/nvme7n1 (state active)
+[2026-08-30T13:31:35Z INFO  squeezefs::nvme_dev] data volume /dev/nvme7n1: write_cache=write-through (durability barrier: io_uring Fsync/DATASYNC per device, coalesced)
+[2026-08-30T13:31:35Z INFO  squeezefs::dlm] fencing: durable writer term 2 adopted (was 0); every token this process mints now dominates every earlier era's (spec §6.7 decision 4)
+[2026-08-30T13:31:35Z INFO  squeezefs::meta_backend::kv::backend] meta volume /dev/nvme3n1: writer claim taken (id=3590e004-a484-49f0-81e8-29187e54de61, term=2, mode=flock+pr)
+[2026-08-30T13:31:35Z INFO  squeezefs] meta volume /dev/nvme3n1: format=3 ledger_seq=17 replay_entries=0 replay_dropped_torn=0 replay_ms=49 free_extents=14304967 next_ino=2 meta_volume_atomicity=cow-checksummed meta_volume_atomicity_physical=unknown writer_guard_mode=flock+pr
+[2026-08-30T13:31:35Z INFO  squeezefs::fuse_client] Dynamic reclaim concurrency limit configured: 4
+[2026-08-30T13:31:35Z INFO  squeezefs::routing] block-key incarnations engaged (spec §6.2 item 6): era 2, appender 0/1 — persisted block keys now name the lifetime of their device offset
+[2026-08-30T13:31:35Z INFO  squeezefs::data_custody] data-plane WERO (rtype 3) acquired on 4 namespace(s), key 0xb8eb0cbaf3e49c57 — guarantee class pr: an unregistered (fenced) host's writes are rejected by the device
+[2026-08-30T13:31:35Z INFO  squeezefs::routing] durable block-reference ledger is EMPTY — declining to treat it as                  authoritative (an un-backfilled stamp reads every live block as free):                  falling back to the layout walk, which then backfills
+[2026-08-30T13:31:35Z INFO  squeezefs] Running block allocator recovery for data volume...
+[2026-08-30T13:31:35Z INFO  squeezefs::block_allocator] Recovery scan summary (v3): checked=1, valid_inodes=1, layouts_found=0
+[2026-08-30T13:31:35Z INFO  squeezefs] Running block allocator recovery for data volume...
+[2026-08-30T13:31:35Z INFO  squeezefs::block_allocator] Recovery scan summary (v3): checked=1, valid_inodes=1, layouts_found=0
+[2026-08-30T13:31:35Z INFO  squeezefs] Running block allocator recovery for data volume...
+[2026-08-30T13:31:35Z INFO  squeezefs::block_allocator] Recovery scan summary (v3): checked=1, valid_inodes=1, layouts_found=0
+[2026-08-30T13:31:35Z INFO  squeezefs] Running block allocator recovery for data volume...
+[2026-08-30T13:31:35Z INFO  squeezefs::block_allocator] Recovery scan summary (v3): checked=1, valid_inodes=1, layouts_found=0
+[2026-08-30T13:31:35Z WARN  squeezefs::job_wire] job wire: listener 0.0.0.0:40679 is PLAINTEXT TCP (no ClusterSecurityConfig) — sessions are AUTHENTICATED (storage-trust challenge proof + per-frame session MAC, S3 cluster_wire) but not private, so mutating publishes pay mandatory-100 % verify-reads (Issue-30; ≈2× device reads on remote-mutated bytes). Set SQUEEZEFS_JOB_WIRE_CA_KEY (+ optional SQUEEZEFS_JOB_WIRE_CA_CERT) for CA-pinned mTLS + sampled verification, or SQUEEZEFS_JOB_WIRE_BIND to narrow/disable the listener.
+[2026-08-30T13:31:35Z INFO  squeezefs::job_wire] job wire: bounds — max 64 concurrent connections, 8192 pre-enrollment frame cap, handshake deadline 10s, challenge freshness 30s
+[2026-08-30T13:31:35Z INFO  squeezefs] job wire: endpoint 172.31.21.141:40679 (published via the mount registration)
+[2026-08-30T13:31:35Z INFO  squeezefs::free_grace] freed-offset grace period armed (spec §6.8 item 3): a terminally-freed offset is not reallocatable until every live reader has acknowledged passing it. Grace bound 76.045s (under space pressure 38.0225s), ring cap 841785 offsets per volume — past the bound a laggard is FENCED, not waited on
+[2026-08-30T13:31:35Z INFO  squeezefs::membership] membership owner '6eaf3062-2be7-4a87-b0cd-f1de2e27a177' armed in term 2 (was 1): lease TTL 45s, member deadline T_self 42.955s, renewal cadence 10s, grace 45s — liveness is RAM state renewed over cluster_wire and costs ZERO journal transactions (DLM S6, spec §6.5 item 3)
+[2026-08-30T13:31:35Z INFO  squeezefs::cluster_wire] cluster wire: listener 0.0.0.0:33381 (plaintext) — thread-per-connection, max 64 connections, 8192 B pre-authn frame cap, handshake deadline 10s, challenge freshness 30s; every admitted frame carries a session MAC derived from the shared volume's job:enroll secret
+[2026-08-30T13:31:35Z INFO  squeezefs::membership_wire] membership plane listening on 0.0.0.0:33381 (owner '6eaf3062-2be7-4a87-b0cd-f1de2e27a177', term 2) — liveness for every member is RAM state renewed over this wire, so a beat costs ZERO journal transactions (DLM S6)
+[2026-08-30T13:31:35Z INFO  squeezefs::membership] claim set on /dev/nvme3n1: writer 'node_e56e47de7cb413eb.mae9dc892' is a durable member in term 2 (1 member(s),          registrant key 0xb8eb0cbaf3e49c57) — §6.2 item 7
+[2026-08-30T13:31:35Z INFO  squeezefs::membership] membership OWNER armed on 172.31.21.141:33381 (id '6eaf3062-2be7-4a87-b0cd-f1de2e27a177', term 2, superseding 1): members hold RAM leases renewed over cluster_wire, so liveness costs ZERO journal transactions and `squeezefs clients` reads ONE record plus a paged census instead of one getxattr per client (DLM S6, spec §6.5 item 3)
+[2026-08-30T13:31:35Z INFO  squeezefs::data_custody] data-plane WERO: joining the standing hold on 4 namespace(s) (key 0xb8eb0cbaf3e49c57) — a second reservation would conflict at the device
+[2026-08-30T13:31:35Z INFO  squeezefs::membership] claim set on /dev/nvme3n1: writer 'node_e56e47de7cb413eb.mede43def' is a durable member in term 2 (2 member(s),          registrant key 0x0) — §6.2 item 7
+[2026-08-30T13:31:35Z INFO  squeezefs::membership] claim set on /dev/nvme3n1: writer 'node_e56e47de7cb413eb.mad13c96f' is a durable member in term 2 (3 member(s),          registrant key 0x0) — §6.2 item 7
+[2026-08-30T13:31:35Z INFO  squeezefs::membership] claim set on /dev/nvme3n1: writer 'node_e56e47de7cb413eb.m0cb1fc55' is a durable member in term 2 (4 member(s),          registrant key 0x0) — §6.2 item 7
+[2026-08-30T13:31:35Z INFO  squeezefs::membership] claim set on /dev/nvme3n1: writer 'node_e56e47de7cb413eb.m2d45e9c3' is a durable member in term 2 (5 member(s),          registrant key 0x0) — §6.2 item 7
+[2026-08-30T13:31:35Z INFO  squeezefs::membership] claim set on /dev/nvme3n1: writer 'node_e56e47de7cb413eb.m5bc655d3' is a durable member in term 2 (6 member(s),          registrant key 0x0) — §6.2 item 7
+[2026-08-30T13:31:35Z INFO  squeezefs::membership] claim set on /dev/nvme3n1: writer 'node_e56e47de7cb413eb.m11bafcbf' is a durable member in term 2 (7 member(s),          registrant key 0x0) — §6.2 item 7
+[2026-08-30T13:31:35Z INFO  squeezefs::membership] claim set on /dev/nvme3n1: writer 'node_e56e47de7cb413eb.mad7c5113' is a durable member in term 2 (8 member(s),          registrant key 0x0) — §6.2 item 7
+[2026-08-30T13:31:35Z INFO  squeezefs::membership] claim set on /dev/nvme3n1: writer 'node_e56e47de7cb413eb.me2d0c742' is a durable member in term 2 (9 member(s),          registrant key 0x0) — §6.2 item 7
+[2026-08-30T13:31:35Z WARN  squeezefs::cowriter] claim set: 8 durable co-writer enrollment(s) committed for ["node_e56e47de7cb413eb.mede43def", "node_e56e47de7cb413eb.mad13c96f", "node_e56e47de7cb413eb.m0cb1fc55", "node_e56e47de7cb413eb.m2d45e9c3", "node_e56e47de7cb413eb.m5bc655d3", "node_e56e47de7cb413eb.m11bafcbf", "node_e56e47de7cb413eb.mad7c5113", "node_e56e47de7cb413eb.me2d0c742"] in term 2 — each named node may now be ADMITTED as a co-writer of this set (§6.2 item 7; the authority is the only writer of this record)
+[2026-08-30T13:31:35Z WARN  squeezefs::multi_writer] multi-writer: 8 durable co-writer enrollment(s) committed for ["node_e56e47de7cb413eb.mede43def", "node_e56e47de7cb413eb.mad13c96f", "node_e56e47de7cb413eb.m0cb1fc55", "node_e56e47de7cb413eb.m2d45e9c3", "node_e56e47de7cb413eb.m5bc655d3", "node_e56e47de7cb413eb.m11bafcbf", "node_e56e47de7cb413eb.mad7c5113", "node_e56e47de7cb413eb.me2d0c742"] in era 2 — each named node may now pass admission rung 3
+[2026-08-30T13:31:35Z INFO  squeezefs::data_grant] write-custody authority 'mw-01f6633e-3335-48be-8b54-c2f6f791adb7' armed in era 2 (superseding 0): client lease TTL 45s, member deadline T_self 42.955s, renewal cadence 10s, grace 45s. Only CUSTODY travels here — a co-writer's bytes go straight to the device (DLM S9, spec §6.9)
+[2026-08-30T13:31:35Z WARN  squeezefs::data_grant] S9: custody authority 'mw-01f6633e-3335-48be-8b54-c2f6f791adb7' runs era 2 with a 16-way data-plane allocation partition (15 enrolled co-writer lane(s); this node is lane 0). Every member's lane travels on its lease — no knob can put two writers in one residue class
+[2026-08-30T13:31:35Z INFO  squeezefs::block_allocator] data-plane allocation partition engaged on volume 'nvme4n1': lane 0 of 16, reservation grain 96 blocks, 838189 block(s) of this device belong to other lanes (alloc_lane_stranded_bytes)
+[2026-08-30T13:31:35Z WARN  squeezefs::alloc_lane_grant] data-plane allocation lane ENGAGED on volume 'nvme4n1': lane 0 of 16, resuming at block 0 (floor from this mount's own ownership recovery). Fresh allocation is this mount's residue class; frees stay lane-blind
+[2026-08-30T13:31:35Z INFO  squeezefs::block_allocator] data-plane allocation partition engaged on volume 'nvme5n1': lane 0 of 16, reservation grain 96 blocks, 838189 block(s) of this device belong to other lanes (alloc_lane_stranded_bytes)
+[2026-08-30T13:31:35Z WARN  squeezefs::alloc_lane_grant] data-plane allocation lane ENGAGED on volume 'nvme5n1': lane 0 of 16, resuming at block 0 (floor from this mount's own ownership recovery). Fresh allocation is this mount's residue class; frees stay lane-blind
+[2026-08-30T13:31:35Z INFO  squeezefs::block_allocator] data-plane allocation partition engaged on volume 'nvme7n1': lane 0 of 16, reservation grain 96 blocks, 838189 block(s) of this device belong to other lanes (alloc_lane_stranded_bytes)
+[2026-08-30T13:31:35Z WARN  squeezefs::alloc_lane_grant] data-plane allocation lane ENGAGED on volume 'nvme7n1': lane 0 of 16, resuming at block 0 (floor from this mount's own ownership recovery). Fresh allocation is this mount's residue class; frees stay lane-blind
+[2026-08-30T13:31:35Z INFO  squeezefs::block_allocator] data-plane allocation partition engaged on volume 'nvme6n1': lane 0 of 16, reservation grain 96 blocks, 838189 block(s) of this device belong to other lanes (alloc_lane_stranded_bytes)
+[2026-08-30T13:31:35Z WARN  squeezefs::alloc_lane_grant] data-plane allocation lane ENGAGED on volume 'nvme6n1': lane 0 of 16, resuming at block 0 (floor from this mount's own ownership recovery). Fresh allocation is this mount's residue class; frees stay lane-blind
+[2026-08-30T13:31:35Z WARN  squeezefs::alloc_lane_grant] data-plane allocation lane ENGAGED on volume 'nvme4n1': lane 0 of 16, resuming at block 0 (floor from this mount's own ownership recovery). Fresh allocation is this mount's residue class; frees stay lane-blind
+[2026-08-30T13:31:35Z INFO  squeezefs::cluster_wire] cluster wire: listener 0.0.0.0:45999 (plaintext) — thread-per-connection, max 64 connections, 8192 B pre-authn frame cap, handshake deadline 10s, challenge freshness 30s; every admitted frame carries a session MAC derived from the shared volume's job:enroll secret
+[2026-08-30T13:31:35Z WARN  squeezefs::meta_ship::owners] metadata function shipping ARMED (DLM S8): 1 of 1 volumes owned locally, 0 shipped to 0 peer(s) []; 65536 slots home locally. Metadata verbs on a foreign volume now travel to its owner; the DATA plane still refuses foreign-home custody loud (S9 ships that half)
+[2026-08-30T13:31:35Z WARN  squeezefs::multi_writer] MULTI-WRITER ARMED (DLM S9) on 172.31.21.141:45999: era 2, custody authority 'mw-01f6633e-3335-48be-8b54-c2f6f791adb7', data-plane fence class pr, 0 of 1 metadata volume(s) owned elsewhere. Peers may now acquire write custody here and DMA directly to the shared namespaces — only custody travels, never data (spec §6.9 S9)
+Mounting Squeezefs at "/scratch/mnt"...
+[2026-08-30T13:31:35Z INFO  squeezefs::fuse_client] Transport payload-buffer cap: 2466 MiB (memory budget 19729 MiB)
+[2026-08-30T13:31:35Z WARN  squeezefs::ipc_host] SQUEEZEFS_IPC_ALLOW_DEV is set — the KD-7 build-commit skew gate is RELAXED for this mount (degenerate `unknown`/`-dirty` identities will be admitted, counted in ipc_binds_dev_override). Dev boxes only: a mismatched daemon/shim pair is undefined behavior.
+[2026-08-30T13:31:35Z INFO  squeezefs::ipc_host] ipc host: path ctl socket at /run/squeezefs/sqz-il0-3757-e5a69ad5.sock
+[2026-08-30T13:31:35Z INFO  squeezefs::fuse_client] IPC session host armed (socket sqz-il0-3757-e5a69ad5, session shm cap 2466 MiB)
+[2026-08-30T13:31:35Z INFO  squeezefs::fuse_client] SqueezeFS version 1.1.0 (8e4a2cab2e3a / 8e4a2cab2e3a60bce4ae925e5be0f1bf06ec9de4) built 2026-08-30T12:49:36Z initializing mount
+[2026-08-30T13:31:35Z INFO  squeezefs::fuse_client] FUSE Daemon: Mounting squeezefs at "/scratch/mnt"...
+[2026-08-30T13:31:35Z INFO  squeezefs::fuse_client] FUSE Daemon: Metadata connection active.
+[2026-08-30T13:31:35Z INFO  squeezefs::fuse_client] device-overlay armed: transport streaming holds enabled (SQUEEZEFS_DEVICE_OVERLAY)
+[92mOK[0m Squeezefs is ready at "/scratch/mnt"
+[2026-08-30T13:31:35Z INFO  squeezefs::fuse_client] IPC session host: mount st_dev resolved (56)
+[2026-08-30T13:31:35Z INFO  squeezefs::fuse_client] FUSE Daemon: Initialized Squeezefs Filesystem mount (version 1.1.0 (8e4a2cab2e3a / 8e4a2cab2e3a60bce4ae925e5be0f1bf06ec9de4) built 2026-08-30T12:49:36Z).
+squeezefs: mount ready (version 1.1.0 (8e4a2cab2e3a / 8e4a2cab2e3a60bce4ae925e5be0f1bf06ec9de4) built 2026-08-30T12:49:36Z, exe hint: rebuild target/release and reinstall)
+[2026-08-30T13:31:35Z INFO  squeezefs::fuse_client] FUSE kernel protocol 7.45 (init flags 0x7ff73fffffb): FOPEN_NOFLUSH advertised + honored on non-writeback opens (kernel ≥ 7.35) (D2.a; under writeback cache the elision switch is the clean-FLUSH ENOSYS latch — uapi: NOFLUSH applies 'unless FUSE_WRITEBACK_CACHE'); UNKNOWN init capability bits 0x40000000000 advertised — investigate whether an atomic-open-class capability is among them (D2.d adoption follow-up)
+squeezefs: FUSE kernel 7.45 — FOPEN_NOFLUSH advertised (wb-cache elision = clean-FLUSH ENOSYS latch); UNKNOWN init capability bits 0x40000000000 advertised — investigate whether an atomic-open-class capability is among them (D2.d adoption follow-up)
+[2026-08-30T13:31:35Z INFO  squeezefs::fuse_client] FUSE_HANDLE_KILLPRIV_V2 negotiated (kernel killpriv probe deleted; daemon owns suid/sgid/caps clearing) for this mount
+[2026-08-30T13:31:35Z WARN  fuse3::raw::connection::kmbuf] SQUEEZEFS_FUSE_ZC=1 declined: the kmbuf/zc io_uring surface is Absent on this kernel — continuing on the userspace-ent path (fuse3_zc_replies stays 0; the sqz kernel series carries the surface)
+[2026-08-30T13:31:35Z INFO  fuse3::raw::connection::fuse_over_uring] fuse-over-uring queue-ring setup probe: SINGLE_ISSUER+DEFER_TASKRUN available
+FUSE-over-io_uring registered: queues=32 depth=32 payload_sz=1048576 max_write=1048576 max_pages=256 buffers=user-ents kmbuf_ops=absent fd=320 sqpoll=off drain_groups=4(width<=8)
+[2026-08-30T13:31:35Z INFO  fuse3::raw::connection::fuse_over_uring] FUSE-over-io_uring registered: queues=32 depth=32 payload_sz=1048576 max_write=1048576 max_pages=256 buffers=user-ents kmbuf_ops=absent fd=320 sqpoll=off drain_groups=4(width<=8)
+FUSE-over-io_uring session path armed (ready=true, queues=32)
+FUSE-over-io_uring transport armed for this session
+[2026-08-30T13:31:35Z INFO  fuse3::raw::session] FUSE-over-io_uring transport armed for this session
+FUSE-over-io_uring: classical sideband servicer armed (primary session; FORGET/INTERRUPT/resend + switchover stragglers)
+[2026-08-30T13:31:49Z INFO  squeezefs::cluster_wire] cluster wire: peer 'node_e56e47de7cb413eb.mede43def' admitted from 172.31.21.141:34060 (plaintext, storage-trust proof, per-frame MAC)
+[2026-08-30T13:31:49Z INFO  squeezefs::cluster_wire] cluster wire: peer 'node_e56e47de7cb413eb.mede43def' admitted from 172.31.21.141:50244 (plaintext, storage-trust proof, per-frame MAC)
+[2026-08-30T13:31:49Z INFO  squeezefs::data_grant] S9: co-writer 'node_e56e47de7cb413eb.mede43def' joined authority 'mw-01f6633e-3335-48be-8b54-c2f6f791adb7' in era 2 with lease epoch 1 (custody epoch 0x20000000001, registrant key 0xb8eb0cbaf3e49c57)
+[2026-08-30T13:31:49Z INFO  squeezefs::cluster_wire] cluster wire: peer 'node_e56e47de7cb413eb.mede43def' admitted from 172.31.21.141:50250 (plaintext, storage-trust proof, per-frame MAC)
+[2026-08-30T13:31:49Z INFO  squeezefs::cluster_wire] cluster wire: peer 'node_e56e47de7cb413eb.mede43def' admitted from 172.31.21.141:50252 (plaintext, storage-trust proof, per-frame MAC)
+[2026-08-30T13:31:50Z INFO  squeezefs::cluster_wire] cluster wire: peer 'node_e56e47de7cb413eb.mede43def' admitted from 172.31.21.141:50258 (plaintext, storage-trust proof, per-frame MAC)
+[2026-08-30T13:31:50Z INFO  squeezefs::data_custody] data-plane WERO: joining the standing hold on 4 namespace(s) (key 0xb8eb0cbaf3e49c57) — a second reservation would conflict at the device
+[2026-08-30T13:31:50Z INFO  squeezefs::job_wire] job wire: WERO (rtype 3) held on the data namespaces (key 0xb8eb0cbaf3e49c57) — guarantee class pr (expired worker hosts will be PR-preempted). The hold is the process's ONE data-plane reservation (DLM S7, data_custody::acquire_wero): an S7-armed mount and this fence share it rather than conflicting at the device
+[2026-08-30T13:31:50Z INFO  squeezefs::job_wire] job wire: worker node_e56e47de7cb413eb.mede43def enrolled from 172.31.21.141:45492 (session 1, pr_key None, fence pr, channel plaintext, session MAC)
+[2026-08-30T13:31:50Z INFO  squeezefs::cluster_wire] cluster wire: peer 'node_e56e47de7cb413eb.mede43def' admitted from 172.31.21.141:50266 (plaintext, storage-trust proof, per-frame MAC)
+[2026-08-30T13:31:50Z INFO  squeezefs::meta_ship::service] S10 delegation: holder 'node_e56e47de7cb413eb.mede43def' re-asserted 1 object(s), 1 re-admitted in era 2 (grace closed)
+[2026-08-30T13:31:59Z INFO  squeezefs::cluster_wire] cluster wire: peer 'node_e56e47de7cb413eb.mede43def' admitted from 172.31.21.141:42068 (plaintext, storage-trust proof, per-frame MAC)
+[2026-08-30T13:32:02Z INFO  squeezefs::cluster_wire] cluster wire: peer 'node_e56e47de7cb413eb.mad13c96f' admitted from 172.31.21.141:60342 (plaintext, storage-trust proof, per-frame MAC)
+[2026-08-30T13:32:02Z INFO  squeezefs::cluster_wire] cluster wire: peer 'node_e56e47de7cb413eb.mad13c96f' admitted from 172.31.21.141:54086 (plaintext, storage-trust proof, per-frame MAC)
+[2026-08-30T13:32:02Z INFO  squeezefs::data_grant] S9: co-writer 'node_e56e47de7cb413eb.mad13c96f' joined authority 'mw-01f6633e-3335-48be-8b54-c2f6f791adb7' in era 2 with lease epoch 2 (custody epoch 0x20000000002, registrant key 0xb8eb0cbaf3e49c57)
+[2026-08-30T13:32:02Z INFO  squeezefs::cluster_wire] cluster wire: peer 'node_e56e47de7cb413eb.mad13c96f' admitted from 172.31.21.141:54092 (plaintext, storage-trust proof, per-frame MAC)
+[2026-08-30T13:32:02Z INFO  squeezefs::cluster_wire] cluster wire: peer 'node_e56e47de7cb413eb.mad13c96f' admitted from 172.31.21.141:54100 (plaintext, storage-trust proof, per-frame MAC)
+[2026-08-30T13:32:03Z INFO  squeezefs::cluster_wire] cluster wire: peer 'node_e56e47de7cb413eb.mad13c96f' admitted from 172.31.21.141:54106 (plaintext, storage-trust proof, per-frame MAC)
+[2026-08-30T13:32:03Z INFO  squeezefs::job_wire] job wire: worker node_e56e47de7cb413eb.mad13c96f enrolled from 172.31.21.141:48694 (session 2, pr_key None, fence pr, channel plaintext, session MAC)
+[2026-08-30T13:32:03Z INFO  squeezefs::cluster_wire] cluster wire: peer 'node_e56e47de7cb413eb.mad13c96f' admitted from 172.31.21.141:54116 (plaintext, storage-trust proof, per-frame MAC)
+[2026-08-30T13:32:03Z INFO  squeezefs::meta_ship::service] S10 delegation: holder 'node_e56e47de7cb413eb.mad13c96f' re-asserted 1 object(s), 1 re-admitted in era 2 (grace closed)
+[2026-08-30T13:32:12Z INFO  squeezefs::cluster_wire] cluster wire: peer 'node_e56e47de7cb413eb.mad13c96f' admitted from 172.31.21.141:44422 (plaintext, storage-trust proof, per-frame MAC)
+[2026-08-30T13:32:13Z INFO  squeezefs::cluster_wire] cluster wire: peer 'node_e56e47de7cb413eb.m0cb1fc55' admitted from 172.31.21.141:57064 (plaintext, storage-trust proof, per-frame MAC)
+[2026-08-30T13:32:13Z INFO  squeezefs::cluster_wire] cluster wire: peer 'node_e56e47de7cb413eb.m0cb1fc55' admitted from 172.31.21.141:44434 (plaintext, storage-trust proof, per-frame MAC)
+[2026-08-30T13:32:13Z INFO  squeezefs::data_grant] S9: co-writer 'node_e56e47de7cb413eb.m0cb1fc55' joined authority 'mw-01f6633e-3335-48be-8b54-c2f6f791adb7' in era 2 with lease epoch 3 (custody epoch 0x20000000003, registrant key 0xb8eb0cbaf3e49c57)
+[2026-08-30T13:32:13Z INFO  squeezefs::cluster_wire] cluster wire: peer 'node_e56e47de7cb413eb.m0cb1fc55' admitted from 172.31.21.141:44450 (plaintext, storage-trust proof, per-frame MAC)
+[2026-08-30T13:32:13Z INFO  squeezefs::cluster_wire] cluster wire: peer 'node_e56e47de7cb413eb.m0cb1fc55' admitted from 172.31.21.141:44464 (plaintext, storage-trust proof, per-frame MAC)
+[2026-08-30T13:32:14Z INFO  squeezefs::cluster_wire] cluster wire: peer 'node_e56e47de7cb413eb.m0cb1fc55' admitted from 172.31.21.141:44480 (plaintext, storage-trust proof, per-frame MAC)
+[2026-08-30T13:32:14Z INFO  squeezefs::job_wire] job wire: worker node_e56e47de7cb413eb.m0cb1fc55 enrolled from 172.31.21.141:47426 (session 3, pr_key None, fence pr, channel plaintext, session MAC)
+[2026-08-30T13:32:14Z INFO  squeezefs::cluster_wire] cluster wire: peer 'node_e56e47de7cb413eb.m0cb1fc55' admitted from 172.31.21.141:44494 (plaintext, storage-trust proof, per-frame MAC)
+[2026-08-30T13:32:14Z INFO  squeezefs::meta_ship::service] S10 delegation: holder 'node_e56e47de7cb413eb.m0cb1fc55' re-asserted 1 object(s), 1 re-admitted in era 2 (grace closed)
+[2026-08-30T13:32:22Z INFO  squeezefs::cluster_wire] cluster wire: peer 'node_e56e47de7cb413eb.m2d45e9c3' admitted from 172.31.21.141:60858 (plaintext, storage-trust proof, per-frame MAC)
+[2026-08-30T13:32:22Z INFO  squeezefs::cluster_wire] cluster wire: peer 'node_e56e47de7cb413eb.m2d45e9c3' admitted from 172.31.21.141:45198 (plaintext, storage-trust proof, per-frame MAC)
+[2026-08-30T13:32:22Z INFO  squeezefs::data_grant] S9: co-writer 'node_e56e47de7cb413eb.m2d45e9c3' joined authority 'mw-01f6633e-3335-48be-8b54-c2f6f791adb7' in era 2 with lease epoch 4 (custody epoch 0x20000000004, registrant key 0xb8eb0cbaf3e49c57)
+[2026-08-30T13:32:22Z INFO  squeezefs::cluster_wire] cluster wire: peer 'node_e56e47de7cb413eb.m2d45e9c3' admitted from 172.31.21.141:45208 (plaintext, storage-trust proof, per-frame MAC)
+[2026-08-30T13:32:22Z INFO  squeezefs::cluster_wire] cluster wire: peer 'node_e56e47de7cb413eb.m2d45e9c3' admitted from 172.31.21.141:45218 (plaintext, storage-trust proof, per-frame MAC)
+[2026-08-30T13:32:22Z INFO  squeezefs::cluster_wire] cluster wire: peer 'node_e56e47de7cb413eb.m2d45e9c3' admitted from 172.31.21.141:45234 (plaintext, storage-trust proof, per-frame MAC)
+[2026-08-30T13:32:22Z WARN  squeezefs::meta_ship::tokens] S10 recall valve: object ino 1 demoted to owner-served for 270.035456s — 3 grant→recall cycles inside 33.754432s (spec R5's thrash shape; grants resume after the cooldown)
+[2026-08-30T13:32:22Z INFO  squeezefs::job_wire] job wire: worker node_e56e47de7cb413eb.m2d45e9c3 enrolled from 172.31.21.141:35794 (session 4, pr_key None, fence pr, channel plaintext, session MAC)
+[2026-08-30T13:32:23Z INFO  squeezefs::cluster_wire] cluster wire: peer 'node_e56e47de7cb413eb.m0cb1fc55' admitted from 172.31.21.141:45246 (plaintext, storage-trust proof, per-frame MAC)
+[2026-08-30T13:32:29Z INFO  squeezefs::cluster_wire] cluster wire: peer 'node_e56e47de7cb413eb.m5bc655d3' admitted from 172.31.21.141:60864 (plaintext, storage-trust proof, per-frame MAC)
+[2026-08-30T13:32:29Z INFO  squeezefs::cluster_wire] cluster wire: peer 'node_e56e47de7cb413eb.m5bc655d3' admitted from 172.31.21.141:45250 (plaintext, storage-trust proof, per-frame MAC)
+[2026-08-30T13:32:29Z INFO  squeezefs::data_grant] S9: co-writer 'node_e56e47de7cb413eb.m5bc655d3' joined authority 'mw-01f6633e-3335-48be-8b54-c2f6f791adb7' in era 2 with lease epoch 5 (custody epoch 0x20000000005, registrant key 0xb8eb0cbaf3e49c57)
+[2026-08-30T13:32:29Z INFO  squeezefs::cluster_wire] cluster wire: peer 'node_e56e47de7cb413eb.m5bc655d3' admitted from 172.31.21.141:45262 (plaintext, storage-trust proof, per-frame MAC)
+[2026-08-30T13:32:29Z INFO  squeezefs::cluster_wire] cluster wire: peer 'node_e56e47de7cb413eb.m5bc655d3' admitted from 172.31.21.141:45274 (plaintext, storage-trust proof, per-frame MAC)
+[2026-08-30T13:32:29Z INFO  squeezefs::cluster_wire] cluster wire: peer 'node_e56e47de7cb413eb.m5bc655d3' admitted from 172.31.21.141:45278 (plaintext, storage-trust proof, per-frame MAC)
+[2026-08-30T13:32:29Z INFO  squeezefs::job_wire] job wire: worker node_e56e47de7cb413eb.m5bc655d3 enrolled from 172.31.21.141:35802 (session 5, pr_key None, fence pr, channel plaintext, session MAC)
+[2026-08-30T13:32:32Z INFO  squeezefs::cluster_wire] cluster wire: peer 'node_e56e47de7cb413eb.m2d45e9c3' admitted from 172.31.21.141:38140 (plaintext, storage-trust proof, per-frame MAC)
+[2026-08-30T13:32:33Z INFO  squeezefs::cluster_wire] cluster wire: peer 'node_e56e47de7cb413eb.m11bafcbf' admitted from 172.31.21.141:52314 (plaintext, storage-trust proof, per-frame MAC)
+[2026-08-30T13:32:34Z INFO  squeezefs::cluster_wire] cluster wire: peer 'node_e56e47de7cb413eb.m11bafcbf' admitted from 172.31.21.141:38154 (plaintext, storage-trust proof, per-frame MAC)
+[2026-08-30T13:32:34Z INFO  squeezefs::data_grant] S9: co-writer 'node_e56e47de7cb413eb.m11bafcbf' joined authority 'mw-01f6633e-3335-48be-8b54-c2f6f791adb7' in era 2 with lease epoch 6 (custody epoch 0x20000000006, registrant key 0xb8eb0cbaf3e49c57)
+[2026-08-30T13:32:34Z INFO  squeezefs::cluster_wire] cluster wire: peer 'node_e56e47de7cb413eb.m11bafcbf' admitted from 172.31.21.141:38166 (plaintext, storage-trust proof, per-frame MAC)
+[2026-08-30T13:32:34Z INFO  squeezefs::cluster_wire] cluster wire: peer 'node_e56e47de7cb413eb.m11bafcbf' admitted from 172.31.21.141:38170 (plaintext, storage-trust proof, per-frame MAC)
+[2026-08-30T13:32:34Z INFO  squeezefs::cluster_wire] cluster wire: peer 'node_e56e47de7cb413eb.m11bafcbf' admitted from 172.31.21.141:38176 (plaintext, storage-trust proof, per-frame MAC)
+[2026-08-30T13:32:34Z INFO  squeezefs::job_wire] job wire: worker node_e56e47de7cb413eb.m11bafcbf enrolled from 172.31.21.141:35754 (session 6, pr_key None, fence pr, channel plaintext, session MAC)
+[2026-08-30T13:32:36Z INFO  squeezefs::cluster_wire] cluster wire: peer 'node_e56e47de7cb413eb.mad7c5113' admitted from 172.31.21.141:52320 (plaintext, storage-trust proof, per-frame MAC)
+[2026-08-30T13:32:36Z INFO  squeezefs::cluster_wire] cluster wire: peer 'node_e56e47de7cb413eb.mad7c5113' admitted from 172.31.21.141:38184 (plaintext, storage-trust proof, per-frame MAC)
+[2026-08-30T13:32:36Z INFO  squeezefs::data_grant] S9: co-writer 'node_e56e47de7cb413eb.mad7c5113' joined authority 'mw-01f6633e-3335-48be-8b54-c2f6f791adb7' in era 2 with lease epoch 7 (custody epoch 0x20000000007, registrant key 0xb8eb0cbaf3e49c57)
+[2026-08-30T13:32:36Z INFO  squeezefs::cluster_wire] cluster wire: peer 'node_e56e47de7cb413eb.mad7c5113' admitted from 172.31.21.141:38186 (plaintext, storage-trust proof, per-frame MAC)
+[2026-08-30T13:32:36Z INFO  squeezefs::cluster_wire] cluster wire: peer 'node_e56e47de7cb413eb.mad7c5113' admitted from 172.31.21.141:38194 (plaintext, storage-trust proof, per-frame MAC)
+[2026-08-30T13:32:36Z INFO  squeezefs::cluster_wire] cluster wire: peer 'node_e56e47de7cb413eb.mad7c5113' admitted from 172.31.21.141:38206 (plaintext, storage-trust proof, per-frame MAC)
+[2026-08-30T13:32:37Z INFO  squeezefs::job_wire] job wire: worker node_e56e47de7cb413eb.mad7c5113 enrolled from 172.31.21.141:35758 (session 7, pr_key None, fence pr, channel plaintext, session MAC)
+[2026-08-30T13:32:37Z INFO  squeezefs::cluster_wire] cluster wire: peer 'node_e56e47de7cb413eb.me2d0c742' admitted from 172.31.21.141:52328 (plaintext, storage-trust proof, per-frame MAC)
+[2026-08-30T13:32:37Z INFO  squeezefs::cluster_wire] cluster wire: peer 'node_e56e47de7cb413eb.me2d0c742' admitted from 172.31.21.141:38208 (plaintext, storage-trust proof, per-frame MAC)
+[2026-08-30T13:32:37Z INFO  squeezefs::data_grant] S9: co-writer 'node_e56e47de7cb413eb.me2d0c742' joined authority 'mw-01f6633e-3335-48be-8b54-c2f6f791adb7' in era 2 with lease epoch 8 (custody epoch 0x20000000008, registrant key 0xb8eb0cbaf3e49c57)
+[2026-08-30T13:32:37Z INFO  squeezefs::cluster_wire] cluster wire: peer 'node_e56e47de7cb413eb.me2d0c742' admitted from 172.31.21.141:38224 (plaintext, storage-trust proof, per-frame MAC)
+[2026-08-30T13:32:37Z INFO  squeezefs::cluster_wire] cluster wire: peer 'node_e56e47de7cb413eb.me2d0c742' admitted from 172.31.21.141:38236 (plaintext, storage-trust proof, per-frame MAC)
+[2026-08-30T13:32:37Z INFO  squeezefs::cluster_wire] cluster wire: peer 'node_e56e47de7cb413eb.me2d0c742' admitted from 172.31.21.141:38248 (plaintext, storage-trust proof, per-frame MAC)
+[2026-08-30T13:32:37Z INFO  squeezefs::job_wire] job wire: worker node_e56e47de7cb413eb.me2d0c742 enrolled from 172.31.21.141:35770 (session 8, pr_key None, fence pr, channel plaintext, session MAC)
+[2026-08-30T13:32:39Z INFO  squeezefs::cluster_wire] cluster wire: peer 'node_e56e47de7cb413eb.m5bc655d3' admitted from 172.31.21.141:38250 (plaintext, storage-trust proof, per-frame MAC)
+[2026-08-30T13:32:44Z INFO  squeezefs::cluster_wire] cluster wire: peer 'node_e56e47de7cb413eb.m11bafcbf' admitted from 172.31.21.141:44346 (plaintext, storage-trust proof, per-frame MAC)
+[2026-08-30T13:32:46Z INFO  squeezefs::cluster_wire] cluster wire: peer 'node_e56e47de7cb413eb.mad7c5113' admitted from 172.31.21.141:44360 (plaintext, storage-trust proof, per-frame MAC)
+[2026-08-30T13:32:47Z INFO  squeezefs::cluster_wire] cluster wire: peer 'node_e56e47de7cb413eb.me2d0c742' admitted from 172.31.21.141:44368 (plaintext, storage-trust proof, per-frame MAC)
+[2026-08-30T13:32:51Z WARN  squeezefs::cluster_wire] cluster wire: peer 'node_e56e47de7cb413eb.mede43def' sent no frame within 60s — closing the idle session
+[2026-08-30T13:32:51Z WARN  squeezefs::cluster_wire] cluster wire: peer 'node_e56e47de7cb413eb.mede43def' sent no frame within 60s — closing the idle session
+[2026-08-30T13:32:58Z INFO  squeezefs::cluster_wire] cluster wire: peer 'node_e56e47de7cb413eb.m5bc655d3' admitted from 172.31.21.141:33938 (plaintext, storage-trust proof, per-frame MAC)
+[2026-08-30T13:32:58Z INFO  squeezefs::cluster_wire] cluster wire: peer 'node_e56e47de7cb413eb.m11bafcbf' admitted from 172.31.21.141:33940 (plaintext, storage-trust proof, per-frame MAC)
+[2026-08-30T13:32:58Z INFO  squeezefs::meta_ship::service] S10 delegation: holder 'node_e56e47de7cb413eb.m5bc655d3' re-asserted 1 object(s), 1 re-admitted in era 2 (grace closed)
+[2026-08-30T13:32:58Z INFO  squeezefs::meta_ship::service] S10 delegation: holder 'node_e56e47de7cb413eb.m11bafcbf' re-asserted 1 object(s), 1 re-admitted in era 2 (grace closed)
+[2026-08-30T13:32:58Z INFO  squeezefs::cluster_wire] cluster wire: peer 'node_e56e47de7cb413eb.me2d0c742' admitted from 172.31.21.141:33974 (plaintext, storage-trust proof, per-frame MAC)
+[2026-08-30T13:32:58Z INFO  squeezefs::cluster_wire] cluster wire: peer 'node_e56e47de7cb413eb.mad7c5113' admitted from 172.31.21.141:33958 (plaintext, storage-trust proof, per-frame MAC)
+[2026-08-30T13:32:58Z INFO  squeezefs::cluster_wire] cluster wire: peer 'node_e56e47de7cb413eb.m2d45e9c3' admitted from 172.31.21.141:33944 (plaintext, storage-trust proof, per-frame MAC)
+[2026-08-30T13:32:58Z INFO  squeezefs::meta_ship::service] S10 delegation: holder 'node_e56e47de7cb413eb.me2d0c742' re-asserted 1 object(s), 1 re-admitted in era 2 (grace closed)
+[2026-08-30T13:32:58Z INFO  squeezefs::meta_ship::service] S10 delegation: holder 'node_e56e47de7cb413eb.mad7c5113' re-asserted 1 object(s), 1 re-admitted in era 2 (grace closed)
+[2026-08-30T13:32:58Z INFO  squeezefs::cluster_wire] cluster wire: peer 'node_e56e47de7cb413eb.mede43def' admitted from 172.31.21.141:33980 (plaintext, storage-trust proof, per-frame MAC)
+[2026-08-30T13:32:58Z INFO  squeezefs::meta_ship::service] S10 delegation: holder 'node_e56e47de7cb413eb.m2d45e9c3' re-asserted 1 object(s), 1 re-admitted in era 2 (grace closed)
+[2026-08-30T13:32:58Z INFO  squeezefs::cluster_wire] cluster wire: peer 'node_e56e47de7cb413eb.mede43def' admitted from 172.31.21.141:33994 (plaintext, storage-trust proof, per-frame MAC)
+[2026-08-30T13:32:58Z WARN  squeezefs::meta_ship::tokens] S10 recall valve: object ino 2 demoted to owner-served for 270.035456s — 3 grant→recall cycles inside 33.754432s (spec R5's thrash shape; grants resume after the cooldown)
+[2026-08-30T13:33:05Z WARN  fuse3::raw::connection::fuse_over_uring] fuse-over-uring qid=1 ent=31: unique=226 delivered 5672 ms ago and still unreplied — the caller is in uninterruptible sleep (transport_slots_overdue; not-fused, fused_ready_total=0, zc_bridge_pends=0, scan_passes=0, scan_pends_seen=0, scan_orphans_seen=0, pend_max_age_ms=0, cancel_latched=0, park_backstop_ticks=0, zc_msgs_sent=0, zc_msgs_taken=0)
+[2026-08-30T13:34:00Z WARN  squeezefs::data_grant] S11: refusing range custody of inode_2 [7751073792,7752122368) to 'node_e56e47de7cb413eb.mad7c5113' (conflicting custody): Lock acquisition failed: range [7751073792,7752122368) on inode_2 is held by foreign custody overlapping REQUIRED after the 5s wait budget — refusing loud (required is never silently trimmed to fit — §9.2)
+[2026-08-30T13:34:00Z WARN  squeezefs::data_grant] S9 custody refusal: range custody of inode_2 Some((7751073792, 7752122368)) refused to 'node_e56e47de7cb413eb.mad7c5113' (conflicting custody): Lock acquisition failed: range [7751073792,7752122368) on inode_2 is held by foreign custody overlapping REQUIRED after the 5s wait budget — refusing loud (required is never silently trimmed to fit — §9.2)
+[2026-08-30T13:34:33Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 88340430848: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:34:33Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 89078628352: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:34:34Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 88076189696: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:34:34Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 88873107456: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:34:34Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 87526735872: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:34:34Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 88336236544: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:34:34Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 88202018816: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:34:34Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 88344625152: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:34:34Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 88143298560: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:34:34Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 89959432192: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:34:34Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 89758105600: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:34:34Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 87983915008: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:34:34Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 87379935232: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:34:34Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 89758105600: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:34:34Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 88520785920: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:34:34Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 88390762496: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:34:34Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 87853891584: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:34:34Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 89825214464: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:34:34Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 87992303616: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:34:34Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 87992303616: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:34:39Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 93847552000: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:34:39Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 96133447680: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:34:39Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 96401883136: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:34:39Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 94044684288: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:34:39Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 94514446336: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:34:40Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 93637836800: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:34:40Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 93155491840: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:34:40Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 94166319104: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:34:44Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 100420026368: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:34:44Z WARN  squeezefs::meta_ship::tokens] S10 recall valve: object ino 198403 demoted to owner-served for 270.035456s — 3 grant→recall cycles inside 33.754432s (spec R5's thrash shape; grants resume after the cooldown)
+[2026-08-30T13:34:44Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 101225332736: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:34:45Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 97177829376: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:34:45Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 100617158656: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:34:45Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 99878961152: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:34:45Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 98935242752: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:34:45Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 100201922560: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:34:45Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 100139008000: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:34:45Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 99405004800: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:34:45Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 98733916160: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:34:45Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 100004790272: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:34:45Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 100541661184: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:34:49Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 106245914624: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:34:49Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 105314779136: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:34:49Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 105977479168: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:34:50Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 105243475968: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:34:50Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 105713238016: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:34:50Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 106862477312: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:34:50Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 105654517760: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:34:50Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 105524494336: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:34:50Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 105591603200: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:34:50Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 105973284864: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:34:55Z WARN  squeezefs::meta_ship::tokens] S10 recall valve: object ino 228481 demoted to owner-served for 270.035456s — 3 grant→recall cycles inside 33.754432s (spec R5's thrash shape; grants resume after the cooldown)
+[2026-08-30T13:34:55Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 112969383936: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:34:55Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 113036492800: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:34:55Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 112013082624: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:34:55Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 110868037632: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:34:56Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 111421685760: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:34:56Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 113447534592: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:35:01Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 117872525312: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:35:01Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 117268545536: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:35:01Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 117671198720: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:35:01Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 117847359488: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:35:01Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 120158420992: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:35:01Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 117058830336: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:35:06Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 124025569280: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:35:06Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 123690024960: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:35:06Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 125250306048: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:35:06Z WARN  squeezefs::meta_ship::tokens] S10 recall valve: object ino 221502 demoted to owner-served for 270.035456s — 3 grant→recall cycles inside 33.754432s (spec R5's thrash shape; grants resume after the cooldown)
+[2026-08-30T13:35:06Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 123778105344: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:35:06Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 122289127424: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:35:06Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 122289127424: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:35:10Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 127926272000: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:35:11Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 129796931584: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:35:11Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 129729822720: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:35:11Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 129541079040: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:35:11Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 130199584768: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:35:11Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 131030056960: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:35:11Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 130153447424: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:35:12Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 132103798784: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:35:12Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 129213923328: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:35:15Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 135186612224: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:35:16Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 135522156544: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:35:16Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 135790592000: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:35:16Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 134368722944: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:35:17Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 135031422976: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:35:17Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 134838484992: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:35:17Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 134905593856: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:35:17Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 134557466624: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:35:17Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 137875161088: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:35:17Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 134423248896: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:35:17Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 135509573632: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:35:17Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 134838484992: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:35:17Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 136189050880: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:35:17Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 136323268608: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:35:21Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 140408520704: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:35:21Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 140265914368: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:35:21Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 140534349824: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:35:21Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 141339656192: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:35:21Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 141071220736: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:35:21Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 141809418240: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:35:22Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 141763280896: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:35:22Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 141335461888: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:35:22Z WARN  squeezefs::meta_ship::tokens] S10 recall valve: object ino 52601 demoted to owner-served for 270.035456s — 3 grant→recall cycles inside 33.754432s (spec R5's thrash shape; grants resume after the cooldown)
+[2026-08-30T13:35:22Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 143109652480: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:35:22Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 141025083392: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:35:22Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 141293518848: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:35:22Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 142367260672: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:35:22Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 141813612544: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:35:26Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 146997772288: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:35:26Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 147803078656: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:35:27Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 145710120960: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:35:27Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 147249430528: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:35:27Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 147786301440: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:35:27Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 148188954624: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:35:27Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 146033082368: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:35:27Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 147123601408: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:35:27Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 147190710272: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:35:31Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 151737335808: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:35:32Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 153423446016: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:35:32Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 154027425792: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:35:32Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 153624772608: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:35:32Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 152349704192: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:35:32Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 153297616896: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:35:32Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 155457683456: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:35:32Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 152559419392: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:35:32Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 154652377088: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:35:37Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 157844242432: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:35:37Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 158515331072: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:35:37Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 160201441280: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:35:37Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 159681347584: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:35:38Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 158867652608: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:35:38Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 159270305792: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:35:38Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 158934761472: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:35:38Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 158125260800: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:35:38Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 158729240576: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:35:38Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 158863458304: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:35:38Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 159006064640: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:35:38Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 160146915328: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:35:38Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 160952221696: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:35:42Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 165360435200: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:35:42Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 165494652928: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:35:42Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 165024890880: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:35:42Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 164085366784: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:35:42Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 165712756736: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:35:42Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 164957782016: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:35:42Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 165041668096: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:35:42Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 163292643328: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:35:43Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 163158425600: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:35:43Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 163695296512: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:35:43Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 164156669952: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:35:47Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 169672179712: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:35:48Z WARN  squeezefs::meta_ship::tokens] S10 recall valve: object ino 183673 demoted to owner-served for 270.035456s — 3 grant→recall cycles inside 33.754432s (spec R5's thrash shape; grants resume after the cooldown)
+[2026-08-30T13:35:48Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 170527817728: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:35:48Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 173241532416: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:35:48Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 169533767680: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:35:48Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 168795570176: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:35:48Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 172763381760: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:35:48Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 171622531072: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:35:48Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 173166034944: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:35:48Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 171823857664: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:35:54Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 175640674304: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:35:54Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 175774892032: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:35:54Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 175707783168: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:35:54Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 176177545216: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:35:54Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 174969585664: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:35:54Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 175036694528: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:35:54Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 179012894720: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:35:54Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 179214221312: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:35:54Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 176366288896: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:35:54Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 178601852928: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:35:54Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 176911548416: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:35:54Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 177716854784: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:35:54Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 177381310464: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:35:59Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 183488217088: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:35:59Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 182758408192: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:35:59Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 182825517056: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:35:59Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 182963929088: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:35:59Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 183169449984: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:35:59Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 182901014528: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:35:59Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 182699687936: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:35:59Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 183345610752: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:35:59Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 181399453696: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:35:59Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 181667889152: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:35:59Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 182741630976: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:35:59Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 182607413248: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:36:00Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 181814689792: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:36:00Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 182083125248: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:36:00Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 180606730240: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:36:04Z WARN  squeezefs::meta_ship::tokens] S10 recall valve: object ino 81303 demoted to owner-served for 270.035456s — 3 grant→recall cycles inside 33.754432s (spec R5's thrash shape; grants resume after the cooldown)
+[2026-08-30T13:36:04Z WARN  squeezefs::meta_ship::tokens] S10 recall valve: object ino 47499 demoted to owner-served for 270.035456s — 3 grant→recall cycles inside 33.754432s (spec R5's thrash shape; grants resume after the cooldown)
+[2026-08-30T13:36:05Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 187242119168: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:36:05Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 188244557824: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:36:05Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 189184081920: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:36:05Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 190748557312: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:36:05Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 190413012992: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:36:05Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 186914963456: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:36:05Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 190480121856: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:36:05Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 190211686400: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:36:08Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 195446177792: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:36:09Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 195714613248: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:36:09Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 195043524608: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:36:09Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 196721246208: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:36:10Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 197400723456: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:36:10Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 195651698688: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:36:10Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 197065179136: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:36:10Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 196394090496: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:36:10Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 195249045504: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:36:10Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 195374874624: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:36:10Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 192820543488: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:36:10Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 194636677120: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:36:10Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 195509092352: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:36:10Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 193424523264: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:36:10Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 194963832832: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:36:13Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 202702323712: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:36:15Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 199061667840: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:36:15Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 200684863488: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:36:15Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 199732756480: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:36:15Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 202358390784: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:36:15Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 201355952128: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:36:15Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 200189935616: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:36:15Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 200550645760: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:36:15Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 201339174912: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:36:20Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 204153552896: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:36:20Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 202215784448: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:36:20Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 207127314432: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:36:21Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 209346101248: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:36:21Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 208876339200: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:36:21Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 207110537216: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:36:21Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 206993096704: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:36:21Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 206305230848: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:36:25Z WARN  squeezefs::meta_ship::tokens] S10 recall valve: object ino 244107 demoted to owner-served for 270.035456s — 3 grant→recall cycles inside 33.754432s (spec R5's thrash shape; grants resume after the cooldown)
+[2026-08-30T13:36:25Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 214639312896: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:36:25Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 213343272960: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:36:25Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 211262898176: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:36:25Z WARN  squeezefs::meta_ship::tokens] S10 recall valve: object ino 197987 demoted to owner-served for 270.035456s — 3 grant→recall cycles inside 33.754432s (spec R5's thrash shape; grants resume after the cooldown)
+[2026-08-30T13:36:26Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 211824934912: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:36:26Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 213435547648: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:36:26Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 212068204544: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:36:26Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 212470857728: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:36:26Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 212537966592: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:36:26Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 213485879296: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:36:26Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 212286308352: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:36:26Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 213687205888: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:36:26Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 212412137472: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:36:26Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 214156967936: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:36:26Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 212219199488: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:36:30Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 216967151616: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:36:31Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 217248169984: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:36:31Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 216979734528: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:36:31Z WARN  squeezefs::meta_ship::tokens] S10 recall valve: object ino 146839 demoted to owner-served for 270.035456s — 3 grant→recall cycles inside 33.754432s (spec R5's thrash shape; grants resume after the cooldown)
+[2026-08-30T13:36:31Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 219211104256: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:36:31Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 217663406080: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:36:31Z WARN  squeezefs::meta_ship::tokens] S10 recall valve: object ino 37273 demoted to owner-served for 270.035456s — 3 grant→recall cycles inside 33.754432s (spec R5's thrash shape; grants resume after the cooldown)
+[2026-08-30T13:36:31Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 216098930688: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:36:31Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 216031821824: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:36:31Z WARN  squeezefs::meta_ship::tokens] S10 recall valve: object ino 118137 demoted to owner-served for 270.035456s — 3 grant→recall cycles inside 33.754432s (spec R5's thrash shape; grants resume after the cooldown)
+[2026-08-30T13:36:35Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 221333422080: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:36:35Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 221467639808: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:36:35Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 224646922240: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:36:36Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 222281334784: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:36:36Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 225154433024: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:36:36Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 225221541888: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:36:36Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 226114928640: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:36:36Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 224705642496: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:36:36Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 223812255744: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:36:37Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 226047819776: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:36:37Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 223829032960: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:36:37Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 225632583680: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:36:40Z WARN  squeezefs::meta_ship::tokens] S10 recall valve: object ino 249209 demoted to owner-served for 270.035456s — 3 grant→recall cycles inside 33.754432s (spec R5's thrash shape; grants resume after the cooldown)
+[2026-08-30T13:36:41Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 230477004800: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:36:42Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 230619611136: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:36:42Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 229516509184: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:36:42Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 231194230784: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:36:42Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 230531530752: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:36:46Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 234755194880: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:36:46Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 234910384128: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:36:47Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 237376634880: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:36:47Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 237577961472: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:36:47Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 235573084160: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:36:51Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 241478664192: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:36:51Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 241076011008: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:36:51Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 241747099648: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:36:52Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 241537384448: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:36:52Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 243907166208: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:36:52Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 242829230080: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:36:52Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 242158141440: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:36:52Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 243227688960: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:36:52Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 243294797824: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:36:52Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 244167213056: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:36:57Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 249657556992: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:36:57Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 250005684224: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:36:57Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 248718032896: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:36:57Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 247971446784: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:36:57Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 247036116992: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:36:57Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 245022851072: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:36:58Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 246847373312: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:36:58Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 244762804224: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:36:58Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 249477201920: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:36:58Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 247652679680: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:36:58Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 251222032384: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:36:58Z WARN  squeezefs::meta_ship::tokens] S10 recall valve: object ino 102809 demoted to owner-served for 270.035456s — 3 grant→recall cycles inside 33.754432s (spec R5's thrash shape; grants resume after the cooldown)
+[2026-08-30T13:37:03Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 253608591360: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:37:03Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 253633757184: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:37:03Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 252895559680: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:37:03Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 255361810432: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:37:03Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 254095130624: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:37:03Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 253285629952: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:37:03Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 254099324928: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:37:03Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 254816550912: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:37:03Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 254971740160: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:37:03Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 255449890816: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:37:03Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 257328939008: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:37:03Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 256045481984: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:37:03Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 250869710848: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:37:03Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 253218521088: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:37:07Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 263100301312: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:37:08Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 259589668864: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:37:08Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 262630539264: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:37:08Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 255760269312: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:37:08Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 258444623872: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:37:08Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 259782606848: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:37:08Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 261015732224: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:37:08Z ERROR squeezefs::block_allocator] begin_free REFUSED untracked offset 254627807232: no refcount entry — double-release lineage (see block_untracked_free_refusals)
+[2026-08-30T13:37:08Z WARN  squeezefs::meta_ship::tokens] S10 recall valve: object ino 1 demoted to owner-served for 270.035456s — 3 grant→recall cycles inside 33.754432s (spec R5's thrash shape; grants resume after the cooldown)
+[2026-08-30T13:37:33Z WARN  squeezefs::meta_ship::tokens] S10 recall valve: object ino 2 demoted to owner-served for 270.035456s — 3 grant→recall cycles inside 33.754432s (spec R5's thrash shape; grants resume after the cooldown)

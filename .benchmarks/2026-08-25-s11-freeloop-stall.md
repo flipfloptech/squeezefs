@@ -1499,3 +1499,35 @@ end on this host — the repro-port mandate satisfied along the way by
 findings 37 (the capacity deadlock, cargo-pinned red-first) and the
 generic/798 adjudication; the non-FHS harness portability ladder (17
 commits) is what made the suites runnable here at all.
+
+## Findings 29 (residual) + 35c CLOSED (2026-08-31, branch fix/f29-grace-pressure-retry)
+
+**Finding 29 residual** (red `d13306b7`, fix `a50da1e4` + `24f0e527`):
+the pressure ruling's promised wait had NO performer — the write ladder
+took the first prompt StorageFull as terminal and surfaced fsync EIO
+with the fence gauges at 0 and reclaimable space in the ring. The
+bounded form (`allocate_block_grace_bounded`: park on derived slices,
+re-harvest per pass, the tightened deadline fences — release-or-evict;
+empty-ring and frozen-plane arms refuse honestly) rode all 14
+routing/fuse write-path sites + the serve-side blob mint. The first
+storm probe convicted the local-ring-only park condition (co-writer
+supply lives at the AUTHORITY behind the lane-harvest sink —
+`pressure_parks` 0 with 293 stalls); the probe now recognizes both
+shapes. Field, from-zero on the 32 GiB oversubscription storm:
+**fsync failures 269 → 0** through two 8-iteration passes. Log polish:
+the inner lane-refusal line rate-limits to 1/s (was 30k lines/row).
+
+**Finding 35c** (fix `9b58ec4d`): the re-measure (3 from-zero two-pass
+rolls at 110 GiB) read C2 = 0/1/3 pre-fix — REAL, and the corpses
+convicted the f33 funnel's blind face: the funnel fires at REMOVAL,
+but the common death of an own-mint entry is a REPLACING insert (a
+refetch lands the durable head's foreign view over it; roll 3: 69
+foreign-free skips vs 2 reclaims, 3 leaked blobs). The reclaim is now
+ONE seam (`reclaim_own_mint_blob`) fired from both faces — the funnel
+and the new insert chokepoint (`publish_layout_cache_entry`, every
+routing.rs insert routed). Post-fix from-zero: **0/0 × 3 rolls**.
+
+Residual (BOARD, de-minimis): ONE space-only C2 per extreme-storm row
+on the 32 GiB venue — likely the reclaim's free_block failing against
+the full store (the leak-safe warn arm); 4 MiB per pathological row,
+fsck C2 the standing backstop.

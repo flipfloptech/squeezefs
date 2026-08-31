@@ -1884,6 +1884,22 @@ impl BlockAllocator {
     /// sink, or an empty supply — and errors are ABSORBED into `0` (the
     /// caller's honest `StorageFull` stands; a harvest failure must never
     /// mask the diagnosis).
+    /// Finding 29: does a RECLAIMABLE supply exist that a bounded
+    /// allocation should wait for? Two shapes: the local grace ring
+    /// (the authority's own displaced offsets), and — on a co-writer —
+    /// the REMOTE lane supply behind the harvest sink (its shipped
+    /// frees land on the authority's list/ring; each bounded retry's
+    /// `allocate_block` re-runs the harvest, whose serve-side pass 3
+    /// evaluates the pressure fence at the authority). The field
+    /// re-measure convicted the local-ring-only condition: co-writer
+    /// stalls parked ZERO times while their supply sat remote.
+    fn reclaimable_supply_exists(&self) -> bool {
+        if !self.grace.is_empty() {
+            return true;
+        }
+        self.lanes.get().is_some_and(|l| l.harvest.get().is_some())
+    }
+
     async fn harvest_lane_supply(&self) -> u64 {
         let Some(lanes) = self.lanes.get() else {
             return 0;
@@ -2248,7 +2264,7 @@ impl BlockAllocator {
         let mut waited_ms: u64 = 0;
         loop {
             match self.allocate_block().await {
-                Err(e) if is_storage_full(&e) && !self.grace.is_empty() => {
+                Err(e) if is_storage_full(&e) && self.reclaimable_supply_exists() => {
                     let wall = crate::free_grace::pressure_park_wall_ms();
                     if waited_ms >= wall {
                         log::error!(

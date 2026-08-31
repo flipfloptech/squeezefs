@@ -1392,3 +1392,43 @@ Artifacts: `.benchmarks/cloud/2026-08-30-093249` (16) +
 acceptance rung (design-full-multi-writer §s11-mpiio, the free-grace-
 sustain campaign's gate) is **MET** on the real-fabric venue with
 findings 22–36 closed under it.
+
+## Release-gate suites (2026-08-30/31, binary `8e4a2cab`+harness branch): pjdfstests PASS, LTP PASS, fstests 787/788 with ONE product finding
+
+- **pjdfstests: PASS** — 238 files, 8,798 tests, all successful (179 s).
+- **LTP full syscalls: PASS** — 174 passed, 0 failed, 0 broken, 9 TCONF.
+- **fstests `-g auto` (788 tests)**: every test has run clean across the
+  fail-fast segments except (a) `generic/798`, ADJUDICATED by design
+  (write-through FUSE — no `FUSE_WRITEBACK_CACHE`, a buffered write's
+  kernel page is clean the instant write(2) returns; pinned exact shape
+  beside 003/192/213/634, joins the QUICK set), and (b) **finding 37**.
+  Twelve runner-portability commits (branch `fix/suite-runners-nixos-bash`)
+  were needed on this non-FHS host — su interpreter, PATH carriage,
+  libmount helper dir, FHS-literal rewrites, multi-call-coreutils ls
+  shim — every arm probe- or existence-gated; zero product changes.
+
+## Finding 37 (OPEN — the from-zero acceptance blocker): 9-hour AIO-DIO write wedge under the zc transport
+
+The from-zero acceptance pass wedged at `generic/208`
+(`aio-dio-invalidate-failure` — the AIO-DIO vs page-invalidation race
+soak; it PASSED in 200 s on the debugging segment: intermittent). The
+corpse (`/tmp/f37-corpse/`): 64 kernel requests waiting on connection
+75; WRITE handlers in flight 9 h 5 m (`fuse_op_watchdog` firing every
+5 s, D1.b semantics honored — no cancellation); the filesystem core
+IDLE (conveyor drained, pipeline empty, reclaim empty, park ledger
+CLOSED 259/259); **32 transport payload leases outstanding — exactly
+one queue's depth — with `transport_lease_max_age_ms: 87`** (the lease
+law's own gauge says no lease is old: the handlers never RECEIVED their
+payloads, i.e. the deliveries were lost between the ring and the
+handler dispatch, not stuck in handlers). The mount had negotiated the
+FUSE_URING_ZERO_COPY contract (`fuse3_zc_negotiated: 1`, kmbuf 1,
+extractions 46,880). Kernel side: one exiting child in
+`folio_wait_writeback` under `fuse_flush`, its sibling in `exit_aio`
+waiting a DIO that never completed. The documented supervisor abort
+(`connections/75/abort`) released everything cleanly.
+
+Rate loop running: `/tmp/f37-roll.sh` (generic/208 × 12, wedge capture
++ abort built in). NEXT: fresh-capture the zc bridge state at wedge
+(the `zc_bridge_cqe_wedge_tests` / `fuse_zc_write_fusion_tests`
+contract sets are the red venue), then red-first fix. The from-zero
+fstests acceptance pass restarts after the fix per the counted-run law.

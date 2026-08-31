@@ -5754,11 +5754,26 @@ impl DataRouter {
     /// ships and lands in the untracked→seed→Freed arm. Counted on
     /// `publish_blob_orphan_reclaims`.
     pub fn discard_layout_cache(&self, ino: u64) {
+        if let Some(m) = self.metadata_cache.get(&ino) {
+            self.reclaim_own_mint_blob(ino, &m, "cache discard");
+        }
+        self.metadata_cache.remove(&ino);
+    }
+
+    /// Finding 35c: the ONE own-mint reclaim seam — the f33 funnel's act,
+    /// callable from every site that is about to DROP an entry's mint
+    /// knowledge (the discard funnel, and any REPLACING insert whose new
+    /// entry names a different map blob — the refetch face the f35c
+    /// re-measure convicted: 69 foreign-free skips, 2 reclaims, 3 leaked
+    /// blobs on one roll, because a refetch REPLACED the own-mint entry
+    /// with the durable head's foreign view and nothing ever discarded
+    /// it). Capacity/idle eviction remains the fsck-C2 backstop.
+    fn reclaim_own_mint_blob(&self, ino: u64, m: &CachedMetadata, why: &'static str) {
         if crate::fuse_client::co_writer_mount()
             && !crate::cowriter::authority_accounting_scope_active()
             && crate::meta_ship::tokens::range_episode(ino)
         {
-            if let Some(m) = self.metadata_cache.get(&ino) {
+            {
                 if m.block_map_id_own_mint {
                     if let Some(key) = m
                         .block_map_id
@@ -5788,8 +5803,7 @@ impl DataRouter {
                             .fetch_add(1, Ordering::Relaxed);
                         log::debug!(
                             "finding 33: reclaiming the outgoing own-mint blob '{key}' of \
-                             ino {ino} at cache discard (the entry is this lifecycle's \
-                             last holder)"
+                             ino {ino} at {why} (the entry is this lifecycle's last holder)"
                         );
                         crate::meta_exec::spawn_meta("blob_orphan_reclaim", async move {
                             // f33c (attempt 14's 12 C8 drifts): the discard
@@ -5827,14 +5841,26 @@ impl DataRouter {
                 }
             }
         }
-        self.metadata_cache.remove(&ino);
+    }
+
+    /// Finding 35c: the layout-entry INSERT chokepoint — a replacing
+    /// insert whose new entry names a DIFFERENT map blob reclaims the
+    /// old entry's own mint first (same-key re-inserts and non-mint
+    /// entries pass straight through: one peek).
+    pub fn publish_layout_cache_entry(&self, ino: u64, m: CachedMetadata) {
+        if let Some(old) = self.metadata_cache.get(&ino) {
+            if old.block_map_id_own_mint && old.block_map_id != m.block_map_id {
+                self.reclaim_own_mint_blob(ino, &old, "replacing insert");
+            }
+        }
+        self.metadata_cache.insert(ino, m);
     }
 
     pub(crate) fn reset_layout_provenance(&self, ino: u64) {
         if let Some(mut m) = self.metadata_cache.get(&ino) {
             if m.layout_version != 0 {
                 m.layout_version = 0;
-                self.metadata_cache.insert(ino, m);
+                self.publish_layout_cache_entry(ino, m);
             }
         }
     }
@@ -6863,7 +6889,7 @@ impl DataRouter {
         // save minted the head's blob (the one mint site). A collapsed
         // (inline) head clears it; a kept foreign head keeps it false.
         cached.block_map_id_own_mint = new_indirect_key.is_some();
-        self.metadata_cache.insert(ino, cached);
+        self.publish_layout_cache_entry(ino, cached);
 
         if let Some(ref old_key) = old_indirect_to_free {
             let _ = self.backend_router.free_block(old_key).await;
@@ -10418,7 +10444,7 @@ impl DataRouter {
             }
         }
         if let Some(m) = self.fetch_metadata_from_backend(ino).await? {
-            self.metadata_cache.insert(ino, m.clone());
+            self.publish_layout_cache_entry(ino, m.clone());
             return Ok(m);
         }
 
@@ -10440,7 +10466,7 @@ impl DataRouter {
             layout_version: 0,
             block_map_id_own_mint: false,
         };
-        self.metadata_cache.insert(ino, m.clone());
+        self.publish_layout_cache_entry(ino, m.clone());
         Ok(m)
     }
 
@@ -10647,7 +10673,7 @@ impl DataRouter {
             updated.cached_at = std::time::Instant::now();
             self.save_metadata_to_backend(ino, &updated, fencing_token)
                 .await?;
-            self.metadata_cache.insert(ino, updated);
+            self.publish_layout_cache_entry(ino, updated);
             if let Some(prev) = displaced {
                 if prev != block_key {
                     // Re-promotion over an older durable copy: purge here
@@ -10998,7 +11024,7 @@ impl DataRouter {
             self.note_block_ref_ops(ino, ops);
         }
         let size_now = current.size;
-        self.metadata_cache.insert(ino, current);
+        self.publish_layout_cache_entry(ino, current);
         // Epoch bookkeeping.
         match epoch.shadow.entry_sync(b) {
             scc::hash_map::Entry::Occupied(mut occ) => *occ.get_mut() = new_key,
@@ -11125,7 +11151,7 @@ impl DataRouter {
                     .await
                 {
                     Ok(()) => {
-                        self.metadata_cache.insert(ino, cur);
+                        self.publish_layout_cache_entry(ino, cur);
                         Ok(())
                     }
                     Err(e) => Err(e),
@@ -12007,7 +12033,7 @@ impl DataRouter {
             Some(entry) => Some(entry),
             None => match self.fetch_metadata_from_backend(ino).await {
                 Ok(Some(m)) => {
-                    self.metadata_cache.insert(ino, m.clone());
+                    self.publish_layout_cache_entry(ino, m.clone());
                     Some(m)
                 }
                 Ok(None) | Err(_) => None,
@@ -12031,7 +12057,7 @@ impl DataRouter {
                 // fsync/release cadence like every dirty layout.
                 entry.layout_dirty = true;
                 entry.cached_at = std::time::Instant::now();
-                self.metadata_cache.insert(ino, entry);
+                self.publish_layout_cache_entry(ino, entry);
             }
         }
     }
@@ -12837,7 +12863,7 @@ impl DataRouter {
                         self.cache.write_lru.remove(file_path);
                         self.cache.read_lru.remove(file_path);
 
-                        self.metadata_cache.insert(ino, updated_meta);
+                        self.publish_layout_cache_entry(ino, updated_meta);
                         // The staged form is superseded: release its ring
                         // entry (budget) and any promoted/spilled durable
                         // copy.
@@ -12941,7 +12967,7 @@ impl DataRouter {
 
                 self.cache.write_lru.put(file_path, shared_data.clone());
                 self.cache.read_lru.put(file_path, shared_data);
-                self.metadata_cache.insert(ino, updated_meta);
+                self.publish_layout_cache_entry(ino, updated_meta);
                 // A truncated-then-rewritten staged/spilled file leaves a ring
                 // entry and/or a durable copy behind: release them.
                 self.release_superseded_staged(
@@ -13019,7 +13045,7 @@ impl DataRouter {
                         updated_meta.layout_dirty = true;
                     }
                     updated_meta.cached_at = std::time::Instant::now();
-                    self.metadata_cache.insert(ino, updated_meta);
+                    self.publish_layout_cache_entry(ino, updated_meta);
                     // Drop any stale whole-file RAM snapshot: the staging ring
                     // entry is now authoritative for this file, but a prior
                     // `read_file` (e.g. a copy_file_range source read) or an
@@ -13153,7 +13179,7 @@ impl DataRouter {
                     // DUR-8f: the layout names the block — custody
                     // transferred; from here the ordinary free paths own it.
                     minted.disarm();
-                    self.metadata_cache.insert(ino, updated_meta);
+                    self.publish_layout_cache_entry(ino, updated_meta);
                     // Release the superseded stale ring entry (returns its
                     // budget) and any older durable copy it had.
                     let deferred = self
@@ -15626,7 +15652,7 @@ impl DataRouter {
                 );
                 self.save_metadata_to_backend_refs(ino, &updated_meta, merge_token, &refs)
                     .await?;
-                self.metadata_cache.insert(ino, updated_meta);
+                self.publish_layout_cache_entry(ino, updated_meta);
                 self.cache.write_lru.remove(&file_path);
                 self.cache.read_lru.remove(&file_path);
                 // Release the superseded ring entry + any older durable copy.
@@ -16130,7 +16156,7 @@ impl DataRouter {
             }
             self.save_metadata_to_backend(ino, &meta, fencing_token)
                 .await?;
-            self.metadata_cache.insert(ino, meta);
+            self.publish_layout_cache_entry(ino, meta);
             self.cache.write_lru.remove(&file_path);
             self.cache.read_lru.remove(&file_path);
             return Ok(());
@@ -16327,7 +16353,7 @@ impl DataRouter {
             );
             self.save_metadata_to_backend_refs(ino, &updated, fencing_token, &refs)
                 .await?;
-            self.metadata_cache.insert(ino, updated);
+            self.publish_layout_cache_entry(ino, updated);
 
             // The truncated tail is gone: drop any whole-file RAM snapshot so
             // a later re-extend reads zeros instead of a stale copy.

@@ -4440,3 +4440,90 @@ async fn a_local_episode_save_composes_onto_the_durable_head() {
         v.shutdown().await.expect("clean unmount");
     }
 }
+
+/// Finding 35c (RED pre-fix: the leaked mint has no observer but fsck
+/// C2 — the re-measure read 1–3 leaked blobs per two-pass roll with 69
+/// foreign-free skips against 2 reclaims): the f33 discard funnel fires
+/// only at REMOVAL, but the common death of an own-mint entry is a
+/// REPLACING insert — a refetch lands the durable head's foreign view
+/// over it and the dying mint's only knowledge drops without reclaim.
+/// The law: every layout-cache insert that supersedes an own-mint entry
+/// with a DIFFERENT map blob reclaims the old mint first (record
+/// release then block free, the f33b order), through the same seam the
+/// funnel uses.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_replacing_insert_never_orphans_the_shippers_own_blob_mint() {
+    let _serial = serial();
+    let _restore = restore();
+    squeezefs::meta_ship::tokens::test_clear_range_cache();
+    let dir = TempDir::new().unwrap();
+    let vol = fresh_volume(dir.path(), "f35c-replace").await;
+    let dev = data_device(dir.path(), "f35c-replace.dev");
+    let auth = Authority::start(&vol, &dev, &[NODE_A]).await;
+    let ino = authority_file_with_block(&auth, "replace.bin", 0).await;
+
+    let cwr = CoWriter::join(&auth, &vol, &dev, NODE_A).await;
+    let stage = tempdir().unwrap();
+    let dlm = DlmClient::new().expect("dlm");
+    let router = save_router(&dlm, &cwr.alloc, &dev, &cwr.meta, stage.path()).await;
+    squeezefs::meta_ship::tokens::record_range_grant(ino, (0, 4 * 1024 * 1024), 9035);
+
+    // Save 1: the over-cap map MINTS this mount's own blob.
+    let mut big = std::collections::HashMap::new();
+    for i in 0..900u32 {
+        big.insert(i, format!("be://data:k{i:05}"));
+    }
+    router.metadata_cache.insert(
+        ino,
+        CachedMetadata {
+            file_type: "striped".into(),
+            size: 4 * 1024 * 1024,
+            block_map: Some(std::sync::Arc::new(big)),
+            layout_dirty: true,
+            layout_delta_chain: LAYOUT_DELTA_CHAIN_INELIGIBLE,
+            ..Default::default()
+        },
+    );
+    let tok = dlm.get_fencing_token_ino(ino);
+    router
+        .persist_dirty_layout_if_needed(&format!("inode_{ino}"), tok)
+        .await
+        .expect("the over-cap save mints and ships");
+    let entry = router.metadata_cache.get(&ino).expect("republished entry");
+    assert!(entry.block_map_id_own_mint, "fixture: the mint is OURS");
+    let minted_key = entry
+        .block_map_id
+        .as_deref()
+        .and_then(|id| id.strip_prefix("indirect:"))
+        .expect("indirect head")
+        .to_string();
+    let minted_off: u64 = minted_key.parse().expect("plain offset key in this rig");
+    let minted_idx = minted_off / cwr.alloc.chunk_size();
+
+    // The REPLACING insert: the durable head's foreign view lands over
+    // the own-mint entry (the refetch face — f35c's convicted shape).
+    let mut foreign = entry.clone();
+    foreign.block_map_id = Some("indirect:99999999".into());
+    foreign.block_map_id_own_mint = false;
+    foreign.layout_dirty = false;
+    router.publish_layout_cache_entry(ino, foreign);
+
+    // The dying mint is reclaimed: record released, block freed, offset
+    // back in the shared supply (detached — bounded poll).
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        if auth.free_listed(minted_idx) && auth.population(minted_idx).await == 0 {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the replaced own-mint blob must be reclaimed (finding 35c: \
+             a replacing insert was the funnel's blind face — 1–3 leaked \
+             blobs per two-pass roll, fsck C2 the only observer)"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    drop(cwr);
+    auth.stop().await;
+}

@@ -110,11 +110,17 @@ tasks:
           "{{.ROOT_DIR}}"/*) ;;
           *) git_mount="-v $common:$common:ro" ;;
         esac
+        # RUSTUP_HOME rides a named volume: rust-toolchain.toml pins the
+        # stable CHANNEL, so cargo's shim syncs it at run time — on the
+        # image overlay that sync dies EXDEV (overlayfs cannot rename a
+        # lower-layer dir). The volume seeds from the image on first use
+        # and persists the synced toolchain across runs.
         {{.CONTAINER_TOOL}} run --rm \
           -v "{{.ROOT_DIR}}:{{.ROOT_DIR}}:ro" \
           $git_mount \
           -v "{{.ROOT_DIR}}/dist/{{.TARGET}}:/out" \
           -v "squeezefs-cargo-registry-{{.TARGET}}:/usr/local/cargo/registry" \
+          -v "squeezefs-rustup-{{.TARGET}}:/usr/local/rustup" \
           -v "squeezefs-target-{{.TARGET}}:/build" \
           -w "{{.ROOT_DIR}}" \
           -e GLIBC_CEILING="{{.GLIBC_CEILING}}" \

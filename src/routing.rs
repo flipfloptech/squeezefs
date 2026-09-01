@@ -6724,7 +6724,47 @@ impl DataRouter {
         // crash between chunk and layout leaves only report-only fsck C8
         // residue (space-safe, data-safe) instead of unpublishable data.
         const BLOCK_REF_TX_CHUNK: usize = 512;
-        while refs.len() > BLOCK_REF_TX_CHUNK {
+        // Rung 17 (KD-MW-8): a CHAINED publish target — a foreign-home
+        // ino (the merge SHIPS) or an ino with live foreign custody on
+        // this authority — composes on the owner's chain-onto-head arm,
+        // so the RAM chain-cap full save (a private-view clobber under
+        // two publishers) stands down: the OWNER compacts the durable
+        // chain from ITS OWN folded state at the cap. One relaxed-load
+        // ladder on every solo mount. (Hoisted above the finding-38
+        // chunk loop — finding 36b needs the class verdict there.)
+        let max_chain = layout_delta_max_chain();
+        let merge_chained = crate::meta_ship::publish::merge_is_chained(backend, ino);
+        let delta_eligible = publish_entries.is_some()
+            // Vector B: drained deferred notes describe map changes outside
+            // this save's entries — they ride full-save-class commits only
+            // (see the drain comment above).
+            && !has_deferred_refs
+            && !needs_indirect
+            && max_chain > 0
+            && (m.layout_delta_chain < max_chain
+                || (merge_chained && m.layout_delta_chain != LAYOUT_DELTA_CHAIN_INELIGIBLE))
+            && !m
+                .block_map_id
+                .as_deref()
+                .is_some_and(|id| id.starts_with("indirect:"));
+        // Finding 36b (the CHUNK hole — the s11-mpiio store exhaustion):
+        // a SHIPPED full-save's claims are the owner's scoped-compose
+        // INPUT (finding 35: adoption/removal follow the claim sets), so
+        // pre-chunking them starved the compose of everything but the
+        // ≤512-op tail — the chunked indexes kept their DEAD durable
+        // bindings and their displaced blocks got no free owner (~256
+        // leaked blocks per chunked save, counted on the fleet row). A
+        // shipped full-save therefore carries its WHOLE claim set on the
+        // verb (the CONTROL frame admits ~26k ops — well past the f38
+        // corpse's 8k; an over-frame load refuses loud at encode), and
+        // the OWNER runs the journal-entry-cap chunking instead (the
+        // serve arm's twin of this loop — same tail-rides-the-commit
+        // law, same crash residue class). Local saves and delta-class
+        // shipped saves (whose recompute is entries-driven, never
+        // claims-driven) keep the f38 pre-chunk verbatim.
+        let ship_full_claims =
+            !delta_eligible && !crate::meta_ship::publish::publishes_locally(backend, ino);
+        while !ship_full_claims && refs.len() > BLOCK_REF_TX_CHUNK {
             let tail = refs.split_off(BLOCK_REF_TX_CHUNK);
             let chunk = std::mem::replace(&mut refs, tail);
             if let Err(e) = crate::meta_ship::publish::commit_block_refs(backend, ino, &chunk).await
@@ -6764,28 +6804,6 @@ impl DataRouter {
             }
         }
 
-        let max_chain = layout_delta_max_chain();
-        // Rung 17 (KD-MW-8): a CHAINED publish target — a foreign-home
-        // ino (the merge SHIPS) or an ino with live foreign custody on
-        // this authority — composes on the owner's chain-onto-head arm,
-        // so the RAM chain-cap full save (a private-view clobber under
-        // two publishers) stands down: the OWNER compacts the durable
-        // chain from ITS OWN folded state at the cap. One relaxed-load
-        // ladder on every solo mount.
-        let merge_chained = crate::meta_ship::publish::merge_is_chained(backend, ino);
-        let delta_eligible = publish_entries.is_some()
-            // Vector B: drained deferred notes describe map changes outside
-            // this save's entries — they ride full-save-class commits only
-            // (see the drain comment above).
-            && !has_deferred_refs
-            && !needs_indirect
-            && max_chain > 0
-            && (m.layout_delta_chain < max_chain
-                || (merge_chained && m.layout_delta_chain != LAYOUT_DELTA_CHAIN_INELIGIBLE))
-            && !m
-                .block_map_id
-                .as_deref()
-                .is_some_and(|id| id.starts_with("indirect:"));
         let t_commit = std::time::Instant::now();
         // Spec §6.2 item 9: the link this save will stage, if the delta
         // path engages — declared out here so the republish below can

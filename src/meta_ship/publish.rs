@@ -3491,7 +3491,7 @@ impl PublishService {
                 let was_recomputed = recomputed.is_some();
                 let mut released_data: Vec<crate::meta_backend::kv::block_refs::BlockRef> =
                     Vec::new();
-                let refs: Vec<BlockRefOp> = match recomputed {
+                let mut refs: Vec<BlockRefOp> = match recomputed {
                     Some(mut r) => {
                         released_data = r
                             .iter()
@@ -3505,6 +3505,24 @@ impl PublishService {
                     }
                     None => refs,
                 };
+                // Finding 36b (the chunk hole's OWNER half): a shipped
+                // full-save now carries its WHOLE claim set (the routing
+                // pre-chunk stands down for shipped full-saves so the
+                // scoped compose above saw every claim), so the
+                // journal-entry-cap protection (finding 38) runs HERE:
+                // over-cap ledger loads commit FIRST in refs-only
+                // transactions under the serve's per-ino stripe (no
+                // publish interleaves — SERVE_INO_LOCKS), the tail rides
+                // the layout transaction, and a crash between chunk and
+                // layout leaves only report-only fsck C8 residue
+                // (space-safe, data-safe) — f38's law verbatim, moved to
+                // the node whose journal admits the commit.
+                const SERVE_REF_TX_CHUNK: usize = 512;
+                while refs.len() > SERVE_REF_TX_CHUNK {
+                    let tail = refs.split_off(SERVE_REF_TX_CHUNK);
+                    let chunk = std::mem::replace(&mut refs, tail);
+                    self.inner.commit_block_refs(ino, &chunk).await?;
+                }
                 self.inner
                     .set_layout_and_size(ino, &layout, size, &refs)
                     .await?;

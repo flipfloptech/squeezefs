@@ -1559,3 +1559,26 @@ Cold-vs-cold field verdict on the current pair: read +3–8 % (30.1–31.6
 vs 29.3), write par, read IOPS ~2× (847–894k vs 442k), write IOPS
 +38–43 % (673–701k vs 490k). The fabric's true streaming read is
 ~29–31 GB/s; the box action is the script's mgs-ip cache-drop fix.
+
+### EXA field episode, final adjudication (2026-09-01): 41.3 GB/s repeatable cacheless reads; the "decay" was queue-depth arithmetic
+
+The box re-ran with the corrected job (size=16g, iodepth=16, 24 jobs,
+libaio, direct=1) on the CACHELESS mount: **40.4 then 41.3 GB/s on
+consecutive runs** — repeatable, climbing, above the Lustre-on-TCP
+40/40 reference on the same servers. Byte-exact engagement:
+`read_zc_serve_bytes` +1.653 TB ≡ 40 s × 41.3 GB/s — every byte rode
+the zero-copy device-true serve; fill/tier deltas ≈ 0 (no cache in the
+story). The whole decay mystery closes with Little's law: the cold
+path's per-1MiB latency is ~9 ms, so qd8×24 = 192 MiB in flight ⇒
+~21 GB/s (measured 21.7) and qd16×24 = 384 MiB ⇒ ~41 (measured 41.3);
+run-1 "44s" were warm-tier LATENCY (µs-class) inflating qd8 rows. The
+validation job was under-depthed, not the store aging.
+
+BOARD (the real product item this surfaced): the **cold-read latency
+floor** — Lustre's 40 at qd8 implies ~5 ms effective per-request
+latency vs our ~9 ms; the device-true zc read path stands speculative
+prefetch down BY DESIGN, so each O_DIRECT read pays the unhidden
+fabric round trip. Halving the floor gives 40 GB/s at qd8. Second
+look: `layout_indirect_map_reads` +960/+4 GB per 30 s run (map-blob
+refetch churn on 16 GiB files). Recommendation shipped to the fleet:
+size=16g + iodepth=16 as the standing read-BW job.

@@ -1531,3 +1531,31 @@ Residual (BOARD, de-minimis): ONE space-only C2 per extreme-storm row
 on the 32 GiB venue — likely the reclaim's free_block failing against
 the full store (the leak-safe warn arm); 4 MiB per pathological row,
 fsck C2 the standing backstop.
+
+## Field adjudication (2026-09-01, EXA client validation, memp-s3ds-aqs-37): the shim "read regression" was two instrument artifacts
+
+Report: the EXA client-perf script read 21.6 GB/s with the shim vs
+43.6 without (IOPS rows winning 2×). Triage closed BOTH deltas without
+a product change:
+
+1. **The halving was the PRE-LANE-GATE pair** deployed on the box —
+   big reads rode the ring's two-copy read path (writes par: one-copy;
+   IOPS up: the ring's own lane). The 2026-08-07 hybrid lane gate is
+   the standing fix; deploying the fresh same-commit rocky8 pair took
+   the read row to no-shim parity (44.2 vs 43.6) with the IOPS wins
+   intact. Local A-B-B-A on the loop substrate (engagement-verified:
+   `ipc_lane_gate_kernel_routes` accounts for every 1 MiB op): shim
+   45.4/49.2 vs kernel 43.7/43.5 GiB/s.
+2. **The repeat-run decay (44 → ~30, shim-independent — the no-shim
+   repeat reads 29.3) is the write-warm first-run burst**: the script's
+   EXA cache-drop step fails on this box ("can't find mgs ip"), so run
+   1 reads just-written tier-warm blocks; later runs read honest cold
+   (the scan-resistant admission governor deliberately does not re-warm
+   beyond-budget streams). Sealed by the delete+remount bracket (forced
+   re-create → 44.3; immediate repeat → 31.4) and by the local aging
+   loop (4 re-create cycles FLAT at 48–50 GiB/s — no store aging).
+
+Cold-vs-cold field verdict on the current pair: read +3–8 % (30.1–31.6
+vs 29.3), write par, read IOPS ~2× (847–894k vs 442k), write IOPS
++38–43 % (673–701k vs 490k). The fabric's true streaming read is
+~29–31 GB/s; the box action is the script's mgs-ip cache-drop fix.

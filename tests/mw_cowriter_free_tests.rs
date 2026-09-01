@@ -158,6 +158,7 @@ impl Drop for Restore {
     fn drop(&mut self) {
         fuse_client::set_mount_posture(MountPosture::Writer);
         lane::test_reset_mount_partition();
+        squeezefs::meta_backend::kv::block_refs::uninstall_block_ref_resolver();
         grant::uninstall_frontier_source();
         data_grant::uninstall_custody_client();
         data_grant::uninstall_custody_owner();
@@ -4523,6 +4524,415 @@ async fn a_replacing_insert_never_orphans_the_shippers_own_blob_mint() {
         );
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
+
+    drop(cwr);
+    auth.stop().await;
+}
+
+// ===========================================================================
+// 10. Finding 36 — the recomputed free stream: a chained merge's displaced
+//     DEVICE frees belong to the transition the AUTHORITY committed, never
+//     to the co-writer's private RAM frame
+// ===========================================================================
+//
+// The leak/refusal pair (field wedge: ~6,550 leaked blocks, a 64 GiB store
+// ENOSPC'd in ~2 minutes): a chained/composed shipped merge RECOMPUTES its
+// durable accounting against the owner's head (rung 19/20) precisely
+// because the caller's frame legitimately lags — so when the frames skew
+// (a failed publish drops the co-writer's layout cache and the refetch
+// answers a lagging head), every rewrite produces (1) a caller-frame
+// shipped free naming a block whose free ALREADY ran — refused on the
+// untracked tripwire, exactly-once preserved — and (2) a binding the
+// committed transition ACTUALLY displaced whose ledger Delete the
+// recompute staged and whose device free NO ONE issues. One leaked block
+// per skewed rewrite.
+//
+// The contract: the recompute-released DATA blocks run the AUTHORITY's own
+// free ladder strictly after commit Ok (grace ring, S7 quarantine and the
+// reclaim manners compose unchanged — the displaced-blob post-commit
+// pattern), and a publish the owner recomputed stands the co-writer's
+// caller-frame free stream DOWN (local tier/tracking hygiene only — no
+// verb, no device commands). Un-recomputed publishes (no resolver armed,
+// the free-VERB seam, solo locals) stay byte-identical.
+
+/// Production truth: `multi_writer::arm_multi_writer` installs the rung-19
+/// refs resolver (the router's `block_ref_for`) on every armed authority —
+/// the serve-side recompute is structurally inert without it, so the tests
+/// that exercise it mirror the arm (the fixture-truth discipline; `Restore`
+/// uninstalls).
+fn install_authority_refs_resolver(br: &Arc<BackendRouter>) {
+    let br = Arc::clone(br);
+    squeezefs::meta_backend::kv::block_refs::install_block_ref_resolver(Arc::new(
+        move |k: &str, ino: u64, idx: u32| br.block_ref_for(k, ino, idx),
+    ));
+}
+
+/// A durable inline striped head `{0: key}` for `ino`, its durable
+/// data-block reference riding the same publish — the state an
+/// authority-written striped file's first publish leaves behind.
+async fn durable_inline_head(auth: &Authority, ino: u64, key: &str, idx: u64, size: u64) {
+    let head = bincode::serialize(&squeezefs::layout_wire::LayoutMetadata {
+        file_type: "striped".into(),
+        size,
+        block_map_id: None,
+        block_prefix: None,
+        file_id: None,
+        data_key: None,
+        block_map: Some([(0u32, key.to_string())].into_iter().collect()),
+    })
+    .expect("head bytes");
+    auth.meta
+        .set_layout_and_size(
+            ino,
+            &head,
+            size,
+            &[BlockRefOp::taken(BlockRef {
+                vol_tag: volume_tag(DATA_VOL),
+                block_idx: idx,
+                owner_ino: ino,
+                block_index: 0,
+            })],
+        )
+        .await
+        .expect("the durable head commits");
+}
+
+/// A dirty striped RAM entry `{0: key}` — the co-writer's private frame
+/// (the dirty-authority rule makes it the merge conveyor's RMW base), in
+/// the delta-eligible shape (inline provenance, chain 0).
+fn dirty_inline_entry(size: u64, key: &str) -> CachedMetadata {
+    let mut map = std::collections::HashMap::new();
+    map.insert(0u32, key.to_string());
+    CachedMetadata {
+        file_type: "striped".into(),
+        size,
+        block_map: Some(std::sync::Arc::new(map)),
+        layout_dirty: true,
+        layout_delta_chain: 0,
+        ..Default::default()
+    }
+}
+
+const F36_SIZE: u64 = 4 * 1024 * 1024;
+
+/// Contract (finding 36, both halves): a co-writer rewrite whose frame
+/// SKEWED from the durable head — the lagging-refetch shape — leaks
+/// nothing and refuses nothing. The authority frees the block its own
+/// recompute released (the transition it actually committed), and the
+/// co-writer's caller-frame free stream stands down instead of shipping a
+/// free whose block was already freed (the double-release refusal).
+///
+/// RED against dev: after the skewed publish, the actually-displaced
+/// block's device free runs NOWHERE (its offset never re-enters the free
+/// supply — one leaked block per skewed rewrite), and the caller-frame
+/// free comes back `Refused` on `block_untracked_free_refusals`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_skewed_frame_rewrite_frees_the_recompute_released_block_on_the_authority() {
+    let _serial = serial();
+    let _restore = restore();
+    squeezefs::meta_ship::tokens::test_clear_range_cache();
+    let dir = TempDir::new().unwrap();
+    let vol = fresh_volume(dir.path(), "f36-skew").await;
+    let dev = data_device(dir.path(), "f36-skew.dev");
+    let auth = Authority::start(&vol, &dev, &[NODE_A]).await;
+    install_authority_refs_resolver(&auth.br);
+
+    // The durable truth: ino's block 0 → X (authority-minted, RAM-tracked,
+    // durably referenced by the inline head).
+    let x_off = auth.alloc.allocate_block().await.expect("mint X");
+    let x_idx = x_off / auth.alloc.chunk_size();
+    auth.alloc.publish_block(x_off);
+    let ino = auth
+        .meta
+        .create_with_rdev_size(1, "f36-skew.bin", 0o100644, 0, 0, 0, 0)
+        .await
+        .expect("create")
+        .ino;
+    durable_inline_head(&auth, ino, &x_off.to_string(), x_idx, F36_SIZE).await;
+
+    let cwr = CoWriter::join(&auth, &vol, &dev, NODE_A).await;
+    let stage = tempdir().unwrap();
+    let dlm = DlmClient::new().expect("dlm");
+    let router = save_router(&dlm, &cwr.alloc, &dev, &cwr.meta, stage.path()).await;
+
+    let untracked_before = METRICS
+        .block_untracked_free_refusals
+        .load(Ordering::Relaxed);
+    let live_before = METRICS.block_live_free_refusals.load(Ordering::Relaxed);
+    let double_before = METRICS.block_double_frees.load(Ordering::Relaxed);
+
+    // --- Publish 1 (un-skewed): the frame matches the durable head. ---
+    let n1_off = cwr.alloc.allocate_block().await.expect("mint N1");
+    let n1_idx = n1_off / cwr.alloc.chunk_size();
+    cwr.alloc.publish_block(n1_off);
+    router
+        .metadata_cache
+        .insert(ino, dirty_inline_entry(F36_SIZE, &x_off.to_string()));
+    let token = dlm.get_fencing_token_ino(ino);
+    let displaced1 = router
+        .merge_block_mappings_coalesced(
+            ino,
+            vec![(0u32, n1_off.to_string())],
+            0,
+            squeezefs::routing::LayoutFlip::KeepLayout,
+            token,
+        )
+        .await
+        .expect("publish 1 lands");
+    // Production's free site: every returned displaced key is handed to
+    // the free path (the co-writer arm ships it as a verb).
+    for k in &displaced1 {
+        let _ = router.backend_router.free_block(k).await;
+    }
+    auth.br.reclaim_drain().await;
+    assert!(
+        auth.free_listed(x_idx),
+        "the un-skewed displaced block re-enters the free supply on the authority"
+    );
+    assert_eq!(
+        auth.population(x_idx).await,
+        0,
+        "X's durable reference was released by publish 1"
+    );
+    assert_eq!(
+        METRICS
+            .block_untracked_free_refusals
+            .load(Ordering::Relaxed),
+        untracked_before,
+        "the un-skewed publish produces no untracked-free refusal"
+    );
+
+    // --- Publish 2 (SKEWED): the frame believes block 0 STILL holds X ---
+    // (the lagging-refetch shape: a failed publish dropped the layout
+    // cache and the refetch answered a lagging head). The transition the
+    // authority actually commits displaces N1.
+    let n2_off = cwr.alloc.allocate_block().await.expect("mint N2");
+    let n2_idx = n2_off / cwr.alloc.chunk_size();
+    cwr.alloc.publish_block(n2_off);
+    router
+        .metadata_cache
+        .insert(ino, dirty_inline_entry(F36_SIZE, &x_off.to_string()));
+    let token = dlm.get_fencing_token_ino(ino);
+    let displaced2 = router
+        .merge_block_mappings_coalesced(
+            ino,
+            vec![(0u32, n2_off.to_string())],
+            0,
+            squeezefs::routing::LayoutFlip::KeepLayout,
+            token,
+        )
+        .await
+        .expect("publish 2 lands (the skewed frame is a legal caller state)");
+    for k in &displaced2 {
+        let _ = router.backend_router.free_block(k).await;
+    }
+    auth.br.reclaim_drain().await;
+
+    assert_eq!(
+        auth.population(n1_idx).await,
+        0,
+        "the recompute's ledger Delete rode the publish — N1 is durably unreferenced"
+    );
+    assert_eq!(
+        auth.population(n2_idx).await,
+        1,
+        "the committed transition took N2"
+    );
+    assert!(
+        auth.free_listed(n1_idx),
+        "finding 36: the block the committed transition ACTUALLY displaced (N1) must run \
+         the AUTHORITY's free ladder — on dev its ledger Delete is staged by the recompute \
+         and its device free is issued by NO ONE (one leaked block per skewed rewrite)"
+    );
+    assert_eq!(
+        METRICS
+            .block_untracked_free_refusals
+            .load(Ordering::Relaxed),
+        untracked_before,
+        "finding 36: the caller-frame free of an already-freed block never ships — the \
+         double-release refusal storm ('the authority refused N shipped frees') stays silent"
+    );
+    assert_eq!(
+        METRICS.block_live_free_refusals.load(Ordering::Relaxed),
+        live_before,
+        "no live-free refusal fires on either publish"
+    );
+    assert_eq!(
+        METRICS.block_double_frees.load(Ordering::Relaxed),
+        double_before,
+        "no double free anywhere in the pair"
+    );
+
+    drop(cwr);
+    auth.stop().await;
+}
+
+/// Contract (finding 36's preservation half): a chained shipped merge the
+/// owner did NOT recompute — no rung-19 resolver armed — keeps the
+/// caller-frame free stream verbatim: the displaced keys come back to the
+/// caller, their frees SHIP as verbs, and nothing is refused or
+/// double-freed. Pinned green so the suppression can never widen past the
+/// publishes whose accounting the owner actually owns.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_unrecomputed_chained_merge_keeps_the_callers_free_stream() {
+    let _serial = serial();
+    let _restore = restore();
+    squeezefs::meta_ship::tokens::test_clear_range_cache();
+    let dir = TempDir::new().unwrap();
+    let vol = fresh_volume(dir.path(), "f36-verbatim").await;
+    let dev = data_device(dir.path(), "f36-verbatim.dev");
+    let auth = Authority::start(&vol, &dev, &[NODE_A]).await;
+    // Deliberately NO block_ref_resolver: the recompute declines and the
+    // caller's ops stand (the pre-rung-19 shape, byte-identical).
+
+    let x_off = auth.alloc.allocate_block().await.expect("mint X");
+    let x_idx = x_off / auth.alloc.chunk_size();
+    auth.alloc.publish_block(x_off);
+    let ino = auth
+        .meta
+        .create_with_rdev_size(1, "f36-verbatim.bin", 0o100644, 0, 0, 0, 0)
+        .await
+        .expect("create")
+        .ino;
+    durable_inline_head(&auth, ino, &x_off.to_string(), x_idx, F36_SIZE).await;
+
+    let cwr = CoWriter::join(&auth, &vol, &dev, NODE_A).await;
+    let stage = tempdir().unwrap();
+    let dlm = DlmClient::new().expect("dlm");
+    let router = save_router(&dlm, &cwr.alloc, &dev, &cwr.meta, stage.path()).await;
+
+    let untracked_before = METRICS
+        .block_untracked_free_refusals
+        .load(Ordering::Relaxed);
+    let double_before = METRICS.block_double_frees.load(Ordering::Relaxed);
+    let shipped_before = publish::stats().free_shipped_blocks;
+
+    let n_off = cwr.alloc.allocate_block().await.expect("mint N");
+    cwr.alloc.publish_block(n_off);
+    router
+        .metadata_cache
+        .insert(ino, dirty_inline_entry(F36_SIZE, &x_off.to_string()));
+    let token = dlm.get_fencing_token_ino(ino);
+    let displaced = router
+        .merge_block_mappings_coalesced(
+            ino,
+            vec![(0u32, n_off.to_string())],
+            0,
+            squeezefs::routing::LayoutFlip::KeepLayout,
+            token,
+        )
+        .await
+        .expect("the un-recomputed publish lands");
+    assert_eq!(
+        displaced,
+        vec![x_off.to_string()],
+        "an un-recomputed publish hands its displaced keys back to the caller verbatim"
+    );
+    for k in &displaced {
+        router
+            .backend_router
+            .free_block(k)
+            .await
+            .expect("the caller-frame free ships");
+    }
+    auth.br.reclaim_drain().await;
+
+    assert!(
+        auth.free_listed(x_idx),
+        "the displaced offset re-entered the free supply through the shipped verb"
+    );
+    assert_eq!(
+        publish::stats().free_shipped_blocks - shipped_before,
+        1,
+        "the free travelled as a verb — the caller-frame stream stayed authoritative"
+    );
+    assert_eq!(
+        METRICS
+            .block_untracked_free_refusals
+            .load(Ordering::Relaxed),
+        untracked_before,
+        "no refusal"
+    );
+    assert_eq!(
+        METRICS.block_double_frees.load(Ordering::Relaxed),
+        double_before,
+        "no double free"
+    );
+
+    drop(cwr);
+    auth.stop().await;
+}
+
+/// Contract (finding 36, the error half): a shipped merge that FAILS to
+/// commit frees nothing on either side — the recompute-released set dies
+/// with the refused commit, and the co-writer's never-lossy refill keeps
+/// custody of the accounting.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_failed_shipped_merge_frees_nothing_on_either_side() {
+    let _serial = serial();
+    let _restore = restore();
+    squeezefs::meta_ship::tokens::test_clear_range_cache();
+    let dir = TempDir::new().unwrap();
+    let vol = fresh_volume(dir.path(), "f36-err").await;
+    let dev = data_device(dir.path(), "f36-err.dev");
+    let auth = Authority::start(&vol, &dev, &[NODE_A]).await;
+    install_authority_refs_resolver(&auth.br);
+
+    // A LIVE lifetime the failed publish must not touch: X is tracked and
+    // durably referenced by a real file.
+    let x_off = auth.alloc.allocate_block().await.expect("mint X");
+    let x_idx = x_off / auth.alloc.chunk_size();
+    let ino_live = authority_file_with_block(&auth, "f36-live.bin", x_idx).await;
+    assert_eq!(auth.population(x_idx).await, 1, "fixture: X is live (ino {ino_live})");
+
+    let cwr = CoWriter::join(&auth, &vol, &dev, NODE_A).await;
+    let stage = tempdir().unwrap();
+    let dlm = DlmClient::new().expect("dlm");
+    let router = save_router(&dlm, &cwr.alloc, &dev, &cwr.meta, stage.path()).await;
+
+    let queued_before = METRICS.block_free_reclaim_queued.load(Ordering::Relaxed);
+
+    // A publish for an ino that does not exist: the owner's commit refuses
+    // (NotFound) with nothing staged. The frame's displaced belief names
+    // the LIVE block X.
+    let bogus_ino = 0x00F3_6000_0000_0001u64;
+    let n_off = cwr.alloc.allocate_block().await.expect("mint N");
+    cwr.alloc.publish_block(n_off);
+    router
+        .metadata_cache
+        .insert(bogus_ino, dirty_inline_entry(F36_SIZE, &x_off.to_string()));
+    let token = dlm.get_fencing_token_ino(bogus_ino);
+    router
+        .merge_block_mappings_coalesced(
+            bogus_ino,
+            vec![(0u32, n_off.to_string())],
+            0,
+            squeezefs::routing::LayoutFlip::KeepLayout,
+            token,
+        )
+        .await
+        .expect_err("a publish for a nonexistent ino refuses");
+    auth.br.reclaim_drain().await;
+
+    assert_eq!(
+        auth.population(x_idx).await,
+        1,
+        "the live block's durable reference is untouched by the failed publish"
+    );
+    assert_eq!(
+        auth.alloc.refcount(x_off),
+        Some(1),
+        "the live block's RAM tracking is untouched"
+    );
+    assert!(
+        !auth.free_listed(x_idx),
+        "commit Err frees NOTHING — X never enters the free supply"
+    );
+    assert_eq!(
+        METRICS.block_free_reclaim_queued.load(Ordering::Relaxed),
+        queued_before,
+        "no reclaim was queued anywhere for the failed publish"
+    );
 
     drop(cwr);
     auth.stop().await;

@@ -1,7 +1,9 @@
 # Design: PB-class file support — the `TREE_BLOCK_MAP` KV tree (finding 42)
 
-**Status: DRAFT Rev 0** (design phase 2026-09-01; drafted by the f42 planning
-pass, unreviewed — run the design review loop before the first PR). The
+**Status: DRAFT Rev 1** (design phase 2026-09-01; Rev 0 drafted by the f42
+planning pass; Rev 1 folds the adversarial review's amendments — §6 — whose
+three critical findings supersede the corresponding Rev 0 clauses. Do not
+start the PR ladder before §6's A1–A5 are reflected in PR 1/2 scopes). The
 implementation is the `feat/kvmap-*` PR ladder in §4.
 
 ## 0. Problem
@@ -83,23 +85,61 @@ atomicity / rung-19-20 compose / fsck / blast radius):
 
 ## 3. Mechanics
 
-- **Crossing** (once per ino, idempotent): chunked record Puts
-  (`SQUEEZEFS_MAP_MIGRATE_CHUNK`, default = the finding-38
-  `BLOCK_REF_TX_CHUNK = 512` law) under the caller's held 3.5 section; one
-  final tx flips the head to `kvmap:1` + tail chunk + this publish's
-  BlockRefOps. A crash mid-migration leaves invisible re-Puttable residue
-  (reads still follow the old head); fsck C11 reports it.
-- **Publish**: map-entry Puts (+ range Deletes on truncate) staged into the
-  SAME KvTx as the head Put and the BlockRefOps — one conveyor pass = one
-  journal entry. A 64-block window ≈ 4 KiB of journal vs today's 4 MiB
-  blob DMA + barrier + full save. The Vector-B deferred-notes complication
-  simplifies: a kvmap save persists exactly what it carries.
+- **Crossing** (once per ino, idempotent): a **residue-sweep prologue**
+  (Rev 1, A1 — chunked range-Delete of `[ino‖0, ino‖u32::MAX]` before the
+  first Put: a crashed prior crossing's residue would otherwise resurrect
+  as stale mappings after a truncate-shrink-recross-extend sequence —
+  silent wrong data; on a healthy ino the sweep is one empty leaf
+  descent), then chunked record Puts (`SQUEEZEFS_MAP_MIGRATE_CHUNK`,
+  default = the finding-38 `BLOCK_REF_TX_CHUNK = 512` law, registry max
+  ≤ 1,024 so a mis-set knob cannot poison the entry cap), then one final
+  tx flipping the head to `kvmap:1` + tail chunk + this publish's
+  BlockRefOps. **The whole train (sweep → chunks → flip) holds the ino's
+  exclusive 4a** (Rev 1, A3/A4 — the 3.5 section covers local publishes
+  only; 4a is what fsck's re-check and the served compose arms serialize
+  against). A co-writer-custodied ino's crossing SHIPS: the map travels as
+  a RETRIED-class idempotent verb with the FreeBlocks dedup-window
+  pattern, executed by the authority under the same held-4a train. A
+  crash mid-migration leaves invisible residue the next crossing's sweep
+  deletes; fsck C11 reports it (report-only — see §Mechanics/fsck).
+- **Publish**: map-entry Puts staged into the SAME KvTx as the head Put
+  and the BlockRefOps — one conveyor pass = one journal entry. A 64-block
+  window ≈ 4 KiB of journal vs today's 4 MiB blob DMA + barrier + full
+  save. The Vector-B deferred-notes complication simplifies: a kvmap save
+  persists exactly what it carries.
+- **Truncate/unlink** (Rev 1, supersedes Rev 0's same-tx range Deletes —
+  impossible at scale: a 1 PiB truncate is 2²⁸ Deletes ≈ five orders past
+  the whole-entry cap, and today's `truncate_layout` would materialize the
+  removed set in RAM): **size-flip-first + background sweep**. The SETATTR
+  tx commits only the new size plus a durable per-ino sweep cursor in the
+  head sentinel (`kvmap:1;sweep:K`); reads clamp to size, so shadowed
+  records are immediately unreadable. A job-fabric sweep then walks the
+  ino's range in chunks — each tx = map Deletes + their ref releases
+  (§6.2's law preserved per chunk) + reclaim enqueues — crash-resumable
+  from the cursor, throttled. Unlink/`delete_file` ride the same sweep.
+  fsck treats a head with an open sweep cursor as exempt-in-range.
 - **Read**: dirty overlay first, then `get_block_mapping(ino, index)` — a
-  point lookup with run-floor fallback. Warm = node-cache bset search;
-  cold = one leaf read amortizing ~8 k neighboring entries. RAM bounded by
-  the node-cache budget; optional per-ino window as R5 component
-  `block_map_window` (floor 0). Co-writers resolve via a shipped
-  `GetBlockMapRange` verb (the `XattrValueCap` pattern; schema bump).
+  point lookup with run-floor fallback. Rev 1 (A6): the tree has no
+  floor/predecessor primitive, so runs are bounded (`RUN_LEN_MAX = 4096`)
+  and the floor is one bounded forward `range([ino‖N−RUN_LEN_MAX, ino‖N])`
+  take-last with an owner-ino prefix check; the coalescer's run-Put and
+  point-Deletes ride ONE tx. Rev 1 (A9): head+record resolution brackets
+  with the reader revalidation seqlock (retry on epoch change) and the
+  `CachedMetadata`-head-vs-live-record skew rule is stated in PR 3. Warm
+  = node-cache bset search; cold = one leaf read amortizing ~8 k
+  neighboring entries. Rev 1 (A7): tree-7 leaf loads enter the node-cache
+  clock on PROBATION (no second-chance until a second touch) so a giant
+  streaming file cannot evict an unrelated workload's inode/dentry nodes;
+  PR 3 carries the interference bench row. RAM bounded by the node-cache
+  budget; optional per-ino window as R5 component `block_map_window`
+  (floor 0). Co-writers resolve via a shipped `GetBlockMapRange` verb
+  (the `XattrValueCap` pattern; schema bump) — Rev 1 (A8): replies carry
+  the leaf-span (~8 k entries) around the miss, and the co-writer's map
+  cache states its staleness law: own-custody ranges are authoritative
+  from its own overlay; foreign ranges are the S5 reader-staleness class,
+  SAFE by construction under the free-grace ring (a stale mapping
+  resolves to a freed-but-not-reallocated block until the free-epoch
+  ack), invalidated on free-epoch acks.
 - **Rung-19/20 compose**: shipped entries become record Puts under the
   owner's conveyor — same-key ordering is the KV layer's existing law. The
   blob-compose apparatus (memos, `IndirectBlobGuard`, displaced-blob
@@ -107,10 +147,15 @@ atomicity / rung-19-20 compose / fsck / blast radius):
 - **fsck / walkers**: ONE shared extraction arm (`kvmap:` heads scan the
   tree) used by C2/C8, `verify_durable_block_refs` (both oracle sides
   through the same path — the C8 law), the mount recovery walk, backfill,
-  defrag, jobs. New class **C11 — map-plane consistency** (C9/C10
-  precedent): orphan map records (crossing residue / dead ino),
-  run-vs-point coverage sanity; report-only + quarantine repair, zero-FP
-  via the era floor + settle ladder.
+  defrag, jobs. New class **C11 — map-plane consistency**: orphan map
+  records (crossing residue / dead ino), run-vs-point coverage sanity.
+  **Rev 1 (A3): C9's era floor is structurally inapplicable here** (a map
+  record's ino may be years old while its crossing is live on THIS mount
+  — C10's own reasoning); zero-FP instead rides the crossing's held 4a +
+  an in-flight crossing registry (the C2/C3 `inflight_exempted` pattern:
+  an incomplete pass records no verdict for a registered ino). **C11
+  ships REPORT-ONLY** (the C8 posture) until both shields are pinned —
+  a false-positive quarantine here would hole a live crossing.
 
 ## 4. PR ladder (each independently gateable, tests-first)
 
@@ -139,10 +184,12 @@ PR 5 is where the residual fold-law care lives.
 
 - Crossing: unchanged (~60 KiB inline ≈ 6–8 GiB at 4 MiB blocks); zero
   cost below it (pinned byte-identical).
-- Ceiling: `min(2³² × block_size, u64)` = **16 EiB at 4 MiB blocks** (was
-  ~545 GiB). Practical bound = meta capacity: ~8 GiB of map leaves +
-  ~13 GiB of ref leaves per 1 PiB file at 4 MiB blocks; runs collapse the
-  map side ~len× for sequential data.
+- Ceiling: `(2³² − 1) × block_size` = **16 PiB at 4 MiB blocks** (was
+  ~545 GiB; index `u32::MAX` is reserved by the refs MAP_BLOB sentinel,
+  and the bound is enforced as an explicit EFBIG refusal — §6 A5).
+  Practical bound = meta capacity: ~8 GiB of map leaves + ~13 GiB of ref
+  leaves per 1 PiB file at 4 MiB blocks; runs collapse the map side
+  ~len× for sequential data.
 - Gauges: `block_map_tree_{records,puts,deletes,run_puts,leaf_reads,lookup_overlay_hits,lookup_tree_hits}`,
   `map_migrate_{inos,records,resumed}`, `publish_map_record_bytes`
   (`publish_indirect_blob_bytes` / `layout_indirect_map_reads` must trend
@@ -150,3 +197,21 @@ PR 5 is where the residual fold-law care lives.
   `fsck_map_orphan_records`, `meta_ship_publish.map_{shipped,served,refused}`.
 - Knobs (ENG-10 registry): `SQUEEZEFS_MAP_MIGRATE_CHUNK` (derived, floor
   64), `SQUEEZEFS_KVMAP=0` (A/B measurement lever), `SQUEEZEFS_MAP_WINDOW_{MB,PCT}`.
+
+## 6. Rev 1 — adversarial review amendments (2026-09-01)
+
+The review's verdict on Rev 0 was NEEDS-REVISION; every amendment below is
+folded into §§2–5 and binds the PR ladder:
+
+| # | Severity | Amendment (now normative) |
+|---|----------|---------------------------|
+| A1 | CRITICAL | Crossing prologue = chunked residue range-Delete of the ino's whole index range (kills the truncate-shrink-recross-extend stale-mapping resurrection — silent wrong data) |
+| A2 | CRITICAL | Truncate/unlink = size-flip-first + durable sweep cursor in the head + background job-fabric sweep; never same-tx range Deletes (2²⁸ Deletes ≈ 5 orders past the entry cap) |
+| A3 | CRITICAL | C11: era floor inapplicable (C10's reasoning); crossing holds 4a across the whole train; in-flight crossing registry exemption; REPORT-ONLY until both are pinned |
+| A4 | HIGH | Served/co-writer crossing: whole-map ships as a RETRIED-class idempotent verb (dedup window); owner executes under held 4a; the 3.5 claim is local-publish-only |
+| A5 | HIGH | Explicit EFBIG at `(2³² − 1) × block_size` (u32::MAX reserved by the refs sentinel); ceiling corrected to 16 PiB at 4 MiB blocks |
+| A6 | MEDIUM | `RUN_LEN_MAX = 4096` + floor-by-bounded-forward-scan (no floor primitive exists); owner-ino prefix check; run-Put + point-Deletes one-tx coalesce law |
+| A7 | MEDIUM | Tree-7 leaves enter the node-cache clock on probation; PR 3 carries the unrelated-workload interference bench row |
+| A8 | MEDIUM | `GetBlockMapRange` leaf-span replies + co-writer map cache with the free-grace-bounded staleness law, invalidated on free-epoch acks |
+| A9 | MEDIUM | Reader-side head+record resolution seqlock-bracketed; head-cache skew rule stated |
+| A10 | LOW | `SQUEEZEFS_MAP_MIGRATE_CHUNK` registry max ≤ 1,024; `SQUEEZEFS_KVMAP=0` governs new crossings only (kvmap-head resolution can never be disabled) |

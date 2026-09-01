@@ -894,3 +894,167 @@ async fn test_compact_overflow_signals_split() {
     .expect("split absorbs the oversized fold");
     assert_eq!(lw.record_count + rw.record_count, 15 + 8);
 }
+
+// ---------------------------------------------------------------------------
+// Finding 41 — split same-key cohesion (spec §6.2 item 9 across SMOs).
+// ---------------------------------------------------------------------------
+
+/// Build an inline-layout full `Put` on `key` (the chain's base segment).
+fn f41_layout_put(key: &[u8], seq: u64, map: &[(u32, &str)]) -> Record {
+    let layout = squeezefs::layout_wire::LayoutMetadata {
+        file_type: "striped".into(),
+        size: 4096,
+        block_map_id: None,
+        block_prefix: Some("be://data".into()),
+        file_id: None,
+        data_key: None,
+        block_map: Some(map.iter().map(|(b, k)| (*b, k.to_string())).collect()),
+    };
+    let value = squeezefs::meta_backend::kv::record::XattrValue::encode_parts(
+        b"layout",
+        &bincode::serialize(&layout).expect("layout encodes"),
+    )
+    .expect("xattr value encodes");
+    Record::put(key.to_vec(), seq, value)
+}
+
+/// Build a versioned layout-delta link on `key` (`versions` = (base, ver)).
+fn f41_layout_link(key: &[u8], seq: u64, entries: &[(u32, &str)], versions: (u64, u64)) -> Record {
+    let mut d = squeezefs::layout_wire::LayoutDelta::from_final_state(
+        "striped",
+        4096,
+        None,
+        Some("be://data"),
+        None,
+        None,
+        entries
+            .iter()
+            .map(|(b, k)| (*b, k.to_string()))
+            .collect::<Vec<_>>(),
+    );
+    d.set_versions(versions.0, versions.1);
+    Record {
+        key: key.to_vec(),
+        seq,
+        kind: RecordKind::Delta,
+        value: d.encode(),
+    }
+}
+
+/// Finding 41 (the EXA 8-GiB-crossing corruption, 2026-09-01): a node split
+/// cuts at a pure byte-balanced record boundary with NO same-key cohesion.
+/// `compact_fold`'s lineage rule emits TWO records for a versioned layout
+/// chain — the folded base `Put` plus the retained newest link (restamped
+/// to claim 0) — and a cut BETWEEN them strands the link in the right
+/// sibling BELOW its own `min_key` (= successor(left.max = key)): the link
+/// is unroutable forever, the left side folds to a bare `Put`, and the next
+/// gate-legal link (claiming the retained version) lands above that bare
+/// base — "link seq N names base version 0xV but folds onto 0x0", the exact
+/// field corpse, refused by every subsequent fold of the key FOREVER (the
+/// checkpoint tick fails, the journal never truncates, writes stall).
+///
+/// The law: a split's cut may only land on a KEY boundary — every record of
+/// one key lands on ONE side, and each written side's records lie within
+/// its own [min_key, max_key] bounds.
+#[tokio::test]
+async fn split_never_cuts_a_same_key_group() {
+    let vol = fresh_volume();
+    let l = layout();
+    let n = DEFAULT_NODE_SIZE as u64;
+
+    // Key layout engineered so the byte-balanced cut lands INSIDE key B's
+    // fold group: A is small, B's folded Put is large (a near-crossing
+    // inline layout — the field shape), B's retained link and C are small.
+    // fold order: [A.put, B.put, B.link] — cumulative bytes cross half the
+    // total exactly after B.put, so the un-cohesive cut separates B.put
+    // from B.link.
+    let key_a = b"xattr-layout-a".to_vec();
+    let key_b = b"xattr-layout-b".to_vec();
+    let big_map: Vec<(u32, String)> = (0..1200u32)
+        .map(|i| (i, format!("be://data/block-{i:08}")))
+        .collect();
+    let big_map_refs: Vec<(u32, &str)> = big_map.iter().map(|(b, k)| (*b, k.as_str())).collect();
+
+    let records = vec![
+        f41_layout_put(&key_a, 1, &[(0, "be://data:a")]),
+        f41_layout_put(&key_b, 2, &big_map_refs),
+        // The chain's newest record is a VERSIONED link: compact_fold's
+        // lineage rule retains it (restamped claim 0) above the folded Put.
+        f41_layout_link(&key_b, 3, &[(1200, "be://data:tail")], (0, 0x51)),
+    ];
+    let written = write_node(vol.path(), &l, &params(0, 1, b"", b"\xff"), &records, 3)
+        .await
+        .expect("source node");
+    let _ = written;
+
+    let src = load_node(vol.path(), &l, 0, 0).await.expect("load src");
+    let (lw, rw) = split_node(
+        vol.path(),
+        &l,
+        &src,
+        &[],
+        &SplitDest {
+            node_addr: n,
+            node_seq: 2,
+        },
+        &SplitDest {
+            node_addr: 2 * n,
+            node_seq: 3,
+        },
+        0,
+    )
+    .await
+    .expect("split");
+    assert!(
+        lw.record_count >= 1 && rw.record_count >= 1,
+        "both sides live"
+    );
+
+    // THE CONTRACT: every record of every side lies within that side's own
+    // key bounds — no stranded records, no same-key group cut in two.
+    for (addr, side) in [(n, "left"), (2 * n, "right")] {
+        let node = load_node(vol.path(), &l, addr, 0).await.expect("load side");
+        let (min, max) = (node.header().min_key.clone(), node.header().max_key.clone());
+        for bi in 0..node.bset_count() {
+            let b = node.bset(bi).expect("bset");
+            for ri in 0..b.len() {
+                let k = b.record(ri).key;
+                assert!(
+                    k >= &min[..] && k <= &max[..],
+                    "{side}: record key {:02x?} outside its node bounds \
+                     [{:02x?}, {:02x?}] — a same-key fold group was cut in \
+                     two (finding 41: the stranded retained link)",
+                    k,
+                    min,
+                    max
+                );
+            }
+        }
+    }
+
+    // The lineage survives the split whole: B's folded Put AND its retained
+    // link live on ONE side, so a later gate-legal link (claiming the
+    // retained version 0x51) still folds clean.
+    let side_of_b = if load_node(vol.path(), &l, n, 0)
+        .await
+        .expect("left")
+        .lookup(&key_b)
+        .ok()
+        .and_then(|f| f.live_value().map(|_| ()))
+        .is_some()
+    {
+        n
+    } else {
+        2 * n
+    };
+    let node_b = load_node(vol.path(), &l, side_of_b, 0)
+        .await
+        .expect("b side");
+    match node_b
+        .lookup(&key_b)
+        .expect("B folds clean after the split")
+    {
+        Folded::Put { .. } => {}
+        other => panic!("B must fold to a live value, got {other:?}"),
+    }
+}

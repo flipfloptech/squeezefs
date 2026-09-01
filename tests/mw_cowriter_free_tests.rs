@@ -5426,3 +5426,138 @@ async fn an_over_chunk_claim_set_reaches_the_scoped_compose_whole() {
     drop(cwr);
     auth.stop().await;
 }
+
+/// Contract (finding 36b, the AUTHORITY-LOCAL arm — the fleet's steady
+/// residual): the authority's OWN layout publishes on a custody ino (the
+/// extent-assembly folds, its rung-17 local chained merges, the f35b
+/// episode composes) displace blocks a CO-WRITER minted — blocks the
+/// authority's allocator never tracked. The local free ladder refuses
+/// them unseeded (`begin_free REFUSED untracked` — the fleet's steady
+/// refusal stream outside the verb path) and the block leaks. The same
+/// two-halved law applies: the local publisher's recompute owns the
+/// released set (the executor ladder seeds-and-frees the untracked-but-
+/// durably-released), and the frame-derived caller stream stands down.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_authority_local_publish_frees_a_co_writer_minted_displaced_block() {
+    let _serial = serial();
+    let _restore = restore();
+    squeezefs::meta_ship::tokens::test_clear_range_cache();
+    let dir = TempDir::new().unwrap();
+    let vol = fresh_volume(dir.path(), "f36b-local").await;
+    let dev = data_device(dir.path(), "f36b-local.dev");
+    let auth = Authority::start(&vol, &dev, &[NODE_A]).await;
+    install_authority_refs_resolver(&auth.br);
+    let bs = auth.alloc.chunk_size();
+    let fsz = 4 * bs;
+    auth.owner
+        .install_range_geometry(data_grant::fixed_range_geometry(fsz, bs));
+
+    // Durable truth: block 0 → X (authority mint).
+    let x_off = auth.alloc.allocate_block().await.expect("mint X");
+    auth.alloc.publish_block(x_off);
+    let ino = auth
+        .meta
+        .create_with_rdev_size(1, "f36b-local.bin", 0o100644, 0, 0, 0, 0)
+        .await
+        .expect("create")
+        .ino;
+    durable_inline_head(&auth, ino, &x_off.to_string(), x_off / bs, fsz).await;
+
+    // A co-writer takes range custody and rewrites block 0 to ITS mint N1
+    // (the shipped scoped Put — the recomputed publish frees X).
+    let cwr = CoWriter::join(&auth, &vol, &dev, NODE_A).await;
+    let _rg = cwr
+        .client
+        .acquire_range(ino, (0, bs), (0, bs), Duration::from_secs(2))
+        .await
+        .expect("block-0 range custody");
+    let stage = tempdir().unwrap();
+    let dlm = DlmClient::new().expect("dlm");
+    let router = save_router(&dlm, &cwr.alloc, &dev, &cwr.meta, stage.path()).await;
+    let n1_off = cwr.alloc.allocate_block().await.expect("mint N1 (co-writer lane)");
+    let n1_idx = n1_off / bs;
+    cwr.alloc.publish_block(n1_off);
+    let mut e = dirty_inline_entry(fsz, &x_off.to_string());
+    e.layout_delta_chain = LAYOUT_DELTA_CHAIN_INELIGIBLE;
+    router.metadata_cache.insert(ino, e);
+    let token = dlm.get_fencing_token_ino(ino);
+    router
+        .merge_block_mappings_coalesced(
+            ino,
+            vec![(0u32, n1_off.to_string())],
+            0,
+            squeezefs::routing::LayoutFlip::KeepLayout,
+            token,
+        )
+        .await
+        .expect("the co-writer's scoped Put lands");
+    assert_eq!(
+        auth.population(n1_idx).await,
+        1,
+        "fixture: the co-writer's mint is the durable binding"
+    );
+
+    // The AUTHORITY's OWN publish on the custody ino (the assembly-fold /
+    // episode-compose shape): its local save displaces the CO-WRITER's
+    // mint N1 — a block its allocator never tracked. The process-global
+    // ownership map is the CO-WRITER's all-foreign one (this file's
+    // one-process caveat); the authority's own saves route LOCALLY in
+    // production, so the arm stands down here.
+    ship::disarm_ownership();
+    let auth_stage = tempdir().unwrap();
+    let auth_dlm = DlmClient::new().expect("dlm");
+    fuse_client::set_mount_posture(MountPosture::Writer);
+    let auth_router = save_router(&auth_dlm, &auth.alloc, &dev, &auth.meta, auth_stage.path()).await;
+    let untracked_before = METRICS
+        .block_untracked_free_refusals
+        .load(Ordering::Relaxed);
+    let recomputed_before = publish::stats().free_recomputed_blocks;
+    let a1_off = auth.alloc.allocate_block().await.expect("authority mint A1");
+    auth.alloc.publish_block(a1_off);
+    let mut e = dirty_inline_entry(fsz, &n1_off.to_string());
+    e.layout_delta_chain = LAYOUT_DELTA_CHAIN_INELIGIBLE;
+    auth_router.metadata_cache.insert(ino, e);
+    let token = auth_dlm.get_fencing_token_ino(ino);
+    let displaced = auth_router
+        .merge_block_mappings_coalesced(
+            ino,
+            vec![(0u32, a1_off.to_string())],
+            0,
+            squeezefs::routing::LayoutFlip::KeepLayout,
+            token,
+        )
+        .await
+        .expect("the authority's local publish lands");
+    for k in &displaced {
+        let _ = auth_router.backend_router.free_block(k).await;
+    }
+    auth.br.reclaim_drain().await;
+    auth_router.backend_router.reclaim_drain().await;
+
+    assert_eq!(
+        auth.population(n1_idx).await,
+        0,
+        "the local compose's ledger Delete rode the publish"
+    );
+    assert!(
+        auth.free_listed(n1_idx),
+        "finding 36b (the local arm): the co-writer-minted displaced block must run the \
+         authority's SHIPPED-free-class ladder (seed + free) — the local caller-frame free \
+         refuses it unseeded and it leaks (the fleet's steady begin_free-REFUSED stream)"
+    );
+    assert_eq!(
+        METRICS
+            .block_untracked_free_refusals
+            .load(Ordering::Relaxed),
+        untracked_before,
+        "no unseeded refusal — the recomputed release owns the free"
+    );
+    assert!(
+        publish::stats().free_recomputed_blocks > recomputed_before,
+        "the engagement gauge accounts the local recompute's release"
+    );
+
+    squeezefs::meta_ship::tokens::test_clear_range_cache();
+    drop(cwr);
+    auth.stop().await;
+}

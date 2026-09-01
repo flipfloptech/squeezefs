@@ -5277,7 +5277,15 @@ async fn an_over_chunk_claim_set_reaches_the_scoped_compose_whole() {
         .install_range_geometry(data_grant::fixed_range_geometry(fsz, bs));
 
     // The durable truth: 300 authority-minted bindings, durably
-    // referenced by the inline head.
+    // referenced by the inline head. Two burner inos first: the fixture's
+    // custody clocks are MANUAL, so sibling tests' ranged grants on low
+    // ino numbers never expire — this test's ranged ino must be its own.
+    for n in ["f36b-chunk-burner-a", "f36b-chunk-burner-b"] {
+        auth.meta
+            .create_with_rdev_size(1, n, 0o100644, 0, 0, 0, 0)
+            .await
+            .expect("burner create");
+    }
     let ino = auth
         .meta
         .create_with_rdev_size(1, "f36b-chunk.bin", 0o100644, 0, 0, 0, 0)
@@ -5455,6 +5463,16 @@ async fn an_authority_local_publish_frees_a_co_writer_minted_displaced_block() {
     // Durable truth: block 0 → X (authority mint).
     let x_off = auth.alloc.allocate_block().await.expect("mint X");
     auth.alloc.publish_block(x_off);
+    // Burner ino: the fixture's custody clocks are MANUAL (grants never
+    // expire in fixture time), so a real ranged grant on a low ino
+    // number outlives its test — every range-acquiring test in this file
+    // must own a distinct ino number.
+    let _burner = auth
+        .meta
+        .create_with_rdev_size(1, "f36b-local-burner", 0o100644, 0, 0, 0, 0)
+        .await
+        .expect("burner create")
+        .ino;
     let ino = auth
         .meta
         .create_with_rdev_size(1, "f36b-local.bin", 0o100644, 0, 0, 0, 0)
@@ -5531,20 +5549,30 @@ async fn an_authority_local_publish_frees_a_co_writer_minted_displaced_block() {
     for k in &displaced {
         let _ = auth_router.backend_router.free_block(k).await;
     }
-    auth.br.reclaim_drain().await;
-    auth_router.backend_router.reclaim_drain().await;
-
     assert_eq!(
         auth.population(n1_idx).await,
         0,
         "the local compose's ledger Delete rode the publish"
     );
-    assert!(
-        auth.free_listed(n1_idx),
-        "finding 36b (the local arm): the co-writer-minted displaced block must run the \
-         authority's SHIPPED-free-class ladder (seed + free) — the local caller-frame free \
-         refuses it unseeded and it leaks (the fleet's steady begin_free-REFUSED stream)"
-    );
+    // The released-set free runs DETACHED on the publish conveyor pass,
+    // strictly after the 3.5 guard drops (RES-1) — bounded poll (the
+    // f35c pattern).
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        auth.br.reclaim_drain().await;
+        auth_router.backend_router.reclaim_drain().await;
+        if auth.free_listed(n1_idx) {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "finding 36b (the local arm): the co-writer-minted displaced block must run the \
+             authority's SHIPPED-free-class ladder (seed + free) — the local caller-frame \
+             free refuses it unseeded and it leaks (the fleet's steady begin_free-REFUSED \
+             stream)"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
     assert_eq!(
         METRICS
             .block_untracked_free_refusals

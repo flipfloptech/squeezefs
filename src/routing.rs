@@ -5881,9 +5881,13 @@ impl DataRouter {
         m: &CachedMetadata,
         fencing_token: u64,
     ) -> Result<()> {
+        // The verdict pair is DROPPED here on purpose: this wrapper's
+        // callers publish shapes whose local arms never recompute (a
+        // recomputed save's released set only mints on the merge/episode
+        // arms, which return through `_ext`'s consumers).
         self.save_metadata_to_backend_ext(ino, m, fencing_token, None, &[])
             .await
-            .map(|_owner_recomputed| ())
+            .map(|_verdict| ())
     }
 
     /// [`Self::save_metadata_to_backend`] carrying the transaction's
@@ -6166,7 +6170,7 @@ impl DataRouter {
         m: &CachedMetadata,
         fencing_token: u64,
         block_refs: &[crate::meta_backend::kv::block_refs::BlockRefOp],
-    ) -> Result<bool> {
+    ) -> Result<(bool, Vec<crate::meta_backend::kv::block_refs::BlockRef>)> {
         self.save_metadata_to_backend_ext(ino, m, fencing_token, None, block_refs)
             .await
     }
@@ -6187,7 +6191,7 @@ impl DataRouter {
         fencing_token: u64,
         publish_entries: Option<&[(u32, String)]>,
         block_refs: &[crate::meta_backend::kv::block_refs::BlockRefOp],
-    ) -> Result<bool> {
+    ) -> Result<(bool, Vec<crate::meta_backend::kv::block_refs::BlockRef>)> {
         // Finding 35b (the aged-file strand cluster's second half): the
         // AUTHORITY's local save of a RANGE-EPISODE ino persists a whole
         // map computed from a RAM snapshot taken under (3.5) — but served
@@ -6222,10 +6226,21 @@ impl DataRouter {
             if let Some((composed, swap_refs)) =
                 self.compose_episode_save(ino, m, block_refs).await?
             {
+                // Finding 36b (the authority-local arm): the episode
+                // compose's swap diff IS a local recompute — its released
+                // data blocks (a co-writer's mints included, which the
+                // local ladder cannot free unseeded) travel up for the
+                // post-guard shipped-free ladder, and the caller's
+                // frame-derived stream stands down.
+                let released: Vec<crate::meta_backend::kv::block_refs::BlockRef> = swap_refs
+                    .iter()
+                    .filter(|o| !o.take && !o.reference.is_map_blob())
+                    .map(|o| o.reference)
+                    .collect();
                 // publish_entries = None: the composed map is full-save
                 // class BY LAW (the swap diff is exact against the whole
                 // head; a delta would re-stage the caller's claim list).
-                return crate::meta_ship::publish::with_serve_window_held(
+                let (_, body_released) = crate::meta_ship::publish::with_serve_window_held(
                     self.save_metadata_to_backend_body(
                         ino,
                         &composed,
@@ -6234,7 +6249,10 @@ impl DataRouter {
                         &swap_refs,
                     ),
                 )
-                .await;
+                .await?;
+                debug_assert!(body_released.is_empty(), "the episode body never recomputes");
+                let _ = self.inner.publish_recomputed.insert_sync(ino, ());
+                return Ok((true, released));
             }
             // No durable head yet (the establishing save): the snapshot
             // IS the truth — the body runs verbatim, stripe still held.
@@ -6375,10 +6393,14 @@ impl DataRouter {
         Ok(Some((map, blob_key, layout.size)))
     }
 
-    /// Returns the finding-36 owner-recompute verdict: `true` ⇔ the
-    /// publish was a shipped merge whose accounting the OWNER recomputed —
-    /// the owner ran the displaced-block device frees itself, so the
-    /// caller's frame-derived displaced frees must stand down.
+    /// Returns the finding-36 verdict pair: `.0` = the publish's staged
+    /// accounting was RECOMPUTED (a shipped merge/Put the owner recomputed,
+    /// or — finding 36b — a LOCAL recomputed arm), so the caller's
+    /// frame-derived displaced frees must stand down; `.1` = a LOCAL
+    /// recompute's RELEASED data blocks, which the save's post-guard venue
+    /// must run through the shipped-free ladder (RES-1: never freed under
+    /// the caller's 3.5 stripe). Empty on every shipped arm — the owner
+    /// freed its own.
     async fn save_metadata_to_backend_body(
         &self,
         ino: u64,
@@ -6386,7 +6408,7 @@ impl DataRouter {
         fencing_token: u64,
         publish_entries: Option<&[(u32, String)]>,
         block_refs: &[crate::meta_backend::kv::block_refs::BlockRefOp],
-    ) -> Result<bool> {
+    ) -> Result<(bool, Vec<crate::meta_backend::kv::block_refs::BlockRef>)> {
         let backend = self.inner.meta_backend.get().ok_or_else(|| {
             SqueezefsError::InvalidOperation("Metadata backend not initialized".to_string())
         })?;
@@ -6809,12 +6831,15 @@ impl DataRouter {
         // path engages — declared out here so the republish below can
         // stamp the RAM provenance to exactly what was persisted.
         let mut minted_version = 0u64;
-        // Finding 36: whether the owner RECOMPUTED this publish's staged
-        // accounting (a shipped chained/composed merge, or — finding 36b —
-        // the custody-scoped Put) — surfaced to the displaced-free sites
-        // so the caller-frame stream stands down. Assigned on every Ok
-        // path of both publish classes below.
+        // Finding 36: whether this publish's staged accounting was
+        // RECOMPUTED (a shipped chained/composed merge, the custody-scoped
+        // Put, or a local recomputed arm) — surfaced to the displaced-free
+        // sites so the caller-frame stream stands down. Assigned on every
+        // Ok path of both publish classes below.
         let owner_recomputed;
+        // Finding 36b: a LOCAL recompute's released set (empty on shipped
+        // arms — the owner freed its own).
+        let mut local_released: Vec<crate::meta_backend::kv::block_refs::BlockRef> = Vec::new();
         let delta_used = if delta_eligible {
             let mut delta = crate::layout_wire::LayoutDelta::from_final_state(
                 &layout.file_type,
@@ -6853,11 +6878,13 @@ impl DataRouter {
             )
             .await
             {
-                Ok((used, staged_version, recomputed)) => {
-                    // Finding 36: the OWNER recomputed this publish's
-                    // accounting and owns its displaced device frees —
-                    // the caller's frame-derived stream stands down.
+                Ok((used, staged_version, recomputed, released)) => {
+                    // Finding 36: this publish's accounting was
+                    // RECOMPUTED — the caller's frame-derived stream
+                    // stands down; a LOCAL recompute's released set
+                    // travels up for the post-guard free (finding 36b).
                     owner_recomputed = recomputed;
+                    local_released = released;
                     // Rung 17: on a CHAINED target the OWNER re-minted the
                     // staged link — the reply's version is the provenance
                     // the next delta must claim (chain-without-refetch);
@@ -6980,7 +7007,7 @@ impl DataRouter {
         } else {
             let _ = self.inner.publish_recomputed.remove_sync(&ino);
         }
-        Ok(owner_recomputed)
+        Ok((owner_recomputed, local_released))
     }
 
     pub fn new(
@@ -11233,34 +11260,39 @@ impl DataRouter {
         // dirty arm, the ino's latched last-save verdict on the clean arm
         // (the covering save ran earlier under this same lock discipline
         // and this close never saw its return).
-        let save_res: Result<bool> = match current {
-            Some(mut cur) if cur.layout_dirty => {
-                cur.layout_dirty = false;
-                cur.cached_at = std::time::Instant::now();
-                match self
-                    .save_metadata_to_backend_ext(ino, &cur, fencing_token, None, &[])
-                    .await
-                {
-                    Ok(recomputed) => {
-                        self.publish_layout_cache_entry(ino, cur);
-                        Ok(recomputed)
+        let save_res: Result<(bool, Vec<crate::meta_backend::kv::block_refs::BlockRef>)> =
+            match current {
+                Some(mut cur) if cur.layout_dirty => {
+                    cur.layout_dirty = false;
+                    cur.cached_at = std::time::Instant::now();
+                    match self
+                        .save_metadata_to_backend_ext(ino, &cur, fencing_token, None, &[])
+                        .await
+                    {
+                        Ok(verdict) => {
+                            self.publish_layout_cache_entry(ino, cur);
+                            Ok(verdict)
+                        }
+                        Err(e) => Err(e),
                     }
-                    Err(e) => Err(e),
                 }
-            }
-            // Clean entry (an intermediate save — a flush-leg merge or a
-            // staged persist — already covered every recorded binding:
-            // saves persist the current-at-save RAM map under this same
-            // lock) or a vanished layout (destroyed ino): the frees below
-            // are legal by the §5.2 law.
-            _ => Ok(self
-                .inner
-                .publish_recomputed
-                .read_sync(&ino, |_, _| ())
-                .is_some()),
-        };
+                // Clean entry (an intermediate save — a flush-leg merge
+                // or a staged persist — already covered every recorded
+                // binding: saves persist the current-at-save RAM map
+                // under this same lock; a covering LOCAL recompute freed
+                // its released set at its own venue) or a vanished layout
+                // (destroyed ino): the frees below are legal by the §5.2
+                // law.
+                _ => Ok((
+                    self.inner
+                        .publish_recomputed
+                        .read_sync(&ino, |_, _| ())
+                        .is_some(),
+                    Vec::new(),
+                )),
+            };
         match save_res {
-            Ok(owner_recomputed) => {
+            Ok((owner_recomputed, local_released)) => {
                 // Frees strictly AFTER the durable save (§5.2) — and
                 // RES-1: after the level-3.5 guard too. This loop is the
                 // worst park amplifier in the tree (one displaced key per
@@ -11281,9 +11313,16 @@ impl DataRouter {
                     Ordering::Relaxed,
                 );
                 drop(map_guard);
+                // Finding 36b: a LOCAL recompute's released set runs the
+                // shipped-free ladder post-guard (RES-1), post-commit
+                // (§5.2).
+                if !local_released.is_empty() {
+                    crate::meta_ship::publish::free_recomputed_releases(ino, local_released)
+                        .await;
+                }
                 // Finding 36 (half 2, the epoch face): a covering publish
-                // the OWNER recomputed owns these device frees — local
-                // hygiene only, never a shipped frame-derived free.
+                // whose accounting was recomputed owns these device frees
+                // — local hygiene only, never a frame-derived free.
                 if owner_recomputed {
                     crate::cowriter::retire_displaced_locally(&self.backend_router, &deferred);
                 } else {
@@ -11688,11 +11727,17 @@ impl DataRouter {
         // would hold `overlay_open` nonzero mount-wide.
         drop(_map_guard);
         self.overlay_schedule_retires(ino, overlay_touched);
-        // Finding 36 (half 2, the serialized lever leg): a publish the
-        // OWNER recomputed owns its displaced device frees — the
-        // caller-frame keys get their local hygiene and are handed back
-        // to NO ONE (the conveyor pass's law, verbatim).
-        if save_res? {
+        // Finding 36 (half 2, the serialized lever leg): a RECOMPUTED
+        // publish owns its displaced device frees — the caller-frame keys
+        // get their local hygiene and are handed back to NO ONE (the
+        // conveyor pass's law, verbatim); a LOCAL recompute's released
+        // set runs the shipped-free ladder HERE, strictly after the 3.5
+        // guard dropped (RES-1) and strictly after the commit (§5.2).
+        let (owner_recomputed, local_released) = save_res?;
+        if !local_released.is_empty() {
+            crate::meta_ship::publish::free_recomputed_releases(ino, local_released).await;
+        }
+        if owner_recomputed {
             crate::cowriter::retire_displaced_locally(&self.backend_router, &displaced);
             return Ok(Some(Vec::new()));
         }
@@ -12096,6 +12141,7 @@ impl DataRouter {
         METRICS
             .layout_publish_batches
             .fetch_add(1, Ordering::Relaxed);
+        let mut local_released: Vec<crate::meta_backend::kv::block_refs::BlockRef> = Vec::new();
         match self
             .save_metadata_to_backend_ext(
                 ino,
@@ -12106,7 +12152,8 @@ impl DataRouter {
             )
             .await
         {
-            Ok(owner_recomputed) => {
+            Ok((owner_recomputed, released)) => {
+                local_released = released;
                 for o in applied {
                     publish_phase_record(PublishPhase::Total, o.enqueued_at);
                     // Finding 36 (half 2): a publish the OWNER recomputed
@@ -12141,6 +12188,12 @@ impl DataRouter {
         // §5.7's retire venue (post-3.5): see merge_block_mappings_marked.
         drop(_map_guard);
         self.overlay_schedule_retires(ino, overlay_touched);
+        // Finding 36b: a LOCAL recompute's released set runs the
+        // shipped-free ladder strictly after the 3.5 guard dropped
+        // (RES-1) and strictly after the commit (§5.2).
+        if !local_released.is_empty() {
+            crate::meta_ship::publish::free_recomputed_releases(ino, local_released).await;
+        }
     }
 
     /// Bump the RAM metadata entry's size floor (write handler's

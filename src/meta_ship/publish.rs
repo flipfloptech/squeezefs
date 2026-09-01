@@ -1586,11 +1586,13 @@ pub async fn set_layout_and_size(
 /// version (0 on a full-Put commit), which the caller stamps into the RAM
 /// provenance so the next delta claims the right base (rung 17's
 /// chain-without-refetch law; on the un-chained local arm the version is
-/// the delta's own), plus the finding-36 verdict: `true` ⇔ the OWNER
-/// recomputed the staged accounting and ran the displaced-block device
-/// frees through its own ladder, so the caller's frame-derived displaced
-/// frees must stand down for this publish. Both local arms answer `false`
-/// (the local caller's own free path stays authoritative there).
+/// the delta's own), plus the finding-36 verdict: `true` ⇔ the publish's
+/// accounting was RECOMPUTED, so the caller's frame-derived displaced
+/// frees must stand down. The fourth element is the LOCAL chained arm's
+/// released set (finding 36b): the shipped arm's owner freed its own, so
+/// it travels back empty; a local recompute's releases must run the
+/// shipped-free ladder at the save's post-guard venue (RES-1: never
+/// inline — the caller may hold the 3.5 stripe).
 pub async fn merge_layout_and_size(
     be: &Arc<RoutedMetaBackend>,
     ino: Ino,
@@ -1598,7 +1600,7 @@ pub async fn merge_layout_and_size(
     full_layout: bytes::Bytes,
     size: u64,
     refs: Vec<BlockRefOp>,
-) -> Result<(bool, u64, bool)> {
+) -> Result<(bool, u64, bool, Vec<BlockRef>)> {
     match owner_of(be, ino)? {
         None => {
             note_local();
@@ -1617,20 +1619,25 @@ pub async fn merge_layout_and_size(
                 .unwrap_or(false);
             let _serve_window = local_publish_guard(ino).await;
             if granted {
-                // Finding 36: the LOCAL chained arm keeps the caller's
-                // own free path authoritative (the recompute verdict is
-                // dropped) — the frame-vs-head skew this arm can carry is
-                // the authority's own, freed through its local ladder as
-                // before.
-                let (used, version) = be
-                    .merge_layout_and_size_chained(ino, delta, full_layout, size, refs)
+                // Finding 36b (the AUTHORITY-LOCAL arm): the local
+                // chained merge's recompute owns its released set too —
+                // a displaced block a CO-WRITER minted is untracked on
+                // this allocator, so the caller-frame local free refuses
+                // it unseeded and it leaks (the fleet's steady refusal
+                // stream). The released set travels UP (never freed
+                // inline — the caller may hold the 3.5 stripe, RES-1)
+                // and the save's post-guard venue runs the shipped-free
+                // ladder over it.
+                let (used, version, released) = be
+                    .merge_layout_and_size_chained_accounted(ino, delta, full_layout, size, refs)
                     .await?;
-                Ok((used, version, false))
+                let recomputed = released.is_some();
+                Ok((used, version, recomputed, released.unwrap_or_default()))
             } else {
                 let used = be
                     .merge_layout_and_size(ino, delta, full_layout, size, refs)
                     .await?;
-                Ok((used, if used { delta.version } else { 0 }, false))
+                Ok((used, if used { delta.version } else { 0 }, false, Vec::new()))
             }
         }
         Some(peer) => {
@@ -1645,11 +1652,13 @@ pub async fn merge_layout_and_size(
                 request_id: crate::cowriter::next_ship_request_id(),
             };
             match ship_witnessed(&peer, call).await? {
+                // The OWNER freed its recompute's releases (finding 36):
+                // nothing travels back for the caller to free.
                 PublishReply::DeltaUsed {
                     used,
                     version,
                     recomputed,
-                } => Ok((used, version, recomputed)),
+                } => Ok((used, version, recomputed, Vec::new())),
                 other => Err(protocol_error(
                     "merge_layout_and_size",
                     &format!("{other:?}"),
@@ -2247,7 +2256,7 @@ pub(crate) fn note_free_ship_failure(blocks: u64) {
 /// A missing executor or a failed ladder is LEAK-SAFE and loud: the
 /// offsets are durably unreferenced (the commit already released them) and
 /// the authority's next derivation returns them.
-async fn free_recomputed_releases(ino: u64, released: Vec<BlockRef>) {
+pub(crate) async fn free_recomputed_releases(ino: u64, released: Vec<BlockRef>) {
     // Dedup on the durable identity: one transition can release the same
     // device block at two map indexes — its free runs once.
     let mut seen: std::collections::HashSet<(u64, u64)> = std::collections::HashSet::new();

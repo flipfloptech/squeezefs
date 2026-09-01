@@ -1901,3 +1901,78 @@ async fn a_prior_eras_unforgotten_corpse_is_reclaimed_at_mount() {
     assert!(rig.drift().await.is_empty());
     rig.shutdown().await;
 }
+
+// ---------------------------------------------------------------------------
+// 11. Finding 38: a ref load beyond one journal entry's admission still
+//     publishes (chunked), and the accumulator can never poison
+// ---------------------------------------------------------------------------
+
+/// Finding 38 (RED pre-fix: the merge fails `EntryTooLarge` — the field
+/// corpse's exact class): a rewrite storm's writeback backpressure
+/// accumulated ~8k deferred ledger ops on one ino; the next save drained
+/// them into ONE transaction whose journal entry (~370 KB) exceeds the
+/// 128 KiB whole-entry cap — refused terminally, every failure refilled
+/// the accumulator (the permanent poison), and the unmount drain lost
+/// the block on a cacheless mount ("Dismount durable upload failed").
+/// The law: the save commits the overflow in preceding refs-only
+/// transactions under its held meta lock and keeps only a bounded tail
+/// on the layout transaction — every binding of THIS publish still
+/// carries its accounting (§6.2), the ledger converges to the full
+/// population, and no ref load is ever unpublishable.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_overcap_ref_load_publishes_chunked_and_converges() {
+    let meta = NamedTempFile::new().unwrap();
+    let data = NamedTempFile::new().unwrap();
+    format_meta_stamped(meta.path()).await;
+    // File-backed venue: pre-size the data file so blob reads at high
+    // offsets never short (a real block device always returns full
+    // blocks; the sparse temp file is the rig's artifact).
+    data.as_file()
+        .set_len(2048 * 4 * 1024 * 1024 + 4 * 1024 * 1024)
+        .expect("pre-size data file");
+    let rig = mount(meta.path(), data.path()).await;
+    let ino = rig.mk_file("overcap.bin").await;
+
+    // ONE merge carrying 4,096 bindings — its take set alone encodes
+    // ~190 KB of journal records, beyond any single entry's admission.
+    // (The rig's volume caps at 2,048 blocks: each block binds at TWO
+    // indices — the clone shape, refcount 2 — so 4,096 takes.)
+    // 2,000 blocks (48 left free for the indirect-map blob mint the
+    // spilled save needs) x 2 indices = 4,000 takes (~184 KB encoded).
+    const N: u32 = 4000;
+    let mut entries: Vec<(u32, String)> = Vec::with_capacity(N as usize);
+    for i in 0..N / 2 {
+        let off = rig.alloc.allocate_block().await.expect("allocate");
+        rig.alloc.publish_block(off);
+        entries.push((i, off.to_string()));
+        entries.push((i + N / 2, off.to_string()));
+    }
+    rig.router
+        .merge_block_mappings(
+            ino,
+            BlockMapOp::Merge(&entries),
+            N as u64 * 4 * 1024 * 1024,
+            LayoutFlip::ToStripedKeepStagedIdentity,
+            rig.token(ino),
+        )
+        .await
+        .expect(
+            "an over-cap ref load must publish (finding 38: chunked refs-only \
+             transactions ahead of the layout commit — never EntryTooLarge)",
+        );
+
+    // Convergence: every binding's take is durable (the derived answer
+    // equals the ledger — zero drift), and nothing stayed pending.
+    let durable = rig.durable().await;
+    assert!(
+        durable.len() >= N as usize,
+        "all {N} takes are durable (got {})",
+        durable.len()
+    );
+    let drift = rig.drift().await;
+    assert!(
+        drift.is_empty(),
+        "the chunked publish leaves ZERO ledger drift, got {drift:?}"
+    );
+    rig.shutdown().await;
+}

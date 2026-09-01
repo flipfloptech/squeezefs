@@ -5873,6 +5873,7 @@ impl DataRouter {
     ) -> Result<()> {
         self.save_metadata_to_backend_ext(ino, m, fencing_token, None, &[])
             .await
+            .map(|_owner_recomputed| ())
     }
 
     /// [`Self::save_metadata_to_backend`] carrying the transaction's
@@ -6158,6 +6159,7 @@ impl DataRouter {
     ) -> Result<()> {
         self.save_metadata_to_backend_ext(ino, m, fencing_token, None, block_refs)
             .await
+            .map(|_owner_recomputed| ())
     }
 
     /// [`Self::save_metadata_to_backend`] with the write-commit-economy
@@ -6176,7 +6178,7 @@ impl DataRouter {
         fencing_token: u64,
         publish_entries: Option<&[(u32, String)]>,
         block_refs: &[crate::meta_backend::kv::block_refs::BlockRefOp],
-    ) -> Result<()> {
+    ) -> Result<bool> {
         // Finding 35b (the aged-file strand cluster's second half): the
         // AUTHORITY's local save of a RANGE-EPISODE ino persists a whole
         // map computed from a RAM snapshot taken under (3.5) — but served
@@ -6364,6 +6366,10 @@ impl DataRouter {
         Ok(Some((map, blob_key, layout.size)))
     }
 
+    /// Returns the finding-36 owner-recompute verdict: `true` ⇔ the
+    /// publish was a shipped merge whose accounting the OWNER recomputed —
+    /// the owner ran the displaced-block device frees itself, so the
+    /// caller's frame-derived displaced frees must stand down.
     async fn save_metadata_to_backend_body(
         &self,
         ino: u64,
@@ -6371,7 +6377,7 @@ impl DataRouter {
         fencing_token: u64,
         publish_entries: Option<&[(u32, String)]>,
         block_refs: &[crate::meta_backend::kv::block_refs::BlockRefOp],
-    ) -> Result<()> {
+    ) -> Result<bool> {
         let backend = self.inner.meta_backend.get().ok_or_else(|| {
             SqueezefsError::InvalidOperation("Metadata backend not initialized".to_string())
         })?;
@@ -6776,6 +6782,10 @@ impl DataRouter {
         // path engages — declared out here so the republish below can
         // stamp the RAM provenance to exactly what was persisted.
         let mut minted_version = 0u64;
+        // Finding 36: whether the owner RECOMPUTED this publish's staged
+        // accounting (shipped chained/composed merges only) — surfaced to
+        // the displaced-free sites so the caller-frame stream stands down.
+        let mut owner_recomputed = false;
         let delta_used = if delta_eligible {
             let mut delta = crate::layout_wire::LayoutDelta::from_final_state(
                 &layout.file_type,
@@ -6814,7 +6824,11 @@ impl DataRouter {
             )
             .await
             {
-                Ok((used, staged_version)) => {
+                Ok((used, staged_version, recomputed)) => {
+                    // Finding 36: the OWNER recomputed this publish's
+                    // accounting and owns its displaced device frees —
+                    // the caller's frame-derived stream stands down.
+                    owner_recomputed = recomputed;
                     // Rung 17: on a CHAINED target the OWNER re-minted the
                     // staged link — the reply's version is the provenance
                     // the next delta must claim (chain-without-refetch);
@@ -6922,7 +6936,7 @@ impl DataRouter {
             let _ = self.backend_router.free_block(old_key).await;
         }
 
-        Ok(())
+        Ok(owner_recomputed)
     }
 
     pub fn new(
@@ -12024,10 +12038,29 @@ impl DataRouter {
             )
             .await
         {
-            Ok(()) => {
+            Ok(owner_recomputed) => {
                 for o in applied {
                     publish_phase_record(PublishPhase::Total, o.enqueued_at);
-                    let _ = o.done.send(Ok(o.payload));
+                    // Finding 36 (half 2): a publish the OWNER recomputed
+                    // owns its displaced DEVICE frees (the recompute-
+                    // released set ran the authority's ladder strictly
+                    // after commit). The caller-frame keys — a private
+                    // view that may name blocks whose free already ran —
+                    // get their local hygiene here and are handed back to
+                    // NO ONE: shipping them is the refusal/leak pair the
+                    // finding named. Un-recomputed publishes (solo
+                    // mounts, no resolver armed) keep the caller stream
+                    // verbatim.
+                    let payload = if owner_recomputed {
+                        crate::cowriter::retire_displaced_locally(
+                            &self.backend_router,
+                            &o.payload,
+                        );
+                        Vec::new()
+                    } else {
+                        o.payload
+                    };
+                    let _ = o.done.send(Ok(payload));
                 }
             }
             Err(e) => {

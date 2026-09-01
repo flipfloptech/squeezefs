@@ -5214,12 +5214,31 @@ struct QueuedLayoutMerge {
     /// an ino with live foreign custody — both structurally unreachable
     /// on a solo mount (`false` keeps the shipped semantics verbatim).
     chain: bool,
-    /// The submitter's result channel: `(use_delta, staged_version)` —
-    /// the staged link's version (0 on a full-Put/unversioned commit),
-    /// which is what lets a co-writer chain without a refetch (the
-    /// design-mw-layout-versions §6 residual this rung pays).
-    done: squeezefs_ipc::sqz_channel::oneshot::Sender<crate::error::Result<(bool, u64)>>,
+    /// The submitter's result channel: `(use_delta, staged_version,
+    /// recompute verdict)` — the staged link's version (0 on a
+    /// full-Put/unversioned commit), which is what lets a co-writer chain
+    /// without a refetch (the design-mw-layout-versions §6 residual this
+    /// rung pays), plus the finding-36 owner-recompute verdict (see
+    /// [`RecomputedReleases`]).
+    done: squeezefs_ipc::sqz_channel::oneshot::Sender<crate::error::Result<MergeOutcome>>,
 }
+
+/// Finding 36 — a chained/composed merge's owner-recompute verdict,
+/// returned beside `(use_delta, staged_version)`. `None` = the caller's
+/// accounting frame stood (the solo/un-recomputed shape: its own displaced
+/// frees stay authoritative). `Some(released)` = the staged accounting was
+/// RECOMPUTED against this authority's own head (rung 19/20), and
+/// `released` names every DATA-block reference the committed transition
+/// dropped (map-blob custody stays on the displaced-blob post-commit free).
+/// The S9 publish serve owns these device frees strictly after commit Ok,
+/// and the reply's `recomputed` flag stands the co-writer's caller-frame
+/// free stream down — a private view that may name blocks whose free
+/// already ran (the finding-36 refusal/leak pair).
+pub type RecomputedReleases = Option<Vec<super::block_refs::BlockRef>>;
+
+/// One chained merge's result: `(use_delta, staged_version, recompute
+/// verdict)`.
+pub type MergeOutcome = (bool, u64, RecomputedReleases);
 
 /// [`KvMetaBackend::spill_oversize_chained_full`]'s spill result — the
 /// inline→oversize crossing arm's product (2026-08-19 wedge trigger fix).
@@ -7545,7 +7564,7 @@ impl KvMetaBackend {
     ) -> Result<bool> {
         self.merge_layout_and_size_ext(ino, refs_owner, delta, full_layout, size, block_refs, false)
             .await
-            .map(|(used, _version)| used)
+            .map(|(used, _version, _recomputed)| used)
     }
 
     /// DLM S11 rung 17 — [`Self::merge_layout_and_size`] in **chain-onto-
@@ -7574,8 +7593,47 @@ impl KvMetaBackend {
         size: u64,
         block_refs: Vec<super::block_refs::BlockRefOp>,
     ) -> Result<(bool, u64)> {
+        self.merge_layout_and_size_chained_accounted(
+            ino,
+            refs_owner,
+            delta,
+            full_layout,
+            size,
+            block_refs,
+        )
+        .await
+        .map(|(used, version, _recomputed)| (used, version))
+    }
+
+    /// [`Self::merge_layout_and_size_chained`] surfacing the finding-36
+    /// owner-recompute verdict (see [`RecomputedReleases`]) — the S9
+    /// publish serve consumes the released set (its post-commit free
+    /// ladder) and the reply's `recomputed` flag; every other caller drops
+    /// it, keeping the pre-fix shape verbatim.
+    pub async fn merge_layout_and_size_chained_accounted(
+        &self,
+        ino: Ino,
+        refs_owner: Ino,
+        delta: &crate::layout_wire::LayoutDelta,
+        full_layout: Bytes,
+        size: u64,
+        block_refs: Vec<super::block_refs::BlockRefOp>,
+    ) -> Result<MergeOutcome> {
         self.merge_layout_and_size_ext(ino, refs_owner, delta, full_layout, size, block_refs, true)
             .await
+    }
+
+    /// Finding 36: the DATA-block references a recomputed op set RELEASES
+    /// — the device frees the publish serve owns post-commit. Map-blob
+    /// releases are excluded (their free is the displaced-blob
+    /// post-commit arm's, never the block ladder's).
+    fn released_data_refs(
+        ops: &[super::block_refs::BlockRefOp],
+    ) -> Vec<super::block_refs::BlockRef> {
+        ops.iter()
+            .filter(|o| !o.take && !o.reference.is_map_blob())
+            .map(|o| o.reference)
+            .collect()
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -7588,7 +7646,7 @@ impl KvMetaBackend {
         size: u64,
         block_refs: Vec<super::block_refs::BlockRefOp>,
         chain: bool,
-    ) -> Result<(bool, u64)> {
+    ) -> Result<MergeOutcome> {
         // Rewrite-publish-drain Lever B (2026-08-01): delta-class layout
         // saves aggregate on the per-volume layout-merge conveyor — one
         // multi-ino KvTx per drained window (one journal entry, one ring
@@ -7781,14 +7839,15 @@ impl KvMetaBackend {
         // commit Ok; dropped-armed on Err, freeing the fresh blob).
         #[allow(clippy::type_complexity)]
         let mut staged: Vec<(
-            squeezefs_ipc::sqz_channel::oneshot::Sender<crate::error::Result<(bool, u64)>>,
+            squeezefs_ipc::sqz_channel::oneshot::Sender<crate::error::Result<MergeOutcome>>,
             bool,
             u64,
             Option<super::indirect_map::IndirectBlobGuard>,
+            RecomputedReleases,
         )> = Vec::new();
         #[allow(clippy::type_complexity)]
         let mut failed: Vec<(
-            squeezefs_ipc::sqz_channel::oneshot::Sender<crate::error::Result<(bool, u64)>>,
+            squeezefs_ipc::sqz_channel::oneshot::Sender<crate::error::Result<MergeOutcome>>,
             crate::error::SqueezefsError,
         )> = Vec::new();
         // Spec §6.2 item 9 (versioned volumes): the tree probe reads the
@@ -7878,6 +7937,11 @@ impl KvMetaBackend {
             // refs below. NO released twin and nothing joins
             // `displaced_blobs` — the displaced head was INLINE.
             let mut crossing_fresh: Option<String> = None;
+            // Finding 36: whether this member's accounting was RECOMPUTED
+            // (rung 19/20 replaced the caller's frame) — the released
+            // set's device frees then belong to the serve's post-commit
+            // ladder, never to the caller's frame-derived stream.
+            let mut refs_recomputed = false;
             if existing {
                 match self.xattrs.lookup(&key).await {
                     Ok(Some(cur)) => {
@@ -8120,6 +8184,7 @@ impl KvMetaBackend {
                             }
                             if let Some(refs) = composed_refs {
                                 op.block_refs = refs;
+                                refs_recomputed = true;
                             }
                             // Staging is certain from here: commit the
                             // candidate into the memo and record the name
@@ -8320,6 +8385,7 @@ impl KvMetaBackend {
                                     &op.block_refs,
                                 ) {
                                     op.block_refs = refs;
+                                    refs_recomputed = true;
                                 }
                             }
                             // The crossing's blob custody: ONE take for
@@ -8389,7 +8455,17 @@ impl KvMetaBackend {
             if self.block_refs.is_some() {
                 tx.stage_block_refs(&op.block_refs);
             }
-            staged.push((op.done, use_delta, staged_version, member_blob_guard));
+            // Finding 36: the recompute verdict travels with the member's
+            // outcome — released DATA refs only (the map-blob transfers
+            // free through `displaced_blobs` below, never the ladder).
+            let recomputed = refs_recomputed.then(|| Self::released_data_refs(&op.block_refs));
+            staged.push((
+                op.done,
+                use_delta,
+                staged_version,
+                member_blob_guard,
+                recomputed,
+            ));
         }
         for (done, e) in failed {
             let _ = done.send(Err(e));
@@ -8410,13 +8486,13 @@ impl KvMetaBackend {
         publish_phase_record(PublishPhase::CommitTxWait, t_tx);
         match out {
             Ok(()) => {
-                for (done, use_delta, staged_version, blob_guard) in staged {
+                for (done, use_delta, staged_version, blob_guard, recomputed) in staged {
                     // Rung 20: the batch commit named this member's fresh
                     // blob — custody transfers.
                     if let Some(mut g) = blob_guard {
                         g.disarm();
                     }
-                    let _ = done.send(Ok((use_delta, staged_version)));
+                    let _ = done.send(Ok((use_delta, staged_version, recomputed)));
                 }
                 // Rung 20: the names the commit stopped carrying (old
                 // blobs + superseded intermediates) are freed only NOW —
@@ -8436,7 +8512,7 @@ impl KvMetaBackend {
                 // composed member's fresh blob is freed; the displaced
                 // names are freed NEVER (the committed heads still carry
                 // them).
-                for (done, _, _, _blob_guard) in staged {
+                for (done, _, _, _blob_guard, _) in staged {
                     let _ = done.send(Err(dup_err(&e)));
                 }
             }
@@ -8635,7 +8711,7 @@ impl KvMetaBackend {
         size: u64,
         block_refs: &[super::block_refs::BlockRefOp],
         chain: bool,
-    ) -> Result<(bool, u64)> {
+    ) -> Result<MergeOutcome> {
         use crate::fuse_client::{publish_phase_record, PublishPhase};
         self.write_gate()?;
         // Publish decomposition (2026-08-01): the meta_commit interior —
@@ -8915,7 +8991,11 @@ impl KvMetaBackend {
                 (io.free)(old).await;
             }
         }
-        Ok((use_delta, staged_version))
+        // Finding 36: `refs_override` is `Some` exactly when the staged
+        // accounting was RECOMPUTED (rung 19/20) — the released set's
+        // device frees belong to the serve's post-commit ladder.
+        let recomputed = refs_override.as_deref().map(Self::released_data_refs);
+        Ok((use_delta, staged_version, recomputed))
     }
 
     /// Rung 17's covering-version probe: the ino's durable layout-chain

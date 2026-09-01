@@ -4660,6 +4660,8 @@ async fn a_skewed_frame_rewrite_frees_the_recompute_released_block_on_the_author
         .load(Ordering::Relaxed);
     let live_before = METRICS.block_live_free_refusals.load(Ordering::Relaxed);
     let double_before = METRICS.block_double_frees.load(Ordering::Relaxed);
+    let recomputed_before = publish::stats().free_recomputed_blocks;
+    let shipped_before = publish::stats().free_shipped_blocks;
 
     // --- Publish 1 (un-skewed): the frame matches the durable head. ---
     let n1_off = cwr.alloc.allocate_block().await.expect("mint N1");
@@ -4679,6 +4681,10 @@ async fn a_skewed_frame_rewrite_frees_the_recompute_released_block_on_the_author
         )
         .await
         .expect("publish 1 lands");
+    assert!(
+        displaced1.is_empty(),
+        "a recomputed publish hands its caller-frame displaced keys back to NO ONE          (local hygiene ran; the authority owns the device frees): {displaced1:?}"
+    );
     // Production's free site: every returned displaced key is handed to
     // the free path (the co-writer arm ships it as a verb).
     for k in &displaced1 {
@@ -4761,6 +4767,16 @@ async fn a_skewed_frame_rewrite_frees_the_recompute_released_block_on_the_author
         METRICS.block_double_frees.load(Ordering::Relaxed),
         double_before,
         "no double free anywhere in the pair"
+    );
+    assert_eq!(
+        publish::stats().free_recomputed_blocks - recomputed_before,
+        2,
+        "the engagement gauge accounts both recompute-released device frees          (X on publish 1, N1 on publish 2)"
+    );
+    assert_eq!(
+        publish::stats().free_shipped_blocks - shipped_before,
+        0,
+        "no caller-frame free ever travelled as a verb for a recomputed publish"
     );
 
     drop(cwr);

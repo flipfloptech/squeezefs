@@ -135,7 +135,18 @@ use std::sync::Arc;
 /// mismatch refuses loud in both directions (this wire's standing
 /// posture), and the co-writer's horizon word then simply keeps its
 /// derivation default, which is the design's fallback by construction.
-pub const PUBLISH_SCHEMA: u32 = 8;
+///
+/// **9 since the merge reply carries the owner-recompute verdict**
+/// (finding 36): [`PublishReply::DeltaUsed`] gained `recomputed` — `true`
+/// ⇔ the owner REPLACED the caller's accounting frame with the rung-19/20
+/// recompute and ran the released blocks through its OWN free ladder
+/// post-commit, so the co-writer must stand its caller-frame displaced
+/// frees down (shipping them is the refusal/leak pair the finding named:
+/// a free whose block was already freed refuses on the untracked
+/// tripwire, and the block the commit ACTUALLY displaced leaks). An
+/// 8-speaker cannot decode the widened reply — the mismatch refuses loud
+/// at the first frame (KD-7 same-commit fleets).
+pub const PUBLISH_SCHEMA: u32 = 9;
 
 /// First verb of S9's publish block. S3's ping is 0, S8's metadata verbs
 /// are 16/17, S6's membership owns `0x0100..=0x01FF`, S9's custody
@@ -675,6 +686,12 @@ pub enum PublishReply {
     DeltaUsed {
         used: bool,
         version: u64,
+        /// Finding 36 (schema 9): `true` ⇔ the owner recomputed the staged
+        /// accounting against its own head (rung 19/20) and owns the
+        /// displaced-block DEVICE frees — the co-writer's caller-frame
+        /// free stream must stand down for this publish (local tier /
+        /// tracking hygiene only).
+        recomputed: bool,
     },
     /// `write_extent` (rung 17): `covering_version` is `Some` **iff the
     /// covering publish has already run** — releasing the shipper's
@@ -780,6 +797,7 @@ static REPLAYS: AtomicU64 = AtomicU64::new(0);
 // shipped mount by construction — nothing installs the verb's halves).
 static FREE_SHIPPED_BLOCKS: AtomicU64 = AtomicU64::new(0);
 static FREE_SERVED_BLOCKS: AtomicU64 = AtomicU64::new(0);
+static FREE_RECOMPUTED_BLOCKS: AtomicU64 = AtomicU64::new(0);
 static FREE_REPLAYS: AtomicU64 = AtomicU64::new(0);
 static FREE_STALE_REFUSALS: AtomicU64 = AtomicU64::new(0);
 static FREE_SHIP_FAILURES: AtomicU64 = AtomicU64::new(0);
@@ -840,6 +858,12 @@ pub struct PublishStats {
     /// `Freed` verdicts only, so shipped − served − non-terminal − refused
     /// closes per row.
     pub free_served_blocks: u64,
+    /// Finding 36 (owner side): recompute-released device frees — blocks a
+    /// served chained/composed merge's rung-19/20 recompute RELEASED whose
+    /// terminal ladder ran on this authority post-commit (`Freed` verdicts
+    /// only). The rewriting-fleet engagement gauge: 0 beside a growing
+    /// recomputed-merge stream means displaced frees are leaking again.
+    pub free_recomputed_blocks: u64,
     /// Free verbs answered from the dedup window instead of re-applied —
     /// the exactly-once witness's engagement (a lost-reply retry landing
     /// here is the mechanism WORKING, not a fault).
@@ -908,6 +932,7 @@ pub fn stats() -> PublishStats {
         replays: REPLAYS.load(Ordering::Relaxed),
         free_shipped_blocks: FREE_SHIPPED_BLOCKS.load(Ordering::Relaxed),
         free_served_blocks: FREE_SERVED_BLOCKS.load(Ordering::Relaxed),
+        free_recomputed_blocks: FREE_RECOMPUTED_BLOCKS.load(Ordering::Relaxed),
         free_replays: FREE_REPLAYS.load(Ordering::Relaxed),
         free_stale_refusals: FREE_STALE_REFUSALS.load(Ordering::Relaxed),
         free_ship_failures: FREE_SHIP_FAILURES.load(Ordering::Relaxed),
@@ -941,6 +966,7 @@ pub fn stats_json() -> serde_json::Value {
         "replays": s.replays,
         "free_shipped_blocks": s.free_shipped_blocks,
         "free_served_blocks": s.free_served_blocks,
+        "free_recomputed_blocks": s.free_recomputed_blocks,
         "free_replays": s.free_replays,
         "free_stale_refusals": s.free_stale_refusals,
         "free_ship_failures": s.free_ship_failures,
@@ -1524,10 +1550,15 @@ pub async fn set_layout_and_size(
 }
 
 /// Routed [`RoutedMetaBackend::merge_layout_and_size`]. Returns
-/// `(use_delta, staged_version)` — the staged link's version (0 on a
-/// full-Put commit), which the caller stamps into the RAM provenance so
-/// the next delta claims the right base (rung 17's chain-without-refetch
-/// law; on the un-chained local arm the version is the delta's own).
+/// `(use_delta, staged_version, owner_recomputed)` — the staged link's
+/// version (0 on a full-Put commit), which the caller stamps into the RAM
+/// provenance so the next delta claims the right base (rung 17's
+/// chain-without-refetch law; on the un-chained local arm the version is
+/// the delta's own), plus the finding-36 verdict: `true` ⇔ the OWNER
+/// recomputed the staged accounting and ran the displaced-block device
+/// frees through its own ladder, so the caller's frame-derived displaced
+/// frees must stand down for this publish. Both local arms answer `false`
+/// (the local caller's own free path stays authoritative there).
 pub async fn merge_layout_and_size(
     be: &Arc<RoutedMetaBackend>,
     ino: Ino,
@@ -1535,7 +1566,7 @@ pub async fn merge_layout_and_size(
     full_layout: bytes::Bytes,
     size: u64,
     refs: Vec<BlockRefOp>,
-) -> Result<(bool, u64)> {
+) -> Result<(bool, u64, bool)> {
     match owner_of(be, ino)? {
         None => {
             note_local();
@@ -1554,13 +1585,20 @@ pub async fn merge_layout_and_size(
                 .unwrap_or(false);
             let _serve_window = local_publish_guard(ino).await;
             if granted {
-                be.merge_layout_and_size_chained(ino, delta, full_layout, size, refs)
-                    .await
+                // Finding 36: the LOCAL chained arm keeps the caller's
+                // own free path authoritative (the recompute verdict is
+                // dropped) — the frame-vs-head skew this arm can carry is
+                // the authority's own, freed through its local ladder as
+                // before.
+                let (used, version) = be
+                    .merge_layout_and_size_chained(ino, delta, full_layout, size, refs)
+                    .await?;
+                Ok((used, version, false))
             } else {
                 let used = be
                     .merge_layout_and_size(ino, delta, full_layout, size, refs)
                     .await?;
-                Ok((used, if used { delta.version } else { 0 }))
+                Ok((used, if used { delta.version } else { 0 }, false))
             }
         }
         Some(peer) => {
@@ -1575,7 +1613,11 @@ pub async fn merge_layout_and_size(
                 request_id: crate::cowriter::next_ship_request_id(),
             };
             match ship_witnessed(&peer, call).await? {
-                PublishReply::DeltaUsed { used, version } => Ok((used, version)),
+                PublishReply::DeltaUsed {
+                    used,
+                    version,
+                    recomputed,
+                } => Ok((used, version, recomputed)),
                 other => Err(protocol_error(
                     "merge_layout_and_size",
                     &format!("{other:?}"),
@@ -2160,6 +2202,60 @@ pub async fn ship_harvest_lane_free(
 /// [`crate::cowriter::ship_displaced_frees`]'s abandon arm.
 pub(crate) fn note_free_ship_failure(blocks: u64) {
     FREE_SHIP_FAILURES.fetch_add(blocks, Ordering::Relaxed);
+}
+
+/// Finding 36 (half 1) — run a served merge's RECOMPUTE-RELEASED data
+/// blocks through the authority's own free ladder, strictly AFTER the
+/// commit landed (the caller runs this only on Ok). Rides the installed
+/// [`FreeExecutor`] — the `FreeBlocks` ladder verbatim, so the durable
+/// population validation, the grace ring, S7's quarantine and the reclaim
+/// manners compose unchanged, and a block still referenced elsewhere
+/// answers `NonTerminal` instead of a wrongful device free. `Freed`
+/// verdicts land on `free_recomputed_blocks` (the field engagement gauge).
+/// A missing executor or a failed ladder is LEAK-SAFE and loud: the
+/// offsets are durably unreferenced (the commit already released them) and
+/// the authority's next derivation returns them.
+async fn free_recomputed_releases(ino: u64, released: Vec<BlockRef>) {
+    // Dedup on the durable identity: one transition can release the same
+    // device block at two map indexes — its free runs once.
+    let mut seen: std::collections::HashSet<(u64, u64)> = std::collections::HashSet::new();
+    let mut by_vol: std::collections::BTreeMap<u64, Vec<u64>> = std::collections::BTreeMap::new();
+    for r in released {
+        if !r.is_map_blob() && seen.insert((r.vol_tag, r.block_idx)) {
+            by_vol.entry(r.vol_tag).or_default().push(r.block_idx);
+        }
+    }
+    if by_vol.is_empty() {
+        return;
+    }
+    let Some(exec) = free_executor() else {
+        log::error!(
+            "S9 (finding 36): a served merge for ino {ino} recomputed {} released block(s) but \
+             no free executor is installed — the offsets stay durably unreferenced until the \
+             authority's next derivation (leak-safe, loud)",
+            seen.len()
+        );
+        return;
+    };
+    for (vol_tag, blocks) in by_vol {
+        let count = blocks.len();
+        match exec(vol_tag, blocks).await {
+            Ok(verdicts) => {
+                let freed = verdicts
+                    .iter()
+                    .filter(|v| **v == FreeVerdict::Freed)
+                    .count() as u64;
+                FREE_RECOMPUTED_BLOCKS.fetch_add(freed, Ordering::Relaxed);
+            }
+            Err(e) => {
+                log::error!(
+                    "S9 (finding 36): the recomputed-release free ladder failed for {count} \
+                     block(s) on vol_tag {vol_tag:#016x} (ino {ino}): {e} — leak-safe (the \
+                     commit already released them durably; the next derivation returns them)"
+                );
+            }
+        }
+    }
 }
 
 /// **Ship one displaced-free verb** to the authority at `endpoint` and
@@ -3428,9 +3524,9 @@ impl PublishService {
                 // private full layout (the s11-range C8 clobber). The
                 // reply carries the staged version: the co-writer chains
                 // without a refetch.
-                let (used, version) = self
+                let (used, version, released) = self
                     .inner
-                    .merge_layout_and_size_chained(
+                    .merge_layout_and_size_chained_accounted(
                         ino,
                         &delta,
                         bytes::Bytes::from(full_layout),
@@ -3438,7 +3534,21 @@ impl PublishService {
                         refs,
                     )
                     .await?;
-                Ok(PublishReply::DeltaUsed { used, version })
+                // Finding 36 (half 1): the recompute-released DATA blocks
+                // run this authority's OWN free ladder strictly AFTER
+                // commit Ok (the displaced-blob post-commit pattern) —
+                // the caller's frame stood down on the reply flag, so
+                // these device frees have exactly one owner. On commit
+                // Err the `?` above already returned: nothing is freed.
+                let recomputed = released.is_some();
+                if let Some(released) = released {
+                    free_recomputed_releases(ino, released).await;
+                }
+                Ok(PublishReply::DeltaUsed {
+                    used,
+                    version,
+                    recomputed,
+                })
             }
             PublishCall::WriteExtent {
                 ino,

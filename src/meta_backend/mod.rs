@@ -3317,12 +3317,33 @@ impl RoutedMetaBackend {
         size: u64,
         block_refs: Vec<crate::meta_backend::kv::block_refs::BlockRefOp>,
     ) -> Result<(bool, u64)> {
+        self.merge_layout_and_size_chained_accounted(ino, delta, full_layout, size, block_refs)
+            .await
+            .map(|(used, version, _recomputed)| (used, version))
+    }
+
+    /// [`Self::merge_layout_and_size_chained`] surfacing the finding-36
+    /// owner-recompute verdict ([`crate::meta_backend::kv::backend::
+    /// RecomputedReleases`]): the S9 publish serve runs the released set
+    /// through the authority's own free ladder strictly after commit Ok
+    /// and answers the reply's `recomputed` flag; every other caller uses
+    /// the dropping wrapper above.
+    pub async fn merge_layout_and_size_chained_accounted(
+        &self,
+        ino: Ino,
+        delta: &crate::layout_wire::LayoutDelta,
+        full_layout: bytes::Bytes,
+        size: u64,
+        block_refs: Vec<crate::meta_backend::kv::block_refs::BlockRefOp>,
+    ) -> Result<crate::meta_backend::kv::backend::MergeOutcome> {
         let _deleg_gate = crate::meta_ship::deleg_mutation_gate(self, &[ino]).await;
         let _gate = self.slot_gate_enter(&[ino]).await;
         let (v_idx, local_ino) = self.route_ino(ino);
         self.check_volume_enabled(v_idx)?;
         let out = self.volumes[v_idx]
-            .merge_layout_and_size_chained(local_ino, ino, delta, full_layout, size, block_refs)
+            .merge_layout_and_size_chained_accounted(
+                local_ino, ino, delta, full_layout, size, block_refs,
+            )
             .await;
         if out.is_err() {
             self.mirror_volume_failure(v_idx);

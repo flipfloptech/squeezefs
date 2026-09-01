@@ -1560,6 +1560,29 @@ const FREE_SHIP_ATTEMPTS: u32 = 3;
 /// because a resend under the new epoch would be a new act the window
 /// cannot correlate — the freed-then-reallocated ABA window. The abandoned
 /// offset is durably unreferenced and recovery owns it.
+/// Finding 36 (half 2) — the LOCAL hygiene half of a displaced free whose
+/// DEVICE half the AUTHORITY already owns: a publish the owner RECOMPUTED
+/// (the merge reply's `recomputed` flag) ran the committed transition's
+/// displaced blocks through its own ladder post-commit, so the caller's
+/// frame-derived keys perform only the non-accounting local acts
+/// [`ship_displaced_frees`] runs after an acknowledged verb — the
+/// read-tier purge and the local tracking retire. No wire, no device
+/// commands, no accounting: a frame key whose free already ran (the
+/// skewed-frame shape) simply has nothing left to purge, instead of coming
+/// back `Refused` on the authority's untracked tripwire.
+pub fn retire_displaced_locally(router: &crate::routing::BackendRouter, block_keys: &[String]) {
+    for key in block_keys {
+        let cleaned = crate::routing::clean_block_key(key);
+        router.purge_read_tiers(&cleaned);
+        let Ok(parts) = router.parse_block_key_parts(&cleaned) else {
+            continue; // the local ladder's silent skip (unparsable key)
+        };
+        if let Some(alloc) = router.allocator_for_be_id(&parts.be_id) {
+            alloc.release_shipped_free_tracking(parts.offset);
+        }
+    }
+}
+
 pub async fn ship_displaced_frees(
     router: &crate::routing::BackendRouter,
     block_keys: &[&str],

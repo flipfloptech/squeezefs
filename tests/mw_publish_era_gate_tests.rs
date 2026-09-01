@@ -622,7 +622,7 @@ async fn out_of_order_and_cross_era_publishes_refuse() {
         )
         .await
         .expect("rung 17: a divergent-base SHIPPED delta chains onto the head");
-    let publish::PublishReply::DeltaUsed { used, version } = reply else {
+    let publish::PublishReply::DeltaUsed { used, version, .. } = reply else {
         panic!("the merge reply carries the staged version: {reply:?}");
     };
     assert!(used, "the chained delta STAGED (never a full-Put re-base)");

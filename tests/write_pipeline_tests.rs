@@ -228,7 +228,7 @@ async fn depth_target_grows_with_measured_bandwidth_and_stays_budget_bounded() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn red_clamps_target_to_floor_and_pinned_override_wins_verbatim() {
+async fn red_clamps_target_to_measured_drain_and_pinned_override_wins_verbatim() {
     let _s = serial().await;
     let _g = OverrideGuard;
     set_depth_override(None);
@@ -248,10 +248,12 @@ async fn red_clamps_target_to_floor_and_pinned_override_wins_verbatim() {
 
     red.store(true, Ordering::Relaxed);
     assert_eq!(
-        pipe.depth_target_bytes(BS),
-        FLOOR_BLOCKS_PER_LANE * BS,
-        "Red must clamp the target to the floor — honest backpressure while \
-         in-flight custody converges by completion, never OOM"
+        pipe.depth_target_bytes(BS) * HEADROOM,
+        learned,
+        "Red must clamp the target to the un-headroomed measured-BDP sum — \
+         honest backpressure that sheds the queueing bytes while in-flight \
+         custody converges by completion, never a fixed floor that starves \
+         the drain (finding 39)"
     );
     red.store(false, Ordering::Relaxed);
 
@@ -260,6 +262,75 @@ async fn red_clamps_target_to_floor_and_pinned_override_wins_verbatim() {
         pipe.depth_target_bytes(BS),
         5 * BS,
         "the pinned A/B override wins verbatim over the governor"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn red_clamp_derives_from_measured_drain_never_a_fixed_aggregate_floor() {
+    // Finding 39 (EXA field capture, 2026-08-31): under mem-budget Red a
+    // 10-lane store whose learned target was ~352 MiB clamped to the FIXED
+    // 8-block aggregate floor — 32 MiB in flight across a ~12 ms fabric is
+    // ≈ 2.4 GB/s by Little's law, an 8× collapse with multi-second
+    // admission tails (parked_gate_waits +19,375) that STARVED the very
+    // drain that converges the gauge. The Red clamp must DERIVE from the
+    // measured drain: Σ per-lane raw BDP (no HEADROOM, no probe
+    // multiplier) — shed exactly the queueing bytes, sustain the measured
+    // completion rate. The fixed floor is legitimate only as the cold
+    // posture (nothing learned yet).
+    let _s = serial().await;
+    let _g = OverrideGuard;
+    set_depth_override(None);
+    let red = Arc::new(AtomicBool::new(false));
+    let red2 = red.clone();
+    let pipe = WritePipeline::with_caps(
+        Arc::new(move || red2.load(Ordering::Relaxed)),
+        Some(1 << 40),
+    );
+    let floor = FLOOR_BLOCKS_PER_LANE * BS;
+
+    // Cold + Red: the fixed floor IS the honest posture while unlearned.
+    red.store(true, Ordering::Relaxed);
+    assert_eq!(
+        pipe.depth_target_bytes(BS),
+        floor,
+        "cold pipe under Red must sit at the cold-start floor"
+    );
+    red.store(false, Ordering::Relaxed);
+
+    // Ten learned lanes (the EXA shape): identical feed, two window rolls.
+    for lane in 0..10u32 {
+        let name = format!("vol-{lane}");
+        for i in 0..8u64 {
+            pipe.record_completion_at(&name, 500_000_000, 1_000_000, 10 + i);
+        }
+        pipe.record_completion_at(&name, 0, 1_000_000, 300);
+        pipe.record_completion_at(&name, 0, 1_000_000, 600);
+    }
+    let learned = pipe.depth_target_bytes(BS);
+    assert!(
+        learned > 10 * floor,
+        "fixture: every lane must have learned"
+    );
+
+    red.store(true, Ordering::Relaxed);
+    let red_target = pipe.depth_target_bytes(BS);
+    assert!(
+        red_target > floor,
+        "Red must NOT collapse a learned multi-lane store to the fixed \
+         aggregate floor — the field capture starved a 19 GB/s drain to \
+         2.4 GB/s (got {red_target} vs floor {floor})"
+    );
+    assert!(
+        red_target < learned,
+        "Red must still SHED the headroom/probe queueing bytes \
+         (got {red_target} vs learned {learned})"
+    );
+    assert_eq!(
+        red_target * HEADROOM,
+        learned,
+        "the Red clamp is the un-headroomed measured-BDP sum — exactly the \
+         in-flight that sustains the measured drain rate while the gauge \
+         converges"
     );
 }
 

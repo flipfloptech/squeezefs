@@ -1704,7 +1704,11 @@ fn partition_records(folded: &[Record], budget: usize) -> Vec<&[Record]> {
     let mut acc = 0usize;
     for (i, r) in folded.iter().enumerate() {
         let len = r.record_ref().encoded_len();
-        if acc + len > budget && i > start {
+        // Finding 41: a part boundary may only land on a KEY boundary —
+        // same-key fold groups (the compact_fold lineage pair) must land
+        // whole in ONE part (see split_node's cohesion rule; the byte
+        // budget yields, the key law does not).
+        if acc + len > budget && i > start && folded[i].key != folded[i - 1].key {
             parts.push(&folded[start..i]);
             start = i;
             acc = 0;

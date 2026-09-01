@@ -624,6 +624,21 @@ pub async fn write_node(
     journal_seq_horizon: u64,
 ) -> Result<WrittenNode, KvError> {
     check_addr_alignment(params.node_addr)?;
+    // Finding 41 defense-in-depth: a record outside its node's key bounds
+    // is unroutable forever (revalidation rejects the key the parent
+    // separators route here) — refuse LOUD at the write instead of landing
+    // durable stranded state. Records are (key, seq)-ascending (bset law),
+    // so the first/last keys bound the set.
+    if let (Some(first), Some(last)) = (base_records.first(), base_records.last()) {
+        if first.key[..] < *params.min_key || last.key[..] > *params.max_key {
+            return Err(KvError::Corrupt(format!(
+                "node write at {:#x} carries records outside its key bounds \
+                 (first {:02x?}, last {:02x?} vs [{:02x?}, {:02x?}]) — a \
+                 stranded-record hazard (finding 41)",
+                params.node_addr, first.key, last.key, params.min_key, params.max_key
+            )));
+        }
+    }
     let header = NodeHeader {
         node_addr: params.node_addr,
         node_seq: params.node_seq,
@@ -1010,6 +1025,31 @@ pub async fn split_node(
         if acc * 2 >= total && i + 1 < folded.len() {
             cut = i + 1;
             break;
+        }
+    }
+    // Finding 41 (the 8-GiB-crossing corruption): the cut may only land on
+    // a KEY boundary. `compact_fold`'s lineage rule emits TWO same-key
+    // records for a versioned layout chain (folded Put + retained link),
+    // and a cut between them strands the link in the right sibling BELOW
+    // its own `min_key` (= successor(left.max = key)) — unroutable forever;
+    // the next gate-legal link then folds onto the bare Put and every
+    // subsequent fold of the key refuses ("divergent layout-delta chain"),
+    // wedging the checkpoint permanently. Advance to the next key boundary;
+    // if none remains ahead, retreat to the previous one.
+    while cut < folded.len() && folded[cut].key == folded[cut - 1].key {
+        cut += 1;
+    }
+    if cut >= folded.len() {
+        cut = folded.len() - 1;
+        while cut > 0 && folded[cut].key == folded[cut - 1].key {
+            cut -= 1;
+        }
+        if cut == 0 {
+            return Err(KvError::Corrupt(
+                "cannot split a node whose folded records all share one key \
+                 (same-key cohesion, finding 41)"
+                    .to_string(),
+            ));
         }
     }
     let (left_records, right_records) = folded.split_at(cut);

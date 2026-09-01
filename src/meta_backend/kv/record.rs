@@ -891,9 +891,25 @@ fn fold_deltas_onto_put(base_value: &[u8], deltas: &[RecordRef<'_>]) -> Result<V
                     }
                     let want = prev_version.unwrap_or(0);
                     if dec.base_version != want {
+                        // F41TAPE: dump the WHOLE chain (oldest-first) so
+                        // the field corpse names every link's identity.
+                        let mut tape = String::new();
+                        for t in deltas.iter().rev() {
+                            if let Ok(td) = LayoutDelta::decode(t.value) {
+                                tape.push_str(&format!(
+                                    "[seq {} v {:#x} base {:#x} entries {}] ",
+                                    t.seq,
+                                    td.version,
+                                    td.base_version,
+                                    td.entries.len()
+                                ));
+                            } else {
+                                tape.push_str(&format!("[seq {} UNDECODABLE] ", t.seq));
+                            }
+                        }
                         return Err(KvError::Corrupt(format!(
                             "divergent layout-delta chain (spec §6.2 item 9): link seq {} \
-                             names base version {:#x} but folds onto {:#x}",
+                             names base version {:#x} but folds onto {:#x} — CHAIN: {tape}",
                             d.seq, dec.base_version, want
                         )));
                     }

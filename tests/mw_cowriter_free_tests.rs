@@ -5242,3 +5242,187 @@ async fn an_unscoped_full_put_keeps_the_callers_free_stream() {
     drop(cwr);
     auth.stop().await;
 }
+
+/// Contract (finding 36b, the CHUNK hole — the field row's dominant leak):
+/// a shipped full-save whose claim set exceeds the finding-38 pre-chunk
+/// threshold (512 ops) must reach the owner's scoped compose WHOLE. On the
+/// broken shape the leading 512 ops commit VERBATIM via `commit_block_refs`
+/// before the Put and only the tail reaches the compose — so the chunked
+/// indexes are never adopted (the durable map keeps their DEAD bindings)
+/// and their displaced blocks get no free owner while the reply's
+/// `recomputed` stands the whole caller stream down: ~256 leaked blocks
+/// per chunked save (the s11-mpiio store exhaustion: 48 chunked saves ≈
+/// 12.3k orphaned frees on the counted fleet row).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_over_chunk_claim_set_reaches_the_scoped_compose_whole() {
+    use squeezefs::meta_backend::Metadata as _;
+    let _serial = serial();
+    let _restore = restore();
+    squeezefs::meta_ship::tokens::test_clear_range_cache();
+    let dir = TempDir::new().unwrap();
+    let vol = fresh_volume(dir.path(), "f36b-chunk").await;
+    // A bigger sparse backing: this contract mints 2 × 300 blocks.
+    let dev = dir.path().join("f36b-chunk.dev");
+    std::fs::File::create(&dev)
+        .unwrap()
+        .set_len(4 * 1024 * 1024 * 1024)
+        .unwrap();
+    let auth = Authority::start(&vol, &dev, &[NODE_A]).await;
+    install_authority_refs_resolver(&auth.br);
+    let bs = auth.alloc.chunk_size();
+    // 300 rewritten indexes = 600 claim ops — past the 512-op pre-chunk.
+    const N: u32 = 300;
+    let fsz = u64::from(N) * bs;
+    auth.owner
+        .install_range_geometry(data_grant::fixed_range_geometry(fsz, bs));
+
+    // The durable truth: 300 authority-minted bindings, durably
+    // referenced by the inline head.
+    let ino = auth
+        .meta
+        .create_with_rdev_size(1, "f36b-chunk.bin", 0o100644, 0, 0, 0, 0)
+        .await
+        .expect("create")
+        .ino;
+    let mut old_offs = Vec::new();
+    let mut head_map = std::collections::HashMap::new();
+    let mut head_refs = Vec::new();
+    for b in 0..N {
+        let off = auth.alloc.allocate_block().await.expect("mint old");
+        auth.alloc.publish_block(off);
+        head_map.insert(b, off.to_string());
+        head_refs.push(BlockRefOp::taken(BlockRef {
+            vol_tag: volume_tag(DATA_VOL),
+            block_idx: off / bs,
+            owner_ino: ino,
+            block_index: b,
+        }));
+        old_offs.push(off);
+    }
+    let head = bincode::serialize(&squeezefs::layout_wire::LayoutMetadata {
+        file_type: "striped".into(),
+        size: fsz,
+        block_map_id: None,
+        block_prefix: None,
+        file_id: None,
+        data_key: None,
+        block_map: Some(head_map.clone()),
+    })
+    .expect("head bytes");
+    auth.meta
+        .set_layout_and_size(ino, &head, fsz, &head_refs)
+        .await
+        .expect("the durable head commits");
+
+    let cwr = CoWriter::join(&auth, &vol, &dev, NODE_A).await;
+    let _rg = cwr
+        .client
+        .acquire_range(ino, (0, fsz), (0, fsz), Duration::from_secs(2))
+        .await
+        .expect("whole-span range custody");
+    let stage = tempdir().unwrap();
+    let dlm = DlmClient::new().expect("dlm");
+    let router = save_router(&dlm, &cwr.alloc, &dev, &cwr.meta, stage.path()).await;
+
+    let untracked_before = METRICS
+        .block_untracked_free_refusals
+        .load(Ordering::Relaxed);
+    let recomputed_before = publish::stats().free_recomputed_blocks;
+    let shipped_before = publish::stats().free_shipped_blocks;
+
+    // The rewrite: all 300 indexes move to fresh co-writer mints in ONE
+    // full-save-class publish (600 claim ops ride it).
+    let mut entries = Vec::new();
+    let mut new_offs = Vec::new();
+    for b in 0..N {
+        let off = cwr.alloc.allocate_block().await.expect("mint new");
+        cwr.alloc.publish_block(off);
+        entries.push((b, off.to_string()));
+        new_offs.push(off);
+    }
+    let mut frame = std::collections::HashMap::new();
+    for (b, k) in head_map.iter() {
+        frame.insert(*b, k.clone());
+    }
+    let entry = CachedMetadata {
+        file_type: "striped".into(),
+        size: fsz,
+        block_map: Some(std::sync::Arc::new(frame)),
+        layout_dirty: true,
+        layout_delta_chain: LAYOUT_DELTA_CHAIN_INELIGIBLE,
+        ..Default::default()
+    };
+    router.metadata_cache.insert(ino, entry);
+    let token = dlm.get_fencing_token_ino(ino);
+    let displaced = router
+        .merge_block_mappings_coalesced(
+            ino,
+            entries.clone(),
+            0,
+            squeezefs::routing::LayoutFlip::KeepLayout,
+            token,
+        )
+        .await
+        .expect("the over-chunk publish lands");
+    for k in &displaced {
+        let _ = router.backend_router.free_block(k).await;
+    }
+    auth.br.reclaim_drain().await;
+
+    // The durable map carries EVERY claimed transition — the chunked
+    // indexes must not keep their dead bindings.
+    let durable = auth
+        .meta
+        .getxattr(ino, "layout")
+        .await
+        .expect("layout read")
+        .expect("the composed head persists");
+    let decoded =
+        squeezefs::layout_wire::decode_base_layout(&durable).expect("the head decodes inline");
+    let map = decoded.block_map.expect("the head carries its map");
+    let mut stale = 0usize;
+    for (b, k) in &entries {
+        if map.get(b).map(String::as_str) != Some(k.as_str()) {
+            stale += 1;
+        }
+    }
+    assert_eq!(
+        stale, 0,
+        "finding 36b (the chunk hole): {stale} of {N} claimed transitions never reached the \
+         scoped compose — the pre-chunked claims committed verbatim and their indexes kept \
+         DEAD bindings in the durable map"
+    );
+    // Every displaced block runs the authority's ladder — none leak.
+    let mut leaked = 0usize;
+    for off in &old_offs {
+        if !auth.free_listed(off / bs) {
+            leaked += 1;
+        }
+    }
+    assert_eq!(
+        leaked, 0,
+        "finding 36b (the chunk hole): {leaked} of {N} displaced blocks never re-entered the \
+         free supply (~256 leaked blocks per chunked save — the s11-mpiio store exhaustion)"
+    );
+    assert_eq!(
+        publish::stats().free_recomputed_blocks - recomputed_before,
+        u64::from(N),
+        "the engagement gauge accounts every recompute-released device free"
+    );
+    assert_eq!(
+        publish::stats().free_shipped_blocks - shipped_before,
+        0,
+        "no caller-frame free ships for the recomputed publish"
+    );
+    assert_eq!(
+        METRICS
+            .block_untracked_free_refusals
+            .load(Ordering::Relaxed),
+        untracked_before,
+        "no untracked-free refusal anywhere in the rewrite"
+    );
+
+    squeezefs::meta_ship::tokens::test_clear_range_cache();
+    drop(cwr);
+    auth.stop().await;
+}

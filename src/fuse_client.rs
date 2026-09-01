@@ -5881,6 +5881,14 @@ pub struct Metrics {
     /// tail (KD-4.6) and the paced drain engaged under foreground.
     /// ≈ 0 on stores with fresh headroom.
     pub block_free_debt_pressure_drains: Align64<AtomicU64>,
+    /// Supply-pressure drain passes (finding 40 — fill-coupled reclaim
+    /// pacing): the queued reclaim debt reached a material share (≥ half)
+    /// of a device's remaining free supply, so the drain ran REGARDLESS
+    /// of moving foreground — headroom regenerates ahead of allocation
+    /// instead of the ENOSPC valve paying it synchronously on the write
+    /// path. ≈ 0 on stores with fresh headroom; steady growth at high
+    /// fill is the arm working, not a regression.
+    pub block_free_reclaim_supply_drains: Align64<AtomicU64>,
     /// Debt-drainer passes (one per inner-loop sweep over the targets) —
     /// the drainer's pacing instrument (finding 12, 2026-08-23: a fully
     /// grace-held backlog spun this at ~5,000/s on an IDLE daemon,
@@ -10052,6 +10060,7 @@ impl SqueezefsFilesystem {
                 "block_free_trim_bytes": METRICS.block_free_trim_bytes.load(Ordering::Relaxed),
                 "block_free_debt_pressure_drains": METRICS.block_free_debt_pressure_drains.load(Ordering::Relaxed),
                 "block_free_debt_drain_passes": METRICS.block_free_debt_drain_passes.load(Ordering::Relaxed),
+                "block_free_reclaim_supply_drains": METRICS.block_free_reclaim_supply_drains.load(Ordering::Relaxed),
                 // RW1 rand-write device-byte ledger (design-random-small-
                 // writes §1.2 buckets; always-on — the G-RW2 gate's
                 // attribution source).

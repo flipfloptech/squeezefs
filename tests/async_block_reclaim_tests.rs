@@ -1889,6 +1889,79 @@ async fn drain_defers_under_foreground_and_catches_up_idle() {
 }
 
 // ---------------------------------------------------------------------------
+// Contract 12b — fill-coupled drain pressure (finding 40, the EXA
+// full-store collapse 2026-08-31): the manners deferral must never starve
+// a THINNING free supply. At ~97 % fill the field's foreground writes held
+// the drain deferred while the free list emptied, until every allocation
+// paid the ENOSPC valve's synchronous drain — 12–22 ms fabric round trips
+// inline on the write path (sync_drains + multi-second parked-gate tails).
+// When the queued reclaim debt holds a material share (≥ half) of a
+// store's remaining free supply, the drain runs REGARDLESS of foreground:
+// headroom regenerates AHEAD of allocation. Derived entirely from store
+// state (queue population vs live free supply) — no fill constant.
+// ---------------------------------------------------------------------------
+
+fn supply_drains() -> u64 {
+    METRICS
+        .block_free_reclaim_supply_drains
+        .load(Ordering::Relaxed)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn thin_supply_drains_despite_moving_foreground() {
+    let _g = serial().await;
+    let _m = EnvGuard::set("SQUEEZEFS_RECLAIM_BATCH_MS", "0");
+    let (router, ba, _backing, _staging) = make_router().await;
+    // Foreground stays MOVING the whole time — on a healthy-fill store
+    // that defers the drain (contract 12); at thin supply it must not.
+    let _seam = FgSeam::install(&router.backend_router);
+
+    // Bound the store small and consume most of it: 64-block capacity,
+    // 48 allocated, 32 freed terminally. The queue holds 32 blocks while
+    // the remaining free supply is 16 virgin blocks — 2× the supply, far
+    // past the half-share pressure bound — and sits far below the RAM cap
+    // (default 4096), so ONLY the supply-pressure arm can drain it.
+    ba.set_capacity_bytes(64 * ba.chunk_size());
+    let mut offsets = Vec::with_capacity(48);
+    for _ in 0..48 {
+        let o = ba.allocate_block().await.expect("alloc");
+        ba.publish_block(o);
+        offsets.push(o);
+    }
+    let (p0, s0, qb0, df0, sd0) = (
+        punches(),
+        skipped(),
+        queue_bytes(),
+        double_frees(),
+        supply_drains(),
+    );
+    for o in offsets.iter().take(32) {
+        router
+            .backend_router
+            .free_block(&o.to_string())
+            .await
+            .expect("terminal free");
+    }
+    eventually(
+        || (punches() - p0) + (skipped() - s0) == 32 && queue_bytes() == qb0,
+        "a thin free supply must drain the queued reclaims despite moving \
+         foreground (fill-coupled pacing — headroom regenerates ahead of \
+         allocation instead of the ENOSPC valve paying it inline)",
+    )
+    .await;
+    assert!(
+        supply_drains() > sd0,
+        "the supply-pressure arm is the engagement gauge — the drain ran \
+         because supply thinned, not because foreground went idle"
+    );
+    assert_eq!(
+        double_frees() - df0,
+        0,
+        "exactly-once under supply pressure"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Contract 13 — park-don't-spill at the cap: an at-cap enqueue PARKS and
 // the drain relieves it REGARDLESS of foreground (parked enqueues are
 // foreground writers too); device commands never issue from the enqueue

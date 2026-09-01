@@ -4953,3 +4953,292 @@ async fn a_failed_shipped_merge_frees_nothing_on_either_side() {
     drop(cwr);
     auth.stop().await;
 }
+
+// ---------------------------------------------------------------------------
+// Finding 36b — the FIELD arm: the S11 custody-SCOPED full Put
+// (`PublishService::custody_scoped_layout`, the SetLayoutAndSize serve).
+// The s11-mpiio fleet row (range custody armed, one shared >8 GiB-class
+// file) never ships MergeLayoutAndSize: a co-writer's RAM head is
+// indirect-classed, so every save is FULL-SAVE class and the owner's
+// SCOPED COMPOSE recomputes the accounting (the head→composed swap diff,
+// publish.rs rung 19; `publish_blob_composes` counts its rehydrated arm —
+// the field's 861) — the exact recompute the f36 merge fix never covered.
+// Field corpse: block_untracked_free_refusals=8946, free_recomputed_blocks
+// =0, one leaked block per skewed Put, rank abort on ENOSPC.
+// ---------------------------------------------------------------------------
+
+/// Contract (finding 36b, both halves on the SCOPED-PUT arm): a
+/// range-custody co-writer's full-save rewrite whose frame SKEWED from the
+/// durable head leaks nothing and refuses nothing — the authority frees
+/// the block its scoped compose released, and the co-writer's caller-frame
+/// stream stands down.
+///
+/// RED against dev: the Set serve stages the compose's ledger Delete but
+/// frees only map blobs post-commit, and its reply (`Unit`) carries no
+/// recompute verdict — so the actually-displaced block never re-enters the
+/// free supply and the stale caller-frame free refuses on the untracked
+/// tripwire.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_range_custody_full_put_skew_frees_the_scoped_release_on_the_authority() {
+    let _serial = serial();
+    let _restore = restore();
+    squeezefs::meta_ship::tokens::test_clear_range_cache();
+    let dir = TempDir::new().unwrap();
+    let vol = fresh_volume(dir.path(), "f36b-skew").await;
+    let dev = data_device(dir.path(), "f36b-skew.dev");
+    let auth = Authority::start(&vol, &dev, &[NODE_A]).await;
+    install_authority_refs_resolver(&auth.br);
+    let bs = auth.alloc.chunk_size();
+    let fsz = 4 * bs;
+    // The S11 range plane: the geometry source is what lets the owner
+    // scope a range holder's Put (production: multi_writer's
+    // router_range_geometry — the fixture mirrors the arm).
+    auth.owner
+        .install_range_geometry(data_grant::fixed_range_geometry(fsz, bs));
+
+    // The durable truth: ino's block 0 → X (authority-minted, tracked,
+    // durably referenced by the inline head).
+    let x_off = auth.alloc.allocate_block().await.expect("mint X");
+    let x_idx = x_off / bs;
+    auth.alloc.publish_block(x_off);
+    let ino = auth
+        .meta
+        .create_with_rdev_size(1, "f36b-skew.bin", 0o100644, 0, 0, 0, 0)
+        .await
+        .expect("create")
+        .ino;
+    durable_inline_head(&auth, ino, &x_off.to_string(), x_idx, fsz).await;
+
+    let cwr = CoWriter::join(&auth, &vol, &dev, NODE_A).await;
+    // Block-0 RANGE custody: the serve's scoping discriminator (the
+    // s11-mpiio ranks' shape — every write under a ranged lease).
+    let _rg = cwr
+        .client
+        .acquire_range(ino, (0, bs), (0, bs), Duration::from_secs(2))
+        .await
+        .expect("block-0 range custody");
+    let stage = tempdir().unwrap();
+    let dlm = DlmClient::new().expect("dlm");
+    let router = save_router(&dlm, &cwr.alloc, &dev, &cwr.meta, stage.path()).await;
+
+    let untracked_before = METRICS
+        .block_untracked_free_refusals
+        .load(Ordering::Relaxed);
+    let live_before = METRICS.block_live_free_refusals.load(Ordering::Relaxed);
+    let double_before = METRICS.block_double_frees.load(Ordering::Relaxed);
+    let recomputed_before = publish::stats().free_recomputed_blocks;
+    let shipped_before = publish::stats().free_shipped_blocks;
+
+    // A FULL-SAVE-class dirty frame (the fleet's shape: an indirect-classed
+    // RAM head is never delta-eligible; `LAYOUT_DELTA_CHAIN_INELIGIBLE` is
+    // that classification's caller half).
+    let full_save_entry = |key: &str| {
+        let mut e = dirty_inline_entry(fsz, key);
+        e.layout_delta_chain = LAYOUT_DELTA_CHAIN_INELIGIBLE;
+        e
+    };
+
+    // --- Put 1 (un-skewed): the frame matches the durable head. ---
+    let n1_off = cwr.alloc.allocate_block().await.expect("mint N1");
+    let n1_idx = n1_off / bs;
+    cwr.alloc.publish_block(n1_off);
+    router
+        .metadata_cache
+        .insert(ino, full_save_entry(&x_off.to_string()));
+    let token = dlm.get_fencing_token_ino(ino);
+    let displaced1 = router
+        .merge_block_mappings_coalesced(
+            ino,
+            vec![(0u32, n1_off.to_string())],
+            0,
+            squeezefs::routing::LayoutFlip::KeepLayout,
+            token,
+        )
+        .await
+        .expect("Put 1 lands (the scoped compose adopts the claimed take)");
+    assert!(
+        displaced1.is_empty(),
+        "a scoped-compose Put hands its caller-frame displaced keys back to NO ONE: \
+         {displaced1:?}"
+    );
+    for k in &displaced1 {
+        let _ = router.backend_router.free_block(k).await;
+    }
+    auth.br.reclaim_drain().await;
+    assert!(
+        auth.free_listed(x_idx),
+        "the un-skewed displaced block re-enters the free supply on the authority"
+    );
+    assert_eq!(auth.population(x_idx).await, 0, "X's reference released");
+
+    // --- Put 2 (SKEWED): the frame believes block 0 STILL holds X (the
+    // lagging-refetch shape); the compose the authority commits displaces
+    // N1. ---
+    let n2_off = cwr.alloc.allocate_block().await.expect("mint N2");
+    let n2_idx = n2_off / bs;
+    cwr.alloc.publish_block(n2_off);
+    router
+        .metadata_cache
+        .insert(ino, full_save_entry(&x_off.to_string()));
+    let token = dlm.get_fencing_token_ino(ino);
+    let displaced2 = router
+        .merge_block_mappings_coalesced(
+            ino,
+            vec![(0u32, n2_off.to_string())],
+            0,
+            squeezefs::routing::LayoutFlip::KeepLayout,
+            token,
+        )
+        .await
+        .expect("Put 2 lands (the skewed frame is a legal caller state)");
+    for k in &displaced2 {
+        let _ = router.backend_router.free_block(k).await;
+    }
+    auth.br.reclaim_drain().await;
+
+    assert_eq!(
+        auth.population(n1_idx).await,
+        0,
+        "the scoped compose's ledger Delete rode the Put — N1 is durably unreferenced"
+    );
+    assert_eq!(auth.population(n2_idx).await, 1, "the compose took N2");
+    assert!(
+        auth.free_listed(n1_idx),
+        "finding 36b: the block the committed compose ACTUALLY displaced (N1) must run the \
+         AUTHORITY's free ladder — on dev the Set serve frees only map blobs post-commit, \
+         so N1's device free is issued by NO ONE (the s11-mpiio leak)"
+    );
+    assert_eq!(
+        METRICS
+            .block_untracked_free_refusals
+            .load(Ordering::Relaxed),
+        untracked_before,
+        "finding 36b: the caller-frame free of an already-freed block never ships — the \
+         field's 8946-refusal storm stays silent"
+    );
+    assert_eq!(
+        METRICS.block_live_free_refusals.load(Ordering::Relaxed),
+        live_before,
+        "no live-free refusal on either Put"
+    );
+    assert_eq!(
+        METRICS.block_double_frees.load(Ordering::Relaxed),
+        double_before,
+        "no double free anywhere in the pair"
+    );
+    assert_eq!(
+        publish::stats().free_recomputed_blocks - recomputed_before,
+        2,
+        "the engagement gauge accounts both scoped-compose device frees (X on Put 1, N1 on \
+         Put 2)"
+    );
+    assert_eq!(
+        publish::stats().free_shipped_blocks - shipped_before,
+        0,
+        "no caller-frame free ever travelled as a verb for a scoped-compose Put"
+    );
+
+    squeezefs::meta_ship::tokens::test_clear_range_cache();
+    drop(cwr);
+    auth.stop().await;
+}
+
+/// Contract (finding 36b's preservation half, pinned green): a
+/// custody-LESS shipped full Put — no range grant, no episode — stays
+/// VERBATIM on the owner (the caller's frame is the staged accounting),
+/// so its displaced keys come back to the caller and their frees SHIP.
+/// The suppression can never widen past the Puts whose accounting the
+/// owner actually recomputed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_unscoped_full_put_keeps_the_callers_free_stream() {
+    let _serial = serial();
+    let _restore = restore();
+    squeezefs::meta_ship::tokens::test_clear_range_cache();
+    let dir = TempDir::new().unwrap();
+    let vol = fresh_volume(dir.path(), "f36b-verbatim").await;
+    let dev = data_device(dir.path(), "f36b-verbatim.dev");
+    let auth = Authority::start(&vol, &dev, &[NODE_A]).await;
+    install_authority_refs_resolver(&auth.br);
+    let bs = auth.alloc.chunk_size();
+    let fsz = 4 * bs;
+
+    let x_off = auth.alloc.allocate_block().await.expect("mint X");
+    let x_idx = x_off / bs;
+    auth.alloc.publish_block(x_off);
+    // Burner ino: the process-global range-EPISODE latch is sticky per ino
+    // number by design (finding 35), and suites re-mint low inos — this
+    // test's contract is the never-ranged verbatim arm, so its file must
+    // not alias an ino a sibling test ran a range episode on.
+    let _burner = auth
+        .meta
+        .create_with_rdev_size(1, "f36b-burner", 0o100644, 0, 0, 0, 0)
+        .await
+        .expect("burner create")
+        .ino;
+    let ino = auth
+        .meta
+        .create_with_rdev_size(1, "f36b-verbatim.bin", 0o100644, 0, 0, 0, 0)
+        .await
+        .expect("create")
+        .ino;
+    durable_inline_head(&auth, ino, &x_off.to_string(), x_idx, fsz).await;
+
+    let cwr = CoWriter::join(&auth, &vol, &dev, NODE_A).await;
+    let stage = tempdir().unwrap();
+    let dlm = DlmClient::new().expect("dlm");
+    let router = save_router(&dlm, &cwr.alloc, &dev, &cwr.meta, stage.path()).await;
+
+    let untracked_before = METRICS
+        .block_untracked_free_refusals
+        .load(Ordering::Relaxed);
+    let shipped_before = publish::stats().free_shipped_blocks;
+
+    let n_off = cwr.alloc.allocate_block().await.expect("mint N");
+    cwr.alloc.publish_block(n_off);
+    let mut entry = dirty_inline_entry(fsz, &x_off.to_string());
+    entry.layout_delta_chain = LAYOUT_DELTA_CHAIN_INELIGIBLE;
+    router.metadata_cache.insert(ino, entry);
+    let token = dlm.get_fencing_token_ino(ino);
+    let displaced = router
+        .merge_block_mappings_coalesced(
+            ino,
+            vec![(0u32, n_off.to_string())],
+            0,
+            squeezefs::routing::LayoutFlip::KeepLayout,
+            token,
+        )
+        .await
+        .expect("the verbatim full Put lands");
+    assert_eq!(
+        displaced,
+        vec![x_off.to_string()],
+        "an un-scoped Put hands its displaced keys back to the caller verbatim"
+    );
+    for k in &displaced {
+        router
+            .backend_router
+            .free_block(k)
+            .await
+            .expect("the caller-frame free ships");
+    }
+    auth.br.reclaim_drain().await;
+    assert!(
+        auth.free_listed(x_idx),
+        "the displaced offset re-entered the free supply through the shipped verb"
+    );
+    assert_eq!(
+        publish::stats().free_shipped_blocks - shipped_before,
+        1,
+        "the free travelled as a verb — the caller-frame stream stayed authoritative"
+    );
+    assert_eq!(
+        METRICS
+            .block_untracked_free_refusals
+            .load(Ordering::Relaxed),
+        untracked_before,
+        "no refusal"
+    );
+
+    drop(cwr);
+    auth.stop().await;
+}

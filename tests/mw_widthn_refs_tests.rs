@@ -459,7 +459,10 @@ async fn a_chained_merge_recomputes_refs_against_the_live_head() {
         )
         .await
         .expect("the base Put lands");
-    assert!(matches!(reply, publish::PublishReply::Unit), "{reply:?}");
+    assert!(
+        matches!(reply, publish::PublishReply::PutDone { .. }),
+        "{reply:?}"
+    );
     assert_eq!(
         ledger(&owner_be).await,
         vec![(kid("be://data:A"), ino, 0)],
@@ -758,7 +761,10 @@ async fn a_range_holders_put_onto_an_indirect_head_refuses_not_clobbers() {
         )
         .await
         .expect("the indirect head lands (pre-custody verbatim)");
-    assert!(matches!(reply, publish::PublishReply::Unit), "{reply:?}");
+    assert!(
+        matches!(reply, publish::PublishReply::PutDone { .. }),
+        "{reply:?}"
+    );
 
     // The holder's custody + its partial-view full Put.
     let _g = client
@@ -1050,7 +1056,10 @@ async fn an_armed_scoped_put_composes_over_the_indirect_durable_head() {
         )
         .await
         .expect("the indirect head lands (pre-custody verbatim)");
-    assert!(matches!(reply, publish::PublishReply::Unit), "{reply:?}");
+    assert!(
+        matches!(reply, publish::PublishReply::PutDone { .. }),
+        "{reply:?}"
+    );
 
     // The holder's custody: block 0 ONLY. Its Put carries an in-custody
     // displacement (0→K_new) and a stale out-of-custody claim (5→K_mine).
@@ -1078,7 +1087,10 @@ async fn an_armed_scoped_put_composes_over_the_indirect_durable_head() {
         )
         .await
         .expect("the armed scoped Put composes instead of refusing");
-    assert!(matches!(reply, publish::PublishReply::Unit), "{reply:?}");
+    assert!(
+        matches!(reply, publish::PublishReply::PutDone { .. }),
+        "{reply:?}"
+    );
 
     // The composed head is INLINE again (small map — the collapse arm):
     // the fold layer's own decoder accepts it.
@@ -1166,7 +1178,10 @@ async fn an_armed_scoped_put_reads_the_shipped_side_blob() {
         )
         .await
         .expect("the inline base Put lands");
-    assert!(matches!(reply, publish::PublishReply::Unit), "{reply:?}");
+    assert!(
+        matches!(reply, publish::PublishReply::PutDone { .. }),
+        "{reply:?}"
+    );
 
     // The holder's custody: block 0. Its Put SHIPPED as an indirect
     // layout whose blob carries an in-custody entry (0→K_new) and an
@@ -1201,7 +1216,10 @@ async fn an_armed_scoped_put_reads_the_shipped_side_blob() {
         )
         .await
         .expect("the armed scoped Put reads the shipped blob and composes");
-    assert!(matches!(reply, publish::PublishReply::Unit), "{reply:?}");
+    assert!(
+        matches!(reply, publish::PublishReply::PutDone { .. }),
+        "{reply:?}"
+    );
 
     let map = owner_map(&owner_be, ino).await;
     assert_eq!(
@@ -1715,7 +1733,10 @@ async fn an_armed_scoped_put_crossing_the_inline_cap_composes_to_indirect() {
         )
         .await
         .expect("the inline base head lands (pre-custody verbatim)");
-    assert!(matches!(reply, publish::PublishReply::Unit), "{reply:?}");
+    assert!(
+        matches!(reply, publish::PublishReply::PutDone { .. }),
+        "{reply:?}"
+    );
 
     // The holder's custody: block 0 only. Its scoped Put composes with
     // every peer entry the head holds — past the cap.
@@ -1744,7 +1765,10 @@ async fn an_armed_scoped_put_crossing_the_inline_cap_composes_to_indirect() {
              fresh CoW blob — the verbatim inline encode is the permanent-fsync-failure \
              class (the KV refuses it, the retry recomposes it, for ever)",
         );
-    assert!(matches!(reply, publish::PublishReply::Unit), "{reply:?}");
+    assert!(
+        matches!(reply, publish::PublishReply::PutDone { .. }),
+        "{reply:?}"
+    );
 
     // The durable head names the fresh blob; the blob holds the FULL
     // composed map (the holder's entry + every peer entry).
@@ -2093,7 +2117,10 @@ async fn a_scoped_puts_refs_follow_the_composition_not_the_callers_frame() {
         )
         .await
         .expect("the base Put lands");
-    assert!(matches!(reply, publish::PublishReply::Unit), "{reply:?}");
+    assert!(
+        matches!(reply, publish::PublishReply::PutDone { .. }),
+        "{reply:?}"
+    );
 
     // The holder's custody: block 0 ONLY.
     let _g = client
@@ -2128,7 +2155,10 @@ async fn a_scoped_puts_refs_follow_the_composition_not_the_callers_frame() {
         )
         .await
         .expect("the scoped Put lands");
-    assert!(matches!(reply, publish::PublishReply::Unit), "{reply:?}");
+    assert!(
+        matches!(reply, publish::PublishReply::PutDone { .. }),
+        "{reply:?}"
+    );
 
     let map = owner_map(&owner_be, ino).await;
     assert_eq!(

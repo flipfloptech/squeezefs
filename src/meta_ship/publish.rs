@@ -146,7 +146,18 @@ use std::sync::Arc;
 /// tripwire, and the block the commit ACTUALLY displaced leaks). An
 /// 8-speaker cannot decode the widened reply — the mismatch refuses loud
 /// at the first frame (KD-7 same-commit fleets).
-pub const PUBLISH_SCHEMA: u32 = 9;
+///
+/// **10 since the SCOPED PUT reply carries the same verdict** (finding
+/// 36b — the s11-mpiio field venue): on a range-custody fleet a shared
+/// file's saves are FULL-SAVE class (indirect-classed RAM heads are never
+/// delta-eligible), so the recompute the co-writer must stand down for is
+/// `custody_scoped_layout`'s — the `SetLayoutAndSize` serve — not the
+/// merge arms schema 9 covered. `SetLayoutAndSize` now answers
+/// [`PublishReply::PutDone`] (`recomputed` beside the commit), and the
+/// owner frees the scoped compose's released data blocks through its own
+/// ladder post-commit, exactly the schema-9 law on the arm the field
+/// actually rides.
+pub const PUBLISH_SCHEMA: u32 = 10;
 
 /// First verb of S9's publish block. S3's ping is 0, S8's metadata verbs
 /// are 16/17, S6's membership owns `0x0100..=0x01FF`, S9's custody
@@ -678,6 +689,15 @@ impl PublishCall {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PublishReply {
     Unit,
+    /// `set_layout_and_size` (schema 10, finding 36b): the commit landed,
+    /// and `recomputed` says whether the owner REPLACED the caller's
+    /// accounting frame with the custody-scoped compose's own swap diff —
+    /// `true` ⇔ the owner ran the released blocks through its own free
+    /// ladder post-commit, so the caller's frame-derived displaced frees
+    /// must stand down for this publish.
+    PutDone {
+        recomputed: bool,
+    },
     /// `merge_layout_and_size`: whether a delta record was staged, and
     /// the STAGED LINK'S VERSION (0 on a full-Put commit) — rung 17's
     /// chain-without-refetch input (design-mw-layout-versions §6's named
@@ -1514,37 +1534,49 @@ fn protocol_error(what: &str, got: &str, want: &str) -> SqueezefsError {
     SqueezefsError::InvalidOperation(msg)
 }
 
-/// Routed [`RoutedMetaBackend::set_layout_and_size`].
+/// Routed [`RoutedMetaBackend::set_layout_and_size`]. Returns the
+/// finding-36b owner-recompute verdict: `true` ⇔ the owner's
+/// custody-scoped compose replaced the caller's accounting frame and ran
+/// the displaced-block device frees through its own ladder, so the
+/// caller's frame-derived displaced frees must stand down for this
+/// publish. The local arm answers `false` (its own free path stays
+/// authoritative).
 pub async fn set_layout_and_size(
     be: &Arc<RoutedMetaBackend>,
     ino: Ino,
     layout: &[u8],
     size: u64,
     refs: &[BlockRefOp],
-) -> Result<()> {
+) -> Result<bool> {
     match owner_of(be, ino)? {
         None => {
             note_local();
             let _serve_window = local_publish_guard(ino).await;
-            be.set_layout_and_size(ino, layout, size, refs).await
+            be.set_layout_and_size(ino, layout, size, refs).await?;
+            Ok(false)
         }
         Some(peer) => {
             intent_barrier_inos(&[ino]).await?;
-            expect_unit(
-                ship_witnessed(
-                    &peer,
-                    PublishCall::SetLayoutAndSize {
-                        ino,
-                        layout: layout.to_vec(),
-                        size,
-                        refs: wire_refs(refs),
-                        lease_epoch: current_lease_epoch(),
-                        request_id: crate::cowriter::next_ship_request_id(),
-                    },
-                )
-                .await?,
-                "set_layout_and_size",
+            match ship_witnessed(
+                &peer,
+                PublishCall::SetLayoutAndSize {
+                    ino,
+                    layout: layout.to_vec(),
+                    size,
+                    refs: wire_refs(refs),
+                    lease_epoch: current_lease_epoch(),
+                    request_id: crate::cowriter::next_ship_request_id(),
+                },
             )
+            .await?
+            {
+                PublishReply::PutDone { recomputed } => Ok(recomputed),
+                other => Err(protocol_error(
+                    "set_layout_and_size",
+                    &format!("{other:?}"),
+                    "a Put acknowledgement",
+                )),
+            }
         }
     }
 }
@@ -3452,8 +3484,20 @@ impl PublishService {
                 // (staged verbatim they double-count / mis-name blobs
                 // the composition renamed). Every verbatim arm keeps the
                 // caller's frame byte-identical.
+                // Finding 36b: the scoped compose's RELEASED data blocks
+                // are the displaced set the COMMIT actually performs —
+                // collected here, freed strictly after commit Ok below
+                // (map-blob custody stays on `free_after_commit`).
+                let was_recomputed = recomputed.is_some();
+                let mut released_data: Vec<crate::meta_backend::kv::block_refs::BlockRef> =
+                    Vec::new();
                 let refs: Vec<BlockRefOp> = match recomputed {
                     Some(mut r) => {
+                        released_data = r
+                            .iter()
+                            .filter(|o| !o.take && !o.reference.is_map_blob())
+                            .map(|o| o.reference)
+                            .collect();
                         if !blob_custody.drop_caller_blob_ops {
                             r.extend(refs.iter().filter(|o| o.reference.is_map_blob()).copied());
                         }
@@ -3478,7 +3522,18 @@ impl PublishService {
                         }
                     }
                 }
-                Ok(PublishReply::Unit)
+                // Finding 36b (half 1, the SCOPED-PUT arm — the s11-mpiio
+                // field venue): the compose's released data blocks run
+                // this authority's own free ladder, strictly AFTER commit
+                // Ok; the reply's `recomputed` stands the caller's frame
+                // stream down. On commit Err the `?` above already
+                // returned — nothing is freed.
+                if !released_data.is_empty() {
+                    free_recomputed_releases(ino, released_data).await;
+                }
+                Ok(PublishReply::PutDone {
+                    recomputed: was_recomputed,
+                })
             }
             PublishCall::MergeLayoutAndSize {
                 ino,

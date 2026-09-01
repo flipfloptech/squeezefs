@@ -3664,6 +3664,16 @@ pub struct DataRouterInner {
     /// One idle-close sweeper per router, armed lazily on the first
     /// epoch open (the KD-1.6 idle/size-stable trigger).
     pub(crate) epoch_sweeper_armed: std::sync::atomic::AtomicBool,
+    /// Finding 36: inos whose LAST successful layout publish was
+    /// owner-RECOMPUTED (the shipped chained/composed merge or the
+    /// custody-scoped Put) — written by every save under the ino's
+    /// `INODE_META_LOCKS`, read by the rewrite-epoch close's CLEAN arm,
+    /// whose parked displaced keys were covered by an INTERMEDIATE save
+    /// it never saw the verdict of. Membership-only (`true` inserts,
+    /// `false` removes), so the map is bounded by actively-rewritten
+    /// custody inos and empty on every solo/authority mount by
+    /// construction.
+    pub(crate) publish_recomputed: std::sync::Arc<scc::HashMap<u64, ()>>,
 }
 
 #[derive(Clone)]
@@ -6156,10 +6166,9 @@ impl DataRouter {
         m: &CachedMetadata,
         fencing_token: u64,
         block_refs: &[crate::meta_backend::kv::block_refs::BlockRefOp],
-    ) -> Result<()> {
+    ) -> Result<bool> {
         self.save_metadata_to_backend_ext(ino, m, fencing_token, None, block_refs)
             .await
-            .map(|_owner_recomputed| ())
     }
 
     /// [`Self::save_metadata_to_backend`] with the write-commit-economy
@@ -6783,9 +6792,11 @@ impl DataRouter {
         // stamp the RAM provenance to exactly what was persisted.
         let mut minted_version = 0u64;
         // Finding 36: whether the owner RECOMPUTED this publish's staged
-        // accounting (shipped chained/composed merges only) — surfaced to
-        // the displaced-free sites so the caller-frame stream stands down.
-        let mut owner_recomputed = false;
+        // accounting (a shipped chained/composed merge, or — finding 36b —
+        // the custody-scoped Put) — surfaced to the displaced-free sites
+        // so the caller-frame stream stands down. Assigned on every Ok
+        // path of both publish classes below.
+        let owner_recomputed;
         let delta_used = if delta_eligible {
             let mut delta = crate::layout_wire::LayoutDelta::from_final_state(
                 &layout.file_type,
@@ -6855,13 +6866,19 @@ impl DataRouter {
                 }
             }
         } else {
-            if let Err(e) =
-                crate::meta_ship::publish::set_layout_and_size(backend, ino, &bytes, m.size, &refs)
-                    .await
+            match crate::meta_ship::publish::set_layout_and_size(backend, ino, &bytes, m.size, &refs)
+                .await
             {
-                self.note_block_ref_ops(ino, refs);
-                self.reset_layout_provenance(ino);
-                return Err(e);
+                // Finding 36b: the OWNER's custody-scoped compose
+                // recomputed this Put's accounting and owns its displaced
+                // device frees — the caller's frame-derived stream stands
+                // down (the s11-mpiio field arm).
+                Ok(recomputed) => owner_recomputed = recomputed,
+                Err(e) => {
+                    self.note_block_ref_ops(ino, refs);
+                    self.reset_layout_provenance(ino);
+                    return Err(e);
+                }
             }
             false
         };
@@ -6936,6 +6953,15 @@ impl DataRouter {
             let _ = self.backend_router.free_block(old_key).await;
         }
 
+        // Finding 36: latch the verdict for free sites whose covering
+        // publish ran earlier (the epoch close's clean arm) — written
+        // under the caller's held `INODE_META_LOCKS`, like every layout
+        // mutation.
+        if owner_recomputed {
+            let _ = self.inner.publish_recomputed.insert_sync(ino, ());
+        } else {
+            let _ = self.inner.publish_recomputed.remove_sync(&ino);
+        }
         Ok(owner_recomputed)
     }
 
@@ -7107,6 +7133,7 @@ impl DataRouter {
                 pending_block_refs: std::sync::Arc::new(scc::HashMap::new()),
                 rewrite_epochs: std::sync::Arc::new(scc::HashMap::new()),
                 epoch_sweeper_armed: std::sync::atomic::AtomicBool::new(false),
+                publish_recomputed: std::sync::Arc::new(scc::HashMap::new()),
             }),
         };
         // Merge-worker promotion commits layout through the router (weak:
@@ -11183,17 +11210,22 @@ impl DataRouter {
         let Some((_, epoch)) = self.inner.rewrite_epochs.remove_sync(&ino) else {
             return Ok(false);
         };
-        let save_res: Result<()> = match current {
+        // Finding 36: the close's frees follow the verdict of the publish
+        // that COVERED the recorded bindings — this save's own on the
+        // dirty arm, the ino's latched last-save verdict on the clean arm
+        // (the covering save ran earlier under this same lock discipline
+        // and this close never saw its return).
+        let save_res: Result<bool> = match current {
             Some(mut cur) if cur.layout_dirty => {
                 cur.layout_dirty = false;
                 cur.cached_at = std::time::Instant::now();
                 match self
-                    .save_metadata_to_backend(ino, &cur, fencing_token)
+                    .save_metadata_to_backend_ext(ino, &cur, fencing_token, None, &[])
                     .await
                 {
-                    Ok(()) => {
+                    Ok(recomputed) => {
                         self.publish_layout_cache_entry(ino, cur);
-                        Ok(())
+                        Ok(recomputed)
                     }
                     Err(e) => Err(e),
                 }
@@ -11203,10 +11235,14 @@ impl DataRouter {
             // saves persist the current-at-save RAM map under this same
             // lock) or a vanished layout (destroyed ino): the frees below
             // are legal by the §5.2 law.
-            _ => Ok(()),
+            _ => Ok(self
+                .inner
+                .publish_recomputed
+                .read_sync(&ino, |_, _| ())
+                .is_some()),
         };
         match save_res {
-            Ok(()) => {
+            Ok(owner_recomputed) => {
                 // Frees strictly AFTER the durable save (§5.2) — and
                 // RES-1: after the level-3.5 guard too. This loop is the
                 // worst park amplifier in the tree (one displaced key per
@@ -11227,7 +11263,14 @@ impl DataRouter {
                     Ordering::Relaxed,
                 );
                 drop(map_guard);
-                self.free_deferred_keys(deferred).await;
+                // Finding 36 (half 2, the epoch face): a covering publish
+                // the OWNER recomputed owns these device frees — local
+                // hygiene only, never a shipped frame-derived free.
+                if owner_recomputed {
+                    crate::cowriter::retire_displaced_locally(&self.backend_router, &deferred);
+                } else {
+                    self.free_deferred_keys(deferred).await;
+                }
                 Ok(true)
             }
             Err(e @ SqueezefsError::FencingTokenExpired { .. }) => {
@@ -11627,7 +11670,14 @@ impl DataRouter {
         // would hold `overlay_open` nonzero mount-wide.
         drop(_map_guard);
         self.overlay_schedule_retires(ino, overlay_touched);
-        save_res?;
+        // Finding 36 (half 2, the serialized lever leg): a publish the
+        // OWNER recomputed owns its displaced device frees — the
+        // caller-frame keys get their local hygiene and are handed back
+        // to NO ONE (the conveyor pass's law, verbatim).
+        if save_res? {
+            crate::cowriter::retire_displaced_locally(&self.backend_router, &displaced);
+            return Ok(Some(Vec::new()));
+        }
         Ok(Some(displaced))
     }
 
@@ -12919,7 +12969,7 @@ impl DataRouter {
                     .save_metadata_to_backend_refs(ino, &updated_meta, fencing_token, &refs)
                     .await
                 {
-                    Ok(()) => {
+                    Ok(_owner_recomputed) => {
                         self.cache.write_lru.remove(file_path);
                         self.cache.read_lru.remove(file_path);
 

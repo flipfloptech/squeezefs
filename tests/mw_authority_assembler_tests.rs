@@ -2357,7 +2357,10 @@ async fn a_scoped_put_never_reverts_a_demoted_blocks_assembly() {
         )
         .await
         .expect("the scoped Put lands");
-    assert!(matches!(reply, publish::PublishReply::Unit), "{reply:?}");
+    assert!(
+        matches!(reply, publish::PublishReply::PutDone { .. }),
+        "{reply:?}"
+    );
 
     let final_layout = owner_layout(&owner_be, ino).await;
     let map = final_layout.block_map.expect("striped map");

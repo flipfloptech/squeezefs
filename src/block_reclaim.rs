@@ -549,6 +549,16 @@ pub struct ReclaimEntry {
     pub size: u64,
 }
 
+/// Per-device supply bookkeeping (finding 40 — fill-coupled reclaim
+/// pacing): the allocator plus the live queued-entry count for every
+/// device that ever enqueued, read by the worker's supply-pressure probe.
+struct SupplyEntry {
+    alloc: Arc<BlockAllocator>,
+    /// Entries of this device currently queued (bumped BEFORE the push,
+    /// like `len` — an upper bound a concurrent pop can never underflow).
+    queued: AtomicU64,
+}
+
 /// The per-router background reclaim queue. Lock-free (`SegQueue` +
 /// atomics) — enqueue on the write path is push + notify, no latches, no
 /// device I/O.
@@ -556,6 +566,8 @@ pub struct ReclaimQueue {
     q: crossbeam::queue::SegQueue<ReclaimEntry>,
     /// Entries currently queued (upper bound during a push window).
     len: AtomicU64,
+    /// Finding 40: the per-device supply registry (see [`SupplyEntry`]).
+    supply: scc::HashMap<String, SupplyEntry>,
     /// Entries popped whose reclaim has not completed — drains must wait
     /// for these too, or the ENOSPC valve could observe an empty queue
     /// while the last free blocks are in a worker's hands.
@@ -603,6 +615,7 @@ impl ReclaimQueue {
         Arc::new(Self {
             q: crossbeam::queue::SegQueue::new(),
             len: AtomicU64::new(0),
+            supply: scc::HashMap::new(),
             processing: AtomicU64::new(0),
             notify: Arc::new(squeezefs_ipc::sqz_notify::Notify::new()),
             worker_armed: AtomicBool::new(false),
@@ -768,6 +781,7 @@ impl ReclaimQueue {
             .fetch_add(entry.size, Ordering::Relaxed);
         // len before push: `len` is an upper bound, so a concurrent pop
         // can never underflow it.
+        self.note_supply_enqueue(&entry);
         self.len.fetch_add(1, Ordering::AcqRel);
         self.q.push(entry);
         self.ensure_worker();
@@ -799,6 +813,69 @@ impl ReclaimQueue {
         let sig = self.foreground_value();
         let prev = self.fg_last.swap(sig, Ordering::AcqRel);
         sig != prev
+    }
+
+    /// Register one enqueued entry in the per-device supply registry
+    /// (finding 40). Bumped BEFORE the queue push (the `len` discipline),
+    /// so [`Self::note_supply_dequeue`]'s decrement can never underflow.
+    fn note_supply_enqueue(&self, entry: &ReclaimEntry) {
+        if self
+            .supply
+            .read_sync(entry.device_path.as_str(), |_, s| {
+                s.queued.fetch_add(1, Ordering::AcqRel);
+            })
+            .is_none()
+        {
+            match self.supply.entry_sync(entry.device_path.clone()) {
+                scc::hash_map::Entry::Occupied(occ) => {
+                    occ.get().queued.fetch_add(1, Ordering::AcqRel);
+                }
+                scc::hash_map::Entry::Vacant(vac) => {
+                    vac.insert_entry(SupplyEntry {
+                        alloc: entry.allocator.clone(),
+                        queued: AtomicU64::new(1),
+                    });
+                }
+            }
+        }
+    }
+
+    /// Retire one popped entry from the supply registry (every dequeue
+    /// routes through `take_batch`, so this covers the worker, the ENOSPC
+    /// valve and the unmount drain alike).
+    fn note_supply_dequeue(&self, entry: &ReclaimEntry) {
+        self.supply.read_sync(entry.device_path.as_str(), |_, s| {
+            s.queued.fetch_sub(1, Ordering::AcqRel);
+        });
+    }
+
+    /// Fill-coupled drain pressure (finding 40 — the EXA full-store
+    /// collapse, 2026-08-31): `true` when any device's queued reclaim
+    /// debt holds a material share (≥ half) of its remaining free supply.
+    /// The manners deferral starved allocation at high fill — foreground
+    /// writes held the drain deferred while the free list emptied, until
+    /// every allocation paid the ENOSPC valve's synchronous drain
+    /// (12–22 ms fabric round trips inline on the write path). Parked
+    /// allocators are foreground writers too: when supply thins, the
+    /// drain runs regardless of foreground so headroom regenerates AHEAD
+    /// of allocation. Derived from store state only (live queue
+    /// population vs the allocator's live free supply — no fill
+    /// constant); capacity-unbounded allocators never read pressure.
+    fn supply_pressure(&self) -> bool {
+        let mut pressured = false;
+        self.supply.iter_sync(|_, s| {
+            let queued = s.queued.load(Ordering::Acquire);
+            if queued == 0 {
+                return true;
+            }
+            let supply = s.alloc.free_supply_blocks();
+            if supply != u64::MAX && queued.saturating_mul(2) >= supply {
+                pressured = true;
+                return false;
+            }
+            true
+        });
+        pressured
     }
 
     /// Spawn the background worker once (lazily, on the first enqueue —
@@ -841,15 +918,25 @@ impl ReclaimQueue {
                     // writers too); idle, full-width catch-up.
                     let at_cap = q.len.load(Ordering::Acquire) >= q.max_queued;
                     if q.foreground_active() && !at_cap {
-                        if q.len.load(Ordering::Acquire) == 0 {
-                            break; // nothing deferred — park on notify
+                        if q.supply_pressure() {
+                            // Fill-coupled pacing (finding 40): a thin
+                            // free supply outranks manners — drain so
+                            // headroom regenerates ahead of allocation.
+                            METRICS
+                                .block_free_reclaim_supply_drains
+                                .fetch_add(1, Ordering::Relaxed);
+                        } else {
+                            if q.len.load(Ordering::Acquire) == 0 {
+                                break; // nothing deferred — park on notify
+                            }
+                            // Deferred: re-evaluate on a coarse tick (drop
+                            // the Arc across the sleep — the health-worker
+                            // sentinel discipline).
+                            drop(q);
+                            squeezefs_ipc::sqz_time::sleep(std::time::Duration::from_millis(50))
+                                .await;
+                            continue;
                         }
-                        // Deferred: re-evaluate on a coarse tick (drop
-                        // the Arc across the sleep — the health-worker
-                        // sentinel discipline).
-                        drop(q);
-                        squeezefs_ipc::sqz_time::sleep(std::time::Duration::from_millis(50)).await;
-                        continue;
                     }
                     // Demand-derived take: up to one full fan-out's
                     // worth per pass (batch_blocks × lanes_per_dev) — a
@@ -877,6 +964,7 @@ impl ReclaimQueue {
             match self.q.pop() {
                 Some(e) => {
                     self.len.fetch_sub(1, Ordering::AcqRel);
+                    self.note_supply_dequeue(&e);
                     out.push(e);
                 }
                 None => {

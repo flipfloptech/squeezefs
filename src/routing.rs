@@ -6695,6 +6695,33 @@ impl DataRouter {
             Vec::with_capacity(deferred.len() + block_refs.len() + 2);
         refs.extend(deferred);
         refs.extend_from_slice(block_refs);
+        // Finding 38: a ref load beyond ONE journal entry's admission can
+        // NEVER publish — the field corpse: a rewrite storm's writeback
+        // backpressure accumulated ~8k deferred ops on one ino (~370 KB
+        // encoded vs the 128 KiB whole-entry cap), every publish refused
+        // `EntryTooLarge`, every failure REFILLED the accumulator (the
+        // poison), and the unmount drain lost the block on a cacheless
+        // mount ("Dismount durable upload failed"). The overflow commits
+        // FIRST in refs-only transactions (each far under the cap),
+        // under the caller's held 3.5 section so no publish interleaves;
+        // the tail (≤ one chunk) still rides the layout transaction —
+        // §6.2's law holds for every binding this publish changes, and a
+        // crash between chunk and layout leaves only report-only fsck C8
+        // residue (space-safe, data-safe) instead of unpublishable data.
+        const BLOCK_REF_TX_CHUNK: usize = 512;
+        while refs.len() > BLOCK_REF_TX_CHUNK {
+            let tail = refs.split_off(BLOCK_REF_TX_CHUNK);
+            let chunk = std::mem::replace(&mut refs, tail);
+            if let Err(e) = crate::meta_ship::publish::commit_block_refs(backend, ino, &chunk).await
+            {
+                // Never-lossy refill: the un-committed remainder returns
+                // to the accumulator for the next save's carry.
+                let mut refill = chunk;
+                refill.extend(refs.drain(..));
+                self.note_block_ref_ops(ino, refill);
+                return Err(e);
+            }
+        }
         if let Some(ref new_blob) = new_indirect_key {
             match self.backend_router.block_ref_for(
                 new_blob,

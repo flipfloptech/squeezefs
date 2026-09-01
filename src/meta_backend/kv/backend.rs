@@ -7623,7 +7623,11 @@ impl KvMetaBackend {
         } else {
             delta.encode_unversioned()
         });
-        let weight = (delta_wire.len() + full_layout.len()) as u64;
+        // Finding 38: the weight is the member's ENTRY contribution — the
+        // refs are journal bytes too (46 B/op measured), and a weight
+        // that ignored them let the group's one-entry transaction blow
+        // the whole-entry cap.
+        let weight = (delta_wire.len() + full_layout.len() + block_refs.len() * 46 + 256) as u64;
         // Enqueue-then-elect with no await between (the conveyor_core
         // no-lost-wakeup protocol).
         self.layout_conveyor.enqueue(
@@ -7699,7 +7703,12 @@ impl KvMetaBackend {
                 }
             };
             let cap = crate::routing::publish_commit_group_max().unwrap_or(be.batch_max_txs);
-            let batch = conveyor.drain(cap, be.batch_max_bytes);
+            // Finding 38: this conveyor's batch is ONE KvTx = ONE journal
+            // entry (unlike the M7 conveyor's N entries), so its byte
+            // bound is the whole-entry cap with headroom for the shared
+            // framing — the ring-scale `batch_max_bytes` let a group
+            // compose an entry no journal could ever admit.
+            let batch = conveyor.drain(cap, super::journal::MAX_ENTRY_LEN / 2);
             if batch.is_empty() {
                 drop(be); // never park on leadership holding the backend
                 if !conveyor.unlead_and_recheck() {

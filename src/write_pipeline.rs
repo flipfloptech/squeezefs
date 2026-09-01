@@ -25,9 +25,11 @@
 //! 1. **The R5 memory budget** — in-flight write-block bytes are the
 //!    gauged `write_pipeline_inflight` component (a non-sheddable drain
 //!    like `transport_payload_buffers`: Red clamps the admission target to
-//!    its floor so the gauge converges by completion — honest
-//!    backpressure, never OOM), and the target is hard-capped at
-//!    budget ÷ [`BUDGET_CAP_DIVISOR`].
+//!    the un-headroomed measured-BDP sum — floored by the cold posture —
+//!    so the queueing bytes shed while the measured drain rate sustains
+//!    and the gauge converges by completion — honest backpressure, never
+//!    OOM and never a starved drain; finding 39), and the target is
+//!    hard-capped at budget ÷ [`BUDGET_CAP_DIVISOR`].
 //! 2. **Honest backpressure to the writer** — admission is awaited in the
 //!    WRITE handler before the completing write ACKs, so a full pipe
 //!    stalls the writer exactly like every other admission gate.
@@ -94,10 +96,12 @@ pub use crate::write_pipeline_core::{
     ProbeCore, PROBE_COOLDOWN_EPOCHS, PROBE_EPOCH_MS, PROBE_MUL_MAX, PROBE_MUL_ONE,
 };
 
-/// Cold-start / Red-clamp floor: blocks per known backend lane (and the
-/// aggregate floor while no lane has reported). Small on purpose — the
-/// measured BDP owns the depth; the floor only keeps the pipe fed while
-/// the estimates learn (and is the honest-backpressure posture under Red).
+/// Cold-start floor: blocks per known backend lane (and the aggregate
+/// floor while no lane has reported). Small on purpose — the measured BDP
+/// owns the depth; the floor only keeps the pipe fed while the estimates
+/// learn. Under Red it is the LOWER bound of the derived drain clamp,
+/// never the clamp itself (finding 39: a fixed aggregate clamp starved a
+/// 10-lane fabric to ⅛ of its measured drain).
 pub const FLOOR_BLOCKS_PER_LANE: u64 = 8;
 
 /// BDP multiplier: absorbs service-time variance and the non-device legs
@@ -181,13 +185,17 @@ pub fn sync_inline() -> bool {
     depth_override() == Some(0)
 }
 
-/// Pure lane-target arithmetic: `max(floor, BDP × HEADROOM)` where
-/// `BDP = bw_peak × lat_floor` (u128 intermediate — a 100 GB/s × 1 s
-/// product must not wrap).
+/// Pure raw-BDP arithmetic: `bw_peak × lat_floor` (u128 intermediate — a
+/// 100 GB/s × 1 s product must not wrap). The measured minimum in-flight
+/// that sustains the measured drain rate — the Red clamp's per-lane term.
+pub fn lane_bdp_bytes(bw_peak_bps: u64, lat_floor_ns: u64) -> u64 {
+    ((bw_peak_bps as u128) * (lat_floor_ns as u128) / 1_000_000_000u128) as u64
+}
+
+/// Pure lane-target arithmetic: `max(floor, BDP × HEADROOM)`.
 pub fn lane_target_bytes(bw_peak_bps: u64, lat_floor_ns: u64, block_size: u64) -> u64 {
     let floor = FLOOR_BLOCKS_PER_LANE.saturating_mul(block_size);
-    let bdp = ((bw_peak_bps as u128) * (lat_floor_ns as u128) / 1_000_000_000u128) as u64;
-    floor.max(bdp.saturating_mul(HEADROOM))
+    floor.max(lane_bdp_bytes(bw_peak_bps, lat_floor_ns).saturating_mul(HEADROOM))
 }
 
 /// Pure window roll for the bandwidth peak: the windowed rate, or the
@@ -420,10 +428,10 @@ impl WritePipeline {
 
     /// The aggregate depth target in bytes (see module docs): pinned
     /// override verbatim, else Σ per-lane BDP targets (floored) — Red
-    /// clamps to the floor (drain posture: honest writer backpressure
-    /// while in-flight custody converges by completion), and the R5
-    /// budget cap bounds everything (never below one block: admission
-    /// must always be able to make progress).
+    /// clamps to the measured drain bound (drain posture: honest writer
+    /// backpressure while in-flight custody converges by completion), and
+    /// the R5 budget cap bounds everything (never below one block:
+    /// admission must always be able to make progress).
     pub fn depth_target_bytes(&self, block_size: u64) -> u64 {
         let bs = block_size.max(1);
         let floor = FLOOR_BLOCKS_PER_LANE.saturating_mul(bs);
@@ -440,7 +448,21 @@ impl WritePipeline {
                 scaled.max(floor)
             }
         };
-        let raw = if (self.red)() { raw.min(floor) } else { raw };
+        // Finding 39 (EXA field capture, 2026-08-31): Red used to clamp to
+        // the FIXED aggregate floor — 32 MiB in flight across a 10-lane
+        // ~12 ms fabric is ≈ 2.4 GB/s by Little's law, an 8× collapse that
+        // starved the very drain that converges the gauge (multi-second
+        // admission tails, parked_gate_waits +19,375). The clamp now
+        // DERIVES from the measured drain: the un-headroomed raw-BDP sum —
+        // shedding exactly the headroom/probe queueing bytes (≥ ⅔ of the
+        // component under the ×3 HEADROOM) while sustaining the measured
+        // completion rate. The fixed floor survives only as the cold
+        // posture (nothing learned) and the progress guarantee.
+        let raw = if (self.red)() {
+            raw.min(self.red_drain_sum_bytes().max(floor))
+        } else {
+            raw
+        };
         raw.min(self.cap_bytes(bs))
     }
 
@@ -463,6 +485,22 @@ impl WritePipeline {
                 l.bw_peak_bps.load(Ordering::Relaxed),
                 l.lat_floor_ns.load(Ordering::Relaxed),
                 bs,
+            ));
+            true
+        });
+        sum
+    }
+
+    /// Σ per-lane RAW BDP (no HEADROOM, no probe multiplier) — the Red
+    /// clamp bound: the measured minimum in-flight that still sustains the
+    /// measured drain rate (finding 39; see `depth_target_bytes`). Cold
+    /// lanes contribute nothing — the aggregate floor covers them.
+    fn red_drain_sum_bytes(&self) -> u64 {
+        let mut sum = 0u64;
+        self.lanes.iter_sync(|_, l| {
+            sum = sum.saturating_add(lane_bdp_bytes(
+                l.bw_peak_bps.load(Ordering::Relaxed),
+                l.lat_floor_ns.load(Ordering::Relaxed),
             ));
             true
         });

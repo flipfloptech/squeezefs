@@ -238,8 +238,12 @@ impl Rig {
         bincode::deserialize(&bytes).expect("bincode head")
     }
 
-    /// Every tree-7 record of `ino`, decoded to key strings.
+    /// Every tree-7 record of `ino`, decoded to key strings. PR 3 emits
+    /// POINT for undecorated keys (this rig's are all default-slot bare
+    /// offsets), STRING for decorated shapes — resolve both.
     async fn tree_records(&self, ino: u64) -> Vec<(u32, String)> {
+        let default_tag =
+            squeezefs::meta_backend::kv::block_refs::volume_tag(DATA_VOL_ID);
         let mut out = Vec::new();
         let mut cursor = 0u32;
         loop {
@@ -252,10 +256,14 @@ impl Rig {
                 break;
             };
             for (idx, entry) in page {
-                let MapEntry::String(bytes) = entry else {
-                    panic!("PR 2 writes STRING records only, got {entry:?}");
+                let key = match entry {
+                    MapEntry::String(bytes) => String::from_utf8(bytes).expect("utf8 key"),
+                    MapEntry::Point { vol_tag, offset } => {
+                        assert_eq!(vol_tag, default_tag, "the rig's one data volume");
+                        offset.to_string()
+                    }
                 };
-                out.push((idx, String::from_utf8(bytes).expect("utf8 key")));
+                out.push((idx, key));
             }
             cursor = match last.checked_add(1) {
                 Some(n) => n,

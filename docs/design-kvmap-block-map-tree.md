@@ -1,9 +1,10 @@
 # Design: PB-class file support — the `TREE_BLOCK_MAP` KV tree (finding 42)
 
-**Status: DRAFT Rev 1.6** (design phase 2026-09-01; Rev 0 drafted by the
+**Status: DRAFT Rev 1.7** (design phase 2026-09-01; Rev 0 drafted by the
 f42 planning pass; Rev 1 folds the adversarial review's amendments — §6 —
 whose three critical findings supersede the corresponding Rev 0 clauses;
-Rev 1.6 records PR 5b's landed laws — §12. Do not start the PR ladder
+Rev 1.7 records PR 5b's landed laws — §13, numbered past dev's Rev 1.6
+PR-6-split section. Do not start the PR ladder
 before §6's A1–A5 are reflected in PR 1/2 scopes). The implementation is
 the `feat/kvmap-*` PR ladder in §4.
 
@@ -386,6 +387,7 @@ the S5 staleness bound (safe via free-grace); the verb's load-bearing
 face is the WRITE-side base refresh — measure the read side before
 building it.
 
+<<<<<<< HEAD
 ## 12. Rev 1.6 — the PR-6 split (2026-09-02)
 
 The PR-6 pre-map splits the economy/scale rung into three, with four
@@ -432,7 +434,10 @@ Also: the routing-layer "incarnation not engaged" comment contradicts
 Rev 1.4 #1 — verify bit-13 default engagement before sizing POINT2
 (likely a stale comment); the pre-short-circuit O(map) inline-sizing
 pass on kvmap saves is a free CPU hoist for 6a.
-## 12. Rev 1.6 — PR 5b landed: kvmap multi-writer support (2026-09-02, normative)
+## 13. Rev 1.7 — PR 5b landed: kvmap multi-writer support (2026-09-02, normative)
+=======
+## 13. Rev 1.7 — PR 5b landed: kvmap multi-writer support (2026-09-02, normative)
+>>>>>>> 88c9de3e (docs(design): kvmap Rev 1.7 — renumber the PR 5b section past dev's Rev 1.6 (PR-6 split) to keep the merge clean)
 
 PR 5b (`feat/kvmap-mw`) replaced PR 5a's two loud refusals with real
 support. The landed laws:

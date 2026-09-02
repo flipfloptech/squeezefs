@@ -102,18 +102,15 @@ async fn serial() -> tokio::sync::MutexGuard<'static, ()> {
 fn phase_count(family: &serde_json::Value, phase: &str) -> u64 {
     family
         .get(phase)
-        .unwrap_or_else(|| panic!("phase key {phase} missing from family: {family}"))
-        .as_object()
-        .expect("phase histogram must be a bucket object")
-        .values()
-        .map(|v| v.as_u64().expect("bucket counts are u64"))
-        .sum()
+        .unwrap_or_else(|| panic!("phase key {phase} missing from family: {family}"))["count"]
+        .as_u64()
+        .expect("histogram count word")
 }
 
 fn read_family_snapshot_sums() -> Vec<(String, u64)> {
     fuse3::read_transport_phase_snapshot()
         .iter()
-        .map(|(name, buckets)| ((*name).to_string(), buckets.iter().sum::<u64>()))
+        .map(|p| (p.name.to_string(), p.count))
         .collect()
 }
 
@@ -211,10 +208,10 @@ async fn write_family_shape_phase_exact_and_independent() {
     assert_eq!(snap1.len(), TRANSPORT_PHASES.len());
     for (i, name) in TRANSPORT_PHASES.iter().enumerate() {
         assert_eq!(
-            snap1[i].0, *name,
+            snap1[i].name, *name,
             "write transport phase order/name must mirror the read family"
         );
-        let d: u64 = snap1[i].1.iter().sum::<u64>() - snap0[i].1.iter().sum::<u64>();
+        let d: u64 = snap1[i].count - snap0[i].count;
         let want = u64::from(*name == "queue_wait");
         assert_eq!(
             d, want,
@@ -239,8 +236,7 @@ async fn write_family_shape_phase_exact_and_independent() {
     let wsnap1 = fuse3::write_transport_phase_snapshot();
     for i in 0..TRANSPORT_PHASES.len() {
         assert_eq!(
-            wsnap1[i].1.iter().sum::<u64>(),
-            wsnap0[i].1.iter().sum::<u64>(),
+            wsnap1[i].count, wsnap0[i].count,
             "recording a READ span must never move the WRITE transport family"
         );
     }
@@ -264,7 +260,9 @@ async fn write_family_json_buckets_through_the_shared_core() {
     let fam = write_transport_phase_json();
     for name in TRANSPORT_PHASES {
         let hist = fam.get(name).expect("phase present in JSON");
-        let obj = hist.as_object().expect("bucketed object");
+        // Buckets live under "buckets" beside the exact count/sum_ns words
+        // (e2e audit A).
+        let obj = hist["buckets"].as_object().expect("bucketed object");
         assert_eq!(
             obj.len(),
             squeezefs::latency_core::LATENCY_BUCKET_LABELS.len(),
@@ -282,10 +280,10 @@ async fn write_family_json_buckets_through_the_shared_core() {
     let snap = fuse3::write_transport_phase_snapshot();
     let total_row = snap
         .iter()
-        .find(|(n, _)| *n == "transport_total")
+        .find(|p| p.name == "transport_total")
         .expect("transport_total phase");
     assert!(
-        total_row.1[idx] >= 1,
+        total_row.buckets[idx] >= 1,
         "the recorded 100 µs span must land in shared-core bucket {idx}"
     );
 }

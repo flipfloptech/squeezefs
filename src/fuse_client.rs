@@ -3788,22 +3788,13 @@ pub fn fused_timeline_json() -> serde_json::Value {
     transport_phase_json(fuse3::fused_timeline_snapshot())
 }
 
-fn transport_phase_json<const N: usize>(
-    snapshot: [(&'static str, [u64; crate::latency_core::LATENCY_BUCKETS]); N],
-) -> serde_json::Value {
+fn transport_phase_json<const N: usize>(snapshot: [fuse3::PhaseSnapshot; N]) -> serde_json::Value {
     let mut phases = serde_json::Map::new();
-    for (pname, buckets) in snapshot {
-        let mut map = serde_json::Map::new();
-        for (i, label) in crate::latency_core::LATENCY_BUCKET_LABELS
-            .iter()
-            .enumerate()
-        {
-            map.insert(
-                label.to_string(),
-                serde_json::Value::Number(serde_json::Number::from(buckets[i])),
-            );
-        }
-        phases.insert(pname.to_string(), serde_json::Value::Object(map));
+    for p in snapshot {
+        phases.insert(
+            p.name.to_string(),
+            histogram_json(&p.buckets, p.count, p.sum_ns),
+        );
     }
     serde_json::Value::Object(phases)
 }
@@ -4201,43 +4192,68 @@ impl<T> std::ops::DerefMut for Align64<T> {
     }
 }
 
+/// The repo's standard latency histogram: 26 power-of-two µs buckets PLUS
+/// the exact `count` / `sum_ns` words (e2e audit A, 2026-09-02 — before
+/// them every quoted mean was a bucket-midpoint estimate with up to 2×
+/// per-bucket error and no containment law was checkable to the ns).
+/// `record` = three relaxed `fetch_add`s; cost priced in
+/// `benches/high_concurrency_bench.rs` (`perop_counter_sharding`).
 pub struct LatencyHistogram {
     pub buckets: [AtomicU64; 26],
+    count: AtomicU64,
+    sum_ns: AtomicU64,
 }
 
 impl Default for LatencyHistogram {
     fn default() -> Self {
         Self {
-            buckets: [
-                AtomicU64::new(0),
-                AtomicU64::new(0),
-                AtomicU64::new(0),
-                AtomicU64::new(0),
-                AtomicU64::new(0),
-                AtomicU64::new(0),
-                AtomicU64::new(0),
-                AtomicU64::new(0),
-                AtomicU64::new(0),
-                AtomicU64::new(0),
-                AtomicU64::new(0),
-                AtomicU64::new(0),
-                AtomicU64::new(0),
-                AtomicU64::new(0),
-                AtomicU64::new(0),
-                AtomicU64::new(0),
-                AtomicU64::new(0),
-                AtomicU64::new(0),
-                AtomicU64::new(0),
-                AtomicU64::new(0),
-                AtomicU64::new(0),
-                AtomicU64::new(0),
-                AtomicU64::new(0),
-                AtomicU64::new(0),
-                AtomicU64::new(0),
-                AtomicU64::new(0),
-            ],
+            buckets: [const { AtomicU64::new(0) }; 26],
+            count: AtomicU64::new(0),
+            sum_ns: AtomicU64::new(0),
         }
     }
+}
+
+/// JSON keys of the histogram export (beside the byte-identical bucket
+/// labels — tooling descends into `buckets` for the old map).
+pub const HIST_JSON_BUCKETS: &str = "buckets";
+pub const HIST_JSON_COUNT: &str = "count";
+pub const HIST_JSON_SUM_NS: &str = "sum_ns";
+pub const HIST_JSON_MEAN_NS: &str = "mean_ns";
+
+/// Render one histogram (bucket counts + exact words) in the ONE export
+/// shape every family uses — root `LatencyHistogram` and the fuse3
+/// sharded snapshots alike.
+pub fn histogram_json(
+    buckets: &[u64; crate::latency_core::LATENCY_BUCKETS],
+    count: u64,
+    sum_ns: u64,
+) -> serde_json::Value {
+    let mut map = serde_json::Map::new();
+    for (i, label) in crate::latency_core::LATENCY_BUCKET_LABELS
+        .iter()
+        .enumerate()
+    {
+        map.insert(
+            label.to_string(),
+            serde_json::Value::Number(serde_json::Number::from(buckets[i])),
+        );
+    }
+    let mut out = serde_json::Map::new();
+    out.insert(
+        HIST_JSON_BUCKETS.to_string(),
+        serde_json::Value::Object(map),
+    );
+    out.insert(HIST_JSON_COUNT.to_string(), serde_json::Value::from(count));
+    out.insert(
+        HIST_JSON_SUM_NS.to_string(),
+        serde_json::Value::from(sum_ns),
+    );
+    out.insert(
+        HIST_JSON_MEAN_NS.to_string(),
+        serde_json::Value::from(sum_ns.checked_div(count).unwrap_or(0)),
+    );
+    serde_json::Value::Object(out)
 }
 
 impl LatencyHistogram {
@@ -4246,24 +4262,32 @@ impl LatencyHistogram {
         // the same function the fuse3 fork's transport-side histograms
         // use — root and transport phase tables are bucket-for-bucket
         // comparable by construction.
-        let micros = duration.as_micros() as u64;
-        let bucket_idx = crate::latency_core::latency_bucket_index(micros);
+        let ns = duration.as_nanos().min(u64::MAX as u128) as u64;
+        let bucket_idx = crate::latency_core::latency_bucket_index(ns / 1_000);
         self.buckets[bucket_idx].fetch_add(1, Ordering::Relaxed);
+        self.count.fetch_add(1, Ordering::Relaxed);
+        self.sum_ns.fetch_add(ns, Ordering::Relaxed);
+    }
+
+    /// Spans recorded (exact).
+    pub fn count(&self) -> u64 {
+        self.count.load(Ordering::Relaxed)
+    }
+
+    /// Σ recorded spans, ns (exact).
+    pub fn sum_ns(&self) -> u64 {
+        self.sum_ns.load(Ordering::Relaxed)
+    }
+
+    /// `sum_ns / count` (0 on an empty histogram).
+    pub fn mean_ns(&self) -> u64 {
+        self.sum_ns().checked_div(self.count()).unwrap_or(0)
     }
 
     pub fn to_json(&self) -> serde_json::Value {
-        let mut map = serde_json::Map::new();
-        for (i, label) in crate::latency_core::LATENCY_BUCKET_LABELS
-            .iter()
-            .enumerate()
-        {
-            let val = self.buckets[i].load(Ordering::Relaxed);
-            map.insert(
-                label.to_string(),
-                serde_json::Value::Number(serde_json::Number::from(val)),
-            );
-        }
-        serde_json::Value::Object(map)
+        let buckets: [u64; crate::latency_core::LATENCY_BUCKETS] =
+            std::array::from_fn(|i| self.buckets[i].load(Ordering::Relaxed));
+        histogram_json(&buckets, self.count(), self.sum_ns())
     }
 
     /// The p99 bucket bound, µs (`None` on an empty histogram) — the live

@@ -316,8 +316,10 @@ after_full = json.load(open(sys.argv[2]))
 if after_full.get("fuse3_zc_negotiated"):
     delta["fuse3_zc_negotiated"] = after_full["fuse3_zc_negotiated"]
 line = " ".join(f"{k}={delta[k]}" for k in keys if delta.get(k))
-# Histogram-mean PIN columns (bucket-midpoint estimate over the row's
-# delta): ipc_ingress_ns mean; ipc_drain_pass_ns mean + ops/pass + us/op.
+# Histogram-mean PIN columns over the row's delta: ipc_ingress_ns mean;
+# ipc_drain_pass_ns mean + ops/pass + us/op. EXACT from the histogram's
+# count/sum_ns words (e2e audit A, 2026-09-02); the bucket-midpoint
+# estimate is the fallback for pre-audit snapshots.
 def mid_us(lbl):
     if lbl == ">16s":
         return 16e6
@@ -333,6 +335,11 @@ def hist_delta(key):
     hb, ha = before.get(key), after_full.get(key)
     if not isinstance(ha, dict):
         return None
+    if "sum_ns" in ha and "count" in ha:
+        hb = hb if isinstance(hb, dict) else {}
+        n = ha["count"] - hb.get("count", 0)
+        w = (ha["sum_ns"] - hb.get("sum_ns", 0)) / 1e3
+        return (n, (w / n) if n else 0.0)
     n, w = 0, 0.0
     for lbl, av in ha.items():
         dd = av - (hb.get(lbl, 0) if isinstance(hb, dict) else 0)

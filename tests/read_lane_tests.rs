@@ -611,9 +611,8 @@ async fn lane_completions_refill_the_pipeline_without_a_touch() {
 fn fill_total_count() -> u64 {
     // The histogram JSON is `{bucket_label: count}`; the phase's op count
     // is the bucket sum.
-    squeezefs::fuse_client::read_fill_phase_json()["fill_total"]
-        .as_object()
-        .map(|m| m.values().filter_map(|v| v.as_u64()).sum())
+    squeezefs::fuse_client::read_fill_phase_json()["fill_total"]["count"]
+        .as_u64()
         .unwrap_or(0)
 }
 

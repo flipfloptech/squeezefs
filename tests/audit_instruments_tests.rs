@@ -51,7 +51,11 @@ fn histogram_reports_exact_sum_count_and_mean() {
     }
     let want_sum: u64 = spans_ns.iter().sum();
     assert_eq!(h.count(), spans_ns.len() as u64, "one count per record");
-    assert_eq!(h.sum_ns(), want_sum, "sum is exact to the ns, not a bucket estimate");
+    assert_eq!(
+        h.sum_ns(),
+        want_sum,
+        "sum is exact to the ns, not a bucket estimate"
+    );
     assert_eq!(h.mean_ns(), want_sum / spans_ns.len() as u64);
 
     // The bucket law is unchanged: the same µs → index formula as before.
@@ -102,8 +106,8 @@ fn empty_histogram_json_is_all_zero() {
 #[test]
 fn phase_families_export_the_exact_shape() {
     use squeezefs::fuse_client::{
-        meta_txpass_phase_json, publish_phase_json, read_fill_phase_json,
-        read_serve_phase_json, write_pipeline_phase_json,
+        meta_txpass_phase_json, publish_phase_json, read_fill_phase_json, read_serve_phase_json,
+        write_pipeline_phase_json,
     };
     for fam in [
         write_pipeline_phase_json(),
@@ -116,7 +120,11 @@ fn phase_families_export_the_exact_shape() {
             for k in HIST_KEYS {
                 assert!(h.get(k).is_some(), "phase {phase} lacks {k}");
             }
-            assert_eq!(bucket_sum(h), hist_count(h), "phase {phase}: Σ buckets ≡ count");
+            assert_eq!(
+                bucket_sum(h),
+                hist_count(h),
+                "phase {phase}: Σ buckets ≡ count"
+            );
         }
     }
 }
@@ -173,7 +181,10 @@ fn fuse3_sharded_fold_is_exact() {
         .zip(before[phase_idx].buckets.iter())
         .map(|(a, b)| a - b)
         .sum();
-    assert_eq!(bucket_delta, want_count, "Σ buckets ≡ count on the fold too");
+    assert_eq!(
+        bucket_delta, want_count,
+        "Σ buckets ≡ count on the fold too"
+    );
 
     // The daemon renders the fold through the same JSON shape.
     let json = squeezefs::fuse_client::write_transport_phase_json();

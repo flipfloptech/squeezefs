@@ -76,6 +76,11 @@ def hist_mean(container_key, phase=None):
     if phase is not None:
         hb = (hb or {}).get(phase); ha = (ha or {}).get(phase)
     if not isinstance(ha, dict): return "ABSENT"
+    if "sum_ns" in ha:  # exact words (e2e audit A, 2026-09-02)
+        hb = hb if isinstance(hb, dict) else {}
+        n = ha["count"] - hb.get("count", 0)
+        w = (ha["sum_ns"] - hb.get("sum_ns", 0)) / 1e3
+        return f"{w/n:.1f}us(n={n})" if n else "0"
     n, w = 0, 0.0
     for lbl, av in ha.items():
         if not isinstance(av, (int, float)): continue

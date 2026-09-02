@@ -96,12 +96,21 @@ labels = ["<=1us","<=2us","<=4us","<=8us","<=16us","<=32us","<=64us",
           "<=1024ms","<=2s","<=4s","<=8s","<=16s",">16s"]
 def mid_us(i):  # bucket i spans (2^(i-1), 2^i] us; 0 = <=1us
     return 1.0 if i == 0 else 1.5 * (1 << (i - 1))
-print(f"[phases] {label}: phase, spans, est_mean_ms, est_total_ms")
+# Exact means from the count/sum_ns words when the snapshot carries them
+# (e2e audit A, 2026-09-02; buckets then live under "buckets"); the
+# midpoint estimate only serves pre-audit snapshots.
+def bk(h): return h.get("buckets", h)
+print(f"[phases] {label}: phase, spans, mean_ms, total_ms")
 for ph in order:
     if ph not in a: continue
-    d = [a[ph].get(k, 0) - (b.get(ph, {}).get(k, 0) if b else 0) for k in labels]
-    n = sum(d)
-    tot_us = sum(c * mid_us(i) for i, c in enumerate(d))
+    hb = b.get(ph, {}) if b else {}
+    if "sum_ns" in a[ph]:
+        n = a[ph]["count"] - hb.get("count", 0)
+        tot_us = (a[ph]["sum_ns"] - hb.get("sum_ns", 0)) / 1000.0
+    else:
+        d = [bk(a[ph]).get(k, 0) - bk(hb).get(k, 0) for k in labels]
+        n = sum(d)
+        tot_us = sum(c * mid_us(i) for i, c in enumerate(d))
     mean_ms = (tot_us / n / 1000.0) if n else 0.0
     print(f"[phases] {label}: {ph:14s} {n:8d} {mean_ms:10.3f} {tot_us/1000.0:12.1f}")
 EOF

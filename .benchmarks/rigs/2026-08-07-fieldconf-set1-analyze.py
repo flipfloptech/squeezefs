@@ -75,7 +75,10 @@ if fence != 0:
 
 # --- dma phase mode ------------------------------------------------------
 def dma_hist(snap):
-    return snap.get("write_pipeline_phase_ns", {}).get("dma", {})
+    h = snap.get("write_pipeline_phase_ns", {}).get("dma", {})
+    # Buckets live under "buckets" beside the exact count/sum_ns words
+    # (e2e audit A, 2026-09-02); pre-audit snapshots are flat.
+    return h.get("buckets", h)
 
 
 hd = {}

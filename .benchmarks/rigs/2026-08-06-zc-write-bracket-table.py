@@ -90,12 +90,23 @@ def phase_delta(leg, row, phase):
     b = load(f"{OUT}/{leg}-{row}-before.json").get("write_pipeline_phase_ns", {})
     a = load(f"{OUT}/{leg}-{row}-after.json").get("write_pipeline_phase_ns", {})
     pb, pa = b.get(phase, {}), a.get(phase, {})
+    if "sum_ns" in pa:
+        # Exact words (e2e audit A, 2026-09-02): carry the delta's exact
+        # mean beside the bucket deltas (which live under "buckets").
+        n = pa["count"] - pb.get("count", 0)
+        d = {k: pa["buckets"].get(k, 0) - pb.get("buckets", {}).get(k, 0) for k in pa["buckets"]}
+        d["__mean_us"] = ((pa["sum_ns"] - pb.get("sum_ns", 0)) / 1e3 / n) if n else 0
+        return d
     return {k: pa.get(k, 0) - pb.get(k, 0) for k in pa if pa.get(k, 0) != pb.get(k, 0)}
 
 
 def bucket_mean_us(d):
-    """Approximate mean from bucket deltas (bucket midpoint heuristic)."""
+    """Mean of a phase delta: exact when the snapshot carried the
+    count/sum_ns words, else the bucket-midpoint heuristic."""
     import re
+
+    if "__mean_us" in d:
+        return d["__mean_us"]
 
     def edge(k):
         m = re.match(r"<=(\d+)(us|ms|s)", k)
@@ -131,7 +142,7 @@ for row in ROWS:
             f"{s['dev_w_gb']:>8.1f} {s['amp']:>5.2f}"
         )
 
-print("\n== write_pipeline_phase_ns bucket-mean shift (us, midpoint estimate) ==")
+print("\n== write_pipeline_phase_ns mean shift (us; exact on audit-A snapshots, midpoint otherwise) ==")
 print(f"{'row':>7} {'phase':>11} " + " ".join(f"{leg:>9}" for leg, _ in WLEGS))
 for row in ROWS:
     for ph in PHASES:

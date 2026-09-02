@@ -2826,6 +2826,9 @@ def load(p):
     m = root.get("metrics", root)
     return m.get(hist, {}).get(phase, {})
 a, b = load(p0), load(p1)
+# Buckets live under "buckets" beside the exact count/sum_ns words (e2e
+# audit A, 2026-09-02); pre-audit snapshots are the flat bucket map.
+a, b = a.get("buckets", a), b.get("buckets", b)
 delta = [(k, (b.get(k, 0) or 0) - (a.get(k, 0) or 0)) for k in b]
 total = sum(n for _, n in delta)
 if total <= 0:

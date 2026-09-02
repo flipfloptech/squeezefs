@@ -5,8 +5,10 @@ Takes two stats-inode metric snapshots (the fleet_width_bracket.sh
 pre/post files) and prints, for every ALWAYS-ON phase family
 (write_pipeline_phase_ns, publish_phase_ns, meta_txpass_phase_ns,
 write_transport_phase_ns, read_serve_phase_ns if it moved), the per-phase
-bucket-count delta, an estimated total residence (bucket-midpoint
-weighted) and the estimated mean — the instrument the 2026-07-31
+bucket-count delta, the total residence and the mean — EXACT from the
+histogram's count/sum_ns words when the snapshot carries them (e2e audit
+A, 2026-09-02; buckets then live under "buckets"), bucket-midpoint
+estimated on pre-audit snapshots — the instrument the 2026-07-31
 write-wall / 2026-08-01 publish-drain campaigns built, composed per arm.
 
 Usage: phase_delta.py <pre.json> <post.json> [family ...]
@@ -65,23 +67,29 @@ def main():
         if not isinstance(a, dict) or not isinstance(b, dict):
             continue
         rows = []
+        exact = False
         for phase in b:
             pb, pa = a.get(phase, {}), b[phase]
             dcount = 0
             dtot = 0.0
             hi = ""
-            for lab, v in pa.items():
-                d = v - pb.get(lab, 0)
+            for lab, v in pa.get("buckets", pa).items():
+                d = v - pb.get("buckets", pb).get(lab, 0)
                 if d:
                     dcount += d
                     dtot += d * MID.get(lab, 0.0)
                     hi = lab  # labels iterate in insertion order (ascending)
+            if "sum_ns" in pa:
+                exact = True
+                dcount = pa["count"] - pb.get("count", 0)
+                dtot = (pa["sum_ns"] - pb.get("sum_ns", 0)) / 1e3
             if dcount:
                 rows.append((phase, dcount, dtot, dtot / dcount, hi))
         if not rows:
             continue
+        tag = "" if exact else "est "
         print(f"== {fam} ==")
-        print(f"  {'phase':<18} {'n':>9} {'est total':>12} {'est mean':>10}  max-bucket")
+        print(f"  {'phase':<18} {'n':>9} {tag + 'total':>12} {tag + 'mean':>10}  max-bucket")
         for phase, n, tot, mean, hi in rows:
             print(f"  {phase:<18} {n:>9} {fmt_us(tot):>12} {fmt_us(mean):>10}  {hi}")
     # Scalar ledger of interest for the durable decomposition.

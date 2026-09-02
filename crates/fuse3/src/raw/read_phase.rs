@@ -82,7 +82,62 @@ enum OpClass {
 
 const OP_CLASSES: usize = 2;
 
-type PhaseTable = [[AtomicU64; LATENCY_BUCKETS]; PHASES];
+/// One phase's storage: the standard bucket set plus the exact `count` /
+/// `sum_ns` words (e2e audit A, 2026-09-02 — a bucket-only table can only
+/// yield midpoint-estimated means). Recording is three relaxed RMWs on
+/// this thread's shard.
+struct PhaseHist {
+    buckets: [AtomicU64; LATENCY_BUCKETS],
+    count: AtomicU64,
+    sum_ns: AtomicU64,
+}
+
+impl PhaseHist {
+    const fn new() -> Self {
+        Self {
+            buckets: [const { AtomicU64::new(0) }; LATENCY_BUCKETS],
+            count: AtomicU64::new(0),
+            sum_ns: AtomicU64::new(0),
+        }
+    }
+
+    #[inline]
+    fn record_ns(&self, ns: u64) {
+        self.buckets[latency_bucket_index(ns / 1_000)].fetch_add(1, Ordering::Relaxed);
+        self.count.fetch_add(1, Ordering::Relaxed);
+        self.sum_ns.fetch_add(ns, Ordering::Relaxed);
+    }
+}
+
+/// One phase's folded snapshot (Σ over the per-thread shards): bucket
+/// counts index-aligned with `latency_core::LATENCY_BUCKET_LABELS`, plus
+/// the exact `count` and `sum_ns`.
+#[derive(Debug, Clone, Copy)]
+pub struct PhaseSnapshot {
+    pub name: &'static str,
+    pub buckets: [u64; LATENCY_BUCKETS],
+    pub count: u64,
+    pub sum_ns: u64,
+}
+
+fn fold<'a>(name: &'static str, hists: impl Iterator<Item = &'a PhaseHist>) -> PhaseSnapshot {
+    let mut snap = PhaseSnapshot {
+        name,
+        buckets: [0; LATENCY_BUCKETS],
+        count: 0,
+        sum_ns: 0,
+    };
+    for h in hists {
+        for (b, a) in snap.buckets.iter_mut().zip(h.buckets.iter()) {
+            *b += a.load(Ordering::Relaxed);
+        }
+        snap.count += h.count.load(Ordering::Relaxed);
+        snap.sum_ns += h.sum_ns.load(Ordering::Relaxed);
+    }
+    snap
+}
+
+type PhaseTable = [PhaseHist; PHASES];
 
 /// **PERF-3 — the tables are SHARDED per recording thread.**
 ///
@@ -117,11 +172,7 @@ fn tables() -> &'static [[PhaseTable; OP_CLASSES]] {
     static TABLES: OnceLock<Vec<[PhaseTable; OP_CLASSES]>> = OnceLock::new();
     TABLES.get_or_init(|| {
         (0..shard_count())
-            .map(|_| {
-                std::array::from_fn(|_| {
-                    std::array::from_fn(|_| std::array::from_fn(|_| AtomicU64::new(0)))
-                })
-            })
+            .map(|_| std::array::from_fn(|_| std::array::from_fn(|_| PhaseHist::new())))
             .collect()
     })
 }
@@ -146,24 +197,14 @@ fn shard_index() -> usize {
 
 #[inline]
 fn record(op: OpClass, phase: TransportPhase, dur: Duration) {
-    let idx = latency_bucket_index(dur.as_micros() as u64);
-    tables()[shard_index()][op as usize][phase as usize][idx].fetch_add(1, Ordering::Relaxed);
+    let ns = dur.as_nanos().min(u64::MAX as u128) as u64;
+    tables()[shard_index()][op as usize][phase as usize].record_ns(ns);
 }
 
-fn snapshot(op: OpClass) -> [(&'static str, [u64; LATENCY_BUCKETS]); PHASES] {
+fn snapshot(op: OpClass) -> [PhaseSnapshot; PHASES] {
     let shards = tables();
     let oc = op as usize;
-    std::array::from_fn(|pi| {
-        (
-            PHASE_NAMES[pi],
-            std::array::from_fn(|bi| {
-                shards
-                    .iter()
-                    .map(|s| s[oc][pi][bi].load(Ordering::Relaxed))
-                    .sum()
-            }),
-        )
-    })
+    std::array::from_fn(|pi| fold(PHASE_NAMES[pi], shards.iter().map(|s| &s[oc][pi])))
 }
 
 /// Record one READ transport-phase span (always-on; see the module doc for
@@ -179,15 +220,14 @@ pub fn write_transport_phase_record(phase: TransportPhase, dur: Duration) {
     record(OpClass::Write, phase, dur);
 }
 
-/// Snapshot for the daemon's stats inode (`read_transport_phase_ns`):
-/// `(phase name, bucket counts)` in phase order; buckets are index-aligned
-/// with `latency_core::LATENCY_BUCKET_LABELS`.
-pub fn read_transport_phase_snapshot() -> [(&'static str, [u64; LATENCY_BUCKETS]); PHASES] {
+/// Snapshot for the daemon's stats inode (`read_transport_phase_ns`), in
+/// phase order; the fold across shards is exact.
+pub fn read_transport_phase_snapshot() -> [PhaseSnapshot; PHASES] {
     snapshot(OpClass::Read)
 }
 
 /// Snapshot for the daemon's stats inode (`write_transport_phase_ns`).
-pub fn write_transport_phase_snapshot() -> [(&'static str, [u64; LATENCY_BUCKETS]); PHASES] {
+pub fn write_transport_phase_snapshot() -> [PhaseSnapshot; PHASES] {
     snapshot(OpClass::Write)
 }
 
@@ -263,23 +303,21 @@ pub fn write_inplace_replies() -> u64 {
 // bridge DMAs the interleave resolved without waiting out the pass.
 // ---------------------------------------------------------------------------
 
-static FUSED_WAKE_TO_POLL: [AtomicU64; LATENCY_BUCKETS] =
-    [const { AtomicU64::new(0) }; LATENCY_BUCKETS];
-static FUSED_BRIDGE_RTT: [AtomicU64; LATENCY_BUCKETS] =
-    [const { AtomicU64::new(0) }; LATENCY_BUCKETS];
+static FUSED_WAKE_TO_POLL: PhaseHist = PhaseHist::new();
+static FUSED_BRIDGE_RTT: PhaseHist = PhaseHist::new();
 static FUSED_MIDPASS_REAPS: AtomicU64 = AtomicU64::new(0);
 static FUSED_PASSBOTTOM_REAPS: AtomicU64 = AtomicU64::new(0);
 
 /// Record one run-queue push → poll span (ns, transport epoch).
 #[inline]
 pub(crate) fn note_fused_wake_to_poll(ns: u64) {
-    FUSED_WAKE_TO_POLL[latency_bucket_index(ns / 1_000)].fetch_add(1, Ordering::Relaxed);
+    FUSED_WAKE_TO_POLL.record_ns(ns);
 }
 
 /// Record one bridge issue → oneshot-resolution span (ns) plus its venue.
 #[inline]
 pub(crate) fn note_fused_bridge_resolved(ns: u64, midpass: bool) {
-    FUSED_BRIDGE_RTT[latency_bucket_index(ns / 1_000)].fetch_add(1, Ordering::Relaxed);
+    FUSED_BRIDGE_RTT.record_ns(ns);
     if midpass {
         FUSED_MIDPASS_REAPS.fetch_add(1, Ordering::Relaxed);
     } else {
@@ -287,14 +325,11 @@ pub(crate) fn note_fused_bridge_resolved(ns: u64, midpass: bool) {
     }
 }
 
-/// Stats-inode snapshot: the fused timeline histograms, name + buckets
-/// (index-aligned with `latency_core::LATENCY_BUCKET_LABELS`).
-pub fn fused_timeline_snapshot() -> [(&'static str, [u64; LATENCY_BUCKETS]); 2] {
-    let load =
-        |a: &[AtomicU64; LATENCY_BUCKETS]| std::array::from_fn(|i| a[i].load(Ordering::Relaxed));
+/// Stats-inode snapshot: the fused timeline histograms.
+pub fn fused_timeline_snapshot() -> [PhaseSnapshot; 2] {
     [
-        ("wake_to_poll", load(&FUSED_WAKE_TO_POLL)),
-        ("bridge_rtt", load(&FUSED_BRIDGE_RTT)),
+        fold("wake_to_poll", std::iter::once(&FUSED_WAKE_TO_POLL)),
+        fold("bridge_rtt", std::iter::once(&FUSED_BRIDGE_RTT)),
     ]
 }
 
@@ -312,14 +347,18 @@ pub fn fused_passbottom_reaps() -> u64 {
 mod transport_phase_tests {
     use super::*;
 
+    /// The tables are process-global; delta tests serialize.
+    static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     /// One span recorded on one family moves exactly that (family, phase)
     /// cell — the root suite pins the same law through the public API;
     /// this is the fork-local twin so the fuse3 standalone suite carries
     /// the contract too.
     #[test]
     fn families_are_phase_exact_and_independent() {
-        let sum = |snap: &[(&'static str, [u64; LATENCY_BUCKETS]); PHASES]| -> Vec<u64> {
-            snap.iter().map(|(_, b)| b.iter().sum::<u64>()).collect()
+        let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let sum = |snap: &[PhaseSnapshot; PHASES]| -> Vec<u64> {
+            snap.iter().map(|p| p.buckets.iter().sum::<u64>()).collect()
         };
 
         let r0 = sum(&read_transport_phase_snapshot());
@@ -351,5 +390,44 @@ mod transport_phase_tests {
                 "read family phase {name} moved unexpectedly"
             );
         }
+    }
+
+    /// e2e audit A: the per-thread shards fold to EXACT count / sum_ns
+    /// (the root suite pins the same law through the daemon's JSON).
+    #[test]
+    fn shard_fold_is_exact_to_the_ns() {
+        let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        const THREADS: u64 = 5;
+        const PER_THREAD: u64 = 200;
+        let pi = TransportPhase::DispatchLag as usize;
+        let before = read_transport_phase_snapshot()[pi];
+        let hs: Vec<_> = (0..THREADS)
+            .map(|t| {
+                std::thread::spawn(move || {
+                    for i in 0..PER_THREAD {
+                        read_transport_phase_record(
+                            TransportPhase::DispatchLag,
+                            Duration::from_nanos(3_000 * (t + 1) + 11 * i),
+                        );
+                    }
+                })
+            })
+            .collect();
+        for h in hs {
+            h.join().unwrap();
+        }
+        let after = read_transport_phase_snapshot()[pi];
+        let want_sum: u64 = (0..THREADS)
+            .flat_map(|t| (0..PER_THREAD).map(move |i| 3_000 * (t + 1) + 11 * i))
+            .sum();
+        assert_eq!(after.count - before.count, THREADS * PER_THREAD);
+        assert_eq!(after.sum_ns - before.sum_ns, want_sum);
+        let bucket_delta: u64 = after
+            .buckets
+            .iter()
+            .zip(before.buckets.iter())
+            .map(|(a, b)| a - b)
+            .sum();
+        assert_eq!(bucket_delta, THREADS * PER_THREAD, "Σ buckets ≡ count");
     }
 }

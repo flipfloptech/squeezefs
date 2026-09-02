@@ -89,12 +89,9 @@ const PHASES: [&str; 12] = [
 fn phase_count(family: &serde_json::Value, phase: &str) -> u64 {
     family
         .get(phase)
-        .unwrap_or_else(|| panic!("phase key {phase} missing from fuse_write_phase_ns"))
-        .as_object()
-        .expect("phase histogram must be a bucket object")
-        .values()
-        .map(|v| v.as_u64().expect("bucket counts are u64"))
-        .sum()
+        .unwrap_or_else(|| panic!("phase key {phase} missing from fuse_write_phase_ns"))["count"]
+        .as_u64()
+        .expect("histogram count word")
 }
 
 struct H {

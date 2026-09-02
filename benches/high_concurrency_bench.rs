@@ -997,6 +997,73 @@ fn bench_sharded_counters(c: &mut Criterion) {
         });
     });
 
+    // e2e audit A (2026-09-02): `LatencyHistogram::record` grew from ONE
+    // relaxed RMW (bucket) to THREE (bucket + count + sum_ns) so every
+    // family's mean is exact. The pair below prices that at the field's
+    // recording shape — one process-global histogram hit from every lane
+    // with a tight distribution (one hot bucket line, like the
+    // `global_one_line` arm): the bucket-only control vs the shipped
+    // record. `hist_record_exact_1thread` is the uncontended per-record
+    // cost the D lock-guard hooks are gated on (~50 ns/acquire rule).
+    group.bench_function("hist_record_bucket_only", |b| {
+        let hist: Arc<[AtomicU64; 26]> = Arc::new([const { AtomicU64::new(0) }; 26]);
+        b.iter(|| {
+            let mut hs = Vec::with_capacity(THREADS);
+            for _ in 0..THREADS {
+                let hist = Arc::clone(&hist);
+                hs.push(std::thread::spawn(move || {
+                    for i in 0..PER_THREAD {
+                        let d = std::time::Duration::from_nanos(100_000 + i as u64);
+                        let idx =
+                            squeezefs::latency_core::latency_bucket_index(d.as_micros() as u64);
+                        black_box(hist[idx].fetch_add(1, Ordering::Relaxed));
+                    }
+                }));
+            }
+            for h in hs {
+                h.join().unwrap();
+            }
+        });
+    });
+
+    group.bench_function("hist_record_exact", |b| {
+        let hist = Arc::new(squeezefs::fuse_client::LatencyHistogram::default());
+        b.iter(|| {
+            let mut hs = Vec::with_capacity(THREADS);
+            for _ in 0..THREADS {
+                let hist = Arc::clone(&hist);
+                hs.push(std::thread::spawn(move || {
+                    for i in 0..PER_THREAD {
+                        hist.record(std::time::Duration::from_nanos(100_000 + i as u64));
+                    }
+                }));
+            }
+            for h in hs {
+                h.join().unwrap();
+            }
+        });
+    });
+
+    group.throughput(criterion::Throughput::Elements(1));
+    group.bench_function("hist_record_bucket_only_1thread", |b| {
+        let hist: [AtomicU64; 26] = [const { AtomicU64::new(0) }; 26];
+        let mut i = 0u64;
+        b.iter(|| {
+            i += 1;
+            let d = std::time::Duration::from_nanos(100_000 + i);
+            let idx = squeezefs::latency_core::latency_bucket_index(d.as_micros() as u64);
+            black_box(hist[idx].fetch_add(1, Ordering::Relaxed));
+        });
+    });
+    group.bench_function("hist_record_exact_1thread", |b| {
+        let hist = squeezefs::fuse_client::LatencyHistogram::default();
+        let mut i = 0u64;
+        b.iter(|| {
+            i += 1;
+            hist.record(std::time::Duration::from_nanos(100_000 + i));
+        });
+    });
+
     group.finish();
 }
 

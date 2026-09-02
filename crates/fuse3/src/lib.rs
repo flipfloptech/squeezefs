@@ -51,7 +51,7 @@ pub use raw::{
     fused_midpass_reaps, fused_passbottom_reaps, fused_timeline_snapshot, pin_scope_from_env,
     read_inplace_replies, read_transport_phase_record, read_transport_phase_snapshot,
     scoped_affinity_cpus, write_inplace_replies, write_transport_phase_record,
-    write_transport_phase_snapshot, PinScope, TransportPhase,
+    write_transport_phase_snapshot, PhaseSnapshot, PinScope, TransportPhase,
 };
 #[cfg(feature = "tokio-runtime")]
 pub use raw::{tpc_lane_redispatches, tpc_spawn, tpc_spawn_on_node, tpc_thread_count};

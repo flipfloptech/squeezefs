@@ -413,15 +413,22 @@ MS_BUCKETS = ["<=2ms", "<=4ms", "<=8ms", "<=16ms", "<=32ms", "<=64ms",
               "<=128ms", "<=256ms", "<=512ms", "<=1024ms", "<=2s", "<=4s",
               "<=8s", "<=16s", ">16s"]
 
+# Histograms carry their buckets under "buckets" beside the exact
+# count/sum_ns words (e2e audit A, 2026-09-02); older snapshots are flat.
+def bk(h):
+    return h.get("buckets", h) if isinstance(h, dict) else {}
+
 def tail(hist_b, hist_a):
     if not isinstance(hist_a, dict):
         return 0
-    return sum(int(hist_a.get(k, 0)) - int((hist_b or {}).get(k, 0))
+    return sum(int(bk(hist_a).get(k, 0)) - int(bk(hist_b).get(k, 0))
                for k in MS_BUCKETS)
 
 def total(hist_b, hist_a):
     if not isinstance(hist_a, dict):
         return 0
+    if "count" in hist_a:
+        return int(hist_a["count"]) - int((hist_b or {}).get("count", 0))
     return sum(int(v) - int((hist_b or {}).get(k, 0))
                for k, v in hist_a.items())
 

@@ -34,14 +34,24 @@ def hist_delta(pre, post, key, sub=None):
         a = {}
     if not isinstance(b, dict):
         b = {}
-    return [int(b.get(l, 0)) - int(a.get(l, 0)) for l in LABELS]
+    # Exact mean from the count/sum_ns words when present (e2e audit A,
+    # 2026-09-02; buckets then live under "buckets"); midpoint otherwise.
+    exact = None
+    if "sum_ns" in b:
+        n = int(b.get("count", 0)) - int(a.get("count", 0))
+        exact = ((int(b["sum_ns"]) - int(a.get("sum_ns", 0))) / 1e3 / n) if n else 0.0
+    a, b = a.get("buckets", a), b.get("buckets", b)
+    delta = [int(b.get(l, 0)) - int(a.get(l, 0)) for l in LABELS]
+    delta.append(exact)
+    return delta
 
 
 def hstats(delta):
+    delta, exact = delta[:-1], delta[-1]
     n = sum(delta)
     if n == 0:
         return {"n": 0, "mean": None, "p50": None, "p99": None}
-    mean = sum(c * MID[i] for i, c in enumerate(delta)) / n
+    mean = exact if exact is not None else sum(c * MID[i] for i, c in enumerate(delta)) / n
 
     def pct(p):
         want = p * n

@@ -310,12 +310,7 @@ fn recalls_batch_one_frame_carries_many_recalls_under_the_rate_cap() {
     // The phase table recorded every recall's issue + ack_wait + total.
     let phases = lane.phase_json();
     for arm in ["issue", "ack_wait", "total"] {
-        let sum: u64 = phases[arm]
-            .as_object()
-            .expect("phase arm is a histogram object")
-            .values()
-            .map(|v| v.as_u64().unwrap_or(0))
-            .sum();
+        let sum: u64 = phases[arm]["count"].as_u64().expect("histogram count word");
         assert_eq!(sum, total, "dlm_revoke_phase_ns.{arm} saw every recall");
     }
 }
@@ -492,12 +487,7 @@ fn the_dark_posture_exports_the_family_as_zeros_and_pays_nothing() {
     // The phase table exports its three arms, all empty.
     let p = revoke_phase_json();
     for arm in ["issue", "ack_wait", "total"] {
-        let sum: u64 = p[arm]
-            .as_object()
-            .expect("phase arm present")
-            .values()
-            .map(|v| v.as_u64().unwrap_or(0))
-            .sum();
+        let sum: u64 = p[arm]["count"].as_u64().expect("histogram count word");
         assert_eq!(sum, 0, "dark posture: dlm_revoke_phase_ns.{arm} is empty");
     }
 }

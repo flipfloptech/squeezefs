@@ -29,6 +29,9 @@ def hist_delta(pre, post, key, sub=None):
     if sub is not None:
         a = a.get(sub, {})
         b = b.get(sub, {})
+    # Buckets live under "buckets" beside the exact count/sum_ns words
+    # (e2e audit A, 2026-09-02); pre-audit snapshots are flat.
+    a, b = a.get("buckets", a), b.get("buckets", b)
     return [int(b.get(l, 0)) - int(a.get(l, 0)) for l in LABELS]
 
 
@@ -54,7 +57,11 @@ def counter_delta(pre, post, key):
 
 def ingress_count(m):
     h = m.get("ipc_ingress_ns", {})
-    return sum(int(v) for v in h.values()) if isinstance(h, dict) else 0
+    if not isinstance(h, dict):
+        return 0
+    if "count" in h:
+        return int(h["count"])
+    return sum(int(v) for v in h.values())
 
 
 def analyze(out, leg, qd):

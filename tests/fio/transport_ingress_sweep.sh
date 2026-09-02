@@ -95,11 +95,17 @@ for fam, phase in (("read_transport_phase_ns","queue_wait"),
                    ("read_transport_phase_ns","transport_total"),
                    ("read_serve_phase_ns","total"),
                    ("read_fill_phase_ns","dev_service")):
-    delta = {}
-    for bk, v in a.get(fam, {}).get(phase, {}).items():
-        d = v - b.get(fam, {}).get(phase, {}).get(bk, 0)
-        if d: delta[bk] = d
-    est, n = wmean_us(delta)
+    ha, hb = a.get(fam, {}).get(phase, {}), b.get(fam, {}).get(phase, {})
+    if "sum_ns" in ha:
+        # Exact (e2e audit A): count/sum_ns words beside the buckets.
+        n = ha["count"] - hb.get("count", 0)
+        est = ((ha["sum_ns"] - hb.get("sum_ns", 0)) / 1e3 / n) if n else 0.0
+    else:
+        delta = {}
+        for bk, v in ha.items():
+            d = v - hb.get(bk, 0)
+            if d: delta[bk] = d
+        est, n = wmean_us(delta)
     cells.append(f"{phase}={est:.0f}us(n={n})")
 print(" ".join(cells))
 EOF

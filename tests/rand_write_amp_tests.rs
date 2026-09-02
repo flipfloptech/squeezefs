@@ -237,11 +237,7 @@ async fn make_striped(h: &H, ino: u64, blocks: u64, seed: u8) -> Vec<u8> {
 }
 
 fn hist_total(hist: &serde_json::Value) -> u64 {
-    hist.as_object()
-        .expect("histogram object")
-        .values()
-        .map(|v| v.as_u64().unwrap_or(0))
-        .sum()
+    hist["count"].as_u64().expect("histogram count word")
 }
 
 fn phase_total(phase: &str) -> u64 {

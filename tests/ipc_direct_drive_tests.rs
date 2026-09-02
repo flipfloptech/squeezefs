@@ -1037,12 +1037,9 @@ fn drain_pass_count(v: &serde_json::Value) -> u64 {
     v.get("metrics")
         .expect("stats JSON carries a metrics object")
         .get("ipc_drain_pass_ns")
-        .expect("stats inode must export ipc_drain_pass_ns")
-        .as_object()
-        .expect("drain-pass histogram is a bucket map")
-        .values()
-        .map(|n| n.as_u64().unwrap_or(0))
-        .sum()
+        .expect("stats inode must export ipc_drain_pass_ns")["count"]
+        .as_u64()
+        .expect("histogram count word")
 }
 
 /// Sample count of the `ipc_ingress_ns` histogram (reap-fanin campaign,
@@ -1051,12 +1048,9 @@ fn ingress_count(v: &serde_json::Value) -> u64 {
     v.get("metrics")
         .expect("stats JSON carries a metrics object")
         .get("ipc_ingress_ns")
-        .expect("stats inode must export ipc_ingress_ns")
-        .as_object()
-        .expect("ingress histogram is a bucket map")
-        .values()
-        .map(|n| n.as_u64().unwrap_or(0))
-        .sum()
+        .expect("stats inode must export ipc_ingress_ns")["count"]
+        .as_u64()
+        .expect("histogram count word")
 }
 
 fn phase_counts(v: &serde_json::Value, phase: &str) -> u64 {
@@ -1065,12 +1059,9 @@ fn phase_counts(v: &serde_json::Value, phase: &str) -> u64 {
         .get("ipc_direct_phase_ns")
         .unwrap_or_else(|| panic!("stats inode must export ipc_direct_phase_ns (phase {phase})"))
         .get(phase)
-        .unwrap_or_else(|| panic!("ipc_direct_phase_ns must carry phase '{phase}'"))
-        .as_object()
-        .expect("phase histogram is a bucket map")
-        .values()
-        .map(|n| n.as_u64().unwrap_or(0))
-        .sum()
+        .unwrap_or_else(|| panic!("ipc_direct_phase_ns must carry phase '{phase}'"))["count"]
+        .as_u64()
+        .expect("histogram count word")
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1298,12 +1289,9 @@ async fn drain_passes_record_duration_and_counts() {
         .get("metrics")
         .expect("metrics object")
         .get("ipc_drain_flush_ns")
-        .expect("stats inode must export ipc_drain_flush_ns")
-        .as_object()
-        .expect("flush histogram is a bucket map")
-        .values()
-        .map(|v| v.as_u64().unwrap_or(0))
-        .sum();
+        .expect("stats inode must export ipc_drain_flush_ns")["count"]
+        .as_u64()
+        .expect("histogram count word");
     assert!(
         flush_count >= grew,
         "every non-empty pass records its flush half (flush {flush_count} < passes {grew})"

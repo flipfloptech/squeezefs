@@ -113,12 +113,9 @@ const TRANSPORT_PHASES: [&str; 5] = [
 fn phase_count(family: &serde_json::Value, phase: &str) -> u64 {
     family
         .get(phase)
-        .unwrap_or_else(|| panic!("phase key {phase} missing from family: {family}"))
-        .as_object()
-        .expect("phase histogram must be a bucket object")
-        .values()
-        .map(|v| v.as_u64().expect("bucket counts are u64"))
-        .sum()
+        .unwrap_or_else(|| panic!("phase key {phase} missing from family: {family}"))["count"]
+        .as_u64()
+        .expect("histogram count word")
 }
 
 struct H {
@@ -492,8 +489,8 @@ async fn transport_family_shape_and_bucket_tie() {
     let snap1 = fuse3::read_transport_phase_snapshot();
     assert_eq!(snap1.len(), TRANSPORT_PHASES.len());
     for (i, name) in TRANSPORT_PHASES.iter().enumerate() {
-        assert_eq!(snap1[i].0, *name, "transport phase order/name");
-        let d: u64 = snap1[i].1.iter().sum::<u64>() - snap0[i].1.iter().sum::<u64>();
+        assert_eq!(snap1[i].name, *name, "transport phase order/name");
+        let d: u64 = snap1[i].count - snap0[i].count;
         let want = u64::from(*name == "queue_wait");
         assert_eq!(
             d, want,
@@ -507,7 +504,9 @@ async fn transport_family_shape_and_bucket_tie() {
     let fam = read_transport_phase_json();
     for name in TRANSPORT_PHASES {
         let hist = fam.get(name).expect("phase present in JSON");
-        let obj = hist.as_object().expect("bucketed object");
+        // Buckets live under "buckets" beside the exact count/sum_ns words
+        // (e2e audit A).
+        let obj = hist["buckets"].as_object().expect("bucketed object");
         assert_eq!(
             obj.len(),
             squeezefs::latency_core::LATENCY_BUCKET_LABELS.len(),
@@ -525,7 +524,7 @@ async fn transport_family_shape_and_bucket_tie() {
     let idx = squeezefs::latency_core::latency_bucket_index(100);
     let qsnap = fuse3::read_transport_phase_snapshot();
     assert!(
-        qsnap[0].1[idx] >= 1,
+        qsnap[0].buckets[idx] >= 1,
         "the recorded 100 µs span must land in shared-core bucket {idx}"
     );
 }

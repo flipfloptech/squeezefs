@@ -718,3 +718,26 @@ The 6c pre-map's verdicts (normative for the remaining rungs):
 - Crossing + sub-threshold kvmap inos + legacy arms keep whole-map RAM
   verbatim (pinned); an `SQUEEZEFS_KVMAP_OVERLAY=0` A/B lever (registry
   entry) is sanctioned for the acceptance brackets only.
+
+## 15. Finding 44 — adjudicated (2026-09-02)
+
+The PR-6a live smoke's rewrite+remount zeros: **not reproducible on the
+tip** (`7c5aad36` — the exact failing sequence, reformat + fresh + two
+rewrite passes + remount + md5 + verify_only, TWICE clean with overlay
+engagement exact: 30,719 ACK-early stores, `ack_early_lost = 0`, all
+tripwires 0). The forensic corpse had already proven the map/run records
+CORRECT (the device block itself was under-written), and the corpse
+store's prehistory carried an UNCLEAN KILL (`pkill -9` between smokes:
+writer_claim reclaimed from a dead pid) — so the damage is attributed to
+un-fsynced ACK-early loss in that prehistory (the documented DUR-2
+volatility class), not a live rewrite-path defect. The suspected
+run-stride units bug was FALSIFIED (emission and expansion share ONE
+stride hook). What landed as the class-catchers: the engagement-pinned
+multi-pass rewrite+remount content venue (`f44_overlay_rewrite_tests` —
+both overlay legs, silent-passthrough-proof) and the run
+emission-vs-expansion stride-equivalence pin at 64 KiB / 1 MiB / 4 MiB
+(`kvmap_run_tests`) — the content/expansion oracle the content-blind C8
+could never be. Boarded from the same train: the consistent
+post-rewrite umount SIGTERM-timeout → kernel-abort fallback (data
+proved durable both times, but the exit slowness is a standing
+observation).

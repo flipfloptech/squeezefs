@@ -27,6 +27,9 @@ use proptest::prelude::*;
 use std::os::unix::process::CommandExt;
 
 use squeezefs::layout_wire::{decode_base_layout, encode_layout, LayoutDelta, LayoutMetadata};
+use squeezefs::meta_backend::kv::block_map::{
+    decode_block_map_key, decode_block_map_value, parse_kvmap_head,
+};
 use squeezefs::meta_backend::kv::bset::{
     build_bset, checksum_image, BsetView, BSET_HEADER_LEN, BSET_MAGIC, BSET_VERSION,
 };
@@ -277,6 +280,34 @@ proptest! {
             let again = LayoutDelta::decode(&re).expect("a decoded delta re-encodes");
             prop_assert_eq!(again.size, d.size);
             prop_assert_eq!(again.entries.len(), d.entries.len());
+        }
+    }
+
+    /// The block-map tree's key decoder (PR 1,
+    /// docs/design-kvmap-block-map-tree.md §2) is total.
+    #[test]
+    fn block_map_key_decode_never_panics(data in prop::collection::vec(any::<u8>(), 0..64)) {
+        let _ = decode_block_map_key(&data);
+    }
+
+    /// The block-map tree's value decoder is total, and anything it
+    /// accepts round-trips byte-identically (the exact-encoding law).
+    #[test]
+    fn block_map_value_decode_never_panics(data in prop::collection::vec(any::<u8>(), 0..128)) {
+        if let Ok(entry) = decode_block_map_value(&data) {
+            prop_assert_eq!(entry.encode(), data);
+        }
+    }
+
+    /// The `kvmap:` head-sentinel parser is total over arbitrary strings —
+    /// both far-from-grammar inputs and near-misses behind the prefix —
+    /// and anything it accepts round-trips through its own encoder.
+    #[test]
+    fn kvmap_head_parse_never_panics(s in "\\PC{0,48}") {
+        let _ = parse_kvmap_head(&s);
+        let prefixed = format!("kvmap:{s}");
+        if let Ok(head) = parse_kvmap_head(&prefixed) {
+            prop_assert_eq!(head.encode(), prefixed);
         }
     }
 }

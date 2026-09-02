@@ -789,3 +789,68 @@ umount: `map_migrate_inos = 3`, 11,090 record ops, byte-identical
 remount, verify clean, drift 0. Standing lesson recorded: live-smoke
 verdicts must read ENGAGEMENT from the session that did the work, and
 every plane owes one greppable engagement line.
+
+## 18. Finding 46 — the streaming-extend publish collapse (2026-09-02)
+
+The E2E audit baseline on squeeze-test (24 fio jobs × 8 GiB sequential
+1 MiB direct writes, cacheless, nvme-tcp) opened at 28.7 GB/s, crossed
+all 24 files into the tree at t+7 s, and fell ~2,000× to 0.36 GiB/s for
+the rest of the row (clat 986 ms per 1 MiB write) — while the REWRITE
+pass over the same kvmap-headed files ran 32 GiB/s. Attribution from the
+row's stats deltas: ≈2,830 post-crossing publishes paid 13,037
+`block_map_range` pages (≈4.6 pages ≈ the ino's whole ~1,500-record
+population per publish; `lookup_exact` 0), ~300 B of journal each (the
+journal side WAS O(window) — H3 falsified: the 35,201
+`layout_delta_commits` were the pre-crossing inline deltas), and the
+`publish_phase_ns` tail put ≈2,980 publishes at 128 ms–1 s (mean
+≈275 ms). The mechanism: Rev 1.3 #2's whole-map delete-by-absence diff
+ran on EVERY steady-state save of a whole-map kvmap head — the RAM-map
+clone + record encode + tree page + decode is O(map) CPU per publish,
+and the publish pass runs on the 2-thread `sqz-meta` pool, so the 24
+inos' publishes serialized ACROSS inos as well as within (H1 + H2, the
+cross-ino face being the pool, not the 4a). §12's "the publish train is
+the canonicalizer" law made this structural, not accidental.
+
+**The law (normative, restating §3 Publish / §14 S2 / §16):** a
+steady-state publish of a kvmap-headed ino ships ONLY its window — tree
+operations proportional to the blocks published, never to the file. The
+whole-map diff is legitimate at the CROSSING (the tree is empty), on the
+NON-publish saves that own deletes (truncate/punch/fsync-persist), and
+on a publish carrying deferred accounting notes (Vector B: notes name
+bindings outside the window) — never per streaming publish.
+
+**Landed:** `MapTrainClaims::window` — the LOCAL whole-map-authority
+publish WINDOW as a third train input beside the whole-map diff and the
+6c-i overlay claims: `take` = the window's indices, `release` = ∅,
+`entries` = the RAM map's CURRENT bindings at exactly those indices,
+`base_gen: None`, `served: false`. The train probes **exact-only** (a
+miss with RAM whole-map authority behind it is a fresh index or an index
+inside a run, and both stage the same superseding point Put under the
+§2 read law — the RUN_LEN_MAX floor scan, ~4 k records on a point-dense
+map, bought nothing per claim), NEVER recomputes (the caller's RAM merge
+captured every displacement, so the frame commits verbatim — the f36
+preservation arm — and the caller keeps its displaced-free stream), and
+a changed take AT a run's own key still dissolves the run. The routing
+gate is `head_is_kvmap && !partial && local && publish_entries.is_some()
+&& no deferred notes && no live range grants && every window index binds
+in the RAM map`; everything else keeps its arm verbatim (the shipped
+verb still carries the whole map — the co-writer wire economy is the mw
+plane's own item; the rewrite program's shadow-epoch swap and the
+truncate/punch saves keep the whole-map diff they need). Gauges:
+`kvmap_window_saves` (engagement — a streaming row's post-crossing
+publishes must account here) and `meta_kv_block_map_range_records`
+(records paged by range calls — the direct tree-reads-per-publish
+instrument the page count hid). Contracts:
+`tests/f46_kvmap_stream_publish_tests.rs` (the FUSE-level venue: two
+interleaved writers — a lone writer's allocations run-collapse to ONE
+record and hide the face — 511 publishes paid 268,914 range records on
+the tip, 511 exact lookups and 0 range records after) and the train pins
+in `tests/kvmap_bounded_save_tests.rs`.
+
+**Residuals boarded:** (a) the 6c-i overlay train's per-claim floor
+probe is O(RUN_LEN_MAX) records on a point-dense map — the partial
+class's own face of this finding; (b) the shipped `MigrateBlockMap` verb
+still carries the whole map per co-writer publish; (c) with the
+steady-state whole-map diff gone, §12a #6's re-coalescing happens only
+on the non-publish saves — 6c-ii's windowed canonicalizer is the owed
+economy item.

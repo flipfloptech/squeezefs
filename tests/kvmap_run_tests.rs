@@ -664,6 +664,7 @@ async fn claims_never_partial_adopt_a_run_silently() {
         // Emulates the SHIPPED (served) train — the gen belt mints.
         served: true,
         overlay: false,
+        window: false,
     };
     rig.kv()
         .migrate_block_map_train(
@@ -716,6 +717,7 @@ async fn claims_never_partial_adopt_a_run_silently() {
         release,
         served: true,
         overlay: false,
+        window: false,
     };
     rig.kv()
         .migrate_block_map_train(
@@ -777,6 +779,7 @@ async fn claims_never_partial_adopt_a_run_silently() {
                 release: std::collections::BTreeSet::new(),
                 served: true,
                 overlay: false,
+                window: false,
             }),
             ino,
             &entry_key_for_tests,

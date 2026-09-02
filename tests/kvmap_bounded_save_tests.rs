@@ -38,6 +38,7 @@ use squeezefs::fuse_client::METRICS;
 use squeezefs::layout_wire::LayoutMetadata;
 use squeezefs::meta_backend::kv::backend::{KvMetaBackend, MapTrainClaims};
 use squeezefs::meta_backend::kv::block_map::{parse_kvmap_head, MapEntry};
+use squeezefs::meta_backend::kv::block_refs::BlockRefOp;
 use squeezefs::meta_backend::kv::builder::{format_v3, FormatV3Options};
 use squeezefs::meta_backend::kv::superblock::{
     classify_volume, set_block_map_tree_bit, set_block_refcounts_bit, write_superblock_v3,
@@ -390,6 +391,303 @@ async fn a_claims_train_probes_o_claims_not_o_map() {
         ),
         "unclaimed indices untouched"
     );
+    rig.shutdown().await;
+}
+
+// ===========================================================================
+// 1a'. Finding 46: the WINDOW train — exact-only probes, frame verbatim
+// ===========================================================================
+
+/// The whole-map ino's steady-state publish arm (`MapTrainClaims::window`):
+/// an EXTEND window over an N-record ino pays exactly one EXACT lookup
+/// per window index — no floor probe (a miss with RAM whole-map authority
+/// behind it is a fresh index or an index inside a run, and both stage
+/// the same superseding point Put under the §2 read law), no whole-map
+/// page — and commits the caller's refs frame VERBATIM (no recompute:
+/// the caller's RAM merge captured every displacement). Every other
+/// record is untouched (delete-by-absence OFF), and a changed take at an
+/// existing exact record supersedes in place.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_window_train_probes_exact_only_and_commits_the_frame_verbatim() {
+    let _serial = serial();
+    let meta = NamedTempFile::new().unwrap();
+    format_meta_kvmap(meta.path()).await;
+    let data = data_file();
+    let rig = mount(meta.path(), data.path()).await;
+    let ino = rig.mk_file("window-probes").await;
+    let n: u32 = 2048;
+    let vol_tag = establish_points(&rig, ino, n).await;
+
+    // The window: 64 fresh indices appended past the map + one changed
+    // take at an existing exact record (a same-batch overwrite).
+    let window: Vec<(u32, MapEntry)> = (n..n + 64)
+        .chain(std::iter::once(7u32))
+        .map(|b| {
+            (
+                b,
+                MapEntry::Point {
+                    vol_tag,
+                    offset: u64::from(b) * BLOCK + 3 * u64::from(n) * BLOCK,
+                },
+            )
+        })
+        .collect();
+    let mut window = window;
+    window.sort_unstable_by_key(|(b, _)| *b);
+    let take: std::collections::BTreeSet<u32> = window.iter().map(|(b, _)| *b).collect();
+    let claims = MapTrainClaims {
+        base_gen: None,
+        take,
+        release: std::collections::BTreeSet::new(),
+        served: false,
+        overlay: false,
+        window: true,
+    };
+    // The caller's frame: one take per window index + the displaced
+    // release at 7 — exactly what the RAM merge computed. With a
+    // recompute the train would REPLACE it; the window law says it
+    // commits verbatim.
+    let ref_at = |idx: u32, key: &str| squeezefs::meta_backend::kv::block_refs::BlockRef {
+        vol_tag,
+        block_idx: key.parse::<u64>().unwrap() / BLOCK,
+        owner_ino: ino,
+        block_index: idx,
+    };
+    let mut frame: Vec<BlockRefOp> = window
+        .iter()
+        .map(|(b, e)| BlockRefOp::taken(ref_at(*b, &entry_key_for_tests(e, 0).unwrap())))
+        .collect();
+    frame.push(BlockRefOp::released(ref_at(7, &(7 * BLOCK).to_string())));
+    let staged0 = squeezefs::meta_backend::kv::META_KV_BLOCK_REFS_STAGED.load(Ordering::Relaxed);
+    let released0 =
+        squeezefs::meta_backend::kv::META_KV_BLOCK_REFS_RELEASED.load(Ordering::Relaxed);
+    let exact0 = META_KV_BLOCK_MAP_LOOKUP_EXACT.load(Ordering::Relaxed);
+    let floor0 = META_KV_BLOCK_MAP_LOOKUP_FLOOR.load(Ordering::Relaxed);
+    let range0 = META_KV_BLOCK_MAP_LOOKUP_RANGE.load(Ordering::Relaxed);
+    // A resolver that would answer every key: the window law must NOT
+    // consult it (a recompute here would double-count the displaced
+    // free the caller's stream already owns).
+    let resolver_calls = std::sync::atomic::AtomicU64::new(0);
+    let outcome = rig
+        .kv()
+        .migrate_block_map_train(
+            ino,
+            &kvmap_head_bytes(u64::from(n + 64) * BLOCK),
+            u64::from(n + 64) * BLOCK,
+            &frame,
+            &window,
+            512,
+            Some(&claims),
+            ino,
+            &entry_key_for_tests,
+            0,
+            &|key, idx| {
+                resolver_calls.fetch_add(1, Ordering::Relaxed);
+                Some(ref_at(idx, key))
+            },
+        )
+        .await
+        .expect("window train")
+        .expect("engaged tree");
+    let exact = META_KV_BLOCK_MAP_LOOKUP_EXACT.load(Ordering::Relaxed) - exact0;
+    let floor = META_KV_BLOCK_MAP_LOOKUP_FLOOR.load(Ordering::Relaxed) - floor0;
+    let range = META_KV_BLOCK_MAP_LOOKUP_RANGE.load(Ordering::Relaxed) - range0;
+    assert_eq!(
+        (exact, floor, range),
+        (65, 0, 0),
+        "the window train probes exact-only: one lookup per window index, no floor \
+         scan, no whole-map page (got exact={exact} floor={floor} range={range})"
+    );
+    assert!(
+        !outcome.recomputed && outcome.released.is_empty() && outcome.released_keys.is_empty(),
+        "a window train never recomputes — the caller's frame commits verbatim: {outcome:?}"
+    );
+    assert_eq!(
+        resolver_calls.load(Ordering::Relaxed),
+        0,
+        "the window train never consults the caller's resolver"
+    );
+    assert_eq!(
+        (
+            squeezefs::meta_backend::kv::META_KV_BLOCK_REFS_STAGED.load(Ordering::Relaxed)
+                - staged0,
+            squeezefs::meta_backend::kv::META_KV_BLOCK_REFS_RELEASED.load(Ordering::Relaxed)
+                - released0,
+        ),
+        (65, 1),
+        "the frame's ops staged verbatim (65 takes + 1 release)"
+    );
+    assert_eq!(outcome.records, 65, "one Put per window index");
+
+    // Correctness: the appended indices bind, the changed take
+    // superseded in place, and every other record stands (no
+    // delete-by-absence).
+    for b in [n, n + 63, 7u32] {
+        assert_eq!(
+            rig.kv().get_block_mapping(ino, b).await.unwrap().unwrap(),
+            (
+                b,
+                MapEntry::Point {
+                    vol_tag,
+                    offset: u64::from(b) * BLOCK + 3 * u64::from(n) * BLOCK
+                }
+            ),
+            "window index {b} binds to its new record"
+        );
+    }
+    for b in [0u32, 6, 8, n - 1] {
+        assert_eq!(
+            rig.kv().get_block_mapping(ino, b).await.unwrap().unwrap(),
+            (
+                b,
+                MapEntry::Point {
+                    vol_tag,
+                    offset: u64::from(b) * BLOCK
+                }
+            ),
+            "un-windowed index {b} untouched"
+        );
+    }
+    let census = rig
+        .kv()
+        .block_map_range(ino, 0, 1 << 20)
+        .await
+        .expect("census");
+    assert_eq!(
+        census.len(),
+        (n + 64) as usize,
+        "one record per index — the window neither duplicated nor deleted"
+    );
+    rig.shutdown().await;
+}
+
+/// The window law's run faces: a window index INSIDE an existing run
+/// stages a superseding point (the §2 read law — one Put, no run split,
+/// no floor scan), and a changed take AT a run's own key dissolves the
+/// run (its other indices survive as records) — both with the exact
+/// probe alone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_window_train_supersedes_inside_a_run_and_dissolves_at_its_key() {
+    let _serial = serial();
+    let meta = NamedTempFile::new().unwrap();
+    format_meta_kvmap(meta.path()).await;
+    let data = data_file();
+    let rig = mount(meta.path(), data.path()).await;
+    let ino = rig.mk_file("window-runs").await;
+    let vol_tag = squeezefs::meta_backend::kv::block_refs::volume_tag(DATA_VOL_ID);
+    // Establish: a 16-run at 0 and a 16-run at 16 (the direct train
+    // accepts pre-coalesced runs verbatim).
+    let runs: Vec<(u32, MapEntry)> = vec![
+        (
+            0,
+            MapEntry::Run {
+                vol_tag,
+                start_offset: 0,
+                len: 16,
+            },
+        ),
+        (
+            16,
+            MapEntry::Run {
+                vol_tag,
+                start_offset: 16 * BLOCK,
+                len: 16,
+            },
+        ),
+    ];
+    rig.kv()
+        .migrate_block_map_train(
+            ino,
+            &kvmap_head_bytes(32 * BLOCK),
+            32 * BLOCK,
+            &[],
+            &runs,
+            512,
+            None,
+            ino,
+            &entry_key_for_tests,
+            0,
+            &|_key, _idx| None,
+        )
+        .await
+        .expect("establishing train")
+        .expect("engaged tree");
+
+    // Window: index 5 (inside run 0 — a superseding point) and index 16
+    // (run 1's OWN key — a dissolve).
+    let fresh = |b: u32| MapEntry::Point {
+        vol_tag,
+        offset: 1000 * BLOCK + u64::from(b) * BLOCK,
+    };
+    let window: Vec<(u32, MapEntry)> = vec![(5, fresh(5)), (16, fresh(16))];
+    let claims = MapTrainClaims {
+        base_gen: None,
+        take: [5u32, 16].into_iter().collect(),
+        release: std::collections::BTreeSet::new(),
+        served: false,
+        overlay: false,
+        window: true,
+    };
+    let floor0 = META_KV_BLOCK_MAP_LOOKUP_FLOOR.load(Ordering::Relaxed);
+    let outcome = rig
+        .kv()
+        .migrate_block_map_train(
+            ino,
+            &kvmap_head_bytes(32 * BLOCK),
+            32 * BLOCK,
+            &[],
+            &window,
+            512,
+            Some(&claims),
+            ino,
+            &entry_key_for_tests,
+            0,
+            &|_key, _idx| None,
+        )
+        .await
+        .expect("window train")
+        .expect("engaged tree");
+    assert_eq!(
+        META_KV_BLOCK_MAP_LOOKUP_FLOOR.load(Ordering::Relaxed) - floor0,
+        0,
+        "no floor probe on the window arm"
+    );
+    assert!(!outcome.recomputed);
+    // Index 5: the exact record now supersedes the covering run; run 0
+    // still covers its other indices.
+    assert_eq!(
+        rig.kv().get_block_mapping(ino, 5).await.unwrap().unwrap(),
+        (5, fresh(5)),
+        "a window index inside a run superseded as a point"
+    );
+    assert_eq!(
+        rig.kv().get_block_mapping(ino, 4).await.unwrap().unwrap(),
+        (
+            0,
+            MapEntry::Run {
+                vol_tag,
+                start_offset: 0,
+                len: 16
+            }
+        ),
+        "run 0 still covers its other indices"
+    );
+    // Index 16: the run dissolved — 16 binds to the new point, 17..32
+    // survive as records.
+    assert_eq!(
+        rig.kv().get_block_mapping(ino, 16).await.unwrap().unwrap(),
+        (16, fresh(16)),
+        "a changed take at a run's key rebinds it"
+    );
+    for b in [17u32, 24, 31] {
+        let (ridx, entry) = rig.kv().get_block_mapping(ino, b).await.unwrap().unwrap();
+        assert_eq!(ridx, b, "run 1's index {b} survives as its own record");
+        assert_eq!(
+            entry_key_for_tests(&entry, 0).as_deref(),
+            Some((u64::from(b) * BLOCK).to_string().as_str()),
+            "run 1's index {b} keeps its binding through the dissolve"
+        );
+    }
     rig.shutdown().await;
 }
 

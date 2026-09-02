@@ -2837,6 +2837,24 @@ impl KvMetaBackend {
         ino: Ino,
         block_index: u32,
     ) -> std::result::Result<Option<(u32, super::block_map::MapEntry)>, KvError> {
+        match self.block_map_exact(ino, block_index).await? {
+            Some(hit) => Ok(Some(hit)),
+            None => self.block_map_floor(ino, block_index).await,
+        }
+    }
+
+    /// The EXACT half of [`Self::get_block_mapping`] alone: the record
+    /// keyed at `(ino, block_index)` or `None` — no floor probe. The
+    /// finding-46 WINDOW train's probe: a miss there is either a fresh
+    /// index (no record can cover it — RAM is whole-map authority) or an
+    /// index inside a run, and BOTH stage the same superseding point Put
+    /// under the §2 read law, so the RUN_LEN_MAX-bounded floor scan (up
+    /// to ~4 k records on a point-dense map) buys nothing per claim.
+    pub async fn block_map_exact(
+        &self,
+        ino: Ino,
+        block_index: u32,
+    ) -> std::result::Result<Option<(u32, super::block_map::MapEntry)>, KvError> {
         let Some(tree) = self.block_map.get() else {
             return Ok(None);
         };
@@ -2850,7 +2868,7 @@ impl KvMetaBackend {
                 block_index,
                 super::block_map::decode_block_map_value(&v)?,
             ))),
-            None => self.block_map_floor(ino, block_index).await,
+            None => Ok(None),
         }
     }
 
@@ -3151,7 +3169,11 @@ impl KvMetaBackend {
     /// claims train also RECOMPUTES its staged accounting as the
     /// tree→composed swap diff (the f36b twin: the shipper's stale frame
     /// may mis-name the displaced binding) and returns the released set
-    /// for the caller's post-commit free ladder.
+    /// for the caller's post-commit free ladder. `claims.window` (finding
+    /// 46) is the LOCAL whole-map-authority publish WINDOW: take claims
+    /// only, exact-lookup probes only, no recompute (the caller's frame
+    /// is exact and commits verbatim) — the steady-state streaming save's
+    /// O(window) form of the same train.
     ///
     /// Every committed train on the multi-writer plane bumps the head's
     /// map GENERATION (§11's belt; solo volumes never mint one — their
@@ -3466,13 +3488,21 @@ impl KvMetaBackend {
             // partial store deletes. `preexisting` counts the DISTINCT
             // records the probes observed (claims-bounded by
             // construction — the A1 whole-population census stays the
-            // establishing train's).
+            // establishing train's). Finding 46: a WINDOW train probes
+            // exact-only — with RAM whole-map authority behind it, a
+            // miss is a fresh index or an index inside a run, and both
+            // stage the same superseding point Put (the §2 read law), so
+            // the floor scan's only yields (the arithmetic-equal skip and
+            // the recompute's displaced ledger) buy nothing here.
             let mut current: std::collections::BTreeMap<u32, super::block_map::MapEntry> =
                 std::collections::BTreeMap::new();
             for &idx in c.take.iter().chain(c.release.iter()) {
-                if let Some((ridx, entry)) = self
-                    .get_block_mapping(ino, idx)
-                    .await
+                let probe = if c.window {
+                    self.block_map_exact(ino, idx).await
+                } else {
+                    self.get_block_mapping(ino, idx).await
+                };
+                if let Some((ridx, entry)) = probe
                     .map_err(|e| self.eio(&format!("block-map claim probe for ino {ino}: {e}")))?
                 {
                     // Probes insert records at their TRUE keys, so the
@@ -3846,8 +3876,13 @@ impl KvMetaBackend {
         // installs): a solo overlay save's displacement discovery lives
         // WHOLLY here (§14 S2 option ii — the merge stopped capturing
         // tree prev-bindings), so it cannot depend on the mw arm.
+        // Finding 46: a WINDOW train never recomputes — its caller's RAM
+        // merge captured every displacement (whole-map authority), so the
+        // frame is exact and a recompute would only double-count the
+        // displaced frees the caller's own stream already owns.
         let resolver_global = super::block_refs::block_ref_resolver();
-        let recompute_armed = claims.is_some_and(|c| resolver_global.is_some() || c.overlay);
+        let recompute_armed =
+            claims.is_some_and(|c| !c.window && (resolver_global.is_some() || c.overlay));
         let staged_refs: Vec<super::block_refs::BlockRefOp> = if recompute_armed {
             recomputed = true;
             let mut out: Vec<super::block_refs::BlockRefOp> = Vec::new();
@@ -7076,6 +7111,17 @@ pub struct MapTrainClaims {
     /// other local claims trains keep the 5b posture — recompute only
     /// under the global resolver, caller frame preserved otherwise.
     pub overlay: bool,
+    /// Finding 46 (design §3 Publish / §14 S2): `true` ⇔ this is a LOCAL
+    /// publish WINDOW on a whole-map-authority kvmap ino — `take` = the
+    /// window's indices, `release` empty, `entries` = the RAM map's
+    /// bindings at exactly those indices. The train probes exact-only
+    /// (no floor scan) and NEVER recomputes: the caller's RAM merge
+    /// captured every displacement, so its frame commits verbatim (the
+    /// f36 preservation arm) and its displaced-free stream stays its own.
+    /// Delete-by-absence stays OFF — the non-publish saves (truncate,
+    /// punch, fsync-persist) and the sweep own deletes. Only the routing
+    /// save sets it.
+    pub window: bool,
 }
 
 /// RAII registration in the in-flight crossing registry (design A3) —

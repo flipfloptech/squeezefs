@@ -7452,8 +7452,22 @@ impl DataRouter {
 
     /// **The kvmap arm of the save body** (PR 2, design §3): publish `ino`
     /// through the block-map tree — the crossing train on a first
-    /// crossing / legacy-blob conversion, the same diff train on every
-    /// later save of a sticky `kvmap:` head.
+    /// crossing / legacy-blob conversion, and on every later save of a
+    /// sticky `kvmap:` head one of THREE train inputs:
+    ///
+    /// * the **whole-map diff** (delete-by-absence; Rev 1.3 #2) — the
+    ///   crossing, and every NON-publish save (truncate/punch/fsync
+    ///   persist: the saves that own deletes) or a publish carrying
+    ///   deferred accounting notes (Vector B: notes describe bindings
+    ///   outside the window);
+    /// * the **overlay claims train** (PR 6c-i) — a PARTIAL ino's save;
+    /// * the **publish WINDOW** (finding 46) — a whole-map ino's
+    ///   publish-class save (`publish_entries = Some`) ships ONLY the
+    ///   window's bindings as take claims: O(window) tree operations,
+    ///   never O(map). The 2026-09-02 field row ran the whole-map diff on
+    ///   every streaming publish — ~4.6 range pages ≈ the ino's whole
+    ///   population per 4 MiB block, ~275 ms each on the 2-thread
+    ///   sqz-meta pool — and collapsed 24 sequential writers ~2,000×.
     ///
     /// `Ok(None)` = the arm STOOD DOWN without consuming anything (a new
     /// crossing whose local home volume has no engaged tree) — the caller
@@ -7467,13 +7481,14 @@ impl DataRouter {
         ino: u64,
         m: &CachedMetadata,
         fencing_token: u64,
-        is_publish: bool,
+        publish_entries: Option<&[(u32, String)]>,
         block_refs: &[crate::meta_backend::kv::block_refs::BlockRefOp],
         head_is_kvmap: bool,
     ) -> Result<Option<(bool, Vec<crate::meta_backend::kv::block_refs::BlockRef>)>> {
         let backend = self.inner.meta_backend.get().ok_or_else(|| {
             SqueezefsError::InvalidOperation("Metadata backend not initialized".to_string())
         })?;
+        let is_publish = publish_entries.is_some();
         // The engagement gate for a NEW crossing. A FOREIGN-HOME new
         // crossing stands down entirely: a co-writer can neither read the
         // owner's superblock nor decide its format posture, and
@@ -7525,23 +7540,71 @@ impl DataRouter {
         } else {
             None
         };
-        let mut entries: Vec<(u32, String)> = match (&overlay_snapshot, m.block_map.as_deref()) {
-            (Some(overlay), _) => overlay
-                .iter()
-                .filter_map(|(b, v)| v.as_ref().map(|k| (*b, k.clone())))
-                .collect(),
-            (None, Some(map)) => map.iter().map(|(b, k)| (*b, k.clone())).collect(),
-            (None, None) => {
-                return Err(SqueezefsError::InvalidOperation(format!(
-                    "kvmap publish for ino {ino}: the RAM entry carries no block map — \
-                     refusing to reconcile the tree against an absent authority"
-                )));
+
+        // The deferred accounting drains exactly as the legacy path does
+        // (older than this call's own ops), and the finding-38 chunk law
+        // pre-commits over-cap loads on the LOCAL arm; a SHIPPED crossing
+        // carries its WHOLE claim set on the verb (finding 36b — the
+        // owner runs the journal-entry-cap chunking).
+        let deferred = self.take_block_ref_ops(ino);
+        let has_deferred_refs = !deferred.is_empty();
+
+        // Finding 46 — the publish WINDOW (whole-map inos, design §3
+        // Publish: "a 64-block window ≈ 4 KiB of journal"). A sticky
+        // whole-map head's PUBLISH-class save ships only the window's
+        // bindings as take claims; the whole-map diff is legitimate at the
+        // crossing and on the saves that own deletes, never per streaming
+        // publish. The gate, each clause load-bearing:
+        // * LOCAL — the shipped verb still carries the whole map (the
+        //   owner derives its claims from the refs frame; the co-writer
+        //   wire economy is the mw plane's own item);
+        // * no deferred notes — Vector B's law verbatim (the delta arm's
+        //   `has_deferred_refs` clause): notes describe bindings OUTSIDE
+        //   this window, so they ride whole-map-class saves only;
+        // * no live range grants — the local train under grants keeps
+        //   the PR 5b claims/recompute posture (`migrate_block_map`'s
+        //   `live_grants` arm) untouched;
+        // * every window index binds in the RAM map — the train Puts
+        //   RAM's CURRENT binding (whole-map authority), never the op's
+        //   own key; an index the map no longer holds means the batch and
+        //   the map diverged, and the whole-map diff is the safe arm.
+        let window: Option<Vec<(u32, String)>> = match (publish_entries, m.block_map.as_deref()) {
+            (Some(w), Some(map))
+                if head_is_kvmap
+                    && !partial
+                    && local
+                    && !has_deferred_refs
+                    && !crate::data_grant::custody_owner()
+                        .is_some_and(|o| o.ino_has_range_grants(ino)) =>
+            {
+                let indices: std::collections::BTreeSet<u32> = w.iter().map(|(b, _)| *b).collect();
+                indices
+                    .into_iter()
+                    .map(|b| map.get(&b).map(|k| (b, k.clone())))
+                    .collect::<Option<Vec<_>>>()
             }
+            _ => None,
         };
+        let mut entries: Vec<(u32, String)> =
+            match (&overlay_snapshot, &window, m.block_map.as_deref()) {
+                (Some(overlay), _, _) => overlay
+                    .iter()
+                    .filter_map(|(b, v)| v.as_ref().map(|k| (*b, k.clone())))
+                    .collect(),
+                (None, Some(w), _) => w.clone(),
+                (None, None, Some(map)) => map.iter().map(|(b, k)| (*b, k.clone())).collect(),
+                (None, None, None) => {
+                    self.note_block_ref_ops(ino, deferred);
+                    return Err(SqueezefsError::InvalidOperation(format!(
+                        "kvmap publish for ino {ino}: the RAM entry carries no block map — \
+                         refusing to reconcile the tree against an absent authority"
+                    )));
+                }
+            };
         entries.sort_unstable_by_key(|&(b, _)| b);
-        let overlay_claims: Option<crate::meta_backend::kv::backend::MapTrainClaims> =
-            overlay_snapshot.as_ref().map(|overlay| {
-                crate::meta_backend::kv::backend::MapTrainClaims {
+        let local_claims: Option<crate::meta_backend::kv::backend::MapTrainClaims> =
+            match (&overlay_snapshot, &window) {
+                (Some(overlay), _) => Some(crate::meta_backend::kv::backend::MapTrainClaims {
                     // The held 4a serializes — no staleness window for
                     // the belt (§14 S2: base_gen None on local trains).
                     base_gen: None,
@@ -7557,15 +7620,21 @@ impl DataRouter {
                     // §14 S2 option ii: displacement discovery rides the
                     // recompute through this save's live `ref_for`.
                     overlay: true,
-                }
-            });
-
-        // The deferred accounting drains exactly as the legacy path does
-        // (older than this call's own ops), and the finding-38 chunk law
-        // pre-commits over-cap loads on the LOCAL arm; a SHIPPED crossing
-        // carries its WHOLE claim set on the verb (finding 36b — the
-        // owner runs the journal-entry-cap chunking).
-        let deferred = self.take_block_ref_ops(ino);
+                    window: false,
+                }),
+                (None, Some(w)) => Some(crate::meta_backend::kv::backend::MapTrainClaims {
+                    base_gen: None,
+                    take: w.iter().map(|(b, _)| *b).collect(),
+                    // Delete-by-absence OFF: truncate/punch/sweep own
+                    // deletes, and this save's RAM merge captured every
+                    // displacement in `block_refs` already.
+                    release: std::collections::BTreeSet::new(),
+                    served: false,
+                    overlay: false,
+                    window: true,
+                }),
+                (None, None) => None,
+            };
         let mut refs: Vec<crate::meta_backend::kv::block_refs::BlockRefOp> =
             Vec::with_capacity(deferred.len() + block_refs.len() + 1);
         refs.extend(deferred);
@@ -7677,7 +7746,7 @@ impl DataRouter {
             map_migrate_chunk(),
             cursor_floor,
             &ref_for,
-            overlay_claims,
+            local_claims,
         )
         .await
         {
@@ -7753,6 +7822,13 @@ impl DataRouter {
             METRICS.kvmap_overlay_saves.fetch_add(1, Ordering::Relaxed);
             self.kvmap_overlay_drain(ino, shipped);
             self.kvmap_window_drop(ino);
+        }
+        // Finding 46: the window save's engagement — a streaming publish
+        // on a whole-map kvmap ino must account here, never on the
+        // whole-map diff (`meta_kv_block_map_range_records` per publish
+        // is the tree-read face of the same law).
+        if window.is_some() {
+            METRICS.kvmap_window_saves.fetch_add(1, Ordering::Relaxed);
         }
         let mut released_up = outcome.released;
         if partial
@@ -7987,7 +8063,7 @@ impl DataRouter {
             .is_some_and(|id| id.starts_with(kvmap_head_prefix()));
         if head_is_kvmap {
             if let Some(verdict) = self
-                .kvmap_publish(ino, m, fencing_token, is_publish, block_refs, true)
+                .kvmap_publish(ino, m, fencing_token, publish_entries, block_refs, true)
                 .await?
             {
                 return Ok(verdict);
@@ -8085,7 +8161,7 @@ impl DataRouter {
         // below runs verbatim.
         if !head_is_kvmap && needs_indirect && kvmap_enabled() {
             if let Some(verdict) = self
-                .kvmap_publish(ino, m, fencing_token, is_publish, block_refs, false)
+                .kvmap_publish(ino, m, fencing_token, publish_entries, block_refs, false)
                 .await?
             {
                 return Ok(verdict);

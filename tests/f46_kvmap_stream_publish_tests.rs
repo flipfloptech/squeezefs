@@ -261,6 +261,7 @@ struct Ledger {
     range_records: u64,
     publishes: u64,
     published_blocks: u64,
+    window_saves: u64,
 }
 
 fn ledger() -> Ledger {
@@ -273,6 +274,7 @@ fn ledger() -> Ledger {
         published_blocks: METRICS
             .layout_publish_batched_blocks
             .load(Ordering::Relaxed),
+        window_saves: METRICS.kvmap_window_saves.load(Ordering::Relaxed),
     }
 }
 
@@ -284,6 +286,7 @@ fn delta(a: Ledger, b: Ledger) -> Ledger {
         range_records: b.range_records - a.range_records,
         publishes: b.publishes - a.publishes,
         published_blocks: b.published_blocks - a.published_blocks,
+        window_saves: b.window_saves - a.window_saves,
     }
 }
 
@@ -385,6 +388,14 @@ async fn a_streaming_extend_on_a_kvmap_ino_publishes_in_o_window_tree_reads() {
         stream.publishes,
         stream.published_blocks,
     );
+    // The engagement face: every steady-state publish rode the WINDOW
+    // arm (`kvmap_window_saves` is the row-validity gauge for the field
+    // verification — a green here with the gauge flat would be a
+    // whole-map save that happened to read cheaply).
+    assert_eq!(
+        stream.window_saves, stream.publishes,
+        "every steady-state publish must account as a window save"
+    );
 
     // Content beside economy: the window's first and last blocks read
     // back exactly on both inos (the durable map names every published
@@ -410,4 +421,111 @@ async fn a_streaming_extend_on_a_kvmap_ino_publishes_in_o_window_tree_reads() {
         "ino {ino}: the tree covers {covered_now} indices for {} written blocks",
         crossed_at + STREAM_BLOCKS
     );
+}
+
+// ===========================================================================
+// The window arm composes with the arms that keep the whole-map diff: a
+// REWRITE (the rewrite program's shadow-epoch swap) and a TRUNCATE (the
+// non-publish save that owns deletes) both run against a tree the window
+// saves left ≡ RAM, and an extend after them rides the window again
+// ===========================================================================
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn window_saves_compose_with_the_rewrite_and_truncate_arms() {
+    let _g = serial().await;
+    let _ = env_logger::builder().is_test(true).try_init();
+    let h = mount_live_shape().await;
+    let ino = create(&h, "f46-rw.bin").await;
+    let sibling = create(&h, "f46-rw-sibling.bin").await;
+    let crossed_at = write_until_both_crossed(&h, [ino, sibling]).await;
+    fsync(&h, ino).await;
+    fsync(&h, sibling).await;
+    // Extend through the window arm first, so the arms below run against
+    // a tree the WINDOW saves produced.
+    let l0 = ledger();
+    for b in crossed_at..crossed_at + 64 {
+        write_block(&h, ino, b).await;
+    }
+    let ext = delta(l0, ledger());
+    assert!(
+        ext.window_saves >= 1 && ext.window_saves == ext.publishes && ext.range_records == 0,
+        "the extend rides the window arm: {ext:?}"
+    );
+    fsync(&h, ino).await;
+    let size_blocks = crossed_at + 64;
+    let (_, covered0) = tree_census(&h, ino).await;
+    assert_eq!(covered0, size_blocks, "the tree covers the extended map");
+
+    // A rewrite pass over 32 blocks in the middle of the map (the f44
+    // shape): the rewrite program's shadow-epoch swap owns this vehicle
+    // (its publish is the epoch close's, never a window save) — the law
+    // here is that it composes onto the window-built tree: coverage
+    // unchanged, the rewritten bytes served, no duplicate records.
+    let lo = crossed_at / 4;
+    let rewritten: Vec<u64> = (lo..lo + 32).collect();
+    for &b in &rewritten {
+        let data: Vec<u8> = pattern(b).into_iter().map(|x| x ^ 0x55 | 1).collect();
+        let len = data.len();
+        let w =
+            h.fs.write(h.req, ino, 0, b * BS, bytes::Bytes::from(data), 0, 0)
+                .await
+                .unwrap_or_else(|e| panic!("rewrite block {b}: {e:?}"));
+        assert_eq!(w.written as usize, len);
+    }
+    fsync(&h, ino).await;
+    let (records1, covered1) = tree_census(&h, ino).await;
+    assert_eq!(
+        covered1, size_blocks,
+        "a same-index rewrite supersedes — coverage unchanged ({records1} records)"
+    );
+    for &b in &rewritten {
+        let want: Vec<u8> = pattern(b).into_iter().map(|x| x ^ 0x55 | 1).collect();
+        assert_eq!(read_block(&h, ino, b).await, want, "rewritten block {b}");
+    }
+
+    // The delete law: a truncate to half the file removes the tail's
+    // records — the NON-publish save's whole-map diff (delete-by-absence)
+    // is what owns that; the window arm's release set is empty by law.
+    let keep = size_blocks / 2;
+    let l0 = ledger();
+    let attr =
+        h.fs.setattr(
+            h.req,
+            ino,
+            None,
+            fuse3::SetAttr {
+                size: Some(keep * BS),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("truncate");
+    assert_eq!(attr.attr.size, keep * BS);
+    fsync(&h, ino).await;
+    let tr = delta(l0, ledger());
+    assert_eq!(
+        tr.window_saves, 0,
+        "a truncate never rides the window arm (it owns deletes): {tr:?}"
+    );
+    let (_, covered2) = tree_census(&h, ino).await;
+    assert_eq!(
+        covered2, keep,
+        "the truncate's save removed the tail records (tree covers {covered2}, kept {keep})"
+    );
+    // And an EXTEND after the truncate publishes windows again, onto the
+    // shrunk map, with the reads exact.
+    let l0 = ledger();
+    for b in keep..keep + 16 {
+        write_block(&h, ino, b).await;
+    }
+    let ext = delta(l0, ledger());
+    assert!(
+        ext.window_saves >= 1 && ext.range_records == 0,
+        "the post-truncate extend rides the window arm again: {ext:?}"
+    );
+    fsync(&h, ino).await;
+    let (_, covered3) = tree_census(&h, ino).await;
+    assert_eq!(covered3, keep + 16, "the tree covers the re-extended map");
+    assert_eq!(read_block(&h, ino, keep + 15).await, pattern(keep + 15));
+    assert_eq!(read_block(&h, ino, keep - 1).await, pattern(keep - 1));
 }

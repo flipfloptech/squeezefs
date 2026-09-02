@@ -5792,6 +5792,14 @@ pub struct Metrics {
     /// claims train (a partial ino's publish delta must account here; ≈ 0
     /// with `SQUEEZEFS_KVMAP_OVERLAY=0`).
     pub kvmap_overlay_saves: Align64<AtomicU64>,
+    /// Finding 46: window-save engagement — publish-class saves of a
+    /// WHOLE-MAP kvmap ino that shipped only the publish window's
+    /// bindings through the LOCAL claims train (O(window) tree reads).
+    /// A streaming write row on kvmap-headed inos must account its
+    /// post-crossing publishes here; `meta_kv_block_map_range_records`
+    /// per publish growing with file size is the whole-map diff running
+    /// where a window should.
+    pub kvmap_window_saves: Align64<AtomicU64>,
     /// kvmap PR 6c-i: warm-window bytes of partial-mode inos (the R5
     /// `block_map_window` component's gauge — floor 0, drop-at-will).
     pub block_map_window_bytes: Align64<AtomicU64>,
@@ -10123,6 +10131,8 @@ impl SqueezefsFilesystem {
                 // family (`block_map_window` is the R5 component).
                 "kvmap_partial_inos": self.router.kvmap_partial_ino_count(),
                 "kvmap_overlay_saves": METRICS.kvmap_overlay_saves.load(Ordering::Relaxed),
+                // Finding 46: the whole-map ino's O(window) publish arm.
+                "kvmap_window_saves": METRICS.kvmap_window_saves.load(Ordering::Relaxed),
                 "block_map_window_bytes": METRICS.block_map_window_bytes.load(Ordering::Relaxed),
                 "block_map_window_fills": METRICS.block_map_window_fills.load(Ordering::Relaxed),
                 "block_map_window_hits": METRICS.block_map_window_hits.load(Ordering::Relaxed),

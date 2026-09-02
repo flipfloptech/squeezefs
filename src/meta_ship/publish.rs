@@ -1927,12 +1927,14 @@ pub async fn migrate_block_map(
     ref_for: &(dyn Fn(&str, u32) -> Option<crate::meta_backend::kv::block_refs::BlockRef>
           + Send
           + Sync),
-    // PR 6c-i (design §14): a PARTIAL-mode local save's OVERLAY claims —
-    // take = dirty bindings, release = tombstones, `served: false`. The
-    // local arm runs them through the claims-scoped train (bounded by
-    // pre-fix a); the shipped arm ignores them (the wire carries
+    // The routing save's own LOCAL claims, `served: false`: PR 6c-i's
+    // OVERLAY claims (take = dirty bindings, release = tombstones) for a
+    // partial ino, or the finding-46 publish WINDOW (take = the window's
+    // indices, `window: true`) for a whole-map ino's steady-state save.
+    // The local arm runs them through the claims-scoped train (bounded
+    // by pre-fix a); the shipped arm ignores them (the wire carries
     // entries + the refs frame, and the owner derives its claims there).
-    overlay_claims: Option<crate::meta_backend::kv::backend::MapTrainClaims>,
+    local_claims: Option<crate::meta_backend::kv::backend::MapTrainClaims>,
 ) -> Result<crate::meta_backend::kv::backend::MapMigrateOutcome> {
     match owner_of(be, ino)? {
         None => {
@@ -1956,12 +1958,13 @@ pub async fn migrate_block_map(
             // crossing gate stands down to the blob arm instead.
             let live_grants = !serve_window_already_held()
                 && crate::data_grant::custody_owner().is_some_and(|o| o.ino_has_range_grants(ino));
-            let claims = if let Some(oc) = overlay_claims {
-                // The overlay save (PR 6c-i): the caller's claims ARE the
-                // overlay's own transitions — authoritative under the
-                // held 4a, no frame derivation needed (and the base is a
-                // sticky kvmap head by construction).
-                Some(oc)
+            let claims = if let Some(lc) = local_claims {
+                // The overlay save (PR 6c-i) / the window save (finding
+                // 46): the caller's claims ARE its own transitions —
+                // authoritative under the held 4a, no frame derivation
+                // needed (and the base is a sticky kvmap head by
+                // construction).
+                Some(lc)
             } else if live_grants {
                 let kvmap_base = match be.getxattr(ino, "layout").await {
                     Ok(Some(bytes)) => crate::layout_wire::decode_layout_any(&bytes)
@@ -2006,6 +2009,7 @@ pub async fn migrate_block_map(
                     // the 5b recompute posture (global resolver) governs.
                     served: false,
                     overlay: false,
+                    window: false,
                 })
             } else {
                 None
@@ -3561,6 +3565,7 @@ impl PublishService {
             // pre-fix b) — mints the belt like every shipped train.
             served: true,
             overlay: false,
+            window: false,
         };
         match self
             .inner
@@ -3719,6 +3724,7 @@ impl PublishService {
                 // train — mints the belt (§14 S2 pre-fix b).
                 served: true,
                 overlay: false,
+                window: false,
             };
             match self
                 .inner

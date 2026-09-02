@@ -907,6 +907,7 @@ async fn a_claims_train_meeting_a_live_cursor_refuses_at_or_above_it() {
         // (§12b #5 / §14: local claims trains barrier instead).
         served: true,
         overlay: false,
+        window: false,
     };
     // (a) A take AT/ABOVE the cursor refuses retried-class.
     let above = rig

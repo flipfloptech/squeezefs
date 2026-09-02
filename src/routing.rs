@@ -5750,6 +5750,13 @@ impl DataRouter {
         meta_backend.install_map_entry_encoder(std::sync::Arc::new(move |key: &str| {
             br.block_key_map_entry(key)
         }));
+        // PR 5b: the decoder mirror — the claims-scoped train's f36b
+        // recompute resolves DISPLACED tree records through the same
+        // volume census.
+        let br = std::sync::Arc::clone(&self.backend_router);
+        meta_backend.install_map_entry_decoder(std::sync::Arc::new(
+            move |e: &crate::meta_backend::kv::block_map::MapEntry| br.map_entry_block_key(e),
+        ));
         let _ = self.inner.meta_backend.set(meta_backend);
     }
 
@@ -6843,12 +6850,25 @@ impl DataRouter {
             }
         }
 
-        // The ~100 B head: `kvmap:1`, no inline map (design §2).
+        // The ~100 B head: `kvmap:1`, no inline map (design §2). PR 5b:
+        // the head carries the caller's KNOWN map generation (the §11
+        // belt) — the shipped verb's base_gen carrier; the committed
+        // train re-stamps it from the durable head either way.
+        let base_gen = m
+            .block_map_id
+            .as_deref()
+            .and_then(|id| crate::meta_backend::kv::block_map::parse_kvmap_head(id).ok())
+            .map(|h| h.gen)
+            .unwrap_or(0);
         let head = LayoutMetadata {
             file_type: m.file_type.to_string(),
             size: m.size,
             block_map_id: Some(
-                crate::meta_backend::kv::block_map::KvmapHead { sweep_cursor: None }.encode(),
+                crate::meta_backend::kv::block_map::KvmapHead {
+                    sweep_cursor: None,
+                    gen: base_gen,
+                }
+                .encode(),
             ),
             block_prefix: m.block_prefix.as_deref().map(str::to_string),
             file_id: m.file_id.as_deref().map(str::to_string),
@@ -6881,6 +6901,16 @@ impl DataRouter {
                 // failure discipline verbatim).
                 self.note_block_ref_ops(ino, refill);
                 self.reset_layout_provenance(ino);
+                // PR 5b (design §11's belt): a generation-lag refusal
+                // means the durable head moved under this ship — re-learn
+                // the head id (gen included) from the local reader view
+                // so the retry converges instead of re-shipping the same
+                // lagging base forever. ONLY the head id is patched: the
+                // RAM map stays this mount's write authority (dropping it
+                // would lose acked bindings).
+                if format!("{e}").contains("kvmap map generation") {
+                    self.refresh_kvmap_head_id(ino, backend).await;
+                }
                 return Err(e);
             }
         };
@@ -6902,12 +6932,21 @@ impl DataRouter {
             }
         }
 
-        // The republish: the head is now `kvmap:1`, delta-ineligible
-        // (Rev 1.1 #5 sticky), and the map stays WARM in RAM — the
-        // crossing must not cold the mount (`m.clone()` carries it).
+        // The republish: the head is now `kvmap:1[;gen:N]` (the train
+        // re-stamps the committed generation — the outcome carries it, so
+        // the next ship's base_gen is current without a refetch),
+        // delta-ineligible (Rev 1.1 #5 sticky), and the map stays WARM in
+        // RAM — the crossing must not cold the mount (`m.clone()`).
         let mut cached = m.clone();
         cached.layout_delta_chain = LAYOUT_DELTA_CHAIN_INELIGIBLE;
-        cached.block_map_id = head.block_map_id.clone().map(Into::into);
+        cached.block_map_id = Some(
+            crate::meta_backend::kv::block_map::KvmapHead {
+                sweep_cursor: None,
+                gen: outcome.gen,
+            }
+            .encode()
+            .into(),
+        );
         cached.cached_at = std::time::Instant::now();
         cached.layout_base_token = fencing_token;
         cached.layout_version = 0;
@@ -6921,9 +6960,47 @@ impl DataRouter {
         if let Some(ref old_key) = old_indirect_to_free {
             let _ = self.backend_router.free_block(old_key).await;
         }
-        // Finding 36: a kvmap publish is never owner-recomputed.
-        let _ = self.inner.publish_recomputed.remove_sync(&ino);
-        Ok(Some((false, Vec::new())))
+        // Finding 36 (the kvmap twin, PR 5b): a claims-scoped train the
+        // owner RECOMPUTED owns its displaced device frees — the verdict
+        // latches so this mount's frame-derived displaced frees stand
+        // down (local tier/tracking hygiene only). A LOCAL recompute's
+        // released set travels up for the save's post-guard shipped-free
+        // ladder (RES-1: never freed under the caller's 3.5 stripe).
+        if outcome.recomputed {
+            let _ = self.inner.publish_recomputed.insert_sync(ino, ());
+        } else {
+            let _ = self.inner.publish_recomputed.remove_sync(&ino);
+        }
+        Ok(Some((outcome.recomputed, outcome.released)))
+    }
+
+    /// PR 5b (design §11's belt): re-learn `ino`'s kvmap head id — the
+    /// map generation included — from the durable record (the co-writer's
+    /// S5 reader view of the shared volume), patching ONLY the cached
+    /// entry's `block_map_id`. Best-effort: an unreadable/non-kvmap head
+    /// leaves the cache untouched and the retry refuses loud again.
+    async fn refresh_kvmap_head_id(
+        &self,
+        ino: u64,
+        backend: &std::sync::Arc<crate::meta_backend::RoutedMetaBackend>,
+    ) {
+        use crate::meta_backend::Metadata as _;
+        let Ok(Some(bytes)) = backend.getxattr(ino, "layout").await else {
+            return;
+        };
+        let Some(id) = crate::layout_wire::decode_layout_any(&bytes)
+            .ok()
+            .and_then(|l| l.block_map_id)
+            .filter(|id| id.starts_with(kvmap_head_prefix()))
+        else {
+            return;
+        };
+        if let Some(mut cur) = self.metadata_cache.get(&ino) {
+            if cur.block_map_id.as_deref() != Some(id.as_str()) {
+                cur.block_map_id = Some(id.into());
+                self.publish_layout_cache_entry(ino, cur);
+            }
+        }
     }
 
     /// Returns the finding-36 verdict pair: `.0` = the publish's staged

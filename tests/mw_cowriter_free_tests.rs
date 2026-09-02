@@ -5602,3 +5602,234 @@ async fn an_authority_local_publish_frees_a_co_writer_minted_displaced_block() {
     drop(cwr);
     auth.stop().await;
 }
+
+// ---------------------------------------------------------------------------
+// kvmap PR 5b — the f36b twin on the SHIPPED MIGRATION TRAIN (design
+// §11 law a): a sticky kvmap head's saves ship as `MigrateBlockMap`, and
+// the pre-5b served train's diff-deleted bindings minted NO ref release
+// and NO device free (the f36b leak class on the map-tree plane), while
+// the shipper's caller-frame free of the binding its STALE frame named
+// came back Refused on the untracked tripwire.
+// ---------------------------------------------------------------------------
+
+/// The kvmap head bytes a co-writer's save flip commits (the routing
+/// arm's shape — `gen` travels in the id when the belt has minted one).
+fn kvmap_head_bytes(size: u64, head_id: &str) -> Vec<u8> {
+    bincode::serialize(&squeezefs::layout_wire::LayoutMetadata {
+        file_type: "striped".into(),
+        size,
+        block_map_id: Some(head_id.to_string()),
+        block_prefix: None,
+        file_id: None,
+        data_key: None,
+        block_map: None,
+    })
+    .expect("kvmap head bytes")
+}
+
+/// A dirty cached kvmap-headed entry — the co-writer's RAM state after a
+/// refetch of a crossed ino (`block_map_id` sticky, map warm, chain
+/// ineligible by the kvmap law).
+fn dirty_kvmap_entry(size: u64, key: &str, head_id: &str) -> CachedMetadata {
+    let mut map = std::collections::HashMap::new();
+    map.insert(0u32, key.to_string());
+    CachedMetadata {
+        file_type: "striped".into(),
+        size,
+        block_map_id: Some(std::sync::Arc::from(head_id)),
+        block_map: Some(std::sync::Arc::new(map)),
+        layout_dirty: true,
+        layout_delta_chain: LAYOUT_DELTA_CHAIN_INELIGIBLE,
+        ..Default::default()
+    }
+}
+
+/// The durable kvmap head id (gen included) as the co-writer's refetch
+/// would learn it.
+async fn durable_kvmap_head_id(auth: &Authority, ino: u64) -> String {
+    use squeezefs::meta_backend::Metadata as _;
+    let bytes = auth
+        .meta
+        .getxattr(ino, "layout")
+        .await
+        .expect("layout read")
+        .expect("layout exists");
+    squeezefs::layout_wire::decode_layout_any(&bytes)
+        .expect("decodable head")
+        .block_map_id
+        .expect("kvmap head id")
+}
+
+/// Contract (kvmap PR 5b item 2 — the f36b recompute twin; RED pre-5b):
+/// a co-writer's shipped kvmap save whose frame SKEWED from the durable
+/// tree (the lagging-refetch shape) leaks nothing and refuses nothing —
+/// the authority's claims-scoped train RECOMPUTES the staged accounting,
+/// frees the block the committed transition ACTUALLY displaced through
+/// its OWN ladder (never the mis-named one the stale frame released),
+/// `map_recomputed_releases` engages, and the co-writer's caller-frame
+/// displaced-free ship stands down (`recomputed` on `MapMigrated` — the
+/// deleted routing shortcut said "a kvmap publish is never
+/// owner-recomputed").
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_skewed_kvmap_ship_frees_the_true_displaced_set_on_the_authority() {
+    let _serial = serial();
+    let _restore = restore();
+    squeezefs::meta_ship::tokens::test_clear_range_cache();
+    let dir = TempDir::new().unwrap();
+    let vol = fresh_volume(dir.path(), "kvmap-f36b").await;
+    let dev = data_device(dir.path(), "kvmap-f36b.dev");
+    let auth = Authority::start(&vol, &dev, &[NODE_A]).await;
+    install_authority_refs_resolver(&auth.br);
+
+    // The durable truth: the ino CROSSED on the authority — a kvmap head
+    // whose tree binds block 0 → X, durably referenced.
+    let x_off = auth.alloc.allocate_block().await.expect("mint X");
+    let x_idx = x_off / auth.alloc.chunk_size();
+    auth.alloc.publish_block(x_off);
+    let ino = auth
+        .meta
+        .create_with_rdev_size(1, "kvmap-f36b.bin", 0o100644, 0, 0, 0, 0)
+        .await
+        .expect("create")
+        .ino;
+    publish::migrate_block_map(
+        &auth.meta,
+        ino,
+        &kvmap_head_bytes(F36_SIZE, "kvmap:1"),
+        F36_SIZE,
+        vec![(0u32, x_off.to_string())],
+        vec![BlockRefOp::taken(BlockRef {
+            vol_tag: volume_tag(DATA_VOL),
+            block_idx: x_idx,
+            owner_ino: ino,
+            block_index: 0,
+        })],
+        512,
+    )
+    .await
+    .expect("the authority's local crossing lands");
+    assert_eq!(auth.population(x_idx).await, 1, "fixture: X is durable");
+
+    let cwr = CoWriter::join(&auth, &vol, &dev, NODE_A).await;
+    let stage = tempdir().unwrap();
+    let dlm = DlmClient::new().expect("dlm");
+    let router = save_router(&dlm, &cwr.alloc, &dev, &cwr.meta, stage.path()).await;
+
+    let untracked_before = METRICS
+        .block_untracked_free_refusals
+        .load(Ordering::Relaxed);
+    let double_before = METRICS.block_double_frees.load(Ordering::Relaxed);
+    let map_recomputed_before = publish::stats().map_recomputed_releases;
+    let free_shipped_before = publish::stats().free_shipped_blocks;
+
+    // --- Publish 1 (un-skewed): the frame matches the durable tree —
+    // RAM believes block 0 holds X (the durable truth), and the merge to
+    // N1 mints release(X) + take(N1).
+    let n1_off = cwr.alloc.allocate_block().await.expect("mint N1");
+    let n1_idx = n1_off / cwr.alloc.chunk_size();
+    cwr.alloc.publish_block(n1_off);
+    let head_id = durable_kvmap_head_id(&auth, ino).await;
+    router
+        .metadata_cache
+        .insert(ino, dirty_kvmap_entry(F36_SIZE, &x_off.to_string(), &head_id));
+    let token = dlm.get_fencing_token_ino(ino);
+    let displaced1 = router
+        .merge_block_mappings_coalesced(
+            ino,
+            vec![(0u32, n1_off.to_string())],
+            0,
+            squeezefs::routing::LayoutFlip::KeepLayout,
+            token,
+        )
+        .await
+        .expect("publish 1 ships the kvmap train");
+    assert!(
+        displaced1.is_empty(),
+        "a recomputed kvmap publish hands its caller-frame displaced keys back to NO ONE \
+         (the authority owns the device frees): {displaced1:?}"
+    );
+    auth.br.reclaim_drain().await;
+    assert_eq!(
+        auth.population(x_idx).await,
+        0,
+        "the recompute's ledger Delete rode the flip tx — X is durably unreferenced"
+    );
+    assert!(
+        auth.free_listed(x_idx),
+        "the un-skewed displaced block re-enters the free supply on the authority"
+    );
+
+    // --- Publish 2 (SKEWED): the frame believes block 0 STILL holds X ---
+    // (the lagging-refetch shape), so its release claim MIS-NAMES the
+    // displaced binding. The transition the authority actually commits
+    // displaces N1.
+    let n2_off = cwr.alloc.allocate_block().await.expect("mint N2");
+    let n2_idx = n2_off / cwr.alloc.chunk_size();
+    cwr.alloc.publish_block(n2_off);
+    let head_id = durable_kvmap_head_id(&auth, ino).await;
+    // Seed the SKEW explicitly: RAM map {0: X}, then the merge to N2
+    // mints release(X)+take(N2) — X is the mis-name (durable holds N1).
+    router
+        .metadata_cache
+        .insert(ino, dirty_kvmap_entry(F36_SIZE, &x_off.to_string(), &head_id));
+    let token = dlm.get_fencing_token_ino(ino);
+    let displaced2 = router
+        .merge_block_mappings_coalesced(
+            ino,
+            vec![(0u32, n2_off.to_string())],
+            0,
+            squeezefs::routing::LayoutFlip::KeepLayout,
+            token,
+        )
+        .await
+        .expect("publish 2 lands (the skewed frame is a legal caller state)");
+    assert!(
+        displaced2.is_empty(),
+        "the recomputed verdict stands the caller-frame stream down: {displaced2:?}"
+    );
+    auth.br.reclaim_drain().await;
+
+    assert_eq!(
+        auth.population(n1_idx).await,
+        0,
+        "the recompute's ledger Delete rode the flip — N1 is durably unreferenced"
+    );
+    assert_eq!(
+        auth.population(n2_idx).await,
+        1,
+        "the committed transition took N2"
+    );
+    assert!(
+        auth.free_listed(n1_idx),
+        "kvmap f36b: the block the committed train ACTUALLY displaced (N1) must run the \
+         AUTHORITY's free ladder — pre-5b its diff-delete staged no release and its \
+         device free ran NOWHERE (one leaked block per skewed kvmap ship)"
+    );
+    assert_eq!(
+        METRICS
+            .block_untracked_free_refusals
+            .load(Ordering::Relaxed),
+        untracked_before,
+        "the caller-frame free of an already-freed block never ships — the untracked \
+         tripwire stays flat"
+    );
+    assert_eq!(
+        METRICS.block_double_frees.load(Ordering::Relaxed),
+        double_before,
+        "no double free anywhere in the pair"
+    );
+    assert_eq!(
+        publish::stats().map_recomputed_releases - map_recomputed_before,
+        2,
+        "the engagement gauge accounts both recompute-released device frees \
+         (X on publish 1, N1 on publish 2)"
+    );
+    assert_eq!(
+        publish::stats().free_shipped_blocks - free_shipped_before,
+        0,
+        "no caller-frame free ever travelled as a verb for a recomputed kvmap publish"
+    );
+
+    drop(cwr);
+    auth.stop().await;
+}

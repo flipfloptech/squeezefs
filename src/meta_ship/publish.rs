@@ -165,7 +165,19 @@ use std::sync::Arc;
 /// plus [`PublishReply::MapMigrated`], the train's accounting. A
 /// 10-speaker cannot decode either — the mismatch refuses loud at the
 /// first frame.
-pub const PUBLISH_SCHEMA: u32 = 11;
+///
+/// **12 since the claims-scoped served train landed** (kvmap PR 5b,
+/// design-kvmap-block-map-tree §11 laws a+b): `MigrateBlockMap` gained
+/// `base_gen` (the shipper's known map generation — the belt input a
+/// lagging ship refuses on, retried-class), and
+/// [`PublishReply::MapMigrated`] gained the f36b verdict triple
+/// (`recomputed` — the owner replaced the shipper's accounting frame with
+/// the train's own swap diff and freed the TRUE displaced set itself, so
+/// the caller's frame-derived displaced frees stand down — plus the
+/// `released` count and the committed `gen` the shipper stamps as its
+/// next base). An 11-speaker cannot decode either direction — the
+/// mismatch refuses loud at the first frame (KD-7 same-commit fleets).
+pub const PUBLISH_SCHEMA: u32 = 12;
 
 /// First verb of S9's publish block. S3's ping is 0, S8's metadata verbs
 /// are 16/17, S6's membership owns `0x0100..=0x01FF`, S9's custody
@@ -507,6 +519,13 @@ pub enum PublishCall {
         /// The COMPLETE map, `(block_index, block-key string)`, sorted.
         entries: Vec<(u32, String)>,
         refs: Vec<WireBlockRefOp>,
+        /// PR 5b (design §11's belt): the map generation of the head this
+        /// ship was computed against. A sticky-head train whose base
+        /// generation lags the durable head refuses retried-class — the
+        /// shipper refetches and recomposes (the `admit_versioned_delta`
+        /// stage/rebase/refuse pattern). 0 on a first crossing (no kvmap
+        /// head exists to lag).
+        base_gen: u64,
         /// Era gate input + witness half (see `SetLayoutAndSize`).
         lease_epoch: u64,
         /// The witness's other half.
@@ -794,11 +813,21 @@ pub enum PublishReply {
     Populations(Vec<u64>),
     /// `migrate_block_map` (kvmap PR 2): the served train's accounting —
     /// the shipper's ledger counters read the OWNER's truth, and
-    /// `preexisting` is the A1 resumed verdict's input.
+    /// `preexisting` is the A1 resumed verdict's input. Since schema 12
+    /// (PR 5b) the reply also carries the f36b verdict: `recomputed`
+    /// ⇔ the owner replaced the shipper's accounting frame with the
+    /// claims-scoped train's own swap diff and ran the `released`
+    /// displaced blocks through its OWN free ladder post-commit — the
+    /// caller's frame-derived displaced frees must stand down; and `gen`,
+    /// the committed head generation the shipper stamps as its next base
+    /// (the §11 belt's chain-without-refetch input).
     MapMigrated {
         records: u64,
         record_bytes: u64,
         preexisting: u64,
+        recomputed: bool,
+        released: u64,
+        gen: u64,
     },
 }
 
@@ -891,11 +920,22 @@ static UNSCOPED_PUT_REFUSALS: AtomicU64 = AtomicU64::new(0);
 static MAP_SHIPPED: AtomicU64 = AtomicU64::new(0);
 static MAP_SERVED: AtomicU64 = AtomicU64::new(0);
 static MAP_REFUSED: AtomicU64 = AtomicU64::new(0);
+// kvmap PR 5b (design §11 law a — the f36b twin): displaced blocks a
+// served claims-scoped train's recompute RELEASED, whose free ladder ran
+// on this authority (the engagement gauge).
+static MAP_RECOMPUTED_RELEASES: AtomicU64 = AtomicU64::new(0);
 
 /// The at-budget W2 spill's counter (incremented by
 /// [`crate::extent_ship`]'s spill arm — release path 4's engagement).
 pub(crate) fn note_extent_spill() {
     EXTENT_SPILLS.fetch_add(1, Ordering::Relaxed);
+}
+
+/// PR 5b (design §11's belt): the train's generation-lag refusal is
+/// minted inside the backend (under the held 4a, where the durable gen is
+/// race-free) — this is its `map_refused` row.
+pub(crate) fn note_map_refused() {
+    MAP_REFUSED.fetch_add(1, Ordering::Relaxed);
 }
 
 /// The publish path's shipped-vs-local ledger.
@@ -1006,6 +1046,12 @@ pub struct PublishStats {
     /// compose lands in PR 5b). The client's never-lossy ladder
     /// re-publishes.
     pub map_refused: u64,
+    /// kvmap PR 5b (the f36b twin): displaced blocks a served
+    /// claims-scoped train's recompute released, freed through THIS
+    /// authority's own ladder post-commit — the rewriting-kvmap-fleet
+    /// engagement gauge (0 beside a growing recomputed-train stream
+    /// means displaced frees are leaking again).
+    pub map_recomputed_releases: u64,
 }
 
 /// Read the publish ledger.
@@ -1039,6 +1085,7 @@ pub fn stats() -> PublishStats {
         map_shipped: MAP_SHIPPED.load(Ordering::Relaxed),
         map_served: MAP_SERVED.load(Ordering::Relaxed),
         map_refused: MAP_REFUSED.load(Ordering::Relaxed),
+        map_recomputed_releases: MAP_RECOMPUTED_RELEASES.load(Ordering::Relaxed),
     }
 }
 
@@ -1076,6 +1123,7 @@ pub fn stats_json() -> serde_json::Value {
         "map_shipped": s.map_shipped,
         "map_served": s.map_served,
         "map_refused": s.map_refused,
+        "map_recomputed_releases": s.map_recomputed_releases,
         // §9.3's live retention gauge (→ 0 at quiesce — falsifiable
         // against the four release paths).
         "extent_retained_bytes": crate::extent_ship::retained_bytes(),
@@ -1902,7 +1950,7 @@ pub async fn migrate_block_map(
                 )));
             }
             match be
-                .migrate_block_map_train(ino, layout, size, &refs, &entries, chunk)
+                .migrate_block_map_train(ino, layout, size, &refs, &entries, chunk, None)
                 .await?
             {
                 Some(outcome) => Ok(outcome),
@@ -1915,12 +1963,23 @@ pub async fn migrate_block_map(
         }
         Some(peer) => {
             intent_barrier_inos(&[ino]).await?;
+            // PR 5b (design §11's belt): the shipped head's own kvmap id
+            // carries the generation this ship was computed against — the
+            // verb's base_gen is its explicit face (0 on a first
+            // crossing, whose head carries no minted generation).
+            let base_gen = crate::layout_wire::decode_layout_any(layout)
+                .ok()
+                .and_then(|l| l.block_map_id)
+                .and_then(|id| crate::meta_backend::kv::block_map::parse_kvmap_head(&id).ok())
+                .map(|h| h.gen)
+                .unwrap_or(0);
             let call = PublishCall::MigrateBlockMap {
                 ino,
                 layout: layout.to_vec(),
                 size,
                 entries,
                 refs: wire_refs(&refs),
+                base_gen,
                 lease_epoch: current_lease_epoch(),
                 request_id: crate::cowriter::next_ship_request_id(),
             };
@@ -1929,12 +1988,20 @@ pub async fn migrate_block_map(
                     records,
                     record_bytes,
                     preexisting,
+                    recomputed,
+                    released: _,
+                    gen,
                 } => {
                     MAP_SHIPPED.fetch_add(1, Ordering::Relaxed);
+                    // The owner freed its own recompute-released set —
+                    // nothing travels back for the caller to free.
                     Ok(crate::meta_backend::kv::backend::MapMigrateOutcome {
                         records,
                         record_bytes,
                         preexisting,
+                        gen,
+                        recomputed,
+                        released: Vec::new(),
                     })
                 }
                 other => Err(protocol_error(
@@ -3176,6 +3243,181 @@ impl PublishService {
         }
     }
 
+    /// **The served migration train** (kvmap PR 2 + PR 5b, design §11
+    /// laws a+b): a first crossing/conversion — durable base NOT kvmap —
+    /// runs the whole-map train verbatim (there are no tree records to
+    /// delete-by-absence, and the shipped map is the crossing's
+    /// authority). A sticky-head re-train — durable base kvmap — runs
+    /// CLAIMS-SCOPED: the shipper's take/release claims (its whole refs
+    /// frame, which a shipped save carries un-chunked — finding 36b) are
+    /// the only transitions adopted, so a stale whole-map ship can never
+    /// erase a peer's fresh bindings; the carried base generation is
+    /// checked against the durable head under the train's held 4a (§11's
+    /// belt — a lagging ship refuses retried-class and the shipper
+    /// refetches); and the train's f36b recompute replaces the shipper's
+    /// frame with the tree→composed swap diff, whose released blocks run
+    /// THIS authority's free ladder strictly after commit Ok (the
+    /// custody-scoped-Put pattern verbatim).
+    #[allow(clippy::too_many_arguments)]
+    async fn serve_map_train(
+        &self,
+        _client: &str,
+        ino: u64,
+        layout: Vec<u8>,
+        size: u64,
+        entries: Vec<(u32, String)>,
+        refs: Vec<WireBlockRefOp>,
+        base_gen: u64,
+    ) -> Result<PublishReply> {
+        // The finding-34 posture: a train on an ino OTHER writers hold
+        // live ranges on would clobber the arbiter's compose — refuse
+        // loud, never verbatim.
+        if let Some(owner) = crate::data_grant::custody_owner() {
+            if owner.ino_has_range_grants(ino) {
+                MAP_REFUSED.fetch_add(1, Ordering::Relaxed);
+                return Err(SqueezefsError::InvalidOperation(format!(
+                    "kvmap crossing for ino {ino} refused — the ino has live range \
+                     grants, and a whole-map train would revert peers' entries \
+                     (finding 34's class); drain range custody first"
+                )));
+            }
+        }
+        use crate::meta_backend::Metadata as _;
+        let mut refs: Vec<BlockRefOp> = refs.into_iter().map(BlockRefOp::from).collect();
+        // The durable base decides the mode (the KVMAP_HEAD_PREFIX law —
+        // never a decode-error probe), under the serve's per-ino stripe.
+        let kvmap_base = match self.inner.getxattr(ino, "layout").await {
+            Ok(Some(bytes)) => crate::layout_wire::decode_layout_any(&bytes)
+                .ok()
+                .and_then(|l| l.block_map_id)
+                .is_some_and(|id| {
+                    id.starts_with(crate::meta_backend::kv::block_map::KVMAP_HEAD_PREFIX)
+                }),
+            _ => false,
+        };
+        if kvmap_base {
+            // §11 law b: the claim sets — the shipper's own transitions
+            // (view ≠ claim: everything else in its whole-map ship is a
+            // snapshot of blocks it never wrote).
+            let mut take: std::collections::BTreeSet<u32> = std::collections::BTreeSet::new();
+            let mut release: std::collections::BTreeSet<u32> = std::collections::BTreeSet::new();
+            for op in &refs {
+                if op.reference.is_map_blob() || op.reference.owner_ino != ino {
+                    continue;
+                }
+                if op.take {
+                    take.insert(op.reference.block_index);
+                } else {
+                    release.insert(op.reference.block_index);
+                }
+            }
+            // Finding 28: a claimed entry naming a DEAD incarnation never
+            // adopts — the durable binding stands (the drop shrinks the
+            // take set; the entry stays in the shipped map, so the
+            // removal law's absence test is untouched).
+            let mut adopt: Vec<(u32, String)> = entries
+                .iter()
+                .filter(|(b, _)| take.contains(b))
+                .cloned()
+                .collect();
+            retain_live_bindings(&mut adopt, ino);
+            let take: std::collections::BTreeSet<u32> = adopt.iter().map(|(b, _)| *b).collect();
+            let claims = crate::meta_backend::kv::backend::MapTrainClaims {
+                base_gen: Some(base_gen),
+                take,
+                release,
+            };
+            match self
+                .inner
+                .migrate_block_map_train(
+                    ino,
+                    &layout,
+                    size,
+                    &refs,
+                    &entries,
+                    crate::routing::map_migrate_chunk(),
+                    Some(&claims),
+                )
+                .await?
+            {
+                Some(o) => {
+                    MAP_SERVED.fetch_add(1, Ordering::Relaxed);
+                    // Finding 36b (the kvmap twin): the recompute's
+                    // released blocks run this authority's own ladder,
+                    // strictly AFTER commit Ok; the reply's `recomputed`
+                    // stands the shipper's frame stream down.
+                    let released = o.released.len() as u64;
+                    if !o.released.is_empty() {
+                        MAP_RECOMPUTED_RELEASES.fetch_add(released, Ordering::Relaxed);
+                        free_recomputed_releases(ino, o.released).await;
+                    }
+                    Ok(PublishReply::MapMigrated {
+                        records: o.records,
+                        record_bytes: o.record_bytes,
+                        preexisting: o.preexisting,
+                        recomputed: o.recomputed,
+                        released,
+                        gen: o.gen,
+                    })
+                }
+                None => {
+                    MAP_REFUSED.fetch_add(1, Ordering::Relaxed);
+                    Err(SqueezefsError::InvalidOperation(format!(
+                        "kvmap re-train for ino {ino} refused — the owner's block-map \
+                         tree could not engage (the bit-16 ratchet failed); nothing \
+                         was committed"
+                    )))
+                }
+            }
+        } else {
+            // Finding 36b's owner half: the shipped crossing carries its
+            // WHOLE claim set, so the journal-entry-cap chunking (f38's
+            // law) runs HERE, under the serve's per-ino stripe.
+            const SERVE_REF_TX_CHUNK: usize = 512;
+            while refs.len() > SERVE_REF_TX_CHUNK {
+                let tail = refs.split_off(SERVE_REF_TX_CHUNK);
+                let chunk = std::mem::replace(&mut refs, tail);
+                self.inner.commit_block_refs(ino, &chunk).await?;
+            }
+            match self
+                .inner
+                .migrate_block_map_train(
+                    ino,
+                    &layout,
+                    size,
+                    &refs,
+                    &entries,
+                    crate::routing::map_migrate_chunk(),
+                    None,
+                )
+                .await?
+            {
+                Some(o) => {
+                    MAP_SERVED.fetch_add(1, Ordering::Relaxed);
+                    Ok(PublishReply::MapMigrated {
+                        records: o.records,
+                        record_bytes: o.record_bytes,
+                        preexisting: o.preexisting,
+                        recomputed: o.recomputed,
+                        released: 0,
+                        gen: o.gen,
+                    })
+                }
+                // The owner's ratchet could not engage the tree —
+                // refused loud (nothing committed); the shipper's
+                // never-lossy ladder owns the retry.
+                None => {
+                    MAP_REFUSED.fetch_add(1, Ordering::Relaxed);
+                    Err(SqueezefsError::InvalidOperation(format!(
+                        "kvmap crossing for ino {ino} refused — the owner's block-map \
+                         tree could not engage (the bit-16 ratchet failed); nothing \
+                         was committed"
+                    )))
+                }
+            }
+        }
+    }
+
     /// Rung 17 — **the custody-scoped full Put** (the s11-range leg's
     /// zeros/remove-class conviction): a shipped `SetLayoutAndSize` is
     /// computed from the SHIPPER's base view, which under two live
@@ -3897,64 +4139,11 @@ impl PublishService {
                 size,
                 entries,
                 refs,
+                base_gen,
                 ..
             } => {
-                // The finding-34 posture: a whole-map train on an ino
-                // OTHER writers hold live ranges on would clobber the
-                // arbiter's compose (the S11 ∘ kvmap composition is a
-                // later PR's) — refuse loud, never verbatim.
-                if let Some(owner) = crate::data_grant::custody_owner() {
-                    if owner.ino_has_range_grants(ino) {
-                        MAP_REFUSED.fetch_add(1, Ordering::Relaxed);
-                        return Err(SqueezefsError::InvalidOperation(format!(
-                            "kvmap crossing for ino {ino} refused — the ino has live range \
-                             grants, and a whole-map train would revert peers' entries \
-                             (finding 34's class); drain range custody first"
-                        )));
-                    }
-                }
-                let mut refs: Vec<BlockRefOp> = refs.into_iter().map(BlockRefOp::from).collect();
-                // Finding 36b's owner half: the shipped crossing carries
-                // its WHOLE claim set, so the journal-entry-cap chunking
-                // (f38's law) runs HERE, under the serve's per-ino stripe.
-                const SERVE_REF_TX_CHUNK: usize = 512;
-                while refs.len() > SERVE_REF_TX_CHUNK {
-                    let tail = refs.split_off(SERVE_REF_TX_CHUNK);
-                    let chunk = std::mem::replace(&mut refs, tail);
-                    self.inner.commit_block_refs(ino, &chunk).await?;
-                }
-                match self
-                    .inner
-                    .migrate_block_map_train(
-                        ino,
-                        &layout,
-                        size,
-                        &refs,
-                        &entries,
-                        crate::routing::map_migrate_chunk(),
-                    )
-                    .await?
-                {
-                    Some(o) => {
-                        MAP_SERVED.fetch_add(1, Ordering::Relaxed);
-                        Ok(PublishReply::MapMigrated {
-                            records: o.records,
-                            record_bytes: o.record_bytes,
-                            preexisting: o.preexisting,
-                        })
-                    }
-                    // The owner's ratchet could not engage the tree —
-                    // refused loud (nothing committed); the shipper's
-                    // never-lossy ladder owns the retry.
-                    None => {
-                        MAP_REFUSED.fetch_add(1, Ordering::Relaxed);
-                        Err(SqueezefsError::InvalidOperation(format!(
-                            "kvmap crossing for ino {ino} refused — the owner's block-map \
-                             tree could not engage (the bit-16 ratchet failed); nothing \
-                             was committed"
-                        )))
-                    }
-                }
+                self.serve_map_train(client, ino, layout, size, entries, refs, base_gen)
+                    .await
             }
             PublishCall::ParkWriteTimes {
                 ino, mtime, ctime, ..

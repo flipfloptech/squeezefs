@@ -887,10 +887,20 @@ pub struct RoutedMetaBackend {
     /// STRING verbatim — the PR 2 form, which every decoder resolves
     /// forever.
     map_entry_encoder: std::sync::OnceLock<MapEntryEncoder>,
+    /// PR 5b (kvmap): the encoder's MIRROR — tree-7 record → router-true
+    /// block-key string, installed at the same site. The claims-scoped
+    /// train's f36b recompute resolves displaced records through it;
+    /// uninstalled falls back to STRING-utf8 (the encoder-less arm only
+    /// ever stored STRING records).
+    map_entry_decoder: std::sync::OnceLock<MapEntryDecoder>,
 }
 
 /// See [`RoutedMetaBackend::install_map_entry_encoder`].
 type MapEntryEncoder = std::sync::Arc<dyn Fn(&str) -> kv::block_map::MapEntry + Send + Sync>;
+
+/// See [`RoutedMetaBackend::install_map_entry_decoder`].
+type MapEntryDecoder =
+    std::sync::Arc<dyn Fn(&kv::block_map::MapEntry) -> Option<String> + Send + Sync>;
 
 /// The latch-free routing tables `route_ino`/`make_global_ino` read.
 struct RouteTable {
@@ -979,6 +989,7 @@ impl RoutedMetaBackend {
                 .map(|_| std::sync::atomic::AtomicUsize::new(0))
                 .collect(),
             map_entry_encoder: std::sync::OnceLock::new(),
+            map_entry_decoder: std::sync::OnceLock::new(),
         }
     }
 
@@ -1038,6 +1049,7 @@ impl RoutedMetaBackend {
                 .map(|_| std::sync::atomic::AtomicUsize::new(0))
                 .collect(),
             map_entry_encoder: std::sync::OnceLock::new(),
+            map_entry_decoder: std::sync::OnceLock::new(),
         })
     }
 
@@ -1059,6 +1071,34 @@ impl RoutedMetaBackend {
         match self.map_entry_encoder.get() {
             Some(enc) => enc(key),
             None => kv::block_map::MapEntry::String(key.as_bytes().to_vec()),
+        }
+    }
+
+    /// PR 5b (kvmap): install the record → block-key DECODER — the
+    /// encoder's mirror (`BackendRouter::map_entry_block_key`), installed
+    /// at the same `DataRouter::set_meta_backend` site. The claims-scoped
+    /// train's f36b recompute resolves DISPLACED tree records through it.
+    pub fn install_map_entry_decoder(
+        &self,
+        decoder: std::sync::Arc<dyn Fn(&kv::block_map::MapEntry) -> Option<String> + Send + Sync>,
+    ) {
+        let _ = self.map_entry_decoder.set(decoder);
+    }
+
+    /// The router-true block-key string for one tree-7 record: through
+    /// the installed decoder; STRING utf8 verbatim when none is installed
+    /// (the encoder-less arm only ever stored STRING records, so the
+    /// fallback is exact); a POINT with no decoder is unresolvable —
+    /// `None`, and the caller must be LOUD.
+    pub fn decode_map_entry(&self, entry: &kv::block_map::MapEntry) -> Option<String> {
+        match self.map_entry_decoder.get() {
+            Some(dec) => dec(entry),
+            None => match entry {
+                kv::block_map::MapEntry::String(bytes) => {
+                    std::str::from_utf8(bytes).ok().map(str::to_string)
+                }
+                kv::block_map::MapEntry::Point { .. } => None,
+            },
         }
     }
 
@@ -3353,7 +3393,9 @@ impl RoutedMetaBackend {
     /// PR 2 (kvmap): the crossing/migration train, routed to `ino`'s home
     /// volume (see [`kv::backend::KvMetaBackend::migrate_block_map_train`]).
     /// The publish class of [`Self::set_layout_and_size`] — same
-    /// delegation + cutover gates.
+    /// delegation + cutover gates. `claims` selects PR 5b's claims-scoped
+    /// mode (design §11 law b — every SHIPPED sticky-head train);
+    /// `None` is the local whole-map diff (Rev 1.3 #2).
     pub async fn migrate_block_map_train(
         &self,
         ino: Ino,
@@ -3362,6 +3404,7 @@ impl RoutedMetaBackend {
         block_refs: &[crate::meta_backend::kv::block_refs::BlockRefOp],
         entries: &[(u32, String)],
         chunk: usize,
+        claims: Option<&crate::meta_backend::kv::backend::MapTrainClaims>,
     ) -> Result<Option<crate::meta_backend::kv::backend::MapMigrateOutcome>> {
         let _deleg_gate = crate::meta_ship::deleg_mutation_gate(self, &[ino]).await;
         let _gate = self.slot_gate_enter(&[ino]).await;
@@ -3375,8 +3418,14 @@ impl RoutedMetaBackend {
             .iter()
             .map(|(b, k)| (*b, self.encode_map_entry(k)))
             .collect();
+        // PR 5b: block refs key on the GLOBAL ino (the block_refs.rs key
+        // law), so the train's recompute is handed both identities plus
+        // the record decoder.
+        let entry_key = |e: &kv::block_map::MapEntry| self.decode_map_entry(e);
         let out = self.volumes[v_idx]
-            .migrate_block_map_train(local_ino, layout, size, block_refs, &records, chunk)
+            .migrate_block_map_train(
+                local_ino, layout, size, block_refs, &records, chunk, claims, ino, &entry_key,
+            )
             .await;
         if out.is_err() {
             self.mirror_volume_failure(v_idx);

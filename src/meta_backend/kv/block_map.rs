@@ -270,21 +270,32 @@ impl BlockMapOp {
     }
 }
 
-/// The parsed head sentinel: `kvmap:1` (`sweep_cursor: None`) or
-/// `kvmap:1;sweep:K` (design §3 truncate/unlink, amendment A2 — the
-/// durable per-ino sweep cursor the background sweep resumes from).
+/// The parsed head sentinel: `kvmap:1[;sweep:K][;gen:N]` — the A2 sweep
+/// cursor (design §3 truncate/unlink) plus, since PR 5b, the **map
+/// generation** (design §11's belt): a monotone per-ino counter of
+/// committed migration trains on the multi-writer plane, so a SHIPPED
+/// train whose carried base generation lags the durable head refuses
+/// (retried-class) instead of composing claims onto a base that moved.
+/// `gen == 0` encodes ABSENT — solo volumes' heads stay byte-identical
+/// to the pre-belt form (the dark-by-default posture).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct KvmapHead {
     pub sweep_cursor: Option<u32>,
+    pub gen: u64,
 }
 
 impl KvmapHead {
-    /// Encode the canonical head string.
+    /// Encode the canonical head string (`gen` omitted at 0 — the
+    /// pre-belt byte-identity law).
     pub fn encode(&self) -> String {
-        match self.sweep_cursor {
-            None => format!("{KVMAP_HEAD_PREFIX}{KVMAP_HEAD_MAJOR}"),
-            Some(k) => format!("{KVMAP_HEAD_PREFIX}{KVMAP_HEAD_MAJOR};sweep:{k}"),
+        let mut out = format!("{KVMAP_HEAD_PREFIX}{KVMAP_HEAD_MAJOR}");
+        if let Some(k) = self.sweep_cursor {
+            out.push_str(&format!(";sweep:{k}"));
         }
+        if self.gen > 0 {
+            out.push_str(&format!(";gen:{}", self.gen));
+        }
+        out
     }
 }
 
@@ -303,40 +314,72 @@ fn parse_canonical_u32(s: &str, what: &str) -> Result<u32, KvError> {
     Ok(v)
 }
 
+/// [`parse_canonical_u32`] at generation width (the belt counter is
+/// unbounded-monotone, never an index).
+fn parse_canonical_u64(s: &str, what: &str) -> Result<u64, KvError> {
+    let v: u64 = s
+        .parse()
+        .map_err(|_| KvError::Corrupt(format!("kvmap head {what} {s:?} is not a u64")))?;
+    if v.to_string() != s {
+        return Err(KvError::Corrupt(format!(
+            "kvmap head {what} {s:?} is not canonical decimal"
+        )));
+    }
+    Ok(v)
+}
+
 /// Parse a head sentinel string. Refuses loud: non-`kvmap:` strings, an
 /// unknown major (always-forward — a newer grammar means a newer
 /// binary's volume, and guessing a sweep state could resurrect shadowed
 /// mappings), and anything outside the exact
-/// `kvmap:1[;sweep:K]` grammar.
+/// `kvmap:1[;sweep:K][;gen:N]` grammar (segments in encoder order only;
+/// `gen:0` refused — the encoder omits an absent generation, and a
+/// parser wider than its encoder is a format hole).
 pub fn parse_kvmap_head(s: &str) -> Result<KvmapHead, KvError> {
     let Some(rest) = s.strip_prefix(KVMAP_HEAD_PREFIX) else {
         return Err(KvError::Corrupt(format!(
             "not a kvmap head: {s:?} (expected the {KVMAP_HEAD_PREFIX:?} prefix)"
         )));
     };
-    let (major_str, tail) = match rest.split_once(';') {
-        Some((m, t)) => (m, Some(t)),
-        None => (rest, None),
-    };
-    let major = parse_canonical_u32(major_str, "major version")?;
+    let mut segs = rest.split(';');
+    let major = parse_canonical_u32(segs.next().unwrap_or(""), "major version")?;
     if major != KVMAP_HEAD_MAJOR {
         return Err(KvError::Corrupt(format!(
             "kvmap head major version {major} is not {KVMAP_HEAD_MAJOR} (a newer \
              binary's head — refusing to guess its sweep state)"
         )));
     }
-    let sweep_cursor = match tail {
-        None => None,
-        Some(seg) => {
-            let Some(k) = seg.strip_prefix("sweep:") else {
-                return Err(KvError::Corrupt(format!(
-                    "kvmap head carries unknown segment {seg:?}"
-                )));
-            };
-            Some(parse_canonical_u32(k, "sweep cursor")?)
+    let mut sweep_cursor = None;
+    let mut gen = 0u64;
+    let mut next = segs.next();
+    if let Some(seg) = next {
+        if let Some(k) = seg.strip_prefix("sweep:") {
+            sweep_cursor = Some(parse_canonical_u32(k, "sweep cursor")?);
+            next = segs.next();
         }
-    };
-    Ok(KvmapHead { sweep_cursor })
+    }
+    if let Some(seg) = next {
+        let Some(g) = seg.strip_prefix("gen:") else {
+            return Err(KvError::Corrupt(format!(
+                "kvmap head carries unknown segment {seg:?}"
+            )));
+        };
+        gen = parse_canonical_u64(g, "map generation")?;
+        if gen == 0 {
+            return Err(KvError::Corrupt(
+                "kvmap head carries gen:0, which the encoder never produces (an \
+                 absent generation is omitted)"
+                    .to_string(),
+            ));
+        }
+        next = segs.next();
+    }
+    if let Some(seg) = next {
+        return Err(KvError::Corrupt(format!(
+            "kvmap head carries unknown segment {seg:?}"
+        )));
+    }
+    Ok(KvmapHead { sweep_cursor, gen })
 }
 
 #[cfg(test)]

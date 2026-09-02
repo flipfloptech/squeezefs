@@ -200,17 +200,24 @@ fn value_codec_round_trips_point_and_string() {
     );
 }
 
-/// The head sentinel round-trips both forms — `kvmap:1` and
-/// `kvmap:1;sweep:K` — because A2's truncate design needs PR 1's encoding
-/// to carry the sweep cursor even though the sweep itself lands later.
+/// The head sentinel round-trips all four forms — `kvmap:1`,
+/// `kvmap:1;sweep:K`, `kvmap:1;gen:N` and `kvmap:1;sweep:K;gen:N` — the
+/// A2 sweep cursor plus PR 5b's map-generation belt (design §11 law b).
+/// `gen == 0` encodes ABSENT (the pre-belt byte-identity law), and the
+/// parser refuses `gen:0` and out-of-order segments (a parser wider than
+/// its encoder is a format hole).
 #[test]
 fn head_sentinel_round_trips_and_carries_the_sweep_cursor() {
-    let plain = KvmapHead { sweep_cursor: None };
+    let plain = KvmapHead {
+        sweep_cursor: None,
+        gen: 0,
+    };
     assert_eq!(plain.encode(), "kvmap:1");
     assert_eq!(parse_kvmap_head("kvmap:1").expect("plain head"), plain);
 
     let swept = KvmapHead {
         sweep_cursor: Some(4096),
+        gen: 0,
     };
     assert_eq!(swept.encode(), "kvmap:1;sweep:4096");
     assert_eq!(
@@ -221,10 +228,39 @@ fn head_sentinel_round_trips_and_carries_the_sweep_cursor() {
     // The cursor's full u32 domain.
     let top = KvmapHead {
         sweep_cursor: Some(u32::MAX),
+        gen: 0,
     };
     assert_eq!(
         parse_kvmap_head(&top.encode()).expect("u32::MAX cursor"),
         top
+    );
+
+    // PR 5b (design §11 law b): the generation belt's forms.
+    let gen = KvmapHead {
+        sweep_cursor: None,
+        gen: 7,
+    };
+    assert_eq!(gen.encode(), "kvmap:1;gen:7");
+    assert_eq!(parse_kvmap_head("kvmap:1;gen:7").expect("gen head"), gen);
+    let both = KvmapHead {
+        sweep_cursor: Some(4),
+        gen: u64::MAX,
+    };
+    assert_eq!(both.encode(), format!("kvmap:1;sweep:4;gen:{}", u64::MAX));
+    assert_eq!(
+        parse_kvmap_head(&both.encode()).expect("both segments"),
+        both
+    );
+    // gen:0 is never encoded, so parsing it is a refusal, not a guess…
+    assert!(parse_kvmap_head("kvmap:1;gen:0").is_err(), "gen:0");
+    // …and segments only parse in encoder order (sweep before gen).
+    assert!(
+        parse_kvmap_head("kvmap:1;gen:7;sweep:4").is_err(),
+        "out-of-order segments"
+    );
+    assert!(
+        parse_kvmap_head("kvmap:1;gen:007").is_err(),
+        "non-canonical decimal"
     );
 }
 

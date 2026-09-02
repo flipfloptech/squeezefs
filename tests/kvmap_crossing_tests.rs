@@ -1073,6 +1073,7 @@ async fn a_shipped_crossing_is_witnessed_owner_ratcheted_and_era_gated() {
         size: 3 * 4194304,
         entries: entries.clone(),
         refs: Vec::new(),
+        base_gen: 0,
         lease_epoch: epoch,
         request_id: 0xD1,
     };
@@ -1164,6 +1165,7 @@ async fn a_shipped_crossing_is_witnessed_owner_ratcheted_and_era_gated() {
                 size: 9 * 4194304,
                 entries: vec![(8, "777777777".to_string())],
                 refs: Vec::new(),
+                base_gen: 1,
                 lease_epoch: epoch,
                 request_id: 0xD2,
             },

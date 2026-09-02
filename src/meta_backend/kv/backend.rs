@@ -3040,9 +3040,30 @@ impl KvMetaBackend {
     /// wrote (legal either way after a crash; the retried save re-diffs
     /// and converges).
     ///
+    /// **Modes (PR 5b, design §11 law b)**: `claims: None` is the
+    /// whole-map diff — delete-by-absence, legal ONLY where RAM is
+    /// whole-map authority (the local save, Rev 1.3 #2, and the
+    /// serve-window episode compose). `claims: Some` is the
+    /// CLAIMS-SCOPED train every SHIPPED sticky-head save rides: adopt a
+    /// Put only under a take claim, delete only under a
+    /// release-without-take claim whose index the shipped map does not
+    /// name (the f35 removal law) — a stale whole-map ship can never
+    /// erase a peer's fresh bindings. With the rung-19 resolver armed the
+    /// claims train also RECOMPUTES its staged accounting as the
+    /// tree→composed swap diff (the f36b twin: the shipper's stale frame
+    /// may mis-name the displaced binding) and returns the released set
+    /// for the caller's post-commit free ladder.
+    ///
+    /// Every committed train on the multi-writer plane bumps the head's
+    /// map GENERATION (§11's belt; solo volumes never mint one — their
+    /// heads stay byte-identical), and a claims train carrying a
+    /// `base_gen` that does not match the durable head refuses
+    /// retried-class before anything stages.
+    ///
     /// Errors are never-lossy for the caller: nothing here consumes the
     /// RAM map or the `block_refs` accounting — the routing save's
     /// refill discipline re-owns both.
+    #[allow(clippy::too_many_arguments)]
     pub async fn migrate_block_map_train(
         &self,
         ino: Ino,
@@ -3051,6 +3072,9 @@ impl KvMetaBackend {
         block_refs: &[super::block_refs::BlockRefOp],
         entries: &[(u32, super::block_map::MapEntry)],
         chunk: usize,
+        claims: Option<&MapTrainClaims>,
+        refs_owner: Ino,
+        entry_key: &(dyn Fn(&super::block_map::MapEntry) -> Option<String> + Send + Sync),
     ) -> Result<Option<MapMigrateOutcome>> {
         self.write_gate()?;
         if !self.block_map_tree_ready().await {
@@ -3059,6 +3083,104 @@ impl KvMetaBackend {
         let chunk = chunk.max(1);
         let _crossing = CrossingGuard::register(&self.crossing_inflight, ino);
         let guards: Arc<[DlmGuard]> = Arc::from(vec![self.dlm.lock_inode_exclusive(ino).await]);
+
+        // PR 5b: the durable head, read under the held 4a — the gen law's
+        // input and the claims train's base identity. `None` = no kvmap
+        // head (a crossing/conversion — the establishing train).
+        let mut durable_size = 0u64;
+        let durable_gen: Option<u64> = match self.getxattr(ino, "layout").await? {
+            Some(bytes) => crate::layout_wire::decode_layout_any(&bytes)
+                .ok()
+                .and_then(|l| {
+                    durable_size = l.size;
+                    l.block_map_id
+                })
+                .and_then(|id| super::block_map::parse_kvmap_head(&id).ok())
+                .map(|h| h.gen),
+            None => None,
+        };
+        // The f35 size law on the claims arm: a stale shipper's size never
+        // regresses a peer's growth (truncation is the setattr plane's;
+        // the whole-map arms keep caller authority verbatim).
+        let size = if claims.is_some() {
+            size.max(durable_size)
+        } else {
+            size
+        };
+        if let Some(c) = claims {
+            let Some(g) = durable_gen else {
+                return Err(crate::error::SqueezefsError::InvalidOperation(format!(
+                    "claims-scoped map train for ino {ino} on a non-kvmap durable head — \
+                     the claims law composes onto tree records (design §11 law b); a \
+                     crossing rides the whole-map train"
+                )));
+            };
+            if let Some(base) = c.base_gen {
+                if base != g {
+                    crate::meta_ship::publish::note_map_refused();
+                    return Err(crate::error::SqueezefsError::InvalidOperation(format!(
+                        "layout delta base unusable: kvmap map generation — ino {ino}'s \
+                         shipped train carries base gen {base} but the durable head is at \
+                         gen {g} (design §11's belt): refetch and recompose (map_refused)"
+                    )));
+                }
+            }
+        }
+        // The bump law: a committed train on the MULTI-WRITER plane —
+        // a claims train (shipped/range-custody by definition), any train
+        // on a custody-armed authority, or a head whose gen was ever
+        // minted (monotone survives a disarm/remount) — bumps; a solo
+        // volume's heads stay byte-identical (dark by default).
+        let committed_gen = match durable_gen {
+            None => 0,
+            Some(g) => {
+                if claims.is_some() || g > 0 || crate::data_grant::custody_owner().is_some() {
+                    g + 1
+                } else {
+                    0
+                }
+            }
+        };
+        // Re-stamp the flip head's generation. Gen 0 commits the caller's
+        // bytes verbatim (the pre-belt byte-identity pin).
+        let layout_restamped: Option<Vec<u8>> = if committed_gen > 0 {
+            let mut head: crate::layout_wire::LayoutMetadata = bincode::deserialize(layout)
+                .map_err(|e| {
+                    crate::error::SqueezefsError::InvalidOperation(format!(
+                        "map train for ino {ino}: undecodable flip head ({e}) — refusing \
+                         to commit a generation-bearing train whose head cannot carry it"
+                    ))
+                })?;
+            let parsed = head
+                .block_map_id
+                .as_deref()
+                .and_then(|id| super::block_map::parse_kvmap_head(id).ok())
+                .ok_or_else(|| {
+                    crate::error::SqueezefsError::InvalidOperation(format!(
+                        "map train for ino {ino}: the flip head is not a kvmap head — \
+                         nothing staged"
+                    ))
+                })?;
+            if parsed.gen == committed_gen {
+                None
+            } else {
+                head.block_map_id = Some(
+                    super::block_map::KvmapHead {
+                        sweep_cursor: parsed.sweep_cursor,
+                        gen: committed_gen,
+                    }
+                    .encode(),
+                );
+                Some(bincode::serialize(&head).map_err(|e| {
+                    crate::error::SqueezefsError::InvalidOperation(format!(
+                        "map train for ino {ino}: flip-head re-encode failed: {e}"
+                    ))
+                })?)
+            }
+        } else {
+            None
+        };
+        let layout: &[u8] = layout_restamped.as_deref().unwrap_or(layout);
 
         // The diff scan (step 3). Desired bindings arrive in RECORD form
         // (PR 3, Rev 1.3 #3: the routed layer encodes POINT for
@@ -3070,48 +3192,192 @@ impl KvMetaBackend {
             entries.iter().map(|(b, e)| (*b, e)).collect();
         let mut ops: Vec<super::block_map::BlockMapOp> = Vec::new();
         let mut preexisting = 0u64;
-        let mut matched: std::collections::BTreeSet<u32> = std::collections::BTreeSet::new();
-        let mut cursor = 0u32;
-        loop {
-            let page = self
-                .block_map_range(ino, cursor, chunk)
-                .await
-                .map_err(|e| self.eio(&format!("block-map diff scan for ino {ino}: {e}")))?;
-            let Some((last, _)) = page.last() else {
-                break;
-            };
-            let next = last.checked_add(1);
-            for (idx, existing) in page {
-                preexisting += 1;
-                match desired.get(&idx) {
-                    Some(want) if existing == **want => {
-                        matched.insert(idx);
+        let mut put_bytes = 0u64;
+        // Claims mode: the displaced OLD records per staged transition —
+        // the f36b recompute's input.
+        let mut displaced: Vec<(u32, super::block_map::MapEntry)> = Vec::new();
+        if let Some(c) = claims {
+            // The claims-scoped diff needs the current records at claimed
+            // indices; the paged scan also feeds `preexisting` (the A1
+            // resumed verdict — same cost class as the whole-map diff).
+            let mut current: std::collections::BTreeMap<u32, super::block_map::MapEntry> =
+                std::collections::BTreeMap::new();
+            let mut cursor = 0u32;
+            loop {
+                let page = self
+                    .block_map_range(ino, cursor, chunk)
+                    .await
+                    .map_err(|e| self.eio(&format!("block-map diff scan for ino {ino}: {e}")))?;
+                let Some((last, _)) = page.last() else {
+                    break;
+                };
+                let next = last.checked_add(1);
+                for (idx, existing) in page {
+                    preexisting += 1;
+                    current.insert(idx, existing);
+                }
+                let Some(next) = next else { break };
+                cursor = next;
+            }
+            for &idx in &c.take {
+                // A take with no shipped entry adopts nothing (a
+                // contradictory frame; the durable record stands).
+                let Some(want) = desired.get(&idx) else {
+                    continue;
+                };
+                match current.get(&idx) {
+                    Some(existing) if existing == *want => {}
+                    old => {
+                        if let Some(old) = old {
+                            displaced.push((idx, old.clone()));
+                        }
+                        put_bytes += (super::block_map::BLOCK_MAP_KEY_LEN + want.encoded_len())
+                            as u64;
+                        ops.push(super::block_map::BlockMapOp::Put {
+                            owner_ino: ino,
+                            block_index: idx,
+                            entry: (*want).clone(),
+                        });
                     }
-                    // Changed binding: the desired-walk below stages the
-                    // superseding Put (same key — no Delete).
-                    Some(_) => {}
-                    None => ops.push(super::block_map::BlockMapOp::Delete {
-                        owner_ino: ino,
-                        block_index: idx,
-                    }),
                 }
             }
-            let Some(next) = next else { break };
-            cursor = next;
-        }
-        let mut put_bytes = 0u64;
-        for (idx, entry) in entries {
-            if matched.contains(idx) {
-                continue;
+            for &idx in &c.release {
+                // The f35 removal law: release-without-take, absent from
+                // the shipped map — absence alone is the shipper's stale
+                // view, never a removal intent.
+                if c.take.contains(&idx) || desired.contains_key(&idx) {
+                    continue;
+                }
+                if let Some(old) = current.get(&idx) {
+                    displaced.push((idx, old.clone()));
+                    ops.push(super::block_map::BlockMapOp::Delete {
+                        owner_ino: ino,
+                        block_index: idx,
+                    });
+                }
             }
-            put_bytes += (super::block_map::BLOCK_MAP_KEY_LEN + entry.encoded_len()) as u64;
-            ops.push(super::block_map::BlockMapOp::Put {
-                owner_ino: ino,
-                block_index: *idx,
-                entry: entry.clone(),
-            });
+        } else {
+            let mut matched: std::collections::BTreeSet<u32> = std::collections::BTreeSet::new();
+            let mut cursor = 0u32;
+            loop {
+                let page = self
+                    .block_map_range(ino, cursor, chunk)
+                    .await
+                    .map_err(|e| self.eio(&format!("block-map diff scan for ino {ino}: {e}")))?;
+                let Some((last, _)) = page.last() else {
+                    break;
+                };
+                let next = last.checked_add(1);
+                for (idx, existing) in page {
+                    preexisting += 1;
+                    match desired.get(&idx) {
+                        Some(want) if existing == **want => {
+                            matched.insert(idx);
+                        }
+                        // Changed binding: the desired-walk below stages the
+                        // superseding Put (same key — no Delete).
+                        Some(_) => {}
+                        None => ops.push(super::block_map::BlockMapOp::Delete {
+                            owner_ino: ino,
+                            block_index: idx,
+                        }),
+                    }
+                }
+                let Some(next) = next else { break };
+                cursor = next;
+            }
+            for (idx, entry) in entries {
+                if matched.contains(idx) {
+                    continue;
+                }
+                put_bytes += (super::block_map::BLOCK_MAP_KEY_LEN + entry.encoded_len()) as u64;
+                ops.push(super::block_map::BlockMapOp::Put {
+                    owner_ino: ino,
+                    block_index: *idx,
+                    entry: entry.clone(),
+                });
+            }
         }
         let records = ops.len() as u64;
+
+        // The f36b recompute (claims mode, resolver armed): the staged
+        // accounting is the tree→composed swap diff — the shipper's frame
+        // legitimately lags and may MIS-NAME the displaced binding, so
+        // its non-map-blob ops are REPLACED (the rung-19 law on the
+        // scoped-Put arm, verbatim); its map-blob ops travel beside. The
+        // released set travels up for the post-commit free ladder.
+        // Unarmed (no resolver): the caller's frame stands byte-identical
+        // (the f36 preservation arm) and the caller keeps its own
+        // displaced-free stream.
+        let mut recomputed = false;
+        let mut released: Vec<super::block_refs::BlockRef> = Vec::new();
+        let staged_refs: Vec<super::block_refs::BlockRefOp> = if claims.is_some() {
+            match super::block_refs::block_ref_resolver() {
+                Some(resolver) => {
+                    recomputed = true;
+                    let mut out: Vec<super::block_refs::BlockRefOp> = Vec::new();
+                    let mut resolve = |entry: &super::block_map::MapEntry, idx: u32, take: bool| {
+                        let Some(key) = entry_key(entry) else {
+                            super::META_KV_BLOCK_REFS_UNRESOLVED.fetch_add(1, Ordering::Relaxed);
+                            return;
+                        };
+                        match resolver(&key, refs_owner, idx) {
+                            Some(r) => {
+                                if take {
+                                    out.push(super::block_refs::BlockRefOp::taken(r));
+                                } else {
+                                    out.push(super::block_refs::BlockRefOp::released(r));
+                                    released.push(r);
+                                }
+                            }
+                            None => {
+                                super::META_KV_BLOCK_REFS_UNRESOLVED
+                                    .fetch_add(1, Ordering::Relaxed);
+                            }
+                        }
+                    };
+                    for (idx, old) in &displaced {
+                        resolve(old, *idx, false);
+                    }
+                    for op in &ops {
+                        if let super::block_map::BlockMapOp::Put {
+                            block_index, entry, ..
+                        } = op
+                        {
+                            resolve(entry, *block_index, true);
+                        }
+                    }
+                    out.extend(
+                        block_refs
+                            .iter()
+                            .filter(|o| o.reference.is_map_blob())
+                            .copied(),
+                    );
+                    out
+                }
+                None => block_refs.to_vec(),
+            }
+        } else {
+            block_refs.to_vec()
+        };
+        // Claims mode carries the WHOLE frame (finding 36b's owner half),
+        // so the journal-entry-cap chunking (f38's law) runs HERE, in
+        // refs-only transactions co-owning the held 4a; the tail rides
+        // the flip. Whole-map callers pre-chunk (their loops are the f38
+        // sites). A crash between chunk and flip leaves only report-only
+        // fsck C8 residue (space-safe, data-safe).
+        const TRAIN_REF_TX_CHUNK: usize = 512;
+        let mut refs_tail = staged_refs;
+        if claims.is_some() && self.block_refs.is_some() {
+            while refs_tail.len() > TRAIN_REF_TX_CHUNK {
+                let rest = refs_tail.split_off(TRAIN_REF_TX_CHUNK);
+                let chunk_ops = std::mem::replace(&mut refs_tail, rest);
+                let mut tx = KvTx::new();
+                tx.stage_block_refs(&chunk_ops);
+                tx.hold_guards(Arc::clone(&guards));
+                self.commit_tx(tx).await?;
+            }
+        }
 
         // Steps 4–5: chunked commits, tail rides the flip.
         let mut tail = ops;
@@ -3123,12 +3389,15 @@ impl KvMetaBackend {
             tx.hold_guards(Arc::clone(&guards));
             self.commit_tx(tx).await?;
         }
-        self.set_layout_and_size_with_map_holding(ino, layout, size, block_refs, &tail, guards)
+        self.set_layout_and_size_with_map_holding(ino, layout, size, &refs_tail, &tail, guards)
             .await?;
         Ok(Some(MapMigrateOutcome {
             records,
             record_bytes: put_bytes,
             preexisting,
+            gen: committed_gen,
+            recomputed,
+            released,
         }))
     }
 
@@ -5760,8 +6029,12 @@ pub type MergeOutcome = (bool, u64, RecomputedReleases);
 /// ([`KvMetaBackend::migrate_block_map_train`]): what the ledger counters
 /// (`map_migrate_records` / `publish_map_record_bytes`) and the A1
 /// resumed verdict (`preexisting > 0` on a FIRST crossing = a crashed
-/// prior train's residue was reconciled) are fed from.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// prior train's residue was reconciled) are fed from. Since PR 5b it
+/// also carries the committed head generation (design §11's belt — the
+/// caller stamps it as its next base), the f36b recompute verdict, and a
+/// LOCAL claims-scoped train's recompute-released blocks (served arms
+/// travel it back empty — the owner frees its own).
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MapMigrateOutcome {
     /// Map operations staged (Puts + Deletes, flip-tx tail included).
     pub records: u64,
@@ -5769,6 +6042,35 @@ pub struct MapMigrateOutcome {
     pub record_bytes: u64,
     /// Tree-7 records that existed BEFORE the train ran.
     pub preexisting: u64,
+    /// The committed head generation (0 = un-minted — solo posture).
+    pub gen: u64,
+    /// The staged accounting was RECOMPUTED (a claims-scoped train with
+    /// the rung-19 resolver armed) — the caller's frame-derived displaced
+    /// frees stand down for this publish.
+    pub recomputed: bool,
+    /// A LOCAL claims-scoped train's recompute-released data blocks — the
+    /// save's post-guard venue runs them through the shipped-free ladder
+    /// (RES-1: never freed under the caller's 3.5 stripe).
+    pub released: Vec<super::block_refs::BlockRef>,
+}
+
+/// PR 5b (design §11 law b) — the CLAIMS-SCOPED mode input for
+/// [`KvMetaBackend::migrate_block_map_train`]: adopt under a take claim,
+/// delete under a release-without-take claim, never delete-by-absence
+/// (the whole-map diff stays local-authority-only, Rev 1.3 #2). The
+/// caller owns custody scoping (span ∩ claims ∖ demoted) and the f28
+/// live-binding filter on the adopt candidates.
+#[derive(Debug, Clone, Default)]
+pub struct MapTrainClaims {
+    /// The shipper's carried base generation, checked against the durable
+    /// head under the held 4a (§11's belt) — `None` skips the check (the
+    /// authority-local claims arm composes against the head it serializes
+    /// on).
+    pub base_gen: Option<u64>,
+    /// take-claim indices.
+    pub take: std::collections::BTreeSet<u32>,
+    /// release-claim indices.
+    pub release: std::collections::BTreeSet<u32>,
 }
 
 /// RAII registration in the in-flight crossing registry (design A3) —

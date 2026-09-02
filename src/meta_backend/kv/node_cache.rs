@@ -1288,6 +1288,16 @@ impl CachedNode {
         self.ref_bit.store(true, Ordering::Relaxed);
     }
 
+    /// A7 probation (design-kvmap-block-map-tree §8 #3): enter the clock
+    /// with NO second chance — the node earns its ref bit only on a
+    /// second touch, so a giant streaming map's demand-paged leaves
+    /// evict first and cannot displace a re-touched foreign working set
+    /// on their first pass. Waiters that race the loader land on the map
+    /// hit path and `touch` — a genuinely-shared leaf promotes itself.
+    fn begin_probation(&self) {
+        self.ref_bit.store(false, Ordering::Relaxed);
+    }
+
     /// Apply records to the open delta **under the held write lock** and
     /// swap a new snapshot (the §4.4 RAM apply). Records must carry seqs
     /// assigned inside this lock window (§4.4 pt 2 ordering). Errors with
@@ -2530,6 +2540,14 @@ impl NodeCache {
             )?;
             if node.level() > 0 {
                 node.pin(); // §4.5: interior nodes always pinned.
+            } else if node.tree_id() == super::record::TREE_BLOCK_MAP {
+                // Demand-paged tree-7 LEAVES only (design-kvmap §8 #3 /
+                // A7): probation + the §5 leaf-read gauge. Interior and
+                // pinned behavior untouched; a root-leaf loaded here is
+                // pinned by the tree open right after, and pinned nodes
+                // never re-enter the clock.
+                node.begin_probation();
+                super::META_KV_BLOCK_MAP_LEAF_READS.fetch_add(1, Ordering::Relaxed);
             }
             self.publish_stamped(node.clone(), snap.epoch);
             super::META_KV_NODE_CACHE_MISSES.fetch_add(1, Ordering::Relaxed);

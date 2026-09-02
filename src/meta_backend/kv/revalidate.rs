@@ -383,6 +383,93 @@ impl KvMetaBackend {
     pub fn reader_epoch(&self) -> u64 {
         self.node_cache().revalidation_epoch()
     }
+
+    /// [`Self::reader_epoch`] gated for the kvmap fetch bracket
+    /// (design-kvmap-block-map-tree §8 #4, amendment A9): `None` on every
+    /// WRITE mount — the read-only latch is checked FIRST, so a writer's
+    /// fetch path performs ZERO epoch-word reads (the pinned no-bracket
+    /// byte-identity: the one-KvTx head+records commit + the 3.5/4a
+    /// serialization + the rebind/currency ladder already own
+    /// racing-publish skew there) — and `None` on an un-armed read-only
+    /// open (an offline probe serves its frozen mount-time snapshot;
+    /// there is no epoch step to bracket against).
+    pub fn reader_fetch_epoch(&self) -> Option<u64> {
+        if !self.is_read_only() {
+            return None;
+        }
+        match self.reader_epoch() {
+            super::epoch_core::UNARMED_EPOCH => None,
+            epoch => Some(epoch),
+        }
+    }
+}
+
+/// **The A9 fetch-bracket core** (design-kvmap §8 #4): the seqlock loop
+/// control for a multi-read resolution — probe → body → probe, retry
+/// while the epoch stepped. Split out of the fetch path so the law is
+/// directly pinnable (an epoch step is not injectable mid-fetch):
+///
+/// * `begin(None)` (a write mount / un-armed probe) commits `Adopt`
+///   unconditionally — the single-pass, bracket-free shape;
+/// * a stable epoch commits `Adopt`;
+/// * a stepped epoch commits `Retry`, once per step, until
+///   `max_retries` — then errs LOUD (a probe that never stabilizes under
+///   a ≥ 1 s poll cadence is a broken epoch source, never a spin).
+#[derive(Debug)]
+pub struct FetchBracket {
+    before: Option<u64>,
+    retries: u32,
+    max_retries: u32,
+}
+
+/// One bracketed pass's verdict — see [`FetchBracket::commit`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BracketVerdict {
+    /// The pass ran under one epoch (or none) — its reads compose.
+    Adopt,
+    /// The epoch stepped mid-pass — re-run the body under a fresh
+    /// `begin`.
+    Retry,
+}
+
+impl FetchBracket {
+    pub fn new(max_retries: u32) -> Self {
+        Self {
+            before: None,
+            retries: 0,
+            max_retries,
+        }
+    }
+
+    /// Open a pass at the probed epoch (`None` = un-bracketed).
+    pub fn begin(&mut self, epoch: Option<u64>) {
+        self.before = epoch;
+    }
+
+    /// Close the pass against the re-probed epoch.
+    pub fn commit(&mut self, epoch: Option<u64>) -> Result<BracketVerdict, KvError> {
+        let Some(before) = self.before else {
+            return Ok(BracketVerdict::Adopt);
+        };
+        if epoch == Some(before) {
+            return Ok(BracketVerdict::Adopt);
+        }
+        self.retries += 1;
+        if self.retries > self.max_retries {
+            return Err(KvError::Corrupt(format!(
+                "reader fetch bracket exhausted after {} retries (epoch {before} → \
+                 {epoch:?}): the revalidation epoch never stabilized across a pass, \
+                 which a ≥ 1 s poll cadence cannot legitimately produce",
+                self.retries - 1
+            )));
+        }
+        Ok(BracketVerdict::Retry)
+    }
+
+    /// Retries consumed so far (the pinned once-per-step law).
+    pub fn retries(&self) -> u32 {
+        self.retries
+    }
 }
 
 /// Snapshot of the reader-side counters, for the stats surface and for

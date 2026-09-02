@@ -458,6 +458,13 @@ fn kvmap_head_prefix() -> &'static str {
     crate::meta_backend::kv::block_map::KVMAP_HEAD_PREFIX
 }
 
+/// PR 3 (A9): the fetch bracket's retry bound. The reader poll cadence is
+/// ≥ 1 s (`resolve_revalidate_interval_ms` floors at the checkpoint
+/// ceiling), so a legitimate fetch can lose at most one step per second —
+/// exhausting this bound means the epoch source is broken, and the
+/// bracket errs loud instead of spinning.
+const KVMAP_FETCH_BRACKET_RETRIES: u32 = 32;
+
 /// `SQUEEZEFS_MAP_MIGRATE_CHUNK` (PR 2, design A10): crossing-train map
 /// ops per transaction. Default = the finding-38 `BLOCK_REF_TX_CHUNK`
 /// law (512); the registry range 64..=1024 keeps a mis-set knob under
@@ -5806,7 +5813,7 @@ impl DataRouter {
                 } else {
                     bincode::deserialize::<LayoutMetadata>(&bytes).ok()
                 };
-                if let Some(layout) = layout_opt {
+                if let Some(mut layout) = layout_opt {
                     // Write-commit-economy: the fetched value IS the
                     // persisted base — an inline bincode layout is
                     // delta-eligible (chain restarts at 0); JSON-era and
@@ -5833,38 +5840,91 @@ impl DataRouter {
                     // TREE so a refetched ino never zero-reads and every
                     // downstream authority (merge RMW base, save diff,
                     // teardown enumeration) keeps the full-RAM-map
-                    // contract it holds today. The bounded/windowed read
-                    // economy is PR 3's; correctness only here.
+                    // contract it holds today.
+                    //
+                    // PR 3 (A9, design §8 #4): on an ARMED reader the
+                    // head + tree-range reads bracket with the
+                    // revalidation seqlock — head RE-read inside the
+                    // bracket so head and records belong to one polled
+                    // checkpoint (the head-cache skew rule), retry on an
+                    // epoch step. A write mount probes `None` before any
+                    // epoch-word read and keeps the PR 2 single pass
+                    // verbatim (the one-KvTx head+records commit + 3.5/4a
+                    // serialization + the rebind ladder own its skew).
                     if base_is_kvmap {
-                        let mut map = std::collections::HashMap::new();
-                        let mut cursor = 0u32;
+                        let mut bracket = crate::meta_backend::kv::revalidate::FetchBracket::new(
+                            KVMAP_FETCH_BRACKET_RETRIES,
+                        );
                         loop {
-                            let page = backend.block_map_range(ino, cursor, 512).await?;
-                            let Some(last) = page.last().map(|(i, _)| *i) else {
-                                break;
-                            };
-                            for (idx, entry) in &page {
-                                let Some(key) = self.backend_router.map_entry_block_key(entry)
-                                else {
-                                    // A mapping we cannot resolve is loud
-                                    // corruption, never a fabricated hole.
-                                    return Err(SqueezefsError::Io(std::io::Error::new(
-                                        std::io::ErrorKind::InvalidData,
-                                        format!(
-                                            "ino {ino}: unresolvable kvmap record at index \
-                                             {idx} ({entry:?}) — refusing to serve a \
-                                             fabricated hole"
-                                        ),
-                                    )));
+                            let probe = backend.reader_fetch_epoch(ino);
+                            bracket.begin(probe);
+                            if probe.is_some() {
+                                // Armed reader: the head is RE-read
+                                // INSIDE the bracket on every pass — the
+                                // outer read above ran before the first
+                                // probe, so head and records would
+                                // otherwise straddle a step (kvmap heads
+                                // are sticky, so the class cannot change;
+                                // a vanished head means the ino was
+                                // reclaimed mid-fetch).
+                                let Some(fresh) = backend.getxattr(ino, "layout").await? else {
+                                    return Ok(None);
                                 };
-                                map.insert(*idx, key);
+                                layout = bincode::deserialize::<LayoutMetadata>(&fresh).map_err(
+                                    |e| {
+                                        SqueezefsError::Io(std::io::Error::new(
+                                            std::io::ErrorKind::InvalidData,
+                                            format!(
+                                                "ino {ino}: kvmap head re-read under the \
+                                                     A9 bracket is undecodable: {e}"
+                                            ),
+                                        ))
+                                    },
+                                )?;
                             }
-                            let Some(next) = last.checked_add(1) else {
-                                break;
-                            };
-                            cursor = next;
+                            let mut map = std::collections::HashMap::new();
+                            let mut cursor = 0u32;
+                            loop {
+                                let page = backend.block_map_range(ino, cursor, 512).await?;
+                                let Some(last) = page.last().map(|(i, _)| *i) else {
+                                    break;
+                                };
+                                for (idx, entry) in &page {
+                                    let Some(key) = self.backend_router.map_entry_block_key(entry)
+                                    else {
+                                        // A mapping we cannot resolve is loud
+                                        // corruption, never a fabricated hole.
+                                        return Err(SqueezefsError::Io(std::io::Error::new(
+                                            std::io::ErrorKind::InvalidData,
+                                            format!(
+                                                "ino {ino}: unresolvable kvmap record at index \
+                                                 {idx} ({entry:?}) — refusing to serve a \
+                                                 fabricated hole"
+                                            ),
+                                        )));
+                                    };
+                                    map.insert(*idx, key);
+                                }
+                                let Some(next) = last.checked_add(1) else {
+                                    break;
+                                };
+                                cursor = next;
+                            }
+                            match bracket
+                                .commit(backend.reader_fetch_epoch(ino))
+                                .map_err(|e| {
+                                    SqueezefsError::Io(std::io::Error::new(
+                                        std::io::ErrorKind::InvalidData,
+                                        format!("ino {ino}: {e}"),
+                                    ))
+                                })? {
+                                crate::meta_backend::kv::revalidate::BracketVerdict::Adopt => {
+                                    block_map = Some(map);
+                                    break;
+                                }
+                                crate::meta_backend::kv::revalidate::BracketVerdict::Retry => {}
+                            }
                         }
-                        block_map = Some(map);
                     }
                     if let Some(ref map_id) = layout.block_map_id {
                         if map_id.starts_with("indirect:") {

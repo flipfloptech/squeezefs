@@ -46,12 +46,12 @@ use squeezefs::meta_backend::kv::block_refs::volume_tag;
 use squeezefs::meta_backend::kv::builder::{
     format_v3, BuilderConfig, FormatV3Options, ImageBuilder,
 };
+use squeezefs::meta_backend::kv::revalidate::{BracketVerdict, FetchBracket};
 use squeezefs::meta_backend::kv::superblock::{
     classify_volume, set_block_map_tree_bit, set_block_refcounts_bit, write_superblock_v3,
     VolumeFormat, FEATURE_INCOMPAT_KV_BLOCK_KEY_INCARNATION, FEATURE_INCOMPAT_KV_BLOCK_MAP_TREE,
     FEATURE_INCOMPAT_KV_BLOCK_REFCOUNTS,
 };
-use squeezefs::meta_backend::kv::revalidate::{BracketVerdict, FetchBracket};
 use squeezefs::meta_backend::kv::{
     META_KV_BLOCK_MAP_LEAF_READS, META_KV_BLOCK_MAP_LOOKUP_EXACT, META_KV_BLOCK_MAP_LOOKUP_RANGE,
     META_KV_BLOCK_MAP_PUTS, META_KV_NODE_CACHE_EVICTIONS, META_KV_NODE_CACHE_MISSES,
@@ -881,13 +881,15 @@ async fn tree7_demand_leaves_enter_the_clock_on_probation() {
         let mut b = 0u32;
         while b < 32_768 {
             let ops: Vec<squeezefs::meta_backend::kv::block_map::BlockMapOp> = (0..512)
-                .map(|i| squeezefs::meta_backend::kv::block_map::BlockMapOp::Put {
-                    owner_ino: map_ino,
-                    block_index: b + i,
-                    entry: MapEntry::String(
-                        format!("999999:0:65536:leaf-filler-{:040}", b + i).into_bytes(),
-                    ),
-                })
+                .map(
+                    |i| squeezefs::meta_backend::kv::block_map::BlockMapOp::Put {
+                        owner_ino: map_ino,
+                        block_index: b + i,
+                        entry: MapEntry::String(
+                            format!("999999:0:65536:leaf-filler-{:040}", b + i).into_bytes(),
+                        ),
+                    },
+                )
                 .collect();
             rig.kv()
                 .set_layout_and_size_with_map(map_ino, b"giant-map-layout", 4096, &[], &ops)
@@ -1122,11 +1124,14 @@ async fn lookup_counters_split_exact_vs_range_and_count_leaf_reads() {
         ino
     };
 
-    // COLD reopen: the first exact lookup demand-pages a tree-7 leaf.
+    // COLD reopen: resolving the map demand-pages tree-7 leaf state.
+    // (This population fits one node, so the leaf IS the root-leaf and
+    // its demand page runs at tree open — the counter is captured before
+    // the mount; the probation test covers the multi-leaf stream shape.)
+    let leaves_before = META_KV_BLOCK_MAP_LEAF_READS.load(Ordering::Relaxed);
     let rig = mount(meta.path(), data.path()).await;
     let exact_before = META_KV_BLOCK_MAP_LOOKUP_EXACT.load(Ordering::Relaxed);
     let range_before = META_KV_BLOCK_MAP_LOOKUP_RANGE.load(Ordering::Relaxed);
-    let leaves_before = META_KV_BLOCK_MAP_LEAF_READS.load(Ordering::Relaxed);
 
     assert!(rig
         .kv()
@@ -1146,7 +1151,7 @@ async fn lookup_counters_split_exact_vs_range_and_count_leaf_reads() {
     );
     assert!(
         META_KV_BLOCK_MAP_LEAF_READS.load(Ordering::Relaxed) > leaves_before,
-        "the cold exact lookup demand-paged a tree-7 leaf"
+        "the cold resolution demand-paged a tree-7 leaf"
     );
 
     let exact_mid = META_KV_BLOCK_MAP_LOOKUP_EXACT.load(Ordering::Relaxed);

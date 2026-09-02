@@ -298,10 +298,27 @@ pub static META_KV_BLOCK_MAP_PUTS: AtomicU64 = AtomicU64::new(0);
 /// sweep's chunks). Surfaced as `meta_kv_block_map_deletes` (PR 2).
 pub static META_KV_BLOCK_MAP_DELETES: AtomicU64 = AtomicU64::new(0);
 
-/// PB-class files, PR 1: block-map resolution passes served THROUGH the
-/// tree (`get_block_mapping` exact lookups + `block_map_range` windows).
-/// Surfaced as `meta_kv_block_map_lookups` (PR 2).
-pub static META_KV_BLOCK_MAP_LOOKUPS: AtomicU64 = AtomicU64::new(0);
+/// PB-class files, PR 3 (design §8 #5 — the PR-1 merged lookups counter
+/// SPLIT, or §5's gauges are un-derivable): `get_block_mapping` exact
+/// point resolutions. Surfaced as `meta_kv_block_map_lookup_exact`.
+pub static META_KV_BLOCK_MAP_LOOKUP_EXACT: AtomicU64 = AtomicU64::new(0);
+
+/// PB-class files, PR 3 (§8 #5): `block_map_range` window reads — the
+/// fetch-rehydration/walker face; ops ÷ entries is the live leaf
+/// amortization. Surfaced as `meta_kv_block_map_lookup_range`.
+/// (The §8 #5 overlay-hit arm has no counter yet BY CONSTRUCTION: PR 3's
+/// read consumers resolve from the whole rehydrated RAM map — Rev 1.3
+/// #2 — so no per-index overlay-vs-tree decision point exists to count;
+/// it lands with the §8 window cache on the map-RAM-boundedness rung.)
+pub static META_KV_BLOCK_MAP_LOOKUP_RANGE: AtomicU64 = AtomicU64::new(0);
+
+/// PB-class files, PR 3 (§8 #5): tree-7 LEAF nodes demand-paged off the
+/// device — counted at the node-cache miss site (`CachedNode` carries
+/// `tree_id`, so attribution is one compare on the already-cold load
+/// path). The §5 `block_map_tree_leaf_reads` gauge: cold-map
+/// amplification ≈ `leaf_reads × node_size` per §8 #5. Surfaced as
+/// `meta_kv_block_map_leaf_reads`.
+pub static META_KV_BLOCK_MAP_LEAF_READS: AtomicU64 = AtomicU64::new(0);
 
 /// PR M6 (design-metadata-throughput §5.4 D4): kernel post-op ctime
 /// writeback echoes (`fuse_update_ctime` → `fuse_flush_times` →

@@ -1516,6 +1516,74 @@ fn bench_kvmap(c: &mut Criterion) {
             }
         });
     });
+
+    // --- The A7 interference row (PR 3, design §8 #3): the tree-7 leaf
+    // stream vs a FOREIGN-tree working set on ONE cache. The
+    // eviction-order CONTRACT (probation: once-touched map leaves evict
+    // before twice-touched foreign nodes) is pinned in
+    // tests/kvmap_read_tests.rs — this row PRICES the interleaved lookup
+    // shape the probation protects: each iteration advances the map
+    // stream one 512-entry range window (the §8 #1 window-fill shape)
+    // and serves one foreign inode-tree point lookup from the same
+    // cache. Regression = the foreign lookup's share degrading once the
+    // stream runs, i.e. the map stream stealing the working set.
+    use squeezefs::meta_backend::kv::block_map::index_range_from;
+    use squeezefs::meta_backend::kv::record::{inode_key, InodeValue, TREE_INODES};
+    const FOREIGN_INOS: u64 = 1024;
+    let foreign = rt.block_on(async {
+        let ftree = KvTree::create(
+            cache.clone(),
+            &mut ctx,
+            TREE_INODES,
+            Arc::new(AtomicU64::new(0)),
+        )
+        .await
+        .expect("create foreign tree");
+        let v = InodeValue {
+            mode: 0o100644,
+            uid: 1000,
+            gid: 1000,
+            nlink: 1,
+            flags: 0,
+            rdev: 0,
+            size: 4096,
+            atime: 1,
+            mtime: 2,
+            ctime: 3,
+        }
+        .encode();
+        for i in 0..FOREIGN_INOS {
+            ftree
+                .insert(&inode_key(i + 2), v.clone())
+                .await
+                .expect("insert foreign inode");
+        }
+        ftree.flush_dirty(&mut ctx).await.expect("flush foreign");
+        ftree
+    });
+    group.bench_function("foreign_lookup_under_leaf_stream", |b| {
+        let mut cursor = 0u32;
+        let mut j = 0u64;
+        b.to_async(&rt).iter(|| {
+            let map_tree = &tree;
+            let foreign = &foreign;
+            let (lo, hi) = index_range_from(OWNER_INO, cursor % MAPPINGS);
+            cursor = cursor.wrapping_add(512);
+            let fkey = inode_key(2 + (j % FOREIGN_INOS));
+            j = j.wrapping_add(1);
+            async move {
+                let win = map_tree.range(&lo, &hi, 512).await.expect("map window");
+                black_box(win.len());
+                black_box(
+                    foreign
+                        .lookup(black_box(&fkey))
+                        .await
+                        .expect("foreign lookup")
+                        .expect("populated working set"),
+                );
+            }
+        });
+    });
     group.finish();
 }
 

@@ -10868,9 +10868,15 @@ impl SqueezefsFilesystem {
                     "meta_kv_block_refs_unresolved".into(),
                     load(&meta_kv::META_KV_BLOCK_REFS_UNRESOLVED),
                 );
-                // kvmap PR 2: the tree-7 staging/resolution family
-                // (design §5's gauges — puts/deletes are the crossing +
-                // steady-publish engagement, lookups the read bridge's).
+                // kvmap PR 2/PR 3: the tree-7 staging/resolution family
+                // (design §5's `block_map_tree_*` gauges under the
+                // meta_kv_ export convention — puts/deletes are the
+                // crossing + steady-publish engagement; PR 3 split the
+                // merged lookups counter per §8 #5: exact point
+                // resolutions vs range windows, plus demand-paged tree-7
+                // leaves. The overlay-hit arm has no gauge until the §8
+                // window cache lands — Rev 1.3 #2's whole-map fetch has
+                // no per-index overlay decision point to count).
                 metrics.insert(
                     "meta_kv_block_map_puts".into(),
                     load(&meta_kv::META_KV_BLOCK_MAP_PUTS),
@@ -10880,8 +10886,16 @@ impl SqueezefsFilesystem {
                     load(&meta_kv::META_KV_BLOCK_MAP_DELETES),
                 );
                 metrics.insert(
-                    "meta_kv_block_map_lookups".into(),
-                    load(&meta_kv::META_KV_BLOCK_MAP_LOOKUPS),
+                    "meta_kv_block_map_lookup_exact".into(),
+                    load(&meta_kv::META_KV_BLOCK_MAP_LOOKUP_EXACT),
+                );
+                metrics.insert(
+                    "meta_kv_block_map_lookup_range".into(),
+                    load(&meta_kv::META_KV_BLOCK_MAP_LOOKUP_RANGE),
+                );
+                metrics.insert(
+                    "meta_kv_block_map_leaf_reads".into(),
+                    load(&meta_kv::META_KV_BLOCK_MAP_LEAF_READS),
                 );
                 metrics.insert(
                     "meta_kv_commit_smo_retries".into(),

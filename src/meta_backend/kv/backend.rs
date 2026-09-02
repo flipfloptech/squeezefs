@@ -2832,7 +2832,7 @@ impl KvMetaBackend {
         let Some(tree) = self.block_map.get() else {
             return Ok(None);
         };
-        super::META_KV_BLOCK_MAP_LOOKUPS.fetch_add(1, Ordering::Relaxed);
+        super::META_KV_BLOCK_MAP_LOOKUP_EXACT.fetch_add(1, Ordering::Relaxed);
         let key = super::block_map::block_map_key(ino, block_index)?;
         match tree.lookup(&key).await? {
             // A malformed mapping is loud corruption, never a silently
@@ -2860,7 +2860,7 @@ impl KvMetaBackend {
         let Some(tree) = self.block_map.get() else {
             return Ok(Vec::new());
         };
-        super::META_KV_BLOCK_MAP_LOOKUPS.fetch_add(1, Ordering::Relaxed);
+        super::META_KV_BLOCK_MAP_LOOKUP_RANGE.fetch_add(1, Ordering::Relaxed);
         let (lo, hi) = super::block_map::index_range_from(ino, from_index);
         let page = tree.range(&lo, &hi, max).await?;
         let mut out = Vec::with_capacity(page.len());

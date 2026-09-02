@@ -3384,6 +3384,15 @@ impl RoutedMetaBackend {
         out
     }
 
+    /// PR 3 (kvmap, A9): the fetch bracket's epoch probe, routed to
+    /// `ino`'s home volume — see
+    /// [`kv::backend::KvMetaBackend::reader_fetch_epoch`]. `None` on
+    /// write mounts (zero epoch reads, pinned) and un-armed readers.
+    pub fn reader_fetch_epoch(&self, ino: Ino) -> Option<u64> {
+        let (v_idx, _) = self.route_ino(ino);
+        self.volumes.get(v_idx)?.reader_fetch_epoch()
+    }
+
     /// PR 2 (kvmap): the unlink-side bounded record sweep, routed to
     /// `ino`'s home volume (never silent residue — Rev 1.1 #4).
     pub async fn sweep_block_map(&self, ino: Ino, chunk: usize) -> Result<u64> {

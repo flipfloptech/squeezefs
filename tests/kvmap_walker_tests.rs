@@ -809,6 +809,140 @@ async fn a_seeded_orphan_map_record_is_c11_and_the_registry_shields_it() {
     rig.shutdown().await;
 }
 
+/// C11 (c) — PR 6a (design §12): run-vs-point coverage sanity. A point
+/// on a DIFFERENT volume strictly inside a covering run's span is ONE
+/// report-only finding on the `map_run_foreign_shadows` census; a
+/// SAME-volume point inside the run (the §2 read law's own legal shadow
+/// — arithmetic-equal and overwrite alike) reports NOTHING; the A3
+/// registry shield exempts a registered crossing; repair refuses.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_foreign_volume_point_inside_a_run_is_c11_and_a_same_volume_one_is_legal() {
+    let _serial = serial();
+    let meta = NamedTempFile::new().unwrap();
+    format_meta_kvmap(meta.path()).await;
+    let data = data_file();
+    let rig = mount(meta.path(), data.path()).await;
+    let ino = rig.mk_file("run_shadowed").await;
+    let entries = rig.publish_spill(ino, SPILL_BLOCKS).await;
+    let head = rig
+        .kv()
+        .getxattr(ino, "layout")
+        .await
+        .unwrap()
+        .expect("head");
+    let own_tag = squeezefs::meta_backend::kv::block_refs::volume_tag(DATA_VOL_ID);
+
+    // A SAME-volume shadow point inside the run — the ARITHMETIC-EQUAL
+    // form (design §12's explicitly-legal shape): binding unchanged, so
+    // the seed needs no reference swap and the census stays clean.
+    let eq_off: u64 = entries[11].1.parse().unwrap();
+    rig.kv()
+        .set_layout_and_size_with_map(
+            ino,
+            &head,
+            u64::from(SPILL_BLOCKS) * 4 * 1024 * 1024,
+            &[],
+            &[squeezefs::meta_backend::kv::block_map::BlockMapOp::Put {
+                owner_ino: ino,
+                block_index: 11,
+                entry: squeezefs::meta_backend::kv::block_map::MapEntry::Point {
+                    vol_tag: own_tag,
+                    offset: eq_off,
+                },
+            }],
+        )
+        .await
+        .expect("stage the same-volume shadow");
+    let ctx = rig.fsck_ctx();
+    let rep = run_fsck(&ctx, &online_opts()).await.expect("fsck pass");
+    assert_eq!(
+        counter(&rep, "map_run_foreign_shadows"),
+        0,
+        "a same-volume shadow is the read law's own legal shape: {:?}",
+        rep.findings
+    );
+
+    // A FOREIGN-volume point inside the run: one report-only C11
+    // finding. The seed swaps the index's reference off the mounted
+    // volume (released) so the durable/derived C8 sides stay agreed —
+    // the deliberately-orphaned old block's own C2 leak report is the
+    // seed's honest residue, not this class's.
+    let foreign_tag = squeezefs::meta_backend::kv::block_refs::volume_tag("vol-00000000000000ee");
+    let old23: u64 = entries[23].1.parse().unwrap();
+    rig.kv()
+        .set_layout_and_size_with_map(
+            ino,
+            &head,
+            u64::from(SPILL_BLOCKS) * 4 * 1024 * 1024,
+            &[
+                squeezefs::meta_backend::kv::block_refs::BlockRefOp::released(
+                    squeezefs::meta_backend::kv::block_refs::BlockRef {
+                        vol_tag: own_tag,
+                        block_idx: old23 / (4 * 1024 * 1024),
+                        owner_ino: ino,
+                        block_index: 23,
+                    },
+                ),
+            ],
+            &[squeezefs::meta_backend::kv::block_map::BlockMapOp::Put {
+                owner_ino: ino,
+                block_index: 23,
+                entry: squeezefs::meta_backend::kv::block_map::MapEntry::Point {
+                    vol_tag: foreign_tag,
+                    offset: 4 * 1024 * 1024,
+                },
+            }],
+        )
+        .await
+        .expect("stage the foreign-volume shadow");
+    let rep = run_fsck(&ctx, &online_opts()).await.expect("fsck pass");
+    let c11 = c11_findings(&rep);
+    assert_eq!(
+        c11.len(),
+        1,
+        "exactly the foreign-volume shadow reports as C11: {:?}",
+        rep.findings
+    );
+    assert_eq!(counter(&rep, "map_run_foreign_shadows"), 1);
+    assert!(
+        c11[0].evidence.contains("index 23"),
+        "the finding names the shadowed index: {:?}",
+        c11[0]
+    );
+
+    // The A3 registry shield.
+    {
+        let _guard = rig.kv().test_register_crossing(ino);
+        let shielded = run_fsck(&ctx, &online_opts()).await.expect("fsck pass");
+        assert!(
+            c11_findings(&shielded).is_empty(),
+            "a registered crossing exempts the ino (A3)"
+        );
+    }
+
+    // Report-only: repair refuses, applies nothing.
+    let rr = run_repair(
+        &ctx,
+        &rep,
+        &RepairOptions {
+            apply: true,
+            quarantine_dir: None,
+            multi_owner: false,
+        },
+    )
+    .await
+    .expect("repair invocation");
+    assert!(rr.applied.iter().all(|a| a.class != "C11"));
+    assert!(
+        rr.refused
+            .iter()
+            .any(|a| a.class == "C11" && a.detail.contains("REPORT-ONLY")),
+        "the refusal states the posture: {:?}",
+        rr.refused
+    );
+    rig.shutdown().await;
+}
+
 /// C11 (b) — head/tree coverage mismatch, the FULLY-EMPTY case only
 /// (Rev 1.1 #3 scope: the size-vs-sparse ambiguity keeps partial
 /// coverage out): a `kvmap:1` head with nonzero size and ZERO tree

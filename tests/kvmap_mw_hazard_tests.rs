@@ -298,14 +298,29 @@ impl Rig {
                 break;
             };
             for (idx, entry) in page {
-                let key = match entry {
-                    MapEntry::String(bytes) => String::from_utf8(bytes).expect("utf8 key"),
+                match entry {
+                    MapEntry::String(bytes) => {
+                        out.push((idx, String::from_utf8(bytes).expect("utf8 key")))
+                    }
                     MapEntry::Point { vol_tag, offset } => {
                         assert_eq!(vol_tag, default_tag, "the rig's one data volume");
-                        offset.to_string()
+                        out.push((idx, offset.to_string()));
                     }
-                };
-                out.push((idx, key));
+                    // PR 6a: expand runs per-index (the shared surfaces'
+                    // arithmetic — this rig's one volume, bare offsets).
+                    MapEntry::Run {
+                        vol_tag,
+                        start_offset,
+                        len,
+                    } => {
+                        assert_eq!(vol_tag, default_tag, "the rig's one data volume");
+                        let stride = self.alloc.chunk_size();
+                        for d in 0..len {
+                            out.push((idx + d, (start_offset + u64::from(d) * stride).to_string()));
+                        }
+                    }
+                    other => panic!("this rig never mints stamped records: {other:?}"),
+                }
             }
             cursor = match last.checked_add(1) {
                 Some(n) => n,
@@ -1200,9 +1215,10 @@ async fn alternating_shipped_saves_keep_peer_bindings_and_the_belt_refuses_lag()
     );
     assert_eq!(gen, 2, "every committed mw-plane train bumps the belt");
     assert_eq!(
-        preexisting,
-        u64::from(SPILL_BLOCKS) + 1,
-        "B's train saw A's committed binding"
+        preexisting, 2,
+        "B's train saw A's committed binding beside the coalesced run \
+         (`preexisting` counts RECORDS — PR 6a collapsed the spill's span \
+         into one RUN record)"
     );
     assert_eq!(publish::stats().map_served - served_before, 1);
 

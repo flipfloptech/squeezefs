@@ -200,6 +200,79 @@ fn value_codec_round_trips_point_and_string() {
     );
 }
 
+/// PR 6a (design §12): the RUN/POINT2/RUN2 codecs round-trip at their
+/// pinned lengths (22/26/30 B), and the parser accepts nothing the
+/// emitter cannot produce — run lengths outside `2..=RUN_LEN_MAX`, a
+/// zero incarnation (the unstamped forms own that spelling), a RUN2
+/// whose stamp arithmetic would wrap, and truncated payloads all refuse
+/// loud.
+#[test]
+fn run_and_stamped_codecs_round_trip_and_refuse_unemittable_forms() {
+    use squeezefs::meta_backend::kv::block_map::{
+        BLOCK_MAP_KIND_POINT_STAMPED, BLOCK_MAP_KIND_RUN, BLOCK_MAP_KIND_RUN_STAMPED,
+        BLOCK_MAP_POINT_STAMPED_VALUE_LEN, BLOCK_MAP_RUN_STAMPED_VALUE_LEN,
+        BLOCK_MAP_RUN_VALUE_LEN, RUN_LEN_MAX,
+    };
+    let run = MapEntry::Run {
+        vol_tag: 0xA1,
+        start_offset: 7 * 4 * 1024 * 1024,
+        len: RUN_LEN_MAX,
+    };
+    let enc = run.encode();
+    assert_eq!(enc.len(), BLOCK_MAP_RUN_VALUE_LEN);
+    assert_eq!(enc[1], BLOCK_MAP_KIND_RUN);
+    assert_eq!(decode_block_map_value(&enc).expect("run roundtrip"), run);
+
+    let p2 = MapEntry::PointStamped {
+        vol_tag: 0xA1,
+        offset: 42,
+        incarnation: (3u64 << 40) | 7,
+    };
+    let enc = p2.encode();
+    assert_eq!(enc.len(), BLOCK_MAP_POINT_STAMPED_VALUE_LEN);
+    assert_eq!(enc[1], BLOCK_MAP_KIND_POINT_STAMPED);
+    assert_eq!(decode_block_map_value(&enc).expect("point2 roundtrip"), p2);
+
+    let r2 = MapEntry::RunStamped {
+        vol_tag: 0xA1,
+        start_offset: 42,
+        len: 2,
+        start_incarnation: (3u64 << 40) | 1,
+    };
+    let enc = r2.encode();
+    assert_eq!(enc.len(), BLOCK_MAP_RUN_STAMPED_VALUE_LEN);
+    assert_eq!(enc[1], BLOCK_MAP_KIND_RUN_STAMPED);
+    assert_eq!(decode_block_map_value(&enc).expect("run2 roundtrip"), r2);
+
+    // Refusals: parser == emitter.
+    let mut too_short = MapEntry::Run {
+        vol_tag: 1,
+        start_offset: 0,
+        len: 1,
+    }
+    .encode();
+    assert!(
+        decode_block_map_value(&too_short).is_err(),
+        "a 1-run is a point — one spelling per mapping"
+    );
+    // len > RUN_LEN_MAX would be invisible to the A6 floor probe.
+    too_short[18..22].copy_from_slice(&(RUN_LEN_MAX + 1).to_le_bytes());
+    assert!(decode_block_map_value(&too_short).is_err());
+    // Zero stamps belong to the unstamped kinds.
+    let mut zero_inc = p2.encode();
+    zero_inc[18..26].copy_from_slice(&0u64.to_le_bytes());
+    assert!(decode_block_map_value(&zero_inc).is_err());
+    // A RUN2 whose stamp span wraps was never minted.
+    let mut wrap = r2.encode();
+    wrap[22..30].copy_from_slice(&u64::MAX.to_le_bytes());
+    assert!(decode_block_map_value(&wrap).is_err());
+    // Truncation refuses on every kind.
+    for e in [&run, &p2, &r2] {
+        let enc = e.encode();
+        assert!(decode_block_map_value(&enc[..enc.len() - 1]).is_err());
+    }
+}
+
 /// The head sentinel round-trips all four forms — `kvmap:1`,
 /// `kvmap:1;sweep:K`, `kvmap:1;gen:N` and `kvmap:1;sweep:K;gen:N` — the
 /// A2 sweep cursor plus PR 5b's map-generation belt (design §11 law b).
@@ -296,9 +369,9 @@ fn reserved_index_and_malformed_keys_refuse_loud() {
     assert!(decode_block_map_key(&reserved).is_err(), "reserved in key");
 }
 
-/// Unknown value versions and kinds refuse loud — including the RUN kind,
-/// whose discriminant is reserved here and decoded only from PR 6 on —
-/// and truncation/trailing bytes are corruption, never a guess.
+/// Unknown value versions and kinds refuse loud — and truncation/trailing
+/// bytes are corruption, never a guess (the RUN kind decodes since PR 6a;
+/// its malformed shapes refuse by length/bounds).
 #[test]
 fn unknown_value_version_kind_and_truncation_refuse_loud() {
     assert!(decode_block_map_value(&[]).is_err(), "empty");
@@ -314,11 +387,13 @@ fn unknown_value_version_kind_and_truncation_refuse_loud() {
         decode_block_map_value(&[BLOCK_MAP_VALUE_VERSION, 9, 0, 0]).is_err(),
         "unknown kind"
     );
+    // PR 6a claimed the RUN reservation: the kind decodes now, so a
+    // malformed (truncated) run value refuses as corruption by LENGTH.
     let run = [BLOCK_MAP_VALUE_VERSION, BLOCK_MAP_KIND_RUN, 0, 0];
-    let err = decode_block_map_value(&run).expect_err("RUN is PR 6's");
+    let err = decode_block_map_value(&run).expect_err("a 4-byte RUN value is corrupt");
     assert!(
-        format!("{err}").contains("run"),
-        "the RUN refusal must name the reserved kind: {err}"
+        format!("{err}").contains("RUN"),
+        "the refusal names the malformed kind: {err}"
     );
 
     let p = point(1, 2).encode();
@@ -435,7 +510,7 @@ async fn map_records_ride_the_layout_transaction_and_add_no_commit() {
     // …and what rode the tx resolves.
     assert_eq!(
         rig.kv().get_block_mapping(ino, 0).await.expect("lookup"),
-        Some(point(0xA1, 0))
+        Some((0, point(0xA1, 0)))
     );
     rig.shutdown().await;
 }
@@ -563,20 +638,20 @@ async fn get_block_mapping_and_range_round_trip_with_cross_ino_isolation() {
     let range_before = META_KV_BLOCK_MAP_LOOKUP_RANGE.load(Ordering::Relaxed);
     assert_eq!(
         rig.kv().get_block_mapping(ino_a, 0).await.unwrap(),
-        Some(a0.clone())
+        Some((0, a0.clone()))
     );
     assert_eq!(
         rig.kv().get_block_mapping(ino_a, 5).await.unwrap(),
-        Some(a5.clone())
+        Some((5, a5.clone()))
     );
     assert_eq!(
         rig.kv().get_block_mapping(ino_a, 7).await.unwrap(),
-        Some(a7.clone())
+        Some((7, a7.clone()))
     );
     assert_eq!(rig.kv().get_block_mapping(ino_a, 1).await.unwrap(), None);
     assert_eq!(
         rig.kv().get_block_mapping(ino_b, 3).await.unwrap(),
-        Some(b3.clone())
+        Some((3, b3.clone()))
     );
     assert_eq!(
         rig.kv().get_block_mapping(ino_b, 5).await.unwrap(),
@@ -696,7 +771,7 @@ async fn map_records_survive_a_crash_remount_through_the_journal() {
     assert!(rig.kv().block_map_tree_engaged());
     assert_eq!(
         rig.kv().get_block_mapping(ino, 12).await.expect("lookup"),
-        Some(entry),
+        Some((12, entry)),
         "the map record must replay out of the journal"
     );
     rig.shutdown().await;

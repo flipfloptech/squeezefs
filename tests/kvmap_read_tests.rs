@@ -342,37 +342,63 @@ async fn undecorated_keys_publish_as_point_records_and_round_trip() {
     );
     let record_bytes = METRICS.publish_map_record_bytes.load(Ordering::Relaxed) - bytes_before;
 
-    // Every record is the binary POINT form: the named volume's durable
-    // tag + the device offset — 30 B per record (12 B key + 18 B value).
+    // PR 6a: the straight sequential named-volume stream coalesces into
+    // ONE RUN record carrying the named volume's durable tag — the
+    // record-count/byte collapse past the PR-3 POINT economy.
     let records = rig.raw_records(ino).await;
-    assert_eq!(records.len(), entries.len());
     let tag2 = volume_tag(DATA_VOL_ID_2);
-    for (idx, entry) in &records {
-        assert_eq!(
-            *entry,
-            MapEntry::Point {
+    assert_eq!(records.len(), 1, "one covering run: {records:?}");
+    assert_eq!(
+        records[0],
+        (
+            0,
+            MapEntry::Run {
                 vol_tag: tag2,
-                offset: u64::from(*idx) * 4 * 1024 * 1024,
-            },
-            "index {idx} must be the compact POINT form"
-        );
-    }
+                start_offset: 0,
+                len: SPILL_BLOCKS,
+            }
+        )
+    );
     let point_bytes = entries.len() as u64 * 30;
     let string_bytes: u64 = entries.iter().map(|(_, k)| (12 + 2 + k.len()) as u64).sum();
     assert_eq!(
-        record_bytes, point_bytes,
-        "the gauge accounts POINT records exactly"
+        record_bytes,
+        12 + 22,
+        "the gauge accounts the one RUN record exactly"
     );
     assert!(
-        record_bytes < string_bytes,
-        "the POINT economy must SHRINK the record bytes: {record_bytes} vs the \
-         PR-2 STRING sizing {string_bytes}"
+        record_bytes < point_bytes && point_bytes < string_bytes,
+        "the record economy ladder must hold: RUN {record_bytes} B < POINT sizing \
+         {point_bytes} B < STRING sizing {string_bytes} B"
     );
-    println!(
-        "POINT shrink on the named-volume streaming fixture: {record_bytes} B vs \
-         {string_bytes} B STRING ({:.1} %)",
-        100.0 * (string_bytes - record_bytes) as f64 / string_bytes as f64
-    );
+
+    // A SCATTERED (non-stride-adjacent) shape keeps the per-record POINT
+    // form — the PR-3 pin, alive on the shape runs cannot cover.
+    let scattered = rig.mk_file("named_scattered").await;
+    let sc_entries: Vec<(u32, String)> = (0..SPILL_BLOCKS)
+        .map(|b| {
+            (
+                b,
+                format!("{DATA_VOL_ID_2}://{}", u64::from(b) * 12 * 1024 * 1024),
+            )
+        })
+        .collect();
+    rig.publish_entries(
+        scattered,
+        &sc_entries,
+        u64::from(SPILL_BLOCKS) * 4 * 1024 * 1024,
+    )
+    .await;
+    for (idx, entry) in rig.raw_records(scattered).await {
+        assert_eq!(
+            entry,
+            MapEntry::Point {
+                vol_tag: tag2,
+                offset: u64::from(idx) * 12 * 1024 * 1024,
+            },
+            "a non-adjacent key stays the compact POINT form"
+        );
+    }
 
     // --- Round trip: fetch resolves the IDENTICAL key strings. ---------
     let map = rig.refetched_map(ino).await;
@@ -385,17 +411,16 @@ async fn undecorated_keys_publish_as_point_records_and_round_trip() {
         );
     }
 
-    // --- Bare default-slot keys take POINT too (the single-volume form).
+    // --- Bare default-slot keys coalesce too (the single-volume form).
     let bare = rig.mk_file("bare_stream").await;
     let bare_entries = rig.publish_spill(bare, SPILL_BLOCKS).await;
     let tag1 = volume_tag(DATA_VOL_ID);
-    for (idx, entry) in rig.raw_records(bare).await {
-        let MapEntry::Point { vol_tag, offset } = entry else {
-            panic!("bare key at index {idx} must be POINT, got {entry:?}");
-        };
-        assert_eq!(vol_tag, tag1);
-        assert_eq!(offset.to_string(), bare_entries[idx as usize].1);
-    }
+    let bare_records = rig.raw_records(bare).await;
+    assert_eq!(bare_records.len(), 1, "one covering run: {bare_records:?}");
+    assert!(
+        matches!(bare_records[0].1, MapEntry::Run { vol_tag, len, .. }
+            if vol_tag == tag1 && len == SPILL_BLOCKS)
+    );
     let map = rig.refetched_map(bare).await;
     for (b, k) in &bare_entries {
         assert_eq!(map.get(b), Some(k), "bare key at index {b} round-trips");
@@ -464,15 +489,17 @@ async fn decorated_keys_still_ride_string_verbatim() {
     rig.shutdown().await;
 }
 
-/// The incarnation-era exclusion (spec §6.2 item 6 composed with the
-/// POINT economy): on a bit-13 volume — the DEFAULT format since the
-/// rung-10b flip — persisted keys carry the offset's lifetime stamp, the
-/// 18-byte POINT form cannot, and a decode that re-attached the CURRENT
-/// stamp would let a record naming a freed-and-reissued offset pass the
-/// staleness refusal. So an engaged era's records ride STRING verbatim —
-/// stamps preserved byte-exactly through the round trip.
+/// The incarnation-era composition (spec §6.2 item 6, PR 6a — design
+/// §12 superseding Rev 1.4 #1's STRING interim): on a bit-13 volume —
+/// the DEFAULT format since the rung-10b flip — persisted keys carry the
+/// offset's lifetime stamp, and since PR 6a the stamp rides the compact
+/// forms VERBATIM: consecutive mints coalesce into RUN2 (stride-1
+/// lane_seqs proven per stamp by the emitter), and the stamps decode
+/// byte-exactly through the round trip — never re-attached from the
+/// live map (which would let a freed-and-reissued offset pass the
+/// staleness refusal).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn incarnation_engaged_eras_keep_string_records() {
+async fn incarnation_engaged_eras_ride_stamped_compact_forms() {
     let _serial = serial();
     let meta = NamedTempFile::new().unwrap();
     // The default-format shape: strip ONLY the 9/16 seams, keep bit 13.
@@ -523,17 +550,18 @@ async fn incarnation_engaged_eras_keep_string_records() {
         Some("kvmap:1")
     );
 
-    // Every record: STRING, byte-exact — the stamp travels.
+    // The record census: consecutive stamped mints = ONE RUN2, whose
+    // start incarnation is the first key's stamp verbatim.
     let records = rig.raw_records(ino).await;
-    assert_eq!(records.len(), entries.len());
-    for ((idx, entry), (b, k)) in records.iter().zip(entries.iter()) {
-        assert_eq!(idx, b);
-        assert_eq!(
-            *entry,
-            MapEntry::String(k.clone().into_bytes()),
-            "a stamped key must ride STRING verbatim, never POINT"
-        );
-    }
+    assert_eq!(records.len(), 1, "stamped RUN2 coalesces: {records:?}");
+    let first_stamp =
+        squeezefs::routing::block_key_incarnation(&entries[0].1).expect("parseable stamp");
+    assert!(
+        matches!(records[0].1, MapEntry::RunStamped { len, start_incarnation, .. }
+            if len == SPILL_BLOCKS && start_incarnation == first_stamp),
+        "the RUN2 record carries the minted stamps verbatim: {:?}",
+        records[0]
+    );
     // And the round trip preserves the stamps.
     let map = rig.refetched_map(ino).await;
     for (b, k) in &entries {
@@ -806,9 +834,14 @@ async fn giant_sparse_matrix_survives_remount_exact() {
         rig.durable_head(ino).await.block_map_id.as_deref(),
         Some("kvmap:1")
     );
-    // The tree: exactly the published set, in index order.
+    // The tree: the published set in index order — the dense spill
+    // coalesced into ONE run (PR 6a), the sparse giants stay points.
     let records = rig.raw_records(ino).await;
-    assert_eq!(records.len(), entries.len());
+    assert_eq!(
+        records.len(),
+        1 + entries.len() - SPILL_BLOCKS as usize,
+        "one run + the sparse points: {records:?}"
+    );
     // The read path: exact bindings at every sparse index.
     let map = rig.refetched_map(ino).await;
     assert_eq!(map.len(), entries.len());
@@ -826,10 +859,13 @@ async fn giant_sparse_matrix_survives_remount_exact() {
     let want: u64 = entries.last().unwrap().1.parse().expect("bare offset key");
     assert_eq!(
         hit,
-        MapEntry::Point {
-            vol_tag: volume_tag(DATA_VOL_ID),
-            offset: want,
-        },
+        (
+            u32::MAX - 1,
+            MapEntry::Point {
+                vol_tag: volume_tag(DATA_VOL_ID),
+                offset: want,
+            }
+        ),
         "the boundary record is the POINT form of its key string"
     );
     rig.shutdown().await;

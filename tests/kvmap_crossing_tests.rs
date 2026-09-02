@@ -255,14 +255,29 @@ impl Rig {
                 break;
             };
             for (idx, entry) in page {
-                let key = match entry {
-                    MapEntry::String(bytes) => String::from_utf8(bytes).expect("utf8 key"),
+                match entry {
+                    MapEntry::String(bytes) => {
+                        out.push((idx, String::from_utf8(bytes).expect("utf8 key")))
+                    }
                     MapEntry::Point { vol_tag, offset } => {
                         assert_eq!(vol_tag, default_tag, "the rig's one data volume");
-                        offset.to_string()
+                        out.push((idx, offset.to_string()));
                     }
-                };
-                out.push((idx, key));
+                    // PR 6a: expand runs per-index (the shared surfaces'
+                    // arithmetic — this rig's one volume, bare offsets).
+                    MapEntry::Run {
+                        vol_tag,
+                        start_offset,
+                        len,
+                    } => {
+                        assert_eq!(vol_tag, default_tag, "the rig's one data volume");
+                        let stride = self.alloc.chunk_size();
+                        for d in 0..len {
+                            out.push((idx + d, (start_offset + u64::from(d) * stride).to_string()));
+                        }
+                    }
+                    other => panic!("this rig never mints stamped records: {other:?}"),
+                }
             }
             cursor = match last.checked_add(1) {
                 Some(n) => n,
@@ -336,14 +351,16 @@ async fn a_crossing_flips_the_head_and_the_tree_carries_every_mapping() {
         1,
         "one crossing"
     );
+    // PR 6a (design §12): a straight sequential spill coalesces into RUN
+    // records — the staged-record count collapses ~len× (SPILL_BLOCKS <
+    // RUN_LEN_MAX ⇒ one run), never one record per mapping.
+    let staged = METRICS.map_migrate_records.load(Ordering::Relaxed) - recs_before;
     assert!(
-        METRICS.map_migrate_records.load(Ordering::Relaxed) - recs_before
-            >= u64::from(SPILL_BLOCKS)
+        staged >= 1 && staged < u64::from(SPILL_BLOCKS) / 100,
+        "a sequential crossing must stage coalesced run records, got {staged}"
     );
     assert!(METRICS.publish_map_record_bytes.load(Ordering::Relaxed) > bytes_before);
-    assert!(
-        META_KV_BLOCK_MAP_PUTS.load(Ordering::Relaxed) - puts_before >= u64::from(SPILL_BLOCKS)
-    );
+    assert!(META_KV_BLOCK_MAP_PUTS.load(Ordering::Relaxed) - puts_before >= 1);
     // The blob counters must NOT have engaged — this publish never
     // wrote an indirect blob.
     assert!(

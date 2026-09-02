@@ -299,6 +299,35 @@ proptest! {
         }
     }
 
+    /// PR 6a (design §12): every EMITTABLE run/stamped form round-trips —
+    /// the constructive mirror of the byte-identity law above (run len in
+    /// `2..=RUN_LEN_MAX`, nonzero stamps, non-wrapping RUN2 spans — the
+    /// emitter's whole domain).
+    #[test]
+    fn block_map_run_and_stamped_forms_round_trip(
+        vol_tag in any::<u64>(),
+        offset in any::<u64>(),
+        len in 2u32..=squeezefs::meta_backend::kv::block_map::RUN_LEN_MAX,
+        inc in 1u64..=(u64::MAX - u64::from(squeezefs::meta_backend::kv::block_map::RUN_LEN_MAX)),
+    ) {
+        use squeezefs::meta_backend::kv::block_map::MapEntry;
+        for entry in [
+            MapEntry::Run { vol_tag, start_offset: offset, len },
+            MapEntry::PointStamped { vol_tag, offset, incarnation: inc },
+            MapEntry::RunStamped {
+                vol_tag,
+                start_offset: offset,
+                len,
+                start_incarnation: inc,
+            },
+        ] {
+            prop_assert_eq!(
+                decode_block_map_value(&entry.encode()).expect("emittable form decodes"),
+                entry
+            );
+        }
+    }
+
     /// The `kvmap:` head-sentinel parser is total over arbitrary strings —
     /// both far-from-grammar inputs and near-misses behind the prefix —
     /// and anything it accepts round-trips through its own encoder.

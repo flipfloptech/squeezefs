@@ -89,16 +89,33 @@ S8 batch-cap floor — the widest frame every machine ships), one owner
 around the one frame; owner-side wall = the client's `ship_ops` await
 (includes one wire RTT).
 
+**Debug build** (`cargo test`):
+
 | Binary | passes / frame | journal entries / frame | wall / frame | per verb |
 |---|---|---|---|---|
 | dev tip `98346dab` (serial) | **64** | 64 | 8.18 ms | 127.7 µs |
 | fix `9a463db7` (×5) | **3, 2, 3, 3, 3** | 64 | 3.86–5.11 ms | 60.3–79.9 µs |
 
-Passes per frame **64 → 2–3** (the ideal is 1; the stragglers are the
-pass task mid-drain when the first committers land — one pass per
-"wave" of arrivals). Owner wall −45 to −53 % on a debug build whose
-per-verb CPU (encode, guards, fold) is serialized by nothing but the
-pool's width; the release-build and fleet numbers are owed.
+**Release build** (`cargo test --release`, default features — the
+measurement configuration; ×5 each, same binary for the test half, the
+serial half = dev-tip `service.rs` swapped in):
+
+| Binary | passes / frame | wall / frame (×5) | median | per verb (median) |
+|---|---|---|---|---|
+| serial `run_batch` (dev tip) | **64** ×5 | 2.02 / 5.32 / 4.02 / 2.32 / 1.70 ms | **2.32 ms** | 36.3 µs |
+| fix `9a463db7` | **3** ×5 | 0.89 / 0.84 / 1.11 / 1.02 / 1.06 ms | **1.02 ms** | 15.9 µs |
+
+Passes per frame **64 → 3** on every roll (the ideal is 1; the two
+stragglers are the pass task mid-drain when the first committers land
+— one pass per "wave" of arrivals). Release owner wall **2.3× at the
+median, 1.7–5.0× across the bracket** (the serial rows' spread is the
+64 serial barrier round trips each exposed to the file-backed
+sandbox's fsync jitter; the concurrent rows pay 3 and are tight). Both
+rows include one wire RTT over loopback. This is the in-process face of
+the ledger's "2–10× on fan-out" term: the frame-level term lands at the
+low end here because a 64-verb frame on a quiet single-volume sandbox
+has no queueing at ρ ≈ 0.92 to collapse — the fleet row (owed) is where
+the utilization term shows.
 
 **Contract pinned:** ≤ 4 passes per 64-verb frame; entries per frame ≡
 N; every reply id-correlated in op order; a failing verb (ENOENT ino)
@@ -151,16 +168,13 @@ Suites green on the fix (all `--test-threads=1`): the new suite (4),
    zero residue. Not run: the box was serving this session's suite
    runs (foreign cargo load invalidates a row) and the reboot deadline
    forbade a fleet start after 17:05.
-2. **Release-build in-process row** — the table above is `cargo test`
-   debug; a `--release` rerun of `a_frame_of_independent_verbs_…`
-   prices the per-verb CPU term honestly.
-3. **Publish-plane batching** (the follow-on above): a multi-call
+2. **Publish-plane batching** (the follow-on above): a multi-call
    `PublishRequestFrame` or per-co-writer session fan-out so layout
    publishes co-queue at the authority the way verbs now do; verdict =
    aggregate co-writer ingest GiB/s vs the S9-a wall.
-4. **Chain-width instrument** — a `meta_ship_owner_chains` /
+3. **Chain-width instrument** — a `meta_ship_owner_chains` /
    `meta_ship_owner_chain_width` pair on the stats inode (chains per
    frame; ≈ frame width = fully independent, ≈ 1 = one hot object) so
    the field can see the lever engage without the test harness.
-5. `task check` (the full gate) — deferred by instruction; only the
+4. `task check` (the full gate) — deferred by instruction; only the
    suites named above ran.

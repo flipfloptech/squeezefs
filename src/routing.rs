@@ -443,6 +443,31 @@ pub fn layout_delta_max_chain() -> u32 {
     layout_delta_chain_cell().load(std::sync::atomic::Ordering::Relaxed) as u32
 }
 
+/// `SQUEEZEFS_KVMAP` (PR 2, design A10): whether NEW beyond-inline
+/// crossings take the tree-7 kvmap arm. `0` routes new crossings to the
+/// legacy indirect-blob arm — the A/B lever; it never disables
+/// kvmap-HEAD resolution (an existing head is force-kvmap). Read at the
+/// crossing decision — a cold path, so the per-decision read is fine.
+pub fn kvmap_enabled() -> bool {
+    crate::env_knobs::bool_knob("SQUEEZEFS_KVMAP", true)
+}
+
+/// The `kvmap:` head-sentinel prefix (design §2), one spelling for the
+/// routing arms.
+fn kvmap_head_prefix() -> &'static str {
+    crate::meta_backend::kv::block_map::KVMAP_HEAD_PREFIX
+}
+
+/// `SQUEEZEFS_MAP_MIGRATE_CHUNK` (PR 2, design A10): crossing-train map
+/// ops per transaction. Default = the finding-38 `BLOCK_REF_TX_CHUNK`
+/// law (512); the registry range 64..=1024 keeps a mis-set knob under
+/// the 128 KiB whole-journal-entry admission. Out-of-range values were
+/// refused at startup (ENG-10); the clamp here only guards mid-process
+/// env mutation.
+pub fn map_migrate_chunk() -> usize {
+    crate::env_knobs::int_knob("SQUEEZEFS_MAP_MIGRATE_CHUNK", 512usize).clamp(64, 1024)
+}
+
 /// Test seam (write-commit-economy lever 1; the
 /// [`TEST_TIER_PUBLISH_DELAY_MS`] precedent): artificial delay, in
 /// milliseconds, injected at the head of every publish-conveyor pass —
@@ -2660,6 +2685,92 @@ impl BackendRouter {
         out
     }
 
+    /// PR 2 (kvmap): resolve one tree-7 map record's value to the
+    /// backend-true block-key string every consumer speaks
+    /// (`persist_block_key` output). STRING records are verbatim bytes
+    /// (the only kind PR 2 writes); POINT records — the codec's binary
+    /// fast form (PR 1 fixtures, later PRs) — resolve their durable
+    /// `vol_tag` through the same volume census the durable-ref plane
+    /// uses (KD-5). `None` = an unresolvable entry (a foreign/retired
+    /// volume tag, non-UTF-8 string bytes) — the caller must be LOUD: a
+    /// wrong or silently-skipped resolve is the failure the tree exists
+    /// to prevent.
+    pub(crate) fn map_entry_block_key(
+        &self,
+        entry: &crate::meta_backend::kv::block_map::MapEntry,
+    ) -> Option<String> {
+        use crate::meta_backend::kv::block_map::MapEntry;
+        match entry {
+            MapEntry::String(bytes) => std::str::from_utf8(bytes).ok().map(str::to_string),
+            MapEntry::Point { vol_tag, offset } => {
+                if crate::meta_backend::kv::block_refs::volume_tag(
+                    self.default_allocator.volume_id(),
+                ) == *vol_tag
+                {
+                    // The default slot's canonical bare-offset form.
+                    return Some(self.persist_block_key("backend_0", *offset));
+                }
+                for be in self.backends.iter() {
+                    if crate::meta_backend::kv::block_refs::volume_tag(
+                        be.value().block_allocator.volume_id(),
+                    ) == *vol_tag
+                    {
+                        return Some(self.persist_block_key(be.key(), *offset));
+                    }
+                }
+                None
+            }
+        }
+    }
+
+    /// PR 2 (kvmap): **the shared tree-7 extraction** — one ino's map
+    /// records as `(index, block-key string)` pairs, paged off `kv`
+    /// (volume-LOCAL ino, the identity the records key on). BOTH C8
+    /// oracle sides ride this (the fsck census and the derived
+    /// recovery/census walk — Rev 1.1 #2/#3: an oracle that
+    /// re-implemented the extraction would only ever test the
+    /// re-implementation), as does the unlink teardown's block
+    /// enumeration. Unresolvable entries are loud and skipped — the
+    /// conservative direction for a walker (a skipped entry reads as
+    /// drift/leak, never as a second owner).
+    pub(crate) async fn kvmap_layout_entries(
+        &self,
+        kv: &crate::meta_backend::kv::backend::KvMetaBackend,
+        local_ino: u64,
+    ) -> Vec<(u32, String)> {
+        let mut out = Vec::new();
+        let mut cursor = 0u32;
+        loop {
+            let page = match kv.block_map_range(local_ino, cursor, 512).await {
+                Ok(p) => p,
+                Err(e) => {
+                    log::warn!(
+                        "kvmap extraction: tree-7 scan failed for local ino {local_ino}: {e} \
+                         (the walk's view is INCOMPLETE — fsck names the residue)"
+                    );
+                    break;
+                }
+            };
+            let Some(last) = page.last().map(|(i, _)| *i) else {
+                break;
+            };
+            for (idx, entry) in &page {
+                match self.map_entry_block_key(entry) {
+                    Some(k) => out.push((*idx, k)),
+                    None => log::warn!(
+                        "kvmap extraction: unresolvable map record at local ino {local_ino} \
+                         index {idx} ({entry:?}) — no mounted volume carries its tag"
+                    ),
+                }
+            }
+            let Some(next) = last.checked_add(1) else {
+                break;
+            };
+            cursor = next;
+        }
+        out
+    }
+
     /// **Durable block-reference recovery** (pre-RC engineering spec §6.2
     /// item 1) — seed every data volume's RAM refcount map, free list and
     /// allocation cursor from the DURABLE records, with **no inode-tree
@@ -2843,6 +2954,7 @@ impl BackendRouter {
             // entries in the async pass, never by blocking on a device read.
             let mut inline: Vec<(u64, Vec<(u32, String)>)> = Vec::new();
             let mut indirect: Vec<(u64, String)> = Vec::new();
+            let mut kvmap: Vec<u64> = Vec::new();
             crate::block_allocator::walk_live_layouts(kv, |ino, layout| {
                 if layout.file_type != "striped" && layout.file_type != "staged" {
                     return;
@@ -2864,11 +2976,26 @@ impl BackendRouter {
                     ));
                     indirect.push((ino, blob.to_string()));
                 }
+                // PR 2 (kvmap): a `kvmap:` head's entries live in tree 7 —
+                // the shared extraction resolves them in the async pass.
+                if layout
+                    .block_map_id
+                    .as_deref()
+                    .is_some_and(|id| id.starts_with(kvmap_head_prefix()))
+                {
+                    kvmap.push(ino);
+                }
                 if !entries.is_empty() {
                     inline.push((ino, entries));
                 }
             })
             .await?;
+            for ino in kvmap {
+                let entries = self.kvmap_layout_entries(kv, ino).await;
+                if !entries.is_empty() {
+                    inline.push((ino, entries));
+                }
+            }
 
             // The blobs' entries (a spilled map's references live in the
             // blob, not in the layout value).
@@ -5633,12 +5760,56 @@ impl DataRouter {
                         .block_map_id
                         .as_deref()
                         .is_some_and(|id| id.starts_with("indirect:"));
-                    let layout_delta_chain = if base_is_json || base_is_indirect {
+                    // PR 2: kvmap heads are layout-delta-INELIGIBLE by law
+                    // (design §2 — `decode_base_layout` refuses them).
+                    let base_is_kvmap = layout
+                        .block_map_id
+                        .as_deref()
+                        .is_some_and(|id| id.starts_with(kvmap_head_prefix()));
+                    let layout_delta_chain = if base_is_json || base_is_indirect || base_is_kvmap {
                         LAYOUT_DELTA_CHAIN_INELIGIBLE
                     } else {
                         0
                     };
                     let mut block_map = layout.block_map.clone();
+                    // PR 2 (kvmap, Rev 1.1 #4): a `kvmap:` head names NO
+                    // inline/blob map — resolve the whole map through the
+                    // TREE so a refetched ino never zero-reads and every
+                    // downstream authority (merge RMW base, save diff,
+                    // teardown enumeration) keeps the full-RAM-map
+                    // contract it holds today. The bounded/windowed read
+                    // economy is PR 3's; correctness only here.
+                    if base_is_kvmap {
+                        let mut map = std::collections::HashMap::new();
+                        let mut cursor = 0u32;
+                        loop {
+                            let page = backend.block_map_range(ino, cursor, 512).await?;
+                            let Some(last) = page.last().map(|(i, _)| *i) else {
+                                break;
+                            };
+                            for (idx, entry) in &page {
+                                let Some(key) = self.backend_router.map_entry_block_key(entry)
+                                else {
+                                    // A mapping we cannot resolve is loud
+                                    // corruption, never a fabricated hole.
+                                    return Err(SqueezefsError::Io(std::io::Error::new(
+                                        std::io::ErrorKind::InvalidData,
+                                        format!(
+                                            "ino {ino}: unresolvable kvmap record at index \
+                                             {idx} ({entry:?}) — refusing to serve a \
+                                             fabricated hole"
+                                        ),
+                                    )));
+                                };
+                                map.insert(*idx, key);
+                            }
+                            let Some(next) = last.checked_add(1) else {
+                                break;
+                            };
+                            cursor = next;
+                        }
+                        block_map = Some(map);
+                    }
                     if let Some(ref map_id) = layout.block_map_id {
                         if map_id.starts_with("indirect:") {
                             let block_key = map_id.strip_prefix("indirect:").unwrap();
@@ -6396,6 +6567,200 @@ impl DataRouter {
         Ok(Some((map, blob_key, layout.size)))
     }
 
+    /// **The kvmap arm of the save body** (PR 2, design §3): publish `ino`
+    /// through the block-map tree — the crossing train on a first
+    /// crossing / legacy-blob conversion, the same diff train on every
+    /// later save of a sticky `kvmap:` head.
+    ///
+    /// `Ok(None)` = the arm STOOD DOWN without consuming anything (a new
+    /// crossing whose local home volume has no engaged tree) — the caller
+    /// falls through to the legacy blob arm verbatim. Past that probe the
+    /// arm owns the publish: errors refill the drained accounting and
+    /// zero the chain provenance (the delta arm's never-lossy
+    /// discipline), and success republishes the RAM entry with the map
+    /// kept WARM (the crossing must not cold the mount).
+    async fn kvmap_publish(
+        &self,
+        ino: u64,
+        m: &CachedMetadata,
+        fencing_token: u64,
+        is_publish: bool,
+        block_refs: &[crate::meta_backend::kv::block_refs::BlockRefOp],
+        head_is_kvmap: bool,
+    ) -> Result<Option<(bool, Vec<crate::meta_backend::kv::block_refs::BlockRef>)>> {
+        let backend = self.inner.meta_backend.get().ok_or_else(|| {
+            SqueezefsError::InvalidOperation("Metadata backend not initialized".to_string())
+        })?;
+        // The engagement gate for a NEW crossing: LOCAL publishes probe
+        // the home volume (an un-stamped volume keeps the legacy blob arm
+        // verbatim — stamping is an explicit act, the D9 caution), and a
+        // FOREIGN-HOME new crossing stands down entirely: a co-writer can
+        // neither read the owner's superblock nor decide its format
+        // posture, and self-arming the owner from the wire would flip
+        // every mw fleet's blob lifecycle by default (the finding-23/33
+        // contracts). The ino crosses when the AUTHORITY's own save does;
+        // the co-writer then follows the STICKY head (A10 force-kvmap),
+        // shipping the A4 verb below — which is how a co-writer never
+        // runs the local train.
+        let local = crate::meta_ship::publish::publishes_locally(backend, ino);
+        if !head_is_kvmap && !(local && backend.block_map_tree_engaged(ino)) {
+            return Ok(None);
+        }
+        // The whole current map is the train's input. A kvmap head with
+        // NO map authority must refuse — diffing against an absent map
+        // would mass-delete live records (an empty map is `Some(empty)`,
+        // never `None`, on every merge/truncate path).
+        let Some(map) = m.block_map.as_deref() else {
+            return Err(SqueezefsError::InvalidOperation(format!(
+                "kvmap publish for ino {ino}: the RAM entry carries no block map — \
+                 refusing to reconcile the tree against an absent authority"
+            )));
+        };
+        let mut entries: Vec<(u32, String)> = map.iter().map(|(b, k)| (*b, k.clone())).collect();
+        entries.sort_unstable_by_key(|&(b, _)| b);
+
+        // The deferred accounting drains exactly as the legacy path does
+        // (older than this call's own ops), and the finding-38 chunk law
+        // pre-commits over-cap loads on the LOCAL arm; a SHIPPED crossing
+        // carries its WHOLE claim set on the verb (finding 36b — the
+        // owner runs the journal-entry-cap chunking).
+        let deferred = self.take_block_ref_ops(ino);
+        let mut refs: Vec<crate::meta_backend::kv::block_refs::BlockRefOp> =
+            Vec::with_capacity(deferred.len() + block_refs.len() + 1);
+        refs.extend(deferred);
+        refs.extend_from_slice(block_refs);
+        const BLOCK_REF_TX_CHUNK: usize = 512;
+        while local && refs.len() > BLOCK_REF_TX_CHUNK {
+            let tail = refs.split_off(BLOCK_REF_TX_CHUNK);
+            let chunk = std::mem::replace(&mut refs, tail);
+            if let Err(e) = crate::meta_ship::publish::commit_block_refs(backend, ino, &chunk).await
+            {
+                let mut refill = chunk;
+                refill.append(&mut refs);
+                self.note_block_ref_ops(ino, refill);
+                return Err(e);
+            }
+        }
+
+        // Legacy-blob CONVERSION (design §2): the flip stops naming the
+        // blob — its MAP_BLOB record releases IN the flip tx and the
+        // device block frees on the existing post-commit tail. The
+        // finding-23/24 foreign-lifecycle skip applies verbatim.
+        let foreign_blob_lifecycle = crate::fuse_client::co_writer_mount()
+            && !crate::cowriter::authority_accounting_scope_active()
+            && crate::meta_ship::tokens::range_episode(ino)
+            && !m.block_map_id_own_mint;
+        let mut old_indirect_to_free = None;
+        if let Some(old_blob) = m
+            .block_map_id
+            .as_deref()
+            .and_then(|id| id.strip_prefix("indirect:"))
+        {
+            if foreign_blob_lifecycle {
+                METRICS
+                    .publish_blob_foreign_free_skips
+                    .fetch_add(1, Ordering::Relaxed);
+            } else {
+                match self.backend_router.block_ref_for(
+                    old_blob,
+                    ino,
+                    crate::meta_backend::kv::block_refs::BLOCK_INDEX_MAP_BLOB,
+                ) {
+                    Some(r) => {
+                        refs.push(crate::meta_backend::kv::block_refs::BlockRefOp::released(r))
+                    }
+                    None => {
+                        crate::meta_backend::kv::META_KV_BLOCK_REFS_UNRESOLVED
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+                old_indirect_to_free = Some(old_blob.to_string());
+            }
+        }
+
+        // The ~100 B head: `kvmap:1`, no inline map (design §2).
+        let head = LayoutMetadata {
+            file_type: m.file_type.to_string(),
+            size: m.size,
+            block_map_id: Some(
+                crate::meta_backend::kv::block_map::KvmapHead { sweep_cursor: None }.encode(),
+            ),
+            block_prefix: m.block_prefix.as_deref().map(str::to_string),
+            file_id: m.file_id.as_deref().map(str::to_string),
+            data_key: m.data_key.as_ref().map(|b| b.to_vec()),
+            block_map: None,
+        };
+        let bytes = bincode::serialize(&head).map_err(|e| {
+            SqueezefsError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("Failed to serialize kvmap head layout: {e}"),
+            ))
+        })?;
+
+        let t_commit = std::time::Instant::now();
+        let refill = refs.clone();
+        let outcome = match crate::meta_ship::publish::migrate_block_map(
+            backend,
+            ino,
+            &bytes,
+            m.size,
+            entries,
+            refs,
+            map_migrate_chunk(),
+        )
+        .await
+        {
+            Ok(o) => o,
+            Err(e) => {
+                // Never-lossy refill + zeroed provenance (the delta arm's
+                // failure discipline verbatim).
+                self.note_block_ref_ops(ino, refill);
+                self.reset_layout_provenance(ino);
+                return Err(e);
+            }
+        };
+        if is_publish {
+            publish_phase_record(PublishPhase::MetaCommit, t_commit);
+        }
+        METRICS
+            .map_migrate_records
+            .fetch_add(outcome.records, Ordering::Relaxed);
+        METRICS
+            .publish_map_record_bytes
+            .fetch_add(outcome.record_bytes, Ordering::Relaxed);
+        if !head_is_kvmap {
+            METRICS.map_migrate_inos.fetch_add(1, Ordering::Relaxed);
+            if outcome.preexisting > 0 {
+                // A1's engagement: a FIRST crossing found a crashed prior
+                // train's residue and reconciled it.
+                METRICS.map_migrate_resumed.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+
+        // The republish: the head is now `kvmap:1`, delta-ineligible
+        // (Rev 1.1 #5 sticky), and the map stays WARM in RAM — the
+        // crossing must not cold the mount (`m.clone()` carries it).
+        let mut cached = m.clone();
+        cached.layout_delta_chain = LAYOUT_DELTA_CHAIN_INELIGIBLE;
+        cached.block_map_id = head.block_map_id.clone().map(Into::into);
+        cached.cached_at = std::time::Instant::now();
+        cached.layout_base_token = fencing_token;
+        cached.layout_version = 0;
+        // No blob exists behind a kvmap head — nothing to own-mint.
+        cached.block_map_id_own_mint = false;
+        self.publish_layout_cache_entry(ino, cached);
+
+        // The conversion's displaced blob rides the existing post-commit
+        // free tail (RES-1: an enqueue-class free, never a device command
+        // under the caller's 3.5 stripe).
+        if let Some(ref old_key) = old_indirect_to_free {
+            let _ = self.backend_router.free_block(old_key).await;
+        }
+        // Finding 36: a kvmap publish is never owner-recomputed.
+        let _ = self.inner.publish_recomputed.remove_sync(&ino);
+        Ok(Some((false, Vec::new())))
+    }
+
     /// Returns the finding-36 verdict pair: `.0` = the publish's staged
     /// accounting was RECOMPUTED (a shipped merge/Put the owner recomputed,
     /// or — finding 36b — a LOCAL recomputed arm), so the caller's
@@ -6548,6 +6913,28 @@ impl DataRouter {
         };
         if is_publish {
             publish_phase_record(PublishPhase::SaveEncode, t_encode);
+        }
+
+        // PR 2 (kvmap, design §3): the crossing decision is a 3-way.
+        // An existing `kvmap:` head is FORCE-kvmap regardless of the knob
+        // (A10 — heads are STICKY, Rev 1.1 #5: a shrinking map never
+        // collapses back inline; collapse would need its own sweep tx and
+        // buys nothing at a ~100 B head). A NEW beyond-inline crossing
+        // takes the tree where the knob is on AND the arm can engage —
+        // `kvmap_publish` stands down (`Ok(None)`) without consuming
+        // anything when it cannot, and the legacy blob arm below runs
+        // verbatim.
+        let head_is_kvmap = m
+            .block_map_id
+            .as_deref()
+            .is_some_and(|id| id.starts_with(kvmap_head_prefix()));
+        if head_is_kvmap || (needs_indirect && kvmap_enabled()) {
+            if let Some(verdict) = self
+                .kvmap_publish(ino, m, fencing_token, is_publish, block_refs, head_is_kvmap)
+                .await?
+            {
+                return Ok(verdict);
+            }
         }
 
         // Finding 23 (`.benchmarks/2026-08-25-s11-freeloop-stall.md`): on a
@@ -6768,10 +7155,12 @@ impl DataRouter {
             && max_chain > 0
             && (m.layout_delta_chain < max_chain
                 || (merge_chained && m.layout_delta_chain != LAYOUT_DELTA_CHAIN_INELIGIBLE))
-            && !m
-                .block_map_id
-                .as_deref()
-                .is_some_and(|id| id.starts_with("indirect:"));
+            // PR 2: kvmap heads are delta-INELIGIBLE by law (design §2) —
+            // the early kvmap arm owns them, and `decode_base_layout`'s
+            // refusal is the backend half of the same guard.
+            && !m.block_map_id.as_deref().is_some_and(|id| {
+                id.starts_with("indirect:") || id.starts_with(kvmap_head_prefix())
+            });
         // Finding 36b (the CHUNK hole — the s11-mpiio store exhaustion):
         // a SHIPPED full-save's claims are the owner's scoped-compose
         // INPUT (finding 35: adoption/removal follow the claim sets), so
@@ -16694,6 +17083,7 @@ impl DataRouter {
             }
         }
 
+        let mut kvmap_head = false;
         if let Some(ref map_id) = meta.block_map_id {
             if map_id.starts_with("indirect:") {
                 let block_key = map_id.strip_prefix("indirect:").unwrap();
@@ -16703,6 +17093,11 @@ impl DataRouter {
                     false,
                 ));
                 blocks_to_free.push(block_key.to_string());
+            } else if map_id.starts_with(kvmap_head_prefix()) {
+                // PR 2 (Rev 1.1 #4): the corpse's tree-7 records are swept
+                // below — there is no blob to free; the data blocks ride
+                // `meta.block_map` (the fetch rehydrated the full map).
+                kvmap_head = true;
             }
         }
 
@@ -16802,6 +17197,23 @@ impl DataRouter {
                 log::warn!(
                     "durable block-reference release failed for reclaimed ino {ino}: {e}                      (the corpse's references survive — fsck C2/C8 reclaim them; the                      blocks themselves are freed below)"
                 );
+            }
+        }
+
+        // PR 2 (kvmap, Rev 1.1 #4): the corpse's tree-7 records — the
+        // bounded synchronous sweep (chunked deletes under one 4a guard),
+        // NEVER silent residue: a failure is loud and the records stay
+        // for fsck to name (leak-safe — they reference blocks the frees
+        // below reclaim, so the worst residue is a stale record, exactly
+        // the class the A1 crossing prologue re-sweeps).
+        if kvmap_head {
+            if let Some(backend) = self.inner.meta_backend.get() {
+                if let Err(e) = backend.sweep_block_map(ino, map_migrate_chunk()).await {
+                    log::warn!(
+                        "kvmap record sweep failed for reclaimed ino {ino}: {e} — residue \
+                         stays visible to fsck, never silently dropped"
+                    );
+                }
             }
         }
 

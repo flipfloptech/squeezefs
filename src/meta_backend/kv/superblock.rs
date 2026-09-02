@@ -1459,6 +1459,18 @@ pub async fn set_layout_deltas_bit(path: &Path) -> Result<bool, KvError> {
     set_incompat_bit(path, FEATURE_INCOMPAT_KV_LAYOUT_DELTAS, "layout-deltas").await
 }
 
+/// Stamp [`FEATURE_INCOMPAT_KV_BLOCK_MAP_TREE`] on `path`'s superblock —
+/// step **(1)** of the bit-before-first-map-record ordering invariant
+/// (design-kvmap-block-map-tree §2, the bit-5 precedent): callers must
+/// let the write land durably (the backend barriers with `sync_device`)
+/// **before** the volume's first `TREE_BLOCK_MAP` record is written.
+/// Stamp-then-crash is inert: an old binary refuses the volume outright,
+/// and the next mount of this binary mints the missing tree-7 root from
+/// the ledger gap with zero records staged.
+pub async fn set_block_map_tree_bit(path: &Path) -> Result<bool, KvError> {
+    set_incompat_bit(path, FEATURE_INCOMPAT_KV_BLOCK_MAP_TREE, "block-map-tree").await
+}
+
 /// Stamp [`FEATURE_INCOMPAT_KV_LAYOUT_VERSIONS`] on `path`'s superblock —
 /// the §6.2 item-9 upgrade path (the batched Phase-8 reformat window;
 /// **mount NEVER calls this**, ruling D9). Returns whether the bit was

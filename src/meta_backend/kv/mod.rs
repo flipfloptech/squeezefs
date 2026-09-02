@@ -289,21 +289,18 @@ pub static META_KV_BLOCK_REFS_UNRESOLVED: AtomicU64 = AtomicU64::new(0);
 /// records **staged** as `Put`s into layout transactions — one per
 /// mapping bound. Rides the publish tx (design §3: one conveyor pass =
 /// one journal entry), so a flat counter under a crossing/publish storm
-/// means the wiring regressed to the blob path. Surfaced on the stats
-/// inode when PR 2 wires the crossing; until then read by
-/// `tests/kvmap_tree_tests.rs`.
+/// means the wiring regressed to the blob path. Surfaced as
+/// `meta_kv_block_map_puts` (PR 2).
 pub static META_KV_BLOCK_MAP_PUTS: AtomicU64 = AtomicU64::new(0);
 
 /// PB-class files, PR 1: block-map records **staged** as `Delete`s (one
-/// per mapping removed — displacement, the A1 residue sweep, the A2
-/// truncate sweep's chunks). Surfaced with the PR 2 wiring; until then
-/// read by `tests/kvmap_tree_tests.rs`.
+/// per mapping removed — displacement, the A1 residue sweep, the unlink
+/// sweep's chunks). Surfaced as `meta_kv_block_map_deletes` (PR 2).
 pub static META_KV_BLOCK_MAP_DELETES: AtomicU64 = AtomicU64::new(0);
 
 /// PB-class files, PR 1: block-map resolution passes served THROUGH the
 /// tree (`get_block_mapping` exact lookups + `block_map_range` windows).
-/// Surfaced with the PR 2 wiring; until then read by
-/// `tests/kvmap_tree_tests.rs`.
+/// Surfaced as `meta_kv_block_map_lookups` (PR 2).
 pub static META_KV_BLOCK_MAP_LOOKUPS: AtomicU64 = AtomicU64::new(0);
 
 /// PR M6 (design-metadata-throughput §5.4 D4): kernel post-op ctime

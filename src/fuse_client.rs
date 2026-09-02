@@ -5734,6 +5734,20 @@ pub struct Metrics {
     /// Bytes DMA'd to indirect map blobs by publish-class saves (the
     /// `blob_write` phase's byte face).
     pub publish_indirect_blob_bytes: Align64<AtomicU64>,
+    /// kvmap PR 2: tree-7 map-record bytes staged by kvmap-class saves —
+    /// the blob-byte counter's tree twin (`publish_indirect_blob_bytes`
+    /// must trend to 0 on converted volumes while this grows).
+    pub publish_map_record_bytes: Align64<AtomicU64>,
+    /// kvmap PR 2: crossings COMPLETED (head flipped to `kvmap:1`) —
+    /// first crossings and legacy-blob conversions alike.
+    pub map_migrate_inos: Align64<AtomicU64>,
+    /// kvmap PR 2: map operations (Puts + Deletes) the crossing trains
+    /// staged.
+    pub map_migrate_records: Align64<AtomicU64>,
+    /// kvmap PR 2: first crossings whose A1 diff found PRE-EXISTING
+    /// tree-7 records — a crashed prior train's residue reconciled
+    /// (silent-wrong-data class had the sweep not run).
+    pub map_migrate_resumed: Align64<AtomicU64>,
     /// Indirect block-map rehydrates (whole-block device READS on the
     /// meta-fetch path — publish-pass base fetches, cold meta reads).
     pub layout_indirect_map_reads: Align64<AtomicU64>,
@@ -10025,6 +10039,10 @@ impl SqueezefsFilesystem {
                 "publish_full_save_chain_cap": METRICS.publish_full_save_chain_cap.load(Ordering::Relaxed),
                 "publish_full_save_other": METRICS.publish_full_save_other.load(Ordering::Relaxed),
                 "publish_indirect_blob_bytes": METRICS.publish_indirect_blob_bytes.load(Ordering::Relaxed),
+                "publish_map_record_bytes": METRICS.publish_map_record_bytes.load(Ordering::Relaxed),
+                "map_migrate_inos": METRICS.map_migrate_inos.load(Ordering::Relaxed),
+                "map_migrate_records": METRICS.map_migrate_records.load(Ordering::Relaxed),
+                "map_migrate_resumed": METRICS.map_migrate_resumed.load(Ordering::Relaxed),
                 "layout_indirect_map_reads": METRICS.layout_indirect_map_reads.load(Ordering::Relaxed),
                 "layout_indirect_map_read_bytes": METRICS.layout_indirect_map_read_bytes.load(Ordering::Relaxed),
                 "publish_blob_composes": METRICS.publish_blob_composes.load(Ordering::Relaxed),
@@ -10849,6 +10867,21 @@ impl SqueezefsFilesystem {
                 metrics.insert(
                     "meta_kv_block_refs_unresolved".into(),
                     load(&meta_kv::META_KV_BLOCK_REFS_UNRESOLVED),
+                );
+                // kvmap PR 2: the tree-7 staging/resolution family
+                // (design §5's gauges — puts/deletes are the crossing +
+                // steady-publish engagement, lookups the read bridge's).
+                metrics.insert(
+                    "meta_kv_block_map_puts".into(),
+                    load(&meta_kv::META_KV_BLOCK_MAP_PUTS),
+                );
+                metrics.insert(
+                    "meta_kv_block_map_deletes".into(),
+                    load(&meta_kv::META_KV_BLOCK_MAP_DELETES),
+                );
+                metrics.insert(
+                    "meta_kv_block_map_lookups".into(),
+                    load(&meta_kv::META_KV_BLOCK_MAP_LOOKUPS),
                 );
                 metrics.insert(
                     "meta_kv_commit_smo_retries".into(),

@@ -139,6 +139,8 @@ pub static KNOBS: &[Knob] = &[
     k("SQUEEZEFS_PUBLISH_COALESCE_MAX", int(0, 1 << 20), "64", "Per-ino publish-coalescing window; 1 = the pre-campaign serialized posture (A/B lever)."),
     k("SQUEEZEFS_LAYOUT_DELTA_MAX_CHAIN", int(0, 1 << 20), "64", "Layout delta-record chain cap before a full re-base save; 0 = full saves only (A/B lever)."),
     k("SQUEEZEFS_PUBLISH_COMMIT_GROUP_MAX", int(0, 1 << 20), "0 (derives from META_COMMIT_BATCH_TXS)", "Layout saves aggregated into one multi-ino KvTx per conveyor window; 1 = per-save commits (A/B lever)."),
+    k("SQUEEZEFS_KVMAP", Kind::Bool, "on", "PB-class block-map tree (design-kvmap-block-map-tree, PR 2): whether NEW beyond-inline crossings take the tree-7 kvmap arm where the ino's home volume can engage it. 0 = new crossings take the legacy indirect-blob arm — the A/B lever, and it NEVER disables kvmap-head resolution (A10: an existing kvmap: head is force-kvmap regardless)."),
+    k("SQUEEZEFS_MAP_MIGRATE_CHUNK", int(64, 1024), "512", "kvmap crossing-train ops per transaction (the finding-38 BLOCK_REF_TX_CHUNK law). The registry cap keeps a mis-set knob under the 128 KiB whole-journal-entry admission (design A10)."),
     // -- Write path ------------------------------------------------------
     k("SQUEEZEFS_PATCH_MAX_BYTES", int(0, BYTES_MAX), "derived block_size/8", "W1 sole-owner in-place patch ceiling, bytes; 0 = the acceptance A/B lever."),
     k("SQUEEZEFS_FOLD_MAX_EXTENTS", int(0, 1 << 24), "64", "W2 fold trigger: parked extents per block."),

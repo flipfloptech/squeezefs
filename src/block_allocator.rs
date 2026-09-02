@@ -3058,12 +3058,16 @@ impl BlockAllocator {
     ) -> Result<std::collections::BTreeMap<u64, u32>> {
         let mut census: std::collections::BTreeMap<u64, u32> = std::collections::BTreeMap::new();
         let mut indirect: Vec<String> = Vec::new();
-        self.walk_live_layouts(kv, |layout| {
+        let mut kvmap: Vec<u64> = Vec::new();
+        self.walk_live_layouts(kv, |ino, layout| {
             let (mut owned, mut blobs) = self.layout_owned_blocks(backend_router, layout);
             for idx in owned.drain(..) {
                 *census.entry(idx).or_insert(0) += 1;
             }
             indirect.append(&mut blobs);
+            if layout_is_kvmap(layout) {
+                kvmap.push(ino);
+            }
         })
         .await?;
         // The indirect blobs' ENTRIES need device reads, which cannot run
@@ -3072,6 +3076,16 @@ impl BlockAllocator {
         for key in indirect {
             for idx in self.indirect_owned_blocks(backend_router, &key).await {
                 *census.entry(idx).or_insert(0) += 1;
+            }
+        }
+        // PR 2 (kvmap, Rev 1.1 #3): a `kvmap:` head's entries live in
+        // tree 7 — the SHARED extraction resolves them, so the oracle's
+        // derived side and the fsck census cannot drift apart.
+        for ino in kvmap {
+            for (_b, key) in backend_router.kvmap_layout_entries(kv, ino).await {
+                if let Some(offset) = self.owned_offset(backend_router, &key) {
+                    *census.entry(offset / self.chunk_size).or_insert(0) += 1;
+                }
             }
         }
         Ok(census)
@@ -3106,15 +3120,30 @@ impl BlockAllocator {
         // synchronous visitor.
         let mut indices: Vec<u64> = Vec::new();
         let mut indirect: Vec<String> = Vec::new();
+        let mut kvmap: Vec<u64> = Vec::new();
         let summary = self
-            .walk_live_layouts(kv, |layout| {
+            .walk_live_layouts(kv, |ino, layout| {
                 let (owned, mut blobs) = self.layout_owned_blocks(backend_router, layout);
                 indices.extend(owned);
                 indirect.append(&mut blobs);
+                if layout_is_kvmap(layout) {
+                    kvmap.push(ino);
+                }
             })
             .await?;
         for key in indirect {
             indices.extend(self.indirect_owned_blocks(backend_router, &key).await);
+        }
+        // PR 2 (kvmap, Rev 1.1 #2 — pulled-forward safety): a `kvmap:`
+        // head yielding ZERO owned blocks would let gap-completion
+        // free-list LIVE data on a derived (bit-9-absent) mount — the
+        // tree-7 arm is mandatory HERE, not in the walkers PR.
+        for ino in kvmap {
+            for (_b, key) in backend_router.kvmap_layout_entries(kv, ino).await {
+                if let Some(offset) = self.owned_offset(backend_router, &key) {
+                    indices.push(offset / self.chunk_size);
+                }
+            }
         }
         for idx in indices {
             let _ = self.recover_block(idx).await;
@@ -3130,17 +3159,19 @@ impl BlockAllocator {
         Ok(())
     }
 
-    /// [`walk_live_layouts`] bound to this allocator (the visitor sees only
-    /// the layout — the seed and the oracle key on blocks, not inodes).
+    /// [`walk_live_layouts`] bound to this allocator. The visitor gets the
+    /// volume-LOCAL ino too (PR 2): a `kvmap:` head's entries live in
+    /// tree-7 records keyed on it, so the kvmap async pass needs the ino
+    /// the layout alone no longer carries.
     async fn walk_live_layouts<F>(
         &self,
         kv: &crate::meta_backend::kv::backend::KvMetaBackend,
-        mut visit: F,
+        visit: F,
     ) -> Result<LayoutWalkSummary>
     where
-        F: FnMut(&crate::routing::LayoutMetadata),
+        F: FnMut(u64, &crate::routing::LayoutMetadata),
     {
-        walk_live_layouts(kv, |_ino, layout| visit(layout)).await
+        walk_live_layouts(kv, visit).await
     }
 
     /// Every block index on THIS volume that `layout` durably references
@@ -3351,6 +3382,18 @@ pub(crate) async fn collect_corpse_inos(
 /// §6.2-item-1 **backfill**. A free function precisely because it touches
 /// no allocator state — an allocator-bound copy would invite one of the
 /// three to drift.
+/// PR 2 (kvmap): does this layout's map live in the block-map tree (a
+/// `kvmap:` head)? The `layout_owned_blocks` file-type gate applies to
+/// the tree arm too — only striped/staged layouts carry durable block
+/// references.
+fn layout_is_kvmap(layout: &crate::routing::LayoutMetadata) -> bool {
+    (layout.file_type == "striped" || layout.file_type == "staged")
+        && layout
+            .block_map_id
+            .as_deref()
+            .is_some_and(|id| id.starts_with(crate::meta_backend::kv::block_map::KVMAP_HEAD_PREFIX))
+}
+
 pub(crate) async fn walk_live_layouts<F>(
     kv: &crate::meta_backend::kv::backend::KvMetaBackend,
     mut visit: F,

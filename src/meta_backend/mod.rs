@@ -3272,6 +3272,75 @@ impl RoutedMetaBackend {
         out
     }
 
+    /// PR 2 (kvmap): is the block-map tree engaged on `ino`'s HOME volume
+    /// (incompat bit 16 stamped, tree mounted)? The crossing decision's
+    /// probe — `false` keeps the legacy indirect-blob arm.
+    pub fn block_map_tree_engaged(&self, ino: Ino) -> bool {
+        let (v_idx, _) = self.route_ino(ino);
+        self.volumes[v_idx].block_map_tree_engaged()
+    }
+
+    /// PR 2 (kvmap): a bounded window of `ino`'s tree-7 mappings from
+    /// `from_index` upward, routed to its home volume (records key on the
+    /// volume-LOCAL ino — the `inode_key` identity the per-volume walkers
+    /// join against layout heads).
+    pub async fn block_map_range(
+        &self,
+        ino: Ino,
+        from_index: u32,
+        max: usize,
+    ) -> Result<Vec<(u32, crate::meta_backend::kv::block_map::MapEntry)>> {
+        let (v_idx, local_ino) = self.route_ino(ino);
+        self.check_volume_enabled(v_idx)?;
+        self.volumes[v_idx]
+            .block_map_range(local_ino, from_index, max)
+            .await
+            .map_err(|e| {
+                crate::error::SqueezefsError::InvalidOperation(format!(
+                    "block-map range for ino {ino} failed: {e}"
+                ))
+            })
+    }
+
+    /// PR 2 (kvmap): the crossing/migration train, routed to `ino`'s home
+    /// volume (see [`kv::backend::KvMetaBackend::migrate_block_map_train`]).
+    /// The publish class of [`Self::set_layout_and_size`] — same
+    /// delegation + cutover gates.
+    pub async fn migrate_block_map_train(
+        &self,
+        ino: Ino,
+        layout: &[u8],
+        size: u64,
+        block_refs: &[crate::meta_backend::kv::block_refs::BlockRefOp],
+        entries: &[(u32, String)],
+        chunk: usize,
+    ) -> Result<Option<crate::meta_backend::kv::backend::MapMigrateOutcome>> {
+        let _deleg_gate = crate::meta_ship::deleg_mutation_gate(self, &[ino]).await;
+        let _gate = self.slot_gate_enter(&[ino]).await;
+        let (v_idx, local_ino) = self.route_ino(ino);
+        self.check_volume_enabled(v_idx)?;
+        let out = self.volumes[v_idx]
+            .migrate_block_map_train(local_ino, layout, size, block_refs, entries, chunk)
+            .await;
+        if out.is_err() {
+            self.mirror_volume_failure(v_idx);
+        }
+        out
+    }
+
+    /// PR 2 (kvmap): the unlink-side bounded record sweep, routed to
+    /// `ino`'s home volume (never silent residue — Rev 1.1 #4).
+    pub async fn sweep_block_map(&self, ino: Ino, chunk: usize) -> Result<u64> {
+        let _gate = self.slot_gate_enter(&[ino]).await;
+        let (v_idx, local_ino) = self.route_ino(ino);
+        self.check_volume_enabled(v_idx)?;
+        let out = self.volumes[v_idx].sweep_block_map(local_ino, chunk).await;
+        if out.is_err() {
+            self.mirror_volume_failure(v_idx);
+        }
+        out
+    }
+
     /// Write-commit-economy campaign: [`Self::set_layout_and_size`] with
     /// a layout **delta** carrying the publish batch — the volume stages
     /// an O(batch) delta record where a live inline base exists, the

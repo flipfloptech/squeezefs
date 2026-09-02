@@ -675,7 +675,12 @@ pub struct KvMetaBackend {
     /// [`Self::trees`] (digest walk / migration keyspace / fsck stay
     /// defined over the three user trees until PR 4's walkers), included
     /// in [`Self::all_trees`] for checkpoint/roots/maintenance.
-    block_map: Option<KvTree>,
+    ///
+    /// A `OnceLock` (PR 2), not an `Option`: the bit-16 ratchet
+    /// ([`Self::block_map_tree_ready`]) can stamp+mint AT RUNTIME on the
+    /// owner-served crossing path, and engagement is monotone for the
+    /// mount's life either way.
+    block_map: std::sync::OnceLock<KvTree>,
     alloc: Arc<ExtentAllocator>,
     /// §4.8 monotonic watermark, recovered at mount; the create path
     /// `fetch_add`s it.
@@ -762,6 +767,17 @@ pub struct KvMetaBackend {
     /// Serializes the one-time incompat ratchet (sector-0 RMW must not
     /// race itself); contended at most once per volume lifetime.
     layout_delta_ratchet: crate::sqz_sync::SqzMutex<()>,
+    /// PR 2 (kvmap): serializes the one-time bit-16 stamp + tree-7 mint
+    /// ([`Self::block_map_tree_ready`]) — the `layout_delta_ratchet`
+    /// discipline, its own mutex so the two one-shot ratchets never
+    /// serialize each other.
+    block_map_ratchet: crate::sqz_sync::SqzMutex<()>,
+    /// PR 2 (kvmap): inos whose crossing train is IN FLIGHT on this
+    /// volume (design A3 — the future fsck C11 exemption registry, the
+    /// C2/C3 `inflight_exempted` pattern). Registered before the A1
+    /// sweep, deregistered after the head flip; keyed on the volume-local
+    /// ino the map records key on.
+    crossing_inflight: scc::HashMap<Ino, ()>,
     // ---- PR M7: the §5.5 D5 commit conveyor ----
     /// The per-volume conveyor: all user commits enqueue here; a
     /// leader-elect committer spawns the detached pass task that drains
@@ -2078,7 +2094,13 @@ impl KvMetaBackend {
             dentries,
             xattrs,
             block_refs,
-            block_map,
+            block_map: {
+                let cell = std::sync::OnceLock::new();
+                if let Some(t) = block_map {
+                    let _ = cell.set(t);
+                }
+                cell
+            },
             alloc,
             next_ino: AtomicU64::new(next_ino),
             era_ino_floor_native: next_ino,
@@ -2100,6 +2122,8 @@ impl KvMetaBackend {
             stalls: AtomicU64::new(0),
             layout_deltas_ok: AtomicBool::new(layout_deltas_stamped),
             layout_delta_ratchet: crate::sqz_sync::SqzMutex::new(()),
+            block_map_ratchet: crate::sqz_sync::SqzMutex::new(()),
+            crossing_inflight: scc::HashMap::new(),
             conveyor: Arc::new(ConveyorCore::new()),
             conveyor_self: std::sync::OnceLock::new(),
             layout_conveyor: Arc::new(ConveyorCore::new()),
@@ -2691,7 +2715,7 @@ impl KvMetaBackend {
         if let Some(t) = self.block_refs.as_ref() {
             v.push(t);
         }
-        if let Some(t) = self.block_map.as_ref() {
+        if let Some(t) = self.block_map.get() {
             v.push(t);
         }
         v
@@ -2788,7 +2812,7 @@ impl KvMetaBackend {
     /// existed — and staging a map record refuses loud
     /// ([`Self::set_layout_and_size_with_map`]).
     pub fn block_map_tree_engaged(&self) -> bool {
-        self.block_map.is_some()
+        self.block_map.get().is_some()
     }
 
     /// PB-class files, PR 1 (design §3 read law, the exact-key half):
@@ -2805,7 +2829,7 @@ impl KvMetaBackend {
         ino: Ino,
         block_index: u32,
     ) -> std::result::Result<Option<super::block_map::MapEntry>, KvError> {
-        let Some(tree) = self.block_map.as_ref() else {
+        let Some(tree) = self.block_map.get() else {
             return Ok(None);
         };
         super::META_KV_BLOCK_MAP_LOOKUPS.fetch_add(1, Ordering::Relaxed);
@@ -2833,7 +2857,7 @@ impl KvMetaBackend {
         from_index: u32,
         max: usize,
     ) -> std::result::Result<Vec<(u32, super::block_map::MapEntry)>, KvError> {
-        let Some(tree) = self.block_map.as_ref() else {
+        let Some(tree) = self.block_map.get() else {
             return Ok(Vec::new());
         };
         super::META_KV_BLOCK_MAP_LOOKUPS.fetch_add(1, Ordering::Relaxed);
@@ -2852,6 +2876,260 @@ impl KvMetaBackend {
             out.push((index, super::block_map::decode_block_map_value(v)?));
         }
         Ok(out)
+    }
+
+    /// Is `ino`'s crossing train in flight on this volume? Exported for
+    /// the future fsck **C11** map-plane class (design A3: an incomplete
+    /// pass records no verdict for a registered ino — the C2/C3
+    /// `inflight_exempted` pattern); the PR 2 contract tests consume it.
+    pub fn crossing_in_flight(&self, ino: Ino) -> bool {
+        self.crossing_inflight.contains_sync(&ino)
+    }
+
+    /// The one-time **bit-16 ratchet + tree-7 mint** (PR 2, the
+    /// `layout_deltas_ready` shape): the bit is durable — and barriered —
+    /// BEFORE the volume's first map record can be (design §2, the KD-14
+    /// bit-before-durable-record ordering), and the tree root is minted
+    /// live (the open path's post-stamp first-mount mint, run at runtime;
+    /// stamp-then-crash is inert — the next mount mints from the ledger
+    /// gap and replay folds any journaled record into the fresh root by
+    /// key). `false` = the ratchet could not complete — the caller falls
+    /// back to the legacy indirect-blob arm (never block writes on it).
+    ///
+    /// Reachable un-engaged only through the SHIPPED crossing's owner
+    /// executor: local crossings pre-probe [`Self::block_map_tree_engaged`]
+    /// (an un-stamped local volume keeps the legacy arm — stamping a
+    /// volume is otherwise an explicit act), while a co-writer cannot
+    /// read the owner's superblock, so the owner self-arms at its first
+    /// served crossing.
+    pub async fn block_map_tree_ready(&self) -> bool {
+        if self.block_map.get().is_some() {
+            return true;
+        }
+        if self.read_only {
+            return false;
+        }
+        let _g = self.block_map_ratchet.lock().await;
+        if self.block_map.get().is_some() {
+            return true;
+        }
+        match super::superblock::set_block_map_tree_bit(&self.path).await {
+            Ok(_newly_set) => {
+                // Barrier the sector-0 write before any map record can
+                // become durable (same device — one fdatasync covers it).
+                if let Err(e) = self.sync_device().await {
+                    log::warn!(
+                        "meta volume {}: block-map-tree ratchet barrier failed ({e}); \
+                         staying on the indirect-blob path",
+                        self.path.display()
+                    );
+                    return false;
+                }
+                let seq = self.inodes.seq_handle();
+                let mut smo = self.smo.lock().await;
+                match KvTree::create(
+                    self.cache.clone(),
+                    &mut smo,
+                    super::record::TREE_BLOCK_MAP,
+                    seq,
+                )
+                .await
+                {
+                    Ok(tree) => {
+                        let _ = self.block_map.set(tree);
+                        log::info!(
+                            "meta volume {}: incompat bit 16 (block-map tree) stamped and \
+                             the tree-7 root minted (the first crossing's ratchet)",
+                            self.path.display()
+                        );
+                        true
+                    }
+                    Err(e) => {
+                        log::warn!(
+                            "meta volume {}: could not mint the block-map tree root ({e}); \
+                             staying on the indirect-blob path (the stamped bit is inert \
+                             with zero records — the next mount mints)",
+                            self.path.display()
+                        );
+                        false
+                    }
+                }
+            }
+            Err(e) => {
+                log::warn!(
+                    "meta volume {}: could not stamp KV_BLOCK_MAP_TREE ({e}); \
+                     staying on the indirect-blob path",
+                    self.path.display()
+                );
+                false
+            }
+        }
+    }
+
+    /// **The crossing/migration train** (PR 2, design §3 + Rev 1.1 #1):
+    /// reconcile `ino`'s tree-7 records to exactly `entries` and flip the
+    /// layout head — under ONE exclusive 4a I-guard held across the whole
+    /// train (the stripes are non-reentrant, so no existing verb can
+    /// compose this):
+    ///
+    /// 1. `write_gate` → [`Self::block_map_tree_ready`] (`Ok(None)` = not
+    ///    ready — the caller falls back to the legacy blob arm, never
+    ///    blocks the write);
+    /// 2. register the ino in the in-flight crossing registry (A3);
+    /// 3. the A1 residue sweep, generalized to a DIFF: one paged scan of
+    ///    the ino's existing records staged against the desired map —
+    ///    Deletes for stale indices, Puts for new/changed bindings (a
+    ///    changed binding is ONE Put; same-key supersede). On a healthy
+    ///    first crossing the scan is one empty leaf descent and the diff
+    ///    is the whole map;
+    /// 4. chunked commits (`chunk` ops per tx, each co-owning the guard —
+    ///    the M7 `hold_guards` law) for everything but the tail;
+    /// 5. the FLIP as the final tx while the guard is still held: layout
+    ///    head Put + inode(size) Put + `block_refs` + the tail chunk —
+    ///    the `set_layout_and_size_with_map` one-tx shape.
+    ///
+    /// Crash windows: on a FIRST crossing every pre-flip record is
+    /// invisible (the head still names the inline/blob map) and the next
+    /// crossing's diff deletes/reuses it. On a RE-train of a live
+    /// `kvmap:` head, pre-flip Deletes remove bindings whose blocks the
+    /// punch/truncate already freed (deleting early is the safe
+    /// direction — a stale record naming a freed block is the A1 class)
+    /// and pre-flip Puts expose write-through bytes an unacked publish
+    /// wrote (legal either way after a crash; the retried save re-diffs
+    /// and converges).
+    ///
+    /// Errors are never-lossy for the caller: nothing here consumes the
+    /// RAM map or the `block_refs` accounting — the routing save's
+    /// refill discipline re-owns both.
+    pub async fn migrate_block_map_train(
+        &self,
+        ino: Ino,
+        layout: &[u8],
+        size: u64,
+        block_refs: &[super::block_refs::BlockRefOp],
+        entries: &[(u32, String)],
+        chunk: usize,
+    ) -> Result<Option<MapMigrateOutcome>> {
+        self.write_gate()?;
+        if !self.block_map_tree_ready().await {
+            return Ok(None);
+        }
+        let chunk = chunk.max(1);
+        let _crossing = CrossingGuard::register(&self.crossing_inflight, ino);
+        let guards: Arc<[DlmGuard]> = Arc::from(vec![self.dlm.lock_inode_exclusive(ino).await]);
+
+        // The diff scan (step 3). Desired bindings are STRING records —
+        // the router-true key strings every consumer resolves today
+        // (POINT stays the codec's fast form for later PRs; both kinds
+        // decode on the read side).
+        let desired: std::collections::BTreeMap<u32, &str> =
+            entries.iter().map(|(b, k)| (*b, k.as_str())).collect();
+        let mut ops: Vec<super::block_map::BlockMapOp> = Vec::new();
+        let mut preexisting = 0u64;
+        let mut matched: std::collections::BTreeSet<u32> = std::collections::BTreeSet::new();
+        let mut cursor = 0u32;
+        loop {
+            let page = self
+                .block_map_range(ino, cursor, chunk)
+                .await
+                .map_err(|e| self.eio(&format!("block-map diff scan for ino {ino}: {e}")))?;
+            let Some((last, _)) = page.last() else {
+                break;
+            };
+            let next = last.checked_add(1);
+            for (idx, existing) in page {
+                preexisting += 1;
+                match desired.get(&idx) {
+                    Some(k)
+                        if existing
+                            == super::block_map::MapEntry::String(k.as_bytes().to_vec()) =>
+                    {
+                        matched.insert(idx);
+                    }
+                    // Changed binding: the desired-walk below stages the
+                    // superseding Put (same key — no Delete).
+                    Some(_) => {}
+                    None => ops.push(super::block_map::BlockMapOp::Delete {
+                        owner_ino: ino,
+                        block_index: idx,
+                    }),
+                }
+            }
+            let Some(next) = next else { break };
+            cursor = next;
+        }
+        let mut put_bytes = 0u64;
+        for (idx, key) in entries {
+            if matched.contains(idx) {
+                continue;
+            }
+            put_bytes += (super::block_map::BLOCK_MAP_KEY_LEN + 2 + key.len()) as u64;
+            ops.push(super::block_map::BlockMapOp::Put {
+                owner_ino: ino,
+                block_index: *idx,
+                entry: super::block_map::MapEntry::String(key.as_bytes().to_vec()),
+            });
+        }
+        let records = ops.len() as u64;
+
+        // Steps 4–5: chunked commits, tail rides the flip.
+        let mut tail = ops;
+        while tail.len() > chunk {
+            let rest = tail.split_off(chunk);
+            let chunk_ops = std::mem::replace(&mut tail, rest);
+            let mut tx = KvTx::new();
+            tx.stage_block_map(&chunk_ops)?;
+            tx.hold_guards(Arc::clone(&guards));
+            self.commit_tx(tx).await?;
+        }
+        self.set_layout_and_size_with_map_holding(ino, layout, size, block_refs, &tail, guards)
+            .await?;
+        Ok(Some(MapMigrateOutcome {
+            records,
+            record_bytes: put_bytes,
+            preexisting,
+        }))
+    }
+
+    /// **The bounded synchronous record sweep** (PR 2, Rev 1.1 #4's
+    /// unlink half): delete every tree-7 record of `ino`, chunked one tx
+    /// per `chunk` Deletes under one held 4a guard — never silent
+    /// residue. The A2 job-fabric sweep (size-flip-first + durable
+    /// cursor) supersedes this for truncate at scale in a later PR;
+    /// unlink teardown is bounded by the PRESENT record population.
+    /// A no-op — not an error — on a volume with no engaged tree.
+    pub async fn sweep_block_map(&self, ino: Ino, chunk: usize) -> Result<u64> {
+        if self.block_map.get().is_none() {
+            return Ok(0);
+        }
+        self.write_gate()?;
+        let chunk = chunk.max(1);
+        let guards: Arc<[DlmGuard]> = Arc::from(vec![self.dlm.lock_inode_exclusive(ino).await]);
+        let mut deleted = 0u64;
+        loop {
+            // Always from index 0: committed Deletes vanish from the
+            // fold, so the window shrinks to empty.
+            let page = self
+                .block_map_range(ino, 0, chunk)
+                .await
+                .map_err(|e| self.eio(&format!("block-map sweep scan for ino {ino}: {e}")))?;
+            if page.is_empty() {
+                break;
+            }
+            let ops: Vec<super::block_map::BlockMapOp> = page
+                .into_iter()
+                .map(|(idx, _)| super::block_map::BlockMapOp::Delete {
+                    owner_ino: ino,
+                    block_index: idx,
+                })
+                .collect();
+            deleted += ops.len() as u64;
+            let mut tx = KvTx::new();
+            tx.stage_block_map(&ops)?;
+            tx.hold_guards(Arc::clone(&guards));
+            self.commit_tx(tx).await?;
+        }
+        Ok(deleted)
     }
 
     /// The resolved OQ 2 contract class for every v3 volume:
@@ -5437,6 +5715,42 @@ pub type RecomputedReleases = Option<Vec<super::block_refs::BlockRef>>;
 /// verdict)`.
 pub type MergeOutcome = (bool, u64, RecomputedReleases);
 
+/// One crossing/migration train's accounting
+/// ([`KvMetaBackend::migrate_block_map_train`]): what the ledger counters
+/// (`map_migrate_records` / `publish_map_record_bytes`) and the A1
+/// resumed verdict (`preexisting > 0` on a FIRST crossing = a crashed
+/// prior train's residue was reconciled) are fed from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MapMigrateOutcome {
+    /// Map operations staged (Puts + Deletes, flip-tx tail included).
+    pub records: u64,
+    /// Key + value bytes of the staged Puts.
+    pub record_bytes: u64,
+    /// Tree-7 records that existed BEFORE the train ran.
+    pub preexisting: u64,
+}
+
+/// RAII registration in the in-flight crossing registry (design A3) —
+/// deregisters on EVERY exit, error paths included, so a failed train
+/// can never leave an ino permanently "in flight".
+struct CrossingGuard<'a> {
+    map: &'a scc::HashMap<Ino, ()>,
+    ino: Ino,
+}
+
+impl<'a> CrossingGuard<'a> {
+    fn register(map: &'a scc::HashMap<Ino, ()>, ino: Ino) -> Self {
+        let _ = map.insert_sync(ino, ());
+        Self { map, ino }
+    }
+}
+
+impl Drop for CrossingGuard<'_> {
+    fn drop(&mut self) {
+        let _ = self.map.remove_sync(&self.ino);
+    }
+}
+
 /// [`KvMetaBackend::spill_oversize_chained_full`]'s spill result — the
 /// inline→oversize crossing arm's product (2026-08-19 wedge trigger fix).
 struct SpilledChainedFull {
@@ -5607,7 +5921,7 @@ impl KvMetaBackend {
             // silent-skip.
             super::record::TREE_BLOCK_MAP => self
                 .block_map
-                .as_ref()
+                .get()
                 .expect("block-map records staged on a volume without incompat bit 16"),
             _ => unreachable!("kv commits stage only the §4.2 trees"),
         }
@@ -7693,7 +8007,7 @@ impl KvMetaBackend {
         block_refs: &[super::block_refs::BlockRefOp],
         block_map: &[super::block_map::BlockMapOp],
     ) -> Result<()> {
-        if !block_map.is_empty() && self.block_map.is_none() {
+        if !block_map.is_empty() && self.block_map.get().is_none() {
             return Err(crate::error::SqueezefsError::InvalidOperation(format!(
                 "block-map records staged on meta volume {} which does not carry \
                  incompat bit 16 (KV_BLOCK_MAP_TREE): map records ARE the mapping, so \
@@ -7704,6 +8018,25 @@ impl KvMetaBackend {
         }
         self.write_gate()?;
         let guards: Arc<[DlmGuard]> = Arc::from(vec![self.dlm.lock_inode_exclusive(ino).await]);
+        self.set_layout_and_size_with_map_holding(ino, layout, size, block_refs, block_map, guards)
+            .await
+    }
+
+    /// [`Self::set_layout_and_size_with_map`] with the ino's 4a guard
+    /// ALREADY HELD (the `routed_*` guards-parameter precedent): the PR 2
+    /// crossing train holds ONE exclusive I-guard across sweep → chunks →
+    /// flip (design A3), and the DLM stripes are non-reentrant, so the
+    /// flip transaction cannot re-acquire. Callers own `write_gate` and
+    /// the un-engaged-map refusal.
+    async fn set_layout_and_size_with_map_holding(
+        &self,
+        ino: Ino,
+        layout: &[u8],
+        size: u64,
+        block_refs: &[super::block_refs::BlockRefOp],
+        block_map: &[super::block_map::BlockMapOp],
+        guards: Arc<[DlmGuard]>,
+    ) -> Result<()> {
         let mut v = self
             .read_inode_value(ino)
             .await?

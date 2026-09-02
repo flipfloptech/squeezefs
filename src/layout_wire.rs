@@ -645,6 +645,20 @@ pub fn decode_base_layout(base: &[u8]) -> Result<LayoutMetadata, LayoutWireError
                 .into(),
         ));
     }
+    // kvmap heads are layout-delta-INELIGIBLE by law (design §2): the map
+    // lives in tree-7 records, so a delta's map entries have nothing to
+    // fold onto. The refusal text deliberately does NOT contain
+    // "indirect" — the compose arms that key on that word must not
+    // rehydrate a kvmap head through the blob hook (it names no blob).
+    if layout
+        .block_map_id
+        .as_deref()
+        .is_some_and(|id| id.starts_with("kvmap:"))
+    {
+        return Err(LayoutWireError::BadBase(
+            "kvmap base — its map lives in the block-map tree; a delta cannot fold onto it".into(),
+        ));
+    }
     Ok(layout)
 }
 

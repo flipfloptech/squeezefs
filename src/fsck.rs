@@ -2754,7 +2754,13 @@ async fn walk_census(
                     bincode::deserialize(&bytes).ok()
                 };
                 let Some(layout) = layout else { continue };
-                census_layout(ctx, global_ino, &layout, block_size, &mut out).await;
+                // PR 2 (kvmap, Rev 1.1 #3): a `kvmap:` head's entries are
+                // paged out of tree 7 through the SHARED extraction —
+                // the derived census's own arm — so both C8 oracle sides
+                // read the same multiset and a healthy kvmap volume
+                // reads zero drift.
+                let tree_entries = kvmap_entries_for(ctx, kv, local_ino, &layout).await;
+                census_layout(ctx, global_ino, &layout, block_size, tree_entries, &mut out).await;
             }
             throttle(opts, t0.elapsed()).await;
         }
@@ -2768,14 +2774,42 @@ async fn walk_census(
     Ok(out)
 }
 
-/// One layout's contribution: block-map entries (inline or indirect,
-/// the indirect blob block itself included) — mirrors
+/// PR 2 (kvmap): the census's tree-entry input for one layout — a
+/// `kvmap:` head's records through the SHARED extraction
+/// (`BackendRouter::kvmap_layout_entries`, Rev 1.1 #3: both C8 oracle
+/// sides read the same multiset), `None` for every other head.
+async fn kvmap_entries_for(
+    ctx: &FsckCtx,
+    kv: &crate::meta_backend::kv::backend::KvMetaBackend,
+    local_ino: u64,
+    layout: &crate::routing::LayoutMetadata,
+) -> Option<Vec<(u32, String)>> {
+    if layout
+        .block_map_id
+        .as_deref()
+        .is_some_and(|id| id.starts_with(crate::meta_backend::kv::block_map::KVMAP_HEAD_PREFIX))
+    {
+        Some(
+            ctx.router
+                .backend_router
+                .kvmap_layout_entries(kv, local_ino)
+                .await,
+        )
+    } else {
+        None
+    }
+}
+
+/// One layout's contribution: block-map entries (inline, indirect — the
+/// blob block itself included — or `tree_entries`, a kvmap head's
+/// records pre-paged through the SHARED extraction) — mirrors
 /// `recover_active_blocks_v3`'s accounting exactly.
 async fn census_layout(
     ctx: &FsckCtx,
     global_ino: u64,
     layout: &crate::routing::LayoutMetadata,
     block_size: usize,
+    tree_entries: Option<Vec<(u32, String)>>,
     out: &mut CensusOut,
 ) {
     let count_ref = |mapping: &str, ino: u64, idx: u32, out: &mut CensusOut| {
@@ -2824,7 +2858,7 @@ async fn census_layout(
         }
     };
 
-    let mut entries: Vec<(u32, String)> = Vec::new();
+    let mut entries: Vec<(u32, String)> = tree_entries.unwrap_or_default();
     if let Some(ref map_id) = layout.block_map_id {
         if let Some(blob_key) = map_id.strip_prefix("indirect:") {
             // The blob block itself is a referenced block.
@@ -3366,7 +3400,8 @@ async fn layout_mappings_of(ctx: &FsckCtx, ino: u64) -> Vec<MappingRef> {
         .block_size
         .load(std::sync::atomic::Ordering::Relaxed) as usize;
     let mut probe = probe_census();
-    census_layout(ctx, ino, &layout, block_size, &mut probe).await;
+    let tree_entries = kvmap_entries_for(ctx, kv, local, &layout).await;
+    census_layout(ctx, ino, &layout, block_size, tree_entries, &mut probe).await;
     probe.mappings
 }
 
@@ -4702,10 +4737,11 @@ async fn reverify_scrub_failure(
         .as_ref()
         .is_some_and(|bm| bm.get(&m.block_idx).is_some_and(|v| v == &m.mapping));
     if !still_mapped {
-        // Indirect maps / blob references: re-read through the census
-        // decoder for this single layout.
+        // Indirect/kvmap maps: re-read through the census decoder for
+        // this single layout.
         let mut probe = probe_census();
-        census_layout(ctx, m.ino, &layout, block_size, &mut probe).await;
+        let tree_entries = kvmap_entries_for(ctx, kv, local, &layout).await;
+        census_layout(ctx, m.ino, &layout, block_size, tree_entries, &mut probe).await;
         still_mapped = probe.mappings.iter().any(|p| p.mapping == m.mapping);
     }
     if !still_mapped {
@@ -5230,7 +5266,8 @@ async fn current_mapping_present(ctx: &FsckCtx, ino: u64, block_idx: u32, mappin
         .block_size
         .load(std::sync::atomic::Ordering::Relaxed) as usize;
     let mut probe = probe_census();
-    census_layout(ctx, ino, &layout, block_size, &mut probe).await;
+    let tree_entries = kvmap_entries_for(ctx, kv, local, &layout).await;
+    census_layout(ctx, ino, &layout, block_size, tree_entries, &mut probe).await;
     probe
         .mappings
         .iter()
@@ -6452,7 +6489,8 @@ pub async fn repair(
                     };
                     let Some(layout) = layout else { continue };
                     let mut probe = probe_census();
-                    census_layout(ctx, r_ino, &layout, block_size, &mut probe).await;
+                    let tree_entries = kvmap_entries_for(ctx, kv, local, &layout).await;
+                    census_layout(ctx, r_ino, &layout, block_size, tree_entries, &mut probe).await;
                     counted += probe
                         .refs
                         .get(vol)

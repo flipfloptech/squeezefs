@@ -157,7 +157,15 @@ use std::sync::Arc;
 /// owner frees the scoped compose's released data blocks through its own
 /// ladder post-commit, exactly the schema-9 law on the arm the field
 /// actually rides.
-pub const PUBLISH_SCHEMA: u32 = 10;
+///
+/// **11 since the kvmap crossing verb landed** (PB-class files PR 2,
+/// design-kvmap-block-map-tree §3 + A4): `MigrateBlockMap` — a
+/// co-writer's beyond-inline crossing ships its WHOLE map and the OWNER
+/// runs the migration train under its own held 4a + serve stripe —
+/// plus [`PublishReply::MapMigrated`], the train's accounting. A
+/// 10-speaker cannot decode either — the mismatch refuses loud at the
+/// first frame.
+pub const PUBLISH_SCHEMA: u32 = 11;
 
 /// First verb of S9's publish block. S3's ping is 0, S8's metadata verbs
 /// are 16/17, S6's membership owns `0x0100..=0x01FF`, S9's custody
@@ -479,6 +487,31 @@ pub enum PublishCall {
         /// Dense block indices — `TREE_BLOCK_REFS`'s own key grain.
         block_idxs: Vec<u64>,
     },
+    /// **The kvmap crossing train, shipped** (PB-class files PR 2 —
+    /// design-kvmap-block-map-tree §3/A4, the finding-36b whole-claim-set
+    /// law): a co-writer cannot commit metadata, so its beyond-inline
+    /// crossing ships the WHOLE map (and its whole refs frame — the
+    /// owner runs the journal-entry-cap chunking, f38's law on the node
+    /// whose journal admits the commit) and the OWNER executes the train
+    /// under its own held 4a + `SERVE_INO_LOCKS` stripe.
+    ///
+    /// Layout-publish class: era-gated + witnessed
+    /// (`(lease_epoch, request_id)`) — the train is idempotent by the A1
+    /// diff, but only the witness makes a lost-reply resend answer the
+    /// winner's own outcome instead of re-running a whole train.
+    MigrateBlockMap {
+        ino: u64,
+        /// The encoded `kvmap:1` head layout the flip commits.
+        layout: Vec<u8>,
+        size: u64,
+        /// The COMPLETE map, `(block_index, block-key string)`, sorted.
+        entries: Vec<(u32, String)>,
+        refs: Vec<WireBlockRefOp>,
+        /// Era gate input + witness half (see `SetLayoutAndSize`).
+        lease_epoch: u64,
+        /// The witness's other half.
+        request_id: u64,
+    },
 }
 
 /// One block's outcome inside a served [`PublishCall::FreeBlocks`].
@@ -516,6 +549,7 @@ impl PublishCall {
             Self::WriteExtent { .. } => "write_extent",
             Self::FlushExtents { .. } => "flush_extents",
             Self::BlockRefPopulation { .. } => "block_ref_population",
+            Self::MigrateBlockMap { .. } => "migrate_block_map",
         }
     }
 
@@ -537,7 +571,8 @@ impl PublishCall {
             | Self::FreeBlocks { lease_epoch, .. }
             | Self::HarvestLaneFree { lease_epoch, .. }
             | Self::WriteExtent { lease_epoch, .. }
-            | Self::FlushExtents { lease_epoch, .. } => Some(*lease_epoch),
+            | Self::FlushExtents { lease_epoch, .. }
+            | Self::MigrateBlockMap { lease_epoch, .. } => Some(*lease_epoch),
             Self::XattrValueCap { .. }
             | Self::ReaddirStream { .. }
             | Self::BlockRefPopulation { .. } => None,
@@ -559,7 +594,8 @@ impl PublishCall {
             | Self::DestroyInodes { lease_epoch, .. }
             | Self::CreateWithRdevSize { lease_epoch, .. }
             | Self::WriteExtent { lease_epoch, .. }
-            | Self::FlushExtents { lease_epoch, .. } => Some(*lease_epoch),
+            | Self::FlushExtents { lease_epoch, .. }
+            | Self::MigrateBlockMap { lease_epoch, .. } => Some(*lease_epoch),
             _ => None,
         }
     }
@@ -581,6 +617,7 @@ impl PublishCall {
                 | Self::MergeLayoutAndSize { .. }
                 | Self::CommitBlockRefs { .. }
                 | Self::DestroyInodes { .. }
+                | Self::MigrateBlockMap { .. }
         )
     }
 
@@ -648,6 +685,11 @@ impl PublishCall {
                 lease_epoch,
                 request_id,
                 ..
+            }
+            | Self::MigrateBlockMap {
+                lease_epoch,
+                request_id,
+                ..
             } => Some((*lease_epoch, *request_id)),
             _ => None,
         }
@@ -662,6 +704,7 @@ impl PublishCall {
             | Self::ParkWriteTimes { ino, .. }
             | Self::WriteExtent { ino, .. }
             | Self::FlushExtents { ino, .. }
+            | Self::MigrateBlockMap { ino, .. }
             | Self::XattrValueCap { ino } => vec![*ino],
             Self::DestroyInodes { inos, .. } => inos.clone(),
             Self::CreateWithRdevSize { parent, .. } => vec![*parent],
@@ -749,6 +792,14 @@ pub enum PublishReply {
     /// `block_ref_population`: per-index reference populations summed over
     /// the SERVING node's owned volumes, in request order.
     Populations(Vec<u64>),
+    /// `migrate_block_map` (kvmap PR 2): the served train's accounting —
+    /// the shipper's ledger counters read the OWNER's truth, and
+    /// `preexisting` is the A1 resumed verdict's input.
+    MapMigrated {
+        records: u64,
+        record_bytes: u64,
+        preexisting: u64,
+    },
 }
 
 /// A publish request frame.
@@ -835,6 +886,11 @@ static EXTENT_FLUSH_FORCES: AtomicU64 = AtomicU64::new(0);
 static EXTENT_SPILLS: AtomicU64 = AtomicU64::new(0);
 // Finding 34: the custody-less-Put shield's engagement (must stay 0).
 static UNSCOPED_PUT_REFUSALS: AtomicU64 = AtomicU64::new(0);
+// kvmap PR 2 — the shipped crossing's ledger (design §5:
+// `meta_ship_publish.map_{shipped,served,refused}`).
+static MAP_SHIPPED: AtomicU64 = AtomicU64::new(0);
+static MAP_SERVED: AtomicU64 = AtomicU64::new(0);
+static MAP_REFUSED: AtomicU64 = AtomicU64::new(0);
 
 /// The at-budget W2 spill's counter (incremented by
 /// [`crate::extent_ship`]'s spill arm — release path 4's engagement).
@@ -937,6 +993,15 @@ pub struct PublishStats {
     /// 0** — growth means some client shipped a layout publish after its
     /// range release outran it (the rung-1 drain ordering broken).
     pub unscoped_put_refusals: u64,
+    /// kvmap crossings SHIPPED to an owner (client side).
+    pub map_shipped: u64,
+    /// kvmap crossing trains EXECUTED for a peer (owner side) —
+    /// `shipped ≡ served` is the engagement law.
+    pub map_served: u64,
+    /// Shipped kvmap crossings the owner REFUSED (its tree could not
+    /// engage, or the ino carries live range grants — the finding-34
+    /// posture). The client's never-lossy ladder re-publishes.
+    pub map_refused: u64,
 }
 
 /// Read the publish ledger.
@@ -967,6 +1032,9 @@ pub fn stats() -> PublishStats {
         extent_flush_forces: EXTENT_FLUSH_FORCES.load(Ordering::Relaxed),
         extent_spills: EXTENT_SPILLS.load(Ordering::Relaxed),
         unscoped_put_refusals: UNSCOPED_PUT_REFUSALS.load(Ordering::Relaxed),
+        map_shipped: MAP_SHIPPED.load(Ordering::Relaxed),
+        map_served: MAP_SERVED.load(Ordering::Relaxed),
+        map_refused: MAP_REFUSED.load(Ordering::Relaxed),
     }
 }
 
@@ -1001,6 +1069,9 @@ pub fn stats_json() -> serde_json::Value {
         "extent_flush_forces": s.extent_flush_forces,
         "extent_spills": s.extent_spills,
         "unscoped_put_refusals": s.unscoped_put_refusals,
+        "map_shipped": s.map_shipped,
+        "map_served": s.map_served,
+        "map_refused": s.map_refused,
         // §9.3's live retention gauge (→ 0 at quiesce — falsifiable
         // against the four release paths).
         "extent_retained_bytes": crate::extent_ship::retained_bytes(),
@@ -1778,6 +1849,75 @@ pub async fn commit_block_refs(
                 .await?,
                 "commit_block_refs",
             )
+        }
+    }
+}
+
+/// Routed [`RoutedMetaBackend::migrate_block_map_train`] — the kvmap
+/// crossing (PB-class files PR 2). The local arm runs the train on this
+/// node under the serve-window discipline every local layout publish
+/// keeps; the foreign-home arm ships the WHOLE map as the witnessed
+/// [`PublishCall::MigrateBlockMap`] verb and the owner runs the train.
+///
+/// A local `Ok(None)` from the train (the tree could not engage) comes
+/// back as a loud error rather than a silent local fallback: the CALLER
+/// probed engagement before consuming anything, so this arm firing means
+/// the ratchet failed mid-save — the never-lossy refill + retry owns it.
+pub async fn migrate_block_map(
+    be: &Arc<RoutedMetaBackend>,
+    ino: Ino,
+    layout: &[u8],
+    size: u64,
+    entries: Vec<(u32, String)>,
+    refs: Vec<BlockRefOp>,
+    chunk: usize,
+) -> Result<crate::meta_backend::kv::backend::MapMigrateOutcome> {
+    match owner_of(be, ino)? {
+        None => {
+            note_local();
+            let _serve_window = local_publish_guard(ino).await;
+            match be
+                .migrate_block_map_train(ino, layout, size, &refs, &entries, chunk)
+                .await?
+            {
+                Some(outcome) => Ok(outcome),
+                None => Err(SqueezefsError::InvalidOperation(format!(
+                    "kvmap crossing for ino {ino}: the block-map tree could not engage \
+                     (the bit-16 ratchet failed) — nothing was committed; the caller's \
+                     never-lossy ladder re-publishes"
+                ))),
+            }
+        }
+        Some(peer) => {
+            intent_barrier_inos(&[ino]).await?;
+            let call = PublishCall::MigrateBlockMap {
+                ino,
+                layout: layout.to_vec(),
+                size,
+                entries,
+                refs: wire_refs(&refs),
+                lease_epoch: current_lease_epoch(),
+                request_id: crate::cowriter::next_ship_request_id(),
+            };
+            match ship_witnessed(&peer, call).await? {
+                PublishReply::MapMigrated {
+                    records,
+                    record_bytes,
+                    preexisting,
+                } => {
+                    MAP_SHIPPED.fetch_add(1, Ordering::Relaxed);
+                    Ok(crate::meta_backend::kv::backend::MapMigrateOutcome {
+                        records,
+                        record_bytes,
+                        preexisting,
+                    })
+                }
+                other => Err(protocol_error(
+                    "migrate_block_map",
+                    &format!("{other:?}"),
+                    "the train's accounting",
+                )),
+            }
         }
     }
 }
@@ -3695,6 +3835,71 @@ impl PublishService {
                 let refs: Vec<BlockRefOp> = refs.into_iter().map(BlockRefOp::from).collect();
                 self.inner.commit_block_refs(ino, &refs).await?;
                 Ok(PublishReply::Unit)
+            }
+            PublishCall::MigrateBlockMap {
+                ino,
+                layout,
+                size,
+                entries,
+                refs,
+                ..
+            } => {
+                // The finding-34 posture: a whole-map train on an ino
+                // OTHER writers hold live ranges on would clobber the
+                // arbiter's compose (the S11 ∘ kvmap composition is a
+                // later PR's) — refuse loud, never verbatim.
+                if let Some(owner) = crate::data_grant::custody_owner() {
+                    if owner.ino_has_range_grants(ino) {
+                        MAP_REFUSED.fetch_add(1, Ordering::Relaxed);
+                        return Err(SqueezefsError::InvalidOperation(format!(
+                            "kvmap crossing for ino {ino} refused — the ino has live range \
+                             grants, and a whole-map train would revert peers' entries \
+                             (finding 34's class); drain range custody first"
+                        )));
+                    }
+                }
+                let mut refs: Vec<BlockRefOp> = refs.into_iter().map(BlockRefOp::from).collect();
+                // Finding 36b's owner half: the shipped crossing carries
+                // its WHOLE claim set, so the journal-entry-cap chunking
+                // (f38's law) runs HERE, under the serve's per-ino stripe.
+                const SERVE_REF_TX_CHUNK: usize = 512;
+                while refs.len() > SERVE_REF_TX_CHUNK {
+                    let tail = refs.split_off(SERVE_REF_TX_CHUNK);
+                    let chunk = std::mem::replace(&mut refs, tail);
+                    self.inner.commit_block_refs(ino, &chunk).await?;
+                }
+                match self
+                    .inner
+                    .migrate_block_map_train(
+                        ino,
+                        &layout,
+                        size,
+                        &refs,
+                        &entries,
+                        crate::routing::map_migrate_chunk(),
+                    )
+                    .await?
+                {
+                    Some(o) => {
+                        MAP_SERVED.fetch_add(1, Ordering::Relaxed);
+                        Ok(PublishReply::MapMigrated {
+                            records: o.records,
+                            record_bytes: o.record_bytes,
+                            preexisting: o.preexisting,
+                        })
+                    }
+                    // The owner's ratchet could not engage the tree —
+                    // refused loud (nothing committed); the shipper's
+                    // never-lossy ladder owns the retry.
+                    None => {
+                        MAP_REFUSED.fetch_add(1, Ordering::Relaxed);
+                        Err(SqueezefsError::InvalidOperation(format!(
+                            "kvmap crossing for ino {ino} refused — the owner's block-map \
+                             tree could not engage (the bit-16 ratchet failed); nothing \
+                             was committed"
+                        )))
+                    }
+                }
             }
             PublishCall::ParkWriteTimes {
                 ino, mtime, ctime, ..

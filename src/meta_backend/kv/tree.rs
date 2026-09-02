@@ -271,6 +271,15 @@ impl std::fmt::Debug for KvTree {
 }
 
 impl KvTree {
+    /// The volume-shared record/node seq source this tree stamps with —
+    /// what a RUNTIME tree mint ([`Self::create`] after open) must reuse
+    /// so its root's `node_seq` joins the volume's one monotonic space
+    /// (the kvmap PR-2 ratchet's mint; open-time mints get it from the
+    /// ledger recovery).
+    pub(super) fn seq_handle(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.seq)
+    }
+
     /// Format a fresh, empty tree: claim one extent (internal class — tree
     /// roots are checkpoint/format internals, §4.7), write an empty leaf
     /// root spanning the whole key space, publish it pinned.

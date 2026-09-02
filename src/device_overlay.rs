@@ -248,6 +248,17 @@ pub fn ack_early_odirect() -> bool {
     tri(&ACK_EARLY_ODIRECT, "SQUEEZEFS_ZC_ACK_EARLY_ODIRECT")
 }
 
+/// W-3 (e2e perf audit write board #3): overlay stores admit through the
+/// write-pipeline depth governor (`SQUEEZEFS_OVERLAY_DEPTH_GOVERNOR`,
+/// default ON; `0` = the pre-W-3 open-loop store — the A/B control).
+static DEPTH_GOVERNOR: AtomicU8 = AtomicU8::new(0);
+
+/// Whether overlay stores take a write-pipeline permit (see
+/// [`crate::write_pipeline::WritePipeline::admit_segment`]).
+pub fn depth_governor_enabled() -> bool {
+    tri_default_on(&DEPTH_GOVERNOR, "SQUEEZEFS_OVERLAY_DEPTH_GOVERNOR")
+}
+
 /// Test override (the `set_patch_max_bytes` precedent): pins both the
 /// enablement and the bytes-vehicle seam without env-order coupling.
 pub fn set_device_overlay_for_tests(enabled: bool, bytes_vehicle: bool) {

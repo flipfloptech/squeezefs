@@ -380,15 +380,29 @@ impl WritePipeline {
     }
 
     /// Record one completed upload for `lane` (backend id): feeds the
-    /// governor's service-time / bandwidth estimates.
+    /// governor's service-time / bandwidth estimates. `bytes` is a whole
+    /// block on the accumulation path, so it doubles as the target's
+    /// block scale; sub-block vehicles use [`Self::record_completion_sized`].
     pub fn record_completion(&self, lane: &str, bytes: u64, dur: Duration) {
         self.record_completion_at(lane, bytes, dur.as_nanos() as u64, coarse_ms());
+    }
+
+    /// [`Self::record_completion`] for a SUB-BLOCK completion (W-3: the
+    /// device-overlay segment store) — `block_size` scales the
+    /// saturation/headroom probe inputs so a 1 MiB segment reads the
+    /// same target a 4 MiB block does.
+    pub fn record_completion_sized(&self, lane: &str, bytes: u64, block_size: u64, dur: Duration) {
+        self.record_at(lane, bytes, block_size, dur.as_nanos() as u64, coarse_ms());
     }
 
     /// [`Self::record_completion`] with an explicit window clock — the
     /// governor-math test hook (window rolls are wall-clock-driven in
     /// production).
     pub fn record_completion_at(&self, lane: &str, bytes: u64, dur_ns: u64, now_ms: u64) {
+        self.record_at(lane, bytes, bytes, dur_ns, now_ms);
+    }
+
+    fn record_at(&self, lane: &str, bytes: u64, block_size: u64, dur_ns: u64, now_ms: u64) {
         let l = match self.lanes.read_sync(lane, |_, l| l.clone()) {
             Some(l) => l,
             None => {
@@ -410,7 +424,7 @@ impl WritePipeline {
         if depth_override().is_none() {
             self.probe.on_bytes(bytes);
             let waits = self.admission_waits.load(Ordering::Relaxed);
-            let bs = bytes.max(1);
+            let bs = block_size.max(1);
             let target = self.depth_target_bytes(bs);
             // Saturated = writers parked this epoch (waits grew), or the
             // pipe sits at/above target right now. No saturation ⇒ extra
@@ -518,10 +532,10 @@ impl WritePipeline {
     /// One admission attempt against the CURRENT depth target. `None` =
     /// the pipe is at target (park). A CAS race means "the counters moved
     /// under us", never "no room", so it retries in place.
-    fn try_admit_step(self: &Arc<Self>, block_bytes: u64) -> Option<PipelinePermit> {
+    fn try_admit_step(self: &Arc<Self>, bytes: u64, block_size: u64) -> Option<PipelinePermit> {
         loop {
-            let target = self.depth_target_bytes(block_bytes.max(1));
-            match self.core.try_admit_once(block_bytes, target) {
+            let target = self.depth_target_bytes(block_size.max(1));
+            match self.core.try_admit_once(bytes, target) {
                 crate::write_pipeline_core::AdmitAttempt::Admitted => {
                     // Wedge-census mirror (2026-08-07): the process-global
                     // twin of `core.inflight_blocks()` — permit-count
@@ -530,7 +544,7 @@ impl WritePipeline {
                     PIPELINE_INFLIGHT_PERMITS.fetch_add(1, Ordering::Relaxed);
                     return Some(PipelinePermit {
                         pipe: self.clone(),
-                        bytes: block_bytes,
+                        bytes,
                         // DLM S7: custody is established HERE (admission
                         // is the honest-backpressure gate the WRITE
                         // handler awaits before the ACK), and the DMA
@@ -552,12 +566,22 @@ impl WritePipeline {
     /// completions; re-polls on a short tick so Red/target changes are
     /// observed). Progress guarantee: an empty pipe always admits.
     pub async fn admit(self: &Arc<Self>, block_bytes: u64) -> PipelinePermit {
+        self.admit_segment(block_bytes, block_bytes).await
+    }
+
+    /// [`Self::admit`] for a SUB-BLOCK segment (W-3, e2e perf audit write
+    /// board #3 — the device-overlay store): `bytes` of in-flight DMA
+    /// custody counted against the target at the volume's `block_size`
+    /// scale, so the overlay's segments and the accumulation path's whole
+    /// blocks share ONE gauge, ONE target and ONE backpressure gate. The
+    /// caller's ACK still detaches from the CQE; only ADMISSION waits.
+    pub async fn admit_segment(self: &Arc<Self>, bytes: u64, block_size: u64) -> PipelinePermit {
         let mut waited = false;
         loop {
             // Fast attempt: an admitting pipe pays NO wait-list traffic
             // (the registration below is a `Notify` wait-list push/pop
             // pair — free on the park path, pure cost on the common one).
-            if let Some(permit) = self.try_admit_step(block_bytes) {
+            if let Some(permit) = self.try_admit_step(bytes, block_size) {
                 return permit;
             }
             // PERF-13 — **register the wake BEFORE the admission
@@ -577,7 +601,7 @@ impl WritePipeline {
             let mut park = self.completions.notified_raw();
             park.enable();
 
-            if let Some(permit) = self.try_admit_step(block_bytes) {
+            if let Some(permit) = self.try_admit_step(bytes, block_size) {
                 return permit;
             }
             if !waited {

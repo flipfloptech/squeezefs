@@ -1029,6 +1029,17 @@ pub fn set_test_overlay_capture_stall_ms(ms: u64) {
     test_overlay_capture_stall_cell().store(ms, Ordering::Relaxed);
 }
 
+/// W-3: an overlay store's governor ticket — the write-pipeline permit
+/// (the segment's in-flight DMA custody on the shared
+/// `write_pipeline_inflight` gauge/R5 component) plus the service-time
+/// anchor its lane sample is measured from. Completed at the store's
+/// CQE by [`SqueezefsFilesystem::overlay_store_complete`]; dropping it
+/// on any pre-store exit returns the custody untouched.
+pub(crate) struct OverlayAdmission {
+    permit: crate::write_pipeline::PipelinePermit,
+    t0: std::time::Instant,
+}
+
 /// TEST SEAM (`SQUEEZEFS_TEST_CHECKOUT_STALL_MS`): stall the write
 /// handler inside its BLOCK_FLUSH_LOCKS-held window, strictly after the
 /// overlay checkout/park and before the request-slice merge — the
@@ -3087,7 +3098,7 @@ pub fn lock_wait_census(threshold: Duration) -> Vec<LockWaitEntry> {
 /// Live-phase names, indexed by the stamp constants below (coarser than
 /// the profile-gated [`WritePhase`] duration histograms on purpose: each
 /// entry names ONE await class a unit can park in).
-pub const LIVE_WRITE_PHASE_NAMES: [&str; 18] = [
+pub const LIVE_WRITE_PHASE_NAMES: [&str; 19] = [
     "entry",
     "materialize",
     "checkout",
@@ -3106,6 +3117,7 @@ pub const LIVE_WRITE_PHASE_NAMES: [&str; 18] = [
     "ov_ack_early",
     "ov_slot_store",
     "ov_pooled",
+    "ov_admit",
 ];
 pub const WP_ENTRY: u32 = 0;
 pub const WP_MATERIALIZE: u32 = 1;
@@ -3125,6 +3137,8 @@ pub const WP_OV_SETTLE_RETRY: u32 = 14;
 pub const WP_OV_ACK_EARLY: u32 = 15;
 pub const WP_OV_SLOT_STORE: u32 = 16;
 pub const WP_OV_POOLED: u32 = 17;
+/// W-3: parked in write-pipeline admission ahead of an overlay store.
+pub const WP_OV_ADMIT: u32 = 18;
 
 static WRITE_PHASE_MAP: Lazy<scc::HashMap<(u64, u64, u32), (u32, u64)>> =
     Lazy::new(scc::HashMap::new);
@@ -7060,6 +7074,12 @@ pub struct Metrics {
     pub overlay_ack_early_stores: Align64<AtomicU64>,
     /// Byte face of [`Self::overlay_ack_early_stores`].
     pub overlay_ack_early_bytes: Align64<AtomicU64>,
+    /// W-3 engagement: overlay stores that took a write-pipeline permit
+    /// (`admit_segment`) before issuing — every store on a governed
+    /// mount, 0 under `SQUEEZEFS_OVERLAY_DEPTH_GOVERNOR=0`. An overlay
+    /// row's `write_pipeline_inflight_bytes`/`admission_waits` are only
+    /// meaningful when this delta accounts for its stores.
+    pub overlay_governed_stores: Align64<AtomicU64>,
     /// Overlay Bytes vehicle that DMA'd the extract/sever buffer as-is
     /// (`write_block` `WriteData::Aligned` — no `BUFFER_POOL` memcpy).
     /// A-leg validity: ≈ `overlay_ack_early_bytes` on 4 KiB-aligned
@@ -10909,6 +10929,9 @@ impl SqueezefsFilesystem {
                 // accumulate).
                 "overlay_ack_early_stores": METRICS.overlay_ack_early_stores.load(Ordering::Relaxed),
                 "overlay_ack_early_bytes": METRICS.overlay_ack_early_bytes.load(Ordering::Relaxed),
+                // W-3: stores admitted through the write-pipeline depth
+                // governor (≡ overlay stores on a governed mount).
+                "overlay_governed_stores": METRICS.overlay_governed_stores.load(Ordering::Relaxed),
                 "overlay_dma_passthrough_bytes": METRICS
                     .overlay_dma_passthrough_bytes
                     .load(Ordering::Relaxed),
@@ -15418,6 +15441,39 @@ impl SqueezefsFilesystem {
             }
         };
 
+        // ---- W-3 (e2e perf audit write board #3): admission through
+        // the write-pipeline depth governor. The store used to issue
+        // open-loop — the accumulation path's BDP target, R5 component
+        // and probe-up governor saw none of its in-flight bytes, the
+        // 0.68–0.80× device-bound-venue loss the overlay notes' bracket
+        // rows recorded. The permit spans admission→CQE (the segment's
+        // in-flight DMA custody, released in the continuation at the
+        // CQE — BEFORE the coverage publish, so a parked admitter
+        // holding this block's guard can never wait on a permit whose
+        // release needs that guard); the ACK still detaches at store
+        // time — only ADMISSION waits when the pipe is over target.
+        // Taken here, after the registry (no 3.5 section is held) and
+        // before the claim (a parked writer holds no in-flight claim a
+        // settle would await).
+        let admission = if crate::device_overlay::depth_governor_enabled() {
+            let t_admit = std::time::Instant::now();
+            write_phase(ino, offset_hint, b, WP_OV_ADMIT);
+            let permit = self
+                .write_pipeline
+                .admit_segment(len as u64, block_size as u64)
+                .await;
+            pipeline_phase_record(PipelinePhase::AdmitWait, t_admit);
+            METRICS
+                .overlay_governed_stores
+                .fetch_add(1, Ordering::Relaxed);
+            Some(OverlayAdmission {
+                permit,
+                t0: std::time::Instant::now(),
+            })
+        } else {
+            None
+        };
+
         // ---- Claim + accept (§2.3: the claim spans submit→CQE).
         let first_page = rel / crate::overlay_core::OVERLAY_PAGE;
         let pages = len.div_ceil(crate::overlay_core::OVERLAY_PAGE);
@@ -15436,6 +15492,9 @@ impl SqueezefsFilesystem {
                 METRICS
                     .overlay_claim_conflicts
                     .fetch_add(1, Ordering::Relaxed);
+                // No DMA will issue: return the governor custody before
+                // parking on the in-flight set.
+                drop(admission);
                 write_phase(ino, offset_hint, b, WP_OV_SETTLE_RETRY);
                 // DELIBERATE close-hint dropper (§5.4 venue law) — the
                 // accumulation fallback's own boundaries follow.
@@ -15501,6 +15560,7 @@ impl SqueezefsFilesystem {
                             dest,
                             len,
                             z2,
+                            admission,
                         )
                         .await;
                     });
@@ -15542,7 +15602,7 @@ impl SqueezefsFilesystem {
                         .overlay_ack_early_bytes
                         .fetch_add(len as u64, Ordering::Relaxed);
                     crate::detached::tpc_spawn_guarded("overlay_ack_early_snapshot", async move {
-                        fs.finish_ack_early_bytes(ino, b, rec2, ticket, dest, len, snap)
+                        fs.finish_ack_early_bytes(ino, b, rec2, ticket, dest, len, snap, admission)
                             .await;
                     });
                     return Ok(true);
@@ -15597,7 +15657,7 @@ impl SqueezefsFilesystem {
                     .overlay_ack_early_bytes
                     .fetch_add(len as u64, Ordering::Relaxed);
                 crate::detached::tpc_spawn_guarded("overlay_ack_early_bytes", async move {
-                    fs.finish_ack_early_bytes(ino, b, rec2, ticket, dest, len, owned)
+                    fs.finish_ack_early_bytes(ino, b, rec2, ticket, dest, len, owned, admission)
                         .await;
                 });
                 return Ok(true);
@@ -15618,6 +15678,8 @@ impl SqueezefsFilesystem {
 
         // ---- CQE: coverage publication (law 3) + the completion
         // transition → freeze + detached publication.
+        // W-3: the ACK-after-CQE arms landed inline — governor act first.
+        self.overlay_store_complete(admission, &rec, len, true);
         let verdict = rec.complete_store_and_wake(ticket, true);
         crate::gauge_core::sub_saturating(&METRICS.overlay_inflight_bytes, len as u64);
         METRICS.overlay_stores.fetch_add(1, Ordering::Relaxed);
@@ -15662,6 +15724,35 @@ impl SqueezefsFilesystem {
         Ok(true)
     }
 
+    /// W-3: the overlay store's CQE-side governor act — release the
+    /// permit (the in-flight custody is gone whichever way the DMA
+    /// ended) and, on a LANDED store, feed the lane's BDP/probe governor
+    /// exactly like `upload_block_publish_phase` does for a whole block
+    /// (bytes = the segment, block scale = the volume block size, lane =
+    /// the destination backend). Runs BEFORE the coverage publish so the
+    /// release never waits on a block guard.
+    fn overlay_store_complete(
+        &self,
+        admission: Option<OverlayAdmission>,
+        rec: &crate::device_overlay::DeviceOverlayRecord,
+        len: usize,
+        stored: bool,
+    ) {
+        let Some(OverlayAdmission { permit, t0 }) = admission else {
+            return;
+        };
+        let dur = t0.elapsed();
+        drop(permit);
+        if stored {
+            self.write_pipeline.record_completion_sized(
+                &rec.be_id,
+                len as u64,
+                self.router.block_size.load(Ordering::Relaxed),
+                dur,
+            );
+        }
+    }
+
     /// The ACK-early store CONTINUATION (detached, panic-guarded — the
     /// reply is already out, so this task owns the acked custody):
     /// await the retained-slot DMA, retry-forever on transient failure
@@ -15682,6 +15773,7 @@ impl SqueezefsFilesystem {
         dest: u64,
         len: usize,
         z: std::sync::Arc<crate::routing::ZcWriteSlot>,
+        admission: Option<OverlayAdmission>,
     ) {
         // Own census entry: the spawner's per-block guard died with its
         // write unit (the reply is out); this detached continuation is
@@ -15781,6 +15873,8 @@ impl SqueezefsFilesystem {
             }
         };
 
+        // W-3: the governor's CQE act first (permit release + lane sample).
+        self.overlay_store_complete(admission, &rec, len, stored);
         // CQE-anchored coverage (law 3): identical to the inline path.
         let verdict = rec.complete_store_and_wake(ticket, stored);
         crate::gauge_core::sub_saturating(&METRICS.overlay_inflight_bytes, len as u64);
@@ -15839,6 +15933,7 @@ impl SqueezefsFilesystem {
         dest: u64,
         len: usize,
         data: bytes::Bytes,
+        admission: Option<OverlayAdmission>,
     ) {
         let mut attempt: u32 = 0;
         let stored = loop {
@@ -15873,6 +15968,7 @@ impl SqueezefsFilesystem {
             }
         };
 
+        self.overlay_store_complete(admission, &rec, len, stored);
         let verdict = rec.complete_store_and_wake(ticket, stored);
         crate::gauge_core::sub_saturating(&METRICS.overlay_inflight_bytes, len as u64);
         if stored {

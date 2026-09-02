@@ -430,13 +430,18 @@ impl DrainFx {
 /// blocks: the volume retired with live data still on it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_drain_moves_kvmap_blocks_and_republishes_the_map() {
+    let _ = env_logger::builder().is_test(true).try_init();
     let _serial = serial();
     std::env::set_var("SQUEEZEFS_DEFAULT_BLOCK_SIZE", BLOCK.to_string());
     let _bs = BlockSizeGuard;
     let dir = tempfile::tempdir().unwrap();
     let meta = make_file(dir.path(), "meta", 256 * 1024 * 1024);
-    let oss1 = make_file(dir.path(), "oss1", 4 << 30);
-    let oss2 = make_file(dir.path(), "oss2", 4 << 30);
+    // The survivor's allocator accounts 4 MiB (CHUNK_SIZE) per moved
+    // block regardless of the 4 KiB payload, so 800 moves consume
+    // 3.2 GiB of accounting — size it past that plus the 1 GiB drain
+    // headroom or the drain self-pauses `paused-capacity` mid-pass.
+    let oss1 = make_file(dir.path(), "oss1", 8 << 30);
+    let oss2 = make_file(dir.path(), "oss2", 8 << 30);
     let cfg = base_format_config(&[&oss1, &oss2]);
     // 64 KiB nodes lower the inline cap so DRAIN_SPILL entries cross.
     format_v3(

@@ -750,8 +750,9 @@ async fn census_for(
                     continue;
                 };
 
-                // The block-map entries: inline, or rehydrated from the
-                // indirect blob (whose own block may also need moving).
+                // The block-map entries: inline, rehydrated from the
+                // indirect blob (whose own block may also need moving), or
+                // paged out of tree 7 for a `kvmap:` head.
                 let mut entries: Vec<(u32, String)> = Vec::new();
                 let mut indirect_on_source = false;
                 if let Some(ref map_id) = layout.block_map_id {
@@ -773,6 +774,18 @@ async fn census_for(
                                 );
                             }
                         }
+                    } else if map_id
+                        .starts_with(crate::meta_backend::kv::block_map::KVMAP_HEAD_PREFIX)
+                    {
+                        // PR 4 (kvmap, design §3 walkers): tree-7 entries via
+                        // the SHARED extraction (Rev 1.1 #3). No blob to
+                        // relocate — map records are metadata, and the
+                        // move_one republish rides merge_block_mappings,
+                        // whose sticky-head save IS the kvmap arm (A10), so
+                        // a moved mapping's record rewrite needs nothing
+                        // here. A census that saw zero kvmap blocks would
+                        // retire a volume with LIVE data still on it.
+                        entries = br.kvmap_layout_entries(kv, local_ino).await;
                     }
                 }
                 if entries.is_empty() {

@@ -180,9 +180,10 @@ pub(crate) struct FileMap {
 }
 
 /// Walk every meta volume's live inode tree and collect each striped
-/// file's parsed block map (the `census_for` walk shape — inline maps
-/// and indirect blobs both). Undecodable mappings are skipped (fsck owns
-/// that surface).
+/// file's parsed block map (the `census_for` walk shape — inline maps,
+/// indirect blobs, and `kvmap:` heads via the SHARED tree-7 extraction,
+/// design-kvmap-block-map-tree §3 walkers). Undecodable mappings are
+/// skipped (fsck owns that surface).
 pub(crate) async fn walk_striped_files(
     meta: &Arc<RoutedMetaBackend>,
     router: &DataRouter,
@@ -241,6 +242,15 @@ pub(crate) async fn walk_striped_files(
                                 raw = decoded;
                             }
                         }
+                    } else if map_id
+                        .starts_with(crate::meta_backend::kv::block_map::KVMAP_HEAD_PREFIX)
+                    {
+                        // PR 4 (kvmap, design §3 walkers): a `kvmap:` head's
+                        // entries live in tree 7 — the SHARED extraction,
+                        // never a second ad-hoc walk (Rev 1.1 #3). A head
+                        // resolving to zero entries would make the file
+                        // invisible to every defrag gauge and mover pick.
+                        raw = br.kvmap_layout_entries(kv, local_ino).await;
                     }
                 }
                 if raw.is_empty() {

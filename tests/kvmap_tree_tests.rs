@@ -45,8 +45,8 @@ use squeezefs::meta_backend::kv::superblock::{
     FEATURE_INCOMPAT_KV_BLOCK_MAP_TREE, MULTI_WRITER_FORMAT_BITS,
 };
 use squeezefs::meta_backend::kv::{
-    META_KV_BLOCK_MAP_DELETES, META_KV_BLOCK_MAP_LOOKUPS, META_KV_BLOCK_MAP_PUTS,
-    META_KV_JOURNAL_ENTRIES,
+    META_KV_BLOCK_MAP_DELETES, META_KV_BLOCK_MAP_LOOKUP_EXACT, META_KV_BLOCK_MAP_LOOKUP_RANGE,
+    META_KV_BLOCK_MAP_PUTS, META_KV_JOURNAL_ENTRIES,
 };
 use squeezefs::meta_backend::{Metadata, RoutedMetaBackend};
 use std::sync::atomic::Ordering;
@@ -521,8 +521,10 @@ async fn get_block_mapping_and_range_round_trip_with_cross_ino_isolation() {
         .await
         .expect("publish b");
 
-    // Exact hits and absent keys.
-    let lookups_before = META_KV_BLOCK_MAP_LOOKUPS.load(Ordering::Relaxed);
+    // Exact hits and absent keys (PR 3 split the merged PR-1 counter:
+    // exact lookups and range reads attribute separately).
+    let exact_before = META_KV_BLOCK_MAP_LOOKUP_EXACT.load(Ordering::Relaxed);
+    let range_before = META_KV_BLOCK_MAP_LOOKUP_RANGE.load(Ordering::Relaxed);
     assert_eq!(
         rig.kv().get_block_mapping(ino_a, 0).await.unwrap(),
         Some(a0.clone())
@@ -546,8 +548,13 @@ async fn get_block_mapping_and_range_round_trip_with_cross_ino_isolation() {
         "ino b must not see ino a's index-5 mapping"
     );
     assert!(
-        META_KV_BLOCK_MAP_LOOKUPS.load(Ordering::Relaxed) > lookups_before,
-        "the lookup counter must account for the resolution traffic"
+        META_KV_BLOCK_MAP_LOOKUP_EXACT.load(Ordering::Relaxed) > exact_before,
+        "the exact-lookup counter must account for the resolution traffic"
+    );
+    assert_eq!(
+        META_KV_BLOCK_MAP_LOOKUP_RANGE.load(Ordering::Relaxed),
+        range_before,
+        "exact lookups never count as range reads (the §8 #5 split)"
     );
     // The reserved index refuses at the lookup seam too (A5).
     assert!(rig.kv().get_block_mapping(ino_a, u32::MAX).await.is_err());

@@ -51,7 +51,11 @@ use squeezefs::meta_backend::kv::superblock::{
     VolumeFormat, FEATURE_INCOMPAT_KV_BLOCK_KEY_INCARNATION, FEATURE_INCOMPAT_KV_BLOCK_MAP_TREE,
     FEATURE_INCOMPAT_KV_BLOCK_REFCOUNTS,
 };
-use squeezefs::meta_backend::kv::META_KV_BLOCK_MAP_PUTS;
+use squeezefs::meta_backend::kv::revalidate::{BracketVerdict, FetchBracket};
+use squeezefs::meta_backend::kv::{
+    META_KV_BLOCK_MAP_LEAF_READS, META_KV_BLOCK_MAP_LOOKUP_EXACT, META_KV_BLOCK_MAP_LOOKUP_RANGE,
+    META_KV_BLOCK_MAP_PUTS, META_KV_NODE_CACHE_EVICTIONS, META_KV_NODE_CACHE_MISSES,
+};
 use squeezefs::meta_backend::{Metadata, RoutedMetaBackend};
 use squeezefs::nvme_dev::NvmeBlockDev;
 use squeezefs::routing::{BlockMapOp, DataRouter, LayoutFlip};
@@ -827,6 +831,381 @@ async fn giant_sparse_matrix_survives_remount_exact() {
             offset: want,
         },
         "the boundary record is the POINT form of its key string"
+    );
+    rig.shutdown().await;
+}
+
+// ===========================================================================
+// 4. A7 probation (design §8 #3) — eviction order under budget pressure
+// ===========================================================================
+
+/// Restores the node-cache budget knob on every exit (a panicking leg
+/// must not poison the suite's environment).
+struct BudgetGuard;
+
+impl Drop for BudgetGuard {
+    fn drop(&mut self) {
+        std::env::remove_var("SQUEEZEFS_META_NODE_CACHE_MB");
+    }
+}
+
+/// Demand-loaded tree-7 LEAVES enter the clock on PROBATION: no second
+/// chance until a second touch. Under budget pressure a once-touched
+/// giant-map leaf stream evicts ITSELF, and a twice-touched foreign-tree
+/// node (an xattr working set) survives the whole pass — pre-A7 the
+/// stream's leaves all carried set ref bits, so the first over-budget
+/// sweep cleared everyone and evicted the OLDEST mapping: the foreign
+/// working set.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn tree7_demand_leaves_enter_the_clock_on_probation() {
+    let _serial = serial();
+    let meta = NamedTempFile::new().unwrap();
+    format_meta_kvmap(meta.path()).await;
+    let data = data_file();
+    let (map_ino, warm_ino) = {
+        let rig = mount(meta.path(), data.path()).await;
+        let map_ino = rig.mk_file("giant_map").await;
+        let warm_ino = rig.mk_file("warm_set").await;
+        // The foreign working set: ~300 fat xattrs → several 64 KiB
+        // xattr-tree leaves.
+        let val = vec![0xEEu8; 800];
+        for i in 0..300 {
+            rig.routed
+                .setxattr(warm_ino, &format!("w{i}"), &val)
+                .await
+                .expect("plant xattr");
+        }
+        // The giant map: ~32k fat STRING records → ~40 tree-7 leaves at
+        // 64 KiB nodes (records are planted raw through the tx seam; the
+        // stream below never resolves them, so decoration is free).
+        let mut b = 0u32;
+        while b < 32_768 {
+            let ops: Vec<squeezefs::meta_backend::kv::block_map::BlockMapOp> = (0..512)
+                .map(|i| squeezefs::meta_backend::kv::block_map::BlockMapOp::Put {
+                    owner_ino: map_ino,
+                    block_index: b + i,
+                    entry: MapEntry::String(
+                        format!("999999:0:65536:leaf-filler-{:040}", b + i).into_bytes(),
+                    ),
+                })
+                .collect();
+            rig.kv()
+                .set_layout_and_size_with_map(map_ino, b"giant-map-layout", 4096, &[], &ops)
+                .await
+                .expect("plant map records");
+            b += 512;
+        }
+        rig.shutdown().await;
+        (map_ino, warm_ino)
+    };
+
+    // Reopen COLD under a 2 MiB budget (32 × 64 KiB nodes): every node
+    // below demand-pages.
+    let _guard = BudgetGuard;
+    std::env::set_var("SQUEEZEFS_META_NODE_CACHE_MB", "2");
+    let rig = mount(meta.path(), data.path()).await;
+
+    // The foreign working set: touched TWICE (load + hit ⇒ ref bit set).
+    for _ in 0..2 {
+        assert!(rig
+            .kv()
+            .getxattr(warm_ino, "w150")
+            .await
+            .expect("warm read")
+            .is_some());
+    }
+
+    // The giant-map stream: page tree-7 leaves until well past the
+    // budget (the leaf-read counter is the honest leaf census — pages
+    // within one leaf re-touch it, which is exactly what probation
+    // permits).
+    let leaves_before = META_KV_BLOCK_MAP_LEAF_READS.load(Ordering::Relaxed);
+    let evict_before = META_KV_NODE_CACHE_EVICTIONS.load(Ordering::Relaxed);
+    let mut cursor = 0u32;
+    loop {
+        let page = rig
+            .kv()
+            .block_map_range(map_ino, cursor, 4096)
+            .await
+            .expect("stream");
+        let Some(last) = page.last().map(|(i, _)| *i) else {
+            break;
+        };
+        if META_KV_BLOCK_MAP_LEAF_READS.load(Ordering::Relaxed) - leaves_before >= 28 {
+            break;
+        }
+        cursor = match last.checked_add(1) {
+            Some(n) => n,
+            None => break,
+        };
+    }
+    let leaves_streamed = META_KV_BLOCK_MAP_LEAF_READS.load(Ordering::Relaxed) - leaves_before;
+    assert!(
+        leaves_streamed >= 24,
+        "the fixture must stream enough tree-7 leaves to pressure the budget \
+         (got {leaves_streamed})"
+    );
+    assert!(
+        META_KV_NODE_CACHE_EVICTIONS.load(Ordering::Relaxed) > evict_before,
+        "the stream must actually evict — no pressure, no verdict"
+    );
+
+    // The verdict: the twice-touched foreign node SURVIVED the stream.
+    let misses_before = META_KV_NODE_CACHE_MISSES.load(Ordering::Relaxed);
+    assert!(rig
+        .kv()
+        .getxattr(warm_ino, "w150")
+        .await
+        .expect("warm re-read")
+        .is_some());
+    assert_eq!(
+        META_KV_NODE_CACHE_MISSES.load(Ordering::Relaxed),
+        misses_before,
+        "a once-touched tree-7 leaf stream must not evict the twice-touched \
+         foreign working set (A7 probation)"
+    );
+    rig.shutdown().await;
+}
+
+// ===========================================================================
+// 5. A9 reader bracket (design §8 #4)
+// ===========================================================================
+
+/// Posture: `reader_fetch_epoch` is `None` on a WRITE mount (gated on
+/// the read-only latch BEFORE any epoch word is touched — the pinned
+/// no-bracket byte-identity) and on an un-armed read-only probe (a
+/// frozen snapshot has no epoch to bracket); `Some(epoch)` once the S5
+/// arming declaration ran — and the armed reader's kvmap fetch resolves
+/// the tree map exactly.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn reader_bracket_arms_on_armed_readers_only() {
+    let _serial = serial();
+    let meta = NamedTempFile::new().unwrap();
+    format_meta_kvmap(meta.path()).await;
+    let data = data_file();
+    let (ino, entries) = {
+        let rig = mount(meta.path(), data.path()).await;
+        let ino = rig.mk_file("reader_view").await;
+        let mut entries = rig.publish_spill(ino, SPILL_BLOCKS).await;
+        entries.sort_unstable_by_key(|&(b, _)| b);
+        // The WRITE-mount posture: no epoch source exists at all.
+        assert_eq!(
+            rig.kv().reader_fetch_epoch(),
+            None,
+            "a write mount has no reader epoch (the zero-epoch-reads pin)"
+        );
+        assert_eq!(rig.routed.reader_fetch_epoch(ino), None);
+        // …and its own fetch path serves the tree map (no bracket).
+        let map = rig.refetched_map(ino).await;
+        assert_eq!(map.len(), entries.len());
+        rig.shutdown().await;
+        (ino, entries)
+    };
+
+    // An RO probe WITHOUT arming: frozen snapshot, still no epoch.
+    {
+        let probe = KvMetaBackend::open_read_only(meta.path())
+            .await
+            .expect("ro probe");
+        assert_eq!(
+            probe.reader_fetch_epoch(),
+            None,
+            "an un-armed read-only open serves its snapshot — nothing to bracket"
+        );
+        drop(probe);
+    }
+
+    // The ARMED reader: epoch present, kvmap fetch bracket resolves the
+    // exact map.
+    let reader = KvMetaBackend::open_read_only(meta.path())
+        .await
+        .expect("read-only mount");
+    reader
+        .arm_reader_revalidation(None)
+        .expect("arm reader revalidation");
+    let epoch = reader
+        .reader_fetch_epoch()
+        .expect("an armed reader has a bracket epoch");
+    assert_ne!(epoch, 0, "armed epochs are nonzero by construction");
+
+    let routed = Arc::new(RoutedMetaBackend::new(vec![reader]));
+    assert_eq!(routed.reader_fetch_epoch(ino), Some(epoch));
+    let dlm = DlmClient::new().unwrap();
+    let nvme = Arc::new(NvmeBlockDev::new(data.path().to_str().unwrap()));
+    let alloc = Arc::new(BlockAllocator::new(DATA_VOL_ID).await.unwrap());
+    alloc.set_capacity_bytes(DATA_LEN);
+    let cache = TieredCache::new(
+        Vec::new(),
+        Some("64MB"),
+        Some("64MB"),
+        Some("16MB"),
+        Some("32MB"),
+        alloc.clone(),
+        nvme.clone(),
+        None,
+    )
+    .await
+    .unwrap();
+    let router = DataRouter::new(dlm, cache, alloc, nvme);
+    router.set_meta_backend(routed.clone());
+    let fetched = router
+        .fetch_metadata(&squeezefs::keys::inode_path(ino))
+        .await
+        .expect("armed-reader fetch");
+    assert_eq!(fetched.block_map_id.as_deref(), Some("kvmap:1"));
+    let map = fetched.block_map.as_deref().expect("tree-resolved map");
+    assert_eq!(map.len(), entries.len());
+    for (b, k) in &entries {
+        assert_eq!(map.get(b), Some(k), "index {b} resolved under the bracket");
+    }
+}
+
+/// The bracket core's seqlock law, pinned directly (the epoch step is
+/// not injectable mid-fetch, so the loop-control core is its own unit):
+/// unarmed (`None`) adopts in one pass without a second probe demand; a
+/// stable epoch adopts; a step retries exactly once per step; and a
+/// probe that never stabilizes exhausts loudly instead of spinning.
+#[test]
+fn fetch_bracket_core_retries_on_epoch_step() {
+    // Unarmed: one pass, adopt.
+    let mut b = FetchBracket::new(4);
+    b.begin(None);
+    assert!(matches!(b.commit(None), Ok(BracketVerdict::Adopt)));
+    assert_eq!(b.retries(), 0);
+
+    // Stable epoch: adopt.
+    let mut b = FetchBracket::new(4);
+    b.begin(Some(7));
+    assert!(matches!(b.commit(Some(7)), Ok(BracketVerdict::Adopt)));
+
+    // One step: retry, then adopt at the new epoch.
+    let mut b = FetchBracket::new(4);
+    b.begin(Some(7));
+    assert!(matches!(b.commit(Some(8)), Ok(BracketVerdict::Retry)));
+    assert_eq!(b.retries(), 1);
+    b.begin(Some(8));
+    assert!(matches!(b.commit(Some(8)), Ok(BracketVerdict::Adopt)));
+
+    // Never-stable: bounded, loud.
+    let mut b = FetchBracket::new(2);
+    b.begin(Some(1));
+    assert!(matches!(b.commit(Some(2)), Ok(BracketVerdict::Retry)));
+    b.begin(Some(2));
+    assert!(matches!(b.commit(Some(3)), Ok(BracketVerdict::Retry)));
+    b.begin(Some(3));
+    assert!(
+        b.commit(Some(4)).is_err(),
+        "a probe that never stabilizes must exhaust loudly, never spin"
+    );
+}
+
+// ===========================================================================
+// 6. The stats split (design §8 #5) + the resolve economy (§9 #2)
+// ===========================================================================
+
+/// The merged PR-1 lookups counter is SPLIT: `get_block_mapping` bumps
+/// exact-hits only, `block_map_range` bumps range-reads only, and a
+/// demand-loaded tree-7 leaf counts as a leaf read at the node-cache
+/// miss site (the §5 `leaf_reads` gauge — cheaply attributable because
+/// `CachedNode` carries `tree_id`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn lookup_counters_split_exact_vs_range_and_count_leaf_reads() {
+    let _serial = serial();
+    let meta = NamedTempFile::new().unwrap();
+    format_meta_kvmap(meta.path()).await;
+    let data = data_file();
+    let ino = {
+        let rig = mount(meta.path(), data.path()).await;
+        let ino = rig.mk_file("split").await;
+        rig.publish_spill(ino, SPILL_BLOCKS).await;
+        rig.shutdown().await;
+        ino
+    };
+
+    // COLD reopen: the first exact lookup demand-pages a tree-7 leaf.
+    let rig = mount(meta.path(), data.path()).await;
+    let exact_before = META_KV_BLOCK_MAP_LOOKUP_EXACT.load(Ordering::Relaxed);
+    let range_before = META_KV_BLOCK_MAP_LOOKUP_RANGE.load(Ordering::Relaxed);
+    let leaves_before = META_KV_BLOCK_MAP_LEAF_READS.load(Ordering::Relaxed);
+
+    assert!(rig
+        .kv()
+        .get_block_mapping(ino, 7)
+        .await
+        .expect("exact")
+        .is_some());
+    assert_eq!(
+        META_KV_BLOCK_MAP_LOOKUP_EXACT.load(Ordering::Relaxed) - exact_before,
+        1,
+        "one exact lookup"
+    );
+    assert_eq!(
+        META_KV_BLOCK_MAP_LOOKUP_RANGE.load(Ordering::Relaxed),
+        range_before,
+        "an exact lookup is not a range read"
+    );
+    assert!(
+        META_KV_BLOCK_MAP_LEAF_READS.load(Ordering::Relaxed) > leaves_before,
+        "the cold exact lookup demand-paged a tree-7 leaf"
+    );
+
+    let exact_mid = META_KV_BLOCK_MAP_LOOKUP_EXACT.load(Ordering::Relaxed);
+    assert!(!rig
+        .kv()
+        .block_map_range(ino, 0, 16)
+        .await
+        .expect("range")
+        .is_empty());
+    assert_eq!(
+        META_KV_BLOCK_MAP_LOOKUP_RANGE.load(Ordering::Relaxed) - range_before,
+        1,
+        "one range read"
+    );
+    assert_eq!(
+        META_KV_BLOCK_MAP_LOOKUP_EXACT.load(Ordering::Relaxed),
+        exact_mid,
+        "a range read is not an exact lookup"
+    );
+    rig.shutdown().await;
+}
+
+/// The resolve economy (§9 #2's read half, in-process): fetch-rehydrating
+/// a 4096-entry kvmap ino costs a LEAF-AMORTIZED handful of tree range
+/// calls — entries/page + the terminal empty page — and zero exact
+/// lookups; never a per-index resolution storm.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn fetch_rehydration_is_leaf_amortized() {
+    let _serial = serial();
+    let meta = NamedTempFile::new().unwrap();
+    format_meta_kvmap(meta.path()).await;
+    let data = data_file();
+    let rig = mount(meta.path(), data.path()).await;
+    let ino = rig.mk_file("amortized").await;
+    const N: u32 = 4096;
+    rig.publish_spill(ino, N).await;
+
+    rig.router.metadata_cache.invalidate(&ino);
+    let exact_before = META_KV_BLOCK_MAP_LOOKUP_EXACT.load(Ordering::Relaxed);
+    let range_before = META_KV_BLOCK_MAP_LOOKUP_RANGE.load(Ordering::Relaxed);
+    let fetched = rig
+        .router
+        .fetch_metadata(&squeezefs::keys::inode_path(ino))
+        .await
+        .expect("refetch");
+    assert_eq!(
+        fetched.block_map.as_deref().map(|m| m.len()),
+        Some(N as usize)
+    );
+    let range_calls = META_KV_BLOCK_MAP_LOOKUP_RANGE.load(Ordering::Relaxed) - range_before;
+    assert!(
+        range_calls <= u64::from(N) / 512 + 2,
+        "fetch rehydration must be leaf-amortized: {range_calls} range calls \
+         for {N} entries (page size 512)"
+    );
+    assert_eq!(
+        META_KV_BLOCK_MAP_LOOKUP_EXACT.load(Ordering::Relaxed),
+        exact_before,
+        "rehydration never resolves per-index"
     );
     rig.shutdown().await;
 }

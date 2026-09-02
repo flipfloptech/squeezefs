@@ -7811,6 +7811,9 @@ impl KvMetaBackend {
         // acquire (checkpoint-freeze/SMO interference shows here),
         // revalidate, pre-images, reservation, RAM apply.
         let t_locks = std::time::Instant::now();
+        // e2e audit D: the PURE lock-acquire wait inside that window, Σ
+        // over every attempt (`lock_phase_ns.leaf_lock_wait`).
+        let mut leaf_wait = std::time::Duration::ZERO;
         let mut attempt = 0usize;
         let (res, undo, failed) = loop {
             attempt += 1;
@@ -7855,9 +7858,11 @@ impl KvMetaBackend {
             lock_set.sort_by_key(|n| n.addr());
             lock_set.dedup_by_key(|n| n.addr());
             let mut guards = Vec::with_capacity(lock_set.len());
+            let t_leaf = std::time::Instant::now();
             for node in &lock_set {
                 guards.push(node.lock().write().await);
             }
+            leaf_wait += t_leaf.elapsed();
             // Revalidate EVERY member under the locks (§4.6); any stale
             // leaf ⇒ drop ALL, re-resolve ALL, re-lock the union.
             let stale = s.entries.iter().zip(&leaves).any(|(q, entry_leaves)| {
@@ -8036,6 +8041,10 @@ impl KvMetaBackend {
             break (res, undo, failed);
         };
         meta_txpass_phase_record(MetaTxPassPhase::PassLeafLocks, t_locks);
+        crate::fuse_client::lock_phase_record(
+            crate::fuse_client::LockPhase::LeafLockWait,
+            leaf_wait,
+        );
 
         // (6) The pass's own bytes, outside every lock: the surviving
         // members' entries — N ORDINARY checksummed entries in the one

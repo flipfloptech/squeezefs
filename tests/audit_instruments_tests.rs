@@ -802,15 +802,42 @@ fn lock_family_is_pinned_to_four_phases() {
 /// The 3.5 stripe guard: an uncontended acquire records a ZERO wait (the
 /// fast path pays no clock read for it) and one hold; a contended acquire
 /// records the wait it actually parked for, and the holder's hold
-/// brackets its critical section.
+/// brackets its critical section. The HOLD half is the
+/// `SQUEEZEFS_OP_PROFILE`-gated half (measured +66.6 ns/acquire always-on,
+/// over the ~50 ns rule): OFF by default, armed here through the seam.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn stripe_lock_wait_and_hold_move_on_contention_and_wait_is_zero_uncontended() {
-    use squeezefs::fuse_client::lock_phase_json;
+    use squeezefs::fuse_client::{lock_phase_json, set_stripe_hold_timing};
     use squeezefs::routing::meta_lock_acquire;
     let _g = serial().await;
     const INO: u64 = 0x5EED_0001;
 
-    // Uncontended.
+    // Default posture (rig off): the wait half records, the hold half is
+    // silent.
+    let f0 = lock_phase_json();
+    drop(meta_lock_acquire(INO).await);
+    let f1 = lock_phase_json();
+    assert_eq!(
+        phase_words(&f1, "stripe_lock_wait").0 - phase_words(&f0, "stripe_lock_wait").0,
+        1,
+        "the wait half is always-on"
+    );
+    assert_eq!(
+        phase_words(&f1, "stripe_lock_hold"),
+        phase_words(&f0, "stripe_lock_hold"),
+        "the hold half is gated (off with the rig off)"
+    );
+
+    struct Disarm;
+    impl Drop for Disarm {
+        fn drop(&mut self) {
+            set_stripe_hold_timing(false);
+        }
+    }
+    let _d = Disarm;
+    set_stripe_hold_timing(true);
+
+    // Uncontended, hold armed.
     let f0 = lock_phase_json();
     {
         let g = meta_lock_acquire(INO).await;
@@ -899,10 +926,12 @@ async fn dlm_exclusive_inode_guard_records_its_hold() {
     );
 }
 
-/// Through the real FS: creates take the 4a exclusive I-guard (holds move)
-/// and commit through the conveyor, whose pass records exactly one
-/// `leaf_lock_wait` per `pass_leaf_locks` with `Σ leaf_lock_wait ≤
-/// Σ pass_leaf_locks` (the pure wait is a subset of the locked window).
+/// Through the real FS: mkdirs take the parent's 4a EXCLUSIVE I-guard
+/// (design §3.8 — regular creates take it SHARED, so they are not this
+/// histogram's population) and commit through the conveyor, whose pass
+/// records exactly one `leaf_lock_wait` per `pass_leaf_locks` with
+/// `Σ leaf_lock_wait ≤ Σ pass_leaf_locks` (the pure wait is a subset of
+/// the locked window).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn conveyor_pass_splits_the_leaf_lock_pure_wait() {
     use squeezefs::fuse_client::{lock_phase_json, meta_txpass_phase_json};
@@ -911,7 +940,9 @@ async fn conveyor_pass_splits_the_leaf_lock_pure_wait() {
     let l0 = lock_phase_json();
     let t0 = meta_txpass_phase_json();
     for i in 0..16 {
-        create(&h, &format!("d{i}")).await;
+        h.fs.mkdir(h.req, 1, OsStr::new(&format!("d{i}")), 0o755, 0)
+            .await
+            .expect("mkdir");
     }
     let l1 = lock_phase_json();
     let t1 = meta_txpass_phase_json();
@@ -919,7 +950,7 @@ async fn conveyor_pass_splits_the_leaf_lock_pure_wait() {
     let (pl1, pls1) = phase_words(&t1, "pass_leaf_locks");
     let (lw0, lws0) = phase_words(&l0, "leaf_lock_wait");
     let (lw1, lws1) = phase_words(&l1, "leaf_lock_wait");
-    assert!(pl1 - pl0 >= 1, "creates run conveyor passes");
+    assert!(pl1 - pl0 >= 1, "mkdirs run conveyor passes");
     assert_eq!(lw1 - lw0, pl1 - pl0, "one leaf_lock_wait per pass");
     assert!(
         lws1 - lws0 <= pls1 - pls0,
@@ -927,10 +958,12 @@ async fn conveyor_pass_splits_the_leaf_lock_pure_wait() {
         lws1 - lws0,
         pls1 - pls0
     );
-    assert!(
-        phase_words(&l1, "dlm_guard_hold").0 - phase_words(&l0, "dlm_guard_hold").0 >= 16,
-        "every create holds at least one exclusive I-guard"
-    );
+    // Every mkdir holds the parent's exclusive I-guard; its drop rides
+    // the conveyor's terminal fan-out (the queue entry co-owns the guard
+    // set until then), so the LAST op's sample may land after this read
+    // — the population, not the exact count, is the contract.
+    let holds = phase_words(&l1, "dlm_guard_hold").0 - phase_words(&l0, "dlm_guard_hold").0;
+    assert!(holds >= 8, "mkdirs hold exclusive I-guards (saw {holds})");
 
     // Stats-inode surface, ungated.
     let reply =

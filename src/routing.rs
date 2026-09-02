@@ -38,8 +38,10 @@ static INODE_META_LOCKS: once_cell::sync::Lazy<StripeLocks<crate::sqz_sync::SqzM
 /// Census-wrapped `INODE_META_LOCKS` acquisition (the D1.b named-holder
 /// surface, VL10): every acquisition site routes here so a contended wait
 /// on the block-map merge domain shows up in the watchdog's lock-wait
-/// census with its inode named. Fast path = one `try_lock`.
-pub(crate) async fn meta_lock_acquire(ino: u64) -> crate::sqz_sync::SqzMutexGuard<'static, ()> {
+/// census with its inode named, and (e2e audit D) every site's wait AND
+/// hold land in `lock_phase_ns` through the one guard type. Fast path =
+/// one `try_lock`. `pub` for the contract suite's contention fixture.
+pub async fn meta_lock_acquire(ino: u64) -> crate::fuse_client::MetaLockGuard {
     crate::fuse_client::census_meta_lock_acquire(INODE_META_LOCKS.get_inode_lock(ino), ino).await
 }
 

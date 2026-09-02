@@ -1045,6 +1045,57 @@ fn bench_sharded_counters(c: &mut Criterion) {
     });
 
     group.throughput(criterion::Throughput::Elements(1));
+
+    // e2e audit D: the `INODE_META_LOCKS` (3.5) guard now records its wait
+    // (a zero sample, no clock read, on the uncontended fast path) and its
+    // HOLD (one `Instant` at acquire + one at drop) at every site. This
+    // pair prices the uncontended acquire→drop cycle against a bare
+    // `try_lock` guard on the same primitive — the ~50 ns/acquire rule
+    // the hold half's always-on posture is gated on.
+    group.bench_function("stripe_lock_bare_try_lock_1thread", |b| {
+        let lock = squeezefs::sqz_sync::SqzMutex::new(());
+        b.iter(|| {
+            let g = lock.try_lock().expect("uncontended");
+            black_box(&g);
+            drop(g);
+        });
+    });
+    group.bench_function("stripe_lock_guard_wait_only_1thread", |b| {
+        squeezefs::fuse_client::set_stripe_hold_timing(false);
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        b.iter_custom(|iters| {
+            rt.block_on(async {
+                let t0 = std::time::Instant::now();
+                for _ in 0..iters {
+                    let g = squeezefs::routing::meta_lock_acquire(0x5EED).await;
+                    black_box(&g);
+                    drop(g);
+                }
+                t0.elapsed()
+            })
+        });
+    });
+    group.bench_function("stripe_lock_guard_wait_hold_1thread", |b| {
+        squeezefs::fuse_client::set_stripe_hold_timing(true);
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        b.iter_custom(|iters| {
+            rt.block_on(async {
+                let t0 = std::time::Instant::now();
+                for _ in 0..iters {
+                    let g = squeezefs::routing::meta_lock_acquire(0x5EED).await;
+                    black_box(&g);
+                    drop(g);
+                }
+                t0.elapsed()
+            })
+        });
+        squeezefs::fuse_client::set_stripe_hold_timing(false);
+    });
+
     group.bench_function("hist_record_bucket_only_1thread", |b| {
         let hist: [AtomicU64; 26] = [const { AtomicU64::new(0) }; 26];
         let mut i = 0u64;

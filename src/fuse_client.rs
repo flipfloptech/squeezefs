@@ -3231,18 +3231,120 @@ pub fn log_lock_wait_census(threshold: Duration) {
     }
 }
 
+// ===========================================================================
+// Lock wait AND hold histograms (`lock_phase_ns`) — e2e audit D
+// (2026-09-02). Before it, wait histograms existed only for the order-1
+// guard, order-2 lease, order-3 block stripes and 4a at three sites; no
+// lock class had a HOLD histogram, `INODE_META_LOCKS` (3.5) had no wait
+// histogram at its 20+ non-publish sites, and the 4b pure wait was
+// lumped into `pass_leaf_locks`. Always-on, exact sums (audit A).
+// ===========================================================================
+
+/// `lock_phase_ns` phases. `repr(usize)` indexes the table directly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(usize)]
+pub enum LockPhase {
+    /// `INODE_META_LOCKS` (3.5) acquire wait, EVERY site: one sample per
+    /// acquire — exactly zero (no clock read) on the uncontended
+    /// `try_lock` fast path, the parked span otherwise.
+    StripeLockWait = 0,
+    /// `INODE_META_LOCKS` (3.5) hold: acquisition → guard drop.
+    StripeLockHold = 1,
+    /// Conveyor pass: Σ pure `node.lock().write().await` wait over the
+    /// union leaf set (all attempts) — the 4b wait split out of
+    /// `pass_leaf_locks`; one sample per pass.
+    LeafLockWait = 2,
+    /// 4a EXCLUSIVE `I{ino}` guard hold: acquisition → `DlmGuard` drop.
+    DlmGuardHold = 3,
+}
+
+const LOCK_PHASES: usize = 4;
+const LOCK_PHASE_NAMES: [&str; LOCK_PHASES] = [
+    "stripe_lock_wait",
+    "stripe_lock_hold",
+    "leaf_lock_wait",
+    "dlm_guard_hold",
+];
+
+static LOCK_PROF: Lazy<[LatencyHistogram; LOCK_PHASES]> =
+    Lazy::new(|| std::array::from_fn(|_| LatencyHistogram::default()));
+
+/// Record one lock span of known length against `phase`.
+#[inline]
+pub fn lock_phase_record(phase: LockPhase, dur: Duration) {
+    LOCK_PROF[phase as usize].record(dur);
+}
+
+/// `lock_phase_ns` stats payload: `{phase: histogram}` — UNGATED.
+pub fn lock_phase_json() -> serde_json::Value {
+    let mut phases = serde_json::Map::new();
+    for (pi, pname) in LOCK_PHASE_NAMES.iter().enumerate() {
+        phases.insert((*pname).to_string(), LOCK_PROF[pi].to_json());
+    }
+    serde_json::Value::Object(phases)
+}
+
+/// The ONE `INODE_META_LOCKS` (3.5) guard every site holds. The WAIT
+/// half is always-on (a zero sample, no clock read, on the uncontended
+/// fast path). The HOLD half (`stripe_lock_hold` — one `Instant` at
+/// acquire + one at drop) is gated on `SQUEEZEFS_OP_PROFILE`: measured
+/// (`benches/high_concurrency_bench.rs`, `stripe_lock_*`, release, two
+/// quiet runs) an uncontended acquire→drop cycle costs 26.8–29.1 ns bare,
+/// 43.7–49.5 ns wait-only (+15–20 ns) and 96.6–123 ns wait+hold
+/// (+67–95 ns — over the ~50 ns always-on rule). This is the write hot
+/// path's per-block/per-publish lock; the audit arms the rig for hold
+/// rows.
+pub struct MetaLockGuard {
+    _g: crate::sqz_sync::SqzMutexGuard<'static, ()>,
+    /// `Some` = hold-timed (`SQUEEZEFS_OP_PROFILE=1`).
+    acquired: Option<std::time::Instant>,
+}
+
+impl Drop for MetaLockGuard {
+    fn drop(&mut self) {
+        if let Some(t) = self.acquired {
+            lock_phase_record(LockPhase::StripeLockHold, t.elapsed());
+        }
+    }
+}
+
+/// The hold-half gate: seeded from `SQUEEZEFS_OP_PROFILE`, runtime-
+/// settable ([`set_stripe_hold_timing`]) so the contract suite and an
+/// A/B row can arm it without a process restart.
+static STRIPE_HOLD_TIMED: Lazy<std::sync::atomic::AtomicBool> =
+    Lazy::new(|| std::sync::atomic::AtomicBool::new(op_profile_enabled()));
+
+/// Arm/disarm `stripe_lock_hold` recording (tests/acceptance seam).
+pub fn set_stripe_hold_timing(on: bool) {
+    STRIPE_HOLD_TIMED.store(on, Ordering::Relaxed);
+}
+
 /// Census-wrapped acquisition of an `INODE_META_LOCKS`-class mutex (used
 /// by `routing::meta_lock_acquire` — the lock lives in `routing`, the
-/// census here). Fast path: one `try_lock`.
+/// census here). Fast path: one `try_lock`; the wait sample is exactly
+/// zero there (no clock read). Contended: the D1.b named-holder census
+/// token + the parked span.
 pub async fn census_meta_lock_acquire(
-    lock: &crate::sqz_sync::SqzMutex<()>,
+    lock: &'static crate::sqz_sync::SqzMutex<()>,
     ino: u64,
-) -> crate::sqz_sync::SqzMutexGuard<'_, ()> {
+) -> MetaLockGuard {
+    let hold_timed = STRIPE_HOLD_TIMED.load(Ordering::Relaxed);
     if let Ok(g) = lock.try_lock() {
-        return g;
+        lock_phase_record(LockPhase::StripeLockWait, Duration::ZERO);
+        return MetaLockGuard {
+            _g: g,
+            acquired: hold_timed.then(std::time::Instant::now),
+        };
     }
     let _t = LockWaitToken::begin(LockClass::Meta, 0, ino, 0);
-    lock.lock().await
+    let t0 = std::time::Instant::now();
+    let g = lock.lock().await;
+    let acquired = std::time::Instant::now();
+    lock_phase_record(LockPhase::StripeLockWait, acquired.duration_since(t0));
+    MetaLockGuard {
+        _g: g,
+        acquired: hold_timed.then_some(acquired),
+    }
 }
 
 /// RAII in-flight WRITE sample (`fuse_write_inflight`): entering samples the
@@ -10110,6 +10212,10 @@ impl SqueezefsFilesystem {
                 // per metadata op class — the profile-gated
                 // `fuse_op_phase_ns` below keeps the deep all-op view.
                 "meta_op_phase_ns": meta_op_phase_json(),
+                // Lock wait AND hold (e2e audit D): the 3.5 stripe guard's
+                // wait/hold at every site, the 4b pure leaf-lock wait,
+                // the 4a exclusive I-guard hold. ALWAYS-ON.
+                "lock_phase_ns": lock_phase_json(),
                 // Read-serve residence decomposition (2026-08-01
                 // serve-latency decomposition campaign): ALWAYS-ON
                 // per-phase histograms — the read twin of the family

@@ -72,15 +72,27 @@ impl DlmLockManager {
             .shard_index(parent ^ xxh3_64(name.as_bytes()).rotate_left(1))
     }
 
+    /// `hold_timed`: the 4a EXCLUSIVE `I{ino}` guard records its hold in
+    /// `lock_phase_ns.dlm_guard_hold` (e2e audit D); shared and dentry
+    /// guards do not.
     async fn lock_stripe(
         locks: &StripeLocks<Arc<RwLock<()>>, STRIPES>,
         index: usize,
         mode: LockMode,
+        hold_timed: bool,
     ) -> DlmGuard {
         let cell = locks.get_by_index(index).clone();
-        match mode {
-            LockMode::Shared => DlmGuard::Shared(cell.read_owned().await),
-            LockMode::Exclusive => DlmGuard::Exclusive(cell.write_owned().await),
+        let inner = match mode {
+            LockMode::Shared => DlmGuardInner::Shared {
+                _g: cell.read_owned().await,
+            },
+            LockMode::Exclusive => DlmGuardInner::Exclusive {
+                _g: cell.write_owned().await,
+            },
+        };
+        DlmGuard {
+            _inner: inner,
+            acquired: hold_timed.then(std::time::Instant::now),
         }
     }
 
@@ -90,13 +102,20 @@ impl DlmLockManager {
             &self.inode_locks,
             self.inode_stripe(ino),
             LockMode::Exclusive,
+            true,
         )
         .await
     }
 
     /// Shared `I{ino}` lock.
     pub async fn lock_inode_shared(&self, ino: u64) -> DlmGuard {
-        Self::lock_stripe(&self.inode_locks, self.inode_stripe(ino), LockMode::Shared).await
+        Self::lock_stripe(
+            &self.inode_locks,
+            self.inode_stripe(ino),
+            LockMode::Shared,
+            false,
+        )
+        .await
     }
 
     /// Exclusive `D{parent,name}` lock.
@@ -105,6 +124,7 @@ impl DlmLockManager {
             &self.dentry_locks,
             self.dentry_stripe(parent, name),
             LockMode::Exclusive,
+            false,
         )
         .await
     }
@@ -115,6 +135,7 @@ impl DlmLockManager {
             &self.dentry_locks,
             self.dentry_stripe(parent, name),
             LockMode::Shared,
+            false,
         )
         .await
     }
@@ -136,19 +157,20 @@ impl DlmLockManager {
             .map(|&(ino, mode)| (self.inode_stripe(ino), mode))
             .collect();
         let mut guards = Vec::with_capacity(inodes.len() + dentries.len());
-        guards.extend(Self::acquire_deduped(&self.inode_locks, &mut plan).await);
+        guards.extend(Self::acquire_deduped(&self.inode_locks, &mut plan, true).await);
 
         let mut plan: Vec<(usize, LockMode)> = dentries
             .iter()
             .map(|&(parent, name, mode)| (self.dentry_stripe(parent, name), mode))
             .collect();
-        guards.extend(Self::acquire_deduped(&self.dentry_locks, &mut plan).await);
+        guards.extend(Self::acquire_deduped(&self.dentry_locks, &mut plan, false).await);
         guards
     }
 
     async fn acquire_deduped(
         locks: &StripeLocks<Arc<RwLock<()>>, STRIPES>,
         plan: &mut Vec<(usize, LockMode)>,
+        inode_class: bool,
     ) -> Vec<DlmGuard> {
         plan.sort_unstable_by_key(|&(idx, mode)| (idx, mode == LockMode::Shared));
         // After the sort an exclusive request on a stripe precedes a shared
@@ -156,13 +178,38 @@ impl DlmLockManager {
         plan.dedup_by_key(|&mut (idx, _)| idx);
         let mut guards = Vec::with_capacity(plan.len());
         for &(idx, mode) in plan.iter() {
-            guards.push(Self::lock_stripe(locks, idx, mode).await);
+            let hold_timed = inode_class && mode == LockMode::Exclusive;
+            guards.push(Self::lock_stripe(locks, idx, mode, hold_timed).await);
         }
         guards
     }
 }
 
-pub enum DlmGuard {
-    Shared(crate::sqz_sync::OwnedSqzRwLockReadGuard<()>),
-    Exclusive(crate::sqz_sync::OwnedSqzRwLockWriteGuard<()>),
+/// The held RwLock guard (RAII only — never read).
+enum DlmGuardInner {
+    Shared {
+        _g: crate::sqz_sync::OwnedSqzRwLockReadGuard<()>,
+    },
+    Exclusive {
+        _g: crate::sqz_sync::OwnedSqzRwLockWriteGuard<()>,
+    },
+}
+
+/// One held 4a object lock. Dropping an EXCLUSIVE `I{ino}` guard records
+/// its hold in `lock_phase_ns.dlm_guard_hold` (e2e audit D).
+pub struct DlmGuard {
+    _inner: DlmGuardInner,
+    /// `Some` = hold-timed (exclusive inode class).
+    acquired: Option<std::time::Instant>,
+}
+
+impl Drop for DlmGuard {
+    fn drop(&mut self) {
+        if let Some(t) = self.acquired {
+            crate::fuse_client::lock_phase_record(
+                crate::fuse_client::LockPhase::DlmGuardHold,
+                t.elapsed(),
+            );
+        }
+    }
 }

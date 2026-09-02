@@ -1412,6 +1412,9 @@ fn bench_op_trace_hook(c: &mut Criterion) {
     });
     op_trace::disarm();
     let _ = op_trace::drain();
+    group.finish();
+}
+
 /// A future that is Pending on its first poll and Ready on the second —
 /// the device-read completion oneshot's shape (the DMA always outlives
 /// the first poll, so `Timeout::poll` registers the sleep's waker).

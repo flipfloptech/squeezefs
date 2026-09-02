@@ -28,10 +28,15 @@
 //! owning thread pushes (Release on `head`), the stats-inode drain pops
 //! (Acquire on `head`, Release on `tail`). A full ring DROPS the push and
 //! the caller counts it — a trace is a diagnostic and may never park,
-//! spill or allocate on the data path. The producer's Acquire load of
-//! `tail` is what orders the consumer's slot reads before the producer's
-//! overwrite of that slot; weakening either edge admits a torn sample
-//! (the `op_trace_ring_*` loom models pin this).
+//! spill or allocate on the data path. The producer's Release store of
+//! `head` publishes the three slot words to the consumer's Acquire load
+//! — weakening either side drains an unwritten `(0, 0, 0)` slot, which
+//! the `op_trace_ring_*` loom models catch (weakening-verified
+//! 2026-09-02). The producer's Acquire load of `tail` against the
+//! consumer's Release store is the reuse edge (a slot is overwritten only
+//! after its sample was read); its failure is a load-store reordering
+//! loom's stale-read model cannot express, so that pair stands on the
+//! Lamport SPSC argument, not on a model.
 //!
 //! ## The sampling law
 //!

@@ -277,6 +277,8 @@ pub mod grant_table_core;
 pub mod incarnation_core;
 #[path = "../../crates/squeezefs-ipc/src/cqe_core.rs"]
 pub mod ipc_cqe_core;
+#[path = "../../crates/squeezefs-ipc/src/op_trace_core.rs"]
+pub mod op_trace_core;
 #[path = "../../crates/squeezefs-ipc/src/ring_core.rs"]
 pub mod ipc_ring_core;
 #[path = "../../crates/squeezefs-ipc/src/slot_core.rs"]
@@ -5954,6 +5956,135 @@ mod range_custody_models {
                 TOKEN,
                 "at quiesce the floor covers the retired grant exactly"
             );
+        });
+    }
+}
+
+#[cfg(all(test, loom))]
+mod op_trace_ring_models {
+    //! [`op_trace_core::TraceRing`]: the per-thread SPSC trace ring
+    //! (e2e audit A2). One producer (the stamping thread) pushes while
+    //! the consumer (the `.trace` drain) pops concurrently — BOTH are
+    //! spawned threads (loom does not preempt the model's main thread
+    //! ahead of its first tracked access after a spawn, so a main-thread
+    //! consumer never observes a concurrent push and the model is vacuous;
+    //! verified 2026-09-02). Invariants:
+    //! * **never torn, never stale**: every drained sample's three words
+    //!   belong to ONE push — the producer's Release head store publishes
+    //!   them and the consumer's Acquire head load sees all three or none.
+    //!   Weakening the head store to Relaxed drains
+    //!   `Sample { 0, 0, 0 }` (the unwritten slot) — caught.
+    //! * **never lost, never duplicated, in order**: across the drains,
+    //!   exactly the pushes the producer reported succeeded come out,
+    //!   each once, in push order. The consumer's Release tail store and
+    //!   the producer's Acquire tail load are what let a slot be reused
+    //!   only after its sample was read — that edge's failure mode (a
+    //!   slot read reordered PAST the consumer's tail publish, so the
+    //!   producer's overwrite lands in the read) is a load-store
+    //!   reordering loom's stale-read model cannot express, so weakening
+    //!   the tail pair is NOT caught here (verified 2026-09-02); the pair
+    //!   is the textbook Lamport SPSC requirement and stays by argument.
+    //! * **drop, never block**: a full ring refuses the push and the
+    //!   producer makes progress regardless of the consumer.
+    use crate::op_trace_core::{Sample, TraceRing};
+    use loom::sync::Arc;
+    use loom::thread;
+
+    fn sample(i: u64) -> Sample {
+        Sample {
+            op_id: i,
+            stage: i as u16,
+            mono_ns: i * 10,
+        }
+    }
+
+    /// `out` must be exactly `sample(1..=pushed)` in order: a stale slot
+    /// read (the zero-initialized words, or a previous lap's sample)
+    /// fails the range/order checks, a torn triple fails the field
+    /// agreement.
+    fn assert_intact(out: &[Sample], pushed: u64) {
+        assert_eq!(out.len() as u64, pushed, "every accepted push drains exactly once");
+        for (i, s) in out.iter().enumerate() {
+            assert_eq!(s.op_id, i as u64 + 1, "stale/duplicate/missing sample at {i}: {s:?}");
+            assert_eq!(u64::from(s.stage), s.op_id, "torn sample {s:?}");
+            assert_eq!(s.mono_ns, s.op_id * 10, "torn sample {s:?}");
+        }
+    }
+
+    /// A 2-slot ring, 3 pushes racing one concurrent drain: the third
+    /// push may land (a slot freed by the drain) or drop (full) — either
+    /// way what drains is intact, ordered and exactly the accepted set.
+    #[test]
+    fn spsc_ring_never_tears_loses_or_duplicates() {
+        loom::model(|| {
+            let ring = Arc::new(TraceRing::with_capacity(2));
+            let producer = {
+                let ring = ring.clone();
+                thread::spawn(move || {
+                    let mut pushed = 0u64;
+                    for i in 1..=3u64 {
+                        if ring.push(sample(i)) {
+                            pushed += 1;
+                        }
+                    }
+                    pushed
+                })
+            };
+            let consumer = {
+                let ring = ring.clone();
+                thread::spawn(move || {
+                    let mut out = Vec::new();
+                    ring.drain_into(&mut out);
+                    out
+                })
+            };
+            let pushed = producer.join().unwrap();
+            let mut out = consumer.join().unwrap();
+            ring.drain_into(&mut out);
+            assert!(pushed >= 2, "a 2-slot ring accepts at least two of three pushes");
+            assert_intact(&out, pushed);
+            assert!(ring.is_empty(), "drained to empty");
+        });
+    }
+
+    /// The reuse edge: a full ring, a drain freeing its slots racing the
+    /// producer's next push into a freed slot — what drains is exactly
+    /// the two resident samples plus the re-push if it landed, in order
+    /// (the slot-reuse bookkeeping: `head − tail` against capacity across
+    /// the wrap).
+    #[test]
+    fn spsc_ring_reuse_happens_after_the_read() {
+        loom::model(|| {
+            let ring = Arc::new(TraceRing::with_capacity(2));
+            assert!(ring.push(sample(1)));
+            assert!(ring.push(sample(2)));
+            let producer = {
+                let ring = ring.clone();
+                thread::spawn(move || {
+                    // Two attempts: the ring is full until the consumer
+                    // frees a slot; a refused push is the drop law.
+                    let mut pushed = 0u64;
+                    for _ in 0..2 {
+                        if ring.push(sample(3)) {
+                            pushed += 1;
+                            break;
+                        }
+                    }
+                    pushed
+                })
+            };
+            let consumer = {
+                let ring = ring.clone();
+                thread::spawn(move || {
+                    let mut out = Vec::new();
+                    ring.drain_into(&mut out);
+                    out
+                })
+            };
+            let pushed = producer.join().unwrap();
+            let mut out = consumer.join().unwrap();
+            ring.drain_into(&mut out);
+            assert_intact(&out, 2 + pushed);
         });
     }
 }

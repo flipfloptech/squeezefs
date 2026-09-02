@@ -1306,8 +1306,118 @@ fn bench_tier_get_contended(c: &mut Criterion) {
     group.finish();
 }
 
+/// e2e audit A2 (2026-09-02): the per-op trace ring's HOOK cost — the
+/// number every always-on phase record now pays on top of its histogram
+/// RMWs. The contract the rows price: DISARMED ≤ ~1 ns per hook (one
+/// pointer load / one thread-local read / one field compare), ARMED
+/// ≤ ~20 ns per stamp (selection multiply + ring-index read + three
+/// relaxed slot stores + one Release head store + one per-ring counter
+/// RMW). Field shape: every op leaves ~10–20 stamps, so at the 1 M
+/// IOPS class the armed cost is what the `divisor` derivation amortizes.
+fn bench_op_trace_hook(c: &mut Criterion) {
+    use squeezefs::op_trace::{self, Stage};
+    use std::time::{Duration, Instant};
+
+    let mut group = c.benchmark_group("op_trace_hook");
+    group.throughput(criterion::Throughput::Elements(1));
+    let now = Instant::now();
+
+    // ---- disarmed (the shipped default) -------------------------------
+    op_trace::disarm();
+    let _ = op_trace::drain();
+    group.bench_function("stamp_disarmed", |b| {
+        let mut id = 1u64;
+        b.iter(|| {
+            id += 2;
+            op_trace::stamp(black_box(id), Stage::ReadRouted, now);
+        });
+    });
+    group.bench_function("stamp_current_disarmed", |b| {
+        b.iter(|| op_trace::stamp_current(Stage::ReadRouted, black_box(now)));
+    });
+    group.bench_function("traced_disarmed", |b| {
+        let mut id = 1u64;
+        b.iter(|| {
+            id += 2;
+            black_box(op_trace::traced(black_box(id)));
+        });
+    });
+    // The per-poll cost of the scope wrapper when the op binds nothing
+    // (disarmed / unsampled): a field compare over the bare future.
+    group.bench_function("scope_poll_unbound", |b| {
+        b.iter(|| {
+            let fut = op_trace::scope(black_box(0u64), std::future::ready(7u32));
+            black_box(squeezefs_ipc::sqz_blocking::block_on(fut))
+        });
+    });
+    group.bench_function("bare_poll_control", |b| {
+        b.iter(|| {
+            black_box(squeezefs_ipc::sqz_blocking::block_on(std::future::ready(
+                7u32,
+            )))
+        });
+    });
+
+    // ---- armed, every op sampled, one ring deep enough to never drop
+    // inside a measured window (drained between windows) --------------
+    const CAP: usize = 1 << 16;
+    op_trace::arm_for_tests_with_geometry(1, 4, CAP);
+    group.bench_function("stamp_armed", |b| {
+        b.iter_custom(|iters| {
+            let mut total = Duration::ZERO;
+            let mut left = iters;
+            let mut id = 1u64;
+            while left > 0 {
+                let n = left.min((CAP / 2) as u64);
+                let t0 = Instant::now();
+                for _ in 0..n {
+                    id += 2;
+                    op_trace::stamp(black_box(id), Stage::ReadRouted, now);
+                }
+                total += t0.elapsed();
+                let _ = op_trace::drain();
+                left -= n;
+            }
+            total
+        });
+    });
+    group.bench_function("stamp_current_armed", |b| {
+        b.iter_custom(|iters| {
+            let mut total = Duration::ZERO;
+            let mut left = iters;
+            while left > 0 {
+                let n = left.min((CAP / 2) as u64);
+                total += squeezefs_ipc::sqz_blocking::block_on(op_trace::scope(0x5EED, async {
+                    let t0 = Instant::now();
+                    for _ in 0..n {
+                        op_trace::stamp_current(Stage::ReadRouted, black_box(now));
+                    }
+                    t0.elapsed()
+                }));
+                let _ = op_trace::drain();
+                left -= n;
+            }
+            total
+        });
+    });
+    // Armed but UNSAMPLED (divisor 1 << 20): the cost an untraced op pays
+    // under an armed ring — the load + the selection multiply.
+    op_trace::arm_for_tests_with_geometry(1 << 20, 4, CAP);
+    group.bench_function("stamp_armed_unsampled", |b| {
+        let mut id = 1u64;
+        b.iter(|| {
+            id += 2;
+            op_trace::stamp(black_box(id), Stage::ReadRouted, now);
+        });
+    });
+    op_trace::disarm();
+    let _ = op_trace::drain();
+    group.finish();
+}
+
 criterion_group!(
     benches,
+    bench_op_trace_hook,
     bench_reclaim_enqueue,
     bench_sharded_counters,
     bench_op_registry,

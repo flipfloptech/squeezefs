@@ -1134,11 +1134,19 @@ pub fn stats_json() -> serde_json::Value {
 // The client
 // ---------------------------------------------------------------------------
 
+/// **Test seam** (the S8 `TEST_SHIP_DRAIN_HOLD_MS` precedent): milliseconds
+/// the publish lane's drain waits at its head before taking the queue, so
+/// concurrent arrivals accumulate deterministically and the framing
+/// contract is testable without a sleep as coordination. `0` = off.
+pub static TEST_PUBLISH_DRAIN_HOLD_MS: AtomicU64 = AtomicU64::new(0);
+
 /// The client half: one authenticated session per authority endpoint, kept
 /// warm.
 pub struct PublishClient {
     peer_id: Arc<str>,
     secret: Arc<Vec<u8>>,
+    /// Frames this client may hold in flight per endpoint.
+    depth: usize,
     sessions: scc::HashMap<String, Arc<crate::sqz_sync::SqzMutex<Option<RpcClient>>>>,
 }
 
@@ -1146,6 +1154,7 @@ impl std::fmt::Debug for PublishClient {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PublishClient")
             .field("peer_id", &self.peer_id)
+            .field("depth", &self.depth)
             .field("sessions", &self.sessions.len())
             .finish_non_exhaustive()
     }
@@ -1155,9 +1164,16 @@ impl PublishClient {
     /// A client identifying itself as `peer_id`, proving storage membership
     /// with the volume set's `job:enroll` secret.
     pub fn new(peer_id: &str, secret: Vec<u8>) -> Arc<Self> {
+        Self::with_depth(peer_id, secret, 1)
+    }
+
+    /// [`Self::new`] with an explicit per-endpoint in-flight frame depth
+    /// (the measurement lever; `1` = stop-and-wait).
+    pub fn with_depth(peer_id: &str, secret: Vec<u8>, depth: usize) -> Arc<Self> {
         Arc::new(Self {
             peer_id: Arc::from(peer_id),
             secret: Arc::new(secret),
+            depth: depth.max(1),
             sessions: scc::HashMap::new(),
         })
     }

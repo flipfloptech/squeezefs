@@ -81,16 +81,21 @@ impl Drop for Serial {
     }
 }
 
+/// Disarm every process-global half a rig arms (between rows and at exit).
+fn reset_planes() {
+    data_grant::uninstall_custody_client();
+    data_grant::uninstall_custody_owner();
+    publish::uninstall_client();
+    ship::disarm_ownership();
+    data_custody::test_reset_custody_generation();
+    data_custody::test_clear_poison();
+}
+
 struct Restore;
 
 impl Drop for Restore {
     fn drop(&mut self) {
-        data_grant::uninstall_custody_client();
-        data_grant::uninstall_custody_owner();
-        publish::uninstall_client();
-        ship::disarm_ownership();
-        data_custody::test_reset_custody_generation();
-        data_custody::test_clear_poison();
+        reset_planes();
     }
 }
 
@@ -313,35 +318,161 @@ impl TwoNodes {
     }
 }
 
+/// Poll `cond` at 1 ms until it holds or `within` elapses (a bounded
+/// condition wait, never a sleep as coordination).
+async fn eventually(within: Duration, mut cond: impl FnMut() -> bool) -> bool {
+    let deadline = Instant::now() + within;
+    loop {
+        if cond() {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+}
+
+/// The drain-hold seam, armed for one scope.
+struct DrainHold;
+
+impl DrainHold {
+    fn arm(ms: u64) -> Self {
+        publish::TEST_PUBLISH_DRAIN_HOLD_MS.store(ms, Ordering::SeqCst);
+        DrainHold
+    }
+}
+
+impl Drop for DrainHold {
+    fn drop(&mut self) {
+        publish::TEST_PUBLISH_DRAIN_HOLD_MS.store(0, Ordering::SeqCst);
+    }
+}
+
+/// The hold every framing contract arms: long enough that a burst of
+/// concurrent submissions is provably queued before the drain takes it.
+const HOLD_MS: u64 = 150;
+
 // ===========================================================================
-// 1. The measurement contract — the campaign's in-process row
+// 1. The measurement rows — the campaign's in-process face
 // ===========================================================================
 
-/// **The publish plane's shape under a 24-ino concurrent co-writer.**
+/// **The publish plane's shape under a 24-ino concurrent co-writer**, at
+/// the derived depth and at depth 1 (the two levers isolated).
 ///
-/// Today (dev tip): `PublishClient::ship` encodes ONE call per
-/// `PublishRequestFrame` and serializes every ship on the endpoint's
-/// session mutex, so 24 concurrent publishes are 24 stop-and-wait round
-/// trips — **frames/publish = 1.0** — and the owner sees them one at a
-/// time, so its conveyor runs **one pass per publish** (passes/publish
-/// ≈ 1.0: nothing co-queues). The journal-entry count is N by law (one
-/// tx = one checksummed entry) and must stay N under any fix.
+/// Dev tip `4c596ec2`: `PublishClient::ship` encoded ONE call per
+/// `PublishRequestFrame` and serialized every ship on the endpoint's
+/// session mutex, so 24 concurrent publishes were 24 stop-and-wait round
+/// trips — **frames/publish = 1.0** — and the owner saw them one at a
+/// time, so its conveyor ran **one pass per publish** (nothing
+/// co-queued): measured 24 / 24 / 24 entries / 291–378 µs per publish.
+/// The journal-entry count is N by law (one tx = one checksummed entry)
+/// and must stay N under any fix.
 ///
-/// The row is printed as the in-process face of the S9-a wall; the
-/// assertions pin today's shape so the D-1b fix FLIPS them.
+/// The contract here is the NATURAL (seam-free) collapse: a busy pipe
+/// self-batches, so a concurrent set must ride well under one frame per
+/// publish and well under one owner pass per publish. The strict bound
+/// lives in the seam-controlled contract below.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn measurement_row_24_concurrent_publishes_from_one_co_writer() {
+async fn measurement_rows_24_concurrent_publishes_from_one_co_writer() {
+    let _serial = serial();
+    let _restore = restore();
+    for (label, pc) in [
+        (
+            "derived depth",
+            publish::PublishClient::new(NODE, SECRET.to_vec()),
+        ),
+        (
+            "depth 1",
+            publish::PublishClient::with_depth(NODE, SECRET.to_vec(), 1),
+        ),
+    ] {
+        let dir = TempDir::new().unwrap();
+        let nodes = TwoNodes::start(dir.path(), pc).await;
+        nodes.warm().await;
+        let inos = mint(&nodes.owner_be, INOS, "stream").await;
+
+        let before = counters(&nodes.auth);
+        let (outcomes, wall) = nodes
+            .publish_concurrently(&inos, |i| 4096 * (i as u64 + 1))
+            .await;
+        let after = counters(&nodes.auth);
+
+        for (i, out) in outcomes.iter().enumerate() {
+            out.as_ref()
+                .unwrap_or_else(|e| panic!("publish {i} failed: {e}"));
+        }
+        for (i, &ino) in inos.iter().enumerate() {
+            assert_eq!(
+                owner_size(&nodes.owner_be, ino).await,
+                4096 * (i as u64 + 1),
+                "every caller's own publish landed on its own ino"
+            );
+        }
+
+        let frames = after.frames - before.frames;
+        let passes = after.passes - before.passes;
+        let entries = after.entries - before.entries;
+        let n = INOS as f64;
+        println!(
+            "D-1b in-process row [{label}] (debug build, file-backed KV sandbox, loopback \
+             wire): {INOS} concurrent publishes from one co-writer -> frames {frames} \
+             ({:.2}/publish), owner conveyor passes {passes} ({:.2}/publish), journal \
+             entries {entries}, wall {:.2} ms ({:.1} us/publish)",
+            frames as f64 / n,
+            passes as f64 / n,
+            wall.as_secs_f64() * 1e3,
+            wall.as_secs_f64() * 1e6 / n
+        );
+
+        assert_eq!(
+            entries, INOS as u64,
+            "[{label}] one tx = one checksummed journal entry — the count that never collapses"
+        );
+        assert!(
+            frames * 2 <= INOS as u64,
+            "[{label}] a busy publish pipe self-batches: {frames} frames for {INOS} concurrent \
+             publishes is the stop-and-wait shape"
+        );
+        assert!(
+            passes * 2 <= INOS as u64,
+            "[{label}] batched publishes co-queue on the owner's conveyor: {passes} passes for \
+             {INOS} publishes is the one-pass-per-publish shape"
+        );
+
+        nodes.stop().await;
+        // Between rows the process-global halves must be re-armable.
+        reset_planes();
+    }
+}
+
+// ===========================================================================
+// 2. The framing contract (seam-controlled): 24 concurrent publishes ride
+//    ≤ 4 frames and ≤ 4 owner conveyor passes
+// ===========================================================================
+
+/// Contract: a burst of 24 concurrent publishes from one co-writer to one
+/// authority is framed into **at most 4 wire frames** and commits in **at
+/// most 4 conveyor passes** at the owner (the frame's independent inos
+/// co-queue into ONE M7 pass — D-1's mechanism, applied to the publish
+/// plane), while the journal-entry count stays 24 and every caller gets
+/// its own reply (its own ino's size lands). The drain-hold seam makes
+/// "concurrent" deterministic: all 24 are queued before the drain takes
+/// the queue, so the ideal is ONE frame.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn twenty_four_concurrent_publishes_ride_at_most_four_frames_and_four_passes() {
     let _serial = serial();
     let _restore = restore();
     let dir = TempDir::new().unwrap();
     let pc = publish::PublishClient::new(NODE, SECRET.to_vec());
     let nodes = TwoNodes::start(dir.path(), pc).await;
     nodes.warm().await;
-    let inos = mint(&nodes.owner_be, INOS, "stream").await;
+    let inos = mint(&nodes.owner_be, INOS, "burst").await;
 
+    let _hold = DrainHold::arm(HOLD_MS);
     let before = counters(&nodes.auth);
-    let (outcomes, wall) = nodes
-        .publish_concurrently(&inos, |i| 4096 * (i as u64 + 1))
+    let (outcomes, _wall) = nodes
+        .publish_concurrently(&inos, |i| 8192 * (i as u64 + 1))
         .await;
     let after = counters(&nodes.auth);
 
@@ -352,40 +483,301 @@ async fn measurement_row_24_concurrent_publishes_from_one_co_writer() {
     for (i, &ino) in inos.iter().enumerate() {
         assert_eq!(
             owner_size(&nodes.owner_be, ino).await,
-            4096 * (i as u64 + 1),
-            "every caller's own publish landed on its own ino"
+            8192 * (i as u64 + 1),
+            "reply correlation: caller {i}'s publish landed on caller {i}'s ino"
         );
     }
-
     let frames = after.frames - before.frames;
     let passes = after.passes - before.passes;
-    let entries = after.entries - before.entries;
-    let n = INOS as f64;
-    println!(
-        "D-1b in-process row (debug build, file-backed KV sandbox, loopback wire): \
-         {INOS} concurrent publishes from one co-writer -> frames {frames} \
-         ({:.2}/publish), owner conveyor passes {passes} ({:.2}/publish), journal entries \
-         {entries}, wall {:.2} ms ({:.1} us/publish)",
-        frames as f64 / n,
-        passes as f64 / n,
-        wall.as_secs_f64() * 1e3,
-        wall.as_secs_f64() * 1e6 / n
-    );
-
-    assert_eq!(
-        entries, INOS as u64,
-        "one tx = one checksummed journal entry — the count that never collapses"
-    );
-    // TODAY's shape (the finding's signature): one frame per publish and
-    // one conveyor pass per publish — the plane is stop-and-wait depth 1.
-    assert_eq!(
-        frames, INOS as u64,
-        "dev tip: every publish is its own stop-and-wait frame"
+    assert_eq!(after.entries - before.entries, INOS as u64);
+    assert!(
+        frames <= 4,
+        "24 queued publishes must ride ≤ 4 frames (got {frames})"
     );
     assert!(
-        passes >= INOS as u64 - 2,
-        "dev tip: the owner commits the publishes one pass at a time (got {passes} for {INOS})"
+        passes <= 4,
+        "24 framed publishes must co-queue into ≤ 4 owner conveyor passes (got {passes})"
     );
+
+    nodes.stop().await;
+}
+
+// ===========================================================================
+// 3. Per-call isolation inside one frame
+// ===========================================================================
+
+/// Contract: a call that FAILS at the owner (here: a publish naming an
+/// ino the owner does not have) lands its error in ITS caller's reply and
+/// nothing else's — its 8 siblings in the same frame all apply (journal
+/// entries += 8), and the frame count says they WERE one frame. The
+/// caller-side never-lossy refill (the f38 law) hangs off that per-call
+/// `Err`, so isolating it is what keeps a sibling's accounting from being
+/// refilled for a failure it did not have.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_failed_call_isolates_from_its_siblings_in_one_frame() {
+    let _serial = serial();
+    let _restore = restore();
+    let dir = TempDir::new().unwrap();
+    let pc = publish::PublishClient::new(NODE, SECRET.to_vec());
+    let nodes = TwoNodes::start(dir.path(), pc).await;
+    nodes.warm().await;
+    let mut inos = mint(&nodes.owner_be, 8, "iso").await;
+    // The doomed sibling: a routable ino no one minted.
+    let bogus = inos[7] + 500;
+    inos.insert(4, bogus);
+
+    let _hold = DrainHold::arm(HOLD_MS);
+    let before = counters(&nodes.auth);
+    let (outcomes, _wall) = nodes.publish_concurrently(&inos, |_| 4096).await;
+    let after = counters(&nodes.auth);
+
+    for (i, (out, &ino)) in outcomes.iter().zip(&inos).enumerate() {
+        if ino == bogus {
+            assert!(
+                out.is_err(),
+                "the doomed call's failure lands in ITS slot (slot {i})"
+            );
+        } else {
+            out.as_ref()
+                .unwrap_or_else(|e| panic!("sibling {i} must apply, got {e}"));
+            assert_eq!(owner_size(&nodes.owner_be, ino).await, 4096);
+        }
+    }
+    assert_eq!(
+        after.entries - before.entries,
+        8,
+        "the 8 siblings committed; the doomed call staged nothing"
+    );
+    // The burst is ONE frame; the doomed call's bounded witnessed ladder
+    // (`PUBLISH_SHIP_ATTEMPTS` = 3) re-ships it alone twice more, each
+    // answered from the owner's window — the only extra frames allowed.
+    let frames = after.frames - before.frames;
+    assert!(
+        frames <= 3,
+        "all 9 travelled as ONE frame (+ the doomed call's two re-ships) — isolation is per \
+         call, not per frame (got {frames})"
+    );
+
+    nodes.stop().await;
+}
+
+// ===========================================================================
+// 4. A replayed frame is absorbed by the witness, call by call
+// ===========================================================================
+
+/// Contract: a frame re-sent with the SAME `(lease_epoch, request_id)`
+/// witnesses — the lost-reply retry shape — answers every call from the
+/// owner's dedup window: `replays` grows by N, the journal stays where it
+/// was (nothing re-applied), and each caller's outcome is byte-identical
+/// to the winner's. Both the original and the replay travel as ONE frame
+/// each.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_replayed_frame_is_absorbed_by_the_witness_call_by_call() {
+    let _serial = serial();
+    let _restore = restore();
+    let dir = TempDir::new().unwrap();
+    let pc = publish::PublishClient::new(NODE, SECRET.to_vec());
+    let nodes = TwoNodes::start(dir.path(), Arc::clone(&pc)).await;
+    nodes.warm().await;
+    let inos = mint(&nodes.owner_be, 8, "replay").await;
+    let epoch = nodes._client.lease_epoch();
+    let calls: Vec<publish::PublishCall> = inos
+        .iter()
+        .enumerate()
+        .map(|(i, &ino)| publish::PublishCall::SetLayoutAndSize {
+            ino,
+            layout: layout_bytes(16384),
+            size: 16384,
+            refs: Vec::new(),
+            lease_epoch: epoch,
+            request_id: 0xB00 + i as u64,
+        })
+        .collect();
+    let ship_all = |calls: Vec<publish::PublishCall>| {
+        let pc = Arc::clone(&pc);
+        let endpoint = nodes.auth.endpoint.clone();
+        async move {
+            let handles: Vec<_> = calls
+                .into_iter()
+                .map(|call| {
+                    let pc = Arc::clone(&pc);
+                    let endpoint = endpoint.clone();
+                    tokio::spawn(async move { pc.ship(&endpoint, call).await })
+                })
+                .collect();
+            let mut out = Vec::new();
+            for h in handles {
+                out.push(h.await.expect("no panic").expect("the call is answered"));
+            }
+            out
+        }
+    };
+
+    let _hold = DrainHold::arm(HOLD_MS);
+    let before = counters(&nodes.auth);
+    let replays_before = publish::stats().replays;
+    let first = ship_all(calls.clone()).await;
+    let mid = counters(&nodes.auth);
+    assert_eq!(mid.entries - before.entries, 8, "the originals applied");
+    assert_eq!(
+        mid.frames - before.frames,
+        1,
+        "the originals were ONE frame"
+    );
+
+    let replayed = ship_all(calls).await;
+    let after = counters(&nodes.auth);
+    assert_eq!(
+        replayed, first,
+        "every replay answers its winner's own outcome"
+    );
+    assert_eq!(
+        publish::stats().replays - replays_before,
+        8,
+        "every call of the replayed frame is a witness hit"
+    );
+    assert_eq!(
+        after.entries, mid.entries,
+        "journal-entry equality: the replay staged NOTHING"
+    );
+    assert_eq!(after.frames - mid.frames, 1, "the replay was ONE frame");
+    for &ino in &inos {
+        assert_eq!(owner_size(&nodes.owner_be, ino).await, 16384);
+    }
+
+    nodes.stop().await;
+}
+
+// ===========================================================================
+// 5. Same-ino calls inside one frame keep submission order
+// ===========================================================================
+
+/// Contract: two publishes naming ONE ino that land in the same frame
+/// execute in submission order — the later one's state is what the ino
+/// ends with — while independent siblings in the frame run beside them.
+/// Enqueue order is made deterministic by a current-thread runtime: each
+/// submitter is driven to its park (the enqueue is before its first
+/// pending point) before the next is spawned.
+#[tokio::test]
+async fn same_ino_calls_in_one_frame_keep_submission_order() {
+    let _serial = serial();
+    let _restore = restore();
+    let dir = TempDir::new().unwrap();
+    let pc = publish::PublishClient::new(NODE, SECRET.to_vec());
+    let nodes = TwoNodes::start(dir.path(), pc).await;
+    nodes.warm().await;
+    let inos = mint(&nodes.owner_be, 7, "order").await;
+    let hot = inos[3];
+
+    let _hold = DrainHold::arm(HOLD_MS);
+    let before = counters(&nodes.auth);
+    let submit = |ino: u64, size: u64| {
+        let be = Arc::clone(&nodes.client_be);
+        tokio::spawn(async move {
+            publish::set_layout_and_size(&be, ino, &layout_bytes(size), size, &[]).await
+        })
+    };
+    let mut handles = Vec::new();
+    // Submission order: hot@1000, six siblings, hot@2000, one sibling.
+    handles.push(submit(hot, 1000));
+    for _ in 0..8 {
+        tokio::task::yield_now().await;
+    }
+    for &ino in inos.iter().filter(|&&i| i != hot).take(5) {
+        handles.push(submit(ino, 4096));
+    }
+    for _ in 0..8 {
+        tokio::task::yield_now().await;
+    }
+    handles.push(submit(hot, 2000));
+    for _ in 0..8 {
+        tokio::task::yield_now().await;
+    }
+    handles.push(submit(inos[6], 4096));
+    for h in handles {
+        h.await
+            .expect("no panic")
+            .expect("every publish in the frame is answered Ok");
+    }
+    let after = counters(&nodes.auth);
+    assert_eq!(
+        owner_size(&nodes.owner_be, hot).await,
+        2000,
+        "the LATER same-ino publish is what the ino ends with"
+    );
+    assert_eq!(after.entries - before.entries, 8);
+    assert_eq!(
+        after.frames - before.frames,
+        1,
+        "the whole burst — both same-ino calls included — was ONE frame"
+    );
+
+    nodes.stop().await;
+}
+
+// ===========================================================================
+// 6. The in-flight depth is pipelined AND bounded
+// ===========================================================================
+
+/// Contract: with depth K = 2, two frames are in flight to the owner at
+/// once (a second session is dialed while the first frame is parked at
+/// the owner), and the K+1'th frame WAITS — no third session is ever
+/// dialed; it ships on the first session the moment that frame
+/// completes. The owner is parked by holding the served inos' serve
+/// stripes (`test_lock_serve_ino`), which is exactly where a served
+/// layout publish parks.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_in_flight_frame_depth_is_pipelined_and_bounded() {
+    let _serial = serial();
+    let _restore = restore();
+    let dir = TempDir::new().unwrap();
+    let pc = publish::PublishClient::with_depth(NODE, SECRET.to_vec(), 2);
+    let nodes = TwoNodes::start(dir.path(), pc).await;
+    nodes.warm().await;
+    let inos = mint(&nodes.owner_be, 3, "depth").await;
+    let (x, y, z) = (inos[0], inos[1], inos[2]);
+    let admitted = || nodes.auth.listener.stats().sessions_admitted;
+    let base = admitted();
+
+    let park_x = publish::test_lock_serve_ino(x).await;
+    let park_y = publish::test_lock_serve_ino(y).await;
+    let submit = |ino: u64| {
+        let be = Arc::clone(&nodes.client_be);
+        tokio::spawn(async move {
+            publish::set_layout_and_size(&be, ino, &layout_bytes(4096), 4096, &[]).await
+        })
+    };
+
+    // Frame 1 (X) parks at the owner on the pooled session.
+    let hx = submit(x);
+    // Frame 2 (Y) must go out WHILE X is parked: a second session dials.
+    let hy = submit(y);
+    assert!(
+        eventually(Duration::from_secs(3), || admitted() == base + 1).await,
+        "depth 2: the second frame is in flight beside the parked first one (a second \
+         session dialed) — got {} admissions over base",
+        admitted() - base
+    );
+    // Frame 3 (Z) is the K+1'th: it waits — no third session, ever.
+    let hz = submit(z);
+    assert!(
+        !eventually(Duration::from_millis(300), || admitted() > base + 1).await,
+        "the depth bound: a third frame never dials a third session while two are in flight"
+    );
+    assert!(!hz.is_finished(), "Z has not shipped while X and Y park");
+
+    // Release X: its frame completes, and Z ships on the SAME session.
+    drop(park_x);
+    hx.await.expect("no panic").expect("X applies");
+    hz.await
+        .expect("no panic")
+        .expect("Z applies once a slot frees");
+    assert_eq!(admitted(), base + 1, "Z reused X's session — still two");
+    drop(park_y);
+    hy.await.expect("no panic").expect("Y applies");
+    for &ino in &inos {
+        assert_eq!(owner_size(&nodes.owner_be, ino).await, 4096);
+    }
 
     nodes.stop().await;
 }

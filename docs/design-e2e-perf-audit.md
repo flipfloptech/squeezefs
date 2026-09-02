@@ -313,7 +313,7 @@ last in the tier** because it buys headroom no current fleet uses.
 | Write #7 | per-WRITE **4 Box + 4 Arc slot closures, per-block `String`s, ~30 atomics** | stack closures, `StackKey`, sharded counters (the op-economy suite's law) |
 | Write #10 | gap seeding re-reads the whole old block | ranged seed of the uncovered span only |
 | DLM #7 | owner `spawn_meta_join` hop (`src/meta_exec.rs:147`) ≤ 32 µs vs ≤ 8 µs read execute | execute on the accepting lane |
-| DLM #8 | stop-and-wait frame depth 1 | pipelined frames (composes with F-A) |
+| ~~DLM #8~~ | stop-and-wait frame depth 1 — **LANDED 2026-09-02 as D-1b** (`.benchmarks/2026-09-02-d1b-publish-plane-batching.md`): the publish plane frames concurrent publishes (N calls per `PublishRequestFrame`, schema 13) and pipelines `SQUEEZEFS_PUBLISH_SHIP_DEPTH` frames per authority on a session pool; the owner co-queues a frame's independent inos (F-A's chains). In-process 24 concurrent publishes: 24 frames / 24 passes / 122 µs each → 1–5 / 3–5 / 26 µs (release). Fleet row owed (the rig is committed) | the SINGLE-CONNECTION half (frames multiplexed on one socket, owner read-ahead) + the wire's 100 ms `ACCEPT_POLL_TICK` stay with D-5 |
 | DLM #9/#10 | wire copies / allocs (LOW) | after #1–#8 |
 
 ### 3.5 At the floor — leave alone (the DLM ledger's floor table)
@@ -510,7 +510,7 @@ R (read), W (write), D (DLM/metadata), C (the shared conveyor).
 | 15 | `perf/fsync-economy` | W-5 | W #9: `fsync_phase_ns` first, then touched-namespace flush + parallel meta legs | `w_durable` + fsync storm |
 | 16 | `perf/read-handler-economy` | R-5 | R #6/#7/#8/#9 batched | `kernel_op_economy_tests` alloc law; `rr_4k` CPU/op |
 | 17 | `perf/write-handler-economy` | W-6 | W #7/#10 batched | op-economy suite; `rw_4k` CPU/op |
-| 18 | `perf/owner-hop-and-depth` | D-5 | DLM #7/#8 | `owner_phase_ns.dispatch`; pipelined frames |
+| 18 | `perf/owner-hop-and-depth` | D-5 | DLM #7 + #8's single-connection half (#8's framing + session-pool depth landed as D-1b, `perf/d1b-publish-plane-batching`) + the accept-tick | `owner_phase_ns.dispatch`; frames multiplexed per socket |
 | 19 | `perf/wire-economy` | D-6 | DLM #9/#10 | after the above |
 | — | `fix/read-deposit-shard-lock` | R | **R #10 — correctness-class triage** | if a reader-visible window exists: red-first repro (the finding-17 pattern), lands as a bug fix outside the perf order; if it is hold time only, it joins R-5 |
 

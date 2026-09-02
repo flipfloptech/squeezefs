@@ -765,3 +765,27 @@ window keeps 5b's whole-map posture (partial inos route through the
 claims train). Items 1–5 landed as one commit (one structure) — the
 per-item red cadence held only for item 0; recorded as an honest
 deviation.
+
+## 17. Finding 45 — adjudicated: no stand-down existed (2026-09-02)
+
+The 6c-i live smoke's "zero kvmap engagement" was an OBSERVABILITY
+failure, not a regression: the crossing HAD engaged (three bit-16
+ratchet stamps in the session-1 log; the verify daemon resolved all
+reads through tree-7 with `layout_indirect_map_reads = 0`), but the
+evidence pipeline could not see it — the ratchet's log line never said
+"kvmap", the per-ino crossing logged nothing, `map_migrate_inos` is
+per-process and died with session 1, and a read-only session's mutating
+tree counters legitimately read 0. A correct run was grep- and
+stats-indistinguishable from the feared blob regression. The over-budget
+stand-down hypothesis was FALSIFIED on both planes (the live threshold
+reads ~5.15 GiB of MAP bytes ≈ a ~450 TiB file at 4 MiB blocks; the §16
+outcome law — over-budget crossings cross into PARTIAL — was green on
+tip and is now pinned in the live-DEFAULT-format FUSE fixture, the f43
+self-arm's first in-process exercise). Landed (`a7684785`): one INFO
+line per crossing (ino, record ops, preexisting, mode) — engagement is
+now greppable by the ladder's name; the observability pin is the red
+test. Live re-verify fully green with session-1 gauges read before
+umount: `map_migrate_inos = 3`, 11,090 record ops, byte-identical
+remount, verify clean, drift 0. Standing lesson recorded: live-smoke
+verdicts must read ENGAGEMENT from the session that did the work, and
+every plane owes one greppable engagement line.

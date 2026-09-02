@@ -1704,14 +1704,85 @@ fn prof_now_ns() -> u64 {
 /// 30 s-class threshold — diagnostic-grade by design.
 static COARSE_NOW_NS: AtomicU64 = AtomicU64::new(0);
 
-/// The profile-mode stamps (four precise `Instant` reads per op) — only
-/// allocated inside [`OpProf`] when `SQUEEZEFS_OP_PROFILE=1`; the
-/// disabled path pays no clock reads at all (the M2 cost contract,
-/// carried forward under the always-on watchdog registration).
+/// The phase stamps (four precise `Instant` reads per op). Carried by
+/// every op when `SQUEEZEFS_OP_PROFILE=1`, and ALWAYS by the metadata
+/// op classes (`meta_op_index`) since e2e audit C — the data paths pay
+/// their clock reads in `write_pipeline_phase_ns`/`read_serve_phase_ns`
+/// already; data ops with the rig off pay no clock reads at all (the M2
+/// cost contract, carried forward under the always-on watchdog
+/// registration).
 struct OpProfStamps {
     t0_ns: u64,
     backend_start_ns: AtomicU64,
     backend_done_ns: AtomicU64,
+}
+
+/// Metadata op classes carrying the always-on `meta_op_phase_ns` family
+/// (e2e audit C), in export order.
+const META_OP_KINDS: [FuseOpKind; 9] = [
+    FuseOpKind::Lookup,
+    FuseOpKind::Getattr,
+    FuseOpKind::Setattr,
+    FuseOpKind::Mkdir,
+    FuseOpKind::Create,
+    FuseOpKind::Unlink,
+    FuseOpKind::Rename,
+    FuseOpKind::Readdir,
+    FuseOpKind::Readdirplus,
+];
+
+/// Index of `kind` in [`META_OP_KINDS`] (`None` = a data/handle op that
+/// owns another phase family).
+#[inline]
+fn meta_op_index(kind: FuseOpKind) -> Option<usize> {
+    META_OP_KINDS.iter().position(|k| *k == kind)
+}
+
+/// `meta_op_phase_ns` phase names — the same four stamp points as the
+/// gated family (`OP_PHASE_NAMES`), index-aligned.
+const META_OP_PHASE_NAMES: [&str; OP_PHASES] =
+    ["entry_to_backend", "backend", "backend_to_reply", "total"];
+
+/// `meta_op_phase_ns` — `[meta op][phase]`, the same four stamp points
+/// as the gated `fuse_op_phase_ns`, ungated.
+static META_OP_PROF: Lazy<[[LatencyHistogram; OP_PHASES]; META_OP_KINDS.len()]> =
+    Lazy::new(|| std::array::from_fn(|_| std::array::from_fn(|_| LatencyHistogram::default())));
+
+/// `meta_op_phase_ns` stats payload: `{op: {phase: histogram}}` —
+/// surfaced UNGATED on the stats inode.
+pub fn meta_op_phase_json() -> serde_json::Value {
+    let mut ops = serde_json::Map::new();
+    for (oi, kind) in META_OP_KINDS.iter().enumerate() {
+        let mut phases = serde_json::Map::new();
+        for (pi, pname) in META_OP_PHASE_NAMES.iter().enumerate() {
+            phases.insert((*pname).to_string(), META_OP_PROF[oi][pi].to_json());
+        }
+        ops.insert(kind.name().to_string(), serde_json::Value::Object(phases));
+    }
+    serde_json::Value::Object(ops)
+}
+
+/// Record the four phases of one op into `hists` from its stamps at
+/// drop time `now` (the D1.a stamp-point law; drop-based so error exits
+/// record truthfully).
+fn record_op_phases(hists: &[LatencyHistogram; OP_PHASES], s: &OpProfStamps, now: u64) {
+    let bs = s.backend_start_ns.load(Ordering::Relaxed);
+    let bd = s.backend_done_ns.load(Ordering::Relaxed);
+    if bs > 0 {
+        hists[0].record(Duration::from_nanos(bs.saturating_sub(s.t0_ns)));
+        if bd >= bs {
+            hists[1].record(Duration::from_nanos(bd - bs));
+        }
+    }
+    let reply_from = if bd > 0 {
+        bd
+    } else if bs > 0 {
+        bs
+    } else {
+        s.t0_ns
+    };
+    hists[2].record(Duration::from_nanos(now.saturating_sub(reply_from)));
+    hists[3].record(Duration::from_nanos(now.saturating_sub(s.t0_ns)));
 }
 
 /// One in-flight FUSE op: created at handler entry, `Drop` at handler
@@ -1765,16 +1836,21 @@ pub struct OpProf {
     kind: FuseOpKind,
     slot: Option<usize>,
     stamps: Option<OpProfStamps>,
+    /// Drop records into the gated `fuse_op_phase_ns` too (the rig is
+    /// armed); metadata ops carry stamps regardless for `meta_op_phase_ns`.
+    profile: bool,
 }
 
 impl OpProf {
     /// The handler entry point: always registers the op with the
-    /// watchdog registry; adds profile stamps only under
-    /// `SQUEEZEFS_OP_PROFILE=1`.
+    /// watchdog registry; adds phase stamps under `SQUEEZEFS_OP_PROFILE=1`
+    /// and, always, for the metadata op classes (e2e audit C).
     #[inline]
     pub fn begin(kind: FuseOpKind, ino: u64) -> OpProf {
         if op_profile_enabled() {
             Self::begin_forced(kind, ino)
+        } else if meta_op_index(kind).is_some() {
+            Self::begin_stamped(kind, ino, false)
         } else {
             OpProf {
                 kind,
@@ -1782,6 +1858,7 @@ impl OpProf {
                     .registry
                     .claim(kind, ino, COARSE_NOW_NS.load(Ordering::Relaxed)),
                 stamps: None,
+                profile: false,
             }
         }
     }
@@ -1790,6 +1867,10 @@ impl OpProf {
     /// process-wide and default-off under `cargo test`, so rig behavior
     /// is exercised explicitly) and the `begin` fast path's slow arm.
     pub fn begin_forced(kind: FuseOpKind, ino: u64) -> OpProf {
+        Self::begin_stamped(kind, ino, true)
+    }
+
+    fn begin_stamped(kind: FuseOpKind, ino: u64, profile: bool) -> OpProf {
         let t0_ns = prof_now_ns();
         OpProf {
             kind,
@@ -1799,6 +1880,7 @@ impl OpProf {
                 backend_start_ns: AtomicU64::new(0),
                 backend_done_ns: AtomicU64::new(0),
             }),
+            profile,
         }
     }
 
@@ -1836,7 +1918,7 @@ impl OpProf {
     /// through CREATE completion, so arrival is the honest span start).
     /// Profile-mode only.
     pub fn note_lookup_arrival(&self, parent: u64, name: &str) {
-        if let Some(s) = &self.stamps {
+        if let (true, Some(s)) = (self.profile, &self.stamps) {
             OP_PROFILE.recent_lookups.note(parent, name, s.t0_ns);
         }
     }
@@ -1845,7 +1927,7 @@ impl OpProf {
     /// LOOKUP-arrival → CREATE-reply span (`fuse_create_under_lock_ns`).
     /// Profile-mode only.
     pub fn pair_create_reply(&self, parent: u64, name: &str) {
-        if self.stamps.is_none() {
+        if !self.profile {
             return;
         }
         if let Some(arrival_ns) = OP_PROFILE.recent_lookups.take(parent, name) {
@@ -1861,24 +1943,12 @@ impl Drop for OpProf {
     fn drop(&mut self) {
         if let Some(s) = &self.stamps {
             let now = prof_now_ns();
-            let hists = &OP_PROFILE.phases[self.kind as usize];
-            let bs = s.backend_start_ns.load(Ordering::Relaxed);
-            let bd = s.backend_done_ns.load(Ordering::Relaxed);
-            if bs > 0 {
-                hists[0].record(Duration::from_nanos(bs.saturating_sub(s.t0_ns)));
-                if bd >= bs {
-                    hists[1].record(Duration::from_nanos(bd - bs));
-                }
+            if self.profile {
+                record_op_phases(&OP_PROFILE.phases[self.kind as usize], s, now);
             }
-            let reply_from = if bd > 0 {
-                bd
-            } else if bs > 0 {
-                bs
-            } else {
-                s.t0_ns
-            };
-            hists[2].record(Duration::from_nanos(now.saturating_sub(reply_from)));
-            hists[3].record(Duration::from_nanos(now.saturating_sub(s.t0_ns)));
+            if let Some(oi) = meta_op_index(self.kind) {
+                record_op_phases(&META_OP_PROF[oi], s, now);
+            }
         }
         if let Some(idx) = self.slot {
             OP_PROFILE.registry.release(idx);
@@ -10035,6 +10105,11 @@ impl SqueezefsFilesystem {
                 // → publish → displaced-free → invalidation → total.
                 // Deliberately ungated (see the PipelinePhase block).
                 "write_pipeline_phase_ns": write_pipeline_phase_json(),
+                // Metadata-op residence (e2e audit C): ALWAYS-ON
+                // {entry_to_backend, backend, backend_to_reply, total}
+                // per metadata op class — the profile-gated
+                // `fuse_op_phase_ns` below keeps the deep all-op view.
+                "meta_op_phase_ns": meta_op_phase_json(),
                 // Read-serve residence decomposition (2026-08-01
                 // serve-latency decomposition campaign): ALWAYS-ON
                 // per-phase histograms — the read twin of the family

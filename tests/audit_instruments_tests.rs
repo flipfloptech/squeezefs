@@ -627,10 +627,7 @@ const META_OP_PHASES: [&str; 4] = ["entry_to_backend", "backend", "backend_to_re
 
 fn meta_op_words(fam: &serde_json::Value, op: &str, phase: &str) -> (u64, u64) {
     let h = &fam[op][phase];
-    assert!(
-        h.is_object(),
-        "meta_op_phase_ns.{op}.{phase} missing from {fam}"
-    );
+    assert!(h.is_object(), "meta_op_phase_ns.{op}.{phase} missing");
     (hist_count(h), hist_sum_ns(h))
 }
 

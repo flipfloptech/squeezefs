@@ -204,3 +204,26 @@ symbol share — design §4.3.
 8. **The per-row-delta transcription** from the artifacts: which six
    24-file sets crossed (`map_migrate_inos` 144), per-row `ipc_ops_*` vs
    fio op counts, per-row `overlay_ack_early_stores` attribution.
+
+## Addendum — same-day raw-device controls (2026-09-02 15:40, the denominators)
+
+Raw `fio` libaio direct against the ten data namespaces on the same
+client, FS mounted but idle (artifacts `raw.*.json` beside the rows).
+These replace the ledger-era constants for every "% of floor" on this
+venue:
+
+| Control | Shape | Result |
+|---|---|---|
+| qd1 fabric RTT (4k randread) | 1×1 | **24.8 µs** mean, p50 24.4, p99 32.4 (the 235 µs constant was another fleet's) |
+| 4k randread IOPS ceiling | 32×8 / 32×32 | **2.03 M** (116 µs mean) / **2.73 M** (365 µs mean) |
+| 1 MiB seq read ceiling | 24×16 (= the FS read job's shape) | **38.59 GiB/s** (41.4 GB/s ≈ 93 % of the 44.7 GB/s payload wire), clat 9.5 ms |
+
+Re-derived distances (same shape, same day):
+
+| FS row | kern | il | verdict |
+|---|---|---|---|
+| seq read 24×16 | 36.88 GiB/s = 89 % of wire | 40.35 GiB/s = **97 % of wire — at the floor** | kern owes ~8 % (transport ingress, read board #2); il has nothing left |
+| seq rewrite | 32.3 = 78 % | 30.5 = 73 % | write board #3/#5 (overlay depth, conveyor) — ~22 % to the wire |
+| rand-4k read 24×8 | 441 k = **22 %** of 2.03 M | 874 k = **43 %** | THE headroom: FS adds ~310 µs (kern) / ~100 µs (il) per op over raw at matching depth — read board #1/#2/#6 |
+| rand-4k write | 476 k / 704 k | raw randwrite control not yet run (nullblk writes are discards — run it before adjudicating) | |
+| seq fresh write | 0.36 GiB/s | | finding 46 |

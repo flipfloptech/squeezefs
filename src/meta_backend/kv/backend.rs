@@ -8238,6 +8238,38 @@ impl KvMetaBackend {
             .await
     }
 
+    /// PR 5a (design §11 row 3): does this stored layout record carry a
+    /// `kvmap:` head sentinel? Probed from the head's own `block_map_id`
+    /// (the KVMAP_HEAD_PREFIX law) — NEVER from the fold error text: the
+    /// rung-19 `head_indirect` gates key on the WORD "indirect" in the
+    /// base-decode error, and a kvmap head's refusal deliberately lacks
+    /// it, which is exactly how a chained merge reached `use_delta` and
+    /// staged a delta onto the delta-ineligible kvmap base.
+    fn stored_layout_is_kvmap_head(cur: &[u8]) -> bool {
+        XattrValue::decode(cur).is_ok_and(|x| {
+            crate::layout_wire::decode_layout_any(&x.value).is_ok_and(|l| {
+                l.block_map_id
+                    .as_deref()
+                    .is_some_and(|id| id.starts_with(super::block_map::KVMAP_HEAD_PREFIX))
+            })
+        })
+    }
+
+    /// PR 5a (design §11 row 3): the chained-merge-onto-a-kvmap-base
+    /// refusal, shared by the direct arm and the aggregated pass.
+    /// Retried-class ("layout delta base unusable" — the shipper's
+    /// error arm resets its RAM provenance, so the retry refetches the
+    /// kvmap head and re-ships the A4 crossing train), staged NOTHING.
+    fn kvmap_chain_refusal(ino: Ino) -> crate::error::SqueezefsError {
+        crate::error::SqueezefsError::InvalidOperation(format!(
+            "layout delta base unusable: kvmap base — ino {ino}'s durable head lives in \
+             the block-map tree; a chained delta staged onto it poisons every later fold \
+             and a partial full Put would clobber it. The chained-merge ∘ kvmap compose \
+             lands in PR 5b — refetch and recompose (the reset provenance re-reads the \
+             kvmap head and the save re-ships the crossing train)"
+        ))
+    }
+
     /// Finding 36: the DATA-block references a recomputed op set RELEASES
     /// — the device frees the publish serve owns post-commit. Map-blob
     /// releases are excluded (their free is the displaced-blob
@@ -8563,6 +8595,18 @@ impl KvMetaBackend {
                         let base_ok = XattrValue::decode(&cur)
                             .map(|x| !x.value.starts_with(b"{"))
                             .unwrap_or(false);
+                        // PR 5a (design §11 row 3 — the aggregated twin
+                        // of the direct arm's screen, see there): a
+                        // chained member on a `kvmap:` base refuses
+                        // BEFORE any staging. No memo probe needed: kvmap
+                        // trains never ride this pass, so a batch-prior
+                        // mate cannot have staged a kvmap head the lookup
+                        // misses (the composed_heads memo is indirect-
+                        // compose state only).
+                        if op.chain && base_ok && Self::stored_layout_is_kvmap_head(&cur) {
+                            failed.push((op.done, Self::kvmap_chain_refusal(op.ino)));
+                            continue;
+                        }
                         // DUR-8b (aggregated twin of the direct path):
                         // the cap must bound the DURABLE chain, not the
                         // caller's RAM counter, which a metadata-cache
@@ -9377,6 +9421,16 @@ impl KvMetaBackend {
                 let base_ok = XattrValue::decode(&cur)
                     .map(|x| !x.value.starts_with(b"{"))
                     .unwrap_or(false);
+                // PR 5a (design §11 row 3): a `kvmap:` base is bincode-
+                // decodable (`base_ok`), and the rung-19 indirect gate
+                // below matches only the WORD "indirect" in the decode
+                // error — so a chained merge reached `use_delta` and
+                // staged a versioned delta ONTO the delta-ineligible
+                // kvmap base (delayed read-side poison: every later fold
+                // of the key refuses). Refuse BEFORE any staging.
+                if chain && base_ok && Self::stored_layout_is_kvmap_head(&cur) {
+                    return Err(Self::kvmap_chain_refusal(ino));
+                }
                 // DUR-8b: the cap must bound the DURABLE chain. The
                 // caller's `layout_delta_chain` is a RAM counter that a
                 // metadata-cache refill resets to 0, so before this probe

@@ -998,9 +998,13 @@ pub struct PublishStats {
     /// kvmap crossing trains EXECUTED for a peer (owner side) —
     /// `shipped ≡ served` is the engagement law.
     pub map_served: u64,
-    /// Shipped kvmap crossings the owner REFUSED (its tree could not
-    /// engage, or the ino carries live range grants — the finding-34
-    /// posture). The client's never-lossy ladder re-publishes.
+    /// kvmap map-plane refusals: shipped crossings the owner refused (its
+    /// tree could not engage, or the ino carries live range grants — the
+    /// finding-34 posture), LOCAL whole-map trains refused under live
+    /// range grants (§11 row 4 — the f34 screen's local twin), and scoped
+    /// Puts refused over a `kvmap:` head (§11 row 2 — the S11 ∘ kvmap
+    /// compose lands in PR 5b). The client's never-lossy ladder
+    /// re-publishes.
     pub map_refused: u64,
 }
 
@@ -3316,6 +3320,36 @@ impl PublishService {
             crate::layout_wire::decode_base_layout(&durable),
             crate::layout_wire::decode_base_layout(&shipped),
         );
+        // PR 5a (design §11 row 2): a `kvmap:` head is UNDECODABLE as a
+        // delta base BY DESIGN (its map lives in tree 7, and its refusal
+        // text deliberately carries no "indirect"), so pre-screen it fell
+        // through the undecodable-base "legacy verbatim" arm below — the
+        // shipper's stale inline map overwrote the head and orphaned
+        // every tree-7 record. The probe reads the head's own
+        // `block_map_id` (the KVMAP_HEAD_PREFIX law — never the decode
+        // error text), on BOTH sides: a kvmap head anywhere in a scoped
+        // Put is un-composable until PR 5b builds the S11 ∘ kvmap
+        // compose. Leak-safe: nothing composed, nothing staged — the
+        // shipper's never-lossy ladder keeps custody of the bytes.
+        let kvmap_side = |bytes: &[u8]| {
+            crate::layout_wire::decode_layout_any(bytes).is_ok_and(|l| {
+                l.block_map_id.as_deref().is_some_and(|id| {
+                    id.starts_with(crate::meta_backend::kv::block_map::KVMAP_HEAD_PREFIX)
+                })
+            })
+        };
+        let kvmap_durable = kvmap_side(&durable);
+        if kvmap_durable || kvmap_side(&shipped) {
+            MAP_REFUSED.fetch_add(1, Ordering::Relaxed);
+            return Err(SqueezefsError::InvalidOperation(format!(
+                "S11: range holder '{client}'s Put for ino {ino} meets a `kvmap:` head \
+                 ({} side) — the map lives in the block-map tree, and applying the Put \
+                 verbatim would regress the head to a stale inline map while orphaning \
+                 every tree-7 record; S11 scoped Puts on a kvmap head land in PR 5b \
+                 (map_refused)",
+                if kvmap_durable { "durable" } else { "shipped" }
+            )));
+        }
         // Rung 19 (the MPI-IO row's live conviction — the 10 GiB face):
         // an INDIRECT layout on EITHER side of a RANGE holder's Put is
         // un-composable at the meta plane UNARMED (the blob is a

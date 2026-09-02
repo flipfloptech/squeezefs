@@ -1159,6 +1159,9 @@ async fn overlay_completions_feed_the_lane_bdp() {
     ctl.open_gate();
 
     let floor = squeezefs::write_pipeline::FLOOR_BLOCKS_PER_LANE * BS;
+    // Process-global METRICS: the dead-ring suite legitimately grows the
+    // loss counter, so assert on the DELTA.
+    let lost0 = METRICS.overlay_ack_early_lost.load(Ordering::Relaxed);
     let base0 = h.fs.write_pipeline.depth_target_base_bytes(BS);
     assert_eq!(
         base0, floor,
@@ -1215,7 +1218,7 @@ async fn overlay_completions_feed_the_lane_bdp() {
     );
     assert_eq!(
         METRICS.overlay_ack_early_lost.load(Ordering::Relaxed),
-        0,
+        lost0,
         "no acked custody lost"
     );
     assert!(

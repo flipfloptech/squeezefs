@@ -7801,6 +7801,27 @@ impl DataRouter {
             cached.block_map = None;
             self.kvmap_partial_arm(ino);
         }
+        // Finding 45 (the observability half): the crossing announces
+        // itself GREPPABLY — the live smoke's `grep kvmap` over a
+        // fully-engaged session read 0 (the ratchet's line says
+        // "block-map tree", the train logs nothing per ino, and the
+        // write-side counters die with the session), so a correct run was
+        // indistinguishable from a blob-plane stand-down. One INFO line
+        // per CROSSING (never per steady-state save): the ladder's name,
+        // the ino, the staged records, and the landed mode.
+        if !head_is_kvmap {
+            log::info!(
+                "kvmap crossing: ino {ino} entered the block-map tree ({} record op(s), \
+                 {} preexisting, mode={}) — design-kvmap-block-map-tree §14/§16",
+                outcome.records,
+                outcome.preexisting,
+                if cached.block_map.is_none() {
+                    "partial"
+                } else {
+                    "whole-map"
+                }
+            );
+        }
         // PR 6a (§12 option b): the republish's resident write authority
         // — whole-map length, or the overlay's for partial entries.
         let est = if cached.block_map.is_none() {

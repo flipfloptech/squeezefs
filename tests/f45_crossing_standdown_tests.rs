@@ -263,7 +263,7 @@ async fn write_until_crossed(h: &H, ino: u64) -> (bool, u64) {
         // The live venue's writeback beat: fio + the kernel flush the
         // dirty span; without it the fixture parks in accumulation and
         // no layout publish (hence no crossing decision) ever runs.
-        if blocks % 32 == 0 {
+        if blocks.is_multiple_of(32) {
             h.fs.fsync(h.req, ino, 0, false).await.expect("fsync");
         }
         let head = durable_head_id(h, ino).await;

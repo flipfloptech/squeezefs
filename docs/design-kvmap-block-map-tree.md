@@ -349,3 +349,38 @@ drift 0.
 3. **The §8 overlay-hit gauge is deferred** to the map-RAM-boundedness
    rung: Rev 1.3 #2's whole-map fetch has no per-index overlay-vs-tree
    decision point to count.
+
+## 11. Rev 1.5 — PR-5 map: the serve-arm hazard table (2026-09-01)
+
+The PR-5 pre-implementation map classified every serve arm a kvmap ino
+can reach on the MULTI-WRITER planes. Three are SILENT-WRONG on the
+PR-3-era tip and gate any mw fleet run until PR 5a closes them
+(single-writer mounts never reach any of them):
+
+| Arm | Today on a `kvmap:1` head | Class |
+|---|---|---|
+| Authority-LOCAL episode compose (`fetch_durable_layout_head`) | reads the head as an EMPTY map (`block_map: None` by format law) → the compose diffs claims against emptiness → mass-deletes live tree-7 records | SILENT-WRONG (worst — no wire needed) |
+| `custody_scoped_layout` (S11 scoped Put) | kvmap head falls through the undecodable-base "legacy verbatim" arm → head regressed to the shipper's stale inline map, tree records orphaned | SILENT-WRONG |
+| Chained shipped `MergeLayoutAndSize` | `head_indirect` gates on the word "indirect" → stages a versioned delta ONTO the delta-ineligible kvmap base → delayed read-side poison (or the compaction arm refuses loud) | SILENT-WRONG (delayed) |
+| `MigrateBlockMap` (sticky-head ship) | owner train correct for a sole current-base shipper; refuses loud under live range grants (f34) | correct / refuses-loud |
+| Fetch/cache-refill | full tree rehydrate | correct |
+
+Further PR-5-binding facts: (a) **the shipped train's diff is
+delete-by-absence** — a second writer's stale whole-map ship would
+mass-delete a peer's fresh bindings (Rev 1.3 #2 gone cross-writer), and
+a diff-deleted binding the shipper never claimed mints NO ref release
+and NO device free (the f36b leak class, kvmap twin owed: owner-side
+recompute + `recomputed` on `MapMigrated`, schema bump). The law chosen:
+**claims-scoped adoption for SHIPPED trains** (the f35 pattern — adopt
+under claim_take, delete only under claim_release, never
+delete-by-absence; the whole-map diff stays local-authority-only), with
+a head-sentinel map generation as the belt. (b) The LOCAL train lacks
+the f34 range-grant screen (serve-side only) — parity required. (c) The
+existing s11-mpiio fleet row already sizes past the crossing on default
+formats, so with f43's self-arm THE ROW IS the kvmap-compose field gate
+— and on the PR-3 tip it would hit the empty-map compose (correctness
+red). Do not run range-custody fleets on tips between PR 3 and PR 5a.
+(d) `GetBlockMapRange`: co-writer READS already resolve locally under
+the S5 staleness bound (safe via free-grace); the verb's load-bearing
+face is the WRITE-side base refresh — measure the read side before
+building it.

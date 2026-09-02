@@ -1067,7 +1067,7 @@ file (`crates/squeezefs-ipc/src/env_knob_core.rs`).
 Knobs that are **measurement levers, not operational settings** say so in the
 registry (`SQUEEZEFS_WRITE_PIPELINE_DEPTH_BLOCKS`, `SQUEEZEFS_PATCH_MAX_BYTES=0`,
 `SQUEEZEFS_PUBLISH_COALESCE_MAX=1`, `SQUEEZEFS_NUMA=0`, `SQUEEZEFS_READ_LANE=0`,
-`SQUEEZEFS_NT_COPY=0`, …). They exist so an A/B can be counted; a fleet running
+`SQUEEZEFS_NT_COPY=0`, `SQUEEZEFS_OVERLAY_DEPTH_GOVERNOR=0`, …). They exist so an A/B can be counted; a fleet running
 one of them is running an experiment.
 
 ### SqueezeFS URI scheme

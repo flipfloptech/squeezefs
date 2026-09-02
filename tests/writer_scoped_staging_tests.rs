@@ -1218,6 +1218,9 @@ fn incompat_bits_are_single_bit_and_pairwise_disjoint() {
             "KV_LAYOUT_VERSIONS",
             sb::FEATURE_INCOMPAT_KV_LAYOUT_VERSIONS,
         ),
+        // PB-class files (docs/design-kvmap-block-map-tree.md): the
+        // block-map tree took bit 16.
+        ("KV_BLOCK_MAP_TREE", sb::FEATURE_INCOMPAT_KV_BLOCK_MAP_TREE),
     ];
     let mut seen = 0u64;
     for (name, bit) in bits {

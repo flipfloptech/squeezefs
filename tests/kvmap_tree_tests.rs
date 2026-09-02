@@ -34,9 +34,8 @@
 use squeezefs::meta_backend::kv::backend::KvMetaBackend;
 use squeezefs::meta_backend::kv::block_map::{
     block_map_key, decode_block_map_key, decode_block_map_value, index_range_from,
-    parse_kvmap_head, BlockMapOp, KvmapHead, MapEntry, BLOCK_MAP_KEY_LEN,
-    BLOCK_MAP_KIND_POINT, BLOCK_MAP_KIND_RUN, BLOCK_MAP_KIND_STRING,
-    BLOCK_MAP_POINT_VALUE_LEN, BLOCK_MAP_VALUE_VERSION,
+    parse_kvmap_head, BlockMapOp, KvmapHead, MapEntry, BLOCK_MAP_KEY_LEN, BLOCK_MAP_KIND_POINT,
+    BLOCK_MAP_KIND_RUN, BLOCK_MAP_KIND_STRING, BLOCK_MAP_POINT_VALUE_LEN, BLOCK_MAP_VALUE_VERSION,
 };
 use squeezefs::meta_backend::kv::builder::{format_v3, FormatV3Options};
 use squeezefs::meta_backend::kv::journal::{tag_for, untag};
@@ -102,7 +101,9 @@ struct Rig {
 }
 
 async fn mount(meta: &std::path::Path) -> Rig {
-    let kv = KvMetaBackend::open(meta).await.expect("open v3 meta volume");
+    let kv = KvMetaBackend::open(meta)
+        .await
+        .expect("open v3 meta volume");
     Rig {
         routed: Arc::new(RoutedMetaBackend::new(vec![kv])),
     }
@@ -221,7 +222,10 @@ fn head_sentinel_round_trips_and_carries_the_sweep_cursor() {
     let top = KvmapHead {
         sweep_cursor: Some(u32::MAX),
     };
-    assert_eq!(parse_kvmap_head(&top.encode()).expect("u32::MAX cursor"), top);
+    assert_eq!(
+        parse_kvmap_head(&top.encode()).expect("u32::MAX cursor"),
+        top
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -241,7 +245,10 @@ fn reserved_index_and_malformed_keys_refuse_loud() {
 
     assert!(decode_block_map_key(&[]).is_err(), "empty");
     let k = block_map_key(7, 3).unwrap();
-    assert!(decode_block_map_key(&k[..BLOCK_MAP_KEY_LEN - 1]).is_err(), "short");
+    assert!(
+        decode_block_map_key(&k[..BLOCK_MAP_KEY_LEN - 1]).is_err(),
+        "short"
+    );
     let mut long = k.to_vec();
     long.push(0);
     assert!(decode_block_map_key(&long).is_err(), "long");
@@ -259,7 +266,10 @@ fn reserved_index_and_malformed_keys_refuse_loud() {
 #[test]
 fn unknown_value_version_kind_and_truncation_refuse_loud() {
     assert!(decode_block_map_value(&[]).is_err(), "empty");
-    assert!(decode_block_map_value(&[BLOCK_MAP_VALUE_VERSION]).is_err(), "kindless");
+    assert!(
+        decode_block_map_value(&[BLOCK_MAP_VALUE_VERSION]).is_err(),
+        "kindless"
+    );
     assert!(
         decode_block_map_value(&[2, BLOCK_MAP_KIND_POINT, 0, 0]).is_err(),
         "unknown version"
@@ -290,15 +300,15 @@ fn unknown_value_version_kind_and_truncation_refuse_loud() {
 #[test]
 fn unknown_kvmap_major_and_malformed_heads_refuse_loud() {
     for bad in [
-        "kvmap:2",             // unknown major — forward-only refusal
-        "kvmap:",              // no major
-        "kvmap:one",           // non-numeric major
-        "kvmap:1;sweep:",      // empty cursor
-        "kvmap:1;sweep:x",     // non-numeric cursor
+        "kvmap:2",                  // unknown major — forward-only refusal
+        "kvmap:",                   // no major
+        "kvmap:one",                // non-numeric major
+        "kvmap:1;sweep:",           // empty cursor
+        "kvmap:1;sweep:x",          // non-numeric cursor
         "kvmap:1;sweep:4294967296", // cursor past u32
-        "kvmap:1;bogus:3",     // unknown segment
-        "kvmap:1;sweep:5;more", // trailing segment
-        "indirect:blk-42",     // not a kvmap head at all
+        "kvmap:1;bogus:3",          // unknown segment
+        "kvmap:1;sweep:5;more",     // trailing segment
+        "indirect:blk-42",          // not a kvmap head at all
         "",
     ] {
         assert!(
@@ -513,11 +523,23 @@ async fn get_block_mapping_and_range_round_trip_with_cross_ino_isolation() {
 
     // Exact hits and absent keys.
     let lookups_before = META_KV_BLOCK_MAP_LOOKUPS.load(Ordering::Relaxed);
-    assert_eq!(rig.kv().get_block_mapping(ino_a, 0).await.unwrap(), Some(a0.clone()));
-    assert_eq!(rig.kv().get_block_mapping(ino_a, 5).await.unwrap(), Some(a5.clone()));
-    assert_eq!(rig.kv().get_block_mapping(ino_a, 7).await.unwrap(), Some(a7.clone()));
+    assert_eq!(
+        rig.kv().get_block_mapping(ino_a, 0).await.unwrap(),
+        Some(a0.clone())
+    );
+    assert_eq!(
+        rig.kv().get_block_mapping(ino_a, 5).await.unwrap(),
+        Some(a5.clone())
+    );
+    assert_eq!(
+        rig.kv().get_block_mapping(ino_a, 7).await.unwrap(),
+        Some(a7.clone())
+    );
     assert_eq!(rig.kv().get_block_mapping(ino_a, 1).await.unwrap(), None);
-    assert_eq!(rig.kv().get_block_mapping(ino_b, 3).await.unwrap(), Some(b3.clone()));
+    assert_eq!(
+        rig.kv().get_block_mapping(ino_b, 3).await.unwrap(),
+        Some(b3.clone())
+    );
     assert_eq!(
         rig.kv().get_block_mapping(ino_b, 5).await.unwrap(),
         None,

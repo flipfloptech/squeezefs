@@ -329,7 +329,8 @@ pub fn encode_entry_payload(records: &[(u8, Record)]) -> Vec<u8> {
 }
 
 /// Encode a record tag byte: the low nibble is the §4.2 `tree_id`
-/// (1..=5), the high nibble the node **level** the record targets — 0 for
+/// (`TREE_INODES..=TREE_ID_MAX`, ≤ 15 by construction), the high nibble
+/// the node **level** the record targets — 0 for
 /// ordinary leaf records (byte == tree_id, the K3 wire encoding
 /// unchanged), > 0 for the SMO task's journaled interior-pointer records
 /// (§4.6: "interior mutations are journaled records"). Replay routes a

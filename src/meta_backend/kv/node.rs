@@ -68,8 +68,8 @@ use std::path::Path;
 #[cfg(debug_assertions)]
 pub(crate) fn debug_audit_records(tree_id: u8, level: u8, records: &[Record]) {
     use super::record::{
-        DentryValue, InodeDelta, InodeValue, RecordKind, XattrValue, TREE_BLOCK_REFS,
-        TREE_DENTRIES, TREE_INODES, TREE_XATTRS,
+        DentryValue, InodeDelta, InodeValue, RecordKind, XattrValue, TREE_BLOCK_MAP,
+        TREE_BLOCK_REFS, TREE_DENTRIES, TREE_INODES, TREE_XATTRS,
     };
     for r in records {
         let ok = match (level, r.kind) {
@@ -87,6 +87,14 @@ pub(crate) fn debug_audit_records(tree_id: u8, level: u8, records: &[Record]) {
                 TREE_BLOCK_REFS => {
                     super::block_refs::decode_block_ref_key(&r.key).is_ok()
                         && super::block_refs::decode_block_ref_value(&r.value).is_ok()
+                }
+                // PB-class files, PR 1: a map record whose key or value
+                // does not decode under its own type would mis-resolve a
+                // block at read time — audited write-side, before a byte
+                // is persisted.
+                TREE_BLOCK_MAP => {
+                    super::block_map::decode_block_map_key(&r.key).is_ok()
+                        && super::block_map::decode_block_map_value(&r.value).is_ok()
                 }
                 _ => true, // foreign trees (test harnesses) are not audited
             },

@@ -558,8 +558,14 @@ impl MigrationTee {
             // index, or (spec §6.2 item 1) a block-reference record's
             // data-volume TAG — a random u64 that can fall inside any
             // migrating keyspace and would tee the record to a volume it
-            // does not belong to.
-            if *tree_id == TREE_ALLOC_RESERVED || *tree_id == super::record::TREE_BLOCK_REFS {
+            // does not belong to. The block-map tree IS ino-keyed, but
+            // its migration story is PR 4/5's (the VL5b engine copies the
+            // three user trees only) — skipped like the other structural
+            // trees until the walkers land.
+            if *tree_id == TREE_ALLOC_RESERVED
+                || *tree_id == super::record::TREE_BLOCK_REFS
+                || *tree_id == super::record::TREE_BLOCK_MAP
+            {
                 continue;
             }
             let Some(ino) = Self::key_owner(&r.key) else {
@@ -657,6 +663,19 @@ pub struct KvMetaBackend {
     /// consumers (checkpoint flush, ledger roots, maintenance) use
     /// [`Self::all_trees`], which includes this one.
     block_refs: Option<KvTree>,
+    /// PB-class files, PR 1 (docs/design-kvmap-block-map-tree.md): the
+    /// **block-map tree** — `Some` exactly when this volume carries
+    /// [`super::superblock::FEATURE_INCOMPAT_KV_BLOCK_MAP_TREE`] (bit 16)
+    /// and the mount may write. `None` means inline/`indirect:` layout
+    /// heads only, i.e. pre-kvmap behavior verbatim — and, unlike
+    /// `block_refs`, staging into an absent tree REFUSES loud (map
+    /// records ARE the mapping; a silent skip is data loss).
+    ///
+    /// The `block_refs` posture otherwise transfers: not part of
+    /// [`Self::trees`] (digest walk / migration keyspace / fsck stay
+    /// defined over the three user trees until PR 4's walkers), included
+    /// in [`Self::all_trees`] for checkpoint/roots/maintenance.
+    block_map: Option<KvTree>,
     alloc: Arc<ExtentAllocator>,
     /// §4.8 monotonic watermark, recovered at mount; the create path
     /// `fetch_add`s it.
@@ -1770,6 +1789,57 @@ impl KvMetaBackend {
             None
         };
 
+        // 5a″. PB-class files, PR 1 (docs/design-kvmap-block-map-tree.md):
+        // the block-map tree, under incompat bit 16 — the bit-9 arm's
+        // discipline verbatim: a stamped volume whose ledger names no
+        // tree-7 root mints one (idempotent across a crash — the claimed
+        // extent's bitmap bit only becomes durable at a checkpoint), the
+        // mint happens BEFORE replay so any map record still in the
+        // journal window folds into the fresh root by key, and a
+        // read-only-degraded mount (unknown-ro bits) never mints.
+        let block_map = if sb.block_map_tree_stamped() && sb.unknown_ro() == 0 {
+            match ledger
+                .tree_roots
+                .iter()
+                .find(|r| r.tree_id == super::record::TREE_BLOCK_MAP)
+            {
+                Some(root) => {
+                    let tree = KvTree::open(
+                        cache.clone(),
+                        super::record::TREE_BLOCK_MAP,
+                        RootPtr {
+                            addr: root.node_addr,
+                            seq: root.node_seq,
+                        },
+                        seq.clone(),
+                    )
+                    .await?;
+                    seq.fetch_max(root.node_seq, Ordering::AcqRel);
+                    Some(tree)
+                }
+                None => {
+                    log::info!(
+                        "meta volume {}: incompat bit 16 (block-map tree) is stamped \
+                         but the ledger names no block-map root — minting an empty \
+                         one (the post-stamp first mount)",
+                        path.display()
+                    );
+                    let mut mint_ctx = SmoContext::new(alloc.clone());
+                    Some(
+                        KvTree::create(
+                            cache.clone(),
+                            &mut mint_ctx,
+                            super::record::TREE_BLOCK_MAP,
+                            seq.clone(),
+                        )
+                        .await?,
+                    )
+                }
+            }
+        } else {
+            None
+        };
+
         // 5b. Read-only replay into the cache, TWO-PHASE (Option C′,
         // docs/design-smo-replay-currency.md §2/§4): routing must not
         // evolve UNDER the content walk. Single-pass seq-order replay
@@ -1820,7 +1890,8 @@ impl KvMetaBackend {
             for (tag, rec) in &entry.records {
                 let (tree_id, level) = untag(*tag);
                 let mounted = matches!(tree_id, TREE_INODES | TREE_DENTRIES | TREE_XATTRS)
-                    || (tree_id == super::record::TREE_BLOCK_REFS && block_refs.is_some());
+                    || (tree_id == super::record::TREE_BLOCK_REFS && block_refs.is_some())
+                    || (tree_id == super::record::TREE_BLOCK_MAP && block_map.is_some());
                 if level > 0 && mounted {
                     interior.push((tree_id, level, entry.seq, rec));
                 }
@@ -1835,6 +1906,9 @@ impl KvMetaBackend {
                 super::record::TREE_BLOCK_REFS => block_refs
                     .as_ref()
                     .expect("phase 1 collects the block-ref tree only when it is mounted"),
+                super::record::TREE_BLOCK_MAP => block_map
+                    .as_ref()
+                    .expect("phase 1 collects the block-map tree only when it is mounted"),
                 _ => unreachable!("phase 1 collects only the mounted trees"),
             };
             // Keep post-mount node-seq mints above every child
@@ -1876,6 +1950,14 @@ impl KvMetaBackend {
                     // volume whose mint raced a crash folds them into the
                     // new root by key.
                     super::record::TREE_BLOCK_REFS => match block_refs.as_ref() {
+                        Some(t) => t,
+                        None => continue,
+                    },
+                    // PB-class files, PR 1: map records replay like any
+                    // other content record — routed by key into the
+                    // (possibly freshly minted) block-map root. An
+                    // un-engaged volume cannot have them.
+                    super::record::TREE_BLOCK_MAP => match block_map.as_ref() {
                         Some(t) => t,
                         None => continue,
                     },
@@ -1996,6 +2078,7 @@ impl KvMetaBackend {
             dentries,
             xattrs,
             block_refs,
+            block_map,
             alloc,
             next_ino: AtomicU64::new(next_ino),
             era_ino_floor_native: next_ino,
@@ -2608,6 +2691,9 @@ impl KvMetaBackend {
         if let Some(t) = self.block_refs.as_ref() {
             v.push(t);
         }
+        if let Some(t) = self.block_map.as_ref() {
+            v.push(t);
+        }
         v
     }
 
@@ -2694,6 +2780,78 @@ impl KvMetaBackend {
             }
         }
         Ok(population)
+    }
+
+    /// `true` ⇔ the block-map tree is engaged on this volume (incompat
+    /// bit 16 present and the mount may write). `false` means every
+    /// layout head stays inline/`indirect:`, exactly as before the bit
+    /// existed — and staging a map record refuses loud
+    /// ([`Self::set_layout_and_size_with_map`]).
+    pub fn block_map_tree_engaged(&self) -> bool {
+        self.block_map.is_some()
+    }
+
+    /// PB-class files, PR 1 (design §3 read law, the exact-key half):
+    /// resolve `(ino, block_index)` through the block-map tree — a point
+    /// lookup. PR 6's run records add the bounded run-floor fallback
+    /// (A6); until then every tree-resident mapping IS a point record,
+    /// so an exact miss is an absent mapping.
+    ///
+    /// `Ok(None)` on a volume with no engaged tree — a caller that must
+    /// distinguish asks [`Self::block_map_tree_engaged`] (the
+    /// `block_ref_scan` posture). The reserved index refuses (A5).
+    pub async fn get_block_mapping(
+        &self,
+        ino: Ino,
+        block_index: u32,
+    ) -> std::result::Result<Option<super::block_map::MapEntry>, KvError> {
+        let Some(tree) = self.block_map.as_ref() else {
+            return Ok(None);
+        };
+        super::META_KV_BLOCK_MAP_LOOKUPS.fetch_add(1, Ordering::Relaxed);
+        let key = super::block_map::block_map_key(ino, block_index)?;
+        match tree.lookup(&key).await? {
+            // A malformed mapping is loud corruption, never a silently
+            // skipped block (a wrong resolve is the failure the tree
+            // exists to prevent).
+            Some(v) => Ok(Some(super::block_map::decode_block_map_value(&v)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// A bounded window of `ino`'s mappings from `from_index` upward, in
+    /// index order — the tree.rs `range` primitive over the per-ino
+    /// prefix ([`super::block_map::index_range_from`]'s exact bounds, so
+    /// one ino's window can never bleed into its neighbour's). PR 3/4/5
+    /// consume it (read windows, walkers, the A1/A2 sweeps' scan side).
+    ///
+    /// `Ok(vec![])` on a volume with no engaged tree, like
+    /// [`Self::get_block_mapping`].
+    pub async fn block_map_range(
+        &self,
+        ino: Ino,
+        from_index: u32,
+        max: usize,
+    ) -> std::result::Result<Vec<(u32, super::block_map::MapEntry)>, KvError> {
+        let Some(tree) = self.block_map.as_ref() else {
+            return Ok(Vec::new());
+        };
+        super::META_KV_BLOCK_MAP_LOOKUPS.fetch_add(1, Ordering::Relaxed);
+        let (lo, hi) = super::block_map::index_range_from(ino, from_index);
+        let page = tree.range(&lo, &hi, max).await?;
+        let mut out = Vec::with_capacity(page.len());
+        for (k, v) in &page {
+            let (owner, index) = super::block_map::decode_block_map_key(k)?;
+            if owner != ino {
+                // Unreachable through the exact bounds — reaching it
+                // means the bounds law broke, which must be loud.
+                return Err(KvError::Corrupt(format!(
+                    "block-map range for ino {ino} returned a record owned by {owner}"
+                )));
+            }
+            out.push((index, super::block_map::decode_block_map_value(v)?));
+        }
+        Ok(out)
     }
 
     /// The resolved OQ 2 contract class for every v3 volume:
@@ -5169,6 +5327,45 @@ impl KvTx {
         }
     }
 
+    /// PB-class files, PR 1 (docs/design-kvmap-block-map-tree.md §3):
+    /// stage the transaction's block-map operations — one `Put` per
+    /// mapping bound, one `Delete` per mapping removed, into the **same**
+    /// tx as the layout record and the inode record. One tx = one
+    /// checksummed journal entry (§4.10), so a mapping can never
+    /// disagree with the head/size that justifies it, not even across a
+    /// torn write; and the publish stays ONE commit (the
+    /// write-commit-economy collapse is not re-split). The reserved
+    /// index `u32::MAX` (design A5) refuses here as a Result — a staged
+    /// tx never carries it.
+    fn stage_block_map(
+        &mut self,
+        ops: &[super::block_map::BlockMapOp],
+    ) -> std::result::Result<(), KvError> {
+        let mut puts = 0u64;
+        let mut deletes = 0u64;
+        for op in ops {
+            let key = op.key()?.to_vec();
+            match op {
+                super::block_map::BlockMapOp::Put { entry, .. } => {
+                    self.stage_put(super::record::TREE_BLOCK_MAP, key, entry.encode());
+                    puts += 1;
+                }
+                super::block_map::BlockMapOp::Delete { .. } => {
+                    self.stage_delete(super::record::TREE_BLOCK_MAP, key);
+                    deletes += 1;
+                }
+            }
+        }
+        if puts > 0 {
+            super::META_KV_BLOCK_MAP_PUTS.fetch_add(puts, std::sync::atomic::Ordering::Relaxed);
+        }
+        if deletes > 0 {
+            super::META_KV_BLOCK_MAP_DELETES
+                .fetch_add(deletes, std::sync::atomic::Ordering::Relaxed);
+        }
+        Ok(())
+    }
+
     fn is_empty(&self) -> bool {
         self.staged.is_empty()
     }
@@ -5404,6 +5601,14 @@ impl KvMetaBackend {
                 .block_refs
                 .as_ref()
                 .expect("block-reference records staged on a volume without incompat bit 8"),
+            // PB-class files, PR 1: unreachable un-engaged — the staging
+            // seam refuses non-empty map ops loud BEFORE a tx exists
+            // (`set_layout_and_size_with_map`), unlike the block_refs
+            // silent-skip.
+            super::record::TREE_BLOCK_MAP => self
+                .block_map
+                .as_ref()
+                .expect("block-map records staged on a volume without incompat bit 16"),
             _ => unreachable!("kv commits stage only the §4.2 trees"),
         }
     }
@@ -7464,6 +7669,39 @@ impl KvMetaBackend {
         size: u64,
         block_refs: &[super::block_refs::BlockRefOp],
     ) -> Result<()> {
+        self.set_layout_and_size_with_map(ino, layout, size, block_refs, &[])
+            .await
+    }
+
+    /// [`Self::set_layout_and_size`] carrying **block-map operations** in
+    /// the SAME transaction — the design §3 publish/head-flip tx shape
+    /// (layout head Put + inode Put + map records + BlockRefOps = one
+    /// conveyor pass = one journal entry), which PR 2's crossing and
+    /// spill switch consume. PR 1 has no production caller with a
+    /// non-empty `block_map`; the contract tests pin the one-tx
+    /// atomicity (journal-entry equality vs an un-stamped volume).
+    ///
+    /// Unlike `block_refs` (accounting the derived walk can rebuild —
+    /// silently skipped on an un-stamped volume), map records ARE the
+    /// mapping: non-empty ops on a volume without incompat bit 16 REFUSE
+    /// loud rather than silently losing where the data lives.
+    pub async fn set_layout_and_size_with_map(
+        &self,
+        ino: Ino,
+        layout: &[u8],
+        size: u64,
+        block_refs: &[super::block_refs::BlockRefOp],
+        block_map: &[super::block_map::BlockMapOp],
+    ) -> Result<()> {
+        if !block_map.is_empty() && self.block_map.is_none() {
+            return Err(crate::error::SqueezefsError::InvalidOperation(format!(
+                "block-map records staged on meta volume {} which does not carry \
+                 incompat bit 16 (KV_BLOCK_MAP_TREE): map records ARE the mapping, so \
+                 dropping them silently would lose data — stamp the bit before the \
+                 first record (the PR 2 crossing's own ordering law)",
+                self.path.display()
+            )));
+        }
         self.write_gate()?;
         let guards: Arc<[DlmGuard]> = Arc::from(vec![self.dlm.lock_inode_exclusive(ino).await]);
         let mut v = self
@@ -7500,6 +7738,9 @@ impl KvMetaBackend {
         if self.block_refs.is_some() {
             tx.stage_block_refs(block_refs);
         }
+        // Design §3: the map records ride THIS tx too (no second
+        // commit). The un-engaged case refused loud above.
+        tx.stage_block_map(block_map)?;
         tx.hold_guards(guards);
         self.commit_tx(tx).await?;
         Ok(())

@@ -517,6 +517,35 @@ pub const FEATURE_INCOMPAT_KV_CLAIM_SET: u64 = 1 << 14;
 /// parallel claim a red gate instead of silent on-disk aliasing).
 pub const FEATURE_INCOMPAT_KV_LAYOUT_VERSIONS: u64 = 1 << 15;
 
+/// `features_incompat` bit 16: **the block-map KV tree** (PB-class file
+/// support, docs/design-kvmap-block-map-tree.md §2 — finding 42). The
+/// volume's striped block maps past the inline xattr cap live as one
+/// record per mapping in [`crate::meta_backend::kv::record::TREE_BLOCK_MAP`]
+/// (tree 7), with the layout head reduced to the `kvmap:1` sentinel —
+/// instead of the single indirect CoW blob whose `block_size²/30`
+/// ceiling (~545 GiB at 4 MiB blocks) the design retires.
+///
+/// **Presence is OPTIONAL** (the bit-9 pattern, unlike bit 6's
+/// presence-required one): a volume WITHOUT this bit mounts exactly as
+/// it did before the bit existed — inline/`indirect:` heads only, no
+/// tree-7 root, and any attempt to stage a map record refuses loud
+/// (map records ARE the mapping, so a silent skip would be data loss,
+/// not missing accounting). Pre-bit binaries refuse a stamped volume via
+/// the [`FEATURES_INCOMPAT_KNOWN`] gate — exactly right: they cannot
+/// resolve a `kvmap:` head and would read every crossed file as
+/// map-less.
+///
+/// **Never stamped by [`SuperblockV3::plan`]** and stamped by NOTHING in
+/// PR 1 (fresh formats stay byte-identical — pinned in
+/// `tests/kvmap_tree_tests.rs`): PR 2's crossing writes and barriers the
+/// bit before a volume's first map record, the bit-5 `KV_LAYOUT_DELTAS`
+/// precedent.
+///
+/// **Bit 16** — 0..=15 are claimed; the
+/// `incompat_bits_are_single_bit_and_pairwise_disjoint` union clause is
+/// what makes a parallel claim a red gate instead of on-disk aliasing.
+pub const FEATURE_INCOMPAT_KV_BLOCK_MAP_TREE: u64 = 1 << 16;
+
 /// The **one-act multi-writer stamp set** (KD-MW-1,
 /// docs/design-full-multi-writer.md §6.1/§6.2): the nine incompat bits a
 /// multi-writer-capable format carries — 7 (durable term), 8 (partitioned
@@ -561,7 +590,8 @@ pub const FEATURES_INCOMPAT_KNOWN: u64 = FEATURE_INCOMPAT_KV_V3
     | FEATURE_INCOMPAT_KV_INO_LANES
     | FEATURE_INCOMPAT_KV_BLOCK_KEY_INCARNATION
     | FEATURE_INCOMPAT_KV_CLAIM_SET
-    | FEATURE_INCOMPAT_KV_LAYOUT_VERSIONS;
+    | FEATURE_INCOMPAT_KV_LAYOUT_VERSIONS
+    | FEATURE_INCOMPAT_KV_BLOCK_MAP_TREE;
 
 /// Read-only feature bits this binary understands (none yet — §4.11
 /// reserves the mechanism for snapshots). Unknown bits mount read-only.
@@ -756,6 +786,14 @@ impl SuperblockV3 {
     /// to withhold; K6a's read side logs it).
     pub fn unknown_ro(&self) -> u64 {
         self.features_ro & !FEATURES_RO_KNOWN
+    }
+
+    /// `true` ⇔ this volume carries the block-map KV tree
+    /// ([`FEATURE_INCOMPAT_KV_BLOCK_MAP_TREE`], bit 16) — the mount gate
+    /// that opens/mints tree 7, and PR 2's stamped-before-first-record
+    /// predicate.
+    pub fn block_map_tree_stamped(&self) -> bool {
+        self.features_incompat & FEATURE_INCOMPAT_KV_BLOCK_MAP_TREE != 0
     }
 
     /// Encode into a checksummed whole-sector image (generation 0 — the

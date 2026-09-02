@@ -35,12 +35,22 @@ pub const TREE_BACKPTR_RESERVED: u8 = 5;
 /// other volume has no such root and behaves exactly as it did before
 /// the bit existed.
 pub const TREE_BLOCK_REFS: u8 = 6;
+/// **Block-map tree** (PB-class file support,
+/// docs/design-kvmap-block-map-tree.md; incompat bit 16): key/value per
+/// [`crate::meta_backend::kv::block_map`], one record per
+/// `(owner ino, block index)` mapping — the striped block map as
+/// first-class KV records instead of an inline xattr / indirect blob.
+/// Present only on volumes carrying
+/// [`super::superblock::FEATURE_INCOMPAT_KV_BLOCK_MAP_TREE`]; every
+/// other volume has no such root and behaves exactly as before the bit
+/// existed (nothing stamps it in PR 1 — the crossing is PR 2's).
+pub const TREE_BLOCK_MAP: u8 = 7;
 
 /// Highest tree id this binary writes or accepts on the wire. The
 /// journal's tag nibble ([`super::journal::tag_for`]) bounds it at 15;
 /// anything outside `TREE_INODES..=TREE_ID_MAX` is structural
 /// corruption.
-pub const TREE_ID_MAX: u8 = TREE_BLOCK_REFS;
+pub const TREE_ID_MAX: u8 = TREE_BLOCK_MAP;
 
 // ---------------------------------------------------------------------------
 // Key builders — memcmp-ordered big-endian composites (design §4.2).
@@ -1359,7 +1369,10 @@ mod tests {
         assert_eq!(TREE_ALLOC_RESERVED, 4);
         assert_eq!(TREE_BACKPTR_RESERVED, 5);
         assert_eq!(TREE_BLOCK_REFS, 6);
-        assert_eq!(TREE_ID_MAX, TREE_BLOCK_REFS);
+        assert_eq!(TREE_BLOCK_MAP, 7);
+        assert_eq!(TREE_ID_MAX, TREE_BLOCK_MAP);
+        // The journal tag byte keeps tree ids in its low nibble.
+        assert!(TREE_ID_MAX <= 0x0F);
     }
 
     #[test]

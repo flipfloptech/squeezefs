@@ -355,9 +355,10 @@ fn test_entry_payload_roundtrip_and_bounds() {
     zero_id[0] = 0;
     assert!(decode_entry_payload(&zero_id).is_err());
     let mut big_id = payload;
-    // Tree id 7 — one past `TREE_ID_MAX` (6 = the durable block-ref tree,
-    // spec §6.2 item 1 / incompat bit 8; the §4.2 table grew).
-    big_id[0] = 7;
+    // Tree id 8 — one past `TREE_ID_MAX` (7 = the block-map tree,
+    // docs/design-kvmap-block-map-tree.md / incompat bit 16; the §4.2
+    // table grew again — 6 is the durable block-ref tree).
+    big_id[0] = 8;
     assert!(decode_entry_payload(&big_id).is_err());
 }
 

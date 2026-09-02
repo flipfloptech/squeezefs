@@ -165,24 +165,6 @@ fn pattern(len: usize, tag: u8) -> Vec<u8> {
     (0..len).map(|i| (i % 249) as u8 ^ tag | 1).collect()
 }
 
-/// Write `blocks` whole blocks, fsync, drain the pipeline.
-async fn stream_blocks(h: &H, ino: u64, blocks: u32, tag: u8) {
-    for b in 0..blocks {
-        write_at(
-            h,
-            ino,
-            b as u64 * BS,
-            &pattern(BS as usize, tag ^ (b as u8)),
-        )
-        .await;
-    }
-    h.fs.fsync(h.req, ino, 0, false).await.unwrap();
-    assert!(
-        h.fs.write_pipeline.quiesce(Duration::from_secs(30)).await,
-        "pipeline must drain"
-    );
-}
-
 /// `(count, sum_ns)` of one phase in a family export.
 fn phase_words(family: &serde_json::Value, phase: &str) -> (u64, u64) {
     let h = family

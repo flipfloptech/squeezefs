@@ -236,8 +236,18 @@ async fn make_striped(h: &H, ino: u64, blocks: u64, seed: u8) -> Vec<u8> {
     p
 }
 
+/// Samples in a histogram: the exact `count` word on latency histograms
+/// (e2e audit A); the bucket sum on the depth histograms
+/// (`fuse_write_inflight`, `waiters_at_arrival`), which carry none.
 fn hist_total(hist: &serde_json::Value) -> u64 {
-    hist["count"].as_u64().expect("histogram count word")
+    if let Some(n) = hist.get("count").and_then(|v| v.as_u64()) {
+        return n;
+    }
+    hist.as_object()
+        .expect("histogram object")
+        .values()
+        .map(|v| v.as_u64().unwrap_or(0))
+        .sum()
 }
 
 fn phase_total(phase: &str) -> u64 {

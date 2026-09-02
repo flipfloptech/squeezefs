@@ -37,9 +37,17 @@ batch-gate rule (one `task check` per batch).
      move release-gate/scoreboard rows to `dist`.
    - f47: tcp-substrate acceptance re-run.
    - Raw randwrite control on squeeze-test (nullblk discards — care).
-5. Next campaigns (docs/design-e2e-perf-audit.md §5 order): D-2 two-stage
-   conveyor, R-2 READ fast-dispatch, R-3 fill-issue economy, D-3 resident
-   pass task, D-5 connection multiplexing. Attribute the 4k-random gap
+5. Next campaigns (docs/design-e2e-perf-audit.md §5 order): **D-1b FIRST**
+   — D-1's scoping finding: the fix collapses the METADATA-verb frame
+   (64 passes → 3) but the LAYOUT-PUBLISH plane the co-writer ingest wall
+   actually rides is separate — `PublishRequestFrame` carries ONE call and
+   `PublishClient` is one mutex-serialized session per endpoint
+   (stop-and-wait depth 1, DLM board #8), so the 2.6 GiB/s wall does NOT
+   move until the publish client batches in-flight publishes into frames
+   and the owner co-queues them (F-A's mechanism, applied to the publish
+   plane). Then D-2 two-stage conveyor, R-2 READ fast-dispatch, R-3
+   fill-issue economy, D-3 resident pass task, D-5 connection
+   multiplexing. D-1 also owes a `meta_ship_owner_chains` engagement gauge. Attribute the 4k-random gap
    with the A2 trace ring FIRST (`SQUEEZEFS_OP_TRACE=1`, `cat <mnt>/.trace`,
    `tests/op_trace_stitch.py`) before R-2/R-3.
 6. kvmap PR 7 acceptance + release tiers (pjdfstests / LTP / fstests from

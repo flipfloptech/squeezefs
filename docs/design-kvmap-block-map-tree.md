@@ -1,10 +1,11 @@
 # Design: PB-class file support — the `TREE_BLOCK_MAP` KV tree (finding 42)
 
-**Status: DRAFT Rev 1.7** (design phase 2026-09-01; Rev 0 drafted by the
+**Status: DRAFT Rev 1.8** (design phase 2026-09-01; Rev 0 drafted by the
 f42 planning pass; Rev 1 folds the adversarial review's amendments — §6 —
 whose three critical findings supersede the corresponding Rev 0 clauses;
 Rev 1.7 records PR 5b's landed laws — §13, numbered past dev's Rev 1.6
-PR-6-split section. Do not start the PR ladder
+PR-6-split section; Rev 1.8 records PR 6a's landed laws — §12a. Do not
+start the PR ladder
 before §6's A1–A5 are reflected in PR 1/2 scopes). The implementation is
 the `feat/kvmap-*` PR ladder in §4.
 
@@ -387,7 +388,6 @@ the S5 staleness bound (safe via free-grace); the verb's load-bearing
 face is the WRITE-side base refresh — measure the read side before
 building it.
 
-<<<<<<< HEAD
 ## 12. Rev 1.6 — the PR-6 split (2026-09-02)
 
 The PR-6 pre-map splits the economy/scale rung into three, with four
@@ -434,10 +434,83 @@ Also: the routing-layer "incarnation not engaged" comment contradicts
 Rev 1.4 #1 — verify bit-13 default engagement before sizing POINT2
 (likely a stale comment); the pre-short-circuit O(map) inline-sizing
 pass on kvmap saves is a free CPU hoist for 6a.
+
+## 12a. Rev 1.8 — PR 6a landed (2026-09-02, normative)
+
+`perf/kvmap-runs-point2` landed §12's first rung. The adjudications:
+
+1. **The bit-13 flag RESOLVED: stamps ARE engaged on default formats.**
+   `format_v3` stamps `MULTI_WRITER_FORMAT_BITS` (bit 13 included) since
+   the rung-10b Phase-B flip, a write mount takes a durable term (bit 7)
+   so `block_key_incarnation_engaged()` is true per volume, and
+   `DataRouter::set_meta_backend` engages `engage_incarnation_keys` —
+   every fresh mint carries a stamp. The routing-layer "nothing stamps
+   bit 13 today (ruling D9)" comments were STALE (pre-flip) and are
+   corrected. Consequence per §12's coupling law: **all four forms
+   shipped** — RUN (kind 3, 22 B), POINT2 (kind 4, 26 B), RUN2 (kind 5,
+   30 B; emitted iff the covered stamps are literally consecutive
+   composed words — the emitter verifies every actual stamp, so decode
+   arithmetic reproduces exactly what was minted).
+2. **The run stride is the router's census, never stored**: records stay
+   at the pinned §12 widths; `RoutedMetaBackend`'s `map_run_stride` hook
+   (`vol_tag → chunk_size`, installed at `set_meta_backend` beside the
+   PR-3 encoder) feeds emission, and the two shared expansion surfaces
+   resolve per-index keys through `map_entry_block_key_at(entry, delta)`.
+   Claims-scoped trains never emit runs (per-index by law).
+3. **The floor law is take-last-COVERING, not take-last** (a §12
+   sharpening the tests forced): a superseding point INSIDE a run's span
+   — the read law's own legal shape — sits between the run and the
+   query, so the A6 bounded scan keeps the last record whose
+   `start + run_len > N`, at exact-miss (`get_block_mapping`, which now
+   answers `(record_index, entry)`) and in the claims train's
+   covering-run resolve alike. The ROUTED `block_map_range` prepends the
+   covering run record VERBATIM for a mid-span `from_index` (record-true
+   — no clipped synthetic record exists to fabricate, and clipping would
+   need the stride the meta layer lacks); the per-volume primitive stays
+   strictly record-true for the sweep/C11/diff paging loops, and the
+   fetch loop gained the no-progress guard + below-cursor re-delivery
+   skip.
+4. **Diff crash-order law**: ops stage as GROUPS the chunk packer keeps
+   tx-atomic where they fit (the A6 run-Put + covered-point-Deletes
+   one-tx law); coverage-shrinking same-key Puts order AFTER the records
+   that re-cover their tail, stale deletes last — every pre-flip
+   intermediate state resolves each index to its old or new binding,
+   never to absence.
+5. **The claims×runs law (§12's "never partial-adopt")**: a changed take
+   INSIDE a run adopts as ONE superseding point (§2's own overwrite
+   law); a release inside a run — or a changed take AT the run's own key
+   — DISSOLVES the run into per-index records (survivors as router-true
+   STRINGs, exact records never clobbered, the run's own key staged
+   last), and the next full local publish re-coalesces; a desired-side
+   run on a claims train refuses loud. Ref takes ride an explicit
+   adoption ledger (dissolve survivors mint no reference).
+6. **fsck C11 gained arm (c)** — run-vs-point coverage sanity: a
+   DIFFERENT-volume point strictly inside a run's span reports
+   (report-only, A3-shielded, `fsck_map_run_foreign_shadows`);
+   same-volume points inside runs are legal by the §2 read law
+   (arithmetic-equal shadow and overwrite alike — indistinguishable
+   without the router's stride census, deliberately).
+7. **The §12 option-b cap shipped**: `kvmap_write_map_bytes` (Σ estimated
+   resident RAM map bytes of write-touched kvmap inos, revalidated
+   lazily) + the derived `mem_budget/16` share (the node-cache divisor;
+   no floor, no knob) refusing over-budget kvmap merges **EFBIG** at the
+   §5.3 merge seam (growth ops only; truncate/punch never refuse). EFBIG
+   and not ENOSPC: the condition is the FILE's class against this
+   mount's RAM, not storage. The read-open residency of a giant map
+   (fetch rehydration) stays un-capped — that is PR 3's window / 6c's
+   overlay, not this cap's charter.
+8. **The economy hoist landed**: the sticky-kvmap probe now precedes the
+   O(map) inline-sizing pass in the save body.
+9. Gauges added: `meta_kv_block_map_run_puts`,
+   `meta_kv_block_map_lookup_floor`, `kvmap_write_map_bytes` (+
+   `kvmap_write_map_budget_bytes`), `fsck_map_run_foreign_shadows`.
+   Contracts: `tests/kvmap_run_tests.rs`, the codec pins in
+   `tests/kvmap_tree_tests.rs` + `tests/decoder_property_tests.rs`, the
+   C11 (c) arm in `tests/kvmap_walker_tests.rs`. `map_migrate_records` /
+   `preexisting` count RECORDS (runs collapse them — the engagement
+   face).
+
 ## 13. Rev 1.7 — PR 5b landed: kvmap multi-writer support (2026-09-02, normative)
-=======
-## 13. Rev 1.7 — PR 5b landed: kvmap multi-writer support (2026-09-02, normative)
->>>>>>> 88c9de3e (docs(design): kvmap Rev 1.7 — renumber the PR 5b section past dev's Rev 1.6 (PR-6 split) to keep the merge clean)
 
 PR 5b (`feat/kvmap-mw`) replaced PR 5a's two loud refusals with real
 support. The landed laws:

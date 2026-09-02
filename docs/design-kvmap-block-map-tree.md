@@ -1,11 +1,11 @@
 # Design: PB-class file support — the `TREE_BLOCK_MAP` KV tree (finding 42)
 
-**Status: DRAFT Rev 1.8** (design phase 2026-09-01; Rev 0 drafted by the
+**Status: DRAFT Rev 1.9** (design phase 2026-09-01; Rev 0 drafted by the
 f42 planning pass; Rev 1 folds the adversarial review's amendments — §6 —
 whose three critical findings supersede the corresponding Rev 0 clauses;
 Rev 1.7 records PR 5b's landed laws — §13, numbered past dev's Rev 1.6
-PR-6-split section; Rev 1.8 records PR 6a's landed laws — §12a. Do not
-start the PR ladder
+PR-6-split section; Rev 1.8 records PR 6a's landed laws — §12a; Rev 1.9
+records PR 6b's landed laws — §12b. Do not start the PR ladder
 before §6's A1–A5 are reflected in PR 1/2 scopes). The implementation is
 the `feat/kvmap-*` PR ladder in §4.
 
@@ -509,6 +509,88 @@ pass on kvmap saves is a free CPU hoist for 6a.
    C11 (c) arm in `tests/kvmap_walker_tests.rs`. `map_migrate_records` /
    `preexisting` count RECORDS (runs collapse them — the engagement
    face).
+
+## 12b. Rev 1.9 — PR 6b landed: the A2 background sweep (2026-09-02, normative)
+
+`feat/kvmap-sweep` landed §12's second rung. The adjudications:
+
+1. **Size-flip-first is O(1) by construction**: the over-threshold
+   striped-kvmap shrink (`(old_size − new_size)/block_size >`
+   `kvmap_sweep_threshold_blocks() = map_migrate_chunk() × 64` — derived,
+   never a knob) bypasses the publish train entirely:
+   `KvMetaBackend::kvmap_truncate_handoff` commits size + `;sweep:K`
+   (K = the first removed index; `min`-composed with any live cursor, so
+   the swept region only grows downward) in ONE two-record tx (pinned
+   ≤ 2 journal entries against a ~4,100-record removed set). The RAM map
+   prunes under the 3.5 guard with NO ref staging and NO frees — the
+   durable record/ref/free work IS what defers. Below the threshold the
+   PR-2 synchronous paths run verbatim (pinned).
+2. **The chunk law**: `JobType::KvmapSweep` (authority-only, local-pool,
+   `mover_scope` None — per-ino serialization is the chunk's own held
+   4a) runs `kvmap_sweep_chunk` per task: ONE KvTx = record-true map
+   Deletes + their BlockRefOp releases + the cursor-advance head Put;
+   freed keys return for the router's purge + reclaim enqueue AFTER the
+   guard drops (RES-1). The deletable floor re-derives from the CURRENT
+   size under the held 4a per chunk. The chunk budget counts COVERED
+   INDICES, not records — the red-first suite convicted the one-shot
+   run dissolve at 178 KiB against the 128 KiB whole-entry cap, so a
+   straddling/whole run consumes from the RIGHT: each tx re-Puts the run
+   shortened by exactly the span whose references it releases (len 1
+   collapses to the point form), keeping every committed intermediate
+   state coverage-exact. The TERMINAL chunk clears the cursor in the
+   same tx as the final Deletes.
+3. **The corpse ordering (the §12 open design point — decided)**:
+   `delete_file` on an over-threshold (or already-cursored) kvmap ino
+   keeps the inode record + head ALIVE as a corpse — nlink 0,
+   unreachable, `;sweep:0`, size 0 — probed off the durable head BEFORE
+   `fetch_metadata` (the corpse path never pays the Rev 1.3 #2 whole-map
+   rehydration). The handoff tx drains the pending accounting notes as
+   releases; the torn-down rewrite epoch's displaced/shadow keys free
+   inline (bounded — never durable records, so invisible to the sweep);
+   staging teardown stays O(PRESENT). The job's terminal chunk performs
+   the destroy (record + xattrs, one tx — the C9 destroy shape; no
+   quarantine, it is a planned teardown). Reclaim and the mount corpse
+   sweep WITHHOLD `destroy_inodes` for registry-marked corpses
+   (destroying the head would orphan the records); the census/oracle
+   already include `nlink == 0` layouts (the 2026-08-23 corpse-census
+   correction), so the mid-corpse state reads drift-free — C8/C9/C10/C11
+   all pinned clean mid-sweep.
+4. **KD-6, both halves**: the live half is the `submit_kvmap_sweep`
+   hook (`wire_kvmap_sweep_submit`, deduped on live jobs); the crash
+   half is `adopt_kvmap_sweeps` at mount — one tree-7 owner SKIP-scan
+   per volume, a job regenerated for every live cursor no record
+   covers, corpse marks re-armed from `nlink == 0`. Chunk deletions are
+   record-true and cursor-resumed, so the counted-run law holds across
+   a crash: deletions sum to exactly the residue (pinned per boundary),
+   never a double free.
+5. **The write-during-sweep law (the cursor invariant)**: while
+   `;sweep:K` is live, every record ≥ K is unreadable residue and no
+   live record sits at/above K. RAM write authority EXCLUDES residue
+   (the fetch rehydration and `fetch_durable_layout_head` both filter at
+   the cursor); the whole-map train — which re-stamps the flip head's
+   cursor from the DURABLE head, like the gen belt, so a mid-sweep
+   publish can never lose the plan — bounds its diff scan below the
+   cursor and runs the **extend barrier** when
+   `cursor_floor = ceil(size/bs)` exceeds it: the re-exposed span's
+   residue deletes + releases in chunked txs co-owning the held 4a
+   (freed keys ride the caller's post-commit tail), and the cursor
+   advances to the floor. The degenerate barrier (no growth) still
+   dissolves the left-boundary straddler — a shrink-superseding diff Put
+   would otherwise drop its tail's coverage with the references never
+   released. Claims-scoped (shipped/co-writer) trains never barrier: a
+   size-raising ship or a claim at/above the cursor refuses
+   retried-class (`map_refused`), below-cursor claims compose with the
+   cursor preserved verbatim — and the handoff itself is gated on
+   `publishes_locally`, so a co-writer truncate plants the cursor on the
+   OWNER when its shipped SETATTR executes there (the job is
+   authority-only). A re-cross can never meet a cursor: cursors live
+   only in kvmap heads and kvmap heads never regress (the sticky pin).
+6. Gauges: `map_sweep_{jobs,chunks,records,resumed}` (stats JSON;
+   `records` counts job chunks + publish-barrier absorptions);
+   `fsck_map_orphan_records` pinned 0 across mid-sweep passes (C11's
+   orphan and empty-head arms both read live-record + kvmap-head /
+   cursor-exempt states as healthy — no fsck change was needed, pinned).
+   Contracts: `tests/kvmap_sweep_tests.rs`.
 
 ## 13. Rev 1.7 — PR 5b landed: kvmap multi-writer support (2026-09-02, normative)
 

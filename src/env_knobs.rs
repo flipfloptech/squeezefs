@@ -109,6 +109,7 @@ pub static KNOBS: &[Knob] = &[
     k("SQUEEZEFS_BUILD_COMMIT_SHORT", Kind::BuildTime, "git", "Short form of the build commit."),
     k("SQUEEZEFS_BUILD_DIRTY", Kind::BuildTime, "git", "1 when the build tree carried uncommitted tracked changes."),
     k("SQUEEZEFS_BUILD_TAG", Kind::BuildTime, "git", "Exact stable-*/lts-* tag on the build commit, else empty."),
+    k("SQUEEZEFS_BUILD_PROFILE", Kind::BuildTime, "cargo", "Cargo profile name the binary was built under (release = thin LTO; dist = fat LTO, tagged releases only)."),
     k("SQUEEZEFS_BUILD_TIMESTAMP", Kind::BuildTime, "git", "UTC RFC3339 build timestamp (honors SOURCE_DATE_EPOCH)."),
     k("SQUEEZEFS_IL_BUILD_COMMIT", Kind::BuildTime, "git", "The shim's build commit (KD-7 daemon/shim pairing)."),
     // -- CLI / process ---------------------------------------------------

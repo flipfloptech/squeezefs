@@ -88,6 +88,48 @@ tasks:
       - task: build:ubuntu2404
       - task: build:ubuntu2604
 
+  # The two-profile LTO law (2026-09-02): everything above builds the
+  # `release` profile (thin LTO — the dev / field-A/B / gate build).
+  # `dist:*` builds the `dist` + `preload-dist` pair (fat LTO, one codegen
+  # unit) and is the ONLY path a tagged release ships from; `--version`
+  # names the profile so the two can never be confused in a row.
+  dist:rocky8:
+    desc: 'TAGGED-RELEASE build (fat LTO) for Rocky 8 → dist/rocky8-dist/'
+    cmds:
+      - task: dist:distro
+        vars: { TARGET: rocky8, GLIBC_CEILING: '2.28' }
+  dist:rocky9:
+    desc: 'TAGGED-RELEASE build (fat LTO) for Rocky 9 → dist/rocky9-dist/'
+    cmds:
+      - task: dist:distro
+        vars: { TARGET: rocky9, GLIBC_CEILING: '2.34' }
+  dist:ubuntu2404:
+    desc: 'TAGGED-RELEASE build (fat LTO) for Ubuntu 24.04 → dist/ubuntu2404-dist/'
+    cmds:
+      - task: dist:distro
+        vars: { TARGET: ubuntu2404, GLIBC_CEILING: '2.39' }
+  dist:ubuntu2604:
+    desc: 'TAGGED-RELEASE build (fat LTO) for Ubuntu 26.04 → dist/ubuntu2604-dist/'
+    cmds:
+      - task: dist:distro
+        vars: { TARGET: ubuntu2604, GLIBC_CEILING: 'auto' }
+  dist:all:
+    desc: All four TAGGED-RELEASE (fat LTO) distro targets
+    cmds:
+      - task: dist:rocky8
+      - task: dist:rocky9
+      - task: dist:ubuntu2404
+      - task: dist:ubuntu2604
+
+  dist:distro:
+    internal: true
+    label: 'dist:{{.TARGET}}'
+    requires:
+      vars: [TARGET, GLIBC_CEILING]
+    cmds:
+      - task: build:distro
+        vars: { TARGET: '{{.TARGET}}', GLIBC_CEILING: '{{.GLIBC_CEILING}}', SQZ_DIST: '1', OUT_SUFFIX: '-dist' }
+
   build:distro:
     internal: true
     label: 'build:{{.TARGET}}'
@@ -98,7 +140,7 @@ tasks:
         msg: 'No container runtime found (docker or podman); install one or set CONTAINER_TOOL.'
     cmds:
       - '{{.CONTAINER_TOOL}} build -t squeezefs-build:{{.TARGET}} -f docker/Dockerfile.{{.TARGET}} docker'
-      - mkdir -p dist/{{.TARGET}}
+      - mkdir -p dist/{{.TARGET}}{{.OUT_SUFFIX}}
       # The checkout mounts READ-ONLY at its host absolute path so build.rs
       # git identity capture works verbatim; a linked worktree additionally
       # mounts its git common dir (the `.git` file's absolute target).
@@ -118,12 +160,13 @@ tasks:
         {{.CONTAINER_TOOL}} run --rm \
           -v "{{.ROOT_DIR}}:{{.ROOT_DIR}}:ro" \
           $git_mount \
-          -v "{{.ROOT_DIR}}/dist/{{.TARGET}}:/out" \
+          -v "{{.ROOT_DIR}}/dist/{{.TARGET}}{{.OUT_SUFFIX}}:/out" \
           -v "squeezefs-cargo-registry-{{.TARGET}}:/usr/local/cargo/registry" \
           -v "squeezefs-rustup-{{.TARGET}}:/usr/local/rustup" \
           -v "squeezefs-target-{{.TARGET}}:/build" \
           -w "{{.ROOT_DIR}}" \
           -e GLIBC_CEILING="{{.GLIBC_CEILING}}" \
+          -e SQZ_DIST="{{.SQZ_DIST}}" \
           -e HOST_UID="$(id -u)" -e HOST_GID="$(id -g)" \
           squeezefs-build:{{.TARGET}} \
           "{{.ROOT_DIR}}/docker/build-in-container.sh"

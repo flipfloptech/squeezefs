@@ -17,12 +17,21 @@ export CARGO_TARGET_DIR=${CARGO_TARGET_DIR:-/build/target}
 # blanket-trust it (throwaway build container, nothing else runs here).
 git config --global --add safe.directory '*'
 
-cargo build --release --locked
-# The only sanctioned shim build (§5.4 Issue-4 panic-profile guard).
-cargo build -p squeezefs-preload --profile preload-release --features interposers --locked
+# The two-profile LTO law (2026-09-02): `release` (thin LTO) is the dev /
+# field-A-B / gate build; SQZ_DIST=1 selects `dist` + `preload-dist`
+# (fat LTO, one codegen unit) — tagged releases ONLY (`task dist:*`).
+if [ "${SQZ_DIST:-0}" = "1" ]; then
+  daemon_profile=dist; shim_profile=preload-dist
+else
+  daemon_profile=release; shim_profile=preload-release
+fi
+cargo build --profile "$daemon_profile" --locked
+# The only sanctioned shim builds (§5.4 Issue-4 panic-profile guard):
+# preload-release, or its fat-LTO twin preload-dist.
+cargo build -p squeezefs-preload --profile "$shim_profile" --features interposers --locked
 
-install -m 0755 "$CARGO_TARGET_DIR/release/squeezefs" "$out/squeezefs"
-install -m 0755 "$CARGO_TARGET_DIR/preload-release/libsqueezefs_il.so" "$out/libsqueezefs_il.so"
+install -m 0755 "$CARGO_TARGET_DIR/$daemon_profile/squeezefs" "$out/squeezefs"
+install -m 0755 "$CARGO_TARGET_DIR/$shim_profile/libsqueezefs_il.so" "$out/libsqueezefs_il.so"
 
 # Foreign-glibc artifacts: identity + ceiling assertions run HERE, inside
 # the container that can execute them.

@@ -125,4 +125,28 @@ fn main() {
         "cargo:rustc-env=SQUEEZEFS_BUILD_TIMESTAMP={}",
         utc_rfc3339_now()
     );
+    println!(
+        "cargo:rustc-env=SQUEEZEFS_BUILD_PROFILE={}",
+        build_profile_name()
+    );
+}
+
+/// The cargo PROFILE NAME this binary is built under (`release`, `dist`,
+/// `dev`, `preload-release`, …). Cargo's `PROFILE` env collapses every
+/// custom profile to `debug`/`release`, so the name is read from
+/// `OUT_DIR`'s layout (`target/<profile>/build/<crate>-<hash>/out`) — the
+/// two-profile LTO law needs the binary to say WHICH release-class profile
+/// it is, since only `dist` carries fat LTO.
+fn build_profile_name() -> String {
+    let out_dir = std::env::var("OUT_DIR").unwrap_or_default();
+    let parts: Vec<&str> = out_dir.split('/').collect();
+    // .../<profile>/build/<pkg-hash>/out  → the segment before "build".
+    parts
+        .iter()
+        .position(|s| *s == "build")
+        .and_then(|i| i.checked_sub(1))
+        .and_then(|i| parts.get(i))
+        .map(|s| s.to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| std::env::var("PROFILE").unwrap_or_else(|_| "unknown".into()))
 }

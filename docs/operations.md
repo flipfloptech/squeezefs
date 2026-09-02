@@ -77,12 +77,14 @@ This is the operator reference for SqueezeFS: the durability contract and its gu
 
 ```bash
 squeezefs --version        # or -V
-# untagged build:  squeezefs 1.1.0 (f63455bcb824 / f63455bcb8249b064531d000624c40825a6e763e) built 2026-07-18T13:45:25Z
-# release build:   squeezefs 1.1.0 (f63455bcb824 / f63455bcb8249b064531d000624c40825a6e763e, tag stable-2026.07) built 2026-07-18T13:45:25Z
-grep -E '"build_(commit|tag)"' <mountpoint>/.stats   # the fleet mixed-version detector
+# untagged build:  squeezefs 1.1.0 (f63455bcb824 / f63455bcb8249b064531d000624c40825a6e763e) built 2026-07-18T13:45:25Z profile release
+# release build:   squeezefs 1.1.0 (f63455bcb824 / f63455bcb8249b064531d000624c40825a6e763e, tag stable-2026.07) built 2026-07-18T13:45:25Z profile dist
+grep -E '"build_(commit|tag|profile)"' <mountpoint>/.stats   # the fleet mixed-version detector
 ```
 
-The `.stats` inode exports `build_commit` (the full hash) and `build_tag` (always present; empty string when the commit is not a release) on every mounted daemon — sweep it across the fleet to find mixed-version nodes. A `-dirty` suffix on the hash means the binary was built from a tree with uncommitted **tracked** changes (untracked scratch does not count; the flag is captured when the build script runs) — a dirty rebuild of a tagged commit deliberately does not masquerade as the release.
+**The two-profile LTO law (2026-09-02).** `cargo build --release` (and every `task build*`, the gate, every field A/B leg) builds the **`release`** profile — thin LTO, parallel codegen: the fast dev/field build. A **tagged release** ships from the **`dist`** profile (`task dist:<distro>` / `cargo build --profile dist`, shim `preload-dist`) — fat LTO plus a single codegen unit, the slow maximal-inlining build that only a `stable-*`/`lts-*` tag should pay for. The version line's trailing `profile <name>` and `.stats` `build_profile` say which one a binary is, so a measurement row can never silently compare a `release` leg against a `dist` leg (both legs of any A/B must name the same profile; the scoreboard and release-gate rows run `dist`).
+
+The `.stats` inode exports `build_commit` (the full hash), `build_tag` (always present; empty string when the commit is not a release) and `build_profile` on every mounted daemon — sweep it across the fleet to find mixed-version nodes. A `-dirty` suffix on the hash means the binary was built from a tree with uncommitted **tracked** changes (untracked scratch does not count; the flag is captured when the build script runs) — a dirty rebuild of a tagged commit deliberately does not masquerade as the release.
 
 Mechanics and edges:
 

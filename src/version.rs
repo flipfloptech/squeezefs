@@ -34,6 +34,11 @@ pub const BUILD_TAG: &str = env!("SQUEEZEFS_BUILD_TAG");
 /// UTC RFC3339 build timestamp (second precision; honors
 /// `SOURCE_DATE_EPOCH`).
 pub const BUILD_TIMESTAMP: &str = env!("SQUEEZEFS_BUILD_TIMESTAMP");
+/// The cargo profile NAME this binary was built under (`release` = thin
+/// LTO, the dev/field/gate profile; `dist` = fat LTO + one codegen unit,
+/// tagged releases only — the two-profile LTO law, 2026-09-02). Surfaced
+/// so a measurement row can never silently mix the two.
+pub const BUILD_PROFILE: &str = env!("SQUEEZEFS_BUILD_PROFILE");
 
 /// Whether the build tree carried uncommitted tracked changes.
 fn build_dirty() -> bool {
@@ -43,12 +48,14 @@ fn build_dirty() -> bool {
 /// Format the one-line, grep-friendly, train-first version string (without
 /// the leading binary name — clap prepends `squeezefs `):
 ///
-/// * untagged: `<train> (<short>[-dirty] / <full>[-dirty]) built <built_utc>`
-/// * tagged:   `<train> (<short>[-dirty] / <full>[-dirty], tag <tag>) built <built_utc>`
+/// * untagged: `<train> (<short>[-dirty] / <full>[-dirty]) built <built_utc> profile <profile>`
+/// * tagged:   `<train> (<short>[-dirty] / <full>[-dirty], tag <tag>) built <built_utc> profile <profile>`
 ///
 /// The release-train version leads; the commit identity survives verbatim.
 /// `-dirty` rides **both** hash forms — a dirty rebuild of a tagged commit
-/// must never masquerade as the release.
+/// must never masquerade as the release. The profile trails (the
+/// two-profile LTO law): a `release` binary and a `dist` binary are
+/// different measurement subjects.
 pub fn format_version_line(
     train: &str,
     short: &str,
@@ -56,12 +63,13 @@ pub fn format_version_line(
     dirty: bool,
     tag: &str,
     built_utc: &str,
+    profile: &str,
 ) -> String {
     let d = if dirty { "-dirty" } else { "" };
     if tag.is_empty() {
-        format!("{train} ({short}{d} / {full}{d}) built {built_utc}")
+        format!("{train} ({short}{d} / {full}{d}) built {built_utc} profile {profile}")
     } else {
-        format!("{train} ({short}{d} / {full}{d}, tag {tag}) built {built_utc}")
+        format!("{train} ({short}{d} / {full}{d}, tag {tag}) built {built_utc} profile {profile}")
     }
 }
 
@@ -137,6 +145,7 @@ static VERSION_LINE: LazyLock<String> = LazyLock::new(|| {
         build_dirty(),
         BUILD_TAG,
         BUILD_TIMESTAMP,
+        BUILD_PROFILE,
     );
     match format_profiling_notice(measurement_disqualifiers()) {
         Some(notice) => format!("{base}{notice}"),
@@ -161,4 +170,9 @@ pub fn build_commit() -> String {
 /// commit is not a release — the `.stats` `build_tag` value.
 pub fn build_tag() -> &'static str {
     BUILD_TAG
+}
+
+/// The embedded cargo profile name — the `.stats` `build_profile` value.
+pub fn build_profile() -> &'static str {
+    BUILD_PROFILE
 }

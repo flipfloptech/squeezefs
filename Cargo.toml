@@ -151,12 +151,27 @@ fuse3 = { path = "crates/fuse3" }
 tikv-jemallocator = "0.5"
 tikv-jemalloc-sys = "0.5"
 
+# The two-profile LTO law (user directive 2026-09-02): `release` is the
+# dev / field-A-B / gate profile — thin LTO, parallel codegen — because
+# fat LTO + one codegen unit cost every rebuild minutes for a few percent
+# that only a tagged release should pay. `--version` and `.stats
+# build_profile` name the profile a binary was built with, so a
+# measurement row can never silently mix the two (the `dhat-on`
+# precedent: a build says what it is). `panic = "abort"` is load-bearing
+# for the daemon (see the preload-release note below).
 [profile.release]
 debug = true
 opt-level = 3
+lto = "thin"
+panic = "abort"
+
+# The tagged-release profile ONLY (`stable-*` / `lts-*` tags, `task dist:*`):
+# fat LTO + a single codegen unit — the slow, maximal-inlining build.
+# Never the dev or gate profile; never an A/B leg unless BOTH legs are dist.
+[profile.dist]
+inherits = "release"
 lto = "fat"
 codegen-units = 1
-panic = "abort"
 
 # The ONLY sanctioned build profile for the future `squeezefs-preload`
 # cdylib (design-preload-interception §5.4, Issue-4 resolution): the root
@@ -167,6 +182,14 @@ panic = "abort"
 [profile.preload-release]
 inherits = "release"
 panic = "unwind"
+
+# The shim's tagged-release twin: fat LTO like `dist`, unwind like
+# `preload-release` (the two laws compose; the KD-7 same-commit pairing
+# ships `dist` + `preload-dist` together).
+[profile.preload-dist]
+inherits = "preload-release"
+lto = "fat"
+codegen-units = 1
 
 [[bench]]
 name = "meta_lv_bench"

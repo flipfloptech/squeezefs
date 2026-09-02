@@ -9859,6 +9859,7 @@ impl SqueezefsFilesystem {
             // not a `stable-*`/`lts-*` release.
             "build_commit": crate::version::build_commit(),
             "build_tag": crate::version::build_tag(),
+            "build_profile": crate::version::build_profile(),
             // VAL-7a: the CENSUS-FREE gauges — always exported. These are
             // what `squeezefs umount` reads to decide whether unflushed
             // staged writes exist; they name nothing.

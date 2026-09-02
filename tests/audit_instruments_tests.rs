@@ -15,6 +15,10 @@
 //!    journal pass's lumped `pass_journal_write` splits into
 //!    `journal_ring_write` / `journal_prefix_wait` / `journal_barrier`
 //!    (the old label stays as their sum).
+//! C. Always-on `meta_op_phase_ns`: per metadata op {entry_to_backend,
+//!    backend, backend_to_reply, total}, riding the existing `OpProf`
+//!    begin/mark/Drop hooks with NO `SQUEEZEFS_OP_PROFILE` gate; the gated
+//!    `fuse_op_phase_ns` keeps its behavior (silent + absent when off).
 
 use fuse3::raw::prelude::Filesystem;
 use fuse3::raw::Request;
@@ -601,4 +605,168 @@ async fn strict_cadence_puts_the_barrier_in_the_pass() {
     assert_eq!(ring_n, lump_n);
     assert_eq!(pfx_n, lump_n);
     assert!(lump_sum >= ring_sum + pfx_sum + bar_sum);
+}
+
+// ---------------------------------------------------------------------------
+// C — always-on meta_op_phase_ns
+// ---------------------------------------------------------------------------
+
+const META_OPS: [&str; 9] = [
+    "lookup",
+    "getattr",
+    "setattr",
+    "mkdir",
+    "create",
+    "unlink",
+    "rename",
+    "readdir",
+    "readdirplus",
+];
+
+const META_OP_PHASES: [&str; 4] = ["entry_to_backend", "backend", "backend_to_reply", "total"];
+
+fn meta_op_words(fam: &serde_json::Value, op: &str, phase: &str) -> (u64, u64) {
+    let h = &fam[op][phase];
+    assert!(
+        h.is_object(),
+        "meta_op_phase_ns.{op}.{phase} missing from {fam}"
+    );
+    (hist_count(h), hist_sum_ns(h))
+}
+
+#[test]
+fn meta_op_family_is_pinned_to_the_metadata_ops_and_four_phases() {
+    let fam = squeezefs::fuse_client::meta_op_phase_json();
+    let ops = fam.as_object().expect("family object");
+    let mut have: Vec<&str> = ops.keys().map(|k| k.as_str()).collect();
+    have.sort_unstable();
+    let mut want = META_OPS.to_vec();
+    want.sort_unstable();
+    assert_eq!(have, want, "exactly the metadata op classes");
+    for op in META_OPS {
+        let phases = fam[op].as_object().expect("op object");
+        assert_eq!(phases.len(), META_OP_PHASES.len(), "{op}: four phases");
+        for ph in META_OP_PHASES {
+            let _ = meta_op_words(&fam, op, ph);
+        }
+    }
+}
+
+/// The pure hook law with the profile rig OFF: one metadata `OpProf`
+/// (begin → mark_backend_start → mark_backend_done → drop) records
+/// exactly one span in each of its four phases, the three legs tile
+/// `total` exactly, a data op (READ) moves nothing here, and the gated
+/// `fuse_op_phase_ns` family stays silent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn one_metadata_op_moves_its_four_phases_and_the_gated_family_stays_silent() {
+    use squeezefs::fuse_client::{
+        meta_op_phase_json, op_profile_enabled, op_profile_phase_json, FuseOpKind, OpProf,
+    };
+    let _g = serial().await;
+    assert!(
+        !op_profile_enabled(),
+        "fixture premise: SQUEEZEFS_OP_PROFILE must be OFF"
+    );
+    let m0 = meta_op_phase_json();
+    let g0 = op_profile_phase_json();
+
+    let p = OpProf::begin(FuseOpKind::Create, 7);
+    p.mark_backend_start();
+    std::thread::sleep(Duration::from_micros(300));
+    p.mark_backend_done();
+    drop(p);
+
+    let m1 = meta_op_phase_json();
+    let g1 = op_profile_phase_json();
+    let mut legs = 0u64;
+    for ph in META_OP_PHASES {
+        let (c0, s0) = meta_op_words(&m0, "create", ph);
+        let (c1, s1) = meta_op_words(&m1, "create", ph);
+        assert_eq!(c1 - c0, 1, "create.{ph}: exactly one span");
+        if ph != "total" {
+            legs += s1 - s0;
+        }
+    }
+    let (_, t0) = meta_op_words(&m0, "create", "total");
+    let (_, t1) = meta_op_words(&m1, "create", "total");
+    assert_eq!(legs, t1 - t0, "the three legs tile total exactly");
+    assert!(
+        meta_op_words(&m1, "create", "backend").1 - meta_op_words(&m0, "create", "backend").1
+            >= 300_000,
+        "backend leg brackets the 300 µs backend span"
+    );
+    for op in META_OPS {
+        if op == "create" {
+            continue;
+        }
+        for ph in META_OP_PHASES {
+            assert_eq!(
+                meta_op_words(&m1, op, ph).0,
+                meta_op_words(&m0, op, ph).0,
+                "{op}.{ph} must not move on a create"
+            );
+        }
+    }
+    assert_eq!(
+        g1, g0,
+        "the SQUEEZEFS_OP_PROFILE-gated fuse_op_phase_ns must stay silent when off"
+    );
+
+    // A data op is not a metadata op: nothing here moves.
+    let m2 = meta_op_phase_json();
+    let r = OpProf::begin(FuseOpKind::Read, 7);
+    r.mark_backend_start();
+    r.mark_backend_done();
+    drop(r);
+    assert_eq!(
+        meta_op_phase_json(),
+        m2,
+        "READ never touches meta_op_phase_ns"
+    );
+}
+
+/// Through the real FS: a create moves the family; the stats inode
+/// carries it UNGATED (and, with the rig off, does NOT carry the gated
+/// `fuse_op_phase_ns`); a stats-inode read — a data op — leaves every
+/// metadata class flat.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn real_create_moves_the_family_and_the_stats_inode_carries_it_ungated() {
+    use squeezefs::fuse_client::{meta_op_phase_json, STATS_INODE};
+    let _g = serial().await;
+    let h = make([0x21; 16], "audit_c_create").await;
+    let m0 = meta_op_phase_json();
+    let _ino = create(&h, "c1").await;
+    let m1 = meta_op_phase_json();
+    for ph in META_OP_PHASES {
+        assert_eq!(
+            meta_op_words(&m1, "create", ph).0 - meta_op_words(&m0, "create", ph).0,
+            1,
+            "one real create ⇒ one create.{ph} span"
+        );
+    }
+
+    let m2 = meta_op_phase_json();
+    let reply =
+        h.fs.read(h.req, STATS_INODE, 0, 0, 1 << 22, 0)
+            .await
+            .expect("read stats inode");
+    let stats: serde_json::Value = serde_json::from_slice(&reply.data).expect("stats JSON");
+    let metrics = stats.get("metrics").expect("metrics object");
+    let fam = metrics
+        .get("meta_op_phase_ns")
+        .expect("stats inode must carry meta_op_phase_ns UNGATED");
+    for op in META_OPS {
+        for ph in META_OP_PHASES {
+            let _ = meta_op_words(fam, op, ph);
+        }
+    }
+    assert!(
+        metrics.get("fuse_op_phase_ns").is_none(),
+        "the gated family stays absent with the rig off"
+    );
+    let m3 = meta_op_phase_json();
+    assert_eq!(
+        m3, m2,
+        "a stats-inode READ is a data op: no metadata class moves"
+    );
 }

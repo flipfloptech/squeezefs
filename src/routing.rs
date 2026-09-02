@@ -12997,6 +12997,40 @@ impl DataRouter {
         }
     }
 
+    /// Close EVERY open rewrite epoch — the clean-unmount boundary
+    /// (finding 48). An epoch's shadow bindings are RAM-only until a
+    /// close trigger fires (fsync, coverage completion, the 30 s idle
+    /// sweeper); a dismount inside that window used to drop them and the
+    /// durable map kept naming the displaced keys — acked bytes lost on a
+    /// CLEAN unmount. The read-path overlay drain and the dismount's own
+    /// overlay drain both feed epochs no handle ever fsyncs, so the
+    /// teardown owns the close. Returns the number of epochs closed;
+    /// failures are logged and skipped (a fenced era publishes nothing by
+    /// law, and a transient failure re-registers the epoch — the
+    /// unflushed-at-unmount class, loud).
+    pub(crate) async fn close_open_rewrite_epochs(&self) -> usize {
+        let mut inos: Vec<u64> = Vec::new();
+        self.inner.rewrite_epochs.iter_sync(|ino, _| {
+            inos.push(*ino);
+            true
+        });
+        let mut closed = 0usize;
+        for ino in inos {
+            let token = self.inner.dlm.get_fencing_token_ino(ino);
+            match self.close_rewrite_epoch(ino, token).await {
+                Ok(true) => closed += 1,
+                Ok(false) => {}
+                Err(e) => {
+                    log::error!(
+                        "dismount: rewrite epoch close for ino {ino} failed ({e:?}); its \
+                         RAM-only bindings do not reach the durable map"
+                    );
+                }
+            }
+        }
+        closed
+    }
+
     /// Arm the idle-close sweeper (KD-1.6, lazily on the first epoch —
     /// the `ensure_worker` pattern, Weak-held).
     fn ensure_epoch_sweeper(&self) {

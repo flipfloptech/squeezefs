@@ -28,6 +28,7 @@
 //!   persist carries the binding;
 //! * a clean unmount closes every open rewrite epoch, so a binding fed by
 //!   a read drain (or by the unmount drain itself) is never lost.
+//!
 //! Both legs assert warm == written == cold byte-exact.
 
 use fuse3::raw::prelude::Filesystem;

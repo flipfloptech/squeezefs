@@ -21013,6 +21013,22 @@ impl SqueezefsFilesystem {
             let _ = squeezefs_ipc::sqz_time::timeout(remaining, notify.notified()).await;
         }
 
+        // Finding 48: a clean unmount is a durability boundary for every
+        // open rewrite epoch — the overlay drains above (and any read
+        // drain before them) FEED bindings into RAM-only epochs that no
+        // handle will fsync, and the idle sweeper's 30 s horizon does not
+        // run past process exit. DUR-1: the data barrier precedes the
+        // saves that name the blocks. Runs after the staged sweep (whose
+        // publishes may feed epochs too) and before the reclaim drain
+        // (the closes' displaced frees are what it must return).
+        if let Err(e) = self.router.backend_router.flush_data_devices().await {
+            error!("dismount: data barrier before the rewrite-epoch closes failed: {e:?}");
+        }
+        let closed = self.router.close_open_rewrite_epochs().await;
+        if closed > 0 {
+            info!("FUSE Daemon: dismount closed {closed} open rewrite epoch(s).");
+        }
+
         // Async block-reclaim conservation (contract 3,
         // tests/async_block_reclaim_tests.rs): a clean unmount returns
         // every queued device range before declaring the dismount clean —
@@ -24719,6 +24735,22 @@ impl Filesystem for SqueezefsFilesystem {
             if let Ok(fencing_token) = self.get_or_acquire_lease(ino).await {
                 let fs = self.clone();
                 crate::bg_admit::spawn_bg(async move {
+                    // Finding 48: a device-overlay record whose coverage
+                    // can never complete (a block whose first segment
+                    // rode the layout-promotion arm, a partial tail
+                    // block) stays Open past its writer's close, and the
+                    // first boundary-crossing READ then drains it into a
+                    // RAM-only epoch that no handle owns — a clean
+                    // unmount inside the idle horizon dropped the fed
+                    // binding and the durable map kept naming the
+                    // promotion key (one segment + never-written device
+                    // bytes). Settle the ino's records here, FIRST, so
+                    // the layout persist below carries the binding
+                    // (write-back class like the rest of this task — no
+                    // data barrier; fsync stays the durable point) and
+                    // `overlay_open` reaches 0 at quiesce.
+                    let r = fs.drain_device_overlays_for_ino(ino, u64::MAX, false).await;
+                    fs.note_writeback_result(ino, &r);
                     // POSIX-16: these three ran with their results
                     // dropped on the floor — a close whose data never
                     // landed reported success and the failure reached

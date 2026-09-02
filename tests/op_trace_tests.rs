@@ -822,6 +822,110 @@ async fn trace_inode_is_owner_only_and_stats_carry_the_gauges() {
     assert_eq!(m["op_trace_divisor"].as_u64(), Some(1));
 }
 
+/// The stitch tool (`tests/op_trace_stitch.py`) over a real dump: per-op
+/// timelines, the transition table, the named phase spans and the
+/// containment check against the row's pre/post `.stats` — exit 0 with
+/// every section present. `python3` absent ⇒ ledgered toolchain skip.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn stitch_tool_joins_a_real_dump_against_the_histograms() {
+    use squeezefs_testkit::skip;
+    if std::process::Command::new("python3")
+        .arg("--version")
+        .output()
+        .is_err()
+    {
+        skip!(Toolchain, "python3 not on PATH — the stitch tool is Python");
+    }
+    let _g = serial().await;
+    let h = make([0xA6; 16], "op_trace_stitch").await;
+    let pre = h.fs.generate_stats_json().await;
+    op_trace::arm_for_tests(1);
+    let mut inos = Vec::new();
+    for i in 0..24u64 {
+        let u = 10_000 + i * 2;
+        let ino = op_trace::scope(
+            u,
+            h.fs.create(
+                req(u),
+                1,
+                OsStr::new(&format!("s{i}.bin")),
+                libc::S_IFREG | 0o644,
+                0,
+            ),
+        )
+        .await
+        .unwrap()
+        .attr
+        .ino;
+        inos.push(ino);
+    }
+    let post = h.fs.generate_stats_json().await;
+    let dump = op_trace::trace_json().to_string();
+    let dir = tempdir().unwrap();
+    let tp = dir.path().join("trace.json");
+    let pp = dir.path().join("pre.json");
+    let qp = dir.path().join("post.json");
+    std::fs::write(&tp, dump).unwrap();
+    std::fs::write(&pp, pre).unwrap();
+    std::fs::write(&qp, post).unwrap();
+    let out = std::process::Command::new("python3")
+        .arg(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/op_trace_stitch.py"
+        ))
+        .arg(&tp)
+        .args([
+            "--stats-pre",
+            pp.to_str().unwrap(),
+            "--stats-post",
+            qp.to_str().unwrap(),
+        ])
+        .args([
+            "--ops",
+            "2",
+            "--json",
+            dir.path().join("out.json").to_str().unwrap(),
+        ])
+        .output()
+        .expect("run the stitch tool");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "stitch exited {:?}\nstdout:\n{stdout}\nstderr:\n{stderr}",
+        out.status
+    );
+    for section in [
+        "== per-op timelines",
+        "== stage transitions",
+        "== phase spans",
+        "== containment vs histograms",
+        "meta_txpass_phase_ns.pass_total",
+        "meta_txpass_phase_ns.tx_queue_wait",
+    ] {
+        assert!(
+            stdout.contains(section),
+            "stitch output lacks {section:?}:\n{stdout}"
+        );
+    }
+    let stitched: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(dir.path().join("out.json")).unwrap()).unwrap();
+    assert_eq!(stitched["divisor"].as_u64(), Some(1));
+    assert!(
+        stitched["ops"].as_u64().unwrap() >= 24,
+        "every traced create is an op"
+    );
+    let cont = stitched["containment"]
+        .as_object()
+        .expect("containment table");
+    let pass_total = &cont["meta_txpass_phase_ns.pass_total"];
+    assert_eq!(
+        pass_total["verdict"].as_str(),
+        Some("OK"),
+        "the trace's pass_total mean agrees with the exact histogram mean: {pass_total}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // 6 — the knob + the derived geometry
 // ---------------------------------------------------------------------------

@@ -1467,7 +1467,7 @@ impl PublishClient {
     ///   (same request ids — the owner's dedup window absorbs it); a frame
     ///   of one-attempt calls (the un-witnessed mutators) refuses on the
     ///   true sent-then-lost ambiguity. The drain never mixes the two.
-    ///   The witnessed layout-publish class rides [`ship_witnessed`]'s
+    ///   The witnessed layout-publish class rides `ship_witnessed`'s
     ///   bounded epoch-stable ladder above this.
     /// * **Era** (finding #6): a per-call [`PUBLISH_STALE_LEASE`] whose
     ///   refused epoch IS this client's current lease composes the full

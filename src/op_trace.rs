@@ -172,10 +172,13 @@ fn arm_geometry(g: Geometry) {
 }
 
 /// Arm with the DERIVED geometry (the knob's and the admin verb's arm).
+/// Sizing roots: the R5 budget and the DIVIDED cpu root
+/// (`process_parallelism` — the fleet share applies; the ring is a
+/// sizing choice, not kernel-mandated geometry).
 pub fn arm_default() -> Geometry {
     let g = derive_geometry(
         crate::mem_budget::MEM_BUDGET.resolve_budget_now(),
-        crate::cpu::possible_cpus(),
+        crate::cpu::process_parallelism(),
     );
     arm_geometry(g);
     g

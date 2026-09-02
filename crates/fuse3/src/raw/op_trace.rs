@@ -57,12 +57,16 @@
 //! CLOCK_MONOTONIC` stamps with. On the box:
 //!
 //! ```text
+//! cat <mnt>/.stats > /tmp/pre.json               # the row's pre snapshot
 //! bpftrace -e '
 //!   tracepoint:fuse:fuse_request_send { printf("send,%llu,%llu\n", args->unique, nsecs); }
 //!   tracepoint:fuse:fuse_request_end  { printf("end,%llu,%llu\n",  args->unique, nsecs); }' \
-//!   > /tmp/fuse_tp.csv
+//!   > /tmp/fuse_tp.csv &
+//! <the row>
+//! cat <mnt>/.stats > /tmp/post.json
 //! cat <mnt>/.trace > /tmp/trace.json            # drains the rings
-//! tests/op_trace_stitch.py /tmp/trace.json --tp /tmp/fuse_tp.csv --stats <mnt>/.stats
+//! tests/op_trace_stitch.py /tmp/trace.json --tp /tmp/fuse_tp.csv \
+//!     --stats-pre /tmp/pre.json --stats-post /tmp/post.json
 //! ```
 //!
 //! `fuse:fuse_request_send` is the kernel's queue-time stamp for

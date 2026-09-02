@@ -593,3 +593,46 @@ Gauges added: `meta_ship_publish.map_recomputed_releases`. Contracts:
 `tests/mw_cowriter_free_tests.rs`
 (`a_skewed_kvmap_ship_frees_the_true_displaced_set_on_the_authority` —
 item 2), `tests/kvmap_tree_tests.rs` (the gen grammar).
+
+## 14. Rev 1.9 — the PR-6c map: bounded maps, both sides (2026-09-02)
+
+The 6c pre-map's verdicts (normative for the remaining rungs):
+
+- **S1: the §8 window cache was never built** — every mount full-rehydrates
+  a kvmap map at open. 6c owes the bounded READ-residency story too, or a
+  PB read-open OOMs regardless of the save-side work. The §8 window and
+  the 6c overlay land as ONE structure: `CachedMetadata.block_map` becomes
+  the bounded dirty-overlay-plus-warm-spans store with a `partial` marker
+  and TOMBSTONES (a partial map's read-through must never resurrect a
+  displaced-but-unswept tree binding), gated by the knob-less mode
+  heuristic at the 6a cap's own seam — whole-map RAM below `mem_budget/16`
+  (every real fleet file today), overlay past it (the PB class), EFBIG
+  deleted. Reads: `PartialMiss ≠ Hole` at every resolve arm (the
+  silent-wrong bomb rows); the anomalous-entry refetch arm becomes the
+  legitimate bounded tree-resolving arm with warm-span retention.
+- **S2: PR 5b built ~70 % of the train** — 6c's local save ships the
+  overlay as a claims-scoped train (entries = dirty indices, claims = the
+  refs frame; `base_gen: None` — local trains serialize on the held 4a).
+  Displacement discovery moves WHOLLY to the train's f36b recompute
+  (option ii): the merge stops capturing prev-bindings, tier purges ride
+  the publish tail over `released`. Two train breaks to fix first: the
+  claims arm's `current` scan is itself O(map) (must become
+  claims-bounded probes), and the gen-bump keys on claims-presence (a
+  solo mount's local claims trains would mint gens — split the criterion;
+  the solo-dark pin governs).
+- **The coalescer replacement** (for §12a #6's law, which 6c deletes):
+  rung 1 — the LOCAL claims train may emit runs over its OWN contiguous
+  takes (the shipped per-index law exists for partial-adopt hazards a
+  held-4a local train doesn't have); rung 2 — a windowed canonicalizer
+  chunk in the 6b job family (cursor-resumable, never whole-map), gauged
+  by a record-count-vs-ideal instrument, never a knob. A full-republish
+  trigger is banned (it re-requires whole-map RAM).
+- **Sequencing**: 6b is a HARD prerequisite (overlay-mode truncate must
+  never refuse — it size-flips into the sweep). 6c splits: 6c-i =
+  mechanism (partial semantics, mode flip, read-through, overlay saves;
+  the B8/B9 train fixes first as their own gateable step); 6c-ii =
+  economy (the coalescer rungs) — adjudicate at PR 7 whether the PB
+  soak tolerates points-not-runs if 6c-ii defers.
+- Crossing + sub-threshold kvmap inos + legacy arms keep whole-map RAM
+  verbatim (pinned); an `SQUEEZEFS_KVMAP_OVERLAY=0` A/B lever (registry
+  entry) is sanctioned for the acceptance brackets only.

@@ -276,7 +276,7 @@ are one mechanism):
 | **1** | **DLM F-A — the owner executes a shipped frame SERIALLY** (DLM #1) | `src/meta_ship/service.rs:673-690` `run_batch`: `for op in ops { out.push(self.run_op(..).await) }` — one conveyor commit per mutating verb. The **9,473 verbs/s authority ceiling = 1 / (owner per-verb serial latency)**, and it is the root of the **≈ 2.6 GiB/s co-writer ingest wall** the S9-a note published as writer-count-independent | **2–10× on fan-out** (ledger) / HIGH mechanism, MEDIUM number (midpoint) | K-co-writer fan-out fleet (`tests/mw_fleet.sh`, `tests/run_mw_matrix.sh`), A-B-B-A on tcp devsub then squeeze-test; `meta_ship_owner_phase_ns` (sum/count) + `meta_txpass_phase_ns`; verdict = verbs/s per authority and aggregate ingest GiB/s, engagement `shipped ≡ served` |
 | **2** | **The conveyor is one serialized server incl. the device write** (DLM #2 ≡ W #5) | M7 pass: admission → union leaf locks → journal write → barrier → fan-out, serialized per volume; ρ ≈ 0.92 at the field's saturated rate; ≈ 0.78 ms pass vs ≈ 0.17 ms leaf-lock floor; write-side face ≈ 4.8 ms/block publish at saturation | **~4× pass headroom** (ledger: two-stage apply/durability conveyor — N journal writes in flight, in-order acks) / HIGH mechanism, MEDIUM number | mdstorm (`tests/run_mdstorm.sh`) + the streaming-publish shape (`w_fresh` post-f46) A-B-B-A on loop AND tcp; `meta_txpass_phase_ns.pass_journal_write` split (A1) must show the barrier as the only serialized term post-fix; `meta_commit_group_size` up, `publish_phase_ns.queue_wait` down |
 | **3** | **Wake-hop inflation on the conveyor** (DLM #3, the W #5 residue) | spawn-per-leadership pass task (`backend.rs:7498-7512`); ≈ 0.68 ms residue between "batch ready" and "pass running" | absorbed into #2's ~4× if built together / HIGH mechanism, LOW number (never isolated) | same rig as #2 with a resident pass task on `sqz_notify` + fan-out on the committer's lane; `tx_queue_wait` histogram (sum/count) is the verdict |
-| **4** | **Read #1 — the `sqz_time`/`sqz_channel` mutex class on every device read** (finding candidate 48, §4.3) | `src/nvme_dev.rs:2426` wraps EVERY device read in `sqz_time::timeout` (30 s deadline, `nvme_dev.rs:91-97`): a process-global `Mutex<Registry>` (`sqz_time.rs:69`) around a `BinaryHeap` (`:55`) whose cancelled entries become tombstones (`:192`), plus `Box::pin` of the future (`:240`); `routing.rs:9299` does the same per 50 ms cohort-wait slice; per-fill `Mutex` on the lane mpsc (`nvme_dev.rs:2404`) and the oneshot (`:2395`) | **HIGH mechanism / LOW number** — the ledger's arithmetic is ~1.2 M mutex ops/s + ~190 MB of tombstones at field rand-4k rates; **unpriced by any read row** | **measure first**: A1 `dev_queue` sum/count + `daemon_cpu_ns_by_class` + perf on the svc/tpc lanes during `rr_4k`; then the lever (timer-less per-lane deadline watchdog; SPSC completion rings) A-B-B-A on loop (latency) and tcp; verdict = `rr_4k` clat at fixed depth + CPU/op |
+| ~~**4**~~ | **Read #1 — the `sqz_time`/`sqz_channel` mutex class on every device read** (finding candidate 48, §4.3) — **MEASURED 2026-09-02, NOT FAT at the field posture; retired from Tier 1** (`.benchmarks/2026-09-02-r1-device-read-executor.md`) | `src/nvme_dev.rs:2426` wraps every `NvmeBlockDev::read_block` in `sqz_time::timeout` — but on the sqz kernel **neither field mode reaches it** (kern → the FUSE-zc direct leg, il → direct-drive; **0 arms per 27.9 M field kernel reads**). The per-op arm is `InboundQueue::pop`'s ticked recv on the fuse3 fork's OWN `sqz_time` registry (a second lock/heap/thread): 0.35–0.45 arms/kernel READ. The lane mpsc is crossbeam (lock-free, 12 ns); the oneshot's mutex is uncontended and a lock-free oneshot is not faster | **measured**: ≤ 3 % daemon CPU kern / ≈ 0.5 % il, < 0.2 % of per-op latency; the registry lock's knee (0.8–1.0 M arms/s, microbench) sits at ≈ 1.8–2.2 M kernel IOPS ≥ the device ceiling | adjudicated load-bearing-at-cost; the residual (timer-thread wakeup coalescing ≈ 1.1–1.5 % CPU; a timer-less inbound park) joins the Tier-3 economy batch (R-5 / the transport-economy PR). On the stock-kernel `SQUEEZEFS_FUSE_ZC=0` posture the named site engages (1.14 arms/op, ≈ 5–6 % CPU) but `dev_queue` = 500 µs (read #3) dwarfs it |
 | **5** | **Write #3 — the overlay has no depth governor** | the B4 overlay arm admits stores open-loop; the ledger measured **0.68–0.80× on device-bound venues**, field-neutral | field-neutral today, so the gain is venue protection + the governor pattern the write pipeline already owns (`ProbeCore`) / HIGH mechanism, HIGH number on the losing venue | tcp devsub (the device-bound venue) A-B-B-A rewrite rows, then squeeze-test must stay ≥ par; `overlay_*` residence family (a gap — Appendix C) lands with it |
 | **6** | **DLM F-B — the cluster wire is thread-per-connection** | `src/cluster_wire.rs:1464` `max_connections_from(cpus) = (cpus×16).clamp(64, 1024)`; one OS thread per accepted connection (`:2060`) → **≤ 1,024 readers or ≤ ~340 co-writers PER AUTHORITY by construction** (3–4 planes per node); 15 k members = 15 k OS threads | a **capability limit**, not a throughput number: 15 k requires ≥ 15 authorities (readers) / ≥ 45 (co-writers) by arithmetic on the ledger's constants; gain at today's fleet sizes = 0 / HIGH mechanism | membership fleet at N ≫ 1,024 on the SIM-1 harness (measured-simulated) + a real-mount N = 512/1,024/2,048 ladder on one box: connection count, RSS, renewal latency; lever = multiplex planes per node (×3–4) then a poll/uring venue that removes the thread term |
 
@@ -401,7 +401,37 @@ write-through/overlay suites. The baseline's `rw_4k` rows are NOT this
 shape (fresh sole-owner files → W1, `patch_writes` 55.3 M) — the f47 venue
 must be built deliberately.
 
-### 4.3 Finding candidate 48 — the per-read timer + channel mutex class (MEASURE FIRST)
+### 4.3 Finding candidate 48 — the per-read timer + channel mutex class (MEASURED — NOT FAT, closed)
+
+**Adjudicated 2026-09-02 (R-1, `perf/r1-device-read-executor`,
+[`.benchmarks/2026-09-02-r1-device-read-executor.md`](../.benchmarks/2026-09-02-r1-device-read-executor.md)):
+the candidate does NOT promote.** The measurement (uprobes on both
+`Sleep::new` symbols + `cpu-clock` profiles + the new `timer_*` /
+`transport_timer_*` gauges and `sqz-timer` / `fuse3-ur` CPU classes, tcp
+devsub then squeeze-test) found: (1) the named site `nvme_dev.rs:2426` is
+**cold on the sqz-kernel field posture in both modes** — kern rand-4k
+rides the FUSE-zc direct leg (`zc_device_fetch`, a worker-side deadline
+and a plain oneshot, no per-op timer), il rides the direct-drive engine;
+the field kern row ran `ranged_reads = 0` over 27.9 M reads; (2) the
+per-op timer arm that does exist is **`InboundQueue::pop`'s ticked
+`mpsc::recv` park** (`fuse_over_uring.rs:1412-1435`) on the **fuse3 fork's
+own `#[path]`-shared `sqz_time` registry** — a second global lock / heap /
+`sqz-timer` thread — at 0.35–0.45 arms per kernel READ (1.12 per 1 MiB
+READ): the exact "per-pull timer registration" L3 lever C retired, brought
+back by the rip-tokio-TOTAL sweep through `ticked()`; (3) the lane channel
+is crossbeam (lock-free, 12 ns/op) and the oneshot's per-channel mutex is
+uncontended (a lock-free oneshot measures slower) — both "mutex" items
+retire; (4) cost: `sqz-timer` class 1.14 % (kern) / 0.44 % (il) of daemon
+CPU on the field, the whole class ≤ 3 % / ≈ 0.5 %, and < 0.2 % of per-op
+latency; the registry lock's contention knee (0.8–1.0 M arm cycles/s per
+registry, `read_fill_executor_prims`) sits at ≈ 1.8–2.2 M kernel IOPS —
+at/above the field device ceiling. Below the ≥ ~5 % bar ⇒
+load-bearing-at-cost. Residual levers (Tier 3, not landed): timer-thread
+wakeup coalescing (the thread's cost is a ≈ 200 k wakeups/s stream, not
+the pops), a timer-less inbound park. The stock-kernel `SQUEEZEFS_FUSE_ZC=0`
+posture does pay the named site (1.14 arms/op, ≈ 5–6 % CPU) but its
+`dev_queue` = 500 µs is read board #3's term and dwarfs it. The original
+hypothesis text follows for the record.
 
 **Not yet a finding**: a finding needs a number, and this one has a
 mechanism and an arithmetic estimate only. **Mechanism** (read ledger fat
@@ -466,7 +496,7 @@ R (read), W (write), D (DLM/metadata), C (the shared conveyor).
 | 1 | `perf/owner-concurrent-verbs` | D-1 | F-A: dispatch a frame's mutating verbs concurrently so they co-queue into ONE M7 pass | K-writer fan-out: verbs/s per authority and ingest GiB/s vs the S9-a wall; `owner_phase_ns` sums; `shipped ≡ served`; fsck + C8 clean |
 | 2 | `perf/conveyor-two-stage` | C-1 | DLM #2 ≡ W #5: apply stage / durability stage, N journal writes in flight, in-order acks; one tx = one entry unchanged | mdstorm + `w_fresh`/`w_rewrite` streams; `pass_journal_write` split shows the barrier alone; `publish_phase_ns.queue_wait` down; loom on the two-stage handoff |
 | 3 | `perf/conveyor-resident-pass` | C-2 | DLM #3: resident pass task on `sqz_notify`, fan-out on the committer's lane | `tx_queue_wait` sums; the 0.68 ms residue gone |
-| 4 | `perf/read-fill-timerless` | R-1 | candidate 48: measure → per-lane deadline watchdog + SPSC completion rings | `rr_4k` clat/CPU-op both modes; `sqz_time` share in perf → ~0; loom on the lane watchdog |
+| 4 | `perf/r1-device-read-executor` (was `perf/read-fill-timerless`) | R-1 | candidate 48: **measured → NOT FAT, closed** (§4.3; `.benchmarks/2026-09-02-r1-device-read-executor.md`) — instruments + microbench landed, no lever; the residual joins R-5 / the transport-economy PR | done: `sqz_time` share in perf ≤ 3 % kern / ≈ 0.5 % il on the field, < 0.2 % of clat |
 | 5 | `perf/overlay-depth-governor` | W-1 | W #3: `ProbeCore`-governed overlay admission + the `overlay_phase_ns` residence family | tcp devsub rewrite rows ≥ par (was 0.68–0.80×); field ≥ par |
 | 6 | `perf/wire-multiplex` | D-2 | F-B: multiplex planes per node, then the poll/uring accept venue | N-ladder 512/1,024/2,048 on one box; SIM-1 at 15 k (measured-simulated, labeled) |
 | 7 | `perf/read-fast-dispatch` | R-2 | R #2: READ dispatch from the reap thread | `r_cold` 1 MiB qd8/16; `queue_wait + dispatch_lag` sums |
@@ -623,13 +653,17 @@ rip-tokio-TOTAL sweep, which put a process-global `std::sync::Mutex` +
 read (`src/nvme_dev.rs:2426`, 30 s deadline) and every cohort-wait slice
 (`src/routing.rs:9299`), plus a per-channel `Mutex` on every fill's lane
 mpsc (`nvme_dev.rs:2404`) and per oneshot (`:2395`) — unpriced by any read
-row.
+row. *(Priced 2026-09-02 by R-1, §4.3: the named site is cold on the
+sqz-kernel field posture in both modes, the lane mpsc is crossbeam, the
+oneshot mutex is uncontended; the real per-op arm is the transport's
+inbound-pop ticked park on the fuse3 registry at ≤ 3 % daemon CPU —
+fat #1 below is retired.)*
 
 **Fat board:**
 
 | # | Item | Term | Lever |
 |---|---|---|---|
-| 1 | the `sqz_time`/`sqz_channel` mutex class | HIGH mechanism / LOW number; ~1.2 M mutex ops/s + ~190 MB tombstones at field rand-4k rates | timer-less per-lane deadline watchdog / SPSC rings |
+| ~~1~~ | the `sqz_time`/`sqz_channel` mutex class — **retired 2026-09-02 (R-1, not fat; §4.3)** | measured: ≤ 3 % daemon CPU kern / ≈ 0.5 % il, < 0.2 % of clat; named site cold on the field | residual → Tier 3 (timer-thread wakeup coalescing; timer-less inbound park) |
 | 2 | transport ingress | `queue_wait + dispatch_lag` ≈ 3.25 ms of 10.5 ms at 1 MiB qd8 | READ fast-dispatch from the reap thread |
 | 3 | fill-issue economy | `dev_queue` ≈ 1.37 + wake ≈ 1.63 = 3.0 of 7.77 ms | poll-between-completions instead of `submit_and_wait(1)` park; wake cohort on the reaping thread |
 | 4 | whole-box CPU wall | 2.7 passes/byte | zc serve (`READ_FIXED` into folios, sqz kernel) |

@@ -141,6 +141,13 @@ async fn format_meta(path: &std::path::Path, uuid: [u8; 16]) {
 
 async fn make(tag: &str) -> H {
     std::env::set_var("SQUEEZEFS_DEFAULT_BLOCK_SIZE", "65536");
+    // The mount's own derivation (`apply_derived_write_knobs`): the W1
+    // cap is block_size/8 = 8 KiB here, and since finding 47 it is also
+    // the overlay's length floor — the BS/4 segments below are the
+    // overlay class, PAGE-sized writes are the W1/W2 program's.
+    squeezefs::fuse_client::set_patch_max_bytes(squeezefs::fuse_client::derived_patch_max_bytes(
+        BS,
+    ));
     set_device_overlay_for_tests(true, true);
     // This suite pins ACK-after-CQE (KD-OV-7): production Bytes overlay
     // now ACKs early by default, which would race the crash-drop and
@@ -514,7 +521,9 @@ async fn partial_overlay_read_does_not_seed_or_publish() {
 /// a reader; every byte whose write COMPLETED before the read began
 /// must never read stale (zeros where data was ACKed, or a previous
 /// value). The overlay path must hold the same contract the
-/// accumulation path holds today.
+/// accumulation path holds today. Segments are BS/4 — the overlay class
+/// above the finding-47 length floor (PAGE-sized sequential segments
+/// are the W1/W2 program's and accumulate); reads probe page-granular.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn fresh_stream_storm_never_serves_stale_bytes() {
     let _g = serial().await;
@@ -525,16 +534,17 @@ async fn fresh_stream_storm_never_serves_stale_bytes() {
     let installs0 = m(&METRICS.overlay_installs);
 
     const BLOCKS: u64 = 6; // blocks 2..8 — fresh territory
+    const SEG: u64 = BS / 4;
     let (tx, rx) = tokio::sync::watch::channel(0u64); // completed end (abs)
 
     let writer = {
         let h = h.clone();
         tokio::spawn(async move {
-            for p in 0..(BLOCKS * BS / PAGE) {
-                let off = 2 * BS + p * PAGE;
-                let val = (p % 199 + 1) as u8;
-                write_at(&h, ino, off, &vec![val; PAGE as usize]).await;
-                let _ = tx.send(off + PAGE);
+            for s in 0..(BLOCKS * BS / SEG) {
+                let off = 2 * BS + s * SEG;
+                let val = (s % 199 + 1) as u8;
+                write_at(&h, ino, off, &vec![val; SEG as usize]).await;
+                let _ = tx.send(off + SEG);
             }
             drop(tx);
         })
@@ -549,8 +559,8 @@ async fn fresh_stream_storm_never_serves_stale_bytes() {
                 if end > 2 * BS {
                     let off = 2 * BS + ((end - 2 * BS) / 2 / PAGE) * PAGE;
                     let got = read_at(&h, ino, off, PAGE as u32).await;
-                    let p = (off - 2 * BS) / PAGE;
-                    let want = (p % 199 + 1) as u8;
+                    let s = (off - 2 * BS) / SEG;
+                    let want = (s % 199 + 1) as u8;
                     for (i, &b) in got.iter().enumerate() {
                         assert_eq!(
                             b, want,
@@ -574,13 +584,13 @@ async fn fresh_stream_storm_never_serves_stale_bytes() {
         "the storm must have exercised the overlay path"
     );
     // Post-storm durable audit.
-    for p in 0..(BLOCKS * BS / PAGE) {
-        let off = 2 * BS + p * PAGE;
-        let want = (p % 199 + 1) as u8;
-        let got = read_at(&h, ino, off, PAGE as u32).await;
+    for s in 0..(BLOCKS * BS / SEG) {
+        let off = 2 * BS + s * SEG;
+        let want = (s % 199 + 1) as u8;
+        let got = read_at(&h, ino, off, SEG as u32).await;
         assert!(
             got.iter().all(|&b| b == want),
-            "post-storm byte at {off} must carry its pass value"
+            "post-storm segment at {off} must carry its pass value"
         );
     }
 }
@@ -645,6 +655,11 @@ async fn fresh_overlay_never_creates_a_shadow_epoch_interaction() {
 async fn crash_without_drain_reclaims_unpublished_offsets() {
     let _g = serial().await;
     std::env::set_var("SQUEEZEFS_DEFAULT_BLOCK_SIZE", "65536");
+    // The mount's derivation (see `make`): the BS/4 segment below is the
+    // overlay class only above the derived 8 KiB floor.
+    squeezefs::fuse_client::set_patch_max_bytes(squeezefs::fuse_client::derived_patch_max_bytes(
+        BS,
+    ));
     set_device_overlay_for_tests(true, true);
     set_ack_early_for_tests(false, false);
     let b = NamedTempFile::new().unwrap();

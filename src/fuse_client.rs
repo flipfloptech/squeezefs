@@ -569,6 +569,32 @@ pub fn set_patch_max_bytes(v: u64) {
     patch_max_bytes_cell().store(v, Ordering::Relaxed);
 }
 
+/// The device overlay's **length floor** (finding 47;
+/// design-overlay-overwrite §5.1, the §5.8 falsifier arm): is a
+/// `len`-byte segment overlay-eligible BY LENGTH?
+///
+/// `len > patch_max_bytes()` — literally the W1 predicate-5 oversize
+/// verdict, so the two classes tile the sub-block population exactly:
+/// `≤ cap` is the Random-small-write program's (W1 in place when
+/// eligible, else the W2 byte-budgeted extent park + amortized fold),
+/// `> cap` is the overlay/accumulation class (the 1 MiB+ segment
+/// A-leg, KD-B4). Without the floor a sub-cap write the patch DECLINED
+/// at state time (hole / clone-shared / decorated / co-writer-refused /
+/// stream-adjacent) minted a whole CoW dest per touched block and paid
+/// a whole-block old-image read + complement seed at every settle
+/// (`.benchmarks/2026-08-17-mw-shipped-free-c8-fix.md`: six 4 KiB
+/// writes ⇒ `overlay_gap_seed_old_bytes` = 6 × 4 MiB − 24,576).
+///
+/// Composition with the `SQUEEZEFS_PATCH_MAX_BYTES=0` A/B lever: cap 0
+/// empties the W1 class, so EVERY length is overlay-eligible — exactly
+/// as it makes none patch-eligible. The boundary is derived
+/// ([`derived_patch_max_bytes`] = block_size/8 at mount), never a
+/// free-floating byte constant.
+pub fn overlay_length_eligible(len: u64) -> bool {
+    let cap = patch_max_bytes();
+    cap == 0 || len > cap
+}
+
 /// In-place full-block overwrite (write-wall iterations 1–2 —
 /// `SQUEEZEFS_INPLACE_OVERWRITE=1` opts IN; **default OFF**): an
 /// eligible full-block overwrite (sole-owned, undecorated, passthrough,
@@ -6946,6 +6972,17 @@ pub struct Metrics {
     /// arm): growth means range custody engaged on shared blocks or the
     /// predicate rotted.
     pub overlay_ineligible_range_shared: Align64<AtomicU64>,
+    /// §5.1 **length floor** (finding 47; [`overlay_length_eligible`]):
+    /// aligned single-block passthrough segments that every OTHER
+    /// overlay shape conjunct admitted but whose length is ≤ the W1 cap
+    /// (`patch_max_bytes()`, block_size/8) — sent down the W1/W2 ladder
+    /// instead (patch in place when eligible, else the extent park /
+    /// accumulation). BOTH shapes. Grows ≈ per sub-cap aligned write on
+    /// overlay-armed mounts by design; a sub-cap shape reaching the
+    /// overlay ledgers (`overlay_gap_seed_old_bytes` growing on a rand-4k
+    /// row) while this stays flat is the predicate rotting. 0 under
+    /// `SQUEEZEFS_PATCH_MAX_BYTES=0` (cap 0 empties the sub-cap class).
+    pub overlay_ineligible_sub_cap: Align64<AtomicU64>,
     /// §5.1 / KD-B4-8: a `StorageFull` dest mint declined the overwrite
     /// arm to accumulation (whose epoch KD-1.7 early-close ladder
     /// recycles the parked displaced supply) — never a write error.
@@ -10687,6 +10724,7 @@ impl SqueezefsFilesystem {
                 "overlay_overwrite_bytes": METRICS.overlay_overwrite_bytes.load(Ordering::Relaxed),
                 "overlay_ineligible_shadow_bound": METRICS.overlay_ineligible_shadow_bound.load(Ordering::Relaxed),
                 "overlay_ineligible_range_shared": METRICS.overlay_ineligible_range_shared.load(Ordering::Relaxed),
+                "overlay_ineligible_sub_cap": METRICS.overlay_ineligible_sub_cap.load(Ordering::Relaxed),
                 "overlay_enospc_declines": METRICS.overlay_enospc_declines.load(Ordering::Relaxed),
                 "overlay_gap_seeds": METRICS.overlay_gap_seeds.load(Ordering::Relaxed),
                 "overlay_gap_seed_bytes": METRICS.overlay_gap_seed_bytes.load(Ordering::Relaxed),
@@ -14851,6 +14889,15 @@ impl SqueezefsFilesystem {
         if len == 0 || is_virtual_ino(ino) || offset % 4096 != 0 || u64::from(len) % 4096 != 0 {
             return false;
         }
+        // Finding 47 — the length floor, BOTH shapes: a sub-cap segment
+        // is the W1/W2 program's whatever its block's state, so the slot
+        // follows the patch ladder's hold rules (the HELD-slot late
+        // WRITE_FIXED vehicle, the opposite of the overlay's
+        // extract-at-delivery posture) or extracts at delivery. Same
+        // predicate as the handler's authoritative screen.
+        if !overlay_length_eligible(u64::from(len)) {
+            return false;
+        }
         if crate::write_verification_enabled() || !self.router.get_crypto().is_passthrough() {
             return false;
         }
@@ -14873,23 +14920,11 @@ impl SqueezefsFilesystem {
         };
         // B4c-ii: mapped blocks are hold-eligible under the overwrite
         // lever (the whole point — the slot retains at delivery; a stale
-        // TRUE only costs one late extraction). Two carve-outs:
-        // shadow-bound blocks stay declined (the §5.1 one-authority
-        // arm), and PATCH-SHAPED mapped writes (≤ the W1 cap) stay on
-        // the patch ladder's hold rules — the patch runs FIRST in the
-        // handler ladder and owns that population, and its O_DIRECT
-        // vehicle is the HELD slot (late WRITE_FIXED), the opposite of
-        // the overlay's extract-at-delivery posture. A patch that then
-        // declines at state time (clause 8, shared, …) costs one late
-        // extraction — the documented stale-verdict price.
-        if bm.contains_key(&(b as u32)) {
-            if !crate::device_overlay::overlay_overwrite_enabled() {
-                return false;
-            }
-            let cap = patch_max_bytes();
-            if cap != 0 && u64::from(len) <= cap {
-                return false;
-            }
+        // TRUE only costs one late extraction). Shadow-bound blocks stay
+        // declined (the §5.1 one-authority arm); the patch-shaped
+        // population left this arm with the length floor above.
+        if bm.contains_key(&(b as u32)) && !crate::device_overlay::overlay_overwrite_enabled() {
+            return false;
         }
         if self.router.rewrite_epoch_binds_block(ino, b as u32) {
             return false;
@@ -16644,7 +16679,7 @@ impl SqueezefsFilesystem {
         // verification; the STATE half (striped authority, fresh block,
         // no staged/RAM/shadow custody) runs in the per-block future
         // under the held block guard.
-        let try_overlay = crate::device_overlay::device_overlay_enabled()
+        let overlay_shape = crate::device_overlay::device_overlay_enabled()
             && !payload.is_empty()
             && start_block == end_block
             && offset % 4096 == 0
@@ -16652,6 +16687,22 @@ impl SqueezefsFilesystem {
             && (payload.slot().is_some() || crate::device_overlay::bytes_vehicle_armed())
             && !crate::write_verification_enabled()
             && self.router.get_crypto().is_passthrough();
+        // Finding 47 — the LENGTH FLOOR (`overlay_length_eligible`):
+        // a sub-cap segment is the Random-small-write program's, whatever
+        // the patch's state verdict — below the floor the ladder falls
+        // through exactly as before the overlay landed (W1 when
+        // eligible, else the W2 extent park / accumulation). Counted only
+        // when every other shape conjunct held, so the bucket reads
+        // "segments the floor alone sent down the ladder".
+        let try_overlay = overlay_shape && {
+            let above = overlay_length_eligible(payload_len);
+            if !above {
+                METRICS
+                    .overlay_ineligible_sub_cap
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            above
+        };
 
         // D14: a slot payload stays UNMATERIALIZED only for the
         // single-block patch/overlay shapes (the direct slot→device DMA

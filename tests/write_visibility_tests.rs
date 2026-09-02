@@ -55,8 +55,19 @@ struct H {
     _s: TempDir,
 }
 
+/// The overlay-class segment for the overlay-path pins: ABOVE the
+/// derived W1 cap (BS/8 = 8 KiB — since finding 47 also the device
+/// overlay's length floor; an 8 KiB segment is the W1/W2 program's).
+const OVL_SEG: usize = 16384;
+
 async fn make() -> H {
     std::env::set_var("SQUEEZEFS_DEFAULT_BLOCK_SIZE", "65536");
+    // The mount's own derivation (`apply_derived_write_knobs`): the W1
+    // cap is block_size/8 — the 4 KiB patch shapes stay W1's, OVL_SEG
+    // segments are the overlay's.
+    squeezefs::fuse_client::set_patch_max_bytes(squeezefs::fuse_client::derived_patch_max_bytes(
+        BS,
+    ));
     let dlm = DlmClient::new().unwrap();
 
     let b = NamedTempFile::new().unwrap();
@@ -1796,10 +1807,12 @@ async fn overlay_compose_read_clamps_to_eof() {
         .overlay_installs
         .load(AtomOrd::Relaxed);
     let ino = create(&h, "ovl_eof").await;
-    // The storm's own growth shape: sequential 8 KiB chunks walking the
-    // file through its layouts — stop mid-block so the file ends with a
-    // partial tail block. 6 blocks + one 8 KiB chunk.
-    const CHUNK: usize = 8192;
+    // The storm's growth shape in the OVERLAY class: sequential
+    // overlay-class chunks walking the file through its layouts — stop
+    // mid-block so the file ends with a partial tail block. 6 blocks +
+    // one chunk. (The storm's own 8 KiB chunk is the W1/W2 program's
+    // since finding 47 — the accumulation path, whose A/B proved clean.)
+    const CHUNK: usize = OVL_SEG;
     let tail_block_start = 6 * BS;
     let eof = tail_block_start + CHUNK as u64;
     let pattern: Vec<u8> = (0..eof as usize).map(|i| (i % 251) as u8 ^ 0x5A).collect();
@@ -1903,9 +1916,10 @@ async fn overlay_installed_inside_read_window_never_hides_acked_bytes() {
     }
 
     // Writer: the first write to block 2 — the fresh-shape device-overlay
-    // store (striped, 4 KiB-aligned, single-block, no custody anywhere).
-    // Its ACK publishes size = 2*BS + 8192 while the reader sits inside
-    // its window and the bytes sit at the overlay's unpublished dest.
+    // store (striped, 4 KiB-aligned, single-block, overlay-class length,
+    // no custody anywhere). Its ACK publishes size = 2*BS + OVL_SEG while
+    // the reader sits inside its window and the bytes sit at the
+    // overlay's unpublished dest.
     let installs0 = squeezefs::fuse_client::METRICS
         .overlay_installs
         .load(AtomOrd::Relaxed);
@@ -1913,7 +1927,7 @@ async fn overlay_installed_inside_read_window_never_hides_acked_bytes() {
         &h,
         ino,
         2 * BS,
-        &pattern[2 * BS as usize..2 * BS as usize + 8192],
+        &pattern[2 * BS as usize..2 * BS as usize + OVL_SEG],
     )
     .await;
     assert!(
@@ -1955,7 +1969,7 @@ async fn overlay_installed_inside_read_window_never_hides_acked_bytes() {
     assert_eq!(
         got.len(),
         16384,
-        "size 2*BS+8192 was published before the serve; the reply must \
+        "size 2*BS+OVL_SEG was published before the serve; the reply must \
          cover the full window"
     );
     let base = (2 * BS - 8192) as usize;
@@ -2020,8 +2034,9 @@ async fn settle_inside_the_validate_gap_never_hides_acked_bytes() {
         tokio::time::sleep(std::time::Duration::from_millis(1)).await;
     }
 
-    // The racing write: fresh-shape overlay store on block 2, ACK +
-    // size publish while the reader is parked pre-snapshot.
+    // The racing write: fresh-shape overlay store on block 2 (overlay-
+    // class length), ACK + size publish while the reader is parked
+    // pre-snapshot.
     let installs0 = squeezefs::fuse_client::METRICS
         .overlay_installs
         .load(AtomOrd::Relaxed);
@@ -2029,7 +2044,7 @@ async fn settle_inside_the_validate_gap_never_hides_acked_bytes() {
         &h,
         ino,
         2 * BS,
-        &pattern[2 * BS as usize..2 * BS as usize + 8192],
+        &pattern[2 * BS as usize..2 * BS as usize + OVL_SEG],
     )
     .await;
     assert!(
@@ -2289,7 +2304,7 @@ async fn fresh_overlay_mint_under_space_pressure_declines_never_eio() {
     squeezefs::device_overlay::set_device_overlay_for_tests(true, true);
 
     let ino = create(&h, "ovl_enospc").await;
-    let pattern: Vec<u8> = (0..2 * BS as usize + 8192)
+    let pattern: Vec<u8> = (0..2 * BS as usize + OVL_SEG)
         .map(|i| (i % 251) as u8 ^ 0x5A)
         .collect();
     write_at(&h, ino, 0, &pattern[..2 * BS as usize]).await;
@@ -2308,10 +2323,11 @@ async fn fresh_overlay_mint_under_space_pressure_declines_never_eio() {
     }
 
     // The write that walks the fresh-shape overlay screen (striped file,
-    // aligned, single-block, block 2 unmapped, no custody anywhere).
-    // Pre-fix: the mint's StorageFull surfaced as write EIO (the storm's
-    // dead-writer tape). Post-fix: the mint DECLINES (counted) and the
-    // write ACKs through the accumulation park, which allocates nothing.
+    // aligned, single-block, overlay-class length, block 2 unmapped, no
+    // custody anywhere). Pre-fix: the mint's StorageFull surfaced as
+    // write EIO (the storm's dead-writer tape). Post-fix: the mint
+    // DECLINES (counted) and the write ACKs through the accumulation
+    // park, which allocates nothing.
     let declines0 = squeezefs::fuse_client::METRICS
         .overlay_enospc_declines
         .load(AtomOrd::Relaxed);
@@ -2327,7 +2343,7 @@ async fn fresh_overlay_mint_under_space_pressure_declines_never_eio() {
 
     // The acked bytes serve from the parked custody (no allocation was
     // needed and none may have happened).
-    let got = read_at(&h, ino, 2 * BS, 8192).await;
+    let got = read_at(&h, ino, 2 * BS, OVL_SEG as u32).await;
     assert_eq!(
         &got[..],
         &pattern[2 * BS as usize..],
@@ -2380,11 +2396,13 @@ async fn escalation_composes_an_open_record_never_settles_it() {
         );
         tokio::time::sleep(std::time::Duration::from_millis(1)).await;
     }
+    // Overlay-class length (above the finding-47 floor) — the record
+    // this pin needs OPEN.
     write_at(
         &h,
         ino,
         2 * BS,
-        &pattern[2 * BS as usize..2 * BS as usize + 8192],
+        &pattern[2 * BS as usize..2 * BS as usize + OVL_SEG],
     )
     .await;
 

@@ -170,6 +170,7 @@ verdict instead of declining:
 ```
 mapped(b) ∧ striped-authority ∧ passthrough ∧ ¬write_verification
         ∧ aligned single-block segment (4 KiB offset+len, one block)
+        ∧ len > patch_max_bytes()              — the LENGTH FLOOR (finding 47), BOTH shapes
         ∧ no RAM accumulation (active_block_buffers)         [existing]
         ∧ no staged custody (active_block / active_block_ext) [existing]
         ∧ no live W2 extent overlay on the block              [existing]
@@ -179,6 +180,37 @@ mapped(b) ∧ striped-authority ∧ passthrough ∧ ¬write_verification
 ```
 
 Load-bearing points, each with its measured or structural reason:
+
+* **The length floor (finding 47, 2026-09-02 — `overlay_length_eligible`,
+  `src/fuse_client.rs`; contracts `tests/overlay_length_floor_tests.rs`).**
+  A segment is overlay-eligible by length iff `len > patch_max_bytes()`
+  — literally the W1 predicate-5 oversize verdict, so the two fast
+  paths tile the sub-block population at the derived cap (block_size/8,
+  512 KiB on the shipped block): `≤ cap` is the Random-small-write
+  program's (W1 in place when eligible, else the W2 byte-budgeted extent
+  park + amortized fold), `> cap` is the overlay/accumulation class —
+  the 1 MiB+ segment A-leg this design was built for. It applies to
+  BOTH shapes (a fresh/hole sub-cap write is W2's too) and to the hold
+  gates (a sub-cap slot follows the patch ladder's hold rules or
+  extracts at delivery). Why: the shape screen had no minimum and the
+  overlay arm runs BEFORE the W2 park, so a sub-cap write the patch
+  declined at STATE time (hole / clone-shared / decorated /
+  co-writer-refused / stream-adjacent) minted a whole CoW dest per
+  touched block, held it Open across the drain interval, fed the
+  rewrite epoch per record, and at settle read the whole old image and
+  seeded the whole complement as gap runs — the §5.8 falsifier firing
+  exactly as written: `.benchmarks/2026-08-17-mw-shipped-free-c8-fix.md`
+  (six refused patches ⇒ `overlay_gap_seed_old_bytes` = 6 × 4 MiB −
+  24,576, one 4 KiB write per record). Composition with the
+  `SQUEEZEFS_PATCH_MAX_BYTES=0` A/B lever: cap 0 empties the W1 class,
+  so every length is overlay-eligible — exactly as it makes none
+  patch-eligible; the lever keeps meaning "no W1", never "no overlay".
+  Counted `overlay_ineligible_sub_cap` (§11). Small-bs SEQUENTIAL
+  segments (4–256 KiB, `patch_ineligible_adjacent`) are the same
+  population's other face: below the floor they accumulate in the
+  `ActiveBlockBuf` into ONE whole-block write-through (request size =
+  the block) instead of one overlay store per op (`wareq-sz` collapsing
+  to bs).
 
 * **Shared blocks are eligible.** Unlike W1 (refcount == 1 mandatory —
   in-place mutation of a pinned block is corruption), B4 is CoW: the old
@@ -899,6 +931,7 @@ family (`src/fuse_client.rs:5854+`):
 | `overlay_gap_seed_old_bytes` | the §5.8 falsifier instrument (subset of `overlay_gap_seed_bytes`); ≈ 0 on sequential shapes |
 | `overlay_ineligible_shadow_bound`, `overlay_enospc_declines` | the two new decline ledgers (§5.1) |
 | `overlay_ineligible_range_shared` | the S11 rung-16 range clause (§5.1) — the W1 clause-7 twin, kept apart from `patch_ineligible_range_shared` and from `overlay_ineligible_shadow_bound` (the ledgers must not merge). **0 on every shipped mount** (whole-file leases ARE whole-inode custody; no verb issues ranges without the mw arm) and **0 on block-aligned ranged rows** (`design-full-multi-writer.md` §9.5's MPI-IO gate: nothing should share a block) — growth means range custody engaged on sub-block-shared blocks (rung 17's demotion territory) or the predicate rotted |
+| `overlay_ineligible_sub_cap` | the §5.1 **length floor** (finding 47): aligned single-block passthrough segments every other shape conjunct admitted but whose length is ≤ the W1 cap (`patch_max_bytes()`, block_size/8) — sent down the W1/W2 ladder instead, BOTH shapes. Grows ≈ per sub-cap aligned write on overlay-armed mounts by design; `overlay_gap_seed_old_bytes` growing on a rand-4k row while this stays flat is the predicate rotting. 0 under `SQUEEZEFS_PATCH_MAX_BYTES=0` (cap 0 empties the sub-cap class) |
 | `patch_ineligible_device_overlay` | W1 clause 8 (kept apart from both the W2 `patch_ineligible_overlay` bucket and the S11 clause-7 `patch_ineligible_range_shared`) |
 | `overlay_mover_skips` | the §5.7 `MergeExpected` skip engaging — counted at BOTH layers (the mover quiesce-probe deferral and the primitive belt for guard-less callers); acked custody preserved, mover/repair re-plans or refuses — growth under mover passes is the hook working |
 | `overlay_superseded_by_merge` | the §5.7 DISCARDING-class belt engaging (`TruncateFrom`/`RemoveBlocks` reaching the primitive un-drained) — pair with `rewrite_shadow_superseded`; a FOREIGN un-marked `Merge` additionally trips `invariant_tripwires` (`overlay_foreign_merge`) — **must stay 0 on healthy mounts** now that the settle's own publish is provenance-exempted (§5.7): any growth is a real one-authority-screen escape, never publish noise |

@@ -39,7 +39,8 @@ use squeezefs::device_overlay::{
 };
 use squeezefs::dlm::DlmClient;
 use squeezefs::fuse_client::{
-    derived_patch_max_bytes, set_patch_max_bytes, SqueezefsFilesystem, METRICS,
+    derived_patch_max_bytes, overlay_length_eligible, patch_max_bytes, set_patch_max_bytes,
+    SqueezefsFilesystem, METRICS,
 };
 use squeezefs::meta_backend::kv::backend::KvMetaBackend;
 use squeezefs::meta_backend::kv::builder::{BuilderConfig, ImageBuilder};
@@ -275,6 +276,7 @@ struct Snap {
     overlay_store_bytes: u64,
     overlay_gap_seed_bytes: u64,
     overlay_gap_seed_old_bytes: u64,
+    overlay_ineligible_sub_cap: u64,
     overlay_open: u64,
     extent_parks: u64,
     fold_passes: u64,
@@ -296,6 +298,7 @@ fn snap() -> Snap {
         overlay_store_bytes: m(&METRICS.overlay_store_bytes),
         overlay_gap_seed_bytes: m(&METRICS.overlay_gap_seed_bytes),
         overlay_gap_seed_old_bytes: m(&METRICS.overlay_gap_seed_old_bytes),
+        overlay_ineligible_sub_cap: m(&METRICS.overlay_ineligible_sub_cap),
         overlay_open: m(&METRICS.overlay_open),
         extent_parks: m(&METRICS.extent_parks),
         fold_passes: m(&METRICS.fold_passes),
@@ -370,6 +373,11 @@ async fn sub_cap_hole_write_rides_w2_never_the_overlay() {
         delta!(after, before, overlay_stores),
         0,
         "no overlay store for a sub-cap segment"
+    );
+    assert_eq!(
+        delta!(after, before, overlay_ineligible_sub_cap),
+        1,
+        "the floor's ledger names the decline"
     );
     assert_eq!(
         delta!(after, before, extent_parks),
@@ -469,6 +477,11 @@ async fn sub_cap_write_to_a_clone_shared_block_rides_w2_never_the_overlay() {
         "no overlay record"
     );
     assert_eq!(
+        delta!(after, before, overlay_ineligible_sub_cap),
+        1,
+        "the floor's ledger names the decline (the overwrite shape too)"
+    );
+    assert_eq!(
         delta!(after, before, extent_parks),
         1,
         "the W2 extent park absorbs the patch-ineligible sub-cap write"
@@ -533,6 +546,11 @@ async fn above_cap_aligned_overwrite_still_takes_the_overlay() {
         delta!(after, before, extent_parks),
         0,
         "the overlay class never parks extents"
+    );
+    assert_eq!(
+        delta!(after, before, overlay_ineligible_sub_cap),
+        0,
+        "the floor stays silent above the cap"
     );
 
     fsync(&h, ino).await;
@@ -613,7 +631,23 @@ async fn patch_cap_zero_makes_every_length_overlay_eligible() {
     let _g = serial().await;
     let (h, _lever) = make("f47_cap0", BS).await;
     let (ino, _) = sparse_striped(&h, "cap0.dat", 2, 6, 0x70).await;
+
+    // The predicate itself: `len > cap`, the W1 oversize verdict — the
+    // classes tile at the cap (≤ cap ⇒ W1/W2, > cap ⇒ overlay) — and
+    // cap 0 admits every length.
+    let cap = patch_max_bytes();
+    assert_eq!(cap, derived_patch_max_bytes(BS), "harness derived the cap");
+    assert!(!overlay_length_eligible(PAGE));
+    assert!(
+        !overlay_length_eligible(cap),
+        "len == cap is W1's (predicate 5 admits it)"
+    );
+    assert!(overlay_length_eligible(cap + PAGE));
     set_patch_max_bytes(0);
+    assert!(
+        overlay_length_eligible(PAGE),
+        "cap 0: every length is overlay-eligible"
+    );
 
     let before = snap();
     let p = pattern(PAGE as usize, 0x71);
@@ -629,6 +663,11 @@ async fn patch_cap_zero_makes_every_length_overlay_eligible() {
         delta!(after, before, overlay_installs),
         1,
         "cap 0: a 4 KiB hole write is overlay-eligible by length"
+    );
+    assert_eq!(
+        delta!(after, before, overlay_ineligible_sub_cap),
+        0,
+        "cap 0: the floor's ledger is silent too (no sub-cap class exists)"
     );
     assert_eq!(delta!(after, before, extent_parks), 0, "…and never parks");
     fsync(&h, ino).await;
@@ -681,6 +720,11 @@ async fn rand_4k_burst_into_holes_rides_w2_amortized() {
     assert_eq!(
         burst.overlay_open, before.overlay_open,
         "no dest pinned per touched block"
+    );
+    assert_eq!(
+        delta!(burst, before, overlay_ineligible_sub_cap),
+        64,
+        "the floor engaged on every op of the burst"
     );
     assert_eq!(
         delta!(burst, before, extent_parks),
@@ -740,6 +784,15 @@ async fn small_bs_sequential_segments_accumulate_into_one_write_through() {
         write_at(&h, ino, 2 * BS + i * PAGE, &p).await;
         want[(i * PAGE) as usize..((i + 1) * PAGE) as usize].copy_from_slice(&p);
     }
+    // The complete-block write-through rides the detached write
+    // pipeline (its ACK detaches from the DMA): drain it before reading
+    // the ledger — no fsync yet, the write-through is the point.
+    assert!(
+        h.fs.write_pipeline
+            .quiesce(std::time::Duration::from_secs(30))
+            .await,
+        "pipeline must drain"
+    );
     let after = snap();
 
     assert_eq!(
@@ -749,14 +802,23 @@ async fn small_bs_sequential_segments_accumulate_into_one_write_through() {
     );
     assert_eq!(delta!(after, before, overlay_installs), 0);
     assert_eq!(
+        delta!(after, before, overlay_ineligible_sub_cap),
+        BS / PAGE,
+        "the floor engaged on every segment"
+    );
+    assert_eq!(
         delta!(after, before, write_through_blocks),
         1,
         "the coverage union completes the block ⇒ ONE whole-block write-through"
     );
-    assert_eq!(
-        delta!(after, before, extent_parks),
-        0,
-        "stream-adjacent segments keep the whole-block economy (W2 §5.2)"
+    // Only the stream's FIRST segment may park (its adjacency is
+    // unknowable — predicate 6 needs a previous end); the second
+    // segment escalates that extent overlay in place and the stream
+    // keeps the whole-block economy (W2 §5.2).
+    assert!(
+        delta!(after, before, extent_parks) <= 1,
+        "stream-adjacent segments never park per op (got {})",
+        delta!(after, before, extent_parks)
     );
     assert!(
         delta!(after, before, patch_ineligible_adjacent) >= (BS / PAGE) - 1,

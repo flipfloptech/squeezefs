@@ -194,6 +194,13 @@ async fn format_meta(path: &std::path::Path, uuid: [u8; 16]) {
 
 async fn make(tag: &str) -> H {
     std::env::set_var("SQUEEZEFS_DEFAULT_BLOCK_SIZE", "65536");
+    // The mount's derivation (`apply_derived_write_knobs`): W1 cap =
+    // block_size/8 = 8 KiB — since finding 47 also the overlay's length
+    // floor, so this suite's whole-block (BS) stores are the overlay
+    // class and its 4 KiB W1 probe stays the patch ladder's.
+    squeezefs::fuse_client::set_patch_max_bytes(squeezefs::fuse_client::derived_patch_max_bytes(
+        BS,
+    ));
     set_device_overlay_for_tests(true, false); // SLOT vehicle, not bytes
     set_ack_early_for_tests(true, true); // enabled + O_DIRECT opt-in
                                          // Backing files under target/ — tmpfs refuses the O_DIRECT open the
@@ -950,11 +957,13 @@ async fn stale_size_seed_class_never_zeros_a_published_overlay_sibling() {
     let ino = create(&h, "f").await;
     promote_striped(&h, ino).await; // size = 2*BS, striped authority
 
-    // Sibling A: single-block aligned 8 KiB at block 4 rel 16 KiB —
-    // the overlay store owns the fresh block. DISJOINT from B's slice
-    // (overlapping concurrent writes may legally serve either content;
-    // the field corruption is at the overlay coverage's COMPLEMENT).
-    let a = vec![0x5Au8; 8192];
+    // Sibling A: single-block aligned 16 KiB at block 4 rel 16 KiB —
+    // the overlay store owns the fresh block (16 KiB is ABOVE the
+    // derived 8 KiB floor; a sub-cap segment would be W2's since
+    // finding 47). DISJOINT from B's slice (overlapping concurrent
+    // writes may legally serve either content; the field corruption is
+    // at the overlay coverage's COMPLEMENT).
+    let a = vec![0x5Au8; 16384];
     let stores0 = METRICS.overlay_stores.load(Ordering::Relaxed);
     h.fs.write(
         h.req,
@@ -989,7 +998,7 @@ async fn stale_size_seed_class_never_zeros_a_published_overlay_sibling() {
     .expect("straddler B");
 
     // A's acked (and now PUBLISHED) bytes must survive B's classification.
-    let back = read_at(&h, ino, 4 * BS + 16384, 8192).await;
+    let back = read_at(&h, ino, 4 * BS + 16384, 16384).await;
     assert_eq!(
         back, a,
         "the sibling's published overlay bytes were replaced by the \
@@ -997,7 +1006,7 @@ async fn stale_size_seed_class_never_zeros_a_published_overlay_sibling() {
     );
     // And durably, through the flush boundary.
     h.fs.fsync(h.req, ino, 0, false).await.expect("fsync");
-    let back = read_at(&h, ino, 4 * BS + 16384, 8192).await;
+    let back = read_at(&h, ino, 4 * BS + 16384, 16384).await;
     assert_eq!(back, a, "the durable image keeps the sibling's bytes");
     // B's own bytes are intact on both sides of the boundary.
     let bband = read_at(&h, ino, 4 * BS - 8192, 16384).await;

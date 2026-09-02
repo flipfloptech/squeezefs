@@ -2469,19 +2469,21 @@ fn patch_range_shared_refusals() -> u64 {
     m64(&METRICS.patch_ineligible_range_shared)
 }
 
-/// **The composed pin (the rung-16 charter's red-first):** ONE
-/// patch-shaped write under FOREIGN byte-range custody refuses the W1
-/// patch (clause 7) AND the B4 overlay (the §5.1 range clause) — each
-/// counted in ITS OWN ledger bucket — and still lands byte-exact through
-/// the accumulation (CoW-rewrite) path. The pin is the COMPOSITION: no
-/// fast path exists for a shared span.
+/// **The composed pin (the rung-16 charter's red-first):** under FOREIGN
+/// byte-range custody NO fast path exists for the shared span — every
+/// aligned write refuses its class's fast path in ITS OWN ledger bucket
+/// and still lands byte-exact through the accumulation (CoW-rewrite)
+/// path. Since finding 47 the two fast paths tile the sub-block
+/// population at the W1 cap (`overlay_length_eligible` = the predicate-5
+/// oversize verdict), so the composition is pinned per class: a SUB-CAP
+/// write is W1's — clause 7 refuses it and the overlay is never reached
+/// (the floor, `overlay_ineligible_sub_cap`); an ABOVE-CAP write is the
+/// overlay's — the §5.1 range clause refuses it and W1 was never a
+/// candidate (oversize). Neither class installs a record or patches.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn range_shared_span_refuses_both_patch_and_overlay() {
     let _g = serial().await;
     let _l = live_levers();
-    // The composed pin needs the patch ladder ARMED (the suite posture
-    // disarms it): both fast paths must refuse the SAME write.
-    squeezefs::fuse_client::set_patch_max_bytes(512 * 1024);
     let h = make_harness("s11r16_composed").await;
     let old = pattern((2 * FBS) as usize, 0x21).to_vec();
     let ino = striped_fixture_with(&h, "f1", &old).await;
@@ -2498,48 +2500,92 @@ async fn range_shared_span_refuses_both_patch_and_overlay() {
         .await
         .expect("foreign range custody");
     let token = h.fs.router.dlm.get_fencing_token_ino(ino);
+    let mut want = old[..FBS as usize].to_vec();
+    let (sb0, t0) = (m64(&METRICS.overlay_ineligible_shadow_bound), trips());
 
-    let (p0, o0, sb0, i0, pw0, t0) = (
+    // ---- Above-cap class FIRST (its refusal parks RAM custody on block
+    // 0, which the overlay's state screen declines ahead of the range
+    // clause): the DERIVED cap (FBS/8 = 2 KiB) makes one page
+    // overlay-class — the overlay is the candidate, W1 is oversize by
+    // predicate 5.
+    squeezefs::fuse_client::set_patch_max_bytes(squeezefs::fuse_client::derived_patch_max_bytes(
+        FBS,
+    ));
+    let (p1, o1, ov0, i1, pw1) = (
         patch_range_shared_refusals(),
         ow_range_shared(),
-        m64(&METRICS.overlay_ineligible_shadow_bound),
+        m64(&METRICS.patch_ineligible_oversize),
         ow_installs(),
         m64(&METRICS.patch_writes),
-        trips(),
     );
-    // ONE aligned sub-cap non-adjacent non-extending write into mapped
-    // block 0: the handler ladder runs patch THEN overlay — under the
-    // foreign grant BOTH must refuse.
+    let q = pattern(PAGE as usize, 0xC8);
+    h.fs.write_file_staged(ino, 3 * PAGE, bytes::Bytes::from(q.clone()), size, token)
+        .await
+        .expect("above-cap write under foreign range custody must LAND (rewrite path)");
+    want[3 * PAGE as usize..4 * PAGE as usize].copy_from_slice(&q);
+    assert_eq!(
+        ow_range_shared() - o1,
+        1,
+        "the B4 §5.1 range clause refused the overlay (counted in ITS ledger) — \
+         the composed law: no fast path exists for a range-shared span"
+    );
+    assert_eq!(
+        m64(&METRICS.patch_ineligible_oversize) - ov0,
+        1,
+        "W1 was never a candidate above the cap (predicate 5)"
+    );
+    assert_eq!(
+        patch_range_shared_refusals() - p1,
+        0,
+        "clause 7 never evaluated"
+    );
+    assert_eq!(ow_installs() - i1, 0, "no overlay record installed");
+    assert_eq!(m64(&METRICS.patch_writes) - pw1, 0, "no patch happened");
+
+    // ---- Sub-cap class: the patch ladder ARMED (the suite posture
+    // disarms it) with a cap above the page — W1 is the candidate.
+    squeezefs::fuse_client::set_patch_max_bytes(512 * 1024);
+    let (p0, o0, sc0, i0, pw0) = (
+        patch_range_shared_refusals(),
+        ow_range_shared(),
+        m64(&METRICS.overlay_ineligible_sub_cap),
+        ow_installs(),
+        m64(&METRICS.patch_writes),
+    );
     let p = pattern(PAGE as usize, 0xC7);
     h.fs.write_file_staged(ino, 2 * PAGE, bytes::Bytes::from(p.clone()), size, token)
         .await
-        .expect("write under foreign range custody must LAND (rewrite path)");
+        .expect("sub-cap write under foreign range custody must LAND (rewrite path)");
+    want[2 * PAGE as usize..3 * PAGE as usize].copy_from_slice(&p);
     assert_eq!(
         patch_range_shared_refusals() - p0,
         1,
         "W1 clause 7 refused the in-place patch (counted in its ledger)"
     );
     assert_eq!(
-        ow_range_shared() - o0,
+        m64(&METRICS.overlay_ineligible_sub_cap) - sc0,
         1,
-        "the B4 §5.1 range clause refused the overlay (counted in ITS ledger) — \
-         the composed law: no fast path exists for a range-shared span"
+        "the sub-cap write never reached the overlay's range clause — the \
+         length floor owns that decline (finding 47)"
+    );
+    assert_eq!(
+        ow_range_shared() - o0,
+        0,
+        "the range clause was never evaluated"
     );
     assert_eq!(ow_installs() - i0, 0, "no overlay record installed");
     assert_eq!(m64(&METRICS.patch_writes) - pw0, 0, "no patch happened");
     assert_eq!(
         m64(&METRICS.overlay_ineligible_shadow_bound) - sb0,
         0,
-        "the refusal is the RANGE clause, not the shadow-bound bucket — \
-         the ledgers must not merge (predicate-rot detection)"
+        "the refusals are the RANGE clause / the floor, not the shadow-bound \
+         bucket — the ledgers must not merge (predicate-rot detection)"
     );
     // Byte-exact under the holder's own verification (RYW), then durable.
-    let mut want = old[..FBS as usize].to_vec();
-    want[2 * PAGE as usize..3 * PAGE as usize].copy_from_slice(&p);
     assert_eq!(
         read_at(&h, ino, 0, FBS as usize).await,
         want,
-        "the refused-fast-path write landed byte-exact via accumulation"
+        "the refused-fast-path writes landed byte-exact via accumulation"
     );
     foreign.release().await.expect("release foreign");
     fsync(&h, ino).await;

@@ -3007,7 +3007,7 @@ impl KvMetaBackend {
         layout: &[u8],
         size: u64,
         block_refs: &[super::block_refs::BlockRefOp],
-        entries: &[(u32, String)],
+        entries: &[(u32, super::block_map::MapEntry)],
         chunk: usize,
     ) -> Result<Option<MapMigrateOutcome>> {
         self.write_gate()?;
@@ -3018,12 +3018,14 @@ impl KvMetaBackend {
         let _crossing = CrossingGuard::register(&self.crossing_inflight, ino);
         let guards: Arc<[DlmGuard]> = Arc::from(vec![self.dlm.lock_inode_exclusive(ino).await]);
 
-        // The diff scan (step 3). Desired bindings are STRING records —
-        // the router-true key strings every consumer resolves today
-        // (POINT stays the codec's fast form for later PRs; both kinds
-        // decode on the read side).
-        let desired: std::collections::BTreeMap<u32, &str> =
-            entries.iter().map(|(b, k)| (*b, k.as_str())).collect();
+        // The diff scan (step 3). Desired bindings arrive in RECORD form
+        // (PR 3, Rev 1.3 #3: the routed layer encodes POINT for
+        // undecorated keys, STRING for decorated/encoder-less arms), so
+        // the match is record equality: a PR-2 STRING record whose key
+        // now encodes POINT reads as a changed binding and upgrades on
+        // this publish — a one-time rewrite, never a steady-state churn.
+        let desired: std::collections::BTreeMap<u32, &super::block_map::MapEntry> =
+            entries.iter().map(|(b, e)| (*b, e)).collect();
         let mut ops: Vec<super::block_map::BlockMapOp> = Vec::new();
         let mut preexisting = 0u64;
         let mut matched: std::collections::BTreeSet<u32> = std::collections::BTreeSet::new();
@@ -3040,10 +3042,7 @@ impl KvMetaBackend {
             for (idx, existing) in page {
                 preexisting += 1;
                 match desired.get(&idx) {
-                    Some(k)
-                        if existing
-                            == super::block_map::MapEntry::String(k.as_bytes().to_vec()) =>
-                    {
+                    Some(want) if existing == **want => {
                         matched.insert(idx);
                     }
                     // Changed binding: the desired-walk below stages the
@@ -3059,15 +3058,15 @@ impl KvMetaBackend {
             cursor = next;
         }
         let mut put_bytes = 0u64;
-        for (idx, key) in entries {
+        for (idx, entry) in entries {
             if matched.contains(idx) {
                 continue;
             }
-            put_bytes += (super::block_map::BLOCK_MAP_KEY_LEN + 2 + key.len()) as u64;
+            put_bytes += (super::block_map::BLOCK_MAP_KEY_LEN + entry.encoded_len()) as u64;
             ops.push(super::block_map::BlockMapOp::Put {
                 owner_ino: ino,
                 block_index: *idx,
-                entry: super::block_map::MapEntry::String(key.as_bytes().to_vec()),
+                entry: entry.clone(),
             });
         }
         let records = ops.len() as u64;

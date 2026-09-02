@@ -879,7 +879,18 @@ pub struct RoutedMetaBackend {
     /// ino's slot. Relaxed is sufficient — the rotor feeds a pure
     /// distribution choice, never an ordering edge.
     mint_rr: Vec<std::sync::atomic::AtomicUsize>,
+    /// PR 3 (kvmap, Rev 1.3 #3): the block-key → tree-7 record encoder,
+    /// installed by `DataRouter::set_meta_backend` (the volume-census
+    /// round-trip law lives on the router — `BackendRouter::
+    /// block_key_map_entry`). Uninstalled (bare backends, offline tools,
+    /// the shipped-verb owner without a mounted data plane) falls back to
+    /// STRING verbatim — the PR 2 form, which every decoder resolves
+    /// forever.
+    map_entry_encoder: std::sync::OnceLock<MapEntryEncoder>,
 }
+
+/// See [`RoutedMetaBackend::install_map_entry_encoder`].
+type MapEntryEncoder = std::sync::Arc<dyn Fn(&str) -> kv::block_map::MapEntry + Send + Sync>;
 
 /// The latch-free routing tables `route_ino`/`make_global_ino` read.
 struct RouteTable {
@@ -967,6 +978,7 @@ impl RoutedMetaBackend {
             mint_rr: (0..n)
                 .map(|_| std::sync::atomic::AtomicUsize::new(0))
                 .collect(),
+            map_entry_encoder: std::sync::OnceLock::new(),
         }
     }
 
@@ -1025,7 +1037,29 @@ impl RoutedMetaBackend {
             mint_rr: (0..n)
                 .map(|_| std::sync::atomic::AtomicUsize::new(0))
                 .collect(),
+            map_entry_encoder: std::sync::OnceLock::new(),
         })
+    }
+
+    /// PR 3 (kvmap): install the block-key → record encoder (once, at
+    /// `DataRouter::set_meta_backend` — the round-trip law needs the
+    /// router's volume census). A second install is ignored: the census
+    /// it captures is the same router.
+    pub fn install_map_entry_encoder(
+        &self,
+        encoder: std::sync::Arc<dyn Fn(&str) -> kv::block_map::MapEntry + Send + Sync>,
+    ) {
+        let _ = self.map_entry_encoder.set(encoder);
+    }
+
+    /// The record form for one block-key string: POINT through the
+    /// installed encoder, STRING verbatim when none is installed (the
+    /// PR 2 form — always decodable).
+    fn encode_map_entry(&self, key: &str) -> kv::block_map::MapEntry {
+        match self.map_entry_encoder.get() {
+            Some(enc) => enc(key),
+            None => kv::block_map::MapEntry::String(key.as_bytes().to_vec()),
+        }
     }
 
     /// PR VL5b: publish a new slot→volume map (the migration flip's
@@ -3333,8 +3367,16 @@ impl RoutedMetaBackend {
         let _gate = self.slot_gate_enter(&[ino]).await;
         let (v_idx, local_ino) = self.route_ino(ino);
         self.check_volume_enabled(v_idx)?;
+        // PR 3 (Rev 1.3 #3): the record economy — encode each key string
+        // to its tree-7 record form HERE (the last point with router
+        // access on both the local and the served arm; the wire stays
+        // strings, so the verb schema is untouched).
+        let records: Vec<(u32, kv::block_map::MapEntry)> = entries
+            .iter()
+            .map(|(b, k)| (*b, self.encode_map_entry(k)))
+            .collect();
         let out = self.volumes[v_idx]
-            .migrate_block_map_train(local_ino, layout, size, block_refs, entries, chunk)
+            .migrate_block_map_train(local_ino, layout, size, block_refs, &records, chunk)
             .await;
         if out.is_err() {
             self.mirror_volume_failure(v_idx);

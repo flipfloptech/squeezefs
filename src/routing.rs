@@ -2688,13 +2688,14 @@ impl BackendRouter {
     /// PR 2 (kvmap): resolve one tree-7 map record's value to the
     /// backend-true block-key string every consumer speaks
     /// (`persist_block_key` output). STRING records are verbatim bytes
-    /// (the only kind PR 2 writes); POINT records — the codec's binary
-    /// fast form (PR 1 fixtures, later PRs) — resolve their durable
-    /// `vol_tag` through the same volume census the durable-ref plane
-    /// uses (KD-5). `None` = an unresolvable entry (a foreign/retired
-    /// volume tag, non-UTF-8 string bytes) — the caller must be LOUD: a
-    /// wrong or silently-skipped resolve is the failure the tree exists
-    /// to prevent.
+    /// (decorated shapes, PR-2-era volumes, encoder-less arms); POINT
+    /// records — the binary fast form [`Self::block_key_map_entry`]
+    /// emits since PR 3 — resolve their durable `vol_tag` through the
+    /// same volume census the durable-ref plane uses (KD-5). `None` = an
+    /// unresolvable entry (a foreign/retired volume tag, non-UTF-8
+    /// string bytes) — the caller must be LOUD: a wrong or
+    /// silently-skipped resolve is the failure the tree exists to
+    /// prevent.
     pub(crate) fn map_entry_block_key(
         &self,
         entry: &crate::meta_backend::kv::block_map::MapEntry,
@@ -2721,6 +2722,54 @@ impl BackendRouter {
                 None
             }
         }
+    }
+
+    /// PR 3 (kvmap, Rev 1.3 #3): the ENCODE direction of
+    /// [`Self::map_entry_block_key`] — the tree-7 record form for one
+    /// router-true block-key string. Undecorated backend keys (the bare
+    /// default-slot offset / `name://offset` forms) become the 18-byte
+    /// binary POINT; everything else — `damaged:` markers, size-carrying
+    /// staged decorations, incarnation-stamped keys on a disengaged era,
+    /// foreign/unregistered volume names — rides STRING verbatim.
+    ///
+    /// The eligibility law is the ROUND TRIP itself, never a second
+    /// grammar: a key is POINT-eligible iff decoding the candidate
+    /// through `map_entry_block_key` reproduces the IDENTICAL string, so
+    /// the encoder is correct-by-construction against every current and
+    /// future decoration (a parser wider than its decoder would resolve
+    /// blocks to wrong device bytes — the failure the tree exists to
+    /// prevent). One exclusion sits ABOVE the round trip: a key carrying
+    /// an incarnation stamp (spec §6.2 item 6) never emits POINT even
+    /// when the stamp happens to equal the offset's live one — the
+    /// 18-byte form cannot carry the lifetime, and a decode that
+    /// re-attaches the CURRENT stamp would let a record naming a
+    /// freed-and-reissued offset pass the staleness refusal the stamp
+    /// exists to fire.
+    pub(crate) fn block_key_map_entry(
+        &self,
+        key: &str,
+    ) -> crate::meta_backend::kv::block_map::MapEntry {
+        use crate::meta_backend::kv::block_map::MapEntry;
+        if let Ok((be_id, offset, incarnation)) = Self::split_key(key) {
+            let vol_tag = if be_id == "backend_0" {
+                Some(crate::meta_backend::kv::block_refs::volume_tag(
+                    self.default_allocator.volume_id(),
+                ))
+            } else {
+                self.backends.get(be_id).map(|be| {
+                    crate::meta_backend::kv::block_refs::volume_tag(be.block_allocator.volume_id())
+                })
+            };
+            if incarnation == INCARNATION_NONE {
+                if let Some(vol_tag) = vol_tag {
+                    let point = MapEntry::Point { vol_tag, offset };
+                    if self.map_entry_block_key(&point).as_deref() == Some(key) {
+                        return point;
+                    }
+                }
+            }
+        }
+        MapEntry::String(key.as_bytes().to_vec())
     }
 
     /// PR 2 (kvmap): **the shared tree-7 extraction** — one ino's map
@@ -5687,6 +5736,13 @@ impl DataRouter {
                 ),
             }
         }
+        // PR 3 (kvmap, Rev 1.3 #3): the tree-7 record encoder — the
+        // round-trip law needs this router's volume census, so the
+        // wiring point where router and meta backend meet installs it.
+        let br = std::sync::Arc::clone(&self.backend_router);
+        meta_backend.install_map_entry_encoder(std::sync::Arc::new(move |key: &str| {
+            br.block_key_map_entry(key)
+        }));
         let _ = self.inner.meta_backend.set(meta_backend);
     }
 

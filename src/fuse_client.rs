@@ -19799,8 +19799,10 @@ impl SqueezefsFilesystem {
     /// back zeros (fstests generic/525; pinned in
     /// tests/sparse_write_bounded_tests.rs). Widening the index space is
     /// an on-disk layout-key change; at the default 4 MiB block size the
-    /// cap is ~16 EiB−4 MiB, far past the i64 VFS ceiling — only small
-    /// custom block sizes ever observe it.
+    /// cap is 16 PiB − 4 MiB (design-kvmap-block-map-tree §5/A5 — the
+    /// u32 bound binds below the i64 VFS ceiling, and index `u32::MAX`
+    /// itself stays reserved for the refs MAP_BLOB sentinel, which this
+    /// screen keeps unreachable from every FUSE entry point).
     pub fn max_file_size(&self) -> u64 {
         let bs = self.router.block_size.load(Ordering::Relaxed);
         (i64::MAX as u64).min(bs.saturating_mul(u32::MAX as u64))

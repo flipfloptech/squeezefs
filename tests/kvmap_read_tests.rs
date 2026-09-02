@@ -43,10 +43,13 @@ use squeezefs::layout_wire::LayoutMetadata;
 use squeezefs::meta_backend::kv::backend::KvMetaBackend;
 use squeezefs::meta_backend::kv::block_map::MapEntry;
 use squeezefs::meta_backend::kv::block_refs::volume_tag;
-use squeezefs::meta_backend::kv::builder::{format_v3, BuilderConfig, FormatV3Options, ImageBuilder};
+use squeezefs::meta_backend::kv::builder::{
+    format_v3, BuilderConfig, FormatV3Options, ImageBuilder,
+};
 use squeezefs::meta_backend::kv::superblock::{
     classify_volume, set_block_map_tree_bit, set_block_refcounts_bit, write_superblock_v3,
-    VolumeFormat, FEATURE_INCOMPAT_KV_BLOCK_MAP_TREE, FEATURE_INCOMPAT_KV_BLOCK_REFCOUNTS,
+    VolumeFormat, FEATURE_INCOMPAT_KV_BLOCK_KEY_INCARNATION, FEATURE_INCOMPAT_KV_BLOCK_MAP_TREE,
+    FEATURE_INCOMPAT_KV_BLOCK_REFCOUNTS,
 };
 use squeezefs::meta_backend::kv::META_KV_BLOCK_MAP_PUTS;
 use squeezefs::meta_backend::{Metadata, RoutedMetaBackend};
@@ -111,7 +114,11 @@ fn opts() -> FormatV3Options {
 }
 
 /// Format WITHOUT bit 16/bit 9 (immune to the `SQUEEZEFS_TEST_STAMP_*`
-/// seams), then stamp both explicitly — the crossing-ready shape.
+/// seams) and WITHOUT bit 13 — the `--single-writer`-shaped volume whose
+/// block keys carry no incarnation stamp, i.e. the class the POINT
+/// economy engages on (a stamped key's lifetime cannot ride the 18-byte
+/// form — see `incarnation_engaged_eras_keep_string_records`). Then
+/// stamp bits 9 + 16 explicitly — the crossing-ready shape.
 async fn format_meta_kvmap(path: &Path) {
     format_v3(path, META_LEN, &opts())
         .await
@@ -119,7 +126,9 @@ async fn format_meta_kvmap(path: &Path) {
     let VolumeFormat::V3(mut sb) = classify_volume(path).await.expect("classify") else {
         panic!("expected v3");
     };
-    let strip = FEATURE_INCOMPAT_KV_BLOCK_REFCOUNTS | FEATURE_INCOMPAT_KV_BLOCK_MAP_TREE;
+    let strip = FEATURE_INCOMPAT_KV_BLOCK_REFCOUNTS
+        | FEATURE_INCOMPAT_KV_BLOCK_MAP_TREE
+        | FEATURE_INCOMPAT_KV_BLOCK_KEY_INCARNATION;
     if sb.features_incompat & strip != 0 {
         sb.features_incompat &= !strip;
         write_superblock_v3(path, &sb).await.expect("strip seams");
@@ -345,10 +354,7 @@ async fn undecorated_keys_publish_as_point_records_and_round_trip() {
         );
     }
     let point_bytes = entries.len() as u64 * 30;
-    let string_bytes: u64 = entries
-        .iter()
-        .map(|(_, k)| (12 + 2 + k.len()) as u64)
-        .sum();
+    let string_bytes: u64 = entries.iter().map(|(_, k)| (12 + 2 + k.len()) as u64).sum();
     assert_eq!(
         record_bytes, point_bytes,
         "the gauge accounts POINT records exactly"
@@ -450,6 +456,84 @@ async fn decorated_keys_still_ride_string_verbatim() {
     assert_eq!(map.len(), entries.len());
     for (b, k) in &entries {
         assert_eq!(map.get(b), Some(k), "index {b} round-trips");
+    }
+    rig.shutdown().await;
+}
+
+/// The incarnation-era exclusion (spec §6.2 item 6 composed with the
+/// POINT economy): on a bit-13 volume — the DEFAULT format since the
+/// rung-10b flip — persisted keys carry the offset's lifetime stamp, the
+/// 18-byte POINT form cannot, and a decode that re-attached the CURRENT
+/// stamp would let a record naming a freed-and-reissued offset pass the
+/// staleness refusal. So an engaged era's records ride STRING verbatim —
+/// stamps preserved byte-exactly through the round trip.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn incarnation_engaged_eras_keep_string_records() {
+    let _serial = serial();
+    let meta = NamedTempFile::new().unwrap();
+    // The default-format shape: strip ONLY the 9/16 seams, keep bit 13.
+    format_v3(meta.path(), META_LEN, &opts())
+        .await
+        .expect("format v3 meta volume");
+    let VolumeFormat::V3(mut sb) = classify_volume(meta.path()).await.expect("classify") else {
+        panic!("expected v3");
+    };
+    let strip = FEATURE_INCOMPAT_KV_BLOCK_REFCOUNTS | FEATURE_INCOMPAT_KV_BLOCK_MAP_TREE;
+    if sb.features_incompat & strip != 0 {
+        sb.features_incompat &= !strip;
+        write_superblock_v3(meta.path(), &sb)
+            .await
+            .expect("strip seams");
+    }
+    assert!(set_block_refcounts_bit(meta.path()).await.unwrap());
+    assert!(set_block_map_tree_bit(meta.path()).await.unwrap());
+    let data = data_file();
+    let rig = mount(meta.path(), data.path()).await;
+    assert!(
+        rig.kv().block_key_incarnation_engaged(),
+        "the default format engages incarnation keys — the fixture's premise"
+    );
+    let ino = rig.mk_file("stamped").await;
+
+    // Field-shaped keys: allocated, then minted through persist_block_key
+    // (which attaches the live lifetime stamp on this era).
+    let mut entries: Vec<(u32, String)> = Vec::new();
+    for b in 0..SPILL_BLOCKS {
+        let off = rig.alloc.allocate_block().await.expect("allocate");
+        rig.alloc.publish_block(off);
+        entries.push((
+            b,
+            rig.router
+                .backend_router
+                .persist_block_key("backend_0", off),
+        ));
+    }
+    assert!(
+        entries.iter().any(|(_, k)| k.contains('@')),
+        "the fixture's keys must actually carry stamps"
+    );
+    rig.publish_entries(ino, &entries, u64::from(SPILL_BLOCKS) * 4 * 1024 * 1024)
+        .await;
+    assert_eq!(
+        rig.durable_head(ino).await.block_map_id.as_deref(),
+        Some("kvmap:1")
+    );
+
+    // Every record: STRING, byte-exact — the stamp travels.
+    let records = rig.raw_records(ino).await;
+    assert_eq!(records.len(), entries.len());
+    for ((idx, entry), (b, k)) in records.iter().zip(entries.iter()) {
+        assert_eq!(idx, b);
+        assert_eq!(
+            *entry,
+            MapEntry::String(k.clone().into_bytes()),
+            "a stamped key must ride STRING verbatim, never POINT"
+        );
+    }
+    // And the round trip preserves the stamps.
+    let map = rig.refetched_map(ino).await;
+    for (b, k) in &entries {
+        assert_eq!(map.get(b), Some(k), "index {b} keeps its stamped key");
     }
     rig.shutdown().await;
 }
@@ -631,11 +715,10 @@ async fn kvmap_boundary_admits_last_index_and_refuses_efbig_at_reserved() {
     let puts_before = META_KV_BLOCK_MAP_PUTS.load(Ordering::Relaxed);
     let recs_before = METRICS.map_migrate_records.load(Ordering::Relaxed);
 
-    let e = h
-        .fs
-        .write(h.req, ino, 0, cap, bytes::Bytes::from_static(b"x"), 0, 0)
-        .await
-        .expect_err("a write minting index u32::MAX must refuse");
+    let e =
+        h.fs.write(h.req, ino, 0, cap, bytes::Bytes::from_static(b"x"), 0, 0)
+            .await
+            .expect_err("a write minting index u32::MAX must refuse");
     let io: std::io::Error = e.into();
     assert_eq!(io.raw_os_error(), Some(libc::EFBIG), "write → EFBIG");
 

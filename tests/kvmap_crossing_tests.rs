@@ -242,8 +242,7 @@ impl Rig {
     /// POINT for undecorated keys (this rig's are all default-slot bare
     /// offsets), STRING for decorated shapes — resolve both.
     async fn tree_records(&self, ino: u64) -> Vec<(u32, String)> {
-        let default_tag =
-            squeezefs::meta_backend::kv::block_refs::volume_tag(DATA_VOL_ID);
+        let default_tag = squeezefs::meta_backend::kv::block_refs::volume_tag(DATA_VOL_ID);
         let mut out = Vec::new();
         let mut cursor = 0u32;
         loop {

@@ -160,6 +160,15 @@ pub enum MapEntry {
 }
 
 impl MapEntry {
+    /// [`Self::encode`]'s length without the allocation — the
+    /// `publish_map_record_bytes` accounting (design §5).
+    pub fn encoded_len(&self) -> usize {
+        match self {
+            MapEntry::Point { .. } => BLOCK_MAP_POINT_VALUE_LEN,
+            MapEntry::String(bytes) => 2 + bytes.len(),
+        }
+    }
+
     /// Encode as `version | kind | payload` (values are little-endian —
     /// no ordering requirement, the §4.2 convention).
     pub fn encode(&self) -> Vec<u8> {

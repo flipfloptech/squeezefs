@@ -640,6 +640,7 @@ async fn a_sticky_head_local_train_under_live_range_grants_composes_claims_scope
         // never engages (a claims train refuses instead).
         0,
         &|_key, _idx| None,
+        None,
     )
     .await
     .expect("a sticky-head local train under live grants composes claims-scoped (item 4)");
@@ -668,6 +669,7 @@ async fn a_sticky_head_local_train_under_live_range_grants_composes_claims_scope
         // never engages (a claims train refuses instead).
         0,
         &|_key, _idx| None,
+        None,
     )
     .await
     .expect("an empty-claims subset train is legal");
@@ -814,6 +816,7 @@ async fn shipped_crossing(client_be: &Arc<RoutedMetaBackend>, ino: u64) -> Vec<(
         // never engages (a claims train refuses instead).
         0,
         &|_key, _idx| None,
+        None,
     )
     .await
     .expect("the shipped crossing lands");

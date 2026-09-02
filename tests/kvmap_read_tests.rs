@@ -268,6 +268,10 @@ impl Rig {
     }
 
     /// The tree-resolved map as the READ path sees it (evict + refetch).
+    /// PR 6c-i: an over-budget head legitimately fetches PARTIAL
+    /// (`block_map: None` — the §14 S1 bounded read-open); the read
+    /// path's per-index truth is then the partial ladder, asked here for
+    /// every record-covered index (read-THROUGH, never the raw records).
     async fn refetched_map(&self, ino: u64) -> std::collections::HashMap<u32, String> {
         self.router.metadata_cache.invalidate(&ino);
         let fetched = self
@@ -276,11 +280,27 @@ impl Rig {
             .await
             .expect("refetch");
         assert_eq!(fetched.block_map_id.as_deref(), Some("kvmap:1"));
-        fetched
-            .block_map
-            .as_deref()
-            .expect("tree-resolved map")
-            .clone()
+        if let Some(map) = fetched.block_map.as_deref() {
+            return map.clone();
+        }
+        let path = squeezefs::keys::inode_path(ino);
+        let mut out = std::collections::HashMap::new();
+        for (idx, entry) in self.raw_records(ino).await {
+            for d in 0..entry.run_len() {
+                let b = idx + d;
+                if let Some(k) = self
+                    .router
+                    .load_striped_block_keys(&path, &fetched, b, b)
+                    .await
+                    .expect("partial ladder")
+                    .pop()
+                    .and_then(|(_, k)| k)
+                {
+                    out.insert(b, k);
+                }
+            }
+        }
+        out
     }
 
     async fn shutdown(self) {
@@ -729,16 +749,28 @@ async fn kvmap_boundary_admits_last_index_and_refuses_efbig_at_reserved() {
         h.fs.getattr(h.req, ino, None, 0).await.unwrap().attr.size,
         cap
     );
-    // The boundary index is IN the tree-resolved map.
+    // The boundary index is IN the tree-resolved map. PR 6c-i: a head at
+    // the ~256 TiB size class fetches PARTIAL (§14 S1), so the probe
+    // rides the read path's own ladder when no whole map is resident.
     let m =
         h.fs.router
             .fetch_metadata(&format!("inode_{ino}"))
             .await
             .expect("fetch");
+    let boundary_bound = match m.block_map.as_deref() {
+        Some(map) => map.contains_key(&(u32::MAX - 1)),
+        None => {
+            h.fs.router
+                .load_striped_block_keys(&format!("inode_{ino}"), &m, u32::MAX - 1, u32::MAX - 1)
+                .await
+                .expect("partial ladder")
+                .pop()
+                .and_then(|(_, k)| k)
+                .is_some()
+        }
+    };
     assert!(
-        m.block_map
-            .as_deref()
-            .is_some_and(|map| map.contains_key(&(u32::MAX - 1))),
+        boundary_bound,
         "index u32::MAX − 1 must be mapped through the tree"
     );
 

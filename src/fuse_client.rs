@@ -5781,12 +5781,29 @@ pub struct Metrics {
     /// the handoff commit and the job's terminal chunk re-plans here).
     pub map_sweep_resumed: Align64<AtomicU64>,
     /// kvmap PR 6a (design §12 option b): Σ estimated RAM map bytes of
-    /// write-active kvmap inos — the honest write-map GAUGE beside the
-    /// derived `mem_budget/16` cap that refuses over-budget giant
-    /// write-opens EFBIG (Rev 1.3 #2's boundedness debt, priced until
-    /// 6c's dirty-index overlay). Revalidated at the merge seam and on
-    /// stats reads.
+    /// write-active kvmap inos — whole-map entries at map-length, PARTIAL
+    /// entries at overlay-length (PR 6c-i: the retired EFBIG cap's
+    /// budget arithmetic became the partial-mode flip threshold, and the
+    /// overlay bytes stay on this gauge). Revalidated at the merge seam
+    /// and on stats reads.
     pub kvmap_write_map_bytes: Align64<AtomicU64>,
+    /// kvmap PR 6c-i (design §14): overlay-save engagement — partial-mode
+    /// publishes that shipped ONLY the dirty overlay through the LOCAL
+    /// claims train (a partial ino's publish delta must account here; ≈ 0
+    /// with `SQUEEZEFS_KVMAP_OVERLAY=0`).
+    pub kvmap_overlay_saves: Align64<AtomicU64>,
+    /// kvmap PR 6c-i: warm-window bytes of partial-mode inos (the R5
+    /// `block_map_window` component's gauge — floor 0, drop-at-will).
+    pub block_map_window_bytes: Align64<AtomicU64>,
+    /// kvmap PR 6c-i: warm-window fills (one `block_map_range` page per
+    /// PartialMiss that reached the tree).
+    pub block_map_window_fills: Align64<AtomicU64>,
+    /// kvmap PR 6c-i: warm-window serves (overlay misses answered from a
+    /// covering span — binding or in-span hole).
+    pub block_map_window_hits: Align64<AtomicU64>,
+    /// kvmap PR 6c-i: window spans dropped (per-ino LRU, local map
+    /// mutations, the R5 shed).
+    pub block_map_window_evictions: Align64<AtomicU64>,
     /// Indirect block-map rehydrates (whole-block device READS on the
     /// meta-fetch path — publish-pass base fetches, cold meta reads).
     pub layout_indirect_map_reads: Align64<AtomicU64>,
@@ -10101,6 +10118,15 @@ impl SqueezefsFilesystem {
                 // gauge (revalidated live on this read) + its derived cap.
                 "kvmap_write_map_bytes": self.router.kvmap_write_map_gauge(),
                 "kvmap_write_map_budget_bytes": crate::routing::kvmap_write_map_budget_bytes(),
+                // kvmap PR 6c-i (design §14): the partial store — mode
+                // gauge, overlay-save engagement, and the warm-window
+                // family (`block_map_window` is the R5 component).
+                "kvmap_partial_inos": self.router.kvmap_partial_ino_count(),
+                "kvmap_overlay_saves": METRICS.kvmap_overlay_saves.load(Ordering::Relaxed),
+                "block_map_window_bytes": METRICS.block_map_window_bytes.load(Ordering::Relaxed),
+                "block_map_window_fills": METRICS.block_map_window_fills.load(Ordering::Relaxed),
+                "block_map_window_hits": METRICS.block_map_window_hits.load(Ordering::Relaxed),
+                "block_map_window_evictions": METRICS.block_map_window_evictions.load(Ordering::Relaxed),
                 "layout_indirect_map_reads": METRICS.layout_indirect_map_reads.load(Ordering::Relaxed),
                 "layout_indirect_map_read_bytes": METRICS.layout_indirect_map_read_bytes.load(Ordering::Relaxed),
                 "publish_blob_composes": METRICS.publish_blob_composes.load(Ordering::Relaxed),
@@ -13293,7 +13319,16 @@ impl SqueezefsFilesystem {
             }
             if old_block_key.is_none() {
                 if let Ok(meta) = self.router.fetch_metadata(file_path).await {
-                    if let Some(ref bm) = meta.block_map {
+                    if self.router.entry_is_partial(seed_ino, &meta) {
+                        // PR 6c-i: a PARTIAL entry's absent map is never
+                        // an absent binding — the bounded ladder resolves
+                        // (a miss here seeding zeros over a live
+                        // tree-mapped block is §14's silent-wrong bomb).
+                        old_block_key = self
+                            .router
+                            .resolve_partial_block_binding(seed_ino, &meta, b)
+                            .await?;
+                    } else if let Some(ref bm) = meta.block_map {
                         old_block_key = bm.get(&b).cloned();
                     }
                 }
@@ -21245,6 +21280,24 @@ impl Filesystem for SqueezefsFilesystem {
                     Arc::new(|| fuse3::over_uring_geometry().3),
                     Arc::new(|_| {}),
                 ));
+                // PR 6c-i (design §14): partial-mode kvmap warm windows —
+                // a CLEAN derived cache (floor 0, drop-at-will: a dropped
+                // span refills from the tree on demand; the read_lane_hold
+                // posture). Weight 2: warmth is the cheapest sacrifice.
+                {
+                    let win_router = self.router.clone();
+                    MEM_BUDGET.register(Component::new(
+                        "block_map_window",
+                        0,
+                        2,
+                        Arc::new(|| {
+                            METRICS
+                                .block_map_window_bytes
+                                .load(std::sync::atomic::Ordering::Relaxed)
+                        }),
+                        Arc::new(move |target| win_router.kvmap_windows_shed(target)),
+                    ));
+                }
                 MEM_BUDGET.register(Component::new(
                     "buffer_pool",
                     16 * 4 * MIB,

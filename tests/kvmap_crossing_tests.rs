@@ -1162,11 +1162,18 @@ async fn a_shipped_crossing_is_witnessed_owner_ratcheted_and_era_gated() {
         // PR 6b: no live sweep cursor — the barrier never engages.
         0,
         &|_key, _idx| None,
+        // PR 6c-i: not an overlay save — the shipped whole-map shape.
+        None,
     )
     .await
     .expect("the helper ships");
     assert_eq!(outcome.records, 0, "an identical map diffs to zero ops");
-    assert_eq!(outcome.preexisting, 3);
+    assert_eq!(
+        outcome.preexisting, 0,
+        "PR 6c-i (§14 S2 pre-fix a): the served claims train probes its \
+         CLAIMED indices only — an empty refs frame claims nothing, so the \
+         bounded probes observe zero preexisting records"
+    );
     assert_eq!(publish::stats().map_shipped - shipped_before, 1);
     assert_eq!(publish::stats().map_served - served_before, 1);
 

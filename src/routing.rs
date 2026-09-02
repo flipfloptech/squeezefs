@@ -489,6 +489,77 @@ pub fn kvmap_write_map_budget_bytes() -> u64 {
 /// §12 hoist just removed from this path).
 pub const KVMAP_WRITE_MAP_ENTRY_EST: u64 = 64;
 
+/// `SQUEEZEFS_KVMAP_OVERLAY` (PR 6c-i, design §14): whether over-budget
+/// kvmap inos take the PARTIAL map store (dirty overlay + bounded warm
+/// windows + tree read-through). `0` = whole-map RAM at any size — the
+/// acceptance bracket control, never an operational escape (a PB-class
+/// open with the knob off is an OOM the operator asked for).
+pub fn kvmap_overlay_enabled() -> bool {
+    crate::env_knobs::bool_knob("SQUEEZEFS_KVMAP_OVERLAY", true)
+}
+
+/// The §14 mode heuristic, SIZE-based by contract (deterministic from the
+/// head alone — no record walk): a kvmap ino flips PARTIAL when its
+/// dense-map estimate (`ceil(size / block_size)` entries at
+/// [`KVMAP_WRITE_MAP_ENTRY_EST`]) exceeds the 6a budget share
+/// ([`kvmap_write_map_budget_bytes`] — the same seam the retired EFBIG
+/// refusal keyed on; the cap became this flip threshold). Sticky-safe:
+/// the flip runs only at CLEAN points (fetch, post-publish republish),
+/// and a non-empty dirty overlay pins partial mode regardless of size.
+pub fn kvmap_size_over_budget(size: u64, block_size: u64) -> bool {
+    if !kvmap_overlay_enabled() {
+        return false;
+    }
+    let entries = size.div_ceil(block_size.max(1));
+    entries.saturating_mul(KVMAP_WRITE_MAP_ENTRY_EST) > kvmap_write_map_budget_bytes()
+}
+
+/// PR 6c-i (§14 / §8 #1): warm-window spans retained per partial-mode ino
+/// — "per-ino span cap (1–2, LRU)". 2: one demand stream + one lateral.
+const KVMAP_WINDOW_SPANS_PER_INO: usize = 2;
+
+/// Records per warm-window fill — one `block_map_range` page (the §8 #1
+/// leaf-span class; the same 512 as the fetch arm's page).
+const KVMAP_WINDOW_FILL_RECORDS: usize = 512;
+
+/// Expanded-index clip per fill: a run-heavy page must not balloon the
+/// window (RUN_LEN_MAX-class bound — 4096 indices ≈ 256 KiB at the entry
+/// estimate).
+const KVMAP_WINDOW_FILL_INDICES_MAX: u32 = 4096;
+
+/// PR 6c-i: one partial-mode ino's dirty overlay — this mount's
+/// un-published bindings (`Some(key)`) and TOMBSTONES (`None`: a
+/// truncate/punch displaced the index; read-through must serve zeros and
+/// never resurrect the tree's stale binding). Keyed off `CachedMetadata`
+/// deliberately (the registry, not a struct field): the overlay is the
+/// ino's write authority across cache evictions and refetches, exactly
+/// like the deferred block-ref accumulator it publishes beside.
+pub(crate) type KvmapOverlay = std::collections::BTreeMap<u32, Option<String>>;
+
+/// One warm read-span of a partial-mode ino's map: `[lo, hi)` was filled
+/// COMPLETELY from the tree, so an index in-range but absent from
+/// `entries` is a definitive HOLE (zeros), never a PartialMiss.
+pub(crate) struct KvmapWindowSpan {
+    lo: u32,
+    /// Exclusive coverage bound (`u32::MAX` = the tree is exhausted above
+    /// `lo`).
+    hi: u32,
+    /// The armed-reader fetch epoch this span was filled under (`None` on
+    /// write mounts — always valid); an epoch step invalidates the span
+    /// (§8 #6's drop arm).
+    epoch: Option<u64>,
+    entries: std::collections::BTreeMap<u32, String>,
+    bytes: u64,
+}
+
+/// A partial-mode ino's warm windows (≤ [`KVMAP_WINDOW_SPANS_PER_INO`],
+/// insertion-order LRU) — a CLEAN derived cache (R5 component
+/// `block_map_window`, floor 0, drop-at-will).
+#[derive(Default)]
+pub(crate) struct KvmapWindows {
+    spans: Vec<KvmapWindowSpan>,
+}
+
 /// PR 3 (A9): the fetch bracket's retry bound. The reader poll cadence is
 /// ≥ 1 s (`resolve_revalidate_interval_ms` floors at the checkpoint
 /// ceiling), so a legitimate fetch can lose at most one step per second —
@@ -4039,6 +4110,15 @@ pub struct DataRouterInner {
     /// to WITHHOLD their own `destroy_inodes` (destroying the head would
     /// orphan every remaining record and strand its references).
     pub(crate) kvmap_sweep_corpses: std::sync::Arc<scc::HashMap<u64, ()>>,
+    /// PR 6c-i (design §14): PARTIAL-mode kvmap inos — presence IS the
+    /// mode marker, the value is the ino's dirty overlay. Mutated only
+    /// under the ino's `INODE_META_LOCKS` stripe (the §5.3 merge
+    /// domain); probed lock-free on the read paths.
+    pub(crate) kvmap_overlays: std::sync::Arc<scc::HashMap<u64, KvmapOverlay>>,
+    /// PR 6c-i: the bounded warm read-windows of partial-mode inos (the
+    /// §8 window cache) — clean derived state, dropped at will (R5
+    /// `block_map_window`, floor 0) and on every local map mutation.
+    pub(crate) kvmap_windows: std::sync::Arc<scc::HashMap<u64, KvmapWindows>>,
 }
 
 #[derive(Clone)]
@@ -6048,7 +6128,33 @@ impl DataRouter {
                     // epoch-word read and keeps the PR 2 single pass
                     // verbatim (the one-KvTx head+records commit + 3.5/4a
                     // serialization + the rebind ladder own its skew).
-                    if base_is_kvmap {
+                    // PR 6c-i (design §14 S1): the mode heuristic at the
+                    // fetch — a CLEAN point by construction (dirty
+                    // entries never refill). SIZE-based: an over-budget
+                    // dense-map estimate flips PARTIAL (no whole-map
+                    // materialization — the S1 read-open debt); a
+                    // non-empty dirty overlay pins partial regardless
+                    // (sticky-safe: dropping it would lose acked
+                    // custody); under-budget + clean flips back DOWN and
+                    // rehydrates whole-map VERBATIM.
+                    let fetch_partial = if base_is_kvmap {
+                        let bs = self.block_size.load(Ordering::Relaxed).max(1);
+                        let dirty_overlay = self
+                            .inner
+                            .kvmap_overlays
+                            .read_sync(&ino, |_, o| !o.is_empty())
+                            .unwrap_or(false);
+                        let partial = dirty_overlay || kvmap_size_over_budget(layout.size, bs);
+                        if partial {
+                            self.kvmap_partial_arm(ino);
+                        } else {
+                            let _ = self.kvmap_partial_disarm_if_clean(ino);
+                        }
+                        partial
+                    } else {
+                        false
+                    };
+                    if base_is_kvmap && !fetch_partial {
                         let mut bracket = crate::meta_backend::kv::revalidate::FetchBracket::new(
                             KVMAP_FETCH_BRACKET_RETRIES,
                         );
@@ -6256,17 +6362,36 @@ impl DataRouter {
                     // pointless save at close).
                     if let Some(epoch) = self.inner.rewrite_epochs.read_sync(&ino, |_, e| e.clone())
                     {
-                        let mut map_arc = fetched.block_map.take().unwrap_or_default();
-                        let map = std::sync::Arc::make_mut(&mut map_arc);
-                        let mut composed = false;
-                        epoch.shadow.iter_sync(|b, k| {
-                            map.insert(*b, k.clone());
-                            composed = true;
-                            true
-                        });
-                        fetched.block_map = Some(map_arc);
-                        if composed {
-                            fetched.layout_dirty = true;
+                        if fetch_partial {
+                            // PR 6c-i: a PARTIAL fetch composes shadow
+                            // bindings into the OVERLAY — materializing
+                            // them into `block_map` would fabricate
+                            // whole-map authority over a bounded store.
+                            // (Structurally rare: partial inos decline the
+                            // shadow-record fast path, so a live epoch
+                            // predates the mode flip.)
+                            let mut composed = false;
+                            epoch.shadow.iter_sync(|b, k| {
+                                self.kvmap_overlay_insert(ino, *b, Some(k.clone()));
+                                composed = true;
+                                true
+                            });
+                            if composed {
+                                fetched.layout_dirty = true;
+                            }
+                        } else {
+                            let mut map_arc = fetched.block_map.take().unwrap_or_default();
+                            let map = std::sync::Arc::make_mut(&mut map_arc);
+                            let mut composed = false;
+                            epoch.shadow.iter_sync(|b, k| {
+                                map.insert(*b, k.clone());
+                                composed = true;
+                                true
+                            });
+                            fetched.block_map = Some(map_arc);
+                            if composed {
+                                fetched.layout_dirty = true;
+                            }
                         }
                     }
                     return Ok(Some(fetched));
@@ -6981,6 +7106,350 @@ impl DataRouter {
         Ok(Some((map, head_map_id, layout.size)))
     }
 
+    // -----------------------------------------------------------------
+    // PR 6c-i (design §14): the PARTIAL map store — dirty overlay +
+    // bounded warm windows + tree read-through for over-budget kvmap
+    // inos. PartialMiss ≠ Hole at every arm: an index the overlay and a
+    // covering window both lack goes to the TREE, never to zeros.
+    // -----------------------------------------------------------------
+
+    /// Is `ino` in PARTIAL map mode? Registry presence IS the §14 marker
+    /// — the value is the ino's dirty overlay (empty = clean partial).
+    pub fn kvmap_partial_mode(&self, ino: u64) -> bool {
+        self.inner.kvmap_overlays.contains_sync(&ino)
+    }
+
+    /// The `kvmap_partial_inos` gauge (§14): live partial-mode inos.
+    pub fn kvmap_partial_ino_count(&self) -> u64 {
+        self.inner.kvmap_overlays.len() as u64
+    }
+
+    /// The partial-entry screen: `meta` is the bounded store's face —
+    /// a kvmap head with NO whole map on a registry-marked ino. Every
+    /// `block_map` consumer that can meet a kvmap ino distinguishes this
+    /// from the legacy "anomalous entry" shape through here.
+    pub(crate) fn entry_is_partial(&self, ino: u64, meta: &CachedMetadata) -> bool {
+        meta.block_map.is_none()
+            && meta
+                .block_map_id
+                .as_deref()
+                .is_some_and(|id| id.starts_with(kvmap_head_prefix()))
+            && self.kvmap_partial_mode(ino)
+    }
+
+    /// Flip `ino` INTO partial mode (idempotent): an existing overlay is
+    /// PRESERVED — sticky-safe, a dirty overlay is acked custody and the
+    /// flip runs only at clean points anyway (fetch / post-publish).
+    pub(crate) fn kvmap_partial_arm(&self, ino: u64) {
+        match self.inner.kvmap_overlays.entry_sync(ino) {
+            scc::hash_map::Entry::Occupied(_) => {}
+            scc::hash_map::Entry::Vacant(vac) => {
+                let _ = vac.insert_entry(KvmapOverlay::new());
+            }
+        }
+    }
+
+    /// Flip DOWN — legal only with an EMPTY overlay (a non-empty overlay
+    /// is un-published custody; dropping it would lose acked writes).
+    pub(crate) fn kvmap_partial_disarm_if_clean(&self, ino: u64) -> bool {
+        let removed = self
+            .inner
+            .kvmap_overlays
+            .remove_if_sync(&ino, |o| o.is_empty())
+            .is_some();
+        if removed {
+            self.kvmap_window_drop(ino);
+        }
+        removed
+    }
+
+    /// Teardown (unlink/corpse): the overlay and windows go with the ino.
+    pub(crate) fn kvmap_partial_teardown(&self, ino: u64) {
+        let _ = self.inner.kvmap_overlays.remove_sync(&ino);
+        self.kvmap_window_drop(ino);
+    }
+
+    /// Overlay probe: `None` = no overlay verdict (PartialMiss — go to
+    /// the window/tree); `Some(Some(k))` = un-published binding;
+    /// `Some(None)` = TOMBSTONE (zeros — never read through).
+    pub(crate) fn kvmap_overlay_probe(&self, ino: u64, b: u32) -> Option<Option<String>> {
+        self.inner
+            .kvmap_overlays
+            .read_sync(&ino, |_, o| o.get(&b).cloned())
+            .flatten()
+    }
+
+    /// Overlay insert under the caller's 3.5 stripe; answers the PREVIOUS
+    /// overlay verdict at `b` (the overlay-LOCAL displacement face — the
+    /// only displacement the partial merge still captures; tree
+    /// displacement is the train recompute's, §14 S2 option ii).
+    fn kvmap_overlay_insert(&self, ino: u64, b: u32, v: Option<String>) -> Option<Option<String>> {
+        match self.inner.kvmap_overlays.entry_sync(ino) {
+            scc::hash_map::Entry::Occupied(mut occ) => occ.get_mut().insert(b, v),
+            scc::hash_map::Entry::Vacant(vac) => {
+                let mut o = KvmapOverlay::new();
+                o.insert(b, v);
+                let _ = vac.insert_entry(o);
+                None
+            }
+        }
+    }
+
+    /// Snapshot the overlay (the overlay save's train input) — read under
+    /// the caller's 3.5 stripe, so it is the same authority the merge
+    /// mutates.
+    pub(crate) fn kvmap_overlay_snapshot(&self, ino: u64) -> KvmapOverlay {
+        self.inner
+            .kvmap_overlays
+            .read_sync(&ino, |_, o| o.clone())
+            .unwrap_or_default()
+    }
+
+    /// Drain the overlay after a successful overlay-save publish (the
+    /// entries are durable tree records now). The registry entry STAYS —
+    /// partial mode is sticky until a clean under-budget fetch flips it
+    /// down. Only the exact snapshot the train shipped drains: bindings a
+    /// racing merge added AFTER the snapshot must survive (never-lossy).
+    pub(crate) fn kvmap_overlay_drain(&self, ino: u64, shipped: &KvmapOverlay) {
+        let _ = self.inner.kvmap_overlays.update_sync(&ino, |_, o| {
+            for (b, v) in shipped {
+                if o.get(b) == Some(v) {
+                    o.remove(b);
+                }
+            }
+        });
+    }
+
+    /// Overlay entry count × the RAM estimate — the partial ino's face of
+    /// the `kvmap_write_map_bytes` gauge.
+    pub(crate) fn kvmap_overlay_est(&self, ino: u64) -> u64 {
+        self.inner
+            .kvmap_overlays
+            .read_sync(&ino, |_, o| o.len() as u64)
+            .unwrap_or(0)
+            .saturating_mul(KVMAP_WRITE_MAP_ENTRY_EST)
+    }
+
+    /// Drop `ino`'s warm windows (every local map mutation, publish, and
+    /// the R5 shed — clean derived cache, drop-at-will).
+    pub(crate) fn kvmap_window_drop(&self, ino: u64) {
+        if let Some((_, w)) = self.inner.kvmap_windows.remove_sync(&ino) {
+            let bytes: u64 = w.spans.iter().map(|s| s.bytes).sum();
+            if bytes > 0 {
+                METRICS
+                    .block_map_window_bytes
+                    .fetch_sub(bytes, Ordering::Relaxed);
+            }
+            METRICS
+                .block_map_window_evictions
+                .fetch_add(w.spans.len() as u64, Ordering::Relaxed);
+        }
+    }
+
+    /// The R5 `block_map_window` shed: drop whole-ino windows until the
+    /// gauge is at/under `target` (floor 0 — warmth is the cheapest
+    /// sacrifice; a dropped span refills on demand).
+    pub fn kvmap_windows_shed(&self, target: u64) {
+        let mut victims: Vec<u64> = Vec::new();
+        self.inner.kvmap_windows.iter_sync(|ino, _| {
+            victims.push(*ino);
+            true
+        });
+        for ino in victims {
+            if METRICS.block_map_window_bytes.load(Ordering::Relaxed) <= target {
+                break;
+            }
+            self.kvmap_window_drop(ino);
+        }
+    }
+
+    /// Window probe: `Some(Some(k))` = warm binding; `Some(None)` = the
+    /// index is INSIDE a covering span with no record — a definitive
+    /// HOLE; `None` = PartialMiss (no covering span / stale epoch).
+    fn kvmap_window_probe(
+        &self,
+        ino: u64,
+        b: u32,
+        epoch_now: Option<u64>,
+    ) -> Option<Option<String>> {
+        let hit = self
+            .inner
+            .kvmap_windows
+            .read_sync(&ino, |_, w| {
+                w.spans
+                    .iter()
+                    .find(|s| s.epoch == epoch_now && s.lo <= b && u64::from(b) < u64::from(s.hi))
+                    .map(|s| s.entries.get(&b).cloned())
+            })
+            .flatten();
+        if hit.is_some() {
+            METRICS
+                .block_map_window_hits
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        hit
+    }
+
+    /// One warm-window FILL from the tree (`block_map_range` from `b`,
+    /// run-expanded through the router's stride census — the fetch arm's
+    /// two shared expansion surfaces), retained per-ino under the span
+    /// LRU. Answers `b`'s binding directly: the fresh span covers `b` by
+    /// construction, so absence in it is a definitive HOLE. Never-lossy:
+    /// an unresolvable record refuses loud (the fetch arm's law — a
+    /// fabricated hole is the silent-wrong bomb §14 names).
+    async fn kvmap_window_fill(
+        &self,
+        ino: u64,
+        b: u32,
+        sweep_cut: Option<u32>,
+    ) -> Result<Option<String>> {
+        let backend = self.inner.meta_backend.get().ok_or_else(|| {
+            SqueezefsError::InvalidOperation("Metadata backend not initialized".to_string())
+        })?;
+        let epoch = backend.reader_fetch_epoch(ino);
+        let page = backend
+            .block_map_range(ino, b, KVMAP_WINDOW_FILL_RECORDS)
+            .await
+            .map_err(|e| {
+                SqueezefsError::Io(std::io::Error::other(format!(
+                    "ino {ino}: partial-map window fill failed at index {b}: {e}"
+                )))
+            })?;
+        let complete = page.len() < KVMAP_WINDOW_FILL_RECORDS;
+        let clip = u64::from(b) + u64::from(KVMAP_WINDOW_FILL_INDICES_MAX);
+        let mut hi: u64 = if complete {
+            u64::from(u32::MAX)
+        } else {
+            page.last()
+                .map(|(i, e)| u64::from(*i) + u64::from(e.run_len()))
+                .unwrap_or(u64::from(b) + 1)
+        };
+        let mut entries: std::collections::BTreeMap<u32, String> =
+            std::collections::BTreeMap::new();
+        'fill: for (idx, entry) in &page {
+            for delta in 0..entry.run_len() {
+                let at = u64::from(*idx) + u64::from(delta);
+                if at < u64::from(b) {
+                    // The prepended covering run's below-window coverage.
+                    continue;
+                }
+                if sweep_cut.is_some_and(|k| at >= u64::from(k)) {
+                    // A2 residue never enters a window (reads clamp to
+                    // size, so holes above the cursor are correct).
+                    break 'fill;
+                }
+                if at >= clip {
+                    hi = hi.min(clip);
+                    break 'fill;
+                }
+                let Some(key) = self.backend_router.map_entry_block_key_at(entry, delta) else {
+                    return Err(SqueezefsError::Io(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!(
+                            "ino {ino}: unresolvable kvmap record at index {at} \
+                             ({entry:?} + {delta}) — refusing to serve a fabricated hole"
+                        ),
+                    )));
+                };
+                // Key order makes a later exact record override its
+                // covering run's derived binding (the §2 read law).
+                entries.insert(at as u32, key);
+            }
+        }
+        let answer = entries.get(&b).cloned();
+        let bytes = (entries.len() as u64).saturating_mul(KVMAP_WRITE_MAP_ENTRY_EST);
+        let span = KvmapWindowSpan {
+            lo: b,
+            hi: hi.min(u64::from(u32::MAX)) as u32,
+            epoch,
+            entries,
+            bytes,
+        };
+        METRICS
+            .block_map_window_fills
+            .fetch_add(1, Ordering::Relaxed);
+        METRICS
+            .block_map_window_bytes
+            .fetch_add(bytes, Ordering::Relaxed);
+        let mut evicted: u64 = 0;
+        let mut evicted_bytes: u64 = 0;
+        match self.inner.kvmap_windows.entry_sync(ino) {
+            scc::hash_map::Entry::Occupied(mut occ) => {
+                let w = occ.get_mut();
+                w.spans.push(span);
+                while w.spans.len() > KVMAP_WINDOW_SPANS_PER_INO {
+                    let old = w.spans.remove(0);
+                    evicted += 1;
+                    evicted_bytes += old.bytes;
+                }
+            }
+            scc::hash_map::Entry::Vacant(vac) => {
+                let _ = vac.insert_entry(KvmapWindows { spans: vec![span] });
+            }
+        }
+        if evicted > 0 {
+            METRICS
+                .block_map_window_evictions
+                .fetch_add(evicted, Ordering::Relaxed);
+            METRICS
+                .block_map_window_bytes
+                .fetch_sub(evicted_bytes, Ordering::Relaxed);
+        }
+        Ok(answer)
+    }
+
+    /// The §14 partial resolve ladder: overlay (binding / tombstone) →
+    /// warm window (binding / in-span hole) → the TREE (PartialMiss —
+    /// one window fill, retained). `Ok(None)` is always a real HOLE
+    /// (zeros); errors are loud (never a fabricated hole).
+    pub(crate) async fn resolve_partial_block_binding(
+        &self,
+        ino: u64,
+        meta: &CachedMetadata,
+        b: u32,
+    ) -> Result<Option<String>> {
+        let sweep_cut = meta
+            .block_map_id
+            .as_deref()
+            .and_then(|id| crate::meta_backend::kv::block_map::parse_kvmap_head(id).ok())
+            .and_then(|h| h.sweep_cursor);
+        if sweep_cut.is_some_and(|k| b >= k) {
+            // Shadowed A2 residue: unreadable by law (reads clamp to the
+            // flipped size).
+            return Ok(None);
+        }
+        if let Some(verdict) = self.kvmap_overlay_probe(ino, b) {
+            return Ok(verdict);
+        }
+        let epoch = self
+            .inner
+            .meta_backend
+            .get()
+            .and_then(|be| be.reader_fetch_epoch(ino));
+        if let Some(verdict) = self.kvmap_window_probe(ino, b, epoch) {
+            return Ok(verdict);
+        }
+        self.kvmap_window_fill(ino, b, sweep_cut).await
+    }
+
+    /// The SYNC face of the partial ladder (the il §5.5.1 fast leg):
+    /// overlay + window only — `Some(k)` serves, anything else DEMOTES to
+    /// the async handler (which runs the full ladder; a tombstone/hole
+    /// demotes too, matching the whole-map leg's absence behavior).
+    pub(crate) fn resolve_partial_block_binding_sync(&self, ino: u64, b: u32) -> Option<String> {
+        match self.kvmap_overlay_probe(ino, b) {
+            Some(Some(k)) => return Some(k),
+            Some(None) => return None,
+            None => {}
+        }
+        let epoch = self
+            .inner
+            .meta_backend
+            .get()
+            .and_then(|be| be.reader_fetch_epoch(ino));
+        self.kvmap_window_probe(ino, b, epoch).flatten()
+    }
+
     /// **The kvmap arm of the save body** (PR 2, design §3): publish `ino`
     /// through the block-map tree — the crossing train on a first
     /// crossing / legacy-blob conversion, the same diff train on every
@@ -7041,18 +7510,55 @@ impl DataRouter {
                 return Ok(None);
             }
         }
-        // The whole current map is the train's input. A kvmap head with
-        // NO map authority must refuse — diffing against an absent map
-        // would mass-delete live records (an empty map is `Some(empty)`,
-        // never `None`, on every merge/truncate path).
-        let Some(map) = m.block_map.as_deref() else {
-            return Err(SqueezefsError::InvalidOperation(format!(
-                "kvmap publish for ino {ino}: the RAM entry carries no block map — \
-                 refusing to reconcile the tree against an absent authority"
-            )));
+        // The train's input. Whole-map mode: the current RAM map (the
+        // delete-by-absence diff — RAM is whole-map authority, Rev 1.3
+        // #2). PARTIAL mode (PR 6c-i, design §14): ONLY the overlay —
+        // dirty bindings as entries, tombstones as release claims — rides
+        // the LOCAL claims-scoped train (bounded by pre-fix a; the
+        // whole-map diff never runs, which is the point). A kvmap head
+        // with NEITHER authority must refuse — diffing against an absent
+        // map would mass-delete live records (an empty map is
+        // `Some(empty)`, never `None`, on every merge/truncate path).
+        let partial = head_is_kvmap && self.entry_is_partial(ino, m);
+        let overlay_snapshot: Option<KvmapOverlay> = if partial {
+            Some(self.kvmap_overlay_snapshot(ino))
+        } else {
+            None
         };
-        let mut entries: Vec<(u32, String)> = map.iter().map(|(b, k)| (*b, k.clone())).collect();
+        let mut entries: Vec<(u32, String)> = match (&overlay_snapshot, m.block_map.as_deref()) {
+            (Some(overlay), _) => overlay
+                .iter()
+                .filter_map(|(b, v)| v.as_ref().map(|k| (*b, k.clone())))
+                .collect(),
+            (None, Some(map)) => map.iter().map(|(b, k)| (*b, k.clone())).collect(),
+            (None, None) => {
+                return Err(SqueezefsError::InvalidOperation(format!(
+                    "kvmap publish for ino {ino}: the RAM entry carries no block map — \
+                     refusing to reconcile the tree against an absent authority"
+                )));
+            }
+        };
         entries.sort_unstable_by_key(|&(b, _)| b);
+        let overlay_claims: Option<crate::meta_backend::kv::backend::MapTrainClaims> =
+            overlay_snapshot.as_ref().map(|overlay| {
+                crate::meta_backend::kv::backend::MapTrainClaims {
+                    // The held 4a serializes — no staleness window for
+                    // the belt (§14 S2: base_gen None on local trains).
+                    base_gen: None,
+                    take: overlay
+                        .iter()
+                        .filter_map(|(b, v)| v.is_some().then_some(*b))
+                        .collect(),
+                    release: overlay
+                        .iter()
+                        .filter_map(|(b, v)| v.is_none().then_some(*b))
+                        .collect(),
+                    served: false,
+                    // §14 S2 option ii: displacement discovery rides the
+                    // recompute through this save's live `ref_for`.
+                    overlay: true,
+                }
+            });
 
         // The deferred accounting drains exactly as the legacy path does
         // (older than this call's own ops), and the finding-38 chunk law
@@ -7171,6 +7677,7 @@ impl DataRouter {
             map_migrate_chunk(),
             cursor_floor,
             &ref_for,
+            overlay_claims,
         )
         .await
         {
@@ -7235,13 +7742,46 @@ impl DataRouter {
             self.free_deferred_keys(cleaned).await;
         }
 
+        // PR 6c-i: the overlay save's tail. The shipped snapshot is
+        // durable — drain exactly it (racing post-snapshot merges keep
+        // their entries: never-lossy), drop the now-stale warm windows,
+        // and on a SOLO mount free the recompute-released displaced
+        // supply through the deferred-key ladder (tier purge first — the
+        // mw arms keep the `released` BlockRef ladder at the save's
+        // post-guard venue).
+        if let Some(ref shipped) = overlay_snapshot {
+            METRICS.kvmap_overlay_saves.fetch_add(1, Ordering::Relaxed);
+            self.kvmap_overlay_drain(ino, shipped);
+            self.kvmap_window_drop(ino);
+        }
+        let mut released_up = outcome.released;
+        if partial
+            && !outcome.released_keys.is_empty()
+            && crate::data_grant::custody_owner().is_none()
+        {
+            for key in &outcome.released_keys {
+                self.cache.purge_block_key(key);
+            }
+            let cleaned: Vec<String> = outcome
+                .released_keys
+                .iter()
+                .map(|k| clean_block_key(k))
+                .collect();
+            self.free_deferred_keys(cleaned).await;
+            released_up = Vec::new();
+        }
+
         // The republish: the head is now `kvmap:1[;sweep:K][;gen:N]` (the
         // train re-stamps the committed generation AND carries the live
         // A2 sweep cursor forward — the outcome carries both, so the next
         // ship's base_gen is current without a refetch and the cached
         // head never lies about the sweep plan), delta-ineligible (Rev
         // 1.1 #5 sticky), and the map stays WARM in RAM — the crossing
-        // must not cold the mount (`m.clone()`).
+        // must not cold the mount (`m.clone()`). PR 6c-i: a POST-PUBLISH
+        // entry is CLEAN — the §14 flip point: an over-budget whole-map
+        // entry republishes PARTIAL (`block_map: None` + the registry
+        // mark), bounding whole-map growth at one publish cycle; a
+        // partial entry stays partial verbatim.
         let mut cached = m.clone();
         cached.layout_delta_chain = LAYOUT_DELTA_CHAIN_INELIGIBLE;
         cached.block_map_id = Some(
@@ -7257,16 +7797,22 @@ impl DataRouter {
         cached.layout_version = 0;
         // No blob exists behind a kvmap head — nothing to own-mint.
         cached.block_map_id_own_mint = false;
-        // PR 6a (§12 option b): the crossing/republish materialized this
-        // ino's whole map as resident write authority — register it in
-        // the write-map gauge (the merge seam ENFORCES the cap on later
-        // growth; the train already ran, so this arm never refuses).
-        let est = (cached
-            .block_map
-            .as_ref()
-            .map(|m| m.len() as u64)
-            .unwrap_or(0))
-        .saturating_mul(KVMAP_WRITE_MAP_ENTRY_EST);
+        if !partial && kvmap_size_over_budget(cached.size, bs) {
+            cached.block_map = None;
+            self.kvmap_partial_arm(ino);
+        }
+        // PR 6a (§12 option b): the republish's resident write authority
+        // — whole-map length, or the overlay's for partial entries.
+        let est = if cached.block_map.is_none() {
+            self.kvmap_overlay_est(ino)
+        } else {
+            (cached
+                .block_map
+                .as_ref()
+                .map(|m| m.len() as u64)
+                .unwrap_or(0))
+            .saturating_mul(KVMAP_WRITE_MAP_ENTRY_EST)
+        };
         match self.inner.kvmap_write_maps.entry_sync(ino) {
             scc::hash_map::Entry::Occupied(mut occ) => *occ.get_mut() = est,
             scc::hash_map::Entry::Vacant(vac) => {
@@ -7287,12 +7833,18 @@ impl DataRouter {
         // down (local tier/tracking hygiene only). A LOCAL recompute's
         // released set travels up for the save's post-guard shipped-free
         // ladder (RES-1: never freed under the caller's 3.5 stripe).
-        if outcome.recomputed {
+        // PR 6c-i: a PARTIAL save's caller-displaced keys are
+        // overlay-LOCAL by construction (never tree records — DISJOINT
+        // from the recompute's released set), so the finding-36
+        // stand-down never applies to them: the verdict toward the caller
+        // stays `false` and the displaced free stream runs verbatim.
+        let recomputed_verdict = if partial { false } else { outcome.recomputed };
+        if recomputed_verdict {
             let _ = self.inner.publish_recomputed.insert_sync(ino, ());
         } else {
             let _ = self.inner.publish_recomputed.remove_sync(&ino);
         }
-        Ok(Some((outcome.recomputed, outcome.released)))
+        Ok(Some((recomputed_verdict, released_up)))
     }
 
     /// PR 5b (design §11's belt): re-learn `ino`'s kvmap head id — the
@@ -8157,6 +8709,8 @@ impl DataRouter {
                 publish_recomputed: std::sync::Arc::new(scc::HashMap::new()),
                 kvmap_write_maps: std::sync::Arc::new(scc::HashMap::new()),
                 kvmap_sweep_corpses: std::sync::Arc::new(scc::HashMap::new()),
+                kvmap_overlays: std::sync::Arc::new(scc::HashMap::new()),
+                kvmap_windows: std::sync::Arc::new(scc::HashMap::new()),
             }),
         };
         // Merge-worker promotion commits layout through the router (weak:
@@ -12032,6 +12586,13 @@ impl DataRouter {
                 Err(_) => return ShadowRecordOutcome::NotShadowed(guard),
             },
         };
+        // PR 6c-i: PARTIAL entries decline the shadow fast path — the
+        // record's displaced-prev capture and the KD-1.9 refetch-compose
+        // assume whole-map RAM; the durable merge (which is
+        // partial-aware) owns these publishes.
+        if self.entry_is_partial(ino, &current) {
+            return ShadowRecordOutcome::NotShadowed(guard);
+        }
         let prev = current
             .block_map
             .as_ref()
@@ -12393,15 +12954,19 @@ impl DataRouter {
         let mut sum = 0u64;
         let mut dead: Vec<u64> = Vec::new();
         self.inner.kvmap_write_maps.iter_sync(|ino, bytes| {
-            let live = self
-                .metadata_cache
-                .peek_with(ino, |m| {
-                    m.block_map.is_some()
-                        && m.block_map_id
-                            .as_deref()
-                            .is_some_and(|id| id.starts_with(kvmap_head_prefix()))
-                })
-                .unwrap_or(false);
+            // PR 6c-i: a PARTIAL ino's registry entry gauges its OVERLAY
+            // (the entry carries no map by design) — live as long as the
+            // mode is.
+            let live = self.kvmap_partial_mode(*ino)
+                || self
+                    .metadata_cache
+                    .peek_with(ino, |m| {
+                        m.block_map.is_some()
+                            && m.block_map_id
+                                .as_deref()
+                                .is_some_and(|id| id.starts_with(kvmap_head_prefix()))
+                    })
+                    .unwrap_or(false);
             if live {
                 sum += *bytes;
             } else {
@@ -12418,36 +12983,19 @@ impl DataRouter {
         sum
     }
 
-    /// The §12 option-b refusal at the first-dirty/growth seam: admit
-    /// `ino`'s estimated write-map bytes into the registry, refusing
-    /// **EFBIG** when the write-active sum would exceed the derived
-    /// budget share. EFBIG and not ENOSPC: the condition is a property of
-    /// the FILE's size class against this mount's RAM budget (its map
-    /// cannot be held as whole-map write authority — Rev 1.3 #2), not of
-    /// storage, and ENOSPC would send an operator hunting for space that
-    /// exists. A refusal leaves the registry at the ino's PRIOR
-    /// admission (the standing dirty map is still resident RAM truth).
-    fn admit_kvmap_write_map(&self, ino: u64, estimate: u64) -> Result<()> {
+    /// The write-map GAUGE registration at the first-dirty/growth seam
+    /// (PR 6a option b, re-chartered by PR 6c-i): record `ino`'s
+    /// estimated write-map bytes. The 6a EFBIG refusal is DELETED — the
+    /// budget arithmetic now selects the PARTIAL mode at the next clean
+    /// flip point instead of refusing the write (design §14: "EFBIG
+    /// deleted"), so this is pure instrumentation.
+    fn note_kvmap_write_map(&self, ino: u64, estimate: u64) {
         let prior = self
             .inner
             .kvmap_write_maps
             .read_sync(&ino, |_, b| *b)
             .unwrap_or(0);
         let others = self.kvmap_write_map_gauge().saturating_sub(prior);
-        let cap = kvmap_write_map_budget_bytes();
-        if others.saturating_add(estimate) > cap {
-            log::error!(
-                "kvmap write-map cap: ino {ino}'s estimated RAM map ({estimate} B) plus \
-                 {others} B of other write-active kvmap maps exceeds the derived budget \
-                 share ({cap} B = mem_budget/16) — refusing EFBIG: this mount cannot hold \
-                 the file's map as whole-map write authority (design \
-                 docs/design-kvmap-block-map-tree.md §12, Rev 1.3 #2; the 6c dirty-index \
-                 overlay is the boundedness successor)"
-            );
-            return Err(SqueezefsError::Io(std::io::Error::from_raw_os_error(
-                libc::EFBIG,
-            )));
-        }
         match self.inner.kvmap_write_maps.entry_sync(ino) {
             scc::hash_map::Entry::Occupied(mut occ) => *occ.get_mut() = estimate,
             scc::hash_map::Entry::Vacant(vac) => {
@@ -12458,7 +13006,42 @@ impl DataRouter {
             others.saturating_add(estimate),
             std::sync::atomic::Ordering::Relaxed,
         );
-        Ok(())
+    }
+
+    /// PR 6c-i: the CURRENT tree binding at one index — a bounded probe
+    /// (one routed range read with the covering-run prepend), the partial
+    /// punch/tombstone arms' displacement witness. `Ok(None)` = no
+    /// durable record covers `b`.
+    async fn tree_block_binding(&self, ino: u64, b: u32) -> Result<Option<String>> {
+        let Some(backend) = self.inner.meta_backend.get() else {
+            return Ok(None);
+        };
+        let page = backend.block_map_range(ino, b, 1).await?;
+        let Some((idx, entry)) = page.into_iter().next() else {
+            return Ok(None);
+        };
+        if idx > b || u64::from(idx) + u64::from(entry.run_len()) <= u64::from(b) {
+            return Ok(None);
+        }
+        let delta = b - idx;
+        match self.backend_router.map_entry_block_key_at(&entry, delta) {
+            Some(k) => Ok(Some(k)),
+            None => Err(SqueezefsError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "ino {ino}: unresolvable kvmap record at index {b} ({entry:?} + \
+                     {delta}) — refusing to treat it as a hole"
+                ),
+            ))),
+        }
+    }
+
+    /// Remove one overlay index outright (a punched never-published
+    /// binding with no tree record to shadow — absent, not tombstoned).
+    fn kvmap_overlay_remove_index(&self, ino: u64, b: u32) {
+        let _ = self.inner.kvmap_overlays.update_sync(&ino, |_, o| {
+            o.remove(&b);
+        });
     }
 
     pub async fn merge_block_mappings(
@@ -12555,13 +13138,17 @@ impl DataRouter {
             },
         };
 
-        // PR 6a (design §12 option b): the honest write-map cap at the
-        // §5.3 one-merge seam — the ONE place a kvmap ino's RAM map
-        // becomes (or grows as) whole-map WRITE authority. Growth-class
-        // ops only: a truncate/punch SHRINKS the authority and must never
-        // refuse. O(1): the estimate is `len × entry-est`, never a key
-        // walk.
-        if matches!(op, BlockMapOp::Merge(_) | BlockMapOp::MergeExpected(_))
+        // PR 6a (design §12 option b) / PR 6c-i (design §14): the honest
+        // write-map GAUGE at the §5.3 one-merge seam — the ONE place a
+        // kvmap ino's RAM map grows as whole-map WRITE authority. The 6a
+        // EFBIG refusal is DELETED: the budget arithmetic became the
+        // partial-mode flip threshold (an over-budget entry flips at its
+        // next clean point — fetch or post-publish republish — bounding
+        // whole-map growth at one publish cycle). Partial entries gauge
+        // their OVERLAY length after the merge below.
+        let partial = self.entry_is_partial(ino, &current);
+        if !partial
+            && matches!(op, BlockMapOp::Merge(_) | BlockMapOp::MergeExpected(_))
             && current
                 .block_map_id
                 .as_deref()
@@ -12579,7 +13166,7 @@ impl DataRouter {
                 .unwrap_or(0)
                 + merged)
                 .saturating_mul(KVMAP_WRITE_MAP_ENTRY_EST);
-            self.admit_kvmap_write_map(ino, estimate)?;
+            self.note_kvmap_write_map(ino, estimate);
         }
 
         let forensics_base = if current.layout_dirty {
@@ -12601,7 +13188,13 @@ impl DataRouter {
         // CoW publish (item A): take the Arc, mutate a uniquely-owned copy
         // via `make_mut` — held reader snapshots keep the exact map they
         // were taken with (test_block_map_snapshot_independent_of_*).
-        let mut block_map_arc = current.block_map.take().unwrap_or_default();
+        // Partial entries (PR 6c-i) mutate the registry OVERLAY instead —
+        // the scratch map stays empty and is never written back.
+        let mut block_map_arc = if partial {
+            Default::default()
+        } else {
+            current.block_map.take().unwrap_or_default()
+        };
         let block_map = std::sync::Arc::make_mut(&mut block_map_arc);
         let mut displaced: Vec<String> = Vec::new();
         // Spec §6.2 item 1: the EXACT durable-reference delta this merge
@@ -12643,6 +13236,32 @@ impl DataRouter {
                     &mut overlay_touched,
                 );
                 for (b, new_key) in entries {
+                    if partial {
+                        // PR 6c-i (§14 S2 option ii): the partial merge
+                        // captures ONLY overlay-LOCAL displacement (an
+                        // un-published binding this mount minted and now
+                        // replaces — the tree never saw it, so the train
+                        // recompute cannot). TREE displacement discovery
+                        // rides the overlay save's recompute; its freed
+                        // supply travels back as `released`.
+                        match self.kvmap_overlay_insert(ino, *b, Some(new_key.clone())) {
+                            Some(Some(prev)) if prev != *new_key => {
+                                purge(&prev);
+                                ref_changes.push((*b, prev.clone(), false));
+                                ref_changes.push((*b, new_key.clone(), true));
+                                displaced.push(prev);
+                            }
+                            // Idempotent re-bind.
+                            Some(Some(_)) => {}
+                            // Fresh index, or a tombstone overwritten by a
+                            // new write (the displaced tree binding's
+                            // release was minted when the tombstone was).
+                            Some(None) | None => {
+                                ref_changes.push((*b, new_key.clone(), true));
+                            }
+                        }
+                        continue;
+                    }
                     match block_map.insert(*b, new_key.clone()) {
                         Some(prev) if prev != *new_key => {
                             purge(&prev);
@@ -12667,6 +13286,19 @@ impl DataRouter {
                 }
             }
             BlockMapOp::MergeExpected(entries) => {
+                // PR 6c-i: the mover republish needs whole-map
+                // expected-current semantics a bounded store cannot
+                // honestly answer — refuse LOUD (the mover re-plans /
+                // fails its job) rather than skip-apply forever. Lifting
+                // this is the 6c-ii/mover-composition rung's, not a
+                // silent degrade.
+                if partial {
+                    return Err(SqueezefsError::InvalidOperation(format!(
+                        "mover publish (MergeExpected) on partial-mode kvmap ino {ino} is \
+                         not supported (design-kvmap-block-map-tree §14, 6c-i): the map \
+                         exceeds this mount's RAM budget share"
+                    )));
+                }
                 // Supersession coherence: only APPLIED entries evict shadow
                 // bindings — a skipped entry means the MOVER's view is
                 // stale, not the epoch's.
@@ -12731,17 +13363,35 @@ impl DataRouter {
                         .collect();
                     self.overlay_screen_discard(ino, past_cut, &mut overlay_touched);
                 }
-                block_map.retain(|&b, bk| {
-                    if (b as u64) * block_size >= new_size {
-                        purge(bk);
-                        ref_changes.push((b, bk.clone(), false));
-                        displaced.push(bk.clone());
-                        false
-                    } else {
-                        true
+                if partial {
+                    // PR 6c-i (§14 item 4): a partial-mode SHRINK never
+                    // reaches this arm — `truncate_layout` routes every
+                    // partial shrink through the 6b size-flip handoff
+                    // (bounded ranges, never whole-map). Reaching it means
+                    // the routing law broke upstream; refusing beats a
+                    // silent whole-map walk that cannot run. A GROW is
+                    // O(1): nothing to remove, the size commits.
+                    if new_size < current.size {
+                        return Err(SqueezefsError::InvalidOperation(format!(
+                            "partial-mode kvmap ino {ino}: a shrink TruncateFrom reached \
+                             the merge primitive — the 6b size-flip handoff owns this \
+                             shape (design-kvmap-block-map-tree §14)"
+                        )));
                     }
-                });
-                current.size = new_size;
+                    current.size = new_size;
+                } else {
+                    block_map.retain(|&b, bk| {
+                        if (b as u64) * block_size >= new_size {
+                            purge(bk);
+                            ref_changes.push((b, bk.clone(), false));
+                            displaced.push(bk.clone());
+                            false
+                        } else {
+                            true
+                        }
+                    });
+                    current.size = new_size;
+                }
             }
             BlockMapOp::RemoveBlocks(idxs) => {
                 // Supersession coherence: a punch kills the binding
@@ -12751,6 +13401,39 @@ impl DataRouter {
                 // §5.7 discarding class (the punch belt).
                 self.overlay_screen_discard(ino, idxs.iter().copied(), &mut overlay_touched);
                 for &b in idxs {
+                    if partial {
+                        // PR 6c-i: bounded-probe punch. Overlay-local
+                        // bindings displace here (un-published mints the
+                        // train can never discover); the TREE binding is
+                        // probed (one bounded range) so the tombstone's
+                        // release rides the refs frame — the overlay
+                        // save's recompute resolves the displaced record
+                        // and its block frees on the publish tail. A
+                        // never-bound index plants no tombstone (a true
+                        // hole reads zeros either way).
+                        let prev = self.kvmap_overlay_probe(ino, b);
+                        if let Some(Some(p)) = &prev {
+                            purge(p);
+                            ref_changes.push((b, p.clone(), false));
+                            displaced.push(p.clone());
+                        }
+                        if prev == Some(None) {
+                            continue; // already tombstoned
+                        }
+                        match self.tree_block_binding(ino, b).await? {
+                            Some(t) => {
+                                purge(&t);
+                                ref_changes.push((b, t, false));
+                                self.kvmap_overlay_insert(ino, b, None);
+                            }
+                            None => {
+                                if prev.is_some() {
+                                    self.kvmap_overlay_remove_index(ino, b);
+                                }
+                            }
+                        }
+                        continue;
+                    }
                     if let Some(bk) = block_map.remove(&b) {
                         purge(&bk);
                         ref_changes.push((b, bk.clone(), false));
@@ -12781,7 +13464,15 @@ impl DataRouter {
                  token={fencing_token} displaced={displaced:?} map_now={map_now:?}"
             );
         }
-        current.block_map = Some(block_map_arc);
+        if partial {
+            // PR 6c-i: the entry STAYS partial (`block_map: None` — the
+            // overlay is the store); local mutation drops the warm
+            // windows (stale spans) and re-gauges the overlay.
+            self.kvmap_window_drop(ino);
+            self.note_kvmap_write_map(ino, self.kvmap_overlay_est(ino));
+        } else {
+            current.block_map = Some(block_map_arc);
+        }
 
         match layout_flip {
             LayoutFlip::ToStripedKeepStagedIdentity => {
@@ -13101,8 +13792,16 @@ impl DataRouter {
         publish_phase_record(PublishPhase::BaseFetch, t_base);
 
         // CoW publish (item A): held reader snapshots keep their map.
+        // PR 6c-i: a PARTIAL base applies to the registry OVERLAY (the
+        // merge primitive's partial Merge arm, batched) — the scratch map
+        // stays empty and is never written back.
         let t_apply = std::time::Instant::now();
-        let mut block_map_arc = current.block_map.take().unwrap_or_default();
+        let partial = self.entry_is_partial(ino, &current);
+        let mut block_map_arc = if partial {
+            Default::default()
+        } else {
+            current.block_map.take().unwrap_or_default()
+        };
         let block_map = std::sync::Arc::make_mut(&mut block_map_arc);
         /// One op's terminal-fan-out bookkeeping (sender + per-op payload
         /// + the enqueue instant for the `total` publish phase).
@@ -13161,6 +13860,25 @@ impl DataRouter {
                 &mut overlay_touched,
             );
             for (b, new_key) in &op.entries {
+                if partial {
+                    // PR 6c-i (§14 S2 option ii): overlay-LOCAL
+                    // displacement only — tree displacement is the
+                    // overlay save's recompute (the primitive's partial
+                    // Merge arm, verbatim).
+                    match self.kvmap_overlay_insert(ino, *b, Some(new_key.clone())) {
+                        Some(Some(prev)) if prev != *new_key => {
+                            self.cache.purge_block_key(&prev);
+                            ref_changes.push((*b, prev.clone(), false));
+                            ref_changes.push((*b, new_key.clone(), true));
+                            displaced.push(prev);
+                        }
+                        Some(Some(_)) => {}
+                        Some(None) | None => {
+                            ref_changes.push((*b, new_key.clone(), true));
+                        }
+                    }
+                    continue;
+                }
                 match block_map.insert(*b, new_key.clone()) {
                     Some(prev) if prev != *new_key => {
                         // Purge every tier for a displaced key — its
@@ -13208,7 +13926,12 @@ impl DataRouter {
                 current.size = cached.size;
             }
         }
-        current.block_map = Some(block_map_arc);
+        if partial {
+            self.kvmap_window_drop(ino);
+            self.note_kvmap_write_map(ino, self.kvmap_overlay_est(ino));
+        } else {
+            current.block_map = Some(block_map_arc);
+        }
         publish_phase_record(PublishPhase::Apply, t_apply);
         for o in fenced {
             publish_phase_record(PublishPhase::Total, o.enqueued_at);
@@ -13434,14 +14157,23 @@ impl DataRouter {
             return None;
         }
         let part_key;
+        let partial_key;
         let b_key: &str = if let Some(map) = &meta.block_map {
             map.get(&start_block)?
         } else if meta.block_map_id.is_some() {
-            // Map-id without an inline map (anomalous — see
-            // `load_striped_block_keys`): this sync leg cannot re-resolve
-            // from the backend, so DEMOTE to the async handler (which can),
-            // never fabricate a miss/hole.
-            return None;
+            // PR 6c-i: a PARTIAL entry probes the overlay + warm window
+            // SYNC (lock-free scc — the §8 #1 sync-probeable store that
+            // keeps the il fast path alive on partial inos); a
+            // PartialMiss/tombstone/hole DEMOTES to the async handler
+            // (the full ladder — never a fabricated miss). The legacy
+            // map-id-without-map anomaly demotes exactly as before.
+            let ino = parse_inode_from_path(file_path);
+            if self.kvmap_partial_mode(ino) {
+                partial_key = self.resolve_partial_block_binding_sync(ino, start_block)?;
+                &partial_key
+            } else {
+                return None;
+            }
         } else {
             let prefix = meta.block_prefix.as_ref()?;
             match crate::keys::StackKey::format(format_args!("{prefix}/part_{start_block}")) {
@@ -13604,6 +14336,19 @@ impl DataRouter {
                 let key_opt = block_map.get(&b).cloned();
                 block_keys.push((b, key_opt));
             }
+        } else if self.entry_is_partial(parse_inode_from_path(file_path), meta) {
+            // PR 6c-i (design §14): the PARTIAL store's authoritative
+            // resolve — overlay → warm window → tree read-through (one
+            // window fill per PartialMiss, retained). This is §14's
+            // "anomalous-entry refetch arm become the legitimate bounded
+            // tree-resolving arm with warm-span retention": absence here
+            // is a verdict (tombstone / in-span hole), never a
+            // fabrication — the ladder errs loud on unresolvable records.
+            let ino = parse_inode_from_path(file_path);
+            for b in start_block..=end_block {
+                let key_opt = self.resolve_partial_block_binding(ino, meta, b).await?;
+                block_keys.push((b, key_opt));
+            }
         } else if meta.block_map_id.is_some() {
             // A map-id WITHOUT an inline map: `fetch_metadata_from_backend`
             // always inline-resolves (indirect maps rehydrate into
@@ -13624,6 +14369,15 @@ impl DataRouter {
                     let map = fresh.block_map.as_ref().expect("checked is_some");
                     for b in start_block..=end_block {
                         block_keys.push((b, map.get(&b).cloned()));
+                    }
+                }
+                // PR 6c-i: the refetch legitimately answers a PARTIAL
+                // entry (the mode flipped at the fetch) — resolve through
+                // the bounded ladder instead of refusing.
+                Some(fresh) if self.entry_is_partial(ino, &fresh) => {
+                    for b in start_block..=end_block {
+                        let key_opt = self.resolve_partial_block_binding(ino, &fresh, b).await?;
+                        block_keys.push((b, key_opt));
                     }
                 }
                 _ => {
@@ -14591,11 +15345,21 @@ impl DataRouter {
 
         let meta = self.fetch_metadata(file_path).await?;
         let existing_size = meta.size;
-        let block_map = meta.block_map.clone().unwrap_or_default();
-
-        let mut old_block_keys = Vec::new();
-        for b in start_block..=end_block {
-            old_block_keys.push(block_map.get(&b).cloned());
+        // PR 6c-i: a PARTIAL entry's span resolves through the bounded
+        // ladder (overlay → window → tree) — reading its absent map as
+        // all-holes would seed every RMW with zeros over live tree-mapped
+        // bytes (the §14 silent-wrong bomb). Whole-map entries keep the
+        // direct per-index read verbatim.
+        let mut old_block_keys: Vec<Option<String>> = Vec::new();
+        if self.entry_is_partial(ino, &meta) {
+            for b in start_block..=end_block {
+                old_block_keys.push(self.resolve_partial_block_binding(ino, &meta, b).await?);
+            }
+        } else {
+            let block_map = meta.block_map.clone().unwrap_or_default();
+            for b in start_block..=end_block {
+                old_block_keys.push(block_map.get(&b).cloned());
+            }
         }
 
         // Spawn tasks to modify affected blocks concurrently. The old
@@ -17232,6 +17996,19 @@ impl DataRouter {
                     }
                 }
             }
+            // PR 6c-i: a PARTIAL-mode source has no whole map to pin —
+            // cloning it would silently mint an EMPTY dest (data loss).
+            // Per-record tree-walk cloning is a later rung; refuse loud.
+            {
+                let src_ino = parse_inode_from_path(src);
+                if self.entry_is_partial(src_ino, &meta) {
+                    return Err(SqueezefsError::InvalidOperation(format!(
+                        "clone of partial-mode kvmap ino {src_ino} is not supported \
+                         (design-kvmap-block-map-tree §14, 6c-i): its map exceeds this \
+                         mount's RAM budget share"
+                    )));
+                }
+            }
             let mut current = meta.clone();
             let mut attempt = 0usize;
             loop {
@@ -17452,8 +18229,15 @@ impl DataRouter {
             drop(meta_guard);
             return Ok(false);
         }
+        // PR 6c-i (§14 item 4): a PARTIAL-mode shrink takes this handoff
+        // at ANY size — the synchronous TruncateFrom would need the
+        // whole-map walk a bounded store cannot run. Under the threshold
+        // the sweep DRAINS SYNCHRONOUSLY below (bounded ranges, ≤
+        // threshold indices — the sync path's semantics preserved);
+        // over it the job owns it, 6b verbatim.
+        let partial = self.entry_is_partial(ino, &current);
         let removed_estimate = (current.size - new_size) / bs;
-        if removed_estimate <= kvmap_sweep_threshold_blocks() {
+        if removed_estimate <= kvmap_sweep_threshold_blocks() && !partial {
             drop(meta_guard);
             return Ok(false);
         }
@@ -17483,22 +18267,50 @@ impl DataRouter {
             self.overlay_screen_discard(ino, past_cut, &mut overlay_touched);
         }
         // RAM prune — deliberately NO ref staging and NO displaced-key
-        // frees: the durable record/ref/free work for the removed set IS
-        // what defers to the sweep (A2). Tier purges still run — the
-        // sweep will free these offsets and a reallocation under the
-        // same key string must never serve stale tier bytes.
-        let mut map_arc = current.block_map.take().unwrap_or_default();
-        let map = std::sync::Arc::make_mut(&mut map_arc);
-        map.retain(|&b, bk| {
-            if (b as u64) * bs >= new_size {
-                self.cache.purge_block_key(bk);
-                false
-            } else {
-                true
+        // frees for TREE-mapped blocks: the durable record/ref/free work
+        // for the removed set IS what defers to the sweep (A2). Tier
+        // purges still run — the sweep will free these offsets and a
+        // reallocation under the same key string must never serve stale
+        // tier bytes. PR 6c-i: a PARTIAL entry prunes its OVERLAY instead
+        // — un-published mints above the cut are THIS mount's own (the
+        // sweep can never find them in the tree), so they free below
+        // after the guard drops (RES-1); tombstones above the cut drop
+        // (the cursor shadows the whole region).
+        let mut overlay_cut_bindings: Vec<String> = Vec::new();
+        let live_entries;
+        if partial {
+            let k32: u32 = new_size
+                .div_ceil(bs)
+                .min(u64::from(u32::MAX - 1))
+                .try_into()
+                .expect("clamped to u32 range");
+            let _ = self.inner.kvmap_overlays.update_sync(&ino, |_, o| {
+                let cut = o.split_off(&k32);
+                for (_, v) in cut {
+                    if let Some(p) = v {
+                        overlay_cut_bindings.push(p);
+                    }
+                }
+            });
+            for p in &overlay_cut_bindings {
+                self.cache.purge_block_key(p);
             }
-        });
-        let live_entries = map.len() as u64;
-        current.block_map = Some(map_arc);
+            self.kvmap_window_drop(ino);
+            live_entries = 0;
+        } else {
+            let mut map_arc = current.block_map.take().unwrap_or_default();
+            let map = std::sync::Arc::make_mut(&mut map_arc);
+            map.retain(|&b, bk| {
+                if (b as u64) * bs >= new_size {
+                    self.cache.purge_block_key(bk);
+                    false
+                } else {
+                    true
+                }
+            });
+            live_entries = map.len() as u64;
+            current.block_map = Some(map_arc);
+        }
         current.size = new_size;
         // K = the first removed index (design §3): ceil(new_size / bs).
         let k: u32 = new_size
@@ -17515,8 +18327,13 @@ impl DataRouter {
             .await?;
         current.block_map_id = Some(head_id.into());
         current.cached_at = std::time::Instant::now();
-        // The write-map gauge shrank with the prune (PR 6a option b).
-        let est = live_entries.saturating_mul(KVMAP_WRITE_MAP_ENTRY_EST);
+        // The write-map gauge shrank with the prune (PR 6a option b) —
+        // partial entries gauge the pruned overlay.
+        let est = if partial {
+            self.kvmap_overlay_est(ino)
+        } else {
+            live_entries.saturating_mul(KVMAP_WRITE_MAP_ENTRY_EST)
+        };
         match self.inner.kvmap_write_maps.entry_sync(ino) {
             scc::hash_map::Entry::Occupied(mut occ) => *occ.get_mut() = est,
             scc::hash_map::Entry::Vacant(vac) => {
@@ -17530,6 +18347,36 @@ impl DataRouter {
         self.cache.read_lru.remove(file_path);
         drop(meta_guard);
         self.overlay_schedule_retires(ino, overlay_touched);
+        // PR 6c-i: the pruned overlay's un-published mints free AFTER the
+        // guard dropped (RES-1) — purged above, never re-servable.
+        if !overlay_cut_bindings.is_empty() {
+            let cleaned: Vec<String> = overlay_cut_bindings
+                .iter()
+                .map(|k| clean_block_key(k))
+                .collect();
+            self.free_deferred_keys(cleaned).await;
+        }
+        // PR 6c-i (§14 item 4): an UNDER-threshold partial shrink drains
+        // its sweep SYNCHRONOUSLY — bounded ranges (≤ threshold covered
+        // indices, one tx per chunk), never whole-map — preserving the
+        // sync path's frees-before-return semantics. A chunk error falls
+        // back to the job (the durable cursor is the crash-safe plan
+        // either way — never-lossy).
+        if partial && removed_estimate <= kvmap_sweep_threshold_blocks() {
+            loop {
+                match self.kvmap_sweep_chunk(ino, map_migrate_chunk()).await {
+                    Ok(KvmapSweepProgress::Progress { .. }) => continue,
+                    Ok(_) => return Ok(true),
+                    Err(e) => {
+                        log::warn!(
+                            "partial-mode sync sweep of ino {ino} failed ({e}); handing \
+                             the durable cursor to the job fabric"
+                        );
+                        break;
+                    }
+                }
+            }
+        }
         // The coordinator submit (KD-6's live half; the durable cursor is
         // the crash-safe plan the mount adoption scan regenerates from).
         crate::fuse_client::METRICS
@@ -17955,6 +18802,14 @@ impl DataRouter {
             return true;
         }
         let bs = self.block_size.load(Ordering::Relaxed).max(1);
+        // PR 6c-i (§14 item 4): a PARTIAL-mode (or over-budget — the
+        // SIZE-based heuristic, durable-head-derived so the corpse path
+        // never pays a rehydration) kvmap unlink ALWAYS takes the corpse
+        // handoff — the synchronous teardown enumerates the whole map,
+        // which a bounded store cannot and an over-budget one must not.
+        if self.kvmap_partial_mode(ino) || kvmap_size_over_budget(layout.size, bs) {
+            return true;
+        }
         layout.size / bs > kvmap_sweep_threshold_blocks()
     }
 
@@ -18026,6 +18881,20 @@ impl DataRouter {
         // one tx. K = 0: the whole range is the removed set.
         backend.kvmap_truncate_handoff(ino, 0, 0, &refs).await?;
         let _ = self.inner.kvmap_sweep_corpses.insert_sync(ino, ());
+        // PR 6c-i: the corpse's OVERLAY bindings are RAM-only exactly
+        // like the epoch's shadow keys — the sweep can never find them in
+        // the tree, so they free here; the registry and windows go with
+        // the ino.
+        if let Some((_, overlay)) = self.inner.kvmap_overlays.remove_sync(&ino) {
+            for (_, v) in overlay {
+                if let Some(p) = v {
+                    epoch_frees.push(clean_block_key(&p));
+                }
+            }
+            epoch_frees.sort_unstable();
+            epoch_frees.dedup();
+        }
+        self.kvmap_window_drop(ino);
         for key in &epoch_frees {
             self.cache.purge_block_key(key);
         }
@@ -18328,6 +19197,10 @@ impl DataRouter {
 
         self.cache.write_lru.remove(file_path);
         self.cache.read_lru.remove(file_path);
+        // PR 6c-i hygiene: partial-mode inos route through the corpse
+        // handoff, so a registry entry here is clean-by-construction —
+        // it goes with the ino either way.
+        self.kvmap_partial_teardown(parse_inode_from_path(file_path));
         self.metadata_cache
             .invalidate(&parse_inode_from_path(file_path));
         Ok(())

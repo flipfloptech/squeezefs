@@ -372,7 +372,11 @@ async fn a_claims_train_probes_o_claims_not_o_map() {
         "the take claim adopted"
     );
     assert!(
-        rig.kv().get_block_mapping(ino, 100).await.unwrap().is_none(),
+        rig.kv()
+            .get_block_mapping(ino, 100)
+            .await
+            .unwrap()
+            .is_none(),
         "the release claim deleted"
     );
     assert_eq!(
@@ -459,13 +463,576 @@ async fn a_solo_local_claims_train_mints_no_generation() {
 }
 
 // ===========================================================================
-// Later items' contracts (mode heuristic, PartialMiss ≠ Hole, overlay
-// saves, truncate composition) land with their own red/impl pairs below.
+// Shared partial-mode helpers
 // ===========================================================================
 
-/// Placeholder anchor so the suite names the ladder even before the later
-/// rungs' contracts land — deliberately trivially green.
+/// Budget clamp: 64 KiB flag budget ⇒ `kvmap_write_map_budget_bytes()` ≤
+/// 4 KiB ⇒ any map estimate past 64 entries flips PARTIAL. Restores on
+/// drop (the kvmap_run_tests BudgetGuard pattern).
+struct BudgetGuard;
+impl Drop for BudgetGuard {
+    fn drop(&mut self) {
+        squeezefs::mem_budget::MEM_BUDGET.set_flag_budget(0);
+        squeezefs::mem_budget::MEM_BUDGET.tick();
+    }
+}
+
+fn shrink_budget() -> BudgetGuard {
+    squeezefs::mem_budget::MEM_BUDGET.set_flag_budget(64 * 1024);
+    squeezefs::mem_budget::MEM_BUDGET.tick();
+    assert!(squeezefs::routing::kvmap_write_map_budget_bytes() <= 4 * 1024);
+    BudgetGuard
+}
+
+impl Rig {
+    /// The RAW tree-7 records (kinds preserved).
+    async fn raw_records(&self, ino: u64) -> Vec<(u32, MapEntry)> {
+        let mut out = Vec::new();
+        let mut cursor = 0u32;
+        loop {
+            let page = self
+                .kv()
+                .block_map_range(ino, cursor, 512)
+                .await
+                .expect("tree scan");
+            let Some(last) = page.last().map(|(i, _)| *i) else {
+                break;
+            };
+            out.extend(page);
+            cursor = match last.checked_add(1) {
+                Some(n) => n,
+                None => break,
+            };
+        }
+        out
+    }
+
+    /// Per-index expansion with the §2 read-law overlay — the test's own
+    /// independent arithmetic (the kvmap_run_tests helper).
+    async fn expanded_records(&self, ino: u64) -> std::collections::BTreeMap<u32, String> {
+        let stride = self.alloc.chunk_size();
+        let mut out = std::collections::BTreeMap::new();
+        for (idx, entry) in self.raw_records(ino).await {
+            match entry {
+                MapEntry::String(bytes) => {
+                    out.insert(idx, String::from_utf8(bytes).expect("utf8 key"));
+                }
+                MapEntry::Point { offset, .. } => {
+                    out.insert(idx, offset.to_string());
+                }
+                MapEntry::PointStamped {
+                    offset,
+                    incarnation,
+                    ..
+                } => {
+                    out.insert(
+                        idx,
+                        squeezefs::routing::block_key_with_incarnation(
+                            &offset.to_string(),
+                            incarnation,
+                        ),
+                    );
+                }
+                MapEntry::Run {
+                    start_offset, len, ..
+                } => {
+                    for d in 0..len {
+                        out.insert(idx + d, (start_offset + u64::from(d) * stride).to_string());
+                    }
+                }
+                MapEntry::RunStamped {
+                    start_offset,
+                    len,
+                    start_incarnation,
+                    ..
+                } => {
+                    for d in 0..len {
+                        out.insert(
+                            idx + d,
+                            squeezefs::routing::block_key_with_incarnation(
+                                &(start_offset + u64::from(d) * stride).to_string(),
+                                start_incarnation + u64::from(d),
+                            ),
+                        );
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// The C8 oracle: durable-vs-derived, both sides through the shared
+    /// extraction.
+    async fn drift(&self) -> Vec<(String, u64, u32, u32)> {
+        self.router
+            .backend_router
+            .verify_durable_block_refs(&self.routed)
+            .await
+            .expect("verification pass")
+    }
+
+    /// Evict + refetch, answering the fresh entry (the read path's view).
+    async fn refetched(&self, ino: u64) -> squeezefs::routing::CachedMetadata {
+        self.router.metadata_cache.invalidate(&ino);
+        self.router
+            .fetch_metadata(&squeezefs::keys::inode_path(ino))
+            .await
+            .expect("refetch")
+    }
+
+    /// The partial ladder's answers over `[0, upto)` via the authoritative
+    /// span resolve.
+    async fn resolved_span(
+        &self,
+        ino: u64,
+        meta: &squeezefs::routing::CachedMetadata,
+        upto: u32,
+    ) -> std::collections::BTreeMap<u32, String> {
+        let path = squeezefs::keys::inode_path(ino);
+        let keys = self
+            .router
+            .load_striped_block_keys(&path, meta, 0, upto - 1)
+            .await
+            .expect("span resolve");
+        keys.into_iter()
+            .filter_map(|(b, k)| k.map(|k| (b, k)))
+            .collect()
+    }
+}
+
+// ===========================================================================
+// 2. The mode heuristic — SIZE-based, both directions, bounded fetch
+//    (design §14 S1)
+// ===========================================================================
+
+/// Over the budget share the ino flips PARTIAL at its post-publish
+/// republish and the refetch builds the BOUNDED store (no whole-map
+/// materialization — the S1 read-open debt); resolution reads THROUGH the
+/// tree byte-for-byte; restoring the budget flips a CLEAN ino back DOWN
+/// to whole-map RAM verbatim.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_mode_flip_is_size_based_both_directions_with_bounded_fetch() {
+    let _serial = serial();
+    let meta = NamedTempFile::new().unwrap();
+    format_meta_kvmap(meta.path()).await;
+    let data = data_file();
+    let rig = mount(meta.path(), data.path()).await;
+    let ino = rig.mk_file("flip").await;
+    let mut expect: std::collections::BTreeMap<u32, String> = rig
+        .publish_spill(ino, SPILL_BLOCKS)
+        .await
+        .into_iter()
+        .collect();
+    assert!(
+        !rig.router.kvmap_partial_mode(ino),
+        "under the real budget the ino keeps whole-map RAM (byte-identity)"
+    );
+
+    let _budget = shrink_budget();
+    // A growth merge publishes; the CLEAN republish is the §14 flip point.
+    let grow = rig.alloc.allocate_block().await.unwrap();
+    rig.alloc.publish_block(grow);
+    rig.router
+        .merge_block_mappings(
+            ino,
+            BlockMapOp::Merge(&[(SPILL_BLOCKS, grow.to_string())]),
+            u64::from(SPILL_BLOCKS + 1) * BLOCK,
+            LayoutFlip::KeepLayout,
+            rig.token(ino),
+        )
+        .await
+        .expect("over-budget growth merges (EFBIG deleted)");
+    expect.insert(SPILL_BLOCKS, grow.to_string());
+    assert!(
+        rig.router.kvmap_partial_mode(ino),
+        "the post-publish republish flips an over-budget ino PARTIAL"
+    );
+
+    // The bounded fetch: no whole-map materialization…
+    let fetched = rig.refetched(ino).await;
+    assert!(
+        fetched.block_map.is_none(),
+        "a partial fetch materializes NO map (§14 S1)"
+    );
+    assert!(rig.router.kvmap_partial_mode(ino));
+    // …and the ladder reads THROUGH the tree, window-retained.
+    let fills0 = METRICS.block_map_window_fills.load(Ordering::Relaxed);
+    let got = rig.resolved_span(ino, &fetched, SPILL_BLOCKS + 1).await;
+    assert_eq!(
+        got,
+        rig.expanded_records(ino).await,
+        "partial resolution ≡ the tree's own truth"
+    );
+    assert_eq!(got.len() as u32, SPILL_BLOCKS + 1);
+    assert!(
+        METRICS.block_map_window_fills.load(Ordering::Relaxed) > fills0,
+        "the read-through retained warm windows"
+    );
+    assert!(
+        METRICS.block_map_window_bytes.load(Ordering::Relaxed) > 0,
+        "the R5 gauge carries the window bytes"
+    );
+
+    // Both directions: a CLEAN under-budget refetch flips DOWN and
+    // rehydrates whole-map verbatim.
+    squeezefs::mem_budget::MEM_BUDGET.set_flag_budget(0);
+    squeezefs::mem_budget::MEM_BUDGET.tick();
+    let fetched = rig.refetched(ino).await;
+    assert!(
+        !rig.router.kvmap_partial_mode(ino),
+        "a clean under-budget fetch flips back to whole-map"
+    );
+    let whole = fetched.block_map.as_deref().expect("whole map rehydrated");
+    assert_eq!(whole.len() as u32, SPILL_BLOCKS + 1);
+    for (b, k) in &expect {
+        assert_eq!(whole.get(b), Some(k), "whole-map rehydration at {b}");
+    }
+    rig.shutdown().await;
+}
+
+// ===========================================================================
+// 3. PartialMiss ≠ Hole (design §14's silent-wrong bomb rows) +
+//    tombstones never resurrect
+// ===========================================================================
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn partial_miss_reads_through_holes_read_zeros_tombstones_never_resurrect() {
+    let _serial = serial();
+    let meta = NamedTempFile::new().unwrap();
+    format_meta_kvmap(meta.path()).await;
+    let data = data_file();
+    let rig = mount(meta.path(), data.path()).await;
+    let ino = rig.mk_file("sparse").await;
+
+    let _budget = shrink_budget();
+    // A SPARSE over-budget map: [0,600) and [800,1400) mapped, a real
+    // hole between (1,200 entries — past the 64 KiB-node inline cap, the
+    // crossing trigger).
+    let mut entries: Vec<(u32, String)> = Vec::new();
+    for b in (0..600).chain(800..1400) {
+        let off = rig.alloc.allocate_block().await.unwrap();
+        rig.alloc.publish_block(off);
+        entries.push((b, off.to_string()));
+    }
+    rig.router
+        .merge_block_mappings(
+            ino,
+            BlockMapOp::Merge(&entries),
+            1400 * BLOCK,
+            LayoutFlip::ToStripedKeepStagedIdentity,
+            rig.token(ino),
+        )
+        .await
+        .expect("sparse crossing");
+    assert!(rig.router.kvmap_partial_mode(ino), "over-budget ⇒ partial");
+    let fetched = rig.refetched(ino).await;
+    assert!(fetched.block_map.is_none());
+
+    let path = squeezefs::keys::inode_path(ino);
+    let span = rig
+        .router
+        .load_striped_block_keys(&path, &fetched, 0, 1399)
+        .await
+        .expect("span");
+    let by_idx: std::collections::BTreeMap<u32, Option<String>> = span.into_iter().collect();
+    let want: std::collections::BTreeMap<u32, String> = entries.iter().cloned().collect();
+    for b in 0..1400u32 {
+        match want.get(&b) {
+            Some(k) => assert_eq!(
+                by_idx.get(&b).cloned().flatten().as_ref(),
+                Some(k),
+                "a WRITTEN index the overlay lacks reads THROUGH the tree ({b})"
+            ),
+            None => assert_eq!(
+                by_idx.get(&b).cloned().flatten(),
+                None,
+                "an unwritten index is a definitive HOLE ({b})"
+            ),
+        }
+    }
+
+    // The tombstone law: a punch on a partial ino kills the binding —
+    // reads answer zeros and NOTHING (window refill, refetch) resurrects
+    // the displaced tree binding.
+    let punched_off: u64 = want.get(&1000).unwrap().parse().unwrap();
+    rig.router
+        .merge_block_mappings(
+            ino,
+            BlockMapOp::RemoveBlocks(&[1000]),
+            1400 * BLOCK,
+            LayoutFlip::KeepLayout,
+            rig.token(ino),
+        )
+        .await
+        .expect("partial punch never refuses");
+    let fetched = rig.refetched(ino).await;
+    let after = rig.resolved_span(ino, &fetched, 1400).await;
+    assert!(
+        !after.contains_key(&1000),
+        "a tombstoned index reads zeros after publish + refetch (never resurrects)"
+    );
+    assert_eq!(
+        after.get(&999),
+        want.get(&999),
+        "the punch displaced ONLY its own index"
+    );
+    assert!(
+        matches!(rig.alloc.refcount(punched_off), None | Some(0)),
+        "the punched binding's block left the reference ledger"
+    );
+    assert_eq!(rig.drift().await, Vec::new(), "C8 oracle clean");
+    rig.shutdown().await;
+}
+
+// ===========================================================================
+// 4. Overlay saves: only the overlay ships; the train recompute owns
+//    displacement (design §14 S2, option ii)
+// ===========================================================================
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_overlay_save_ships_the_overlay_and_the_recompute_frees_the_displaced_block() {
+    let _serial = serial();
+    let meta = NamedTempFile::new().unwrap();
+    format_meta_kvmap(meta.path()).await;
+    let data = data_file();
+    let rig = mount(meta.path(), data.path()).await;
+    let ino = rig.mk_file("overlay-save").await;
+
+    let _budget = shrink_budget();
+    let entries = rig.publish_spill(ino, SPILL_BLOCKS).await;
+    assert!(rig.router.kvmap_partial_mode(ino));
+    let old_key = entries[5].1.clone();
+    let old_off: u64 = old_key.parse().unwrap();
+    assert_eq!(
+        rig.alloc.refcount(old_off),
+        Some(1),
+        "the spill's own reference"
+    );
+
+    let saves0 = METRICS.kvmap_overlay_saves.load(Ordering::Relaxed);
+    let range0 = META_KV_BLOCK_MAP_LOOKUP_RANGE.load(Ordering::Relaxed);
+    let new_off = rig.alloc.allocate_block().await.unwrap();
+    rig.alloc.publish_block(new_off);
+    let displaced = rig
+        .router
+        .merge_block_mappings(
+            ino,
+            BlockMapOp::Merge(&[(5, new_off.to_string())]),
+            u64::from(SPILL_BLOCKS) * BLOCK,
+            LayoutFlip::KeepLayout,
+            rig.token(ino),
+        )
+        .await
+        .expect("partial overwrite merges");
+    // §14 S2 option ii: the merge stopped capturing tree prev-bindings —
+    // displacement discovery moved WHOLLY to the train's recompute, and
+    // the freed supply rides the publish tail.
+    assert_eq!(
+        displaced,
+        Vec::<String>::new(),
+        "no caller-frame displaced key for a tree binding"
+    );
+    assert!(
+        METRICS.kvmap_overlay_saves.load(Ordering::Relaxed) > saves0,
+        "the publish rode the overlay-save claims train (engagement)"
+    );
+    let expanded = rig.expanded_records(ino).await;
+    assert_eq!(
+        expanded.get(&5),
+        Some(&new_off.to_string()),
+        "the overlay binding adopted durably"
+    );
+    assert!(
+        matches!(rig.alloc.refcount(old_off), None | Some(0)),
+        "the displaced tree binding's block was freed on the publish tail"
+    );
+    // The bounded-probe law held on the steady-state publish path: the
+    // overlay save probed its claims, never the 300-record population
+    // (≤ 1 range page — the routed floor-prepend probe).
+    assert!(
+        META_KV_BLOCK_MAP_LOOKUP_RANGE.load(Ordering::Relaxed) - range0 <= 2,
+        "an overlay save stays claims-bounded"
+    );
+    assert_eq!(rig.drift().await, Vec::new(), "C8 oracle clean");
+    rig.shutdown().await;
+}
+
+// ===========================================================================
+// 5. Truncate composition (design §14 item 4)
+// ===========================================================================
+
+/// A partial-mode truncate NEVER refuses: the under-threshold shrink
+/// takes the 6b size-flip handoff and drains its sweep synchronously via
+/// bounded ranges (records removed, references released, cursor cleared);
+/// a subsequent extend write publishes cleanly past the old cut.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn partial_truncate_never_refuses_and_sweeps_via_bounded_ranges() {
+    let _serial = serial();
+    let meta = NamedTempFile::new().unwrap();
+    format_meta_kvmap(meta.path()).await;
+    let data = data_file();
+    let rig = mount(meta.path(), data.path()).await;
+    let ino = rig.mk_file("partial-trunc").await;
+
+    let _budget = shrink_budget();
+    let entries = rig.publish_spill(ino, SPILL_BLOCKS).await;
+    assert!(rig.router.kvmap_partial_mode(ino));
+    let removed_off: u64 = entries[200].1.parse().unwrap();
+
+    rig.router
+        .truncate_layout(ino, 100 * BLOCK, rig.token(ino))
+        .await
+        .expect("partial-mode truncate never refuses (§14 item 4)");
+    // The sync bounded-range drain ran to terminal: records above the cut
+    // gone, cursor cleared, references released.
+    let head = rig.durable_head(ino).await;
+    assert_eq!(head.size, 100 * BLOCK, "size-flip-first");
+    let parsed = parse_kvmap_head(head.block_map_id.as_deref().unwrap()).unwrap();
+    assert_eq!(
+        parsed.sweep_cursor, None,
+        "the under-threshold sweep drained synchronously to terminal"
+    );
+    let max_idx = rig.raw_records(ino).await.into_iter().map(|(i, _)| i).max();
+    assert!(
+        max_idx.is_some_and(|m| m < 100),
+        "no record survives at/above the cut: {max_idx:?}"
+    );
+    assert!(
+        matches!(rig.alloc.refcount(removed_off), None | Some(0)),
+        "a removed binding's block was released"
+    );
+
+    // Write-during/after-sweep composition: an extend publish past the
+    // old cut lands cleanly (the cursor/extend-barrier law).
+    let grow = rig.alloc.allocate_block().await.unwrap();
+    rig.alloc.publish_block(grow);
+    rig.router
+        .merge_block_mappings(
+            ino,
+            BlockMapOp::Merge(&[(150, grow.to_string())]),
+            151 * BLOCK,
+            LayoutFlip::KeepLayout,
+            rig.token(ino),
+        )
+        .await
+        .expect("post-truncate extend publishes");
+    let fetched = rig.refetched(ino).await;
+    let got = rig.resolved_span(ino, &fetched, 151).await;
+    assert_eq!(got.get(&150), Some(&grow.to_string()));
+    assert_eq!(
+        got.get(&50),
+        Some(&entries[50].1),
+        "below-cut bindings intact"
+    );
+    assert!(
+        !got.contains_key(&120),
+        "the truncated hole between cut and extend stays a hole"
+    );
+    assert_eq!(rig.drift().await, Vec::new(), "C8 oracle clean");
+    rig.shutdown().await;
+}
+
+// ===========================================================================
+// 6. The A/B lever + byte-identity (design §14: `SQUEEZEFS_KVMAP_OVERLAY=0`
+//    = whole-map RAM at any size)
+// ===========================================================================
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn knob_off_keeps_whole_map_ram_at_any_size() {
+    let _serial = serial();
+    std::env::set_var("SQUEEZEFS_KVMAP_OVERLAY", "0");
+    struct KnobGuard;
+    impl Drop for KnobGuard {
+        fn drop(&mut self) {
+            std::env::remove_var("SQUEEZEFS_KVMAP_OVERLAY");
+        }
+    }
+    let _knob = KnobGuard;
+    let meta = NamedTempFile::new().unwrap();
+    format_meta_kvmap(meta.path()).await;
+    let data = data_file();
+    let rig = mount(meta.path(), data.path()).await;
+    let ino = rig.mk_file("knob-off").await;
+
+    let _budget = shrink_budget();
+    let entries = rig.publish_spill(ino, SPILL_BLOCKS).await;
+    assert!(
+        !rig.router.kvmap_partial_mode(ino),
+        "knob off: never partial, at any size (the acceptance bracket control)"
+    );
+    let fetched = rig.refetched(ino).await;
+    let whole = fetched
+        .block_map
+        .as_deref()
+        .expect("whole-map RAM verbatim");
+    assert_eq!(whole.len() as u32, SPILL_BLOCKS);
+    for (b, k) in &entries {
+        assert_eq!(whole.get(b), Some(k));
+    }
+    rig.shutdown().await;
+}
+
+// ===========================================================================
+// 7. The f44 mirror: over-cap REMOUNT content law at the binding level
+//    (design §14 S1 read-open boundedness across sessions)
+// ===========================================================================
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_over_cap_remount_resolves_identical_bindings_without_materializing() {
+    let _serial = serial();
+    let meta = NamedTempFile::new().unwrap();
+    format_meta_kvmap(meta.path()).await;
+    let data = data_file();
+    let _budget = shrink_budget();
+
+    // Session 1: cross + overwrite (the f44 two-session shape's write
+    // half), snapshot the tree truth, unmount clean.
+    let (ino, want) = {
+        let rig = mount(meta.path(), data.path()).await;
+        let ino = rig.mk_file("remount").await;
+        let _ = rig.publish_spill(ino, SPILL_BLOCKS).await;
+        assert!(rig.router.kvmap_partial_mode(ino));
+        let new_off = rig.alloc.allocate_block().await.unwrap();
+        rig.alloc.publish_block(new_off);
+        rig.router
+            .merge_block_mappings(
+                ino,
+                BlockMapOp::Merge(&[(7, new_off.to_string())]),
+                u64::from(SPILL_BLOCKS) * BLOCK,
+                LayoutFlip::KeepLayout,
+                rig.token(ino),
+            )
+            .await
+            .expect("session-1 rewrite");
+        let want = rig.expanded_records(ino).await;
+        assert_eq!(want.len() as u32, SPILL_BLOCKS);
+        rig.shutdown().await;
+        (ino, want)
+    };
+
+    // Session 2: the remount's fetch stays BOUNDED and the ladder answers
+    // the same bindings (the content law at the binding level).
+    let rig = mount(meta.path(), data.path()).await;
+    let fetched = rig.refetched(ino).await;
+    assert!(
+        fetched.block_map.is_none(),
+        "the over-cap remount fetch materializes NO map"
+    );
+    assert!(rig.router.kvmap_partial_mode(ino));
+    let got = rig.resolved_span(ino, &fetched, SPILL_BLOCKS).await;
+    assert_eq!(got, want, "remount binding truth ≡ session 1's tree");
+    assert_eq!(rig.drift().await, Vec::new(), "C8 oracle clean");
+    rig.shutdown().await;
+}
+
+/// The gauges named by §14 item 5 exist on the stats surface (compile-time
+/// pin: the fields are read here exactly as the stats JSON reads them).
 #[test]
 fn suite_anchor() {
     let _ = METRICS.kvmap_write_map_bytes.load(Ordering::Relaxed);
+    let _ = METRICS.kvmap_overlay_saves.load(Ordering::Relaxed);
+    let _ = METRICS.block_map_window_bytes.load(Ordering::Relaxed);
+    let _ = METRICS.block_map_window_fills.load(Ordering::Relaxed);
+    let _ = METRICS.block_map_window_hits.load(Ordering::Relaxed);
+    let _ = METRICS.block_map_window_evictions.load(Ordering::Relaxed);
 }

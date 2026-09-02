@@ -663,6 +663,7 @@ async fn claims_never_partial_adopt_a_run_silently() {
         release: std::collections::BTreeSet::new(),
         // Emulates the SHIPPED (served) train — the gen belt mints.
         served: true,
+        overlay: false,
     };
     rig.kv()
         .migrate_block_map_train(
@@ -714,6 +715,7 @@ async fn claims_never_partial_adopt_a_run_silently() {
         take: std::collections::BTreeSet::new(),
         release,
         served: true,
+        overlay: false,
     };
     rig.kv()
         .migrate_block_map_train(
@@ -774,6 +776,7 @@ async fn claims_never_partial_adopt_a_run_silently() {
                 take: [0u32].into_iter().collect(),
                 release: std::collections::BTreeSet::new(),
                 served: true,
+                overlay: false,
             }),
             ino,
             &entry_key_for_tests,
@@ -934,12 +937,14 @@ async fn stamped_keys_ride_point2_and_run2_with_verbatim_stamps() {
 // 5. The write-map cap (§12 option b)
 // ===========================================================================
 
-/// The honest write-map cap: `kvmap_write_map_bytes` gauges the
-/// write-active kvmap RAM maps, and a merge whose map estimate exceeds
-/// the derived `mem_budget/16` share refuses EFBIG loud (never ENOSPC —
-/// storage exists; the FILE's class is what this mount cannot hold).
+/// PR 6c-i (design §14): the 6a EFBIG refusal is DELETED — the budget
+/// arithmetic became the PARTIAL-mode flip threshold. The gauge still
+/// prices write-active kvmap maps, an over-budget merge SUCCEEDS (the
+/// mode flips at the next clean point — fetch/post-publish), and the
+/// staged records stay intact. The former refusal contract is now the
+/// mode-flip contract (tests/kvmap_bounded_save_tests.rs).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn an_over_budget_kvmap_write_map_refuses_efbig() {
+async fn an_over_budget_kvmap_merge_flips_mode_instead_of_refusing() {
     let _serial = serial();
     let meta = NamedTempFile::new().unwrap();
     format_meta_kvmap(meta.path()).await;
@@ -970,11 +975,9 @@ async fn an_over_budget_kvmap_write_map_refuses_efbig() {
     squeezefs::mem_budget::MEM_BUDGET.tick();
     assert!(squeezefs::routing::kvmap_write_map_budget_bytes() <= 4 * 1024);
 
-    let records_before = rig.raw_records(ino).await;
     let grow = rig.alloc.allocate_block().await.unwrap();
     rig.alloc.publish_block(grow);
-    let refused = rig
-        .router
+    rig.router
         .merge_block_mappings(
             ino,
             BlockMapOp::Merge(&[(SPILL_BLOCKS, grow.to_string())]),
@@ -982,21 +985,13 @@ async fn an_over_budget_kvmap_write_map_refuses_efbig() {
             LayoutFlip::KeepLayout,
             rig.token(ino),
         )
-        .await;
-    match refused {
-        Err(SqueezefsError::Io(e)) => {
-            assert_eq!(
-                e.raw_os_error(),
-                Some(libc::EFBIG),
-                "the cap's errno is EFBIG (the file-class refusal), got {e:?}"
-            );
-        }
-        other => panic!("an over-budget kvmap merge must refuse EFBIG, got {other:?}"),
-    }
+        .await
+        .expect("an over-budget kvmap merge no longer refuses (§14: EFBIG deleted)");
+    let after = rig.expanded_records(ino).await;
     assert_eq!(
-        rig.raw_records(ino).await,
-        records_before,
-        "a refused merge stages nothing"
+        after.get(&SPILL_BLOCKS),
+        Some(&grow.to_string()),
+        "the over-budget growth landed durably"
     );
     rig.shutdown().await;
 }

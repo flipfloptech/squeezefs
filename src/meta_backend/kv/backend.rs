@@ -3206,10 +3206,16 @@ impl KvMetaBackend {
         let durable_gen: Option<u64> = durable_head.as_ref().map(|h| h.gen);
         let durable_cursor: Option<u32> = durable_head.as_ref().and_then(|h| h.sweep_cursor);
         let shipped_size = size;
+        // PR 6c-i: LOCAL claims trains (the §14 overlay saves) are the
+        // size/cursor AUTHORITY exactly like the whole-map train they
+        // replace — the f35 size law and the §12b #5 cursor refusal are
+        // the SHIPPED trains' (a peer's view may lag; the local save
+        // cannot lag itself, it holds the 4a).
+        let served_claims = claims.is_some_and(|c| c.served);
         // The f35 size law on the claims arm: a stale shipper's size never
         // regresses a peer's growth (truncation is the setattr plane's;
-        // the whole-map arms keep caller authority verbatim).
-        let size = if claims.is_some() {
+        // the local arms keep caller authority verbatim).
+        let size = if served_claims {
             size.max(durable_size)
         } else {
             size
@@ -3232,15 +3238,16 @@ impl KvMetaBackend {
                     )));
                 }
             }
-            // PR 6b (design §3/A2): a claims train meeting a live sweep
-            // cursor composes only STRICTLY BELOW it and never grows the
-            // size past the truncate — a size-raising ship or a claim at
-            // a shadowed index would re-expose residue the sweep has not
-            // released (silent stale data, the A1 class). Retried-class:
-            // the shipper refetches and recomposes; the cursor clears
-            // when the sweep (or the authority's own extend barrier)
-            // finishes.
-            if let Some(k) = durable_cursor {
+            // PR 6b (design §3/A2): a SERVED claims train meeting a live
+            // sweep cursor composes only STRICTLY BELOW it and never
+            // grows the size past the truncate — a size-raising ship or a
+            // claim at a shadowed index would re-expose residue the sweep
+            // has not released (silent stale data, the A1 class).
+            // Retried-class: the shipper refetches and recomposes; the
+            // cursor clears when the sweep (or the authority's own extend
+            // barrier) finishes. A LOCAL claims train (PR 6c-i) runs the
+            // extend barrier below instead — it IS the authority.
+            if let Some(k) = durable_cursor.filter(|_| c.served) {
                 let claimed_high = c.take.iter().chain(c.release.iter()).any(|&i| i >= k)
                     || entries.iter().any(|(b, _)| *b >= k);
                 if shipped_size > durable_size || claimed_high {
@@ -3269,7 +3276,10 @@ impl KvMetaBackend {
         // the caller's post-commit reclaim (RES-1).
         let mut swept_records = 0u64;
         let mut swept_freed: Vec<String> = Vec::new();
-        let flip_cursor: Option<u32> = match (claims.is_none(), durable_cursor) {
+        // The barrier ownership law (PR 6c-i): every LOCAL train —
+        // whole-map or claims-scoped — barriers (it holds the 4a and owns
+        // size); SERVED trains never do (they were refused above).
+        let flip_cursor: Option<u32> = match (!served_claims, durable_cursor) {
             (true, Some(k)) => {
                 // `bound == k` is the degenerate barrier: no growth, but
                 // the left-boundary straddler (a run keyed below K whose
@@ -3302,16 +3312,17 @@ impl KvMetaBackend {
             }
             (_, cursor) => cursor,
         };
-        if claims.is_none() {
+        if !served_claims {
             if let Some(k) = flip_cursor {
                 if let Some((b, _)) = entries.iter().find(|(b, _)| *b >= k) {
-                    // Unreachable through the routing layer (the RAM map
-                    // excludes shadowed residue and the barrier covers
-                    // regrowth) — reaching it means a desired binding
-                    // names an index the sweep owns, and committing it
-                    // would strand its superseded record's reference.
+                    // Unreachable through the routing layer (the RAM map /
+                    // overlay excludes shadowed residue and the barrier
+                    // covers regrowth) — reaching it means a desired
+                    // binding names an index the sweep owns, and
+                    // committing it would strand its superseded record's
+                    // reference.
                     return Err(crate::error::SqueezefsError::InvalidOperation(format!(
-                        "whole-map train for ino {ino} desires index {b} at/above the \
+                        "local train for ino {ino} desires index {b} at/above the \
                          live A2 sweep cursor {k} (design §3): the cursor invariant \
                          broke upstream — refusing rather than stranding references"
                     )));
@@ -3599,9 +3610,12 @@ impl KvMetaBackend {
                 let span_end = u64::from(start) + u64::from(len);
                 let mut cursor = start;
                 loop {
-                    let page = self.block_map_range(ino, cursor, chunk).await.map_err(|e| {
-                        self.eio(&format!("block-map dissolve-span scan for ino {ino}: {e}"))
-                    })?;
+                    let page = self
+                        .block_map_range(ino, cursor, chunk)
+                        .await
+                        .map_err(|e| {
+                            self.eio(&format!("block-map dissolve-span scan for ino {ino}: {e}"))
+                        })?;
                     let Some(last) = page.last().map(|(i, _)| *i) else {
                         break;
                     };
@@ -3824,53 +3838,60 @@ impl KvMetaBackend {
         // displaced-free stream.
         let mut recomputed = false;
         let mut released: Vec<super::block_refs::BlockRef> = Vec::new();
-        let staged_refs: Vec<super::block_refs::BlockRefOp> = if claims.is_some() {
-            match super::block_refs::block_ref_resolver() {
-                Some(resolver) => {
-                    recomputed = true;
-                    let mut out: Vec<super::block_refs::BlockRefOp> = Vec::new();
-                    let mut resolve =
-                        |entry: &super::block_map::MapEntry, idx: u32, delta: u32, take: bool| {
-                            let Some(key) = entry_key(entry, delta) else {
-                                super::META_KV_BLOCK_REFS_UNRESOLVED
-                                    .fetch_add(1, Ordering::Relaxed);
-                                return;
-                            };
-                            match resolver(&key, refs_owner, idx) {
-                                Some(r) => {
-                                    if take {
-                                        out.push(super::block_refs::BlockRefOp::taken(r));
-                                    } else {
-                                        out.push(super::block_refs::BlockRefOp::released(r));
-                                        released.push(r);
-                                    }
-                                }
-                                None => {
-                                    super::META_KV_BLOCK_REFS_UNRESOLVED
-                                        .fetch_add(1, Ordering::Relaxed);
-                                }
+        let mut released_keys: Vec<String> = Vec::new();
+        // PR 6c-i: the recompute arms — the rung-19 GLOBAL resolver
+        // (served/mw trains) or, for a LOCAL claims train, the caller's
+        // own `ref_for` (the routing `block_ref_for` closure every mount
+        // installs): a solo overlay save's displacement discovery lives
+        // WHOLLY here (§14 S2 option ii — the merge stopped capturing
+        // tree prev-bindings), so it cannot depend on the mw arm.
+        let resolver_global = super::block_refs::block_ref_resolver();
+        let recompute_armed = claims.is_some_and(|c| resolver_global.is_some() || c.overlay);
+        let staged_refs: Vec<super::block_refs::BlockRefOp> = if recompute_armed {
+            recomputed = true;
+            let mut out: Vec<super::block_refs::BlockRefOp> = Vec::new();
+            let mut resolve =
+                |entry: &super::block_map::MapEntry, idx: u32, delta: u32, take: bool| {
+                    let Some(key) = entry_key(entry, delta) else {
+                        super::META_KV_BLOCK_REFS_UNRESOLVED.fetch_add(1, Ordering::Relaxed);
+                        return;
+                    };
+                    let resolved = match &resolver_global {
+                        Some(resolver) => resolver(&key, refs_owner, idx),
+                        None => ref_for(&key, idx),
+                    };
+                    match resolved {
+                        Some(r) => {
+                            if take {
+                                out.push(super::block_refs::BlockRefOp::taken(r));
+                            } else {
+                                out.push(super::block_refs::BlockRefOp::released(r));
+                                released.push(r);
+                                released_keys.push(key);
                             }
-                        };
-                    for (idx, old, delta) in &displaced {
-                        resolve(old, *idx, *delta, false);
+                        }
+                        None => {
+                            super::META_KV_BLOCK_REFS_UNRESOLVED.fetch_add(1, Ordering::Relaxed);
+                        }
                     }
-                    // Takes are the EXPLICIT adoption ledger — never the
-                    // staged Puts, which since §12 also carry
-                    // binding-preserving dissolve survivors that must
-                    // mint no reference.
-                    for (idx, entry) in &ref_takes {
-                        resolve(entry, *idx, 0, true);
-                    }
-                    out.extend(
-                        block_refs
-                            .iter()
-                            .filter(|o| o.reference.is_map_blob())
-                            .copied(),
-                    );
-                    out
-                }
-                None => block_refs.to_vec(),
+                };
+            for (idx, old, delta) in &displaced {
+                resolve(old, *idx, *delta, false);
             }
+            // Takes are the EXPLICIT adoption ledger — never the
+            // staged Puts, which since §12 also carry
+            // binding-preserving dissolve survivors that must
+            // mint no reference.
+            for (idx, entry) in &ref_takes {
+                resolve(entry, *idx, 0, true);
+            }
+            out.extend(
+                block_refs
+                    .iter()
+                    .filter(|o| o.reference.is_map_blob())
+                    .copied(),
+            );
+            out
         } else {
             block_refs.to_vec()
         };
@@ -3925,6 +3946,7 @@ impl KvMetaBackend {
             gen: committed_gen,
             recomputed,
             released,
+            released_keys,
             sweep_cursor: flip_cursor,
             swept_records,
             swept_freed,
@@ -6920,6 +6942,11 @@ pub struct MapMigrateOutcome {
     /// save's post-guard venue runs them through the shipped-free ladder
     /// (RES-1: never freed under the caller's 3.5 stripe).
     pub released: Vec<super::block_refs::BlockRef>,
+    /// PR 6c-i: the released records' router-true KEYS (index-paired with
+    /// the recompute's release resolves) — the SOLO overlay save's free
+    /// tail (tier purge + deferred key free) consumes these; the mw arms
+    /// keep the `BlockRef` ladder above.
+    pub released_keys: Vec<String>,
     /// PR 6b: the committed head's A2 sweep cursor (`None` = no live
     /// sweep) — the caller's RAM head id republish carries it, so the
     /// CachedMetadata-head-vs-durable skew rule keeps holding mid-sweep.
@@ -7040,6 +7067,14 @@ pub struct MapTrainClaims {
     /// cursor refuses retried-class), local claims trains run the extend
     /// barrier like the whole-map train they replace.
     pub served: bool,
+    /// PR 6c-i (design §14 S2 option ii): `true` ⇔ this is a LOCAL
+    /// OVERLAY save — displacement discovery rides the train's f36b
+    /// recompute through the CALLER's `ref_for` even where the rung-19
+    /// global resolver is unarmed (solo mounts). Only the routing save
+    /// sets it (its `ref_for` is the live `block_ref_for` closure);
+    /// other local claims trains keep the 5b posture — recompute only
+    /// under the global resolver, caller frame preserved otherwise.
+    pub overlay: bool,
 }
 
 /// RAII registration in the in-flight crossing registry (design A3) —

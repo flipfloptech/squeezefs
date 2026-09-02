@@ -1927,6 +1927,12 @@ pub async fn migrate_block_map(
     ref_for: &(dyn Fn(&str, u32) -> Option<crate::meta_backend::kv::block_refs::BlockRef>
           + Send
           + Sync),
+    // PR 6c-i (design §14): a PARTIAL-mode local save's OVERLAY claims —
+    // take = dirty bindings, release = tombstones, `served: false`. The
+    // local arm runs them through the claims-scoped train (bounded by
+    // pre-fix a); the shipped arm ignores them (the wire carries
+    // entries + the refs frame, and the owner derives its claims there).
+    overlay_claims: Option<crate::meta_backend::kv::backend::MapTrainClaims>,
 ) -> Result<crate::meta_backend::kv::backend::MapMigrateOutcome> {
     match owner_of(be, ino)? {
         None => {
@@ -1950,7 +1956,13 @@ pub async fn migrate_block_map(
             // crossing gate stands down to the blob arm instead.
             let live_grants = !serve_window_already_held()
                 && crate::data_grant::custody_owner().is_some_and(|o| o.ino_has_range_grants(ino));
-            let claims = if live_grants {
+            let claims = if let Some(oc) = overlay_claims {
+                // The overlay save (PR 6c-i): the caller's claims ARE the
+                // overlay's own transitions — authoritative under the
+                // held 4a, no frame derivation needed (and the base is a
+                // sticky kvmap head by construction).
+                Some(oc)
+            } else if live_grants {
                 let kvmap_base = match be.getxattr(ino, "layout").await {
                     Ok(Some(bytes)) => crate::layout_wire::decode_layout_any(&bytes)
                         .ok()
@@ -1990,8 +2002,10 @@ pub async fn migrate_block_map(
                     release,
                     // A LOCAL train (§14 S2 pre-fix b): custody arming —
                     // live here by the `live_grants` gate — is what
-                    // mints, never claims-presence.
+                    // mints, never claims-presence. Not an overlay save:
+                    // the 5b recompute posture (global resolver) governs.
                     served: false,
+                    overlay: false,
                 })
             } else {
                 None
@@ -2059,6 +2073,7 @@ pub async fn migrate_block_map(
                         gen,
                         recomputed,
                         released: Vec::new(),
+                        released_keys: Vec::new(),
                         // Shipped trains never barrier (a live cursor on
                         // the owner refuses retried-class instead).
                         sweep_cursor: None,
@@ -3545,6 +3560,7 @@ impl PublishService {
             // A served scoped Put: the mw plane's compose (§14 S2
             // pre-fix b) — mints the belt like every shipped train.
             served: true,
+            overlay: false,
         };
         match self
             .inner
@@ -3702,6 +3718,7 @@ impl PublishService {
                 // A SHIPPED verb executed for a peer: the mw plane's
                 // train — mints the belt (§14 S2 pre-fix b).
                 served: true,
+                overlay: false,
             };
             match self
                 .inner

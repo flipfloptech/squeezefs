@@ -996,3 +996,210 @@ async fn an_over_budget_kvmap_write_map_refuses_efbig() {
     );
     rig.shutdown().await;
 }
+
+// ===========================================================================
+// 6. Emission↔expansion equivalence at every stride (finding 44's
+//    class-catcher: the C8 oracle is content-blind, and both oracle sides
+//    ride the SAME extraction — a units bug in the run arithmetic would
+//    read as healthy everywhere except the served bytes)
+// ===========================================================================
+
+/// The coalescer and the run expansion ride ONE stride census
+/// (`run_stride_for_tag` — the volume's physical chunk stride, NEVER the
+/// logical block size or a hardcoded default). The pin, per stride: the
+/// coalesced records EXPANDED back through the record arithmetic
+/// (`start_offset + stride × delta`, `start_incarnation + delta`)
+/// reproduce the per-index input EXACTLY; contiguous-at-stride inputs
+/// must actually FORM runs (a never-coalescing coalescer passes the
+/// equality vacuously); and offsets contiguous at a FOREIGN stride must
+/// NOT coalesce under this census (the finding-44 suspect class: an arm
+/// assuming the 4 MiB default where the census says 64 KiB resolves
+/// every run neighbour to garbage — either direction of that units bug
+/// goes red here).
+#[test]
+fn run_expansion_equals_emission_at_every_stride() {
+    use squeezefs::meta_backend::coalesce_map_runs;
+    const TAG: u64 = 0xF44;
+
+    /// The test's own independent expansion arithmetic (the
+    /// `expanded_records` precedent — deliberately not the shared
+    /// surface): per-index `(vol_tag, offset, stamp)`, stamp 0 =
+    /// unstamped.
+    fn expand(
+        records: &[(u32, MapEntry)],
+        stride: u64,
+    ) -> std::collections::BTreeMap<u32, (u64, u64, u64)> {
+        let mut out = std::collections::BTreeMap::new();
+        for (idx, e) in records {
+            match e {
+                MapEntry::Point { vol_tag, offset } => {
+                    out.insert(*idx, (*vol_tag, *offset, 0));
+                }
+                MapEntry::PointStamped {
+                    vol_tag,
+                    offset,
+                    incarnation,
+                } => {
+                    out.insert(*idx, (*vol_tag, *offset, *incarnation));
+                }
+                MapEntry::Run {
+                    vol_tag,
+                    start_offset,
+                    len,
+                } => {
+                    for d in 0..*len {
+                        out.insert(idx + d, (*vol_tag, start_offset + stride * u64::from(d), 0));
+                    }
+                }
+                MapEntry::RunStamped {
+                    vol_tag,
+                    start_offset,
+                    len,
+                    start_incarnation,
+                } => {
+                    for d in 0..*len {
+                        out.insert(
+                            idx + d,
+                            (
+                                *vol_tag,
+                                start_offset + stride * u64::from(d),
+                                start_incarnation + u64::from(d),
+                            ),
+                        );
+                    }
+                }
+                MapEntry::String(_) => panic!("no STRING inputs in this pin"),
+            }
+        }
+        out
+    }
+
+    // 64 KiB (the f44 venue's block size), 1 MiB (the field's segment
+    // grain), 4 MiB (the shipped chunk) — the census value governs, so
+    // the arithmetic must hold at ALL of them identically.
+    for stride in [64 * 1024u64, 1 << 20, 4 << 20] {
+        let stride_of = move |tag: u64| (tag == TAG).then_some(stride);
+        let base = 7 * stride;
+
+        // (a) contiguous stamped mints — ONE RunStamped, and back.
+        let stamped: Vec<(u32, MapEntry)> = (0..100u32)
+            .map(|i| {
+                (
+                    i,
+                    MapEntry::PointStamped {
+                        vol_tag: TAG,
+                        offset: base + stride * u64::from(i),
+                        incarnation: 1_000 + u64::from(i),
+                    },
+                )
+            })
+            .collect();
+        let out = coalesce_map_runs(stamped.clone(), &stride_of);
+        assert_eq!(
+            out.len(),
+            1,
+            "stride {stride}: contiguous stamped mints must coalesce, got {out:?}"
+        );
+        assert!(
+            matches!(out[0].1, MapEntry::RunStamped { len: 100, .. }),
+            "stride {stride}: the RUN2 form, got {:?}",
+            out[0]
+        );
+        assert_eq!(
+            expand(&out, stride),
+            expand(&stamped, stride),
+            "stride {stride}: RUN2 expansion must reproduce every stamped mint"
+        );
+
+        // (b) contiguous unstamped — ONE Run, and back.
+        let plain: Vec<(u32, MapEntry)> = (0..100u32)
+            .map(|i| {
+                (
+                    i,
+                    MapEntry::Point {
+                        vol_tag: TAG,
+                        offset: base + stride * u64::from(i),
+                    },
+                )
+            })
+            .collect();
+        let out = coalesce_map_runs(plain.clone(), &stride_of);
+        assert_eq!(out.len(), 1, "stride {stride}: plain run forms");
+        assert_eq!(expand(&out, stride), expand(&plain, stride));
+
+        // (c) adversarial breaks: an offset gap, a stamp discontinuity,
+        // an index gap, and a RUN_LEN_MAX straddle — whatever forms,
+        // the expansion is EXACT.
+        let mut broken: Vec<(u32, MapEntry)> = Vec::new();
+        for i in 0..(RUN_LEN_MAX + 5) {
+            let offset_jump = if i >= 50 { 13 * stride } else { 0 };
+            let inc_jump = if i >= 90 { 7_777 } else { 0 };
+            let idx = if i >= 130 { i + 3 } else { i };
+            broken.push((
+                idx,
+                MapEntry::PointStamped {
+                    vol_tag: TAG,
+                    offset: base + stride * u64::from(i) + offset_jump,
+                    incarnation: 1_000 + u64::from(i) + inc_jump,
+                },
+            ));
+        }
+        let out = coalesce_map_runs(broken.clone(), &stride_of);
+        assert!(
+            out.len() < broken.len(),
+            "stride {stride}: the contiguous spans still coalesce"
+        );
+        assert!(
+            out.iter().all(|(_, e)| e.run_len() <= RUN_LEN_MAX),
+            "stride {stride}: no run exceeds RUN_LEN_MAX"
+        );
+        assert_eq!(
+            expand(&out, stride),
+            expand(&broken, stride),
+            "stride {stride}: adversarial expansion must be index-exact"
+        );
+
+        // (d) the units-bug face: offsets contiguous at a FOREIGN stride
+        // (2×) must never coalesce under THIS census — a coalescer
+        // consulting a default instead of the census would form a run
+        // whose expansion misplaces every neighbour.
+        let foreign: Vec<(u32, MapEntry)> = (0..50u32)
+            .map(|i| {
+                (
+                    i,
+                    MapEntry::Point {
+                        vol_tag: TAG,
+                        offset: base + 2 * stride * u64::from(i),
+                    },
+                )
+            })
+            .collect();
+        let out = coalesce_map_runs(foreign.clone(), &stride_of);
+        assert_eq!(
+            out.len(),
+            foreign.len(),
+            "stride {stride}: foreign-stride offsets must stay points"
+        );
+        assert_eq!(expand(&out, stride), expand(&foreign, stride));
+
+        // (e) an unknown tag never coalesces (emission's loud-refusal
+        // twin of the expansion side's `None`).
+        let unknown: Vec<(u32, MapEntry)> = (0..10u32)
+            .map(|i| {
+                (
+                    i,
+                    MapEntry::Point {
+                        vol_tag: TAG + 1,
+                        offset: base + stride * u64::from(i),
+                    },
+                )
+            })
+            .collect();
+        let out = coalesce_map_runs(unknown.clone(), &stride_of);
+        assert_eq!(
+            out.len(),
+            unknown.len(),
+            "stride {stride}: an unknown tag's mints must stay points"
+        );
+    }
+}

@@ -83,6 +83,15 @@ pub mod numa_core;
 // histograms bucket identically by construction.
 #[path = "../../squeezefs-ipc/src/latency_core.rs"]
 pub mod latency_core;
+// Per-op trace-ring CORE (e2e audit A2) — canonical file in the
+// squeezefs-ipc tree, `#[path]`-included here ONLY (the storage lives in
+// `raw::op_trace`, and the root crate reaches the one ring set through
+// `fuse3::op_trace` rather than a second include — a second `Stage`
+// identity would not be accepted by the stamp API) and by `loom-models`
+// (the SPSC ring is a lock-free core).
+#[path = "../../squeezefs-ipc/src/op_trace_core.rs"]
+pub mod op_trace_core;
+pub use raw::op_trace;
 // The ONE env-knob parsing convention (ENG-10) — canonical file in the
 // squeezefs-ipc tree, `#[path]`-included here (this fork cannot depend on
 // that crate: it is its own excluded workspace root) and by the root crate

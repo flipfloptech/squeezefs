@@ -78,6 +78,11 @@ pub(crate) mod affinity;
 pub mod connection;
 mod filesystem;
 pub mod flags;
+// The per-op trace ring's storage + policy half (e2e audit A2): `pub` —
+// the daemon's `squeezefs::op_trace` layer arms, stamps and drains it
+// through `fuse3::op_trace`, and every hook site below the handler reads
+// the task-scoped current op from here.
+pub mod op_trace;
 pub(crate) mod read_phase;
 pub mod reply;
 mod request;

@@ -42,6 +42,11 @@ pub mod thp;
 pub mod tiering;
 
 pub mod numa;
+// Per-op trace ring, the DAEMON policy layer (e2e audit A2): geometry
+// derivation, arming (knob / admin verb / test seams), the il op-id law
+// and the `.trace` export over the ONE ring set the transport crate owns
+// (`fuse3::op_trace`). A plain comment (the `env_knobs` note below).
+pub mod op_trace;
 
 pub mod assembly_tasks;
 pub mod bench;

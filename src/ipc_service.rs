@@ -247,47 +247,53 @@ pub(crate) fn spawn_read_handoff(
     } else {
         None
     };
-    handoff_spawn_on(arena_node, async move {
-        // Re-seed a cold attr cache so warm workloads return to the
-        // sync fast path after ONE miss demotion (the handler's own
-        // fallback reads the backend but does not populate the cache).
-        if fs.attr_cache.get(&ino).is_none() {
-            fs.refresh_attr_cache(ino).await;
-        }
-        let res = match dest {
-            Some(d) => {
-                IPC_READ_DEST
-                    .scope(d, fs.read(request, ino, 0, offset, len, flags))
-                    .await
+    // op-trace (audit A2): the handoff runs under the il op's scope so
+    // the handler's serve/fill stages join the ring op's chain.
+    let trace_id = op.trace_id;
+    handoff_spawn_on(
+        arena_node,
+        crate::op_trace::scope(trace_id, async move {
+            // Re-seed a cold attr cache so warm workloads return to the
+            // sync fast path after ONE miss demotion (the handler's own
+            // fallback reads the backend but does not populate the cache).
+            if fs.attr_cache.get(&ino).is_none() {
+                fs.refresh_attr_cache(ino).await;
             }
-            None => fs.read(request, ino, 0, offset, len, flags).await,
-        };
-        match res {
-            Ok(reply) => {
-                // In-place check: dest-armed serve legs return bytes
-                // BACKED BY the window base (heap replies — staged/
-                // inline/virtual arms, parked-run rebuilds — still
-                // bounce through `payload.write` below).
-                let in_place = !reply.data.is_empty()
-                    && reply.data.as_ptr() == op.payload.as_base_ptr() as *const u8;
-                if in_place {
-                    METRICS.ipc_read_dest_serves.fetch_add(1, Ordering::Relaxed);
-                } else {
-                    // Into the SNAPSHOT window (§5.3.1: bounds validated
-                    // at dequeue; mid-serve descriptor mutation is inert).
-                    op.payload.write(&reply.data);
+            let res = match dest {
+                Some(d) => {
+                    IPC_READ_DEST
+                        .scope(d, fs.read(request, ino, 0, offset, len, flags))
+                        .await
                 }
-                METRICS.ipc_ops_read.fetch_add(1, Ordering::Relaxed);
-                METRICS
-                    .ipc_bytes_out
-                    .fetch_add(reply.data.len() as u64, Ordering::Relaxed);
-                completion.complete(reply.data.len() as i64);
+                None => fs.read(request, ino, 0, offset, len, flags).await,
+            };
+            match res {
+                Ok(reply) => {
+                    // In-place check: dest-armed serve legs return bytes
+                    // BACKED BY the window base (heap replies — staged/
+                    // inline/virtual arms, parked-run rebuilds — still
+                    // bounce through `payload.write` below).
+                    let in_place = !reply.data.is_empty()
+                        && reply.data.as_ptr() == op.payload.as_base_ptr() as *const u8;
+                    if in_place {
+                        METRICS.ipc_read_dest_serves.fetch_add(1, Ordering::Relaxed);
+                    } else {
+                        // Into the SNAPSHOT window (§5.3.1: bounds validated
+                        // at dequeue; mid-serve descriptor mutation is inert).
+                        op.payload.write(&reply.data);
+                    }
+                    METRICS.ipc_ops_read.fetch_add(1, Ordering::Relaxed);
+                    METRICS
+                        .ipc_bytes_out
+                        .fetch_add(reply.data.len() as u64, Ordering::Relaxed);
+                    completion.complete(reply.data.len() as i64);
+                }
+                Err(errno) => {
+                    completion.complete(i64::from(libc::c_int::from(errno)));
+                }
             }
-            Err(errno) => {
-                completion.complete(i64::from(libc::c_int::from(errno)));
-            }
-        }
-    });
+        }),
+    );
 }
 
 /// The direct-drive WRITE lane's non-ACK-blocking postlude tail
@@ -464,7 +470,10 @@ pub(crate) fn spawn_write_handoff(
     } else {
         0
     };
-    let fut = async move {
+    // op-trace (audit A2): the handoff runs under the il op's scope so
+    // the write handler's pipeline stages join the ring op's chain.
+    let trace_id = op.trace_id;
+    let fut = crate::op_trace::scope(trace_id, async move {
         match fs
             .write(request, ino, 0, offset, severed, write_flags, 0)
             .await
@@ -489,7 +498,7 @@ pub(crate) fn spawn_write_handoff(
                 completion.complete(i64::from(libc::c_int::from(errno)));
             }
         }
-    };
+    });
     if placed && defer_placed_to_sweep {
         // Placed writes defer their handler spawn to end-of-sweep (see
         // PENDING_PLACED_HANDOFFS): the sibling chunks still in this
@@ -1686,6 +1695,10 @@ impl crate::ipc_host::AdminSink for FabricAdminSink {
                         .map(|_| "throttled".into())
                         .map_err(|e| e.to_string())
                 }
+                // e2e audit A2: arm / disarm / inspect the per-op trace
+                // ring live (the `SQUEEZEFS_OP_TRACE` knob's runtime
+                // face; `cat <mnt>/.trace` drains it).
+                "op-trace" => crate::op_trace::admin_verb(&arg),
                 other => Err(format!(
                     "unknown admin verb `{other}` (see docs/design-volume-lifecycle.md §6)"
                 )),

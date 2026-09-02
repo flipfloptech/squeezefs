@@ -813,22 +813,46 @@ impl FuseConnection {
                 // this dispatch loop is one sequential task and each
                 // worker owns its own connection clone, so the
                 // store-then-read pairing per op is exact.
-                if opcode == crate::raw::abi::fuse_opcode::FUSE_READ as u32 {
+                //
+                // op-trace (audit A2): `transport_recv` = the arrival
+                // stamp already in hand, `dispatch` = the pop instant.
+                // READ/WRITE read the clock for `queue_wait` anyway; any
+                // other opcode reads it only when the op is in the
+                // sample (one pointer load otherwise).
+                let is_read = opcode == crate::raw::abi::fuse_opcode::FUSE_READ as u32;
+                let is_write = opcode == crate::raw::abi::fuse_opcode::FUSE_WRITE as u32;
+                let traced = crate::raw::op_trace::traced(inbound.unique);
+                if is_read || is_write || traced != 0 {
                     let now_ns = crate::raw::read_phase::transport_now_ns();
-                    crate::raw::read_phase::read_transport_phase_record(
-                        crate::raw::read_phase::TransportPhase::QueueWait,
-                        std::time::Duration::from_nanos(now_ns.saturating_sub(inbound.arrived_ns)),
-                    );
-                    self.last_read_arrival_ns
-                        .store(inbound.arrived_ns, std::sync::atomic::Ordering::Relaxed);
-                } else if opcode == crate::raw::abi::fuse_opcode::FUSE_WRITE as u32 {
-                    let now_ns = crate::raw::read_phase::transport_now_ns();
-                    crate::raw::read_phase::write_transport_phase_record(
-                        crate::raw::read_phase::TransportPhase::QueueWait,
-                        std::time::Duration::from_nanos(now_ns.saturating_sub(inbound.arrived_ns)),
-                    );
-                    self.last_write_arrival_ns
-                        .store(inbound.arrived_ns, std::sync::atomic::Ordering::Relaxed);
+                    let queue_wait =
+                        std::time::Duration::from_nanos(now_ns.saturating_sub(inbound.arrived_ns));
+                    if is_read {
+                        crate::raw::read_phase::read_transport_phase_record(
+                            crate::raw::read_phase::TransportPhase::QueueWait,
+                            queue_wait,
+                        );
+                        self.last_read_arrival_ns
+                            .store(inbound.arrived_ns, std::sync::atomic::Ordering::Relaxed);
+                    } else if is_write {
+                        crate::raw::read_phase::write_transport_phase_record(
+                            crate::raw::read_phase::TransportPhase::QueueWait,
+                            queue_wait,
+                        );
+                        self.last_write_arrival_ns
+                            .store(inbound.arrived_ns, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    if traced != 0 {
+                        crate::raw::op_trace::stamp(
+                            traced,
+                            crate::raw::op_trace::Stage::TransportRecv,
+                            crate::raw::read_phase::transport_instant(inbound.arrived_ns),
+                        );
+                        crate::raw::op_trace::stamp(
+                            traced,
+                            crate::raw::op_trace::Stage::Dispatch,
+                            crate::raw::read_phase::transport_instant(now_ns),
+                        );
+                    }
                 }
                 // D14: held-slot WRITE deliveries carry an EMPTY
                 // placeholder payload (the body stays in the sparse

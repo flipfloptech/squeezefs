@@ -151,6 +151,12 @@ impl ReplyTx {
     /// Send this request's reply. Never silently drops: a dead reply task
     /// falls back to a direct slot commit (rows 2 and 3).
     pub(crate) async fn send(&mut self, data: FuseData) -> Result<(), ()> {
+        // op-trace `reply_commit` for every opcode WITHOUT an in-place
+        // reply arm (the READ/WRITE arms stamp beside their own
+        // transport-phase clock read): a clock read only for a traced op.
+        if self.owed {
+            crate::raw::op_trace::stamp_now(self.unique, crate::raw::op_trace::Stage::ReplyCommit);
+        }
         self.owed = false;
         let Err(rejected) = self.inner.unbounded_send(FuseReply {
             data,
@@ -1860,7 +1866,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
         let mut resp_sender = self.reply_tx(&request);
         let fs = fs.clone();
 
-        spawn(debug_span!("fuse_lookup"), async move {
+        spawn(debug_span!("fuse_lookup"), request.unique, async move {
             debug!(
                 "lookup unique {} name {:?} in parent {}",
                 request.unique, name, in_header.nodeid
@@ -1932,7 +1938,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
 
         let fs = fs.clone();
 
-        spawn(debug_span!("fuse_forget"), async move {
+        spawn(debug_span!("fuse_forget"), request.unique, async move {
             debug!(
                 "forget unique {} inode {} nlookup {}",
                 request.unique, in_header.nodeid, forget_in.nlookup
@@ -1971,7 +1977,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
         let mut resp_sender = self.reply_tx(&request);
         let fs = fs.clone();
 
-        spawn(debug_span!("fuse_getattr"), async move {
+        spawn(debug_span!("fuse_getattr"), request.unique, async move {
             debug!(
                 "getattr unique {} inode {}",
                 request.unique, in_header.nodeid
@@ -2056,7 +2062,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
         let mut resp_sender = self.reply_tx(&request);
         let fs = fs.clone();
 
-        spawn(debug_span!("fuse_setattr"), async move {
+        spawn(debug_span!("fuse_setattr"), request.unique, async move {
             let set_attr = SetAttr::from(&setattr_in);
 
             let fh = if setattr_in.valid & FATTR_FH > 0 {
@@ -2114,7 +2120,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
         let mut resp_sender = self.reply_tx(&request);
         let fs = fs.clone();
 
-        spawn(debug_span!("fuse_readlink"), async move {
+        spawn(debug_span!("fuse_readlink"), request.unique, async move {
             debug!(
                 "readlink unique {} inode {}",
                 request.unique, in_header.nodeid
@@ -2196,7 +2202,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
         let mut resp_sender = self.reply_tx(&request);
         let fs = fs.clone();
 
-        spawn(debug_span!("fuse_symlink"), async move {
+        spawn(debug_span!("fuse_symlink"), request.unique, async move {
             debug!(
                 "symlink unique {} parent {} name {:?} link {:?}",
                 request.unique, in_header.nodeid, name, link_name
@@ -2287,7 +2293,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
         let mut resp_sender = self.reply_tx(&request);
         let fs = fs.clone();
 
-        spawn(debug_span!("fuse_mknod"), async move {
+        spawn(debug_span!("fuse_mknod"), request.unique, async move {
             debug!(
                 "mknod unique {} parent {} name {:?} {:?}",
                 request.unique, in_header.nodeid, name, mknod_in
@@ -2374,7 +2380,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
         let mut resp_sender = self.reply_tx(&request);
         let fs = fs.clone();
 
-        spawn(debug_span!("fuse_mkdir"), async move {
+        spawn(debug_span!("fuse_mkdir"), request.unique, async move {
             debug!(
                 "mkdir unique {} parent {} name {:?} {:?}",
                 request.unique, in_header.nodeid, name, mkdir_in
@@ -2444,7 +2450,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
         let mut resp_sender = self.reply_tx(&request);
         let fs = fs.clone();
 
-        spawn(debug_span!("fuse_unlink"), async move {
+        spawn(debug_span!("fuse_unlink"), request.unique, async move {
             debug!(
                 "unlink unique {} parent {} name {:?}",
                 request.unique, in_header.nodeid, name
@@ -2496,7 +2502,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
         let mut resp_sender = self.reply_tx(&request);
         let fs = fs.clone();
 
-        spawn(debug_span!("fuse_rmdir"), async move {
+        spawn(debug_span!("fuse_rmdir"), request.unique, async move {
             debug!(
                 "rmdir unique {} parent {} name {:?}",
                 request.unique, in_header.nodeid, name
@@ -2582,7 +2588,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
         let mut resp_sender = self.reply_tx(&request);
         let fs = fs.clone();
 
-        spawn(debug_span!("fuse_rename"), async move {
+        spawn(debug_span!("fuse_rename"), request.unique, async move {
             debug!(
                 "rename unique {} parent {} name {:?} new parent {} new name {:?}",
                 request.unique, in_header.nodeid, name, rename_in.newdir, new_name
@@ -2660,7 +2666,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
         let mut resp_sender = self.reply_tx(&request);
         let fs = fs.clone();
 
-        spawn(debug_span!("fuse_link"), async move {
+        spawn(debug_span!("fuse_link"), request.unique, async move {
             debug!(
                 "link unique {} inode {} new parent {} new name {:?}",
                 request.unique, link_in.oldnodeid, in_header.nodeid, name
@@ -2724,7 +2730,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
         let mut resp_sender = self.reply_tx(&request);
         let fs = fs.clone();
 
-        spawn(debug_span!("fuse_open"), async move {
+        spawn(debug_span!("fuse_open"), request.unique, async move {
             debug!(
                 "open unique {} inode {} flags {} open_flags {}",
                 request.unique, in_header.nodeid, open_in.flags, open_in.open_flags
@@ -2810,7 +2816,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
 
         // Lever 1 (transport-ingress dispatch): same-lane spawn_local when
         // this dispatch loop already runs on a TPC lane — see `spawn_read`.
-        spawn_read(debug_span!("fuse_read"), async move {
+        spawn_read(debug_span!("fuse_read"), request.unique, async move {
             crate::raw::read_phase::read_transport_phase_record(
                 crate::raw::read_phase::TransportPhase::DispatchLag,
                 dispatch_t0.elapsed(),
@@ -2887,11 +2893,21 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
                         crate::raw::read_phase::TransportPhase::TransportTotal,
                         std::time::Duration::from_nanos(now_ns.saturating_sub(arrival_ns)),
                     );
+                    crate::raw::op_trace::stamp(
+                        request.unique,
+                        crate::raw::op_trace::Stage::ReplyCommit,
+                        crate::raw::read_phase::transport_instant(now_ns),
+                    );
                 }
                 return;
             }
 
             let reply_t0 = std::time::Instant::now();
+            crate::raw::op_trace::stamp(
+                request.unique,
+                crate::raw::op_trace::Stage::HandlerReturn,
+                reply_t0,
+            );
             if reply_data.len() > read_in.size as _ {
                 reply_data.truncate(read_in.size as _);
             }
@@ -2942,18 +2958,29 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
             }
             // `reply_commit`: handler returned → reply committed to the
             // transport (in-place arm: the synchronous COMMIT enqueue; the
-            // channel arm measures the hand-off — INIT-phase only).
+            // channel arm measures the hand-off — INIT-phase only). ONE
+            // clock read closes reply_commit, transport_total and the
+            // op-trace `reply_commit` stamp (audit A2's one-read law;
+            // `Instant` and the transport epoch are the same
+            // CLOCK_MONOTONIC on Linux).
+            let now = std::time::Instant::now();
             crate::raw::read_phase::read_transport_phase_record(
                 crate::raw::read_phase::TransportPhase::ReplyCommit,
-                reply_t0.elapsed(),
+                now.saturating_duration_since(reply_t0),
             );
             if arrival_ns > 0 {
-                let now_ns = crate::raw::read_phase::transport_now_ns();
                 crate::raw::read_phase::read_transport_phase_record(
                     crate::raw::read_phase::TransportPhase::TransportTotal,
-                    std::time::Duration::from_nanos(now_ns.saturating_sub(arrival_ns)),
+                    now.saturating_duration_since(crate::raw::read_phase::transport_instant(
+                        arrival_ns,
+                    )),
                 );
             }
+            crate::raw::op_trace::stamp(
+                request.unique,
+                crate::raw::op_trace::Stage::ReplyCommit,
+                now,
+            );
         });
     }
 
@@ -3065,6 +3092,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
 
         spawn(
             debug_span!("fuse_write"),
+            request.unique,
             write_handler_body(
                 fs,
                 reply_conn,
@@ -3084,7 +3112,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
         let mut resp_sender = self.reply_tx(&request);
         let fs = fs.clone();
 
-        spawn(debug_span!("fuse_statfs"), async move {
+        spawn(debug_span!("fuse_statfs"), request.unique, async move {
             debug!(
                 "statfs unique {} inode {}",
                 request.unique, in_header.nodeid
@@ -3147,7 +3175,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
         let mut resp_sender = self.reply_tx(&request);
         let fs = fs.clone();
 
-        spawn(debug_span!("fuse_release"), async move {
+        spawn(debug_span!("fuse_release"), request.unique, async move {
             let flush = release_in.release_flags & FUSE_RELEASE_FLUSH > 0;
 
             debug!(
@@ -3216,7 +3244,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
         let mut resp_sender = self.reply_tx(&request);
         let fs = fs.clone();
 
-        spawn(debug_span!("fuse_fsync"), async move {
+        spawn(debug_span!("fuse_fsync"), request.unique, async move {
             let data_sync = fsync_in.fsync_flags & 1 > 0;
 
             debug!(
@@ -3304,7 +3332,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
         let mut resp_sender = self.reply_tx(&request);
         let fs = fs.clone();
 
-        spawn(debug_span!("fuse_setxattr"), async move {
+        spawn(debug_span!("fuse_setxattr"), request.unique, async move {
             debug!(
                 "setxattr unique {} inode {}",
                 request.unique, in_header.nodeid
@@ -3381,7 +3409,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
         let mut resp_sender = self.reply_tx(&request);
         let fs = fs.clone();
 
-        spawn(debug_span!("fuse_getxattr"), async move {
+        spawn(debug_span!("fuse_getxattr"), request.unique, async move {
             debug!(
                 "getxattr unique {} inode {}",
                 request.unique, in_header.nodeid
@@ -3479,7 +3507,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
         let mut resp_sender = self.reply_tx(&request);
         let fs = fs.clone();
 
-        spawn(debug_span!("fuse_listxattr"), async move {
+        spawn(debug_span!("fuse_listxattr"), request.unique, async move {
             debug!(
                 "listxattr unique {} inode {} size {}",
                 request.unique, in_header.nodeid, listxattr_in.size
@@ -3569,31 +3597,35 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
         let mut resp_sender = self.reply_tx(&request);
         let fs = fs.clone();
 
-        spawn(debug_span!("fuse_removexattr"), async move {
-            debug!(
-                "removexattr unique {} inode {}",
-                request.unique, in_header.nodeid
-            );
+        spawn(
+            debug_span!("fuse_removexattr"),
+            request.unique,
+            async move {
+                debug!(
+                    "removexattr unique {} inode {}",
+                    request.unique, in_header.nodeid
+                );
 
-            let resp_value =
-                if let Err(err) = fs.removexattr(request, in_header.nodeid, &name).await {
-                    err.into()
-                } else {
-                    0
+                let resp_value =
+                    if let Err(err) = fs.removexattr(request, in_header.nodeid, &name).await {
+                        err.into()
+                    } else {
+                        0
+                    };
+
+                let out_header = fuse_out_header {
+                    len: FUSE_OUT_HEADER_SIZE as u32,
+                    error: resp_value,
+                    unique: request.unique,
                 };
 
-            let out_header = fuse_out_header {
-                len: FUSE_OUT_HEADER_SIZE as u32,
-                error: resp_value,
-                unique: request.unique,
-            };
+                let data = get_bincode_config()
+                    .serialize(&out_header)
+                    .expect("won't happened");
 
-            let data = get_bincode_config()
-                .serialize(&out_header)
-                .expect("won't happened");
-
-            let _ = resp_sender.send(Either::Left(data)).await;
-        });
+                let _ = resp_sender.send(Either::Left(data)).await;
+            },
+        );
     }
 
     #[instrument(level = "debug", skip(self, data, fs))]
@@ -3622,7 +3654,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
         let mut resp_sender = self.reply_tx(&request);
         let fs = fs.clone();
 
-        spawn(debug_span!("fuse_flush"), async move {
+        spawn(debug_span!("fuse_flush"), request.unique, async move {
             debug!(
                 "flush unique {} inode {} fh {} lock_owner {}",
                 request.unique, in_header.nodeid, flush_in.fh, flush_in.lock_owner
@@ -3677,7 +3709,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
         let mut resp_sender = self.reply_tx(&request);
         let fs = fs.clone();
 
-        spawn(debug_span!("fuse_opendir"), async move {
+        spawn(debug_span!("fuse_opendir"), request.unique, async move {
             debug!(
                 "opendir unique {} inode {} flags {}",
                 request.unique, in_header.nodeid, open_in.flags
@@ -3746,7 +3778,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
         let mut resp_sender = self.reply_tx(&request);
         let fs = fs.clone();
 
-        spawn(debug_span!("fuse_readdir"), async move {
+        spawn(debug_span!("fuse_readdir"), request.unique, async move {
             debug!(
                 "readdir unique {} inode {} fh {} offset {}",
                 request.unique, in_header.nodeid, read_in.fh, read_in.offset
@@ -3857,7 +3889,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
         let mut resp_sender = self.reply_tx(&request);
         let fs = fs.clone();
 
-        spawn(debug_span!("fuse_releasedir"), async move {
+        spawn(debug_span!("fuse_releasedir"), request.unique, async move {
             debug!(
                 "releasedir unique {} inode {} fh {} flags {}",
                 request.unique, in_header.nodeid, release_in.fh, release_in.flags
@@ -3912,7 +3944,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
         let mut resp_sender = self.reply_tx(&request);
         let fs = fs.clone();
 
-        spawn(debug_span!("fuse_fsyncdir"), async move {
+        spawn(debug_span!("fuse_fsyncdir"), request.unique, async move {
             let data_sync = fsync_in.fsync_flags & 1 > 0;
 
             debug!(
@@ -3970,7 +4002,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
         let mut resp_sender = self.reply_tx(&request);
         let fs = fs.clone();
 
-        spawn(debug_span!("fuse_getlk"), async move {
+        spawn(debug_span!("fuse_getlk"), request.unique, async move {
             debug!(
                 "getlk unique {} inode {} {:?}",
                 request.unique, in_header.nodeid, getlk_in
@@ -4053,7 +4085,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
         let mut resp_sender = self.reply_tx(&request);
         let fs = fs.clone();
 
-        spawn(debug_span!("fuse_setlk"), async move {
+        spawn(debug_span!("fuse_setlk"), request.unique, async move {
             debug!(
                 "setlk unique {} inode {} block {} {:?}",
                 request.unique, in_header.nodeid, block, setlk_in
@@ -4118,7 +4150,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
         let mut resp_sender = self.reply_tx(&request);
         let fs = fs.clone();
 
-        spawn(debug_span!("fuse_access"), async move {
+        spawn(debug_span!("fuse_access"), request.unique, async move {
             debug!(
                 "access unique {} inode {} mask {}",
                 request.unique, in_header.nodeid, access_in.mask
@@ -4190,7 +4222,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
         let mut resp_sender = self.reply_tx(&request);
         let fs = fs.clone();
 
-        spawn(debug_span!("fuse_create"), async move {
+        spawn(debug_span!("fuse_create"), request.unique, async move {
             debug!(
                 "create unique {} parent {} name {:?} mode {} flags {}",
                 request.unique, in_header.nodeid, name, create_in.mode, create_in.flags
@@ -4269,7 +4301,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
 
         let fs = fs.clone();
 
-        spawn(debug_span!("fuse_interrupt"), async move {
+        spawn(debug_span!("fuse_interrupt"), request.unique, async move {
             debug!(
                 "interrupt_in unique {} interrupt unique {}",
                 request.unique, interrupt_in.unique
@@ -4311,7 +4343,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
         let mut resp_sender = self.reply_tx(&request);
         let fs = fs.clone();
 
-        spawn(debug_span!("fuse_bmap"), async move {
+        spawn(debug_span!("fuse_bmap"), request.unique, async move {
             debug!(
                 "bmap unique {} inode {} block size {} idx {}",
                 request.unique, in_header.nodeid, bmap_in.blocksize, bmap_in.block
@@ -4371,7 +4403,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
         let mut resp_sender = self.reply_tx(&request);
         let fs = fs.clone();
 
-        spawn(debug_span!("fuse_ioctl"), async move {
+        spawn(debug_span!("fuse_ioctl"), request.unique, async move {
             debug!(
                 "ioctl unique {} inode {} cmd {}",
                 request.unique, in_header.nodeid, ioctl_in.cmd
@@ -4456,7 +4488,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
 
         let notify = self.get_notify();
 
-        spawn(debug_span!("fuse_poll"), async move {
+        spawn(debug_span!("fuse_poll"), request.unique, async move {
             debug!(
                 "poll unique {} inode {} {:?}",
                 request.unique, in_header.nodeid, poll_in
@@ -4558,19 +4590,23 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
 
         let fs = fs.clone();
 
-        spawn(debug_span!("fuse_notify_reply"), async move {
-            if let Err(err) = fs
-                .notify_reply(
-                    request,
-                    in_header.nodeid,
-                    notify_retrieve_in.offset,
-                    data.into(),
-                )
-                .await
-            {
-                reply_error_in_place(err, request, resp_sender).await;
-            }
-        });
+        spawn(
+            debug_span!("fuse_notify_reply"),
+            request.unique,
+            async move {
+                if let Err(err) = fs
+                    .notify_reply(
+                        request,
+                        in_header.nodeid,
+                        notify_retrieve_in.offset,
+                        data.into(),
+                    )
+                    .await
+                {
+                    reply_error_in_place(err, request, resp_sender).await;
+                }
+            },
+        );
     }
 
     #[instrument(level = "debug", skip(self, data, fs))]
@@ -4636,21 +4672,25 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
 
         let fs = fs.clone();
 
-        spawn(debug_span!("fuse_batch_forget"), async move {
-            // FUSE-3k: carry the PER-ENTRY nlookup. `fuse_forget_one` is
-            // `{ nodeid, nlookup }` and the second word used to be dropped
-            // here, so a filesystem keeping lookup references could not
-            // honor them on the one path that returns them in bulk.
-            let inodes = forgets
-                .into_iter()
-                .map(|forget_one| (forget_one.nodeid, forget_one.nlookup))
-                .collect::<Vec<_>>();
+        spawn(
+            debug_span!("fuse_batch_forget"),
+            request.unique,
+            async move {
+                // FUSE-3k: carry the PER-ENTRY nlookup. `fuse_forget_one` is
+                // `{ nodeid, nlookup }` and the second word used to be dropped
+                // here, so a filesystem keeping lookup references could not
+                // honor them on the one path that returns them in bulk.
+                let inodes = forgets
+                    .into_iter()
+                    .map(|forget_one| (forget_one.nodeid, forget_one.nlookup))
+                    .collect::<Vec<_>>();
 
-            debug!("batch_forget unique {} inodes {:?}", request.unique, inodes);
+                debug!("batch_forget unique {} inodes {:?}", request.unique, inodes);
 
-            // Over-uring: ring entry already COMMITed in the queue worker (noreply).
-            fs.batch_forget(request, &inodes).await
-        });
+                // Over-uring: ring entry already COMMITed in the queue worker (noreply).
+                fs.batch_forget(request, &inodes).await
+            },
+        );
     }
 
     #[instrument(level = "debug", skip(self, data, fs))]
@@ -4679,7 +4719,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
         let mut resp_sender = self.reply_tx(&request);
         let fs = fs.clone();
 
-        spawn(debug_span!("fuse_fallocate"), async move {
+        spawn(debug_span!("fuse_fallocate"), request.unique, async move {
             debug!(
                 "fallocate unique {} inode {} {:?}",
                 request.unique, in_header.nodeid, fallocate_in
@@ -4741,108 +4781,112 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
         let mut resp_sender = self.reply_tx(&request);
         let fs = fs.clone();
 
-        spawn(debug_span!("fuse_readdirplus"), async move {
-            debug!(
-                "readdirplus unique {} parent {} {:?}",
-                request.unique, in_header.nodeid, readdirplus_in
-            );
+        spawn(
+            debug_span!("fuse_readdirplus"),
+            request.unique,
+            async move {
+                debug!(
+                    "readdirplus unique {} parent {} {:?}",
+                    request.unique, in_header.nodeid, readdirplus_in
+                );
 
-            let directory_plus = match fs
-                .readdirplus(
-                    request,
-                    in_header.nodeid,
-                    readdirplus_in.fh,
-                    readdirplus_in.offset,
-                    readdirplus_in.lock_owner,
-                )
-                .await
-            {
-                Err(err) => {
-                    reply_error_in_place(err, request, resp_sender).await;
-
-                    return;
-                }
-
-                Ok(directory_plus) => directory_plus,
-            };
-
-            let max_size = readdirplus_in.size as usize;
-
-            let mut entry_data = Vec::with_capacity(max_size);
-
-            let entries = directory_plus.entries;
-            let mut entries = pin!(entries);
-
-            while let Some(entry) = entries.next().await {
-                let entry = match entry {
+                let directory_plus = match fs
+                    .readdirplus(
+                        request,
+                        in_header.nodeid,
+                        readdirplus_in.fh,
+                        readdirplus_in.offset,
+                        readdirplus_in.lock_owner,
+                    )
+                    .await
+                {
                     Err(err) => {
                         reply_error_in_place(err, request, resp_sender).await;
 
                         return;
                     }
 
-                    Ok(entry) => entry,
+                    Ok(directory_plus) => directory_plus,
                 };
 
-                let name = &entry.name;
+                let max_size = readdirplus_in.size as usize;
 
-                let dir_entry_size = FUSE_DIRENTPLUS_SIZE + name.len();
+                let mut entry_data = Vec::with_capacity(max_size);
 
-                let padding_size = get_padding_size(dir_entry_size);
+                let entries = directory_plus.entries;
+                let mut entries = pin!(entries);
 
-                if entry_data.len() + dir_entry_size > max_size {
-                    break;
+                while let Some(entry) = entries.next().await {
+                    let entry = match entry {
+                        Err(err) => {
+                            reply_error_in_place(err, request, resp_sender).await;
+
+                            return;
+                        }
+
+                        Ok(entry) => entry,
+                    };
+
+                    let name = &entry.name;
+
+                    let dir_entry_size = FUSE_DIRENTPLUS_SIZE + name.len();
+
+                    let padding_size = get_padding_size(dir_entry_size);
+
+                    if entry_data.len() + dir_entry_size > max_size {
+                        break;
+                    }
+
+                    let attr = entry.attr;
+
+                    let dir_entry = fuse_direntplus {
+                        entry_out: fuse_entry_out {
+                            nodeid: attr.ino,
+                            generation: entry.generation,
+                            entry_valid: entry.entry_ttl.as_secs(),
+                            attr_valid: entry.attr_ttl.as_secs(),
+                            entry_valid_nsec: entry.entry_ttl.subsec_nanos(),
+                            attr_valid_nsec: entry.attr_ttl.subsec_nanos(),
+                            attr: attr.into(),
+                        },
+                        dirent: fuse_dirent {
+                            ino: entry.inode,
+                            off: entry.offset as u64,
+                            namelen: name.len() as u32,
+                            // learn from fuse-rs and golang bazil.org fuse DirentType
+                            r#type: mode_from_kind_and_perm(entry.kind, 0) >> 12,
+                        },
+                    };
+
+                    get_bincode_config()
+                        .serialize_into(&mut entry_data, &dir_entry)
+                        .expect("won't happened");
+
+                    entry_data.extend_from_slice(name.as_bytes());
+
+                    // padding
+                    entry_data.resize(entry_data.len() + padding_size, 0);
                 }
 
-                let attr = entry.attr;
+                // TODO find a way to avoid multi allocate
 
-                let dir_entry = fuse_direntplus {
-                    entry_out: fuse_entry_out {
-                        nodeid: attr.ino,
-                        generation: entry.generation,
-                        entry_valid: entry.entry_ttl.as_secs(),
-                        attr_valid: entry.attr_ttl.as_secs(),
-                        entry_valid_nsec: entry.entry_ttl.subsec_nanos(),
-                        attr_valid_nsec: entry.attr_ttl.subsec_nanos(),
-                        attr: attr.into(),
-                    },
-                    dirent: fuse_dirent {
-                        ino: entry.inode,
-                        off: entry.offset as u64,
-                        namelen: name.len() as u32,
-                        // learn from fuse-rs and golang bazil.org fuse DirentType
-                        r#type: mode_from_kind_and_perm(entry.kind, 0) >> 12,
-                    },
+                let out_header = fuse_out_header {
+                    len: (FUSE_OUT_HEADER_SIZE + entry_data.len()) as u32,
+                    error: 0,
+                    unique: request.unique,
                 };
 
+                let mut data = Vec::with_capacity(FUSE_OUT_HEADER_SIZE);
+
                 get_bincode_config()
-                    .serialize_into(&mut entry_data, &dir_entry)
+                    .serialize_into(&mut data, &out_header)
                     .expect("won't happened");
 
-                entry_data.extend_from_slice(name.as_bytes());
-
-                // padding
-                entry_data.resize(entry_data.len() + padding_size, 0);
-            }
-
-            // TODO find a way to avoid multi allocate
-
-            let out_header = fuse_out_header {
-                len: (FUSE_OUT_HEADER_SIZE + entry_data.len()) as u32,
-                error: 0,
-                unique: request.unique,
-            };
-
-            let mut data = Vec::with_capacity(FUSE_OUT_HEADER_SIZE);
-
-            get_bincode_config()
-                .serialize_into(&mut data, &out_header)
-                .expect("won't happened");
-
-            let _ = resp_sender
-                .send(Either::Right((data, entry_data.into(), None)))
-                .await;
-        });
+                let _ = resp_sender
+                    .send(Either::Right((data, entry_data.into(), None)))
+                    .await;
+            },
+        );
     }
 
     #[instrument(level = "debug", skip(self, data, fs))]
@@ -4905,7 +4949,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
         let mut resp_sender = self.reply_tx(&request);
         let fs = fs.clone();
 
-        spawn(debug_span!("fuse_rename2"), async move {
+        spawn(debug_span!("fuse_rename2"), request.unique, async move {
             debug!(
                 "rename2 unique {} parent {} name {:?} new parent {} new name {:?} flags {}",
                 request.unique,
@@ -4973,7 +5017,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
 
         let fs = fs.clone();
 
-        spawn(debug_span!("fuse_lseek"), async move {
+        spawn(debug_span!("fuse_lseek"), request.unique, async move {
             debug!(
                 "lseek unique {} inode {} {:?}",
                 request.unique, in_header.nodeid, lseek_in
@@ -5048,54 +5092,58 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
 
         let fs = fs.clone();
 
-        spawn(debug_span!("fuse_copy_file_range"), async move {
-            debug!(
-                "reply_copy_file_range unique {} inode {} {:?}",
-                request.unique, in_header.nodeid, copy_file_range_in
-            );
+        spawn(
+            debug_span!("fuse_copy_file_range"),
+            request.unique,
+            async move {
+                debug!(
+                    "reply_copy_file_range unique {} inode {} {:?}",
+                    request.unique, in_header.nodeid, copy_file_range_in
+                );
 
-            let reply_copy_file_range = match fs
-                .copy_file_range(
-                    request,
-                    in_header.nodeid,
-                    copy_file_range_in.fh_in,
-                    copy_file_range_in.off_in,
-                    copy_file_range_in.nodeid_out,
-                    copy_file_range_in.fh_out,
-                    copy_file_range_in.off_out,
-                    copy_file_range_in.len,
-                    copy_file_range_in.flags,
-                )
-                .await
-            {
-                Err(err) => {
-                    reply_error_in_place(err, request, resp_sender).await;
+                let reply_copy_file_range = match fs
+                    .copy_file_range(
+                        request,
+                        in_header.nodeid,
+                        copy_file_range_in.fh_in,
+                        copy_file_range_in.off_in,
+                        copy_file_range_in.nodeid_out,
+                        copy_file_range_in.fh_out,
+                        copy_file_range_in.off_out,
+                        copy_file_range_in.len,
+                        copy_file_range_in.flags,
+                    )
+                    .await
+                {
+                    Err(err) => {
+                        reply_error_in_place(err, request, resp_sender).await;
 
-                    return;
-                }
+                        return;
+                    }
 
-                Ok(reply_copy_file_range) => reply_copy_file_range,
-            };
+                    Ok(reply_copy_file_range) => reply_copy_file_range,
+                };
 
-            let write_out: fuse_write_out = reply_copy_file_range.into();
+                let write_out: fuse_write_out = reply_copy_file_range.into();
 
-            let out_header = fuse_out_header {
-                len: (FUSE_OUT_HEADER_SIZE + FUSE_WRITE_OUT_SIZE) as u32,
-                error: 0,
-                unique: request.unique,
-            };
+                let out_header = fuse_out_header {
+                    len: (FUSE_OUT_HEADER_SIZE + FUSE_WRITE_OUT_SIZE) as u32,
+                    error: 0,
+                    unique: request.unique,
+                };
 
-            let mut data = Vec::with_capacity(FUSE_OUT_HEADER_SIZE + FUSE_WRITE_OUT_SIZE);
+                let mut data = Vec::with_capacity(FUSE_OUT_HEADER_SIZE + FUSE_WRITE_OUT_SIZE);
 
-            get_bincode_config()
-                .serialize_into(&mut data, &out_header)
-                .expect("won't happened");
-            get_bincode_config()
-                .serialize_into(&mut data, &write_out)
-                .expect("won't happened");
+                get_bincode_config()
+                    .serialize_into(&mut data, &out_header)
+                    .expect("won't happened");
+                get_bincode_config()
+                    .serialize_into(&mut data, &write_out)
+                    .expect("won't happened");
 
-            let _ = resp_sender.send(Either::Left(data)).await;
-        });
+                let _ = resp_sender.send(Either::Left(data)).await;
+            },
+        );
     }
 }
 
@@ -5149,6 +5197,11 @@ async fn write_handler_body<FS: Filesystem + Send + Sync + 'static>(
     };
 
     let reply_t0 = std::time::Instant::now();
+    crate::raw::op_trace::stamp(
+        request.unique,
+        crate::raw::op_trace::Stage::HandlerReturn,
+        reply_t0,
+    );
     let write_out: fuse_write_out = reply_write.into();
 
     let out_header = fuse_out_header {
@@ -5197,18 +5250,25 @@ async fn write_handler_body<FS: Filesystem + Send + Sync + 'static>(
     }
     // `reply_commit`: handler returned → reply committed to the
     // transport (in-place arm: the synchronous COMMIT enqueue;
-    // the channel arm measures the hand-off — INIT-phase only).
+    // the channel arm measures the hand-off — INIT-phase only). ONE
+    // clock read closes reply_commit, transport_total and the op-trace
+    // `reply_commit` stamp (audit A2's one-read law).
+    let now = std::time::Instant::now();
     crate::raw::read_phase::write_transport_phase_record(
         crate::raw::read_phase::TransportPhase::ReplyCommit,
-        reply_t0.elapsed(),
+        now.saturating_duration_since(reply_t0),
     );
     if arrival_ns > 0 {
-        let now_ns = crate::raw::read_phase::transport_now_ns();
         crate::raw::read_phase::write_transport_phase_record(
             crate::raw::read_phase::TransportPhase::TransportTotal,
-            std::time::Duration::from_nanos(now_ns.saturating_sub(arrival_ns)),
+            now.saturating_duration_since(crate::raw::read_phase::transport_instant(arrival_ns)),
         );
     }
+    crate::raw::op_trace::stamp(
+        request.unique,
+        crate::raw::op_trace::Stage::ReplyCommit,
+        now,
+    );
 }
 
 /// One FUSED WRITE handler invocation (zc-write-fusion campaign): the
@@ -5333,16 +5393,32 @@ async fn fused_write_future<FS: Filesystem + Send + Sync + 'static>(
             return;
         }
     }
-    write_handler_body(
-        fs,
-        Some(conn),
-        resp_sender,
-        request,
-        in_header.nodeid,
-        write_in,
-        payload,
-        mint_t0,
-        arrived_ns,
+    // The fused venue has no `spawn`: the op-trace scope wraps the body
+    // here (the dispatch-pop stamps ride the same `traced` decision).
+    let traced = crate::raw::op_trace::traced(request.unique);
+    if traced != 0 {
+        if arrived_ns > 0 {
+            crate::raw::op_trace::stamp(
+                traced,
+                crate::raw::op_trace::Stage::TransportRecv,
+                crate::raw::read_phase::transport_instant(arrived_ns),
+            );
+        }
+        crate::raw::op_trace::stamp(traced, crate::raw::op_trace::Stage::Dispatch, mint_t0);
+    }
+    handler_scope(
+        request.unique,
+        write_handler_body(
+            fs,
+            Some(conn),
+            resp_sender,
+            request,
+            in_header.nodeid,
+            write_in,
+            payload,
+            mint_t0,
+            arrived_ns,
+        ),
     )
     .await
 }
@@ -5815,41 +5891,63 @@ fn same_lane_dispatch_enabled() -> bool {
 /// the lever on), else through the global rotation. READ-path dispatch
 /// uses this; other opcodes keep the rotation until their venues are
 /// measured.
+///
+/// `unique` is the request's op id (audit A2): the handler future runs
+/// under an [`op_trace::scope`] bound to it, so every hook below the
+/// handler — router, device funnel, conveyor — reads the op it serves
+/// from the task-scoped current op; the scope's first poll stamps
+/// `handler_entry`. An unsampled (or disarmed) op binds 0 and the scope
+/// is a plain field compare per poll.
 #[inline]
-fn spawn_read<F>(span: Span, fut: F)
+fn spawn_read<F>(span: Span, unique: u64, fut: F)
 where
     F: Future + Send + 'static,
     F::Output: Send + 'static,
 {
     #[cfg(feature = "tokio-runtime")]
     {
+        let fut = handler_scope(unique, fut.instrument(span));
         if same_lane_dispatch_enabled() && IS_TPC_LANE.with(|c| c.get()) {
             let lane = CURRENT_LANE.with(|c| c.borrow().clone());
             if let Some(lane) = lane {
                 lane.spawn(async move {
-                    let _ = fut.instrument(span).await;
+                    let _ = fut.await;
                 });
                 return;
             }
         }
         TPC_SCHEDULER.spawn(async move {
-            let _ = fut.instrument(span).await;
+            let _ = fut.await;
         });
     }
 }
 
+/// See [`spawn_read`] for `unique`.
 #[inline]
-fn spawn<F>(span: Span, fut: F)
+fn spawn<F>(span: Span, unique: u64, fut: F)
 where
     F: Future + Send + 'static,
     F::Output: Send + 'static,
 {
     #[cfg(feature = "tokio-runtime")]
     {
+        let fut = handler_scope(unique, fut.instrument(span));
         TPC_SCHEDULER.spawn(async move {
-            let _ = fut.instrument(span).await;
+            let _ = fut.await;
         });
     }
+}
+
+/// The handler future's op-trace scope (audit A2): bound to `unique`
+/// iff the op is in the sample, stamping `handler_entry` on its first
+/// poll.
+#[inline]
+fn handler_scope<F: Future>(unique: u64, fut: F) -> crate::raw::op_trace::OpScope<F> {
+    crate::raw::op_trace::scope_with_entry(
+        unique,
+        Some(crate::raw::op_trace::Stage::HandlerEntry),
+        fut,
+    )
 }
 
 pub fn tpc_spawn<F>(fut: F)

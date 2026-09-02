@@ -26,7 +26,7 @@ use std::sync::OnceLock;
 
 pub use fuse3::op_trace::{
     current_op, divisor, drain, dropped, is_armed, samples_total, scope, scope_with_entry, stamp,
-    stamp_current, stamp_now, traced, ArmConfig, OpScope, Sample, Stage, TracedBatch,
+    stamp_current, stamp_mono, stamp_now, traced, ArmConfig, OpScope, Sample, Stage, TracedBatch,
 };
 
 /// The IL namespace bit: il ring op ids carry it, kernel `unique`s never

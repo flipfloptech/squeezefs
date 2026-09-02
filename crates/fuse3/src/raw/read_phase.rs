@@ -235,12 +235,21 @@ pub fn write_transport_phase_snapshot() -> [PhaseSnapshot; PHASES] {
 /// in atomics; one shared epoch so spans compose across the reap → pop →
 /// handler → reply chain).
 pub(crate) fn transport_now_ns() -> u64 {
+    transport_epoch().elapsed().as_nanos().min(u64::MAX as u128) as u64
+}
+
+fn transport_epoch() -> &'static Instant {
     static EPOCH: OnceLock<Instant> = OnceLock::new();
-    EPOCH
-        .get_or_init(Instant::now)
-        .elapsed()
-        .as_nanos()
-        .min(u64::MAX as u128) as u64
+    EPOCH.get_or_init(Instant::now)
+}
+
+/// The `Instant` a [`transport_now_ns`] stamp names (epoch + ns — pure
+/// arithmetic, no clock read): the form the op-trace hooks take, so a
+/// stamp already read for a phase histogram is passed through instead
+/// of read again (audit A2's one-clock-read law).
+#[inline]
+pub(crate) fn transport_instant(ns: u64) -> Instant {
+    *transport_epoch() + Duration::from_nanos(ns)
 }
 
 static READ_INPLACE_REPLIES: AtomicU64 = AtomicU64::new(0);

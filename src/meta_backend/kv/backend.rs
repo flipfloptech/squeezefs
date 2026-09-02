@@ -7171,6 +7171,9 @@ struct QueuedTx {
     /// Enqueue instant (`meta_txpass_phase_ns` tx_queue_wait — the
     /// rewrite-publish-drain decomposition, 2026-08-01).
     enqueued_at: std::time::Instant,
+    /// op-trace (audit A2): the originating op's trace id (0 =
+    /// untraced) — the pass stamps its stages for every traced member.
+    trace_id: u64,
     /// D4.a: the `KvTx` construction site (counted on success).
     site: &'static std::panic::Location<'static>,
     /// Issue 13 (§5.5 revision 2): the tx's DLM I/D guards, held by THIS
@@ -7212,6 +7215,9 @@ struct PassSentinel<'a> {
     /// with `failed` latched the checkpoint task idles and the divergence
     /// dies at remount.
     applied_unrolled: bool,
+    /// op-trace (audit A2): the batch's traced members — every pass-level
+    /// phase record stamps its stage for each of them.
+    traced: crate::op_trace::TracedBatch,
 }
 
 impl Drop for PassSentinel<'_> {
@@ -7531,11 +7537,19 @@ impl KvMetaBackend {
             )
         })?;
         let (done, rx) = squeezefs_ipc::sqz_channel::oneshot::channel();
+        // op-trace (audit A2): the tx carries the ORIGINATING op's id
+        // (the committer's task scope) so the pass's stages join that
+        // op's chain; the enqueue instant already read is its
+        // `meta_enqueue` stamp.
+        let enqueued_at = std::time::Instant::now();
+        let trace_id = crate::op_trace::current_op();
+        crate::op_trace::stamp(trace_id, crate::op_trace::Stage::MetaEnqueue, enqueued_at);
         self.conveyor.enqueue(
             QueuedTx {
                 recs,
                 len,
-                enqueued_at: std::time::Instant::now(),
+                enqueued_at,
+                trace_id,
                 site,
                 _guards: tx.guards,
                 done,
@@ -7672,8 +7686,13 @@ impl KvMetaBackend {
             // (9) Fan out per-tx results; each entry's guard set is
             // released at ITS terminal outcome — post-result-send on
             // success, post-rollback on failure (which already ran
-            // inside the pipeline).
+            // inside the pipeline). op-trace `fanout`: a clock read per
+            // TRACED member only (the untraced population pays a field
+            // compare).
             for (q, outcome) in outcomes {
+                if q.trace_id != 0 {
+                    crate::op_trace::stamp_now(q.trace_id, crate::op_trace::Stage::Fanout);
+                }
                 let _ = q.done.send(outcome);
             }
         }
@@ -7687,17 +7706,28 @@ impl KvMetaBackend {
         self: &Arc<Self>,
         batch: Vec<QueuedTx>,
     ) -> Vec<(QueuedTx, std::result::Result<(), KvError>)> {
-        use crate::fuse_client::{meta_txpass_phase_record, MetaTxPassPhase};
+        use crate::fuse_client::{
+            meta_txpass_phase_record, meta_txpass_phase_record_dur, MetaTxPassPhase,
+        };
         super::META_CONVEYOR_LEADER_PASSES.fetch_add(1, Ordering::Relaxed);
         super::META_COMMIT_GROUP_SIZE.record(batch.len());
         super::META_COMMIT_GROUP_BYTES
             .fetch_add(batch.iter().map(|q| q.len).sum::<u64>(), Ordering::Relaxed);
         // Pass decomposition (2026-08-01): queue residence per drained tx
-        // + the whole-pass span.
+        // + the whole-pass span. op-trace (audit A2): the batch's traced
+        // members (a fixed-size set, collected once) receive every
+        // pass-level stage; `pass_begin` is the ONE instant that closes
+        // each member's `tx_queue_wait`.
         let t_pass = std::time::Instant::now();
+        let mut traced = crate::op_trace::TracedBatch::new();
         for q in &batch {
-            meta_txpass_phase_record(MetaTxPassPhase::TxQueueWait, q.enqueued_at);
+            meta_txpass_phase_record_dur(
+                MetaTxPassPhase::TxQueueWait,
+                t_pass.saturating_duration_since(q.enqueued_at),
+            );
+            traced.push(q.trace_id);
         }
+        traced.stamp(crate::op_trace::Stage::PassBegin, t_pass);
 
         // Issue-13 structural invariant, debug-asserted (it must be
         // UNFIREABLE now: a conflicting same-key writer cannot co-queue
@@ -7747,6 +7777,7 @@ impl KvMetaBackend {
             admission: None,
             reservation: None,
             applied_unrolled: false,
+            traced,
         };
         self.run_batch_pipeline(&mut sentinel).await;
         debug_assert!(
@@ -7756,7 +7787,7 @@ impl KvMetaBackend {
             "the batch pipeline must reach a terminal outcome for every entry on every \
              non-panic path (the sentinel is for unwinds only)"
         );
-        meta_txpass_phase_record(MetaTxPassPhase::PassTotal, t_pass);
+        meta_txpass_phase_record(MetaTxPassPhase::PassTotal, t_pass, &sentinel.traced);
         std::mem::take(&mut sentinel.outcomes)
     }
 
@@ -7766,7 +7797,7 @@ impl KvMetaBackend {
     /// out per-tx results and empties the sentinel itself.
     async fn run_batch_pipeline(&self, s: &mut PassSentinel<'_>) {
         use crate::fuse_client::{
-            meta_txpass_phase_record, meta_txpass_phase_record_dur, MetaTxPassPhase,
+            meta_txpass_phase_record, meta_txpass_phase_record_span, MetaTxPassPhase,
         };
         // Inherited liveness re-checks (§5.5: "the shutdown/failure-flag
         // re-checks it inherits from commit_tx's admission loop").
@@ -7792,7 +7823,7 @@ impl KvMetaBackend {
                 return;
             }
         }
-        meta_txpass_phase_record(MetaTxPassPhase::PassAdmission, t_adm);
+        meta_txpass_phase_record(MetaTxPassPhase::PassAdmission, t_adm, &s.traced);
 
         // Test seam (PR M4 D1.b, same protocol position as the per-tx
         // pipeline: admission held, nothing reserved — the historical
@@ -8040,7 +8071,7 @@ impl KvMetaBackend {
             }
             break (res, undo, failed);
         };
-        meta_txpass_phase_record(MetaTxPassPhase::PassLeafLocks, t_locks);
+        meta_txpass_phase_record(MetaTxPassPhase::PassLeafLocks, t_locks, &s.traced);
         crate::fuse_client::lock_phase_record(
             crate::fuse_client::LockPhase::LeafLockWait,
             leaf_wait,
@@ -8082,16 +8113,18 @@ impl KvMetaBackend {
 
         match write_out {
             Ok(()) => {
-                meta_txpass_phase_record_dur(
+                meta_txpass_phase_record_span(
                     MetaTxPassPhase::JournalRingWrite,
-                    t_ring_done.duration_since(t_jwrite),
+                    t_jwrite,
+                    t_ring_done,
+                    &s.traced,
                 );
                 // (7) One completed-prefix wait covers every member
                 // (their entries all end at-or-before the batch end;
                 // chain-reachability per the K3 barrier observation).
                 let t_pfx = std::time::Instant::now();
                 self.ring.wait_completed_upto(res.end()).await;
-                meta_txpass_phase_record(MetaTxPassPhase::JournalPrefixWait, t_pfx);
+                meta_txpass_phase_record(MetaTxPassPhase::JournalPrefixWait, t_pfx, &s.traced);
                 self.journal_failures.store(0, Ordering::Release);
                 // A skipped member left an unwritten hole in front of
                 // acked survivors: checkpoint past it BEFORE acking, so
@@ -8119,7 +8152,7 @@ impl KvMetaBackend {
                     // mechanism: the barrier leaves the throughput path).
                     let t_bar = std::time::Instant::now();
                     let out = self.sync_device().await.map_err(KvError::Io);
-                    meta_txpass_phase_record(MetaTxPassPhase::JournalBarrier, t_bar);
+                    meta_txpass_phase_record(MetaTxPassPhase::JournalBarrier, t_bar, &s.traced);
                     out
                 } else {
                     if hole_err.is_none() {
@@ -8127,7 +8160,7 @@ impl KvMetaBackend {
                     }
                     Ok(())
                 };
-                meta_txpass_phase_record(MetaTxPassPhase::PassJournalWrite, t_jwrite);
+                meta_txpass_phase_record(MetaTxPassPhase::PassJournalWrite, t_jwrite, &s.traced);
                 s.applied_unrolled = false;
 
                 // Terminal outcomes, in queue order (the pass task fans

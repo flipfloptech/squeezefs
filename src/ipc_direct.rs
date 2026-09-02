@@ -632,15 +632,24 @@ impl PendingOp {
     /// [`DirectDriveEngine::claim_and_stamp`]). Records the op's
     /// `sq_wait` span with the caller's single clock read.
     fn stamp_flush(&mut self, now_ns: u64) {
-        let (t_insert, slot) = match self {
-            PendingOp::Read(p) => (p.t_insert_ns, &mut p.t_flush_ns),
-            PendingOp::Write(p) => (p.t_insert_ns, &mut p.t_flush_ns),
+        let (t_insert, trace_id, slot) = match self {
+            PendingOp::Read(p) => (p.t_insert_ns, p.op.trace_id, &mut p.t_flush_ns),
+            PendingOp::Write(p) => (p.t_insert_ns, p.op.trace_id, &mut p.t_flush_ns),
         };
         *slot = now_ns;
         crate::fuse_client::ipc_direct_phase_record_span(
             crate::fuse_client::IpcDirectPhase::SqWait,
             std::time::Duration::from_nanos(now_ns.saturating_sub(t_insert)),
         );
+        crate::op_trace::stamp_mono(trace_id, crate::op_trace::Stage::IpcSqEnter, now_ns);
+    }
+
+    /// The op's trace id (0 = untraced) — see `DataOp::trace_id`.
+    fn trace_id(&self) -> u64 {
+        match self {
+            PendingOp::Read(p) => p.op.trace_id,
+            PendingOp::Write(p) => p.op.trace_id,
+        }
     }
 }
 
@@ -1102,6 +1111,11 @@ impl DirectDriveEngine {
             crate::fuse_client::IpcDirectPhase::Admit,
             std::time::Duration::from_nanos(t_insert_ns.saturating_sub(snap.t0_ns)),
         );
+        crate::op_trace::stamp_mono(
+            op.trace_id,
+            crate::op_trace::Stage::IpcAdmitted,
+            t_insert_ns,
+        );
         let pending = Pending {
             op,
             completion,
@@ -1443,6 +1457,11 @@ impl DirectDriveEngine {
         crate::fuse_client::ipc_direct_phase_record_span(
             crate::fuse_client::IpcDirectPhase::Admit,
             std::time::Duration::from_nanos(t_insert_ns.saturating_sub(snap.t0_ns)),
+        );
+        crate::op_trace::stamp_mono(
+            op.trace_id,
+            crate::op_trace::Stage::IpcAdmitted,
+            t_insert_ns,
         );
         let dev_write_off = snap.dev_write_off;
         let dev_off = snap.dev_off;
@@ -1919,6 +1938,11 @@ impl DirectDriveEngine {
                 crate::fuse_client::IpcDirectPhase::Inflight,
                 std::time::Duration::from_nanos(t_cqe_ns.saturating_sub(pending.t_insert_ns())),
             );
+            crate::op_trace::stamp_mono(
+                pending.trace_id(),
+                crate::op_trace::Stage::IpcCqe,
+                t_cqe_ns,
+            );
             // The split's second half: carrying enter → CQE pop. An
             // unstamped op (`t_flush_ns == 0` — the racer class, or a
             // shutdown straggler) records the FULL span here and no
@@ -2046,6 +2070,7 @@ impl DirectDriveEngine {
                 crate::fuse_client::IpcDirectPhase::Total,
                 std::time::Duration::from_nanos(end_ns.saturating_sub(snap.t0_ns)),
             );
+            crate::op_trace::stamp_mono(op.trace_id, crate::op_trace::Stage::IpcComplete, end_ns);
         } else {
             // Custody moved mid-DMA, or the device said no: the handler
             // owns the truth (never-lossy, never-fabricating).
@@ -2175,6 +2200,7 @@ impl DirectDriveEngine {
                 crate::fuse_client::IpcDirectPhase::Total,
                 std::time::Duration::from_nanos(end_ns.saturating_sub(snap.t0_ns)),
             );
+            crate::op_trace::stamp_mono(op.trace_id, crate::op_trace::Stage::IpcComplete, end_ns);
             // The non-ACK-blocking tail: collected into the drain
             // batch — ONE coalesced handoff per batch (ino-deduped)
             // after the last ACK, never a per-op dispatch (the 208 k/s

@@ -244,6 +244,11 @@ fn push(p: &'static Pool, op_id: u64, stage: Stage, at: Instant) {
     let mono_ns = p
         .epoch_mono_ns
         .wrapping_add(rel.as_nanos().min(u64::MAX as u128) as u64);
+    push_mono(p, op_id, stage, mono_ns);
+}
+
+#[inline]
+fn push_mono(p: &'static Pool, op_id: u64, stage: Stage, mono_ns: u64) {
     let key = RING.with(|c| c.get());
     let idx = if key != NO_RING && (key >> 32) as u32 == p.gen {
         key as u32
@@ -286,6 +291,18 @@ pub fn stamp(op_id: u64, stage: Stage, at: Instant) {
     }
 }
 
+/// Stamp `stage` for `op_id` at an absolute CLOCK_MONOTONIC ns the
+/// caller already read (the il direct-drive path's `mono_core` stamps —
+/// the ring's native clock, no conversion).
+#[inline]
+pub fn stamp_mono(op_id: u64, stage: Stage, mono_ns: u64) {
+    if let Some(p) = pool() {
+        if op_id != 0 && selected(op_id, p.threshold.load(Ordering::Relaxed)) {
+            push_mono(p, op_id, stage, mono_ns);
+        }
+    }
+}
+
 /// Stamp `stage` for `op_id` now — reads the clock ONLY for a traced op
 /// (the form for sites with no phase clock read of their own).
 #[inline]
@@ -310,13 +327,14 @@ pub fn stamp_current(stage: Stage, at: Instant) {
     }
 }
 
-/// Bind `op_id` as the current op for every poll of `fut` (0 = no
-/// binding: the wrapper is then a plain field compare per poll). The
-/// FIRST poll stamps `entry` when given (the session passes
+/// Bind `op_id` as the current op for every poll of `fut` — iff the op
+/// is traced under the current arm ([`traced`]: a disarmed or unsampled
+/// op binds 0, and the wrapper is then a plain field compare per poll).
+/// The FIRST poll stamps `entry` when given (the session passes
 /// [`Stage::HandlerEntry`]; detached work passes `None`).
 pub fn scope_with_entry<F: Future>(op_id: u64, entry: Option<Stage>, fut: F) -> OpScope<F> {
     OpScope {
-        op_id,
+        op_id: traced(op_id),
         entry: entry.map_or(0, |s| s as u16),
         fut,
     }
@@ -530,7 +548,7 @@ mod tests {
         let r = std::panic::catch_unwind(|| {
             let mut s = scope(9, Boom);
             let w = std::task::Waker::noop();
-            let mut cx = Context::from_waker(&w);
+            let mut cx = Context::from_waker(w);
             let _ = Pin::new(&mut s).poll(&mut cx);
         });
         assert!(r.is_err());

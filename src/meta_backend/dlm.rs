@@ -90,9 +90,27 @@ impl DlmLockManager {
                 _g: cell.write_owned().await,
             },
         };
+        // op-trace (audit A2): the guard is dropped at its tx's terminal
+        // outcome — often on the conveyor pass task, outside the op's
+        // scope — so the op id travels ON the guard, and the stamps ride
+        // the hold histogram's own two clock reads (the hold-timed class
+        // is exactly the one the trace names: the 4a exclusive I-guard).
+        let trace_id = if hold_timed {
+            crate::op_trace::current_op()
+        } else {
+            0
+        };
+        let acquired = if hold_timed {
+            let now = std::time::Instant::now();
+            crate::op_trace::stamp(trace_id, crate::op_trace::Stage::DlmGuardAcquired, now);
+            Some(now)
+        } else {
+            None
+        };
         DlmGuard {
             _inner: inner,
-            acquired: hold_timed.then(std::time::Instant::now),
+            acquired,
+            trace_id,
         }
     }
 
@@ -201,15 +219,19 @@ pub struct DlmGuard {
     _inner: DlmGuardInner,
     /// `Some` = hold-timed (exclusive inode class).
     acquired: Option<std::time::Instant>,
+    /// The acquiring op's trace id (0 = untraced) — see `lock_stripe`.
+    trace_id: u64,
 }
 
 impl Drop for DlmGuard {
     fn drop(&mut self) {
         if let Some(t) = self.acquired {
+            let now = std::time::Instant::now();
             crate::fuse_client::lock_phase_record(
                 crate::fuse_client::LockPhase::DlmGuardHold,
-                t.elapsed(),
+                now.saturating_duration_since(t),
             );
+            crate::op_trace::stamp(self.trace_id, crate::op_trace::Stage::DlmGuardReleased, now);
         }
     }
 }

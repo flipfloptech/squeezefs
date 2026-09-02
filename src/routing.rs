@@ -5,8 +5,8 @@ pub const MAX_INLINE_SIZE: usize = 4096;
 
 use crate::error::{Result, SqueezefsError};
 use crate::fuse_client::{
-    publish_phase_record, read_fill_phase_record, read_serve_phase_record, PublishPhase,
-    ReadFillPhase, ReadServePhase, METRICS,
+    publish_phase_record, publish_phase_record_op, read_fill_phase_record, read_serve_phase_record,
+    PublishPhase, ReadFillPhase, ReadServePhase, METRICS,
 };
 use crate::meta_backend::Metadata;
 use crate::stripe_locks::StripeLocks;
@@ -344,6 +344,10 @@ pub(crate) struct QueuedPublish {
     /// `publish_phase_ns` queue_wait records at pass drain, total at
     /// terminal fan-out.
     enqueued_at: std::time::Instant,
+    /// op-trace (audit A2): the enqueuing op's trace id (0 = untraced).
+    /// Per-op phases (queue_wait, total) stamp it directly; the pass runs
+    /// under the batch's first traced member's scope for the rest.
+    trace_id: u64,
     /// KD-B4-11: the settle's self-publish provenance marker. Scope is
     /// the per-ino APPLY pass (this conveyor is keyed by ino) — the
     /// marker is consumed at apply and never serialized into the
@@ -13734,6 +13738,16 @@ impl DataRouter {
         };
         let (done, rx) = squeezefs_ipc::sqz_channel::oneshot::channel();
         let blocks = entries.len() as u64;
+        // op-trace (audit A2): the op carries its task-scoped trace id
+        // onto the conveyor (the pass runs detached, outside its scope);
+        // the enqueue instant already read is its `publish_enqueue`.
+        let enqueued_at = std::time::Instant::now();
+        let trace_id = crate::op_trace::current_op();
+        crate::op_trace::stamp(
+            trace_id,
+            crate::op_trace::Stage::PublishEnqueue,
+            enqueued_at,
+        );
         // Enqueue-then-elect with no await between (the conveyor_core
         // no-lost-wakeup protocol): a cancelled submitter can never
         // strand its entry without a responsible leader.
@@ -13744,7 +13758,8 @@ impl DataRouter {
                 flip,
                 fencing_token,
                 done,
-                enqueued_at: std::time::Instant::now(),
+                enqueued_at,
+                trace_id,
                 overlay_self_publish,
             },
             blocks,
@@ -13824,7 +13839,17 @@ impl DataRouter {
                 }
                 continue;
             }
-            self.publish_pass(ino, batch).await;
+            // op-trace (audit A2): the pass — and the save/commit chain
+            // it runs down into the journal conveyor — is scoped to the
+            // batch's FIRST traced member ("if a tx serves many ops,
+            // sample the leader's"); per-op phases stamp their own ids
+            // inside.
+            let leader = batch
+                .iter()
+                .map(|q| q.trace_id)
+                .find(|id| *id != 0)
+                .unwrap_or(0);
+            crate::op_trace::scope(leader, self.publish_pass(ino, batch)).await;
         }
         guard.clean = true;
         drop(guard);
@@ -13847,7 +13872,7 @@ impl DataRouter {
         // recorded BEFORE the test-delay seam (the seam models commit
         // latency, not queue residence).
         for op in &batch {
-            publish_phase_record(PublishPhase::QueueWait, op.enqueued_at);
+            publish_phase_record_op(op.trace_id, PublishPhase::QueueWait, op.enqueued_at);
         }
         // Test seam (the `TEST_TIER_PUBLISH_DELAY_MS` pattern — one
         // relaxed load, zero-cost when unset, no `#[cfg(test)]` fork):
@@ -13914,7 +13939,11 @@ impl DataRouter {
                     Err(e) => {
                         publish_phase_record(PublishPhase::BaseFetch, t_base);
                         for op in batch {
-                            publish_phase_record(PublishPhase::Total, op.enqueued_at);
+                            publish_phase_record_op(
+                                op.trace_id,
+                                PublishPhase::Total,
+                                op.enqueued_at,
+                            );
                             let _ = op.done.send(Err(dup_err(&e)));
                         }
                         return;
@@ -13942,6 +13971,7 @@ impl DataRouter {
             done: squeezefs_ipc::sqz_channel::oneshot::Sender<Result<Vec<String>>>,
             payload: T,
             enqueued_at: std::time::Instant,
+            trace_id: u64,
         }
         let mut applied: Vec<Outcome<Vec<String>>> = Vec::new();
         let mut fenced: Vec<Outcome<u64>> = Vec::new();
@@ -13971,6 +14001,7 @@ impl DataRouter {
                     done: op.done,
                     payload: op.fencing_token,
                     enqueued_at: op.enqueued_at,
+                    trace_id: op.trace_id,
                 });
                 continue;
             }
@@ -14049,6 +14080,7 @@ impl DataRouter {
                 done: op.done,
                 payload: displaced,
                 enqueued_at: op.enqueued_at,
+                trace_id: op.trace_id,
             });
         }
         // The freshest RAM size floor (writes publish size to the RAM
@@ -14067,7 +14099,7 @@ impl DataRouter {
         }
         publish_phase_record(PublishPhase::Apply, t_apply);
         for o in fenced {
-            publish_phase_record(PublishPhase::Total, o.enqueued_at);
+            publish_phase_record_op(o.trace_id, PublishPhase::Total, o.enqueued_at);
             let _ = o.done.send(Err(SqueezefsError::FencingTokenExpired {
                 token: o.payload,
                 expected: current_fencing,
@@ -14095,7 +14127,7 @@ impl DataRouter {
             Ok((owner_recomputed, released)) => {
                 local_released = released;
                 for o in applied {
-                    publish_phase_record(PublishPhase::Total, o.enqueued_at);
+                    publish_phase_record_op(o.trace_id, PublishPhase::Total, o.enqueued_at);
                     // Finding 36 (half 2): a publish the OWNER recomputed
                     // owns its displaced DEVICE frees (the recompute-
                     // released set ran the authority's ladder strictly
@@ -14117,7 +14149,7 @@ impl DataRouter {
             }
             Err(e) => {
                 for o in applied {
-                    publish_phase_record(PublishPhase::Total, o.enqueued_at);
+                    publish_phase_record_op(o.trace_id, PublishPhase::Total, o.enqueued_at);
                     let _ = o.done.send(Err(dup_err(&e)));
                 }
             }

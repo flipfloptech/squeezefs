@@ -48,7 +48,10 @@ const BS: u64 = 65536;
 /// the ring DISARMED and drained.
 static SERIAL: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
 
-struct Armed(tokio::sync::MutexGuard<'static, ()>);
+struct Armed {
+    /// Held for the test's whole body (RAII serialization).
+    _guard: tokio::sync::MutexGuard<'static, ()>,
+}
 
 impl Drop for Armed {
     fn drop(&mut self) {
@@ -66,7 +69,7 @@ async fn serial() -> Armed {
         .await;
     op_trace::disarm();
     let _ = op_trace::drain();
-    Armed(g)
+    Armed { _guard: g }
 }
 
 struct H {
@@ -151,7 +154,11 @@ fn pattern(len: usize, tag: u8) -> Vec<u8> {
 
 /// The samples of one op, in ring order.
 fn chain(samples: &[Sample], op_id: u64) -> Vec<Sample> {
-    samples.iter().filter(|s| s.op_id == op_id).copied().collect()
+    samples
+        .iter()
+        .filter(|s| s.op_id == op_id)
+        .copied()
+        .collect()
 }
 
 fn has_stage(chain: &[Sample], stage: Stage) -> bool {
@@ -174,6 +181,9 @@ fn stage_ns(chain: &[Sample], stage: Stage) -> u64 {
 async fn disarmed_hooks_record_nothing() {
     let _g = serial().await;
     assert!(!op_trace::is_armed());
+    // The counters are cumulative over the ring's life: deltas.
+    let base_total = op_trace::samples_total();
+    let base_dropped = op_trace::dropped();
     let now = Instant::now();
     op_trace::stamp(42, Stage::TransportRecv, now);
     op_trace::stamp_now(42, Stage::Dispatch);
@@ -183,8 +193,8 @@ async fn disarmed_hooks_record_nothing() {
     let seen = op_trace::scope(42, async { op_trace::current_op() }).await;
     assert_eq!(seen, 0, "a disarmed scope never binds an op id");
     assert!(op_trace::drain().is_empty(), "disarmed ⇒ no samples");
-    assert_eq!(op_trace::samples_total(), 0);
-    assert_eq!(op_trace::dropped(), 0);
+    assert_eq!(op_trace::samples_total(), base_total, "no push counted");
+    assert_eq!(op_trace::dropped(), base_dropped, "no drop counted");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -202,7 +212,12 @@ async fn armed_explicit_stamps_land_sorted_and_drain_empties() {
     op_trace::stamp(7, Stage::TransportRecv, t0);
     op_trace::stamp(7, Stage::HandlerEntry, t2);
     op_trace::stamp(0, Stage::HandlerEntry, t2); // 0 is never an op id
-    let got = op_trace::drain();
+                                                 // Detached tasks of an earlier fixture may still be stamping under
+                                                 // their own ids: judge OUR ids only.
+    let got: Vec<Sample> = op_trace::drain()
+        .into_iter()
+        .filter(|s| s.op_id == 3 || s.op_id == 7)
+        .collect();
     assert_eq!(got.len(), 4, "four real stamps, the id-0 one refused");
     let ids: Vec<u64> = got.iter().map(|s| s.op_id).collect();
     assert_eq!(ids, vec![3, 7, 7, 7], "sorted by op_id");
@@ -225,10 +240,11 @@ async fn armed_explicit_stamps_land_sorted_and_drain_empties() {
         20_000,
         "stamps carry the Instant deltas exactly (ns)"
     );
-    assert_eq!(op_trace::samples_total(), 4);
     assert!(
-        op_trace::drain().is_empty(),
-        "a drain EMPTIES the rings — the second read is empty"
+        op_trace::drain()
+            .iter()
+            .all(|s| s.op_id != 3 && s.op_id != 7),
+        "a drain EMPTIES the rings — the second read carries none of ours"
     );
 }
 
@@ -241,7 +257,9 @@ async fn sampling_divisor_is_deterministic_and_stride_independent() {
     let _g = serial().await;
     op_trace::arm_for_tests(8);
     assert_eq!(op_trace::divisor(), 8);
-    let dense = (1..=8_000u64).filter(|id| op_trace::traced(*id) != 0).count();
+    let dense = (1..=8_000u64)
+        .filter(|id| op_trace::traced(*id) != 0)
+        .count();
     let even = (1..=8_000u64)
         .map(|k| k * 2)
         .filter(|id| op_trace::traced(*id) != 0)
@@ -262,8 +280,12 @@ async fn sampling_divisor_is_deterministic_and_stride_independent() {
         assert!(t == 0 || t == id, "traced returns the id or 0");
     }
     // A stamp on an UNSAMPLED id is refused; on a sampled id it lands.
-    let sampled = (1..=10_000u64).find(|id| op_trace::traced(*id) != 0).unwrap();
-    let unsampled = (1..=10_000u64).find(|id| op_trace::traced(*id) == 0).unwrap();
+    let sampled = (1..=10_000u64)
+        .find(|id| op_trace::traced(*id) != 0)
+        .unwrap();
+    let unsampled = (1..=10_000u64)
+        .find(|id| op_trace::traced(*id) == 0)
+        .unwrap();
     let now = Instant::now();
     op_trace::stamp(sampled, Stage::TransportRecv, now);
     op_trace::stamp(unsampled, Stage::TransportRecv, now);
@@ -319,12 +341,19 @@ async fn ring_overflow_drops_and_counts_never_blocks() {
         "overflow must never block"
     );
     let dropped = op_trace::dropped();
-    assert_eq!(dropped, (n - CAP) as u64, "every push past capacity is counted");
+    assert_eq!(
+        dropped,
+        (n - CAP) as u64,
+        "every push past capacity is counted"
+    );
     let got = op_trace::drain();
     assert_eq!(got.len(), CAP, "exactly the ring's capacity landed");
     for s in &got {
         assert_eq!(s.stage, Stage::TransportRecv as u16);
-        assert!((1_000..1_000 + n as u64).contains(&s.op_id), "intact sample");
+        assert!(
+            (1_000..1_000 + n as u64).contains(&s.op_id),
+            "intact sample"
+        );
     }
     assert_eq!(op_trace::samples_total(), CAP as u64);
     // After a drain the ring accepts again.
@@ -429,20 +458,18 @@ fn il_op_id_is_namespaced_and_injective_over_the_ticket() {
 async fn armed_write_yields_an_ordered_pipeline_chain_for_its_unique() {
     let _g = serial().await;
     let h = make([0xA2; 16], "op_trace_write").await;
-    let ino = h
-        .fs
-        .create(req(2), 1, OsStr::new("w.bin"), libc::S_IFREG | 0o644, 0)
-        .await
-        .unwrap()
-        .attr
-        .ino;
+    let ino =
+        h.fs.create(req(2), 1, OsStr::new("w.bin"), libc::S_IFREG | 0o644, 0)
+            .await
+            .unwrap()
+            .attr
+            .ino;
     // Promote to striped first (fixture write + fsync), untraced.
     let data = pattern(BS as usize * 4, 0x11);
-    let w = h
-        .fs
-        .write(req(4), ino, 0, 0, bytes::Bytes::from(data.clone()), 0, 0)
-        .await
-        .unwrap();
+    let w =
+        h.fs.write(req(4), ino, 0, 0, bytes::Bytes::from(data.clone()), 0, 0)
+            .await
+            .unwrap();
     assert_eq!(w.written as usize, data.len());
     h.fs.fsync(req(6), ino, 0, false).await.unwrap();
 
@@ -451,7 +478,15 @@ async fn armed_write_yields_an_ordered_pipeline_chain_for_its_unique() {
     let data2 = pattern(BS as usize * 4, 0x22);
     let w = op_trace::scope(
         UNIQUE,
-        h.fs.write(req(UNIQUE), ino, 0, 0, bytes::Bytes::from(data2.clone()), 0, 0),
+        h.fs.write(
+            req(UNIQUE),
+            ino,
+            0,
+            0,
+            bytes::Bytes::from(data2.clone()),
+            0,
+            0,
+        ),
     )
     .await
     .unwrap();
@@ -496,13 +531,12 @@ async fn armed_write_yields_an_ordered_pipeline_chain_for_its_unique() {
 async fn armed_read_yields_an_ordered_serve_chain_for_its_unique() {
     let _g = serial().await;
     let h = make([0xA3; 16], "op_trace_read").await;
-    let ino = h
-        .fs
-        .create(req(2), 1, OsStr::new("r.bin"), libc::S_IFREG | 0o644, 0)
-        .await
-        .unwrap()
-        .attr
-        .ino;
+    let ino =
+        h.fs.create(req(2), 1, OsStr::new("r.bin"), libc::S_IFREG | 0o644, 0)
+            .await
+            .unwrap()
+            .attr
+            .ino;
     let data = pattern(BS as usize * 4, 0x33);
     h.fs.write(req(4), ino, 0, 0, bytes::Bytes::from(data.clone()), 0, 0)
         .await
@@ -558,7 +592,13 @@ async fn armed_create_carries_its_unique_through_the_conveyor() {
     const UNIQUE: u64 = 3_000;
     op_trace::scope(
         UNIQUE,
-        h.fs.create(req(UNIQUE), 1, OsStr::new("c.bin"), libc::S_IFREG | 0o644, 0),
+        h.fs.create(
+            req(UNIQUE),
+            1,
+            OsStr::new("c.bin"),
+            libc::S_IFREG | 0o644,
+            0,
+        ),
     )
     .await
     .unwrap();
@@ -598,6 +638,9 @@ async fn armed_create_carries_its_unique_through_the_conveyor() {
 async fn trace_json_shape_is_pinned_and_drains() {
     let _g = serial().await;
     op_trace::arm_for_tests(1);
+    // The counters are cumulative over the ring's life (rows read deltas).
+    let base_total = op_trace::samples_total();
+    let base_dropped = op_trace::dropped();
     let t0 = Instant::now();
     op_trace::stamp(9, Stage::Dispatch, t0 + std::time::Duration::from_nanos(5));
     op_trace::stamp(9, Stage::TransportRecv, t0);
@@ -620,8 +663,8 @@ async fn trace_json_shape_is_pinned_and_drains() {
     );
     assert_eq!(json["armed"], serde_json::Value::Bool(true));
     assert_eq!(json["divisor"].as_u64(), Some(1));
-    assert_eq!(json["dropped"].as_u64(), Some(0));
-    assert_eq!(json["samples_total"].as_u64(), Some(3));
+    assert_eq!(json["dropped"].as_u64(), Some(base_dropped));
+    assert!(json["samples_total"].as_u64().unwrap() >= base_total + 3);
     assert_eq!(json["clock"].as_str(), Some("CLOCK_MONOTONIC_ns"));
     let stages = json["stages"].as_object().expect("stage table");
     assert_eq!(stages.len(), Stage::ALL.len());
@@ -629,7 +672,14 @@ async fn trace_json_shape_is_pinned_and_drains() {
         stages[&(Stage::TransportRecv as u16).to_string()].as_str(),
         Some("transport_recv")
     );
-    let samples = json["samples"].as_array().expect("samples array");
+    // Detached tasks of an earlier fixture may still stamp under their
+    // own ids: judge OUR rows only.
+    let samples: Vec<&serde_json::Value> = json["samples"]
+        .as_array()
+        .expect("samples array")
+        .iter()
+        .filter(|r| matches!(r[0].as_u64(), Some(8) | Some(9)))
+        .collect();
     assert_eq!(samples.len(), 3);
     let row = |i: usize| -> (u64, u64, u64) {
         let r = samples[i].as_array().expect("triple");
@@ -644,10 +694,18 @@ async fn trace_json_shape_is_pinned_and_drains() {
     assert_eq!(row(1), (9, Stage::TransportRecv as u64, row(1).2));
     assert_eq!(row(2).1, Stage::Dispatch as u64);
     assert_eq!(row(2).2 - row(1).2, 5, "ns deltas exact");
-    // Drained: the next export carries no samples but the same table.
+    // Drained: the next export carries none of ours but the same table.
     let again = op_trace::trace_json();
-    assert_eq!(again["samples"].as_array().unwrap().len(), 0);
-    assert_eq!(again["samples_total"].as_u64(), Some(3), "cumulative");
+    assert!(again["samples"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|r| !matches!(r[0].as_u64(), Some(8) | Some(9))));
+    assert!(
+        again["samples_total"].as_u64().unwrap() >= base_total + 3,
+        "cumulative"
+    );
+    assert_eq!(again["stages"].as_object().unwrap().len(), Stage::ALL.len());
     // The disarmed export is honest about it.
     op_trace::disarm();
     let off = op_trace::trace_json();
@@ -663,11 +721,10 @@ async fn trace_inode_is_owner_only_and_stats_carry_the_gauges() {
     let h = make([0xA5; 16], "op_trace_inode").await;
     op_trace::arm_for_tests(1);
     op_trace::stamp(77, Stage::TransportRecv, Instant::now());
-    let entry = h
-        .fs
-        .lookup(req(1), 1, OsStr::new(".trace"))
-        .await
-        .expect(".trace resolves at the root");
+    let entry =
+        h.fs.lookup(req(1), 1, OsStr::new(".trace"))
+            .await
+            .expect(".trace resolves at the root");
     assert_eq!(
         entry.attr.perm,
         squeezefs::fuse_client::VIRTUAL_INODE_MODE,
@@ -682,42 +739,87 @@ async fn trace_inode_is_owner_only_and_stats_carry_the_gauges() {
         squeezefs::fuse_client::virtual_class(entry.attr.ino),
         Some(squeezefs::fuse_client::VirtualClass::Trace)
     );
-    let opened = h.fs.open(req(1), entry.attr.ino, libc::O_RDONLY as u32).await.unwrap();
-    let data = h
-        .fs
-        .read(req(1), entry.attr.ino, opened.fh, 0, entry.attr.size as u32, 0)
+    let opened =
+        h.fs.open(req(1), entry.attr.ino, libc::O_RDONLY as u32, 0)
+            .await
+            .unwrap();
+    let data =
+        h.fs.read(
+            req(1),
+            entry.attr.ino,
+            opened.fh,
+            0,
+            entry.attr.size as u32,
+            0,
+        )
         .await
         .unwrap();
     assert_eq!(data.data.len() as u64, entry.attr.size, "size = payload");
     let json: serde_json::Value = serde_json::from_slice(&data.data).expect("JSON payload");
-    let samples = json["samples"].as_array().unwrap();
-    assert_eq!(samples.len(), 1, "the lookup drained exactly our stamp");
-    assert_eq!(samples[0][0].as_u64(), Some(77));
+    let ours: Vec<&serde_json::Value> = json["samples"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|r| r[0].as_u64() == Some(77))
+        .collect();
+    assert_eq!(ours.len(), 1, "the lookup drained our stamp");
+    assert_eq!(ours[0][1].as_u64(), Some(Stage::TransportRecv as u64));
     // The lookup DRAINED: a second generation is empty.
     let entry2 = h.fs.lookup(req(1), 1, OsStr::new(".trace")).await.unwrap();
-    assert_ne!(entry2.attr.ino, entry.attr.ino, "fresh generation per lookup");
-    let opened2 = h.fs.open(req(1), entry2.attr.ino, libc::O_RDONLY as u32).await.unwrap();
-    let data2 = h
-        .fs
-        .read(req(1), entry2.attr.ino, opened2.fh, 0, entry2.attr.size as u32, 0)
+    assert_ne!(
+        entry2.attr.ino, entry.attr.ino,
+        "fresh generation per lookup"
+    );
+    let opened2 =
+        h.fs.open(req(1), entry2.attr.ino, libc::O_RDONLY as u32, 0)
+            .await
+            .unwrap();
+    let data2 =
+        h.fs.read(
+            req(1),
+            entry2.attr.ino,
+            opened2.fh,
+            0,
+            entry2.attr.size as u32,
+            0,
+        )
         .await
         .unwrap();
     let json2: serde_json::Value = serde_json::from_slice(&data2.data).unwrap();
-    assert_eq!(json2["samples"].as_array().unwrap().len(), 0);
+    assert!(json2["samples"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|r| r[0].as_u64() != Some(77)));
 
     // Stats gauges.
     let stats_entry = h.fs.lookup(req(1), 1, OsStr::new(".stats")).await.unwrap();
-    let so = h.fs.open(req(1), stats_entry.attr.ino, libc::O_RDONLY as u32).await.unwrap();
-    let sd = h
-        .fs
-        .read(req(1), stats_entry.attr.ino, so.fh, 0, stats_entry.attr.size as u32, 0)
+    let so =
+        h.fs.open(req(1), stats_entry.attr.ino, libc::O_RDONLY as u32, 0)
+            .await
+            .unwrap();
+    let sd =
+        h.fs.read(
+            req(1),
+            stats_entry.attr.ino,
+            so.fh,
+            0,
+            stats_entry.attr.size as u32,
+            0,
+        )
         .await
         .unwrap();
     let stats: serde_json::Value = serde_json::from_slice(&sd.data).unwrap();
-    assert_eq!(stats["op_trace_armed"], serde_json::Value::Bool(true));
-    assert_eq!(stats["op_trace_samples"].as_u64(), Some(1));
-    assert_eq!(stats["op_trace_dropped"].as_u64(), Some(0));
-    assert_eq!(stats["op_trace_divisor"].as_u64(), Some(1));
+    let m = &stats["metrics"];
+    assert_eq!(m["op_trace_armed"], serde_json::Value::Bool(true));
+    // Cumulative over the ring's life (a row reads deltas).
+    assert_eq!(
+        m["op_trace_samples"].as_u64(),
+        Some(op_trace::samples_total())
+    );
+    assert!(m["op_trace_samples"].as_u64().unwrap() >= 1);
+    assert_eq!(m["op_trace_dropped"].as_u64(), Some(op_trace::dropped()));
+    assert_eq!(m["op_trace_divisor"].as_u64(), Some(1));
 }
 
 // ---------------------------------------------------------------------------
@@ -727,8 +829,8 @@ async fn trace_inode_is_owner_only_and_stats_carry_the_gauges() {
 /// `SQUEEZEFS_OP_TRACE` is a registered Bool knob (ENG-10), default off.
 #[test]
 fn op_trace_knob_is_registered_bool_default_off() {
-    let entry = squeezefs::env_knobs::lookup("SQUEEZEFS_OP_TRACE")
-        .expect("SQUEEZEFS_OP_TRACE registered");
+    let entry =
+        squeezefs::env_knobs::lookup("SQUEEZEFS_OP_TRACE").expect("SQUEEZEFS_OP_TRACE registered");
     assert!(
         matches!(entry.kind, squeezefs::env_knobs::Kind::Bool),
         "Bool kind"

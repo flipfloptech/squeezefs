@@ -41,11 +41,39 @@ pub const VIRTUAL_GEN_INO_FIRST: u64 = 0xffff_ffff_0000_0000;
 pub const VIRTUAL_GEN_INO_LAST: u64 = 0xffff_ffff_ffff_fff0;
 
 /// Which virtual payload a virtual ino names — the class survives
-/// registry eviction because the generation mint encodes it in bit 0.
+/// registry eviction because the generation mint encodes it in the low
+/// two bits ([`VIRTUAL_CLASS_BITS`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VirtualClass {
     Stats,
     Config,
+    /// `.trace` — the per-op trace ring's DRAIN (e2e audit A2): lookup-
+    /// minted like `.stats`, every generation's payload drains the rings
+    /// once. No canonical fixed ino (nothing predates the generation
+    /// scheme for it).
+    Trace,
+}
+
+/// Low bits of a generation ino carrying its [`VirtualClass`].
+pub const VIRTUAL_CLASS_BITS: u64 = 2;
+
+impl VirtualClass {
+    const fn tag(self) -> u64 {
+        match self {
+            VirtualClass::Stats => 0,
+            VirtualClass::Config => 1,
+            VirtualClass::Trace => 2,
+        }
+    }
+
+    const fn from_tag(tag: u64) -> Option<VirtualClass> {
+        match tag {
+            0 => Some(VirtualClass::Stats),
+            1 => Some(VirtualClass::Config),
+            2 => Some(VirtualClass::Trace),
+            _ => None,
+        }
+    }
 }
 
 /// Classify a virtual ino: the canonical fixed inos AND the per-lookup
@@ -67,15 +95,12 @@ pub fn virtual_class(ino: u64) -> Option<VirtualClass> {
     }
 }
 
-/// Class extraction for per-lookup GENERATION inos only (bit 0 is the
-/// class the mint encoded); `None` outside the reserved range.
+/// Class extraction for per-lookup GENERATION inos only (the low
+/// [`VIRTUAL_CLASS_BITS`] are the class the mint encoded); `None`
+/// outside the reserved range or for an unminted tag.
 pub fn virtual_gen_class(ino: u64) -> Option<VirtualClass> {
     if (VIRTUAL_GEN_INO_FIRST..=VIRTUAL_GEN_INO_LAST).contains(&ino) {
-        if ino & 1 == 0 {
-            Some(VirtualClass::Stats)
-        } else {
-            Some(VirtualClass::Config)
-        }
+        VirtualClass::from_tag(ino & ((1 << VIRTUAL_CLASS_BITS) - 1))
     } else {
         None
     }
@@ -1714,11 +1739,23 @@ static OP_PROFILE: Lazy<OpProfileState> = Lazy::new(|| OpProfileState {
     },
 });
 
+static PROF_EPOCH: Lazy<std::time::Instant> = Lazy::new(std::time::Instant::now);
+
 /// Monotonic ns since the rig's first use (one process-wide `Instant`
 /// epoch — stamps are u64s so they live in atomics).
 fn prof_now_ns() -> u64 {
-    static PROF_EPOCH: Lazy<std::time::Instant> = Lazy::new(std::time::Instant::now);
-    PROF_EPOCH.elapsed().as_nanos() as u64
+    prof_now().1
+}
+
+/// ONE clock read in both forms: the `Instant` (the op-trace stamp's
+/// currency — audit A2's one-read law) and the epoch ns the stamp words
+/// store.
+fn prof_now() -> (std::time::Instant, u64) {
+    let now = std::time::Instant::now();
+    (
+        now,
+        now.saturating_duration_since(*PROF_EPOCH).as_nanos() as u64,
+    )
 }
 
 /// The watchdog's coarse clock: epoch-ns refreshed by the watchdog task
@@ -1921,11 +1958,14 @@ impl OpProf {
     }
 
     /// Stamp the backend entry (first backend/router touch). No-op when
-    /// the rig is disabled (no clock read).
+    /// the rig is disabled (no clock read). The same read stamps the
+    /// op-trace `meta_backend_start` stage for the task-scoped op.
     #[inline]
     pub fn mark_backend_start(&self) {
         if let Some(s) = &self.stamps {
-            s.backend_start_ns.store(prof_now_ns(), Ordering::Relaxed);
+            let (now, ns) = prof_now();
+            s.backend_start_ns.store(ns, Ordering::Relaxed);
+            crate::op_trace::stamp_current(crate::op_trace::Stage::MetaBackendStart, now);
         }
     }
 
@@ -1934,7 +1974,9 @@ impl OpProf {
     #[inline]
     pub fn mark_backend_done(&self) {
         if let Some(s) = &self.stamps {
-            s.backend_done_ns.store(prof_now_ns(), Ordering::Relaxed);
+            let (now, ns) = prof_now();
+            s.backend_done_ns.store(ns, Ordering::Relaxed);
+            crate::op_trace::stamp_current(crate::op_trace::Stage::MetaBackendDone, now);
         }
     }
 
@@ -1968,12 +2010,13 @@ impl OpProf {
 impl Drop for OpProf {
     fn drop(&mut self) {
         if let Some(s) = &self.stamps {
-            let now = prof_now_ns();
+            let (now_at, now) = prof_now();
             if self.profile {
                 record_op_phases(&OP_PROFILE.phases[self.kind as usize], s, now);
             }
             if let Some(oi) = meta_op_index(self.kind) {
                 record_op_phases(&META_OP_PROF[oi], s, now);
+                crate::op_trace::stamp_current(crate::op_trace::Stage::MetaOpReturn, now_at);
             }
         }
         if let Some(idx) = self.slot {
@@ -3329,7 +3372,9 @@ pub struct MetaLockGuard {
 impl Drop for MetaLockGuard {
     fn drop(&mut self) {
         if let Some(t) = self.acquired {
-            lock_phase_record(LockPhase::StripeLockHold, t.elapsed());
+            let now = std::time::Instant::now();
+            lock_phase_record(LockPhase::StripeLockHold, now.saturating_duration_since(t));
+            crate::op_trace::stamp_current(crate::op_trace::Stage::StripeLockReleased, now);
         }
     }
 }
@@ -3367,6 +3412,9 @@ pub async fn census_meta_lock_acquire(
     let g = lock.lock().await;
     let acquired = std::time::Instant::now();
     lock_phase_record(LockPhase::StripeLockWait, acquired.duration_since(t0));
+    // op-trace: the contended acquire's own clock read (the try_lock
+    // fast path reads none and stamps none).
+    crate::op_trace::stamp_current(crate::op_trace::Stage::StripeLockAcquired, acquired);
     MetaLockGuard {
         _g: g,
         acquired: hold_timed.then_some(acquired),
@@ -3490,11 +3538,45 @@ const PIPELINE_PHASE_NAMES: [&str; PIPELINE_PHASES] = [
 static PIPELINE_PROF: Lazy<[LatencyHistogram; PIPELINE_PHASES]> =
     Lazy::new(|| std::array::from_fn(|_| LatencyHistogram::default()));
 
+/// The op-trace stage each pipeline phase's record stamps (audit A2 —
+/// the stage is the phase's END boundary). The funnel pair records on
+/// the NvmeBlockDev worker, which has no task scope: its stamps ride
+/// the request's carried trace id at the funnel, so `None` here.
+const PIPELINE_STAGE: [Option<crate::op_trace::Stage>; PIPELINE_PHASES] = [
+    Some(crate::op_trace::Stage::WriteAdmitted),
+    Some(crate::op_trace::Stage::WriteDetached),
+    Some(crate::op_trace::Stage::WriteLocked),
+    Some(crate::op_trace::Stage::WriteEncoded),
+    Some(crate::op_trace::Stage::WriteAllocated),
+    Some(crate::op_trace::Stage::WriteDmaDone),
+    Some(crate::op_trace::Stage::WritePublished),
+    Some(crate::op_trace::Stage::WriteFreed),
+    Some(crate::op_trace::Stage::WriteInvalDone),
+    Some(crate::op_trace::Stage::WriteDone),
+    None,
+    None,
+];
+
 /// Record one residence span started at `t0` against `phase` (always-on;
-/// see the module block above for the cost contract).
+/// see the module block above for the cost contract). The ONE clock
+/// read also stamps the phase's op-trace stage for the task-scoped op.
 #[inline]
 pub fn pipeline_phase_record(phase: PipelinePhase, t0: std::time::Instant) {
-    PIPELINE_PROF[phase as usize].record(t0.elapsed());
+    pipeline_phase_record_at(phase, t0, std::time::Instant::now());
+}
+
+/// [`pipeline_phase_record`] with the end instant the caller already
+/// read (the funnel passes its submit/complete stamp through).
+#[inline]
+pub fn pipeline_phase_record_at(
+    phase: PipelinePhase,
+    t0: std::time::Instant,
+    now: std::time::Instant,
+) {
+    PIPELINE_PROF[phase as usize].record(now.saturating_duration_since(t0));
+    if let Some(stage) = PIPELINE_STAGE[phase as usize] {
+        crate::op_trace::stamp_current(stage, now);
+    }
 }
 
 /// `write_pipeline_phase_ns` stats payload: `{phase: histogram}` —
@@ -3594,11 +3676,42 @@ const PUBLISH_PHASE_NAMES: [&str; PUBLISH_PHASES] = [
 static PUBLISH_PROF: Lazy<[LatencyHistogram; PUBLISH_PHASES]> =
     Lazy::new(|| std::array::from_fn(|_| LatencyHistogram::default()));
 
+/// The op-trace stage each publish phase's record stamps (audit A2 —
+/// the phase's END boundary; `queue_wait` ends at the drain).
+const PUBLISH_STAGE: [crate::op_trace::Stage; PUBLISH_PHASES] = [
+    crate::op_trace::Stage::PublishDrained,
+    crate::op_trace::Stage::PublishLocked,
+    crate::op_trace::Stage::PublishBaseReady,
+    crate::op_trace::Stage::PublishApplied,
+    crate::op_trace::Stage::PublishEncoded,
+    crate::op_trace::Stage::PublishBlobWritten,
+    crate::op_trace::Stage::PublishCommitted,
+    crate::op_trace::Stage::CommitGuarded,
+    crate::op_trace::Stage::CommitInodeRead,
+    crate::op_trace::Stage::CommitSlotProbed,
+    crate::op_trace::Stage::CommitTxDone,
+    crate::op_trace::Stage::PublishDone,
+];
+
 /// Record one publish span started at `t0` against `phase` (always-on;
-/// see the module block above for the cost contract).
+/// see the module block above for the cost contract). The pass-level
+/// phases run under the pass's op-trace scope (the batch's first traced
+/// member), so the ONE clock read also stamps that op's stage.
 #[inline]
 pub fn publish_phase_record(phase: PublishPhase, t0: std::time::Instant) {
-    PUBLISH_PROF[phase as usize].record(t0.elapsed());
+    let now = std::time::Instant::now();
+    PUBLISH_PROF[phase as usize].record(now.saturating_duration_since(t0));
+    crate::op_trace::stamp_current(PUBLISH_STAGE[phase as usize], now);
+}
+
+/// [`publish_phase_record`] for a PER-OP phase inside a batch loop
+/// (`queue_wait`, `total`): the stamp goes to the op's OWN trace id, not
+/// the pass scope's.
+#[inline]
+pub fn publish_phase_record_op(trace_id: u64, phase: PublishPhase, t0: std::time::Instant) {
+    let now = std::time::Instant::now();
+    PUBLISH_PROF[phase as usize].record(now.saturating_duration_since(t0));
+    crate::op_trace::stamp(trace_id, PUBLISH_STAGE[phase as usize], now);
 }
 
 /// `publish_phase_ns` stats payload: `{phase: histogram}` — surfaced
@@ -3669,15 +3782,52 @@ const META_TXPASS_PHASE_NAMES: [&str; META_TXPASS_PHASES] = [
 static META_TXPASS_PROF: Lazy<[LatencyHistogram; META_TXPASS_PHASES]> =
     Lazy::new(|| std::array::from_fn(|_| LatencyHistogram::default()));
 
-/// Record one conveyor-pass span started at `t0` against `phase`.
+/// The op-trace stage each pass phase's record stamps (audit A2) for
+/// EVERY traced member of the batch: a pass serves N txs, and its
+/// stages belong to each op it carries. `tx_queue_wait` (per tx) ends at
+/// the pass start = `pass_begin`; `pass_journal_write` is the SUM of the
+/// three split phases and stamps nothing (its end is `pass_end`).
+const META_TXPASS_STAGE: [Option<crate::op_trace::Stage>; META_TXPASS_PHASES] = [
+    Some(crate::op_trace::Stage::PassBegin),
+    Some(crate::op_trace::Stage::PassAdmitted),
+    Some(crate::op_trace::Stage::PassLocked),
+    None,
+    Some(crate::op_trace::Stage::PassEnd),
+    Some(crate::op_trace::Stage::JournalWritten),
+    Some(crate::op_trace::Stage::JournalPrefixDone),
+    Some(crate::op_trace::Stage::Barrier),
+];
+
+/// Record one conveyor-pass span started at `t0` against `phase`; the
+/// ONE clock read also stamps the phase's stage for the batch's traced
+/// members.
 #[inline]
-pub fn meta_txpass_phase_record(phase: MetaTxPassPhase, t0: std::time::Instant) {
-    META_TXPASS_PROF[phase as usize].record(t0.elapsed());
+pub fn meta_txpass_phase_record(
+    phase: MetaTxPassPhase,
+    t0: std::time::Instant,
+    traced: &crate::op_trace::TracedBatch,
+) {
+    meta_txpass_phase_record_span(phase, t0, std::time::Instant::now(), traced);
 }
 
-/// Record one conveyor-pass span of known length (a span whose end was
-/// stamped before its outcome was known, or one accumulated across a
-/// retry loop).
+/// Record one conveyor-pass span `[t0, end]` whose end the caller
+/// already stamped (a span closed before its outcome was known).
+#[inline]
+pub fn meta_txpass_phase_record_span(
+    phase: MetaTxPassPhase,
+    t0: std::time::Instant,
+    end: std::time::Instant,
+    traced: &crate::op_trace::TracedBatch,
+) {
+    META_TXPASS_PROF[phase as usize].record(end.saturating_duration_since(t0));
+    if let Some(stage) = META_TXPASS_STAGE[phase as usize] {
+        traced.stamp(stage, end);
+    }
+}
+
+/// Record one conveyor-pass span of known length with NO stage (the
+/// per-tx `tx_queue_wait` loop records N spans against ONE pass-start
+/// instant; the pass stamps `pass_begin` once for its traced members).
 #[inline]
 pub fn meta_txpass_phase_record_dur(phase: MetaTxPassPhase, dur: Duration) {
     META_TXPASS_PROF[phase as usize].record(dur);
@@ -3959,17 +4109,62 @@ pub fn ipc_direct_phase_json() -> serde_json::Value {
     serde_json::Value::Object(phases)
 }
 
+/// The op-trace stage each serve phase's record stamps (audit A2 — the
+/// phase's END boundary, for the task-scoped op).
+const READ_SERVE_STAGE: [crate::op_trace::Stage; READ_SERVE_PHASES] = [
+    crate::op_trace::Stage::ReadRouted,
+    crate::op_trace::Stage::MetaResolved,
+    crate::op_trace::Stage::KeysResolved,
+    crate::op_trace::Stage::TierProbed,
+    crate::op_trace::Stage::CohortServed,
+    crate::op_trace::Stage::BlockFetched,
+    crate::op_trace::Stage::BindingChecked,
+    crate::op_trace::Stage::ServeCopied,
+    crate::op_trace::Stage::ReadValidated,
+    crate::op_trace::Stage::ReadReturn,
+];
+
+/// The op-trace stage each fill phase's record stamps. The funnel pair
+/// records on the NvmeBlockDev worker (no task scope): its stamps ride
+/// the request's carried trace id at the funnel, so `None` here.
+const READ_FILL_STAGE: [Option<crate::op_trace::Stage>; READ_FILL_PHASES] = [
+    None,
+    None,
+    Some(crate::op_trace::Stage::FetchDone),
+    Some(crate::op_trace::Stage::Decoded),
+    Some(crate::op_trace::Stage::Admitted),
+    Some(crate::op_trace::Stage::Deposited),
+    Some(crate::op_trace::Stage::FillDone),
+];
+
 /// Record one serve-residence span started at `t0` (always-on; see the
-/// module block above for the cost contract).
+/// module block above for the cost contract). The ONE clock read also
+/// stamps the phase's op-trace stage for the task-scoped op.
 #[inline]
 pub fn read_serve_phase_record(phase: ReadServePhase, t0: std::time::Instant) {
-    READ_SERVE_PROF[phase as usize].record(t0.elapsed());
+    let now = std::time::Instant::now();
+    READ_SERVE_PROF[phase as usize].record(now.saturating_duration_since(t0));
+    crate::op_trace::stamp_current(READ_SERVE_STAGE[phase as usize], now);
 }
 
 /// Record one fill-residence span started at `t0` (always-on).
 #[inline]
 pub fn read_fill_phase_record(phase: ReadFillPhase, t0: std::time::Instant) {
-    READ_FILL_PROF[phase as usize].record(t0.elapsed());
+    read_fill_phase_record_at(phase, t0, std::time::Instant::now());
+}
+
+/// [`read_fill_phase_record`] with the end instant the caller already
+/// read (the funnel passes its submit/complete stamp through).
+#[inline]
+pub fn read_fill_phase_record_at(
+    phase: ReadFillPhase,
+    t0: std::time::Instant,
+    now: std::time::Instant,
+) {
+    READ_FILL_PROF[phase as usize].record(now.saturating_duration_since(t0));
+    if let Some(stage) = READ_FILL_STAGE[phase as usize] {
+        crate::op_trace::stamp_current(stage, now);
+    }
 }
 
 /// `read_serve_phase_ns` stats payload: `{phase: histogram}` — UNGATED.
@@ -9650,6 +9845,11 @@ impl SqueezefsFilesystem {
         // CPU attribution (e2e audit E): ONE sample — per-thread classes
         // scanned before the process total, so Σ classes ≤ total holds.
         let cpu = crate::daemon_cpu::sample();
+        // Per-op trace ring gauges (e2e audit A2): the ring's state and
+        // its cumulative push/drop counts (the samples themselves are
+        // the `.trace` inode's — a stats read never drains).
+        let (op_trace_armed, op_trace_samples, op_trace_dropped, op_trace_divisor) =
+            crate::op_trace::stats_gauges();
 
         let mut stats_obj = serde_json::json!({
             // Build identity (docs/operations.md §Versioning & releases):
@@ -10261,6 +10461,15 @@ impl SqueezefsFilesystem {
                 // comm class (retired threads keep their last sample).
                 "daemon_cpu_ns": cpu.total_ns,
                 "daemon_cpu_ns_by_class": cpu.by_class_json(),
+                // Per-op trace ring (e2e audit A2): armed state, the
+                // cumulative samples pushed / dropped (a full ring drops,
+                // never blocks — growth of `dropped` under a row means the
+                // derived divisor is too low for the row's op rate), and
+                // the sampling divisor in force. `cat <mnt>/.trace` drains.
+                "op_trace_armed": op_trace_armed,
+                "op_trace_samples": op_trace_samples,
+                "op_trace_dropped": op_trace_dropped,
+                "op_trace_divisor": op_trace_divisor,
                 // Read-serve residence decomposition (2026-08-01
                 // serve-latency decomposition campaign): ALWAYS-ON
                 // per-phase histograms — the read twin of the family
@@ -11539,11 +11748,12 @@ impl SqueezefsFilesystem {
     }
 
     /// Mint a per-lookup generation ino for `payload` and register it.
-    /// The class rides bit 0 (see [`virtual_gen_class`]) so it survives
-    /// registry eviction; the mint counter is one cell across clones.
-    /// The counter wraps modulo the range's slot count (~2.1 G mints per
-    /// class — years of 10 Hz stats polling; any prior same-ino kernel
-    /// inode was FORGETted eons before a wrap can reuse its slot).
+    /// The class rides the low [`VIRTUAL_CLASS_BITS`] (see
+    /// [`virtual_gen_class`]) so it survives registry eviction; the mint
+    /// counter is one cell across clones. The counter wraps modulo the
+    /// range's slot count (~1 G mints per class — years of 10 Hz stats
+    /// polling; any prior same-ino kernel inode was FORGETted eons
+    /// before a wrap can reuse its slot).
     fn mint_virtual_gen_ino(&self, class: VirtualClass, payload: std::sync::Arc<Vec<u8>>) -> u64 {
         // Safety-cap eviction (see VIRTUAL_GEN_REGISTRY_CAP): a kernel
         // that never FORGETs must not grow the registry unbounded — drop
@@ -11561,12 +11771,9 @@ impl SqueezefsFilesystem {
             }
         }
         let seq = self.next_virtual_gen.fetch_add(1, Ordering::Relaxed);
-        let slots = (VIRTUAL_GEN_INO_LAST - VIRTUAL_GEN_INO_FIRST + 1) / 2;
-        let class_bit = match class {
-            VirtualClass::Stats => 0,
-            VirtualClass::Config => 1,
-        };
-        let ino = VIRTUAL_GEN_INO_FIRST + (seq % slots) * 2 + class_bit;
+        let stride = 1u64 << VIRTUAL_CLASS_BITS;
+        let slots = (VIRTUAL_GEN_INO_LAST - VIRTUAL_GEN_INO_FIRST + 1) / stride;
+        let ino = VIRTUAL_GEN_INO_FIRST + (seq % slots) * stride + class.tag();
         self.virtual_gen_payloads
             .insert(ino, VirtualGenEntry { payload, seq });
         ino
@@ -11574,10 +11781,12 @@ impl SqueezefsFilesystem {
 
     /// The attr a virtual ino reports: the class attr shape with the ino
     /// field naming the GENERATION ino (the canonical builders hardcode
-    /// their fixed inos).
+    /// their fixed inos). `.trace` shares `.stats`' shape (the same
+    /// VAL-7a owner-only posture: a trace names inos, offsets and op
+    /// ids).
     fn virtual_gen_attr(&self, ino: u64, class: VirtualClass, size: u64) -> FileAttr {
         let mut attr = match class {
-            VirtualClass::Stats => self.get_stats_attr(size),
+            VirtualClass::Stats | VirtualClass::Trace => self.get_stats_attr(size),
             VirtualClass::Config => self.get_config_attr(size),
         };
         attr.ino = ino;
@@ -17316,19 +17525,28 @@ impl SqueezefsFilesystem {
                         // runtime-handle spawn onto the global inject
                         // queue).
                         let t_detach = std::time::Instant::now();
+                        // op-trace (audit A2): the detached upload
+                        // re-enters the WRITE's scope so its pipeline
+                        // stages (and the device funnel + publish chain
+                        // below them) join the op's chain past the ACK.
+                        let trace_id = crate::op_trace::current_op();
                         // RES-8: contained + counted. A panic here loses
                         // the block's write-back and nothing joins this
                         // task; without the guard the phase histogram
                         // merely UNDER-REPORTS (no `Total` sample).
-                        crate::detached::tpc_spawn_guarded("write_pipeline_upload", async move {
-                            pipeline_phase_record(PipelinePhase::DetachLag, t_detach);
-                            fs.pipeline_upload_parked_block(permit, ino, b as u32, key)
-                                .await;
-                            // Task end ≈ permit release (the permit drops
-                            // inside the upload body's scope): the whole
-                            // residence every in-pipe block pays.
-                            pipeline_phase_record(PipelinePhase::Total, t_admit);
-                        });
+                        crate::detached::tpc_spawn_guarded(
+                            "write_pipeline_upload",
+                            crate::op_trace::scope(trace_id, async move {
+                                pipeline_phase_record(PipelinePhase::DetachLag, t_detach);
+                                fs.pipeline_upload_parked_block(permit, ino, b as u32, key)
+                                    .await;
+                                // Task end ≈ permit release (the permit
+                                // drops inside the upload body's scope):
+                                // the whole residence every in-pipe block
+                                // pays.
+                                pipeline_phase_record(PipelinePhase::Total, t_admit);
+                            }),
+                        );
                     }
                 } else {
                     // Partial coverage: already parked (never left the
@@ -21239,6 +21457,9 @@ impl Filesystem for SqueezefsFilesystem {
         // per-op `timeout()` wrappers (see the await-disposition audit at
         // the top of this module).
         spawn_op_watchdog();
+        // e2e audit A2: `SQUEEZEFS_OP_TRACE=1` arms the per-op trace ring
+        // at mount with the derived geometry (off = one load per hook).
+        crate::op_trace::arm_from_env();
         // Also print to stderr so operators can confirm which binary is live
         // without enabling full logging (PATH often pointed at a stale install).
         eprintln!(
@@ -21881,6 +22102,21 @@ impl Filesystem for SqueezefsFilesystem {
             return Ok(ReplyEntry {
                 ttl: Duration::from_secs(0), // dynamic stats shouldn't be cached long
                 attr: self.virtual_gen_attr(gen_ino, VirtualClass::Stats, size),
+                generation: entry_generation(),
+            });
+        }
+
+        // `.trace` (e2e audit A2): the per-op trace ring's DRAIN — the
+        // lookup consumes every ring (a second lookup reads empty) into
+        // one immutable generation; owner-only like `.stats` (VAL-7a).
+        if parent == 1 && name_str == ".trace" {
+            let payload =
+                std::sync::Arc::new(crate::op_trace::trace_json().to_string().into_bytes());
+            let size = payload.len() as u64;
+            let gen_ino = self.mint_virtual_gen_ino(VirtualClass::Trace, payload);
+            return Ok(ReplyEntry {
+                ttl: Duration::from_secs(0),
+                attr: self.virtual_gen_attr(gen_ino, VirtualClass::Trace, size),
                 generation: entry_generation(),
             });
         }

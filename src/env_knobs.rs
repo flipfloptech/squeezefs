@@ -261,6 +261,7 @@ pub static KNOBS: &[Knob] = &[
     k("SQUEEZEFS_ZCRX_LANE_TARGET", Kind::Str, "none", "Lane target tuple (6 comma-separated fields); malformed = lane not armed, loudly."),
     // -- Diagnostics / forensics -----------------------------------------
     k("SQUEEZEFS_OP_PROFILE", Kind::Bool, "off", "Per-op phase histograms + the under-i_rwsem estimator (zero cost off)."),
+    k("SQUEEZEFS_OP_TRACE", Kind::Bool, "off", "e2e audit A2: arm the per-op TRACE RING at mount — one CLOCK_MONOTONIC stamp per phase boundary per sampled op (op id = the FUSE request unique / the il slot ticket), joined on one timeline; `cat <mnt>/.trace` DRAINS it, `tests/op_trace_stitch.py` stitches it against the histograms and the kernel fuse tracepoints. Geometry and the sampling divisor are DERIVED (rings from the thread population, pool from the R5 budget, divisor so one drain interval of the op ceiling fits); the `op-trace on|off|status` admin verb toggles it live. Off = one relaxed load per hook."),
     k("SQUEEZEFS_FREE_FORENSICS", Kind::Bool, "off", "Capture a backtrace per block free to attribute double frees (expensive)."),
     k("SQUEEZEFS_STATS_KEY_CENSUS", Kind::Bool, "off", "VAL-7a: arm the `.stats` key census (live object keys + per-inode write custody — a debugging surface). The `*_count` replacements stay unconditional."),
     // -- Cluster wire (DLM S3 — the ONE cluster transport) ---------------

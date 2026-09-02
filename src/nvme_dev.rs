@@ -263,6 +263,11 @@ enum UringRequest {
         /// Enqueue stamp — feeds `read_fill_phase_ns.dev_queue`
         /// (channel + slot wait before the SQE submits).
         enq: std::time::Instant,
+        /// op-trace (audit A2): the enqueuing op's trace id (0 =
+        /// untraced). The worker thread has no task scope, so the id
+        /// travels on the request for the `dev_submit` / `dev_complete`
+        /// stamps.
+        trace_id: u64,
         /// MEM-1: owner token for a zero-copy destination (`dest_addr`
         /// reads). The WORKER holds it for exactly the SQE's lifetime and
         /// drops it at CQE completion (before the caller oneshot fires),
@@ -280,6 +285,8 @@ enum UringRequest {
         /// Enqueue stamp — feeds `write_pipeline_phase_ns.dev_queue`
         /// (the read funnel's twin, e2e audit B).
         enq: std::time::Instant,
+        /// op-trace: the enqueuing op's trace id (see `Read::trace_id`).
+        trace_id: u64,
     },
     /// DUR-2: the data-device durability barrier (io_uring `Fsync`,
     /// `FSYNC_DATASYNC` when `datasync`). `O_DIRECT` bypasses the page
@@ -303,12 +310,16 @@ enum UringResponse {
         /// SQE-submit stamp — feeds `read_fill_phase_ns.dev_service`
         /// (submit → CQE completion).
         submitted: std::time::Instant,
+        /// op-trace: carried from the request for `dev_complete`.
+        trace_id: u64,
     },
     Write {
         tx: oneshot::Sender<Result<()>>,
         /// SQE-submit stamp — feeds `write_pipeline_phase_ns.dev_service`;
         /// `None` for barriers (an fsync is not a device write).
         submitted: Option<std::time::Instant>,
+        /// op-trace: carried from the request for `dev_complete`.
+        trace_id: u64,
     },
 }
 
@@ -753,19 +764,32 @@ fn worker_thread_loop(
                 offset,
                 tx,
                 submitted,
+                trace_id,
             } => {
-                crate::fuse_client::read_fill_phase_record(
+                // ONE clock read closes `dev_service` and stamps the
+                // op-trace `dev_complete` for the carried op (audit A2).
+                let now = std::time::Instant::now();
+                crate::fuse_client::read_fill_phase_record_at(
                     crate::fuse_client::ReadFillPhase::DevService,
                     submitted,
+                    now,
                 );
+                crate::op_trace::stamp(trace_id, crate::op_trace::Stage::DevComplete, now);
                 let _ = tx.send(finish_read(io_res, bytes, size, offset));
             }
-            UringResponse::Write { tx, submitted } => {
+            UringResponse::Write {
+                tx,
+                submitted,
+                trace_id,
+            } => {
                 if let Some(submitted) = submitted {
-                    crate::fuse_client::pipeline_phase_record(
+                    let now = std::time::Instant::now();
+                    crate::fuse_client::pipeline_phase_record_at(
                         crate::fuse_client::PipelinePhase::DevService,
                         submitted,
+                        now,
                     );
+                    crate::op_trace::stamp(trace_id, crate::op_trace::Stage::DevComplete, now);
                 }
                 // DUR-2 watermark: writes AND fsyncs ride
                 // `UringResponse::Write`, and both count symmetrically at
@@ -834,6 +858,7 @@ fn worker_thread_loop(
                     bytes,
                     tx,
                     enq,
+                    trace_id,
                     dest_token,
                 } => {
                     // Test seam: deterministic device-order stall (MEM-1
@@ -863,18 +888,24 @@ fn worker_thread_loop(
                     }
                     // read_fill_phase_ns: `dev_queue` = enqueue → SQE
                     // build (channel + slot wait); `dev_service` starts
-                    // here and records at CQE completion.
-                    crate::fuse_client::read_fill_phase_record(
+                    // here and records at CQE completion. ONE clock read
+                    // closes dev_queue, anchors dev_service and stamps
+                    // the op-trace `dev_submit` (audit A2).
+                    let submitted = std::time::Instant::now();
+                    crate::fuse_client::read_fill_phase_record_at(
                         crate::fuse_client::ReadFillPhase::DevQueue,
                         enq,
+                        submitted,
                     );
+                    crate::op_trace::stamp(trace_id, crate::op_trace::Stage::DevSubmit, submitted);
                     active[slot_idx] = Some(ActiveReq {
                         response: UringResponse::Read {
                             bytes,
                             size,
                             offset,
                             tx,
-                            submitted: std::time::Instant::now(),
+                            submitted,
+                            trace_id,
                         },
                         free_ptr: None,
                         _keep_alive: None,
@@ -914,6 +945,7 @@ fn worker_thread_loop(
                     data,
                     tx,
                     enq,
+                    trace_id,
                 } => {
                     // Test seam: deterministic slow-DMA stall (the read
                     // seam's twin) — the write is already accounted
@@ -964,15 +996,21 @@ fn worker_thread_loop(
                     crate::dev_power_cut::note_write(&device_path, offset, len);
                     // write_pipeline_phase_ns: `dev_queue` = enqueue → SQE
                     // build; `dev_service` starts here and records at
-                    // CQE completion (the read funnel's twin).
-                    crate::fuse_client::pipeline_phase_record(
+                    // CQE completion (the read funnel's twin). ONE clock
+                    // read for dev_queue, dev_service's anchor and the
+                    // op-trace `dev_submit`.
+                    let submitted = std::time::Instant::now();
+                    crate::fuse_client::pipeline_phase_record_at(
                         crate::fuse_client::PipelinePhase::DevQueue,
                         enq,
+                        submitted,
                     );
+                    crate::op_trace::stamp(trace_id, crate::op_trace::Stage::DevSubmit, submitted);
                     active[slot_idx] = Some(ActiveReq {
                         response: UringResponse::Write {
                             tx,
-                            submitted: Some(std::time::Instant::now()),
+                            submitted: Some(submitted),
+                            trace_id,
                         },
                         free_ptr,
                         _keep_alive: keep_alive,
@@ -1001,6 +1039,7 @@ fn worker_thread_loop(
                         response: UringResponse::Write {
                             tx,
                             submitted: None,
+                            trace_id: 0,
                         },
                         free_ptr: None,
                         _keep_alive: None,
@@ -2148,6 +2187,7 @@ impl NvmeBlockDev {
                     data: data_type,
                     tx,
                     enq: std::time::Instant::now(),
+                    trace_id: crate::op_trace::current_op(),
                 })
                 .map_err(|e| {
                     // The send never happened: terminally resolved here.
@@ -2251,6 +2291,7 @@ impl NvmeBlockDev {
                     data: data_type,
                     tx,
                     enq: std::time::Instant::now(),
+                    trace_id: crate::op_trace::current_op(),
                 })
                 .is_err()
             {
@@ -2449,6 +2490,7 @@ impl NvmeBlockDev {
                 bytes,
                 tx,
                 enq: std::time::Instant::now(),
+                trace_id: crate::op_trace::current_op(),
                 dest_token,
             })
             .map_err(|e| {

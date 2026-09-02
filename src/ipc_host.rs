@@ -398,6 +398,9 @@ pub struct DataOp {
     /// r5 single-read law): the daemon-residence t0 every
     /// `ipc_direct_phase_ns` span anchors against.
     pub t0_ns: u64,
+    /// op-trace (audit A2): the op's trace id — the slot ticket under
+    /// the IL namespace bit when the op is in the sample, else 0.
+    pub trace_id: u64,
     /// The validated arena window `[arena_off, arena_off + len)` —
     /// **client-writable memory** (§5.3.1: single-read discipline; derived
     /// values from a severed copy only).
@@ -1030,17 +1033,42 @@ impl IpcSession {
             // `ipc_direct_phase_ns` admit/total base), so the probe
             // pays no clock read of its own.
             let t0_ns = crate::mono_core::monotonic_ns_u64();
-            if let Some(ns) =
-                squeezefs_ipc::layout::ingress_delta_ns(t0_ns as u32, slot.ingress_stamp())
-            {
+            // op-trace (audit A2): the il op id is the slot TICKET
+            // `(session, slot, generation)` under the IL namespace bit;
+            // the generation word is read only when the ring is armed
+            // (one pointer load otherwise). The dequeue read stamps
+            // `ipc_dequeue`, and the measured ingress delta places the
+            // client's publish (`ipc_ingress`) on the same clock.
+            let trace_id = if crate::op_trace::is_armed() {
+                crate::op_trace::traced(crate::op_trace::il_op_id(
+                    self.id,
+                    index,
+                    slot.core.generation(),
+                ))
+            } else {
+                0
+            };
+            let ingress =
+                squeezefs_ipc::layout::ingress_delta_ns(t0_ns as u32, slot.ingress_stamp());
+            if let Some(ns) = ingress {
                 crate::fuse_client::ipc_ingress_record_ns(ns);
+            }
+            if trace_id != 0 {
+                if let Some(ns) = ingress {
+                    crate::op_trace::stamp_mono(
+                        trace_id,
+                        crate::op_trace::Stage::IpcIngress,
+                        t0_ns.saturating_sub(ns),
+                    );
+                }
+                crate::op_trace::stamp_mono(trace_id, crate::op_trace::Stage::IpcDequeue, t0_ns);
             }
             let completion = SlotCompletion {
                 map: Arc::clone(&self.map),
                 slot_index: index,
                 inflight: Some(Arc::clone(&self.inflight)),
             };
-            self.serve_validated(&desc, t0_ns, sink, completion);
+            self.serve_validated(&desc, t0_ns, trace_id, sink, completion);
             served += 1;
             if served >= budget {
                 break;
@@ -1058,6 +1086,7 @@ impl IpcSession {
         &self,
         desc: &SlotDescriptor,
         t0_ns: u64,
+        trace_id: u64,
         sink: &Arc<dyn SessionSink>,
         completion: SlotCompletion,
     ) {
@@ -1123,6 +1152,7 @@ impl IpcSession {
                 desc: *desc,
                 binding,
                 t0_ns,
+                trace_id,
                 payload,
             },
             completion,

@@ -608,3 +608,265 @@ async fn a_drain_moves_kvmap_blocks_and_republishes_the_map() {
     );
     fx.close().await;
 }
+
+// ===========================================================================
+// 3. fsck C11 — map-plane consistency, REPORT-ONLY (design §3 fsck + A3)
+// ===========================================================================
+
+use squeezefs::fsck::{
+    repair as run_repair, run as run_fsck, FsckCtx, FsckOptions, FsckReport, RepairOptions,
+};
+
+impl Rig {
+    fn fsck_ctx(&self) -> FsckCtx {
+        FsckCtx {
+            meta: self.routed.clone(),
+            router: self.router.clone(),
+            staging_dirs: vec![],
+            expected_generation: None,
+        }
+    }
+}
+
+/// Fast-settle online options (the full suspect → settle → re-check
+/// machinery still runs; only the wall clock shrinks).
+fn online_opts() -> FsckOptions {
+    let mut o = FsckOptions::online();
+    o.settle = std::time::Duration::from_millis(100);
+    o
+}
+
+/// A per-run counter by NAME through the report's serde face — red-first
+/// friendly: a field this binary does not carry reads 0.
+fn counter(rep: &FsckReport, name: &str) -> u64 {
+    serde_json::to_value(&rep.counters)
+        .expect("counters serialize")
+        .get(name)
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0)
+}
+
+fn c11_findings(rep: &FsckReport) -> Vec<&squeezefs::fsck::FsckFinding> {
+    rep.findings.iter().filter(|f| f.class == "C11").collect()
+}
+
+/// The zero-FP tripwire: a healthy kvmap volume — crossed ino, tree
+/// records complete — runs a full online pass with `findings == 0` and
+/// both C11 must-stay-0 counters at 0.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_healthy_kvmap_volume_passes_fsck_with_zero_findings() {
+    let _serial = serial();
+    let meta = NamedTempFile::new().unwrap();
+    format_meta_kvmap(meta.path()).await;
+    let data = data_file();
+    let rig = mount(meta.path(), data.path()).await;
+    let ino = rig.mk_file("healthy").await;
+    rig.publish_spill(ino, SPILL_BLOCKS).await;
+    assert_eq!(
+        rig.durable_head(ino).await.block_map_id.as_deref(),
+        Some("kvmap:1")
+    );
+
+    let rep = run_fsck(&rig.fsck_ctx(), &online_opts())
+        .await
+        .expect("fsck pass");
+    assert_eq!(
+        rep.counters.findings, 0,
+        "healthy kvmap volume must be finding-free: {:?}",
+        rep.findings
+    );
+    assert_eq!(counter(&rep, "map_orphan_records"), 0);
+    assert_eq!(counter(&rep, "map_empty_heads"), 0);
+    rig.shutdown().await;
+}
+
+/// C11 (a) — orphan map records: a tree-7 record staged for a DEAD ino
+/// (a crashed crossing's residue class) is detected, counted on the
+/// must-stay-0 census, rolled into `fsck_findings`, REFUSED loudly by
+/// repair (report-only, the C8 posture) — and NOT reported while the
+/// ino's crossing is registered in flight (the A3 registry shield).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_seeded_orphan_map_record_is_c11_and_the_registry_shields_it() {
+    let _serial = serial();
+    let meta = NamedTempFile::new().unwrap();
+    format_meta_kvmap(meta.path()).await;
+    let data = data_file();
+    let rig = mount(meta.path(), data.path()).await;
+
+    // A live helper ino with one healthy inline mapping — the seeding
+    // vehicle (the crossing suite's residue-planting seam): the staged
+    // map op names a DEAD owner ino, so only a tree-7 record is planted.
+    let helper = rig.mk_file("helper").await;
+    let off = rig.alloc.allocate_block().await.unwrap();
+    rig.alloc.publish_block(off);
+    rig.router
+        .merge_block_mappings(
+            helper,
+            BlockMapOp::Merge(&[(0, off.to_string())]),
+            4 * 1024 * 1024,
+            LayoutFlip::ToStripedKeepStagedIdentity,
+            rig.token(helper),
+        )
+        .await
+        .expect("helper publish");
+    const DEAD_INO: u64 = 77_777;
+    let helper_head = rig
+        .kv()
+        .getxattr(helper, "layout")
+        .await
+        .unwrap()
+        .expect("helper head");
+    rig.kv()
+        .set_layout_and_size_with_map(
+            helper,
+            &helper_head,
+            4 * 1024 * 1024,
+            &[],
+            &[squeezefs::meta_backend::kv::block_map::BlockMapOp::Put {
+                owner_ino: DEAD_INO,
+                block_index: 3,
+                entry: squeezefs::meta_backend::kv::block_map::MapEntry::String(
+                    b"999999999".to_vec(),
+                ),
+            }],
+        )
+        .await
+        .expect("seed the orphan record");
+
+    let ctx = rig.fsck_ctx();
+    let rep = run_fsck(&ctx, &online_opts()).await.expect("fsck pass");
+    let c11 = c11_findings(&rep);
+    assert_eq!(
+        c11.len(),
+        1,
+        "the seeded orphan record must be ONE C11 finding: {:?}",
+        rep.findings
+    );
+    assert!(
+        c11[0].object.contains(&DEAD_INO.to_string()),
+        "the finding names the dead owner ino: {:?}",
+        c11[0]
+    );
+    assert_eq!(
+        counter(&rep, "map_orphan_records"),
+        1,
+        "the census counts the orphan RECORD"
+    );
+    assert!(
+        rep.counters.findings >= 1,
+        "C11 rides the fsck_findings roll-up"
+    );
+
+    // The A3 registry shield: a registered in-flight crossing records
+    // NO verdict for the ino — and the exemption gauge shows engagement.
+    {
+        let _guard = rig.kv().test_register_crossing(DEAD_INO);
+        let shielded = run_fsck(&ctx, &online_opts()).await.expect("fsck pass");
+        assert!(
+            c11_findings(&shielded).is_empty(),
+            "a registered crossing exempts the ino (A3): {:?}",
+            shielded.findings
+        );
+        assert!(
+            counter(&shielded, "crossing_exempted") >= 1,
+            "the shield's engagement gauge must count the exemption"
+        );
+    }
+
+    // REPORT-ONLY (the C8 posture): apply-mode repair REFUSES loudly and
+    // applies nothing for C11 — a false quarantine would hole a live
+    // crossing.
+    let rr = run_repair(
+        &ctx,
+        &rep,
+        &RepairOptions {
+            apply: true,
+            quarantine_dir: None,
+            multi_owner: false,
+        },
+    )
+    .await
+    .expect("repair invocation");
+    assert!(
+        rr.applied.iter().all(|a| a.class != "C11"),
+        "no C11 action may ever apply: {:?}",
+        rr.applied
+    );
+    let refused = rr
+        .refused
+        .iter()
+        .find(|a| a.class == "C11")
+        .expect("C11 repair must REFUSE loudly (report-only by design A3)");
+    assert!(
+        refused.detail.contains("REPORT-ONLY"),
+        "the refusal states the posture: {}",
+        refused.detail
+    );
+
+    // Detection unchanged after the refusal: the record still stands.
+    let again = run_fsck(&ctx, &online_opts()).await.expect("fsck pass");
+    assert_eq!(c11_findings(&again).len(), 1, "report-only never mutates");
+    rig.shutdown().await;
+}
+
+/// C11 (b) — head/tree coverage mismatch, the FULLY-EMPTY case only
+/// (Rev 1.1 #3 scope: the size-vs-sparse ambiguity keeps partial
+/// coverage out): a `kvmap:1` head with nonzero size and ZERO tree
+/// records is detected, counted, and shielded by the crossing registry.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_empty_kvmap_head_with_nonzero_size_is_c11_report_only() {
+    let _serial = serial();
+    let meta = NamedTempFile::new().unwrap();
+    format_meta_kvmap(meta.path()).await;
+    let data = data_file();
+    let rig = mount(meta.path(), data.path()).await;
+    let ino = rig.mk_file("empty_head").await;
+    let head = squeezefs::layout_wire::LayoutMetadata {
+        file_type: "striped".to_string(),
+        size: 4 * 1024 * 1024,
+        block_map_id: Some("kvmap:1".to_string()),
+        block_prefix: None,
+        file_id: None,
+        data_key: None,
+        block_map: None,
+    };
+    rig.kv()
+        .set_layout_and_size_with_map(
+            ino,
+            &bincode::serialize(&head).unwrap(),
+            head.size,
+            &[],
+            &[],
+        )
+        .await
+        .expect("plant the empty kvmap head");
+
+    let ctx = rig.fsck_ctx();
+    let rep = run_fsck(&ctx, &online_opts()).await.expect("fsck pass");
+    let c11 = c11_findings(&rep);
+    assert_eq!(
+        c11.len(),
+        1,
+        "the empty head must be ONE C11 finding: {:?}",
+        rep.findings
+    );
+    assert_eq!(
+        counter(&rep, "map_empty_heads"),
+        1,
+        "the census counts the empty head"
+    );
+    assert!(rep.counters.findings >= 1);
+
+    // The registry shield covers the empty-head arm too.
+    {
+        let _guard = rig.kv().test_register_crossing(ino);
+        let shielded = run_fsck(&ctx, &online_opts()).await.expect("fsck pass");
+        assert!(
+            c11_findings(&shielded).is_empty(),
+            "a registered crossing exempts the ino (A3): {:?}",
+            shielded.findings
+        );
+        assert!(counter(&shielded, "crossing_exempted") >= 1);
+    }
+    rig.shutdown().await;
+}

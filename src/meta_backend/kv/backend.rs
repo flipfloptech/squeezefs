@@ -2878,12 +2878,23 @@ impl KvMetaBackend {
         Ok(out)
     }
 
-    /// Is `ino`'s crossing train in flight on this volume? Exported for
-    /// the future fsck **C11** map-plane class (design A3: an incomplete
-    /// pass records no verdict for a registered ino — the C2/C3
-    /// `inflight_exempted` pattern); the PR 2 contract tests consume it.
+    /// Is `ino`'s crossing train in flight on this volume? The fsck
+    /// **C11** map-plane class's zero-FP registry shield (design A3: an
+    /// incomplete pass records no verdict for a registered ino — the
+    /// C2/C3 `inflight_exempted` pattern); the PR 2 contract tests
+    /// consume it too.
     pub fn crossing_in_flight(&self, ino: Ino) -> bool {
         self.crossing_inflight.contains_sync(&ino)
+    }
+
+    /// TEST SEAM (the C11 shield contracts, `tests/kvmap_walker_tests.rs`):
+    /// register `ino` in the crossing registry exactly as the train does,
+    /// returning the same RAII guard. Production registration happens only
+    /// inside the held-4a migration train; the seam exists because the A3
+    /// shield's zero-FP contract must be pinned deterministically, not by
+    /// racing a live train.
+    pub fn test_register_crossing(&self, ino: Ino) -> impl Drop + '_ {
+        CrossingGuard::register(&self.crossing_inflight, ino)
     }
 
     /// The one-time **bit-16 ratchet + tree-7 mint** (PR 2, the

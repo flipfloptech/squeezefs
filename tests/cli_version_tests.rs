@@ -9,8 +9,8 @@
 //!
 //! Pinned here:
 //! * `squeezefs --version` / `-V` print one grep-friendly, train-first line:
-//!   - untagged: `squeezefs <train> (<short12>[-dirty] / <full40>[-dirty]) built <utc-rfc3339>`
-//!   - tagged:   `squeezefs <train> (<short12>[-dirty] / <full40>[-dirty], tag <tag>) built <utc-rfc3339>`
+//!   - untagged: `squeezefs <train> (<short12>[-dirty] / <full40>[-dirty]) built <utc-rfc3339> profile <profile>`
+//!   - tagged:   `squeezefs <train> (<short12>[-dirty] / <full40>[-dirty], tag <tag>) built <utc-rfc3339> profile <profile>`
 //! * The train version is `CARGO_PKG_VERSION` and is no longer the retired
 //!   `0.1.0` cargo placeholder.
 //! * A binary built from this repo embeds a REAL hash (never the `unknown`
@@ -50,7 +50,7 @@ fn version_line_regex() -> Regex {
         r"(?x)^squeezefs\ \d+\.\d+\.\d+\ \(
             [0-9a-f]{12}(?:-dirty)?\ /\ [0-9a-f]{40}(?:-dirty)?
             (?:,\ tag\ \S+)?
-          \)\ built\ \d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z
+          \)\ built\ \d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z\ profile\ [a-z0-9-]+
           (?:\ \[PROFILING\ BUILD:\ [a-z0-9+-]+\ —\ NOT\ measurement-valid\])?$",
     )
     .expect("version-line regex compiles")
@@ -200,21 +200,22 @@ const TRAIN: &str = "1.1.0";
 const SHORT: &str = "f63455bcb824";
 const FULL: &str = "f63455bcb8249b064531d000624c40825a6e763e";
 const TS: &str = "2026-07-18T00:00:00Z";
+const PROF: &str = "release";
 
 #[test]
 fn formatter_untagged_clean_is_train_first_with_the_commit_pair() {
     assert_eq!(
-        squeezefs::version::format_version_line(TRAIN, SHORT, FULL, false, "", TS),
-        format!("{TRAIN} ({SHORT} / {FULL}) built {TS}"),
-        "untagged clean build: `<train> (<short> / <full>) built <ts>`"
+        squeezefs::version::format_version_line(TRAIN, SHORT, FULL, false, "", TS, PROF),
+        format!("{TRAIN} ({SHORT} / {FULL}) built {TS} profile {PROF}"),
+        "untagged clean build: `<train> (<short> / <full>) built <ts> profile <p>`"
     );
 }
 
 #[test]
 fn formatter_untagged_dirty_suffixes_both_hashes() {
     assert_eq!(
-        squeezefs::version::format_version_line(TRAIN, SHORT, FULL, true, "", TS),
-        format!("{TRAIN} ({SHORT}-dirty / {FULL}-dirty) built {TS}"),
+        squeezefs::version::format_version_line(TRAIN, SHORT, FULL, true, "", TS, PROF),
+        format!("{TRAIN} ({SHORT}-dirty / {FULL}-dirty) built {TS} profile {PROF}"),
         "dirty build: -dirty rides both the short and full hash"
     );
 }
@@ -222,8 +223,16 @@ fn formatter_untagged_dirty_suffixes_both_hashes() {
 #[test]
 fn formatter_tagged_release_carries_the_tag_with_the_commit() {
     assert_eq!(
-        squeezefs::version::format_version_line(TRAIN, SHORT, FULL, false, "stable-2026.07", TS),
-        format!("{TRAIN} ({SHORT} / {FULL}, tag stable-2026.07) built {TS}"),
+        squeezefs::version::format_version_line(
+            TRAIN,
+            SHORT,
+            FULL,
+            false,
+            "stable-2026.07",
+            TS,
+            "dist"
+        ),
+        format!("{TRAIN} ({SHORT} / {FULL}, tag stable-2026.07) built {TS} profile dist"),
         "tagged release: `<train> (<short> / <full>, tag <tag>) built <ts>` \
          — the tag names the release, the commit identity survives verbatim"
     );
@@ -232,8 +241,10 @@ fn formatter_tagged_release_carries_the_tag_with_the_commit() {
 #[test]
 fn formatter_tagged_dirty_still_carries_dirty_hashes() {
     assert_eq!(
-        squeezefs::version::format_version_line(TRAIN, SHORT, FULL, true, "lts-2026.07", TS),
-        format!("{TRAIN} ({SHORT}-dirty / {FULL}-dirty, tag lts-2026.07) built {TS}"),
+        squeezefs::version::format_version_line(TRAIN, SHORT, FULL, true, "lts-2026.07", TS, PROF),
+        format!(
+            "{TRAIN} ({SHORT}-dirty / {FULL}-dirty, tag lts-2026.07) built {TS} profile {PROF}"
+        ),
         "a dirty rebuild of a tagged commit must not masquerade as the release"
     );
 }
@@ -250,7 +261,7 @@ fn formatter_output_shapes_match_the_cli_regex() {
     ] {
         let line = format!(
             "squeezefs {}",
-            squeezefs::version::format_version_line(TRAIN, SHORT, FULL, dirty, tag, TS)
+            squeezefs::version::format_version_line(TRAIN, SHORT, FULL, dirty, tag, TS, PROF)
         );
         assert!(
             re.is_match(&line),
@@ -453,5 +464,61 @@ async fn stats_surface_exports_build_commit_and_build_tag() {
         tag,
         squeezefs::version::build_tag(),
         "stats build_tag must be the embedded release tag (empty when untagged)"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The two-profile LTO law (user directive 2026-09-02): fat LTO + one
+// codegen unit belong to TAGGED releases only — the `dist` profile. Every
+// `--release` (dev, field A/B legs, the gate) is thin-LTO. A binary names
+// its profile so no measurement row can silently mix the two.
+// ---------------------------------------------------------------------------
+
+/// The build profile the version line reports, from the same compile-time
+/// env `build.rs` stamps into the binary.
+fn expected_profile() -> &'static str {
+    env!("SQUEEZEFS_BUILD_PROFILE")
+}
+
+#[test]
+fn version_line_names_the_build_profile() {
+    let stdout = run_version("--version");
+    let line = stdout.trim_end_matches('\n');
+    let want = format!(" profile {}", expected_profile());
+    assert!(
+        line.contains(&want),
+        "the version line must name the cargo profile the binary was built \
+         with (`{want}`) — the two-profile LTO law: only `dist` carries fat \
+         LTO, and a row must be able to say which one it measured; got: {line:?}"
+    );
+}
+
+#[test]
+fn only_the_dist_profile_carries_fat_lto() {
+    let manifest = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml"))
+        .expect("read Cargo.toml");
+    let release = manifest
+        .split("[profile.release]")
+        .nth(1)
+        .and_then(|s| s.split("\n[").next())
+        .expect("[profile.release] present");
+    assert!(
+        release.contains(r#"lto = "thin""#),
+        "[profile.release] must be thin-LTO (the dev/field/gate profile): {release}"
+    );
+    assert!(
+        !release.contains("codegen-units = 1"),
+        "[profile.release] must not pin codegen-units = 1 (that is the dist profile's)"
+    );
+    let dist = manifest
+        .split("[profile.dist]")
+        .nth(1)
+        .and_then(|s| s.split("\n[").next())
+        .expect("[profile.dist] present — the tagged-release profile");
+    assert!(
+        dist.contains(r#"inherits = "release""#)
+            && dist.contains(r#"lto = "fat""#)
+            && dist.contains("codegen-units = 1"),
+        "[profile.dist] = release + fat LTO + codegen-units = 1: {dist}"
     );
 }

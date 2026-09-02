@@ -791,8 +791,9 @@ async fn a_fresh_format_does_not_carry_bit16_and_sector0_stays_byte_identical() 
     assert_eq!(TREE_BLOCK_MAP, 7, "the §4.2 tree table pins the id");
     assert_eq!(TREE_ID_MAX, TREE_BLOCK_MAP);
     assert_eq!(TREE_BLOCK_REFS, 6, "tree 7 sits beside the refs tree");
-    assert!(
-        TREE_BLOCK_MAP <= 0x0F,
+    assert_eq!(
+        TREE_BLOCK_MAP & 0xF0,
+        0,
         "the journal tag nibble bounds tree ids at 15"
     );
     assert_eq!(

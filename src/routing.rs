@@ -7768,7 +7768,7 @@ impl DataRouter {
                 // Never-lossy refill: the un-committed remainder returns
                 // to the accumulator for the next save's carry.
                 let mut refill = chunk;
-                refill.extend(refs.drain(..));
+                refill.append(&mut refs);
                 self.note_block_ref_ops(ino, refill);
                 return Err(e);
             }

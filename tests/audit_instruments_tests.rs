@@ -19,6 +19,12 @@
 //!    backend, backend_to_reply, total}, riding the existing `OpProf`
 //!    begin/mark/Drop hooks with NO `SQUEEZEFS_OP_PROFILE` gate; the gated
 //!    `fuse_op_phase_ns` keeps its behavior (silent + absent when off).
+//! D. Lock wait AND hold: `lock_phase_ns` = {stripe_lock_wait,
+//!    stripe_lock_hold} for the 3.5 `INODE_META_LOCKS` at every site (one
+//!    guard type, `routing::meta_lock_acquire`), `leaf_lock_wait` (the 4b
+//!    pure wait split out of `pass_leaf_locks`) and `dlm_guard_hold` (the
+//!    4a exclusive I-guard's `DlmGuard` Drop). Waits/holds move on
+//!    contended fixtures, waits stay zero uncontended.
 
 use fuse3::raw::prelude::Filesystem;
 use fuse3::raw::Request;
@@ -766,4 +772,176 @@ async fn real_create_moves_the_family_and_the_stats_inode_carries_it_ungated() {
         m3, m2,
         "a stats-inode READ is a data op: no metadata class moves"
     );
+}
+
+// ---------------------------------------------------------------------------
+// D — lock wait AND hold histograms
+// ---------------------------------------------------------------------------
+
+const LOCK_PHASES: [&str; 4] = [
+    "stripe_lock_wait",
+    "stripe_lock_hold",
+    "leaf_lock_wait",
+    "dlm_guard_hold",
+];
+
+#[test]
+fn lock_family_is_pinned_to_four_phases() {
+    let fam = squeezefs::fuse_client::lock_phase_json();
+    let obj = fam.as_object().expect("family object");
+    assert_eq!(
+        obj.len(),
+        LOCK_PHASES.len(),
+        "exactly the four lock phases: {obj:?}"
+    );
+    for p in LOCK_PHASES {
+        let _ = phase_words(&fam, p);
+    }
+}
+
+/// The 3.5 stripe guard: an uncontended acquire records a ZERO wait (the
+/// fast path pays no clock read for it) and one hold; a contended acquire
+/// records the wait it actually parked for, and the holder's hold
+/// brackets its critical section.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn stripe_lock_wait_and_hold_move_on_contention_and_wait_is_zero_uncontended() {
+    use squeezefs::fuse_client::lock_phase_json;
+    use squeezefs::routing::meta_lock_acquire;
+    let _g = serial().await;
+    const INO: u64 = 0x5EED_0001;
+
+    // Uncontended.
+    let f0 = lock_phase_json();
+    {
+        let g = meta_lock_acquire(INO).await;
+        std::thread::sleep(Duration::from_micros(500));
+        drop(g);
+    }
+    let f1 = lock_phase_json();
+    let (w0, ws0) = phase_words(&f0, "stripe_lock_wait");
+    let (w1, ws1) = phase_words(&f1, "stripe_lock_wait");
+    let (h0, hs0) = phase_words(&f0, "stripe_lock_hold");
+    let (h1, hs1) = phase_words(&f1, "stripe_lock_hold");
+    assert_eq!(w1 - w0, 1, "one wait sample per acquire");
+    assert_eq!(
+        ws1 - ws0,
+        0,
+        "uncontended ⇒ the wait sample is exactly zero"
+    );
+    assert_eq!(h1 - h0, 1, "one hold sample per release");
+    assert!(
+        hs1 - hs0 >= 500_000,
+        "hold brackets the 500 µs critical section"
+    );
+
+    // Contended: A holds for 2 ms while B parks.
+    let f0 = lock_phase_json();
+    let (armed_tx, armed_rx) = tokio::sync::oneshot::channel::<()>();
+    let a = tokio::spawn(async move {
+        let g = meta_lock_acquire(INO).await;
+        armed_tx.send(()).unwrap();
+        squeezefs_ipc::sqz_time::sleep(Duration::from_millis(2)).await;
+        drop(g);
+    });
+    armed_rx.await.unwrap();
+    let t0 = std::time::Instant::now();
+    let g = meta_lock_acquire(INO).await;
+    let b_wall = t0.elapsed().as_nanos() as u64;
+    drop(g);
+    a.await.unwrap();
+    let f1 = lock_phase_json();
+    let (_, ws0) = phase_words(&f0, "stripe_lock_wait");
+    let (w1, ws1) = phase_words(&f1, "stripe_lock_wait");
+    let (h0, hs0) = phase_words(&f0, "stripe_lock_hold");
+    let (h1, hs1) = phase_words(&f1, "stripe_lock_hold");
+    assert_eq!(
+        w1 - phase_words(&f0, "stripe_lock_wait").0,
+        2,
+        "two acquires"
+    );
+    assert!(
+        ws1 - ws0 >= 1_000_000 && ws1 - ws0 <= b_wall,
+        "B's parked wait ({}) is ≥ ~A's hold and ⊆ B's wall ({b_wall})",
+        ws1 - ws0
+    );
+    assert_eq!(h1 - h0, 2, "two releases");
+    assert!(hs1 - hs0 >= 2_000_000, "A's hold brackets its 2 ms section");
+}
+
+/// The 4a I-guard: an EXCLUSIVE inode guard records its hold at drop;
+/// shared inode guards and dentry guards record nothing here.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dlm_exclusive_inode_guard_records_its_hold() {
+    use squeezefs::fuse_client::lock_phase_json;
+    use squeezefs::meta_backend::dlm::DlmLockManager;
+    let _g = serial().await;
+    let dlm = DlmLockManager::new();
+
+    let f0 = lock_phase_json();
+    let g = dlm.lock_inode_exclusive(99).await;
+    std::thread::sleep(Duration::from_millis(1));
+    drop(g);
+    let f1 = lock_phase_json();
+    let (c0, s0) = phase_words(&f0, "dlm_guard_hold");
+    let (c1, s1) = phase_words(&f1, "dlm_guard_hold");
+    assert_eq!(c1 - c0, 1, "one exclusive I-guard ⇒ one hold sample");
+    assert!(s1 - s0 >= 1_000_000, "hold brackets the 1 ms section");
+
+    let f2 = lock_phase_json();
+    drop(dlm.lock_inode_shared(99).await);
+    drop(dlm.lock_dentry_exclusive(1, "x").await);
+    drop(dlm.lock_dentry_shared(1, "y").await);
+    let f3 = lock_phase_json();
+    assert_eq!(
+        phase_words(&f3, "dlm_guard_hold"),
+        phase_words(&f2, "dlm_guard_hold"),
+        "shared / dentry guards are not the 4a exclusive I-guard"
+    );
+}
+
+/// Through the real FS: creates take the 4a exclusive I-guard (holds move)
+/// and commit through the conveyor, whose pass records exactly one
+/// `leaf_lock_wait` per `pass_leaf_locks` with `Σ leaf_lock_wait ≤
+/// Σ pass_leaf_locks` (the pure wait is a subset of the locked window).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn conveyor_pass_splits_the_leaf_lock_pure_wait() {
+    use squeezefs::fuse_client::{lock_phase_json, meta_txpass_phase_json};
+    let _g = serial().await;
+    let h = make([0x31; 16], "audit_d_leaf").await;
+    let l0 = lock_phase_json();
+    let t0 = meta_txpass_phase_json();
+    for i in 0..16 {
+        create(&h, &format!("d{i}")).await;
+    }
+    let l1 = lock_phase_json();
+    let t1 = meta_txpass_phase_json();
+    let (pl0, pls0) = phase_words(&t0, "pass_leaf_locks");
+    let (pl1, pls1) = phase_words(&t1, "pass_leaf_locks");
+    let (lw0, lws0) = phase_words(&l0, "leaf_lock_wait");
+    let (lw1, lws1) = phase_words(&l1, "leaf_lock_wait");
+    assert!(pl1 - pl0 >= 1, "creates run conveyor passes");
+    assert_eq!(lw1 - lw0, pl1 - pl0, "one leaf_lock_wait per pass");
+    assert!(
+        lws1 - lws0 <= pls1 - pls0,
+        "Σ leaf_lock_wait ({}) ⊆ Σ pass_leaf_locks ({})",
+        lws1 - lws0,
+        pls1 - pls0
+    );
+    assert!(
+        phase_words(&l1, "dlm_guard_hold").0 - phase_words(&l0, "dlm_guard_hold").0 >= 16,
+        "every create holds at least one exclusive I-guard"
+    );
+
+    // Stats-inode surface, ungated.
+    let reply =
+        h.fs.read(h.req, squeezefs::fuse_client::STATS_INODE, 0, 0, 1 << 22, 0)
+            .await
+            .expect("read stats inode");
+    let stats: serde_json::Value = serde_json::from_slice(&reply.data).expect("stats JSON");
+    let fam = stats["metrics"]
+        .get("lock_phase_ns")
+        .expect("stats inode must carry lock_phase_ns UNGATED");
+    for p in LOCK_PHASES {
+        let _ = phase_words(fam, p);
+    }
 }

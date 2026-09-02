@@ -215,3 +215,36 @@ folded into §§2–5 and binds the PR ladder:
 | A8 | MEDIUM | `GetBlockMapRange` leaf-span replies + co-writer map cache with the free-grace-bounded staleness law, invalidated on free-epoch acks |
 | A9 | MEDIUM | Reader-side head+record resolution seqlock-bracketed; head-cache skew rule stated |
 | A10 | LOW | `SQUEEZEFS_MAP_MIGRATE_CHUNK` registry max ≤ 1,024; `SQUEEZEFS_KVMAP=0` governs new crossings only (kvmap-head resolution can never be disabled) |
+
+## 7. Rev 1.1 — PR-2 implementation-map addenda (2026-09-01)
+
+The pre-implementation code map surfaced five design-level facts that bind
+PR 2 (line anchors drift — anchor on symbols):
+
+1. **The held-4a train needs its own backend seam.** `DlmLockManager`
+   stripes are non-reentrant (re-locking self-deadlocks), so the crossing
+   train cannot compose existing verbs (`commit_block_refs` /
+   `set_layout_and_size` each acquire their own 4a). The train is a
+   backend-internal method (`migrate_block_map_train`) taking
+   `lock_inode_exclusive(ino)` ONCE and running every chunk tx with
+   `hold_guards(clone)` — the M7 guards-co-ownership law; the `routed_*`
+   guards-parameter precedent. Shipped inos: the co-writer ships ONE
+   RETRIED-class `MigrateBlockMap` verb (FreeBlocks dedup-window
+   template); the OWNER runs the train under its own 4a + serve stripe
+   (the finding-36b whole-claim-set law).
+2. **Derived recovery must learn tree 7 IN PR 2** (not PR 4): on a bit-9-
+   absent volume the mount recovery walk derives owned blocks from layout
+   heads — a `kvmap:` head would yield zero and gap-completion would
+   free-list LIVE data. Either the tree-7 walk arm lands in PR 2 or kvmap
+   crossings hard-gate on `block_refs_engaged()` (bit 9).
+3. **Both C8 oracle sides learn tree 7 in PR 2** (fsck census + derived
+   walk through the shared extraction), or every kvmap ino reads as drift
+   on a healthy volume — PR 2's own acceptance gate demands it.
+4. **The read-minimal set is mandatory in PR 2**: cache eviction +
+   refetch on a `kvmap:1` head must resolve via the tree (a `block_map:
+   None` head would zero-read). Unlink/`delete_file` of a kvmap ino needs
+   at least a bounded synchronous record sweep until A2's job-fabric
+   sweep lands (never silent residue).
+5. **kvmap heads are STICKY** (decision): a shrinking map never collapses
+   back inline — collapse would need its own sweep tx and buys nothing
+   (the head is ~100 B either way). Pinned by test in PR 2.

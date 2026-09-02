@@ -29,10 +29,18 @@ pub struct ThreadClass {
 /// before any shorter `sqz-ipc` prefix could be added). The mount-slot
 /// comm suffix (`m{:x}`) sits after the index, so prefix matching
 /// tolerates it.
-pub const CLASSES: [ThreadClass; 7] = [
+pub const CLASSES: [ThreadClass; 9] = [
     ThreadClass {
         prefix: "fuse3-tpc",
         class: "fuse3-tpc",
+    },
+    // The FUSE-over-io_uring queue workers (`f3-ur{qid}[-{qid}]`, plus the
+    // `/dev/fuse` watcher): the transport's submit/reap side and, on a zc
+    // kernel, the device DMA issuer of the READ direct leg. R-1 (2026-09-02)
+    // found them folded into `other` at 51 % of a kern rand-4k row's CPU.
+    ThreadClass {
+        prefix: "f3-ur",
+        class: "fuse3-ur",
     },
     ThreadClass {
         prefix: "sqz-ipc-svc",
@@ -57,6 +65,13 @@ pub const CLASSES: [ThreadClass; 7] = [
     ThreadClass {
         prefix: "sqz-zcrx",
         class: "sqz-zcrx",
+    },
+    // Both `sqz_time` service threads (the squeezefs-ipc registry and the
+    // fuse3 fork's `#[path]`-shared copy): the timer class's own CPU face
+    // — tombstone pops under each registry lock (R-1, candidate finding 48).
+    ThreadClass {
+        prefix: "sqz-timer",
+        class: "sqz-timer",
     },
 ];
 

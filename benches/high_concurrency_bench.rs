@@ -1412,6 +1412,219 @@ fn bench_op_trace_hook(c: &mut Criterion) {
     });
     op_trace::disarm();
     let _ = op_trace::drain();
+/// A future that is Pending on its first poll and Ready on the second —
+/// the device-read completion oneshot's shape (the DMA always outlives
+/// the first poll, so `Timeout::poll` registers the sleep's waker).
+struct PendingOnce(bool);
+
+impl std::future::Future for PendingOnce {
+    type Output = ();
+    fn poll(
+        mut self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<()> {
+        if self.0 {
+            std::task::Poll::Ready(())
+        } else {
+            self.0 = true;
+            std::task::Poll::Pending
+        }
+    }
+}
+
+/// One device read's timer ceremony (`nvme_dev.rs` `read_block`): arm
+/// `sqz_time::timeout(d, rx)` (global-lock registry insert + heap push +
+/// `Box::pin`), first poll Pending (global lock, waker clone), completion
+/// poll Ready, drop (global lock, live-map remove — the heap entry stays
+/// as a tombstone until the service thread pops it at `d`).
+fn timeout_cycle(d: std::time::Duration) {
+    let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+    let mut t = squeezefs_ipc::sqz_time::timeout(d, PendingOnce(false));
+    let mut p = std::pin::Pin::new(&mut t);
+    assert!(std::future::Future::poll(p.as_mut(), &mut cx).is_pending());
+    assert!(std::future::Future::poll(p.as_mut(), &mut cx).is_ready());
+    drop(t);
+}
+
+/// The timer-less alternative's per-op face: stamp `Instant::now()` into
+/// the in-flight slot at submit, compare against the deadline at reap.
+fn deadline_stamp_cycle(slot: &mut Option<std::time::Instant>, d: std::time::Duration) {
+    *slot = Some(std::time::Instant::now());
+    let submitted = slot.take().expect("stamped");
+    assert!(black_box(submitted.elapsed()) < d);
+}
+
+/// One device read's completion channel (`nvme_dev.rs` `read_block` ↔
+/// the worker's `complete_one`): channel mint (Arc alloc), caller poll
+/// Pending (mutex, waker clone), worker `send` (mutex, wake), caller poll
+/// Ready (mutex), Sender drop (mutex), Receiver drop (mutex).
+fn sqz_oneshot_cycle() {
+    let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+    let (tx, mut rx) = squeezefs_ipc::sqz_channel::oneshot::channel::<u64>();
+    assert!(std::future::Future::poll(std::pin::Pin::new(&mut rx), &mut cx).is_pending());
+    tx.send(black_box(7)).expect("receiver alive");
+    assert!(std::future::Future::poll(std::pin::Pin::new(&mut rx), &mut cx).is_ready());
+}
+
+/// The lock-free reference for the same cycle (`futures::channel::oneshot`:
+/// atomic state word + a locked-by-bit waker slot, no mutex).
+fn futures_oneshot_cycle() {
+    let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+    let (tx, mut rx) = futures::channel::oneshot::channel::<u64>();
+    assert!(std::future::Future::poll(std::pin::Pin::new(&mut rx), &mut cx).is_pending());
+    tx.send(black_box(7)).expect("receiver alive");
+    assert!(std::future::Future::poll(std::pin::Pin::new(&mut rx), &mut cx).is_ready());
+}
+
+/// **e2e audit R-1 (candidate finding 48) — the per-device-read executor
+/// primitives**, priced in isolation before the in-daemon attribution.
+///
+/// FIELD shape (`.benchmarks/2026-09-02-e2e-audit-baseline.md`): rand-4k
+/// kernel reads at 441 k IOPS, each one `NvmeBlockDev::read_block` →
+/// `sqz_time::timeout(30 s, oneshot)` over a crossbeam lane channel. Three
+/// arms per read touch ONE process-global registry mutex
+/// (`crates/squeezefs-ipc/src/sqz_time.rs`), and every completed read
+/// leaves a heap tombstone the `sqz-timer` thread pops 30 s later under
+/// that same lock — at the field rate that heap holds ≈ 13 M entries.
+///
+/// Rows: the timer cycle uncontended vs 8 / 32 threads (the handler-lane
+/// population), with a 30 s deadline (the shipped shape — tombstones
+/// accumulate) and a 2 ms deadline (the service thread pops them
+/// concurrently, the steady-state lock-sharing face compressed); the
+/// tombstone drain itself (200 k pops, against an empty heap and against a
+/// 4 M-entry resident heap — log₂n sift-downs through a 64 MiB array);
+/// the completion oneshot (sqz mutex vs the lock-free reference); the
+/// crossbeam lane channel (already lock-free — the ledger's "per-channel
+/// Mutex" claim is checked here); and the timer-less deadline stamp.
+fn bench_read_fill_executor_prims(c: &mut Criterion) {
+    use std::time::{Duration, Instant};
+
+    const PER_THREAD: usize = 8_192;
+    const FIELD_DEADLINE: Duration = Duration::from_secs(30);
+    const SHORT_DEADLINE: Duration = Duration::from_millis(2);
+
+    let mut group = c.benchmark_group("read_fill_executor_prims");
+    // The 30 s-deadline rows leave one tombstone per op in the process-wide
+    // heap for 30 s; a bounded sample keeps that population bounded.
+    group.sample_size(10);
+    group.warm_up_time(Duration::from_millis(500));
+    group.measurement_time(Duration::from_secs(1));
+
+    // The service thread's tombstone drain (FIRST — before any 30 s row
+    // leaves long-lived tombstones that would pop mid-measurement): arm N
+    // sleeps at one near deadline, cancel them all, then time deadline →
+    // N tombstones popped. The service pops the whole batch in ONE
+    // critical section, so the probe that sees the count advance marks
+    // the batch's end.
+    const DRAIN: usize = 200_000;
+    let loaded = std::cell::Cell::new(0usize);
+    let drain_batch = |resident: usize| {
+        // Resident far-future tombstones deepen the heap for the whole
+        // process lifetime (they never fire) — arm them once.
+        while loaded.get() < resident {
+            drop(squeezefs_ipc::sqz_time::sleep(Duration::from_secs(3600)));
+            loaded.set(loaded.get() + 1);
+        }
+        let popped0 = squeezefs_ipc::sqz_time::TIMER_TOMBSTONES_SKIPPED
+            .load(std::sync::atomic::Ordering::Relaxed);
+        // Far enough out that every arm lands before the service wakes
+        // (an arm against the deep heap sifts up log₂n levels).
+        let deadline = Instant::now() + Duration::from_millis(300);
+        for _ in 0..DRAIN {
+            drop(squeezefs_ipc::sqz_time::sleep_until(deadline));
+        }
+        assert!(Instant::now() < deadline, "arm loop outran the deadline");
+        loop {
+            let popped = squeezefs_ipc::sqz_time::TIMER_TOMBSTONES_SKIPPED
+                .load(std::sync::atomic::Ordering::Relaxed);
+            if popped - popped0 >= DRAIN as u64 {
+                break;
+            }
+            std::thread::sleep(Duration::from_micros(100));
+        }
+        Instant::now().saturating_duration_since(deadline)
+    };
+    group.throughput(criterion::Throughput::Elements(DRAIN as u64));
+    group.bench_function("tombstone_drain_200k_heap_200k", |b| {
+        b.iter_custom(|iters| (0..iters).map(|_| drain_batch(0)).sum());
+    });
+    group.bench_function("tombstone_drain_200k_heap_4m", |b| {
+        b.iter_custom(|iters| (0..iters).map(|_| drain_batch(4_000_000)).sum());
+    });
+
+    group.throughput(criterion::Throughput::Elements(1));
+    group.bench_function("timeout_30s_cycle_1t", |b| {
+        b.iter(|| timeout_cycle(FIELD_DEADLINE));
+    });
+    group.bench_function("timeout_2ms_cycle_1t", |b| {
+        b.iter(|| timeout_cycle(SHORT_DEADLINE));
+    });
+    group.bench_function("sqz_oneshot_cycle", |b| {
+        b.iter(sqz_oneshot_cycle);
+    });
+    group.bench_function("futures_oneshot_cycle", |b| {
+        b.iter(futures_oneshot_cycle);
+    });
+    group.bench_function("crossbeam_lane_try_send_recv", |b| {
+        let (tx, rx) = crossbeam::channel::bounded::<u64>(4096);
+        b.iter(|| {
+            tx.try_send(black_box(7)).expect("room");
+            assert_eq!(rx.try_recv().expect("queued"), 7);
+        });
+    });
+    group.bench_function("deadline_stamp_cycle", |b| {
+        let mut slot = None;
+        b.iter(|| deadline_stamp_cycle(&mut slot, FIELD_DEADLINE));
+    });
+
+    // Contention slope: N threads × PER_THREAD cycles against the ONE
+    // registry lock (the handler-lane population at the field rate).
+    for &(threads, d, label) in &[
+        (8usize, FIELD_DEADLINE, "timeout_30s_cycle_8t"),
+        (32, FIELD_DEADLINE, "timeout_30s_cycle_32t"),
+        (8, SHORT_DEADLINE, "timeout_2ms_cycle_8t"),
+        (32, SHORT_DEADLINE, "timeout_2ms_cycle_32t"),
+    ] {
+        group.throughput(criterion::Throughput::Elements(
+            (threads * PER_THREAD) as u64,
+        ));
+        group.bench_function(label, |b| {
+            b.iter(|| {
+                let hs: Vec<_> = (0..threads)
+                    .map(|_| {
+                        std::thread::spawn(move || {
+                            for _ in 0..PER_THREAD {
+                                timeout_cycle(d);
+                            }
+                        })
+                    })
+                    .collect();
+                for h in hs {
+                    h.join().unwrap();
+                }
+            });
+        });
+    }
+    // The stamp under the same thread population: no shared word at all.
+    group.throughput(criterion::Throughput::Elements((32 * PER_THREAD) as u64));
+    group.bench_function("deadline_stamp_cycle_32t", |b| {
+        b.iter(|| {
+            let hs: Vec<_> = (0..32)
+                .map(|_| {
+                    std::thread::spawn(move || {
+                        let mut slot = None;
+                        for _ in 0..PER_THREAD {
+                            deadline_stamp_cycle(&mut slot, FIELD_DEADLINE);
+                        }
+                    })
+                })
+                .collect();
+            for h in hs {
+                h.join().unwrap();
+            }
+        });
+    });
+
     group.finish();
 }
 
@@ -1429,6 +1642,8 @@ criterion_group!(
     bench_dynamic_meta_routing,
     bench_error_paths,
     bench_writeback_latch,
-    bench_read_mostly_cache
+    bench_read_mostly_cache,
+    // Last: its 4 M-entry resident heap load outlives the group.
+    bench_read_fill_executor_prims
 );
 criterion_main!(benches);

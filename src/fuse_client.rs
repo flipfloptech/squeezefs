@@ -9870,6 +9870,10 @@ impl SqueezefsFilesystem {
         // the `.trace` inode's — a stats read never drains).
         let (op_trace_armed, op_trace_samples, op_trace_dropped, op_trace_divisor) =
             crate::op_trace::stats_gauges();
+        // Timer registry occupancy (one lock per registry, a stats read).
+        let (timer_heap_entries, timer_live_sleeps) = squeezefs_ipc::sqz_time::registry_len();
+        let (transport_timer_heap_entries, transport_timer_live_sleeps) =
+            fuse3::sqz_time::registry_len();
 
         let mut stats_obj = serde_json::json!({
             // Build identity (docs/operations.md §Versioning & releases):
@@ -10142,6 +10146,28 @@ impl SqueezefsFilesystem {
                 // schedules; growth = a lost wake was absorbed, loudly
                 // (the backstop WORKING, never a wedge).
                 "lock_ticked_reregisters": crate::sqz_sync::TICK_RECOVERIES.load(Ordering::Relaxed),
+                // e2e audit R-1 (candidate finding 48): the sqz_time
+                // registry's per-op face. `timer_arms` grows once per
+                // `sleep`/`timeout` arm; `timer_tombstones_skipped` once
+                // per cancelled arm the service thread later pops under
+                // the process-global lock; the two gauges are the live
+                // heap/live-map occupancy (heap − live ≈ tombstones
+                // queued). A device read that no longer arms a timer
+                // reads 0 growth here across its row.
+                "timer_arms": squeezefs_ipc::sqz_time::TIMER_ARMS.load(Ordering::Relaxed),
+                "timer_tombstones_skipped": squeezefs_ipc::sqz_time::TIMER_TOMBSTONES_SKIPPED.load(Ordering::Relaxed),
+                "timer_heap_entries": timer_heap_entries,
+                "timer_live_sleeps": timer_live_sleeps,
+                // The fuse3 fork's `#[path]`-shared copy is a SECOND
+                // registry (own lock, own heap, own `sqz-timer` thread):
+                // the transport's ticked parks — `InboundQueue::pop`'s
+                // recv, the per-qid commit channels — arm here, not above.
+                // R-1 measured ≈ 0.38 arms per kernel READ on this face
+                // while the row above stayed at ≈ 0.001.
+                "transport_timer_arms": fuse3::sqz_time::TIMER_ARMS.load(Ordering::Relaxed),
+                "transport_timer_tombstones_skipped": fuse3::sqz_time::TIMER_TOMBSTONES_SKIPPED.load(Ordering::Relaxed),
+                "transport_timer_heap_entries": transport_timer_heap_entries,
+                "transport_timer_live_sleeps": transport_timer_live_sleeps,
                 // Stage 1b (sqz-exec handler lanes) — both must stay ≈0:
                 // a tick rescue is a lane notify that never delivered; a
                 // task panic is a handler completed-by-panic (loud, lane

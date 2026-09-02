@@ -975,6 +975,9 @@ fn thread_classes_fold_by_comm_prefix_with_the_mount_suffix_tolerated() {
     for (comm, want) in [
         ("fuse3-tpc12", "fuse3-tpc"),
         ("fuse3-tpc511m7", "fuse3-tpc"),
+        ("f3-ur0", "fuse3-ur"),
+        ("f3-ur4-7m2", "fuse3-ur"),
+        ("f3-ur-watch", "fuse3-ur"),
         ("sqz-ipc-svc0", "sqz-ipc-svc"),
         ("sqz-ipc-svc63ma", "sqz-ipc-svc"),
         ("sqz-ipc-dd7", "sqz-ipc-dd"),
@@ -983,7 +986,8 @@ fn thread_classes_fold_by_comm_prefix_with_the_mount_suffix_tolerated() {
         ("sqz-nvme3m1", "sqz-nvme"),
         ("sqz-zcrx-rd2", "sqz-zcrx"),
         ("sqz-ipc-reap", OTHER),
-        ("sqz-timer", OTHER),
+        ("sqz-timer", "sqz-timer"),
+        ("sqz-timerm3", "sqz-timer"),
         ("squeezefs", OTHER),
         ("", OTHER),
     ] {
@@ -1092,4 +1096,101 @@ async fn stats_inode_carries_daemon_cpu_words() {
     let sum: u64 = by.values().map(|v| v.as_u64().expect("ns")).sum();
     assert!(sum <= total, "Σ classes ({sum}) ≤ total ({total})");
     assert!(by.contains_key("other"), "the residual class is exported");
+}
+
+// ---------------------------------------------------------------------------
+// R-1 — the sqz_time registry gauges (candidate finding 48's instrument)
+// ---------------------------------------------------------------------------
+
+/// Both registries (squeezefs-ipc's and the fuse3 fork's `#[path]` copy)
+/// export arms / tombstones / occupancy on the stats inode, each face
+/// reading ITS OWN registry's words — the two must stay distinguishable,
+/// because the transport's ticked parks land on the fuse3 registry while
+/// the daemon's land on squeezefs-ipc's. Background cadence loops may arm
+/// timers between reads, so every check is an interval, never an equality
+/// against a quiescent counter.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn stats_inode_carries_both_timer_registries_reading_their_own_words() {
+    use std::sync::atomic::Ordering;
+    use std::time::Duration;
+    let _g = serial().await;
+    let h = make([0x51; 16], "audit_r1_timer").await;
+    let read = || async {
+        let reply =
+            h.fs.read(h.req, squeezefs::fuse_client::STATS_INODE, 0, 0, 1 << 22, 0)
+                .await
+                .expect("read stats inode");
+        let stats: serde_json::Value = serde_json::from_slice(&reply.data).expect("stats JSON");
+        stats["metrics"].clone()
+    };
+    let word = |m: &serde_json::Value, k: &str| -> u64 {
+        m[k].as_u64()
+            .unwrap_or_else(|| panic!("{k} is a u64 gauge on the stats inode"))
+    };
+    const KEYS: [&str; 8] = [
+        "timer_arms",
+        "timer_tombstones_skipped",
+        "timer_heap_entries",
+        "timer_live_sleeps",
+        "transport_timer_arms",
+        "transport_timer_tombstones_skipped",
+        "transport_timer_heap_entries",
+        "transport_timer_live_sleeps",
+    ];
+
+    // Each exported word is bracketed by its OWN static read before and
+    // after the inode read (monotone counters ⇒ the export lies inside).
+    let ipc_a = squeezefs_ipc::sqz_time::TIMER_ARMS.load(Ordering::Relaxed);
+    let f3_a = fuse3::sqz_time::TIMER_ARMS.load(Ordering::Relaxed);
+    let m0 = read().await;
+    let ipc_b = squeezefs_ipc::sqz_time::TIMER_ARMS.load(Ordering::Relaxed);
+    let f3_b = fuse3::sqz_time::TIMER_ARMS.load(Ordering::Relaxed);
+    for k in KEYS {
+        let _ = word(&m0, k);
+    }
+    assert!(
+        (ipc_a..=ipc_b).contains(&word(&m0, "timer_arms")),
+        "timer_arms reads the squeezefs-ipc registry"
+    );
+    assert!(
+        (f3_a..=f3_b).contains(&word(&m0, "transport_timer_arms")),
+        "transport_timer_arms reads the fuse3 registry"
+    );
+
+    // A WON timeout on each face: arms +≥1 on that face now, and its heap
+    // entry pops as a tombstone once the deadline passes.
+    let r = squeezefs_ipc::sqz_time::timeout(Duration::from_millis(20), async { 7u32 }).await;
+    assert_eq!(r, Ok(7));
+    let r = fuse3::sqz_time::timeout(Duration::from_millis(20), async { 9u32 }).await;
+    assert_eq!(r, Ok(9));
+    let m1 = read().await;
+    assert!(
+        word(&m1, "timer_arms") > word(&m0, "timer_arms"),
+        "a squeezefs-ipc arm moves timer_arms"
+    );
+    assert!(
+        word(&m1, "transport_timer_arms") > word(&m0, "transport_timer_arms"),
+        "a fuse3 arm moves transport_timer_arms"
+    );
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    let m2 = read().await;
+    assert!(
+        word(&m2, "timer_tombstones_skipped") > word(&m0, "timer_tombstones_skipped"),
+        "the won squeezefs-ipc timeout's heap entry pops as a tombstone"
+    );
+    assert!(
+        word(&m2, "transport_timer_tombstones_skipped")
+            > word(&m0, "transport_timer_tombstones_skipped"),
+        "the won fuse3 timeout's heap entry pops as a tombstone"
+    );
+    // Occupancy words are gauges: a held sleep on either face is visible
+    // in BOTH its heap and live counts while it lives.
+    let held = fuse3::sqz_time::sleep(Duration::from_secs(3600));
+    let m3 = read().await;
+    assert!(
+        word(&m3, "transport_timer_live_sleeps") >= 1
+            && word(&m3, "transport_timer_heap_entries") >= 1,
+        "a live fuse3 sleep shows in the transport occupancy gauges"
+    );
+    drop(held);
 }

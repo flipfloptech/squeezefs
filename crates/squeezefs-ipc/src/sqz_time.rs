@@ -71,6 +71,27 @@ struct Service {
     next_id: AtomicU64,
 }
 
+/// Sleeps registered (cumulative — every `sleep`/`timeout` arm). Exported
+/// on the stats inode as `timer_arms`: the per-op timer class's
+/// engagement instrument (e2e audit R-1, candidate finding 48).
+pub static TIMER_ARMS: AtomicU64 = AtomicU64::new(0);
+
+/// Heap entries the service thread popped whose sleep had already been
+/// cancelled (a `timeout` whose future won) — the tombstone churn. Every
+/// one is a `BinaryHeap::pop` under the process-global registry lock;
+/// exported as `timer_tombstones_skipped`.
+pub static TIMER_TOMBSTONES_SKIPPED: AtomicU64 = AtomicU64::new(0);
+
+/// Registry occupancy snapshot `(heap_entries, live_sleeps)` — the
+/// difference is the tombstone population still queued for the service
+/// thread (exported as `timer_heap_entries` / `timer_live_sleeps`). Takes
+/// the registry lock once; a stats read, never a hot-path call.
+pub fn registry_len() -> (usize, usize) {
+    let svc = service();
+    let reg = svc.reg.lock().unwrap_or_else(|e| e.into_inner());
+    (reg.heap.len(), reg.live.len())
+}
+
 fn service() -> &'static Service {
     static S: OnceLock<&'static Service> = OnceLock::new();
     S.get_or_init(|| {
@@ -98,13 +119,18 @@ fn service_loop(svc: &'static Service) {
                 break;
             }
             let id = reg.heap.pop().expect("peeked").id;
-            if let Some(state) = reg.live.get_mut(&id) {
-                let prev = std::mem::replace(state, SleepState::Fired);
-                if let SleepState::Waiting(Some(w)) = prev {
-                    wakers.push(w);
+            match reg.live.get_mut(&id) {
+                Some(state) => {
+                    let prev = std::mem::replace(state, SleepState::Fired);
+                    if let SleepState::Waiting(Some(w)) = prev {
+                        wakers.push(w);
+                    }
+                }
+                // Absent = cancelled tombstone: skip (counted).
+                None => {
+                    TIMER_TOMBSTONES_SKIPPED.fetch_add(1, Ordering::Relaxed);
                 }
             }
-            // Absent = cancelled tombstone: skip.
         }
         if !wakers.is_empty() {
             drop(reg);
@@ -142,6 +168,7 @@ impl Sleep {
     fn new(deadline: Instant) -> Sleep {
         let svc = service();
         let id = svc.next_id.fetch_add(1, Ordering::Relaxed);
+        TIMER_ARMS.fetch_add(1, Ordering::Relaxed);
         {
             let mut reg = svc.reg.lock().unwrap_or_else(|e| e.into_inner());
             let is_next = reg

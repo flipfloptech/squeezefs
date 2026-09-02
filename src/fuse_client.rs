@@ -5095,6 +5095,21 @@ pub struct Metrics {
     /// untracked by this mount's own-lane census; C8 stays the
     /// multi-writer oracle). 0 on every unpartitioned mount.
     pub fsck_foreign_lane_exempted: Align64<AtomicU64>,
+    /// C11 (kvmap, design-kvmap-block-map-tree §3 fsck + §5 gauges):
+    /// verified orphan tree-7 map records — records whose owner ino has
+    /// no live inode record, or whose head is not kvmap-class (crossing
+    /// residue). **Must stay 0 on healthy volumes** (report-only class;
+    /// the A1 residue sweep is the reclaim path, never a repair).
+    pub fsck_map_orphan_records: Align64<AtomicU64>,
+    /// C11: verified fully-empty kvmap heads — nonzero declared size,
+    /// ZERO tree records (the size-vs-sparse ambiguity keeps partial
+    /// coverage out of scope). **Must stay 0 on healthy volumes.**
+    pub fsck_map_empty_heads: Align64<AtomicU64>,
+    /// C11's zero-FP shield engagement (design A3): map-plane verdicts
+    /// withheld because the ino's crossing train is REGISTERED in flight
+    /// — the map plane's `fsck_inflight_exempted`. Growth under live
+    /// crossings is the proof the shield is not vacuous.
+    pub fsck_crossing_exempted: Align64<AtomicU64>,
     /// C9: dentry records whose TARGET ino the referenced-ino pass
     /// indexed — the cheap-direction pass's engagement gauge (C9 asks
     /// "which inodes are named" once, never "who names me" per inode).
@@ -9640,6 +9655,13 @@ impl SqueezefsFilesystem {
                 "fsck_inode_plane_cross_owner_declined": METRICS.fsck_inode_plane_cross_owner_declined.load(Ordering::Relaxed),
                 "fsck_inode_plane_proposals_admitted": METRICS.fsck_inode_plane_proposals_admitted.load(Ordering::Relaxed),
                 "fsck_inode_plane_proposals_stripped": METRICS.fsck_inode_plane_proposals_stripped.load(Ordering::Relaxed),
+                // C11 (kvmap map plane, design-kvmap-block-map-tree §3
+                // fsck): the two verified-finding gauges must stay 0 on
+                // healthy volumes; `crossing_exempted` is the A3 registry
+                // shield's engagement.
+                "fsck_map_orphan_records": METRICS.fsck_map_orphan_records.load(Ordering::Relaxed),
+                "fsck_map_empty_heads": METRICS.fsck_map_empty_heads.load(Ordering::Relaxed),
+                "fsck_crossing_exempted": METRICS.fsck_crossing_exempted.load(Ordering::Relaxed),
                 "fsck_findings": METRICS.fsck_findings.load(Ordering::Relaxed),
                 "fsck_scan_secs": METRICS.fsck_scan_secs.load(Ordering::Relaxed),
                 "scrub_blocks_scanned": METRICS.scrub_blocks_scanned.load(Ordering::Relaxed),

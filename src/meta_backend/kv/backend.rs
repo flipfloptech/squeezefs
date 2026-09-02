@@ -2897,6 +2897,37 @@ impl KvMetaBackend {
         CrossingGuard::register(&self.crossing_inflight, ino)
     }
 
+    /// Every distinct owner ino with at least one tree-7 map record — the
+    /// fsck **C11** orphan census's tree side (design §3 fsck: orphan map
+    /// records are invisible to every other walker, because they all reach
+    /// tree 7 only THROUGH a live layout head). Skip-scan: one bounded
+    /// range probe per owner, then the cursor jumps to the next owner's
+    /// range start — O(distinct owners), never O(records), so a PB-class
+    /// file contributes one probe. `Ok(vec![])` on a volume with no
+    /// engaged tree, like [`Self::block_map_range`].
+    pub async fn block_map_owner_scan(&self) -> std::result::Result<Vec<Ino>, KvError> {
+        let Some(tree) = self.block_map.get() else {
+            return Ok(Vec::new());
+        };
+        let mut out = Vec::new();
+        let mut cursor = [0u8; super::block_map::BLOCK_MAP_KEY_LEN];
+        let end = [0xFFu8; super::block_map::BLOCK_MAP_KEY_LEN];
+        loop {
+            let page = tree.range(&cursor, &end, 1).await?;
+            let Some((k, _)) = page.first() else {
+                break;
+            };
+            let (owner, _idx) = super::block_map::decode_block_map_key(k)?;
+            out.push(owner);
+            let Some(next) = owner.checked_add(1) else {
+                break;
+            };
+            // Index 0 of the successor owner is always encodable.
+            cursor = super::block_map::block_map_key(next, 0)?;
+        }
+        Ok(out)
+    }
+
     /// The one-time **bit-16 ratchet + tree-7 mint** (PR 2, the
     /// `layout_deltas_ready` shape): the bit is durable — and barriered —
     /// BEFORE the volume's first map record can be (design §2, the KD-14

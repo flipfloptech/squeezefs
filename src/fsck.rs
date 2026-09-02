@@ -2,7 +2,7 @@
 //! KD-9/KD-17; repair is VL6b and consumes the findings this module
 //! verifies).
 //!
-//! Check classes (C1–C10; C8, C9 and C10 postdate the VL6a seven):
+//! Check classes (C1–C11; C8–C11 postdate the VL6a seven):
 //!
 //! | Class | What | Source of truth |
 //! |---|---|---|
@@ -33,6 +33,22 @@
 //! dentries naming an inode that does not exist | the SAME dentry pass's
 //! name counts vs the census's `nlink`, and the reverse difference of the
 //! same two sets |
+//! | C11 | **map-plane consistency** (kvmap,
+//! `docs/design-kvmap-block-map-tree.md` §3 fsck + A3): (a) orphan
+//! tree-7 map records — the owner ino has no live inode record, or its
+//! head is not kvmap-class (crossing residue); (b) a `kvmap:` head with
+//! nonzero size and ZERO tree records (the fully-empty coverage case —
+//! the size-vs-sparse ambiguity keeps partial coverage out of scope).
+//! **REPORT-ONLY**: a false quarantine would hole a live crossing, and
+//! the A1 residue sweep is the reclaim path. Zero-FP shields, BOTH
+//! mandatory per A3: the in-flight crossing registry
+//! (`crossing_in_flight` — an incomplete pass records no verdict for a
+//! registered ino; C9's era floor is structurally inapplicable, since a
+//! map record's ino may be years old while its crossing is live on THIS
+//! mount) and the settle + re-check ladder under the ino's exclusive 4a
+//! lease (the train holds 4a across sweep → chunks → flip, so a lease
+//! held here brackets out any live train) | the tree-7 owner skip-scan
+//! vs the inode records + layout heads; the census's kvmap extraction |
 //!
 //! ## C9 — unreferenced inodes (the class S3.5 left owed)
 //!
@@ -454,7 +470,7 @@ impl FsckOptions {
 /// the input VL6b's repair planner consumes.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct FsckFinding {
-    /// `"C1"`..`"C9"`.
+    /// `"C1"`..`"C11"`.
     pub class: String,
     /// The object's identity (ino / key / volume+offset / path).
     pub object: String,
@@ -545,6 +561,17 @@ pub enum FindingId {
         key_hex: String,
         child_ino: u64,
     },
+    /// C11 (kvmap map plane, design-kvmap-block-map-tree §3 fsck + A3):
+    /// orphan tree-7 map records — the owner ino has no live inode
+    /// record, or its head is not kvmap-class (crossing residue). `ino`
+    /// is the volume-LOCAL owner ino (the identity tree-7 records key
+    /// on). REPORT-ONLY: repair refuses (a false quarantine would hole a
+    /// live crossing; the A1 residue sweep reclaims).
+    C11OrphanMapRecords { vol: usize, ino: u64, records: u64 },
+    /// C11: a `kvmap:` head with nonzero size and ZERO tree records —
+    /// the fully-empty coverage-mismatch case (the size-vs-sparse
+    /// ambiguity keeps partial coverage undetectable). REPORT-ONLY.
+    C11EmptyKvmapHead { vol: usize, ino: u64 },
 }
 
 /// The §10 `fsck_*` / `scrub_*` counter families, per run (the process
@@ -638,6 +665,18 @@ pub struct FsckCounters {
     /// partition). The cross-writer oracle stays C8; the lane-aligned
     /// fleet-parallel fsck is rung 10c's (KD-MW-16).
     pub foreign_lane_exempted: u64,
+    /// C11: verified orphan tree-7 map RECORDS (per record, not per owner
+    /// — the census the design's must-stay-0 `fsck_map_orphan_records`
+    /// gauge accumulates). 0 on healthy volumes.
+    pub map_orphan_records: u64,
+    /// C11: verified fully-empty `kvmap:` heads (nonzero size, zero tree
+    /// records). 0 on healthy volumes.
+    pub map_empty_heads: u64,
+    /// C11's zero-FP registry shield engagement (design A3): verdicts
+    /// withheld because the ino's crossing train is registered in flight
+    /// — the map plane's `inflight_exempted`. Growth under live crossings
+    /// is the proof the shield is not vacuous.
+    pub crossing_exempted: u64,
     pub findings: u64,
     pub scan_secs: u64,
     pub scrub_blocks_scanned: u64,
@@ -1061,6 +1100,13 @@ struct CensusOut {
     /// verdict. C9's direction is unaffected: a missing live inode is
     /// simply one fewer candidate.
     complete: bool,
+    /// C11 (b) NOMINATIONS: `kvmap:` heads the census saw with nonzero
+    /// size and ZERO tree-7 records, as `(vol, local ino, size)` — free
+    /// to carry (the census already pages the kvmap extraction per
+    /// layout). The verify ladder owns every verdict; sweep-cursor heads
+    /// and corpses never nominate (A2: a truncate/unlink sweep
+    /// legitimately leaves this shape in range).
+    kvmap_empty_heads: Vec<(usize, u64, u64)>,
     inodes_scanned: u64,
 }
 
@@ -1076,6 +1122,7 @@ fn probe_census() -> CensusOut {
         odd_nlink: HashMap::new(),
         odd_nlink_complete: true,
         complete: true,
+        kvmap_empty_heads: Vec::new(),
         inodes_scanned: 0,
     }
 }
@@ -1223,6 +1270,16 @@ enum SuspectKind {
         /// `nlink`, which this class does not verify — so repair refuses
         /// it rather than guessing.
         file_type: u8,
+    },
+    /// C11 (a): tree-7 records whose owner ino has no live inode record
+    /// or whose head is not kvmap-class (crossing residue). `local_ino`
+    /// is the volume-LOCAL owner ino the records key on.
+    C11OrphanMapRecords { vol: usize, local_ino: u64 },
+    /// C11 (b): a `kvmap:` head with nonzero size and ZERO tree records.
+    C11EmptyKvmapHead {
+        vol: usize,
+        local_ino: u64,
+        size: u64,
     },
 }
 
@@ -1456,6 +1513,12 @@ pub async fn run(ctx: &FsckCtx, opts: &FsckOptions) -> Result<FsckReport> {
         // walk is the whole cost the durable records exist to delete).
         if opts.shard.is_none() && !opts.inode_plane_only {
             evaluate_c8(ctx, &mut suspects).await;
+            // C11 (kvmap map plane, design-kvmap-block-map-tree §3 fsck):
+            // the C8 posture exactly — unsharded only (a shard's census
+            // sees a residue subset, and the orphan skip-scan is one
+            // whole-tree question), report-only, verify-before-report.
+            evaluate_c11_orphans(ctx, &mut counters, &mut suspects).await;
+            evaluate_c11_empty_heads(&census, &mut counters, &mut suspects, &ctx.meta);
         }
 
         // C9 (the class design-cow-kv-metadata §4.10a owed): live
@@ -1666,6 +1729,9 @@ pub fn merge_reports(reports: &[FsckReport]) -> FsckReport {
         counters.inflight_exempted += r.counters.inflight_exempted;
         counters.mover_ledger_exempted += r.counters.mover_ledger_exempted;
         counters.foreign_lane_exempted += r.counters.foreign_lane_exempted;
+        counters.map_orphan_records += r.counters.map_orphan_records;
+        counters.map_empty_heads += r.counters.map_empty_heads;
+        counters.crossing_exempted += r.counters.crossing_exempted;
         counters.scrub_blocks_scanned += r.counters.scrub_blocks_scanned;
         counters.scrub_bytes_scanned += r.counters.scrub_bytes_scanned;
         counters.scrub_aead_verified += r.counters.scrub_aead_verified;
@@ -1734,6 +1800,11 @@ fn fold_finalize_counters(dst: &mut FsckCounters, fin: &FsckCounters) {
     dst.inflight_exempted += fin.inflight_exempted;
     dst.mover_ledger_exempted += fin.mover_ledger_exempted;
     dst.foreign_lane_exempted += fin.foreign_lane_exempted;
+    // C11 runs ONLY in the finalize (shards skip the map plane, so the
+    // shard reports carry zeros — no double count).
+    dst.map_orphan_records += fin.map_orphan_records;
+    dst.map_empty_heads += fin.map_empty_heads;
+    dst.crossing_exempted += fin.crossing_exempted;
     // **The inode plane's counters are the union of the ADMITTED shards
     // and this finalize** (KD-PV-16, §5.8.2 F4 — the premise that the
     // plane "exists only here" is what that decision retires). The two
@@ -2175,6 +2246,9 @@ pub async fn run_fleet(
                 odd_nlink: HashMap::new(),
                 odd_nlink_complete: true,
                 complete: true,
+                // Shards carry no kvmap head info; the finalize's C11 (b)
+                // arm rides its own real census (`ip_census`) below.
+                kvmap_empty_heads: Vec::new(),
                 inodes_scanned: merged.counters.inodes_scanned,
             },
             None => {
@@ -2195,6 +2269,11 @@ pub async fn run_fleet(
             &mut fin_suspects,
         );
         evaluate_c8(ctx, &mut fin_suspects).await;
+        // C11 (a) rides the finalize like C8 — the orphan skip-scan is
+        // self-contained, so a fleet pass never covers less than the
+        // coordinator's own unsharded run. The (b) arm follows the
+        // finalize's own real census (`ip_census`) below.
+        evaluate_c11_orphans(ctx, &mut fin_counters, &mut fin_suspects).await;
 
         // ---- The INODE PLANE, judged from ONE view PER OWNER (the
         // 2026-08-17 tarx C10 conviction, restated by KD-PV-16;
@@ -2227,6 +2306,10 @@ pub async fn run_fleet(
             .await;
             fin_counters.dentry_refs_indexed += ip_indexed;
             let ip_census = walk_census(ctx, &fin_opts, &mut fin_counters).await?;
+            // C11 (b): the finalize's own unsharded census carries the
+            // empty-head nominations (the merged shard census cannot —
+            // shards collect no kvmap head info).
+            evaluate_c11_empty_heads(&ip_census, &mut fin_counters, &mut fin_suspects, &ctx.meta);
             let frozen = !fin_opts.multi_owner || peer_volumes_are_assigned(ctx, &fin_opts).await;
             match (
                 ip_refs.as_ref().filter(|_| frozen),
@@ -2760,6 +2843,23 @@ async fn walk_census(
                 // read the same multiset and a healthy kvmap volume
                 // reads zero drift.
                 let tree_entries = kvmap_entries_for(ctx, kv, local_ino, &layout).await;
+                // PR 4 — C11 (b) nomination (design §3 fsck): a kvmap
+                // head with nonzero size and ZERO tree records. Corpses
+                // never nominate (their sweep runs at reclaim), and a
+                // head with an open sweep cursor is exempt-in-range (A2).
+                if !corpse && layout.size > 0 {
+                    if let Some(entries) = &tree_entries {
+                        if entries.is_empty()
+                            && layout.block_map_id.as_deref().is_some_and(|id| {
+                                crate::meta_backend::kv::block_map::parse_kvmap_head(id)
+                                    .is_ok_and(|h| h.sweep_cursor.is_none())
+                            })
+                        {
+                            out.kvmap_empty_heads
+                                .push((vol_idx, local_ino, layout.size));
+                        }
+                    }
+                }
                 census_layout(ctx, global_ino, &layout, block_size, tree_entries, &mut out).await;
             }
             throttle(opts, t0.elapsed()).await;
@@ -3442,6 +3542,142 @@ async fn evaluate_c8(ctx: &FsckCtx, suspects: &mut Vec<Suspect>) {
             "fsck C8: durable block-reference comparison failed: {e} (no verdict \
              recorded — the class is skipped for this run, never guessed)"
         ),
+    }
+}
+
+/// One owner's tree-7 record count, paged (`block_map_range`, the same
+/// primitive the shared extraction rides) — C11's evidence unit. A
+/// decode failure ends the count at what was read (conservative; C1's
+/// walk owns unreadable records).
+async fn kvmap_record_count(
+    kv: &crate::meta_backend::kv::backend::KvMetaBackend,
+    local_ino: u64,
+) -> u64 {
+    let mut n = 0u64;
+    let mut cursor = 0u32;
+    loop {
+        let page = match kv.block_map_range(local_ino, cursor, SCAN_PAGE).await {
+            Ok(p) => p,
+            Err(_) => break,
+        };
+        let Some(last) = page.last().map(|(i, _)| *i) else {
+            break;
+        };
+        n += page.len() as u64;
+        let Some(next) = last.checked_add(1) else {
+            break;
+        };
+        cursor = next;
+    }
+    n
+}
+
+/// `local_ino`'s durable layout head, decoded. `None` = no layout /
+/// undecodable (the latter is C1's business).
+async fn kvmap_head_of(
+    kv: &crate::meta_backend::kv::backend::KvMetaBackend,
+    local_ino: u64,
+) -> Option<crate::routing::LayoutMetadata> {
+    let bytes = kv.getxattr(local_ino, "layout").await.ok()??;
+    if bytes.starts_with(b"{") {
+        serde_json::from_slice(&bytes).ok()
+    } else {
+        bincode::deserialize(&bytes).ok()
+    }
+}
+
+fn head_is_kvmap(layout: &Option<crate::routing::LayoutMetadata>) -> bool {
+    layout
+        .as_ref()
+        .and_then(|l| l.block_map_id.as_deref())
+        .is_some_and(|id| id.starts_with(crate::meta_backend::kv::block_map::KVMAP_HEAD_PREFIX))
+}
+
+/// C11 (a) nomination — orphan map records (design-kvmap-block-map-tree
+/// §3 fsck + A3): tree-7 records whose owner ino has no live inode
+/// record (a dead ino — the crashed unlink/crossing residue class) or
+/// whose head is not kvmap-class (a crashed crossing's staged chunks,
+/// invisible to reads, reclaimed only by the next crossing's A1 sweep).
+///
+/// The tree side is the owner SKIP-SCAN (one probe per distinct owner,
+/// never per record — `block_map_owner_scan`); the reverse "does the
+/// live head reach the tree" question is every other walker's arm, so
+/// this pass is the ONLY detector of records no head names. The A3
+/// registry shield applies at nomination AND at the verify arm; C9's
+/// era floor is structurally inapplicable here (a record's ino may be
+/// years old while its crossing is live on THIS mount).
+async fn evaluate_c11_orphans(
+    ctx: &FsckCtx,
+    counters: &mut FsckCounters,
+    suspects: &mut Vec<Suspect>,
+) {
+    for (vol_idx, kv) in ctx.meta.volumes.iter().enumerate() {
+        if !kv.block_map_tree_engaged() {
+            continue;
+        }
+        let owners = match kv.block_map_owner_scan().await {
+            Ok(o) => o,
+            Err(e) => {
+                log::warn!(
+                    "fsck C11: tree-7 owner scan failed on vol {vol_idx}: {e} — the map \
+                     plane records no verdict for this volume (never guessed)"
+                );
+                continue;
+            }
+        };
+        for local_ino in owners {
+            // The A3 registry shield: an incomplete pass records no
+            // verdict for a registered ino.
+            if kv.crossing_in_flight(local_ino) {
+                counters.crossing_exempted += 1;
+                continue;
+            }
+            let live = match kv.read_inode_value_routed(local_ino).await {
+                Ok(v) => v.is_some(),
+                Err(_) => continue, // unreadable: C1's business, no verdict
+            };
+            if live && head_is_kvmap(&kvmap_head_of(kv, local_ino).await) {
+                continue; // healthy: the head names the tree
+            }
+            suspects.push(Suspect {
+                kind: SuspectKind::C11OrphanMapRecords {
+                    vol: vol_idx,
+                    local_ino,
+                },
+            });
+        }
+    }
+}
+
+/// C11 (b) nomination — head/tree coverage mismatch, the FULLY-EMPTY
+/// case only (a `kvmap:1` head with nonzero size and ZERO tree records;
+/// the size-vs-sparse ambiguity makes any partial-coverage verdict
+/// unsafe, so it is deliberately out of scope). Candidates ride the
+/// census walk (which already pages the kvmap extraction per layout);
+/// the verify ladder owns every verdict.
+fn evaluate_c11_empty_heads(
+    census: &CensusOut,
+    counters: &mut FsckCounters,
+    suspects: &mut Vec<Suspect>,
+    meta: &RoutedMetaBackend,
+) {
+    for &(vol, local_ino, size) in &census.kvmap_empty_heads {
+        // The A3 registry shield at nomination (re-checked at verify).
+        if meta
+            .volumes
+            .get(vol)
+            .is_some_and(|kv| kv.crossing_in_flight(local_ino))
+        {
+            counters.crossing_exempted += 1;
+            continue;
+        }
+        suspects.push(Suspect {
+            kind: SuspectKind::C11EmptyKvmapHead {
+                vol,
+                local_ino,
+                size,
+            },
+        });
     }
 }
 
@@ -4406,6 +4642,133 @@ async fn recheck_suspects(
                     }),
                 })
             }
+            // C11 (design-kvmap-block-map-tree §3 fsck + A3): both
+            // shields, in order — the registry BEFORE the lease (a live
+            // train holds the ino's 4a across sweep → chunks → flip, so
+            // waiting on it here could park the pass for a whole PB-class
+            // migration), then the exclusive 4a re-check (a lease held
+            // here brackets out any train), then fresh state reads.
+            SuspectKind::C11OrphanMapRecords { vol, local_ino } => {
+                let Some(kv) = ctx.meta.volumes.get(*vol) else {
+                    continue;
+                };
+                if kv.crossing_in_flight(*local_ino) {
+                    counters.crossing_exempted += 1;
+                    counters.suspects_cleared += 1;
+                    continue;
+                }
+                let _lease = if online {
+                    Some(kv.dlm().lock_inode_exclusive(*local_ino).await)
+                } else {
+                    None
+                };
+                if kv.crossing_in_flight(*local_ino) {
+                    counters.crossing_exempted += 1;
+                    counters.suspects_cleared += 1;
+                    continue;
+                }
+                let records = kvmap_record_count(kv, *local_ino).await;
+                if records == 0 {
+                    // The A1/unlink sweep won the race: nothing stands.
+                    counters.suspects_cleared += 1;
+                    continue;
+                }
+                let live = match kv.read_inode_value_routed(*local_ino).await {
+                    Ok(v) => v.is_some(),
+                    Err(_) => {
+                        counters.suspects_cleared += 1; // no verdict
+                        continue;
+                    }
+                };
+                if live && head_is_kvmap(&kvmap_head_of(kv, *local_ino).await) {
+                    // The crossing completed between passes: the head now
+                    // names the tree.
+                    counters.suspects_cleared += 1;
+                    continue;
+                }
+                counters.map_orphan_records += records;
+                Some(FsckFinding {
+                    class: "C11".to_string(),
+                    object: format!("vol{vol} ino {local_ino}"),
+                    evidence: format!(
+                        "{records} orphan block-map record(s): owner ino {local_ino} \
+                         (volume-local) {} — a crashed crossing/unlink's residue, \
+                         invisible to reads (the head is the truth) and reclaimed by \
+                         the next crossing's A1 sweep. REPORT-ONLY (design A3): a false \
+                         quarantine would hole a live crossing",
+                        if live {
+                            "is live but its head is not kvmap-class"
+                        } else {
+                            "has no live inode record"
+                        }
+                    ),
+                    identity: Some(FindingId::C11OrphanMapRecords {
+                        vol: *vol,
+                        ino: *local_ino,
+                        records,
+                    }),
+                })
+            }
+            SuspectKind::C11EmptyKvmapHead {
+                vol,
+                local_ino,
+                size,
+            } => {
+                let Some(kv) = ctx.meta.volumes.get(*vol) else {
+                    continue;
+                };
+                if kv.crossing_in_flight(*local_ino) {
+                    counters.crossing_exempted += 1;
+                    counters.suspects_cleared += 1;
+                    continue;
+                }
+                let _lease = if online {
+                    Some(kv.dlm().lock_inode_exclusive(*local_ino).await)
+                } else {
+                    None
+                };
+                if kv.crossing_in_flight(*local_ino) {
+                    counters.crossing_exempted += 1;
+                    counters.suspects_cleared += 1;
+                    continue;
+                }
+                // Fresh state, all four legs: still live, head still a
+                // sweep-less kvmap sentinel, size still nonzero, tree
+                // still empty. Any leg moved ⇒ cleared.
+                let live = matches!(kv.read_inode_value_routed(*local_ino).await, Ok(Some(v)) if v.nlink > 0);
+                let head = kvmap_head_of(kv, *local_ino).await;
+                let still_empty_sentinel = head
+                    .as_ref()
+                    .and_then(|l| l.block_map_id.as_deref())
+                    .and_then(|id| crate::meta_backend::kv::block_map::parse_kvmap_head(id).ok())
+                    .is_some_and(|h| h.sweep_cursor.is_none())
+                    && head.as_ref().is_some_and(|l| l.size > 0);
+                let still_no_records = matches!(
+                    kv.block_map_range(*local_ino, 0, 1).await,
+                    Ok(page) if page.is_empty()
+                );
+                if !(live && still_empty_sentinel && still_no_records) {
+                    counters.suspects_cleared += 1;
+                    continue;
+                }
+                counters.map_empty_heads += 1;
+                Some(FsckFinding {
+                    class: "C11".to_string(),
+                    object: format!("vol{vol} ino {local_ino}"),
+                    evidence: format!(
+                        "kvmap head with ZERO tree records at {size} B of declared size: \
+                         every read of ino {local_ino} (volume-local) resolves to holes \
+                         while the head claims mapped data — the fully-empty coverage \
+                         mismatch (the size-vs-sparse ambiguity keeps partial coverage \
+                         out of scope). REPORT-ONLY (design A3): restating the map would \
+                         fabricate data"
+                    ),
+                    identity: Some(FindingId::C11EmptyKvmapHead {
+                        vol: *vol,
+                        ino: *local_ino,
+                    }),
+                })
+            }
             SuspectKind::C5Generation { dir, why } => {
                 // Re-read the marker (a live restamp clears).
                 let expected = ctx.expected_generation.as_deref().unwrap_or("");
@@ -4832,6 +5195,12 @@ fn publish_metrics(c: &FsckCounters) {
         .fetch_add(c.mover_ledger_exempted, Ordering::Relaxed);
     m.fsck_foreign_lane_exempted
         .fetch_add(c.foreign_lane_exempted, Ordering::Relaxed);
+    m.fsck_map_orphan_records
+        .fetch_add(c.map_orphan_records, Ordering::Relaxed);
+    m.fsck_map_empty_heads
+        .fetch_add(c.map_empty_heads, Ordering::Relaxed);
+    m.fsck_crossing_exempted
+        .fetch_add(c.crossing_exempted, Ordering::Relaxed);
     m.fsck_findings.fetch_add(c.findings, Ordering::Relaxed);
     m.fsck_scan_secs.store(c.scan_secs, Ordering::Relaxed);
     m.scrub_blocks_scanned
@@ -5241,6 +5610,23 @@ fn planned_action(id: &FindingId) -> (&'static str, String) {
                  the physical block stays in place for forensics"
             ),
         ),
+        FindingId::C11OrphanMapRecords { vol, ino, records } => (
+            "report-only",
+            format!(
+                "{records} orphan block-map record(s) on vol{vol} for owner ino {ino}: \
+                 REPORT-ONLY by design (design-kvmap-block-map-tree A3 — a false \
+                 quarantine would hole a live crossing); the next crossing's A1 residue \
+                 sweep is the reclaim path"
+            ),
+        ),
+        FindingId::C11EmptyKvmapHead { vol, ino } => (
+            "report-only",
+            format!(
+                "kvmap head on vol{vol} ino {ino} declares nonzero size with ZERO tree \
+                 records: REPORT-ONLY (the C8 posture) — restating the map would \
+                 fabricate data; the operator adjudicates"
+            ),
+        ),
     }
 }
 
@@ -5604,6 +5990,41 @@ pub async fn repair(
                          never auto-repaired: the ledger and the layouts diverged, and \
                          restating one from the other would erase the evidence of why. \
                          The layouts remain authoritative"
+                    ),
+                );
+                continue;
+            }
+            // ------------------------------------ C11 map-plane (kvmap)
+            //
+            // REPORT-ONLY, deliberately (design-kvmap-block-map-tree §3
+            // fsck + A3, the C8 posture): a false-positive quarantine of
+            // "orphan" records would hole a LIVE crossing's staged map —
+            // silent wrong data, the exact failure the tree exists to
+            // prevent — and an empty head has nothing safe to restate
+            // (fabricating a map is never a repair). Orphan records are
+            // reclaimed by the next crossing's A1 residue sweep.
+            FindingId::C11OrphanMapRecords { vol, ino, records } => {
+                refuse(
+                    &mut out,
+                    f,
+                    format!(
+                        "{records} orphan block-map record(s) on vol{vol} for owner ino \
+                         {ino} are REPORTED, never auto-repaired (design A3: a false \
+                         quarantine would hole a live crossing) — REPORT-ONLY; the next \
+                         crossing's A1 residue sweep reclaims them"
+                    ),
+                );
+                continue;
+            }
+            FindingId::C11EmptyKvmapHead { vol, ino } => {
+                refuse(
+                    &mut out,
+                    f,
+                    format!(
+                        "the fully-empty kvmap head on vol{vol} ino {ino} is REPORTED, \
+                         never auto-repaired — REPORT-ONLY (design A3): restating the \
+                         map would fabricate data where redundancy does not exist; the \
+                         operator adjudicates"
                     ),
                 );
                 continue;

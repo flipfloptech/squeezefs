@@ -741,3 +741,27 @@ could never be. Boarded from the same train: the consistent
 post-rewrite umount SIGTERM-timeout → kernel-abort fallback (data
 proved durable both times, but the exit slowness is a standing
 observation).
+
+## 16. Rev 2.0 — PR 6c-i landed (2026-09-02, normative)
+
+The mechanism rung landed (`f5087c67` + the item-0 pre-fix pair): the
+partial store (dirty overlay + tombstones + 2-span/ino epoch-stamped
+warm windows, `PartialMiss ≠ Hole` at every resolve arm), the size-based
+mode heuristic on the 6a budget seam (the EFBIG refusal DELETED — the
+cap is now the mode-flip threshold), overlay-only claims-train saves for
+partial inos (bounded probes: a 2-claim save on a 2,048-record ino pays
+2 exact lookups where the tip paid 5 whole-map range pages), bounded
+read-opens (the S1 debt paid), and the truncate/sweep composition
+(partial truncate never refuses). R5 gained `block_map_window` (floor 0,
+drop-at-will); `SQUEEZEFS_KVMAP_OVERLAY` is the A/B lever. Adjudications
+that bind 6c-ii/PR 7: the f36b recompute rides the caller's live
+`ref_for` on OVERLAY trains (solo mounts have no mw resolver — solo
+recompute-released supply frees via `released_keys` → deferred keys);
+the barrier law splits on `served` (a LOCAL overlay save barriers — it
+owns size); `clone` and mover `MergeExpected` on partial inos REFUSE
+LOUD (6c-ii owes them); lseek hole-export / `allocated_blocks` /
+GDS custody degrade conservatively on partial inos; the episode-compose
+window keeps 5b's whole-map posture (partial inos route through the
+claims train). Items 1–5 landed as one commit (one structure) — the
+per-item red cadence held only for item 0; recorded as an honest
+deviation.

@@ -15,6 +15,11 @@
 //!    point of decision 1. Nothing about the owner's execution is special:
 //!    the 4a `DlmGuard`s are taken where they always were, the commit
 //!    rides the M7 conveyor, one tx is one checksummed journal entry.
+//!    Since D-1 (finding F-A) a frame's verbs dispatch **concurrently
+//!    across independent objects** — one chain per connected set of
+//!    named inodes, serial inside a chain — so N independent mutations
+//!    co-queue into ONE conveyor pass instead of paying N serial passes
+//!    (see [`dependency_chains`] and `run_batch`).
 //! 4. **Piggyback the grant** — the object's fencing generation as the
 //!    LOCAL authority knows it, which is what makes the client's fencing
 //!    read sound without a second round trip.
@@ -106,6 +111,51 @@ squeezefs_ipc::sqz_task_local! {
     /// so the revocation reaches the holder WITH the mutation's own
     /// reply (read-your-own-writes by construction, zero added rounds).
     static SHIP_REVOKES: RefCell<Vec<u64>>;
+}
+
+/// Partition a frame's ops into **dependency chains** (D-1 / F-A): ops
+/// that name a common inode — transitively — share a chain and execute in
+/// submission order; distinct chains dispatch concurrently. Returns one
+/// dense chain index per op (first-appearance numbering, so a frame of
+/// pairwise-independent ops maps to `0..n`).
+///
+/// The relation is `MetaCall::named_inos` overlap, union-find closed:
+/// `rename` names both parents, `link` its inode and the new parent, so a
+/// verb touching two objects fuses their chains. Children an
+/// `unlink`/`rename` DISCOVERS under guards are deliberately not part of
+/// the relation — the client cannot see them, so no same-frame op can be
+/// causally dependent on them, and two ops racing such a child through
+/// its own ino are exactly the 4a-guard race two local tasks have today.
+pub fn dependency_chains(ops: &[MetaOp]) -> Vec<usize> {
+    fn find(parent: &mut [usize], mut x: usize) -> usize {
+        while parent[x] != x {
+            parent[x] = parent[parent[x]];
+            x = parent[x];
+        }
+        x
+    }
+    let mut parent: Vec<usize> = (0..ops.len()).collect();
+    let mut last_by_ino: HashMap<u64, usize> = HashMap::new();
+    for (i, op) in ops.iter().enumerate() {
+        for ino in op.call.named_inos() {
+            if let Some(&j) = last_by_ino.get(&ino) {
+                let a = find(&mut parent, i);
+                let b = find(&mut parent, j);
+                if a != b {
+                    parent[a] = b;
+                }
+            }
+            last_by_ino.insert(ino, i);
+        }
+    }
+    let mut dense: HashMap<usize, usize> = HashMap::new();
+    (0..ops.len())
+        .map(|i| {
+            let root = find(&mut parent, i);
+            let next = dense.len();
+            *dense.entry(root).or_insert(next)
+        })
+        .collect()
 }
 
 /// Is this task executing a verb an owner service accepted **on behalf of
@@ -629,7 +679,23 @@ impl MetaShipService {
         .await;
         super::owner_phase_record(OwnerPhase::Dispatch, t_dispatch);
         let results = match joined {
-            Ok(results) => results,
+            Ok(Some(results)) => results,
+            Ok(None) => {
+                // A concurrently dispatched CHAIN unwound (its panic is
+                // already counted by `contain`); the frame refuses whole,
+                // exactly as the serial batch's own unwind did.
+                self.panics.fetch_add(1, Ordering::Relaxed);
+                super::OWNER_PANICS.fetch_add(1, Ordering::Relaxed);
+                log::error!(
+                    "S8 owner-side batch execution unwound: a dispatched verb chain panicked"
+                );
+                return RpcResponse {
+                    id: req.id,
+                    status: STATUS_PANIC,
+                    body: b"S8 owner-side execution panicked: a dispatched verb chain unwound"
+                        .to_vec(),
+                };
+            }
             Err(e) => {
                 // A shipped verb UNWOUND. Nothing joins a data-path task,
                 // so this counter is the only record its work was lost
@@ -661,21 +727,100 @@ impl MetaShipService {
         }
     }
 
-    /// Execute a batch's ops **in order** — in-batch causality is
-    /// submission order, which is what lets a client pipeline a create and
-    /// a lookup of the same name in one frame.
+    /// Execute a batch's ops — **concurrently across independent objects,
+    /// in submission order within a dependency chain** (E2E perf audit
+    /// D-1, DLM structural finding F-A).
     ///
-    /// The whole batch runs inside the `SHIP_CLIENT`/`SHIP_REVOKES`
+    /// The serial form this replaced (`for op in ops { run_op(..).await }`)
+    /// awaited each mutating verb's `commit_tx` before starting the next,
+    /// so a frame of N independent verbs paid N conveyor passes — N
+    /// journal writes, N barriers — at ≈ 106–128 µs each: the 9,473
+    /// verbs/s authority ceiling. The M7 conveyor batches CONCURRENT
+    /// committers into one pass (union leaf locks, one write, one
+    /// barrier), so the lever is simply to have the frame's verbs park on
+    /// it at the same time.
+    ///
+    /// **Causality is preserved exactly where it can exist.** Two ops are
+    /// dependent iff they NAME a common inode (`MetaCall::named_inos`,
+    /// closed transitively): the documented in-batch contract — "a create
+    /// and a lookup of the same name in one frame see each other" — is
+    /// the same-parent case, and a production frame coalesces
+    /// independently in-flight callers (each awaits its own reply, so no
+    /// caller can name an inode a same-frame verb has not yet minted).
+    /// Dependent ops form one CHAIN executed serially in submission order;
+    /// chains run concurrently, each on its own sqz-meta task. Reply
+    /// order is op order regardless of completion order, the dedup window
+    /// is per op (unchanged), and a chain's unwind refuses the frame whole
+    /// (`None`) exactly as the serial batch's did.
+    ///
+    /// Each chain runs inside its own `SHIP_CLIENT`/`SHIP_REVOKES`
     /// task-local scopes (rung 12): the mutation gate — which fires deep
     /// inside the backend's trait impl, where no client identity can be a
     /// parameter — reads the mutator's identity from the scope, and the
-    /// surrenders it performs accumulate into each op's reply.
-    async fn run_batch(&self, frame: MetaRequestFrame) -> Vec<MetaOpResult> {
+    /// surrenders it performs accumulate into each op's reply. The
+    /// per-chain revoke scope is what keeps one chain's surrenders out of
+    /// a concurrent sibling's reply.
+    async fn run_batch(self: Arc<Self>, frame: MetaRequestFrame) -> Option<Vec<MetaOpResult>> {
         let client_epoch = frame.client_epoch;
-        let client_id = frame.client_id.clone();
+        let client_id = Arc::<str>::from(frame.client_id.as_str());
         let ops = frame.ops;
+        let n = ops.len();
+        let chains = dependency_chains(&ops);
+        if chains.len() <= 1 {
+            // One chain (or an empty frame): the serial form, in-task.
+            let me = Arc::clone(&self);
+            return Some(me.run_chain(client_epoch, client_id, ops).await);
+        }
+        // Slot the ops into their chains (submission order within each).
+        let mut per_chain: Vec<Vec<(usize, MetaOp)>> = vec![Vec::new(); chains.len()];
+        for (idx, (op, chain)) in ops.into_iter().zip(chains).enumerate() {
+            per_chain[chain].push((idx, op));
+        }
+        let mut joins = Vec::with_capacity(per_chain.len());
+        for chain in per_chain {
+            let me = Arc::clone(&self);
+            let client_id = Arc::clone(&client_id);
+            joins.push(crate::meta_exec::spawn_meta_join(
+                "meta_ship_verb_chain",
+                async move {
+                    let (idxs, calls): (Vec<usize>, Vec<MetaOp>) = chain.into_iter().unzip();
+                    let results = me.run_chain(client_epoch, client_id, calls).await;
+                    idxs.into_iter().zip(results).collect::<Vec<_>>()
+                },
+            ));
+        }
+        let mut out: Vec<Option<MetaOpResult>> = (0..n).map(|_| None).collect();
+        let mut unwound = false;
+        for join in joins {
+            match join.await {
+                Ok(results) => {
+                    for (idx, res) in results {
+                        out[idx] = Some(res);
+                    }
+                }
+                Err(_) => unwound = true,
+            }
+        }
+        if unwound {
+            return None;
+        }
+        Some(
+            out.into_iter()
+                .map(|r| r.expect("every op slotted into exactly one chain"))
+                .collect(),
+        )
+    }
+
+    /// One dependency chain: its ops in submission order, inside the
+    /// rung-12 task-local scopes.
+    async fn run_chain(
+        self: Arc<Self>,
+        client_epoch: u64,
+        client_id: Arc<str>,
+        ops: Vec<MetaOp>,
+    ) -> Vec<MetaOpResult> {
         SHIP_CLIENT
-            .scope(client_id.clone(), async move {
+            .scope(client_id.to_string(), async move {
                 SHIP_REVOKES
                     .scope(RefCell::new(Vec::new()), async move {
                         let mut out = Vec::with_capacity(ops.len());

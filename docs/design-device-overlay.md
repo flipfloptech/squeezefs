@@ -455,6 +455,25 @@ fsync means the same thing it meant yesterday, and the DUR-1 ordering
 (data barrier strictly precedes the metadata barrier) is preserved by
 construction because step 4 precedes step 5.
 
+**The two non-fsync boundaries, as built (finding 48, 2026-09-02 —
+`.benchmarks/2026-09-02-f48-warm-cold-overlay-gap.md`):** a record whose
+coverage can never complete (a block whose first segment rode the
+layout-promotion arm, a partial tail block) outlives its writer unless a
+boundary drains it, and the §5.4 feed leaves a RAM-only epoch binding
+that only fsync / coverage completion / the 30 s idle sweeper close.
+Therefore: **RELEASE** of a dirty handle runs steps 1–3 and 5 (no data
+barrier — write-back class, like the rest of the release flush) ahead of
+its layout persist, so `overlay_open` → 0 at quiesce and the fed binding
+rides the persist; and the **unmount drain** is followed by a data
+barrier and a close of EVERY open rewrite epoch before the meta volumes
+shut down (`DataRouter::close_open_rewrite_epochs`) — a clean unmount
+never drops a fed binding, whatever fed it (a read drain, the unmount
+drain itself, an un-fsynced rewrite inside the idle horizon). Before
+this, the release ran no drain and the teardown closed no epochs: the
+first boundary-crossing READ of such a file fed an epoch nobody owned,
+and a clean unmount inside the horizon durably kept the promotion key —
+one segment plus never-written device bytes.
+
 Gap-seeding rationale (Rev 2 — Resolved Questions #2, **confirmed**):
 seeding into the unpublished destination makes every published overlay
 a **whole block** — one map op, no extent records, no partial-block

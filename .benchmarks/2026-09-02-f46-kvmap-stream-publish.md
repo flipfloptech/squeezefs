@@ -101,6 +101,14 @@ umount/remount; session-2 `meta_kv_block_refs_drift = 0`,
    2 gap seeds — identical on both binaries). The durable store is right;
    the same-mount read of an Open gap-bearing record is what is wrong.
    Repro: `/scratch/tmp/f46_ab.sh <label> 8g`.
+   **CORRECTED by finding 48 (`.benchmarks/2026-09-02-f48-warm-cold-overlay-gap.md`,
+   fixed `aa464b7e`): the attribution was inverted.** The warm read was
+   right; the DURABLE image was wrong — the read-fed rewrite epoch was
+   RAM-only and a clean unmount inside the 30 s idle horizon dropped it
+   (23 of 24 files' block 0 read one segment + zeros cold on this
+   binary). The `--verify_only` "0 bad" above verified nothing (it
+   reports err=0 on a corrupted local file); a READ job with
+   `verify=crc32c` fails the cold image (err=84).
 2. The 6c-i overlay train's per-claim floor probe is O(RUN_LEN_MAX)
    records on a point-dense map (the partial class's face of f46).
 3. The shipped `MigrateBlockMap` verb still carries the whole map per

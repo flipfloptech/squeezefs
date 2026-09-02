@@ -506,6 +506,17 @@ pub fn map_migrate_chunk() -> usize {
     crate::env_knobs::int_knob("SQUEEZEFS_MAP_MIGRATE_CHUNK", 512usize).clamp(64, 1024)
 }
 
+/// PR 6b (design §12, Rev 1.6): the sync-vs-job truncate/unlink handoff
+/// threshold, in REMOVED BLOCKS — `map_migrate_chunk() × 64` (~32,768
+/// blocks ≈ 128 GiB at the shipped 4 MiB block and default chunk).
+/// Derived, never its own knob (the chunk knob is the one lever, and the
+/// tests' A/B seam): below it the synchronous PR-2 paths run VERBATIM;
+/// above it the SETATTR/unlink commits O(1) (size flip + `;sweep:K`
+/// cursor) and the record/ref/free work rides `JobType::KvmapSweep`.
+pub fn kvmap_sweep_threshold_blocks() -> u64 {
+    map_migrate_chunk() as u64 * 64
+}
+
 /// Test seam (write-commit-economy lever 1; the
 /// [`TEST_TIER_PUBLISH_DELAY_MS`] precedent): artificial delay, in
 /// milliseconds, injected at the head of every publish-conveyor pass —
@@ -594,6 +605,22 @@ pub enum LayoutFlip {
 pub struct StorageBackend {
     pub device: std::sync::Arc<crate::nvme_dev::NvmeBlockDev>,
     pub block_allocator: std::sync::Arc<crate::block_allocator::BlockAllocator>,
+}
+
+/// PR 6b (design §3/A2): one [`DataRouter::kvmap_sweep_chunk`] verdict —
+/// the job fabric's per-chunk progress unit (the freed keys were already
+/// purged + reclaim-enqueued by the router; `records` feeds
+/// `map_sweep_records`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KvmapSweepProgress {
+    /// No live sweep cursor (done, absorbed by a publish barrier, or
+    /// never planted) — the job completes.
+    NoCursor,
+    /// One chunk committed; residue remains above the advanced cursor.
+    Progress { records: u64 },
+    /// The terminal chunk committed and cleared the cursor. A corpse
+    /// owner (`nlink == 0`) is now the job's to destroy.
+    Terminal { records: u64 },
 }
 
 /// One `volume_states` row (design-volume-lifecycle §10): the per-volume
@@ -4004,6 +4031,14 @@ pub struct DataRouterInner {
     /// the `kvmap_write_map_bytes` gauge and the input to the
     /// budget-share refusal (`kvmap_write_map_budget_bytes`).
     pub(crate) kvmap_write_maps: std::sync::Arc<scc::HashMap<u64, u64>>,
+    /// PR 6b (design §3/A2): inos whose `delete_file` took the
+    /// over-threshold CORPSE handoff — the inode record + cursor-bearing
+    /// head stay ALIVE (nlink 0, unreachable — the POSIX
+    /// unlinked-but-open class) until the sweep job's terminal chunk
+    /// performs the destroy. The reclaim/mount-sweep callers consult this
+    /// to WITHHOLD their own `destroy_inodes` (destroying the head would
+    /// orphan every remaining record and strand its references).
+    pub(crate) kvmap_sweep_corpses: std::sync::Arc<scc::HashMap<u64, ()>>,
 }
 
 #[derive(Clone)]
@@ -6044,6 +6079,20 @@ impl DataRouter {
                                     },
                                 )?;
                             }
+                            // PR 6b (design §3/A2): a live sweep cursor
+                            // shadows every record at/above it — residue
+                            // the background sweep owns, NEVER RAM write
+                            // authority (rehydrating it would make the
+                            // next save's diff re-assert deleted records
+                            // over freed blocks). Re-parsed per bracket
+                            // pass beside the head it came from.
+                            let sweep_cut: Option<u32> = layout
+                                .block_map_id
+                                .as_deref()
+                                .and_then(|id| {
+                                    crate::meta_backend::kv::block_map::parse_kvmap_head(id).ok()
+                                })
+                                .and_then(|h| h.sweep_cursor);
                             let mut map = std::collections::HashMap::new();
                             let mut cursor = 0u32;
                             loop {
@@ -6070,12 +6119,22 @@ impl DataRouter {
                                     if *idx < cursor {
                                         continue;
                                     }
+                                    // PR 6b: shadowed residue never
+                                    // rehydrates (see `sweep_cut` above);
+                                    // a straddling run keeps only its
+                                    // below-cursor coverage.
+                                    if sweep_cut.is_some_and(|k| *idx >= k) {
+                                        continue;
+                                    }
                                     // PR 6a: the second shared
                                     // run-expansion surface (design §12)
                                     // — key order makes a later exact
                                     // record override its covering run's
                                     // derived binding (the §2 read law).
                                     for delta in 0..entry.run_len() {
+                                        if sweep_cut.is_some_and(|k| idx + delta >= k) {
+                                            break;
+                                        }
                                         let Some(key) = self
                                             .backend_router
                                             .map_entry_block_key_at(entry, delta)
@@ -6469,8 +6528,19 @@ impl DataRouter {
                     );
                 }
             }
-            crate::meta_ship::publish::destroy_inodes(backend, &corpses).await?;
-            swept += corpses.len() as u64;
+            // PR 6b: a corpse whose delete_file took the A2 sweep handoff
+            // keeps its record + cursor head — the sweep job's terminal
+            // chunk owns the destroy; destroying here would orphan every
+            // remaining record and strand its references.
+            let destroyable: Vec<u64> = corpses
+                .iter()
+                .copied()
+                .filter(|&i| !self.kvmap_sweep_corpse_pending(i))
+                .collect();
+            if !destroyable.is_empty() {
+                crate::meta_ship::publish::destroy_inodes(backend, &destroyable).await?;
+            }
+            swept += destroyable.len() as u64;
         }
         Ok(swept)
     }
@@ -6890,10 +6960,20 @@ impl DataRouter {
             // re-enters the sticky kvmap arm.
             let (v_idx, local_ino) = backend.route_ino(ino);
             head_map_id = layout.block_map_id.clone();
+            // PR 6b: the compose input is WRITE AUTHORITY — a live sweep
+            // cursor's shadowed residue stays out of it (the shared
+            // extraction itself stays unfiltered: ownership walks must
+            // keep counting residue until the sweep releases it).
+            let sweep_cut: Option<u32> = layout
+                .block_map_id
+                .as_deref()
+                .and_then(|id| crate::meta_backend::kv::block_map::parse_kvmap_head(id).ok())
+                .and_then(|h| h.sweep_cursor);
             self.backend_router
                 .kvmap_layout_entries(&backend.volumes[v_idx], local_ino)
                 .await
                 .into_iter()
+                .filter(|(b, _)| !sweep_cut.is_some_and(|k| *b >= k))
                 .collect()
         } else {
             layout.block_map.clone().unwrap_or_default()
@@ -7067,6 +7147,20 @@ impl DataRouter {
 
         let t_commit = std::time::Instant::now();
         let refill = refs.clone();
+        // PR 6b (design §3/A2): the extend-barrier floor — the first
+        // index this publish's committed size does NOT cover. With a live
+        // sweep cursor below it, the train sweeps the re-exposed span
+        // (residue there would become servable the instant the size
+        // commits) and advances the cursor; the freed keys come back for
+        // the post-commit reclaim below.
+        let bs = self.block_size.load(Ordering::Relaxed).max(1);
+        let cursor_floor: u32 = m
+            .size
+            .div_ceil(bs)
+            .min(u64::from(u32::MAX - 1))
+            .try_into()
+            .expect("clamped to u32 range");
+        let ref_for = |key: &str, idx: u32| self.backend_router.block_ref_for(key, ino, idx);
         let outcome = match crate::meta_ship::publish::migrate_block_map(
             backend,
             ino,
@@ -7075,6 +7169,8 @@ impl DataRouter {
             entries,
             refs,
             map_migrate_chunk(),
+            cursor_floor,
+            &ref_for,
         )
         .await
         {
@@ -7115,16 +7211,42 @@ impl DataRouter {
             }
         }
 
-        // The republish: the head is now `kvmap:1[;gen:N]` (the train
-        // re-stamps the committed generation — the outcome carries it, so
-        // the next ship's base_gen is current without a refetch),
-        // delta-ineligible (Rev 1.1 #5 sticky), and the map stays WARM in
-        // RAM — the crossing must not cold the mount (`m.clone()`).
+        // PR 6b: the extend barrier's swept residue — accounting + frees
+        // strictly AFTER the train committed (the train's guards are
+        // gone; purge-before-free so a reallocated offset can never serve
+        // the dead incarnation's tier bytes). Enqueue-class frees under
+        // the caller's 3.5 stripe — the `old_indirect_to_free` precedent
+        // below — bounded by the re-exposed span's records, never the
+        // whole residue (that stays the background job's).
+        if outcome.swept_records > 0 {
+            crate::fuse_client::METRICS
+                .map_sweep_records
+                .fetch_add(outcome.swept_records, Ordering::Relaxed);
+        }
+        if !outcome.swept_freed.is_empty() {
+            for key in &outcome.swept_freed {
+                self.cache.purge_block_key(key);
+            }
+            let cleaned: Vec<String> = outcome
+                .swept_freed
+                .iter()
+                .map(|k| clean_block_key(k))
+                .collect();
+            self.free_deferred_keys(cleaned).await;
+        }
+
+        // The republish: the head is now `kvmap:1[;sweep:K][;gen:N]` (the
+        // train re-stamps the committed generation AND carries the live
+        // A2 sweep cursor forward — the outcome carries both, so the next
+        // ship's base_gen is current without a refetch and the cached
+        // head never lies about the sweep plan), delta-ineligible (Rev
+        // 1.1 #5 sticky), and the map stays WARM in RAM — the crossing
+        // must not cold the mount (`m.clone()`).
         let mut cached = m.clone();
         cached.layout_delta_chain = LAYOUT_DELTA_CHAIN_INELIGIBLE;
         cached.block_map_id = Some(
             crate::meta_backend::kv::block_map::KvmapHead {
-                sweep_cursor: None,
+                sweep_cursor: outcome.sweep_cursor,
                 gen: outcome.gen,
             }
             .encode()
@@ -8034,6 +8156,7 @@ impl DataRouter {
                 epoch_sweeper_armed: std::sync::atomic::AtomicBool::new(false),
                 publish_recomputed: std::sync::Arc::new(scc::HashMap::new()),
                 kvmap_write_maps: std::sync::Arc::new(scc::HashMap::new()),
+                kvmap_sweep_corpses: std::sync::Arc::new(scc::HashMap::new()),
             }),
         };
         // Merge-worker promotion commits layout through the router (weak:
@@ -17202,6 +17325,220 @@ impl DataRouter {
         Ok(())
     }
 
+    /// PR 6b: is `ino` a sweep corpse — a `delete_file` that took the A2
+    /// over-threshold handoff, whose inode record + cursor head stay
+    /// alive until the sweep job's terminal destroy? Reclaim and the
+    /// mount corpse sweep WITHHOLD their `destroy_inodes` for these.
+    pub fn kvmap_sweep_corpse_pending(&self, ino: u64) -> bool {
+        self.inner.kvmap_sweep_corpses.contains_sync(&ino)
+    }
+
+    /// PR 6b: the sweep job's terminal destroy ran — the corpse is gone.
+    pub fn kvmap_sweep_corpse_clear(&self, ino: u64) {
+        let _ = self.inner.kvmap_sweep_corpses.remove_sync(&ino);
+    }
+
+    /// PR 6b: re-arm the corpse mark for an ADOPTED sweep (a prior era's
+    /// handoff — the RAM registry died with its process; KD-6's
+    /// regeneration restores it beside the job).
+    pub fn kvmap_sweep_corpse_mark(&self, ino: u64) {
+        let _ = self.inner.kvmap_sweep_corpses.insert_sync(ino, ());
+    }
+
+    /// PR 6b (design §3/A2): execute ONE background-sweep chunk for
+    /// `ino` — the job fabric's unit of work. The backend commits the
+    /// one-tx chunk (record-true map Deletes + their reference releases +
+    /// the cursor-advance head Put) under its own held 4a, re-deriving
+    /// the deletable floor from the CURRENT size (the write-during-sweep
+    /// law); this wrapper then purges the freed keys' read tiers and
+    /// enqueues their device frees AFTER the guard is gone (RES-1 — the
+    /// `truncate_layout` deferred-frees pattern).
+    pub async fn kvmap_sweep_chunk(&self, ino: u64, chunk: usize) -> Result<KvmapSweepProgress> {
+        let backend = self.inner.meta_backend.get().ok_or_else(|| {
+            SqueezefsError::InvalidOperation("Metadata backend not initialized".to_string())
+        })?;
+        let bs = self.block_size.load(Ordering::Relaxed).max(1);
+        let floor_of = move |size: u64| -> u32 {
+            size.div_ceil(bs)
+                .min(u64::from(u32::MAX - 1))
+                .try_into()
+                .expect("clamped to u32 range")
+        };
+        let ref_for = |key: &str, idx: u32| self.backend_router.block_ref_for(key, ino, idx);
+        let out = backend
+            .kvmap_sweep_chunk(ino, chunk, &floor_of, &ref_for)
+            .await?;
+        let (records, freed, terminal) = match out {
+            crate::meta_backend::kv::backend::SweepChunkOutcome::NoCursor => {
+                return Ok(KvmapSweepProgress::NoCursor)
+            }
+            crate::meta_backend::kv::backend::SweepChunkOutcome::Progress { records, freed } => {
+                (records, freed, false)
+            }
+            crate::meta_backend::kv::backend::SweepChunkOutcome::Terminal { records, freed } => {
+                (records, freed, true)
+            }
+        };
+        crate::fuse_client::METRICS
+            .map_sweep_chunks
+            .fetch_add(1, Ordering::Relaxed);
+        crate::fuse_client::METRICS
+            .map_sweep_records
+            .fetch_add(records, Ordering::Relaxed);
+        // Purge-before-free (the displaced-key law): the offset will be
+        // reallocated under the SAME key string once freed, and a stale
+        // tier hit would serve the dead incarnation's bytes.
+        for key in &freed {
+            self.cache.purge_block_key(key);
+        }
+        let cleaned: Vec<String> = freed.iter().map(|k| clean_block_key(k)).collect();
+        self.free_deferred_keys(cleaned).await;
+        Ok(if terminal {
+            KvmapSweepProgress::Terminal { records }
+        } else {
+            KvmapSweepProgress::Progress { records }
+        })
+    }
+
+    /// PR 6b (design §3/A2, Rev 1.6): the **size-flip-first truncate
+    /// handoff** for a striped kvmap ino whose removed-record estimate
+    /// (`(old_size − new_size) / block_size`) exceeds the derived
+    /// [`kvmap_sweep_threshold_blocks`] — the SETATTR commits ONLY the
+    /// new size + the head re-Put carrying `;sweep:K` (K = the first
+    /// removed index), O(1) and never O(removed). Reads clamp to size,
+    /// so the shadowed records are immediately unreadable; the RAM map
+    /// prunes here (RAM is cheap — it is the DURABLE record/ref/free
+    /// work that defers to [`crate::jobs::JobType::KvmapSweep`]).
+    ///
+    /// `Ok(false)` = not this arm's shape (below threshold, non-kvmap,
+    /// a grow, or a foreign-home ino — the job is AUTHORITY-only: a
+    /// co-writer's SETATTR ships via meta_ship and the OWNER's own
+    /// truncate runs this handoff) — the caller's synchronous path runs
+    /// VERBATIM.
+    async fn kvmap_truncate_sweep_handoff(
+        &self,
+        ino: u64,
+        file_path: &str,
+        new_size: u64,
+        fencing_token: u64,
+    ) -> Result<bool> {
+        let Some(backend) = self.inner.meta_backend.get() else {
+            return Ok(false);
+        };
+        if !crate::meta_ship::publish::publishes_locally(backend, ino) {
+            return Ok(false);
+        }
+        let bs = self.block_size.load(Ordering::Relaxed).max(1);
+        let meta_guard = meta_lock_acquire(ino).await;
+        // Freshest authority under the 3.5 guard — the merge primitive's
+        // dirty-authority rule (never `fetch_metadata`: it retakes this
+        // lock).
+        let current = match self.metadata_cache.get(&ino) {
+            Some(m) if m.layout_dirty => Some(m),
+            cached => match self.fetch_metadata_from_backend(ino).await? {
+                Some(m) => Some(m),
+                None => cached,
+            },
+        };
+        let Some(mut current) = current else {
+            drop(meta_guard);
+            return Ok(false);
+        };
+        let is_kvmap = current
+            .block_map_id
+            .as_deref()
+            .is_some_and(|id| id.starts_with(kvmap_head_prefix()));
+        if current.file_type != "striped" || !is_kvmap || new_size >= current.size {
+            drop(meta_guard);
+            return Ok(false);
+        }
+        let removed_estimate = (current.size - new_size) / bs;
+        if removed_estimate <= kvmap_sweep_threshold_blocks() {
+            drop(meta_guard);
+            return Ok(false);
+        }
+        // FIND-M11-A: stale custody never commits a size flip.
+        let live_token = self.dlm.get_fencing_token_ino(ino);
+        if fencing_token < live_token {
+            drop(meta_guard);
+            return Err(SqueezefsError::FencingTokenExpired {
+                token: fencing_token,
+                expected: live_token,
+            });
+        }
+        // The pruning-op beats of the TruncateFrom arm, verbatim: bump
+        // the layout-prune epoch (in-flight delayed merges must observe
+        // the cut and refuse), retire stale shadow bindings, and screen
+        // device overlays past the cut.
+        LAYOUT_PRUNE_EPOCHS
+            .get_inode_lock(ino)
+            .fetch_add(1, Ordering::Release);
+        self.supersede_shadow_bindings_from(ino, new_size, bs);
+        let mut overlay_touched: Vec<u32> = Vec::new();
+        if let Some(h) = self.overlay_hooks_live() {
+            let past_cut: Vec<u32> = (h.blocks_of)(ino)
+                .into_iter()
+                .filter(|&b| (b as u64) * bs >= new_size)
+                .collect();
+            self.overlay_screen_discard(ino, past_cut, &mut overlay_touched);
+        }
+        // RAM prune — deliberately NO ref staging and NO displaced-key
+        // frees: the durable record/ref/free work for the removed set IS
+        // what defers to the sweep (A2). Tier purges still run — the
+        // sweep will free these offsets and a reallocation under the
+        // same key string must never serve stale tier bytes.
+        let mut map_arc = current.block_map.take().unwrap_or_default();
+        let map = std::sync::Arc::make_mut(&mut map_arc);
+        map.retain(|&b, bk| {
+            if (b as u64) * bs >= new_size {
+                self.cache.purge_block_key(bk);
+                false
+            } else {
+                true
+            }
+        });
+        let live_entries = map.len() as u64;
+        current.block_map = Some(map_arc);
+        current.size = new_size;
+        // K = the first removed index (design §3): ceil(new_size / bs).
+        let k: u32 = new_size
+            .div_ceil(bs)
+            .min(u64::from(u32::MAX - 1))
+            .try_into()
+            .expect("clamped to u32 range");
+        // The O(1) durable commit: head re-Put (cursor = min(existing, K)
+        // — the backend owns the min under its 4a) + inode size, ONE tx,
+        // no refs of its own (a pure truncate takes nothing; the removed
+        // set's releases are the sweep's).
+        let head_id = backend
+            .kvmap_truncate_handoff(ino, new_size, k, &[])
+            .await?;
+        current.block_map_id = Some(head_id.into());
+        current.cached_at = std::time::Instant::now();
+        // The write-map gauge shrank with the prune (PR 6a option b).
+        let est = live_entries.saturating_mul(KVMAP_WRITE_MAP_ENTRY_EST);
+        match self.inner.kvmap_write_maps.entry_sync(ino) {
+            scc::hash_map::Entry::Occupied(mut occ) => *occ.get_mut() = est,
+            scc::hash_map::Entry::Vacant(vac) => {
+                let _ = vac.insert_entry(est);
+            }
+        }
+        self.publish_layout_cache_entry(ino, current);
+        // The truncated tail is gone: drop whole-file RAM snapshots so a
+        // later re-extend reads zeros (the TruncateFrom arm's law).
+        self.cache.write_lru.remove(file_path);
+        self.cache.read_lru.remove(file_path);
+        drop(meta_guard);
+        self.overlay_schedule_retires(ino, overlay_touched);
+        // The coordinator submit (KD-6's live half; the durable cursor is
+        // the crash-safe plan the mount adoption scan regenerates from).
+        crate::fuse_client::METRICS
+            .map_sweep_jobs
+            .fetch_add(1, Ordering::Relaxed);
+        crate::jobs::submit_kvmap_sweep(ino);
+        Ok(true)
+    }
+
     /// Truncate a file's layout metadata, reclaiming blocks that fall beyond the new size.
     pub async fn truncate_layout(&self, ino: u64, new_size: u64, fencing_token: u64) -> Result<()> {
         let file_path = crate::keys::inode_path(ino);
@@ -17228,6 +17565,16 @@ impl DataRouter {
         // unconditionally is both correct and cheap on the grow path.
 
         if meta.file_type == "striped" {
+            // PR 6b (design §3/A2): the over-threshold kvmap shrink takes
+            // the size-flip-first handoff — O(1) commit, background sweep.
+            // Below the derived threshold (and on every non-kvmap shape)
+            // the synchronous path below runs VERBATIM.
+            if self
+                .kvmap_truncate_sweep_handoff(ino, &file_path, new_size, fencing_token)
+                .await?
+            {
+                return Ok(());
+            }
             // Removal-RMW through the shared merge primitive (§5.3 one merge
             // discipline): read→prune blocks whose start is >= new_size→save,
             // serialized under INODE_META_LOCKS against every other striped-map
@@ -17576,6 +17923,138 @@ impl DataRouter {
         Ok(())
     }
 
+    /// PR 6b: does `ino` qualify for the over-threshold kvmap CORPSE
+    /// handoff? Read off the DURABLE head alone (one xattr get — never
+    /// the map rehydration): a kvmap head whose record estimate
+    /// (`size / block_size`) exceeds the derived threshold, or one whose
+    /// sweep cursor is ALREADY live (a truncate sweep in progress, or a
+    /// repeated `delete_file` of an existing corpse — re-running the
+    /// synchronous path would pay the rehydration the handoff defers).
+    /// Authority-only, like the truncate handoff.
+    async fn kvmap_corpse_handoff_qualifies(&self, ino: u64) -> bool {
+        let Some(backend) = self.inner.meta_backend.get() else {
+            return false;
+        };
+        if !crate::meta_ship::publish::publishes_locally(backend, ino) {
+            return false;
+        }
+        let Ok(Some(bytes)) = backend.getxattr(ino, "layout").await else {
+            return false;
+        };
+        let Ok(layout) = crate::layout_wire::decode_layout_any(&bytes) else {
+            return false;
+        };
+        let Some(head) = layout
+            .block_map_id
+            .as_deref()
+            .and_then(|id| crate::meta_backend::kv::block_map::parse_kvmap_head(id).ok())
+        else {
+            return false;
+        };
+        if head.sweep_cursor.is_some() {
+            return true;
+        }
+        let bs = self.block_size.load(Ordering::Relaxed).max(1);
+        layout.size / bs > kvmap_sweep_threshold_blocks()
+    }
+
+    /// PR 6b (design §3/A2 — the landed corpse ordering): `delete_file`
+    /// on an over-threshold kvmap ino keeps the inode record + head
+    /// ALIVE as a CORPSE (nlink 0, unreachable — the POSIX
+    /// unlinked-but-open class the census already carries) with
+    /// `;sweep:0`, and the sweep job's TERMINAL chunk performs the
+    /// destroy (record + xattrs in one tx — the C9
+    /// quarantine-then-destroy shape's destroy half; no quarantine: this
+    /// is a planned teardown, not a repair). Kept honest by:
+    ///
+    /// * the corpse's durable REFERENCES stay until each chunk releases
+    ///   them with its Deletes — the census/oracle include `nlink == 0`
+    ///   layouts (the 2026-08-23 corpse-census correction), so the
+    ///   mid-sweep state reads drift-free;
+    /// * the pending accounting notes drain into the handoff tx as
+    ///   releases (the normal corpse release's dedup law — bounded by
+    ///   un-persisted rebinds, never file size);
+    /// * the torn-down rewrite epoch's displaced/shadow keys free HERE
+    ///   (bounded by the epoch — the sweep cannot see them: they were
+    ///   never durable records);
+    /// * staging teardown stays O(PRESENT) (the prefix scans; the
+    ///   map-derived defense-in-depth keys are the sweep's population).
+    async fn kvmap_corpse_sweep_handoff(
+        &self,
+        ino: u64,
+        file_path: &str,
+        reclaimed_epoch: Option<std::sync::Arc<RewriteEpoch>>,
+    ) -> Result<()> {
+        let backend = self.inner.meta_backend.get().ok_or_else(|| {
+            SqueezefsError::InvalidOperation("Metadata backend not initialized".to_string())
+        })?;
+        // The torn-down epoch's parked custody (the delete_file fence
+        // comment's law, applied to the corpse arm): guards drop first,
+        // then displaced + shadow keys free — both RAM-only populations
+        // the durable tree never named, so the sweep can never reclaim
+        // them.
+        let mut epoch_frees: Vec<String> = Vec::new();
+        if let Some(epoch) = reclaimed_epoch {
+            while epoch.guards.pop().is_some() {}
+            while let Some(k) = epoch.displaced.pop() {
+                epoch_frees.push(clean_block_key(&k));
+            }
+            epoch.shadow.iter_sync(|_, k| {
+                epoch_frees.push(clean_block_key(k));
+                true
+            });
+            epoch_frees.sort_unstable();
+            epoch_frees.dedup();
+        }
+        // The corpse's deferred accounting notes — drained as RELEASES
+        // (the FIND-M11-A reclaimed-ino orphan-discard law; a Delete of
+        // an absent key is a no-op, so the set is conservative and
+        // exact — the normal delete_file's own dedup discipline).
+        let pending = self.take_block_ref_ops(ino);
+        let mut refs: Vec<crate::meta_backend::kv::block_refs::BlockRefOp> = Vec::new();
+        let mut seen: std::collections::BTreeSet<crate::meta_backend::kv::block_refs::BlockRef> =
+            std::collections::BTreeSet::new();
+        for op in pending {
+            if seen.insert(op.reference) {
+                refs.push(crate::meta_backend::kv::block_refs::BlockRefOp::released(
+                    op.reference,
+                ));
+            }
+        }
+        // The O(1) commit: size 0 + `;sweep:0` (min-composed with any
+        // live truncate cursor by the backend) + the drained releases —
+        // one tx. K = 0: the whole range is the removed set.
+        backend.kvmap_truncate_handoff(ino, 0, 0, &refs).await?;
+        let _ = self.inner.kvmap_sweep_corpses.insert_sync(ino, ());
+        for key in &epoch_frees {
+            self.cache.purge_block_key(key);
+        }
+        self.free_deferred_keys(epoch_frees).await;
+        // Staged-overlay teardown, O(PRESENT) only (the prefix scans of
+        // the normal path; §6.2 item 8's writer-scope retain applies).
+        let mut keys: Vec<String> = self
+            .cache
+            .nvme
+            .staged_keys_with_prefix(&format!("active_block:{file_path}:"));
+        keys.extend(
+            self.cache
+                .nvme
+                .staged_keys_with_prefix(&format!("active_block_ext:{file_path}:")),
+        );
+        keys.sort_unstable();
+        keys.dedup();
+        keys.retain(|k| crate::writer_scope::key_is_mine(k));
+        let _ = self.cache.nvme.remove_active_blocks_async(keys).await;
+        self.cache.write_lru.remove(file_path);
+        self.cache.read_lru.remove(file_path);
+        self.metadata_cache.invalidate(&ino);
+        crate::fuse_client::METRICS
+            .map_sweep_jobs
+            .fetch_add(1, Ordering::Relaxed);
+        crate::jobs::submit_kvmap_sweep(ino);
+        Ok(())
+    }
+
     /// Safely delete all underlying storage files/blocks associated with the file.
     pub async fn delete_file(&self, file_path: &str) -> Result<()> {
         // Reclaim-latch serialization point (the live-statfs drift fix):
@@ -17613,6 +18092,12 @@ impl DataRouter {
         // commit (both the FIND-M11-A reclaimed-ino orphan-discard law —
         // nlink is 0 and nothing is open, never live acked data).
         let ino_for_fence = parse_inode_from_path(file_path);
+        // PR 6b (design §3/A2 + Rev 1.6's corpse design point): probe the
+        // over-threshold kvmap CORPSE handoff BEFORE `fetch_metadata` —
+        // the fetch rehydrates the FULL tree-resolved map (Rev 1.3 #2),
+        // which for the PB class is exactly the O(records) work the
+        // handoff exists to defer. Probed on the durable head alone.
+        let corpse_handoff = self.kvmap_corpse_handoff_qualifies(ino_for_fence).await;
         let reclaimed_epoch = {
             let fence = meta_lock_acquire(ino_for_fence).await;
             let epoch = self
@@ -17623,6 +18108,11 @@ impl DataRouter {
             drop(fence);
             epoch
         };
+        if corpse_handoff {
+            return self
+                .kvmap_corpse_sweep_handoff(ino_for_fence, file_path, reclaimed_epoch)
+                .await;
+        }
         let meta = self.fetch_metadata(file_path).await?;
 
         let mut blocks_to_free: Vec<String> = Vec::new();

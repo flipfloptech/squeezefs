@@ -1159,6 +1159,9 @@ async fn a_shipped_crossing_is_witnessed_owner_ratcheted_and_era_gated() {
         entries.clone(),
         Vec::new(),
         512,
+        // PR 6b: no live sweep cursor — the barrier never engages.
+        0,
+        &|_key, _idx| None,
     )
     .await
     .expect("the helper ships");

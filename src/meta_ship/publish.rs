@@ -1923,6 +1923,10 @@ pub async fn migrate_block_map(
     entries: Vec<(u32, String)>,
     refs: Vec<BlockRefOp>,
     chunk: usize,
+    cursor_floor: u32,
+    ref_for: &(dyn Fn(&str, u32) -> Option<crate::meta_backend::kv::block_refs::BlockRef>
+          + Send
+          + Sync),
 ) -> Result<crate::meta_backend::kv::backend::MapMigrateOutcome> {
     match owner_of(be, ino)? {
         None => {
@@ -1989,7 +1993,17 @@ pub async fn migrate_block_map(
                 None
             };
             match be
-                .migrate_block_map_train(ino, layout, size, &refs, &entries, chunk, claims.as_ref())
+                .migrate_block_map_train(
+                    ino,
+                    layout,
+                    size,
+                    &refs,
+                    &entries,
+                    chunk,
+                    claims.as_ref(),
+                    cursor_floor,
+                    ref_for,
+                )
                 .await?
             {
                 Some(outcome) => Ok(outcome),
@@ -2041,6 +2055,11 @@ pub async fn migrate_block_map(
                         gen,
                         recomputed,
                         released: Vec::new(),
+                        // Shipped trains never barrier (a live cursor on
+                        // the owner refuses retried-class instead).
+                        sweep_cursor: None,
+                        swept_records: 0,
+                        swept_freed: Vec::new(),
                     })
                 }
                 other => Err(protocol_error(
@@ -3530,6 +3549,10 @@ impl PublishService {
                 &entries,
                 crate::routing::map_migrate_chunk(),
                 Some(&claims),
+                // Claims trains never barrier: a live sweep cursor
+                // refuses retried-class inside the train (PR 6b).
+                0,
+                &|_key, _idx| None,
             )
             .await?
         {
@@ -3680,6 +3703,10 @@ impl PublishService {
                     &entries,
                     crate::routing::map_migrate_chunk(),
                     Some(&claims),
+                    // Claims trains never barrier: a live sweep cursor
+                    // refuses retried-class inside the train (PR 6b).
+                    0,
+                    &|_key, _idx| None,
                 )
                 .await?
             {
@@ -3732,6 +3759,12 @@ impl PublishService {
                     &entries,
                     crate::routing::map_migrate_chunk(),
                     None,
+                    // A served ESTABLISHING train's durable base is never
+                    // kvmap (its sticky-head siblings ride the claims
+                    // arms), so no cursor can exist to barrier over; a
+                    // violated invariant refuses loud inside the train.
+                    0,
+                    &|_key, _idx| None,
                 )
                 .await?
             {

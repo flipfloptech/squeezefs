@@ -55,6 +55,7 @@ use super::record::{
 use super::superblock::{classify_volume, SuperblockV3, VolumeFormat};
 use super::tree::{decode_interior_value, KvTree, RootPtr, SmoContext, SmoJournal};
 use super::KvError;
+use super::{block_map, block_refs};
 use crate::error::Result;
 use crate::meta_backend::atomicity::META_VOLUME_ATOMICITY_COW;
 // DLM S3.5 (design-cow-kv-metadata §4.10a): the cross-volume plan
@@ -3172,6 +3173,8 @@ impl KvMetaBackend {
         claims: Option<&MapTrainClaims>,
         refs_owner: Ino,
         entry_key: &(dyn Fn(&super::block_map::MapEntry, u32) -> Option<String> + Send + Sync),
+        cursor_floor: u32,
+        ref_for: &(dyn Fn(&str, u32) -> Option<super::block_refs::BlockRef> + Send + Sync),
     ) -> Result<Option<MapMigrateOutcome>> {
         self.write_gate()?;
         if !self.block_map_tree_ready().await {
@@ -3183,19 +3186,26 @@ impl KvMetaBackend {
 
         // PR 5b: the durable head, read under the held 4a — the gen law's
         // input and the claims train's base identity. `None` = no kvmap
-        // head (a crossing/conversion — the establishing train).
+        // head (a crossing/conversion — the establishing train). PR 6b:
+        // the same read carries the A2 sweep cursor — a live cursor can
+        // only exist in a kvmap head, and kvmap heads never regress
+        // (sticky, pinned), so the establishing train structurally never
+        // meets one: the re-cross-vs-sweep compose is trivial by law.
         let mut durable_size = 0u64;
-        let durable_gen: Option<u64> = match self.getxattr(ino, "layout").await? {
-            Some(bytes) => crate::layout_wire::decode_layout_any(&bytes)
-                .ok()
-                .and_then(|l| {
-                    durable_size = l.size;
-                    l.block_map_id
-                })
-                .and_then(|id| super::block_map::parse_kvmap_head(&id).ok())
-                .map(|h| h.gen),
-            None => None,
-        };
+        let durable_head: Option<super::block_map::KvmapHead> =
+            match self.getxattr(ino, "layout").await? {
+                Some(bytes) => crate::layout_wire::decode_layout_any(&bytes)
+                    .ok()
+                    .and_then(|l| {
+                        durable_size = l.size;
+                        l.block_map_id
+                    })
+                    .and_then(|id| super::block_map::parse_kvmap_head(&id).ok()),
+                None => None,
+            };
+        let durable_gen: Option<u64> = durable_head.as_ref().map(|h| h.gen);
+        let durable_cursor: Option<u32> = durable_head.as_ref().and_then(|h| h.sweep_cursor);
+        let shipped_size = size;
         // The f35 size law on the claims arm: a stale shipper's size never
         // regresses a peer's growth (truncation is the setattr plane's;
         // the whole-map arms keep caller authority verbatim).
@@ -3222,6 +3232,91 @@ impl KvMetaBackend {
                     )));
                 }
             }
+            // PR 6b (design §3/A2): a claims train meeting a live sweep
+            // cursor composes only STRICTLY BELOW it and never grows the
+            // size past the truncate — a size-raising ship or a claim at
+            // a shadowed index would re-expose residue the sweep has not
+            // released (silent stale data, the A1 class). Retried-class:
+            // the shipper refetches and recomposes; the cursor clears
+            // when the sweep (or the authority's own extend barrier)
+            // finishes.
+            if let Some(k) = durable_cursor {
+                let claimed_high = c.take.iter().chain(c.release.iter()).any(|&i| i >= k)
+                    || entries.iter().any(|(b, _)| *b >= k);
+                if shipped_size > durable_size || claimed_high {
+                    crate::meta_ship::publish::note_map_refused();
+                    return Err(crate::error::SqueezefsError::InvalidOperation(format!(
+                        "layout delta base unusable: kvmap sweep cursor — ino {ino}'s \
+                         head carries a live A2 sweep cursor at {k} and the shipped \
+                         train grows size ({shipped_size} > {durable_size}) or claims \
+                         indices at/above it: refetch and recompose once the sweep \
+                         drains (map_refused)"
+                    )));
+                }
+            }
+        }
+        // PR 6b: the extend barrier (design §3/A2's write-during-sweep
+        // law). With a live cursor K, every record at/above K is residue
+        // and every live record sits below K — a whole-map publish whose
+        // size now reaches past K (`cursor_floor = ceil(size/bs)`,
+        // computed by the router) would otherwise re-expose residue in
+        // [K, cursor_floor): reads clamp to size, so those stale records
+        // become servable the instant the size commits. The barrier
+        // sweeps exactly the re-exposed span — Deletes + reference
+        // releases in chunked txs co-owning the held 4a (no cursor
+        // advances: a crash re-runs record-true and idempotent) — and the
+        // flip head carries the advanced cursor. Freed keys travel up for
+        // the caller's post-commit reclaim (RES-1).
+        let mut swept_records = 0u64;
+        let mut swept_freed: Vec<String> = Vec::new();
+        let flip_cursor: Option<u32> = match (claims.is_none(), durable_cursor) {
+            (true, Some(k)) => {
+                // `bound == k` is the degenerate barrier: no growth, but
+                // the left-boundary straddler (a run keyed below K whose
+                // span crosses it) still dissolves — a shrink-superseding
+                // diff Put would otherwise drop its tail's coverage with
+                // the tail's references never released.
+                let bound = cursor_floor.max(k);
+                let mut pos = k;
+                loop {
+                    let pg = self
+                        .kvmap_sweep_page(ino, pos, Some(bound), chunk, entry_key, ref_for)
+                        .await?;
+                    swept_records += pg.records;
+                    swept_freed.extend(pg.freed);
+                    if !pg.ops.is_empty() {
+                        let mut tx = KvTx::new();
+                        tx.stage_block_map(&pg.ops)?;
+                        if self.block_refs.is_some() {
+                            tx.stage_block_refs(&pg.rel);
+                        }
+                        tx.hold_guards(Arc::clone(&guards));
+                        self.commit_tx(tx).await?;
+                    }
+                    match pg.resume {
+                        Some(next) => pos = next,
+                        None => break,
+                    }
+                }
+                Some(bound)
+            }
+            (_, cursor) => cursor,
+        };
+        if claims.is_none() {
+            if let Some(k) = flip_cursor {
+                if let Some((b, _)) = entries.iter().find(|(b, _)| *b >= k) {
+                    // Unreachable through the routing layer (the RAM map
+                    // excludes shadowed residue and the barrier covers
+                    // regrowth) — reaching it means a desired binding
+                    // names an index the sweep owns, and committing it
+                    // would strand its superseded record's reference.
+                    return Err(crate::error::SqueezefsError::InvalidOperation(format!(
+                        "whole-map train for ino {ino} desires index {b} at/above the \
+                         live A2 sweep cursor {k} (design §3): the cursor invariant \
+                         broke upstream — refusing rather than stranding references"
+                    )));
+                }
+            }
         }
         // The bump law: a committed train on the MULTI-WRITER plane —
         // a claims train (shipped/range-custody by definition), any train
@@ -3238,9 +3333,14 @@ impl KvMetaBackend {
                 }
             }
         };
-        // Re-stamp the flip head's generation. Gen 0 commits the caller's
-        // bytes verbatim (the pre-belt byte-identity pin).
-        let layout_restamped: Option<Vec<u8>> = if committed_gen > 0 {
+        // Re-stamp the flip head's generation — and, PR 6b, the A2 sweep
+        // cursor: the DURABLE head owns the cursor (the caller's bytes
+        // arrive cursor-less — the routing layer never authors one), so a
+        // publish during a live sweep must carry it forward or the plan
+        // is lost and the residue's records/references strand forever.
+        // Gen 0 with no live cursor commits the caller's bytes verbatim
+        // (the pre-belt byte-identity pin).
+        let layout_restamped: Option<Vec<u8>> = if committed_gen > 0 || flip_cursor.is_some() {
             let mut head: crate::layout_wire::LayoutMetadata = bincode::deserialize(layout)
                 .map_err(|e| {
                     crate::error::SqueezefsError::InvalidOperation(format!(
@@ -3258,13 +3358,18 @@ impl KvMetaBackend {
                          nothing staged"
                     ))
                 })?;
-            if parsed.gen == committed_gen {
+            let flip_gen = if committed_gen > 0 {
+                committed_gen
+            } else {
+                parsed.gen
+            };
+            if parsed.gen == flip_gen && parsed.sweep_cursor == flip_cursor {
                 None
             } else {
                 head.block_map_id = Some(
                     super::block_map::KvmapHead {
-                        sweep_cursor: parsed.sweep_cursor,
-                        gen: committed_gen,
+                        sweep_cursor: flip_cursor,
+                        gen: flip_gen,
                     }
                     .encode(),
                 );
@@ -3570,7 +3675,7 @@ impl KvMetaBackend {
                 std::collections::BTreeSet::new();
             let mut stale_deletes: Vec<super::block_map::BlockMapOp> = Vec::new();
             let mut cursor = 0u32;
-            loop {
+            'scan: loop {
                 let page = self
                     .block_map_range(ino, cursor, chunk)
                     .await
@@ -3580,6 +3685,14 @@ impl KvMetaBackend {
                 };
                 let next = last.checked_add(1);
                 for (idx, existing) in page {
+                    // PR 6b: the diff never reaches past a live sweep
+                    // cursor — records at/above it are residue the
+                    // background sweep owns (deleting them by-absence
+                    // here would strand their references, which the diff
+                    // has no frame to release).
+                    if flip_cursor.is_some_and(|k| idx >= k) {
+                        break 'scan;
+                    }
                     preexisting += 1;
                     match desired.get(&idx) {
                         Some(want) if existing == **want => {
@@ -3763,6 +3876,9 @@ impl KvMetaBackend {
             gen: committed_gen,
             recomputed,
             released,
+            sweep_cursor: flip_cursor,
+            swept_records,
+            swept_freed,
         }))
     }
 
@@ -3805,6 +3921,329 @@ impl KvMetaBackend {
             self.commit_tx(tx).await?;
         }
         Ok(deleted)
+    }
+
+    /// PR 6b (design §3/A2): the **size-flip-first truncate/unlink
+    /// handoff** — commit ONLY the new size plus the durable per-ino
+    /// sweep cursor in the head sentinel (`kvmap:1;sweep:K`), one
+    /// two-record tx under one 4a guard, O(1) regardless of the removed
+    /// set (a 1 PiB truncate is 2²⁸ record Deletes — five orders past the
+    /// whole-entry cap — so the DURABLE record/ref/free work defers to
+    /// the job-fabric sweep; reads clamp to size, so every shadowed
+    /// record is immediately unreadable). The cursor law: a handoff onto
+    /// an already-cursored head takes `min(existing, k)` — the swept
+    /// region only ever grows downward, so "every record ≥ cursor is
+    /// residue" survives repeated truncates. Everything else in the head
+    /// (gen included — this is not a train, it stages no records) is
+    /// preserved verbatim. Returns the committed head id for the
+    /// caller's RAM republish.
+    pub async fn kvmap_truncate_handoff(
+        &self,
+        ino: Ino,
+        new_size: u64,
+        k: u32,
+        block_refs: &[super::block_refs::BlockRefOp],
+    ) -> Result<String> {
+        self.write_gate()?;
+        let guards: Arc<[DlmGuard]> = Arc::from(vec![self.dlm.lock_inode_exclusive(ino).await]);
+        let bytes = self.getxattr(ino, "layout").await?.ok_or_else(|| {
+            Self::not_found(format!("kvmap truncate handoff: ino {ino} has no layout"))
+        })?;
+        let mut layout: crate::layout_wire::LayoutMetadata =
+            bincode::deserialize(&bytes).map_err(|e| {
+                crate::error::SqueezefsError::InvalidOperation(format!(
+                    "kvmap truncate handoff for ino {ino}: undecodable head ({e}) — \
+                     the handoff composes onto a durable kvmap head only"
+                ))
+            })?;
+        let head = layout
+            .block_map_id
+            .as_deref()
+            .and_then(|id| super::block_map::parse_kvmap_head(id).ok())
+            .ok_or_else(|| {
+                crate::error::SqueezefsError::InvalidOperation(format!(
+                    "kvmap truncate handoff for ino {ino}: the durable head is not \
+                     kvmap-class — the synchronous path owns this shape"
+                ))
+            })?;
+        let cursor = head.sweep_cursor.map_or(k, |c| c.min(k));
+        layout.block_map_id = Some(
+            super::block_map::KvmapHead {
+                sweep_cursor: Some(cursor),
+                gen: head.gen,
+            }
+            .encode(),
+        );
+        layout.size = new_size;
+        let head_id = layout
+            .block_map_id
+            .clone()
+            .expect("just assigned the head id");
+        let encoded = bincode::serialize(&layout).map_err(|e| {
+            crate::error::SqueezefsError::InvalidOperation(format!(
+                "kvmap truncate handoff for ino {ino}: head re-encode failed: {e}"
+            ))
+        })?;
+        self.set_layout_and_size_with_map_holding(ino, &encoded, new_size, block_refs, &[], guards)
+            .await?;
+        Ok(head_id)
+    }
+
+    /// PR 6b: one A2 sweep chunk under one held 4a — the per-chunk
+    /// ONE-tx law (design §12): record-true map Deletes + their
+    /// BlockRefOp releases + the cursor-advance head Put ride ONE KvTx;
+    /// the freed block keys are RETURNED for the caller's post-commit
+    /// reclaim enqueue (RES-1 — device commands never issue under the
+    /// guard, which drops when this returns).
+    ///
+    /// The cursor law: the deletable floor is re-derived from the
+    /// CURRENT durable size under the held 4a (`floor_of(size)`), so a
+    /// write/extend that grew the file back past the cursor — whose
+    /// publish barrier already swept and advanced past the re-exposed
+    /// span — never has its minted records deleted: the chunk starts at
+    /// `max(cursor, floor)`.
+    ///
+    /// The straddler law (the run face of the 6a dissolve law): a RUN
+    /// record keyed below the start whose span crosses it is re-Put
+    /// SHORTENED at its own key (len 1 collapses to the point form —
+    /// same vol_tag/offset/stamp arithmetic, so the record stays
+    /// record-true) and the covered tail above the start releases with
+    /// the chunk; a record fully at/above the start deletes whole.
+    ///
+    /// The TERMINAL chunk (scan exhausted) clears the cursor from the
+    /// head in the same tx; the caller owns the corpse destroy
+    /// (`nlink == 0`).
+    #[allow(clippy::type_complexity)]
+    pub async fn kvmap_sweep_chunk(
+        &self,
+        ino: Ino,
+        chunk: usize,
+        floor_of: &(dyn Fn(u64) -> u32 + Send + Sync),
+        entry_key: &(dyn Fn(&super::block_map::MapEntry, u32) -> Option<String> + Send + Sync),
+        ref_for: &(dyn Fn(&str, u32) -> Option<super::block_refs::BlockRef> + Send + Sync),
+    ) -> Result<SweepChunkOutcome> {
+        if self.block_map.get().is_none() {
+            return Ok(SweepChunkOutcome::NoCursor);
+        }
+        self.write_gate()?;
+        let chunk = chunk.max(1);
+        let guards: Arc<[DlmGuard]> = Arc::from(vec![self.dlm.lock_inode_exclusive(ino).await]);
+        // The durable head, re-read under the held 4a — the plan IS the
+        // cursor (KD-6); a vanished record / cleared cursor means the
+        // work is done (a publish absorbed it, or a duplicate job ran).
+        let Some(bytes) = self.getxattr(ino, "layout").await? else {
+            return Ok(SweepChunkOutcome::NoCursor);
+        };
+        let Ok(mut layout) = bincode::deserialize::<crate::layout_wire::LayoutMetadata>(&bytes)
+        else {
+            return Ok(SweepChunkOutcome::NoCursor); // JSON/legacy: never kvmap
+        };
+        let Some(head) = layout
+            .block_map_id
+            .as_deref()
+            .and_then(|id| super::block_map::parse_kvmap_head(id).ok())
+        else {
+            return Ok(SweepChunkOutcome::NoCursor);
+        };
+        let Some(cursor) = head.sweep_cursor else {
+            return Ok(SweepChunkOutcome::NoCursor);
+        };
+        let start = cursor.max(floor_of(layout.size));
+        let page = self
+            .kvmap_sweep_page(ino, start, None, chunk, entry_key, ref_for)
+            .await?;
+        let new_cursor = page.resume;
+        layout.block_map_id = Some(
+            super::block_map::KvmapHead {
+                sweep_cursor: new_cursor,
+                gen: head.gen,
+            }
+            .encode(),
+        );
+        let encoded = bincode::serialize(&layout).map_err(|e| {
+            crate::error::SqueezefsError::InvalidOperation(format!(
+                "kvmap sweep chunk for ino {ino}: head re-encode failed: {e}"
+            ))
+        })?;
+        self.set_layout_and_size_with_map_holding(
+            ino,
+            &encoded,
+            layout.size,
+            &page.rel,
+            &page.ops,
+            guards,
+        )
+        .await?;
+        Ok(match new_cursor {
+            Some(_) => SweepChunkOutcome::Progress {
+                records: page.records,
+                freed: page.freed,
+            },
+            None => SweepChunkOutcome::Terminal {
+                records: page.records,
+                freed: page.freed,
+            },
+        })
+    }
+
+    /// The shared A2 sweep-page builder (the chunk method and the train's
+    /// extend barrier): stage record-true Deletes for `ino`'s records in
+    /// `[start, upto)` (unbounded when `upto` is `None`), one bounded
+    /// page's worth (`chunk` counts COVERED INDICES, so a run's per-index
+    /// releases can never blow the f38 journal-entry cap), plus the
+    /// straddler dissolve at the left boundary. Never-lossy: an
+    /// unresolvable entry (foreign/retired volume tag) REFUSES the chunk
+    /// loud — deleting a record whose reference cannot release, or whose
+    /// block cannot free, would strand the block forever (fsck C2/C8).
+    async fn kvmap_sweep_page(
+        &self,
+        ino: Ino,
+        start: u32,
+        upto: Option<u32>,
+        chunk: usize,
+        entry_key: &(dyn Fn(&super::block_map::MapEntry, u32) -> Option<String> + Send + Sync),
+        ref_for: &(dyn Fn(&str, u32) -> Option<super::block_refs::BlockRef> + Send + Sync),
+    ) -> Result<SweepPageOps> {
+        let refs_engaged = self.block_refs.is_some();
+        let mut out = SweepPageOps::default();
+        let mut budget = chunk;
+        // Release the deltas `[from, to)` of one record — every release
+        // pairs a freed key, so the chunk budget bounds BOTH the tx's
+        // journal footprint (the whole-entry cap: a 4096-index run's
+        // one-shot release measured ~178 KiB against the 128 KiB cap)
+        // and the caller's post-commit reclaim batch.
+        let resolve_span = |out: &mut SweepPageOps,
+                            entry: &super::block_map::MapEntry,
+                            idx: u32,
+                            from: u32,
+                            to: u32|
+         -> Result<()> {
+            for delta in from..to {
+                let Some(key) = entry_key(entry, delta) else {
+                    return Err(crate::error::SqueezefsError::InvalidOperation(format!(
+                        "kvmap sweep for ino {ino}: cannot resolve index {} of record \
+                         {entry:?} — no mounted volume resolves its arithmetic; refusing \
+                         rather than stranding its block (never-lossy)",
+                        idx + delta
+                    )));
+                };
+                if refs_engaged {
+                    let Some(r) = ref_for(&key, idx + delta) else {
+                        return Err(crate::error::SqueezefsError::InvalidOperation(format!(
+                            "kvmap sweep for ino {ino}: no durable-reference resolution \
+                             for '{key}' at index {} — refusing rather than leaking the \
+                             record's reference (fsck C8's class)",
+                            idx + delta
+                        )));
+                    };
+                    out.rel.push(super::block_refs::BlockRefOp::released(r));
+                }
+                out.freed.push(key);
+            }
+            Ok(())
+        };
+        // Consume one record's removable span `[keep, run_len)` from the
+        // RIGHT under the budget — the run face of the §12a dissolve law:
+        // each tx re-Puts the run SHORTENED by exactly the span whose
+        // references it releases, so every committed intermediate state
+        // is coverage-exact (never released-but-covered, never
+        // covered-but-released). `true` = the record fully consumed
+        // (deleted, or shortened to its live `keep` head); `false` =
+        // budget ran out mid-record — the chunk stops and resumes at a
+        // cursor whose scan re-finds this record's remainder.
+        let consume = |out: &mut SweepPageOps,
+                       budget: &mut usize,
+                       idx: u32,
+                       entry: &super::block_map::MapEntry,
+                       keep: u32|
+         -> Result<bool> {
+            let len = entry.run_len();
+            let span = len - keep;
+            let take = (span as usize).min((*budget).max(1)) as u32;
+            resolve_span(out, entry, idx, len - take, len)?;
+            *budget = budget.saturating_sub(take as usize);
+            out.records += 1;
+            if take == span && keep == 0 {
+                out.ops.push(super::block_map::BlockMapOp::Delete {
+                    owner_ino: ino,
+                    block_index: idx,
+                });
+            } else {
+                out.ops.push(super::block_map::BlockMapOp::Put {
+                    owner_ino: ino,
+                    block_index: idx,
+                    entry: shortened_run_entry(entry, len - take),
+                });
+            }
+            Ok(take == span)
+        };
+        // The left-boundary straddler: a run keyed below `start` covering
+        // it (the floor probe answers COVERING records only). Its keep
+        // head `[s, start)` is LIVE; the tail consumes right-to-left
+        // across as many chunk txs as the budget dictates — resuming at
+        // `start`, whose floor probe re-finds the shorter run until the
+        // tail is gone.
+        if start > 0 {
+            if let Some((s, entry)) = self
+                .block_map_floor(ino, start)
+                .await
+                .map_err(|e| self.eio(&format!("kvmap sweep floor probe for ino {ino}: {e}")))?
+            {
+                if !consume(&mut out, &mut budget, s, &entry, start - s)? {
+                    out.resume = Some(start);
+                    return Ok(out);
+                }
+            }
+        }
+        let page = self
+            .block_map_range(ino, start, chunk)
+            .await
+            .map_err(|e| self.eio(&format!("kvmap sweep scan for ino {ino}: {e}")))?;
+        let scan_exhausted = page.len() < chunk;
+        let mut cut_short = false;
+        let mut bound_reached = false;
+        for (idx, entry) in page {
+            if upto.is_some_and(|u| idx >= u) {
+                // Bounded (barrier) mode: records at/above the bound stay
+                // the background sweep's.
+                bound_reached = true;
+                break;
+            }
+            if budget == 0 {
+                // Budget spent: the first UNPROCESSED record's own key is
+                // the resume cursor (never a processed record's
+                // `idx + run_len` — a superseding point INSIDE a deleted
+                // run's span is its own record and must not be skipped).
+                out.resume = Some(idx);
+                cut_short = true;
+                break;
+            }
+            if !consume(&mut out, &mut budget, idx, &entry, 0)? {
+                // Budget ran out mid-run: the record survives shortened —
+                // resume AT its key (it still carries the remainder).
+                out.resume = Some(idx);
+                cut_short = true;
+                break;
+            }
+        }
+        if !cut_short && !bound_reached && !scan_exhausted {
+            // A full page, fully processed (and the bound — if any — not
+            // reached): more records may follow the last processed key.
+            // A bound that WAS reached left `resume` `None`, which is the
+            // exhaustion verdict.
+            out.resume = out
+                .ops
+                .iter()
+                .rev()
+                .find_map(|op| match op {
+                    super::block_map::BlockMapOp::Delete { block_index, .. } => {
+                        block_index.checked_add(1)
+                    }
+                    super::block_map::BlockMapOp::Put { .. } => None,
+                })
+                .or(Some(start));
+        }
+        Ok(out)
     }
 
     /// The resolved OQ 2 contract class for every v3 volume:
@@ -6432,6 +6871,98 @@ pub struct MapMigrateOutcome {
     /// save's post-guard venue runs them through the shipped-free ladder
     /// (RES-1: never freed under the caller's 3.5 stripe).
     pub released: Vec<super::block_refs::BlockRef>,
+    /// PR 6b: the committed head's A2 sweep cursor (`None` = no live
+    /// sweep) — the caller's RAM head id republish carries it, so the
+    /// CachedMetadata-head-vs-durable skew rule keeps holding mid-sweep.
+    pub sweep_cursor: Option<u32>,
+    /// PR 6b: residue records the train's extend barrier deleted
+    /// (design §3's write-during-sweep law).
+    pub swept_records: u64,
+    /// PR 6b: the barrier's freed block keys — the caller's post-commit
+    /// reclaim enqueue (RES-1: never freed under the train's guards).
+    pub swept_freed: Vec<String>,
+}
+
+/// PR 6b (design §3/A2): the verdict of one background sweep chunk.
+#[derive(Debug)]
+pub enum SweepChunkOutcome {
+    /// The head carries no live sweep cursor (never planted, already
+    /// terminal, or a publish's extend barrier absorbed the span) — the
+    /// job completes with nothing to do.
+    NoCursor,
+    /// One chunk tx committed (Deletes + releases + cursor advance);
+    /// records remain above the advanced cursor. `freed` is the caller's
+    /// post-commit reclaim enqueue (RES-1: the 4a guard is gone).
+    Progress { records: u64, freed: Vec<String> },
+    /// The terminal chunk committed — the cursor CLEARED in the same tx
+    /// as the final Deletes. A corpse owner (`nlink == 0`) is the
+    /// caller's to destroy.
+    Terminal { records: u64, freed: Vec<String> },
+}
+
+/// One [`KvMetaBackend::kvmap_sweep_page`] result: the staged ops for one
+/// chunk tx plus the resume cursor (`None` = the span is exhausted).
+#[derive(Debug, Default)]
+struct SweepPageOps {
+    ops: Vec<block_map::BlockMapOp>,
+    rel: Vec<block_refs::BlockRefOp>,
+    freed: Vec<String>,
+    records: u64,
+    resume: Option<u32>,
+}
+
+/// PR 6b straddler dissolve (the run face of the §12a dissolve law): the
+/// surviving head `[key, key + keep)` of a run whose tail the sweep
+/// removes — same start offset/stamp arithmetic, shorter span; `keep == 1`
+/// collapses to the point form (a 1-run is not an encodable run). Only
+/// meaningful for run-class entries with `keep < run_len` — the callers'
+/// covering-floor probe guarantees both.
+fn shortened_run_entry(entry: &block_map::MapEntry, keep: u32) -> block_map::MapEntry {
+    use block_map::MapEntry;
+    match entry {
+        MapEntry::Run {
+            vol_tag,
+            start_offset,
+            ..
+        } => {
+            if keep == 1 {
+                MapEntry::Point {
+                    vol_tag: *vol_tag,
+                    offset: *start_offset,
+                }
+            } else {
+                MapEntry::Run {
+                    vol_tag: *vol_tag,
+                    start_offset: *start_offset,
+                    len: keep,
+                }
+            }
+        }
+        MapEntry::RunStamped {
+            vol_tag,
+            start_offset,
+            start_incarnation,
+            ..
+        } => {
+            if keep == 1 {
+                MapEntry::PointStamped {
+                    vol_tag: *vol_tag,
+                    offset: *start_offset,
+                    incarnation: *start_incarnation,
+                }
+            } else {
+                MapEntry::RunStamped {
+                    vol_tag: *vol_tag,
+                    start_offset: *start_offset,
+                    len: keep,
+                    start_incarnation: *start_incarnation,
+                }
+            }
+        }
+        // Point-class records never cover past their own key; the floor
+        // probe cannot nominate one.
+        other => other.clone(),
+    }
 }
 
 /// PR 5b (design §11 law b) — the CLAIMS-SCOPED mode input for

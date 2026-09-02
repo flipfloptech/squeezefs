@@ -3591,6 +3591,10 @@ impl RoutedMetaBackend {
         entries: &[(u32, String)],
         chunk: usize,
         claims: Option<&crate::meta_backend::kv::backend::MapTrainClaims>,
+        cursor_floor: u32,
+        ref_for: &(dyn Fn(&str, u32) -> Option<crate::meta_backend::kv::block_refs::BlockRef>
+              + Send
+              + Sync),
     ) -> Result<Option<crate::meta_backend::kv::backend::MapMigrateOutcome>> {
         let _deleg_gate = crate::meta_ship::deleg_mutation_gate(self, &[ino]).await;
         let _gate = self.slot_gate_enter(&[ino]).await;
@@ -3623,7 +3627,17 @@ impl RoutedMetaBackend {
             |e: &kv::block_map::MapEntry, delta: u32| self.decode_map_entry_at(e, delta);
         let out = self.volumes[v_idx]
             .migrate_block_map_train(
-                local_ino, layout, size, block_refs, &records, chunk, claims, ino, &entry_key,
+                local_ino,
+                layout,
+                size,
+                block_refs,
+                &records,
+                chunk,
+                claims,
+                ino,
+                &entry_key,
+                cursor_floor,
+                ref_for,
             )
             .await;
         if out.is_err() {
@@ -3648,6 +3662,60 @@ impl RoutedMetaBackend {
         let (v_idx, local_ino) = self.route_ino(ino);
         self.check_volume_enabled(v_idx)?;
         let out = self.volumes[v_idx].sweep_block_map(local_ino, chunk).await;
+        if out.is_err() {
+            self.mirror_volume_failure(v_idx);
+        }
+        out
+    }
+
+    /// PR 6b (design §3/A2): the size-flip-first truncate/unlink handoff
+    /// — O(1), one tx: the new size + the durable per-ino sweep cursor in
+    /// the head sentinel — routed to `ino`'s home volume with the
+    /// `set_layout_and_size` gates (the publish class).
+    pub async fn kvmap_truncate_handoff(
+        &self,
+        ino: Ino,
+        new_size: u64,
+        k: u32,
+        block_refs: &[crate::meta_backend::kv::block_refs::BlockRefOp],
+    ) -> Result<String> {
+        let _deleg_gate = crate::meta_ship::deleg_mutation_gate(self, &[ino]).await;
+        let _gate = self.slot_gate_enter(&[ino]).await;
+        let (v_idx, local_ino) = self.route_ino(ino);
+        self.check_volume_enabled(v_idx)?;
+        let out = self.volumes[v_idx]
+            .kvmap_truncate_handoff(local_ino, new_size, k, block_refs)
+            .await;
+        if out.is_err() {
+            self.mirror_volume_failure(v_idx);
+        }
+        out
+    }
+
+    /// PR 6b: one A2 background-sweep chunk, routed to `ino`'s home
+    /// volume — the per-chunk one-tx law (map Deletes + ref releases +
+    /// cursor advance) with the freed keys returned for the caller's
+    /// post-commit reclaim enqueue (RES-1). `entry_key`/`ref_for`
+    /// resolution rides the same shared expansion surface the migrate
+    /// train uses ([`Self::decode_map_entry_at`]).
+    pub async fn kvmap_sweep_chunk(
+        &self,
+        ino: Ino,
+        chunk: usize,
+        floor_of: &(dyn Fn(u64) -> u32 + Send + Sync),
+        ref_for: &(dyn Fn(&str, u32) -> Option<crate::meta_backend::kv::block_refs::BlockRef>
+              + Send
+              + Sync),
+    ) -> Result<crate::meta_backend::kv::backend::SweepChunkOutcome> {
+        let _deleg_gate = crate::meta_ship::deleg_mutation_gate(self, &[ino]).await;
+        let _gate = self.slot_gate_enter(&[ino]).await;
+        let (v_idx, local_ino) = self.route_ino(ino);
+        self.check_volume_enabled(v_idx)?;
+        let entry_key =
+            |e: &kv::block_map::MapEntry, delta: u32| self.decode_map_entry_at(e, delta);
+        let out = self.volumes[v_idx]
+            .kvmap_sweep_chunk(local_ino, chunk, floor_of, &entry_key, ref_for)
+            .await;
         if out.is_err() {
             self.mirror_volume_failure(v_idx);
         }

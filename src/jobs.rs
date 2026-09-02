@@ -208,6 +208,17 @@ pub enum JobType {
     /// PR VL7 (§5.7 D3): kick every parked/spilled extent block through
     /// the EXISTING W2 fold machinery (the mount-wired [`FoldHook`]).
     DefragFold,
+    /// PR 6b (design-kvmap-block-map-tree §3/A2): the background
+    /// truncate/unlink sweep of one kvmap ino — chunked record-true map
+    /// Deletes + reference releases + reclaim enqueues, resumable from
+    /// the durable `;sweep:K` head cursor (KD-6: the cursor IS the plan
+    /// — submitted at the size-flip handoff AND regenerated at mount by
+    /// [`adopt_kvmap_sweeps`]'s cursor-head scan). The terminal chunk
+    /// clears the cursor; a corpse owner (`nlink == 0`) is then
+    /// destroyed (record + xattrs, one tx).
+    KvmapSweep {
+        ino: u64,
+    },
 }
 
 impl JobType {
@@ -222,7 +233,8 @@ impl JobType {
             | JobType::Fsck { .. }
             | JobType::DefragData { .. }
             | JobType::DefragMeta
-            | JobType::DefragFold => 0,
+            | JobType::DefragFold
+            | JobType::KvmapSweep { .. } => 0,
         }
     }
 
@@ -247,7 +259,10 @@ impl JobType {
             | JobType::MigrateMetaSlot { .. }
             | JobType::Fsck { .. }
             | JobType::DefragMeta
-            | JobType::DefragFold => None,
+            | JobType::DefragFold
+            // The sweep frees blocks but never PLACES any; per-ino
+            // serialization is the chunk's own held 4a.
+            | JobType::KvmapSweep { .. } => None,
         }
     }
 
@@ -594,6 +609,135 @@ async fn fire_pre_publish_hook(ino: u64, block_idx: u32) {
     if let Some(h) = hook {
         squeezefs_ipc::sqz_blocking::run_blocking(move || h(ino, block_idx)).await;
     }
+}
+
+// ---------------------------------------------------------------------------
+// PR 6b: the kvmap A2 sweep's submit surface (design §3/A2)
+// ---------------------------------------------------------------------------
+
+/// The routing layer's handoff→fabric seam (the `EVAC_PRE_PUBLISH_HOOK`
+/// registration shape): `truncate_layout`/`delete_file` cannot hold the
+/// fabric (the router predates it at mount), so the mount wires this to
+/// [`JobFabric::submit`]. Unwired (offline verbs, unit fixtures) the
+/// durable cursor alone carries the plan — the next mount's
+/// [`adopt_kvmap_sweeps`] regenerates the job (KD-6).
+#[allow(clippy::type_complexity)]
+static KVMAP_SWEEP_SUBMIT_HOOK: parking_lot::RwLock<Option<Arc<dyn Fn(u64) + Send + Sync>>> =
+    parking_lot::RwLock::new(None);
+
+/// Submit a [`JobType::KvmapSweep`] for `ino` through the wired fabric
+/// (a no-op when unwired — the durable cursor is the crash-safe plan).
+pub fn submit_kvmap_sweep(ino: u64) {
+    let hook = KVMAP_SWEEP_SUBMIT_HOOK.read().clone();
+    if let Some(h) = hook {
+        h(ino);
+    }
+}
+
+/// Wire [`submit_kvmap_sweep`] to `fabric` (the mount, and the test
+/// venues). Deduped on live non-terminal jobs for the same ino —
+/// duplicate sweeps are SAFE (every chunk re-reads the durable cursor
+/// under the ino's held 4a and deletes record-true) but pointless.
+pub fn wire_kvmap_sweep_submit(fabric: &Arc<JobFabric>) {
+    let weak = Arc::downgrade(fabric);
+    *KVMAP_SWEEP_SUBMIT_HOOK.write() = Some(Arc::new(move |ino: u64| {
+        let Some(fabric) = weak.upgrade() else {
+            return;
+        };
+        let dup = fabric
+            .jobs_matching(|t| matches!(t, JobType::KvmapSweep { ino: i } if *i == ino))
+            .into_iter()
+            .any(|(_, st)| !st.is_terminal());
+        if dup {
+            return;
+        }
+        crate::meta_exec::spawn_meta("kvmap_sweep_submit", async move {
+            if let Err(e) = fabric
+                .submit(JobSpec {
+                    job_type: JobType::KvmapSweep { ino },
+                    throttle_pct: 0,
+                })
+                .await
+            {
+                log::error!(
+                    "kvmap sweep submit for ino {ino} failed: {e} — the durable cursor \
+                     stays the plan; the next mount's adoption scan regenerates the job"
+                );
+            }
+        });
+    }));
+}
+
+/// Unwire the submit hook (test hygiene; the mount never unwires).
+pub fn clear_kvmap_sweep_submit() {
+    *KVMAP_SWEEP_SUBMIT_HOOK.write() = None;
+}
+
+/// PR 6b (KD-6 — crash-resume by plan regeneration): the mount-time
+/// **cursor-head scan**. The durable `;sweep:K` cursor IS the plan, so a
+/// crash anywhere between the handoff commit and the job's terminal
+/// chunk resumes here: one tree-7 owner SKIP-scan per volume (O(distinct
+/// kvmap owners), never O(records)), each owner's durable head read for
+/// a live cursor, and a [`JobType::KvmapSweep`] submitted for every
+/// cursor no live/durable job already covers (the fabric's own record
+/// adoption re-queues jobs that were durably submitted — this scan
+/// closes the window where the cursor committed and the submit did not).
+/// Corpses whose sweep already emptied the tree carry no cursor scan hit
+/// and stay the mount corpse sweep's (their `delete_file` re-plants).
+pub async fn adopt_kvmap_sweeps(
+    fabric: &Arc<JobFabric>,
+    router: &crate::routing::DataRouter,
+) -> crate::error::Result<u64> {
+    let meta = fabric.meta_handle();
+    let mut resumed = 0u64;
+    for (v_idx, kv) in meta.volumes.iter().enumerate() {
+        if !kv.block_map_tree_engaged() {
+            continue;
+        }
+        let owners = kv.block_map_owner_scan().await.map_err(|e| {
+            crate::error::SqueezefsError::InvalidOperation(format!(
+                "kvmap sweep adoption: tree-7 owner scan failed on vol {v_idx}: {e}"
+            ))
+        })?;
+        for local_ino in owners {
+            let Some(ino) = meta.try_make_global_ino(local_ino, v_idx) else {
+                continue; // guest/control records — never sweep candidates
+            };
+            let Ok(Some(bytes)) = kv.getxattr(local_ino, "layout").await else {
+                continue;
+            };
+            let cursor_live = crate::layout_wire::decode_layout_any(&bytes)
+                .ok()
+                .and_then(|l| l.block_map_id)
+                .and_then(|id| crate::meta_backend::kv::block_map::parse_kvmap_head(&id).ok())
+                .is_some_and(|h| h.sweep_cursor.is_some());
+            if !cursor_live {
+                continue;
+            }
+            let covered = fabric
+                .jobs_matching(|t| matches!(t, JobType::KvmapSweep { ino: i } if *i == ino))
+                .into_iter()
+                .any(|(_, st)| !st.is_terminal());
+            if covered {
+                continue;
+            }
+            // A corpse handed off by a PRIOR era re-arms its
+            // destroy-withholding mark too (the reclaim/mount-sweep
+            // callers consult it).
+            if matches!(meta.getattr(ino).await, Ok(inode) if inode.nlink == 0) {
+                router.kvmap_sweep_corpse_mark(ino);
+            }
+            fabric
+                .submit(JobSpec {
+                    job_type: JobType::KvmapSweep { ino },
+                    throttle_pct: 0,
+                })
+                .await?;
+            resumed += 1;
+            METRICS.map_sweep_resumed.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    Ok(resumed)
 }
 
 // ---------------------------------------------------------------------------
@@ -1803,6 +1947,7 @@ impl JobFabric {
             }
             JobType::DefragMeta => self.run_defrag_meta(job_id, ctl).await,
             JobType::DefragFold => self.run_defrag_fold(job_id, ctl).await,
+            JobType::KvmapSweep { ino } => self.run_kvmap_sweep(job_id, ctl, ino).await,
             JobType::MigrateMetaSlot {
                 slot,
                 target_volume,
@@ -2225,6 +2370,98 @@ impl JobFabric {
                 crate::defrag::refresh_d1_d3_gauges(&router)
             })
             .await;
+        }
+        let _ = self.checkpoint_as(job_id, ctl, JobState::Completed).await;
+        METRICS.job_completed.fetch_add(1, Ordering::Relaxed);
+        ctl.set_state(JobState::Completed);
+    }
+
+    /// PR 6b (design §3/A2): the kvmap background sweep — one
+    /// [`crate::routing::DataRouter::kvmap_sweep_chunk`] per task
+    /// (throttled, KD-3), crash-resume by the durable cursor (KD-6: a
+    /// re-run re-reads it under the ino's held 4a and continues
+    /// record-true — no double deletes, no double frees). The TERMINAL
+    /// chunk cleared the cursor; a corpse owner (`nlink == 0`,
+    /// unreachable — the `delete_file` handoff's shape) is then
+    /// destroyed here: record + xattrs in one tx (the C9
+    /// quarantine-then-destroy shape's destroy half — the corpse is a
+    /// planned teardown, not a repair, so nothing quarantines), and the
+    /// reclaim callers' destroy-withholding mark clears with it.
+    async fn run_kvmap_sweep(&self, job_id: &str, ctl: &JobCtl, ino: u64) {
+        let Some(ctx) = self.mover.as_ref() else {
+            self.fail_job(
+                job_id,
+                ctl,
+                "kvmap sweep needs a mover context (the router resolves records to \
+                 block keys and owns the reclaim enqueue) — not wired on this fabric",
+            )
+            .await;
+            return;
+        };
+        let chunk = crate::routing::map_migrate_chunk();
+        let mut last_checkpoint = std::time::Instant::now();
+        loop {
+            if ctl.cancelled.load(Ordering::SeqCst) {
+                let _ = self.checkpoint_as(job_id, ctl, JobState::Cancelled).await;
+                ctl.set_state(JobState::Cancelled);
+                return;
+            }
+            if ctl.paused.load(Ordering::SeqCst) {
+                self.park_paused(job_id, ctl).await;
+                return;
+            }
+            let start = std::time::Instant::now();
+            let terminal = match ctx.router.kvmap_sweep_chunk(ino, chunk).await {
+                // No cursor: nothing owed — a publish's extend barrier
+                // absorbed the span, a duplicate job won, or the plan
+                // completed under a prior era.
+                Ok(crate::routing::KvmapSweepProgress::NoCursor) => true,
+                Ok(crate::routing::KvmapSweepProgress::Progress { .. }) => {
+                    ctl.done.fetch_add(1, Ordering::Relaxed);
+                    METRICS.job_tasks_done.fetch_add(1, Ordering::Relaxed);
+                    false
+                }
+                Ok(crate::routing::KvmapSweepProgress::Terminal { .. }) => {
+                    ctl.done.fetch_add(1, Ordering::Relaxed);
+                    METRICS.job_tasks_done.fetch_add(1, Ordering::Relaxed);
+                    true
+                }
+                Err(e) => {
+                    // Loud + resumable: the durable cursor survives, so a
+                    // resume (or the next mount's adoption scan) re-plans
+                    // from exactly where this chunk refused.
+                    self.fail_job(job_id, ctl, &format!("kvmap sweep chunk failed: {e}"))
+                        .await;
+                    return;
+                }
+            };
+            if terminal {
+                break;
+            }
+            if last_checkpoint.elapsed() >= Duration::from_secs(CHECKPOINT_SECS) {
+                let _ = self.checkpoint(job_id, ctl).await;
+                last_checkpoint = std::time::Instant::now();
+            }
+            Self::duty_park(ctl, start.elapsed()).await;
+        }
+        // The corpse's terminal destroy (the delete_file handoff kept the
+        // record + head alive as the durable plan carrier).
+        let corpse = matches!(self.meta.getattr(ino).await, Ok(inode) if inode.nlink == 0);
+        if corpse {
+            if let Err(e) = crate::meta_ship::publish::destroy_inodes(&self.meta, &[ino]).await {
+                self.fail_job(
+                    job_id,
+                    ctl,
+                    &format!(
+                        "kvmap sweep: records drained but the corpse destroy failed: {e} \
+                         — resumable (the mount corpse sweep also owns a cursor-less \
+                         empty corpse)"
+                    ),
+                )
+                .await;
+                return;
+            }
+            ctx.router.kvmap_sweep_corpse_clear(ino);
         }
         let _ = self.checkpoint_as(job_id, ctl, JobState::Completed).await;
         METRICS.job_completed.fetch_add(1, Ordering::Relaxed);

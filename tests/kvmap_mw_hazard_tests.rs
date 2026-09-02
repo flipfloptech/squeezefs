@@ -636,6 +636,10 @@ async fn a_sticky_head_local_train_under_live_range_grants_composes_claims_scope
             },
         )],
         512,
+        // PR 6b: no live sweep cursor in these shapes — the barrier
+        // never engages (a claims train refuses instead).
+        0,
+        &|_key, _idx| None,
     )
     .await
     .expect("a sticky-head local train under live grants composes claims-scoped (item 4)");
@@ -660,6 +664,10 @@ async fn a_sticky_head_local_train_under_live_range_grants_composes_claims_scope
         vec![entries[0].clone()],
         Vec::new(),
         512,
+        // PR 6b: no live sweep cursor in these shapes — the barrier
+        // never engages (a claims train refuses instead).
+        0,
+        &|_key, _idx| None,
     )
     .await
     .expect("an empty-claims subset train is legal");
@@ -802,6 +810,10 @@ async fn shipped_crossing(client_be: &Arc<RoutedMetaBackend>, ino: u64) -> Vec<(
         entries.clone(),
         Vec::new(),
         512,
+        // PR 6b: no live sweep cursor in these shapes — the barrier
+        // never engages (a claims train refuses instead).
+        0,
+        &|_key, _idx| None,
     )
     .await
     .expect("the shipped crossing lands");

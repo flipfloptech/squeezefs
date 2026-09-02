@@ -679,6 +679,9 @@ async fn claims_never_partial_adopt_a_run_silently() {
             Some(&claims),
             ino,
             &entry_key_for_tests,
+            // PR 6b: claims trains never barrier (no live cursor here).
+            0,
+            &|_key, _idx| None,
         )
         .await
         .expect("claims adopt")
@@ -720,6 +723,9 @@ async fn claims_never_partial_adopt_a_run_silently() {
             Some(&claims),
             ino,
             &entry_key_for_tests,
+            // PR 6b: claims trains never barrier (no live cursor here).
+            0,
+            &|_key, _idx| None,
         )
         .await
         .expect("claims release")
@@ -767,6 +773,9 @@ async fn claims_never_partial_adopt_a_run_silently() {
             }),
             ino,
             &entry_key_for_tests,
+            // PR 6b: claims trains never barrier (no live cursor here).
+            0,
+            &|_key, _idx| None,
         )
         .await;
     assert!(

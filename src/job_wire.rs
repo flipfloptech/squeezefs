@@ -3378,7 +3378,8 @@ impl JobWireWorker {
                     | JobType::Fsck { .. }
                     | JobType::DefragData { .. }
                     | JobType::DefragMeta
-                    | JobType::DefragFold => {
+                    | JobType::DefragFold
+                    | JobType::KvmapSweep { .. } => {
                         log::error!(
                             "job worker: mover shard {}:{} reached the wire — the \
                              dispatcher must not assign mover job types (v1.1); aborting",

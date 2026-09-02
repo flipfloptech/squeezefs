@@ -5767,6 +5767,19 @@ pub struct Metrics {
     /// tree-7 records — a crashed prior train's residue reconciled
     /// (silent-wrong-data class had the sweep not run).
     pub map_migrate_resumed: Align64<AtomicU64>,
+    /// kvmap PR 6b (design §3/A2): `KvmapSweep` jobs submitted at the
+    /// size-flip-first truncate/unlink handoff (the over-threshold arm).
+    pub map_sweep_jobs: Align64<AtomicU64>,
+    /// kvmap PR 6b: background-sweep chunk transactions committed (map
+    /// Deletes + ref releases + cursor advance, one tx each).
+    pub map_sweep_chunks: Align64<AtomicU64>,
+    /// kvmap PR 6b: tree-7 records the A2 sweep removed — the job's
+    /// chunks plus the publish train's extend-barrier absorptions.
+    pub map_sweep_records: Align64<AtomicU64>,
+    /// kvmap PR 6b: sweep jobs REGENERATED from a durable cursor-head at
+    /// mount adoption (KD-6: the cursor IS the plan — a crash between
+    /// the handoff commit and the job's terminal chunk re-plans here).
+    pub map_sweep_resumed: Align64<AtomicU64>,
     /// kvmap PR 6a (design §12 option b): Σ estimated RAM map bytes of
     /// write-active kvmap inos — the honest write-map GAUGE beside the
     /// derived `mem_budget/16` cap that refuses over-budget giant
@@ -10077,6 +10090,13 @@ impl SqueezefsFilesystem {
                 "map_migrate_inos": METRICS.map_migrate_inos.load(Ordering::Relaxed),
                 "map_migrate_records": METRICS.map_migrate_records.load(Ordering::Relaxed),
                 "map_migrate_resumed": METRICS.map_migrate_resumed.load(Ordering::Relaxed),
+                // kvmap PR 6b (design §3/A2): the background truncate/unlink
+                // sweep — jobs handed off, chunk txs, records removed, and
+                // KD-6 mount-adoption regenerations.
+                "map_sweep_jobs": METRICS.map_sweep_jobs.load(Ordering::Relaxed),
+                "map_sweep_chunks": METRICS.map_sweep_chunks.load(Ordering::Relaxed),
+                "map_sweep_records": METRICS.map_sweep_records.load(Ordering::Relaxed),
+                "map_sweep_resumed": METRICS.map_sweep_resumed.load(Ordering::Relaxed),
                 // kvmap PR 6a (design §12 option b): the honest write-map
                 // gauge (revalidated live on this read) + its derived cap.
                 "kvmap_write_map_bytes": self.router.kvmap_write_map_gauge(),
@@ -20370,7 +20390,18 @@ impl SqueezefsFilesystem {
             }
         }
 
-        self.destroy_batch_bisect(backend, &admitted).await;
+        // PR 6b (design §3/A2): an over-threshold kvmap corpse's
+        // `delete_file` took the sweep handoff — its record + cursor head
+        // ARE the durable plan, so the destroy is WITHHELD here (the
+        // sweep job's terminal chunk owns it); the per-ino teardown tail
+        // (lease release, cache invalidation) still runs.
+        let (deferred, destroyable): (Vec<u64>, Vec<u64>) = admitted
+            .iter()
+            .partition(|&&i| self.router.kvmap_sweep_corpse_pending(i));
+        for ino in deferred {
+            self.reclaim_teardown(ino).await;
+        }
+        self.destroy_batch_bisect(backend, &destroyable).await;
     }
 
     /// Retire EVERY RAM-parked overlay owned by the reclaim batch's inos —

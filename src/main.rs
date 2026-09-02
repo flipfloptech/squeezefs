@@ -6448,6 +6448,25 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                     .job_fabric
                     .store(std::sync::Arc::new(Some(fabric.clone())));
 
+                // kvmap PR 6b (design §3/A2): wire the truncate/unlink
+                // handoff's submit seam, then regenerate any sweep a
+                // prior era left mid-plan — the durable `;sweep:K` cursor
+                // IS the plan (KD-6), so a crash between the handoff
+                // commit and the job's terminal chunk resumes here.
+                squeezefs::jobs::wire_kvmap_sweep_submit(&fabric);
+                match squeezefs::jobs::adopt_kvmap_sweeps(&fabric, &fs_engine.router).await {
+                    Ok(0) => {}
+                    Ok(n) => log::info!(
+                        "kvmap sweep adoption: {n} durable cursor-head plan(s) \
+                         regenerated as KvmapSweep jobs (KD-6)"
+                    ),
+                    Err(e) => log::warn!(
+                        "kvmap sweep adoption scan failed: {e} — durable cursors stay \
+                         the plan; the next mount retries (fsck C11's cursor exemption \
+                         keeps the state report-clean meanwhile)"
+                    ),
+                }
+
                 // PR VL2b: the §5.1.6 job-shard execution wire — the
                 // coordinator's TCP listener, the WERO fence over the data
                 // namespaces, and the endpoint published through the

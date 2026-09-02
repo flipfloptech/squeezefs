@@ -5705,6 +5705,9 @@ async fn a_skewed_kvmap_ship_frees_the_true_displaced_set_on_the_authority() {
             block_index: 0,
         })],
         512,
+        // PR 6b: no live sweep cursor — the barrier never engages.
+        0,
+        &|_key, _idx| None,
     )
     .await
     .expect("the authority's local crossing lands");

@@ -25,6 +25,10 @@
 //!    pure wait split out of `pass_leaf_locks`) and `dlm_guard_hold` (the
 //!    4a exclusive I-guard's `DlmGuard` Drop). Waits/holds move on
 //!    contended fixtures, waits stay zero uncontended.
+//! E. CPU attribution: `daemon_cpu_ns` (RUSAGE_SELF utime+stime) and
+//!    `daemon_cpu_ns_by_class` (per-thread schedstat folded by comm
+//!    prefix; retired threads keep their last sample so classes stay
+//!    monotone), sampled at stats-read time only.
 
 use fuse3::raw::prelude::Filesystem;
 use fuse3::raw::Request;
@@ -977,4 +981,133 @@ async fn conveyor_pass_splits_the_leaf_lock_pure_wait() {
     for p in LOCK_PHASES {
         let _ = phase_words(fam, p);
     }
+}
+
+// ---------------------------------------------------------------------------
+// E — CPU attribution
+// ---------------------------------------------------------------------------
+
+#[test]
+fn thread_classes_fold_by_comm_prefix_with_the_mount_suffix_tolerated() {
+    use squeezefs::daemon_cpu::{classify, CLASSES, OTHER};
+    for (comm, want) in [
+        ("fuse3-tpc12", "fuse3-tpc"),
+        ("fuse3-tpc511m7", "fuse3-tpc"),
+        ("sqz-ipc-svc0", "sqz-ipc-svc"),
+        ("sqz-ipc-svc63ma", "sqz-ipc-svc"),
+        ("sqz-ipc-dd7", "sqz-ipc-dd"),
+        ("sqz-meta1m3", "sqz-meta"),
+        ("sqz-blk12", "sqz-blk"),
+        ("sqz-nvme3m1", "sqz-nvme"),
+        ("sqz-zcrx-rd2", "sqz-zcrx"),
+        ("sqz-ipc-reap", OTHER),
+        ("sqz-timer", OTHER),
+        ("squeezefs", OTHER),
+        ("", OTHER),
+    ] {
+        assert_eq!(classify(comm), want, "comm {comm:?}");
+    }
+    // Every class name is exported even when no thread of it is alive.
+    let sample = squeezefs::daemon_cpu::sample();
+    for c in CLASSES
+        .iter()
+        .map(|c| c.class)
+        .chain(std::iter::once(OTHER))
+    {
+        assert!(
+            sample.by_class.iter().any(|(k, _)| *k == c),
+            "class {c} exported"
+        );
+    }
+}
+
+/// Monotone non-decreasing across samples (total AND every class), class
+/// sum ≤ total, and a known-CPU-burning thread moves exactly its class;
+/// a retired thread keeps its last sample (the class never falls).
+#[test]
+fn cpu_sample_is_monotone_class_sum_bounded_and_attributes_a_burning_thread() {
+    use squeezefs::daemon_cpu::sample;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    let s0 = sample();
+    let get = |s: &squeezefs::daemon_cpu::CpuSample, c: &str| {
+        s.by_class
+            .iter()
+            .find(|(k, _)| *k == c)
+            .map(|(_, v)| *v)
+            .expect("class present")
+    };
+    let class_sum =
+        |s: &squeezefs::daemon_cpu::CpuSample| -> u64 { s.by_class.iter().map(|(_, v)| *v).sum() };
+    assert!(class_sum(&s0) <= s0.total_ns, "Σ classes ≤ total");
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let burner = {
+        let stop = Arc::clone(&stop);
+        std::thread::Builder::new()
+            .name("fuse3-tpc99".into())
+            .spawn(move || {
+                let mut x = 0u64;
+                while !stop.load(Ordering::Relaxed) {
+                    x = x.wrapping_mul(6364136223846793005).wrapping_add(1);
+                    std::hint::black_box(x);
+                }
+            })
+            .unwrap()
+    };
+    std::thread::sleep(Duration::from_millis(60));
+    let s1 = sample(); // burner alive
+    stop.store(true, Ordering::Relaxed);
+    burner.join().unwrap();
+    let s2 = sample(); // burner retired
+
+    assert!(
+        s1.total_ns >= s0.total_ns && s2.total_ns >= s1.total_ns,
+        "total monotone"
+    );
+    for (k, v0) in &s0.by_class {
+        assert!(get(&s1, k) >= *v0, "class {k} monotone (s0→s1)");
+        assert!(
+            get(&s2, k) >= get(&s1, k),
+            "class {k} monotone (s1→s2, retired kept)"
+        );
+    }
+    assert!(class_sum(&s1) <= s1.total_ns, "Σ classes ≤ total (s1)");
+    assert!(class_sum(&s2) <= s2.total_ns, "Σ classes ≤ total (s2)");
+    let burned = get(&s1, "fuse3-tpc") - get(&s0, "fuse3-tpc");
+    assert!(
+        burned >= 20_000_000,
+        "a 60 ms burner named fuse3-tpc99 moves its class by ≥ 20 ms (saw {burned} ns)"
+    );
+    assert!(
+        get(&s2, "fuse3-tpc") >= get(&s1, "fuse3-tpc"),
+        "the retired burner's sample is kept"
+    );
+
+    let json = squeezefs::daemon_cpu::by_class_json();
+    assert!(
+        json["fuse3-tpc"].as_u64().is_some(),
+        "JSON is {{class: ns}}"
+    );
+}
+
+/// The stats inode carries both words.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn stats_inode_carries_daemon_cpu_words() {
+    let _g = serial().await;
+    let h = make([0x41; 16], "audit_e_stats").await;
+    let reply =
+        h.fs.read(h.req, squeezefs::fuse_client::STATS_INODE, 0, 0, 1 << 22, 0)
+            .await
+            .expect("read stats inode");
+    let stats: serde_json::Value = serde_json::from_slice(&reply.data).expect("stats JSON");
+    let m = &stats["metrics"];
+    let total = m["daemon_cpu_ns"].as_u64().expect("daemon_cpu_ns is u64");
+    let by = m["daemon_cpu_ns_by_class"]
+        .as_object()
+        .expect("daemon_cpu_ns_by_class is an object");
+    let sum: u64 = by.values().map(|v| v.as_u64().expect("ns")).sum();
+    assert!(sum <= total, "Σ classes ({sum}) ≤ total ({total})");
+    assert!(by.contains_key("other"), "the residual class is exported");
 }

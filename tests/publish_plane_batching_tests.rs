@@ -396,11 +396,13 @@ async fn measurement_rows_24_concurrent_publishes_from_one_co_writer() {
         nodes.warm().await;
         let inos = mint(&nodes.owner_be, INOS, "stream").await;
 
+        let dials_before = publish::stats().ship_session_dials;
         let before = counters(&nodes.auth);
         let (outcomes, wall) = nodes
             .publish_concurrently(&inos, |i| 4096 * (i as u64 + 1))
             .await;
         let after = counters(&nodes.auth);
+        let dials = publish::stats().ship_session_dials - dials_before;
 
         for (i, out) in outcomes.iter().enumerate() {
             out.as_ref()
@@ -418,15 +420,29 @@ async fn measurement_rows_24_concurrent_publishes_from_one_co_writer() {
         let passes = after.passes - before.passes;
         let entries = after.entries - before.entries;
         let n = INOS as f64;
+        // A session dialed INSIDE the row pays the cluster wire's 100 ms
+        // accept-poll tick (`ACCEPT_POLL_TICK`) — label it so the wall is
+        // read as a cold-pool roll, not a steady-state one.
         println!(
-            "D-1b in-process row [{label}] (debug build, file-backed KV sandbox, loopback \
+            "D-1b in-process row [{label}] ({} build, file-backed KV sandbox, loopback \
              wire): {INOS} concurrent publishes from one co-writer -> frames {frames} \
              ({:.2}/publish), owner conveyor passes {passes} ({:.2}/publish), journal \
-             entries {entries}, wall {:.2} ms ({:.1} us/publish)",
+             entries {entries}, wall {:.2} ms ({:.1} us/publish), in-row session dials \
+             {dials}{}",
+            if cfg!(debug_assertions) {
+                "debug"
+            } else {
+                "release"
+            },
             frames as f64 / n,
             passes as f64 / n,
             wall.as_secs_f64() * 1e3,
-            wall.as_secs_f64() * 1e6 / n
+            wall.as_secs_f64() * 1e6 / n,
+            if dials > 0 {
+                " (COLD POOL: each dial pays the wire's 100 ms accept tick)"
+            } else {
+                ""
+            }
         );
 
         assert_eq!(

@@ -25,8 +25,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
 
 pub use fuse3::op_trace::{
-    current_op, divisor, drain, dropped, is_armed, samples_total, scope, scope_with_entry, stamp,
-    stamp_current, stamp_mono, stamp_now, traced, ArmConfig, OpScope, Sample, Stage, TracedBatch,
+    current_op, divisor, drain, dropped, is_armed, samples_total, scope, stamp, stamp_current,
+    stamp_mono, stamp_now, traced, ArmConfig, Sample, Stage, TracedBatch,
 };
 
 /// The IL namespace bit: il ring op ids carry it, kernel `unique`s never
@@ -99,7 +99,9 @@ impl Geometry {
 ///   ring must never compete with the tiers it measures; floored at
 ///   `rings × RING_MIN_CAPACITY × SAMPLE_BYTES` (below that depth a ring
 ///   records drops, not chains).
-/// - `ring_capacity = next_pow2(pool_bytes / rings / SAMPLE_BYTES)`.
+/// - `ring_capacity = prev_pow2(pool_bytes / rings / SAMPLE_BYTES)` — rounded
+///   DOWN so the pool never exceeds its slice (floored at the minimum
+///   depth).
 /// - `divisor = ceil(cpus × OPS_PER_CORE_PER_S × STAGES_PER_OP ×
 ///   DRAIN_INTERVAL_S / (rings × ring_capacity))`: the smallest N such
 ///   that one drain interval of the machine's op ceiling, at the longest
@@ -110,8 +112,8 @@ pub fn derive_geometry(budget_bytes: u64, cpus: usize) -> Geometry {
     let rings = (cpus * 8).clamp(16, 4096);
     let floor = rings as u64 * RING_MIN_CAPACITY as u64 * SAMPLE_BYTES;
     let pool_bytes = (budget_bytes >> 10).max(floor);
-    let per_ring = pool_bytes / rings as u64 / SAMPLE_BYTES;
-    let ring_capacity = (per_ring.max(RING_MIN_CAPACITY as u64) as usize).next_power_of_two();
+    let per_ring = (pool_bytes / rings as u64 / SAMPLE_BYTES).max(RING_MIN_CAPACITY as u64);
+    let ring_capacity = 1usize << per_ring.ilog2();
     let capacity = rings as u64 * ring_capacity as u64;
     let demand = cpus as u64 * OPS_PER_CORE_PER_S * STAGES_PER_OP * DRAIN_INTERVAL_S;
     let divisor = demand.div_ceil(capacity).clamp(1, u32::MAX as u64) as u32;

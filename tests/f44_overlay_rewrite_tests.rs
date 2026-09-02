@@ -17,8 +17,23 @@
 //! a rewrite rides — accumulation write-through, W1 patch, or the device
 //! overlay's ACK-early store — a COLD re-read after quiesce returns the
 //! last acknowledged bytes, byte-exact, for every pass. The A/B pair
-//! pins the attribution: the overlay-OFF control passes on dev; the
-//! overlay-ON leg is RED on dev (the finding).
+//! pins the attribution: the overlay-OFF control is the coverage suites'
+//! historical posture; the overlay-ON leg is the field composition, with
+//! its ENGAGEMENT asserted (stores + overwrite installs) so a green can
+//! never be a silent passthrough.
+//!
+//! ADJUDICATED (2026-09-02): the venue's original deterministic EIO at
+//! block 0 (both legs) was a FIXTURE identity bug, not a product one —
+//! session 2 minted a fresh allocator volume identity (`{ns}_s2`), so
+//! every tree-7 record's durable `vol_tag` (KD-5: the volume id
+//! verbatim) resolved to NO mounted volume and the fetch rehydrate
+//! refused loud ("unresolvable kvmap record … refusing to serve a
+//! fabricated hole") — the DESIGNED refusal for a foreign/retired tag.
+//! A real remount keeps the durable `vol-{16 hex}` id, so the remount
+//! here reuses the namespace (the kvmap suites' DATA_VOL_ID pattern).
+//! The field finding's silent zeros are NOT reproduced by this venue
+//! (both legs green with engagement exact); the live tcp-devsub smoke
+//! remains the field composition's instrument.
 
 use fuse3::raw::prelude::Filesystem;
 use fuse3::raw::Request;
@@ -26,6 +41,7 @@ use squeezefs::block_allocator::BlockAllocator;
 use squeezefs::cache::TieredCache;
 use squeezefs::dlm::DlmClient;
 use squeezefs::fuse_client::SqueezefsFilesystem;
+use squeezefs::fuse_client::METRICS;
 use squeezefs::meta_backend::kv::backend::KvMetaBackend;
 use squeezefs::meta_backend::kv::builder::{format_v3, FormatV3Options};
 use squeezefs::meta_backend::RoutedMetaBackend;
@@ -228,6 +244,7 @@ async fn cold_full_read_matches(h: &H, ino: u64, want: &[u8], what: &str) {
 }
 
 async fn run_multi_pass(overlay_on: bool, ns: &str) {
+    let _ = env_logger::builder().is_test(true).try_init();
     // Backing under target/ — tmpfs refuses the O_DIRECT open the
     // zc_write_fd screen requires (the ack-early suite's rule); ONE
     // backing+meta pair spans both sessions (the remount law's venue).
@@ -245,6 +262,11 @@ async fn run_multi_pass(overlay_on: bool, ns: &str) {
 
     let h = make(&b, &m, ns, overlay_on, true).await;
     let ino = create(&h, "f44").await;
+    // Engagement snapshot (the charter's row-validity law): a green
+    // overlay-ON leg is meaningless if the overlay never engaged.
+    let ord = std::sync::atomic::Ordering::Relaxed;
+    let ov0 = METRICS.overlay_stores.load(ord) + METRICS.overlay_ack_early_stores.load(ord);
+    let ow0 = METRICS.overlay_overwrite_installs.load(ord);
     let len = BLOCKS * BS as usize;
     let mut want = pattern(len, 1);
     // Fresh pass in block-sized writes (one giant Bytes would be a
@@ -280,12 +302,43 @@ async fn run_multi_pass(overlay_on: bool, ns: &str) {
     rewrite_pass(&h, ino, &mut want, 3).await;
     cold_full_read_matches(&h, ino, &want, "rewrite pass 2 (same session)").await;
 
+    // The A/B pair's validity: the ON leg must have ENGAGED the overlay
+    // (stores + overwrite installs — the rewrite passes are the
+    // overwrite face, the field composition); the OFF control must not
+    // have touched it at all.
+    let ov1 = METRICS.overlay_stores.load(ord) + METRICS.overlay_ack_early_stores.load(ord);
+    let ow1 = METRICS.overlay_overwrite_installs.load(ord);
+    eprintln!(
+        "[f44 {ns}] overlay stores delta {} overwrite installs delta {}",
+        ov1 - ov0,
+        ow1 - ow0
+    );
+    if overlay_on {
+        assert!(
+            ov1 > ov0,
+            "overlay-ON leg never engaged the overlay store path — the A/B pair is void"
+        );
+        assert!(
+            ow1 > ow0,
+            "overlay-ON leg's rewrite passes never installed an OVERWRITE-shape record — \
+             the field composition (rewrite over a mapped block) is not being exercised"
+        );
+    } else {
+        assert_eq!(
+            ov1, ov0,
+            "overlay-OFF control leaked overlay stores — the attribution control is void"
+        );
+    }
+
     // SESSION 2 — the true remount (the field's umount/mount): a fresh
     // backend open + recovery walk over the same volumes; the cold read
-    // must return pass-2's acknowledged bytes byte-exact.
+    // must return pass-2's acknowledged bytes byte-exact. The allocator
+    // namespace IS the volume identity (KD-5: tree-7 vol_tags decode the
+    // durable volume id verbatim), so the remount reuses it — a renamed
+    // session-2 namespace would orphan every record's tag and turn the
+    // whole read plane into the loud unresolvable-record refusal.
     drop(h);
-    let ns2 = format!("{ns}_s2");
-    let h2 = make(&b, &m, &ns2, overlay_on, false).await;
+    let h2 = make(&b, &m, ns, overlay_on, false).await;
     cold_full_read_matches(&h2, ino, &want, "rewrite pass 2 (REMOUNT)").await;
 }
 

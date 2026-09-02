@@ -903,6 +903,9 @@ async fn a_claims_train_meeting_a_live_cursor_refuses_at_or_above_it() {
         base_gen: None,
         take: [idx].into_iter().collect(),
         release: std::collections::BTreeSet::new(),
+        // The cursor-refusal law under test is the SHIPPED trains'
+        // (§12b #5 / §14: local claims trains barrier instead).
+        served: true,
     };
     // (a) A take AT/ABOVE the cursor refuses retried-class.
     let above = rig

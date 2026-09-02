@@ -3319,14 +3319,21 @@ impl KvMetaBackend {
             }
         }
         // The bump law: a committed train on the MULTI-WRITER plane —
-        // a claims train (shipped/range-custody by definition), any train
-        // on a custody-armed authority, or a head whose gen was ever
-        // minted (monotone survives a disarm/remount) — bumps; a solo
-        // volume's heads stay byte-identical (dark by default).
+        // a SERVED claims train (shipped by definition), any train on a
+        // custody-armed authority, or a head whose gen was ever minted
+        // (monotone survives a disarm/remount) — bumps; a solo volume's
+        // heads stay byte-identical (dark by default). PR 6c-i (§14 S2
+        // pre-fix b): claims-PRESENCE alone no longer mints — a solo
+        // mount's LOCAL claims trains (the overlay saves) run per
+        // publish, and keying on presence would gen-stamp every solo
+        // partial-mode head.
         let committed_gen = match durable_gen {
             None => 0,
             Some(g) => {
-                if claims.is_some() || g > 0 || crate::data_grant::custody_owner().is_some() {
+                if claims.is_some_and(|c| c.served)
+                    || g > 0
+                    || crate::data_grant::custody_owner().is_some()
+                {
                     g + 1
                 } else {
                     0
@@ -3438,27 +3445,34 @@ impl KvMetaBackend {
                      rather than partial-adopting a span"
                 )));
             }
-            // The claims-scoped diff needs the current records at claimed
-            // indices; the paged scan also feeds `preexisting` (the A1
-            // resumed verdict — same cost class as the whole-map diff).
+            // PR 6c-i (design §14 S2 pre-fix a): the claims-scoped diff
+            // needs the current records at CLAIMED indices only — one
+            // exact lookup (+ the bounded A6 floor probe on a miss) per
+            // claimed index, never a whole-map materialization: the
+            // overlay saves publish through this arm per conveyor pass,
+            // so an O(map) scan here would re-pay the very cost the
+            // partial store deletes. `preexisting` counts the DISTINCT
+            // records the probes observed (claims-bounded by
+            // construction — the A1 whole-population census stays the
+            // establishing train's).
             let mut current: std::collections::BTreeMap<u32, super::block_map::MapEntry> =
                 std::collections::BTreeMap::new();
-            let mut cursor = 0u32;
-            loop {
-                let page = self
-                    .block_map_range(ino, cursor, chunk)
+            for &idx in c.take.iter().chain(c.release.iter()) {
+                if let Some((ridx, entry)) = self
+                    .get_block_mapping(ino, idx)
                     .await
-                    .map_err(|e| self.eio(&format!("block-map diff scan for ino {ino}: {e}")))?;
-                let Some((last, _)) = page.last() else {
-                    break;
-                };
-                let next = last.checked_add(1);
-                for (idx, existing) in page {
-                    preexisting += 1;
-                    current.insert(idx, existing);
+                    .map_err(|e| self.eio(&format!("block-map claim probe for ino {ino}: {e}")))?
+                {
+                    // Probes insert records at their TRUE keys, so the
+                    // exact-vs-covering reads below stay the §2 read law:
+                    // `current.get(&idx)` is Some only for a record keyed
+                    // at the claimed index (the exact arm ran first
+                    // inside the probe), and a covering run lands at its
+                    // own start key.
+                    if current.insert(ridx, entry).is_none() {
+                        preexisting += 1;
+                    }
                 }
-                let Some(next) = next else { break };
-                cursor = next;
             }
             // The covering run for an index with no exact record (the §2
             // read law's resolve, over the scanned records). Backward
@@ -3569,6 +3583,41 @@ impl KvMetaBackend {
                     if let Some(rc) = run_claims.get_mut(&start) {
                         rc.adopted.insert(*idx, want.clone());
                     }
+                }
+            }
+            // Pre-fix (a)'s dissolve face: a dissolving run's survivors
+            // must not clobber exact shadow points inside its span (the
+            // §2 read law's `contains_key` screen below), and the bounded
+            // probes above fetched CLAIMED keys only — page exactly the
+            // dissolving spans (≤ RUN_LEN_MAX records each,
+            // claims-bounded: every dissolving run was itself claimed).
+            let dissolving: Vec<(u32, u32)> = run_claims
+                .keys()
+                .filter_map(|s| current.get(s).map(|e| (*s, e.run_len())))
+                .collect();
+            for (start, len) in dissolving {
+                let span_end = u64::from(start) + u64::from(len);
+                let mut cursor = start;
+                loop {
+                    let page = self.block_map_range(ino, cursor, chunk).await.map_err(|e| {
+                        self.eio(&format!("block-map dissolve-span scan for ino {ino}: {e}"))
+                    })?;
+                    let Some(last) = page.last().map(|(i, _)| *i) else {
+                        break;
+                    };
+                    let short = page.len() < chunk;
+                    for (idx, entry) in page {
+                        if u64::from(idx) < span_end {
+                            current.entry(idx).or_insert(entry);
+                        }
+                    }
+                    if short || u64::from(last) + 1 >= span_end {
+                        break;
+                    }
+                    let Some(next) = last.checked_add(1) else {
+                        break;
+                    };
+                    cursor = next;
                 }
             }
             // The dissolves, one GROUP per run: survivor/adopted records
@@ -6982,6 +7031,15 @@ pub struct MapTrainClaims {
     pub take: std::collections::BTreeSet<u32>,
     /// release-claim indices.
     pub release: std::collections::BTreeSet<u32>,
+    /// PR 6c-i (design §14 S2 pre-fix b): `true` ⇔ this train executes a
+    /// SHIPPED verb on behalf of a peer (`serve_map_train`). The gen-bump
+    /// criterion keys on it — a SOLO mount's LOCAL claims trains (the 6c
+    /// overlay saves) mint no generation (the solo-dark byte-identity
+    /// law); only served and custody-armed trains bump the belt. It also
+    /// selects the cursor law's arm: served trains never barrier (a live
+    /// cursor refuses retried-class), local claims trains run the extend
+    /// barrier like the whole-map train they replace.
+    pub served: bool,
 }
 
 /// RAII registration in the in-flight crossing registry (design A3) —

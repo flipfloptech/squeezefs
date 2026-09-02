@@ -1227,10 +1227,11 @@ async fn alternating_shipped_saves_keep_peer_bindings_and_the_belt_refuses_lag()
     );
     assert_eq!(gen, 2, "every committed mw-plane train bumps the belt");
     assert_eq!(
-        preexisting, 2,
-        "B's train saw A's committed binding beside the coalesced run \
-         (`preexisting` counts RECORDS — PR 6a collapsed the spill's span \
-         into one RUN record)"
+        preexisting, 0,
+        "PR 6c-i (§14 S2 pre-fix a): a claims train probes CLAIMED indices \
+         only — B claimed the unmapped index SPILL_BLOCKS + 1, so its \
+         bounded probes observed zero preexisting records (the whole-map \
+         census stays the establishing train's)"
     );
     assert_eq!(publish::stats().map_served - served_before, 1);
 

@@ -1988,6 +1988,10 @@ pub async fn migrate_block_map(
                     base_gen: None,
                     take,
                     release,
+                    // A LOCAL train (§14 S2 pre-fix b): custody arming —
+                    // live here by the `live_grants` gate — is what
+                    // mints, never claims-presence.
+                    served: false,
                 })
             } else {
                 None
@@ -3538,6 +3542,9 @@ impl PublishService {
             base_gen: None,
             take,
             release,
+            // A served scoped Put: the mw plane's compose (§14 S2
+            // pre-fix b) — mints the belt like every shipped train.
+            served: true,
         };
         match self
             .inner
@@ -3692,6 +3699,9 @@ impl PublishService {
                 base_gen: Some(base_gen),
                 take,
                 release,
+                // A SHIPPED verb executed for a peer: the mw plane's
+                // train — mints the belt (§14 S2 pre-fix b).
+                served: true,
             };
             match self
                 .inner

@@ -55,10 +55,10 @@ use squeezefs::meta_backend::kv::superblock::{
 };
 use squeezefs::meta_backend::kv::META_KV_JOURNAL_ENTRIES;
 use squeezefs::meta_backend::{Metadata, RoutedMetaBackend};
-use squeezefs::meta_ship::{self as ship, publish};
+use squeezefs::meta_ship::{self as ship, publish, OwnerMap, PeerOwner};
 use squeezefs::nvme_dev::NvmeBlockDev;
 use squeezefs::routing::{BlockMapOp, DataRouter, LayoutFlip};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -638,4 +638,368 @@ async fn a_sticky_head_local_train_under_live_range_grants_refuses_loud() {
     holder.drain_releases().await;
     auth.listener.shutdown();
     rig.shutdown().await;
+}
+
+// ===========================================================================
+// The two-node harness (the kvmap_crossing_tests shipped-verb fixture: one
+// authority backend + listener, one all-foreign client backend, a real
+// custody join)
+// ===========================================================================
+
+const VOL_LEN: u64 = 256 * 1024 * 1024;
+
+fn make_file(dir: &Path, name: &str, len: u64) -> PathBuf {
+    let p = dir.join(name);
+    std::fs::File::create(&p).unwrap().set_len(len).unwrap();
+    p
+}
+
+async fn sandbox(dir: &Path, tag: &str) -> Arc<RoutedMetaBackend> {
+    let plan = squeezefs::meta_backend::plan_meta_slot_set(1).expect("derived plan");
+    let p = make_file(dir, &format!("{tag}-meta0"), VOL_LEN);
+    squeezefs::meta_backend::kv::builder::format_v3_stamped(
+        &p,
+        VOL_LEN,
+        &FormatV3Options {
+            node_size: squeezefs::meta_backend::kv::node::DEFAULT_NODE_SIZE,
+            journal_len_override: None,
+            force: true,
+            full_wipe: false,
+            format_config_xattr: None,
+        },
+        plan.stamps[0].clone(),
+    )
+    .await
+    .expect("format meta volume");
+    squeezefs::meta_backend::open_routed_meta_set(&[p.display().to_string()])
+        .await
+        .expect("open routed set")
+}
+
+async fn shutdown_set(routed: &Arc<RoutedMetaBackend>) {
+    for vol in &routed.volumes {
+        vol.shutdown().await.expect("volume shutdown");
+    }
+}
+
+async fn arm_client(
+    auth: &Authority,
+    client_be: &Arc<RoutedMetaBackend>,
+) -> (Arc<WriteCustodyClient>, Arc<publish::PublishClient>) {
+    let foreign: Vec<(usize, PeerOwner)> = (0..client_be.volumes.len())
+        .map(|v| (v, PeerOwner::new("kvmap-hazard-authority", &auth.endpoint)))
+        .collect();
+    ship::arm_ownership(OwnerMap::for_volumes(client_be, foreign).expect("owner map"));
+    let pc = publish::PublishClient::new(NODE, SECRET.to_vec());
+    publish::install_client(Arc::clone(&pc));
+    let client = WriteCustodyClient::connect(&auth.endpoint, SECRET, NODE)
+        .await
+        .expect("the co-writer joins the custody plane");
+    data_grant::install_custody_client(Arc::clone(&client));
+    (client, pc)
+}
+
+fn kvmap_head_bytes(size: u64) -> Vec<u8> {
+    bincode::serialize(&LayoutMetadata {
+        file_type: "striped".into(),
+        size,
+        block_map_id: Some("kvmap:1".into()),
+        block_prefix: None,
+        file_id: None,
+        data_key: None,
+        block_map: None,
+    })
+    .expect("serialize kvmap head")
+}
+
+fn inline_head_bytes(size: u64, map: Vec<(u32, String)>) -> Vec<u8> {
+    bincode::serialize(&LayoutMetadata {
+        file_type: "striped".into(),
+        size,
+        block_map_id: None,
+        block_prefix: None,
+        file_id: None,
+        data_key: None,
+        block_map: Some(map.into_iter().collect()),
+    })
+    .expect("serialize inline head")
+}
+
+/// A shipped create at a per-test DISTINCT ino (the `mk_file_at` law for
+/// the two-node harness).
+async fn shipped_file_at(client_be: &Arc<RoutedMetaBackend>, name: &str, fillers: u32) -> u64 {
+    for i in 0..fillers {
+        publish::create_with_rdev_size(
+            client_be,
+            1,
+            &format!("filler-{name}-{i}"),
+            libc::S_IFREG | 0o644,
+            0,
+            0,
+            0,
+            0,
+        )
+        .await
+        .expect("filler create ships");
+    }
+    publish::create_with_rdev_size(client_be, 1, name, libc::S_IFREG | 0o644, 0, 0, 0, 0)
+        .await
+        .expect("create ships")
+        .ino
+}
+
+/// Cross `ino` to a kvmap head on the OWNER through the shipped train
+/// (the A4 verb — 3 records at indices 0..3), returning the entries.
+async fn shipped_crossing(client_be: &Arc<RoutedMetaBackend>, ino: u64) -> Vec<(u32, String)> {
+    let entries: Vec<(u32, String)> = (0..3u32)
+        .map(|b| (b, (u64::from(b) * BLOCK).to_string()))
+        .collect();
+    publish::migrate_block_map(
+        client_be,
+        ino,
+        &kvmap_head_bytes(3 * BLOCK),
+        3 * BLOCK,
+        entries.clone(),
+        Vec::new(),
+        512,
+    )
+    .await
+    .expect("the shipped crossing lands");
+    entries
+}
+
+// ===========================================================================
+// 2. §11 row 2 — the S11 scoped Put over a kvmap head
+// ===========================================================================
+
+/// Contract (§11 row 2, RED pre-fix): a range holder's full Put served
+/// over a kvmap-headed ino must REFUSE — a `kvmap:` head's base decode is
+/// Err BY DESIGN (its map lives in tree 7), so pre-fix it fell through
+/// `custody_scoped_layout`'s undecodable-base "legacy verbatim" arm: the
+/// shipper's stale inline map overwrote the head and orphaned every
+/// tree-7 record. The fixed shape: refused loud naming PR 5b, counted on
+/// `map_refused`, the head and the tree records byte-identical, and
+/// NOTHING committed (journal-entry equality).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_scoped_put_served_over_a_kvmap_head_refuses_and_stages_nothing() {
+    let _serial = serial();
+    let _restore = Restore;
+    let dir = TempDir::new().unwrap();
+    let owner_be = sandbox(dir.path(), "sp-own").await;
+    let client_be = sandbox(dir.path(), "sp-cli").await;
+    let auth = start_authority(Arc::clone(&owner_be));
+    let (client, pc) = arm_client(&auth, &client_be).await;
+
+    let ino = shipped_file_at(&client_be, "scoped.bin", 12).await;
+    shipped_crossing(&client_be, ino).await;
+
+    // The §9.2 geometry source (the scoped compose refuses without it —
+    // the production mount arm installs the router-backed one), then the
+    // shipper takes LIVE range custody: the Put below is the SCOPED
+    // shape, not finding 34's custody-less one.
+    auth.owner
+        .install_range_geometry(data_grant::fixed_range_geometry(3 * BLOCK, BLOCK));
+    let lease = match client
+        .acquire_range(ino, (0, BLOCK), (0, BLOCK), Duration::from_secs(3))
+        .await
+        .expect("the holder's ranged grant")
+    {
+        RangeAcquireOutcome::New { lease, .. } => lease,
+        other => panic!("a fresh ino's first ranged ask must be NEW, got {other:?}"),
+    };
+
+    let head_before = owner_be
+        .getxattr(ino, "layout")
+        .await
+        .expect("layout read")
+        .expect("kvmap head");
+    let refused_before = publish::stats().map_refused;
+    let journal_before = journal_entries();
+
+    // The holder's full Put: a stale inline map naming only idx 0 —
+    // applied verbatim it regresses the head and orphans the records.
+    let err = pc
+        .ship(
+            &auth.endpoint,
+            publish::PublishCall::SetLayoutAndSize {
+                ino,
+                layout: inline_head_bytes(3 * BLOCK, vec![(0u32, "0".to_string())]),
+                size: 3 * BLOCK,
+                refs: Vec::new(),
+                lease_epoch: client.lease_epoch(),
+                request_id: 0x52A,
+            },
+        )
+        .await
+        .expect_err(
+            "a scoped Put served over a kvmap-headed ino must refuse (§11 row 2) — \
+             the verbatim arm regresses the head to the shipper's stale inline map",
+        );
+    assert!(
+        format!("{err}").contains("PR 5b"),
+        "the refusal names PR 5b (the S11 ∘ kvmap compose): {err}"
+    );
+    assert_eq!(
+        publish::stats().map_refused,
+        refused_before + 1,
+        "the refusal is counted (map_refused)"
+    );
+    assert_eq!(
+        journal_entries(),
+        journal_before,
+        "NOTHING committed — the screen fires before any staging"
+    );
+    assert_eq!(
+        owner_be
+            .getxattr(ino, "layout")
+            .await
+            .expect("layout read")
+            .expect("kvmap head"),
+        head_before,
+        "the head is byte-identical"
+    );
+    assert_eq!(
+        owner_be
+            .block_map_range(ino, 0, 16)
+            .await
+            .expect("tree scan")
+            .len(),
+        3,
+        "every tree-7 record survives the refused Put"
+    );
+
+    drop(lease);
+    client.drain_releases().await;
+    auth.listener.shutdown();
+    shutdown_set(&owner_be).await;
+    shutdown_set(&client_be).await;
+}
+
+// ===========================================================================
+// 3. §11 row 3 — the chained shipped merge onto a kvmap base
+// ===========================================================================
+
+/// Contract (§11 row 3, RED pre-fix): a chained shipped merge onto a
+/// kvmap base must REFUSE — the `head_indirect` gate keys on the WORD
+/// "indirect" in the base-decode error, and a kvmap head's refusal text
+/// deliberately does not carry it, so the merge reached `use_delta` and
+/// staged a versioned delta ONTO the delta-ineligible kvmap base: every
+/// later fold of the key refuses forever (delayed read-side poison). The
+/// fixed shape, on BOTH arms (the aggregated conveyor pass — the shipped
+/// default — and the `SQUEEZEFS_PUBLISH_COMMIT_GROUP_MAX=1` direct
+/// twin): refused loud in the retried class ("layout delta base
+/// unusable" — the shipper's reset provenance refetches the kvmap head
+/// and re-ships the A4 train), naming PR 5b, NOTHING staged
+/// (journal-entry equality), and the base still folds clean.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_chained_shipped_merge_onto_a_kvmap_base_refuses_before_staging() {
+    let _serial = serial();
+    let _restore = Restore;
+    let dir = TempDir::new().unwrap();
+    let owner_be = sandbox(dir.path(), "cm-own").await;
+    let client_be = sandbox(dir.path(), "cm-cli").await;
+    let auth = start_authority(Arc::clone(&owner_be));
+    let (_client, _pc) = arm_client(&auth, &client_be).await;
+
+    let ino = shipped_file_at(&client_be, "chained.bin", 16).await;
+    shipped_crossing(&client_be, ino).await;
+    let head_before = owner_be
+        .getxattr(ino, "layout")
+        .await
+        .expect("layout read")
+        .expect("kvmap head");
+    let journal_before = journal_entries();
+
+    let delta = squeezefs::layout_wire::LayoutDelta {
+        file_type: "striped".into(),
+        size: 4 * BLOCK,
+        block_map_id: None,
+        block_prefix: None,
+        file_id: None,
+        data_key: None,
+        entries: vec![(3u32, (3 * BLOCK).to_string())],
+        base_version: 0,
+        version: 0,
+    };
+    let full = bytes::Bytes::from(inline_head_bytes(
+        4 * BLOCK,
+        vec![(3u32, (3 * BLOCK).to_string())],
+    ));
+
+    // Arm 1: the aggregated conveyor pass (the shipped default).
+    let out = publish::merge_layout_and_size(
+        &client_be,
+        ino,
+        &delta,
+        full.clone(),
+        4 * BLOCK,
+        Vec::new(),
+    )
+    .await;
+    let err = out.expect_err(
+        "a chained shipped merge onto a kvmap base must refuse (§11 row 3, the \
+         aggregated arm) — staging a delta onto it poisons every later fold",
+    );
+    assert!(
+        format!("{err}").contains("layout delta base unusable"),
+        "retried-class marker (the shipper refetches and re-ships the train): {err}"
+    );
+    assert!(
+        format!("{err}").contains("PR 5b"),
+        "the refusal names PR 5b: {err}"
+    );
+
+    // Arm 2: the direct twin (`SQUEEZEFS_PUBLISH_COMMIT_GROUP_MAX=1`) —
+    // override set around the ONE call, restored before any assertion
+    // can panic past it.
+    squeezefs::routing::set_publish_commit_group_override(Some(1));
+    let direct = publish::merge_layout_and_size(
+        &client_be,
+        ino,
+        &delta,
+        full.clone(),
+        4 * BLOCK,
+        Vec::new(),
+    )
+    .await;
+    squeezefs::routing::set_publish_commit_group_override(None);
+    let err = direct.expect_err(
+        "a chained shipped merge onto a kvmap base must refuse (§11 row 3, the \
+         direct arm)",
+    );
+    assert!(
+        format!("{err}").contains("layout delta base unusable")
+            && format!("{err}").contains("PR 5b"),
+        "same class, same PR-5b naming, on the direct arm: {err}"
+    );
+
+    assert_eq!(
+        journal_entries(),
+        journal_before,
+        "NOTHING staged on either arm — journal-entry equality"
+    );
+    // The base still folds clean: a staged delta would make this read
+    // refuse FOREVER (the delayed poison §11 row 3 names).
+    assert_eq!(
+        owner_be
+            .getxattr(ino, "layout")
+            .await
+            .expect("the kvmap base still folds clean")
+            .expect("kvmap head"),
+        head_before,
+        "the head is byte-identical"
+    );
+    assert_eq!(
+        owner_be
+            .block_map_range(ino, 0, 16)
+            .await
+            .expect("tree scan")
+            .len(),
+        3,
+        "every tree-7 record survives the refused merges"
+    );
+
+    auth.listener.shutdown();
+    shutdown_set(&owner_be).await;
+    shutdown_set(&client_be).await;
 }

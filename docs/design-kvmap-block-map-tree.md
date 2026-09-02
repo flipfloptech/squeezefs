@@ -248,3 +248,43 @@ PR 2 (line anchors drift — anchor on symbols):
 5. **kvmap heads are STICKY** (decision): a shrinking map never collapses
    back inline — collapse would need its own sweep tx and buys nothing
    (the head is ~100 B either way). Pinned by test in PR 2.
+
+## 8. Rev 1.2 — PR-3 read-map addenda (2026-09-01)
+
+The PR-3 pre-implementation map's design-level facts:
+
+1. **The window cache is a HYBRID**: materialized leaf-span ranges (one
+   `block_map_range` fill ≈ 4–8 k entries ≈ 16–32 GiB of data at 4 MiB
+   blocks — restores the O(1) probe), probed sync + lock-free. Point-
+   through alone is impossible: two consumers are contractually SYNC
+   (the il §5.5.1 fast path and the read-lane coverage screen) — without
+   a sync-probeable store, every kvmap warm il read DEMOTES to the async
+   handoff (the 1 M-IOPS engine structurally off) and lane coverage
+   reads UNCOVERED. Per-ino span cap (1–2, LRU) ⇒ ≤ ~512 KiB per
+   random-access PB file; R5 component `block_map_window` (floor 0,
+   weight 2, drop-at-will — clean derived cache).
+2. **No R2/lane map prefetch**: one leaf spans 16–32 GiB of data, so a
+   stream crosses a leaf every several seconds at multi-GB/s and the
+   window's miss-fetch runs naturally ahead of the data pipeline; a
+   `block_map_window_misses`-class counter adjudicates ever pricing an
+   explicit next-window prefetch.
+3. **A7 probation is one line**: `CachedNode.ref_bit` initializes true —
+   demand-loaded tree-7 LEAVES construct with it false (no second chance
+   until a second touch); interior/pinned behavior untouched.
+4. **A9 bracket is armed-readers-only**: write mounts stamp
+   `UNARMED_EPOCH` and the one-KvTx head+records commit + 3.5/4a
+   serialization + the existing rebind/currency ladder already own
+   racing-publish skew — pinned no-bracket byte-identity on writers.
+   Window entries stamp their load epoch (the `publish_stamped` law).
+5. **Cold map amplification IMPROVES** (≈ 256 KiB leaf vs the 4 MiB blob
+   per 16 GiB file); the risk is per-lookup latency shape, and the
+   PR-1 merged `LOOKUPS` counter must split (exact / range / overlay
+   hits; `leaf_reads` = tree-7-attributed node-cache misses) or §5's
+   gauges are un-derivable.
+6. **Map-window invalidation needs its own epoch-step drop arm** (the
+   R-6 purge sink is block-key-addressed); co-writer foreign-range
+   windows also drop at the free-epoch ack promotion point — BEFORE the
+   ack rides the renewal, keeping the acknowledged-label safety argument
+   true of the map cache. The co-writer cache lands in PR 3 with a
+   pluggable fill (local S5 read now; the PR-5 `GetBlockMapRange` verb
+   later).

@@ -214,8 +214,7 @@ async fn rewrite_pass(h: &H, ino: u64, want: &mut [u8], tag: u8) {
     fsync(h, ino).await;
 }
 
-async fn cold_full_read_matches(h: &H, ino: u64, want: &[u8], what: &str) {
-    purge_tiers(h, ino).await;
+async fn full_read_matches(h: &H, ino: u64, want: &[u8], what: &str) {
     // Read in 8-block windows (a 131 MiB single READ is no kernel shape).
     let mut got = Vec::with_capacity(want.len());
     let mut off = 0usize;
@@ -241,6 +240,16 @@ async fn cold_full_read_matches(h: &H, ino: u64, want: &[u8], what: &str) {
             got[i], want[i]
         );
     }
+}
+
+/// Finding 48's oracle: the WARM (same-mount, tiers intact, any live
+/// overlay composed) read and the COLD (tiers purged) read must both
+/// equal the acknowledged bytes — a warm/cold disagreement is a
+/// composition bug on one side or the other, never a legal outcome.
+async fn warm_and_cold_full_reads_match(h: &H, ino: u64, want: &[u8], what: &str) {
+    full_read_matches(h, ino, want, &format!("{what} (WARM)")).await;
+    purge_tiers(h, ino).await;
+    full_read_matches(h, ino, want, &format!("{what} (COLD)")).await;
 }
 
 async fn run_multi_pass(overlay_on: bool, ns: &str) {
@@ -294,13 +303,13 @@ async fn run_multi_pass(overlay_on: bool, ns: &str) {
         "fixture: the file must cross into the kvmap tree (got {:?})",
         head_check.block_map_id
     );
-    cold_full_read_matches(&h, ino, &want, "fresh pass").await;
+    warm_and_cold_full_reads_match(&h, ino, &want, "fresh pass").await;
 
     rewrite_pass(&h, ino, &mut want, 2).await;
-    cold_full_read_matches(&h, ino, &want, "rewrite pass 1").await;
+    warm_and_cold_full_reads_match(&h, ino, &want, "rewrite pass 1").await;
 
     rewrite_pass(&h, ino, &mut want, 3).await;
-    cold_full_read_matches(&h, ino, &want, "rewrite pass 2 (same session)").await;
+    warm_and_cold_full_reads_match(&h, ino, &want, "rewrite pass 2 (same session)").await;
 
     // The A/B pair's validity: the ON leg must have ENGAGED the overlay
     // (stores + overwrite installs — the rewrite passes are the
@@ -339,7 +348,7 @@ async fn run_multi_pass(overlay_on: bool, ns: &str) {
     // whole read plane into the loud unresolvable-record refusal.
     drop(h);
     let h2 = make(&b, &m, ns, overlay_on, false).await;
-    cold_full_read_matches(&h2, ino, &want, "rewrite pass 2 (REMOUNT)").await;
+    full_read_matches(&h2, ino, &want, "rewrite pass 2 (REMOUNT)").await;
 }
 
 /// The finding-44 red: the FIELD posture (device overlay ON — the shipped

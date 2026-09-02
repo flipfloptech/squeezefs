@@ -6591,20 +6591,29 @@ impl DataRouter {
         let backend = self.inner.meta_backend.get().ok_or_else(|| {
             SqueezefsError::InvalidOperation("Metadata backend not initialized".to_string())
         })?;
-        // The engagement gate for a NEW crossing: LOCAL publishes probe
-        // the home volume (an un-stamped volume keeps the legacy blob arm
-        // verbatim — stamping is an explicit act, the D9 caution), and a
-        // FOREIGN-HOME new crossing stands down entirely: a co-writer can
-        // neither read the owner's superblock nor decide its format
-        // posture, and self-arming the owner from the wire would flip
-        // every mw fleet's blob lifecycle by default (the finding-23/33
-        // contracts). The ino crosses when the AUTHORITY's own save does;
-        // the co-writer then follows the STICKY head (A10 force-kvmap),
-        // shipping the A4 verb below — which is how a co-writer never
-        // runs the local train.
+        // The engagement gate for a NEW crossing. A FOREIGN-HOME new
+        // crossing stands down entirely: a co-writer can neither read the
+        // owner's superblock nor decide its format posture, and
+        // self-arming the owner from the wire would flip every mw fleet's
+        // blob lifecycle by default (the finding-23/33 contracts). The
+        // ino crosses when the AUTHORITY's own save does; the co-writer
+        // then follows the STICKY head (A10 force-kvmap), shipping the A4
+        // verb below — which is how a co-writer never runs the local
+        // train. A LOCAL new crossing SELF-ARMS (finding 43 — the landed
+        // engaged-only pre-probe was circular: only the train stamps the
+        // bit, no offline verb exists, so kvmap was unreachable on every
+        // real mount; design §2's bit-5 law is stamp-at-first-use, never
+        // on untouched volumes). The probe runs BEFORE any state is
+        // consumed — a failed ratchet keeps the legacy blob arm with the
+        // deferred accumulator untouched, never a blocked write.
         let local = crate::meta_ship::publish::publishes_locally(backend, ino);
-        if !head_is_kvmap && !(local && backend.block_map_tree_engaged(ino)) {
-            return Ok(None);
+        if !head_is_kvmap {
+            if !local {
+                return Ok(None);
+            }
+            if !backend.block_map_tree_ready(ino).await {
+                return Ok(None);
+            }
         }
         // The whole current map is the train's input. A kvmap head with
         // NO map authority must refuse — diffing against an absent map

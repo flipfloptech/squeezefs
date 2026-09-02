@@ -3280,6 +3280,20 @@ impl RoutedMetaBackend {
         self.volumes[v_idx].block_map_tree_engaged()
     }
 
+    /// Finding 43 — the SELF-ARMING probe for a local NEW crossing
+    /// (design §2, the bit-5 law: the ratchet engages at first use,
+    /// never on untouched volumes): routes to `ino`'s home volume and
+    /// runs its bit-16 ratchet + tree mint. `false` = the ratchet could
+    /// not complete — the caller keeps the legacy blob arm, never blocks
+    /// the write.
+    pub async fn block_map_tree_ready(&self, ino: Ino) -> bool {
+        let (v_idx, _) = self.route_ino(ino);
+        if self.check_volume_enabled(v_idx).is_err() {
+            return false;
+        }
+        self.volumes[v_idx].block_map_tree_ready().await
+    }
+
     /// PR 2 (kvmap): a bounded window of `ino`'s tree-7 mappings from
     /// `from_index` upward, routed to its home volume (records key on the
     /// volume-LOCAL ino — the `inode_key` identity the per-volume walkers

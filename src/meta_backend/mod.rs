@@ -891,8 +891,18 @@ pub struct RoutedMetaBackend {
     /// block-key string, installed at the same site. The claims-scoped
     /// train's f36b recompute resolves displaced records through it;
     /// uninstalled falls back to STRING-utf8 (the encoder-less arm only
-    /// ever stored STRING records).
+    /// ever stored STRING records). Since PR 6a the hook takes the
+    /// per-index DELTA into the record (0 for point-class records; a
+    /// run's covered indices resolve through the router's stride census
+    /// — design §12).
     map_entry_decoder: std::sync::OnceLock<MapEntryDecoder>,
+    /// PR 6a (design §12): the run-emission STRIDE census — `vol_tag` →
+    /// the owning data volume's block size in bytes (the one-block offset
+    /// stride a RUN record's arithmetic rides). Installed beside the
+    /// encoder at `DataRouter::set_meta_backend`; uninstalled = no run
+    /// emission (bare backends only ever encode STRING records, which
+    /// never coalesce).
+    map_run_stride: std::sync::OnceLock<MapRunStride>,
 }
 
 /// See [`RoutedMetaBackend::install_map_entry_encoder`].
@@ -900,7 +910,10 @@ type MapEntryEncoder = std::sync::Arc<dyn Fn(&str) -> kv::block_map::MapEntry + 
 
 /// See [`RoutedMetaBackend::install_map_entry_decoder`].
 type MapEntryDecoder =
-    std::sync::Arc<dyn Fn(&kv::block_map::MapEntry) -> Option<String> + Send + Sync>;
+    std::sync::Arc<dyn Fn(&kv::block_map::MapEntry, u32) -> Option<String> + Send + Sync>;
+
+/// See [`RoutedMetaBackend::install_map_run_stride`].
+type MapRunStride = std::sync::Arc<dyn Fn(u64) -> Option<u64> + Send + Sync>;
 
 /// The latch-free routing tables `route_ino`/`make_global_ino` read.
 struct RouteTable {
@@ -912,6 +925,129 @@ struct RouteTable {
     /// per-slot cursors are the durable half and already travel at
     /// cutover). [`RoutedMetaBackend::pick_mint_slot`] rotates over it.
     mint_slots: Vec<Vec<u16>>,
+}
+
+/// PR 6a (design §12/A6): the post-encode RUN seam — coalesce a sorted
+/// `(index, record)` sequence's straight spans into RUN/RUN2 records.
+/// `pub` for `meta_lv_bench`'s run-emission row (the seam's per-publish
+/// CPU price); production callers stay inside `migrate_block_map_train`.
+/// A span extends while indices are consecutive, the volume tag is one,
+/// offsets advance by exactly the volume's block stride (`stride_of` —
+/// the router's census; an unknown tag never coalesces), and — for
+/// stamped keys — the incarnation stamps are LITERALLY consecutive
+/// composed words (consecutive-mint lane_seqs prove stride-1; the
+/// emitter verifies every ACTUAL stamp, so decode arithmetic reproduces
+/// exactly what was minted). STRING records (decorated keys,
+/// encoder-less arms) break spans. Runs cap at
+/// [`kv::block_map::RUN_LEN_MAX`] (the A6 floor-probe bound) and need
+/// length ≥ 2 (a 1-run is a point — one spelling per mapping, or the
+/// record-equality diff churns).
+pub fn coalesce_map_runs(
+    records: Vec<(u32, kv::block_map::MapEntry)>,
+    stride_of: &(dyn Fn(u64) -> Option<u64> + Send + Sync),
+) -> Vec<(u32, kv::block_map::MapEntry)> {
+    use kv::block_map::{MapEntry, RUN_LEN_MAX};
+    let mut out: Vec<(u32, MapEntry)> = Vec::with_capacity(records.len());
+    // The open span: (start_index, vol_tag, start_offset, stride,
+    // start_incarnation — 0 = unstamped span, len).
+    struct Span {
+        start: u32,
+        vol_tag: u64,
+        start_offset: u64,
+        stride: u64,
+        start_inc: u64,
+        len: u32,
+    }
+    let mut open: Option<Span> = None;
+    let flush = |out: &mut Vec<(u32, MapEntry)>, span: Option<Span>| {
+        let Some(s) = span else { return };
+        if s.len >= 2 {
+            let entry = if s.start_inc == 0 {
+                MapEntry::Run {
+                    vol_tag: s.vol_tag,
+                    start_offset: s.start_offset,
+                    len: s.len,
+                }
+            } else {
+                MapEntry::RunStamped {
+                    vol_tag: s.vol_tag,
+                    start_offset: s.start_offset,
+                    len: s.len,
+                    start_incarnation: s.start_inc,
+                }
+            };
+            out.push((s.start, entry));
+        } else {
+            // A 1-span re-emits the point verbatim.
+            let entry = if s.start_inc == 0 {
+                MapEntry::Point {
+                    vol_tag: s.vol_tag,
+                    offset: s.start_offset,
+                }
+            } else {
+                MapEntry::PointStamped {
+                    vol_tag: s.vol_tag,
+                    offset: s.start_offset,
+                    incarnation: s.start_inc,
+                }
+            };
+            out.push((s.start, entry));
+        }
+    };
+    for (idx, entry) in records {
+        let (vol_tag, offset, inc) = match &entry {
+            MapEntry::Point { vol_tag, offset } => (*vol_tag, *offset, 0u64),
+            MapEntry::PointStamped {
+                vol_tag,
+                offset,
+                incarnation,
+            } => (*vol_tag, *offset, *incarnation),
+            // STRING (and any pre-coalesced run a caller hands back)
+            // breaks the span and passes through verbatim.
+            _ => {
+                flush(&mut out, open.take());
+                out.push((idx, entry));
+                continue;
+            }
+        };
+        if let Some(s) = &mut open {
+            let extends = s.vol_tag == vol_tag
+                && s.len < RUN_LEN_MAX
+                && idx == s.start.wrapping_add(s.len)
+                && idx > s.start
+                && offset == s.start_offset.wrapping_add(s.stride * u64::from(s.len))
+                && offset > s.start_offset
+                && if s.start_inc == 0 {
+                    inc == 0
+                } else {
+                    inc == s.start_inc.wrapping_add(u64::from(s.len)) && inc > s.start_inc
+                };
+            if extends {
+                s.len += 1;
+                continue;
+            }
+            let closed = open.take();
+            flush(&mut out, closed);
+        }
+        match stride_of(vol_tag) {
+            Some(stride) if stride > 0 => {
+                open = Some(Span {
+                    start: idx,
+                    vol_tag,
+                    start_offset: offset,
+                    stride,
+                    start_inc: inc,
+                    len: 1,
+                });
+            }
+            _ => {
+                // No stride census for this tag: the point stands alone.
+                out.push((idx, entry));
+            }
+        }
+    }
+    flush(&mut out, open.take());
+    out
 }
 
 /// Derive each volume's mint set from an expanded slot map: the first
@@ -990,6 +1126,7 @@ impl RoutedMetaBackend {
                 .collect(),
             map_entry_encoder: std::sync::OnceLock::new(),
             map_entry_decoder: std::sync::OnceLock::new(),
+            map_run_stride: std::sync::OnceLock::new(),
         }
     }
 
@@ -1050,6 +1187,7 @@ impl RoutedMetaBackend {
                 .collect(),
             map_entry_encoder: std::sync::OnceLock::new(),
             map_entry_decoder: std::sync::OnceLock::new(),
+            map_run_stride: std::sync::OnceLock::new(),
         })
     }
 
@@ -1080,9 +1218,21 @@ impl RoutedMetaBackend {
     /// train's f36b recompute resolves DISPLACED tree records through it.
     pub fn install_map_entry_decoder(
         &self,
-        decoder: std::sync::Arc<dyn Fn(&kv::block_map::MapEntry) -> Option<String> + Send + Sync>,
+        decoder: std::sync::Arc<
+            dyn Fn(&kv::block_map::MapEntry, u32) -> Option<String> + Send + Sync,
+        >,
     ) {
         let _ = self.map_entry_decoder.set(decoder);
+    }
+
+    /// PR 6a (design §12): install the run-emission stride census —
+    /// `vol_tag` → the owning data volume's block size. Same install
+    /// site and once-wins posture as the encoder/decoder pair.
+    pub fn install_map_run_stride(
+        &self,
+        stride: std::sync::Arc<dyn Fn(u64) -> Option<u64> + Send + Sync>,
+    ) {
+        let _ = self.map_run_stride.set(stride);
     }
 
     /// The router-true block-key string for one tree-7 record: through
@@ -1091,13 +1241,24 @@ impl RoutedMetaBackend {
     /// fallback is exact); a POINT with no decoder is unresolvable —
     /// `None`, and the caller must be LOUD.
     pub fn decode_map_entry(&self, entry: &kv::block_map::MapEntry) -> Option<String> {
+        self.decode_map_entry_at(entry, 0)
+    }
+
+    /// [`Self::decode_map_entry`] at a per-index DELTA into a run record
+    /// (0 for point-class records — design §12): the claims train's
+    /// dissolve/recompute resolve covered indices through it.
+    pub fn decode_map_entry_at(
+        &self,
+        entry: &kv::block_map::MapEntry,
+        delta: u32,
+    ) -> Option<String> {
         match self.map_entry_decoder.get() {
-            Some(dec) => dec(entry),
+            Some(dec) => dec(entry, delta),
             None => match entry {
-                kv::block_map::MapEntry::String(bytes) => {
+                kv::block_map::MapEntry::String(bytes) if delta == 0 => {
                     std::str::from_utf8(bytes).ok().map(str::to_string)
                 }
-                kv::block_map::MapEntry::Point { .. } => None,
+                _ => None,
             },
         }
     }
@@ -3372,6 +3533,17 @@ impl RoutedMetaBackend {
     /// `from_index` upward, routed to its home volume (records key on the
     /// volume-LOCAL ino — the `inode_key` identity the per-volume walkers
     /// join against layout heads).
+    ///
+    /// PR 6a (design §12): a `from_index` landing strictly INSIDE a
+    /// preceding run's span PREPENDS that covering run — record-true
+    /// (the run rides verbatim, keyed at its true start; the consumer
+    /// clips/overlays), so a fresh mid-run window never reads a covered
+    /// index as absent. Continuation loops (cursor = last key + 1) get
+    /// the same record re-delivered when their cursor lands mid-span —
+    /// their per-index overlay is idempotent, and a page whose every
+    /// record precedes the cursor means the walk is DONE (the
+    /// no-progress guard; the per-volume primitive stays strictly
+    /// record-true for the sweep/C11 count loops).
     pub async fn block_map_range(
         &self,
         ino: Ino,
@@ -3380,14 +3552,28 @@ impl RoutedMetaBackend {
     ) -> Result<Vec<(u32, crate::meta_backend::kv::block_map::MapEntry)>> {
         let (v_idx, local_ino) = self.route_ino(ino);
         self.check_volume_enabled(v_idx)?;
-        self.volumes[v_idx]
+        let mut page = self.volumes[v_idx]
             .block_map_range(local_ino, from_index, max)
             .await
             .map_err(|e| {
                 crate::error::SqueezefsError::InvalidOperation(format!(
                     "block-map range for ino {ino} failed: {e}"
                 ))
-            })
+            })?;
+        if from_index > 0 && page.first().map(|(i, _)| *i) != Some(from_index) {
+            if let Some((start, entry)) = self.volumes[v_idx]
+                .block_map_floor(local_ino, from_index)
+                .await
+                .map_err(|e| {
+                    crate::error::SqueezefsError::InvalidOperation(format!(
+                        "block-map floor probe for ino {ino} failed: {e}"
+                    ))
+                })?
+            {
+                page.insert(0, (start, entry));
+            }
+        }
+        Ok(page)
     }
 
     /// PR 2 (kvmap): the crossing/migration train, routed to `ino`'s home
@@ -3414,14 +3600,27 @@ impl RoutedMetaBackend {
         // to its tree-7 record form HERE (the last point with router
         // access on both the local and the served arm; the wire stays
         // strings, so the verb schema is untouched).
-        let records: Vec<(u32, kv::block_map::MapEntry)> = entries
+        let mut records: Vec<(u32, kv::block_map::MapEntry)> = entries
             .iter()
             .map(|(b, k)| (*b, self.encode_map_entry(k)))
             .collect();
+        // PR 6a (design §12): the post-encode RUN seam — straight
+        // sequential spans coalesce into RUN/RUN2 records on LOCAL
+        // whole-map trains only. Claims-scoped (shipped/range-custody)
+        // trains stay per-index BY LAW: adoption/release is claim-index
+        // arithmetic, and a run a claim splits must never be
+        // partial-adopted silently.
+        if claims.is_none() {
+            if let Some(stride_of) = self.map_run_stride.get() {
+                records = coalesce_map_runs(records, stride_of.as_ref());
+            }
+        }
         // PR 5b: block refs key on the GLOBAL ino (the block_refs.rs key
         // law), so the train's recompute is handed both identities plus
-        // the record decoder.
-        let entry_key = |e: &kv::block_map::MapEntry| self.decode_map_entry(e);
+        // the record decoder. PR 6a: the per-index delta form (run
+        // records resolve covered indices through the stride census).
+        let entry_key =
+            |e: &kv::block_map::MapEntry, delta: u32| self.decode_map_entry_at(e, delta);
         let out = self.volumes[v_idx]
             .migrate_block_map_train(
                 local_ino, layout, size, block_refs, &records, chunk, claims, ino, &entry_key,

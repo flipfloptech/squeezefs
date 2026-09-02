@@ -303,6 +303,18 @@ pub static META_KV_BLOCK_MAP_DELETES: AtomicU64 = AtomicU64::new(0);
 /// point resolutions. Surfaced as `meta_kv_block_map_lookup_exact`.
 pub static META_KV_BLOCK_MAP_LOOKUP_EXACT: AtomicU64 = AtomicU64::new(0);
 
+/// PB-class files, PR 6a (design §12/A6): exact-miss lookups that ran the
+/// bounded run-floor probe (whether or not a covering run answered) — the
+/// point-over-run read law's engagement face. Surfaced as
+/// `meta_kv_block_map_lookup_floor`.
+pub static META_KV_BLOCK_MAP_LOOKUP_FLOOR: AtomicU64 = AtomicU64::new(0);
+
+/// PB-class files, PR 6a (design §5 `block_map_tree_run_puts`): RUN/RUN2
+/// records **staged** as `Put`s — the run-emission engagement gauge
+/// (blocks÷records collapse is `map_migrate_records` vs the covered
+/// span). Surfaced as `meta_kv_block_map_run_puts`.
+pub static META_KV_BLOCK_MAP_RUN_PUTS: AtomicU64 = AtomicU64::new(0);
+
 /// PB-class files, PR 3 (§8 #5): `block_map_range` window reads — the
 /// fetch-rehydration/walker face; ops ÷ entries is the live leaf
 /// amortization. Surfaced as `meta_kv_block_map_lookup_range`.

@@ -329,9 +329,10 @@ pub struct BlockAllocator {
     /// Spec §6.2 item 6 (incompat bit 13): the mount's lifetime-stamp
     /// minter — `Some` only when incarnation keys are engaged, which
     /// requires every mounted meta volume to carry bit 13 and a durable
-    /// writer term (bit 7). `None` on every volume today (ruling D9:
-    /// build the bit, do not stamp it), and then every minted key is the
-    /// bare offset form, byte-identical to the shipped one.
+    /// writer term (bit 7). Since the rung-10b flip the DEFAULT format
+    /// stamps bit 13, so every plain write mount engages (PR 6a's item-1
+    /// verdict); `None` on `--single-writer`/pre-flip volumes and probe
+    /// mounts, where every minted key stays the bare offset form.
     incarnation_minter: std::sync::OnceLock<IncarnationMinter>,
     /// DLM **S7** (pre-RC engineering spec §6.7 "Recovery"): this volume's
     /// dead-epoch **do-not-reallocate** quarantine —

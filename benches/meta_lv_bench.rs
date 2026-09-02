@@ -1584,6 +1584,88 @@ fn bench_kvmap(c: &mut Criterion) {
             }
         });
     });
+
+    // --- PR 6a (design §12): the RUN rows. --------------------------
+    //
+    // `run_emission_4096_seq` — the post-encode coalesce pass at the A6
+    // field shape: one RUN_LEN_MAX-long straight sequential window of
+    // POINT records (4 MiB stride), the per-publish CPU the seam adds to
+    // every giant sequential publish. Throughput = entries.
+    let seq_records: Vec<(u32, squeezefs::meta_backend::kv::block_map::MapEntry)> = (0..4096u32)
+        .map(|i| {
+            (
+                i,
+                MapEntry::Point {
+                    vol_tag,
+                    offset: u64::from(i) * 4 * 1024 * 1024,
+                },
+            )
+        })
+        .collect();
+    let stride_of = |tag: u64| (tag == vol_tag).then_some(4u64 * 1024 * 1024);
+    group.throughput(criterion::Throughput::Elements(4096));
+    group.bench_function("run_emission_4096_seq", |b| {
+        b.iter(|| {
+            let out = squeezefs::meta_backend::coalesce_map_runs(
+                black_box(seq_records.clone()),
+                &stride_of,
+            );
+            black_box(out.len())
+        });
+    });
+
+    // `floor_probe_point_override` — the A6 exact-miss read law at the
+    // point-over-run shape: a full-width run at 0 plus a superseding
+    // point mid-span; every probe is an exact miss resolved by the
+    // bounded forward take-last-covering scan (the §12 read floor).
+    const RUN_OWNER: u64 = 900_002;
+    rt.block_on(async {
+        let key = block_map_key(RUN_OWNER, 0).expect("legal index");
+        let run = MapEntry::Run {
+            vol_tag,
+            start_offset: 0,
+            len: 4096,
+        };
+        tree.insert(&key, run.encode()).await.expect("insert run");
+        let key = block_map_key(RUN_OWNER, 2048).expect("legal index");
+        let point = MapEntry::Point {
+            vol_tag,
+            offset: 1 << 40,
+        };
+        tree.insert(&key, point.encode())
+            .await
+            .expect("insert override");
+        while tree.maintenance_pending() {
+            tree.run_maintenance(&mut ctx).await.expect("maintenance");
+        }
+    });
+    group.throughput(criterion::Throughput::Elements(1));
+    group.bench_function("floor_probe_point_override", |b| {
+        let mut i = 1u32;
+        b.to_async(&rt).iter(|| {
+            let tree = &tree;
+            // Exact miss at a covered index: the floor scan window is
+            // [i − 4095, i − 1] take-last-covering, decoded per record.
+            let probe = 1 + (i.wrapping_mul(7919) % 4095);
+            i = i.wrapping_add(1);
+            async move {
+                let (lo, hi) = (
+                    block_map_key(RUN_OWNER, probe.saturating_sub(4095)).expect("lo"),
+                    block_map_key(RUN_OWNER, probe - 1).expect("hi"),
+                );
+                let page = tree.range(&lo, &hi, 512).await.expect("floor window");
+                let mut covering = None;
+                for (k, v) in &page {
+                    let (_, idx) = decode_block_map_key(k).expect("key");
+                    let e = decode_block_map_value(v).expect("value");
+                    if u64::from(idx) + u64::from(e.run_len()) > u64::from(probe) {
+                        covering = Some((idx, e));
+                    }
+                }
+                black_box(covering.expect("covered index"))
+            }
+        });
+    });
     group.finish();
 }
 

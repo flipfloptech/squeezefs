@@ -2493,8 +2493,10 @@ impl KvMetaBackend {
     /// block keys (incompat bit 13 — spec §6.2 item 6) AND this mount has a
     /// durable writer era to compose stamps from (incompat bit 7's term,
     /// which the stamping path requires and a read-only/probe mount does
-    /// not have). Nothing stamps bit 13 today (ruling D9), so this is
-    /// `false` on every production volume and every key stays bare.
+    /// not have). Since the rung-10b flip the DEFAULT format carries
+    /// bit 13, so this is `true` on every plain write mount and fresh
+    /// mints carry stamps (PR 6a's item-1 verdict; `--single-writer` /
+    /// pre-flip volumes stay bare).
     pub fn block_key_incarnation_engaged(&self) -> bool {
         self.sb.features_incompat & super::superblock::FEATURE_INCOMPAT_KV_BLOCK_KEY_INCARNATION
             != 0
@@ -2817,9 +2819,14 @@ impl KvMetaBackend {
 
     /// PB-class files, PR 1 (design §3 read law, the exact-key half):
     /// resolve `(ino, block_index)` through the block-map tree — a point
-    /// lookup. PR 6's run records add the bounded run-floor fallback
-    /// (A6); until then every tree-resident mapping IS a point record,
-    /// so an exact miss is an absent mapping.
+    /// lookup, then (PR 6a, design §12/A6) the bounded run-floor probe on
+    /// an exact miss. Returns the RECORD's key index alongside the entry:
+    /// an exact hit answers `(block_index, entry)`, a covering run
+    /// answers `(start_index, run)` and the caller derives the per-index
+    /// binding from `block_index − start_index` (the offset/stamp
+    /// arithmetic lives with the router's stride census). The read law is
+    /// exact-supersedes-covering-run BY CONSTRUCTION here: the exact
+    /// lookup runs first, the floor probe only on its miss.
     ///
     /// `Ok(None)` on a volume with no engaged tree — a caller that must
     /// distinguish asks [`Self::block_map_tree_engaged`] (the
@@ -2828,7 +2835,7 @@ impl KvMetaBackend {
         &self,
         ino: Ino,
         block_index: u32,
-    ) -> std::result::Result<Option<super::block_map::MapEntry>, KvError> {
+    ) -> std::result::Result<Option<(u32, super::block_map::MapEntry)>, KvError> {
         let Some(tree) = self.block_map.get() else {
             return Ok(None);
         };
@@ -2838,9 +2845,77 @@ impl KvMetaBackend {
             // A malformed mapping is loud corruption, never a silently
             // skipped block (a wrong resolve is the failure the tree
             // exists to prevent).
-            Some(v) => Ok(Some(super::block_map::decode_block_map_value(&v)?)),
-            None => Ok(None),
+            Some(v) => Ok(Some((
+                block_index,
+                super::block_map::decode_block_map_value(&v)?,
+            ))),
+            None => self.block_map_floor(ino, block_index).await,
         }
+    }
+
+    /// The A6 run-floor probe (design §3/§12): the tree has no
+    /// floor/predecessor primitive, so the exact-miss arm is ONE bounded
+    /// forward range `[ino‖N−(RUN_LEN_MAX−1), ino‖N−1]` take-last with the
+    /// owner-ino prefix check (`index_range` bounds are ino-exact by
+    /// construction; the decode re-checks), then the coverage check —
+    /// `Some` only when the floor record is a run whose span reaches `N`.
+    /// `RUN_LEN_MAX` bounds the scan BECAUSE it bounds every emitted run:
+    /// a record keyed further back can never cover `N`.
+    pub async fn block_map_floor(
+        &self,
+        ino: Ino,
+        block_index: u32,
+    ) -> std::result::Result<Option<(u32, super::block_map::MapEntry)>, KvError> {
+        let Some(tree) = self.block_map.get() else {
+            return Ok(None);
+        };
+        if block_index == 0 {
+            // No index precedes 0 — a covering run would BE the exact hit.
+            return Ok(None);
+        }
+        super::META_KV_BLOCK_MAP_LOOKUP_FLOOR.fetch_add(1, Ordering::Relaxed);
+        let lo_idx = block_index.saturating_sub(super::block_map::RUN_LEN_MAX - 1);
+        let lo = super::block_map::block_map_key(ino, lo_idx)?;
+        let hi = super::block_map::block_map_key(ino, block_index - 1)?;
+        // Take the LAST **covering** record over the bounded window,
+        // paged forward (the range primitive is forward-only). Not the
+        // last record plain: a superseding point INSIDE a run's span (the
+        // §2 read law's own legal shape — a claims adoption) sits between
+        // the run and `N`, and taking it would read a covered index as
+        // absent. Take-LAST among coverers is what the mid-train
+        // crash-window analysis needs too: where two runs transiently
+        // overlap (the shrink ordering), the later start is the newer
+        // truth.
+        let mut covering: Option<(u32, super::block_map::MapEntry)> = None;
+        let mut cursor: Vec<u8> = lo.to_vec();
+        loop {
+            let page = tree.range(&cursor, &hi, 512).await?;
+            let Some((last_key, _)) = page.last() else {
+                break;
+            };
+            let full = page.len() >= 512;
+            let next = key_successor(last_key);
+            for (k, v) in &page {
+                let (owner, idx) = super::block_map::decode_block_map_key(k)?;
+                if owner != ino {
+                    return Err(KvError::Corrupt(format!(
+                        "block-map floor probe for ino {ino} returned a record owned by \
+                         {owner}"
+                    )));
+                }
+                let entry = super::block_map::decode_block_map_value(v)?;
+                // Coverage: `idx + run_len > N` (`idx < N` by the range
+                // bound; point/string records never cover — run_len 1).
+                if u64::from(idx) + u64::from(entry.run_len()) > u64::from(block_index) {
+                    covering = Some((idx, entry));
+                }
+            }
+            if !full {
+                break;
+            }
+            cursor = next;
+        }
+        Ok(covering)
     }
 
     /// A bounded window of `ino`'s mappings from `from_index` upward, in
@@ -3008,6 +3083,28 @@ impl KvMetaBackend {
         }
     }
 
+    /// The §12 claims×runs dissolve's survivor record: index `start +
+    /// delta` of a dissolving run, materialized as the router-true key
+    /// STRING (the always-decodable PR-2 form; the next local publish
+    /// upgrades and re-coalesces it). An unresolvable arithmetic refuses
+    /// the train loud — dropping a peer's live binding is the mass-delete
+    /// class the claims law exists to prevent.
+    fn run_survivor_entry(
+        ino: Ino,
+        run: &super::block_map::MapEntry,
+        delta: u32,
+        entry_key: &(dyn Fn(&super::block_map::MapEntry, u32) -> Option<String> + Send + Sync),
+    ) -> Result<super::block_map::MapEntry> {
+        match entry_key(run, delta) {
+            Some(k) => Ok(super::block_map::MapEntry::String(k.into_bytes())),
+            None => Err(crate::error::SqueezefsError::InvalidOperation(format!(
+                "claims-scoped map train for ino {ino}: cannot materialize index +{delta} \
+                 of a dissolving run — no mounted volume resolves its arithmetic; refusing \
+                 rather than dropping a peer's live binding (design §12)"
+            ))),
+        }
+    }
+
     /// **The crossing/migration train** (PR 2, design §3 + Rev 1.1 #1):
     /// reconcile `ino`'s tree-7 records to exactly `entries` and flip the
     /// layout head — under ONE exclusive 4a I-guard held across the whole
@@ -3074,7 +3171,7 @@ impl KvMetaBackend {
         chunk: usize,
         claims: Option<&MapTrainClaims>,
         refs_owner: Ino,
-        entry_key: &(dyn Fn(&super::block_map::MapEntry) -> Option<String> + Send + Sync),
+        entry_key: &(dyn Fn(&super::block_map::MapEntry, u32) -> Option<String> + Send + Sync),
     ) -> Result<Option<MapMigrateOutcome>> {
         self.write_gate()?;
         if !self.block_map_tree_ready().await {
@@ -3184,19 +3281,58 @@ impl KvMetaBackend {
 
         // The diff scan (step 3). Desired bindings arrive in RECORD form
         // (PR 3, Rev 1.3 #3: the routed layer encodes POINT for
-        // undecorated keys, STRING for decorated/encoder-less arms), so
+        // undecorated keys, STRING for decorated/encoder-less arms;
+        // PR 6a: local trains arrive run-coalesced — design §12), so
         // the match is record equality: a PR-2 STRING record whose key
         // now encodes POINT reads as a changed binding and upgrades on
         // this publish — a one-time rewrite, never a steady-state churn.
+        //
+        // Ops are staged as GROUPS the chunk packer keeps tx-atomic where
+        // they fit (the A6 run-Put + point-Deletes one-tx coalesce law);
+        // a group past the chunk splits IN ORDER (Puts lead), which the
+        // exact-supersedes-covering-run read law keeps crash-safe: every
+        // pre-flip intermediate state resolves each index to its old or
+        // its new binding, never to absence (coverage-shrinking same-key
+        // Puts are ordered AFTER the records that re-cover their tail).
         let desired: std::collections::BTreeMap<u32, &super::block_map::MapEntry> =
             entries.iter().map(|(b, e)| (*b, e)).collect();
-        let mut ops: Vec<super::block_map::BlockMapOp> = Vec::new();
+        let mut groups: Vec<Vec<super::block_map::BlockMapOp>> = Vec::new();
         let mut preexisting = 0u64;
         let mut put_bytes = 0u64;
         // Claims mode: the displaced OLD records per staged transition —
-        // the f36b recompute's input.
-        let mut displaced: Vec<(u32, super::block_map::MapEntry)> = Vec::new();
+        // the f36b recompute's input. The third element is the index's
+        // DELTA into the displaced record (0 for point-class records; a
+        // run's per-index arithmetic — design §12).
+        let mut displaced: Vec<(u32, super::block_map::MapEntry, u32)> = Vec::new();
+        // Claims mode: the ADOPTED bindings — the refs-take side of the
+        // f36b recompute. Explicit (never derived from staged Puts): the
+        // §12 claims×runs law also stages binding-PRESERVING Puts when a
+        // release dissolves a run, and those must mint no reference.
+        let mut ref_takes: Vec<(u32, super::block_map::MapEntry)> = Vec::new();
+        let stage_put = |groups: &mut Vec<Vec<super::block_map::BlockMapOp>>,
+                         put_bytes: &mut u64,
+                         idx: u32,
+                         entry: super::block_map::MapEntry| {
+            *put_bytes += (super::block_map::BLOCK_MAP_KEY_LEN + entry.encoded_len()) as u64;
+            groups.push(vec![super::block_map::BlockMapOp::Put {
+                owner_ino: ino,
+                block_index: idx,
+                entry,
+            }]);
+        };
         if let Some(c) = claims {
+            // The §12 claims×runs law: a claims-scoped train never
+            // partial-adopts a run silently. Desired records are
+            // per-index BY CONSTRUCTION (the routed seam skips run
+            // emission on claims trains); a run here is a caller bug and
+            // refuses rather than guessing a span-adoption semantics.
+            if let Some((idx, _)) = entries.iter().find(|(_, e)| e.run_len() > 1) {
+                return Err(crate::error::SqueezefsError::InvalidOperation(format!(
+                    "claims-scoped map train for ino {ino} carries a RUN record at index \
+                     {idx} — claims trains are per-index only (design §12); refusing \
+                     rather than partial-adopting a span"
+                )));
+            }
             // The claims-scoped diff needs the current records at claimed
             // indices; the paged scan also feeds `preexisting` (the A1
             // resumed verdict — same cost class as the whole-map diff).
@@ -3219,6 +3355,41 @@ impl KvMetaBackend {
                 let Some(next) = next else { break };
                 cursor = next;
             }
+            // The covering run for an index with no exact record (the §2
+            // read law's resolve, over the scanned records). Backward
+            // over the RUN_LEN_MAX-bounded window for the last record
+            // that COVERS — never take-last plain: a superseding point
+            // between the run and the index (the read law's own legal
+            // shape) would otherwise hide the run.
+            let covering_run =
+                |current: &std::collections::BTreeMap<u32, super::block_map::MapEntry>,
+                 idx: u32|
+                 -> Option<(u32, super::block_map::MapEntry)> {
+                    let lo = idx.saturating_sub(super::block_map::RUN_LEN_MAX - 1);
+                    current
+                        .range(lo..=idx)
+                        .rev()
+                        .find(|(s, e)| {
+                            e.run_len() > 1
+                                && u64::from(**s) + u64::from(e.run_len()) > u64::from(idx)
+                        })
+                        .map(|(s, e)| (*s, e.clone()))
+                };
+            // Per existing run intersected by a claim that cannot ride a
+            // superseding point: the release set (absence has no point
+            // form) and any changed take at the run's OWN key (a same-key
+            // Put would replace the whole span). §12's conservative law:
+            // the run DISSOLVES to per-index records in this train; the
+            // next full local publish re-coalesces (the publish train is
+            // the canonicalizer).
+            #[derive(Default)]
+            struct RunClaims {
+                releases: std::collections::BTreeSet<u32>,
+                adopted: std::collections::BTreeMap<u32, super::block_map::MapEntry>,
+                start_adopt: Option<super::block_map::MapEntry>,
+            }
+            let mut run_claims: std::collections::BTreeMap<u32, RunClaims> =
+                std::collections::BTreeMap::new();
             for &idx in &c.take {
                 // A take with no shipped entry adopts nothing (a
                 // contradictory frame; the durable record stands).
@@ -3227,18 +3398,36 @@ impl KvMetaBackend {
                 };
                 match current.get(&idx) {
                     Some(existing) if existing == *want => {}
-                    old => {
-                        if let Some(old) = old {
-                            displaced.push((idx, old.clone()));
-                        }
-                        put_bytes +=
-                            (super::block_map::BLOCK_MAP_KEY_LEN + want.encoded_len()) as u64;
-                        ops.push(super::block_map::BlockMapOp::Put {
-                            owner_ino: ino,
-                            block_index: idx,
-                            entry: (*want).clone(),
-                        });
+                    Some(existing) if existing.run_len() > 1 => {
+                        // A changed take AT a run's key: same-key Puts
+                        // replace the record, so this is a split — the
+                        // run dissolves.
+                        run_claims.entry(idx).or_default().start_adopt = Some((*want).clone());
                     }
+                    Some(existing) => {
+                        displaced.push((idx, existing.clone(), 0));
+                        ref_takes.push((idx, (*want).clone()));
+                        stage_put(&mut groups, &mut put_bytes, idx, (*want).clone());
+                    }
+                    None => match covering_run(&current, idx) {
+                        Some((start, run))
+                            if entry_key(&run, idx - start).as_deref()
+                                != entry_key(want, 0).as_deref()
+                                || entry_key(want, 0).is_none() =>
+                        {
+                            // A changed take INSIDE a run rides the §2
+                            // read law verbatim: one superseding Put,
+                            // never a hot-path run split.
+                            displaced.push((idx, run, idx - start));
+                            ref_takes.push((idx, (*want).clone()));
+                            stage_put(&mut groups, &mut put_bytes, idx, (*want).clone());
+                        }
+                        Some(_) => {} // arithmetic-equal: the run already binds it
+                        None => {
+                            ref_takes.push((idx, (*want).clone()));
+                            stage_put(&mut groups, &mut put_bytes, idx, (*want).clone());
+                        }
+                    },
                 }
             }
             for &idx in &c.release {
@@ -3248,16 +3437,138 @@ impl KvMetaBackend {
                 if c.take.contains(&idx) || desired.contains_key(&idx) {
                     continue;
                 }
-                if let Some(old) = current.get(&idx) {
-                    displaced.push((idx, old.clone()));
-                    ops.push(super::block_map::BlockMapOp::Delete {
-                        owner_ino: ino,
-                        block_index: idx,
-                    });
+                match current.get(&idx) {
+                    Some(old) if old.run_len() > 1 => {
+                        // Release at a run's own key: the span splits.
+                        run_claims.entry(idx).or_default().releases.insert(idx);
+                    }
+                    Some(old) => {
+                        displaced.push((idx, old.clone(), 0));
+                        groups.push(vec![super::block_map::BlockMapOp::Delete {
+                            owner_ino: ino,
+                            block_index: idx,
+                        }]);
+                    }
+                    None => {
+                        if let Some((start, _)) = covering_run(&current, idx) {
+                            run_claims.entry(start).or_default().releases.insert(idx);
+                        }
+                    }
                 }
             }
+            // Fold the superseding adopt Puts already staged into the
+            // dissolve bookkeeping: a dissolved run must not re-materialize
+            // a survivor under an index the adoption just re-bound.
+            for (idx, want) in &ref_takes {
+                if let Some((start, _)) = covering_run(&current, *idx) {
+                    if let Some(rc) = run_claims.get_mut(&start) {
+                        rc.adopted.insert(*idx, want.clone());
+                    }
+                }
+            }
+            // The dissolves, one GROUP per run: survivor/adopted records
+            // for every still-bound index (survivors verbatim as STRING
+            // — router-true key strings, the always-decodable PR-2 form;
+            // the next local publish upgrades and re-coalesces), the
+            // run's OWN key staged LAST (the coverage-shrink order law).
+            for (start, rc) in run_claims {
+                let Some(run) = current.get(&start).cloned() else {
+                    continue;
+                };
+                let len = run.run_len();
+                let mut group: Vec<super::block_map::BlockMapOp> = Vec::new();
+                let mut start_op: Option<super::block_map::BlockMapOp> = None;
+                for delta in 0..len {
+                    let idx = start + delta;
+                    if rc.releases.contains(&idx) {
+                        displaced.push((idx, run.clone(), delta));
+                        if idx == start {
+                            start_op = Some(super::block_map::BlockMapOp::Delete {
+                                owner_ino: ino,
+                                block_index: idx,
+                            });
+                        }
+                        continue;
+                    }
+                    // An EXACT record at this index (a prior superseding
+                    // point — the §2 shadow shape) already IS the truth
+                    // there: the run never bound it, so the dissolve must
+                    // not clobber it with the run's stale arithmetic.
+                    if idx != start && current.contains_key(&idx) {
+                        continue;
+                    }
+                    let entry = if idx == start {
+                        match &rc.start_adopt {
+                            Some(want) => {
+                                displaced.push((idx, run.clone(), 0));
+                                ref_takes.push((idx, want.clone()));
+                                want.clone()
+                            }
+                            None => Self::run_survivor_entry(ino, &run, delta, entry_key)?,
+                        }
+                    } else if let Some(want) = rc.adopted.get(&idx) {
+                        // The adoption Put is already staged as its own
+                        // superseding group; the dissolve replaces the
+                        // run record, so the point stands on its own.
+                        want.clone()
+                    } else {
+                        Self::run_survivor_entry(ino, &run, delta, entry_key)?
+                    };
+                    let op = super::block_map::BlockMapOp::Put {
+                        owner_ino: ino,
+                        block_index: idx,
+                        entry,
+                    };
+                    if idx == start {
+                        put_bytes += (super::block_map::BLOCK_MAP_KEY_LEN
+                            + match &op {
+                                super::block_map::BlockMapOp::Put { entry, .. } => {
+                                    entry.encoded_len()
+                                }
+                                _ => 0,
+                            }) as u64;
+                        start_op = Some(op);
+                    } else if !rc.adopted.contains_key(&idx) {
+                        put_bytes += (super::block_map::BLOCK_MAP_KEY_LEN
+                            + match &op {
+                                super::block_map::BlockMapOp::Put { entry, .. } => {
+                                    entry.encoded_len()
+                                }
+                                _ => 0,
+                            }) as u64;
+                        group.push(op);
+                    }
+                }
+                if let Some(op) = start_op {
+                    group.push(op);
+                }
+                groups.push(group);
+            }
         } else {
+            // Desired runs, for the covered-point coalesce (sorted by
+            // construction: `entries` arrive index-ascending).
+            let desired_runs: Vec<(u32, u32)> = entries
+                .iter()
+                .filter(|(_, e)| e.run_len() > 1)
+                .map(|(b, e)| (*b, e.run_len()))
+                .collect();
+            let covered_by_desired_run = |idx: u32| -> Option<u32> {
+                let i = desired_runs.partition_point(|&(s, _)| s <= idx);
+                let (s, l) = *desired_runs.get(i.checked_sub(1)?)?;
+                (u64::from(s) + u64::from(l) > u64::from(idx)).then_some(s)
+            };
             let mut matched: std::collections::BTreeSet<u32> = std::collections::BTreeSet::new();
+            // Existing point-class records covered by a desired run: their
+            // Deletes ride the covering run-Put's GROUP (the A6 law).
+            let mut run_deletes: std::collections::BTreeMap<
+                u32,
+                Vec<super::block_map::BlockMapOp>,
+            > = std::collections::BTreeMap::new();
+            // Same-key replacements whose coverage SHRINKS: ordered after
+            // every other Put (their displaced tail is re-covered first).
+            let mut shrink_keys: std::collections::BTreeSet<u32> =
+                std::collections::BTreeSet::new();
+            let mut stale_deletes: Vec<super::block_map::BlockMapOp> = Vec::new();
             let mut cursor = 0u32;
             loop {
                 let page = self
@@ -3275,30 +3586,70 @@ impl KvMetaBackend {
                             matched.insert(idx);
                         }
                         // Changed binding: the desired-walk below stages the
-                        // superseding Put (same key — no Delete).
-                        Some(_) => {}
-                        None => ops.push(super::block_map::BlockMapOp::Delete {
-                            owner_ino: ino,
-                            block_index: idx,
-                        }),
+                        // superseding Put (same key — no Delete). A
+                        // replacement that covers LESS than the record it
+                        // supersedes is deferred behind the Puts that
+                        // re-cover its tail.
+                        Some(want) => {
+                            if u64::from(idx) + u64::from(want.run_len())
+                                < u64::from(idx) + u64::from(existing.run_len())
+                            {
+                                shrink_keys.insert(idx);
+                            }
+                        }
+                        None => {
+                            let del = super::block_map::BlockMapOp::Delete {
+                                owner_ino: ino,
+                                block_index: idx,
+                            };
+                            match covered_by_desired_run(idx) {
+                                Some(run_start) if existing.run_len() == 1 => {
+                                    run_deletes.entry(run_start).or_default().push(del);
+                                }
+                                // Stale (or a whole superseded run):
+                                // deleted AFTER every Put — desired
+                                // coverage lands first.
+                                _ => stale_deletes.push(del),
+                            }
+                        }
                     }
                 }
                 let Some(next) = next else { break };
                 cursor = next;
             }
+            let mut shrink_groups: Vec<Vec<super::block_map::BlockMapOp>> = Vec::new();
             for (idx, entry) in entries {
                 if matched.contains(idx) {
                     continue;
                 }
                 put_bytes += (super::block_map::BLOCK_MAP_KEY_LEN + entry.encoded_len()) as u64;
-                ops.push(super::block_map::BlockMapOp::Put {
+                let mut group = vec![super::block_map::BlockMapOp::Put {
                     owner_ino: ino,
                     block_index: *idx,
                     entry: entry.clone(),
-                });
+                }];
+                if entry.run_len() > 1 {
+                    group.append(&mut run_deletes.remove(idx).unwrap_or_default());
+                }
+                if shrink_keys.contains(idx) {
+                    shrink_groups.push(group);
+                } else {
+                    groups.push(group);
+                }
+            }
+            // Covered points under a run that MATCHED verbatim: coverage
+            // is already durable, the shadow deletes stand alone.
+            for (_, dels) in run_deletes {
+                if !dels.is_empty() {
+                    groups.push(dels);
+                }
+            }
+            groups.append(&mut shrink_groups);
+            if !stale_deletes.is_empty() {
+                groups.push(stale_deletes);
             }
         }
-        let records = ops.len() as u64;
+        let records: u64 = groups.iter().map(|g| g.len() as u64).sum();
 
         // The f36b recompute (claims mode, resolver armed): the staged
         // accounting is the tree→composed swap diff — the shipper's frame
@@ -3316,36 +3667,37 @@ impl KvMetaBackend {
                 Some(resolver) => {
                     recomputed = true;
                     let mut out: Vec<super::block_refs::BlockRefOp> = Vec::new();
-                    let mut resolve = |entry: &super::block_map::MapEntry, idx: u32, take: bool| {
-                        let Some(key) = entry_key(entry) else {
-                            super::META_KV_BLOCK_REFS_UNRESOLVED.fetch_add(1, Ordering::Relaxed);
-                            return;
-                        };
-                        match resolver(&key, refs_owner, idx) {
-                            Some(r) => {
-                                if take {
-                                    out.push(super::block_refs::BlockRefOp::taken(r));
-                                } else {
-                                    out.push(super::block_refs::BlockRefOp::released(r));
-                                    released.push(r);
-                                }
-                            }
-                            None => {
+                    let mut resolve =
+                        |entry: &super::block_map::MapEntry, idx: u32, delta: u32, take: bool| {
+                            let Some(key) = entry_key(entry, delta) else {
                                 super::META_KV_BLOCK_REFS_UNRESOLVED
                                     .fetch_add(1, Ordering::Relaxed);
+                                return;
+                            };
+                            match resolver(&key, refs_owner, idx) {
+                                Some(r) => {
+                                    if take {
+                                        out.push(super::block_refs::BlockRefOp::taken(r));
+                                    } else {
+                                        out.push(super::block_refs::BlockRefOp::released(r));
+                                        released.push(r);
+                                    }
+                                }
+                                None => {
+                                    super::META_KV_BLOCK_REFS_UNRESOLVED
+                                        .fetch_add(1, Ordering::Relaxed);
+                                }
                             }
-                        }
-                    };
-                    for (idx, old) in &displaced {
-                        resolve(old, *idx, false);
+                        };
+                    for (idx, old, delta) in &displaced {
+                        resolve(old, *idx, *delta, false);
                     }
-                    for op in &ops {
-                        if let super::block_map::BlockMapOp::Put {
-                            block_index, entry, ..
-                        } = op
-                        {
-                            resolve(entry, *block_index, true);
-                        }
+                    // Takes are the EXPLICIT adoption ledger — never the
+                    // staged Puts, which since §12 also carry
+                    // binding-preserving dissolve survivors that must
+                    // mint no reference.
+                    for (idx, entry) in &ref_takes {
+                        resolve(entry, *idx, 0, true);
                     }
                     out.extend(
                         block_refs
@@ -3379,15 +3731,28 @@ impl KvMetaBackend {
             }
         }
 
-        // Steps 4–5: chunked commits, tail rides the flip.
-        let mut tail = ops;
-        while tail.len() > chunk {
-            let rest = tail.split_off(chunk);
-            let chunk_ops = std::mem::replace(&mut tail, rest);
-            let mut tx = KvTx::new();
-            tx.stage_block_map(&chunk_ops)?;
-            tx.hold_guards(Arc::clone(&guards));
-            self.commit_tx(tx).await?;
+        // Steps 4–5: chunked commits, tail rides the flip. Groups pack
+        // whole into a tx where they fit (the A6 one-tx coalesce law); a
+        // group past the chunk splits in its own order, which the read
+        // law keeps crash-safe (Puts lead their Deletes).
+        let mut tail: Vec<super::block_map::BlockMapOp> = Vec::new();
+        for group in groups {
+            if !tail.is_empty() && tail.len() + group.len() > chunk {
+                let chunk_ops = std::mem::take(&mut tail);
+                let mut tx = KvTx::new();
+                tx.stage_block_map(&chunk_ops)?;
+                tx.hold_guards(Arc::clone(&guards));
+                self.commit_tx(tx).await?;
+            }
+            tail.extend(group);
+            while tail.len() > chunk {
+                let rest = tail.split_off(chunk);
+                let chunk_ops = std::mem::replace(&mut tail, rest);
+                let mut tx = KvTx::new();
+                tx.stage_block_map(&chunk_ops)?;
+                tx.hold_guards(Arc::clone(&guards));
+                self.commit_tx(tx).await?;
+            }
         }
         self.set_layout_and_size_with_map_holding(ino, layout, size, &refs_tail, &tail, guards)
             .await?;
@@ -5946,6 +6311,21 @@ impl KvTx {
         }
         if puts > 0 {
             super::META_KV_BLOCK_MAP_PUTS.fetch_add(puts, std::sync::atomic::Ordering::Relaxed);
+        }
+        // PR 6a: the run-emission engagement gauge counts staged RUN/RUN2
+        // Puts apart (design §5 `block_map_tree_run_puts`).
+        let run_puts = ops
+            .iter()
+            .filter(|op| {
+                matches!(
+                    op,
+                    super::block_map::BlockMapOp::Put { entry, .. } if entry.run_len() > 1
+                )
+            })
+            .count() as u64;
+        if run_puts > 0 {
+            super::META_KV_BLOCK_MAP_RUN_PUTS
+                .fetch_add(run_puts, std::sync::atomic::Ordering::Relaxed);
         }
         if deletes > 0 {
             super::META_KV_BLOCK_MAP_DELETES

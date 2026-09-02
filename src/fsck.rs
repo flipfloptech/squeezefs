@@ -572,6 +572,18 @@ pub enum FindingId {
     /// the fully-empty coverage-mismatch case (the size-vs-sparse
     /// ambiguity keeps partial coverage undetectable). REPORT-ONLY.
     C11EmptyKvmapHead { vol: usize, ino: u64 },
+    /// C11 (PR 6a, design §12): run-vs-point coverage sanity — a point
+    /// record on a DIFFERENT volume strictly inside a covering run's
+    /// span. Same-volume points inside a run are legal by the §2 read
+    /// law (the arithmetic-equal shadow and the overwrite class alike);
+    /// a cross-volume override is rare enough to warrant eyes.
+    /// REPORT-ONLY.
+    C11RunForeignShadow {
+        vol: usize,
+        ino: u64,
+        run_start: u32,
+        idx: u32,
+    },
 }
 
 /// The §10 `fsck_*` / `scrub_*` counter families, per run (the process
@@ -672,6 +684,10 @@ pub struct FsckCounters {
     /// C11: verified fully-empty `kvmap:` heads (nonzero size, zero tree
     /// records). 0 on healthy volumes.
     pub map_empty_heads: u64,
+    /// C11 (PR 6a): verified cross-volume point records strictly inside
+    /// a covering run's span (design §12's run-vs-point sanity arm).
+    /// Same-volume shadows are legal (the §2 read law) and never counted.
+    pub map_run_foreign_shadows: u64,
     /// C11's zero-FP registry shield engagement (design A3): verdicts
     /// withheld because the ino's crossing train is registered in flight
     /// — the map plane's `inflight_exempted`. Growth under live crossings
@@ -1281,6 +1297,14 @@ enum SuspectKind {
         local_ino: u64,
         size: u64,
     },
+    /// C11 (c) — PR 6a: a point record on a DIFFERENT volume strictly
+    /// inside a covering run's span (design §12).
+    C11RunForeignShadow {
+        vol: usize,
+        local_ino: u64,
+        run_start: u32,
+        idx: u32,
+    },
 }
 
 struct Suspect {
@@ -1518,6 +1542,9 @@ pub async fn run(ctx: &FsckCtx, opts: &FsckOptions) -> Result<FsckReport> {
             // sees a residue subset, and the orphan skip-scan is one
             // whole-tree question), report-only, verify-before-report.
             evaluate_c11_orphans(ctx, &mut counters, &mut suspects).await;
+            // C11 (c) — PR 6a (design §12): run-vs-point coverage sanity,
+            // the same unsharded posture.
+            evaluate_c11_run_coverage(ctx, &mut counters, &mut suspects).await;
             evaluate_c11_empty_heads(&census, &mut counters, &mut suspects, &ctx.meta);
         }
 
@@ -1731,6 +1758,7 @@ pub fn merge_reports(reports: &[FsckReport]) -> FsckReport {
         counters.foreign_lane_exempted += r.counters.foreign_lane_exempted;
         counters.map_orphan_records += r.counters.map_orphan_records;
         counters.map_empty_heads += r.counters.map_empty_heads;
+        counters.map_run_foreign_shadows += r.counters.map_run_foreign_shadows;
         counters.crossing_exempted += r.counters.crossing_exempted;
         counters.scrub_blocks_scanned += r.counters.scrub_blocks_scanned;
         counters.scrub_bytes_scanned += r.counters.scrub_bytes_scanned;
@@ -1804,6 +1832,7 @@ fn fold_finalize_counters(dst: &mut FsckCounters, fin: &FsckCounters) {
     // shard reports carry zeros — no double count).
     dst.map_orphan_records += fin.map_orphan_records;
     dst.map_empty_heads += fin.map_empty_heads;
+    dst.map_run_foreign_shadows += fin.map_run_foreign_shadows;
     dst.crossing_exempted += fin.crossing_exempted;
     // **The inode plane's counters are the union of the ADMITTED shards
     // and this finalize** (KD-PV-16, §5.8.2 F4 — the premise that the
@@ -2274,6 +2303,9 @@ pub async fn run_fleet(
         // coordinator's own unsharded run. The (b) arm follows the
         // finalize's own real census (`ip_census`) below.
         evaluate_c11_orphans(ctx, &mut fin_counters, &mut fin_suspects).await;
+        // C11 (c) — PR 6a (design §12): run-vs-point coverage sanity,
+        // finalize-only like (a) (the same owner skip-scan feeds it).
+        evaluate_c11_run_coverage(ctx, &mut fin_counters, &mut fin_suspects).await;
 
         // ---- The INODE PLANE, judged from ONE view PER OWNER (the
         // 2026-08-17 tarx C10 conviction, restated by KD-PV-16;
@@ -3649,6 +3681,99 @@ async fn evaluate_c11_orphans(
     }
 }
 
+/// One owner's C11 (c) evidence scan (PR 6a, design §12): point records
+/// on a DIFFERENT volume strictly inside a covering run's span, as
+/// `(run_start, idx)` pairs. Same-volume points inside a run are LEGAL
+/// by the §2 read law (the arithmetic-equal shadow and the overwrite
+/// class alike — and without the router's stride census this walker
+/// cannot tell them apart, which is fine: the report arm needs only the
+/// volume tags). STRING records carry no tag and record no verdict.
+/// Record order is key order, so a covering run always precedes the
+/// points inside its span.
+async fn kvmap_run_foreign_shadows(
+    kv: &crate::meta_backend::kv::backend::KvMetaBackend,
+    local_ino: u64,
+) -> Vec<(u32, u32)> {
+    use crate::meta_backend::kv::block_map::MapEntry;
+    let mut out = Vec::new();
+    // The open covering run: (start, end_exclusive, vol_tag).
+    let mut open_run: Option<(u32, u64, u64)> = None;
+    let mut cursor = 0u32;
+    loop {
+        let page = match kv.block_map_range(local_ino, cursor, SCAN_PAGE).await {
+            Ok(p) => p,
+            Err(_) => break, // unreadable: C1's business, no verdict
+        };
+        let Some(last) = page.last().map(|(i, _)| *i) else {
+            break;
+        };
+        for (idx, entry) in page {
+            match entry {
+                MapEntry::Run { vol_tag, len, .. } | MapEntry::RunStamped { vol_tag, len, .. } => {
+                    open_run = Some((idx, u64::from(idx) + u64::from(len), vol_tag));
+                }
+                MapEntry::Point { vol_tag, .. } | MapEntry::PointStamped { vol_tag, .. } => {
+                    if let Some((start, end, run_tag)) = open_run {
+                        if u64::from(idx) > u64::from(start)
+                            && u64::from(idx) < end
+                            && vol_tag != run_tag
+                        {
+                            out.push((start, idx));
+                        }
+                    }
+                }
+                MapEntry::String(_) => {}
+            }
+        }
+        let Some(next) = last.checked_add(1) else {
+            break;
+        };
+        cursor = next;
+    }
+    out
+}
+
+/// C11 (c) nomination — the PR 6a run-vs-point coverage sanity arm
+/// (design §12): rides the same owner skip-scan as (a), with the same A3
+/// registry shield.
+async fn evaluate_c11_run_coverage(
+    ctx: &FsckCtx,
+    counters: &mut FsckCounters,
+    suspects: &mut Vec<Suspect>,
+) {
+    for (vol_idx, kv) in ctx.meta.volumes.iter().enumerate() {
+        if !kv.block_map_tree_engaged() {
+            continue;
+        }
+        let owners = match kv.block_map_owner_scan().await {
+            Ok(o) => o,
+            Err(e) => {
+                log::warn!(
+                    "fsck C11 (c): tree-7 owner scan failed on vol {vol_idx}: {e} — the map \
+                     plane records no verdict for this volume (never guessed)"
+                );
+                continue;
+            }
+        };
+        for local_ino in owners {
+            if kv.crossing_in_flight(local_ino) {
+                counters.crossing_exempted += 1;
+                continue;
+            }
+            for (run_start, idx) in kvmap_run_foreign_shadows(kv, local_ino).await {
+                suspects.push(Suspect {
+                    kind: SuspectKind::C11RunForeignShadow {
+                        vol: vol_idx,
+                        local_ino,
+                        run_start,
+                        idx,
+                    },
+                });
+            }
+        }
+    }
+}
+
 /// C11 (b) nomination — head/tree coverage mismatch, the FULLY-EMPTY
 /// case only (a `kvmap:1` head with nonzero size and ZERO tree records;
 /// the size-vs-sparse ambiguity makes any partial-coverage verdict
@@ -4769,6 +4894,62 @@ async fn recheck_suspects(
                     }),
                 })
             }
+            SuspectKind::C11RunForeignShadow {
+                vol,
+                local_ino,
+                run_start,
+                idx,
+            } => {
+                // The (a)/(b) shield ladder verbatim: registry, lease,
+                // registry again, then a FRESH evidence re-scan — a
+                // publish between passes legitimately re-canonicalizes
+                // the span (the publish train is the coalescer), which
+                // clears the suspect.
+                let Some(kv) = ctx.meta.volumes.get(*vol) else {
+                    continue;
+                };
+                if kv.crossing_in_flight(*local_ino) {
+                    counters.crossing_exempted += 1;
+                    counters.suspects_cleared += 1;
+                    continue;
+                }
+                let _lease = if online {
+                    Some(kv.dlm().lock_inode_exclusive(*local_ino).await)
+                } else {
+                    None
+                };
+                if kv.crossing_in_flight(*local_ino) {
+                    counters.crossing_exempted += 1;
+                    counters.suspects_cleared += 1;
+                    continue;
+                }
+                if !kvmap_run_foreign_shadows(kv, *local_ino)
+                    .await
+                    .contains(&(*run_start, *idx))
+                {
+                    counters.suspects_cleared += 1;
+                    continue;
+                }
+                counters.map_run_foreign_shadows += 1;
+                Some(FsckFinding {
+                    class: "C11".to_string(),
+                    object: format!("vol{vol} ino {local_ino}"),
+                    evidence: format!(
+                        "cross-volume point record at index {idx} strictly inside the run \
+                         at [{run_start}, …): the point supersedes by the §2 read law (a \
+                         legal shape same-volume), but a DIFFERENT-volume override inside \
+                         a straight run is design §12's report-only sanity signal — a \
+                         mover/claims train left an unusual span. REPORT-ONLY: the point \
+                         is presumed the truth; the next full publish re-canonicalizes"
+                    ),
+                    identity: Some(FindingId::C11RunForeignShadow {
+                        vol: *vol,
+                        ino: *local_ino,
+                        run_start: *run_start,
+                        idx: *idx,
+                    }),
+                })
+            }
             SuspectKind::C5Generation { dir, why } => {
                 // Re-read the marker (a live restamp clears).
                 let expected = ctx.expected_generation.as_deref().unwrap_or("");
@@ -5199,6 +5380,8 @@ fn publish_metrics(c: &FsckCounters) {
         .fetch_add(c.map_orphan_records, Ordering::Relaxed);
     m.fsck_map_empty_heads
         .fetch_add(c.map_empty_heads, Ordering::Relaxed);
+    m.fsck_map_run_foreign_shadows
+        .fetch_add(c.map_run_foreign_shadows, Ordering::Relaxed);
     m.fsck_crossing_exempted
         .fetch_add(c.crossing_exempted, Ordering::Relaxed);
     m.fsck_findings.fetch_add(c.findings, Ordering::Relaxed);
@@ -5627,6 +5810,19 @@ fn planned_action(id: &FindingId) -> (&'static str, String) {
                  fabricate data; the operator adjudicates"
             ),
         ),
+        FindingId::C11RunForeignShadow {
+            vol,
+            ino,
+            run_start,
+            idx,
+        } => (
+            "report-only",
+            format!(
+                "cross-volume point at index {idx} inside the run at [{run_start}, …) on \
+                 vol{vol} ino {ino}: REPORT-ONLY (design §12) — the point supersedes by \
+                 the §2 read law and the next full publish re-canonicalizes"
+            ),
+        ),
     }
 }
 
@@ -6025,6 +6221,24 @@ pub async fn repair(
                          never auto-repaired — REPORT-ONLY (design A3): restating the \
                          map would fabricate data where redundancy does not exist; the \
                          operator adjudicates"
+                    ),
+                );
+                continue;
+            }
+            FindingId::C11RunForeignShadow {
+                vol,
+                ino,
+                run_start,
+                idx,
+            } => {
+                refuse(
+                    &mut out,
+                    f,
+                    format!(
+                        "the cross-volume point at index {idx} inside the run at \
+                         [{run_start}, …) on vol{vol} ino {ino} is REPORTED, never \
+                         auto-repaired — REPORT-ONLY (design §12): the point supersedes \
+                         by the read law and the next full publish re-canonicalizes"
                     ),
                 );
                 continue;

@@ -458,6 +458,37 @@ fn kvmap_head_prefix() -> &'static str {
     crate::meta_backend::kv::block_map::KVMAP_HEAD_PREFIX
 }
 
+/// PR 6a (design §12 option b): the write-map cap — the share of the R5
+/// memory budget this mount will hold as whole-map WRITE authority for
+/// kvmap inos (Rev 1.3 #2: a write-active kvmap ino's RAM map is O(file)
+/// until 6c's dirty-index overlay lands). Derived as `budget/16` — the
+/// node-cache default's divisor (`SQUEEZEFS_META_NODE_CACHE_*`, the
+/// existing derived-cap precedent) — with NO floor and NO knob: a floor
+/// would ADMIT a map the budget cannot actually hold, and the smallest
+/// real budgets still admit multi-TiB file classes (a 2 TiB map ≈ 33 MB
+/// at this estimate).
+pub fn kvmap_write_map_budget_bytes() -> u64 {
+    // The sampler's stored budget when it has ticked (every real mount,
+    // 1 Hz); the same resolution ladder computed on demand before the
+    // first tick (harness-built routers — a 0 budget would refuse every
+    // kvmap write).
+    let b = crate::mem_budget::MEM_BUDGET.budget_bytes();
+    let b = if b == 0 {
+        crate::mem_budget::MEM_BUDGET.resolve_budget_now()
+    } else {
+        b
+    };
+    b / 16
+}
+
+/// The per-entry RAM estimate behind the `kvmap_write_map_bytes` gauge:
+/// one `HashMap<u32, String>` slot + `String` header + a router-true key
+/// body (bare/stamped offset forms). An ESTIMATE by design — the gauge
+/// prices boundedness, not allocation truth — and O(1) per merge (an
+/// exact Σ over key bytes would re-add the O(map) per-publish pass the
+/// §12 hoist just removed from this path).
+pub const KVMAP_WRITE_MAP_ENTRY_EST: u64 = 64;
+
 /// PR 3 (A9): the fetch bracket's retry bound. The reader poll cadence is
 /// ≥ 1 s (`resolve_revalidate_interval_ms` floors at the checkpoint
 /// ceiling), so a legitimate fetch can lose at most one step per second —
@@ -2324,8 +2355,11 @@ impl BackendRouter {
     /// allowed — the fix would then be to hoist the gate to the publish
     /// batch, never to drop the lifetime.
     pub fn persist_block_key(&self, be_id: &str, offset: u64) -> String {
-        // The shipped path (ruling D9: nothing stamps bit 13) — one relaxed
-        // load, then the pre-item-6 function verbatim.
+        // The disengaged path (`--single-writer`/pre-flip volumes) — one
+        // relaxed load, then the pre-item-6 function verbatim. Since the
+        // rung-10b flip the DEFAULT format carries bit 13, so a plain
+        // write mount takes the stamped arm below (PR 6a's item-1
+        // verdict, design-kvmap-block-map-tree §12a).
         if self
             .incarnation_era
             .load(std::sync::atomic::Ordering::Relaxed)
@@ -2452,9 +2486,11 @@ impl BackendRouter {
     /// 7) and `part` its appender lane. Refuses loud on an era outside the
     /// term budget — a bad era composes stamps that alias a real one.
     ///
-    /// Nothing calls this in production today: `DataRouter::set_meta_backend`
-    /// engages only when EVERY mounted meta volume carries incompat bit 13,
-    /// and nothing stamps bit 13 (ruling D9).
+    /// `DataRouter::set_meta_backend` engages this whenever EVERY mounted
+    /// meta volume carries incompat bit 13 with a live writer term —
+    /// which, since the rung-10b Phase-B flip stamped bit 13 into the
+    /// DEFAULT format, is every plain write mount (PR 6a's item-1
+    /// verdict; the pre-flip "nothing stamps bit 13" note was stale).
     pub fn engage_incarnation_keys(
         &self,
         era: u64,
@@ -2707,28 +2743,113 @@ impl BackendRouter {
         &self,
         entry: &crate::meta_backend::kv::block_map::MapEntry,
     ) -> Option<String> {
+        self.map_entry_block_key_at(entry, 0)
+    }
+
+    /// [`Self::map_entry_block_key`] at a per-index DELTA into the record
+    /// (PR 6a, design §12): a RUN/RUN2 record's covered index `start +
+    /// delta` resolves as `start_offset + delta × stride` (stride = the
+    /// owning volume's block size, this router's census) — and, for
+    /// RUN2, incarnation `start_incarnation + delta`. Point-class records
+    /// accept delta 0 only. The RECORDED stamp is what decodes — never
+    /// the offset's live one (re-attaching the current stamp would let a
+    /// freed-and-reissued offset pass the staleness refusal, Rev 1.4 #1)
+    /// — which is also why the point arm rides
+    /// [`Self::persist_block_key_body`], not the live-stamp-attaching
+    /// [`Self::persist_block_key`]: a POINT record encoded a BARE key by
+    /// the eligibility law, and its decode must reproduce it verbatim.
+    pub(crate) fn map_entry_block_key_at(
+        &self,
+        entry: &crate::meta_backend::kv::block_map::MapEntry,
+        delta: u32,
+    ) -> Option<String> {
         use crate::meta_backend::kv::block_map::MapEntry;
+        if delta > 0 && u64::from(delta) >= u64::from(entry.run_len()) {
+            return None;
+        }
         match entry {
             MapEntry::String(bytes) => std::str::from_utf8(bytes).ok().map(str::to_string),
             MapEntry::Point { vol_tag, offset } => {
-                if crate::meta_backend::kv::block_refs::volume_tag(
-                    self.default_allocator.volume_id(),
-                ) == *vol_tag
-                {
-                    // The default slot's canonical bare-offset form.
-                    return Some(self.persist_block_key("backend_0", *offset));
-                }
-                for be in self.backends.iter() {
-                    if crate::meta_backend::kv::block_refs::volume_tag(
-                        be.value().block_allocator.volume_id(),
-                    ) == *vol_tag
-                    {
-                        return Some(self.persist_block_key(be.key(), *offset));
-                    }
-                }
-                None
+                let be_id = self.be_id_for_tag(*vol_tag)?;
+                Some(self.persist_block_key_body(&be_id, *offset))
+            }
+            MapEntry::PointStamped {
+                vol_tag,
+                offset,
+                incarnation,
+            } => {
+                let be_id = self.be_id_for_tag(*vol_tag)?;
+                Some(block_key_with_incarnation(
+                    &self.persist_block_key_body(&be_id, *offset),
+                    *incarnation,
+                ))
+            }
+            MapEntry::Run {
+                vol_tag,
+                start_offset,
+                ..
+            } => {
+                let be_id = self.be_id_for_tag(*vol_tag)?;
+                let stride = self.run_stride_for_tag(*vol_tag)?;
+                let offset = start_offset.checked_add(stride.checked_mul(u64::from(delta))?)?;
+                Some(self.persist_block_key_body(&be_id, offset))
+            }
+            MapEntry::RunStamped {
+                vol_tag,
+                start_offset,
+                start_incarnation,
+                ..
+            } => {
+                let be_id = self.be_id_for_tag(*vol_tag)?;
+                let stride = self.run_stride_for_tag(*vol_tag)?;
+                let offset = start_offset.checked_add(stride.checked_mul(u64::from(delta))?)?;
+                let inc = start_incarnation.checked_add(u64::from(delta))?;
+                Some(block_key_with_incarnation(
+                    &self.persist_block_key_body(&be_id, offset),
+                    inc,
+                ))
             }
         }
+    }
+
+    /// The backend id whose data volume carries `vol_tag` (KD-5 census):
+    /// the default slot answers its canonical `backend_0` alias — the
+    /// same naming law `persist_block_key` writes.
+    fn be_id_for_tag(&self, vol_tag: u64) -> Option<String> {
+        if crate::meta_backend::kv::block_refs::volume_tag(self.default_allocator.volume_id())
+            == vol_tag
+        {
+            return Some("backend_0".to_string());
+        }
+        for be in self.backends.iter() {
+            if crate::meta_backend::kv::block_refs::volume_tag(
+                be.value().block_allocator.volume_id(),
+            ) == vol_tag
+            {
+                return Some(be.key().clone());
+            }
+        }
+        None
+    }
+
+    /// PR 6a (design §12): the RUN arithmetic's stride for `vol_tag`'s
+    /// volume — its block (chunk) size in bytes. `None` for an unknown
+    /// tag: emission never coalesces it and expansion refuses loud.
+    pub(crate) fn run_stride_for_tag(&self, vol_tag: u64) -> Option<u64> {
+        if crate::meta_backend::kv::block_refs::volume_tag(self.default_allocator.volume_id())
+            == vol_tag
+        {
+            return Some(self.default_allocator.chunk_size());
+        }
+        for be in self.backends.iter() {
+            if crate::meta_backend::kv::block_refs::volume_tag(
+                be.value().block_allocator.volume_id(),
+            ) == vol_tag
+            {
+                return Some(be.value().block_allocator.chunk_size());
+            }
+        }
+        None
     }
 
     /// PR 3 (kvmap, Rev 1.3 #3): the ENCODE direction of
@@ -2740,18 +2861,18 @@ impl BackendRouter {
     /// foreign/unregistered volume names — rides STRING verbatim.
     ///
     /// The eligibility law is the ROUND TRIP itself, never a second
-    /// grammar: a key is POINT-eligible iff decoding the candidate
+    /// grammar: a key is POINT/POINT2-eligible iff decoding the candidate
     /// through `map_entry_block_key` reproduces the IDENTICAL string, so
     /// the encoder is correct-by-construction against every current and
     /// future decoration (a parser wider than its decoder would resolve
     /// blocks to wrong device bytes — the failure the tree exists to
-    /// prevent). One exclusion sits ABOVE the round trip: a key carrying
-    /// an incarnation stamp (spec §6.2 item 6) never emits POINT even
-    /// when the stamp happens to equal the offset's live one — the
-    /// 18-byte form cannot carry the lifetime, and a decode that
-    /// re-attaches the CURRENT stamp would let a record naming a
-    /// freed-and-reissued offset pass the staleness refusal the stamp
-    /// exists to fire.
+    /// prevent). Since PR 6a (design §12) a key carrying an incarnation
+    /// stamp (spec §6.2 item 6 — engaged by the default format's bit 13,
+    /// Rev 1.4 #1) emits the 26-byte **POINT2**, which carries the stamp
+    /// VERBATIM: the stamp is part of the round-tripped identity, decoded
+    /// back exactly as recorded and never re-attached from the live map
+    /// (a re-attach would let a record naming a freed-and-reissued offset
+    /// pass the staleness refusal the stamp exists to fire).
     pub(crate) fn block_key_map_entry(
         &self,
         key: &str,
@@ -2767,12 +2888,18 @@ impl BackendRouter {
                     crate::meta_backend::kv::block_refs::volume_tag(be.block_allocator.volume_id())
                 })
             };
-            if incarnation == INCARNATION_NONE {
-                if let Some(vol_tag) = vol_tag {
-                    let point = MapEntry::Point { vol_tag, offset };
-                    if self.map_entry_block_key(&point).as_deref() == Some(key) {
-                        return point;
+            if let Some(vol_tag) = vol_tag {
+                let candidate = if incarnation == INCARNATION_NONE {
+                    MapEntry::Point { vol_tag, offset }
+                } else {
+                    MapEntry::PointStamped {
+                        vol_tag,
+                        offset,
+                        incarnation,
                     }
+                };
+                if self.map_entry_block_key(&candidate).as_deref() == Some(key) {
+                    return candidate;
                 }
             }
         }
@@ -2794,7 +2921,12 @@ impl BackendRouter {
         kv: &crate::meta_backend::kv::backend::KvMetaBackend,
         local_ino: u64,
     ) -> Vec<(u32, String)> {
-        let mut out = Vec::new();
+        // PR 6a: one of the TWO shared run-expansion surfaces (design
+        // §12) — runs expand to per-index keys via the offset/stamp
+        // arithmetic, and the §2 read law rides record ORDER: an exact
+        // record inside a run's span follows the run in key order, so a
+        // later insert at the same index OVERRIDES the run-derived one.
+        let mut out: std::collections::BTreeMap<u32, String> = std::collections::BTreeMap::new();
         let mut cursor = 0u32;
         loop {
             let page = match kv.block_map_range(local_ino, cursor, 512).await {
@@ -2811,12 +2943,18 @@ impl BackendRouter {
                 break;
             };
             for (idx, entry) in &page {
-                match self.map_entry_block_key(entry) {
-                    Some(k) => out.push((*idx, k)),
-                    None => log::warn!(
-                        "kvmap extraction: unresolvable map record at local ino {local_ino} \
-                         index {idx} ({entry:?}) — no mounted volume carries its tag"
-                    ),
+                for delta in 0..entry.run_len() {
+                    match self.map_entry_block_key_at(entry, delta) {
+                        Some(k) => {
+                            out.insert(idx + delta, k);
+                        }
+                        None => log::warn!(
+                            "kvmap extraction: unresolvable map record at local ino \
+                             {local_ino} index {} ({entry:?} + {delta}) — no mounted \
+                             volume carries its tag",
+                            idx + delta
+                        ),
+                    }
                 }
             }
             let Some(next) = last.checked_add(1) else {
@@ -2824,7 +2962,7 @@ impl BackendRouter {
             };
             cursor = next;
         }
-        out
+        out.into_iter().collect()
     }
 
     /// **Durable block-reference recovery** (pre-RC engineering spec §6.2
@@ -3857,6 +3995,15 @@ pub struct DataRouterInner {
     /// custody inos and empty on every solo/authority mount by
     /// construction.
     pub(crate) publish_recomputed: std::sync::Arc<scc::HashMap<u64, ()>>,
+    /// PR 6a (design §12 option b — the honest write-map cap): the
+    /// write-active kvmap inos and their estimated RAM map bytes. Upserted
+    /// at the ONE map-mutation seam (`merge_block_mappings*`, the §5.3
+    /// merge discipline) and revalidated lazily against the cache's
+    /// dirty/kvmap state there and on the stats read — no dirty-clear
+    /// site needs a hook, the registry self-heals. Its revalidated sum is
+    /// the `kvmap_write_map_bytes` gauge and the input to the
+    /// budget-share refusal (`kvmap_write_map_budget_bytes`).
+    pub(crate) kvmap_write_maps: std::sync::Arc<scc::HashMap<u64, u64>>,
 }
 
 #[derive(Clone)]
@@ -5752,11 +5899,19 @@ impl DataRouter {
         }));
         // PR 5b: the decoder mirror — the claims-scoped train's f36b
         // recompute resolves DISPLACED tree records through the same
-        // volume census.
+        // volume census (PR 6a: at per-index delta, for run records).
         let br = std::sync::Arc::clone(&self.backend_router);
         meta_backend.install_map_entry_decoder(std::sync::Arc::new(
-            move |e: &crate::meta_backend::kv::block_map::MapEntry| br.map_entry_block_key(e),
+            move |e: &crate::meta_backend::kv::block_map::MapEntry, delta: u32| {
+                br.map_entry_block_key_at(e, delta)
+            },
         ));
+        // PR 6a (design §12): the run-emission stride census — the RUN
+        // arithmetic's one-block offset stride per volume tag.
+        let br = std::sync::Arc::clone(&self.backend_router);
+        meta_backend.install_map_run_stride(std::sync::Arc::new(move |tag: u64| {
+            br.run_stride_for_tag(tag)
+        }));
         let _ = self.inner.meta_backend.set(meta_backend);
     }
 
@@ -5896,21 +6051,49 @@ impl DataRouter {
                                 let Some(last) = page.last().map(|(i, _)| *i) else {
                                     break;
                                 };
+                                // PR 6a no-progress guard: the routed
+                                // range PREPENDS a run covering a
+                                // mid-span cursor — a page whose every
+                                // record precedes the cursor means the
+                                // walk is done (re-expansion below is
+                                // idempotent either way).
+                                if last < cursor {
+                                    break;
+                                }
                                 for (idx, entry) in &page {
-                                    let Some(key) = self.backend_router.map_entry_block_key(entry)
-                                    else {
-                                        // A mapping we cannot resolve is loud
-                                        // corruption, never a fabricated hole.
-                                        return Err(SqueezefsError::Io(std::io::Error::new(
-                                            std::io::ErrorKind::InvalidData,
-                                            format!(
-                                                "ino {ino}: unresolvable kvmap record at index \
-                                                 {idx} ({entry:?}) — refusing to serve a \
-                                                 fabricated hole"
-                                            ),
-                                        )));
-                                    };
-                                    map.insert(*idx, key);
+                                    // A record keyed below the cursor is a
+                                    // covering-run RE-delivery (the routed
+                                    // prepend): it was fully expanded — and
+                                    // possibly point-OVERRIDDEN — in an
+                                    // earlier page; re-expanding it would
+                                    // clobber those overrides.
+                                    if *idx < cursor {
+                                        continue;
+                                    }
+                                    // PR 6a: the second shared
+                                    // run-expansion surface (design §12)
+                                    // — key order makes a later exact
+                                    // record override its covering run's
+                                    // derived binding (the §2 read law).
+                                    for delta in 0..entry.run_len() {
+                                        let Some(key) = self
+                                            .backend_router
+                                            .map_entry_block_key_at(entry, delta)
+                                        else {
+                                            // A mapping we cannot resolve is loud
+                                            // corruption, never a fabricated hole.
+                                            return Err(SqueezefsError::Io(std::io::Error::new(
+                                                std::io::ErrorKind::InvalidData,
+                                                format!(
+                                                    "ino {ino}: unresolvable kvmap record at \
+                                                     index {} ({entry:?} + {delta}) — refusing \
+                                                     to serve a fabricated hole",
+                                                    idx + delta
+                                                ),
+                                            )));
+                                        };
+                                        map.insert(idx + delta, key);
+                                    }
                                 }
                                 let Some(next) = last.checked_add(1) else {
                                     break;
@@ -6952,6 +7135,22 @@ impl DataRouter {
         cached.layout_version = 0;
         // No blob exists behind a kvmap head — nothing to own-mint.
         cached.block_map_id_own_mint = false;
+        // PR 6a (§12 option b): the crossing/republish materialized this
+        // ino's whole map as resident write authority — register it in
+        // the write-map gauge (the merge seam ENFORCES the cap on later
+        // growth; the train already ran, so this arm never refuses).
+        let est = (cached
+            .block_map
+            .as_ref()
+            .map(|m| m.len() as u64)
+            .unwrap_or(0))
+        .saturating_mul(KVMAP_WRITE_MAP_ENTRY_EST);
+        match self.inner.kvmap_write_maps.entry_sync(ino) {
+            scc::hash_map::Entry::Occupied(mut occ) => *occ.get_mut() = est,
+            scc::hash_map::Entry::Vacant(vac) => {
+                let _ = vac.insert_entry(est);
+            }
+        }
         self.publish_layout_cache_entry(ino, cached);
 
         // The conversion's displaced blob rides the existing post-commit
@@ -7079,6 +7278,31 @@ impl DataRouter {
         // publish-class saves only (the pipeline hot path under test) —
         // plain layout persists stay unrecorded.
         let is_publish = publish_entries.is_some();
+
+        // PR 6a economy hoist (design §12): a sticky `kvmap:` head never
+        // persists an inline map, so the O(map) inline-sizing pass below
+        // (`encoded_len` walks every mapping) is pure waste on exactly
+        // the saves where the map is largest — probe the head class
+        // FIRST and enter the sticky arm before any sizing. A NEW
+        // crossing still needs `needs_indirect` (the spill decision), so
+        // its kvmap arm stays below the sizing pass.
+        let head_is_kvmap = m
+            .block_map_id
+            .as_deref()
+            .is_some_and(|id| id.starts_with(kvmap_head_prefix()));
+        if head_is_kvmap {
+            if let Some(verdict) = self
+                .kvmap_publish(ino, m, fencing_token, is_publish, block_refs, true)
+                .await?
+            {
+                return Ok(verdict);
+            }
+            // Unreachable today — the sticky arm owns the publish past
+            // its engagement gate (`Ok(None)` is the NEW-crossing
+            // stand-down only) — but a fall-through keeps the legacy arm
+            // as the loud-safe direction rather than a panic.
+        }
+
         let t_encode = std::time::Instant::now();
         let mut old_indirect_to_free = None;
         // Spec §6.2 item 1: the fresh CoW indirect-map blob this save
@@ -7157,22 +7381,16 @@ impl DataRouter {
             publish_phase_record(PublishPhase::SaveEncode, t_encode);
         }
 
-        // PR 2 (kvmap, design §3): the crossing decision is a 3-way.
-        // An existing `kvmap:` head is FORCE-kvmap regardless of the knob
-        // (A10 — heads are STICKY, Rev 1.1 #5: a shrinking map never
-        // collapses back inline; collapse would need its own sweep tx and
-        // buys nothing at a ~100 B head). A NEW beyond-inline crossing
-        // takes the tree where the knob is on AND the arm can engage —
-        // `kvmap_publish` stands down (`Ok(None)`) without consuming
-        // anything when it cannot, and the legacy blob arm below runs
-        // verbatim.
-        let head_is_kvmap = m
-            .block_map_id
-            .as_deref()
-            .is_some_and(|id| id.starts_with(kvmap_head_prefix()));
-        if head_is_kvmap || (needs_indirect && kvmap_enabled()) {
+        // PR 2 (kvmap, design §3): the crossing decision is a 3-way. An
+        // existing `kvmap:` head is FORCE-kvmap and entered ABOVE the
+        // sizing pass (A10 sticky — the PR 6a hoist). A NEW beyond-inline
+        // crossing takes the tree where the knob is on AND the arm can
+        // engage — `kvmap_publish` stands down (`Ok(None)`) without
+        // consuming anything when it cannot, and the legacy blob arm
+        // below runs verbatim.
+        if !head_is_kvmap && needs_indirect && kvmap_enabled() {
             if let Some(verdict) = self
-                .kvmap_publish(ino, m, fencing_token, is_publish, block_refs, head_is_kvmap)
+                .kvmap_publish(ino, m, fencing_token, is_publish, block_refs, false)
                 .await?
             {
                 return Ok(verdict);
@@ -7815,6 +8033,7 @@ impl DataRouter {
                 rewrite_epochs: std::sync::Arc::new(scc::HashMap::new()),
                 epoch_sweeper_armed: std::sync::atomic::AtomicBool::new(false),
                 publish_recomputed: std::sync::Arc::new(scc::HashMap::new()),
+                kvmap_write_maps: std::sync::Arc::new(scc::HashMap::new()),
             }),
         };
         // Merge-worker promotion commits layout through the router (weak:
@@ -12039,6 +12258,86 @@ impl DataRouter {
         });
     }
 
+    /// PR 6a (design §12 option b): revalidate the write-active kvmap
+    /// registry against the cache and publish the summed gauge.
+    /// "Write-active" = a write-touched kvmap ino whose whole RAM map is
+    /// still RESIDENT (`CachedMetadata` in the cache with its map) — the
+    /// Rev 1.3 #2 boundedness term the cap prices; an entry evicted or no
+    /// longer kvmap-headed drops, so no eviction/clean site needs a hook.
+    /// O(write-active kvmap inos), which is small by the very cap this
+    /// feeds.
+    pub fn kvmap_write_map_gauge(&self) -> u64 {
+        let mut sum = 0u64;
+        let mut dead: Vec<u64> = Vec::new();
+        self.inner.kvmap_write_maps.iter_sync(|ino, bytes| {
+            let live = self
+                .metadata_cache
+                .peek_with(ino, |m| {
+                    m.block_map.is_some()
+                        && m.block_map_id
+                            .as_deref()
+                            .is_some_and(|id| id.starts_with(kvmap_head_prefix()))
+                })
+                .unwrap_or(false);
+            if live {
+                sum += *bytes;
+            } else {
+                dead.push(*ino);
+            }
+            true
+        });
+        for ino in dead {
+            self.inner.kvmap_write_maps.remove_sync(&ino);
+        }
+        METRICS
+            .kvmap_write_map_bytes
+            .store(sum, std::sync::atomic::Ordering::Relaxed);
+        sum
+    }
+
+    /// The §12 option-b refusal at the first-dirty/growth seam: admit
+    /// `ino`'s estimated write-map bytes into the registry, refusing
+    /// **EFBIG** when the write-active sum would exceed the derived
+    /// budget share. EFBIG and not ENOSPC: the condition is a property of
+    /// the FILE's size class against this mount's RAM budget (its map
+    /// cannot be held as whole-map write authority — Rev 1.3 #2), not of
+    /// storage, and ENOSPC would send an operator hunting for space that
+    /// exists. A refusal leaves the registry at the ino's PRIOR
+    /// admission (the standing dirty map is still resident RAM truth).
+    fn admit_kvmap_write_map(&self, ino: u64, estimate: u64) -> Result<()> {
+        let prior = self
+            .inner
+            .kvmap_write_maps
+            .read_sync(&ino, |_, b| *b)
+            .unwrap_or(0);
+        let others = self.kvmap_write_map_gauge().saturating_sub(prior);
+        let cap = kvmap_write_map_budget_bytes();
+        if others.saturating_add(estimate) > cap {
+            log::error!(
+                "kvmap write-map cap: ino {ino}'s estimated RAM map ({estimate} B) plus \
+                 {others} B of other write-active kvmap maps exceeds the derived budget \
+                 share ({cap} B = mem_budget/16) — refusing EFBIG: this mount cannot hold \
+                 the file's map as whole-map write authority (design \
+                 docs/design-kvmap-block-map-tree.md §12, Rev 1.3 #2; the 6c dirty-index \
+                 overlay is the boundedness successor)"
+            );
+            return Err(SqueezefsError::Io(std::io::Error::from_raw_os_error(
+                libc::EFBIG,
+            )));
+        }
+        match self.inner.kvmap_write_maps.entry_sync(ino) {
+            scc::hash_map::Entry::Occupied(mut occ) => *occ.get_mut() = estimate,
+            scc::hash_map::Entry::Vacant(vac) => {
+                let _ = vac.insert_entry(estimate);
+            }
+        }
+        METRICS.kvmap_write_map_bytes.store(
+            others.saturating_add(estimate),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        Ok(())
+    }
+
     pub async fn merge_block_mappings(
         &self,
         ino: u64,
@@ -12132,6 +12431,33 @@ impl DataRouter {
                 None => cached.unwrap_or_default(),
             },
         };
+
+        // PR 6a (design §12 option b): the honest write-map cap at the
+        // §5.3 one-merge seam — the ONE place a kvmap ino's RAM map
+        // becomes (or grows as) whole-map WRITE authority. Growth-class
+        // ops only: a truncate/punch SHRINKS the authority and must never
+        // refuse. O(1): the estimate is `len × entry-est`, never a key
+        // walk.
+        if matches!(op, BlockMapOp::Merge(_) | BlockMapOp::MergeExpected(_))
+            && current
+                .block_map_id
+                .as_deref()
+                .is_some_and(|id| id.starts_with(kvmap_head_prefix()))
+        {
+            let merged = match &op {
+                BlockMapOp::Merge(e) => e.len() as u64,
+                BlockMapOp::MergeExpected(e) => e.len() as u64,
+                _ => 0,
+            };
+            let estimate = (current
+                .block_map
+                .as_ref()
+                .map(|m| m.len() as u64)
+                .unwrap_or(0)
+                + merged)
+                .saturating_mul(KVMAP_WRITE_MAP_ENTRY_EST);
+            self.admit_kvmap_write_map(ino, estimate)?;
+        }
 
         let forensics_base = if current.layout_dirty {
             "dirty-ram"

@@ -5105,6 +5105,10 @@ pub struct Metrics {
     /// ZERO tree records (the size-vs-sparse ambiguity keeps partial
     /// coverage out of scope). **Must stay 0 on healthy volumes.**
     pub fsck_map_empty_heads: Align64<AtomicU64>,
+    /// C11 (c) — PR 6a (design §12): verified cross-volume point records
+    /// strictly inside a covering run's span. Same-volume shadows are
+    /// legal by the §2 read law and never counted. Report-only.
+    pub fsck_map_run_foreign_shadows: Align64<AtomicU64>,
     /// C11's zero-FP shield engagement (design A3): map-plane verdicts
     /// withheld because the ino's crossing train is REGISTERED in flight
     /// — the map plane's `fsck_inflight_exempted`. Growth under live
@@ -5763,6 +5767,13 @@ pub struct Metrics {
     /// tree-7 records — a crashed prior train's residue reconciled
     /// (silent-wrong-data class had the sweep not run).
     pub map_migrate_resumed: Align64<AtomicU64>,
+    /// kvmap PR 6a (design §12 option b): Σ estimated RAM map bytes of
+    /// write-active kvmap inos — the honest write-map GAUGE beside the
+    /// derived `mem_budget/16` cap that refuses over-budget giant
+    /// write-opens EFBIG (Rev 1.3 #2's boundedness debt, priced until
+    /// 6c's dirty-index overlay). Revalidated at the merge seam and on
+    /// stats reads.
+    pub kvmap_write_map_bytes: Align64<AtomicU64>,
     /// Indirect block-map rehydrates (whole-block device READS on the
     /// meta-fetch path — publish-pass base fetches, cold meta reads).
     pub layout_indirect_map_reads: Align64<AtomicU64>,
@@ -9661,6 +9672,7 @@ impl SqueezefsFilesystem {
                 // shield's engagement.
                 "fsck_map_orphan_records": METRICS.fsck_map_orphan_records.load(Ordering::Relaxed),
                 "fsck_map_empty_heads": METRICS.fsck_map_empty_heads.load(Ordering::Relaxed),
+                "fsck_map_run_foreign_shadows": METRICS.fsck_map_run_foreign_shadows.load(Ordering::Relaxed),
                 "fsck_crossing_exempted": METRICS.fsck_crossing_exempted.load(Ordering::Relaxed),
                 "fsck_findings": METRICS.fsck_findings.load(Ordering::Relaxed),
                 "fsck_scan_secs": METRICS.fsck_scan_secs.load(Ordering::Relaxed),
@@ -10065,6 +10077,10 @@ impl SqueezefsFilesystem {
                 "map_migrate_inos": METRICS.map_migrate_inos.load(Ordering::Relaxed),
                 "map_migrate_records": METRICS.map_migrate_records.load(Ordering::Relaxed),
                 "map_migrate_resumed": METRICS.map_migrate_resumed.load(Ordering::Relaxed),
+                // kvmap PR 6a (design §12 option b): the honest write-map
+                // gauge (revalidated live on this read) + its derived cap.
+                "kvmap_write_map_bytes": self.router.kvmap_write_map_gauge(),
+                "kvmap_write_map_budget_bytes": crate::routing::kvmap_write_map_budget_bytes(),
                 "layout_indirect_map_reads": METRICS.layout_indirect_map_reads.load(Ordering::Relaxed),
                 "layout_indirect_map_read_bytes": METRICS.layout_indirect_map_read_bytes.load(Ordering::Relaxed),
                 "publish_blob_composes": METRICS.publish_blob_composes.load(Ordering::Relaxed),
@@ -10914,6 +10930,15 @@ impl SqueezefsFilesystem {
                 metrics.insert(
                     "meta_kv_block_map_lookup_range".into(),
                     load(&meta_kv::META_KV_BLOCK_MAP_LOOKUP_RANGE),
+                );
+                // PR 6a (design §12): run emission + the A6 floor probe.
+                metrics.insert(
+                    "meta_kv_block_map_run_puts".into(),
+                    load(&meta_kv::META_KV_BLOCK_MAP_RUN_PUTS),
+                );
+                metrics.insert(
+                    "meta_kv_block_map_lookup_floor".into(),
+                    load(&meta_kv::META_KV_BLOCK_MAP_LOOKUP_FLOOR),
                 );
                 metrics.insert(
                     "meta_kv_block_map_leaf_reads".into(),

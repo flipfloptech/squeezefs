@@ -27,20 +27,27 @@
 //!
 //! value (versioned, little-endian — no ordering requirement):
 //!   [0]       version: u8       [`BLOCK_MAP_VALUE_VERSION`]
-//!   [1]       kind:    u8       POINT | STRING (RUN reserved for PR 6)
+//!   [1]       kind:    u8       POINT | STRING | RUN | POINT2 | RUN2
 //!   POINT  ⇒  [2..10) vol_tag: u64 ‖ [10..18) offset: u64
 //!   STRING ⇒  [2..]   decorated block key bytes, VERBATIM
+//!   RUN    ⇒  [2..10) vol_tag ‖ [10..18) start_offset ‖ [18..22) len: u32
+//!   POINT2 ⇒  POINT ‖ [18..26) incarnation: u64 (verbatim stamp)
+//!   RUN2   ⇒  RUN   ‖ [22..30) start_incarnation: u64
 //! ```
 //!
 //! POINT is the binary fast form: `vol_tag` is the durable `vol-{16 hex}`
 //! data-volume identity decoded verbatim (KD-5 — [`super::block_refs::
 //! volume_tag`], never a path or an ordinal) plus the device offset.
 //! Decorated keys (`damaged:` markers, `:extra` trailers) ride STRING
-//! untouched. The RUN kind ([`BLOCK_MAP_KIND_RUN`]) is reserved here so
-//! PR 6's run records cannot collide with a later claim; decoding it (or
-//! any unknown kind/version) refuses loud — guessing would silently
-//! resolve a block to the wrong device bytes, the exact failure the tree
-//! exists to prevent.
+//! untouched. RUN/RUN2 (PR 6a, design §12) collapse straight sequential
+//! spans — key at `start_index`, one-block offset stride, capped at
+//! [`RUN_LEN_MAX`] (A6: the exact-miss read is a bounded forward
+//! take-last, and this cap IS its bound). POINT2/RUN2 carry the spec
+//! §6.2 item-6 incarnation stamp VERBATIM (Rev 1.4 #1: a decode that
+//! re-attached the CURRENT stamp would let a freed-and-reissued offset
+//! pass the staleness refusal). Any unknown kind/version refuses loud —
+//! guessing would silently resolve a block to the wrong device bytes,
+//! the exact failure the tree exists to prevent.
 //!
 //! ## The head sentinel (design §2/§3, amendment A2)
 //!
@@ -77,15 +84,49 @@ pub const BLOCK_MAP_KIND_POINT: u8 = 1;
 /// markers etc. — design §2).
 pub const BLOCK_MAP_KIND_STRING: u8 = 2;
 
-/// `kind`: RESERVED for PR 6's run records (`vol_tag ‖ start_offset ‖
-/// len`, key at `start_index` — design §2/§6 A6). Claimed here so a
-/// parallel branch cannot alias the discriminant (the incompat-bit-8
-/// collision lesson applied to a kind byte); this binary refuses it at
-/// decode.
+/// `kind`: a RUN record (PR 6a, design §2/§12) — `vol_tag ‖ start_offset
+/// ‖ len`, key at `start_index`, covering indices
+/// `[start_index, start_index + len)` at one-block offset stride (the
+/// stride itself is the owning data volume's block size, resolved by the
+/// router — never stored, so the 22-B value stays fixed). Read law: an
+/// exact-match record at N supersedes a covering run (design §2).
 pub const BLOCK_MAP_KIND_RUN: u8 = 3;
+
+/// `kind`: POINT2 (PR 6a, design §12) — a POINT carrying the block key's
+/// **incarnation stamp** (spec §6.2 item 6) VERBATIM: `vol_tag ‖ offset ‖
+/// incarnation`. The stamp is part of the key's identity and is decoded
+/// back verbatim — never re-attached from the live map, which would let
+/// a record naming a freed-and-reissued offset pass the staleness
+/// refusal the stamp exists to fire (Rev 1.4 #1).
+pub const BLOCK_MAP_KIND_POINT_STAMPED: u8 = 4;
+
+/// `kind`: RUN2 (PR 6a, design §12) — a RUN whose covered keys carry
+/// incarnation stamps: `vol_tag ‖ start_offset ‖ len ‖ start_incarnation`,
+/// legal iff the covered stamps are LITERALLY consecutive composed words
+/// (`stamp(i) = start_incarnation + i` — consecutive-mint lane_seqs prove
+/// stride-1; the emitter verifies every actual stamp, so the decode
+/// arithmetic reproduces exactly what was minted).
+pub const BLOCK_MAP_KIND_RUN_STAMPED: u8 = 5;
 
 /// Encoded POINT value length: `version | kind | vol_tag | offset`.
 pub const BLOCK_MAP_POINT_VALUE_LEN: usize = 1 + 1 + 8 + 8;
+
+/// Encoded RUN value length: `version | kind | vol_tag | start_offset |
+/// len`.
+pub const BLOCK_MAP_RUN_VALUE_LEN: usize = 1 + 1 + 8 + 8 + 4;
+
+/// Encoded POINT2 value length: POINT + the u64 incarnation stamp.
+pub const BLOCK_MAP_POINT_STAMPED_VALUE_LEN: usize = BLOCK_MAP_POINT_VALUE_LEN + 8;
+
+/// Encoded RUN2 value length: RUN + the u64 start incarnation.
+pub const BLOCK_MAP_RUN_STAMPED_VALUE_LEN: usize = BLOCK_MAP_RUN_VALUE_LEN + 8;
+
+/// The longest span one run record may cover (design §6 **A6**): the tree
+/// has no floor/predecessor primitive, so the exact-miss read law is one
+/// bounded forward `range([ino‖N−RUN_LEN_MAX+1, ino‖N])` take-last — this
+/// constant IS that bound, so it is a format law, never a knob (a wider
+/// run would be invisible to every reader's floor probe).
+pub const RUN_LEN_MAX: u32 = 4096;
 
 /// The head-sentinel prefix (`block_map_id = "kvmap:…"`).
 pub const KVMAP_HEAD_PREFIX: &str = "kvmap:";
@@ -149,7 +190,8 @@ pub fn index_range_from(
     (lo, hi)
 }
 
-/// One decoded mapping value (design §2 v1 kinds; RUN is PR 6's).
+/// One decoded mapping value (design §2 v1 kinds + the PR 6a run/stamped
+/// forms, design §12).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MapEntry {
     /// Binary `(vol_tag, offset)` — `vol_tag` per
@@ -157,6 +199,29 @@ pub enum MapEntry {
     Point { vol_tag: u64, offset: u64 },
     /// A decorated block key, verbatim bytes.
     String(Vec<u8>),
+    /// A RUN (design §2/§12): `len` consecutive indices from the record's
+    /// key, offsets advancing one data-volume block per index. Exact
+    /// records supersede a covering run (the §2 read law).
+    Run {
+        vol_tag: u64,
+        start_offset: u64,
+        len: u32,
+    },
+    /// POINT2 (design §12): a point whose block key carries an
+    /// incarnation stamp, stored VERBATIM (never re-attached at decode).
+    PointStamped {
+        vol_tag: u64,
+        offset: u64,
+        incarnation: u64,
+    },
+    /// RUN2 (design §12): a run of stamped keys whose stamps are
+    /// literally consecutive (`stamp(i) = start_incarnation + i`).
+    RunStamped {
+        vol_tag: u64,
+        start_offset: u64,
+        len: u32,
+        start_incarnation: u64,
+    },
 }
 
 impl MapEntry {
@@ -166,6 +231,19 @@ impl MapEntry {
         match self {
             MapEntry::Point { .. } => BLOCK_MAP_POINT_VALUE_LEN,
             MapEntry::String(bytes) => 2 + bytes.len(),
+            MapEntry::Run { .. } => BLOCK_MAP_RUN_VALUE_LEN,
+            MapEntry::PointStamped { .. } => BLOCK_MAP_POINT_STAMPED_VALUE_LEN,
+            MapEntry::RunStamped { .. } => BLOCK_MAP_RUN_STAMPED_VALUE_LEN,
+        }
+    }
+
+    /// Indices this record covers from its key: 1 for point/string forms,
+    /// the run length otherwise — the span arithmetic every coverage
+    /// check (floor probe, diff, C11) shares.
+    pub fn run_len(&self) -> u32 {
+        match self {
+            MapEntry::Run { len, .. } | MapEntry::RunStamped { len, .. } => *len,
+            _ => 1,
         }
     }
 
@@ -188,8 +266,64 @@ impl MapEntry {
                 out.extend_from_slice(bytes);
                 out
             }
+            MapEntry::Run {
+                vol_tag,
+                start_offset,
+                len,
+            } => {
+                let mut out = Vec::with_capacity(BLOCK_MAP_RUN_VALUE_LEN);
+                out.push(BLOCK_MAP_VALUE_VERSION);
+                out.push(BLOCK_MAP_KIND_RUN);
+                out.extend_from_slice(&vol_tag.to_le_bytes());
+                out.extend_from_slice(&start_offset.to_le_bytes());
+                out.extend_from_slice(&len.to_le_bytes());
+                out
+            }
+            MapEntry::PointStamped {
+                vol_tag,
+                offset,
+                incarnation,
+            } => {
+                let mut out = Vec::with_capacity(BLOCK_MAP_POINT_STAMPED_VALUE_LEN);
+                out.push(BLOCK_MAP_VALUE_VERSION);
+                out.push(BLOCK_MAP_KIND_POINT_STAMPED);
+                out.extend_from_slice(&vol_tag.to_le_bytes());
+                out.extend_from_slice(&offset.to_le_bytes());
+                out.extend_from_slice(&incarnation.to_le_bytes());
+                out
+            }
+            MapEntry::RunStamped {
+                vol_tag,
+                start_offset,
+                len,
+                start_incarnation,
+            } => {
+                let mut out = Vec::with_capacity(BLOCK_MAP_RUN_STAMPED_VALUE_LEN);
+                out.push(BLOCK_MAP_VALUE_VERSION);
+                out.push(BLOCK_MAP_KIND_RUN_STAMPED);
+                out.extend_from_slice(&vol_tag.to_le_bytes());
+                out.extend_from_slice(&start_offset.to_le_bytes());
+                out.extend_from_slice(&len.to_le_bytes());
+                out.extend_from_slice(&start_incarnation.to_le_bytes());
+                out
+            }
         }
     }
+}
+
+/// Run-length validation shared by both run kinds: the encoder emits
+/// `2 ..= RUN_LEN_MAX` only (a 1-run is a point; a parser wider than its
+/// encoder is a format hole, and a run past `RUN_LEN_MAX` is INVISIBLE
+/// to the A6 bounded floor probe — accepting one would silently
+/// unresolve every covered index).
+fn validate_run_len(len: u32) -> Result<(), KvError> {
+    if len < 2 || len > RUN_LEN_MAX {
+        return Err(KvError::Corrupt(format!(
+            "block-map run length {len} is outside 2..={RUN_LEN_MAX} (design A6/§12) — \
+             no encoder produces it"
+        )));
+    }
+    Ok(())
 }
 
 /// Decode + validate a mapping value: version-gated, kind-gated,
@@ -225,11 +359,76 @@ pub fn decode_block_map_value(value: &[u8]) -> Result<MapEntry, KvError> {
             })
         }
         BLOCK_MAP_KIND_STRING => Ok(MapEntry::String(value[2..].to_vec())),
-        BLOCK_MAP_KIND_RUN => Err(KvError::Corrupt(
-            "block-map value carries the run kind, which is reserved until the run \
-             encoding lands (design §2, PR 6) — this binary cannot resolve it"
-                .to_string(),
-        )),
+        BLOCK_MAP_KIND_RUN => {
+            if value.len() != BLOCK_MAP_RUN_VALUE_LEN {
+                return Err(KvError::Corrupt(format!(
+                    "block-map RUN value must be {BLOCK_MAP_RUN_VALUE_LEN} bytes, got {}",
+                    value.len()
+                )));
+            }
+            let len = u32::from_le_bytes(value[18..22].try_into().expect("length checked"));
+            validate_run_len(len)?;
+            Ok(MapEntry::Run {
+                vol_tag: u64::from_le_bytes(value[2..10].try_into().expect("length checked")),
+                start_offset: u64::from_le_bytes(value[10..18].try_into().expect("length checked")),
+                len,
+            })
+        }
+        BLOCK_MAP_KIND_POINT_STAMPED => {
+            if value.len() != BLOCK_MAP_POINT_STAMPED_VALUE_LEN {
+                return Err(KvError::Corrupt(format!(
+                    "block-map POINT2 value must be {BLOCK_MAP_POINT_STAMPED_VALUE_LEN} \
+                     bytes, got {}",
+                    value.len()
+                )));
+            }
+            let incarnation = u64::from_le_bytes(value[18..26].try_into().expect("length checked"));
+            if incarnation == 0 {
+                // Stamp 0 is INCARNATION_NONE — an unstamped key rides
+                // POINT, so a zero here has two spellings for one mapping
+                // (the record-equality diff's poison) and no encoder
+                // produces it.
+                return Err(KvError::Corrupt(
+                    "block-map POINT2 value carries incarnation 0 (an unstamped key \
+                     rides POINT — design §12); no encoder produces it"
+                        .to_string(),
+                ));
+            }
+            Ok(MapEntry::PointStamped {
+                vol_tag: u64::from_le_bytes(value[2..10].try_into().expect("length checked")),
+                offset: u64::from_le_bytes(value[10..18].try_into().expect("length checked")),
+                incarnation,
+            })
+        }
+        BLOCK_MAP_KIND_RUN_STAMPED => {
+            if value.len() != BLOCK_MAP_RUN_STAMPED_VALUE_LEN {
+                return Err(KvError::Corrupt(format!(
+                    "block-map RUN2 value must be {BLOCK_MAP_RUN_STAMPED_VALUE_LEN} \
+                     bytes, got {}",
+                    value.len()
+                )));
+            }
+            let len = u32::from_le_bytes(value[18..22].try_into().expect("length checked"));
+            validate_run_len(len)?;
+            let start_incarnation =
+                u64::from_le_bytes(value[22..30].try_into().expect("length checked"));
+            // Zero stamp: the POINT2 law. Overflowing stamp arithmetic:
+            // the emitter verified every ACTUAL minted stamp, so a span
+            // whose `start + len - 1` wraps cannot have been emitted.
+            if start_incarnation == 0 || start_incarnation.checked_add(u64::from(len) - 1).is_none()
+            {
+                return Err(KvError::Corrupt(format!(
+                    "block-map RUN2 value carries start incarnation {start_incarnation} \
+                     with len {len}, which no emitter produces (design §12)"
+                )));
+            }
+            Ok(MapEntry::RunStamped {
+                vol_tag: u64::from_le_bytes(value[2..10].try_into().expect("length checked")),
+                start_offset: u64::from_le_bytes(value[10..18].try_into().expect("length checked")),
+                len,
+                start_incarnation,
+            })
+        }
         other => Err(KvError::Corrupt(format!(
             "block-map value carries unknown kind {other}"
         ))),
@@ -401,6 +600,9 @@ mod tests {
     fn kind_discriminants_pin_the_on_disk_format() {
         assert_eq!(BLOCK_MAP_KIND_POINT, 1);
         assert_eq!(BLOCK_MAP_KIND_STRING, 2);
-        assert_eq!(BLOCK_MAP_KIND_RUN, 3, "PR 6's reservation");
+        assert_eq!(BLOCK_MAP_KIND_RUN, 3, "PR 6a claimed the PR-1 reservation");
+        assert_eq!(BLOCK_MAP_KIND_POINT_STAMPED, 4);
+        assert_eq!(BLOCK_MAP_KIND_RUN_STAMPED, 5);
+        assert_eq!(RUN_LEN_MAX, 4096, "A6's floor-probe bound is a format law");
     }
 }

@@ -3264,9 +3264,16 @@ pub enum PipelinePhase {
     /// Admission start → task end (≈ permit release): the whole
     /// residence every in-pipe block pays — Little's law's numerator.
     Total = 9,
+    /// NvmeBlockDev write request enqueue → SQE submitted (worker
+    /// channel + slot wait) — the read funnel's `dev_queue` twin, recorded
+    /// for EVERY data-device write at the funnel (e2e audit B).
+    DevQueue = 10,
+    /// SQE submitted → CQE completion handed back (device/fabric
+    /// service). `dma ⊇ dev_queue + dev_service` for pipeline writes.
+    DevService = 11,
 }
 
-const PIPELINE_PHASES: usize = 10;
+const PIPELINE_PHASES: usize = 12;
 const PIPELINE_PHASE_NAMES: [&str; PIPELINE_PHASES] = [
     "admit_wait",
     "detach_lag",
@@ -3278,6 +3285,8 @@ const PIPELINE_PHASE_NAMES: [&str; PIPELINE_PHASES] = [
     "displaced_free",
     "inval_tail",
     "total",
+    "dev_queue",
+    "dev_service",
 ];
 
 static PIPELINE_PROF: Lazy<[LatencyHistogram; PIPELINE_PHASES]> =
@@ -3430,19 +3439,33 @@ pub enum MetaTxPassPhase {
     /// (checkpoint-freeze / SMO interference shows here).
     PassLeafLocks = 2,
     /// Pass: journal device write + completed-prefix wait (+ the
-    /// strict-mode coalesced barrier).
+    /// strict-mode coalesced barrier) — kept as the SUM of the three
+    /// split phases below so rows stay comparable (e2e audit B).
     PassJournalWrite = 3,
     /// Pass: drain → terminal outcomes staged (the whole `run_batch`).
     PassTotal = 4,
+    /// Pass: the batch's ring write (`write_entries_batch` submit →
+    /// completion).
+    JournalRingWrite = 5,
+    /// Pass: the completed-prefix wait (`wait_completed_upto` — parks
+    /// behind OTHER passes' in-flight entries).
+    JournalPrefixWait = 6,
+    /// Pass: the strict-cadence coalesced barrier (`sync_device`);
+    /// records nothing on the default cadence, where the barrier leaves
+    /// the pass.
+    JournalBarrier = 7,
 }
 
-const META_TXPASS_PHASES: usize = 5;
+const META_TXPASS_PHASES: usize = 8;
 const META_TXPASS_PHASE_NAMES: [&str; META_TXPASS_PHASES] = [
     "tx_queue_wait",
     "pass_admission",
     "pass_leaf_locks",
     "pass_journal_write",
     "pass_total",
+    "journal_ring_write",
+    "journal_prefix_wait",
+    "journal_barrier",
 ];
 
 static META_TXPASS_PROF: Lazy<[LatencyHistogram; META_TXPASS_PHASES]> =
@@ -3452,6 +3475,14 @@ static META_TXPASS_PROF: Lazy<[LatencyHistogram; META_TXPASS_PHASES]> =
 #[inline]
 pub fn meta_txpass_phase_record(phase: MetaTxPassPhase, t0: std::time::Instant) {
     META_TXPASS_PROF[phase as usize].record(t0.elapsed());
+}
+
+/// Record one conveyor-pass span of known length (a span whose end was
+/// stamped before its outcome was known, or one accumulated across a
+/// retry loop).
+#[inline]
+pub fn meta_txpass_phase_record_dur(phase: MetaTxPassPhase, dur: Duration) {
+    META_TXPASS_PROF[phase as usize].record(dur);
 }
 
 /// `meta_txpass_phase_ns` stats payload — surfaced UNGATED.

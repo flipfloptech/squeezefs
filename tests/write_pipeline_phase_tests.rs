@@ -19,7 +19,9 @@
 //!
 //! Contracts:
 //!
-//! 1. **The family exists always-on** with exactly the ten phase keys,
+//! 1. **The family exists always-on** with exactly the twelve phase keys
+//!    (ten residence phases + the e2e-audit-B `dev_queue`/`dev_service`
+//!    funnel split),
 //!    each a standard µs-bucket histogram, surfaced on the stats inode
 //!    unconditionally (no profile gate).
 //! 2. **A coverage-complete striped write drives every phase** through
@@ -56,7 +58,7 @@ async fn serial() -> tokio::sync::MutexGuard<'static, ()> {
         .await
 }
 
-const PHASES: [&str; 10] = [
+const PHASES: [&str; 12] = [
     "admit_wait",
     "detach_lag",
     "lock_wait",
@@ -67,6 +69,8 @@ const PHASES: [&str; 10] = [
     "displaced_free",
     "inval_tail",
     "total",
+    "dev_queue",
+    "dev_service",
 ];
 
 /// Sum of one phase histogram's buckets (= spans recorded).
@@ -163,7 +167,7 @@ fn pattern(len: usize, seed: u8) -> Vec<u8> {
 }
 
 // ---------------------------------------------------------------------------
-// Contract 1 — the family exists always-on with exactly the ten keys and
+// Contract 1 — the family exists always-on with exactly the twelve keys and
 // rides the stats inode UNGATED (no SQUEEZEFS_OP_PROFILE arm required).
 // ---------------------------------------------------------------------------
 
@@ -182,7 +186,7 @@ async fn phase_family_is_always_on_with_exact_keys() {
     assert_eq!(
         obj.len(),
         PHASES.len(),
-        "exactly the ten residence phases: {obj:?}"
+        "exactly the twelve phases: {obj:?}"
     );
     for p in PHASES {
         let _ = phase_count(&family, p); // key exists, histogram-shaped

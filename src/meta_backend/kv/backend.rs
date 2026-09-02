@@ -7765,7 +7765,9 @@ impl KvMetaBackend {
     /// state; on every normal path (success and failure alike) it fans
     /// out per-tx results and empties the sentinel itself.
     async fn run_batch_pipeline(&self, s: &mut PassSentinel<'_>) {
-        use crate::fuse_client::{meta_txpass_phase_record, MetaTxPassPhase};
+        use crate::fuse_client::{
+            meta_txpass_phase_record, meta_txpass_phase_record_dur, MetaTxPassPhase,
+        };
         // Inherited liveness re-checks (§5.5: "the shutdown/failure-flag
         // re-checks it inherits from commit_tx's admission loop").
         if self.is_shutting_down() || self.is_failed() {
@@ -8058,6 +8060,10 @@ impl KvMetaBackend {
                 self.ring.write_entries_batch(&parts).await
             }
         };
+        // e2e audit B: the lumped `pass_journal_write` splits into the
+        // ring write, the completed-prefix wait and the barrier (the
+        // three record only on the success arm, like the lump).
+        let t_ring_done = std::time::Instant::now();
         // Completion is unconditional and pass-owned (commit_entry's
         // guarantee, batch edition): a reservation that never completes
         // would wedge the completed-prefix watermark. An unwritten /
@@ -8067,10 +8073,16 @@ impl KvMetaBackend {
 
         match write_out {
             Ok(()) => {
+                meta_txpass_phase_record_dur(
+                    MetaTxPassPhase::JournalRingWrite,
+                    t_ring_done.duration_since(t_jwrite),
+                );
                 // (7) One completed-prefix wait covers every member
                 // (their entries all end at-or-before the batch end;
                 // chain-reachability per the K3 barrier observation).
+                let t_pfx = std::time::Instant::now();
                 self.ring.wait_completed_upto(res.end()).await;
+                meta_txpass_phase_record(MetaTxPassPhase::JournalPrefixWait, t_pfx);
                 self.journal_failures.store(0, Ordering::Release);
                 // A skipped member left an unwritten hole in front of
                 // acked survivors: checkpoint past it BEFORE acking, so
@@ -8096,7 +8108,10 @@ impl KvMetaBackend {
                     // (8) Strict-0 group commit: ONE coalesced fdatasync
                     // for the whole batch (§4.6 pt 4 / §5.5 — the G3
                     // mechanism: the barrier leaves the throughput path).
-                    self.sync_device().await.map_err(KvError::Io)
+                    let t_bar = std::time::Instant::now();
+                    let out = self.sync_device().await.map_err(KvError::Io);
+                    meta_txpass_phase_record(MetaTxPassPhase::JournalBarrier, t_bar);
+                    out
                 } else {
                     if hole_err.is_none() {
                         self.needs_flush.store(true, Ordering::Release);

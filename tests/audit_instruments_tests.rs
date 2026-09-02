@@ -60,7 +60,11 @@ struct H {
 /// The publish_phase_tests harness: real v3 meta backend, real striped
 /// write path, real publish + journal conveyors.
 async fn make(uuid: [u8; 16], alloc_ns: &str) -> H {
-    std::env::set_var("SQUEEZEFS_DEFAULT_BLOCK_SIZE", BS.to_string());
+    make_bs(uuid, alloc_ns, BS).await
+}
+
+async fn make_bs(uuid: [u8; 16], alloc_ns: &str, bs: u64) -> H {
+    std::env::set_var("SQUEEZEFS_DEFAULT_BLOCK_SIZE", bs.to_string());
     squeezefs::fuse_client::set_patch_max_bytes(0);
     let dlm = DlmClient::new().unwrap();
     let b = NamedTempFile::new().unwrap();
@@ -477,10 +481,34 @@ async fn nvme_write_block_is_split_at_the_funnel_and_barriers_are_not() {
 async fn pipeline_dma_contains_the_funnel_split() {
     use squeezefs::fuse_client::write_pipeline_phase_json;
     let _g = serial().await;
-    let h = make([0x11; 16], "audit_b_pipeline").await;
+    // The CoW pipeline venue (the write_pipeline_phase_tests posture): the
+    // fresh small-file route promotes via staging, so the measured pass is
+    // the striped coverage-complete REWRITE, routed CoW (not in place, no
+    // rewrite shadow) so every block pays `dma`.
+    struct Restore;
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            squeezefs::routing::set_rewrite_shadow(true);
+            squeezefs::fuse_client::set_inplace_overwrite(false);
+        }
+    }
+    let _r = Restore;
+    squeezefs::routing::set_rewrite_shadow(false);
+    squeezefs::fuse_client::set_inplace_overwrite(false);
+    // 4 KiB blocks, one coverage-complete 8-block write (the
+    // write_pipeline_phase_tests venue): fixture write + fsync promotes to
+    // striped; the measured pass is the 8-block rewrite.
+    const FBS: u64 = 4096;
+    let blocks = 8u64;
+    let h = make_bs([0x11; 16], "audit_b_pipeline", FBS).await;
     let ino = create(&h, "split").await;
+    let whole = |tag: u8| pattern((blocks * FBS) as usize, tag);
+    write_at(&h, ino, 0, &whole(0x21)).await;
+    h.fs.fsync(h.req, ino, 0, false).await.unwrap();
+    assert!(h.fs.write_pipeline.quiesce(Duration::from_secs(30)).await);
     let before = write_pipeline_phase_json();
-    stream_blocks(&h, ino, 6, 0x21).await;
+    write_at(&h, ino, 0, &whole(0x33)).await;
+    assert!(h.fs.write_pipeline.quiesce(Duration::from_secs(30)).await);
     let after = write_pipeline_phase_json();
 
     let d = |p: &str| {
@@ -491,7 +519,10 @@ async fn pipeline_dma_contains_the_funnel_split() {
     let (dma_n, dma_sum) = d("dma");
     let (q_n, _) = d("dev_queue");
     let (s_n, s_sum) = d("dev_service");
-    assert!(dma_n >= 6, "six whole blocks ⇒ ≥ 6 dma spans, got {dma_n}");
+    assert!(
+        dma_n >= blocks,
+        "{blocks} whole blocks ⇒ ≥ {blocks} dma spans, got {dma_n}"
+    );
     assert!(
         q_n >= dma_n,
         "every dma is a funnel write: dev_queue {q_n} ≥ dma {dma_n}"

@@ -277,6 +277,9 @@ enum UringRequest {
         offset: u64,
         data: WriteData,
         tx: oneshot::Sender<Result<()>>,
+        /// Enqueue stamp — feeds `write_pipeline_phase_ns.dev_queue`
+        /// (the read funnel's twin, e2e audit B).
+        enq: std::time::Instant,
     },
     /// DUR-2: the data-device durability barrier (io_uring `Fsync`,
     /// `FSYNC_DATASYNC` when `datasync`). `O_DIRECT` bypasses the page
@@ -303,6 +306,9 @@ enum UringResponse {
     },
     Write {
         tx: oneshot::Sender<Result<()>>,
+        /// SQE-submit stamp — feeds `write_pipeline_phase_ns.dev_service`;
+        /// `None` for barriers (an fsync is not a device write).
+        submitted: Option<std::time::Instant>,
     },
 }
 
@@ -745,7 +751,13 @@ fn worker_thread_loop(
                 );
                 let _ = tx.send(finish_read(io_res, bytes, size, offset));
             }
-            UringResponse::Write { tx } => {
+            UringResponse::Write { tx, submitted } => {
+                if let Some(submitted) = submitted {
+                    crate::fuse_client::pipeline_phase_record(
+                        crate::fuse_client::PipelinePhase::DevService,
+                        submitted,
+                    );
+                }
                 // DUR-2 watermark: writes AND fsyncs ride
                 // `UringResponse::Write`, and both count symmetrically at
                 // submit, so the ledger stays exact (an asymmetric count
@@ -888,7 +900,12 @@ fn worker_thread_loop(
                             .user_data(slot_idx as u64),
                     }
                 }
-                UringRequest::Write { offset, data, tx } => {
+                UringRequest::Write {
+                    offset,
+                    data,
+                    tx,
+                    enq,
+                } => {
                     // Test seam: deterministic slow-DMA stall (the read
                     // seam's twin) — the write is already accounted
                     // submitted on its lane's watermark, so the DUR-2
@@ -936,8 +953,18 @@ fn worker_thread_loop(
                     // write BEFORE the SQE goes out (armed only — one
                     // relaxed load otherwise).
                     crate::dev_power_cut::note_write(&device_path, offset, len);
+                    // write_pipeline_phase_ns: `dev_queue` = enqueue → SQE
+                    // build; `dev_service` starts here and records at
+                    // CQE completion (the read funnel's twin).
+                    crate::fuse_client::pipeline_phase_record(
+                        crate::fuse_client::PipelinePhase::DevQueue,
+                        enq,
+                    );
                     active[slot_idx] = Some(ActiveReq {
-                        response: UringResponse::Write { tx },
+                        response: UringResponse::Write {
+                            tx,
+                            submitted: Some(std::time::Instant::now()),
+                        },
                         free_ptr,
                         _keep_alive: keep_alive,
                         dest_token: None,
@@ -962,7 +989,10 @@ fn worker_thread_loop(
                 // started.
                 UringRequest::Fsync { datasync, tx } => {
                     active[slot_idx] = Some(ActiveReq {
-                        response: UringResponse::Write { tx },
+                        response: UringResponse::Write {
+                            tx,
+                            submitted: None,
+                        },
                         free_ptr: None,
                         _keep_alive: None,
                         // MEM-1: a barrier carries no payload destination,
@@ -1048,7 +1078,7 @@ fn worker_thread_loop(
                                 ),
                             )));
                         }
-                        UringResponse::Write { tx } => {
+                        UringResponse::Write { tx, .. } => {
                             // DUR-2 watermark: a refusal is a terminal
                             // resolution.
                             wm.note_completed();
@@ -1153,7 +1183,7 @@ fn worker_thread_loop(
                         "NvmeBlockDev worker shutting down".to_string(),
                     )));
                 }
-                UringResponse::Write { tx } => {
+                UringResponse::Write { tx, .. } => {
                     // DUR-2 watermark: teardown is a terminal resolution.
                     wm.note_completed();
                     let _ = tx.send(Err(crate::error::SqueezefsError::InvalidOperation(
@@ -2108,6 +2138,7 @@ impl NvmeBlockDev {
                     offset,
                     data: data_type,
                     tx,
+                    enq: std::time::Instant::now(),
                 })
                 .map_err(|e| {
                     // The send never happened: terminally resolved here.
@@ -2210,6 +2241,7 @@ impl NvmeBlockDev {
                     offset,
                     data: data_type,
                     tx,
+                    enq: std::time::Instant::now(),
                 })
                 .is_err()
             {

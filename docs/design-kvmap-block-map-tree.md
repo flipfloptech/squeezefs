@@ -288,3 +288,31 @@ The PR-3 pre-implementation map's design-level facts:
    true of the map cache. The co-writer cache lands in PR 3 with a
    pluggable fill (local S5 read now; the PR-5 `GetBlockMapRange` verb
    later).
+
+## 9. Rev 1.3 — PR-2 landed deviations (2026-09-01, normative)
+
+PR 2 (`708ab67e`) landed with three deliberate deviations, each test- or
+safety-forced:
+
+1. **Co-writer NEW crossings do not ship** — a shipped `MigrateBlockMap`
+   from the routing gate let the wire self-arm bit 16 on the owner and
+   flipped every mw fleet's blob lifecycle by default (three pinned
+   blob-lifecycle contracts failed). The landed gate: a NEW crossing
+   engages only when the publish is LOCAL to an engaged volume; a
+   co-writer follows the STICKY head (once the authority crossed the
+   ino, force-kvmap saves ship the verb — witnessed, era-gated,
+   owner-ratcheted, owner-side f38 chunking, all as designed).
+2. **Fetch rehydrates the FULL tree-resolved map into `CachedMetadata`**
+   (not `block_map: None` + a per-index bridge): the write side treats
+   the RAM map as whole-map authority — a `None`-map refetch would make
+   the next save's diff MASS-DELETE live records. Consequence: write-
+   side map RAM is O(file) for now (~10 MB at the 545 GiB class —
+   acceptable; ~13 GB at PB class — NOT), so **PB-class write-side map
+   boundedness is a new ladder item** (fold with A2's sweep work /
+   PR 6): the save diff must become overlay/delta-based before PB files
+   are writable in practice. PR 3's read windowing stands unchanged
+   (read-only opens and eviction/refetch on non-writing mounts are
+   where the window bounds RAM).
+3. **PR 2 emits STRING map records only** (router-true key strings
+   verbatim); POINT encoding is the PR 3/6 economy item, decoded
+   support already whole.

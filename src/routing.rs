@@ -6578,7 +6578,7 @@ impl DataRouter {
             Vec<crate::meta_backend::kv::block_refs::BlockRefOp>,
         )>,
     > {
-        let Some((head_map, head_blob, head_size)) = self.fetch_durable_layout_head(ino).await?
+        let Some((head_map, head_map_id, head_size)) = self.fetch_durable_layout_head(ino).await?
         else {
             return Ok(None);
         };
@@ -6623,8 +6623,10 @@ impl DataRouter {
         // The durable predecessor is what this commit stops naming — the
         // snapshot's belief may lag a serve's compose (the blob-pair
         // fork). Not this mount's mint: the head's blob is the durable
-        // lifecycle this commit's CoW displaces.
-        mc.block_map_id = head_blob.map(|b| format!("indirect:{b}").into());
+        // lifecycle this commit's CoW displaces. A `kvmap:` head travels
+        // verbatim (PR 5a, §11 row 1): the composed save must re-enter
+        // the sticky kvmap arm, never regress to an inline/blob head.
+        mc.block_map_id = head_map_id.map(Into::into);
         mc.block_map_id_own_mint = false;
         // Size law: peers' growth never regresses (the serve compose's
         // max law); a claimed shrink (release-without-take beyond the
@@ -6639,9 +6641,13 @@ impl DataRouter {
         Ok(Some((mc, swap_refs)))
     }
 
-    /// Finding 35b: the DURABLE layout head — map, indirect blob key and
+    /// Finding 35b: the DURABLE layout head — map, out-of-band map id and
     /// size — read raw (no epoch overlay, no cache), for the episode
-    /// compose. `None` = no persisted layout.
+    /// compose. `None` = no persisted layout. The second element is the
+    /// head's `block_map_id` for the two OUT-OF-BAND map classes
+    /// (`indirect:{blob}` / `kvmap:…` verbatim; `None` for inline heads):
+    /// the composed save must re-enter the head's own publish arm, so the
+    /// class travels up with the map.
     async fn fetch_durable_layout_head(
         &self,
         ino: u64,
@@ -6660,7 +6666,7 @@ impl DataRouter {
         let Some(layout) = layout_opt else {
             return Ok(None);
         };
-        let mut blob_key: Option<String> = None;
+        let mut head_map_id: Option<String> = None;
         let map = if let Some(id) = layout
             .block_map_id
             .as_deref()
@@ -6674,13 +6680,35 @@ impl DataRouter {
             METRICS
                 .layout_indirect_map_read_bytes
                 .fetch_add(raw.len() as u64, Ordering::Relaxed);
-            blob_key = Some(id.to_string());
+            head_map_id = Some(format!("indirect:{id}"));
             let entries = decode_indirect_block_map(&raw)?;
             entries.into_iter().collect()
+        } else if layout
+            .block_map_id
+            .as_deref()
+            .is_some_and(|id| id.starts_with(kvmap_head_prefix()))
+        {
+            // PR 5a (design §11 row 1 — the WORST arm): a `kvmap:` head
+            // names NO inline map (`block_map: None` by format law), so
+            // the retired `unwrap_or_default()` fed the episode compose
+            // an EMPTY head and the claims diff mass-deleted every live
+            // unclaimed tree-7 record on the authority's own next publish
+            // of a range-episode kvmap ino. The head resolves through the
+            // SHARED tree-7 extraction (the C8-oracle path — Rev 1.1 #3)
+            // into the same map shape the blob/inline arms produce, and
+            // the head id travels up verbatim so the composed save
+            // re-enters the sticky kvmap arm.
+            let (v_idx, local_ino) = backend.route_ino(ino);
+            head_map_id = layout.block_map_id.clone();
+            self.backend_router
+                .kvmap_layout_entries(&backend.volumes[v_idx], local_ino)
+                .await
+                .into_iter()
+                .collect()
         } else {
             layout.block_map.clone().unwrap_or_default()
         };
-        Ok(Some((map, blob_key, layout.size)))
+        Ok(Some((map, head_map_id, layout.size)))
     }
 
     /// **The kvmap arm of the save body** (PR 2, design §3): publish `ino`
@@ -6725,6 +6753,18 @@ impl DataRouter {
         let local = crate::meta_ship::publish::publishes_locally(backend, ino);
         if !head_is_kvmap {
             if !local {
+                return Ok(None);
+            }
+            // PR 5a (design §11 row 4, the NEW-crossing half of the f34
+            // parity screen): a crossing on an ino OTHER writers hold
+            // LIVE ranges on stands down to the legacy blob arm — S11
+            // scoped Puts on a kvmap head refuse until PR 5b builds the
+            // S11 ∘ kvmap compose, so flipping the head mid-episode
+            // would wedge every ranged peer's publishes. Probed BEFORE
+            // the ratchet: a stood-down crossing must not stamp bit 16.
+            // The sticky-head twin (the refusal) lives at the train's
+            // door (`meta_ship::publish::migrate_block_map`).
+            if crate::data_grant::custody_owner().is_some_and(|o| o.ino_has_range_grants(ino)) {
                 return Ok(None);
             }
             if !backend.block_map_tree_ready(ino).await {

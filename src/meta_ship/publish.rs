@@ -1876,6 +1876,27 @@ pub async fn migrate_block_map(
         None => {
             note_local();
             let _serve_window = local_publish_guard(ino).await;
+            // PR 5a (design §11 row 4 — f34 parity, the serve arm's probe
+            // verbatim): a LOCAL whole-map train on an ino with live range
+            // grants reverts peers' entries by delete-by-absence exactly
+            // like the shipped one, and a sticky `kvmap:` head cannot fall
+            // back to the blob arm (the head would regress) — refuse loud,
+            // nothing staged; the S11 ∘ kvmap compose lands in PR 5b. The
+            // ONE exemption is the routing save's episode-compose window
+            // (finding 35b): its train input IS the durable head plus this
+            // save's claims, composed and committed under the same stripe
+            // the served scoped Puts serialize on.
+            if !serve_window_already_held()
+                && crate::data_grant::custody_owner().is_some_and(|o| o.ino_has_range_grants(ino))
+            {
+                MAP_REFUSED.fetch_add(1, Ordering::Relaxed);
+                return Err(SqueezefsError::InvalidOperation(format!(
+                    "kvmap crossing for ino {ino} refused — the ino has live range grants, \
+                     and a LOCAL whole-map train would revert peers' entries (finding 34's \
+                     class; the S11 ∘ kvmap compose lands in PR 5b); drain range custody \
+                     first (map_refused)"
+                )));
+            }
             match be
                 .migrate_block_map_train(ino, layout, size, &refs, &entries, chunk)
                 .await?

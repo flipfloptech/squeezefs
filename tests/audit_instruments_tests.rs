@@ -1085,7 +1085,7 @@ fn cpu_sample_is_monotone_class_sum_bounded_and_attributes_a_burning_thread() {
         "the retired burner's sample is kept"
     );
 
-    let json = squeezefs::daemon_cpu::by_class_json();
+    let json = s2.by_class_json();
     assert!(
         json["fuse3-tpc"].as_u64().is_some(),
         "JSON is {{class: ns}}"

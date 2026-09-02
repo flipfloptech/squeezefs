@@ -52,6 +52,7 @@ fn comm_names_fit_the_kernel_budget_for_every_base_in_the_tree() {
     let bases = [
         "sqz-ipc-svc63",
         "sqz-ipc-dd63",
+        "sqz-nvme127",
         "sqz-ipc-accept",
         "sqz-ipc-accp",
         "sqz-ipc-reap",

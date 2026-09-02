@@ -498,13 +498,22 @@ impl UringWorker {
         let (tx, rx) = crossbeam::channel::bounded(URING_REQ_QUEUE_CAP);
         let wm = Arc::new(WriteWatermark::new());
         let worker_wm = wm.clone();
-        let thread = std::thread::spawn(move || {
-            worker_thread_loop(device_path, rx, &worker_wm);
-            // Every exit path (normal drain, refused O_DIRECT open,
-            // refused ring build) lands here: unreachable watermark
-            // targets fail parked barriers loud instead of forever.
-            worker_wm.mark_dead();
-        });
+        // Named so `daemon_cpu_ns_by_class` can attribute the device lanes
+        // (e2e audit E); an unnamed worker inherited the main comm.
+        static NEXT_LANE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let lane = NEXT_LANE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let thread = std::thread::Builder::new()
+            .name(squeezefs_ipc::comm_core::comm_name(&format!(
+                "sqz-nvme{lane}"
+            )))
+            .spawn(move || {
+                worker_thread_loop(device_path, rx, &worker_wm);
+                // Every exit path (normal drain, refused O_DIRECT open,
+                // refused ring build) lands here: unreachable watermark
+                // targets fail parked barriers loud instead of forever.
+                worker_wm.mark_dead();
+            })
+            .expect("sqz-nvme worker thread spawns");
         Self {
             tx: Some(tx),
             thread: Some(thread),

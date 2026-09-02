@@ -9610,6 +9610,9 @@ impl SqueezefsFilesystem {
             .as_ref()
             .map(|h| h.wake_economy_snapshot())
             .unwrap_or((0, 0, 0));
+        // CPU attribution (e2e audit E): ONE sample — per-thread classes
+        // scanned before the process total, so Σ classes ≤ total holds.
+        let cpu = crate::daemon_cpu::sample();
 
         let mut stats_obj = serde_json::json!({
             // Build identity (docs/operations.md §Versioning & releases):
@@ -10216,6 +10219,11 @@ impl SqueezefsFilesystem {
                 // wait/hold at every site, the 4b pure leaf-lock wait,
                 // the 4a exclusive I-guard hold. ALWAYS-ON.
                 "lock_phase_ns": lock_phase_json(),
+                // CPU attribution (e2e audit E), sampled at THIS read:
+                // process utime+stime, and per-thread on-CPU ns folded by
+                // comm class (retired threads keep their last sample).
+                "daemon_cpu_ns": cpu.total_ns,
+                "daemon_cpu_ns_by_class": cpu.by_class_json(),
                 // Read-serve residence decomposition (2026-08-01
                 // serve-latency decomposition campaign): ALWAYS-ON
                 // per-phase histograms — the read twin of the family

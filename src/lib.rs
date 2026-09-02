@@ -62,6 +62,7 @@ pub(crate) mod cow_core;
 pub mod cowriter;
 pub mod cpu;
 pub mod crypto_compress;
+pub mod daemon_cpu;
 // DLM stage S7 (pre-RC spec §6.9 / §6.7 / RES-6): the data plane's
 // custody-epoch fence — ONE authorization point for every DMA submission —
 // the dead-epoch allocation quarantine, and the shared WERO hold on data

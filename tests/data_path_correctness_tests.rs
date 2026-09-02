@@ -1543,6 +1543,20 @@ async fn test_v3_six_gib_shaped_file_keeps_inline_map() {
 /// the already-indirect map, and re-inline on shrink.
 #[tokio::test]
 async fn test_v3_spill_boundary_roundtrips_both_directions() {
+    // This test pins the LEGACY indirect-blob spill (incl. the re-inline
+    // shrink, which the kvmap tree deliberately does NOT do — sticky
+    // heads); since the finding-43 self-arm, an engaged volume's crossing
+    // takes the kvmap tree by default, so hold the blob arm open via the
+    // sanctioned A/B lever (A10). The kvmap laws are pinned in the
+    // kvmap_* suites.
+    struct KnobGuard;
+    impl Drop for KnobGuard {
+        fn drop(&mut self) {
+            std::env::remove_var("SQUEEZEFS_KVMAP");
+        }
+    }
+    let _knob = KnobGuard;
+    std::env::set_var("SQUEEZEFS_KVMAP", "0");
     let (router, routed, dlm, _b, _m, _s) = v3_spill_router(DEFAULT_NODE_SIZE, "k8_boundary").await;
     let ino = mk_striped_file(&routed, "boundary").await;
     let path = format!("inode_{ino}");
@@ -1637,6 +1651,17 @@ async fn test_v3_spill_boundary_roundtrips_both_directions() {
 /// `route_ino`/`make_global_ino`.
 #[tokio::test]
 async fn test_mixed_node_size_volumes_spill_per_volume() {
+    // The LEGACY blob arm's per-volume cap arithmetic (the kvmap arm's
+    // owner-geometry cap is pinned in kvmap_crossing_tests) — held open
+    // via the sanctioned A/B lever, as above.
+    struct KnobGuard;
+    impl Drop for KnobGuard {
+        fn drop(&mut self) {
+            std::env::remove_var("SQUEEZEFS_KVMAP");
+        }
+    }
+    let _knob = KnobGuard;
+    std::env::set_var("SQUEEZEFS_KVMAP", "0");
     std::env::set_var("SQUEEZEFS_DEFAULT_BLOCK_SIZE", K8_BLOCK_SIZE.to_string());
     let dlm = DlmClient::new().unwrap();
     let backing = NamedTempFile::new().unwrap();

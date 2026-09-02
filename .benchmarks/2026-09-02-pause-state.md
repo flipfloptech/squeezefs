@@ -29,8 +29,16 @@ batch-gate rule (one `task check` per batch).
 3. Recreate the local substrate (does not survive reboot):
    `sudo SQZ_DEVSUB_TRANSPORT=tcp tests/dev_substrate.sh create`.
 4. Owed measurement rows (the campaign notes list them):
-   - W-3: tcp devsub A-B-B-A (1 MiB seq + rand-4k write) —
-     `.benchmarks/2026-09-02-w3-overlay-depth-governor.md`.
+   - W-3: tcp devsub A-B-B-A (1 MiB seq-write/rewrite + rand-4k write,
+     amplification + wareq-sz columns, sustained 60 s) — the ADJUDICATING
+     device-bound venue, skipped only because R-1's mount held the
+     substrate; rig `.benchmarks/rigs/2026-09-02-w3-field-abba.sh`; plus
+     the field sustained-60 s ON/OFF pair and the rw_4k no-regression
+     row. Field 30 s result: bandwidth par, p99.9 −17/−33 %, engagement
+     exact (`overlay_governed_stores ≡ overlay_stores`).
+   - Write-board observation (W-3, both arms, field venue):
+     `write_pipeline_admission_tick_wakes` 5.9–11.2 k per 30 s leg — a
+     pre-existing PERF-13-class signal, not W-3's; board it.
    - D-1: the mw fleet ingest row (`tests/mw_fleet.sh` + the s9 ingest
      matrix row) — `.benchmarks/2026-09-02-d1-owner-concurrent-dispatch.md`.
    - Two-profile LTO: quiet-box fat-vs-thin build-time + perf brackets;

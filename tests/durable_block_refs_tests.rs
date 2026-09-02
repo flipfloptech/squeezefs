@@ -908,6 +908,17 @@ async fn a_data_device_power_cut_leaves_ledger_and_layout_agreeing() {
 /// live map's block to the next writer.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_indirect_map_blob_carries_its_own_durable_reference() {
+    // The LEGACY blob contract — since the finding-43 self-arm, a fresh
+    // volume's crossing takes the kvmap tree by default, so this pin
+    // holds the blob arm open via the sanctioned A/B lever (A10).
+    struct KnobGuard;
+    impl Drop for KnobGuard {
+        fn drop(&mut self) {
+            std::env::remove_var("SQUEEZEFS_KVMAP");
+        }
+    }
+    let _knob = KnobGuard;
+    std::env::set_var("SQUEEZEFS_KVMAP", "0");
     let meta = NamedTempFile::new().unwrap();
     format_meta_stamped(meta.path()).await;
     let data = data_file();

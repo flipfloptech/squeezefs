@@ -45,10 +45,17 @@ use tempfile::{tempdir, NamedTempFile, TempDir};
 static SERIAL: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
 
 async fn serial() -> tokio::sync::MutexGuard<'static, ()> {
-    SERIAL
+    let g = SERIAL
         .get_or_init(|| tokio::sync::Mutex::new(()))
         .lock()
-        .await
+        .await;
+    // This whole suite pins the LEGACY indirect-blob path — since the
+    // finding-43 self-arm, a fresh volume's crossing takes the kvmap tree
+    // by default, so the suite holds the blob arm open via the sanctioned
+    // A/B lever (A10) for its whole process; suites are separate test
+    // binaries, so nothing leaks across files.
+    std::env::set_var("SQUEEZEFS_KVMAP", "0");
+    g
 }
 
 /// Router block size: big enough that the spilled indirect blob (≈22 KiB at

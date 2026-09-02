@@ -548,37 +548,52 @@ async fn crash_residue_is_invisible_and_the_recross_sweeps_it() {
 /// crossing never self-arms a volume — the D9 caution), and the kvmap
 /// counters stay flat.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn an_unstamped_volume_keeps_the_legacy_blob_arm_verbatim() {
+async fn a_fresh_volume_self_arms_at_its_first_crossing() {
+    // Finding 43 (the kvmap reachability bug, caught by the first
+    // live-mount smoke): PR 2's gate pre-probed `block_map_tree_engaged`
+    // — true only after the tree exists — while the ONLY thing that ever
+    // stamps bit 16 and mints the tree is the train BEHIND that gate,
+    // and no offline stamping verb exists. Every real mount's crossings
+    // took the legacy blob arm forever (the smoke: 1,324 indirect full
+    // saves, zero map records) — the posture-dispatch reachability
+    // class. The design's law (§2, the bit-5 KV_LAYOUT_DELTAS
+    // precedent): the ratchet SELF-ARMS at first use — stamped+barriered
+    // before the volume's first map record, never on untouched volumes
+    // (a volume that never crosses stays byte-identical; that pin lives
+    // in kvmap_tree_tests).
     let _serial = serial();
     let meta = NamedTempFile::new().unwrap();
     format_meta(meta.path()).await;
     assert!(set_block_refcounts_bit(meta.path()).await.unwrap());
     let data = data_file();
     let rig = mount(meta.path(), data.path()).await;
-    assert!(!rig.kv().block_map_tree_engaged());
-    let ino = rig.mk_file("legacy").await;
+    assert!(
+        !rig.kv().block_map_tree_engaged(),
+        "fixture: the volume starts un-stamped"
+    );
+    let ino = rig.mk_file("selfarm").await;
 
     let inos_before = METRICS.map_migrate_inos.load(Ordering::Relaxed);
-    rig.publish_spill(ino, SPILL_BLOCKS).await;
+    let entries = rig.publish_spill(ino, SPILL_BLOCKS).await;
 
-    let bytes = rig
-        .kv()
-        .getxattr(ino, "layout")
-        .await
-        .unwrap()
-        .expect("head");
-    let head: LayoutMetadata = bincode::deserialize(&bytes).expect("bincode head");
-    assert!(
-        head.block_map_id
-            .as_deref()
-            .is_some_and(|id| id.starts_with("indirect:")),
-        "the legacy blob arm ran: {:?}",
-        head.block_map_id
+    let head = rig.durable_head(ino).await;
+    assert_eq!(
+        head.block_map_id.as_deref(),
+        Some("kvmap:1"),
+        "the first crossing on a fresh volume must SELF-ARM and take the \
+         tree (finding 43: the engaged-only gate made kvmap unreachable \
+         on every real mount)"
     );
     assert_eq!(
         METRICS.map_migrate_inos.load(Ordering::Relaxed),
-        inos_before,
-        "no kvmap train ran"
+        inos_before + 1,
+        "the train ran"
+    );
+    let records = rig.tree_records(ino).await;
+    assert_eq!(
+        records.len(),
+        entries.len(),
+        "the tree carries every mapping"
     );
     assert!(rig.drift().await.is_empty());
     rig.shutdown().await;
@@ -587,8 +602,8 @@ async fn an_unstamped_volume_keeps_the_legacy_blob_arm_verbatim() {
         panic!("expected v3");
     };
     assert!(
-        !sb.block_map_tree_stamped(),
-        "a local crossing on an un-stamped volume must NOT stamp bit 16"
+        sb.block_map_tree_stamped(),
+        "bit 16 is durable after the self-arming crossing"
     );
 }
 
@@ -687,6 +702,18 @@ async fn a_legacy_indirect_ino_converts_on_its_first_publish() {
     assert!(set_block_refcounts_bit(meta.path()).await.unwrap());
     let data = data_file();
     let ino = {
+        // Build the LEGACY head under `SQUEEZEFS_KVMAP=0` — since the
+        // finding-43 self-arm fix, an un-stamped volume's crossing would
+        // otherwise engage the tree; the knob is the sanctioned lever
+        // that keeps the blob arm (A10).
+        struct KnobGuard;
+        impl Drop for KnobGuard {
+            fn drop(&mut self) {
+                std::env::remove_var("SQUEEZEFS_KVMAP");
+            }
+        }
+        let _knob = KnobGuard;
+        std::env::set_var("SQUEEZEFS_KVMAP", "0");
         let rig = mount(meta.path(), data.path()).await;
         let ino = rig.mk_file("converted").await;
         rig.publish_spill(ino, SPILL_BLOCKS).await;

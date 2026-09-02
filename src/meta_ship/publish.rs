@@ -1637,7 +1637,12 @@ pub async fn merge_layout_and_size(
                 let used = be
                     .merge_layout_and_size(ino, delta, full_layout, size, refs)
                     .await?;
-                Ok((used, if used { delta.version } else { 0 }, false, Vec::new()))
+                Ok((
+                    used,
+                    if used { delta.version } else { 0 },
+                    false,
+                    Vec::new(),
+                ))
             }
         }
         Some(peer) => {

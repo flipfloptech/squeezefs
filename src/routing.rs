@@ -6250,7 +6250,10 @@ impl DataRouter {
                     ),
                 )
                 .await?;
-                debug_assert!(body_released.is_empty(), "the episode body never recomputes");
+                debug_assert!(
+                    body_released.is_empty(),
+                    "the episode body never recomputes"
+                );
                 let _ = self.inner.publish_recomputed.insert_sync(ino, ());
                 return Ok((true, released));
             }
@@ -6911,8 +6914,10 @@ impl DataRouter {
                 }
             }
         } else {
-            match crate::meta_ship::publish::set_layout_and_size(backend, ino, &bytes, m.size, &refs)
-                .await
+            match crate::meta_ship::publish::set_layout_and_size(
+                backend, ino, &bytes, m.size, &refs,
+            )
+            .await
             {
                 // Finding 36b: the OWNER's custody-scoped compose
                 // recomputed this Put's accounting and owns its displaced
@@ -11317,8 +11322,7 @@ impl DataRouter {
                 // shipped-free ladder post-guard (RES-1), post-commit
                 // (§5.2).
                 if !local_released.is_empty() {
-                    crate::meta_ship::publish::free_recomputed_releases(ino, local_released)
-                        .await;
+                    crate::meta_ship::publish::free_recomputed_releases(ino, local_released).await;
                 }
                 // Finding 36 (half 2, the epoch face): a covering publish
                 // whose accounting was recomputed owns these device frees
@@ -12167,10 +12171,7 @@ impl DataRouter {
                     // mounts, no resolver armed) keep the caller stream
                     // verbatim.
                     let payload = if owner_recomputed {
-                        crate::cowriter::retire_displaced_locally(
-                            &self.backend_router,
-                            &o.payload,
-                        );
+                        crate::cowriter::retire_displaced_locally(&self.backend_router, &o.payload);
                         Vec::new()
                     } else {
                         o.payload

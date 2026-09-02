@@ -1469,7 +1469,10 @@ async fn shipped_merges_chain_onto_the_head_and_never_clobber_a_peer() {
         request_id: 0xC1,
     };
     let r1 = pc.ship(&auth.endpoint, p1).await.expect("W1's merge lands");
-    let publish::PublishReply::DeltaUsed { used, version: v1, .. } = r1 else {
+    let publish::PublishReply::DeltaUsed {
+        used, version: v1, ..
+    } = r1
+    else {
         panic!("the merge reply carries the staged version: {r1:?}");
     };
     assert!(
@@ -1497,7 +1500,10 @@ async fn shipped_merges_chain_onto_the_head_and_never_clobber_a_peer() {
         request_id: 0xC2,
     };
     let r2 = pc.ship(&auth.endpoint, p2).await.expect("W2's merge lands");
-    let publish::PublishReply::DeltaUsed { used, version: v2, .. } = r2 else {
+    let publish::PublishReply::DeltaUsed {
+        used, version: v2, ..
+    } = r2
+    else {
         panic!("reply shape: {r2:?}");
     };
     assert!(used, "W2's merge chained as a delta too");

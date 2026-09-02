@@ -4899,7 +4899,11 @@ async fn a_failed_shipped_merge_frees_nothing_on_either_side() {
     let x_off = auth.alloc.allocate_block().await.expect("mint X");
     let x_idx = x_off / auth.alloc.chunk_size();
     let ino_live = authority_file_with_block(&auth, "f36-live.bin", x_idx).await;
-    assert_eq!(auth.population(x_idx).await, 1, "fixture: X is live (ino {ino_live})");
+    assert_eq!(
+        auth.population(x_idx).await,
+        1,
+        "fixture: X is live (ino {ino_live})"
+    );
 
     let cwr = CoWriter::join(&auth, &vol, &dev, NODE_A).await;
     let stage = tempdir().unwrap();
@@ -5492,7 +5496,11 @@ async fn an_authority_local_publish_frees_a_co_writer_minted_displaced_block() {
     let stage = tempdir().unwrap();
     let dlm = DlmClient::new().expect("dlm");
     let router = save_router(&dlm, &cwr.alloc, &dev, &cwr.meta, stage.path()).await;
-    let n1_off = cwr.alloc.allocate_block().await.expect("mint N1 (co-writer lane)");
+    let n1_off = cwr
+        .alloc
+        .allocate_block()
+        .await
+        .expect("mint N1 (co-writer lane)");
     let n1_idx = n1_off / bs;
     cwr.alloc.publish_block(n1_off);
     let mut e = dirty_inline_entry(fsz, &x_off.to_string());
@@ -5525,12 +5533,17 @@ async fn an_authority_local_publish_frees_a_co_writer_minted_displaced_block() {
     let auth_stage = tempdir().unwrap();
     let auth_dlm = DlmClient::new().expect("dlm");
     fuse_client::set_mount_posture(MountPosture::Writer);
-    let auth_router = save_router(&auth_dlm, &auth.alloc, &dev, &auth.meta, auth_stage.path()).await;
+    let auth_router =
+        save_router(&auth_dlm, &auth.alloc, &dev, &auth.meta, auth_stage.path()).await;
     let untracked_before = METRICS
         .block_untracked_free_refusals
         .load(Ordering::Relaxed);
     let recomputed_before = publish::stats().free_recomputed_blocks;
-    let a1_off = auth.alloc.allocate_block().await.expect("authority mint A1");
+    let a1_off = auth
+        .alloc
+        .allocate_block()
+        .await
+        .expect("authority mint A1");
     auth.alloc.publish_block(a1_off);
     let mut e = dirty_inline_entry(fsz, &n1_off.to_string());
     e.layout_delta_chain = LAYOUT_DELTA_CHAIN_INELIGIBLE;

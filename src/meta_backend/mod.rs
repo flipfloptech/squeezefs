@@ -3342,7 +3342,12 @@ impl RoutedMetaBackend {
         self.check_volume_enabled(v_idx)?;
         let out = self.volumes[v_idx]
             .merge_layout_and_size_chained_accounted(
-                local_ino, ino, delta, full_layout, size, block_refs,
+                local_ino,
+                ino,
+                delta,
+                full_layout,
+                size,
+                block_refs,
             )
             .await;
         if out.is_err() {

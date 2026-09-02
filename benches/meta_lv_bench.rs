@@ -1415,6 +1415,110 @@ fn bench_block_refs(c: &mut Criterion) {
     group.finish();
 }
 
+/// **PB-class files, PR 1 — the block-map tree's codec + lookup floors**
+/// (docs/design-kvmap-block-map-tree.md §2/§3). Field shape: a
+/// **512 GiB file at 4 MiB blocks = 131,072 point mappings** — the first
+/// shape past the retired ~545 GiB indirect-blob ceiling (design §0/§5)
+/// and the population `get_block_mapping` serves per giant-file read.
+/// 12 B BE keys, 18 B POINT values (`vol_tag` = the durable KD-5
+/// identity, here `vol-…a1`'s verbatim decode).
+fn bench_kvmap(c: &mut Criterion) {
+    use squeezefs::meta_backend::kv::block_map::{
+        block_map_key, decode_block_map_key, decode_block_map_value, MapEntry,
+    };
+    use squeezefs::meta_backend::kv::block_refs::volume_tag;
+    use squeezefs::meta_backend::kv::record::TREE_BLOCK_MAP;
+
+    let rt = Runtime::new().unwrap();
+    let mut group = c.benchmark_group("kvmap");
+    let vol_tag = volume_tag("vol-00000000000000a1");
+    /// 512 GiB ÷ 4 MiB blocks.
+    const MAPPINGS: u32 = 131_072;
+
+    // --- The codec floors (per record staged / resolved). ---------------
+    group.throughput(criterion::Throughput::Elements(1));
+    group.bench_function("key_codec", |b| {
+        b.iter(|| {
+            let k = block_map_key(black_box(900_001), black_box(77_000)).expect("legal index");
+            black_box(decode_block_map_key(&k).expect("roundtrip"))
+        });
+    });
+    let point = MapEntry::Point {
+        vol_tag,
+        offset: 77_000u64 * 4 * 1024 * 1024,
+    };
+    group.bench_function("point_value_codec", |b| {
+        b.iter(|| {
+            let v = black_box(&point).encode();
+            black_box(decode_block_map_value(&v).expect("roundtrip"))
+        });
+    });
+
+    // --- Exact-key resolution against the populated field fixture. ------
+    // The warm `get_block_mapping` shape: node-cache-resident tree-7
+    // leaves, latch-free snapshot fold (design §3 read law).
+    let file = NamedTempFile::new().expect("temp volume");
+    let node_size = DEFAULT_NODE_SIZE;
+    let extents = 4096u64;
+    file.as_file()
+        .set_len(extents * node_size as u64)
+        .expect("size volume");
+    let cache = NodeCache::new(NodeCacheConfig {
+        path: file.path().to_path_buf(),
+        layout: NodeLayout::new(node_size).expect("layout"),
+        heap_base: 0,
+        budget_bytes: extents * node_size as u64,
+        writeback_delta_bytes: DEFAULT_WRITEBACK_DELTA_BYTES,
+    });
+    let alloc = Arc::new(ExtentAllocator::format(extents, 0, 4096));
+    let mut ctx = SmoContext::new(alloc);
+    const OWNER_INO: u64 = 900_001;
+    let tree = rt.block_on(async {
+        let tree = KvTree::create(
+            cache.clone(),
+            &mut ctx,
+            TREE_BLOCK_MAP,
+            Arc::new(AtomicU64::new(0)),
+        )
+        .await
+        .expect("create tree 7");
+        for i in 0..MAPPINGS {
+            let key = block_map_key(OWNER_INO, i).expect("legal index");
+            let entry = MapEntry::Point {
+                vol_tag,
+                offset: u64::from(i) * 4 * 1024 * 1024,
+            };
+            tree.insert(&key, entry.encode()).await.expect("insert");
+            if i % 4096 == 0 {
+                while tree.maintenance_pending() {
+                    tree.run_maintenance(&mut ctx).await.expect("maintenance");
+                }
+            }
+        }
+        tree.flush_dirty(&mut ctx).await.expect("flush");
+        tree
+    });
+    group.bench_function("point_lookup_512g_fixture", |b| {
+        let mut i = 0u32;
+        b.to_async(&rt).iter(|| {
+            let tree = &tree;
+            // 7919 is coprime to the population: a full-cycle stride, so
+            // the lookups walk every leaf instead of one hot bset.
+            let key = block_map_key(OWNER_INO, i % MAPPINGS).expect("legal index");
+            i = i.wrapping_add(7919);
+            async move {
+                let v = tree
+                    .lookup(black_box(&key))
+                    .await
+                    .expect("lookup")
+                    .expect("populated fixture");
+                black_box(decode_block_map_value(&v).expect("decode"));
+            }
+        });
+    });
+    group.finish();
+}
+
 /// **DLM S3.5 — the cross-volume intent-record path** (design-cow-kv-
 /// metadata §4.11; DUR-7). The transaction's per-op CPU cost that is NOT
 /// already a journal entry is exactly this: mint the id, encode the plan,
@@ -1831,6 +1935,7 @@ criterion_group!(
     bench_kv_journal,
     bench_ino_cursors,
     bench_block_refs,
+    bench_kvmap,
     bench_fsck_c9_refset,
     bench_fsck_c10_name_counts,
     bench_crossvol_tx,

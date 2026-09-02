@@ -2939,6 +2939,7 @@ impl KvMetaBackend {
         super::META_KV_BLOCK_MAP_LOOKUP_RANGE.fetch_add(1, Ordering::Relaxed);
         let (lo, hi) = super::block_map::index_range_from(ino, from_index);
         let page = tree.range(&lo, &hi, max).await?;
+        super::META_KV_BLOCK_MAP_RANGE_RECORDS.fetch_add(page.len() as u64, Ordering::Relaxed);
         let mut out = Vec::with_capacity(page.len());
         for (k, v) in &page {
             let (owner, index) = super::block_map::decode_block_map_key(k)?;

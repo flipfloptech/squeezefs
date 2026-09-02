@@ -10977,6 +10977,12 @@ impl SqueezefsFilesystem {
                     "meta_kv_block_map_lookup_range".into(),
                     load(&meta_kv::META_KV_BLOCK_MAP_LOOKUP_RANGE),
                 );
+                // Finding 46: records paged by those range calls — the
+                // direct tree-reads-per-publish instrument.
+                metrics.insert(
+                    "meta_kv_block_map_range_records".into(),
+                    load(&meta_kv::META_KV_BLOCK_MAP_RANGE_RECORDS),
+                );
                 // PR 6a (design §12): run emission + the A6 floor probe.
                 metrics.insert(
                     "meta_kv_block_map_run_puts".into(),

@@ -324,6 +324,14 @@ pub static META_KV_BLOCK_MAP_RUN_PUTS: AtomicU64 = AtomicU64::new(0);
 /// it lands with the §8 window cache on the map-RAM-boundedness rung.)
 pub static META_KV_BLOCK_MAP_LOOKUP_RANGE: AtomicU64 = AtomicU64::new(0);
 
+/// Finding 46: tree-7 RECORDS returned by `block_map_range` pages — the
+/// direct "tree reads per publish" instrument (a page count hides the
+/// page width: the 2026-09-02 field row paid ~4.6 pages ≈ the ino's
+/// WHOLE record population per steady-state publish). `records ÷
+/// publishes` growing with file size is the whole-map diff running where
+/// only a window should. Surfaced as `meta_kv_block_map_range_records`.
+pub static META_KV_BLOCK_MAP_RANGE_RECORDS: AtomicU64 = AtomicU64::new(0);
+
 /// PB-class files, PR 3 (§8 #5): tree-7 LEAF nodes demand-paged off the
 /// device — counted at the node-cache miss site (`CachedNode` carries
 /// `tree_id`, so attribution is one compare on the already-cold load

@@ -86,6 +86,9 @@ struct SlotCtl {
     /// The extract half of the dead ring: `materialize()` fails
     /// `Unsupported` too (bytes unreachable — the honest-loss arm).
     extract_dead: std::sync::atomic::AtomicBool,
+    /// Modeled device service time per store (ms) — the W-3 governor
+    /// contracts' BDP input (0 = the pwrite's own latency).
+    service_ms: std::sync::atomic::AtomicU64,
 }
 
 impl SlotCtl {
@@ -98,6 +101,7 @@ impl SlotCtl {
             sound,
             store_dead: std::sync::atomic::AtomicBool::new(false),
             extract_dead: std::sync::atomic::AtomicBool::new(false),
+            service_ms: std::sync::atomic::AtomicU64::new(0),
         })
     }
 
@@ -137,6 +141,10 @@ fn arm_slot_seam(ctl: Arc<SlotCtl>) {
                         .is_ok()
                     {
                         return Err(std::io::Error::from_raw_os_error(libc::EIO));
+                    }
+                    let svc = c.service_ms.load(Ordering::Relaxed);
+                    if svc > 0 {
+                        squeezefs_ipc::sqz_time::sleep(Duration::from_millis(svc)).await;
                     }
                     let n = unsafe {
                         libc::pwrite(fd, b.as_ptr().cast(), b.len(), dev_off as libc::off_t)
@@ -1011,4 +1019,208 @@ async fn stale_size_seed_class_never_zeros_a_published_overlay_sibling() {
     // B's own bytes are intact on both sides of the boundary.
     let bband = read_at(&h, ino, 4 * BS - 8192, 16384).await;
     assert_eq!(bband, vec![0x5Bu8; 16384], "B's bytes intact");
+}
+
+// ---------------------------------------------------------------------------
+// W-3 (e2e perf audit, write board #3): the overlay rides the write-
+// pipeline depth governor. The ACK-early store used to issue open-loop —
+// no admission against the BDP target, in-flight bytes invisible to
+// `write_pipeline_inflight_bytes`, completions never feeding the lane —
+// which is the 0.68–0.80× device-bound-venue loss the overlay notes'
+// own bracket rows recorded. ACK-early semantics are unchanged: only
+// ADMISSION waits when the pipe is over target (the accumulation
+// path's honest backpressure, `write_pipeline.rs` module docs).
+// ---------------------------------------------------------------------------
+
+/// Restores the adaptive governor when a test exits by any arm.
+struct DepthOverrideGuard;
+impl Drop for DepthOverrideGuard {
+    fn drop(&mut self) {
+        squeezefs::write_pipeline::set_depth_override(None);
+    }
+}
+
+/// An overlay-store burst beyond the depth target must PARK in pipeline
+/// admission: `write_pipeline_admission_waits` moves and
+/// `write_pipeline_inflight_bytes` stays bounded by `depth_target`,
+/// while every admitted store still ACKs early (the gate is closed —
+/// no CQE has landed when the ACKs return).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn overlay_store_burst_parks_in_pipeline_admission_beyond_depth_target() {
+    let _g = serial().await;
+    let _o = DepthOverrideGuard;
+    let ctl = SlotCtl::new(true);
+    let mut h = make("ackearly-gov-park").await;
+    // In-process fixtures never run the R5 sampler (budget 0 ⇒ the pipe
+    // caps at ONE block): give the governor a real cap, never Red.
+    h.fs.write_pipeline =
+        squeezefs::write_pipeline::WritePipeline::with_caps(Arc::new(|| false), Some(1 << 30));
+    let ino = create(&h, "f").await;
+    promote_striped(&h, ino).await;
+    // Pin the aggregate target at TWO blocks (in this suite one store =
+    // one whole BS block): the third store's admission must park.
+    squeezefs::write_pipeline::set_depth_override(Some(2));
+    arm_slot_seam(ctl.clone());
+
+    let waits0 = h.fs.write_pipeline.admission_waits();
+    let acked0 = METRICS.overlay_ack_early_stores.load(Ordering::Relaxed);
+    let target = h.fs.write_pipeline.depth_target_bytes(BS);
+    assert_eq!(target, 2 * BS, "pinned target");
+
+    let data = vec![0xC3u8; BS as usize];
+    let mut tasks = Vec::new();
+    for blk in 2u64..5 {
+        let fs = h.fs.clone();
+        let req = h.req;
+        let d = bytes::Bytes::copy_from_slice(&data);
+        tasks.push(tokio::spawn(async move {
+            fs.write(req, ino, 0, blk * BS, d, 0, 0)
+                .await
+                .expect("overlay write")
+                .written
+        }));
+    }
+    // Two stores admit and ACK early (gate closed ⇒ their DMAs are in
+    // flight); the third must be parked in admission, NOT in flight.
+    eventually(
+        || METRICS.overlay_ack_early_stores.load(Ordering::Relaxed) >= acked0 + 2,
+        "two ack-early stores admitted",
+    )
+    .await;
+    let pipe = h.fs.write_pipeline.clone();
+    eventually(
+        move || pipe.admission_waits() > waits0,
+        "the third overlay store must park in write-pipeline admission \
+         (write_pipeline_admission_waits) — today the overlay admits open-loop",
+    )
+    .await;
+    let inflight = h.fs.write_pipeline.inflight_bytes();
+    assert!(
+        inflight <= target && inflight >= 2 * BS,
+        "overlay in-flight bytes must ride write_pipeline_inflight_bytes and stay \
+         bounded by the depth target (inflight {inflight}, target {target})"
+    );
+    assert_eq!(
+        METRICS.overlay_ack_early_stores.load(Ordering::Relaxed),
+        acked0 + 2,
+        "the parked store must not have ACKed (it is not admitted)"
+    );
+
+    // Drain: completions release custody, the parked store admits and
+    // ACKs, everything lands and reads back exact.
+    ctl.open_gate();
+    for t in tasks {
+        assert_eq!(t.await.expect("join"), BS as u32);
+    }
+    assert_eq!(
+        METRICS.overlay_ack_early_stores.load(Ordering::Relaxed),
+        acked0 + 3,
+        "all three stores ACK early once admitted"
+    );
+    let c = ctl.clone();
+    eventually(
+        move || c.releases.load(Ordering::SeqCst) == 3,
+        "all three retained slots released at their CQEs",
+    )
+    .await;
+    assert!(
+        h.fs.write_pipeline.quiesce(Duration::from_secs(10)).await,
+        "overlay permits must settle to zero once every CQE landed"
+    );
+    for blk in 2u64..5 {
+        let back = read_at(&h, ino, blk * BS, BS as u32).await;
+        assert_eq!(back, data, "readback block {blk}");
+    }
+    clear_test_zc_slot_wrap();
+}
+
+/// Overlay completions must FEED the lane's BDP: an overlay-only stream
+/// with a modeled service time whose bandwidth × latency exceeds the
+/// cold floor must raise `write_pipeline_depth_target_base` above it.
+/// Today the lane never learns from the overlay (base stays pinned at
+/// the floor for the life of the stream).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn overlay_completions_feed_the_lane_bdp() {
+    let _g = serial().await;
+    let _o = DepthOverrideGuard;
+    squeezefs::write_pipeline::set_depth_override(None);
+    let ctl = SlotCtl::new(true);
+    // 20 ms per store: at the 8-block cold floor that is 8 × 64 KiB /
+    // 20 ms ≈ 26 MB/s × 20 ms × HEADROOM ≈ 1.5 MiB of BDP target — three
+    // floors — so a learning lane MUST leave the floor.
+    ctl.service_ms.store(20, Ordering::Relaxed);
+    let mut h = make("ackearly-gov-learn").await;
+    h.fs.write_pipeline =
+        squeezefs::write_pipeline::WritePipeline::with_caps(Arc::new(|| false), Some(1 << 30));
+    let ino = create(&h, "f").await;
+    promote_striped(&h, ino).await;
+    arm_slot_seam(ctl.clone());
+    ctl.open_gate();
+    ctl.open_gate();
+
+    let floor = squeezefs::write_pipeline::FLOOR_BLOCKS_PER_LANE * BS;
+    let base0 = h.fs.write_pipeline.depth_target_base_bytes(BS);
+    assert_eq!(
+        base0, floor,
+        "precondition: the promote's two accumulation samples leave the base at the cold floor"
+    );
+
+    // Overlay-only stream: 16 writers over disjoint fresh blocks until
+    // the governor's base moves (or the deadline convicts it).
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let next = Arc::new(std::sync::atomic::AtomicU64::new(2));
+    let data = bytes::Bytes::from(vec![0x7Eu8; BS as usize]);
+    let writers: Vec<_> = (0..16)
+        .map(|_| {
+            let fs = h.fs.clone();
+            let req = h.req;
+            let stop = stop.clone();
+            let next = next.clone();
+            let d = data.clone();
+            tokio::spawn(async move {
+                while !stop.load(Ordering::Relaxed) {
+                    let blk = next.fetch_add(1, Ordering::Relaxed);
+                    if blk >= 1500 {
+                        break;
+                    }
+                    let w = fs
+                        .write(req, ino, 0, blk * BS, d.clone(), 0, 0)
+                        .await
+                        .expect("overlay write");
+                    assert_eq!(w.written, BS as u32);
+                }
+            })
+        })
+        .collect();
+    let deadline = std::time::Instant::now() + Duration::from_secs(6);
+    let mut learned = None;
+    while std::time::Instant::now() < deadline {
+        let base = h.fs.write_pipeline.depth_target_base_bytes(BS);
+        if base > floor {
+            learned = Some(base);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    stop.store(true, Ordering::Relaxed);
+    for w in writers {
+        w.await.expect("writer");
+    }
+    let stores = METRICS.overlay_ack_early_stores.load(Ordering::Relaxed);
+    assert!(
+        learned.is_some(),
+        "an overlay-only stream must feed the lane's BDP: \
+         write_pipeline_depth_target_base stayed at the floor ({floor}) after \
+         {stores} ack-early stores — the governor never learned from the overlay"
+    );
+    assert_eq!(
+        METRICS.overlay_ack_early_lost.load(Ordering::Relaxed),
+        0,
+        "no acked custody lost"
+    );
+    assert!(
+        h.fs.write_pipeline.quiesce(Duration::from_secs(20)).await,
+        "overlay permits settle to zero at stream end"
+    );
+    clear_test_zc_slot_wrap();
 }

@@ -316,3 +316,36 @@ safety-forced:
 3. **PR 2 emits STRING map records only** (router-true key strings
    verbatim); POINT encoding is the PR 3/6 economy item, decoded
    support already whole.
+
+## 10. Rev 1.4 — finding 43 + PR-3 landed deviations (2026-09-01, normative)
+
+**Finding 43 (fixed `fc0549aa`)**: PR 2's crossing gate pre-probed
+`block_map_tree_engaged` — circular, since only the train behind the gate
+stamps the bit and no offline verb exists: kvmap was UNREACHABLE on every
+real mount (caught by the first live smoke: 1,324 blob saves, zero map
+records). The normative law is what §2 always said — the bit-5
+stamp-at-first-use ratchet: a local new crossing SELF-ARMS via the routed
+`block_map_tree_ready(ino)` probe at the decision point, before any state
+is consumed; ratchet failure keeps the legacy blob arm; untouched volumes
+stay byte-identical. Live-verified: self-arm + legacy→kvmap conversion of
+3 blob-headed inos, crc32c-verified reads, remount byte-identity, oracle
+drift 0.
+
+**PR 3 (`e424ba0a`) deviations:**
+
+1. **Incarnation-era keys keep STRING records** (a real §2 gap): with
+   bit 13 engaged (the default format), `persist_block_key` output is not
+   a pure function of `(vol_tag, offset)` — an 18-byte POINT cannot carry
+   the lifetime stamp, and re-attaching the CURRENT stamp at decode would
+   let a freed-and-reissued offset pass the staleness refusal. POINT
+   engages on disengaged eras and on any exactly-round-tripping key
+   (pinned); a stamped-key-capable compact form joins PR 6's value work.
+   Measured shrink where POINT engages: 35.9 % of map-record bytes.
+2. **A5 EFBIG pre-existed** via the `max_file_size()` screen (its bound
+   IS the u32 index law); PR 3 pinned the kvmap-class boundary contracts
+   (last legal index `u32::MAX − 1` round-trips; minting `u32::MAX`
+   refuses with zero map-plane side effects) and corrected §5's ceiling
+   arithmetic comment (16 PiB − one block at 4 MiB blocks).
+3. **The §8 overlay-hit gauge is deferred** to the map-RAM-boundedness
+   rung: Rev 1.3 #2's whole-map fetch has no per-index overlay-vs-tree
+   decision point to count.

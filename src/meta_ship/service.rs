@@ -127,6 +127,15 @@ squeezefs_ipc::sqz_task_local! {
 /// causally dependent on them, and two ops racing such a child through
 /// its own ino are exactly the 4a-guard race two local tasks have today.
 pub fn dependency_chains(ops: &[MetaOp]) -> Vec<usize> {
+    let named: Vec<Vec<u64>> = ops.iter().map(|op| op.call.named_inos()).collect();
+    chains_by_named_inos(&named)
+}
+
+/// The relation behind [`dependency_chains`], over the named-inode lists
+/// themselves — shared with the S9 publish plane (D-1b), whose frames
+/// partition by the same overlap. `named[i]` is op `i`'s named inodes; an
+/// op naming nothing is its own chain.
+pub fn chains_by_named_inos(named: &[Vec<u64>]) -> Vec<usize> {
     fn find(parent: &mut [usize], mut x: usize) -> usize {
         while parent[x] != x {
             parent[x] = parent[parent[x]];
@@ -134,10 +143,10 @@ pub fn dependency_chains(ops: &[MetaOp]) -> Vec<usize> {
         }
         x
     }
-    let mut parent: Vec<usize> = (0..ops.len()).collect();
+    let mut parent: Vec<usize> = (0..named.len()).collect();
     let mut last_by_ino: HashMap<u64, usize> = HashMap::new();
-    for (i, op) in ops.iter().enumerate() {
-        for ino in op.call.named_inos() {
+    for (i, inos) in named.iter().enumerate() {
+        for &ino in inos {
             if let Some(&j) = last_by_ino.get(&ino) {
                 let a = find(&mut parent, i);
                 let b = find(&mut parent, j);
@@ -149,7 +158,7 @@ pub fn dependency_chains(ops: &[MetaOp]) -> Vec<usize> {
         }
     }
     let mut dense: HashMap<usize, usize> = HashMap::new();
-    (0..ops.len())
+    (0..named.len())
         .map(|i| {
             let root = find(&mut parent, i);
             let next = dense.len();

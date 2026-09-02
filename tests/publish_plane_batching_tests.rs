@@ -275,13 +275,17 @@ impl TwoNodes {
         }
     }
 
-    /// Warm the publish session so measured frames pay no connect (the
-    /// D-1 discipline), against an ino the row never touches.
+    /// Warm the publish session POOL so measured frames pay no connect
+    /// (the D-1 discipline): a burst wide enough to dial every session
+    /// the derived depth allows, against inos the rows never touch.
     async fn warm(&self) {
-        let warm = mint(&self.owner_be, 1, "warm").await[0];
-        publish::set_layout_and_size(&self.client_be, warm, &layout_bytes(1), 1, &[])
-            .await
-            .expect("the warm publish lands");
+        let warm = mint(&self.owner_be, 16, "warm").await;
+        for round in 0..3 {
+            let (outcomes, _) = self.publish_concurrently(&warm, |_| round + 1).await;
+            for out in outcomes {
+                out.expect("the warm publish lands");
+            }
+        }
     }
 
     /// Ship `inos.len()` layout publishes CONCURRENTLY from the co-writer
@@ -732,12 +736,16 @@ async fn the_in_flight_frame_depth_is_pipelined_and_bounded() {
     let _restore = restore();
     let dir = TempDir::new().unwrap();
     let pc = publish::PublishClient::with_depth(NODE, SECRET.to_vec(), 2);
+    // No warm-up: a fresh lane, so every session this test sees is one
+    // the depth bound admitted.
     let nodes = TwoNodes::start(dir.path(), pc).await;
-    nodes.warm().await;
     let inos = mint(&nodes.owner_be, 3, "depth").await;
     let (x, y, z) = (inos[0], inos[1], inos[2]);
-    let admitted = || nodes.auth.listener.stats().sessions_admitted;
-    let base = admitted();
+    // The publish plane's own dial count (the listener's admissions also
+    // count the custody plane's sessions).
+    let dials = || publish::stats().ship_session_dials;
+    let served_frames = || publish::stats().served_frames;
+    let (base, frames0) = (dials(), served_frames());
 
     let park_x = publish::test_lock_serve_ino(x).await;
     let park_y = publish::test_lock_serve_ino(y).await;
@@ -748,23 +756,41 @@ async fn the_in_flight_frame_depth_is_pipelined_and_bounded() {
         })
     };
 
-    // Frame 1 (X) parks at the owner on the pooled session.
+    // Frame 1 (X) dials the first session and parks at the owner.
     let hx = submit(x);
-    // Frame 2 (Y) must go out WHILE X is parked: a second session dials.
+    assert!(
+        eventually(Duration::from_secs(3), || served_frames() == frames0 + 1).await,
+        "X's frame reached the owner"
+    );
+    // Frame 2 (Y) must go out WHILE X is parked: a second session dials
+    // and the owner decodes a second frame.
     let hy = submit(y);
     assert!(
-        eventually(Duration::from_secs(3), || admitted() == base + 1).await,
-        "depth 2: the second frame is in flight beside the parked first one (a second \
-         session dialed) — got {} admissions over base",
-        admitted() - base
+        eventually(Duration::from_secs(3), || served_frames() == frames0 + 2).await,
+        "depth 2: the second frame is in flight beside the parked first one — got {} \
+         frames at the owner, {} publish sessions dialed",
+        served_frames() - frames0,
+        dials() - base
     );
-    // Frame 3 (Z) is the K+1'th: it waits — no third session, ever.
+    assert_eq!(dials(), base + 2, "two frames in flight = two sessions");
+    // Frame 3 (Z) is the K+1'th: it waits — never reaches the owner and
+    // never dials a third session while two are in flight.
+    let waits0 = publish::stats().ship_depth_waits;
     let hz = submit(z);
     assert!(
-        !eventually(Duration::from_millis(300), || admitted() > base + 1).await,
-        "the depth bound: a third frame never dials a third session while two are in flight"
+        !eventually(Duration::from_millis(300), || {
+            served_frames() > frames0 + 2 || dials() > base + 2
+        })
+        .await,
+        "the depth bound: a third frame neither reaches the owner nor dials a third session \
+         while two are in flight"
     );
     assert!(!hz.is_finished(), "Z has not shipped while X and Y park");
+    assert_eq!(
+        publish::stats().ship_depth_waits - waits0,
+        1,
+        "the drain parked once on the depth bound (Z)"
+    );
 
     // Release X: its frame completes, and Z ships on the SAME session.
     drop(park_x);
@@ -772,7 +798,8 @@ async fn the_in_flight_frame_depth_is_pipelined_and_bounded() {
     hz.await
         .expect("no panic")
         .expect("Z applies once a slot frees");
-    assert_eq!(admitted(), base + 1, "Z reused X's session — still two");
+    assert_eq!(dials(), base + 2, "Z reused X's session — still two");
+    assert_eq!(served_frames(), frames0 + 3);
     drop(park_y);
     hy.await.expect("no panic").expect("Y applies");
     for &ino in &inos {

@@ -1652,6 +1652,7 @@ so there is nothing for a remote node to serialize into.
 |---|---|---|
 | `SQUEEZEFS_META_SHIP_BATCH_MAX` | derived `clamp(cpus × 2, 64, 4096)` | Verbs per shipped frame — the pipelining unit. Derived like the M7 commit-conveyor batch cap, because a frame's ops become that many transactions on the owner's conveyor. |
 | `SQUEEZEFS_META_SHIP_DEDUP_MAX` | derived `max(batch_max × 128, 8192)` | Owner-side idempotency window entries: how far back a client's retry may reach and still be answered from its ORIGINAL outcome instead of re-applying. |
+| `SQUEEZEFS_PUBLISH_SHIP_DEPTH` | derived `clamp(ceil(cpus / 8), 2, 8)` | S9 publish plane (D-1b): publish FRAMES a co-writer keeps in flight per authority — one authenticated session each. A frame carries every publish queued when a slot frees (the S8 lane shape: no timer, no added delay on a serial stream) and the owner runs its independent inos concurrently, so they co-queue into one conveyor pass. `1` = the stop-and-wait A/B control (frames still batch; nothing pipelines). Live: `meta_ship_publish.ship_frames` / `ship_framed_calls` (calls ÷ frames = the coalesce factor), `ship_depth_waits`, `ship_session_dials`, `served_frames` / `served_frame_calls` / `served_chains`. |
 | `SQUEEZEFS_DLM_TOKEN_CACHE_MAX` | derived `max(R5 budget/8192/32 B, 4096)` | Client fencing-token cache entries. Every eviction costs one loud miss line and one shipped `getattr` refresh — never a wrong answer. |
 
 **Live signals** (`.stats`, under `meta_ship`): `armed` (false on every shipped

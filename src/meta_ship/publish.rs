@@ -49,11 +49,24 @@
 //!   window): a swept-but-not-yet-self-fenced zombie's publishes refuse
 //!   with nothing applied, and a current-epoch refusal composes the
 //!   client's full fence (the pull-based revocation law).
-//! * **No batching conveyor.** The ops that arrive here are already
-//!   coalesced (the M7 commit conveyor, the publish coalescer's
-//!   `publish_commit_group*`), so a second batching layer would coalesce
-//!   already-coalesced work. S8's lane shape is the precedent if a measured
-//!   row ever asks for one.
+//! * **Framing, not a batching conveyor** (E2E perf audit D-1b, 2026-09-02
+//!   — the row asked: 24 concurrent publishes from one co-writer were 24
+//!   stop-and-wait frames and 24 owner conveyor passes). The client keeps
+//!   S8's lane shape per endpoint: callers enqueue and park, a drain takes
+//!   **everything queued** into ONE [`PublishRequestFrame`] the moment a
+//!   frame slot is free (no timer, no added delay — a serial stream still
+//!   pays one RTT per publish), and up to `depth` frames are in flight per
+//!   endpoint on a pool of that many sessions (the wire is request/reply
+//!   per connection on both ends; single-connection multiplexing is the
+//!   audit's D-5). The owner partitions a frame into dependency chains by
+//!   named-inode overlap (D-1's `chains_by_named_inos`), runs chains
+//!   concurrently and same-ino calls in submission order, so a frame's
+//!   independent publishes co-queue into ONE M7 pass. Every law below is
+//!   PER CALL: the era gate, the not-owner screen, the witness window, the
+//!   RETRIED/REFUSED classes, the `recomputed` verdict, and the reply
+//!   shape — a frame is homogeneous in resend class (the drain cuts a
+//!   frame where the class changes), so a transport resend re-sends the
+//!   SAME frame with the SAME request ids or nothing.
 //! * **No cross-owner transaction.** `destroy_inodes` is per-ino by
 //!   construction and groups by owner; nothing here spans two authorities
 //!   inside one transaction (that is S3.5, and S8's `cross_owner_error` is
@@ -177,7 +190,19 @@ use std::sync::Arc;
 /// `released` count and the committed `gen` the shipper stamps as its
 /// next base). An 11-speaker cannot decode either direction — the
 /// mismatch refuses loud at the first frame (KD-7 same-commit fleets).
-pub const PUBLISH_SCHEMA: u32 = 12;
+///
+/// **13 since the publish frame carries N calls** (E2E perf audit D-1b —
+/// `docs/design-e2e-perf-audit.md` §3 board DLM #8, D-1's scoping
+/// finding): [`PublishRequestFrame::calls`] is a `Vec` and
+/// [`PublishReplyFrame::outcomes`] answers one [`PublishCallOutcome`]
+/// per call in call order, so the per-call refusal statuses
+/// (`PUBLISH_NOT_OWNER` / `PUBLISH_STALE_LEASE` / `PUBLISH_LANE_REFUSED`
+/// / `PUBLISH_PANIC`) moved from the wire status into the reply body —
+/// the wire status now covers only frame-level refusals (schema,
+/// malformed). A 12-speaker reads a `Vec` where it expects one call in
+/// either direction — the mismatch refuses loud at the first frame
+/// (KD-7 same-commit fleets).
+pub const PUBLISH_SCHEMA: u32 = 13;
 
 /// First verb of S9's publish block. S3's ping is 0, S8's metadata verbs
 /// are 16/17, S6's membership owns `0x0100..=0x01FF`, S9's custody
@@ -185,7 +210,8 @@ pub const PUBLISH_SCHEMA: u32 = 12;
 pub const VERB_PUBLISH_BASE: u16 = 0x0300;
 /// Last verb of S9's publish block.
 pub const VERB_PUBLISH_LAST: u16 = 0x03FF;
-/// One publish call per frame (see the module docs on batching).
+/// One publish FRAME per wire call — a frame carries one or more
+/// [`PublishCall`]s (see the module docs on framing).
 pub const VERB_PUBLISH_CALL: u16 = VERB_PUBLISH_BASE;
 
 /// Status: the call was executed and its own outcome is in the body.
@@ -831,21 +857,99 @@ pub enum PublishReply {
     },
 }
 
-/// A publish request frame.
+/// A publish request frame: one or more calls from ONE client (schema 13).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PublishRequestFrame {
     pub schema: u32,
     /// The client's identity (logs and audit only — authentication is the
     /// transport's, and the storage-trust secret is the root).
     pub client: String,
-    pub call: PublishCall,
+    /// The frame's calls, in submission order; the reply answers one
+    /// [`PublishCallOutcome`] per call in the same order. Never empty.
+    pub calls: Vec<PublishCall>,
 }
 
-/// A publish reply frame: the op's own outcome, errno-preserving.
+/// One call's answer inside a [`PublishReplyFrame`] (schema 13): the
+/// per-call face of what used to be the wire status + body.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PublishCallOutcome {
+    /// The call was executed; this is its own outcome, errno-preserving.
+    Done(std::result::Result<PublishReply, WireError>),
+    /// The call was REFUSED before execution (or its execution unwound):
+    /// one of the `PUBLISH_*` statuses other than [`PUBLISH_OK`], with
+    /// the operator-facing reason. Nothing was applied.
+    Refused { status: u16, detail: String },
+}
+
+/// A publish reply frame: one outcome per call, in call order.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PublishReplyFrame {
     pub schema: u32,
-    pub outcome: std::result::Result<PublishReply, WireError>,
+    pub outcomes: Vec<PublishCallOutcome>,
+}
+
+/// The upper bound the frame-forming drain uses for one call's encoded
+/// size: bincode's varint ints are never longer than 9 bytes, so every
+/// integer counts 9 and every sequence its length prefix plus its
+/// elements. Exact enough to keep a frame inside the CONTROL cap without
+/// encoding it twice; a single call past the cap still ships alone and
+/// refuses at encode as before.
+const INT_HINT: usize = 9;
+
+impl PublishCall {
+    /// See [`INT_HINT`].
+    fn wire_size_hint(&self) -> usize {
+        fn refs(n: usize) -> usize {
+            INT_HINT + n * (4 * INT_HINT + 1)
+        }
+        fn bytes(n: usize) -> usize {
+            INT_HINT + n
+        }
+        // The enum tag.
+        INT_HINT
+            + match self {
+                Self::SetLayoutAndSize {
+                    layout, refs: r, ..
+                } => 3 * INT_HINT + bytes(layout.len()) + refs(r.len()),
+                Self::MergeLayoutAndSize {
+                    delta,
+                    full_layout,
+                    refs: r,
+                    ..
+                } => 3 * INT_HINT + bytes(delta.len()) + bytes(full_layout.len()) + refs(r.len()),
+                Self::CommitBlockRefs { refs: r, .. } => 3 * INT_HINT + refs(r.len()),
+                Self::ParkWriteTimes { .. } => 4 * INT_HINT,
+                Self::DestroyInodes { inos, .. } => 2 * INT_HINT + inos.len() * INT_HINT,
+                Self::CreateWithRdevSize { name, .. } => 7 * INT_HINT + bytes(name.len()),
+                Self::XattrValueCap { .. } => INT_HINT,
+                Self::ReaddirStream { .. } => 3 * INT_HINT,
+                Self::RaiseAllocLane { .. } => 5 * INT_HINT,
+                Self::FreeBlocks { blocks, .. } => {
+                    3 * INT_HINT + INT_HINT + blocks.len() * INT_HINT
+                }
+                Self::HarvestLaneFree { .. } => 6 * INT_HINT,
+                Self::WriteExtent { data, .. } => 5 * INT_HINT + bytes(data.len()),
+                Self::FlushExtents { .. } => 3 * INT_HINT,
+                Self::BlockRefPopulation { block_idxs, .. } => {
+                    INT_HINT + INT_HINT + block_idxs.len() * INT_HINT
+                }
+                Self::MigrateBlockMap {
+                    layout,
+                    entries,
+                    refs: r,
+                    ..
+                } => {
+                    4 * INT_HINT
+                        + bytes(layout.len())
+                        + INT_HINT
+                        + entries
+                            .iter()
+                            .map(|(_, k)| INT_HINT + bytes(k.len()))
+                            .sum::<usize>()
+                        + refs(r.len())
+                }
+            }
+    }
 }
 
 fn decode_limit() -> u64 {
@@ -924,6 +1028,19 @@ static MAP_REFUSED: AtomicU64 = AtomicU64::new(0);
 // served claims-scoped train's recompute RELEASED, whose free ladder ran
 // on this authority (the engagement gauge).
 static MAP_RECOMPUTED_RELEASES: AtomicU64 = AtomicU64::new(0);
+// D-1b — the publish plane's framing ledger (the S8 `batches` /
+// `batched_verbs` shape): client-side frames shipped and the calls they
+// carried (`ship_framed_calls / ship_frames` is the live coalesce
+// factor), drain parks on the depth bound, and the owner's frames /
+// calls / dependency chains served (`served_chains / served_frames` is
+// the live chain width — ≈ frame width = fully independent).
+static SHIP_FRAMES: AtomicU64 = AtomicU64::new(0);
+static SHIP_FRAMED_CALLS: AtomicU64 = AtomicU64::new(0);
+static SHIP_DEPTH_WAITS: AtomicU64 = AtomicU64::new(0);
+static SHIP_SESSION_DIALS: AtomicU64 = AtomicU64::new(0);
+static SERVED_FRAMES: AtomicU64 = AtomicU64::new(0);
+static SERVED_FRAME_CALLS: AtomicU64 = AtomicU64::new(0);
+static SERVED_CHAINS: AtomicU64 = AtomicU64::new(0);
 
 /// The at-budget W2 spill's counter (incremented by
 /// [`crate::extent_ship`]'s spill arm — release path 4's engagement).
@@ -1052,6 +1169,32 @@ pub struct PublishStats {
     /// engagement gauge (0 beside a growing recomputed-train stream
     /// means displaced frees are leaking again).
     pub map_recomputed_releases: u64,
+    /// D-1b (client side): publish FRAMES shipped — the wire round trips.
+    pub ship_frames: u64,
+    /// D-1b (client side): calls carried by those frames;
+    /// `ship_framed_calls / ship_frames` is the live coalesce factor
+    /// (≈ 1 on a serial stream — one RTT per publish, the accepted cost;
+    /// ≫ 1 on a concurrent one).
+    pub ship_framed_calls: u64,
+    /// D-1b (client side): drain parks on the per-endpoint depth bound —
+    /// the K+1'th frame waiting. Growth means the pipe is saturated at
+    /// the current depth (the frames that follow carry more calls each).
+    pub ship_depth_waits: u64,
+    /// D-1b (client side): publish sessions dialed — pool growth toward
+    /// the depth bound plus reconnects after a transport failure / the
+    /// owner's idle reaper. Bounded by `depth` per endpoint at steady
+    /// state; steady growth means sessions are dying between frames.
+    pub ship_session_dials: u64,
+    /// D-1b (owner side): publish frames served.
+    pub served_frames: u64,
+    /// D-1b (owner side): calls those frames carried (`shipped ≡ served`
+    /// composes per call; this is the frame-level face).
+    pub served_frame_calls: u64,
+    /// D-1b (owner side): dependency chains dispatched — the concurrent
+    /// units. `served_chains / served_frames` ≈ frame width means the
+    /// frame's calls were independent (co-queue into one M7 pass); ≈ 1
+    /// means one hot object serialized the frame.
+    pub served_chains: u64,
 }
 
 /// Read the publish ledger.
@@ -1086,6 +1229,13 @@ pub fn stats() -> PublishStats {
         map_served: MAP_SERVED.load(Ordering::Relaxed),
         map_refused: MAP_REFUSED.load(Ordering::Relaxed),
         map_recomputed_releases: MAP_RECOMPUTED_RELEASES.load(Ordering::Relaxed),
+        ship_frames: SHIP_FRAMES.load(Ordering::Relaxed),
+        ship_framed_calls: SHIP_FRAMED_CALLS.load(Ordering::Relaxed),
+        ship_depth_waits: SHIP_DEPTH_WAITS.load(Ordering::Relaxed),
+        ship_session_dials: SHIP_SESSION_DIALS.load(Ordering::Relaxed),
+        served_frames: SERVED_FRAMES.load(Ordering::Relaxed),
+        served_frame_calls: SERVED_FRAME_CALLS.load(Ordering::Relaxed),
+        served_chains: SERVED_CHAINS.load(Ordering::Relaxed),
     }
 }
 
@@ -1124,6 +1274,13 @@ pub fn stats_json() -> serde_json::Value {
         "map_served": s.map_served,
         "map_refused": s.map_refused,
         "map_recomputed_releases": s.map_recomputed_releases,
+        "ship_frames": s.ship_frames,
+        "ship_framed_calls": s.ship_framed_calls,
+        "ship_depth_waits": s.ship_depth_waits,
+        "ship_session_dials": s.ship_session_dials,
+        "served_frames": s.served_frames,
+        "served_frame_calls": s.served_frame_calls,
+        "served_chains": s.served_chains,
         // §9.3's live retention gauge (→ 0 at quiesce — falsifiable
         // against the four release paths).
         "extent_retained_bytes": crate::extent_ship::retained_bytes(),
@@ -1140,14 +1297,90 @@ pub fn stats_json() -> serde_json::Value {
 /// contract is testable without a sleep as coordination. `0` = off.
 pub static TEST_PUBLISH_DRAIN_HOLD_MS: AtomicU64 = AtomicU64::new(0);
 
-/// The client half: one authenticated session per authority endpoint, kept
-/// warm.
+/// Absolute override for the derived per-endpoint in-flight frame depth.
+pub const SHIP_DEPTH_ENV: &str = "SQUEEZEFS_PUBLISH_SHIP_DEPTH";
+
+/// The per-endpoint in-flight frame depth (D-1b): how many publish frames
+/// one client keeps in flight to one authority — one authenticated session
+/// each, since the cluster wire is request/reply per connection on both
+/// ends.
+///
+/// Derivation (caps derive from system resources): `ceil(cpus / 8)`
+/// clamped to `[2, 8]` — the SAME "one lane per 8 cores" slope the owner's
+/// own RPC-lane derivation uses ([`crate::cluster_wire::service_threads_from`]),
+/// so a client's sessions toward one authority scale with the box the way
+/// the authority's serving lanes do. Floor 2 = the minimum at which a
+/// frame's wire RTT overlaps a sibling frame's owner pass at all (depth 1
+/// serializes RTT + pass per frame); ceiling 8 = the RPC-lane ceiling, so
+/// a 256-core client does not open a session farm per authority. `cpus` is
+/// the fleet-share-divided root (KD-MW-14).
+pub fn publish_ship_depth() -> usize {
+    publish_ship_depth_from(
+        crate::env_knobs::opt_int_knob::<usize>(SHIP_DEPTH_ENV),
+        crate::cpu::process_parallelism(),
+    )
+}
+
+/// Pure form (tie-tested in the derivation sweep): explicit wins verbatim
+/// within its admissible range (`1` = stop-and-wait, the A/B control);
+/// derived = `ceil(cpus / 8).clamp(2, 8)`.
+pub fn publish_ship_depth_from(explicit: Option<usize>, cpus: usize) -> usize {
+    if let Some(explicit) = explicit {
+        return explicit.clamp(1, 64);
+    }
+    cpus.div_ceil(8).clamp(2, 8)
+}
+
+/// The per-frame call cap — S8's frame cap, for the same reason: a frame's
+/// calls become that many transactions on the owner's conveyor, so sizing a
+/// frame past what one pass drains buys queueing, not throughput.
+fn frame_call_cap() -> usize {
+    super::router::batch_max()
+}
+
+/// The frame's byte budget: the wire's CONTROL class cap less the frame
+/// header (`schema` + `client` + the calls' length prefix, all ≤
+/// [`INT_HINT`] each plus the client id).
+fn frame_byte_budget(client_len: usize) -> usize {
+    (decode_limit() as usize).saturating_sub(4 * INT_HINT + client_len)
+}
+
+/// One queued publish: the call, its parking spot, and what the shipper
+/// needs to frame and answer it without re-inspecting the call.
+struct Submission {
+    call: PublishCall,
+    /// [`PublishCall::transport_resend_safe`] — frames are homogeneous in
+    /// this, so a resend re-sends a whole frame or nothing.
+    resend_safe: bool,
+    size_hint: usize,
+    reply: squeezefs_ipc::sqz_channel::oneshot::Sender<Result<PublishReply>>,
+    queued_at: std::time::Instant,
+}
+
+/// One endpoint's lane: the bounded submission queue its drain serves.
+struct PublishLane {
+    tx: squeezefs_ipc::sqz_channel::mpsc::Sender<Submission>,
+}
+
+/// What every frame shipper on one lane shares: the endpoint, the
+/// identity, the depth bound and the idle-session pool (≤ depth sessions
+/// by construction — only a permit holder ever dials one).
+struct LaneShared {
+    endpoint: String,
+    peer_id: Arc<str>,
+    secret: Arc<Vec<u8>>,
+    depth: Arc<squeezefs_ipc::sqz_semaphore::Semaphore>,
+    pool: parking_lot::Mutex<Vec<RpcClient>>,
+}
+
+/// The client half: per authority endpoint, one framing lane and a pool of
+/// up to `depth` authenticated sessions, kept warm.
 pub struct PublishClient {
     peer_id: Arc<str>,
     secret: Arc<Vec<u8>>,
     /// Frames this client may hold in flight per endpoint.
     depth: usize,
-    sessions: scc::HashMap<String, Arc<crate::sqz_sync::SqzMutex<Option<RpcClient>>>>,
+    lanes: scc::HashMap<String, Arc<PublishLane>>,
 }
 
 impl std::fmt::Debug for PublishClient {
@@ -1155,16 +1388,17 @@ impl std::fmt::Debug for PublishClient {
         f.debug_struct("PublishClient")
             .field("peer_id", &self.peer_id)
             .field("depth", &self.depth)
-            .field("sessions", &self.sessions.len())
+            .field("lanes", &self.lanes.len())
             .finish_non_exhaustive()
     }
 }
 
 impl PublishClient {
     /// A client identifying itself as `peer_id`, proving storage membership
-    /// with the volume set's `job:enroll` secret.
+    /// with the volume set's `job:enroll` secret, at the derived depth
+    /// ([`publish_ship_depth`]).
     pub fn new(peer_id: &str, secret: Vec<u8>) -> Arc<Self> {
-        Self::with_depth(peer_id, secret, 1)
+        Self::with_depth(peer_id, secret, publish_ship_depth())
     }
 
     /// [`Self::new`] with an explicit per-endpoint in-flight frame depth
@@ -1174,159 +1408,378 @@ impl PublishClient {
             peer_id: Arc::from(peer_id),
             secret: Arc::new(secret),
             depth: depth.max(1),
-            sessions: scc::HashMap::new(),
+            lanes: scc::HashMap::new(),
         })
     }
 
-    fn lane(&self, endpoint: &str) -> Arc<crate::sqz_sync::SqzMutex<Option<RpcClient>>> {
-        if let Some(lane) = self.sessions.read_sync(endpoint, |_, l| Arc::clone(l)) {
+    /// The lane for `endpoint`, started on first use.
+    fn lane(&self, endpoint: &str) -> Arc<PublishLane> {
+        if let Some(lane) = self.lanes.read_sync(endpoint, |_, l| Arc::clone(l)) {
             return lane;
         }
-        let lane = Arc::new(crate::sqz_sync::SqzMutex::new(None));
+        // Bounded by law (S8's lane): frame_cap × 8 submissions in flight,
+        // so a saturated authority backpressures its clients instead of
+        // growing a queue without limit; a stuck one surfaces as the
+        // wire's reply timeout on the frame, never as unbounded queueing.
+        let (tx, rx) =
+            squeezefs_ipc::sqz_channel::mpsc::channel::<Submission>(frame_call_cap() * 8);
+        let lane = Arc::new(PublishLane { tx });
+        let spawn_drain = || {
+            let shared = Arc::new(LaneShared {
+                endpoint: endpoint.to_string(),
+                peer_id: Arc::clone(&self.peer_id),
+                secret: Arc::clone(&self.secret),
+                depth: Arc::new(squeezefs_ipc::sqz_semaphore::Semaphore::new(self.depth)),
+                pool: parking_lot::Mutex::new(Vec::with_capacity(self.depth)),
+            });
+            // The drain rides the sqz-meta pool — the venue that owns the
+            // daemon's plane tasks; it ends when the client (and hence the
+            // lane's sender) is dropped.
+            crate::meta_exec::spawn_meta("meta_ship_publish_drain", lane_drain(shared, rx));
+        };
         match self
-            .sessions
+            .lanes
             .insert_sync(endpoint.to_string(), Arc::clone(&lane))
         {
-            Ok(()) => lane,
-            Err(_) => self
-                .sessions
-                .read_sync(endpoint, |_, l| Arc::clone(l))
-                .unwrap_or(lane),
+            Ok(()) => {
+                spawn_drain();
+                lane
+            }
+            Err(_) => match self.lanes.read_sync(endpoint, |_, l| Arc::clone(l)) {
+                Some(raced_in) => raced_in,
+                None => {
+                    spawn_drain();
+                    lane
+                }
+            },
         }
     }
 
     /// Ship one call to `endpoint` and return its outcome.
     ///
-    /// **One attempt, deliberately** — see the module docs: un-witnessed
-    /// verbs have no dedup window, so a resend of `create_with_rdev_size`
-    /// after a lost reply would mint a second name. The witnessed
-    /// layout-publish class rides [`ship_witnessed`], whose bounded
-    /// epoch-stable ladder resends the SAME frame only.
+    /// The call joins the endpoint's lane and travels in the next frame
+    /// the drain forms (alone on a quiet lane — no delay is ever added;
+    /// beside every concurrently queued call on a busy one). Every law
+    /// below is applied per call by the frame shipper:
     ///
-    /// A [`PUBLISH_STALE_LEASE`] answer is the era gate firing (finding
-    /// #6): when the refused epoch IS this client's current lease, the
-    /// full fence composes HERE (`note_publish_era_refused` — the
-    /// pull-based revocation law at the publish round trip), and the
-    /// error surfaces in the fence class (`WriterGuardFenced`) every
-    /// retry ladder returns immediately.
+    /// * **Resend** (rung 18, residual d): a TRANSPORT failure on a frame
+    ///   of resend-safe calls reconnects and resends the SAME frame once
+    ///   (same request ids — the owner's dedup window absorbs it); a frame
+    ///   of one-attempt calls (the un-witnessed mutators) refuses on the
+    ///   true sent-then-lost ambiguity. The drain never mixes the two.
+    ///   The witnessed layout-publish class rides [`ship_witnessed`]'s
+    ///   bounded epoch-stable ladder above this.
+    /// * **Era** (finding #6): a per-call [`PUBLISH_STALE_LEASE`] whose
+    ///   refused epoch IS this client's current lease composes the full
+    ///   fence HERE (`note_publish_era_refused` — the pull-based
+    ///   revocation law at the publish round trip), surfacing as
+    ///   `WriterGuardFenced`.
     pub async fn ship(&self, endpoint: &str, call: PublishCall) -> Result<PublishReply> {
-        let name = call.name();
-        let presented = call.presented_epoch();
-        let resend_safe = call.transport_resend_safe();
-        let body = encode(
-            &PublishRequestFrame {
-                schema: PUBLISH_SCHEMA,
-                client: self.peer_id.to_string(),
-                call,
-            },
-            name,
-        )?;
         let lane = self.lane(endpoint);
-        let mut guard = lane.lock().await;
-        // Finding 14 (the width-8 re-grade's conviction): a POOLED session
-        // the idle reaper closed is provably dead BEFORE the send — the
-        // queued FIN answers a non-blocking peek — so replacing it here
-        // costs no attempt and touches no retry law (the one-attempt
-        // classes refuse only the true sent-then-lost ambiguity). Without
-        // this screen, every un-witnessed mutator following a ≥ 60 s
-        // quiet spell surfaced EINVAL to the application.
-        if guard.as_ref().is_some_and(|c| c.dead_on_arrival()) {
-            *guard = None;
+        let (tx, rx) = squeezefs_ipc::sqz_channel::oneshot::channel();
+        lane.tx
+            .send(Submission {
+                resend_safe: call.transport_resend_safe(),
+                size_hint: call.wire_size_hint(),
+                call,
+                reply: tx,
+                queued_at: std::time::Instant::now(),
+            })
+            .await
+            .map_err(|_| {
+                SqueezefsError::InvalidOperation(format!(
+                    "S9: the publish lane to {endpoint} is gone"
+                ))
+            })?;
+        rx.await.map_err(|_| {
+            SqueezefsError::InvalidOperation(format!(
+                "S9: the publish lane to {endpoint} dropped a frame's outcomes"
+            ))
+        })?
+    }
+}
+
+/// One lane's drain: form frames from whatever is queued the moment a
+/// frame slot is free, and hand each to its own shipper task.
+///
+/// The park on the depth bound comes BEFORE the frame is formed, so the
+/// frame that goes out when a slot frees carries everything that queued
+/// while the pipe was full — the natural batching of a busy pipe, with no
+/// timer and no added delay on a quiet one. A frame is cut at the call
+/// cap, at the byte budget, and where the resend class changes (the item
+/// that would have crossed a boundary heads the next frame).
+async fn lane_drain(
+    shared: Arc<LaneShared>,
+    mut rx: squeezefs_ipc::sqz_channel::mpsc::Receiver<Submission>,
+) {
+    let mut carry: Option<Submission> = None;
+    loop {
+        let first = match carry.take() {
+            Some(s) => s,
+            None => match rx.recv().await {
+                Some(s) => s,
+                None => return,
+            },
+        };
+        // The head-of-iteration hold is a TEST seam only (0 in production,
+        // one relaxed load).
+        let hold = TEST_PUBLISH_DRAIN_HOLD_MS.load(Ordering::Relaxed);
+        if hold > 0 {
+            squeezefs_ipc::sqz_time::sleep(std::time::Duration::from_millis(hold)).await;
         }
-        // Rung 18 (residual d — the idle-reap conviction): a TRANSPORT
-        // failure on a resend-safe call reconnects and resends the SAME
-        // frame once (the S8 batch precedent; classification is
-        // STRUCTURAL — a refusal comes back as Ok(reply) with a status,
-        // so a call error is always the dead-session class). The live
-        // fleet's 60 s idle-session reaper makes a dead first session the
-        // NORMAL state of any verb that follows a quiet spell.
+        let permit = match Arc::clone(&shared.depth).try_acquire_owned() {
+            Ok(p) => p,
+            Err(_) => {
+                SHIP_DEPTH_WAITS.fetch_add(1, Ordering::Relaxed);
+                match Arc::clone(&shared.depth).acquire_owned().await {
+                    Ok(p) => p,
+                    Err(_) => {
+                        // The semaphore is never closed; refuse loud
+                        // rather than strand the waiter if it ever is.
+                        let _ = first
+                            .reply
+                            .send(Err(SqueezefsError::InvalidOperation(format!(
+                                "S9: the publish lane to {} lost its depth bound",
+                                shared.endpoint
+                            ))));
+                        return;
+                    }
+                }
+            }
+        };
+        let cap = frame_call_cap();
+        let budget = frame_byte_budget(shared.peer_id.len());
+        let class = first.resend_safe;
+        let mut bytes = first.size_hint;
+        let mut frame = vec![first];
+        while frame.len() < cap {
+            match rx.try_recv() {
+                Ok(next) => {
+                    if next.resend_safe != class || bytes.saturating_add(next.size_hint) > budget {
+                        carry = Some(next);
+                        break;
+                    }
+                    bytes += next.size_hint;
+                    frame.push(next);
+                }
+                Err(_) => break,
+            }
+        }
+        let shared = Arc::clone(&shared);
+        crate::meta_exec::spawn_meta("meta_ship_publish_frame", async move {
+            ship_frame(&shared, frame).await;
+            drop(permit);
+        });
+    }
+}
+
+/// A parked caller: its reply slot plus what the per-call interpretation
+/// needs (the verb name for messages, the presented epoch for the fence).
+struct Waiter {
+    reply: squeezefs_ipc::sqz_channel::oneshot::Sender<Result<PublishReply>>,
+    name: &'static str,
+    presented: Option<u64>,
+}
+
+fn fail_all(waiters: Vec<Waiter>, msg: &str) {
+    for w in waiters {
+        let _ = w
+            .reply
+            .send(Err(SqueezefsError::InvalidOperation(msg.to_string())));
+    }
+}
+
+/// Ship one formed frame and fan every call's outcome back to its caller.
+async fn ship_frame(shared: &LaneShared, frame: Vec<Submission>) {
+    let n = frame.len();
+    let resend_safe = frame.first().is_some_and(|s| s.resend_safe);
+    let mut calls = Vec::with_capacity(n);
+    let mut waiters = Vec::with_capacity(n);
+    for sub in frame {
+        super::phase_record(super::ShipPhase::QueueWait, sub.queued_at);
+        waiters.push(Waiter {
+            reply: sub.reply,
+            name: sub.call.name(),
+            presented: sub.call.presented_epoch(),
+        });
+        calls.push(sub.call);
+    }
+    SHIP_FRAMES.fetch_add(1, Ordering::Relaxed);
+    SHIP_FRAMED_CALLS.fetch_add(n as u64, Ordering::Relaxed);
+    let body = match encode(
+        &PublishRequestFrame {
+            schema: PUBLISH_SCHEMA,
+            client: shared.peer_id.to_string(),
+            calls,
+        },
+        "frame",
+    ) {
+        Ok(b) => b,
+        Err(e) => {
+            fail_all(waiters, &e.to_string());
+            return;
+        }
+    };
+    let reply = match shared.exchange(body, resend_safe, n).await {
+        Ok(r) => r,
+        Err(e) => {
+            fail_all(waiters, &e.to_string());
+            return;
+        }
+    };
+    // Calls that travelled to an owner — per call, whatever the status
+    // (today's ledger semantics, one frame later).
+    SHIPPED.fetch_add(n as u64, Ordering::Relaxed);
+    if reply.status != PUBLISH_OK {
+        // A FRAME-level refusal (schema / malformed): every call shares it.
+        fail_all(
+            waiters,
+            &format!(
+                "S9: the owner at {} refused a {n}-call publish frame (status {}): {}",
+                shared.endpoint,
+                reply.status,
+                String::from_utf8_lossy(&reply.body)
+            ),
+        );
+        return;
+    }
+    let decoded: PublishReplyFrame = match decode(&reply.body, "reply frame") {
+        Ok(f) => f,
+        Err(e) => {
+            fail_all(waiters, &e.to_string());
+            return;
+        }
+    };
+    if decoded.schema != PUBLISH_SCHEMA {
+        fail_all(
+            waiters,
+            &format!(
+                "S9: the owner at {} replied in publish schema {} (this build speaks \
+                 {PUBLISH_SCHEMA})",
+                shared.endpoint, decoded.schema
+            ),
+        );
+        return;
+    }
+    if decoded.outcomes.len() != n {
+        fail_all(
+            waiters,
+            &format!(
+                "S9 publish protocol violation: the owner at {} answered a {n}-call frame with \
+                 {} outcomes — refusing every call rather than guessing which is whose",
+                shared.endpoint,
+                decoded.outcomes.len()
+            ),
+        );
+        return;
+    }
+    for (w, outcome) in waiters.into_iter().zip(decoded.outcomes) {
+        let out = match outcome {
+            PublishCallOutcome::Done(r) => r.map_err(WireError::into_error),
+            PublishCallOutcome::Refused { status, detail } if status == PUBLISH_STALE_LEASE => {
+                let fenced = match (w.presented, crate::data_grant::custody_client()) {
+                    (Some(epoch), Some(client)) => client.note_publish_era_refused(epoch, &detail),
+                    _ => false,
+                };
+                log::error!(
+                    "S9: the authority at {} refused {} BY ERA ({detail}) — nothing was \
+                     applied{}",
+                    shared.endpoint,
+                    w.name,
+                    if fenced {
+                        "; this epoch was our CURRENT lease, so the full fence composed \
+                         (custody poisoned — re-admission is by remount)"
+                    } else {
+                        " (the refused epoch is not this mount's current lease — a dead \
+                         frame, not a dead era)"
+                    }
+                );
+                Err(SqueezefsError::WriterGuardFenced)
+            }
+            PublishCallOutcome::Refused { status, detail } => {
+                Err(SqueezefsError::InvalidOperation(format!(
+                    "S9: the owner at {} refused {} (status {status}): {detail}",
+                    shared.endpoint, w.name
+                )))
+            }
+        };
+        let _ = w.reply.send(out);
+    }
+}
+
+impl LaneShared {
+    /// One authenticated exchange of an encoded frame: a pooled session
+    /// (or a fresh dial), the round trip, and the session's return to the
+    /// pool on success. A transport failure drops the session; a
+    /// resend-safe frame then reconnects and resends the SAME bytes once
+    /// (rung 18, residual d — the idle-session reaper makes a dead first
+    /// session the normal state of a frame that follows a quiet spell); a
+    /// one-attempt frame refuses (the true sent-then-lost ambiguity).
+    async fn exchange(
+        &self,
+        mut body: Vec<u8>,
+        resend_safe: bool,
+        n: usize,
+    ) -> Result<RpcResponse> {
         let attempts = if resend_safe { 2 } else { 1 };
-        let mut reply = None;
-        let mut last_err = None;
+        let mut last_err: Option<SqueezefsError> = None;
         for attempt in 0..attempts {
-            if guard.is_none() {
-                match RpcClient::connect(endpoint, &self.secret, &self.peer_id, None).await {
-                    Ok(c) => *guard = Some(c),
+            // Finding 14: a POOLED session the idle reaper closed is
+            // provably dead BEFORE the send — replacing it here costs no
+            // attempt and touches no retry law. The pool guard is a
+            // statement-scoped short hold, never across an await.
+            let pooled = self.pool.lock().pop();
+            let mut session = match pooled {
+                Some(s) if !s.dead_on_arrival() => s,
+                _ => match RpcClient::connect(&self.endpoint, &self.secret, &self.peer_id, None)
+                    .await
+                {
+                    Ok(c) => {
+                        SHIP_SESSION_DIALS.fetch_add(1, Ordering::Relaxed);
+                        c
+                    }
                     Err(e) => {
                         last_err = Some(e);
                         continue;
                     }
-                }
-            }
-            // Rung 9 (S8-a attribution): a publish-vocabulary ship pays the
-            // same authenticated round trip as an S8 trait verb, so it records
-            // the SAME `meta_ship_phase_ns.rtt` phase — the published serial
-            // A/B's rtt column covers the whole shipped stream, not just the
-            // trait half.
+                },
+            };
+            // Rung 9 (S8-a attribution): a publish frame pays the same
+            // authenticated round trip as an S8 verb frame, so it records
+            // the SAME `meta_ship_phase_ns.rtt` phase.
             let t_rtt = std::time::Instant::now();
-            let out = guard
-                .as_mut()
-                .expect("connected above")
-                .call(VERB_PUBLISH_CALL, body.clone())
-                .await;
+            let bytes = if attempt + 1 == attempts {
+                std::mem::take(&mut body)
+            } else {
+                body.clone()
+            };
+            let out = session.call(VERB_PUBLISH_CALL, bytes).await;
             super::phase_record(super::ShipPhase::Rtt, t_rtt);
             match out {
                 Ok(r) => {
-                    reply = Some(r);
-                    break;
+                    self.pool.lock().push(session);
+                    return Ok(r);
                 }
                 Err(e) => {
-                    *guard = None;
+                    drop(session);
                     if attempt + 1 < attempts {
                         log::warn!(
-                            "S9: publish {name} to {endpoint} failed ({e}) — reconnecting and \
+                            "S9: a {n}-call publish frame to {} failed ({e}) — reconnecting and \
                              resending the same frame (resend-safe class: witnessed / monotone \
-                             / read; the idle-session reaper makes a dead first session normal)"
+                             / read; the idle-session reaper makes a dead first session normal)",
+                            self.endpoint
                         );
                     }
                     last_err = Some(e);
                 }
             }
         }
-        let Some(reply) = reply else {
-            return Err(last_err.unwrap_or_else(|| {
-                SqueezefsError::InvalidOperation(format!(
-                    "S9: no session to {endpoint} and no error to report for {name}"
-                ))
-            }));
-        };
-        drop(guard);
-        SHIPPED.fetch_add(1, Ordering::Relaxed);
-        if reply.status == PUBLISH_STALE_LEASE {
-            let detail = String::from_utf8_lossy(&reply.body).to_string();
-            let fenced = match (presented, crate::data_grant::custody_client()) {
-                (Some(epoch), Some(client)) => client.note_publish_era_refused(epoch, &detail),
-                _ => false,
-            };
-            log::error!(
-                "S9: the authority at {endpoint} refused {name} BY ERA ({detail}) — nothing \
-                 was applied{}",
-                if fenced {
-                    "; this epoch was our CURRENT lease, so the full fence composed (custody \
-                     poisoned — re-admission is by remount)"
-                } else {
-                    " (the refused epoch is not this mount's current lease — a dead frame, \
-                     not a dead era)"
-                }
-            );
-            return Err(SqueezefsError::WriterGuardFenced);
-        }
-        if reply.status != PUBLISH_OK {
-            return Err(SqueezefsError::InvalidOperation(format!(
-                "S9: the owner at {endpoint} refused {name} (status {}): {}",
-                reply.status,
-                String::from_utf8_lossy(&reply.body)
-            )));
-        }
-        let frame: PublishReplyFrame = decode(&reply.body, name)?;
-        if frame.schema != PUBLISH_SCHEMA {
-            return Err(SqueezefsError::InvalidOperation(format!(
-                "S9: the owner at {endpoint} replied in publish schema {} (this build speaks \
-                 {PUBLISH_SCHEMA})",
-                frame.schema
-            )));
-        }
-        frame.outcome.map_err(WireError::into_error)
+        Err(last_err.unwrap_or_else(|| {
+            SqueezefsError::InvalidOperation(format!(
+                "S9: no session to {} and no error to report for a {n}-call frame",
+                self.endpoint
+            ))
+        }))
     }
 }
 
@@ -2881,7 +3334,18 @@ impl PublishService {
         self.authority.get(v_idx).copied().unwrap_or(false)
     }
 
-    fn refuse(id: u64, status: u16, reason: String) -> RpcResponse {
+    /// A per-call refusal (nothing applied), logged loud.
+    fn refuse(status: u16, reason: String) -> PublishCallOutcome {
+        log::warn!("S9 publish owner refused a call: {reason}");
+        PublishCallOutcome::Refused {
+            status,
+            detail: reason,
+        }
+    }
+
+    /// A frame-level refusal — the wire status covers only what no call
+    /// can own: an unknown verb, an undecodable frame, a schema mismatch.
+    fn refuse_frame(id: u64, status: u16, reason: String) -> RpcResponse {
         log::warn!("S9 publish owner refused a frame: {reason}");
         RpcResponse {
             id,
@@ -2890,6 +3354,20 @@ impl PublishService {
         }
     }
 
+    /// Serve one publish FRAME (D-1b): decode, screen the schema, then
+    /// partition its calls into dependency chains by named-inode overlap
+    /// (D-1's relation, [`super::service::chains_by_named_inos`]) —
+    /// calls naming a common inode execute serially in submission order,
+    /// distinct chains concurrently — so a frame's independent publishes
+    /// park on the M7 conveyor together and co-queue into one pass.
+    /// Outcomes are re-slotted into call order. Every per-call law (the
+    /// not-owner screen, the era gate, the witness window, the lane/free
+    /// validations, the unwind record) runs inside [`Self::serve_call`].
+    ///
+    /// The venue rule (S8's, verbatim): a call's execution hops to the
+    /// sqz-meta pool inside `serve_call` exactly as it did per frame; the
+    /// chain futures themselves only sequence and await those hops, so a
+    /// one-call frame costs the one hop it always cost.
     async fn serve(&self, req: RpcRequest) -> RpcResponse {
         if req.verb != VERB_PUBLISH_CALL {
             return RpcResponse {
@@ -2900,10 +3378,10 @@ impl PublishService {
         }
         let frame: PublishRequestFrame = match decode(&req.body, "request") {
             Ok(f) => f,
-            Err(e) => return Self::refuse(req.id, PUBLISH_MALFORMED, format!("{e}")),
+            Err(e) => return Self::refuse_frame(req.id, PUBLISH_MALFORMED, format!("{e}")),
         };
         if frame.schema != PUBLISH_SCHEMA {
-            return Self::refuse(
+            return Self::refuse_frame(
                 req.id,
                 PUBLISH_SCHEMA_MISMATCH,
                 format!(
@@ -2913,15 +3391,89 @@ impl PublishService {
                 ),
             );
         }
-        if let Some(foreign) = frame
-            .call
+        let n = frame.calls.len();
+        if n == 0 {
+            return Self::refuse_frame(
+                req.id,
+                PUBLISH_MALFORMED,
+                "a publish frame carries at least one call".into(),
+            );
+        }
+        SERVED_FRAMES.fetch_add(1, Ordering::Relaxed);
+        SERVED_FRAME_CALLS.fetch_add(n as u64, Ordering::Relaxed);
+        let client: Arc<str> = Arc::from(frame.client.as_str());
+        let named: Vec<Vec<u64>> = frame.calls.iter().map(PublishCall::named_inos).collect();
+        let chains = super::service::chains_by_named_inos(&named);
+        let chain_count = chains.iter().copied().max().map_or(0, |m| m + 1);
+        SERVED_CHAINS.fetch_add(chain_count as u64, Ordering::Relaxed);
+        let outcomes: Vec<PublishCallOutcome> = if chain_count <= 1 {
+            // One chain (the one-call frame, or one hot object): the
+            // serial form, in-task.
+            let mut out = Vec::with_capacity(n);
+            for call in frame.calls {
+                out.push(self.serve_call(&client, call).await);
+            }
+            out
+        } else {
+            let mut per_chain: Vec<Vec<(usize, PublishCall)>> = vec![Vec::new(); chain_count];
+            for (idx, (call, chain)) in frame.calls.into_iter().zip(chains).enumerate() {
+                per_chain[chain].push((idx, call));
+            }
+            let futs = per_chain.into_iter().map(|chain| {
+                let client = Arc::clone(&client);
+                async move {
+                    let mut out = Vec::with_capacity(chain.len());
+                    for (idx, call) in chain {
+                        out.push((idx, self.serve_call(&client, call).await));
+                    }
+                    out
+                }
+            });
+            let mut slots: Vec<Option<PublishCallOutcome>> = (0..n).map(|_| None).collect();
+            for chain_out in futures::future::join_all(futs).await {
+                for (idx, outcome) in chain_out {
+                    slots[idx] = Some(outcome);
+                }
+            }
+            slots
+                .into_iter()
+                .map(|slot| {
+                    // Every call was slotted into exactly one chain; the
+                    // arm below is unreachable and refuses loud if not.
+                    slot.unwrap_or_else(|| {
+                        Self::refuse(
+                            PUBLISH_MALFORMED,
+                            "S9 publish owner: a framed call was dispatched to no chain".into(),
+                        )
+                    })
+                })
+                .collect()
+        };
+        let reply = PublishReplyFrame {
+            schema: PUBLISH_SCHEMA,
+            outcomes,
+        };
+        match encode(&reply, "reply frame") {
+            Ok(body) => RpcResponse {
+                id: req.id,
+                status: PUBLISH_OK,
+                body,
+            },
+            Err(e) => Self::refuse_frame(req.id, PUBLISH_MALFORMED, format!("reply encode: {e}")),
+        }
+    }
+
+    /// Serve ONE call of a frame — the gates in their landed order, then
+    /// the class's own serve path. Refusals are per call and apply
+    /// nothing; a sibling call in the same frame is untouched.
+    async fn serve_call(&self, client: &str, call: PublishCall) -> PublishCallOutcome {
+        if let Some(foreign) = call
             .named_inos()
             .into_iter()
             .find(|ino| !self.has_authority(*ino))
         {
             NOT_OWNER.fetch_add(1, Ordering::Relaxed);
             return Self::refuse(
-                req.id,
                 PUBLISH_NOT_OWNER,
                 format!(
                     "ino {foreign} routes to a metadata volume this node holds no authority \
@@ -2937,26 +3489,26 @@ impl PublishService {
         // era's replay must never be answered from cache — the FreeBlocks
         // precedent verbatim). The raise/free/harvest verbs keep their own,
         // older gates below (landed counter surface).
-        if let Some(epoch) = frame.call.era_gated_epoch() {
-            if let Err(reason) = crate::data_grant::validate_publish_era(&frame.client, epoch) {
+        if let Some(epoch) = call.era_gated_epoch() {
+            if let Err(reason) = crate::data_grant::validate_publish_era(client, epoch) {
                 // Rung 17: the extent class's era refusals land on their
                 // OWN row (`extent_stale_refusals`); the layout class
                 // keeps the finding-#6 row.
-                if frame.call.is_extent() {
+                if call.is_extent() {
                     EXTENT_STALE_REFUSALS.fetch_add(1, Ordering::Relaxed);
                 } else {
                     STALE_REFUSALS.fetch_add(1, Ordering::Relaxed);
                 }
-                return Self::refuse(req.id, PUBLISH_STALE_LEASE, reason);
+                return Self::refuse(PUBLISH_STALE_LEASE, reason);
             }
         }
         // The layout-publish class (law 2) and rung 17's extent class:
         // witnessed — served through the dedup window, never through the
         // generic dispatch below, whose no-retry law it would otherwise
         // weaken.
-        if let Some((epoch, request_id)) = frame.call.witness() {
+        if let Some((epoch, request_id)) = call.witness() {
             return self
-                .serve_layout_publish(req.id, epoch, request_id, frame.client, frame.call)
+                .serve_layout_publish(epoch, request_id, client.to_string(), call)
                 .await;
         }
         // DLM S9's allocation-lane seam: the ONE verb whose argument reaches a
@@ -2969,15 +3521,15 @@ impl PublishService {
             writers,
             lease_epoch,
             ..
-        } = &frame.call
+        } = &call
         {
             if let Err(reason) =
-                crate::data_grant::validate_lane_raise(&frame.client, *lease_epoch, *lane, *writers)
+                crate::data_grant::validate_lane_raise(client, *lease_epoch, *lane, *writers)
             {
                 crate::fuse_client::METRICS
                     .alloc_lane_raise_refusals
                     .fetch_add(1, Ordering::Relaxed);
-                return Self::refuse(req.id, PUBLISH_LANE_REFUSED, reason);
+                return Self::refuse(PUBLISH_LANE_REFUSED, reason);
             }
         }
         // The lane free HARVEST (rung 10, residual 2): validated exactly as
@@ -2990,17 +3542,15 @@ impl PublishService {
             lease_epoch,
             request_id,
             ..
-        } = &frame.call
+        } = &call
         {
             if let Err(reason) =
-                crate::data_grant::validate_lane_raise(&frame.client, *lease_epoch, *lane, *writers)
+                crate::data_grant::validate_lane_raise(client, *lease_epoch, *lane, *writers)
             {
                 HARVEST_REFUSALS.fetch_add(1, Ordering::Relaxed);
-                return Self::refuse(req.id, PUBLISH_LANE_REFUSED, reason);
+                return Self::refuse(PUBLISH_LANE_REFUSED, reason);
             }
-            return self
-                .serve_harvest(req.id, *lease_epoch, *request_id, frame.call)
-                .await;
+            return self.serve_harvest(*lease_epoch, *request_id, call).await;
         }
         // The co-writer FREE path: retried (like the harvest above and only
         // it), served through the era gate and then the dedup window —
@@ -3010,61 +3560,46 @@ impl PublishService {
             lease_epoch,
             request_id,
             ..
-        } = &frame.call
+        } = &call
         {
             // The era gate FIRST, before the window: a dead era must be
             // refused whether or not its id once executed — answering a
             // dead era's replay from cache would tell a fenced mount its
             // custody still speaks.
-            if let Err(reason) = crate::data_grant::validate_free(&frame.client, *lease_epoch) {
+            if let Err(reason) = crate::data_grant::validate_free(client, *lease_epoch) {
                 FREE_STALE_REFUSALS.fetch_add(1, Ordering::Relaxed);
-                return Self::refuse(req.id, PUBLISH_STALE_LEASE, reason);
+                return Self::refuse(PUBLISH_STALE_LEASE, reason);
             }
-            return self
-                .serve_free(req.id, *lease_epoch, *request_id, frame.call)
-                .await;
+            return self.serve_free(*lease_epoch, *request_id, call).await;
         }
         let Some(me) = self.owned() else {
             return Self::refuse(
-                req.id,
                 PUBLISH_MALFORMED,
                 "S9 publish service is shutting down — no handle to dispatch on".into(),
             );
         };
-        let name = frame.call.name();
-        let client = frame.client;
-        let call = frame.call;
+        let name = call.name();
+        let client = client.to_string();
         let joined = crate::meta_exec::spawn_meta_join("meta_ship_publish_verb", async move {
             me.execute(&client, call).await
         })
         .await;
-        let outcome = match joined {
-            Ok(out) => out,
+        match joined {
+            Ok(outcome) => {
+                SERVED.fetch_add(1, Ordering::Relaxed);
+                PublishCallOutcome::Done(outcome.map_err(|e| WireError::from_error(&e)))
+            }
             Err(e) => {
                 // An owner-side publish UNWOUND. Nothing joins a data-path
                 // task, so this counter is the only record its work was
                 // lost (the RES-7/RES-8 discipline).
                 PANICS.fetch_add(1, Ordering::Relaxed);
                 log::error!("S9 publish owner-side execution of {name} unwound: {e}");
-                return RpcResponse {
-                    id: req.id,
-                    status: PUBLISH_PANIC,
-                    body: format!("S9 publish owner-side execution panicked: {e}").into_bytes(),
-                };
+                Self::refuse(
+                    PUBLISH_PANIC,
+                    format!("S9 publish owner-side execution panicked: {e}"),
+                )
             }
-        };
-        SERVED.fetch_add(1, Ordering::Relaxed);
-        let frame = PublishReplyFrame {
-            schema: PUBLISH_SCHEMA,
-            outcome: outcome.map_err(|e| WireError::from_error(&e)),
-        };
-        match encode(&frame, name) {
-            Ok(body) => RpcResponse {
-                id: req.id,
-                status: PUBLISH_OK,
-                body,
-            },
-            Err(e) => Self::refuse(req.id, PUBLISH_MALFORMED, format!("reply encode: {e}")),
         }
     }
 
@@ -3074,19 +3609,17 @@ impl PublishService {
     /// `(lease_epoch, request_id)` executes on the sqz-meta pool; every
     /// duplicate — a freeze-window lost-reply retry, or an overlapping
     /// resend — awaits the winner's own outcome and is counted
-    /// (`replays`). The era gate already ran in [`Self::serve`], so a
-    /// dead era can never reach (or be answered from) this window.
+    /// (`replays`). The era gate already ran in [`Self::serve_call`], so
+    /// a dead era can never reach (or be answered from) this window.
     async fn serve_layout_publish(
         &self,
-        req_id: u64,
         lease_epoch: u64,
         request_id: u64,
         client: String,
         call: PublishCall,
-    ) -> RpcResponse {
+    ) -> PublishCallOutcome {
         let Some(me) = self.owned() else {
             return Self::refuse(
-                req_id,
                 PUBLISH_MALFORMED,
                 "S9 publish service is shutting down — no handle to dispatch on".into(),
             );
@@ -3103,7 +3636,7 @@ impl PublishService {
         }
         let outcome = slot
             .get_or_init(|| async move {
-                // The venue rule, verbatim (see serve/serve_free): the
+                // The venue rule, verbatim (see serve_call/serve_free): the
                 // commit runs on the sqz-meta pool, never inline on a
                 // `sqz-cluster-svc{n}` lane.
                 match crate::meta_exec::spawn_meta_join("meta_ship_publish_verb", async move {
@@ -3159,18 +3692,7 @@ impl PublishService {
         if is_extent && owns && outcome.is_ok() {
             EXTENT_SERVED.fetch_add(1, Ordering::Relaxed);
         }
-        let frame = PublishReplyFrame {
-            schema: PUBLISH_SCHEMA,
-            outcome,
-        };
-        match encode(&frame, name) {
-            Ok(body) => RpcResponse {
-                id: req_id,
-                status: PUBLISH_OK,
-                body,
-            },
-            Err(e) => Self::refuse(req_id, PUBLISH_MALFORMED, format!("reply encode: {e}")),
-        }
+        PublishCallOutcome::Done(outcome)
     }
 
     /// Serve one [`PublishCall::FreeBlocks`] through the dedup window: the
@@ -3178,27 +3700,24 @@ impl PublishService {
     /// pool under the installed [`FreeExecutor`]; every duplicate —
     /// a lost-reply retry, or an overlapping resend — awaits the winner's
     /// own outcome and is counted (`free_replays`). The era gate already
-    /// ran in [`Self::serve`].
+    /// ran in [`Self::serve_call`].
     async fn serve_free(
         &self,
-        req_id: u64,
         lease_epoch: u64,
         request_id: u64,
         call: PublishCall,
-    ) -> RpcResponse {
+    ) -> PublishCallOutcome {
         let PublishCall::FreeBlocks {
             vol_tag, blocks, ..
         } = call
         else {
             return Self::refuse(
-                req_id,
                 PUBLISH_MALFORMED,
                 "serve_free dispatched a non-free call".into(),
             );
         };
         let Some(exec) = free_executor() else {
             return Self::refuse(
-                req_id,
                 PUBLISH_MALFORMED,
                 "S9: a shipped free arrived but no free executor is installed — the ownership \
                  plane is armed without its FREE half. Executing it against the metadata set \
@@ -3249,18 +3768,7 @@ impl PublishService {
             .await
             .clone();
         SERVED.fetch_add(1, Ordering::Relaxed);
-        let frame = PublishReplyFrame {
-            schema: PUBLISH_SCHEMA,
-            outcome: outcome.map(PublishReply::FreeVerdicts),
-        };
-        match encode(&frame, "free_blocks") {
-            Ok(body) => RpcResponse {
-                id: req_id,
-                status: PUBLISH_OK,
-                body,
-            },
-            Err(e) => Self::refuse(req_id, PUBLISH_MALFORMED, format!("reply encode: {e}")),
-        }
+        PublishCallOutcome::Done(outcome.map(PublishReply::FreeVerdicts))
     }
 
     /// Serve one [`PublishCall::HarvestLaneFree`] through its dedup window
@@ -3268,14 +3776,13 @@ impl PublishService {
     /// `(lease_epoch, request_id)` executes on the sqz-meta pool under the
     /// installed [`HarvestExecutor`]; every duplicate awaits the winner's
     /// own grant and is counted (`harvest_replays`). The lane + era gate
-    /// already ran in [`Self::serve`].
+    /// already ran in [`Self::serve_call`].
     async fn serve_harvest(
         &self,
-        req_id: u64,
         lease_epoch: u64,
         request_id: u64,
         call: PublishCall,
-    ) -> RpcResponse {
+    ) -> PublishCallOutcome {
         let PublishCall::HarvestLaneFree {
             vol_tag,
             lane,
@@ -3285,14 +3792,12 @@ impl PublishService {
         } = call
         else {
             return Self::refuse(
-                req_id,
                 PUBLISH_MALFORMED,
                 "serve_harvest dispatched a non-harvest call".into(),
             );
         };
         let Some(exec) = harvest_executor() else {
             return Self::refuse(
-                req_id,
                 PUBLISH_MALFORMED,
                 "S9: a lane free harvest arrived but no harvest executor is installed — the \
                  ownership plane is armed without its reuse half. Handing out offsets without \
@@ -3335,25 +3840,14 @@ impl PublishService {
             .await
             .clone();
         SERVED.fetch_add(1, Ordering::Relaxed);
-        let frame = PublishReplyFrame {
-            schema: PUBLISH_SCHEMA,
-            // OQ 2 (schema 8): the reply carries the authority's LIVE
-            // bound age — the loop latency in force — so the co-writer's
-            // refill horizon is a measurement (0 = nothing held, and the
-            // ship side then keeps its derivation).
-            outcome: outcome.map(|blocks| PublishReply::LaneFreeGrant {
-                blocks,
-                bound_age_ms: crate::free_grace::bound_age_ms(),
-            }),
-        };
-        match encode(&frame, "harvest_lane_free") {
-            Ok(body) => RpcResponse {
-                id: req_id,
-                status: PUBLISH_OK,
-                body,
-            },
-            Err(e) => Self::refuse(req_id, PUBLISH_MALFORMED, format!("reply encode: {e}")),
-        }
+        // OQ 2 (schema 8): the reply carries the authority's LIVE bound
+        // age — the loop latency in force — so the co-writer's refill
+        // horizon is a measurement (0 = nothing held, and the ship side
+        // then keeps its derivation).
+        PublishCallOutcome::Done(outcome.map(|blocks| PublishReply::LaneFreeGrant {
+            blocks,
+            bound_age_ms: crate::free_grace::bound_age_ms(),
+        }))
     }
 
     /// PR 5b items 3+4 — the custody verdict for a kvmap-headed serve's

@@ -2116,13 +2116,13 @@ fn bench_alloc_lane_grant(c: &mut Criterion) {
     let frame = squeezefs::meta_ship::publish::PublishRequestFrame {
         schema: squeezefs::meta_ship::publish::PUBLISH_SCHEMA,
         client: "node_00000000deadbeef".to_string(),
-        call: call.clone(),
+        calls: vec![call.clone()],
     };
     group.bench_function("raise_frame_named_inos", |b| {
         b.iter(|| black_box(call.named_inos()))
     });
     group.bench_function("raise_frame_clone", |b| {
-        b.iter(|| black_box(frame.call.clone()))
+        b.iter(|| black_box(frame.calls[0].clone()))
     });
 
     // Per 4 MiB BLOCK: the gate. Three postures — the shipped writer (the row
@@ -2208,12 +2208,12 @@ fn bench_cowriter_free(c: &mut Criterion) {
     let frame_of = |blocks: Vec<u64>| PublishRequestFrame {
         schema: PUBLISH_SCHEMA,
         client: "node_00000000deadbeef".to_string(),
-        call: PublishCall::FreeBlocks {
+        calls: vec![PublishCall::FreeBlocks {
             vol_tag: 0x00aa_11bb_00aa_11bb,
             blocks,
             lease_epoch: 42,
             request_id: 7,
-        },
+        }],
     };
     let one = frame_of(vec![1_650]);
     let batch = frame_of((0..64u64).map(|i| 1_650 + i * 4).collect());

@@ -1390,6 +1390,14 @@ fn fleet_share_quarters_the_residue_site_derivations() {
     );
     assert_eq!(batch_max_from(None, field), 64, "M7 floor holds");
 
+    // meta_ship publish-plane in-flight frame depth (ceil(cpus/8), clamp
+    // [2, 8] — the owner RPC-lane slope, D-1b): the quarter is visible on
+    // the 32-core box; the field shape sits on the double-buffer floor.
+    use squeezefs::meta_ship::publish::publish_ship_depth_from;
+    assert_eq!(publish_ship_depth_from(None, 32), 4);
+    assert_eq!(publish_ship_depth_from(None, 256), 8, "RPC-lane ceiling");
+    assert_eq!(publish_ship_depth_from(None, field), 2, "depth floor holds");
+
     // Job-fabric workers (cpus/4, clamp [2, 8]).
     use squeezefs::jobs::fabric_workers_default;
     assert_eq!(fabric_workers_default(32), 8);
@@ -1457,6 +1465,11 @@ fn residue_site_floors_hold_at_every_share() {
             "M7 batch floor holds at share={share}"
         );
         assert_eq!(
+            squeezefs::meta_ship::publish::publish_ship_depth_from(None, c),
+            2,
+            "publish-depth floor holds at share={share}"
+        );
+        assert_eq!(
             squeezefs::jobs::fabric_workers_default(c),
             2,
             "fabric-worker floor holds at share={share}"
@@ -1483,6 +1496,17 @@ fn residue_site_explicit_levers_stay_verbatim() {
     use squeezefs::meta_ship::router::batch_max_from;
     assert_eq!(batch_max_from(Some(8), 1), 8, "explicit wins verbatim");
     assert_eq!(batch_max_from(Some(9999), 256), 4096, "range clamp only");
+    use squeezefs::meta_ship::publish::publish_ship_depth_from;
+    assert_eq!(
+        publish_ship_depth_from(Some(1), 256),
+        1,
+        "the stop-and-wait A/B control wins verbatim"
+    );
+    assert_eq!(
+        publish_ship_depth_from(Some(999), 1),
+        64,
+        "range clamp only"
+    );
     assert_eq!(service_threads_from(Some(6), 32), 6, "explicit wins");
     assert_eq!(
         service_threads_from(Some(16), 4),

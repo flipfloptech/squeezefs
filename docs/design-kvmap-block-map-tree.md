@@ -384,3 +384,50 @@ red). Do not run range-custody fleets on tips between PR 3 and PR 5a.
 the S5 staleness bound (safe via free-grace); the verb's load-bearing
 face is the WRITE-side base refresh — measure the read side before
 building it.
+
+## 12. Rev 1.6 — the PR-6 split (2026-09-02)
+
+The PR-6 pre-map splits the economy/scale rung into three, with four
+structural findings:
+
+- **PR 6a `perf/kvmap-runs-point2`** — RUN records + the stamped-capable
+  compact value, COUPLED: incarnation stamps gate RUN exactly as they
+  gated POINT (Rev 1.4 #1), so plain runs are near-inert on default
+  formats unless the stamp-carrying forms (POINT2 = 26 B
+  vol_tag‖offset‖incarnation verbatim — never re-attached; RUN2 iff
+  consecutive-mint lane_seqs prove stride-1) ship together. Run
+  detection at the routed train's post-encode seam; run-aware diff
+  equality (run-Put + point-Deletes ride the existing train tx — the
+  coalesce law for free); floor-scan on exact-miss + mid-run range
+  starts; expansion at the TWO shared surfaces only. NO separate
+  coalescer: every sticky-head publish re-runs the whole-map diff, so
+  THE PUBLISH TRAIN IS THE CANONICALIZER (owed for real when 6c kills
+  the whole-map diff). 1 PiB sequential: 65,536 run records ≈ 2.2 MiB
+  vs 7.5 GiB of points (~3,500× fewer bytes; the crossing train drops
+  to ~128 chunk txs). POINT2's byte win vs stamped STRINGs is
+  MARGINAL for bare-offset keys (26 B vs ~18-30 B) — measure before
+  committing; the record-count/structure win is what runs deliver.
+- **PR 6b `feat/kvmap-sweep`** — the A2 background sweep:
+  size-flip-first SETATTR (+`;sweep:K` head — the grammar and the C11
+  exemption already exist), `JobType::KvmapSweep` with the
+  cursor-head-scan KD-6 plan, the derived sync-vs-job handoff
+  threshold (`size/block_size` vs `map_migrate_chunk()×K` — ~128 GiB
+  at defaults stays synchronous), per-chunk ONE-tx law (map Deletes +
+  ref releases + cursor advance; frees post-commit, RES-1). Main open
+  design point: the unlink corpse's head-vs-destroy ordering (the
+  sweep needs the cursor OR the C11 orphan census as its plan).
+- **PR 6c `feat/kvmap-bounded-save`** (STRICTLY post-5b) — write-side
+  map-RAM boundedness via the dirty-index overlay + claims-scoped
+  LOCAL train (the `ref_changes` per-merge delta is the ready-made
+  overlay seed; segmented windows are structurally invalid while the
+  local diff is delete-by-absence). Until then: option (b)'s honest
+  cap — a `kvmap_write_map_bytes` gauge + derived budget refusing
+  over-budget giant write-opens loudly (ships with 6a/6b). Venue
+  arithmetic: 24×16 GiB write-active ≈ 10 MB (trivial); one 1 PiB
+  write-active file ≈ 13-26 GB (the blocker — and that shape is the
+  S11 venue, itself post-5b).
+
+Also: the routing-layer "incarnation not engaged" comment contradicts
+Rev 1.4 #1 — verify bit-13 default engagement before sizing POINT2
+(likely a stale comment); the pre-short-circuit O(map) inline-sizing
+pass on kvmap saves is a free CPU hoist for 6a.

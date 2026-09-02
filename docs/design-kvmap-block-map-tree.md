@@ -1,10 +1,11 @@
 # Design: PB-class file support — the `TREE_BLOCK_MAP` KV tree (finding 42)
 
-**Status: DRAFT Rev 1** (design phase 2026-09-01; Rev 0 drafted by the f42
-planning pass; Rev 1 folds the adversarial review's amendments — §6 — whose
-three critical findings supersede the corresponding Rev 0 clauses. Do not
-start the PR ladder before §6's A1–A5 are reflected in PR 1/2 scopes). The
-implementation is the `feat/kvmap-*` PR ladder in §4.
+**Status: DRAFT Rev 1.6** (design phase 2026-09-01; Rev 0 drafted by the
+f42 planning pass; Rev 1 folds the adversarial review's amendments — §6 —
+whose three critical findings supersede the corresponding Rev 0 clauses;
+Rev 1.6 records PR 5b's landed laws — §12. Do not start the PR ladder
+before §6's A1–A5 are reflected in PR 1/2 scopes). The implementation is
+the `feat/kvmap-*` PR ladder in §4.
 
 ## 0. Problem
 
@@ -431,3 +432,86 @@ Also: the routing-layer "incarnation not engaged" comment contradicts
 Rev 1.4 #1 — verify bit-13 default engagement before sizing POINT2
 (likely a stale comment); the pre-short-circuit O(map) inline-sizing
 pass on kvmap saves is a free CPU hoist for 6a.
+## 12. Rev 1.6 — PR 5b landed: kvmap multi-writer support (2026-09-02, normative)
+
+PR 5b (`feat/kvmap-mw`) replaced PR 5a's two loud refusals with real
+support. The landed laws:
+
+1. **Claims-scoped SHIPPED trains (§11 law b, built)**: the owner-executed
+   train for a `MigrateBlockMap` whose DURABLE base is a `kvmap:` head
+   adopts a Put only under the shipper's take claims (its whole refs
+   frame — a shipped save carries it un-chunked, f36b) and deletes only
+   under an explicit release-without-take absent from the shipped map
+   (the f35 removal law) — **never delete-by-absence**. The whole-map
+   diff survives exactly where RAM is whole-map authority: local solo
+   saves, the episode-compose window (serve-window exemption), and
+   ESTABLISHING trains (crossing/conversion — the tree is empty, the
+   diff is vacuous). Claimed adopt candidates pass the f28 live-binding
+   probe; a stale shipper's size never regresses a peer's growth (the
+   f35 size law on the claims arm).
+2. **The map-generation BELT**: the head sentinel grammar is now
+   `kvmap:1[;sweep:K][;gen:N]` (`gen` omitted at 0 — pre-belt heads and
+   solo volumes stay byte-identical; `gen:0` and out-of-order segments
+   refuse). Every committed train on the MW PLANE bumps it — claims
+   trains, any train on a custody-armed authority, and any head whose
+   gen was ever minted (monotone across disarm/remount); solo mounts
+   never mint one (dark by default). A shipped train whose `base_gen`
+   (schema 12's new verb field; the routing arm parses it from the
+   cached head id and re-stamps from every `MapMigrated.gen` reply)
+   mismatches the durable head refuses RETRIED-class ("layout delta base
+   unusable: kvmap map generation", `map_refused`) under the train's
+   held 4a; the client-side error arm re-learns the head id from the
+   local reader view (head-id-only patch — the RAM map stays this
+   mount's write authority).
+3. **The f36b recompute twin**: with the rung-19 resolver armed, a
+   claims-scoped train REPLACES the shipper's non-map-blob frame with
+   the tree→composed swap diff (a stale frame legitimately MIS-NAMES the
+   displaced binding), stages it in the flip tx (over-cap loads chunk
+   in-train, refs-only txs co-owning the held 4a — f38's law), and the
+   authority frees the TRUE displaced set via
+   `free_recomputed_releases` strictly after commit Ok.
+   `MapMigrated` gained `recomputed`/`released`/`gen` (schema 11→12,
+   KD-7 same-commit fleets); `meta_ship_publish.map_recomputed_releases`
+   is the engagement gauge; the caller stands its displaced-free ship
+   down on `recomputed` and purges local tiers only (routing's "a kvmap
+   publish is never owner-recomputed" shortcut deleted). Unarmed
+   (no-resolver) trains keep the caller frame byte-identical and the
+   caller keeps its free stream — the f36 preservation arm. In-frame
+   TRANSIENT displacements (took-and-released between publishes) follow
+   the accepted scoped-Put semantics (final-state diff) — a shared
+   pre-existing class, not widened here.
+4. **The S11 ∘ kvmap scoped compose (item 3, replaces §11 row 2's
+   refusal)**: a scoped `SetLayoutAndSize` meeting a kvmap DURABLE head
+   composes over the TREE-RESOLVED map under the claims law — claims
+   custody-scoped to the holder's spans minus demoted regions (whole-file
+   and grant-free shapes compose span-unfiltered; the finding-34
+   custody-less-against-grants class keeps its refusal on
+   `unscoped_put_refusals`) — and persists via the claims-scoped train
+   (sticky durable head id, the train re-stamps the gen); the reply stays
+   `PutDone{recomputed}`. An indirect shipped side rehydrates through the
+   rung-20 hook. **Remaining refusals** (retried-class, `map_refused`): a
+   Put SHIPPING a kvmap head over a non-kvmap durable base (sticky heads
+   never regress — a stale/foreign frame), a kvmap-headed
+   `SetLayoutAndSize` at all (no product path mints one — sticky saves
+   ship the train), an undecodable legacy/JSON ship over a kvmap base
+   (the retired "legacy verbatim" arm was §11 row 2's clobber), and §11
+   row 3's chained merge onto a kvmap base (unchanged — the shipper
+   refetches and re-ships the train).
+5. **f34 retirement for kvmap (item 4, gated on the s11-shaped contract —
+   green)**: the sticky-head SERVE refusal lifted for kvmap bases (a
+   range holder's whole-map ship runs the claims train, span-scoped); the
+   LOCAL-train screen lifted the same way (outside the compose window,
+   live grants ⇒ claims-scoped from the save's own refs frame). **Kept**:
+   a NEW CROSSING under live range grants still stands down to the blob
+   arm (caller gate) and a direct whole-map crossing train under live
+   grants still refuses — flipping the head mid-episode takes whole-map
+   authority nobody arbitrated. Acceptance:
+   `a_range_granted_kvmap_ino_composes_two_scoped_writers_and_the_episode_publish`
+   (two scoped writers + the authority's episode compose, all landing,
+   oracle clean).
+
+Gauges added: `meta_ship_publish.map_recomputed_releases`. Contracts:
+`tests/kvmap_mw_hazard_tests.rs` (items 1, 3, 4),
+`tests/mw_cowriter_free_tests.rs`
+(`a_skewed_kvmap_ship_frees_the_true_displaced_set_on_the_authority` —
+item 2), `tests/kvmap_tree_tests.rs` (the gen grammar).

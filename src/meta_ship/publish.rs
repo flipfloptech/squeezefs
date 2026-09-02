@@ -1927,30 +1927,69 @@ pub async fn migrate_block_map(
     match owner_of(be, ino)? {
         None => {
             note_local();
+            use crate::meta_backend::Metadata as _;
             let _serve_window = local_publish_guard(ino).await;
-            // PR 5a (design §11 row 4 — f34 parity, the serve arm's probe
-            // verbatim): a LOCAL whole-map train on an ino with live range
-            // grants reverts peers' entries by delete-by-absence exactly
-            // like the shipped one, and a sticky `kvmap:` head cannot fall
-            // back to the blob arm (the head would regress) — refuse loud,
-            // nothing staged; the S11 ∘ kvmap compose lands in PR 5b. The
-            // ONE exemption is the routing save's episode-compose window
-            // (finding 35b): its train input IS the durable head plus this
-            // save's claims, composed and committed under the same stripe
-            // the served scoped Puts serialize on.
-            if !serve_window_already_held()
-                && crate::data_grant::custody_owner().is_some_and(|o| o.ino_has_range_grants(ino))
-            {
-                MAP_REFUSED.fetch_add(1, Ordering::Relaxed);
-                return Err(SqueezefsError::InvalidOperation(format!(
-                    "kvmap crossing for ino {ino} refused — the ino has live range grants, \
-                     and a LOCAL whole-map train would revert peers' entries (finding 34's \
-                     class; the S11 ∘ kvmap compose lands in PR 5b); drain range custody \
-                     first (map_refused)"
-                )));
-            }
+            // §11 row 4 / item 4 (f34 parity, lifted for kvmap bases): a
+            // LOCAL whole-map train under live range grants reverts
+            // peers' entries by delete-by-absence exactly like the
+            // shipped one. The exemptions: the routing save's
+            // episode-compose window (finding 35b — its train input IS
+            // the durable head plus this save's claims, composed under
+            // the same stripe the served scoped Puts serialize on, so
+            // whole-map is exact there), and — since PR 5b — a STICKY
+            // kvmap base outside the window, which runs CLAIMS-SCOPED
+            // (adopt under this save's take claims, delete under its
+            // release-without-take claims; the compose IS the
+            // range-custody path now). A NON-kvmap base (a new crossing)
+            // keeps the refusal: flipping the head mid-episode takes
+            // whole-map authority nobody arbitrated — the caller's
+            // crossing gate stands down to the blob arm instead.
+            let live_grants = !serve_window_already_held()
+                && crate::data_grant::custody_owner().is_some_and(|o| o.ino_has_range_grants(ino));
+            let claims = if live_grants {
+                let kvmap_base = match be.getxattr(ino, "layout").await {
+                    Ok(Some(bytes)) => crate::layout_wire::decode_layout_any(&bytes)
+                        .ok()
+                        .and_then(|l| l.block_map_id)
+                        .is_some_and(|id| {
+                            id.starts_with(crate::meta_backend::kv::block_map::KVMAP_HEAD_PREFIX)
+                        }),
+                    _ => false,
+                };
+                if !kvmap_base {
+                    MAP_REFUSED.fetch_add(1, Ordering::Relaxed);
+                    return Err(SqueezefsError::InvalidOperation(format!(
+                        "kvmap crossing for ino {ino} refused — the ino has live range \
+                         grants, and a LOCAL whole-map crossing train would revert peers' \
+                         entries (finding 34's class); the crossing stands down to the \
+                         blob arm until range custody drains (map_refused)"
+                    )));
+                }
+                let mut take: std::collections::BTreeSet<u32> = std::collections::BTreeSet::new();
+                let mut release: std::collections::BTreeSet<u32> =
+                    std::collections::BTreeSet::new();
+                for op in &refs {
+                    if op.reference.is_map_blob() || op.reference.owner_ino != ino {
+                        continue;
+                    }
+                    if op.take {
+                        take.insert(op.reference.block_index);
+                    } else {
+                        release.insert(op.reference.block_index);
+                    }
+                }
+                Some(crate::meta_backend::kv::backend::MapTrainClaims {
+                    // The local authority composes against the head it
+                    // serializes on — no staleness window for the belt.
+                    base_gen: None,
+                    take,
+                    release,
+                })
+            } else {
+                None
+            };
             match be
-                .migrate_block_map_train(ino, layout, size, &refs, &entries, chunk, None)
+                .migrate_block_map_train(ino, layout, size, &refs, &entries, chunk, claims.as_ref())
                 .await?
             {
                 Some(outcome) => Ok(outcome),
@@ -2689,6 +2728,22 @@ struct ScopedBlobCustody {
     free_after_commit: Vec<String>,
 }
 
+/// PR 5b items 3+4 — a kvmap-headed serve's custody verdict for its
+/// CLAIM SCOPE (see [`PublishService::kvmap_claim_scope`]).
+enum KvmapClaimScope {
+    /// Claims apply span-unfiltered (the §11 law-b baseline).
+    Unscoped,
+    /// A RANGE holder: claims filter to its spans minus demoted regions.
+    Scoped {
+        spans: Vec<(u64, u64)>,
+        demoted: Vec<(u64, u64)>,
+        block: u64,
+    },
+    /// Finding 34's class: a custody-less writer against OTHER holders'
+    /// live grants — the caller refuses on its own counter.
+    UnscopedAgainstGrants,
+}
+
 /// The publish path executed for a peer, against the volumes this node has
 /// authority over.
 ///
@@ -3243,6 +3298,262 @@ impl PublishService {
         }
     }
 
+    /// PR 5b items 3+4 — the custody verdict for a kvmap-headed serve's
+    /// CLAIM SCOPE: `Unscoped` (no owner armed / whole-file custody / a
+    /// custody-less writer on a grant-free ino — the claims law still
+    /// applies, span-unfiltered), `Scoped` (a RANGE holder: claims filter
+    /// to its spans minus demoted regions), or the finding-34 class (a
+    /// custody-less writer against OTHER holders' live grants — the
+    /// caller refuses on its own counter). Mirrors
+    /// [`Self::custody_scoped_layout`]'s shape ladder; the geometry
+    /// refusal is the scoped-or-not-at-all law verbatim.
+    async fn kvmap_claim_scope(&self, client: &str, ino: u64) -> Result<KvmapClaimScope> {
+        let Some(owner) = crate::data_grant::custody_owner() else {
+            return Ok(KvmapClaimScope::Unscoped);
+        };
+        let spans = match owner.client_custody_on(client, ino) {
+            crate::data_grant::ClientCustodyShape::Ranges(spans) => spans,
+            crate::data_grant::ClientCustodyShape::WholeFile => {
+                return Ok(KvmapClaimScope::Unscoped)
+            }
+            crate::data_grant::ClientCustodyShape::None if owner.ino_has_range_grants(ino) => {
+                return Ok(KvmapClaimScope::UnscopedAgainstGrants);
+            }
+            crate::data_grant::ClientCustodyShape::None => return Ok(KvmapClaimScope::Unscoped),
+        };
+        let block = match owner.geometry_of(ino).await {
+            Some((_size, block)) if block > 0 => block,
+            other => {
+                return Err(SqueezefsError::InvalidOperation(format!(
+                    "S11 ∘ kvmap: range holder '{client}'s publish for ino {ino} cannot be \
+                     custody-scoped ({}) — refusing rather than adopting its claims \
+                     unscoped (the zeros-interleave law). Arm the authority's range plane \
+                     with its geometry source (multi_writer::router_range_geometry)",
+                    match other {
+                        None => "no geometry source installed",
+                        Some(_) => "the geometry source answered block size 0",
+                    }
+                )));
+            }
+        };
+        Ok(KvmapClaimScope::Scoped {
+            spans,
+            demoted: crate::dlm::demoted_regions(ino),
+            block,
+        })
+    }
+
+    /// PR 5b item 3 — **the S11 ∘ kvmap scoped compose** (replaces PR 5a's
+    /// §11 row-2 refusal): a scoped `SetLayoutAndSize` meeting a kvmap
+    /// DURABLE head composes over the TREE-RESOLVED map under the claims
+    /// law and persists via the claims-scoped train (item 1's mode)
+    /// instead of an inline/blob Put — the head stays sticky-kvmap, every
+    /// unclaimed binding survives, and the f36b recompute (item 2) rides
+    /// the train. `Ok(None)` = not a kvmap shape (the caller's
+    /// inline/blob compose proceeds verbatim).
+    ///
+    /// Remaining refusals (stated per item 3's contract): a SHIPPED
+    /// kvmap head — over a non-kvmap durable base it is a stale/foreign
+    /// frame (sticky heads never regress), and as a Put shape at all it
+    /// is not a publish the product mints (sticky-head saves ship the
+    /// MigrateBlockMap train); and an undecodable legacy/JSON ship over a
+    /// kvmap base (the retired "legacy verbatim" arm is exactly the
+    /// head-regressing clobber §11 row 2 named).
+    async fn try_scoped_kvmap_put(
+        &self,
+        client: &str,
+        ino: u64,
+        layout: &[u8],
+        size: u64,
+        refs: &[BlockRefOp],
+    ) -> Result<Option<PublishReply>> {
+        use crate::meta_backend::Metadata as _;
+        let kvmap_id = |bytes: &[u8]| {
+            crate::layout_wire::decode_layout_any(bytes)
+                .ok()
+                .and_then(|l| l.block_map_id)
+                .filter(|id| id.starts_with(crate::meta_backend::kv::block_map::KVMAP_HEAD_PREFIX))
+        };
+        let durable_kv = match self.inner.getxattr(ino, "layout").await {
+            Ok(Some(bytes)) => kvmap_id(&bytes),
+            _ => None,
+        };
+        let shipped_kv = kvmap_id(layout).is_some();
+        let Some(durable_id) = durable_kv else {
+            if shipped_kv {
+                MAP_REFUSED.fetch_add(1, Ordering::Relaxed);
+                return Err(SqueezefsError::InvalidOperation(format!(
+                    "layout delta base unusable: range holder '{client}'s Put for ino \
+                     {ino} ships a kvmap head over a NON-kvmap durable base — sticky \
+                     heads never regress, so the frame is stale/foreign; refetch and \
+                     recompose (map_refused)"
+                )));
+            }
+            return Ok(None);
+        };
+        if shipped_kv {
+            MAP_REFUSED.fetch_add(1, Ordering::Relaxed);
+            return Err(SqueezefsError::InvalidOperation(format!(
+                "S11 ∘ kvmap: a kvmap-headed SetLayoutAndSize for ino {ino} is not a \
+                 publish shape — a sticky-head save ships the MigrateBlockMap train; \
+                 nothing staged (map_refused)"
+            )));
+        }
+        // Decode the shipped Put's map: inline, or rehydrated from its
+        // blob (the rung-20 hook). An undecodable non-indirect base
+        // refuses — the retired "legacy verbatim" arm is the §11 row-2
+        // head-regressing clobber.
+        let dec = crate::layout_wire::decode_base_layout(layout);
+        let shipped_indirect = matches!(&dec, Err(e) if format!("{e}").contains("indirect"));
+        let mut new = match dec {
+            Ok(l) => l,
+            Err(_) if shipped_indirect => {
+                let Some(io) = crate::meta_backend::kv::indirect_map::indirect_map_io() else {
+                    return Err(SqueezefsError::InvalidOperation(format!(
+                        "layout delta base unusable: indirect base — range holder \
+                         '{client}'s full Put for ino {ino} ships an indirect map onto a \
+                         kvmap head with no indirect-map hook armed (rung 19: refetch \
+                         and recompose)"
+                    )));
+                };
+                let mut head = crate::layout_wire::decode_layout_any(layout).map_err(|e| {
+                    SqueezefsError::InvalidOperation(format!(
+                        "S11 ∘ kvmap: undecodable indirect shipped layout for ino {ino}: {e}"
+                    ))
+                })?;
+                let blob = head
+                    .block_map_id
+                    .as_deref()
+                    .and_then(|id| id.strip_prefix("indirect:"))
+                    .map(str::to_string)
+                    .ok_or_else(|| {
+                        SqueezefsError::InvalidOperation(format!(
+                            "S11 ∘ kvmap: indirect shipped layout for ino {ino} names no blob"
+                        ))
+                    })?;
+                let full = (io.read)(blob).await?;
+                head.block_map = Some(full.into_iter().collect());
+                head
+            }
+            Err(e) => {
+                MAP_REFUSED.fetch_add(1, Ordering::Relaxed);
+                return Err(SqueezefsError::InvalidOperation(format!(
+                    "S11 ∘ kvmap: range holder '{client}'s Put for ino {ino} is \
+                     undecodable as a map source ({e}) — applying it verbatim would \
+                     regress the kvmap head to a stale inline value and orphan every \
+                     tree-7 record (§11 row 2's clobber); refused, nothing staged \
+                     (map_refused)"
+                )));
+            }
+        };
+        let mut entries: Vec<(u32, String)> = new
+            .block_map
+            .take()
+            .unwrap_or_default()
+            .into_iter()
+            .collect();
+        entries.sort_unstable_by_key(|&(b, _)| b);
+        // The claims (finding 35's law: view ≠ claim), custody-scoped.
+        let mut take: std::collections::BTreeSet<u32> = std::collections::BTreeSet::new();
+        let mut release: std::collections::BTreeSet<u32> = std::collections::BTreeSet::new();
+        for op in refs {
+            if op.reference.is_map_blob() || op.reference.owner_ino != ino {
+                continue;
+            }
+            if op.take {
+                take.insert(op.reference.block_index);
+            } else {
+                release.insert(op.reference.block_index);
+            }
+        }
+        match self.kvmap_claim_scope(client, ino).await? {
+            KvmapClaimScope::Unscoped => {}
+            KvmapClaimScope::Scoped {
+                spans,
+                demoted,
+                block,
+            } => {
+                let in_custody = |b: &u32| {
+                    let bs = u64::from(*b) * block;
+                    let be = bs + block;
+                    spans.iter().any(|&(s, e)| e > bs && s < be)
+                        && !demoted.iter().any(|&(s, e)| e > bs && s < be)
+                };
+                take.retain(in_custody);
+                release.retain(in_custody);
+            }
+            KvmapClaimScope::UnscopedAgainstGrants => {
+                // Finding 34's class, verbatim (the kvmap face): a
+                // custody-less Put against other holders' live grants.
+                UNSCOPED_PUT_REFUSALS.fetch_add(1, Ordering::Relaxed);
+                return Err(SqueezefsError::InvalidOperation(format!(
+                    "S11 (finding 34): range-custody-less full Put for ino {ino} from \
+                     '{client}' refused — the ino has live range grants held by other \
+                     writers (unscoped_put_refusals)"
+                )));
+            }
+        }
+        // Finding 28: a claimed entry naming a DEAD incarnation never
+        // adopts — the durable binding stands.
+        let mut adopt: Vec<(u32, String)> = entries
+            .iter()
+            .filter(|(b, _)| take.contains(b))
+            .cloned()
+            .collect();
+        retain_live_bindings(&mut adopt, ino);
+        let take: std::collections::BTreeSet<u32> = adopt.iter().map(|(b, _)| *b).collect();
+        // The flip head: the Put's non-map fields under the STICKY
+        // durable kvmap id (the train re-stamps the generation) — never
+        // an inline/blob head (§11 row 2's regression).
+        new.block_map_id = Some(durable_id);
+        new.block_map = None;
+        let head_bytes = bincode::serialize(&new).map_err(|e| {
+            SqueezefsError::InvalidOperation(format!(
+                "S11 ∘ kvmap: flip-head encode failed for ino {ino}: {e}"
+            ))
+        })?;
+        let claims = crate::meta_backend::kv::backend::MapTrainClaims {
+            // No generation travels on a Put — the compose reads the
+            // CURRENT tree under the serve stripe, so there is no
+            // staleness window for the belt to close.
+            base_gen: None,
+            take,
+            release,
+        };
+        match self
+            .inner
+            .migrate_block_map_train(
+                ino,
+                &head_bytes,
+                size,
+                refs,
+                &entries,
+                crate::routing::map_migrate_chunk(),
+                Some(&claims),
+            )
+            .await?
+        {
+            Some(o) => {
+                MAP_SERVED.fetch_add(1, Ordering::Relaxed);
+                let released = o.released.len() as u64;
+                if !o.released.is_empty() {
+                    MAP_RECOMPUTED_RELEASES.fetch_add(released, Ordering::Relaxed);
+                    free_recomputed_releases(ino, o.released).await;
+                }
+                Ok(Some(PublishReply::PutDone {
+                    recomputed: o.recomputed,
+                }))
+            }
+            None => {
+                MAP_REFUSED.fetch_add(1, Ordering::Relaxed);
+                Err(SqueezefsError::InvalidOperation(format!(
+                    "S11 ∘ kvmap: the scoped compose for ino {ino} could not engage the \
+                     block-map tree (the bit-16 ratchet failed); nothing was committed"
+                )))
+            }
+        }
+    }
+
     /// **The served migration train** (kvmap PR 2 + PR 5b, design §11
     /// laws a+b): a first crossing/conversion — durable base NOT kvmap —
     /// runs the whole-map train verbatim (there are no tree records to
@@ -3261,7 +3572,7 @@ impl PublishService {
     #[allow(clippy::too_many_arguments)]
     async fn serve_map_train(
         &self,
-        _client: &str,
+        client: &str,
         ino: u64,
         layout: Vec<u8>,
         size: u64,
@@ -3269,19 +3580,6 @@ impl PublishService {
         refs: Vec<WireBlockRefOp>,
         base_gen: u64,
     ) -> Result<PublishReply> {
-        // The finding-34 posture: a train on an ino OTHER writers hold
-        // live ranges on would clobber the arbiter's compose — refuse
-        // loud, never verbatim.
-        if let Some(owner) = crate::data_grant::custody_owner() {
-            if owner.ino_has_range_grants(ino) {
-                MAP_REFUSED.fetch_add(1, Ordering::Relaxed);
-                return Err(SqueezefsError::InvalidOperation(format!(
-                    "kvmap crossing for ino {ino} refused — the ino has live range \
-                     grants, and a whole-map train would revert peers' entries \
-                     (finding 34's class); drain range custody first"
-                )));
-            }
-        }
         use crate::meta_backend::Metadata as _;
         let mut refs: Vec<BlockRefOp> = refs.into_iter().map(BlockRefOp::from).collect();
         // The durable base decides the mode (the KVMAP_HEAD_PREFIX law —
@@ -3295,10 +3593,29 @@ impl PublishService {
                 }),
             _ => false,
         };
+        if !kvmap_base {
+            // The finding-34 posture, kept for CROSSING trains (§11 item
+            // 4's stated residue): flipping the head mid-episode would
+            // take new-crossing whole-map authority nobody arbitrated —
+            // the crossing stands down at the caller until custody
+            // drains, and a direct train here refuses loud.
+            if let Some(owner) = crate::data_grant::custody_owner() {
+                if owner.ino_has_range_grants(ino) {
+                    MAP_REFUSED.fetch_add(1, Ordering::Relaxed);
+                    return Err(SqueezefsError::InvalidOperation(format!(
+                        "kvmap crossing for ino {ino} refused — the ino has live range \
+                         grants, and a whole-map crossing train would revert peers' \
+                         entries (finding 34's class); drain range custody first"
+                    )));
+                }
+            }
+        }
         if kvmap_base {
             // §11 law b: the claim sets — the shipper's own transitions
             // (view ≠ claim: everything else in its whole-map ship is a
-            // snapshot of blocks it never wrote).
+            // snapshot of blocks it never wrote), custody-scoped (item 4:
+            // a RANGE holder's sticky-head ship IS the range-custody path
+            // now — the f34 blanket refusal lifted for kvmap bases).
             let mut take: std::collections::BTreeSet<u32> = std::collections::BTreeSet::new();
             let mut release: std::collections::BTreeSet<u32> = std::collections::BTreeSet::new();
             for op in &refs {
@@ -3309,6 +3626,32 @@ impl PublishService {
                     take.insert(op.reference.block_index);
                 } else {
                     release.insert(op.reference.block_index);
+                }
+            }
+            match self.kvmap_claim_scope(client, ino).await? {
+                KvmapClaimScope::Unscoped => {}
+                KvmapClaimScope::Scoped {
+                    spans,
+                    demoted,
+                    block,
+                } => {
+                    let in_custody = |b: &u32| {
+                        let bs = u64::from(*b) * block;
+                        let be = bs + block;
+                        spans.iter().any(|&(s, e)| e > bs && s < be)
+                            && !demoted.iter().any(|&(s, e)| e > bs && s < be)
+                    };
+                    take.retain(in_custody);
+                    release.retain(in_custody);
+                }
+                KvmapClaimScope::UnscopedAgainstGrants => {
+                    MAP_REFUSED.fetch_add(1, Ordering::Relaxed);
+                    return Err(SqueezefsError::InvalidOperation(format!(
+                        "kvmap re-train for ino {ino} from '{client}' refused — the ino \
+                         has live range grants held by OTHER writers and the shipper \
+                         holds no custody (finding 34's class); drain publishes before \
+                         releasing range custody (map_refused)"
+                    )));
                 }
             }
             // Finding 28: a claimed entry naming a DEAD incarnation never
@@ -3562,36 +3905,10 @@ impl PublishService {
             crate::layout_wire::decode_base_layout(&durable),
             crate::layout_wire::decode_base_layout(&shipped),
         );
-        // PR 5a (design §11 row 2): a `kvmap:` head is UNDECODABLE as a
-        // delta base BY DESIGN (its map lives in tree 7, and its refusal
-        // text deliberately carries no "indirect"), so pre-screen it fell
-        // through the undecodable-base "legacy verbatim" arm below — the
-        // shipper's stale inline map overwrote the head and orphaned
-        // every tree-7 record. The probe reads the head's own
-        // `block_map_id` (the KVMAP_HEAD_PREFIX law — never the decode
-        // error text), on BOTH sides: a kvmap head anywhere in a scoped
-        // Put is un-composable until PR 5b builds the S11 ∘ kvmap
-        // compose. Leak-safe: nothing composed, nothing staged — the
-        // shipper's never-lossy ladder keeps custody of the bytes.
-        let kvmap_side = |bytes: &[u8]| {
-            crate::layout_wire::decode_layout_any(bytes).is_ok_and(|l| {
-                l.block_map_id.as_deref().is_some_and(|id| {
-                    id.starts_with(crate::meta_backend::kv::block_map::KVMAP_HEAD_PREFIX)
-                })
-            })
-        };
-        let kvmap_durable = kvmap_side(&durable);
-        if kvmap_durable || kvmap_side(&shipped) {
-            MAP_REFUSED.fetch_add(1, Ordering::Relaxed);
-            return Err(SqueezefsError::InvalidOperation(format!(
-                "S11: range holder '{client}'s Put for ino {ino} meets a `kvmap:` head \
-                 ({} side) — the map lives in the block-map tree, and applying the Put \
-                 verbatim would regress the head to a stale inline map while orphaning \
-                 every tree-7 record; S11 scoped Puts on a kvmap head land in PR 5b \
-                 (map_refused)",
-                if kvmap_durable { "durable" } else { "shipped" }
-            )));
-        }
+        // PR 5b item 3: a `kvmap:` head on either side never reaches this
+        // compose — the SetLayoutAndSize arm routes kvmap-durable bases
+        // through `try_scoped_kvmap_put` (the S11 ∘ kvmap compose) and
+        // refuses the kvmap-shipped shapes BEFORE calling here.
         // Rung 19 (the MPI-IO row's live conviction — the 10 GiB face):
         // an INDIRECT layout on EITHER side of a RANGE holder's Put is
         // un-composable at the meta plane UNARMED (the blob is a
@@ -3923,6 +4240,16 @@ impl PublishService {
                 ..
             } => {
                 let refs: Vec<BlockRefOp> = refs.into_iter().map(BlockRefOp::from).collect();
+                // PR 5b item 3: a kvmap-headed DURABLE base composes over
+                // the tree via the claims-scoped train (the S11 ∘ kvmap
+                // compose) — the inline/blob compose below never sees a
+                // kvmap side.
+                if let Some(reply) = self
+                    .try_scoped_kvmap_put(client, ino, &layout, size, &refs)
+                    .await?
+                {
+                    return Ok(reply);
+                }
                 let (layout, recomputed, mut blob_custody) = self
                     .custody_scoped_layout(client, ino, layout, &refs)
                     .await?;

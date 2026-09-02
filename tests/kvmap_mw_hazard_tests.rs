@@ -117,7 +117,18 @@ impl Drop for Restore {
         data_custody::test_clear_poison();
         squeezefs::meta_ship::tokens::test_clear_range_cache();
         squeezefs::dlm::test_clear_range_episodes();
+        squeezefs::meta_backend::kv::block_refs::uninstall_block_ref_resolver();
     }
+}
+
+/// The production arm's rung-19 refs resolver, mirrored onto the rig's
+/// router (the mw_cowriter_free_tests fixture-truth discipline) — the
+/// scoped compose's f36b recompute is structurally inert without it.
+fn install_rig_refs_resolver(rig: &Rig) {
+    let br = std::sync::Arc::clone(&rig.router.backend_router);
+    squeezefs::meta_backend::kv::block_refs::install_block_ref_resolver(std::sync::Arc::new(
+        move |k: &str, ino: u64, idx: u32| br.block_ref_for(k, ino, idx),
+    ));
 }
 
 // ---------------------------------------------------------------------------
@@ -469,12 +480,11 @@ async fn a_range_episode_publish_on_a_kvmap_ino_keeps_every_unclaimed_live_bindi
     // the §11 map-generation belt — the sticky pin is the PARSED kvmap
     // head, and the minted generation is asserted beside it.
     let head_id = rig.durable_head(ino).await.block_map_id;
-    let parsed = squeezefs::meta_backend::kv::block_map::parse_kvmap_head(
-        head_id.as_deref().unwrap_or(""),
-    )
-    .unwrap_or_else(|e| {
-        panic!("the composed publish must keep the sticky kvmap head ({head_id:?}): {e}")
-    });
+    let parsed =
+        squeezefs::meta_backend::kv::block_map::parse_kvmap_head(head_id.as_deref().unwrap_or(""))
+            .unwrap_or_else(|e| {
+                panic!("the composed publish must keep the sticky kvmap head ({head_id:?}): {e}")
+            });
     assert_eq!(parsed.sweep_cursor, None);
     assert_eq!(
         parsed.gen, 1,
@@ -561,20 +571,19 @@ async fn a_new_crossing_under_live_range_grants_stands_down_to_the_blob_arm() {
 }
 
 // ===========================================================================
-// 4b. §11 row 4 — a sticky-head LOCAL train under live grants refuses
+// 4b. §11 row 4 → PR 5b item 4 — a sticky-head LOCAL train under live
+//     grants composes CLAIMS-SCOPED (the f34 local screen, lifted)
 // ===========================================================================
 
-/// Contract (§11 further-fact b, the STICKY half; RED pre-fix): the
-/// serve arm refuses a whole-map train under live range grants (the f34
-/// screen); the LOCAL train must refuse the same way — a stood-down blob
-/// fallback is WRONG here (the ino is already kvmap-headed and sticky, a
-/// blob save would regress the head), and running the train would revert
-/// peers' entries by delete-by-absence. Refuses loud, names PR 5b,
-/// counted on `map_refused`, NOTHING committed (journal-entry equality;
-/// head and records byte-identical). Pre-fix the local arm ran the train
-/// and mass-deleted the un-shipped records.
+/// Contract (PR 5b item 4 — replaces PR 5a's local-train refusal): a
+/// sticky-head LOCAL whole-map train under live range grants, OUTSIDE the
+/// episode-compose window, runs CLAIMS-SCOPED — its own claimed
+/// transition lands, a SUBSET map deletes NOTHING by absence (peers'
+/// entries survive), and an empty-claims train is a records no-op. The
+/// non-kvmap-base refusal STAYS (a new-crossing whole-map train under
+/// live grants — the crossing stands down at the caller instead).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_sticky_head_local_train_under_live_range_grants_refuses_loud() {
+async fn a_sticky_head_local_train_under_live_range_grants_composes_claims_scoped() {
     let _serial = serial();
     let _restore = Restore;
     let meta = NamedTempFile::new().unwrap();
@@ -586,63 +595,69 @@ async fn a_sticky_head_local_train_under_live_range_grants_refuses_loud() {
     // The crossing first (no grants yet).
     let mut entries = rig.publish_spill(ino, SPILL_BLOCKS).await;
     entries.sort_unstable_by_key(|&(b, _)| b);
-    let head_bytes = rig
-        .kv()
-        .getxattr(ino, "layout")
-        .await
-        .expect("layout read")
-        .expect("kvmap head");
 
     let auth = start_authority(Arc::clone(&rig.routed));
     let (holder, lease) = live_range_grant(&auth.endpoint, NODE, ino).await;
     assert!(auth.owner.ino_has_range_grants(ino));
 
     // The LOCAL train, outside any compose window, carrying a SUBSET map
-    // — pre-fix its diff deletes every record the subset does not name.
-    let refused_before = publish::stats().map_refused;
-    let journal_before = journal_entries();
-    let out = publish::migrate_block_map(
+    // plus ONE claimed new binding — pre-5b this refused loud; the
+    // pre-law diff would have deleted every record the subset omits.
+    let new_off = rig.alloc.allocate_block().await.unwrap();
+    rig.alloc.publish_block(new_off);
+    let vol_tag = squeezefs::meta_backend::kv::block_refs::volume_tag(DATA_VOL_ID);
+    let outcome = publish::migrate_block_map(
         &rig.routed,
         ino,
-        &head_bytes,
-        u64::from(SPILL_BLOCKS) * BLOCK,
+        &kvmap_head_bytes(u64::from(SPILL_BLOCKS + 1) * BLOCK),
+        u64::from(SPILL_BLOCKS + 1) * BLOCK,
+        vec![entries[0].clone(), (SPILL_BLOCKS, new_off.to_string())],
+        vec![squeezefs::meta_backend::kv::block_refs::BlockRefOp::taken(
+            squeezefs::meta_backend::kv::block_refs::BlockRef {
+                vol_tag,
+                block_idx: new_off / BLOCK,
+                owner_ino: ino,
+                block_index: SPILL_BLOCKS,
+            },
+        )],
+        512,
+    )
+    .await
+    .expect("a sticky-head local train under live grants composes claims-scoped (item 4)");
+    assert_eq!(outcome.records, 1, "exactly the claimed transition staged");
+    assert_eq!(outcome.gen, 1, "a committed mw-plane train bumps the belt");
+
+    let mut expect = entries.clone();
+    expect.push((SPILL_BLOCKS, new_off.to_string()));
+    assert_eq!(
+        rig.tree_records(ino).await,
+        expect,
+        "the SUBSET map deleted NOTHING by absence — peers' entries survive"
+    );
+
+    // An empty-claims subset train is a records NO-OP (nothing adopted,
+    // nothing deleted) — the §11 law-b floor.
+    let noop = publish::migrate_block_map(
+        &rig.routed,
+        ino,
+        &kvmap_head_bytes(u64::from(SPILL_BLOCKS + 1) * BLOCK),
+        u64::from(SPILL_BLOCKS + 1) * BLOCK,
         vec![entries[0].clone()],
         Vec::new(),
         512,
     )
-    .await;
-    let err = out.expect_err(
-        "a sticky-head LOCAL whole-map train under live range grants must refuse \
-         loud (the f34 screen's local twin) — running it reverts peers' entries",
-    );
-    assert!(
-        format!("{err}").contains("PR 5b"),
-        "the refusal names PR 5b (the S11 ∘ kvmap compose): {err}"
-    );
+    .await
+    .expect("an empty-claims subset train is legal");
     assert_eq!(
-        publish::stats().map_refused,
-        refused_before + 1,
-        "the refusal is counted (map_refused)"
-    );
-    assert_eq!(
-        journal_entries(),
-        journal_before,
-        "NOTHING committed — the refusal fires before the train stages"
-    );
-    assert_eq!(
-        rig.kv()
-            .getxattr(ino, "layout")
-            .await
-            .expect("layout read")
-            .expect("kvmap head"),
-        head_bytes,
-        "the head is byte-identical"
+        noop.records, 0,
+        "no claims ⇒ no ops — never delete-by-absence"
     );
     assert_eq!(
         rig.tree_records(ino).await,
-        entries,
-        "every tree-7 record survives the refused train"
+        expect,
+        "every record survives the no-op train"
     );
+    assert!(rig.drift().await.is_empty(), "the accounting stayed exact");
 
     drop(lease);
     holder.drain_releases().await;
@@ -779,110 +794,157 @@ async fn shipped_crossing(client_be: &Arc<RoutedMetaBackend>, ino: u64) -> Vec<(
 }
 
 // ===========================================================================
-// 2. §11 row 2 — the S11 scoped Put over a kvmap head
+// 2. §11 row 2 → PR 5b item 3 — the S11 ∘ kvmap scoped compose
 // ===========================================================================
 
-/// Contract (§11 row 2, RED pre-fix): a range holder's full Put served
-/// over a kvmap-headed ino must REFUSE — a `kvmap:` head's base decode is
-/// Err BY DESIGN (its map lives in tree 7), so pre-fix it fell through
-/// `custody_scoped_layout`'s undecodable-base "legacy verbatim" arm: the
-/// shipper's stale inline map overwrote the head and orphaned every
-/// tree-7 record. The fixed shape: refused loud naming PR 5b, counted on
-/// `map_refused`, the head and the tree records byte-identical, and
-/// NOTHING committed (journal-entry equality).
+/// Contract (PR 5b item 3 — replaces PR 5a's row-2 refusal with the
+/// positive S11 ∘ kvmap compose): a range holder's full Put served over a
+/// kvmap-headed ino composes over the TREE-RESOLVED map under the claims
+/// law and persists via the claims-scoped train — the scoped Put lands
+/// its range's CLAIMED binding, every UNCLAIMED binding survives (the
+/// shipper's stale garbage entry never adopts), an out-of-custody claim
+/// is span-filtered, the head stays sticky-kvmap, the f36b recompute
+/// stands the caller's frame down (`PutDone{recomputed: true}` +
+/// `map_recomputed_releases`), and the C8 oracle reads zero drift.
+///
+/// The REMAINING refusal (item 3's stated residue, pinned): a Put that
+/// SHIPS a kvmap head over a non-kvmap durable base refuses retried-class
+/// (sticky heads never regress, so the frame is stale/foreign), counted
+/// on `map_refused`, journal-entry equality.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_scoped_put_served_over_a_kvmap_head_refuses_and_stages_nothing() {
+async fn a_scoped_put_served_over_a_kvmap_head_composes_claims_scoped() {
     let _serial = serial();
     let _restore = Restore;
-    let dir = TempDir::new().unwrap();
-    let owner_be = sandbox(dir.path(), "sp-own").await;
-    let client_be = sandbox(dir.path(), "sp-cli").await;
-    let auth = start_authority(Arc::clone(&owner_be));
-    let (client, pc) = arm_client(&auth, &client_be).await;
+    let meta = NamedTempFile::new().unwrap();
+    format_meta_kvmap(meta.path()).await;
+    let data = data_file();
+    let rig = mount(meta.path(), data.path()).await;
+    let ino = rig.mk_file_at("scoped.bin", 12).await;
 
-    let ino = shipped_file_at(&client_be, "scoped.bin", 12).await;
-    shipped_crossing(&client_be, ino).await;
+    // The crossing first (no custody plane yet).
+    let mut entries = rig.publish_spill(ino, SPILL_BLOCKS).await;
+    entries.sort_unstable_by_key(|&(b, _)| b);
 
-    // The §9.2 geometry source (the scoped compose refuses without it —
-    // the production mount arm installs the router-backed one), then the
-    // shipper takes LIVE range custody: the Put below is the SCOPED
-    // shape, not finding 34's custody-less one.
+    let auth = start_authority(Arc::clone(&rig.routed));
+    install_rig_refs_resolver(&rig);
     auth.owner
-        .install_range_geometry(data_grant::fixed_range_geometry(3 * BLOCK, BLOCK));
-    let lease = match client
-        .acquire_range(ino, (0, BLOCK), (0, BLOCK), Duration::from_secs(3))
-        .await
-        .expect("the holder's ranged grant")
-    {
-        RangeAcquireOutcome::New { lease, .. } => lease,
-        other => panic!("a fresh ino's first ranged ask must be NEW, got {other:?}"),
+        .install_range_geometry(data_grant::fixed_range_geometry(
+            u64::from(SPILL_BLOCKS) * BLOCK,
+            BLOCK,
+        ));
+    // The holder's LIVE range grant covers block index 0 only.
+    let (holder, lease) = live_range_grant(&auth.endpoint, NODE, ino).await;
+    assert!(auth.owner.ino_has_range_grants(ino));
+    let pc = publish::PublishClient::new(NODE, SECRET.to_vec());
+
+    let vol_tag = squeezefs::meta_backend::kv::block_refs::volume_tag(DATA_VOL_ID);
+    let wire_ref = |off: u64, idx: u32, take: bool| publish::WireBlockRefOp {
+        vol_tag,
+        block_idx: off / BLOCK,
+        owner_ino: ino,
+        block_index: idx,
+        take,
     };
+    let old0: u64 = entries[0].1.parse().expect("plain offset key");
+    let old2: u64 = entries[2].1.parse().expect("plain offset key");
+    let new0 = rig.alloc.allocate_block().await.unwrap();
+    rig.alloc.publish_block(new0);
+    let out2 = rig.alloc.allocate_block().await.unwrap();
+    rig.alloc.publish_block(out2);
 
-    let head_before = owner_be
-        .getxattr(ino, "layout")
-        .await
-        .expect("layout read")
-        .expect("kvmap head");
-    let refused_before = publish::stats().map_refused;
-    let journal_before = journal_entries();
-
-    // The holder's full Put: a stale inline map naming only idx 0 —
-    // applied verbatim it regresses the head and orphans the records.
-    let err = pc
+    // The holder's full Put: its RANGE's rewrite at idx 0 (claimed), a
+    // stale GARBAGE entry at idx 1 (unclaimed — its view of a block it
+    // never wrote), and an OUT-OF-CUSTODY claimed rewrite at idx 2 (the
+    // span filter's row).
+    let mut put_map = entries.clone();
+    put_map[0] = (0, new0.to_string());
+    put_map[1] = (1, "999999999".to_string());
+    put_map[2] = (2, out2.to_string());
+    let recomputed_before = publish::stats().map_recomputed_releases;
+    let reply = pc
         .ship(
             &auth.endpoint,
             publish::PublishCall::SetLayoutAndSize {
                 ino,
-                layout: inline_head_bytes(3 * BLOCK, vec![(0u32, "0".to_string())]),
-                size: 3 * BLOCK,
-                refs: Vec::new(),
-                lease_epoch: client.lease_epoch(),
-                request_id: 0x52A,
+                layout: inline_head_bytes(u64::from(SPILL_BLOCKS) * BLOCK, put_map),
+                size: u64::from(SPILL_BLOCKS) * BLOCK,
+                refs: vec![
+                    wire_ref(old0, 0, false),
+                    wire_ref(new0, 0, true),
+                    wire_ref(old2, 2, false),
+                    wire_ref(out2, 2, true),
+                ],
+                lease_epoch: holder.lease_epoch(),
+                request_id: 0x53A,
             },
         )
         .await
-        .expect_err(
-            "a scoped Put served over a kvmap-headed ino must refuse (§11 row 2) — \
-             the verbatim arm regresses the head to the shipper's stale inline map",
-        );
+        .expect("the S11 ∘ kvmap scoped Put composes (item 3's positive contract)");
+    assert_eq!(
+        reply,
+        publish::PublishReply::PutDone { recomputed: true },
+        "the compose recomputed the accounting — the caller's frame stream stands down"
+    );
+
+    // The claimed in-custody binding landed; everything unclaimed (and
+    // the out-of-custody claim) survived verbatim.
+    let mut expect = entries.clone();
+    expect[0] = (0, new0.to_string());
+    assert_eq!(
+        rig.tree_records(ino).await,
+        expect,
+        "adopt under claim ∩ custody; never the shipper's stale view (§11 row 2's \
+         clobber is exactly this assertion failing)"
+    );
+    let head_id = rig.durable_head(ino).await.block_map_id;
+    let parsed =
+        squeezefs::meta_backend::kv::block_map::parse_kvmap_head(head_id.as_deref().unwrap_or(""))
+            .unwrap_or_else(|e| panic!("the head stays sticky-kvmap ({head_id:?}): {e}"));
+    assert_eq!(parsed.gen, 1, "the compose is a committed mw-plane train");
     assert!(
-        format!("{err}").contains("PR 5b"),
-        "the refusal names PR 5b (the S11 ∘ kvmap compose): {err}"
+        rig.drift().await.is_empty(),
+        "zero C8 drift — the recomputed swap diff matches the tree diff"
     );
     assert_eq!(
-        publish::stats().map_refused,
-        refused_before + 1,
-        "the refusal is counted (map_refused)"
+        publish::stats().map_recomputed_releases - recomputed_before,
+        1,
+        "the displaced in-custody binding (old0) is the recompute's released set"
     );
+
+    // The remaining refusal: SHIPPING a kvmap head over a non-kvmap
+    // durable base (a stale/foreign frame — sticky heads never regress).
+    let ino2 = rig.mk_file_at("nonkvmap.bin", 0).await;
+    let refused_before = publish::stats().map_refused;
+    let journal_before = journal_entries();
+    let err = pc
+        .ship(
+            &auth.endpoint,
+            publish::PublishCall::SetLayoutAndSize {
+                ino: ino2,
+                layout: kvmap_head_bytes(BLOCK),
+                size: BLOCK,
+                refs: Vec::new(),
+                lease_epoch: holder.lease_epoch(),
+                request_id: 0x53B,
+            },
+        )
+        .await
+        .expect_err("a shipped kvmap head over a non-kvmap durable base refuses");
+    assert!(
+        format!("{err}").contains("layout delta base unusable"),
+        "retried-class (the shipper refetches): {err}"
+    );
+    assert_eq!(publish::stats().map_refused, refused_before + 1);
     assert_eq!(
         journal_entries(),
         journal_before,
-        "NOTHING committed — the screen fires before any staging"
-    );
-    assert_eq!(
-        owner_be
-            .getxattr(ino, "layout")
-            .await
-            .expect("layout read")
-            .expect("kvmap head"),
-        head_before,
-        "the head is byte-identical"
-    );
-    assert_eq!(
-        owner_be
-            .block_map_range(ino, 0, 16)
-            .await
-            .expect("tree scan")
-            .len(),
-        3,
-        "every tree-7 record survives the refused Put"
+        "NOTHING committed — the refusal fires before any staging"
     );
 
     drop(lease);
-    client.drain_releases().await;
+    holder.drain_releases().await;
     auth.listener.shutdown();
-    shutdown_set(&owner_be).await;
-    shutdown_set(&client_be).await;
+    rig.shutdown().await;
 }
 
 // ===========================================================================
@@ -1093,7 +1155,10 @@ async fn alternating_shipped_saves_keep_peer_bindings_and_the_belt_refuses_lag()
     let publish::PublishReply::MapMigrated { records, gen, .. } = a_reply else {
         panic!("the train answers its accounting: {a_reply:?}");
     };
-    assert_eq!(records, 1, "A's claims-scoped diff stages exactly its claim");
+    assert_eq!(
+        records, 1,
+        "A's claims-scoped diff stages exactly its claim"
+    );
     assert_eq!(gen, 1, "the first mw-plane train mints the belt");
 
     // Writer B's shipped save: a CURRENT base generation but a STALE map
@@ -1129,7 +1194,10 @@ async fn alternating_shipped_saves_keep_peer_bindings_and_the_belt_refuses_lag()
     else {
         panic!("the train answers its accounting: {b_reply:?}");
     };
-    assert_eq!(records, 1, "B's claims-scoped diff stages exactly its claim");
+    assert_eq!(
+        records, 1,
+        "B's claims-scoped diff stages exactly its claim"
+    );
     assert_eq!(gen, 2, "every committed mw-plane train bumps the belt");
     assert_eq!(
         preexisting,
@@ -1197,6 +1265,197 @@ async fn alternating_shipped_saves_keep_peer_bindings_and_the_belt_refuses_lag()
 
     drop(writer_a);
     drop(writer_b);
+    auth.listener.shutdown();
+    rig.shutdown().await;
+}
+
+// ===========================================================================
+// 6. PR 5b item 4 — the s11-shaped composition contract (the f34 lift's
+//    gate): a range-granted kvmap ino under TWO scoped writers plus the
+//    authority's own episode compose
+// ===========================================================================
+
+/// Contract (PR 5b item 4 — the lift's acceptance): on a RANGE-GRANTED
+/// kvmap ino, writer A's scoped Put (item 3's path), writer B's
+/// sticky-head shipped TRAIN under live grants (the lifted f34 serve —
+/// claims custody-scoped to B's span), and the authority's own episode
+/// compose ALL land: each writer's claimed binding sticks, every peer
+/// binding survives every stale ship, the belt counts three committed
+/// trains, and the C8 oracle reads zero drift.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_range_granted_kvmap_ino_composes_two_scoped_writers_and_the_episode_publish() {
+    let _serial = serial();
+    let _restore = Restore;
+    let meta = NamedTempFile::new().unwrap();
+    format_meta_kvmap(meta.path()).await;
+    let data = data_file();
+    let rig = mount(meta.path(), data.path()).await;
+    let ino = rig.mk_file_at("s11shape.bin", 32).await;
+
+    let mut entries = rig.publish_spill(ino, SPILL_BLOCKS).await;
+    entries.sort_unstable_by_key(|&(b, _)| b);
+
+    let auth = start_authority(Arc::clone(&rig.routed));
+    install_rig_refs_resolver(&rig);
+    auth.owner
+        .install_range_geometry(data_grant::fixed_range_geometry(
+            u64::from(SPILL_BLOCKS) * BLOCK,
+            BLOCK,
+        ));
+    // Writer A holds block 0; writer B holds block 1 — disjoint ranges.
+    let (holder_a, lease_a) = live_range_grant(&auth.endpoint, "node-s11-a", ino).await;
+    let holder_b = WriteCustodyClient::connect(&auth.endpoint, SECRET, "node-s11-b")
+        .await
+        .expect("writer B joins");
+    let lease_b = match holder_b
+        .acquire_range(
+            ino,
+            (BLOCK, 2 * BLOCK),
+            (BLOCK, 2 * BLOCK),
+            Duration::from_secs(3),
+        )
+        .await
+        .expect("writer B's ranged grant")
+    {
+        RangeAcquireOutcome::New { lease, .. } => lease,
+        other => panic!("B's first ranged ask must be NEW, got {other:?}"),
+    };
+    let pc_a = publish::PublishClient::new("node-s11-a", SECRET.to_vec());
+    let pc_b = publish::PublishClient::new("node-s11-b", SECRET.to_vec());
+
+    let vol_tag = squeezefs::meta_backend::kv::block_refs::volume_tag(DATA_VOL_ID);
+    let wire_ref = |off: u64, idx: u32, take: bool| publish::WireBlockRefOp {
+        vol_tag,
+        block_idx: off / BLOCK,
+        owner_ino: ino,
+        block_index: idx,
+        take,
+    };
+    let old0: u64 = entries[0].1.parse().expect("plain offset key");
+    let old1: u64 = entries[1].1.parse().expect("plain offset key");
+    let recomputed_before = publish::stats().map_recomputed_releases;
+    let refused_before = publish::stats().map_refused;
+    let unscoped_before = publish::stats().unscoped_put_refusals;
+
+    // Writer A: the scoped Put (item 3's path) rewriting ITS block 0.
+    let a_new = rig.alloc.allocate_block().await.unwrap();
+    rig.alloc.publish_block(a_new);
+    let mut a_map = entries.clone();
+    a_map[0] = (0, a_new.to_string());
+    let reply = pc_a
+        .ship(
+            &auth.endpoint,
+            publish::PublishCall::SetLayoutAndSize {
+                ino,
+                layout: inline_head_bytes(u64::from(SPILL_BLOCKS) * BLOCK, a_map),
+                size: u64::from(SPILL_BLOCKS) * BLOCK,
+                refs: vec![wire_ref(old0, 0, false), wire_ref(a_new, 0, true)],
+                lease_epoch: holder_a.lease_epoch(),
+                request_id: 0x511,
+            },
+        )
+        .await
+        .expect("writer A's scoped Put lands");
+    assert_eq!(reply, publish::PublishReply::PutDone { recomputed: true });
+
+    // Writer B: the sticky-head shipped TRAIN under LIVE grants (the
+    // lifted f34 serve) — a STALE whole map (it lags A's rewrite) plus
+    // its own claimed rewrite of ITS block 1, base gen refetched current.
+    let b_new = rig.alloc.allocate_block().await.unwrap();
+    rig.alloc.publish_block(b_new);
+    let mut b_map = entries.clone();
+    b_map[1] = (1, b_new.to_string());
+    let b_reply = pc_b
+        .ship(
+            &auth.endpoint,
+            publish::PublishCall::MigrateBlockMap {
+                ino,
+                layout: kvmap_head_bytes(u64::from(SPILL_BLOCKS) * BLOCK),
+                size: u64::from(SPILL_BLOCKS) * BLOCK,
+                entries: b_map,
+                refs: vec![wire_ref(old1, 1, false), wire_ref(b_new, 1, true)],
+                base_gen: 1,
+                lease_epoch: holder_b.lease_epoch(),
+                request_id: 0x512,
+            },
+        )
+        .await
+        .expect("writer B's sticky-head train lands under live grants (the f34 lift)");
+    let publish::PublishReply::MapMigrated {
+        records,
+        recomputed,
+        released,
+        gen,
+        ..
+    } = b_reply
+    else {
+        panic!("the train answers its accounting: {b_reply:?}");
+    };
+    assert_eq!(
+        records, 1,
+        "B's claims-scoped diff stages exactly its claim"
+    );
+    assert!(recomputed, "the f36b recompute rides the lifted serve");
+    assert_eq!(released, 1, "old1 is the recompute's released set");
+    assert_eq!(gen, 2);
+
+    // The authority's OWN episode compose (the §11 row-1 arm, unchanged):
+    // a fresh claimed binding at index SPILL_BLOCKS.
+    let c_new = rig.alloc.allocate_block().await.unwrap();
+    rig.alloc.publish_block(c_new);
+    rig.router
+        .merge_block_mappings(
+            ino,
+            BlockMapOp::Merge(&[(SPILL_BLOCKS, c_new.to_string())]),
+            u64::from(SPILL_BLOCKS + 1) * BLOCK,
+            LayoutFlip::KeepLayout,
+            rig.token(ino),
+        )
+        .await
+        .expect("the authority's episode compose lands beside both writers");
+
+    // Everything landed; nobody's stale view erased anybody's binding.
+    let mut expect = entries.clone();
+    expect[0] = (0, a_new.to_string());
+    expect[1] = (1, b_new.to_string());
+    expect.push((SPILL_BLOCKS, c_new.to_string()));
+    assert_eq!(
+        rig.tree_records(ino).await,
+        expect,
+        "two scoped writers + the episode compose all landed, claims-scoped"
+    );
+    let head_id = rig.durable_head(ino).await.block_map_id;
+    let parsed =
+        squeezefs::meta_backend::kv::block_map::parse_kvmap_head(head_id.as_deref().unwrap_or(""))
+            .unwrap_or_else(|e| panic!("the head stays sticky-kvmap ({head_id:?}): {e}"));
+    assert_eq!(
+        parsed.gen, 3,
+        "three committed trains — the belt counted every one"
+    );
+    assert!(
+        rig.drift().await.is_empty(),
+        "zero C8 drift across the whole composition"
+    );
+    assert_eq!(
+        publish::stats().map_recomputed_releases - recomputed_before,
+        2,
+        "old0 (A's Put) and old1 (B's train) are the recomputes' released sets"
+    );
+    assert_eq!(
+        publish::stats().map_refused,
+        refused_before,
+        "no refusal anywhere — the screens lifted for kvmap inos"
+    );
+    assert_eq!(
+        publish::stats().unscoped_put_refusals,
+        unscoped_before,
+        "every ship carried custody — the f34 class never fired"
+    );
+
+    drop(lease_a);
+    drop(lease_b);
+    holder_a.drain_releases().await;
+    holder_b.drain_releases().await;
     auth.listener.shutdown();
     rig.shutdown().await;
 }

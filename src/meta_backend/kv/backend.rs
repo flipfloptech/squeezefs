@@ -3231,8 +3231,8 @@ impl KvMetaBackend {
                         if let Some(old) = old {
                             displaced.push((idx, old.clone()));
                         }
-                        put_bytes += (super::block_map::BLOCK_MAP_KEY_LEN + want.encoded_len())
-                            as u64;
+                        put_bytes +=
+                            (super::block_map::BLOCK_MAP_KEY_LEN + want.encoded_len()) as u64;
                         ops.push(super::block_map::BlockMapOp::Put {
                             owner_ino: ino,
                             block_index: idx,

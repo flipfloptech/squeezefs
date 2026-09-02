@@ -5729,9 +5729,10 @@ async fn a_skewed_kvmap_ship_frees_the_true_displaced_set_on_the_authority() {
     let n1_idx = n1_off / cwr.alloc.chunk_size();
     cwr.alloc.publish_block(n1_off);
     let head_id = durable_kvmap_head_id(&auth, ino).await;
-    router
-        .metadata_cache
-        .insert(ino, dirty_kvmap_entry(F36_SIZE, &x_off.to_string(), &head_id));
+    router.metadata_cache.insert(
+        ino,
+        dirty_kvmap_entry(F36_SIZE, &x_off.to_string(), &head_id),
+    );
     let token = dlm.get_fencing_token_ino(ino);
     let displaced1 = router
         .merge_block_mappings_coalesced(
@@ -5769,9 +5770,10 @@ async fn a_skewed_kvmap_ship_frees_the_true_displaced_set_on_the_authority() {
     let head_id = durable_kvmap_head_id(&auth, ino).await;
     // Seed the SKEW explicitly: RAM map {0: X}, then the merge to N2
     // mints release(X)+take(N2) — X is the mis-name (durable holds N1).
-    router
-        .metadata_cache
-        .insert(ino, dirty_kvmap_entry(F36_SIZE, &x_off.to_string(), &head_id));
+    router.metadata_cache.insert(
+        ino,
+        dirty_kvmap_entry(F36_SIZE, &x_off.to_string(), &head_id),
+    );
     let token = dlm.get_fencing_token_ino(ino);
     let displaced2 = router
         .merge_block_mappings_coalesced(

@@ -21,9 +21,11 @@
 //!    — a linked `TIMEOUT` ahead of the read's SQE, so the DEVICE
 //!    completion is late while the worker is free), a second read issued
 //!    afterwards completes at device speed, long before the slow one.
-//! 2. **Enters are batched**: a concurrent burst of N fills rides fewer
-//!    than N ring enters (`dev_enters` Δ < `dev_fills` Δ = N), and every
-//!    completion drain that resolved ≥ 1 fill is one `dev_wake_batches`.
+//! 2. **Enters are batched**: a burst of N fills queued while the worker
+//!    is busy (the read-stall seam) rides ≤ 4 SUBMIT enters
+//!    (`dev_submit_enters` Δ ≪ `dev_fills` Δ = N — one pass pumps every
+//!    queued request), and every completion drain that resolved ≥ 1 fill
+//!    is one `dev_wake_batches`.
 //! 3. **The idle lane wakes on its first request** through the ring
 //!    (`dev_wake_writes` moves): no request ever waits for a device event
 //!    to be noticed.
@@ -47,7 +49,7 @@ fn pattern_file(len: usize) -> tempfile::NamedTempFile {
 /// The funnel counters are process-global: read them as one snapshot.
 fn funnel() -> (u64, u64, u64, u64) {
     (
-        METRICS.dev_enters.load(Ordering::Relaxed),
+        METRICS.dev_submit_enters.load(Ordering::Relaxed),
         METRICS.dev_fills.load(Ordering::Relaxed),
         METRICS.dev_wake_batches.load(Ordering::Relaxed),
         METRICS.dev_wake_writes.load(Ordering::Relaxed),
@@ -105,6 +107,7 @@ async fn a_fast_fill_completes_while_a_slow_fill_holds_the_lane() {
 async fn a_concurrent_burst_rides_fewer_enters_than_fills() {
     let _g = SERIAL.lock().await;
     nvme_dev::set_test_read_slow(0, 0);
+    nvme_dev::set_test_read_stall(0, 0);
     const N: usize = 64;
     let file = pattern_file(N * BLOCK);
     let dev = NvmeBlockDev::new(file.path().to_str().unwrap());
@@ -112,6 +115,15 @@ async fn a_concurrent_burst_rides_fewer_enters_than_fills() {
     dev.read_block(0, BLOCK).await.expect("prime");
     tokio::time::sleep(Duration::from_millis(20)).await;
 
+    // A deterministic burst: the worker STALLS 150 ms at the first
+    // submission (the read-stall seam — the worker thread itself), so the
+    // other 63 requests are queued when it resumes and the SAME pass pumps
+    // them all into ONE submit enter. Timing-free by construction: the
+    // issue side does not depend on how fast the box runs the issuing
+    // tasks. (The completion side is the device's clustering — a file-
+    // backed read completes in tens of µs, staggered — so the total enter
+    // count is not the law; `dev_submit_enters` is.)
+    nvme_dev::set_test_read_stall(1, 150);
     let (e0, f0, w0, _) = funnel();
     let mut hs = Vec::with_capacity(N);
     for i in 0..N {
@@ -131,13 +143,15 @@ async fn a_concurrent_burst_rides_fewer_enters_than_fills() {
     let (enters, fills, batches) = (e1 - e0, f1 - f0, w1 - w0);
     assert_eq!(fills, N as u64, "every burst read is one fill");
     assert!(
-        enters < fills,
-        "a concurrent burst must share ring enters: {enters} enters for {fills} fills"
+        enters <= 4,
+        "a queued burst must share ring enters (one pass pumps every queued request): \
+         {enters} submit enters for {fills} fills"
     );
     assert!(
         (1..=fills).contains(&batches),
         "completion drains resolving ≥ 1 fill: {batches} for {fills} fills"
     );
+    nvme_dev::set_test_read_stall(0, 0);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

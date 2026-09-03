@@ -959,6 +959,8 @@ fn worker_thread_loop(
             wake.coalescer.disarm();
             wake_consumed = false;
         }
+        // Fills this pass pushed (the pass-bottom enter carries them all).
+        let mut pass_fills: u64 = 0;
         if !wake_armed {
             wake_armed = arm_wake(&mut ring, wake_buf);
         }
@@ -1282,6 +1284,7 @@ fn worker_thread_loop(
             }
 
             active_count += 1;
+            pass_fills += 1;
         }
 
         if disconnected && active_count == 0 {
@@ -1297,6 +1300,11 @@ fn worker_thread_loop(
         crate::fuse_client::METRICS
             .dev_enters
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if pass_fills > 0 {
+            crate::fuse_client::METRICS
+                .dev_submit_enters
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
         match ring.submit_and_wait(1) {
             Ok(_) => {}
             Err(e) if e.raw_os_error() == Some(libc::EINTR) => {}

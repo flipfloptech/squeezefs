@@ -5452,6 +5452,11 @@ pub struct Metrics {
     /// fills ≪ 1` under concurrency is the batching instrument (≈ 1 on a
     /// serial stream by construction).
     pub dev_enters: Align64<AtomicU64>,
+    /// The subset of `dev_enters` that carried ≥ 1 freshly pushed fill
+    /// (the SUBMIT face of the batching law: `fills ÷ submit_enters` is
+    /// the live SQEs-per-enter factor, independent of how completions
+    /// happen to cluster).
+    pub dev_submit_enters: Align64<AtomicU64>,
     pub dev_fills: Align64<AtomicU64>,
     /// Completion drains that resolved ≥ 1 request (a batch of waiter
     /// wakes on the reaping thread); `fills ÷ wake_batches` is the live
@@ -10244,6 +10249,7 @@ impl SqueezefsFilesystem {
                 // completions-per-drain factor, writes/(writes+elided) the
                 // request-wake coalescer's health.
                 "dev_enters": METRICS.dev_enters.load(Ordering::Relaxed),
+                "dev_submit_enters": METRICS.dev_submit_enters.load(Ordering::Relaxed),
                 "dev_fills": METRICS.dev_fills.load(Ordering::Relaxed),
                 "dev_wake_batches": METRICS.dev_wake_batches.load(Ordering::Relaxed),
                 "dev_wake_writes": METRICS.dev_wake_writes.load(Ordering::Relaxed),

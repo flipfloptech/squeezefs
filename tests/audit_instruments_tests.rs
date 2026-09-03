@@ -1310,6 +1310,39 @@ async fn stats_inode_carries_the_fast_dispatch_engagement_pair() {
     );
 }
 
+/// R-4: the spin-before-park ledger rides the stats inode as five u64
+/// words reading the fuse3 fold — `absorbed + expired` ≡ the spins run
+/// (the closure law), `ns` their summed cost, `refused_busy` the box
+/// gauge's refusals, `window_us` the last derived window. 0 across the
+/// board in this harness (no armed session).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn stats_inode_carries_the_spin_ledger_reading_the_fuse3_fold() {
+    let _g = serial().await;
+    let h = make([0x54; 16], "audit_r4_spin").await;
+    let reply =
+        h.fs.read(h.req, squeezefs::fuse_client::STATS_INODE, 0, 0, 1 << 22, 0)
+            .await
+            .expect("read stats inode");
+    let stats: serde_json::Value = serde_json::from_slice(&reply.data).expect("stats JSON");
+    let m = &stats["metrics"];
+    let (absorbed, expired, ns, refused, window_us) = fuse3::transport_spin_stats();
+    for (key, want) in [
+        ("transport_spin_absorbed", absorbed),
+        ("transport_spin_expired", expired),
+        ("transport_spin_ns", ns),
+        ("transport_spin_refused_busy", refused),
+        ("transport_spin_window_us", window_us),
+    ] {
+        assert_eq!(
+            m[key]
+                .as_u64()
+                .unwrap_or_else(|| panic!("{key} is a u64 word")),
+            want,
+            "{key} reads the fuse3 fold"
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------
 // R-3 — the zc direct-leg bridge decomposition (`zc_bridge_phase_ns`)
 // ---------------------------------------------------------------------------

@@ -76,7 +76,7 @@ This is the operator reference for SqueezeFS: the durability contract and its gu
 
 **A SqueezeFS build carries two identities, both surfaced** (user directive 2026-07-24, superseding the commit-only 2026-07-18 policy):
 
-1. **The release-train version** — `Cargo.toml`'s package `version` (currently the **1.1 train**), bumped **as a release act** (never by CI, never per commit). The first-party crates (`crates/fuse3` — the fully-diverged fork, `crates/squeezefs-ipc`, `crates/squeezefs-preload`) track the same train.
+1. **The release-train version** — `Cargo.toml`'s package `version` (currently the **1.2 train**), bumped **as a release act** (never by CI, never per commit). The first-party crates (`crates/fuse3` — the fully-diverged fork, `crates/squeezefs-ipc`, `crates/squeezefs-preload`) track the same train. What each train changed for operators is [`RELEASE_NOTES.md`](../RELEASE_NOTES.md) (1.2.0: highlights, the upgrade story from 1.1, fixes, new surface, the release gate).
 2. **The git commit the build was produced from** — the fine-grained identity. Periodic releases remain **annotated git tags on specific commits** — `stable-YYYY.MM[.N]` and `lts-YYYY.MM` — created manually as a release act. The tag names the release; the commit pins the exact build. Tags are the **only** release names.
 
 **Verify what a node is running** (the two surfaces carry the same build-time capture):

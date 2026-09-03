@@ -595,13 +595,30 @@ pub fn hex_encode(bytes: &[u8]) -> String {
 }
 
 /// Decode lower/upper-case hex; `None` on any non-hex input.
+///
+/// Walks BYTES, not `str` slices: the former `&s[i..i + 2]` panicked when
+/// an even-length input carried a multi-byte character across the slice
+/// boundary — and this function decodes the `job:enroll` secret, an
+/// on-disk record, so that panic was a daemon abort on a corrupt or
+/// tampered xattr (1.2 fuzz find, `tests/decoder_property_tests.rs`).
+/// The alphabet is explicit too: `u8::from_str_radix` accepted a leading
+/// `+`/`-`, a form [`hex_encode`] never produces.
 pub fn hex_decode(s: &str) -> Option<Vec<u8>> {
-    if s.len() % 2 != 0 {
+    fn nibble(b: u8) -> Option<u8> {
+        match b {
+            b'0'..=b'9' => Some(b - b'0'),
+            b'a'..=b'f' => Some(b - b'a' + 10),
+            b'A'..=b'F' => Some(b - b'A' + 10),
+            _ => None,
+        }
+    }
+    let bytes = s.as_bytes();
+    if bytes.len() % 2 != 0 {
         return None;
     }
-    (0..s.len())
-        .step_by(2)
-        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).ok())
+    bytes
+        .chunks_exact(2)
+        .map(|pair| Some((nibble(pair[0])? << 4) | nibble(pair[1])?))
         .collect()
 }
 

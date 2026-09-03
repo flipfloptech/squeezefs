@@ -861,6 +861,60 @@ mod tests {
         assert_eq!(folded[1].key, inode_key(2).to_vec());
     }
 
+    /// The run-end memo (finding 49) against the independent reference:
+    /// the merge of any source set equals the record multiset sorted
+    /// `(key asc, seq desc, source asc)` — long same-key runs, runs that
+    /// span sources, runs ending at a source's last record, single-source
+    /// and six-source shapes. Deterministic xorshift, 400 trials; the
+    /// memo is only ever consulted for the run its cursor sits on and is
+    /// reset the moment that run is exhausted, which is what this pins.
+    #[test]
+    fn bset_nway_merge_matches_the_reference_order_under_long_same_key_runs() {
+        let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut rnd = |m: u64| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state % m
+        };
+        for trial in 0..400 {
+            let nsrc = 1 + rnd(6) as usize;
+            let mut imgs = Vec::new();
+            let mut all: Vec<(usize, Vec<u8>, u64)> = Vec::new();
+            let mut seq = 1u64;
+            for si in 0..nsrc {
+                let nkeys = 1 + rnd(5) as usize;
+                let mut recs = Vec::new();
+                let mut key = rnd(4) + 1;
+                for _ in 0..nkeys {
+                    let run = 1 + rnd(9) as usize;
+                    for _ in 0..run {
+                        recs.push(Record::delta(
+                            inode_key(key).to_vec(),
+                            seq,
+                            &InodeDelta::times(seq, seq),
+                        ));
+                        all.push((si, inode_key(key).to_vec(), seq));
+                        seq += 1;
+                    }
+                    key += 1 + rnd(3);
+                }
+                imgs.push(build_bset(&recs, seq).expect("build"));
+            }
+            let views: Vec<BsetView<'_>> = imgs
+                .iter()
+                .map(|i| BsetView::parse(i).expect("parse"))
+                .collect();
+            let got: Vec<(Vec<u8>, u64)> = merge(&views).map(|r| (r.key.to_vec(), r.seq)).collect();
+            all.sort_by(|(sa, ka, qa), (sb, kb, qb)| ka.cmp(kb).then(qb.cmp(qa)).then(sa.cmp(sb)));
+            let want: Vec<(Vec<u8>, u64)> = all.into_iter().map(|(_, k, q)| (k, q)).collect();
+            assert_eq!(
+                got, want,
+                "trial {trial}: the memoized merge diverged from the reference order"
+            );
+        }
+    }
+
     // -- lookup fold across sources ---------------------------------------------
 
     #[test]

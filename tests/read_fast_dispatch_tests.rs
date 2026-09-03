@@ -25,6 +25,12 @@
 //! 6. **Served-op accounting**: `queue_wait == dispatch_lag == 0` exact
 //!    zeros, `transport_total` the arrival→commit span, and the trace
 //!    chain `transport_recv ≡ fast_dispatch → reply_commit`.
+//! 7. **Live engagement (mount class)**: on an armed session every
+//!    kernel READ is either served inline or minted straight to a lane —
+//!    `Δserves + Δdemotes ≡ the READs delivered`, the served ones never
+//!    take the handler's in-place arm (`Δserves + Δinplace ≡ READs`), the
+//!    bytes round-trip exact, and the lever's `0` leaves both counters
+//!    flat while every READ rides the handler arm.
 //!
 //! RED against 12f6d3f5 + the R-2 step-1/2 commits: the trait default is
 //! `Demote` for every shape (laws 1–2), and no session registers a
@@ -235,19 +241,44 @@ async fn cold_block_demotes_then_the_tier_resident_block_serves_into_the_dest_wi
     let _g = serial().await;
     let h = make("rfd_tier", *b"rfd-tier-vol!!!!").await;
     let ino = create(&h, "tier").await;
+    // Two blocks (the read_serve_phase suite's cold recipe): block 0
+    // completes when block 1 starts and write-throughs past staging, so
+    // after the tier purge it is GENUINELY cold — a single staged block
+    // would legitimately serve from the staging ring (the handler's own
+    // first leg), which is parity, not coldness.
     let data = pattern(BS as usize, 0x22);
     write_at(&h, ino, 0, &data).await;
+    write_at(&h, ino, BS, &pattern(BS as usize, 0x23)).await;
     make_cold(&h, ino).await;
 
     // Cold: no RAM-resident copy anywhere — the probe must demote (a
     // device fetch is the lanes' business).
+    let g0 = squeezefs::fuse_client::METRICS
+        .get_obj
+        .load(std::sync::atomic::Ordering::Relaxed);
     assert_eq!(
         h.fs.read_fast_probe(ino, 0, 0, 4096, 0, None),
         FastReadProbe::Demote,
         "a cold block is never served sync"
     );
-    // The handler it defers to serves the cold read (and warms a tier).
+    assert_eq!(
+        squeezefs::fuse_client::METRICS
+            .get_obj
+            .load(std::sync::atomic::Ordering::Relaxed),
+        g0,
+        "the probe never touches a device"
+    );
+    // The handler it defers to serves the cold read (one device fetch)
+    // and warms a tier.
     assert_eq!(read_at(&h, ino, 0, 128 * 1024).await, &data[..128 * 1024]);
+    assert_eq!(
+        squeezefs::fuse_client::METRICS
+            .get_obj
+            .load(std::sync::atomic::Ordering::Relaxed)
+            - g0,
+        1,
+        "fixture premise: the handler paid exactly one device fetch (block 0 was cold)"
+    );
 
     // Warm now: a DIFFERENT sub-range of the same block serves from the
     // tier ladder (staging / hot / hold / read-cache), landing in the
@@ -427,4 +458,291 @@ async fn served_op_records_zero_ingress_and_the_fast_dispatch_trace_chain() {
     );
     assert_eq!(Stage::FastDispatch.name(), "fast_dispatch");
     assert_eq!(Stage::from_u16(6), Some(Stage::FastDispatch), "wire id 6");
+}
+
+// ---------------------------------------------------------------------------
+// Law 7 — live engagement on an armed session (mount class; self-skips
+// through the testkit ledger where /dev/fuse / enable_uring / fusermount3
+// are absent — the require-mount gate turns the skip into a failure).
+// ---------------------------------------------------------------------------
+
+struct Mount {
+    child: std::process::Child,
+    mnt: std::path::PathBuf,
+    base: std::path::PathBuf,
+    log: std::path::PathBuf,
+}
+
+impl Mount {
+    fn metric_u64(&self, key: &str) -> u64 {
+        let raw = std::fs::read_to_string(self.mnt.join(".stats")).expect("read .stats");
+        let stats: serde_json::Value = serde_json::from_str(&raw).expect("stats JSON");
+        stats["metrics"][key]
+            .as_u64()
+            .unwrap_or_else(|| panic!("metric {key} missing/not-u64"))
+    }
+
+    fn unmount(mut self) {
+        let _ = std::process::Command::new("fusermount3")
+            .arg("-u")
+            .arg(&self.mnt)
+            .status();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            match self.child.try_wait().expect("try_wait mount child") {
+                Some(_) => break,
+                None if std::time::Instant::now() > deadline => {
+                    let _ = self.child.kill();
+                    panic!(
+                        "mount daemon did not exit within 30s of unmount; log:\n{}",
+                        std::fs::read_to_string(&self.log).unwrap_or_default()
+                    );
+                }
+                None => std::thread::sleep(std::time::Duration::from_millis(200)),
+            }
+        }
+    }
+}
+
+impl Drop for Mount {
+    fn drop(&mut self) {
+        let _ = std::process::Command::new("fusermount3")
+            .arg("-uz")
+            .arg(&self.mnt)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        let _ = std::fs::remove_dir_all(&self.base);
+    }
+}
+
+fn mount_fs(tag: &str, envs: &[(&str, &str)]) -> Mount {
+    use std::process::{Command, Stdio};
+    let bin = env!("CARGO_BIN_EXE_squeezefs");
+    let base = std::env::temp_dir().join(format!("sqfs_rfd_{tag}_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    std::fs::create_dir_all(&base).unwrap();
+    let meta = base.join("meta.bin");
+    let data = base.join("data.bin");
+    let staging = base.join("staging");
+    let mnt = base.join("mnt");
+    let log = base.join("mount.log");
+    std::fs::create_dir_all(&staging).unwrap();
+    std::fs::create_dir_all(&mnt).unwrap();
+    std::fs::File::create(&meta)
+        .unwrap()
+        .set_len(256 * 1024 * 1024)
+        .unwrap();
+    std::fs::File::create(&data)
+        .unwrap()
+        .set_len(2 * 1024 * 1024 * 1024)
+        .unwrap();
+    let fmt = Command::new(bin)
+        .arg("format")
+        .arg(format!("sqmeta://{}", meta.display()))
+        .arg(format!("sqdata://{}", data.display()))
+        .arg("--disk-cache-paths")
+        .arg(&staging)
+        .output()
+        .expect("run squeezefs format");
+    assert!(
+        fmt.status.success(),
+        "format failed: {}\n{}",
+        String::from_utf8_lossy(&fmt.stdout),
+        String::from_utf8_lossy(&fmt.stderr)
+    );
+    let logf = std::fs::File::create(&log).unwrap();
+    let mut cmd = Command::new(bin);
+    cmd.arg("mount")
+        .arg(format!("sqmeta://{}", meta.display()))
+        .arg(&mnt)
+        .arg("--uid")
+        .arg(unsafe { libc::getuid() }.to_string())
+        .arg("--gid")
+        .arg(unsafe { libc::getgid() }.to_string());
+    cmd.env_remove("SQUEEZEFS_FUSE_READ_FAST_DISPATCH");
+    for (k, v) in envs {
+        cmd.env(k, v);
+    }
+    let child = cmd
+        .stdout(Stdio::from(logf.try_clone().unwrap()))
+        .stderr(Stdio::from(logf))
+        .spawn()
+        .expect("spawn squeezefs mount");
+    let mount = Mount {
+        child,
+        mnt,
+        base,
+        log,
+    };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(90);
+    loop {
+        if std::fs::read_to_string(mount.mnt.join(".stats")).is_ok() {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "mount did not become ready in 90s; log:\n{}",
+            std::fs::read_to_string(&mount.log).unwrap_or_default()
+        );
+        std::thread::sleep(std::time::Duration::from_millis(250));
+    }
+    mount
+}
+
+/// `n` 4 KiB O_DIRECT reads at 4 KiB-aligned offsets of `path` (one
+/// FUSE_READ each — O_DIRECT takes no readahead), content-checked against
+/// `payload`. Returns the count issued.
+fn odirect_reads_4k(path: &std::path::Path, payload: &[u8], n: usize) -> usize {
+    use std::os::unix::fs::OpenOptionsExt;
+    use std::os::unix::io::AsRawFd;
+    let f = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECT)
+        .open(path)
+        .expect("open O_DIRECT");
+    // 4 KiB-aligned buffer (O_DIRECT alignment law).
+    let layout = std::alloc::Layout::from_size_align(4096, 4096).unwrap();
+    // SAFETY: a fresh 4 KiB allocation, fully written by pread before read.
+    let buf = unsafe { std::alloc::alloc_zeroed(layout) };
+    assert!(!buf.is_null());
+    let blocks = payload.len() / 4096;
+    let mut issued = 0;
+    for i in 0..n {
+        // A deterministic scatter over the file (no two consecutive
+        // offsets adjacent — no sequential-stream classification).
+        let b = (i * 7919 + 13) % blocks;
+        let off = (b * 4096) as i64;
+        // SAFETY: buf is 4096 B, aligned; the fd is open for read.
+        let got = unsafe { libc::pread(f.as_raw_fd(), buf as *mut _, 4096, off) };
+        assert_eq!(got, 4096, "pread at {off} returned {got}");
+        let slice = unsafe { std::slice::from_raw_parts(buf, 4096) };
+        assert_eq!(
+            slice,
+            &payload[b * 4096..(b + 1) * 4096],
+            "O_DIRECT read at block {b} must be byte-exact"
+        );
+        issued += 1;
+    }
+    // SAFETY: matches the alloc above.
+    unsafe { std::alloc::dealloc(buf, layout) };
+    issued
+}
+
+#[test]
+fn live_armed_session_reads_are_all_fast_dispatched_and_close_against_inplace_replies() {
+    use squeezefs_testkit::{mount_supported, site};
+    if !mount_supported(site!()) {
+        return;
+    }
+    let m = mount_fs("engage", &[]);
+    let write_file = |name: &str, size: usize| -> (std::path::PathBuf, Vec<u8>) {
+        use std::io::Write;
+        let path = m.mnt.join(name);
+        let payload: Vec<u8> = (0..size as u32)
+            .map(|i| ((i * 31 + 7) % 251) as u8)
+            .collect();
+        let mut f = std::fs::File::create(&path).expect("create");
+        f.write_all(&payload).expect("write");
+        f.sync_all().expect("fsync");
+        (path, payload)
+    };
+    let words = |m: &Mount| {
+        let raw = std::fs::read_to_string(m.mnt.join(".stats")).expect("read .stats");
+        let stats: serde_json::Value = serde_json::from_str(&raw).expect("stats JSON");
+        let met = &stats["metrics"];
+        let u = |k: &str| met[k].as_u64().unwrap_or_else(|| panic!("{k} missing"));
+        let qw = &met["read_transport_phase_ns"]["queue_wait"];
+        (
+            u("transport_fast_dispatch_serves"),
+            u("transport_fast_dispatch_demotes"),
+            u("fuse3_read_inplace_replies"),
+            qw["count"].as_u64().unwrap(),
+            qw["sum_ns"].as_u64().unwrap(),
+        )
+    };
+
+    // Shape A — a 1 MiB file (the STAGED layout: its bytes sit in the
+    // staging ring, the sync ladder's first leg): every O_DIRECT READ is
+    // served + committed on the queue worker. The `.stats` reads that
+    // bracket the row are READs too (virtual ino ⇒ demote), so the
+    // demote/in-place deltas are exactly those.
+    let (path, payload) = write_file("staged.bin", 1 << 20);
+    let (s0, d0, i0, qc0, qs0) = words(&m);
+    let n = odirect_reads_4k(&path, &payload, 48) as u64;
+    let (s1, d1, i1, qc1, qs1) = words(&m);
+    assert_eq!(s1 - s0, n, "every warm READ served inline on the worker");
+    assert_eq!(
+        d1 - d0,
+        i1 - i0,
+        "the demoted READs (the .stats brackets) are exactly the in-place replies"
+    );
+    assert_eq!(
+        qc1 - qc0,
+        n + (d1 - d0),
+        "queue_wait counts every READ on the armed session (served + demoted)"
+    );
+    assert_eq!(
+        qs1 - qs0,
+        0,
+        "queue_wait is an exact zero on every fast-dispatched READ (the inbound queue is \
+         not on the path)"
+    );
+
+    // Shape B — an 8 MiB striped file read O_DIRECT at random 4 KiB
+    // offsets: the hybrid policy serves these as RANGED device reads
+    // (no tier ever holds the block), so every READ demotes exactly once
+    // and stays lane-served — the field rr_4k shape.
+    let (path, payload) = write_file("cold.bin", 8 << 20);
+    let (s0, d0, i0, _, qs0) = words(&m);
+    let n = odirect_reads_4k(&path, &payload, 48) as u64;
+    let (s1, d1, i1, _, qs1) = words(&m);
+    assert_eq!(s1 - s0, 0, "a ranged device read is never served sync");
+    assert!(
+        d1 - d0 >= n,
+        "every cold READ demotes (demotes {} for {n} READs)",
+        d1 - d0
+    );
+    assert_eq!(
+        d1 - d0,
+        i1 - i0,
+        "a demoted READ is lane-served exactly once (in-place replies ≡ demotes)"
+    );
+    assert_eq!(qs1 - qs0, 0, "the demote arm skips the inbound queue too");
+    m.unmount();
+
+    // The A/B control: the lever off leaves both counters flat and every
+    // READ rides the handler arm (the pre-campaign path).
+    let m = mount_fs("control", &[("SQUEEZEFS_FUSE_READ_FAST_DISPATCH", "0")]);
+    let path = m.mnt.join("ctl.bin");
+    let payload: Vec<u8> = (0..1u32 << 20)
+        .map(|i| ((i * 31 + 7) % 251) as u8)
+        .collect();
+    {
+        use std::io::Write;
+        let mut f = std::fs::File::create(&path).expect("create");
+        f.write_all(&payload).expect("write");
+        f.sync_all().expect("fsync");
+    }
+    let s0 = m.metric_u64("transport_fast_dispatch_serves");
+    let d0 = m.metric_u64("transport_fast_dispatch_demotes");
+    let i0 = m.metric_u64("fuse3_read_inplace_replies");
+    let n = odirect_reads_4k(&path, &payload, 32);
+    assert_eq!(
+        m.metric_u64("transport_fast_dispatch_serves"),
+        s0,
+        "lever off: no inline serves"
+    );
+    assert_eq!(
+        m.metric_u64("transport_fast_dispatch_demotes"),
+        d0,
+        "lever off: no direct mints"
+    );
+    assert!(
+        m.metric_u64("fuse3_read_inplace_replies") - i0 >= n as u64,
+        "lever off: every READ rides the handler's in-place arm"
+    );
+    m.unmount();
 }

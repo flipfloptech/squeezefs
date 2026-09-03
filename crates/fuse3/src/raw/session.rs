@@ -959,6 +959,40 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
                             fs_for_gate.zc_write_hold_eligible(ino, offset, len, odirect)
                         },
                     ));
+                    // R-2 READ fast-dispatch: the filesystem's SYNC
+                    // try-only probe + the READ-handler mint, so the
+                    // queue workers can serve warm READs inline at the
+                    // delivery CQE and hand cold ones straight to a
+                    // lane. Same Weak-connection shape as the fused
+                    // write mint; READs delivered before this
+                    // registration ride the inbound queue.
+                    {
+                        use crate::raw::connection::fuse_over_uring::fast_dispatch::ReadFastDispatch;
+                        let fs_for_probe = fs.clone();
+                        let fs_for_mint = fs.clone();
+                        let conn_weak = Arc::downgrade(&fuse_connection);
+                        let reply_sender = self.response_sender.clone();
+                        fuse_connection.set_read_fast_dispatcher(ReadFastDispatch {
+                            probe: Arc::new(
+                                move |ino: u64,
+                                      fh: u64,
+                                      offset: u64,
+                                      size: u32,
+                                      flags: u32,
+                                      dest: Option<(u64, usize)>| {
+                                    fs_for_probe.read_fast_probe(ino, fh, offset, size, flags, dest)
+                                },
+                            ),
+                            mint: Arc::new(move |req: InboundUringReq| -> FusedFuture {
+                                Box::pin(fast_read_future(
+                                    fs_for_mint.clone(),
+                                    conn_weak.clone(),
+                                    reply_sender.clone(),
+                                    req,
+                                ))
+                            }),
+                        });
+                    }
                 }
             }
         }
@@ -2806,7 +2840,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
             Ok(read_in) => read_in,
         };
 
-        let mut resp_sender = self.reply_tx(&request);
+        let resp_sender = self.reply_tx(&request);
         let fs = fs.clone();
         // P2 per-op economy: on an armed over-uring session the READ reply
         // is completed in place from the handler task (a synchronous
@@ -2816,172 +2850,20 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
 
         // Lever 1 (transport-ingress dispatch): same-lane spawn_local when
         // this dispatch loop already runs on a TPC lane — see `spawn_read`.
-        spawn_read(debug_span!("fuse_read"), request.unique, async move {
-            crate::raw::read_phase::read_transport_phase_record(
-                crate::raw::read_phase::TransportPhase::DispatchLag,
-                dispatch_t0.elapsed(),
-            );
-            debug!(
-                "read unique {} inode {} {:?}",
-                request.unique, in_header.nodeid, read_in
-            );
-
-            let (mut reply_data, backing, zc_prefilled) = match fs
-                .read(
-                    request,
-                    in_header.nodeid,
-                    read_in.fh,
-                    read_in.offset,
-                    read_in.size,
-                    read_in.flags,
-                )
-                .await
-            {
-                Err(err) => {
-                    reply_error_in_place(err, request, resp_sender).await;
-
-                    return;
-                }
-
-                Ok(reply_data) => (reply_data.data, reply_data.backing, reply_data.zc_prefilled),
-            };
-
-            // zc direct leg (K1 kill): the payload already sits in the
-            // request's pages — commit header + length, no body move.
-            // Prefilled replies exist only on zc-armed sessions (the
-            // handler mints them against the live connection), so a
-            // missing/un-armed connection here is a bug: fail the request
-            // loud rather than fabricate a body-less classical reply.
-            if let Some(n) = zc_prefilled {
-                let n = n.min(read_in.size);
-                let out_header = fuse_out_header {
-                    len: (FUSE_OUT_HEADER_SIZE + n as usize) as u32,
-                    error: 0,
-                    unique: request.unique,
-                };
-                let mut data_buf = Vec::with_capacity(FUSE_OUT_HEADER_SIZE);
-                get_bincode_config()
-                    .serialize_into(&mut data_buf, &out_header)
-                    .expect("won't happened");
-                match reply_conn.filter(|c| c.over_uring_ready()) {
-                    Some(conn) => {
-                        resp_sender.mark_replied();
-                        if let Err(err) = conn.submit_reply_prefilled(request.slot, data_buf, n) {
-                            if err.kind() == ErrorKind::NotFound {
-                                warn!(
-                                    "may reply interrupted fuse request, ignore this error {}",
-                                    err
-                                );
-                            } else {
-                                error!("zc prefilled read reply failed {}", err);
-                            }
-                        }
-                        crate::raw::read_phase::note_read_inplace_reply();
-                        drop(backing);
-                    }
-                    None => {
-                        error!(
-                            "zc prefilled reply with no armed connection (unique {}) — EIO",
-                            request.unique
-                        );
-                        reply_error_in_place(libc::EIO.into(), request, resp_sender).await;
-                    }
-                }
-                if arrival_ns > 0 {
-                    let now_ns = crate::raw::read_phase::transport_now_ns();
-                    crate::raw::read_phase::read_transport_phase_record(
-                        crate::raw::read_phase::TransportPhase::TransportTotal,
-                        std::time::Duration::from_nanos(now_ns.saturating_sub(arrival_ns)),
-                    );
-                    crate::raw::op_trace::stamp(
-                        request.unique,
-                        crate::raw::op_trace::Stage::ReplyCommit,
-                        crate::raw::read_phase::transport_instant(now_ns),
-                    );
-                }
-                return;
-            }
-
-            let reply_t0 = std::time::Instant::now();
-            crate::raw::op_trace::stamp(
-                request.unique,
-                crate::raw::op_trace::Stage::HandlerReturn,
-                reply_t0,
-            );
-            if reply_data.len() > read_in.size as _ {
-                reply_data.truncate(read_in.size as _);
-            }
-
-            let out_header = fuse_out_header {
-                len: (FUSE_OUT_HEADER_SIZE + reply_data.len()) as u32,
-                error: 0,
-                unique: request.unique,
-            };
-
-            let mut data_buf = Vec::with_capacity(FUSE_OUT_HEADER_SIZE);
-
-            get_bincode_config()
-                .serialize_into(&mut data_buf, &out_header)
-                .expect("won't happened");
-
-            // In-place reply on an armed session; the channel path stays
-            // for INIT-phase/classical sessions (pool not ready) and any
-            // clone without a connection handle. Error semantics mirror
-            // `reply_fuse`: NotFound = interrupted/double reply (benign);
-            // anything else is logged loud — the session's dispatch task
-            // observes a dead connection through its own read path.
-            match reply_conn.filter(|c| c.over_uring_ready()) {
-                Some(conn) => {
-                    resp_sender.mark_replied();
-                    if let Err(err) = conn
-                        .write_vectored(data_buf, Some(reply_data), request.slot)
-                        .await
-                        .1
-                    {
-                        if err.kind() == ErrorKind::NotFound {
-                            warn!(
-                                "may reply interrupted fuse request, ignore this error {}",
-                                err
-                            );
-                        } else {
-                            error!("in-place read reply failed {}", err);
-                        }
-                    }
-                    crate::raw::read_phase::note_read_inplace_reply();
-                    drop(backing);
-                }
-                None => {
-                    let _ = resp_sender
-                        .send(Either::Right((data_buf, reply_data, backing)))
-                        .await;
-                }
-            }
-            // `reply_commit`: handler returned → reply committed to the
-            // transport (in-place arm: the synchronous COMMIT enqueue; the
-            // channel arm measures the hand-off — INIT-phase only). ONE
-            // clock read closes reply_commit, transport_total and the
-            // op-trace `reply_commit` stamp (audit A2's one-read law;
-            // `Instant` and the transport epoch are the same
-            // CLOCK_MONOTONIC on Linux).
-            let now = std::time::Instant::now();
-            crate::raw::read_phase::read_transport_phase_record(
-                crate::raw::read_phase::TransportPhase::ReplyCommit,
-                now.saturating_duration_since(reply_t0),
-            );
-            if arrival_ns > 0 {
-                crate::raw::read_phase::read_transport_phase_record(
-                    crate::raw::read_phase::TransportPhase::TransportTotal,
-                    now.saturating_duration_since(crate::raw::read_phase::transport_instant(
-                        arrival_ns,
-                    )),
-                );
-            }
-            crate::raw::op_trace::stamp(
-                request.unique,
-                crate::raw::op_trace::Stage::ReplyCommit,
-                now,
-            );
-        });
+        spawn_read(
+            debug_span!("fuse_read"),
+            request.unique,
+            read_handler_body(
+                fs,
+                reply_conn,
+                resp_sender,
+                request,
+                in_header.nodeid,
+                read_in,
+                dispatch_t0,
+                arrival_ns,
+            ),
+        );
     }
 
     #[instrument(level = "debug", skip(self, data, fs))]
@@ -5271,6 +5153,296 @@ async fn write_handler_body<FS: Filesystem + Send + Sync + 'static>(
     );
 }
 
+/// The FUSE_READ handler body — everything after `handle_read`'s parse:
+/// run the filesystem read, then commit the reply in place (armed
+/// sessions: the zc prefilled arm or the synchronous COMMIT enqueue) or
+/// through the reply channel (INIT-phase/classical). Extracted (R-2 READ
+/// fast-dispatch) so the SAME body runs from both venues — the dispatch
+/// loop's same-lane spawn and the queue worker's direct lane mint for a
+/// demoted READ. `dispatch_t0` anchors `dispatch_lag` (the dispatch pop,
+/// or the worker's mint instant); `arrival_ns` the `transport_total`
+/// anchor (0 = classical delivery — the arrival-anchored phases skip).
+#[allow(clippy::too_many_arguments)] // the parse results + the reply plumbing, verbatim
+async fn read_handler_body<FS: Filesystem + Send + Sync + 'static>(
+    fs: Arc<FS>,
+    reply_conn: Option<Arc<FuseConnection>>,
+    mut resp_sender: ReplyTx,
+    request: Request,
+    nodeid: u64,
+    read_in: fuse_read_in,
+    dispatch_t0: std::time::Instant,
+    arrival_ns: u64,
+) {
+    crate::raw::read_phase::read_transport_phase_record(
+        crate::raw::read_phase::TransportPhase::DispatchLag,
+        dispatch_t0.elapsed(),
+    );
+    debug!(
+        "read unique {} inode {} {:?}",
+        request.unique, nodeid, read_in
+    );
+
+    let (mut reply_data, backing, zc_prefilled) = match fs
+        .read(
+            request,
+            nodeid,
+            read_in.fh,
+            read_in.offset,
+            read_in.size,
+            read_in.flags,
+        )
+        .await
+    {
+        Err(err) => {
+            reply_error_in_place(err, request, resp_sender).await;
+
+            return;
+        }
+
+        Ok(reply_data) => (reply_data.data, reply_data.backing, reply_data.zc_prefilled),
+    };
+
+    // zc direct leg (K1 kill): the payload already sits in the
+    // request's pages — commit header + length, no body move.
+    // Prefilled replies exist only on zc-armed sessions (the
+    // handler mints them against the live connection), so a
+    // missing/un-armed connection here is a bug: fail the request
+    // loud rather than fabricate a body-less classical reply.
+    if let Some(n) = zc_prefilled {
+        let n = n.min(read_in.size);
+        let out_header = fuse_out_header {
+            len: (FUSE_OUT_HEADER_SIZE + n as usize) as u32,
+            error: 0,
+            unique: request.unique,
+        };
+        let mut data_buf = Vec::with_capacity(FUSE_OUT_HEADER_SIZE);
+        get_bincode_config()
+            .serialize_into(&mut data_buf, &out_header)
+            .expect("won't happened");
+        match reply_conn.filter(|c| c.over_uring_ready()) {
+            Some(conn) => {
+                resp_sender.mark_replied();
+                if let Err(err) = conn.submit_reply_prefilled(request.slot, data_buf, n) {
+                    if err.kind() == ErrorKind::NotFound {
+                        warn!(
+                            "may reply interrupted fuse request, ignore this error {}",
+                            err
+                        );
+                    } else {
+                        error!("zc prefilled read reply failed {}", err);
+                    }
+                }
+                crate::raw::read_phase::note_read_inplace_reply();
+                drop(backing);
+            }
+            None => {
+                error!(
+                    "zc prefilled reply with no armed connection (unique {}) — EIO",
+                    request.unique
+                );
+                reply_error_in_place(libc::EIO.into(), request, resp_sender).await;
+            }
+        }
+        if arrival_ns > 0 {
+            let now_ns = crate::raw::read_phase::transport_now_ns();
+            crate::raw::read_phase::read_transport_phase_record(
+                crate::raw::read_phase::TransportPhase::TransportTotal,
+                std::time::Duration::from_nanos(now_ns.saturating_sub(arrival_ns)),
+            );
+            crate::raw::op_trace::stamp(
+                request.unique,
+                crate::raw::op_trace::Stage::ReplyCommit,
+                crate::raw::read_phase::transport_instant(now_ns),
+            );
+        }
+        return;
+    }
+
+    let reply_t0 = std::time::Instant::now();
+    crate::raw::op_trace::stamp(
+        request.unique,
+        crate::raw::op_trace::Stage::HandlerReturn,
+        reply_t0,
+    );
+    if reply_data.len() > read_in.size as _ {
+        reply_data.truncate(read_in.size as _);
+    }
+
+    let out_header = fuse_out_header {
+        len: (FUSE_OUT_HEADER_SIZE + reply_data.len()) as u32,
+        error: 0,
+        unique: request.unique,
+    };
+
+    let mut data_buf = Vec::with_capacity(FUSE_OUT_HEADER_SIZE);
+
+    get_bincode_config()
+        .serialize_into(&mut data_buf, &out_header)
+        .expect("won't happened");
+
+    // In-place reply on an armed session; the channel path stays
+    // for INIT-phase/classical sessions (pool not ready) and any
+    // clone without a connection handle. Error semantics mirror
+    // `reply_fuse`: NotFound = interrupted/double reply (benign);
+    // anything else is logged loud — the session's dispatch task
+    // observes a dead connection through its own read path.
+    match reply_conn.filter(|c| c.over_uring_ready()) {
+        Some(conn) => {
+            resp_sender.mark_replied();
+            if let Err(err) = conn
+                .write_vectored(data_buf, Some(reply_data), request.slot)
+                .await
+                .1
+            {
+                if err.kind() == ErrorKind::NotFound {
+                    warn!(
+                        "may reply interrupted fuse request, ignore this error {}",
+                        err
+                    );
+                } else {
+                    error!("in-place read reply failed {}", err);
+                }
+            }
+            crate::raw::read_phase::note_read_inplace_reply();
+            drop(backing);
+        }
+        None => {
+            let _ = resp_sender
+                .send(Either::Right((data_buf, reply_data, backing)))
+                .await;
+        }
+    }
+    // `reply_commit`: handler returned → reply committed to the
+    // transport (in-place arm: the synchronous COMMIT enqueue; the
+    // channel arm measures the hand-off — INIT-phase only). ONE
+    // clock read closes reply_commit, transport_total and the
+    // op-trace `reply_commit` stamp (audit A2's one-read law;
+    // `Instant` and the transport epoch are the same
+    // CLOCK_MONOTONIC on Linux).
+    let now = std::time::Instant::now();
+    crate::raw::read_phase::read_transport_phase_record(
+        crate::raw::read_phase::TransportPhase::ReplyCommit,
+        now.saturating_duration_since(reply_t0),
+    );
+    if arrival_ns > 0 {
+        crate::raw::read_phase::read_transport_phase_record(
+            crate::raw::read_phase::TransportPhase::TransportTotal,
+            now.saturating_duration_since(crate::raw::read_phase::transport_instant(arrival_ns)),
+        );
+    }
+    crate::raw::op_trace::stamp(
+        request.unique,
+        crate::raw::op_trace::Stage::ReplyCommit,
+        now,
+    );
+}
+
+/// One DEMOTED READ handler invocation (R-2 fast dispatch): the dispatch
+/// loop's prelude — header/`fuse_read_in` parse — followed by
+/// [`read_handler_body`], as ONE future the queue worker mints at the
+/// delivery CQE and hands straight to a handler lane. The inbound queue
+/// and the session dispatch task are not on this path: `queue_wait` is
+/// recorded as an exact zero at the first poll (the count keeps closing
+/// against the READ population), `dispatch_lag` anchors on the worker's
+/// mint instant (= the arrival stamp — one clock read on the worker).
+/// Every parse refusal replies EINVAL through the same `ReplyTx`
+/// discipline (FUSE-2 holds on this venue by the same machinery as the
+/// handler lanes: a dropped/panicked future's drop-guard synthesizes).
+#[cfg(all(target_os = "linux", feature = "tokio-runtime"))]
+async fn fast_read_future<FS: Filesystem + Send + Sync + 'static>(
+    fs: Arc<FS>,
+    conn: std::sync::Weak<FuseConnection>,
+    reply_sender: UnboundedSender<FuseReply>,
+    req: crate::raw::connection::fuse_over_uring::InboundUringReq,
+) {
+    let arrived_ns = req.arrived_ns;
+    let mint_t0 = crate::raw::read_phase::transport_instant(arrived_ns);
+    crate::raw::read_phase::read_transport_phase_record(
+        crate::raw::read_phase::TransportPhase::QueueWait,
+        std::time::Duration::ZERO,
+    );
+    let Some(conn) = conn.upgrade() else {
+        // Teardown raced the mint: the worker's row-8 drain owns the
+        // slot (this future never took a ReplyTx, so nothing double
+        // synthesizes).
+        return;
+    };
+    let bare = |unique: u64, slot: crate::raw::ReplySlot| Request {
+        unique,
+        uid: 0,
+        gid: 0,
+        pid: 0,
+        slot,
+    };
+    if req.header_and_op.len() < FUSE_IN_HEADER_SIZE {
+        error!(
+            "fast read: short header frame ({} B) for unique {}",
+            req.header_and_op.len(),
+            req.unique
+        );
+        let request = bare(req.unique, req.slot);
+        let sender = ReplyTx::owing(reply_sender, &request, req.slot, Some(conn));
+        reply_error_in_place(libc::EINVAL.into(), request, sender).await;
+        return;
+    }
+    let in_header = match get_bincode_config()
+        .deserialize::<fuse_in_header>(&req.header_and_op[..FUSE_IN_HEADER_SIZE])
+    {
+        Ok(h) => h,
+        Err(err) => {
+            error!("fast read: fuse_in_header deserialize failed {err}");
+            let request = bare(req.unique, req.slot);
+            let sender = ReplyTx::owing(reply_sender, &request, req.slot, Some(conn));
+            reply_error_in_place(libc::EINVAL.into(), request, sender).await;
+            return;
+        }
+    };
+    let mut request = Request::from(&in_header);
+    request.slot = req.slot;
+    let request = request;
+    let resp_sender = ReplyTx::owing(reply_sender, &request, req.slot, Some(conn.clone()));
+    // Belt: the worker mints READ deliveries only.
+    if in_header.opcode != fuse_opcode::FUSE_READ as u32 {
+        error!(
+            "fast read: non-READ opcode {} reached the fast-dispatch mint (unique {})",
+            in_header.opcode, request.unique
+        );
+        reply_error_in_place(libc::EINVAL.into(), request, resp_sender).await;
+        return;
+    }
+    let op = &req.header_and_op[FUSE_IN_HEADER_SIZE..];
+    let read_in = match get_bincode_config().deserialize::<fuse_read_in>(op) {
+        Ok(r) => r,
+        Err(err) => {
+            error!("fast read: fuse_read_in deserialize failed {err}");
+            reply_error_in_place(libc::EINVAL.into(), request, resp_sender).await;
+            return;
+        }
+    };
+    // The op-trace ingress stamps the dispatch pop would have made:
+    // arrival and dispatch at the SAME instant (the worker minted at the
+    // reap) — `queue_wait` reads 0 in the stitch too.
+    let traced = crate::raw::op_trace::traced(request.unique);
+    if traced != 0 {
+        crate::raw::op_trace::stamp(traced, crate::raw::op_trace::Stage::TransportRecv, mint_t0);
+        crate::raw::op_trace::stamp(traced, crate::raw::op_trace::Stage::Dispatch, mint_t0);
+    }
+    handler_scope(
+        request.unique,
+        read_handler_body(
+            fs,
+            Some(conn),
+            resp_sender,
+            request,
+            in_header.nodeid,
+            read_in,
+            mint_t0,
+            arrived_ns,
+        ),
+    )
+    .await
+}
+
 /// One FUSED WRITE handler invocation (zc-write-fusion campaign): the
 /// dispatch-loop prelude — header/`fuse_write_in` parse, body-bounds
 /// validation, the held-length agreement check — followed by
@@ -5785,6 +5957,32 @@ impl TpcScheduler {
         self.spawn(fut);
     }
 
+    /// [`Self::spawn_on_node`] for an ALREADY-boxed future (the R-2 fast
+    /// dispatch's minted READ handler): the same node-local round-robin
+    /// (global rotation when `node` is unknown or has no lanes), with
+    /// no second `Box::pin` around the box. Zero-lane configs take the
+    /// [`Self::spawn`] fallback thread.
+    fn spawn_boxed_on_node(&self, node: Option<usize>, fut: LaneFuture) {
+        if self.lanes.is_empty() {
+            self.spawn(fut);
+            return;
+        }
+        if let Some(group) = node.and_then(|n| self.node_lanes.get(n)) {
+            if !group.is_empty() {
+                let n = node.expect("group came from node");
+                let k = self.node_next[n].fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                    % group.len();
+                Self::dispatch(&self.lanes, group[k], fut);
+                return;
+            }
+        }
+        let idx = self
+            .next_idx
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            % self.lanes.len();
+        Self::dispatch(&self.lanes, idx, fut);
+    }
+
     /// Lane dispatch with **loud dead-lane re-dispatch** (shim-parity
     /// campaign 2026-07-28, ingest-economy board item 2): a lane whose
     /// receiver is gone (its OS thread died — an escaped panic outside a
@@ -5969,6 +6167,14 @@ where
     F: std::future::Future<Output = ()> + Send + 'static,
 {
     TPC_SCHEDULER.spawn_on_node(node, fut);
+}
+
+/// Hand an already-boxed handler future to a lane (R-2 READ fast
+/// dispatch's demote arm): node-local round-robin when `node` is known,
+/// the global rotation otherwise — [`tpc_spawn_on_node`] without the
+/// second box.
+pub(crate) fn tpc_dispatch_boxed(node: Option<usize>, fut: LaneFuture) {
+    TPC_SCHEDULER.spawn_boxed_on_node(node, fut);
 }
 
 pub fn tpc_thread_count() -> usize {

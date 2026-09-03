@@ -7968,6 +7968,92 @@ pub enum IpcReadProbe {
     Miss,
 }
 
+/// The READ fast-dispatch probe's serve destination (R-2): the
+/// transport's reply window when the queue worker handed one (the ent
+/// payload / zc bounce slot — the served `Bytes` then ALIAS it and the
+/// commit elides the copy), else a heap buffer sized to the request
+/// (probes with no window — the in-process suites; the worker always
+/// has one).
+enum FastReadSink {
+    Window { addr: u64, cap: usize },
+    Heap(std::cell::RefCell<Vec<u8>>),
+}
+
+impl FastReadSink {
+    /// The served bytes: a non-owning view over the window (the FUSE-4e
+    /// `ReadDest` provenance — the window is this request's own until
+    /// its commit), or the heap buffer truncated to the serve.
+    fn into_bytes(self, n: usize) -> bytes::Bytes {
+        match self {
+            FastReadSink::Window { addr, cap } => {
+                let n = n.min(cap);
+                // SAFETY: `addr..addr + cap` is this request's registered
+                // reply window (the §5.4 ownership argument: exclusively
+                // the request's between delivery and commit), and the
+                // returned Bytes lives only until the worker's commit of
+                // this very request.
+                bytes::Bytes::from_owner(unsafe {
+                    crate::cache::pool::UringBufOwner::new(addr as *mut u8, n)
+                })
+            }
+            FastReadSink::Heap(v) => {
+                let mut v = v.into_inner();
+                v.truncate(n);
+                bytes::Bytes::from(v)
+            }
+        }
+    }
+}
+
+impl crate::PayloadSink for FastReadSink {
+    fn write_at(&self, off: usize, bytes: &[u8]) {
+        match self {
+            FastReadSink::Window { addr, cap } => {
+                let end = off.saturating_add(bytes.len()).min(*cap);
+                if off < end {
+                    // SAFETY: bounded to the window by `end ≤ cap`; the
+                    // window is this request's own (see `into_bytes`).
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(
+                            bytes.as_ptr(),
+                            (*addr as *mut u8).add(off),
+                            end - off,
+                        );
+                    }
+                }
+            }
+            FastReadSink::Heap(v) => {
+                let mut v = v.borrow_mut();
+                let end = off.saturating_add(bytes.len()).min(v.len());
+                if off < end {
+                    v[off..end].copy_from_slice(&bytes[..end - off]);
+                }
+            }
+        }
+    }
+
+    fn zero_at(&self, off: usize, len: usize) {
+        match self {
+            FastReadSink::Window { addr, cap } => {
+                let end = off.saturating_add(len).min(*cap);
+                if off < end {
+                    // SAFETY: as `write_at`.
+                    unsafe {
+                        std::ptr::write_bytes((*addr as *mut u8).add(off), 0, end - off);
+                    }
+                }
+            }
+            FastReadSink::Heap(v) => {
+                let mut v = v.borrow_mut();
+                let end = off.saturating_add(len).min(v.len());
+                if off < end {
+                    v[off..end].fill(0);
+                }
+            }
+        }
+    }
+}
+
 pub struct SqueezefsFilesystem {
     pub router: DataRouter,
     dlm: DlmClient,
@@ -21595,6 +21681,98 @@ impl Filesystem for SqueezefsFilesystem {
             return false;
         }
         true
+    }
+
+    /// The READ fast-dispatch probe (e2e perf audit R-2, read board #2):
+    /// the il §5.5.1 sync fast path's EXACT posture for a kernel READ —
+    /// per-inode `try_read()` (a writer holding or queued on the lock is
+    /// a Demote, never a wait: the reap thread must never block), then
+    /// [`Self::ipc_read_probe_locked`]'s warm ladder (attr/meta size
+    /// coherence, EOF, single block, no device overlay, active-buffer
+    /// snapshot slice, then the sync tier serves — staging ring → hot →
+    /// read-lane hold → NVMe read-cache — INTO the transport's reply
+    /// window), the guard dropped before any continuation. Every shape
+    /// the ladder declines demotes to the authoritative handler.
+    ///
+    /// Kernel-path clauses the il path has no need of: virtual inodes
+    /// (regenerated async), the device-true O_DIRECT diagnostic posture
+    /// (the handler keeps the whole device-true path — a tier serve here
+    /// would turn a device-true row warm), rung-17 retained extents (the
+    /// handler overlays them onto the served bytes), and the FUSE-4e
+    /// window bound (a reply larger than the window is refused — Demote
+    /// — never shortened: a short read below EOF is the kernel
+    /// zero-filling user data).
+    ///
+    /// Side effects mirror the handler's warm serve exactly: the
+    /// page-coherence latch for buffered kernel reads (the handler bumps
+    /// it BEFORE the reply — so does this), the stream-lane touch the il
+    /// warm serve makes, and `fuse_ops`. Silent on Demote by design (the
+    /// handler it defers to owns every count).
+    fn read_fast_probe(
+        &self,
+        ino: u64,
+        _fh: u64,
+        offset: u64,
+        size: u32,
+        flags: u32,
+        dest: Option<(u64, usize)>,
+    ) -> FastReadProbe {
+        if is_virtual_ino(ino) || size == 0 {
+            return FastReadProbe::Demote;
+        }
+        let odirect = flags & (libc::O_DIRECT as u32) != 0;
+        if odirect && self.router.direct_device_true() {
+            return FastReadProbe::Demote;
+        }
+        if crate::extent_ship::any_retained() && crate::extent_ship::retained_count(ino) > 0 {
+            return FastReadProbe::Demote;
+        }
+        // FUSE-4e: the reply window must hold the WHOLE request — the
+        // ladder clamps only to EOF, never to the window.
+        let sink = match dest {
+            Some((addr, cap)) => {
+                if (size as usize) > cap {
+                    return FastReadProbe::Demote;
+                }
+                FastReadSink::Window { addr, cap }
+            }
+            None => FastReadSink::Heap(std::cell::RefCell::new(vec![0u8; size as usize])),
+        };
+        let lock = self.get_inode_lock_ref(ino);
+        let Ok(guard) = lock.try_read() else {
+            return FastReadProbe::Demote;
+        };
+        let (probe, meta) = self.ipc_read_probe_locked(ino, offset, size, &sink);
+        // Drop-guard-before-enqueue (§5.5.1): nothing continues under the
+        // guard — the served bytes are already captured (snapshot slice
+        // or landed in the sink).
+        drop(guard);
+        let served = match probe {
+            IpcReadProbe::Eof => bytes::Bytes::new(),
+            IpcReadProbe::Hit(b) => b,
+            IpcReadProbe::Served(n) => sink.into_bytes(n),
+            IpcReadProbe::Miss => return FastReadProbe::Demote,
+        };
+        METRICS.fuse_ops.fetch_add(1, Ordering::Relaxed);
+        if odirect {
+            METRICS
+                .read_odirect_requests
+                .fetch_add(1, Ordering::Relaxed);
+        } else {
+            // Page-coherence law: a buffered kernel READ instantiates
+            // page-cache folios — the clean latch must not survive it.
+            self.note_page_instantiation(ino);
+        }
+        if !served.is_empty() {
+            self.router.ring_read_lane_touch(
+                meta.as_ref(),
+                ino,
+                offset,
+                served.len() as u32,
+                false,
+            );
+        }
+        FastReadProbe::Served(served)
     }
 
     async fn init(&self, _req: Request) -> FuseResult<ReplyInit> {

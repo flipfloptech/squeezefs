@@ -496,6 +496,19 @@ impl FuseConnection {
         }
     }
 
+    /// Register the READ fast-dispatch pair (e2e perf audit R-2) — see
+    /// [`super::fuse_over_uring::FuseOverUring::set_read_fast_dispatcher`].
+    /// No-op when no over-uring pool exists (classical sessions).
+    #[cfg(target_os = "linux")]
+    pub fn set_read_fast_dispatcher(
+        &self,
+        d: super::fuse_over_uring::fast_dispatch::ReadFastDispatch,
+    ) {
+        if let Some(pool) = self.over_uring.get() {
+            pool.set_read_fast_dispatcher(d);
+        }
+    }
+
     /// Commit a reply whose payload already sits in the request's pages
     /// (the zc direct leg) — see
     /// [`super::fuse_over_uring::FuseOverUring::submit_reply_prefilled`].

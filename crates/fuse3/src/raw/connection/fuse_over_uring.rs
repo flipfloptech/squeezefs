@@ -1525,6 +1525,10 @@ pub struct FuseOverUring {
     /// shape no direct vehicle consumes buys hold + late extraction,
     /// serialized at fabric RTT).
     zc_hold_gate: std::sync::OnceLock<fused::ZcHoldGate>,
+    /// READ fast-dispatch (e2e perf audit R-2): the session's sync probe
+    /// and READ-handler mint, registered once after INIT. Unregistered
+    /// means every READ rides the inbound queue exactly as before.
+    read_fast_dispatch: std::sync::OnceLock<fast_dispatch::ReadFastDispatch>,
     /// Ring depth (per queue) — the `slot_watch` stride.
     depth: usize,
     /// §5.3 D3.b: session SQPOLL posture for the queue rings (`None` =
@@ -2803,6 +2807,7 @@ impl FuseOverUring {
             zc_msgs_taken: AtomicU64::new(0),
             fused_watches: std::sync::Mutex::new(Vec::new()),
             zc_hold_gate: std::sync::OnceLock::new(),
+            read_fast_dispatch: std::sync::OnceLock::new(),
             fused_dispatch: std::sync::OnceLock::new(),
             depth,
             sqpoll,
@@ -3050,6 +3055,7 @@ impl FuseOverUring {
             zc_msgs_taken: AtomicU64::new(0),
             fused_watches: std::sync::Mutex::new(Vec::new()),
             zc_hold_gate: std::sync::OnceLock::new(),
+            read_fast_dispatch: std::sync::OnceLock::new(),
             fused_dispatch: std::sync::OnceLock::new(),
             depth: Self::SIM_DEPTH,
             sqpoll: None,
@@ -3318,6 +3324,14 @@ impl FuseOverUring {
     /// deliveries before registration extract at delivery (never hold).
     pub fn set_zc_write_hold_gate(&self, g: fused::ZcHoldGate) {
         let _ = self.zc_hold_gate.set(g);
+    }
+
+    /// Register the READ fast-dispatch pair (e2e perf audit R-2): the
+    /// filesystem's sync probe + the READ-handler mint. First set wins
+    /// (worker sessions all clone one primary); READs delivered before
+    /// registration ride the inbound queue.
+    pub fn set_read_fast_dispatcher(&self, d: fast_dispatch::ReadFastDispatch) {
+        let _ = self.read_fast_dispatch.set(d);
     }
 
     /// D14 write-side direct leg: DMA the request's HELD WRITE payload
@@ -4346,6 +4360,8 @@ fn queue_worker(
     // wakes ride the group's own coalescer+eventfd producer protocol.
     let fusion_on = zc_mode && fused::fusion_enabled();
     let fusion_max = fused::fusion_ceiling(payload_sz_cfg);
+    // R-2 READ fast-dispatch lever (default on; `0` = the A/B control).
+    let fast_dispatch_on = fast_dispatch::fast_dispatch_enabled();
     let mut fused_lane = fused::FusedLane::new(group_depth, Arc::clone(&wake_coalescer), wake_fd);
     {
         let (watch, rq) = fused_lane.watch_handle();
@@ -6440,6 +6456,118 @@ fn queue_worker(
                 pool.stats_replies.fetch_add(1, Ordering::Relaxed);
                 STATS_REPLIES.fetch_add(1, Ordering::Relaxed);
                 continue;
+            }
+
+            // READ fast-dispatch from the reap thread (e2e perf audit
+            // R-2, read board #2 — the `fast_dispatch` module doc): run
+            // the filesystem's SYNC try-only probe HERE, at the delivery
+            // CQE. Served ⇒ commit inline through the same lease-gated
+            // routing every reply takes (no channel, no wake, no lane —
+            // `queue_wait == dispatch_lag == 0`); Demote ⇒ mint the full
+            // READ handler and hand it straight to a handler lane (the
+            // inbound queue + session dispatch task skipped). READ
+            // deliveries carry no payload lease, so the §5.4 gate is a
+            // structural pass on this arm; a cold read's device work
+            // stays on the lanes exactly as before.
+            if fast_dispatch::fast_dispatch_candidate(
+                opcode,
+                fast_dispatch_on,
+                pool.read_fast_dispatch.get().is_some(),
+            ) {
+                let d = pool
+                    .read_fast_dispatch
+                    .get()
+                    .expect("candidate implies registered");
+                // fuse_read_in rides op_in: fh u64 ‖ offset u64 ‖ size u32
+                // ‖ read_flags u32 ‖ lock_owner u64 ‖ flags u32 (LE).
+                let op_in = &m.ents[ent_idx].hdr().op_in;
+                let nodeid =
+                    u64::from_le_bytes(m.ents[ent_idx].hdr().in_out[16..24].try_into().unwrap());
+                let r_fh = u64::from_le_bytes(op_in[0..8].try_into().unwrap());
+                let r_off = u64::from_le_bytes(op_in[8..16].try_into().unwrap());
+                let r_size = u32::from_le_bytes(op_in[16..20].try_into().unwrap());
+                let r_flags = u32::from_le_bytes(op_in[32..36].try_into().unwrap());
+                // The reply destination the probe may serve INTO: the
+                // bounce slot on zc sessions (the out-paged READ reply's
+                // staging area — `commit_ready_reply` elides the copy by
+                // pointer equality), else the ent's payload buffer
+                // (`apply_reply`'s elision).
+                let dest: Option<(u64, usize)> = match &zc_bounce {
+                    Some(zb) => zb.buf_ptr(ent_idx).map(|p| (p as u64, zb.stride())),
+                    None => m.ents[ent_idx].has_payload_buf().then(|| {
+                        (
+                            m.ents[ent_idx].payload_ptr as u64,
+                            m.ents[ent_idx].payload_len,
+                        )
+                    }),
+                };
+                // ONE clock read: the arrival stamp, the fast-dispatch
+                // instant and (on demote) the mint instant are the same
+                // point by construction.
+                let now_ns = crate::raw::read_phase::transport_now_ns();
+                match (d.probe)(nodeid, r_fh, r_off, r_size, r_flags, dest) {
+                    crate::raw::reply::FastReadProbe::Served(body) => {
+                        // The handler's clamp: never more than asked.
+                        let body = if body.len() > r_size as usize {
+                            body.slice(..r_size as usize)
+                        } else {
+                            body
+                        };
+                        let mut header = vec![0u8; 16];
+                        header[0..4].copy_from_slice(&((16 + body.len()) as u32).to_le_bytes());
+                        header[8..16].copy_from_slice(&unique.to_le_bytes());
+                        commit_ready_reply(
+                            &mut ring,
+                            &mut batch,
+                            &mut m.slots,
+                            &mut m.ents[ent_idx],
+                            &mut m.zc_pend[ent_idx],
+                            &mut m.bridge_deadlines,
+                            &pool.zc_bridge_pends,
+                            zc_bounce.as_ref(),
+                            zc_track,
+                            pool.slot_watch_cell(qid, ent_idx),
+                            qid,
+                            gent,
+                            CommitMsg {
+                                qid,
+                                ent_idx: ent_idx as u16,
+                                commit_id,
+                                header,
+                                reply_body: body,
+                                prefilled: None,
+                                retain: false,
+                            },
+                        )?;
+                        pool.stats_replies.fetch_add(1, Ordering::Relaxed);
+                        STATS_REPLIES.fetch_add(1, Ordering::Relaxed);
+                        fast_dispatch::record_served(
+                            unique,
+                            now_ns,
+                            crate::raw::read_phase::transport_now_ns(),
+                        );
+                        continue;
+                    }
+                    crate::raw::reply::FastReadProbe::Demote => {
+                        fast_dispatch::note_fast_dispatch_demote();
+                        let fut = (d.mint)(InboundUringReq {
+                            header_and_op,
+                            payload,
+                            unique,
+                            slot: ReplySlot::Ring {
+                                qid,
+                                ent_idx: ent_idx as u16,
+                                commit_id,
+                            },
+                            arrived_ns: now_ns,
+                        });
+                        // The handoff-economy venue: a fuse3-tpc lane on
+                        // this queue's node (round-robin within it),
+                        // never a runtime-handle spawn.
+                        crate::raw::session::tpc_dispatch_boxed(queue_node, fut);
+                        continue;
+                    }
+                }
             }
 
             // D14 write-side HYBRID delivery (the zcws-8 lesson): a zc

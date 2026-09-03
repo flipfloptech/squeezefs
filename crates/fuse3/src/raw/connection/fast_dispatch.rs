@@ -58,21 +58,20 @@ use crate::raw::abi::fuse_opcode;
 use crate::raw::read_phase::{read_transport_phase_record, transport_instant, TransportPhase};
 use crate::raw::reply::FastReadProbe;
 
+/// The sync READ probe's shape: `(nodeid, fh, offset, size, flags, dest)
+/// → probe` — `Filesystem::read_fast_probe` behind the filesystem's
+/// `Arc`. `dest` names this request's reply window (bounce slot on zc
+/// sessions) so a tier serve can land its bytes there directly.
+pub type ReadFastProbeFn =
+    dyn Fn(u64, u64, u64, u32, u32, Option<(u64, usize)>) -> FastReadProbe + Send + Sync + 'static;
+
 /// The registered fast-dispatch pair (the `FusedWriteDispatch` shape):
 /// `probe` is the filesystem's sync warm ladder for one READ delivery,
 /// `mint` builds the full READ handler future for a demoted delivery.
 pub struct ReadFastDispatch {
-    /// `(nodeid, fh, offset, size, flags, dest) → probe`, called on the
-    /// queue-worker thread once per READ delivery: SYNC, try-only,
-    /// non-blocking (`Filesystem::read_fast_probe`'s contract). `dest`
-    /// names this request's ent payload window (bounce slot on zc
-    /// sessions) so a tier serve can land its bytes there directly.
-    pub probe: Arc<
-        dyn Fn(u64, u64, u64, u32, u32, Option<(u64, usize)>) -> FastReadProbe
-            + Send
-            + Sync
-            + 'static,
-    >,
+    /// Called on the queue-worker thread once per READ delivery: SYNC,
+    /// try-only, non-blocking (`Filesystem::read_fast_probe`'s contract).
+    pub probe: Arc<ReadFastProbeFn>,
     /// The READ handler future for one delivery (parse + body — the
     /// dispatch loop's `handle_read` as one future).
     pub mint: Arc<dyn Fn(InboundUringReq) -> FusedFuture + Send + Sync + 'static>,

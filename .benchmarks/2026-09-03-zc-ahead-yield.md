@@ -261,8 +261,9 @@ that same price bought nothing (§3); here it buys +53–84 %.
    red, and with item 2 the law it should pin is "a stream whose depth
    leaves RTT exposed issues ahead fills regardless of transport class",
    which needs the concurrency-aware yield to be true. It is the right
-   red-first contract for that item and stays on the branch as its
-   input.
+   red-first contract for that item; the branch is RETIRED (deleted —
+   nothing stays dangling off `dev`) and the test + fix are preserved
+   verbatim in Appendix A below as the board item's input.
 4. **Design-doc line to keep true**: `docs/design-read-path.md`'s
    `read_dest_lease_bytes` row states the yield law ("`prefetch_issued`
    / `read_lane_fetches` ≈ 0 — the lane YIELDS to dest-leaseable
@@ -341,3 +342,230 @@ cancels`, `detached_task_panics`, `data_dma_fence_refusals`); R5 level 0,
 no red/yellow events; instrument + substrate + binary + profile + kernel
 + tier stated; the box returned unmounted with `/scratch/tmp/sqz-agent/`
 removed.
+
+## Appendix A. The retired branch's test + fix (`perf/zc-ahead-yield`, commits `a3c1920a` + `d6c06c10`, verbatim)
+
+Preserved here because the branch is deleted (everything either lands on
+`dev` or is retired with its evidence). The test is the red-first input for
+the concurrency-aware-yield board item (§7 item 2); the fix is the transport-
+class remedy this note measured and declined. Both apply cleanly to `dev`
+at `2479d424` with `git am`.
+
+````diff
+From a3c1920aabf90890eed315c38f2212768a5044c7 Mon Sep 17 00:00:00 2001
+From: flipfloptech <109311040+flipfloptech@users.noreply.github.com>
+Date: Tue, 1 Sep 2026 20:43:31 -0400
+Subject: [PATCH 1/2] test(read): zc streams must still issue ahead fills
+
+Dest-lease contract 2 stands the speculative fill machinery down
+so a demand window the request DMAs itself is not double-fetched.
+The field 1 MiB path is FUSE-zc, not dest-lease: applying that
+yield to zc_geometry left prefetch_issued/read_lane_fetches at 0
+on squeeze-test (38.4 GB/s at 10.5 ms clat). Pin both the zc-only
+shape and the field dest-lease+zc composition.
+---
+ tests/fuse_zc_serve_tests.rs | 129 +++++++++++++++++++++++++++++++++++
+ 1 file changed, 129 insertions(+)
+
+diff --git a/tests/fuse_zc_serve_tests.rs b/tests/fuse_zc_serve_tests.rs
+index 51ca76d1..1f0e47cf 100644
+--- a/tests/fuse_zc_serve_tests.rs
++++ b/tests/fuse_zc_serve_tests.rs
+@@ -447,3 +447,132 @@ async fn zc_fetch_failure_falls_through_to_the_ordinary_ladder() {
+         "the leg was genuinely attempted"
+     );
+ }
++
++/// Contract 5 — zc-geometry must NOT stand the ahead lane down.
++///
++/// Field 2026-09-02 (squeeze-test, cacheless, 24×8g, 1 MiB libaio
++/// qd16): 38.4 GB/s at 10.5 ms clat, `read_zc_serve_bytes` accounted
++/// every byte, `prefetch_issued`/`read_lane_fetches` stayed 0. The
++/// dest-lease yield stamp was being applied to zc-geometry streams
++/// (`pipeline_touch(..., dest_leaseable || zc_geometry)`), so a 1 MiB
++/// sequential zc serve — which DMAs only its own window — also
++/// forbade fetching the NEXT 4 MiB block into the hold. That leaves
++/// fabric RTT fully in the client's critical path (Little's law:
++/// 384 MiB / 10.5 ms ≈ 36.6 GiB/s). Dest-lease-only traffic (no zc
++/// handle) keeps the stream-wide yield — that 0-copy law is
++/// `tests/read_dest_lease_tests.rs` contract 2 and is unchanged.
++///
++/// The field composition is dest-lease hint AND a zc handle (kernel
++/// ent dest + sparse-slot pages). Both shapes are pinned: zc-only
++/// (this suite's injected handle, no dest) and dest-lease+zc.
++#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
++async fn zc_streaming_reads_still_issue_ahead_fetches() {
++    let h = make([0x5E; 16], "zc-serve-c").await;
++    // 24 × 1 MiB — past the classifier edge (request 4) so the stream
++    // is classified sequential; dest-lease phase A uses the same width.
++    const BLOCKS: u64 = 24;
++    let ino = create(&h, "zc_c.bin").await;
++    write_pattern(&h, ino, BLOCKS * BS).await;
++    make_cold(&h, ino).await;
++    let path = squeezefs::keys::inode_path(ino);
++
++    let pages = FakePages::new();
++    let lane0 = METRICS.read_lane_fetches.load(Ordering::Relaxed);
++    let pref0 = METRICS.prefetch_issued.load(Ordering::Relaxed);
++    let zc0 = METRICS.read_zc_serve_bytes.load(Ordering::Relaxed);
++
++    // Sequential 512 KiB windows with a zc handle and NO dest-lease
++    // dest — zc_geometry alone used to stamp the yield.
++    for b in 0..BLOCKS {
++        for w in 0..(BS / WIN) {
++            let off = b * BS + w * WIN;
++            let zc = pages.serve(false);
++            let (data, _b) =
++                h.fs.router
++                    .read_file_range_zero_copy_with_meta(
++                        &path,
++                        off,
++                        WIN as u32,
++                        None,
++                        ReadClassHint::default(),
++                        None,
++                        Some(&zc),
++                    )
++                    .await
++                    .unwrap_or_else(|e| panic!("zc window at {off}: {e:?}"));
++            // Cold first-touches of a block zc-serve (empty body);
++            // a hold/tier hit after an ahead fill returns bytes.
++            assert!(
++                data.is_empty() || data.len() == WIN as usize,
++                "window at {off}: empty zc body or hold/tier bytes, got {}",
++                data.len()
++            );
++        }
++    }
++
++    let lane = METRICS.read_lane_fetches.load(Ordering::Relaxed) - lane0;
++    let pref = METRICS.prefetch_issued.load(Ordering::Relaxed) - pref0;
++    let zc_bytes = METRICS.read_zc_serve_bytes.load(Ordering::Relaxed) - zc0;
++    assert!(
++        lane + pref > 0,
++        "zc-geometry sequential stream must issue ahead/R2 fills for \
++         blocks PAST the demand window (field 38.4 GB/s / 10.5 ms clat \
++         residual); got lane_fetches={lane} prefetch_issued={pref} \
++         zc_serve_bytes={zc_bytes}"
++    );
++    assert!(
++        zc_bytes > 0,
++        "demand windows still zc-serve (ahead must not steal the \
++         in-flight demand block): zc_serve_bytes={zc_bytes}"
++    );
++
++    // Field composition: dest-lease hint + zc handle. The FUSE handler
++    // sets dest_lease on kernel ent dests AND mints a zc handle; today
++    // that OR's into the yield. A fresh file so the classifier starts
++    // clean.
++    let ino_f = create(&h, "zc_field.bin").await;
++    write_pattern(&h, ino_f, BLOCKS * BS).await;
++    make_cold(&h, ino_f).await;
++    let path_f = squeezefs::keys::inode_path(ino_f);
++    let field_hint = ReadClassHint {
++        dest_lease: true,
++        ..Default::default()
++    };
++    let lane0 = METRICS.read_lane_fetches.load(Ordering::Relaxed);
++    let pref0 = METRICS.prefetch_issued.load(Ordering::Relaxed);
++    // 4 KiB-aligned dest so dest_leaseable geometry is true (the
++    // field's kernel ent payload).
++    let dest_layout = std::alloc::Layout::from_size_align(WIN as usize, 4096).expect("dest");
++    for b in 0..BLOCKS {
++        for w in 0..(BS / WIN) {
++            let off = b * BS + w * WIN;
++            // SAFETY: exclusive test dest, freed on this iteration.
++            let dest_ptr = unsafe { std::alloc::alloc(dest_layout) };
++            assert!(!dest_ptr.is_null());
++            // SAFETY: allocation outlives the read; cap == WIN.
++            let dest = unsafe { squeezefs::routing::ReadDest::new(dest_ptr as u64, WIN as usize) };
++            let zc = pages.serve(false);
++            let res =
++                h.fs.router
++                    .read_file_range_zero_copy_with_meta(
++                        &path_f,
++                        off,
++                        WIN as u32,
++                        Some(dest),
++                        field_hint,
++                        None,
++                        Some(&zc),
++                    )
++                    .await;
++            unsafe { std::alloc::dealloc(dest_ptr, dest_layout) };
++            res.unwrap_or_else(|e| panic!("field-shape window at {off}: {e:?}"));
++        }
++    }
++    let lane = METRICS.read_lane_fetches.load(Ordering::Relaxed) - lane0;
++    let pref = METRICS.prefetch_issued.load(Ordering::Relaxed) - pref0;
++    assert!(
++        lane + pref > 0,
++        "field composition (dest_lease + zc handle) must still issue \
++         ahead fills; got lane_fetches={lane} prefetch_issued={pref}"
++    );
++}
+-- 
+2.55.0
+
+
+From d6c06c10f502c5e2c50b75f9b94e9bfefb4c1811 Mon Sep 17 00:00:00 2001
+From: flipfloptech <109311040+flipfloptech@users.noreply.github.com>
+Date: Tue, 1 Sep 2026 20:43:38 -0400
+Subject: [PATCH 2/2] perf(read): do not yield the ahead lane on zc-geometry
+ streams
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+pipeline_touch was passed dest_leaseable || zc_geometry, so a
+1 MiB FUSE-zc serve stamped the dest-lease 2 s stream-wide yield
+and forbade fetching the next block into the hold. Demand zc
+only DMAs its own window; consumed_edge already excludes that
+block from issue. Dest-lease-only traffic (no zc handle) keeps
+the yield — dest-lease contract 2 is unchanged.
+---
+ src/routing.rs | 20 +++++++++++++++-----
+ 1 file changed, 15 insertions(+), 5 deletions(-)
+
+diff --git a/src/routing.rs b/src/routing.rs
+index d6f67bd2..7d657c48 100644
+--- a/src/routing.rs
++++ b/src/routing.rs
+@@ -16357,10 +16357,20 @@ impl DataRouter {
+                         // the windowed top-up. Ring-originated requests
+                         // fed the lanes at the sink (`lane_pre_fed`) —
+                         // observing them again would declassify (§5.3).
+-                        // zc-eligible traffic yields the speculative fill
+-                        // machinery exactly like dest-leaseable traffic —
+-                        // same law, same stamp (a pooled fill for a window
+-                        // the demand read DMAs itself is a double-fetch).
++                        // Dest-lease-only traffic still yields the
++                        // speculative fill machinery (a pooled fill for
++                        // a window the demand read DMAs itself is a
++                        // double-fetch — dest-lease contract 2). zc
++                        // geometry does NOT: the demand zc fetch is the
++                        // request's own 1 MiB (or whole-block) window,
++                        // and standing the ahead lane down for the
++                        // whole stream leaves fabric RTT unhidden
++                        // (squeeze-test 2026-09-02: 38.4 GB/s / 10.5 ms
++                        // clat, prefetch_issued = 0). `consumed_edge`
++                        // already excludes the demand block from issue;
++                        // ahead of that edge populates the hold for the
++                        // next block. Field composition is dest-lease
++                        // hint AND a zc handle — zc wins the yield.
+                         if !device_true && !hint.lane_pre_fed {
+                             let first_key = block_keys.first().and_then(|(_, k)| k.as_deref());
+                             let will_wait = first_key.is_some_and(|k| {
+@@ -16377,7 +16387,7 @@ impl DataRouter {
+                                 will_wait,
+                                 first_key,
+                                 true,
+-                                dest_leaseable || zc_geometry,
++                                dest_leaseable && !zc_geometry,
+                             );
+                         }
+                         if let Some((_, b_key_opt)) = block_keys.first() {
+-- 
+2.55.0
+
+````

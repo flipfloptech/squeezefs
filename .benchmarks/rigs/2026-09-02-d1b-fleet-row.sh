@@ -63,8 +63,12 @@ run_row() { # leg-label
     mapfile -t cws < <(cowriter_idxs)
     [ "${#cws[@]}" -ge 1 ] || die "no co-writer members in $MEMBERS"
     log "$leg: ${#cws[@]} co-writers x $STREAMS streams x ${MB} MiB (dd bs=1M conv=fsync, /dev/zero); loadavg=$(cut -d' ' -f1-3 /proc/loadavg)"
+    # Every member mounts the SAME filesystem: per-member directories, or
+    # eight co-writers create the same 24 names in one directory and the
+    # row measures S10 intent EEXIST refusals + custody conflicts instead
+    # (the s9-fanout row's per-member naming, for the same reason).
     for idx in "${cws[@]}"; do
-        mkdir -p "$(mnt_of "$idx")/d1b"
+        mkdir -p "$(mnt_of "$idx")/d1b-m$idx"
     done
     snap 0 "$rowdir" p0
     for idx in "${cws[@]}"; do snap "$idx" "$rowdir" p0; done
@@ -74,7 +78,7 @@ run_row() { # leg-label
             local st=() j rc=0 a b
             a="$(date +%s.%N)"
             for ((j = 0; j < STREAMS; j++)); do
-                dd if=/dev/zero of="$(mnt_of "$idx")/d1b/s$j.dat" bs=1M count="$MB" \
+                dd if=/dev/zero of="$(mnt_of "$idx")/d1b-m$idx/s$j.dat" bs=1M count="$MB" \
                     conv=fsync status=none 2>"$rowdir/m$idx-s$j.err" &
                 st+=("$!")
             done
@@ -157,7 +161,7 @@ if bad:
     sys.exit(1)
 print("row VALID (closure within instrument skew, tripwires flat)")
 PY
-    for idx in "${cws[@]}"; do rm -rf "$(mnt_of "$idx")/d1b"; done
+    for idx in "${cws[@]}"; do rm -rf "$(mnt_of "$idx")/d1b-m$idx"; done
 }
 
 if [ "$ROW_ONLY" = "1" ]; then

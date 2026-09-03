@@ -119,6 +119,13 @@ pub enum Stage {
     Deposited = 37,
     /// fill_total end.
     FillDone = 38,
+    /// zc bridge (`zc_bridge_phase_ns`): the handler's fetch message
+    /// sent to the queue worker (msg_hop's start / total's start).
+    BridgeSent = 39,
+    /// zc bridge: the queue worker took the message and built the SQE
+    /// (msg_hop end; `dev_submit` is the enter that carries it,
+    /// `dev_complete` its CQE pop, `block_fetched` the handler's resume).
+    BridgeTaken = 40,
 
     // -- write pipeline (`write_pipeline_phase_ns` ends) ---------------
     /// admit_wait end (the pre-ACK admission).
@@ -249,6 +256,8 @@ impl Stage {
         Stage::Admitted,
         Stage::Deposited,
         Stage::FillDone,
+        Stage::BridgeSent,
+        Stage::BridgeTaken,
         Stage::WriteAdmitted,
         Stage::WriteDetached,
         Stage::WriteLocked,
@@ -323,6 +332,8 @@ impl Stage {
             Stage::Admitted => "admitted",
             Stage::Deposited => "deposited",
             Stage::FillDone => "fill_done",
+            Stage::BridgeSent => "bridge_sent",
+            Stage::BridgeTaken => "bridge_taken",
             Stage::WriteAdmitted => "write_admitted",
             Stage::WriteDetached => "write_detached",
             Stage::WriteLocked => "write_locked",

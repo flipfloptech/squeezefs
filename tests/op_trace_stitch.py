@@ -63,6 +63,14 @@ PHASE_SPANS = {
     ("read_serve_phase_ns", "classify_probe"): ("keys_resolved", "tier_probed", False),
     ("read_serve_phase_ns", "total"): ("handler_entry", "read_return", False),
     ("read_fill_phase_ns", "dev_service"): ("dev_submit", "dev_complete", True),
+    # The zc direct leg (R-3): the kern rand-4k `block_fetch` split. The
+    # `wake_hop`/`total` ends are the handler's resume clock read a few
+    # hundred ns before `block_fetched`'s, hence `~`.
+    ("zc_bridge_phase_ns", "msg_hop"): ("bridge_sent", "bridge_taken", True),
+    ("zc_bridge_phase_ns", "sq_wait"): ("bridge_taken", "dev_submit", True),
+    ("zc_bridge_phase_ns", "device_cq"): ("dev_submit", "dev_complete", True),
+    ("zc_bridge_phase_ns", "wake_hop"): ("dev_complete", "block_fetched", False),
+    ("zc_bridge_phase_ns", "total"): ("bridge_sent", "block_fetched", False),
     ("write_pipeline_phase_ns", "dev_service"): ("dev_submit", "dev_complete", True),
     ("write_pipeline_phase_ns", "detach_lag"): ("write_admitted", "write_detached", False),
     ("meta_txpass_phase_ns", "tx_queue_wait"): ("meta_enqueue", "pass_begin", True),
@@ -85,6 +93,7 @@ FAMILY_CLASS = {
     "read_transport_phase_ns": "read",
     "read_serve_phase_ns": "read",
     "read_fill_phase_ns": "read",
+    "zc_bridge_phase_ns": "read",
     "write_transport_phase_ns": "write",
     "write_pipeline_phase_ns": "write",
 }

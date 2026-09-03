@@ -1307,3 +1307,133 @@ async fn stats_inode_carries_the_fast_dispatch_engagement_pair() {
         "demotes reads the fuse3 static"
     );
 }
+
+// ---------------------------------------------------------------------------
+// R-3 — the zc direct-leg bridge decomposition (`zc_bridge_phase_ns`)
+// ---------------------------------------------------------------------------
+
+/// The 4 KiB-random attribution pass measured the kern READ's
+/// `keys_resolved → block_fetched` at 166 µs with the device at 40 —
+/// ≈ 126 µs of bridge software with no per-op split (the note's
+/// instrument gap #2). The family that splits it: five phases in the
+/// documented order, exact-sum, folding across the worker (three phases)
+/// and the lane (two) shards, rendered through the one histogram shape
+/// on the stats inode; and the two stages that anchor its op-trace
+/// spans (`bridge_sent`, `bridge_taken`) sit in the funnel block of the
+/// vocabulary, between `fill_done` and the write pipeline.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn zc_bridge_family_exports_five_exact_phases_and_its_stages_are_in_the_table() {
+    use fuse3::{zc_bridge_phase_record_ns, zc_bridge_phase_snapshot, ZcBridgePhase};
+    use squeezefs::op_trace::Stage;
+    let _g = serial().await;
+
+    let names: Vec<&str> = zc_bridge_phase_snapshot().iter().map(|p| p.name).collect();
+    assert_eq!(
+        names,
+        ["msg_hop", "sq_wait", "device_cq", "wake_hop", "total"],
+        "phase order is the export's contract"
+    );
+
+    // Worker-side phases from N "worker" threads, lane-side phases from
+    // M "lane" threads: the fold is exact to the ns per phase.
+    const WORKERS: u64 = 3;
+    const LANES: u64 = 2;
+    const PER: u64 = 100;
+    let before = zc_bridge_phase_snapshot();
+    let mut hs = Vec::new();
+    for t in 0..WORKERS {
+        hs.push(std::thread::spawn(move || {
+            for i in 0..PER {
+                zc_bridge_phase_record_ns(ZcBridgePhase::MsgHop, 5_000 + t * 100 + i);
+                zc_bridge_phase_record_ns(ZcBridgePhase::SqWait, 2_000 + t * 100 + i);
+                zc_bridge_phase_record_ns(ZcBridgePhase::DeviceCq, 40_000 + t * 100 + i);
+            }
+        }));
+    }
+    for t in 0..LANES {
+        hs.push(std::thread::spawn(move || {
+            for i in 0..PER {
+                zc_bridge_phase_record_ns(ZcBridgePhase::WakeHop, 9_000 + t * 100 + i);
+                zc_bridge_phase_record_ns(ZcBridgePhase::Total, 60_000 + t * 100 + i);
+            }
+        }));
+    }
+    for h in hs {
+        h.join().unwrap();
+    }
+    let after = zc_bridge_phase_snapshot();
+    let want = |threads: u64, base: u64| -> (u64, u64) {
+        let sum: u64 = (0..threads)
+            .flat_map(|t| (0..PER).map(move |i| base + t * 100 + i))
+            .sum();
+        (threads * PER, sum)
+    };
+    for (phase, threads, base) in [
+        (ZcBridgePhase::MsgHop, WORKERS, 5_000),
+        (ZcBridgePhase::SqWait, WORKERS, 2_000),
+        (ZcBridgePhase::DeviceCq, WORKERS, 40_000),
+        (ZcBridgePhase::WakeHop, LANES, 9_000),
+        (ZcBridgePhase::Total, LANES, 60_000),
+    ] {
+        let pi = phase as usize;
+        let (n, sum) = want(threads, base);
+        assert_eq!(after[pi].count - before[pi].count, n, "{:?} count", phase);
+        assert_eq!(
+            after[pi].sum_ns - before[pi].sum_ns,
+            sum,
+            "{:?} sum_ns",
+            phase
+        );
+        let bucket_delta: u64 = after[pi]
+            .buckets
+            .iter()
+            .zip(before[pi].buckets.iter())
+            .map(|(a, b)| a - b)
+            .sum();
+        assert_eq!(bucket_delta, n, "{:?}: Σ buckets ≡ count", phase);
+    }
+
+    // The daemon renders the family through the one histogram shape,
+    // and the stats inode carries it ungated.
+    let json = squeezefs::fuse_client::zc_bridge_phase_json();
+    for (pi, name) in names.iter().enumerate() {
+        let h = &json[*name];
+        for k in HIST_KEYS {
+            assert!(h.get(k).is_some(), "zc_bridge_phase_ns.{name} lacks {k}");
+        }
+        assert_eq!(hist_count(h), after[pi].count);
+        assert_eq!(hist_sum_ns(h), after[pi].sum_ns);
+    }
+    let h = make([0x53; 16], "audit_r3_bridge").await;
+    let reply =
+        h.fs.read(h.req, squeezefs::fuse_client::STATS_INODE, 0, 0, 1 << 22, 0)
+            .await
+            .expect("read stats inode");
+    let stats: serde_json::Value = serde_json::from_slice(&reply.data).expect("stats JSON");
+    let fam = &stats["metrics"]["zc_bridge_phase_ns"];
+    assert!(fam.is_object(), "zc_bridge_phase_ns rides the stats inode");
+    for name in &names {
+        assert!(
+            hist_count(&fam[*name]) >= after[0].count.min(after[3].count),
+            "stats inode carries {name} with its exact words"
+        );
+    }
+
+    // The op-trace anchors: both stages exist, name-stable, and sit in
+    // the device-funnel block (after `fill_done`, before the write
+    // pipeline's first stage) so a chain sorts them beside dev_submit /
+    // dev_complete.
+    assert_eq!(Stage::BridgeSent.name(), "bridge_sent");
+    assert_eq!(Stage::BridgeTaken.name(), "bridge_taken");
+    assert!((Stage::FillDone as u16) < (Stage::BridgeSent as u16));
+    assert!((Stage::BridgeSent as u16) < (Stage::BridgeTaken as u16));
+    assert!((Stage::BridgeTaken as u16) < (Stage::WriteAdmitted as u16));
+    assert_eq!(
+        Stage::from_u16(Stage::BridgeSent as u16),
+        Some(Stage::BridgeSent)
+    );
+    assert_eq!(
+        Stage::from_u16(Stage::BridgeTaken as u16),
+        Some(Stage::BridgeTaken)
+    );
+}

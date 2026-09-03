@@ -37,6 +37,10 @@ RUNUSER="${SUDO_USER:-$(id -un)}"
 SUITES=(
   fuse_zc_write_fusion_tests
   zc_bridge_cqe_wedge_tests
+  # The zc direct-leg bridge decomposition (R-3): the per-op
+  # bridge_sent → … → block_fetched chain + the exact-sum family on
+  # the real READ_FIXED(device → slot) bridge.
+  zc_bridge_phase_tests
   bench_tests
   # Live WERO-semantics leg (fix/wero-rtype): root + kernel nvmet +
   # nvme-cli — the sqz box has all three, so REQUIRE_CAPABILITY turns

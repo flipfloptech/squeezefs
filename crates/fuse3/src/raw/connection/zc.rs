@@ -255,6 +255,16 @@ impl Drop for ZcBounce {
     }
 }
 
+/// A handler bridge's resolution as the worker hands it back: the raw
+/// ring result plus the transport-epoch instant the worker popped the
+/// CQE (the `zc_bridge_phase_ns` `wake_hop` anchor — the handler reads
+/// its resume clock against it; no second clock read on the worker).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct BridgeCqe {
+    pub(crate) res: i32,
+    pub(crate) popped_ns: u64,
+}
+
 /// One ent's parked zc work at the queue worker (the third pending
 /// population beside lease-parked commits and REGISTER backoffs; a slot
 /// carries at most one of these at a time because an ent serves one
@@ -273,10 +283,13 @@ pub(crate) enum ZcPend {
     /// A handler-initiated device fetch (`READ_FIXED(device → slot)`,
     /// the direct read leg): the handler task parks on the oneshot; the
     /// CQE result is forwarded verbatim (`res` — negative errno, or
-    /// bytes read). The slot's reply commit comes LATER via the normal
-    /// path.
+    /// bytes read) with the worker's pop stamp. The slot's reply commit
+    /// comes LATER via the normal path. `trace_id` is the requesting
+    /// op's trace id (0 = untraced) — the `dev_submit`/`dev_complete`
+    /// stamps on this leg ride it.
     HandlerFetch {
-        done: crate::sqz_channel::oneshot::Sender<i32>,
+        done: crate::sqz_channel::oneshot::Sender<BridgeCqe>,
+        trace_id: u64,
     },
     /// A handler-initiated device STORE (`WRITE_FIXED(device fd ←
     /// slot)`, the D14 write-side direct leg): the WRITE payload's
@@ -286,7 +299,7 @@ pub(crate) enum ZcPend {
     /// AT THE CONSUMING SITE (the root patch path), never here, so a
     /// caller-side validation failure can never leave a phantom count.
     HandlerStore {
-        done: crate::sqz_channel::oneshot::Sender<i32>,
+        done: crate::sqz_channel::oneshot::Sender<BridgeCqe>,
     },
     /// A handler-requested LAZY payload extraction (`WRITE_FIXED(slot →
     /// memfd)`, dispatch-before-extraction): the delivered request was
@@ -377,6 +390,10 @@ fn hold_streaming() -> bool {
 pub(crate) struct BridgeDeadlines {
     /// Issue stamp (transport-epoch ns); 0 = no pend.
     born: Vec<u64>,
+    /// The `io_uring_enter` that carried the pend's SQE (transport-epoch
+    /// ns; 0 = pushed, not yet flushed) — `zc_bridge_phase_ns`'s
+    /// `sq_wait` end / `device_cq` start.
+    submitted: Vec<u64>,
     /// Cancel-once latch, reset by [`Self::clear`]/[`Self::stamp`].
     cancelled: Vec<bool>,
     outstanding: usize,
@@ -386,6 +403,7 @@ impl BridgeDeadlines {
     pub(crate) fn new(depth: usize) -> Self {
         Self {
             born: vec![0; depth],
+            submitted: vec![0; depth],
             cancelled: vec![false; depth],
             outstanding: 0,
         }
@@ -400,11 +418,28 @@ impl BridgeDeadlines {
                 self.outstanding += 1;
             }
             *b = now_ns.max(1);
+            self.submitted[ent] = 0;
             self.cancelled[ent] = false;
             fresh
         } else {
             false
         }
+    }
+
+    /// Record the enter that carried `ent`'s SQE (first flush after the
+    /// push wins; a re-stamp resets it).
+    pub(crate) fn note_submitted(&mut self, ent: usize, now_ns: u64) {
+        if let Some(s) = self.submitted.get_mut(ent) {
+            if *s == 0 {
+                *s = now_ns.max(1);
+            }
+        }
+    }
+
+    /// `ent`'s carrying-enter stamp (transport-epoch ns; 0 = not yet
+    /// flushed or no pend).
+    pub(crate) fn submitted_ns(&self, ent: usize) -> u64 {
+        self.submitted.get(ent).copied().unwrap_or(0)
     }
 
     /// Record `ent`'s bridge op resolved (any CQE — success, error, or
@@ -417,6 +452,7 @@ impl BridgeDeadlines {
                 self.outstanding -= 1;
             }
             *b = 0;
+            self.submitted[ent] = 0;
             self.cancelled[ent] = false;
             was
         } else {

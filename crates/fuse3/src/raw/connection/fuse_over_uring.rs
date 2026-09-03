@@ -212,7 +212,13 @@ pub(crate) struct ZcFetchMsg {
     fd: RawFd,
     off: u64,
     len: u32,
-    done: crate::sqz_channel::oneshot::Sender<i32>,
+    done: crate::sqz_channel::oneshot::Sender<zc::BridgeCqe>,
+    /// The requesting op's trace id (0 = untraced) — the worker's
+    /// `bridge_taken`/`dev_submit`/`dev_complete` stamps ride it.
+    trace_id: u64,
+    /// The handler's send instant (transport-epoch ns) —
+    /// `zc_bridge_phase_ns.msg_hop`'s start.
+    sent_ns: u64,
 }
 
 /// A handler-initiated zc device STORE (the D14 write-side direct leg):
@@ -225,7 +231,7 @@ pub(crate) struct ZcStoreMsg {
     ent_idx: u16,
     fd: RawFd,
     dev_off: u64,
-    done: crate::sqz_channel::oneshot::Sender<i32>,
+    done: crate::sqz_channel::oneshot::Sender<zc::BridgeCqe>,
 }
 
 /// A handler-requested LAZY WRITE-payload extraction
@@ -1736,9 +1742,72 @@ struct SubmitBatch {
     /// `Ent::last_opcode`).
     commit_reads: bool,
     commit_writes: bool,
+    /// Handler FETCH bridges pushed and not yet settled into their
+    /// member's deadline ledger (`zc_bridge_phase_ns`, R-3): the flush
+    /// that carries them stamps `submitted_ns`; the loop settles them
+    /// where it owns the members. Grows to the group's depth once, then
+    /// `retain`s in place — no steady-state allocation.
+    bridge_pending: Vec<BridgePending>,
+}
+
+/// One pushed handler FETCH awaiting its carrying enter (see
+/// [`SubmitBatch::bridge_pending`]).
+struct BridgePending {
+    gent: usize,
+    trace_id: u64,
+    /// Message taken / SQE built (transport-epoch ns).
+    taken_ns: u64,
+    /// The carrying enter (0 = not yet flushed).
+    submitted_ns: u64,
 }
 
 impl SubmitBatch {
+    /// Note a handler FETCH bridge SQE pushed at `taken_ns` for `gent`:
+    /// its `sq_wait` runs until the next flush.
+    fn note_bridge_pushed(&mut self, gent: usize, trace_id: u64, taken_ns: u64) {
+        self.bridge_pending.push(BridgePending {
+            gent,
+            trace_id,
+            taken_ns,
+            submitted_ns: 0,
+        });
+    }
+
+    /// Every not-yet-flushed bridge push is carried by the enter about
+    /// to happen: close its `sq_wait`, stamp `dev_submit`. ONE clock
+    /// read per flush that carries a bridge, none otherwise.
+    fn note_bridge_flushed(&mut self) {
+        if self.bridge_pending.iter().all(|p| p.submitted_ns != 0) {
+            return;
+        }
+        let now = crate::raw::read_phase::transport_now_ns().max(1);
+        let at = crate::raw::read_phase::transport_instant(now);
+        for p in self
+            .bridge_pending
+            .iter_mut()
+            .filter(|p| p.submitted_ns == 0)
+        {
+            p.submitted_ns = now;
+            crate::raw::read_phase::zc_bridge_phase_record_ns(
+                crate::raw::read_phase::ZcBridgePhase::SqWait,
+                now.saturating_sub(p.taken_ns),
+            );
+            crate::op_trace::stamp(p.trace_id, crate::op_trace::Stage::DevSubmit, at);
+        }
+    }
+
+    /// Hand every flushed bridge push's `(gent, submitted_ns)` to the
+    /// member ledgers through `settle` (the CQE pop reads it there for
+    /// `device_cq`); unflushed pushes stay for the next flush.
+    fn settle_bridge_submits(&mut self, mut settle: impl FnMut(usize, u64)) {
+        self.bridge_pending.retain(|p| {
+            if p.submitted_ns == 0 {
+                return true;
+            }
+            settle(p.gent, p.submitted_ns);
+            false
+        });
+    }
     /// Attribute a pushed commit to its op class for the `commit_flush`
     /// phase (READ/WRITE only — the families' scope).
     fn note_commit_opcode(&mut self, opcode: u32) {
@@ -1760,6 +1829,7 @@ impl SubmitBatch {
             TRANSPORT_COMMIT_FLUSHES.fetch_add(1, Ordering::Relaxed);
             TRANSPORT_COMMITS_SUBMITTED.fetch_add(self.commits as u64, Ordering::Relaxed);
         }
+        self.note_bridge_flushed();
         let classes = (self.commit_reads, self.commit_writes);
         self.pending = 0;
         self.commits = 0;
@@ -3268,6 +3338,16 @@ impl FuseOverUring {
             .get(qid as usize)
             .and_then(|&gi| self.groups.get(gi as usize))
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "bad qid"))?;
+        // `zc_bridge_phase_ns` (R-3): ONE clock read anchors `msg_hop`
+        // and `total` and stamps the op-trace `bridge_sent`; the worker's
+        // three stamps ride the message's trace id.
+        let trace_id = crate::op_trace::current_op();
+        let sent_ns = crate::raw::read_phase::transport_now_ns();
+        crate::op_trace::stamp(
+            trace_id,
+            crate::op_trace::Stage::BridgeSent,
+            crate::raw::read_phase::transport_instant(sent_ns),
+        );
         g.commit_tx
             .send(WorkerMsg::ZcFetch(ZcFetchMsg {
                 qid,
@@ -3276,6 +3356,8 @@ impl FuseOverUring {
                 off,
                 len,
                 done: done_tx,
+                trace_id,
+                sent_ns,
             }))
             .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "uring worker closed"))?;
         if g.wake_coalescer.arm() {
@@ -3286,13 +3368,27 @@ impl FuseOverUring {
         } else {
             TRANSPORT_WAKES_ELIDED.fetch_add(1, Ordering::Relaxed);
         }
-        let res = done_rx.await.map_err(|_| {
+        let cqe = done_rx.await.map_err(|_| {
             io::Error::new(io::ErrorKind::BrokenPipe, "zc fetch dropped (teardown)")
         })?;
-        if res < 0 {
-            return Err(io::Error::from_raw_os_error(-res));
+        // The handler's resume: `wake_hop` against the worker's pop
+        // stamp, `total` against the send. A refusal answered without a
+        // ring pop (`popped_ns == 0`) records total only.
+        let now = crate::raw::read_phase::transport_now_ns();
+        if cqe.popped_ns != 0 {
+            crate::raw::read_phase::zc_bridge_phase_record_ns(
+                crate::raw::read_phase::ZcBridgePhase::WakeHop,
+                now.saturating_sub(cqe.popped_ns),
+            );
         }
-        Ok(res as u32)
+        crate::raw::read_phase::zc_bridge_phase_record_ns(
+            crate::raw::read_phase::ZcBridgePhase::Total,
+            now.saturating_sub(sent_ns),
+        );
+        if cqe.res < 0 {
+            return Err(io::Error::from_raw_os_error(-cqe.res));
+        }
+        Ok(cqe.res as u32)
     }
 
     /// D14 write-side: the HELD payload length of `slot`'s request
@@ -3387,13 +3483,13 @@ impl FuseOverUring {
         } else {
             TRANSPORT_WAKES_ELIDED.fetch_add(1, Ordering::Relaxed);
         }
-        let res = done_rx.await.map_err(|_| {
+        let cqe = done_rx.await.map_err(|_| {
             io::Error::new(io::ErrorKind::BrokenPipe, "zc store dropped (teardown)")
         })?;
-        if res < 0 {
-            return Err(io::Error::from_raw_os_error(-res));
+        if cqe.res < 0 {
+            return Err(io::Error::from_raw_os_error(-cqe.res));
         }
-        Ok(res as u32)
+        Ok(cqe.res as u32)
     }
 
     /// D14 write-side lazy extraction (the ineligible-shape vehicle):
@@ -4673,10 +4769,12 @@ fn queue_worker(
         slots: &mut SlotTable,
         ent: &mut Ent,
         zc_pend_slot: &mut Option<ZcPend>,
+        deadlines: &zc::BridgeDeadlines,
         watch: Option<&SlotWatch>,
         qid: u16,
         gent: usize,
         res: i32,
+        popped_ns: u64,
     ) -> io::Result<Option<PendDone>> {
         let idx = gent % slots.len();
         match zc_pend_slot.take() {
@@ -4687,14 +4785,19 @@ fn queue_worker(
                 );
                 Ok(None)
             }
-            Some(ZcPend::HandlerFetch { done }) | Some(ZcPend::HandlerStore { done }) => {
+            Some(ZcPend::HandlerFetch { done, trace_id }) => {
                 // A dropped receiver = the handler gave up (teardown);
-                // nothing owed here — its reply path owns the slot. The
-                // store's engagement ledger is counted at the CONSUMING
-                // site (the root patch path) after ITS validation, so a
-                // caller-side length refusal never leaves a phantom
-                // count.
-                let _ = done.send(res);
+                // nothing owed here — its reply path owns the slot.
+                note_handler_fetch_popped(deadlines, idx, trace_id, popped_ns);
+                let _ = done.send(zc::BridgeCqe { res, popped_ns });
+                Ok(None)
+            }
+            Some(ZcPend::HandlerStore { done }) => {
+                // The store's engagement ledger is counted at the
+                // CONSUMING site (the root patch path) after ITS
+                // validation, so a caller-side length refusal never
+                // leaves a phantom count.
+                let _ = done.send(zc::BridgeCqe { res, popped_ns });
                 Ok(None)
             }
             Some(ZcPend::BounceFetch {
@@ -5023,6 +5126,11 @@ fn queue_worker(
                             fused_more = false;
                             continue;
                         }
+                        batch.settle_bridge_submits(|gent, ns| {
+                            members[gent / depth]
+                                .bridge_deadlines
+                                .note_submitted(gent % depth, ns);
+                        });
                     }
                     // Mid-pass reap: resolve finished HANDLER bridges NOW
                     // (raw `done.send` + deadline clear — byte-identical
@@ -5048,6 +5156,13 @@ fn queue_worker(
                         // counted HERE, where they surfaced, not at the
                         // pass bottom that consumes them).
                         cadence.cqes_surfaced(cq.len());
+                        // ONE pop stamp per reap (the R-5 clock economy):
+                        // every bridge CQE of this drain shares it.
+                        let popped_ns = if cq.is_empty() {
+                            0
+                        } else {
+                            crate::raw::read_phase::transport_now_ns()
+                        };
                         for c in cq {
                             let (user_data, res, flags) = (c.user_data(), c.result(), c.flags());
                             let Some((op, gent)) = decode_user_data(user_data) else {
@@ -5084,20 +5199,34 @@ fn queue_worker(
                                 continue;
                             }
                             match m.zc_pend[ent_idx].take() {
-                                Some(ZcPend::HandlerFetch { done })
-                                | Some(ZcPend::HandlerStore { done }) => {
+                                Some(ZcPend::HandlerFetch { done, trace_id }) => {
                                     // Fused timeline: issue → resolution,
                                     // mid-pass venue (the funnel fix's
                                     // engagement instrument).
                                     let born = m.bridge_deadlines.born_ns(ent_idx);
                                     if born != 0 {
                                         crate::raw::read_phase::note_fused_bridge_resolved(
-                                            crate::raw::read_phase::transport_now_ns()
-                                                .saturating_sub(born),
+                                            popped_ns.saturating_sub(born),
                                             true,
                                         );
                                     }
-                                    let _ = done.send(res);
+                                    note_handler_fetch_popped(
+                                        &m.bridge_deadlines,
+                                        ent_idx,
+                                        trace_id,
+                                        popped_ns,
+                                    );
+                                    let _ = done.send(zc::BridgeCqe { res, popped_ns });
+                                }
+                                Some(ZcPend::HandlerStore { done }) => {
+                                    let born = m.bridge_deadlines.born_ns(ent_idx);
+                                    if born != 0 {
+                                        crate::raw::read_phase::note_fused_bridge_resolved(
+                                            popped_ns.saturating_sub(born),
+                                            true,
+                                        );
+                                    }
+                                    let _ = done.send(zc::BridgeCqe { res, popped_ns });
                                 }
                                 other => {
                                     // Checked two branches up; keep the
@@ -5155,12 +5284,16 @@ fn queue_worker(
                     // answer the oneshot with a negative errno (the
                     // handler falls back to the normal serve ladder).
                     let idx = f.ent_idx as usize;
+                    let refused = |errno: i32| zc::BridgeCqe {
+                        res: -errno,
+                        popped_ns: 0,
+                    };
                     let Some(mi) = member_of_qid(f.qid).filter(|_| idx < depth) else {
                         warn!(
                             "fuse-over-uring qids={qids:?}: zc fetch for bad slot qid={} ent={idx}",
                             f.qid
                         );
-                        let _ = f.done.send(-libc::EINVAL);
+                        let _ = f.done.send(refused(libc::EINVAL));
                         continue;
                     };
                     let m = &mut members[mi];
@@ -5170,7 +5303,7 @@ fn queue_worker(
                              pending bridge — refusing",
                             f.qid
                         );
-                        let _ = f.done.send(-libc::EBUSY);
+                        let _ = f.done.send(refused(libc::EBUSY));
                         continue;
                     }
                     let gent = gent_of(mi, idx);
@@ -5187,10 +5320,26 @@ fn queue_worker(
                     );
                     match push_fetch_batched(&mut ring, &mut batch, entry) {
                         Ok(()) => {
-                            m.zc_pend[idx] = Some(ZcPend::HandlerFetch { done: f.done });
-                            if m.bridge_deadlines
-                                .stamp(idx, crate::raw::read_phase::transport_now_ns())
-                            {
+                            // `zc_bridge_phase_ns`: ONE clock read closes
+                            // `msg_hop`, anchors `sq_wait` (the batch
+                            // entry), stamps `bridge_taken` and the
+                            // deadline ledger's issue instant.
+                            let taken_ns = crate::raw::read_phase::transport_now_ns();
+                            crate::raw::read_phase::zc_bridge_phase_record_ns(
+                                crate::raw::read_phase::ZcBridgePhase::MsgHop,
+                                taken_ns.saturating_sub(f.sent_ns),
+                            );
+                            crate::op_trace::stamp(
+                                f.trace_id,
+                                crate::op_trace::Stage::BridgeTaken,
+                                crate::raw::read_phase::transport_instant(taken_ns),
+                            );
+                            batch.note_bridge_pushed(gent, f.trace_id, taken_ns);
+                            m.zc_pend[idx] = Some(ZcPend::HandlerFetch {
+                                done: f.done,
+                                trace_id: f.trace_id,
+                            });
+                            if m.bridge_deadlines.stamp(idx, taken_ns) {
                                 pool.zc_bridge_pends.fetch_add(1, Ordering::Relaxed);
                             }
                         }
@@ -5199,7 +5348,7 @@ fn queue_worker(
                                 "fuse-over-uring qid={} ent={idx}: zc fetch push failed ({e})",
                                 f.qid
                             );
-                            let _ = f.done.send(-libc::EIO);
+                            let _ = f.done.send(refused(libc::EIO));
                         }
                     }
                     continue;
@@ -5211,12 +5360,16 @@ fn queue_worker(
                     // oneshot with a negative errno (the handler falls
                     // back to the extraction vehicle).
                     let idx = s.ent_idx as usize;
+                    let refused = |errno: i32| zc::BridgeCqe {
+                        res: -errno,
+                        popped_ns: 0,
+                    };
                     let Some(mi) = member_of_qid(s.qid).filter(|_| idx < depth) else {
                         warn!(
                             "fuse-over-uring qids={qids:?}: zc store for bad slot qid={} ent={idx}",
                             s.qid
                         );
-                        let _ = s.done.send(-libc::EINVAL);
+                        let _ = s.done.send(refused(libc::EINVAL));
                         continue;
                     };
                     let m = &mut members[mi];
@@ -5226,7 +5379,7 @@ fn queue_worker(
                              payload — refusing",
                             s.qid
                         );
-                        let _ = s.done.send(-libc::ENOENT);
+                        let _ = s.done.send(refused(libc::ENOENT));
                         continue;
                     };
                     if m.zc_pend[idx].is_some() {
@@ -5235,7 +5388,7 @@ fn queue_worker(
                              pending bridge — refusing",
                             s.qid
                         );
-                        let _ = s.done.send(-libc::EBUSY);
+                        let _ = s.done.send(refused(libc::EBUSY));
                         continue;
                     }
                     let gent = gent_of(mi, idx);
@@ -5262,7 +5415,7 @@ fn queue_worker(
                                 "fuse-over-uring qid={} ent={idx}: zc store push failed ({e})",
                                 s.qid
                             );
-                            let _ = s.done.send(-libc::EIO);
+                            let _ = s.done.send(refused(libc::EIO));
                         }
                     }
                     continue;
@@ -5702,7 +5855,16 @@ fn queue_worker(
             break;
         }
 
-        let completed: Vec<(u64, i32, u32)> = {
+        // The enter above carried every bridge SQE pushed this pass:
+        // settle their `submitted_ns` into the member ledgers BEFORE the
+        // drain reads them (`device_cq`).
+        batch.settle_bridge_submits(|gent, ns| {
+            members[gent / depth]
+                .bridge_deadlines
+                .note_submitted(gent % depth, ns);
+        });
+
+        let (completed, popped_ns): (Vec<(u64, i32, u32)>, u64) = {
             let mut cq = ring.completion();
             cq.sync();
             // FUSE-3f: read the overflow counter with the same sync that
@@ -5718,12 +5880,22 @@ fn queue_worker(
             // The fresh completions this enter surfaced (the deferred
             // ones were counted by the mid-pass enter that surfaced them).
             cadence.cqes_surfaced(cq.len());
+            // ONE pop stamp per drain (the bridge CQEs' `dev_complete`);
+            // none on an empty pass.
+            let popped_ns = if cq.is_empty() && deferred_cqes.is_empty() {
+                0
+            } else {
+                crate::raw::read_phase::transport_now_ns()
+            };
             // Mid-pass-deferred CQEs first (they ARRIVED first), then the
             // post-wait drain.
-            deferred_cqes
-                .drain(..)
-                .chain(cq.map(|c| (c.user_data(), c.result(), c.flags())))
-                .collect()
+            (
+                deferred_cqes
+                    .drain(..)
+                    .chain(cq.map(|c| (c.user_data(), c.result(), c.flags())))
+                    .collect(),
+                popped_ns,
+            )
         };
 
         // Reclaim list — group-local ent ids (member recovered by
@@ -5810,10 +5982,12 @@ fn queue_worker(
                                 &mut m.slots,
                                 &mut m.ents[ent_idx],
                                 &mut m.zc_pend[ent_idx],
+                                &m.bridge_deadlines,
                                 pool.slot_watch_cell(qid, ent_idx),
                                 qid,
                                 gent,
                                 -libc::ETIMEDOUT,
+                                popped_ns,
                             )?;
                             if m.bridge_deadlines.clear(ent_idx) {
                                 pool.zc_bridge_pends.fetch_sub(1, Ordering::Relaxed);
@@ -5871,10 +6045,12 @@ fn queue_worker(
                         &mut m.slots,
                         &mut m.ents[ent_idx],
                         &mut m.zc_pend[ent_idx],
+                        &m.bridge_deadlines,
                         pool.slot_watch_cell(qid, ent_idx),
                         qid,
                         gent,
                         res,
+                        popped_ns,
                     )?;
                     if m.bridge_deadlines.clear(ent_idx) {
                         pool.zc_bridge_pends.fetch_sub(1, Ordering::Relaxed);
@@ -6098,10 +6274,12 @@ fn queue_worker(
                     &mut m.slots,
                     &mut m.ents[ent_idx],
                     &mut m.zc_pend[ent_idx],
+                    &m.bridge_deadlines,
                     pool.slot_watch_cell(qid, ent_idx),
                     qid,
                     gent,
                     res,
+                    popped_ns,
                 )?;
                 if m.bridge_deadlines.clear(ent_idx) {
                     pool.zc_bridge_pends.fetch_sub(1, Ordering::Relaxed);
@@ -7549,6 +7727,32 @@ fn note_handler_bridge_passbottom(
             );
         }
     }
+}
+
+/// `zc_bridge_phase_ns` `device_cq` + the op-trace `dev_complete` for a
+/// handler FETCH whose CQE the worker popped at `popped_ns` (R-3): the
+/// carrying-enter stamp is read from the ledger BEFORE the caller's
+/// `clear`. A pend whose SQE was never flushed (a refusal answered
+/// without a ring pop) has no `submitted_ns` and records nothing.
+fn note_handler_fetch_popped(
+    deadlines: &zc::BridgeDeadlines,
+    ent_idx: usize,
+    trace_id: u64,
+    popped_ns: u64,
+) {
+    let submitted = deadlines.submitted_ns(ent_idx);
+    if submitted == 0 || popped_ns == 0 {
+        return;
+    }
+    crate::raw::read_phase::zc_bridge_phase_record_ns(
+        crate::raw::read_phase::ZcBridgePhase::DeviceCq,
+        popped_ns.saturating_sub(submitted),
+    );
+    crate::op_trace::stamp(
+        trace_id,
+        crate::op_trace::Stage::DevComplete,
+        crate::raw::read_phase::transport_instant(popped_ns),
+    );
 }
 
 /// Push one zc sparse-slot bridge SQE (READ_FIXED / WRITE_FIXED) with the

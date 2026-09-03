@@ -497,6 +497,81 @@ impl ReapCadence {
     }
 }
 
+// ---------------------------------------------------------------------------
+// The zc DIRECT-LEG bridge decomposition (`zc_bridge_phase_ns`, e2e audit
+// R-3, 2026-09-03): the 4 KiB-random attribution pass measured the kern
+// READ's `keys_resolved → block_fetched` at 166 µs of which the device
+// was 40 (nvme tracepoints, population-level) — the ≈ 126 µs software
+// half of the single largest stage had no per-op split. The bridge is
+// four cross-thread hops around one DMA; each gets a phase, exact-sum
+// (`sum_ns`/`count`), always-on, per-op:
+//
+// * `msg_hop`   — handler `zc_device_fetch` send → the queue worker takes
+//                 the message (channel + eventfd + the worker's park/pass
+//                 queueing).
+// * `sq_wait`   — message taken (SQE built) → the `io_uring_enter` that
+//                 carries it (the pass-remainder before the flush).
+// * `device_cq` — that enter → the CQE popped by the worker (device +
+//                 fabric + the reap latency of a parked/busy worker).
+// * `wake_hop`  — CQE popped (oneshot sent) → the handler future
+//                 resumed on its lane.
+// * `total`     — send → resume: the handler's `block_fetch` minus its
+//                 pre-send probes (containment: `total ≈ msg_hop + sq_wait
+//                 + device_cq + wake_hop`, every boundary ONE clock read
+//                 shared with the op-trace stamp on that boundary).
+//
+// FETCH leg only (the family's class is READ; the write store keeps its
+// own `bridge_rtt` venue split). Sharded per recording thread like the
+// transport tables: the worker records the first three, the lane the
+// last two.
+// ---------------------------------------------------------------------------
+
+/// zc direct-leg bridge phases (see the block above). `repr(usize)`
+/// indexes the table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(usize)]
+pub enum ZcBridgePhase {
+    /// Handler send → worker take.
+    MsgHop = 0,
+    /// Worker take (SQE built) → the carrying `io_uring_enter`.
+    SqWait = 1,
+    /// Carrying enter → CQE popped.
+    DeviceCq = 2,
+    /// CQE popped (oneshot sent) → handler resumed.
+    WakeHop = 3,
+    /// Handler send → handler resumed.
+    Total = 4,
+}
+
+const ZC_BRIDGE_PHASES: usize = 5;
+const ZC_BRIDGE_PHASE_NAMES: [&str; ZC_BRIDGE_PHASES] =
+    ["msg_hop", "sq_wait", "device_cq", "wake_hop", "total"];
+
+type ZcBridgeTable = [PhaseHist; ZC_BRIDGE_PHASES];
+
+fn zc_bridge_tables() -> &'static [ZcBridgeTable] {
+    static TABLES: OnceLock<Vec<ZcBridgeTable>> = OnceLock::new();
+    TABLES.get_or_init(|| {
+        (0..shard_count())
+            .map(|_| std::array::from_fn(|_| PhaseHist::new()))
+            .collect()
+    })
+}
+
+/// Record one zc bridge span (ns, already a difference of two
+/// transport-epoch stamps — no clock read here).
+#[inline]
+pub fn zc_bridge_phase_record_ns(phase: ZcBridgePhase, ns: u64) {
+    zc_bridge_tables()[shard_index()][phase as usize].record_ns(ns);
+}
+
+/// Stats-inode snapshot (`zc_bridge_phase_ns`), in phase order; the fold
+/// across shards is exact.
+pub fn zc_bridge_phase_snapshot() -> [PhaseSnapshot; ZC_BRIDGE_PHASES] {
+    let shards = zc_bridge_tables();
+    std::array::from_fn(|pi| fold(ZC_BRIDGE_PHASE_NAMES[pi], shards.iter().map(|s| &s[pi])))
+}
+
 #[cfg(test)]
 mod transport_phase_tests {
     use super::*;
@@ -645,5 +720,49 @@ mod transport_phase_tests {
     fn reap_gap_snapshot_names_the_three_phases() {
         let names: Vec<&str> = reap_gap_snapshot().iter().map(|p| p.name).collect();
         assert_eq!(names, ["blind", "blind_cqe", "park"]);
+    }
+
+    /// The zc bridge family: five phases in the documented order, one
+    /// span moves exactly its cell, and the cross-thread fold is exact
+    /// (the worker records three phases, the lane two — the shards are
+    /// what make that sum exact).
+    #[test]
+    fn zc_bridge_family_is_phase_exact_and_folds_across_threads() {
+        let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let names: Vec<&str> = zc_bridge_phase_snapshot().iter().map(|p| p.name).collect();
+        assert_eq!(
+            names,
+            ["msg_hop", "sq_wait", "device_cq", "wake_hop", "total"],
+            "phase order is the export's contract"
+        );
+        let before = zc_bridge_phase_snapshot();
+        zc_bridge_phase_record_ns(ZcBridgePhase::WakeHop, 7_500);
+        let mid = zc_bridge_phase_snapshot();
+        for (pi, name) in ZC_BRIDGE_PHASE_NAMES.iter().enumerate() {
+            let want = u64::from(*name == "wake_hop");
+            assert_eq!(mid[pi].count - before[pi].count, want, "phase {name}");
+            assert_eq!(mid[pi].sum_ns - before[pi].sum_ns, want * 7_500);
+        }
+        const THREADS: u64 = 4;
+        const PER_THREAD: u64 = 100;
+        let hs: Vec<_> = (0..THREADS)
+            .map(|t| {
+                std::thread::spawn(move || {
+                    for i in 0..PER_THREAD {
+                        zc_bridge_phase_record_ns(ZcBridgePhase::DeviceCq, 40_000 + t * 1_000 + i);
+                    }
+                })
+            })
+            .collect();
+        for h in hs {
+            h.join().unwrap();
+        }
+        let after = zc_bridge_phase_snapshot()[ZcBridgePhase::DeviceCq as usize];
+        let want_sum: u64 = (0..THREADS)
+            .flat_map(|t| (0..PER_THREAD).map(move |i| 40_000 + t * 1_000 + i))
+            .sum();
+        let base = mid[ZcBridgePhase::DeviceCq as usize];
+        assert_eq!(after.count - base.count, THREADS * PER_THREAD);
+        assert_eq!(after.sum_ns - base.sum_ns, want_sum);
     }
 }

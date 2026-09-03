@@ -4269,6 +4269,18 @@ pub fn transport_reap_gap_json() -> serde_json::Value {
     transport_phase_json(fuse3::reap_gap_snapshot())
 }
 
+/// `zc_bridge_phase_ns` stats payload — the zc direct-leg bridge
+/// decomposition (e2e audit R-3, 2026-09-03): `msg_hop` (handler send →
+/// queue worker take), `sq_wait` (take → the carrying `io_uring_enter`),
+/// `device_cq` (enter → CQE popped), `wake_hop` (popped → handler
+/// resumed), `total` (send → resumed). Exact-sum, always-on, fetch leg
+/// only; `total ≈ msg_hop + sq_wait + device_cq + wake_hop` is the
+/// containment law, and `read_serve_phase_ns.block_fetch − total` is the
+/// handler's pre-send probe cost.
+pub fn zc_bridge_phase_json() -> serde_json::Value {
+    transport_phase_json(fuse3::zc_bridge_phase_snapshot())
+}
+
 fn transport_phase_json<const N: usize>(snapshot: [fuse3::PhaseSnapshot; N]) -> serde_json::Value {
     let mut phases = serde_json::Map::new();
     for p in snapshot {
@@ -10669,6 +10681,10 @@ impl SqueezefsFilesystem {
                 // The WRITE twin (transport-ingress campaign): the write
                 // wall's pre-handler leg, measured — no longer inferred.
                 "write_transport_phase_ns": write_transport_phase_json(),
+                // The zc direct-leg bridge's four hops around one DMA
+                // (e2e audit R-3): the kern rand-4k `block_fetch` split
+                // into msg_hop / sq_wait / device_cq / wake_hop / total.
+                "zc_bridge_phase_ns": zc_bridge_phase_json(),
                 "fuse3_fused_timeline_ns": fused_timeline_json(),
                 "fuse3_fused_midpass_reaps": fuse3::fused_midpass_reaps(),
                 "fuse3_fused_passbottom_reaps": fuse3::fused_passbottom_reaps(),

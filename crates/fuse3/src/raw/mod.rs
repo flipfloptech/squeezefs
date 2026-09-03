@@ -37,7 +37,8 @@ pub use read_phase::{
     fused_midpass_reaps, fused_passbottom_reaps, fused_timeline_snapshot, read_inplace_replies,
     read_transport_phase_record, read_transport_phase_snapshot, reap_gap_snapshot,
     reap_phase_record_n, write_inplace_replies, write_transport_phase_record,
-    write_transport_phase_snapshot, PhaseSnapshot, ReapPhase, TransportPhase,
+    write_transport_phase_snapshot, zc_bridge_phase_record_ns, zc_bridge_phase_snapshot,
+    PhaseSnapshot, ReapPhase, TransportPhase, ZcBridgePhase,
 };
 pub use request::{ReplySlot, Request};
 #[cfg(feature = "tokio-runtime")]

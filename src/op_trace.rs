@@ -55,8 +55,8 @@ pub const fn il_op_id(session_id: u64, slot_index: u32, generation: u64) -> u64 
 pub const OPS_PER_CORE_PER_S: u64 = 40_000;
 
 /// Stamps one traced op can leave across its longest chain (transport 5
-/// + read serve 10 + fill 7 = 22, rounded to the next power of two) —
-/// the derivation's per-op multiplier.
+/// + read serve 10 + fill 7 + zc bridge 2 = 24, rounded to the next
+/// power of two) — the derivation's per-op multiplier.
 pub const STAGES_PER_OP: u64 = 32;
 
 /// The drain cadence the pool is sized for: the rigs' 1 Hz `.stats` /

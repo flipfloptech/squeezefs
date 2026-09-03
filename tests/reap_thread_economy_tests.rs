@@ -11,15 +11,19 @@
 //! mount (mount class — self-skips through the testkit ledger; the
 //! require-mount gate turns the skip into a failure):
 //!
-//! 1. **A quiet queue burns nothing.** On an idle mount the `fuse3-ur`
-//!    CPU class stays flat and the spin ledger does not move: the spin
-//!    engages only while the worker's queues hold ops in flight, and an
-//!    idle worker's gap EWMA sits far past the rail.
-//! 2. **The ledger closes and engages under pressure.** With an explicit
-//!    cap, a concurrent O_DIRECT random-read burst moves
-//!    `transport_spin_absorbed + transport_spin_expired` (spins ran) and
-//!    `transport_spin_ns` (their cost), while the same burst under the
-//!    `0` control leaves every spin word flat — the A/B lever is exact.
+//! 1. **A quiet queue burns nothing.** On an idle mount with the governor
+//!    ARMED (a nonzero cap) the `fuse3-ur` CPU class stays flat and the
+//!    spin ledger does not move: the spin engages only while the worker's
+//!    queues hold ops in flight, and an idle worker's gap EWMA sits far
+//!    past the rail.
+//! 2. **The ledger closes and engages under pressure.** With a nonzero
+//!    cap, a concurrent O_DIRECT random-read burst engages the governor:
+//!    `transport_spin_absorbed + transport_spin_expired` (spins ran) plus
+//!    `transport_spin_refused_busy` (regime hits the box's queueing knee
+//!    refused — the dev box is shared and often past 80 % busy) move,
+//!    every spin's cost lands in `transport_spin_ns` at or under the cap,
+//!    while the same burst under the default (off) leaves every spin word
+//!    flat — the A/B lever is exact.
 //! 3. **The commit-batch and reap-gap instruments keep closing** on the
 //!    sharded counters: `transport_commit_batch_commits` accounts for
 //!    every reply the burst committed, and `transport_reap_gap_ns.park`
@@ -215,7 +219,7 @@ fn spin_words(m: &serde_json::Value) -> (u64, u64, u64) {
     )
 }
 
-/// Laws 1 and 3 on the default posture: an idle mount's workers stay
+/// Laws 1 and 3 with the governor armed: an idle mount's workers stay
 /// flat and never spin; then a concurrent cold random-read burst keeps
 /// the commit-batch ledger closing on the sharded counters.
 #[test]
@@ -224,7 +228,7 @@ fn idle_mount_queue_workers_stay_flat_and_never_spin_then_the_ledgers_close_unde
     if !mount_supported(site!()) {
         return;
     }
-    let m = mount_fs("idle", &[]);
+    let m = mount_fs("idle", &[("SQUEEZEFS_FUSE_IO_URING_SPIN_US", "200")]);
     // Settle: registration bursts and the first `.stats` read are over.
     std::thread::sleep(Duration::from_secs(1));
     let m0 = m.metrics();
@@ -245,7 +249,7 @@ fn idle_mount_queue_workers_stay_flat_and_never_spin_then_the_ledgers_close_unde
     assert_eq!(
         (a1 - a0, e1 - e0, n1 - n0),
         (0, 0, 0),
-        "idle mount: the spin ledger must not move (no ops in flight ⇒ no window)"
+        "idle mount, governor armed: the spin ledger must not move (no ops in flight ⇒ no window)"
     );
     // Law 3: a concurrent cold burst — every reply is one COMMIT_AND_FETCH,
     // and the sharded flush accounting must still account for each.
@@ -289,45 +293,57 @@ fn burst(path: &Path, payload: &[u8], threads: usize, per: usize) -> u64 {
     hs.into_iter().map(|h| h.join().unwrap() as u64).sum()
 }
 
-/// Law 2: an explicit cap engages the spin under a concurrent burst (the
-/// operator's verbatim posture — the box gauge does not refuse it), the
-/// ledger closes (`absorbed + expired` ≡ spins, `spin_ns` their cost),
-/// and the `0` control leaves every spin word flat under the same burst.
+/// Law 2: a nonzero cap engages the governor under a concurrent burst —
+/// spins run, or the box's queueing-knee gauge refuses them (the shared
+/// dev box is routinely past 80 % busy; a refusal is the governor's own
+/// verdict, counted) — the ledger closes (`absorbed + expired` ≡ spins,
+/// `spin_ns` their cost, at or under the cap per spin), and the default
+/// (off) leaves every spin word flat under the same burst.
 #[test]
 fn explicit_cap_engages_under_a_burst_and_the_zero_control_stays_flat() {
     use squeezefs_testkit::{mount_supported, site};
     if !mount_supported(site!()) {
         return;
     }
-    // Explicit 200 µs cap: any short-gap park under the burst is a
-    // candidate; the EWMA seeds from the burst's own parks.
+    // A 200 µs cap: any short-gap park under the burst is a candidate;
+    // the EWMA seeds from the burst's own parks.
     let m = mount_fs("cap", &[("SQUEEZEFS_FUSE_IO_URING_SPIN_US", "200")]);
     let (path, payload) = write_file(&m.mnt, "cold.bin", 8 << 20);
-    let (a0, e0, n0) = spin_words(&m.metrics());
+    let m0 = m.metrics();
+    let (a0, e0, n0) = spin_words(&m0);
+    let r0 = u(&m0, "transport_spin_refused_busy");
     // Two rounds: the first seeds every worker's gap EWMA, the second
     // runs with the window open.
     burst(&path, &payload, 8, 128);
     burst(&path, &payload, 8, 128);
-    let (a1, e1, n1) = spin_words(&m.metrics());
+    let m1 = m.metrics();
+    let (a1, e1, n1) = spin_words(&m1);
+    let r1 = u(&m1, "transport_spin_refused_busy");
     let spins = (a1 - a0) + (e1 - e0);
     assert!(
-        spins > 0,
-        "explicit cap under an 8-stream cold burst: no spin ran (absorbed {} expired {})",
+        spins + (r1 - r0) > 0,
+        "cap 200 under an 8-stream cold burst: the governor never engaged (absorbed {} expired {} \
+         refused_busy {})",
         a1 - a0,
-        e1 - e0
+        e1 - e0,
+        r1 - r0
     );
-    assert!(
-        n1 - n0 > 0,
-        "spins ran but transport_spin_ns did not move — the cost column must account for them"
-    );
-    assert!(
-        (n1 - n0) / spins <= 200_000 + 50_000,
-        "mean spin {} ns exceeds the 200 µs cap (+ one clock quantum of slack)",
-        (n1 - n0) / spins
-    );
+    match (n1 - n0).checked_div(spins) {
+        Some(mean_ns) => {
+            assert!(
+                n1 - n0 > 0,
+                "spins ran but transport_spin_ns did not move — the cost column must account for them"
+            );
+            assert!(
+                mean_ns <= 200_000 + 50_000,
+                "mean spin {mean_ns} ns exceeds the 200 µs cap (+ one clock quantum of slack)"
+            );
+        }
+        None => assert_eq!(n1 - n0, 0, "no spin ran ⇒ no spin cost"),
+    }
     m.unmount();
 
-    let m = mount_fs("off", &[("SQUEEZEFS_FUSE_IO_URING_SPIN_US", "0")]);
+    let m = mount_fs("off", &[]);
     let (path, payload) = write_file(&m.mnt, "cold.bin", 8 << 20);
     let (a0, e0, n0) = spin_words(&m.metrics());
     burst(&path, &payload, 8, 128);
@@ -336,7 +352,7 @@ fn explicit_cap_engages_under_a_burst_and_the_zero_control_stays_flat() {
     assert_eq!(
         (a1 - a0, e1 - e0, n1 - n0),
         (0, 0, 0),
-        "SQUEEZEFS_FUSE_IO_URING_SPIN_US=0: the A/B control never spins"
+        "the default (SQUEEZEFS_FUSE_IO_URING_SPIN_US absent = 0) never spins"
     );
     m.unmount();
 }

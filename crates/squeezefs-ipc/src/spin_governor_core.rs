@@ -54,7 +54,14 @@
 //! STRUCTURAL — ops in flight on the worker's queues (a slot delivered
 //! and not yet committed, a bridge pend outstanding): an idle queue has
 //! nothing coming on a bounded clock and never spins — and the box
-//! guard is the queueing-theory knee ([`worker_busy_ceiling_pct`]).
+//! guard is the queueing-theory knee ([`WORKER_BUSY_CEILING_PCT`]).
+//! **Shipped OFF** (cap 0) on measurement: at the field the governor
+//! deleted 69 % of the worker's parks (0.76 → 0.24 per op) and moved no
+//! latency term — `msg_hop`, `device_cq`, `wake_hop` unchanged to the µs
+//! — at +5.5 % CPU/op; the parks it absorbed were the ≤ 16 µs class the
+//! kernel wait already returns from without a sleep, and the long class
+//! that carries the wake latency sits past any window the box's 75–80 %
+//! busy can afford. The cap is the registered measurement lever.
 
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::Duration;
@@ -173,10 +180,10 @@ pub const WORKER_BUSY_CEILING_PCT: u32 = 80;
 /// The queue worker's derived spin window (ns) for one park decision —
 /// see the module doc's worker law.
 ///
-/// * `cap_ns`: the ceiling on the window. `Some(0)` = never spin (the
-///   A/B control); `Some(c)` = an explicit operator cap (verbatim: the
-///   regime gates below still apply — spinning on an idle queue buys
-///   nothing at any cap); `None` = the derived cap, [`SPIN_RAIL_US`].
+/// * `cap_ns`: the ceiling on the window; `0` = never spin — the SHIPPED
+///   default (measured not-fat at the field: `.benchmarks/2026-09-03-r4-
+///   reap-thread-economy.md` §6 — the governor deleted 69 % of the
+///   worker's parks and moved no latency term, at +5.5 % CPU/op).
 /// * `gap_ewma_ns`: the worker's EWMA of observed park gaps (spin-
 ///   absorbed gaps included). 0 = never parked — engage on OBSERVED
 ///   churn only, never speculatively.
@@ -190,29 +197,17 @@ pub const WORKER_BUSY_CEILING_PCT: u32 = 80;
 /// (device-RTT-spaced qd1 parks sit inside it — those are productive
 /// waits a spin shortens, and their CPU cost is one otherwise-idle core's
 /// RTT per op, bounded by the same ceiling).
-pub fn worker_window_ns(
-    cap_ns: Option<u64>,
-    gap_ewma_ns: u64,
-    in_flight: bool,
-    busy_pct: u32,
-) -> u64 {
-    let (cap, explicit) = match cap_ns {
-        Some(0) => return 0,
-        Some(c) => (c, true),
-        None => (SPIN_RAIL_US * 1_000, false),
-    };
-    if !in_flight || gap_ewma_ns == 0 {
+pub fn worker_window_ns(cap_ns: u64, gap_ewma_ns: u64, in_flight: bool, busy_pct: u32) -> u64 {
+    if cap_ns == 0 || !in_flight || gap_ewma_ns == 0 {
         return 0;
     }
     if gap_ewma_ns > SPIN_RAIL_US * 1_000 {
         return 0;
     }
-    // The box gauge refuses the DERIVED window only: an explicit cap is
-    // the operator's verbatim measurement posture (the ipc-cap law).
-    if !explicit && busy_pct > WORKER_BUSY_CEILING_PCT {
+    if busy_pct > WORKER_BUSY_CEILING_PCT {
         return 0;
     }
-    gap_ewma_ns.saturating_mul(2).min(cap)
+    gap_ewma_ns.saturating_mul(2).min(cap_ns)
 }
 
 /// One `/proc/stat` reading as `(busy_jiffies, total_jiffies)` for
@@ -416,62 +411,54 @@ mod tests {
     }
 
     /// The worker law (R-4): the window is the reaction clock (2 × the
-    /// observed gap EWMA) capped by the rail or the explicit cap; every
-    /// regime gate returns 0 — no ops in flight, never parked, idle-
-    /// spaced gaps, box past the queueing knee; `Some(0)` is the off
-    /// switch whatever the regime says.
+    /// observed gap EWMA) capped by the operator's cap; every regime gate
+    /// returns 0 — no ops in flight, never parked, idle-spaced gaps, box
+    /// past the queueing knee; cap 0 is the off switch (the shipped
+    /// default) whatever the regime says.
     #[test]
     fn worker_window_is_the_reaction_clock_under_every_gate() {
+        let rail = SPIN_RAIL_US * 1_000;
         assert_eq!(
-            worker_window_ns(None, 20_000, true, 70),
+            worker_window_ns(rail, 20_000, true, 70),
             40_000,
-            "2 × a 20 µs gap EWMA under the rail"
+            "2 × a 20 µs gap EWMA under the cap"
         );
         assert_eq!(
-            worker_window_ns(None, 150_000, true, 70),
-            SPIN_RAIL_US * 1_000,
-            "2 × 150 µs caps at the rail"
+            worker_window_ns(rail, 150_000, true, 70),
+            rail,
+            "2 × 150 µs caps at the rail-sized cap"
         );
         assert_eq!(
-            worker_window_ns(Some(30_000), 20_000, true, 70),
+            worker_window_ns(30_000, 20_000, true, 70),
             30_000,
-            "an explicit cap bounds the doubled gap"
+            "a smaller cap bounds the doubled gap"
         );
         assert_eq!(
-            worker_window_ns(Some(30_000), 5_000, true, 70),
+            worker_window_ns(30_000, 5_000, true, 70),
             10_000,
-            "an explicit cap never widens the window past the reaction clock"
+            "a cap never widens the window past the reaction clock"
         );
+        assert_eq!(worker_window_ns(0, 20_000, true, 0), 0, "cap 0 = off");
         assert_eq!(
-            worker_window_ns(Some(0), 20_000, true, 0),
-            0,
-            "Some(0) = off"
-        );
-        assert_eq!(
-            worker_window_ns(None, 20_000, false, 0),
+            worker_window_ns(rail, 20_000, false, 0),
             0,
             "nothing in flight"
         );
-        assert_eq!(worker_window_ns(None, 0, true, 0), 0, "never parked");
+        assert_eq!(worker_window_ns(rail, 0, true, 0), 0, "never parked");
         assert_eq!(
-            worker_window_ns(None, SPIN_RAIL_US * 1_000 + 1, true, 0),
+            worker_window_ns(rail, rail + 1, true, 0),
             0,
             "idle-spaced gaps past the rail"
         );
         assert_eq!(
-            worker_window_ns(None, 20_000, true, WORKER_BUSY_CEILING_PCT),
+            worker_window_ns(rail, 20_000, true, WORKER_BUSY_CEILING_PCT),
             40_000,
             "at the knee: engaged"
         );
         assert_eq!(
-            worker_window_ns(None, 20_000, true, WORKER_BUSY_CEILING_PCT + 1),
+            worker_window_ns(rail, 20_000, true, WORKER_BUSY_CEILING_PCT + 1),
             0,
             "past the knee: refused"
-        );
-        assert_eq!(
-            worker_window_ns(Some(30_000), 20_000, true, 100),
-            30_000,
-            "an explicit cap is the operator's verbatim choice — the box gauge does not refuse it"
         );
     }
 

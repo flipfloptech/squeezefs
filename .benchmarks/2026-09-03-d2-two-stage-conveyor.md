@@ -171,7 +171,99 @@ instruction).
 
 ## Field row — the D-1b fleet rig, A-B-B-A (measured-simulated tier)
 
-FIELD_ROW_PLACEHOLDER
+`.benchmarks/rigs/2026-09-02-d1b-fleet-row.sh` (D-1b's rig, verbatim) on the
+32-CPU dev box (117 GiB), tcp devsub (nvmet-tcp on `127.0.0.1`, zram OSS
+2 × 64 GiB), `tests/mw_fleet.sh create N=1 --multi-writer --cowriters=8` per
+leg, torn down to zero residue between legs. Row: **8 co-writers × 24
+concurrent `dd bs=1M count=128 conv=fsync` streams from `/dev/zero`**
+(device term removed by design), per-member directories. **A** = the D-1b
+field-row binary `ec921b87` (code-identical to the D-1b tip `63c79b9d`; the
+diff is one doc line), **B** = this branch `a33bb010`; both `--version
+… profile release`, recorded in the create logs. Analysis:
+`.benchmarks/rigs/2026-09-03-d2-fleet-analyze.py`. Box: no other daemon or
+fleet during the run (the rig refuses on `task check`/`cargo`), but NOT as
+quiet as D-1b's session — a sibling agent's substrate and a 10-minute-old
+load tail were present; loadavg at leg start **8.3 / 11.4 / 8.2 / 6.7**
+(D-1b's legs started at 3–9). Depth on the fleet = 2.
+
+**The authority's conveyor** (the shape D-2 exists to move):
+
+| leg | passes | ρ(apply) | `pass_total` | `pass_leaf_locks` | `tx_queue_wait` | `journal_ring_write` | `window_lane_wait` | commit latency (queue + window) | windows hwm | windows / dur. pass |
+|---|---|---|---|---|---|---|---|---|---|---|
+| A1 d1b | 9,252 | **1.001** | 725 µs | 95 | **696** | 618 | — | 1,421 µs | (1) | — |
+| B1 d2 | 11,180 | **0.125** | **112** | 100 | **325** | 1,306 | 762 | 1,750 µs | **24** | 1.14 |
+| B2 d2 | 11,035 | **0.140** | **101** | 87 | **285** | 1,011 | 621 | 1,403 µs | **22** | 1.14 |
+| A2 d1b | 9,616 | **0.928** | 766 µs | 93 | **794** | 654 | — | 1,560 µs | (1) | — |
+
+**Engagement: exact, and the finding is closed as stated.** The serialized
+server's utilization fell from 1.00 / 0.93 to **0.125 / 0.140**; its
+service time from 725 / 766 µs to **112 / 101 µs** = the leaf-lock window
+(the device wait left the pass); `tx_queue_wait` **−55 %** (696 / 794 →
+325 / 285 µs); 22–24 windows in flight at the peak (mean in flight ≈ Σ
+`window_total` ÷ wall ≈ 1.6); journal entries per served publish unchanged
+(0.261 / 0.261 → 0.259 / 0.259 — the Lever-B aggregation factor; one entry
+per KvTx by construction); every tripwire flat (`meta_conveyor_pass_panics`
+= `detached_task_panics` = `invariant_tripwires` = `uring_queue_full` =
+`meta_kv_journal_full_stalls` = 0; ledger closure `served ≡ shipped` on
+every leg; `refusals` = `owner_panics` = 0). `leaf_lock_hold` mean 94 / 82
+µs over 11 k holds; its tail (95 / 96 samples ≥ 1 ms, one at ≤ 64 ms) is
+ascending-acquire contention with the checkpoint freeze plus preemption on
+a box at load 12–16 — no device call sits inside the hold by construction.
+
+**Aggregate ingest: NOT up — PAR at best, brackets disagree.** A1 3.58, B1
+**2.41**, B2 3.03, A2 3.02 GiB/s: the reversed bracket (B2 / A2) is par
+(+0.3 %), the first (B1 / A1) −33 % with B1 started at the session's
+highest load (11.4). Per the A-B-B-A rule a single-order delta the reversed
+bracket does not reproduce is not attributable; the row's honest reading is
+**par with one degraded leg**, and the same-binary spread (A1 3.58 vs A2
+3.02 = 18 %) says this session's noise band is wider than D-1b's (±2 %).
+
+**Why the freed conveyor did not convert on this venue — the next wall, by
+number.** The per-tx commit latency (queue + window) is par-to-worse
+(1,421 / 1,560 → 1,750 / 1,403 µs) because the journal write's completion
+round trip itself rose, 618 / 654 → **1,306 / 1,011 µs** per window, and
+the lane waits on it in order:
+
+* `journal_ring_write` is not device time. Its MODE is 50–200 µs on every
+  leg (A1: 2,291 samples ≤ 64 µs, 1,635 ≤ 128, 1,318 ≤ 256); the mean is a
+  ms-class TAIL (A1: 622 ≤ 2 ms, 384 ≤ 4 ms, 259 ≤ 8 ms, 62 ≤ 16 ms; B1: 708
+  ≤ 4 ms, 562 ≤ 8 ms, 317 ≤ 16 ms, 103 ≤ 32 ms, 12 ≤ 64 ms). A ~1 KiB
+  page-cache write completes in µs; the tail is the `uring_fs` round trip —
+  queue hop → worker submit → CQE → oneshot wake onto one of the two
+  `sqz-meta` lane threads, which also host the pass task, the checkpoint
+  task and every `spawn_meta_join` owner call (7 k/s here) — on a box with
+  200+ runnable threads (192 dd + 9 daemons on 32 cores). That is DLM #3's
+  wake-hop class (C-2), now isolated as THE term with its own per-window
+  instrument.
+* The in-order lane head-of-line-blocks behind that tail: `window_lane_wait`
+  is bimodal — ~7,000 windows picked up in ≤ 16 µs (lane idle), ~1,900
+  waited ≥ 1 ms and 588 waited ≥ 8 ms behind a head whose write was in the
+  tail. In-order is the journal-order law (chain reachability), so the HOL
+  is inherent; pre-D-2 the same slow write blocked the apply too.
+* With the pass no longer paced by the device, batches got SMALLER —
+  size-1 groups 78 % → 86 % of passes, no ≤ 32 groups on B — so passes /
+  submissions / completion hops rose +18 % (9,252 / 9,616 → 11,180 /
+  11,035) for the same entries. The audit's "`meta_commit_group_size` up"
+  expectation assumed arrivals would keep accumulating during a device
+  wait the lever removes; on a hop-bound venue the lost implicit batching
+  offsets the freed serialization.
+* Co-writer side, consistently: `publish_phase_ns.total` per save 21.4 /
+  25.5 → 30.4 / 24.9 ms, its `queue_wait` 6.5 / 7.4 → 8.7 / 7.4, the frame
+  RTT 3.41 / 3.52 → 4.28 / 3.52 ms, `write_pipeline_phase_ns.publish` 16.8 /
+  19.3 → 25.6 / 21.6 ms — B1 worse, B2 par. Authority CPU 5.57 / 5.94 →
+  6.17 / 5.79 s (par; `sqz-meta` 2.83 / 2.98 → 3.09 / 2.92).
+
+**Verdict.** The mechanism is correct and engaged exactly (the conveyor is
+no longer a serialized server; ρ 1.0 → 0.13, queue wait −55 %, crash
+contracts green), and the in-process rows show the ~2× the closed loop
+permits when the device term is real latency. On the co-located fleet the
+binding term was never the device — it is the completion HOP chain under
+CPU saturation, which this lever exposes rather than moves; aggregate
+ingest is par, one leg degraded under load. D-2 therefore closes board #2's
+MECHANISM and hands #3 (C-2: the resident pass/lane on `sqz_notify`, the
+fan-out on the committer's lane, the `uring_fs` completion hop) the number
+it needs: ~1.0–1.3 ms mean / 50–200 µs mode per journal write completion,
+with a 5 % tail ≥ 4 ms, on the path from a page-cache write to the lane.
 
 ## Laws the design did not anticipate (reasoned here, written into the module doc)
 

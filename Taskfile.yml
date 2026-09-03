@@ -190,6 +190,10 @@ tasks:
       # test/bench targets). Its own suite and its `file-lock` cfg sites
       # need their own leg.
       - task: check:fuse3
+      # The isolated loom crate #[path]-includes protocol cores from src/;
+      # it is outside the workspace, so no line above compiles it. Build
+      # only (seconds) — the model RUN is tests/run_loom.sh.
+      - task: check:loom
       - task: check:docs
       # ENG-2: supply chain. Last so a dependency advisory does not mask a
       # code failure, but inside the same gate — the AGENTS.md Phase-5
@@ -212,6 +216,25 @@ tasks:
       - cargo fmt --check
       - cargo test --all-features -- --test-threads=1
       - cargo bench --benches -- --test
+
+  check:loom:
+    desc: >-
+      The isolated loom model-checking crate COMPILES against the cores it
+      #[path]-includes from src/ (build + fmt, seconds — the same RUSTFLAGS
+      and target dir as tests/run_loom.sh, so the runner reuses the
+      dependency artifacts this leg built).
+      loom-models/ is excluded from the workspace on purpose (a global
+      `--cfg loom` poisons the main crate's deps), which also meant no gate
+      line compiled it: the finding-31 core change (2026-08-28) broke every
+      model silently until 2026-09-03. `-D warnings` because a dead or
+      un-cfg-gated model is drift too. The model RUN stays the nightly /
+      lock-free-core-change tier (AGENTS.md Phase 4): tests/run_loom.sh.
+    dir: loom-models
+    env:
+      RUSTFLAGS: --cfg loom -D warnings
+    cmds:
+      - cargo build --release --tests
+      - cargo fmt --check
 
   audit:
     desc: >-

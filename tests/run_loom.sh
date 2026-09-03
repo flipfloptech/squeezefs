@@ -7,8 +7,13 @@
 # Isolated crate on purpose: a global `--cfg loom` poisons transitive deps
 # of the main crate; loom-models depends only on `loom` and #[path]-includes
 # the shipped core sources, so the models check the real code.
+#
+# `task check:loom` (part of `task check`) compiles this crate with the SAME
+# RUSTFLAGS so the two share one artifact set; `-D warnings` because a dead
+# or un-cfg-gated model is drift (cargo caps dependency lints, so the flag
+# reaches only this crate).
 set -euo pipefail
 cd "$(dirname "$0")/../loom-models"
 # LOOM_MAX_PREEMPTIONS=3 keeps the exploration exhaustive-in-practice while
 # bounded; raise for deeper searches.
-RUSTFLAGS="--cfg loom" LOOM_MAX_PREEMPTIONS=3 cargo test --release "$@"
+RUSTFLAGS="--cfg loom -D warnings" LOOM_MAX_PREEMPTIONS=3 cargo test --release "$@"

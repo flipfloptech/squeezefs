@@ -448,6 +448,7 @@ cargo test --all-features -- --test-threads=1
 cargo doc --no-deps
 cargo bench --benches -- --test   # criterion smoke: one iteration per bench, no measurement
 task check:fuse3                  # the excluded fork's own suite/fmt/clippy/bench — ENG-17
+task check:loom                   # the isolated loom crate COMPILES against the cores it #[path]-includes (build+fmt, -D warnings; the model RUN is tests/run_loom.sh)
 task check:docs                   # markdown link/anchor check (tests/check_markdown_links.sh)
 task audit                        # cargo audit, BOTH lockfiles, --deny unsound --deny yanked — ENG-2
 ```
@@ -577,6 +578,7 @@ cargo test --all-features -- --test-threads=1
 cargo doc --no-deps
 cargo bench --benches -- --test   # criterion smoke: one iteration per bench, no measurement
 task check:fuse3                  # the excluded fork's own suite/fmt/clippy/bench — ENG-17
+task check:loom                   # the isolated loom crate COMPILES against the cores it #[path]-includes (build+fmt, -D warnings; the model RUN is tests/run_loom.sh)
 task check:docs                   # markdown link/anchor check (tests/check_markdown_links.sh)
 task audit                        # cargo audit, BOTH lockfiles, --deny unsound --deny yanked — ENG-2
 ```

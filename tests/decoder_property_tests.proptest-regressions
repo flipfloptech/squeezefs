@@ -5,3 +5,4 @@
 # It is recommended to check this file in to source control so that
 # everyone who runs the test benefits from these saved cases.
 cc 837f28d5becfbc50876d22c52b1b5235095372ad98a147dcfe63de784099616d # shrinks to recs = [Record { key: [0], seq: 0, kind: Put, value: [] }], tree = 0
+cc 4bf733ba54564edad538d395889ea9ae85003eba7abb2db5a5646a81343b2a47 # shrinks to s = "A𖭽a   aaጘ00a "

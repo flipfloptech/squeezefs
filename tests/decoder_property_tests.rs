@@ -27,7 +27,8 @@ use proptest::prelude::*;
 use std::os::unix::process::CommandExt;
 
 use squeezefs::cluster_wire::{
-    read_plain_frame, session_framers, session_key, write_plain_frame, FrameClass, Role, RpcFrame,
+    hex_decode, hex_encode, read_plain_frame, session_framers, session_key, write_plain_frame,
+    FrameClass, Role, RpcFrame,
 };
 use squeezefs::layout_wire::{decode_base_layout, encode_layout, LayoutDelta, LayoutMetadata};
 use squeezefs::meta_backend::kv::block_map::{
@@ -190,6 +191,46 @@ fn kv_bset_record_count_bound_holds_across_data_lengths() {
             "data_len {data_len} cannot hold {claimed} records — must refuse"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// The find: `hex_decode` sliced a &str by BYTE index
+// ---------------------------------------------------------------------------
+
+/// **Regression pin for a 1.2 fuzz find** (`cluster_wire_frame`, 414
+/// executions in). `cluster_wire::hex_decode` walked its input two BYTES at
+/// a time with `&s[i..i + 2]` — a `str` slice, which panics when the end
+/// index lands inside a multi-byte character. Its documented contract is
+/// "`None` on any non-hex input", and its callers decode the `job:enroll`
+/// record's `secret` — on-disk metadata anyone who can write the volume
+/// controls — so a four-byte xattr like `":ז\0"` was a daemon **abort**
+/// (`panic = "abort"` in the release profile) at the first job-wire or
+/// membership enrollment. The same walk used `u8::from_str_radix`, which
+/// accepts a leading sign: `"+f"` decoded to `[0x0f]`, a form
+/// `hex_encode` never produces (a parser wider than its encoder).
+#[test]
+fn cluster_wire_hex_decode_is_total_and_exact() {
+    // The minimized fuzz artifact: `:`, then U+05D6 (2 bytes), then NUL —
+    // 4 bytes, even, and byte index 2 is inside the character.
+    let artifact = std::str::from_utf8(&[0x3a, 0xd7, 0x96, 0x00]).expect("valid UTF-8");
+    assert_eq!(artifact.len(), 4);
+    assert_eq!(
+        hex_decode(artifact),
+        None,
+        "non-ASCII is non-hex, never a panic"
+    );
+    // Sign characters are not hex digits, whatever `from_str_radix` thinks.
+    assert_eq!(hex_decode("+f"), None);
+    assert_eq!(hex_decode("-0"), None);
+    assert_eq!(hex_decode("0+"), None);
+    // The honest boundary: both cases decode, and lower-case is canonical.
+    assert_eq!(hex_decode("0aFf"), Some(vec![0x0a, 0xff]));
+    assert_eq!(hex_decode(""), Some(Vec::new()));
+    assert_eq!(hex_decode("abc"), None, "odd length");
+    assert_eq!(
+        hex_decode(&hex_encode(&[0, 127, 128, 255])),
+        Some(vec![0, 127, 128, 255])
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -405,6 +446,17 @@ proptest! {
         if let Ok(f) = decode_reclaim(&data) {
             let re = encode_reclaim(&f).expect("re-encodes");
             prop_assert_eq!(decode_reclaim(&re).expect("re-decodes"), f);
+        }
+    }
+
+    /// `hex_decode` is total over arbitrary Unicode (the 1.2 find above,
+    /// as a law) and exact: whatever it accepts is `hex_encode`'s own
+    /// output up to case.
+    #[test]
+    fn cluster_wire_hex_decode_never_panics(s in "\\PC{0,24}") {
+        if let Some(bytes) = hex_decode(&s) {
+            prop_assert_eq!(bytes.len() * 2, s.len());
+            prop_assert_eq!(hex_encode(&bytes), s.to_ascii_lowercase());
         }
     }
 }

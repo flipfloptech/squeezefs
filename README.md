@@ -1,6 +1,6 @@
 # SqueezeFS
 
-SqueezeFS is a high-performance distributed POSIX filesystem for Linux, written in Rust on `tokio` and `io_uring`. File metadata lives on dedicated block-based metadata volumes (**MetaLV**, a copy-on-write key/value store) and file contents are striped across local NVMe or NVMe-oF block devices. A FUSE client daemon exposes the filesystem at bare-metal throughput — no external database or coordination service required.
+SqueezeFS is a high-performance distributed POSIX filesystem for Linux, written in Rust on `io_uring` with its own lock-free executor — the daemon links no async-runtime framework. File metadata lives on dedicated block-based metadata volumes (**MetaLV**, a copy-on-write key/value store) and file contents are striped across local NVMe or NVMe-oF block devices. A FUSE client daemon exposes the filesystem at bare-metal throughput — no external database or coordination service required.
 
 ## Key properties
 
@@ -18,7 +18,7 @@ SqueezeFS is a high-performance distributed POSIX filesystem for Linux, written 
 ```
    +-------------------------------------------------+
    |                  FUSE Client                    |
-   |  (Rust, tokio, FUSE-over-io_uring transport)    |
+   |  (Rust, FUSE-over-io_uring transport)           |
    +--------+-------------------------------+--------+
             |                               |
    (locking & metadata)              (block data I/O)

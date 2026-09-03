@@ -1,6 +1,6 @@
 # AGENTS.md — Squeezefs One Source of Truth
 
-Squeezefs is a high-performance distributed POSIX FUSE filesystem (Rust + tokio + io_uring) with a decoupled block-based logical volume metadata store backend (MetaLV) and an NVMe / NVMe-oF block data backend. Linux-only.
+Squeezefs is a high-performance distributed POSIX FUSE filesystem (Rust + io_uring + the in-house `sqz_exec` executor — the shipped binary links NO tokio, user ruling 2026-08-13; `tests/no_tokio_convention_tests.rs` is the rail) with a decoupled block-based logical volume metadata store backend (MetaLV) and an NVMe / NVMe-oF block data backend. Linux-only.
 
 **This combined document is the single authoritative reference.** It merges architectural rules, non-negotiables, development workflow, build/test gates, profiling, and repo conventions. Read it before touching core logic.
 
@@ -93,7 +93,7 @@ Hardening: pool not marked ready until all queues submit REGISTER; per-qid commi
 * **Architecture Type:** Decoupled metadata (MetaLV) + **block data** (local NVMe / NVMe-oF), exposed via POSIX FUSE.
 
 ### Technology Stack
-* **Client Daemon (FUSE Engine):** Built in **Rust** using the asynchronous `tokio` runtime and `io_uring` polling over `/dev/fuse`.
+* **Client Daemon (FUSE Engine):** Built in **Rust** on `io_uring` (FUSE-over-io_uring after INIT) with the in-house executor (`crates/squeezefs-ipc/src/sqz_{exec,time,channel,blocking,taskset}.rs` — rip-tokio-total, 2026-08-13: the scheduler-bug remedy was REMOVAL; tokio survives as a `#[tokio::test]` dev-dependency only, enforced by `tests/no_tokio_convention_tests.rs`).
 * **Metadata & Distributed Lock Manager (DLM):** Local or distributed logical volume backend (**MetaLV**). Primary meta store for attrs, layout maps, leases, and volume format.
 * **Data Backend (primary):** **NVMe / NVMe-oF block devices** via `NvmeBlockDev` (io_uring workers). Progressive layouts (inline / staged / striped) live on this path.
 
@@ -128,7 +128,7 @@ Write custody maps to leases on Metadata Volumes:
 
 ### FUSE Client & Asynchronous I/O
 
-* Work-stealing / multi-thread tokio; core pinning where configured.
+* The in-house `sqz_exec` lane executor (per-core handler lanes, `sqz-meta` lanes, blocking pool); core pinning where configured. No tokio in product code.
 * **Block path io_uring:** `NvmeBlockDev` worker (bounded request queue, backpressure, fixed-file register when available).
 * **Path file I/O io_uring:** `crate::uring_fs` for ad-hoc local files (e.g. GDS cache materialize). Staging **mmap** segments stay mmap for zero-syscall get/put.
 * **FUSE transport:** the first-party **fuse3** fork (`crates/fuse3`) — classical `/dev/fuse` only for `FUSE_INIT` (kernel requires initialized connection before REGISTER); **FUSE-over-io_uring is required** for the request hot path after arm (`flags2` `FUSE_OVER_IO_URING`, `REGISTER` / `COMMIT_AND_FETCH`). No userspace opt-out; mount fails if setup fails. Auto-enables `fuse.enable_uring=Y` when possible. One queue per possible CPU; session arms only after all queues REGISTERed.
@@ -320,7 +320,7 @@ Behaviors:
 
 Concurrency:
 - Shared state: [Arc<Mutex<T>>, Arc<RwLock<T>>, lock-free, actor]
-- Async runtime: [tokio multi-thread, current-thread, custom]
+- Executor: [sqz_exec lane (which class), sqz_blocking pool, no async at all — NEVER tokio in product code]
 - Cancellation: [CancellationToken, drop-based, deadline]
 ```
 

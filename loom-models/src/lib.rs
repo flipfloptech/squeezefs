@@ -277,8 +277,6 @@ pub mod grant_table_core;
 pub mod incarnation_core;
 #[path = "../../crates/squeezefs-ipc/src/cqe_core.rs"]
 pub mod ipc_cqe_core;
-#[path = "../../crates/squeezefs-ipc/src/op_trace_core.rs"]
-pub mod op_trace_core;
 #[path = "../../crates/squeezefs-ipc/src/ring_core.rs"]
 pub mod ipc_ring_core;
 #[path = "../../crates/squeezefs-ipc/src/slot_core.rs"]
@@ -293,6 +291,8 @@ pub mod lease_clock_core;
 pub mod lease_core;
 #[path = "../../src/meta_backend/kv/node_state_core.rs"]
 pub mod node_state_core;
+#[path = "../../crates/squeezefs-ipc/src/op_trace_core.rs"]
+pub mod op_trace_core;
 #[path = "../../src/overlay_core.rs"]
 pub mod overlay_core;
 #[path = "../../src/patch_clone_core.rs"]
@@ -5647,6 +5647,7 @@ mod grant_table_models {
     }
 }
 
+#[cfg(all(test, loom))]
 mod range_custody_models {
     //! [`range_custody_core`] (DLM S11 rung 15, design-full-multi-writer
     //! §9.4's four named models; KD-MW-10's fourth core): the
@@ -5670,6 +5671,14 @@ mod range_custody_models {
     use loom::sync::{Arc, Mutex};
     use loom::thread;
 
+    /// The file geometry `plan_range` reads (finding 31): `dlm.rs` threads
+    /// `geometry.block_size` through as `block_size.unwrap_or(0)`, and `0`
+    /// selects the pre-f31 merge verbatim — skipping the head-stretch clip
+    /// and the abutment merge's block-hull gate. The models carry a real
+    /// geometry so both arms run: the asks below are block-shaped on
+    /// 4 KiB blocks (the shipped 4 MiB-block workloads, scaled).
+    const BLOCK_SIZE: u64 = 4096;
+
     fn grant(span: (u64, u64), scope: u64, token: u64) -> Grant {
         Grant {
             start: span.0,
@@ -5677,9 +5686,14 @@ mod range_custody_models {
             owner_nonce: scope,
             token,
             mode: LockMode::Exclusive,
-            // §9.3a's identity case: the models' asks carry no desired
-            // stretch, so the whole span is the required union.
+            // §9.3a: the ask's never-trim floor — everything beyond its
+            // hull is shrinkable stretch. The models admit the planned
+            // window as the record's required (the shipped admit names
+            // its `required`; the models' minted windows carry no tail).
             required: span,
+            // Finding 31: the honest per-ask claim list starts as the one
+            // ask (`dlm.rs`'s `required_segments: vec![required]`).
+            required_segments: vec![span],
         }
     }
 
@@ -5689,47 +5703,60 @@ mod range_custody_models {
     /// decision atomic. Weakening (plan in one lock take, admit in a
     /// second) lets both overlapping planners see a free window and both
     /// admit: EX custody granted twice over one byte range.
+    ///
+    /// The disjoint ask carries a desired stretch one block each way, so
+    /// the finding-31 head clip runs under the race: the minted window
+    /// keeps the TAIL block and never the head one (a whole foreign block
+    /// below the required's own block carries no honest custody — and the
+    /// clipped head is exactly what keeps the later overlap ask a fresh
+    /// scope-2 admit rather than an extension of this record).
     #[test]
     fn disjoint_admits_both_grant_and_overlaps_never_double_grant() {
         loom::model(|| {
             let custody = Arc::new(Mutex::new(FileCustody::empty()));
             let admit = |c: &Arc<Mutex<FileCustody>>,
                          required: (u64, u64),
+                         desired: (u64, u64),
                          scope: u64,
                          token: u64| {
                 let mut c = c.lock().unwrap();
                 // ONE critical section: plan and apply (the shipped
                 // `acquire_lock_range_scoped` discipline).
-                match c.plan_range(required, required, scope).plan {
+                match c.plan_range(required, desired, scope, BLOCK_SIZE).plan {
                     RangePlan::New { span } => {
                         c.admit(Some(span), grant(span, scope, token));
-                        true
+                        Some(span)
                     }
-                    RangePlan::HeldForeign => false,
+                    RangePlan::HeldForeign => None,
                     other => panic!("fresh scopes never coalesce/cover: {other:?}"),
                 }
             };
 
-            // T1: [0,4096) scope 1. T2: disjoint [8192,12288) scope 2,
-            // then OVERLAPPING [2048,6144) scope 2.
+            // T1: [0,4096) scope 1. T2: disjoint required [8192,12288)
+            // with desired [4096,16384) scope 2, then OVERLAPPING
+            // [2048,6144) scope 2.
             let t1 = {
                 let c = Arc::clone(&custody);
-                thread::spawn(move || admit(&c, (0, 4096), 1, 101))
+                thread::spawn(move || admit(&c, (0, 4096), (0, 4096), 1, 101))
             };
             let t2 = {
                 let c = Arc::clone(&custody);
                 thread::spawn(move || {
-                    let disjoint = admit(&c, (8192, 12288), 2, 102);
-                    let overlap = admit(&c, (2048, 6144), 2, 103);
+                    let disjoint = admit(&c, (8192, 12288), (4096, 16384), 2, 102);
+                    let overlap = admit(&c, (2048, 6144), (2048, 6144), 2, 103);
                     (disjoint, overlap)
                 })
             };
-            let g1 = t1.join().unwrap();
+            let g1 = t1.join().unwrap().is_some();
             let (disjoint, overlap) = t2.join().unwrap();
-            assert!(
+            assert_eq!(
                 disjoint,
-                "a DISJOINT span must grant on every interleaving (never serialized)"
+                Some((8192, 16384)),
+                "a DISJOINT span must grant on every interleaving (never serialized), \
+                 head-clipped to the required's own block and keeping the tail stretch \
+                 (finding 31)"
             );
+            let overlap = overlap.is_some();
             assert!(
                 g1 ^ overlap,
                 "overlapping EX spans from two scopes: exactly one admits, never both \
@@ -5781,7 +5808,10 @@ mod range_custody_models {
                 thread::spawn(move || {
                     let snapshot = w.load(Ordering::Acquire); // notified.enable()
                     let held = matches!(
-                        c.lock().unwrap().plan_range((1024, 2048), (1024, 2048), 7).plan,
+                        c.lock()
+                            .unwrap()
+                            .plan_range((1024, 2048), (1024, 2048), 7, BLOCK_SIZE)
+                            .plan,
                         RangePlan::HeldForeign
                     );
                     (snapshot, held)
@@ -5804,7 +5834,10 @@ mod range_custody_models {
             let admitted: Vec<bool> = (0..2u64)
                 .map(|i| {
                     let mut c = custody.lock().unwrap();
-                    match c.plan_range((1024, 2048), (1024, 2048), 20 + i).plan {
+                    match c
+                        .plan_range((1024, 2048), (1024, 2048), 20 + i, BLOCK_SIZE)
+                        .plan
+                    {
                         RangePlan::New { span } => {
                             c.admit(Some(span), grant(span, 20 + i, 200 + i));
                             true
@@ -5847,7 +5880,7 @@ mod range_custody_models {
                 let c = Arc::clone(&custody);
                 thread::spawn(move || {
                     let mut c = c.lock().unwrap();
-                    match c.plan_range((0, 4096), (0, 4096), 2).plan {
+                    match c.plan_range((0, 4096), (0, 4096), 2, BLOCK_SIZE).plan {
                         RangePlan::New { span } => {
                             c.admit(Some(span), grant(span, 2, 302));
                             true
@@ -5896,8 +5929,10 @@ mod range_custody_models {
                 let floor = Arc::clone(&floor);
                 thread::spawn(move || {
                     publish_floor_then_admit(&floor, TOKEN, || {
-                        *entry.lock().unwrap() =
-                            Some(FileCustody::opened(Some((0, 4096)), grant((0, 4096), 1, TOKEN)));
+                        *entry.lock().unwrap() = Some(FileCustody::opened(
+                            Some((0, 4096)),
+                            grant((0, 4096), 1, TOKEN),
+                        ));
                     });
                 })
             };
@@ -6003,9 +6038,17 @@ mod op_trace_ring_models {
     /// fails the range/order checks, a torn triple fails the field
     /// agreement.
     fn assert_intact(out: &[Sample], pushed: u64) {
-        assert_eq!(out.len() as u64, pushed, "every accepted push drains exactly once");
+        assert_eq!(
+            out.len() as u64,
+            pushed,
+            "every accepted push drains exactly once"
+        );
         for (i, s) in out.iter().enumerate() {
-            assert_eq!(s.op_id, i as u64 + 1, "stale/duplicate/missing sample at {i}: {s:?}");
+            assert_eq!(
+                s.op_id,
+                i as u64 + 1,
+                "stale/duplicate/missing sample at {i}: {s:?}"
+            );
             assert_eq!(u64::from(s.stage), s.op_id, "torn sample {s:?}");
             assert_eq!(s.mono_ns, s.op_id * 10, "torn sample {s:?}");
         }
@@ -6041,7 +6084,10 @@ mod op_trace_ring_models {
             let pushed = producer.join().unwrap();
             let mut out = consumer.join().unwrap();
             ring.drain_into(&mut out);
-            assert!(pushed >= 2, "a 2-slot ring accepts at least two of three pushes");
+            assert!(
+                pushed >= 2,
+                "a 2-slot ring accepts at least two of three pushes"
+            );
             assert_intact(&out, pushed);
             assert!(ring.is_empty(), "drained to empty");
         });

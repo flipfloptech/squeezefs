@@ -330,3 +330,83 @@ plane over) and the co-writer's CPU-starved publish pipeline.
    dedicated thread under saturation. A spin-before-park on the journal
    lane (the `SQUEEZEFS_IPC_SPIN_US` precedent — a fleet lever, never an
    ambient default) would trade a core for it; unmeasured.
+6. **Finding 49 — FIXED (`fix/f49-ring-park-abort`: RED `eea11eba`, fix
+   `3d3ad22d`).** Batch gate #3 on dev `4d194c59` (C-2 + R-4 on D-2):
+   `cargo test --all-features --test kv_scale_tests -- --test-threads=1`
+   failed 3/3 on `million_entry_directory_storm_create_lookup_readdir_
+   rmdir`'s UNLINK storm with `commit aborted while parked for ring
+   space`, the volume fail-stopped, and `rightmost_separator_pointer_
+   record_replays_clean` inherited the poisoned process.
+   * **Mechanism: none of (a)/(b)/(c) — a fourth, (d): the checkpoint's
+     cadence starved by its own unbounded threshold drain.** On the
+     failing run `meta_kv_checkpoints` sat at 1 and `reusable_upto` at
+     249 for the whole ~190 s storm while `head` climbed to the 32 MiB
+     cap; `min_inflight_start` = MAX (no open reservation held the tail —
+     not (c)); `windows_inflight` 0–1 with the `sqz-jrnl0` lane parked
+     idle in `io_cqring_wait` (stage B was not behind stage A — not (b));
+     the durability lane had nothing to wait on and the checkpoint's
+     barrier rides the `uring_fs` process pool, not the journal lane (no
+     cycle — not (a); the acyclicity argument is now `checkpoint.rs`'s
+     module doc). The checkpoint task's select — `timeout_at(next_tick,
+     wake.notified())` — polls the wake BEFORE the sleep; every pass under
+     the storm crossed the writeback threshold and re-armed the
+     maintenance wake, and `run_maintenance` popped until empty, so the
+     cadence arm (the ONLY path to a ring-pressure `checkpoint_cycle`,
+     i.e. the only thing that advances `reusable_upto` for a parked
+     committer) was never reached. The drain never emptied because single
+     items took 1–96 s: gdb on the spinning `sqz-meta0` (R state, one
+     CPU) → `bset::MergeIter::run_end` ← `compact` ← `fold_node_sources`
+     ← `compact_node` ← `smo_replace` ← `checkpoint_flush_node`, and a
+     fold census read 2 views / 35,114 records in → 1,839 out in **44.3 s**
+     (the next: 29,654 records, 31 s) — the directory inode's frozen Δtime
+     overlay is one same-key run, and `run_end` rescanned it from its
+     start for EVERY candidate (O(run²) record decodes). The D1.b
+     escalation then did what it is specified to do at 3 × 30 s of
+     continuous park. Latent before C-2 (the cadence contract is RED with
+     `SQUEEZEFS_JOURNAL_LANE=0` too — 0 cycles over a 5.0 s storm); C-2's
+     faster commit rate plus the all-features dhat allocator's global
+     lock made it deterministic under the gate (default-features and the
+     lane-off shape ran the storm 4× faster and outran the threshold).
+   * **Fix at the law level (three parts):** the cadence deadline is read
+     off the CLOCK after every wake (a wake returning past the deadline IS
+     the deadline); every threshold drain is bounded by one cadence period
+     (`KvTree::run_maintenance_until`, ≥ 1 item per pass so it always
+     progresses, leftovers re-arm the wake; the shutdown tick stays
+     unbounded); `MergeIter` memoizes the current run's end per source.
+     With all three the storm alone (all-features, lane on) creates in
+     9.8 s / unlinks in 9.5 s (was 76 s / 110–190 s + fail-stop); the
+     longest maintenance item 547 ms. What the drain bound does NOT bound
+     is one item's own service time — the reclaim-latency floor under a
+     storm is one SMO + one flush pass, stated in the module doc.
+   * **Contracts** (`tests/conveyor_two_stage_tests.rs` §3): `checkpoint_
+     cadence_survives_a_sustained_maintenance_storm` (16 committers × 300
+     × 4 KiB xattr commits, 32 MiB ring, 15 ms armed device latency; 0
+     cycles RED → 3 GREEN, 0 stalls) and `parked_committers_are_released_
+     by_the_checkpoint_under_a_sustained_storm` (8 MiB ring, `SQUEEZEFS_
+     TIMEOUT=1`, an observer that sees `reusable_upto` advance while
+     committers are parked — green before and after, pins the law).
+   * **Loom:** the ring-capacity dimension is already model-checked where
+     it is a word protocol — the `journal_core` models (admission past
+     `reusable_upto` refused, released by `advance_reusable_upto`,
+     conservation across transfer). Finding 49 is a scheduling-LIVENESS
+     property under a real clock (a select arm never reached), which
+     loom's bounded interleaving of atomics cannot express; the cargo
+     contract is its pin.
+   * **Field exposure: the C-2 brackets were NOT exposed.** Per leg the
+     authority wrote 8.15–8.34 MB of journal (7.7–7.9 MB on the busy
+     volume) over ~7.5 s against the 32 MiB ring — **≈ 0.24 rings per
+     leg** — with 19–20 checkpoint cycles per leg (one every ≈ 0.4 s) and
+     `meta_kv_journal_full_stalls` +0 on both volumes in all four legs
+     (`target/c2-fleet-abba/*/m0_p{0,1}.json`). A fail-stop would have
+     read as an ingest cliff; the rows were par. The trigger needs TWO
+     ratios at once: the serialized SMO drain's utilization ≥ 1 (item
+     arrivals × item service time — the maintenance queue never empties
+     within a cadence period) sustained for ≥ (ring − reserve) ÷ commit
+     byte rate — on the fleet ≈ 32 MiB ÷ 1.05 MB/s ≈ 30 s of a never-
+     empty queue, against an observed drain that emptied 20× per leg. The
+     storm hit both: 100 k same-directory unlinks (the debug-gate
+     population; 8 writers, dhat allocator) whose per-entry journal bytes
+     filled the ring while its ONE drain item ran 31–44 s — with the
+     checkpoint stuck at cycle 1 from the storm's first seconds, the
+     ring's whole capacity was the budget, and the 90 s D1.b ladder
+     (3 × `SQUEEZEFS_TIMEOUT`) elapsed inside the drain.

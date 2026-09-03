@@ -11672,6 +11672,28 @@ impl SqueezefsFilesystem {
                     "meta_conveyor_durability_passes".into(),
                     load(&meta_kv::META_CONVEYOR_DURABILITY_PASSES),
                 );
+                // C-2 (e2e audit DLM #3): the per-volume journal lanes —
+                // spawned (one per volume that committed), ringless (the
+                // degrade-loud arm, 0 on an io_uring box), and the
+                // engagement pair: windows submitted on a lane's OWN ring
+                // vs through the process pool (`SQUEEZEFS_JOURNAL_LANE=0`
+                // reads all-pool).
+                metrics.insert(
+                    "journal_lanes_spawned".into(),
+                    load(&meta_kv::journal_lane::JOURNAL_LANES_SPAWNED),
+                );
+                metrics.insert(
+                    "journal_lanes_ringless".into(),
+                    load(&meta_kv::journal_lane::JOURNAL_LANES_RINGLESS),
+                );
+                metrics.insert(
+                    "journal_ring_lane_writes".into(),
+                    load(&meta_kv::journal_lane::JOURNAL_RING_LANE_WRITES),
+                );
+                metrics.insert(
+                    "journal_ring_pool_writes".into(),
+                    load(&meta_kv::journal_lane::JOURNAL_RING_POOL_WRITES),
+                );
                 metrics.insert(
                     "meta_kv_checkpoints".into(),
                     load(&meta_kv::META_KV_CHECKPOINTS),

@@ -892,6 +892,14 @@ pub struct KvMetaBackend {
     /// two-stage commit conveyor"). Ungauged by the core: its population
     /// is `META_CONVEYOR_WINDOWS_INFLIGHT`, handoff → terminal outcome.
     durability_lane: Arc<ConveyorCore<ConveyorWindow>>,
+    /// C-2 (e2e audit DLM #3): the volume's own journal lane — the OS
+    /// thread both conveyor stages run on, which owns the volume's
+    /// journal io_uring and parks in it ([`super::journal_lane`]).
+    /// Spawned on the volume's FIRST commit (a reader / co-writer /
+    /// peer-owned volume never commits and never gets one); `None` inside
+    /// = `SQUEEZEFS_JOURNAL_LANE=0`, the shipped D-2 shape on the shared
+    /// `sqz-meta` pool.
+    journal_lane: std::sync::OnceLock<Option<Arc<super::journal_lane::JournalLane>>>,
     /// `Weak` self-reference the pass tasks upgrade per batch (set once,
     /// immediately after `Arc::new`, on every open path — the
     /// checkpoint-task `Weak` discipline).
@@ -2230,6 +2238,7 @@ impl KvMetaBackend {
             crossing_inflight: scc::HashMap::new(),
             conveyor: Arc::new(ConveyorCore::new()),
             durability_lane: Arc::new(ConveyorCore::with_gauge(None)),
+            journal_lane: std::sync::OnceLock::new(),
             conveyor_self: std::sync::OnceLock::new(),
             layout_conveyor: Arc::new(ConveyorCore::new()),
             batch_max_txs: resolve_commit_batch_txs(
@@ -7673,6 +7682,37 @@ impl KvMetaBackend {
         Ok(())
     }
 
+    /// The volume's journal lane (C-2), spawned on first use; `None` under
+    /// `SQUEEZEFS_JOURNAL_LANE=0`.
+    fn journal_lane(&self) -> Option<&Arc<super::journal_lane::JournalLane>> {
+        self.journal_lane
+            .get_or_init(|| {
+                if !crate::env_knobs::bool_knob("SQUEEZEFS_JOURNAL_LANE", true) {
+                    return None;
+                }
+                let idx = super::journal_lane::JOURNAL_LANES_SPAWNED.load(Ordering::Relaxed);
+                Some(super::journal_lane::JournalLane::spawn(
+                    &self.path,
+                    idx as usize,
+                ))
+            })
+            .as_ref()
+    }
+
+    /// Spawn a conveyor-stage task (the apply pass, the durability lane)
+    /// on the volume's journal lane — or on the shared `sqz-meta` pool
+    /// when the lane is off. Both venues are plane-critical, panic-
+    /// contained and counted.
+    fn spawn_conveyor_task<F>(&self, site: &'static str, fut: F)
+    where
+        F: std::future::Future<Output = ()> + Send + 'static,
+    {
+        match self.journal_lane() {
+            Some(lane) => lane.spawn_task(site, fut),
+            None => crate::meta_exec::spawn_meta(site, fut),
+        }
+    }
+
     fn note_journal_failure(&self) {
         let n = self.journal_failures.fetch_add(1, Ordering::AcqRel) + 1;
         if n >= JOURNAL_FAILURE_LATCH && !self.failed.swap(true, Ordering::AcqRel) {
@@ -7807,11 +7847,9 @@ impl KvMetaBackend {
             let conveyor = Arc::clone(&self.conveyor);
             // Stage 1c: the pass task is PLANE-CRITICAL (it holds the 4b
             // union leaf locks and every committer parks on its fan-out)
-            // — sqz-meta lanes, never the main tokio runtime.
-            crate::meta_exec::spawn_meta(
-                "kv_conveyor_pass",
-                Self::conveyor_pass_task(conveyor, weak),
-            );
+            // — the volume's journal lane (C-2; the sqz-meta pool with the
+            // lane off), never the main tokio runtime.
+            self.spawn_conveyor_task("kv_conveyor_pass", Self::conveyor_pass_task(conveyor, weak));
         }
 
         // (3) Park on the fan-out. A closed channel means the pass died
@@ -7920,7 +7958,7 @@ impl KvMetaBackend {
                 let len = window.entries.len() as u64;
                 lane.enqueue(window, len);
                 if lane.try_lead() {
-                    crate::meta_exec::spawn_meta(
+                    be.spawn_conveyor_task(
                         "kv_conveyor_durability",
                         Self::durability_lane_task(lane, Weak::clone(&weak)),
                     );
@@ -8460,7 +8498,9 @@ impl KvMetaBackend {
             if parts.is_empty() {
                 Ok(None)
             } else {
-                self.ring.submit_entries_batch(&parts).map(Some)
+                self.ring
+                    .submit_entries_batch(&parts, self.journal_lane().map(Arc::as_ref))
+                    .map(Some)
             }
         };
 

@@ -899,15 +899,32 @@ impl JournalRing {
     /// The caller owns registration/completion of the covering
     /// reservation (completed on BOTH outcomes once the write's outcome
     /// is known — the commit_entry discipline, batch edition).
+    ///
+    /// **C-2**: with the volume's journal lane armed (and this call made
+    /// on it — the apply pass runs there by construction) the batch is
+    /// submitted on the lane's OWN ring, whose completion the lane reaps
+    /// itself; otherwise on the process pool.
     pub fn submit_entries_batch(
         &self,
         parts: &[(Reservation, &[(u8, Record)])],
+        lane: Option<&super::journal_lane::JournalLane>,
     ) -> Result<EntriesWriteInFlight, KvError> {
         let mut ops: Vec<(u64, bytes::Bytes)> = Vec::new();
         for (res, records) in parts {
             self.entry_ops(res, records, &mut ops)?;
         }
-        let completion = crate::uring_fs::submit_write_at_batch(&self.path, ops)?;
+        let mut ops = Some(ops);
+        let completion = match lane.and_then(|l| l.submit_write_at_batch(&self.path, &mut ops)) {
+            Some(c) => c,
+            None => {
+                super::journal_lane::JOURNAL_RING_POOL_WRITES
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                crate::uring_fs::submit_write_at_batch(
+                    &self.path,
+                    ops.take().expect("ops untouched by a declined lane submit"),
+                )?
+            }
+        };
         Ok(EntriesWriteInFlight {
             submitted_at: completion.submitted_at(),
             completion,

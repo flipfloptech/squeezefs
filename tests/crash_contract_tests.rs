@@ -1743,7 +1743,7 @@ async fn kv_write_batch3(
         .zip(&recs)
         .map(|(r, recs)| (*r, recs.as_slice()))
         .collect();
-    ring.submit_entries_batch(&parts)
+    ring.submit_entries_batch(&parts, None)
         .expect("clean batch submit")
         .finish(ring, &squeezefs::op_trace::TracedBatch::new())
         .await

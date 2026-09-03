@@ -59,6 +59,7 @@ pub mod indirect_map;
 pub mod ino_lane;
 pub mod journal;
 pub mod journal_core;
+pub mod journal_lane;
 pub mod node;
 pub mod node_cache;
 pub mod node_state_core;

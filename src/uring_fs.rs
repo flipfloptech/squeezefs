@@ -1448,7 +1448,13 @@ impl Reactor {
     /// Only a push that fails right after a successful flush is a real
     /// error (and must be loud).
     fn push_slot(&mut self, i: usize) {
-        let sqe = self.sqe_for(i);
+        self.push_slot_flags(i, io_uring::squeue::Flags::empty());
+    }
+
+    /// [`Self::push_slot`] with SQE flags (`IO_LINK` for the slow-device
+    /// seam's chained batch).
+    fn push_slot_flags(&mut self, i: usize, flags: io_uring::squeue::Flags) {
+        let sqe = self.sqe_for(i).flags(flags);
         // SAFETY: buffers referenced by the SQE live in `self.slots[i]`, which
         // stays untouched until this SQE's completion is reaped.
         let mut res = unsafe { self.ring.submission().push(&sqe) };
@@ -1469,6 +1475,74 @@ impl Reactor {
                     let _ = tx.send(Err(err()));
                 }
             }
+        }
+    }
+
+    /// Admit one logical write batch: every non-empty `(offset, bytes)`
+    /// gets its own slot + SQE sharing one aggregate completion. With
+    /// `link_after` (the slow-device seam on an owned ring — the pool
+    /// models latency on its deadline lane instead) the batch is chained
+    /// behind a `TIMEOUT(ETIME_SUCCESS)` SQE: the whole batch completes no
+    /// earlier than that latency after submission, on the same ring, so
+    /// the owning lane's slow path (a completion NOT present at submit) is
+    /// exercised by a REAL late CQE. The kernel reads the timespec at
+    /// submission: `link_after`'s caller submits before returning.
+    fn admit_write_batch(
+        &mut self,
+        path: PathBuf,
+        ops: Vec<(u64, bytes::Bytes)>,
+        tx: WriteTx,
+        admitted_at: std::time::Instant,
+        link_after: Option<&io_uring::types::Timespec>,
+    ) {
+        let file = match cached_open(&mut self.cache, &path, true) {
+            Ok(f) => f,
+            Err(e) => {
+                send_now(tx, Err(e));
+                return;
+            }
+        };
+        let entries: Vec<(u64, bytes::Bytes)> =
+            ops.into_iter().filter(|(_, d)| !d.is_empty()).collect();
+        if entries.is_empty() {
+            send_now(tx, Ok(()));
+            return;
+        }
+        let state = Rc::new(std::cell::RefCell::new(BatchState {
+            remaining: entries.len(),
+            first_err: None,
+            tx: Some(tx),
+            admitted_at,
+        }));
+        let linked = link_after.is_some();
+        if let Some(ts) = link_after {
+            let t = io_uring::opcode::Timeout::new(ts)
+                .flags(io_uring::types::TimeoutFlags::ETIME_SUCCESS)
+                .build()
+                .flags(io_uring::squeue::Flags::IO_LINK)
+                .user_data(SEAM_TIMEOUT_UD);
+            // SAFETY: the timespec outlives the submission (caller's
+            // contract above); the SQE references nothing else.
+            if unsafe { self.ring.submission().push(&t) }.is_err() && self.ring.submit().is_ok() {
+                // SAFETY: as above.
+                let _ = unsafe { self.ring.submission().push(&t) };
+            }
+        }
+        let n = entries.len();
+        for (k, (offset, data)) in entries.into_iter().enumerate() {
+            let i = self.claim_slot(Pending::Write {
+                file: file.clone(),
+                data,
+                file_offset: offset,
+                written: 0,
+                done: UnitDone::Batch(state.clone()),
+            });
+            let flags = if linked && k + 1 < n {
+                io_uring::squeue::Flags::IO_LINK
+            } else {
+                io_uring::squeue::Flags::empty()
+            };
+            self.push_slot_flags(i, flags);
         }
     }
 
@@ -1604,33 +1678,7 @@ impl Reactor {
                 Err(e) => send_now(tx, Err(e)),
             },
             FsReq::WriteAtBatch { path, ops, tx } => {
-                match cached_open(&mut self.cache, &path, true) {
-                    Ok(file) => {
-                        let entries: Vec<(u64, bytes::Bytes)> =
-                            ops.into_iter().filter(|(_, d)| !d.is_empty()).collect();
-                        if entries.is_empty() {
-                            send_now(tx, Ok(()));
-                            return;
-                        }
-                        let state = Rc::new(std::cell::RefCell::new(BatchState {
-                            remaining: entries.len(),
-                            first_err: None,
-                            tx: Some(tx),
-                            admitted_at,
-                        }));
-                        for (offset, data) in entries {
-                            let i = self.claim_slot(Pending::Write {
-                                file: file.clone(),
-                                data,
-                                file_offset: offset,
-                                written: 0,
-                                done: UnitDone::Batch(state.clone()),
-                            });
-                            self.push_slot(i);
-                        }
-                    }
-                    Err(e) => send_now(tx, Err(e)),
-                }
+                self.admit_write_batch(path, ops, tx, admitted_at, None);
             }
             FsReq::Fdatasync { path, tx } => match cached_open(&mut self.cache, &path, false) {
                 Ok(file) => {
@@ -1780,53 +1828,77 @@ fn worker_loop(rx: crossbeam::channel::Receiver<FsReq>) {
                 // Ring is broken: fail every in-flight op loudly and drop to
                 // the blocking fallback for the rest of the process lifetime.
                 log::error!("uring-fs: submit_and_wait failed: {e:?}");
-                let now = std::time::Instant::now();
-                for i in 0..r.slots.len() {
-                    if r.slots[i].is_some() {
-                        let p = r.release_slot(i);
-                        let err = || map_io(std::io::Error::other("uring-fs ring failed"));
-                        match p {
-                            Pending::Read { tx, .. } => {
-                                let _ = tx.send(Err(err()));
-                            }
-                            Pending::Write { done, .. } => done.complete(Err(err()), now),
-                            Pending::Fsync { tx, .. } => {
-                                let _ = tx.send(Err(err()));
-                            }
-                        }
-                    }
-                }
+                r.fail_all("uring-fs ring failed");
                 blocking_fallback_loop(rx);
                 return;
             }
         }
+        r.reap();
+    }
+}
 
-        // Reap all available completions; push continuations after the CQ
-        // borrow ends (each continuation reuses a just-reaped SQ slot).
-        // ONE clock read per reap pass stamps `ufs_wake` on every outcome
-        // it delivers.
+/// `user_data` of the slow-device seam's chain-head `TIMEOUT` SQE (never a
+/// slot index; skipped at reap).
+const SEAM_TIMEOUT_UD: u64 = u64::MAX - 1;
+/// `user_data` of an owned ring's wake-eventfd `READ` SQE (skipped at
+/// reap; its arrival re-arms the next park).
+const WAKE_UD: u64 = u64::MAX;
+
+impl Reactor {
+    /// Reap every posted completion; push continuations after the CQ
+    /// borrow ends (each continuation reuses a just-reaped SQ slot). ONE
+    /// clock read per reap pass stamps `ufs_wake` on every outcome it
+    /// delivers. Returns `true` if the owned ring's wake CQE was among
+    /// them.
+    fn reap(&mut self) -> bool {
         let mut resubmit: Vec<usize> = Vec::new();
+        let mut woke = false;
         {
-            let mut cq = r.ring.completion();
+            let mut cq = self.ring.completion();
             cq.sync();
-            let completed: Vec<(usize, i32)> = (&mut cq)
-                .map(|cqe| (cqe.user_data() as usize, cqe.result()))
+            let completed: Vec<(u64, i32)> = (&mut cq)
+                .map(|cqe| (cqe.user_data(), cqe.result()))
                 .collect();
             drop(cq);
             let now = std::time::Instant::now();
-            for (slot, res) in completed {
-                if r.advance(slot, res, now) {
-                    resubmit.push(slot);
+            for (ud, res) in completed {
+                match ud {
+                    WAKE_UD => woke = true,
+                    SEAM_TIMEOUT_UD => {}
+                    slot => {
+                        if self.advance(slot as usize, res, now) {
+                            resubmit.push(slot as usize);
+                        }
+                    }
                 }
             }
         }
         for slot in resubmit {
-            r.push_slot_continue(slot);
+            self.push_slot_continue(slot);
+        }
+        woke
+    }
+
+    /// Fail every in-flight op loudly (the ring is broken).
+    fn fail_all(&mut self, what: &'static str) {
+        let now = std::time::Instant::now();
+        for i in 0..self.slots.len() {
+            if self.slots[i].is_some() {
+                let p = self.release_slot(i);
+                let err = || map_io(std::io::Error::other(what));
+                match p {
+                    Pending::Read { tx, .. } => {
+                        let _ = tx.send(Err(err()));
+                    }
+                    Pending::Write { done, .. } => done.complete(Err(err()), now),
+                    Pending::Fsync { tx, .. } => {
+                        let _ = tx.send(Err(err()));
+                    }
+                }
+            }
         }
     }
-}
 
-impl Reactor {
     /// Re-queue a continuation SQE for a slot that stays in flight (the slot
     /// was NOT released, so `inflight` is unchanged).
     fn push_slot_continue(&mut self, i: usize) {
@@ -1850,6 +1922,259 @@ impl Reactor {
                     let _ = tx.send(Err(err()));
                 }
             }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The OWNED reactor (e2e perf audit C-2): one io_uring driven by the thread
+// that also awaits its completions.
+//
+// The pool above is a worker-per-ring pipeline behind a queue: a caller's
+// write crosses two threads to complete (caller → worker, worker → the
+// caller's lane) and each crossing is a scheduler wake — the hop chain
+// `uring_fs_write_phase_ns` decomposes. A lane that owns its ring submits
+// on its own thread (`submit_write_at_batch`: admit + `submit()`, no wait),
+// parks IN the ring (`park`: `io_uring_enter` with the wake-eventfd `READ`
+// SQE armed, so a task wake and a device completion arrive through one
+// wait), and reaps on its own thread (`service`) — the completion's
+// oneshot fires on the thread that will poll the awaiting task, and the
+// only cross-thread wakes left are the kernel's own (the io-wq punt a
+// buffered block-device write takes, and the ring wait's return).
+//
+// Same reactor, same fault shim, same continuation/short-write handling,
+// same `WriteCompletion` handle as the pool — only WHO drives it differs.
+// ---------------------------------------------------------------------------
+
+/// A wake handle onto an owned reactor's eventfd (any thread): the lane
+/// parker's `unpark` (`squeezefs_ipc::sqz_exec::LanePark`).
+#[derive(Clone)]
+pub struct RingWake {
+    fd: Arc<std::os::fd::OwnedFd>,
+}
+
+impl RingWake {
+    /// Bump the eventfd: a park in progress returns, a park not yet
+    /// entered returns at once when it does (the counter is sticky).
+    pub fn wake(&self) {
+        let one: u64 = 1;
+        // SAFETY: an 8-byte write of a u64 to a live eventfd this handle
+        // co-owns; EAGAIN (counter saturated) is impossible at our rates
+        // and harmless (a saturated counter is already "woken").
+        let _ = unsafe {
+            libc::write(
+                self.fd.as_raw_fd(),
+                (&one as *const u64).cast(),
+                std::mem::size_of::<u64>(),
+            )
+        };
+    }
+}
+
+/// The `Send` half of an owned reactor: the ring and its wake eventfd,
+/// created on any thread and handed to the thread that will drive them
+/// ([`OwnedRing::into_reactor`]).
+pub struct OwnedRing {
+    ring: io_uring::IoUring,
+    wake: RingWake,
+}
+
+impl OwnedRing {
+    /// A ring of `entries` SQEs plus its wake eventfd.
+    pub fn new(entries: u32) -> std::io::Result<Self> {
+        let ring = io_uring::IoUring::new(entries)?;
+        // SAFETY: eventfd(2) with no invalid arguments; the fd is owned.
+        let raw = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
+        if raw < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        // SAFETY: a fresh, valid fd we own.
+        let fd = unsafe { <std::os::fd::OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(raw) };
+        Ok(Self {
+            ring,
+            wake: RingWake { fd: Arc::new(fd) },
+        })
+    }
+
+    /// The any-thread wake handle.
+    pub fn wake_handle(&self) -> RingWake {
+        self.wake.clone()
+    }
+
+    /// Bind the ring to the calling thread as its reactor.
+    pub fn into_reactor(self) -> OwnedReactor {
+        OwnedReactor {
+            r: Reactor::new(self.ring),
+            wake: self.wake,
+            wake_buf: Box::new(0),
+            wake_armed: false,
+        }
+    }
+}
+
+/// One io_uring owned and driven by ONE thread (module comment above; the
+/// journal lane keeps it in a thread-local). Built from an [`OwnedRing`]
+/// on the driving thread — the reactor's slot table is thread-bound.
+pub struct OwnedReactor {
+    r: Reactor,
+    wake: RingWake,
+    /// The eventfd `READ` SQE's target — boxed so its address is stable
+    /// for the SQE's lifetime whatever moves this struct before the first
+    /// arm.
+    wake_buf: Box<u64>,
+    /// Exactly one wake `READ` is pending whenever the thread parks.
+    wake_armed: bool,
+}
+
+/// The shim's verdict for a write bound for an owned ring.
+enum InlineVerdict {
+    /// Proceed on the ring (power-cut originals captured), with the armed
+    /// device latency to model as a linked timeout.
+    Proceed {
+        ops: Vec<(u64, bytes::Bytes)>,
+        latency: Option<std::time::Duration>,
+    },
+    /// The shim consumed the write (failed it now, or parked it on a
+    /// stall to be resubmitted through the pool): the outcome arrives on
+    /// this completion.
+    Consumed(WriteCompletion),
+}
+
+/// Run the fault shim for an owned-ring write. Every arm the pool's
+/// admission applies applies here — poison, sector error, torn write,
+/// write stall, power-cut capture — EXCEPT the device latency, which the
+/// pool serves from its deadline lane and an owned ring models as a
+/// linked `TIMEOUT` on the ring itself (so the owning lane's late-CQE
+/// path is what a slow device exercises).
+fn intercept_inline_write(path: &Path, ops: Vec<(u64, bytes::Bytes)>) -> InlineVerdict {
+    if !FAULTS_ACTIVE.load(std::sync::atomic::Ordering::Relaxed) {
+        return InlineVerdict::Proceed { ops, latency: None };
+    }
+    let latency = FAULT_STATE
+        .lock()
+        .unwrap()
+        .latency
+        .get(path)
+        .map(|l| l.write)
+        .filter(|d| !d.is_zero());
+    let (tx, rx) = oneshot::channel();
+    let submitted_at = std::time::Instant::now();
+    // `Delayed` skips the shim's latency arm (served above); every other
+    // arm applies verbatim.
+    let req = FsReq::Delayed(Box::new(FsReq::WriteAtBatch {
+        path: path.to_path_buf(),
+        ops,
+        tx,
+    }));
+    match fault_intercept(req) {
+        Some(FsReq::WriteAtBatch { ops, .. }) => InlineVerdict::Proceed { ops, latency },
+        Some(_) => unreachable!("the shim returns the request it was given"),
+        None => InlineVerdict::Consumed(WriteCompletion {
+            rx,
+            submitted_at,
+            done: None,
+        }),
+    }
+}
+
+impl OwnedReactor {
+    /// Submit every `(offset, bytes)` pair to `path` as one batch on THIS
+    /// ring — admit + `submit()`, no wait — and return its completion.
+    /// The fault shim is honored (module comment); an armed device
+    /// latency rides as a linked timeout.
+    pub fn submit_write_at_batch(
+        &mut self,
+        path: &Path,
+        ops: Vec<(u64, bytes::Bytes)>,
+    ) -> WriteCompletion {
+        let (ops, latency) = match intercept_inline_write(path, ops) {
+            InlineVerdict::Proceed { ops, latency } => (ops, latency),
+            InlineVerdict::Consumed(c) => return c,
+        };
+        let (tx, rx) = oneshot::channel();
+        let submitted_at = std::time::Instant::now();
+        let ts = latency.map(|d| {
+            io_uring::types::Timespec::new()
+                .sec(d.as_secs())
+                .nsec(d.subsec_nanos())
+        });
+        // `ufs_admit` ≡ `ufs_submit` on an owned ring: the submitter IS
+        // the admitter (queue_hop reads the SQE build, µs).
+        self.r
+            .admit_write_batch(path.to_path_buf(), ops, tx, submitted_at, ts.as_ref());
+        // Non-blocking: hands the SQEs to the kernel (a buffered
+        // block-device write punts to io-wq here; a filesystem that
+        // completes it inline posts the CQE before this returns).
+        if let Err(e) = self.r.ring.submit() {
+            if e.kind() != std::io::ErrorKind::Interrupted {
+                log::error!("uring-fs owned ring: submit failed: {e:?}");
+                self.r.fail_all("uring-fs owned ring submit failed");
+            }
+        }
+        WriteCompletion {
+            rx,
+            submitted_at,
+            done: None,
+        }
+    }
+
+    /// Park the owning thread in the ring until a completion or a wake
+    /// arrives, or `tick` elapses (`true` = the tick fired). Exactly one
+    /// wake `READ` SQE is kept armed across parks.
+    pub fn park(&mut self, tick: std::time::Duration) -> bool {
+        if !self.wake_armed {
+            let sqe = io_uring::opcode::Read::new(
+                io_uring::types::Fd(self.wake.fd.as_raw_fd()),
+                (&mut *self.wake_buf as *mut u64).cast::<u8>(),
+                std::mem::size_of::<u64>() as u32,
+            )
+            .build()
+            .user_data(WAKE_UD);
+            // SAFETY: `wake_buf` is boxed (stable address) and lives as long
+            // as this reactor, which outlives every SQE it submits.
+            if unsafe { self.r.ring.submission().push(&sqe) }.is_err()
+                && self.r.ring.submit().is_ok()
+            {
+                // SAFETY: as above.
+                let _ = unsafe { self.r.ring.submission().push(&sqe) };
+            }
+            self.wake_armed = true;
+        }
+        let ts = io_uring::types::Timespec::new()
+            .sec(tick.as_secs())
+            .nsec(tick.subsec_nanos());
+        let args = io_uring::types::SubmitArgs::new().timespec(&ts);
+        match self.r.ring.submitter().submit_with_args(1, &args) {
+            Ok(_) => false,
+            Err(e) if e.raw_os_error() == Some(libc::ETIME) => true,
+            Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => false,
+            Err(e) if e.raw_os_error() == Some(libc::EINVAL) => {
+                // No `IORING_FEAT_EXT_ARG` (pre-5.11): an untimed wait — the
+                // eventfd makes wakes lossless, the tick backstop is lost.
+                match self.r.ring.submit_and_wait(1) {
+                    Ok(_) => false,
+                    Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => false,
+                    Err(e) => {
+                        log::error!("uring-fs owned ring: wait failed: {e:?}");
+                        self.r.fail_all("uring-fs owned ring wait failed");
+                        false
+                    }
+                }
+            }
+            Err(e) => {
+                log::error!("uring-fs owned ring: wait failed: {e:?}");
+                self.r.fail_all("uring-fs owned ring wait failed");
+                false
+            }
+        }
+    }
+
+    /// Reap every posted completion (the owning thread's per-iteration
+    /// hook): outcomes fire their oneshots here, on the thread that polls
+    /// the tasks awaiting them.
+    pub fn service(&mut self) {
+        if self.r.reap() {
+            self.wake_armed = false;
         }
     }
 }

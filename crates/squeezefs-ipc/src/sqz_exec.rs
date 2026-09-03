@@ -24,6 +24,17 @@
 //! * **A panicking task never kills the lane** (`catch_unwind` per
 //!   poll): the task completes-by-panic, [`task_panics`] grows (the
 //!   detached-task-panics discipline), the lane serves on.
+//! * **The park is pluggable** ([`LanePark`], e2e perf audit C-2): a lane
+//!   that owns an I/O ring parks IN the ring (`io_uring_enter` with a
+//!   wake-eventfd SQE armed) instead of on a condvar, so the ring's
+//!   completions and the lane's task wakes arrive through ONE wait and
+//!   a completion never crosses a thread to reach the task awaiting it.
+//!   The default parker is the condvar. The lost-wake-freedom argument
+//!   is the queue mutex: the lane marks itself parked UNDER the lock in
+//!   the same section that found the queue empty, and every enqueue
+//!   reads that mark UNDER the lock after its push — a push the lane's
+//!   check missed sees the mark and unparks (parkers are sticky: an
+//!   unpark before the park returns it immediately).
 
 use crate::exec_core::TaskState;
 use std::collections::VecDeque;
@@ -36,6 +47,51 @@ use std::time::Duration;
 
 /// The park bound — the same 2 s liveness posture as `sqz_sync::TICK`.
 pub const TICK: Duration = Duration::from_secs(2);
+
+/// How a lane thread waits for work (see the module doc). `park` runs on
+/// the lane thread only, with the ready-queue mutex NOT held; `unpark`
+/// runs on any thread and must be STICKY (an unpark delivered before the
+/// matching park makes that park return at once); `service` runs on the
+/// lane thread once per loop iteration — the owner's non-blocking hook
+/// (a ring parker reaps its completions here, so a completion posted
+/// while the lane was busy is delivered without a park).
+pub trait LanePark: Send + Sync {
+    /// Block until unparked or `tick` elapses; `true` = the tick fired.
+    fn park(&self, tick: Duration) -> bool;
+    /// Wake a parked lane.
+    fn unpark(&self);
+    /// Per-iteration owner hook (never blocks).
+    fn service(&self) {}
+}
+
+/// The default parker: a sticky flag under a mutex + condvar.
+#[derive(Default)]
+pub struct CondvarPark {
+    flag: Mutex<bool>,
+    cv: Condvar,
+}
+
+impl LanePark for CondvarPark {
+    fn park(&self, tick: Duration) -> bool {
+        let mut g = self.flag.lock().unwrap_or_else(|e| e.into_inner());
+        let mut timed_out = false;
+        while !*g && !timed_out {
+            let (guard, t) = self
+                .cv
+                .wait_timeout(g, tick)
+                .unwrap_or_else(|e| e.into_inner());
+            g = guard;
+            timed_out = t.timed_out();
+        }
+        let woke = std::mem::replace(&mut *g, false);
+        timed_out && !woke
+    }
+
+    fn unpark(&self) {
+        *self.flag.lock().unwrap_or_else(|e| e.into_inner()) = true;
+        self.cv.notify_one();
+    }
+}
 
 /// Ticks that found runnable work waiting (a notify that never landed).
 /// ≈0 healthy; growth is a delivery bug surfacing loudly instead of a
@@ -76,18 +132,30 @@ impl std::task::Wake for LaneTask {
     }
 }
 
+/// The ready queue plus the lane's parked mark — ONE mutex, so the
+/// mark's visibility to an enqueuer needs no fence argument.
+struct Ready {
+    queue: VecDeque<Arc<LaneTask>>,
+    /// Set by the lane thread in the lock section that found the queue
+    /// empty; cleared by it after the park returns.
+    parked: bool,
+}
+
 struct ExecShared {
-    queue: Mutex<VecDeque<Arc<LaneTask>>>,
-    ready: Condvar,
+    ready: Mutex<Ready>,
+    park: Arc<dyn LanePark>,
     shutdown: AtomicBool,
 }
 
 impl ExecShared {
     fn enqueue(&self, task: Arc<LaneTask>) {
-        let mut q = self.queue.lock().unwrap_or_else(|e| e.into_inner());
-        q.push_back(task);
-        drop(q);
-        self.ready.notify_one();
+        let mut r = self.ready.lock().unwrap_or_else(|e| e.into_inner());
+        r.queue.push_back(task);
+        let parked = r.parked;
+        drop(r);
+        if parked {
+            self.park.unpark();
+        }
     }
 }
 
@@ -106,10 +174,18 @@ impl Default for LaneExec {
 
 impl LaneExec {
     pub fn new() -> Self {
+        Self::with_park(Arc::new(CondvarPark::default()))
+    }
+
+    /// A lane whose idle wait is `park` (see [`LanePark`]).
+    pub fn with_park(park: Arc<dyn LanePark>) -> Self {
         LaneExec {
             shared: Arc::new(ExecShared {
-                queue: Mutex::new(VecDeque::new()),
-                ready: Condvar::new(),
+                ready: Mutex::new(Ready {
+                    queue: VecDeque::new(),
+                    parked: false,
+                }),
+                park,
                 shutdown: AtomicBool::new(false),
             }),
         }
@@ -136,11 +212,12 @@ impl LaneExec {
         self.shared.enqueue(task);
     }
 
-    /// Ask the run loop to exit once observed (tests / teardown; lane
-    /// threads are process-lifetime in the daemon).
+    /// Ask the run loop to exit once observed (tests / teardown; the
+    /// process-wide lanes are process-lifetime in the daemon, the
+    /// per-volume journal lanes live with their volume).
     pub fn shutdown(&self) {
         self.shared.shutdown.store(true, Ordering::Release);
-        self.shared.ready.notify_one();
+        self.shared.park.unpark();
     }
 
     /// The lane thread body: pop → poll → route the outcome through the
@@ -148,24 +225,30 @@ impl LaneExec {
     pub fn run(&self) {
         let shared = &self.shared;
         loop {
+            if shared.shutdown.load(Ordering::Acquire) {
+                return;
+            }
             let task = {
-                let mut q = shared.queue.lock().unwrap_or_else(|e| e.into_inner());
-                loop {
-                    if shared.shutdown.load(Ordering::Acquire) {
-                        return;
-                    }
-                    if let Some(t) = q.pop_front() {
-                        break t;
-                    }
-                    let (guard, timeout) = shared
-                        .ready
-                        .wait_timeout(q, TICK)
-                        .unwrap_or_else(|e| e.into_inner());
-                    q = guard;
-                    if timeout.timed_out() && !q.is_empty() {
-                        // The tick backstop engaged: work was waiting
-                        // and no notify delivered it. ≈0 healthy.
-                        TICK_RESCUES.fetch_add(1, Ordering::Relaxed);
+                let mut r = shared.ready.lock().unwrap_or_else(|e| e.into_inner());
+                match r.queue.pop_front() {
+                    Some(t) => t,
+                    None => {
+                        // Mark parked in the SAME lock section that found
+                        // the queue empty (module doc: the lost-wake
+                        // argument is this mutex).
+                        r.parked = true;
+                        drop(r);
+                        let timed_out = shared.park.park(TICK);
+                        let mut r = shared.ready.lock().unwrap_or_else(|e| e.into_inner());
+                        r.parked = false;
+                        if timed_out && !r.queue.is_empty() {
+                            // The tick backstop engaged: work was waiting
+                            // and no unpark delivered it. ≈0 healthy.
+                            TICK_RESCUES.fetch_add(1, Ordering::Relaxed);
+                        }
+                        drop(r);
+                        shared.park.service();
+                        continue;
                     }
                 }
             };
@@ -212,15 +295,17 @@ impl LaneExec {
                     }
                 }
             }
+            shared.park.service();
         }
     }
 
     /// Queue depth (diagnostics).
     pub fn queue_len(&self) -> usize {
         self.shared
-            .queue
+            .ready
             .lock()
             .unwrap_or_else(|e| e.into_inner())
+            .queue
             .len()
     }
 }
@@ -350,6 +435,151 @@ mod tests {
         rx.recv_timeout(Duration::from_secs(5))
             .expect("lane must survive a task panic");
         assert!(TASK_PANICS.load(Ordering::Relaxed) > before);
+        ex.shutdown();
+        jh.join().unwrap();
+    }
+
+    /// A recording parker: sticky like the contract demands, and it
+    /// counts parks/unparks so the tests can read the protocol.
+    #[derive(Default)]
+    struct CountingPark {
+        inner: CondvarPark,
+        parks: AtomicU64,
+        unparks: AtomicU64,
+        services: AtomicU64,
+    }
+
+    impl LanePark for CountingPark {
+        fn park(&self, tick: Duration) -> bool {
+            self.parks.fetch_add(1, Ordering::SeqCst);
+            self.inner.park(tick)
+        }
+        fn unpark(&self) {
+            self.unparks.fetch_add(1, Ordering::SeqCst);
+            self.inner.unpark();
+        }
+        fn service(&self) {
+            self.services.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    /// A pluggable parker sees the lane's idle waits and the wakes that
+    /// end them: a spawn onto a PARKED lane unparks it exactly once, a
+    /// spawn from the lane's own poll (or a mid-poll self-wake) never
+    /// does (the lane is running, `parked` is clear), and the per-
+    /// iteration hook runs at least once per poll and once per park.
+    #[test]
+    fn pluggable_park_is_unparked_only_while_parked() {
+        let park = Arc::new(CountingPark::default());
+        let ex = LaneExec::with_park(park.clone());
+        let ex2 = ex.clone();
+        let jh = std::thread::spawn(move || ex2.run());
+        // Let the lane reach its first park.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while park.parks.load(Ordering::SeqCst) == 0 && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(
+            park.parks.load(Ordering::SeqCst),
+            1,
+            "lane parked once idle"
+        );
+        assert_eq!(park.unparks.load(Ordering::SeqCst), 0);
+
+        // A foreign spawn onto the parked lane: exactly one unpark.
+        let (tx, rx) = mpsc::channel();
+        let ex3 = ex.clone();
+        ex.spawn(async move {
+            // Spawned FROM the lane while it runs: no unpark.
+            ex3.spawn(async move {
+                tx.send(()).unwrap();
+            });
+        });
+        rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(
+            park.unparks.load(Ordering::SeqCst),
+            1,
+            "one foreign spawn onto a parked lane = one unpark; the lane-local spawn adds none"
+        );
+        assert!(
+            park.services.load(Ordering::SeqCst) >= 3,
+            "the hook ran after the park and after each of the two polls"
+        );
+        ex.shutdown();
+        jh.join().unwrap();
+        assert!(
+            park.unparks.load(Ordering::SeqCst) >= 2,
+            "shutdown unparks the lane"
+        );
+    }
+
+    /// The sticky law: an unpark delivered BEFORE the park makes that
+    /// park return at once (the eventfd-counter shape the ring parker
+    /// relies on), and a park with no unpark honours the tick.
+    #[test]
+    fn condvar_park_is_sticky_and_ticks() {
+        let p = CondvarPark::default();
+        p.unpark();
+        let t0 = std::time::Instant::now();
+        assert!(
+            !p.park(Duration::from_secs(5)),
+            "a pre-delivered unpark returns the park"
+        );
+        assert!(t0.elapsed() < Duration::from_secs(1));
+        let t0 = std::time::Instant::now();
+        assert!(
+            p.park(Duration::from_millis(20)),
+            "no unpark: the tick fires"
+        );
+        assert!(t0.elapsed() >= Duration::from_millis(20));
+    }
+
+    /// Lost-wake freedom under a spawn storm from foreign threads: every
+    /// spawned task completes in well under one TICK (a push the lane's
+    /// empty-check missed that did NOT unpark it would cost a whole tick
+    /// before the backstop rescued it).
+    #[test]
+    fn pluggable_park_never_loses_a_wake() {
+        let park = Arc::new(CountingPark::default());
+        let ex = LaneExec::with_park(park.clone());
+        let ex2 = ex.clone();
+        let jh = std::thread::spawn(move || ex2.run());
+        let t0 = std::time::Instant::now();
+        const N: usize = 2000;
+        let (tx, rx) = mpsc::channel();
+        let spawners: Vec<_> = (0..4)
+            .map(|s| {
+                let ex = ex.clone();
+                let tx = tx.clone();
+                std::thread::spawn(move || {
+                    for i in 0..N / 4 {
+                        let tx = tx.clone();
+                        ex.spawn(async move {
+                            tx.send(s * 1000 + i).unwrap();
+                        });
+                        // Give the lane a chance to park between spawns.
+                        if i % 7 == 0 {
+                            std::thread::yield_now();
+                        }
+                    }
+                })
+            })
+            .collect();
+        drop(tx);
+        let mut got = 0;
+        while got < N {
+            rx.recv_timeout(Duration::from_secs(10))
+                .expect("every spawned task completes (no lost wake)");
+            got += 1;
+        }
+        for s in spawners {
+            s.join().unwrap();
+        }
+        assert!(
+            t0.elapsed() < TICK / 2,
+            "{N} spawns took {:?}: a lost wake waited for the tick backstop",
+            t0.elapsed()
+        );
         ex.shutdown();
         jh.join().unwrap();
     }

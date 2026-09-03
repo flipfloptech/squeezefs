@@ -1,26 +1,17 @@
 # SqueezeFS
 
-SqueezeFS is a high-performance distributed POSIX filesystem for Linux, built in Rust on `tokio` and `io_uring`. It decouples metadata from data: file metadata lives on dedicated block-based metadata volumes (**MetaLV**, a copy-on-write key/value store), while file contents are striped across local NVMe or NVMe-oF block devices. A FUSE client daemon exposes the filesystem — with no external database or coordination service — at bare-metal throughput.
-
-> **Concurrency scope, stated plainly.** What ships is **one metadata AUTHORITY per volume set** (the write mount, enforced — not merely advised — by the single-writer mount guard: a second plain write mount is refused loudly), **plus N read-only mounts, plus N co-writer mounts**. Readers (`-o ro`) take no lease and no claim; their guarantee is documented rather than implied: **bounded, monotone staleness** published live on `.stats` (`reader_staleness_bound_ms`, 2 s with the shipped defaults), with the data-block half of that bound *eliminated* when the membership plane is armed (the freed-offset grace period) and *bounded* with it off, the default ([docs/operations.md → Read-only coherent mounts](docs/operations.md#read-only-coherent-mounts--o-ro--one-writer-plus-n-readers)). Co-writers are the multi-writer data plane (opt-in `SQUEEZEFS_MULTI_WRITER=1`, a five-rung admission ladder, PR-capable NVMe namespaces required — refused loudly otherwise): they write their own data straight to the shared namespaces under authority-granted custody leases and **ship** every metadata mutation to the authority; byte-range custody of one shared file (the MPI-IO shape) exists behind the default-off `SQUEEZEFS_RANGE_CUSTODY` ([docs/operations.md → Write custody & visibility by mount posture](docs/operations.md#write-custody--visibility-by-mount-posture-the-54-guarantee-tables)). Fresh formats are multi-writer-capable **by default** (`--single-writer` is the opt-out). **Scale claims carry their evidence tier** (`docs/rc-manifest.md`): the proving fleet is single-node — up to 32 co-located mounts plus a qemu guest against a real PR-capable nvmet-tcp target, kill-9/fencing crucibles with the fsck oracle green after every kill (`.benchmarks/2026-08-18-mw-program-closing.md`) — and the 15,000-node target remains **arithmetic on measured constants**, not a measured row: the published arithmetic itself names the single-authority metadata plane as the wall the next program (fleet-of-authorities) exists to move. Every capability claim in this README describes shipped behavior; roadmap items say so.
+SqueezeFS is a high-performance distributed POSIX filesystem for Linux, written in Rust on `tokio` and `io_uring`. File metadata lives on dedicated block-based metadata volumes (**MetaLV**, a copy-on-write key/value store) and file contents are striped across local NVMe or NVMe-oF block devices. A FUSE client daemon exposes the filesystem at bare-metal throughput — no external database or coordination service required.
 
 ## Key properties
 
-- **FUSE-over-io_uring transport.** Every mount arms the kernel's FUSE-over-io_uring request path after the INIT handshake — required, not optional; the mount fails loudly if the kernel cannot arm it.
-- **Crash-safe metadata by construction.** The v3 metadata format is a copy-on-write, checksummed key/value btree: whole-transaction atomicity and torn-write immunity on any substrate, including plain files. Scales to ≥ 100 M inodes and 1 M+ entries per directory per volume.
-- **Zero-copy write path.** Large writes travel kernel → transport payload lease → one merge copy → io_uring DMA; fully written blocks upload directly to the block backend, skipping staging entirely.
-- **Efficient random small writes.** Aligned small overwrites of exclusively owned blocks become one in-place sub-block DMA — no read-modify-write, no metadata commit; other shapes ride a byte-budgeted extent overlay with batched folds.
-- **Progressive data layouts.** Files grow from inline (< 4 KiB, metadata-resident) through locally staged (≤ 4 MiB, NVMe staging) to striped 4 MiB blocks, promoted durably as they cross thresholds.
-- **Tiered caching with hybrid O_DIRECT.** Optional GPU Direct Storage, RAM clock/LRU tiers, and NVMe staging/read cache. O_DIRECT reads bypass the kernel page cache but still serve from SqueezeFS's own tiers; a mount option restores strictly device-true O_DIRECT for measurement.
-- **Write custody and fencing.** File write custody is a per-inode lease with a monotonic fencing token; stale writers are fenced, never trusted. Within one mount the lease manager is process-local; **across mounts**, custody is the multi-writer plane's (see the scope note above): co-writer custody leases carry TTL + renewal + pull-based revocation, a lapsed holder **self-fences before the authority can re-grant** (its own deadline is strictly stricter), and on PR substrates the *device itself* rejects a preempted writer's DMA — proven live with kill-9 and freeze matrices. POSIX advisory locks are kernel-local per mount — full canonical semantics via the kernel's own arbitration.
-- **Single-writer mount guard.** Write mounts claim their metadata volumes via `flock`, NVMe Persistent Reservations where the device supports them, and heartbeat claim records — a second concurrent plain write mount is refused loudly, naming the holder. A **co-writer** is not a second appender: it enters through a separate five-rung admission gate, holds no metadata authority, and the guard's refusals are byte-for-byte unweakened ([guarantee classes](docs/operations.md#single-writer-mount-guard-guarantee-classes)).
-- **Transparent compression & encryption.** Per-volume `lz4`/`zstd` compression and AES-256-GCM/ChaCha20 encryption declared at format, with the data key wrapped under an HKDF-SHA-256-derived key-encryption key; the key itself lives in a file the operator controls — never on the volume, never on `argv`. Compression is best-effort per block, so incompressible data is stored raw instead of expanding.
-- **Instant copy-on-write clones.** `squeezefs clone` duplicates a file's metadata without copying block data; block reference counts track the sharing.
-- **Managed NVMe-oF targets, dual-stack.** `squeezefs nvmeof` shares, restores, and adopts target subsystems on SPDK (default) or kernel nvmet, backed by a write-ahead share ledger; refusals are loud and name the exact remedy.
-- **Online volume lifecycle & maintenance.** Add and remove metadata and data volumes with honest capacity preflight and automatic copy-on-write migration; online fsck with verified findings and per-class quarantine-first repair; a four-axis online defragmenter; all long-running maintenance runs as pausable, percentage-throttled background jobs that survive crashes and can be distributed across mounted clients — on an armed multi-writer fleet every joined member is an eligible read-shard worker by membership (fsck wall-clock measured 2.5× faster at 4 members).
-- **Real observability.** Live daemon metrics as JSON on the virtual `.stats` inode; `status`, `clients`, and `df` verbs answer from the volumes themselves — no live mount required.
-- **Host auto-tuning.** `squeezefs tune` applies the recommended kernel posture in one step: virtual-memory dirty ratios, socket buffer maxima, and live FUSE connection limits.
-- **Proven crash contract.** kill-9 soak suites measure zero acked-durability loss, and every performance or durability claim traces to a committed measurement record in `.benchmarks/`.
+- **FUSE-over-io_uring transport.** Every mount uses the kernel's FUSE-over-io_uring request path. It is required, not optional: a mount fails loudly if the kernel cannot provide it.
+- **Crash-safe metadata.** Every metadata change is atomic and checksummed on any device, including plain files — a crash or torn write can never leave metadata half-applied.
+- **Files of any size.** The block map scales to petabyte-class files with nothing to configure; large files are handled automatically.
+- **Fast writes of every shape.** Large writes travel zero-copy from the kernel to the device; small random overwrites become one in-place sub-block write instead of a read-modify-write.
+- **One writer, many readers, opt-in co-writers.** One write mount per volume set, any number of read-only mounts, and co-writer mounts sharing the data devices (opt-in). A mount guard refuses a second plain writer loudly, naming the holder.
+- **Transparent compression and encryption.** Per-volume `lz4`/`zstd` compression and AES-256-GCM/ChaCha20 encryption, declared at format; the key lives in a file the operator controls, never on the volume.
+- **Instant copy-on-write clones.** `squeezefs clone` duplicates a file's metadata without copying its blocks.
+- **Built to operate.** Online volume add/remove, online fsck and defrag, managed NVMe-oF targets; live metrics as JSON on the mount (`.stats`), and `status`/`clients`/`df` answered from the volumes directly.
 
 ## Architecture
 
@@ -41,60 +32,40 @@ SqueezeFS is a high-performance distributed POSIX filesystem for Linux, built in
    +-------------------+           +-------------------+
 ```
 
-The client daemon routes each write by size: tiny payloads inline into the metadata volume, small files stage on local NVMe and promote asynchronously, and large files stripe directly across the block backend. Metadata volumes double as the coordination plane — leases, fencing tokens, mount claims, and client heartbeats are ordinary records on them, so no separate lock service exists. All block and file I/O rides io_uring; hot staged segments are memory-mapped for zero-syscall access.
+The client daemon routes each write by size: tiny payloads are stored inside the metadata volume, small files stage on local NVMe and promote in the background, and large files stripe directly across the block devices. The metadata volumes double as the coordination plane — leases, mount claims, and client heartbeats are ordinary records on them, so there is no separate lock service to run. All block and file I/O rides io_uring.
 
 ## Performance
 
-Measured with the built-in benchmark and elbencho on the reference substrate; every number links to a committed `.benchmarks/` record that states its box, substrate, and method. Selected headline classes:
+Measured on a 5-node NVMe-oF/TCP fabric (memory-backed targets) with a 32-core client, interception mode, build `c985fa8c`:
 
-| Workload | Measured | Record |
-|---|---|---|
-| Random 4 KiB O_DIRECT read, default mount (device-true) | **300–320 k IOPS**, no tuning | [transport concurrency](.benchmarks/2026-07-15-l1-transport-concurrency.md), [decomposition](.benchmarks/2026-07-15-iops-parity-decomposition.md) |
-| Random 4 KiB O_DIRECT read, cache-tier resident | **~536–558 k IOPS**, zero device traffic | [hybrid I/O](.benchmarks/2026-07-15-hybrid-io.md) |
-| Random 4 KiB write (in-place patch shape) | **59–67 k IOPS**, device cost 4 KiB-class per op | [random-write closing](.benchmarks/2026-07-17-rand-write-program-closing.md) |
-| Large sequential write | **~1.8 GB/s** write-through; **4.4–4.6 GiB/s** device-true during sequential scoreboard rows | [zero-copy closing](.benchmarks/2026-07-08-zero-copy-write-path-closing.md), [random-write closing](.benchmarks/2026-07-17-rand-write-program-closing.md) |
-| Random 4 KiB read via **LD_PRELOAD interception** (`-o interception` + `libsqueezefs_il.so`) | warm **~1.02 M IOPS** (1.58× the kernel-FUSE warm path); device-true **~622 k**, beating the kernel-FUSE reference — engagement counter-verified | [interception closing](.benchmarks/2026-07-19-l4-interception-closing.md) |
-| Metadata | many-dirs creates 32.7 k/s; rename/unlink ≈ 1.0 journal entries/op; 100 M-inode volume cold-mounts in ~22 ms | [metadata closing](.benchmarks/2026-07-15-metadata-throughput-closing.md), [v3 gates](.benchmarks/2026-07-09-kv-v3-gates.md) |
-| vs. the reference FUSE field — JuiceFS, SeaweedFS, geesefs, mountpoint-s3 (matched conditions, 3 regimes × 6 workloads, fsync-inclusive **durable** write timing) | **top-3 or better on every row-family; fastest of the field on 13 of 18 rows** (59 W / 2 TIE across 66 comparable cells; 3 attributed-loss cells tracked) | [multi-reference scoreboard](.benchmarks/2026-07-18-multi-reference-scoreboard.md), [JuiceFS-only lineage](.benchmarks/2026-07-15-vs-juicefs-scoreboard.md) |
+| Read bandwidth | Write bandwidth | Read IOPS (4 KiB) | Write IOPS (4 KiB) |
+|:---:|:---:|:---:|:---:|
+| **43.9 GB/s** | **36.4 GB/s** | **942 k** | **727 k** |
 
-The full record set, the multi-reference scoreboard harness (`tests/run_scoreboard.sh`), and the built-in benchmark reference live in [docs/operations.md → Performance records](docs/operations.md#performance-records).
+SqueezeFS is the fastest of the reference FUSE field on most rows — JuiceFS, SeaweedFS, geesefs, mountpoint-s3. Every measurement, method and record lives in [docs/operations.md → Performance records](docs/operations.md#performance-records) and the notes under [`.benchmarks/`](.benchmarks/).
+
+**Scope, stated plainly.** What ships is one write mount per volume set, plus any number of read-only mounts, plus opt-in co-writer mounts. The very-large-fleet design target has so far been proven on a single-node fleet of many co-located mounts; every scale claim carries its evidence tier in [docs/rc-manifest.md](docs/rc-manifest.md).
 
 ## Building
 
-Linux-only: the build links FUSE 3 and uses `io_uring` end to end; mounting requires a kernel with FUSE-over-io_uring support (the mount enables `fuse.enable_uring` automatically where it can, and fails loudly if the transport cannot arm). System dependencies (Ubuntu/Debian):
+Linux only: the build links FUSE 3 and mounting needs a kernel with FUSE-over-io_uring support (the mount enables `fuse.enable_uring` itself where it can). System dependencies (Ubuntu/Debian):
 
 ```bash
 sudo apt install -y build-essential pkg-config libfuse3-dev fuse3 clang libclang-dev
 cargo build --release
 ```
 
-Optional Cargo features (off by default): `gds` (GPU Direct Storage path), `dhat-on` (heap profiling), `coz-on` (causal profiling). Release builds keep debug symbols for profiling.
-
-### Packaged builds with go-task
-
-The packaged build path is [go-task](https://taskfile.dev) (`Taskfile.yml`); plain `cargo build` remains valid for dev work. Bootstrap go-task without root — install into `./bin` locally if it is absent (never sudo system-wide; some distros ship the binary as `go-task`, both spellings work):
-
-```bash
-command -v task go-task >/dev/null || \
-  sh -c "$(curl -fsSL https://taskfile.dev/install.sh)" -- -d -b ./bin
-export PATH="$PWD/bin:$PATH"
-```
+Packaged builds use [go-task](https://taskfile.dev) (`Taskfile.yml`); install it into `./bin` without root if it is absent (`sh -c "$(curl -fsSL https://taskfile.dev/install.sh)" -- -d -b ./bin`):
 
 | Task | Result |
 |---|---|
-| `task build` (default) | Host dev build → `dist/host/` (daemon + interception shim) |
-| `task build:rocky8` / `build:rocky9` / `build:ubuntu2404` / `build:ubuntu2604` | Distro-targeted container build → `dist/<target>/` |
-| `task build:all` | All four distro targets |
-| `task check` | The authoritative full cargo gate (clippy `-D warnings`, fmt, tests, doc, bench smoke) |
-| `task clean` | Remove `dist/` |
+| `task build` | Host build → `dist/host/` (daemon + interception shim) |
+| `task build:<distro>` — `rocky8`, `rocky9`, `ubuntu2404`, `ubuntu2604` | Container build for that distro → `dist/<distro>/` (needs docker or podman) |
+| `task build:all` | All four distro builds |
+| `task dist:<distro>` / `task dist:all` | Release builds (full LTO) for tagged releases → `dist/<distro>-dist/` |
+| `task check` | The full verification gate |
 
-Every `dist/<target>/` holds `squeezefs` and `libsqueezefs_il.so` **side by side under their default names** — the folder disambiguates, never a filename suffix. The pair in one folder is built from the **same commit**, and that pairing is load-bearing: interception sessions refuse a daemon/shim build-commit mismatch (KD-7), so deploy a dist folder as a unit and never mix artifacts across folders or builds.
-
-Distro builds need docker or podman (docker preferred; `CONTAINER_TOOL=podman task build:rocky8` overrides). They mount the checkout read-only so the git commit identity embeds, cache the cargo registry/target in per-target named volumes for incremental rebuilds, and assert per artifact — inside the container — that `--version` carries the real commit (never `unknown`) and that the maximum referenced `GLIBC_` symbol version stays within the distro's ceiling (Rocky 8 = 2.28, Rocky 9 = 2.34, Ubuntu 24.04 = 2.39, Ubuntu 26.04 probed in-image).
-
-Builds carry two identities: the release-train version (currently the 1.1 train, bumped as a release act) and the git commit they were built from; releases are `stable-*`/`lts-*` git tags on specific commits. Check a build with `squeezefs --version` (both identities on one line; also the `.stats` `build_commit` field on a mounted daemon); policy details in [docs/operations.md §Versioning & releases](docs/operations.md#versioning--releases).
-
-To verify a build, run the standard gate — `task check`: clippy (`-D warnings`), `cargo fmt --check`, `cargo test --all-features -- --test-threads=1`, `cargo doc --no-deps`, and the criterion bench smoke. Root-only external suites (pjdfstest, LTP, fstests, elbencho, the NVMe-oF fidelity tier) live under `tests/` and are tiered in [AGENTS.md](AGENTS.md).
+Each build folder holds `squeezefs` and `libsqueezefs_il.so` side by side. Deploy the daemon and the interception shim from the same build folder together — they refuse to pair across builds. `squeezefs --version` prints the release train, the git commit and the build profile on one line, e.g. `squeezefs 1.1.0 (<commit> / <full commit>) built <timestamp> profile release`.
 
 ## Quick example
 
@@ -123,10 +94,10 @@ The CLI surface: `format`, `mount`, `umount`, `status`, `clients`, `df`, `bench`
 | Document | Contents |
 |---|---|
 | [QUICKSTART.md](QUICKSTART.md) | Hands-on walkthrough: local sandbox, virtual NVMe dev substrate, bare metal, NVMe-oF fabrics, kernel tuning, durability knobs |
-| [docs/operations.md](docs/operations.md) | Operator reference: durability & crash contract, mount-guard guarantee classes, breaking changes & removed verbs, configuration knobs, observability, NVMe-oF operations, performance records |
-| `docs/design-*.md` | Normative design records for each subsystem — metadata format, write/read paths, metadata throughput, NVMe-oF target management |
-| [`.benchmarks/`](.benchmarks/) | Committed measurement records: baselines, attributions, fix verifications, and program-closing adjudications |
-| [AGENTS.md](AGENTS.md) | Contributor and agent rules: architecture invariants, TDD workflow, verification gates |
+| [docs/operations.md](docs/operations.md) | Operator reference: durability & crash contract, mount-guard guarantee classes, breaking changes & removed verbs, every configuration knob, every metric, NVMe-oF operations, performance records |
+| `docs/design-*.md` | Design records for each subsystem |
+| [`.benchmarks/`](.benchmarks/) | Committed measurement records |
+| [AGENTS.md](AGENTS.md) | Contributor rules: architecture invariants, development workflow, verification gates |
 
 ## License
 

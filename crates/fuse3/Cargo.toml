@@ -24,7 +24,7 @@ name = "fuse3"
 # Fully-diverged first-party fork (forked from upstream fuse3 0.7.3 — see
 # THIRD_PARTY_NOTICES.md): carries the SqueezeFS release-train version
 # (docs/operations.md §Versioning & releases), bumped as a release act.
-version = "1.1.0"
+version = "1.2.0"
 authors = ["Sherlock Holo <sherlockya@gmail.com>"]
 build = false
 autobins = false

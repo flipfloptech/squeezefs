@@ -12,7 +12,7 @@ name = "squeezefs-ipc"
 # First-party crate: tracks the SqueezeFS release-train version
 # (docs/operations.md §Versioning & releases), bumped as a release act.
 # Git commits remain the fine-grained identity.
-version = "1.1.0"
+version = "1.2.0"
 edition = "2021"
 license-file = "../../LICENSE"
 publish = false

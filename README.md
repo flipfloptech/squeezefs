@@ -65,7 +65,7 @@ Packaged builds use [go-task](https://taskfile.dev) (`Taskfile.yml`); install it
 | `task dist:<distro>` / `task dist:all` | Release builds (full LTO) for tagged releases → `dist/<distro>-dist/` |
 | `task check` | The full verification gate |
 
-Each build folder holds `squeezefs` and `libsqueezefs_il.so` side by side. Deploy the daemon and the interception shim from the same build folder together — they refuse to pair across builds. `squeezefs --version` prints the release train, the git commit and the build profile on one line, e.g. `squeezefs 1.1.0 (<commit> / <full commit>) built <timestamp> profile release`.
+Each build folder holds `squeezefs` and `libsqueezefs_il.so` side by side. Deploy the daemon and the interception shim from the same build folder together — they refuse to pair across builds. `squeezefs --version` prints the release train, the git commit and the build profile on one line, e.g. `squeezefs 1.2.0 (<commit> / <full commit>) built <timestamp> profile release`.
 
 ## Quick example
 

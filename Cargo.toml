@@ -5,11 +5,11 @@ name = "squeezefs"
 # the fine-grained identity; stable-*/lts-* tags remain the release names.
 # The first-party crates (crates/fuse3, crates/squeezefs-{ipc,preload})
 # track the same train.
-version = "1.1.0"
+version = "1.2.0"
 edition = "2021"
 license-file = "LICENSE"
 # ENG-16: `cargo publish` is unrepresentable here — the crate depends on
-# `fuse3 = "1.1"`, satisfied ONLY by the `[patch.crates-io]` path entry
+# `fuse3 = "1.2"`, satisfied ONLY by the `[patch.crates-io]` path entry
 # below (crates.io has no fuse3 1.1), and patch entries do not travel in a
 # published package. `publish = false` makes the footgun a hard refusal
 # instead of a broken artifact on crates.io.
@@ -60,7 +60,7 @@ rcgen = "0.13"
 # Resolves ONLY via the [patch.crates-io] path entry below (crates.io has
 # no fuse3 1.1 — the fully-diverged first-party fork carries the SqueezeFS
 # release train; see the workspace-topology note above).
-fuse3 = { version = "1.1", features = ["tokio-runtime", "unprivileged"] }
+fuse3 = { version = "1.2", features = ["tokio-runtime", "unprivileged"] }
 io-uring = "0.6"
 dashmap = "5.5"
 serde = { version = "1.0", features = ["derive"] }
@@ -141,7 +141,7 @@ nix = { version = "0.29.0", features = ["ioctl"] }
 squeezefs-preload = { path = "crates/squeezefs-preload" }
 
 # Load-bearing (see the crates/fuse3 workspace-topology note at the top):
-# redirects the prepublish-style `fuse3 = "1.1"` requirement to the
+# redirects the prepublish-style `fuse3 = "1.2"` requirement to the
 # in-tree first-party fork — cargo rejects the equivalent direct path
 # dependency because the fork is its own (excluded) workspace root.
 [patch.crates-io]

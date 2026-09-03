@@ -83,8 +83,8 @@ This is the operator reference for SqueezeFS: the durability contract and its gu
 
 ```bash
 squeezefs --version        # or -V
-# untagged build:  squeezefs 1.1.0 (f63455bcb824 / f63455bcb8249b064531d000624c40825a6e763e) built 2026-07-18T13:45:25Z profile release
-# release build:   squeezefs 1.1.0 (f63455bcb824 / f63455bcb8249b064531d000624c40825a6e763e, tag stable-2026.07) built 2026-07-18T13:45:25Z profile dist
+# untagged build:  squeezefs 1.2.0 (f63455bcb824 / f63455bcb8249b064531d000624c40825a6e763e) built 2026-07-18T13:45:25Z profile release
+# release build:   squeezefs 1.2.0 (f63455bcb824 / f63455bcb8249b064531d000624c40825a6e763e, tag stable-2026.07) built 2026-07-18T13:45:25Z profile dist
 grep -E '"build_(commit|tag|profile)"' <mountpoint>/.stats   # the fleet mixed-version detector
 ```
 

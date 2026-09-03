@@ -46,6 +46,21 @@
 ///      §4.4 pt 5 / R10 acyclicity argument transfers with the taker
 ///      population renamed. Batch ring admission still precedes every
 ///      node lock (one Σ-admission per batch).
+///
+///      **D-2 (e2e audit DLM #2) — the two-stage conveyor**: the pass is
+///      now the APPLY stage only (it drops its leaf locks before
+///      SUBMITTING the batch's entries — the hold never spans the device
+///      write, `lock_phase_ns.leaf_lock_hold` is the tripwire), and a
+///      per-volume DURABILITY lane awaits writes / prefix / barrier and
+///      fans out. The lane takes leaf locks in exactly one arm — the §4.4
+///      pt 4 seq-conditional rollback of a FAILED write (`rollback_failed_
+///      tx`: ascending, deduped, revalidated, released before its
+///      compensation commit) — so the taker population is {apply pass,
+///      lane rollback arm, checkpoint/SMO task}; no node-lock holder ever
+///      waits on the lane, and the lane holds node locks only while
+///      waiting on other node locks ascending. The full wait-for argument
+///      is `src/meta_backend/kv/backend.rs`'s module doc ("The two-stage
+///      commit conveyor").
 ///    - c. **format v2**: sector locks (`sector_locks`) — commit-time
 ///      RMW+apply, acquired in **ascending sector-offset order** (total order
 ///      ⇒ deadlock-free) and only at commit, never taken while holding a DLM

@@ -1717,7 +1717,7 @@ async fn test_rename_one_entry_atomicity_power_cut() {
 // ---------------------------------------------------------------------------
 
 /// Write a 3-member conveyor batch (one contiguous reservation, one
-/// `write_entries_batch` submission) of `lens`-sized entries with inos
+/// `submit_entries_batch` submission) of `lens`-sized entries with inos
 /// 101/102/103, returning the per-member reservations.
 async fn kv_write_batch3(
     ring: &JournalRing,
@@ -1743,7 +1743,9 @@ async fn kv_write_batch3(
         .zip(&recs)
         .map(|(r, recs)| (*r, recs.as_slice()))
         .collect();
-    ring.write_entries_batch(&parts)
+    ring.submit_entries_batch(&parts)
+        .expect("clean batch submit")
+        .finish(ring)
         .await
         .expect("clean batch write");
     parts_res

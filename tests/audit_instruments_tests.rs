@@ -374,7 +374,10 @@ const PIPELINE_PHASES: [&str; 12] = [
     "dev_service",
 ];
 
-const TXPASS_PHASES: [&str; 8] = [
+/// The eight audit-B phases plus D-2's two durability-lane phases
+/// (`window_lane_wait`: handoff → lane pickup; `window_total`: apply pass
+/// start → the window's members answered).
+const TXPASS_PHASES: [&str; 10] = [
     "tx_queue_wait",
     "pass_admission",
     "pass_leaf_locks",
@@ -383,6 +386,8 @@ const TXPASS_PHASES: [&str; 8] = [
     "journal_ring_write",
     "journal_prefix_wait",
     "journal_barrier",
+    "window_lane_wait",
+    "window_total",
 ];
 
 #[test]
@@ -406,7 +411,7 @@ fn meta_txpass_family_carries_the_journal_split() {
     assert_eq!(
         obj.len(),
         TXPASS_PHASES.len(),
-        "exactly the eight phases: {obj:?}"
+        "exactly the ten phases: {obj:?}"
     );
     for p in TXPASS_PHASES {
         let _ = phase_words(&fam, p);
@@ -764,21 +769,24 @@ async fn real_create_moves_the_family_and_the_stats_inode_carries_it_ungated() {
 // D — lock wait AND hold histograms
 // ---------------------------------------------------------------------------
 
-const LOCK_PHASES: [&str; 4] = [
+/// The four audit-D phases plus D-2's `leaf_lock_hold` (the conveyor
+/// pass's 4b union hold — the "never across device I/O" instrument).
+const LOCK_PHASES: [&str; 5] = [
     "stripe_lock_wait",
     "stripe_lock_hold",
     "leaf_lock_wait",
     "dlm_guard_hold",
+    "leaf_lock_hold",
 ];
 
 #[test]
-fn lock_family_is_pinned_to_four_phases() {
+fn lock_family_is_pinned_to_five_phases() {
     let fam = squeezefs::fuse_client::lock_phase_json();
     let obj = fam.as_object().expect("family object");
     assert_eq!(
         obj.len(),
         LOCK_PHASES.len(),
-        "exactly the four lock phases: {obj:?}"
+        "exactly the five lock phases: {obj:?}"
     );
     for p in LOCK_PHASES {
         let _ = phase_words(&fam, p);

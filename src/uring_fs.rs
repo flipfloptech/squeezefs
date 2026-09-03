@@ -268,25 +268,90 @@ pub async fn write_at(
     rx.await.map_err(worker_closed_err)?
 }
 
-/// Write every `(offset, bytes)` pair to `path` as **one** worker message:
-/// the entries fan out into parallel SQEs on one ring and the call completes
-/// when all have landed (any failure fails the whole batch, loudly). Entry
-/// order is not an ordering guarantee — callers needing order between
-/// batches issue separate calls.
-pub async fn write_at_batch(path: impl AsRef<Path>, ops: Vec<(u64, bytes::Bytes)>) -> Result<()> {
-    if ops.is_empty() {
-        return Ok(());
+/// A write handed to the worker pool whose completion has not been
+/// awaited yet ([`submit_write_at_batch`]). Submission and completion are
+/// separable on purpose: the commit conveyor's apply stage SUBMITS a
+/// batch's journal entries and hands this to its durability stage, which
+/// awaits it — the device's completion latency never sits inside the
+/// serialized apply server (D-2, e2e audit DLM #2).
+pub struct WriteCompletion {
+    rx: oneshot::Receiver<Result<()>>,
+    /// The outcome once observed by [`Self::poll_done`], so a completion
+    /// probed non-blockingly is never lost before [`Self::wait`].
+    done: Option<Result<()>>,
+}
+
+impl WriteCompletion {
+    /// Non-blocking probe: `true` once the write has completed (its
+    /// outcome is retained for [`Self::wait`]).
+    pub fn poll_done(&mut self) -> bool {
+        if self.done.is_some() {
+            return true;
+        }
+        match self.rx.try_recv() {
+            Ok(out) => {
+                self.done = Some(out);
+                true
+            }
+            Err(oneshot::TryRecvError::Closed) => {
+                self.done = Some(Err(worker_closed_err("completion sender dropped")));
+                true
+            }
+            Err(oneshot::TryRecvError::Empty) => false,
+        }
     }
+
+    /// Await the write's outcome.
+    pub async fn wait(mut self) -> Result<()> {
+        if let Some(out) = self.done.take() {
+            return out;
+        }
+        self.rx.await.map_err(worker_closed_err)?
+    }
+}
+
+/// Submit every `(offset, bytes)` pair to `path` as **one** worker message
+/// (parallel SQEs on one ring; any failure fails the whole batch) and
+/// return its completion to await later. Entry order is not an ordering
+/// guarantee — callers needing order between batches issue separate
+/// submissions. An empty batch is already complete.
+pub fn submit_write_at_batch(
+    path: impl AsRef<Path>,
+    ops: Vec<(u64, bytes::Bytes)>,
+) -> Result<WriteCompletion> {
     let (tx, rx) = oneshot::channel();
-    URING_FS
-        .sender()
-        .try_send(FsReq::WriteAtBatch {
+    let mut ops = ops;
+    let req = match ops.len() {
+        0 => {
+            let _ = tx.send(Ok(()));
+            return Ok(WriteCompletion { rx, done: None });
+        }
+        // A single op rides the single-op request (the shape it always
+        // had — the worker's one-slot path, and the fault shim's single-
+        // op arms).
+        1 => {
+            let (offset, data) = ops.pop().expect("one op");
+            FsReq::WriteAt {
+                path: path.as_ref().to_path_buf(),
+                offset,
+                data,
+                tx,
+            }
+        }
+        _ => FsReq::WriteAtBatch {
             path: path.as_ref().to_path_buf(),
             ops,
             tx,
-        })
-        .map_err(queue_full_err)?;
-    rx.await.map_err(worker_closed_err)?
+        },
+    };
+    URING_FS.sender().try_send(req).map_err(queue_full_err)?;
+    Ok(WriteCompletion { rx, done: None })
+}
+
+/// [`submit_write_at_batch`] + await: the call completes when every entry
+/// has landed.
+pub async fn write_at_batch(path: impl AsRef<Path>, ops: Vec<(u64, bytes::Bytes)>) -> Result<()> {
+    submit_write_at_batch(path, ops)?.wait().await
 }
 
 fn map_io(e: std::io::Error) -> SqueezefsError {
@@ -482,6 +547,10 @@ enum HeldOp {
         data: bytes::Bytes,
         tx: oneshot::Sender<Result<()>>,
     },
+    WriteAtBatch {
+        ops: Vec<(u64, bytes::Bytes)>,
+        tx: oneshot::Sender<Result<()>>,
+    },
 }
 
 /// An armed write stall: the byte range that parks and its held ops.
@@ -578,7 +647,7 @@ pub fn release_barrier_stall(path: impl AsRef<Path>) {
     for tx in held {
         let tx = match tx {
             HeldOp::Fdatasync(tx) => tx,
-            HeldOp::WriteAt { tx, .. } => tx,
+            HeldOp::WriteAt { tx, .. } | HeldOp::WriteAtBatch { tx, .. } => tx,
         };
         let _ = URING_FS.sender().try_send(FsReq::Fdatasync {
             path: path.as_ref().to_path_buf(),
@@ -588,7 +657,8 @@ pub fn release_barrier_stall(path: impl AsRef<Path>) {
 }
 
 /// Arm the **write stall** on `path` for writes intersecting
-/// `[offset, offset + len)`: matching `write_at` requests are held
+/// `[offset, offset + len)`: matching `write_at` / `write_at_batch`
+/// requests (a batch is held whole if any of its ops intersects) are held
 /// (never admitted — nothing lands) until [`release_write_stall`]
 /// resubmits them. The durability sibling of [`arm_barrier_stall`]: it
 /// parks a caller at a known point in its commit sequence, so a test can
@@ -628,13 +698,23 @@ pub fn release_write_stall(path: impl AsRef<Path>) {
         None => return,
     };
     for op in held {
-        if let HeldOp::WriteAt { offset, data, tx } = op {
-            let _ = URING_FS.sender().try_send(FsReq::WriteAt {
-                path: path.as_ref().to_path_buf(),
-                offset,
-                data,
-                tx,
-            });
+        match op {
+            HeldOp::WriteAt { offset, data, tx } => {
+                let _ = URING_FS.sender().try_send(FsReq::WriteAt {
+                    path: path.as_ref().to_path_buf(),
+                    offset,
+                    data,
+                    tx,
+                });
+            }
+            HeldOp::WriteAtBatch { ops, tx } => {
+                let _ = URING_FS.sender().try_send(FsReq::WriteAtBatch {
+                    path: path.as_ref().to_path_buf(),
+                    ops,
+                    tx,
+                });
+            }
+            HeldOp::Fdatasync(_) => {}
         }
     }
 }
@@ -916,6 +996,19 @@ fn fault_intercept(req: FsReq) -> Option<FsReq> {
                 st.poisoned.insert(path);
                 let _ = tx.send(Err(fault_eio("batch write torn mid-sector, device died")));
                 return None;
+            }
+            // Write stall: a batch is held WHOLE if any op intersects the
+            // armed range (batch semantics — nothing of it lands).
+            if let Some(stall) = st.write_stalls.get_mut(&path) {
+                let (lo, hi) = stall.range;
+                if ops
+                    .iter()
+                    .any(|(off, d)| *off < hi && *off + d.len() as u64 > lo)
+                {
+                    let _ = stall.ops.arrived.send(());
+                    stall.ops.held.push(HeldOp::WriteAtBatch { ops, tx });
+                    return None;
+                }
             }
             if let Some(log) = st.tracked.get_mut(&path) {
                 for (off, d) in &ops {

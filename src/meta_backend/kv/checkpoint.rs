@@ -1160,8 +1160,6 @@ async fn tick(
     last_checkpoint: &mut std::time::Instant,
     final_cycle: bool,
 ) -> Result<(), KvError> {
-    let mut smo = be.smo.lock().await;
-
     if final_cycle {
         // New mutations are already refused (`write_gate`); wait out the
         // in-flight ones so the final flush pass sees every applied
@@ -1174,6 +1172,13 @@ async fn tick(
         // Gated writers are finite, so the head converges; the iteration
         // bound is a belt against a pathological writer, after which the
         // final cycle proceeds with the freshest head it saw.
+        //
+        // BEFORE taking the SMO mutex (D-2): in-flight reservations are
+        // completed by the conveyor's durability lane, whose hole
+        // checkpoints (`checkpoint_past`) take this mutex — a lane parked
+        // on it while earlier windows of its own still hold open
+        // reservations would never complete them, and this wait would
+        // hold the mutex forever.
         for _ in 0..64 {
             let head = be.journal_ring().core().head();
             be.journal_ring().wait_completed_upto(head).await;
@@ -1182,6 +1187,7 @@ async fn tick(
             }
         }
     }
+    let mut smo = be.smo.lock().await;
 
     // 1. Threshold maintenance (appends + SMOs, serialized here — §4.6).
     //    Reserve exhaustion runs a drain cycle and retries; a pending-

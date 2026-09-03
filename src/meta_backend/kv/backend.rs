@@ -35,6 +35,101 @@
 //! PR K7); an offset `c > 2` resumes at entries whose dentry-key suffix is
 //! **strictly greater** than `c − 3`. Cookies are the key itself, so they
 //! are stable across concurrent inserts/removals.
+//!
+//! ## The two-stage commit conveyor (D-2 — e2e perf audit DLM board #2)
+//!
+//! The M7 conveyor (design-metadata-throughput §5.5 D5) ran every user
+//! commit on a volume through ONE serialized pass: drain → Σ admission →
+//! union leaf locks (RAM apply) → unlock → journal ring write → completed-
+//! prefix wait → (strict) barrier → fan-out. The device write's completion
+//! sat INSIDE that server's service time — on the D-1b fleet row the
+//! authority's pass was 752–776 µs of which `journal_ring_write` was
+//! 650–672 µs and the leaf-lock window 86–91 µs, at ρ ≈ 0.97, every
+//! committer queued 764–801 µs behind it
+//! (`.benchmarks/2026-09-02-d1b-publish-plane-batching.md`). Since D-2
+//! the conveyor is two stages:
+//!
+//! * **Stage A — the apply pass** ([`KvMetaBackend::conveyor_pass_task`],
+//!   [`KvMetaBackend::run_batch`]): drain → admission → union leaf locks →
+//!   revalidate → pre-images → ONE contiguous reservation → RAM apply →
+//!   unlock → **encode + SUBMIT** the surviving entries (one `uring_fs`
+//!   submission, no wait — [`super::journal::JournalRing::
+//!   submit_entries_batch`]) → hand the [`ConveyorWindow`] to stage B.
+//!   Stage A never waits on the device; its service time is the leaf-lock
+//!   window plus the encode.
+//! * **Stage B — the durability lane** ([`KvMetaBackend::
+//!   durability_lane_task`], [`KvMetaBackend::run_windows`]): one
+//!   per-volume task draining windows in handoff order; per GROUP (the
+//!   head window awaited + every successor whose write has already
+//!   landed): complete the reservations, ONE completed-prefix wait, the
+//!   §4.4 pt 4 hole checkpoints, ONE strict barrier, then the members'
+//!   terminal outcomes in journal order. Stage B never touches a node lock
+//!   except in the rollback arm of a FAILED write (below).
+//!
+//! N windows sit between A and B; the bound is the ring's admissible
+//! capacity (§4.4 pt 5) — every window holds a registered reservation and
+//! stage A parks on ring admission before any node lock — never a
+//! constant. Engagement: `meta_conveyor_windows_inflight[_hwm]`.
+//!
+//! **What is unchanged, and why.** One tx = one checksummed journal entry
+//! (the window's entries are the same N ordinary entries in the same
+//! contiguous reservation — zero on-disk change); whole-tx atomicity and
+//! torn-write immunity are per entry (§4.10) and do not see the stages. A
+//! tx is acked only after its entry landed (deferred cadence: the D0 law —
+//! stage B awaits the write) or after a barrier that followed it (strict).
+//! Acks are in journal order: a later window is never answered while an
+//! earlier one's entry is unlanded, because an entry is chain-reachable
+//! only through its predecessors and a hole ahead of it strands it —
+//! stage B's in-order groups + the completed-prefix wait + the hole
+//! checkpoints before any ack are exactly the pre-D-2 tail's discipline,
+//! applied per window. DLM guards stay co-owned by the queue entries until
+//! the STAGE-B terminal outcome (never released at apply), so the Issue-13
+//! same-key exclusion is untouched. The D0 fail-stop lattice fires from
+//! stage B exactly as it fired from the pass: `note_barrier_failure` at
+//! the strict barrier, `note_journal_failure` on a failed write and on a
+//! stuck hole checkpoint, `JOURNAL_FAILURE_LATCH` consecutive failures
+//! latching `failed`. Each stage is panic-guarded ([`PassSentinel`],
+//! [`LaneSentinel`]): an unwind abandons the reservations (never a
+//! `completed_upto` wedge), answers every member EIO, fails out the queue
+//! behind it, and fail-stops the volume when an applied window's write
+//! outcome is unknown (RAM would diverge from replay).
+//!
+//! **Lock order 4b — why the acyclicity argument survives.** Leaf-lock
+//! TAKERS are now {stage A, stage B's failed-write rollback arm, the
+//! checkpoint/SMO task}. Stage A takes leaf locks only, ascending NodeId,
+//! deduped, lock-then-revalidate-then-retry, and drops them BEFORE the
+//! submission — the hold never spans device I/O or a ring-space wait
+//! (`lock_phase_ns.leaf_lock_hold` is the tripwire). Stage B's rollback
+//! arm is the §4.4 pt 4 committer rollback verbatim (`rollback_failed_tx`:
+//! leaf locks only, ascending, deduped, revalidated, released before its
+//! compensation commit) — the design wrote that rollback for CONCURRENT
+//! committers whose writes complete out of apply order, which is exactly
+//! the population two stages recreate; it is seq-conditional, so a later
+//! window's apply over the same key (only Δtime merge records can share a
+//! key across windows — every other same-key writer is still excluded by
+//! the guards the failed window's entries hold) is never clobbered.
+//! Interior locks stay the serialized SMO task's (parent-then-child).
+//! Wait-for edges: A waits on leaf locks (held by A-itself ascending, by
+//! B's rollback, or by the checkpoint freeze — all RAM-only, none waiting
+//! on A) and on ring admission holding nothing; B waits on uring
+//! completions (independent), on `completed_upto` (advanced by B itself
+//! and by the checkpoint task's own SMO completions, which never wait on
+//! B), on the SMO mutex for hole checkpoints (held by the checkpoint task,
+//! which waits on leaf locks only — never on B), and, in the rollback arm,
+//! on leaf locks under the ascending discipline. No holder of a node lock
+//! ever waits on B, and B holds node locks only while waiting on other
+//! node locks ascending; the checkpoint task's own admissions never park
+//! (they drain-and-retry). The two populations stay acyclic without any
+//! NodeId relationship between leaves and interiors, as before.
+//!
+//! **The checkpoint tail rule** (`checkpoint.rs`) needs no change: a
+//! window's reservation stays registered from stage A's in-lock reserve
+//! until stage B observes its write outcome, so `min_inflight_start`
+//! holds the tail — and `reusable_upto` — behind every applied-but-
+//! unlanded window, exactly the span the rule was written for.
+//! `shutdown`'s final cycle drains in-flight windows through the same
+//! `wait_completed_upto(head)` loop (stage B completes them as their
+//! writes land).
 
 use super::alloc_ext::{compaction_reserve_extents, ExtentAllocator};
 use super::checkpoint::{read_newest_ledger, LedgerRecord};
@@ -111,18 +206,19 @@ pub static TEST_COMMIT_ADMITTED_STALL_MS: AtomicU64 = AtomicU64::new(0);
 /// Test seam (PR M7 §5.5 D5): hold the conveyor pass at a protocol stage
 /// so arrivals accumulate deterministically (no sleep-based batching in
 /// tests — the hold IS the scenario). `0` = off (one relaxed load per
-/// pass iteration); [`TEST_CONVEYOR_HOLD_PRE_DRAIN`] parks the pass
+/// pass iteration); [`TEST_CONVEYOR_HOLD_PRE_DRAIN`] parks the apply pass
 /// before it drains a batch (entries queue up behind it);
-/// [`TEST_CONVEYOR_HOLD_PRE_FANOUT`] parks it after the batch is written,
-/// acked and barriered but before results fan out (the cancel-pre-fanout
-/// stage). Release via [`test_conveyor_hold_release`].
+/// [`TEST_CONVEYOR_HOLD_PRE_FANOUT`] parks the durability lane after a
+/// group is written, prefix-waited and barriered but before its results
+/// fan out (the cancel-pre-fanout stage). Release via
+/// [`test_conveyor_hold_release`].
 pub static TEST_CONVEYOR_HOLD_STAGE: AtomicU64 = AtomicU64::new(0);
 
-/// [`TEST_CONVEYOR_HOLD_STAGE`] value: park the pass before draining.
+/// [`TEST_CONVEYOR_HOLD_STAGE`] value: park the apply pass before draining.
 pub const TEST_CONVEYOR_HOLD_PRE_DRAIN: u64 = 1;
 
-/// [`TEST_CONVEYOR_HOLD_STAGE`] value: park the pass after the batch's
-/// write/ack/barrier, before per-tx result fan-out.
+/// [`TEST_CONVEYOR_HOLD_STAGE`] value: park the durability lane after a
+/// group's write/prefix/barrier, before per-tx result fan-out.
 pub const TEST_CONVEYOR_HOLD_PRE_FANOUT: u64 = 2;
 
 /// [`TEST_CONVEYOR_HOLD_STAGE`] value: park the pass's EMPTY-drain tail
@@ -789,6 +885,13 @@ pub struct KvMetaBackend {
     /// moment the last user `Arc` dies — never parked behind an idling
     /// pass (the drop-then-reopen replay pattern).
     conveyor: Arc<ConveyorCore<QueuedTx>>,
+    /// D-2 (e2e audit DLM #2): the conveyor's DURABILITY stage — the
+    /// in-order queue of applied-and-submitted windows the apply pass hands
+    /// off, drained by the per-volume durability lane task (same leader-
+    /// elect / Weak-upgrade lifecycle as `conveyor`; module docs, "The
+    /// two-stage commit conveyor"). Ungauged by the core: its population
+    /// is `META_CONVEYOR_WINDOWS_INFLIGHT`, handoff → terminal outcome.
+    durability_lane: Arc<ConveyorCore<ConveyorWindow>>,
     /// `Weak` self-reference the pass tasks upgrade per batch (set once,
     /// immediately after `Arc::new`, on every open path — the
     /// checkpoint-task `Weak` discipline).
@@ -2126,6 +2229,7 @@ impl KvMetaBackend {
             block_map_ratchet: crate::sqz_sync::SqzMutex::new(()),
             crossing_inflight: scc::HashMap::new(),
             conveyor: Arc::new(ConveyorCore::new()),
+            durability_lane: Arc::new(ConveyorCore::with_gauge(None)),
             conveyor_self: std::sync::OnceLock::new(),
             layout_conveyor: Arc::new(ConveyorCore::new()),
             batch_max_txs: resolve_commit_batch_txs(
@@ -7186,27 +7290,86 @@ struct QueuedTx {
     done: squeezefs_ipc::sqz_channel::oneshot::Sender<std::result::Result<(), KvError>>,
 }
 
-/// The §5.5 panic guard: pipeline state that must never be dropped on
-/// the floor, armed for the whole batch pass. Every NORMAL path (success
-/// and failure alike) empties it; [`Drop`] therefore fires with content
-/// only when the pass unwinds (panic) or the detached task is torn down
-/// mid-await (runtime shutdown) — and then performs the all-sync §5.5
-/// cleanup: release the un-transferred `Admission`, `complete()` any
-/// registered reservation as **abandoned** (the §4.4 pt 4
-/// unwritten-range mechanism — replay's checksum walk drops it), fail
+/// One conveyor **window** (D-2, module docs "The two-stage commit
+/// conveyor"): a batch past its RAM apply, its entries SUBMITTED to the
+/// journal ring, handed from the apply pass to the per-volume durability
+/// lane, which awaits the write, the completed prefix and (strict) the
+/// barrier, then fans the members' terminal outcomes out — in handoff
+/// order, which is drain order, which is journal-seq order.
+struct ConveyorWindow {
+    /// The batch members (queue order), each still co-owning its DLM
+    /// guards — released only at the terminal outcome the lane computes.
+    entries: Vec<QueuedTx>,
+    /// Members rolled OUT of the window at apply (`(index, error)`); their
+    /// sub-ranges are unwritten holes.
+    failed: Vec<(usize, KvError)>,
+    /// The batch's contiguous registered reservation; the lane completes
+    /// it once the write's outcome is known (`res_open` tracks that).
+    res: Reservation,
+    res_open: bool,
+    /// First-touch pre-images for the §4.4 pt 4 seq-conditional rollback
+    /// the lane runs if the write fails.
+    undo: Vec<UndoKey>,
+    /// The in-flight ring write: `Ok(None)` when nothing was submitted
+    /// (every member failed at apply), `Err` when the encode refused
+    /// before any byte was submitted (a failed write with nothing landed).
+    write: Option<std::result::Result<Option<super::journal::EntriesWriteInFlight>, KvError>>,
+    /// The apply pass's start (`window_total`) and the handoff instant
+    /// (`window_lane_wait`).
+    t_pass: std::time::Instant,
+    t_handoff: std::time::Instant,
+    /// The write's submission instant, captured when the lane takes the
+    /// in-flight handle (`pass_journal_write`'s start; `None` = nothing
+    /// was submitted).
+    submitted_at: Option<std::time::Instant>,
+    /// op-trace (audit A2): the batch's traced members.
+    traced: crate::op_trace::TracedBatch,
+}
+
+/// What one apply pass produces (`run_batch`): the pre-reserve terminal
+/// outcomes (a batch that failed as a unit) or the window for the lane —
+/// never both non-empty.
+struct BatchProduct {
+    outcomes: Vec<(QueuedTx, std::result::Result<(), KvError>)>,
+    window: Option<ConveyorWindow>,
+}
+
+impl ConveyorWindow {
+    /// Non-blocking: has this window's write landed (or is there nothing
+    /// to wait for)? The lane's grouping probe.
+    fn write_landed(&mut self) -> bool {
+        match self.write.as_mut() {
+            Some(Ok(Some(inflight))) => inflight.poll_done(),
+            _ => true,
+        }
+    }
+}
+
+/// The §5.5 panic guard for the APPLY stage: pipeline state that must
+/// never be dropped on the floor, armed for the whole batch pass. Every
+/// NORMAL path (success and failure alike) empties it; [`Drop`] therefore
+/// fires with content only when the pass unwinds (panic) or the detached
+/// task is torn down mid-await (runtime shutdown) — and then performs the
+/// all-sync §5.5 cleanup: release the un-transferred `Admission`,
+/// `complete()` any registered reservation as **abandoned** (the §4.4
+/// pt 4 unwritten-range mechanism — replay's checksum walk drops it), fail
 /// the batch's oneshots with EIO, fail out anything still queued behind
 /// the dead leader, release leadership, and escalate loud. A batch can
 /// fail; `completed_upto` can never wedge.
 struct PassSentinel<'a> {
     be: &'a Arc<KvMetaBackend>,
+    /// The pass start (`pass_total`, and the window's `window_total`).
+    t_pass: std::time::Instant,
     /// Batch members not yet at their terminal outcome.
     entries: Vec<QueuedTx>,
     /// Members WITH their terminal outcome computed, awaiting fan-out
-    /// (the pass task sends these after releasing the backend ref).
+    /// (the pass task sends these after releasing the backend ref) — the
+    /// pre-reserve batch failures.
     outcomes: Vec<(QueuedTx, std::result::Result<(), KvError>)>,
     /// Σ admission, held from admit until transfer to the reservation.
     admission: Option<super::journal_core::Admission>,
-    /// The registered batch reservation, held until the pass completes it.
+    /// The registered batch reservation, held until it moves into the
+    /// window at handoff.
     reservation: Option<Reservation>,
     /// Records are applied to RAM and neither journaled nor rolled back
     /// (the span where RAM would silently diverge from replay): a panic
@@ -7215,6 +7378,9 @@ struct PassSentinel<'a> {
     /// with `failed` latched the checkpoint task idles and the divergence
     /// dies at remount.
     applied_unrolled: bool,
+    /// The window built at handoff, taken by the pass task the instant
+    /// the pipeline returns (no await in between).
+    window: Option<ConveyorWindow>,
     /// op-trace (audit A2): the batch's traced members — every pass-level
     /// phase record stamps its stage for each of them.
     traced: crate::op_trace::TracedBatch,
@@ -7226,6 +7392,7 @@ impl Drop for PassSentinel<'_> {
             && self.outcomes.is_empty()
             && self.admission.is_none()
             && self.reservation.is_none()
+            && self.window.is_none()
         {
             return;
         }
@@ -7244,13 +7411,23 @@ impl Drop for PassSentinel<'_> {
         if let Some(adm) = self.admission.take() {
             self.be.ring.core().release(adm);
         }
-        let batch_n = self.entries.len();
+        let mut batch_n = self.entries.len();
         for q in self.entries.drain(..) {
             let _ = q.done.send(Err(KvError::Io(self.be.eio(
                 "commit conveyor pass panicked — batch failed loud (§5.5 panic guard)",
             ))));
         }
-        if self.applied_unrolled && !self.be.failed.swap(true, Ordering::AcqRel) {
+        // A window built but not handed off: its write is in flight and
+        // its outcome unknown — abandon it exactly like the lane's
+        // sentinel would (RAM diverges from replay ⇒ fail-stop).
+        let mut applied_unrolled = self.applied_unrolled;
+        if let Some(w) = self.window.take() {
+            batch_n += w.entries.len();
+            applied_unrolled = true;
+            self.be
+                .abandon_window(w, "conveyor pass panicked at the durability handoff");
+        }
+        if applied_unrolled && !self.be.failed.swap(true, Ordering::AcqRel) {
             log::error!(
                 "meta volume {}: conveyor pass panicked AFTER RAM apply — volume marked \
                  FAILED (RAM diverges from replay for the failed batch; mutations return \
@@ -7280,6 +7457,69 @@ impl Drop for PassSentinel<'_> {
             "meta volume {}: conveyor pass panic contained — {batch_n} batch member(s) \
              failed EIO, {stranded_n} queued tx(s) failed out, budget released, \
              reservation abandoned (meta_conveyor_pass_panics)",
+            self.be.path.display()
+        );
+    }
+}
+
+/// The §5.5 panic guard for the DURABILITY stage (D-2): the windows the
+/// lane took together and has not yet answered. Every normal path empties
+/// it; [`Drop`] with content = the lane unwound (panic) or was torn down
+/// mid-await, and then: deliver computed outcomes, abandon every window
+/// still in progress (complete its reservation as abandoned, fail its
+/// members EIO), fail out every window still queued behind the dead lane,
+/// release lane leadership, **fail-stop the volume** (every abandoned
+/// window's RAM apply is un-journaled-or-unknown — the divergence dies at
+/// remount), and escalate loud.
+struct LaneSentinel<'a> {
+    be: &'a Arc<KvMetaBackend>,
+    /// Windows in progress, in journal order.
+    windows: Vec<ConveyorWindow>,
+    /// Members WITH their terminal outcome computed, awaiting fan-out.
+    outcomes: Vec<(QueuedTx, std::result::Result<(), KvError>)>,
+}
+
+impl Drop for LaneSentinel<'_> {
+    fn drop(&mut self) {
+        if self.windows.is_empty() && self.outcomes.is_empty() {
+            return;
+        }
+        for (q, outcome) in self.outcomes.drain(..) {
+            let _ = q.done.send(outcome);
+        }
+        super::META_CONVEYOR_PASS_PANICS.fetch_add(1, Ordering::Relaxed);
+        let mut members = 0usize;
+        for w in self.windows.drain(..) {
+            members += w.entries.len();
+            self.be
+                .abandon_window(w, "conveyor durability lane panicked — window failed loud");
+        }
+        let mut stranded = 0usize;
+        loop {
+            for w in self.be.durability_lane.drain(usize::MAX, u64::MAX) {
+                stranded += w.entries.len();
+                self.be.abandon_window(
+                    w,
+                    "conveyor durability lane panicked before this window was reached",
+                );
+            }
+            if !self.be.durability_lane.unlead_and_recheck() {
+                break;
+            }
+        }
+        if !self.be.failed.swap(true, Ordering::AcqRel) {
+            log::error!(
+                "meta volume {}: durability lane panicked with applied windows in flight — \
+                 volume marked FAILED (RAM may diverge from replay; mutations return EIO \
+                 until remount)",
+                self.be.path.display()
+            );
+        }
+        self.be.note_journal_failure();
+        log::error!(
+            "meta volume {}: durability lane panic contained — {members} member(s) in \
+             progress and {stranded} queued failed EIO, reservations abandoned \
+             (meta_conveyor_pass_panics)",
             self.be.path.display()
         );
     }
@@ -7463,11 +7703,14 @@ impl KvMetaBackend {
     ///    survives until the pass reaches the tx's terminal outcome
     ///    (§5.5 revision 2, Issue 13).
     ///
-    /// The batch pipeline itself — one Σ admission, union leaf locks,
-    /// contiguous per-tx reservations, one `write_at_batch`, one barrier
-    /// — is [`Self::run_batch`]; a batch of 1 runs today's per-tx
-    /// pipeline stages byte-for-byte (the degenerate case IS the
-    /// pre-conveyor code path).
+    /// The batch pipeline itself is two stages (module docs, "The
+    /// two-stage commit conveyor"): the APPLY pass — one Σ admission,
+    /// union leaf locks, contiguous per-tx reservations, RAM apply, one
+    /// submitted `write_at_batch` — is [`Self::run_batch`]; the
+    /// DURABILITY lane — write completion, completed prefix, one barrier,
+    /// fan-out in journal order — is [`Self::run_windows`]. A batch of 1
+    /// runs the per-tx pipeline stages byte-for-byte on the ring (the
+    /// degenerate case IS the pre-conveyor entry shape).
     async fn commit_tx(&self, tx: KvTx) -> std::result::Result<(), KvError> {
         if tx.is_empty() {
             return Ok(());
@@ -7666,7 +7909,121 @@ impl KvMetaBackend {
                 }
                 continue;
             }
-            let outcomes = be.run_batch(batch).await;
+            let BatchProduct { outcomes, window } = be.run_batch(batch).await;
+            // Stage A → stage B handoff (D-2): the window joins the
+            // durability lane's in-order queue; the enqueue and the
+            // leader-elect are two uninterruptible steps (no await between
+            // them), so a window can never sit in the lane leaderless.
+            if let Some(window) = window {
+                super::note_window_inflight();
+                let lane = Arc::clone(&be.durability_lane);
+                let len = window.entries.len() as u64;
+                lane.enqueue(window, len);
+                if lane.try_lead() {
+                    crate::meta_exec::spawn_meta(
+                        "kv_conveyor_durability",
+                        Self::durability_lane_task(lane, Weak::clone(&weak)),
+                    );
+                }
+            }
+            // Release the backend BEFORE waking committers: a woken
+            // committer may own the last user `Arc` and re-open.
+            drop(be);
+            // The pre-reserve batch failures are the pass's own terminal
+            // outcomes (nothing reserved, nothing applied) — fan them out
+            // here; everything else answers from the durability lane.
+            Self::fan_out(outcomes);
+        }
+    }
+
+    /// Fan out per-tx terminal outcomes; each entry's guard set is
+    /// released at ITS terminal outcome — post-result-send on success,
+    /// post-rollback on failure. op-trace `fanout`: a clock read per
+    /// TRACED member only (the untraced population pays a field compare).
+    fn fan_out(outcomes: Vec<(QueuedTx, std::result::Result<(), KvError>)>) {
+        for (q, outcome) in outcomes {
+            if q.trace_id != 0 {
+                crate::op_trace::stamp_now(q.trace_id, crate::op_trace::Stage::Fanout);
+            }
+            let _ = q.done.send(outcome);
+        }
+    }
+
+    /// Abandon a window whose write outcome will never be observed (the
+    /// panic sentinels' arm): complete its reservation as **abandoned**
+    /// (the §4.4 pt 4 mechanism — if the bytes landed anyway, replay
+    /// applies an un-acked tx, which the crash contract permits; if not,
+    /// the checksum walk drops the hole), fail every member EIO, and close
+    /// the in-flight gauge. All-sync.
+    fn abandon_window(&self, w: ConveyorWindow, why: &str) {
+        if w.res_open {
+            self.ring.complete(&w.res);
+        }
+        for q in w.entries {
+            let _ = q.done.send(Err(KvError::Io(self.eio(why))));
+        }
+        super::note_window_done();
+    }
+
+    /// **Stage B — the per-volume durability lane** (D-2; module docs "The
+    /// two-stage commit conveyor"). Drains windows in handoff order and
+    /// takes each GROUP — the head window (awaited) plus every following
+    /// window whose write has already landed — to its terminal outcome:
+    /// complete the reservations, ONE completed-prefix wait, the hole
+    /// checkpoints, ONE strict barrier, then the members' outcomes in
+    /// journal order. Never touches a node lock except in the §4.4 pt 4
+    /// rollback arm of a FAILED write (the 4b argument in the module doc).
+    /// Same lifecycle as the apply pass: holds the backend per group only,
+    /// releases it before waking committers, exits on an empty drain via
+    /// the release-then-recheck protocol (the loom-modeled core).
+    async fn durability_lane_task(
+        lane: Arc<ConveyorCore<ConveyorWindow>>,
+        weak: Weak<KvMetaBackend>,
+    ) {
+        // Windows drained but not yet processed: the lane drains the whole
+        // queue at once (FIFO) and works its way through in groups, so a
+        // window whose write has not landed waits HERE (in order) while the
+        // group ahead of it is answered.
+        let mut carry: std::collections::VecDeque<ConveyorWindow> =
+            std::collections::VecDeque::new();
+        loop {
+            if carry.is_empty() {
+                carry.extend(lane.drain(usize::MAX, u64::MAX));
+            }
+            let Some(head) = carry.pop_front() else {
+                if !lane.unlead_and_recheck() {
+                    return;
+                }
+                continue;
+            };
+            let Some(be) = weak.upgrade() else {
+                // Backend dropped without shutdown: live committers hold
+                // `&self`, so these windows' committers are gone — their
+                // writes complete on their own (the pool holds path +
+                // bytes), the guards release with the entries. Answer the
+                // dead receivers (the sends are the belt) and release.
+                let dead = |w: ConveyorWindow| {
+                    for q in w.entries {
+                        let _ = q.done.send(Err(KvError::Corrupt(
+                            "meta volume dropped with commit windows in flight".to_string(),
+                        )));
+                    }
+                    super::note_window_done();
+                };
+                dead(head);
+                for w in carry.drain(..) {
+                    dead(w);
+                }
+                loop {
+                    for w in lane.drain(usize::MAX, u64::MAX) {
+                        dead(w);
+                    }
+                    if !lane.unlead_and_recheck() {
+                        return;
+                    }
+                }
+            };
+            let outcomes = be.run_windows(head, &mut carry).await;
             // Release the backend BEFORE waking committers: a woken
             // committer may own the last user `Arc` and re-open.
             drop(be);
@@ -7682,30 +8039,16 @@ impl KvMetaBackend {
                 }
                 notified.await;
             }
-
-            // (9) Fan out per-tx results; each entry's guard set is
-            // released at ITS terminal outcome — post-result-send on
-            // success, post-rollback on failure (which already ran
-            // inside the pipeline). op-trace `fanout`: a clock read per
-            // TRACED member only (the untraced population pays a field
-            // compare).
-            for (q, outcome) in outcomes {
-                if q.trace_id != 0 {
-                    crate::op_trace::stamp_now(q.trace_id, crate::op_trace::Stage::Fanout);
-                }
-                let _ = q.done.send(outcome);
-            }
+            Self::fan_out(outcomes);
         }
     }
 
-    /// One conveyor batch through the §4.4 pipeline (§5.5: "runs the
-    /// pipeline ONCE for the batch"), under the panic sentinel. Never
-    /// errs — it returns every member's terminal outcome for the caller
-    /// to fan out (after releasing the backend ref), each exactly once.
-    async fn run_batch(
-        self: &Arc<Self>,
-        batch: Vec<QueuedTx>,
-    ) -> Vec<(QueuedTx, std::result::Result<(), KvError>)> {
+    /// One conveyor batch through the §4.4 pipeline's APPLY stage (§5.5:
+    /// "runs the pipeline ONCE for the batch"), under the panic sentinel.
+    /// Never errs — it returns either the pre-reserve terminal outcomes
+    /// (every member failed as a unit, nothing reserved or applied) or the
+    /// applied-and-submitted window for the durability lane.
+    async fn run_batch(self: &Arc<Self>, batch: Vec<QueuedTx>) -> BatchProduct {
         use crate::fuse_client::{
             meta_txpass_phase_record, meta_txpass_phase_record_dur, MetaTxPassPhase,
         };
@@ -7772,11 +8115,13 @@ impl KvMetaBackend {
         // fail loud but can never wedge `completed_upto`.
         let mut sentinel = PassSentinel {
             be: self,
+            t_pass,
             entries: batch,
             outcomes: Vec::new(),
             admission: None,
             reservation: None,
             applied_unrolled: false,
+            window: None,
             traced,
         };
         self.run_batch_pipeline(&mut sentinel).await;
@@ -7784,21 +8129,26 @@ impl KvMetaBackend {
             sentinel.entries.is_empty()
                 && sentinel.admission.is_none()
                 && sentinel.reservation.is_none(),
-            "the batch pipeline must reach a terminal outcome for every entry on every \
-             non-panic path (the sentinel is for unwinds only)"
+            "the batch pipeline must reach a terminal outcome or a handoff for every entry \
+             on every non-panic path (the sentinel is for unwinds only)"
         );
+        // `pass_total` is the SERIALIZED server's service time — drain →
+        // handoff; the device wait it used to contain is the lane's.
         meta_txpass_phase_record(MetaTxPassPhase::PassTotal, t_pass, &sentinel.traced);
-        std::mem::take(&mut sentinel.outcomes)
+        BatchProduct {
+            outcomes: std::mem::take(&mut sentinel.outcomes),
+            window: sentinel.window.take(),
+        }
     }
 
-    /// The batch pipeline body. Mutates the sentinel as protocol stages
-    /// pass so an unwind at ANY await leaves exactly the right cleanup
-    /// state; on every normal path (success and failure alike) it fans
-    /// out per-tx results and empties the sentinel itself.
+    /// The APPLY-stage pipeline body. Mutates the sentinel as protocol
+    /// stages pass so an unwind at ANY await leaves exactly the right
+    /// cleanup state; on every normal path it either stages every member's
+    /// terminal outcome (a pre-reserve batch failure) or builds the window
+    /// the durability lane takes over, emptying the sentinel's entries
+    /// itself.
     async fn run_batch_pipeline(&self, s: &mut PassSentinel<'_>) {
-        use crate::fuse_client::{
-            meta_txpass_phase_record, meta_txpass_phase_record_span, MetaTxPassPhase,
-        };
+        use crate::fuse_client::{meta_txpass_phase_record, MetaTxPassPhase};
         // Inherited liveness re-checks (§5.5: "the shutdown/failure-flag
         // re-checks it inherits from commit_tx's admission loop").
         if self.is_shutting_down() || self.is_failed() {
@@ -8089,17 +8439,14 @@ impl KvMetaBackend {
             leaf_wait,
         );
 
-        // (6) The pass's own bytes, outside every lock: the surviving
-        // members' entries — N ORDINARY checksummed entries in the one
-        // contiguous reservation, one `write_at_batch` submission. A
-        // failed member's sub-range stays unwritten (the §4.4 pt 4
-        // unwritten-hole mechanism; replay's checksum walk drops it).
-        // The window is in flight from here until its members' terminal
-        // outcomes are staged (D-2's engagement instrument).
-        super::note_window_inflight();
-        super::META_CONVEYOR_DURABILITY_PASSES.fetch_add(1, Ordering::Relaxed);
-        let t_jwrite = std::time::Instant::now();
-        let write_out = {
+        // (6) SUBMIT the surviving members' entries, outside every lock —
+        // N ORDINARY checksummed entries in the one contiguous reservation,
+        // one `uring_fs` submission, NO wait (D-2): the completion is the
+        // durability lane's to await. A failed member's sub-range stays
+        // unwritten (the §4.4 pt 4 unwritten-hole mechanism; replay's
+        // checksum walk drops it). An encode refusal is a failed write
+        // with nothing landed — the lane treats it exactly so.
+        let write = {
             let mut parts: Vec<(Reservation, &[(u8, Record)])> = Vec::new();
             let mut seq_cursor = res.start;
             for (qi, q) in s.entries.iter().enumerate() {
@@ -8111,146 +8458,280 @@ impl KvMetaBackend {
                 parts.push((Reservation { start, len: q.len }, &q.recs));
             }
             if parts.is_empty() {
-                Ok(())
+                Ok(None)
             } else {
-                self.ring.write_entries_batch(&parts).await
+                self.ring.submit_entries_batch(&parts).map(Some)
             }
         };
-        // e2e audit B: the lumped `pass_journal_write` splits into the
-        // ring write, the completed-prefix wait and the barrier (the
-        // three record only on the success arm, like the lump).
-        let t_ring_done = std::time::Instant::now();
-        // Completion is unconditional and pass-owned (commit_entry's
-        // guarantee, batch edition): a reservation that never completes
-        // would wedge the completed-prefix watermark. An unwritten /
-        // failed range still completes — it is an abandoned hole.
-        let res = s.reservation.take().expect("reservation registered");
-        self.ring.complete(&res);
 
-        match write_out {
-            Ok(()) => {
-                meta_txpass_phase_record_span(
-                    MetaTxPassPhase::JournalRingWrite,
-                    t_jwrite,
-                    t_ring_done,
-                    &s.traced,
-                );
-                // (7) One completed-prefix wait covers every member
-                // (their entries all end at-or-before the batch end;
-                // chain-reachability per the K3 barrier observation).
-                let t_pfx = std::time::Instant::now();
-                self.ring.wait_completed_upto(res.end()).await;
-                meta_txpass_phase_record(MetaTxPassPhase::JournalPrefixWait, t_pfx, &s.traced);
-                self.journal_failures.store(0, Ordering::Release);
-                // A skipped member left an unwritten hole in front of
-                // acked survivors: checkpoint past it BEFORE acking, so
-                // an immediate crash cannot strand chain-reachability of
-                // what we are about to ack (§4.4 pt 4's hole discipline,
-                // applied batch-mid).
-                let mut hole_err: Option<String> = None;
-                if !failed.is_empty() {
-                    if let Err(ck) = self.checkpoint_past(res.end()).await {
+        // (7) Handoff: the window now owns the reservation, the members and
+        // their applied-but-unjournaled state; the lane's sentinel covers
+        // them from here (the pass task takes the window the instant this
+        // returns — no await in between).
+        let res = s.reservation.take().expect("reservation registered");
+        let entries = std::mem::take(&mut s.entries);
+        s.applied_unrolled = false;
+        s.window = Some(ConveyorWindow {
+            entries,
+            failed,
+            res,
+            res_open: true,
+            undo,
+            write: Some(write),
+            t_pass: s.t_pass,
+            t_handoff: std::time::Instant::now(),
+            submitted_at: None,
+            traced: s.traced,
+        });
+    }
+
+    /// **Stage B for one group of windows** (D-2): `head` (whose write is
+    /// awaited) plus every window behind it in `carry` whose write has
+    /// ALREADY landed — taken as one group so the deferred cadence pays one
+    /// completed-prefix wait and the strict cadence ONE coalesced barrier
+    /// for all of them (group commit of barriers, the §5.5 shape moved
+    /// downstream). Windows are answered in handoff order: the members'
+    /// terminal outcomes are staged in journal order and fanned out by the
+    /// caller after it releases the backend.
+    ///
+    /// Per window the durability protocol is the pre-D-2 pass tail
+    /// verbatim: complete the reservation on BOTH outcomes (a reservation
+    /// that never completes wedges `completed_upto`); on success wait the
+    /// completed prefix, reset the consecutive-failure rung, checkpoint
+    /// past any apply-hole BEFORE acking survivors (§4.4 pt 4's hole
+    /// discipline — later windows' entries sit behind the hole in the same
+    /// ring pages and are unreachable until the tail passes it); on a
+    /// failed write run the §4.4 pt 4 seq-conditional rollback over the
+    /// window's range (the one arm in which this stage takes leaf locks —
+    /// ascending, deduped, revalidated, never across I/O), escalate through
+    /// `note_journal_failure`, and checkpoint past the permanent hole.
+    async fn run_windows(
+        self: &Arc<Self>,
+        head: ConveyorWindow,
+        carry: &mut std::collections::VecDeque<ConveyorWindow>,
+    ) -> Vec<(QueuedTx, std::result::Result<(), KvError>)> {
+        use crate::fuse_client::{
+            meta_txpass_phase_record, meta_txpass_phase_record_span, MetaTxPassPhase,
+        };
+        super::META_CONVEYOR_DURABILITY_PASSES.fetch_add(1, Ordering::Relaxed);
+        let mut s = LaneSentinel {
+            be: self,
+            windows: vec![head],
+            outcomes: Vec::new(),
+        };
+
+        // (8) Await the head's write; then take every landed successor.
+        let head_out = self.await_window_write(&mut s.windows[0]).await;
+        while carry.front_mut().is_some_and(|w| w.write_landed()) {
+            s.windows.push(carry.pop_front().expect("probed front"));
+        }
+        let mut write_outs: Vec<std::result::Result<(), KvError>> =
+            Vec::with_capacity(s.windows.len());
+        write_outs.push(head_out);
+        for i in 1..s.windows.len() {
+            let out = self.await_window_write(&mut s.windows[i]).await;
+            write_outs.push(out);
+        }
+        // Completion is unconditional and lane-owned: every window's
+        // reservation completes now that its write's outcome is known
+        // (an unwritten / failed range still completes — an abandoned
+        // hole), in journal order so `completed_upto` walks forward.
+        for w in s.windows.iter_mut() {
+            self.ring.complete(&w.res);
+            w.res_open = false;
+        }
+
+        // (9) Per window, in order: the success arm or the rollback arm.
+        // `hole_end` accumulates the furthest position replay's chain walk
+        // must start past before any survivor in the group is acked.
+        let group_end = s.windows.last().expect("head").res.end();
+        let mut hole_end: Option<u64> = None;
+        let mut any_ok = false;
+        // Per-window verdict feeding the outcomes: `Ok(())` = ack pending
+        // the group barrier; `Err(msg)` = every survivor fails with `msg`.
+        let mut verdicts: Vec<std::result::Result<(), KvError>> =
+            Vec::with_capacity(s.windows.len());
+        let t_pfx = std::time::Instant::now();
+        if write_outs.iter().any(|o| o.is_ok()) {
+            // One completed-prefix wait covers every member of the group
+            // (their entries all end at-or-before the group end; chain-
+            // reachability per the K3 barrier observation).
+            self.ring.wait_completed_upto(group_end).await;
+        }
+        meta_txpass_phase_record(
+            MetaTxPassPhase::JournalPrefixWait,
+            t_pfx,
+            &s.windows[0].traced,
+        );
+        for (w, write_out) in s.windows.iter().zip(write_outs) {
+            match write_out {
+                Ok(()) => {
+                    self.journal_failures.store(0, Ordering::Release);
+                    if !w.failed.is_empty() {
+                        hole_end = Some(hole_end.map_or(w.res.end(), |h| h.max(w.res.end())));
+                    }
+                    any_ok = true;
+                    verdicts.push(Ok(()));
+                }
+                Err(e) => {
+                    log::warn!(
+                        "meta volume {}: batch journal write failed (seqs [{}, {})): {e} — \
+                         rolling back {} member(s)",
+                        self.path.display(),
+                        w.res.start,
+                        w.res.end(),
+                        w.entries.len(),
+                    );
+                    // (9') Whole-window rollback: the §4.4 pt 4
+                    // seq-conditional machinery over the window's
+                    // contiguous range with the first-touch pre-images —
+                    // exact against every later window's apply (only Δtime
+                    // merge records can share a key across windows: every
+                    // other same-key writer is still excluded by the DLM
+                    // guards this window's entries hold), skip-if-newer
+                    // being precisely LWW-correct for those.
+                    self.rollback_failed_tx(w.res.start, w.res.end(), &w.undo)
+                        .await;
+                    self.note_journal_failure();
+                    // The reserved range is now a PERMANENT hole in the
+                    // ring (§4.1 discovery loses same-page successors of a
+                    // dead chain): checkpoint past it — zero ring bytes by
+                    // the §4.4 pt 5 progress theorem.
+                    if let Err(ck) = self.checkpoint_past(w.res.end()).await {
                         log::error!(
-                            "meta volume {}: post-isolation checkpoint could not cover the \
-                             batch hole: {ck} (volume escalating; failing the survivors \
-                             loud rather than acking unreachable entries)",
+                            "meta volume {}: post-failure checkpoint could not drain the \
+                             journal hole: {ck} (volume escalating)",
                             self.path.display()
                         );
                         self.note_journal_failure();
-                        hole_err = Some(format!(
-                            "batch hole checkpoint failed after a member rollback: {ck}"
-                        ));
                     }
-                }
-                let barrier_out = if hole_err.is_none() && self.strict {
-                    // (8) Strict-0 group commit: ONE coalesced fdatasync
-                    // for the whole batch (§4.6 pt 4 / §5.5 — the G3
-                    // mechanism: the barrier leaves the throughput path).
-                    let t_bar = std::time::Instant::now();
-                    let out = self.sync_device().await.map_err(KvError::Io);
-                    meta_txpass_phase_record(MetaTxPassPhase::JournalBarrier, t_bar, &s.traced);
-                    out
-                } else {
-                    if hole_err.is_none() {
-                        self.needs_flush.store(true, Ordering::Release);
-                    }
-                    Ok(())
-                };
-                meta_txpass_phase_record(MetaTxPassPhase::PassJournalWrite, t_jwrite, &s.traced);
-                s.applied_unrolled = false;
-
-                // Terminal outcomes, in queue order (the pass task fans
-                // them out after releasing the backend ref).
-                let mut failed = failed;
-                // PR VL5b (§5.5.2 step 3): the pass task IS the key tee —
-                // every user commit on the volume passes through here, so
-                // one armed-tee load per batch captures every migrating-
-                // keyspace key with zero cost when no migration runs.
-                let tee = self.migration_tee.load_full();
-                for (qi, q) in std::mem::take(&mut s.entries).into_iter().enumerate() {
-                    if let Some(pos) = failed.iter().position(|(fi, _)| *fi == qi) {
-                        let (_, e) = failed.swap_remove(pos);
-                        s.outcomes.push((q, Err(e)));
-                        continue;
-                    }
-                    let outcome = match (&hole_err, &barrier_out) {
-                        (Some(msg), _) => Err(KvError::Io(self.eio(msg))),
-                        (None, Err(e)) => Err(self.clone_kv_error(e)),
-                        (None, Ok(())) => {
-                            // D4.a: one successful commit_tx = one journal
-                            // entry against the tx's construction site.
-                            super::note_commit_site(q.site);
-                            if let Some(tee) = tee.as_deref() {
-                                tee.note_committed(&q.recs);
-                            }
-                            Ok(())
-                        }
-                    };
-                    s.outcomes.push((q, outcome));
-                }
-            }
-            Err(e) => {
-                log::warn!(
-                    "meta volume {}: batch journal write failed (seqs [{}, {})): {e} — \
-                     rolling back {} member(s)",
-                    self.path.display(),
-                    res.start,
-                    res.end(),
-                    s.entries.len(),
-                );
-                // (8') Whole-batch rollback: the §4.4 pt 4 seq-conditional
-                // machinery reused over the batch's contiguous range with
-                // the first-touch pre-images (each member's records carry
-                // seqs inside [start, end), so removal + skip-if-newer
-                // compensation compose exactly as for one tx).
-                self.rollback_failed_tx(res.start, res.end(), &undo).await;
-                s.applied_unrolled = false;
-                self.note_journal_failure();
-                // The reserved range is now a PERMANENT hole in the ring
-                // (§4.1 discovery loses same-page successors of a dead
-                // chain): checkpoint past it — zero ring bytes by the
-                // §4.4 pt 5 progress theorem.
-                if let Err(ck) = self.checkpoint_past(res.end()).await {
-                    log::error!(
-                        "meta volume {}: post-failure checkpoint could not drain the \
-                         journal hole: {ck} (volume escalating)",
-                        self.path.display()
-                    );
-                    self.note_journal_failure();
-                }
-                let mut failed = failed;
-                for (qi, q) in std::mem::take(&mut s.entries).into_iter().enumerate() {
-                    let outcome = if let Some(pos) = failed.iter().position(|(fi, _)| *fi == qi) {
-                        let (_, member_e) = failed.swap_remove(pos);
-                        Err(member_e)
-                    } else {
-                        Err(self.clone_kv_error(&e))
-                    };
-                    s.outcomes.push((q, outcome));
+                    verdicts.push(Err(e));
                 }
             }
         }
-        super::note_window_done();
+        // Apply-holes in acked windows: checkpoint past them BEFORE acking
+        // survivors, so an immediate crash cannot strand chain-
+        // reachability of what is about to be acked (§4.4 pt 4's hole
+        // discipline, applied window-mid). One cycle covers the furthest.
+        let mut hole_err: Option<String> = None;
+        if let Some(end) = hole_end {
+            if let Err(ck) = self.checkpoint_past(end).await {
+                log::error!(
+                    "meta volume {}: post-isolation checkpoint could not cover the batch \
+                     hole: {ck} (volume escalating; failing the survivors loud rather than \
+                     acking unreachable entries)",
+                    self.path.display()
+                );
+                self.note_journal_failure();
+                hole_err = Some(format!(
+                    "batch hole checkpoint failed after a member rollback: {ck}"
+                ));
+            }
+        }
+        // (10) Strict cadence: ONE coalesced barrier for the whole group
+        // (§4.6 pt 4 / §5.5 — the G3 mechanism, now also amortized across
+        // the windows that landed while the head was awaited).
+        let barrier_out = if hole_err.is_none() && any_ok && self.strict {
+            let t_bar = std::time::Instant::now();
+            let out = self.sync_device().await.map_err(KvError::Io);
+            meta_txpass_phase_record(MetaTxPassPhase::JournalBarrier, t_bar, &s.windows[0].traced);
+            out
+        } else {
+            if hole_err.is_none() && any_ok {
+                self.needs_flush.store(true, Ordering::Release);
+            }
+            Ok(())
+        };
+
+        // (11) Terminal outcomes, window by window in journal order. PR
+        // VL5b (§5.5.2 step 3): the lane IS the key tee — every user commit
+        // on the volume passes through here, so one armed-tee load per
+        // group captures every migrating-keyspace key with zero cost when
+        // no migration runs.
+        let tee = self.migration_tee.load_full();
+        let t_done = std::time::Instant::now();
+        for (mut w, verdict) in std::mem::take(&mut s.windows).into_iter().zip(verdicts) {
+            // The pre-D-2 lump, per window: submission → this window's
+            // durability decided (comparable to the baseline's
+            // `pass_journal_write`, which ended at the same protocol point).
+            if let Some(t_sub) = w.submitted_at {
+                meta_txpass_phase_record_span(
+                    MetaTxPassPhase::PassJournalWrite,
+                    t_sub,
+                    t_done,
+                    &w.traced,
+                );
+            }
+            meta_txpass_phase_record_span(
+                MetaTxPassPhase::WindowTotal,
+                w.t_pass,
+                t_done,
+                &w.traced,
+            );
+            let mut failed = std::mem::take(&mut w.failed);
+            for (qi, q) in std::mem::take(&mut w.entries).into_iter().enumerate() {
+                if let Some(pos) = failed.iter().position(|(fi, _)| *fi == qi) {
+                    let (_, e) = failed.swap_remove(pos);
+                    s.outcomes.push((q, Err(e)));
+                    continue;
+                }
+                let outcome = match (&verdict, &hole_err, &barrier_out) {
+                    (Err(e), _, _) => Err(self.clone_kv_error(e)),
+                    (Ok(()), Some(msg), _) => Err(KvError::Io(self.eio(msg))),
+                    (Ok(()), None, Err(e)) => Err(self.clone_kv_error(e)),
+                    (Ok(()), None, Ok(())) => {
+                        // D4.a: one successful commit_tx = one journal
+                        // entry against the tx's construction site.
+                        super::note_commit_site(q.site);
+                        if let Some(tee) = tee.as_deref() {
+                            tee.note_committed(&q.recs);
+                        }
+                        Ok(())
+                    }
+                };
+                s.outcomes.push((q, outcome));
+            }
+            super::note_window_done();
+        }
+        std::mem::take(&mut s.outcomes)
+    }
+
+    /// Await one window's ring write (D-2 stage B step 8), recording
+    /// `window_lane_wait` (handoff → pickup) and `journal_ring_write`
+    /// (submission → observed completion). `Ok(())` when nothing was
+    /// submitted (every member failed at apply); an encode refusal is the
+    /// failed-write outcome it always was.
+    async fn await_window_write(&self, w: &mut ConveyorWindow) -> std::result::Result<(), KvError> {
+        use crate::fuse_client::{
+            meta_txpass_phase_record_dur, meta_txpass_phase_record_span, MetaTxPassPhase,
+        };
+        let t_pick = std::time::Instant::now();
+        meta_txpass_phase_record_dur(
+            MetaTxPassPhase::WindowLaneWait,
+            t_pick.saturating_duration_since(w.t_handoff),
+        );
+        match w
+            .write
+            .take()
+            .expect("a window's write is awaited exactly once")
+        {
+            Ok(None) => Ok(()),
+            Ok(Some(inflight)) => {
+                let t_sub = inflight.submitted_at;
+                w.submitted_at = Some(t_sub);
+                let out = inflight.finish(&self.ring).await;
+                if out.is_ok() {
+                    meta_txpass_phase_record_span(
+                        MetaTxPassPhase::JournalRingWrite,
+                        t_sub,
+                        std::time::Instant::now(),
+                        &w.traced,
+                    );
+                }
+                out
+            }
+            Err(e) => Err(e),
+        }
     }
 
     /// The §4.4 pt 5 user ring admission with the D1.b park-escalation

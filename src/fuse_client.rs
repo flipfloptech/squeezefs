@@ -3776,25 +3776,39 @@ pub enum MetaTxPassPhase {
     /// acquire + revalidate + pre-images + reservation + RAM apply
     /// (checkpoint-freeze / SMO interference shows here).
     PassLeafLocks = 2,
-    /// Pass: journal device write + completed-prefix wait (+ the
-    /// strict-mode coalesced barrier) — kept as the SUM of the three
-    /// split phases below so rows stay comparable (e2e audit B).
+    /// Durability lane (D-2; the pass before it): journal device write +
+    /// completed-prefix wait (+ the strict-mode coalesced barrier) — per
+    /// window, submission → its durability decided; the lump the three
+    /// split phases below decompose, kept so rows stay comparable with the
+    /// pre-D-2 baseline (e2e audit B).
     PassJournalWrite = 3,
-    /// Pass: drain → terminal outcomes staged (the whole `run_batch`).
+    /// Apply pass: drain → handoff to the durability lane (the whole
+    /// `run_batch`) — the SERIALIZED server's service time; ρ = Σ ÷ wall.
+    /// Before D-2 it also contained the device write.
     PassTotal = 4,
-    /// Pass: the batch's ring write (`write_entries_batch` submit →
+    /// Durability lane: a window's ring write (submission → observed
     /// completion).
     JournalRingWrite = 5,
-    /// Pass: the completed-prefix wait (`wait_completed_upto` — parks
-    /// behind OTHER passes' in-flight entries).
+    /// Durability lane: the completed-prefix wait (`wait_completed_upto` —
+    /// one per group; parks behind the checkpoint task's own in-flight
+    /// entries).
     JournalPrefixWait = 6,
     /// Pass: the strict-cadence coalesced barrier (`sync_device`);
     /// records nothing on the default cadence, where the barrier leaves
     /// the pass.
     JournalBarrier = 7,
+    /// D-2 two-stage conveyor: a window's residence in the durability
+    /// lane's queue — apply-stage handoff → the lane picks it up (per
+    /// window). Growing = the lane is the bottleneck (device-bound), the
+    /// apply stage is not.
+    WindowLaneWait = 8,
+    /// D-2: a window's whole conveyor residence past its queue wait —
+    /// apply pass start → its members' terminal outcomes staged (per
+    /// window). `tx_queue_wait + window_total` ≈ a tx's commit latency.
+    WindowTotal = 9,
 }
 
-const META_TXPASS_PHASES: usize = 8;
+const META_TXPASS_PHASES: usize = 10;
 const META_TXPASS_PHASE_NAMES: [&str; META_TXPASS_PHASES] = [
     "tx_queue_wait",
     "pass_admission",
@@ -3804,6 +3818,8 @@ const META_TXPASS_PHASE_NAMES: [&str; META_TXPASS_PHASES] = [
     "journal_ring_write",
     "journal_prefix_wait",
     "journal_barrier",
+    "window_lane_wait",
+    "window_total",
 ];
 
 static META_TXPASS_PROF: Lazy<[LatencyHistogram; META_TXPASS_PHASES]> =
@@ -3823,6 +3839,8 @@ const META_TXPASS_STAGE: [Option<crate::op_trace::Stage>; META_TXPASS_PHASES] = 
     Some(crate::op_trace::Stage::JournalWritten),
     Some(crate::op_trace::Stage::JournalPrefixDone),
     Some(crate::op_trace::Stage::Barrier),
+    None,
+    None,
 ];
 
 /// Record one conveyor-pass span started at `t0` against `phase`; the

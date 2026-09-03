@@ -881,6 +881,15 @@ impl JournalRing {
     /// reservation, and replay is byte-for-byte today's walk; a torn
     /// member drops that tx only).
     ///
+    /// **D-2 (e2e audit DLM #2): submission only.** The entry bytes are
+    /// encoded and handed to the `uring_fs` pool here — a memcpy into the
+    /// reserved window plus one queue push, no wait — and the returned
+    /// [`EntriesWriteInFlight`] is awaited by the conveyor's DURABILITY
+    /// stage, so the device's completion latency never sits inside the
+    /// serialized apply pass. An encode failure surfaces here, before any
+    /// byte is submitted (the caller treats it exactly like a failed
+    /// write: nothing landed, the range is an abandoned hole).
+    ///
     /// Parts must be non-overlapping and each sized exactly
     /// ([`entry_len_for`] == `res.len`), but need not be contiguous —
     /// a rolled-back member's sub-range is simply absent (the §4.4 pt 4
@@ -888,31 +897,35 @@ impl JournalRing {
     /// part owns the page's first byte).
     ///
     /// The caller owns registration/completion of the covering
-    /// reservation (the pass completes it on BOTH outcomes — the
-    /// commit_entry discipline, batch edition).
-    pub async fn write_entries_batch(
+    /// reservation (completed on BOTH outcomes once the write's outcome
+    /// is known — the commit_entry discipline, batch edition).
+    pub fn submit_entries_batch(
         &self,
         parts: &[(Reservation, &[(u8, Record)])],
-    ) -> Result<(), KvError> {
+    ) -> Result<EntriesWriteInFlight, KvError> {
         let mut ops: Vec<(u64, bytes::Bytes)> = Vec::new();
         for (res, records) in parts {
             self.entry_ops(res, records, &mut ops)?;
         }
-        if ops.len() == 1 {
-            let (off, data) = ops.pop().expect("one op");
-            crate::uring_fs::write_at(&self.path, off, data).await?;
-        } else {
-            crate::uring_fs::write_at_batch(&self.path, ops).await?;
-        }
-        let bytes: u64 = parts.iter().map(|(r, _)| r.len).sum();
+        let completion = crate::uring_fs::submit_write_at_batch(&self.path, ops)?;
+        Ok(EntriesWriteInFlight {
+            completion,
+            entries: parts.len() as u64,
+            bytes: parts.iter().map(|(r, _)| r.len).sum(),
+            submitted_at: std::time::Instant::now(),
+        })
+    }
+
+    /// Account a completed [`EntriesWriteInFlight`] (its entries landed
+    /// in the ring): the §10 / §8 row 7 journal-byte story, process-global
+    /// and per-volume.
+    fn note_entries_written(&self, entries: u64, bytes: u64) {
         super::META_KV_JOURNAL_BYTES.fetch_add(bytes, std::sync::atomic::Ordering::Relaxed);
-        super::META_KV_JOURNAL_ENTRIES
-            .fetch_add(parts.len() as u64, std::sync::atomic::Ordering::Relaxed);
+        super::META_KV_JOURNAL_ENTRIES.fetch_add(entries, std::sync::atomic::Ordering::Relaxed);
         self.written_bytes
             .fetch_add(bytes, std::sync::atomic::Ordering::Relaxed);
         self.written_entries
-            .fetch_add(parts.len() as u64, std::sync::atomic::Ordering::Relaxed);
-        Ok(())
+            .fetch_add(entries, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// [`Self::write_entry`] + guaranteed [`Self::complete`] on **both**
@@ -927,6 +940,36 @@ impl JournalRing {
         let out = self.write_entry(res, records).await;
         self.complete(res);
         out
+    }
+}
+
+/// A conveyor batch's ring write, submitted by [`JournalRing::
+/// submit_entries_batch`] and not yet observed complete — the unit the
+/// apply stage hands the durability stage (D-2).
+pub struct EntriesWriteInFlight {
+    completion: crate::uring_fs::WriteCompletion,
+    entries: u64,
+    bytes: u64,
+    /// Submission instant (`meta_txpass_phase_ns.journal_ring_write` =
+    /// submission → observed completion).
+    pub submitted_at: std::time::Instant,
+}
+
+impl EntriesWriteInFlight {
+    /// Non-blocking: has the write completed? (The durability lane groups
+    /// every already-landed window behind the one it awaited into ONE
+    /// prefix wait + ONE barrier.)
+    pub fn poll_done(&mut self) -> bool {
+        self.completion.poll_done()
+    }
+
+    /// Await the write; on success, account the landed entries against
+    /// `ring` (the ring that issued the submission).
+    pub async fn finish(self, ring: &JournalRing) -> Result<(), KvError> {
+        let (entries, bytes) = (self.entries, self.bytes);
+        self.completion.wait().await?;
+        ring.note_entries_written(entries, bytes);
+        Ok(())
     }
 }
 

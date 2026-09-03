@@ -80,6 +80,12 @@ pub struct ConveyorCore<T> {
     queue: Mutex<VecDeque<(T, u64)>>,
     /// Leadership word: `true` while exactly one pass task owns draining.
     leader: AtomicBool,
+    /// The queued-population gauge this core maintains (enqueue +1, drain
+    /// −n), if any: the tx/layout/publish conveyors share the wedge
+    /// census's `META_CONVEYOR_QUEUED`; the durability lane (D-2) carries
+    /// none — its population is gauged by the backend as windows in flight
+    /// from handoff to terminal outcome, which a drain does not end.
+    gauge: Option<&'static std::sync::atomic::AtomicU64>,
 }
 
 impl<T> Default for ConveyorCore<T> {
@@ -89,10 +95,17 @@ impl<T> Default for ConveyorCore<T> {
 }
 
 impl<T> ConveyorCore<T> {
+    /// A core gauged by the wedge census's queued-entries counter.
     pub fn new() -> Self {
+        Self::with_gauge(Some(&super::META_CONVEYOR_QUEUED))
+    }
+
+    /// A core with an explicit (or no) queued-population gauge.
+    pub fn with_gauge(gauge: Option<&'static std::sync::atomic::AtomicU64>) -> Self {
         Self {
             queue: Mutex::new(VecDeque::new()),
             leader: AtomicBool::new(false),
+            gauge,
         }
     }
 
@@ -102,7 +115,9 @@ impl<T> ConveyorCore<T> {
         self.queue.lock().unwrap().push_back((item, len));
         // Wedge census (2026-08-07): the process-global queued gauge —
         // maintained HERE (enqueue/drain) so no fan-out path can leak it.
-        super::META_CONVEYOR_QUEUED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if let Some(g) = self.gauge {
+            g.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
     }
 
     /// Attempt to become the leader. `true` ⇒ the caller MUST arrange a
@@ -135,9 +150,8 @@ impl<T> ConveyorCore<T> {
             bytes += len;
             out.push(item);
         }
-        if !out.is_empty() {
-            super::META_CONVEYOR_QUEUED
-                .fetch_sub(out.len() as u64, std::sync::atomic::Ordering::Relaxed);
+        if let Some(g) = self.gauge.filter(|_| !out.is_empty()) {
+            g.fetch_sub(out.len() as u64, std::sync::atomic::Ordering::Relaxed);
         }
         out
     }

@@ -509,35 +509,46 @@ async fn throughput_tracks_the_committer_population_when_the_device_is_slow() {
 
 /// **Acks follow journal order across overlapped windows.** Eight
 /// one-tx windows enqueued in a known order (the pass held pre-drain, one
-/// arrival admitted at a time), then released against a 10 ms device: the
-/// committers must be answered in exactly enqueue order — which is drain
-/// order (the conveyor core's FIFO) and therefore journal-seq order (seqs
-/// are stamped in drain order inside the lock window) — while ≥ 2 windows
-/// are in flight, and their inos (allocated at staging, before enqueue)
-/// are monotone in that same order.
+/// arrival admitted at a time) with the FIRST window's ring write parked
+/// (`arm_write_stall` on its reserved range), then released: the seven
+/// later windows are applied and submitted — their writes LAND — yet none
+/// of them may be answered while their predecessor's entry has not: an
+/// entry is chain-reachable only through the entries before it in the
+/// ring, so acking a later window ahead of an earlier one would ack a tx
+/// a crash could not replay. Releasing the parked write answers all
+/// eight; their inos (allocated at staging, before enqueue) are monotone
+/// in enqueue order — the order that is drain order (the conveyor core's
+/// FIFO) and therefore journal-seq order.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn acks_follow_journal_order_across_overlapped_windows() {
     let _faults = FaultGuard;
     let _cap = EnvVarGuard::set("SQUEEZEFS_META_COMMIT_BATCH_TXS", "1");
     let (routed, kv, file) = sandbox().await;
     const N: usize = 8;
-    let d = Duration::from_millis(10);
-    squeezefs::uring_fs::arm_device_latency(file.path(), d, Duration::ZERO);
     META_CONVEYOR_WINDOWS_INFLIGHT_HWM.store(0, Ordering::SeqCst);
 
-    let ack_clock = Arc::new(AtomicU64::new(0));
+    // Park the ring write of whatever entry is reserved NEXT — window 0's.
+    let head = kv.journal_ring().core().head();
+    let mut arrived = squeezefs::uring_fs::arm_write_stall(
+        file.path(),
+        kv.journal_ring().physical_offset_of(head),
+        8,
+    );
+
+    let acked = Arc::new(AtomicU64::new(0));
     TEST_CONVEYOR_HOLD_STAGE.store(TEST_CONVEYOR_HOLD_PRE_DRAIN, Ordering::SeqCst);
     let mut tasks = Vec::new();
     for i in 0..N {
         let routed = routed.clone();
-        let clock = ack_clock.clone();
+        let acked = acked.clone();
         tasks.push(tokio::spawn(async move {
             let ino = routed
                 .create(1, &format!("order_{i}"), libc::S_IFREG | 0o644, 0, 0)
                 .await
                 .expect("create")
                 .ino;
-            (clock.fetch_add(1, Ordering::SeqCst), ino)
+            acked.fetch_add(1, Ordering::SeqCst);
+            ino
         }));
         let want = i + 1;
         poll_until("committer enqueued", || kv.conveyor_pending_len() >= want).await;
@@ -545,28 +556,39 @@ async fn acks_follow_journal_order_across_overlapped_windows() {
     TEST_CONVEYOR_HOLD_STAGE.store(0, Ordering::SeqCst);
     test_conveyor_hold_release();
 
-    let mut acks = Vec::with_capacity(N);
+    // Window 0's write reached the stall; the seven behind it are applied
+    // and submitted (all eight in flight) — and none is answered.
+    tokio::time::timeout(POLL_DEADLINE, arrived.recv())
+        .await
+        .expect("window 0's ring write must reach the stall")
+        .expect("stall arrival channel");
+    poll_until("every later window applied and handed off", || {
+        META_CONVEYOR_WINDOWS_INFLIGHT.load(Ordering::Relaxed) >= N as u64
+    })
+    .await;
+    assert_eq!(
+        acked.load(Ordering::SeqCst),
+        0,
+        "a later window was acked while its predecessor's entry had not landed — an ack \
+         left journal order"
+    );
+    squeezefs::uring_fs::release_write_stall(file.path());
+
+    let mut inos = Vec::with_capacity(N);
     for t in tasks {
-        acks.push(t.await.expect("committer task"));
+        inos.push(t.await.expect("committer task"));
     }
     let hwm = META_CONVEYOR_WINDOWS_INFLIGHT_HWM.load(Ordering::Relaxed);
-    println!(
-        "order row: ack indices by enqueue order {:?}, hwm {hwm}",
-        acks
-    );
-    for (i, (ack_idx, _)) in acks.iter().enumerate() {
-        assert_eq!(
-            *ack_idx as usize, i,
-            "committer {i} (enqueue order) was acked {ack_idx}th — acks left journal order"
-        );
-    }
-    for w in acks.windows(2) {
-        assert!(w[0].1 < w[1].1, "inos are monotone in enqueue order");
+    println!("order row: inos by enqueue order {inos:?}, hwm {hwm}");
+    assert_eq!(acked.load(Ordering::SeqCst), N as u64);
+    for w in inos.windows(2) {
+        assert!(w[0] < w[1], "inos are monotone in enqueue order");
     }
     assert!(
-        hwm >= 2,
+        hwm >= N as u64,
         "the eight released windows never overlapped (hwm {hwm})"
     );
+    assert_eq!(META_CONVEYOR_WINDOWS_INFLIGHT.load(Ordering::Relaxed), 0);
     kv.shutdown().await.expect("shutdown");
 }
 
@@ -602,18 +624,18 @@ async fn an_ack_never_precedes_its_barrier_on_the_strict_cadence() {
         .await
         .expect("a barrier must reach the stall")
         .expect("stall arrival channel");
-    poll_until("every submitted write landed", || {
-        kv.journal_ring().completed_upto() >= kv.journal_ring().core().head()
+    // The apply stage is not behind the parked barrier: every committer's
+    // window gets applied and submitted while the lane waits — the
+    // serialized conveyor could hold only one here (its pass IS the
+    // parked barrier).
+    poll_until("every window applied and handed off", || {
+        META_CONVEYOR_WINDOWS_INFLIGHT.load(Ordering::Relaxed) >= N as u64
     })
     .await;
     assert_eq!(
         acked.load(Ordering::SeqCst),
         0,
         "a committer was acked while its barrier was still parked"
-    );
-    assert!(
-        META_CONVEYOR_WINDOWS_INFLIGHT.load(Ordering::Relaxed) >= 1,
-        "the written-but-unbarriered window is in flight"
     );
     squeezefs::uring_fs::release_barrier_stall(file.path());
     for t in tasks {

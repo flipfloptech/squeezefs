@@ -5,16 +5,36 @@
 #
 # Produces EL8-installable kernel RPMs via `make binrpm-pkg` with
 # LOCALVERSION=-sqz (the non-negotiable sqz tag), from:
-#   linux-6.19.14 (base the FUSE-zc series applies to; sha256-pinned)
-#   + the 30-patch series in /src/patches (SERIES.md is the manifest)
+#   the TRACK's pinned base tarball (sha256-pinned; table below)
+#   + the TRACK's series in /src/patches[-TRACK] (SERIES.md is the manifest)
 #   + client base config + /src/config-fragment (checklist asserted).
+#
+# TRACK selects the row: 6.19.14 (default — the FIELD build, the EL8
+# fleet RPMs), 7.1 (linux-7.1.6, patches-7.1/), 7.2 (linux-7.2.3,
+# patches-7.2/). An unknown TRACK refuses loud before any fetch.
 set -euo pipefail
 
-KVER=6.19.14
+TRACK=${TRACK:-6.19.14}
+case "$TRACK" in
+	6.19.14)
+		KVER=6.19.14
+		SHA256=cde8bf6739be4a0777fedbbba5330b8188c55680c45a922a4dfa289cbec6f185
+		PATCHES=/src/patches ;;
+	7.1)
+		KVER=7.1.6
+		SHA256=995dd7188d924662b94b48fd6fb783587267590e5b8bb33dade2c771e7d855c1
+		PATCHES=/src/patches-7.1 ;;
+	7.2)
+		KVER=7.2.3
+		SHA256=8ba259e8e7b13ec6ef0941c8a39ad90b24bd4a4d6c0010ba6bafb794550ecd03
+		PATCHES=/src/patches-7.2 ;;
+	*)
+		echo "unknown TRACK='${TRACK}' (want 6.19.14 | 7.1 | 7.2)"; exit 1 ;;
+esac
 TARBALL=linux-${KVER}.tar.xz
-SHA256=cde8bf6739be4a0777fedbbba5330b8188c55680c45a922a4dfa289cbec6f185
-URL=https://cdn.kernel.org/pub/linux/kernel/v6.x/${TARBALL}
+URL=https://cdn.kernel.org/pub/linux/kernel/v${KVER%%.*}.x/${TARBALL}
 JOBS=${JOBS:-$(nproc)}
+echo "track: ${TRACK} → linux-${KVER} + $(ls "${PATCHES}"/*.patch | wc -l) patches from ${PATCHES}"
 
 # gcc-toolset (pinned in the Dockerfile).
 source /opt/rh/${SQZ_TOOLSET:?}/enable
@@ -31,7 +51,7 @@ rm -rf "linux-${KVER}" && tar xf "${TARBALL}"
 cd "linux-${KVER}"
 
 echo "== applying series (SERIES.md manifest) =="
-for p in /src/patches/*.patch; do
+for p in "${PATCHES}"/*.patch; do
 	echo "  $(basename "$p")"
 	patch -p1 --fuzz=0 --silent < "$p"
 done

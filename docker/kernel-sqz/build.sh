@@ -3,8 +3,10 @@
 # image, then runs build-kernel.sh in it with dev-box manners (capped
 # CPUs, nice). Artifacts land in dist/kernel-sqz/.
 #
-#   docker/kernel-sqz/build.sh [--cpus N]
+#   [TRACK=6.19.14|7.1|7.2] docker/kernel-sqz/build.sh [--cpus N]
 #
+# TRACK (default 6.19.14 — the FIELD build) is passed through to
+# build-kernel.sh, which owns the base-version/sha256/patch-dir table.
 # podman or docker both work (podman preferred, matching the house
 # Taskfile pattern).
 set -euo pipefail
@@ -26,5 +28,6 @@ exec nice -n 10 $engine run --rm \
 	-v squeezefs-kernel-sqz-work:/work \
 	-v "$out":/out \
 	-e JOBS="$cpus" \
+	-e TRACK="${TRACK:-6.19.14}" \
 	squeezefs-kernel-sqz-build:el8 \
 	bash /src/build-kernel.sh

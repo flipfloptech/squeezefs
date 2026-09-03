@@ -17,6 +17,26 @@ class adjudicated NOT fat — not re-chased here). **Branch:**
 daemon + shim one build, KD-7). Every mean below is an A1 exact
 `Δsum_ns / Δcount`; every per-op number is an A2 trace join.
 
+**Composition addendum (§9, 2026-09-03 04:27–05:05 UTC):** R-2
+(`perf/read-fast-dispatch`, dev `197eb9d9`) landed on dev while this
+branch was in flight and re-shaped the same delivery CQE. Rebased and
+composed into ONE dispatch law — (a) warm: served inline (R-2); (b) cold
+zc under the ceiling: fused onto the queue worker (R-3); (c) else: the
+lane homed on the queue's CPU (R-2) — and re-measured against R-2 alone
+on the field: **the two levers do NOT compound.** With fusion on the
+composed binary read **481 k vs R-2's 514 k (−6.5 %, p50 +70 µs, p99
+−66 %)**; the traced legs put the loss where the gain went — the fused
+pass's run-queue waits (`dispatch_lag` 47 → 92, `wake_hop` ≈ 100) replace
+R-2's lane hop and the bridge's two worker hops at a net +15 µs. Both
+levers converge on the reap thread's per-op serialization from two
+sides. **The READ fusion lever therefore ships default OFF** (arm (c) for
+demoted READs); the composed default binary re-measured at **507–510 k vs
+503–507 k for R-2 alone (par, +0.9 %)**, seq 1 MiB and il par, and the
+bridge instrument reads R-2's shape per op: `msg_hop` 28 / `device_cq`
+99 (device 40) / `wake_hop` 36 — the attribution's ≈ 126 µs, now a
+measurement. Everything below §9 is the standalone campaign as run
+(fusion vs the pre-R-2 dispatch), kept as the record.
+
 **Verdict up front.** The instrument decomposed the bridge into four
 hops (`zc_bridge_phase_ns`: `msg_hop` / `sq_wait` / `device_cq` /
 `wake_hop`, a partition of `total` to the ns) and said what the ≈ 126 µs
@@ -332,6 +352,136 @@ its queue's ops on one ring — role-aware ring depth, gap 4 of the
 attribution note, now sharper). K1 (`send → transport_recv`) grew ≈ 22 µs
 for the same reason and stays the tail's owner.
 
+## 9. The composition with R-2 (rebased onto dev `2b011d91`)
+
+### 9.1 The composed READ dispatch law (`fast_dispatch.rs` module doc; the delivery arm's comment)
+
+A fetched READ on the reap thread takes exactly ONE arm, in this order:
+
+| arm | condition | venue | counter |
+|---|---|---|---|
+| **(a) served inline** | the filesystem's SYNC try-only probe finds the bytes warm (R-2) | committed on the reap thread through the lease-gated `commit_ready_reply`; `queue_wait == dispatch_lag == 0` | `transport_fast_dispatch_serves` |
+| **(b) fused** | zc-armed session ∧ `fuse_read_in.size ≤` the fusion ceiling ∧ `SQUEEZEFS_FUSE_ZC_READ_FUSION=1` (R-3) | the SAME `ReadFastDispatch::mint` future, polled on the queue worker's fused lane — fetch message, CQE resume and prefilled COMMIT same-thread | `fuse3_zc_read_fusions` (+ `_demotions` on a capacity refusal, which then takes (c)) |
+| **(c) handed to a lane** | everything else (R-2's lane-homing law) | the `fuse3-tpc` lane homed on the queue's CPU; inbound queue + session dispatcher skipped | `transport_fast_dispatch_demotes` |
+
+**Partition law (pinned):** `serves + zc_read_fusions + demotes ≡` the
+READs delivered on an armed session with R-2's lever on, and
+`zc_read_fusions + demotes ≡ fuse3_read_inplace_replies` — pinned by
+`tests/read_fast_dispatch_tests.rs` (R-2's live contract, now reading the
+composed partition; unprivileged zc never arms so fusions = 0) and the
+capability suite's `composed_dispatch_law_partitions_every_read_on_a_zc_session`
+(both arms zc-armed, both lever values: serves 0, fusions + demotes ≡
+in-place replies, fusions ≥ the data reads only when on, mid-pass bridge
+reaps > 0 only when fused). The reap thread never blocks on any arm (the
+probe is try-only, a fused future parks in the slab, the hand-off is a
+queue push). The instruments coexist without a double-counted stage:
+`transport_reap_gap_ns` brackets the worker's enters; `read_transport_
+phase_ns` records `queue_wait ≡ 0` on (b)/(c) with `dispatch_lag` =
+arrival → first handler poll (the run-queue wait on (b), the lane hop on
+(c)); `zc_bridge_phase_ns` splits the handler's `block_fetch` on the zc
+leg (`Σ hops ≡ total`; stages 39/40 vs R-2's `fast_dispatch` = 6). R-3's
+separate `FusedReadDispatch`/`fused_read_future` were deleted — one READ
+mint serves both handler venues (`read_handler_body`, R-2's extraction).
+The funnel contract was made deterministic in the same step
+(`dev_submit_enters`, the issue-side batching face: ≤ 4 submit enters for
+64 fills queued behind the read-stall seam; the total enter count follows
+the device's completion clustering and was not a law).
+
+Suites on the composed tree: fuse3 215/215; `read_fast_dispatch_tests`
+6/6 (also as root under zc), `zc_bridge_phase_tests` 2/2 (root, zc),
+`fuse_zc_write_fusion_tests` 5/5 (root), `zc_bridge_cqe_wedge_tests` 3/3
+(root), `nvme_fill_issue_economy_tests` 3/3 (8× stable under load),
+`audit_instruments_tests` 25, `op_trace_tests` 16, read_serve_phase,
+read_lane, zcrx_lane 70, read_dest_lease, rebind_starvation,
+transport_lease_overlong, kernel/ipc_op_economy, transport_ingress,
+multi_queue, skip_ledger, bench_tests 95, `read_path_bench --test` 29/29;
+clippy clean both workspaces (all-features + shipped), fmt clean.
+`env_knob_convention_tests` fails on dev `2b011d91` itself (D-2's
+unregistered `SQUEEZEFS_D2_*` test knobs in `tests/conveyor_two_stage_tests.rs`)
+— not this branch's.
+
+### 9.2 Field A-B-B-A, fusion ON: A = R-2 alone (`2b011d91`), B = composed (`55a7bdbb`) — squeeze-test, 04:27–04:42 UTC
+
+Same protocol (fresh cluster, `write_BW` pass under A, 24 × 8 GiB, 30 s + 10 s ramp; both rocky8 `release` builds, clean, KD-7 shim pairing).
+
+| Row | A1 | B1 | B2 (traced) | A2 (traced) | Δ B vs A |
+|---|---|---|---|---|---|
+| **kern rand-4k** IOPS | **514,438** | **481,251** | 481,358 | 513,944 | **−6.5 % / −6.3 %** |
+| kern clat mean / p50 / p99 / p99.9 µs | 369 / 198 / 4,358 / 11,862 | 395 / 268 / **1,483** / 11,207 | 395 / 268 / 1,466 / 11,600 | 369 / 194 / 4,293 / 12,648 | +26 mean, **+70 p50, −66 % p99** |
+| kern daemon CPU µs/op | 40.1 (ur 59 %, tpc 41 %) | 34.3 (ur 100 %) | 34.6 | 40.0 | −14 % (all on the worker) |
+| partition | demotes 20.37 M ≡ inplace, fusions 0 | **fusions 19.04 M ≡ inplace**, demotes 0 | fusions ≡ inplace | demotes ≡ inplace | exact |
+| `transport_total` / `dispatch_lag` / `block_fetch` | 216 / 40.4 / 164 | 249 / **88.0** / 149 | 248 / 87.1 / 148 | 214 / 38.5 / 164 | +33 / +48 / −15 |
+| `zc_bridge_phase_ns` msg / sq / device_cq / wake | (pre-instrument) | 0.6 / 0.3 / 49.2 / **98.3** | 0.6 / 0.3 / 49.0 / 97.9 | — | |
+| `transport_reap_gap_ns` blind_cqe / park µs | 14.2 / 48.7 | 11.7 / 309 | 11.5 / 302 | 14.0 / 48.7 | |
+| wake writes/op · mid-pass reaps | 1.33 · 0 | 0.45 · 93.7 % | 0.45 · 93.7 % | 1.35 · 0 | |
+| **il rand-4k** IOPS · clat | 873,918 · 218.8 | 864,768 · 221.1 | 870,773 · 219.6 | 882,852 · 216.6 | par |
+| **seq 1 MiB** GiB/s | 36.69 | 39.36 | 37.92 | 35.51 | par (+5 %, fusions 3) |
+| **sustained 60 s kern** | (A2) **515,422** / 367.9 / p99 4,227 / flat +4.1 % | (B1) **479,182** / 396.9 / p99 1,483 / flat +1.1 % | | | **−7.0 %** |
+| sustained 60 s il | 890,494 / 214.7 | 859,346 / 222.5 | | | −3.5 % |
+
+Tripwires 0 on every row; kern closure every byte in `read_zc_serve_bytes`; il closure `dest_dma + arena ≡ bytes_out`, bounce 0.
+
+### 9.3 Where the gain went (the traced legs, per op)
+
+| Stage | A2 = R-2 alone p50 / mean | B2 = composed p50 / mean | reading |
+|---|---|---|---|
+| `transport_recv → handler_entry` (ingress to the first handler poll) | 14.4 / **46.6** (the lane hop) | 50.9 / **91.7** (the fused first poll's run-queue wait) | **+45** |
+| `keys_resolved → block_fetched` (the bridge) | 105 / **180.9** (msg 28 + device 40 + reap ≈ 60 + wake 36 + probes) | `bridge_sent → taken` 0.7 · `sq_wait` 0.3 · `device_cq` **49.2** · `wake_hop` **99.7** = 153 | **−28** |
+| `transport_recv → reply_commit` | 135 / **238.7** | 179 / **253.7** | **+15** |
+| fio clat | 198 / 369 | 268 / 395 | +26 |
+
+The bridge's two worker hops (msg_hop 28, the reap share ≈ 60 → 0.7 + ≈ 9)
+are gone, as designed — but the fused arm pays for them with two
+run-queue waits inside the worker's pass (92 + 100 µs) where R-2 pays one
+lane hop (47) plus the handler's own thread hops. The worker is now the
+whole daemon (34 µs/op of CPU on one thread per queue, 50 % utilized at
+15 k ops/s/queue, bursty arrivals ⇒ queueing ≈ a pass per poll). **The
+two levers attacked the same critical path from two sides and converge
+on the same wall — the reap thread's per-op serialization — rather than
+compounding.** The kernel-side residue (`clat − transport_total`) also
+grew ≈ 10 µs (the busier worker reaps delivery CQEs later).
+
+### 9.4 The confirming bracket: the composed DEFAULT (fusion off, `71b7b6d9`) vs R-2 alone — 04:55–05:05 UTC
+
+| Row | A1 (R-2) | B1 (composed, default) | B2 | A2 | verdict |
+|---|---|---|---|---|---|
+| kern rand-4k IOPS | 506,610 | 506,932 | **510,500** | 502,774 | **par, +0.9 %** |
+| kern clat / p50 / p99 | 374 / 198 / 4,424 | 374 / 198 / 4,424 | 372 / 196 / 4,620 | 377 / 198 / 4,293 | identical shape |
+| kern CPU µs/op | 40.5 | 40.8 | 40.5 | 40.9 | par |
+| partition | demotes ≡ inplace | demotes ≡ inplace, fusions 0 | same | same | exact |
+| `zc_bridge_phase_ns` msg / device_cq / wake (R-2's shape, first per-op read) | — | **28.1 / 99.8 / 36.4** | 27.9 / 99.4 / 35.9 | — | device 40 ⇒ reap ≈ 60; Σ software ≈ 125 = the attribution's ≈ 126 |
+| sustained 60 s kern | (A2) 502,104 / 377.3 / flat +3.8 % | (B1) **508,183** / 373.2 / flat +1.5 % | | | **+1.2 %** |
+| seq 1 MiB GiB/s | 35.70 | 35.75 | | | par |
+| il rand-4k | — | (B2) 888,230 / 215.3 | | | par |
+
+Same-day drift vs §9.2's A: −1.5 % on both arms (the box, not the
+binaries). **Acceptance verdict:** the composed default binary ≥ R-2
+alone (par within noise, slightly ahead), never below it; it does NOT
+reach the 750–950 k the attribution predicted, and §9.3 says why: the
+prediction assumed the ingress and bridge stages were independent
+queues; both are the same thread's serialization.
+
+### 9.5 What the composition leaves on the board
+
+- **The reap thread's per-op serialization is the wall for BOTH levers.**
+  R-2's demote arm and R-3's fused arm each move the handler's hops
+  around it; neither shortens the worker's own per-op work (≈ 18 µs of
+  it on the R-2 shape, ≈ 34 µs fused — the kernel's COMMIT_AND_FETCH
+  work `commit_flush` 9–10 µs, the delivery + nvme task-work under the
+  enters, the pass ceremony). Cutting that CPU is what would let either
+  arm win: the kernel COMMIT cost (sqz-kernel), the per-enter task-work
+  batching, the probe short-circuit R-2's residual board named (on the
+  cold row the probe is 1–2 µs of pure cost per READ on the worker —
+  in the composed-ON row it sat on top of the fused pass).
+- **Fusion's tail** (p99 1.5 vs 4.3 ms; p99.9 par) is real and is the
+  reason the lever stays registered: a latency-shaped consumer can turn
+  it on. The tail campaign (K1's `park` wake path — R-2 §5.3) is the
+  IOPS-neutral way to that tail.
+- **The bridge instrument now reads the R-2 shape per op** (§9.4): the
+  next bridge lever's target is `device_cq − device ≈ 60 µs` (the parked
+  worker's CQE wake) + `msg_hop` 28 + `wake_hop` 36 — three wake latencies,
+  scheduler-bound, on the lane arm.
+
 **Landing-law checklist:** A-B-B-A — local (same binary, knob) both orders
 + field (arm = binary) both orders, cited; substrates — tcp devsub (the
 mandatory multi-connection venue; no loop bracket — the lever is a thread
@@ -342,3 +492,7 @@ bytes, il closure); `read_copy_*` closure — kern zero passes, il dest_dma
 + arena = bytes_out, bounce 0; instrument + substrate + binary + profile
 (`release`, thin LTO, both arms) + kernel + tier stated; tripwires 0;
 the box returned unmounted with `/scratch/tmp/sqz-agent/` removed.
+Composition (§9): A-B-B-A both orders × two brackets (fusion on, then
+the default) with R-2 alone as the A arm; sustained 60 s on both;
+engagement partition exact on every row; artifacts
+`~/sqz-field-artifacts/2026-09-03/r3-compose*-artifacts.tgz`.

@@ -24,10 +24,10 @@ OUT="${OUT:-$D/run-$(date +%Y%m%d-%H%M%S)}"
 META="${META:-sqmeta:///dev/nvme0n1,/dev/nvme2n1,/dev/nvme4n1,/dev/nvme6n1,/dev/nvme8n1}"
 MNT=/scratch/tmp/test
 JOBS=/scratch/tmp/fio_jobs
-A_BIN=$D/squeezefs.r2
-A_IL=$D/libsqueezefs_il.so.r2
-B_BIN=$D/squeezefs.r3c
-B_IL=$D/libsqueezefs_il.so.r3c
+A_BIN=${A_BIN:-$D/squeezefs.r2}
+A_IL=${A_IL:-$D/libsqueezefs_il.so.r2}
+B_BIN=${B_BIN:-$D/squeezefs.r3c}
+B_IL=${B_IL:-$D/libsqueezefs_il.so.r3c}
 mkdir -p "$OUT"
 JOB60="$D/randread_iops_60.job"
 sed "s/^runtime=30$/runtime=60/" "$JOBS/randread_iops.job" > "$JOB60"
@@ -109,6 +109,13 @@ row prep-write write_BW kern 30 "" 0
 umount_arm
 
 # ---- A B B A --------------------------------------------------------------
+if [ "${SHORT:-0}" = 1 ]; then
+  mount_arm A A1; row A1-rr4k-kern randread_iops kern 30 "" 0; row A1-seq1m-kern read_BW kern 30 "" 0; umount_arm
+  mount_arm B B1; row B1-rr4k-kern randread_iops kern 30 "" 0; row B1-seq1m-kern read_BW kern 30 "" 0; row B1-rr4k-kern-60 randread_iops_60 kern 60 "" 0; umount_arm
+  mount_arm B B2; row B2-rr4k-kern randread_iops kern 30 "" 0; row B2-rr4k-il randread_iops il 30 "$B_IL" 0; umount_arm
+  mount_arm A A2; row A2-rr4k-kern randread_iops kern 30 "" 0; row A2-rr4k-kern-60 randread_iops_60 kern 60 "" 0; umount_arm
+  echo "== done $(date -u +%FT%TZ)"; grep -h "^ROW" "$OUT"/*.row; exit 0
+fi
 # A1
 mount_arm A A1
 row A1-rr4k-kern randread_iops kern 30 "" 0

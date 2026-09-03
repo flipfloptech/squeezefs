@@ -69,6 +69,45 @@ pub fn set_test_read_stall(count: usize, ms: u64) {
     STALL_NEXT_READS.store(count, std::sync::atomic::Ordering::SeqCst);
 }
 
+/// Test seam (R-3 fill-issue economy): the next N reads complete LATE at
+/// the device — the worker links a `TIMEOUT` of [`SLOW_READ_MS`] ahead of
+/// each read's SQE (`ETIME_SUCCESS`, so the chain proceeds), so the
+/// read's CQE is late while the worker itself stays free. The stand-in
+/// for one slow fill among fast ones (the read-stall seam above stalls
+/// the WORKER, which is the other shape). One relaxed load unset; never
+/// set in production.
+static SLOW_NEXT_READS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static SLOW_READ_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Arm the slow-read test seam: the next `count` reads complete `ms`
+/// milliseconds late at the device (`0` disables).
+pub fn set_test_read_slow(count: usize, ms: u64) {
+    SLOW_READ_MS.store(ms, std::sync::atomic::Ordering::SeqCst);
+    SLOW_NEXT_READS.store(count, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// Consume one slow-read seam budget unit; `Some(ms)` = this read is late.
+fn take_slow_read() -> Option<u64> {
+    loop {
+        let cur = SLOW_NEXT_READS.load(std::sync::atomic::Ordering::SeqCst);
+        if cur == 0 {
+            return None;
+        }
+        if SLOW_NEXT_READS
+            .compare_exchange(
+                cur,
+                cur - 1,
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst,
+            )
+            .is_ok()
+        {
+            let ms = SLOW_READ_MS.load(std::sync::atomic::Ordering::SeqCst);
+            return (ms > 0).then_some(ms);
+        }
+    }
+}
+
 /// Test seam: the worker stalls the next N WRITE submissions (the
 /// deterministic stand-in for a slow fabric DMA — the read seam's twin,
 /// used by the DUR-2 cross-lane flush-drain contract). One relaxed load
@@ -82,6 +121,14 @@ pub fn set_test_write_stall(count: usize, ms: u64) {
     STALL_WRITE_MS.store(ms, std::sync::atomic::Ordering::SeqCst);
     STALL_NEXT_WRITES.store(count, std::sync::atomic::Ordering::SeqCst);
 }
+
+/// Ring `user_data` sentinels above every request slot index: the
+/// request-arrival wake (`UD_WAKE`) and the slow-read seam's linked
+/// timeout (`UD_SEAM`). Slot indices are small; anything `≥ UD_RESERVED`
+/// is never a request.
+const UD_RESERVED: u64 = u64::MAX - 1;
+const UD_SEAM: u64 = u64::MAX - 1;
+const UD_WAKE: u64 = u64::MAX;
 
 /// Caller-side wait bound (ms) on the uring-worker read oneshot. Default
 /// 30 000 — a wedged device/worker must not freeze the whole FUSE session
@@ -493,12 +540,66 @@ impl WriteWatermark {
     }
 }
 
+/// The lane's request-arrival wake (R-3 fill-issue economy): an eventfd
+/// the worker keeps a `READ` SQE armed on in its own ring, so its
+/// `submit_and_wait(1)` park returns on the first of {a device CQE, a
+/// new request} — a request never waits for an UNRELATED completion to
+/// be noticed (the retired shape parked on the ring alone and pumped the
+/// channel only after a completion woke it: `dev_queue` ≈ one device RTT
+/// under load). Producers publish (channel send) → `arm()` → write the
+/// fd only when it was clear; the worker consumes the wake CQE →
+/// `disarm()` → scans the channel — the fuse3 queue worker's loom-
+/// verified drain → disarm → scan protocol (`wake_core`).
+struct LaneWake {
+    coalescer: squeezefs_ipc::wake_core::WakeCoalescer,
+    fd: std::os::fd::OwnedFd,
+}
+
+impl LaneWake {
+    fn new() -> std::io::Result<Self> {
+        // SAFETY: eventfd(2) with no invalid arguments; the fd is owned.
+        let raw = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
+        if raw < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(Self {
+            coalescer: squeezefs_ipc::wake_core::WakeCoalescer::new(),
+            // SAFETY: a fresh fd nothing else owns.
+            fd: unsafe { <std::os::fd::OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(raw) },
+        })
+    }
+
+    /// Producer side: wake a possibly-parked worker (coalesced).
+    fn wake(&self) {
+        if self.coalescer.arm() {
+            self.write();
+            crate::fuse_client::METRICS
+                .dev_wake_writes
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        } else {
+            crate::fuse_client::METRICS
+                .dev_wakes_elided
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    /// Unconditional write (teardown: the disconnect must reach a parked
+    /// worker whatever the flag says).
+    fn write(&self) {
+        let one: u64 = 1;
+        // SAFETY: writing 8 bytes to a live eventfd this struct owns.
+        let _ = unsafe { libc::write(self.fd.as_raw_fd(), &one as *const u64 as *const _, 8) };
+    }
+}
+
 struct UringWorker {
     /// Dropped first in `Drop` so the worker observes disconnect and drains.
     tx: Option<crossbeam::channel::Sender<UringRequest>>,
     thread: Option<std::thread::JoinHandle<()>>,
     /// The lane's DUR-2 write watermark (see [`WriteWatermark`]).
     wm: Arc<WriteWatermark>,
+    /// The request-arrival wake (see [`LaneWake`]).
+    wake: Arc<LaneWake>,
 }
 
 /// P1-6: bound io_uring request queue to apply backpressure under overload.
@@ -509,6 +610,8 @@ impl UringWorker {
         let (tx, rx) = crossbeam::channel::bounded(URING_REQ_QUEUE_CAP);
         let wm = Arc::new(WriteWatermark::new());
         let worker_wm = wm.clone();
+        let wake = Arc::new(LaneWake::new().expect("eventfd for the sqz-nvme lane wake"));
+        let worker_wake = wake.clone();
         // Named so `daemon_cpu_ns_by_class` can attribute the device lanes
         // (e2e audit E); an unnamed worker inherited the main comm.
         static NEXT_LANE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
@@ -518,7 +621,7 @@ impl UringWorker {
                 "sqz-nvme{lane}"
             )))
             .spawn(move || {
-                worker_thread_loop(device_path, rx, &worker_wm);
+                worker_thread_loop(device_path, rx, &worker_wm, &worker_wake);
                 // Every exit path (normal drain, refused O_DIRECT open,
                 // refused ring build) lands here: unreachable watermark
                 // targets fail parked barriers loud instead of forever.
@@ -529,13 +632,22 @@ impl UringWorker {
             tx: Some(tx),
             thread: Some(thread),
             wm,
+            wake,
         }
     }
 
-    fn sender(&self) -> &crossbeam::channel::Sender<UringRequest> {
+    /// Enqueue one request and wake the lane (the producer half of the
+    /// arrival-wake protocol: publish, then arm/write).
+    fn submit(
+        &self,
+        req: UringRequest,
+    ) -> std::result::Result<(), crossbeam::channel::TrySendError<UringRequest>> {
         self.tx
             .as_ref()
             .expect("UringWorker sender used after drop")
+            .try_send(req)?;
+        self.wake.wake();
+        Ok(())
     }
 }
 
@@ -571,8 +683,11 @@ impl Drop for UringWorker {
     fn drop(&mut self) {
         // Close the channel first so the worker stops accepting work and exits
         // its loop, then join so exit cleanup (free unaligned bufs) runs before
-        // we return (P0-1).
+        // we return (P0-1). The worker parks on its ring: the disconnect is
+        // observable only through the arrival wake, so write it
+        // unconditionally after the sender is gone.
         drop(self.tx.take());
+        self.wake.write();
         if let Some(handle) = self.thread.take() {
             if let Err(e) = handle.join() {
                 log::error!("NvmeBlockDev uring worker thread panicked: {:?}", e);
@@ -615,6 +730,7 @@ fn worker_thread_loop(
     device_path: String,
     rx: crossbeam::channel::Receiver<UringRequest>,
     wm: &WriteWatermark,
+    wake: &LaneWake,
 ) {
     // TEST-1 env seam (`SQUEEZEFS_TEST_POWER_CUT_DEVS`): read ONCE per
     // worker, zero cost unset, never set in production.
@@ -812,30 +928,50 @@ fn worker_thread_loop(
     let mut active_count = 0;
     let mut disconnected = false;
 
-    loop {
-        loop {
-            let req = if active_count == 0 {
-                match rx.recv() {
-                    Ok(r) => Some(r),
-                    Err(_) => {
-                        disconnected = true;
-                        None
-                    }
-                }
-            } else {
-                match rx.try_recv() {
-                    Ok(r) => Some(r),
-                    Err(crossbeam::channel::TryRecvError::Empty) => None,
-                    Err(crossbeam::channel::TryRecvError::Disconnected) => {
-                        disconnected = true;
-                        None
-                    }
-                }
-            };
+    // R-3 fill-issue economy: the request-arrival wake rides the ring. ONE
+    // `READ(eventfd)` SQE stays armed at every park, so `submit_and_wait(1)`
+    // returns on the first of {a device CQE, a new request} and a request
+    // never waits for an unrelated completion to be noticed. The 8-byte
+    // landing buffer is leaked (8 B once per lane): ring teardown cancels
+    // the read asynchronously, so its target must outlive this frame.
+    let wake_buf: &'static mut [u8; 8] = Box::leak(Box::new([0u8; 8]));
+    let wake_fd = wake.fd.as_raw_fd();
+    let mut wake_armed = false;
+    // The drain → disarm → scan order: `wake_consumed` = this pass reaped the
+    // arrival CQE (the eventfd counter is drained); disarm THEN scan.
+    let mut wake_consumed = false;
+    let arm_wake = |ring: &mut IoUring, buf: &mut [u8; 8]| -> bool {
+        let sqe = opcode::Read::new(Fd(wake_fd), buf.as_mut_ptr(), 8)
+            .build()
+            .user_data(UD_WAKE);
+        // SAFETY: the buffer is process-lifetime (leaked above); the fd is
+        // owned by the lane's `LaneWake`, which outlives the worker.
+        if unsafe { ring.submission().push(&sqe) }.is_err() {
+            let _ = ring.submit();
+            // SAFETY: as above.
+            return unsafe { ring.submission().push(&sqe) }.is_ok();
+        }
+        true
+    };
 
-            let req = match req {
-                Some(r) => r,
-                None => break,
+    loop {
+        if wake_consumed {
+            wake.coalescer.disarm();
+            wake_consumed = false;
+        }
+        if !wake_armed {
+            wake_armed = arm_wake(&mut ring, wake_buf);
+        }
+        loop {
+            // The pump never blocks on the channel: the arrival wake is a
+            // ring event, so the ONE park below covers both event classes.
+            let req = match rx.try_recv() {
+                Ok(r) => r,
+                Err(crossbeam::channel::TryRecvError::Empty) => break,
+                Err(crossbeam::channel::TryRecvError::Disconnected) => {
+                    disconnected = true;
+                    break;
+                }
             };
 
             let slot_idx = match free_slots.pop() {
@@ -850,6 +986,9 @@ fn worker_thread_loop(
                 }
             };
 
+            // R-3 slow-read seam: `Some(ms)` = link a TIMEOUT ahead of
+            // this read's SQE (the CQE is late, the worker stays free).
+            let mut slow_link_ms: Option<u64> = None;
             let sqe = match req {
                 UringRequest::Read {
                     offset,
@@ -891,6 +1030,7 @@ fn worker_thread_loop(
                     // here and records at CQE completion. ONE clock read
                     // closes dev_queue, anchors dev_service and stamps
                     // the op-trace `dev_submit` (audit A2).
+                    slow_link_ms = take_slow_read();
                     let submitted = std::time::Instant::now();
                     crate::fuse_client::read_fill_phase_record_at(
                         crate::fuse_client::ReadFillPhase::DevQueue,
@@ -1066,6 +1206,25 @@ fn worker_thread_loop(
                 }
             };
 
+            if let Some(ms) = slow_link_ms {
+                let ts = types::Timespec::new()
+                    .sec(ms / 1000)
+                    .nsec(((ms % 1000) * 1_000_000) as u32);
+                let t = opcode::Timeout::new(&ts)
+                    .flags(types::TimeoutFlags::ETIME_SUCCESS)
+                    .build()
+                    .flags(io_uring::squeue::Flags::IO_LINK)
+                    .user_data(UD_SEAM);
+                // SAFETY: the timespec is read at push (the SQE copies it).
+                if unsafe { ring.submission().push(&t) }.is_err() {
+                    let _ = ring.submit();
+                    // SAFETY: as above.
+                    let _ = unsafe { ring.submission().push(&t) };
+                }
+            }
+            crate::fuse_client::METRICS
+                .dev_fills
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let mut pushed_sqe = false;
             for _retry in 0..3 {
                 // SAFETY: this worker owns its ring exclusively (one submitter per
@@ -1077,40 +1236,16 @@ fn worker_thread_loop(
                         break;
                     }
                 }
-
                 // Push failed: the submission ring is full of this pass's
-                // not-yet-submitted SQEs. ONE enter both flushes them and
-                // waits for ≥ 1 completion (PERF-4 (c) — and the only
-                // DEFER_TASKRUN-correct shape: a plain submit() runs no
-                // completion task-work, so the old submit-then-peek pass
-                // drained nothing on deferred rings).
-                if let Err(e) = ring.submit_and_wait(1) {
-                    log::error!(
-                        "Uring worker: submit_and_wait(1) failed on SQ full: {:?}",
-                        e
-                    );
-                }
-                let mut cq = ring.completion();
-                cq.sync();
-                let mut completed_slots = Vec::new();
-                for cqe in cq {
-                    let slot_idx = cqe.user_data() as usize;
-                    let res = cqe.result();
-
-                    if let Some(act) = active[slot_idx].take() {
-                        let io_res = if res < 0 {
-                            Err(std::io::Error::from_raw_os_error(-res))
-                        } else {
-                            Ok(res as usize)
-                        };
-                        complete_one(act, io_res, wm);
-                    }
-                    completed_slots.push(slot_idx);
-                }
-
-                for idx in completed_slots {
-                    free_slots.push(idx);
-                    active_count -= 1;
+                // not-yet-submitted SQEs. A plain submit hands them to the
+                // kernel (freeing the SQ) without parking on a completion
+                // — completions drain at the pass bottom, whose enter
+                // carries GETEVENTS (the DEFER_TASKRUN-correct reap).
+                crate::fuse_client::METRICS
+                    .dev_enters
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if let Err(e) = ring.submit() {
+                    log::error!("Uring worker: submit failed on SQ full: {:?}", e);
                 }
             }
 
@@ -1149,44 +1284,62 @@ fn worker_thread_loop(
             active_count += 1;
         }
 
-        // PERF-4 (c): ONE io_uring_enter per pass — submit_and_wait both
-        // flushes every SQE this pass pushed and parks for ≥ 1 completion
-        // (the old shape paid submit() + submit_and_wait(1) = two enters).
-        // A successful push always increments active_count, so pushed > 0
-        // ⇒ active_count > 0 and nothing is ever left unflushed here.
-        if active_count > 0 {
-            if let Err(e) = ring.submit_and_wait(1) {
-                log::error!("io_uring submit_and_wait failed: {:?}", e);
-            }
-
-            let mut cq = ring.completion();
-            cq.sync();
-
-            let mut completed_slots = Vec::new();
-            for cqe in cq {
-                let slot_idx = cqe.user_data() as usize;
-                let res = cqe.result();
-
-                if let Some(act) = active[slot_idx].take() {
-                    let io_res = if res < 0 {
-                        Err(std::io::Error::from_raw_os_error(-res))
-                    } else {
-                        Ok(res as usize)
-                    };
-                    complete_one(act, io_res, wm);
-                }
-
-                completed_slots.push(slot_idx);
-            }
-
-            for idx in completed_slots {
-                free_slots.push(idx);
-                active_count -= 1;
-            }
-        }
-
         if disconnected && active_count == 0 {
             break;
+        }
+
+        // PERF-4 (c) + R-3: ONE io_uring_enter per pass — submit_and_wait
+        // both flushes every SQE this pass pushed (requests AND the re-armed
+        // arrival wake) and parks for the FIRST event of either class. An
+        // idle lane parks here at zero cost (only the wake SQE in flight);
+        // a loaded lane wakes for every completion batch AND every request
+        // burst, so no fill's issue ever waits out another fill's service.
+        crate::fuse_client::METRICS
+            .dev_enters
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        match ring.submit_and_wait(1) {
+            Ok(_) => {}
+            Err(e) if e.raw_os_error() == Some(libc::EINTR) => {}
+            Err(e) => log::error!("io_uring submit_and_wait failed: {:?}", e),
+        }
+
+        let mut cq = ring.completion();
+        cq.sync();
+        let mut completed_slots = Vec::new();
+        for cqe in cq {
+            let ud = cqe.user_data();
+            if ud == UD_WAKE {
+                // The eventfd read landed: requests arrived (or teardown).
+                // Its counter is consumed by the read itself; re-arm before
+                // the next park (level-triggered: a write racing this pass
+                // completes the new read immediately).
+                wake_consumed = true;
+                wake_armed = false;
+                continue;
+            }
+            if ud >= UD_RESERVED {
+                continue; // the slow-read seam's linked timeout
+            }
+            let slot_idx = ud as usize;
+            let res = cqe.result();
+            if let Some(act) = active[slot_idx].take() {
+                let io_res = if res < 0 {
+                    Err(std::io::Error::from_raw_os_error(-res))
+                } else {
+                    Ok(res as usize)
+                };
+                complete_one(act, io_res, wm);
+            }
+            completed_slots.push(slot_idx);
+        }
+        if !completed_slots.is_empty() {
+            crate::fuse_client::METRICS
+                .dev_wake_batches
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        for idx in completed_slots {
+            free_slots.push(idx);
+            active_count -= 1;
         }
     }
 
@@ -1872,8 +2025,7 @@ impl NvmeBlockDev {
                 // variant, so both must count or neither).
                 self.worker.wm.note_submitted();
                 self.worker
-                    .sender()
-                    .try_send(UringRequest::Fsync { datasync: true, tx })
+                    .submit(UringRequest::Fsync { datasync: true, tx })
                     .map_err(|e| {
                         self.worker.wm.note_completed();
                         crate::fuse_client::METRICS
@@ -2181,25 +2333,24 @@ impl NvmeBlockDev {
             let data_type = WriteData::Aligned { data: data.clone() };
             let (tx, rx) = oneshot::channel();
             lane.wm.note_submitted();
-            lane.sender()
-                .try_send(UringRequest::Write {
-                    offset,
-                    data: data_type,
-                    tx,
-                    enq: std::time::Instant::now(),
-                    trace_id: crate::op_trace::current_op(),
-                })
-                .map_err(|e| {
-                    // The send never happened: terminally resolved here.
-                    lane.wm.note_completed();
-                    crate::fuse_client::METRICS
-                        .uring_queue_full
-                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    crate::error::SqueezefsError::InvalidOperation(format!(
-                        "Uring request queue full or closed (backpressure): {:?}",
-                        e
-                    ))
-                })?;
+            lane.submit(UringRequest::Write {
+                offset,
+                data: data_type,
+                tx,
+                enq: std::time::Instant::now(),
+                trace_id: crate::op_trace::current_op(),
+            })
+            .map_err(|e| {
+                // The send never happened: terminally resolved here.
+                lane.wm.note_completed();
+                crate::fuse_client::METRICS
+                    .uring_queue_full
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                crate::error::SqueezefsError::InvalidOperation(format!(
+                    "Uring request queue full or closed (backpressure): {:?}",
+                    e
+                ))
+            })?;
             rx
         } else {
             // Zero-copy write-path §5.6 (PR 2): pooled write sources are
@@ -2285,8 +2436,7 @@ impl NvmeBlockDev {
             let (tx, rx) = oneshot::channel();
             lane.wm.note_submitted();
             if lane
-                .sender()
-                .try_send(UringRequest::Write {
+                .submit(UringRequest::Write {
                     offset,
                     data: data_type,
                     tx,
@@ -2482,8 +2632,7 @@ impl NvmeBlockDev {
         // alive for this request's whole lifetime.
         let read_lane = self.read_lane_pick();
         read_lane
-            .sender()
-            .try_send(UringRequest::Read {
+            .submit(UringRequest::Read {
                 offset,
                 buf_ptr: SendPtr(buf_ptr),
                 size,

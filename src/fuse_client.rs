@@ -5445,6 +5445,24 @@ pub struct Metrics {
     pub bg_spawn_rejected: Align64<AtomicU64>,
     /// io_uring request queue backpressure (submit rejected as full).
     pub uring_queue_full: Align64<AtomicU64>,
+    /// NvmeBlockDev funnel issue economy (e2e audit R-3, read board #3):
+    /// `dev_enters` = lane-worker `io_uring_enter` calls (one per pass —
+    /// the flush of every SQE the pass pumped AND the park for the next
+    /// event); `dev_fills` = read/write/fsync SQEs pushed; `enters ÷
+    /// fills ≪ 1` under concurrency is the batching instrument (≈ 1 on a
+    /// serial stream by construction).
+    pub dev_enters: Align64<AtomicU64>,
+    pub dev_fills: Align64<AtomicU64>,
+    /// Completion drains that resolved ≥ 1 request (a batch of waiter
+    /// wakes on the reaping thread); `fills ÷ wake_batches` is the live
+    /// completions-per-drain factor.
+    pub dev_wake_batches: Align64<AtomicU64>,
+    /// Request-arrival wakes: eventfd writes the enqueue side paid to wake
+    /// a possibly-parked lane worker vs writes elided by the coalescer
+    /// (a pass already owed). `writes/(writes+elided) ≈ 1` under a
+    /// saturated lane means the coalescer stopped eliding.
+    pub dev_wake_writes: Align64<AtomicU64>,
+    pub dev_wakes_elided: Align64<AtomicU64>,
     /// Block writes that missed `write_block`'s zero-copy `WriteData::Aligned`
     /// DMA branch and paid the bounce-buffer copy (zero-copy write-path design
     /// §5.6, PR 2 — the pooled-buffer alignment-contract violation detector).
@@ -10221,6 +10239,15 @@ impl SqueezefsFilesystem {
                 "bg_spawn_admitted": METRICS.bg_spawn_admitted.load(Ordering::Relaxed),
                 "bg_spawn_rejected": METRICS.bg_spawn_rejected.load(Ordering::Relaxed),
                 "uring_queue_full": METRICS.uring_queue_full.load(Ordering::Relaxed),
+                // NvmeBlockDev funnel issue economy (R-3): enters ÷ fills
+                // is the batching factor, fills ÷ wake_batches the
+                // completions-per-drain factor, writes/(writes+elided) the
+                // request-wake coalescer's health.
+                "dev_enters": METRICS.dev_enters.load(Ordering::Relaxed),
+                "dev_fills": METRICS.dev_fills.load(Ordering::Relaxed),
+                "dev_wake_batches": METRICS.dev_wake_batches.load(Ordering::Relaxed),
+                "dev_wake_writes": METRICS.dev_wake_writes.load(Ordering::Relaxed),
+                "dev_wakes_elided": METRICS.dev_wakes_elided.load(Ordering::Relaxed),
                 "staging_generation_discards": METRICS.staging_generation_discards.load(Ordering::Relaxed),
                 "staging_writer_scope": match crate::writer_scope::engaged_scope() {
                     // KD-MW-2: the pair renders `w_{node}.m{slot}`; a

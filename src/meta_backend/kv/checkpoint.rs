@@ -50,6 +50,52 @@
 //! folds the member's entry start; SMO flips already pinned at
 //! `res.start`).
 //!
+//! ## The cadence is never starved by its own threshold drain (finding 49)
+//!
+//! The cadence tick is the ONLY path to a ring-pressure checkpoint cycle
+//! — the only thing that ever advances `reusable_upto` for a committer
+//! parked on ring admission (§4.4 pt 5). Two laws keep it live under a
+//! storm whose every pass crosses the writeback threshold (so the
+//! maintenance wake is never silent): (1) the cadence deadline is read
+//! off the CLOCK after every wake — `timeout_at` polls the wake before the
+//! sleep, so a wake returning past the deadline IS the deadline; (2) every
+//! threshold drain is BOUNDED by one cadence period
+//! (`KvTree::run_maintenance_until`; at least one item per pass so it
+//! always progresses), leftovers re-arming the wake. Together: the tick
+//! runs every ≤ period + one maintenance item's service time. The shipped
+//! form (wake-first select + pop-until-empty drain) let a storm whose
+//! items were slower than its arrivals hold the drain open for minutes —
+//! no checkpoint, no reclaim, a 32 MiB ring full, the parked pass
+//! escalating to fail-stop at 3 × `SQUEEZEFS_TIMEOUT` (the `kv_scale`
+//! million-entry storm under the all-features gate: the directory
+//! inode's 35 k-record same-key Δtime run folded in 44 s through the
+//! O(run²) `bset::MergeIter::run_end` rescan — memoized in the same fix —
+//! and the drain never emptied; latent on every venue where SMO service
+//! time ≥ the threshold-crossing interval). Contracts: `tests/
+//! conveyor_two_stage_tests.rs` §3. What the drain bound does NOT bound is
+//! one item's own service time (an SMO is serialized here by design) —
+//! the reclaim latency floor under a storm is one SMO + one flush pass.
+//!
+//! Acyclicity (the D-2 / C-2 lanes): the checkpoint task runs on the
+//! `sqz-meta` pool and waits on nothing the conveyor holds. Its barrier is
+//! `sync_device` → the `uring_fs` PROCESS pool's fdatasync (never the
+//! volume's journal lane); its tail inputs are `head`, the dirty floors
+//! and `min_inflight_start` — a window's reservation, registered by stage
+//! A and released when stage B observes the write outcome, which needs
+//! only the device (the C-2 lane reaps its own CQEs; a ring-space park is
+//! an async `Notify` wait on the parked committer's task, so it yields the
+//! lane executor to stage B rather than holding the thread). The
+//! conveyor's one dependency on this task is `advance_reusable_upto`,
+//! which nothing here waits behind. Checkpoint → device; conveyor → device
+//! + checkpoint: no cycle — so the only way a parked committer is never
+//! released is this task not RUNNING its cycle, which is exactly what the
+//! two laws above rule out. The ring-capacity half of that argument is
+//! model-checked where it is a word protocol (`loom-models`' `journal_core`
+//! models: admission past `reusable_upto` refused, released by
+//! `advance_reusable_upto`); the cadence half is a liveness property under
+//! a real clock — a select arm never reached — which loom's interleaving
+//! model cannot express, so the cargo contract is its pin.
+//!
 //! ## R10: the drain always makes progress
 //!
 //! The cycle consumes **zero ring bytes** for everything except SMO
@@ -1062,16 +1108,28 @@ async fn checkpoint_task(
     // threshold wakes must never starve the cadence's
     // barriers/checkpoints under a sustained storm — the deadline only
     // advances when it fires.
+    //
+    // Finding 49: the deadline is read off the CLOCK, not off the select
+    // arm. `timeout_at` polls the wake before the sleep, so under a storm
+    // that re-arms the maintenance wake on every pass the sleep arm was
+    // never reached and the cadence tick — the only path to a ring-
+    // pressure checkpoint cycle, i.e. the only thing that ever advances
+    // `reusable_upto` for a parked committer — never ran: the ring
+    // filled, the pass parked, and the D1.b escalation fail-stopped a
+    // volume whose checkpoint could have reclaimed. A wake that returns
+    // past the deadline IS the deadline; with the maintenance drain
+    // bounded by the period (`run_maintenance_until`), the cadence runs
+    // every ≤ period + one maintenance item's service time.
     let period = std::time::Duration::from_millis(interval_ms);
     let mut next_tick = std::time::Instant::now() + period;
     loop {
         let cadence = match squeezefs_ipc::sqz_time::timeout_at(next_tick, wake.notified()).await {
-            Ok(()) => false,
-            Err(_) => {
-                next_tick = std::time::Instant::now() + period;
-                true
-            }
+            Ok(()) => std::time::Instant::now() >= next_tick,
+            Err(_) => true,
         };
+        if cadence {
+            next_tick = std::time::Instant::now() + period;
+        }
         let Some(be) = weak.upgrade() else {
             return; // backend dropped without shutdown: exit, leak nothing
         };
@@ -1088,8 +1146,13 @@ async fn checkpoint_task(
         if be.is_failed() && !shutting_down {
             continue;
         }
+        // The threshold drain's budget: one cadence period (finding 49 —
+        // never a constant; the strict cadence's `0` drains one item per
+        // wake, which is still progress). The shutdown tick is unbounded:
+        // its final cycle must see every queued append.
+        let drain_deadline = (!shutting_down).then(|| std::time::Instant::now() + period);
         if cadence || shutting_down {
-            if let Err(e) = tick(&be, &mut last_checkpoint, shutting_down).await {
+            if let Err(e) = tick(&be, &mut last_checkpoint, shutting_down, drain_deadline).await {
                 // ENG-3 re-triage: error, not warn — a failed cycle can
                 // carry a failed allocator-bitmap page write (DUR-4's
                 // dirty-set exposure), and this line is the operator's
@@ -1109,37 +1172,43 @@ async fn checkpoint_task(
             // worth of open delta): appends only — no barrier, no ledger,
             // both stay on the cadence. Commit RAM-apply cost is O(open
             // delta), so the drain must not wait out the tick.
-            if let Err(e) = maintenance_pass(&be).await {
+            if let Err(e) = maintenance_pass(&be, drain_deadline).await {
                 log::warn!(
                     "kv maintenance pass failed on {:?}: {e} (state stays RAM-consistent; \
                      the cadence tick retries)",
                     be.device_path()
                 );
             }
-            // Work arrived while draining (or a reserve drain deferred
-            // it): re-arm and return to the select so the ticker still
-            // gets its turn — never spin the cadence out.
-            if be.all_trees().into_iter().any(|t| t.maintenance_pending()) {
-                wake.notify_one();
-            }
+        }
+        // Work arrived while draining (or the budget / a reserve drain
+        // deferred it): re-arm and return to the select so the ticker
+        // still gets its turn — never spin the cadence out. The re-arm
+        // can no longer starve the cadence: the deadline is read off the
+        // clock above.
+        if be.all_trees().into_iter().any(|t| t.maintenance_pending()) {
+            wake.notify_one();
         }
     }
 }
 
 /// The maintenance-only wake body: drain every tree's threshold queue
-/// (bset appends + any compact/split the appends force). Journal-reserve
-/// exhaustion runs one full checkpoint cycle — the §4.4 pt 5 zero-ring-
-/// byte drain — exactly like the cadence tick's maintenance step; a
-/// pending-free-FIFO refusal (the SMO admission headroom check,
-/// design-smo-replay-currency PR 4 clause a) forces the same cycle,
-/// whose flush pass now discharges the pinning floor itself (the §4.7
-/// cycle-break) and whose centralized progress audit (clause b, inside
-/// `checkpoint_cycle`) bounds a genuinely wedged tail loud.
-async fn maintenance_pass(be: &Arc<KvMetaBackend>) -> Result<(), KvError> {
+/// (bset appends + any compact/split the appends force) within
+/// `deadline` (finding 49 — one cadence period; leftovers re-arm the
+/// wake). Journal-reserve exhaustion runs one full checkpoint cycle — the
+/// §4.4 pt 5 zero-ring-byte drain — exactly like the cadence tick's
+/// maintenance step; a pending-free-FIFO refusal (the SMO admission
+/// headroom check, design-smo-replay-currency PR 4 clause a) forces the
+/// same cycle, whose flush pass now discharges the pinning floor itself
+/// (the §4.7 cycle-break) and whose centralized progress audit (clause
+/// b, inside `checkpoint_cycle`) bounds a genuinely wedged tail loud.
+async fn maintenance_pass(
+    be: &Arc<KvMetaBackend>,
+    deadline: Option<std::time::Instant>,
+) -> Result<(), KvError> {
     let mut smo = be.smo.lock().await;
     for tree in be.all_trees() {
         loop {
-            match tree.run_maintenance(&mut smo).await {
+            match tree.run_maintenance_until(&mut smo, deadline).await {
                 Ok(_) => break,
                 Err(KvError::JournalReserveExhausted { .. } | KvError::PendingFreeFull { .. }) => {
                     be.checkpoint_cycle(&mut smo, true).await?;
@@ -1151,14 +1220,16 @@ async fn maintenance_pass(be: &Arc<KvMetaBackend>) -> Result<(), KvError> {
     Ok(())
 }
 
-/// One task tick: maintenance → deferred flush barrier → checkpoint when
-/// due. `final_cycle` (shutdown) drains in-flight commits first and
-/// forces a full cycle with an immediate post-ledger barrier, leaving
-/// `tail == head` — an empty replay window for the next mount.
+/// One task tick: maintenance (within `drain_deadline`) → deferred flush
+/// barrier → checkpoint when due. `final_cycle` (shutdown) drains
+/// in-flight commits first and forces a full cycle with an immediate
+/// post-ledger barrier, leaving `tail == head` — an empty replay window
+/// for the next mount.
 async fn tick(
     be: &Arc<KvMetaBackend>,
     last_checkpoint: &mut std::time::Instant,
     final_cycle: bool,
+    drain_deadline: Option<std::time::Instant>,
 ) -> Result<(), KvError> {
     if final_cycle {
         // New mutations are already refused (`write_gate`); wait out the
@@ -1189,7 +1260,9 @@ async fn tick(
     }
     let mut smo = be.smo.lock().await;
 
-    // 1. Threshold maintenance (appends + SMOs, serialized here — §4.6).
+    // 1. Threshold maintenance (appends + SMOs, serialized here — §4.6),
+    //    within the drain budget (finding 49: the checkpoint decision
+    //    below must not sit behind an unbounded drain under a storm).
     //    Reserve exhaustion runs a drain cycle and retries; a pending-
     //    free-FIFO refusal (SMO admission headroom, design-smo-replay-
     //    currency PR 4 clause a) forces the same cycle — its flush pass
@@ -1197,7 +1270,7 @@ async fn tick(
     //    centralized progress audit (clause b) bounds genuine wedges.
     for tree in be.all_trees() {
         loop {
-            match tree.run_maintenance(&mut smo).await {
+            match tree.run_maintenance_until(&mut smo, drain_deadline).await {
                 Ok(_) => break,
                 Err(KvError::JournalReserveExhausted { .. } | KvError::PendingFreeFull { .. }) => {
                     be.checkpoint_cycle(&mut smo, true).await?;

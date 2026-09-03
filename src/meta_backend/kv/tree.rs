@@ -820,9 +820,33 @@ impl KvTree {
         &self,
         ctx: &mut SmoContext,
     ) -> Result<MaintenanceOutcome, KvError> {
+        self.run_maintenance_until(ctx, None).await
+    }
+
+    /// [`Self::run_maintenance`] bounded by a deadline (finding 49): pops
+    /// until the queue is empty OR `deadline` has passed — always at least
+    /// one entry, so every pass makes progress. The checkpoint task runs
+    /// its threshold drains under its cadence period: a storm that
+    /// re-enqueues faster than the drain pops (every pop is a device
+    /// round trip; an SMO is several) would otherwise hold the drain open
+    /// indefinitely and the cadence tick — the only path to a ring-
+    /// pressure checkpoint — behind it. Work left queued is the caller's
+    /// to re-arm.
+    pub(crate) async fn run_maintenance_until(
+        &self,
+        ctx: &mut SmoContext,
+        deadline: Option<std::time::Instant>,
+    ) -> Result<MaintenanceOutcome, KvError> {
         let mut out = MaintenanceOutcome::default();
+        let mut first = true;
         while let Some(entry) = self.maintenance.pop() {
             let addr = **entry;
+            if !first && deadline.is_some_and(|d| std::time::Instant::now() >= d) {
+                // Past the budget: hand the entry back for the next pass.
+                self.maintenance.push(addr);
+                break;
+            }
+            first = false;
             self.maintain_node(ctx, addr, &mut out).await?;
         }
         Ok(out)

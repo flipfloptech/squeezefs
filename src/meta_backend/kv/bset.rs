@@ -303,8 +303,12 @@ pub fn merge<'v, 'a>(sources: &'v [BsetView<'a>]) -> MergeIter<'v, 'a> {
         sources,
         cursors: vec![0; sources.len()],
         run_emitted: vec![0; sources.len()],
+        run_ends: vec![RUN_END_UNKNOWN; sources.len()],
     }
 }
+
+/// `run_ends` sentinel: the current run's end has not been scanned yet.
+const RUN_END_UNKNOWN: usize = usize::MAX;
 
 /// Iterator returned by [`merge`].
 pub struct MergeIter<'v, 'a> {
@@ -314,11 +318,22 @@ pub struct MergeIter<'v, 'a> {
     /// How many of the current run have been emitted (runs emit in reverse,
     /// newest seq first).
     run_emitted: Vec<usize>,
+    /// The current run's exclusive end per source, scanned ONCE when the
+    /// cursor lands on a new key (finding 49: the per-candidate rescan
+    /// made a same-key run cost O(run²) record decodes — a directory
+    /// inode's frozen Δtime overlay of 35 k records folded in 44 s on the
+    /// checkpoint task, which is what turned a storm's threshold
+    /// maintenance from milliseconds into minutes).
+    run_ends: Vec<usize>,
 }
 
 impl<'v, 'a> MergeIter<'v, 'a> {
-    /// The exclusive end of the same-key run starting at `cursors[si]`.
-    fn run_end(&self, si: usize) -> usize {
+    /// The exclusive end of the same-key run starting at `cursors[si]`
+    /// (memoized per run).
+    fn run_end(&mut self, si: usize) -> usize {
+        if self.run_ends[si] != RUN_END_UNKNOWN {
+            return self.run_ends[si];
+        }
         let view = &self.sources[si];
         let start = self.cursors[si];
         let key = view.record(start).key;
@@ -326,19 +341,19 @@ impl<'v, 'a> MergeIter<'v, 'a> {
         while end < view.len() && view.record(end).key == key {
             end += 1;
         }
+        self.run_ends[si] = end;
         end
     }
 
     /// This source's candidate: the highest un-emitted seq of its current
     /// key run (bsets are seq-ascending within a key, so that is the run
     /// scanned from the back).
-    fn candidate(&self, si: usize) -> Option<(usize, RecordRef<'a>)> {
-        let view = &self.sources[si];
-        if self.cursors[si] >= view.len() {
+    fn candidate(&mut self, si: usize) -> Option<(usize, RecordRef<'a>)> {
+        if self.cursors[si] >= self.sources[si].len() {
             return None;
         }
         let idx = self.run_end(si) - 1 - self.run_emitted[si];
-        Some((idx, view.record(idx)))
+        Some((idx, self.sources[si].record(idx)))
     }
 }
 
@@ -374,6 +389,7 @@ impl<'a> Iterator for MergeIter<'_, 'a> {
         if self.cursors[si] + self.run_emitted[si] == run_end {
             self.cursors[si] = run_end;
             self.run_emitted[si] = 0;
+            self.run_ends[si] = RUN_END_UNKNOWN;
         }
         Some(r)
     }

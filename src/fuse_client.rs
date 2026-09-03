@@ -4226,6 +4226,18 @@ pub fn fused_timeline_json() -> serde_json::Value {
     transport_phase_json(fuse3::fused_timeline_snapshot())
 }
 
+/// `transport_reap_gap_ns` stats payload — the queue worker's enter
+/// cadence (e2e perf audit R-2 step 1, the K1 `send → transport_recv`
+/// residue's instrument): `blind` (previous enter's return → this enter's
+/// call — the CQ-blind window a landed completion waits out, per enter),
+/// `blind_cqe` (the same span weighted per CQE the enter surfaced —
+/// `sum/count` is the mean per-completion reap-gap bound), `park` (each
+/// blocking enter's wall time). Always-on; recorded on the `fuse3-ur`
+/// workers only (two clock reads per enter, never per op).
+pub fn transport_reap_gap_json() -> serde_json::Value {
+    transport_phase_json(fuse3::reap_gap_snapshot())
+}
+
 fn transport_phase_json<const N: usize>(snapshot: [fuse3::PhaseSnapshot; N]) -> serde_json::Value {
     let mut phases = serde_json::Map::new();
     for p in snapshot {
@@ -10543,6 +10555,21 @@ impl SqueezefsFilesystem {
                 "fuse3_fused_timeline_ns": fused_timeline_json(),
                 "fuse3_fused_midpass_reaps": fuse3::fused_midpass_reaps(),
                 "fuse3_fused_passbottom_reaps": fuse3::fused_passbottom_reaps(),
+                // R-2 (e2e perf audit, read board #2): the queue worker's
+                // enter cadence — the K1 `send → transport_recv` residue's
+                // instrument (blind / blind_cqe / park; see
+                // `transport_reap_gap_json`). Always-on, worker-thread
+                // only.
+                "transport_reap_gap_ns": transport_reap_gap_json(),
+                // R-2 engagement pair: READs served + committed inline on
+                // the reap thread (queue_wait == dispatch_lag == 0 by
+                // construction) vs READs the inline probe declined and
+                // handed straight to a handler lane (inbound queue +
+                // session dispatch task skipped). serves + demotes ≡ the
+                // READs delivered on an armed session with the lever on;
+                // both 0 on `SQUEEZEFS_FUSE_READ_FAST_DISPATCH=0`.
+                "transport_fast_dispatch_serves": fuse3::fast_dispatch_serves(),
+                "transport_fast_dispatch_demotes": fuse3::fast_dispatch_demotes(),
                 // The P2 in-place READ reply engagement gauge (found
                 // mis-wired by this campaign: dispatch takes the session
                 // connection, so handle_read's in-place arm never fired;

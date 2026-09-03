@@ -9,6 +9,8 @@
 pub use affinity::{pin_scope_from_env, scoped_affinity_cpus, PinScope};
 use bytes::Bytes;
 #[cfg(all(target_os = "linux", feature = "tokio-runtime"))]
+pub use connection::fuse_over_uring::fast_dispatch::{fast_dispatch_demotes, fast_dispatch_serves};
+#[cfg(all(target_os = "linux", feature = "tokio-runtime"))]
 pub use connection::fuse_over_uring::fused::{
     zc_write_fusion_bytes, zc_write_fusion_demotions, zc_write_fusions, zc_write_lazy_extractions,
 };
@@ -33,8 +35,9 @@ pub use filesystem::Filesystem;
 use futures_util::future::Either;
 pub use read_phase::{
     fused_midpass_reaps, fused_passbottom_reaps, fused_timeline_snapshot, read_inplace_replies,
-    read_transport_phase_record, read_transport_phase_snapshot, write_inplace_replies,
-    write_transport_phase_record, write_transport_phase_snapshot, PhaseSnapshot, TransportPhase,
+    read_transport_phase_record, read_transport_phase_snapshot, reap_gap_snapshot,
+    reap_phase_record_n, write_inplace_replies, write_transport_phase_record,
+    write_transport_phase_snapshot, PhaseSnapshot, ReapPhase, TransportPhase,
 };
 pub use request::{ReplySlot, Request};
 #[cfg(feature = "tokio-runtime")]

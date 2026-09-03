@@ -1194,3 +1194,108 @@ async fn stats_inode_carries_both_timer_registries_reading_their_own_words() {
     );
     drop(held);
 }
+
+// ---------------------------------------------------------------------------
+// R-2 step 1 — the reap-gap family + the fast-dispatch engagement pair
+// (`.benchmarks/2026-09-03-4k-random-attribution.md` §5/§8: the K1
+// `send → transport_recv` residue owned the kern tail with no instrument
+// that could say whether the queue worker was busy, parked or
+// descheduled; the fast-dispatch pair is the lever's engagement).
+// ---------------------------------------------------------------------------
+
+/// `transport_reap_gap_ns` rides the stats inode UNGATED with exactly the
+/// three phases, in the one histogram shape, and a recorded span moves
+/// exactly its phase's exact words (the family folds across the fuse3
+/// shards like the transport tables — a weighted `blind_cqe` record adds
+/// `n` to the count and `n × span` to the sum in ONE record).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn stats_inode_carries_the_reap_gap_family_exact() {
+    use fuse3::{reap_gap_snapshot, reap_phase_record_n, ReapPhase};
+    let _g = serial().await;
+    let h = make([0x52; 16], "audit_r2_reap").await;
+    let read = || async {
+        let reply =
+            h.fs.read(h.req, squeezefs::fuse_client::STATS_INODE, 0, 0, 1 << 22, 0)
+                .await
+                .expect("read stats inode");
+        let stats: serde_json::Value = serde_json::from_slice(&reply.data).expect("stats JSON");
+        stats["metrics"].clone()
+    };
+    let m0 = read().await;
+    let fam0 = m0
+        .get("transport_reap_gap_ns")
+        .expect("stats inode metrics must carry transport_reap_gap_ns UNGATED");
+    let obj = fam0.as_object().expect("family object");
+    assert_eq!(
+        obj.keys().collect::<Vec<_>>(),
+        ["blind", "blind_cqe", "park"],
+        "exactly the three reap phases, in order"
+    );
+    for (phase, hh) in obj {
+        for k in HIST_KEYS {
+            assert!(hh.get(k).is_some(), "phase {phase} lacks {k}");
+        }
+        assert_eq!(
+            bucket_sum(hh),
+            hist_count(hh),
+            "phase {phase}: Σ buckets ≡ count"
+        );
+    }
+    // The export reads the fuse3 fold: a direct record on each phase
+    // moves that phase's words by exactly the recorded weight/span.
+    let snap0 = reap_gap_snapshot();
+    reap_phase_record_n(ReapPhase::Blind, 12_345, 1);
+    reap_phase_record_n(ReapPhase::BlindCqe, 12_345, 9);
+    reap_phase_record_n(ReapPhase::Park, 777_000, 1);
+    let m1 = read().await;
+    let fam1 = &m1["transport_reap_gap_ns"];
+    let snap1 = reap_gap_snapshot();
+    let (bc, bs) = phase_words(fam1, "blind");
+    let (cc, cs) = phase_words(fam1, "blind_cqe");
+    let (pc, ps) = phase_words(fam1, "park");
+    // Live workers may record concurrently (none in this harness — no
+    // mount), so the pins are exact deltas against the fold read around
+    // the inode read.
+    assert_eq!(bc - snap0[0].count, snap1[0].count - snap0[0].count);
+    assert_eq!(snap1[0].count - snap0[0].count, 1, "one blind sample");
+    assert_eq!(bs - snap0[0].sum_ns, 12_345, "blind sum is the exact span");
+    assert_eq!(cc - snap0[1].count, 9, "blind_cqe count = the CQE weight");
+    assert_eq!(
+        cs - snap0[1].sum_ns,
+        12_345 * 9,
+        "blind_cqe sum = span × weight"
+    );
+    assert_eq!(pc - snap0[2].count, 1, "one park sample");
+    assert_eq!(ps - snap0[2].sum_ns, 777_000, "park sum is the exact span");
+}
+
+/// The fast-dispatch engagement pair rides the stats inode as u64
+/// counters reading the fuse3 statics (0 in this harness — no armed
+/// session; the mechanism's own suites move them).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn stats_inode_carries_the_fast_dispatch_engagement_pair() {
+    let _g = serial().await;
+    let h = make([0x53; 16], "audit_r2_fastd").await;
+    let reply =
+        h.fs.read(h.req, squeezefs::fuse_client::STATS_INODE, 0, 0, 1 << 22, 0)
+            .await
+            .expect("read stats inode");
+    let stats: serde_json::Value = serde_json::from_slice(&reply.data).expect("stats JSON");
+    let m = &stats["metrics"];
+    let serves = m["transport_fast_dispatch_serves"]
+        .as_u64()
+        .expect("transport_fast_dispatch_serves is a u64 counter");
+    let demotes = m["transport_fast_dispatch_demotes"]
+        .as_u64()
+        .expect("transport_fast_dispatch_demotes is a u64 counter");
+    assert_eq!(
+        serves,
+        fuse3::fast_dispatch_serves(),
+        "serves reads the fuse3 static"
+    );
+    assert_eq!(
+        demotes,
+        fuse3::fast_dispatch_demotes(),
+        "demotes reads the fuse3 static"
+    );
+}

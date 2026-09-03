@@ -103,9 +103,22 @@ impl PhaseHist {
 
     #[inline]
     fn record_ns(&self, ns: u64) {
-        self.buckets[latency_bucket_index(ns / 1_000)].fetch_add(1, Ordering::Relaxed);
-        self.count.fetch_add(1, Ordering::Relaxed);
-        self.sum_ns.fetch_add(ns, Ordering::Relaxed);
+        self.record_ns_n(ns, 1);
+    }
+
+    /// Record the SAME span `n` times in three RMWs (the per-CQE reap
+    /// bound below is one pass span shared by every CQE that pass
+    /// surfaced — recording it per CQE in a loop would cost 3n RMWs on
+    /// the reap thread). `n == 0` records nothing.
+    #[inline]
+    fn record_ns_n(&self, ns: u64, n: u64) {
+        if n == 0 {
+            return;
+        }
+        self.buckets[latency_bucket_index(ns / 1_000)].fetch_add(n, Ordering::Relaxed);
+        self.count.fetch_add(n, Ordering::Relaxed);
+        self.sum_ns
+            .fetch_add(ns.saturating_mul(n), Ordering::Relaxed);
     }
 }
 
@@ -352,6 +365,138 @@ pub fn fused_passbottom_reaps() -> u64 {
     FUSED_PASSBOTTOM_REAPS.load(Ordering::Relaxed)
 }
 
+// ---------------------------------------------------------------------------
+// The reap-gap family (`transport_reap_gap_ns` — e2e perf audit R-2, the
+// K1 residue's instrument; `.benchmarks/2026-09-03-4k-random-attribution.md`
+// §5: `send → transport_recv` runs 56 µs mean at a p50 of 8 µs and owns
+// 61 % of every > 3 ms op, and the board had no instrument that could say
+// whether the queue worker was parked, busy, or descheduled when the CQE
+// landed). No CQE carries a kernel completion timestamp, and under
+// `DEFER_TASKRUN` a completion is not even IN the CQ until the ring owner
+// enters with GETEVENTS — so the honest per-worker measure is the enter
+// cadence itself:
+//
+// * `blind` — per completion-surfacing `io_uring_enter`: the span from the
+//   PREVIOUS enter's return to this enter's call. The worker cannot
+//   observe any completion inside it, so a CQE that landed in the window
+//   waited at most this long before the reap saw it. Its mean is the
+//   pass's own work (and any preemption of the worker thread — a
+//   3–10 ms `blind` with sub-100 µs pass work is the CPU-oversubscription
+//   signature); its count is the enter count.
+// * `blind_cqe` — the same span recorded once per CQE that enter
+//   surfaced (three RMWs per enter, `record_ns_n`): `sum/count` is the
+//   MEAN per-CQE reap-gap bound the row's completions actually paid, the
+//   number `send → transport_recv`'s daemon half is compared against.
+// * `park` — the wall time of each BLOCKING enter (`submit_and_wait(1)`
+//   or a bounded EXT_ARG park). A CQE arriving mid-park is surfaced by
+//   the wake, so its wait is the wake latency, not the park; the
+//   histogram is the idle/cadence face (a work-conserving zero-timeout
+//   flush is not a park and records nothing here).
+//
+// Recorded on the worker thread only: two clock reads per enter, no
+// per-op cost, sharded like the transport tables.
+// ---------------------------------------------------------------------------
+
+/// Reap-cadence phases (see the family doc above). `repr(usize)` indexes
+/// the table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(usize)]
+pub enum ReapPhase {
+    /// Previous enter's return → this enter's call (the CQ-blind window).
+    Blind = 0,
+    /// `Blind`, weighted per CQE the enter surfaced.
+    BlindCqe = 1,
+    /// A blocking enter's wall time.
+    Park = 2,
+}
+
+const REAP_PHASES: usize = 3;
+const REAP_PHASE_NAMES: [&str; REAP_PHASES] = ["blind", "blind_cqe", "park"];
+
+fn reap_tables() -> &'static [[PhaseHist; REAP_PHASES]] {
+    static TABLES: OnceLock<Vec<[PhaseHist; REAP_PHASES]>> = OnceLock::new();
+    TABLES.get_or_init(|| {
+        (0..shard_count())
+            .map(|_| std::array::from_fn(|_| PhaseHist::new()))
+            .collect()
+    })
+}
+
+/// Record one reap-cadence span (`n` = the CQE weight for `BlindCqe`,
+/// 1 for the others).
+#[inline]
+pub fn reap_phase_record_n(phase: ReapPhase, ns: u64, n: u64) {
+    reap_tables()[shard_index()][phase as usize].record_ns_n(ns, n);
+}
+
+/// Snapshot for the daemon's stats inode (`transport_reap_gap_ns`), in
+/// phase order; the fold across shards is exact.
+pub fn reap_gap_snapshot() -> [PhaseSnapshot; REAP_PHASES] {
+    let shards = reap_tables();
+    std::array::from_fn(|pi| fold(REAP_PHASE_NAMES[pi], shards.iter().map(|s| &s[pi])))
+}
+
+/// The per-worker enter-cadence gauge — owned by ONE queue-worker thread
+/// (like its `SlotTable`), driven at the three points of every
+/// completion-surfacing enter: [`Self::enter_begin`] immediately before
+/// the syscall, [`Self::enter_end`] immediately after it returns, and
+/// [`Self::cqes_surfaced`] once the post-enter CQ sync has counted the
+/// fresh completions. Pure arithmetic over the transport epoch; tested
+/// without a ring (`reap_cadence_*`).
+pub(crate) struct ReapCadence {
+    /// The previous enter's return stamp (transport epoch ns).
+    prev_enter_end_ns: u64,
+    /// The blind span the current enter closed (for the per-CQE weight).
+    blind_ns: u64,
+}
+
+impl ReapCadence {
+    /// Start the cadence at `now` — the worker's REGISTER submit is the
+    /// first enter, so the first blind window is the arm-to-first-pass
+    /// span (one sample; every later window is a pass).
+    pub(crate) fn new() -> Self {
+        Self {
+            prev_enter_end_ns: transport_now_ns(),
+            blind_ns: 0,
+        }
+    }
+
+    /// Immediately BEFORE a GETEVENTS-carrying enter: closes and records
+    /// the blind window. Returns the call stamp for [`Self::enter_end`].
+    #[inline]
+    pub(crate) fn enter_begin(&mut self) -> u64 {
+        let now = transport_now_ns();
+        self.blind_ns = now.saturating_sub(self.prev_enter_end_ns);
+        reap_phase_record_n(ReapPhase::Blind, self.blind_ns, 1);
+        now
+    }
+
+    /// Immediately AFTER the enter returns. `blocking` = the enter could
+    /// park (a `submit_and_wait` or bounded EXT_ARG wait), so its wall
+    /// time is a `park` sample; a zero-timeout flush records none.
+    #[inline]
+    pub(crate) fn enter_end(&mut self, began_ns: u64, blocking: bool) {
+        let now = transport_now_ns();
+        if blocking {
+            reap_phase_record_n(ReapPhase::Park, now.saturating_sub(began_ns), 1);
+        }
+        self.prev_enter_end_ns = now;
+    }
+
+    /// After the post-enter CQ sync: `n` fresh completions surfaced —
+    /// each waited at most the blind window this enter closed.
+    #[inline]
+    pub(crate) fn cqes_surfaced(&self, n: usize) {
+        reap_phase_record_n(ReapPhase::BlindCqe, self.blind_ns, n as u64);
+    }
+
+    /// The blind span the most recent enter closed (tests).
+    #[cfg(test)]
+    pub(crate) fn last_blind_ns(&self) -> u64 {
+        self.blind_ns
+    }
+}
+
 #[cfg(test)]
 mod transport_phase_tests {
     use super::*;
@@ -438,5 +583,67 @@ mod transport_phase_tests {
             .map(|(a, b)| a - b)
             .sum();
         assert_eq!(bucket_delta, THREADS * PER_THREAD, "Σ buckets ≡ count");
+    }
+
+    fn reap_words() -> [(u64, u64); REAP_PHASES] {
+        let snap = reap_gap_snapshot();
+        std::array::from_fn(|i| (snap[i].count, snap[i].sum_ns))
+    }
+
+    /// R-2 step 1: one enter records ONE `blind` span (the gap since the
+    /// previous enter's return), a blocking enter ONE `park` span, and
+    /// the surfaced CQEs weight `blind_cqe` by their count with the SAME
+    /// span — exact to the ns, no per-CQE loop.
+    #[test]
+    fn reap_cadence_records_blind_park_and_per_cqe_weight_exactly() {
+        let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let [b0, c0, p0] = reap_words();
+        let mut cad = ReapCadence::new();
+
+        // A zero-timeout (work-conserving) enter: blind, no park.
+        let t = cad.enter_begin();
+        cad.enter_end(t, false);
+        cad.cqes_surfaced(0);
+        let [b1, c1, p1] = reap_words();
+        assert_eq!(b1.0 - b0.0, 1, "one blind sample per enter");
+        assert_eq!(c1, c0, "zero CQEs weight nothing");
+        assert_eq!(p1, p0, "a non-blocking enter is not a park");
+
+        // A blocking enter that surfaced 7 CQEs.
+        std::thread::sleep(Duration::from_millis(2));
+        let t = cad.enter_begin();
+        let blind = cad.last_blind_ns();
+        assert!(
+            blind >= 2_000_000,
+            "the blind window spans the gap since the previous enter's return ({blind} ns)"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+        cad.enter_end(t, true);
+        cad.cqes_surfaced(7);
+        let [b2, c2, p2] = reap_words();
+        assert_eq!(b2.0 - b1.0, 1);
+        assert_eq!(b2.1 - b1.1, blind, "blind sum is the exact span");
+        assert_eq!(c2.0 - c1.0, 7, "blind_cqe count = CQEs surfaced");
+        assert_eq!(c2.1 - c1.1, blind * 7, "blind_cqe sum = span × CQEs");
+        assert_eq!(p2.0 - p1.0, 1, "one park sample per blocking enter");
+        assert!(p2.1 - p1.1 >= 1_000_000, "park is the enter's wall time");
+
+        // The next window starts at the previous enter's RETURN, not its
+        // call: a long park must not inflate the following blind span.
+        let t = cad.enter_begin();
+        assert!(
+            cad.last_blind_ns() < 1_000_000,
+            "blind excludes the park ({} ns)",
+            cad.last_blind_ns()
+        );
+        cad.enter_end(t, false);
+    }
+
+    /// The family's export shape: exactly the three named phases, in
+    /// order.
+    #[test]
+    fn reap_gap_snapshot_names_the_three_phases() {
+        let names: Vec<&str> = reap_gap_snapshot().iter().map(|p| p.name).collect();
+        assert_eq!(names, ["blind", "blind_cqe", "park"]);
     }
 }

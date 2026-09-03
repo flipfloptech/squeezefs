@@ -88,6 +88,12 @@ use wake_core::WakeCoalescer;
 #[path = "fused.rs"]
 pub mod fused;
 
+/// READ fast-dispatch from the reap thread (e2e perf audit R-2): the
+/// inline probe/serve + direct lane mint at the delivery CQE, and its
+/// engagement pair. Child of this module like `fused`.
+#[path = "fast_dispatch.rs"]
+pub mod fast_dispatch;
+
 use super::kmbuf::{self, KmbufQueue, TransportBufferMode};
 use super::zc::{self, ZcBounce, ZcPend};
 use crate::raw::request::ReplySlot;
@@ -1873,12 +1879,21 @@ fn flush_submit(ring: &mut Ring, batch: &mut SubmitBatch) -> io::Result<usize> {
 /// non-blocking GETEVENTS idiom (the dd-ring bounded-wait precedent):
 /// task work runs, completed CQEs land, and an empty completion state
 /// answers `ETIME` immediately — never a park.
-fn flush_submit_getevents(ring: &mut Ring, batch: &mut SubmitBatch) -> io::Result<usize> {
+fn flush_submit_getevents(
+    ring: &mut Ring,
+    batch: &mut SubmitBatch,
+    cadence: &mut crate::raw::read_phase::ReapCadence,
+) -> io::Result<usize> {
     let (had_reads, had_writes) = batch.note_flush();
     let t0 = (had_reads || had_writes).then(Instant::now);
     let ts = types::Timespec::new();
     let args = types::SubmitArgs::new().timespec(&ts);
-    let n = match ring.submitter().submit_with_args(1, &args) {
+    // A completion-surfacing enter: the reap-gap gauge brackets it
+    // (non-blocking — no park sample).
+    let began = cadence.enter_begin();
+    let res = ring.submitter().submit_with_args(1, &args);
+    cadence.enter_end(began, false);
+    let n = match res {
         Err(e) if e.raw_os_error() == Some(libc::ETIME) => Ok(0),
         other => other,
     }?;
@@ -4886,6 +4901,10 @@ fn queue_worker(
     // wait). Only the syscall is shared: the §5.4 lease re-arm gate still
     // runs per ent *before* its SQE is pushed.
     let mut batch = SubmitBatch::default();
+    // R-2 reap-gap gauge (`transport_reap_gap_ns`): brackets every
+    // completion-surfacing enter of this worker — the REGISTER submit
+    // above was the first, so the cadence starts here.
+    let mut cadence = crate::raw::read_phase::ReapCadence::new();
     // Row 7: sticky across passes — see the re-arm site below.
     let mut need_repoll_sticky = false;
     // Mid-pass-reaped CQEs the narrow bridge arm does NOT resolve —
@@ -4979,7 +4998,8 @@ fn queue_worker(
                         .map(|m| m.bridge_deadlines.outstanding())
                         .sum();
                     if batch.pending > 0 || live_pends > 0 {
-                        if let Err(e) = flush_submit_getevents(&mut ring, &mut batch) {
+                        if let Err(e) = flush_submit_getevents(&mut ring, &mut batch, &mut cadence)
+                        {
                             warn!(
                                 "fuse-over-uring qids={qids:?}: eager bridge flush \
                                  failed ({e}); deferring to the pass-bottom submit"
@@ -5007,6 +5027,11 @@ fn queue_worker(
                                 cq_drops.nodrop()
                             );
                         }
+                        // Every CQE this enter surfaced waited at most
+                        // the blind window it closed (deferred ones are
+                        // counted HERE, where they surfaced, not at the
+                        // pass bottom that consumes them).
+                        cadence.cqes_surfaced(cq.len());
                         for c in cq {
                             let (user_data, res, flags) = (c.user_data(), c.result(), c.flags());
                             let Some((op, gent)) = decode_user_data(user_data) else {
@@ -5588,6 +5613,11 @@ fn queue_worker(
         let park_backstop = (fused_lane.len() > 0
             || pool.zc_bridge_pends.load(Ordering::Relaxed) > 0)
             .then(|| Duration::from_millis(100));
+        // R-2 reap-gap gauge: the pass-bottom enter is THE completion-
+        // surfacing syscall — bracket it (blind window closes here; a
+        // blocking arm is a park sample).
+        let enter_began = cadence.enter_begin();
+        let mut enter_blocking = false;
         let wait_result = if !deferred_cqes.is_empty() || pass_polls > 0 || pass_msgs > 0 {
             // Work-conserving pass: completions in hand (parking would
             // sleep over work nothing re-signals — the drained-then-park
@@ -5604,6 +5634,7 @@ fn queue_worker(
                 other => other,
             }
         } else {
+            enter_blocking = true;
             let retry_left =
                 next_retry.map(|deadline| deadline.saturating_duration_since(Instant::now()));
             match (retry_left, park_backstop) {
@@ -5634,6 +5665,7 @@ fn queue_worker(
                 }
             }
         };
+        cadence.enter_end(enter_began, enter_blocking);
         match wait_result {
             Ok(_) => {}
             Err(e) if e.raw_os_error() == Some(libc::EINTR) => continue,
@@ -5667,6 +5699,9 @@ fn queue_worker(
                     cq_drops.nodrop()
                 );
             }
+            // The fresh completions this enter surfaced (the deferred
+            // ones were counted by the mid-pass enter that surfaced them).
+            cadence.cqes_surfaced(cq.len());
             // Mid-pass-deferred CQEs first (they ARRIVED first), then the
             // post-wait drain.
             deferred_cqes

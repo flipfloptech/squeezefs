@@ -35,23 +35,24 @@ use raw::abi::{
 pub use raw::set_zc_hold_streaming;
 #[cfg(all(target_os = "linux", feature = "tokio-runtime"))]
 pub use raw::{
-    drain_group_stats, kmbuf_negotiated, negotiated_max_readahead, note_zc_write_direct,
-    numa_local_bytes, numa_remote_bytes, over_uring_classical_sideband,
-    over_uring_commit_batch_stats, over_uring_geometry, over_uring_negotiated_write,
-    over_uring_sessions_active, over_uring_stats, retention_negotiated,
-    transport_cq_overflow_stats, transport_lease_stats, transport_park_backstop_ticks,
-    transport_reply_integrity_stats, transport_wake_stats, zc_bridge_cancels, zc_bridge_lost,
-    zc_bridge_orphans, zc_fallbacks, zc_negotiated, zc_release_failures, zc_releases, zc_replies,
-    zc_retain_commits, zc_retain_refused, zc_retained_outstanding, zc_slot_payload_skips,
-    zc_write_direct_bytes, zc_write_directs, zc_write_extract_bytes, zc_write_extractions,
-    zc_write_fusion_bytes, zc_write_fusion_demotions, zc_write_fusions, zc_write_lazy_extractions,
-    zc_write_store_qid_census, COMMIT_BATCH_LABELS,
+    drain_group_stats, fast_dispatch_demotes, fast_dispatch_serves, kmbuf_negotiated,
+    negotiated_max_readahead, note_zc_write_direct, numa_local_bytes, numa_remote_bytes,
+    over_uring_classical_sideband, over_uring_commit_batch_stats, over_uring_geometry,
+    over_uring_negotiated_write, over_uring_sessions_active, over_uring_stats,
+    retention_negotiated, transport_cq_overflow_stats, transport_lease_stats,
+    transport_park_backstop_ticks, transport_reply_integrity_stats, transport_wake_stats,
+    zc_bridge_cancels, zc_bridge_lost, zc_bridge_orphans, zc_fallbacks, zc_negotiated,
+    zc_release_failures, zc_releases, zc_replies, zc_retain_commits, zc_retain_refused,
+    zc_retained_outstanding, zc_slot_payload_skips, zc_write_direct_bytes, zc_write_directs,
+    zc_write_extract_bytes, zc_write_extractions, zc_write_fusion_bytes, zc_write_fusion_demotions,
+    zc_write_fusions, zc_write_lazy_extractions, zc_write_store_qid_census, COMMIT_BATCH_LABELS,
 };
 pub use raw::{
     fused_midpass_reaps, fused_passbottom_reaps, fused_timeline_snapshot, pin_scope_from_env,
     read_inplace_replies, read_transport_phase_record, read_transport_phase_snapshot,
-    scoped_affinity_cpus, write_inplace_replies, write_transport_phase_record,
-    write_transport_phase_snapshot, PhaseSnapshot, PinScope, TransportPhase,
+    reap_gap_snapshot, reap_phase_record_n, scoped_affinity_cpus, write_inplace_replies,
+    write_transport_phase_record, write_transport_phase_snapshot, PhaseSnapshot, PinScope,
+    ReapPhase, TransportPhase,
 };
 #[cfg(feature = "tokio-runtime")]
 pub use raw::{tpc_lane_redispatches, tpc_spawn, tpc_spawn_on_node, tpc_thread_count};

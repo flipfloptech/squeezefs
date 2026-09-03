@@ -160,6 +160,34 @@ if ! "$LS_PROBE" -d / >/dev/null 2>&1; then
 fi
 rm -f "$LS_PROBE"
 
+# xfstests' `check` and its common/ helpers shell out to a handful of
+# tools the build/mount prerequisites above do not cover (`check` needs
+# `bc` just to expand `-g auto` — 0 tests otherwise; tests need
+# `indent`/`dbench`-class extras only in groups we do not run). NixOS
+# boxes carry them only via nix; the post-reboot root PATH silently
+# lost `bc` on 2026-09-03 and the release-gate sweep refused with an
+# empty expansion. Resolve each missing tool from nixpkgs into the shim
+# dir — the same seam the ls shim uses — and refuse loud if one still
+# cannot be found.
+SHIM_DIR="${SHIM_DIR:-/tmp/squeezefs-fstests-shims}"
+mkdir -p "$SHIM_DIR"
+for tool_pkg in bc:bc perl:perl; do
+    tool="${tool_pkg%%:*}"
+    pkg="${tool_pkg##*:}"
+    command -v "$tool" >/dev/null 2>&1 && continue
+    if command -v nix >/dev/null 2>&1; then
+        out="$(nix --extra-experimental-features 'nix-command flakes' build "nixpkgs#${pkg}" --no-link --print-out-paths 2>/dev/null | tail -1)"
+        if [ -n "$out" ] && [ -x "$out/bin/$tool" ]; then
+            ln -sf "$out/bin/$tool" "$SHIM_DIR/$tool"
+        fi
+    fi
+    case ":$PATH:" in *":$SHIM_DIR:"*) ;; *) export PATH="$SHIM_DIR:$PATH" ;; esac
+    if ! command -v "$tool" >/dev/null 2>&1; then
+        echo "ERROR: '$tool' not found (xfstests needs it); install it or make nix available." >&2
+        exit 1
+    fi
+done
+
 cd "$XFSTESTS_DIR"
 # xfstests requires the fsgqa user/group; keep this OUTSIDE the
 # compile-once guard so cached-suite runs repair it too. -m / the home

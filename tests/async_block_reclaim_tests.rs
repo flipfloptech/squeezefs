@@ -298,7 +298,24 @@ async fn eventually(mut cond: impl FnMut() -> bool, what: &str) {
     while !cond() {
         assert!(
             std::time::Instant::now() < deadline,
-            "background reclaim worker never completed: {what}"
+            "background reclaim worker never completed: {what}\n  ledger: punches {} skipped {} \
+             queue_bytes {} queued {} commands {} cap_parks {} supply_drains {} sync_drains {} \
+             fence_halts {}",
+            punches(),
+            skipped(),
+            queue_bytes(),
+            METRICS.block_free_reclaim_queued.load(Ordering::Relaxed),
+            reclaim_commands(),
+            METRICS.block_free_reclaim_cap_parks.load(Ordering::Relaxed),
+            METRICS
+                .block_free_reclaim_supply_drains
+                .load(Ordering::Relaxed),
+            METRICS
+                .block_free_reclaim_sync_drains
+                .load(Ordering::Relaxed),
+            METRICS
+                .block_free_reclaim_fence_halts
+                .load(Ordering::Relaxed),
         );
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }

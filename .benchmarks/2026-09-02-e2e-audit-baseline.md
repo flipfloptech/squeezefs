@@ -227,3 +227,37 @@ Re-derived distances (same shape, same day):
 | rand-4k read 24×8 | 441 k = **22 %** of 2.03 M | 874 k = **43 %** | THE headroom: FS adds ~310 µs (kern) / ~100 µs (il) per op over raw at matching depth — read board #1/#2/#6 |
 | rand-4k write | 476 k / 704 k | raw randwrite control not yet run (nullblk writes are discards — run it before adjudicating) | |
 | seq fresh write | 0.36 GiB/s | | finding 46 |
+
+## Addendum — the user-run EXA client-validation row (binary `c985fa8c`)
+
+Recorded beside the baseline rows because it is the row the README
+quotes (the four "hero numbers"); it is **the user's instrument, not
+this rig's**, and is not a re-run of the table above.
+
+**Instrument:** the user-run **EXA client-validation script v1.2.1**,
+**il mode** (`LD_PRELOAD=libsqueezefs_il.so`, same-commit pairing),
+**40 s rows**, memory-backed targets on the squeeze-test fabric (the
+venue at the top of this note). **Binary:** `c985fa8c` (dev tip
+2026-09-03 — carries the R-2/R-3/R-4 read-side campaign, the W-3 overlay
+depth governor, the f46/f47 fixes, D-1b/D-2/C-2 on the metadata side,
+and the finding-40 reclaim hysteresis that is the commit itself).
+
+| Row | Result |
+|---|---|
+| Read BW | **43.9 GB/s** (= 40.9 GiB/s; the 24×16 il `r_cold` row above read 40.35 GiB/s on `aecf1561`) |
+| Write BW | **36.4 GB/s** (= 33.9 GiB/s; the `w_rewrite` / `w_durable` rows above read 30.5–32.3 GiB/s on `aecf1561`) |
+| Read IOPS (4 KiB) | **942 k** (the il `rr_4k` row above read 874 k on `aecf1561`; the R-2/R-3 notes measured the read-side levers' kern gain at +14.8 %/+15.5 %) |
+| Write IOPS (4 KiB) | **727 k** (the il `rw_4k` row above read 704 k on `aecf1561`) |
+
+What this row does NOT carry, stated so it is not over-read: the
+script's job shapes (block size, queue depth, job count, file set) are
+the script's own and were not transcribed here — the parenthetical
+comparisons above are shape-approximate, not same-shape brackets; no
+`.stats` engagement deltas (charter rule 4: `ipc_ops_*` vs the row's op
+count) and no amplification columns were captured for it; 40 s is
+below the ≥ 60 s sustained-row bar, so it is a **burst-class** row like
+the 30 s baseline rows, not a sustained claim. **The script's summary
+printed an `actions ⚠` flag; what that flag means is unexplained** — the
+script's author owns its semantics, and this note records the flag
+rather than interpreting it. Tier: measured-real (the user's own
+fabric), instrument external to the repo.

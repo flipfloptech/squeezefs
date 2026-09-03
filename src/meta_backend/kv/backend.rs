@@ -8719,7 +8719,7 @@ impl KvMetaBackend {
             Ok(Some(inflight)) => {
                 let t_sub = inflight.submitted_at;
                 w.submitted_at = Some(t_sub);
-                let out = inflight.finish(&self.ring).await;
+                let out = inflight.finish(&self.ring, &w.traced).await;
                 if out.is_ok() {
                     meta_txpass_phase_record_span(
                         MetaTxPassPhase::JournalRingWrite,

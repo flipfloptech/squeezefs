@@ -219,6 +219,20 @@ pub enum Stage {
     /// finish / total end (completion posted).
     IpcComplete = 117,
 
+    // -- uring_fs write completion hops (`uring_fs_write_phase_ns`,
+    //    e2e audit C-2) — the conveyor window's journal ring write ------
+    /// The caller's queue push (queue_hop's start; ≡ the window's
+    /// submission instant).
+    UfsSubmit = 120,
+    /// The worker admitted the request — popped + SQEs pushed (queue_hop
+    /// end / device start).
+    UfsAdmit = 121,
+    /// The worker reaped the last CQE and sent the outcome — the
+    /// completion's wake fired (device end / wake_hop start).
+    UfsWake = 122,
+    /// The awaiting task observed the outcome (wake_hop / total end).
+    UfsObserved = 123,
+
     // -- locks (`lock_phase_ns`) -----------------------------------------
     /// `INODE_META_LOCKS` (3.5) acquired (stripe_lock_wait end).
     StripeLockAcquired = 128,
@@ -299,6 +313,10 @@ impl Stage {
         Stage::IpcSqEnter,
         Stage::IpcCqe,
         Stage::IpcComplete,
+        Stage::UfsSubmit,
+        Stage::UfsAdmit,
+        Stage::UfsWake,
+        Stage::UfsObserved,
         Stage::StripeLockAcquired,
         Stage::StripeLockReleased,
         Stage::DlmGuardAcquired,
@@ -375,6 +393,10 @@ impl Stage {
             Stage::IpcSqEnter => "ipc_sq_enter",
             Stage::IpcCqe => "ipc_cqe",
             Stage::IpcComplete => "ipc_complete",
+            Stage::UfsSubmit => "ufs_submit",
+            Stage::UfsAdmit => "ufs_admit",
+            Stage::UfsWake => "ufs_wake",
+            Stage::UfsObserved => "ufs_observed",
             Stage::StripeLockAcquired => "stripe_lock_acquired",
             Stage::StripeLockReleased => "stripe_lock_released",
             Stage::DlmGuardAcquired => "dlm_guard_acquired",

@@ -10836,6 +10836,13 @@ impl SqueezefsFilesystem {
                 // == passes, exact) and the full-save decision ledger.
                 "publish_phase_ns": publish_phase_json(),
                 "meta_txpass_phase_ns": meta_txpass_phase_json(),
+                // The journal ring write's completion-hop decomposition
+                // (e2e audit C-2): `journal_ring_write` split at the two
+                // thread boundaries a pooled submission crosses —
+                // queue_hop (submit → worker admit) / device (admit → CQE
+                // reaped + wake sent) / wake_hop (sent → the durability
+                // lane observed it) / total. ALWAYS-ON, exact-sum.
+                "uring_fs_write_phase_ns": crate::uring_fs::uring_fs_write_phase_json(),
                 "publish_base_dirty_serves": METRICS.publish_base_dirty_serves.load(Ordering::Relaxed),
                 "publish_base_fetches": METRICS.publish_base_fetches.load(Ordering::Relaxed),
                 "publish_base_ram_serves": METRICS.publish_base_ram_serves.load(Ordering::Relaxed),

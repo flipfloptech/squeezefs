@@ -70,11 +70,41 @@ fn fd_cache_cap() -> usize {
     *CAP
 }
 
+/// A write's terminal outcome plus the two worker-side instants the
+/// completion-hop decomposition reads (`uring_fs_write_phase_ns`, e2e
+/// audit C-2): the payload rides the oneshot the request already
+/// allocates, so the stamps cost no allocation and no extra channel.
+pub struct WriteOutcome {
+    pub result: Result<()>,
+    /// The worker took the request off the queue and pushed its SQE(s)
+    /// (the queue hop's end / the device span's start). For an outcome
+    /// decided at admission (fault shim, open failure) this equals
+    /// `woken_at`.
+    pub admitted_at: std::time::Instant,
+    /// The worker reaped the request's (last) CQE and sent this outcome —
+    /// the completion's wake fired (the device span's end / the wake
+    /// hop's start).
+    pub woken_at: std::time::Instant,
+}
+
+type WriteTx = oneshot::Sender<WriteOutcome>;
+
+/// Send a write outcome decided NOW (no worker admission/reap happened:
+/// fault-shim refusals, open failures, fallback-path completions).
+fn send_now(tx: WriteTx, result: Result<()>) {
+    let now = std::time::Instant::now();
+    let _ = tx.send(WriteOutcome {
+        result,
+        admitted_at: now,
+        woken_at: now,
+    });
+}
+
 enum FsReq {
     WriteAll {
         path: PathBuf,
         data: bytes::Bytes,
-        tx: oneshot::Sender<Result<()>>,
+        tx: WriteTx,
     },
     ReadAll {
         path: PathBuf,
@@ -90,14 +120,14 @@ enum FsReq {
         path: PathBuf,
         offset: u64,
         data: bytes::Bytes,
-        tx: oneshot::Sender<Result<()>>,
+        tx: WriteTx,
     },
     /// One logical commit: every `(offset, bytes)` lands (unordered between
     /// entries) before the single completion fires.
     WriteAtBatch {
         path: PathBuf,
         ops: Vec<(u64, bytes::Bytes)>,
-        tx: oneshot::Sender<Result<()>>,
+        tx: WriteTx,
     },
     Fdatasync {
         path: PathBuf,
@@ -205,7 +235,7 @@ pub async fn write_all(path: impl AsRef<Path>, data: impl Into<bytes::Bytes>) ->
             tx,
         })
         .map_err(queue_full_err)?;
-    rx.await.map_err(worker_closed_err)?
+    rx.await.map_err(worker_closed_err)?.result
 }
 
 /// Read entire file via the process io_uring file worker.
@@ -265,7 +295,107 @@ pub async fn write_at(
             tx,
         })
         .map_err(queue_full_err)?;
-    rx.await.map_err(worker_closed_err)?
+    rx.await.map_err(worker_closed_err)?.result
+}
+
+// ---------------------------------------------------------------------------
+// The write completion-hop decomposition (`uring_fs_write_phase_ns`, e2e
+// audit C-2 — `docs/design-e2e-perf-audit.md` §3 DLM board #3).
+//
+// D-2 isolated the journal ring write's round trip as THE term on the
+// co-located fleet: a ~1 KiB page-cache write reading 1.0–1.3 ms MEAN with
+// a 50–200 µs MODE (`meta_txpass_phase_ns.journal_ring_write`). That span
+// is `submit → observed`; this family splits it at the two thread
+// boundaries a pooled submission crosses, exact-sum, always-on, zero
+// allocation (the stamps ride the request's own oneshot payload):
+//
+//   queue_hop : submit (the caller's queue push) → the worker admitted it
+//               (popped + SQEs pushed) — the caller→worker wake + queue
+//               residence;
+//   device    : admitted → the worker reaped its last CQE and sent the
+//               outcome — the kernel write (an io-wq punt for a buffered
+//               block-device write) + the worker's own wake out of the
+//               ring wait;
+//   wake_hop  : outcome sent → the awaiting task OBSERVED it — the
+//               oneshot's waker → the task's lane queue → that lane
+//               thread's dispatch (the run-queue hop the finding names);
+//   total     : submit → observed (≡ `journal_ring_write` on the conveyor).
+// ---------------------------------------------------------------------------
+
+/// Phases of [`uring_fs_write_phase_json`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(usize)]
+pub enum UringFsWritePhase {
+    QueueHop = 0,
+    Device = 1,
+    WakeHop = 2,
+    Total = 3,
+}
+
+const URING_FS_WRITE_PHASES: usize = 4;
+const URING_FS_WRITE_PHASE_NAMES: [&str; URING_FS_WRITE_PHASES] =
+    ["queue_hop", "device", "wake_hop", "total"];
+
+static URING_FS_WRITE_PROF: Lazy<[crate::fuse_client::LatencyHistogram; URING_FS_WRITE_PHASES]> =
+    Lazy::new(|| std::array::from_fn(|_| crate::fuse_client::LatencyHistogram::default()));
+
+/// `uring_fs_write_phase_ns` stats payload — surfaced UNGATED.
+pub fn uring_fs_write_phase_json() -> serde_json::Value {
+    let mut phases = serde_json::Map::new();
+    for (pi, pname) in URING_FS_WRITE_PHASE_NAMES.iter().enumerate() {
+        phases.insert((*pname).to_string(), URING_FS_WRITE_PROF[pi].to_json());
+    }
+    serde_json::Value::Object(phases)
+}
+
+/// Exact `(sum_ns, count)` of one phase (the in-process harness's
+/// instrument; the stats inode carries the same words as JSON).
+pub fn uring_fs_write_phase_totals(phase: UringFsWritePhase) -> (u64, u64) {
+    let h = &URING_FS_WRITE_PROF[phase as usize];
+    (h.sum_ns(), h.count())
+}
+
+/// The four instants of one submitted write, retained by
+/// [`WriteCompletion`] once the outcome is observed (the op-trace stamps
+/// `ufs_submit` / `ufs_admit` / `ufs_wake` / `ufs_observed`).
+#[derive(Debug, Clone, Copy)]
+pub struct WriteStamps {
+    pub submitted_at: std::time::Instant,
+    pub admitted_at: std::time::Instant,
+    pub woken_at: std::time::Instant,
+    pub observed_at: std::time::Instant,
+}
+
+impl WriteStamps {
+    /// Stamp the four instants onto every traced member of `traced`.
+    pub fn stamp(&self, traced: &crate::op_trace::TracedBatch) {
+        traced.stamp(crate::op_trace::Stage::UfsSubmit, self.submitted_at);
+        traced.stamp(crate::op_trace::Stage::UfsAdmit, self.admitted_at);
+        traced.stamp(crate::op_trace::Stage::UfsWake, self.woken_at);
+        traced.stamp(crate::op_trace::Stage::UfsObserved, self.observed_at);
+    }
+}
+
+/// Record one observed completion's decomposition. `submitted_at` is
+/// the caller's queue push; the outcome carries the worker's two instants;
+/// `observed_at` is read HERE — the one clock read the observer pays.
+fn record_write_hops(submitted_at: std::time::Instant, out: &WriteOutcome) -> WriteStamps {
+    let observed_at = std::time::Instant::now();
+    let prof = &*URING_FS_WRITE_PROF;
+    prof[UringFsWritePhase::QueueHop as usize]
+        .record(out.admitted_at.saturating_duration_since(submitted_at));
+    prof[UringFsWritePhase::Device as usize]
+        .record(out.woken_at.saturating_duration_since(out.admitted_at));
+    prof[UringFsWritePhase::WakeHop as usize]
+        .record(observed_at.saturating_duration_since(out.woken_at));
+    prof[UringFsWritePhase::Total as usize]
+        .record(observed_at.saturating_duration_since(submitted_at));
+    WriteStamps {
+        submitted_at,
+        admitted_at: out.admitted_at,
+        woken_at: out.woken_at,
+        observed_at,
+    }
 }
 
 /// A write handed to the worker pool whose completion has not been
@@ -275,13 +405,22 @@ pub async fn write_at(
 /// awaits it — the device's completion latency never sits inside the
 /// serialized apply server (D-2, e2e audit DLM #2).
 pub struct WriteCompletion {
-    rx: oneshot::Receiver<Result<()>>,
-    /// The outcome once observed by [`Self::poll_done`], so a completion
-    /// probed non-blockingly is never lost before [`Self::wait`].
-    done: Option<Result<()>>,
+    rx: oneshot::Receiver<WriteOutcome>,
+    /// The caller's queue push (`ufs_submit`).
+    submitted_at: std::time::Instant,
+    /// The outcome once observed (by [`Self::poll_done`] or the await),
+    /// so a completion probed non-blockingly is never lost before
+    /// [`Self::wait`]; the decomposition is recorded at that first
+    /// observation.
+    done: Option<(Result<()>, WriteStamps)>,
 }
 
 impl WriteCompletion {
+    fn observe(&mut self, out: WriteOutcome) {
+        let stamps = record_write_hops(self.submitted_at, &out);
+        self.done = Some((out.result, stamps));
+    }
+
     /// Non-blocking probe: `true` once the write has completed (its
     /// outcome is retained for [`Self::wait`]).
     pub fn poll_done(&mut self) -> bool {
@@ -290,23 +429,50 @@ impl WriteCompletion {
         }
         match self.rx.try_recv() {
             Ok(out) => {
-                self.done = Some(out);
+                self.observe(out);
                 true
             }
             Err(oneshot::TryRecvError::Closed) => {
-                self.done = Some(Err(worker_closed_err("completion sender dropped")));
+                let now = std::time::Instant::now();
+                self.observe(WriteOutcome {
+                    result: Err(worker_closed_err("completion sender dropped")),
+                    admitted_at: now,
+                    woken_at: now,
+                });
                 true
             }
             Err(oneshot::TryRecvError::Empty) => false,
         }
     }
 
+    /// The submission instant.
+    pub fn submitted_at(&self) -> std::time::Instant {
+        self.submitted_at
+    }
+
     /// Await the write's outcome.
-    pub async fn wait(mut self) -> Result<()> {
-        if let Some(out) = self.done.take() {
-            return out;
+    pub async fn wait(self) -> Result<()> {
+        self.wait_stamped().await.0
+    }
+
+    /// Await the write's outcome and hand back its four instants (the
+    /// conveyor's durability lane stamps them onto its traced members).
+    pub async fn wait_stamped(mut self) -> (Result<()>, WriteStamps) {
+        if let Some(done) = self.done.take() {
+            return done;
         }
-        self.rx.await.map_err(worker_closed_err)?
+        match (&mut self.rx).await {
+            Ok(out) => self.observe(out),
+            Err(e) => {
+                let now = std::time::Instant::now();
+                self.observe(WriteOutcome {
+                    result: Err(worker_closed_err(e)),
+                    admitted_at: now,
+                    woken_at: now,
+                });
+            }
+        }
+        self.done.take().expect("observed above")
     }
 }
 
@@ -320,11 +486,16 @@ pub fn submit_write_at_batch(
     ops: Vec<(u64, bytes::Bytes)>,
 ) -> Result<WriteCompletion> {
     let (tx, rx) = oneshot::channel();
+    let submitted_at = std::time::Instant::now();
     let mut ops = ops;
     let req = match ops.len() {
         0 => {
-            let _ = tx.send(Ok(()));
-            return Ok(WriteCompletion { rx, done: None });
+            send_now(tx, Ok(()));
+            return Ok(WriteCompletion {
+                rx,
+                submitted_at,
+                done: None,
+            });
         }
         // A single op rides the single-op request (the shape it always
         // had — the worker's one-slot path, and the fault shim's single-
@@ -345,7 +516,11 @@ pub fn submit_write_at_batch(
         },
     };
     URING_FS.sender().try_send(req).map_err(queue_full_err)?;
-    Ok(WriteCompletion { rx, done: None })
+    Ok(WriteCompletion {
+        rx,
+        submitted_at,
+        done: None,
+    })
 }
 
 /// [`submit_write_at_batch`] + await: the call completes when every entry
@@ -428,7 +603,7 @@ struct FaultState {
     barrier_errors: std::collections::HashMap<PathBuf, i32>,
     /// Barrier stalls ([`arm_barrier_stall`]): per path, the barriers held
     /// in flight.
-    barrier_stalls: std::collections::HashMap<PathBuf, HeldOps>,
+    barrier_stalls: std::collections::HashMap<PathBuf, HeldOps<oneshot::Sender<Result<()>>>>,
     /// Write stalls ([`arm_write_stall`]): per path, the range that parks
     /// and the writes held there.
     write_stalls: std::collections::HashMap<PathBuf, WriteStall>,
@@ -534,29 +709,28 @@ fn latency_lane_push(due: std::time::Instant, req: FsReq) {
 }
 
 /// Operations parked by a stall, plus the arrival tap a test awaits.
-struct HeldOps {
+struct HeldOps<T> {
     arrived: squeezefs_ipc::sqz_channel::mpsc::UnboundedSender<()>,
-    held: Vec<HeldOp>,
+    held: Vec<T>,
 }
 
-/// One parked operation, resumable verbatim.
-enum HeldOp {
-    Fdatasync(oneshot::Sender<Result<()>>),
+/// One parked write, resumable verbatim.
+enum HeldWrite {
     WriteAt {
         offset: u64,
         data: bytes::Bytes,
-        tx: oneshot::Sender<Result<()>>,
+        tx: WriteTx,
     },
     WriteAtBatch {
         ops: Vec<(u64, bytes::Bytes)>,
-        tx: oneshot::Sender<Result<()>>,
+        tx: WriteTx,
     },
 }
 
 /// An armed write stall: the byte range that parks and its held ops.
 struct WriteStall {
     range: (u64, u64),
-    ops: HeldOps,
+    ops: HeldOps<HeldWrite>,
 }
 
 static FAULT_STATE: Lazy<std::sync::Mutex<FaultState>> =
@@ -645,10 +819,6 @@ pub fn release_barrier_stall(path: impl AsRef<Path>) {
         None => return,
     };
     for tx in held {
-        let tx = match tx {
-            HeldOp::Fdatasync(tx) => tx,
-            HeldOp::WriteAt { tx, .. } | HeldOp::WriteAtBatch { tx, .. } => tx,
-        };
         let _ = URING_FS.sender().try_send(FsReq::Fdatasync {
             path: path.as_ref().to_path_buf(),
             tx,
@@ -699,7 +869,7 @@ pub fn release_write_stall(path: impl AsRef<Path>) {
     };
     for op in held {
         match op {
-            HeldOp::WriteAt { offset, data, tx } => {
+            HeldWrite::WriteAt { offset, data, tx } => {
                 let _ = URING_FS.sender().try_send(FsReq::WriteAt {
                     path: path.as_ref().to_path_buf(),
                     offset,
@@ -707,14 +877,13 @@ pub fn release_write_stall(path: impl AsRef<Path>) {
                     tx,
                 });
             }
-            HeldOp::WriteAtBatch { ops, tx } => {
+            HeldWrite::WriteAtBatch { ops, tx } => {
                 let _ = URING_FS.sender().try_send(FsReq::WriteAtBatch {
                     path: path.as_ref().to_path_buf(),
                     ops,
                     tx,
                 });
             }
-            HeldOp::Fdatasync(_) => {}
         }
     }
 }
@@ -897,8 +1066,8 @@ fn fault_intercept(req: FsReq) -> Option<FsReq> {
             match req {
                 FsReq::WriteAll { tx, .. }
                 | FsReq::WriteAt { tx, .. }
-                | FsReq::WriteAtBatch { tx, .. }
-                | FsReq::Fdatasync { tx, .. } => {
+                | FsReq::WriteAtBatch { tx, .. } => send_now(tx, Err(err())),
+                FsReq::Fdatasync { tx, .. } => {
                     let _ = tx.send(Err(err()));
                 }
                 FsReq::ReadAll { tx, .. } | FsReq::ReadAt { tx, .. } => {
@@ -937,7 +1106,7 @@ fn fault_intercept(req: FsReq) -> Option<FsReq> {
             tx,
         } => {
             if sector_error_hits(offset, data.len()) {
-                let _ = tx.send(Err(fault_eio("persistent sector write error")));
+                send_now(tx, Err(fault_eio("persistent sector write error")));
                 return None;
             }
             if let Some(keep) = tear_hits(offset, data.len()) {
@@ -946,7 +1115,7 @@ fn fault_intercept(req: FsReq) -> Option<FsReq> {
                     .offset
                     .store(u64::MAX, std::sync::atomic::Ordering::Relaxed);
                 st.poisoned.insert(path);
-                let _ = tx.send(Err(fault_eio("write torn mid-sector, device died")));
+                send_now(tx, Err(fault_eio("write torn mid-sector, device died")));
                 return None;
             }
             // Write stall: park the whole request (nothing lands) until
@@ -955,7 +1124,7 @@ fn fault_intercept(req: FsReq) -> Option<FsReq> {
                 let (lo, hi) = stall.range;
                 if offset < hi && offset + data.len() as u64 > lo {
                     let _ = stall.ops.arrived.send(());
-                    stall.ops.held.push(HeldOp::WriteAt { offset, data, tx });
+                    stall.ops.held.push(HeldWrite::WriteAt { offset, data, tx });
                     return None;
                 }
             }
@@ -974,7 +1143,7 @@ fn fault_intercept(req: FsReq) -> Option<FsReq> {
             if ops.iter().any(|(off, d)| sector_error_hits(*off, d.len())) {
                 // The whole logical commit fails loudly (batch semantics);
                 // nothing is written, the fault stays armed.
-                let _ = tx.send(Err(fault_eio("persistent sector write error in batch")));
+                send_now(tx, Err(fault_eio("persistent sector write error in batch")));
                 return None;
             }
             let torn_at = ops
@@ -994,7 +1163,10 @@ fn fault_intercept(req: FsReq) -> Option<FsReq> {
                     .offset
                     .store(u64::MAX, std::sync::atomic::Ordering::Relaxed);
                 st.poisoned.insert(path);
-                let _ = tx.send(Err(fault_eio("batch write torn mid-sector, device died")));
+                send_now(
+                    tx,
+                    Err(fault_eio("batch write torn mid-sector, device died")),
+                );
                 return None;
             }
             // Write stall: a batch is held WHOLE if any op intersects the
@@ -1006,7 +1178,7 @@ fn fault_intercept(req: FsReq) -> Option<FsReq> {
                     .any(|(off, d)| *off < hi && *off + d.len() as u64 > lo)
                 {
                     let _ = stall.ops.arrived.send(());
-                    stall.ops.held.push(HeldOp::WriteAtBatch { ops, tx });
+                    stall.ops.held.push(HeldWrite::WriteAtBatch { ops, tx });
                     return None;
                 }
             }
@@ -1043,7 +1215,7 @@ fn fault_intercept(req: FsReq) -> Option<FsReq> {
             // volatile — the DUR-3 window, exactly.
             if let Some(stall) = st.barrier_stalls.get_mut(&path) {
                 let _ = stall.arrived.send(());
-                stall.held.push(HeldOp::Fdatasync(tx));
+                stall.held.push(tx);
                 return None;
             }
             Some(FsReq::Fdatasync { path, tx })
@@ -1053,23 +1225,34 @@ fn fault_intercept(req: FsReq) -> Option<FsReq> {
 }
 
 /// Completion sink: single ops answer their own oneshot; batch entries share
-/// an aggregate that fires once when the last entry lands.
+/// an aggregate that fires once when the last entry lands. Both carry the
+/// request's admission instant for the outcome's stamps.
 enum UnitDone {
-    Single(oneshot::Sender<Result<()>>),
+    Single {
+        tx: WriteTx,
+        admitted_at: std::time::Instant,
+    },
     Batch(Rc<std::cell::RefCell<BatchState>>),
 }
 
 struct BatchState {
     remaining: usize,
     first_err: Option<SqueezefsError>,
-    tx: Option<oneshot::Sender<Result<()>>>,
+    tx: Option<WriteTx>,
+    admitted_at: std::time::Instant,
 }
 
 impl UnitDone {
-    fn complete(self, res: Result<()>) {
+    /// `now` is the reap instant of the CQE that decided `res` (one clock
+    /// read per reap pass, shared by every completion it delivers).
+    fn complete(self, res: Result<()>, now: std::time::Instant) {
         match self {
-            UnitDone::Single(tx) => {
-                let _ = tx.send(res);
+            UnitDone::Single { tx, admitted_at } => {
+                let _ = tx.send(WriteOutcome {
+                    result: res,
+                    admitted_at,
+                    woken_at: now,
+                });
             }
             UnitDone::Batch(state) => {
                 let mut st = state.borrow_mut();
@@ -1081,9 +1264,13 @@ impl UnitDone {
                 st.remaining -= 1;
                 if st.remaining == 0 {
                     if let Some(tx) = st.tx.take() {
-                        let _ = tx.send(match st.first_err.take() {
-                            Some(e) => Err(e),
-                            None => Ok(()),
+                        let _ = tx.send(WriteOutcome {
+                            result: match st.first_err.take() {
+                                Some(e) => Err(e),
+                                None => Ok(()),
+                            },
+                            admitted_at: st.admitted_at,
+                            woken_at: now,
                         });
                     }
                 }
@@ -1277,7 +1464,7 @@ impl Reactor {
                 Pending::Read { tx, .. } => {
                     let _ = tx.send(Err(err()));
                 }
-                Pending::Write { done, .. } => done.complete(Err(err())),
+                Pending::Write { done, .. } => done.complete(Err(err()), std::time::Instant::now()),
                 Pending::Fsync { tx, .. } => {
                     let _ = tx.send(Err(err()));
                 }
@@ -1288,6 +1475,10 @@ impl Reactor {
     /// Admit one request: do the (rare, blocking) opens inline, then queue
     /// its first SQE(s).
     fn admit(&mut self, req: FsReq) {
+        // `ufs_admit`: one clock read per admitted request (the queue
+        // hop's end); read before the open so a cold fd-cache miss counts
+        // against the device span, not the queue.
+        let admitted_at = std::time::Instant::now();
         // Fault-injection shim (§4.7a): one relaxed load when disarmed.
         let req = if FAULTS_ACTIVE.load(std::sync::atomic::Ordering::Relaxed) {
             match fault_intercept(req) {
@@ -1324,13 +1515,11 @@ impl Reactor {
                             data,
                             file_offset: 0,
                             written: 0,
-                            done: UnitDone::Single(tx),
+                            done: UnitDone::Single { tx, admitted_at },
                         });
                         self.push_slot(i);
                     }
-                    Err(e) => {
-                        let _ = tx.send(Err(e));
-                    }
+                    Err(e) => send_now(tx, Err(e)),
                 }
             }
             FsReq::ReadAll { path, tx } => {
@@ -1400,7 +1589,7 @@ impl Reactor {
             } => match cached_open(&mut self.cache, &path, true) {
                 Ok(file) => {
                     if data.is_empty() {
-                        let _ = tx.send(Ok(()));
+                        send_now(tx, Ok(()));
                         return;
                     }
                     let i = self.claim_slot(Pending::Write {
@@ -1408,13 +1597,11 @@ impl Reactor {
                         data,
                         file_offset: offset,
                         written: 0,
-                        done: UnitDone::Single(tx),
+                        done: UnitDone::Single { tx, admitted_at },
                     });
                     self.push_slot(i);
                 }
-                Err(e) => {
-                    let _ = tx.send(Err(e));
-                }
+                Err(e) => send_now(tx, Err(e)),
             },
             FsReq::WriteAtBatch { path, ops, tx } => {
                 match cached_open(&mut self.cache, &path, true) {
@@ -1422,13 +1609,14 @@ impl Reactor {
                         let entries: Vec<(u64, bytes::Bytes)> =
                             ops.into_iter().filter(|(_, d)| !d.is_empty()).collect();
                         if entries.is_empty() {
-                            let _ = tx.send(Ok(()));
+                            send_now(tx, Ok(()));
                             return;
                         }
                         let state = Rc::new(std::cell::RefCell::new(BatchState {
                             remaining: entries.len(),
                             first_err: None,
                             tx: Some(tx),
+                            admitted_at,
                         }));
                         for (offset, data) in entries {
                             let i = self.claim_slot(Pending::Write {
@@ -1441,9 +1629,7 @@ impl Reactor {
                             self.push_slot(i);
                         }
                     }
-                    Err(e) => {
-                        let _ = tx.send(Err(e));
-                    }
+                    Err(e) => send_now(tx, Err(e)),
                 }
             }
             FsReq::Fdatasync { path, tx } => match cached_open(&mut self.cache, &path, false) {
@@ -1460,7 +1646,9 @@ impl Reactor {
 
     /// Advance slot `i` with its completion result; returns `true` if the
     /// slot needs its next SQE pushed (short read/write continuation).
-    fn advance(&mut self, i: usize, res: i32) -> bool {
+    /// `now` is the reap pass's clock read (`ufs_wake` for the outcomes
+    /// it delivers).
+    fn advance(&mut self, i: usize, res: i32, now: std::time::Instant) -> bool {
         enum Next {
             Done,
             Resubmit,
@@ -1518,14 +1706,20 @@ impl Reactor {
                     }
                     Pending::Write { done, .. } => {
                         if res < 0 {
-                            done.complete(Err(map_io(std::io::Error::from_raw_os_error(-res))));
+                            done.complete(
+                                Err(map_io(std::io::Error::from_raw_os_error(-res))),
+                                now,
+                            );
                         } else if res == 0 {
-                            done.complete(Err(map_io(std::io::Error::new(
-                                std::io::ErrorKind::WriteZero,
-                                "uring write returned 0",
-                            ))));
+                            done.complete(
+                                Err(map_io(std::io::Error::new(
+                                    std::io::ErrorKind::WriteZero,
+                                    "uring write returned 0",
+                                ))),
+                                now,
+                            );
                         } else {
-                            done.complete(Ok(()));
+                            done.complete(Ok(()), now);
                         }
                     }
                     Pending::Fsync { tx, .. } => {
@@ -1586,6 +1780,7 @@ fn worker_loop(rx: crossbeam::channel::Receiver<FsReq>) {
                 // Ring is broken: fail every in-flight op loudly and drop to
                 // the blocking fallback for the rest of the process lifetime.
                 log::error!("uring-fs: submit_and_wait failed: {e:?}");
+                let now = std::time::Instant::now();
                 for i in 0..r.slots.len() {
                     if r.slots[i].is_some() {
                         let p = r.release_slot(i);
@@ -1594,7 +1789,7 @@ fn worker_loop(rx: crossbeam::channel::Receiver<FsReq>) {
                             Pending::Read { tx, .. } => {
                                 let _ = tx.send(Err(err()));
                             }
-                            Pending::Write { done, .. } => done.complete(Err(err())),
+                            Pending::Write { done, .. } => done.complete(Err(err()), now),
                             Pending::Fsync { tx, .. } => {
                                 let _ = tx.send(Err(err()));
                             }
@@ -1608,6 +1803,8 @@ fn worker_loop(rx: crossbeam::channel::Receiver<FsReq>) {
 
         // Reap all available completions; push continuations after the CQ
         // borrow ends (each continuation reuses a just-reaped SQ slot).
+        // ONE clock read per reap pass stamps `ufs_wake` on every outcome
+        // it delivers.
         let mut resubmit: Vec<usize> = Vec::new();
         {
             let mut cq = r.ring.completion();
@@ -1616,8 +1813,9 @@ fn worker_loop(rx: crossbeam::channel::Receiver<FsReq>) {
                 .map(|cqe| (cqe.user_data() as usize, cqe.result()))
                 .collect();
             drop(cq);
+            let now = std::time::Instant::now();
             for (slot, res) in completed {
-                if r.advance(slot, res) {
+                if r.advance(slot, res, now) {
                     resubmit.push(slot);
                 }
             }
@@ -1647,7 +1845,7 @@ impl Reactor {
                 Pending::Read { tx, .. } => {
                     let _ = tx.send(Err(err()));
                 }
-                Pending::Write { done, .. } => done.complete(Err(err())),
+                Pending::Write { done, .. } => done.complete(Err(err()), std::time::Instant::now()),
                 Pending::Fsync { tx, .. } => {
                     let _ = tx.send(Err(err()));
                 }
@@ -1679,7 +1877,7 @@ fn blocking_fallback_loop(rx: crossbeam::channel::Receiver<FsReq>) {
                     }
                     std::fs::write(&path, &data)
                 })();
-                let _ = tx.send(res.map_err(map_io));
+                send_now(tx, res.map_err(map_io));
             }
             FsReq::ReadAll { path, tx } => {
                 let _ = tx.send(std::fs::read(&path).map(bytes::Bytes::from).map_err(map_io));
@@ -1723,7 +1921,7 @@ fn blocking_fallback_loop(rx: crossbeam::channel::Receiver<FsReq>) {
                     .open(&path)
                     .and_then(|f| f.write_all_at(&data, offset))
                     .map_err(map_io);
-                let _ = tx.send(res);
+                send_now(tx, res);
             }
             FsReq::WriteAtBatch { path, ops, tx } => {
                 let res = OpenOptions::new()
@@ -1739,7 +1937,7 @@ fn blocking_fallback_loop(rx: crossbeam::channel::Receiver<FsReq>) {
                         Ok(())
                     })
                     .map_err(map_io);
-                let _ = tx.send(res);
+                send_now(tx, res);
             }
             FsReq::Fdatasync { path, tx } => {
                 let res = OpenOptions::new()

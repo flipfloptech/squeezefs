@@ -909,10 +909,10 @@ impl JournalRing {
         }
         let completion = crate::uring_fs::submit_write_at_batch(&self.path, ops)?;
         Ok(EntriesWriteInFlight {
+            submitted_at: completion.submitted_at(),
             completion,
             entries: parts.len() as u64,
             bytes: parts.iter().map(|(r, _)| r.len).sum(),
-            submitted_at: std::time::Instant::now(),
         })
     }
 
@@ -964,10 +964,18 @@ impl EntriesWriteInFlight {
     }
 
     /// Await the write; on success, account the landed entries against
-    /// `ring` (the ring that issued the submission).
-    pub async fn finish(self, ring: &JournalRing) -> Result<(), KvError> {
+    /// `ring` (the ring that issued the submission). The completion's four
+    /// hop instants (`ufs_submit` … `ufs_observed`) are stamped onto the
+    /// window's traced members.
+    pub async fn finish(
+        self,
+        ring: &JournalRing,
+        traced: &crate::op_trace::TracedBatch,
+    ) -> Result<(), KvError> {
         let (entries, bytes) = (self.entries, self.bytes);
-        self.completion.wait().await?;
+        let (out, stamps) = self.completion.wait_stamped().await;
+        stamps.stamp(traced);
+        out?;
         ring.note_entries_written(entries, bytes);
         Ok(())
     }

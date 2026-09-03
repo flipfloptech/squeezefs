@@ -40,13 +40,13 @@ pub use raw::{
     over_uring_classical_sideband, over_uring_commit_batch_stats, over_uring_geometry,
     over_uring_negotiated_write, over_uring_sessions_active, over_uring_stats,
     retention_negotiated, transport_cq_overflow_stats, transport_lease_stats,
-    transport_park_backstop_ticks, transport_reply_integrity_stats, transport_wake_stats,
-    zc_bridge_cancels, zc_bridge_lost, zc_bridge_orphans, zc_fallbacks, zc_negotiated,
-    zc_read_fusion_demotions, zc_read_fusions, zc_release_failures, zc_releases, zc_replies,
-    zc_retain_commits, zc_retain_refused, zc_retained_outstanding, zc_slot_payload_skips,
-    zc_write_direct_bytes, zc_write_directs, zc_write_extract_bytes, zc_write_extractions,
-    zc_write_fusion_bytes, zc_write_fusion_demotions, zc_write_fusions, zc_write_lazy_extractions,
-    zc_write_store_qid_census, COMMIT_BATCH_LABELS,
+    transport_park_backstop_ticks, transport_reply_integrity_stats, transport_spin_stats,
+    transport_wake_stats, zc_bridge_cancels, zc_bridge_lost, zc_bridge_orphans, zc_fallbacks,
+    zc_negotiated, zc_read_fusion_demotions, zc_read_fusions, zc_release_failures, zc_releases,
+    zc_replies, zc_retain_commits, zc_retain_refused, zc_retained_outstanding,
+    zc_slot_payload_skips, zc_write_direct_bytes, zc_write_directs, zc_write_extract_bytes,
+    zc_write_extractions, zc_write_fusion_bytes, zc_write_fusion_demotions, zc_write_fusions,
+    zc_write_lazy_extractions, zc_write_store_qid_census, COMMIT_BATCH_LABELS,
 };
 pub use raw::{
     fused_midpass_reaps, fused_passbottom_reaps, fused_timeline_snapshot, pin_scope_from_env,
@@ -93,6 +93,12 @@ pub mod latency_core;
 // (the SPSC ring is a lock-free core).
 #[path = "../../squeezefs-ipc/src/op_trace_core.rs"]
 pub mod op_trace_core;
+// Adaptive spin governor core (R-4 reap-thread economy) — canonical
+// file in the squeezefs-ipc tree, `#[path]`-included here (the queue
+// worker's park-or-spin decision) and by the root crate (the ipc service
+// lanes): one park-EWMA fold, one box-headroom gauge, one ceiling law.
+#[path = "../../squeezefs-ipc/src/spin_governor_core.rs"]
+pub mod spin_governor_core;
 pub use raw::op_trace;
 // The ONE env-knob parsing convention (ENG-10) — canonical file in the
 // squeezefs-ipc tree, `#[path]`-included here (this fork cannot depend on

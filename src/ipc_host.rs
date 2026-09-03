@@ -121,27 +121,6 @@ fn service_spin_window() -> Option<Duration> {
     service_spin_window_from(std::env::var("SQUEEZEFS_IPC_SPIN_US").ok().as_deref())
 }
 
-/// One `/proc/stat` aggregate reading for the spin governor's headroom
-/// gauge: `(busy_jiffies, total_jiffies)` over the whole box (busy =
-/// total − idle − iowait). Cadence-gated by the gauge (≤ 10 reads/s
-/// across all lanes); None on any parse surprise (the gauge keeps its
-/// last honest percent).
-fn read_proc_stat_busy() -> Option<(u64, u64)> {
-    let stat = std::fs::read_to_string("/proc/stat").ok()?;
-    let line = stat.lines().next()?;
-    let mut fields = line.split_whitespace();
-    if fields.next()? != "cpu" {
-        return None;
-    }
-    let vals: Vec<u64> = fields.take(8).filter_map(|f| f.parse().ok()).collect();
-    if vals.len() < 5 {
-        return None;
-    }
-    let total: u64 = vals.iter().sum();
-    let idle = vals[3] + vals.get(4).copied().unwrap_or(0);
-    Some((total.saturating_sub(idle), total))
-}
-
 /// The message the daemon logs exactly once when the KD-7 skew gate has
 /// been relaxed (ENG-11). Pure so the contract test can assert the text
 /// without arming the lever.
@@ -2996,7 +2975,7 @@ impl IpcHost {
                 None if self.spin_adaptive && !sessions.is_empty() => {
                     let now = crate::mono_core::monotonic_ns_u64();
                     if self.spin_headroom.should_sample(now) {
-                        if let Some((busy, total)) = read_proc_stat_busy() {
+                        if let Some((busy, total)) = crate::spin_governor::read_proc_stat_busy() {
                             self.spin_headroom.publish(busy, total);
                         }
                     }

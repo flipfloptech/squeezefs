@@ -9898,6 +9898,13 @@ impl SqueezefsFilesystem {
             t_slots_overdue,
             t_replies_oversize,
         ) = (0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64);
+        // R-4 spin-before-park ledger (see the export below).
+        #[cfg(target_os = "linux")]
+        let (t_spin_absorbed, t_spin_expired, t_spin_ns, t_spin_refused_busy, t_spin_window_us) =
+            fuse3::transport_spin_stats();
+        #[cfg(not(target_os = "linux"))]
+        let (t_spin_absorbed, t_spin_expired, t_spin_ns, t_spin_refused_busy, t_spin_window_us) =
+            (0u64, 0u64, 0u64, 0u64, 0u64);
         // FUSE-3f: completion-queue loss. `transport_cq_overflows` is a
         // must-stay-0 tripwire — a dropped CQE is a REGISTER or
         // COMMIT_AND_FETCH completion that never arrives (a stalled ent,
@@ -11039,6 +11046,22 @@ impl SqueezefsFilesystem {
                 // backstop working, never a wedge.
                 "transport_park_backstop_ticks":
                     fuse3::transport_park_backstop_ticks(),
+                // R-4 spin-before-park on the queue workers (module doc
+                // `fuse3::raw::connection::fuse_over_uring::spin`):
+                // `absorbed` = parks the spin deleted (an event caught
+                // inside the window — no sleep, no wake), `expired` =
+                // windows that ran out and parked, `ns` = the CPU the
+                // lever bought with (the cost column of every row that
+                // credits it), `refused_busy` = regime hits the box's
+                // queueing-knee gauge refused, `window_us` = the last
+                // derived window. 0 across the board on an idle mount
+                // (an idle queue never spins) and under
+                // SQUEEZEFS_FUSE_IO_URING_SPIN_US=0.
+                "transport_spin_absorbed": t_spin_absorbed,
+                "transport_spin_expired": t_spin_expired,
+                "transport_spin_ns": t_spin_ns,
+                "transport_spin_refused_busy": t_spin_refused_busy,
+                "transport_spin_window_us": t_spin_window_us,
                 "transport_replies_oversize": t_replies_oversize,
                 // FUSE-3f: see the gather site above.
                 // `transport_cq_overflows` must stay 0.

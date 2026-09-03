@@ -94,8 +94,15 @@ pub mod fused;
 #[path = "fast_dispatch.rs"]
 pub mod fast_dispatch;
 
+/// Spin-before-park on the queue worker (e2e perf audit R-4): the
+/// bounded, derived spin window at the pass bottom + its ledger. Child
+/// of this module like `fused`.
+#[path = "spin.rs"]
+pub mod spin;
+
 use super::kmbuf::{self, KmbufQueue, TransportBufferMode};
 use super::zc::{self, ZcBounce, ZcPend};
+use crate::raw::read_phase::ShardedCounter;
 use crate::raw::request::ReplySlot;
 
 /// `FUSE_OVER_IO_URING` (1ULL<<41) → `flags2` bit 9.
@@ -698,6 +705,18 @@ impl SlotTable {
                 | SlotState::Parked { unique, commit_id } => Some((idx, *unique, *commit_id)),
                 _ => None,
             })
+    }
+
+    /// Does any slot owe a reply (a request is out with a handler)? The
+    /// spin governor's structural regime signal (R-4): such a slot's
+    /// commit message is coming back on a bounded clock. `Replied` slots
+    /// (the kernel owns the ent, the app decides when the next request
+    /// comes) deliberately do not count — an idle queue is all `Replied`.
+    #[inline]
+    pub(crate) fn any_owing(&self) -> bool {
+        self.states
+            .iter()
+            .any(|st| matches!(st, SlotState::Delivered { .. } | SlotState::Parked { .. }))
     }
 }
 
@@ -1535,6 +1554,9 @@ pub struct FuseOverUring {
     /// and READ-handler mint, registered once after INIT. Unregistered
     /// means every READ rides the inbound queue exactly as before.
     read_fast_dispatch: std::sync::OnceLock<fast_dispatch::ReadFastDispatch>,
+    /// The box-headroom gauge the workers' spin decisions read (R-4):
+    /// one `/proc/stat` sample per 100 ms across the pool.
+    spin_headroom: spin::SpinHeadroom,
     /// Ring depth (per queue) — the `slot_watch` stride.
     depth: usize,
     /// §5.3 D3.b: session SQPOLL posture for the queue rings (`None` =
@@ -1567,11 +1589,6 @@ pub struct FuseOverUring {
     /// correspondence; testing queue overrides break it and disable
     /// per-queue placement rather than mis-derive.
     qid_is_cpu: bool,
-    // metrics
-    pub stats_requests: AtomicU64,
-    pub stats_replies: AtomicU64,
-    pub stats_cqe_err: AtomicU64,
-    pub stats_register: AtomicU64,
 }
 
 /// The zc bridge deadline (`SQUEEZEFS_ZC_BRIDGE_TIMEOUT_MS`, default
@@ -1639,16 +1656,28 @@ macro_rules! xport_dbg {
 }
 
 static ACTIVE_SESSIONS: AtomicU64 = AtomicU64::new(0);
-static STATS_REQUESTS: AtomicU64 = AtomicU64::new(0);
-static STATS_REPLIES: AtomicU64 = AtomicU64::new(0);
+// Per-op worker counters ride per-thread shards (R-4 reap-thread
+// economy): every queue worker bumped these process-globals once per
+// delivery / reply / flush — 32 cores RMW'ing the same lines.
+static STATS_REQUESTS: ShardedCounter = ShardedCounter::new();
+static STATS_REPLIES: ShardedCounter = ShardedCounter::new();
 static STATS_CQE_ERR: AtomicU64 = AtomicU64::new(0);
 static STATS_REGISTER: AtomicU64 = AtomicU64::new(0);
 // D3.a (S2) transport submit economy (SqueezeFS metadata-throughput design
 // §5.3): COMMIT_AND_FETCH SQEs per ring flush. ≈ 1 under load means the
-// queue-worker batching regressed to submit-per-message.
-static TRANSPORT_COMMIT_BATCH: CommitBatchHistogram = CommitBatchHistogram::new();
-static TRANSPORT_COMMIT_FLUSHES: AtomicU64 = AtomicU64::new(0);
-static TRANSPORT_COMMITS_SUBMITTED: AtomicU64 = AtomicU64::new(0);
+// queue-worker batching regressed to submit-per-message. One histogram
+// per recording thread (R-4); the export folds them.
+static TRANSPORT_COMMIT_FLUSHES: ShardedCounter = ShardedCounter::new();
+static TRANSPORT_COMMITS_SUBMITTED: ShardedCounter = ShardedCounter::new();
+
+fn commit_batch_shards() -> &'static [CommitBatchHistogram] {
+    static TABLES: OnceLock<Vec<CommitBatchHistogram>> = OnceLock::new();
+    TABLES.get_or_init(|| {
+        (0..crate::raw::read_phase::shard_count())
+            .map(|_| CommitBatchHistogram::new())
+            .collect()
+    })
+}
 
 /// Bucket labels for [`CommitBatchHistogram`] (stats-JSON keys, exported by
 /// [`over_uring_commit_batch_stats`]). Exact for batch sizes 1–8, then
@@ -1720,10 +1749,16 @@ impl CommitBatchHistogram {
 /// `commits / flushes` is the mean batch size; ≈ 1 under storm load means
 /// the queue-worker submit batching regressed (design §9).
 pub fn over_uring_commit_batch_stats() -> (u64, u64, [u64; 11]) {
+    let mut buckets = [0u64; 11];
+    for h in commit_batch_shards() {
+        for (b, v) in buckets.iter_mut().zip(h.snapshot()) {
+            *b += v;
+        }
+    }
     (
-        TRANSPORT_COMMIT_FLUSHES.load(Ordering::Relaxed),
-        TRANSPORT_COMMITS_SUBMITTED.load(Ordering::Relaxed),
-        TRANSPORT_COMMIT_BATCH.snapshot(),
+        TRANSPORT_COMMIT_FLUSHES.load(),
+        TRANSPORT_COMMITS_SUBMITTED.load(),
+        buckets,
     )
 }
 
@@ -1825,9 +1860,10 @@ impl SubmitBatch {
     /// can record `commit_flush` spans after the syscall returns.
     fn note_flush(&mut self) -> (bool, bool) {
         if self.commits > 0 {
-            TRANSPORT_COMMIT_BATCH.record(self.commits as usize);
-            TRANSPORT_COMMIT_FLUSHES.fetch_add(1, Ordering::Relaxed);
-            TRANSPORT_COMMITS_SUBMITTED.fetch_add(self.commits as u64, Ordering::Relaxed);
+            commit_batch_shards()[crate::raw::read_phase::shard_index()]
+                .record(self.commits as usize);
+            TRANSPORT_COMMIT_FLUSHES.add(1);
+            TRANSPORT_COMMITS_SUBMITTED.add(self.commits as u64);
         }
         self.note_bridge_flushed();
         let classes = (self.commit_reads, self.commit_writes);
@@ -2141,20 +2177,22 @@ pub fn transport_reply_integrity_stats() -> (u64, u64, u64, u64, u64, u64, u64) 
 /// protocol is loom-verified under.
 fn drain_wake_eventfd(wake_fd: RawFd) {
     let mut buf = [0u8; 8];
+    // ONE read (R-4): a non-semaphore eventfd read returns the whole
+    // counter and zeroes it atomically, so the retired read-until-EAGAIN
+    // loop's second syscall answered EAGAIN on every drain (2.07
+    // `read(2)`/op on the field kern rand-4k row against 1.01 wakes/op).
+    // A write landing after this read leaves the counter nonzero, which
+    // the level-triggered PollAdd surfaces at the next park — the same
+    // race the loop never closed either (its second read could be
+    // followed by a write just the same).
     loop {
         // SAFETY: an 8-byte read into a local buffer from the queue's
         // eventfd (owned by the pool/arena for the worker's lifetime).
         let n = unsafe { libc::read(wake_fd, buf.as_mut_ptr().cast(), 8) };
-        if n < 0 {
-            let e = io::Error::last_os_error();
-            if e.raw_os_error() == Some(libc::EINTR) {
-                continue;
-            }
-            break;
+        if n < 0 && io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
+            continue;
         }
-        if n == 0 {
-            break;
-        }
+        break;
     }
 }
 
@@ -2313,8 +2351,8 @@ pub fn over_uring_sessions_active() -> u64 {
 /// Cumulative FUSE-over-io_uring counters: (requests, replies, cqe_err, registers).
 pub fn over_uring_stats() -> (u64, u64, u64, u64) {
     (
-        STATS_REQUESTS.load(Ordering::Relaxed),
-        STATS_REPLIES.load(Ordering::Relaxed),
+        STATS_REQUESTS.load(),
+        STATS_REPLIES.load(),
         STATS_CQE_ERR.load(Ordering::Relaxed),
         STATS_REGISTER.load(Ordering::Relaxed),
     )
@@ -2878,6 +2916,7 @@ impl FuseOverUring {
             fused_watches: std::sync::Mutex::new(Vec::new()),
             zc_hold_gate: std::sync::OnceLock::new(),
             read_fast_dispatch: std::sync::OnceLock::new(),
+            spin_headroom: spin::SpinHeadroom::new(),
             fused_dispatch: std::sync::OnceLock::new(),
             depth,
             sqpoll,
@@ -2890,10 +2929,6 @@ impl FuseOverUring {
             buffer_mode,
             retention,
             qid_is_cpu,
-            stats_requests: AtomicU64::new(0),
-            stats_replies: AtomicU64::new(0),
-            stats_cqe_err: AtomicU64::new(0),
-            stats_register: AtomicU64::new(0),
         });
 
         let (err_tx, err_rx) = std::sync::mpsc::sync_channel::<String>(pool.groups.len().max(1));
@@ -3126,6 +3161,7 @@ impl FuseOverUring {
             fused_watches: std::sync::Mutex::new(Vec::new()),
             zc_hold_gate: std::sync::OnceLock::new(),
             read_fast_dispatch: std::sync::OnceLock::new(),
+            spin_headroom: spin::SpinHeadroom::new(),
             fused_dispatch: std::sync::OnceLock::new(),
             depth: Self::SIM_DEPTH,
             sqpoll: None,
@@ -3138,10 +3174,6 @@ impl FuseOverUring {
             buffer_mode: TransportBufferMode::UserEnts,
             retention: false,
             qid_is_cpu: false,
-            stats_requests: AtomicU64::new(0),
-            stats_replies: AtomicU64::new(0),
-            stats_cqe_err: AtomicU64::new(0),
-            stats_register: AtomicU64::new(0),
         });
         // Mirror try_start's session accounting so shutdown's decrement
         // balances (the gauge never underflows in sim processes).
@@ -3261,8 +3293,7 @@ impl FuseOverUring {
         } else {
             TRANSPORT_WAKES_ELIDED.fetch_add(1, Ordering::Relaxed);
         }
-        self.stats_replies.fetch_add(1, Ordering::Relaxed);
-        STATS_REPLIES.fetch_add(1, Ordering::Relaxed);
+        STATS_REPLIES.add(1);
         Ok(())
     }
 
@@ -3594,8 +3625,7 @@ impl FuseOverUring {
         } else {
             TRANSPORT_WAKES_ELIDED.fetch_add(1, Ordering::Relaxed);
         }
-        self.stats_replies.fetch_add(1, Ordering::Relaxed);
-        STATS_REPLIES.fetch_add(1, Ordering::Relaxed);
+        STATS_REPLIES.add(1);
         Ok(())
     }
 
@@ -3963,7 +3993,16 @@ fn build_plain_queue_ring(sq_entries: u32) -> io::Result<Ring> {
                 // The pair (kernel refuses DEFER_TASKRUN without
                 // SINGLE_ISSUER); safe by construction — the worker
                 // thread builds, submits, and reaps this ring alone.
-                builder.setup_single_issuer().setup_defer_taskrun();
+                // TASKRUN_FLAG (R-4): the kernel raises IORING_SQ_TASKRUN
+                // in the shared sq_flags when deferred task work lands,
+                // so the worker's spin-before-park can see a completion
+                // without entering — one acquire load per spin
+                // iteration, no syscall (5.19+, inside DEFER_TASKRUN's
+                // own 6.1 floor).
+                builder
+                    .setup_single_issuer()
+                    .setup_defer_taskrun()
+                    .setup_taskrun_flag();
             }
             builder.build(sq).map_err(|e| {
                 io::Error::other(format!(
@@ -3989,6 +4028,7 @@ fn modern_queue_ring_flags_probed() -> bool {
             .setup_cqsize(8)
             .setup_single_issuer()
             .setup_defer_taskrun()
+            .setup_taskrun_flag()
             .build(4)
             .is_ok();
         info!(
@@ -4632,7 +4672,7 @@ fn queue_worker(
         ent: &mut Ent,
         zc_pend_slot: &mut Option<ZcPend>,
         deadlines: &mut zc::BridgeDeadlines,
-        bridge_gauge: &AtomicU64,
+        pend_delta: &mut i64,
         zc_bounce: Option<&Arc<ZcBounce>>,
         zc_track: Option<kmbuf::KmbufTrack>,
         watch: Option<&SlotWatch>,
@@ -4724,7 +4764,7 @@ fn queue_worker(
                             len: body_len as u32,
                         });
                         if deadlines.stamp(idx, crate::raw::read_phase::transport_now_ns()) {
-                            bridge_gauge.fetch_add(1, Ordering::Relaxed);
+                            *pend_delta += 1;
                         }
                         return Ok(());
                     }
@@ -4988,7 +5028,6 @@ fn queue_worker(
             )
             .map_err(|e| io::Error::other(format!("push REGISTER qid={} ent={idx}: {e}", m.qid)))?;
             m.slots.on_register_submitted(idx);
-            pool.stats_register.fetch_add(1, Ordering::Relaxed);
             STATS_REGISTER.fetch_add(1, Ordering::Relaxed);
         }
     }
@@ -5030,6 +5069,9 @@ fn queue_worker(
     // completion-surfacing enter of this worker — the REGISTER submit
     // above was the first, so the cadence starts here.
     let mut cadence = crate::raw::read_phase::ReapCadence::new();
+    // R-4 spin-before-park: this worker's gap EWMA + the resolved cap
+    // (`SQUEEZEFS_FUSE_IO_URING_SPIN_US`; module doc on `spin`).
+    let mut spin = spin::WorkerSpin::new(spin::spin_cap_ns());
     // Row 7: sticky across passes — see the re-arm site below.
     let mut need_repoll_sticky = false;
     // Mid-pass-reaped CQEs the narrow bridge arm does NOT resolve —
@@ -5037,6 +5079,10 @@ fn queue_worker(
     // post-wait CQ drain (arrival order preserved). Hoisted so passes
     // reuse the allocation.
     let mut deferred_cqes: Vec<(u64, i32, u32)> = Vec::new();
+    // The pass-bottom drain's completion list, reused across passes
+    // (R-4: the per-pass `collect()` was one jemalloc alloc + free per
+    // pass on the worker).
+    let mut completed: Vec<(u64, i32, u32)> = Vec::new();
 
     // R-3 worker economy: the pass-top eventfd drain is 1–2 `read(2)`s
     // per pass (1.8/op measured on the kern rand-4k row, most answering
@@ -5048,6 +5094,28 @@ fn queue_worker(
     // triggered poll completes at the next park, and the following pass
     // drains (`wake_cqe_seen`).
     let mut wake_cqe_seen = true;
+    // R-4: the pool pend gauge is updated ONCE per pass with the pass's
+    // net stamp/clear delta (the steady-state pass stamps one fetch and
+    // clears one — net 0, no RMW at all), instead of two contended
+    // fetch_add/fetch_sub per op on a word every worker shares. The
+    // flush sits before the deadline-scan gate, so every `> 0` gate in
+    // the pass (scan, bounded park) and the watch thread read the exact
+    // count at every park; mid-pass the word may lag by this pass's
+    // delta, which only matters to a PARKED reader — and this worker is
+    // running.
+    let mut pend_delta: i64 = 0;
+    // R-4: the bridge-deadline scan runs on a PERIOD, not every pass.
+    // It walks every member's ledger twice (`overdue` + the orphan
+    // sweep — a `Vec` mint and 2 × depth loads), then stores five
+    // pool-shared gauges; on the field kern rand-4k row that ran 1.76×
+    // per op for a 30 s deadline. The period derives from the deadline
+    // (1/1024 of it — 29 ms at the 30 s default, 98 µs at the 100 ms
+    // floor), so the ladder's resolution stays a fixed fraction of the
+    // bound it enforces. Clocked by the cadence's last-enter stamp: no
+    // extra read. The bounded-park backstop below is unchanged — a
+    // parked worker still ticks every 100 ms while any pend lives.
+    let scan_period_ns = (zc_bridge_timeout_ns() / 1024).max(1);
+    let mut last_scan_ns: u64 = 0;
 
     while pool.active.load(Ordering::Relaxed) {
         // Drain the eventfd FIRST. The wake-fd PollAdd re-arm is deferred to
@@ -5259,7 +5327,7 @@ fn queue_worker(
                                 }
                             }
                             if m.bridge_deadlines.clear(ent_idx) {
-                                pool.zc_bridge_pends.fetch_sub(1, Ordering::Relaxed);
+                                pend_delta -= 1;
                             }
                         }
                     }
@@ -5368,7 +5436,7 @@ fn queue_worker(
                                 trace_id: f.trace_id,
                             });
                             if m.bridge_deadlines.stamp(idx, taken_ns) {
-                                pool.zc_bridge_pends.fetch_add(1, Ordering::Relaxed);
+                                pend_delta += 1;
                             }
                         }
                         Err(e) => {
@@ -5435,7 +5503,7 @@ fn queue_worker(
                             if m.bridge_deadlines
                                 .stamp(idx, crate::raw::read_phase::transport_now_ns())
                             {
-                                pool.zc_bridge_pends.fetch_add(1, Ordering::Relaxed);
+                                pend_delta += 1;
                             }
                         }
                         Err(e) => {
@@ -5504,7 +5572,7 @@ fn queue_worker(
                             if m.bridge_deadlines
                                 .stamp(idx, crate::raw::read_phase::transport_now_ns())
                             {
-                                pool.zc_bridge_pends.fetch_add(1, Ordering::Relaxed);
+                                pend_delta += 1;
                             }
                         }
                         Err(e) => {
@@ -5592,7 +5660,7 @@ fn queue_worker(
                         &mut m.ents[idx],
                         &mut m.zc_pend[idx],
                         &mut m.bridge_deadlines,
-                        &pool.zc_bridge_pends,
+                        &mut pend_delta,
                         zc_bounce.as_ref(),
                         zc_track,
                         pool.slot_watch_cell(qid, idx),
@@ -5637,7 +5705,7 @@ fn queue_worker(
                         &mut m.ents[idx],
                         &mut m.zc_pend[idx],
                         &mut m.bridge_deadlines,
-                        &pool.zc_bridge_pends,
+                        &mut pend_delta,
                         zc_bounce.as_ref(),
                         zc_track,
                         pool.slot_watch_cell(qid, idx),
@@ -5654,6 +5722,12 @@ fn queue_worker(
             break;
         }
 
+        if pend_delta != 0 {
+            pool.zc_bridge_pends
+                .fetch_add(pend_delta as u64, Ordering::Relaxed);
+            pend_delta = 0;
+        }
+
         // The bounded-outcome law (zc-bridge-cqe-wedge, 2026-08-07):
         // every zc bridge op in flight past the deadline gets ONE
         // AsyncCancel — the original op's CQE (completed or -ECANCELED)
@@ -5662,8 +5736,11 @@ fn queue_worker(
         // cancel SQEs ride the same loop-bottom flush; the watch thread
         // wakes parked workers while any pend is outstanding, so this
         // scan runs on idle queues too.
-        if pool.zc_bridge_pends.load(Ordering::Relaxed) > 0 {
+        if pool.zc_bridge_pends.load(Ordering::Relaxed) > 0
+            && cadence.last_enter_end_ns().saturating_sub(last_scan_ns) >= scan_period_ns
+        {
             let now = crate::raw::read_phase::transport_now_ns();
+            last_scan_ns = now;
             let timeout = zc_bridge_timeout_ns();
             pool.scan_passes.fetch_add(1, Ordering::Relaxed);
             let mut pends_seen = 0u64;
@@ -5755,7 +5832,7 @@ fn queue_worker(
         // passes); an idle pass's duration is park time, not submission
         // work (see TransportPhase::CommitFlush).
         let (cf_reads, cf_writes) = batch.note_flush();
-        let cf_t0 = ((cf_reads || cf_writes) && {
+        let mut cf_t0 = ((cf_reads || cf_writes) && {
             let mut cq = ring.completion();
             cq.sync();
             !cq.is_empty()
@@ -5815,15 +5892,90 @@ fn queue_worker(
         // blocking arm is a park sample).
         let enter_began = cadence.enter_begin();
         let mut enter_blocking = false;
-        let wait_result = if !deferred_cqes.is_empty() || pass_polls > 0 || pass_msgs > 0 {
+        // R-4: the blocking enter's own call stamp (≡ `enter_began` unless
+        // a spin ran first — the `park` sample stays the blocking wall).
+        let mut park_began = enter_began;
+        let mut spin_ran = false;
+        let work_in_hand = !deferred_cqes.is_empty() || pass_polls > 0 || pass_msgs > 0;
+        // R-4 spin-before-park (module doc on `spin`): where this pass
+        // would BLOCK, first spin a bounded, derived window — while ops
+        // are in flight on this worker's queues, their echoes (device
+        // CQE, lane message, the app's next submit) arrive on a reaction
+        // clock the worker's own gap EWMA measures; a park + wake for
+        // each costs the scheduler's wake latency (35–60 µs at the
+        // field's load) on the op's critical path. The spin watches
+        // IORING_SQ_TASKRUN (deferred task work landed), the CQ tail
+        // (plain-ring postings), the coalescer's armed flag (a producer
+        // published — its eventfd write is in flight) and the shutdown
+        // word; a catch surfaces the completions with the work-conserving
+        // arm's non-blocking GETEVENTS enter, an expired window falls
+        // into the blocking enter exactly as before. The pass's SQEs are
+        // launched (`submit`, accounting already taken by `note_flush`)
+        // before the spin so their echoes can arrive inside the window;
+        // the wake-fd PollAdd re-arm rides that same submit.
+        let spin_caught = !work_in_hand && {
+            let in_flight = members
+                .iter()
+                .any(|m| m.slots.any_owing() || m.bridge_deadlines.outstanding() > 0);
+            let busy = if in_flight {
+                pool.spin_headroom.busy_pct(enter_began)
+            } else {
+                0
+            };
+            let spin_ns = spin.window_ns(in_flight, busy);
+            let mut caught = false;
+            if spin_ns > 0 && ring.submit().is_ok() {
+                spin_ran = true;
+                let mut spent_ns = 0;
+                loop {
+                    if ring.submission().taskrun() {
+                        caught = true;
+                        break;
+                    }
+                    {
+                        let mut cq = ring.completion();
+                        cq.sync();
+                        if !cq.is_empty() {
+                            caught = true;
+                            break;
+                        }
+                    }
+                    if wake_coalescer.is_armed() {
+                        caught = true;
+                        break;
+                    }
+                    if !pool.active.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    spent_ns =
+                        crate::raw::read_phase::transport_now_ns().saturating_sub(enter_began);
+                    if spent_ns >= spin_ns {
+                        break;
+                    }
+                    std::hint::spin_loop();
+                }
+                if caught {
+                    spin::note_absorbed(spent_ns);
+                } else {
+                    spin::note_expired(spent_ns);
+                }
+                // The commit_flush sample would include the spin — drop it
+                // for this pass (per-flush sampled, never per-op; see
+                // TransportPhase::CommitFlush).
+                cf_t0 = None;
+            }
+            caught
+        };
+        let wait_result = if work_in_hand || spin_caught {
             // Work-conserving pass: completions in hand (parking would
             // sleep over work nothing re-signals — the drained-then-park
-            // wedge), or this pass did real work whose follow-ons (fresh
+            // wedge), this pass did real work whose follow-ons (fresh
             // deliveries from the commits it flushed, wakes from the
             // tasks it polled) are best served by spinning straight back
-            // through the interleave. Flush non-blocking with GETEVENTS
-            // (DEFER_TASKRUN: deliveries only materialize under the
-            // flag) and fall through.
+            // through the interleave, or the spin above caught an event.
+            // Flush non-blocking with GETEVENTS (DEFER_TASKRUN:
+            // deliveries only materialize under the flag) and fall
+            // through.
             let ts = types::Timespec::new();
             let args = types::SubmitArgs::new().timespec(&ts);
             match ring.submitter().submit_with_args(1, &args) {
@@ -5832,6 +5984,9 @@ fn queue_worker(
             }
         } else {
             enter_blocking = true;
+            if spin_ran {
+                park_began = crate::raw::read_phase::transport_now_ns();
+            }
             let retry_left =
                 next_retry.map(|deadline| deadline.saturating_duration_since(Instant::now()));
             match (retry_left, park_backstop) {
@@ -5862,7 +6017,12 @@ fn queue_worker(
                 }
             }
         };
-        cadence.enter_end(enter_began, enter_blocking);
+        cadence.enter_end(park_began, enter_blocking);
+        // The governor's gap signal (R-4): how long this worker waited
+        // for its next event — the spin, the park, or both.
+        if spin_ran || enter_blocking {
+            spin.observe_gap(cadence.last_enter_end_ns().saturating_sub(enter_began));
+        }
         match wait_result {
             Ok(_) => {}
             Err(e) if e.raw_os_error() == Some(libc::EINTR) => continue,
@@ -5892,7 +6052,8 @@ fn queue_worker(
                 .note_submitted(gent % depth, ns);
         });
 
-        let (completed, popped_ns): (Vec<(u64, i32, u32)>, u64) = {
+        completed.clear();
+        let popped_ns: u64 = {
             let mut cq = ring.completion();
             cq.sync();
             // FUSE-3f: read the overflow counter with the same sync that
@@ -5917,20 +6078,16 @@ fn queue_worker(
             };
             // Mid-pass-deferred CQEs first (they ARRIVED first), then the
             // post-wait drain.
-            (
-                deferred_cqes
-                    .drain(..)
-                    .chain(cq.map(|c| (c.user_data(), c.result(), c.flags())))
-                    .collect(),
-                popped_ns,
-            )
+            completed.append(&mut deferred_cqes);
+            completed.extend(cq.map(|c| (c.user_data(), c.result(), c.flags())));
+            popped_ns
         };
 
         // Reclaim list — group-local ent ids (member recovered by
         // `gent / depth` at the re-REGISTER pass).
         let mut resubmit: Vec<usize> = Vec::new();
         let mut disconnect = false;
-        for (user_data, res, cqe_flags) in completed {
+        for &(user_data, res, cqe_flags) in completed.iter() {
             // FUSE-2 row 6: the op class rides `user_data`, so an errored
             // COMMIT is never mistaken for an errored REGISTER (which is
             // how an EAGAIN'd commit used to discard the reply
@@ -5972,7 +6129,6 @@ fn queue_worker(
             if res < 0 {
                 let err = -res;
                 let m = &mut members[mi];
-                pool.stats_cqe_err.fetch_add(1, Ordering::Relaxed);
                 STATS_CQE_ERR.fetch_add(1, Ordering::Relaxed);
                 xport_dbg!("[XPORT] cqe-err qid={qid} ent={ent_idx} op={op:?} err={err}");
                 // zc bridge errors resolve against the ent's pending kind
@@ -6005,6 +6161,7 @@ fn queue_worker(
                                 &m.zc_pend[ent_idx],
                                 &m.bridge_deadlines,
                                 ent_idx,
+                                popped_ns,
                             );
                             let pend = zc_fetch_complete(
                                 &mut ring,
@@ -6020,7 +6177,7 @@ fn queue_worker(
                                 popped_ns,
                             )?;
                             if m.bridge_deadlines.clear(ent_idx) {
-                                pool.zc_bridge_pends.fetch_sub(1, Ordering::Relaxed);
+                                pend_delta -= 1;
                             }
                             if matches!(pend, Some(PendDone::DeliverFailed)) {
                                 fail_ent(
@@ -6051,7 +6208,7 @@ fn queue_worker(
                                 // Structurally a re-stamp (the pend is
                                 // live), but keep the gauge exact if the
                                 // ledger ever disagrees.
-                                pool.zc_bridge_pends.fetch_add(1, Ordering::Relaxed);
+                                pend_delta += 1;
                             }
                         }
                     }
@@ -6068,6 +6225,7 @@ fn queue_worker(
                         &m.zc_pend[ent_idx],
                         &m.bridge_deadlines,
                         ent_idx,
+                        popped_ns,
                     );
                     let pend = zc_fetch_complete(
                         &mut ring,
@@ -6083,7 +6241,7 @@ fn queue_worker(
                         popped_ns,
                     )?;
                     if m.bridge_deadlines.clear(ent_idx) {
-                        pool.zc_bridge_pends.fetch_sub(1, Ordering::Relaxed);
+                        pend_delta -= 1;
                     }
                     if matches!(pend, Some(PendDone::DeliverFailed)) {
                         fail_ent(
@@ -6297,7 +6455,12 @@ fn queue_worker(
                 // A zc bridge completed (device fetch/store, bounce
                 // bridge, or lazy WRITE extraction). NOT a delivery —
                 // resolve the pending kind and move on.
-                note_handler_bridge_passbottom(&m.zc_pend[ent_idx], &m.bridge_deadlines, ent_idx);
+                note_handler_bridge_passbottom(
+                    &m.zc_pend[ent_idx],
+                    &m.bridge_deadlines,
+                    ent_idx,
+                    popped_ns,
+                );
                 let pend = zc_fetch_complete(
                     &mut ring,
                     &mut batch,
@@ -6312,7 +6475,7 @@ fn queue_worker(
                     popped_ns,
                 )?;
                 if m.bridge_deadlines.clear(ent_idx) {
-                    pool.zc_bridge_pends.fetch_sub(1, Ordering::Relaxed);
+                    pend_delta -= 1;
                 }
                 if let Some(p) = pend {
                     // An extracted WRITE payload sits in the bounce
@@ -6605,8 +6768,7 @@ fn queue_worker(
             }
             pool.publish_slot_owed(qid, ent_idx, unique);
 
-            pool.stats_requests.fetch_add(1, Ordering::Relaxed);
-            STATS_REQUESTS.fetch_add(1, Ordering::Relaxed);
+            STATS_REQUESTS.add(1);
             debug!(
                 qid,
                 ent_idx, unique, commit_id, payload_sz, opcode, "fuse-over-uring inbound request"
@@ -6661,8 +6823,7 @@ fn queue_worker(
                     gent,
                     commit_id,
                 )?;
-                pool.stats_replies.fetch_add(1, Ordering::Relaxed);
-                STATS_REPLIES.fetch_add(1, Ordering::Relaxed);
+                STATS_REPLIES.add(1);
                 continue;
             }
 
@@ -6750,7 +6911,7 @@ fn queue_worker(
                             &mut m.ents[ent_idx],
                             &mut m.zc_pend[ent_idx],
                             &mut m.bridge_deadlines,
-                            &pool.zc_bridge_pends,
+                            &mut pend_delta,
                             zc_bounce.as_ref(),
                             zc_track,
                             pool.slot_watch_cell(qid, ent_idx),
@@ -6766,8 +6927,7 @@ fn queue_worker(
                                 retain: false,
                             },
                         )?;
-                        pool.stats_replies.fetch_add(1, Ordering::Relaxed);
-                        STATS_REPLIES.fetch_add(1, Ordering::Relaxed);
+                        STATS_REPLIES.add(1);
                         fast_dispatch::record_served(
                             unique,
                             now_ns,
@@ -6984,7 +7144,7 @@ fn queue_worker(
                             if m.bridge_deadlines
                                 .stamp(ent_idx, crate::raw::read_phase::transport_now_ns())
                             {
-                                pool.zc_bridge_pends.fetch_add(1, Ordering::Relaxed);
+                                pend_delta += 1;
                             }
                         }
                         Err(e) => {
@@ -7229,6 +7389,10 @@ fn queue_worker(
     // Bridge-deadline gauge hygiene: every pend died with this worker —
     // return its share so the watch thread stops waking survivors for
     // ledgers that no longer exist.
+    if pend_delta != 0 {
+        pool.zc_bridge_pends
+            .fetch_add(pend_delta as u64, Ordering::Relaxed);
+    }
     for m in members.iter_mut() {
         let n = m.bridge_deadlines.outstanding() as u64;
         if n > 0 {
@@ -7789,6 +7953,7 @@ fn note_handler_bridge_passbottom(
     pend: &Option<ZcPend>,
     deadlines: &zc::BridgeDeadlines,
     ent_idx: usize,
+    popped_ns: u64,
 ) {
     if matches!(
         pend,
@@ -7796,8 +7961,11 @@ fn note_handler_bridge_passbottom(
     ) {
         let born = deadlines.born_ns(ent_idx);
         if born != 0 {
+            // The drain's ONE pop stamp (R-4) — the resolution instant
+            // for every CQE of this drain; the former per-call clock
+            // read was one of ~10 the worker paid per op.
             crate::raw::read_phase::note_fused_bridge_resolved(
-                crate::raw::read_phase::transport_now_ns().saturating_sub(born),
+                popped_ns.saturating_sub(born),
                 false,
             );
         }

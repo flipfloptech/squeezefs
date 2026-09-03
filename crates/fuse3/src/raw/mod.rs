@@ -16,6 +16,8 @@ pub use connection::fuse_over_uring::fused::{
     zc_write_fusions, zc_write_lazy_extractions,
 };
 #[cfg(all(target_os = "linux", feature = "tokio-runtime"))]
+pub use connection::fuse_over_uring::spin::transport_spin_stats;
+#[cfg(all(target_os = "linux", feature = "tokio-runtime"))]
 pub use connection::fuse_over_uring::{
     drain_group_stats, negotiated_max_readahead, numa_local_bytes, numa_remote_bytes,
     over_uring_classical_sideband, over_uring_commit_batch_stats, over_uring_geometry,

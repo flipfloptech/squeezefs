@@ -81,13 +81,14 @@
 //! the handler's `block_fetch` on the zc leg (`Σ hops ≡ total`), and its
 //! `wake_hop` on (b) is the fused pass's run-queue wait, not a thread hop.
 
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use super::fused::FusedFuture;
 use super::InboundUringReq;
 use crate::raw::abi::fuse_opcode;
-use crate::raw::read_phase::{read_transport_phase_record, transport_instant, TransportPhase};
+use crate::raw::read_phase::{
+    read_transport_phase_record, transport_instant, ShardedCounter, TransportPhase,
+};
 use crate::raw::reply::FastReadProbe;
 
 /// The sync READ probe's shape: `(nodeid, fh, offset, size, flags, dest)
@@ -137,14 +138,16 @@ pub fn fast_dispatch_enabled() -> bool {
     })
 }
 
-static FAST_DISPATCH_SERVES: AtomicU64 = AtomicU64::new(0);
-static FAST_DISPATCH_DEMOTES: AtomicU64 = AtomicU64::new(0);
+// Per-thread-sharded (R-4): both are bumped once per READ by the queue
+// worker that delivered it — 32 cores on one line per op otherwise.
+static FAST_DISPATCH_SERVES: ShardedCounter = ShardedCounter::new();
+static FAST_DISPATCH_DEMOTES: ShardedCounter = ShardedCounter::new();
 
 /// Count one READ the probe declined — minted on the reap thread and
 /// handed straight to a handler lane.
 #[inline]
 pub fn note_fast_dispatch_demote() {
-    FAST_DISPATCH_DEMOTES.fetch_add(1, Ordering::Relaxed);
+    FAST_DISPATCH_DEMOTES.add(1);
 }
 
 /// Account one READ served + committed inline on the reap thread:
@@ -158,7 +161,7 @@ pub fn note_fast_dispatch_demote() {
 /// read — no clock read here.
 #[inline]
 pub fn record_served(unique: u64, arrived_ns: u64, committed_ns: u64) {
-    FAST_DISPATCH_SERVES.fetch_add(1, Ordering::Relaxed);
+    FAST_DISPATCH_SERVES.add(1);
     read_transport_phase_record(TransportPhase::QueueWait, std::time::Duration::ZERO);
     read_transport_phase_record(TransportPhase::DispatchLag, std::time::Duration::ZERO);
     read_transport_phase_record(
@@ -190,7 +193,7 @@ pub fn now_ns() -> u64 {
 /// must account ≈ every warm READ; 0 on `SQUEEZEFS_FUSE_READ_FAST_DISPATCH=0`
 /// mounts and before the session registers the dispatcher.
 pub fn fast_dispatch_serves() -> u64 {
-    FAST_DISPATCH_SERVES.load(Ordering::Relaxed)
+    FAST_DISPATCH_SERVES.load()
 }
 
 /// `transport_fast_dispatch_demotes` (stats inode): READs the inline
@@ -198,7 +201,7 @@ pub fn fast_dispatch_serves() -> u64 {
 /// (the inbound queue + session dispatch task skipped). `serves +
 /// demotes` ≡ the READs delivered on an armed session with the lever on.
 pub fn fast_dispatch_demotes() -> u64 {
-    FAST_DISPATCH_DEMOTES.load(Ordering::Relaxed)
+    FAST_DISPATCH_DEMOTES.load()
 }
 
 #[cfg(test)]

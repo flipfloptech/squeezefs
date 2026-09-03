@@ -36,6 +36,25 @@
 //! `SQUEEZEFS_IPC_SPIN_US` (including `0`) is the static window exactly
 //! as shipped, governor OFF. `SQUEEZEFS_IPC_SPIN_ADAPTIVE=0` is the A/B
 //! control (window 0 = the pre-campaign shipped posture).
+//!
+//! # The queue-worker law (R-4 reap-thread economy, 2026-09-03)
+//!
+//! The FUSE-over-io_uring queue worker is the second spin population
+//! ([`worker_window_ns`]). Its parks are REACTION gaps, not fan-in
+//! interleave: every event it waits for is the echo of something it just
+//! did — the device CQE of the fetch it submitted, the lane's message
+//! answering the request it delivered, the app's next submit answering
+//! the reply it committed. The field kern rand-4k row measured them
+//! (`transport_reap_gap_ns.park`, 15 M parks): 47 % ≤ 8 µs, 68 % ≤
+//! 16 µs, 84 % ≤ 32 µs, 90 % ≤ 64 µs — a thread that sleeps for tens of
+//! µs at a time, ~0.76 times per op, paying the scheduler's wake latency
+//! (the same class as the 35–47 µs cross-thread hops R-3 measured) on
+//! every one. So the worker's window is sized by its OWN observed gap
+//! (`2 × EWMA`, the physics of a reaction clock), the regime signal is
+//! STRUCTURAL — ops in flight on the worker's queues (a slot delivered
+//! and not yet committed, a bridge pend outstanding): an idle queue has
+//! nothing coming on a bounded clock and never spins — and the box
+//! guard is the queueing-theory knee ([`worker_busy_ceiling_pct`]).
 
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::Duration;
@@ -136,6 +155,82 @@ pub fn window(
         return Duration::ZERO;
     }
     Duration::from_micros(SPIN_WINDOW_US)
+}
+
+/// The queue-worker busy ceiling, percent of the box: the worker
+/// population is one thread per possible CPU, so the ipc formula
+/// ([`busy_ceiling_pct`] — "every spinner spinning the whole window must
+/// fit in the idle capacity") derives 0 for it by construction, while its
+/// spin is bounded per park by a reaction-clock window and exits at the
+/// event. The guard that applies is the run-queue-wait onset the spin
+/// exists to avoid: for an M/M/c server pool with c ≥ 16, the probability
+/// an arrival waits (Erlang-C) rises past ~25 % at ρ = 0.8 and ~55 % at
+/// ρ = 0.9 — past the knee, a spinning worker steals exactly the cycles
+/// whose absence it was buying down. A physical constant of the queue
+/// discipline, not a tunable.
+pub const WORKER_BUSY_CEILING_PCT: u32 = 80;
+
+/// The queue worker's derived spin window (ns) for one park decision —
+/// see the module doc's worker law.
+///
+/// * `cap_ns`: the ceiling on the window. `Some(0)` = never spin (the
+///   A/B control); `Some(c)` = an explicit operator cap (verbatim: the
+///   regime gates below still apply — spinning on an idle queue buys
+///   nothing at any cap); `None` = the derived cap, [`SPIN_RAIL_US`].
+/// * `gap_ewma_ns`: the worker's EWMA of observed park gaps (spin-
+///   absorbed gaps included). 0 = never parked — engage on OBSERVED
+///   churn only, never speculatively.
+/// * `in_flight`: the structural regime — this worker's queues hold a
+///   delivered-not-committed slot or an outstanding bridge pend.
+/// * `busy_pct`: the box gauge; refused past [`WORKER_BUSY_CEILING_PCT`].
+///
+/// Window = `min(2 × gap_ewma, cap)`: a reaction clock's next event is
+/// expected inside about one observed gap, and the doubling covers the
+/// spread the EWMA smooths over; a gap EWMA past the rail is idle spacing
+/// (device-RTT-spaced qd1 parks sit inside it — those are productive
+/// waits a spin shortens, and their CPU cost is one otherwise-idle core's
+/// RTT per op, bounded by the same ceiling).
+pub fn worker_window_ns(
+    cap_ns: Option<u64>,
+    gap_ewma_ns: u64,
+    in_flight: bool,
+    busy_pct: u32,
+) -> u64 {
+    let (cap, explicit) = match cap_ns {
+        Some(0) => return 0,
+        Some(c) => (c, true),
+        None => (SPIN_RAIL_US * 1_000, false),
+    };
+    if !in_flight || gap_ewma_ns == 0 {
+        return 0;
+    }
+    if gap_ewma_ns > SPIN_RAIL_US * 1_000 {
+        return 0;
+    }
+    // The box gauge refuses the DERIVED window only: an explicit cap is
+    // the operator's verbatim measurement posture (the ipc-cap law).
+    if !explicit && busy_pct > WORKER_BUSY_CEILING_PCT {
+        return 0;
+    }
+    gap_ewma_ns.saturating_mul(2).min(cap)
+}
+
+/// One `/proc/stat` reading as `(busy_jiffies, total_jiffies)` for
+/// [`HeadroomGauge::publish`] (idle + iowait are the idle share).
+pub fn read_proc_stat_busy() -> Option<(u64, u64)> {
+    let stat = std::fs::read_to_string("/proc/stat").ok()?;
+    let line = stat.lines().next()?;
+    let mut fields = line.split_whitespace();
+    if fields.next()? != "cpu" {
+        return None;
+    }
+    let vals: Vec<u64> = fields.take(8).filter_map(|f| f.parse().ok()).collect();
+    if vals.len() < 5 {
+        return None;
+    }
+    let total: u64 = vals.iter().sum();
+    let idle = vals[3] + vals.get(4).copied().unwrap_or(0);
+    Some((total.saturating_sub(idle), total))
 }
 
 /// The shared headroom gauge: any lane may sample, rate-limited by a
@@ -318,6 +413,73 @@ mod tests {
             e < SPIN_RAIL_US * 1_000,
             "sustained churn re-enters the regime within a bounded fold count (got {e})"
         );
+    }
+
+    /// The worker law (R-4): the window is the reaction clock (2 × the
+    /// observed gap EWMA) capped by the rail or the explicit cap; every
+    /// regime gate returns 0 — no ops in flight, never parked, idle-
+    /// spaced gaps, box past the queueing knee; `Some(0)` is the off
+    /// switch whatever the regime says.
+    #[test]
+    fn worker_window_is_the_reaction_clock_under_every_gate() {
+        assert_eq!(
+            worker_window_ns(None, 20_000, true, 70),
+            40_000,
+            "2 × a 20 µs gap EWMA under the rail"
+        );
+        assert_eq!(
+            worker_window_ns(None, 150_000, true, 70),
+            SPIN_RAIL_US * 1_000,
+            "2 × 150 µs caps at the rail"
+        );
+        assert_eq!(
+            worker_window_ns(Some(30_000), 20_000, true, 70),
+            30_000,
+            "an explicit cap bounds the doubled gap"
+        );
+        assert_eq!(
+            worker_window_ns(Some(30_000), 5_000, true, 70),
+            10_000,
+            "an explicit cap never widens the window past the reaction clock"
+        );
+        assert_eq!(
+            worker_window_ns(Some(0), 20_000, true, 0),
+            0,
+            "Some(0) = off"
+        );
+        assert_eq!(
+            worker_window_ns(None, 20_000, false, 0),
+            0,
+            "nothing in flight"
+        );
+        assert_eq!(worker_window_ns(None, 0, true, 0), 0, "never parked");
+        assert_eq!(
+            worker_window_ns(None, SPIN_RAIL_US * 1_000 + 1, true, 0),
+            0,
+            "idle-spaced gaps past the rail"
+        );
+        assert_eq!(
+            worker_window_ns(None, 20_000, true, WORKER_BUSY_CEILING_PCT),
+            40_000,
+            "at the knee: engaged"
+        );
+        assert_eq!(
+            worker_window_ns(None, 20_000, true, WORKER_BUSY_CEILING_PCT + 1),
+            0,
+            "past the knee: refused"
+        );
+        assert_eq!(
+            worker_window_ns(Some(30_000), 20_000, true, 100),
+            30_000,
+            "an explicit cap is the operator's verbatim choice — the box gauge does not refuse it"
+        );
+    }
+
+    /// `/proc/stat` parses on any Linux box: busy ≤ total, both nonzero.
+    #[test]
+    fn proc_stat_reads_a_sane_pair() {
+        let (busy, total) = read_proc_stat_busy().expect("/proc/stat readable");
+        assert!(total > 0 && busy <= total, "busy {busy} total {total}");
     }
 
     /// The headroom gauge: cadence-gated single sampler, delta-computed

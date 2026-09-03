@@ -231,6 +231,11 @@ pub mod sqz_sync;
 /// reference `crate::sqz_time`, which this re-export satisfies in the
 /// root crate (fuse3 owns a real module of the same name).
 pub use squeezefs_ipc::sqz_time;
+// Adaptive spin governor core — canonical file in the squeezefs-ipc
+// tree, `#[path]`-included here (the ipc service lanes) and by the fuse3
+// fork (the FUSE-over-io_uring queue workers, R-4), so both spin
+// populations fold parks and read box headroom through the ONE law.
+#[path = "../crates/squeezefs-ipc/src/spin_governor_core.rs"]
 pub mod spin_governor;
 pub mod sqz_sync_core;
 pub mod storage;

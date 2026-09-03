@@ -169,7 +169,7 @@ type PhaseTable = [PhaseHist; PHASES];
 /// free-floating constant): `available_parallelism` rounded up to a power of
 /// two, railed to [1, 64] so a 256-core host does not spend 3 MiB on
 /// histograms.
-fn shard_count() -> usize {
+pub(crate) fn shard_count() -> usize {
     static N: OnceLock<usize> = OnceLock::new();
     *N.get_or_init(|| {
         std::thread::available_parallelism()
@@ -193,7 +193,7 @@ fn tables() -> &'static [[PhaseTable; OP_CLASSES]] {
 /// This thread's shard index — assigned once per thread, round-robin over
 /// the shard set (the `wake_core`/pool-index precedent: no `sched_getcpu`
 /// per op, and a migrating thread keeps counting into a line it owns).
-fn shard_index() -> usize {
+pub(crate) fn shard_index() -> usize {
     static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     thread_local! {
         static MINE: std::cell::Cell<usize> = const { std::cell::Cell::new(usize::MAX) };
@@ -212,6 +212,56 @@ fn shard_index() -> usize {
 fn record(op: OpClass, phase: TransportPhase, dur: Duration) {
     let ns = dur.as_nanos().min(u64::MAX as u128) as u64;
     tables()[shard_index()][op as usize][phase as usize].record_ns(ns);
+}
+
+/// A per-thread-sharded event counter (R-4 reap-thread economy): the
+/// transport's per-op engagement counters were process-global
+/// `AtomicU64`s that every queue worker RMW'd on every op — one cache
+/// line ping-ponging between 32 cores per counter (the PERF-3 argument,
+/// applied to the plain counters the phase tables left behind). Each
+/// thread increments its own shard ([`shard_index`]); a read folds the
+/// shards (addition commutes, so the total is exact — a fold taken
+/// mid-increment can miss one just-added sample exactly as before).
+///
+/// Shards are allocated on first use (one `AtomicU64` per shard, padded
+/// to a line so two counters never share one).
+pub(crate) struct ShardedCounter {
+    shards: OnceLock<Vec<Line>>,
+}
+
+#[repr(align(64))]
+struct Line(AtomicU64);
+
+impl ShardedCounter {
+    pub(crate) const fn new() -> Self {
+        Self {
+            shards: OnceLock::new(),
+        }
+    }
+
+    fn shards(&self) -> &[Line] {
+        self.shards.get_or_init(|| {
+            (0..shard_count())
+                .map(|_| Line(AtomicU64::new(0)))
+                .collect()
+        })
+    }
+
+    /// Add `n` on this thread's shard (one uncontended relaxed RMW).
+    #[inline]
+    pub(crate) fn add(&self, n: u64) {
+        self.shards()[shard_index()]
+            .0
+            .fetch_add(n, Ordering::Relaxed);
+    }
+
+    /// The exact total across shards.
+    pub(crate) fn load(&self) -> u64 {
+        self.shards()
+            .iter()
+            .map(|l| l.0.load(Ordering::Relaxed))
+            .sum()
+    }
 }
 
 fn snapshot(op: OpClass) -> [PhaseSnapshot; PHASES] {
@@ -325,44 +375,59 @@ pub fn write_inplace_replies() -> u64 {
 // bridge DMAs the interleave resolved without waiting out the pass.
 // ---------------------------------------------------------------------------
 
-static FUSED_WAKE_TO_POLL: PhaseHist = PhaseHist::new();
-static FUSED_BRIDGE_RTT: PhaseHist = PhaseHist::new();
-static FUSED_MIDPASS_REAPS: AtomicU64 = AtomicU64::new(0);
-static FUSED_PASSBOTTOM_REAPS: AtomicU64 = AtomicU64::new(0);
+// Sharded per recording thread (R-4): `bridge_rtt` is recorded once per
+// op by EVERY queue worker — a single process-global histogram was one
+// cache line RMW'd by 32 cores per completion (the PERF-3 argument; the
+// field flat profile put its recorder at 1.3 % of the worker's cycles).
+type FusedTable = [PhaseHist; 2];
+
+fn fused_tables() -> &'static [FusedTable] {
+    static TABLES: OnceLock<Vec<FusedTable>> = OnceLock::new();
+    TABLES.get_or_init(|| {
+        (0..shard_count())
+            .map(|_| std::array::from_fn(|_| PhaseHist::new()))
+            .collect()
+    })
+}
+
+static FUSED_MIDPASS_REAPS: ShardedCounter = ShardedCounter::new();
+static FUSED_PASSBOTTOM_REAPS: ShardedCounter = ShardedCounter::new();
 
 /// Record one run-queue push → poll span (ns, transport epoch).
 #[inline]
 pub(crate) fn note_fused_wake_to_poll(ns: u64) {
-    FUSED_WAKE_TO_POLL.record_ns(ns);
+    fused_tables()[shard_index()][0].record_ns(ns);
 }
 
 /// Record one bridge issue → oneshot-resolution span (ns) plus its venue.
 #[inline]
 pub(crate) fn note_fused_bridge_resolved(ns: u64, midpass: bool) {
-    FUSED_BRIDGE_RTT.record_ns(ns);
+    fused_tables()[shard_index()][1].record_ns(ns);
     if midpass {
-        FUSED_MIDPASS_REAPS.fetch_add(1, Ordering::Relaxed);
+        FUSED_MIDPASS_REAPS.add(1);
     } else {
-        FUSED_PASSBOTTOM_REAPS.fetch_add(1, Ordering::Relaxed);
+        FUSED_PASSBOTTOM_REAPS.add(1);
     }
 }
 
-/// Stats-inode snapshot: the fused timeline histograms.
+/// Stats-inode snapshot: the fused timeline histograms (the fold across
+/// shards is exact).
 pub fn fused_timeline_snapshot() -> [PhaseSnapshot; 2] {
+    let shards = fused_tables();
     [
-        fold("wake_to_poll", std::iter::once(&FUSED_WAKE_TO_POLL)),
-        fold("bridge_rtt", std::iter::once(&FUSED_BRIDGE_RTT)),
+        fold("wake_to_poll", shards.iter().map(|s| &s[0])),
+        fold("bridge_rtt", shards.iter().map(|s| &s[1])),
     ]
 }
 
 /// Mid-pass bridge resolutions (the funnel-fix engagement gauge).
 pub fn fused_midpass_reaps() -> u64 {
-    FUSED_MIDPASS_REAPS.load(Ordering::Relaxed)
+    FUSED_MIDPASS_REAPS.load()
 }
 
 /// Pass-bottom bridge resolutions (the park-then-resolve venue).
 pub fn fused_passbottom_reaps() -> u64 {
-    FUSED_PASSBOTTOM_REAPS.load(Ordering::Relaxed)
+    FUSED_PASSBOTTOM_REAPS.load()
 }
 
 // ---------------------------------------------------------------------------
@@ -488,6 +553,14 @@ impl ReapCadence {
     #[inline]
     pub(crate) fn cqes_surfaced(&self, n: usize) {
         reap_phase_record_n(ReapPhase::BlindCqe, self.blind_ns, n as u64);
+    }
+
+    /// The previous enter's return stamp (transport-epoch ns): the
+    /// pass's own clock for cadence decisions that need no fresh read
+    /// (R-4 — the deadline-scan period rides it).
+    #[inline]
+    pub(crate) fn last_enter_end_ns(&self) -> u64 {
+        self.prev_enter_end_ns
     }
 
     /// The blind span the most recent enter closed (tests).

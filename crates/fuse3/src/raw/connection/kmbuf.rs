@@ -714,7 +714,10 @@ pub fn resolve_buffer_mode() -> TransportBufferMode {
 
 static KMBUF_NEGOTIATED: AtomicU64 = AtomicU64::new(0);
 static ZC_NEGOTIATED: AtomicU64 = AtomicU64::new(0);
-static ZC_REPLIES: AtomicU64 = AtomicU64::new(0);
+// Per-thread-sharded (R-4): every queue worker counts one per prefilled
+// COMMIT — a process-global word was 32 cores RMW'ing one line per op.
+static ZC_REPLIES: crate::raw::read_phase::ShardedCounter =
+    crate::raw::read_phase::ShardedCounter::new();
 static ZC_FALLBACKS: AtomicU64 = AtomicU64::new(0);
 static ZC_SLOT_PAYLOAD_SKIPS: AtomicU64 = AtomicU64::new(0);
 static ZC_WRITE_EXTRACTIONS: AtomicU64 = AtomicU64::new(0);
@@ -854,14 +857,14 @@ pub fn zc_retained_outstanding() -> u64 {
 /// sparse-slot path (device-direct prefill or bounce bridge) — K1's
 /// folio copy skipped by the kernel at COMMIT.
 pub fn note_zc_reply() {
-    ZC_REPLIES.fetch_add(1, Ordering::Relaxed);
+    ZC_REPLIES.add(1);
 }
 
 /// `fuse3_zc_replies` (stats inode): replies whose payload rode the
 /// `FUSE_URING_ZERO_COPY` fixed-buffer path (K1 deleted both
 /// directions). 0 by construction until a session arms zc.
 pub fn zc_replies() -> u64 {
-    ZC_REPLIES.load(Ordering::Relaxed)
+    ZC_REPLIES.load()
 }
 
 /// Count one zc bridge FAILURE that degraded to the kmbuf attachment or

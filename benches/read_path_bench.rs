@@ -431,6 +431,104 @@ fn bench_tier_publish_hop(c: &mut Criterion) {
     group.finish();
 }
 
+/// R-3 fill-issue economy (read board #3): the two primitives the funnel
+/// and the zc bridge pay per fill, in isolation on this box.
+///
+/// * `enter_per_cqe_N` vs `poll_drain_batch_N` — N ops issued on a real
+///   io_uring (NOP SQEs, the kernel's cheapest completion) as N
+///   `submit_and_wait(1)` round trips (the retired per-completion park)
+///   vs ONE `submit_and_wait(N)` + one CQ drain. The gap is the syscall +
+///   ring-sync cost per op the batch amortizes; N = 8 is the field's
+///   per-queue in-flight depth (24 jobs × qd8 over 32 queues).
+/// * `oneshot_cross_thread_hop` vs `oneshot_same_thread_hop` — a
+///   `sqz_channel::oneshot` resolution awaited on a PARKED foreign thread
+///   (the bridge's `wake_hop`: futex wake + schedule + resume) vs the
+///   same resolution consumed by a poll on the sending thread (the fused
+///   venue). The cross-thread row is the mechanism price of one hop at
+///   idle; the field pays it three times per zc READ at load.
+fn bench_fill_issue_economy(c: &mut Criterion) {
+    use io_uring::{opcode, IoUring};
+    let mut group = c.benchmark_group("fill_issue_economy");
+    for &n in &[1usize, 8, 32] {
+        let mut ring = IoUring::new(64).expect("bench ring");
+        group.throughput(Throughput::Elements(n as u64));
+        group.bench_function(format!("enter_per_cqe_{n}"), |b| {
+            b.iter(|| {
+                for i in 0..n {
+                    let e = opcode::Nop::new().build().user_data(i as u64);
+                    // SAFETY: a NOP references no user memory.
+                    unsafe { ring.submission().push(&e) }.expect("sq room");
+                    ring.submit_and_wait(1).expect("enter");
+                    let mut cq = ring.completion();
+                    cq.sync();
+                    for c in cq {
+                        black_box(c.user_data());
+                    }
+                }
+            });
+        });
+        let mut ring = IoUring::new(64).expect("bench ring");
+        group.bench_function(format!("poll_drain_batch_{n}"), |b| {
+            b.iter(|| {
+                for i in 0..n {
+                    let e = opcode::Nop::new().build().user_data(i as u64);
+                    // SAFETY: a NOP references no user memory.
+                    unsafe { ring.submission().push(&e) }.expect("sq room");
+                }
+                ring.submit_and_wait(n).expect("enter");
+                let mut cq = ring.completion();
+                cq.sync();
+                let mut seen = 0usize;
+                for c in cq {
+                    black_box(c.user_data());
+                    seen += 1;
+                }
+                assert_eq!(seen, n);
+            });
+        });
+    }
+    group.throughput(Throughput::Elements(1));
+
+    // Cross-thread hop: the receiver thread parks on the oneshot (a
+    // futex wait through the sqz executor's block_on); the sender
+    // resolves it and waits for the receiver's acknowledgement (a second
+    // oneshot back) so one iteration = one full wake round trip ÷ 2 is
+    // the per-hop price.
+    {
+        use squeezefs_ipc::sqz_channel::oneshot;
+        use std::sync::mpsc;
+        let (req_tx, req_rx) = mpsc::channel::<(oneshot::Receiver<u32>, oneshot::Sender<u32>)>();
+        let worker = std::thread::spawn(move || {
+            while let Ok((rx, ack)) = req_rx.recv() {
+                let v = squeezefs_ipc::sqz_blocking::block_on(rx).unwrap_or(0);
+                let _ = ack.send(v);
+            }
+        });
+        group.bench_function("oneshot_cross_thread_hop", |b| {
+            b.iter(|| {
+                let (tx, rx) = oneshot::channel::<u32>();
+                let (ack_tx, ack_rx) = oneshot::channel::<u32>();
+                req_tx.send((rx, ack_tx)).expect("worker alive");
+                let _ = tx.send(7);
+                let v = squeezefs_ipc::sqz_blocking::block_on(ack_rx).unwrap_or(0);
+                black_box(v);
+            });
+        });
+        drop(req_tx);
+        let _ = worker.join();
+    }
+    group.bench_function("oneshot_same_thread_hop", |b| {
+        use squeezefs_ipc::sqz_channel::oneshot;
+        b.iter(|| {
+            let (tx, rx) = oneshot::channel::<u32>();
+            let _ = tx.send(7);
+            let v = squeezefs_ipc::sqz_blocking::block_on(rx).unwrap_or(0);
+            black_box(v);
+        });
+    });
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_read_dest_bound,
@@ -438,7 +536,8 @@ criterion_group!(
     bench_classifier,
     bench_assembly_join,
     bench_sparse_lseek,
-    bench_tier_publish_hop
+    bench_tier_publish_hop,
+    bench_fill_issue_economy
 );
 
 criterion_main!(benches);

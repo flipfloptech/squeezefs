@@ -362,8 +362,8 @@ pub trait Filesystem {
     ///
     /// the name of the method is misleading, since (unlike fsync) the filesystem is not forced to
     /// flush pending writes. One reason to flush data, is if the filesystem wants to return write
-    /// errors. If the filesystem supports file locking operations ([`setlk`][Filesystem::setlk],
-    /// [`getlk`][Filesystem::getlk]) it should remove all locks belonging to `lock_owner`.
+    /// errors. If the filesystem supports file locking operations (`setlk`, `getlk` — the
+    /// `file-lock` feature) it should remove all locks belonging to `lock_owner`.
     async fn flush(&self, req: Request, inode: Inode, fh: u64, lock_owner: u64) -> Result<()> {
         Err(libc::ENOSYS.into())
     }

@@ -70,7 +70,7 @@
 //!   COMMIT copies out of it with zero page locking. The §5.4
 //!   lease-severance law composes unchanged: a FUSE_WRITE payload lease
 //!   points into the kmbuf region (held alive by the shared
-//!   [`PayloadArena`] Arc), and the commit gate already defers
+//!   `PayloadArena` Arc), and the commit gate already defers
 //!   COMMIT_AND_FETCH — which is the only trigger for a kernel-side
 //!   recycle of the ent's buffer — until the lease drops. **Deferred
 //!   re-arm ≡ deferred recycle: same boundary.**
@@ -87,6 +87,12 @@
 //!   everything else. Requires the kmbuf surface, the kmbuf lever, and
 //!   CAP_SYS_ADMIN; every decline is loud (never a silent no-op), and a
 //!   kernel that refuses the zc REGISTER degrades to BufRing loudly.
+//!
+//! [`kmbuf_surface`]: crate::raw::connection::kmbuf::kmbuf_surface
+//! [`KmbufSurface::Absent`]: crate::raw::connection::kmbuf::KmbufSurface::Absent
+//! [`KmbufQueue`]: crate::raw::connection::kmbuf::KmbufQueue
+//! [`KmbufQueue::note_delivery`]: crate::raw::connection::kmbuf::KmbufQueue::note_delivery
+//! [`FUSE_URING_RINGBUF_GROUP`]: crate::raw::connection::kmbuf::FUSE_URING_RINGBUF_GROUP
 
 #![cfg(all(target_os = "linux", feature = "tokio-runtime"))]
 

@@ -473,7 +473,7 @@ impl AlignedBufPool {
 
     /// PERF-4 (b): slab-backed constructor — the initial `capacity`
     /// backings are `capacity` stride-`buf_size` slots of ONE contiguous
-    /// aligned allocation ([`SlabRegion`]), exposed via
+    /// aligned allocation (`SlabRegion`), exposed via
     /// [`Self::slab_range`] for io_uring fixed-buffer registration. Same
     /// bytes the per-buffer constructor eagerly allocated (zeroed at
     /// birth, lazily committed until touched — registration is what

@@ -19,12 +19,12 @@
 //!   (the `on_kill` seam runs BEFORE the new lease becomes visible, so
 //!   the dead epoch's quarantine precedes any grant under the new one —
 //!   the shipped `join` order, preserved);
-//! * **kill is exactly-once by pop ownership** ([`Self::revoke`]'s
+//! * **kill is exactly-once by pop ownership** ([`GrantTableCore::revoke`]'s
 //!   `clients` removal is the linearization point — racing revoke /
 //!   expiry paths retire a client's grants and quarantine its in-flight
 //!   set exactly once);
 //! * **a grant can never outlive its lease**
-//!   ([`Self::commit_grant_if_current`] — validate-and-commit as ONE
+//!   ([`GrantTableCore::commit_grant_if_current`] — validate-and-commit as ONE
 //!   step under the `clients` lock, never check-then-commit across the
 //!   arbitration await: the rung-4 loom finding's fix);
 //! * **the grace window admits reclaim only and closes exactly once**
@@ -34,8 +34,8 @@
 //! (`LocalLockManager`) and the S7 quarantine stay in
 //! `src/data_grant.rs`; `L` is the authority's own lease handle
 //! (`LockLease` in production — dropping it is what makes the bytes
-//! grantable again, which is why [`Self::revoke`] drops retired entries
-//! INSIDE the call rather than returning them).
+//! grantable again, which is why [`GrantTableCore::revoke`] drops retired
+//! entries INSIDE the call rather than returning them).
 
 #[cfg(loom)]
 pub(crate) mod sync {

@@ -21,9 +21,9 @@
 //!   read-only workloads = unexpected writers; `miss` growth on warm
 //!   workloads = fast-path rot.
 //! - **Async handoff (read demotions + ALL v1 writes)**: the op packages
-//!   onto the **fuse3 per-core handler lanes** ([`handoff_spawn`] →
+//!   onto the **fuse3 per-core handler lanes** (`handoff_spawn` →
 //!   `tpc_spawn` — the same venue kernel-lane handlers run on; the
-//!   2026-07-26 handoff-economy fix, see [`handoff_spawn`]'s docs) and
+//!   2026-07-26 handoff-economy fix, see `handoff_spawn`'s docs) and
 //!   runs the REAL handler ([`fuse3::raw::Filesystem::read`] /
 //!   [`Filesystem::write`]) — same inode locks, same lease/fencing
 //!   acquisition, same coverage-union write-through, same W1 patch
@@ -541,7 +541,7 @@ pub enum InvalScope {
 /// of the window, and the last unbind of an inode fires a whole-inode
 /// shootdown so nothing the window suppressed outlives the bindings.
 ///
-/// [`Notify`]: fuse3::raw::Notify
+/// [`Notify`]: fuse3::notify::Notify
 pub(crate) struct Invalidator {
     hook: Arc<dyn Fn(u64, InvalScope) + Send + Sync>,
     window: std::time::Duration,

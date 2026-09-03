@@ -1925,7 +1925,7 @@ pub fn effective_bound_ms() -> u64 {
 }
 
 /// Finding 18's engagement gauge: decay steps taken by an expired ask
-/// (see [`PROD_DECAYS`]).
+/// (see `PROD_DECAYS`).
 pub fn prod_decays() -> u64 {
     PROD_DECAYS.load(Ordering::Relaxed)
 }

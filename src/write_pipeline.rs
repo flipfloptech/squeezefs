@@ -139,7 +139,7 @@ pub static PIPELINE_INFLIGHT_PERMITS: AtomicU64 = AtomicU64::new(0);
 /// least once behind the depth target).
 pub static PIPELINE_ADMISSION_WAITS: AtomicU64 = AtomicU64::new(0);
 
-/// Set the [`TEST_PREPARK_STALL_US`] seam (tests only).
+/// Set the `TEST_PREPARK_STALL_US` seam (tests only).
 pub fn set_test_prepark_stall_us(us: u64) {
     TEST_PREPARK_STALL_US.store(us, Ordering::Relaxed);
 }

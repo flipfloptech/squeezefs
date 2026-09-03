@@ -50,6 +50,8 @@
 //! NFSv4's non-persistent reply cache gives. Making that exactly-once
 //! needs a DURABLE reply cache, which is S3.5's intent-record machinery;
 //! this stage does not fake it.
+//!
+//! [`super::ownership_armed`]: crate::meta_ship::ownership_armed
 
 use super::owners::{self, PeerOwner};
 use super::tokens;

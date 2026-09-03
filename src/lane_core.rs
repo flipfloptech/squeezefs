@@ -49,6 +49,10 @@
 //! Dependency-free so `loom-models/` can `#[path]`-include it and
 //! exhaustively check the mint / publish / install interleavings. The main
 //! build never sets `cfg(loom)`.
+//!
+//! [`lane_of`]: crate::lane_core::lane_of
+//! [`next_in_lane_at_or_above`]: crate::lane_core::next_in_lane_at_or_above
+//! [`LaneCursor::mint`]: crate::lane_core::LaneCursor::mint
 
 #[cfg(loom)]
 pub(crate) mod atomic {

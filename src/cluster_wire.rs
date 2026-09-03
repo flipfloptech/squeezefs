@@ -1001,7 +1001,7 @@ impl SessionAuthn {
 ///
 /// Returns the rustls `ServerConfig` (the rip-tokio conversion: sessions
 /// run sync `rustls::StreamOwned` on OS threads — see
-/// [`tls_server_handshake`]).
+/// `tls_server_handshake`).
 pub fn tls_acceptor(security: &ClusterSecurityConfig) -> Result<Arc<rustls::ServerConfig>> {
     let ca = require_ca(security)?;
     let cfg = rustls_server_config(&ca)?;
@@ -1330,8 +1330,9 @@ pub enum RpcFrame {
 
 /// An owner-side RPC implementation.
 ///
-/// `call` is **synchronous by contract**, and runs on a pinned
-/// [`ServicePool`] lane. §6.7's arbitration is RAM-only — an `scc` probe
+/// `call` is **synchronous by contract**, and runs on the connection's own
+/// OS thread (`sqz-clw-conn`, one per admitted connection — the module's
+/// §3). §6.7's arbitration is RAM-only — an `scc` probe
 /// plus one atomic — so synchronous is the right shape; anything that must
 /// await (a metadata commit, a device barrier) belongs on an explicit
 /// handoff to the runtime, exactly as `ipc_service` hands off, and must
@@ -1661,7 +1662,7 @@ impl ClusterStream {
     /// full-duplex sessions: one thread reads while others write).
     /// Plaintext halves are dup'd sockets; TLS halves share the rustls
     /// session under a mutex, with the reader parking in bounded
-    /// [`TLS_HALF_POLL_TICK`] slices so a parked read never starves the
+    /// `TLS_HALF_POLL_TICK` slices so a parked read never starves the
     /// writer.
     pub fn split(self) -> std::io::Result<(ClusterReadHalf, ClusterWriteHalf)> {
         match self.0 {
@@ -1745,7 +1746,7 @@ pub struct ClusterReadHalf {
 impl ClusterReadHalf {
     /// Bound every subsequent read. Plaintext: the socket timeout. TLS:
     /// enforced across the mutex-sliced poll loop, so the bound holds
-    /// even though each socket park is a [`TLS_HALF_POLL_TICK`] slice.
+    /// even though each socket park is a `TLS_HALF_POLL_TICK` slice.
     pub fn set_read_timeout(&mut self, d: Option<Duration>) -> std::io::Result<()> {
         match &self.inner {
             HalfInner::Tcp(s) => s.set_read_timeout(d),

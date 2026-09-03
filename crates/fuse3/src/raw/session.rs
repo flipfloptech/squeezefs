@@ -6113,11 +6113,11 @@ fn same_lane_dispatch_enabled() -> bool {
 /// measured.
 ///
 /// `unique` is the request's op id (audit A2): the handler future runs
-/// under an [`op_trace::scope`] bound to it, so every hook below the
-/// handler — router, device funnel, conveyor — reads the op it serves
-/// from the task-scoped current op; the scope's first poll stamps
-/// `handler_entry`. An unsampled (or disarmed) op binds 0 and the scope
-/// is a plain field compare per poll.
+/// under an [`op_trace::scope`](crate::raw::op_trace::scope) bound to it, so
+/// every hook below the handler — router, device funnel, conveyor — reads
+/// the op it serves from the task-scoped current op; the scope's first
+/// poll stamps `handler_entry`. An unsampled (or disarmed) op binds 0 and
+/// the scope is a plain field compare per poll.
 #[inline]
 fn spawn_read<F>(span: Span, unique: u64, fut: F)
 where

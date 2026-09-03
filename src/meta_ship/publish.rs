@@ -71,6 +71,9 @@
 //!   construction and groups by owner; nothing here spans two authorities
 //!   inside one transaction (that is S3.5, and S8's `cross_owner_error` is
 //!   the refusal wherever it can be reached).
+//!
+//! [`super::ownership_armed`]: crate::meta_ship::ownership_armed
+//! [`PublishRequestFrame`]: crate::meta_ship::publish::PublishRequestFrame
 
 use super::service::DedupWindow;
 use super::wire::{WireDirEntry, WireError, WireInode};
@@ -1877,7 +1880,7 @@ squeezefs_ipc::sqz_task_local! {
     static ARBITER_FOLD: ();
 }
 
-/// Run `f` under the arbiter-fold scope (see [`ARBITER_FOLD`]).
+/// Run `f` under the arbiter-fold scope (see `ARBITER_FOLD`).
 pub async fn with_arbiter_fold<F: std::future::Future>(f: F) -> F::Output {
     ARBITER_FOLD.scope((), f).await
 }
@@ -2942,8 +2945,8 @@ pub fn uninstall_extent_flush_executor() {
 /// commits on the backend DIRECTLY, bypassing the authority's own
 /// fs-level RAM metadata cache — so its fold/writeback later computed a
 /// DISPLACED-release set from a view that never saw the co-writer's last
-/// direct merge, and the superseded key's take dangled ([C8] '1 durable
-/// vs 0 layout references' + [C2] leak). The mount arm installs the
+/// direct merge, and the superseded key's take dangled (\[C8\] '1 durable
+/// vs 0 layout references' + \[C2\] leak). The mount arm installs the
 /// authority fs's invalidation here (`metadata_cache.remove` + attr
 /// invalidate — the co-writer side has carried the mirror-image
 /// `install_release_hook` since rung 17); the serve wrapper calls it for
@@ -3144,9 +3147,10 @@ pub async fn ship_free_blocks(
 }
 
 /// **Ship one block-ref population read** to the owner at `endpoint` —
-/// the owner-partitioned half of [`crate::cowriter::durable_block_refcounts`]
-/// (finding 13): the answer is the peer's LIVE-tree count over the volumes
-/// it owns, in request order.
+/// the owner-partitioned half of
+/// [`crate::cowriter::durable_block_refcounts_with`] (finding 13): the
+/// answer is the peer's LIVE-tree count over the volumes it owns, in
+/// request order.
 ///
 /// Pure read, transport-resend-safe; a failure is returned loud — the
 /// shipped-free serve that needed it refuses rather than validating

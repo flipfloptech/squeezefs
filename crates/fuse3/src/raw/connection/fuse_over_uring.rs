@@ -1876,7 +1876,8 @@ impl SubmitBatch {
 }
 
 /// Record one `commit_flush` span per op class the flushed batch carried
-/// (see [`TransportPhase::CommitFlush`] for the sampling contract).
+/// (see [`crate::raw::read_phase::TransportPhase::CommitFlush`] for the
+/// sampling contract).
 fn record_commit_flush(had_reads: bool, had_writes: bool, dur: Duration) {
     use crate::raw::read_phase::{
         read_transport_phase_record, write_transport_phase_record, TransportPhase,
@@ -2514,7 +2515,7 @@ pub struct TransportGeometry {
 
 impl TransportGeometry {
     /// Resolve the session geometry: environment + sysconf + sysctl
-    /// inputs, then the pure [`Self::plan`]. `desired_max_write` is the
+    /// inputs, then the pure `Self::plan`. `desired_max_write` is the
     /// filesystem's INIT desire; the plan negotiates it against the
     /// kernel's `fs.fuse.max_pages_limit` and the payload budget.
     pub fn resolve(
@@ -3814,7 +3815,7 @@ impl FuseOverUring {
         }
     }
 
-    /// True once workers are live (may still be registering). Prefer [`is_ready`] for the
+    /// True once workers are live (may still be registering). Prefer [`Self::is_ready`] for the
     /// session read path.
     pub fn is_active(&self) -> bool {
         self.active.load(Ordering::Relaxed)
@@ -4164,7 +4165,7 @@ fn build_queue_ring(
 
 struct Ent {
     /// Header slot. Classical mode: points into `_owned_header` (the
-    /// per-ent Box the REGISTER iov[0] names). kmbuf mode: points into
+    /// per-ent Box the REGISTER `iov[0]` names). kmbuf mode: points into
     /// the queue's fixed headers region (`KmbufQueue::header_ptr` —
     /// index 0 of the ring's fixed-buffer table), which the kernel
     /// reads/writes through the registered buffer instead of GUP.

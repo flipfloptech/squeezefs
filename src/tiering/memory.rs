@@ -526,7 +526,7 @@ impl MemoryCache {
         self.put_with_class_validated(key, value, protected, referenced, stream, None)
     }
 
-    /// [`Self::put_with_class`] with the finding-17 ATOMIC insert-time
+    /// `Self::put_with_class` with the finding-17 ATOMIC insert-time
     /// validation: `validate` (when present) runs under the entry's bucket
     /// writer lock immediately before the insert becomes visible; a refusal
     /// inserts nothing and removes any existing entry under the key (its

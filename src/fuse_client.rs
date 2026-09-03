@@ -1557,7 +1557,7 @@ struct OpSlot {
     kind: std::sync::atomic::AtomicU32,
     /// Primary ino argument (parent for name-ops) — the watchdog's target.
     ino: AtomicU64,
-    /// Op start, ns since [`prof_epoch`] — the watchdog's overdue test.
+    /// Op start, ns since `PROF_EPOCH` — the watchdog's overdue test.
     start_ns: AtomicU64,
     /// Finding 37: the op's LAST-PASSED STATION (`OpStation`) — the
     /// watchdog's parked-await attribution. One relaxed store per
@@ -8308,7 +8308,7 @@ pub struct SqueezefsFilesystem {
     /// wb-cache torn-JSON fix. Shared across handler clones (`Arc`, the
     /// same one-cell law as the fields above: LOOKUP mints on one queue,
     /// GETATTR/OPEN/READ serve on any other). FORGET/BATCH_FORGET retire
-    /// entries; [`VIRTUAL_GEN_REGISTRY_CAP`] bounds a never-FORGETting
+    /// entries; `VIRTUAL_GEN_REGISTRY_CAP` bounds a never-FORGETting
     /// kernel.
     pub virtual_gen_payloads:
         std::sync::Arc<dashmap::DashMap<u64, VirtualGenEntry, ahash::RandomState>>,
@@ -15413,11 +15413,12 @@ impl SqueezefsFilesystem {
     /// before any active-block / backend I/O (block tasks open their own connections).
     /// (D14 write-side zc leg: the payload is an `Into<WritePayload>` —
     /// plain `Bytes` for every classical/internal caller, or a
-    /// [`WritePayload::Slot`] carrying the FUSE WRITE's payload HELD in
-    /// the transport's sparse slot. The W1 patch shape consumes a slot
-    /// by direct slot→device DMA — zero daemon copies — and every other
-    /// shape materializes it lazily through the memoized extraction, so
-    /// eligible writes never pay the extraction round trip.)
+    /// [`WritePayload::Slot`](crate::routing::WritePayload::Slot) carrying
+    /// the FUSE WRITE's payload HELD in the transport's sparse slot. The
+    /// W1 patch shape consumes a slot by direct slot→device DMA — zero
+    /// daemon copies — and every other shape materializes it lazily
+    /// through the memoized extraction, so eligible writes never pay the
+    /// extraction round trip.)
     /// Device-overlay PR B2 — the HOLD-gate face of the eligibility
     /// ladder (sync, lock-free — the gate runs on the transport
     /// worker): the same screen `try_device_overlay_store` re-runs
@@ -18022,7 +18023,7 @@ impl SqueezefsFilesystem {
     ///
     /// Outcomes: durable publish retires the overlay; a fencing expiry
     /// CONVERGES by re-presenting the ino's current generation
-    /// ([`Self::fencing_retry_token`] — the 2026-08-06 tail-loss fix;
+    /// (`Self::fencing_retry_token` — the 2026-08-06 tail-loss fix;
     /// the parked entry is the newest custody in existence, so dropping
     /// it on a process-local lease rotation was silent data loss); any
     /// other failure rides the never-lossy ladder (staging fallback +
@@ -18609,7 +18610,7 @@ impl SqueezefsFilesystem {
 
     /// §4.1 clause 2 (design-write-inode-convoy): the CONSERVATIVE size
     /// floor for Shared classification — the **opposite** direction of
-    /// [`Self::freshest_size`] (whose `max` serves the never-lose-acked-
+    /// `Self::freshest_size` (whose `max` serves the never-lose-acked-
     /// bytes law). This takes the *minimum* of the two live RAM caches
     /// and returns `None` on any miss: a miss routes to a write-guard
     /// class, never to a fetch (KD-2 — no I/O before or under Shared).
@@ -21578,7 +21579,8 @@ pub struct GdsBlockRange {
 ///   computing `end_offset - 1`;
 /// - `end_block` is clamped to the file's real last block, so a request
 ///   running past EOF can never name a block the file does not have;
-/// - the resulting span is bounded by [`max_block_keys_per_call`] — the
+/// - the resulting span is bounded by
+///   [`crate::routing::max_block_keys_per_call`] — the
 ///   amplifier ([`crate::routing::DataRouter::load_striped_block_keys`])
 ///   materializes one `Vec` entry per block, and 4.29 G of them is ~137 GB
 ///   (reachable WITHOUT any overflow via a file at `max_file_size()`).
@@ -28164,7 +28166,7 @@ impl SqueezefsFilesystem {
 
 /// W2 fold upload (design-random-small-writes §5.2): one durable CoW
 /// block write + map merge for a fold-composed image. The
-/// [`upload_active_block_bytes`] shape (merge presents the ino's CURRENT
+/// `upload_active_block_bytes` shape (merge presents the ino's CURRENT
 /// generation — FIND-M11-A) plus `upload_full_block`'s dead-incarnation
 /// shielding: the new key's read tiers are purged after the DMA and
 /// before the map names it, and the stale whole-file LRU snapshots drop

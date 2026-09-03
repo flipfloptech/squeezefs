@@ -8,9 +8,10 @@
 //! wedges every committer behind it with no census presence (the OQ-5
 //! class, one venue up). This module gives them a first-party home:
 //!
-//! * A small process-global [`sqz_exec::LaneExec`] pool (`sqz-meta{N}`
-//!   OS threads — 2, or 1 on a uniprocessor: the population is a
-//!   handful of mostly-parked loops, not a throughput venue).
+//! * A small process-global [`squeezefs_ipc::sqz_exec::LaneExec`] pool
+//!   (`sqz-meta{N}` OS threads — 2, or 1 on a uniprocessor: the
+//!   population is a handful of mostly-parked loops, not a throughput
+//!   venue).
 //! * Each thread enters a dedicated parked current-thread tokio runtime
 //!   handle (`sqz-meta-timerdrv`) so the tasks' `tokio::time`
 //!   sleeps/intervals keep working — the driver only FIRES wakers; the

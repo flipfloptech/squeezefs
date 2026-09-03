@@ -419,7 +419,7 @@ pub struct ClientStatsPage {
     /// own CQ side (the PR 3 reap-on-submit scout; 0 with the lever
     /// off — its engagement instrument).
     pub il_submit_harvested: AtomicU64,
-    /// Client reap park eras begun (cqe park_begin[_batch] calls) — the
+    /// Client reap park eras begun (cqe `park_begin[_batch]` calls) — the
     /// denominator for wakes-per-era attribution and PR 3's
     /// pre-registered predicted-wash falsification input.
     pub il_park_eras: AtomicU64,

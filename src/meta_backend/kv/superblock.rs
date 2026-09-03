@@ -804,7 +804,7 @@ impl SuperblockV3 {
     }
 
     /// [`Self::encode_sector`] stamped with a DUR-5 superblock
-    /// generation (see [`OFF_SB_GENERATION`]).
+    /// generation (see `OFF_SB_GENERATION`).
     pub fn encode_sector_at_generation(&self, generation: u64) -> Result<Vec<u8>, KvError> {
         let mut img = self.encode_sector_body()?;
         img[OFF_SB_GENERATION..OFF_SB_GENERATION + 8].copy_from_slice(&generation.to_le_bytes());
@@ -1296,7 +1296,7 @@ pub async fn classify_volume_slot(path: &Path) -> Result<(VolumeFormat, Superblo
 /// primary untouched.
 ///
 /// Both images carry `generation`; callers derive it with
-/// [`next_superblock_generation`] so newest-valid-wins is decidable.
+/// `next_superblock_generation` so newest-valid-wins is decidable.
 pub async fn write_superblock_v3(path: &Path, sb: &SuperblockV3) -> Result<(), KvError> {
     let generation = next_superblock_generation(path).await;
     write_superblock_at_generation(path, sb, generation).await

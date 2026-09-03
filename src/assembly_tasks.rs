@@ -33,7 +33,7 @@
 //!    RES-9 face, where each output is a minted-and-published block
 //!    key that must be freed rather than leaked to fsck.
 //!
-//! [`MintedBlockGuard`] covers the task-interior window RES-9 names:
+//! `MintedBlockGuard` covers the task-interior window RES-9 names:
 //! between `allocate_block` and the `Ok` return that surfaces the block
 //! to the caller, ANY exit (a `?` error, a panic, or a cancel-gate drop
 //! landing at an await) frees the minted offset instead of leaking an

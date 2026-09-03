@@ -690,7 +690,7 @@ impl BlockAllocator {
     }
 
     /// Wire the lane free HARVEST sink (rung 10 — co-writer engagements
-    /// only; see [`LanePartition::harvest`]).
+    /// only; see `LanePartition::harvest`).
     pub fn set_lane_harvest_sink(&self, sink: crate::data_alloc_lane::LaneHarvestSink) {
         if let Some(lanes) = self.lanes.get() {
             let _ = lanes.harvest.set(sink);
@@ -740,7 +740,7 @@ impl BlockAllocator {
     /// WERO preempt of the dead lane's host on a PR substrate, recovery's
     /// proof of death otherwise. Adoption needs **no new durable
     /// structure** because the reservation watermark is keyed on the LANE,
-    /// not the holder: [`Self::reserve_lane_frontier`] declares the dense
+    /// not the holder: `Self::reserve_lane_frontier` declares the dense
     /// frontier for every owned lane, so any future holder of an adopted
     /// lane recovers above the indices we minted in it.
     ///
@@ -1508,10 +1508,10 @@ impl BlockAllocator {
 
     /// Record the lifetime a persisted key names for `offset` **without**
     /// minting one — first-touch seeding from the keys mount recovery
-    /// walks ([`Self::owned_offset`]), so an offset laid down by a previous
+    /// walks (`Self::owned_offset`), so an offset laid down by a previous
     /// mount presents its real era instead of "unknown".
     ///
-    /// Never overwrites a stamp: an allocation ([`Self::claim_block_idx`])
+    /// Never overwrites a stamp: an allocation (`Self::claim_block_idx`)
     /// is the only event that changes an offset's lifetime, and a walked
     /// key must not be able to talk this mount out of the lifetime it just
     /// minted.

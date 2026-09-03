@@ -124,7 +124,7 @@ const NOP_WAKE: u64 = u64::MAX;
 static TEST_DDW_CQE_HOLD: AtomicBool = AtomicBool::new(false);
 
 /// Arm/release the CQE-consumption hold (tests only — see
-/// [`TEST_DDW_CQE_HOLD`]). Callers own reopening it: the test suites wrap
+/// `TEST_DDW_CQE_HOLD`). Callers own reopening it: the test suites wrap
 /// it in an RAII guard so a panicking assertion can never wedge the
 /// engine's shutdown drain behind a closed gate.
 pub fn set_test_ddw_cqe_hold(hold: bool) {
@@ -510,7 +510,7 @@ impl<P> WriteTrains<P> {
 
     /// The CQE postlude's pop: the next follower while the tenure has
     /// room, else CLOSE the train (`None` — the caller releases the
-    /// guard and drains residuals via [`Self::pop_parked`]). The close
+    /// guard and drains residuals via [`Self::pop_residual`]). The close
     /// and the pop are one atomic decision under the entry's exclusive
     /// access, which is what makes a park-vs-close race impossible: a
     /// parker either lands before this (and is popped here or by the
@@ -538,7 +538,7 @@ impl<P> WriteTrains<P> {
 
     /// Close the train WITHOUT popping (the error-path releases: engine
     /// refusals, fence refusals, the reaper's leak arm). Residuals drain
-    /// via [`Self::pop_parked`] after the guard drops.
+    /// via [`Self::pop_residual`] after the guard drops.
     fn close(&self, key: (u64, u32)) {
         if let scc::hash_map::Entry::Occupied(mut o) = self.map.entry_sync(key) {
             o.get_mut().open = false;

@@ -153,8 +153,8 @@ const MIN_BLOCK_KEYS_PER_CALL: u32 = 1024 * 1024 * 1024 / 4096;
 
 /// VAL-1 ceiling (pre-RC engineering spec §3), derived from the R5 memory
 /// budget: at most 1/1024 of the budget may be spent materializing ONE
-/// block-key resolve, at [`BLOCK_KEY_ENTRY_BYTES`] per entry, floored at
-/// [`MIN_BLOCK_KEYS_PER_CALL`]. Pure function of the budget so the
+/// block-key resolve, at `BLOCK_KEY_ENTRY_BYTES` per entry, floored at
+/// `MIN_BLOCK_KEYS_PER_CALL`. Pure function of the budget so the
 /// derivation is tie-testable (`tests/gds_ioctl_range_tests.rs`).
 pub fn max_block_keys_for_budget(budget_bytes: u64) -> u32 {
     let derived = budget_bytes / 1024 / BLOCK_KEY_ENTRY_BYTES;
@@ -1347,7 +1347,7 @@ const INDIRECT_MAP_HEADER_LEN: usize = 24;
 const INDIRECT_MAP_SUM_OFF: usize = 16;
 
 /// Serialize a block map for its indirect spill block (see
-/// [`INDIRECT_MAP_MAGIC`]). Entries are sorted by block index for
+/// `INDIRECT_MAP_MAGIC`). Entries are sorted by block index for
 /// deterministic on-disk bytes. The retired pre-versioned shape serialized
 /// `Vec<(u32, u64)>` bare offsets, which lost the owning backend: on
 /// multi-volume mounts every over-spill file's non-first-volume blocks were
@@ -1383,7 +1383,7 @@ pub fn encode_indirect_block_map(
     Ok(out)
 }
 
-/// Decode an indirect block-map blob (see [`INDIRECT_MAP_MAGIC`]). Trailing
+/// Decode an indirect block-map blob (see `INDIRECT_MAP_MAGIC`). Trailing
 /// padding past the bincode payload is ignored (blobs are written
 /// 4 KiB-aligned and read back whole-block). Anything without the versioned
 /// header — notably the retired pre-versioned bare-offset `Vec<(u32, u64)>`
@@ -2346,7 +2346,7 @@ impl BackendRouter {
 
     /// Borrow-form of [`Self::parse_block_key`] (r5 internal-time
     /// program: the direct-drive probe's parse-carry — same
-    /// [`Self::split_key`] core, zero allocation; the returned `&str`
+    /// `Self::split_key` core, zero allocation; the returned `&str`
     /// borrows the caller's key).
     pub fn split_block_key<'a>(&self, block_key: &'a str) -> Result<(&'a str, u64)> {
         let (be_id, offset, _) = Self::split_key(block_key)?;
@@ -2355,7 +2355,7 @@ impl BackendRouter {
 
     /// [`Self::parse_block_key`] plus the key's **incarnation** (spec §6.2
     /// item 6) — not a fork: both parses run the SAME extraction core
-    /// ([`Self::split_key`]) and this one keeps the lifetime the other
+    /// (`Self::split_key`) and this one keeps the lifetime the other
     /// drops, so every existing consumer (free, refcount, durable block
     /// references, fsck, the movers) resolves the same `(backend, offset)`
     /// it always did.
@@ -2450,7 +2450,7 @@ impl BackendRouter {
     /// allocator's per-offset map
     /// ([`crate::block_allocator::BlockAllocator::live_incarnation`]), and
     /// when it IS engaged the body is built ONCE and moved into the key
-    /// rather than copied ([`attach_incarnation`]).
+    /// rather than copied (`attach_incarnation`).
     ///
     /// **Predicted, not measured** (ruling D11 defers benches): the
     /// un-stamped mint holds its pre-item-6 cost and the stamped mint costs
@@ -4429,7 +4429,7 @@ impl EscalationCooldown {
 /// subset converges to RAM while the tail stays device-true.
 ///
 /// Concurrency: single-word `Relaxed` atomics, racy-tolerant by the same
-/// argument as [`GhostTable`] (a lost update is one extra or one denied
+/// argument as `GhostTable` (a lost update is one extra or one denied
 /// escalation, never a correctness event); no cross-word invariant ⇒ no
 /// loom model required.
 pub struct AdmissionGovernor {
@@ -6557,19 +6557,6 @@ impl DataRouter {
             .map(|_verdict| ())
     }
 
-    /// [`Self::save_metadata_to_backend`] carrying the transaction's
-    /// **durable block-reference operations** (pre-RC engineering spec
-    /// §6.2 item 1): every reference this save's layout gains or loses,
-    /// staged into the SAME commit as the layout record. Sites that mutate
-    /// a block map compute them at O(batch) — they already know the
-    /// inserted and displaced keys — and every other save passes `&[]`.
-    ///
-    /// A missed op is not silent: the durable-vs-derived census
-    /// ([`Self::verify_durable_block_refs`]) is the oracle, and its drift
-    /// is an fsck finding.
-    /// Commit a standalone durable block-reference release for `ino` (spec
-    /// §6.2 item 1) — the reclaim path's ledger teardown. See the ordering
-    /// note at the call site in [`Self::delete_file`].
     /// **The mount-time corpse sweep** (POSIX-15's missing half, found by
     /// PR 8's acceptance oracle, 2026-08-23): reclaim every `nlink == 0`
     /// inode a prior era left behind, on every volume this mount appends
@@ -6676,6 +6663,9 @@ impl DataRouter {
         Ok(swept)
     }
 
+    /// Commit a standalone durable block-reference release for `ino` (spec
+    /// §6.2 item 1) — the reclaim path's ledger teardown. See the ordering
+    /// note at the call site in [`Self::delete_file`].
     pub(crate) async fn release_block_refs(
         &self,
         ino: u64,
@@ -6862,6 +6852,16 @@ impl DataRouter {
     /// under the cap, no indirect spill). Everything else about the
     /// save (fencing, indirect handling, RAM republish coherence) is
     /// identical.
+    ///
+    /// `block_refs` carries the transaction's **durable block-reference
+    /// operations** (pre-RC engineering spec §6.2 item 1): every reference
+    /// this save's layout gains or loses, staged into the SAME commit as
+    /// the layout record. Sites that mutate a block map compute them at
+    /// O(batch) — they already know the inserted and displaced keys — and
+    /// every other save passes `&[]`. A missed op is not silent: the
+    /// durable-vs-derived census
+    /// ([`BackendRouter::verify_durable_block_refs`]) is the oracle, and
+    /// its drift is an fsck finding.
     async fn save_metadata_to_backend_ext(
         &self,
         ino: u64,
@@ -11280,7 +11280,7 @@ impl DataRouter {
     /// **Exhaustion (2026-08-04 field rebind-starvation fix):** for
     /// `escalate_contended` callers — the pure-read posture — ladder
     /// exhaustion hands off to the SERIALIZED settle arm
-    /// ([`Self::get_block_for_index_settled`]) instead of EIO: a pure
+    /// (`Self::get_block_for_index_settled`) instead of EIO: a pure
     /// read must never fail because writers are busy. Non-escalating
     /// callers (which may hold this block's stripe) keep the loud
     /// exhaustion error.
@@ -14468,7 +14468,7 @@ impl DataRouter {
 
     /// Resolve `[start_block, end_block]` (inclusive) into per-block keys.
     /// Multi-block callers only — single-block resolves take the
-    /// allocation-free [`block_key_in`] (PERF-12).
+    /// allocation-free `block_key_in` (PERF-12).
     ///
     /// **VAL-1 bound (pre-RC engineering spec §3):** the span is capped by
     /// [`max_block_keys_per_call`] before a single entry is pushed. This
@@ -15401,10 +15401,11 @@ impl DataRouter {
     /// Every block I/O is **awaited**. On any allocate/crypto/write failure, all
     /// blocks allocated in this call are freed and the error is returned so the
     /// caller can leave the prior layout (inline/staged) untouched.
-    /// PR VL6a: the returned [`InflightAllocGuard`]s register every
-    /// fresh block as live-owner in-flight — the caller MUST hold them
-    /// until its layout commit published the mappings (drop-on-error is
-    /// exactly right: the error paths free the blocks).
+    /// PR VL6a: the returned
+    /// [`InflightAllocGuard`](crate::block_allocator::InflightAllocGuard)s
+    /// register every fresh block as live-owner in-flight — the caller
+    /// MUST hold them until its layout commit published the mappings
+    /// (drop-on-error is exactly right: the error paths free the blocks).
     async fn durable_write_sparse_blocks(
         &self,
         chunks: Vec<(u32, bytes::Bytes)>,

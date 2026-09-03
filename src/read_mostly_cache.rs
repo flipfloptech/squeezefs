@@ -80,6 +80,10 @@
 //! same happens-before edges as the moka cache they replace. The custody
 //! epoch, fill incarnation, and the rebind ladder remain the backstops for
 //! mid-DMA movement, unchanged.
+//!
+//! [`derived_touch_secs`]: crate::read_mostly_cache::derived_touch_secs
+//! [`ReadMostlyCache::insert`]: crate::read_mostly_cache::ReadMostlyCache::insert
+//! [`ReadMostlyCache::remove`]: crate::read_mostly_cache::ReadMostlyCache::remove
 
 use std::hash::{BuildHasher, Hash};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -108,7 +112,7 @@ fn coarse_now_ms() -> u64 {
     (ts.tv_sec as u64) * 1_000 + (ts.tv_nsec as u64) / 1_000_000 + 1
 }
 
-/// Injectable clock (tests step it; production is [`coarse_now_ms`]).
+/// Injectable clock (tests step it; production is `coarse_now_ms`).
 pub type RmClock = Arc<dyn Fn() -> u64 + Send + Sync>;
 
 /// Pin predicate: entries it holds survive policy eviction (the dirty pin).

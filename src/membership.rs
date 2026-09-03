@@ -1155,7 +1155,7 @@ impl LeaseClocks {
     /// cannot fail-stop before the owner may re-grant is the divergence
     /// this asymmetry exists to prevent, and silently shortening someone
     /// else's lease would hide it. The arithmetic itself lives in
-    /// [`crate::lease_clock_core`] (spec §6.9's `lease_clock_core` loom
+    /// `crate::lease_clock_core` (spec §6.9's `lease_clock_core` loom
     /// obligation — the law's exact nanosecond form, deterministic tests
     /// there).
     pub fn with_params(t_owner: Duration, skew_max: Duration, d_purge: Duration) -> Result<Self> {
@@ -2968,7 +2968,7 @@ pub enum RenewalTick {
 pub static TEST_RENEW_TICK_HOLD_MS: AtomicU64 = AtomicU64::new(0);
 
 /// One member renewal-cadence decision — the body of the renewal loop
-/// ([`spawn_member_renewal`] is the cadence shell around it): renew, and
+/// (`spawn_member_renewal` is the cadence shell around it): renew, and
 /// on failure re-join (a RECLAIM — it presents the epoch it holds, which
 /// is what a successor's grace window admits) until its OWN deadline, at
 /// which point it fail-stops itself rather than waiting for the owner's

@@ -18,11 +18,11 @@
 //!   re-enqueues after the poll — the loom-modeled never-lost law.
 //! * **The park is time-bounded** ([`TICK`]): even against a bug in our
 //!   own notify path, the lane re-checks its queue every tick. A tick
-//!   that finds runnable work counts [`tick_rescues`] — ≈0 healthy
+//!   that finds runnable work counts `tick_rescues` — ≈0 healthy
 //!   (a benign push-vs-timeout race is possible), growth = a notify
 //!   delivery bug, loudly.
 //! * **A panicking task never kills the lane** (`catch_unwind` per
-//!   poll): the task completes-by-panic, [`task_panics`] grows (the
+//!   poll): the task completes-by-panic, `task_panics` grows (the
 //!   detached-task-panics discipline), the lane serves on.
 //! * **The park is pluggable** ([`LanePark`], e2e perf audit C-2): a lane
 //!   that owns an I/O ring parks IN the ring (`io_uring_enter` with a

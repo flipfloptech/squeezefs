@@ -54,7 +54,7 @@ pub fn clear_fail_next_writes() {
 }
 
 /// Test seam: the worker stalls the next N read submissions by
-/// [`read_stall_ms`] each — the deterministic stand-in for a
+/// `STALL_READ_MS` each — the deterministic stand-in for a
 /// wedged/fabric-stalled device (the `SQUEEZEFS_TEST_WRITE_STALL_MS`
 /// precedent: load selects such schedules; this lever selects them
 /// deterministically — `tests/nvme_dest_ownership_tests.rs`, MEM-1).
@@ -401,9 +401,9 @@ fn finish_read(
 }
 
 /// Typed payload of the exact-length contract's `UnexpectedEof` (see
-/// [`finish_read`]): carries the kernel's VALID PREFIX length so the one
+/// `finish_read`): carries the kernel's VALID PREFIX length so the one
 /// sanctioned prefix-tolerant consumer — the overlay old-image funnel,
-/// [`crate::routing::DataRouter::read_nvme_block_old_image`] — can re-read
+/// `DataRouter::read_nvme_block_old_image` — can re-read
 /// the honest prefix instead of wedging on a tail-resident short image
 /// (the generic/795 settle-wedge face, 2026-08-15). The exact-length
 /// contract itself is UNCHANGED: every other consumer still fails loud,

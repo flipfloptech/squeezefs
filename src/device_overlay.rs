@@ -13,10 +13,11 @@
 //!   reserve-before-DMA; the offset's incarnation stays UNSTABLE until
 //!   publication, so racing validated tier fills of a reused key fail
 //!   their seqlock re-check);
-//! * the **fsck guard** — [`InflightAllocGuard`], the C2/C3 in-flight
+//! * the **fsck guard** — [`crate::block_allocator::InflightAllocGuard`],
+//!   the C2/C3 in-flight
 //!   exemption. **Visibility ONLY — dropping it frees nothing**
 //!   (Rev 2 correction A);
-//! * the **mint rollback owner** — a [`MintedBlockGuard`]-class owner
+//! * the **mint rollback owner** — a `MintedBlockGuard`-class owner
 //!   (law 9 / KD-OV-11): every exit between mint and durable
 //!   publication frees the offset through it. Its disposition is
 //!   per-terminal-state: `Published` ⇒ DISARM (the durable map/ref

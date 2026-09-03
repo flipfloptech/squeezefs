@@ -129,7 +129,7 @@ pub fn owner_term() -> u64 {
 /// replayed reply can never lower an object's generation.
 ///
 /// The era floor is recorded BEFORE the grant becomes findable
-/// ([`record_grant_ordered`] — the core's order, weakening-verified in
+/// (`record_grant_ordered` — the core's order, weakening-verified in
 /// its loom model): an entry the sweep later retires must never expose a
 /// miss whose floor predates the grant's own era.
 pub fn record_grant(grant: &TokenGrant) {
@@ -807,7 +807,7 @@ pub fn recall_batch_max_from(explicit: Option<usize>, frame_cap_bytes: u32) -> u
 /// * live evidence ⇒ `4 × (rtt_p99 + owner_total_p99)` **plus the wire's
 ///   structural delivery term** (rung 12: recalls travel on the holder's
 ///   standing poll — up to two park floors of turnaround exist even at
-///   zero load; see [`RECALL_DELIVERY_TERM`]), floored at the 1 ms timer
+///   zero load; see `RECALL_DELIVERY_TERM`), floored at the 1 ms timer
 ///   grain, ceilinged at the membership lease TTL (past the TTL the
 ///   S6/S7 fence arithmetic bounds the client anyway — waiting longer
 ///   buys nothing);
@@ -832,7 +832,7 @@ pub fn recall_deadline_from(
 }
 
 /// The demotion cooldown: `8 × thrash_window` (see
-/// [`RECALL_COOLDOWN_WINDOWS`]); explicit lever wins verbatim.
+/// `RECALL_COOLDOWN_WINDOWS`); explicit lever wins verbatim.
 pub fn recall_cooldown_from(explicit_ms: Option<u64>, thrash_window: Duration) -> Duration {
     if let Some(ms) = explicit_ms {
         return Duration::from_millis(ms.max(1));

@@ -298,7 +298,7 @@ fn has_child_dir(ctrl: &Path, ns: &str) -> bool {
 ///   SERVING its subsystem (a head shared between two identities can
 ///   never verify as dedicated — the shared shape must be visible).
 ///   Serving membership is subsystem-dir-scoped
-///   ([`subsystem_serving_controller_dirs`], rung 6b): on the sqz
+///   (`subsystem_serving_controller_dirs`, rung 6b): on the sqz
 ///   host-scoped kernel a scoped SIBLING shares the subsysnqn, and a
 ///   global attr walk would read a foreign identity under a genuinely
 ///   dedicated head.
@@ -511,7 +511,7 @@ pub fn multipath_merged_shape(dev_path: &str) -> std::io::Result<Option<Multipat
 ///   its subsystem carries our identity (a dedicated controller set) —
 ///   a head round-robining a foreign identity is never handed out.
 ///   Serving membership is subsystem-dir-scoped
-///   ([`subsystem_serving_controller_dirs`], rung 6b — the 5b deferred
+///   (`subsystem_serving_controller_dirs`, rung 6b — the 5b deferred
 ///   item): on the sqz host-scoped kernel scoped SIBLING subsystems
 ///   share our subsysnqn, so a global `foreign_serves` computation read
 ///   the sibling as foreign and answered `None` for BOTH identities;

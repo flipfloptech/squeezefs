@@ -8,7 +8,7 @@
 //! never resumes past its current await point AND its future (captures
 //! included) is dropped. This module reproduces exactly that:
 //!
-//! * [`OwnedSet::spawn`] wraps every task in a [`CancelGate`] sharing
+//! * [`OwnedSet::spawn`] wraps every task in a `CancelGate` sharing
 //!   the set's cancel state. The gate's poll checks the cancel flag
 //!   FIRST: once cancelled, the inner future is never polled again —
 //!   the task cannot resume past its current await point — and the

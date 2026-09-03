@@ -80,6 +80,10 @@
 //! queue wait on (b), the lane hop on (c)); `zc_bridge_phase_ns` splits
 //! the handler's `block_fetch` on the zc leg (`Σ hops ≡ total`), and its
 //! `wake_hop` on (b) is the fused pass's run-queue wait, not a thread hop.
+//!
+//! [`ReadFastDispatch::probe`]: crate::raw::connection::fuse_over_uring::fast_dispatch::ReadFastDispatch::probe
+//! [`ReadFastDispatch::mint`]: crate::raw::connection::fuse_over_uring::fast_dispatch::ReadFastDispatch::mint
+//! [`record_served`]: crate::raw::connection::fuse_over_uring::fast_dispatch::record_served
 
 use std::sync::Arc;
 

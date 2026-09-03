@@ -385,7 +385,7 @@ pub fn span_range_shared_for_arbiter(ino: u64, start: u64, end: u64) -> bool {
 // ---------------------------------------------------------------------------
 
 /// Bytes charged per live grant record for the `dlm_grant_table_bytes`
-/// gauge: the 40-byte [`Grant`] plus its amortized `Vec` slot — the §9.2
+/// gauge: the 40-byte `Grant` plus its amortized `Vec` slot — the §9.2
 /// arithmetic's "~48 B" (*"spans are ~48 B, so even the 1 TiB block-cyclic
 /// shape is ~262,144 spans ≈ 12 MiB"*). A billing estimate for the R5
 /// authority, not a byte-exact malloc trace (the metadata_cache precedent:
@@ -991,7 +991,7 @@ pub fn test_swap_grant_seq(value: u64) -> u64 {
 /// era-composed stamp a layout delta record carries as its own chain
 /// link name (`crate::layout_wire::LayoutDelta::version`).
 ///
-/// Deliberately draws from the SAME [`GRANT_SEQ`] sequencer as the S1
+/// Deliberately draws from the SAME `GRANT_SEQ` sequencer as the S1
 /// fencing mint: `(term, seq)` uniqueness is then ONE invariant with
 /// one owner instead of two counters that must never collide, and the
 /// sequence is gap-carrying by the same law that makes gap-carrying

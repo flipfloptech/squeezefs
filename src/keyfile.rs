@@ -12,6 +12,8 @@
 //! not RSA-OAEP: execution-plan ruling D3 replaces `rsa` outright so
 //! RUSTSEC-2023-0071 (Marvin) leaves the tree instead of being
 //! adjudicated. See the design note §2 for why this and not X25519/HPKE.
+//!
+//! [`KEY_FILE_ENV`]: crate::keyfile::KEY_FILE_ENV
 
 use ring::hkdf;
 use ring::rand::{SecureRandom, SystemRandom};

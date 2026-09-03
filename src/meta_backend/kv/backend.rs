@@ -49,16 +49,16 @@
 //! (`.benchmarks/2026-09-02-d1b-publish-plane-batching.md`). Since D-2
 //! the conveyor is two stages:
 //!
-//! * **Stage A — the apply pass** ([`KvMetaBackend::conveyor_pass_task`],
-//!   [`KvMetaBackend::run_batch`]): drain → admission → union leaf locks →
+//! * **Stage A — the apply pass** (`KvMetaBackend::conveyor_pass_task`,
+//!   `KvMetaBackend::run_batch`): drain → admission → union leaf locks →
 //!   revalidate → pre-images → ONE contiguous reservation → RAM apply →
 //!   unlock → **encode + SUBMIT** the surviving entries (one `uring_fs`
 //!   submission, no wait — [`super::journal::JournalRing::
-//!   submit_entries_batch`]) → hand the [`ConveyorWindow`] to stage B.
+//!   submit_entries_batch`]) → hand the `ConveyorWindow` to stage B.
 //!   Stage A never waits on the device; its service time is the leaf-lock
 //!   window plus the encode.
-//! * **Stage B — the durability lane** ([`KvMetaBackend::
-//!   durability_lane_task`], [`KvMetaBackend::run_windows`]): one
+//! * **Stage B — the durability lane** (`KvMetaBackend::durability_lane_task`,
+//!   `KvMetaBackend::run_windows`): one
 //!   per-volume task draining windows in handoff order; per GROUP (the
 //!   head window awaited + every successor whose write has already
 //!   landed): complete the reservations, ONE completed-prefix wait, the
@@ -88,8 +88,8 @@
 //! stage B exactly as it fired from the pass: `note_barrier_failure` at
 //! the strict barrier, `note_journal_failure` on a failed write and on a
 //! stuck hole checkpoint, `JOURNAL_FAILURE_LATCH` consecutive failures
-//! latching `failed`. Each stage is panic-guarded ([`PassSentinel`],
-//! [`LaneSentinel`]): an unwind abandons the reservations (never a
+//! latching `failed`. Each stage is panic-guarded (`PassSentinel`,
+//! `LaneSentinel`): an unwind abandons the reservations (never a
 //! `completed_upto` wedge), answers every member EIO, fails out the queue
 //! behind it, and fail-stops the volume when an applied window's write
 //! outcome is unknown (RAM would diverge from replay).
@@ -730,8 +730,9 @@ pub struct KvMetaBackend {
     /// format-grade admin verbs (`repair-set`), never on the hot path.
     membership_stamp: std::sync::Mutex<Option<super::checkpoint::MembershipStamp>>,
     /// PR VL5b (§5.5.2 / KD-7): per-slot GUEST ino cursors — one
-    /// [`SlotCursor`] per hosted guest slot, seeded from the mounted
-    /// stamp's `slot_cursors` (+ the replayed per-slot maxima) and
+    /// [`super::slot_cursor_core::SlotCursor`] per hosted guest slot, seeded
+    /// from the mounted stamp's `slot_cursors` (+ the replayed per-slot
+    /// maxima) and
     /// published into every checkpoint's ledger record. Latch-free (scc)
     /// — minting is a hot-path `fetch_add`; the map itself mutates only
     /// on migration flips (control plane).
@@ -7735,7 +7736,7 @@ impl KvMetaBackend {
     ///    per-volume conveyor and leader-elects — **no await between the
     ///    two**, so a cancelled committer future can never strand a
     ///    queued entry leaderless. The election winner spawns the
-    ///    **detached, panic-guarded pass task** ([`Self::conveyor_pass`])
+    ///    **detached, panic-guarded pass task** ([`Self::conveyor_pass_task`])
     ///    and then parks on its own oneshot like every follower;
     /// 3. awaits its result. Dropping this future at the await drops
     ///    only the oneshot receiver and this frame's `Arc` refs — the

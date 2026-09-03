@@ -107,10 +107,10 @@ pub(crate) struct AreaShared {
     /// CID namespace size (== queue depth) — the `cid_slots` diagnostic's
     /// denominator (the MEM-3 no-leak instrument).
     pub cid_capacity: usize,
-    /// In-flight payload admission (see [`admission_permits`]); Arc'd so
-    /// OWNED units ([`AdmissionUnits`]) can ride the pending fill → the
-    /// completed [`super::fill_table::ZcrxFill`] (exact accounting under
-    /// cancellation — the MEM-3 custody law's admission face).
+    /// In-flight payload admission (see [`super::area::admission_permits`]);
+    /// Arc'd so OWNED units ([`AdmissionUnits`]) can ride the pending fill
+    /// → the completed [`super::fill_table::ZcrxFill`] (exact accounting
+    /// under cancellation — the MEM-3 custody law's admission face).
     pub admission: Arc<squeezefs_ipc::sqz_semaphore::Semaphore>,
     pub poisoned: AtomicBool,
     /// Round-5 blast-radius latch: a refill-starvation failover fired

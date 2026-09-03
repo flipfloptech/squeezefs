@@ -15,7 +15,7 @@
 //!   class), floor 8 (physical minimum useful parallel blocking
 //!   capacity on any host) — where `cpus` is the fleet-share-DIVIDED
 //!   sizing root the daemon feeds ([`set_sizing_parallelism`], KD-MW-14
-//!   rung 3c). Idle threads exit after [`IDLE_REAP`].
+//!   rung 3c). Idle threads exit after `IDLE_REAP`.
 
 use std::collections::VecDeque;
 use std::future::Future;

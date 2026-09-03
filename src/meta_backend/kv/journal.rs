@@ -781,7 +781,7 @@ impl JournalRing {
     /// Build one entry's write ops into `ops`: payload segments + the 24 B
     /// header of every page whose first logical byte the reservation owns
     /// (§4.4 pt 2). Shared by [`Self::write_entry`] and
-    /// [`Self::write_entries_batch`], so a conveyor batch member's bytes
+    /// [`Self::submit_entries_batch`], so a conveyor batch member's bytes
     /// are **by construction** identical to a solo commit's (the §5.5
     /// batch-of-1 equivalence). `res.len` must equal [`entry_len_for`] of
     /// `records`.

@@ -232,7 +232,7 @@ impl FuseConnection {
     }
 
     /// Start kernel FUSE-over-io_uring workers after FUSE_INIT. Required transport.
-    /// Shared with multi-queue clones via [`clone_connection`].
+    /// Shared with multi-queue clones via [`Self::clone_connection`].
     ///
     /// `geom` is the session geometry resolved by
     /// [`super::fuse_over_uring::TransportGeometry::resolve`] BEFORE the

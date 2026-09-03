@@ -30,8 +30,8 @@
 //!
 //! # The executor
 //!
-//! One [`FusedLane`] per drain-group worker: a slab of handler futures
-//! plus a shared [`FusedRunQueue`]. Wakers push their task id and wake
+//! One `FusedLane` per drain-group worker: a slab of handler futures
+//! plus a shared `FusedRunQueue`. Wakers push their task id and wake
 //! the worker through the group's EXISTING loom-verified
 //! `WakeCoalescer` + eventfd protocol (publish state → `arm()` →
 //! eventfd write — the same producer discipline `submit_reply` uses),

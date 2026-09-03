@@ -286,8 +286,8 @@ pub trait PathFilesystem {
     /// the name of the method is misleading, since (unlike fsync) the filesystem is not forced to
     /// flush pending writes. One reason to flush data, is if the filesystem wants to return write
     /// errors. If the filesystem supports file locking operations (
-    /// [`setlk`][PathFilesystem::setlk], [`getlk`][PathFilesystem::getlk]) it should remove all
-    /// locks belonging to `lock_owner`.
+    /// `setlk`, `getlk` — the `file-lock` feature) it should remove all locks belonging to
+    /// `lock_owner`.
     async fn flush(
         &self,
         req: Request,

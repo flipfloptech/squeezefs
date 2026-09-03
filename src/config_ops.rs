@@ -2046,8 +2046,9 @@ async fn stamp_mw_bit(
 ///    its LAST act (after every volume's terminal bit 11) deletes it. A
 ///    writable mount refuses while the marker exists.
 /// 2. **Serialization** — the verb asserts the D0 guard (a guarded
-///    [`KvMetaBackend::open`] of volume 0, held across every write) before
-///    its first write, so `set_incompat_bit`'s unsynchronized RMW has
+///    [`crate::meta_backend::kv::backend::KvMetaBackend::open`] of volume 0,
+///    held across every write) before its first write, so
+///    `set_incompat_bit`'s unsynchronized RMW has
 ///    exactly one setter: a second concurrent invocation refuses on the
 ///    guard, and no runtime stamper can run because the set is offline.
 ///    This guarded open is **the ONE marker-tolerant writable open**

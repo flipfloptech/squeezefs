@@ -601,7 +601,7 @@ impl WeroHold {
     /// * an unhealable loss (re-acquire refused) → poison + gauge drop →
     ///   [`WeroReverify::Lost`].
     ///
-    /// Only a [`HoldRole::Holder`] heals (a registrant/adopted hold has no
+    /// Only a `HoldRole::Holder` heals (a registrant/adopted hold has no
     /// reservation of its own to re-take). Blocking (one-shot ioctls) —
     /// call via `spawn_blocking` from async paths (the S9 cadence sweep
     /// is the production caller).

@@ -12,8 +12,8 @@
 //! 1. **Where does this lock object live?** [`lock_home_slot`] —
 //!    `slot = (ino − 2) % W` over the volume set's durable
 //!    `routing_width W`, evaluated by the SAME
-//!    [`route_ino_width`](crate::meta_backend::route_ino_width) the
-//!    metadata plane routes with (`docs/design-dynamic-meta-routing.md`).
+//!    [`crate::meta_backend::route_ino_width`] the metadata plane routes
+//!    with (`docs/design-dynamic-meta-routing.md`).
 //!    Spec §6.7 decision 2: the slot map is already durable, already
 //!    online-migratable and already has a per-slot cutover gate that
 //!    parks operations before 4a acquisition, so **no hash ring needs to
@@ -155,7 +155,7 @@ pub fn publish_routing_width(width: u64) {
 }
 
 /// The width lock homing currently routes over (`0` = none published; see
-/// [`ROUTING_WIDTH`]).
+/// `ROUTING_WIDTH`).
 pub fn routing_width() -> u64 {
     ROUTING_WIDTH.load(Ordering::Acquire)
 }
@@ -201,7 +201,7 @@ pub fn dlm_mode() -> &'static str {
     }
 }
 
-/// The `dlm_rpcs` stats field — see [`DLM_RPCS`]. **0 in solo mode, by
+/// The `dlm_rpcs` stats field — see `DLM_RPCS`. **0 in solo mode, by
 /// construction.**
 pub fn dlm_rpcs() -> u64 {
     DLM_RPCS.load(Ordering::Relaxed)
@@ -225,7 +225,7 @@ pub(crate) fn install_local_slots(slots: Option<&[u16]>) {
 }
 
 /// **Test seam** (the [`crate::dlm::test_arm_cw_mode`] precedent):
-/// [`install_local_slots`] without the metadata plane, so the S4 suite can
+/// `install_local_slots` without the metadata plane, so the S4 suite can
 /// reach the foreign-home refusal on its own.
 pub fn test_set_local_slots(slots: Option<&[u16]>) {
     install_local_slots(slots);

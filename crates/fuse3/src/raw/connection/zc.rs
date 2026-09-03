@@ -15,7 +15,7 @@
 //! here answers:
 //!
 //! * **Paged reply bodies can never ride the kmbuf** — the kernel will
-//!   not copy them. Every out-paged reply (READ, READDIR[PLUS],
+//!   not copy them. Every out-paged reply (READ, READDIR\[PLUS\],
 //!   READLINK) moves its bytes into the slot through the RING:
 //!   - the **direct device leg** (`READ_FIXED` device-fd → slot): the
 //!     K1 kill — device DMA straight into the app's pages, zero daemon
@@ -64,6 +64,11 @@
 //! loud, never silent garbage. Ops with MIXED paged+copyable out args
 //! (only FUSE_IOCTL's CUSE retry protocol) are not served with data by
 //! this daemon (ENOTTY/ENOSYS — header-only, safe).
+//!
+//! [`ZcBounce`]: crate::raw::connection::zc::ZcBounce
+//! [`ZcHeldTable`]: crate::raw::connection::zc::ZcHeldTable
+//! [`out_paged`]: crate::raw::connection::zc::out_paged
+//! [`in_paged`]: crate::raw::connection::zc::in_paged
 
 #![cfg(all(target_os = "linux", feature = "tokio-runtime"))]
 

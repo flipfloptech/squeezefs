@@ -90,11 +90,16 @@
 //! same set at a DIFFERENT path makes the successor a different client,
 //! stranding the predecessor's staged residue (possibly acked custody) —
 //! is the **moved-mount-point law** (design §5.1, crash window MW-1b):
-//! detected and reported LOUD at every mount by
-//! [`crate::config_ops::scan_scoped_staging_siblings`], listed by
-//! `squeezefs clients`, resolved by `-o client_slot=<hex8>` (adopt at
-//! mount) or `squeezefs staging adopt|discard --slot <hex8>` — never
-//! silently stranded.
+//! detected at every mount by
+//! [`crate::config_ops::mount_scoped_staging_prelude`] and reported LOUD
+//! ([`crate::config_ops::residue_report`]), listed by `squeezefs clients`,
+//! resolved by `-o client_slot=<hex8>` (adopt at mount) or
+//! `squeezefs staging adopt|discard --slot <hex8>` — never silently
+//! stranded.
+//!
+//! [`derive_mount_slot`]: crate::writer_scope::derive_mount_slot
+//! [`client_slot_from_options`]: crate::writer_scope::client_slot_from_options
+//! [`GenerationBinding::ScopeUpgrade`]: crate::writer_scope::GenerationBinding::ScopeUpgrade
 
 use crate::error::{Result, SqueezefsError};
 

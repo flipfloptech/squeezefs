@@ -45,6 +45,11 @@
 //! ([`super::ownership_armed`]) and the absent `SHIP_CLIENT` task-local —
 //! the shipped mount's mint path is structurally unchanged (the
 //! dark-posture pin).
+//!
+//! [`client_mint_slot`]: crate::meta_ship::placement::client_mint_slot
+//! [`note_supply_event`]: crate::meta_ship::placement::note_supply_event
+//! [`super::constrain_mint_volume`]: crate::meta_ship::constrain_mint_volume
+//! [`super::ownership_armed`]: crate::meta_ship::ownership_armed
 
 use crate::error::Result;
 use crate::meta_backend::RoutedMetaBackend;

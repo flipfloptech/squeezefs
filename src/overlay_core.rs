@@ -23,7 +23,7 @@
 //!   [`OverlayRecordCore::read_valid`]). **Mandatory clause (Rev 2
 //!   correction 1):** two overlapping stores may never be in flight
 //!   concurrently — enforced by the reused
-//!   [`crate::placed_core::PlacedClaims`] page-claim protocol
+//!   `placed_core::PlacedClaims` page-claim protocol
 //!   (grant at submission, release only at the store CQE; the §2.3
 //!   stale-DMA counterexample is unrepresentable). Disjoint ranges run
 //!   concurrently (the 4×1 MiB cohort stays parallel).

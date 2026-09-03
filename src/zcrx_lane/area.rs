@@ -260,7 +260,7 @@ impl ZcrxArea {
     ///
     /// Race law (the notify-then-check shape, condvar form): the probe
     /// re-runs UNDER the gate lock before parking — a release bumps the
-    /// gate under that same lock ([`Self::release_slot`]), so a recycle
+    /// gate under that same lock (`Self::release_slot`), so a recycle
     /// racing the unlocked fast probe is visible either to the locked
     /// re-probe or as a wakeup; the bounded wait is pure backstop
     /// (a lost wake costs one tick, never a wedge — the sqz-sync law).

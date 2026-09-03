@@ -180,7 +180,9 @@ concurrent `dd bs=1M count=128 conv=fsync` streams from `/dev/zero`**
 field-row binary `ec921b87` (code-identical to the D-1b tip `63c79b9d`; the
 diff is one doc line), **B** = this branch `a33bb010`; both `--version
 … profile release`, recorded in the create logs. Analysis:
-`.benchmarks/rigs/2026-09-03-d2-fleet-analyze.py`. Box: no other daemon or
+`.benchmarks/rigs/2026-09-03-d2-fleet-analyze.py`; artifacts (per-leg
+`table.txt`, stats snapshots, create/teardown logs) in this worktree's
+`target/d2-fleet-abba/`. Box: no other daemon or
 fleet during the run (the rig refuses on `task check`/`cargo`), but NOT as
 quiet as D-1b's session — a sibling agent's substrate and a 10-minute-old
 load tail were present; loadavg at leg start **8.3 / 11.4 / 8.2 / 6.7**

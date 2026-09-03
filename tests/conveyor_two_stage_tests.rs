@@ -703,7 +703,255 @@ async fn barrier_failure_fail_stops_from_the_durability_stage_with_windows_in_fl
 }
 
 // ===========================================================================
-// 3. Acked ⇒ replayed under kill -9 while windows overlap (the
+// 3. Ring pressure under a sustained storm (finding 49 — the ring-capacity
+//    dimension the two-stage model has no axis for)
+// ===========================================================================
+
+/// The storm every finding-49 contract runs: `committers` files, each
+/// committer setting 4 KiB xattr values on its own file (one entry = one
+/// writeback-threshold crossing — every pass enqueues threshold
+/// maintenance) against a device whose writes and barriers pay
+/// `arm_device_latency` (every threshold append / SMO image write / barrier
+/// pays it — the checkpoint task's per-item service time is the seam's).
+/// Returns the committer failures (empty = every commit succeeded).
+async fn xattr_storm(
+    routed: &Arc<RoutedMetaBackend>,
+    inos: &[u64],
+    per: usize,
+    value_len: usize,
+) -> Vec<String> {
+    let value = vec![0xA5u8; value_len];
+    let mut tasks = Vec::with_capacity(inos.len());
+    for (c, ino) in inos.iter().enumerate() {
+        let routed = routed.clone();
+        let value = value.clone();
+        let ino = *ino;
+        tasks.push(tokio::spawn(async move {
+            for i in 0..per {
+                routed
+                    .setxattr(ino, &format!("user.k{}", i % 16), &value)
+                    .await
+                    .map_err(|e| format!("committer {c} entry {i}: {e}"))?;
+            }
+            Ok::<(), String>(())
+        }));
+    }
+    let mut failures = Vec::new();
+    for t in tasks {
+        if let Err(e) = t.await.expect("committer task") {
+            failures.push(e);
+        }
+    }
+    failures
+}
+
+async fn storm_sandbox(
+    ring: u64,
+    committers: usize,
+) -> (
+    Arc<RoutedMetaBackend>,
+    Arc<KvMetaBackend>,
+    NamedTempFile,
+    Vec<u64>,
+) {
+    const VOL: u64 = 128 * 1024 * 1024;
+    let file = NamedTempFile::new().expect("temp volume");
+    file.as_file().set_len(VOL).unwrap();
+    format_v3(
+        file.path(),
+        VOL,
+        &FormatV3Options {
+            // The shipped node size: leaves fill slowly, so the storm is
+            // threshold APPENDS (one per pass per touched leaf), not SMOs —
+            // the checkpoint-reserve exhaustion arm (which forces a cycle
+            // of its own) stays out of the picture and the cadence is the
+            // only reclaimer under test.
+            node_size: 256 * 1024,
+            journal_len_override: Some(ring),
+            force: false,
+            full_wipe: false,
+            format_config_xattr: None,
+        },
+    )
+    .await
+    .expect("format v3");
+    let kv = KvMetaBackend::open(file.path()).await.expect("open");
+    let routed = Arc::new(RoutedMetaBackend::new(vec![kv.clone()]));
+    // One file per committer: the xattr writes take the ino exclusively,
+    // so the committers never co-queue on one key and each pass carries
+    // up to `committers` independent 4 KiB entries.
+    let mut inos = Vec::with_capacity(committers);
+    for c in 0..committers {
+        inos.push(
+            routed
+                .create(1, &format!("storm_{c}"), libc::S_IFREG | 0o644, 0, 0)
+                .await
+                .expect("create")
+                .ino,
+        );
+    }
+    (routed, kv, file, inos)
+}
+
+/// **The checkpoint cadence runs at its period under a sustained
+/// threshold-maintenance storm.** §4.6: a checkpoint cycle is due every
+/// ≤ 1 s (`CHECKPOINT_MAX_AGE_MS`), on ring pressure, or on the dirty
+/// cap — and the cadence tick is the ONLY path to a ring-pressure cycle,
+/// i.e. the only thing that ever advances `reusable_upto` for parked
+/// committers. Under a storm whose every pass crosses the writeback
+/// threshold, the maintenance wake is never silent; the cadence must
+/// still fire. Contract: over a ≥ 4 s storm on a ring it never fills
+/// (32 MiB — no pressure, no parking, so the quiesce-at-park accident
+/// below cannot stand in for the cadence), `meta_kv_checkpoints` advances
+/// at least once per two seconds of storm.
+///
+/// RED on the shipped task: its select polls the maintenance wake BEFORE
+/// the deadline and its drain pops the queue until EMPTY — a storm that
+/// keeps the queue full (a 5 ms device makes every pop slower than the
+/// arrivals) re-arms the wake on every return, so the deadline arm is
+/// never reached and the checkpoint count stays flat for the whole storm
+/// (finding 49: the `kv_scale_tests` million-entry storm under the
+/// all-features gate held it flat for 190 s, filled a 32 MiB ring, and the
+/// parked pass escalated to fail-stop at 3 × `SQUEEZEFS_TIMEOUT`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn checkpoint_cadence_survives_a_sustained_maintenance_storm() {
+    let _faults = FaultGuard;
+    const COMMITTERS: usize = 16;
+    const PER: usize = 300;
+    const VALUE: usize = 4096;
+    let (routed, kv, file, inos) = storm_sandbox(32 * 1024 * 1024, COMMITTERS).await;
+    // 15 ms: slow enough that 19.7 MB of entries take > 4 s (a 32 MiB ring
+    // never fills), and every maintenance pop is slower than the arrivals.
+    let latency = Duration::from_millis(15);
+    squeezefs::uring_fs::arm_device_latency(file.path(), latency, latency);
+    let checkpoints0 = squeezefs::meta_backend::kv::META_KV_CHECKPOINTS.load(Ordering::Relaxed);
+    let t0 = Instant::now();
+    let failures = xattr_storm(&routed, &inos, PER, VALUE).await;
+    let wall = t0.elapsed();
+    let checkpoints =
+        squeezefs::meta_backend::kv::META_KV_CHECKPOINTS.load(Ordering::Relaxed) - checkpoints0;
+    squeezefs::uring_fs::disarm_device_latency(file.path());
+    println!(
+        "cadence row: {COMMITTERS} x {PER} x {VALUE} B entries against a {latency:?} device on a \
+         32 MiB ring: wall {wall:.1?}, ring stalls {}, checkpoints under the storm {checkpoints}, \
+         failures {}",
+        kv.journal_full_stalls(),
+        failures.len()
+    );
+    assert!(
+        failures.is_empty(),
+        "{:?}",
+        &failures[..failures.len().min(3)]
+    );
+    assert_eq!(
+        kv.journal_full_stalls(),
+        0,
+        "the cadence row must not reach ring pressure (parking quiesces the storm and lets the \
+         cadence through by accident — the row would not measure the cadence)"
+    );
+    assert!(
+        wall >= Duration::from_secs(4),
+        "the storm must sustain ≥ 4 s for the cadence contract to read (wall {wall:?}) — widen PER"
+    );
+    let floor = (wall.as_secs() / 2).max(1);
+    assert!(
+        checkpoints >= floor,
+        "the checkpoint cadence was starved by the maintenance storm: {checkpoints} cycles over a \
+         {wall:.1?} storm (§4.6: due every ≤ 1 s; floor {floor})"
+    );
+    kv.shutdown().await.expect("shutdown");
+}
+
+/// **A committer parked for ring space is RELEASED by the checkpoint
+/// reclaiming the ring — never fail-stopped.** The §4.4 pt 5 law as the
+/// M1–M12 D1.b watchdog states it: ring-admission parking escalates
+/// through the fail-stop lattice only when the checkpoint CANNOT make
+/// progress; under a legitimate storm the checkpoint task truncates the
+/// ring as windows become durable and parked committers proceed. The
+/// same storm on an 8 MiB ring (the format minimum), ≈ 2.3 rings of
+/// entries, `SQUEEZEFS_TIMEOUT=1` (escalation at 3 × 1 s of continuous
+/// parking). Laws: every commit succeeds and the volume never latches
+/// `failed`; the storm DID park (`journal_full_stalls` ≥ 1 — a row that
+/// never reached ring pressure did not exercise the mechanism); the
+/// checkpoint reclaimed WHILE committers were parked (`reusable_upto`
+/// observed moving off its start before the storm ended).
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn parked_committers_are_released_by_the_checkpoint_under_a_sustained_storm() {
+    let _faults = FaultGuard;
+    let _to = EnvVarGuard::set("SQUEEZEFS_TIMEOUT", "1");
+    const RING: u64 = 8 * 1024 * 1024;
+    const COMMITTERS: usize = 16;
+    const PER: usize = 300;
+    const VALUE: usize = 4096;
+    let (routed, kv, file, inos) = storm_sandbox(RING, COMMITTERS).await;
+    let latency = Duration::from_millis(5);
+    squeezefs::uring_fs::arm_device_latency(file.path(), latency, latency);
+    let checkpoints0 = squeezefs::meta_backend::kv::META_KV_CHECKPOINTS.load(Ordering::Relaxed);
+    let reusable0 = kv.journal_ring().core().reusable_upto();
+
+    // The observer: samples `reusable_upto` while the storm runs, so a
+    // reclaim DURING the storm (not after it) is what the law reads.
+    let reclaimed_under_storm = Arc::new(AtomicU64::new(0));
+    let storm_done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let observer = {
+        let kv = kv.clone();
+        let reclaimed = reclaimed_under_storm.clone();
+        let done = storm_done.clone();
+        tokio::spawn(async move {
+            while !done.load(Ordering::SeqCst) {
+                let now = kv.journal_ring().core().reusable_upto();
+                if now > reusable0 {
+                    reclaimed.fetch_max(now, Ordering::SeqCst);
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+    };
+
+    let t0 = Instant::now();
+    let failures = xattr_storm(&routed, &inos, PER, VALUE).await;
+    storm_done.store(true, Ordering::SeqCst);
+    observer.await.expect("observer");
+    let wall = t0.elapsed();
+    let checkpoints =
+        squeezefs::meta_backend::kv::META_KV_CHECKPOINTS.load(Ordering::Relaxed) - checkpoints0;
+    let stalls = kv.journal_full_stalls();
+    let reclaimed = reclaimed_under_storm.load(Ordering::SeqCst);
+    println!(
+        "storm row: {COMMITTERS} x {PER} x {VALUE} B entries ({:.1} rings) against a {latency:?} \
+         device on an {} MiB ring: wall {wall:.1?}, ring stalls {stalls}, checkpoints under the \
+         storm {checkpoints}, reusable_upto {reusable0} -> {reclaimed} (observed while parked), \
+         failed = {}, failures = {}",
+        (COMMITTERS * PER * VALUE) as f64 / RING as f64,
+        RING >> 20,
+        kv.is_failed(),
+        failures.len()
+    );
+    squeezefs::uring_fs::disarm_device_latency(file.path());
+    assert!(
+        failures.is_empty(),
+        "committers were aborted under a legitimate storm (the ring must be reclaimed, never \
+         fail-stopped): {:?}",
+        &failures[..failures.len().min(3)]
+    );
+    assert!(
+        !kv.is_failed(),
+        "the volume latched `failed` under a storm the checkpoint could have reclaimed"
+    );
+    assert!(
+        stalls >= 1,
+        "the storm never parked for ring space — the row did not reach ring pressure"
+    );
+    assert!(
+        checkpoints >= 1 && reclaimed > reusable0,
+        "the checkpoint did not reclaim the ring while committers were parked (checkpoints \
+         {checkpoints}, reusable_upto {reusable0} -> {reclaimed})"
+    );
+    kv.shutdown().await.expect("shutdown");
+}
+
+// ===========================================================================
+// 4. Acked ⇒ replayed under kill -9 while windows overlap (the
 //    write_commit_crash_tests idiom)
 // ===========================================================================
 

@@ -172,6 +172,17 @@ fn ufs_snap() -> UfsSnap {
     }
 }
 
+/// The `uring_fs_write_phase_ns` `wake_hop` bucket counts (the mode's
+/// input — see `mode_us`).
+fn ufs_wake_hop_buckets() -> Vec<u64> {
+    let j = squeezefs::uring_fs::uring_fs_write_phase_json();
+    let p = &j["wake_hop"];
+    squeezefs::latency_core::LATENCY_BUCKET_LABELS
+        .iter()
+        .map(|l| p["buckets"][*l].as_u64().unwrap_or(0))
+        .collect()
+}
+
 fn mean_us(after: (u64, u64), before: (u64, u64)) -> f64 {
     let sum = after.0 - before.0;
     let n = after.1 - before.1;
@@ -198,6 +209,27 @@ fn txpass_phase(name: &str) -> ((u64, u64), Vec<u64>) {
         ),
         buckets,
     )
+}
+
+/// The share (0..=1) of a bucketed histogram delta's samples that lie in
+/// buckets whose LOWER bound is ≥ `threshold_us` — i.e. samples that took
+/// at least `threshold_us` (bucket `i` covers `(2^(i-1), 2^i]` µs).
+fn share_at_or_above_us(after: &[u64], before: &[u64], threshold_us: u64) -> f64 {
+    let mut total = 0u64;
+    let mut above = 0u64;
+    for (i, (a, b)) in after.iter().zip(before).enumerate() {
+        let d = a - b;
+        total += d;
+        let lower_us = if i == 0 { 0 } else { 1u64 << (i - 1) };
+        if lower_us >= threshold_us {
+            above += d;
+        }
+    }
+    if total == 0 {
+        0.0
+    } else {
+        above as f64 / total as f64
+    }
 }
 
 /// The mode of a bucketed histogram delta: the upper bound (µs) of the
@@ -232,6 +264,18 @@ struct Row {
     /// Exact-sum residual: |Σ(queue_hop, device, wake_hop) − total| ns.
     sum_residual_ns: u64,
     lane_wait_us: f64,
+    /// The structural laws' statistic: the SHARE of windows whose
+    /// `wake_hop` / `window_lane_wait` / `tx_queue_wait` took at least one
+    /// full serve burst. A hop that lands behind the serve lanes puts
+    /// (nearly) EVERY window a burst late — share ≈ 1; an isolated lane on
+    /// a loaded host shows a few percent of scheduler stalls. Neither a
+    /// mean (skewed by one multi-ms stall — the all-features gate flipped
+    /// it 1-in-4 with the topology correct) nor a mode (noisy over a few
+    /// hundred windows whose sub-burst mass is flat) discriminates as
+    /// cleanly.
+    wake_hop_burst_share: f64,
+    lane_wait_burst_share: f64,
+    queue_wait_burst_share: f64,
 }
 
 impl Row {
@@ -244,9 +288,10 @@ impl Row {
 /// (regular files take the parent SHARED — co-queueable), D = 0.
 async fn hop_row(routed: &Arc<RoutedMetaBackend>, tag: &str, committers: usize, per: usize) -> Row {
     let u0 = ufs_snap();
+    let whb0 = ufs_wake_hop_buckets();
     let (rw0, rwb0) = txpass_phase("journal_ring_write");
-    let (lw0, _) = txpass_phase("window_lane_wait");
-    let (qw0, _) = txpass_phase("tx_queue_wait");
+    let (lw0, lwb0) = txpass_phase("window_lane_wait");
+    let (qw0, qwb0) = txpass_phase("tx_queue_wait");
     let passes0 = META_CONVEYOR_LEADER_PASSES.load(Ordering::Relaxed);
     let entries0 = META_KV_JOURNAL_ENTRIES.load(Ordering::Relaxed);
 
@@ -270,9 +315,10 @@ async fn hop_row(routed: &Arc<RoutedMetaBackend>, tag: &str, committers: usize, 
     let wall = t0.elapsed();
 
     let u1 = ufs_snap();
+    let whb1 = ufs_wake_hop_buckets();
     let (rw1, rwb1) = txpass_phase("journal_ring_write");
-    let (lw1, _) = txpass_phase("window_lane_wait");
-    let (qw1, _) = txpass_phase("tx_queue_wait");
+    let (lw1, lwb1) = txpass_phase("window_lane_wait");
+    let (qw1, qwb1) = txpass_phase("tx_queue_wait");
     let parts = (u1.queue_hop.0 - u0.queue_hop.0)
         + (u1.device.0 - u0.device.0)
         + (u1.wake_hop.0 - u0.wake_hop.0);
@@ -292,6 +338,9 @@ async fn hop_row(routed: &Arc<RoutedMetaBackend>, tag: &str, committers: usize, 
         ufs_total_us: mean_us(u1.total, u0.total),
         sum_residual_ns: parts.abs_diff(total),
         lane_wait_us: mean_us(lw1, lw0),
+        wake_hop_burst_share: share_at_or_above_us(&whb1, &whb0, STRUCTURAL_BURST_US),
+        lane_wait_burst_share: share_at_or_above_us(&lwb1, &lwb0, STRUCTURAL_BURST_US),
+        queue_wait_burst_share: share_at_or_above_us(&qwb1, &qwb0, STRUCTURAL_BURST_US),
     }
 }
 
@@ -447,6 +496,14 @@ async fn measurement_rows_completion_hop_under_lane_and_box_load() {
 /// that a hop landing behind ONE burst is unmistakable against the write's
 /// own ~100 µs round trip.
 const STRUCTURAL_BURST: Duration = Duration::from_millis(2);
+/// The burst as a histogram threshold: samples in the `(1024, 2048]` µs
+/// bucket and above took ≥ one full burst (the octave floor at/above
+/// the burst's magnitude).
+const STRUCTURAL_BURST_US: u64 = 1024;
+/// A hop behind the serve lanes puts ~every window a burst late; an
+/// isolated lane on a loaded host shows a few percent of scheduler
+/// stalls. 25 % keeps a ≥ 4× discrimination from the red shape.
+const BURST_SHARE_LIMIT: f64 = 0.25;
 
 /// **The commit plane's completion delivery is isolated from the serve
 /// plane.** Four hog tasks × 2 ms bursts saturate both `sqz-meta` lanes —
@@ -484,22 +541,26 @@ async fn completion_delivery_is_isolated_from_the_serve_lanes() {
     assert_row_valid("serve-lane saturated", &row);
     let burst_us = STRUCTURAL_BURST.as_micros() as f64;
     assert!(
-        row.wake_hop_us < burst_us / 4.0,
-        "the journal write's completion waited behind the serve lanes' bursts: wake_hop mean \
-         {:.0} us against {burst_us:.0} us bursts — the durability lane learns the completion \
-         through a hop onto a lane it shares with the serve plane",
+        row.wake_hop_burst_share < BURST_SHARE_LIMIT,
+        "the journal write's completion waited behind the serve lanes' bursts: {:.0}% of windows' \
+         wake_hop took >= a {burst_us:.0} us burst (mean {:.0} us) — the durability lane learns \
+         the completion through a hop onto a lane it shares with the serve plane",
+        row.wake_hop_burst_share * 100.0,
         row.wake_hop_us
     );
     assert!(
-        row.lane_wait_us < burst_us / 4.0,
+        row.lane_wait_burst_share < BURST_SHARE_LIMIT,
         "the in-order durability lane's pickup of the next window waited behind the serve \
-         lanes' bursts: window_lane_wait mean {:.0} us against {burst_us:.0} us bursts",
+         lanes' bursts: {:.0}% of windows' window_lane_wait took >= a {burst_us:.0} us burst \
+         (mean {:.0} us)",
+        row.lane_wait_burst_share * 100.0,
         row.lane_wait_us
     );
     assert!(
-        row.queue_wait_us < burst_us / 2.0,
-        "the apply pass was dispatched behind the serve lanes' bursts: tx_queue_wait mean {:.0} \
-         us against {burst_us:.0} us bursts",
+        row.queue_wait_burst_share < BURST_SHARE_LIMIT,
+        "the apply pass was dispatched behind the serve lanes' bursts: {:.0}% of txs' \
+         tx_queue_wait took >= a {burst_us:.0} us burst (mean {:.0} us)",
+        row.queue_wait_burst_share * 100.0,
         row.queue_wait_us
     );
     kv.shutdown().await.expect("shutdown");

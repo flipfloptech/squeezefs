@@ -410,3 +410,51 @@ plane over) and the co-writer's CPU-starved publish pipeline.
      checkpoint stuck at cycle 1 from the storm's first seconds, the
      ring's whole capacity was the budget, and the 90 s D1.b ladder
      (3 × `SQUEEZEFS_TIMEOUT`) elapsed inside the drain.
+7. **Finding 50 — FIXED (`fix/f50-mergeiter-stale-fold`: RED `6f7b1ef5`,
+   fix `3975ac62`, memo pin `a9ccac02`).** Batch gate #4 flaked
+   `posix_semantics_tests::statfs_iused_returns_to_baseline_after_create_
+   delete_loop` (48 creates, 48 unlinks, awaited `reclaim_orphaned_batch`,
+   `IUsed` read at the PEAK) and a single-test bisect named finding 49's
+   `MergeIter` memo (8/8 green before, 1-in-6 after). **The memo is
+   exonerated**: a 400-trial randomized equivalence against the `(key
+   asc, seq desc, source asc)` reference order is green (now the
+   permanent pin), the memo lives inside one `compact` call over an
+   immutable `&[BsetView]` (a run cannot grow under it), and the failing
+   read path (`bset::lookup`, find + fold) never touches `merge`. The
+   pre-F49 binary fails the tightened loop **47/48** under the same load
+   — pre-existing, load-selected; the 8-sample bisect at a load-dependent
+   rate was noise.
+   * **The corpse** (every failing round, 45 of 48 loaded lanes): the
+     awaited reclaim's admission logged `already in flight, skipping` for
+     its inos, `IUsed` read the peak, and a read 200 ms later was at
+     baseline with NO second reclaim in between. The owner was the
+     **release-enqueued background reclaim pool** (`release` →
+     `queue_reclaim_inode` → `sqz-meta` batch): its batch, scheduled on
+     its own cadence, claimed the inos after their unlinks landed; the
+     explicit reclaim found every claim held and RETURNED with the
+     owner's destroy uncommitted. The single-drive guard's loser never
+     double-drove — it just never waited. The same load pushed the pool's
+     batch late enough to see nlink 0, which is why it read as
+     scheduling-sensitive to whatever landed on the `sqz-meta` lanes
+     (F49's cadence change included).
+   * **Fix (the return law, on `reclaim_orphaned_batch`)**: when it
+     returns, every ino reached its terminal outcome, whichever batch
+     carried it. `reclaim_inflight` is now `HashMap<ino, Arc<Notify>>`;
+     a loser records the owner's claim and, after its own admitted work,
+     parks on it (`notified()` registers at creation, then a ptr-equal
+     re-check — never a lost wake); back-out and the per-ino teardown
+     release through `release_reclaim_claim` (`notify_waiters`). Acyclic:
+     a batch releases ALL its claims before waiting on foreign ones, and
+     the owner needs nothing the waiter holds. Gauge
+     `meta_reclaim_inflight_waits`.
+   * **Contracts** (`tests/inode_reclaim_inflight_tests.rs`): the
+     deterministic schedule (owner parked in admission on a sentinel
+     orphan's held DLM stripe with its claims in place; the loser must
+     not return while it is — RED 3/3 within µs before, GREEN 3/3
+     after) and the gate's shape tightened to 40 rounds with the pool
+     racing (17/24 loaded lanes RED before; **48/48** after; the posix
+     file **12/12** under the same load, 1/120 before).
+   * The `dirty_floor`/`reusable_upto` pinned at 248 through the whole
+     loop that the corpse also showed is NOT a defect: the loop's 60
+     rounds complete in 0.99 s and `CHECKPOINT_MAX_AGE_MS` is 1,000 — no
+     cycle is due; `ckpts` advances on the second.

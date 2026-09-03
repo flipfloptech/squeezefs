@@ -2,7 +2,7 @@
 
 **Branch** `perf/d1b-publish-plane-batching` (worktree off dev
 `4c596ec2`). Measure `2faface1` → RED `189521d2` → fix `41e474f6` → rig
-`ec921b87` → row labels `abc902a6`. Campaign: `docs/design-e2e-perf-audit.md`
+`ec921b87`/`5ca28caf` → row labels `abc902a6`. Campaign: `docs/design-e2e-perf-audit.md`
 §3 board **DLM #8** (stop-and-wait frame depth 1), opened by D-1's scoping
 finding (`.benchmarks/2026-09-02-d1-owner-concurrent-dispatch.md` §Owed 2);
 contracts `tests/publish_plane_batching_tests.rs`.
@@ -186,6 +186,87 @@ clippy --all-targets --all-features -- -D warnings` and the shipped-config
 clippy clean, `cargo fmt --check` clean. `task check` deferred (batched by
 the user — the box's own batch gate ran throughout this session).
 
+## Field row — the local fleet, A-B-B-A (measured-simulated tier: one box, co-located identities)
+
+`.benchmarks/rigs/2026-09-02-d1b-fleet-row.sh` on the 32-CPU dev box (117 GiB),
+tcp devsub (nvmet-tcp on `127.0.0.1`, zram OSS 2 × 64 GiB), `tests/mw_fleet.sh
+create N=1 --multi-writer --cowriters=8` per leg, torn down to zero residue
+between legs. Row: **8 co-writers × 24 concurrent `dd bs=1M count=128
+conv=fsync` streams from `/dev/zero`** (the device term removed by design —
+zeros compress to nothing on zram — so the row is about the metadata/publish
+plane), per-member directories. A = dev tip `4c596ec2` release, B = this
+branch `ec921b87` release; both legs' `--version` recorded in the create
+logs. Quiet box (the batch gate had finished; load 3–9 at each leg's start).
+Depth on the fleet = **2** (the fleet-share-divided root: `cpus/9 → 4`,
+`ceil(4/8) = 1`, floor 2).
+
+| leg | aggregate ingest | frames / publish | calls / frame | owner passes / publish | owner passes | journal entries | depth waits | served ≡ shipped |
+|---|---|---|---|---|---|---|---|---|
+| A1 dev | 3.30 GiB/s (7.3 s) | **1.000** | 1.00 | **0.276** | 15,592 | 18,817 | — | 56,535 ≡ 56,535 |
+| B1 d1b | 3.24 GiB/s (7.4 s) | **0.614** | 1.63 | **0.172** | 9,539 | 14,405 | 10,225 (28 %) | 55,403 ≡ 55,403 |
+| B2 d1b | 3.32 GiB/s (7.2 s) | **0.626** | 1.60 | **0.165** | 9,128 | 14,143 | 9,921 (27 %) | 55,249 ≡ 55,249 |
+| A2 dev | 3.36 GiB/s (7.1 s) | **1.000** | 1.00 | **0.278** | 15,937 | 19,494 | — | 57,338 ≡ 57,338 |
+
+Every leg VALID: ledger closure exact (`served ≡ shipped`, `free_served ≈ Σ
+free_shipped` 4,808/4,984/4,965/4,839), `refusals` = `owner_panics` =
+`stale_refusals` = `replays` = 0, `local_commit_refusals` = 0 on every
+co-writer, `ship_session_dials` 3 per co-writer (depth 2 + one reconnect).
+Per-co-writer throughput 415–454 MiB/s on every leg.
+
+**Engagement: exact.** frames/publish 1.000 → 0.61–0.63 in both brackets
+(calls/frame 1.6); owner conveyor passes per publish 0.276/0.278 →
+0.172/0.165 (**−39 % passes**), journal entries **−24 %** (the owner's
+Lever-B commit-group aggregation engaging more under concurrent dispatch:
+`meta_commit_group_size` reached 64 on B, 1–2 on A), authority CPU −10 %
+(6.24/6.39 → 5.60/5.71 s per row), `served_chains / served_frames` 1.26–1.28
+(the frames' calls were mostly independent inos).
+
+**Aggregate ingest: PAR** (−1.8 % / −1.2 %, the noise band of the four
+legs). Two reasons, both instrumented:
+
+1. **The row is CPU-bound**: 192 dd streams + 9 daemons on 32 cores (load
+   85 mid-row on every leg). The co-writer's per-block PUBLISH latency
+   collapsed — `publish_phase_ns.total` per save **113.6 / 97.4 ms → 30.0 /
+   22.0 ms (−74 %)**, `publish_phase_ns.meta_commit` 41.9 / 36.7 → 11.2 /
+   8.5 ms, `write_pipeline_phase_ns.publish` per block 102 / 83 → 24 / 18 ms,
+   whole-block pipeline residence `write_pipeline_phase_ns.total` 184 / 157 →
+   67 / 51 ms (−65 %), `block_lock_wait` 41.7 / 33.5 → 21.8 / 14.8 ms (−50 %)
+   — and the bytes/s did not move, so the writer was not waiting on the
+   publish plane for its throughput on this venue.
+2. **The wall moved onto the M7 conveyor — DLM #2 (C-1/C-2), the ladder's
+   next campaign.** With the publish plane no longer metering demand one
+   RTT at a time, the authority's serialized pass got fuller and longer:
+   `pass_total` 373 / 402 → 752 / 776 µs, `pass_journal_write` 311 / 343 →
+   658 / 676 µs, `tx_queue_wait` 238 / 269 → 801 / 764 µs; conveyor
+   utilization **ρ = passes × pass_total / row ≈ 0.80 → 0.97**. The
+   co-writer's per-FRAME `meta_ship_phase_ns.rtt` rose 0.75 / 0.79 → 3.7 /
+   3.6 ms accordingly (a frame is as slow as its slowest co-queued commit,
+   now waiting on a saturated conveyor), and 27–28 % of frames parked on
+   the depth-2 bound — the framing doing exactly its job, feeding the
+   conveyor at its capacity. The audit's #2 ("two-stage apply/durability
+   conveyor, N journal writes in flight, in-order acks → ~4× headroom")
+   is now the binding term on this venue, and this row is its baseline.
+
+**Also observed** (no per-verb breakdown exists on the publish ledger — an
+instrument gap, boarded): the co-writers' S8 verb count fell 10,968 /
+11,322 → 7,154 / 7,051 and their lane raises (`alloc_lane_shipped_
+reservations`) 751 / 783 → 545 / 531 per co-writer for the same 768 blocks
+— fewer wire calls of both classes under the shorter publish critical
+section; attribution needs `shipped_by_verb`.
+
+**A rig lesson worth the paragraph**: the first run put all 8 co-writers'
+24 files in ONE directory (`d1b/`) — every member mounts the same
+filesystem — so eight writers raced to create the same 24 names. The
+control binary answered exactly as designed and it is worth knowing what
+that looks like: S10 intent applies refused EEXIST at the authority ("the
+local mint is destroyed", §8.2's deferred-error channel) surfaced to `dd`
+as "File exists" then "fsync failed: No such file", `open` EIO on the
+losers, and a 5 s-lock-wait custody-conflict storm on the authority
+(`S9 custody refusal … conflicting custody` ×1,950 in 20 min) with 96 dd
+streams still fighting at minute 20. Per-member directories
+(`5ca28caf`) is the fix; the s9-fanout row's per-member naming exists for
+the same reason.
+
 ## Observations
 
 * **The cluster wire's accept loop polls at 100 ms** (`cluster_wire.rs`
@@ -209,33 +290,20 @@ the user — the box's own batch gate ran throughout this session).
 
 ## Owed
 
-1. **The fleet field row** — `.benchmarks/rigs/2026-09-02-d1b-fleet-row.sh`
-   (committed `ec921b87`): 8 co-writers × 24 concurrent `dd bs=1M
-   conv=fsync` streams × 128 MiB from `/dev/zero` (zram: the device term
-   removed by design, exposing the publish-plane ceiling — labeled so),
-   A-B-B-A over `A_BIN` = dev tip `4c596ec2` release and `B_BIN` = this
-   branch release (both built: `/tmp/squeezefs.dev`, `/tmp/squeezefs.d1b`),
-   one fleet at a time (`tests/mw_fleet.sh create N=1 --multi-writer
-   --cowriters=8` with `SQZ_MWFLEET_OSS_GB=64`, row, teardown to zero
-   residue per leg). Columns: aggregate co-writer ingest GiB/s,
-   frames/publish (control reads 1.0 by construction), calls/frame, owner
-   passes/publish, chains/frame, ledger closure, tripwires. **Not run**:
-   the box's `task check` batch gate ran for the whole session (the
-   measured-row law: the gate's CPU load invalidates a fleet row), and the
-   rig refuses on a non-quiet box. Recipe, on a quiet box:
-   ```
-   A_BIN=/tmp/squeezefs.dev B_BIN=/tmp/squeezefs.d1b COWRITERS=8 STREAMS=24 MB=128 \
-     sudo -n -E env "PATH=$PATH" bash .benchmarks/rigs/2026-09-02-d1b-fleet-row.sh
-   ```
-   plus the D-1 note's `s9-fanout` + `s8a` verb-storm rows on the same
-   fleet for the single-stream posture (expect frames/publish ≈ 1 there —
-   see Observations — and no regression).
-2. **The depth lever on a fabric venue** (squeeze-test, ~25 µs RTT; AWS,
-   ~235 µs): depth 1 vs derived, same rig — the loopback rows cannot rank
-   them.
-3. **D-5**: single-connection multiplexing (frames pipelined on one
+1. **The fabric-venue rows** (squeeze-test, ~25 µs RTT; AWS, ~235 µs):
+   the same rig (`A_BIN`/`B_BIN`, per-member directories) where the RTT is
+   a term — the loopback fleet ranks the framing (engagement exact,
+   per-block publish latency −74 %) but cannot rank the depth lever, and
+   its aggregate is CPU- and conveyor-bound. Include the D-1 note's
+   `s9-fanout` + `s8a` rows for the single-stream posture (frames/publish
+   ≈ 1 there by construction — Observations — and no regression).
+2. **DLM #2/#3 (C-1/C-2)** — the row above is the baseline: conveyor ρ
+   0.97 on B, `pass_journal_write` 658 µs, `tx_queue_wait` 801 µs.
+3. **`meta_ship_publish.shipped_by_verb`** — the per-verb breakdown the
+   S8-verb and lane-raise reductions need for attribution.
+4. **D-5**: single-connection multiplexing (frames pipelined on one
    socket, reply demux by id, owner read-ahead) + the accept-tick fix
    above; F-B's connection cap is what makes depth × co-writers a
-   capability term at scale (8 co-writers × 4 = 32 sessions per authority
+   capability term at scale (8 co-writers × 2 = 16 sessions per authority
    here; 340 co-writers × 8 exhausts the 1,024 cap).
-4. `task check` (the full gate) — deferred by instruction.
+5. `task check` (the full gate) — deferred by instruction.

@@ -36,7 +36,8 @@ fuzz_target!(|data: &[u8]| {
         // rest before touching the buffer.
         let node_addr = node_addr & !0xFFF;
         for durable_tail in [0u64, u64::MAX / 2] {
-            let Ok(node) = verify_node_extent(Bytes::from(buf.clone()), &layout, node_addr, durable_tail)
+            let Ok(node) =
+                verify_node_extent(Bytes::from(buf.clone()), &layout, node_addr, durable_tail)
             else {
                 continue;
             };

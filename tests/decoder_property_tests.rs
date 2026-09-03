@@ -26,6 +26,9 @@
 use proptest::prelude::*;
 use std::os::unix::process::CommandExt;
 
+use squeezefs::cluster_wire::{
+    read_plain_frame, session_framers, session_key, write_plain_frame, FrameClass, Role, RpcFrame,
+};
 use squeezefs::layout_wire::{decode_base_layout, encode_layout, LayoutDelta, LayoutMetadata};
 use squeezefs::meta_backend::kv::block_map::{
     decode_block_map_key, decode_block_map_value, parse_kvmap_head,
@@ -40,6 +43,14 @@ use squeezefs::meta_backend::kv::record::{
     InodeDelta, InodeValue, Record, RecordRef, XattrValue,
 };
 use squeezefs::meta_backend::kv::superblock::SuperblockV3;
+use squeezefs::meta_ship::publish::{
+    decode_reply_frame, decode_request_frame, encode_reply_frame, encode_request_frame,
+    PublishCall, PublishCallOutcome, PublishReply, PublishReplyFrame, PublishRequestFrame,
+    WireBlockRefOp, PUBLISH_SCHEMA,
+};
+use squeezefs::meta_ship::wire::{
+    decode_reclaim, decode_reply, decode_request, encode_reclaim, ReclaimFrame, WireError,
+};
 
 // ---------------------------------------------------------------------------
 // The find: a lying `record_count` used to be an allocation authority
@@ -339,6 +350,63 @@ proptest! {
             prop_assert_eq!(head.encode(), prefixed);
         }
     }
+
+    /// The S9 publish frames (schema 13 — a co-writer's bytes at the ONE
+    /// metadata authority, and the authority's bytes at every co-writer)
+    /// are total over arbitrary bytes, and whatever decodes re-encodes to
+    /// an equal frame.
+    #[test]
+    fn publish_wire_decoders_never_panic(data in prop::collection::vec(any::<u8>(), 0..512)) {
+        if let Ok(f) = decode_request_frame(&data) {
+            let re = encode_request_frame(&f).expect("an accepted request frame re-encodes");
+            prop_assert_eq!(decode_request_frame(&re).expect("re-decodes"), f);
+        }
+        if let Ok(f) = decode_reply_frame(&data) {
+            let re = encode_reply_frame(&f).expect("an accepted reply frame re-encodes");
+            prop_assert_eq!(decode_reply_frame(&re).expect("re-decodes"), f);
+        }
+    }
+
+    /// The cluster wire's `RpcFrame` reader (every distributed plane's
+    /// transport) and the S8 verb-body decoders are total over an
+    /// arbitrary byte STREAM under every class cap; an arbitrary tag never
+    /// verifies on the authenticated path.
+    #[test]
+    fn cluster_wire_decoders_never_panic(data in prop::collection::vec(any::<u8>(), 0..512)) {
+        for class in [FrameClass::Handshake, FrameClass::Control, FrameClass::Bulk] {
+            let mut cur = std::io::Cursor::new(&data[..]);
+            for _ in 0..16 {
+                match read_plain_frame::<_, RpcFrame>(&mut cur, class.cap(), None) {
+                    Ok(Some(frame)) => {
+                        let mut re = Vec::new();
+                        write_plain_frame(&mut re, class, &frame)
+                            .expect("an accepted frame re-encodes under its class");
+                        let mut cur2 = std::io::Cursor::new(&re[..]);
+                        let again: RpcFrame = read_plain_frame(&mut cur2, class.cap(), None)
+                            .expect("reads")
+                            .expect("one frame");
+                        let mut re2 = Vec::new();
+                        write_plain_frame(&mut re2, class, &again).expect("re-encodes");
+                        prop_assert_eq!(re2, re, "canonical encoding");
+                    }
+                    Ok(None) | Err(_) => break,
+                }
+            }
+        }
+        let key = session_key(&data, "p", "n0", "n1", None);
+        let (_, mut rx) = session_framers(&key, Role::Peer);
+        let mut cur = std::io::Cursor::new(&data[..]);
+        prop_assert!(!matches!(
+            rx.recv::<_, RpcFrame>(&mut cur, FrameClass::Bulk.cap(), None),
+            Ok(Some(_))
+        ));
+        let _ = decode_request(&data);
+        let _ = decode_reply(&data);
+        if let Ok(f) = decode_reclaim(&data) {
+            let re = encode_reclaim(&f).expect("re-encodes");
+            prop_assert_eq!(decode_reclaim(&re).expect("re-decodes"), f);
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -505,4 +573,204 @@ proptest! {
         prop_assert_eq!(back.size, layout.size);
         prop_assert_eq!(back.block_map, layout.block_map);
     }
+
+    /// A multi-call publish request frame (D-1b) round-trips — the kvmap
+    /// `MigrateBlockMap` train with its whole entries map, refs frame and
+    /// `base_gen` among the calls.
+    #[test]
+    fn publish_request_frame_round_trips(
+        client in "[a-z0-9:-]{1,24}",
+        calls in prop::collection::vec(arb_publish_call(), 1..6),
+    ) {
+        let frame = PublishRequestFrame { schema: PUBLISH_SCHEMA, client, calls };
+        let enc = encode_request_frame(&frame).expect("encodes");
+        prop_assert_eq!(decode_request_frame(&enc).expect("decodes"), frame);
+    }
+
+    /// A publish reply frame round-trips one outcome per call, `MapMigrated
+    /// { recomputed, gen, … }` included.
+    #[test]
+    fn publish_reply_frame_round_trips(
+        outcomes in prop::collection::vec(arb_publish_outcome(), 0..6),
+    ) {
+        let frame = PublishReplyFrame { schema: PUBLISH_SCHEMA, outcomes };
+        let enc = encode_reply_frame(&frame).expect("encodes");
+        prop_assert_eq!(decode_reply_frame(&enc).expect("decodes"), frame);
+    }
+
+    /// An `RpcFrame` rides the authenticated path: the peer verifies and
+    /// decodes what the coordinator sent, and a reflected or replayed copy
+    /// fails verification instead of being skipped.
+    #[test]
+    fn cluster_wire_authenticated_frame_round_trips(
+        secret in prop::collection::vec(any::<u8>(), 0..48),
+        id in any::<u64>(),
+        verb in any::<u16>(),
+        body in prop::collection::vec(any::<u8>(), 0..256),
+    ) {
+        let key = session_key(&secret, "peer", "n0", "n1", Some(&secret));
+        let (mut c_tx, mut c_rx) = session_framers(&key, Role::Coordinator);
+        let (_, mut p_rx) = session_framers(&key, Role::Peer);
+        let frame = RpcFrame::Call { id, verb, body: body.clone() };
+        let mut wire = Vec::new();
+        c_tx.send(&mut wire, FrameClass::Control, &frame).expect("sends");
+        let mut cur = std::io::Cursor::new(&wire[..]);
+        let got: RpcFrame = p_rx
+            .recv(&mut cur, FrameClass::Control.cap(), None)
+            .expect("verifies")
+            .expect("one frame");
+        match got {
+            RpcFrame::Call { id: i, verb: v, body: b } => {
+                prop_assert_eq!(i, id);
+                prop_assert_eq!(v, verb);
+                prop_assert_eq!(b, body);
+            }
+            other => prop_assert!(false, "decoded a different frame: {other:?}"),
+        }
+        let mut cur = std::io::Cursor::new(&wire[..]);
+        prop_assert!(c_rx.recv::<_, RpcFrame>(&mut cur, FrameClass::Control.cap(), None).is_err(),
+            "reflection must fail");
+        let mut cur = std::io::Cursor::new(&wire[..]);
+        prop_assert!(p_rx.recv::<_, RpcFrame>(&mut cur, FrameClass::Control.cap(), None).is_err(),
+            "replay must fail");
+    }
+
+    /// The S8 reclaim frame — the smallest verb body — round-trips.
+    #[test]
+    fn meta_ship_reclaim_frame_round_trips(
+        schema in any::<u32>(),
+        client_epoch in any::<u64>(),
+        inos in prop::collection::vec(any::<u64>(), 0..32),
+    ) {
+        let f = ReclaimFrame { schema, client_epoch, inos };
+        let enc = encode_reclaim(&f).expect("encodes");
+        prop_assert_eq!(decode_reclaim(&enc).expect("decodes"), f);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// publish-wire generators
+// ---------------------------------------------------------------------------
+
+fn arb_ref() -> impl Strategy<Value = WireBlockRefOp> {
+    (
+        any::<u64>(),
+        any::<u64>(),
+        any::<u64>(),
+        any::<u32>(),
+        any::<bool>(),
+    )
+        .prop_map(
+            |(vol_tag, block_idx, owner_ino, block_index, take)| WireBlockRefOp {
+                vol_tag,
+                block_idx,
+                owner_ino,
+                block_index,
+                take,
+            },
+        )
+}
+
+fn arb_publish_call() -> impl Strategy<Value = PublishCall> {
+    let refs = || prop::collection::vec(arb_ref(), 0..4);
+    let bytes = || prop::collection::vec(any::<u8>(), 0..64);
+    prop_oneof![
+        (
+            any::<u64>(),
+            bytes(),
+            any::<u64>(),
+            refs(),
+            any::<u64>(),
+            any::<u64>()
+        )
+            .prop_map(|(ino, layout, size, refs, lease_epoch, request_id)| {
+                PublishCall::SetLayoutAndSize {
+                    ino,
+                    layout,
+                    size,
+                    refs,
+                    lease_epoch,
+                    request_id,
+                }
+            }),
+        (any::<u64>(), refs(), any::<u64>(), any::<u64>()).prop_map(
+            |(ino, refs, lease_epoch, request_id)| PublishCall::CommitBlockRefs {
+                ino,
+                refs,
+                lease_epoch,
+                request_id,
+            }
+        ),
+        (
+            any::<u64>(),
+            prop::collection::vec(any::<u64>(), 0..8),
+            any::<u64>(),
+            any::<u64>()
+        )
+            .prop_map(|(vol_tag, blocks, lease_epoch, request_id)| {
+                PublishCall::FreeBlocks {
+                    vol_tag,
+                    blocks,
+                    lease_epoch,
+                    request_id,
+                }
+            }),
+        (
+            any::<u64>(),
+            bytes(),
+            any::<u64>(),
+            prop::collection::vec((any::<u32>(), "[a-z0-9:_-]{1,16}"), 0..8),
+            refs(),
+            any::<u64>(),
+            any::<u64>(),
+            any::<u64>(),
+        )
+            .prop_map(
+                |(ino, layout, size, entries, refs, base_gen, lease_epoch, request_id)| {
+                    PublishCall::MigrateBlockMap {
+                        ino,
+                        layout,
+                        size,
+                        entries,
+                        refs,
+                        base_gen,
+                        lease_epoch,
+                        request_id,
+                    }
+                }
+            ),
+    ]
+}
+
+fn arb_publish_outcome() -> impl Strategy<Value = PublishCallOutcome> {
+    prop_oneof![
+        Just(PublishCallOutcome::Done(Ok(PublishReply::Unit))),
+        any::<bool>().prop_map(
+            |recomputed| PublishCallOutcome::Done(Ok(PublishReply::PutDone { recomputed }))
+        ),
+        (
+            any::<u64>(),
+            any::<u64>(),
+            any::<u64>(),
+            any::<bool>(),
+            any::<u64>(),
+            any::<u64>()
+        )
+            .prop_map(
+                |(records, record_bytes, preexisting, recomputed, released, gen)| {
+                    PublishCallOutcome::Done(Ok(PublishReply::MapMigrated {
+                        records,
+                        record_bytes,
+                        preexisting,
+                        recomputed,
+                        released,
+                        gen,
+                    }))
+                }
+            ),
+        (any::<i32>(), "\\PC{0,32}")
+            .prop_map(|(errno, msg)| PublishCallOutcome::Done(Err(WireError { errno, msg }))),
+        (any::<u16>(), "\\PC{0,32}")
+            .prop_map(|(status, detail)| PublishCallOutcome::Refused { status, detail }),
+    ]
 }

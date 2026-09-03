@@ -45,7 +45,10 @@ fuzz_target!(|input: Input| {
     // Total: an arbitrary geometry is a refusal, never a panic and never
     // an arithmetic overflow.
     let Ok(layout) = SessionLayout::compute(&g) else {
-        assert!(g.validate().is_err(), "compute refuses iff validate refuses");
+        assert!(
+            g.validate().is_err(),
+            "compute refuses iff validate refuses"
+        );
         return;
     };
     assert!(g.validate().is_ok());

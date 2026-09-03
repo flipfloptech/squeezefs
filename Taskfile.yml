@@ -197,6 +197,10 @@ tasks:
       # it is outside the workspace, so no line above compiles it. Build
       # only (seconds) — the model RUN is tests/run_loom.sh.
       - task: check:loom
+      # The fuzz workspace is excluded too (sanitizer RUSTFLAGS); its
+      # targets type-check on STABLE — only the instrumented RUN needs
+      # nightly + cargo-fuzz. Check only.
+      - task: check:fuzz
       - task: check:docs
       # ENG-2: supply chain. Last so a dependency advisory does not mask a
       # code failure, but inside the same gate — the AGENTS.md Phase-5
@@ -238,6 +242,26 @@ tasks:
       RUSTFLAGS: --cfg loom -D warnings
     cmds:
       - cargo build --release --tests
+      - cargo fmt --check
+
+  check:fuzz:
+    desc: >-
+      The TEST-4 fuzz workspace TYPE-CHECKS against the decoders it drives
+      (check + fmt, stable toolchain; its own target dir, so the cold run
+      checks the squeezefs lib once and is seconds after). fuzz/ is excluded from the
+      workspace on purpose (its sanitizer/coverage RUSTFLAGS must not
+      poison the main graph), which also meant no gate line compiled it:
+      the S3 cluster_wire port (2026-08-02) made job_wire's reader
+      synchronous the same day the async-shaped target landed, and the
+      rot surfaced only at the 1.2 release campaign (2026-09-03). Without
+      the fuzz RUSTFLAGS `libfuzzer-sys` compiles on stable, so this is
+      the same check:loom shape. The instrumented RUN stays the nightly /
+      pre-tag tier (AGENTS.md Test tiering — "Nightly (fuzzing)").
+    dir: fuzz
+    env:
+      RUSTFLAGS: -D warnings
+    cmds:
+      - cargo check --bins
       - cargo fmt --check
 
   audit:

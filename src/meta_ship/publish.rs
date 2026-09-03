@@ -986,6 +986,28 @@ fn decode<T: serde::de::DeserializeOwned>(bytes: &[u8], what: &str) -> Result<T>
         })
 }
 
+/// Encode a request frame (trusted input — we built it).
+pub fn encode_request_frame(frame: &PublishRequestFrame) -> Result<Vec<u8>> {
+    encode(frame, "frame")
+}
+
+/// Decode a request frame (**untrusted** — bounded by the CONTROL cap;
+/// the `publish_wire` fuzz target's entry).
+pub fn decode_request_frame(bytes: &[u8]) -> Result<PublishRequestFrame> {
+    decode(bytes, "request")
+}
+
+/// Encode a reply frame.
+pub fn encode_reply_frame(frame: &PublishReplyFrame) -> Result<Vec<u8>> {
+    encode(frame, "reply frame")
+}
+
+/// Decode a reply frame (**untrusted** — bounded; a co-writer trusts an
+/// authority's reply no further than the authority trusts its request).
+pub fn decode_reply_frame(bytes: &[u8]) -> Result<PublishReplyFrame> {
+    decode(bytes, "reply frame")
+}
+
 // ---------------------------------------------------------------------------
 // The ledger
 // ---------------------------------------------------------------------------
@@ -1609,14 +1631,11 @@ async fn ship_frame(shared: &LaneShared, frame: Vec<Submission>) {
     }
     SHIP_FRAMES.fetch_add(1, Ordering::Relaxed);
     SHIP_FRAMED_CALLS.fetch_add(n as u64, Ordering::Relaxed);
-    let body = match encode(
-        &PublishRequestFrame {
-            schema: PUBLISH_SCHEMA,
-            client: shared.peer_id.to_string(),
-            calls,
-        },
-        "frame",
-    ) {
+    let body = match encode_request_frame(&PublishRequestFrame {
+        schema: PUBLISH_SCHEMA,
+        client: shared.peer_id.to_string(),
+        calls,
+    }) {
         Ok(b) => b,
         Err(e) => {
             fail_all(waiters, &e.to_string());
@@ -1646,7 +1665,7 @@ async fn ship_frame(shared: &LaneShared, frame: Vec<Submission>) {
         );
         return;
     }
-    let decoded: PublishReplyFrame = match decode(&reply.body, "reply frame") {
+    let decoded = match decode_reply_frame(&reply.body) {
         Ok(f) => f,
         Err(e) => {
             fail_all(waiters, &e.to_string());
@@ -3380,7 +3399,7 @@ impl PublishService {
                 body: format!("S9: unknown publish verb {}", req.verb).into_bytes(),
             };
         }
-        let frame: PublishRequestFrame = match decode(&req.body, "request") {
+        let frame = match decode_request_frame(&req.body) {
             Ok(f) => f,
             Err(e) => return Self::refuse_frame(req.id, PUBLISH_MALFORMED, format!("{e}")),
         };
@@ -3457,7 +3476,7 @@ impl PublishService {
             schema: PUBLISH_SCHEMA,
             outcomes,
         };
-        match encode(&reply, "reply frame") {
+        match encode_reply_frame(&reply) {
             Ok(body) => RpcResponse {
                 id: req.id,
                 status: PUBLISH_OK,

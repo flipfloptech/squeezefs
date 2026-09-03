@@ -9,9 +9,16 @@
 #   3. the IPC shared memfd + bootstrap blob — the shim reads a blob and
 #      a header written by a process it must not trust unconditionally.
 #
+# 1.2 added to surfaces 1 and 2: the kvmap block-map tree's codecs
+# (incompat bit 16 — `kvmap_record`), and the cluster wire's RPC
+# vocabulary + authenticated framing with the S8/S9 verb bodies that ride
+# it (`cluster_wire_frame`, `publish_wire`) — the bytes one MEMBER of a
+# multi-writer set hands the volume authority.
+#
 # `tests/ipc_host_tests.rs` and `tests/job_wire_bounds_tests.rs` cover
 # every NAMED refusal class well. What these targets add is the classes
-# nobody thought of.
+# nobody thought of. `tests/decoder_property_tests.rs` is the per-commit
+# proptest mirror of the same laws.
 #
 # Own workspace (like loom-models): the fuzz profile carries sanitizer
 # and coverage RUSTFLAGS that must not poison the main build graph.
@@ -37,8 +44,6 @@ fuse3 = { path = "../crates/fuse3" }
 libfuzzer-sys = "0.4"
 arbitrary = { version = "1", features = ["derive"] }
 bytes = "1.5"
-tokio = { version = "1.48", features = ["rt", "io-util", "macros", "time"] }
-serde_json = "1.0"
 
 [dependencies.squeezefs]
 path = ".."
@@ -95,11 +100,32 @@ test = false
 doc = false
 bench = false
 
-# --- remote job wire -------------------------------------------------------
+[[bin]]
+name = "kvmap_record"
+path = "fuzz_targets/kvmap_record.rs"
+test = false
+doc = false
+bench = false
+
+# --- remote job wire + the cluster wire's RPC vocabulary --------------------
 
 [[bin]]
 name = "job_wire_frame"
 path = "fuzz_targets/job_wire_frame.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "cluster_wire_frame"
+path = "fuzz_targets/cluster_wire_frame.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "publish_wire"
+path = "fuzz_targets/publish_wire.rs"
 test = false
 doc = false
 bench = false

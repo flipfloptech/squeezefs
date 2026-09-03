@@ -10785,6 +10785,10 @@ impl SqueezefsFilesystem {
                 "fuse3_zc_write_fusions": fuse3::zc_write_fusions(),
                 "fuse3_zc_write_fusion_bytes": fuse3::zc_write_fusion_bytes(),
                 "fuse3_zc_write_fusion_demotions": fuse3::zc_write_fusion_demotions(),
+                // R-3 READ fusion engagement: ≈ every kernel READ on an
+                // armed session with the lever on; demotions ≈ 0.
+                "fuse3_zc_read_fusions": fuse3::zc_read_fusions(),
+                "fuse3_zc_read_fusion_demotions": fuse3::zc_read_fusion_demotions(),
                 // The hold gate's staleness gauge (fused-lane-predicate,
                 // 2026-08-08): LATE (post-dispatch lazy) extractions of
                 // HELD writes — the delivery-time eligibility hint went

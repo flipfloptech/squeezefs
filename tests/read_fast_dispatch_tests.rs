@@ -27,8 +27,11 @@
 //!    chain `transport_recv ≡ fast_dispatch → reply_commit`.
 //! 7. **Live engagement (mount class)**: on an armed session every
 //!    kernel READ is either served inline or minted straight to a lane —
-//!    `Δserves + Δdemotes ≡ the READs delivered`, the served ones never
-//!    take the handler's in-place arm (`Δserves + Δinplace ≡ READs`), the
+//!    `Δserves + Δfusions + Δdemotes ≡ the READs delivered` (the composed
+//!    R-2 ⊕ R-3 partition — a demoted READ fuses onto the queue worker's
+//!    lane on a zc-armed session or is handed to a handler lane), the
+//!    served ones never take the handler's in-place arm (`Δserves +
+//!    Δinplace ≡ READs`), the
 //!    bytes round-trip exact, and the lever's `0` leaves both counters
 //!    flat while every READ rides the handler arm.
 //!
@@ -657,7 +660,15 @@ fn live_armed_session_reads_are_all_fast_dispatched_and_close_against_inplace_re
         let qw = &met["read_transport_phase_ns"]["queue_wait"];
         (
             u("transport_fast_dispatch_serves"),
-            u("transport_fast_dispatch_demotes"),
+            // The composed law (R-2 ⊕ R-3): a demoted READ either FUSES
+            // onto the queue worker's lane (zc-armed session, under the
+            // ceiling — `fuse3_zc_read_fusions`) or is handed to a handler
+            // lane (`transport_fast_dispatch_demotes`); both venues reply
+            // in place. Unprivileged mounts never arm zc, so the fusion
+            // count is 0 here and every demote is a lane hand-off; as root
+            // on an sqz kernel the same partition holds with the two arms
+            // swapped (the zc_bridge_phase suite pins that face).
+            u("transport_fast_dispatch_demotes") + u("fuse3_zc_read_fusions"),
             u("fuse3_read_inplace_replies"),
             qw["count"].as_u64().unwrap(),
             qw["sum_ns"].as_u64().unwrap(),
@@ -677,7 +688,8 @@ fn live_armed_session_reads_are_all_fast_dispatched_and_close_against_inplace_re
     assert_eq!(
         d1 - d0,
         i1 - i0,
-        "the demoted READs (the .stats brackets) are exactly the in-place replies"
+        "the demoted READs (the .stats brackets) — lane-handed or fused — are exactly the \
+         in-place replies"
     );
     assert_eq!(
         qc1 - qc0,
@@ -702,13 +714,14 @@ fn live_armed_session_reads_are_all_fast_dispatched_and_close_against_inplace_re
     assert_eq!(s1 - s0, 0, "a ranged device read is never served sync");
     assert!(
         d1 - d0 >= n,
-        "every cold READ demotes (demotes {} for {n} READs)",
+        "every cold READ demotes (demotes + fusions {} for {n} READs)",
         d1 - d0
     );
     assert_eq!(
         d1 - d0,
         i1 - i0,
-        "a demoted READ is lane-served exactly once (in-place replies ≡ demotes)"
+        "a demoted READ is handler-served exactly once, on a lane or fused (in-place \
+         replies ≡ demotes + fusions)"
     );
     assert_eq!(qs1 - qs0, 0, "the demote arm skips the inbound queue too");
     m.unmount();
@@ -728,6 +741,7 @@ fn live_armed_session_reads_are_all_fast_dispatched_and_close_against_inplace_re
     }
     let s0 = m.metric_u64("transport_fast_dispatch_serves");
     let d0 = m.metric_u64("transport_fast_dispatch_demotes");
+    let f0 = m.metric_u64("fuse3_zc_read_fusions");
     let i0 = m.metric_u64("fuse3_read_inplace_replies");
     let n = odirect_reads_4k(&path, &payload, 32);
     assert_eq!(
@@ -739,6 +753,11 @@ fn live_armed_session_reads_are_all_fast_dispatched_and_close_against_inplace_re
         m.metric_u64("transport_fast_dispatch_demotes"),
         d0,
         "lever off: no direct mints"
+    );
+    assert_eq!(
+        m.metric_u64("fuse3_zc_read_fusions"),
+        f0,
+        "lever off: no fusions either — the fused arm sits BEHIND the fast-dispatch probe"
     );
     assert!(
         m.metric_u64("fuse3_read_inplace_replies") - i0 >= n as u64,

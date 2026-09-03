@@ -42,10 +42,11 @@ pub use raw::{
     retention_negotiated, transport_cq_overflow_stats, transport_lease_stats,
     transport_park_backstop_ticks, transport_reply_integrity_stats, transport_wake_stats,
     zc_bridge_cancels, zc_bridge_lost, zc_bridge_orphans, zc_fallbacks, zc_negotiated,
-    zc_release_failures, zc_releases, zc_replies, zc_retain_commits, zc_retain_refused,
-    zc_retained_outstanding, zc_slot_payload_skips, zc_write_direct_bytes, zc_write_directs,
-    zc_write_extract_bytes, zc_write_extractions, zc_write_fusion_bytes, zc_write_fusion_demotions,
-    zc_write_fusions, zc_write_lazy_extractions, zc_write_store_qid_census, COMMIT_BATCH_LABELS,
+    zc_read_fusion_demotions, zc_read_fusions, zc_release_failures, zc_releases, zc_replies,
+    zc_retain_commits, zc_retain_refused, zc_retained_outstanding, zc_slot_payload_skips,
+    zc_write_direct_bytes, zc_write_directs, zc_write_extract_bytes, zc_write_extractions,
+    zc_write_fusion_bytes, zc_write_fusion_demotions, zc_write_fusions, zc_write_lazy_extractions,
+    zc_write_store_qid_census, COMMIT_BATCH_LABELS,
 };
 pub use raw::{
     fused_midpass_reaps, fused_passbottom_reaps, fused_timeline_snapshot, pin_scope_from_env,

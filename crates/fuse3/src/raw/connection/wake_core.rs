@@ -100,6 +100,20 @@ impl WakeCoalescer {
     pub fn disarm(&self) {
         self.armed.swap(false, Ordering::SeqCst);
     }
+
+    /// Worker side, a PEEK before the pass-top drain (R-3 worker
+    /// economy): `false` = no producer has armed since the last disarm,
+    /// so the eventfd counter holds no covered write and the drain's
+    /// `read(2)` may be skipped. Only an ECONOMY, never a correctness
+    /// gate: a producer arming between this peek and the disarm leaves
+    /// its write in the counter, where the level-triggered PollAdd
+    /// completes at the next park and the following pass drains (the
+    /// caller drains unconditionally after a poll CQE). The publication
+    /// edge still rides `disarm`'s RMW, which the caller performs every
+    /// pass regardless.
+    pub fn is_armed(&self) -> bool {
+        self.armed.load(Ordering::SeqCst)
+    }
 }
 
 #[cfg(all(test, not(loom)))]

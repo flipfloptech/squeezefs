@@ -441,3 +441,112 @@ fn cold_zc_reads_decompose_into_four_exact_hops_with_a_per_op_chain() {
     drop(mount);
     let _ = std::fs::remove_dir_all(&base);
 }
+
+/// The composed READ dispatch law's PARTITION on a zc-armed session
+/// (R-2 ⊕ R-3): every READ delivered on the ring takes exactly one arm —
+/// served inline (warm), fused onto the queue worker's lane (cold, zc,
+/// under the ceiling), or handed to a handler lane — so
+/// `serves + zc_read_fusions + demotes ≡ READs`, and the two handler
+/// venues together are exactly the in-place replies
+/// (`zc_read_fusions + demotes ≡ fuse3_read_inplace_replies`). With the
+/// fusion lever off the same READs all take the lane arm (the R-2-only
+/// shape), and the fused bridge's `msg_hop` — a same-thread channel op
+/// when fused — is the only phase whose mean moves by an order of
+/// magnitude between the two.
+#[test]
+fn composed_dispatch_law_partitions_every_read_on_a_zc_session() {
+    if !mount_supported(site!()) {
+        return;
+    }
+    let base = scratch("partition");
+    let meta = format_volume(&base);
+    let mnt = base.join("mnt");
+    const READS: u64 = 128;
+    const FILE_LEN: usize = 4096 * READS as usize * 2;
+    {
+        let log0 = base.join("mount-publish.log");
+        let mount = spawn_zc_mount(&meta, &mnt, &log0, &[]);
+        if !zc_armed(&log0) {
+            drop(mount);
+            let _ = std::fs::remove_dir_all(&base);
+            let _ = squeezefs_testkit::declare(
+                site!(),
+                squeezefs_testkit::SkipClass::Capability,
+                "FUSE_URING_ZERO_COPY did not arm (sqz kernel + CAP_SYS_ADMIN required)",
+            );
+            return;
+        }
+        publish_file(&mnt, "cold.bin", FILE_LEN);
+    }
+    let words = |m: &serde_json::Value| -> (u64, u64, u64, u64) {
+        (
+            word(m, "transport_fast_dispatch_serves"),
+            word(m, "fuse3_zc_read_fusions"),
+            word(m, "transport_fast_dispatch_demotes"),
+            word(m, "fuse3_read_inplace_replies"),
+        )
+    };
+    let mut msg_hop_means = Vec::new();
+    for (arm, envs) in [
+        ("fused", vec![]),
+        ("lane", vec![("SQUEEZEFS_FUSE_ZC_READ_FUSION", "0")]),
+    ] {
+        let log = base.join(format!("mount-{arm}.log"));
+        let mount = spawn_zc_mount(&meta, &mnt, &log, &envs);
+        assert!(zc_armed(&log), "{arm}: the mount arms zc");
+        let path = mnt.join("cold.bin");
+        let pre = stats(&mnt);
+        for i in 0..READS {
+            let off = i * 2 * 4096;
+            let got = odirect_pread_4k(&path, off);
+            assert!(got.iter().all(|b| *b == ((off / 4096) as u8) ^ 0x5A));
+        }
+        let post = stats(&mnt);
+        let (s0, f0, d0, i0) = words(&pre);
+        let (s1, f1, d1, i1) = words(&post);
+        let (ds, df, dd, di) = (s1 - s0, f1 - f0, d1 - d0, i1 - i0);
+        // The population: READS cold data reads + the `.stats` read whose
+        // commit lands after `pre` was built (a virtual ino ⇒ demote to a
+        // lane; its size is above the ceiling anyway).
+        assert_eq!(ds, 0, "{arm}: a cold zc read is never served inline");
+        assert_eq!(
+            df + dd,
+            di,
+            "{arm}: the two handler venues are exactly the in-place replies"
+        );
+        assert!(
+            di >= READS,
+            "{arm}: every data read replied in place ({di} for {READS})"
+        );
+        match arm {
+            "fused" => {
+                assert_eq!(
+                    df, READS,
+                    "fused: every cold 4 KiB READ fused onto the worker"
+                );
+                assert_eq!(
+                    word(&post, "fuse3_zc_read_fusion_demotions")
+                        - word(&pre, "fuse3_zc_read_fusion_demotions"),
+                    0,
+                    "fused: the lane never refused a fresh delivery"
+                );
+            }
+            _ => assert_eq!(df, 0, "lane: the lever off fuses nothing"),
+        }
+        let (n0, s0) = phase(&pre, "zc_bridge_phase_ns", "msg_hop");
+        let (n1, s1) = phase(&post, "zc_bridge_phase_ns", "msg_hop");
+        assert_eq!(n1 - n0, READS, "{arm}: one bridge per data read");
+        msg_hop_means.push((s1 - s0) as f64 / READS as f64);
+        drop(mount);
+    }
+    // Fused, the handler → worker hop is a same-thread channel op (sub-µs
+    // to a few µs); on the lane it is an eventfd wake + a worker pass
+    // (tens of µs). A 3× ratio is the conservative bound on an idle box.
+    assert!(
+        msg_hop_means[1] > 3.0 * msg_hop_means[0],
+        "fused msg_hop {:.0} ns vs lane {:.0} ns — the fused arm must collapse the hop",
+        msg_hop_means[0],
+        msg_hop_means[1]
+    );
+    let _ = std::fs::remove_dir_all(&base);
+}

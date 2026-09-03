@@ -105,7 +105,20 @@ pub(crate) struct FusedRunQueue {
     /// `wake_to_poll` timeline histogram (write-IOPS campaign).
     ready: Mutex<VecDeque<(usize, u64)>>,
     sink: FusedWakeSink,
+    /// This lane's id — matched against the polling thread's
+    /// [`CURRENT_FUSED_LANE`] so a wake issued BY the owning worker (a
+    /// bridge CQE resolved at its own pass bottom) elides the eventfd
+    /// write: the worker drains the run queue at its next pass top before
+    /// any park, so the self-wake is a wasted syscall (R-3 economy).
+    lane_id: usize,
 }
+
+thread_local! {
+    /// The fused lane whose worker this thread is (0 = none).
+    static CURRENT_FUSED_LANE: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+static NEXT_LANE_ID: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(1);
 
 impl FusedRunQueue {
     /// Ready-queue depth (watchdog attribution: a stuck RESIDENT task
@@ -119,12 +132,23 @@ impl FusedRunQueue {
 
     fn push(&self, id: usize) {
         // Publish the observable state FIRST (the producer law), then
-        // wake through the coalescer.
+        // wake through the coalescer — unless the producer IS the owning
+        // worker, which is awake by definition and drains before parking.
+        self.push_local(id);
+        if CURRENT_FUSED_LANE.with(|c| c.get()) != self.lane_id {
+            self.sink.wake();
+        }
+    }
+
+    /// The worker's OWN push (admission at delivery): no wake — the
+    /// worker is awake by definition and drains the lane at its next
+    /// pass top before any park, so the eventfd write a cross-thread
+    /// waker must pay is a wasted syscall here (R-3 economy).
+    fn push_local(&self, id: usize) {
         self.ready
             .lock()
             .expect("fused run queue poisoned-free")
             .push_back((id, crate::raw::read_phase::transport_now_ns()));
-        self.sink.wake();
     }
 
     fn pop(&self) -> Option<(usize, u64)> {
@@ -215,11 +239,19 @@ impl FusedLane {
             rq: Arc::new(FusedRunQueue {
                 ready: Mutex::new(VecDeque::with_capacity(capacity.max(1))),
                 sink: FusedWakeSink { coalescer, wake_fd },
+                lane_id: NEXT_LANE_ID.fetch_add(1, Ordering::Relaxed),
             }),
             capacity: capacity.max(1),
             panics: 0,
             watch: Arc::new(FusedWatch::default()),
         }
+    }
+
+    /// Bind the calling thread as this lane's worker: wakes it issues to
+    /// its own tasks skip the eventfd write (see [`FusedRunQueue::push`]).
+    /// Call once from the drain-group worker thread after construction.
+    pub(crate) fn bind_current_thread(&self) {
+        CURRENT_FUSED_LANE.with(|c| c.set(self.rq.lane_id));
     }
 
     /// The shared residency watch handles (registered with the pool so
@@ -242,8 +274,10 @@ impl FusedLane {
         let id = self.tasks.insert(FusedTask { fut, unique });
         self.watch.note_admit(unique);
         // First poll happens on the worker's next lane drain: enqueue
-        // through the run queue so mint sites need no poll context.
-        self.rq.push(id);
+        // through the run queue so mint sites need no poll context. The
+        // caller IS the worker (admission runs at delivery on its own
+        // pass), so no wake is owed.
+        self.rq.push_local(id);
         true
     }
 
@@ -401,6 +435,72 @@ pub(crate) fn fusion_enabled() -> bool {
 pub struct FusedWriteDispatch {
     pub mint: Arc<dyn Fn(InboundUringReq) -> FusedFuture + Send + Sync + 'static>,
 }
+
+/// READ fusion (e2e audit R-3, the zc direct leg's fusion — composed with
+/// R-2's fast dispatch, see `fuse_over_uring`'s READ dispatch law): a
+/// READ the reap thread's inline probe DEMOTED (cold) and that is
+/// zc-eligible and under the fusion ceiling runs its handler future
+/// (R-2's `ReadFastDispatch::mint` — the one READ mint both venues share)
+/// on the queue worker's fused lane instead of a handler lane. The kern
+/// rand-4k READ's bridge is the write lane's killed term verbatim —
+/// handler-lane `zc_device_fetch` → `WorkerMsg::ZcFetch` (channel +
+/// eventfd wake) → worker SQE → CQE → oneshot → handler-lane wake →
+/// `WorkerMsg::Commit` (a third wake) — measured at the field as three
+/// ~35–47 µs hops around a 40 µs DMA (`zc_bridge_phase_ns` msg_hop /
+/// device_cq-minus-device / wake_hop). Fused, all three are same-thread:
+/// the worker polls the READ future, its fetch message is pumped in the
+/// SAME pass, the CQE resumes it inline, and its prefilled commit is
+/// pumped in that pass too.
+/// The READ fusion lever (`SQUEEZEFS_FUSE_ZC_READ_FUSION`): **default
+/// ON** — accepted by the R-3 A-B-B-A rows (the local tcp devsub kern
+/// rand-4k row and the field row; `.benchmarks/2026-09-03-r3-fill-issue-
+/// economy.md`). `0` is the A/B control: a demoted READ takes R-2's
+/// handler-lane hand-off (the R-2-only shape byte-identical).
+/// Absent/malformed keeps the default (the transport lever law — the
+/// daemon's startup gate already refused a bad value). Read once per
+/// worker at arm.
+pub(crate) fn read_fusion_enabled() -> bool {
+    crate::env_knob_core::parse_bool(
+        "SQUEEZEFS_FUSE_ZC_READ_FUSION",
+        std::env::var("SQUEEZEFS_FUSE_ZC_READ_FUSION")
+            .ok()
+            .as_deref(),
+    )
+    .ok()
+    .flatten()
+    .unwrap_or(true)
+}
+
+/// Count one fused READ dispatch (`fuse3_zc_read_fusions` on the stats
+/// inode — the R-3 engagement instrument: on an armed session with the
+/// lever on this must account ≈ every kernel READ).
+pub fn note_zc_read_fusion() {
+    ZC_READ_FUSIONS.fetch_add(1, Ordering::Relaxed);
+}
+
+/// `fuse3_zc_read_fusions` (stats inode): armed READs whose handler ran
+/// on the queue worker's fused lane. 0 by construction until a session
+/// arms zc with the lever on.
+pub fn zc_read_fusions() -> u64 {
+    ZC_READ_FUSIONS.load(Ordering::Relaxed)
+}
+
+/// Count one fusion-eligible (demoted, zc, under-ceiling) READ delivery
+/// that took the handler-lane hand-off anyway (lane at capacity).
+pub fn note_zc_read_fusion_demotion() {
+    ZC_READ_FUSION_DEMOTIONS.fetch_add(1, Ordering::Relaxed);
+}
+
+/// `fuse3_zc_read_fusion_demotions` (stats inode): ≈ 0 in steady state
+/// (sustained growth means the fused lane is saturated — its capacity is
+/// the group's ent depth, so this names a slab accounting bug).
+pub fn zc_read_fusion_demotions() -> u64 {
+    ZC_READ_FUSION_DEMOTIONS.load(Ordering::Relaxed)
+}
+
+static ZC_READ_FUSIONS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static ZC_READ_FUSION_DEMOTIONS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
 
 /// The zc-write HOLD gate (fused-lane-predicate campaign, 2026-08-08):
 /// `(ino, offset, len, odirect) → may this payload stay HELD in the

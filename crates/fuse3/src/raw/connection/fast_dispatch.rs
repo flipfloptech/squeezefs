@@ -48,6 +48,38 @@
 //!
 //! `SQUEEZEFS_FUSE_READ_FAST_DISPATCH=0` is the A/B control (the
 //! pre-campaign inbound-queue path, byte-identical).
+//!
+//! # The composed READ dispatch law (R-2 ⊕ R-3, 2026-09-03)
+//!
+//! R-3 (`.benchmarks/2026-09-03-r3-fill-issue-economy.md`) named the
+//! DEMOTED cold READ's next term: around one 40 µs DMA the zc direct leg
+//! paid three cross-thread wakes (handler lane → worker, CQE → worker,
+//! worker → handler lane), 35–47 µs each under the field's CPU load. The
+//! two levers compose into ONE law at the delivery CQE, in this order:
+//!
+//! - **(a) served inline if warm** — step 1/2 above (R-2);
+//! - **(b) else fused onto the queue worker's lane** if the session is
+//!   zc-armed and `fuse_read_in.size` is at or under the fusion ceiling
+//!   (`SQUEEZEFS_FUSE_ZC_READ_FUSION`, default on — the D16 fused lane;
+//!   the SAME [`ReadFastDispatch::mint`] future, polled by the reaping
+//!   worker: its fetch message, its CQE resume and its prefilled COMMIT
+//!   are same-thread; `fuse3_zc_read_fusions` counts it);
+//! - **(c) else handed to the lane homed on the queue's CPU** — step 3
+//!   above (`transport_fast_dispatch_demotes` counts it; an eligible READ
+//!   the fused lane refused at capacity also counts
+//!   `fuse3_zc_read_fusion_demotions`).
+//!
+//! **Partition law:** `serves + zc_read_fusions + demotes ≡` the READs
+//! delivered on an armed session with the lever on — every READ takes
+//! exactly one arm, and `zc_read_fusions + demotes ≡ fuse3_read_inplace_
+//! replies` (a served READ never takes the handler's in-place arm). The
+//! reap thread never blocks on any arm. The instruments coexist without
+//! double-counting a stage: `transport_reap_gap_ns` brackets the worker's
+//! enters; `read_transport_phase_ns` records `queue_wait ≡ 0` on (b) and
+//! (c) with `dispatch_lag` = arrival → the handler's first poll (the run-
+//! queue wait on (b), the lane hop on (c)); `zc_bridge_phase_ns` splits
+//! the handler's `block_fetch` on the zc leg (`Σ hops ≡ total`), and its
+//! `wake_hop` on (b) is the fused pass's run-queue wait, not a thread hop.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;

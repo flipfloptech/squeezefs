@@ -12,7 +12,8 @@ use bytes::Bytes;
 pub use connection::fuse_over_uring::fast_dispatch::{fast_dispatch_demotes, fast_dispatch_serves};
 #[cfg(all(target_os = "linux", feature = "tokio-runtime"))]
 pub use connection::fuse_over_uring::fused::{
-    zc_write_fusion_bytes, zc_write_fusion_demotions, zc_write_fusions, zc_write_lazy_extractions,
+    zc_read_fusion_demotions, zc_read_fusions, zc_write_fusion_bytes, zc_write_fusion_demotions,
+    zc_write_fusions, zc_write_lazy_extractions,
 };
 #[cfg(all(target_os = "linux", feature = "tokio-runtime"))]
 pub use connection::fuse_over_uring::{

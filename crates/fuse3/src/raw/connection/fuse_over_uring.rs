@@ -4455,10 +4455,16 @@ fn queue_worker(
     // exists only while its ent owes a reply — the bound is structural);
     // wakes ride the group's own coalescer+eventfd producer protocol.
     let fusion_on = zc_mode && fused::fusion_enabled();
+    // R-3: READ fusion — every armed READ's handler runs on this worker's
+    // fused lane (the zc direct leg's three cross-thread hops collapse to
+    // same-thread channel ops); `SQUEEZEFS_FUSE_ZC_READ_FUSION=0` is the
+    // classic-dispatch A/B control.
+    let read_fusion_on = zc_mode && fused::read_fusion_enabled();
     let fusion_max = fused::fusion_ceiling(payload_sz_cfg);
     // R-2 READ fast-dispatch lever (default on; `0` = the A/B control).
     let fast_dispatch_on = fast_dispatch::fast_dispatch_enabled();
     let mut fused_lane = fused::FusedLane::new(group_depth, Arc::clone(&wake_coalescer), wake_fd);
+    fused_lane.bind_current_thread();
     {
         let (watch, rq) = fused_lane.watch_handle();
         pool.fused_watches
@@ -5032,6 +5038,17 @@ fn queue_worker(
     // reuse the allocation.
     let mut deferred_cqes: Vec<(u64, i32, u32)> = Vec::new();
 
+    // R-3 worker economy: the pass-top eventfd drain is 1–2 `read(2)`s
+    // per pass (1.8/op measured on the kern rand-4k row, most answering
+    // EAGAIN). It is owed only when a producer armed the coalescer since
+    // the last disarm or the wake-fd PollAdd completed (either means the
+    // counter may be nonzero); a pass entered from a device/delivery CQE
+    // with neither skips the syscalls. Never a correctness gate: a
+    // covered write the peek misses stays in the counter, the level-
+    // triggered poll completes at the next park, and the following pass
+    // drains (`wake_cqe_seen`).
+    let mut wake_cqe_seen = true;
+
     while pool.active.load(Ordering::Relaxed) {
         // Drain the eventfd FIRST. The wake-fd PollAdd re-arm is deferred to
         // the loop-bottom submit_and_wait (S2), so during the passes below
@@ -5044,7 +5061,10 @@ fn queue_worker(
         // already visible to the drains below — and any wake arriving AFTER
         // this drain leaves the counter nonzero, which completes the
         // (level-triggered) PollAdd the moment submit_and_wait arms it.
-        drain_wake_eventfd(wake_fd);
+        if wake_cqe_seen || wake_coalescer.is_armed() {
+            drain_wake_eventfd(wake_fd);
+            wake_cqe_seen = false;
+        }
         // L3 lever B — disarm the wake coalescer AT THIS POINT: after the
         // eventfd drain, before any producer-state scan below. Disarming
         // before the drain leaves the flag armed after the pass while the
@@ -5166,8 +5186,10 @@ fn queue_worker(
                         for c in cq {
                             let (user_data, res, flags) = (c.user_data(), c.result(), c.flags());
                             let Some((op, gent)) = decode_user_data(user_data) else {
-                                // wake-fd poll completed — re-arm later.
+                                // wake-fd poll completed — re-arm later;
+                                // the next pass top owes the drain.
                                 need_repoll_sticky = true;
+                                wake_cqe_seen = true;
                                 continue;
                             };
                             let deferrable = op != RingOp::Fetch
@@ -5249,11 +5271,17 @@ fn queue_worker(
                     // burst's own wakes (reap resolutions) land in the
                     // ready queue and form the NEXT burst after the next
                     // flush, so DMA launch stays eager per burst.
-                    fused_more = match pool.fused_dispatch.get() {
+                    fused_more = match pool
+                        .fused_dispatch
+                        .get()
+                        .map(|_| ())
+                        .or_else(|| pool.read_fast_dispatch.get().map(|_| ()))
+                    {
                         // Presence gate only: a registered dispatcher
-                        // means this lane may drain (no handle travels
-                        // since rip-tokio-total).
-                        Some(_) => {
+                        // (the fused-write mint, or R-2's READ mint whose
+                        // demoted zc READs fuse here) means this lane may
+                        // drain (no handle travels since rip-tokio-total).
+                        Some(()) => {
                             let mut any = false;
                             while fused_lane.drain_one() {
                                 any = true;
@@ -5908,8 +5936,10 @@ fn queue_worker(
             // how an EAGAIN'd commit used to discard the reply
             // `apply_reply` had already written into the ent).
             let Some((op, gent)) = decode_user_data(user_data) else {
-                // wake_fd poll completed — re-arm (or exit if inactive)
+                // wake_fd poll completed — re-arm (or exit if inactive);
+                // the next pass top owes the drain.
                 need_repoll_sticky = true;
+                wake_cqe_seen = true;
                 continue;
             };
             if gent >= members.len() * depth {
@@ -6636,17 +6666,36 @@ fn queue_worker(
                 continue;
             }
 
-            // READ fast-dispatch from the reap thread (e2e perf audit
-            // R-2, read board #2 — the `fast_dispatch` module doc): run
-            // the filesystem's SYNC try-only probe HERE, at the delivery
-            // CQE. Served ⇒ commit inline through the same lease-gated
-            // routing every reply takes (no channel, no wake, no lane —
-            // `queue_wait == dispatch_lag == 0`); Demote ⇒ mint the full
-            // READ handler and hand it straight to a handler lane (the
-            // inbound queue + session dispatch task skipped). READ
-            // deliveries carry no payload lease, so the §5.4 gate is a
-            // structural pass on this arm; a cold read's device work
-            // stays on the lanes exactly as before.
+            // THE READ DISPATCH LAW (R-2 ⊕ R-3, composed 2026-09-03 — the
+            // `fast_dispatch` module doc carries the same three arms). A
+            // fetched READ on the reap thread is:
+            //   (a) SERVED INLINE if warm — the filesystem's SYNC try-only
+            //       probe (R-2): commit through the same lease-gated
+            //       routing every reply takes, no channel, no wake, no
+            //       lane (`queue_wait == dispatch_lag == 0`); a would-
+            //       block (a writer holding the inode lock, an overlay,
+            //       a multi-block shape) is a Demote, never a wait;
+            //   (b) else, if zc-eligible (a zc-armed session) and at or
+            //       under the fusion ceiling, FUSED onto this worker's
+            //       own lane (R-3): the full READ handler future runs
+            //       here, so its `zc_device_fetch` message, the device
+            //       CQE's resume and its prefilled COMMIT are same-thread
+            //       channel ops — the three cross-thread wakes the zc
+            //       bridge paid are gone;
+            //   (c) else HANDED to the fuse3-tpc lane homed on the queue's
+            //       CPU (R-2's lane-homing law; the pre-existing handler
+            //       venue), the inbound queue + session dispatch task
+            //       skipped.
+            // Partition law (pinned by the root suites):
+            //   transport_fast_dispatch_serves + fuse3_zc_read_fusions +
+            //   transport_fast_dispatch_demotes ≡ the READs delivered on an
+            //   armed session with R-2's lever on — every READ takes
+            //   exactly one arm. The reap thread never blocks on any arm:
+            //   the probe is try-only, a fused future that parks on FS
+            //   state parks in the slab, and the lane hand-off is a queue
+            //   push. READ deliveries carry no payload lease, so the §5.4
+            //   gate is a structural pass on arm (a); a cold read's device
+            //   work stays on the lanes (c) or this worker's ring (b).
             if fast_dispatch::fast_dispatch_candidate(
                 opcode,
                 fast_dispatch_on,
@@ -6727,7 +6776,6 @@ fn queue_worker(
                         continue;
                     }
                     crate::raw::reply::FastReadProbe::Demote => {
-                        fast_dispatch::note_fast_dispatch_demote();
                         let fut = (d.mint)(InboundUringReq {
                             header_and_op,
                             payload,
@@ -6739,14 +6787,41 @@ fn queue_worker(
                             },
                             arrived_ns: now_ns,
                         });
-                        // The handoff-economy venue: the fuse3-tpc lane
-                        // HOMED on this queue's CPU (qid = the requester's
-                        // CPU on queue-per-CPU sessions — one lane per
-                        // queue, the same-lane posture; the first field
-                        // bracket's node round-robin woke a different
+                        // Law (b): a cold zc-eligible READ at or under the
+                        // fusion ceiling FUSES onto THIS worker's lane (R-3)
+                        // — its `zc_device_fetch` message, the CQE resume
+                        // and its prefilled COMMIT are then same-thread
+                        // channel ops instead of three cross-thread wakes.
+                        // The ceiling is the write lane's bound on
+                        // `fuse_read_in.size`: a serve the inline probe
+                        // declined as a would-block (not a miss) may still
+                        // copy `size` bytes on the worker, and the
+                        // non-blocking-drain law forbids payload-scale
+                        // memcpys there. The lane's capacity is the group's
+                        // ent depth (a fused task exists only while its ent
+                        // owes a reply), so a fresh delivery is admitted by
+                        // construction; the capacity check is the belt and
+                        // a refusal falls through to law (c), counted.
+                        let fusible =
+                            read_fusion_on && fused::fuse_candidate(r_size, fusion_max, true);
+                        if fusible && fused_lane.len() < group_depth {
+                            let admitted = fused_lane.spawn(fut, unique);
+                            debug_assert!(admitted, "capacity checked above");
+                            fused::note_zc_read_fusion();
+                            continue;
+                        }
+                        if fusible {
+                            fused::note_zc_read_fusion_demotion();
+                        }
+                        // Law (c): hand the minted handler to the fuse3-tpc
+                        // lane HOMED on this queue's CPU (qid = the
+                        // requester's CPU on queue-per-CPU sessions — one
+                        // lane per queue, the same-lane posture; the first
+                        // field bracket's node round-robin woke a different
                         // parked lane per op and moved the tail onto the
                         // worker's blind window), else node round-robin;
                         // never a runtime-handle spawn.
+                        fast_dispatch::note_fast_dispatch_demote();
                         crate::raw::session::tpc_dispatch_boxed(
                             pool.qid_is_cpu.then_some(qid as usize),
                             queue_node,

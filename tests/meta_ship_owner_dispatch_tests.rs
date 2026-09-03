@@ -210,9 +210,16 @@ const FRAME: usize = 64;
 
 /// The contract's pass ceiling: one pass is the ideal (every verb parks
 /// on the conveyor before the pass task drains); the slack covers the
-/// pass task being mid-drain when the first committers arrive (a
-/// straggler pass) plus scheduling skew on the pool.
-const MAX_PASSES: u64 = 4;
+/// frame's ARRIVAL SPREAD — 64 verbs dispatched across the two `sqz-meta`
+/// lanes reach the conveyor over ~100s of µs — against the pass task's
+/// responsiveness. On the shared pool the pass waited for a lane behind
+/// the serves and drained 2–3 batches; since C-2 the pass runs on the
+/// volume's own journal lane and takes the first arrivals the instant
+/// they land (4–8 passes measured, debug and release). `FRAME / 4` keeps
+/// the pin's meaning — ≥ 4 verbs co-queued per pass, an order of magnitude
+/// under the serial owner loop's one pass per verb — without encoding one
+/// venue's dispatch timing.
+const MAX_PASSES: u64 = (FRAME / 4) as u64;
 
 // ---------------------------------------------------------------------------
 // 1. The measurement contract — passes per frame

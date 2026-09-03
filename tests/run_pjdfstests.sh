@@ -94,7 +94,7 @@ fi
 # tests needing DISTINCT names collide. NixOS boxes carry it only via nix.
 if ! command -v openssl &>/dev/null; then
     if command -v nix &>/dev/null; then
-        ossl=$(nix build 'nixpkgs#openssl.bin' --no-link --print-out-paths 2>/dev/null | tail -1)
+        ossl=$(nix --extra-experimental-features 'nix-command flakes' build 'nixpkgs#openssl.bin' --no-link --print-out-paths 2>/dev/null | tail -1)
         [ -n "$ossl" ] && [ -x "$ossl/bin/openssl" ] && export PATH="$PATH:$ossl/bin"
     fi
     if ! command -v openssl &>/dev/null; then

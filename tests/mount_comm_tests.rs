@@ -59,6 +59,10 @@ fn comm_names_fit_the_kernel_budget_for_every_base_in_the_tree() {
         "sqz-ipc-ctl",
         "sqz-ipc-thp",
         "sqz-meta1",
+        // C-2 journal lanes: one per writable volume, indexed by the
+        // process-wide spawn count (a 4-digit index = 9,999 volumes
+        // opened over the process life, far past any set).
+        "sqz-jrnl9999",
         "sqz-timer",
         "sqz-fdwatch",
         "sqz-signal",

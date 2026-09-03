@@ -990,6 +990,8 @@ fn thread_classes_fold_by_comm_prefix_with_the_mount_suffix_tolerated() {
         ("sqz-ipc-svc63ma", "sqz-ipc-svc"),
         ("sqz-ipc-dd7", "sqz-ipc-dd"),
         ("sqz-meta1m3", "sqz-meta"),
+        ("sqz-jrnl0", "sqz-jrnl"),
+        ("sqz-jrnl3m2", "sqz-jrnl"),
         ("sqz-blk12", "sqz-blk"),
         ("sqz-nvme3m1", "sqz-nvme"),
         ("sqz-zcrx-rd2", "sqz-zcrx"),

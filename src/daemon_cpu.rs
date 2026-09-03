@@ -29,7 +29,7 @@ pub struct ThreadClass {
 /// before any shorter `sqz-ipc` prefix could be added). The mount-slot
 /// comm suffix (`m{:x}`) sits after the index, so prefix matching
 /// tolerates it.
-pub const CLASSES: [ThreadClass; 9] = [
+pub const CLASSES: [ThreadClass; 10] = [
     ThreadClass {
         prefix: "fuse3-tpc",
         class: "fuse3-tpc",
@@ -53,6 +53,12 @@ pub const CLASSES: [ThreadClass; 9] = [
     ThreadClass {
         prefix: "sqz-meta",
         class: "sqz-meta",
+    },
+    // The per-volume journal lanes (C-2): both commit-conveyor stages and
+    // the volume's journal ring, one thread per writable volume.
+    ThreadClass {
+        prefix: "sqz-jrnl",
+        class: "sqz-jrnl",
     },
     ThreadClass {
         prefix: "sqz-blk",

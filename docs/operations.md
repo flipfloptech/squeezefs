@@ -5,6 +5,7 @@ This is the operator reference for SqueezeFS: the durability contract and its gu
 ## Contents
 
 - [Versioning & releases](#versioning--releases)
+  - [Verifying a build (`task check`)](#verifying-a-build-task-check)
 - [Durability & crash contract](#durability--crash-contract)
   - [Metadata Durability (crash contract)](#metadata-durability-crash-contract)
   - [Single-writer mount guard (guarantee classes)](#single-writer-mount-guard-guarantee-classes)
@@ -27,6 +28,7 @@ This is the operator reference for SqueezeFS: the durability contract and its gu
 - [Removed verbs & flags](#removed-verbs--flags)
 - [Configuration reference](#configuration-reference)
   - [Environment knobs — the parsing convention](#environment-knobs--the-parsing-convention)
+  - [Environment knobs — the complete registry](#environment-knobs--the-complete-registry)
   - [SqueezeFS URI scheme](#squeezefs-uri-scheme)
   - [Format (`squeezefs format`)](#format-squeezefs-format)
   - [Mount (`squeezefs mount`)](#mount-squeezefs-mount)
@@ -38,6 +40,7 @@ This is the operator reference for SqueezeFS: the durability contract and its gu
   - [Read-path tuning](#read-path-tuning-mount-env-design-docsdesign-read-pathmd)
   - [Hybrid I/O for O_DIRECT reads and the device-true escape](#hybrid-io-for-o_direct-reads-default-and-the-device-true-escape)
   - [Random-small-write path](#random-small-write-path-sole-owner-patch--extent-overlay-design-docsdesign-random-small-writesmd)
+  - [Large files — the block-map tree](#large-files--the-block-map-tree)
   - [FUSE transport in-flight concurrency](#fuse-transport-in-flight-concurrency-defaults-are-the-l1-policy-knobs-are-overrides)
   - [FUSE io_uring SQPOLL](#fuse-io_uring-sqpoll-mount-env-measured--leave-unset)
   - [Kernel cache TTLs](#kernel-cache-ttls-mount-options--env-per-class)
@@ -57,10 +60,13 @@ This is the operator reference for SqueezeFS: the durability contract and its gu
   - [Membership plane — lease-based liveness (DLM S6)](#membership-plane--lease-based-liveness-dlm-s6)
   - [Freed-offset grace period (spec §6.8 item 3)](#freed-offset-grace-period-spec-68-item-3)
 - [Observability](#observability)
+  - [The `.stats` families — complete reference](#the-stats-families--complete-reference)
   - [`df` / statfs semantics](#df--statfs-semantics)
   - [Fabric observability](#fabric-observability)
 - [NVMe-oF operations](#nvme-of-operations)
 - [Performance records](#performance-records)
+  - [Field records (squeeze-test)](#field-records-squeeze-test)
+  - [Reference-box records (2026-07 programs)](#reference-box-records-2026-07-programs)
   - [The multi-reference scoreboard (release gate)](#the-multi-reference-scoreboard-release-gate)
   - [Built-in benchmark (`squeezefs bench`)](#built-in-benchmark-squeezefs-bench)
 
@@ -92,6 +98,25 @@ Mechanics and edges:
 - **Bumping the train is a release act**: edit the package `version` in the root `Cargo.toml` and the first-party crate manifests (`crates/fuse3`, `crates/squeezefs-ipc`, `crates/squeezefs-preload`) together — they carry the same train. (The pre-2026-07-24 "`0.1.0` cargo-internal placeholder, never bump" posture is retired.) The `.stats` `build_commit`/`build_tag` fields stay raw commit/tag — fleet tooling never parses the version line.
 - **Tarball / no-git builds**: packagers set `SQUEEZEFS_BUILD_COMMIT` (and optionally `SQUEEZEFS_BUILD_TAG`) in the build environment to stamp the identity; without git *and* without the envs, the build still succeeds and embeds `unknown`. `SOURCE_DATE_EPOCH` is honored for a reproducible build timestamp.
 
+### Verifying a build (`task check`)
+
+`task check` (`Taskfile.yml`) is the authoritative verification gate — the one CI runs (`.github/workflows/gate.yml`) and the one every code-class commit must pass before merge. It runs, in order:
+
+| Leg | Command | What it proves |
+|---|---|---|
+| clippy, all features | `cargo clippy --all-targets --all-features -- -D warnings` | lint-clean incl. the `gds`/`dhat-on`/`coz-on` cfgs; unused code is a failure (deleted, never allowed) |
+| clippy, shipped config | `cargo clippy --all-targets -- -D warnings` | the default-feature configuration the release binary is built from |
+| fmt | `cargo fmt --check` | formatting |
+| tests | `cargo test --all-features -- --test-threads=1` | the whole suite, single-threaded (mount-class suites self-skip without `/dev/fuse` — see the require-mount leg) |
+| rustdoc | `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps` | rustdoc lints (broken intra-doc links) are warnings by default; the flag makes the line a gate |
+| bench smoke | `cargo bench --benches -- --test` | one iteration of every Criterion bench, no measurement — a panicking bench fails the gate |
+| `task check:fuse3` | the same clippy/fmt/test/doc/bench legs inside `crates/fuse3` | the first-party FUSE fork is its own excluded workspace; nothing above compiles its tests |
+| `task check:loom` | `cargo build --release --tests` + `cargo fmt --check` under `RUSTFLAGS="--cfg loom -D warnings"` in `loom-models/` | the lock-free protocol models still compile against the cores they include (the model RUN is `tests/run_loom.sh`, nightly / on lock-free-core changes) |
+| `task check:docs` | `tests/check_markdown_links.sh` | relative links and in-document anchors across every tracked markdown file — the whole gate for a docs-only commit |
+| `task audit` | `cargo audit --deny unsound --deny yanked` over both lockfiles (root + `crates/fuse3`) | supply chain; vulnerabilities, unsound and yanked crates fail |
+
+`--all-features` compiles `dhat-on`, which replaces the jemalloc allocator: correct for a correctness gate, never valid for a measurement. Measurement builds are `cargo build --release` (default features), and tagged releases ship from the `dist` profile via `task dist:<distro>`. The release-only legs beyond `task check` — the external POSIX suites (pjdfstest, LTP, fstests), `task check:require-mount`, the zc-capability gate, fuzzing, the bench baseline compare and the scoreboard — are tiered in [AGENTS.md](../AGENTS.md) §Testing.
+
 ---
 
 ## Durability & crash contract
@@ -110,6 +135,7 @@ SqueezeFS metadata is **format v3** (CoW KV) — the only supported metadata for
 - `SQUEEZEFS_META_FLUSH_INTERVAL_MS`: deferred metadata durability window in ms (default `50`); `0` = strict sync-on-commit — every metadata commit returns only after a post-apply device barrier. Legacy alias `SQUEEZEFS_JOURNAL_FLUSH_INTERVAL_MS` is honored; the new name wins if both are set.
 - `SQUEEZEFS_INODE_RECLAIM_BATCH`: inode-reclaim group-commit batch size (default `64`, clamp 1–1024), with `SQUEEZEFS_INODE_RECLAIM_WINDOW_MS` (default `20`) and `SQUEEZEFS_INODE_RECLAIM_CONCURRENCY` (default `max(4, cpus)`). Renamed out of the unrelated **block**-reclaim prefix (ENG-10 — `SQUEEZEFS_RECLAIM_BATCH` was a strict prefix of `SQUEEZEFS_RECLAIM_BATCH_BLOCKS`); the three old spellings refuse the process loudly, naming these successors.
 - `SQUEEZEFS_META_COMMIT_BATCH_TXS` / `SQUEEZEFS_META_COMMIT_BATCH_BYTES`: per-volume commit-conveyor batch caps (defaults derived since 2026-08-04: `max(64, cpus × 2)` transactions / `max(256 KiB, ring/16)` — floors are the shipped M7 posture; explicit env wins verbatim and bytes are clamped to the journal ring's admissible capacity). Group commit batches admission, locking, the journal write, and the barrier across concurrent transactions — **never the atomicity unit**: one transaction stays one checksummed journal entry (design `docs/design-metadata-throughput.md` §5.5). Watch `meta_commit_group_size` on the `.stats` inode; a strict-mode median ≈ 1 under concurrent writers means batching regressed.
+- **The conveyor runs in two stages on a per-volume journal lane** (2026-09-03): the apply stage takes the batch's leaf locks, applies in RAM, drops the locks and *submits* the journal write; a durability lane then awaits the writes in order and takes each group through one barrier and the acknowledgements — so the device's completion latency never sits inside the serialized apply stage. Both stages run on one OS thread per writable metadata volume (`sqz-jrnl{N}`) that owns that volume's journal io_uring and parks in it. `SQUEEZEFS_JOURNAL_LANE=0` is the A/B control (both stages on the shared metadata pool). Engagement: `meta_conveyor_windows_inflight` (1 = serialized, ≥ 2 = overlapped), `meta_conveyor_durability_passes`, `journal_ring_lane_writes` ≈ conveyor passes (`journal_ring_pool_writes` carries the rest), `journal_lanes_{spawned,ringless}`; the atomicity unit is unchanged (one tx = one checksummed journal entry), acks still arrive in journal order and only after the barrier.
 - `SQUEEZEFS_OP_PROFILE=1`: per-op FUSE phase histograms (`fuse_op_phase_ns`, `fuse_create_under_lock_ns`) on the `.stats` inode — diagnostics for metadata-latency attribution. Off by default; zero per-op cost when off.
 - `SQUEEZEFS_OP_TRACE=1`: arm the **per-op trace ring** at mount (e2e audit A2, `docs/design-e2e-perf-audit.md` §1): one CLOCK_MONOTONIC stamp per phase boundary per sampled op, joined on ONE timeline — the op id is the FUSE request `unique` (the kernel's `fuse:fuse_request_send/end` tracepoints carry it) or the il slot ticket. Geometry and the sampling divisor are derived (rings from the thread population, the pool from the R5 budget as the `op_trace_rings` component, the divisor so one drain interval of the machine's op ceiling fits). `cat <mnt>/.trace` **drains** the rings into `{armed, divisor, dropped, samples_total, clock, stages, samples: [[op_id, stage, ns], …]}` (owner-only `0400`, like `.stats`); `tests/op_trace_stitch.py` stitches a dump against the row's `.stats` histograms and the kernel tracepoints. `.stats` carries `op_trace_{armed,samples,dropped,divisor}`; the `op-trace on|off|status` admin verb toggles the ring live. Off by default; one relaxed load per hook when off (`benches/high_concurrency_bench.rs` `op_trace_hook`: 0.3–0.6 ns disarmed, ~5 ns armed).
 
@@ -127,7 +153,7 @@ The v3 metadata engine is single-writer by construction, and the mount enforces 
 | File-backed volume shared cross-host (NFS et al.), or containers with private `/dev` nodes | **Unsupported for concurrent-mount protection** — single-host operation of such volumes remains fully guarded by flock (former) / PR-if-available (latter) |
 | **Co-writer mount** (`SQUEEZEFS_MULTI_WRITER=1` + `SQUEEZEFS_MW_ROLE=co-writer`, admitted by the five-rung ladder) | **A second write-capable mount, admitted — and the first row in this table that is** (DLM S9; guarantee class `co-writer`). It is NOT a second *appender*: it takes no `flock`, writes no `writer_claim`, registers no key on the metadata namespaces and spawns no checkpoint task, and its metadata write gate refuses every LOCAL commit — every metadata mutation is **shipped** to the authority, whose ladder above runs unchanged. Its DATA writes are its own, admitted only under a custody lease that authority granted. **What ENFORCES it:** on a PR substrate the authority's rtype-1 Write Exclusive on the metadata namespaces means a co-writer *on another host* is device-blocked from writing metadata at all, and the rtype-3 WERO hold on the data namespaces means a preempted co-writer's DMA is rejected by the namespace; which bytes each co-writer may write is the authority's custody arbitration. **What only DETECTS:** the durable claim-set enrollment and the membership census (they answer *who is attached* and mint the dead epoch a failure is quarantined under — they stop nothing by themselves), and — the honest residual — a co-writer sharing a HOST with its authority is inside the same PR host identity, so nothing device-side distinguishes them: on that shape the metadata read-only half is enforced by this mount's own code, not by the device. **What an operator must have configured:** every rung of the ladder, listed in [Multi-writer co-writer mounts](#multi-writer-co-writer-mounts-dlm-stage-s9). Volumes formatted since the rung-10b Phase-B flip pass rung 2 by default (the format stamps the nine capability bits); pre-flip sets and `--single-writer` formats upgrade offline with `squeezefs volume enable-multi-writer` |
 | **Set-authority mount** (`SQUEEZEFS_MULTI_WRITER=1` + `SQUEEZEFS_MW_ROLE=set-authority`, on a set with per-volume owners assigned — see [Per-volume metadata owners](#per-volume-metadata-owners-squeezefs-volume-set-owners)) | **The classic writer row, on a SUBSET of the set.** On the volumes it owns — which include the one hosting the filesystem root — every guarantee above is unchanged, byte for byte: `flock`, `writer_claim`, the reservation where the namespace supports one, the fresh-foreign refusal, the recovery ladder. On the volumes a **peer** owns it takes none of the three (guarantee class `peer-owned` in `writer_guard_mode`) and every metadata mutation there is shipped to that peer, whose own row in this table is the guarantee. **What makes it safe:** the volume it does not claim is one the durable assignment says it must not append to, and a mount whose assignment and live evidence disagree is refused at open, not reconciled |
-| **Partial-authority mount** (`SQUEEZEFS_MULTI_WRITER=1` + `SQUEEZEFS_MW_ROLE=partial-authority`) — **the ladder, the open and the arm are landed and the mount path selects the posture; no fleet acceptance run has been published for it yet** | **The same row for a node that does not own the root's volume.** Identical per-volume guarantees — full writer on its own volumes, `peer-owned` on the rest — with the set-singular planes belonging to the set authority instead: allocation-lane assignment, the custody endpoint, the freed-offset grace ring, maintenance coordination. **What it costs beyond the set authority's row:** the sole-owner in-place small-overwrite path is not available to it (a lifetime ownership retire is durable ownership state), so isolated small overwrites take the copy-on-write path; and terminal frees are shipped to the set authority rather than performed locally. **Ownership does not fail over** — if this node dies, the volumes it owns have no appender, so its subtree stops (every verb about it refuses at the ship site, loudly and counted) while the rest of the set keeps serving; the repair is an offline re-assignment |
+| **Partial-authority mount** (`SQUEEZEFS_MULTI_WRITER=1` + `SQUEEZEFS_MW_ROLE=partial-authority`) — **accepted 2026-08-24 on a 2-owner fleet** (`.benchmarks/2026-08-22-pv-claim-admission.md`: serial `tar -x` on the partial authority's own subtree at 250 µs RTT = **0.98× of authority-local** — gate ≤ 1.10× MET, replacing the co-writer row's 6.73×; the rewrite funnel 0.92× of the set authority, the honest cost of shipping every terminal free; fsck + the C8 oracle clean after every leg; tier measured-real, one box) | **The same row for a node that does not own the root's volume.** Identical per-volume guarantees — full writer on its own volumes, `peer-owned` on the rest — with the set-singular planes belonging to the set authority instead: allocation-lane assignment, the custody endpoint, the freed-offset grace ring, maintenance coordination. **What it costs beyond the set authority's row:** the sole-owner in-place small-overwrite path is not available to it (a lifetime ownership retire is durable ownership state), so isolated small overwrites take the copy-on-write path; and terminal frees are shipped to the set authority rather than performed locally. **Ownership does not fail over** — if this node dies, the volumes it owns have no appender, so its subtree stops (every verb about it refuses at the ship site, loudly and counted) while the rest of the set keeps serving; the repair is an offline re-assignment |
 | **Read-only mount** (`-o ro` / `--read-only`, any substrate) | **Not a writer, and not an obstacle to one** — guarantee class `reader`. A read-only mount takes NO `flock`, writes NO `writer_claim` and registers NO PR key, so (a) it is admitted while a writer holds the volume — including a *fresh foreign* claim, which refuses a write mount — (b) it never refuses a write mount, in either mount order, and (c) it changes nothing about the rows above: a second WRITER is still refused by exactly the same ladder. It mutates no plane (metadata, block allocation, frees, device reclaim, in-place patch/overwrite are all refused) and the kernel mounts it `MS_RDONLY`. Its *consistency* guarantee — which is a separate question from exclusion — is in [Read-only coherent mounts](#read-only-coherent-mounts--o-ro--one-writer-plus-n-readers) |
 
 **What DLM S9 changed, and what it did not.** Every row above except the
@@ -993,11 +1019,15 @@ SqueezeFS moves **always forward** — no backwards compatibility. Refusals are 
 
 > **⚠️ Cache/staging paths are format-declared.** `mount --disk-cache-paths` is refused loudly (never silently ignored). Change paths with the admin op `squeezefs config set-cache-paths <sqmeta-uri> <paths...>` (guarded like `format`: refused while any client has the volume mounted; the new dirs are wiped so the next mount stamps a fresh staging generation). Read them back with `config get-cache-paths`. A filesystem formatted without `--disk-cache-paths` is **permanently cache-less**.
 
+> **⚠️ Multi-writer-capable formats and older binaries.** Since 2026-08-16 a fresh `format` stamps the nine multi-writer capability bits (7–15) by default; a binary from before that refuses such a set loudly, naming the unknown bits. `format --single-writer` produces the older unstamped class for exactly that case (a recovery scratch volume an old binary must read), and `squeezefs volume enable-multi-writer` upgrades an unstamped set offline. **A volume that has ever carried a file into the block-map tree** ([Large files](#large-files--the-block-map-tree)) additionally carries incompat bit 16 (`KV_BLOCK_MAP_TREE`), stamped at the first crossing and never on untouched volumes — binaries older than 2026-09-01 refuse it the same way. Forward-only in every case: upgrade the binary, never downgrade the volume.
+
+> **⚠️ Frozen-width metadata routing — refused (REFORMAT REQUIRED).** Metadata routing widths are derived since 2026-08-02 (`KV_DYNAMIC_ROUTING`, incompat bit 6, presence-required): a set formatted under the earlier frozen `--meta-slots` scheme refuses to mount, naming the reformat. The flag itself is a hard error (see below).
+
 ## Removed verbs & flags
 
 Kept here so stale scripts fail comprehensibly:
 
-> **Removed flags/verbs**: `--strict-meta-atomicity` (only ever gated v2 volumes; deleted with them), `squeezefs migrate` (deleted with v2), `mount --local-ips` (the socket-level multi-rail bonding was removed in the 2026-07-04 connection simplification — fabric multipath is the kernel NVMe initiator's domain), `mount --disk-cache-paths` (see [Breaking changes](#breaking-changes--migration-notes)), the `config data-volume add/remove/migrate` / `config metadata-volume add/remove/migrate` / `config … fsck` fake admin verbs (deleted 2026-07-19 in the volume-lifecycle program's honesty cleanup — they reported success without doing the work; their real successors are `squeezefs volume …` and `squeezefs fsck`, below). `squeezefs defrag` was removed 2026-07-17 for the same honesty reason and **returned as a real implementation in the 2026-07 volume-lifecycle program** — see [Volume lifecycle & online maintenance](#volume-lifecycle--online-maintenance).
+> **Removed flags/verbs**: `--strict-meta-atomicity` (only ever gated v2 volumes; deleted with them), `squeezefs migrate` (deleted with v2), `format --meta-slots` (a hard error since 2026-08-02 naming its successors `volume add-meta --take-slots` / `migrate-meta-slot` — routing widths are derived, never chosen), `format --multi-writer` (accepted and announced-inert: multi-writer-capable is the default; `--single-writer` is the opt-out), `mount --local-ips` (the socket-level multi-rail bonding was removed in the 2026-07-04 connection simplification — fabric multipath is the kernel NVMe initiator's domain), `mount --disk-cache-paths` (see [Breaking changes](#breaking-changes--migration-notes)), the `config data-volume add/remove/migrate` / `config metadata-volume add/remove/migrate` / `config … fsck` fake admin verbs (deleted 2026-07-19 in the volume-lifecycle program's honesty cleanup — they reported success without doing the work; their real successors are `squeezefs volume …` and `squeezefs fsck`, below). `squeezefs defrag` was removed 2026-07-17 for the same honesty reason and **returned as a real implementation in the 2026-07 volume-lifecycle program** — see [Volume lifecycle & online maintenance](#volume-lifecycle--online-maintenance).
 >
 > **NVMe-oF verb migration (2026-07-17, target-management program PR 2/N2** — `docs/design-nvmeof-target-management.md` §API): the whole `squeezefs storage nvmeof <verb>` surface **moved to the top-level `squeezefs nvmeof <verb>`**, and within it: `share --spdk`/`unshare --spdk` → `--target-stack {spdk|nvmet}` (default spdk; `unshare` now resolves the stack from the share ledger, never a flag); `restore-shares` → `restore` (and it works — the old registry truncated itself to `[]` on every root invocation, so share persistence had **never** worked; a pre-existing `/etc/squeezefs/nvmeof_shares.json` is retired to `.retired-by-rebuild` on the first mutating verb, and pre-rebuild live shares surface in `list` as foreign/unmanaged — as of milestone **N4b** the managed exit is **`squeezefs nvmeof adopt <subnqn>`**, which absorbs the live share into the ledger with `adopted_from: pre-rebuild` provenance and zero serving interruption; manual removal-first + re-share remains the documented fallback for shapes adopt refuses); `spdk-install`/`spdk-setup`/`spdk-start` → `nvmeof target install/setup/start` (live as of milestone N3, joined by the new `target stop`/`status`/`systemd-unit`; SPDK *sharing* went live with milestone **N4** — the default stack shares for real, and the interim loud-fail message is gone); `spdk-bind`/`spdk-unbind` **deleted** (PCIe vfio passthrough backing is a future program — v1 serves kernel block nodes and files, `bdev_aio` on the SPDK stack); share's silent 1 GiB sparse auto-create on a missing path **deleted** (refuse loud; `--create-size <sz>` is the explicit opt-in).
 
@@ -1053,6 +1083,7 @@ The laws:
    | `SQUEEZEFS_RECLAIM_BATCH` | `SQUEEZEFS_INODE_RECLAIM_BATCH` |
    | `SQUEEZEFS_RECLAIM_BATCH_WINDOW_MS` | `SQUEEZEFS_INODE_RECLAIM_WINDOW_MS` |
    | `SQUEEZEFS_RECLAIM_CONCURRENCY` | `SQUEEZEFS_INODE_RECLAIM_CONCURRENCY` |
+   | `SQUEEZEFS_FUSE_PLACED_MERGE` | *(deleted — the FUSE placed-merge lever was falsified and removed; the interception shim's placed-sever path is a different mechanism and has no knob)* |
 
    (`SQUEEZEFS_RECLAIM_BATCH_BLOCKS`, `..._BATCH_MS`, `..._QUEUE_MAX_BLOCKS`,
    `..._LANES_PER_DEV` and `..._CAP_PARK_MS` are unchanged — they are the
@@ -1069,6 +1100,339 @@ registry (`SQUEEZEFS_WRITE_PIPELINE_DEPTH_BLOCKS`, `SQUEEZEFS_PATCH_MAX_BYTES=0`
 `SQUEEZEFS_PUBLISH_COALESCE_MAX=1`, `SQUEEZEFS_NUMA=0`, `SQUEEZEFS_READ_LANE=0`,
 `SQUEEZEFS_NT_COPY=0`, `SQUEEZEFS_OVERLAY_DEPTH_GOVERNOR=0`, …). They exist so an A/B can be counted; a fleet running
 one of them is running an experiment.
+
+### Environment knobs — the complete registry
+
+Every knob the tree reads, grouped as the registry groups them (`src/env_knobs.rs` is the source; this table is its operator rendering and a gate test keeps the two in step — a knob that exists in the source but not in the registry fails the build). **Accepts** is the admissible form: `bool` = `1/true/yes/on` vs `0/false/no/off`; `int lo..hi` = an inclusive range, out of range refuses; enum words are exact. **Default** is what an absent knob means (`derived` = a sizing function of the memory budget, core count, block/ring geometry or a live measurement — see the subsystem section). Knobs whose purpose says *A/B lever* or *control* exist so a measurement can be counted; a fleet running one is running an experiment. Knobs marked *test seam* are product code armed only by the suites; never set them in production.
+
+**Build identity (embedded at compile time by build.rs — not read from the process environment)**
+
+| Knob | Accepts | Default | Purpose |
+|---|---|---|---|
+| `SQUEEZEFS_BUILD_COMMIT` | build-time | `git` | Build commit hash embedded by build.rs. |
+| `SQUEEZEFS_BUILD_COMMIT_SHORT` | build-time | `git` | Short form of the build commit. |
+| `SQUEEZEFS_BUILD_DIRTY` | build-time | `git` | 1 when the build tree carried uncommitted tracked changes. |
+| `SQUEEZEFS_BUILD_TAG` | build-time | `git` | Exact stable-*/lts-* tag on the build commit, else empty. |
+| `SQUEEZEFS_BUILD_PROFILE` | build-time | `cargo` | Cargo profile name the binary was built under (release = thin LTO; dist = fat LTO, tagged releases only). |
+| `SQUEEZEFS_BUILD_TIMESTAMP` | build-time | `git` | UTC RFC3339 build timestamp (honors SOURCE_DATE_EPOCH). |
+| `SQUEEZEFS_IL_BUILD_COMMIT` | build-time | `git` | The shim's build commit (KD-7 daemon/shim pairing). |
+
+**CLI / process**
+
+| Knob | Accepts | Default | Purpose |
+|---|---|---|---|
+| `SQUEEZEFS_META_URI` | string | `none` | Default `sqmeta://` URI for the verbs that take one. |
+| `SQUEEZEFS_HOSTNQN` | string | `none (/etc/nvme/hostnqn)` | Per-mount NVMe-oF host NQN presented on every fabrics connection this daemon makes (the mount becomes its own reservation registrant). Pair-or-neither with `SQUEEZEFS_HOSTID`; requires daemon-owned data-plane connects from durable `fabric_endpoint:` records (`config set-fabric-endpoints`). `-o hostnqn=` wins. |
+| `SQUEEZEFS_HOSTID` | string | `none (/etc/nvme/hostid)` | The paired per-mount NVMe-oF host id (see `SQUEEZEFS_HOSTNQN` — pair-or-neither). `-o hostid=` wins. |
+| `SQUEEZEFS_ENCRYPT_KEY_FILE` | string | `/etc/squeezefs/keys/<id>.key` | Encryption key material path (see [Transparent compression & encryption](#transparent-compression--encryption)). |
+| `SQUEEZEFS_DAEMON_PIPE` | int 0..2^31−1 | `none` | Internal: the fd the forked daemon writes `ready` to. Set by the parent process, never by hand. |
+| `SQUEEZEFS_TIMEOUT` | int 1..86400 | `30` | Metadata-operation timeout, seconds (read once at launch). |
+| `SQUEEZEFS_SUPERVISE_INTERVAL_SECS` | int 1..86400 | `5` | `mount --supervise` probe interval, seconds. |
+| `SQUEEZEFS_SUPERVISE_UNRESPONSIVE_SECS` | int 1..86400 | `30` | `mount --supervise` unresponsiveness threshold before abort, seconds. |
+
+**Memory budget (R5)**
+
+| Knob | Accepts | Default | Purpose |
+|---|---|---|---|
+| `SQUEEZEFS_MEM_BUDGET_MB` | int 1..2^30 | `derived` | R5 memory budget, MiB (absolute > pct > cgroup/RAM derivation). |
+
+**Fleet share (co-located daemon fleets)**
+
+| Knob | Accepts | Default | Purpose |
+|---|---|---|---|
+| `SQUEEZEFS_FLEET_SHARE` | int 1..4096 | `1` | N co-located daemons divide the machine: one divisor applied at the root of the derived-sizing tree (memory budget and CPU count become `ceil(system/share)`). Derived tier only — explicit knobs still win, floors are never divided, the FUSE queue count is exempt. Never auto-detected; `1` = whole-machine posture. See [Fleet-share sizing](#fleet-share-sizing-co-located-daemon-fleets). |
+
+**Metadata (the v3 CoW KV store)**
+
+| Knob | Accepts | Default | Purpose |
+|---|---|---|---|
+| `SQUEEZEFS_META_NODE_CACHE_MB` | int 1..2^30 | `derived` | Per-volume KV node-cache budget, MiB (absolute wins over _PCT). |
+| `SQUEEZEFS_META_NODE_CACHE_PCT` | int 1..100 | `derived` | Per-volume KV node-cache budget as a percentage of the R5 budget. |
+| `SQUEEZEFS_META_CHECKPOINT_MAX_DIRTY_NODES` | int 1..2^32 | `derived` | Dirty-node checkpoint cap = the mount-replay working-set bound (derived `max(4096, budget/32 ÷ node_size)`). |
+| `SQUEEZEFS_META_COMMIT_BATCH_TXS` | int 1..2^20 | `derived` | Commit-conveyor batch cap, transactions (derived `max(64, cpus × 2)`). |
+| `SQUEEZEFS_META_COMMIT_BATCH_BYTES` | int 1..1 TiB | `derived` | Commit-conveyor batch cap, bytes (derived `max(256 KiB, ring/16)`, clamped to the ring's admissible capacity). |
+| `SQUEEZEFS_JOURNAL_LANE` | bool | `on` | Each writable metadata volume gets its own journal lane: one OS thread (`sqz-jrnl{N}`) that runs the commit conveyor's apply pass and durability lane and owns the volume's journal io_uring. `0` = both stages on the shared metadata pool (A/B control). Engagement `journal_ring_lane_writes` ≈ conveyor passes. |
+| `SQUEEZEFS_META_FLUSH_INTERVAL_MS` | int 0..86400000 | `50` | Journal/checkpoint cadence, ms; `0` = strict per-commit durability. (The day-long ceiling exists for the suites that park the timer.) |
+| `SQUEEZEFS_JOURNAL_FLUSH_INTERVAL_MS` | int 0..86400000 | `unset` | Legacy alias for SQUEEZEFS_META_FLUSH_INTERVAL_MS (the new spelling wins). |
+| `SQUEEZEFS_META_REVALIDATE_MS` | int 1..86400000 | `derived` | Coherent-reader node-cache revalidation cadence, ms. Derived default = max(flush cadence, the 1 s checkpoint ceiling); trades staleness (interval + 1 s) against reload cost. Inert on write mounts. |
+| `SQUEEZEFS_BLOCK_REFS_VERIFY` | bool | `off` | Run the durable-vs-derived block-reference oracle at mount (pays the inode-tree walk the durable records exist to avoid; fsck runs the same comparison unconditionally as class C8). |
+
+**Layout / publish economy (incl. the block-map tree)**
+
+| Knob | Accepts | Default | Purpose |
+|---|---|---|---|
+| `SQUEEZEFS_DEFAULT_BLOCK_SIZE` | int 4096..1 TiB | `4194304` | Default striped block size, bytes, when format did not record one. |
+| `SQUEEZEFS_PUBLISH_COALESCE_MAX` | int 0..2^20 | `64` | Per-inode publish-coalescing window; `1` = the serialized per-block posture (A/B lever). |
+| `SQUEEZEFS_LAYOUT_DELTA_MAX_CHAIN` | int 0..2^20 | `64` | Layout delta-record chain cap before a full re-base save; `0` = full saves only (A/B lever). |
+| `SQUEEZEFS_PUBLISH_COMMIT_GROUP_MAX` | int 0..2^20 | `0 (derives from META_COMMIT_BATCH_TXS)` | Layout saves aggregated into one multi-inode transaction per conveyor window; `1` = per-save commits (A/B lever). |
+| `SQUEEZEFS_KVMAP` | bool | `on` | Whether new beyond-inline block-map crossings take the block-map tree ([Large files](#large-files--the-block-map-tree)). `0` = new crossings take the legacy indirect-blob arm (A/B lever); never disables resolution of an existing tree head. |
+| `SQUEEZEFS_KVMAP_OVERLAY` | bool | `on` | Whether block-map-tree inos whose estimated map exceeds the derived RAM budget share take the partial store (dirty overlay + bounded warm windows + tree read-through). `0` = whole map in RAM at any size (acceptance control, never an operational escape). |
+| `SQUEEZEFS_MAP_MIGRATE_CHUNK` | int 64..1024 | `512` | Block-map-tree crossing ops per transaction. The registry cap keeps a mis-set value under the whole-journal-entry admission bound. |
+
+**Write path**
+
+| Knob | Accepts | Default | Purpose |
+|---|---|---|---|
+| `SQUEEZEFS_PATCH_MAX_BYTES` | int 0..1 TiB | `derived block_size/8` | Sole-owner in-place patch ceiling, bytes (also the device overlay's minimum segment length); `0` = the acceptance A/B lever. |
+| `SQUEEZEFS_FOLD_MAX_EXTENTS` | int 0..2^24 | `64` | Extent-overlay fold trigger: parked extents per block. |
+| `SQUEEZEFS_FOLD_MAX_BYTES` | int 0..1 TiB | `derived block_size/4` | Extent-overlay fold trigger: parked bytes per block. |
+| `SQUEEZEFS_PARKED_BUFFERS` | int 0..2^24 | `derived` | Parked-write budget in buffers' worth of block size (derived `max(256, budget/16 ÷ block_size)`). |
+| `SQUEEZEFS_PARKED_GATE_ASSIST_MS` | int 0..600000 | `200` | Memory-budget-Red parked-gate self-flush assist window, ms. |
+| `SQUEEZEFS_INPLACE_OVERWRITE` | bool | `off` | Opt a substrate into in-place eligible full-block overwrites (real-SSD DSM fleets; measured loss on zram-lz4). |
+| `SQUEEZEFS_DEVICE_OVERLAY` | bool | `on` | The device-backed visible write overlay: eligible fresh/hole aligned segments store straight to an unpublished destination, ACK early, publish at coverage completion/fsync. Default on — the large-write A-leg. `0` = the accumulation control. Engagement `overlay_store_bytes` / `overlay_ack_early_bytes`. |
+| `SQUEEZEFS_OVERLAY_OVERWRITE` | bool | `on` | The overlay's overwrite arm: aligned single-block overwrites of mapped striped passthrough blocks ride the zero-copy slot→device overlay with a fresh CoW destination (never in place). Default on (field-adjudicated on the CPU-bound fabric venue at half the daemon CPU; device-bound local substrates measured the `0` control ahead at low queue depth). `0` = the fresh-only gate. Engagement `overlay_overwrite_installs` / `overlay_overwrite_bytes`. |
+| `SQUEEZEFS_OVERLAY_CLOSE_BARRIER` | bool | `off` | Barrier the data devices before the coverage-triggered close of an overlay-fed rewrite epoch (upgrades those non-fsync saves out of the write-back-cache volatility class). Default off — the identical window ships in the rewrite program's own non-fsync closes; fsync-class boundaries are always fully ordered regardless. |
+| `SQUEEZEFS_REWRITE_SHADOW` | bool | `on` | Rewrite-program shadow swaps; 0 = the A/B control. |
+| `SQUEEZEFS_WRITEBACK_QUEUE_CAP` | int 1..2^24 | `4096` | Writeback flush-unit queue capacity. |
+| `SQUEEZEFS_WRITE_PIPELINE_DEPTH_BLOCKS` | int 0..2^20 | `derived (BDP)` | Write-pipeline depth target override, blocks — measurement lever; the default is the runtime bandwidth-delay derivation. |
+
+**Block reclaim (device deallocation), inode reclaim, and the allocation-lane reservation**
+
+| Knob | Accepts | Default | Purpose |
+|---|---|---|---|
+| `SQUEEZEFS_RECLAIM_BATCH_BLOCKS` | int 1..1024 | `64` | Background block-reclaim drain batch, blocks. |
+| `SQUEEZEFS_RECLAIM_BATCH_MS` | int 0..600000 | `2` | Background block-reclaim batch-accumulation window, ms. |
+| `SQUEEZEFS_RECLAIM_QUEUE_MAX_BLOCKS` | int 1..2^20 | `4096` | Block-reclaim queue cap; at-cap enqueues park (park-don't-spill). |
+| `SQUEEZEFS_RECLAIM_LANES_PER_DEV` | int 1..64 | `32` | Parallel reclaim drain lanes per device. |
+| `SQUEEZEFS_ALLOC_LANE_RESERVE_BLOCKS` | int 0..2^32 | `derived` | Fresh blocks one durable allocation-lane reservation covers on a partitioned (multi-writer) data plane; derived from the write pipeline's cold window. `1` = a commit per fresh block (pathological A/B control). Inert on every unpartitioned mount. |
+| `SQUEEZEFS_RECLAIM_CAP_PARK_MS` | int 0..60000 | `1000` | At-cap reclaim enqueue park bound, ms, before soft overflow. |
+| `SQUEEZEFS_DISCARD_ELISION` | bool | `on` | Elide discards for blocks a rewrite is about to overwrite; 0 = the A/B control. |
+| `SQUEEZEFS_INODE_RECLAIM_BATCH` | int 1..1024 | `64` | Deferred inode-reclaim gather batch, inodes. |
+| `SQUEEZEFS_INODE_RECLAIM_WINDOW_MS` | int 0..1000 | `20` | Deferred inode-reclaim gather window, ms. |
+| `SQUEEZEFS_INODE_RECLAIM_CONCURRENCY` | int 1..2^16 | `max(4, cpus)` | Concurrent inode-reclaim workers. |
+| `SQUEEZEFS_RECLAIM_BATCH` | retired | `-` | Retired: use `SQUEEZEFS_INODE_RECLAIM_BATCH` (the old name collided with the block-reclaim family). |
+| `SQUEEZEFS_RECLAIM_BATCH_WINDOW_MS` | retired | `-` | Retired: use `SQUEEZEFS_INODE_RECLAIM_WINDOW_MS`. |
+| `SQUEEZEFS_RECLAIM_CONCURRENCY` | retired | `-` | Retired: use `SQUEEZEFS_INODE_RECLAIM_CONCURRENCY`. |
+
+**Read path**
+
+| Knob | Accepts | Default | Purpose |
+|---|---|---|---|
+| `SQUEEZEFS_READ_HOT_BLOCK_CACHE_MB` | int 0..2^30 | `derived` | Hot-block RAM read tier budget, MiB (`0` disables the tier). |
+| `SQUEEZEFS_READ_ADMISSION_FILL_PCT` | int 0..100 | `5` | Scan-resistant admission governor's bounded-waste share, percent of device read bytes. |
+| `SQUEEZEFS_READ_TIER_ADMISSION` | always / second-touch / never | `second-touch` | NVMe read-tier admission policy for large fills (`second-touch` default). |
+| `SQUEEZEFS_READ_PREFETCH_WINDOW` | int 0..2^20 | `derived` | Per-stream prefetch window cap, blocks (`0` disables). |
+| `SQUEEZEFS_READ_PREFETCH_SHARE_PCT` | int 1..100 | `50` | The prefetch pipeline's share of the hot-tier budget, percent. |
+| `SQUEEZEFS_READ_RANGED_THRESHOLD` | int 0..1 TiB | `262144` | Reads at or under this size fetch only their aligned device window instead of the whole block (passthrough volumes); `0` disables. |
+| `SQUEEZEFS_READ_DEST_LEASE` | bool | `on` | Cold aligned sub-block reads DMA device bytes straight into the reply's registered destination (the serve copy deleted). `0` = the pre-lease fill+copy shape (A/B control). Engagement `read_dest_lease_bytes`. |
+| `SQUEEZEFS_READ_LANE` | bool | `on` | The read-lane hold (a completed-fill store the demand cohort serves from); `0` = the control. |
+| `SQUEEZEFS_READ_LANE_DEPTH` | int 0..2^16 | `derived (engage-governor)` | Read-ahead lane depth pin, blocks — unset = probe-governed; `0` = ahead-issue off (hold-only control). |
+| `SQUEEZEFS_NVME_READ_LANES` | int 1..1024 | `derived (cpus / data devices)` | Per-device READ submission fan-out lanes; `1` = single worker (A/B posture). |
+| `SQUEEZEFS_NVME_WRITE_LANES` | int 1..1024 | `derived (cpus / data devices)` | Per-device data-WRITE submission fan-out lanes with block-offset affinity; `1` = single worker (A/B posture). |
+| `SQUEEZEFS_DIRECT_DEVICE_TRUE` | bool | `off` | Strict device-true O_DIRECT reads (measurement escape); the default serves O_DIRECT from the read tiers like buffered I/O. |
+
+**Copy economy**
+
+| Knob | Accepts | Default | Purpose |
+|---|---|---|---|
+| `SQUEEZEFS_WRITE_SHARED` | bool | `on` | Shared-mode write admission: fully-mapped within-EOF striped overwrites take the inode READ guard (classify → acquire → revalidate → at most one upgrade). Default on (+7–8 % on both lanes at ~525 k IOPS); `0` = the A/B lever. |
+| `SQUEEZEFS_NT_COPY` | bool | `on` | Non-temporal stores at the two DMA-destined copy sites; 0 = the A/B control. |
+| `SQUEEZEFS_NT_COPY_MIN` | int 0..1 TiB | `262144` | NT-store engagement floor, bytes. |
+| `SQUEEZEFS_NT_READ_SERVE` | bool | `on` | Non-temporal stores on dest-arm read serves; 0 = the A/B control. |
+| `SQUEEZEFS_NT_READ_SERVE_MIN` | int 0..1 TiB | `262144` | Read-serve NT-store floor, bytes (keeps rand-4k/warm-small serves cached). |
+| `SQUEEZEFS_NUMA` | bool | `on` | NUMA placement actions (structurally inert on single-node hosts); 0 = the A/B lever, instrument stays live. |
+| `SQUEEZEFS_READ_MOSTLY_CACHE` | bool | `on` | Read-mostly backing for the hot process-global caches (metadata, stream lanes, attrs): reads are pure loads, eviction rides a policy shell. `0` = the classic value caches (A/B control). |
+| `SQUEEZEFS_CACHE_TOUCH_SECS` | int 0..86400 | `derived (TTI/4)` | Policy-touch sampling horizon for the TTI caches, seconds — an entry read at least once per horizon keeps access-refreshed residency. `0` = touch the policy on every read (isolation lever). |
+
+**Transport (fuse3 fork)**
+
+| Knob | Accepts | Default | Purpose |
+|---|---|---|---|
+| `SQUEEZEFS_FUSE_MAX_WRITE` | int 4096..1 TiB | `derived` | The daemon's desired FUSE `max_write`, bytes (still gated by the kernel's `fs.fuse.max_pages_limit`); A/B lever. |
+| `SQUEEZEFS_FUSE_OVER_IO_URING_QUEUES` | int 1..512 | `kernel possible CPUs` | FUSE-over-io_uring queue count (TESTING only — fewer than possible CPUs never becomes ready). |
+| `SQUEEZEFS_FUSE_OVER_IO_URING_Q_DEPTH` | int 1..32 | `derived (desired 32)` | Entries per FUSE-over-io_uring queue (default 32 degraded to the payload-buffer cap, floor 4); explicit wins verbatim. |
+| `SQUEEZEFS_FUSE_IO_URING_ENTRIES` | int 64..4096 | `1024` | SQ depth for the classical FUSE rings (INIT/notify). |
+| `SQUEEZEFS_FUSE_IO_URING_SQPOLL_IDLE_MS` | int 0..600000 | `off` | Enable SQPOLL on the transport rings with this idle timeout, ms (measured NOT recommended). |
+| `SQUEEZEFS_FUSE_IO_URING_SQPOLL_CPU` | int 0..4095 | `unpinned` | Pin the SQPOLL kernel thread to this CPU. |
+| `SQUEEZEFS_FUSE_IO_URING_SPIN_US` | int 0..100000 | `off (0)` | Spin-before-park cap (µs) for the FUSE-over-io_uring queue workers; the window adapts to each worker's own park gap, engages only with ops in flight and is refused past the box's busy knee. Default off: at the field it deleted 69 % of the workers' parks and moved no latency term at +5.5 % CPU/op. Any nonzero value engages it (A/B lever). Ledger `transport_spin_{absorbed,expired,ns,refused_busy,window_us}`. |
+| `SQUEEZEFS_FUSE_PIN_SCOPE` | node / core | `node` | Transport thread affinity scope; `core` is the pre-campaign hard-pin posture. |
+| `SQUEEZEFS_FUSE_SAME_LANE_DISPATCH` | bool | `1` | READ handler futures run on the dispatching lane instead of round-robining to another lane; `0` restores the rotation (control). |
+| `SQUEEZEFS_FUSE_READ_FAST_DISPATCH` | bool | `on` | READ fast-dispatch from the reap thread: the queue worker runs the filesystem's sync try-only warm probe at the delivery CQE — a warm READ is served inline, a miss mints the handler straight onto a `fuse3-tpc` lane. `0` = every READ rides the inbound queue (A/B control). Engagement `transport_fast_dispatch_{serves,demotes}`. |
+| `SQUEEZEFS_FUSE_DRAIN_GROUP` | int 1..512 | `derived (node possible CPUs / 4, floor 1)` | Queues per FUSE-over-io_uring drain context; explicit width wins, `1` = one worker per queue (control). |
+| `SQUEEZEFS_FUSE_KMBUF` | bool | `on` | kmbuf reply-buffer negotiation; 0 = the A/B control. |
+| `SQUEEZEFS_FUSE_ZC` | bool | `on` | FUSE zero-copy serve integration (sqz kernel + CAP_SYS_ADMIN required; stock kernels decline loudly and run the buffer-ring path byte-identically). Default on: reads +40–75 %. `0` = the escape / A/B lever. See [FUSE zero-copy serve integration](#fuse-zero-copy-serve-integration-sqz-kernel-opt-in). |
+| `SQUEEZEFS_FUSE_ZC_WRITE_FUSION` | bool | `on` | Handler/worker fusion for small zero-copy-armed FUSE WRITEs (the hold gates on the in-place-patch eligibility probe; ineligible shapes extract at delivery). Default on. `0` = the A/B control. Engagement `fuse3_zc_write_fusions`/`_bytes`; `fuse3_zc_write_lazy_extractions` ≈ 0 is the gate's staleness law. |
+| `SQUEEZEFS_FUSE_ZC_READ_FUSION` | bool | `off` | Handler/worker fusion for zero-copy-armed FUSE READs the inline probe demoted (arm (b) of the READ dispatch law). Default off on measurement: composed behind the fast dispatch it read −6.5 % IOPS vs fast dispatch alone. `1` = fuse (the tail-shaped A/B posture). Engagement `fuse3_zc_read_fusions`. |
+| `SQUEEZEFS_FUSE_ZC_FUSION_MAX` | int 4096..2^30 | `derived (payload/8)` | Fused-dispatch payload ceiling, bytes — bounds the handler work the queue worker runs inline (never payload-scale copies). Default derived payload/8 (128 KiB at the shipped 1 MiB geometry). |
+| `SQUEEZEFS_FUSE_PLACED_MERGE` | retired | `-` | Retired: the FUSE placed-merge lever was falsified and deleted (the shim's placed-sever path is a different mechanism). |
+| `SQUEEZEFS_FUSE_ZC_RETENTION` | bool | `on` | Arm zero-copy payload retention where the kernel offers the RELEASE_PAYLOAD opcode and the session runs zc. Default on (arming alone is bit-identical; stock kernels decline informationally). `0` = the A/B escape. Proof `fuse3_zc_retention_negotiated`. |
+| `SQUEEZEFS_ZC_ACK_EARLY` | bool | `on` | ACK-early for device-overlay stores: eligible stores reply while the DMA runs (page-cache writes retain the zc slot; O_DIRECT extracts at delivery). Coverage, publication, fsync and read-wait stay CQE-anchored. `0` = ACK-after-CQE (A/B). Engagement `overlay_ack_early_stores`/`_bytes`. |
+| `SQUEEZEFS_OVERLAY_DEPTH_GOVERNOR` | bool | `on` | Device-overlay stores admit their in-flight bytes through the write-pipeline depth governor (one gauge, one target, one backpressure gate for both write vehicles). ACK-early unchanged — only admission waits. Default on; `0` = the open-loop overlay store (A/B control). Engagement `overlay_governed_stores`. |
+| `SQUEEZEFS_ZC_ACK_EARLY_ODIRECT` | bool | `off` | Let a held O_DIRECT overlay slot ACK early by snapshotting before the reply. Production O_DIRECT overlay does not hold (it extracts at delivery), so this is a labeled test/measurement posture, default off. |
+| `SQUEEZEFS_ZC_BRIDGE_TIMEOUT_MS` | int 100..600000 | `30000` | zc bridge-op deadline, ms: past it the worker cancels the op and its completion resolves through the loud fallback ladders (`fuse3_zc_bridge_cancels`, must stay 0). |
+| `SQUEEZEFS_TEST_ZC_DROP_WRITE_CQES` | int 0..1000000 | `0` | Test seam: the zc worker consumes-and-drops the first N WRITE-class bridge CQEs (pend + deadline stay live) — the deterministic lost-CQE interleave of the zcws-9 W4 wedge. Never set in production. |
+| `SQUEEZEFS_FUSE_NO_KILLPRIV` | bool | `off` | TESTING escape: refuse FUSE_HANDLE_KILLPRIV_V2 and restore the kernel's per-write GETXATTR probe. |
+| `SQUEEZEFS_FUSE_ATTR_TTL_MS` | int 0..600000 | `1000` | Kernel attribute-cache TTL, ms (-o attr_timeout overrides). |
+| `SQUEEZEFS_FUSE_ENTRY_TTL_MS` | int 0..600000 | `1000` | Kernel dentry TTL, ms (-o entry_timeout overrides). |
+| `SQUEEZEFS_FUSE_DIR_ENTRY_TTL_MS` | int 0..600000 | `1000` | Kernel directory-entry TTL, ms (-o dir_entry_timeout overrides). |
+| `SQUEEZEFS_FUSE_NEGATIVE_TTL_MS` | int 0..600000 | `1000` | Kernel negative-entry TTL, ms (-o negative_timeout overrides). |
+| `SQUEEZEFS_TRANSPORT_MEM_MAX` | int 1..2^30 | `derived` | Transport payload-buffer cap, MiB (absolute > pct > derived). |
+| `SQUEEZEFS_TRANSPORT_MEM_PCT` | int 1..100 | `derived` | Transport payload-buffer cap as a percentage of the R5 budget. |
+| `SQUEEZEFS_TRANSPORT_DEBUG` | bool | `off` | Verbose transport tracing (development). |
+
+**LD_PRELOAD interception — daemon side**
+
+| Knob | Accepts | Default | Purpose |
+|---|---|---|---|
+| `SQUEEZEFS_IPC` | bool | `off` | Env half of `-o interception` (arms the session host). |
+| `SQUEEZEFS_IPC_ALLOW_DEV` | bool | `off` | Admit degenerate (`unknown` / `-dirty`) build identities past the daemon/shim same-build gate — dev boxes only, announced loudly on both ends and counted in `ipc_binds_dev_override`. |
+| `SQUEEZEFS_IPC_ARENA_MB` | int 1..2^20 | `derived` | Per-session payload arena, MiB. |
+| `SQUEEZEFS_IPC_ARENA_THP` | bool | `on` | PMD-align + MADV_COLLAPSE session arenas; 0 disables. |
+| `SQUEEZEFS_IPC_IDLE_SECS` | int 0..86400 | `300` | Idle-session reap window, seconds; 0 disables. |
+| `SQUEEZEFS_IPC_INVAL_WINDOW_MS` | int 1..600000 | `1000` | W1 invalidation coalescing window, ms. |
+| `SQUEEZEFS_IPC_MAX_OP_BYTES` | int 1..1 TiB | `layout default` | Per-op payload ceiling, bytes. |
+| `SQUEEZEFS_IPC_MEM_MAX` | int 1..2^30 | `derived` | Session-arena admission cap, MiB (absolute > pct > derived). |
+| `SQUEEZEFS_IPC_MEM_PCT` | int 1..100 | `derived` | Session-arena admission cap as a percentage of the R5 budget. |
+| `SQUEEZEFS_IPC_SERVICE_THREADS` | int 1..4096 | `derived clamp(3*cpus/8,2,64)` | Interception service-thread ceiling (threads spawn on session admission; same derivation as `SQUEEZEFS_IPC_DD_SHARDS`). |
+| `SQUEEZEFS_IPC_DD_SHARDS` | int 1..4096 | `derived clamp(3*cpus/8,2,64)` | Interception direct-drive io_uring shards (one ring + pinned reaper per shard; override/measurement lever). |
+| `SQUEEZEFS_IPC_DD_EAGER_FLUSH` | int 0..4096 | `governed (CadenceCore)` | Direct-drive issue cadence: absent = the governed threshold (probed downward, adopted only on live delivery response); explicit K > 0 = enter after K unflushed SQEs (measurement lever); `0` = sweep-only with the governor ignored (A/B control). Gauges `ipc_dd_cadence_{k,probe_ups,probe_backoffs}`. |
+| `SQUEEZEFS_IPC_DD_INLINE_REAP` | bool | `on` | Reaper/drain fusion: the owning service thread drains its lane's direct-drive completion queue inline (zero syscall); `0` = reaper-only completion (A/B lever). Auto-disarmed on kernels without `IORING_ENTER_EXT_ARG`. |
+| `SQUEEZEFS_IPC_SOCKET_DIR` | string | `derived (XDG_RUNTIME_DIR / /run)` | Rendezvous socket directory; `none` disables the filesystem-path socket. |
+| `SQUEEZEFS_IPC_SPIN_US` | int 0..100000 | `0 (absent; =1 on SQUEEZEFS_IPC_SPIN_ADAPTIVE routes absent to the governor)` | Service-thread empty-pass spin window, µs. Explicit wins verbatim (incl. 0); absent with `SQUEEZEFS_IPC_SPIN_ADAPTIVE=1` routes to the spin governor. |
+| `SQUEEZEFS_IPC_SPIN_ADAPTIVE` | bool | `on` | The service-thread spin governor (default on): a measured 100 µs window engaged only on multi-session lanes in the park-churn regime under a derived busy ceiling. `0` = the pre-governor posture (A/B control). Instruments `ipc_spin_{window_us,absorbed_parks,disengaged_busy}`. |
+
+**LD_PRELOAD interception — client (shim) side**
+
+| Knob | Accepts | Default | Purpose |
+|---|---|---|---|
+| `SQUEEZEFS_IL_SESSIONS` | int 1..4096 | `derived clamp(cpus/4,2,16)` | Client: fd-sharded sessions per mount (override lever; the default ties to the daemon's ceiling). |
+| `SQUEEZEFS_IL_SPINS` | int 0..2^24 | `adaptive` | Client: fixed completion spin count (pins the adaptive spin for measurement). |
+| `SQUEEZEFS_IL_MAX_RUN_SLOTS` | int 0..2^16 | `0 (unbounded)` | Client: cap on concurrently claimed ring slots per session (`0` = unbounded). |
+| `SQUEEZEFS_IL_OP_TIMEOUT_MS` | int 1..600000 | `bounded default` | Client per-op bounded wait against a stalled daemon, ms; a timeout poisons the session → passthrough. |
+| `SQUEEZEFS_IPC_DD_LANE_FLUSH` | bool | `on` | Direct-drive flush scope: on = a service thread enters only its own lane's ring; `0` = the flush-all sweep that serialized every service thread on every shard's kernel lock (A/B lever). |
+| `SQUEEZEFS_IPC_DD_COOP_TASKRUN` | bool | `on` | Direct-drive rings built with `COOP_TASKRUN` (completion task-work runs at ring entry by the submitting task); `0` = signal-delivered task-work (A/B lever for completion-latency attribution). |
+| `SQUEEZEFS_IL_REAP_PARK_MAX` | int 0..2^16 | `24` | Client libaio reap: queue depth at or below which the event-driven park is used (24 since the 2026-08-13 recount). |
+| `SQUEEZEFS_IL_SPARSE_BATCH_MARKS` | bool | `on` | Client reap: the event park's per-session wake mark derives from its pending population (age-bounded at the reap quantum). Default on (higher IOPS on saturated-reaper fleets; a −3 % local unsaturated cost is recorded); `0` = the A/B control for latency-sensitive mounts. |
+| `SQUEEZEFS_IPC_CQE_WAKE_LATCH` | bool | `on` | Completion-doorbell wake-collapse latch: a park era pays at most one completion `FUTEX_WAKE` (`ipc_cqe_wake_collapsed` counts the rest); `0` = wake per mark-passed completion (A/B control). |
+| `SQUEEZEFS_IL_REAP_QUANTUM_US` | int 1..1000 | `50` | Client libaio reap: the deep-regime park's age bound, µs (the k-th completion cuts it short); measurement lever. |
+| `SQUEEZEFS_IL_READ_DEST` | bool | `on` | Client arena-destination read serves; `0` = the A/B lever. |
+| `SQUEEZEFS_IL_DIRECT_WRITE` | bool | `on` | The client direct-drive WRITE lane: patch-shaped ring writes DMA in place on the service thread's direct-drive lane (no sever bounce, no handler handoff); `0` = every ring write rides the sever→handoff path (control). |
+| `SQUEEZEFS_IL_KERNEL_LANE_MIN` | int 0..1 TiB | `derived (memBW probe x lane-RTT delta, clamp [slab, max_op])` | Hybrid lane gate: ops strictly larger than this ride the kernel FUSE lane, smaller ops the IPC ring; derived from a memory-bandwidth probe × the lane RTT delta. `0` = gate off (all eligible ops ring — A/B lever). |
+
+**zcrx read lane**
+
+| Knob | Accepts | Default | Purpose |
+|---|---|---|---|
+| `SQUEEZEFS_ZCRX_LANE` | bool | `off` | Arm the zcrx read lane. |
+| `SQUEEZEFS_ZCRX_LANE_FORCE_COPY` | bool | `off` | Test seam: allow the classic-recv backend to arm (copy parity). |
+| `SQUEEZEFS_ZCRX_LANE_AREA_SIM` | bool | `off` | Test seam: AREA backend over simulated NIC DMA. |
+| `SQUEEZEFS_ZCRX_LANE_SIM_CHUNK` | int 1..1 TiB | `derived` | Simulated area chunk size, bytes (rounded up to a power of two). |
+| `SQUEEZEFS_ZCRX_LANE_TARGET` | string | `none` | zcrx lane target tuple (6 comma-separated fields); malformed = lane not armed, loudly. |
+
+**Diagnostics / forensics**
+
+| Knob | Accepts | Default | Purpose |
+|---|---|---|---|
+| `SQUEEZEFS_OP_PROFILE` | bool | `off` | Per-op phase histograms + the under-i_rwsem estimator (zero cost off). |
+| `SQUEEZEFS_OP_TRACE` | bool | `off` | Arm the per-op trace ring at mount (one clock stamp per phase boundary per sampled op; `cat <mnt>/.trace` drains it; the `op-trace on\\|off\\|status` admin verb toggles it live). Geometry and sampling divisor derived. Off = one relaxed load per hook. See [Metadata Durability](#metadata-durability-crash-contract). |
+| `SQUEEZEFS_FREE_FORENSICS` | bool | `off` | Capture a backtrace per block free to attribute double frees (expensive). |
+| `SQUEEZEFS_STATS_KEY_CENSUS` | bool | `off` | Arm the `.stats` key census (live object keys + per-inode write custody — a debugging surface); the `*_count` gauges always export. |
+
+**Cluster wire and the multi-writer arm**
+
+| Knob | Accepts | Default | Purpose |
+|---|---|---|---|
+| `SQUEEZEFS_CLUSTER_WIRE_SVC_THREADS` | int 1..4096 | `derived clamp(cpus/8, 1, 8)` | Owner-side cluster-wire RPC lanes (pinned service threads, never the conveyor's task); absolute override, clamped to the core count. |
+| `SQUEEZEFS_MULTI_WRITER` | bool | `off` | Arm the multi-writer planes (device-enforced WERO hold on every data namespace, remote write custody, metadata ownership, the publish path on the wire). Refuses the mount loudly on a non-PR substrate, a format missing any capability bit, an off membership plane or `SQUEEZEFS_MW_BIND=off`. Off = the shipped single-writer posture. See [Multi-writer data plane](#multi-writer-data-plane-dlm-stage-s9). |
+| `SQUEEZEFS_MW_ROLE` | authority / co-writer / set-authority / partial-authority | `authority` | Which multi-writer posture this mount declares: `authority` (default — holds the claim on every volume), `co-writer` (metadata read-only locally, data under a custody lease; refused unless all five admission rungs hold), `set-authority` / `partial-authority` (per-volume owners assigned offline by `volume set-owners`). Read only when `SQUEEZEFS_MULTI_WRITER` is on. See [Multi-writer co-writer mounts](#multi-writer-co-writer-mounts-dlm-stage-s9) and [Per-volume metadata owners](#per-volume-metadata-owners-squeezefs-volume-set-owners). |
+| `SQUEEZEFS_MW_AUTHORITY` | string | `none` | `addr:port` of the set authority (that node's `SQUEEZEFS_MW_BIND` endpoint), dialled for write custody, the lane grant and the publish path. Required for `co-writer` and `partial-authority`; not read for `set-authority`. |
+| `SQUEEZEFS_MW_MEMBERS` | string | `none` | The authority's operator-declared co-writer roster: a comma list of client ids (`node_{16 hex}.m{8 hex}`, printed by a refused co-writer's own mount log; the bare node form names every mount slot of that node). Not read on the set-authority / partial-authority path (`volume set-owners` writes the enrollment). |
+| `SQUEEZEFS_MW_BIND` | string | `auto` | Where this mount serves the write-custody and publish authority: `auto` (0.0.0.0:0, the default), an explicit `addr:port`, or `off` (refuses a multi-writer arm rather than arming an inert one). Read only when `SQUEEZEFS_MULTI_WRITER` is on. |
+
+**Metadata function shipping**
+
+| Knob | Accepts | Default | Purpose |
+|---|---|---|---|
+| `SQUEEZEFS_META_SHIP_BATCH_MAX` | int 1..4096 | `derived clamp(cpus x 2, 64, 4096)` | Verbs per shipped metadata frame (the pipelining unit); derived like the commit-conveyor batch cap, bounded by the cluster wire's control-class cap. |
+| `SQUEEZEFS_META_SHIP_DEDUP_MAX` | int 1..2^24 | `derived max(batch_max x 128, 8192)` | Owner-side idempotency window entries — how far back a client's retry may reach and still be answered from its original outcome. |
+| `SQUEEZEFS_PUBLISH_SHIP_DEPTH` | int 1..64 | `derived clamp(ceil(cpus/8), 2, 8)` | Publish frames one co-writer keeps in flight per authority (one authenticated session each). `1` = stop-and-wait (A/B control, never an operational escape). |
+| `SQUEEZEFS_DLM_TOKEN_CACHE_MAX` | int 1..2^24 | `derived max(R5 budget/8192/32 B, 4096)` | Client fencing-token cache entries; every eviction costs one loud miss and one shipped refresh, never a wrong answer. |
+
+**Delegations, recall lane, byte-range custody, slot placement**
+
+| Knob | Accepts | Default | Purpose |
+|---|---|---|---|
+| `SQUEEZEFS_DLM_RECALL_BATCH_MAX` | int 1..32768 | `derived CONTROL frame cap/2/32 B = 16384` | Recall entries per batched per-client frame (measurement lever); the default derives from the cluster wire's control-class cap so one frame carries a client's whole token set. |
+| `SQUEEZEFS_DLM_RECALL_DEADLINE_MS` | int 1..600000 | `derived 4x live p99 (rtt+owner), clamp [1 ms, lease TTL]` | Per-frame recall ack deadline, ms (measurement lever); derived from the live shipping RTT + owner p99, floored at 1 ms and ceilinged at the membership lease TTL. A timed-out recall's grant is dead, loudly. |
+| `SQUEEZEFS_DLM_RECALL_COOLDOWN_MS` | int 1..600000 | `derived 8x the thrash window (= the deadline)` | How long a demoted (owner-served) hot object refuses new delegation grants (measurement lever); the thrash valve itself has no knob. |
+| `SQUEEZEFS_DELEGATION` | bool | `on` | LOOKUP-class subtree delegations on an armed multi-writer fleet (grants piggyback on shipped replies; recall-before-conflicting-publish). Read only when the ownership plane is armed; `=1` unarmed is announced-inert, `=0` armed is the A/B control. |
+| `SQUEEZEFS_RANGE_CUSTODY` | bool | `off` | Byte-range write custody on the multi-writer custody lease (the shared-file / MPI-IO shape). Default off (ships dark; the composition gate is green). Read only when the ownership plane is armed. See [Byte-range custody](#byte-range-custody-dlm-stage-s11). |
+| `SQUEEZEFS_UPDATE_INTENTS` | bool | `on` | Per-directory exclusive UPDATE grants + asynchronous create-intent batches on an armed fleet (a co-writer mints children of a granted directory locally). Rides the delegation plane; `=0` armed is the tar-x row's control. |
+| `SQUEEZEFS_SLOT_PLACEMENT` | bool | `on` | Client-owned-slot placement on an armed fleet: each shipping client's fresh inos land in a dedicated migratable slot; the migration half is dark on one-authority fleets and disarmed on multi-owner planes. `=0` armed is the A/B control. |
+
+**Fleet jobs and the membership plane**
+
+| Knob | Accepts | Default | Purpose |
+|---|---|---|---|
+| `SQUEEZEFS_FLEET_JOBS` | bool | `on` | Fleet-parallel maintenance: a reader/co-writer that joined the membership plane spawns the fleet job worker and serves read shards (fsck census/scrub) to the coordinator; on the coordinator, lets fsck fan out across enrolled workers. `0` disarms both halves on the mount that sets it. |
+| `SQUEEZEFS_MEMBERSHIP_BIND` | string | `off` | Where this mount serves the membership plane: `off` (default), `auto` (0.0.0.0:0) or an explicit `addr:port`. Armed, a write mount becomes the lease authority and a read-only mount joins as a member. See [Membership plane](#membership-plane--lease-based-liveness-dlm-s6). |
+| `SQUEEZEFS_MEMBERSHIP_LEASE_TTL_MS` | int 1000..600000 | `45000 (= CLIENT_STALE_TTL_SECS)` | The owner's membership lease TTL, ms; defaults to the one staleness law's 45 s so `live`/`stale` mean the same on the plane and in the claim records. The member's own deadline is always stricter. |
+| `SQUEEZEFS_MEMBERSHIP_SKEW_MAX_MS` | int 1..60000 | `derived max(T_owner × 500 ppm, observed RTT)` | Clock-skew bound between owner and member, ms; derived from the physical clock-rate bound (500 ppm) and the measured renewal RTT. A value that collapses the member's deadline refuses the plane rather than clamping. |
+| `SQUEEZEFS_MEMBERSHIP_PURGE_MS` | int 0..600000 | `derived max(2 × checkpoint cadence, observed RTT)` | How long a member may take to fail-stop (purge cached custody, stop in-flight DMA) once it decides to; derived from two revalidation cadences floored at one RTT. A safety input, not a tuning knob. |
+| `SQUEEZEFS_MEMBERSHIP_GRACE_MS` | int 0..600000 | `derived (= the lease TTL)` | The successor owner's failover grace window, ms (reclaim admitted, conflicting fresh acquires refused). Default = the lease TTL; `0` opens no window. |
+
+**Freed-offset grace period and lane refill**
+
+| Knob | Accepts | Default | Purpose |
+|---|---|---|---|
+| `SQUEEZEFS_FREE_GRACE_MAX_MS` | int 1000..600000 | `derived (2 x one acknowledgement cycle)` | How long a terminally-freed offset may wait for a reader's acknowledgement before that reader is fenced and the offset released; derived = 2 × one acknowledgement cycle. A value below one cycle refuses. Inert unless a reader plane is armed. See [Freed-offset grace period](#freed-offset-grace-period-spec-68-item-3). |
+| `SQUEEZEFS_ALLOC_LANE_HARVEST_AHEAD` | bool | `on` | A laned co-writer's background lane refill: harvest the lane's freed supply from the authority ahead of a stall when the allocator is owed blocks and lane-reachable stock sits below the derived watermark. `0` = ENOSPC-triggered harvests only. Engagement `alloc_lane_ahead_harvests`. |
+| `SQUEEZEFS_FREE_GRACE_DEMAND` | bool | `on` | The freed-offset grace loop's demand arm: when recycle coupling is observed, a TTL'd demand mark asks the members holding the free list to renew at the floor cadence, widens the valve's bound refresh, and re-bases the runway on the lane-reachable supply. `0` = the pre-campaign valve (A/B control). |
+| `SQUEEZEFS_FREE_GRACE_PASS_ELASTIC` | bool | `on` | A member adopting a prodded renewal cadence also tightens its reader revalidation pass cadence (more passes, never shorter qualification windows — the published staleness bound never moves). `0` = the routine pass cadence always. |
+| `SQUEEZEFS_FREE_GRACE_ACK_PIPELINE` | bool | `on` | The reader's pipelined acknowledgement ladder: a bounded derived-depth FIFO of label candidates so acks advance one label per pass. `0` = the single-candidate ladder (A/B control). Reader-side; inert without a member session. |
+| `SQUEEZEFS_FREE_GRACE_VALVE` | bool | `on` | The pressure-coupled release valve: as the grace ring's runway shortens the writer prods waiting members onto a shorter renewal cadence and slides the fence deadline toward the pressure bound (never below one acknowledgement cycle). `0` = routine bound + allocation-cliff bound only (A/B control). Engagement `free_grace_prods` / `free_grace_bound_tightenings`. |
+| `SQUEEZEFS_FREE_GRACE_MAX_OFFSETS` | int 1..2^26 | `derived max(budget/1024/24 B, 131072)` | Per-volume cap on offsets held in the freed-offset grace period; derived from the memory budget with a field floor (≈ 120 k blocks — one acknowledgement cycle of saturated ingest). At cap the ring forces progress through the same fence act the deadline uses. |
+
+**fsck / jobs**
+
+| Knob | Accepts | Default | Purpose |
+|---|---|---|---|
+| `SQUEEZEFS_FSCK_SETTLE_MS` | int 0..600000 | `2000` | fsck suspect-settle window, ms (the zero-FP ladder). |
+| `SQUEEZEFS_JOB_WIRE_BIND` | string | `off` | Job-shard execution wire listen address (VAL-6: the posture switch). |
+| `SQUEEZEFS_JOB_WIRE_CA_CERT` | string | `none` | Job-wire CA certificate (PEM or DER). |
+| `SQUEEZEFS_JOB_WIRE_CA_KEY` | string | `none` | Job-wire CA private key (PEM or DER). |
+| `SQUEEZEFS_JOB_WIRE_ENROLL_FRESHNESS_MS` | int 0..600000 | `VAL-6 default` | Job-wire enrollment challenge freshness window, ms (0 is refused by the loader — it would expire every challenge). |
+| `SQUEEZEFS_JOB_WIRE_MAX_CONNS` | int 0..2^20 | `derived from cores` | Concurrent job-wire connection cap (0 is refused by the loader — it would refuse every worker). |
+| `SQUEEZEFS_JOB_WIRE_VERIFY_PERMILLE` | int 0..1000 | `1000 plaintext / sampled TLS` | Pre-publish verify-read sampling, per mille. |
+
+**NVMe-oF target management**
+
+| Knob | Accepts | Default | Purpose |
+|---|---|---|---|
+| `SQUEEZEFS_NVMEOF_TARGET_STACK` | spdk / nvmet | `probed` | Target stack selection; a malformed value never falls back to a default. |
+| `SQUEEZEFS_NVMEOF_STATE_DIR` | string | `/var/lib/squeezefs/nvmeof` | Durable target-ledger directory. |
+| `SQUEEZEFS_NVMEOF_RUN_DIR` | string | `/run/squeezefs/nvmeof` | Runtime directory for target sockets/pids. |
+| `SQUEEZEFS_NVMET_PORT_ID_BASE` | int 0..2^32−1 | `derived` | kernel-nvmet port-id allocation base. |
+| `SQUEEZEFS_SPDK_TGT_BIN` | string | `pinned install` | Override the spdk_tgt binary path. |
+
+**Local file I/O**
+
+| Knob | Accepts | Default | Purpose |
+|---|---|---|---|
+| `SQUEEZEFS_URING_FS_WORKERS` | int 1..64 | `derived` | `uring_fs` process-worker count for ad-hoc local file I/O. |
+
+**Test seams (product code, armed only by suites and rigs — never in production)**
+
+| Knob | Accepts | Default | Purpose |
+|---|---|---|---|
+| `SQUEEZEFS_TEST_UPLOAD_STALL_MS` | int 0..600000 | `0` | Test seam: stall each block upload, ms. |
+| `SQUEEZEFS_TEST_WRITE_STALL_MS` | int 0..600000 | `0` | Test seam: stall the write handler, ms (the transport-lease-overlong pin). |
+| `SQUEEZEFS_TEST_RECLAIM_STALL_MS` | int 0..600000 | `0` | Test seam: stall each reclaim batch, ms. |
+| `SQUEEZEFS_TEST_THP_PREP_STALL_MS` | int 0..600000 | `0` | Test seam: stall each deferred session-arena THP prep job, ms (the fleet-launch admission pin). |
+| `SQUEEZEFS_TEST_INVAL_TAIL_STALL_MS` | int 0..600000 | `0` | Test seam: stall the detached pipeline upload before its invalidation tail, ms (the 2026-08-04 tail-vs-writer race pin). |
+| `SQUEEZEFS_TEST_CHECKOUT_STALL_MS` | int 0..600000 | `0` | Test seam: stall the write handler post-checkout inside its held block-lock window, ms (pairs with the inval-tail stall). |
+| `SQUEEZEFS_TEST_ATTR_PUBLISH_STALL_MS` | int 0..600000 | `0` | Test seam: stall the write handler between its data phase and its size/attr postlude publish, ms (the KD-5/KD-6 attr-merge race pin — design-write-inode-convoy). |
+| `SQUEEZEFS_TEST_NVME_READ_TIMEOUT_MS` | int 1..600000 | `30000` | Test seam: NVMe read timeout, ms. |
+| `SQUEEZEFS_TEST_POWER_CUT_DEVS` | string | `none` | Test seam: comma list of device paths armed for the power-cut simulator. |
+| `SQUEEZEFS_TEST_OVERLAY_BYTES` | bool | `0` | Test seam: force the overlay `Bytes` vehicle on even when `SQUEEZEFS_DEVICE_OVERLAY` is off (in-process suites). |
+| `SQUEEZEFS_TEST_STAMP_BLOCK_REFS` | bool | `0` | Test seam: stamp incompat bit 9 (durable block refcounts) at format on a `--single-writer` base so the ledger can be graded in isolation. Never set in production. |
+| `SQUEEZEFS_TEST_STAMP_WRITER_SCOPE` | bool | `0` | Test seam: stamp incompat bit 10 (writer-scoped staging) at format on a `--single-writer` base. Never set in production. |
+| `SQUEEZEFS_NODE_ID_FILE` | string | `none` | Node-identity source file, ahead of `/etc/machine-id`, `/var/lib/dbus/machine-id` and `/etc/squeezefs/node-id` (writer-scoped staging); the bytes must be host- and reboot-stable. |
+
+**Harness-only variables (suites, rigs, re-exec children — known to the registry, deliberately unvalidated)**
+
+
+`SQZ_CLW_RTT_ENDPOINT` (RTT instrument: dial a REAL coordinator instead of a local loopback listener (tests/cluster_wire_tests.rs `rtt_row`)); `SQZ_CLW_RTT_SECRET_HEX` (RTT instrument: the target volume set's job:enroll secret, hex (required for a remote row)); `SQZ_CLW_RTT_SAMPLES` (RTT instrument: counted samples after the discarded warm-up); `SQZ_CLW_RTT_PAYLOAD` (RTT instrument: payload bytes per direction); `SQUEEZEFS_TEST_REQUIRE_MOUNT` (Turn mount-class skips into failures (TEST-2)); `SQUEEZEFS_TEST_REQUIRE_ALL` (Promote every skip class to a failure); `SQUEEZEFS_TEST_REQUIRE_HARDWARE` (Promote hardware-class skips); `SQUEEZEFS_TEST_REQUIRE_NON_ROOT` (Promote non-root-class skips); `SQUEEZEFS_TEST_REQUIRE_OPT_IN` (Promote opt-in-class skips); `SQUEEZEFS_TEST_REQUIRE_ROOT` (Promote root-class skips); `SQUEEZEFS_TEST_REQUIRE_SUDO` (Promote sudo-class skips); `SQUEEZEFS_TEST_REQUIRE_TOOLCHAIN` (Promote toolchain-class skips); `SQUEEZEFS_TEST_SKIP_LEDGER` (Path the skip ledger is appended to); `SQUEEZEFS_CRASH_CHILD_V3` (KV crash-suite re-exec child marker); `SQUEEZEFS_CRASH_CHILD_V3_BATCHED` (KV crash-suite batched-child marker); `SQUEEZEFS_CRASH_LEDGER` (KV crash-suite ledger path); `SQUEEZEFS_CRASH_ROUNDS` (KV crash-suite round count); `SQUEEZEFS_CRASH_VOL` (KV crash-suite volume path); `SQUEEZEFS_GUARD_CHILD` (Writer-guard suite child marker); `SQUEEZEFS_GUARD_HOLD_CHILD` (Writer-guard hold-child marker); `SQUEEZEFS_GUARD_OUT` (Writer-guard suite output path); `SQUEEZEFS_GUARD_READY` (Writer-guard readiness handshake path); `SQUEEZEFS_GUARD_VOL` (Writer-guard suite volume path); `SQUEEZEFS_WCE_CRASH_CHILD` (Volatile-cache crash-suite child marker); `SQUEEZEFS_WCE_CRASH_ROUNDS` (Volatile-cache crash-suite round count); `SQUEEZEFS_WCE_LEDGER` (Volatile-cache crash-suite ledger path); `SQUEEZEFS_D2_CRASH_CHILD` (Two-stage-conveyor crash-suite child marker); `SQUEEZEFS_D2_CRASH_ROUNDS` (Two-stage-conveyor crash-suite round count); `SQUEEZEFS_D2_LEDGER` (Two-stage-conveyor crash-suite ledger path); `SQUEEZEFS_D2_VOL` (Two-stage-conveyor crash-suite volume path); `SQUEEZEFS_WCE_VOL` (Volatile-cache crash-suite volume path); `SQUEEZEFS_M1_ROOT_DEV` (Meta-slot migration suite device path); `SQUEEZEFS_M1_ROOT_VICTIM_KEY` (Meta-slot migration suite victim key); `SQUEEZEFS_TEST_REQUIRE_CAPABILITY` (Promote capability-class skips); `SQUEEZEFS_RECLAIM_CRASH_CHILD` (Block-reclaim crash-suite child marker); `SQUEEZEFS_RECLAIM_CRASH_DEV` (Block-reclaim crash-suite device path); `SQUEEZEFS_RECLAIM_CRASH_LEDGER` (Block-reclaim crash-suite ledger path); `SQUEEZEFS_RECLAIM_CRASH_ROUNDS` (Block-reclaim crash-suite round count); `SQUEEZEFS_STAGED_CRASH_CHILD` (Staged-payload crash-suite child marker); `SQUEEZEFS_STAGED_CRASH_MANIFEST` (Staged-payload crash-suite manifest path); `SQUEEZEFS_STAGED_CRASH_META` (Staged-payload crash-suite meta path); `SQUEEZEFS_STAGED_CRASH_STAGING` (Staged-payload crash-suite staging path); `SQUEEZEFS_SCALE_DIR_ENTRIES` (Directory-scale suite entry count); `SQUEEZEFS_SKIP_LEDGER_CHILD` (Skip-ledger suite child marker); `SQZ_ALLOC_TRACE` (ipc op-economy allocation-site profiler); `SQZ_BSET_ALLOC_CHILD` (Bset allocation-authority repro child marker); `SQZ_FENCING_REMOUNT_CHILD_DIR` (Fencing-remount suite child directory); `SQZ_VAL3_HARDEN_CHILD` (Key-handling hardening repro child marker).
 
 ### SqueezeFS URI scheme
 
@@ -1269,6 +1633,18 @@ Small random overwrites of striped files no longer pay a whole-block read-modify
 - Knobs (acceptance/diagnostic, not operational escape hatches): `SQUEEZEFS_PATCH_MAX_BYTES` (default derived = block_size/8 — 512 KiB on the shipped 4 MiB block; explicit wins verbatim, `0` disables the patch path — A/B lever — and, by the same act, empties the overlay's sub-cap class so every aligned length is overlay-eligible), `SQUEEZEFS_FOLD_MAX_EXTENTS` / `SQUEEZEFS_FOLD_MAX_BYTES` (fold triggers, default 64 / block_size/4 = 1 MiB on the 4 MiB block).
 - Watch in `.stats`: `patch_writes` ≈ ops on the patch shape (`patch_ineligible_*` growing there = predicate rot), `patch_edge_rmw_reads` **must stay 0**, `fold_fill` median ≥ 16, `extent_records_{recovered,torn_discarded,future_refused}` on recovery.
 
+### Large files — the block-map tree
+
+A striped file's block map lives inline in its metadata record until the encoded map outgrows the record-value cap — **roughly 6–8 GiB of file at the default 4 MiB block size** (~60 KiB of map). Since 2026-09-01 (`docs/design-kvmap-block-map-tree.md`) a file that crosses that point moves its map into a dedicated metadata tree, **one record per block (with run records for contiguous stretches)**, riding the same journal, checkpoint and node cache as every other metadata record. Nothing is configured: the crossing happens on the publish that outgrows the inline cap, once per file, and announces itself in the mount log (`kvmap crossing: ino N entered the block-map tree …` — `grep kvmap <log>`). Below the crossing the on-disk bytes are pinned identical to before.
+
+- **Ceiling.** Block indices are 32-bit, so a file may hold at most `2³² − 1` blocks: **`(2³² − 1) × block_size` = 16 PiB − one block at 4 MiB**, `4 PiB` at 1 MiB. The practical bound is metadata capacity — on the order of 8 GiB of map records plus 13 GiB of block-reference records per PiB of file at 4 MiB blocks, and run records collapse the map side by the run length for sequential data. (The previous scheme, a single indirect blob, capped a file at ≈ `block_size² / 30` ≈ 545 GiB at 4 MiB; a volume still carrying such a legacy blob converts it on the file's first publish under a current binary.)
+- **RAM.** A tree-mapped file's map is read on demand through the node cache, not rehydrated whole. Files whose *write* map would exceed the derived share (`kvmap_write_map_budget_bytes` = memory budget ÷ 16) take the **partial store** — a dirty overlay plus bounded warm windows with tree read-through — gauged as `kvmap_partial_inos`; `kvmap_write_map_bytes` is the live write-map footprint, `block_map_window_{bytes,hits,fills,evictions}` the read-window tier (an R5 component with floor 0).
+- **Truncate and unlink of a tree-mapped file are O(1) at the call**: the size (or the unlink) commits immediately together with a durable per-file sweep cursor, and the record deletes, block-reference releases and device reclaims run as a **background job** in chunks — resumable from the cursor across crashes and remounts, regenerated at mount for every cursor found. `squeezefs job list <mountpoint>` shows them as `kvmap_sweep` jobs; the ledger is `map_sweep_{jobs,chunks,records,resumed}`. Reads clamp to the new size, so shadowed records are unreadable the moment the truncate returns.
+- **Crossing ledger.** `map_migrate_{inos,records,resumed}` count files that crossed, records written and crash-resumed crossings; `publish_map_record_bytes` is the per-publish journal cost on tree-mapped files, and `publish_indirect_blob_bytes` / `layout_indirect_map_reads` must trend to 0 on a converted volume. The per-volume tree counters are `meta_kv_block_map_{puts,deletes,run_puts,lookup_exact,lookup_range,lookup_floor,range_records}`.
+- **fsck class C11 — map-plane consistency (report-only).** Orphan map records (a crossing that crashed mid-train, a dead inode), heads with no records, and run-vs-point coverage anomalies are detected and reported, never auto-repaired: `fsck_map_orphan_records` **must stay 0**, alongside `fsck_map_empty_heads` and `fsck_map_run_foreign_shadows`; `fsck_crossing_exempted` counts files whose crossing was in flight during the pass (an incomplete pass records no verdict). A crashed crossing's residue is invisible to reads and is deleted by the next crossing's sweep prologue.
+- **Format face.** The first crossing on a volume stamps incompat bit 16 (`KV_BLOCK_MAP_TREE`) — never on untouched volumes; binaries older than 2026-09-01 refuse such a volume loudly ([Breaking changes](#breaking-changes--migration-notes)).
+- **Knobs** (measurement levers, not operational settings): `SQUEEZEFS_KVMAP` (default on; `0` = new crossings take the legacy blob arm — never disables resolution of an existing tree head), `SQUEEZEFS_KVMAP_OVERLAY` (default on; `0` = whole map in RAM at any size), `SQUEEZEFS_MAP_MIGRATE_CHUNK` (crossing ops per transaction, default 512, range 64–1024).
+
 ### FUSE transport in-flight concurrency (defaults are the L1 policy; knobs are overrides)
 
 Random-4k iodepth workloads are gated by two multiplicative kernel-side limits: the FUSE-over-io_uring per-queue ring depth and the INIT-negotiated `max_background`. Opening both measured **44k → 316k IOPS (7.2×, device-true)** on `elbencho --rand -t 16 -b 4k --iodepth 16 --direct` (`.benchmarks/2026-07-15-iops-parity-decomposition.md`); since L1 that class is the **default** — no knobs required:
@@ -1384,7 +1760,7 @@ squeezefs volume locate <sqmeta-uri|mountpoint> <path>  # which volume hosts thi
 ### fsck / scrub
 
 ```bash
-squeezefs fsck <target> [--json] [--throttle N]        # detect: 10 classes, verified findings only, exit != 0 on findings
+squeezefs fsck <target> [--json] [--throttle N]        # detect: 11 classes, verified findings only, exit != 0 on findings
 squeezefs fsck <target> --scrub                        # add the C7 data scrub (AEAD/frame/readability per stored form)
 squeezefs fsck <sqmeta-uri> --shards k/N ...           # offline zero-coordination sharding; union with `fsck merge-reports`
 squeezefs fsck <target> --repair                       # plan per-class repairs (DRY RUN)
@@ -1392,6 +1768,8 @@ squeezefs fsck <target> --repair --apply               # execute: quarantine-fir
 ```
 
 Online fsck runs against the live daemon with **zero false positives by design** (every suspect is verified before it is reported — concurrent writes, drains, and parked work are exempted through the live registries, never guessed at). Repair is dry-run by default, quarantines before every discard (per-run quarantine dir + JSON manifest), and is honest where no redundancy exists: torn nodes and scrub-failed blocks are quarantined and reported, never fabricated. On plain (uncompressed, unencrypted) data the scrub can only verify readability — the report says so (`scrub_readability_only`).
+
+The classes: C1–C7 (the volume-lifecycle seven: block/refcount/allocator/layout consistency plus the C7 data scrub), C8 (durable-vs-derived block-reference drift, report-only), C9 (unreferenced inodes) and C10 (inode-plane reference consistency) below, and **C11 — map-plane consistency for tree-mapped large files (report-only)**, described under [Large files](#large-files--the-block-map-tree).
 
 #### C9 — unreferenced inodes (also the cleanup path for pre-S3.5 damage)
 
@@ -2024,14 +2402,20 @@ shape). What an operator must know:
 - Measured: intents take the 250 µs tar-x row from 144–145 to 161–162
   entries/s (−17 % wire verbs/entry) with the create/utime plane fully
   local — real, and deliberately NOT the ≤ 1.10×-of-local recovery, which
-  needs per-volume claim admission (the fleet-of-authorities recipe,
-  future work).
+  needs per-volume claim admission — **built and accepted 2026-08-24**:
+  [Per-volume metadata owners](#per-volume-metadata-owners-squeezefs-volume-set-owners)
+  (the `tar -x` gate is MET at 0.98× of local on a 2-owner fleet,
+  `.benchmarks/2026-08-22-pv-claim-admission.md`).
 
 **Client-owned-slot placement** (`SQUEEZEFS_SLOT_PLACEMENT`, default on
 when armed) is documented in the S8 section above: mint targeting engages
 today (each shipping client's fresh inos land in a dedicated, migratable
-slot); the migration half is structurally dark until a shipping client can
-OWN a volume.
+slot); the migration half is structurally dark on a one-authority fleet
+(no shipping client owns a volume) and **disarmed by design while a
+multi-owner plane is armed** — every migration the policy could select
+there is cross-owner and refused, so `migrations_triggered` /
+`migrations_failed` stay 0 by construction while `migration_candidates`
+counts the demand signal.
 
 **Failover**: delegations and intents are RAM — a holder re-asserts in the
 successor's grace window (NFSv4 pattern), un-reasserted grants are gone,
@@ -2274,6 +2658,197 @@ The **key census** fields (`read_lru_keys`, `write_lru_keys`, `nvme_staged_write
   ```
   A **mounted** filesystem also answers plain `df -h <mountpoint>` from the OS (see [`df` / statfs semantics](#df--statfs-semantics)).
 
+### The `.stats` families — complete reference
+
+Every key the daemon exports, grouped by family. Shapes: a bare name is a monotone **counter** unless marked *gauge* (a live level) or *word* (a string/enum); `*_bytes` are bytes; families written `prefix_{a,b,c}` expand to one key per brace member. **Tripwires** are keys that must stay 0 on a healthy mount — nonzero is the stop-and-read signal, never load. **Engagement gauges** are the keys a benchmark row must account for before its number is valid (a row whose engagement delta does not match its op count measured something else). Percentages, ratios and "≈" laws are the reading, not a promise.
+
+**Latency histograms — the one shape.** Every `*_phase_ns` / `*_gap_ns` / `*_timeline_ns` family (and `fold_fill`, `lease_lock_wait`, `block_lock_wait`, `write_lock_wait*`, `dlm_acquire_time`, `striped_block_concurrency`, `meta_reclaim_batch_size`, `ipc_ingress_ns`, `ipc_session_admission_ns`, `transport_commit_batch`, `fuse_write_inflight`) is an object per phase of the form `{ "buckets": { "<label>": n, … }, "count": N, "sum_ns": S, "mean_ns": S/N }` — 26 log-spaced buckets for the distribution plus **exact** count and sum, so `sum_ns ÷ count` is the true mean (not a bucket-midpoint estimate) and a phase table's members can be checked for containment to the nanosecond (`total ≡ Σ phases` wherever the family says *exact-sum*). Root-daemon and transport-side histograms share one bucketing core, so the two tables compose end to end (`fio clat − read_transport_phase_ns.total` is the kernel-side residue by subtraction). Histograms are always-on unless the family says it rides `SQUEEZEFS_OP_PROFILE`.
+
+#### Identity, posture, build
+
+| Keys | Meaning |
+|---|---|
+| `build_commit`, `build_tag`, `build_profile` (words) | The fleet mixed-version detector: full git commit (`-dirty` when built from a modified tree), the exact release tag (empty when untagged), the cargo profile (`release` / `dist`). See [Versioning & releases](#versioning--releases) |
+| `mount_posture` (word) | `writer` / `reader` / `co-writer` — which of the three mount shapes this daemon is |
+| `read_only_mount`, `reader_revalidate_interval_ms`, `reader_staleness_bound_ms`, `reader_staleness_bound_owners` | The read-only mount's posture and its two DERIVED numbers (interval + the writer's ≤ 1 s checkpoint ceiling — 0 on write mounts); `_owners` is the same bound per owner on a multi-owner set |
+| `direct_device_true`, `write_shared_enabled`, `read_mostly_cache`, `read_lane_armed`, `zcrx_lane_armed`, `stats_key_census` | Posture words/flags echoing the mount's levers: strict device-true O_DIRECT, shared-mode write admission, read-mostly cache backing, the read-lane hold armed, the zcrx lane armed, the key census armed |
+| `meta_format_version` (word, per volume), `meta_volume_atomicity` (`cow-checksummed`), `meta_volume_atomicity_physical` (`atomic4k` / `likely` / `unknown` / `file-backed`), `data_volume_write_cache` (`<dev>=<class>` per data device) | The durability faces: the metadata format (always `3`), the contract class vs the informational hardware probe, and the DATA plane's write-cache class (`write-back` = acknowledged writes stay volatile until a barrier) |
+| `meta_routing_width`, `meta_slot_mint_spread`, `meta_slot_stamp_{runs,cursors}_max` | Dynamic metadata routing: the derived width (65536), the mint spread (64 slots per volume), the stamp encoding's high-water marks |
+| `volume_states`, `volumes_peer_owned`, `placement`, `placement_table_refreshes`, `backend_placement_picks`, `backend_fill_{ratio,spread}` | Per-volume lifecycle state, volumes a peer owns (multi-owner sets), the balance-aware write-placement table and its refresh/pick ledger |
+| `client_slot` | This mount's slot in the node's client identity (`node_{…}.m{slot}`) |
+| `metrics` | The container object most counters below live in (`.stats` has a small top level: identity, caches, the `metrics` object, and the per-volume arrays) |
+
+#### Tripwires (must stay 0) — the daemon-wide set
+
+`invariant_tripwires` (a runtime concurrency-outcome violation reported instead of a panic), `detached_task_panics` (a detached data-path task unwound — its work is lost), `job_worker_panics`, `lane_exec_task_panics` (a handler completed by panic), `lane_exec_tick_rescues` (a lane notify that never delivered), `lock_ticked_reregisters` (a lost lock wake absorbed by the 2 s tick), `open_count_stranded` (a final forget with open handles counted — a lost RELEASE), `dir_nlink_underflows` (a suppressed parent-nlink decrement), `data_dma_fence_refusals` / `data_dma_epoch_refusals` (DMA refused because this mount is fenced / custody moved), `write_pipeline_fence_drops`, `rewrite_shadow_fence_drops`, `overlay_fence_drops`, `block_free_reclaim_fence_halts` (the write-side, rewrite-side, overlay-side and reclaim-side faces of a fenced writer), `block_double_frees` (an offset released twice), `block_untracked_free_refusals` / `block_live_free_refusals` (a free refused because the offset is untracked / still justified by the durable ledger — leak-safe containment of a double-free lineage), `block_key_incarnation_{refusals,exhausted,unknown}` (a block named by a dead incarnation), `transport_cq_overflows` (dropped ring completions; `transport_cq_nodrop` is the capability probe), `transport_requests_abandoned`, `read_dest_overruns`, `ipc_direct_reap_stalls`, `ipc_descriptor_rejects`, `ipc_sessions_poisoned`, `fuse3_zc_bridge_cancels` / `fuse3_zc_bridge_lost` / `fuse3_zc_bridge_orphans` (a zc bridge op hit its deadline / a ring completion was provably lost / a pend lost its deadline coverage), `fuse3_zc_release_failures` / `fuse3_zc_retain_refused`, `fuse3_zc_slot_payload_skips`, `zcrx_lane_poisoned`, `meta_kv_block_refs_drift` (fsck C8), `fsck_findings` (on a healthy volume), `fsck_map_orphan_records`, `staging_foreign_scope_{records,refusals}` (another node's staging root), `alloc_lane_{raise_refusals,enospc_refusals}`, `dlm_token_cache_misses`, `dlm_custody_grace_conflicts`, `dlm_grace_conflicts`, `membership_self_fences`, `free_grace_{forced_releases,laggard_fences}`, `meta_ship_publish.{refusals,owner_panics}`, `writer_guard_fenced` (this mount was fenced — read beside every fence-drop family above). `fuse_op_watchdog_overdue` and `transport_lease_overlong` are **loud-never-fatal**: growth is a long-running op or a write handler past the 1 s lease watchdog, attributed in the log.
+
+#### Metadata store (`meta_kv_*` and the conveyor)
+
+| Keys | Meaning |
+|---|---|
+| `meta_kv_node_cache_{hits,misses,evictions}`, `meta_kv_node_appends`, `meta_kv_node_{append,rewrite}_bytes`, `meta_kv_node_{compactions,splits}`, `meta_kv_node_freeze_shadow_dropped`, `meta_kv_node_dropped_tail_bsets` | The CoW node layer: cache behaviour, appends and rewrites, structural modifications, overlay records shadowed at freeze, torn tails dropped at load |
+| `meta_kv_journal_{bytes,entries,full_stalls}`, `meta_kv_journal_{entries,bytes}_per_volume` (arrays) | Journal traffic (one checksummed entry per transaction) and the per-volume balance instrument — a healthy multi-volume set moves every volume under load; `full_stalls` = admission parked on a full ring |
+| `meta_kv_checkpoints`, `meta_kv_commit_smo_retries`, `meta_kv_dentry_collision_overflows`, `meta_kv_delta_orphans`, `meta_kv_replay_{entries,dropped_torn,ms}` | Checkpoint cadence, lock-then-revalidate retries against structural modifications, dentry hash overflows, orphaned delta records, and the mount-time replay (torn entries detected-and-dropped, never applied) |
+| `meta_kv_block_refs_{staged,released,recovered,drift,unresolved}` | The durable block-reference ledger (one record per reference); `drift` is fsck C8's live must-stay-0 |
+| `meta_kv_free_extents`, `meta_kv_pending_free`, `meta_kv_pending_free_{parked,released,overflow}` | The A/B extent allocator: free extents, frees parked on durable-tail coverage and released by it (`parked − released` tracks the gauge), and at-cap overflow (≈ 0 steady state) |
+| `meta_kv_block_map_{puts,deletes,run_puts,lookup_exact,lookup_range,lookup_floor,range_records}` (per volume) | The block-map tree's record traffic and lookup arms ([Large files](#large-files--the-block-map-tree)) |
+| `meta_kv_fold_{head_serves,memo_hits,memo_misses,memo_bytes}` | Record folds served from overlay heads / snapshot memos (memo bytes are charged to the node-cache budget) |
+| `meta_kv_times_echo_{absorbed,pending,drained,drain_commits}` | The kernel's SETATTR ctime/mtime echo absorbed instead of committed, and its drain |
+| `meta_kv_revalidate_{polls,epochs,nodes_dropped,stale_serves,dirty_skips,keys_purged}`, `meta_kv_reader_load_retries`, `meta_kv_node_partition_refusals` | The coherent-reader revalidation family — all 0 for the life of a write mount; `dirty_skips` and `partition_refusals` are tripwires on every posture, and `epochs` advancing while `nodes_dropped` / `keys_purged` stay flat is a coherence promise not kept |
+| `meta_commit_group_{size,bytes}` (histograms), `meta_conveyor_{leader_passes,pass_panics}`, `meta_conveyor_windows_inflight[_hwm]` (gauge), `meta_conveyor_durability_passes` | The commit conveyor: batch shape, apply passes, windows overlapped between the apply and durability stages (1 = serialized, ≥ 2 = overlapped), durability-lane passes |
+| `journal_ring_{lane,pool}_writes`, `journal_lanes_{spawned,ringless}` | Journal writes issued on the volume's own journal lane vs the shared pool (lane ≈ passes when `SQUEEZEFS_JOURNAL_LANE` is on), lanes spawned / lanes that could not build a ring |
+| `meta_txpass_phase_ns` (exact-sum: `tx_queue_wait`, `pass_{admission,leaf_locks,journal_write,total}`, `window_lane_wait`, `window_total`), `uring_fs_write_phase_ns` (`queue_hop`, `device`, `wake_hop`, `total`) | The conveyor pass interior (`pass_total` = the apply stage's service time; ρ = Σ ÷ wall reads the serialized server) and the journal write's round trip by hop |
+| `lock_phase_ns` (exact-sum; incl. `leaf_lock_hold` — the "never across device I/O" tripwire-by-magnitude), `meta_op_phase_ns` | Lock-hold and metadata-operation phase histograms |
+| `meta_updates`, `meta_sync_requests`, `meta_device_syncs`, `meta_flush_deferred` | Metadata commits, barrier requests vs barriers actually issued (coalescing), commits deferred to the flush cadence |
+| `meta_reclaim_batch_size` (histogram), `meta_reclaim_gather_{fill,window_closes,cap_closes,channel_closes}`, `meta_reclaim_inflight_waits` | Deferred inode reclaim: batch shape, why gathers closed (window / cap / channel), and parks on an ino a concurrent batch already claimed (never double-driven, never returned early) |
+| `meta_parent_scans`, `readdir_parent_memo_hits` | Reverse-dentry scans (legitimate only on the `open_by_handle_at` reconnect path — growing per `readdir` is the regression) vs `..` served from the parent memo |
+| `meta_slot_{migrations,records_copied,delta_keys,delta_overflows,gate_parked_commits,cutover_ms_max}` | Online metadata-slot migration: slots moved, records copied, the conveyor delta tee and its overflow fallback, commits parked on a per-slot cutover gate, worst cutover |
+| `crossvol_tx_{started,completed,recovered}`, `crossvol_tx_midplan_escalations`, `crossvol_tx_steps_already_applied`, `xv_cross_owner_intents` | Cross-volume namespace transactions (`link`/`rename`/`unlink` spanning metadata volumes) and their crash recovery; cross-owner intents on multi-owner sets |
+| `dlm_mode` (word), `dlm_rpcs`, `dlm_term`, `dlm_acquire_time` (histogram), `active_leases_count` (gauge), `lease_acquire_{ok,fail}`, `lease_lock_wait` (histogram), `lease_retry_{waits,exhaustions}` | The lock authority (`solo` on every shipped mount; `dlm_rpcs` must stay 0 there), the durable writer era, per-inode lease acquisition and the retry ladder (waits that later won vs the ladder giving up) |
+
+#### Writer guard, data plane, multi-writer, membership, grace
+
+| Keys | Meaning |
+|---|---|
+| `writer_guard_{mode,fenced,pr_reacquires,term}` | The single-writer mount guard: guarantee class in force (`flock+pr`, `flock+claim`, `co-writer`, `peer-owned`, …), fenced (tripwire), reservation re-acquires (a PTPL regression signal on SPDK targets), the durable writer term |
+| `pr_registrant_shared`, `data_plane_fence_mode`, `data_plane_wero_reacquires`, `dlm_quarantined_offsets` (gauge), `dlm_quarantine_releases` | Data-plane custody: a shared PR host identity (co-located mounts), whether a WERO hold is device-enforced on the data namespaces, its re-acquires (growth = the target dropped reservations), the dead-epoch do-not-reallocate quarantine and its drain-proof releases |
+| `dlm_custody` (object: `mode`, `dlm_custody_held`, `dlm_custody_{grants,renewals,releases,conflicts}`, `dlm_revokes_{issued,expired}`, `dlm_custody_unknown_leases`, `dlm_custody_self_fences`, `dlm_custody_{quarantined_offsets,drain_proofs}`, `dlm_custody_grace_conflicts`, `dlm_custody_grant_census` (opt-in)), `dlm_custody_generation`, `dlm_custody_epoch_advances`, `dlm_custody_phase_ns` (`rtt`, `arbitrate`, `adopt`, `renew`) | Remote write custody on an armed multi-writer plane — all `0`/`off` on a single-writer mount by construction ([Multi-writer data plane](#multi-writer-data-plane-dlm-stage-s9)) |
+| `dlm_delegation` (object), `dlm_recall` (object), `dlm_delegation_recall_phase_ns`, `dlm_revoke_phase_ns` | Subtree delegations, the recall lane and their phase tables ([Subtree delegations](#subtree-delegations--update-intents-dlm-stage-s10)) |
+| `range_custody` (object) | Byte-range custody on an armed plane ([Byte-range custody](#byte-range-custody-dlm-stage-s11)) |
+| `meta_ship` (object), `meta_ship_publish` (object incl. `ship_frames`, `ship_framed_calls`, `ship_depth_waits`, `ship_session_dials`, `served_{frames,frame_calls,chains}`, `free_{shipped_blocks,served_blocks,replays,stale_refusals,ship_failures}`, `map_{shipped,served,refused}`), `meta_ship_intent` (object), `meta_ship_placement` (object), `meta_ship_phase_ns` (`route`, `queue_wait`, `encode`, `rtt`, `decode`), `meta_ship_owner_phase_ns` (`admit`, `dispatch`, `execute`, `reply_encode`, `total`) | Metadata function shipping and its publish/intent/placement planes ([Metadata function shipping](#metadata-function-shipping-dlm-s8)) |
+| `cowriter` (object: `mw_role`, `custody_endpoint`, `admissions`, `admission_refusals`, `accounting_refusals`, `local_commit_refusals`), `peer_volume_local_commit_refusals`, `peer_volume_unclaimed_{admits,refusals}` | The co-writer posture and the per-volume-owner gate ([Multi-writer co-writer mounts](#multi-writer-co-writer-mounts-dlm-stage-s9), [Per-volume metadata owners](#per-volume-metadata-owners-squeezefs-volume-set-owners)) |
+| `alloc_fresh_mints`, `alloc_from_freelist`, `alloc_lane_writers` (0 = unpartitioned), `alloc_lane_id`, `alloc_lanes_owned`, `alloc_lane_{reservations,shipped_reservations,adoptions,raise_refusals,enospc_refusals,stranded_bytes}`, `alloc_lane_{harvests,harvested_blocks,ahead_harvests,owed_blocks,reachable_blocks,harvest_watermark,harvest_horizon_ms,horizon_hints}`, `alloc_lane_stale_records_{pruned,folded}` | Block allocation and the multi-writer allocation partition ([Multi-writer capacity planning](#multi-writer-capacity-planning--the-data-plane-allocation-partition)); the harvest family is the laned co-writer's refill from the authority; stale-record hygiene runs once per affected set |
+| `membership_mode` (word), `membership_{members,readers,writers}`, `membership_{lease_ttl,self_deadline,grace_remaining}_ms`, `membership_min_acked_free_epoch`, `membership_{joins,renewals,renew_refusals,registration_commits,self_fences,evictions,grace_refusals,grace_reclaims,census_serves}`, `membership_renew_sched_lag_ms` (max-gauge) | The membership plane ([Membership plane](#membership-plane--lease-based-liveness-dlm-s6)); `renewals` grows while `meta_kv_journal_entries` does not — that is the point |
+| `free_grace_mode` (word), `free_grace_{deferrals,releases,offsets,bytes}`, `free_grace_bound`, `free_grace_{fence_bound_ms,fence_bound_base_ms,pressure_bound_ms,ring_cap}`, `free_grace_reader_acks`, `free_grace_{forced_releases,laggard_fences,alloc_stalls}`, `free_grace_pressure_pct`, `free_grace_{prods,prod_renew_ms,bound_tightenings}`, `free_grace_demand_{pct,prods}`, `free_grace_bound_refreshes`, `free_grace_pass_{prods,interval_ms}`, `free_grace_ack_pipeline_depth`, `free_grace_acked_lag_ms` | The freed-offset grace period and its pressure valve ([Freed-offset grace period](#freed-offset-grace-period-spec-68-item-3)); closure law `deferrals ≡ releases + offsets` |
+
+#### Layouts, publish, block-map tree
+
+| Keys | Meaning |
+|---|---|
+| `layout_{inline,staged,striped}_writes` | Writes by layout class (tiny inline / locally staged / striped blocks) |
+| `layout_publish_{batches,batched_blocks}` | Per-inode publish coalescing: blocks ÷ batches is the live coalesce factor (≈ 1 on a streaming shape = the conveyor regressed to per-block publishes) |
+| `layout_{delta,full}_commits`, `layout_delta_{bytes,folds}`, `publish_full_save_{indirect,chain_cap,other}` | Layout delta records vs full re-base saves, and why a full save happened |
+| `publish_phase_ns` (exact-sum: `queue_wait`, `lock_wait`, `base_fetch`, `apply`, `save_encode`, `blob_write`, `meta_commit`, `commit_{guard,inode_read,slot_probe,tx_wait}`, `total`) | The publish path's residence decomposition |
+| `publish_base_{dirty_serves,ram_serves,fetches}` | Where the read-modify-write base came from (closes exactly against the pass count; steady rewrite runs `ram_serves ≈ passes`) |
+| `publish_commit_group{s,_saves}` | Delta-class layout saves aggregated into one multi-inode transaction per conveyor window (saves ÷ groups = the live aggregation factor) |
+| `publish_indirect_blob_bytes`, `layout_indirect_map_read{s,_bytes}`, `publish_blob_{composes,orphan_reclaims,foreign_free_skips}`, `publish_compose_spills`, `publish_stale_binding_drops` | The legacy indirect-blob map path (trends to 0 on tree-mapped volumes), its compose/orphan hygiene, and a served publish dropping entries stamped with a dead block incarnation (the shield working under stale-cache churn) |
+| `publish_map_record_bytes`, `map_migrate_{inos,records,resumed}`, `map_sweep_{jobs,chunks,records,resumed}`, `kvmap_write_map_bytes` (gauge), `kvmap_write_map_budget_bytes`, `kvmap_partial_inos` (gauge), `kvmap_{overlay,window}_saves`, `block_map_window_{bytes,hits,fills,evictions}` | The block-map tree ([Large files](#large-files--the-block-map-tree)) |
+| `unpublished_offsets_recovered` | Pre-allocated-but-unpublished destinations recovered at mount |
+
+#### Write path
+
+| Keys | Meaning |
+|---|---|
+| `put_obj`, `get_obj`, `del_obj`, `fuse_ops` | Raw op counts (`get_obj` counts ranged reads by design) |
+| `write_through_{blocks,bytes,fallbacks}`, `write_through_inplace_{overwrites,rewrites}` | Complete-block write-through past staging; never-lossy staging fallbacks; in-place full-block overwrites (`SQUEEZEFS_INPLACE_OVERWRITE`) and the brim in-place rewrite taken only at genuine space pressure |
+| `write_path_seed_read_bytes`, `flush_seed_read_bytes`, `overwrite_seed_{materialized,skipped,deferred}` | Seed reads on the write path (**`write_path_seed_read_bytes` must stay 0** — a fully-covered buffer never pays a seed) and the overwrite-seed decision ledger |
+| `active_block_ooo_runs`, `active_block_cow_copies`, `active_block_memset_elided_bytes`, `write_block_revisits`, `striped_block_concurrency` (histogram) | Kernel-split out-of-order WRITE segments (normal), CoW copies of a shared active buffer, zero-fills elided, block revisits at checkout, concurrent writers per striped block |
+| `patch_{writes,write_bytes,dma_errors}`, `patch_edge_rmw_reads` (0 by definition), `patch_ineligible_{unmapped,decorated,unaligned,overlay,device_overlay,shared,range_shared,transform,adjacent,oversize,posture}` | The sole-owner in-place patch and its decision ledger — growth of an `ineligible_*` arm on a shape that should patch is predicate rot ([Random-small-write path](#random-small-write-path-sole-owner-patch--extent-overlay-design-docsdesign-random-small-writesmd)) |
+| `parked_extent_bytes`, `parked_full_buffer_bytes` (gauges), `extent_{parks,escalations,implicit_escalations,spills,spill_bytes,record_absorbs}`, `fold_{passes,seed_reads,extents_folded}`, `fold_fill` (histogram, median ≥ 16), `staged_rider_{extent_writes,folds}`, `extent_records_{recovered,stale_discarded,torn_discarded,future_refused,foreign_scope}` | The extent overlay, batched fold and staged extent records (recovery classes kept distinct; `foreign_scope` = another writer's records skipped by the mount sweep) |
+| `overlay_{stores,store_bytes,short_stores,store_fallbacks,store_submits_qids}`, `overlay_ack_early_{stores,bytes,retries,lost}`, `overlay_governed_stores`, `overlay_{installs,overwrite_installs,overwrite_bytes}`, `overlay_{publishes,published_bytes,unpublished_at_fsync}`, `overlay_{epoch_feeds,feed_fallbacks,supersessions,superseded_by_merge,claim_conflicts,window_escalations,enospc_declines,mover_skips,teardown_waits}`, `overlay_ineligible_{sub_cap,shadow_bound,range_shared}`, `overlay_gap_{seeds,seed_bytes,seed_old_bytes}`, `overlay_read_{serves,serve_bytes,drains,gap_serves,gap_bytes}`, `overlay_dma_{passthrough,pool_copy}_bytes`, `overlay_inflight_bytes` (gauge), `overlay_open` (gauge), `overlay_fence_drops` (tripwire) | The device-backed write overlay: stores and their ACK-early half, admission through the depth governor, the overwrite arm, publication, supersession, the length floor (`ineligible_sub_cap` ≈ per sub-cap aligned write on an armed mount), old-image seeding at settle (`gap_seed_old_bytes` growing on a rand-4k row is predicate rot), reads served from unpublished overlay bytes, and the DMA vehicle split |
+| `write_pipeline_{inflight_blocks,inflight_bytes,depth_target,depth_target_base,admission_waits,admission_tick_wakes,depth_probe_ups,depth_probe_backoffs,supersessions,superseded_bytes,fence_drops}`, `write_pipeline_phase_ns` (exact-sum: `admit_wait`, `detach_lag`, `lock_wait`, `crypto`, `allocate`, `dma`, `publish`, `displaced_free`, `inval_tail`, `total`) | The write-pipeline depth governor (the runtime bandwidth-delay target and its probe-up multiplier; `admission_waits` is the honest-backpressure gauge) and the ten-phase residence histogram |
+| `rewrite_{blocks,user_bytes,device_write_bytes}`, `rewrite_shadow_{swaps,bytes,parked_bytes,fallbacks,superseded,fence_drops,open_epochs}` | The rewrite program: `device_write_bytes ÷ user_bytes` is the vehicle-blind amplification (gate ≤ 1.05); shadow swaps with `open_epochs` → 0 at quiesce |
+| `write_lock_wait`, `write_lock_wait_{exclusive,shared}` (histograms), `write_lock_scope_{entire,metaprep,shared}`, `write_lock_scope_shared_upgrades`, `write_lock_candidate_{entire,metaprep,shared}` | Inode write-guard acquisition: waits by mode, the scope each write took vs the scope it was classified for, and shared-to-exclusive upgrades |
+| `block_lock_wait` (histogram), `block_lock_wait_by_site` (object) | Per-block flush-lock waits, total and attributed by call site |
+| `nt_copy_bytes`, `numa_{local,remote}_bytes`, `numa_nodes`, `aligned_pool_{hits,misses}` | Non-temporal-store engagement at the DMA-destined copy sites; the NUMA-crossing estimate for daemon copy passes (`numa_nodes` = 1 ⇒ structurally inert); aligned-buffer pool recycling (misses ÷ total ≈ 0 is healthy) |
+| `writeback_queue_depth` (gauge), `writeback_enqueued_{drain,flush,teardown,wt_fallback}`, `writeback_{superseded_noops,stale_token_retries,fence_noops,orphan_discards,retry_exhaustions}`, `writeback_errors_{latched,reported}` | The never-lossy writeback queue: admissions by driver, supersession-aware outcomes (fencing-stale ⇒ no-op, reclaimed-ino ⇒ orphan discard, transient ⇒ retry), and close-time error reporting (`latched − reported` = failures still waiting for an fsync to consume them) |
+| `durable_upload_bytes_{writeback,self_flush,escalation}` | Durable block uploads by driver: the per-block flush unit, the memory-budget-Red self-flush, staging-refusal escalations |
+| `staging_put_bytes_{drain,flush,teardown,wt_fallback}`, `staging_drain_barriers`, `spill_{seed_reads,seed_read_bytes,staging_puts,staging_put_bytes,pass_cacheless_skips}`, `restage_churn_{removes,bytes}`, `staging_sibling_{probes,hops_elided}`, `staged_rmw_pooled_seeds`, `staged_spill_escalations`, `staged_identity_retries`, `staged_payload_lost_reads`, `staged_truncate_{inplace_shrinks,durable_clips}` | Local NVMe staging: puts by driver, inline victim spills (the foreground writer paying a victim's seed), same-key re-stage churn, the staged-sibling probe (latch-free; hops elided when the occupancy index says absent), never-lossy StorageFull escalations, and truncate-shrink correctness arms. **`staged_payload_lost_reads` nonzero after a crash remount = acked-unfsynced staged data was lost and served as zeros (degraded, never errored)** |
+| `staging_generation_discards`, `staging_writer_scope` (word), `staging_scope_upgrades`, `staging_foreign_scope_{records,refusals,discards}` | Staging roots bound to the filesystem generation and the node's writer scope: dead-generation wipes, the scope word, one-time scope upgrades, and the foreign-scope tripwires |
+| `nvme_staging_{current,max}_bytes`, `nvme_staged_write_file_count`, `nvme_staged_write_file_ids` (census), `nvme_unaligned_write_fallbacks`, `active_write_block_count`, `active_writes` (census) | Staging tier occupancy, unflushed staged writes (`squeezefs umount`'s check), unaligned staging fallbacks, live active-write blocks |
+| `bg_admit_capacity`, `bg_admit_available_permits` (gauges), `bg_spawn_{admitted,rejected}` | Best-effort background-task admission |
+| `block_free_{discards,discard_bytes,file_punches,punch_bytes,trim_discards,trim_bytes,reclaim_skipped}`, `block_free_reclaim_{queued,queue_bytes,batches,commands,sync_drains,supply_drains,cap_parks,cap_overflow,elided,fence_halts}`, `block_free_elided_debt_bytes`, `block_free_debt_{drain_passes,pressure_drains}` | Device deallocation: discards/punches issued (blocks ÷ `commands` = the coalesce factor), the background reclaim queue (`sync_drains` must stay 0 except under real space pressure; `supply_drains` = fill-coupled pacing engaging at high fill; `cap_parks` = at-cap enqueues parked, `cap_overflow` ≈ 0), the discard-elision debt ledger (`queued + elided ≡ terminal frees`) and its drainer's pacing (bounded growth at idle) |
+| `data_device_sync_requests`, `data_device_syncs` | Data-device barrier requests vs barriers issued (the difference is coalesced work; a ratio collapsing to 1.0 under concurrent fsync means coalescing stopped) |
+| `data_read_lanes`, `data_write_lanes`, `data_write_lane_submits` | Per-device read/write submission lanes armed at mount and the write lanes' per-lane engagement |
+| `dev_{enters,fills,submit_enters,wake_batches,wake_writes,wakes_elided}` | The NvmeBlockDev lane worker: `io_uring_enter` calls vs fills (enters ÷ fills ≪ 1 under concurrency), request-arrival wakes coalesced |
+| `compress_stored_raw` | Incompressible blocks stored raw (best-effort compression) |
+| `evacuate_{blocks_moved,bytes_moved,shared_blocks_moved,inflight_bytes,stale_token_noops,deferred_staged_blocks,replans,needed_bytes,avail_bytes,transient_bytes}`, `volume_preflight_refusals` | Volume drain/evacuation (a drain row is invalid unless `evacuate_bytes_moved` accounts for the victim's used bytes) and capacity-preflight refusals |
+
+#### Read path
+
+| Keys | Meaning |
+|---|---|
+| `cache_hits`, `cache_misses`, `cache_hit_ratio`, `cache_capacities` (object), `internal_caches` (object), `metadata_cache_size` | The legacy aggregate cache counters and capacity/occupancy objects |
+| `read_mostly_policy_touches`, `read_mostly_dirty_pins` | The read-mostly cache backing: sampled policy touches (rate ≈ hot inodes ÷ horizon; growth proportional to op rate means sampling regressed to per-read) and evictions declined because the entry holds dirty layout state (≈ 0 steady state; growth = the persist cadence is not outrunning the idle horizon) |
+| `read_lru_{current,max}_bytes`, `read_lru_key_count`, `read_lru_keys` (census), `write_lru_{current,max}_bytes`, `write_lru_key_count`, `write_lru_keys` (census) | The RAM read/write LRU tiers (counts always export; the key census is opt-in) |
+| `hot_block_{hits,misses,evictions,probation_drops,dehydrate_skips,current_bytes,max_bytes}` | The RAM hot-block tier for large blocks |
+| `nvme_read_cache_{current,max}_bytes`, `nvme_read_cache_block_count`, `nvme_read_cache_block_keys` (census) | The NVMe read-cache tier |
+| `read_tier_admissions`, `read_tier_admission_ghost_hits`, `read_tier_admission_mode` (word), `read_fill_publishes_skipped`, `read_tier_publishes_paused` | Second-touch tier admission (skipped ≈ streamed cold blocks) and publishes paused under memory-budget Red |
+| `read_admission_{evicted_unhit,wasted_bytes,governor_denials,governor_clamped,stream_transients}` | The scan-resistant admission governor (`governor_denials` ≈ 0 on fitting working sets; `wasted_bytes` ÷ device read bytes ≤ ~5 %) |
+| `prefetch_{issued,completed,wasted,inflight_bytes,window_hwm,foreground_waits,evicted_unconsumed,active_streams}`, `read_streams_classified` | The sequential prefetch pipeline (`evicted_unconsumed` is the refetch-spiral detector) and stream classification |
+| `ranged_{reads,read_bytes,read_unaligned_bounces,read_rebinds,read_ghost_escalations}` | Sub-block ranged reads on passthrough volumes (`ranged_read_bytes` vs user bytes is the rand-4k amplification bound) |
+| `read_lane_{fetches,fetch_bytes,holds,serves,serve_bytes,hold_retired,hold_evicted_unconsumed,hold_ahead_evictions,wasted,covered_skips,depth_target,depth_probe_ups,depth_probe_backoffs,hold_bytes,inflight_bytes}` | The read lane: the hold (a completed-fill store the demand cohort serves from; `hold_evicted_unconsumed` is its spiral detector) and the probe-governed ahead lane |
+| `read_odirect_{requests,tier_serves,ghost_admits}`, `read_device_true_reads` | Hybrid O_DIRECT: requests, tier serves and second-touch admits; device-true reads under the escape |
+| `read_copy_{dest,bounce,warm_serve}_bytes`, `read_{dest,fill}_dma_bytes`, `read_dest_lease_bytes`, `read_zc_serve_bytes`, `nt_read_serve_bytes`, `ipc_arena_copy_bytes` | The READ copy ledger — every daemon CPU pass over read payload bytes by site (closure: `dest + bounce + dest_dma ≈ kernel user bytes`; `dest + arena + dest_dma ≈ il bytes out`; `bounce` ≈ 0 on cold il rows); the dest-window lease and zc serves are the copy-free subsets |
+| `read_serve_phase_ns` (exact-sum: `prelude`, `meta_resolve`, `key_resolve`, `classify_probe`, `sf_wait`, `block_fetch`, `binding_check`, `slice_out`, `post_validate`, `total`), `read_fill_phase_ns` (`dev_queue`, `dev_service`, `fetch_dma`, `decode`, `admission`, `deposit`, `fill_total`), `read_transport_phase_ns` / `write_transport_phase_ns` (`queue_wait`, `dispatch_lag`, `reply_commit`, `commit_flush`, `transport_total`), `zc_bridge_phase_ns` (exact-sum: `msg_hop`, `sq_wait`, `device_cq`, `wake_hop`, `total`) | The read residence tables — per serve, per fill, per transport hop, and the zc direct leg's four hops around one DMA |
+| `singleflight_waiter_result_serves`, `stale_binding_{rebinds,escalations}`, `read_settle_stale_head_refetches`, `seed_settle_escalations` | Cohort serves; the rebind ladder (rebinds are latency, escalations are exhaustions that took the serialized settle arm instead of EIO); cached-head refetches under served-publish churn; the same ladder on stripe-holding seed fetches |
+| `lseek_holes_reported` | Sparse-file export engagement (0 across a `cp --sparse` run means no tool learned about a hole) |
+
+#### Memory budget (R5)
+
+| Keys | Meaning |
+|---|---|
+| `mem_budget_{bytes,pressure_bytes,gauge_sum_bytes,unreclaimable_bytes}`, `mem_budget_level` (word), `mem_budget_components` (object — each component's `current`, `floor`, `weight`, `sheds`) | The daemon's joint memory budget, what is charged against it, and its level (Green / Yellow / Red — Red sheds and pauses, never OOMs) |
+| `mem_budget_{yellow_events,red_events,hard_backstops,backstop_active,tier_publish_paused,dehydrate_paused,floors_clamped}`, `parked_gate_{waits,self_flushes,timeouts}` | Pressure transitions and their consequences; `hard_backstops` / `parked_gate_timeouts` growing on a quiet workload is a convergence regression |
+
+#### FUSE transport (kernel lane)
+
+| Keys | Meaning |
+|---|---|
+| `fuse_over_uring_{sessions_active,registers,requests,replies,cqe_errors}`, `transport_classical_sideband` | FUSE-over-io_uring session state and traffic; requests the kernel routes over the classical sideband (FORGET/INTERRUPT/resends) |
+| `transport_{queues,q_depth,payload_buffer_bytes,max_background,max_write,max_pages,max_readahead}`, `transport_drain_groups`, `transport_drain_group_width` | Negotiated transport geometry (queues = possible CPUs; depth degraded to the payload cap; INIT limits; `max_readahead` echoed verbatim) and the drain-context grouping |
+| `transport_payload_leases`, `transport_leases_outstanding` (gauge), `transport_lease_max_age_ms`, `transport_lease_overlong`, `transport_ents_retired`, `transport_slots_overdue`, `transport_parked_commits`, `transport_unparked_commits`, `transport_park_backstop_ticks` | The zero-copy WRITE payload lease and its watchdog; the park ledger (`parked − unparked` at quiesce is the wedge count — closure is the invariant) |
+| `transport_commit_batch` (histogram), `transport_commit_batch_{commits,flushes}`, `transport_wake_writes`, `transport_wakes_elided`, `transport_reap_gap_ns` (`blind`, `blind_cqe`, `park`) | COMMIT_AND_FETCH batching per drain, queue-eventfd wake coalescing (`writes ÷ (writes + elided)` ≈ 1 under saturation means the coalescer stopped eliding), and the worker's park-gap instrument |
+| `transport_fast_dispatch_{serves,demotes}`, `fuse3_read_inplace_replies`, `fuse3_write_inplace_replies`, `fuse3_tpc_lane_redispatches` | The READ dispatch law (`fast_dispatch_serves + fuse3_zc_read_fusions + fast_dispatch_demotes ≡ READs`), in-place reply arms, and dead-lane re-dispatches (0 on a healthy daemon) |
+| `transport_spin_{absorbed,expired,ns,refused_busy,window_us}` | The queue workers' spin-before-park governor (`absorbed + expired ≡` spins; all 0 on the default) |
+| `transport_replies_{dropped_no_slot,oversize,refused_stale}`, `transport_requests_failed_synthetic`, `transport_dest_dma_leases` | Reply-integrity outcomes (a reply that could not be delivered is failed synthetically, never silently dropped) and read-destination owner-token claims (≈ one per dest-bearing device-read on an armed session) |
+| `transport_timer_{arms,tombstones_skipped,heap_entries,live_sleeps}`, `timer_{arms,tombstones_skipped,heap_entries,live_sleeps}` | The two timer registries (transport-side and daemon-side): arms, cancelled arms popped later, heap occupancy, live sleeps |
+| `fuse3_kmbuf_negotiated`, `fuse3_zc_negotiated`, `fuse3_zc_retention_negotiated` (0/1), `fuse3_zc_replies`, `fuse3_zc_fallbacks`, `fuse3_zc_write_{directs,direct_bytes,extractions,extract_bytes,lazy_extractions}`, `fuse3_zc_write_{fusions,fusion_bytes,fusion_demotions}`, `fuse3_zc_read_{fusions,fusion_demotions}`, `fuse3_zc_{retain_commits,retained_outstanding,releases,release_failures,retain_refused,slot_payload_skips}`, `fuse3_zc_bridge_{cancels,lost,orphans}`, `fuse3_fused_{midpass,passbottom}_reaps`, `fuse3_fused_timeline_ns` | The zero-copy serve integration on the sqz kernel ([FUSE zero-copy serve integration](#fuse-zero-copy-serve-integration-sqz-kernel-opt-in)): negotiation, reply/write vehicles, handler/worker fusion, payload retention, bridge deadlines, and the fused lane's mid-pass vs pass-bottom bridge resolutions |
+| `fuse3_numa_{local,remote}_bytes` | The NUMA-crossing estimate for transport passes (payload delivery, reply serves) |
+| `fuse_write_inflight` (histogram), `fuse_write_phase_ns`, `fuse_op_phase_ns`, `fuse_create_under_lock_ns` | Per-op write concurrency and phase histograms (`fuse_op_phase_ns` / `fuse_create_under_lock_ns` ride `SQUEEZEFS_OP_PROFILE=1`) |
+| `fuse_{flush,release}_clean_fastpath`, `fuse_lookup_negative_replies`, `fuse_attr_cache_refreshes`, `fuse_killpriv_negotiated` (0/1), `fuse_killpriv_clears`, `fuse_reserved_xattr_refusals`, `fuse_dio_write_invals`, `fuse_dio_inval_detached` | Round-trip economy (clean-handle FLUSH/RELEASE, negative dentries, refresh-instead-of-invalidate), the killpriv-v2 clearing law, the reserved-xattr tamper tripwire, and DIO-write page-coherence invalidations (`detached` ≈ 0; growth marks ring-capacity pressure) |
+| `op_trace_{armed,samples,dropped,divisor}` | The per-op trace ring's state (`SQUEEZEFS_OP_TRACE`; `cat <mnt>/.trace` drains it) |
+| `daemon_cpu_ns`, `daemon_cpu_ns_by_class` (object: `fuse3-tpc`, `fuse3-ur`, `sqz-ipc-svc`, `sqz-ipc-dd`, `sqz-meta`, `sqz-jrnl`, `sqz-blk`, `sqz-nvme`, `sqz-zcrx`, `sqz-timer`, `other`) | Daemon CPU by thread class — the CPU/op denominator every campaign row cites |
+| `uring_queue_full` | io_uring submission-queue-full events |
+
+#### LD_PRELOAD interception (`ipc_*`, `il_*`, `placed_*`)
+
+| Keys | Meaning |
+|---|---|
+| `ipc_sessions_{active,total,poisoned,reaped}`, `ipc_session_owners`, `ipc_binds`, `ipc_binds_dev_override`, `ipc_bind_refused_{version,nonce,flags,mode,budget,peercred,disabled}`, `ipc_admission_refusals`, `ipc_descriptor_rejects`, `ipc_session_admission_ns` (histogram) | Session lifecycle and the refusal ledger (`disabled` = a mount without `--interception` refusing data sessions — the expected default posture); `dev_override` nonzero outside dev boxes is a fleet-hygiene alarm |
+| `ipc_arena_bytes`, `ipc_arena_prep_{queued,done,skipped_dead,skipped_pressure}` | Session payload arenas and the deferred huge-page prep worker (skipped when the session died first / under memory-budget Red) |
+| `ipc_ops_{read,write}`, `ipc_bytes_{in,out}` | **The interception engagement instrument** — an il row is invalid unless these deltas account for its ops |
+| `ipc_fast_path_serves`, `ipc_async_handoffs`, `ipc_fast_path_{lock,miss}_demotions`, `ipc_hold_probe_{serves,misses}`, `ipc_read_dest_serves` | The sync warm fast path vs handoffs into the FUSE handler bodies, why serves demoted, the read-lane hold probe on the service thread, arena-destination read serves |
+| `ipc_direct_drive_{submits,serves,bounces,fallbacks_post}`, `ipc_direct_ineligible_{backend,layout,meta,overlay,policy,shape}`, `ipc_direct_shards`, `ipc_direct_inline_reaps`, `ipc_direct_reap_stalls`, `ipc_direct_phase_ns` (`admit`, `inflight`, `finish`, `total`, `sq_wait`, `device_cq`), `ipc_dd_cadence_{k,probe_ups,probe_backoffs}` | The direct-drive READ lane (device reads issued from the interception host's own rings): decision ledger, shards, inline reaps, the per-op phase table (`fio clat − total` = client + ingress), and the governed issue cadence |
+| `ipc_dd_write_{serves,bytes,block_parks,park_redrives,times_dispatches,fence_refusals}`, `ipc_dd_write_ineligible_{shape,align,backend,block_lock,fence_backoff,killpriv,lease,range,overlay}` | The direct-drive WRITE lane (patch-shaped ring writes DMA in place) and its per-cause decision ledger |
+| `ipc_ingress_ns` (histogram) | Client-publish → daemon-dequeue ring-ingress residence (the measured "client + ingress" term; count delta must account for the row's ring ops) |
+| `ipc_drain_{pass_ns,flush_ns}` (histograms), `ipc_drain_empty_passes`, `ipc_service_threads` (gauge), `ipc_service_parks`, `ipc_spin_{window_us,absorbed_parks,disengaged_busy}` | Service-thread drain passes (ops ÷ count = live ops per pass), empty passes, spawned threads, parks, and the spin governor |
+| `ipc_cqe_wake_{writes,elided,collapsed}`, `ipc_cqe_pass_wake_flushes`, `il_park_eras`, `il_slot_reroutes`, `il_submit_harvested` | The completion doorbell: wakes paid only toward parked reapers (`writes ÷ (writes + elided + collapsed)` is the wake economy), pass-scoped flushes, client park eras (the wakes-per-era denominator), slot reroutes, harvested submits |
+| `ipc_severed_pool_{hits,misses,bytes}`, `ipc_placed_severs`, `ipc_placed_sever_fallbacks`, `placed_{adoptions,adoption_refusals,merge_elides,assembly_bytes}` | Ring-write buffer economy: the severed-buffer pool and the one-copy placed-sever path (whole-block ring chunks sever straight into the assembly the first merge adopts) |
+| `ipc_inval_{notifies,suppressed,attrs_only}` | Kernel page-cache invalidations after ring writes (rate-limited per window; size growth always fires an attrs-only notify) |
+| `ipc_lane_gate_{threshold_bytes,kernel_routes,kernel_bytes}` | The hybrid lane gate: ops above the derived threshold routed to the kernel lane |
+
+#### Jobs, fsck, scrub, defrag
+
+| Keys | Meaning |
+|---|---|
+| `job_{submitted,completed,cancelled,failed,tasks_done,checkpoint_writes,copy_buffer_bytes,paused_mem_pressure,paused_capacity,serialized_waits,mover_custody_defers}` | The maintenance job fabric ([Jobs & distributed execution](#jobs--distributed-execution)); `paused_*` are the loud pauses an operator resumes |
+| `job_remote_{workers,enrollments,enroll_refused,shards,submissions,refused_stale,lease_expiries,reassignments,bytes_moved,verify_read_bytes,quarantined_destinations,pr_preempts,fence_mode}` | Remote job-shard execution over the wire (`shards` is the remote-engagement instrument; `enroll_refused` / `refused_stale` are security/fencing tripwires) |
+| `job_fleet_{shards_dispatched,shards_completed,shards_relocal,worker_shards,worker_red_aborts}` | Fleet-parallel maintenance on an armed membership plane |
+| `fsck_{inodes_scanned,nodes_walked,blocks_checked,refcounts_checked,suspects,suspects_cleared,findings,scan_secs}`, `fsck_{epoch,inflight,mover_ledger,current_era,crossing,foreign_lane}_exempted`, `fsck_inode_plane_{volumes_covered,proposals_admitted,proposals_stripped,foreign_scoped,cross_owner_declined}` | fsck detection and its zero-false-positive shields (each `*_exempted` is a shield engaging: allocation epoch, in-flight registry, mover ledger, the writer era's ino floor, an in-flight block-map crossing, a foreign allocation lane) |
+| `fsck_dentry_refs_indexed`, `fsck_nlink_mismatch_{high,low}`, `fsck_nlink_zero_named`, `fsck_dangling_dentries`, `fsck_nlink_names_counted`, `fsck_nlink_transient_cleared` | Classes C9/C10 — `mismatch_low` / `zero_named` / `dangling_dentries` are the LOSS direction ([fsck / scrub](#fsck--scrub)) |
+| `fsck_map_{orphan_records,empty_heads,run_foreign_shadows}` | Class C11 ([Large files](#large-files--the-block-map-tree)) |
+| `fsck_repairs_{planned,applied,refused}`, `fsck_repair_refused_multi_owner`, `fsck_quarantined_{records,blocks,bytes}`, `fsck_repair_classC{1..10}` | Repair planning and execution (dry-run by default, quarantine-first; C8 has no repair arm and C11 is report-only, so neither has a repair counter) |
+| `scrub_{blocks_scanned,bytes_scanned,aead_verified,frame_verified,readability_only,failures}` | The C7 data scrub by stored form |
+| `defrag_{blocks_moved,bytes_moved,folds_kicked,meta_compactions_kicked,passes}`, `frag_d1_{contiguity,reclaimable_tail}`, `frag_d2_locality`, `frag_d3_pressure_bytes`, `frag_d4_dead_bset_ratio` | The four-axis defragmenter and its gauges |
+
+#### Fabric, zcrx lane
+
+| Keys | Meaning |
+|---|---|
+| `fabric_controllers`, `fabric_ctrl_not_live`, `fabric_ctrl_reconnects` | NVMe-oF initiator state sampled from sysfs ([Fabric observability](#fabric-observability)) |
+| `zcrx_lane_armed`, `zcrx_{fills,fill_bytes,gather_bytes,dest_gather_bytes,hdr_copy_bytes,fill_fallbacks}`, `zcrx_area_bytes`, `zcrx_area_admission_waits`, `zcrx_{recv_parks,recv_failovers,conn_errors,degraded_bypasses,structural_teardowns,starved_ms}`, `zcrx_parks_{cq_full,pool_dry,rq_empty}`, `zcrx_frame_violations`, `zcrx_lane_poisoned` | The opt-in zero-copy-receive read lane (`SQUEEZEFS_ZCRX_LANE`; engagement law `gather ≡ fill`; `lane_poisoned` is the tripwire — `docs/design-zcrx-read-lane.md`) |
+
 ### `df` / statfs semantics
 
 A mounted SqueezeFS reports honest, cheap numbers to `statfs(2)` (`df`): **total** is the formatted capacity — the summed data-backend size, or the lower explicit `--capacity` quota chosen at format (the effective limit you experience); **used/free** track the bytes currently allocated on the striped block backends, maintained by the block allocators at alloc/free time (no metadata transactions or device I/O on the statfs path). Tiny inline payloads live in the metadata volume and staged-but-unpromoted small writes in the local NVMe staging dirs, so those transient bytes appear in `df` as their blocks promote via writeback rather than instantaneously; deletes return space after background reclaim completes. Inode columns (`df -i`) report the format inode quota against the v3 monotonic, no-reuse inode watermark — `IFree` is remaining create headroom, and deleting files does not raise it.
@@ -2330,7 +2905,27 @@ Target-side health and initiator-side fabric signals (`target status`, `fabric_*
 
 > **fio engine policy (user ruling 2026-08-07, `.benchmarks/2026-08-07-fio-engine-policy.md`):** every throughput/IOPS row runs `ioengine=libaio --direct=1` with a stated iodepth on BOTH lanes (kernel and il — the il lane rides the v1.1 aio interposers), every A/B comparison uses the SAME engine both sides, and psync survives only as explicitly-labeled §5.5.1 sync-lane coverage rows (never a headline, never cross-lane compared); `io_uring` is a labeled kernel-lane-only extra.
 
-Every number traces to a committed `.benchmarks/` note (box/substrate/method inside each). Headline classes on the reference box:
+Every number traces to a committed `.benchmarks/` note (box/substrate/method inside each). Two venues carry the record: the **field** (squeeze-test — the fabric the product is built for) and the **reference dev box** (the 2026-07 programs' controlled-latency substrate). The README's four hero numbers are the first field row below.
+
+### Field records (squeeze-test)
+
+**Venue:** 5 storage nodes over nvme-tcp, memory-backed (nullblk) NVMe targets; client 32-core Xeon 6426Y, 251 GB RAM, 2×200 GbE; cacheless mount with `--interception`. Two lanes per row: **kern** (kernel FUSE-over-io_uring) and **il** (`LD_PRELOAD=libsqueezefs_il.so`, same-commit pairing). Tier: measured-real. 4 KiB rows are 24 jobs × iodepth 8, closed-loop (≈ 190 ops in flight), so every il-vs-kern delta is a latency delta at equal depth.
+
+| Row | Result | Binary / instrument | Record |
+|---|---|---|---|
+| **Hero row — user-run EXA client-validation script v1.2.1, il mode, 40 s rows** | **Read BW 43.9 GB/s · Write BW 36.4 GB/s · Read IOPS 942 k · Write IOPS 727 k** | `c985fa8c`; the user's instrument, not the rig's | [`.benchmarks/2026-09-02-e2e-audit-baseline.md`](../.benchmarks/2026-09-02-e2e-audit-baseline.md) (addendum) |
+| Sequential read, 1 MiB, 24 × qd16 (`r_cold`) | il **40.35 GiB/s** (97 % of the 41.6 GiB/s wire payload) / kern 36.88 GiB/s (89 %) | `aecf1561`, fio libaio 30 s + 10 s ramp | same note |
+| Sequential rewrite of tree-mapped files (`w_rewrite`) | kern **32.26 GiB/s** / il 30.48 GiB/s; `w_durable` (`end_fsync`) 31.0 GiB/s both lanes | `aecf1561` | same note |
+| Random 4 KiB read, 24 × qd8 (`rr_4k`), kern | **434–441 k IOPS** (clat ≈ 0.43 ms) before the read-path work → **512 k sustained** (+14.8 %, A-B-B-A) after READ fast-dispatch; the composed default binary 507–510 k | `aecf1561` → R-2 branch | [`2026-09-03-4k-random-attribution.md`](../.benchmarks/2026-09-03-4k-random-attribution.md), [`2026-09-03-r2-read-fast-dispatch.md`](../.benchmarks/2026-09-03-r2-read-fast-dispatch.md), [`2026-09-03-r3-fill-issue-economy.md`](../.benchmarks/2026-09-03-r3-fill-issue-economy.md) |
+| Random 4 KiB read, 24 × qd8 (`rr_4k`), il | **858–874 k IOPS** (clat ≈ 0.22 ms) | `aecf1561` | same notes |
+| Random 4 KiB write, 24 × qd8 (`rw_4k`) | kern 476 k / il 704 k IOPS (the in-place patch path) | `aecf1561` | baseline note |
+| Raw fabric controls (fio libaio direct on the ten data namespaces, FS idle) | qd1 4 KiB RTT **24.8 µs** mean; 4 KiB randread ceiling **1.90 M** (24×8, the FS job's shape) – **2.03 M** (32×8); 1 MiB seq read **38.59 GiB/s** (24×16) | same client, same day | baseline addendum + the 4k attribution note |
+
+The campaign notes behind the read-side movement — `2026-09-02-r1-device-read-executor.md`, `2026-09-03-r2-read-fast-dispatch.md`, `2026-09-03-r3-fill-issue-economy.md`, `2026-09-03-r4-reap-thread-economy.md` — and the write/metadata side — `2026-09-02-w3-overlay-depth-governor.md`, `2026-09-02-f46-kvmap-stream-publish.md`, `2026-09-02-d1b-publish-plane-batching.md`, `2026-09-03-d2-two-stage-conveyor.md`, `2026-09-03-c2-uring-fs-completion-hop.md` — each state their bracket order, engagement counters and sustained window. The 30 s baseline rows are scoping rows, not sustained claims; the 512 k row is a sustained (≥ 60 s, first-third vs last-third flat) row; the hero row is the user's own 40 s instrument, recorded as such.
+
+### Reference-box records (2026-07 programs)
+
+Headline classes on the reference dev box (zram/nullblk virtual NVMe substrate):
 
 | Axis | Measured class | Evidence |
 |---|---|---|

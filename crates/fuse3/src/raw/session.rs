@@ -5791,6 +5791,15 @@ struct TpcScheduler {
     /// Per-node rotation cursors (same cache-pressure shape as
     /// `next_idx`).
     node_next: Vec<std::sync::atomic::AtomicUsize>,
+    /// cpu id → the lane HOMED on it (R-2 READ fast dispatch): the kernel
+    /// routes a request to the queue of the requester's CPU, so on
+    /// queue-per-CPU sessions a demoted READ minted by queue worker `qid`
+    /// goes to the lane whose home core is that CPU — ONE lane per queue
+    /// (the same-lane posture the retired dispatch task had), so a
+    /// burst's handlers queue on one already-running lane instead of
+    /// waking a different parked lane per op. `None` = no lane homes
+    /// there (core 0, taskset holes, out-of-range).
+    lane_of_cpu: Vec<Option<usize>>,
 }
 
 impl TpcScheduler {
@@ -5821,6 +5830,8 @@ impl TpcScheduler {
         for _ in 0..topo.len() {
             node_next.push(std::sync::atomic::AtomicUsize::new(0));
         }
+        let mut lane_of_cpu: Vec<Option<usize>> =
+            vec![None; core_ids.iter().copied().max().map_or(0, |m| m + 1)];
 
         let scope = crate::raw::affinity::pin_scope();
         for i in 0..core_count {
@@ -5839,6 +5850,11 @@ impl TpcScheduler {
             if let Some(home) = home_cpu {
                 if let Some(node) = topo.node_of_cpu(home) {
                     node_lanes[node].push(i);
+                }
+                // First lane homed on a core wins (lanes wrap when
+                // core_count > cores — never in production).
+                if lane_of_cpu[home].is_none() {
+                    lane_of_cpu[home] = Some(i);
                 }
             }
 
@@ -5911,6 +5927,7 @@ impl TpcScheduler {
             next_idx: std::sync::atomic::AtomicUsize::new(0),
             node_lanes,
             node_next,
+            lane_of_cpu,
         }
     }
 
@@ -5957,14 +5974,19 @@ impl TpcScheduler {
         self.spawn(fut);
     }
 
-    /// [`Self::spawn_on_node`] for an ALREADY-boxed future (the R-2 fast
-    /// dispatch's minted READ handler): the same node-local round-robin
-    /// (global rotation when `node` is unknown or has no lanes), with
-    /// no second `Box::pin` around the box. Zero-lane configs take the
+    /// The R-2 fast dispatch's demote venue for an ALREADY-boxed READ
+    /// handler: the lane HOMED on `cpu` (the requester's CPU = the queue
+    /// worker's qid — one lane per queue, see `lane_of_cpu`), else the
+    /// node-local round-robin, else the global rotation; no second
+    /// `Box::pin` around the box. Zero-lane configs take the
     /// [`Self::spawn`] fallback thread.
-    fn spawn_boxed_on_node(&self, node: Option<usize>, fut: LaneFuture) {
+    fn spawn_boxed_home(&self, cpu: Option<usize>, node: Option<usize>, fut: LaneFuture) {
         if self.lanes.is_empty() {
             self.spawn(fut);
+            return;
+        }
+        if let Some(idx) = cpu.and_then(|c| self.lane_of_cpu.get(c).copied().flatten()) {
+            Self::dispatch(&self.lanes, idx, fut);
             return;
         }
         if let Some(group) = node.and_then(|n| self.node_lanes.get(n)) {
@@ -6015,7 +6037,7 @@ impl TpcScheduler {
                     (first_idx + attempt - 1) % lanes.len(),
                 );
             }
-            lane.exec.spawn(fut);
+            lane.exec.spawn_boxed(fut);
             return;
         }
         // Every lane thread is dead: no handler can ever run again on
@@ -6170,11 +6192,11 @@ where
 }
 
 /// Hand an already-boxed handler future to a lane (R-2 READ fast
-/// dispatch's demote arm): node-local round-robin when `node` is known,
-/// the global rotation otherwise — [`tpc_spawn_on_node`] without the
-/// second box.
-pub(crate) fn tpc_dispatch_boxed(node: Option<usize>, fut: LaneFuture) {
-    TPC_SCHEDULER.spawn_boxed_on_node(node, fut);
+/// dispatch's demote arm): the lane homed on `cpu` when known (one lane
+/// per queue), else node-local round-robin, else the global rotation —
+/// [`tpc_spawn_on_node`] without the second box.
+pub(crate) fn tpc_dispatch_boxed(cpu: Option<usize>, node: Option<usize>, fut: LaneFuture) {
+    TPC_SCHEDULER.spawn_boxed_home(cpu, node, fut);
 }
 
 pub fn tpc_thread_count() -> usize {

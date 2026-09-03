@@ -121,9 +121,16 @@ impl LaneExec {
     where
         F: Future<Output = ()> + Send + 'static,
     {
+        self.spawn_boxed(Box::pin(fut));
+    }
+
+    /// [`Self::spawn`] for an already-boxed future (a caller that minted
+    /// the box itself — the fuse3 READ fast-dispatch's demote arm — pays
+    /// no second box here).
+    pub fn spawn_boxed(&self, fut: Pin<Box<dyn Future<Output = ()> + Send + 'static>>) {
         let task = Arc::new(LaneTask {
             state: TaskState::new_scheduled(),
-            future: Mutex::new(Some(Box::pin(fut))),
+            future: Mutex::new(Some(fut)),
             exec: self.shared.clone(),
         });
         self.shared.enqueue(task);

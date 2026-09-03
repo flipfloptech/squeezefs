@@ -6561,10 +6561,19 @@ fn queue_worker(
                             },
                             arrived_ns: now_ns,
                         });
-                        // The handoff-economy venue: a fuse3-tpc lane on
-                        // this queue's node (round-robin within it),
+                        // The handoff-economy venue: the fuse3-tpc lane
+                        // HOMED on this queue's CPU (qid = the requester's
+                        // CPU on queue-per-CPU sessions — one lane per
+                        // queue, the same-lane posture; the first field
+                        // bracket's node round-robin woke a different
+                        // parked lane per op and moved the tail onto the
+                        // worker's blind window), else node round-robin;
                         // never a runtime-handle spawn.
-                        crate::raw::session::tpc_dispatch_boxed(queue_node, fut);
+                        crate::raw::session::tpc_dispatch_boxed(
+                            pool.qid_is_cpu.then_some(qid as usize),
+                            queue_node,
+                            fut,
+                        );
                         continue;
                     }
                 }

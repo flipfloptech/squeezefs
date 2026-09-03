@@ -307,6 +307,10 @@ def main():
             dsum = hp["sum_ns"] - hq.get("sum_ns", 0)
             hist_mean = dsum / dn if dn else None
             tmean = statistics.fmean(vals)
+            # A phase the daemon records as EXACT zeros (R-2's
+            # `queue_wait` on fast-dispatched READs) has a 0 histogram
+            # mean: the ratio is undefined, and containment holds iff the
+            # trace agrees within one clock quantum.
             ratio = (tmean / hist_mean) if hist_mean else None
             n_scaled = len(vals) * divisor
             exact = PHASE_SPANS[(fam, phase)][2]
@@ -314,7 +318,10 @@ def main():
             if hist_mean is not None and not exact:
                 verdict = "~approx"
             elif hist_mean is not None and len(vals) >= args.min_n:
-                ok = abs(ratio - 1.0) <= args.tolerance
+                if hist_mean == 0:
+                    ok = tmean < 1_000
+                else:
+                    ok = abs(ratio - 1.0) <= args.tolerance
                 verdict = "OK" if ok else "FAIL"
                 if not ok:
                     failures += 1

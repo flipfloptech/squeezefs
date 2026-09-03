@@ -58,12 +58,22 @@ EOF
 }
 
 do_umount() {
-    sudo -n umount "$MNT" 2>/dev/null || sudo -n umount -l "$MNT" || true
-    for _ in $(seq 1 120); do
-        pgrep -f 'squeezefs moun[t]' >/dev/null || return 0
+    # Plain umount, retried (a fio straggler can hold the tree for a
+    # moment); the lazy detach is the last resort — a lazy-detached
+    # daemon lingering into the NEXT mount's arm is what tore leg B3
+    # down at its own ready line (both at 02:51:34).
+    local ok=0
+    for _ in $(seq 1 20); do
+        if sudo -n umount "$MNT" 2>/dev/null; then ok=1; break; fi
+        sleep 1
+    done
+    [ "$ok" = 1 ] || sudo -n umount -l "$MNT" || true
+    for _ in $(seq 1 240); do
+        pgrep -f 'squeezefs moun[t]' >/dev/null || break
         sleep 0.5
     done
-    sudo -n pkill -f 'squeezefs moun[t]' || true
+    pgrep -f 'squeezefs moun[t]' >/dev/null && { sudo -n pkill -f 'squeezefs moun[t]' || true; sleep 2; }
+    mountpoint -q "$MNT" && die "$MNT still mounted after umount"
     sleep 2
 }
 
@@ -92,8 +102,15 @@ row() { # <rr4k|seq1m> <label> [secs]
     echo "quiet: loadavg $(cut -d' ' -f1-3 /proc/loadavg)" >"$RESULTS/$label.quiet"
     sync; sleep 2
     snap "$RESULTS/$label.stats0"
-    "$FIO" "$job" --runtime="$secs" --write_bw_log="$RESULTS/$label" --log_avg_msec=1000 \
-        --output-format=json --output="$RESULTS/$label.fio.json" >"$RESULTS/$label.fio.out" 2>&1 ||
+    # A job-section `runtime=` beats any command-line value (before OR
+    # after the file), so a non-default duration is a derived job file:
+    # the field job verbatim with only `runtime=` rewritten.
+    if [ "$secs" != 30 ]; then
+        sed "s/^runtime=.*/runtime=$secs/" "$job" >"$RESULTS/$label.job"
+        job="$RESULTS/$label.job"
+    fi
+    "$FIO" --write_bw_log="$RESULTS/$label" --log_avg_msec=1000 \
+        --output-format=json --output="$RESULTS/$label.fio.json" "$job" >"$RESULTS/$label.fio.out" 2>&1 ||
         die "$label: fio failed ($(tail -3 "$RESULTS/$label.fio.out"))"
     snap "$RESULTS/$label.stats1"
     python3 "$(dirname "$0")/row_delta.py" "$RESULTS" "$label" | tee "$RESULTS/$label.row"
@@ -108,8 +125,8 @@ trace_row() { # <label>
     echo "quiet: loadavg $(cut -d' ' -f1-3 /proc/loadavg)" >"$RESULTS/$label.quiet"
     sync; sleep 2
     snap "$RESULTS/$label.stats0"
-    "$FIO" "$JOBS/randread_iops.job" --write_bw_log="$RESULTS/$label" --log_avg_msec=1000 \
-        --output-format=json --output="$RESULTS/$label.fio.json" >"$RESULTS/$label.fio.out" 2>&1 &
+    "$FIO" --write_bw_log="$RESULTS/$label" --log_avg_msec=1000 \
+        --output-format=json --output="$RESULTS/$label.fio.json" "$JOBS/randread_iops.job" >"$RESULTS/$label.fio.out" 2>&1 &
     local fpid=$!
     sleep 25   # 10 s ramp + 15 s
     echo 2 | sudo -n tee /proc/sys/vm/drop_caches >/dev/null; cat "$MNT/.trace" >/dev/null

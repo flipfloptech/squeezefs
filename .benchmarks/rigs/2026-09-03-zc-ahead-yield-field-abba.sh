@@ -86,12 +86,18 @@ row() {  # $1 = tag, $2 = job (read_BW|randread_iops|write_BW), $3 = mode (kern|
   cat "$MNT/.stats" > "$OUT/$tag.stats1"
   python3 "$DELTA" "$OUT" "$tag" | tee "$OUT/$tag.row" || true
   if [ "$mode" = il ]; then
+    # The shim's hybrid lane gate (D14 corollary, 2026-08-07) routes ops
+    # above its derived threshold to the kernel FUSE lane — a 1 MiB il
+    # row engages as `ipc_lane_gate_kernel_routes` (≡ fuse3_zc_replies),
+    # a 4 KiB il row as `ipc_ops_read`. Either is engagement; neither
+    # moving means the shim never bound (row INVALID).
     python3 - "$OUT/$tag.stats0" "$OUT/$tag.stats1" <<'EOF' || { echo "IL ROW INVALID: shim did not engage" >&2; exit 3; }
 import json,sys
 a=json.load(open(sys.argv[1]))["metrics"]; b=json.load(open(sys.argv[2]))["metrics"]
-ops=int(b.get("ipc_ops_read",0))-int(a.get("ipc_ops_read",0))
-print("   il engagement: ipc_ops_read delta =", ops)
-sys.exit(0 if ops>1000 else 1)
+d=lambda k: int(b.get(k,0))-int(a.get(k,0))
+print("   il engagement: ipc_binds=%d ipc_ops_read=%d ipc_lane_gate_kernel_routes=%d (thr=%s) fuse3_zc_replies=%d" % (
+    d("ipc_binds"), d("ipc_ops_read"), d("ipc_lane_gate_kernel_routes"), b.get("ipc_lane_gate_threshold_bytes"), d("fuse3_zc_replies")))
+sys.exit(0 if d("ipc_binds")>0 and (d("ipc_ops_read")>1000 or d("ipc_lane_gate_kernel_routes")>1000) else 1)
 EOF
   fi
 }
@@ -99,9 +105,16 @@ EOF
 leg() {  # $1 = A|B, $2 = leg tag, $3 = sustained (0|1)
   local arm="$1" tag="$2" sus="$3"
   reset_cluster "$tag"
-  mount_arm "$arm" "$tag"
+  mount_arm "$arm" "$tag-layout"
   local il; case "$arm" in A) il=$A_IL ;; B) il=$B_IL ;; esac
   row "$tag-layout-write" write_BW kern 30 ""
+  # The time-based write pass OVERWRITES for most of its 30 s (24 × 8 GiB
+  # lands in ~6 s at 33 GiB/s), leaving ~58 k displaced-block discards
+  # draining to the targets — a read row started on that mount pays them
+  # (run1 A1: 35.4 vs 41.1 GiB/s on the same binary). Umount drains the
+  # reclaim queue; the read rows run on a fresh mount of the same arm.
+  umount_arm
+  mount_arm "$arm" "$tag"
   row "$tag-seq1m-kern" read_BW kern 30 ""
   row "$tag-seq1m-il" read_BW il 30 "$il"
   row "$tag-rr4k-kern" randread_iops kern 30 ""

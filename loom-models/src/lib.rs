@@ -134,6 +134,21 @@
 //!   enqueued-then-dropped committer (Issue 13: the queue entry co-owns
 //!   the DLM guard set, so same-key exclusion survives the committer's
 //!   death until the pass's terminal outcome for that tx).
+//! - `conveyor_two_stage_models` (composition — the D-2 two-stage
+//!   conveyor, `.benchmarks/2026-09-03-d2-two-stage-conveyor.md`): the
+//!   apply pass handing windows to the per-volume durability lane through
+//!   a second [`conveyor_core`] instance, the lane's head-awaited landed-
+//!   successor groups, in-order completion and in-order fan-out —
+//!   invariants: acks never leave journal order (a committer that sees
+//!   window j answered sees every predecessor's write landed — the
+//!   chain-reachability law); a parked predecessor holds its successors'
+//!   answers, failures included; the failed-write rollback is stage B's
+//!   only leaf-lock take and is seq-conditional-exact against a later
+//!   window's apply on the shared key; `completed_upto` is lane-gated
+//!   (a landed-but-unreached window keeps its reservation open).
+//!   Weakening-verified: the lane's ack publish Release→Relaxed and the
+//!   device's landed publish Release→Relaxed each fail it, as does
+//!   completing the reservation at submit instead of in the lane.
 //!
 //! - [`slot_gate_core`]: the PR VL5b per-slot cutover gate
 //!   (design-volume-lifecycle §5.5.2a) — invariants: after `close()` +
@@ -6131,6 +6146,501 @@ mod op_trace_ring_models {
             let mut out = consumer.join().unwrap();
             ring.drain_into(&mut out);
             assert_intact(&out, 2 + pushed);
+        });
+    }
+}
+
+#[cfg(all(test, loom))]
+mod conveyor_two_stage_models {
+    //! The D-2 **two-stage commit conveyor** (e2e perf audit DLM board #2,
+    //! `.benchmarks/2026-09-03-d2-two-stage-conveyor.md`; the protocol
+    //! argument is `src/meta_backend/kv/backend.rs`'s module doc "The
+    //! two-stage commit conveyor"). Stage A (the apply pass) reserves under
+    //! the leaf lock, applies to RAM, unlocks, SUBMITS the ring write and
+    //! hands a window to stage B through a second — real, `#[path]`-
+    //! included — [`ConveyorCore`] (enqueue then `try_lead`, no await
+    //! between). Stage B (the durability lane) drains windows in handoff
+    //! order and takes each GROUP — the head awaited + every successor
+    //! whose write already landed — through: complete the reservations in
+    //! journal order, ONE completed-prefix check, the per-window verdict
+    //! (the §4.4 pt 4 seq-conditional rollback on a FAILED write — the one
+    //! arm in which stage B takes a leaf lock), then the members' terminal
+    //! outcomes in journal order.
+    //!
+    //! The four existing conveyor models pin the handoff core's protocol;
+    //! this module pins what the two stages COMPOSE to — the laws the D-2
+    //! note states (its §"Laws the design did not anticipate" 1, 3, 4):
+    //!
+    //! 1. **Acks never leave journal order (chain reachability)** — a later
+    //!    window is never answered while an earlier window's entry is
+    //!    unlanded. Two faces: the lane's own emission order equals
+    //!    reservation order (in-lane), and any observer that sees window j
+    //!    answered sees every predecessor's write landed (cross-thread —
+    //!    the Release/Acquire chain device→lane→committer).
+    //! 2. **A parked predecessor holds its successors' answers** — with the
+    //!    head's write PARKED and a successor's already landed (even as a
+    //!    FAILURE), the successor stays unanswered until the head lands.
+    //! 3. **The failed-write rollback arm is stage B's only leaf-lock
+    //!    take** — exactly one take per failed window, seq-conditional and
+    //!    therefore exact against every later window's apply on the shared
+    //!    key (only Δtime merge records can share a key across windows).
+    //! 4. **`completed_upto` is lane-gated** — a landed write whose window
+    //!    the lane has not reached keeps its reservation OPEN; the
+    //!    watermark advances only through the lane's in-order completion,
+    //!    never through the device's completion itself.
+    //!
+    //! Weakening evidence (each verified RED, then restored — recorded in
+    //! the landing commit): the lane's ack publish (`acked` store)
+    //! Release→Relaxed fails law 1's cross-thread face (the committer
+    //! observes its successor answered and its predecessor's write not
+    //! landed — a stale read the shipped oneshot's own publication
+    //! forbids); the device's `landed` publish Release→Relaxed fails law 3
+    //! (the lane reads a stale write outcome and rolls back a window that
+    //! landed, taking a second leaf lock).
+    //!
+    //! Model shape: 3 threads (stage A + the committers' observer probe on
+    //! the model's main thread; the durability lane; the device), 3
+    //! windows sharing ONE leaf key, the device landing window 1 first AS
+    //! A FAILURE, then 0, then 2 — the out-of-order shape that puts a
+    //! parked predecessor in front of a landed failure. The in-flight
+    //! reservation registry (`journal.rs`'s `Inflight`: `reserve_registered`
+    //! / `complete` / `completed_upto`) wraps the `#[path]`-included
+    //! `JournalCore` from OUTSIDE the core in the shipped code, so its six
+    //! lines are restated here verbatim as the modeled law
+    //! (`completed_upto = min(open)`, else `head`).
+    use crate::{conveyor_core::ConveyorCore, journal_core};
+    use loom::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use loom::sync::{Arc, Mutex};
+    use loom::thread;
+    use std::collections::{BTreeMap, VecDeque};
+
+    const WINDOWS: usize = 3;
+    /// Window 1 is the one whose ring write FAILS (the rollback arm).
+    const FAILED: usize = 1;
+
+    /// `journal.rs`'s in-flight registry around the reservation core.
+    struct Ring {
+        core: journal_core::JournalCore,
+        inflight: Mutex<Inflight>,
+    }
+
+    #[derive(Default)]
+    struct Inflight {
+        /// Reservations issued but not yet completed: start → end.
+        open: BTreeMap<u64, u64>,
+        /// Every position below this has a completed reservation.
+        completed_upto: u64,
+    }
+
+    impl Ring {
+        fn new() -> Self {
+            // 2 pages × 4 entry bytes = capacity 8 for three 1-byte
+            // windows: admission never parks (the §4.4 pt 5 park is the
+            // journal models' subject).
+            let geo = journal_core::CoreGeometry {
+                page_data_len: 4,
+                pages: 2,
+                reserve_bytes: 0,
+            };
+            Self {
+                core: journal_core::JournalCore::new(geo, 0, 0),
+                inflight: Mutex::new(Inflight::default()),
+            }
+        }
+
+        /// Transfer admitted budget to the head AND register the
+        /// reservation — one mutex section (the shipped
+        /// `reserve_registered`). Called inside the leaf-lock window.
+        fn reserve_registered(&self, len: u64) -> journal_core::Reservation {
+            let adm = self
+                .core
+                .try_admit(len, journal_core::AdmissionClass::User)
+                .expect("three bytes of eight admit unconditionally");
+            let mut g = self.inflight.lock().unwrap();
+            let res = self.core.reserve(adm);
+            g.open.insert(res.start, res.end());
+            res
+        }
+
+        /// The shipped `complete`: remove, then the watermark is the
+        /// oldest still-open start, or the head when none is open.
+        fn complete(&self, res: &journal_core::Reservation) {
+            let mut g = self.inflight.lock().unwrap();
+            let removed = g.open.remove(&res.start);
+            assert!(removed.is_some(), "double-complete of a reservation");
+            g.completed_upto = match g.open.first_key_value() {
+                Some((start, _)) => *start,
+                None => self.core.head(),
+            };
+        }
+
+        fn completed_upto(&self) -> u64 {
+            self.inflight.lock().unwrap().completed_upto
+        }
+
+        fn is_open(&self, start: u64) -> bool {
+            self.inflight.lock().unwrap().open.contains_key(&start)
+        }
+
+        fn open_count(&self) -> usize {
+            self.inflight.lock().unwrap().open.len()
+        }
+    }
+
+    /// The one RAM leaf record every window applies to (the Δtime-merge
+    /// class — the only records that legitimately share a key across
+    /// windows); `seq` is the applying entry's seq (its reservation start).
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    struct LeafRec {
+        value: u64,
+        seq: u64,
+    }
+
+    /// One conveyor window: the batch past its RAM apply with its
+    /// reservation and the §4.4 pt 4 first-touch pre-image.
+    struct Window {
+        idx: usize,
+        res: journal_core::Reservation,
+        undo: LeafRec,
+    }
+
+    struct Shared {
+        ring: Ring,
+        leaf: Mutex<LeafRec>,
+        /// Stage A's "the ring write is in flight" (the device lands only
+        /// submitted writes).
+        submitted: [AtomicBool; WINDOWS],
+        /// The `WriteCompletion` oneshot stand-in: the device publishes the
+        /// outcome (`write_ok`) and then `landed` (Release); the lane
+        /// probes/awaits `landed` (Acquire).
+        landed: [AtomicBool; WINDOWS],
+        write_ok: [AtomicBool; WINDOWS],
+        /// The members' oneshot answers: the lane publishes `ack_ok` then
+        /// `acked` (Release) at the terminal outcome; committers observe
+        /// `acked` (Acquire).
+        acked: [AtomicBool; WINDOWS],
+        ack_ok: [AtomicBool; WINDOWS],
+        /// Stage B leaf-lock takes (the rollback arm is the only one).
+        lane_leaf_takes: AtomicUsize,
+        /// The lane's emission cursor: the next window index to answer.
+        next_ack: AtomicUsize,
+        durability_passes: AtomicUsize,
+    }
+
+    impl Shared {
+        fn new() -> Self {
+            Self {
+                ring: Ring::new(),
+                leaf: Mutex::new(LeafRec { value: 0, seq: 0 }),
+                submitted: [
+                    AtomicBool::new(false),
+                    AtomicBool::new(false),
+                    AtomicBool::new(false),
+                ],
+                landed: [
+                    AtomicBool::new(false),
+                    AtomicBool::new(false),
+                    AtomicBool::new(false),
+                ],
+                write_ok: [
+                    AtomicBool::new(false),
+                    AtomicBool::new(false),
+                    AtomicBool::new(false),
+                ],
+                acked: [
+                    AtomicBool::new(false),
+                    AtomicBool::new(false),
+                    AtomicBool::new(false),
+                ],
+                ack_ok: [
+                    AtomicBool::new(false),
+                    AtomicBool::new(false),
+                    AtomicBool::new(false),
+                ],
+                lane_leaf_takes: AtomicUsize::new(0),
+                next_ack: AtomicUsize::new(0),
+                durability_passes: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    /// The value window `idx`'s apply writes into the leaf.
+    fn value_of(idx: usize) -> u64 {
+        10 + idx as u64
+    }
+
+    /// Park until `flag` publishes (the oneshot await / the device's
+    /// submission wait): a yielding spin, which is how loom models a
+    /// blocking wait on another thread's progress.
+    fn await_flag(flag: &AtomicBool) {
+        while !flag.load(Ordering::Acquire) {
+            thread::yield_now();
+        }
+    }
+
+    /// **Stage A** for one window (`run_batch`'s pipeline, one tx per
+    /// batch): pre-image + in-lock reserve + RAM apply under the leaf
+    /// lock, unlock BEFORE the submission, submit, then the handoff's two
+    /// uninterruptible steps. Returns `true` when the caller won lane
+    /// leadership and must arrange the lane.
+    fn stage_a(sh: &Arc<Shared>, lane: &Arc<ConveyorCore<Window>>, idx: usize) -> bool {
+        let res = {
+            let mut leaf = sh.leaf.lock().unwrap();
+            let undo = leaf.clone();
+            let res = sh.ring.reserve_registered(1);
+            *leaf = LeafRec {
+                value: value_of(idx),
+                seq: res.start,
+            };
+            drop(leaf);
+            sh.submitted[idx].store(true, Ordering::Release);
+            (res, undo)
+        };
+        lane.enqueue(
+            Window {
+                idx,
+                res: res.0,
+                undo: res.1,
+            },
+            1,
+        );
+        lane.try_lead()
+    }
+
+    /// **Stage B** — `durability_lane_task` + `run_windows`: the pass loop
+    /// of whoever holds lane leadership (the spawned lane, or stage A
+    /// itself when its later election won an exited lane).
+    fn lane_loop(sh: &Arc<Shared>, lane: &Arc<ConveyorCore<Window>>) {
+        let mut carry: VecDeque<Window> = VecDeque::new();
+        loop {
+            if carry.is_empty() {
+                carry.extend(lane.drain(usize::MAX, u64::MAX));
+            }
+            let Some(head) = carry.pop_front() else {
+                if !lane.unlead_and_recheck() {
+                    return;
+                }
+                continue;
+            };
+            sh.durability_passes.fetch_add(1, Ordering::Relaxed);
+
+            // (8) Await the head's write; then take every landed successor.
+            await_flag(&sh.landed[head.idx]);
+            let mut group = vec![head];
+            while carry
+                .front()
+                .is_some_and(|w| sh.landed[w.idx].load(Ordering::Acquire))
+            {
+                group.push(carry.pop_front().expect("probed front"));
+            }
+
+            // Completion is unconditional and lane-owned, in journal order,
+            // so `completed_upto` walks forward through the group.
+            for w in &group {
+                sh.ring.complete(&w.res);
+            }
+            // ONE completed-prefix wait per group. The lane is the only
+            // completer in this model (no checkpoint task), so its own
+            // in-order completion must already satisfy it — a wait that
+            // could park proves nothing here, an assertion does.
+            let group_end = group.last().expect("head").res.end();
+            assert!(
+                sh.ring.completed_upto() >= group_end,
+                "the group's in-order completion did not carry the watermark to its end"
+            );
+
+            // (9) Per window, in order: the success arm or the rollback
+            // arm — the ONE arm in which stage B takes a leaf lock.
+            let mut verdicts = Vec::with_capacity(group.len());
+            for w in &group {
+                let ok = sh.write_ok[w.idx].load(Ordering::Relaxed);
+                if !ok {
+                    sh.lane_leaf_takes.fetch_add(1, Ordering::Relaxed);
+                    let mut leaf = sh.leaf.lock().unwrap();
+                    // §4.4 pt 4 seq-conditional: restore the pre-image only
+                    // if this window's apply is still the newest on the
+                    // key (skip-if-newer — LWW-correct for the merge class).
+                    if leaf.seq == w.res.start {
+                        *leaf = w.undo.clone();
+                    }
+                }
+                verdicts.push(ok);
+            }
+
+            // (11) Terminal outcomes, window by window in journal order.
+            for (w, ok) in group.into_iter().zip(verdicts) {
+                let expected = sh.next_ack.fetch_add(1, Ordering::Relaxed);
+                assert_eq!(
+                    w.idx, expected,
+                    "an ack left journal order (window {} answered when {} was next)",
+                    w.idx, expected
+                );
+                sh.ack_ok[w.idx].store(ok, Ordering::Relaxed);
+                // The oneshot send — the publication every committer's
+                // "my predecessors are durable-reachable" belief rides.
+                // WEAKENING TARGET: Relaxed here fails the committer probe.
+                sh.acked[w.idx].store(true, Ordering::Release);
+            }
+        }
+    }
+
+    /// Laws 1–4 under the out-of-order device shape: window 1's write
+    /// lands first and FAILS while window 0's is parked, then 0 lands OK,
+    /// then 2 (which stage A submits racing the lane). Every interleaving
+    /// of stage A's third window, the lane's groups and the device's
+    /// landings is explored.
+    #[test]
+    fn two_stage_acks_in_journal_order_parked_head_holds_successors_rollback_only_leaf_taker() {
+        loom::model(|| {
+            let sh = Arc::new(Shared::new());
+            // The durability lane: a second core, ungauged like the
+            // shipped one.
+            let lane: Arc<ConveyorCore<Window>> = Arc::new(ConveyorCore::with_gauge(None));
+
+            // Stage A, windows 0 and 1: the first handoff elects the lane
+            // (fresh core); the second finds it led — it holds leadership
+            // parked on window 0's write, which cannot land before the
+            // device exists.
+            assert!(stage_a(&sh, &lane, 0), "the first handoff elects the lane");
+            let lane_thread = {
+                let sh = Arc::clone(&sh);
+                let lane = Arc::clone(&lane);
+                thread::spawn(move || lane_loop(&sh, &lane))
+            };
+            assert!(
+                !stage_a(&sh, &lane, 1),
+                "a live lane parked on the head owns the second window"
+            );
+
+            // The device: lands window 1 FIRST, as a failure, probes the
+            // parked-predecessor and lane-gating laws, then lands 0 and 2.
+            let device = {
+                let sh = Arc::clone(&sh);
+                thread::spawn(move || {
+                    sh.write_ok[FAILED].store(false, Ordering::Relaxed);
+                    // WEAKENING TARGET: Relaxed here lets the lane read a
+                    // stale outcome for a landed window (law 3 fails).
+                    sh.landed[FAILED].store(true, Ordering::Release);
+
+                    // Law 2: window 0 is unlanded (this thread lands it
+                    // next), so window 1's FAILURE answer must still be
+                    // withheld — and so must everything behind it.
+                    assert!(
+                        !sh.acked[FAILED].load(Ordering::Acquire),
+                        "a landed successor was answered while its predecessor's write \
+                         was parked (acks left journal order)"
+                    );
+                    assert!(
+                        !sh.acked[2].load(Ordering::Acquire),
+                        "an unlanded window was answered"
+                    );
+                    // Law 4: the landed-but-unreached window keeps its
+                    // reservation open and the watermark sits at the
+                    // parked head — the device's completion moved nothing.
+                    assert!(
+                        sh.ring.is_open(FAILED as u64),
+                        "a landed write's reservation completed before the lane reached it \
+                         (completed_upto is lane-gated)"
+                    );
+                    assert_eq!(
+                        sh.ring.completed_upto(),
+                        0,
+                        "completed_upto advanced past a parked head"
+                    );
+
+                    sh.write_ok[0].store(true, Ordering::Relaxed);
+                    sh.landed[0].store(true, Ordering::Release);
+                    // Window 2 lands only once stage A has submitted it.
+                    await_flag(&sh.submitted[2]);
+                    sh.write_ok[2].store(true, Ordering::Relaxed);
+                    sh.landed[2].store(true, Ordering::Release);
+                })
+            };
+
+            // Stage A, window 2 — racing the lane's groups. If the lane
+            // already drained everything and exited (release-then-recheck),
+            // this election wins and stage A's task runs the lane pass
+            // itself (the shipped spawn-on-win, modeled inline).
+            if stage_a(&sh, &lane, 2) {
+                lane_loop(&sh, &lane);
+            }
+
+            // Law 1, the committer's face: a committer that sees window j
+            // answered must see every predecessor's write landed — the
+            // chain-reachability belief the ack carries. Loads of `landed`
+            // are Relaxed on purpose: the edge must come from the ack.
+            if sh.acked[1].load(Ordering::Acquire) {
+                assert!(
+                    sh.landed[0].load(Ordering::Relaxed),
+                    "window 1 answered without window 0's write visible-landed \
+                     (the ack publish is load-bearing)"
+                );
+            }
+            if sh.acked[2].load(Ordering::Acquire) {
+                assert!(
+                    sh.landed[0].load(Ordering::Relaxed) && sh.landed[1].load(Ordering::Relaxed),
+                    "window 2 answered without both predecessors' writes visible-landed"
+                );
+            }
+            // Law 4, the observer's face: the watermark never runs ahead
+            // of a landed write (the registry mutex carries the edge).
+            let cu = sh.ring.completed_upto();
+            for k in 0..WINDOWS {
+                if cu > k as u64 {
+                    assert!(
+                        sh.landed[k].load(Ordering::Relaxed),
+                        "completed_upto {cu} covers window {k}, whose write has not landed"
+                    );
+                }
+            }
+
+            device.join().unwrap();
+            lane_thread.join().unwrap();
+
+            // Quiesce: every window answered, in journal order, with the
+            // failed window's members refused and the others acked.
+            assert_eq!(sh.next_ack.load(Ordering::Relaxed), WINDOWS);
+            for k in 0..WINDOWS {
+                assert!(
+                    sh.acked[k].load(Ordering::Acquire),
+                    "window {k} never answered"
+                );
+                assert_eq!(
+                    sh.ack_ok[k].load(Ordering::Relaxed),
+                    k != FAILED,
+                    "window {k}'s verdict"
+                );
+            }
+            // Law 3: exactly one stage-B leaf-lock take (the failed
+            // window's rollback), and the rollback was exact against the
+            // later window's apply on the shared key: whether it ran
+            // before or after stage A applied window 2, the leaf ends at
+            // window 2's value under window 2's seq.
+            assert_eq!(
+                sh.lane_leaf_takes.load(Ordering::Relaxed),
+                1,
+                "stage B took a leaf lock outside the failed-write rollback arm"
+            );
+            assert_eq!(
+                *sh.leaf.lock().unwrap(),
+                LeafRec {
+                    value: value_of(2),
+                    seq: 2
+                },
+                "the seq-conditional rollback clobbered a later window's apply"
+            );
+            // Law 4 at quiesce: every reservation completed by the lane;
+            // the watermark reached the head exactly.
+            assert_eq!(sh.ring.open_count(), 0);
+            assert_eq!(sh.ring.completed_upto(), sh.ring.core.head());
+            assert_eq!(sh.ring.core.head(), WINDOWS as u64);
+            let passes = sh.durability_passes.load(Ordering::Relaxed);
+            assert!(
+                (1..=WINDOWS).contains(&passes),
+                "one to three durability passes ({passes})"
+            );
+            assert_eq!(lane.pending(), 0, "no window left queued");
+            assert!(lane.try_lead(), "lane leadership released at quiesce");
         });
     }
 }

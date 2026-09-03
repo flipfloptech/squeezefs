@@ -312,6 +312,17 @@ with a 5 % tail ≥ 4 ms, on the path from a page-cache write to the lane.
    at the D-1b tip (`Grant.required_segments` / `plan_range` 4-arg drift in
    the grant-table models, foreign to this campaign), so the models were
    not RE-RUN here. Fix the drift, run `tests/run_loom.sh`.
+   **Discharged (`fix/loom-models-drift`)**: the drift was the finding-31
+   `block_size` argument (the file geometry; `0` = the pre-f31 merge) and
+   the honest claim-segment list — the range-custody models now carry a
+   real geometry so the head-clip arm runs under the race; all 99 prior
+   models re-run green at `LOOM_MAX_PREEMPTIONS=3` (≈ 8 s wall), and a
+   NEW two-stage model (`conveyor_two_stage_models`, 3 threads × 3
+   windows, 34 k bounded iterations) pins laws 1, 3 and 4 above plus the
+   parked-predecessor form of the ack order — weakening-verified RED on
+   the lane's ack publish (Release→Relaxed), on the device's landed
+   publish (Release→Relaxed) and on completing the reservation at submit.
+   `task check:loom` now compiles the crate inside `task check`.
 3. DLM #3 (C-2: the resident pass task on `sqz_notify`, fan-out on the
    committer's lane) — the wake-hop residue is now the dominant term in
    `journal_ring_write` (a ~860 B page-cache write reads 650 µs on the

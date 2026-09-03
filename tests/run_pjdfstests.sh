@@ -89,6 +89,19 @@ if ! command -v prove &>/dev/null; then
     echo "ERROR: 'prove' (perl Test::Harness) not found." >&2
     exit 1
 fi
+# pjdfstest's misc.sh `namegen` pipes /dev/urandom through `openssl md5`;
+# without the binary every generated name collapses to "pjdfstest_" and
+# tests needing DISTINCT names collide. NixOS boxes carry it only via nix.
+if ! command -v openssl &>/dev/null; then
+    if command -v nix &>/dev/null; then
+        ossl=$(nix build 'nixpkgs#openssl.bin' --no-link --print-out-paths 2>/dev/null | tail -1)
+        [ -n "$ossl" ] && [ -x "$ossl/bin/openssl" ] && export PATH="$PATH:$ossl/bin"
+    fi
+    if ! command -v openssl &>/dev/null; then
+        echo "ERROR: 'openssl' not found (pjdfstest namegen needs it)." >&2
+        exit 1
+    fi
+fi
 
 # 2. Build Squeezefs release binary
 cd "$REPO_DIR"

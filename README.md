@@ -36,7 +36,7 @@ The client daemon routes each write by size: tiny payloads are stored inside the
 
 ## Performance
 
-Measured on a 5-node NVMe-oF/TCP fabric (memory-backed targets) with a 32-core client, interception mode, build `c985fa8c`:
+Measured on a 5-node NVMe-oF/TCP fabric (memory-backed targets) with a 32-core client, using the `LD_PRELOAD` interception shim (the data path that bypasses the kernel for applications that load it), build `c985fa8c`:
 
 | Read bandwidth | Write bandwidth | Read IOPS (4 KiB) | Write IOPS (4 KiB) |
 |:---:|:---:|:---:|:---:|

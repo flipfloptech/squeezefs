@@ -1,0 +1,100 @@
+From 2b1ae48290661b672372fe65014de8b9322778fd Mon Sep 17 00:00:00 2001
+From: Joanne Koong <joannelkoong@gmail.com>
+Date: Fri, 16 Jan 2026 15:30:24 -0800
+Subject: [PATCH 05/25] io_uring/kbuf: support kernel-managed buffer rings in
+ buffer selection
+
+Allow kernel-managed buffers to be selected. This requires modifying the
+io_br_sel struct to separate the fields for address and val, since a
+kernel address cannot be distinguished from a negative val when error
+checking.
+
+Auto-commit any selected kernel-managed buffer.
+
+Signed-off-by: Joanne Koong <joannelkoong@gmail.com>
+Tested-by: syzbot@syzkaller.appspotmail.com
+
+[sqz 7.2.3 rebase] Composed with 7.2's user-pointer validation in io_ring_buffer_select() (sel.addr assigned + access_ok() checked BEFORE any req->flags mutation): the kernel-managed arm assigns sel.kaddr and bypasses access_ok() (a kernel address is never user-accessible), the user arm keeps 7.2's check verbatim.
+---
+ include/linux/io_uring_types.h |  8 ++++----
+ io_uring/kbuf.c                | 23 ++++++++++++++++-------
+ 2 files changed, 20 insertions(+), 11 deletions(-)
+
+diff --git a/include/linux/io_uring_types.h b/include/linux/io_uring_types.h
+index dac5b2cb8..d0cd77651 100644
+--- a/include/linux/io_uring_types.h
++++ b/include/linux/io_uring_types.h
+@@ -118,13 +118,13 @@ struct io_mapped_region {
+  */
+ struct io_br_sel {
+ 	struct io_buffer_list *buf_list;
+-	/*
+-	 * Some selection parts return the user address, others return an error.
+-	 */
+ 	union {
++		/* for classic/ring provided buffers */
+ 		void __user *addr;
+-		ssize_t val;
++		/* for kernel-managed buffers */
++		void *kaddr;
+ 	};
++	ssize_t val;
+ };
+ 
+ 
+diff --git a/io_uring/kbuf.c b/io_uring/kbuf.c
+index f71dc4c65..6fd0d02cc 100644
+--- a/io_uring/kbuf.c
++++ b/io_uring/kbuf.c
+@@ -168,7 +168,8 @@ static int io_provided_buffers_select(struct io_kiocb *req, size_t *len,
+ 	return 1;
+ }
+ 
+-static bool io_should_commit(struct io_kiocb *req, unsigned int issue_flags)
++static bool io_should_commit(struct io_kiocb *req, struct io_buffer_list *bl,
++			     unsigned int issue_flags)
+ {
+ 	/*
+ 	* If we came in unlocked, we have no choice but to consume the
+@@ -183,7 +184,11 @@ static bool io_should_commit(struct io_kiocb *req, unsigned int issue_flags)
+ 	if (issue_flags & IO_URING_F_UNLOCKED)
+ 		return true;
+ 
+-	/* uring_cmd commits kbuf upfront, no need to auto-commit */
++/* kernel-managed buffers are auto-committed */
++	if (bl->flags & IOBL_KERNEL_MANAGED)
++		return true;
++
++	/* multishot uring_cmd commits kbuf upfront, no need to auto-commit */
+ 	if (!io_file_can_poll(req) && !io_is_uring_cmd(req))
+ 		return true;
+ 	return false;
+@@ -210,16 +215,20 @@ static struct io_br_sel io_ring_buffer_select(struct io_kiocb *req, size_t *len,
+ 	buf_len = READ_ONCE(buf->len);
+ 	if (*len == 0 || *len > buf_len)
+ 		*len = buf_len;
+-	sel.addr = u64_to_user_ptr(READ_ONCE(buf->addr));
+-	if (unlikely(!access_ok(sel.addr, *len))) {
+-		sel.addr = NULL;
+-		return sel;
++	if (bl->flags & IOBL_KERNEL_MANAGED) {
++		sel.kaddr = (void *)(uintptr_t)READ_ONCE(buf->addr);
++	} else {
++		sel.addr = u64_to_user_ptr(READ_ONCE(buf->addr));
++		if (unlikely(!access_ok(sel.addr, *len))) {
++			sel.addr = NULL;
++			return sel;
++		}
+ 	}
+ 	req->flags |= REQ_F_BUFFER_RING | REQ_F_BUFFERS_COMMIT;
+ 	req->buf_index = READ_ONCE(buf->bid);
+ 	sel.buf_list = bl;
+ 
+-	if (io_should_commit(req, issue_flags)) {
++if (io_should_commit(req, bl, issue_flags)) {
+ 		if (!io_kbuf_commit(req, sel.buf_list, *len, 1))
+ 			req->flags |= REQ_F_BUF_MORE;
+ 		sel.buf_list = NULL;
+-- 
+2.55.0
+

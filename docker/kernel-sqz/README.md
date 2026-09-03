@@ -50,11 +50,12 @@ maintained; do not resurrect it.
 |---|---|
 | `Dockerfile` | pinned EL8 build image (gcc-toolset-14, from-source pahole v1.30 for BTF) |
 | `build.sh` | host wrapper: image build + capped (`--cpus 16`, `nice`) kernel build; artifacts → `dist/kernel-sqz/` |
-| `build-kernel.sh` | in-container: sha256-pinned tarball → 30 patches → config assembly → checklist assertion (fail loud) → `make binrpm-pkg` |
-| `SERIES.md` | the series manifest: message-ids, base ruling, conflict resolutions, 0025/0029 |
+| `build-kernel.sh` | in-container: sha256-pinned tarball → the track's series → config assembly → checklist assertion (fail loud) → `make binrpm-pkg`. **`TRACK=6.19.14` (default, the FIELD build) / `7.1` / `7.2`** selects `patches-$TRACK/` + the pinned `KVER`/sha256 from its table — see *Build* below |
+| `SERIES.md` | the series manifest: message-ids, base ruling, conflict resolutions, 0025/0029, the 7.2 track's per-patch table |
 | `V2-CANDIDATES.md` | the v2 scoping manifest (ranked candidates; rank 1 = TIME_LIMITS, now patch 0028) |
 | `patches/` | `git format-patch` export (0001–0024 Koong + 0025 abort-race + 0026 docs + 0027 seam + 0028 TIME_LIMITS + 0029 retention + 0030 nvme host-scoped subsystems — rung 5b) |
 | `patches-7.1/` | the **linux-7.1.6 rebase** of the same 30 patches (the D13 latest-mainline track — 0030 was AUTHORED here first; see *The 7.1 track* below) |
+| `patches-7.2/` | the **linux-7.2.3 rebase** — **25 patches**: the same series minus the five FUSE prep-refactors upstream 7.2 landed (renumbered contiguously; mapping in *The 7.2 track* below and SERIES.md) |
 | `config-base-7.1.2-1.el8.elrepo.x86_64` | the field client's running config (the base; copied read-only 2026-08-01) |
 | `config-fragment` | the ENABLE CHECKLIST — every entry asserted in the final `.config` |
 | `probes/` | capability probes (see below) |
@@ -89,7 +90,16 @@ All gcc-8.5-clean, no libnl/liburing — they compile on the field box.
 ```bash
 docker/kernel-sqz/build.sh            # podman or docker
 # → dist/kernel-sqz/kernel-*.rpm + config-6.19.14-sqz + SHA256SUMS
+TRACK=7.2 docker/kernel-sqz/build.sh  # the 7.2.3 track (25 patches) → config-7.2.3-sqz
 ```
+
+`TRACK` (default `6.19.14` — **the FIELD build, unchanged**) selects the
+row in `build-kernel.sh`'s table: `6.19.14` → `patches/`, `7.1` →
+`patches-7.1/` on linux-7.1.6, `7.2` → `patches-7.2/` on linux-7.2.3
+(each row pins its tarball sha256; an unknown value refuses loud). The
+config assembly is the same for every track (client base config →
+`olddefconfig` → `config-fragment` checklist), so the checklist
+assertion — not the track — decides whether a build is acceptable.
 
 ## Install on the field client (safe-boot discipline)
 
@@ -188,3 +198,106 @@ concatenated patch is stacked per-commit diffs: it applies sequentially
 file against a pristine tree reports false failures for later hunks
 that depend on earlier patches in the same file (identical behavior to
 the 6.19 artifact — verified as the control).
+
+## The 7.2 track (`patches-7.2/`) — D13 latest-mainline rebase, 2026-09-03
+
+**Base: linux-7.2.3** (kernel.org stable; the newest 7.2.y on
+2026-09-03 per `releases.json`; sha256
+`8ba259e8e7b13ec6ef0941c8a39ad90b24bd4a4d6c0010ba6bafb794550ecd03`
+from `v7.x/sha256sums.asc`). The 7.1 track's 30 patches semantically
+rebased by the 7.1 recipe (scratch git repo, 7.1.6 orphan base as the
+apply control, `git rebase --onto` 7.2.3 for true three-way merges,
+`git format-patch` export, `patch -p1 --fuzz=0` re-verified on a fresh
+extraction). **6.19.14 stays the FIELD series**; 7.1 and 7.2 are the
+D13 latest-mainline tracks (7.2 supersedes 7.1 as "latest"; 7.1 stays
+in the tree because it is the locally-booted CachyOS line).
+
+**The series is 25 patches on 7.2 — five DROPPED because upstream 7.2
+landed them.** Koong's FUSE prep refactors (v4 patches 13–17: next-req
+split, header copy to/from ring, enum header types, copy-state setup)
+merged in the 7.2 cycle as the `fuse-uring:` series (`6813da095068`,
+`6582f8a06698`, `ba7d47897fd8`, `b2bbd7dcd243`, `c0f9203732fc` — all
+2026-06-15 on torvalds/linux.git). The kmbuf io_uring infrastructure
+(01–12), the rsrc bvec half (20–23), the FUSE consumers (18, 19, 24)
+and the sqz patches did NOT land and stay in the series. Numbering is
+contiguous after the drop: **7.1 0018→0013, 0019→0014, 0020–0024→
+0015–0019, 0025–0030→0020–0025** (0001–0012 unchanged) — so the
+TIME_LIMITS / retention / nvme patches are **0023 / 0024 / 0025** on
+this track. The per-patch table (clean / rebased-which-hunks /
+dropped-with-upstream-id) is SERIES.md → *The 7.2 track*.
+
+Beyond the landed refactors, 7.2 changed three things the series
+composes with: the **`fuse_conn → fuse_chan` split** (`ring->chan`,
+`fch->lock`/`fch->ring`/`fch->connected`, `fuse_dev_i.h` split out of
+`fuse_i.h` — every added `fc` site in 0014/0019/0024 renamed);
+**`access_ok()` validation in `io_ring_buffer_select()`**
+(`46800585ae04` — the kernel-managed arm bypasses it, the user arm
+keeps it; 0005/0011); and **derived huge-page accounting in rsrc**
+(`df0a52537c0f` removed `imu->acct_pages`; 0008/0016/0017). One
+adaptation was found by the compile proof rather than the merge:
+`7d87a5a284bb` routes `commit_fetch()`'s `set_commit` WARN arm through
+`fuse_uring_req_end()`, whose zc form (0019) takes `issue_flags` and
+unregisters through `ent->cmd` — that arm reaches it with
+`ent->cmd == NULL`, so the unregister is now guarded on `ent->cmd`
+(the slot is released at ring-fd teardown). Concatenated manager-ready
+form: **`~/sqz-kmbuf-zc-7.2.3-v1.patch`** = `cat patches-7.2/00*.patch`
+(sha256 `d977fafffe67dfe5429226331267a2c74220ca73c3d9280390056824ca77697a`)
+— sequential `patch -p1 --fuzz=0` clean 25/25 on a fresh pristine
+7.2.3 extraction; single-shot real apply 0 rejects, tree identical to
+the per-patch apply; the naive single-shot `--dry-run` shows the same
+false-FAILED class as the 6.19/7.1 artifacts. Compile-proof:
+`make io_uring/ fs/fuse/ drivers/nvme/host/ drivers/block/ublk_drv.o`
+with the running CachyOS `7.1.8-cachyos-lto` config (`olddefconfig`,
+gcc) on pristine vs patched 7.2.3 — **0 warnings both**, `W=1` on the
+eleven touched TUs empty both. Not boot-tested (no reboot on the
+critical path; the user builds kernels).
+
+### ABI/opcode audit — NO collision, NO renumbering, NO new rung
+
+* `include/uapi/linux/io_uring.h` is **byte-identical 7.1.6 → 7.2.3**:
+  `IORING_REGISTER_BPF_FILTER` still 37, `IORING_REGISTER_LAST` = 38,
+  so the 7.1 track's **38/39** pair is free and **unchanged** on 7.2
+  (verified in the built tree: `IORING_REGISTER_KMBUF_RING=38`,
+  `IORING_UNREGISTER_KMBUF_RING=39`, `register.c` dispatch cases).
+  `IORING_OFF_KMBUF_RING 0x88000000` still free (PBUF 0x80000000,
+  PARAM 0x20000000, ZCRX 0x30000000, mask 0xf8000000; `memmap.c`
+  gains the case). **The daemon's probe ladder needs no new rung**: a
+  7.2-sqz kernel resolves on rung 2 exactly like 7.1-sqz (rung 1's
+  occupant is the same `BPF_FILTER` import-EINVAL, so the
+  false-Present argument transfers verbatim), and `kmbuf_smoke.c` /
+  `crates/fuse3/src/raw/connection/kmbuf.rs` are untouched. The
+  `KmbufTrack::Sqz71` identity (the zc opcode mirror's key: 7.1's
+  page-buffered readdir) also covers 7.2 — same FUSE readdir shape,
+  same base family; re-measure the mirror if a future 7.x changes it.
+* `include/uapi/linux/fuse.h` is **byte-identical 7.1.6 → 7.2.3**:
+  `FUSE_KERNEL_MINOR_VERSION` **45** (the daemon replies
+  `min(kernel, 36)` — negotiation unaffected), init-flag watermark
+  still bit 42 (`FUSE_REQUEST_TIMEOUT`) so `FUSE_TIME_LIMITS
+  (1ULL<<62)` stays clear, `fuse_uring_cmd_req` still 24 bytes with the
+  `init`/`commit` union free (`FUSE_URING_BUF_RING`/`ZERO_COPY`/
+  `PAYLOAD_RETENTION` bits 0/1/2, `FUSE_URING_COMMIT_RETAIN` bit 0),
+  `enum fuse_uring_cmd` ends at 2 so `FUSE_IO_URING_CMD_RELEASE_PAYLOAD=3`
+  is free, `fuse_init_out.unused[11]` still the carve-out 0023 uses.
+* nvme: no upstream `host_scope`/`fabrics_host_scoped_subsystems`
+  symbol in 7.2.3; 0025 applies with an identical patch-id (the touched
+  regions are code-identical 7.1.6 → 7.2.3).
+
+### Port ledger (patch → what changed vs the 7.1 series)
+
+Unlisted patches applied identically (same patch-id). 7.2 numbers.
+
+| Patch | Adaptation on 7.2.3 |
+|---|---|
+| 0005 kmbuf selection | kernel-managed arm assigns `sel.kaddr` and bypasses 7.2's new `access_ok()` user-pointer check; user arm keeps the check verbatim |
+| 0008 fixed_index get/put | add/add adjacency with upstream's `io_buffer_acct_cloned_hpages()`; both kept |
+| 0011 buffer id | only the `sel.buf_id` line lands (addr assignment relocated by 05) |
+| 0014 FUSE kmbuf (was 0019) | `fuse_chan` split (`ring->chan`, `fch->*`), header helpers re-expressed on upstream's offset-returning `ring_header_type_offset()` (`get_kernel_ring_header()` advances the iter by that offset; user arms compute `ent->headers + offset`), `fuse_pqueue_alloc()`, `kzalloc_obj(*ent)`, `READ_ONCE(ring->queues[qid])`, `FUSE_URING_IOV_{HEADERS,PAYLOAD}`, `#include "fuse_dev_i.h"` |
+| 0015 bvec rename (was 0020) | context-only drift (`blk_rq_has_data()` in ublk) |
+| 0016 register split (was 0021) | `imu->acct_pages = 0` dropped (field removed upstream) |
+| 0017 optional release (was 0022) | composes with the derived-local `acct_pages` in `io_buffer_unmap()` |
+| 0019 FUSE zc (was 0024) | `fch->ring`; the new 7.2 `req_end` site in `commit_fetch` gains `issue_flags` and the zc unregister is guarded on `ent->cmd` (see above) |
+| 0024 retention (was 0029) | `fuse_uring_release_payload(…, struct fuse_chan *fch)`, `READ_ONCE` queue load, `zero_copied && !retain && ent->cmd`, the 7.2 `req_end` site passes `false` |
+
+7.2 lives in the same CachyOS kernel-manager posture as 7.1 (the notes
+above apply verbatim); the manager's next base bump to a 7.2.y is
+where this concat gets its first boot.

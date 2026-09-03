@@ -1,0 +1,80 @@
+From ec6d0f855e428c8fcc3127ed9ca47c63ffb10c80 Mon Sep 17 00:00:00 2001
+From: Joanne Koong <joannelkoong@gmail.com>
+Date: Fri, 16 Jan 2026 15:30:30 -0800
+Subject: [PATCH 11/25] io_uring/kbuf: return buffer id in buffer selection
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Return the id of the selected buffer in io_buffer_select(). This is
+needed for kernel-managed buffer rings to later recycle the selected
+buffer.
+
+Signed-off-by: Joanne Koong <joannelkoong@gmail.com>
+Tested-by: syzbot@syzkaller.appspotmail.com
+
+[sqz 7.1.6 rebase] Context-only drift vs 7.1's io_buffer_select (ctx local); no semantic change.
+
+[sqz 7.2.3 rebase] Only the sel.buf_id line lands after sel.buf_list — the kaddr/addr assignment moved above the access_ok() check in the 7.2 form of patch 05.
+---
+ include/linux/io_uring/cmd.h   | 2 +-
+ include/linux/io_uring_types.h | 2 ++
+ io_uring/kbuf.c                | 7 +++++--
+ 3 files changed, 8 insertions(+), 3 deletions(-)
+
+diff --git a/include/linux/io_uring/cmd.h b/include/linux/io_uring/cmd.h
+index 08ba3e24c..ffa9a256b 100644
+--- a/include/linux/io_uring/cmd.h
++++ b/include/linux/io_uring/cmd.h
+@@ -86,7 +86,7 @@ void io_uring_cmd_issue_blocking(struct io_uring_cmd *ioucmd);
+ 
+ /*
+  * Select a buffer from the provided buffer group for multishot uring_cmd.
+- * Returns the selected buffer address and size.
++ * Returns the selected buffer address, size, and id.
+  */
+ struct io_br_sel io_uring_cmd_buffer_select(struct io_uring_cmd *ioucmd,
+ 					    unsigned buf_group, size_t *len,
+diff --git a/include/linux/io_uring_types.h b/include/linux/io_uring_types.h
+index d0cd77651..673f0909d 100644
+--- a/include/linux/io_uring_types.h
++++ b/include/linux/io_uring_types.h
+@@ -125,6 +125,8 @@ struct io_br_sel {
+ 		void *kaddr;
+ 	};
+ 	ssize_t val;
++	/* id of the selected buffer */
++	unsigned buf_id;
+ };
+ 
+ 
+diff --git a/io_uring/kbuf.c b/io_uring/kbuf.c
+index c7a9d3615..632b7c05f 100644
+--- a/io_uring/kbuf.c
++++ b/io_uring/kbuf.c
+@@ -273,6 +273,7 @@ struct io_br_sel io_ring_buffer_select(struct io_kiocb *req, size_t *len,
+ 	req->flags |= REQ_F_BUFFER_RING | REQ_F_BUFFERS_COMMIT;
+ 	req->buf_index = READ_ONCE(buf->bid);
+ 	sel.buf_list = bl;
++	sel.buf_id = req->buf_index;
+ 
+ if (io_should_commit(req, bl, issue_flags)) {
+ 		if (!io_kbuf_commit(req, sel.buf_list, *len, 1))
+@@ -294,10 +295,12 @@ struct io_br_sel io_buffer_select(struct io_kiocb *req, size_t *len,
+ 
+ 	bl = io_buffer_get_list(ctx, buf_group);
+ 	if (likely(bl)) {
+-		if (bl->flags & IOBL_BUF_RING)
++		if (bl->flags & IOBL_BUF_RING) {
+ 			sel = io_ring_buffer_select(req, len, bl, issue_flags);
+-		else
++		} else {
+ 			sel.addr = io_provided_buffer_select(req, len, bl);
++			sel.buf_id = req->buf_index;
++		}
+ 	}
+ 	io_ring_submit_unlock(ctx, issue_flags);
+ 	return sel;
+-- 
+2.55.0
+

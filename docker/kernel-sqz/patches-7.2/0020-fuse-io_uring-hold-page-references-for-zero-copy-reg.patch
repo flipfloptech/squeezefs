@@ -1,0 +1,212 @@
+From 0b1678588be828e0a3b97512d7f7e28d1814e2a2 Mon Sep 17 00:00:00 2001
+From: sqz kernel recipe <sqz-kernel@squeezefs>
+Date: Sun, 9 Aug 2026 07:40:00 -0400
+Subject: [PATCH 20/25] fuse/io_uring: hold page references for zero-copy
+ registrations
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+fuse/io_uring: hold page references for zero-copy registrations
+
+fuse_uring_set_up_zero_copy() (patch 0024) builds a bio_vec array from
+the request's folios and registers it via io_buffer_register_bvec()
+(patch 0023), which copies the bvec into an io_mapped_ubuf via
+io_kernel_buffer_init(..., NULL, NULL, index) — NULL release callback,
+NULL priv, and no page references taken anywhere. The registered table
+holds bare struct page pointers whose lifetime is owned entirely by the
+FUSE request's folios.
+
+Three windows make that unsound:
+
+1. Connection abort / daemon termination.
+   fuse_uring_entry_teardown() → fuse_uring_stop_fuse_req_end() →
+   fuse_request_end() ends a zero-copied request without calling
+   io_buffer_unregister() (the teardown path has no issue_flags
+   uring-cmd context, and ent->zero_copied is never consulted there).
+   The folios are released to their owners; the daemon's ring — which
+   may outlive the FUSE connection — still holds a fixed-buffer table
+   entry pointing at freed pages. Any in-flight or subsequent
+   READ_FIXED/WRITE_FIXED against that slot is a use-after-free DMA.
+
+2. In-flight I/O across COMMIT. Even on the normal path,
+   fuse_uring_req_end() unregisters and then ends the request — but
+   io_buffer_unregister() only removes the table slot; an in-flight
+   fixed-buffer op that already resolved its io_rsrc_node keeps the
+   io_mapped_ubuf alive and continues DMA against pages the request
+   just released. Today this is "safe by protocol discipline" (a
+   correct daemon COMMITs only after its own I/O completed) — which is
+   not a soundness argument, merely an accident of the current daemon.
+
+3. Retention (0029) is impossible without the fix. Keeping the slot
+   registered past fuse_request_end() is the entire point of 0029;
+   with bare pointers, retention converts window 2 from a race into the
+   steady state.
+
+Fix: key page lifetime to the io_mapped_ubuf itself, using the release
+mechanism patch 0022 already provides. io_buffer_register_bvec() grows
+release/priv parameters (passed through to io_kernel_buffer_init(), the
+same shape as io_buffer_register_request()). fuse_uring_set_up_zero_copy()
+folio_get()s each folio into a small carrier (priv); the callback puts
+them when the imu's final reference drops. On register failure the
+callback never fires, so the error path puts and frees the carrier.
+GFP_KERNEL_ACCOUNT matches the existing bvs kcalloc site.
+
+With references held by the imu, the missed-unregister on teardown no
+longer causes use-after-free — the pages live until the daemon's ring
+drops the slot. Window 1 becomes a bounded page-pin leak on abort,
+released by ring death. Do NOT add io_buffer_unregister() to teardown
+itself — it requires a uring-cmd issue context teardown does not have.
+
+ent->zero_copied handling in fuse_uring_req_end() is unchanged
+(unregister at COMMIT stays; 0029 modifies that, not this patch).
+No behavior change for non-zc queues.
+
+sqz-authored fix to the Koong series (same register as patch 0026/0027's
+seam-commit rationale). Mechanism donor: patch 0022.
+
+[sqz 7.1.6 rebase] identical to the 6.19 track besides context offsets; io_buffer_register_bvec / fuse_uring_set_up_zero_copy shape is shared.
+---
+ fs/fuse/dev_uring.c          | 47 ++++++++++++++++++++++++++++++++++--
+ include/linux/io_uring/cmd.h |  5 +++-
+ io_uring/rsrc.c              |  5 ++--
+ 3 files changed, 52 insertions(+), 5 deletions(-)
+
+diff --git a/fs/fuse/dev_uring.c b/fs/fuse/dev_uring.c
+index 64a2be2d2..7a19e3b1e 100644
+--- a/fs/fuse/dev_uring.c
++++ b/fs/fuse/dev_uring.c
+@@ -830,11 +830,35 @@ static int fuse_uring_copy_from_ring(struct fuse_ring *ring,
+ 	return err;
+ }
+ 
++/*
++ * Carrier for folio references held by a zero-copy io_mapped_ubuf.
++ * Lifetime is the imu's: the release callback fires when the table slot
++ * is gone AND every in-flight fixed-buffer op has put its rsrc node.
++ * That is what makes abort-without-unregister (window 1) and in-flight
++ * I/O across COMMIT (window 2) sound, and what makes payload retention
++ * (0029) possible at all.
++ */
++struct fuse_zc_pages {
++	unsigned int nr;
++	struct folio *folios[] __counted_by(nr);
++};
++
++static void fuse_zc_pages_release(void *priv)
++{
++	struct fuse_zc_pages *held = priv;
++	unsigned int i;
++
++	for (i = 0; i < held->nr; i++)
++		folio_put(held->folios[i]);
++	kfree(held);
++}
++
+ static int fuse_uring_set_up_zero_copy(struct fuse_ring_ent *ent,
+ 				       struct fuse_req *req,
+ 				       unsigned issue_flags)
+ {
+ 	struct fuse_args_pages *ap;
++	struct fuse_zc_pages *held;
+ 	size_t total_bytes = 0;
+ 	struct bio_vec *bvs;
+ 	int err, ddir, i;
+@@ -844,27 +868,46 @@ static int fuse_uring_set_up_zero_copy(struct fuse_ring_ent *ent,
+ 
+ 	ap = container_of(req->args, typeof(*ap), args);
+ 
++	held = kzalloc(struct_size(held, folios, ap->num_folios),
++		       GFP_KERNEL_ACCOUNT);
++	if (!held)
++		return -ENOMEM;
++	held->nr = ap->num_folios;
++
+ 	/*
+ 	 * We can avoid having to allocate the bvs array when folios and
+ 	 * descriptors are internally represented by bvs in fuse
+ 	 */
+ 	bvs = kcalloc(ap->num_folios, sizeof(*bvs), GFP_KERNEL_ACCOUNT);
+-	if (!bvs)
++	if (!bvs) {
++		kfree(held);
+ 		return -ENOMEM;
++	}
+ 
+ 	for (i = 0; i < ap->num_folios; i++) {
+ 		total_bytes += ap->descs[i].length;
+ 		bvs[i].bv_page = folio_page(ap->folios[i], 0);
+ 		bvs[i].bv_offset = ap->descs[i].offset;
+ 		bvs[i].bv_len = ap->descs[i].length;
++		/*
++		 * Request folios are live here; the get keys their lifetime
++		 * to the imu so fuse_request_end() (and abort teardown)
++		 * cannot free pages the daemon's ring still points at.
++		 */
++		folio_get(ap->folios[i]);
++		held->folios[i] = ap->folios[i];
+ 	}
+ 
+ 	err = io_buffer_register_bvec(ent->cmd, bvs, ap->num_folios,
+ 				      total_bytes, ddir, ent->fixed_buf_id,
++				      fuse_zc_pages_release, held,
+ 				      issue_flags);
+ 	kfree(bvs);
+-	if (err)
++	if (err) {
++		/* callback never fires on register failure */
++		fuse_zc_pages_release(held);
+ 		return err;
++	}
+ 
+ 	ent->zero_copied = true;
+ 
+diff --git a/include/linux/io_uring/cmd.h b/include/linux/io_uring/cmd.h
+index 15776aa3b..bda5af995 100644
+--- a/include/linux/io_uring/cmd.h
++++ b/include/linux/io_uring/cmd.h
+@@ -116,7 +116,9 @@ int io_buffer_register_request(struct io_uring_cmd *cmd, struct request *rq,
+ 			       unsigned int issue_flags);
+ int io_buffer_register_bvec(struct io_uring_cmd *cmd, const struct bio_vec *bvs,
+ 			    unsigned int nr_bvecs, unsigned int total_bytes,
+-			    u8 dir, unsigned int index, unsigned int issue_flags);
++			    u8 dir, unsigned int index,
++			    void (*release)(void *), void *priv,
++			    unsigned int issue_flags);
+ int io_buffer_unregister(struct io_uring_cmd *cmd, unsigned int index,
+ 			 unsigned int issue_flags);
+ #else
+@@ -212,6 +214,7 @@ static inline int io_buffer_register_bvec(struct io_uring_cmd *cmd,
+ 					  unsigned int nr_bvecs,
+ 					  unsigned int total_bytes, u8 dir,
+ 					  unsigned int index,
++					  void (*release)(void *), void *priv,
+ 					  unsigned int issue_flags)
+ {
+ 	return -EOPNOTSUPP;
+diff --git a/io_uring/rsrc.c b/io_uring/rsrc.c
+index 731ca9f8b..8c68adfee 100644
+--- a/io_uring/rsrc.c
++++ b/io_uring/rsrc.c
+@@ -1104,6 +1104,7 @@ EXPORT_SYMBOL_GPL(io_buffer_register_request);
+ int io_buffer_register_bvec(struct io_uring_cmd *cmd, const struct bio_vec *bvs,
+ 			    unsigned int nr_bvecs, unsigned int total_bytes,
+ 			    u8 dir, unsigned int index,
++			    void (*release)(void *), void *priv,
+ 			    unsigned int issue_flags)
+ {
+ 	struct io_ring_ctx *ctx = cmd_to_io_kiocb(cmd)->ctx;
+@@ -1112,8 +1113,8 @@ int io_buffer_register_bvec(struct io_uring_cmd *cmd, const struct bio_vec *bvs,
+ 	unsigned int i;
+ 
+ 	io_ring_submit_lock(ctx, issue_flags);
+-	imu = io_kernel_buffer_init(ctx, nr_bvecs, total_bytes, dir, NULL,
+-				    NULL, index);
++	imu = io_kernel_buffer_init(ctx, nr_bvecs, total_bytes, dir, release,
++				    priv, index);
+ 	if (IS_ERR(imu)) {
+ 		io_ring_submit_unlock(ctx, issue_flags);
+ 		return PTR_ERR(imu);
+-- 
+2.55.0
+

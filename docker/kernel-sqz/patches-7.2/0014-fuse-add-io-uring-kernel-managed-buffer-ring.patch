@@ -1,0 +1,763 @@
+From c22fb53e9870d1cd52362516d831304e61131864 Mon Sep 17 00:00:00 2001
+From: Joanne Koong <joannelkoong@gmail.com>
+Date: Fri, 16 Jan 2026 15:30:38 -0800
+Subject: [PATCH 14/25] fuse: add io-uring kernel-managed buffer ring
+
+Add io-uring kernel-managed buffer ring capability for fuse daemons
+communicating through the io-uring interface.
+
+This has two benefits:
+a) eliminates the overhead of pinning/unpinning user pages and
+translating virtual addresses for every server-kernel interaction
+
+b) reduces the amount of memory needed for the buffers per queue and
+allows buffers to be reused across entries. Incremental buffer
+consumption, when added, will allow a buffer to be used across multiple
+requests.
+
+Buffer ring usage is set on a per-queue basis. In order to use this, the
+daemon needs to have preregistered a kernel-managed buffer ring and a
+fixed buffer at index 0 that will hold all the headers, and set the
+"use_bufring" field during registration. The kernel-managed buffer ring
+will be pinned for the lifetime of the connection.
+
+Signed-off-by: Joanne Koong <joannelkoong@gmail.com>
+
+[sqz 7.1.6 rebase] Composed with 7.1's dev_uring rework: io_uring_sqe128_cmd() in fuse_uring_register() (7.1 dropped the one-arg io_uring_sqe_cmd form), kzalloc_obj/kzalloc_objs idioms, ERR_PTR-returning create_queue merged with 7.1's shape, send_in_task rework composed with 7.1's cancel-arm teardown.
+
+[sqz 7.2.3 rebase] Composed with 7.2's fuse_conn -> fuse_chan split (ring->chan / fch->lock / fch->ring; every fc site in the added code renamed) and with the UPSTREAM-LANDED form of the header-copy refactor (v4 patches 13-17 are in 7.2, expressed as the offset-returning ring_header_type_offset() instead of v4's get_user_ring_header() pointer form): get_kernel_ring_header() now derives its iov_iter_advance() from ring_header_type_offset(), and the user arms of copy_header_{to,from}_ring() compute (ent->headers + offset). 7.2 idioms: fuse_pqueue_alloc(), kzalloc_obj(*ent), READ_ONCE(ring->queues[qid]), FUSE_URING_IOV_{HEADERS,PAYLOAD} accessors in fuse_uring_create_ring_ent(); the series' ERR_PTR create_queue + goto-error ent shape kept. #include "fuse_dev_i.h" (7.2 moved the dev-internal declarations out of fuse_i.h).
+---
+ fs/fuse/dev_uring.c       | 407 +++++++++++++++++++++++++++++++-------
+ fs/fuse/dev_uring_i.h     |  31 ++-
+ include/uapi/linux/fuse.h |  15 +-
+ 3 files changed, 379 insertions(+), 74 deletions(-)
+
+diff --git a/fs/fuse/dev_uring.c b/fs/fuse/dev_uring.c
+index 6872266ba..c4dc7c949 100644
+--- a/fs/fuse/dev_uring.c
++++ b/fs/fuse/dev_uring.c
+@@ -10,6 +10,8 @@
+ #include "fuse_trace.h"
+ 
+ #include <linux/fs.h>
++#include <linux/io_uring.h>
++#include <linux/io_uring/buf.h>
+ #include <linux/io_uring/cmd.h>
+ 
+ static bool __read_mostly enable_uring;
+@@ -21,6 +23,9 @@ MODULE_PARM_DESC(enable_uring,
+ #define FUSE_URING_IOV_HEADERS 0
+ #define FUSE_URING_IOV_PAYLOAD 1
+ 
++#define FUSE_URING_RINGBUF_GROUP 0
++#define FUSE_URING_FIXED_HEADERS_OFFSET 0
++
+ bool fuse_uring_enabled(void)
+ {
+ 	return enable_uring;
+@@ -281,20 +286,45 @@ static struct fuse_ring *fuse_uring_create(struct fuse_chan *fch)
+ 	return res;
+ }
+ 
+-static struct fuse_ring_queue *fuse_uring_create_queue(struct fuse_ring *ring,
+-						       int qid)
++static int fuse_uring_buf_ring_setup(struct io_uring_cmd *cmd,
++				     struct fuse_ring_queue *queue,
++				     unsigned int issue_flags)
++{
++	int err;
++
++	err = io_uring_buf_ring_pin(cmd, FUSE_URING_RINGBUF_GROUP, issue_flags,
++				    &queue->bufring);
++	if (err)
++		return err;
++
++	if (!io_uring_is_kmbuf_ring(cmd, FUSE_URING_RINGBUF_GROUP,
++				    issue_flags)) {
++		io_uring_buf_ring_unpin(cmd, FUSE_URING_RINGBUF_GROUP,
++					issue_flags);
++		return -EINVAL;
++	}
++
++	queue->use_bufring = true;
++
++	return 0;
++}
++
++static struct fuse_ring_queue *
++fuse_uring_create_queue(struct io_uring_cmd *cmd, struct fuse_ring *ring,
++			int qid, bool use_bufring, unsigned int issue_flags)
+ {
+ 	struct fuse_chan *fch = ring->chan;
+ 	struct fuse_ring_queue *queue;
+ 	struct list_head *pq;
++	int err;
+ 
+ 	queue = kzalloc_obj(*queue, GFP_KERNEL_ACCOUNT);
+ 	if (!queue)
+-		return NULL;
++		return ERR_PTR(-ENOMEM);
+ 	pq = fuse_pqueue_alloc();
+ 	if (!pq) {
+ 		kfree(queue);
+-		return NULL;
++		return ERR_PTR(-ENOMEM);
+ 	}
+ 
+ 	queue->qid = qid;
+@@ -312,6 +342,15 @@ static struct fuse_ring_queue *fuse_uring_create_queue(struct fuse_ring *ring,
+ 	fuse_pqueue_init(&queue->fpq);
+ 	queue->fpq.processing = pq;
+ 
++	if (use_bufring) {
++		err = fuse_uring_buf_ring_setup(cmd, queue, issue_flags);
++		if (err) {
++			kfree(pq);
++			kfree(queue);
++			return ERR_PTR(err);
++		}
++	}
++
+ 	spin_lock(&fch->lock);
+ 	if (ring->queues[qid]) {
+ 		spin_unlock(&fch->lock);
+@@ -605,44 +644,100 @@ static int ring_header_type_offset(enum fuse_uring_header_type type)
+ 	}
+ }
+ 
+-static int copy_header_to_ring(struct fuse_ring_ent *ent,
+-			       enum fuse_uring_header_type type,
+-			       const void *header, size_t header_size)
++static int get_kernel_ring_header(struct fuse_ring_ent *ent,
++				  enum fuse_uring_header_type type,
++				  struct iov_iter *headers_iter)
+ {
+ 	int offset = ring_header_type_offset(type);
+-	void __user *ring;
+ 
+ 	if (offset < 0)
+ 		return offset;
+ 
+-	ring = (void __user *)ent->headers + offset;
++	*headers_iter = ent->headers_iter;
++	if (offset)
++		iov_iter_advance(headers_iter, offset);
++
++	return 0;
++}
++
++static int copy_header_to_ring(struct fuse_ring_ent *ent,
++			       enum fuse_uring_header_type type,
++			       const void *header, size_t header_size)
++{
++	bool use_bufring = ent->queue->use_bufring;
++	int err = 0;
++
++	if (use_bufring) {
++		struct iov_iter iter;
+ 
+-	if (copy_to_user(ring, header, header_size)) {
+-		pr_info_ratelimited("Copying header to ring failed.\n");
+-		return -EFAULT;
++		err = get_kernel_ring_header(ent, type, &iter);
++		if (err)
++			goto done;
++
++		if (copy_to_iter(header, header_size, &iter) != header_size)
++			err = -EFAULT;
++	} else {
++		int offset = ring_header_type_offset(type);
++		void __user *ring;
++
++		if (offset < 0) {
++			err = offset;
++			goto done;
++		}
++
++		ring = (void __user *)ent->headers + offset;
++		if (copy_to_user(ring, header, header_size))
++			err = -EFAULT;
+ 	}
+ 
+-	return 0;
++done:
++	if (err)
++		pr_info_ratelimited("Copying header to ring failed: "
++				    "header_type=%u, header_size=%zu, "
++				    "use_bufring=%d\n", type, header_size,
++				    use_bufring);
++
++	return err;
+ }
+ 
+ static int copy_header_from_ring(struct fuse_ring_ent *ent,
+ 				 enum fuse_uring_header_type type, void *header,
+ 				 size_t header_size)
+ {
+-	int offset = ring_header_type_offset(type);
+-	const void __user *ring;
++	bool use_bufring = ent->queue->use_bufring;
++	int err = 0;
+ 
+-	if (offset < 0)
+-		return offset;
++	if (use_bufring) {
++		struct iov_iter iter;
+ 
+-	ring = (void __user *)ent->headers + offset;
++		err = get_kernel_ring_header(ent, type, &iter);
++		if (err)
++			goto done;
++
++		if (copy_from_iter(header, header_size, &iter) != header_size)
++			err = -EFAULT;
++	} else {
++		int offset = ring_header_type_offset(type);
++		const void __user *ring;
+ 
+-	if (copy_from_user(header, ring, header_size)) {
+-		pr_info_ratelimited("Copying header from ring failed.\n");
+-		return -EFAULT;
++		if (offset < 0) {
++			err = offset;
++			goto done;
++		}
++
++		ring = (void __user *)ent->headers + offset;
++		if (copy_from_user(header, ring, header_size))
++			err = -EFAULT;
+ 	}
+ 
+-	return 0;
++done:
++	if (err)
++		pr_info_ratelimited("Copying header from ring failed: "
++				    "header_type=%u, header_size=%zu, "
++				    "use_bufring=%d\n", type, header_size,
++				    use_bufring);
++
++	return err;
+ }
+ 
+ static int setup_fuse_copy_state(struct fuse_copy_state *cs,
+@@ -652,14 +747,23 @@ static int setup_fuse_copy_state(struct fuse_copy_state *cs,
+ {
+ 	int err;
+ 
+-	err = import_ubuf(dir, ent->payload, ring->max_payload_sz, iter);
+-	if (err) {
+-		pr_info_ratelimited("fuse: Import of user buffer failed\n");
+-		return err;
++	if (!ent->queue->use_bufring) {
++		err = import_ubuf(dir, ent->payload, ring->max_payload_sz, iter);
++		if (err) {
++			pr_info_ratelimited("fuse: Import of user buffer "
++					    "failed\n");
++			return err;
++		}
+ 	}
+ 
+ 	fuse_copy_init(cs, dir == ITER_DEST, iter);
+ 
++	if (ent->queue->use_bufring) {
++		cs->is_kaddr = true;
++		cs->len = ent->payload_kvec.iov_len;
++		cs->kaddr = ent->payload_kvec.iov_base;
++	}
++
+ 	cs->is_uring = true;
+ 	cs->req = req;
+ 
+@@ -771,6 +875,94 @@ static int fuse_uring_copy_to_ring(struct fuse_ring_ent *ent,
+ 				   sizeof(req->in.h));
+ }
+ 
++static bool fuse_uring_req_has_payload(struct fuse_req *req)
++{
++	struct fuse_args *args = req->args;
++
++	return args->in_numargs > 1 || args->out_numargs;
++}
++
++static int fuse_uring_select_buffer(struct fuse_ring_ent *ent,
++				    unsigned int issue_flags)
++	__must_hold(&queue->lock)
++{
++	struct io_br_sel sel;
++	size_t len = 0;
++
++	lockdep_assert_held(&ent->queue->lock);
++
++	/* Get a buffer to use for the payload */
++	sel = io_ring_buffer_select(cmd_to_io_kiocb(ent->cmd), &len,
++				    ent->queue->bufring, issue_flags);
++	if (sel.val)
++		return sel.val;
++	if (!sel.kaddr)
++		return -ENOENT;
++
++	ent->payload_kvec.iov_base = sel.kaddr;
++	ent->payload_kvec.iov_len = len;
++	ent->ringbuf_buf_id = sel.buf_id;
++
++	return 0;
++}
++
++static void fuse_uring_clean_up_buffer(struct fuse_ring_ent *ent,
++				       unsigned int issue_flags)
++	__must_hold(&queue->lock)
++{
++	struct kvec *kvec = &ent->payload_kvec;
++
++	lockdep_assert_held(&ent->queue->lock);
++
++	if (!ent->queue->use_bufring || !kvec->iov_base)
++		return;
++
++	WARN_ON_ONCE(io_uring_kmbuf_recycle(ent->cmd, FUSE_URING_RINGBUF_GROUP,
++					    (u64)kvec->iov_base, kvec->iov_len,
++					    ent->ringbuf_buf_id, issue_flags));
++
++	memset(kvec, 0, sizeof(*kvec));
++}
++
++static int fuse_uring_next_req_update_buffer(struct fuse_ring_ent *ent,
++					     struct fuse_req *req,
++					     unsigned int issue_flags)
++{
++	bool buffer_selected;
++	bool has_payload;
++
++	if (!ent->queue->use_bufring)
++		return 0;
++
++	ent->headers_iter.data_source = false;
++
++	buffer_selected = ent->payload_kvec.iov_base != NULL;
++	has_payload = fuse_uring_req_has_payload(req);
++
++	if (has_payload && !buffer_selected)
++		return fuse_uring_select_buffer(ent, issue_flags);
++
++	if (!has_payload && buffer_selected)
++		fuse_uring_clean_up_buffer(ent, issue_flags);
++
++	return 0;
++}
++
++static int fuse_uring_prep_buffer(struct fuse_ring_ent *ent,
++				  struct fuse_req *req, unsigned issue_flags)
++{
++	if (!ent->queue->use_bufring)
++		return 0;
++
++	ent->headers_iter.data_source = false;
++
++	/* no payload to copy, can skip selecting a buffer */
++	if (!fuse_uring_req_has_payload(req))
++		return 0;
++
++	return fuse_uring_select_buffer(ent, issue_flags);
++}
++
+ static int fuse_uring_prepare_send(struct fuse_ring_ent *ent,
+ 				   struct fuse_req *req)
+ {
+@@ -847,21 +1039,29 @@ static void fuse_uring_add_req_to_ring_ent(struct fuse_ring_ent *ent,
+ }
+ 
+ /* Fetch the next fuse request if available */
+-static struct fuse_req *fuse_uring_ent_assign_req(struct fuse_ring_ent *ent)
++static struct fuse_req *fuse_uring_ent_assign_req(struct fuse_ring_ent *ent,
++						  unsigned int issue_flags)
+ 	__must_hold(&queue->lock)
+ {
+ 	struct fuse_req *req;
+ 	struct fuse_ring_queue *queue = ent->queue;
+ 	struct list_head *req_queue = &queue->fuse_req_queue;
++	int err;
+ 
+ 	lockdep_assert_held(&queue->lock);
+ 
+ 	/* get and assign the next entry while it is still holding the lock */
+ 	req = list_first_entry_or_null(req_queue, struct fuse_req, list);
+-	if (req)
+-		fuse_uring_add_req_to_ring_ent(ent, req);
++	if (req) {
++		err = fuse_uring_next_req_update_buffer(ent, req, issue_flags);
++		if (!err) {
++			fuse_uring_add_req_to_ring_ent(ent, req);
++			return req;
++		}
++	}
+ 
+-	return req;
++	fuse_uring_clean_up_buffer(ent, issue_flags);
++	return NULL;
+ }
+ 
+ /*
+@@ -897,7 +1097,8 @@ static void fuse_uring_commit(struct fuse_ring_ent *ent, struct fuse_req *req,
+  * Else, there is no next fuse request and this returns false.
+  */
+ static bool fuse_uring_get_next_fuse_req(struct fuse_ring_ent *ent,
+-					 struct fuse_ring_queue *queue)
++					 struct fuse_ring_queue *queue,
++					 unsigned int issue_flags)
+ {
+ 	int err;
+ 	struct fuse_req *req;
+@@ -905,7 +1106,7 @@ static bool fuse_uring_get_next_fuse_req(struct fuse_ring_ent *ent,
+ retry:
+ 	spin_lock(&queue->lock);
+ 	fuse_uring_ent_avail(ent, queue);
+-	req = fuse_uring_ent_assign_req(ent);
++	req = fuse_uring_ent_assign_req(ent, issue_flags);
+ 	spin_unlock(&queue->lock);
+ 
+ 	if (req) {
+@@ -947,6 +1148,39 @@ static void fuse_uring_send(struct fuse_ring_ent *ent, struct io_uring_cmd *cmd,
+ 	io_uring_cmd_done(cmd, ret, issue_flags);
+ }
+ 
++static void fuse_uring_headers_cleanup(struct fuse_ring_ent *ent,
++				       unsigned int issue_flags)
++{
++	if (!ent->queue->use_bufring || !ent->headers_node)
++		return;
++
++	io_uring_fixed_index_put(ent->cmd, ent->headers_node, issue_flags);
++	ent->headers_node = NULL;
++}
++
++static int fuse_uring_headers_prep(struct fuse_ring_ent *ent, unsigned int dir,
++				   unsigned int issue_flags)
++{
++	size_t header_size = sizeof(struct fuse_uring_req_header);
++	struct io_uring_cmd *cmd = ent->cmd;
++	struct io_rsrc_node *node;
++	unsigned int offset;
++
++	if (!ent->queue->use_bufring)
++		return 0;
++
++	offset = ent->fixed_buf_id * header_size;
++
++	node = io_uring_fixed_index_get(cmd, FUSE_URING_FIXED_HEADERS_OFFSET,
++					offset, header_size, dir,
++					&ent->headers_iter, issue_flags);
++	if (IS_ERR(node))
++		return PTR_ERR(node);
++
++	ent->headers_node = node;
++	return 0;
++}
++
+ /* FUSE_URING_CMD_COMMIT_AND_FETCH handler */
+ static int fuse_uring_commit_fetch(struct io_uring_cmd *cmd, int issue_flags,
+ 				   struct fuse_chan *fch)
+@@ -961,6 +1195,7 @@ static int fuse_uring_commit_fetch(struct io_uring_cmd *cmd, int issue_flags,
+ 	unsigned int qid = READ_ONCE(cmd_req->qid);
+ 	struct fuse_pqueue *fpq;
+ 	struct fuse_req *req;
++	bool send;
+ 
+ 	err = -ENOTCONN;
+ 	if (!ring)
+@@ -1014,7 +1249,12 @@ static int fuse_uring_commit_fetch(struct io_uring_cmd *cmd, int issue_flags,
+ 
+ 	/* without the queue lock, as other locks are taken */
+ 	fuse_uring_prepare_cancel(cmd, issue_flags, ent);
+-	fuse_uring_commit(ent, req, issue_flags);
++
++	err = fuse_uring_headers_prep(ent, ITER_SOURCE, issue_flags);
++	if (err)
++		fuse_uring_req_end(ent, req, err);
++	else
++		fuse_uring_commit(ent, req, issue_flags);
+ 
+ 	/*
+ 	 * Fetching the next request is absolutely required as queued
+@@ -1022,7 +1262,9 @@ static int fuse_uring_commit_fetch(struct io_uring_cmd *cmd, int issue_flags,
+ 	 * and fetching is done in one step vs legacy fuse, which has separated
+ 	 * read (fetch request) and write (commit result).
+ 	 */
+-	if (fuse_uring_get_next_fuse_req(ent, queue))
++	send = fuse_uring_get_next_fuse_req(ent, queue, issue_flags);
++	fuse_uring_headers_cleanup(ent, issue_flags);
++	if (send)
+ 		fuse_uring_send(ent, cmd, 0, issue_flags);
+ 	return 0;
+ }
+@@ -1130,40 +1372,49 @@ fuse_uring_create_ring_ent(struct io_uring_cmd *cmd,
+ 	struct iovec *headers, *payload;
+ 	int err;
+ 
++	ent = kzalloc_obj(*ent, GFP_KERNEL_ACCOUNT);
++	if (!ent)
++		return ERR_PTR(-ENOMEM);
++
++	INIT_LIST_HEAD(&ent->list);
++
++	ent->queue = queue;
++
++	if (queue->use_bufring) {
++		ent->fixed_buf_id = READ_ONCE(cmd->sqe->buf_index);
++		atomic_inc(&ring->queue_refs);
++		return ent;
++	}
++
+ 	err = fuse_uring_get_iovec_from_sqe(cmd->sqe, iov);
+ 	if (err) {
+ 		pr_info_ratelimited("Failed to get iovec from sqe, err=%d\n",
+ 				    err);
+-		return ERR_PTR(err);
++		goto error;
+ 	}
+ 
+ 	err = -EINVAL;
+ 	headers = &iov[FUSE_URING_IOV_HEADERS];
+ 	if (headers->iov_len < sizeof(struct fuse_uring_req_header)) {
+ 		pr_info_ratelimited("Invalid header len %zu\n", headers->iov_len);
+-		return ERR_PTR(err);
++		goto error;
+ 	}
+ 
+ 	payload = &iov[FUSE_URING_IOV_PAYLOAD];
+ 	if (payload->iov_len < ring->max_payload_sz) {
+ 		pr_info_ratelimited("Invalid req payload len %zu\n",
+ 				    payload->iov_len);
+-		return ERR_PTR(err);
++		goto error;
+ 	}
+-
+-	err = -ENOMEM;
+-	ent = kzalloc_obj(*ent, GFP_KERNEL_ACCOUNT);
+-	if (!ent)
+-		return ERR_PTR(err);
+-
+-	INIT_LIST_HEAD(&ent->list);
+-
+-	ent->queue = queue;
+ 	ent->headers = headers->iov_base;
+ 	ent->payload = payload->iov_base;
+ 
+ 	atomic_inc(&ring->queue_refs);
+ 	return ent;
++
++error:
++	kfree(ent);
++	return ERR_PTR(err);
+ }
+ 
+ /*
+@@ -1175,6 +1426,8 @@ static int fuse_uring_register(struct io_uring_cmd *cmd,
+ {
+ 	const struct fuse_uring_cmd_req *cmd_req = io_uring_sqe128_cmd(cmd->sqe,
+ 								       struct fuse_uring_cmd_req);
++	unsigned int init_flags = READ_ONCE(cmd_req->init.flags);
++	bool use_bufring = init_flags & FUSE_URING_BUF_RING;
+ 	struct fuse_ring *ring = smp_load_acquire(&fch->ring);
+ 	struct fuse_ring_queue *queue;
+ 	struct fuse_ring_ent *ent;
+@@ -1195,9 +1448,13 @@ static int fuse_uring_register(struct io_uring_cmd *cmd,
+ 
+ 	queue = READ_ONCE(ring->queues[qid]);
+ 	if (!queue) {
+-		queue = fuse_uring_create_queue(ring, qid);
+-		if (!queue)
+-			return err;
++		queue = fuse_uring_create_queue(cmd, ring, qid, use_bufring,
++						issue_flags);
++		if (IS_ERR(queue))
++			return PTR_ERR(queue);
++	} else {
++		if (queue->use_bufring != use_bufring)
++			return -EINVAL;
+ 	}
+ 
+ 	/*
+@@ -1294,16 +1551,19 @@ static void fuse_uring_send_in_task(struct io_tw_req tw_req, io_tw_token_t tw)
+ 	struct io_uring_cmd *cmd = io_uring_cmd_from_tw(tw_req);
+ 	struct fuse_ring_ent *ent = uring_cmd_to_ring_ent(cmd);
+ 	struct fuse_ring_queue *queue = ent->queue;
++	bool send = true;
+ 	int err;
+ 
+ 	if (!tw.cancel) {
+-		err = fuse_uring_prepare_send(ent, ent->fuse_req);
+-		if (err) {
+-			if (!fuse_uring_get_next_fuse_req(ent, queue))
+-				return;
+-			err = 0;
+-		}
+-		fuse_uring_send(ent, cmd, err, issue_flags);
++		if (fuse_uring_headers_prep(ent, ITER_DEST, issue_flags))
++			return;
++
++		if (fuse_uring_prepare_send(ent, ent->fuse_req))
++			send = fuse_uring_get_next_fuse_req(ent, queue, issue_flags);
++		fuse_uring_headers_cleanup(ent, issue_flags);
++		if (!send)
++			return;
++		fuse_uring_send(ent, cmd, 0, issue_flags);
+ 	} else {
+ 		err = -ECANCELED;
+ 
+@@ -1370,14 +1630,19 @@ void fuse_uring_queue_fuse_req(struct fuse_iqueue *fiq, struct fuse_req *req)
+ 	req->ring_queue = queue;
+ 	ent = list_first_entry_or_null(&queue->ent_avail_queue,
+ 				       struct fuse_ring_ent, list);
+-	if (ent)
+-		fuse_uring_add_req_to_ring_ent(ent, req);
+-	else
+-		list_add_tail(&req->list, &queue->fuse_req_queue);
+-	spin_unlock(&queue->lock);
++	if (ent) {
++		err = fuse_uring_prep_buffer(ent, req, IO_URING_F_UNLOCKED);
++		if (!err) {
++			fuse_uring_add_req_to_ring_ent(ent, req);
++			spin_unlock(&queue->lock);
++			fuse_uring_dispatch_ent(ent);
++			return;
++		}
++		WARN_ON_ONCE(err != -ENOENT);
++	}
+ 
+-	if (ent)
+-		fuse_uring_dispatch_ent(ent);
++	list_add_tail(&req->list, &queue->fuse_req_queue);
++	spin_unlock(&queue->lock);
+ 
+ 	return;
+ 
+@@ -1395,6 +1660,7 @@ bool fuse_uring_queue_bq_req(struct fuse_req *req)
+ 	struct fuse_ring *ring = fch->ring;
+ 	struct fuse_ring_queue *queue;
+ 	struct fuse_ring_ent *ent = NULL;
++	int err;
+ 
+ 	queue = fuse_uring_task_to_queue(ring);
+ 	if (!queue)
+@@ -1427,14 +1693,15 @@ bool fuse_uring_queue_bq_req(struct fuse_req *req)
+ 	req = list_first_entry_or_null(&queue->fuse_req_queue, struct fuse_req,
+ 				       list);
+ 	if (ent && req) {
+-		fuse_uring_add_req_to_ring_ent(ent, req);
+-		spin_unlock(&queue->lock);
+-
+-		fuse_uring_dispatch_ent(ent);
+-	} else {
+-		spin_unlock(&queue->lock);
++		err = fuse_uring_prep_buffer(ent, req, IO_URING_F_UNLOCKED);
++		if (!err) {
++			fuse_uring_add_req_to_ring_ent(ent, req);
++			spin_unlock(&queue->lock);
++			fuse_uring_dispatch_ent(ent);
++			return true;
++		}
+ 	}
+-
++	spin_unlock(&queue->lock);
+ 	return true;
+ }
+ 
+diff --git a/fs/fuse/dev_uring_i.h b/fs/fuse/dev_uring_i.h
+index 55f8d04e4..b9017b5c5 100644
+--- a/fs/fuse/dev_uring_i.h
++++ b/fs/fuse/dev_uring_i.h
+@@ -7,6 +7,8 @@
+ #ifndef _FS_FUSE_DEV_URING_I_H
+ #define _FS_FUSE_DEV_URING_I_H
+ 
++#include <linux/uio.h>
++
+ #include "fuse_dev_i.h"
+ 
+ #ifdef CONFIG_FUSE_IO_URING
+@@ -38,9 +40,26 @@ enum fuse_ring_req_state {
+ 
+ /** A fuse ring entry, part of the ring queue */
+ struct fuse_ring_ent {
+-	/* userspace buffer */
+-	struct fuse_uring_req_header __user *headers;
+-	void __user *payload;
++	union {
++		/* queue->use_bufring == false */
++		struct {
++			/* userspace buffers */
++			struct fuse_uring_req_header __user *headers;
++			void __user *payload;
++		};
++		/* queue->use_bufring == true */
++		struct {
++			struct iov_iter headers_iter;
++			struct io_rsrc_node *headers_node;
++			struct kvec payload_kvec;
++			/*
++			 * This needs to be tracked in order to properly recycle
++			 * the buffer when done with it
++			 */
++			unsigned int ringbuf_buf_id;
++			unsigned int fixed_buf_id;
++		};
++	};
+ 
+ 	/* the ring queue that owns the request */
+ 	struct fuse_ring_queue *queue;
+@@ -99,6 +118,12 @@ struct fuse_ring_queue {
+ 	unsigned int active_background;
+ 
+ 	bool stopped;
++
++	/* true if kernel-managed buffer ring is used */
++	bool use_bufring: 1;
++
++	/* synchronized by the queue lock */
++	struct io_buffer_list *bufring;
+ };
+ 
+ /*
+diff --git a/include/uapi/linux/fuse.h b/include/uapi/linux/fuse.h
+index c13e1f9a2..b49c8d3b9 100644
+--- a/include/uapi/linux/fuse.h
++++ b/include/uapi/linux/fuse.h
+@@ -240,6 +240,9 @@
+  *  - add FUSE_COPY_FILE_RANGE_64
+  *  - add struct fuse_copy_file_range_out
+  *  - add FUSE_NOTIFY_PRUNE
++ *
++ *  7.46
++ *  - add fuse_uring_cmd_req init flags
+  */
+ 
+ #ifndef _LINUX_FUSE_H
+@@ -1294,6 +1297,9 @@ enum fuse_uring_cmd {
+ 	FUSE_IO_URING_CMD_COMMIT_AND_FETCH = 2,
+ };
+ 
++/* fuse_uring_cmd_req init flags */
++#define FUSE_URING_BUF_RING	(1 << 0)
++
+ /**
+  * In the 80B command area of the SQE.
+  */
+@@ -1305,7 +1311,14 @@ struct fuse_uring_cmd_req {
+ 
+ 	/* queue the command is for (queue index) */
+ 	uint16_t qid;
+-	uint8_t padding[6];
++
++	union {
++		struct {
++			uint16_t flags;
++		} init;
++	};
++
++	uint8_t padding[4];
+ };
+ 
+ #endif /* _LINUX_FUSE_H */
+-- 
+2.55.0
+

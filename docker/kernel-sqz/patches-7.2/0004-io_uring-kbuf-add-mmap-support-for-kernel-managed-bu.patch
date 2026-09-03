@@ -1,0 +1,110 @@
+From e0a329aefe4e9abf01eeaa135c5a228d7f6a43e0 Mon Sep 17 00:00:00 2001
+From: Joanne Koong <joannelkoong@gmail.com>
+Date: Fri, 16 Jan 2026 15:30:23 -0800
+Subject: [PATCH 04/25] io_uring/kbuf: add mmap support for kernel-managed
+ buffer rings
+
+Add support for mmapping kernel-managed buffer rings (kmbuf) to
+userspace, allowing applications to access the kernel-allocated buffers.
+
+Similar to application-provided buffer rings (pbuf), kmbuf rings use the
+buffer group ID encoded in the mmap offset to identify which buffer ring
+to map. The implementation follows the same pattern as pbuf rings.
+
+New mmap offset constants are introduced:
+  - IORING_OFF_KMBUF_RING (0x88000000): Base offset for kmbuf mappings
+  - IORING_OFF_KMBUF_SHIFT (16): Shift value to encode buffer group ID
+
+The mmap offset is calculated during registration, encoding the bgid
+shifted by IORING_OFF_KMBUF_SHIFT. The io_buf_get_region() helper
+retrieves the appropriate region.
+
+This allows userspace to mmap the kernel-allocated buffer region and
+access the buffers directly.
+
+Signed-off-by: Joanne Koong <joannelkoong@gmail.com>
+---
+ include/uapi/linux/io_uring.h |  2 ++
+ io_uring/kbuf.c               | 11 +++++++++--
+ io_uring/kbuf.h               |  5 +++--
+ io_uring/memmap.c             |  5 ++++-
+ 4 files changed, 18 insertions(+), 5 deletions(-)
+
+diff --git a/include/uapi/linux/io_uring.h b/include/uapi/linux/io_uring.h
+index b03259dc0..82b31d268 100644
+--- a/include/uapi/linux/io_uring.h
++++ b/include/uapi/linux/io_uring.h
+@@ -553,6 +553,8 @@ struct io_uring_cqe {
+ #define IORING_OFF_SQES			0x10000000ULL
+ #define IORING_OFF_PBUF_RING		0x80000000ULL
+ #define IORING_OFF_PBUF_SHIFT		16
++#define IORING_OFF_KMBUF_RING		0x88000000ULL
++#define IORING_OFF_KMBUF_SHIFT		16
+ #define IORING_OFF_MMAP_MASK		0xf8000000ULL
+ 
+ /*
+diff --git a/io_uring/kbuf.c b/io_uring/kbuf.c
+index 1356f5fb4..f71dc4c65 100644
+--- a/io_uring/kbuf.c
++++ b/io_uring/kbuf.c
+@@ -806,16 +806,23 @@ int io_register_pbuf_status(struct io_ring_ctx *ctx, void __user *arg)
+ 	return 0;
+ }
+ 
+-struct io_mapped_region *io_pbuf_get_region(struct io_ring_ctx *ctx,
+-					    unsigned int bgid)
++struct io_mapped_region *io_buf_get_region(struct io_ring_ctx *ctx,
++					   unsigned int bgid,
++					   bool kernel_managed)
+ {
+ 	struct io_buffer_list *bl;
++	bool is_kernel_managed;
+ 
+ 	lockdep_assert_held(&ctx->mmap_lock);
+ 
+ 	bl = xa_load(&ctx->io_bl_xa, bgid);
+ 	if (!bl || !(bl->flags & IOBL_BUF_RING))
+ 		return NULL;
++
++	is_kernel_managed = !!(bl->flags & IOBL_KERNEL_MANAGED);
++	if (is_kernel_managed != kernel_managed)
++		return NULL;
++
+ 	return &bl->region;
+ }
+ 
+diff --git a/io_uring/kbuf.h b/io_uring/kbuf.h
+index 00330449c..0d0143395 100644
+--- a/io_uring/kbuf.h
++++ b/io_uring/kbuf.h
+@@ -94,8 +94,9 @@ unsigned int __io_put_kbufs(struct io_kiocb *req, struct io_buffer_list *bl,
+ bool io_kbuf_commit(struct io_kiocb *req,
+ 		    struct io_buffer_list *bl, int len, int nr);
+ 
+-struct io_mapped_region *io_pbuf_get_region(struct io_ring_ctx *ctx,
+-					    unsigned int bgid);
++struct io_mapped_region *io_buf_get_region(struct io_ring_ctx *ctx,
++					   unsigned int bgid,
++					   bool kernel_managed);
+ 
+ static inline bool io_kbuf_recycle_ring(struct io_kiocb *req,
+ 					struct io_buffer_list *bl)
+diff --git a/io_uring/memmap.c b/io_uring/memmap.c
+index e34ef8862..0fa0475f8 100644
+--- a/io_uring/memmap.c
++++ b/io_uring/memmap.c
+@@ -357,7 +357,10 @@ static struct io_mapped_region *io_mmap_get_region(struct io_ring_ctx *ctx,
+ 		return &ctx->sq_region;
+ 	case IORING_OFF_PBUF_RING:
+ 		id = (offset & ~IORING_OFF_MMAP_MASK) >> IORING_OFF_PBUF_SHIFT;
+-		return io_pbuf_get_region(ctx, id);
++		return io_buf_get_region(ctx, id, false);
++	case IORING_OFF_KMBUF_RING:
++		id = (offset & ~IORING_OFF_MMAP_MASK) >> IORING_OFF_KMBUF_SHIFT;
++		return io_buf_get_region(ctx, id, true);
+ 	case IORING_MAP_OFF_PARAM_REGION:
+ 		return &ctx->param_region;
+ 	case IORING_MAP_OFF_ZCRX_REGION:
+-- 
+2.55.0
+

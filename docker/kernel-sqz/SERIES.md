@@ -188,6 +188,94 @@ applied clean.
 `build-kernel.sh` applies it with `patch -p1 --fuzz=0` (any regression
 in the transplant fails loud at apply time).
 
+## The 7.2 track (`patches-7.2/`) — 25 patches on linux-7.2.3
+
+**Base: linux-7.2.3** (kernel.org stable, the newest 7.2.y on
+2026-09-03 — `releases.json` `latest_stable`; sha256
+`8ba259e8e7b13ec6ef0941c8a39ad90b24bd4a4d6c0010ba6bafb794550ecd03`
+from `v7.x/sha256sums.asc`). The 30-patch 7.1 series rebased
+2026-09-03 by the 7.1 track's own recipe — pristine tarball in a
+scratch git repo (7.1.6 as an orphan base, the 30 patches applied
+there clean as the control, then `git rebase --onto` the 7.2.3 base so
+every conflict is a real three-way merge with its true ancestor),
+`git format-patch` export, `patch -p1 --fuzz=0` re-verified on a fresh
+extraction. Every adapted patch carries its `[sqz 7.2.3 rebase]` note
+in the commit body beneath the 7.1 note it inherited.
+
+**Five patches DROPPED — landed upstream in 7.2.** Koong's FUSE
+prep-refactor half (v4 patches 13–17) merged through the fuse tree in
+the 7.2 cycle as the `fuse-uring:` series (all 2026-06-15,
+`git.kernel.org` torvalds/linux.git, `v7.2` log of
+`fs/fuse/dev_uring.c`), so the 7.2 series is **25 patches, renumbered
+contiguously** (the mapping below is authoritative; the 6.19/7.1
+numbers stay in prose about those tracks). The io_uring halves (kmbuf
+kbuf/register/memmap 01–12, rsrc bvec 20–23) did **not** land — the
+`v7.2` logs of `io_uring/kbuf.c` and `io_uring/rsrc.c` carry no kmbuf
+or `io_buffer_register_bvec()` commit, and 7.2.3's
+`include/uapi/linux/io_uring.h` has no `KMBUF` symbol — so all 12 + 4
+stay in the series, as do the 7 FUSE consumer/sqz patches and 0030.
+
+| 7.1 # | 7.2 # | Patch | 7.2.3 verdict |
+|---|---|---|---|
+| 0001 | 0001 | kbuf refactor | applied clean (identical patch-id to 7.1) |
+| 0002 | 0002 | kbuf rename | applied clean |
+| 0003 | 0003 | kmbuf rings (**38/39**) | applied clean — opcodes unchanged, see the audit |
+| 0004 | 0004 | kmbuf mmap | applied clean |
+| 0005 | 0005 | kmbuf buffer selection | **rebased** (`io_ring_buffer_select`): 7.2's `46800585ae04` "validate ring provided buffer addresses with access_ok()" moved the `sel.addr` assignment ahead of any `req->flags` mutation and gates it on `access_ok()`; the kernel-managed arm assigns `sel.kaddr` and bypasses that check (a kernel address is never user-accessible), the user arm keeps 7.2's check verbatim |
+| 0006 | 0006 | pin/unpin | applied clean |
+| 0007 | 0007 | kmbuf recycle | applied clean |
+| 0008 | 0008 | `io_uring_fixed_index_{get,put}` | **rebased** (add/add adjacency): 7.2's `df0a52537c0f` "add huge page accounting for registered buffers" inserted `io_buffer_acct_cloned_hpages()` at the same point after `io_import_reg_buf()`; both kept, no content change |
+| 0009 | 0009 | `io_uring_is_kmbuf_ring` | applied clean |
+| 0010 | 0010 | export `io_ring_buffer_select` | applied clean |
+| 0011 | 0011 | buffer id | **rebased**: only the `sel.buf_id` line lands after `sel.buf_list` (the addr assignment moved in the 7.2 form of 05) |
+| 0012 | 0012 | cmd buffer index | applied clean |
+| 0013 | — | refactor next-req | **DROPPED — landed** as `6813da095068` "fuse-uring: separate next request fetching from sending logic". The 7.1 rebase's `if (ent->fuse_req)` guard in `fuse_uring_send()` was redundant: every caller (COMMIT_AND_FETCH, `send_in_task`, 0029's RELEASE) is gated on a fetched request |
+| 0014 | — | hdr-to-ring | **DROPPED — landed** as `6582f8a06698` "fuse-uring: refactor io-uring header copying to ring" |
+| 0015 | — | hdr-from-ring | **DROPPED — landed** as `ba7d47897fd8` "fuse-uring: refactor io-uring header copying from ring" |
+| 0016 | — | enum header types | **DROPPED — landed** as `b2bbd7dcd243` "fuse-uring: use enum types for header copying" (7.2's form returns an OFFSET from `ring_header_type_offset()` where v4 returned a pointer from `get_user_ring_header()` — the shape 0019 rebases onto) |
+| 0017 | — | copy-state setup | **DROPPED — landed** as `c0f9203732fc` "fuse-uring: refactor setting up copy state for payload copying" (the rebase auto-dropped it as an empty commit — the strongest "already there" evidence) |
+| 0018 | 0013 | kaddr copy support (`dev.c`) | applied clean |
+| 0019 | 0014 | FUSE kmbuf ring | **rebased** (9 hunks): composed with 7.2's `fuse_conn → fuse_chan` split (`b03404ea3a05` ring->chan, `bf9932623d20` fch->lock, `0ea79b7d077f` fch->ring; every added `fc` site renamed) and with the landed offset form of the header helpers — `get_kernel_ring_header()` derives its `iov_iter_advance()` from `ring_header_type_offset()`, the user arms of `copy_header_{to,from}_ring()` compute `ent->headers + offset`; 7.2 idioms `fuse_pqueue_alloc()` (`48649c0603bd`), `kzalloc_obj(*ent)`, `READ_ONCE(ring->queues[qid])`, the `FUSE_URING_IOV_{HEADERS,PAYLOAD}` accessors (`8bbb2ad1f687`) in `create_ring_ent`; `#include "fuse_dev_i.h"` (`c0f817320d6a` dropped `fuse_i.h` from dev_uring) |
+| 0020 | 0015 | bvec rename | applied — context-only drift (ublk's `ublk_rq_has_data()` became `blk_rq_has_data()`), rename hunks unchanged |
+| 0021 | 0016 | register split | **rebased**: `imu->acct_pages` no longer exists (`df0a52537c0f` derives accounting at unmap via `io_buffer_unaccount_pages()`); the assignment is dropped from `io_kernel_buffer_init()` |
+| 0022 | 0017 | optional release | **rebased**: `io_buffer_unmap()` unaccounts from a derived local; the `if (imu->release)` guard composes with that form |
+| 0023 | 0018 | `io_buffer_register_bvec` | applied clean |
+| 0024 | 0019 | FUSE zc | **rebased**: `fch->ring` in `fuse_uring_register()`; and 7.2's `7d87a5a284bb` "fuse-uring: clear ent->fuse_req in commit_fetch error path" routes the `set_commit` `WARN_ON_ONCE` arm through `fuse_uring_req_end()` (background accounting) — the compile proof caught it ("too few arguments"): that site gains `issue_flags`, and because it reaches `req_end` with an ent still in userspace handoff (`ent->cmd == NULL` — no cmd owns the ent), the zc unregister is guarded on `ent->cmd` (the slot is released at ring-fd teardown like every other abandoned registration) |
+| 0025 | 0020 | abort-race folio refs | applied clean |
+| 0026 | 0021 | docs | applied clean |
+| 0027 | 0022 | seam (`io_buffer_add_list` check) | applied clean — **still required** on 7.2 (int-returning `io_buffer_add_list()` unchanged) |
+| 0028 | 0023 | `FUSE_TIME_LIMITS` | applied clean — hunks verified in 7.2's `process_init_reply` `time_gran` block and `fuse_new_init` flag mask |
+| 0029 | 0024 | zc payload retention | **rebased**: `fuse_uring_release_payload()` takes `struct fuse_chan *fch` (`fch->ring` / `fch->connected`), loads the queue with `READ_ONCE(ring->queues[qid])`, dispatch passes `fch`; the RETAIN arm composes with the `ent->cmd` guard (`zero_copied && !retain && ent->cmd`) and the 7.2 `req_end` site passes `false` |
+| 0030 | 0025 | nvme host-scoped fabric subsystems | applied clean (identical patch-id — the region is code-identical 7.1.6 → 7.2.3) |
+
+**Compile proof** (2026-09-03): running CachyOS `7.1.8-cachyos-lto`
+config (`/proc/config.gz`; `CONFIG_FUSE_IO_URING=y`,
+`CONFIG_IO_URING_BPF=y`, `CONFIG_IO_URING_ZCRX=y`, nvme-tcp/fabrics
+`=m`, ublk `=m`) → `make olddefconfig` (gcc 15.3, LTO/BTF/module-sign
+dropped — host-tool availability, not a series concern) →
+`make io_uring/ fs/fuse/ drivers/nvme/host/ drivers/block/ublk_drv.o`
+on the pristine AND the fully-patched 7.2.3 tree: **0 warnings /
+0 errors on both**, and `W=1` on exactly the eleven touched
+translation units: **empty warning set on both**. Every allocated ABI
+value verified in the built tree (`IORING_REGISTER_KMBUF_RING=38`,
+`UNREGISTER=39`, `IORING_REGISTER_LAST` past them,
+`IORING_OFF_KMBUF_RING 0x88000000`, `register.c` dispatch cases,
+`memmap.c` `IORING_OFF_KMBUF_RING` case, the four FUSE init/commit
+bits, `FUSE_IO_URING_CMD_RELEASE_PAYLOAD=3`, `FUSE_TIME_LIMITS
+1ULL<<62`, `nvme_core.fabrics_host_scoped_subsystems`, the
+`BUILD_BUG_ON(sizeof(struct fuse_uring_cmd_req) != 24)`).
+
+**Concatenated manager-ready form:** `~/sqz-kmbuf-zc-7.2.3-v1.patch`
+= `cat patches-7.2/00*.patch` (sha256
+`d977fafffe67dfe5429226331267a2c74220ca73c3d9280390056824ca77697a`,
+158,611 bytes) — sequential per-patch `patch -p1 --fuzz=0` dry-run +
+apply CLEAN 25/25 on a fresh pristine extraction; the single-shot real
+apply of the concat lands 0 rejects and produces a tree identical to
+the per-patch apply; the naive single-shot `--dry-run` of the whole
+file reports 92 false FAILED hunks (later hunks depending on earlier
+patches in the same file — the same control the 6.19 and 7.1
+artifacts show).
+
 ## Config
 
 Base: `config-base-7.1.2-1.el8.elrepo.x86_64` (the client's running

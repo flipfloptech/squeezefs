@@ -1,0 +1,34 @@
+From c88cacb0aadcb7f08c0272d9139dafb423475314 Mon Sep 17 00:00:00 2001
+From: Joanne Koong <joannelkoong@gmail.com>
+Date: Fri, 16 Jan 2026 15:30:41 -0800
+Subject: [PATCH 17/25] io_uring/rsrc: Allow buffer release callback to be
+ optional
+
+This is a preparatory patch for supporting kernel-populated buffers in
+fuse io-uring, which does not need a release callback.
+
+Signed-off-by: Joanne Koong <joannelkoong@gmail.com>
+Reviewed-by: Caleb Sander Mateos <csander@purestorage.com>
+
+[sqz 7.2.3 rebase] io_buffer_unmap() in 7.2 unaccounts from a derived local (acct_pages) rather than imu->acct_pages; the optional-release guard composes with that form.
+---
+ io_uring/rsrc.c | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/io_uring/rsrc.c b/io_uring/rsrc.c
+index cd8fadb2e..97ae2ab43 100644
+--- a/io_uring/rsrc.c
++++ b/io_uring/rsrc.c
+@@ -221,7 +221,8 @@ static void io_buffer_unmap(struct io_ring_ctx *ctx, struct io_mapped_ubuf *imu)
+ 
+ 	if (acct_pages)
+ 		io_unaccount_mem(ctx->user, ctx->mm_account, acct_pages);
+-	imu->release(imu->priv);
++	if (imu->release)
++		imu->release(imu->priv);
+ 	io_free_imu(ctx, imu);
+ }
+ 
+-- 
+2.55.0
+

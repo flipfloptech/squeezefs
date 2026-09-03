@@ -1,0 +1,76 @@
+From 13cb4314d29094bc0de93661ecfd733dd0a7205b Mon Sep 17 00:00:00 2001
+From: Joanne Koong <joannelkoong@gmail.com>
+Date: Fri, 16 Jan 2026 15:30:28 -0800
+Subject: [PATCH 09/25] io_uring/kbuf: add io_uring_is_kmbuf_ring()
+
+io_uring_is_kmbuf_ring() returns true if there is a kernel-managed
+buffer ring at the specified buffer group.
+
+This is a preparatory patch for upcoming fuse kernel-managed buffer
+support, which needs to ensure the buffer ring registered by the server
+is a kernel-managed buffer ring.
+
+Signed-off-by: Joanne Koong <joannelkoong@gmail.com>
+---
+ include/linux/io_uring/cmd.h |  9 +++++++++
+ io_uring/kbuf.c              | 20 ++++++++++++++++++++
+ 2 files changed, 29 insertions(+)
+
+diff --git a/include/linux/io_uring/cmd.h b/include/linux/io_uring/cmd.h
+index 0f04b7001..08ba3e24c 100644
+--- a/include/linux/io_uring/cmd.h
++++ b/include/linux/io_uring/cmd.h
+@@ -107,6 +107,9 @@ int io_uring_buf_ring_unpin(struct io_uring_cmd *cmd, unsigned buf_group,
+ int io_uring_kmbuf_recycle(struct io_uring_cmd *cmd, unsigned int buf_group,
+ 			   u64 addr, unsigned int len, unsigned int bid,
+ 			   unsigned int issue_flags);
++
++bool io_uring_is_kmbuf_ring(struct io_uring_cmd *cmd, unsigned int buf_group,
++			    unsigned int issue_flags);
+ #else
+ static inline int
+ io_uring_cmd_import_fixed(u64 ubuf, unsigned long len, int rw,
+@@ -181,6 +184,12 @@ static inline int io_uring_kmbuf_recycle(struct io_uring_cmd *cmd,
+ {
+ 	return -EOPNOTSUPP;
+ }
++static inline bool io_uring_is_kmbuf_ring(struct io_uring_cmd *cmd,
++					  unsigned int buf_group,
++					  unsigned int issue_flags)
++{
++	return false;
++}
+ #endif
+ 
+ static inline struct io_uring_cmd *io_uring_cmd_from_tw(struct io_tw_req tw_req)
+diff --git a/io_uring/kbuf.c b/io_uring/kbuf.c
+index fcf6dfdf8..140eda071 100644
+--- a/io_uring/kbuf.c
++++ b/io_uring/kbuf.c
+@@ -1002,3 +1002,23 @@ int io_register_kmbuf_ring(struct io_ring_ctx *ctx, void __user *arg)
+ 
+ 	return 0;
+ }
++
++bool io_uring_is_kmbuf_ring(struct io_uring_cmd *cmd, unsigned int buf_group,
++			    unsigned int issue_flags)
++{
++	struct io_ring_ctx *ctx = cmd_to_io_kiocb(cmd)->ctx;
++	struct io_buffer_list *bl;
++	bool is_kmbuf_ring = false;
++
++	io_ring_submit_lock(ctx, issue_flags);
++
++	bl = io_buffer_get_list(ctx, buf_group);
++	if (likely(bl) && (bl->flags & IOBL_KERNEL_MANAGED)) {
++		WARN_ON_ONCE(!(bl->flags & IOBL_BUF_RING));
++		is_kmbuf_ring = true;
++	}
++
++	io_ring_submit_unlock(ctx, issue_flags);
++	return is_kmbuf_ring;
++}
++EXPORT_SYMBOL_GPL(io_uring_is_kmbuf_ring);
+-- 
+2.55.0
+

@@ -568,6 +568,14 @@ pub struct ReclaimQueue {
     len: AtomicU64,
     /// Finding 40: the per-device supply registry (see [`SupplyEntry`]).
     supply: scc::HashMap<String, SupplyEntry>,
+    /// Finding 40 hysteresis: once the supply-pressure arm engages, the
+    /// drain runs to EMPTY. Without the latch the ratio is re-evaluated
+    /// per pass mid-drain — the first batch shrinks the queue and frees
+    /// supply, the ratio drops below the threshold, and the residue is
+    /// parked under moving foreground indefinitely (the all-features
+    /// gate caught 17–29 of 32 drained, `supply_drains` = 1, then a
+    /// forever-deferred tail).
+    pressure_latched: AtomicBool,
     /// Entries popped whose reclaim has not completed — drains must wait
     /// for these too, or the ENOSPC valve could observe an empty queue
     /// while the last free blocks are in a worker's hands.
@@ -616,6 +624,7 @@ impl ReclaimQueue {
             q: crossbeam::queue::SegQueue::new(),
             len: AtomicU64::new(0),
             supply: scc::HashMap::new(),
+            pressure_latched: AtomicBool::new(false),
             processing: AtomicU64::new(0),
             notify: Arc::new(squeezefs_ipc::sqz_notify::Notify::new()),
             worker_armed: AtomicBool::new(false),
@@ -918,10 +927,16 @@ impl ReclaimQueue {
                     // writers too); idle, full-width catch-up.
                     let at_cap = q.len.load(Ordering::Acquire) >= q.max_queued;
                     if q.foreground_active() && !at_cap {
-                        if q.supply_pressure() {
-                            // Fill-coupled pacing (finding 40): a thin
-                            // free supply outranks manners — drain so
-                            // headroom regenerates ahead of allocation.
+                        // Fill-coupled pacing (finding 40): a thin free
+                        // supply outranks manners — drain so headroom
+                        // regenerates ahead of allocation. The latch makes
+                        // the arm run to EMPTY once engaged (hysteresis):
+                        // the ratio is a trigger, never a per-pass gate.
+                        let latched = q.pressure_latched.load(Ordering::Acquire);
+                        if latched || q.supply_pressure() {
+                            if !latched {
+                                q.pressure_latched.store(true, Ordering::Release);
+                            }
                             METRICS
                                 .block_free_reclaim_supply_drains
                                 .fetch_add(1, Ordering::Relaxed);
@@ -946,6 +961,9 @@ impl ReclaimQueue {
                     let take = (q.batch_blocks * q.lanes_per_dev) as usize;
                     let batch = q.take_batch(take);
                     if batch.is_empty() {
+                        // Empty: the pressure episode (if any) is over —
+                        // the next engagement re-evaluates the ratio.
+                        q.pressure_latched.store(false, Ordering::Release);
                         break;
                     }
                     q.dispatch_lanes(batch).await;

@@ -7894,6 +7894,15 @@ impl KvMetaBackend {
                 guards.push(node.lock().write().await);
             }
             leaf_wait += t_leaf.elapsed();
+            // e2e audit D / D-2: the union HOLD (first acquire → every
+            // guard dropped) — recorded at every release site of this
+            // attempt; the "never across device I/O" law's instrument.
+            let record_hold = || {
+                crate::fuse_client::lock_phase_record(
+                    crate::fuse_client::LockPhase::LeafLockHold,
+                    t_leaf.elapsed(),
+                )
+            };
             // Revalidate EVERY member under the locks (§4.6); any stale
             // leaf ⇒ drop ALL, re-resolve ALL, re-lock the union.
             let stale = s.entries.iter().zip(&leaves).any(|(q, entry_leaves)| {
@@ -7904,6 +7913,7 @@ impl KvMetaBackend {
                 })
             });
             if stale {
+                record_hold();
                 drop(guards);
                 super::META_KV_COMMIT_SMO_RETRIES.fetch_add(1, Ordering::Relaxed);
                 continue;
@@ -7938,6 +7948,7 @@ impl KvMetaBackend {
                     }
                 }
                 if let Some(e) = cap_err {
+                    record_hold();
                     drop(guards);
                     let adm = s.admission.take().expect("admission held until reserve");
                     self.ring.core().release(adm);
@@ -8061,6 +8072,7 @@ impl KvMetaBackend {
                     }
                 }
             }
+            record_hold();
             drop(guards);
             if threshold_crossed {
                 // Wake the task for a maintenance-only pass NOW (appends,

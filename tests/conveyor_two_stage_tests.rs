@@ -24,14 +24,19 @@
 //!
 //! Suite runs `--test-threads=1` (process-global stats + fault shim).
 
-use squeezefs::meta_backend::kv::backend::KvMetaBackend;
-use squeezefs::meta_backend::kv::builder::{format_v3, FormatV3Options};
+use squeezefs::meta_backend::kv::backend::{
+    test_conveyor_hold_release, KvMetaBackend, TEST_CONVEYOR_HOLD_PRE_DRAIN,
+    TEST_CONVEYOR_HOLD_STAGE,
+};
+use squeezefs::meta_backend::kv::builder::{digest_backend, format_v3, FormatV3Options};
 use squeezefs::meta_backend::kv::{
     META_CONVEYOR_DURABILITY_PASSES, META_CONVEYOR_LEADER_PASSES, META_CONVEYOR_WINDOWS_INFLIGHT,
     META_CONVEYOR_WINDOWS_INFLIGHT_HWM, META_KV_JOURNAL_ENTRIES,
 };
 use squeezefs::meta_backend::{Metadata, RoutedMetaBackend};
-use std::sync::atomic::Ordering;
+use std::io::Write;
+use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tempfile::NamedTempFile;
@@ -90,12 +95,48 @@ impl Drop for EnvVarGuard {
     }
 }
 
-/// RAII: the fault shim never leaks across tests.
+/// RAII: the fault shim and the conveyor seams never leak across tests.
 struct FaultGuard;
 impl Drop for FaultGuard {
     fn drop(&mut self) {
         squeezefs::uring_fs::clear_faults();
+        TEST_CONVEYOR_HOLD_STAGE.store(0, Ordering::SeqCst);
+        test_conveyor_hold_release();
     }
+}
+
+const POLL_DEADLINE: Duration = Duration::from_secs(20);
+
+/// Bounded condition poll (the condition IS the contract; never a sleep
+/// used as synchronization).
+async fn poll_until(what: &str, mut cond: impl FnMut() -> bool) {
+    let deadline = Instant::now() + POLL_DEADLINE;
+    while Instant::now() < deadline {
+        if cond() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
+    panic!("poll_until({what}): the observable never held");
+}
+
+/// `lock_phase_ns.leaf_lock_hold`: (sum_ns, count, samples in buckets at
+/// or above `floor_us`) — the "never across device I/O" instrument.
+fn leaf_hold_snap(floor_us: u64) -> (u64, u64, u64) {
+    let j = squeezefs::fuse_client::lock_phase_json();
+    let h = &j["leaf_lock_hold"];
+    let floor_idx = squeezefs::latency_core::latency_bucket_index(floor_us);
+    let above: u64 = squeezefs::latency_core::LATENCY_BUCKET_LABELS
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| *i >= floor_idx)
+        .map(|(_, label)| h["buckets"][*label].as_u64().unwrap_or(0))
+        .sum();
+    (
+        h["sum_ns"].as_u64().unwrap_or(0),
+        h["count"].as_u64().unwrap_or(0),
+        above,
+    )
 }
 
 /// One `meta_txpass_phase_ns` phase's exact (sum_ns, count) pair.
@@ -331,5 +372,474 @@ async fn measurement_rows_conveyor_saturation_at_controlled_device_latency() {
         );
         kv.shutdown().await.expect("shutdown");
         drop(routed);
+    }
+}
+
+// ===========================================================================
+// 2. The two-stage contracts (red against the serialized conveyor)
+// ===========================================================================
+
+/// The journal device latency the shape contracts arm — two orders of
+/// magnitude above the apply floor, so the serialized and the overlapped
+/// shapes are unmistakable in wall time.
+const SLOW_DEVICE: Duration = Duration::from_millis(20);
+
+/// **Windows overlap when the device is slow.** One tx per batch (cap 1),
+/// 8 concurrent committers, a 20 ms journal write: the apply stage must
+/// keep applying while earlier windows wait on the device — at least 4
+/// windows in flight at once, the whole burst done in ≪ 8 × D, the
+/// serialized server's service time (`pass_total`) never containing the
+/// device wait, and no leaf lock ever held into the device's latency
+/// (the 4b law's instrument: `leaf_lock_hold` has no sample at or above
+/// D/2).
+///
+/// The serialized conveyor reads hwm == 1 and wall ≈ 8 × (apply + D).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn windows_overlap_when_the_journal_device_is_slow() {
+    let _faults = FaultGuard;
+    let _cap = EnvVarGuard::set("SQUEEZEFS_META_COMMIT_BATCH_TXS", "1");
+    let (routed, kv, file) = sandbox().await;
+    const COMMITTERS: usize = 8;
+
+    squeezefs::uring_fs::arm_device_latency(file.path(), SLOW_DEVICE, Duration::ZERO);
+    META_CONVEYOR_WINDOWS_INFLIGHT_HWM.store(0, Ordering::SeqCst);
+    let p0 = phase_snap();
+    let hold0 = leaf_hold_snap(SLOW_DEVICE.as_micros() as u64 / 2);
+
+    let t0 = Instant::now();
+    let mut tasks = Vec::new();
+    for c in 0..COMMITTERS {
+        let routed = routed.clone();
+        tasks.push(tokio::spawn(async move {
+            routed
+                .create(1, &format!("overlap_{c}"), libc::S_IFREG | 0o644, 0, 0)
+                .await
+                .expect("create")
+        }));
+    }
+    for t in tasks {
+        t.await.expect("committer task");
+    }
+    let wall = t0.elapsed();
+    let p1 = phase_snap();
+    let hold1 = leaf_hold_snap(SLOW_DEVICE.as_micros() as u64 / 2);
+    let hwm = META_CONVEYOR_WINDOWS_INFLIGHT_HWM.load(Ordering::Relaxed);
+    let passes = p1.pass_total.1 - p0.pass_total.1;
+    let pass_us = mean_us(p1.pass_total, p0.pass_total);
+    println!(
+        "overlap row: {COMMITTERS} committers, D = {:?}: wall {:.1} ms, passes {passes}, \
+         pass_total mean {pass_us:.0} us, windows hwm {hwm}, leaf-hold mean {:.1} us over {} \
+         holds ({} at/above D/2)",
+        SLOW_DEVICE,
+        wall.as_secs_f64() * 1e3,
+        (hold1.0 - hold0.0) as f64 / (hold1.1 - hold0.1).max(1) as f64 / 1e3,
+        hold1.1 - hold0.1,
+        hold1.2 - hold0.2,
+    );
+
+    assert!(
+        hwm >= 4,
+        "≥ 4 windows must be in flight at once while the device is slow (hwm {hwm}): the \
+         apply stage waited on the device"
+    );
+    assert!(
+        wall < SLOW_DEVICE * 3,
+        "8 one-tx windows against a {:?} device must complete in ≪ 8 × D (wall {:?}): the \
+         device write is serialized inside the pass",
+        SLOW_DEVICE,
+        wall
+    );
+    assert!(
+        pass_us < SLOW_DEVICE.as_micros() as f64 / 2.0,
+        "the serialized server's service time (pass_total mean {pass_us:.0} us) contains the \
+         device wait ({:?})",
+        SLOW_DEVICE
+    );
+    assert_eq!(
+        hold1.2 - hold0.2,
+        0,
+        "a leaf lock was held into the device's latency window (samples at/above D/2)"
+    );
+    assert_eq!(META_CONVEYOR_WINDOWS_INFLIGHT.load(Ordering::Relaxed), 0);
+    kv.shutdown().await.expect("shutdown");
+}
+
+/// **Throughput tracks the committer population, not one batch per
+/// device period.** A closed loop of 16 committers × 8 creates against a
+/// 5 ms journal write: the serialized conveyor settles into two ping-pong
+/// groups of 8 — every device period commits ONE batch of C/2, so txs/s ×
+/// (D + apply) ≈ C/2. With the device wait off the serialized server every
+/// committer is in flight during every device period: txs/s × (D + apply)
+/// → C. Contract: ≥ 0.75 C (the serialized shape reads 0.5 C by
+/// construction — measured 0.49–0.50 across the rows above).
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn throughput_tracks_the_committer_population_when_the_device_is_slow() {
+    let _faults = FaultGuard;
+    let (routed, kv, file) = sandbox().await;
+    const COMMITTERS: usize = 16;
+    const PER: usize = 8;
+    let d = Duration::from_millis(5);
+    let row = saturation_row(&routed, file.path(), "tput", COMMITTERS, PER, d).await;
+    let in_flight_per_period = row.txs_per_s() * (d.as_secs_f64() + row.leaf_locks_us / 1e6);
+    println!(
+        "throughput row: {COMMITTERS} x {PER} at D = {d:?}: {:.0} tx/s, {:.2} txs per device \
+         period (C = {COMMITTERS}), pass_total mean {:.0} us, queue_wait mean {:.0} us, hwm {}",
+        row.txs_per_s(),
+        in_flight_per_period,
+        row.pass_total_us,
+        row.queue_wait_us,
+        row.windows_hwm
+    );
+    assert!(
+        row.entries >= row.txs && row.entries <= row.txs + 16,
+        "one tx = one entry"
+    );
+    assert!(
+        in_flight_per_period >= 0.75 * COMMITTERS as f64,
+        "only {in_flight_per_period:.2} txs complete per device period for {COMMITTERS} \
+         committers: the conveyor commits one batch per device round trip"
+    );
+    assert!(
+        row.pass_total_us < d.as_micros() as f64 / 2.0,
+        "pass_total mean {:.0} us contains the device wait",
+        row.pass_total_us
+    );
+    kv.shutdown().await.expect("shutdown");
+}
+
+/// **Acks follow journal order across overlapped windows.** Eight
+/// one-tx windows enqueued in a known order (the pass held pre-drain, one
+/// arrival admitted at a time), then released against a 10 ms device: the
+/// committers must be answered in exactly enqueue order — which is drain
+/// order (the conveyor core's FIFO) and therefore journal-seq order (seqs
+/// are stamped in drain order inside the lock window) — while ≥ 2 windows
+/// are in flight, and their inos (allocated at staging, before enqueue)
+/// are monotone in that same order.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn acks_follow_journal_order_across_overlapped_windows() {
+    let _faults = FaultGuard;
+    let _cap = EnvVarGuard::set("SQUEEZEFS_META_COMMIT_BATCH_TXS", "1");
+    let (routed, kv, file) = sandbox().await;
+    const N: usize = 8;
+    let d = Duration::from_millis(10);
+    squeezefs::uring_fs::arm_device_latency(file.path(), d, Duration::ZERO);
+    META_CONVEYOR_WINDOWS_INFLIGHT_HWM.store(0, Ordering::SeqCst);
+
+    let ack_clock = Arc::new(AtomicU64::new(0));
+    TEST_CONVEYOR_HOLD_STAGE.store(TEST_CONVEYOR_HOLD_PRE_DRAIN, Ordering::SeqCst);
+    let mut tasks = Vec::new();
+    for i in 0..N {
+        let routed = routed.clone();
+        let clock = ack_clock.clone();
+        tasks.push(tokio::spawn(async move {
+            let ino = routed
+                .create(1, &format!("order_{i}"), libc::S_IFREG | 0o644, 0, 0)
+                .await
+                .expect("create")
+                .ino;
+            (clock.fetch_add(1, Ordering::SeqCst), ino)
+        }));
+        let want = i + 1;
+        poll_until("committer enqueued", || kv.conveyor_pending_len() >= want).await;
+    }
+    TEST_CONVEYOR_HOLD_STAGE.store(0, Ordering::SeqCst);
+    test_conveyor_hold_release();
+
+    let mut acks = Vec::with_capacity(N);
+    for t in tasks {
+        acks.push(t.await.expect("committer task"));
+    }
+    let hwm = META_CONVEYOR_WINDOWS_INFLIGHT_HWM.load(Ordering::Relaxed);
+    println!(
+        "order row: ack indices by enqueue order {:?}, hwm {hwm}",
+        acks
+    );
+    for (i, (ack_idx, _)) in acks.iter().enumerate() {
+        assert_eq!(
+            *ack_idx as usize, i,
+            "committer {i} (enqueue order) was acked {ack_idx}th — acks left journal order"
+        );
+    }
+    for w in acks.windows(2) {
+        assert!(w[0].1 < w[1].1, "inos are monotone in enqueue order");
+    }
+    assert!(
+        hwm >= 2,
+        "the eight released windows never overlapped (hwm {hwm})"
+    );
+    kv.shutdown().await.expect("shutdown");
+}
+
+/// **An ack never precedes its barrier (strict cadence).** With the
+/// volume's barrier PARKED (`arm_barrier_stall`), committers whose entries
+/// have fully landed in page cache (`completed_upto == head`) must still
+/// be unanswered; releasing the barrier answers every one of them. The
+/// durability stage's ack is gated on the barrier, never on the write.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_ack_never_precedes_its_barrier_on_the_strict_cadence() {
+    let _faults = FaultGuard;
+    let _strict = EnvVarGuard::set("SQUEEZEFS_META_FLUSH_INTERVAL_MS", "0");
+    let _cap = EnvVarGuard::set("SQUEEZEFS_META_COMMIT_BATCH_TXS", "1");
+    let (routed, kv, file) = sandbox().await;
+    const N: usize = 4;
+    let mut arrived = squeezefs::uring_fs::arm_barrier_stall(file.path());
+    let acked = Arc::new(AtomicU64::new(0));
+    let mut tasks = Vec::new();
+    for i in 0..N {
+        let routed = routed.clone();
+        let acked = acked.clone();
+        tasks.push(tokio::spawn(async move {
+            routed
+                .create(1, &format!("barrier_{i}"), libc::S_IFREG | 0o644, 0, 0)
+                .await
+                .expect("create");
+            acked.fetch_add(1, Ordering::SeqCst);
+        }));
+    }
+    // A barrier reached the stall: at least one window is written and
+    // parked on durability.
+    tokio::time::timeout(POLL_DEADLINE, arrived.recv())
+        .await
+        .expect("a barrier must reach the stall")
+        .expect("stall arrival channel");
+    poll_until("every submitted write landed", || {
+        kv.journal_ring().completed_upto() >= kv.journal_ring().core().head()
+    })
+    .await;
+    assert_eq!(
+        acked.load(Ordering::SeqCst),
+        0,
+        "a committer was acked while its barrier was still parked"
+    );
+    assert!(
+        META_CONVEYOR_WINDOWS_INFLIGHT.load(Ordering::Relaxed) >= 1,
+        "the written-but-unbarriered window is in flight"
+    );
+    squeezefs::uring_fs::release_barrier_stall(file.path());
+    for t in tasks {
+        t.await.expect("committer task");
+    }
+    assert_eq!(acked.load(Ordering::SeqCst), N as u64);
+    assert_eq!(META_CONVEYOR_WINDOWS_INFLIGHT.load(Ordering::Relaxed), 0);
+    kv.shutdown().await.expect("shutdown");
+}
+
+/// **A barrier failure fail-stops from the durability stage exactly as it
+/// does today** — with windows in flight. Strict cadence, a slow device
+/// (so six one-tx windows overlap), the reservation-conflict errno at the
+/// barrier: every committer is answered with an error (none stranded
+/// behind a fenced lane), the volume latches `failed`, the fence counter
+/// trips, the in-flight gauge closes, and later mutations refuse.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn barrier_failure_fail_stops_from_the_durability_stage_with_windows_in_flight() {
+    let _faults = FaultGuard;
+    let _strict = EnvVarGuard::set("SQUEEZEFS_META_FLUSH_INTERVAL_MS", "0");
+    let _cap = EnvVarGuard::set("SQUEEZEFS_META_COMMIT_BATCH_TXS", "1");
+    let (routed, kv, file) = sandbox().await;
+    const N: usize = 6;
+    squeezefs::uring_fs::arm_device_latency(file.path(), SLOW_DEVICE, Duration::ZERO);
+    squeezefs::uring_fs::arm_barrier_error(file.path(), libc::EBADE);
+    assert_eq!(kv.writer_guard_fenced(), 0);
+
+    let mut tasks = Vec::new();
+    for i in 0..N {
+        let routed = routed.clone();
+        tasks.push(tokio::spawn(async move {
+            routed
+                .create(1, &format!("fenced_{i}"), libc::S_IFREG | 0o644, 0, 0)
+                .await
+        }));
+    }
+    let mut errs = 0usize;
+    for t in tokio::time::timeout(POLL_DEADLINE, futures::future::join_all(tasks))
+        .await
+        .expect("every fenced committer must be answered (none stranded)")
+    {
+        if t.expect("committer task").is_err() {
+            errs += 1;
+        }
+    }
+    assert_eq!(errs, N, "every commit behind a fenced barrier fails");
+    assert!(
+        kv.is_failed(),
+        "reservation conflict at the barrier latches failed"
+    );
+    assert!(kv.writer_guard_fenced() >= 1, "the fence counter trips");
+    assert_eq!(
+        META_CONVEYOR_WINDOWS_INFLIGHT.load(Ordering::Relaxed),
+        0,
+        "no window left in flight after the fail-stop"
+    );
+    squeezefs::uring_fs::clear_faults();
+    assert!(
+        routed
+            .create(1, "after_fence", libc::S_IFREG | 0o644, 0, 0)
+            .await
+            .is_err(),
+        "the failed latch holds until remount"
+    );
+}
+
+// ===========================================================================
+// 3. Acked ⇒ replayed under kill -9 while windows overlap (the
+//    write_commit_crash_tests idiom)
+// ===========================================================================
+
+fn ledger_append(path: &std::path::Path, line: &str) {
+    let mut f = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .expect("open ledger");
+    f.write_all(format!("{line}\n").as_bytes())
+        .expect("append ledger");
+    f.sync_data().expect("fsync ledger");
+}
+
+/// Child branch: 8 committers stream one-tx windows against a 3 ms journal
+/// device (so several windows are always in flight) and ledger each ack
+/// AFTER `create` returns. The parent kills this process mid-stream.
+#[test]
+fn d2_crash_child_entry() {
+    if std::env::var("SQUEEZEFS_D2_CRASH_CHILD").is_err() {
+        return;
+    }
+    let vol = std::path::PathBuf::from(std::env::var("SQUEEZEFS_D2_VOL").unwrap());
+    let ledger = std::path::PathBuf::from(std::env::var("SQUEEZEFS_D2_LEDGER").unwrap());
+    std::env::set_var("SQUEEZEFS_META_COMMIT_BATCH_TXS", "1");
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(4)
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async move {
+        let kv = KvMetaBackend::open(&vol).await.unwrap();
+        let routed = Arc::new(RoutedMetaBackend::new(vec![kv.clone()]));
+        squeezefs::uring_fs::arm_device_latency(&vol, Duration::from_millis(3), Duration::ZERO);
+        let mut tasks = Vec::new();
+        for c in 0..8usize {
+            let routed = routed.clone();
+            let ledger = ledger.clone();
+            tasks.push(tokio::spawn(async move {
+                for i in 0.. {
+                    let name = format!("k{c}_{i}");
+                    routed
+                        .create(1, &name, libc::S_IFREG | 0o644, 0, 0)
+                        .await
+                        .unwrap();
+                    ledger_append(&ledger, &format!("ack {name}"));
+                }
+            }));
+        }
+        futures::future::join_all(tasks).await;
+    });
+}
+
+/// **Acked ⇒ replayed while windows overlap.** Kill -9 lands with several
+/// windows in flight (applied, submitted, some landed, some still on the
+/// device's latency lane); after remount every ledger-acked name must
+/// resolve (an ack is issued only after the entry's bytes landed — the D0
+/// law), the mount never fails loud, and replay is idempotent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn acked_commits_survive_kill9_while_windows_overlap() {
+    let rounds: u32 = std::env::var("SQUEEZEFS_D2_CRASH_ROUNDS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(5);
+    let exe = std::env::current_exe().expect("test binary path");
+    for round in 0..rounds {
+        let dir = tempfile::tempdir().unwrap();
+        let vol = dir.path().join("d2.v3.meta");
+        let ledger = dir.path().join("ledger.log");
+        {
+            let f = std::fs::File::create(&vol).unwrap();
+            f.set_len(VOL_LEN).unwrap();
+            format_v3(
+                &vol,
+                VOL_LEN,
+                &FormatV3Options {
+                    node_size: NODE_SIZE,
+                    journal_len_override: Some(RING_LEN),
+                    force: false,
+                    full_wipe: false,
+                    format_config_xattr: None,
+                },
+            )
+            .await
+            .unwrap();
+        }
+        let mut child = Command::new(&exe)
+            .args([
+                "--exact",
+                "d2_crash_child_entry",
+                "--test-threads=1",
+                "--nocapture",
+            ])
+            .env("SQUEEZEFS_D2_CRASH_CHILD", "1")
+            .env("SQUEEZEFS_D2_VOL", &vol)
+            .env("SQUEEZEFS_D2_LEDGER", &ledger)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn d2 crash child");
+
+        // Anchor the kill on a MEASURED ack count (never wall-clock).
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let mut anchored = false;
+        while Instant::now() < deadline {
+            let acks = std::fs::read_to_string(&ledger)
+                .map(|s| s.lines().filter(|l| l.starts_with("ack ")).count())
+                .unwrap_or(0);
+            if acks >= 40 {
+                anchored = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        assert!(
+            anchored,
+            "round {round}: the child never reached 40 acks in 60 s"
+        );
+        let jitter: u64 = {
+            use rand::Rng;
+            rand::thread_rng().gen_range(1..=30)
+        };
+        tokio::time::sleep(Duration::from_millis(jitter)).await;
+        child.kill().expect("SIGKILL d2 child");
+        let _ = child.wait();
+
+        let acked: Vec<String> = std::fs::read_to_string(&ledger)
+            .unwrap()
+            .lines()
+            .filter_map(|l| l.strip_prefix("ack ").map(str::to_string))
+            .collect();
+        let m1 = KvMetaBackend::open(&vol)
+            .await
+            .unwrap_or_else(|e| panic!("round {round}: remount failed loud after kill-9: {e}"));
+        let replay = m1.replay_stats();
+        eprintln!(
+            "[d2-kill9 round {round}] {} acked; replay {} entries, {} dropped-torn",
+            acked.len(),
+            replay.entries,
+            replay.dropped_torn
+        );
+        for name in &acked {
+            assert!(
+                Metadata::lookup(m1.as_ref(), 1, name).await.is_ok(),
+                "round {round}: ACKED create {name} lost after kill-9 — acked before its entry \
+                 landed"
+            );
+        }
+        let d1 = digest_backend(&m1).await.unwrap();
+        m1.shutdown().await.unwrap();
+        drop(m1);
+        let m2 = KvMetaBackend::open(&vol).await.unwrap();
+        assert_eq!(
+            m2.replay_stats().entries,
+            0,
+            "clean shutdown ⇒ empty replay window"
+        );
+        assert_eq!(digest_backend(&m2).await.unwrap(), d1, "replay idempotence");
+        m2.shutdown().await.unwrap();
     }
 }

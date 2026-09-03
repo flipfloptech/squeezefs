@@ -3345,14 +3345,21 @@ pub enum LockPhase {
     LeafLockWait = 2,
     /// 4a EXCLUSIVE `I{ino}` guard hold: acquisition → `DlmGuard` drop.
     DlmGuardHold = 3,
+    /// Conveyor pass: the 4b union leaf-lock HOLD — first guard acquired →
+    /// every guard dropped (revalidate + pre-images + reservation + RAM
+    /// apply); one sample per pass attempt. The "node locks never held
+    /// across device I/O" law's instrument (D-2): its tail must sit
+    /// ≪ the journal device latency on every shape.
+    LeafLockHold = 4,
 }
 
-const LOCK_PHASES: usize = 4;
+const LOCK_PHASES: usize = 5;
 const LOCK_PHASE_NAMES: [&str; LOCK_PHASES] = [
     "stripe_lock_wait",
     "stripe_lock_hold",
     "leaf_lock_wait",
     "dlm_guard_hold",
+    "leaf_lock_hold",
 ];
 
 static LOCK_PROF: Lazy<[LatencyHistogram; LOCK_PHASES]> =

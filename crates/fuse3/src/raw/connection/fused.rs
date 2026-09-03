@@ -452,13 +452,18 @@ pub struct FusedWriteDispatch {
 /// SAME pass, the CQE resumes it inline, and its prefilled commit is
 /// pumped in that pass too.
 /// The READ fusion lever (`SQUEEZEFS_FUSE_ZC_READ_FUSION`): **default
-/// ON** — accepted by the R-3 A-B-B-A rows (the local tcp devsub kern
-/// rand-4k row and the field row; `.benchmarks/2026-09-03-r3-fill-issue-
-/// economy.md`). `0` is the A/B control: a demoted READ takes R-2's
-/// handler-lane hand-off (the R-2-only shape byte-identical).
-/// Absent/malformed keeps the default (the transport lever law — the
-/// daemon's startup gate already refused a bad value). Read once per
-/// worker at arm.
+/// OFF** — arm (b) is the measured A/B lever, not the shipped posture.
+/// Standing alone against the pre-R-2 dispatch it won the field kern
+/// rand-4k row (+15.5 %, `.benchmarks/2026-09-03-r3-fill-issue-economy.md`
+/// §5.2); COMPOSED behind R-2's fast dispatch it read −6.5 % IOPS against
+/// R-2 alone (481 k vs 514 k, p50 +70 µs, p99 −66 %) — the two levers
+/// converge on the same wall (the reap thread's per-op serialization:
+/// the fused pass's run-queue waits, `dispatch_lag` 47 → 92 µs and
+/// `wake_hop` ≈ 100, replace the lane hop and the bridge's two worker
+/// hops at a net loss), so a demoted READ ships on arm (c). `1` fuses
+/// (the tail-shaped posture: p99 1.5 vs 4.3 ms). Absent/malformed keeps
+/// the default (the transport lever law — the daemon's startup gate
+/// already refused a bad value). Read once per worker at arm.
 pub(crate) fn read_fusion_enabled() -> bool {
     crate::env_knob_core::parse_bool(
         "SQUEEZEFS_FUSE_ZC_READ_FUSION",
@@ -468,7 +473,7 @@ pub(crate) fn read_fusion_enabled() -> bool {
     )
     .ok()
     .flatten()
-    .unwrap_or(true)
+    .unwrap_or(false)
 }
 
 /// Count one fused READ dispatch (`fuse3_zc_read_fusions` on the stats

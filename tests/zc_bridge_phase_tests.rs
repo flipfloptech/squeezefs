@@ -449,10 +449,9 @@ fn cold_zc_reads_decompose_into_four_exact_hops_with_a_per_op_chain() {
 /// `serves + zc_read_fusions + demotes ≡ READs`, and the two handler
 /// venues together are exactly the in-place replies
 /// (`zc_read_fusions + demotes ≡ fuse3_read_inplace_replies`). With the
-/// fusion lever off the same READs all take the lane arm (the R-2-only
-/// shape), and the fused bridge's `msg_hop` — a same-thread channel op
-/// when fused — is the only phase whose mean moves by an order of
-/// magnitude between the two.
+/// fusion lever off (the shipped default) the same READs all take the
+/// lane arm (the R-2 shape); with it on they fuse, and only the fused arm
+/// resolves bridge CQEs in the worker's mid-pass reap.
 #[test]
 fn composed_dispatch_law_partitions_every_read_on_a_zc_session() {
     if !mount_supported(site!()) {
@@ -487,8 +486,11 @@ fn composed_dispatch_law_partitions_every_read_on_a_zc_session() {
         )
     };
     let mut msg_hop_means = Vec::new();
+    // The lever's default is OFF (arm (c) ships — the composition
+    // measured it); both arms are named explicitly so the contract does
+    // not depend on the default.
     for (arm, envs) in [
-        ("fused", vec![]),
+        ("fused", vec![("SQUEEZEFS_FUSE_ZC_READ_FUSION", "1")]),
         ("lane", vec![("SQUEEZEFS_FUSE_ZC_READ_FUSION", "0")]),
     ] {
         let log = base.join(format!("mount-{arm}.log"));

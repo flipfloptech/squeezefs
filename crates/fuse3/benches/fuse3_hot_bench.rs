@@ -462,6 +462,160 @@ fn bench_delivery_bounds(c: &mut Criterion) {
     group.finish();
 }
 
+/// R-2 (e2e perf audit read board #2): the READ ingress, three ways.
+///
+/// Field shape (`.benchmarks/2026-09-03-4k-random-attribution.md` §4):
+/// a 4 KiB kern random read paid `queue_wait` 69 µs + `dispatch_lag`
+/// 89 µs between the reap CQE and the handler's first poll — the hop
+/// this group prices in isolation (queueing excluded: one op in flight,
+/// so every arm reads the MECHANISM's floor, not the loaded row).
+///
+/// * `hop_queue_dispatch_spawn` — the shipped path: the reap thread
+///   pushes an `InboundUringReq`-shaped frame on the sqz unbounded
+///   channel; a dispatch task parked on that channel (polled on a
+///   `fuse3-tpc` lane, like the per-queue session worker) pops it,
+///   reconstructs the classical framing (header copy + bincode
+///   `fuse_in_header` / `fuse_read_in` decode — the dispatch loop's
+///   exact work) and spawns the handler future onto the lanes; the
+///   handler's first poll answers a oneshot the "worker" awaits. Two
+///   cross-thread wakes + one spawn per op.
+/// * `inline_probe_commit_4k` — the fast-dispatch SERVE arm, all on the
+///   reap thread: the same `fuse_read_in` decode, a sync probe returning
+///   a 4 KiB snapshot slice, the reply's out-header encode and the
+///   `apply_reply`-class body copy into the ent payload window. Zero
+///   hops.
+/// * `mint_direct_lane_spawn` — the fast-dispatch DEMOTE arm: decode +
+///   mint the handler future on the reap thread and hand it straight to
+///   a lane (`tpc_spawn`), whose first poll answers the oneshot. One
+///   cross-thread wake; the inbound queue + dispatch task deleted.
+fn bench_read_ingress(c: &mut Criterion) {
+    use fuse3::raw::abi::fuse_read_in;
+    use fuse3::sqz_channel::{mpsc, oneshot};
+    use futures::executor::block_on;
+
+    const HDR: usize = 40;
+    const OP_IN: usize = 128;
+    const PAYLOAD: usize = 4096;
+
+    // A kernel-shaped READ frame: fuse_in_header (len/opcode/unique/
+    // nodeid) || fuse_read_in in the 128 B op_in slot.
+    fn read_frame(unique: u64) -> Vec<u8> {
+        let mut f = vec![0u8; HDR + OP_IN];
+        f[0..4].copy_from_slice(&((HDR + 40) as u32).to_le_bytes());
+        f[4..8].copy_from_slice(&15u32.to_le_bytes()); // FUSE_READ
+        f[8..16].copy_from_slice(&unique.to_le_bytes());
+        f[16..24].copy_from_slice(&42u64.to_le_bytes()); // nodeid
+                                                         // fuse_read_in: fh, offset, size, read_flags, lock_owner, flags
+        f[HDR..HDR + 8].copy_from_slice(&7u64.to_le_bytes());
+        f[HDR + 8..HDR + 16].copy_from_slice(&(PAYLOAD as u64 * 3).to_le_bytes());
+        f[HDR + 16..HDR + 20].copy_from_slice(&(PAYLOAD as u32).to_le_bytes());
+        f
+    }
+
+    /// The dispatch loop's per-op reconstruction: header decode + op
+    /// decode (the exact codec the session runs).
+    fn decode(frame: &[u8]) -> (fuse_in_header, fuse_read_in) {
+        let h: fuse_in_header = get_bincode_config().deserialize(&frame[..HDR]).unwrap();
+        let r: fuse_read_in = get_bincode_config()
+            .deserialize(&frame[HDR..HDR + 40])
+            .unwrap();
+        (h, r)
+    }
+
+    /// The reply's out-header encode + `apply_reply`'s body move into the
+    /// ent payload window (the worker's commit-side CPU on a served READ).
+    fn commit_inline(unique: u64, body: &[u8], payload: &mut [u8]) -> usize {
+        let out = fuse_out_header {
+            len: (16 + body.len()) as u32,
+            error: 0,
+            unique,
+        };
+        let mut hdr = Vec::with_capacity(16);
+        get_bincode_config().serialize_into(&mut hdr, &out).unwrap();
+        payload[..body.len()].copy_from_slice(body);
+        black_box(hdr.len()) + body.len()
+    }
+
+    struct Frame {
+        header_and_op: Vec<u8>,
+        done: oneshot::Sender<u64>,
+    }
+
+    let mut group = c.benchmark_group("read_ingress");
+    group.throughput(Throughput::Elements(1));
+
+    // Arm 1: the shipped hop. One dispatch task parked on the channel for
+    // the whole measurement (the per-queue session worker's shape).
+    {
+        let (tx, mut rx) = mpsc::unbounded_channel::<Frame>();
+        fuse3::tpc_spawn(async move {
+            while let Some(f) = rx.recv().await {
+                let (h, r) = decode(&f.header_and_op);
+                // `spawn_read`: the handler future onto the lanes; its
+                // first poll is the reply.
+                fuse3::tpc_spawn(async move {
+                    let _ = f.done.send(h.unique ^ r.offset);
+                });
+            }
+        });
+        let frame = read_frame(2);
+        group.bench_function("hop_queue_dispatch_spawn", |b| {
+            b.iter(|| {
+                let (done, rx) = oneshot::channel();
+                assert!(
+                    tx.send(Frame {
+                        header_and_op: frame.clone(),
+                        done,
+                    })
+                    .is_ok(),
+                    "dispatch task alive"
+                );
+                black_box(block_on(rx).expect("handler replied"))
+            })
+        });
+    }
+
+    // Arm 2: the inline serve. The probe is a snapshot-slice return (the
+    // active-buffer / hold hit — a refcount clone, no copy); the commit
+    // copies the 4 KiB into the ent payload.
+    {
+        let snapshot = bytes::Bytes::from(vec![0xA7u8; 1 << 20]);
+        let probe = |offset: u64, size: u32| -> bytes::Bytes {
+            let o = offset as usize;
+            snapshot.slice(o..o + size as usize)
+        };
+        let mut payload = vec![0u8; PAYLOAD];
+        let frame = read_frame(4);
+        group.bench_function("inline_probe_commit_4k", |b| {
+            b.iter(|| {
+                let (h, r) = decode(black_box(&frame));
+                let body = probe(r.offset, r.size);
+                black_box(commit_inline(h.unique, &body, &mut payload))
+            })
+        });
+    }
+
+    // Arm 3: the direct lane mint — decode + Box::pin the handler future
+    // on the reap thread, one lane hop, reply.
+    {
+        let frame = read_frame(6);
+        group.bench_function("mint_direct_lane_spawn", |b| {
+            b.iter(|| {
+                let (h, r) = decode(black_box(&frame));
+                let (done, rx) = oneshot::channel();
+                let fut: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> =
+                    Box::pin(async move {
+                        let _ = done.send(h.unique ^ r.offset);
+                    });
+                fuse3::tpc_spawn(fut);
+                black_box(block_on(rx).expect("handler replied"))
+            })
+        });
+    }
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_delivery_bounds,
@@ -469,6 +623,7 @@ criterion_group!(
     bench_commit_batch,
     bench_kmbuf_attach,
     bench_conn_prelude,
-    bench_reply_addressing
+    bench_reply_addressing,
+    bench_read_ingress
 );
 criterion_main!(benches);

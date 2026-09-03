@@ -219,6 +219,7 @@ struct Row {
     passes: u64,
     entries: u64,
     wall: Duration,
+    queue_wait_us: f64,
     /// `journal_ring_write` (submit → observed): mean / mode / count.
     ring_write_mean_us: f64,
     ring_write_mode_us: u64,
@@ -245,6 +246,7 @@ async fn hop_row(routed: &Arc<RoutedMetaBackend>, tag: &str, committers: usize, 
     let u0 = ufs_snap();
     let (rw0, rwb0) = txpass_phase("journal_ring_write");
     let (lw0, _) = txpass_phase("window_lane_wait");
+    let (qw0, _) = txpass_phase("tx_queue_wait");
     let passes0 = META_CONVEYOR_LEADER_PASSES.load(Ordering::Relaxed);
     let entries0 = META_KV_JOURNAL_ENTRIES.load(Ordering::Relaxed);
 
@@ -270,6 +272,7 @@ async fn hop_row(routed: &Arc<RoutedMetaBackend>, tag: &str, committers: usize, 
     let u1 = ufs_snap();
     let (rw1, rwb1) = txpass_phase("journal_ring_write");
     let (lw1, _) = txpass_phase("window_lane_wait");
+    let (qw1, _) = txpass_phase("tx_queue_wait");
     let parts = (u1.queue_hop.0 - u0.queue_hop.0)
         + (u1.device.0 - u0.device.0)
         + (u1.wake_hop.0 - u0.wake_hop.0);
@@ -279,6 +282,7 @@ async fn hop_row(routed: &Arc<RoutedMetaBackend>, tag: &str, committers: usize, 
         passes: META_CONVEYOR_LEADER_PASSES.load(Ordering::Relaxed) - passes0,
         entries: META_KV_JOURNAL_ENTRIES.load(Ordering::Relaxed) - entries0,
         wall,
+        queue_wait_us: mean_us(qw1, qw0),
         ring_write_mean_us: mean_us(rw1, rw0),
         ring_write_mode_us: mode_us(&rwb1, &rwb0),
         ring_write_n: rw1.1 - rw0.1,
@@ -302,11 +306,12 @@ fn build_label() -> &'static str {
 fn print_header(title: &str) {
     println!("{title}");
     println!(
-        "{:<22}{:>8}{:>7}{:>9}{:>10}{:>9}{:>7}{:>10}{:>9}{:>10}{:>9}",
+        "{:<22}{:>8}{:>7}{:>9}{:>9}{:>10}{:>9}{:>7}{:>10}{:>9}{:>10}{:>9}",
         "row",
         "txs/s",
         "passes",
         "tx/pass",
+        "txq_us",
         "write_us",
         "mode_us",
         "m/m",
@@ -319,11 +324,12 @@ fn print_header(title: &str) {
 
 fn print_row(label: &str, row: &Row) {
     println!(
-        "{:<22}{:>8.0}{:>7}{:>9.1}{:>10.1}{:>9}{:>7.1}{:>10.1}{:>9.1}{:>10.1}{:>9.1}",
+        "{:<22}{:>8.0}{:>7}{:>9.1}{:>9.1}{:>10.1}{:>9}{:>7.1}{:>10.1}{:>9.1}{:>10.1}{:>9.1}",
         label,
         row.txs_per_s(),
         row.passes,
         row.txs as f64 / row.passes.max(1) as f64,
+        row.queue_wait_us,
         row.ring_write_mean_us,
         row.ring_write_mode_us,
         row.ring_write_mean_us / row.ring_write_mode_us.max(1) as f64,
@@ -431,4 +437,70 @@ async fn measurement_rows_completion_hop_under_lane_and_box_load() {
         kv.shutdown().await.expect("shutdown");
         drop(routed);
     }
+}
+
+// ===========================================================================
+// 2. The contract (red against the shipped chain)
+// ===========================================================================
+
+/// The exaggerated serve burst the structural contract arms: long enough
+/// that a hop landing behind ONE burst is unmistakable against the write's
+/// own ~100 µs round trip.
+const STRUCTURAL_BURST: Duration = Duration::from_millis(2);
+
+/// **The commit plane's completion delivery is isolated from the serve
+/// plane.** Four hog tasks × 2 ms bursts saturate both `sqz-meta` lanes —
+/// the STRUCTURAL form of the fleet's owner serves on the lanes the
+/// durability task shares with them. 16 × 32 creates at D = 0. Laws:
+///
+/// * `wake_hop` (the reaper observed the CQE → the durability lane
+///   observed the outcome) does not wait behind a serve burst: mean
+///   < burst/4. On the shipped chain the oneshot's waker enqueues the
+///   lane task behind the hogs (mean ≈ 1–2 bursts).
+/// * `window_lane_wait` (handoff → the lane picked the window up) does not
+///   wait behind a serve burst: mean < burst/4 — the in-order lane's
+///   pickup is not HOL-blocked by unrelated work.
+/// * `tx_queue_wait` (enqueue → drained) does not wait behind a serve
+///   burst: mean < burst/2 — the apply pass is not dispatched behind them
+///   either.
+/// * validity as every row: one tx = one entry, gauge closes, exact-sum.
+///
+/// The mean-vs-mode of `journal_ring_write` is printed for the record (the
+/// audit's phrasing of the finding); the octave buckets make the burst-
+/// relative laws above the pinnable form.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn completion_delivery_is_isolated_from_the_serve_lanes() {
+    let _faults = FaultGuard;
+    let (routed, kv, _file) = sandbox().await;
+    let hog = LaneHog::start(4, STRUCTURAL_BURST);
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let row = hop_row(&routed, "iso", COMMITTERS, PER).await;
+    drop(hog);
+    print_header(&format!(
+        "C-2 structural row ({} build, 4 x {STRUCTURAL_BURST:?} bursts on sqz-meta):",
+        build_label()
+    ));
+    print_row("serve-lane saturated", &row);
+    assert_row_valid("serve-lane saturated", &row);
+    let burst_us = STRUCTURAL_BURST.as_micros() as f64;
+    assert!(
+        row.wake_hop_us < burst_us / 4.0,
+        "the journal write's completion waited behind the serve lanes' bursts: wake_hop mean \
+         {:.0} us against {burst_us:.0} us bursts — the durability lane learns the completion \
+         through a hop onto a lane it shares with the serve plane",
+        row.wake_hop_us
+    );
+    assert!(
+        row.lane_wait_us < burst_us / 4.0,
+        "the in-order durability lane's pickup of the next window waited behind the serve \
+         lanes' bursts: window_lane_wait mean {:.0} us against {burst_us:.0} us bursts",
+        row.lane_wait_us
+    );
+    assert!(
+        row.queue_wait_us < burst_us / 2.0,
+        "the apply pass was dispatched behind the serve lanes' bursts: tx_queue_wait mean {:.0} \
+         us against {burst_us:.0} us bursts",
+        row.queue_wait_us
+    );
+    kv.shutdown().await.expect("shutdown");
 }

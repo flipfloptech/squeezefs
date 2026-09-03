@@ -232,6 +232,23 @@ impl From<Bytes> for ReplyData {
     }
 }
 
+/// The outcome of [`Filesystem::read_fast_probe`](crate::raw::Filesystem::read_fast_probe)
+/// — the READ fast-dispatch probe the transport runs SYNC on the reaping
+/// queue-worker thread (e2e perf audit R-2).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FastReadProbe {
+    /// The whole reply body, already clamped to EOF (an empty `Bytes` is
+    /// EOF). The bytes may ALIAS the destination window the probe was
+    /// handed (a tier serve that landed there directly) — the transport's
+    /// commit elides that copy by pointer equality, exactly as the
+    /// handler's dest-armed serves do.
+    Served(Bytes),
+    /// Not sync-servable — cold block, a writer holding the inode lock,
+    /// an overlay, a multi-block span, a virtual inode, device-true
+    /// O_DIRECT, … — the FULL handler runs on a lane, unchanged.
+    Demote,
+}
+
 #[derive(Debug, Copy, Clone, Ord, PartialOrd, Eq, PartialEq, Hash)]
 /// open reply.
 pub struct ReplyOpen {

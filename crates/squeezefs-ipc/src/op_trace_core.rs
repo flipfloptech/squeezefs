@@ -73,6 +73,13 @@ pub enum Stage {
     /// Reply committed to the transport (reply_commit / transport_total
     /// end).
     ReplyCommit = 5,
+    /// READ fast-dispatch (e2e perf audit R-2): the reaping queue worker
+    /// ran the filesystem's sync probe and served this READ inline —
+    /// stamped at the SAME instant as `transport_recv`, and standing in
+    /// for `dispatch` AND `handler_entry` (the stitch aliases it), so
+    /// `queue_wait` and `dispatch_lag` read 0 on the served op. A demoted
+    /// READ stamps the ordinary `dispatch` at its mint instead.
+    FastDispatch = 6,
 
     // -- read serve (root, `read_serve_phase_ns` ends) -----------------
     /// prelude end: handler → router dispatch.
@@ -224,6 +231,7 @@ impl Stage {
         Stage::HandlerEntry,
         Stage::HandlerReturn,
         Stage::ReplyCommit,
+        Stage::FastDispatch,
         Stage::ReadRouted,
         Stage::MetaResolved,
         Stage::KeysResolved,
@@ -297,6 +305,7 @@ impl Stage {
             Stage::HandlerEntry => "handler_entry",
             Stage::HandlerReturn => "handler_return",
             Stage::ReplyCommit => "reply_commit",
+            Stage::FastDispatch => "fast_dispatch",
             Stage::ReadRouted => "read_routed",
             Stage::MetaResolved => "meta_resolved",
             Stage::KeysResolved => "keys_resolved",

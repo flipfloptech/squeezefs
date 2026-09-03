@@ -89,8 +89,29 @@ FAMILY_CLASS = {
     "write_pipeline_phase_ns": "write",
 }
 
-READ_MARKERS = {"read_routed", "read_return", "meta_resolved"}
+# `fast_dispatch` (R-2): a READ served inline on the reaping queue worker
+# stamps it AT the arrival instant and never stamps `dispatch` /
+# `handler_entry` (it paid neither hop). The daemon records exact zeros on
+# `queue_wait`/`dispatch_lag` for such an op, so the stitch aliases the
+# stamp for both (`expand_fast_dispatch`) — the spans read 0 and the
+# containment check keeps dividing the whole READ population.
+READ_MARKERS = {"read_routed", "read_return", "meta_resolved", "fast_dispatch"}
 WRITE_MARKERS = {"write_admitted", "write_done", "write_dma_done"}
+FAST_DISPATCH_ALIASES = ("dispatch", "handler_entry")
+
+
+def expand_fast_dispatch(chain):
+    """Alias a served op's `fast_dispatch` stamp as `dispatch` and
+    `handler_entry` (same instant) when the op carries neither."""
+    names = {n for _, n in chain}
+    if "fast_dispatch" not in names:
+        return chain
+    at = next(ns for ns, n in chain if n == "fast_dispatch")
+    for alias in FAST_DISPATCH_ALIASES:
+        if alias not in names:
+            chain.append((at, alias))
+    chain.sort()
+    return chain
 
 
 def fmt_ns(ns):
@@ -122,6 +143,7 @@ def load_trace(path):
         ops.setdefault(int(op_id), []).append((int(ns), stages.get(int(stage), f"stage{stage}")))
     for chain in ops.values():
         chain.sort()
+        expand_fast_dispatch(chain)
     return d, ops
 
 

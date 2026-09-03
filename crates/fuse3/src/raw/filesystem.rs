@@ -54,6 +54,44 @@ pub trait Filesystem {
         false
     }
 
+    /// READ fast-dispatch probe (e2e perf audit R-2, read board #2): may
+    /// THIS READ be served from RAM-resident state right now, with no
+    /// await and no blocking wait? The transport calls it on the reaping
+    /// queue-worker thread at the delivery CQE, BEFORE the request is
+    /// queued anywhere: a `Served` body is committed inline (no channel,
+    /// no wake, no lane — `queue_wait == dispatch_lag == 0`), a `Demote`
+    /// mints the full [`Filesystem::read`] handler onto a lane exactly as
+    /// before.
+    ///
+    /// **Default `Demote`** — a filesystem that implements nothing keeps
+    /// the byte-identical lane dispatch for every READ.
+    ///
+    /// Contract: SYNC, TRY-ONLY, non-blocking. The probe must never wait
+    /// on a lock (a contended per-inode lock is a `Demote`, never a
+    /// spin), never touch a device, never allocate on the served path
+    /// beyond a refcount clone, and must return exactly the bytes
+    /// [`Filesystem::read`] would (same size clamp, same coherence
+    /// source) — a `Demote` on ANY doubt is correct by construction,
+    /// because the handler it defers to is the authoritative path.
+    ///
+    /// `dest` is this request's reply destination window `(addr, cap)`
+    /// (the transport's registered ent payload — the bounce slot on zc
+    /// sessions) when the transport has one: a tier serve may land its
+    /// bytes there and return a `Bytes` aliasing them (the commit elides
+    /// the copy). Writes past `cap` are refused by the implementor.
+    fn read_fast_probe(
+        &self,
+        ino: Inode,
+        fh: u64,
+        offset: u64,
+        size: u32,
+        flags: u32,
+        dest: Option<(u64, usize)>,
+    ) -> FastReadProbe {
+        let _ = (ino, fh, offset, size, flags, dest);
+        FastReadProbe::Demote
+    }
+
     /// clean up filesystem. Called on filesystem exit which is fuseblk, in normal fuse filesystem,
     /// kernel may call forget for root. There is some discuss for this
     /// <https://github.com/bazil/fuse/issues/82#issuecomment-88126886>,

@@ -458,6 +458,44 @@ pub static META_CONVEYOR_LEADER_PASSES: AtomicU64 = AtomicU64::new(0);
 /// journal-failure lattice bumped — never a silent `completed_upto` wedge.
 pub static META_CONVEYOR_PASS_PANICS: AtomicU64 = AtomicU64::new(0);
 
+/// Conveyor WINDOWS in flight (`meta_conveyor_windows_inflight`): batches
+/// past their RAM apply whose journal write has been submitted but whose
+/// members are not yet at a terminal outcome — i.e. the applied-but-
+/// not-yet-acked population between the conveyor's apply stage and its
+/// durability stage (e2e perf audit DLM #2, D-2). A serialized conveyor
+/// (apply → write → ack in one server) can never read above 1; the
+/// two-stage conveyor's engagement instrument is this gauge's high-water
+/// mark ([`META_CONVEYOR_WINDOWS_INFLIGHT_HWM`]) reading ≥ 2 under load.
+/// Bounded structurally by the ring's admissible capacity (§4.4 pt 5:
+/// every window holds a registered reservation, and admission parks on
+/// ring space before any node lock) — never by a constant.
+pub static META_CONVEYOR_WINDOWS_INFLIGHT: AtomicU64 = AtomicU64::new(0);
+
+/// High-water mark of [`META_CONVEYOR_WINDOWS_INFLIGHT`] since process
+/// start (`meta_conveyor_windows_inflight_hwm`) — the D-2 engagement
+/// instrument: 1 = the serialized shape, ≥ 2 = journal writes overlapped
+/// the next batch's apply.
+pub static META_CONVEYOR_WINDOWS_INFLIGHT_HWM: AtomicU64 = AtomicU64::new(0);
+
+/// Durability-stage passes (`meta_conveyor_durability_passes`): one per
+/// group of windows the durability lane took to a terminal outcome
+/// together (in journal order; strict cadence = one coalesced barrier per
+/// group). Windows ÷ passes is the lane's live coalesce factor; growing
+/// [`META_CONVEYOR_WINDOWS_INFLIGHT`] while this stays flat is the
+/// stalled-durability-lane signature.
+pub static META_CONVEYOR_DURABILITY_PASSES: AtomicU64 = AtomicU64::new(0);
+
+/// Note a window entering the in-flight population (apply stage handoff).
+pub(crate) fn note_window_inflight() {
+    let now = META_CONVEYOR_WINDOWS_INFLIGHT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    META_CONVEYOR_WINDOWS_INFLIGHT_HWM.fetch_max(now, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Note a window reaching its terminal outcome (every member answered).
+pub(crate) fn note_window_done() {
+    META_CONVEYOR_WINDOWS_INFLIGHT.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// Entries queued on ANY conveyor (tx + layout, every volume) and not
 /// yet drained by a pass — the wedge census's stalled-conveyor gauge
 /// (zc-bridge-cqe-wedge, 2026-08-07): growing while

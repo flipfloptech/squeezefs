@@ -8082,6 +8082,10 @@ impl KvMetaBackend {
         // contiguous reservation, one `write_at_batch` submission. A
         // failed member's sub-range stays unwritten (the §4.4 pt 4
         // unwritten-hole mechanism; replay's checksum walk drops it).
+        // The window is in flight from here until its members' terminal
+        // outcomes are staged (D-2's engagement instrument).
+        super::note_window_inflight();
+        super::META_CONVEYOR_DURABILITY_PASSES.fetch_add(1, Ordering::Relaxed);
         let t_jwrite = std::time::Instant::now();
         let write_out = {
             let mut parts: Vec<(Reservation, &[(u8, Record)])> = Vec::new();
@@ -8234,6 +8238,7 @@ impl KvMetaBackend {
                 }
             }
         }
+        super::note_window_done();
     }
 
     /// The §4.4 pt 5 user ring admission with the D1.b park-escalation

@@ -2242,6 +2242,7 @@ pub fn wedge_census_line() -> String {
     };
     format!(
         "wedge census: meta_conveyor_passes={} meta_conveyor_queued={} \
+         meta_conveyor_windows_inflight={} meta_conveyor_durability_passes={} \
          meta_commit_parked={} meta_publish_parked={} meta_journal_entries={} \
          meta_checkpoints={} pipeline_inflight_blocks={} pipeline_admission_waits={} \
          reclaim_queue_bytes={} rewrite_open_epochs={} transport_leases_outstanding={} \
@@ -2249,6 +2250,11 @@ pub fn wedge_census_line() -> String {
          lane_exec_tick_rescues={} lane_exec_task_panics={}",
         crate::meta_backend::kv::META_CONVEYOR_LEADER_PASSES.load(Ordering::Relaxed),
         crate::meta_backend::kv::META_CONVEYOR_QUEUED.load(Ordering::Relaxed),
+        // Windows in flight growing while durability passes stay flat =
+        // the durability lane stalled (X is inside a write completion, a
+        // barrier, or a hole checkpoint).
+        crate::meta_backend::kv::META_CONVEYOR_WINDOWS_INFLIGHT.load(Ordering::Relaxed),
+        crate::meta_backend::kv::META_CONVEYOR_DURABILITY_PASSES.load(Ordering::Relaxed),
         crate::meta_backend::kv::META_COMMIT_PARKED.load(Ordering::Relaxed),
         crate::meta_backend::kv::META_PUBLISH_PARKED.load(Ordering::Relaxed),
         crate::meta_backend::kv::META_KV_JOURNAL_ENTRIES.load(Ordering::Relaxed),
@@ -11563,6 +11569,23 @@ impl SqueezefsFilesystem {
                 metrics.insert(
                     "meta_conveyor_pass_panics".into(),
                     load(&meta_kv::META_CONVEYOR_PASS_PANICS),
+                );
+                // D-2 (e2e audit DLM #2): the two-stage conveyor's
+                // engagement instrument — applied-but-unacked windows in
+                // flight, their high-water mark (1 = serialized, ≥ 2 =
+                // overlapped), and the durability lane's pass count
+                // (windows ÷ passes = its coalesce factor).
+                metrics.insert(
+                    "meta_conveyor_windows_inflight".into(),
+                    load(&meta_kv::META_CONVEYOR_WINDOWS_INFLIGHT),
+                );
+                metrics.insert(
+                    "meta_conveyor_windows_inflight_hwm".into(),
+                    load(&meta_kv::META_CONVEYOR_WINDOWS_INFLIGHT_HWM),
+                );
+                metrics.insert(
+                    "meta_conveyor_durability_passes".into(),
+                    load(&meta_kv::META_CONVEYOR_DURABILITY_PASSES),
                 );
                 metrics.insert(
                     "meta_kv_checkpoints".into(),

@@ -103,6 +103,10 @@ enum FsReq {
         path: PathBuf,
         tx: oneshot::Sender<Result<()>>,
     },
+    /// A request the fault shim's latency lane re-admits after holding it
+    /// for the armed device latency ([`arm_device_latency`]): admission
+    /// skips the latency arm for it (every other fault still applies).
+    Delayed(Box<FsReq>),
 }
 
 struct UringFsWorker {
@@ -363,6 +367,105 @@ struct FaultState {
     /// Write stalls ([`arm_write_stall`]): per path, the range that parks
     /// and the writes held there.
     write_stalls: std::collections::HashMap<PathBuf, WriteStall>,
+    /// Device latency ([`arm_device_latency`]): per path, how long every
+    /// write / barrier is held before admission — a slow device, not a
+    /// parked one.
+    latency: std::collections::HashMap<PathBuf, DeviceLatency>,
+}
+
+/// An armed device latency: writes (`WriteAt` / `WriteAtBatch`) and
+/// barriers (`Fdatasync`) on the path complete no earlier than this long
+/// after submission.
+#[derive(Clone, Copy)]
+struct DeviceLatency {
+    write: std::time::Duration,
+    barrier: std::time::Duration,
+}
+
+/// One request parked on the latency lane until `due`.
+struct DelayedReq {
+    due: std::time::Instant,
+    /// Admission order tiebreak (FIFO among equal deadlines).
+    seq: u64,
+    req: FsReq,
+}
+
+impl PartialEq for DelayedReq {
+    fn eq(&self, other: &Self) -> bool {
+        self.due == other.due && self.seq == other.seq
+    }
+}
+impl Eq for DelayedReq {}
+impl PartialOrd for DelayedReq {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for DelayedReq {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        (self.due, self.seq).cmp(&(other.due, other.seq))
+    }
+}
+
+/// The latency lane: a deadline heap drained by one lazily-spawned
+/// thread that re-admits each request as [`FsReq::Delayed`] when its
+/// deadline passes. Test-only machinery (spawned on the first arm, never
+/// in production); a request's latency runs from its ORIGINAL admission,
+/// so concurrent requests overlap exactly as they would on a device with
+/// that service time and unbounded concurrency.
+struct LatencyLane {
+    heap: std::sync::Mutex<std::collections::BinaryHeap<std::cmp::Reverse<DelayedReq>>>,
+    cv: std::sync::Condvar,
+    next_seq: std::sync::atomic::AtomicU64,
+}
+
+static LATENCY_LANE: Lazy<LatencyLane> = Lazy::new(|| {
+    std::thread::Builder::new()
+        .name("sqz-uringfs-latency".to_string())
+        .spawn(latency_lane_loop)
+        .expect("spawn uring-fs latency lane");
+    LatencyLane {
+        heap: std::sync::Mutex::new(std::collections::BinaryHeap::new()),
+        cv: std::sync::Condvar::new(),
+        next_seq: std::sync::atomic::AtomicU64::new(0),
+    }
+});
+
+fn latency_lane_loop() {
+    let lane = &*LATENCY_LANE;
+    let mut heap = lane.heap.lock().unwrap();
+    loop {
+        let Some(std::cmp::Reverse(top)) = heap.peek() else {
+            heap = lane.cv.wait(heap).unwrap();
+            continue;
+        };
+        let now = std::time::Instant::now();
+        if top.due > now {
+            let wait = top.due - now;
+            heap = lane.cv.wait_timeout(heap, wait).unwrap().0;
+            continue;
+        }
+        let item = heap.pop().expect("peeked").0;
+        drop(heap);
+        // Blocking send: the lane is the only producer that may wait on
+        // queue space (a test-only thread), and dropping a held request
+        // would strand its caller.
+        let _ = URING_FS.sender().send(FsReq::Delayed(Box::new(item.req)));
+        heap = lane.heap.lock().unwrap();
+    }
+}
+
+/// Park `req` on the latency lane until `due`.
+fn latency_lane_push(due: std::time::Instant, req: FsReq) {
+    let lane = &*LATENCY_LANE;
+    let seq = lane
+        .next_seq
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    lane.heap
+        .lock()
+        .unwrap()
+        .push(std::cmp::Reverse(DelayedReq { due, seq, req }));
+    lane.cv.notify_one();
 }
 
 /// Operations parked by a stall, plus the arrival tap a test awaits.
@@ -536,6 +639,33 @@ pub fn release_write_stall(path: impl AsRef<Path>) {
     }
 }
 
+/// Arm a **device latency** on `path`: every write (`write_at` /
+/// `write_at_batch`) completes no earlier than `write` after its
+/// submission and every `fdatasync` no earlier than `barrier` after its
+/// — held on a deadline lane and then admitted for real, so the bytes
+/// still land and concurrent requests overlap like they would on a device
+/// with that service time. This is the SLOW-device seam (the stalls
+/// above are PARKED-device seams): the conveyor-saturation harness
+/// (`tests/conveyor_two_stage_tests.rs`) arms it to make the journal
+/// write's device term a controlled constant.
+pub fn arm_device_latency(
+    path: impl AsRef<Path>,
+    write: std::time::Duration,
+    barrier: std::time::Duration,
+) {
+    FAULT_STATE.lock().unwrap().latency.insert(
+        path.as_ref().to_path_buf(),
+        DeviceLatency { write, barrier },
+    );
+    FAULTS_ACTIVE.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Disarm `path`'s device latency (requests already on the lane still
+/// complete late — they were admitted under the arm).
+pub fn disarm_device_latency(path: impl AsRef<Path>) {
+    FAULT_STATE.lock().unwrap().latency.remove(path.as_ref());
+}
+
 /// Disarm the barrier fault on `path` (the next `fdatasync` succeeds —
 /// the consecutive-failure escalation's success-reset case).
 pub fn disarm_barrier_error(path: impl AsRef<Path>) {
@@ -593,6 +723,7 @@ pub fn clear_faults() {
     // suite that tore its own fault state down mid-flight.
     st.barrier_stalls.clear();
     st.write_stalls.clear();
+    st.latency.clear();
     FAULTS_ACTIVE.store(false, std::sync::atomic::Ordering::Relaxed);
 }
 
@@ -650,12 +781,25 @@ fn capture_original(path: &Path, offset: u64, len: usize) -> (u64, Vec<u8>) {
     (offset, original)
 }
 
+/// Strip the latency lane's [`FsReq::Delayed`] wrapper: `(inner, true)`
+/// for a re-admitted request, `(req, false)` otherwise. Idempotent, so
+/// both the shim and the disarmed admission paths can call it.
+fn unwrap_delayed(req: FsReq) -> (FsReq, bool) {
+    match req {
+        FsReq::Delayed(inner) => (*inner, true),
+        other => (other, false),
+    }
+}
+
 /// Fault-shim request interception, shared by the uring reactors and the
 /// blocking fallback. Returns `Some(req)` to proceed (possibly after
 /// capturing power-cut originals) or `None` when the request was consumed
 /// (its completion already sent an error).
 fn fault_intercept(req: FsReq) -> Option<FsReq> {
     let mut st = FAULT_STATE.lock().unwrap();
+    // A request re-admitted by the latency lane has served its latency;
+    // every other fault below still applies to it.
+    let (req, delayed) = unwrap_delayed(req);
 
     // Poisoned path: the device died — EVERY request fails.
     {
@@ -666,6 +810,7 @@ fn fault_intercept(req: FsReq) -> Option<FsReq> {
             | FsReq::WriteAt { path, .. }
             | FsReq::WriteAtBatch { path, .. }
             | FsReq::Fdatasync { path, .. } => path,
+            FsReq::Delayed(_) => unreachable!("unwrapped above"),
         };
         if st.poisoned.contains(path) {
             let err = || fault_eio("path poisoned (device died mid-commit)");
@@ -679,7 +824,27 @@ fn fault_intercept(req: FsReq) -> Option<FsReq> {
                 FsReq::ReadAll { tx, .. } | FsReq::ReadAt { tx, .. } => {
                     let _ = tx.send(Err(err()));
                 }
+                FsReq::Delayed(_) => unreachable!("unwrapped above"),
             }
+            return None;
+        }
+    }
+
+    // Device latency: hold the request until its deadline, then re-admit
+    // it (as `Delayed`, so it is not held twice). Checked BEFORE the other
+    // write/barrier faults so they apply at the re-admission — the
+    // moment the slow device would actually service the request.
+    if !delayed {
+        let arm = match &req {
+            FsReq::WriteAt { path, .. } | FsReq::WriteAtBatch { path, .. } => {
+                st.latency.get(path).map(|l| l.write)
+            }
+            FsReq::Fdatasync { path, .. } => st.latency.get(path).map(|l| l.barrier),
+            _ => None,
+        };
+        if let Some(d) = arm.filter(|d| !d.is_zero()) {
+            drop(st);
+            latency_lane_push(std::time::Instant::now() + d, req);
             return None;
         }
     }
@@ -1037,9 +1202,12 @@ impl Reactor {
                 None => return, // consumed: completion already sent an error
             }
         } else {
-            req
+            // A latency-lane re-admission racing `clear_faults` arrives
+            // wrapped with the shim already disarmed.
+            unwrap_delayed(req).0
         };
         match req {
+            FsReq::Delayed(_) => unreachable!("unwrapped at admission"),
             FsReq::WriteAll { path, data, tx } => {
                 let opened = (|| -> Result<Rc<File>> {
                     use std::os::unix::fs::OpenOptionsExt;
@@ -1407,9 +1575,10 @@ fn blocking_fallback_loop(rx: crossbeam::channel::Receiver<FsReq>) {
                 None => continue,
             }
         } else {
-            req
+            unwrap_delayed(req).0
         };
         match req {
+            FsReq::Delayed(_) => unreachable!("unwrapped at admission"),
             FsReq::WriteAll { path, data, tx } => {
                 let res = (|| -> std::io::Result<()> {
                     if let Some(parent) = path.parent() {

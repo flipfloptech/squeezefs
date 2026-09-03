@@ -422,7 +422,7 @@ Before considering work complete:
 2. `cargo test --all-features` — all tests pass project-wide.
 3. `cargo clippy --all-targets --all-features -- -D warnings` — zero warnings.
 4. `cargo fmt --check` — formatting is clean.
-5. `cargo doc --no-deps` — documentation builds without warnings.
+5. `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps` — documentation builds without warnings (rustdoc's intra-doc-link lints are warnings by default and cargo never fails on them; the flag is what makes this line a gate).
 6. `task audit` (= `cargo audit --deny unsound --deny yanked` over BOTH lockfiles — the root workspace and the excluded `crates/fuse3` fork). Vulnerabilities, unsound and yanked crates fail; the `unmaintained` residue is adjudicated in `docs/rc-manifest.md` §5. ENG-2: this line had no enforcement point until 2026-08-03 — it is now part of `task check`.
 7. Review the diff: every changed line traces to the original goal.
 
@@ -445,9 +445,9 @@ cargo clippy --all-targets --all-features -- -D warnings
 cargo clippy --all-targets -- -D warnings   # the SHIPPED (default-features) config — ENG-8
 cargo fmt --check
 cargo test --all-features -- --test-threads=1
-cargo doc --no-deps
+RUSTDOCFLAGS="-D warnings" cargo doc --no-deps   # rustdoc lints are warnings by default — the flag is the gate
 cargo bench --benches -- --test   # criterion smoke: one iteration per bench, no measurement
-task check:fuse3                  # the excluded fork's own suite/fmt/clippy/bench — ENG-17
+task check:fuse3                  # the excluded fork's own suite/fmt/clippy/doc/bench — ENG-17
 task check:loom                   # the isolated loom crate COMPILES against the cores it #[path]-includes (build+fmt, -D warnings; the model RUN is tests/run_loom.sh)
 task check:docs                   # markdown link/anchor check (tests/check_markdown_links.sh)
 task audit                        # cargo audit, BOTH lockfiles, --deny unsound --deny yanked — ENG-2
@@ -575,9 +575,9 @@ cargo clippy --all-targets --all-features -- -D warnings
 cargo clippy --all-targets -- -D warnings   # the SHIPPED (default-features) config — ENG-8
 cargo fmt --check
 cargo test --all-features -- --test-threads=1
-cargo doc --no-deps
+RUSTDOCFLAGS="-D warnings" cargo doc --no-deps   # rustdoc lints are warnings by default — the flag is the gate
 cargo bench --benches -- --test   # criterion smoke: one iteration per bench, no measurement
-task check:fuse3                  # the excluded fork's own suite/fmt/clippy/bench — ENG-17
+task check:fuse3                  # the excluded fork's own suite/fmt/clippy/doc/bench — ENG-17
 task check:loom                   # the isolated loom crate COMPILES against the cores it #[path]-includes (build+fmt, -D warnings; the model RUN is tests/run_loom.sh)
 task check:docs                   # markdown link/anchor check (tests/check_markdown_links.sh)
 task audit                        # cargo audit, BOTH lockfiles, --deny unsound --deny yanked — ENG-2

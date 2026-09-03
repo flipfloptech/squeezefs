@@ -182,7 +182,10 @@ tasks:
       - cargo clippy --all-targets -- -D warnings
       - cargo fmt --check
       - cargo test --all-features -- --test-threads=1
-      - cargo doc --no-deps
+      # Rustdoc lints (broken/private intra-doc links) are warnings by
+      # default and cargo never fails on them — 90 accumulated unnoticed
+      # before this flag existed (2026-09-03).
+      - RUSTDOCFLAGS="-D warnings" cargo doc --no-deps
       # Criterion smoke — one iteration per bench, no measurement.
       - cargo bench --benches -- --test
       # ENG-17: the first-party fuse3 fork is workspace.exclude'd, so every
@@ -215,6 +218,7 @@ tasks:
       - cargo clippy --all-targets --all-features -- -D warnings
       - cargo fmt --check
       - cargo test --all-features -- --test-threads=1
+      - RUSTDOCFLAGS="-D warnings" cargo doc --no-deps
       - cargo bench --benches -- --test
 
   check:loom:

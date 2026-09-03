@@ -6614,6 +6614,13 @@ pub struct Metrics {
     /// Gather batches closed because the reclaim channel closed (unmount /
     /// teardown drain).
     pub meta_reclaim_gather_channel_closes: Align64<AtomicU64>,
+    /// Inos a reclaim batch found CLAIMED by a concurrent batch and
+    /// waited on until that owner's terminal outcome (finding 50 — the
+    /// single-drive guard's other half: the loser never double-drives AND
+    /// never returns early). Growth is the release-enqueued background
+    /// pool racing an explicit/FORGET reclaim of the same inos; 0 when
+    /// reclaims never overlap.
+    pub meta_reclaim_inflight_waits: Align64<AtomicU64>,
     /// Staging dirs whose content was discarded at init because it was
     /// stamped by a DEAD filesystem generation (or predated generation
     /// stamping) — the reformat-over-stale-staging guard (`cache::nvme::
@@ -8378,7 +8385,19 @@ pub struct SqueezefsFilesystem {
     /// destroy + teardown completed; a failed destroy LEAVES the guard set
     /// — the slot and its blocks leak until remount (the never-lossy
     /// direction) instead of re-arming a second data teardown.
-    reclaim_inflight: std::sync::Arc<scc::HashSet<u64>>,
+    ///
+    /// The value is the claim's completion signal (finding 50): a batch
+    /// that finds an ino claimed by a CONCURRENT batch never drives it,
+    /// but it does not return until that owner's outcome has landed
+    /// either — so `reclaim_orphaned_batch(inos).await` means every ino
+    /// in `inos` reached its terminal reclaim outcome, whichever batch
+    /// carried it. The release-enqueued background pool (`release` →
+    /// `queue_reclaim_inode`) races every FORGET-driven or explicit
+    /// reclaim of the same inos; before the wait the loser returned with
+    /// the owner's destroy still uncommitted, and `df -i` read the
+    /// destroyed count too early (the POSIX-1 gate flake).
+    reclaim_inflight:
+        std::sync::Arc<scc::HashMap<u64, std::sync::Arc<squeezefs_ipc::sqz_notify::Notify>>>,
     /// FUSE_HANDLE_KILLPRIV_V2 known-clean latch (killpriv campaign):
     /// inos verified to carry no clearable priv state (no suid, no
     /// group-exec sgid, no security.capability) — a flagged write's kill
@@ -8751,7 +8770,7 @@ impl SqueezefsFilesystem {
             } else {
                 KernelCacheTtls::from_env()
             },
-            reclaim_inflight: std::sync::Arc::new(scc::HashSet::new()),
+            reclaim_inflight: std::sync::Arc::new(scc::HashMap::new()),
             killpriv_clean: std::sync::Arc::new(scc::HashSet::new()),
             page_cache_inos: std::sync::Arc::new(scc::HashMap::new()),
             dio_inval_sink: std::sync::Arc::new(arc_swap::ArcSwap::from_pointee(None)),
@@ -11410,6 +11429,7 @@ impl SqueezefsFilesystem {
                 "meta_reclaim_gather_cap_closes": METRICS.meta_reclaim_gather_cap_closes.load(Ordering::Relaxed),
                 "meta_reclaim_gather_window_closes": METRICS.meta_reclaim_gather_window_closes.load(Ordering::Relaxed),
                 "meta_reclaim_gather_channel_closes": METRICS.meta_reclaim_gather_channel_closes.load(Ordering::Relaxed),
+                "meta_reclaim_inflight_waits": METRICS.meta_reclaim_inflight_waits.load(Ordering::Relaxed),
                 // Per-volume atomicity fields (design §Observability —
                 // live signals over ad-hoc logging). Resolved OQ 2
                 // (design-cow-kv-metadata §4.10): TWO fields per volume —
@@ -21227,6 +21247,20 @@ impl SqueezefsFilesystem {
     ///   now-deferred zero would let a straggling getattr repopulate
     ///   attr_cache from the still-valid slot and survive as a ghost).
     ///
+    /// **Return law (finding 50):** when this returns, every ino in `inos`
+    /// has reached its terminal reclaim outcome — destroyed, refused
+    /// (live / open / missing), failed-and-retained, or carried by a
+    /// CONCURRENT batch whose outcome this call waited for. The
+    /// single-drive guard below still lets exactly one batch drive an
+    /// ino's teardown; the loser now parks on the owner's claim instead
+    /// of returning with the owner's destroy uncommitted. Acyclic by
+    /// construction: a batch releases every claim it holds (the
+    /// per-ino teardown, both edges) BEFORE it waits on foreign ones, so
+    /// two batches that split a set never wait on each other's live
+    /// claims; the owner needs nothing the waiter holds (the waiter holds
+    /// no DLM guard, no node lock — only its `reclaim_semaphore` permit,
+    /// which the owner already owns its own of).
+    ///
     /// `pub` because it is the reclaim worker's unit of work and the
     /// integration seam the bisect tests drive directly.
     pub async fn reclaim_orphaned_batch(&self, inos: Vec<u64>) {
@@ -21236,6 +21270,10 @@ impl SqueezefsFilesystem {
         };
 
         let mut admitted = Vec::with_capacity(inos.len());
+        // Inos a concurrent batch owns: awaited after this batch's own
+        // work, never driven here.
+        let mut owned_elsewhere: Vec<(u64, std::sync::Arc<squeezefs_ipc::sqz_notify::Notify>)> =
+            Vec::new();
         for ino in inos {
             if ino <= 1 || is_virtual_ino(ino) {
                 continue;
@@ -21293,9 +21331,14 @@ impl SqueezefsFilesystem {
             // Single-drive guard (FIND-RW5-A face 4) unchanged: only ONE
             // reclaim may ever run an ino's data teardown — duplicate
             // drives (release+forget enqueues, racing batches) double-freed
-            // the mapped blocks.
-            if self.reclaim_inflight.insert_sync(ino).is_err() {
-                debug!("RECLAIM: ino = {ino} already in flight, skipping");
+            // the mapped blocks. The loser records the owner's claim and
+            // waits for it below (finding 50 — the return law).
+            let claim = std::sync::Arc::new(squeezefs_ipc::sqz_notify::Notify::new());
+            if self.reclaim_inflight.insert_sync(ino, claim).is_err() {
+                debug!("RECLAIM: ino = {ino} already in flight, waiting on its owner");
+                if let Some(owner) = self.reclaim_inflight.read_sync(&ino, |_, c| c.clone()) {
+                    owned_elsewhere.push((ino, owner));
+                }
                 continue;
             }
             if self.is_open(ino) {
@@ -21303,15 +21346,52 @@ impl SqueezefsFilesystem {
                     "RECLAIM: ino = {} opened during admission, backing out",
                     ino
                 );
-                self.reclaim_inflight.remove_sync(&ino);
+                self.release_reclaim_claim(ino);
                 continue;
             }
             admitted.push(ino);
         }
-        if admitted.is_empty() {
-            return;
+        if !admitted.is_empty() {
+            self.reclaim_admitted_batch(backend, admitted).await;
         }
+        // Every claim this batch held is released above (both edges of
+        // the destroy run the per-ino teardown), so waiting here can never
+        // close a cycle with a batch that is itself waiting on us.
+        for (ino, owner) in owned_elsewhere {
+            // Register BEFORE the re-check (the notify registers at
+            // creation — `sqz_notify` todo-24 law): an owner that removes
+            // its claim between the read and the await still wakes us.
+            let released = owner.notified();
+            let still_owned = self
+                .reclaim_inflight
+                .read_sync(&ino, |_, cur| std::sync::Arc::ptr_eq(cur, &owner))
+                .unwrap_or(false);
+            if still_owned {
+                METRICS
+                    .meta_reclaim_inflight_waits
+                    .fetch_add(1, Ordering::Relaxed);
+                released.await;
+            }
+        }
+    }
 
+    /// Drop this batch's claim on `ino` and release anyone parked on it
+    /// (finding 50). The ONLY way a claim leaves the map: the back-out arm
+    /// of admission and the per-ino teardown after the destroy.
+    fn release_reclaim_claim(&self, ino: u64) {
+        if let Some((_, claim)) = self.reclaim_inflight.remove_sync(&ino) {
+            claim.notify_waiters();
+        }
+    }
+
+    /// The admitted set's teardown + destroy — every ino here is claimed
+    /// by this batch and released again by `reclaim_teardown` on both
+    /// edges of the destroy.
+    async fn reclaim_admitted_batch(
+        &self,
+        backend: &std::sync::Arc<crate::meta_backend::RoutedMetaBackend>,
+        admitted: Vec<u64>,
+    ) {
         // RAM-parked overlay teardown FIRST (the 2026-08-05 field leak:
         // 230 GiB of `parked_full_buffer_bytes` flat at idle, every entry
         // keyed by a dead ino). `delete_file` below removes the STAGED
@@ -21445,8 +21525,8 @@ impl SqueezefsFilesystem {
     async fn reclaim_teardown(&self, ino: u64) {
         // The single-drive guard clears only here — after the destroy
         // committed (a failed destroy leaves it set: leak-safe, see the
-        // field doc).
-        self.reclaim_inflight.remove_sync(&ino);
+        // field doc) — and releases every batch parked on the claim.
+        self.release_reclaim_claim(ino);
         if let Some((_, lease)) = self.active_leases.remove(&ino) {
             let _ = lease.release().await;
         }

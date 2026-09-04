@@ -36,6 +36,18 @@
 //!   (by the recheck) or was already drained. Either way exactly one
 //!   pass owns it.
 //!
+//! ## Groups (D-1c — one conveyor group per shipped frame)
+//!
+//! [`ConveyorCore::enqueue_many`] pushes a whole set of entries under
+//! ONE queue-lock acquisition. Because `drain` takes the same lock, a
+//! drain can never observe a partial group: it sees nothing of the group
+//! or all of it (FIFO, in the order given) — the group is atomic with
+//! respect to draining, which is what makes "N staged transactions = one
+//! apply pass" a property of the mechanism rather than of arrival timing
+//! (given caps that admit the group — the byte cap may still split it,
+//! progress-first). The committer's two uninterruptible steps are
+//! unchanged: `enqueue_many`, then `try_lead`.
+//!
 //! ## Invariants (the loom models in `loom-models/src/lib.rs`)
 //!
 //! 1. **Leader uniqueness** — `try_lead` admits at most one leader until
@@ -55,6 +67,10 @@
 //!    pass's terminal outcome for that entry even when the committer's
 //!    own clone drops first (Issue 13 — the exclusion is structural,
 //!    from ownership, not pleaded from committer behavior).
+//! 6. **Group atomicity** — a set enqueued through `enqueue_many` is
+//!    never drained partially: every drain returns none or all of it, in
+//!    order, exactly once, and a group committer's election against a
+//!    retiring leader loses no wakeup (invariant 2 transfers verbatim).
 
 #[cfg(loom)]
 pub(crate) mod sync {
@@ -112,12 +128,25 @@ impl<T> ConveyorCore<T> {
     /// FIFO-enqueue one entry carrying `len` budget bytes (the exact
     /// journal entry size — the drain's byte cap counts these).
     pub fn enqueue(&self, item: T, len: u64) {
-        self.queue.lock().unwrap().push_back((item, len));
+        self.enqueue_many(std::iter::once((item, len)));
+    }
+
+    /// FIFO-enqueue a GROUP of entries under ONE lock acquisition (module
+    /// docs, "Groups"): a concurrent `drain` sees none or all of them, in
+    /// the iterator's order. Returns the number enqueued.
+    pub fn enqueue_many<I: IntoIterator<Item = (T, u64)>>(&self, items: I) -> usize {
+        let n = {
+            let mut q = self.queue.lock().unwrap();
+            let before = q.len();
+            q.extend(items);
+            q.len() - before
+        };
         // Wedge census (2026-08-07): the process-global queued gauge —
         // maintained HERE (enqueue/drain) so no fan-out path can leak it.
-        if let Some(g) = self.gauge {
-            g.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if let Some(g) = self.gauge.filter(|_| n > 0) {
+            g.fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
         }
+        n
     }
 
     /// Attempt to become the leader. `true` ⇒ the caller MUST arrange a
@@ -222,5 +251,29 @@ mod tests {
         );
         assert_eq!(c.drain(64, 1024), vec![7]);
         assert!(!c.unlead_and_recheck());
+    }
+
+    /// Groups: `enqueue_many` keeps FIFO order behind what is already
+    /// queued, answers its population, and the tx cap still takes a
+    /// strict prefix of the queue (the drain caps govern; the atomicity
+    /// law is the loom model).
+    #[test]
+    fn enqueue_many_is_fifo_and_counted() {
+        let c: ConveyorCore<u32> = ConveyorCore::with_gauge(None);
+        c.enqueue(1, 1);
+        assert_eq!(c.enqueue_many([(2u32, 1u64), (3, 1), (4, 1)]), 3);
+        assert_eq!(
+            c.enqueue_many(std::iter::empty()),
+            0,
+            "an empty group is a no-op"
+        );
+        assert_eq!(c.pending(), 4);
+        assert_eq!(c.drain(64, u64::MAX), vec![1, 2, 3, 4]);
+        assert_eq!(c.enqueue_many([(5u32, 10u64), (6, 10)]), 2);
+        // A byte cap below the group still drains it, one entry per
+        // drain (first-entry progress) — grouping never bypasses a cap.
+        assert_eq!(c.drain(64, 5), vec![5]);
+        assert_eq!(c.drain(64, 5), vec![6]);
+        assert_eq!(c.pending(), 0);
     }
 }

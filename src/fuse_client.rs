@@ -11703,6 +11703,17 @@ impl SqueezefsFilesystem {
                     "meta_conveyor_pass_panics".into(),
                     load(&meta_kv::META_CONVEYOR_PASS_PANICS),
                 );
+                // D-1c (e2e audit §5.3 row 1): group commits — staged tx
+                // sets enqueued under one queue lock (txs ÷ commits = the
+                // live group size; 0 on a solo mount by construction).
+                metrics.insert(
+                    "meta_conveyor_group_commits".into(),
+                    load(&meta_kv::META_CONVEYOR_GROUP_COMMITS),
+                );
+                metrics.insert(
+                    "meta_conveyor_group_txs".into(),
+                    load(&meta_kv::META_CONVEYOR_GROUP_TXS),
+                );
                 // D-2 (e2e audit DLM #2): the two-stage conveyor's
                 // engagement instrument — applied-but-unacked windows in
                 // flight, their high-water mark (1 = serialized, ≥ 2 =

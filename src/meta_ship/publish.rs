@@ -82,7 +82,7 @@ use crate::cluster_wire::{
 };
 use crate::error::{Result, SqueezefsError};
 use crate::meta_backend::kv::block_refs::{BlockRef, BlockRefOp};
-use crate::meta_backend::{DirEntry, Ino, Inode, RoutedMetaBackend};
+use crate::meta_backend::{DirEntry, Ino, Inode, LayoutPublish, RoutedMetaBackend};
 use bincode::Options as _;
 use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
@@ -1066,6 +1066,21 @@ static SHIP_SESSION_DIALS: AtomicU64 = AtomicU64::new(0);
 static SERVED_FRAMES: AtomicU64 = AtomicU64::new(0);
 static SERVED_FRAME_CALLS: AtomicU64 = AtomicU64::new(0);
 static SERVED_CHAINS: AtomicU64 = AtomicU64::new(0);
+// D-1c — served frames that committed ≥ 1 conveyor GROUP (the round
+// dispatch's engagement gauge; the group population itself is the
+// process-global `META_CONVEYOR_GROUP_{COMMITS,TXS}`).
+static FRAME_GROUPS: AtomicU64 = AtomicU64::new(0);
+
+/// The D-1c A/B lever: group a served frame's independent layout
+/// publishes into ONE conveyor enqueue per round (default on). `0` = the
+/// pre-rung per-call path — the measurement control, never an operational
+/// escape. Read per served frame (one getenv per wire round trip) so a
+/// contract can flip it in-process.
+pub const CONVEYOR_GROUP_ENV: &str = "SQUEEZEFS_PUBLISH_CONVEYOR_GROUP";
+
+fn conveyor_group_enabled() -> bool {
+    crate::env_knobs::bool_knob(CONVEYOR_GROUP_ENV, true)
+}
 
 /// The at-budget W2 spill's counter (incremented by
 /// [`crate::extent_ship`]'s spill arm — release path 4's engagement).
@@ -1220,6 +1235,12 @@ pub struct PublishStats {
     /// frame's calls were independent (co-queue into one M7 pass); ≈ 1
     /// means one hot object serialized the frame.
     pub served_chains: u64,
+    /// D-1c (owner side): served frames that committed at least one
+    /// conveyor GROUP — a round's independent layout publishes staged
+    /// together and enqueued under one queue lock (one apply pass by
+    /// construction). ≈ `served_frames` minus the single-call frames on a
+    /// grouping authority; 0 under `SQUEEZEFS_PUBLISH_CONVEYOR_GROUP=0`.
+    pub frame_groups: u64,
 }
 
 /// Read the publish ledger.
@@ -1261,6 +1282,7 @@ pub fn stats() -> PublishStats {
         served_frames: SERVED_FRAMES.load(Ordering::Relaxed),
         served_frame_calls: SERVED_FRAME_CALLS.load(Ordering::Relaxed),
         served_chains: SERVED_CHAINS.load(Ordering::Relaxed),
+        frame_groups: FRAME_GROUPS.load(Ordering::Relaxed),
     }
 }
 
@@ -1306,6 +1328,7 @@ pub fn stats_json() -> serde_json::Value {
         "served_frames": s.served_frames,
         "served_frame_calls": s.served_frame_calls,
         "served_chains": s.served_chains,
+        "frame_groups": s.frame_groups,
         // §9.3's live retention gauge (→ 0 at quiesce — falsifiable
         // against the four release paths).
         "extent_retained_bytes": crate::extent_ship::retained_bytes(),
@@ -3262,6 +3285,67 @@ struct ScopedBlobCustody {
     free_after_commit: Vec<String>,
 }
 
+/// What a SetLayoutAndSize serve's commit outcome must settle (D-1c — the
+/// FINISH half's input; see [`PublishService::finish_layout_publish`]).
+struct LayoutPostCommit {
+    blob_custody: ScopedBlobCustody,
+    /// Finding 36b: the scoped compose's released DATA blocks — freed
+    /// through this authority's own ladder strictly after commit Ok.
+    released_data: Vec<BlockRef>,
+    was_recomputed: bool,
+}
+
+/// A SetLayoutAndSize serve past its PREPARE half: the staged commit item
+/// (a [`RoutedMetaBackend::set_layout_and_size_group`] member) and its
+/// post-commit settlement.
+struct PreparedLayoutPublish {
+    item: LayoutPublish,
+    post: LayoutPostCommit,
+}
+
+/// The PREPARE half's verdict: the call completed inside the prepare (the
+/// kvmap scoped-put train committed it — never groupable), or it is
+/// staged for the layout commit.
+enum LayoutPrepare {
+    Done(PublishReply),
+    Staged(PreparedLayoutPublish),
+}
+
+/// A witness slot the group serve CLAIMED (D-1c): this round owns the
+/// `(lease_epoch, request_id)` execution, every concurrent
+/// `serve_layout_publish` of the same key parks on the slot exactly as on
+/// an async winner. Completed with the member's own outcome; dropped
+/// un-completed (an unwind before the answer) it ABANDONS the claim so a
+/// parked replay re-elects — the cancelled-leader shape `sqz_once` gives
+/// an async leader, made explicit.
+struct WitnessLease {
+    slot: Arc<squeezefs_ipc::sqz_once::OnceCell<std::result::Result<PublishReply, WireError>>>,
+    completed: bool,
+}
+
+impl WitnessLease {
+    fn complete(mut self, outcome: std::result::Result<PublishReply, WireError>) {
+        self.slot.complete_init(outcome);
+        self.completed = true;
+    }
+}
+
+impl Drop for WitnessLease {
+    fn drop(&mut self) {
+        if !self.completed {
+            self.slot.abandon_init();
+        }
+    }
+}
+
+/// One claimed member of a round's layout group: its frame slot, the
+/// call, and the witness it owns.
+struct GroupMember {
+    idx: usize,
+    call: PublishCall,
+    lease: WitnessLease,
+}
+
 /// PR 5b items 3+4 — a kvmap-headed serve's custody verdict for its
 /// CLAIM SCOPE (see [`PublishService::kvmap_claim_scope`]).
 enum KvmapClaimScope {
@@ -3387,10 +3471,27 @@ impl PublishService {
     /// not-owner screen, the era gate, the witness window, the lane/free
     /// validations, the unwind record) runs inside [`Self::serve_call`].
     ///
+    /// **D-1c — one conveyor group per shipped frame** (e2e perf audit
+    /// §5.3 row 1): since C-2's instant-drain apply pass, "co-queue" was a
+    /// venue ratio — a frame's calls reach `commit_tx` at different
+    /// instants (each prelude awaits), so 24 publishes landed in 3–14
+    /// passes. With the lever on ([`CONVEYOR_GROUP_ENV`], default), the
+    /// multi-chain dispatch proceeds in ROUNDS: every chain contributes
+    /// its next call; the round's `SetLayoutAndSize` calls are PREPARED
+    /// concurrently and committed as ONE
+    /// [`RoutedMetaBackend::set_layout_and_size_group`] (one queue-lock
+    /// enqueue on the conveyor — one apply pass by construction) while
+    /// the round's other calls serve concurrently as before; a chain's
+    /// next call starts only after its previous one finished (the chain
+    /// order law), so a 24-distinct-ino frame is 24 chains of length 1 →
+    /// one round → one group → one pass. `=0` keeps the D-1b per-chain
+    /// dispatch verbatim (the A/B control).
+    ///
     /// The venue rule (S8's, verbatim): a call's execution hops to the
     /// sqz-meta pool inside `serve_call` exactly as it did per frame; the
     /// chain futures themselves only sequence and await those hops, so a
-    /// one-call frame costs the one hop it always cost.
+    /// one-call frame costs the one hop it always cost. A round's group
+    /// is ONE hop for all its members.
     async fn serve(&self, req: RpcRequest) -> RpcResponse {
         if req.verb != VERB_PUBLISH_CALL {
             return RpcResponse {
@@ -3438,24 +3539,55 @@ impl PublishService {
             }
             out
         } else {
-            let mut per_chain: Vec<Vec<(usize, PublishCall)>> = vec![Vec::new(); chain_count];
+            let mut per_chain: Vec<std::collections::VecDeque<(usize, PublishCall)>> =
+                vec![std::collections::VecDeque::new(); chain_count];
             for (idx, (call, chain)) in frame.calls.into_iter().zip(chains).enumerate() {
-                per_chain[chain].push((idx, call));
+                per_chain[chain].push_back((idx, call));
             }
-            let futs = per_chain.into_iter().map(|chain| {
-                let client = Arc::clone(&client);
-                async move {
-                    let mut out = Vec::with_capacity(chain.len());
-                    for (idx, call) in chain {
-                        out.push((idx, self.serve_call(&client, call).await));
-                    }
-                    out
-                }
-            });
             let mut slots: Vec<Option<PublishCallOutcome>> = (0..n).map(|_| None).collect();
-            for chain_out in futures::future::join_all(futs).await {
-                for (idx, outcome) in chain_out {
-                    slots[idx] = Some(outcome);
+            if conveyor_group_enabled() {
+                // D-1c rounds (see the method doc).
+                let mut grouped = false;
+                loop {
+                    let round: Vec<(usize, PublishCall)> =
+                        per_chain.iter_mut().filter_map(|c| c.pop_front()).collect();
+                    if round.is_empty() {
+                        break;
+                    }
+                    let (layouts, others): (Vec<_>, Vec<_>) = round
+                        .into_iter()
+                        .partition(|(_, c)| matches!(c, PublishCall::SetLayoutAndSize { .. }));
+                    let others_fut =
+                        futures::future::join_all(others.into_iter().map(|(idx, call)| {
+                            let client = Arc::clone(&client);
+                            async move { (idx, self.serve_call(&client, call).await) }
+                        }));
+                    let (others_out, (group_out, committed)) =
+                        futures::join!(others_fut, self.serve_layout_group(&client, layouts));
+                    grouped |= committed;
+                    for (idx, outcome) in others_out.into_iter().chain(group_out) {
+                        slots[idx] = Some(outcome);
+                    }
+                }
+                if grouped {
+                    FRAME_GROUPS.fetch_add(1, Ordering::Relaxed);
+                }
+            } else {
+                // The D-1b per-chain dispatch — the lever's control.
+                let futs = per_chain.into_iter().map(|chain| {
+                    let client = Arc::clone(&client);
+                    async move {
+                        let mut out = Vec::with_capacity(chain.len());
+                        for (idx, call) in chain {
+                            out.push((idx, self.serve_call(&client, call).await));
+                        }
+                        out
+                    }
+                });
+                for chain_out in futures::future::join_all(futs).await {
+                    for (idx, outcome) in chain_out {
+                        slots[idx] = Some(outcome);
+                    }
                 }
             }
             slots
@@ -3486,24 +3618,25 @@ impl PublishService {
         }
     }
 
-    /// Serve ONE call of a frame — the gates in their landed order, then
-    /// the class's own serve path. Refusals are per call and apply
-    /// nothing; a sibling call in the same frame is untouched.
-    async fn serve_call(&self, client: &str, call: PublishCall) -> PublishCallOutcome {
+    /// The two gates every call passes first, in their landed order: the
+    /// not-owner screen, then the ERA gate. `Some` = the call's refusal
+    /// (nothing applied). Shared by [`Self::serve_call`] and the D-1c
+    /// group serve so a grouped call is gated exactly as a serial one.
+    fn screen(&self, client: &str, call: &PublishCall) -> Option<PublishCallOutcome> {
         if let Some(foreign) = call
             .named_inos()
             .into_iter()
             .find(|ino| !self.has_authority(*ino))
         {
             NOT_OWNER.fetch_add(1, Ordering::Relaxed);
-            return Self::refuse(
+            return Some(Self::refuse(
                 PUBLISH_NOT_OWNER,
                 format!(
                     "ino {foreign} routes to a metadata volume this node holds no authority \
                      over — the client's ownership map is stale (re-read the volumes' \
                      writer_claim records)"
                 ),
-            );
+            ));
         }
         // Finding #6 (design-mw-layout-versions §6a, law 1): the ERA GATE on
         // every schema-5 mutating verb — a swept-but-not-yet-self-fenced
@@ -3511,7 +3644,7 @@ impl PublishService {
         // applied. Refused BEFORE the witness window on purpose (a dead
         // era's replay must never be answered from cache — the FreeBlocks
         // precedent verbatim). The raise/free/harvest verbs keep their own,
-        // older gates below (landed counter surface).
+        // older gates in `serve_call` (landed counter surface).
         if let Some(epoch) = call.era_gated_epoch() {
             if let Err(reason) = crate::data_grant::validate_publish_era(client, epoch) {
                 // Rung 17: the extent class's era refusals land on their
@@ -3522,8 +3655,18 @@ impl PublishService {
                 } else {
                     STALE_REFUSALS.fetch_add(1, Ordering::Relaxed);
                 }
-                return Self::refuse(PUBLISH_STALE_LEASE, reason);
+                return Some(Self::refuse(PUBLISH_STALE_LEASE, reason));
             }
+        }
+        None
+    }
+
+    /// Serve ONE call of a frame — the gates in their landed order, then
+    /// the class's own serve path. Refusals are per call and apply
+    /// nothing; a sibling call in the same frame is untouched.
+    async fn serve_call(&self, client: &str, call: PublishCall) -> PublishCallOutcome {
+        if let Some(refusal) = self.screen(client, &call) {
+            return refusal;
         }
         // The layout-publish class (law 2) and rung 17's extent class:
         // witnessed — served through the dedup window, never through the
@@ -3716,6 +3859,238 @@ impl PublishService {
             EXTENT_SERVED.fetch_add(1, Ordering::Relaxed);
         }
         PublishCallOutcome::Done(outcome)
+    }
+
+    /// Serve a round's `SetLayoutAndSize` calls as ONE conveyor group
+    /// (D-1c). Each call passes [`Self::screen`] exactly as a serial call
+    /// does; each then CLAIMS its `(lease_epoch, request_id)` witness slot
+    /// synchronously ([`WitnessLease`]) — a claim that fails means a live
+    /// winner (or a settled outcome) exists, so that call takes the serial
+    /// path, which parks on the winner and counts the replay, exactly as
+    /// before. The claimed calls run [`Self::execute_layout_group`]; the
+    /// serial ones run beside it. Returns the per-call outcomes and
+    /// whether a group was committed (the `frame_groups` engagement).
+    async fn serve_layout_group(
+        &self,
+        client: &Arc<str>,
+        calls: Vec<(usize, PublishCall)>,
+    ) -> (Vec<(usize, PublishCallOutcome)>, bool) {
+        let mut out = Vec::with_capacity(calls.len());
+        if calls.is_empty() {
+            return (out, false);
+        }
+        let mut members: Vec<GroupMember> = Vec::with_capacity(calls.len());
+        let mut serial: Vec<(usize, PublishCall)> = Vec::new();
+        for (idx, call) in calls {
+            if let Some(refusal) = self.screen(client, &call) {
+                out.push((idx, refusal));
+                continue;
+            }
+            let Some(key) = call.witness() else {
+                serial.push((idx, call));
+                continue;
+            };
+            let (slot, _) = self.publish_dedup.slot(key);
+            if slot.claim_init() {
+                members.push(GroupMember {
+                    idx,
+                    call,
+                    lease: WitnessLease {
+                        slot,
+                        completed: false,
+                    },
+                });
+            } else {
+                serial.push((idx, call));
+            }
+        }
+        let serial_fut = futures::future::join_all(serial.into_iter().map(|(idx, call)| {
+            let client = Arc::clone(client);
+            async move { (idx, self.serve_call(&client, call).await) }
+        }));
+        let (serial_out, (group_out, committed)) =
+            futures::join!(serial_fut, self.execute_layout_group(client, members));
+        out.extend(serial_out);
+        out.extend(group_out);
+        (out, committed)
+    }
+
+    /// Execute the claimed members of a round as one group: ONE hop onto
+    /// the sqz-meta pool (the venue rule) running
+    /// [`Self::run_layout_group`]; every member's witness completes with
+    /// its own outcome (a parked replay wakes with it), and an unwind is
+    /// recorded AND cached per member — a replay answers the same loud
+    /// failure instead of re-running half a commit (the
+    /// `serve_layout_publish` law).
+    async fn execute_layout_group(
+        &self,
+        client: &Arc<str>,
+        members: Vec<GroupMember>,
+    ) -> (Vec<(usize, PublishCallOutcome)>, bool) {
+        if members.is_empty() {
+            return (Vec::new(), false);
+        }
+        let mut out = Vec::with_capacity(members.len());
+        let Some(me) = self.owned() else {
+            // Shutting down: the leases drop ABANDONED (a parked replay
+            // re-elects and meets its own refusal).
+            for m in members {
+                out.push((
+                    m.idx,
+                    Self::refuse(
+                        PUBLISH_MALFORMED,
+                        "S9 publish service is shutting down — no handle to dispatch on".into(),
+                    ),
+                ));
+            }
+            return (out, false);
+        };
+        let mut idxs = Vec::with_capacity(members.len());
+        let mut leases = Vec::with_capacity(members.len());
+        let mut work = Vec::with_capacity(members.len());
+        for m in members {
+            idxs.push(m.idx);
+            leases.push(m.lease);
+            work.push(m.call);
+        }
+        let client = client.to_string();
+        let joined = crate::meta_exec::spawn_meta_join("meta_ship_publish_group", async move {
+            me.run_layout_group(&client, work).await
+        })
+        .await;
+        match joined {
+            Ok((outcomes, committed)) => {
+                for ((idx, lease), outcome) in idxs.into_iter().zip(leases).zip(outcomes) {
+                    lease.complete(outcome.clone());
+                    SERVED.fetch_add(1, Ordering::Relaxed);
+                    out.push((idx, PublishCallOutcome::Done(outcome)));
+                }
+                (out, committed)
+            }
+            Err(e) => {
+                // RES-7/RES-8: the unwind is recorded — and CACHED per
+                // member, so a replay answers the same loud failure.
+                PANICS.fetch_add(1, Ordering::Relaxed);
+                log::error!("S9 publish owner-side group execution unwound: {e}");
+                let failure: std::result::Result<PublishReply, WireError> =
+                    Err(WireError::from_error(&SqueezefsError::InvalidOperation(
+                        format!("S9 publish owner-side execution panicked: {e}"),
+                    )));
+                for (idx, lease) in idxs.into_iter().zip(leases) {
+                    lease.complete(failure.clone());
+                    SERVED.fetch_add(1, Ordering::Relaxed);
+                    out.push((idx, PublishCallOutcome::Done(failure.clone())));
+                }
+                (out, false)
+            }
+        }
+    }
+
+    /// The group's execution, ON the sqz-meta pool: the round's serve
+    /// stripes (deduped by stripe index, ascending — `StripeLocks`'s
+    /// multi-acquisition law; two distinct inos may share a stripe), then
+    /// every member's PREPARE concurrently, then ONE
+    /// [`RoutedMetaBackend::set_layout_and_size_group`] over the staged
+    /// items (the backend takes the members' 4a guards as one canonical
+    /// `lock_many` and enqueues the group under one queue lock), then
+    /// every member's FINISH. Members whose prepare completed the call
+    /// (the kvmap train) or failed never join the group. Per-member lock
+    /// ORDER is the serial serve's verbatim — serve stripe → (chunk
+    /// commits' own 4a) → 4a → commit — so the group adds no new edge
+    /// class; what it adds is holding several stripes of each layer at
+    /// once, which the ascending acquisition keeps acyclic against every
+    /// other multi-acquirer (`lock_many`) and every single-stripe holder.
+    /// Returns one outcome per member (input order) and whether a group
+    /// was committed.
+    async fn run_layout_group(
+        &self,
+        client: &str,
+        work: Vec<PublishCall>,
+    ) -> (Vec<std::result::Result<PublishReply, WireError>>, bool) {
+        let n = work.len();
+        let inos: Vec<u64> = work
+            .iter()
+            .map(|c| c.named_inos().first().copied().unwrap_or(0))
+            .collect();
+        let mut stripes: Vec<usize> = inos
+            .iter()
+            .map(|&i| SERVE_INO_LOCKS.shard_index(i))
+            .collect();
+        stripes.sort_unstable();
+        stripes.dedup();
+        let mut stripe_guards = Vec::with_capacity(stripes.len());
+        for s in stripes {
+            stripe_guards.push(SERVE_INO_LOCKS.get_by_index(s).lock().await);
+        }
+        let prepared = futures::future::join_all(work.into_iter().map(|call| async move {
+            let PublishCall::SetLayoutAndSize {
+                ino,
+                layout,
+                size,
+                refs,
+                ..
+            } = call
+            else {
+                return Err(SqueezefsError::InvalidOperation(
+                    "S9 publish owner: a non-layout call was dispatched to a layout group".into(),
+                ));
+            };
+            self.prepare_layout_publish(client, ino, layout, size, refs)
+                .await
+        }))
+        .await;
+        let mut outcomes: Vec<Option<std::result::Result<PublishReply, WireError>>> =
+            (0..n).map(|_| None).collect();
+        let mut invalidate: Vec<u64> = Vec::with_capacity(n);
+        let mut items = Vec::new();
+        let mut posts = Vec::new();
+        let mut item_slots = Vec::new();
+        for (i, p) in prepared.into_iter().enumerate() {
+            match p {
+                Err(e) => outcomes[i] = Some(Err(WireError::from_error(&e))),
+                Ok(LayoutPrepare::Done(reply)) => {
+                    invalidate.push(inos[i]);
+                    outcomes[i] = Some(Ok(reply));
+                }
+                Ok(LayoutPrepare::Staged(PreparedLayoutPublish { item, post })) => {
+                    items.push(item);
+                    posts.push(post);
+                    item_slots.push(i);
+                }
+            }
+        }
+        let committed = !items.is_empty();
+        if committed {
+            let results = self.inner.set_layout_and_size_group(items).await;
+            for ((i, post), committed) in item_slots.into_iter().zip(posts).zip(results) {
+                let out = Self::finish_layout_publish(inos[i], committed, post).await;
+                if out.is_ok() {
+                    invalidate.push(inos[i]);
+                }
+                outcomes[i] = Some(out.map_err(|e| WireError::from_error(&e)));
+            }
+        }
+        // Rung 18: a committed layout-class serve invalidates the
+        // authority fs's RAM view of the named inos (the served commit
+        // bypassed it — see the sink's doc). Under the stripes, as the
+        // serial serve does.
+        if !invalidate.is_empty() {
+            note_served_layout_commit(&invalidate);
+        }
+        drop(stripe_guards);
+        let outcomes = outcomes
+            .into_iter()
+            .map(|slot| {
+                slot.unwrap_or_else(|| {
+                    Err(WireError::from_error(&SqueezefsError::InvalidOperation(
+                        "S9 publish owner: a grouped call reached no outcome (unreachable — \
+                         every member is answered by its prepare or its commit)"
+                            .into(),
+                    )))
+                })
+            })
+            .collect();
+        (outcomes, committed)
     }
 
     /// Serve one [`PublishCall::FreeBlocks`] through the dedup window: the
@@ -4829,6 +5204,131 @@ impl PublishService {
         Ok((encoded, refs, blob_custody))
     }
 
+    /// The SetLayoutAndSize serve's PREPARE half (D-1c): everything before
+    /// the layout commit — the kvmap scoped-put probe (a reply here means
+    /// the call is DONE and never groupable), the custody-scoped compose,
+    /// the rung-19/20 refs recomposition, and the over-cap ledger chunks
+    /// (their own refs-only transactions, committed here under the serve's
+    /// per-ino stripe as before). Returns the staged item plus what the
+    /// commit's outcome must settle ([`Self::finish_layout_publish`]).
+    async fn prepare_layout_publish(
+        &self,
+        client: &str,
+        ino: u64,
+        layout: Vec<u8>,
+        size: u64,
+        refs: Vec<WireBlockRefOp>,
+    ) -> Result<LayoutPrepare> {
+        let refs: Vec<BlockRefOp> = refs.into_iter().map(BlockRefOp::from).collect();
+        // PR 5b item 3: a kvmap-headed DURABLE base composes over the tree
+        // via the claims-scoped train (the S11 ∘ kvmap compose) — the
+        // inline/blob compose below never sees a kvmap side.
+        if let Some(reply) = self
+            .try_scoped_kvmap_put(client, ino, &layout, size, &refs)
+            .await?
+        {
+            return Ok(LayoutPrepare::Done(reply));
+        }
+        let (layout, recomputed, blob_custody) = self
+            .custody_scoped_layout(client, ino, layout, &refs)
+            .await?;
+        // Rung 19: on the SCOPED arm the accounting is the composition's
+        // own diff; the caller's MAP-BLOB ops (the indirect blob custody
+        // transfer — index-disjoint from map entries) travel verbatim
+        // beside it — EXCEPT on the rung-20 compose arm, where the owner
+        // recomputes blob custody entirely and the caller's blob ops are
+        // DROPPED (staged verbatim they double-count / mis-name blobs the
+        // composition renamed). Every verbatim arm keeps the caller's
+        // frame byte-identical.
+        // Finding 36b: the scoped compose's RELEASED data blocks are the
+        // displaced set the COMMIT actually performs — collected here,
+        // freed strictly after commit Ok in `finish_layout_publish`
+        // (map-blob custody stays on `free_after_commit`).
+        let was_recomputed = recomputed.is_some();
+        let mut released_data: Vec<crate::meta_backend::kv::block_refs::BlockRef> = Vec::new();
+        let mut refs: Vec<BlockRefOp> = match recomputed {
+            Some(mut r) => {
+                released_data = r
+                    .iter()
+                    .filter(|o| !o.take && !o.reference.is_map_blob())
+                    .map(|o| o.reference)
+                    .collect();
+                if !blob_custody.drop_caller_blob_ops {
+                    r.extend(refs.iter().filter(|o| o.reference.is_map_blob()).copied());
+                }
+                r
+            }
+            None => refs,
+        };
+        // Finding 36b (the chunk hole's OWNER half): a shipped full-save
+        // now carries its WHOLE claim set (the routing pre-chunk stands
+        // down for shipped full-saves so the scoped compose above saw
+        // every claim), so the journal-entry-cap protection (finding 38)
+        // runs HERE: over-cap ledger loads commit FIRST in refs-only
+        // transactions under the serve's per-ino stripe (no publish
+        // interleaves — SERVE_INO_LOCKS), the tail rides the layout
+        // transaction, and a crash between chunk and layout leaves only
+        // report-only fsck C8 residue (space-safe, data-safe) — f38's law
+        // verbatim, moved to the node whose journal admits the commit.
+        const SERVE_REF_TX_CHUNK: usize = 512;
+        while refs.len() > SERVE_REF_TX_CHUNK {
+            let tail = refs.split_off(SERVE_REF_TX_CHUNK);
+            let chunk = std::mem::replace(&mut refs, tail);
+            self.inner.commit_block_refs(ino, &chunk).await?;
+        }
+        Ok(LayoutPrepare::Staged(PreparedLayoutPublish {
+            item: LayoutPublish {
+                ino,
+                layout,
+                size,
+                block_refs: refs,
+            },
+            post: LayoutPostCommit {
+                blob_custody,
+                released_data,
+                was_recomputed,
+            },
+        }))
+    }
+
+    /// The SetLayoutAndSize serve's FINISH half (D-1c): settle a prepared
+    /// item's commit outcome. On `Err` nothing is freed — the fresh blob's
+    /// guard drops ARMED (freeing it) and the displaced/released sets stay
+    /// untouched, exactly the pre-split `?` shape. On `Ok`: the commit
+    /// named the fresh blob, so custody transfers (rung 20), the displaced
+    /// durable blob is freed only NOW (the DUR-6 CoW law), and the
+    /// compose's released data blocks run this authority's own free
+    /// ladder strictly after commit Ok (finding 36b, half 1 — the reply's
+    /// `recomputed` stands the caller's frame stream down).
+    async fn finish_layout_publish(
+        ino: u64,
+        committed: Result<()>,
+        post: LayoutPostCommit,
+    ) -> Result<PublishReply> {
+        let LayoutPostCommit {
+            mut blob_custody,
+            released_data,
+            was_recomputed,
+        } = post;
+        committed?;
+        if let Some(g) = blob_custody.fresh.as_mut() {
+            g.disarm();
+        }
+        if !blob_custody.free_after_commit.is_empty() {
+            if let Some(io) = crate::meta_backend::kv::indirect_map::indirect_map_io() {
+                for blob_key in blob_custody.free_after_commit {
+                    (io.free)(blob_key).await;
+                }
+            }
+        }
+        if !released_data.is_empty() {
+            free_recomputed_releases(ino, released_data).await;
+        }
+        Ok(PublishReply::PutDone {
+            recomputed: was_recomputed,
+        })
+    }
+
     async fn execute(&self, client: &str, call: PublishCall) -> Result<PublishReply> {
         match call {
             PublishCall::SetLayoutAndSize {
@@ -4837,99 +5337,19 @@ impl PublishService {
                 size,
                 refs,
                 ..
-            } => {
-                let refs: Vec<BlockRefOp> = refs.into_iter().map(BlockRefOp::from).collect();
-                // PR 5b item 3: a kvmap-headed DURABLE base composes over
-                // the tree via the claims-scoped train (the S11 ∘ kvmap
-                // compose) — the inline/blob compose below never sees a
-                // kvmap side.
-                if let Some(reply) = self
-                    .try_scoped_kvmap_put(client, ino, &layout, size, &refs)
-                    .await?
-                {
-                    return Ok(reply);
+            } => match self
+                .prepare_layout_publish(client, ino, layout, size, refs)
+                .await?
+            {
+                LayoutPrepare::Done(reply) => Ok(reply),
+                LayoutPrepare::Staged(PreparedLayoutPublish { item, post }) => {
+                    let committed = self
+                        .inner
+                        .set_layout_and_size(item.ino, &item.layout, item.size, &item.block_refs)
+                        .await;
+                    Self::finish_layout_publish(ino, committed, post).await
                 }
-                let (layout, recomputed, mut blob_custody) = self
-                    .custody_scoped_layout(client, ino, layout, &refs)
-                    .await?;
-                // Rung 19: on the SCOPED arm the accounting is the
-                // composition's own diff; the caller's MAP-BLOB ops (the
-                // indirect blob custody transfer — index-disjoint from
-                // map entries) travel verbatim beside it — EXCEPT on the
-                // rung-20 compose arm, where the owner recomputes blob
-                // custody entirely and the caller's blob ops are DROPPED
-                // (staged verbatim they double-count / mis-name blobs
-                // the composition renamed). Every verbatim arm keeps the
-                // caller's frame byte-identical.
-                // Finding 36b: the scoped compose's RELEASED data blocks
-                // are the displaced set the COMMIT actually performs —
-                // collected here, freed strictly after commit Ok below
-                // (map-blob custody stays on `free_after_commit`).
-                let was_recomputed = recomputed.is_some();
-                let mut released_data: Vec<crate::meta_backend::kv::block_refs::BlockRef> =
-                    Vec::new();
-                let mut refs: Vec<BlockRefOp> = match recomputed {
-                    Some(mut r) => {
-                        released_data = r
-                            .iter()
-                            .filter(|o| !o.take && !o.reference.is_map_blob())
-                            .map(|o| o.reference)
-                            .collect();
-                        if !blob_custody.drop_caller_blob_ops {
-                            r.extend(refs.iter().filter(|o| o.reference.is_map_blob()).copied());
-                        }
-                        r
-                    }
-                    None => refs,
-                };
-                // Finding 36b (the chunk hole's OWNER half): a shipped
-                // full-save now carries its WHOLE claim set (the routing
-                // pre-chunk stands down for shipped full-saves so the
-                // scoped compose above saw every claim), so the
-                // journal-entry-cap protection (finding 38) runs HERE:
-                // over-cap ledger loads commit FIRST in refs-only
-                // transactions under the serve's per-ino stripe (no
-                // publish interleaves — SERVE_INO_LOCKS), the tail rides
-                // the layout transaction, and a crash between chunk and
-                // layout leaves only report-only fsck C8 residue
-                // (space-safe, data-safe) — f38's law verbatim, moved to
-                // the node whose journal admits the commit.
-                const SERVE_REF_TX_CHUNK: usize = 512;
-                while refs.len() > SERVE_REF_TX_CHUNK {
-                    let tail = refs.split_off(SERVE_REF_TX_CHUNK);
-                    let chunk = std::mem::replace(&mut refs, tail);
-                    self.inner.commit_block_refs(ino, &chunk).await?;
-                }
-                self.inner
-                    .set_layout_and_size(ino, &layout, size, &refs)
-                    .await?;
-                // Rung 20: the commit named the fresh blob — custody
-                // transfers (an error above dropped the guard ARMED,
-                // freeing the fresh blob) — and the displaced durable
-                // blob is freed only NOW (the DUR-6 CoW law).
-                if let Some(g) = blob_custody.fresh.as_mut() {
-                    g.disarm();
-                }
-                if !blob_custody.free_after_commit.is_empty() {
-                    if let Some(io) = crate::meta_backend::kv::indirect_map::indirect_map_io() {
-                        for blob_key in blob_custody.free_after_commit {
-                            (io.free)(blob_key).await;
-                        }
-                    }
-                }
-                // Finding 36b (half 1, the SCOPED-PUT arm — the s11-mpiio
-                // field venue): the compose's released data blocks run
-                // this authority's own free ladder, strictly AFTER commit
-                // Ok; the reply's `recomputed` stands the caller's frame
-                // stream down. On commit Err the `?` above already
-                // returned — nothing is freed.
-                if !released_data.is_empty() {
-                    free_recomputed_releases(ino, released_data).await;
-                }
-                Ok(PublishReply::PutDone {
-                    recomputed: was_recomputed,
-                })
-            }
+            },
             PublishCall::MergeLayoutAndSize {
                 ino,
                 delta,

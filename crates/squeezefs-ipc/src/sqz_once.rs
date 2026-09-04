@@ -39,6 +39,42 @@ impl<T> OnceCell<T> {
         self.value.get()
     }
 
+    /// Manual leadership (the meta-ship GROUP serve, D-1c): claim the init
+    /// latch synchronously. `true` ⇒ the caller owns initialization and
+    /// MUST eventually call [`Self::complete_init`] (or
+    /// [`Self::abandon_init`] on failure) — every `get_or_init` caller
+    /// parks on it exactly as on an async leader. `false` ⇒ the value is
+    /// set or another leader (async or manual) is running: the caller
+    /// awaits `get_or_init` like any loser.
+    pub fn claim_init(&self) -> bool {
+        if self.value.get().is_some() {
+            return false;
+        }
+        let mut busy = self.busy.lock().unwrap_or_else(|e| e.into_inner());
+        if *busy {
+            false
+        } else {
+            *busy = true;
+            true
+        }
+    }
+
+    /// Set the value and release a manual leader's latch (the leader
+    /// path's `value.set` then `Unbusy` drop, in that order): parked
+    /// callers wake and read it.
+    pub fn complete_init(&self, v: T) {
+        let _ = self.value.set(v);
+        *self.busy.lock().unwrap_or_else(|e| e.into_inner()) = false;
+        self.changed.notify_waiters();
+    }
+
+    /// Release a manual leader's latch WITHOUT a value (the cancelled-
+    /// leader shape): a parked caller re-elects and runs its own init.
+    pub fn abandon_init(&self) {
+        *self.busy.lock().unwrap_or_else(|e| e.into_inner()) = false;
+        self.changed.notify_waiters();
+    }
+
     /// Get, or run `init` exactly once across all concurrent callers.
     pub async fn get_or_init<F, Fut>(&self, init: F) -> &T
     where
@@ -143,6 +179,70 @@ mod tests {
         // A successor must be able to init.
         let v = crate::sqz_blocking::block_on(cell.get_or_init(|| async { 7u64 }));
         assert_eq!(*v, 7);
+    }
+
+    /// Manual leadership: a claimed latch parks `get_or_init` callers
+    /// (their init never runs), `complete_init` wakes them with the
+    /// leader's value, and a second claim is refused both while the
+    /// latch is held and after the value is set.
+    #[test]
+    fn manual_leader_parks_racers_and_completes_them() {
+        let cell = Arc::new(OnceCell::<u64>::new());
+        assert!(cell.claim_init(), "a fresh cell grants the claim");
+        assert!(!cell.claim_init(), "a held latch refuses a second claim");
+        let inits = Arc::new(AtomicUsize::new(0));
+        let mut joins = Vec::new();
+        for _ in 0..4 {
+            let cell = cell.clone();
+            let inits = inits.clone();
+            joins.push(std::thread::spawn(move || {
+                crate::sqz_blocking::block_on(async {
+                    *cell
+                        .get_or_init(|| async {
+                            inits.fetch_add(1, Ordering::SeqCst);
+                            99u64
+                        })
+                        .await
+                })
+            }));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        cell.complete_init(42);
+        for j in joins {
+            assert_eq!(
+                j.join().unwrap(),
+                42,
+                "racers read the manual leader's value"
+            );
+        }
+        assert_eq!(
+            inits.load(Ordering::SeqCst),
+            0,
+            "no racer ever ran its init"
+        );
+        assert!(!cell.claim_init(), "an initialized cell refuses the claim");
+    }
+
+    /// Manual leadership abandoned: the latch releases without a value
+    /// and a parked caller re-elects and runs its own init.
+    #[test]
+    fn abandoned_manual_leader_lets_a_racer_reelect() {
+        let cell = Arc::new(OnceCell::<u64>::new());
+        assert!(cell.claim_init());
+        let racer = {
+            let cell = cell.clone();
+            std::thread::spawn(move || {
+                crate::sqz_blocking::block_on(async { *cell.get_or_init(|| async { 7u64 }).await })
+            })
+        };
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        cell.abandon_init();
+        assert_eq!(
+            racer.join().unwrap(),
+            7,
+            "the racer re-elected and initialized"
+        );
+        assert_eq!(cell.get(), Some(&7));
     }
 
     fn futures_noop_waker() -> std::task::Waker {

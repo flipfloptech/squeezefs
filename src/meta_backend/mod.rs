@@ -104,6 +104,17 @@ pub struct DirEntry {
     pub file_type: u32,
 }
 
+/// One member of a [`RoutedMetaBackend::set_layout_and_size_group`]: the
+/// single verb's arguments, owned (the group stages its members
+/// concurrently, so each carries its own bytes).
+#[derive(Debug)]
+pub struct LayoutPublish {
+    pub ino: Ino,
+    pub layout: Vec<u8>,
+    pub size: u64,
+    pub block_refs: Vec<kv::block_refs::BlockRefOp>,
+}
+
 #[async_trait::async_trait]
 pub trait Metadata: Send + Sync {
     async fn lookup(&self, parent: Ino, name: &str) -> Result<Inode>;
@@ -3487,6 +3498,147 @@ impl RoutedMetaBackend {
             self.mirror_volume_failure(v_idx);
         }
         out
+    }
+
+    /// **[`Self::set_layout_and_size`] over a SET of distinct inos, committed
+    /// as one conveyor group per volume** (D-1c — e2e perf audit §5.3 row 1,
+    /// one conveyor group per shipped frame). Per item the semantics are the
+    /// single verb's exactly: the S10 coherence gate and the §5.5.2a cutover
+    /// gate are held until the item's terminal outcome, `route_ino` after the
+    /// gates, `check_volume_enabled`, the volume's fail-stop mirrored on error.
+    /// What differs is the commit: the items are grouped by home volume, each
+    /// volume's members take ONE canonical `lock_many` over their inos
+    /// (`dlm.rs`'s acquisition law — distinct inos may share a stripe), stage
+    /// concurrently under that shared guard set, and commit through
+    /// [`kv::backend::KvMetaBackend::commit_tx_group`] — one queue-lock
+    /// enqueue, so the set is one apply pass by construction. One tx = one
+    /// checksummed journal entry is unchanged.
+    ///
+    /// Outcomes are returned in input order. An item that fails BEFORE the
+    /// group (a disabled volume, a stage error such as a missing inode) gets
+    /// its own `Err` and never joins the group; its siblings are unaffected.
+    /// Inos must be distinct within one call — the publish owner's chain
+    /// partition guarantees it (one call per chain per round), so a duplicate
+    /// is refused loud (its later occurrence) rather than serialized: two
+    /// staged txs for one ino in one group would race on the RAM view.
+    pub async fn set_layout_and_size_group(&self, items: Vec<LayoutPublish>) -> Vec<Result<()>> {
+        let n = items.len();
+        let mut results: Vec<Option<Result<()>>> = (0..n).map(|_| None).collect();
+        if n == 0 {
+            return Vec::new();
+        }
+        let inos: Vec<Ino> = items.iter().map(|it| it.ino).collect();
+        // S10 coherence law (rung 12) — the single verb's gate over the
+        // whole set: recall every outstanding delegation on the named
+        // objects, hold the permit across the group.
+        let _deleg_gate = crate::meta_ship::deleg_mutation_gate(self, &inos).await;
+        // §5.5.2a cutover gate — before the backend's own I-guards and
+        // before route derivation (a park can span a flip).
+        let _gate = self.slot_gate_enter(&inos).await;
+
+        // Route, screen, and bucket by home volume (input index kept).
+        let mut seen: std::collections::HashSet<Ino> = std::collections::HashSet::with_capacity(n);
+        let mut per_volume: std::collections::BTreeMap<usize, Vec<(usize, Ino, LayoutPublish)>> =
+            std::collections::BTreeMap::new();
+        for (i, item) in items.into_iter().enumerate() {
+            if !seen.insert(item.ino) {
+                crate::note_invariant_tripwire(
+                    "set_layout_and_size_group_duplicate_ino",
+                    &format!(
+                        "ino {} named twice in one group — the caller's partition law (one \
+                         call per named ino per group) is broken; refusing the duplicate \
+                         rather than racing two staged txs on one ino",
+                        item.ino
+                    ),
+                );
+                results[i] = Some(Err(crate::error::SqueezefsError::InvalidOperation(
+                    format!(
+                        "layout publish group names ino {} twice (one call per ino per group)",
+                        item.ino
+                    ),
+                )));
+                continue;
+            }
+            let (v_idx, local_ino) = self.route_ino(item.ino);
+            if let Err(e) = self.check_volume_enabled(v_idx) {
+                results[i] = Some(Err(e));
+                continue;
+            }
+            per_volume
+                .entry(v_idx)
+                .or_default()
+                .push((i, local_ino, item));
+        }
+
+        // Every volume's sub-group runs independently and concurrently: a
+        // volume's members hold only THAT volume's guards (cross-volume
+        // lock sets stay in ascending volume order by never being held
+        // together here).
+        let futs = per_volume.into_iter().map(|(v_idx, members)| async move {
+            let vol = &self.volumes[v_idx];
+            let want: Vec<(Ino, dlm::LockMode)> = members
+                .iter()
+                .map(|(_, local, _)| (*local, dlm::LockMode::Exclusive))
+                .collect();
+            // ONE canonical acquisition for the whole sub-group (deduped by
+            // stripe, ascending), co-owned by every member tx until its
+            // terminal outcome.
+            let guards: std::sync::Arc<[dlm::DlmGuard]> =
+                std::sync::Arc::from(vol.dlm().lock_many(&want, &[]).await);
+            let staged = futures::future::join_all(members.iter().map(|(_, local, item)| {
+                let guards = std::sync::Arc::clone(&guards);
+                async move {
+                    vol.stage_layout_and_size_holding(
+                        *local,
+                        &item.layout,
+                        item.size,
+                        &item.block_refs,
+                        guards,
+                    )
+                    .await
+                }
+            }))
+            .await;
+            drop(guards);
+            let mut outcomes: Vec<(usize, Result<()>)> = Vec::with_capacity(members.len());
+            let mut txs = Vec::with_capacity(members.len());
+            let mut tx_slots = Vec::with_capacity(members.len());
+            for ((i, _, _), staged) in members.iter().zip(staged) {
+                match staged {
+                    Ok(tx) => {
+                        txs.push(tx);
+                        tx_slots.push(*i);
+                    }
+                    Err(e) => outcomes.push((*i, Err(e))),
+                }
+            }
+            if !txs.is_empty() {
+                for (i, out) in tx_slots.into_iter().zip(vol.commit_tx_group(txs).await) {
+                    outcomes.push((i, out.map_err(Into::into)));
+                }
+            }
+            (v_idx, outcomes)
+        });
+        for (v_idx, outcomes) in futures::future::join_all(futs).await {
+            for (i, out) in outcomes {
+                if out.is_err() {
+                    self.mirror_volume_failure(v_idx);
+                }
+                results[i] = Some(out);
+            }
+        }
+        results
+            .into_iter()
+            .map(|slot| {
+                slot.unwrap_or_else(|| {
+                    Err(crate::error::SqueezefsError::InvalidOperation(
+                        "layout publish group: a member reached no outcome (unreachable — \
+                         every member is refused, staged-and-failed, or committed)"
+                            .to_string(),
+                    ))
+                })
+            })
+            .collect()
     }
 
     /// Spec §6.2 item 1: commit a standalone durable block-reference

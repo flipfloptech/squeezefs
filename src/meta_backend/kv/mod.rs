@@ -459,6 +459,19 @@ pub static META_CONVEYOR_LEADER_PASSES: AtomicU64 = AtomicU64::new(0);
 /// journal-failure lattice bumped — never a silent `completed_upto` wedge.
 pub static META_CONVEYOR_PASS_PANICS: AtomicU64 = AtomicU64::new(0);
 
+/// Conveyor GROUP commits (`meta_conveyor_group_commits` — D-1c, e2e perf
+/// audit §5.3 row 1): sets of staged transactions enqueued under ONE
+/// queue-lock acquisition (`KvMetaBackend::commit_tx_group`), so a drain
+/// can never take part of one — the owner-side mechanism behind "one
+/// shipped frame = one apply pass". Counted once per non-empty group.
+pub static META_CONVEYOR_GROUP_COMMITS: AtomicU64 = AtomicU64::new(0);
+
+/// Member transactions those groups carried (`meta_conveyor_group_txs`);
+/// `group_txs ÷ group_commits` is the live group size — ≈ the served
+/// frame's independent-call width on a grouping authority, 0 on a solo
+/// mount and under `SQUEEZEFS_PUBLISH_CONVEYOR_GROUP=0` by construction.
+pub static META_CONVEYOR_GROUP_TXS: AtomicU64 = AtomicU64::new(0);
+
 /// Conveyor WINDOWS in flight (`meta_conveyor_windows_inflight`): batches
 /// past their RAM apply whose journal write has been submitted but whose
 /// members are not yet at a terminal outcome — i.e. the applied-but-

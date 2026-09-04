@@ -6845,7 +6845,12 @@ where
 /// One staged (not yet committed) transaction: `(tree_id, key, kind,
 /// value)` in stage order. Seqs are assigned at commit, inside the node
 /// locks, from the journal reservation (§4.4 pt 2).
-pub(super) struct KvTx {
+///
+/// Public as an OPAQUE handle only (D-1c): the stage halves
+/// ([`KvMetaBackend::stage_layout_and_size`] and friends) return one and
+/// [`KvMetaBackend::commit_tx_group`] consumes a set — nothing outside
+/// this module stages a record into it.
+pub struct KvTx {
     staged: Vec<(u8, Vec<u8>, RecordKind, Bytes)>,
     /// The `#[track_caller]` construction site — the metadata-throughput
     /// D4.a attribution hook (design §5.4): a successful `commit_tx`
@@ -6869,6 +6874,14 @@ pub(super) struct KvTx {
 impl KvTx {
     #[track_caller]
     fn new() -> Self {
+        Self::empty()
+    }
+
+    /// A transaction with nothing staged — commits as an inline `Ok(())`
+    /// (no pass, no entry). The one constructor outside this module (the
+    /// group-commit contracts' degenerate member).
+    #[track_caller]
+    pub fn empty() -> Self {
         Self {
             staged: Vec::new(),
             site: std::panic::Location::caller(),
@@ -7756,11 +7769,170 @@ impl KvMetaBackend {
         if tx.is_empty() {
             return Ok(());
         }
+        // (1) Exact size before anything is queued (§4.4 pt 5) — an
+        // oversized / undecodable tx fails ALONE, never inside a batch.
+        let weak = self.conveyor_identity()?;
+        let (entry, rx) = self.build_queued_tx(tx)?;
+        let len = entry.len;
+
+        // (2) Enqueue + leader-elect — no await between the two.
+        self.conveyor.enqueue(entry, len);
+        self.lead_pass_if_elected(weak);
+
+        // (3) Park on the fan-out.
+        self.park_on_outcome(rx, len).await
+    }
+
+    /// The conveyor identity the pass task upgrades per batch — resolved
+    /// BEFORE anything is enqueued so a broken wiring fails loud with
+    /// nothing queued (unreachable by construction — set at every open
+    /// path before the first commit). The pass task holds the QUEUE
+    /// strongly but the backend only weakly: an idle pass must never keep
+    /// a dropped-without-shutdown backend — and its writer flock — alive
+    /// past the last user `Arc`.
+    fn conveyor_identity(&self) -> std::result::Result<Weak<KvMetaBackend>, KvError> {
+        self.conveyor_self.get().cloned().ok_or_else(|| {
+            KvError::Corrupt(
+                "conveyor identity missing (commit before open wiring?) — refusing \
+                     to enqueue a tx no pass task could ever drain"
+                    .to_string(),
+            )
+        })
+    }
+
+    /// Leader-elect after an enqueue; the winner spawns the detached,
+    /// panic-guarded pass task (§5.5 lifecycle: no client-visible
+    /// cancellation can drop the pass mid-flight — the journal's
+    /// accounting is unforgiving: a dropped Admission leaks budget
+    /// forever, an uncompleted reservation wedges completed_upto).
+    fn lead_pass_if_elected(&self, weak: Weak<KvMetaBackend>) {
+        if self.conveyor.try_lead() {
+            let conveyor = Arc::clone(&self.conveyor);
+            // Stage 1c: the pass task is PLANE-CRITICAL (it holds the 4b
+            // union leaf locks and every committer parks on its fan-out)
+            // — the volume's journal lane (C-2; the sqz-meta pool with the
+            // lane off), never the main tokio runtime.
+            self.spawn_conveyor_task("kv_conveyor_pass", Self::conveyor_pass_task(conveyor, weak));
+        }
+    }
+
+    /// Park a committer on its tx's fan-out (step 3 of the pipeline). A
+    /// closed channel means the pass died between drain and fan-out — the
+    /// panic sentinel already failed the batch loud (EIO here is the belt,
+    /// not the mechanism). The wedge census gauges the park (2026-08-07):
+    /// writers parked here while passes stay flat IS the stalled-conveyor
+    /// signature; the stage-1b named-wait census ages it in the
+    /// watchdog's lock-wait lines (the gauge counts it; this NAMES it).
+    async fn park_on_outcome(
+        &self,
+        rx: squeezefs_ipc::sqz_channel::oneshot::Receiver<std::result::Result<(), KvError>>,
+        len: u64,
+    ) -> std::result::Result<(), KvError> {
+        let _parked = super::ParkedGaugeGuard::enter(&super::META_COMMIT_PARKED);
+        let _census = crate::fuse_client::LockWaitToken::begin(
+            crate::fuse_client::LockClass::Commit,
+            0,
+            0,
+            len,
+        );
+        match rx.await {
+            Ok(out) => out,
+            Err(_) => Err(KvError::Io(self.eio(
+                "commit conveyor pass dropped its result channel (pass panic — batch \
+                 failed loud)",
+            ))),
+        }
+    }
+
+    /// **Group commit (D-1c — e2e perf audit §5.3 row 1, one conveyor
+    /// group per shipped frame).** `commit_tx`'s pipeline over a SET of
+    /// staged transactions, enqueued under ONE queue-lock acquisition
+    /// ([`ConveyorCore::enqueue_many`]) so a drain can never take part of
+    /// the group: N distinct-object transactions become one apply pass by
+    /// construction, not by arrival timing. Nothing about the group
+    /// reaches the ring — every member stays its own ordinary checksummed
+    /// journal entry (one tx = one entry; the crash contract is untouched),
+    /// the drain caps still govern (the byte cap may split an over-cap
+    /// group, progress-first), and each member's DLM guards release at ITS
+    /// terminal outcome.
+    ///
+    /// Per member, in input order: an empty tx answers `Ok(())` inline; a
+    /// tx that fails admission (size / value cap) gets ITS error and is not
+    /// enqueued — its siblings are unaffected; the rest are built first,
+    /// then enqueued together, then ONE election, then every member's
+    /// fan-out is awaited in order (the pass answers in journal order,
+    /// which is the group's order). The parked-committer census and the
+    /// op-trace stamps apply per member exactly as `commit_tx` applies them.
+    pub async fn commit_tx_group(&self, txs: Vec<KvTx>) -> Vec<std::result::Result<(), KvError>> {
+        let n = txs.len();
+        let mut results: Vec<Option<std::result::Result<(), KvError>>> =
+            (0..n).map(|_| None).collect();
+        if n == 0 {
+            return Vec::new();
+        }
+        // Unreachable by construction (wired at every open path); every
+        // member gets the same loud refusal with nothing queued.
+        let Ok(weak) = self.conveyor_identity() else {
+            return (0..n).map(|_| self.conveyor_identity().map(drop)).collect();
+        };
+        let mut entries: Vec<(QueuedTx, u64)> = Vec::with_capacity(n);
+        let mut waits = Vec::with_capacity(n);
+        for (i, tx) in txs.into_iter().enumerate() {
+            if tx.is_empty() {
+                results[i] = Some(Ok(()));
+                continue;
+            }
+            match self.build_queued_tx(tx) {
+                Ok((entry, rx)) => {
+                    let len = entry.len;
+                    entries.push((entry, len));
+                    waits.push((i, rx, len));
+                }
+                Err(e) => results[i] = Some(Err(e)),
+            }
+        }
+        if !entries.is_empty() {
+            let members = self.conveyor.enqueue_many(entries);
+            super::META_CONVEYOR_GROUP_COMMITS.fetch_add(1, Ordering::Relaxed);
+            super::META_CONVEYOR_GROUP_TXS.fetch_add(members as u64, Ordering::Relaxed);
+            self.lead_pass_if_elected(weak);
+        }
+        for (i, rx, len) in waits {
+            results[i] = Some(self.park_on_outcome(rx, len).await);
+        }
+        results
+            .into_iter()
+            .map(|slot| {
+                slot.unwrap_or_else(|| {
+                    Err(KvError::Corrupt(
+                        "group commit: a member reached no outcome (unreachable — every \
+                         member is answered inline, refused at admission, or awaited)"
+                            .to_string(),
+                    ))
+                })
+            })
+            .collect()
+    }
+
+    /// Steps (1)–(2a) of the commit pipeline for ONE tx: encode its
+    /// records, enforce the per-volume value cap and the exact-size
+    /// admission (§4.4 pt 5 — an oversized / undecodable tx fails ALONE,
+    /// before it can join any batch), mint its fan-out channel and stamp
+    /// its op-trace enqueue. Returns the queue entry (not yet enqueued)
+    /// and the committer's receiver.
+    fn build_queued_tx(
+        &self,
+        tx: KvTx,
+    ) -> std::result::Result<
+        (
+            QueuedTx,
+            squeezefs_ipc::sqz_channel::oneshot::Receiver<std::result::Result<(), KvError>>,
+        ),
+        KvError,
+    > {
         // D4.a attribution: the construction site this (about-to-be-
         // committed) tx counts against on success.
         let site = tx.site;
-        // (1) Exact size before anything is queued (§4.4 pt 5) — an
-        // oversized / undecodable tx fails ALONE, never inside a batch.
         let recs: Vec<(u8, Record)> = tx
             .staged
             .into_iter()
@@ -7806,20 +7978,6 @@ impl KvMetaBackend {
         }
         let len = entry_len_for(&recs)?;
 
-        // (2) Enqueue + leader-elect. The pass task holds the QUEUE
-        // strongly but the backend only weakly (upgraded per batch): an
-        // idle pass must never keep a dropped-without-shutdown backend —
-        // and its writer flock — alive past the last user `Arc`. Resolve
-        // the identity BEFORE enqueueing so a broken wiring fails loud
-        // with nothing queued (unreachable by construction — set at
-        // every open path before the first commit).
-        let weak = self.conveyor_self.get().cloned().ok_or_else(|| {
-            KvError::Corrupt(
-                "conveyor identity missing (commit before open wiring?) — refusing \
-                     to enqueue a tx no pass task could ever drain"
-                    .to_string(),
-            )
-        })?;
         let (done, rx) = squeezefs_ipc::sqz_channel::oneshot::channel();
         // op-trace (audit A2): the tx carries the ORIGINATING op's id
         // (the committer's task scope) so the pass's stages join that
@@ -7828,7 +7986,7 @@ impl KvMetaBackend {
         let enqueued_at = std::time::Instant::now();
         let trace_id = crate::op_trace::current_op();
         crate::op_trace::stamp(trace_id, crate::op_trace::Stage::MetaEnqueue, enqueued_at);
-        self.conveyor.enqueue(
+        Ok((
             QueuedTx {
                 recs,
                 len,
@@ -7838,42 +7996,8 @@ impl KvMetaBackend {
                 _guards: tx.guards,
                 done,
             },
-            len,
-        );
-        if self.conveyor.try_lead() {
-            // Detached (§5.5 lifecycle): no client-visible cancellation
-            // can drop the pass mid-flight; the journal's accounting is
-            // unforgiving (a dropped Admission leaks budget forever, an
-            // uncompleted reservation wedges completed_upto).
-            let conveyor = Arc::clone(&self.conveyor);
-            // Stage 1c: the pass task is PLANE-CRITICAL (it holds the 4b
-            // union leaf locks and every committer parks on its fan-out)
-            // — the volume's journal lane (C-2; the sqz-meta pool with the
-            // lane off), never the main tokio runtime.
-            self.spawn_conveyor_task("kv_conveyor_pass", Self::conveyor_pass_task(conveyor, weak));
-        }
-
-        // (3) Park on the fan-out. A closed channel means the pass died
-        // between drain and fan-out — the panic sentinel already failed
-        // the batch loud (EIO here is the belt, not the mechanism).
-        // The wedge census gauges the park (2026-08-07): writers parked
-        // here while passes stay flat IS the stalled-conveyor signature.
-        let _parked = super::ParkedGaugeGuard::enter(&super::META_COMMIT_PARKED);
-        // Stage-1b named-wait census: ages this park in the watchdog's
-        // lock-wait lines (the gauge above counts it; this NAMES it).
-        let _census = crate::fuse_client::LockWaitToken::begin(
-            crate::fuse_client::LockClass::Commit,
-            0,
-            0,
-            len as u64,
-        );
-        match rx.await {
-            Ok(out) => out,
-            Err(_) => Err(KvError::Io(self.eio(
-                "commit conveyor pass dropped its result channel (pass panic — batch \
-                 failed loud)",
-            ))),
-        }
+            rx,
+        ))
     }
 
     /// The detached conveyor pass task (§5.5): drain whatever is queued
@@ -9973,7 +10097,50 @@ impl KvMetaBackend {
         size: u64,
         block_refs: &[super::block_refs::BlockRefOp],
     ) -> Result<()> {
-        self.set_layout_and_size_with_map(ino, layout, size, block_refs, &[])
+        let tx = self
+            .stage_layout_and_size(ino, layout, size, block_refs)
+            .await?;
+        self.commit_tx(tx).await?;
+        Ok(())
+    }
+
+    /// The STAGE half of [`Self::set_layout_and_size`] (D-1c): the write
+    /// gate, the ino's own exclusive 4a guard, and the staged two-record
+    /// transaction (layout Put + inode Put + accounting) — everything up
+    /// to and excluding the commit. The returned tx co-owns the guard;
+    /// commit it alone (`set_layout_and_size` does) or as a member of a
+    /// [`Self::commit_tx_group`].
+    pub async fn stage_layout_and_size(
+        &self,
+        ino: Ino,
+        layout: &[u8],
+        size: u64,
+        block_refs: &[super::block_refs::BlockRefOp],
+    ) -> Result<KvTx> {
+        self.write_gate()?;
+        let guards: Arc<[DlmGuard]> = Arc::from(vec![self.dlm.lock_inode_exclusive(ino).await]);
+        self.stage_layout_and_size_with_map_holding(ino, layout, size, block_refs, &[], guards)
+            .await
+    }
+
+    /// [`Self::stage_layout_and_size`] under a CALLER-HELD guard set — the
+    /// group path's form (D-1c): a set of publishes takes ONE canonical
+    /// `lock_many` over its members' inos (two distinct inos may share a
+    /// DLM stripe; per-member guards taken while siblings hold theirs
+    /// would self-deadlock on a collision — `dlm.rs`'s acquisition law),
+    /// stages every member under that shared set, then commits the set
+    /// as one group. Callers own the write gate's timing only insofar as
+    /// it is re-checked here (a fenced volume refuses to stage).
+    pub async fn stage_layout_and_size_holding(
+        &self,
+        ino: Ino,
+        layout: &[u8],
+        size: u64,
+        block_refs: &[super::block_refs::BlockRefOp],
+        guards: Arc<[DlmGuard]>,
+    ) -> Result<KvTx> {
+        self.write_gate()?;
+        self.stage_layout_and_size_with_map_holding(ino, layout, size, block_refs, &[], guards)
             .await
     }
 
@@ -10027,6 +10194,27 @@ impl KvMetaBackend {
         block_map: &[super::block_map::BlockMapOp],
         guards: Arc<[DlmGuard]>,
     ) -> Result<()> {
+        let tx = self
+            .stage_layout_and_size_with_map_holding(
+                ino, layout, size, block_refs, block_map, guards,
+            )
+            .await?;
+        self.commit_tx(tx).await?;
+        Ok(())
+    }
+
+    /// The stage half of [`Self::set_layout_and_size_with_map_holding`]:
+    /// the two-record transaction (layout Put + inode Put + the accounting
+    /// and map records that ride it), holding `guards`, NOT yet committed.
+    async fn stage_layout_and_size_with_map_holding(
+        &self,
+        ino: Ino,
+        layout: &[u8],
+        size: u64,
+        block_refs: &[super::block_refs::BlockRefOp],
+        block_map: &[super::block_map::BlockMapOp],
+        guards: Arc<[DlmGuard]>,
+    ) -> Result<KvTx> {
         let mut v = self
             .read_inode_value(ino)
             .await?
@@ -10065,8 +10253,7 @@ impl KvMetaBackend {
         // commit). The un-engaged case refused loud above.
         tx.stage_block_map(block_map)?;
         tx.hold_guards(guards);
-        self.commit_tx(tx).await?;
-        Ok(())
+        Ok(tx)
     }
 
     /// Spec §6.2 item 1: commit a standalone set of durable

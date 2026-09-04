@@ -25,7 +25,6 @@ use futures_util::future::{Either, FutureExt};
 use futures_util::select;
 use futures_util::stream::StreamExt;
 use nix::mount;
-#[cfg(target_os = "freebsd")]
 use nix::mount::MntFlags;
 #[cfg(all(
     target_os = "linux",
@@ -492,7 +491,26 @@ impl MountHandleInner {
                         }
                     }
                     if !success {
-                        return Err(IoError::other("call fusermount3 -u to unmount failed"));
+                        // A bystander holding a transient fd on the mount
+                        // (desktop volume monitors inspect every new mount)
+                        // makes the non-lazy unmount EBUSY for longer than the
+                        // retry window. The daemon is exiting and the session
+                        // is destroyed, so finish the way libfuse's own exit
+                        // path does: detach lazily — the mount leaves the
+                        // namespace now, the bystander's fd drains on its own.
+                        let binary_path = binary_path.clone();
+                        let mount_path = self.mount_path.clone();
+                        let status = crate::sqz_blocking::run_blocking(move || {
+                            Command::new(&binary_path)
+                                .args([OsStr::new("-u"), OsStr::new("-z"), mount_path.as_os_str()])
+                                .status()
+                        })
+                        .await?;
+                        if !status.success() {
+                            return Err(IoError::other(
+                                "call fusermount3 -u (then -u -z) to unmount failed",
+                            ));
+                        }
                     }
 
                     return Ok(());
@@ -512,7 +530,15 @@ impl MountHandleInner {
                     }
                 }
                 if !success {
-                    return Err(IoError::other("umount failed after retries"));
+                    // Same law as the fusermount3 path above: an exiting
+                    // daemon finishes with a lazy detach (MNT_DETACH) when a
+                    // bystander's transient fd keeps the non-lazy form EBUSY.
+                    let mp = mount_path.clone();
+                    crate::sqz_blocking::run_blocking(move || {
+                        mount::umount2(&mp, MntFlags::MNT_DETACH)
+                    })
+                    .await
+                    .map_err(|e| IoError::other(format!("umount (then MNT_DETACH) failed: {e}")))?;
                 }
             }
         }

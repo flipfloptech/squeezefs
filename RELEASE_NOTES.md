@@ -98,10 +98,10 @@ Every measurement behind these numbers — venue, instrument, substrate, and the
 
 ## Verification
 
-The tag ships only when every line below is ticked. The results of the external suites and the fuzz campaign are recorded in the notes named next to them once they complete.
+The tag ships only when every line below is ticked. Every leg ran from zero on one commit (`ac3fb7eb`) in one unattended chain; the record is [.benchmarks/2026-09-04-1.2.0-release-gate.md](.benchmarks/2026-09-04-1.2.0-release-gate.md).
 
-- [ ] `task check` — clippy (all features), clippy (shipped features), fmt, `cargo test --all-features -- --test-threads=1`, rustdoc with `-D warnings`, Criterion bench smoke, the `crates/fuse3` fork's own suite, the loom-model build, the markdown link/anchor check, and `cargo audit` over both lockfiles ([the gate's legs](docs/operations.md#verifying-a-build-task-check)).
-- [ ] pjdfstests (`sudo tests/run_pjdfstests.sh`) — results recorded in `.benchmarks/<date>-1.2.0-release-gate.md`
-- [ ] LTP filesystem syscalls (`sudo tests/run_ltp_syscalls.sh`) — results recorded in `.benchmarks/<date>-1.2.0-release-gate.md`
-- [ ] fstests `-g auto`, one complete pass from zero (`sudo tests/run_fstests.sh`) — results recorded in `.benchmarks/<date>-1.2.0-release-gate.md`
-- [ ] The fuzz campaign over the nine `fuzz/fuzz_targets/` decoders (on-disk metadata, the job wire, the interception shared memory) — results recorded in `.benchmarks/<date>-1.2.0-release-gate.md`
+- [x] `task check` — clippy (all features), clippy (shipped features), fmt, `cargo test --all-features -- --test-threads=1` (4,598 tests), rustdoc with `-D warnings`, Criterion bench smoke, the `crates/fuse3` fork's own suite, the loom-model build, the fuzz workspace type-check, the markdown link/anchor check, and `cargo audit` over both lockfiles ([the gate's legs](docs/operations.md#verifying-a-build-task-check)) — green on `ac3fb7eb`, [.benchmarks/2026-09-04-1.2.0-release-gate.md](.benchmarks/2026-09-04-1.2.0-release-gate.md).
+- [x] pjdfstests (`sudo tests/run_pjdfstests.sh`) — 238 files, 8,798 tests, all successful; [.benchmarks/2026-09-04-1.2.0-release-gate.md](.benchmarks/2026-09-04-1.2.0-release-gate.md)
+- [x] LTP filesystem syscalls (`sudo tests/run_ltp_syscalls.sh`) — 1,884 passed, 0 failed, 0 broken, 44 kernel-feature skips; [.benchmarks/2026-09-04-1.2.0-release-gate.md](.benchmarks/2026-09-04-1.2.0-release-gate.md)
+- [x] fstests `-g auto`, one complete pass from zero (`sudo tests/run_fstests.sh`) — 198 ran, 0 unexpected failures (the four by-design adjudications matched their pinned shapes; the expected-PASS sentinels 074/464 passed); [.benchmarks/2026-09-04-1.2.0-release-gate.md](.benchmarks/2026-09-04-1.2.0-release-gate.md)
+- [x] The fuzz campaign over the twelve `fuzz/fuzz_targets/` decoders (on-disk metadata incl. the block-map tree, the cluster and publish wires, the interception shared memory) — 383.6 M executions, 0 crashes, on the same product code; [.benchmarks/2026-09-03-release-1.2-fuzz.md](.benchmarks/2026-09-03-release-1.2-fuzz.md)

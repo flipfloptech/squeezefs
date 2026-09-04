@@ -82,16 +82,26 @@ echo "   enable_uring:     $(cat /sys/module/fuse/parameters/enable_uring 2>/dev
 case "$(uname -r)" in
 *sqz*) : ;;
 *)
-  echo "   NOTE: kernel does not look like the sqz series — the zc arm" >&2
-  echo "   will refuse and, under REQUIRE_CAPABILITY, fail loudly." >&2
+  # Advisory only: the arming probe decides. A kernel built with the sqz
+  # patch series under another name (a cachyos 7.1.x with the 7.1 track,
+  # for one) arms and passes this gate; a stock kernel refuses the zc arm
+  # and, under REQUIRE_CAPABILITY, fails loudly.
+  echo "   NOTE: kernel name does not say 'sqz' — the zc arm decides:" >&2
+  echo "   a stock kernel refuses it and this gate then fails loudly." >&2
   ;;
 esac
 
+# The unprivileged build shell: `$BASH` (the bash running this script),
+# never the FHS literal `/bin/bash`, which does not exist on NixOS (the
+# run_fstests.sh discipline); the caller's PATH is carried into the user
+# shell so `cargo` resolves the same way it did for the invoking user —
+# `su` resets PATH otherwise, and the 1.2.1 local leg died at "Cannot
+# execute /bin/bash" before a single test ran.
 run_as_user() {
   if [[ "$RUNUSER" != "root" ]] && id "$RUNUSER" &>/dev/null; then
-    su -s /bin/bash "$RUNUSER" -c "cd '$REPO_DIR' && $*"
+    su -s "$BASH" "$RUNUSER" -c "export PATH='$PATH'; cd '$REPO_DIR' && $*"
   else
-    bash -c "cd '$REPO_DIR' && $*"
+    "$BASH" -c "cd '$REPO_DIR' && $*"
   fi
 }
 

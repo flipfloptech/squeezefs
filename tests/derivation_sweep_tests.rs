@@ -1515,6 +1515,29 @@ fn residue_site_explicit_levers_stay_verbatim() {
     );
 }
 
+/// D-1c (e2e perf audit §5.3 row 1 — one conveyor group per shipped
+/// frame): **a frame fits one drain.** The publish plane's per-frame call
+/// cap and the M7 conveyor's per-drain tx cap derive from the SAME root
+/// with the same shape (`cpus × 2`, floor 64), so a full frame's group —
+/// enqueued under one queue-lock acquisition — is never split by the tx
+/// cap; the only cap that may split a group is the byte cap (the
+/// progress law). Drift between the two derivations would silently turn
+/// "one frame = one pass" back into a venue ratio.
+#[test]
+fn a_shipped_frame_fits_one_conveyor_drain_at_every_width() {
+    use squeezefs::meta_backend::kv::backend::resolve_commit_batch_txs;
+    use squeezefs::meta_ship::router::batch_max_from;
+    for cpus in [1usize, 2, 4, 8, 16, 32, 64, 128, 192] {
+        assert!(
+            batch_max_from(None, cpus) <= resolve_commit_batch_txs(None, cpus),
+            "cpus={cpus}: frame cap {} exceeds the conveyor tx cap {} — a full frame would \
+             span two drains",
+            batch_max_from(None, cpus),
+            resolve_commit_batch_txs(None, cpus)
+        );
+    }
+}
+
 /// The `std::thread::available_parallelism` reader census: after rung 3c
 /// the direct readers are exactly the NON-daemon-sizing set — the sizing
 /// roots' own syscall fallbacks (src/cpu.rs, sqz_blocking's unfed-embedding

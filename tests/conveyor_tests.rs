@@ -23,6 +23,15 @@
 //!   observes pre-apply state).
 //! - **Strict-mode batch barrier**: one coalesced fdatasync per batch
 //!   (the G3 mechanism).
+//! - **Group commit (D-1c, e2e perf audit §5.3 row 1 — one conveyor group
+//!   per shipped frame)**: `commit_tx_group` enqueues N staged txs under
+//!   ONE queue-lock acquisition, so a drain can never observe a partial
+//!   group — N distinct-ino txs are ONE pass BY CONSTRUCTION (no held
+//!   pass, no timing), each tx stays its own checksummed journal entry,
+//!   a member that fails admission fails ALONE (its siblings commit), the
+//!   byte cap still splits an over-cap group (progress law: the first
+//!   entry is always taken), and every member's DLM guards release at
+//!   its terminal outcome. Observed via `META_CONVEYOR_GROUP_{COMMITS,TXS}`.
 //!
 //! Every scenario ends with the **conservation audit**: admitted ring
 //! bytes settle to zero, `completed_upto == head` (no watermark wedge),
@@ -35,15 +44,17 @@
 //!
 //! Suite runs `--test-threads=1` (process-global stats + env knobs).
 
+use squeezefs::meta_backend::dlm::{DlmGuard, LockMode};
 use squeezefs::meta_backend::kv::backend::{
-    test_conveyor_hold_release, KvMetaBackend, TEST_COMMIT_ADMITTED_STALL_MS,
+    test_conveyor_hold_release, KvMetaBackend, KvTx, TEST_COMMIT_ADMITTED_STALL_MS,
     TEST_CONVEYOR_HOLD_PRE_DRAIN, TEST_CONVEYOR_HOLD_PRE_FANOUT, TEST_CONVEYOR_HOLD_STAGE,
     TEST_CONVEYOR_POISON_APPLY_INO,
 };
 use squeezefs::meta_backend::kv::builder::{format_v3, FormatV3Options};
 use squeezefs::meta_backend::kv::{
-    META_COMMIT_GROUP_BYTES, META_COMMIT_GROUP_SIZE, META_CONVEYOR_LEADER_PASSES,
-    META_CONVEYOR_PASS_PANICS, META_KV_JOURNAL_ENTRIES,
+    KvError, META_COMMIT_GROUP_BYTES, META_COMMIT_GROUP_SIZE, META_CONVEYOR_GROUP_COMMITS,
+    META_CONVEYOR_GROUP_TXS, META_CONVEYOR_LEADER_PASSES, META_CONVEYOR_PASS_PANICS,
+    META_KV_JOURNAL_ENTRIES,
 };
 use squeezefs::meta_backend::{Metadata, RoutedMetaBackend};
 use std::sync::atomic::Ordering;
@@ -707,4 +718,453 @@ async fn strict_batch_pays_one_barrier() {
          checkpoint ticks at most), got {syncs}"
     );
     conservation_audit(&routed, &kv, "strict_batch_barrier").await;
+}
+
+// ===========================================================================
+// D-1c — group commit: N staged txs enqueued as ONE conveyor group
+// (docs/design-e2e-perf-audit.md §5.3 row 1; the owner-side mechanism
+// behind "one conveyor group per shipped frame").
+// ===========================================================================
+
+/// Mint `n` regular files under the root (distinct inos — the shape a
+/// shipped frame's independent publishes name).
+async fn mint_files(routed: &Arc<RoutedMetaBackend>, n: usize, prefix: &str) -> Vec<u64> {
+    let mut inos = Vec::with_capacity(n);
+    for i in 0..n {
+        inos.push(
+            routed
+                .create(1, &format!("{prefix}_{i}"), libc::S_IFREG | 0o644, 0, 0)
+                .await
+                .expect("mint")
+                .ino,
+        );
+    }
+    inos
+}
+
+/// A layout value of `len` bytes tagged by `tag` (opaque to the backend:
+/// `set_layout_and_size` stores the xattr bytes verbatim; the read-back
+/// compares them).
+fn layout_value(tag: u64, len: usize) -> Vec<u8> {
+    let mut v = vec![0u8; len];
+    v[..8].copy_from_slice(&tag.to_le_bytes());
+    v
+}
+
+/// The group's 4a acquisition: ONE canonical `lock_many` over every
+/// member's `I{ino}` (deduped by stripe, ascending — two distinct inos
+/// may share a stripe, and per-tx guards taken one after another would
+/// self-deadlock on a collision), co-owned by every member tx.
+async fn lock_group(kv: &KvMetaBackend, inos: &[u64]) -> Arc<[DlmGuard]> {
+    let want: Vec<(u64, LockMode)> = inos.iter().map(|&i| (i, LockMode::Exclusive)).collect();
+    Arc::from(kv.dlm().lock_many(&want, &[]).await)
+}
+
+/// Stage one layout publish per `(ino, layout, size)` under the shared
+/// guard set — the stage half of `set_layout_and_size`.
+async fn stage_group(
+    kv: &KvMetaBackend,
+    guards: &Arc<[DlmGuard]>,
+    items: &[(u64, Vec<u8>, u64)],
+) -> Vec<KvTx> {
+    let mut txs = Vec::with_capacity(items.len());
+    for (ino, layout, size) in items {
+        txs.push(
+            kv.stage_layout_and_size_holding(*ino, layout, *size, &[], Arc::clone(guards))
+                .await
+                .expect("stage"),
+        );
+    }
+    txs
+}
+
+/// Every member's `I{ino}` is free again: an exclusive re-acquisition
+/// completes promptly (a leaked group guard would park it forever).
+async fn assert_inode_locks_free(kv: &KvMetaBackend, inos: &[u64]) {
+    for &ino in inos {
+        let g = tokio::time::timeout(Duration::from_secs(5), kv.dlm().lock_inode_exclusive(ino))
+            .await
+            .unwrap_or_else(|_| panic!("I{{{ino}}} still held after the group's terminal outcome"));
+        drop(g);
+    }
+}
+
+struct GroupCounters {
+    passes: u64,
+    entries: u64,
+    groups: u64,
+    group_txs: u64,
+    hist: [u64; 12],
+}
+
+fn group_counters() -> GroupCounters {
+    GroupCounters {
+        passes: META_CONVEYOR_LEADER_PASSES.load(Ordering::Relaxed),
+        entries: META_KV_JOURNAL_ENTRIES.load(Ordering::Relaxed),
+        groups: META_CONVEYOR_GROUP_COMMITS.load(Ordering::Relaxed),
+        group_txs: META_CONVEYOR_GROUP_TXS.load(Ordering::Relaxed),
+        hist: META_COMMIT_GROUP_SIZE.snapshot(),
+    }
+}
+
+/// (a) 16 distinct-ino staged txs committed as one group are ONE apply
+/// pass BY CONSTRUCTION — no held pass, no seam: the group is enqueued
+/// under one queue-lock acquisition, so the drain that takes its head
+/// takes it all. 16 journal entries (one tx = one entry, unchanged),
+/// every slot `Ok`, every layout landed, every guard released.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_group_of_distinct_inos_is_one_pass_by_construction() {
+    let _seams = SeamGuard;
+    let (routed, kv, _f) = sandbox().await;
+    let inos = mint_files(&routed, 16, "grp16").await;
+    let items: Vec<(u64, Vec<u8>, u64)> = inos
+        .iter()
+        .enumerate()
+        .map(|(i, &ino)| (ino, layout_value(ino, 64), 4096 * (i as u64 + 1)))
+        .collect();
+
+    let before = group_counters();
+    let guards = lock_group(&kv, &inos).await;
+    let txs = stage_group(&kv, &guards, &items).await;
+    drop(guards); // the txs co-own the set from here — the committer's ref is not needed
+    let results = kv.commit_tx_group(txs).await;
+    let after = group_counters();
+
+    assert_eq!(results.len(), 16, "one outcome per member, in input order");
+    for (i, r) in results.iter().enumerate() {
+        r.as_ref()
+            .unwrap_or_else(|e| panic!("member {i} must commit: {e}"));
+    }
+    assert_eq!(
+        after.entries - before.entries,
+        16,
+        "one tx = one checksummed journal entry — a group never collapses entries"
+    );
+    let passes = after.passes - before.passes;
+    assert!(
+        (1..=2).contains(&passes),
+        "a 16-tx group is ONE apply pass (≤ 1 ambient singleton tolerated), not {passes}"
+    );
+    let delta = snap_delta(&before.hist, &after.hist);
+    assert_eq!(
+        delta[8], 1,
+        "the group drained as one 16-tx batch (the <=16 bucket); got {delta:?}"
+    );
+    assert_eq!(after.groups - before.groups, 1, "one group commit");
+    assert_eq!(after.group_txs - before.group_txs, 16, "sixteen member txs");
+    for (i, &ino) in inos.iter().enumerate() {
+        assert_eq!(
+            Metadata::getattr(kv.as_ref(), ino)
+                .await
+                .expect("getattr")
+                .size,
+            4096 * (i as u64 + 1),
+            "member {i}'s size landed on member {i}'s ino"
+        );
+        assert_eq!(
+            KvMetaBackend::getxattr(&kv, ino, "layout")
+                .await
+                .expect("layout read")
+                .expect("layout present"),
+            layout_value(ino, 64),
+            "member {i}'s layout landed"
+        );
+    }
+    assert_inode_locks_free(&kv, &inos).await;
+    conservation_audit(&routed, &kv, "group_one_pass").await;
+}
+
+/// (b) A member that fails ADMISSION (its record crosses the per-volume
+/// value cap) fails ALONE before the group is enqueued: its slot is the
+/// `ValueTooLarge` error, its 15 siblings commit in one pass with 15
+/// entries, and its guard releases with everyone else's.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_inadmissible_member_fails_alone_and_its_siblings_commit() {
+    let _seams = SeamGuard;
+    let (routed, kv, _f) = sandbox().await;
+    let inos = mint_files(&routed, 16, "grpbad").await;
+    // Node size 64 KiB ⇒ record value cap 16 KiB + envelope; 32 KiB is
+    // over it by construction.
+    let over_cap = 32 * 1024;
+    let items: Vec<(u64, Vec<u8>, u64)> = inos
+        .iter()
+        .enumerate()
+        .map(|(i, &ino)| {
+            let len = if i == 7 { over_cap } else { 64 };
+            (ino, layout_value(ino, len), 8192)
+        })
+        .collect();
+
+    let before = group_counters();
+    let guards = lock_group(&kv, &inos).await;
+    let txs = stage_group(&kv, &guards, &items).await;
+    drop(guards);
+    let results = kv.commit_tx_group(txs).await;
+    let after = group_counters();
+
+    assert_eq!(results.len(), 16);
+    for (i, r) in results.iter().enumerate() {
+        if i == 7 {
+            assert!(
+                matches!(r, Err(KvError::ValueTooLarge { .. })),
+                "the over-cap member's slot carries ITS refusal, got {r:?}"
+            );
+        } else {
+            r.as_ref()
+                .unwrap_or_else(|e| panic!("sibling {i} must commit despite member 7: {e}"));
+        }
+    }
+    assert_eq!(
+        after.entries - before.entries,
+        15,
+        "15 siblings, 15 entries"
+    );
+    let passes = after.passes - before.passes;
+    assert!(
+        (1..=2).contains(&passes),
+        "the 15 siblings are one pass, not {passes}"
+    );
+    assert_eq!(after.groups - before.groups, 1);
+    assert_eq!(
+        after.group_txs - before.group_txs,
+        15,
+        "the refused member never joined the group"
+    );
+    assert_eq!(
+        Metadata::getattr(kv.as_ref(), inos[7])
+            .await
+            .expect("getattr")
+            .size,
+        0,
+        "the refused member applied nothing"
+    );
+    assert_inode_locks_free(&kv, &inos).await;
+    conservation_audit(&routed, &kv, "group_inadmissible_member").await;
+}
+
+/// (c) The degenerate groups: an empty group answers an empty Vec and
+/// touches nothing; a group of EMPTY txs answers `Ok(())` per slot inline
+/// — no pass, no entry, no group counted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn empty_groups_and_empty_members_commit_nothing() {
+    let _seams = SeamGuard;
+    let (routed, kv, _f) = sandbox().await;
+    let before = group_counters();
+
+    let none = kv.commit_tx_group(Vec::new()).await;
+    assert!(none.is_empty(), "an empty group answers an empty Vec");
+
+    let empties = kv
+        .commit_tx_group(vec![KvTx::empty(), KvTx::empty(), KvTx::empty()])
+        .await;
+    assert_eq!(empties.len(), 3);
+    for r in &empties {
+        assert!(r.is_ok(), "an empty tx is Ok(()) inline");
+    }
+
+    let after = group_counters();
+    assert_eq!(after.passes, before.passes, "no pass ran");
+    assert_eq!(after.entries, before.entries, "no entry was written");
+    assert_eq!(
+        after.groups, before.groups,
+        "nothing was enqueued, nothing counted"
+    );
+    assert_eq!(after.group_txs, before.group_txs);
+    conservation_audit(&routed, &kv, "group_empty").await;
+}
+
+/// (d) Two groups from two racing tasks: every tx commits exactly once,
+/// entries == the total, and the two groups ride at most two passes
+/// (one when the second's enqueue lands before the first's drain). The
+/// interleaving law itself is the loom model
+/// (`conveyor_group_never_drains_partially`); this is its integration face.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn two_racing_groups_commit_every_member_exactly_once() {
+    let _seams = SeamGuard;
+    let (routed, kv, _f) = sandbox().await;
+    let inos_a = mint_files(&routed, 8, "race_a").await;
+    let inos_b = mint_files(&routed, 8, "race_b").await;
+    let items = |inos: &[u64], base: u64| -> Vec<(u64, Vec<u8>, u64)> {
+        inos.iter()
+            .enumerate()
+            .map(|(i, &ino)| (ino, layout_value(ino, 64), base + i as u64))
+            .collect()
+    };
+    let items_a = items(&inos_a, 1_000);
+    let items_b = items(&inos_b, 2_000);
+
+    let before = group_counters();
+    let run = |kv: Arc<KvMetaBackend>, inos: Vec<u64>, items: Vec<(u64, Vec<u8>, u64)>| {
+        tokio::spawn(async move {
+            let guards = lock_group(&kv, &inos).await;
+            let txs = stage_group(&kv, &guards, &items).await;
+            drop(guards);
+            kv.commit_tx_group(txs).await
+        })
+    };
+    let (ra, rb) = tokio::join!(
+        run(kv.clone(), inos_a.clone(), items_a),
+        run(kv.clone(), inos_b.clone(), items_b)
+    );
+    let (ra, rb) = (ra.expect("task a"), rb.expect("task b"));
+    let after = group_counters();
+
+    for (label, res) in [("a", &ra), ("b", &rb)] {
+        assert_eq!(res.len(), 8);
+        for (i, r) in res.iter().enumerate() {
+            r.as_ref()
+                .unwrap_or_else(|e| panic!("group {label} member {i}: {e}"));
+        }
+    }
+    assert_eq!(
+        after.entries - before.entries,
+        16,
+        "16 txs, 16 entries, each exactly once"
+    );
+    let passes = after.passes - before.passes;
+    assert!(
+        (1..=3).contains(&passes),
+        "two groups ride ≤ 2 passes (+ 1 ambient), not {passes}"
+    );
+    assert_eq!(after.groups - before.groups, 2);
+    assert_eq!(after.group_txs - before.group_txs, 16);
+    for (i, &ino) in inos_a.iter().enumerate() {
+        assert_eq!(
+            Metadata::getattr(kv.as_ref(), ino).await.unwrap().size,
+            1_000 + i as u64
+        );
+    }
+    for (i, &ino) in inos_b.iter().enumerate() {
+        assert_eq!(
+            Metadata::getattr(kv.as_ref(), ino).await.unwrap().size,
+            2_000 + i as u64
+        );
+    }
+    assert_inode_locks_free(&kv, &inos_a).await;
+    assert_inode_locks_free(&kv, &inos_b).await;
+    conservation_audit(&routed, &kv, "group_race").await;
+}
+
+/// (e) The byte cap still governs: a group whose summed entry bytes exceed
+/// `SQUEEZEFS_META_COMMIT_BATCH_BYTES` splits at the cap (here: a cap
+/// below one entry ⇒ batches of 1 by the first-entry progress rule) and
+/// STILL commits every member — grouping is queue-side atomicity, never a
+/// license to exceed the drain caps.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_over_cap_group_splits_at_the_byte_cap_and_commits_all() {
+    let _seams = SeamGuard;
+    let _cap = EnvVarGuard::set("SQUEEZEFS_META_COMMIT_BATCH_BYTES", "64");
+    let (routed, kv, _f) = sandbox().await;
+    let inos = mint_files(&routed, 4, "grpcap").await;
+    let items: Vec<(u64, Vec<u8>, u64)> = inos
+        .iter()
+        .map(|&ino| (ino, layout_value(ino, 128), 512))
+        .collect();
+
+    let before = group_counters();
+    let guards = lock_group(&kv, &inos).await;
+    let txs = stage_group(&kv, &guards, &items).await;
+    drop(guards);
+    let results = kv.commit_tx_group(txs).await;
+    let after = group_counters();
+
+    for (i, r) in results.iter().enumerate() {
+        r.as_ref()
+            .unwrap_or_else(|e| panic!("member {i} must commit across the split: {e}"));
+    }
+    assert_eq!(after.entries - before.entries, 4);
+    let delta = snap_delta(&before.hist, &after.hist);
+    assert_eq!(
+        delta[0], 4,
+        "a byte cap below one entry drains the group as four batches of 1; got {delta:?}"
+    );
+    assert_eq!(after.groups - before.groups, 1, "still ONE group enqueue");
+    assert_eq!(after.group_txs - before.group_txs, 4);
+    assert_inode_locks_free(&kv, &inos).await;
+    conservation_audit(&routed, &kv, "group_byte_cap").await;
+}
+
+/// (f) The crash contract is untouched: a 24-tx group is 24 ordinary
+/// checksummed journal entries — the same count 24 single commits write —
+/// and a replay (drop WITHOUT shutdown, checkpoint cadence parked) rebuilds
+/// every one of the 24 layouts and sizes. The group is queue-side only;
+/// nothing about it reaches the ring or the replay.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_group_replays_identically_to_single_commits() {
+    let _seams = SeamGuard;
+    // Park the cadence: no checkpoint covers the group, so the whole set
+    // is the replay window by construction (the kv_scale replay pattern).
+    let _cadence = EnvVarGuard::set("SQUEEZEFS_META_FLUSH_INTERVAL_MS", "60000");
+    const N: usize = 24;
+
+    // Leg 1: 24 single commits — the entry count the group must match.
+    let single_entries = {
+        let (routed, kv, _f) = sandbox().await;
+        let inos = mint_files(&routed, N, "single").await;
+        let before = META_KV_JOURNAL_ENTRIES.load(Ordering::Relaxed);
+        for (i, &ino) in inos.iter().enumerate() {
+            kv.set_layout_and_size(ino, &layout_value(ino, 96), 100 + i as u64, &[])
+                .await
+                .expect("single commit");
+        }
+        let entries = META_KV_JOURNAL_ENTRIES.load(Ordering::Relaxed) - before;
+        kv.shutdown().await.expect("shutdown");
+        entries
+    };
+    assert_eq!(single_entries, N as u64);
+
+    // Leg 2: the same 24 as ONE group, then crash-replay.
+    let (routed, kv, file) = sandbox().await;
+    let inos = mint_files(&routed, N, "grouped").await;
+    let items: Vec<(u64, Vec<u8>, u64)> = inos
+        .iter()
+        .enumerate()
+        .map(|(i, &ino)| (ino, layout_value(ino, 96), 100 + i as u64))
+        .collect();
+    let before = META_KV_JOURNAL_ENTRIES.load(Ordering::Relaxed);
+    let guards = lock_group(&kv, &inos).await;
+    let txs = stage_group(&kv, &guards, &items).await;
+    drop(guards);
+    for (i, r) in kv.commit_tx_group(txs).await.iter().enumerate() {
+        r.as_ref()
+            .unwrap_or_else(|e| panic!("group member {i}: {e}"));
+    }
+    let group_entries = META_KV_JOURNAL_ENTRIES.load(Ordering::Relaxed) - before;
+    assert_eq!(
+        group_entries, single_entries,
+        "a group writes exactly the entries its members would have written alone"
+    );
+    poll_until("group settles before the crash", || {
+        kv.conveyor_pending_len() == 0
+            && kv.journal_ring().completed_upto() >= kv.journal_ring().core().head()
+    })
+    .await;
+
+    // Drop WITHOUT shutdown: no final checkpoint — the group is the
+    // replay window.
+    drop(routed);
+    drop(kv);
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let re = KvMetaBackend::open(file.path())
+        .await
+        .expect("replaying a grouped window must never fail the mount");
+    for (i, &ino) in inos.iter().enumerate() {
+        assert_eq!(
+            Metadata::getattr(re.as_ref(), ino)
+                .await
+                .expect("getattr")
+                .size,
+            100 + i as u64,
+            "member {i}'s size survives replay"
+        );
+        assert_eq!(
+            KvMetaBackend::getxattr(&re, ino, "layout")
+                .await
+                .expect("layout read")
+                .expect("layout present after replay"),
+            layout_value(ino, 96),
+            "member {i}'s layout survives replay"
+        );
+    }
+    re.shutdown().await.expect("shutdown");
 }

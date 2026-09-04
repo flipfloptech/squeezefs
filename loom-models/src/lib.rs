@@ -2412,6 +2412,87 @@ mod models {
         });
     }
 
+    /// Conveyor invariant #6 (D-1c — e2e perf audit §5.3 row 1, one
+    /// conveyor group per shipped frame): **a group enqueued through
+    /// `enqueue_many` is atomic with respect to `drain`** — the drain and
+    /// the multi-enqueue serialize on the queue mutex, so no drain ever
+    /// observes a partial group: every drain (caps ≥ the group) returns
+    /// either nothing or the WHOLE group in FIFO order, exactly once, and
+    /// the release-then-recheck protocol still loses no wakeup when the
+    /// group's `try_lead` races the retiring leader (the committer's two
+    /// uninterruptible steps are unchanged: `enqueue_many`, then
+    /// `try_lead`).
+    #[test]
+    fn conveyor_group_never_drains_partially() {
+        loom::model(|| {
+            let c: Arc<conveyor_core::ConveyorCore<u32>> =
+                Arc::new(conveyor_core::ConveyorCore::new());
+
+            // A live leader with an empty queue, about to retire (the
+            // instant-drain apply pass between arrivals).
+            assert!(c.try_lead(), "seed leader");
+
+            // The group committer: ONE enqueue of three members, then the
+            // election. If it wins, it drains its own group.
+            let committer = {
+                let c = Arc::clone(&c);
+                thread::spawn(move || {
+                    let n = c.enqueue_many([(1u32, 1u64), (2, 1), (3, 1)]);
+                    assert_eq!(n, 3, "the group's population is the enqueue's answer");
+                    let mut got: Vec<u32> = Vec::new();
+                    if c.try_lead() {
+                        loop {
+                            let batch = c.drain(64, u64::MAX);
+                            if batch.is_empty() {
+                                if !c.unlead_and_recheck() {
+                                    break;
+                                }
+                                continue;
+                            }
+                            assert_eq!(
+                                batch,
+                                vec![1, 2, 3],
+                                "a drain that sees the group sees ALL of it, FIFO"
+                            );
+                            got.extend(batch);
+                        }
+                    }
+                    got
+                })
+            };
+
+            // The retiring leader: drain → release-then-recheck loop.
+            let mut leader_got: Vec<u32> = Vec::new();
+            loop {
+                let batch = c.drain(64, u64::MAX);
+                if batch.is_empty() {
+                    if !c.unlead_and_recheck() {
+                        break;
+                    }
+                    continue;
+                }
+                assert_eq!(
+                    batch,
+                    vec![1, 2, 3],
+                    "a drain that sees the group sees ALL of it, FIFO — never a prefix"
+                );
+                leader_got.extend(batch);
+            }
+
+            let committer_got = committer.join().unwrap();
+            let mut all = leader_got.clone();
+            all.extend(committer_got.iter().copied());
+            assert_eq!(
+                all,
+                vec![1, 2, 3],
+                "the group drains exactly once, by exactly one pass (leader {leader_got:?}, \
+                 committer {committer_got:?}) — an empty union is a lost wakeup, a longer one \
+                 a double drain"
+            );
+            assert_eq!(c.pending(), 0, "nothing may remain queued");
+        });
+    }
+
     /// IPC submission-ring invariant #1 (design-preload-interception
     /// §5.3.2, PR L4-1): two racing producers' entries are never lost and
     /// never double-consumed. The single consumer (module precondition —

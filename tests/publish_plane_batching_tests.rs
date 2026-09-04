@@ -26,10 +26,19 @@
 //! * **frames** — the listener's `requests_served` delta (one per wire
 //!   `Call` frame the owner served);
 //! * **owner passes** — the process-global `META_CONVEYOR_LEADER_PASSES`
-//!   delta (the M7 conveyor's pass count) — a measurement on an un-held
-//!   conveyor (since C-2 the pass drains arrivals the instant they land,
-//!   so the count is arrival spread ÷ pass latency), a contract only
-//!   under the held pass (`PassHold`);
+//!   delta (the M7 conveyor's pass count). Before D-1c this was a
+//!   measurement on an un-held conveyor (since C-2 the pass drains
+//!   arrivals the instant they land, so the count was arrival spread ÷
+//!   pass latency — 3–14 passes per 24 publishes over 51 runs) and a
+//!   contract only under the held pass (`PassHold`). **Since D-1c (e2e
+//!   perf audit §5.3 row 1 — one conveyor group per shipped frame) it is
+//!   a contract on the NATURAL row too**: the owner stages a frame's
+//!   independent layout publishes concurrently and enqueues them on the
+//!   conveyor as ONE group (one queue-lock acquisition), so a frame is
+//!   one pass by construction;
+//! * **groups** — `META_CONVEYOR_GROUP_{COMMITS,TXS}` (groups enqueued /
+//!   member txs) and the publish ledger's `frame_groups` (frames that
+//!   committed ≥ 1 group) — the rung's engagement instruments;
 //! * **journal entries** — `META_KV_JOURNAL_ENTRIES` delta (one tx = one
 //!   checksummed entry: the count that must NOT collapse);
 //! * **wall** — spawn-to-join over the whole concurrent set.
@@ -42,7 +51,10 @@ use squeezefs::meta_backend::kv::backend::{
     test_conveyor_hold_release, KvMetaBackend, TEST_CONVEYOR_HOLD_PRE_DRAIN,
     TEST_CONVEYOR_HOLD_STAGE,
 };
-use squeezefs::meta_backend::kv::{META_CONVEYOR_LEADER_PASSES, META_KV_JOURNAL_ENTRIES};
+use squeezefs::meta_backend::kv::{
+    META_CONVEYOR_GROUP_COMMITS, META_CONVEYOR_GROUP_TXS, META_CONVEYOR_LEADER_PASSES,
+    META_KV_JOURNAL_ENTRIES,
+};
 use squeezefs::meta_backend::{
     open_routed_meta_set, plan_meta_slot_set, Metadata, RoutedMetaBackend,
 };
@@ -108,6 +120,31 @@ impl Drop for Restore {
 
 fn restore() -> Restore {
     Restore
+}
+
+/// Scoped env override (the conveyor_tests pattern). The publish owner
+/// reads its group lever per served frame, so a guard wrapping the row is
+/// what flips it; `serial()` keeps rows from overlapping.
+struct EnvVarGuard {
+    key: &'static str,
+    prior: Option<String>,
+}
+
+impl EnvVarGuard {
+    fn set(key: &'static str, val: &str) -> Self {
+        let prior = std::env::var(key).ok();
+        std::env::set_var(key, val);
+        Self { key, prior }
+    }
+}
+
+impl Drop for EnvVarGuard {
+    fn drop(&mut self) {
+        match self.prior.take() {
+            Some(v) => std::env::set_var(self.key, v),
+            None => std::env::remove_var(self.key),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -246,11 +283,16 @@ async fn mint(owner_be: &Arc<RoutedMetaBackend>, n: usize, prefix: &str) -> Vec<
     inos
 }
 
-/// The three counters the rows read, sampled together.
+/// The counters the rows read, sampled together.
 struct Counters {
     frames: u64,
     passes: u64,
     entries: u64,
+    /// D-1c: conveyor groups enqueued / their member txs (process-global).
+    groups: u64,
+    group_txs: u64,
+    /// D-1c: served frames that committed ≥ 1 group (the publish ledger).
+    frame_groups: u64,
 }
 
 fn counters(auth: &Authority) -> Counters {
@@ -258,6 +300,9 @@ fn counters(auth: &Authority) -> Counters {
         frames: auth.listener.stats().requests_served,
         passes: META_CONVEYOR_LEADER_PASSES.load(Ordering::Relaxed),
         entries: META_KV_JOURNAL_ENTRIES.load(Ordering::Relaxed),
+        groups: META_CONVEYOR_GROUP_COMMITS.load(Ordering::Relaxed),
+        group_txs: META_CONVEYOR_GROUP_TXS.load(Ordering::Relaxed),
+        frame_groups: publish::stats().frame_groups,
     }
 }
 
@@ -515,10 +560,10 @@ async fn measurement_rows_24_concurrent_publishes_from_one_co_writer() {
             "[{label}] a busy publish pipe self-batches: {frames} frames for {INOS} concurrent \
              publishes is the stop-and-wait shape"
         );
-        // `passes` is a MEASUREMENT here, not a contract: on an un-held
-        // conveyor it is the venue ratio [`PassHold`] describes (3–14 for
-        // these 24 on one box). The co-queue law is pinned under the held
-        // pass in the seam-controlled contract below.
+        // `passes` is a MEASUREMENT in this row (the client-side drain is
+        // un-held, so frames form by arrival and a straggler frame is its
+        // own pass); the pass-per-frame law is the contract in
+        // `a_framed_burst_is_one_owner_conveyor_pass_by_construction`.
         assert!(
             passes >= 1,
             "[{label}] the owner conveyor ran at least one pass for {INOS} publishes"
@@ -616,6 +661,156 @@ async fn twenty_four_concurrent_publishes_ride_at_most_four_frames_and_one_owner
     );
 
     drop(pass_hold);
+    nodes.stop().await;
+}
+
+// ===========================================================================
+// 2b. D-1c — one conveyor group per shipped frame, WITHOUT a held pass
+// ===========================================================================
+
+/// Contract (D-1c, `docs/design-e2e-perf-audit.md` §5.3 row 1): a frame of
+/// independent layout publishes is ONE owner conveyor pass **by
+/// construction** — no `PassHold`. The owner prepares the frame's calls
+/// concurrently, stages every tx under one canonical 4a acquisition, and
+/// enqueues the staged set on the conveyor as ONE group (one queue-lock
+/// acquisition — the loom-modeled `enqueue_many`), so the drain that takes
+/// the group's head takes the whole group; arrival spread no longer
+/// fragments a frame (the 3–14 passes per 24 publishes the C-2 note
+/// measured). Only the client-side drain hold is armed (it makes
+/// "concurrent" deterministic: the 24 queue into ≤ [`MAX_FRAMES`] frames);
+/// the owner side runs its natural path.
+///
+/// Laws pinned: passes ≤ frames (+ 1 ambient singleton, the
+/// `group_forms_under_held_pass` tolerance); one group per multi-call
+/// frame (`META_CONVEYOR_GROUP_COMMITS`), every framed call a group member
+/// except a single-call frame's, which rides alone (`GROUP_TXS + single
+/// frames == 24`); `frame_groups` engagement; journal entries stay 24 (one
+/// tx = one checksummed entry); every caller's reply lands on its own ino.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_framed_burst_is_one_owner_conveyor_pass_by_construction() {
+    let _serial = serial();
+    let _restore = restore();
+    let dir = TempDir::new().unwrap();
+    let pc = publish::PublishClient::with_depth(NODE, SECRET.to_vec(), MAX_FRAMES as usize);
+    let nodes = TwoNodes::start(dir.path(), pc).await;
+    nodes.warm().await;
+    let inos = mint(&nodes.owner_be, INOS, "grouped").await;
+
+    let _hold = DrainHold::arm(HOLD_MS);
+    let before = counters(&nodes.auth);
+    let (outcomes, wall) = nodes
+        .publish_concurrently(&inos, |i| 8192 * (i as u64 + 1))
+        .await;
+    let after = counters(&nodes.auth);
+
+    for (i, out) in outcomes.iter().enumerate() {
+        out.as_ref()
+            .unwrap_or_else(|e| panic!("publish {i} failed: {e}"));
+    }
+    for (i, &ino) in inos.iter().enumerate() {
+        assert_eq!(
+            owner_size(&nodes.owner_be, ino).await,
+            8192 * (i as u64 + 1),
+            "reply correlation: caller {i}'s publish landed on caller {i}'s ino"
+        );
+    }
+    let frames = after.frames - before.frames;
+    let passes = after.passes - before.passes;
+    let entries = after.entries - before.entries;
+    let groups = after.groups - before.groups;
+    let group_txs = after.group_txs - before.group_txs;
+    let frame_groups = after.frame_groups - before.frame_groups;
+    println!(
+        "D-1c in-process row ({} build): {INOS} concurrent publishes -> frames {frames}, \
+         owner conveyor passes {passes}, conveyor groups {groups} carrying {group_txs} txs, \
+         frame_groups {frame_groups}, journal entries {entries}, wall {:.2} ms",
+        if cfg!(debug_assertions) {
+            "debug"
+        } else {
+            "release"
+        },
+        wall.as_secs_f64() * 1e3
+    );
+
+    assert_eq!(
+        entries, INOS as u64,
+        "one tx = one checksummed journal entry — the count that never collapses"
+    );
+    assert!(
+        frames <= MAX_FRAMES,
+        "24 queued publishes must ride ≤ {MAX_FRAMES} frames (got {frames})"
+    );
+    assert!(
+        passes <= frames + 1,
+        "one conveyor pass per frame BY CONSTRUCTION: {frames} frames drained in {passes} \
+         owner passes (≤ 1 ambient singleton tolerated) — arrival spread fragmented a frame"
+    );
+    assert!(
+        (1..=frames).contains(&groups),
+        "every multi-call frame commits as exactly one group: {groups} groups for {frames} \
+         frames"
+    );
+    // A single-call frame (a straggler) has no group and rides alone; every
+    // other framed call is a group member.
+    assert_eq!(
+        group_txs + (frames - groups),
+        INOS as u64,
+        "every framed call is a group member except a single-call frame's own \
+         ({group_txs} member txs, {frames} frames, {groups} groups)"
+    );
+    assert_eq!(
+        frame_groups, groups,
+        "engagement: each grouped frame is one round here (chains of length 1), so \
+         frame_groups == groups"
+    );
+
+    nodes.stop().await;
+}
+
+/// The A/B lever: `SQUEEZEFS_PUBLISH_CONVEYOR_GROUP=0` restores the
+/// pre-rung per-call path — every framed call commits its own tx (the
+/// group gauges stay flat), and the row still lands every publish with 24
+/// entries. The lever is a measurement control, never an operational
+/// escape; the owner reads it per served frame (one getenv per wire round
+/// trip), which is what lets this row flip it in-process.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_group_lever_off_is_the_pre_rung_per_call_shape() {
+    let _serial = serial();
+    let _restore = restore();
+    let _lever = EnvVarGuard::set("SQUEEZEFS_PUBLISH_CONVEYOR_GROUP", "0");
+    let dir = TempDir::new().unwrap();
+    let pc = publish::PublishClient::with_depth(NODE, SECRET.to_vec(), MAX_FRAMES as usize);
+    let nodes = TwoNodes::start(dir.path(), pc).await;
+    nodes.warm().await;
+    let inos = mint(&nodes.owner_be, INOS, "ungrouped").await;
+
+    let _hold = DrainHold::arm(HOLD_MS);
+    let before = counters(&nodes.auth);
+    let (outcomes, _wall) = nodes.publish_concurrently(&inos, |_| 4096).await;
+    let after = counters(&nodes.auth);
+
+    for (i, out) in outcomes.iter().enumerate() {
+        out.as_ref()
+            .unwrap_or_else(|e| panic!("publish {i} failed under the lever: {e}"));
+    }
+    for &ino in &inos {
+        assert_eq!(owner_size(&nodes.owner_be, ino).await, 4096);
+    }
+    assert_eq!(after.entries - before.entries, INOS as u64);
+    assert!(after.frames - before.frames <= MAX_FRAMES);
+    assert!(after.passes - before.passes >= 1);
+    assert_eq!(
+        after.groups - before.groups,
+        0,
+        "lever off: no conveyor group is enqueued (the per-call path)"
+    );
+    assert_eq!(after.group_txs - before.group_txs, 0);
+    assert_eq!(
+        after.frame_groups - before.frame_groups,
+        0,
+        "lever off: no served frame committed a group"
+    );
+
     nodes.stop().await;
 }
 

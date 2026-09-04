@@ -93,7 +93,7 @@ The CLI surface: `format`, `mount`, `umount`, `status`, `clients`, `df`, `bench`
 
 | Document | Contents |
 |---|---|
-| [RELEASE_NOTES.md](RELEASE_NOTES.md) | What changed in 1.2.0: highlights, upgrading from 1.1, fixes, new operator surface, known limitations, the release gate |
+| [RELEASE_NOTES.md](RELEASE_NOTES.md) | What changed in 1.2.1 and 1.2.0: highlights, upgrading from 1.1, fixes, new operator surface, known limitations, the release gate |
 | [QUICKSTART.md](QUICKSTART.md) | Hands-on walkthrough: local sandbox, virtual NVMe dev substrate, bare metal, NVMe-oF fabrics, kernel tuning, durability knobs |
 | [docs/operations.md](docs/operations.md) | Operator reference: durability & crash contract, mount-guard guarantee classes, breaking changes & removed verbs, every configuration knob, every metric, NVMe-oF operations, performance records |
 | `docs/design-*.md` | Design records for each subsystem |

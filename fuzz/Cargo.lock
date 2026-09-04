@@ -257,7 +257,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "117725a109d387c937a1533ce01b450cbde6b88abceea8473c4d7a85853cda3c"
 dependencies = [
  "lazy_static",
- "windows-sys 0.59.0",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -499,7 +499,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -526,7 +526,7 @@ checksum = "5baebc0774151f905a1a2cc41989300b1e6fbb29aff0ceffa1064fdd3088d582"
 
 [[package]]
 name = "fuse3"
-version = "1.2.0"
+version = "1.2.1"
 dependencies = [
  "async-notify",
  "bincode",
@@ -1190,7 +1190,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.59.0",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -1354,7 +1354,7 @@ dependencies = [
 
 [[package]]
 name = "squeezefs"
-version = "1.2.0"
+version = "1.2.1"
 dependencies = [
  "ahash",
  "arc-swap",
@@ -1414,7 +1414,7 @@ dependencies = [
 
 [[package]]
 name = "squeezefs-ipc"
-version = "1.2.0"
+version = "1.2.1"
 
 [[package]]
 name = "static_assertions"

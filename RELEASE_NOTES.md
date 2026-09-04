@@ -1,3 +1,64 @@
+# SqueezeFS 1.2.1
+
+_Release date: (tag `stable-2026.09.1` pending the release gate)_
+
+1.2.1 is a point release on the 1.2 train: two shutdown fixes, a mount that
+identifies itself, a corrected build-identity stamp on release artifacts,
+and one publish-plane performance rung — all measured, none changing the
+on-disk or wire formats. It upgrades from 1.2.0 in place (same superblock
+bits, same volumes, same clients) and from 1.1 exactly as 1.2.0 does (see
+§Upgrading from 1.1 below).
+
+## 1.2.1 — what changed
+
+- **The daemon unmounts itself on SIGTERM.** Since the multi-queue transport,
+  `SIGTERM` (and `squeezefs umount`) reached "Dismount clean" and then the
+  daemon sat, still mounted, until something external destroyed the FUSE
+  connection — the `umount` verb's kernel-abort fallback masked it after a
+  5 s wait every time. The destroy notification now reaches every session
+  (one per queue plus the primary); SIGTERM → exit measures 0.17 s, and
+  `squeezefs umount` completes in 130–230 ms instead of 5 s + abort. An
+  exiting daemon also finishes with a lazy detach when a bystander (a
+  desktop volume monitor, for example) holds a transient fd on the fresh
+  mount — the mount leaves the namespace immediately.
+- **`squeezefs umount` judges by the mount, not `/proc/<pid>`.** A daemon
+  that is another process's child is a zombie until reaped, and `/proc/<pid>`
+  still exists for a zombie; the verb used to read that as "still alive",
+  wait out two 5 s windows and then fail the direct unmount of a mount that
+  was already gone.
+- **The mount identifies itself.** `mount`, `df -T` and `/proc/mounts` show
+  `squeezefs on … type fuse.squeezefs` (FUSE's `subtype`), not a bare
+  `fuse`; `-o fsname=<name>` still overrides the name. xfstests users:
+  the runner normalizes `fuse.squeezefs` → `fuse` for the harness's exact
+  type check, as it does for `fuse.glusterfs`.
+- **Release artifacts name their profile correctly.** The 1.2.0 `dist`
+  binaries reported `profile release`: `build.rs` parsed the profile name
+  from `OUT_DIR` by the first `build` path component, which under the
+  container's `/build/target/…` was the target directory. Fixed with a
+  shared derivation anchored on the trailing `build/<pkg>-<hash>/out`, pinned
+  on both venues' layouts; `docker/check-artifacts.sh` now refuses a binary
+  whose version line does not end in the profile it was built with.
+- **Publish plane: one conveyor group per shipped frame (D-1c).** On the
+  metadata authority, a shipped frame's layout publishes are staged
+  concurrently and enqueued onto the commit conveyor under one queue lock,
+  so a frame costs one apply pass by construction instead of a
+  timing-dependent 3–14. Adjudicated on two venues (six same-binary
+  A-B-B-A brackets): +6 % aggregate co-writer ingest on the many-small-files
+  row on the field box, par elsewhere, no loss; journal entries per publish
+  unchanged. Lever `SQUEEZEFS_PUBLISH_CONVEYOR_GROUP` (default on; `0` is the
+  A/B control). New gauges `meta_conveyor_group_{commits,txs}`,
+  `meta_ship_publish.frame_groups`. Record:
+  `.benchmarks/2026-09-04-d1c-conveyor-group-per-frame.md`.
+- **Test-harness fixes** that the 1.2.0 gate surfaced: the D-1b publish
+  batching contracts pin the co-queue law under a held pass (a venue ratio
+  was being asserted); the executor park test awaits its third hook call;
+  the live NVMe-reservation leg drives its I/O as `nvme io-passthru` so it
+  runs on nvme-cli 1.x (EL8).
+
+The rest of this document is the 1.2.0 record, which 1.2.1 inherits.
+
+---
+
 # SqueezeFS 1.2.0
 
 _Release date: 2026-09-04 (tag `stable-2026.09`)_

@@ -787,7 +787,7 @@ The integration branch is **`dev`** (not `main`; `main` is reserved for releases
 - Tests-first cycle: write failing tests → implement → refine → commit each logical step separately.
 - Merge with `--ff-only`; rebase feature branches if `dev` has diverged. Delete branches after merge.
 - Conventional commits: `type(scope): description`. Messages explain WHY.
-- **Versioning = release train + git commit** (`docs/operations.md` §Versioning & releases; user directive 2026-07-24 superseding the commit-only posture): package versions track the **release train** (currently 1.2.0) and are bumped **as a release act** across the root and the first-party crates (`crates/fuse3`, `crates/squeezefs-ipc`, `crates/squeezefs-preload`) together — never per commit, never by CI. Git commits remain the fine-grained identity (`--version` shows both); release tags (`stable-*`/`lts-*`, created manually as a release act) remain the only release names.
+- **Versioning = release train + git commit** (`docs/operations.md` §Versioning & releases; user directive 2026-07-24 superseding the commit-only posture): package versions track the **release train** (currently 1.2.1) and are bumped **as a release act** across the root and the first-party crates (`crates/fuse3`, `crates/squeezefs-ipc`, `crates/squeezefs-preload`) together — never per commit, never by CI. Git commits remain the fine-grained identity (`--version` shows both); release tags (`stable-*`/`lts-*`, created manually as a release act) remain the only release names.
 
 See the full TDD Development Workflow section above for the detailed phased process.
 

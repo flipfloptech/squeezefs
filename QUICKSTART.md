@@ -18,7 +18,7 @@ sudo apt update && sudo apt install -y \
 ```bash
 cargo build --release
 ./target/release/squeezefs --version
-#   squeezefs 1.2.0 (<commit> / <full commit>) built <timestamp> profile release
+#   squeezefs 1.2.1 (<commit> / <full commit>) built <timestamp> profile release
 ```
 
 The packaged build path is [go-task](https://taskfile.dev) (`Taskfile.yml`; plain cargo stays valid). Install it into `./bin` without root if it is absent:

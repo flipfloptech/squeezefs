@@ -501,6 +501,13 @@ mod tests {
             1,
             "one foreign spawn onto a parked lane = one unpark; the lane-local spawn adds none"
         );
+        // `tx.send` runs INSIDE the second poll; the lane's post-poll hook
+        // call is still ahead of it on the lane thread, so the third
+        // `service` is awaited (bounded), never asserted at once.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while park.services.load(Ordering::SeqCst) < 3 && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(1));
+        }
         assert!(
             park.services.load(Ordering::SeqCst) >= 3,
             "the hook ran after the park and after each of the two polls"

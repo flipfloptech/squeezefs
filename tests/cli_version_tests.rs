@@ -522,3 +522,69 @@ fn only_the_dist_profile_carries_fat_lto() {
         "[profile.dist] = release + fat LTO + codegen-units = 1: {dist}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// The profile NAME derivation itself (`src/build_profile_core.rs`, shared
+// with build.rs). Found by the 1.2 `task dist:rocky8` artifact check: the
+// fat-LTO binary said `profile release`, because the container's target
+// dir is `/build/target/…` and the front-anchored walk took that `build`
+// segment as the profile anchor. The binary-vs-env test above cannot see
+// this class (both sides read the same stamped value), so the derivation
+// is pinned on the exact OUT_DIR shapes the two build venues produce.
+// ---------------------------------------------------------------------------
+
+use squeezefs::build_profile_core::profile_name_from_out_dir;
+
+#[test]
+fn profile_name_survives_a_target_dir_that_contains_a_build_segment() {
+    // The containerized build (docker/build-in-container.sh): CARGO_TARGET_DIR=/build/target.
+    assert_eq!(
+        profile_name_from_out_dir("/build/target/dist/build/squeezefs-0123456789abcdef/out"),
+        Some("dist".to_string()),
+        "a `/build/...` target dir must not be mistaken for the profile anchor"
+    );
+    assert_eq!(
+        profile_name_from_out_dir("/build/target/preload-dist/build/squeezefs-preload-abc/out"),
+        Some("preload-dist".to_string())
+    );
+    assert_eq!(
+        profile_name_from_out_dir("/build/target/release/build/squeezefs-abc/out"),
+        Some("release".to_string())
+    );
+}
+
+#[test]
+fn profile_name_reads_the_plain_checkout_layout() {
+    assert_eq!(
+        profile_name_from_out_dir(
+            "/home/u/Source/squeezefs/target/release/build/squeezefs-3b2e83aae84ae2c4/out"
+        ),
+        Some("release".to_string())
+    );
+    assert_eq!(
+        profile_name_from_out_dir("/home/u/Source/squeezefs/target/debug/build/squeezefs-abc/out"),
+        Some("debug".to_string())
+    );
+    assert_eq!(
+        profile_name_from_out_dir("/home/u/Source/squeezefs/target/dist/build/squeezefs-abc/out"),
+        Some("dist".to_string())
+    );
+    // A checkout path that itself contains `build` (e.g. a CI workspace).
+    assert_eq!(
+        profile_name_from_out_dir("/var/lib/build/ws/target/dist/build/squeezefs-abc/out"),
+        Some("dist".to_string())
+    );
+}
+
+#[test]
+fn profile_name_declines_shapes_that_are_not_an_out_dir() {
+    // No trailing `build/<pkg>/out` triple → the caller falls back to
+    // cargo's collapsed PROFILE rather than guessing.
+    assert_eq!(profile_name_from_out_dir(""), None);
+    assert_eq!(profile_name_from_out_dir("/build/target/dist"), None);
+    assert_eq!(
+        profile_name_from_out_dir("/build/target/dist/build/squeezefs-abc"),
+        None
+    );
+    assert_eq!(profile_name_from_out_dir("build/squeezefs-abc/out"), None);
+}

@@ -18,9 +18,12 @@ export CARGO_TARGET_DIR=${CARGO_TARGET_DIR:-/build/target}
 git config --global --add safe.directory '*'
 
 # The two-profile LTO law (2026-09-02): `release` (thin LTO) is the dev /
-# field-A-B / gate build; SQZ_DIST=1 selects `dist` + `preload-dist`
-# (fat LTO, one codegen unit) — tagged releases ONLY (`task dist:*`).
-if [ "${SQZ_DIST:-0}" = "1" ]; then
+# field-A-B / gate build; BUILD_DIST=1 selects `dist` + `preload-dist`
+# (fat LTO, one codegen unit) — tagged releases ONLY (`task dist:*`). The
+# selector deliberately sits outside the SQUEEZEFS_*/SQZ_* knob namespace:
+# the artifact check runs `squeezefs --version` in this environment, and
+# the knob registry announces every unregistered name there as a typo.
+if [ "${BUILD_DIST:-0}" = "1" ]; then
   daemon_profile=dist; shim_profile=preload-dist
 else
   daemon_profile=release; shim_profile=preload-release
@@ -36,7 +39,8 @@ install -m 0755 "$CARGO_TARGET_DIR/$shim_profile/libsqueezefs_il.so" "$out/libsq
 # Foreign-glibc artifacts: identity + ceiling assertions run HERE, inside
 # the container that can execute them.
 "$src/docker/check-artifacts.sh" "$out" \
-  "${GLIBC_CEILING:?GLIBC_CEILING must be set (a version, or auto)}"
+  "${GLIBC_CEILING:?GLIBC_CEILING must be set (a version, or auto)}" \
+  "$daemon_profile"
 
 # Hand artifacts back to the invoking host user — real-docker case only.
 # Rootless podman already maps container root onto the host user (there a

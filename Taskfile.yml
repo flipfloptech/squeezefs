@@ -51,8 +51,8 @@ tasks:
       - mkdir -p dist/host
       - install -m 0755 target/release/squeezefs dist/host/squeezefs
       - install -m 0755 target/preload-release/libsqueezefs_il.so dist/host/libsqueezefs_il.so
-      # Identity check only — the host dev build has no foreign glibc ceiling.
-      - docker/check-artifacts.sh dist/host none
+      # Identity + profile check — the host dev build has no foreign glibc ceiling.
+      - docker/check-artifacts.sh dist/host none release
 
   build:rocky8:
     desc: 'Rocky Linux 8 (latest 8.x) build → dist/rocky8/ (glibc ≤ 2.28)'
@@ -128,7 +128,7 @@ tasks:
       vars: [TARGET, GLIBC_CEILING]
     cmds:
       - task: build:distro
-        vars: { TARGET: '{{.TARGET}}', GLIBC_CEILING: '{{.GLIBC_CEILING}}', SQZ_DIST: '1', OUT_SUFFIX: '-dist' }
+        vars: { TARGET: '{{.TARGET}}', GLIBC_CEILING: '{{.GLIBC_CEILING}}', BUILD_DIST: '1', OUT_SUFFIX: '-dist' }
 
   build:distro:
     internal: true
@@ -166,7 +166,7 @@ tasks:
           -v "squeezefs-target-{{.TARGET}}:/build" \
           -w "{{.ROOT_DIR}}" \
           -e GLIBC_CEILING="{{.GLIBC_CEILING}}" \
-          -e SQZ_DIST="{{.SQZ_DIST}}" \
+          -e BUILD_DIST="{{.BUILD_DIST}}" \
           -e HOST_UID="$(id -u)" -e HOST_GID="$(id -g)" \
           squeezefs-build:{{.TARGET}} \
           "{{.ROOT_DIR}}/docker/build-in-container.sh"

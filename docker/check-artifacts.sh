@@ -2,7 +2,7 @@
 # Artifact identity + ABI verification — shared by the host `task build`
 # and the in-container distro builds (docker/build-in-container.sh).
 #
-#   check-artifacts.sh <dir> <glibc-ceiling|auto|none>
+#   check-artifacts.sh <dir> <glibc-ceiling|auto|none> [expected-profile]
 #
 # Identity (KD-7 daemon/shim same-commit equality; the "unidentifiable
 # binary" cluster-incident rule): `<dir>/squeezefs --version` must NOT
@@ -11,15 +11,22 @@
 # SQUEEZEFS_IL_BUILD_COMMIT identity is asserted the strong way instead:
 # the checkout's full hash must appear in the .so bytes.
 #
+# Profile (the two-profile LTO law): when the caller names the profile it
+# built, the version line must end in `profile <that>` — the 1.2 `dist`
+# artifacts said `profile release` (a build.rs OUT_DIR-parsing bug under
+# the container's /build target dir) and only a human reading the log
+# noticed.
+#
 # ABI: the max GLIBC_* symbol version referenced by each artifact must be
 # ≤ the ceiling. "auto" resolves the ceiling from the RUNNING glibc (for
 # images whose ceiling we deliberately do not hardcode, e.g. ubuntu2604);
 # "none" skips the ceiling check (host dev builds).
 set -euo pipefail
 
-usage="usage: check-artifacts.sh <dir> <glibc-ceiling|auto|none>"
+usage="usage: check-artifacts.sh <dir> <glibc-ceiling|auto|none> [expected-profile]"
 dir=${1:?$usage}
 ceiling=${2:?$usage}
+expected_profile=${3:-}
 
 commit=$(git rev-parse HEAD)
 
@@ -38,6 +45,16 @@ case "$ver" in
     exit 1
     ;;
 esac
+if [ -n "$expected_profile" ]; then
+  case "$ver" in
+    *" profile $expected_profile") echo "  profile: $expected_profile" ;;
+    *)
+      echo "FAIL: --version does not end in 'profile $expected_profile' — the binary" \
+           "does not name the profile it was built with (two-profile LTO law)" >&2
+      exit 1
+      ;;
+  esac
+fi
 
 if LC_ALL=C grep -aq "$commit" "$dir/libsqueezefs_il.so"; then
   echo "  libsqueezefs_il.so: embeds build commit $commit"

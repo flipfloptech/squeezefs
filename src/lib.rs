@@ -231,6 +231,10 @@ pub mod sqz_sync;
 /// reference `crate::sqz_time`, which this re-export satisfies in the
 /// root crate (fuse3 owns a real module of the same name).
 pub use squeezefs_ipc::sqz_time;
+/// The cargo profile-name derivation `build.rs` stamps into the binary
+/// (`#[path]`-shared with the build script so the version line's profile
+/// and the test that pins it read the same function).
+pub mod build_profile_core;
 // Adaptive spin governor core — canonical file in the squeezefs-ipc
 // tree, `#[path]`-included here (the ipc service lanes) and by the fuse3
 // fork (the FUSE-over-io_uring queue workers, R-4), so both spin
@@ -240,10 +244,10 @@ pub mod spin_governor;
 pub mod sqz_sync_core;
 pub mod storage;
 pub mod stripe_locks;
+pub mod supervisor;
 // The S8 client token cache's word protocol (spec §6.9's
 // `token_cache_core` loom obligation, KD-MW-10) — the monotone grant
 // slot + era floor `meta_ship/tokens.rs` runs on.
-pub mod supervisor;
 pub(crate) mod token_cache_core;
 pub mod uring_fs;
 pub mod version;

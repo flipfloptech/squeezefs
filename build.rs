@@ -131,22 +131,22 @@ fn main() {
     );
 }
 
+/// The derivation is shared with the crate (`src/build_profile_core.rs`) so
+/// `tests/cli_version_tests.rs` pins the exact function that stamps the
+/// binary — including the containerized `/build/target/…` layout that made
+/// the 1.2 `dist` artifacts report `profile release`.
+#[path = "src/build_profile_core.rs"]
+mod build_profile_core;
+
 /// The cargo PROFILE NAME this binary is built under (`release`, `dist`,
-/// `dev`, `preload-release`, …). Cargo's `PROFILE` env collapses every
-/// custom profile to `debug`/`release`, so the name is read from
-/// `OUT_DIR`'s layout (`target/<profile>/build/<crate>-<hash>/out`) — the
-/// two-profile LTO law needs the binary to say WHICH release-class profile
-/// it is, since only `dist` carries fat LTO.
+/// `dev`, `preload-release`, …), read from `OUT_DIR`'s layout because
+/// cargo's `PROFILE` env collapses every custom profile to `debug` /
+/// `release` — the two-profile LTO law needs the binary to say WHICH
+/// release-class profile it is, since only `dist` carries fat LTO. Falls
+/// back to the collapsed `PROFILE` when `OUT_DIR` has no recognizable
+/// shape, never guesses.
 fn build_profile_name() -> String {
     let out_dir = std::env::var("OUT_DIR").unwrap_or_default();
-    let parts: Vec<&str> = out_dir.split('/').collect();
-    // .../<profile>/build/<pkg-hash>/out  → the segment before "build".
-    parts
-        .iter()
-        .position(|s| *s == "build")
-        .and_then(|i| i.checked_sub(1))
-        .and_then(|i| parts.get(i))
-        .map(|s| s.to_string())
-        .filter(|s| !s.is_empty())
+    build_profile_core::profile_name_from_out_dir(&out_dir)
         .unwrap_or_else(|| std::env::var("PROFILE").unwrap_or_else(|_| "unknown".into()))
 }

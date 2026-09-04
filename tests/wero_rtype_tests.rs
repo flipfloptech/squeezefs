@@ -319,19 +319,37 @@ impl Drop for LiveVenue {
 
 /// Instrument write/read through a controller CHAR device (association-
 /// pinned on native-multipath kernels). `Ok(())` = admitted.
+///
+/// Issued as an NVM `io-passthru` (opcode 0x02 READ / 0x01 WRITE, one
+/// 512-byte block at LBA 0) rather than `nvme read`/`nvme write`: on
+/// nvme-cli 1.x (EL8's 1.16) those two open the char device and probe it
+/// with `ioctl(BLKSSZGET)`, which a controller node answers ENOTTY, so
+/// they exit nonzero with NO output — the empty-string failure the 1.2 zc
+/// gate hit on the sqz box, with every product step of the leg already
+/// green. The passthru form is the same command on the wire and every
+/// nvme-cli speaks it on a char device.
 fn char_io(ctrl: &str, write: bool) -> Result<(), String> {
     let dev = format!("/dev/{ctrl}");
     let mut args: Vec<&str> = vec![
-        if write { "write" } else { "read" },
+        "io-passthru",
         &dev,
-        "-n",
-        "1",
-        "--start-block=0",
-        "--block-count=0",
-        "--data-size=512",
+        "--namespace-id=1",
+        if write {
+            "--opcode=0x01"
+        } else {
+            "--opcode=0x02"
+        },
+        "--data-len=512",
+        // cdw10/11 = SLBA 0, cdw12 = NLB 0 (one block).
+        "--cdw10=0",
+        "--cdw11=0",
+        "--cdw12=0",
     ];
     if write {
-        args.push("--data=/dev/zero");
+        args.push("--write");
+        args.push("--input-file=/dev/zero");
+    } else {
+        args.push("--read");
     }
     let out = nvme_cli(&args);
     if out.status.success() {
@@ -556,9 +574,11 @@ fn live_wero_admits_registered_second_association_and_refuses_unregistered() {
         String::from_utf8_lossy(&out.stderr)
     );
     let refused = char_io(&ctrl_b, true).expect_err("an unregistered host is write-refused");
+    // nvme-cli 2.x prints "Reservation Conflict", 1.x "RESERVATION_CONFLICT".
     assert!(
         refused
             .to_ascii_lowercase()
+            .replace('_', " ")
             .contains("reservation conflict"),
         "the refusal is the reservation-conflict class: {refused}"
     );

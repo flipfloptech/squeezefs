@@ -1,6 +1,6 @@
 # SqueezeFS 1.2.0
 
-_Release date: (tag pending the release gate)_
+_Release date: 2026-09-04 (tag `stable-2026.09`)_
 
 1.2.0 is the release train after 1.1. It removes the file-size ceiling, closes a set of data-integrity bugs found in the field, and lands the first campaigns of an end-to-end performance program together with the instruments that program runs on. Existing volumes mount unchanged; read [Upgrading from 1.1](#upgrading-from-11) before rolling it out to a mixed fleet.
 

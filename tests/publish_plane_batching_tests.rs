@@ -26,7 +26,10 @@
 //! * **frames** — the listener's `requests_served` delta (one per wire
 //!   `Call` frame the owner served);
 //! * **owner passes** — the process-global `META_CONVEYOR_LEADER_PASSES`
-//!   delta (the M7 conveyor's pass count);
+//!   delta (the M7 conveyor's pass count) — a measurement on an un-held
+//!   conveyor (since C-2 the pass drains arrivals the instant they land,
+//!   so the count is arrival spread ÷ pass latency), a contract only
+//!   under the held pass (`PassHold`);
 //! * **journal entries** — `META_KV_JOURNAL_ENTRIES` delta (one tx = one
 //!   checksummed entry: the count that must NOT collapse);
 //! * **wall** — spawn-to-join over the whole concurrent set.
@@ -35,6 +38,10 @@ use squeezefs::data_custody;
 use squeezefs::data_grant::{self, WriteCustodyClient, WriteCustodyOwner};
 use squeezefs::layout_wire::LayoutMetadata;
 use squeezefs::membership::{LeaseClock, LeaseClocks};
+use squeezefs::meta_backend::kv::backend::{
+    test_conveyor_hold_release, KvMetaBackend, TEST_CONVEYOR_HOLD_PRE_DRAIN,
+    TEST_CONVEYOR_HOLD_STAGE,
+};
 use squeezefs::meta_backend::kv::{META_CONVEYOR_LEADER_PASSES, META_KV_JOURNAL_ENTRIES};
 use squeezefs::meta_backend::{
     open_routed_meta_set, plan_meta_slot_set, Metadata, RoutedMetaBackend,
@@ -297,8 +304,19 @@ impl TwoNodes {
         size_of: impl Fn(usize) -> u64,
     ) -> (Vec<squeezefs::error::Result<bool>>, Duration) {
         let started = Instant::now();
-        let handles: Vec<_> = inos
-            .iter()
+        let out = join_publishes(self.spawn_publishes(inos, size_of)).await;
+        (out, started.elapsed())
+    }
+
+    /// The spawn half of [`Self::publish_concurrently`]: one task per ino,
+    /// returned un-joined so a contract can place a barrier between "every
+    /// publish is queued" and "every publish answered".
+    fn spawn_publishes(
+        &self,
+        inos: &[u64],
+        size_of: impl Fn(usize) -> u64,
+    ) -> Vec<tokio::task::JoinHandle<squeezefs::error::Result<bool>>> {
+        inos.iter()
             .enumerate()
             .map(|(i, &ino)| {
                 let be = Arc::clone(&self.client_be);
@@ -307,12 +325,13 @@ impl TwoNodes {
                     publish::set_layout_and_size(&be, ino, &layout_bytes(size), size, &[]).await
                 })
             })
-            .collect();
-        let mut out = Vec::with_capacity(handles.len());
-        for h in handles {
-            out.push(h.await.expect("a publish task never panics"));
-        }
-        (out, started.elapsed())
+            .collect()
+    }
+
+    /// The owner's one meta volume — the conveyor the shipped publishes
+    /// commit on.
+    fn owner_volume(&self) -> &KvMetaBackend {
+        &self.owner_be.volumes[0]
     }
 
     async fn stop(self) {
@@ -320,6 +339,17 @@ impl TwoNodes {
         shutdown(&self.owner_be).await;
         shutdown(&self.client_be).await;
     }
+}
+
+/// Join the spawned publishes in ino order (a publish task never panics).
+async fn join_publishes(
+    handles: Vec<tokio::task::JoinHandle<squeezefs::error::Result<bool>>>,
+) -> Vec<squeezefs::error::Result<bool>> {
+    let mut out = Vec::with_capacity(handles.len());
+    for h in handles {
+        out.push(h.await.expect("a publish task never panics"));
+    }
+    out
 }
 
 /// Poll `cond` at 1 ms until it holds or `within` elapses (a bounded
@@ -356,6 +386,37 @@ impl Drop for DrainHold {
 /// The hold every framing contract arms: long enough that a burst of
 /// concurrent submissions is provably queued before the drain takes it.
 const HOLD_MS: u64 = 150;
+
+/// The owner-side seam (M7 §5.5 D5, the `conveyor_tests::group_forms_
+/// under_held_pass` protocol): park the owner's apply pass BEFORE it
+/// drains, so a frame's calls provably co-queue before one pass takes
+/// them. Since C-2 the apply pass runs on the volume's own journal lane
+/// and drains arrivals the instant they land, so an un-held pass count is
+/// the frame's ARRIVAL SPREAD (24 calls through one `join_all`, each with
+/// its own custody/base prelude) against the pass's latency — a venue
+/// ratio (3–14 passes for 24 publishes over 51 runs on the all-features
+/// debug build), not a publish-plane property. The held pass makes the
+/// co-queue law itself the contract. Drop disarms + releases, so a panic
+/// mid-test cannot strand the next test's conveyor.
+struct PassHold;
+
+impl PassHold {
+    fn arm() -> Self {
+        TEST_CONVEYOR_HOLD_STAGE.store(TEST_CONVEYOR_HOLD_PRE_DRAIN, Ordering::SeqCst);
+        PassHold
+    }
+
+    fn release(&self) {
+        TEST_CONVEYOR_HOLD_STAGE.store(0, Ordering::SeqCst);
+        test_conveyor_hold_release();
+    }
+}
+
+impl Drop for PassHold {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
 
 // ===========================================================================
 // 1. The measurement rows — the campaign's in-process face
@@ -454,10 +515,13 @@ async fn measurement_rows_24_concurrent_publishes_from_one_co_writer() {
             "[{label}] a busy publish pipe self-batches: {frames} frames for {INOS} concurrent \
              publishes is the stop-and-wait shape"
         );
+        // `passes` is a MEASUREMENT here, not a contract: on an un-held
+        // conveyor it is the venue ratio [`PassHold`] describes (3–14 for
+        // these 24 on one box). The co-queue law is pinned under the held
+        // pass in the seam-controlled contract below.
         assert!(
-            passes * 2 <= INOS as u64,
-            "[{label}] batched publishes co-queue on the owner's conveyor: {passes} passes for \
-             {INOS} publishes is the one-pass-per-publish shape"
+            passes >= 1,
+            "[{label}] the owner conveyor ran at least one pass for {INOS} publishes"
         );
 
         nodes.stop().await;
@@ -468,32 +532,64 @@ async fn measurement_rows_24_concurrent_publishes_from_one_co_writer() {
 
 // ===========================================================================
 // 2. The framing contract (seam-controlled): 24 concurrent publishes ride
-//    ≤ 4 frames and ≤ 4 owner conveyor passes
+//    ≤ 4 frames and co-queue into ONE owner conveyor pass
 // ===========================================================================
 
+/// The frame ceiling the drain hold makes deterministic: all 24 are queued
+/// before the lane's drain takes the queue, so the ideal is ONE frame; the
+/// slack is the per-frame call cap (`router::batch_max`) on a small box.
+const MAX_FRAMES: u64 = 4;
+
 /// Contract: a burst of 24 concurrent publishes from one co-writer to one
-/// authority is framed into **at most 4 wire frames** and commits in **at
-/// most 4 conveyor passes** at the owner (the frame's independent inos
-/// co-queue into ONE M7 pass — D-1's mechanism, applied to the publish
-/// plane), while the journal-entry count stays 24 and every caller gets
-/// its own reply (its own ino's size lands). The drain-hold seam makes
-/// "concurrent" deterministic: all 24 are queued before the drain takes
-/// the queue, so the ideal is ONE frame.
+/// authority is framed into **at most [`MAX_FRAMES`] wire frames**, and
+/// the frames' independent inos **co-queue on the owner's M7 conveyor**
+/// (D-1's mechanism, applied to the publish plane): with the owner's apply
+/// pass held pre-drain, every one of the 24 calls is queued behind it
+/// BEFORE it runs, and the release drains them in ONE pass (≤ 2 — the
+/// `group_forms_under_held_pass` tolerance for one ambient singleton).
+/// The journal-entry count stays 24 (one tx = one checksummed entry) and
+/// every caller gets its own reply (its own ino's size lands).
+///
+/// Both seams are what make the two halves deterministic: the client
+/// lane's drain hold for "concurrent" (frames), the owner's pass hold for
+/// "co-queued" (passes). The client's frame depth is pinned to
+/// [`MAX_FRAMES`] so every frame is in flight at once — a frame waiting
+/// on a held pass must never gate the next frame's departure, or the
+/// barrier below could not form.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn twenty_four_concurrent_publishes_ride_at_most_four_frames_and_four_passes() {
+async fn twenty_four_concurrent_publishes_ride_at_most_four_frames_and_one_owner_pass() {
     let _serial = serial();
     let _restore = restore();
     let dir = TempDir::new().unwrap();
-    let pc = publish::PublishClient::new(NODE, SECRET.to_vec());
+    let pc = publish::PublishClient::with_depth(NODE, SECRET.to_vec(), MAX_FRAMES as usize);
     let nodes = TwoNodes::start(dir.path(), pc).await;
     nodes.warm().await;
     let inos = mint(&nodes.owner_be, INOS, "burst").await;
 
     let _hold = DrainHold::arm(HOLD_MS);
+    let pass_hold = PassHold::arm();
     let before = counters(&nodes.auth);
-    let (outcomes, _wall) = nodes
-        .publish_concurrently(&inos, |i| 8192 * (i as u64 + 1))
-        .await;
+    let handles = nodes.spawn_publishes(&inos, |i| 8192 * (i as u64 + 1));
+
+    // The barrier: every call parked on the owner's conveyor behind the
+    // held pass. The frames were served (decoded + dispatched) to get
+    // here, so the frame count is final at this point too.
+    let owner = nodes.owner_volume();
+    let queued = eventually(Duration::from_secs(30), || {
+        owner.conveyor_pending_len() >= INOS
+    })
+    .await;
+    assert!(
+        queued,
+        "all {INOS} framed publishes must queue behind the held owner pass; {} queued \
+         after 30 s (frames served so far: {})",
+        owner.conveyor_pending_len(),
+        counters(&nodes.auth).frames - before.frames
+    );
+    let frames = counters(&nodes.auth).frames - before.frames;
+
+    pass_hold.release();
+    let outcomes = join_publishes(handles).await;
     let after = counters(&nodes.auth);
 
     for (i, out) in outcomes.iter().enumerate() {
@@ -507,18 +603,19 @@ async fn twenty_four_concurrent_publishes_ride_at_most_four_frames_and_four_pass
             "reply correlation: caller {i}'s publish landed on caller {i}'s ino"
         );
     }
-    let frames = after.frames - before.frames;
     let passes = after.passes - before.passes;
     assert_eq!(after.entries - before.entries, INOS as u64);
     assert!(
-        frames <= 4,
-        "24 queued publishes must ride ≤ 4 frames (got {frames})"
+        frames <= MAX_FRAMES,
+        "24 queued publishes must ride ≤ {MAX_FRAMES} frames (got {frames})"
     );
     assert!(
-        passes <= 4,
-        "24 framed publishes must co-queue into ≤ 4 owner conveyor passes (got {passes})"
+        (1..=2).contains(&passes),
+        "24 framed publishes queued behind one held pass must drain in 1–2 owner conveyor \
+         passes, not {passes}"
     );
 
+    drop(pass_hold);
     nodes.stop().await;
 }
 

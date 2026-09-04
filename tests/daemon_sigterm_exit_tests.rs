@@ -27,11 +27,15 @@ use squeezefs_testkit::{mount_supported, site};
 
 const MIB: u64 = 1024 * 1024;
 
-/// SIGTERM → process exit + mountpoint gone. The dismount itself is a
-/// sub-second flush on an idle sandbox; the bound covers a loaded gate box
-/// and stays well under the `umount` verb's 5 s SIGTERM window so the
-/// verb's kernel-abort fallback can never be what makes this pass.
-const EXIT_BOUND: Duration = Duration::from_secs(4);
+/// SIGTERM → the daemon's own unmount + process exit. The dismount itself
+/// is a sub-second flush on an idle sandbox (0.17 s measured, default
+/// build), but the bound must also hold on the gate's `--all-features`
+/// build, where the `dhat` allocator replaces jemalloc and dumps a heap
+/// profile AT EXIT — seconds of work that is the profiler's, not the
+/// daemon's — on a box running the full suite. The pre-fix shape this
+/// pins against is "never exits on its own" (the mount stayed until an
+/// external abort), so a generous bound loses nothing.
+const EXIT_BOUND: Duration = Duration::from_secs(60);
 
 fn bin() -> &'static str {
     env!("CARGO_BIN_EXE_squeezefs")
@@ -270,22 +274,30 @@ fn umount_verb_succeeds_against_an_unreaped_child_daemon() {
         out.status.success(),
         "umount verb failed after {took:?}:\n{text}"
     );
+    // The verb's own account is the instrument (wall time would measure the
+    // dhat exit dump on the all-features build): it prints these two lines
+    // exactly when it burns its SIGTERM window or its post-unmount window.
     assert!(
         !text.contains("did not exit within timeout"),
         "the verb waited out its SIGTERM window on a daemon that had already exited \
-         (zombie read as alive):\n{text}"
+         (zombie read as alive) — took {took:?}:\n{text}"
+    );
+    assert!(
+        !text.contains("still running after unmount"),
+        "the verb's post-unmount wait expired on a daemon that exits on its own — took \
+         {took:?}:\n{text}"
+    );
+    assert!(
+        text.contains("Successfully unmounted"),
+        "the verb must report the clean unmount — took {took:?}:\n{text}"
     );
     assert!(
         !is_mounted(&mnt),
         "mountpoint still mounted after a successful umount verb"
     );
+    // The child exits on its own; reap it so the harness Drop finds nothing.
     assert!(
-        took < EXIT_BOUND,
-        "umount verb took {took:?}; a clean daemon exit must not cost the SIGTERM window"
-    );
-    // The child exited on its own; reap it so the harness Drop finds nothing.
-    assert!(
-        wait_exit(&mut mount.child, Duration::from_secs(1)).is_some(),
+        wait_exit(&mut mount.child, EXIT_BOUND).is_some(),
         "daemon must have exited on its own SIGTERM"
     );
     let _ = std::fs::remove_dir_all(&base);

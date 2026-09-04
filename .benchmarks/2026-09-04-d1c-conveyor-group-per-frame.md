@@ -168,10 +168,17 @@ The D-1b measurement row (no seams, derived depth) on the same binary now
 reads **passes == frames** on every run (1/1, 1/1, 1/1, 3/3, 3/3, 3/4)
 where the same row read 3–14 passes per 24 publishes on the C-2 branch.
 
-## Field A-B-B-A — OWED (the parent runs it; root + tcp devsub)
+## Field A-B-B-A — local fleet (32-CPU dev box, tcp devsub) — MEASURED 2026-09-04
 
-Not run by the implementer (root + a devsub; the cloud rule does not
-apply — this is the local fleet). The rig is written and syntax-checked:
+Three same-binary lever brackets (`SQUEEZEFS_PUBLISH_CONVEYOR_GROUP` 0 / 1
+/ 1 / 0), release build `be98a5db`, `tests/mw_fleet.sh create N=1
+--multi-writer --cowriters=8` per leg torn down to zero residue, tcp devsub
+(nvmet-tcp on `127.0.0.1`, zram OSS), `/dev/zero` source (device term
+removed by design — the row is the publish-plane ceiling). Ambient desktop
+load 6–15 at bracket start (browser/compositor, the C-2 bracket's 4–11
+class); the fleet itself drives loadavg to 40–60 by the fourth leg, which
+penalizes the LATER legs of both arms equally (why both orders are read).
+Artifacts `target/d1c-fleet-lever-abba.{stream128,fullsave,fullsave-depth1}/`.
 
 ```
 sudo SQZ_DEVSUB_TRANSPORT=tcp tests/dev_substrate.sh create      # nvmet-tcp on 127.0.0.1 (MANDATORY: write row)
@@ -180,13 +187,47 @@ BIN=$PWD/target/release/squeezefs sudo -n -E env "PATH=$PATH" \
   bash .benchmarks/rigs/2026-09-04-d1c-fleet-lever-abba.sh        # L0a L1a L1b L0b: lever 0,1,1,0
 ```
 
-Same shape as the C-2 lever rig (`2026-09-03-c2-fleet-lever-abba.sh`):
-`tests/mw_fleet.sh create N=1 --multi-writer --cowriters=8` per leg, the
-D-1b row (`2026-09-02-d1b-fleet-row.sh`, ROW_ONLY) — **8 co-writers × 24
-concurrent `dd bs=1M count=128 conv=fsync` from `/dev/zero`** — torn down
-to zero residue between legs; `SQUEEZEFS_PUBLISH_CONVEYOR_GROUP` inherited
-by the daemons. Analyzer `2026-09-04-d1c-fleet-analyze.py` (+ the C-2
-analyzer for the journal-write hop split).
+The `FILES` dimension was added to the row rig for this bracket
+(`2026-09-02-d1b-fleet-row.sh`, default 1 = the original row): `MB=2
+FILES=64` is the FULL-SAVE shape — every file's first publish is a
+`set_layout_and_size`, the class this rung groups — vs the streaming row,
+where 96 % of publishes are Lever-B delta merges on the layout conveyor.
+
+| bracket (8 co-writers × 24 streams) | leg | ingest GiB/s | verbs/s | authority CPU s | calls/frame | passes/frame | passes/publish | groups (size) / frames engaged | entries/publish |
+|---|---|---|---|---|---|---|---|---|---|
+| streaming 128 MiB | L0a | 2.83 | 7,254 | 5.96 | 1.51 | 0.315 | 0.209 | 0 | 0.257 |
+| | L1a | 2.79 | 7,196 | 5.81 | 1.52 | 0.310 | 0.204 | 1,238 (1.68) / 3.4 % | 0.260 |
+| | L1b | 2.63 | 6,762 | 5.85 | 1.54 | 0.308 | 0.200 | 1,378 (1.64) / 3.9 % | 0.259 |
+| | L0b | 2.70 | 7,028 | 5.83 | 1.68 | 0.330 | 0.197 | 0 | 0.259 |
+| full-save 2 MiB × 64 | L0a | 0.90 | 7,352 | 17.16 | 1.43 | 0.451 | 0.315 | 0 | 0.482 |
+| | L1a | 0.88 | 6,859 | 18.08 | 1.46 | 0.457 | 0.314 | 5,714 (2.16) / 6.8 % | 0.512 |
+| | L1b | 0.92 | 7,369 | 20.28 | 1.45 | 0.440 | 0.304 | 5,978 (2.13) / 6.7 % | 0.496 |
+| | L0b | 0.92 | 7,528 | 18.69 | 1.45 | 0.440 | 0.304 | 0 | 0.477 |
+| full-save, `SHIP_DEPTH=1` | L0a | 0.91 | 7,387 | 15.80 | 1.92 | 0.639 | 0.333 | 0 | 0.493 |
+| | L1a | 0.90 | 7,426 | 16.48 | 1.89 | 0.564 | 0.299 | 7,566 (2.75) / 10.5 % | 0.486 |
+| | L1b | 0.79 | 5,822 | 18.98 | 2.37 | 0.846 | 0.357 | 7,368 (2.88) / 15.4 % | 0.578 |
+| | L0b | 0.90 | 7,280 | 16.44 | 1.93 | 0.666 | 0.345 | 0 | 0.490 |
+
+Ledger closure exact on every leg (`shipped ≡ served`, refusals =
+owner_panics = 0, every stream rc 0); journal entries per publish
+unchanged within noise (one tx = one entry — the mechanism is queue-side).
+
+**Verdict — a WASH on this venue, mechanism engaged and honest.** The
+headline (aggregate ingest, verbs/s per authority) is par inside the
+bracket's own leg-to-leg spread on all three shapes; authority CPU is NOT
+lower — flat on the streaming row, +4–8 % on the clean L0a→L1a pair of the
+full-save rows (the round's `join_all` prepare + the group ceremony cost
+more than the passes it saves). The mechanism does what it claims where it
+can act: at depth 1, passes/publish −10 % (0.333 → 0.299) and passes/frame
+−12 % on the clean pair. What bounds it is the CLIENT'S FRAME FILL:
+frames average 1.4–1.9 calls on this loopback fleet (2.4 on the one
+outlier leg), so only 3–15 % of frames carry two layout calls to group
+(group size 1.6–2.9), and the apply pass was already at ρ 0.15–0.2 with
+78–89 % size-1 batches — there is little to save and the D-2/C-2 rows said
+so (the pass has headroom; the hop binds). The rung's premise — the
+un-grouped pass count is arrival spread ÷ pass latency — is confirmed
+(passes/frame 0.31–0.64 off, never the 3–14 the SEAM-controlled 24-call
+burst shows), but at the fleet's natural fill it is not a cost.
 
 **Verdict columns** (authority m0, per leg, both brackets must agree):
 
@@ -203,9 +244,51 @@ analyzer for the journal-write hop split).
 
 Then the squeeze-test per the ladder row (§5.3 row 1's acceptance).
 
+
+## Field A-B-B-A — `squeeze-test` (32-core Xeon, 6.19.14-sqz, its own tcp devsub) — MEASURED 2026-09-04
+
+Same rig, same three shapes, same binary (`be98a5db`, release), run by the
+box agent — full record with all 12 leg blocks and the analyzer tables:
+`.benchmarks/2026-09-04-d1c-fleet-squeeze-test.md`. Substrate note: this
+kernel's zram carries only `lzo-rle`/`lzo` (rows labeled oss=lzo-rle;
+`/dev/zero` source, so the compressor is not the row's term).
+
+| bracket | ingest GiB/s (0 / 1 / 1 / 0) | passes/frame off → on | engaged frames | group size | calls/frame |
+|---|---|---|---|---|---|
+| streaming 128 MiB | 8.56 / 8.39 / 8.71 / 8.63 — par | 0.303, 0.326 → 0.302, 0.299 (−4 %) | 3.3 / 3.1 % | 1.99 / 1.79 | 1.67–1.71 |
+| full-save 2 MiB × 64 | 0.66 / **0.70** / **0.70** / 0.66 — **+6 % on, both orders** | 0.303, 0.334 → 0.289, 0.304 (−7 %) | 4.9 / 4.7 % | 2.29 / 2.28 | 1.42–1.45 |
+| full-save, `SHIP_DEPTH=1` | 0.70 / 0.71 / 0.70 / 0.70 — par | 0.456, 0.428 → 0.381, 0.385 (−13 %) | 6.9 / 7.2 % | 2.93 / 2.94 | 1.67–1.72 |
+
+`pass_total` par (67–106 µs), ρ(apply) 0.10–0.22, verbs/s par-or-up (+4 %
+on the full-save rows), authority CPU per served publish par, journal
+entries per publish unchanged, `frame_groups` = 0 on every off leg, ledger
+closure exact, every stream rc 0.
+
+## Verdict and disposition — LANDS, default ON
+
+Across two venues, six brackets, 24 legs: **no loss anywhere**, par on the
+streaming and depth-1 rows, and **a +6 % ingest win on the full-save row
+on the field box, A-B-B-A-consistent** (the many-small-files class the
+rung was named for — every file's first publish is a full save). The
+mechanism is honest about what bounds it: the CLIENT'S FRAME FILL
+(1.4–2.4 calls per frame on both fleets), so it engages on 3–15 % of frames
+and removes exactly the passes those frames would have split (−4 → −13 %),
+while the D-2/C-2 apply pass already ran at ρ 0.1–0.2 — which is why the
+laptop rows are par rather than up. The laptop's +4–8 % authority-CPU
+reading on the full-save rows did not reproduce on the box (par per served
+publish), so it is read as that box's ambient load, not a cost.
+
+What the rung also buys is structural: the D-1-family "passes per frame"
+contracts pin the mechanism (one group = one drain) instead of a venue
+ratio, and a frame of N layout publishes costs ONE apply pass by
+construction whatever the arrival spread — the property every future
+frame-fill improvement (deeper client pipelines, larger frames on a
+higher-RTT fabric) inherits for free. The lever `SQUEEZEFS_PUBLISH_CONVEYOR_GROUP=0`
+stays as the A/B control, never an operational escape.
+
 ## Owed / next rungs
 
-1. **The field A-B-B-A above** — landed-pending-field.
+1. ~~The field A-B-B-A~~ — RUN on both venues (above); landed.
 2. **The other publish verbs stay per-call by decision** (this rung's scope
    was the `SetLayoutAndSize` class): `MergeLayoutAndSize` (the Lever-B
    layout conveyor's own aggregation path — grouping it means composing
@@ -220,11 +303,11 @@ Then the squeeze-test per the ladder row (§5.3 row 1's acceptance).
    so a frame carries ≤ 1 call per ino) rounds are 1 per frame; a frame
    with long same-ino chains pays R rounds. If the fleet row shows it,
    the lever is the control and the per-chain dispatch is one branch away.
-4. **`task check` on this box** stopped at `tests/daemon_sigterm_exit_tests.rs`
-   (2 failures: "daemon still alive 4 s after SIGTERM", "umount verb took
-   6.3 s") — **reproduced identically at the dev tip `3066cfc3`** in an
-   isolated worktree + target dir, i.e. pre-existing/environmental (a
-   foreign `sigterm-probe` daemon from another session,
-   `target/release/squeezefs mount … /home/justin/tmp/sigterm-probe/mnt`,
-   was running on the box throughout). The remaining legs ran separately
-   (see the final report).
+4. **`task check` on the implementing worktree** stopped at
+   `tests/daemon_sigterm_exit_tests.rs` (2 failures). NOT this branch and
+   not environmental noise: a real fork bug the new SIGTERM contracts
+   exposed under the gate's build — the daemon's own `fusermount3 -u` got
+   EBUSY from a desktop volume monitor's transient fd and never fell back
+   to a lazy detach — plus test bounds that measured the dhat exit dump.
+   Both fixed on `dev` (`88e84d9a`, before this branch's rebase); the
+   suite passes on the rebased branch (all-features build).

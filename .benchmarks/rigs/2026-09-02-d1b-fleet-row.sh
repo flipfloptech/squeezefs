@@ -41,6 +41,11 @@ OUT="${OUT:-$REPO/target/d1b-fleet-$(date +%Y%m%d-%H%M%S)}"
 COWRITERS="${COWRITERS:-8}"
 STREAMS="${STREAMS:-24}"
 MB="${MB:-128}"
+# Files per stream, written back to back (default 1 = the original row).
+# MB=2 FILES=64 is the FULL-SAVE shape: every file's first publish is a
+# `set_layout_and_size` (not a Lever-B delta merge), so a co-writer's frame
+# carries its concurrent streams' full saves — the class D-1c groups.
+FILES="${FILES:-1}"
 OSS_GB="${SQZ_MWFLEET_OSS_GB:-64}"
 ROW_ONLY="${ROW_ONLY:-0}"
 mkdir -p "$OUT"
@@ -62,7 +67,7 @@ run_row() { # leg-label
     mkdir -p "$rowdir"
     mapfile -t cws < <(cowriter_idxs)
     [ "${#cws[@]}" -ge 1 ] || die "no co-writer members in $MEMBERS"
-    log "$leg: ${#cws[@]} co-writers x $STREAMS streams x ${MB} MiB (dd bs=1M conv=fsync, /dev/zero); loadavg=$(cut -d' ' -f1-3 /proc/loadavg)"
+    log "$leg: ${#cws[@]} co-writers x $STREAMS streams x $FILES files x ${MB} MiB (dd bs=1M conv=fsync, /dev/zero); loadavg=$(cut -d' ' -f1-3 /proc/loadavg)"
     # Every member mounts the SAME filesystem: per-member directories, or
     # eight co-writers create the same 24 names in one directory and the
     # row measures S10 intent EEXIST refusals + custody conflicts instead
@@ -78,8 +83,12 @@ run_row() { # leg-label
             local st=() j rc=0 a b
             a="$(date +%s.%N)"
             for ((j = 0; j < STREAMS; j++)); do
-                dd if=/dev/zero of="$(mnt_of "$idx")/d1b-m$idx/s$j.dat" bs=1M count="$MB" \
-                    conv=fsync status=none 2>"$rowdir/m$idx-s$j.err" &
+                (
+                    for ((f = 0; f < FILES; f++)); do
+                        dd if=/dev/zero of="$(mnt_of "$idx")/d1b-m$idx/s$j-f$f.dat" bs=1M \
+                            count="$MB" conv=fsync status=none || exit $?
+                    done
+                ) 2>"$rowdir/m$idx-s$j.err" &
                 st+=("$!")
             done
             for p in "${st[@]}"; do wait "$p" || rc=$?; done
@@ -98,8 +107,9 @@ run_row() { # leg-label
         [ "$rc" = "0" ] || die "$leg: co-writer m$idx had a failed stream (rc=$rc): $(cat "$rowdir"/m$idx-s*.err | head -3)"
     done
     echo "$t0 $t1" >"$rowdir/wall"
-    python3 - "$rowdir" "$STREAMS" "$MB" "$leg" "${cws[@]}" <<'PY' | tee "$rowdir/table.txt"
+    python3 - "$rowdir" "$STREAMS" "$((MB * FILES))" "$leg" "${cws[@]}" <<'PY' | tee "$rowdir/table.txt"
 import json, sys
+# `mb` is MiB per STREAM (files x MiB per file) — the byte total's unit.
 rowdir, streams, mb, leg = sys.argv[1], int(sys.argv[2]), int(sys.argv[3]), sys.argv[4]
 cws = sys.argv[5:]
 def flat(d, out=None, pfx=""):

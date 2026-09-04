@@ -450,8 +450,10 @@ fn cold_zc_reads_decompose_into_four_exact_hops_with_a_per_op_chain() {
 /// venues together are exactly the in-place replies
 /// (`zc_read_fusions + demotes ≡ fuse3_read_inplace_replies`). With the
 /// fusion lever off (the shipped default) the same READs all take the
-/// lane arm (the R-2 shape); with it on they fuse, and only the fused arm
-/// resolves bridge CQEs in the worker's mid-pass reap.
+/// lane arm (the R-2 shape); with it on they fuse. On both arms the worker's
+/// two reap venues (mid-pass, pass bottom) partition the bridge CQEs; only
+/// the fused arm can resolve any mid-pass (a timing ratio, gauged not
+/// asserted), the lane arm resolves none (structural).
 #[test]
 fn composed_dispatch_law_partitions_every_read_on_a_zc_session() {
     if !mount_supported(site!()) {
@@ -541,14 +543,35 @@ fn composed_dispatch_law_partitions_every_read_on_a_zc_session() {
         let (n1, s1) = phase(&post, "zc_bridge_phase_ns", "msg_hop");
         assert_eq!(n1 - n0, READS, "{arm}: one bridge per data read");
         msg_hop_means.push((s1 - s0) as f64 / READS as f64);
-        // The venue law: a fused READ's fetch CQE resolves in the worker's
-        // MID-PASS reap (the interleave runs only while fused tasks are
-        // resident); on the lane arm no fused task exists, so every bridge
-        // CQE resolves at a pass bottom.
+        // The venue law: every bridge CQE resolves in exactly ONE of the
+        // worker's two reap venues — the MID-PASS interleave (runs only
+        // while fused tasks are resident) or the pass bottom — so the two
+        // counters partition the bridges on BOTH arms. WHICH venue a fused
+        // CQE lands in is the device's completion time against the pass's
+        // reap window: a venue timing ratio (0–4 of 128 at qd-1 on a
+        // file-backed sandbox, 14–21 with ms gaps between reads — the 1.2.1
+        // gate on squeeze-test, and 0 of 128 seen on the dev box), gauged
+        // here, never asserted. The T1 failure this clause used to stand
+        // in for (the mid-pass reap syncing an eternally-empty CQ) is
+        // pinned deterministically by the fork's
+        // `getevents_flush_materializes_deferred_completions_without_parking`.
+        // On the lane arm no fused task exists, so mid-pass is 0 —
+        // structural, asserted.
         let midpass =
             word(&post, "fuse3_fused_midpass_reaps") - word(&pre, "fuse3_fused_midpass_reaps");
+        let passbottom = word(&post, "fuse3_fused_passbottom_reaps")
+            - word(&pre, "fuse3_fused_passbottom_reaps");
+        assert_eq!(
+            midpass + passbottom,
+            READS,
+            "{arm}: every bridge CQE resolves in exactly one reap venue (midpass {midpass} + \
+             passbottom {passbottom} for {READS} bridges)"
+        );
         match arm {
-            "fused" => assert!(midpass > 0, "fused: bridge CQEs resolve mid-pass"),
+            "fused" => eprintln!(
+                "fused: bridge CQE venues — midpass {midpass}, passbottom {passbottom} of {READS} \
+                 (venue timing ratio, observation)"
+            ),
             _ => assert_eq!(midpass, 0, "lane: no fused task, no mid-pass reap"),
         }
         drop(mount);

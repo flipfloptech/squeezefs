@@ -8659,6 +8659,85 @@ mod tests {
         assert_eq!(FUSE_OVER_IO_URING_FLAGS2, 1u32 << 9);
     }
 
+    /// The mid-pass reap's flush idiom, pinned where it is deterministic:
+    /// on a `DEFER_TASKRUN` ring a plain `submit()` never sets
+    /// `IORING_ENTER_GETEVENTS`, so the task work that posts an
+    /// ASYNCHRONOUS completion does not run and the finished op stays
+    /// INVISIBLE in the CQ — the T1 engagement row's shape
+    /// (`fused_midpass_reaps` +0 against 22.85 M pass-bottom
+    /// resolutions). The op has to complete off the submitting task
+    /// (a NOP completes inline during submit and proves nothing): a read
+    /// on an empty pipe, made ready by a write AFTER submission.
+    /// `flush_submit_getevents` (want = 1 + a zero `EXT_ARG` timespec)
+    /// must materialize it without parking, and answer `Ok(0)` — never an
+    /// error — on an empty ring. The live engagement of the venue itself
+    /// (a fetch CQE landing mid-pass) is a venue timing ratio and is
+    /// gauged, not asserted, in `tests/zc_bridge_phase_tests.rs`.
+    #[test]
+    fn getevents_flush_materializes_deferred_completions_without_parking() {
+        let ring: Ring = match IoUring::builder()
+            .setup_single_issuer()
+            .setup_defer_taskrun()
+            .build(8)
+        {
+            Ok(r) => r,
+            // Pre-6.1 kernel (no DEFER_TASKRUN): the production ring
+            // builder degrades to a plain ring, where GETEVENTS is a
+            // no-op — nothing to pin here.
+            Err(e) if e.raw_os_error() == Some(libc::EINVAL) => return,
+            Err(e) => panic!("io_uring setup: {e}"),
+        };
+        let mut ring = ring;
+        let mut batch = SubmitBatch::default();
+        let mut cadence = crate::raw::read_phase::ReapCadence::new();
+
+        // Empty ring: the non-blocking enter reports ETIME → Ok(0).
+        let n = flush_submit_getevents(&mut ring, &mut batch, &mut cadence)
+            .expect("empty getevents flush");
+        assert_eq!(n, 0);
+
+        let mut fds = [0 as libc::c_int; 2];
+        // SAFETY: `fds` is a valid 2-element array for pipe2.
+        assert_eq!(unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) }, 0);
+        let (rfd, wfd) = (fds[0], fds[1]);
+        let mut buf = [0u8; 8];
+        let read = opcode::Read::new(types::Fd(rfd), buf.as_mut_ptr(), buf.len() as u32)
+            .build()
+            .user_data(0x51);
+        // SAFETY: `buf` outlives the completion (this function collects it
+        // below before returning); the SQE is fully initialized.
+        unsafe { ring.submission().push(&read.into()).expect("push read") };
+        ring.submit().expect("plain submit");
+        // Make the read ready from outside the ring: the completion is
+        // posted as deferred task work, which a plain submit never runs.
+        // SAFETY: writing 1 byte from a valid buffer to our own pipe.
+        assert_eq!(unsafe { libc::write(wfd, b"x".as_ptr().cast(), 1) }, 1);
+        // Give the kernel's completion path its moment; on a plain enter
+        // the CQ stays empty regardless of how long we wait.
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        ring.submit().expect("plain submit again");
+        let before: Vec<_> = ring.completion().map(|c| c.user_data()).collect();
+        assert!(
+            before.is_empty(),
+            "the deferred completion must NOT be visible after plain submits (the bug's \
+             precondition); saw {before:?} — this kernel posts it inline, the pin is moot"
+        );
+
+        let _ =
+            flush_submit_getevents(&mut ring, &mut batch, &mut cadence).expect("getevents flush");
+        let cqes: Vec<_> = ring.completion().map(|c| c.user_data()).collect();
+        assert_eq!(
+            cqes,
+            vec![0x51],
+            "the deferred completion must be visible after the GETEVENTS flush"
+        );
+        // SAFETY: closing fds this test opened.
+        unsafe {
+            libc::close(rfd);
+            libc::close(wfd);
+        }
+    }
+
     /// PERF-2 pool-level teardown law, restated on slot addressing
     /// (FUSE-2 ⊕ PERF-16): a pre-teardown reply commits (Ok); after
     /// teardown the queue worker's drain owns every owed slot, so a

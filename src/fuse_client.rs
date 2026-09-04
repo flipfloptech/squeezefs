@@ -546,9 +546,9 @@ pub fn op_profile_enabled() -> bool {
 /// reads them, which is the operator path.
 pub const VIRTUAL_INODE_MODE: u16 = 0o400;
 
-/// The default filesystem name a mount presents to the kernel: the type
-/// shows as `fuse.squeezefs` (FUSE's `subtype=`) and the source column as
-/// `squeezefs`. `-o fsname=<name>` overrides it per mount.
+/// The filesystem's name to the kernel: always the mount TYPE suffix
+/// (`fuse.squeezefs`, FUSE's `subtype=`) and the default SOURCE column
+/// (`fsname=`); `-o fsname=<name>` overrides the source only.
 pub const MOUNT_FS_NAME: &str = "squeezefs";
 
 /// VAL-7a: is the `.stats` **key census** armed
@@ -26853,9 +26853,12 @@ pub async fn start_mount<P: AsRef<Path>>(
 
     let mut options = MountOptions::default();
     // The mount identifies itself: type `fuse.squeezefs` (the kernel's
-    // `subtype=`) with `squeezefs` as the source column, so `mount`,
-    // `df -T` and `/proc/mounts` say which filesystem this is instead of
-    // "some FUSE". `-o fsname=<name>` below overrides the name.
+    // `subtype=` — ALWAYS this, it names the filesystem) with `squeezefs`
+    // as the default source column (`fsname=`, which `-o fsname=<name>`
+    // below overrides — xfstests' helper puts the device path there). The
+    // two are independent FUSE options; deriving one from the other made
+    // the 1.2.1 gate's mounts `fuse./dev/shm/...`.
+    options.subtype(MOUNT_FS_NAME);
     options.fs_name(MOUNT_FS_NAME);
     let is_root = unsafe { libc::getuid() } == 0;
     if is_root {

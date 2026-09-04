@@ -21,6 +21,7 @@ pub struct MountOptions {
     pub(crate) dirsync: bool,
     pub(crate) default_permissions: bool,
     pub(crate) fs_name: Option<String>,
+    pub(crate) subtype: Option<String>,
     pub(crate) gid: Option<u32>,
     #[cfg(target_os = "freebsd")]
     pub(crate) intr: bool,
@@ -82,11 +83,21 @@ impl MountOptions {
         self
     }
 
-    /// set fuse filesystem name, default is **fuse**. A named filesystem
-    /// mounts as type `fuse.<name>` (the `subtype=` option) with `<name>`
-    /// as its source column; unnamed stays the bare `fuse`.
+    /// set fuse filesystem name — the mount's SOURCE column (`fsname=`),
+    /// default is **fuse**. Independent of [`Self::subtype`]: xfstests'
+    /// mount helper, for one, passes the device path here.
     pub fn fs_name(&mut self, name: impl Into<String>) -> &mut Self {
         self.fs_name.replace(name.into());
+
+        self
+    }
+
+    /// set the fuse filesystem SUBTYPE (`subtype=`): the mount reports as
+    /// type `fuse.<subtype>` in `/proc/mounts`, `mount` and `df -T` instead
+    /// of a bare `fuse`. Independent of [`Self::fs_name`] (the source
+    /// column) — the two are separate FUSE options. Unset = bare `fuse`.
+    pub fn subtype(&mut self, subtype: impl Into<String>) -> &mut Self {
+        self.subtype.replace(subtype.into());
 
         self
     }
@@ -282,8 +293,8 @@ impl MountOptions {
         if self.default_permissions {
             nmount.null_opt(c"default_permissions");
         }
-        if let Some(fs_name) = &self.fs_name {
-            nmount.str_opt_owned(c"subtype=", fs_name.as_str());
+        if let Some(subtype) = &self.subtype {
+            nmount.str_opt_owned(c"subtype=", subtype.as_str());
         }
         if self.intr {
             nmount.null_opt(c"intr");
@@ -311,10 +322,11 @@ impl MountOptions {
         ];
 
         // `subtype=` is what makes the kernel report the mount as
-        // `fuse.<name>` instead of a bare `fuse` (the FreeBSD builder's
-        // nmount form of the same option).
-        if let Some(fs_name) = &self.fs_name {
-            opts.push(format!("subtype={fs_name}"));
+        // `fuse.<subtype>` instead of a bare `fuse` (the FreeBSD builder's
+        // nmount form of the same option). Never derived from `fs_name`:
+        // that is the SOURCE column, and callers put device paths there.
+        if let Some(subtype) = &self.subtype {
+            opts.push(format!("subtype={subtype}"));
         }
 
         if self.allow_root {
@@ -357,10 +369,10 @@ impl MountOptions {
             ),
         ];
 
-        // fusermount3 turns `subtype=<name>` into the `fuse.<name>` type
-        // (and drops it from the options it passes the kernel).
-        if let Some(fs_name) = &self.fs_name {
-            opts.push(format!("subtype={fs_name}"));
+        // fusermount3 turns `subtype=<subtype>` into the `fuse.<subtype>`
+        // type (and drops it from the options it passes the kernel).
+        if let Some(subtype) = &self.subtype {
+            opts.push(format!("subtype={subtype}"));
         }
 
         if self.allow_root {
@@ -493,41 +505,65 @@ mod tests {
 
     /// The kernel names a FUSE mount `fuse` unless the mount options carry
     /// `subtype=<name>`, in which case `/proc/mounts`, `mount` and `df -T`
-    /// show `fuse.<name>`. Both Linux builders emit it from `fs_name`, so a
-    /// named filesystem is identifiable as itself and not as "some FUSE".
+    /// show `fuse.<name>`. `subtype` and `fsname` are INDEPENDENT FUSE
+    /// options — the type suffix vs the source column — and the 1.2.1 gate
+    /// proved why they must stay so: xfstests' mount helper passes
+    /// `-o fsname=<device>`, and deriving the subtype from the name produced
+    /// the type `fuse./dev/shm/squeezefs_fstests_test_meta` (xfstests then
+    /// refused: "mounted but not a type fuse filesystem").
     #[test]
-    fn root_mount_options_carry_the_subtype_from_fs_name() {
+    fn root_mount_options_carry_the_subtype_independent_of_fsname() {
         let mut mo = MountOptions::default();
-        mo.fs_name("squeezefs");
+        mo.subtype("squeezefs");
+        mo.fs_name("/dev/shm/squeezefs_fstests_test_meta");
         let opts = opts_of(&mo.build(7));
         assert!(
             opts.iter().any(|o| o == "subtype=squeezefs"),
-            "root mount(2) options must carry subtype=<fs_name>: {opts:?}"
+            "root mount(2) options must carry subtype=<subtype>: {opts:?}"
+        );
+        assert!(
+            !opts.iter().any(|o| o.starts_with("subtype=/")),
+            "the fsname must never leak into the subtype: {opts:?}"
         );
         assert!(opts.iter().any(|o| o == "fd=7"));
     }
 
     #[cfg(feature = "unprivileged")]
     #[test]
-    fn fusermount_options_carry_the_subtype_and_the_fsname() {
+    fn fusermount_options_carry_the_subtype_and_the_fsname_separately() {
         let mut mo = MountOptions::default();
-        mo.fs_name("squeezefs");
+        mo.subtype("squeezefs");
+        mo.fs_name("/dev/shm/squeezefs_fstests_test_meta");
         let opts = opts_of(&mo.build_with_unprivileged());
         assert!(
             opts.iter().any(|o| o == "subtype=squeezefs"),
-            "fusermount3 options must carry subtype=<fs_name>: {opts:?}"
+            "fusermount3 options must carry subtype=<subtype>: {opts:?}"
         );
         assert!(
-            opts.iter().any(|o| o == "fsname=squeezefs"),
-            "the source column keeps fsname=<fs_name>: {opts:?}"
+            opts.iter()
+                .any(|o| o == "fsname=/dev/shm/squeezefs_fstests_test_meta"),
+            "the source column is the fsname verbatim: {opts:?}"
         );
     }
 
-    /// Unnamed stays the historical shape: no subtype (type `fuse`), and the
-    /// unprivileged path's `fsname=fuse` source column.
+    /// A subtype with no fsname: the source column keeps the historical
+    /// `fuse` on the fusermount3 path; the type is `fuse.<subtype>`.
+    #[cfg(feature = "unprivileged")]
     #[test]
-    fn unnamed_mount_emits_no_subtype() {
-        let mo = MountOptions::default();
+    fn subtype_without_fsname_keeps_the_default_source() {
+        let mut mo = MountOptions::default();
+        mo.subtype("squeezefs");
+        let opts = opts_of(&mo.build_with_unprivileged());
+        assert!(opts.iter().any(|o| o == "subtype=squeezefs"), "{opts:?}");
+        assert!(opts.iter().any(|o| o == "fsname=fuse"), "{opts:?}");
+    }
+
+    /// No subtype set stays the historical shape: type `fuse`, even when a
+    /// fsname is given (the two options are independent).
+    #[test]
+    fn no_subtype_emits_no_subtype_even_with_a_fsname() {
+        let mut mo = MountOptions::default();
+        mo.fs_name("/dev/shm/some_meta");
         let opts = opts_of(&mo.build(7));
         assert!(!opts.iter().any(|o| o.starts_with("subtype=")), "{opts:?}");
     }

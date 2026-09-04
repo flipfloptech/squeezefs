@@ -458,3 +458,27 @@ plane over) and the co-writer's CPU-starved publish pipeline.
      loop that the corpse also showed is NOT a defect: the loop's 60
      rounds complete in 0.99 s and `CHECKPOINT_MAX_AGE_MS` is 1,000 — no
      cycle is due; `ckpts` advances on the second.
+8. **The instant drain re-grades every "passes per burst" contract
+   (D-1b's found by the 1.2 release gate, 2026-09-03 19:35).** With the
+   apply pass on the volume's own lane taking arrivals the moment they
+   land, the pass count for a concurrent burst is arrival spread ÷ pass
+   latency — a venue ratio, not a mechanism property. D-1's
+   `a_frame_of_independent_verbs_commits_in_few_conveyor_passes` was
+   re-graded for it when C-2 landed (`FRAME / 4`); D-1b's
+   `publish_plane_batching_tests` (landed 09-02 19:11, before C-2) kept
+   its pre-C-2 bounds — `≤ 4` passes for 24 framed publishes and
+   `passes × 2 ≤ 24` on the natural row — and passed the batch gates on a
+   ≈ 96 % rate (51 isolated runs on the all-features debug build: 3–14
+   passes for 24 publishes, frames 1–5; the strict contract 1/51 red at
+   9). Fixed test-side (`fix/d1b-pass-bound-post-c2`): the strict
+   contract now holds the OWNER's pass pre-drain (`TEST_CONVEYOR_HOLD_
+   PRE_DRAIN`, the `group_forms_under_held_pass` protocol), barriers on
+   `conveyor_pending_len() ≥ 24`, releases, and pins **1–2 passes** — the
+   co-queue law itself, deterministic — with the client's frame depth
+   pinned to the frame ceiling so a frame parked on the held pass never
+   gates the next frame's departure; the natural row keeps `passes` as a
+   printed measurement. **Product-side lever (not landed):** the owner's
+   chain dispatch could hand a frame's calls to the conveyor as ONE group
+   (a batched `commit_tx` entry — one pass per frame by construction),
+   which is also what would make the un-held ratio a contract again; the
+   D-1 residual (4–8 passes per 64-verb frame) is the same item.

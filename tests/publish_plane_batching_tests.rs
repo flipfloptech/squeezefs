@@ -412,6 +412,30 @@ async fn eventually(within: Duration, mut cond: impl FnMut() -> bool) -> bool {
     }
 }
 
+/// The owner conveyor's `meta_txpass_phase_ns` means over a row (exact
+/// sum ÷ count deltas — the audit A1 discipline), for the D-1c rows'
+/// before/after print: `tx_queue_wait` (a member's park before its pass),
+/// `pass_total` (the apply stage's service time) and `window_total`.
+fn txpass_means(before: &serde_json::Value, after: &serde_json::Value) -> String {
+    ["tx_queue_wait", "pass_total", "window_total"]
+        .iter()
+        .map(|ph| {
+            let get = |v: &serde_json::Value, k: &str| v[ph][k].as_u64().unwrap_or(0);
+            let sum = get(after, "sum_ns").saturating_sub(get(before, "sum_ns"));
+            let n = get(after, "count").saturating_sub(get(before, "count"));
+            format!(
+                "{ph} {:.1} us (n={n})",
+                if n == 0 {
+                    0.0
+                } else {
+                    sum as f64 / n as f64 / 1e3
+                }
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 /// The drain-hold seam, armed for one scope.
 struct DrainHold;
 
@@ -698,10 +722,12 @@ async fn a_framed_burst_is_one_owner_conveyor_pass_by_construction() {
 
     let _hold = DrainHold::arm(HOLD_MS);
     let before = counters(&nodes.auth);
+    let phases_before = squeezefs::fuse_client::meta_txpass_phase_json();
     let (outcomes, wall) = nodes
         .publish_concurrently(&inos, |i| 8192 * (i as u64 + 1))
         .await;
     let after = counters(&nodes.auth);
+    let phases_after = squeezefs::fuse_client::meta_txpass_phase_json();
 
     for (i, out) in outcomes.iter().enumerate() {
         out.as_ref()
@@ -721,15 +747,18 @@ async fn a_framed_burst_is_one_owner_conveyor_pass_by_construction() {
     let group_txs = after.group_txs - before.group_txs;
     let frame_groups = after.frame_groups - before.frame_groups;
     println!(
-        "D-1c in-process row ({} build): {INOS} concurrent publishes -> frames {frames}, \
-         owner conveyor passes {passes}, conveyor groups {groups} carrying {group_txs} txs, \
-         frame_groups {frame_groups}, journal entries {entries}, wall {:.2} ms",
+        "D-1c in-process row [lever on] ({} build): {INOS} concurrent publishes -> frames \
+         {frames}, owner conveyor passes {passes}, conveyor groups {groups} carrying \
+         {group_txs} txs, frame_groups {frame_groups}, journal entries {entries}, wall {:.2} ms \
+         ({:.1} us/publish); meta_txpass_phase_ns: {}",
         if cfg!(debug_assertions) {
             "debug"
         } else {
             "release"
         },
-        wall.as_secs_f64() * 1e3
+        wall.as_secs_f64() * 1e3,
+        wall.as_secs_f64() * 1e6 / INOS as f64,
+        txpass_means(&phases_before, &phases_after)
     );
 
     assert_eq!(
@@ -786,16 +815,39 @@ async fn the_group_lever_off_is_the_pre_rung_per_call_shape() {
 
     let _hold = DrainHold::arm(HOLD_MS);
     let before = counters(&nodes.auth);
-    let (outcomes, _wall) = nodes.publish_concurrently(&inos, |_| 4096).await;
+    let phases_before = squeezefs::fuse_client::meta_txpass_phase_json();
+    let (outcomes, wall) = nodes
+        .publish_concurrently(&inos, |i| 8192 * (i as u64 + 1))
+        .await;
     let after = counters(&nodes.auth);
+    let phases_after = squeezefs::fuse_client::meta_txpass_phase_json();
 
     for (i, out) in outcomes.iter().enumerate() {
         out.as_ref()
             .unwrap_or_else(|e| panic!("publish {i} failed under the lever: {e}"));
     }
-    for &ino in &inos {
-        assert_eq!(owner_size(&nodes.owner_be, ino).await, 4096);
+    for (i, &ino) in inos.iter().enumerate() {
+        assert_eq!(
+            owner_size(&nodes.owner_be, ino).await,
+            8192 * (i as u64 + 1)
+        );
     }
+    println!(
+        "D-1c in-process row [lever OFF — the pre-rung shape] ({} build): {INOS} concurrent \
+         publishes -> frames {}, owner conveyor passes {}, journal entries {}, wall {:.2} ms \
+         ({:.1} us/publish); meta_txpass_phase_ns: {}",
+        if cfg!(debug_assertions) {
+            "debug"
+        } else {
+            "release"
+        },
+        after.frames - before.frames,
+        after.passes - before.passes,
+        after.entries - before.entries,
+        wall.as_secs_f64() * 1e3,
+        wall.as_secs_f64() * 1e6 / INOS as f64,
+        txpass_means(&phases_before, &phases_after)
+    );
     assert_eq!(after.entries - before.entries, INOS as u64);
     assert!(after.frames - before.frames <= MAX_FRAMES);
     assert!(after.passes - before.passes >= 1);

@@ -735,7 +735,20 @@ impl FuseConnection {
         let mut read_fut = pin!(self.inner_read_vectored(header_buf, data_buf).fuse());
 
         select! {
-            _ = unmount_fut => None,
+            _ = unmount_fut => {
+                // `notify()` grants ONE permit, and every session — the
+                // primary (whose completion `MountHandle::unmount` awaits)
+                // plus one FUSE-over-io_uring worker per queue — waits on
+                // this same notify. Pass the baton so the wake reaches all
+                // of them: without it one arbitrary worker ran the dismount
+                // and the primary stayed parked until something external
+                // destroyed the connection (2026-09-04, the SIGTERM hang the
+                // `umount` verb's kernel-abort fallback had been masking).
+                // The last permit is stored unconsumed, which is harmless:
+                // nothing reads this connection after teardown.
+                self.unmount_notify.notify();
+                None
+            }
             res = read_fut => Some(res)
         }
     }

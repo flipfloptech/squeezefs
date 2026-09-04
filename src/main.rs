@@ -7593,19 +7593,30 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             if let Some(pid) = daemon_pid {
                 println!("Sending SIGTERM to squeezefs daemon (PID {})...", pid);
                 if nix_kill(pid, false).is_ok() {
-                    // Wait for daemon to exit and unmount itself
+                    // Wait for the daemon to unmount itself and exit. The
+                    // verdict is the MOUNT being gone: a daemon spawned as
+                    // some process's child stays a zombie in /proc until
+                    // reaped, so "/proc/<pid> exists" would call a clean,
+                    // already-unmounted exit a timeout and then fail the
+                    // direct unmount of a mount that no longer exists.
                     let start_wait = std::time::Instant::now();
                     let max_wait = std::time::Duration::from_secs(dismount_wait.max(5));
-                    while std::path::Path::new(&format!("/proc/{pid}")).exists() {
+                    while is_path_mounted(&abs_mp) && daemon_running(pid) {
                         if start_wait.elapsed() >= max_wait {
                             break;
                         }
                         squeezefs_ipc::sqz_time::sleep(std::time::Duration::from_millis(100)).await;
                     }
-                    if !std::path::Path::new(&format!("/proc/{pid}")).exists() {
+                    if !is_path_mounted(&abs_mp) {
                         unmount_success = true;
-                    } else {
+                    } else if daemon_running(pid) {
                         println!("Daemon (PID {}) did not exit within timeout.", pid);
+                    } else {
+                        println!(
+                            "Daemon (PID {}) exited but {} is still mounted.",
+                            pid,
+                            abs_mp.display()
+                        );
                     }
                 }
             }
@@ -7651,8 +7662,10 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 // Kernel abort should make the over-uring pool shut down and the
                 // daemon exit on its own. Wait, then only kill leftovers with --force.
                 if let Some(pid) = daemon_pid {
-                    let proc_path = format!("/proc/{pid}");
-                    if std::path::Path::new(&proc_path).exists() {
+                    // Liveness is `daemon_running` (non-zombie), never
+                    // `/proc/<pid>` existence: a cleanly exited child daemon
+                    // stays a zombie there until its parent reaps it.
+                    if daemon_running(pid) {
                         print!(
                             "Waiting for FUSE daemon (PID {}) to exit after kernel abort...",
                             pid
@@ -7661,14 +7674,14 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                         let start_wait = std::time::Instant::now();
                         // Kernel uring teardown can be async; give it a few seconds.
                         let max_wait = std::time::Duration::from_secs(dismount_wait.max(5));
-                        while std::path::Path::new(&proc_path).exists() {
+                        while daemon_running(pid) {
                             if start_wait.elapsed() >= max_wait {
                                 break;
                             }
                             squeezefs_ipc::sqz_time::sleep(std::time::Duration::from_millis(100))
                                 .await;
                         }
-                        if !std::path::Path::new(&proc_path).exists() {
+                        if !daemon_running(pid) {
                             println!(" done.");
                         } else if force {
                             println!();
@@ -7679,10 +7692,10 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                             let _ = nix_kill(pid, false);
                             squeezefs_ipc::sqz_time::sleep(std::time::Duration::from_millis(400))
                                 .await;
-                            if std::path::Path::new(&proc_path).exists() {
+                            if daemon_running(pid) {
                                 let _ = nix_kill(pid, true);
                             }
-                            if std::path::Path::new(&proc_path).exists() {
+                            if daemon_running(pid) {
                                 eprintln!("Warning: failed to kill daemon PID {}", pid);
                             } else {
                                 println!("Daemon killed.");
@@ -7727,6 +7740,18 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     Ok(())
+}
+
+/// True while `pid` is a live (non-zombie) process. `/proc/<pid>` alone
+/// is not liveness: an exited child stays listed as a zombie (`State: Z`)
+/// until its parent reaps it.
+fn daemon_running(pid: u32) -> bool {
+    match std::fs::read_to_string(format!("/proc/{pid}/status")) {
+        Ok(status) => !status
+            .lines()
+            .any(|l| l.starts_with("State:") && l.split_whitespace().nth(1) == Some("Z")),
+        Err(_) => false,
+    }
 }
 
 /// True if `path` is a mount point according to `/proc/self/mountinfo`.

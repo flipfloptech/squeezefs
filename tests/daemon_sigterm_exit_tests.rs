@@ -235,3 +235,58 @@ fn sigterm_unmounts_and_exits_without_external_help() {
     );
     let _ = std::fs::remove_dir_all(&base);
 }
+
+/// Contract: `squeezefs umount` against a daemon that is some process's
+/// CHILD (here: ours, un-reaped) succeeds promptly and never reports a
+/// SIGTERM timeout. Once the daemon exits on its own SIGTERM it is a
+/// zombie until reaped, and `/proc/<pid>` still exists for a zombie — the
+/// verb used to read that as "still alive", declare a timeout, and then
+/// fail the direct unmount of a mount that was already gone. The verdict
+/// has to be the MOUNT being gone.
+#[test]
+fn umount_verb_succeeds_against_an_unreaped_child_daemon() {
+    if !mount_supported(site!()) {
+        return;
+    }
+    let base = scratch("verb");
+    let meta = format_volume(&base);
+    let mnt = base.join("mnt");
+    let mut mount = spawn_mount(&meta, &mnt, &base.join("mount.log"));
+    std::fs::write(mnt.join("f"), b"hello").expect("write through the mount");
+
+    let started = Instant::now();
+    let out = Command::new(bin())
+        .arg("umount")
+        .arg(&mnt)
+        .output()
+        .expect("run squeezefs umount");
+    let took = started.elapsed();
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        out.status.success(),
+        "umount verb failed after {took:?}:\n{text}"
+    );
+    assert!(
+        !text.contains("did not exit within timeout"),
+        "the verb waited out its SIGTERM window on a daemon that had already exited \
+         (zombie read as alive):\n{text}"
+    );
+    assert!(
+        !is_mounted(&mnt),
+        "mountpoint still mounted after a successful umount verb"
+    );
+    assert!(
+        took < EXIT_BOUND,
+        "umount verb took {took:?}; a clean daemon exit must not cost the SIGTERM window"
+    );
+    // The child exited on its own; reap it so the harness Drop finds nothing.
+    assert!(
+        wait_exit(&mut mount.child, Duration::from_secs(1)).is_some(),
+        "daemon must have exited on its own SIGTERM"
+    );
+    let _ = std::fs::remove_dir_all(&base);
+}

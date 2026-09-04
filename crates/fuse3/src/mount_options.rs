@@ -82,7 +82,9 @@ impl MountOptions {
         self
     }
 
-    /// set fuse filesystem name, default is **fuse**.
+    /// set fuse filesystem name, default is **fuse**. A named filesystem
+    /// mounts as type `fuse.<name>` (the `subtype=` option) with `<name>`
+    /// as its source column; unnamed stays the bare `fuse`.
     pub fn fs_name(&mut self, name: impl Into<String>) -> &mut Self {
         self.fs_name.replace(name.into());
 
@@ -308,6 +310,13 @@ impl MountOptions {
             format!("rootmode={}", self.rootmode.unwrap_or(40000)),
         ];
 
+        // `subtype=` is what makes the kernel report the mount as
+        // `fuse.<name>` instead of a bare `fuse` (the FreeBSD builder's
+        // nmount form of the same option).
+        if let Some(fs_name) = &self.fs_name {
+            opts.push(format!("subtype={fs_name}"));
+        }
+
         if self.allow_root {
             opts.push("allow_root".to_string());
         }
@@ -347,6 +356,12 @@ impl MountOptions {
                 self.fs_name.as_ref().unwrap_or(&"fuse".to_string())
             ),
         ];
+
+        // fusermount3 turns `subtype=<name>` into the `fuse.<name>` type
+        // (and drops it from the options it passes the kernel).
+        if let Some(fs_name) = &self.fs_name {
+            opts.push(format!("subtype={fs_name}"));
+        }
 
         if self.allow_root {
             opts.push("allow_root".to_string());
@@ -465,5 +480,55 @@ impl MountOptions {
             flags.insert(MsFlags::MS_SYNCHRONOUS);
         }
         flags
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::*;
+
+    fn opts_of(s: &OsString) -> Vec<String> {
+        s.to_string_lossy().split(',').map(str::to_string).collect()
+    }
+
+    /// The kernel names a FUSE mount `fuse` unless the mount options carry
+    /// `subtype=<name>`, in which case `/proc/mounts`, `mount` and `df -T`
+    /// show `fuse.<name>`. Both Linux builders emit it from `fs_name`, so a
+    /// named filesystem is identifiable as itself and not as "some FUSE".
+    #[test]
+    fn root_mount_options_carry_the_subtype_from_fs_name() {
+        let mut mo = MountOptions::default();
+        mo.fs_name("squeezefs");
+        let opts = opts_of(&mo.build(7));
+        assert!(
+            opts.iter().any(|o| o == "subtype=squeezefs"),
+            "root mount(2) options must carry subtype=<fs_name>: {opts:?}"
+        );
+        assert!(opts.iter().any(|o| o == "fd=7"));
+    }
+
+    #[cfg(feature = "unprivileged")]
+    #[test]
+    fn fusermount_options_carry_the_subtype_and_the_fsname() {
+        let mut mo = MountOptions::default();
+        mo.fs_name("squeezefs");
+        let opts = opts_of(&mo.build_with_unprivileged());
+        assert!(
+            opts.iter().any(|o| o == "subtype=squeezefs"),
+            "fusermount3 options must carry subtype=<fs_name>: {opts:?}"
+        );
+        assert!(
+            opts.iter().any(|o| o == "fsname=squeezefs"),
+            "the source column keeps fsname=<fs_name>: {opts:?}"
+        );
+    }
+
+    /// Unnamed stays the historical shape: no subtype (type `fuse`), and the
+    /// unprivileged path's `fsname=fuse` source column.
+    #[test]
+    fn unnamed_mount_emits_no_subtype() {
+        let mo = MountOptions::default();
+        let opts = opts_of(&mo.build(7));
+        assert!(!opts.iter().any(|o| o.starts_with("subtype=")), "{opts:?}");
     }
 }

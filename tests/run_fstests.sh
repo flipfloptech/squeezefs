@@ -248,6 +248,18 @@ fi
 # (getfattr -h walk), so -P is semantics-identical; idempotent sed.
 sed -i 's/setfattr -h --restore=/setfattr -hP --restore=/' tests/generic/062
 
+# The daemon mounts as type `fuse.squeezefs` (FUSE `subtype=`), and
+# xfstests' init_rc compares `_fs_type $TEST_DEV` (df -T) against
+# FSTYP=fuse EXACTLY ("mounted but not a type fuse filesystem", exit 1).
+# common/rc already normalizes its other subtyped FUSE filesystems
+# (fuse.glusterfs, fuse.ceph-fuse) in `_fs_type`; add ours to that sed
+# the same way (idempotent).
+if ! grep -q "s/fuse.squeezefs/fuse/" common/rc; then
+    sed -i "s|-e 's/fuse.ceph-fuse/ceph-fuse/'|-e 's/fuse.ceph-fuse/ceph-fuse/' -e 's/fuse.squeezefs/fuse/'|" common/rc
+    grep -q "s/fuse.squeezefs/fuse/" common/rc \
+        || { echo "ERROR: could not add the fuse.squeezefs type normalization to xfstests common/rc _fs_type" >&2; exit 1; }
+fi
+
 # 4. Install mount and mkfs helpers
 # libmount resolves `mount -t fuse.squeezefs` through its COMPILED
 # fs-search path — plain /sbin on FHS hosts, but e.g. NixOS builds it

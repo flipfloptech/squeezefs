@@ -546,6 +546,11 @@ pub fn op_profile_enabled() -> bool {
 /// reads them, which is the operator path.
 pub const VIRTUAL_INODE_MODE: u16 = 0o400;
 
+/// The default filesystem name a mount presents to the kernel: the type
+/// shows as `fuse.squeezefs` (FUSE's `subtype=`) and the source column as
+/// `squeezefs`. `-o fsname=<name>` overrides it per mount.
+pub const MOUNT_FS_NAME: &str = "squeezefs";
+
 /// VAL-7a: is the `.stats` **key census** armed
 /// (`SQUEEZEFS_STATS_KEY_CENSUS=1`)?
 ///
@@ -26836,6 +26841,11 @@ pub async fn start_mount<P: AsRef<Path>>(
     }
 
     let mut options = MountOptions::default();
+    // The mount identifies itself: type `fuse.squeezefs` (the kernel's
+    // `subtype=`) with `squeezefs` as the source column, so `mount`,
+    // `df -T` and `/proc/mounts` say which filesystem this is instead of
+    // "some FUSE". `-o fsname=<name>` below overrides the name.
+    options.fs_name(MOUNT_FS_NAME);
     let is_root = unsafe { libc::getuid() } == 0;
     if is_root {
         options.uid(uid);

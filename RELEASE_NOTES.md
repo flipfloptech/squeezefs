@@ -1,6 +1,6 @@
 # SqueezeFS 1.2.1
 
-_Release date: (tag `stable-2026.09.1` pending the release gate)_
+_Release date: 2026-09-05 (tag `stable-2026.09.1`)_
 
 1.2.1 is a point release on the 1.2 train: two shutdown fixes, a mount that
 identifies itself, a corrected build-identity stamp on release artifacts,
@@ -54,6 +54,14 @@ bits, same volumes, same clients) and from 1.1 exactly as 1.2.0 does (see
   was being asserted); the executor park test awaits its third hook call;
   the live NVMe-reservation leg drives its I/O as `nvme io-passthru` so it
   runs on nvme-cli 1.x (EL8).
+
+**Verification.** Every leg of the release gate ran from zero on one
+commit (`ae4f27e8`) in one unattended chain — `task check` (4,626 cargo
+tests), fstests `-g auto` (198 ran, only the four documented by-design
+shapes), pjdfstests (8,798), LTP (1,884 / 0 / 0), require-mount — and the
+zc-capability leg passed on two sqz-series kernels (149/149, skip ledger
+empty, both). No fuzz re-run: nothing on disk or on the wire changed.
+Record: [.benchmarks/2026-09-05-1.2.1-release-gate.md](.benchmarks/2026-09-05-1.2.1-release-gate.md).
 
 The rest of this document is the 1.2.0 record, which 1.2.1 inherits.
 

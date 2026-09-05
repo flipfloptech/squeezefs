@@ -450,7 +450,7 @@ async fn test_read_straddling_eof_errors_instead_of_garbage_tail() {
 #[test]
 fn read_bounce_pool_routing_and_home_recycle() {
     use squeezefs::cache::pool::{
-        read_bounce_pool, ALIGNED_BUF_POOL, RANGED_BUF_POOL, RANGED_BUF_SIZE,
+        read_bounce_pool, zc_fill_pool, ALIGNED_BUF_POOL, RANGED_BUF_POOL, RANGED_BUF_SIZE,
     };
 
     // The gauges below are process-global: serialize against every test
@@ -463,7 +463,11 @@ fn read_bounce_pool_routing_and_home_recycle() {
         .get_or_init(|| tokio::sync::Mutex::new(()))
         .blocking_lock();
 
-    // Routing: sub-block windows ride the small pool; whole-block stays big.
+    // Routing: sub-block windows ride the small pool; whole-block windows
+    // ride the WHOLE-BLOCK pool — which is the fd-addressable zc fill pool
+    // when the R-4 fd-source serve is on (default since 2026-09-05) and the
+    // heap pool otherwise; the size-class law is the same either way.
+    let big: &std::sync::Arc<_> = zc_fill_pool().unwrap_or(&ALIGNED_BUF_POOL);
     assert!(std::sync::Arc::ptr_eq(
         read_bounce_pool(4096),
         &RANGED_BUF_POOL
@@ -474,29 +478,33 @@ fn read_bounce_pool_routing_and_home_recycle() {
     ));
     assert!(std::sync::Arc::ptr_eq(
         read_bounce_pool(RANGED_BUF_SIZE + 1),
-        &ALIGNED_BUF_POOL
+        big
     ));
     assert!(std::sync::Arc::ptr_eq(
         read_bounce_pool(4 * 1024 * 1024),
-        &ALIGNED_BUF_POOL
+        big
     ));
+    assert!(
+        !std::sync::Arc::ptr_eq(big, &RANGED_BUF_POOL),
+        "the whole-block pool is never the sub-block pool"
+    );
     assert_eq!(RANGED_BUF_POOL.buf_size(), RANGED_BUF_SIZE);
 
     // Home recycle: alloc from EACH pool, drop the Bytes owner, and the
     // idle byte count of BOTH pools must return exactly to its prior value
     // (small never leaks into big, big never leaks into small).
     let small_before = RANGED_BUF_POOL.allocated_bytes();
-    let big_before = ALIGNED_BUF_POOL.allocated_bytes();
+    let big_before = big.allocated_bytes();
     let (_p1, small_bytes) = RANGED_BUF_POOL.alloc();
-    let (_p2, big_bytes) = ALIGNED_BUF_POOL.alloc();
+    let (_p2, big_bytes) = big.alloc();
     assert_eq!(
         RANGED_BUF_POOL.allocated_bytes(),
         small_before - RANGED_BUF_SIZE as u64,
         "small alloc checks out of the small pool"
     );
     assert_eq!(
-        ALIGNED_BUF_POOL.allocated_bytes(),
-        big_before - ALIGNED_BUF_POOL.buf_size() as u64,
+        big.allocated_bytes(),
+        big_before - big.buf_size() as u64,
         "big alloc checks out of the big pool"
     );
     drop(small_bytes);
@@ -507,7 +515,7 @@ fn read_bounce_pool_routing_and_home_recycle() {
         "small backing must recycle into its HOME pool"
     );
     assert_eq!(
-        ALIGNED_BUF_POOL.allocated_bytes(),
+        big.allocated_bytes(),
         big_before,
         "big backing must recycle into its HOME pool"
     );

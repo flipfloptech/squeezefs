@@ -1,0 +1,7 @@
+mkdir ops=20000 wall_s=2.551 ops_s=7841
+create ops=100000 wall_s=14.296 ops_s=6995
+stat ops=100000 wall_s=0.210 ops_s=476422
+rename ops=100000 wall_s=18.384 ops_s=5440
+unlink ops=100000 wall_s=16.264 ops_s=6149
+manydirs ops=100000 wall_s=9.516 ops_s=10508
+rmdir ops=20000 wall_s=2.944 ops_s=6793

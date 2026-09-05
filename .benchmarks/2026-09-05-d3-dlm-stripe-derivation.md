@@ -1,8 +1,7 @@
 # D-3 — DLM stripe derivation (`perf/dlm-stripe-derivation`, e2e perf audit ladder row 9 / DLM board #4)
 
-**Status: mechanism landed, in-process rows measured, FIELD ROWS OWED** (see
-the last section — the parent campaign runs `tests/run_mdstorm.sh`; it needs
-root and a mount, which this box's shared posture does not permit here).
+**Status: LANDED — mechanism + in-process rows + the mdstorm field row (§7),
+A-B-B-A in both orders: collisions −76 %, 4a wait −58 %/op, throughput par.**
 
 ## 1. The finding
 
@@ -241,24 +240,41 @@ the same one-line change if a data-path row ever convicts them). The dead
   stripe at 576 in flight ⇒ ≈ 56 % → 3.5 % at 16,384). Those rows are the
   fleet rig's.
 
-## 7. Field rows — OWED (the parent runs these)
+## 7. Field row — mdstorm A-B-B-A, MEASURED 2026-09-05 (dev box, root)
 
-1. **`sudo tests/run_mdstorm.sh`, A-B-B-A, same binary**, on the field box:
-   A = `SQUEEZEFS_DLM_STRIPES=4096` (the shipped 4a width — NOT 1024: 1024
-   was never the 4a width, it is the waiter/serve tables'), B = unset
-   (derived; 16,384 on a 32-possible-CPU box). Columns per phase: ops/s;
-   from the `stats_*_{pre,post}.json` deltas `dlm_inode_stripe_collisions`,
-   `dlm_inode_key_waits`, `dlm_dentry_stripe_collisions`,
-   `dlm_dentry_key_waits`, `lock_phase_ns.dlm_guard_wait` (count, Σ, p99),
-   `lock_phase_ns.dlm_guard_hold` p99. The census delta must read
-   collisions ≈ (A − B) × 4 on the many-dirs phase; a row whose 4a census
-   did not move is not this lever's row. Run also at
-   `SQZ_MDSTORM_THREADS=64` (the board's 24–64 writers).
-2. **The fan-out shape** (`tests/mw_fleet.sh` / the D-1c rig, 8–24
-   co-writers × 24 streams, tcp devsub): the same A/B with the
-   `serve_ino_*` and `dlm_inode_*` census columns beside ingest GiB/s and
-   `meta_ship_publish` owner phases — the shape §6 predicts the width
-   matters for.
-3. A `SQUEEZEFS_DLM_STRIPES=1` leg on the storm as a crucible (everything
-   serializes on one stripe per class; correctness only — `lock_many`
-   dedupes, `fsck` clean).
+`sudo tests/run_mdstorm.sh leg` ×4, same binary (`d551f1ba`, release —
+the five-campaign stack), `SQZ_MDSTORM_THREADS=64`, `/dev/shm` substrate
+(fresh format per leg), **A = `SQUEEZEFS_DLM_STRIPES=4096` (the shipped 4a
+width) / B = derived (16,384 at 32 possible CPUs × q_depth 32)**, order A B
+B A. Load 8 at A1 (cold start), 30–37 for the other three — A1 is the cold
+leg on every phase and is read as such. Analyzer
+`.benchmarks/rigs/2026-09-05-d3-mdstorm-analyze.py`; artifacts
+`.benchmarks/rows-d3-mdstorm-20260905/`.
+
+| leg | width | rename/s | unlink/s | create/s | manydirs/s | 4a collisions/op | 4a key waits/op | `dlm_guard_wait` µs/op | Σ 4a wait |
+|---|---|---|---|---|---|---|---|---|---|
+| A1 | 4,096 | 5,440 | 6,149 | 6,995 | 10,508 | **0.01987** | 0.01672 | **67.5** | 36.4 s |
+| B1 | 16,384 | 6,355 | 7,138 | 8,146 | 10,903 | **0.00477** | 0.01466 | **28.8** | 15.6 s |
+| B2 | 16,384 | 6,243 | 7,200 | 8,210 | 11,212 | **0.00483** | 0.01489 | **27.9** | 15.0 s |
+| A2 | 4,096 | 6,221 | 7,254 | 8,375 | 10,777 | **0.02041** | 0.01682 | **67.8** | 36.6 s |
+
+`serve_ino`, `inode_meta`, `block_flush`, `lease_waiter` collisions: 0 on
+every leg (the storm is a metadata row — the board's suspects stay
+acquitted here). 540,000 ops per leg; every leg's row was clean.
+
+**Verdict — LANDS (derivation law).** The mechanism removes exactly what
+it claims, in both orders: 4a false-sharing collisions **−76 %** (the 4×
+width ratio, to the third digit), the 4a guard wait **−58 %** per op
+(67 → 28 µs), key waits −12 % (the fan-out ack-after-drop fix). Throughput
+is **par**: against the clean A2 leg the B legs are within ±2 % on every
+phase (rename +2 %/+0.4 %, unlink −1.6 %/−0.7 %, create −2.7 %/−2.0 %,
+manydirs +1.2 %/+4 %) — the 4a wait is < 1 % of this venue's ~10 ms/op
+storm budget, so its removal cannot show in ops/s here; the note's
+in-process rows already said so. What lands is the derivation (a free
+4096 replaced by `next_pow2(max(shipped, 16 × possible_cpus × q_depth))`,
+2.6 MiB per volume at the field's 32 × 32), the always-on census, and the
+fan-out fix; `SQUEEZEFS_DLM_STRIPES` stays the explicit override / A-B
+lever. The fan-out rig row (24 co-writers × 24 streams — where the
+in-process census predicts 4a ≈ 14 % and the 1024-way serve stripe ≈ 56 %
+collisions at shipped widths) stays owed to a fleet session; the storm
+row is the campaign's acceptance.

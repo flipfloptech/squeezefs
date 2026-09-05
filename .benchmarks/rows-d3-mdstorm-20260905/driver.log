@@ -1,0 +1,37 @@
+== leg A1 DLM_STRIPES=4096 14:17:23 load=8.45
+[mdstorm] leg A1 (clean):
+  [A1] mkdir ops=20000 wall_s=2.551 ops_s=7841
+  [A1] create ops=100000 wall_s=14.296 ops_s=6995
+  [A1] stat ops=100000 wall_s=0.210 ops_s=476422
+  [A1] rename ops=100000 wall_s=18.384 ops_s=5440
+  [A1] unlink ops=100000 wall_s=16.264 ops_s=6149
+  [A1] manydirs ops=100000 wall_s=9.516 ops_s=10508
+  [A1] rmdir ops=20000 wall_s=2.944 ops_s=6793
+== leg B1 DLM_STRIPES=derived 14:20:09 load=36.70
+[mdstorm] leg B1 (clean):
+  [B1] mkdir ops=20000 wall_s=2.279 ops_s=8778
+  [B1] create ops=100000 wall_s=12.275 ops_s=8146
+  [B1] stat ops=100000 wall_s=0.207 ops_s=483875
+  [B1] rename ops=100000 wall_s=15.736 ops_s=6355
+  [B1] unlink ops=100000 wall_s=14.010 ops_s=7138
+  [B1] manydirs ops=100000 wall_s=9.172 ops_s=10903
+  [B1] rmdir ops=20000 wall_s=2.597 ops_s=7701
+== leg B2 DLM_STRIPES=derived 14:24:16 load=30.29
+[mdstorm] leg B2 (clean):
+  [B2] mkdir ops=20000 wall_s=2.220 ops_s=9009
+  [B2] create ops=100000 wall_s=12.180 ops_s=8210
+  [B2] stat ops=100000 wall_s=0.204 ops_s=491142
+  [B2] rename ops=100000 wall_s=16.019 ops_s=6243
+  [B2] unlink ops=100000 wall_s=13.889 ops_s=7200
+  [B2] manydirs ops=100000 wall_s=8.919 ops_s=11212
+  [B2] rmdir ops=20000 wall_s=2.550 ops_s=7843
+== leg A2 DLM_STRIPES=4096 14:28:04 load=30.87
+[mdstorm] leg A2 (clean):
+  [A2] mkdir ops=20000 wall_s=2.184 ops_s=9158
+  [A2] create ops=100000 wall_s=11.940 ops_s=8375
+  [A2] stat ops=100000 wall_s=0.206 ops_s=484541
+  [A2] rename ops=100000 wall_s=16.075 ops_s=6221
+  [A2] unlink ops=100000 wall_s=13.785 ops_s=7254
+  [A2] manydirs ops=100000 wall_s=9.279 ops_s=10777
+  [A2] rmdir ops=20000 wall_s=2.461 ops_s=8126
+== done 14:32:01

@@ -413,7 +413,12 @@ fn documented_defaults_match_the_shipped_ones() {
         ("SQUEEZEFS_INODE_RECLAIM_BATCH", "64"),
         ("SQUEEZEFS_INODE_RECLAIM_WINDOW_MS", "20"),
         ("SQUEEZEFS_RECLAIM_BATCH_BLOCKS", "64"),
-        ("SQUEEZEFS_RECLAIM_CAP_PARK_MS", "1000"),
+        // 1000 -> derived (W-4, 2026-09-05, e2e perf audit ladder row 14):
+        // the at-cap park bound derives from the drain's measured room
+        // latency, clamped 50..1000 — the shipped 1,000 ms stays its
+        // ceiling. An intentional counted derivation, not convention
+        // drift; `tests/derivation_sweep_tests.rs` ties the arithmetic.
+        ("SQUEEZEFS_RECLAIM_CAP_PARK_MS", "derived (50..1000)"),
         ("SQUEEZEFS_IPC_IDLE_SECS", "300"),
         // "0" -> adaptive: the 2026-08-14 client-topology governor
         // (absent = derived window; explicit values incl. 0 verbatim) —

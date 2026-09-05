@@ -160,10 +160,10 @@ pub static KNOBS: &[Knob] = &[
     // -- Block reclaim (device deallocation) -----------------------------
     k("SQUEEZEFS_RECLAIM_BATCH_BLOCKS", int(1, 1024), "64", "Background block-reclaim drain batch, blocks."),
     k("SQUEEZEFS_RECLAIM_BATCH_MS", int(0, MS_MAX), "2", "Background block-reclaim batch-accumulation window, ms."),
-    k("SQUEEZEFS_RECLAIM_QUEUE_MAX_BLOCKS", int(1, 1 << 20), "4096", "Block-reclaim queue cap; at-cap enqueues park (park-don't-spill)."),
+    k("SQUEEZEFS_RECLAIM_QUEUE_MAX_BLOCKS", int(1, 1 << 20), "derived (floor 4096)", "Block-reclaim deferred-space cap, blocks (queued + in-flight); at-cap enqueues park (park-don't-spill). W-4 derived default: clamp(measured displacement rate × the drain's room latency, 4096 = the shipped floor, budget/1024 ÷ per-entry RAM); explicit value wins verbatim (4096 = the A/B lever)."),
     k("SQUEEZEFS_RECLAIM_LANES_PER_DEV", int(1, 64), "32", "Parallel reclaim drain lanes per device."),
     k("SQUEEZEFS_ALLOC_LANE_RESERVE_BLOCKS", int(0, 1 << 32), "derived", "Fresh blocks one durable data-plane allocation-lane reservation covers (DLM S9 blocker #3). Derived from the write pipeline's cold window (FLOOR_BLOCKS_PER_LANE × HEADROOM × cpus), floored at the 8-lane cold aggregate and capped at 1/64 of a lane share; 0 = derived, 1 = a commit per fresh block (the pathological A/B control). Inert on every unpartitioned (single-writer) mount."),
-    k("SQUEEZEFS_RECLAIM_CAP_PARK_MS", int(0, 60_000), "1000", "At-cap reclaim enqueue park bound, ms, before soft overflow."),
+    k("SQUEEZEFS_RECLAIM_CAP_PARK_MS", int(0, 60_000), "derived (50..1000)", "At-cap reclaim enqueue park bound, ms, before soft overflow — the safety bound only: the park ends on the drain's room-made edge. W-4 derived default: clamp(4 × batch_blocks ÷ measured drain rate, 50 ms manners tick, 1000 ms = the shipped constant, never longer); explicit value wins verbatim (1000 = the A/B lever, 0 = never park)."),
     k("SQUEEZEFS_DISCARD_ELISION", Kind::Bool, "on", "Elide discards for blocks a rewrite is about to overwrite; 0 = the A/B control."),
     // -- Inode reclaim (ENG-10 rename: the old spellings collided with the
     //    block-reclaim family above, `SQUEEZEFS_RECLAIM_BATCH` being a

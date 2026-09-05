@@ -100,28 +100,73 @@
 //!   device commands from the enqueue context** (the retired inline
 //!   arm charged a measured ~12–22 ms synchronous fabric round-trip to
 //!   the write path — and ran it ON the tpc handler lane). It PARKS
-//!   (async, 5 ms ticks) until the drain relieves the cap, bounded by
-//!   `SQUEEZEFS_RECLAIM_CAP_PARK_MS` (default 1000, clamp 0..=60000;
-//!   `0` = never park); a bound expiry soft-overflows the entry into
-//!   the queue (counted `block_free_reclaim_cap_overflow` — RAM-bounded
-//!   growth, conservation preserved by the valve/unmount/idle drains).
+//!   until the drain relieves the cap, bounded by
+//!   `SQUEEZEFS_RECLAIM_CAP_PARK_MS` (`0` = never park); a bound expiry
+//!   soft-overflows the entry into the queue (counted
+//!   `block_free_reclaim_cap_overflow` — RAM-bounded growth,
+//!   conservation preserved by the valve/unmount/idle drains).
 //!   Engagement gauges: `block_free_reclaim_cap_parks` (parked
 //!   enqueues) and `block_free_reclaim_cap_overflow` (bound expiries —
-//!   ≈ 0 in steady state).
+//!   ≈ 0 while the drain keeps pace; the NORM when displacement outruns
+//!   the target's deallocate service, each costing the write path
+//!   exactly one derived bound).
+//!
+//! * **The park is EVENT-DRIVEN and both liveness constants DERIVE**
+//!   (W-4, e2e perf audit ladder row 14 —
+//!   `.benchmarks/2026-09-05-w4-reclaim-derivation.md`; contracts
+//!   14–16). The 2026-09-01 rewrite rows read the 1,000 ms quantum
+//!   straight off the tail (p99.9 893 ms / max 3.08 s): a parked
+//!   producer holds its write-pipeline permit, so the park bound WAS the
+//!   pipeline's service time in the pinned regime. Now:
+//!
+//!   - **Population = queued + in-flight.** The cap governs the honest
+//!     deferred-space count (`queue_bytes` always gauged exactly that);
+//!     a pop opens no room — a reclaimed range does.
+//!   - **Room edges per coalesced range**: `process_entries` issues one
+//!     device command, `finish_free`s its blocks, and wakes parked
+//!     producers (`room.notify_waiters`, registration-before-recheck —
+//!     the write pipeline's PERF-13 discipline). Under target-bound load
+//!     room flows continuously at the drain rate instead of in
+//!     pass-sized bursts. An at-cap park also wakes a manners-deferred
+//!     worker immediately (`cap_wake`), so the 50 ms tick never sits in
+//!     a park.
+//!   - **The bound derives from the drain's measured room latency**:
+//!     `room_ms = batch_blocks ÷ drain_rate` (an EWMA of blocks
+//!     `finish_free`d per second, `block_free_reclaim_drain_rate`);
+//!     `bound = clamp(4 × room_ms, 50 ms, 1000 ms)` — see
+//!     [`derived_park_bound_ms`]. Fleet under load (~1,800 blocks/s):
+//!     140 ms. Cold = the shipped 1 s.
+//!   - **The cap derives from displacement × room latency**:
+//!     `cap = clamp(arrival_rate × room_ms, 4096, ram_ceiling)` — the
+//!     blocks the write side displaces while the drain makes one batch
+//!     of room (the buffer a keeping-pace drain needs so producers
+//!     never park); see [`derived_queue_cap_blocks`]. The arrival rate
+//!     is the queue's own enqueue rate sampled by the worker (never a
+//!     clock on the enqueue path), peak-held with the write pipeline's
+//!     `rolled_bw_peak` law; before the first sample it is the write
+//!     pipeline's BDP peak in blocks (`set_displacement_seed`).
+//!   - Gauges: `block_free_reclaim_{drain_rate,arrival_rate}` (blocks/s),
+//!     `block_free_reclaim_queue_cap`, `block_free_reclaim_park_bound_ms`
+//!     (the live derived-or-pinned values — the operator can check the
+//!     arithmetic), `block_free_reclaim_park_tick_wakes` (parks resumed
+//!     by the liveness tick instead of an edge — ≈ 0 while room flows,
+//!     the PERF-13 lost-wake tripwire).
 //!
 //! Knobs (read at queue construction — i.e. per `BackendRouter`):
 //! `SQUEEZEFS_RECLAIM_BATCH_BLOCKS` (max entries per worker batch,
 //! default 64, clamp 1..=1024), `SQUEEZEFS_RECLAIM_BATCH_MS`
 //! (accumulation window after first wake, default 2, clamp 0..=600000 —
 //! large values park the worker, used by tests),
-//! `SQUEEZEFS_RECLAIM_QUEUE_MAX_BLOCKS` (the deferred-space budget,
-//! default 4096; an enqueue past the cap PARKS — see park-don't-spill),
-//! `SQUEEZEFS_RECLAIM_CAP_PARK_MS` (park liveness bound, default 1000),
-//! and `SQUEEZEFS_RECLAIM_LANES_PER_DEV` (per-device parallel-drain
-//! lane cap, default 32, clamp 1..=64 — engaged only on idle-fabric
-//! catch-up drains since the manners law; the field width experiment
-//! measured idle drain 2,700 → 5,900 cmd/s from 8 → 32 lanes/device,
-//! and NO width sensitivity under foreground load).
+//! `SQUEEZEFS_RECLAIM_QUEUE_MAX_BLOCKS` (explicit override of the DERIVED
+//! deferred-space budget — floor 4096; an enqueue past the cap PARKS —
+//! see park-don't-spill), `SQUEEZEFS_RECLAIM_CAP_PARK_MS` (explicit
+//! override of the DERIVED park bound — `1000` restores the shipped
+//! constant, the A/B lever), and `SQUEEZEFS_RECLAIM_LANES_PER_DEV`
+//! (per-device parallel-drain lane cap, default 32, clamp 1..=64 —
+//! engaged only on idle-fabric catch-up drains since the manners law;
+//! the field width experiment measured idle drain 2,700 → 5,900 cmd/s
+//! from 8 → 32 lanes/device, and NO width sensitivity under foreground
+//! load).
 
 use crate::block_allocator::{BlockAllocator, InflightAllocGuard};
 use crate::fuse_client::METRICS;
@@ -137,6 +182,142 @@ fn env_u64(key: &str, default: u64, lo: u64, hi: u64) -> u64 {
         .unwrap_or(default)
         .clamp(lo, hi)
 }
+
+// ---------------------------------------------------------------------------
+// W-4 — the reclaim derivation (e2e perf audit ladder row 14; write-wall
+// OQ-5 discharged). Pure functions, tied in tests/derivation_sweep_tests.rs.
+// ---------------------------------------------------------------------------
+
+/// The manners tick: the worker's deferred-drain re-evaluation cadence
+/// (its coarsest scheduling quantum) and the park bound's floor.
+pub const MANNERS_TICK_MS: u64 = 50;
+
+/// Queue-cap floor = the shipped 4,096-block posture (never regress below).
+pub const QUEUE_CAP_FLOOR_BLOCKS: u64 = 4096;
+
+/// The registry's admissible maximum for the cap (`src/env_knobs.rs`):
+/// the derived ceiling never exceeds what an operator may set.
+pub const QUEUE_CAP_REGISTRY_MAX_BLOCKS: u64 = 1 << 20;
+
+/// The R5 budget share the queue's ENTRIES may hold: budget/1024. Entries
+/// are bookkeeping only (the deferred bytes live on the device, gauged as
+/// `queue_bytes`), so a 0.1 % share is negligible against every gauged
+/// data component by construction and never worth an R5 component of its
+/// own.
+pub const QUEUE_RAM_SHARE_DIVISOR: u64 = 1024;
+
+/// Park-bound floor = one manners tick: the at-cap wake short-circuits
+/// the tick, but a bound below the worker's guaranteed cadence could
+/// trip on a healthy worker whose wake sat behind a saturated blocking
+/// pool.
+pub const PARK_BOUND_FLOOR_MS: u64 = MANNERS_TICK_MS;
+
+/// Park-bound ceiling = the shipped 1,000 ms constant: the derived bound
+/// never parks a producer LONGER than the shipped posture did, and it is
+/// the cold (no drain measured yet) value.
+pub const PARK_BOUND_CEILING_MS: u64 = 1000;
+
+/// The bound is this many batches' worth of room latency: a producer that
+/// saw no room edge in four batch-times is waiting on a STALLED drain,
+/// not a slow one (room is made per coalesced range, so a live drain at
+/// ANY rate frees a batch within one batch-time), and soft overflow is
+/// then the right answer.
+pub const PARK_BOUND_BATCHES: u64 = 4;
+
+/// Per-entry RAM the cap's ceiling prices: the entry itself plus the
+/// device-path heap (`/dev/nvmeXnY`-class, one small allocation) and the
+/// `SegQueue` slot pointer.
+pub fn reclaim_entry_ram_bytes() -> u64 {
+    (std::mem::size_of::<ReclaimEntry>() + 32 + std::mem::size_of::<usize>()) as u64
+}
+
+/// The drain's ROOM LATENCY: the time the reclaimer needs to free one
+/// batch of queue slots at its measured aggregate drain rate
+/// (`batch_blocks ÷ drain_rate`). Width-blind by construction — under
+/// target-bound load the aggregate rate is what the target delivers at
+/// any client width (write-wall §6.2 E2), so it never inflates with the
+/// lane count the way a per-lane wall does. Cold (`drain_rate == 0`) =
+/// the shipped 1 s park bound — the assumption that constant encoded.
+pub fn room_latency_ms(batch_blocks: u64, drain_rate_bps: u64) -> u64 {
+    if drain_rate_bps == 0 {
+        return PARK_BOUND_CEILING_MS;
+    }
+    (batch_blocks.saturating_mul(1000) / drain_rate_bps).max(1)
+}
+
+/// `SQUEEZEFS_RECLAIM_CAP_PARK_MS` derived default:
+/// `clamp(PARK_BOUND_BATCHES × room_latency, floor, ceiling)`.
+pub fn derived_park_bound_ms(room_latency_ms: u64) -> u64 {
+    room_latency_ms
+        .saturating_mul(PARK_BOUND_BATCHES)
+        .clamp(PARK_BOUND_FLOOR_MS, PARK_BOUND_CEILING_MS)
+}
+
+/// The cap's RAM ceiling: `budget / QUEUE_RAM_SHARE_DIVISOR ÷ per-entry
+/// RAM`, floored at the shipped cap (a tiny/unknown budget never shrinks
+/// the shipped posture) and capped at the registry maximum.
+pub fn queue_cap_ceiling_blocks(budget_bytes: u64) -> u64 {
+    (budget_bytes / QUEUE_RAM_SHARE_DIVISOR / reclaim_entry_ram_bytes().max(1))
+        .clamp(QUEUE_CAP_FLOOR_BLOCKS, QUEUE_CAP_REGISTRY_MAX_BLOCKS)
+}
+
+/// `SQUEEZEFS_RECLAIM_QUEUE_MAX_BLOCKS` derived default: the blocks the
+/// write side displaces while the drain makes one batch of room —
+/// `clamp(displacement_rate × room_latency, floor, ram_ceiling)` (u128
+/// intermediate: a runaway rate must clamp, never wrap).
+pub fn derived_queue_cap_blocks(
+    displacement_rate_bps: u64,
+    room_latency_ms: u64,
+    budget_bytes: u64,
+) -> u64 {
+    let raw = (displacement_rate_bps as u128 * room_latency_ms as u128 / 1000).min(u64::MAX as u128)
+        as u64;
+    raw.clamp(
+        QUEUE_CAP_FLOOR_BLOCKS,
+        queue_cap_ceiling_blocks(budget_bytes),
+    )
+}
+
+/// An explicit `SQUEEZEFS_RECLAIM_QUEUE_MAX_BLOCKS` inside the registry
+/// range; absent/malformed/out-of-range ⇒ `None` (the startup gate
+/// refuses the latter before a mount; in-process this is the
+/// library-embedding/test path).
+fn explicit_queue_cap_blocks(env: Option<&str>) -> Option<u64> {
+    env.and_then(|s| s.trim().parse::<u64>().ok())
+        .filter(|v| (1..=QUEUE_CAP_REGISTRY_MAX_BLOCKS).contains(v))
+}
+
+/// Explicit knob wins verbatim over `derived` (the ipc-cap precedence law).
+pub fn resolve_queue_cap_blocks(env: Option<&str>, derived: u64) -> u64 {
+    explicit_queue_cap_blocks(env).unwrap_or(derived)
+}
+
+/// An explicit `SQUEEZEFS_RECLAIM_CAP_PARK_MS` inside the registry range
+/// (`0` = never park is a valid explicit posture).
+fn explicit_park_bound_ms(env: Option<&str>) -> Option<u64> {
+    env.and_then(|s| s.trim().parse::<u64>().ok())
+        .filter(|v| *v <= 60_000)
+}
+
+/// Explicit knob wins verbatim over `derived`.
+pub fn resolve_park_bound_ms(env: Option<&str>, derived: u64) -> u64 {
+    explicit_park_bound_ms(env).unwrap_or(derived)
+}
+
+/// Coarse monotonic milliseconds since process start (the rate windows'
+/// clock — the write pipeline's `coarse_ms` shape).
+fn coarse_ms() -> u64 {
+    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    START
+        .get_or_init(std::time::Instant::now)
+        .elapsed()
+        .as_millis() as u64
+}
+
+/// Drain-rate EWMA window (ms): the write pipeline's `WINDOW_MS` scale —
+/// two orders above a device command, small enough to re-learn a target
+/// that slowed under load within a few windows.
+const DRAIN_RATE_WINDOW_MS: u64 = 250;
 
 // ---------------------------------------------------------------------------
 // Idea 4 — discard elision until pressure (rewrite program P0,
@@ -597,14 +778,55 @@ pub struct ReclaimQueue {
 
     batch_blocks: u64,
     batch_ms: u64,
-    max_queued: u64,
+    /// The live deferred-space cap in blocks (queued + in-flight) —
+    /// derived by the worker ([`derived_queue_cap_blocks`]) unless
+    /// `cap_pinned`. Read at every enqueue (one relaxed load).
+    cap_blocks: AtomicU64,
+    /// `SQUEEZEFS_RECLAIM_QUEUE_MAX_BLOCKS` was set: the cap is the
+    /// operator's verbatim, never re-derived.
+    cap_pinned: bool,
     /// Per-device parallel-drain lane cap (see module docs, demand-derived
     /// parallel drain). Width in use = Σ over devices of
     /// min(ceil(device demand / batch_blocks), this) — and 1 under
     /// foreground device I/O (the manners law).
     lanes_per_dev: u64,
-    /// Park liveness bound for at-cap enqueues (ms; see park-don't-spill).
-    cap_park_ms: u64,
+    /// The live park bound for at-cap enqueues (ms) — derived from the
+    /// drain's measured room latency ([`derived_park_bound_ms`]) unless
+    /// `park_pinned`; `0` = never park (immediate soft overflow).
+    park_bound_ms: AtomicU64,
+    /// `SQUEEZEFS_RECLAIM_CAP_PARK_MS` was set: verbatim, never re-derived.
+    park_pinned: bool,
+    /// The room-made edge: parked at-cap producers wait here and every
+    /// population decrement (a reclaimed range's `finish_free`, a batch
+    /// guard's unwind, a cap raise, the fence latch) wakes them all —
+    /// they re-check `population() < cap` under the PERF-13
+    /// registration-before-recheck order.
+    room: squeezefs_ipc::sqz_notify::Notify,
+    /// An at-cap park pulls a manners-DEFERRED worker out of its 50 ms
+    /// tick immediately (at cap the law drains regardless of foreground;
+    /// the tick must never sit inside a park). Signalled ONLY by the park
+    /// path — a per-enqueue signal would re-evaluate manners 19k×/s.
+    cap_wake: squeezefs_ipc::sqz_notify::Notify,
+    /// Entries ever enqueued on THIS queue (the arrival-rate sample the
+    /// worker differences — one relaxed add on the enqueue path, no
+    /// clock).
+    arrivals: AtomicU64,
+    /// The worker's previous arrival sample: `(arrivals, coarse_ms)`.
+    arr_sample: AtomicU64,
+    arr_sample_ms: AtomicU64,
+    /// Peak-held arrival rate, blocks/s (`rolled_bw_peak`'s law: the
+    /// windowed rate or the previous peak decayed by ⅛ — a storm
+    /// registers on its first window, a lull relaxes the cap over ~8).
+    arrival_rate: AtomicU64,
+    /// Drain-rate EWMA, blocks `finish_free`d per second, rolled on a
+    /// [`DRAIN_RATE_WINDOW_MS`] window at the room edge.
+    drain_rate: AtomicU64,
+    drain_win_start_ms: AtomicU64,
+    drain_win_blocks: AtomicU64,
+    /// The write pipeline's BDP peak in blocks/s — the displacement-rate
+    /// SEED before the first arrival sample (an upper bound: fresh writes
+    /// displace nothing). Wired by the mount; bare routers seed 0.
+    displacement_seed: std::sync::OnceLock<Arc<dyn Fn() -> u64 + Send + Sync>>,
     /// Foreground device-activity signal (a monotonic device-byte/op
     /// sum; ANY advance between worker passes = foreground active).
     /// Defaults to the METRICS device-plane sum; injectable for tests.
@@ -620,7 +842,30 @@ pub struct ReclaimQueue {
 
 impl ReclaimQueue {
     pub fn from_env() -> Arc<Self> {
-        Arc::new(Self {
+        let batch_blocks = env_u64("SQUEEZEFS_RECLAIM_BATCH_BLOCKS", 64, 1, 1024);
+        // Cold derivations: the shipped constants exactly (no drain
+        // measured, nothing displacing) — the worker re-derives from its
+        // first sample on. An explicit knob pins its value verbatim.
+        let cap_explicit = explicit_queue_cap_blocks(
+            std::env::var("SQUEEZEFS_RECLAIM_QUEUE_MAX_BLOCKS")
+                .ok()
+                .as_deref(),
+        );
+        let cap_blocks = cap_explicit.unwrap_or_else(|| {
+            derived_queue_cap_blocks(
+                0,
+                room_latency_ms(batch_blocks, 0),
+                crate::mem_budget::MEM_BUDGET.budget_bytes(),
+            )
+        });
+        let park_explicit = explicit_park_bound_ms(
+            std::env::var("SQUEEZEFS_RECLAIM_CAP_PARK_MS")
+                .ok()
+                .as_deref(),
+        );
+        let park_bound_ms = park_explicit
+            .unwrap_or_else(|| derived_park_bound_ms(room_latency_ms(batch_blocks, 0)));
+        let q = Arc::new(Self {
             q: crossbeam::queue::SegQueue::new(),
             len: AtomicU64::new(0),
             supply: scc::HashMap::new(),
@@ -635,24 +880,165 @@ impl ReclaimQueue {
             // batch 64 blocks / 2 ms = the shipped coalesce shape of the
             // async-reclaim campaign (`.benchmarks/2026-07-27-async-block-
             // reclaim.md` — blocks ÷ `commands` is the live factor).
-            batch_blocks: env_u64("SQUEEZEFS_RECLAIM_BATCH_BLOCKS", 64, 1, 1024),
+            batch_blocks,
             batch_ms: env_u64("SQUEEZEFS_RECLAIM_BATCH_MS", 2, 0, 600_000),
-            // 4096 = the deferred thin-space budget the write-wall rows ran
-            // (`.benchmarks/2026-07-31-write-wall.md`); the filed derivation
-            // thesis is aggregate data capacity (thin-space debt, not RAM)
-            // — pending its queue-cap sweep, the measured constant stands.
-            max_queued: env_u64("SQUEEZEFS_RECLAIM_QUEUE_MAX_BLOCKS", 4096, 1, 1 << 20),
+            cap_blocks: AtomicU64::new(cap_blocks),
+            cap_pinned: cap_explicit.is_some(),
             // 32 lanes = the write-wall width experiment's verdict (idle
             // drain 2,700 → 5,900 cmd/s from 8 → 32 lanes/device; NO width
             // sensitivity under foreground load — module doc, ibid.).
             lanes_per_dev: env_u64("SQUEEZEFS_RECLAIM_LANES_PER_DEV", 32, 1, 64),
-            // 1 s park bound = the park-don't-spill liveness horizon
-            // (write-wall iteration 1 — time horizon, not a resource cap).
-            cap_park_ms: env_u64("SQUEEZEFS_RECLAIM_CAP_PARK_MS", 1000, 0, 60_000),
+            park_bound_ms: AtomicU64::new(park_bound_ms),
+            park_pinned: park_explicit.is_some(),
+            room: squeezefs_ipc::sqz_notify::Notify::new(),
+            cap_wake: squeezefs_ipc::sqz_notify::Notify::new(),
+            arrivals: AtomicU64::new(0),
+            arr_sample: AtomicU64::new(0),
+            arr_sample_ms: AtomicU64::new(0),
+            arrival_rate: AtomicU64::new(0),
+            drain_rate: AtomicU64::new(0),
+            drain_win_start_ms: AtomicU64::new(0),
+            drain_win_blocks: AtomicU64::new(0),
+            displacement_seed: std::sync::OnceLock::new(),
             fg_signal: std::sync::OnceLock::new(),
             fg_last: AtomicU64::new(0),
             test_stall_ms: env_u64("SQUEEZEFS_TEST_RECLAIM_STALL_MS", 0, 0, 600_000),
-        })
+        });
+        q.publish_derived_gauges();
+        q
+    }
+
+    /// Wire the write pipeline's BDP peak (blocks/s) as the displacement
+    /// seed the cap derivation uses before the queue has measured its own
+    /// arrivals. Set once at mount; later calls are no-ops.
+    pub fn set_displacement_seed(&self, seed: Arc<dyn Fn() -> u64 + Send + Sync>) {
+        let _ = self.displacement_seed.set(seed);
+    }
+
+    /// Queued + in-flight — the population the cap governs (the honest
+    /// deferred-space count; `queue_bytes` gauges exactly this in bytes).
+    fn population(&self) -> u64 {
+        self.len
+            .load(Ordering::Acquire)
+            .saturating_add(self.processing.load(Ordering::Acquire))
+    }
+
+    /// The live cap (tests / stats).
+    pub fn queue_cap_blocks(&self) -> u64 {
+        self.cap_blocks.load(Ordering::Relaxed)
+    }
+
+    /// The live park bound (tests / stats).
+    pub fn park_bound_ms(&self) -> u64 {
+        self.park_bound_ms.load(Ordering::Relaxed)
+    }
+
+    /// The room-made edge (see the `room` field): every population
+    /// decrement — and every cap raise — passes here.
+    fn room_made(&self) {
+        self.room.notify_waiters();
+    }
+
+    /// Fold `blocks` just `finish_free`d into the drain-rate window; on a
+    /// window roll, re-derive the park bound (and the cap, whose room
+    /// latency moved). One clock read per coalesced range — never per
+    /// block, never on the enqueue path.
+    fn note_drained(&self, blocks: u64) {
+        self.drain_win_blocks.fetch_add(blocks, Ordering::Relaxed);
+        let now = coarse_ms().max(1);
+        let ws = self.drain_win_start_ms.load(Ordering::Relaxed);
+        if ws == 0 {
+            let _ = self.drain_win_start_ms.compare_exchange(
+                0,
+                now,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            );
+            return;
+        }
+        let elapsed = now.saturating_sub(ws);
+        if elapsed >= DRAIN_RATE_WINDOW_MS
+            && self
+                .drain_win_start_ms
+                .compare_exchange(ws, now, Ordering::AcqRel, Ordering::Relaxed)
+                .is_ok()
+        {
+            // This thread rolls the window: EWMA α = ¼ (windows are
+            // coarse; a target that slowed under load re-learns in a few).
+            let wb = self.drain_win_blocks.swap(0, Ordering::Relaxed);
+            let rate = wb.saturating_mul(1000) / elapsed.max(1);
+            let prev = self.drain_rate.load(Ordering::Relaxed);
+            let ewma = if prev == 0 {
+                rate
+            } else {
+                prev - prev / 4 + rate / 4
+            };
+            self.drain_rate.store(ewma, Ordering::Relaxed);
+            self.rederive();
+        }
+    }
+
+    /// The worker's arrival sample (once per inner-loop iteration —
+    /// deferral ticks and passes alike): the enqueue rate over the
+    /// interval since the previous sample, peak-held.
+    fn sample_arrivals(&self) {
+        let now = coarse_ms().max(1);
+        let arrivals = self.arrivals.load(Ordering::Relaxed);
+        let prev_ms = self.arr_sample_ms.swap(now, Ordering::AcqRel);
+        let prev = self.arr_sample.swap(arrivals, Ordering::AcqRel);
+        if prev_ms == 0 {
+            return; // first sample anchors the window
+        }
+        let elapsed = now.saturating_sub(prev_ms).max(1);
+        let peak = crate::write_pipeline::rolled_bw_peak(
+            self.arrival_rate.load(Ordering::Relaxed),
+            arrivals.saturating_sub(prev),
+            elapsed,
+        );
+        self.arrival_rate.store(peak, Ordering::Relaxed);
+        self.rederive();
+    }
+
+    /// Re-derive the live cap and park bound from the current measurements
+    /// (pinned knobs stay verbatim) and publish the gauges. A cap RAISE is
+    /// a room edge.
+    fn rederive(&self) {
+        let room = room_latency_ms(self.batch_blocks, self.drain_rate.load(Ordering::Relaxed));
+        if !self.park_pinned {
+            self.park_bound_ms
+                .store(derived_park_bound_ms(room), Ordering::Relaxed);
+        }
+        if !self.cap_pinned {
+            let measured = self.arrival_rate.load(Ordering::Relaxed);
+            let rate = if measured > 0 {
+                measured
+            } else {
+                self.displacement_seed.get().map(|f| f()).unwrap_or(0)
+            };
+            let cap =
+                derived_queue_cap_blocks(rate, room, crate::mem_budget::MEM_BUDGET.budget_bytes());
+            let prev = self.cap_blocks.swap(cap, Ordering::AcqRel);
+            if cap > prev {
+                self.room_made();
+            }
+        }
+        self.publish_derived_gauges();
+    }
+
+    fn publish_derived_gauges(&self) {
+        METRICS
+            .block_free_reclaim_drain_rate
+            .store(self.drain_rate.load(Ordering::Relaxed), Ordering::Relaxed);
+        METRICS
+            .block_free_reclaim_arrival_rate
+            .store(self.arrival_rate.load(Ordering::Relaxed), Ordering::Relaxed);
+        METRICS
+            .block_free_reclaim_queue_cap
+            .store(self.cap_blocks.load(Ordering::Relaxed), Ordering::Relaxed);
+        METRICS.block_free_reclaim_park_bound_ms.store(
+            self.park_bound_ms.load(Ordering::Relaxed),
+            Ordering::Relaxed,
+        );
     }
 
     /// Wire the writer-guard fence probe (see the field doc). Set once at
@@ -682,6 +1068,9 @@ impl ReclaimQueue {
                      accounting (un-returned thin space, re-covered on reuse; counted in \
                      block_free_reclaim_fence_halts)"
                 );
+                // Parked producers break on the fence (their re-check
+                // reads `fence_halted`) — the latch is a room edge.
+                self.room_made();
             }
             return true;
         }
@@ -701,6 +1090,7 @@ impl ReclaimQueue {
     /// (`BackendRouter::reclaim_cease`).
     pub fn halt_device_reclaims(&self) {
         self.halted.store(true, Ordering::Release);
+        self.room_made();
     }
 
     /// Queue one terminal free's reclaim. Past the deferred-space cap the
@@ -761,29 +1151,9 @@ impl ReclaimQueue {
         METRICS
             .block_free_reclaim_queued
             .fetch_add(1, Ordering::Relaxed);
-        if self.len.load(Ordering::Acquire) >= self.max_queued && !self.fence_halted() {
-            METRICS
-                .block_free_reclaim_cap_parks
-                .fetch_add(1, Ordering::Relaxed);
-            // Make sure a drain is actually running to relieve us (the
-            // manners law drains at-cap queues regardless of foreground).
-            self.ensure_worker();
-            self.notify.notify_one();
-            let deadline =
-                std::time::Instant::now() + std::time::Duration::from_millis(self.cap_park_ms);
-            loop {
-                if self.len.load(Ordering::Acquire) < self.max_queued || self.fence_halted() {
-                    break;
-                }
-                if std::time::Instant::now() >= deadline {
-                    METRICS
-                        .block_free_reclaim_cap_overflow
-                        .fetch_add(1, Ordering::Relaxed);
-                    break;
-                }
-                // 5 ms tick — the admit-park liveness pattern.
-                squeezefs_ipc::sqz_time::sleep(std::time::Duration::from_millis(5)).await;
-            }
+        self.arrivals.fetch_add(1, Ordering::Relaxed);
+        if self.population() >= self.cap_blocks.load(Ordering::Relaxed) && !self.fence_halted() {
+            self.park_at_cap().await;
         }
         METRICS
             .block_free_reclaim_queue_bytes
@@ -795,6 +1165,59 @@ impl ReclaimQueue {
         self.q.push(entry);
         self.ensure_worker();
         self.notify.notify_one();
+    }
+
+    /// The at-cap park (park-don't-spill, event-driven since W-4): wait
+    /// for the drain's room-made edge, bounded by the live park bound.
+    /// Registration BEFORE the re-check (PERF-13): `notify_waiters`
+    /// stores no permit, so an edge landing between a full re-check and
+    /// the park's first poll would otherwise be lost and only the tick
+    /// could resume us. The bound is measured from the park's START and
+    /// survives every re-park (an edge that woke us into a still-full
+    /// queue does not reset it); expiry soft-overflows.
+    async fn park_at_cap(self: &Arc<Self>) {
+        METRICS
+            .block_free_reclaim_cap_parks
+            .fetch_add(1, Ordering::Relaxed);
+        // Make sure a drain is actually running to relieve us (the manners
+        // law drains at-cap queues regardless of foreground), and pull a
+        // deferred worker out of its tick NOW.
+        self.ensure_worker();
+        self.notify.notify_one();
+        self.cap_wake.notify_one();
+        let bound_ms = self.park_bound_ms.load(Ordering::Relaxed);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(bound_ms);
+        let tick = std::time::Duration::from_millis(MANNERS_TICK_MS);
+        loop {
+            let mut edge = self.room.notified_raw();
+            edge.enable();
+            // Re-check under the registration: the live cap (a raise is
+            // an edge too) and the fence latch.
+            if self.population() < self.cap_blocks.load(Ordering::Relaxed) || self.fence_halted() {
+                return;
+            }
+            let now = std::time::Instant::now();
+            if now >= deadline {
+                METRICS
+                    .block_free_reclaim_cap_overflow
+                    .fetch_add(1, Ordering::Relaxed);
+                return;
+            }
+            // The liveness tick is the lost-edge backstop only (counted):
+            // never longer than the remaining bound.
+            let wait = (deadline - now).min(tick);
+            match squeezefs_ipc::sqz_future::race2(edge, squeezefs_ipc::sqz_time::sleep(wait)).await
+            {
+                squeezefs_ipc::sqz_future::Either::Left(()) => {}
+                squeezefs_ipc::sqz_future::Either::Right(()) => {
+                    if std::time::Instant::now() < deadline {
+                        METRICS
+                            .block_free_reclaim_park_tick_wakes
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+            }
+        }
     }
 
     /// Inject the foreground device-activity signal (tests). Set once;
@@ -917,6 +1340,11 @@ impl ReclaimQueue {
                 }
                 loop {
                     let Some(q) = weak.upgrade() else { return };
+                    // W-4: the arrival-rate sample (Δarrivals over the
+                    // interval since the previous iteration — deferral
+                    // ticks and passes alike) re-derives the cap; the
+                    // enqueue path itself never reads a clock.
+                    q.sample_arrivals();
                     // The manners law (write-wall iteration 1): defer
                     // while foreground device I/O is moving and the
                     // queue sits below the deferred-space cap — the
@@ -925,7 +1353,7 @@ impl ReclaimQueue {
                     // CPU from foreground writes. At cap, drain
                     // regardless (parked enqueues are foreground
                     // writers too); idle, full-width catch-up.
-                    let at_cap = q.len.load(Ordering::Acquire) >= q.max_queued;
+                    let at_cap = q.population() >= q.cap_blocks.load(Ordering::Relaxed);
                     if q.foreground_active() && !at_cap {
                         // Fill-coupled pacing (finding 40): a thin free
                         // supply outranks manners — drain so headroom
@@ -944,12 +1372,22 @@ impl ReclaimQueue {
                             if q.len.load(Ordering::Acquire) == 0 {
                                 break; // nothing deferred — park on notify
                             }
-                            // Deferred: re-evaluate on a coarse tick (drop
-                            // the Arc across the sleep — the health-worker
-                            // sentinel discipline).
+                            // Deferred: re-evaluate on the manners tick —
+                            // or NOW if an enqueue parks at the cap (the
+                            // tick must never sit inside a park). The wake
+                            // future borrows `q`, so the Arc is held across
+                            // this one tick: a dropped router's queue
+                            // outlives it by ≤ 50 ms before the Weak
+                            // upgrade fails (the sentinel discipline's
+                            // bound, not its violation).
+                            squeezefs_ipc::sqz_future::race2(
+                                q.cap_wake.notified(),
+                                squeezefs_ipc::sqz_time::sleep(std::time::Duration::from_millis(
+                                    MANNERS_TICK_MS,
+                                )),
+                            )
+                            .await;
                             drop(q);
-                            squeezefs_ipc::sqz_time::sleep(std::time::Duration::from_millis(50))
-                                .await;
                             continue;
                         }
                     }
@@ -1119,12 +1557,15 @@ impl ReclaimQueue {
     }
 
     /// Process owned entries: group by device, coalesce adjacent ranges,
-    /// issue the reclaim, then `finish_free` each offset. Counters stay
+    /// then PER RANGE issue the reclaim, `finish_free` its offsets and
+    /// wake parked producers (the room-made edge — W-4: room flows at the
+    /// drain rate instead of in pass-sized bursts). Counters stay
     /// PER-BLOCK (`block_free_discards ≡ displaced blocks` — the field
     /// ledger) even when ranges merge into one device command.
     ///
     /// Panic-safe accounting: the guard reconciles `processing` and the
-    /// byte gauge for every entry, processed or unwound.
+    /// byte gauge for every entry, processed or unwound — and fires the
+    /// room edge for whatever it reconciled.
     fn process_entries(&self, entries: Vec<ReclaimEntry>) {
         if self.test_stall_ms > 0 {
             // Deterministic slow-device seam (test-only; see field doc).
@@ -1137,12 +1578,16 @@ impl ReclaimQueue {
         }
         impl Drop for BatchGuard<'_> {
             fn drop(&mut self) {
+                if self.remaining == 0 && self.bytes_remaining == 0 {
+                    return;
+                }
                 self.q
                     .processing
                     .fetch_sub(self.remaining as u64, Ordering::AcqRel);
                 METRICS
                     .block_free_reclaim_queue_bytes
                     .fetch_sub(self.bytes_remaining, Ordering::Relaxed);
+                self.q.room_made();
             }
         }
         let mut guard = BatchGuard {
@@ -1174,22 +1619,62 @@ impl ReclaimQueue {
         }
         for (device_path, mut group) in by_dev {
             group.sort_by_key(|e| e.offset);
-            reclaim_device_group(&device_path, &group);
-            for e in group {
-                // finish_free AFTER the reclaim — the offset becomes
-                // reallocatable only now (the pre-existing free-window
-                // law, unchanged; a new owner's DMA can never race the
-                // discard). The in-flight guard drops with the entry.
-                e.allocator.finish_free(e.offset);
-                guard.remaining -= 1;
-                guard.bytes_remaining -= e.size;
-                self.processing.fetch_sub(1, Ordering::AcqRel);
+            // Coalesce adjacent ranges over the sorted group: `(start,
+            // len, blocks)` — the k-th range covers the next k entries of
+            // the sorted order, which is what lets finish_free follow each
+            // command instead of the whole group.
+            let ranges = coalesce_entry_ranges(&group);
+            let target = open_reclaim_target(&device_path);
+            let mut entries = group.into_iter();
+            for (start, len, k) in ranges {
+                match &target {
+                    Some(t) => {
+                        issue_range(t, start, len, k, IssueVenue::ReclaimWorker);
+                    }
+                    None => {
+                        METRICS
+                            .block_free_reclaim_skipped
+                            .fetch_add(k, Ordering::Relaxed);
+                    }
+                }
+                let mut freed_bytes = 0u64;
+                for e in entries.by_ref().take(k as usize) {
+                    // finish_free AFTER the reclaim — the offset becomes
+                    // reallocatable only now (the pre-existing free-window
+                    // law, unchanged; a new owner's DMA can never race the
+                    // discard). The in-flight guard drops with the entry.
+                    e.allocator.finish_free(e.offset);
+                    freed_bytes += e.size;
+                }
+                guard.remaining -= k as usize;
+                guard.bytes_remaining -= freed_bytes;
+                self.processing.fetch_sub(k, Ordering::AcqRel);
                 METRICS
                     .block_free_reclaim_queue_bytes
-                    .fetch_sub(e.size, Ordering::Relaxed);
+                    .fetch_sub(freed_bytes, Ordering::Relaxed);
+                // The room-made edge + the drain-rate sample, per range.
+                self.note_drained(k);
+                self.room_made();
             }
         }
     }
+}
+
+/// Coalesce a sorted entry group into `(start, len, blocks)` ranges (the
+/// reclaim worker's adjacency rule; the trim venue's guard-carrying twin
+/// is [`coalesce_ranges`]).
+fn coalesce_entry_ranges(group: &[ReclaimEntry]) -> Vec<(u64, u64, u64)> {
+    let mut ranges: Vec<(u64, u64, u64)> = Vec::new();
+    for e in group {
+        match ranges.last_mut() {
+            Some((start, len, k)) if *start + *len == e.offset => {
+                *len += e.size;
+                *k += 1;
+            }
+            _ => ranges.push((e.offset, e.size, 1)),
+        }
+    }
+    ranges
 }
 
 impl Drop for ReclaimQueue {
@@ -1201,156 +1686,153 @@ impl Drop for ReclaimQueue {
     }
 }
 
-/// Issue the device reclaim for one device's sorted entry group,
-/// coalescing adjacent `[offset, offset+size)` ranges into single device
-/// commands. Per-block counting (see `process_entries`).
-///
-/// The engine is the shim-write-amplification fix verbatim
-/// (`.benchmarks/2026-07-27-shim-write-amplification.md`): `PUNCH_HOLE`
+/// One opened device-reclaim target: the fd plus its classified op (the
+/// shim-write-amplification classification, verbatim —
+/// `.benchmarks/2026-07-27-shim-write-amplification.md`): `PUNCH_HOLE`
 /// on regular-file backings (host-FS sparse reclaim), `BLKDISCARD` on
 /// block devices (NVMe DSM Deallocate — no data payload, never
 /// write-bandwidth-accounted; the former unconditional PUNCH_HOLE was
-/// `blkdev_issue_zeroout` there). Refused/unsupported reclaims are
-/// SKIPPED and counted — never degraded into a zeroing write; freed
-/// ranges are never read (hole semantics + write-before-publish + the
-/// incarnation seqlock).
+/// `blkdev_issue_zeroout` there). Opened ONCE per device group, never per
+/// command.
 #[cfg(target_os = "linux")]
-fn reclaim_device_group(device_path: &str, group: &[ReclaimEntry]) {
-    // Coalesce adjacent ranges: (start, len, blocks_covered).
-    let mut ranges: Vec<(u64, u64, u64)> = Vec::new();
-    for e in group {
-        match ranges.last_mut() {
-            Some((start, len, k)) if *start + *len == e.offset => {
-                *len += e.size;
-                *k += 1;
-            }
-            _ => ranges.push((e.offset, e.size, 1)),
-        }
+struct ReclaimTarget {
+    file: std::fs::File,
+    op: FreeReclaimOp,
+}
+
+/// Open + classify a reclaim target. `None` = the Skip class (unopenable,
+/// or neither a regular file nor a block device): the caller counts the
+/// blocks in `block_free_reclaim_skipped` and NEVER degrades into a
+/// zeroing write — freed ranges are never read (hole semantics +
+/// write-before-publish + the incarnation seqlock).
+#[cfg(target_os = "linux")]
+fn open_reclaim_target(device_path: &str) -> Option<ReclaimTarget> {
+    use std::os::unix::fs::MetadataExt;
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .open(device_path)
+        .ok()?;
+    let mode = file.metadata().map(|m| m.mode()).unwrap_or(0);
+    let op = free_reclaim_op(mode);
+    if matches!(op, FreeReclaimOp::Skip) {
+        return None;
     }
-    issue_device_ranges(device_path, &ranges, IssueVenue::ReclaimWorker);
+    Some(ReclaimTarget { file, op })
 }
 
 #[cfg(not(target_os = "linux"))]
-fn reclaim_device_group(_device_path: &str, group: &[ReclaimEntry]) {
-    METRICS
-        .block_free_reclaim_skipped
-        .fetch_add(group.len() as u64, Ordering::Relaxed);
+struct ReclaimTarget;
+
+#[cfg(not(target_os = "linux"))]
+fn open_reclaim_target(_device_path: &str) -> Option<ReclaimTarget> {
+    None
 }
 
-/// The shared device-reclaim issue engine (the shim-write-amplification
-/// classification, verbatim): `PUNCH_HOLE` on regular-file backings,
-/// `BLKDISCARD` on block devices, refused/unsupported SKIPPED-and-counted
-/// — never a zeroing write. Counts the per-block device-reclaim ledger
-/// (`block_free_{discards,file_punches}` + bytes + the per-COMMAND
-/// economy counter) for every venue; the Trim venue additionally counts
-/// its own engagement family (`block_free_trim_{discards,bytes}`).
-/// Returns `(ok_blocks, ok_bytes)`.
+/// Issue ONE coalesced range `(start, len, k blocks)` on an opened target.
+/// Counts the per-COMMAND economy counter and the per-block
+/// device-reclaim ledger (`block_free_{discards,file_punches}` + bytes;
+/// refused ⇒ `block_free_reclaim_skipped`, never a zeroing-write
+/// fallback) for every venue; the Trim venue additionally counts its own
+/// engagement family (`block_free_trim_{discards,bytes}`). Returns
+/// whether the device accepted the command.
 #[cfg(target_os = "linux")]
+fn issue_range(t: &ReclaimTarget, start: u64, len: u64, k: u64, venue: IssueVenue) -> bool {
+    use std::os::unix::io::AsRawFd;
+    let fd = t.file.as_raw_fd();
+    // Per-COMMAND economy counter (contract 11): blocks ÷ commands is the
+    // live coalesce factor; the per-block ledger stays on the
+    // punch/discard/skip counters below.
+    METRICS
+        .block_free_reclaim_commands
+        .fetch_add(1, Ordering::Relaxed);
+    let issued = match t.op {
+        FreeReclaimOp::FilePunch => {
+            let r = unsafe {
+                libc::fallocate(
+                    fd,
+                    libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE,
+                    start as libc::off_t,
+                    len as libc::off_t,
+                )
+            };
+            if r == 0 {
+                METRICS
+                    .block_free_file_punches
+                    .fetch_add(k, Ordering::Relaxed);
+                METRICS
+                    .block_free_punch_bytes
+                    .fetch_add(len, Ordering::Relaxed);
+                true
+            } else {
+                false
+            }
+        }
+        FreeReclaimOp::BdevDiscard => {
+            // BLKDISCARD = _IO(0x12, 119): REQ_OP_DISCARD (NVMe DSM
+            // Deallocate). Not in the libc crate's const table.
+            const BLKDISCARD: libc::c_ulong = 0x1277;
+            let range: [u64; 2] = [start, len];
+            let r = unsafe { libc::ioctl(fd, BLKDISCARD as _, range.as_ptr()) };
+            if r == 0 {
+                METRICS.block_free_discards.fetch_add(k, Ordering::Relaxed);
+                METRICS
+                    .block_free_discard_bytes
+                    .fetch_add(len, Ordering::Relaxed);
+                true
+            } else {
+                false
+            }
+        }
+        FreeReclaimOp::Skip => unreachable!("open_reclaim_target filters the Skip class"),
+    };
+    if issued {
+        if venue == IssueVenue::Trim {
+            METRICS
+                .block_free_trim_discards
+                .fetch_add(k, Ordering::Relaxed);
+            METRICS
+                .block_free_trim_bytes
+                .fetch_add(len, Ordering::Relaxed);
+        }
+    } else {
+        // Unsupported/refused reclaim: skip loud-once in the counter,
+        // NEVER a zeroing-write fallback.
+        METRICS
+            .block_free_reclaim_skipped
+            .fetch_add(k, Ordering::Relaxed);
+    }
+    issued
+}
+
+#[cfg(not(target_os = "linux"))]
+fn issue_range(_t: &ReclaimTarget, _start: u64, _len: u64, k: u64, _venue: IssueVenue) -> bool {
+    METRICS
+        .block_free_reclaim_skipped
+        .fetch_add(k, Ordering::Relaxed);
+    false
+}
+
+/// The trim venue's whole-batch issue: open once, issue every range.
+/// Returns `(ok_blocks, ok_bytes)`.
 fn issue_device_ranges(
     device_path: &str,
     ranges: &[(u64, u64, u64)],
     venue: IssueVenue,
 ) -> (u64, u64) {
-    use std::os::unix::fs::MetadataExt;
-    use std::os::unix::io::AsRawFd;
-
-    let total_blocks: u64 = ranges.iter().map(|(_, _, k)| *k).sum();
-    let Ok(file) = std::fs::OpenOptions::new().write(true).open(device_path) else {
+    let Some(target) = open_reclaim_target(device_path) else {
+        let total_blocks: u64 = ranges.iter().map(|(_, _, k)| *k).sum();
         METRICS
             .block_free_reclaim_skipped
             .fetch_add(total_blocks, Ordering::Relaxed);
         return (0, 0);
     };
-    let mode = file.metadata().map(|m| m.mode()).unwrap_or(0);
-    let fd = file.as_raw_fd();
-    let op = free_reclaim_op(mode);
-    if matches!(op, FreeReclaimOp::Skip) {
-        METRICS
-            .block_free_reclaim_skipped
-            .fetch_add(total_blocks, Ordering::Relaxed);
-        return (0, 0);
-    }
-
     let mut ok_blocks = 0u64;
     let mut ok_bytes = 0u64;
     for &(start, len, k) in ranges {
-        // Per-COMMAND economy counter (contract 11): blocks ÷ commands is
-        // the live coalesce factor; the per-block ledger stays on the
-        // punch/discard/skip counters below.
-        METRICS
-            .block_free_reclaim_commands
-            .fetch_add(1, Ordering::Relaxed);
-        let issued = match op {
-            FreeReclaimOp::FilePunch => {
-                let r = unsafe {
-                    libc::fallocate(
-                        fd,
-                        libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE,
-                        start as libc::off_t,
-                        len as libc::off_t,
-                    )
-                };
-                if r == 0 {
-                    METRICS
-                        .block_free_file_punches
-                        .fetch_add(k, Ordering::Relaxed);
-                    METRICS
-                        .block_free_punch_bytes
-                        .fetch_add(len, Ordering::Relaxed);
-                    true
-                } else {
-                    false
-                }
-            }
-            FreeReclaimOp::BdevDiscard => {
-                // BLKDISCARD = _IO(0x12, 119): REQ_OP_DISCARD (NVMe DSM
-                // Deallocate). Not in the libc crate's const table.
-                const BLKDISCARD: libc::c_ulong = 0x1277;
-                let range: [u64; 2] = [start, len];
-                let r = unsafe { libc::ioctl(fd, BLKDISCARD as _, range.as_ptr()) };
-                if r == 0 {
-                    METRICS.block_free_discards.fetch_add(k, Ordering::Relaxed);
-                    METRICS
-                        .block_free_discard_bytes
-                        .fetch_add(len, Ordering::Relaxed);
-                    true
-                } else {
-                    false
-                }
-            }
-            FreeReclaimOp::Skip => unreachable!("filtered above"),
-        };
-        if issued {
+        if issue_range(&target, start, len, k, venue) {
             ok_blocks += k;
             ok_bytes += len;
-            if venue == IssueVenue::Trim {
-                METRICS
-                    .block_free_trim_discards
-                    .fetch_add(k, Ordering::Relaxed);
-                METRICS
-                    .block_free_trim_bytes
-                    .fetch_add(len, Ordering::Relaxed);
-            }
-        } else {
-            // Unsupported/refused reclaim: skip loud-once in the counter,
-            // NEVER a zeroing-write fallback.
-            METRICS
-                .block_free_reclaim_skipped
-                .fetch_add(k, Ordering::Relaxed);
         }
     }
     (ok_blocks, ok_bytes)
-}
-
-#[cfg(not(target_os = "linux"))]
-fn issue_device_ranges(
-    _device_path: &str,
-    ranges: &[(u64, u64, u64)],
-    _venue: IssueVenue,
-) -> (u64, u64) {
-    let total_blocks: u64 = ranges.iter().map(|(_, _, k)| *k).sum();
-    METRICS
-        .block_free_reclaim_skipped
-        .fetch_add(total_blocks, Ordering::Relaxed);
-    (0, 0)
 }

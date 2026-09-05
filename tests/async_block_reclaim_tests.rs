@@ -2124,9 +2124,9 @@ async fn at_cap_park_ends_on_the_room_made_edge_not_the_quantum() {
     // the EDGE, never the bound.
     let _p = EnvGuard::set("SQUEEZEFS_RECLAIM_CAP_PARK_MS", "60000");
     let (router, ba, _backing, _staging) = make_router().await;
-    // Foreground MOVING throughout: the at-cap wake must pull the worker
-    // out of its manners deferral tick, not wait for idle.
-    let _seam = FgSeam::install(&router.backend_router);
+    // Foreground MOVING through the park: the at-cap wake must pull the
+    // worker out of its manners deferral tick, not wait for idle.
+    let seam = FgSeam::install(&router.backend_router);
 
     let mut offsets = Vec::with_capacity(9);
     for _ in 0..9 {
@@ -2178,6 +2178,9 @@ async fn at_cap_park_ends_on_the_room_made_edge_not_the_quantum() {
         "no soft overflow — the edge ended the park"
     );
 
+    // End of row: the lone 9th block sits below the cap under moving
+    // foreground (deferred by the manners law, correctly); idle drains it.
+    seam.idle();
     eventually_within(
         || (punches() - p0) + (skipped() - s0) == 9 && queue_bytes() == qb0,
         std::time::Duration::from_secs(30),
@@ -2203,7 +2206,7 @@ async fn derived_park_bound_never_overflows_while_the_drain_keeps_pace() {
     // Derived bound: the knob is UNSET (the shipped default posture).
     let _p = EnvGuard::unset("SQUEEZEFS_RECLAIM_CAP_PARK_MS");
     let (router, ba, _backing, _staging) = make_router().await;
-    let _seam = FgSeam::install(&router.backend_router);
+    let seam = FgSeam::install(&router.backend_router);
 
     let mut offsets = Vec::with_capacity(64);
     for _ in 0..64 {
@@ -2237,6 +2240,7 @@ async fn derived_park_bound_never_overflows_while_the_drain_keeps_pace() {
          room latency — a healthy drain relieves every park on an edge \
          before it (overflow means the bound is mis-derived)"
     );
+    seam.idle();
     eventually_within(
         || (punches() - p0) + (skipped() - s0) == 64 && queue_bytes() == qb0,
         std::time::Duration::from_secs(30),

@@ -1586,6 +1586,18 @@ impl BackendRouter {
         self.reclaim.set_foreground_signal(sig);
     }
 
+    /// Wire the write pipeline's BDP peak (blocks/s) as the reclaim cap's
+    /// displacement-rate seed (W-4,
+    /// [`crate::block_reclaim::ReclaimQueue::set_displacement_seed`]):
+    /// used only until the queue has measured its own arrivals. Set once
+    /// at mount; bare routers seed 0 (the shipped floor governs).
+    pub fn set_reclaim_displacement_seed(
+        &self,
+        seed: std::sync::Arc<dyn Fn() -> u64 + Send + Sync>,
+    ) {
+        self.reclaim.set_displacement_seed(seed);
+    }
+
     /// Cease all device reclaims permanently (the fence-halt latch,
     /// [`crate::block_reclaim::ReclaimQueue::halt_device_reclaims`]): the
     /// in-process kill-9/teardown analog — a custody holder that ends

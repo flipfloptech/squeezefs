@@ -6578,10 +6578,31 @@ pub struct Metrics {
     pub block_free_reclaim_cap_parks: Align64<AtomicU64>,
     /// Park liveness-bound expiries: the entry soft-overflowed into the
     /// queue past the cap (RAM-bounded growth; conservation preserved by
-    /// the valve/unmount/idle drains). **≈ 0 in steady state** — growth
-    /// means the drain is wedged or the bound is mis-sized for the
-    /// fabric.
+    /// the valve/unmount/idle drains). **≈ 0 while the drain keeps
+    /// pace**; the NORM when displacement outruns the target's
+    /// deallocate service (each expiry costs the write path exactly one
+    /// `block_free_reclaim_park_bound_ms`) — read beside the drain-rate
+    /// and arrival-rate gauges.
     pub block_free_reclaim_cap_overflow: Align64<AtomicU64>,
+    /// W-4 (reclaim derivation, `src/block_reclaim.rs`): the drain's
+    /// measured rate — blocks `finish_free`d per second (EWMA over 250 ms
+    /// windows). The park bound's input: `room = batch_blocks ÷ this`.
+    pub block_free_reclaim_drain_rate: Align64<AtomicU64>,
+    /// The queue's measured arrival (= displacement) rate, blocks/s,
+    /// peak-held — the cap derivation's rate input (`queued ≡ displaced
+    /// blocks`, so this IS the write side's displacement rate).
+    pub block_free_reclaim_arrival_rate: Align64<AtomicU64>,
+    /// GAUGE: the live deferred-space cap (queued + in-flight blocks) —
+    /// derived `clamp(arrival × room, 4096, budget/1024 ÷ entry RAM)` or
+    /// the explicit `SQUEEZEFS_RECLAIM_QUEUE_MAX_BLOCKS` verbatim.
+    pub block_free_reclaim_queue_cap: Align64<AtomicU64>,
+    /// GAUGE: the live at-cap park bound, ms — derived `clamp(4 × room,
+    /// 50, 1000)` or the explicit `SQUEEZEFS_RECLAIM_CAP_PARK_MS`
+    /// verbatim. The shipped 1,000 ms constant WAS the rewrite p99.9.
+    pub block_free_reclaim_park_bound_ms: Align64<AtomicU64>,
+    /// Parks resumed by the 50 ms liveness tick instead of a room-made
+    /// edge (the PERF-13 lost-wake tripwire): ≈ 0 while room flows.
+    pub block_free_reclaim_park_tick_wakes: Align64<AtomicU64>,
     /// Device reclaim COMMANDS issued (BLKDISCARD / PUNCH_HOLE calls,
     /// success or refusal) — the command-economy face of adjacent-range
     /// coalescing: `block_free_{discards,file_punches}` stay per-BLOCK
@@ -8934,6 +8955,18 @@ impl SqueezefsFilesystem {
                     latch.contains_sync(&ino)
                 }));
         }
+        // W-4: the block-reclaim cap's displacement seed = the write
+        // pipeline's measured bandwidth peak in blocks/s (leaf captures
+        // only — pipeline + block-size Arcs; no fs/router cycle).
+        {
+            let pipe = fs.write_pipeline.clone();
+            let block_size = fs.router.block_size.clone();
+            fs.router
+                .backend_router
+                .set_reclaim_displacement_seed(std::sync::Arc::new(move || {
+                    pipe.peak_bandwidth_bps() / block_size.load(Ordering::Relaxed).max(1)
+                }));
+        }
         // §5.7 (B4c-i, design-overlay-overwrite): the overlay
         // foreign-merge surface — the QuiesceProbe/reclaim_probe
         // injection pattern. Every closure captures ONLY the registry
@@ -11054,6 +11087,14 @@ impl SqueezefsFilesystem {
                 "block_free_reclaim_fence_halts": METRICS.block_free_reclaim_fence_halts.load(Ordering::Relaxed),
                 "block_free_reclaim_cap_parks": METRICS.block_free_reclaim_cap_parks.load(Ordering::Relaxed),
                 "block_free_reclaim_cap_overflow": METRICS.block_free_reclaim_cap_overflow.load(Ordering::Relaxed),
+                // W-4 reclaim derivation: the measured inputs + the live
+                // derived-or-pinned outputs (the operator can check the
+                // arithmetic), and the park's lost-wake tripwire.
+                "block_free_reclaim_drain_rate": METRICS.block_free_reclaim_drain_rate.load(Ordering::Relaxed),
+                "block_free_reclaim_arrival_rate": METRICS.block_free_reclaim_arrival_rate.load(Ordering::Relaxed),
+                "block_free_reclaim_queue_cap": METRICS.block_free_reclaim_queue_cap.load(Ordering::Relaxed),
+                "block_free_reclaim_park_bound_ms": METRICS.block_free_reclaim_park_bound_ms.load(Ordering::Relaxed),
+                "block_free_reclaim_park_tick_wakes": METRICS.block_free_reclaim_park_tick_wakes.load(Ordering::Relaxed),
                 "block_free_reclaim_commands": METRICS.block_free_reclaim_commands.load(Ordering::Relaxed),
                 // Idea 4 — discard elision (design-rewrite-program §3):
                 // queued + elided ≡ terminal frees; trim_* is the

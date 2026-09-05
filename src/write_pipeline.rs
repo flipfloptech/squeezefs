@@ -505,6 +505,21 @@ impl WritePipeline {
         sum
     }
 
+    /// Σ per-lane achieved-bandwidth peaks (bytes/s) — the write side's
+    /// measured delivery ceiling. W-4 seeds the block-reclaim cap's
+    /// displacement rate from it (÷ block size) before the queue has
+    /// measured its own arrivals: an upper bound by construction (fresh
+    /// writes displace nothing), so the seeded cap errs large, bounded by
+    /// its RAM ceiling.
+    pub fn peak_bandwidth_bps(&self) -> u64 {
+        let mut sum = 0u64;
+        self.lanes.iter_sync(|_, l| {
+            sum = sum.saturating_add(l.bw_peak_bps.load(Ordering::Relaxed));
+            true
+        });
+        sum
+    }
+
     /// Σ per-lane RAW BDP (no HEADROOM, no probe multiplier) — the Red
     /// clamp bound: the measured minimum in-flight that still sustains the
     /// measured drain rate (finding 39; see `depth_target_bytes`). Cold

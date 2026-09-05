@@ -166,6 +166,24 @@ async fn read_at(h: &H, ino: u64, off: u64, size: u32) -> Vec<u8> {
         .to_vec()
 }
 
+/// The DURABLE view of an ino: persist first, then drop the RAM caches.
+/// A grown size / dirty layout is ACKED-ONLY-HERE state by design — the
+/// striped write path defers its durable persist to the fsync/release
+/// cadence and the cache PINS the dirty entry against eviction as the sole
+/// authority for acked bytes (`update_metadata_cache_size`,
+/// `fetch_metadata`'s local-authority rule). Dropping that entry without
+/// persisting first read the LAGGING durable size (a short read after an
+/// aligned append, ~1 in 30 under load, on every tree back to 1.2.1) — the
+/// test was asserting more than the design promises. `fsync` is the
+/// promise.
+async fn durable_view(h: &H, ino: u64) {
+    h.fs.fsync(h.req, ino, 0, false)
+        .await
+        .expect("fsync persists the dirty layout/size floor");
+    h.fs.router.metadata_cache.invalidate(&ino);
+    h.fs.attr_cache.invalidate(&ino);
+}
+
 fn pattern(len: usize) -> Vec<u8> {
     (0..len).map(|i| (i % 251) as u8).collect()
 }
@@ -870,8 +888,7 @@ async fn test_aligned_striped_overwrite_equivalence_64k_blocks() {
     assert_eq!(got, expected, "aligned append mismatch");
 
     // Durable view: drop the hot meta/attr caches and read again.
-    h.fs.router.metadata_cache.invalidate(&ino);
-    h.fs.attr_cache.invalidate(&ino);
+    durable_view(&h, ino).await;
     assert_eq!(
         read_at(&h, ino, 0, (size + block) as u32).await,
         expected,
@@ -949,8 +966,7 @@ async fn test_inline_to_striped_promotion_roundtrip() {
     );
 
     // Durable view (cold meta/attr caches).
-    h.fs.router.metadata_cache.invalidate(&ino);
-    h.fs.attr_cache.invalidate(&ino);
+    durable_view(&h, ino).await;
     assert_eq!(
         read_at(&h, ino, 0, expected.len() as u32).await,
         expected,
@@ -991,8 +1007,7 @@ async fn test_staged_to_striped_promotion_roundtrip() {
     );
 
     // Durable view (cold meta/attr caches).
-    h.fs.router.metadata_cache.invalidate(&ino);
-    h.fs.attr_cache.invalidate(&ino);
+    durable_view(&h, ino).await;
     assert_eq!(
         read_at(&h, ino, 0, expected.len() as u32).await,
         expected,

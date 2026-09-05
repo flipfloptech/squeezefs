@@ -784,11 +784,10 @@ async fn warm_arms_and_the_cold_fill_slice_are_attributed_per_arm() {
     // `read_lane_serves` delta below is the fixture's armed-lane proof).
     let k6 = map.get(&6).expect("block 6 mapped").clone();
     let block6: Vec<u8> = (0..BS).map(|i| pat(6 * BS + i)).collect();
-    h.fs.router.cache.read_lane_hold.insert(
-        &k6,
-        bytes::Bytes::from(block6),
-        64 * 1024 * 1024,
-    );
+    h.fs.router
+        .cache
+        .read_lane_hold
+        .insert(&k6, bytes::Bytes::from(block6), 64 * 1024 * 1024);
     let s0 = snap();
     let serves0 = METRICS.read_lane_serves.load(Ordering::Relaxed);
     let (data, _backing) =

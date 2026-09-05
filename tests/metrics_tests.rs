@@ -934,6 +934,11 @@ async fn fuse_zc_ledger_always_exports_under_metrics() {
         "fuse3_zc_bridge_cancels",
         "fuse3_zc_bridge_lost",
         "read_zc_serve_bytes",
+        // R-4 per-arm READ copy split (the zc-serve pricing instrument).
+        "read_copy_hot_serve_bytes",
+        "read_copy_hold_serve_bytes",
+        "read_copy_cache_serve_bytes",
+        "read_copy_fill_slice_bytes",
     ];
 
     let metrics = json

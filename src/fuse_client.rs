@@ -5427,6 +5427,26 @@ pub struct Metrics {
     /// auditor's claim in — re-priced from this split, never the
     /// +15–25 % blanket.
     pub read_copy_warm_serve_bytes: Align64<AtomicU64>,
+    /// R-4 per-ARM split (e2e perf audit read board #4/#5,
+    /// `perf/read-zc-serve`, 2026-09-05): the three tier arms PARTITION
+    /// `read_copy_warm_serve_bytes` exactly — `hot + hold + cache ≡
+    /// warm_serve` — because a zc serve's prerequisite differs per arm
+    /// (hot/hold `Bytes` are fill-pool memory an fd-addressable pool can
+    /// bridge; the NVMe read cache is an mmap'd segment ring whose
+    /// recycle race needs a post-CQE generation check). Counted AT the
+    /// copy, like the buckets they split, so the partition is exact even
+    /// under a rebind retry.
+    pub read_copy_hot_serve_bytes: Align64<AtomicU64>,
+    pub read_copy_hold_serve_bytes: Align64<AtomicU64>,
+    pub read_copy_cache_serve_bytes: Align64<AtomicU64>,
+    /// R-4: the cold whole-block fill → dest SLICE-OUT — the EXA cold
+    /// row's ONE daemon pass (the 2.69 passes/byte ledger: RX 0.69 +
+    /// slice-out 1.00 + kernel commit/bridge 1.00). A SUBSET of the cold
+    /// residual `dest − warm_serve` (the rest is ranged bounce-with-dest
+    /// legs, ranged escalation slices and multi-block assembly slices,
+    /// which stay unnamed by design). This is the arm an fd-addressable
+    /// fill pool deletes on an armed session, so it is priced apart.
+    pub read_copy_fill_slice_bytes: Align64<AtomicU64>,
     /// POSIX-14: inodes that reached their FINAL forget (the kernel
     /// certifying it holds no reference, which requires every handle
     /// closed) with a nonzero daemon open count — i.e. a lost RELEASE.
@@ -10484,6 +10504,12 @@ impl SqueezefsFilesystem {
                 // (warm tier-buffer serve arms; cold residual = dest −
                 // warm_serve). The A1 handoff's pricing instrument.
                 "read_copy_warm_serve_bytes": METRICS.read_copy_warm_serve_bytes.load(Ordering::Relaxed),
+                // R-4 per-arm split: hot + hold + cache ≡ warm_serve (an
+                // exact partition); fill_slice ⊆ dest − warm_serve.
+                "read_copy_hot_serve_bytes": METRICS.read_copy_hot_serve_bytes.load(Ordering::Relaxed),
+                "read_copy_hold_serve_bytes": METRICS.read_copy_hold_serve_bytes.load(Ordering::Relaxed),
+                "read_copy_cache_serve_bytes": METRICS.read_copy_cache_serve_bytes.load(Ordering::Relaxed),
+                "read_copy_fill_slice_bytes": METRICS.read_copy_fill_slice_bytes.load(Ordering::Relaxed),
                 // FUSE-4e tripwire: must stay 0 (see the field doc).
                 "read_dest_overruns": METRICS.read_dest_overruns.load(Ordering::Relaxed),
                 // POSIX-14 tripwire: must stay 0 (lost RELEASE detector).

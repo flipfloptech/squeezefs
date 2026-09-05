@@ -16481,6 +16481,10 @@ impl DataRouter {
                                         METRICS
                                             .read_copy_warm_serve_bytes
                                             .fetch_add(len as u64, Ordering::Relaxed);
+                                        // R-4 per-arm split: the hot arm.
+                                        METRICS
+                                            .read_copy_hot_serve_bytes
+                                            .fetch_add(len as u64, Ordering::Relaxed);
                                         // SAFETY: the destination window this serve was bounded against at
                                         // entry (`ReadDest::checked_ptr`, FUSE-4e) — writes stay within
                                         // `cap`, and §5.4 lease exclusivity (kernel path) / session arena
@@ -16580,6 +16584,10 @@ impl DataRouter {
                                             // the field doc).
                                             METRICS
                                                 .read_copy_warm_serve_bytes
+                                                .fetch_add(len as u64, Ordering::Relaxed);
+                                            // R-4 per-arm split: the hold arm.
+                                            METRICS
+                                                .read_copy_hold_serve_bytes
                                                 .fetch_add(len as u64, Ordering::Relaxed);
                                             // SAFETY: the destination window this serve was bounded against at
                                             // entry (`ReadDest::checked_ptr`, FUSE-4e) — writes stay within
@@ -16700,6 +16708,11 @@ impl DataRouter {
                                             // arm — see the field doc).
                                             METRICS
                                                 .read_copy_warm_serve_bytes
+                                                .fetch_add(len as u64, Ordering::Relaxed);
+                                            // R-4 per-arm split: the NVMe
+                                            // read-cache arm.
+                                            METRICS
+                                                .read_copy_cache_serve_bytes
                                                 .fetch_add(len as u64, Ordering::Relaxed);
                                             dest_bytes(dest_ptr, len)
                                         }
@@ -17203,6 +17216,16 @@ impl DataRouter {
                                                                 len as u64,
                                                                 Ordering::Relaxed,
                                                             );
+                                                            // R-4 per-arm split: the cold
+                                                            // whole-block fill → dest
+                                                            // slice-out (the EXA row's
+                                                            // one daemon pass).
+                                                            METRICS
+                                                                .read_copy_fill_slice_bytes
+                                                                .fetch_add(
+                                                                    len as u64,
+                                                                    Ordering::Relaxed,
+                                                                );
                                                             // Unwritten remainder of the reused
                                                             // uring dest region must never replay
                                                             // a previous reply's bytes.
@@ -17286,6 +17309,12 @@ impl DataRouter {
                                                     }
                                                     METRICS
                                                         .read_copy_dest_bytes
+                                                        .fetch_add(len as u64, Ordering::Relaxed);
+                                                    // R-4 per-arm split: the
+                                                    // stale-absent face of the
+                                                    // cold fill → dest slice-out.
+                                                    METRICS
+                                                        .read_copy_fill_slice_bytes
                                                         .fetch_add(len as u64, Ordering::Relaxed);
                                                     if len < slice_len as usize {
                                                         std::ptr::write_bytes(

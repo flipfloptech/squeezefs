@@ -1,0 +1,18 @@
+[15:07:07] == mint: fresh format + 8 x 1G
+[15:07:23] == leg A1 [SQUEEZEFS_READ_ZC_SERVE=1] load=3.04 3.32 5.55
+[15:07:24]    fuse3_zc_negotiated=1
+  A1.r_cold.json: 12.42 GiB/s  clat mean 9.96 ms  p99 61.6 ms
+  A1.r_warm.json: 12.94 GiB/s  clat mean 9.63 ms  p99 58.5 ms
+[15:08:40] == leg B1 [SQUEEZEFS_READ_ZC_SERVE=0] load=12.15 5.70 6.19
+[15:08:40]    fuse3_zc_negotiated=1
+  B1.r_cold.json: 10.42 GiB/s  clat mean 11.98 ms  p99 75.0 ms
+  B1.r_warm.json: 8.99 GiB/s  clat mean 13.87 ms  p99 73.9 ms
+[15:09:41] == leg B2 [SQUEEZEFS_READ_ZC_SERVE=0] load=15.62 7.77 6.86
+[15:09:42]    fuse3_zc_negotiated=1
+  B2.r_cold.json: 8.45 GiB/s  clat mean 14.76 ms  p99 78.1 ms
+  B2.r_warm.json: 8.13 GiB/s  clat mean 15.33 ms  p99 83.4 ms
+[15:10:43] == leg A2 [SQUEEZEFS_READ_ZC_SERVE=1] load=18.87 10.14 7.74
+[15:10:44]    fuse3_zc_negotiated=1
+  A2.r_cold.json: 8.73 GiB/s  clat mean 14.30 ms  p99 81.3 ms
+  A2.r_warm.json: 8.45 GiB/s  clat mean 14.76 ms  p99 83.4 ms
+[15:11:45] == done; rows in /home/justin/Source/squeezefs/target/r4-abba-unaligned

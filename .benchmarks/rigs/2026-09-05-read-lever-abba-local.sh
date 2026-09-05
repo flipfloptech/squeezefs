@@ -20,6 +20,13 @@ META="${META:-sqmeta:///dev/nvme1n1,/dev/nvme2n1,/dev/nvme3n1,/dev/nvme4n1}"
 DATA="${DATA:-sqdata:///dev/nvme5n1,/dev/nvme6n1,/dev/nvme7n1,/dev/nvme8n1}"
 MNT="${MNT:-/mnt/sqz-lever}"
 JOBS="${JOBS:-8}"; QD="${QD:-8}"; BS="${BS:-1M}"; SIZE="${SIZE:-1G}"
+# OFFSET (bytes, default 0): a non-block-aligned start (e.g. 4096) makes
+# every read span two blocks, so it takes the pooled-fill slice-out arm
+# cold and the tier arms warm — the population a tier-buffer lever acts on;
+# aligned direct=1 reads on an armed session ride the direct zc leg and
+# never touch a tier. RUNTIME (s, default 0 = one pass): time_based loop
+# for a sustained row.
+OFFSET="${OFFSET:-0}"; RUNTIME="${RUNTIME:-0}"
 KNOB="${KNOB:?KNOB=<name>}"; A_VAL="${A_VAL:?}"; B_VAL="${B_VAL:?}"
 FIO="${FIO:-$(command -v fio || true)}"; [ -x "$FIO" ] || { echo "fio missing (set FIO=/path/to/fio)" >&2; exit 2; }
 mkdir -p "$OUT" "$MNT"
@@ -37,10 +44,14 @@ umount_leg() {
   for _ in $(seq 1 100); do mountpoint -q "$MNT" || break; sleep 0.2; done
 }
 write_job() {  # $1 = job file path; 2*JOBS readers, readers j and j+JOBS share file j
-  python3 - "$1" "$JOBS" "$QD" "$BS" "$SIZE" "$MNT/rows" <<'PY'
+  python3 - "$1" "$JOBS" "$QD" "$BS" "$SIZE" "$MNT/rows" "$OFFSET" "$RUNTIME" <<'PY'
 import sys
-p, jobs, qd, bs, size, d = sys.argv[1], int(sys.argv[2]), sys.argv[3], sys.argv[4], sys.argv[5], sys.argv[6]
+p, jobs, qd, bs, size, d, off, rt = sys.argv[1], int(sys.argv[2]), sys.argv[3], sys.argv[4], sys.argv[5], sys.argv[6], int(sys.argv[7]), int(sys.argv[8])
 out = f"[global]\nioengine=libaio\ndirect=1\nbs={bs}\niodepth={qd}\nrw=read\nsize={size}\ndirectory={d}\ngroup_reporting=1\n"
+if off:
+    out += f"offset={off}\n"
+if rt:
+    out += f"time_based=1\nruntime={rt}\n"
 for j in range(jobs * 2):
     out += f"[r{j}]\nfilename=f.{j % jobs}\n"
 open(p, "w").write(out)

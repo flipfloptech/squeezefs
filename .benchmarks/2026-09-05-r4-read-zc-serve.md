@@ -99,7 +99,7 @@ cache → the request's folios (the K1 commit copy's zc-era twin;
 
 All export under `metrics` (pinned in `metrics_tests::fuse_zc_ledger_always_exports_under_metrics`).
 
-## 4. The lever — `SQUEEZEFS_READ_ZC_SERVE` (default off)
+## 4. The lever — `SQUEEZEFS_READ_ZC_SERVE` (default ON since the 2026-09-05 field bracket, §7)
 
 **Substrate** (`src/cache/pool.rs`): `AlignedBufPool::new_memfd_slabbed` —
 one `memfd_create` + `ftruncate(capacity × 4 MiB)` + `mmap(MAP_SHARED)`;
@@ -225,22 +225,88 @@ missing fields → compile-red, `deda3681`), the fast-probe venue (phase E
 dest delta 0 against the tree, `2fa7b473` — proven by stash-and-run), the
 lever (API absent → compile-red, `35400e0f`).
 
-## 7. Field rows — OWED (parent, root, sqz kernel)
+## 7. Field rows — MEASURED 2026-09-05 (dev box, tcp devsub, root, zc armed)
 
-Venue: tcp devsub (`SQZ_DEVSUB_TRANSPORT=tcp`), the sqz 7.1 kernel armed
-(`fuse3_zc_negotiated` = 1), same `release` binary both legs, the knob
-the only difference, A-B-B-A per row, ≥ 60 s sustained + burst:
+Venue: this box's `7.1.8-cachyos-lto` (sqz 7.1 patch track) — `fuse3_zc_
+negotiated` = 1 on every leg; tcp devsub (zram OSS at memory-bus speed, so
+the rows are CPU-per-byte rows, not device rows); same `release` binary
+`d551f1ba` (the five-campaign stack); rig
+`.benchmarks/rigs/2026-09-05-read-lever-abba-local.sh` (8 × 1 GiB minted
+once from `/dev/urandom`; per leg a COLD remount, then `r_cold` and
+`r_warm` = fio 3.42 libaio `direct=1`, 16 readers qd8 — readers j and j+8
+share file j, the EXA follower shape — 1 MiB reads); **A =
+`SQUEEZEFS_READ_ZC_SERVE=1` / B = `0`**, order A B B A; artifacts
+`.benchmarks/rows-r4-read-zc-20260905/{aligned,unaligned}/`.
 
-| Row | Shape | What the ledger predicts | Read |
-|---|---|---|---|
-| `r_cold` | fio 1 MiB seq, 2 readers/file (the EXA follower shape), qd8/qd16, cold remount per leg | leader bytes direct (`read_zc_serve_bytes`, unchanged); follower bytes move `read_copy_fill_slice_bytes` → `read_zc_pool_serve_bytes`; daemon CPU/byte on the `fuse3-tpc` class −1 pass on the follower share | `daemon_cpu_ns_by_class`, `read_copy_*` closure (`zc_serve + zc_pool_serve + dest + bounce + dest_dma ≈ user bytes × ramp`), `fuse3_zc_replies` ≡ out-paged replies, `fuse3_zc_fd_body_fallbacks` = 0 |
-| `r_warm` | a resident set re-read (unaligned or cohort-warmed so it IS warm on an armed mount — §2 finding 2) | `read_copy_{hot,hold}_serve_bytes` → `read_zc_pool_serve_warm_bytes`; `transport_fast_dispatch_serves` unchanged (the same probe, a different vehicle); reap-thread CPU (`fuse3-ur`) −1 memcpy per served byte — the R-4 reap-economy row's other half | same + `transport_fast_dispatch_serves`, `fuse3_zc_fd_body_replies` ≈ fd-source serves |
-| gate | `sudo tests/run_zc_capability_gate.sh` with and without the knob | every capability-class suite green under both postures | — |
+### 7.1 Aligned reads — the direct leg, a null row (`aligned/`)
 
-Ladder row 11 status: **instrument landed; lever built and pinned in
-process; field adjudication OWED** — the knob stays off until the
-A-B-B-A prices the win and the sibling-campaign composition
-(R-2/R-3/R-4 reap-thread work) is read together.
+Block-aligned 1 MiB `direct=1` on an armed session rides the pre-existing
+direct zc serve: `read_zc_serve_bytes` = 16 GiB = every byte on every leg,
+cold AND warm, every tier counter 0, `read_zc_pool_serve_bytes` 0 — §2
+finding 2 verbatim (the aligned cold population never becomes warm; at
+12 GiB/s from zram no follower ever finds a fill in flight to cohort on).
+The lever has no population here; recorded as the null it is.
+
+### 7.2 Unaligned reads — the lever's population, sustained 30 s (`unaligned/`)
+
+`offset=4096`: every 1 MiB read spans two blocks → the pooled-fill
+slice-out arm cold, the tier arms warm. 16 readers × qd8 × 30 s per row.
+
+| row | leg | GiB/s | clat mean | daemon CPU ms/GiB | `fuse3-ur` ms/GiB | `zc_serve` | `zc_pool_serve` (warm subset) | `copy_dest` | `copy_fill_slice` | `copy_hot`+`hold`+`cache` | fd-body replies / fallbacks |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| `r_cold` | A1 | **12.42** | 10.0 ms | **386** | **59** | 122.9 G | 156.6 G (48.6 G) | 93.2 G | 0 | 0 | 160,354 / 0 |
+| | B1 | 10.42 | 12.0 ms | 507 | 95 | 107.7 G | 0 | 205.0 G | 86.2 G | 40.7 G | 0 / 0 |
+| | B2 | 8.45 | 14.8 ms | 725 | 112 | 86.5 G | 0 | 167.3 G | 75.5 G | 28.3 G | 0 / 0 |
+| | A2 | **8.73** | 14.3 ms | **559** | **70** | 98.2 G | 98.3 G (33.2 G) | 65.5 G | 0 | 0 | 100,617 / 0 |
+| `r_warm` | A1 | **12.94** | 9.6 ms | **369** | **58** | 119.9 G | 171.5 G (51.3 G) | 97.1 G | 0 | 0 | 175,618 / 0 |
+| | B1 | 8.99 | 13.9 ms | 650 | 107 | 97.6 G | 0 | 172.3 G | 75.3 G | 29.5 G | 0 / 0 |
+| | B2 | 8.13 | 15.3 ms | 756 | 118 | 83.0 G | 0 | 161.1 G | 72.8 G | 27.3 G | 0 / 0 |
+| | A2 | **8.45** | 14.8 ms | **566** | **69** | 89.3 G | 101.0 G (33.0 G) | 63.4 G | 0 | 0 | 103,384 / 0 |
+
+Closure exact on every leg: `zc_serve + zc_pool_serve + copy_dest ≡ bytes
+served` (A1 cold: 122.9 + 156.6 + 93.2 = 372.7 G vs fio 372.6 G); with
+the lever on the fill-slice and the three warm-tier copies go to ZERO and
+their bytes reappear as `read_zc_pool_serve_bytes` (the warm subset = the
+former hot+hold+cache sum), `fuse3_zc_fd_body_fallbacks` = 0 across
+440 k fd-source replies, `transport_fast_dispatch_serves` unchanged in
+kind. The box heated through the bracket (load 3 → 19; 12.4 → 8.5 GiB/s
+leg to leg with identical knobs on the B pair), which is why the per-byte
+columns are the verdict and the reversed bracket the honest throughput read.
+
+**Verdict — LANDS, default ON (flipped from the campaign's off).** Daemon
+CPU per GiB **−24 % cold / −25 % warm** on the clean reversed bracket
+(A2 vs B2: 559 vs 725, 566 vs 756) and −24 % / −43 % on the first; the
+transport-worker class (`fuse3-ur`, where the serve memcpy lived) **−37 %
+to −46 %**; throughput A ≥ B on all four pairs (+3 % / +4 % reversed,
++19 % / +44 % first — the latter inflated by thermal drift); clat A ≤ B
+on all four. On this venue the device is not the bound, so the CPU/byte
+column is the one the board's "whole-box CPU wall" names — and it is the
+one that moved. The aligned direct leg is untouched (7.1). The zc-
+capability gate ran on this code under both postures (§7.3).
+### 7.3 zc-capability gate under both postures (this box, root)
+
+`sudo tests/run_zc_capability_gate.sh` with `SQUEEZEFS_READ_ZC_SERVE=1`
+and again with `=0` on the five-campaign stack: the zero-copy surface is
+**green both times** — `fuse_zc_write_fusion` 5/5, `zc_bridge_cqe_wedge`
+3/3, `zc_bridge_phase` 2/2, `bench_tests` 95/95, zcrx lib probes 38 ×3,
+skip ledger EMPTY (`/tmp/five/zc-gate-{on,off}.log`). The bundled live
+NVMe-reservation leg (`wero_rtype_tests::live_wero_…`, 1 of 6) failed
+under BOTH postures in 0.06 s at its own `nvme connect`: `nvme nvme1:
+creating 26 I/O queues … Connect command failed, errno: -18 … failed to
+connect queue: 15` — a kernel-level fault of this box's current state
+(the 1.2.1 fstests `-g auto` run's CPU-hotplug test, `generic/650`, left
+CPUs 8, 10, 20, 22, 28, 30 firmware-latched offline at 22:48 on 09-04 —
+"failed to report alive state" on every re-online attempt — so the box
+has 26 of 32 CPUs; 4-queue connects (the dev substrate's) succeed, the
+default 26-queue connects fail at queue 15; the multi-writer fleet's
+identity connect fails the same way). It passed on this box at 10:52
+today (1.2.1 gate, `zc-gate-local.log`) and is untouched by any of the
+five levers (none reach `nvme connect`). Re-run after the reboot the
+latched cores need; recorded, not adjudicated, here.
+
+**Venue caveat for every row in §7:** all of today's brackets ran on the
+26-CPU box — identical for both arms of each bracket, so every A/B stands;
+the absolute numbers are 26-core numbers.
 
 ## 8. Next rungs (not built)
 

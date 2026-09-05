@@ -1,0 +1,103 @@
+SqueezeFS version 1.2.1 (d551f1baf014 / d551f1baf0140e3b91fb87a514650a7be28bf4a3) built 1980-01-01T00:00:00Z profile release
+======================================================================
+  Mount Configuration Summary
+----------------------------------------------------------------------
+  Volume Name:         squeezefs
+  Capacity:            32.00 GiB
+  Block Size:          4.00 MiB
+  Compression:         none
+  Encryption:          none
+----------------------------------------------------------------------
+Metadata Volumes:
+  - [enabled] /dev/nvme1n1 (health: 1000)
+  - [enabled] /dev/nvme2n1 (health: 1000)
+  - [enabled] /dev/nvme3n1 (health: 1000)
+  - [enabled] /dev/nvme4n1 (health: 1000)
+Data Volumes:
+  - [enabled] /dev/nvme5n1 (health: 1000)
+  - [enabled] /dev/nvme6n1 (health: 1000)
+  - [enabled] /dev/nvme7n1 (health: 1000)
+  - [enabled] /dev/nvme8n1 (health: 1000)
+----------------------------------------------------------------------
+Cache/Staging:
+  Memory Cache Size:   1GB
+  Disk Cache Size:     10GB
+  Staging Paths:       none (cache-less)
+----------------------------------------------------------------------
+Mount Options:
+  Mountpoint:          "/mnt/sqz-lever"
+  Writeback Cache:     enabled
+  Allow Other:         enabled
+======================================================================
+[2026-09-05T19:05:25Z INFO  squeezefs] root subprocess PATH sanitized (VAL-7i): dropped relative/empty/group-or-world-writable entries; using '/run/wrappers/bin:/run/current-system/sw/bin:/nix/store/7a60q5dgnv6z96c279rc1nalyiw4mgqn-bash-interactive-5.3p15/bin:/nix/store/fpig164lz7fcipbndn61sfd2y2yq363n-patchelf-0.15.2/bin:/nix/store/w88q44gqd1qg5wmkk7v0h97rpiqvam0l-gcc-wrapper-15.3.0/bin:/nix/store/4yxdxw3kppr2pbic95p4mri520rkdag2-gcc-15.3.0/bin:/nix/store/axmdd5wlxg1c9dbblvj09pjhkawqxmqx-glibc-2.42-84-bin/bin:/nix/store/3qgy8q2j64v2m9jy3a5jmssacbblhd4r-coreutils-9.11/bin:/nix/store/rm982p6i9ry7rwq5jn638kdpv0a2331f-binutils-wrapper-2.46/bin:/nix/store/5pa1282x1sasbwhmnah6bny1g9pc2lj1-binutils-2.46/bin:/nix/store/dv55qwamlq68hdiprg1v104ymwh1c27r-cargo-1.97.1/bin:/nix/store/yaa1sq5g4jar7rvlspy7kk2wd98nj6qh-rustc-wrapper-1.97.1/bin:/nix/store/47k26k98v32x56rxiqawdk5qk0r0b6w1-rustfmt-1.97.1/bin:/nix/store/n4c4rzywa0wsfy239bqkgsx8lfhsfmwx-clippy-1.97.1/bin:/nix/store/bvzzl57kpmvzb6aj0v0yc45gvw8ggf2a-go-task-3.53.1/bin:/nix/store/3mkwfy7wnzdngx7nj8nvs60jj2r4gmmc-cargo-audit-0.22.2/bin:/nix/store/7fx93fz9c809w8yjxb0934zw6xcjis58-pkg-config-wrapper-0.29.2/bin:/nix/store/w021fbcg4z6vxihnp6gb6vijyifl051f-clang-wrapper-21.1.8/bin:/nix/store/603yaax3l2jmc0hfv6g3hgjr1qk5jfxk-clang-21.1.8/bin:/nix/store/vs80ag6hsr58wv5fn3nlq8qi32x9hwfi-binutils-wrapper-2.46/bin:/nix/store/06w7nc3znmzbw227ksbcj3kzv2dvnqpd-clang-21.1.8-dev/bin:/nix/store/cfmpcnlljlda8w2y0pw6shpbf7y84nz9-openmpi-5.0.10-dev/bin:/nix/store/b60ygklpk7cznna4bs0dcm6h6ncyh26z-openmpi-5.0.10/bin:/nix/store/b5bpi6zfajzzrwwpgba2q6li3nnya4bs-python3-3.14.7/bin:/nix/store/nsz342365nfvnvyfcjvds75rzw6rx520-nvme-cli-2.16/bin:/nix/store/f7cmpy9nszykh5gfjpxh5ks3pa78nssr-awscli2-2.35.11/bin:/nix/store/lbx1ba84hzgw5ixy47nmzvdmjp8ayqi4-liburing-2.14-bin/bin:/nix/store/wjvj88kk8gv0742k1lwazpxr7lnzgi1a-e2fsprogs-1.47.4-bin/bin:/nix/store/65ql38i4yki6adklv0d83amba6c5cd9i-util-linux-minimal-2.42.2-bin/bin:/nix/store/c4bh8ipd5jwxq44g4m630jswac1bqa6d-xfsprogs-7.1.1-bin/bin:/nix/store/yljbd9wmqsdg89pprp6r7ml0c5a109f7-btrfs-progs-7.1/bin:/nix/store/qhi7wvkfj6k2p38ds1ahc2bldypj5fr0-f2fs-tools-1.16.0/bin:/nix/store/xkwpln569xr659h2vzqv498cm2nvbwx7-exfatprogs-1.4.3/bin:/nix/store/zwv3i1aawb8zmxj029x7lyd0an5q4nj6-util-linux-2.42.2-bin/bin:/nix/store/ync7h8cyhw4nzw2laba4wra6b8mcn9by-compiler-rt-libc-21.1.8/bin:/nix/store/i4kjidyvl8ciwbcwm75g75sriq3knav0-findutils-4.11.0/bin:/nix/store/xw09m9cnc9ayb2j53y2rj8jhm1h7kkxa-diffutils-3.12/bin:/nix/store/4nylac9gazdpsid79qyk0jpqm312b2jx-gnused-4.10/bin:/nix/store/yhr4ps9rdmb55pgqaq246vlh7xfac1dx-gnugrep-3.12/bin:/nix/store/bpy2ps3f0f3gvgvqjwgqriw1j1n840wd-gawk-5.4.1/bin:/nix/store/w2mbg6mcq7k3j088sbwfziy8vsdhyk7v-gnutar-1.35/bin:/nix/store/sd9qcv5s2gxvd6hpp5hk5cixq2bd4jd1-gzip-1.14/bin:/nix/store/622jkvg8hgffly7dca6iif9drvimingx-bzip2-1.0.8-bin/bin:/nix/store/hd36xbvbc0vrn9f9idrfwxznri0ax427-gnumake-4.4.1/bin:/nix/store/9ipfvwnqp1q8ijnmi5sxvlx9r8w34lw3-bash-5.3p15/bin:/nix/store/1rcr9yyj9qlgm3dyin1j37xl7q84h15i-patch-2.8/bin:/nix/store/0fb3jrf20z28598alm6g7rrsw6dz2cqj-xz-5.8.3-bin/bin:/nix/store/xcab8m6wdrd30l10bw3hkz32yiibynzv-file-5.48/bin:/home/justin/.local/share/flatpak/exports/bin:/nix/store/444h3sfs9fk7fi8hif6wgg11rkc24vjd-ghostty-1.3.1/bin'
+[2026-09-05T19:05:25Z INFO  squeezefs::nvme_dev] data volume /dev/nvme5n1: write_cache=write-through (durability barrier: io_uring Fsync/DATASYNC per device, coalesced)
+[2026-09-05T19:05:25Z INFO  squeezefs] writer-scoped staging ENGAGED: client scope w_1c4e7f3e0e89c39d.mabcd6e68 (staging generation "v3:deb9f7f9f8394d37831edb0844edc367|v3:f5738e17be674505b7af5756ce8f3418|v3:9747bd453fbf4847ad2c43d7ce2c0b07|v3:bc1c8ba8a95243cb82392d6fc3d7b3e2@node:1c4e7f3e0e89c39d.mabcd6e68") — staging keys carry the scope and this client's staging roots are bound to it
+[2026-09-05T19:05:25Z INFO  squeezefs::cache::gds] GPU Direct Storage: No discrete GPU environment found. GDS bypassed.
+[2026-09-05T19:05:25Z INFO  squeezefs] Registering data volume 'nvme5n1' at path /dev/nvme5n1 (state active)
+[2026-09-05T19:05:25Z INFO  squeezefs] Registering data volume 'nvme6n1' at path /dev/nvme6n1 (state active)
+[2026-09-05T19:05:25Z INFO  squeezefs::nvme_dev] data volume /dev/nvme6n1: write_cache=write-through (durability barrier: io_uring Fsync/DATASYNC per device, coalesced)
+[2026-09-05T19:05:25Z INFO  squeezefs] Registering data volume 'nvme7n1' at path /dev/nvme7n1 (state active)
+[2026-09-05T19:05:25Z INFO  squeezefs::nvme_dev] data volume /dev/nvme7n1: write_cache=write-through (durability barrier: io_uring Fsync/DATASYNC per device, coalesced)
+[2026-09-05T19:05:25Z INFO  squeezefs] Registering data volume 'nvme8n1' at path /dev/nvme8n1 (state active)
+[2026-09-05T19:05:25Z INFO  squeezefs::nvme_dev] data volume /dev/nvme8n1: write_cache=write-through (durability barrier: io_uring Fsync/DATASYNC per device, coalesced)
+[2026-09-05T19:05:25Z INFO  squeezefs::nvme_dev] NvmeBlockDev /dev/nvme5n1: read submission fan-out armed (7 lanes)
+[2026-09-05T19:05:25Z INFO  squeezefs::nvme_dev] NvmeBlockDev /dev/nvme5n1: write submission fan-out armed (7 lanes, 4194304 B affinity grain)
+[2026-09-05T19:05:25Z INFO  squeezefs::nvme_dev] NvmeBlockDev /dev/nvme8n1: read submission fan-out armed (7 lanes)
+[2026-09-05T19:05:25Z INFO  squeezefs::nvme_dev] NvmeBlockDev /dev/nvme8n1: write submission fan-out armed (7 lanes, 4194304 B affinity grain)
+[2026-09-05T19:05:25Z INFO  squeezefs::nvme_dev] NvmeBlockDev /dev/nvme6n1: read submission fan-out armed (7 lanes)
+[2026-09-05T19:05:25Z INFO  squeezefs::nvme_dev] NvmeBlockDev /dev/nvme6n1: write submission fan-out armed (7 lanes, 4194304 B affinity grain)
+[2026-09-05T19:05:25Z INFO  squeezefs::nvme_dev] NvmeBlockDev /dev/nvme7n1: read submission fan-out armed (7 lanes)
+[2026-09-05T19:05:25Z INFO  squeezefs::nvme_dev] NvmeBlockDev /dev/nvme7n1: write submission fan-out armed (7 lanes, 4194304 B affinity grain)
+[2026-09-05T19:05:25Z INFO  squeezefs::dlm] fencing: durable writer term 4 adopted (was 0); every token this process mints now dominates every earlier era's (spec §6.7 decision 4)
+[2026-09-05T19:05:25Z INFO  squeezefs::meta_backend::kv::backend] meta volume /dev/nvme1n1: writer claim taken (id=1c33a932-f79b-477c-8248-db84c8e5708a, term=4, mode=flock+pr)
+[2026-09-05T19:05:25Z INFO  squeezefs::meta_backend::kv::backend] meta volume /dev/nvme2n1: writer claim taken (id=c3e60ea2-a28b-47ee-a6e7-c9d8cfb53bdc, term=4, mode=flock+pr)
+[2026-09-05T19:05:25Z INFO  squeezefs::meta_backend::kv::backend] meta volume /dev/nvme3n1: writer claim taken (id=81f5db8f-382e-4635-9383-ebaa32524231, term=4, mode=flock+pr)
+[2026-09-05T19:05:25Z INFO  squeezefs::meta_backend::kv::backend] meta volume /dev/nvme4n1: writer claim taken (id=2773ccaf-dbb5-49bf-a6fe-b85861a1d75e, term=4, mode=flock+pr)
+[2026-09-05T19:05:25Z INFO  squeezefs] meta volume /dev/nvme1n1: format=3 ledger_seq=26 replay_entries=0 replay_dropped_torn=0 replay_ms=8 free_extents=4025 next_ino=3 meta_volume_atomicity=cow-checksummed meta_volume_atomicity_physical=atomic4k writer_guard_mode=flock+pr
+[2026-09-05T19:05:25Z INFO  squeezefs] meta volume /dev/nvme2n1: format=3 ledger_seq=19 replay_entries=0 replay_dropped_torn=0 replay_ms=7 free_extents=4026 next_ino=3 meta_volume_atomicity=cow-checksummed meta_volume_atomicity_physical=atomic4k writer_guard_mode=flock+pr
+[2026-09-05T19:05:25Z INFO  squeezefs] meta volume /dev/nvme3n1: format=3 ledger_seq=14 replay_entries=0 replay_dropped_torn=0 replay_ms=7 free_extents=4026 next_ino=3 meta_volume_atomicity=cow-checksummed meta_volume_atomicity_physical=atomic4k writer_guard_mode=flock+pr
+[2026-09-05T19:05:25Z INFO  squeezefs] meta volume /dev/nvme4n1: format=3 ledger_seq=18 replay_entries=0 replay_dropped_torn=0 replay_ms=7 free_extents=4026 next_ino=3 meta_volume_atomicity=cow-checksummed meta_volume_atomicity_physical=atomic4k writer_guard_mode=flock+pr
+[2026-09-05T19:05:25Z INFO  squeezefs::fuse_client] Dynamic reclaim concurrency limit configured: 26
+[2026-09-05T19:05:25Z INFO  squeezefs::routing] block-key incarnations engaged (spec §6.2 item 6): era 4, appender 0/1 — persisted block keys now name the lifetime of their device offset
+[2026-09-05T19:05:25Z INFO  squeezefs::data_custody] data plane armed single-writer: custody epoch:0x40000000000 fenced locally (no data-namespace reservation — the D0 writer guard is the arbiter; set SQUEEZEFS_MULTI_WRITER=1 to demand a device-enforced WERO hold)
+[2026-09-05T19:05:25Z INFO  squeezefs] block ownership recovered from DURABLE records: 2048                          reference(s), no inode-tree walk (incompat bit 8)
+[2026-09-05T19:05:25Z WARN  squeezefs::job_wire] job wire: listener 0.0.0.0:45737 is PLAINTEXT TCP (no ClusterSecurityConfig) — sessions are AUTHENTICATED (storage-trust challenge proof + per-frame session MAC, S3 cluster_wire) but not private, so mutating publishes pay mandatory-100 % verify-reads (Issue-30; ≈2× device reads on remote-mutated bytes). Set SQUEEZEFS_JOB_WIRE_CA_KEY (+ optional SQUEEZEFS_JOB_WIRE_CA_CERT) for CA-pinned mTLS + sampled verification, or SQUEEZEFS_JOB_WIRE_BIND to narrow/disable the listener.
+[2026-09-05T19:05:25Z INFO  squeezefs::job_wire] job wire: bounds — max 416 concurrent connections, 8192 pre-enrollment frame cap, handshake deadline 10s, challenge freshness 30s
+[2026-09-05T19:05:25Z INFO  squeezefs] job wire: endpoint 192.168.86.52:45737 (published via the mount registration)
+Mounting Squeezefs at "/mnt/sqz-lever"...
+[2026-09-05T19:05:25Z INFO  squeezefs::fuse_client] Transport payload-buffer cap: 10544 MiB (memory budget 84352 MiB)
+[2026-09-05T19:05:25Z INFO  squeezefs::ipc_host] ipc host: path ctl socket at /run/squeezefs/sqz-il0-3236495-9105d831.sock
+[2026-09-05T19:05:25Z INFO  squeezefs::fuse_client] IPC session host armed (socket sqz-il0-3236495-9105d831, session shm cap 10544 MiB)
+[2026-09-05T19:05:25Z INFO  squeezefs::fuse_client] SqueezeFS version 1.2.1 (d551f1baf014 / d551f1baf0140e3b91fb87a514650a7be28bf4a3) built 1980-01-01T00:00:00Z profile release initializing mount
+[2026-09-05T19:05:25Z INFO  squeezefs::fuse_client] FUSE Daemon: Mounting squeezefs at "/mnt/sqz-lever"...
+[2026-09-05T19:05:25Z INFO  squeezefs::fuse_client] FUSE Daemon: Metadata connection active.
+[2026-09-05T19:05:25Z INFO  squeezefs::fuse_client] device-overlay armed: transport streaming holds enabled (SQUEEZEFS_DEVICE_OVERLAY)
+[92mOK[0m Squeezefs is ready at "/mnt/sqz-lever"
+[2026-09-05T19:05:25Z INFO  squeezefs::fuse_client] IPC session host: mount st_dev resolved (123)
+[2026-09-05T19:05:25Z INFO  squeezefs::fuse_client] FUSE Daemon: Initialized Squeezefs Filesystem mount (version 1.2.1 (d551f1baf014 / d551f1baf0140e3b91fb87a514650a7be28bf4a3) built 1980-01-01T00:00:00Z profile release).
+squeezefs: mount ready (version 1.2.1 (d551f1baf014 / d551f1baf0140e3b91fb87a514650a7be28bf4a3) built 1980-01-01T00:00:00Z profile release, exe hint: rebuild target/release and reinstall)
+[2026-09-05T19:05:25Z INFO  squeezefs::fuse_client] FUSE kernel protocol 7.45 (init flags 0x400007ff73fffffb): FOPEN_NOFLUSH advertised + honored on non-writeback opens (kernel ≥ 7.35) (D2.a; under writeback cache the elision switch is the clean-FLUSH ENOSYS latch — uapi: NOFLUSH applies 'unless FUSE_WRITEBACK_CACHE'); UNKNOWN init capability bits 0x4000040000000000 advertised — investigate whether an atomic-open-class capability is among them (D2.d adoption follow-up)
+squeezefs: FUSE kernel 7.45 — FOPEN_NOFLUSH advertised (wb-cache elision = clean-FLUSH ENOSYS latch); UNKNOWN init capability bits 0x4000040000000000 advertised — investigate whether an atomic-open-class capability is among them (D2.d adoption follow-up)
+[2026-09-05T19:05:25Z INFO  squeezefs::fuse_client] FUSE_HANDLE_KILLPRIV_V2 negotiated (kernel killpriv probe deleted; daemon owns suid/sgid/caps clearing) for this mount
+[2026-09-05T19:05:25Z INFO  fuse3::raw::connection::fuse_over_uring] fuse-over-uring queue-ring setup probe: SINGLE_ISSUER+DEFER_TASKRUN available
+FUSE-over-io_uring registered: queues=32 depth=32 payload_sz=1048576 max_write=1048576 max_pages=256 buffers=kmbuf-bufring+zero-copy+retention kmbuf_ops=38/39 (7.1-sqz) fd=145 sqpoll=off drain_groups=32(width<=1)
+[2026-09-05T19:05:25Z INFO  fuse3::raw::connection::fuse_over_uring] FUSE-over-io_uring registered: queues=32 depth=32 payload_sz=1048576 max_write=1048576 max_pages=256 buffers=kmbuf-bufring+zero-copy+retention kmbuf_ops=38/39 (7.1-sqz) fd=145 sqpoll=off drain_groups=32(width<=1)
+FUSE-over-io_uring session path armed (ready=true, queues=32)
+FUSE-over-io_uring transport armed for this session
+[2026-09-05T19:05:25Z INFO  fuse3::raw::session] FUSE-over-io_uring transport armed for this session
+FUSE-over-io_uring: classical sideband servicer armed (primary session; FORGET/INTERRUPT/resend + switchover stragglers)
+[SIG] Received SIGTERM (or signal watcher exited); shutting down.
+[SIG] Shutdown resolved. Running shutdown logic...
+[2026-09-05T19:05:29Z INFO  squeezefs::fuse_client] Received shutdown signal. Force flushing memory buffers to staging...
+[2026-09-05T19:05:29Z INFO  squeezefs::fuse_client] FUSE Daemon: Force flushing all in-memory write buffers to local NVMe staging...
+[2026-09-05T19:05:29Z INFO  squeezefs::fuse_client] FUSE Daemon: All in-memory write buffers flushed to local NVMe staging.
+[2026-09-05T19:05:29Z INFO  squeezefs::fuse_client] FUSE Daemon: Destroying mount. Force flushing all staged and memory data...
+[2026-09-05T19:05:29Z INFO  squeezefs::fuse_client] FUSE Daemon: Force flushing all in-memory write buffers to local NVMe staging...
+[2026-09-05T19:05:29Z INFO  squeezefs::fuse_client] FUSE Daemon: All in-memory write buffers flushed to local NVMe staging.
+[2026-09-05T19:05:29Z INFO  squeezefs::fuse_client] FUSE Daemon: Force flushing all staged active blocks to NVMe-oF backend...
+[2026-09-05T19:05:29Z INFO  squeezefs::fuse_client] FUSE Daemon: No staged active blocks to flush.
+[2026-09-05T19:05:29Z INFO  squeezefs::fuse_client] FUSE Daemon: Dismount clean. All write staged blocks successfully flushed to backend.
+[2026-09-05T19:05:29Z INFO  fuse3::raw::connection::fuse_over_uring] fuse-over-uring watch: /dev/fuse revents=0x8 (abort/unmount); shutting down
+[2026-09-05T19:05:29Z INFO  fuse3::raw::connection::fuse_over_uring] FUSE-over-io_uring shutting down (fd=145)
+[2026-09-05T19:05:29Z INFO  fuse3::raw::connection::fuse_over_uring] fuse-over-uring qid=0 ent=22: disconnect CQE err=107; shutting down
+[2026-09-05T19:05:29Z INFO  squeezefs::fuse_client] Cleanly unmounted filesystem on exit.

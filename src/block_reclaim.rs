@@ -957,7 +957,18 @@ impl ReclaimQueue {
             return;
         }
         let elapsed = now.saturating_sub(ws);
-        if elapsed >= DRAIN_RATE_WINDOW_MS
+        let prev = self.drain_rate.load(Ordering::Relaxed);
+        // The FIRST window is one manners tick: a cold queue parks at the
+        // shipped 1 s until a rate exists, so the first estimate must land
+        // within the worker's own cadence (the in-process rows' cold
+        // residue: p99.9 285 ms at a 250 ms first window vs an 80 ms
+        // derived bound). Steady-state windows are 250 ms.
+        let window = if prev == 0 {
+            MANNERS_TICK_MS
+        } else {
+            DRAIN_RATE_WINDOW_MS
+        };
+        if elapsed >= window
             && self
                 .drain_win_start_ms
                 .compare_exchange(ws, now, Ordering::AcqRel, Ordering::Relaxed)
@@ -967,7 +978,6 @@ impl ReclaimQueue {
             // coarse; a target that slowed under load re-learns in a few).
             let wb = self.drain_win_blocks.swap(0, Ordering::Relaxed);
             let rate = wb.saturating_mul(1000) / elapsed.max(1);
-            let prev = self.drain_rate.load(Ordering::Relaxed);
             let ewma = if prev == 0 {
                 rate
             } else {
@@ -1000,13 +1010,16 @@ impl ReclaimQueue {
     }
 
     /// Re-derive the live cap and park bound from the current measurements
-    /// (pinned knobs stay verbatim) and publish the gauges. A cap RAISE is
-    /// a room edge.
+    /// (pinned knobs stay verbatim) and publish the gauges. A cap RAISE and
+    /// a bound SHRINK are room edges (parked producers re-read both).
     fn rederive(&self) {
         let room = room_latency_ms(self.batch_blocks, self.drain_rate.load(Ordering::Relaxed));
         if !self.park_pinned {
-            self.park_bound_ms
-                .store(derived_park_bound_ms(room), Ordering::Relaxed);
+            let bound = derived_park_bound_ms(room);
+            let prev = self.park_bound_ms.swap(bound, Ordering::AcqRel);
+            if bound < prev {
+                self.room_made();
+            }
         }
         if !self.cap_pinned {
             let measured = self.arrival_rate.load(Ordering::Relaxed);
@@ -1174,7 +1187,12 @@ impl ReclaimQueue {
     /// the park's first poll would otherwise be lost and only the tick
     /// could resume us. The bound is measured from the park's START and
     /// survives every re-park (an edge that woke us into a still-full
-    /// queue does not reset it); expiry soft-overflows.
+    /// queue does not reset it) — but it is re-read LIVE on every wake: a
+    /// park that began cold (the shipped 1 s, no drain measured yet)
+    /// collapses to the derived bound the moment the first drain-rate
+    /// window rolls, instead of carrying the cold value to its end (the
+    /// in-process rows' first shape: p99.9 pinned at 1 s by cold parks
+    /// while the live bound already read 80 ms). Expiry soft-overflows.
     async fn park_at_cap(self: &Arc<Self>) {
         METRICS
             .block_free_reclaim_cap_parks
@@ -1185,8 +1203,7 @@ impl ReclaimQueue {
         self.ensure_worker();
         self.notify.notify_one();
         self.cap_wake.notify_one();
-        let bound_ms = self.park_bound_ms.load(Ordering::Relaxed);
-        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(bound_ms);
+        let start = std::time::Instant::now();
         let tick = std::time::Duration::from_millis(MANNERS_TICK_MS);
         loop {
             let mut edge = self.room.notified_raw();
@@ -1196,6 +1213,8 @@ impl ReclaimQueue {
             if self.population() < self.cap_blocks.load(Ordering::Relaxed) || self.fence_halted() {
                 return;
             }
+            let deadline = start
+                + std::time::Duration::from_millis(self.park_bound_ms.load(Ordering::Relaxed));
             let now = std::time::Instant::now();
             if now >= deadline {
                 METRICS

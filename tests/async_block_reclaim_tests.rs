@@ -2339,7 +2339,9 @@ async fn park_rows_leg(label: &str, pinned_bound: Option<&str>) {
     };
     let (router, ba, _backing, _staging) = make_router().await;
     let router = Arc::new(router);
-    let _seam = FgSeam::install(&router.backend_router);
+    // Foreground MOVING through the storm (the rewrite row's shape); idle
+    // afterwards so the residue drains (end of row).
+    let seam = FgSeam::install(&router.backend_router);
     const PRODUCERS: usize = 32;
     const PER_PRODUCER: usize = 24;
     let mut offsets = Vec::with_capacity(PRODUCERS * PER_PRODUCER);
@@ -2381,6 +2383,10 @@ async fn park_rows_leg(label: &str, pinned_bound: Option<&str>) {
     walls.sort_unstable();
     let pct = |p: f64| walls[((walls.len() as f64 - 1.0) * p).round() as usize];
     let n = offsets.len() as u64;
+    // Read the derivation gauges at the storm's end (the idle catch-up
+    // below re-learns a faster drain rate and would overwrite them).
+    let (rate_d, rate_a, bound, cap) = (drain_rate(), arrival_rate(), park_bound_ms(), queue_cap());
+    seam.idle();
     eventually_within(
         || (punches() - p0) + (skipped() - s0) == n && queue_bytes() == qb0,
         std::time::Duration::from_secs(120),
@@ -2388,7 +2394,7 @@ async fn park_rows_leg(label: &str, pinned_bound: Option<&str>) {
     )
     .await;
     println!(
-        "ROW {label}: frees {n} in {:.3} s | park wall µs p50 {} p99 {} p99.9 {} max {} | \
+        "\nROW {label}: frees {n} in {:.3} s | park wall µs p50 {} p99 {} p99.9 {} max {} | \
          cap_parks {} cap_overflow {} | drain_rate {} blocks/s arrival_rate {} bound_ms {} cap {}",
         row_wall.as_secs_f64(),
         pct(0.50),
@@ -2397,10 +2403,10 @@ async fn park_rows_leg(label: &str, pinned_bound: Option<&str>) {
         walls[walls.len() - 1],
         cap_parks() - pk0,
         cap_overflow() - ov0,
-        drain_rate(),
-        arrival_rate(),
-        park_bound_ms(),
-        queue_cap(),
+        rate_d,
+        rate_a,
+        bound,
+        cap,
     );
 }
 

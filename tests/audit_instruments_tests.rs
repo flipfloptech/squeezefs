@@ -770,23 +770,26 @@ async fn real_create_moves_the_family_and_the_stats_inode_carries_it_ungated() {
 // ---------------------------------------------------------------------------
 
 /// The four audit-D phases plus D-2's `leaf_lock_hold` (the conveyor
-/// pass's 4b union hold — the "never across device I/O" instrument).
-const LOCK_PHASES: [&str; 5] = [
+/// pass's 4b union hold — the "never across device I/O" instrument) and
+/// D-3's `dlm_guard_wait` (the CONTENDED 4a acquire's parked span; its
+/// count ≡ Σ the two 4a census classes — `tests/stripe_census_tests.rs`).
+const LOCK_PHASES: [&str; 6] = [
     "stripe_lock_wait",
     "stripe_lock_hold",
     "leaf_lock_wait",
     "dlm_guard_hold",
     "leaf_lock_hold",
+    "dlm_guard_wait",
 ];
 
 #[test]
-fn lock_family_is_pinned_to_five_phases() {
+fn lock_family_is_pinned_to_six_phases() {
     let fam = squeezefs::fuse_client::lock_phase_json();
     let obj = fam.as_object().expect("family object");
     assert_eq!(
         obj.len(),
         LOCK_PHASES.len(),
-        "exactly the five lock phases: {obj:?}"
+        "exactly the six lock phases: {obj:?}"
     );
     for p in LOCK_PHASES {
         let _ = phase_words(&fam, p);

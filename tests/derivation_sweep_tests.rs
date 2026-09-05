@@ -221,6 +221,161 @@ fn commit_batch_bytes_derives_from_journal_ring() {
 const KIB: u64 = 1024;
 
 // ---------------------------------------------------------------------------
+// D-3 — DLM-class stripe widths: the transport's delivered concurrency
+// ---------------------------------------------------------------------------
+
+/// The width law (`stripe_locks::derived_stripe_width`), pinned over the
+/// canonical grid: `next_pow2(max(shipped, 16 × possible_cpus ×
+/// q_depth))`. The product is the concurrency the FUSE-over-io_uring
+/// transport can present (one queue per kernel possible CPU × the
+/// per-queue depth); ×16 is the load-factor target (α ≤ 1/16 — a
+/// false-sharing wait, which on the 4a tables costs a whole commit, on
+/// at most one acquire in sixteen at full ring occupancy); `shipped` is
+/// the never-regress floor. Every width is a power of two ≥ shipped and
+/// ≥ 16 × cpus × depth, and the law is monotone in both inputs.
+#[test]
+fn dlm_stripe_width_derives_from_possible_cpus_times_q_depth() {
+    use squeezefs::stripe_locks::{
+        derived_stripe_width, DLM_STRIPES_SHIPPED, LEASE_STRIPES_SHIPPED, STRIPE_LOAD_FACTOR_INV,
+    };
+    assert_eq!(
+        STRIPE_LOAD_FACTOR_INV, 16,
+        "the α ≤ 1/16 load-factor target"
+    );
+    assert_eq!(
+        DLM_STRIPES_SHIPPED, 4096,
+        "the shipped 4a width is the floor"
+    );
+    assert_eq!(
+        LEASE_STRIPES_SHIPPED, 1024,
+        "the shipped waiter/serve width"
+    );
+    let cpus = [1usize, 2, 4, 8, 16, 32, 64, 128, 192];
+    let depths = [4usize, 8, 16, 32];
+    for shipped in [DLM_STRIPES_SHIPPED, LEASE_STRIPES_SHIPPED] {
+        let mut prev_by_depth = [0usize; 4];
+        for &c in &cpus {
+            for (di, &d) in depths.iter().enumerate() {
+                let w = derived_stripe_width(shipped, c, d);
+                assert!(
+                    w.is_power_of_two(),
+                    "shipped {shipped} cpus {c} depth {d}: {w}"
+                );
+                assert!(
+                    w >= shipped,
+                    "never below the shipped floor ({shipped}): {w}"
+                );
+                assert!(
+                    w >= 16 * c * d,
+                    "≥ 16 × cpus × depth (16 × {c} × {d} = {}): {w}",
+                    16 * c * d
+                );
+                assert!(
+                    w < 2 * (16 * c * d).max(shipped),
+                    "the next power of two, not beyond it: {w}"
+                );
+                assert!(w >= prev_by_depth[di], "monotone in cpus at depth {d}");
+                prev_by_depth[di] = w;
+                if di > 0 {
+                    assert!(
+                        w >= derived_stripe_width(shipped, c, depths[di - 1]),
+                        "monotone in depth at {c} cpus"
+                    );
+                }
+            }
+        }
+    }
+    // The two canonical shapes, both classes.
+    assert_eq!(
+        derived_stripe_width(4096, 32, 32),
+        16_384,
+        "field 4a: 4× shipped"
+    );
+    assert_eq!(
+        derived_stripe_width(1024, 32, 32),
+        16_384,
+        "field waiter/serve: 16×"
+    );
+    assert_eq!(
+        derived_stripe_width(4096, 2, 4),
+        4096,
+        "floor box 4a: the shipped width"
+    );
+    assert_eq!(
+        derived_stripe_width(1024, 2, 4),
+        1024,
+        "floor box waiter/serve: shipped"
+    );
+    // The depth-degraded field box (payload budget at the Q_DEPTH_FLOOR):
+    // 32 × 4 × 16 = 2048 < 4096 — the 4a floor holds.
+    assert_eq!(derived_stripe_width(4096, 32, 4), 4096);
+    assert_eq!(derived_stripe_width(1024, 32, 4), 2048);
+    // A 192-CPU box at depth 32: 98,304 → 131,072.
+    assert_eq!(derived_stripe_width(4096, 192, 32), 131_072);
+}
+
+/// `SQUEEZEFS_DLM_STRIPES` resolution: explicit wins verbatim (a non-power
+/// of two rounds UP — the index is a mask), else the derived law. `4096`
+/// is the shipped-4a control and `1` the everything-serializes crucible.
+#[test]
+fn dlm_stripes_knob_is_explicit_over_derived_and_rounds_up_to_pow2() {
+    use squeezefs::stripe_locks::resolve_dlm_stripes;
+    assert_eq!(resolve_dlm_stripes(None, 4096, 32, 32), 16_384, "derived");
+    assert_eq!(
+        resolve_dlm_stripes(Some(4096), 4096, 32, 32),
+        4096,
+        "the A/B control"
+    );
+    assert_eq!(
+        resolve_dlm_stripes(Some(1024), 4096, 32, 32),
+        1024,
+        "explicit below shipped"
+    );
+    assert_eq!(
+        resolve_dlm_stripes(Some(1), 4096, 32, 32),
+        1,
+        "the crucible"
+    );
+    assert_eq!(
+        resolve_dlm_stripes(Some(1000), 4096, 32, 32),
+        1024,
+        "rounds up to pow2"
+    );
+    assert_eq!(resolve_dlm_stripes(Some(65_536), 1024, 2, 4), 65_536);
+    // Registered, the ENG-10 way.
+    let k = squeezefs::env_knobs::KNOBS
+        .iter()
+        .find(|k| k.key == squeezefs::stripe_locks::DLM_STRIPES_ENV)
+        .expect("SQUEEZEFS_DLM_STRIPES is registered");
+    assert_eq!(
+        k.kind,
+        squeezefs::env_knobs::Kind::Int { lo: 1, hi: 1 << 24 }
+    );
+    // The live tables were built at the law's width (the process reads
+    // the knob once; this suite runs without it set).
+    let live = squeezefs::stripe_locks::dlm_stripe_width();
+    let q_depth = std::env::var("SQUEEZEFS_FUSE_OVER_IO_URING_Q_DEPTH")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .map(|d| d.clamp(1, fuse3::raw::Q_DEPTH_DESIRED))
+        .unwrap_or(fuse3::raw::Q_DEPTH_DESIRED);
+    let expect = resolve_dlm_stripes(
+        std::env::var(squeezefs::stripe_locks::DLM_STRIPES_ENV)
+            .ok()
+            .and_then(|v| v.trim().parse().ok()),
+        4096,
+        squeezefs::cpu::possible_cpus(),
+        q_depth,
+    );
+    assert_eq!(live, expect, "the live 4a width is the law's");
+    assert_eq!(
+        squeezefs::meta_backend::dlm::DlmLockManager::new().width(),
+        live,
+        "a fresh DlmLockManager is built at the live width"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // A7/A8 — W1 patch cap + W2 fold byte trigger: block-size fractions
 // ---------------------------------------------------------------------------
 
@@ -1267,6 +1422,12 @@ fn fleet_share_exemption_list_is_pinned_to_the_kernel_mandated_set() {
         // payload) against the divided budget — it reads the exempt
         // root because the demand it names cannot scale with the share.
         "src/mem_budget.rs",
+        // D-3: the DLM-class stripe widths shadow the DELIVERED ring
+        // geometry (possible_cpus × q_depth = the most ops the transport
+        // can hold in flight against one daemon's lock tables) — the op
+        // registry's class; N co-located daemons each face their own
+        // full ring, so the width is never divided.
+        "src/stripe_locks.rs",
         // The kernel-mandated queue COUNT itself (fuse_uring_create():
         // one queue per possible CPU; fewer never becomes ready) and the
         // qid-is-cpu identity check.

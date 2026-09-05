@@ -82,6 +82,11 @@ struct H {
 
 async fn make(test_id: &str, uuid: [u8; 16]) -> H {
     std::env::set_var("SQUEEZEFS_DEFAULT_BLOCK_SIZE", BS.to_string());
+    // The dest-window contracts below are the COPY vehicle's (`Served` +
+    // the serve copy into the dest); the fd-source serve (default on since
+    // 2026-09-05) lets the kernel place the body itself, so this suite pins
+    // the copy posture — `tests/read_zc_pool_serve_tests.rs` pins the other.
+    std::env::set_var("SQUEEZEFS_READ_ZC_SERVE", "0");
     std::env::set_var("SQUEEZEFS_READ_PREFETCH_WINDOW", "0");
     std::env::set_var("SQUEEZEFS_READ_RANGED_THRESHOLD", "0");
     let dlm = DlmClient::new().unwrap();
@@ -196,7 +201,7 @@ fn pattern(len: usize, tag: u8) -> Vec<u8> {
 fn served(p: FastReadProbe) -> bytes::Bytes {
     match p {
         FastReadProbe::Served(b) => b,
-        // R-4 fd-source serve (SQUEEZEFS_READ_ZC_SERVE, off in this
+        // R-4 fd-source serve (SQUEEZEFS_READ_ZC_SERVE, pinned off in this
         // suite): unreachable here, but the bytes are the body either way.
         FastReadProbe::ServedFd { body, .. } => body,
         FastReadProbe::Demote => panic!("expected Served, got Demote"),

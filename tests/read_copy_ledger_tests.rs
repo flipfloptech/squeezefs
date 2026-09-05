@@ -69,6 +69,11 @@ struct H {
 
 async fn make_with(block_size: &str, uuid: [u8; 16], alloc_ns: &str) -> H {
     std::env::set_var("SQUEEZEFS_DEFAULT_BLOCK_SIZE", block_size);
+    // This suite is the COPY ledger: its arms are the memcpy vehicles
+    // (`read_copy_*`), so it pins the copy posture explicitly. Since the
+    // R-4 default flipped to on (2026-09-05), the fd-source serve is the
+    // shipped vehicle; `tests/read_zc_pool_serve_tests.rs` is its ledger.
+    std::env::set_var("SQUEEZEFS_READ_ZC_SERVE", "0");
     let dlm = DlmClient::new().unwrap();
 
     let b = NamedTempFile::new().unwrap();

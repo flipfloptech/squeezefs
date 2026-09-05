@@ -767,7 +767,11 @@ pub static ALIGNED_BUF_POOL: Lazy<Arc<AlignedBufPool>> = Lazy::new(|| {
 /// backings keep their substrate, so an A/B on this lever moves the
 /// READ serve and nothing else. Same derived capacity (the DIVIDED root).
 pub static ZC_FILL_POOL: Lazy<Option<Arc<AlignedBufPool>>> = Lazy::new(|| {
-    if !crate::env_knobs::bool_knob("SQUEEZEFS_READ_ZC_SERVE", false) {
+    // Default ON since the 2026-09-05 field bracket (note §7.2): daemon CPU
+    // per GiB −24 % cold / −25 % warm on the unaligned population, A-B-B-A
+    // in both orders, closure exact, fd-body fallbacks 0. `=0` is the A/B
+    // control (the shipped-before shape byte-identically).
+    if !crate::env_knobs::bool_knob("SQUEEZEFS_READ_ZC_SERVE", true) {
         return None;
     }
     let capacity = block_pool_capacity_from(crate::cpu::process_parallelism());

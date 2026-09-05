@@ -609,6 +609,64 @@ async fn extending_write_completes_under_a_held_read_guard() {
     assert_eq!(read_at(&h, ino, 2 * BS, BS as usize).await, data);
 }
 
+/// KD-2's ONE upgrade under the narrowed class: the revalidation's
+/// failure mode is the snapshot EVICTION (a reclaim purge / cache drop
+/// between the pre-lock probe and the held read guard) — the writer
+/// drops its read guard, takes exclusive once, and completes on the
+/// fetch-capable path. Deterministic: the test holds the ino's exclusive
+/// guard, observes the writer PARKED on it (`SqzRwLock::waiters`), evicts
+/// both caches, then releases.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn evicted_snapshot_between_probe_and_guard_upgrades_exactly_once() {
+    let _s = SERIAL.lock().await;
+    let _reset = SeamReset;
+    set_write_shared_for_tests(true);
+    set_write_guard_narrow_for_tests(true);
+    let h = make("wsg_evict").await;
+    let ino = create(&h, "ev").await;
+    grow_striped(&h, ino, 2).await;
+
+    let lock = h.fs.active_inode_locks.get_inode_lock(ino);
+    let held = lock.write().await;
+    let l0 = ledger();
+    let fs = h.fs.clone();
+    let req = h.req;
+    let data = block_pattern(0x6B, 2, BS as usize);
+    let d2 = data.clone();
+    let w = tokio::spawn(async move { write_at(&fs, req, ino, 2 * BS, &d2).await });
+    // The writer's pre-lock probe admitted Shared; its read acquisition
+    // parks behind our exclusive guard — wait for the park itself.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while lock.waiters() == 0 {
+        assert!(
+            Instant::now() < deadline,
+            "the writer never parked on the guard"
+        );
+        tokio::task::yield_now().await;
+    }
+    h.fs.router.metadata_cache.invalidate(&ino);
+    h.fs.attr_cache.invalidate(&ino);
+    drop(held);
+    w.await.expect("writer task");
+
+    let d = delta(&l0, &ledger());
+    assert_eq!(
+        d.upgrades, 1,
+        "revalidation misses once and takes the ONE upgrade"
+    );
+    assert_eq!(
+        d.scope[SHARED], 0,
+        "an upgraded op never counts a Shared final scope"
+    );
+    assert_eq!(
+        d.scope[METAPREP], 1,
+        "it completes on the exclusive drop-before-I/O class"
+    );
+    assert_hold_closes(&d, "evicted upgrade");
+    quiesce(&h, ino).await;
+    assert_eq!(read_at(&h, ino, 2 * BS, BS as usize).await, data);
+}
+
 /// KD-2/KD-7 rails survive the widening: a cold-cache extend routes
 /// exclusive at admission (no Shared, no upgrade).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

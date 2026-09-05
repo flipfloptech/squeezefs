@@ -4385,12 +4385,16 @@ pub enum InodeWriteLockScope {
     /// size update). Data I/O runs without the inode write lock; per-block
     /// [`BLOCK_FLUSH_LOCKS`] serialize active-block mutation.
     MetaPrepOnly,
-    /// Fully-mapped within-EOF striped overwrite (KD-3): hold the READ
-    /// (shared) guard, dropped before data I/O — the same drop point as
-    /// `MetaPrepOnly` (KD-1). The guard covers classification-
-    /// revalidation, lease, and the size/type/map snapshot; it is never
-    /// a DMA fence. A Shared holder never re-enters
-    /// `active_inode_locks` on the same ino (§4.2 must-not).
+    /// Cache-resident striped write: hold the READ (shared) guard,
+    /// dropped before data I/O — the same drop point as `MetaPrepOnly`
+    /// (KD-1). The guard covers classification-revalidation, lease, and
+    /// the size/type/map snapshot; it is never a DMA fence. A Shared
+    /// holder never re-enters `active_inode_locks` on the same ino (§4.2
+    /// must-not). The convoy campaign's v1 admitted only the fully-mapped
+    /// within-EOF overwrite (KD-3); W-2 (`SQUEEZEFS_WRITE_GUARD_NARROW`,
+    /// 2026-09-05) widened the class to the extending stream and
+    /// hole-fills — their inode-plane mutations run after the drop on
+    /// both modes, so the exclusive meta-prep protected nothing.
     Shared,
 }
 
@@ -4526,6 +4530,12 @@ pub const MAX_INLINE_SIZE: u64 = 4096;
 /// exists only after PR 3's held-guard revalidation. In PR 1 candidates
 /// are counted (`write_lock_candidate_*`) while every class still takes
 /// today's exclusive guard.
+///
+/// `narrow` is the W-2 posture ([`write_guard_narrow_enabled`]): with it
+/// the Shared class is EVERY striped write whose snapshot is resident
+/// (`size_floor.is_some()` — both RAM caches, KD-7's witness), the
+/// extending stream and hole-fills included; without it the class is the
+/// convoy campaign's v1 mapped-within-EOF overwrite only.
 #[inline]
 pub fn inode_write_lock_scope(
     file_type: &str,
@@ -4534,18 +4544,29 @@ pub fn inode_write_lock_scope(
     size_floor: Option<u64>,
     range_end: u64,
     range_fully_mapped: Option<bool>,
+    narrow: bool,
 ) -> InodeWriteLockScope {
     if file_type == "striped" {
+        // Any probe miss (`None`) routes MetaPrepOnly — never a fetch,
+        // never an error (KD-2).
+        let Some(floor) = size_floor else {
+            return InodeWriteLockScope::MetaPrepOnly;
+        };
+        // W-2: a resident striped snapshot is the whole Shared predicate.
+        // The mapped/within-EOF clauses (KD-3) guarded inode-plane
+        // mutations that run AFTER the drop point on both modes — the
+        // exclusive meta-prep the extend/hole shapes took serialized a
+        // RAM-only snapshot and nothing else.
+        if narrow {
+            return InodeWriteLockScope::Shared;
+        }
         // §4.1 Shared (KD-3, v1 mapped-only): within the CONSERVATIVE
         // floor (closed bound — end == floor is within EOF) AND every
-        // touched block mapped in the one cached snapshot. Any probe
-        // miss (`None`) or any hole routes MetaPrepOnly — never a
-        // fetch, never an error (KD-2). Extending shapes publish size
-        // ⇒ MetaPrepOnly.
-        if let (Some(floor), Some(true)) = (size_floor, range_fully_mapped) {
-            if range_end <= floor {
-                return InodeWriteLockScope::Shared;
-            }
+        // touched block mapped in the one cached snapshot; any hole
+        // routes MetaPrepOnly. Extending shapes publish size ⇒
+        // MetaPrepOnly.
+        if range_fully_mapped == Some(true) && range_end <= floor {
+            return InodeWriteLockScope::Shared;
         }
         return InodeWriteLockScope::MetaPrepOnly;
     }
@@ -12509,6 +12530,7 @@ impl SqueezefsFilesystem {
             Some(floor),
             write_end,
             mapped,
+            write_guard_narrow_enabled(),
         ) == InodeWriteLockScope::Shared)
             .then_some(size)
     }
@@ -23658,6 +23680,7 @@ impl Filesystem for SqueezefsFilesystem {
                     size_floor,
                     write_end,
                     range_mapped,
+                    write_guard_narrow_enabled(),
                 )
             };
             match candidate {

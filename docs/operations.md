@@ -1226,6 +1226,7 @@ Every knob the tree reads, grouped as the registry groups them (`src/env_knobs.r
 | Knob | Accepts | Default | Purpose |
 |---|---|---|---|
 | `SQUEEZEFS_WRITE_SHARED` | bool | `on` | Shared-mode write admission: fully-mapped within-EOF striped overwrites take the inode READ guard (classify → acquire → revalidate → at most one upgrade). Default on (+7–8 % on both lanes at ~525 k IOPS); `0` = the A/B lever. |
+| `SQUEEZEFS_WRITE_GUARD_NARROW` | bool | `on` | W-2 write-stream-guard (2026-09-05): the Shared class widens to EVERY cache-resident striped write — the fresh/append (extending) stream and hole-fills included — so a qd-N stream's meta-prep takes the inode READ guard instead of handing one exclusive guard down an N-deep wake chain (its data path already ran under block locks only). `0` = the pre-campaign class (mapped within-EOF overwrites only) — the same-binary A/B lever, never an operational escape. Inert under `SQUEEZEFS_WRITE_SHARED=0`. Engagement: `write_lock_scope_shared` counts the stream's writes; `write_lock_hold_shared` is their hold. |
 | `SQUEEZEFS_NT_COPY` | bool | `on` | Non-temporal stores at the two DMA-destined copy sites; 0 = the A/B control. |
 | `SQUEEZEFS_NT_COPY_MIN` | int 0..1 TiB | `262144` | NT-store engagement floor, bytes. |
 | `SQUEEZEFS_NT_READ_SERVE` | bool | `on` | Non-temporal stores on dest-arm read serves; 0 = the A/B control. |

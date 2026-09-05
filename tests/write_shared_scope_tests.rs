@@ -40,11 +40,12 @@ const BS: u64 = 65536;
 /// are process-wide.
 static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
-/// RAII posture reset (leave the shipped default for other binaries).
+/// RAII posture reset (leave the shipped defaults for other binaries).
 struct PostureReset;
 impl Drop for PostureReset {
     fn drop(&mut self) {
         set_write_shared_for_tests(true);
+        squeezefs::fuse_client::set_write_guard_narrow_for_tests(true);
     }
 }
 
@@ -239,19 +240,23 @@ async fn mapped_overwrite_dispatches_on_the_shared_guard() {
 }
 
 /// KD-8 closure: Σ final-scope ≡ Σ candidate ≡ classified writes, and the
-/// classes agree per shape on a quiet (unraced) schedule.
+/// classes agree per shape on a quiet (unraced) schedule. Pinned on the
+/// convoy campaign's v1 class (W-2's `SQUEEZEFS_WRITE_GUARD_NARROW=0` A/B
+/// leg, where extends are MetaPrepOnly); the narrowed default's per-shape
+/// rows live in `tests/write_stream_guard_tests.rs`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn scope_ledger_closes_against_classified_writes() {
     let _s = SERIAL.lock().await;
     let _reset = PostureReset;
     set_write_shared_for_tests(true);
+    squeezefs::fuse_client::set_write_guard_narrow_for_tests(false);
     let h = make("wss_closure").await;
     let ino = create(&h, "c").await;
     grow_striped(&h, ino, 4).await;
 
     let s0 = snap();
-    // 5 Shared-shaped (within-EOF mapped), 3 extending (MetaPrepOnly),
-    // plus one fresh inline file (EntireOp).
+    // 5 Shared-shaped (within-EOF mapped), 3 extending (MetaPrepOnly on
+    // the v1 class), plus one fresh inline file (EntireOp).
     for i in 0..5u64 {
         write_at(&h, ino, i * 4096, &[0x22u8; 4096]).await;
     }
@@ -276,6 +281,10 @@ async fn scope_ledger_closes_against_classified_writes() {
          per class (upgrades would move counts between them)"
     );
     assert_eq!(d.scope[0], 5, "the five mapped overwrites ran Shared");
+    assert_eq!(
+        d.scope[1], 3,
+        "the three extends ran MetaPrepOnly (v1 class)"
+    );
     assert_eq!(d.upgrades, 0);
 }
 
@@ -288,11 +297,18 @@ async fn scope_ledger_closes_against_classified_writes() {
 /// RwLock is write-preferring), mutates both caches to the post-truncate
 /// state a real truncate publishes before dropping its guard, then
 /// releases. The writer's revalidation sees end > floor ⇒ upgrade.
+///
+/// Pinned on the v1 class (W-2's `SQUEEZEFS_WRITE_GUARD_NARROW=0` leg):
+/// under the narrowed default an extend is itself Shared, so a truncate
+/// no longer moves the verdict — the narrowed class's revalidation
+/// failure is the snapshot EVICTION, pinned in
+/// `tests/write_stream_guard_tests.rs`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn truncate_between_probe_and_guard_upgrades_exactly_once() {
     let _s = SERIAL.lock().await;
     let _reset = PostureReset;
     set_write_shared_for_tests(true);
+    squeezefs::fuse_client::set_write_guard_narrow_for_tests(false);
     let h = make("wss_upgrade").await;
     let ino = create(&h, "u").await;
     grow_striped(&h, ino, 4).await;

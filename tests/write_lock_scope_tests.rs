@@ -37,6 +37,8 @@ use tempfile::{tempdir, NamedTempFile};
 
 const BS: u64 = 65536;
 
+/// The convoy campaign's v1 class (W-2's `SQUEEZEFS_WRITE_GUARD_NARROW=0`
+/// leg): the matrix below pins it verbatim as the A/B control.
 fn classify(
     file_type: &str,
     expected_new_size: u64,
@@ -44,7 +46,68 @@ fn classify(
     end: u64,
     mapped: Option<bool>,
 ) -> InodeWriteLockScope {
-    inode_write_lock_scope(file_type, expected_new_size, BS, floor, end, mapped)
+    inode_write_lock_scope(file_type, expected_new_size, BS, floor, end, mapped, false)
+}
+
+/// The W-2 narrowed class (`SQUEEZEFS_WRITE_GUARD_NARROW=1`, the default).
+fn classify_narrow(
+    file_type: &str,
+    expected_new_size: u64,
+    floor: Option<u64>,
+    end: u64,
+    mapped: Option<bool>,
+) -> InodeWriteLockScope {
+    inode_write_lock_scope(file_type, expected_new_size, BS, floor, end, mapped, true)
+}
+
+/// W-2: with the narrowed posture EVERY cache-resident striped write is
+/// Shared — the extending stream, the hole-fill and the mapped overwrite
+/// alike — while every non-resident / non-striped arm keeps its class.
+#[test]
+fn narrowed_class_admits_every_resident_striped_shape() {
+    // The fresh/append stream: extends past the floor.
+    assert_eq!(
+        classify_narrow("striped", 5 * BS, Some(4 * BS), 5 * BS, Some(false)),
+        InodeWriteLockScope::Shared,
+        "an extending striped write is Shared under the narrowed class"
+    );
+    // A within-EOF hole-fill.
+    assert_eq!(
+        classify_narrow("striped", 4 * BS, Some(4 * BS), 2 * BS, Some(false)),
+        InodeWriteLockScope::Shared,
+        "a hole-fill is Shared under the narrowed class (its map insert runs \
+         under (3)+(3.5) after the drop, on both modes)"
+    );
+    // The v1 class stays in.
+    assert_eq!(
+        classify_narrow("striped", 2 * BS, Some(4 * BS), 2 * BS, Some(true)),
+        InodeWriteLockScope::Shared
+    );
+    // A non-resident map (indirect, not rehydrated) is still Shared: the
+    // classifier decides the guard MODE, the data path never consults it.
+    assert_eq!(
+        classify_narrow("striped", 2 * BS, Some(4 * BS), 2 * BS, None),
+        InodeWriteLockScope::Shared
+    );
+    // The rails: snapshot miss ⇒ exclusive-class (KD-2/KD-7), and the
+    // non-striped arms are untouched.
+    assert_eq!(
+        classify_narrow("striped", 2 * BS, None, 2 * BS, Some(true)),
+        InodeWriteLockScope::MetaPrepOnly,
+        "a size-floor miss routes exclusive-class regardless of posture"
+    );
+    assert_eq!(
+        classify_narrow("staged", BS, None, BS, None),
+        InodeWriteLockScope::MetaPrepOnly
+    );
+    assert_eq!(
+        classify_narrow("staged", BS + 1, None, BS + 1, None),
+        InodeWriteLockScope::EntireOp
+    );
+    assert_eq!(
+        classify_narrow("inline", 4096, None, 4096, None),
+        InodeWriteLockScope::EntireOp
+    );
 }
 
 #[test]
@@ -382,16 +445,26 @@ async fn mapped_overwrite_counts_a_shared_candidate() {
             .to_vec();
     assert_eq!(back, data);
 
-    // The extending sibling stays MetaPrepOnly.
+    // The extending sibling: a Shared candidate under W-2's narrowed class
+    // (the default), MetaPrepOnly under the `=0` A/B leg.
+    let sh0 = METRICS.write_lock_candidate_shared.load(Ordering::Relaxed);
+    write_at(&h, ino, 4 * BS, &data).await; // extends
+    assert!(
+        METRICS.write_lock_candidate_shared.load(Ordering::Relaxed) > sh0,
+        "an extending striped write is a Shared candidate under the narrowed class"
+    );
+    squeezefs::fuse_client::set_write_guard_narrow_for_tests(false);
     let mp0 = METRICS
         .write_lock_candidate_metaprep
         .load(Ordering::Relaxed);
-    write_at(&h, ino, 4 * BS, &data).await; // extends
+    write_at(&h, ino, 5 * BS, &data).await; // extends
+    squeezefs::fuse_client::set_write_guard_narrow_for_tests(true);
     assert!(
         METRICS
             .write_lock_candidate_metaprep
             .load(Ordering::Relaxed)
             > mp0,
-        "an extending striped write is a MetaPrepOnly candidate"
+        "under SQUEEZEFS_WRITE_GUARD_NARROW=0 an extending striped write is a \
+         MetaPrepOnly candidate (the pre-campaign class)"
     );
 }

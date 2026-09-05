@@ -180,6 +180,13 @@ impl<T> SqzRwLock<T> {
         }
     }
 
+    /// Parked acquirers (test/diagnostic surface — the deterministic
+    /// "the writer is parked on this guard" observable, in place of a
+    /// sleep).
+    pub fn waiters(&self) -> usize {
+        self.core.queue_len()
+    }
+
     /// `Arc`-owned shared guard (the `DlmGuard` shape).
     pub async fn read_owned(self: Arc<Self>) -> OwnedSqzRwLockReadGuard<T> {
         acquire_ticked(&self.core, Want::Shared).await;

@@ -241,7 +241,24 @@ fixed binary's). Red: `the_residence_histogram_resets_with_the_plane`
 and exact words together — called by the seam (`39bdf9e6`). Product
 behavior unchanged (no production reset path exists).
 
-## 6. Fleet acceptance — OWED (parent runs)
+## 6. Fleet acceptance — OWED (attempted 2026-09-05, blocked by the box)
+
+**Attempt 2026-09-05 15:33 (dev box, `perf/five` stack `d551f1ba`):**
+`sudo SQZ_MWFLEET_OSS_GB=32 SQZ_MWFLEET_RANGE_CUSTODY=1 tests/mw_fleet.sh
+create N=1 --cowriters=8` built its tcp devsub instance and then failed
+at the writer-identity meta connect (`nvme nvme1: creating 26 I/O queues
+… Connect command failed, errno: -18 … failed to connect queue: 15`) — the
+same kernel-level `nvme connect` fault the zc gate's live NVMe-reservation
+leg hit the same hour: the 1.2.1 fstests CPU-hotplug test (`generic/650`,
+09-04 22:48) left CPUs 8, 10, 20, 22, 28, 30 firmware-latched offline
+(26 of 32; every re-online attempt "failed to report alive state"), and
+default-queue-count nvme-tcp connects now fail at queue 15 while 4-queue
+connects (the plain dev substrate's) succeed. Not a product fault (the
+D-1c fleet brackets ran on this box the day before; the matrix leg was
+never reached) and not this campaign's. **Re-run from zero after the
+reboot the latched cores need**, on the quiet box the venue demands
+(probe ≥ 750 MiB/s). Recipe unchanged below.
+
 
 The design's PR 5 rung. Not run here (root + devsub + fleet scripts are the
 parent's; four campaigns share this box). **PR 5's harness rung is NOT

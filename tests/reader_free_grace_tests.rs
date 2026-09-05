@@ -128,6 +128,34 @@
 //!     which is the failure the valve exists to prevent (and which an
 //!     ordinary `SQUEEZEFS_META_FLUSH_INTERVAL_MS` already makes reachable
 //!     without any valve at all).
+//!
+//! ## The sustain campaign's closed loop (D-4, ladder row 13)
+//!
+//! `docs/design-free-grace-sustain.md`'s §3 rate equation, driven end to
+//! end in-process on the manual owner clock (the `LoopShape` harness —
+//! every decision is product code: labels, runway, rungs (a)/(a′), site 0,
+//! the ladder's gates, the min-composition, the sweep, the L3 refresh).
+//! Four shapes × the four lever configurations of PR 5's A/B (A0 =
+//! pre-campaign, A3 = shipped), printed as `ROW` lines for
+//! `.benchmarks/2026-09-05-d4-free-grace-sustain.md`:
+//!
+//! 19. **The recycle-bound stream releases faster with the levers and
+//!     never fences**: closure on every configuration, `forced = fences
+//!     = 0`, A3 sustains the stream above A0 with a lower `bound_age` and
+//!     no more stalls, and site 0 observes the coupling.
+//! 20. **Little's law holds on a still-bound stream**: `rate ≈ spare ÷
+//!     bound_age` on every configuration (the §3.3 reconciliation on live
+//!     gauges), and the shipped ceiling sits above the pre-campaign one by
+//!     the latency it removes.
+//! 21. **Finding D4-1 (economy, pinned as current behavior)**: the
+//!     re-based runway divides ONE lane's supply by the FLEET's ring rate,
+//!     so a mid-supply lane is asked the floor cadence for a storm's whole
+//!     duration — buying parked inventory, never throughput.
+//! 22. **An uncoupled fleet runs the routine beat and the demand arm stays
+//!     dark** (the 2026-08-30 GREEN s11-mpiio row's shape): `demand_waits
+//!     = prods = stalls = 0`, `bound_age` at the routine composite under
+//!     every configuration — PR 5's gate (c) is a statement about a
+//!     COUPLED storm.
 
 use squeezefs::block_allocator::BlockAllocator;
 use squeezefs::block_reclaim::{ReclaimEntry, ReclaimQueue};
@@ -2416,6 +2444,745 @@ fn bound_age_and_residence_follow_the_ring() {
         0,
         "the ring drained: the instrument falls to 0"
     );
+}
+
+// ===========================================================================
+// D-4 (e2e perf audit ladder row 13, DLM #6 — `.benchmarks/2026-09-05-d4-
+// free-grace-sustain.md`): the design's §3 RATE EQUATION, closed-loop,
+// in-process. Every decision below is PRODUCT code on the manual owner
+// clock — labels, the runway, rung (a)/(a′), site 0, the ladder's three
+// gates, the min-composition, the sweep, the L3 refresh — and the only
+// test-side arithmetic is the allocator's free-list bookkeeping (counts
+// of blocks by residue class, `BlockAllocator`'s own law: a lane-0 stream
+// reaches lane-0 offsets only; foreign-lane releases accumulate on the
+// passed-global number until a lane harvest consumes them, and none runs
+// here — the row's `alloc_lane_harvests 0`). L5 (the co-writer's
+// ahead-of-stall refill) rides the publish wire and is NOT in this loop;
+// L2b is structurally inert on this venue (routine pass = the 1 s floor).
+// ===========================================================================
+
+/// The design's §3.4 loop, parametrized (`docs/design-free-grace-sustain.md`).
+#[derive(Debug, Clone, Copy)]
+struct LoopShape {
+    label: &'static str,
+    /// Readers acknowledging (the s11 venue: 8 co-writers).
+    members: usize,
+    /// The STARVING stream's circulating spare, blocks — lane 0's
+    /// `lane_reachable` at t0 (all virgin).
+    lane_spare: u64,
+    /// The starving stream's offered rewrite demand, blocks/s.
+    lane_demand_per_s: u64,
+    /// The rest of the fleet's displaced frees entering the SAME ring
+    /// (co-writer-lane blocks the authority `finish_free`s), blocks/s.
+    storm_per_s: u64,
+    /// Owner-clock duration.
+    duration_ms: u64,
+    /// Members' first renewals spread across one beat (the §3.2 T8 phase
+    /// assumption) or all in phase (the mw rig's near-simultaneous start).
+    staggered: bool,
+}
+
+/// One measured row of the loop (the note's columns). Every `*_steady`
+/// figure is a delta over the steady window (the last two thirds — the
+/// first third is the loop's fill: readers acking their first labels, the
+/// lane spending its virgin margin).
+#[derive(Debug, Clone)]
+struct LoopRow {
+    config: &'static str,
+    /// Lane-0 allocations that landed, per steady second — the stream's
+    /// sustained throughput (× 4 MiB = MiB/s).
+    steady_allocs_per_s: f64,
+    /// The thirds law: middle-third vs last-third throughput.
+    mid_third_per_s: f64,
+    last_third_per_s: f64,
+    /// `StorageFull` refusals in the steady window (each one park slice).
+    stalls_steady: u64,
+    deferrals: u64,
+    releases: u64,
+    held_end: u64,
+    forced: u64,
+    fences: u64,
+    bound_age_mean_ms: f64,
+    bound_age_max_ms: u64,
+    residence_mean_ms: f64,
+    /// Prods handed out in the steady window (the bootstrap's own prods —
+    /// a ring whose first two labels land in one ms reads a zero runway —
+    /// belong to the fill).
+    prods_steady: u64,
+    demand_prods: u64,
+    demand_waits: u64,
+    bound_refreshes: u64,
+    tightenings: u64,
+    prod_decays: u64,
+    acks_steady: u64,
+    renewals_steady: u64,
+    from_freelist: u64,
+    fresh: u64,
+}
+
+impl LoopRow {
+    fn render(&self, shape: &LoopShape) -> String {
+        format!(
+            "ROW {label} {config}: lane {mibs:.1} MiB/s ({allocs:.2} blk/s; thirds mid {mid:.2} / \
+             last {last:.2}) stalls {stalls} | deferrals {d} releases {r} held {h} closure {clo} | \
+             forced {f} fences {fe} | bound_age mean {ba:.0} ms max {bam} ms residence mean {res:.0} ms | \
+             prods {p} demand_prods {dp} demand_waits {dw} refreshes {rf} tightenings {t} decays {dec} | \
+             acks {acks} renewals {ren} | alloc freelist {fl} fresh {fr}",
+            label = shape.label,
+            config = self.config,
+            mibs = self.steady_allocs_per_s * 4.0,
+            allocs = self.steady_allocs_per_s,
+            mid = self.mid_third_per_s,
+            last = self.last_third_per_s,
+            stalls = self.stalls_steady,
+            d = self.deferrals,
+            r = self.releases,
+            h = self.held_end,
+            clo = if self.deferrals == self.releases + self.held_end { "OK" } else { "BROKEN" },
+            f = self.forced,
+            fe = self.fences,
+            ba = self.bound_age_mean_ms,
+            bam = self.bound_age_max_ms,
+            res = self.residence_mean_ms,
+            p = self.prods_steady,
+            dp = self.demand_prods,
+            dw = self.demand_waits,
+            rf = self.bound_refreshes,
+            t = self.tightenings,
+            dec = self.prod_decays,
+            acks = self.acks_steady,
+            ren = self.renewals_steady,
+            fl = self.from_freelist,
+            fr = self.fresh,
+        )
+    }
+}
+
+/// One simulated reader: its ladder (product code), the label it learned
+/// on its last grant, the ack it is carrying, and its two cadences.
+struct SimReader {
+    id: String,
+    epoch: u64,
+    ladder: ReaderAckLadder,
+    learned: (u64, u64),
+    acked: u64,
+    next_renew_ms: u64,
+    next_pass_ms: u64,
+}
+
+const LOOP_BLOCK: u64 = 4 * 1024 * 1024;
+/// The partition width the s11 venue derives (9 writers → 16).
+const LOOP_LANES: u64 = 16;
+/// The starving stream's residue class.
+const LOOP_LANE: u64 = 0;
+/// A parked writer's queue depth: demand beyond it is a STALLED writer,
+/// not a backlog — the storm is paced by the loop, never queued forever.
+const LOOP_MAX_BACKLOG: u64 = 16;
+/// The simulation step: one owner-clock millisecond, so a storm's frees
+/// spread across labels the way a real one's do (two frees stamped in one
+/// ms read as a zero-span burst — the documented cliff reading — which a
+/// coarser step would manufacture at every tick).
+const LOOP_STEP_MS: u64 = 1;
+
+/// Drive the closed loop once under one lever configuration.
+///
+/// The starving stream (lane 0) allocates at its offered rate through the
+/// allocator's funnel order — harvest, free list, virgin mint, then the
+/// `StorageFull` arm's pressure harvest — and every landed rewrite
+/// displaces one lane-0 block into the ring. The storm (the co-writers'
+/// shipped frees) enters the same ring at its own rate and its releases
+/// pile up on the passed-global number, reachable to nobody here. Members
+/// pass once per revalidation interval (every pass advances the epoch —
+/// a storming writer checkpoints continuously) and renew on the cadence
+/// their last grant carried; the owner sweeps on `renew_interval`.
+fn run_closed_loop(shape: &LoopShape, pipeline: bool, demand: bool) -> LoopRow {
+    free_grace::reset_for_test();
+    membership::uninstall();
+    free_grace::test_set_ack_pipeline(Some(pipeline));
+    free_grace::test_set_demand(Some(demand));
+    let (clock, ticks) = manual_clock();
+    let owner = armed_owner(&clock);
+    free_grace::arm_owner_plane(clock.clone(), owner.clocks()).expect("derived bound");
+    let clocks = owner.clocks().clone();
+    let renew_ms = clocks.renew_interval.as_millis() as u64;
+    let skew_ms = clocks.skew_max.as_millis() as u64;
+    let staleness_ms = squeezefs::ro_coherence::reader_staleness_bound().as_millis() as u64;
+    let pass_ms = squeezefs::ro_coherence::reader_revalidate_interval().as_millis() as u64;
+    let qualify_lag_ms = staleness_ms + skew_ms;
+    let drain_lag_ms = staleness_ms + clocks.d_purge.as_millis() as u64;
+    let refresh_floor_ms = pass_ms.max(skew_ms);
+
+    let t0 = clock.now_ms();
+    let mut readers: Vec<SimReader> = (0..shape.members)
+        .map(|i| {
+            let id = format!("sim-reader-{i}");
+            let grant = join(&owner, &id, MemberRole::Reader);
+            let phase = if shape.staggered {
+                renew_ms * (i as u64 + 1) / shape.members as u64
+            } else {
+                renew_ms
+            };
+            SimReader {
+                id,
+                epoch: grant.epoch,
+                ladder: ReaderAckLadder::new(),
+                learned: (grant.granted_at_owner_ms, t0),
+                acked: 0,
+                next_renew_ms: t0 + phase,
+                next_pass_ms: t0 + pass_ms,
+            }
+        })
+        .collect();
+    owner.refresh_free_grace_bound();
+    assert!(free_grace::armed(), "owner + members ⇒ the gate is live");
+
+    // The ring is never the constraint (the field: 572 of 3.6 M) — cap it
+    // far above anything this loop holds.
+    let ring = GraceRing::new(1 << 22);
+    // The allocator's arithmetic — lane 0's reachable set and the
+    // passed-global accumulation (`BlockAllocator::{lane_reachable_blocks,
+    // free_supply_blocks}`; `grace_supply_blocks` resolves the lever).
+    let mut lane_free: u64 = 0;
+    let mut lane_virgin: u64 = shape.lane_spare;
+    let mut foreign_released: u64 = 0;
+    let mut lane_mint: u64 = 0;
+    let mut storm_mint: u64 = 0;
+    let route = |released: &[u64], lane_free: &mut u64, foreign: &mut u64| {
+        for off in released {
+            if (off / LOOP_BLOCK) % LOOP_LANES == LOOP_LANE {
+                *lane_free += 1;
+            } else {
+                *foreign += 1;
+            }
+        }
+    };
+    let harvest = |ring: &GraceRing, lane_free: &mut u64, lane_virgin: u64, foreign: &mut u64| {
+        let lane_reachable = *lane_free + lane_virgin;
+        let supply = if demand {
+            lane_reachable
+        } else {
+            lane_reachable + *foreign
+        };
+        let released = ring.harvest_with_supply(free_grace::HARVEST_BATCH, supply, lane_reachable);
+        route(&released, lane_free, foreign);
+    };
+
+    let mut lane_acc: u64 = 0;
+    let mut storm_acc: u64 = 0;
+    let mut allocs_by_third = [0u64; 3];
+    let mut from_freelist = 0u64;
+    let mut fresh = 0u64;
+    let mut renewals = 0u64;
+    let mut bound_age_samples: Vec<u64> = Vec::new();
+    let mut next_sample_ms = t0 + pass_ms;
+    let mut next_sweep_ms = t0 + renew_ms;
+    // A refused allocation parks for the product's own slice before it
+    // re-runs the pressure harvest (finding 29's bounded wait).
+    let mut parked_until_ms = 0u64;
+    let third_ms = shape.duration_ms / 3;
+    let steady_from_ms = t0 + third_ms;
+    let end = t0 + shape.duration_ms;
+    // Counters snapshotted at the steady window's start (deltas below).
+    let mut at_steady: Option<(u64, u64, u64, u64)> = None;
+
+    while clock.now_ms() < end {
+        ticks.fetch_add(LOOP_STEP_MS, Ordering::SeqCst);
+        let now = clock.now_ms();
+        let third = ((now - t0) / third_ms.max(1)).min(2) as usize;
+        if at_steady.is_none() && now >= steady_from_ms {
+            at_steady = Some((
+                free_grace::alloc_stalls(),
+                free_grace::prods(),
+                free_grace::reader_acks(),
+                renewals,
+            ));
+        }
+
+        // The storm: the co-writers' displaced frees, `finish_free`d at
+        // the authority (each runs the routine harvest, per terminal free).
+        storm_acc += shape.storm_per_s * LOOP_STEP_MS;
+        while storm_acc >= 1_000 {
+            storm_acc -= 1_000;
+            let lane = 1 + (storm_mint % (LOOP_LANES / 2));
+            let idx = storm_mint * LOOP_LANES + lane;
+            storm_mint += 1;
+            assert!(ring.defer(idx * LOOP_BLOCK, LOOP_BLOCK), "armed ⇒ deferred");
+            harvest(&ring, &mut lane_free, lane_virgin, &mut foreign_released);
+        }
+
+        // The starving stream: the allocator's funnel, in its order.
+        lane_acc =
+            (lane_acc + shape.lane_demand_per_s * LOOP_STEP_MS).min(LOOP_MAX_BACKLOG * 1_000);
+        while lane_acc >= 1_000 && now >= parked_until_ms {
+            harvest(&ring, &mut lane_free, lane_virgin, &mut foreign_released);
+            let landed = if lane_free > 0 {
+                lane_free -= 1;
+                from_freelist += 1;
+                true
+            } else if lane_virgin > 0 {
+                lane_virgin -= 1;
+                fresh += 1;
+                true
+            } else {
+                // The `StorageFull` arm: the pressure harvest, then the
+                // counted refusal and the park (finding 29).
+                let released = ring.harvest_pressure(free_grace::HARVEST_BATCH);
+                route(&released, &mut lane_free, &mut foreign_released);
+                if lane_free > 0 {
+                    lane_free -= 1;
+                    from_freelist += 1;
+                    true
+                } else {
+                    free_grace::note_alloc_stall(ring.len(), ring.bytes());
+                    parked_until_ms = now + free_grace::pressure_park_slice_ms();
+                    false
+                }
+            };
+            if !landed {
+                break;
+            }
+            lane_acc -= 1_000;
+            allocs_by_third[third] += 1;
+            // The rewrite displaces one lane-0 block: it enters the ring.
+            let idx = lane_mint * LOOP_LANES + LOOP_LANE;
+            lane_mint += 1;
+            assert!(ring.defer(idx * LOOP_BLOCK, LOOP_BLOCK), "armed ⇒ deferred");
+        }
+
+        // The readers: passes (the ladder) and renewals (the carriage).
+        for r in readers.iter_mut() {
+            if now >= r.next_pass_ms {
+                let promoted = r.ladder.note_pass(AckInputs {
+                    label: r.learned.0,
+                    learned_at_ms: r.learned.1,
+                    pass_start_ms: now,
+                    now_ms: now,
+                    advanced: true,
+                    qualify_lag_ms,
+                    drain_lag_ms,
+                    refresh_floor_ms,
+                });
+                if let Some(label) = promoted {
+                    r.acked = label;
+                }
+                r.next_pass_ms += pass_ms;
+            }
+            if now >= r.next_renew_ms {
+                match owner.renew(&r.id, r.epoch, r.acked) {
+                    RenewOutcome::Renewed(grant) => {
+                        r.learned = (grant.granted_at_owner_ms, now);
+                        r.next_renew_ms = now + grant.renew_ms.max(LOOP_STEP_MS);
+                        renewals += 1;
+                    }
+                    other => panic!("a healthy reader's renewal is admitted: {other:?}"),
+                }
+            }
+        }
+
+        // The owner's sweep (the idle-fleet backstop).
+        if now >= next_sweep_ms {
+            owner.refresh_free_grace_bound();
+            next_sweep_ms += renew_ms;
+        }
+        if now >= next_sample_ms {
+            if third >= 1 {
+                bound_age_samples.push(free_grace::bound_age_ms());
+            }
+            next_sample_ms += pass_ms;
+        }
+    }
+
+    let steady_secs = (shape.duration_ms - third_ms) as f64 / 1_000.0;
+    let third_secs = third_ms as f64 / 1_000.0;
+    let residence_mean_ms = free_grace::stats_snapshot()["free_grace_residence_ms"]["mean_ns"]
+        .as_u64()
+        .unwrap_or(0) as f64
+        / 1e6;
+    let (stalls0, prods0, acks0, renewals0) = at_steady.expect("the loop ran past its fill");
+    let row = LoopRow {
+        config: match (pipeline, demand) {
+            (false, false) => "A0 pipeline=0 demand=0",
+            (true, false) => "A1 pipeline=1 demand=0",
+            (false, true) => "A2 pipeline=0 demand=1",
+            (true, true) => "A3 pipeline=1 demand=1",
+        },
+        steady_allocs_per_s: (allocs_by_third[1] + allocs_by_third[2]) as f64 / steady_secs,
+        mid_third_per_s: allocs_by_third[1] as f64 / third_secs,
+        last_third_per_s: allocs_by_third[2] as f64 / third_secs,
+        stalls_steady: free_grace::alloc_stalls() - stalls0,
+        deferrals: free_grace::deferrals(),
+        releases: free_grace::releases(),
+        held_end: free_grace::held_offsets(),
+        forced: free_grace::forced_releases(),
+        fences: free_grace::laggard_fences(),
+        bound_age_mean_ms: bound_age_samples.iter().sum::<u64>() as f64
+            / bound_age_samples.len().max(1) as f64,
+        bound_age_max_ms: bound_age_samples.iter().copied().max().unwrap_or(0),
+        residence_mean_ms,
+        prods_steady: free_grace::prods() - prods0,
+        demand_prods: free_grace::demand_prods(),
+        demand_waits: free_grace::demand_waits(),
+        bound_refreshes: free_grace::bound_refreshes(),
+        tightenings: free_grace::bound_tightenings(),
+        prod_decays: free_grace::prod_decays(),
+        acks_steady: free_grace::reader_acks() - acks0,
+        renewals_steady: renewals - renewals0,
+        from_freelist,
+        fresh,
+    };
+    drop(readers);
+    assert!(free_grace::test_clear_ack_pipeline());
+    assert!(free_grace::test_clear_demand());
+    row
+}
+
+/// The four lever configurations the acceptance A/B names (PR 5 (e)):
+/// A0 = the pre-campaign shape (`ACK_PIPELINE=0 DEMAND=0`), A3 = shipped.
+fn run_loop_matrix(shape: &LoopShape) -> [LoopRow; 4] {
+    let rows = [
+        run_closed_loop(shape, false, false),
+        run_closed_loop(shape, true, false),
+        run_closed_loop(shape, false, true),
+        run_closed_loop(shape, true, true),
+    ];
+    for r in &rows {
+        println!("{}", r.render(shape));
+    }
+    rows
+}
+
+/// **The recycle-bound stream (finding 15's shape): the levers move the
+/// loop's ceiling, and the promise never bends.** Lane 0's spare is
+/// smaller than its demand × the routine loop latency, so the stream is
+/// paced by the release rate (Little's law: `spare ÷ L_lag`). The storm
+/// keeps the passed-global number high (foreign-lane releases nobody
+/// harvests — the KD-FG-10 skew), so the pre-campaign valve reads no
+/// scarcity while the lane starves.
+///
+/// Laws pinned (numbers printed as `ROW` lines for the note):
+/// * closure `deferrals ≡ releases + held` on every configuration;
+/// * `forced_releases = 0` and `laggard_fences = 0` on every configuration
+///   (faster HONEST acks, never faster fences);
+/// * the shipped configuration (A3) sustains the stream at a higher rate
+///   than the pre-campaign one (A0), with a lower steady `bound_age`, and
+///   never stalls it more;
+/// * the demand arm engages on this shape — site 0 observes the coupling
+///   (`demand_waits > 0`) and the members are asked at the floor
+///   (`prods > 0`). `demand_prods` is NOT asserted: it counts prods the
+///   space arm would not have issued, and under the KD-FG-10 re-base the
+///   space arm reads the same lane-reachable trough and asks the floor on
+///   its own — the mark's share is 0 by the ledger's own definition.
+#[test]
+fn the_recycle_bound_loop_releases_faster_with_the_levers_and_never_fences() {
+    let _serial = serial();
+    let shape = LoopShape {
+        label: "coupled(spare=256,demand=20/s,storm=500/s,8m,staggered)",
+        members: 8,
+        lane_spare: 256,
+        lane_demand_per_s: 20,
+        storm_per_s: 500,
+        duration_ms: 300_000,
+        staggered: true,
+    };
+    let rows = run_loop_matrix(&shape);
+    for r in &rows {
+        assert_eq!(
+            r.deferrals,
+            r.releases + r.held_end,
+            "{}: closure — no leak, no double release",
+            r.config
+        );
+        assert_eq!(
+            r.forced, 0,
+            "{}: no forced release on a healthy fleet",
+            r.config
+        );
+        assert_eq!(
+            r.fences, 0,
+            "{}: no laggard fence on a healthy fleet",
+            r.config
+        );
+        assert!(
+            r.deferrals > 0 && r.releases > 0,
+            "{}: the loop ran (deferrals {} releases {})",
+            r.config,
+            r.deferrals,
+            r.releases
+        );
+    }
+    let a0 = &rows[0];
+    let a3 = &rows[3];
+    assert!(
+        a3.demand_waits > 0 && a3.prods_steady > 0,
+        "the shipped configuration observes the coupling and asks the floor \
+         (demand_waits {} prods {})",
+        a3.demand_waits,
+        a3.prods_steady
+    );
+    assert!(
+        a3.steady_allocs_per_s > a0.steady_allocs_per_s,
+        "the levers raise the recycle-bound stream's sustained rate: A3 {:.2} vs A0 {:.2} blk/s",
+        a3.steady_allocs_per_s,
+        a0.steady_allocs_per_s
+    );
+    assert!(
+        a3.bound_age_mean_ms < a0.bound_age_mean_ms,
+        "the levers cut the loop latency: A3 bound_age {:.0} vs A0 {:.0} ms",
+        a3.bound_age_mean_ms,
+        a0.bound_age_mean_ms
+    );
+    assert!(
+        a3.stalls_steady <= a0.stalls_steady,
+        "the levers never stall the stream more: A3 {} vs A0 {}",
+        a3.stalls_steady,
+        a0.stalls_steady
+    );
+}
+
+/// **Little's law on the closed loop: when the stream stays recycle-bound
+/// even post-fix, its ceiling is `spare ÷ L_lag`, and the levers move it
+/// by exactly the latency they remove.** Lane 0's spare (128 blocks) is
+/// below demand × the POST-fix latency, so every configuration runs
+/// below the offered rate; the sustained rate must then agree with the
+/// circulating inventory over the measured bound age (the §3.3
+/// reconciliation — `held ÷ rate = L_lag` — on live gauges), and the
+/// shipped configuration's ceiling must sit above the pre-campaign one
+/// in the same ratio its latency sits below.
+#[test]
+fn a_still_bound_stream_runs_at_spare_over_latency_on_every_configuration() {
+    let _serial = serial();
+    let shape = LoopShape {
+        label: "bound(spare=128,demand=20/s,storm=500/s,8m,staggered)",
+        members: 8,
+        lane_spare: 128,
+        lane_demand_per_s: 20,
+        storm_per_s: 500,
+        duration_ms: 300_000,
+        staggered: true,
+    };
+    let rows = run_loop_matrix(&shape);
+    for r in &rows {
+        assert_eq!(
+            r.deferrals,
+            r.releases + r.held_end,
+            "{}: closure",
+            r.config
+        );
+        assert_eq!(r.forced, 0, "{}: no forced release", r.config);
+        assert_eq!(r.fences, 0, "{}: no laggard fence", r.config);
+        assert!(
+            r.steady_allocs_per_s < shape.lane_demand_per_s as f64,
+            "{}: the stream is recycle-bound ({:.2} < {} blk/s)",
+            r.config,
+            r.steady_allocs_per_s,
+            shape.lane_demand_per_s
+        );
+        // Little's law: rate ≈ spare ÷ L_lag, with L_lag read as the
+        // steady bound age (the inventory's own residence). Bucketed
+        // gauges and the park slice's quantization leave ±30 %.
+        let littles = shape.lane_spare as f64 / (r.bound_age_mean_ms / 1_000.0);
+        assert!(
+            (r.steady_allocs_per_s - littles).abs() <= 0.3 * littles,
+            "{}: sustained {:.2} blk/s vs spare ÷ bound_age {:.2} (Little's law)",
+            r.config,
+            r.steady_allocs_per_s,
+            littles
+        );
+    }
+    let a0 = &rows[0];
+    let a3 = &rows[3];
+    assert!(
+        a3.steady_allocs_per_s > a0.steady_allocs_per_s
+            && a3.bound_age_mean_ms < a0.bound_age_mean_ms,
+        "the shipped configuration's ceiling is above the pre-campaign one \
+         because its latency is below (A3 {:.2} blk/s @ {:.0} ms vs A0 {:.2} @ {:.0})",
+        a3.steady_allocs_per_s,
+        a3.bound_age_mean_ms,
+        a0.steady_allocs_per_s,
+        a0.bound_age_mean_ms
+    );
+}
+
+/// **Finding D4-1 (economy class, pinned as CURRENT behavior — a
+/// follow-on that changes the divisor must flip this assertion red
+/// first).** The re-based runway (KD-FG-10) reads ONE lane's reachable
+/// supply but divides it by the RING's deferral rate, which on an
+/// authority that `finish_free`s the whole fleet's shipped frees is the
+/// FLEET's rate: `runway = lane_reachable ÷ fleet_rate`. A lane whose own
+/// demand would take 200 s to spend its spare therefore reads a ≈ 8 s
+/// runway under a 500 blk/s storm, and rung (a) asks every member the
+/// floor cadence for the storm's whole duration. What that buys is
+/// INVENTORY, not throughput: the stream was never recycle-bound (it runs
+/// at its offered rate with or without the prods), but the parked
+/// inventory falls by λ × (L_routine − L_floor) — the row below holds
+/// ≈ 4.5 k blocks instead of ≈ 12 k (≈ 30 GiB of the fleet's spare not
+/// parked). The cost is the floor beat on the lease lane for the storm's
+/// duration (§5.8's "pressure-scoped" term becomes storm-scoped). Never a
+/// correctness effect — rung (b)'s floor is one honest ack cycle and no
+/// fence results — and structurally absent on a solo writer, whose ring
+/// rate IS its allocation rate. The lane's own claim rate (the EWMA L5
+/// keeps for the co-writer watermark) is the divisor that would make the
+/// runway a per-lane forecast; whether the inventory is worth the beats
+/// is the trade this row prices for the adjudication.
+#[test]
+fn a_mid_supply_lane_is_asked_at_the_floor_by_the_fleet_rate_divisor() {
+    let _serial = serial();
+    let shape = LoopShape {
+        label: "midsupply(spare=4096,demand=20/s,storm=500/s,8m,staggered)",
+        members: 8,
+        lane_spare: 4_096,
+        lane_demand_per_s: 20,
+        storm_per_s: 500,
+        duration_ms: 300_000,
+        staggered: true,
+    };
+    let rows = run_loop_matrix(&shape);
+    for r in &rows {
+        assert_eq!(
+            r.deferrals,
+            r.releases + r.held_end,
+            "{}: closure",
+            r.config
+        );
+        assert_eq!(r.forced, 0, "{}: no forced release", r.config);
+        assert_eq!(r.fences, 0, "{}: no laggard fence", r.config);
+        assert_eq!(r.stalls_steady, 0, "{}: never recycle-bound", r.config);
+        assert!(
+            (r.steady_allocs_per_s - shape.lane_demand_per_s as f64).abs() < 0.5,
+            "{}: the stream runs at its offered rate regardless ({:.2})",
+            r.config,
+            r.steady_allocs_per_s
+        );
+    }
+    // The passed-global runway (DEMAND=0) reads the foreign accumulation
+    // and never prods; the lane-reachable one (DEMAND=1) prods at the
+    // floor on every renewal of the steady window — the finding.
+    assert_eq!(
+        rows[0].prods_steady, 0,
+        "A0: the passed-global runway is long"
+    );
+    assert!(
+        rows[3].prods_steady >= rows[3].renewals_steady * 9 / 10,
+        "A3: the fleet-rate divisor asks the floor on ≈ every renewal \
+         (prods {} of {} renewals) — finding D4-1",
+        rows[3].prods_steady,
+        rows[3].renewals_steady
+    );
+}
+
+/// **The residence histogram resets with the plane** (RED against the
+/// tree at `27a396e1`): `160650e3` (audit A) gave every latency histogram
+/// exact `count`/`sum_ns`/`mean_ns` words AFTER `reset_for_test` was
+/// written, and the seam kept zeroing the buckets alone — so
+/// `free_grace_residence_ms.mean_ns` bled from one contract into the
+/// next (the same deterministic loop read a 13.9 s and a 23.9 s mean in
+/// two process orders). A seam that resets HALF an instrument is a
+/// measurement hazard, not a flake: every row's residence column rode
+/// on it.
+#[test]
+fn the_residence_histogram_resets_with_the_plane() {
+    let _serial = serial();
+    let (clock, ticks) = manual_clock();
+    let owner = armed_owner(&clock);
+    free_grace::arm_owner_plane(clock.clone(), owner.clocks()).expect("derived bound");
+    let grant = join(&owner, "r-reset", MemberRole::Reader);
+    owner.refresh_free_grace_bound();
+    let ring = GraceRing::new(64);
+    let label = clock.now_ms() + 1;
+    assert!(ring.defer(4 * 1024 * 1024, 4 * 1024 * 1024));
+    ticks.fetch_add(5_000, Ordering::SeqCst);
+    ack(&owner, "r-reset", grant.epoch, label);
+    assert_eq!(ring.harvest_with_supply(64, u64::MAX, u64::MAX).len(), 1);
+    let hist = free_grace::stats_snapshot()["free_grace_residence_ms"].clone();
+    assert_eq!(hist["count"].as_u64(), Some(1), "one release, one sample");
+    assert!(hist["mean_ns"].as_u64().unwrap_or(0) >= 5_000_000_000);
+
+    // The seam, then a fresh plane: EVERY word of the instrument is 0.
+    free_grace::reset_for_test();
+    membership::uninstall();
+    let (clock, _ticks) = manual_clock();
+    let owner = armed_owner(&clock);
+    free_grace::arm_owner_plane(clock.clone(), owner.clocks()).expect("derived bound");
+    let hist = free_grace::stats_snapshot()["free_grace_residence_ms"].clone();
+    assert_eq!(free_grace::residence_samples(), 0);
+    assert_eq!(hist["count"].as_u64(), Some(0), "the exact count resets");
+    assert_eq!(hist["sum_ns"].as_u64(), Some(0), "the exact sum resets");
+    assert_eq!(hist["mean_ns"].as_u64(), Some(0), "the mean resets");
+    let buckets = hist["buckets"].as_object().expect("bucket map");
+    assert!(
+        buckets.values().all(|v| v.as_u64() == Some(0)),
+        "every bucket resets"
+    );
+}
+
+/// **The uncoupled fleet (the 2026-08-30 GREEN s11-mpiio row's shape —
+/// `.benchmarks/cloud/2026-08-30-094130`): the demand arm stays DARK and
+/// the loop runs the ROUTINE beat, by design.** Lane 0's spare dwarfs its
+/// demand × latency, so no stream is recycle-bound; site 0 never fires
+/// (`demand_waits 0`), no prod is issued, and `bound_age` sits at the
+/// routine composite (the §3.2 T1–T8 band, ≈ 24–29 s) under EVERY lever
+/// configuration — which is what the field row read (23–29 s) and why
+/// PR 5's gate (c) (`bound_age ≤ 12 s`) is a statement about a COUPLED
+/// storm, not a healthy well-supplied fleet (the design's non-goal 4: the
+/// routine beat is not retuned). Inventory = λ × L_lag, and the fleet
+/// pays it in parked space, never in throughput.
+#[test]
+fn an_uncoupled_fleet_runs_the_routine_beat_and_the_demand_arm_stays_dark() {
+    let _serial = serial();
+    let shape = LoopShape {
+        label: "uncoupled(spare=100000,demand=20/s,storm=500/s,8m,staggered)",
+        members: 8,
+        lane_spare: 100_000,
+        lane_demand_per_s: 20,
+        storm_per_s: 500,
+        duration_ms: 300_000,
+        staggered: true,
+    };
+    let rows = run_loop_matrix(&shape);
+    let renew_ms = shipped_clocks().renew_interval.as_millis() as f64;
+    for r in &rows {
+        assert_eq!(
+            r.deferrals,
+            r.releases + r.held_end,
+            "{}: closure",
+            r.config
+        );
+        assert_eq!(r.forced, 0, "{}: no forced release", r.config);
+        assert_eq!(r.fences, 0, "{}: no laggard fence", r.config);
+        assert_eq!(
+            r.stalls_steady, 0,
+            "{}: an uncoupled stream never stalls",
+            r.config
+        );
+        assert_eq!(
+            r.demand_waits, 0,
+            "{}: site 0 is silent when no lane is at the trough",
+            r.config
+        );
+        assert_eq!(
+            r.prods_steady, 0,
+            "{}: no prod on a long runway once the loop has filled",
+            r.config
+        );
+        assert!(
+            (r.steady_allocs_per_s - shape.lane_demand_per_s as f64).abs() < 0.5,
+            "{}: the stream runs at its offered rate ({:.2} vs {} blk/s)",
+            r.config,
+            r.steady_allocs_per_s,
+            shape.lane_demand_per_s
+        );
+        // The routine composite (§3.2 T1–T8): more than one renewal beat
+        // (the min over members ages 10–20 s before the sweep republishes
+        // it) and at most the routine fence bound.
+        assert!(
+            r.bound_age_mean_ms > renew_ms
+                && r.bound_age_mean_ms <= free_grace::fence_bound_base_ms() as f64,
+            "{}: the uncoupled loop runs the routine beat's composite \
+             (bound_age mean {:.0} ms against a {renew_ms} ms beat)",
+            r.config,
+            r.bound_age_mean_ms
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------

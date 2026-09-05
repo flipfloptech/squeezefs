@@ -870,6 +870,56 @@ async fn warm_arms_and_the_cold_fill_slice_are_attributed_per_arm() {
         "phase D: a read-cache serve moves NO other arm"
     );
     drop(data);
+
+    // ---- Phase E: the R-2 READ fast-dispatch probe (the reap thread's
+    // SYNC warm ladder, `Filesystem::read_fast_probe`) serving a hot
+    // block INTO the reply window. Since R-2 this is THE warm venue on
+    // an armed session — its copy into the window is a daemon CPU pass
+    // like any other and MUST be in the ledger (dest + warm + the arm),
+    // or a warm field row fails closure by the ledger's own rule.
+    // Block 5 is hot from phases A/B.
+    let s0 = snap();
+    let hot0 = METRICS.hot_block_hits.load(Ordering::Relaxed);
+    let probe = h.fs.read_fast_probe(
+        ino,
+        0,
+        5 * BS,
+        part as u32,
+        0,
+        Some((dest.dest().addr(), dest.dest().cap())),
+    );
+    let served = match probe {
+        fuse3::raw::reply::FastReadProbe::Served(b) => b,
+        other => panic!("phase E: the fast probe must serve a hot block (got {other:?})"),
+    };
+    assert_eq!(served.len(), part, "phase E: whole request served");
+    assert!(
+        served
+            .iter()
+            .enumerate()
+            .all(|(j, &x)| x == pat(5 * BS + j as u64)),
+        "phase E content"
+    );
+    assert!(
+        METRICS.hot_block_hits.load(Ordering::Relaxed) > hot0,
+        "phase E must serve from the hot tier"
+    );
+    let d = delta(&s0);
+    assert_per_arm_laws(&d, "phase E");
+    assert_eq!(d.fill_dma, 0, "phase E: warm — no device fetch");
+    assert_eq!(
+        d.dest, part as u64,
+        "phase E: the fast-probe copy into the reply window is a dest copy — \
+         the R-2 venue must be IN the ledger"
+    );
+    assert_eq!(d.warm, part as u64, "phase E: ... and a warm one");
+    assert_eq!(d.hot, part as u64, "phase E: ... attributed to the hot arm");
+    assert_eq!(
+        (d.hold, d.cache, d.fill_slice),
+        (0, 0, 0),
+        "phase E: a fast-probe hot serve moves NO other arm"
+    );
+    drop(served);
 }
 
 // ---------------------------------------------------------------------------

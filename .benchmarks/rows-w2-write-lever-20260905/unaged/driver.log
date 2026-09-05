@@ -1,0 +1,19 @@
+[14:34:30] == leg A1 [SQUEEZEFS_WRITE_GUARD_NARROW=1] load=3.34 10.29 11.69
+[14:34:31] == leg B1 [SQUEEZEFS_WRITE_GUARD_NARROW=0] load=3.34 10.29 11.69
+[14:34:31] == leg B2 [SQUEEZEFS_WRITE_GUARD_NARROW=0] load=3.34 10.29 11.69
+[14:34:32] == leg A2 [SQUEEZEFS_WRITE_GUARD_NARROW=1] load=3.87 10.29 11.68
+[14:34:33] == done; rows in /home/justin/Source/squeezefs/target/w2-abba
+[14:35:29] == leg A1 [SQUEEZEFS_WRITE_GUARD_NARROW=1] load=1.72 8.60 11.02
+  A1.w_fresh.json: 1.33 GiB/s  clat mean 177.45 ms  p99 918.6 ms  p99.9 1434.5 ms
+  A1.w_rewrite.json: 0.93 GiB/s  clat mean 262.81 ms  p99 943.7 ms  p99.9 1417.7 ms
+[14:35:59] == leg B1 [SQUEEZEFS_WRITE_GUARD_NARROW=0] load=4.96 8.72 10.98
+  B1.w_fresh.json: 0.94 GiB/s  clat mean 257.90 ms  p99 1283.5 ms  p99.9 1770.0 ms
+  B1.w_rewrite.json: 0.86 GiB/s  clat mean 280.68 ms  p99 1384.1 ms  p99.9 1904.2 ms
+[14:36:37] == leg B2 [SQUEEZEFS_WRITE_GUARD_NARROW=0] load=6.60 8.76 10.91
+  B2.w_fresh.json: 0.88 GiB/s  clat mean 270.46 ms  p99 1300.2 ms  p99.9 1921.0 ms
+  B2.w_rewrite.json: 0.83 GiB/s  clat mean 289.67 ms  p99 1283.5 ms  p99.9 1803.6 ms
+[14:37:16] == leg A2 [SQUEEZEFS_WRITE_GUARD_NARROW=1] load=9.05 9.12 10.95
+  A2.w_fresh.json: 0.87 GiB/s  clat mean 274.16 ms  p99 1300.2 ms  p99.9 2197.8 ms
+  A2.w_rewrite.json: 0.88 GiB/s  clat mean 273.66 ms  p99 1350.6 ms  p99.9 1719.7 ms
+[14:37:55] == done; rows in /home/justin/Source/squeezefs/target/w2-abba
+[14:40:16] == leg P0 [SQUEEZEFS_WRITE_GUARD_NARROW=1] load=1.35 5.90 9.41

@@ -235,30 +235,50 @@ here (the parent's batch gate). Loom: not re-run — `sqz_sync_core.rs`
 (the modeled core) is untouched; `SqzRwLock::waiters` is a pass-through
 on the shipped face.
 
-## 7. Field rows — OWED (the parent's)
+## 7. Field rows — MEASURED 2026-09-05 (dev box, tcp devsub, root)
 
-Same binary, `w_fresh` (`/scratch/tmp/fio_jobs/write_BW.job`: 24 × 8 GiB,
-sequential 1 MiB libaio `direct=1`, iodepth 16, 30 s + 10 s ramp; the
-sustained-60 s form beside it) on the **tcp devsub** (root), **A-B-B-A**
-via `SQUEEZEFS_WRITE_GUARD_NARROW=1` (A) / `=0` (B), fresh reset per leg,
-post-f46 binary:
+Same binary (`d551f1ba`, release — the five-campaign stack), rig
+`.benchmarks/rigs/2026-09-05-write-lever-abba-local.sh` (fresh format per
+leg; fio 3.42 libaio `direct=1`, 16 jobs × qd16 × 1 MiB seq, 1 GiB per job;
+`w_fresh` = the minting pass, `w_rewrite` = the same job over the files it
+just wrote), **A = `SQUEEZEFS_WRITE_GUARD_NARROW=1` / B = `0`**, order
+P0 A B B A — P0 is a throwaway pre-aging leg: this substrate's zram OSS
+writes a fresh slot ≈ 2× faster than it replaces one, and the un-aged first
+attempt (`rows-w2-write-lever-20260905/unaged/`) read 1.33 GiB/s on its
+pristine first leg against ≈ 0.9 for every aged leg with identical code.
+Analyzer `.benchmarks/rigs/2026-09-05-write-lever-abba-analyze.py`;
+artifacts `.benchmarks/rows-w2-write-lever-20260905/`. Load 1–10 (ambient).
 
-| leg | GiB/s | clat mean / p99 | `write_lock_wait_exclusive` (n, mean, ≥ 64 µs population) | `write_lock_wait_shared` (n, mean) | `write_lock_hold_shared` / `_metaprep` (n, mean, max bucket) | `write_lock_scope_{shared,metaprep,entire}` | `write_pipeline_phase_ns.lock_wait` (n, mean) | `fuse_op_phase_ns` write `entry_to_backend` (mean) |
+| row | leg | GiB/s | clat mean | p99 | p99.9 | `write_lock_wait_exclusive` | `write_lock_wait_shared` | scope shared / metaprep / entire |
 |---|---|---|---|---|---|---|---|---|
-| A `narrow=1` | | | | | | expect `shared` ≈ writes − 24, `entire` = 24 | | |
-| B `narrow=0` | | | | | | expect `metaprep` ≈ writes − 24, `entire` = 24 | | |
-| B | | | | | | | | |
-| A | | | | | | | | |
+| `w_fresh` | A1 | **0.91** | 261 ms | 1,502 | 2,265 | 242 × 16.6 ms | 16,142 × 0.3 µs | 16,142 / 226 / 16 |
+| | B1 | 0.91 | 264 ms | 1,267 | 1,770 | **16,383 × 253 µs** | 1 | 1 / 16,367 / 16 |
+| | B2 | 0.88 | 274 ms | 1,283 | 1,904 | **16,384 × 248 µs** | 0 | 0 / 16,368 / 16 |
+| | A2 | **0.93** | 262 ms | 1,149 | 1,451 | 241 × 13.0 ms | 16,143 × 0.4 µs | 16,143 / 225 / 16 |
+| `w_rewrite` (code-identical both modes — the noise calibration) | A1 | 0.91 | 264 ms | 1,367 | 1,804 | 0 | 16,384 × 0.5 µs | 16,384 / 0 / 0 |
+| | B1 | 0.80 | 299 ms | 1,418 | 1,770 | 0 | 16,384 × 0.6 µs | 16,384 / 0 / 0 |
+| | B2 | 0.90 | 267 ms | 1,116 | 1,837 | 0 | 16,384 × 0.5 µs | 16,384 / 0 / 0 |
+| | A2 | 0.86 | 279 ms | 1,317 | 1,938 | 0 | 16,384 × 0.4 µs | 16,384 / 0 / 0 |
 
-Validity: the scope columns must account for the row's writes (the f46
-`entire = 24` law); Σ hold ≡ Σ scope; `fuse_op_watchdog_overdue` = 0,
-`invariant_tripwires` = 0, `meta_kv_block_refs_drift` = 0;
-`write_lock_scope_shared_upgrades` ≈ 0 (nonzero = eviction/truncate
-racing the stream). Verdict rule (§0 landing law): the knob's default
-stays `on` if A ≥ B within noise on both brackets with the exclusive-wait
-population gone; a beyond-noise loss on either bracket flips the default
-to `0` and the note records why (the write ledger's own row 16 — the
-il-vs-kernel parity verdict — rides the same row).
+Validity: scope columns account for every write on every leg (`entire =
+16` = one promotion per file, the f46 law, both modes); `shared_upgrades`
+0; `fuse_op_watchdog_overdue` 0; `invariant_tripwires` 0. The `w_rewrite`
+rows run the SAME code under both knob values (the cache-resident
+overwrite was already Shared-class), so their ±10 % leg-to-leg spread IS
+this venue's noise band.
+
+**Verdict — default stays ON (the §0 landing law).** `w_fresh` A ≥ B on
+both aged brackets (0.91 vs 0.91; 0.93 vs 0.88) with no beyond-noise loss
+on either, and the exclusive-wait population gone from the stream:
+16,384 exclusive waits × 250 µs per leg → 241 (the ≈ 15 file-start
+dispatches per file that arrive during the 12–15 ms promotion `entire`
+hold — present in both modes; their wait is the promotion's, not a new
+tail) — Σ exclusive wait 4.1 s → 3.5 s per leg, shared waits sub-µs. The
+lever does what it claims and loses nothing; the throughput term is
+inside the noise, as the in-process rows priced it (0.5–1.1 % of the
+field's clat). The field cluster's `w_fresh` (the 24 × qd16 × 8 GiB
+job on squeeze-test) stays a follow-on row when that box is next
+reserved; the tcp devsub bracket is the campaign's acceptance.
 
 ## 8. Boarded (not done here)
 

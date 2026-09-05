@@ -15,7 +15,7 @@
 #
 # KNOB/A_VAL/B_VAL toggles one knob; KNOBS_B is the alternative form for
 # levers whose B leg pins several knobs (A leg = all unset = derived).
-set -eu
+set -euo pipefail
 SQZ="${SQZ:-$PWD/target/release/squeezefs}"
 OUT="${OUT:-$PWD/target/write-lever-abba}"
 META="${META:-sqmeta:///dev/nvme1n1,/dev/nvme2n1,/dev/nvme3n1,/dev/nvme4n1}"
@@ -56,10 +56,10 @@ EOF
 }
 run_row() {  # $1 = leg tag, $2 = row name
   local tag=$1 row=$2
-  cp "$MNT/.stats" "$OUT/$tag.$row.pre.json"
+  cat "$MNT/.stats" > "$OUT/$tag.$row.pre.json"
   fio_job "$row" > "$OUT/$tag.$row.fio"
   "$FIO" --output-format=json --output="$OUT/$tag.$row.json" "$OUT/$tag.$row.fio" >/dev/null
-  cp "$MNT/.stats" "$OUT/$tag.$row.post.json"
+  cat "$MNT/.stats" > "$OUT/$tag.$row.post.json"
   python3 - "$OUT/$tag.$row.json" <<'PY'
 import json,sys
 d=json.load(open(sys.argv[1])); j=d["jobs"][0]["write"]
@@ -67,8 +67,14 @@ bw=j["bw_bytes"]/2**30; p=j["clat_ns"]["percentile"]
 print(f"  {sys.argv[1].split('/')[-1]}: {bw:.2f} GiB/s  clat mean {j['clat_ns']['mean']/1e6:.2f} ms  p99 {p.get('99.000000',0)/1e6:.1f} ms  p99.9 {p.get('99.900000',0)/1e6:.1f} ms")
 PY
 }
-for leg in A1 B1 B2 A2; do
-  cls=${leg:0:1}
+# PREAGE=1 (default): a throwaway leg first. The tcp devsub's zram OSS
+# writes a FRESH slot ~2x faster than it replaces one, so the first leg on
+# a pristine substrate is not comparable to the rest (W-2's first bracket:
+# 1.33 vs 0.9 GiB/s with identical code); aging the footprint once puts
+# every measured leg in the same regime.
+LEGS="A1 B1 B2 A2"; [ "${PREAGE:-1}" = 1 ] && LEGS="P0 $LEGS"
+for leg in $LEGS; do
+  cls=${leg:0:1}; [ "$cls" = P ] && cls=A
   envs=$(leg_env "$cls")
   log "== leg $leg [${envs:-derived/default}] load=$(cut -d' ' -f1-3 /proc/loadavg)"
   "$SQZ" format "$META" "$DATA" --force >"$OUT/$leg.format.log" 2>&1

@@ -231,6 +231,13 @@ struct LedgerSnap {
     bounce: u64,
     dest_dma: u64,
     fill_dma: u64,
+    /// R-4 per-arm split of the warm bucket (hot / read-lane hold / NVMe
+    /// read cache — an exact partition of `warm`) and of the cold
+    /// residual (`fill_slice`: the whole-block fill → dest slice-out).
+    hot: u64,
+    hold: u64,
+    cache: u64,
+    fill_slice: u64,
 }
 
 fn snap() -> LedgerSnap {
@@ -240,6 +247,10 @@ fn snap() -> LedgerSnap {
         bounce: METRICS.read_copy_bounce_bytes.load(Ordering::Relaxed),
         dest_dma: METRICS.read_dest_dma_bytes.load(Ordering::Relaxed),
         fill_dma: METRICS.read_fill_dma_bytes.load(Ordering::Relaxed),
+        hot: METRICS.read_copy_hot_serve_bytes.load(Ordering::Relaxed),
+        hold: METRICS.read_copy_hold_serve_bytes.load(Ordering::Relaxed),
+        cache: METRICS.read_copy_cache_serve_bytes.load(Ordering::Relaxed),
+        fill_slice: METRICS.read_copy_fill_slice_bytes.load(Ordering::Relaxed),
     }
 }
 
@@ -251,7 +262,36 @@ fn delta(s0: &LedgerSnap) -> LedgerSnap {
         bounce: s1.bounce - s0.bounce,
         dest_dma: s1.dest_dma - s0.dest_dma,
         fill_dma: s1.fill_dma - s0.fill_dma,
+        hot: s1.hot - s0.hot,
+        hold: s1.hold - s0.hold,
+        cache: s1.cache - s0.cache,
+        fill_slice: s1.fill_slice - s0.fill_slice,
     }
+}
+
+/// The per-arm laws every phase of every dest-armed serve must satisfy
+/// (R-4 read-zc-serve, 2026-09-05): the three tier arms PARTITION the
+/// warm bucket exactly, and the cold fill slice-out lives inside the
+/// cold residual.
+fn assert_per_arm_laws(d: &LedgerSnap, phase: &str) {
+    assert_eq!(
+        d.hot + d.hold + d.cache,
+        d.warm,
+        "{phase}: hot + hold + cache must PARTITION read_copy_warm_serve_bytes exactly \
+         (hot={} hold={} cache={} warm={})",
+        d.hot,
+        d.hold,
+        d.cache,
+        d.warm
+    );
+    assert!(
+        d.fill_slice <= d.dest - d.warm,
+        "{phase}: the fill slice-out is a subset of the cold residual \
+         (fill_slice={} dest={} warm={})",
+        d.fill_slice,
+        d.dest,
+        d.warm
+    );
 }
 
 /// Contracts 1 + 2: the per-site ledger closes on every serve shape of
@@ -626,6 +666,209 @@ async fn warm_tier_serves_split_out_of_the_dest_bucket() {
         d.warm, part as u64,
         "phase C: the NVMe read-cache tier serve is attributed to \
          read_copy_warm_serve_bytes (the disk-tier warm arm)"
+    );
+    drop(data);
+}
+
+/// R-4 (e2e perf audit read board #4/#5, `perf/read-zc-serve`,
+/// 2026-09-05): the per-ARM copy split that prices a zc serve arm by
+/// arm. `read_copy_warm_serve_bytes` aggregated three tier arms whose
+/// zc prerequisites DIFFER (the hot/hold `Bytes` are fill-pool memory;
+/// the NVMe read cache is an mmap'd segment ring), and the cold residual
+/// `dest − warm` mixed the whole-block fill → dest slice-out (the EXA
+/// cold `slice_out`, the 2.69 passes/byte row's ONE daemon pass) with
+/// ranged bounce legs and assembly slices. Contracts:
+///
+///  * `read_copy_hot_serve_bytes + read_copy_hold_serve_bytes +
+///    read_copy_cache_serve_bytes ≡ read_copy_warm_serve_bytes` — an
+///    exact PARTITION, phase by phase (subset counters counted AT the
+///    copy, like the buckets they split);
+///  * `read_copy_fill_slice_bytes` counts the cold whole-block fill →
+///    dest slice-out and NOTHING warm (⊆ `dest − warm`);
+///  * every existing closure equation is untouched (the new counters
+///    are subsets; `dest`/`warm` deltas are asserted unchanged).
+///
+/// Phases (one fixture — the counters are process-global):
+///  A. cold fill → dest slice-out: `fill_slice == dest == part`, every
+///     tier arm 0;
+///  B. hot-tier serve: `hot == warm == part`, hold/cache/fill_slice 0;
+///  C. read-lane HOLD serve (entry planted for a block the hot tier
+///     never saw): `hold == warm == part`, the others 0;
+///  D. NVMe read-cache serve (planted): `cache == warm == part`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn warm_arms_and_the_cold_fill_slice_are_attributed_per_arm() {
+    let h = make_with("524288", *b"rcledger-r4-2026", "rcl_ns_r4").await;
+    for i in 0..8 {
+        let _ = create(&h, &format!("r4salt{i}")).await;
+    }
+    let ino = create(&h, "r4_arms").await;
+    write_pattern(&h, ino, 12 * BS).await;
+    let map = make_cold(&h, ino).await;
+    let path = squeezefs::keys::inode_path(ino);
+    let part = 384 * 1024usize; // > ranged threshold (256 KiB), < BS
+    let dest = AlignedDest::new(BS as usize);
+
+    // ---- Phase A: cold fill + slice-out into the dest (block 5).
+    let s0 = snap();
+    let (data, _backing) =
+        h.fs.router
+            .read_file_range_zero_copy_with_meta(
+                &path,
+                5 * BS,
+                part as u32,
+                Some(dest.dest()),
+                ReadClassHint::default(),
+                None,
+                None,
+            )
+            .await
+            .expect("phase A cold read");
+    assert_eq!(data.len(), part);
+    let d = delta(&s0);
+    assert_per_arm_laws(&d, "phase A");
+    assert_eq!(d.fill_dma, BS, "phase A: one whole-block pooled fill");
+    assert_eq!(d.dest, part as u64, "phase A: dest unchanged by the split");
+    assert_eq!(d.warm, 0, "phase A: cold — warm stays 0");
+    assert_eq!(
+        d.fill_slice, part as u64,
+        "phase A: the cold whole-block fill → dest slice-out is attributed to \
+         read_copy_fill_slice_bytes — the arm the fd-source zc serve deletes"
+    );
+    assert_eq!(
+        (d.hot, d.hold, d.cache),
+        (0, 0, 0),
+        "phase A: no tier arm moves on a cold fill"
+    );
+    drop(data);
+
+    // ---- Phase B: hot-tier serve (phase A deposited block 5 in hot
+    // probation).
+    let s0 = snap();
+    let hot0 = METRICS.hot_block_hits.load(Ordering::Relaxed);
+    let (data, _backing) =
+        h.fs.router
+            .read_file_range_zero_copy_with_meta(
+                &path,
+                5 * BS,
+                part as u32,
+                Some(dest.dest()),
+                ReadClassHint::default(),
+                None,
+                None,
+            )
+            .await
+            .expect("phase B warm read");
+    assert_eq!(data.len(), part);
+    assert!(
+        METRICS.hot_block_hits.load(Ordering::Relaxed) > hot0,
+        "phase B must serve from the hot tier"
+    );
+    let d = delta(&s0);
+    assert_per_arm_laws(&d, "phase B");
+    assert_eq!(d.fill_dma, 0, "phase B: warm — no device fetch");
+    assert_eq!(d.warm, part as u64, "phase B: warm unchanged by the split");
+    assert_eq!(
+        d.hot, part as u64,
+        "phase B: the hot-tier serve copy is attributed to read_copy_hot_serve_bytes"
+    );
+    assert_eq!(
+        (d.hold, d.cache, d.fill_slice),
+        (0, 0, 0),
+        "phase B: a hot serve moves NO other arm"
+    );
+    drop(data);
+
+    // ---- Phase C: read-lane HOLD serve. Plant block 6 (never read —
+    // cold in every tier) straight into the hold, the deep-qd cohort
+    // store; the ladder probes hot (miss) then the hold (hit — the
+    // `read_lane_serves` delta below is the fixture's armed-lane proof).
+    let k6 = map.get(&6).expect("block 6 mapped").clone();
+    let block6: Vec<u8> = (0..BS).map(|i| pat(6 * BS + i)).collect();
+    h.fs.router.cache.read_lane_hold.insert(
+        &k6,
+        bytes::Bytes::from(block6),
+        64 * 1024 * 1024,
+    );
+    let s0 = snap();
+    let serves0 = METRICS.read_lane_serves.load(Ordering::Relaxed);
+    let (data, _backing) =
+        h.fs.router
+            .read_file_range_zero_copy_with_meta(
+                &path,
+                6 * BS,
+                part as u32,
+                Some(dest.dest()),
+                ReadClassHint::default(),
+                None,
+                None,
+            )
+            .await
+            .expect("phase C hold read");
+    assert_eq!(data.len(), part);
+    assert!(
+        dest.slice(part)
+            .iter()
+            .enumerate()
+            .all(|(j, &x)| x == pat(6 * BS + j as u64)),
+        "phase C content (served from the planted hold entry)"
+    );
+    assert_eq!(
+        METRICS.read_lane_serves.load(Ordering::Relaxed) - serves0,
+        1,
+        "phase C must serve from the read-lane hold"
+    );
+    let d = delta(&s0);
+    assert_per_arm_laws(&d, "phase C");
+    assert_eq!(d.fill_dma, 0, "phase C: warm — no device fetch");
+    assert_eq!(d.warm, part as u64, "phase C: warm unchanged by the split");
+    assert_eq!(
+        d.hold, part as u64,
+        "phase C: the hold serve copy is attributed to read_copy_hold_serve_bytes"
+    );
+    assert_eq!(
+        (d.hot, d.cache, d.fill_slice),
+        (0, 0, 0),
+        "phase C: a hold serve moves NO other arm"
+    );
+    drop(data);
+
+    // ---- Phase D: NVMe read-cache serve (planted block 7; hot/hold
+    // never saw it).
+    let k7 = map.get(&7).expect("block 7 mapped").clone();
+    let block7: Vec<u8> = (0..BS).map(|i| pat(7 * BS + i)).collect();
+    h.fs.router
+        .cache
+        .nvme
+        .cache_read_block(&k7, bytes::Bytes::from(block7))
+        .expect("phase D: disk-tier plant must land");
+    let s0 = snap();
+    let (data, _backing) =
+        h.fs.router
+            .read_file_range_zero_copy_with_meta(
+                &path,
+                7 * BS,
+                part as u32,
+                Some(dest.dest()),
+                ReadClassHint::default(),
+                None,
+                None,
+            )
+            .await
+            .expect("phase D tier read");
+    assert_eq!(data.len(), part);
+    let d = delta(&s0);
+    assert_per_arm_laws(&d, "phase D");
+    assert_eq!(d.fill_dma, 0, "phase D: warm — no device fetch");
+    assert_eq!(d.warm, part as u64, "phase D: warm unchanged by the split");
+    assert_eq!(
+        d.cache, part as u64,
+        "phase D: the NVMe read-cache serve copy is attributed to \
+         read_copy_cache_serve_bytes"
+    );
+    assert_eq!(
+        (d.hot, d.hold, d.fill_slice),
+        (0, 0, 0),
+        "phase D: a read-cache serve moves NO other arm"
     );
     drop(data);
 }

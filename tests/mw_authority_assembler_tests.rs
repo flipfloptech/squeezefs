@@ -2459,7 +2459,7 @@ async fn a_local_publish_of_a_range_granted_ino_parks_on_the_serve_window() {
     // Hold the serve window open (the scoped Put's read→commit span),
     // then drive the authority's own LOCAL publish: it must PARK until
     // the window closes — never land inside it.
-    let window = publish::test_lock_serve_ino(ino).await;
+    let window = publish::serve_ino_guard(ino).await;
     let be = Arc::clone(&owner_be);
     let base = base_layout_bytes(BLOCK, &[(0, "be://data/K_fold")]);
     let publish_task =
@@ -2481,7 +2481,7 @@ async fn a_local_publish_of_a_range_granted_ino_parks_on_the_serve_window() {
 
     // The custody-free control: no grant, no guard — a local publish of
     // an un-granted ino never pays the stripe (KD-MW-12's shape).
-    let window2 = publish::test_lock_serve_ino(free_ino).await;
+    let window2 = publish::serve_ino_guard(free_ino).await;
     let be2 = Arc::clone(&owner_be);
     let base2 = base_layout_bytes(BLOCK, &[(0, "be://data/K_solo")]);
     let free_task = tokio::spawn(async move {

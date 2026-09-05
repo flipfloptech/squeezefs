@@ -1088,7 +1088,7 @@ async fn same_ino_calls_in_one_frame_keep_submission_order() {
 /// the owner), and the K+1'th frame WAITS — no third session is ever
 /// dialed; it ships on the first session the moment that frame
 /// completes. The owner is parked by holding the served inos' serve
-/// stripes (`test_lock_serve_ino`), which is exactly where a served
+/// stripes (`serve_ino_guard`), which is exactly where a served
 /// layout publish parks.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_in_flight_frame_depth_is_pipelined_and_bounded() {
@@ -1107,8 +1107,8 @@ async fn the_in_flight_frame_depth_is_pipelined_and_bounded() {
     let served_frames = || publish::stats().served_frames;
     let (base, frames0) = (dials(), served_frames());
 
-    let park_x = publish::test_lock_serve_ino(x).await;
-    let park_y = publish::test_lock_serve_ino(y).await;
+    let park_x = publish::serve_ino_guard(x).await;
+    let park_y = publish::serve_ino_guard(y).await;
     let submit = |ino: u64| {
         let be = Arc::clone(&nodes.client_be);
         tokio::spawn(async move {

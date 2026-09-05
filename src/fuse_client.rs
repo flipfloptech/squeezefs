@@ -2349,11 +2349,83 @@ pub(crate) fn check_component_name_len(name: &std::ffi::OsStr) -> Result<(), Err
 }
 
 /// `BLOCK_FLUSH_LOCKS` stripe count — shared with the RW1 stripe-collision
-/// audit table, which must be sized to the ACTUAL lock population.
+/// audit table, which must be sized to the ACTUAL lock population. Stays
+/// the shipped 4096: the hold is one block's checkout/flush, never a
+/// commit park (the D-3 census `block_flush_stripe_collisions` is what
+/// would convict it).
 pub const BLOCK_LOCK_STRIPES: usize = 4096;
 
-pub static BLOCK_FLUSH_LOCKS: Lazy<StripeLocks<crate::sqz_sync::SqzMutex<()>, BLOCK_LOCK_STRIPES>> =
-    Lazy::new(|| StripeLocks::new());
+/// The order-1 inode guard, order-2 lease lock and attr-publish tables'
+/// width (the shipped 4096; data-path holds, not commit parks).
+const INODE_GUARD_STRIPES: usize = 4096;
+
+/// D-3: every striped table's `{TABLE_stripes, TABLE_stripe_collisions,
+/// TABLE_key_waits}` — flat words for the stats inode (beside
+/// `lock_phase_ns`). Collisions are contended acquires against a
+/// DIFFERENT key on the stripe (false sharing — the width's cost); key
+/// waits the SAME key (true contention). On the two 4a classes a collision
+/// costs a full commit (the D5 hold); on `serve_ino` a served publish; on
+/// `inode_meta` / `block_flush` a RAM-only merge or one block's checkout;
+/// on `lease_waiter` only a spurious wake (the custody table is per key).
+pub fn stripe_census_entries() -> Vec<(&'static str, u64)> {
+    use crate::stripe_locks as sl;
+    // (stripes word, collisions word, key-waits word, width, counters).
+    let tables: [(&str, &str, &str, usize, &sl::StripeCensusCounters); 6] = [
+        (
+            "dlm_inode_stripes",
+            "dlm_inode_stripe_collisions",
+            "dlm_inode_key_waits",
+            sl::dlm_stripe_width(),
+            &sl::DLM_INODE_CENSUS,
+        ),
+        (
+            "dlm_dentry_stripes",
+            "dlm_dentry_stripe_collisions",
+            "dlm_dentry_key_waits",
+            sl::dlm_stripe_width(),
+            &sl::DLM_DENTRY_CENSUS,
+        ),
+        (
+            "serve_ino_stripes",
+            "serve_ino_stripe_collisions",
+            "serve_ino_key_waits",
+            crate::meta_ship::publish::serve_ino_stripe_width(),
+            &sl::SERVE_INO_CENSUS,
+        ),
+        (
+            "inode_meta_stripes",
+            "inode_meta_stripe_collisions",
+            "inode_meta_key_waits",
+            crate::routing::INODE_META_STRIPES,
+            &sl::INODE_META_CENSUS,
+        ),
+        (
+            "block_flush_stripes",
+            "block_flush_stripe_collisions",
+            "block_flush_key_waits",
+            BLOCK_LOCK_STRIPES,
+            &sl::BLOCK_FLUSH_CENSUS,
+        ),
+        (
+            "lease_waiter_stripes",
+            "lease_waiter_stripe_collisions",
+            "lease_waiter_key_waits",
+            crate::dlm::lease_waiter_stripe_width(),
+            &sl::LEASE_WAITER_CENSUS,
+        ),
+    ];
+    let mut out = Vec::with_capacity(tables.len() * 3);
+    for (stripes, collisions, key_waits, width, c) in tables {
+        let (nc, nw) = c.snapshot();
+        out.push((stripes, width as u64));
+        out.push((collisions, nc));
+        out.push((key_waits, nw));
+    }
+    out
+}
+
+pub static BLOCK_FLUSH_LOCKS: Lazy<StripeLocks<crate::sqz_sync::SqzMutex<()>>> =
+    Lazy::new(|| StripeLocks::new(BLOCK_LOCK_STRIPES));
 
 /// Per-(ino, block) CUSTODY-TRANSFER epoch — the moving-custody read
 /// protocol's seqlock word (fstests generic/795). A block's acked bytes
@@ -2365,9 +2437,8 @@ pub static BLOCK_FLUSH_LOCKS: Lazy<StripeLocks<crate::sqz_sync::SqzMutex<()>, BL
 /// Every retire bumps this word; the read handler fingerprints it across
 /// its whole probe window and re-runs the read on movement. Stripe
 /// collisions only ever cause a spurious retry, never a missed one.
-pub static BLOCK_CUSTODY_EPOCHS: Lazy<
-    StripeLocks<std::sync::atomic::AtomicU64, BLOCK_LOCK_STRIPES>,
-> = Lazy::new(StripeLocks::new);
+pub static BLOCK_CUSTODY_EPOCHS: Lazy<StripeLocks<std::sync::atomic::AtomicU64>> =
+    Lazy::new(|| StripeLocks::new(BLOCK_LOCK_STRIPES));
 
 /// Bump `ino`/`b`'s custody epoch (Release) — call at every overlay /
 /// staged-sibling / extent-record retire, after the removal completed.
@@ -2813,6 +2884,7 @@ async fn block_lock_acquire_prof(
     let guard = match lock.try_lock() {
         Ok(g) => g,
         Err(_) => {
+            block_census_classify(stripe, ino, b);
             let holder = WRITE_PROF.stripe_holders[stripe].load(Ordering::Relaxed);
             let depth = WRITE_PROF.stripe_wait_depth[stripe].fetch_add(1, Ordering::Relaxed) + 1;
             WRITE_PROF.stripe_waiters.record(depth as usize);
@@ -2858,24 +2930,43 @@ pub async fn block_lock_acquire_timed(
 
 /// Always-on census acquisition: `try_lock` fast path (one CAS, the same
 /// state transition `lock()` performs uncontended); the contended arm
-/// registers a [`LockWaitToken`] so the watchdog can name this wait, and
-/// every acquisition stamps the stripe's last-holder word.
+/// classifies the wait for the D-3 stripe census and registers a
+/// [`LockWaitToken`] so the watchdog can name it, and every acquisition
+/// stamps the stripe's last-holder word.
 async fn block_lock_census_acquire(
     lock: &crate::sqz_sync::SqzMutex<()>,
     site: BlockLockSite,
     ino: u64,
     b: u32,
 ) -> crate::sqz_sync::SqzMutexGuard<'_, ()> {
+    let stripe = BLOCK_FLUSH_LOCKS.block_shard_index(ino, b);
     let g = match lock.try_lock() {
         Ok(g) => g,
         Err(_) => {
+            block_census_classify(stripe, ino, b);
             let _t = LockWaitToken::begin(LockClass::Block, site as u64, ino, b as u64);
             lock.lock().await
         }
     };
-    let stripe = BLOCK_FLUSH_LOCKS.block_shard_index(ino, b);
     STRIPE_LAST_HOLDER[stripe].store(pack_holder(site, ino, b), Ordering::Relaxed);
     g
+}
+
+/// D-3 block-class census: a contended `BLOCK_FLUSH_LOCKS` acquire whose
+/// stripe's always-on last-holder word names a DIFFERENT `(ino, block)` is
+/// a false-sharing collision, the same key a true wait. Reads the word
+/// [`STRIPE_LAST_HOLDER`] already maintains (site bits masked off) — no
+/// second holder table; the low-36/24-bit truncation is the same
+/// diagnostic-grade approximation the holder word itself makes.
+#[inline]
+fn block_census_classify(stripe: usize, ino: u64, b: u32) {
+    const KEY_BITS: u64 = (1 << 60) - 1;
+    crate::stripe_locks::classify_against(
+        &STRIPE_LAST_HOLDER[stripe],
+        KEY_BITS,
+        pack_holder(BlockLockSite::WriteCheckout, ino, b) & KEY_BITS,
+        &crate::stripe_locks::BLOCK_FLUSH_CENSUS,
+    );
 }
 
 /// [`block_lock_acquire_timed`] for the sites that never timed their wait:
@@ -3356,15 +3447,23 @@ pub enum LockPhase {
     /// across device I/O" law's instrument (D-2): its tail must sit
     /// ≪ the journal device latency on every shape.
     LeafLockHold = 4,
+    /// 4a `DlmLockManager` acquire WAIT (D-3): the parked span of a
+    /// CONTENDED acquire, both classes, both modes — one sample per
+    /// contended acquire (the uncontended try-acquire fast path records
+    /// nothing, so `count ≡ Σ dlm_{inode,dentry}_{stripe_collisions,
+    /// key_waits}`). The 4a wait the audit-D family lacked; the census
+    /// beside it says which half of the count is the table's width.
+    DlmGuardWait = 5,
 }
 
-const LOCK_PHASES: usize = 5;
+const LOCK_PHASES: usize = 6;
 const LOCK_PHASE_NAMES: [&str; LOCK_PHASES] = [
     "stripe_lock_wait",
     "stripe_lock_hold",
     "leaf_lock_wait",
     "dlm_guard_hold",
     "leaf_lock_hold",
+    "dlm_guard_wait",
 ];
 
 static LOCK_PROF: Lazy<[LatencyHistogram; LOCK_PHASES]> =
@@ -3426,22 +3525,30 @@ pub fn set_stripe_hold_timing(on: bool) {
 /// by `routing::meta_lock_acquire` — the lock lives in `routing`, the
 /// census here). Fast path: one `try_lock`; the wait sample is exactly
 /// zero there (no clock read). Contended: the D1.b named-holder census
-/// token + the parked span.
+/// token, the D-3 stripe-collision classification
+/// (`inode_meta_stripe_collisions` vs `inode_meta_key_waits`, against
+/// `census`'s last-acquirer word for `stripe`) and the parked span.
 pub async fn census_meta_lock_acquire(
     lock: &'static crate::sqz_sync::SqzMutex<()>,
+    census: &'static crate::stripe_locks::StripeCensus,
+    stripe: usize,
     ino: u64,
 ) -> MetaLockGuard {
     let hold_timed = STRIPE_HOLD_TIMED.load(Ordering::Relaxed);
+    let key = crate::stripe_locks::key_word(ino, 0);
     if let Ok(g) = lock.try_lock() {
+        census.stamp(stripe, key);
         lock_phase_record(LockPhase::StripeLockWait, Duration::ZERO);
         return MetaLockGuard {
             _g: g,
             acquired: hold_timed.then(std::time::Instant::now),
         };
     }
+    census.classify_contended(stripe, key);
     let _t = LockWaitToken::begin(LockClass::Meta, 0, ino, 0);
     let t0 = std::time::Instant::now();
     let g = lock.lock().await;
+    census.stamp(stripe, key);
     let acquired = std::time::Instant::now();
     lock_phase_record(LockPhase::StripeLockWait, acquired.duration_since(t0));
     // op-trace: the contended acquire's own clock read (the try_lock
@@ -8299,8 +8406,8 @@ pub struct SqueezefsFilesystem {
     /// (KD-MW-12 — empty on every shipped mount); entries retire with
     /// the ino's range leases.
     range_stream_frontier: std::sync::Arc<dashmap::DashMap<u64, u64, ahash::RandomState>>,
-    lease_locks: std::sync::Arc<StripeLocks<crate::sqz_sync::SqzMutex<()>, 4096>>,
-    pub active_inode_locks: std::sync::Arc<StripeLocks<crate::sqz_sync::SqzRwLock<()>, 4096>>,
+    lease_locks: std::sync::Arc<StripeLocks<crate::sqz_sync::SqzMutex<()>>>,
+    pub active_inode_locks: std::sync::Arc<StripeLocks<crate::sqz_sync::SqzRwLock<()>>>,
     /// P1-4: capacity-bounded attribute cache (moka TTL + max_capacity).
     /// L3 coherence campaign (2026-08-08): read-mostly backing — the
     /// §5.5.1 probe's size read stops paying moka's per-read bookkeeping
@@ -8317,7 +8424,7 @@ pub struct SqueezefsFilesystem {
     /// order: acquired last, holds no other lock, never held across an
     /// await. Publications route through [`Self::publish_attr`] — the
     /// ONE door (`tests/attr_publish_tests.rs` pins the scan).
-    attr_publish_locks: std::sync::Arc<StripeLocks<std::sync::Mutex<()>, 4096>>,
+    attr_publish_locks: std::sync::Arc<StripeLocks<std::sync::Mutex<()>>>,
     /// §4.5 (PR K7): snapshots of directories ≤
     /// [`DIR_ENTRY_CACHE_MAX_ENTRIES`], cookie-ascending
     /// `(name, ino, §5.1 cookie, file_type)` so cache-served pages keep
@@ -8849,10 +8956,10 @@ impl SqueezefsFilesystem {
             range_stream_frontier: std::sync::Arc::new(dashmap::DashMap::with_hasher(
                 ahash::RandomState::new(),
             )),
-            lease_locks: std::sync::Arc::new(StripeLocks::new()),
-            active_inode_locks: std::sync::Arc::new(StripeLocks::new()),
+            lease_locks: std::sync::Arc::new(StripeLocks::new(INODE_GUARD_STRIPES)),
+            active_inode_locks: std::sync::Arc::new(StripeLocks::new(INODE_GUARD_STRIPES)),
             attr_cache,
-            attr_publish_locks: std::sync::Arc::new(StripeLocks::new()),
+            attr_publish_locks: std::sync::Arc::new(StripeLocks::new(INODE_GUARD_STRIPES)),
             dir_entry_cache_v3,
             parent_memo,
             dir_gen: std::sync::Arc::new(scc::HashMap::new()),
@@ -11500,6 +11607,11 @@ impl SqueezefsFilesystem {
                 "block_lock_wait": METRICS.block_lock_wait.to_json(),
                 "lease_lock_wait": METRICS.lease_lock_wait.to_json(),
                 "dlm_acquire_time": METRICS.dlm_acquire_time.to_json(),
+                // D-3: lease waiters parked on their key's stripe right
+                // now (whole-file + range asks); the census beside
+                // `lease_waiter_*` says how many of their wakes were a
+                // stripe-mate's release.
+                "lease_waiters_parked": crate::dlm::lease_waiters_parked(),
                 // DLM S4 (spec §6.9): the slot-homed lock authority's
                 // mode + its network ledger. `solo` = this node owns
                 // every slot, so `dlm_rpcs` is **0 by construction** (the
@@ -11731,6 +11843,13 @@ impl SqueezefsFilesystem {
             // exception-free).
             if let Some(reachable) = self.router.backend_router.lane_reachable_blocks_sum() {
                 metrics.insert("alloc_lane_reachable_blocks".to_string(), reachable.into());
+            }
+            // D-3: the stripe-collision census — every striped lock
+            // table's width + false-sharing vs same-key contended
+            // acquires, flat (beside `lock_phase_ns`, whose
+            // `dlm_guard_wait.count ≡ Σ dlm_{inode,dentry}` words).
+            for (k, v) in stripe_census_entries() {
+                metrics.insert(k.to_string(), v.into());
             }
         }
 
@@ -26035,7 +26154,6 @@ impl Filesystem for SqueezefsFilesystem {
             return;
         }
         self.attr_cache.invalidate(&ino);
-        self.active_inode_locks.remove(&ino);
         // RES-13: the two per-inode side maps FORGET used to walk past.
         self.forget_side_maps(ino);
         // Reclaim inodes that reached nlink==0 while still open (unlink/14.t).
@@ -26070,7 +26188,6 @@ impl Filesystem for SqueezefsFilesystem {
                 continue;
             }
             self.attr_cache.invalidate(&ino);
-            self.active_inode_locks.remove(&ino);
             // RES-13: exactly like N FORGETs — and this IS the
             // drop_caches / memory-pressure path, i.e. exactly when the
             // unswept side maps matter.
@@ -28002,7 +28119,7 @@ async fn run_constant_writeback_worker(
     requeue_tx: squeezefs_ipc::sqz_channel::mpsc::Sender<WritebackRequest>,
     router: DataRouter,
     dlm: DlmClient,
-    active_inode_locks: std::sync::Arc<StripeLocks<crate::sqz_sync::SqzRwLock<()>, 4096>>,
+    active_inode_locks: std::sync::Arc<StripeLocks<crate::sqz_sync::SqzRwLock<()>>>,
     max_uploads: usize,
 ) {
     let upload_semaphore =
@@ -28215,7 +28332,7 @@ async fn flush_due_active_blocks_for_inode(
     block_indices: Vec<u32>,
     router: &DataRouter,
     _dlm: &DlmClient,
-    _active_inode_locks: &StripeLocks<crate::sqz_sync::SqzRwLock<()>, 4096>,
+    _active_inode_locks: &StripeLocks<crate::sqz_sync::SqzRwLock<()>>,
 ) -> Result<(), SqueezefsError> {
     use futures::stream::{self, StreamExt};
 
@@ -28445,7 +28562,7 @@ async fn flush_single_active_block(
     owner_token: Option<u64>,
     router: &DataRouter,
     _dlm: &DlmClient,
-    active_inode_locks: &StripeLocks<crate::sqz_sync::SqzRwLock<()>, 4096>,
+    active_inode_locks: &StripeLocks<crate::sqz_sync::SqzRwLock<()>>,
     is_striped: bool,
 ) -> Result<(), SqueezefsError> {
     let _inode_guard = active_inode_locks.get_inode_lock(ino).read().await;

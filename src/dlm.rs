@@ -690,9 +690,7 @@ pub fn ack_demotion(ino: u64, incumbent_token: u64, region: (u64, u64)) -> bool 
         .unwrap_or(false);
     if acked {
         RANGE_DEMOTION_ACKS.fetch_add(1, Ordering::Relaxed);
-        LOCK_WAITERS
-            .get_inode_lock(key.stripe_seed())
-            .notify_waiters();
+        wake_stripe(&key);
     }
     acked
 }
@@ -749,9 +747,7 @@ pub fn ack_tail_shrink(ino: u64, incumbent_token: u64, watermark: u64) -> Shrink
         RANGE_DEMOTION_FENCE_RESOLVES.fetch_add(demotions_fence_resolved as u64, Ordering::Relaxed);
     }
     if resolution != ShrinkResolution::None {
-        LOCK_WAITERS
-            .get_inode_lock(key.stripe_seed())
-            .notify_waiters();
+        wake_stripe(&key);
     }
     resolution
 }
@@ -1026,14 +1022,15 @@ pub fn mint_layout_version() -> u64 {
 /// and converges, the FIND-M11-A transient class — and for the `==`
 /// coherence memos, which miss and refetch). HELD objects never read the
 /// floor: their entry token is exact, so live writers cannot be
-/// spuriously fenced by stripe collisions. 1024 stripes = the existing
-/// waiter-stripe constant below (fixed structural fan-out, 8 KiB total —
-/// the whole point of S1 is O(1) fencing state).
-static LAST_GRANT_FLOOR: Lazy<Vec<AtomicU64>> =
-    Lazy::new(|| (0..1024).map(|_| AtomicU64::new(0)).collect());
+/// spuriously fenced by stripe collisions. Width = the waiter stripes'
+/// below (`stripe_locks::lease_stripe_width` — D-3's derived law over the
+/// shipped 1024; 8 B per stripe, so 128 KiB at the 32 × 32 field
+/// geometry — the whole point of S1 is O(1) fencing state).
+static LAST_GRANT_FLOOR: Lazy<StripeLocks<AtomicU64>> =
+    Lazy::new(|| StripeLocks::new(crate::stripe_locks::lease_stripe_width()));
 
 fn grant_floor(identity: &ObjectKey) -> &'static AtomicU64 {
-    &LAST_GRANT_FLOOR[(identity.stripe_seed() % 1024) as usize]
+    LAST_GRANT_FLOOR.get_inode_lock(identity.stripe_seed())
 }
 
 /// The identity's readable generation — the surface the ~24-site fencing
@@ -1076,8 +1073,82 @@ fn read_identity(identity: &ObjectKey) -> u64 {
 /// Per-stripe release notifications. A release wakes only its own stripe —
 /// never every waiter in the process (the old single global `Notify` was a
 /// thundering herd and let unrelated churn burn waiters' retry budgets).
-static LOCK_WAITERS: Lazy<StripeLocks<squeezefs_ipc::sqz_notify::Notify, 1024>> =
-    Lazy::new(StripeLocks::new);
+/// Width = `stripe_locks::lease_stripe_width` (D-3: `SQUEEZEFS_DLM_STRIPES`
+/// explicit, else `next_pow2(max(1024, 16 × possible_cpus × q_depth))`).
+/// A stripe collision here is a SPURIOUS WAKE (the custody table is per
+/// key — the woken waiter re-checks and re-parks), never a wait; the
+/// census (`lease_waiter_stripe_collisions` vs `lease_waiter_key_waits`)
+/// classifies every wake by the stripe's last-RELEASED key.
+static LOCK_WAITERS: Lazy<StripeLocks<squeezefs_ipc::sqz_notify::Notify>> =
+    Lazy::new(|| StripeLocks::new(crate::stripe_locks::lease_stripe_width()));
+
+/// The waiter stripes' D-3 census (the per-stripe word is the last
+/// RELEASED key, stamped by [`wake_stripe`]).
+static LEASE_WAITER_CENSUS_TABLE: Lazy<crate::stripe_locks::StripeCensus> = Lazy::new(|| {
+    crate::stripe_locks::StripeCensus::new(
+        LOCK_WAITERS.width(),
+        &crate::stripe_locks::LEASE_WAITER_CENSUS,
+    )
+});
+
+/// Live parked lease waiters (whole-file and range asks) — the gauge the
+/// census contract suite parks a waiter against; exported as
+/// `lease_waiters_parked`.
+static LEASE_WAITERS_PARKED: AtomicU64 = AtomicU64::new(0);
+
+/// Live parked lease waiters.
+pub fn lease_waiters_parked() -> u64 {
+    LEASE_WAITERS_PARKED.load(Ordering::Relaxed)
+}
+
+/// The waiter stripe population in force.
+pub fn lease_waiter_stripe_width() -> usize {
+    LOCK_WAITERS.width()
+}
+
+/// The waiter stripe `ino`'s lease identity maps to (public: the census
+/// contract suite constructs stripe-mates).
+pub fn lease_waiter_stripe(ino: u64) -> usize {
+    LOCK_WAITERS.shard_index(ObjectKey::Ino(ino).stripe_seed())
+}
+
+/// Wake `key`'s waiter stripe after a custody change on `key`, stamping
+/// the stripe's last-released word first (so a woken waiter can tell its
+/// own key's release from a stripe-mate's).
+fn wake_stripe(key: &ObjectKey) {
+    let seed = key.stripe_seed();
+    let stripe = LOCK_WAITERS.shard_index(seed);
+    LEASE_WAITER_CENSUS_TABLE.stamp(stripe, crate::stripe_locks::key_word(seed, 0));
+    LOCK_WAITERS.get_by_index(stripe).notify_waiters();
+}
+
+/// RAII park bracket for one waiter (the `lease_waiters_parked` gauge).
+struct ParkedWaiter;
+
+impl ParkedWaiter {
+    fn begin() -> Self {
+        LEASE_WAITERS_PARKED.fetch_add(1, Ordering::Relaxed);
+        Self
+    }
+}
+
+impl Drop for ParkedWaiter {
+    fn drop(&mut self) {
+        LEASE_WAITERS_PARKED.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+/// Classify a waiter's wake on `key`'s stripe: the stripe's last-released
+/// word is this key ⇒ a key wait (our holder released — we re-check and,
+/// unless barged, acquire); another key ⇒ a stripe-mate's release woke us
+/// for nothing (a collision — the spurious wake the width costs).
+fn classify_lease_wake(key: &ObjectKey) {
+    let seed = key.stripe_seed();
+    LEASE_WAITER_CENSUS_TABLE.classify_contended(
+        LOCK_WAITERS.shard_index(seed),
+        crate::stripe_locks::key_word(seed, 0),
+    );
+}
 
 static CLIENT_NONCE: AtomicU64 = AtomicU64::new(1);
 
@@ -1321,6 +1392,7 @@ impl LocalLockManager {
                 });
             }
 
+            let parked = ParkedWaiter::begin();
             if squeezefs_ipc::sqz_time::timeout_at(deadline, notified)
                 .await
                 .is_err()
@@ -1332,6 +1404,8 @@ impl LocalLockManager {
                     ),
                 });
             }
+            drop(parked);
+            classify_lease_wake(&key);
         }
     }
 
@@ -1780,6 +1854,7 @@ impl LocalLockManager {
                         parked = true;
                         RANGE_WAITS.fetch_add(1, Ordering::Relaxed);
                     }
+                    let park = ParkedWaiter::begin();
                     if squeezefs_ipc::sqz_time::timeout_at(deadline, notified)
                         .await
                         .is_err()
@@ -1795,6 +1870,8 @@ impl LocalLockManager {
                             ),
                         });
                     }
+                    drop(park);
+                    classify_lease_wake(&key);
                 }
             }
         }
@@ -1901,9 +1978,7 @@ impl LockLeaseInner {
                 .fetch_add(shrink_fence_resolved as u64, Ordering::Relaxed);
         }
         if retired {
-            LOCK_WAITERS
-                .get_inode_lock(self.key.stripe_seed())
-                .notify_waiters();
+            wake_stripe(&self.key);
         }
     }
 }

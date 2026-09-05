@@ -198,6 +198,31 @@ impl<T> SqzRwLock<T> {
         acquire_ticked(&self.core, Want::Exclusive).await;
         OwnedSqzRwLockWriteGuard { lock: self }
     }
+
+    /// [`Self::try_read`]'s `Arc`-owned form: the guard on success, the
+    /// `Arc` handed back on refusal so a caller falling through to
+    /// [`Self::read_owned`] pays no extra refcount traffic (the D-3 census
+    /// arm: classify the CONTENDED acquire, then park).
+    pub fn try_read_owned(self: Arc<Self>) -> Result<OwnedSqzRwLockReadGuard<T>, Arc<Self>> {
+        let (granted, wake) = self.core.try_acquire(Want::Shared, None);
+        wake_all(wake);
+        if granted {
+            Ok(OwnedSqzRwLockReadGuard { lock: self })
+        } else {
+            Err(self)
+        }
+    }
+
+    /// [`Self::try_write`]'s `Arc`-owned form (see [`Self::try_read_owned`]).
+    pub fn try_write_owned(self: Arc<Self>) -> Result<OwnedSqzRwLockWriteGuard<T>, Arc<Self>> {
+        let (granted, wake) = self.core.try_acquire(Want::Exclusive, None);
+        wake_all(wake);
+        if granted {
+            Ok(OwnedSqzRwLockWriteGuard { lock: self })
+        } else {
+            Err(self)
+        }
+    }
 }
 
 impl<T: Default> Default for SqzRwLock<T> {

@@ -29,7 +29,7 @@ fn bench_high_concurrency(c: &mut Criterion) {
     });
 
     // 2. StripeLocks contention
-    let active_inode_locks = Arc::new(StripeLocks::<tokio::sync::RwLock<()>, 4096>::new());
+    let active_inode_locks = Arc::new(StripeLocks::<tokio::sync::RwLock<()>>::new(4096));
     group.bench_function("stripe_locks_contention", |b| {
         b.to_async(&rt).iter(|| {
             let active_inode_locks = active_inode_locks.clone();

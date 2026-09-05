@@ -1836,10 +1836,62 @@ static CLIENT: Lazy<arc_swap::ArcSwapOption<PublishClient>> =
 /// custody-scoped full Put reads the durable layout BEFORE its commit,
 /// and two clients' serves of one ino must not interleave in that window
 /// (the backend's own 4a guard covers the commit, not the read). Striped;
-/// collisions only serialize spuriously.
-static SERVE_INO_LOCKS: Lazy<
-    crate::stripe_locks::StripeLocks<crate::sqz_sync::SqzMutex<()>, 1024>,
-> = Lazy::new(crate::stripe_locks::StripeLocks::new);
+/// collisions only serialize spuriously — but the hold spans a served
+/// publish's read → compose → COMMIT, so a stripe-mate pays a full commit
+/// for nothing: D-3 sizes the table by the DLM width law
+/// (`stripe_locks::lease_stripe_width` — `SQUEEZEFS_DLM_STRIPES` explicit,
+/// else `next_pow2(max(1024, 16 × possible_cpus × q_depth))`) and every
+/// acquisition goes through [`serve_ino_guard`] /
+/// [`serve_ino_guard_by_index`], the census doors
+/// (`serve_ino_stripe_collisions` vs `serve_ino_key_waits`).
+static SERVE_INO_LOCKS: Lazy<crate::stripe_locks::StripeLocks<crate::sqz_sync::SqzMutex<()>>> =
+    Lazy::new(|| crate::stripe_locks::StripeLocks::new(crate::stripe_locks::lease_stripe_width()));
+
+static SERVE_INO_CENSUS_TABLE: Lazy<crate::stripe_locks::StripeCensus> = Lazy::new(|| {
+    crate::stripe_locks::StripeCensus::new(
+        SERVE_INO_LOCKS.width(),
+        &crate::stripe_locks::SERVE_INO_CENSUS,
+    )
+});
+
+/// The serve stripe population in force.
+pub fn serve_ino_stripe_width() -> usize {
+    SERVE_INO_LOCKS.width()
+}
+
+/// The serve stripe `ino` maps to (public: the census contract suite
+/// constructs stripe-mates; `run_layout_group` dedupes by it).
+#[inline]
+pub fn serve_ino_stripe(ino: u64) -> usize {
+    SERVE_INO_LOCKS.shard_index(ino)
+}
+
+/// The ONE acquisition door for `ino`'s serve stripe.
+pub async fn serve_ino_guard(ino: u64) -> crate::sqz_sync::SqzMutexGuard<'static, ()> {
+    serve_ino_guard_by_index(serve_ino_stripe(ino), ino).await
+}
+
+/// Acquire serve stripe `stripe` on behalf of `ino` (the census identity —
+/// for a deduped group, the first member of the stripe). `try_lock` first
+/// (the same one core critical section the parking acquire takes
+/// uncontended); a refusal is the contended arm: classify against the
+/// stripe's last acquirer, then park.
+pub async fn serve_ino_guard_by_index(
+    stripe: usize,
+    ino: u64,
+) -> crate::sqz_sync::SqzMutexGuard<'static, ()> {
+    let key = crate::stripe_locks::key_word(ino, 0);
+    let lock = SERVE_INO_LOCKS.get_by_index(stripe);
+    let g = match lock.try_lock() {
+        Ok(g) => g,
+        Err(_) => {
+            SERVE_INO_CENSUS_TABLE.classify_contended(stripe, key);
+            lock.lock().await
+        }
+    };
+    SERVE_INO_CENSUS_TABLE.stamp(stripe, key);
+    g
+}
 
 /// Rung 18 — the LOCAL half of the serve-window law (the s11-subblock
 /// C8/C2 dangling-take mint's second face): a served scoped Put reads
@@ -1861,7 +1913,7 @@ async fn local_publish_guard(ino: Ino) -> Option<crate::sqz_sync::SqzMutexGuard<
         return None;
     }
     if crate::data_grant::custody_owner().is_some() && crate::dlm::ino_has_range_custody(ino) {
-        Some(SERVE_INO_LOCKS.get_inode_lock(ino).lock().await)
+        Some(serve_ino_guard(ino).await)
     } else {
         None
     }
@@ -1897,7 +1949,7 @@ pub(crate) fn publishes_locally(be: &Arc<RoutedMetaBackend>, ino: Ino) -> bool {
 /// snapshot (the aged-file strand cluster: six takes stranded at one
 /// staging instant).
 pub(crate) async fn hold_serve_window(ino: Ino) -> crate::sqz_sync::SqzMutexGuard<'static, ()> {
-    SERVE_INO_LOCKS.get_inode_lock(ino).lock().await
+    serve_ino_guard(ino).await
 }
 
 /// Run `f` with the held-serve-window marker set (finding 35b — the
@@ -1992,14 +2044,6 @@ pub(crate) async fn settle_serve_window(
     ino: Ino,
 ) -> Option<crate::sqz_sync::SqzMutexGuard<'static, ()>> {
     local_publish_guard(ino).await
-}
-
-/// Test seam (the structural pin's venue): the serve stripe for `ino`,
-/// so a suite can hold the serve window open and prove a local publish
-/// of a range-granted ino PARKS on it.
-#[doc(hidden)]
-pub async fn test_lock_serve_ino(ino: Ino) -> crate::sqz_sync::SqzMutexGuard<'static, ()> {
-    SERVE_INO_LOCKS.get_inode_lock(ino).lock().await
 }
 
 /// Install the process's publish client (the multi-writer mount arm's act).
@@ -3820,7 +3864,7 @@ impl PublishService {
                     let _ino_guard = if call.is_extent() {
                         None
                     } else {
-                        Some(SERVE_INO_LOCKS.get_inode_lock(ino).lock().await)
+                        Some(serve_ino_guard(ino).await)
                     };
                     // Rung 18: a committed layout-class serve invalidates
                     // the authority fs's RAM view of the named inos (the
@@ -4012,15 +4056,16 @@ impl PublishService {
             .iter()
             .map(|c| c.named_inos().first().copied().unwrap_or(0))
             .collect();
-        let mut stripes: Vec<usize> = inos
-            .iter()
-            .map(|&i| SERVE_INO_LOCKS.shard_index(i))
-            .collect();
-        stripes.sort_unstable();
-        stripes.dedup();
+        // (stripe, ino): dedup by stripe keeps the FIRST member as the
+        // stripe's census identity — an in-group collision is one acquire,
+        // never a self-collision.
+        let mut stripes: Vec<(usize, u64)> =
+            inos.iter().map(|&i| (serve_ino_stripe(i), i)).collect();
+        stripes.sort_unstable_by_key(|&(s, _)| s);
+        stripes.dedup_by_key(|&mut (s, _)| s);
         let mut stripe_guards = Vec::with_capacity(stripes.len());
-        for s in stripes {
-            stripe_guards.push(SERVE_INO_LOCKS.get_by_index(s).lock().await);
+        for (s, ino) in stripes {
+            stripe_guards.push(serve_ino_guard_by_index(s, ino).await);
         }
         let prepared = futures::future::join_all(work.into_iter().map(|call| async move {
             let PublishCall::SetLayoutAndSize {

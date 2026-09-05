@@ -32,8 +32,31 @@ use uuid::Uuid;
 ///
 /// Held only for the short read→merge→save; block *data* I/O stays concurrent
 /// (COW) outside the lock.
-static INODE_META_LOCKS: once_cell::sync::Lazy<StripeLocks<crate::sqz_sync::SqzMutex<()>, 4096>> =
-    once_cell::sync::Lazy::new(StripeLocks::new);
+///
+/// 4096-way: the hold is a RAM-only read→merge→save (never a commit park,
+/// unlike the 4a tables), so the shipped width stays; the D-3 census
+/// (`inode_meta_stripe_collisions` vs `inode_meta_key_waits`) is what
+/// would convict it.
+pub const INODE_META_STRIPES: usize = 4096;
+
+static INODE_META_LOCKS: once_cell::sync::Lazy<StripeLocks<crate::sqz_sync::SqzMutex<()>>> =
+    once_cell::sync::Lazy::new(|| StripeLocks::new(INODE_META_STRIPES));
+
+/// The 3.5 table's D-3 collision census (last-acquirer word per stripe).
+static INODE_META_CENSUS_TABLE: once_cell::sync::Lazy<crate::stripe_locks::StripeCensus> =
+    once_cell::sync::Lazy::new(|| {
+        crate::stripe_locks::StripeCensus::new(
+            INODE_META_STRIPES,
+            &crate::stripe_locks::INODE_META_CENSUS,
+        )
+    });
+
+/// The `INODE_META_LOCKS` stripe `ino` maps to (public: the census
+/// contract suite constructs stripe-mates).
+#[inline]
+pub fn inode_meta_stripe(ino: u64) -> usize {
+    INODE_META_LOCKS.shard_index(ino)
+}
 
 /// Census-wrapped `INODE_META_LOCKS` acquisition (the D1.b named-holder
 /// surface, VL10): every acquisition site routes here so a contended wait
@@ -42,7 +65,14 @@ static INODE_META_LOCKS: once_cell::sync::Lazy<StripeLocks<crate::sqz_sync::SqzM
 /// hold land in `lock_phase_ns` through the one guard type. Fast path =
 /// one `try_lock`. `pub` for the contract suite's contention fixture.
 pub async fn meta_lock_acquire(ino: u64) -> crate::fuse_client::MetaLockGuard {
-    crate::fuse_client::census_meta_lock_acquire(INODE_META_LOCKS.get_inode_lock(ino), ino).await
+    let stripe = INODE_META_LOCKS.shard_index(ino);
+    crate::fuse_client::census_meta_lock_acquire(
+        INODE_META_LOCKS.get_by_index(stripe),
+        &INODE_META_CENSUS_TABLE,
+        stripe,
+        ino,
+    )
+    .await
 }
 
 /// Per-inode (striped, collision-tolerant) LAYOUT-PRUNE EPOCH — a latch-free
@@ -58,8 +88,8 @@ pub async fn meta_lock_acquire(ino: u64) -> crate::fuse_client::MetaLockGuard {
 /// `None`) when the epoch moved; the caller frees its orphaned upload and
 /// retries against the post-prune state. Shard collisions only ever cause a
 /// spurious retry, never a missed invalidation.
-static LAYOUT_PRUNE_EPOCHS: once_cell::sync::Lazy<StripeLocks<std::sync::atomic::AtomicU64, 4096>> =
-    once_cell::sync::Lazy::new(StripeLocks::new);
+static LAYOUT_PRUNE_EPOCHS: once_cell::sync::Lazy<StripeLocks<std::sync::atomic::AtomicU64>> =
+    once_cell::sync::Lazy::new(|| StripeLocks::new(INODE_META_STRIPES));
 
 /// Current layout-prune epoch for `ino` (Acquire).
 pub fn layout_prune_epoch(ino: u64) -> u64 {

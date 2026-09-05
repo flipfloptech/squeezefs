@@ -8304,11 +8304,13 @@ pub enum IpcReadProbe {
     /// guard-independent; keeping the copy outside minimizes the
     /// critical section).
     Hit(bytes::Bytes),
-    /// The tier legs (staging mmap / R4 hot / NVMe read cache) served
-    /// `n` bytes directly into the caller's [`crate::PayloadSink`]
-    /// (op-economy campaign: no intermediate heap buffer). Short serves
-    /// are the handler's own semantics.
-    Served(usize),
+    /// The tier legs (staging mmap / R4 hot / read-lane hold / NVMe read
+    /// cache) served `n` bytes directly into the caller's
+    /// [`crate::PayloadSink`] (op-economy campaign: no intermediate heap
+    /// buffer), from the named arm (R-4: the kernel fast probe's ledger
+    /// attribution; the il caller ignores it). Short serves are the
+    /// handler's own semantics.
+    Served(usize, crate::routing::SyncServeArm),
     /// Any shape needing async work: demote (release the guard, then
     /// enqueue the handoff — never the reverse order).
     Miss,
@@ -13707,11 +13709,11 @@ impl SqueezefsFilesystem {
             // window) — no intermediate heap buffer.
             if let Some(m) = &meta {
                 let file_path = crate::keys::inode_path_stack(ino);
-                if let Some(n) = self
+                if let Some((n, arm)) = self
                     .router
                     .try_read_range_sync(&file_path, m, offset, read_len, out)
                 {
-                    return (IpcReadProbe::Served(n), meta);
+                    return (IpcReadProbe::Served(n, arm), meta);
                 }
             }
             return (IpcReadProbe::Miss, meta);
@@ -22314,7 +22316,33 @@ impl Filesystem for SqueezefsFilesystem {
         let served = match probe {
             IpcReadProbe::Eof => bytes::Bytes::new(),
             IpcReadProbe::Hit(b) => b,
-            IpcReadProbe::Served(n) => sink.into_bytes(n),
+            IpcReadProbe::Served(n, arm) => {
+                // READ copy ledger (R-4): the tier leg's copy into the
+                // sink is a daemon CPU pass — into the reply window it
+                // is the lawful dest copy (the R-2 venue of the handler's
+                // dest arms), into the heap stand-in a bounce. Warm-tier
+                // arms split per arm exactly like the handler's.
+                let bucket = match &sink {
+                    FastReadSink::Window { .. } => &METRICS.read_copy_dest_bytes,
+                    FastReadSink::Heap(_) => &METRICS.read_copy_bounce_bytes,
+                };
+                bucket.fetch_add(n as u64, Ordering::Relaxed);
+                let arm_ctr = match arm {
+                    crate::routing::SyncServeArm::Hot => Some(&METRICS.read_copy_hot_serve_bytes),
+                    crate::routing::SyncServeArm::Hold => Some(&METRICS.read_copy_hold_serve_bytes),
+                    crate::routing::SyncServeArm::Cache => {
+                        Some(&METRICS.read_copy_cache_serve_bytes)
+                    }
+                    crate::routing::SyncServeArm::Staged => None,
+                };
+                if let Some(c) = arm_ctr {
+                    METRICS
+                        .read_copy_warm_serve_bytes
+                        .fetch_add(n as u64, Ordering::Relaxed);
+                    c.fetch_add(n as u64, Ordering::Relaxed);
+                }
+                sink.into_bytes(n)
+            }
             IpcReadProbe::Miss => return FastReadProbe::Demote,
         };
         METRICS.fuse_ops.fetch_add(1, Ordering::Relaxed);

@@ -973,10 +973,12 @@ impl DataPlaneSink {
                             false,
                         );
                     }
-                    IpcReadProbe::Served(n) => {
+                    IpcReadProbe::Served(n, _arm) => {
                         // Tier leg already wrote the payload into the
                         // arena window (op-economy: zero intermediate
-                        // alloc/copy).
+                        // alloc/copy; the arena sink counted the copy on
+                        // `ipc_arena_copy_bytes` — the arm is the kernel
+                        // probe's ledger business).
                         METRICS.ipc_fast_path_serves.fetch_add(1, Ordering::Relaxed);
                         METRICS.ipc_ops_read.fetch_add(1, Ordering::Relaxed);
                         METRICS.ipc_bytes_out.fetch_add(n as u64, Ordering::Relaxed);

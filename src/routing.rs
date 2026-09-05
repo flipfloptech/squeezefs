@@ -5542,6 +5542,23 @@ pub struct ReadClassHint {
     pub dest_lease: bool,
 }
 
+/// Which SYNC tier leg served a [`DataRouter::try_read_range_sync`] call
+/// (R-4 read-zc-serve, 2026-09-05). The kernel READ fast probe (R-2)
+/// runs that ladder on the reap thread and copies INTO the reply window
+/// — a daemon CPU pass the READ copy ledger must attribute exactly like
+/// the handler's arms (`read_copy_{hot,hold,cache}_serve_bytes`), or a
+/// warm armed row fails closure by the ledger's own rule. `Staged` is
+/// the write-side custody station (the staging mmap ring), counted as a
+/// dest copy but outside the warm-tier partition, like the handler's
+/// staged serves.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SyncServeArm {
+    Staged,
+    Hot,
+    Hold,
+    Cache,
+}
+
 /// The dest-arm serve copy (read-copy-count 2026-08-02): NT-policied for
 /// registered uring ent payload dests (the counted +11 % EXA-cold-read
 /// win — `SQUEEZEFS_NT_READ_SERVE`, default on, floor 256 KiB), CACHED
@@ -14277,7 +14294,10 @@ impl DataRouter {
     /// in the ring op's arena window — the former intermediate
     /// `Bytes::copy_from_slice` bounce (one alloc + one memcpy per warm
     /// op) is deleted. Returns the served byte count (short serves are
-    /// the handler's own semantics); `None` = not sync-servable, demote.
+    /// the handler's own semantics) and the ARM that served it (R-4: the
+    /// kernel fast probe attributes its window copy per arm on the READ
+    /// copy ledger; the il caller ignores it — its arena sink counts
+    /// `ipc_arena_copy_bytes` itself); `None` = not sync-servable, demote.
     pub fn try_read_range_sync(
         &self,
         file_path: &str,
@@ -14285,7 +14305,7 @@ impl DataRouter {
         offset: u64,
         read_len: usize,
         out: &dyn crate::PayloadSink,
-    ) -> Option<usize> {
+    ) -> Option<(usize, SyncServeArm)> {
         if read_len == 0 {
             return None;
         }
@@ -14309,7 +14329,7 @@ impl DataRouter {
                 // exactly as the handler's staged serve would.
                 out.zero_at(end - start, read_len - (end - start));
             }
-            return Some(read_len);
+            return Some((read_len, SyncServeArm::Staged));
         }
         if meta.file_type != "striped" {
             return None;
@@ -14353,7 +14373,7 @@ impl DataRouter {
             let start = rel_s.min(guard.len);
             let end = rel_e.min(guard.len);
             out.write_at(0, &guard[start..end]);
-            return Some(end - start);
+            return Some((end - start, SyncServeArm::Staged));
         }
 
         // Leg 2: the R4 hot tier. Skipped wholesale under the
@@ -14408,7 +14428,7 @@ impl DataRouter {
                     .read_lane_hold
                     .credit(b_key, (end - start) as u64);
             }
-            return Some(end - start);
+            return Some((end - start, SyncServeArm::Hot));
         }
 
         // Leg 2b: the read-lane hold — the sync fast path's fourth leg
@@ -14482,7 +14502,7 @@ impl DataRouter {
                             .await;
                     });
                 }
-                return Some(end - start);
+                return Some((end - start, SyncServeArm::Hold));
             }
             // The probe ran (lane armed, binding resolved, hot missed)
             // and found nothing — the engagement pair's miss half.
@@ -14505,7 +14525,7 @@ impl DataRouter {
         )?;
         METRICS.cache_hits.fetch_add(1, Ordering::Relaxed);
         out.write_at(0, &guard);
-        Some(guard.len)
+        Some((guard.len, SyncServeArm::Cache))
     }
 
     /// Resolve `[start_block, end_block]` (inclusive) into per-block keys.

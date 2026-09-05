@@ -163,6 +163,43 @@
 //!
 //! RED against dev f629b46: the inline at-cap arm exists (spills), no
 //! deferral exists, and neither cap_parks nor cap_overflow exists.
+//!
+//! ## Reclaim derivation (W-4, e2e perf audit ladder row 14) — contracts 14–16
+//!
+//! Field fingerprint (2026-09-01 rewrite rows, 4 MiB blocks at ~19 GB/s):
+//! `w_rewrite` p99.9 ≈ 893 ms / max 3.08 s — multiples of the reclaim
+//! queue's 1,000 ms at-cap park. The two constants were liveness bounds
+//! filed as un-derived (write-wall OQ-5): the 4,096-block cap fills in
+//! ≈ 0.2 s at fleet displacement rates, and the park QUANTUM — a 5 ms
+//! poll bounded at 1 s — IS the tail, because a parked producer holds its
+//! write-pipeline permit for the whole park. Laws pinned here:
+//!
+//! 14. **The park ends on the room-made edge, never on the quantum**: an
+//!     at-cap enqueue is WOKEN by the drain freeing room (`finish_free`
+//!     per coalesced range — the queue's population is queued + in-flight,
+//!     the honest deferred-space count the `queue_bytes` gauge already
+//!     reports) and completes as soon as room exists; the quantum is only
+//!     the stalled-drain safety bound. Deterministic via the stall seam:
+//!     a 60 s quantum, a 1 s-stalled lane, and the parked enqueue must
+//!     complete at ≈ 1 s (after the drain's finish, not a pop) and ≪ 60 s.
+//! 15. **The derived quantum never trips on a healthy drain**: with the
+//!     park bound UNPINNED (derived = a small multiple of the measured
+//!     time the drain needs to free one batch of room, floored at the
+//!     worker's 50 ms manners tick, capped at the shipped 1 s), a burst
+//!     against a small cap parks and resolves on room edges with
+//!     `cap_overflow` = 0; the derived bound gauge sits inside its bounds
+//!     and the drain-rate gauge is measured, not 0.
+//! 16. **The derived cap is the registered posture**: unpinned, the live
+//!     cap gauge reads ≥ the shipped 4,096 floor (never regress below);
+//!     an explicit `SQUEEZEFS_RECLAIM_QUEUE_MAX_BLOCKS` still wins
+//!     verbatim. The pure derivation (rate × drain window, RAM-budgeted
+//!     ceiling) is tied in `tests/derivation_sweep_tests.rs`.
+//!
+//! RED against dev 27a396e1: the park polls a 5 ms tick, the cap counts
+//! queued entries only (a pop opens room before any block is reclaimed),
+//! both knobs are free constants, and none of the gauges
+//! `block_free_reclaim_{drain_rate,arrival_rate,queue_cap,park_bound_ms}`
+//! exists.
 
 use fuse3::raw::prelude::Filesystem;
 use fuse3::raw::Request;
@@ -202,6 +239,13 @@ impl EnvGuard {
     fn set(key: &'static str, val: &str) -> Self {
         let prev = std::env::var(key).ok();
         std::env::set_var(key, val);
+        Self { key, prev }
+    }
+    /// Pin a knob ABSENT for one test (the derived-default posture even
+    /// when the invoking shell exports it), restoring on drop.
+    fn unset(key: &'static str) -> Self {
+        let prev = std::env::var(key).ok();
+        std::env::remove_var(key);
         Self { key, prev }
     }
 }
@@ -2038,4 +2082,332 @@ async fn at_cap_enqueue_parks_until_drain_relieves_and_never_overflows() {
     )
     .await;
     assert_eq!(double_frees() - df0, 0, "exactly-once under parking");
+}
+
+// ---------------------------------------------------------------------------
+// Contract 14 — the park ends on the room-made edge (W-4 reclaim
+// derivation): an at-cap enqueue is woken by the drain freeing room and
+// never waits out the quantum. The queue's population is queued +
+// in-flight (a pop opens no room; a finished range does), so with a
+// 1 s-stalled lane the parked enqueue completes at ≈ 1 s — after the
+// drain's finish — and nowhere near the 60 s quantum.
+// ---------------------------------------------------------------------------
+
+fn drain_rate() -> u64 {
+    METRICS
+        .block_free_reclaim_drain_rate
+        .load(Ordering::Relaxed)
+}
+fn arrival_rate() -> u64 {
+    METRICS
+        .block_free_reclaim_arrival_rate
+        .load(Ordering::Relaxed)
+}
+fn queue_cap() -> u64 {
+    METRICS.block_free_reclaim_queue_cap.load(Ordering::Relaxed)
+}
+fn park_bound_ms() -> u64 {
+    METRICS
+        .block_free_reclaim_park_bound_ms
+        .load(Ordering::Relaxed)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn at_cap_park_ends_on_the_room_made_edge_not_the_quantum() {
+    let _g = serial().await;
+    const STALL_MS: u64 = 1000;
+    let _b = EnvGuard::set("SQUEEZEFS_RECLAIM_BATCH_BLOCKS", "8");
+    let _m = EnvGuard::set("SQUEEZEFS_RECLAIM_BATCH_MS", "0");
+    let _c = EnvGuard::set("SQUEEZEFS_RECLAIM_QUEUE_MAX_BLOCKS", "8");
+    let _s = EnvGuard::set("SQUEEZEFS_TEST_RECLAIM_STALL_MS", "1000");
+    // The quantum is parked far away: any completion inside seconds is
+    // the EDGE, never the bound.
+    let _p = EnvGuard::set("SQUEEZEFS_RECLAIM_CAP_PARK_MS", "60000");
+    let (router, ba, _backing, _staging) = make_router().await;
+    // Foreground MOVING throughout: the at-cap wake must pull the worker
+    // out of its manners deferral tick, not wait for idle.
+    let _seam = FgSeam::install(&router.backend_router);
+
+    let mut offsets = Vec::with_capacity(9);
+    for _ in 0..9 {
+        let o = ba.allocate_block().await.expect("alloc");
+        ba.publish_block(o);
+        offsets.push(o);
+    }
+    let (pk0, ov0, p0, s0, qb0) = (
+        cap_parks(),
+        cap_overflow(),
+        punches(),
+        skipped(),
+        queue_bytes(),
+    );
+
+    // Fill to the cap: 8 terminal frees (the worker pops them into a
+    // 1 s-stalled lane — queued + in-flight stays 8 = cap either way).
+    for o in offsets.iter().take(8) {
+        router
+            .backend_router
+            .free_block(&o.to_string())
+            .await
+            .expect("terminal free (fills the cap)");
+    }
+    // The 9th parks. It may complete ONLY when the stalled lane finishes
+    // its range (finish_free = the room edge).
+    let t0 = std::time::Instant::now();
+    router
+        .backend_router
+        .free_block(&offsets[8].to_string())
+        .await
+        .expect("terminal free (parked at cap)");
+    let waited = t0.elapsed();
+    assert_eq!(cap_parks() - pk0, 1, "the 9th enqueue parked at the cap");
+    assert!(
+        waited >= std::time::Duration::from_millis(STALL_MS * 7 / 10),
+        "the parked enqueue must wait for the DRAIN's finish (room = a \
+         reclaimed range, never a pop): waited {waited:?} against a \
+         {STALL_MS} ms stalled lane"
+    );
+    assert!(
+        waited < std::time::Duration::from_secs(6),
+        "the parked enqueue must end on the room-made edge — {waited:?} \
+         is quantum-shaped (60 s bound), not edge-shaped (~{STALL_MS} ms)"
+    );
+    assert_eq!(
+        cap_overflow() - ov0,
+        0,
+        "no soft overflow — the edge ended the park"
+    );
+
+    eventually_within(
+        || (punches() - p0) + (skipped() - s0) == 9 && queue_bytes() == qb0,
+        std::time::Duration::from_secs(30),
+        "every block reclaimed exactly once through the event-driven park",
+    )
+    .await;
+}
+
+// ---------------------------------------------------------------------------
+// Contract 15 — the DERIVED quantum never trips on a healthy drain: with
+// the park bound unpinned, parks resolve on room edges and cap_overflow
+// stays 0; the bound gauge sits inside [floor, shipped 1 s] and the
+// drain-rate gauge is measured.
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn derived_park_bound_never_overflows_while_the_drain_keeps_pace() {
+    let _g = serial().await;
+    let _b = EnvGuard::set("SQUEEZEFS_RECLAIM_BATCH_BLOCKS", "8");
+    let _m = EnvGuard::set("SQUEEZEFS_RECLAIM_BATCH_MS", "0");
+    let _c = EnvGuard::set("SQUEEZEFS_RECLAIM_QUEUE_MAX_BLOCKS", "8");
+    let _s = EnvGuard::set("SQUEEZEFS_TEST_RECLAIM_STALL_MS", "50");
+    // Derived bound: the knob is UNSET (the shipped default posture).
+    let _p = EnvGuard::unset("SQUEEZEFS_RECLAIM_CAP_PARK_MS");
+    let (router, ba, _backing, _staging) = make_router().await;
+    let _seam = FgSeam::install(&router.backend_router);
+
+    let mut offsets = Vec::with_capacity(64);
+    for _ in 0..64 {
+        let o = ba.allocate_block().await.expect("alloc");
+        ba.publish_block(o);
+        offsets.push(o);
+    }
+    let (pk0, ov0, p0, s0, qb0, df0) = (
+        cap_parks(),
+        cap_overflow(),
+        punches(),
+        skipped(),
+        queue_bytes(),
+        double_frees(),
+    );
+    for o in &offsets {
+        router
+            .backend_router
+            .free_block(&o.to_string())
+            .await
+            .expect("terminal free (parks at cap)");
+    }
+    assert!(
+        cap_parks() - pk0 > 0,
+        "a 64-block burst against cap 8 parks"
+    );
+    assert_eq!(
+        cap_overflow() - ov0,
+        0,
+        "the derived quantum is a small multiple of the drain's measured \
+         room latency — a healthy drain relieves every park on an edge \
+         before it (overflow means the bound is mis-derived)"
+    );
+    eventually_within(
+        || (punches() - p0) + (skipped() - s0) == 64 && queue_bytes() == qb0,
+        std::time::Duration::from_secs(30),
+        "burst reclaimed exactly once under the derived bound",
+    )
+    .await;
+    assert_eq!(double_frees() - df0, 0, "exactly-once");
+    let bound = park_bound_ms();
+    assert!(
+        (squeezefs::block_reclaim::PARK_BOUND_FLOOR_MS
+            ..=squeezefs::block_reclaim::PARK_BOUND_CEILING_MS)
+            .contains(&bound),
+        "the derived park bound gauge ({bound} ms) must sit inside \
+         [floor {}, shipped ceiling {}]",
+        squeezefs::block_reclaim::PARK_BOUND_FLOOR_MS,
+        squeezefs::block_reclaim::PARK_BOUND_CEILING_MS
+    );
+    assert!(
+        drain_rate() > 0,
+        "the drain-rate gauge is MEASURED after a drain (blocks/s EWMA), never 0"
+    );
+    assert!(
+        arrival_rate() > 0,
+        "the arrival-rate gauge is measured after a burst (blocks/s), never 0"
+    );
+    assert_eq!(queue_cap(), 8, "an explicit cap knob wins verbatim (gauge)");
+}
+
+// ---------------------------------------------------------------------------
+// Contract 16 — the derived cap is the registered posture: unpinned, the
+// live cap gauge reads ≥ the shipped 4,096 floor; the pure derivation is
+// tied in tests/derivation_sweep_tests.rs.
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn derived_queue_cap_never_regresses_below_the_shipped_floor() {
+    let _g = serial().await;
+    let _m = EnvGuard::set("SQUEEZEFS_RECLAIM_BATCH_MS", "0");
+    let _c = EnvGuard::unset("SQUEEZEFS_RECLAIM_QUEUE_MAX_BLOCKS");
+    let _p = EnvGuard::unset("SQUEEZEFS_RECLAIM_CAP_PARK_MS");
+    let (router, ba, _backing, _staging) = make_router().await;
+
+    let mut offsets = Vec::with_capacity(16);
+    for _ in 0..16 {
+        let o = ba.allocate_block().await.expect("alloc");
+        ba.publish_block(o);
+        offsets.push(o);
+    }
+    let (p0, s0, qb0, pk0) = (punches(), skipped(), queue_bytes(), cap_parks());
+    for o in &offsets {
+        router
+            .backend_router
+            .free_block(&o.to_string())
+            .await
+            .expect("terminal free");
+    }
+    eventually(
+        || (punches() - p0) + (skipped() - s0) == 16 && queue_bytes() == qb0,
+        "burst reclaimed",
+    )
+    .await;
+    assert_eq!(cap_parks() - pk0, 0, "16 blocks never reach a ≥ 4096 cap");
+    let cap = queue_cap();
+    assert!(
+        cap >= squeezefs::block_reclaim::QUEUE_CAP_FLOOR_BLOCKS,
+        "the derived cap gauge ({cap}) must never regress below the shipped \
+         4,096-block posture"
+    );
+    assert!(
+        cap <= squeezefs::block_reclaim::queue_cap_ceiling_blocks(
+            squeezefs::mem_budget::MEM_BUDGET.budget_bytes()
+        ),
+        "and never exceeds the RAM-budgeted ceiling"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// In-process rows (W-4 note §4) — NOT a gate: run explicitly in release:
+//   cargo test --release --test async_block_reclaim_tests reclaim_park_rows \
+//     -- --ignored --nocapture
+// A displacement storm from 32 concurrent producers against a drain the
+// stall seam prices SLOWER than arrival (the fleet's pinned regime), with
+// the park quantum pinned to the shipped 1,000 ms (A) vs derived (B).
+// Reports per-free wall p50/p99/p99.9/max + cap_parks/cap_overflow.
+// ---------------------------------------------------------------------------
+
+async fn park_rows_leg(label: &str, pinned_bound: Option<&str>) {
+    let _b = EnvGuard::set("SQUEEZEFS_RECLAIM_BATCH_BLOCKS", "8");
+    let _m = EnvGuard::set("SQUEEZEFS_RECLAIM_BATCH_MS", "0");
+    let _l = EnvGuard::set("SQUEEZEFS_RECLAIM_LANES_PER_DEV", "1");
+    let _c = EnvGuard::set("SQUEEZEFS_RECLAIM_QUEUE_MAX_BLOCKS", "64");
+    let _s = EnvGuard::set("SQUEEZEFS_TEST_RECLAIM_STALL_MS", "20");
+    let _p = match pinned_bound {
+        Some(v) => EnvGuard::set("SQUEEZEFS_RECLAIM_CAP_PARK_MS", v),
+        None => EnvGuard::unset("SQUEEZEFS_RECLAIM_CAP_PARK_MS"),
+    };
+    let (router, ba, _backing, _staging) = make_router().await;
+    let router = Arc::new(router);
+    let _seam = FgSeam::install(&router.backend_router);
+    const PRODUCERS: usize = 32;
+    const PER_PRODUCER: usize = 24;
+    let mut offsets = Vec::with_capacity(PRODUCERS * PER_PRODUCER);
+    for _ in 0..PRODUCERS * PER_PRODUCER {
+        let o = ba.allocate_block().await.expect("alloc");
+        ba.publish_block(o);
+        offsets.push(o);
+    }
+    let (pk0, ov0, p0, s0, qb0) = (
+        cap_parks(),
+        cap_overflow(),
+        punches(),
+        skipped(),
+        queue_bytes(),
+    );
+    let t_row = std::time::Instant::now();
+    let mut tasks = Vec::new();
+    for chunk in offsets.chunks(PER_PRODUCER) {
+        let chunk: Vec<u64> = chunk.to_vec();
+        let r = router.clone();
+        tasks.push(tokio::spawn(async move {
+            let mut walls = Vec::with_capacity(chunk.len());
+            for o in chunk {
+                let t = std::time::Instant::now();
+                r.backend_router
+                    .free_block(&o.to_string())
+                    .await
+                    .expect("terminal free");
+                walls.push(t.elapsed().as_micros() as u64);
+            }
+            walls
+        }));
+    }
+    let mut walls: Vec<u64> = Vec::new();
+    for t in tasks {
+        walls.extend(t.await.expect("producer"));
+    }
+    let row_wall = t_row.elapsed();
+    walls.sort_unstable();
+    let pct = |p: f64| walls[((walls.len() as f64 - 1.0) * p).round() as usize];
+    let n = offsets.len() as u64;
+    eventually_within(
+        || (punches() - p0) + (skipped() - s0) == n && queue_bytes() == qb0,
+        std::time::Duration::from_secs(120),
+        "row blocks reclaimed",
+    )
+    .await;
+    println!(
+        "ROW {label}: frees {n} in {:.3} s | park wall µs p50 {} p99 {} p99.9 {} max {} | \
+         cap_parks {} cap_overflow {} | drain_rate {} blocks/s arrival_rate {} bound_ms {} cap {}",
+        row_wall.as_secs_f64(),
+        pct(0.50),
+        pct(0.99),
+        pct(0.999),
+        walls[walls.len() - 1],
+        cap_parks() - pk0,
+        cap_overflow() - ov0,
+        drain_rate(),
+        arrival_rate(),
+        park_bound_ms(),
+        queue_cap(),
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+#[ignore = "in-process rows for the W-4 note — run explicitly in release with --ignored --nocapture"]
+async fn reclaim_park_rows() {
+    let _g = serial().await;
+    // A-B-B-A: the shared allocator/backing is fresh per leg, but the
+    // process-global METRICS and blocking pool warm across legs.
+    park_rows_leg("A pinned-1000ms", Some("1000")).await;
+    park_rows_leg("B derived", None).await;
+    park_rows_leg("B derived", None).await;
+    park_rows_leg("A pinned-1000ms", Some("1000")).await;
 }

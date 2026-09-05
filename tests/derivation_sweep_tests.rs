@@ -1729,3 +1729,186 @@ fn the_unreclaimable_arm_divides_by_the_fleet_share_like_every_system_root() {
         "a non-even sample rounds UP"
     );
 }
+
+// ---------------------------------------------------------------------------
+// W-4 — block-reclaim queue cap + at-cap park bound (e2e perf audit ladder
+// row 14; write-wall OQ-5 discharged): the two liveness constants become
+// derivations of the reclaimer's OWN measured drain and the write side's
+// displacement rate. Evidence note:
+// `.benchmarks/2026-09-05-w4-reclaim-derivation.md`.
+// ---------------------------------------------------------------------------
+
+/// The drain's ROOM LATENCY — the time the reclaimer needs to free one
+/// batch of queue slots at its measured aggregate drain rate
+/// (`batch_blocks ÷ drain_rate`). This is the "drain service time for
+/// one batch" both derivations key on: width-blind by construction (under
+/// target-bound load the aggregate rate is what the target delivers at
+/// ANY client width — write-wall E2), so it never inflates with the lane
+/// count the way a per-lane wall does. Cold (no drain measured) = the
+/// shipped 1 s park bound — the assumption the shipped constant encoded.
+#[test]
+fn reclaim_room_latency_is_batch_over_measured_drain_rate() {
+    use squeezefs::block_reclaim::{room_latency_ms, PARK_BOUND_CEILING_MS};
+    // Fleet under load: ~1,800 blocks/s (write-wall §6.2 E2, any width),
+    // the shipped 64-block batch ⇒ 35 ms per batch of room.
+    assert_eq!(room_latency_ms(64, 1_800), 35);
+    // Idle catch-up at width 32: ~5,900 cmd/s ⇒ 10 ms.
+    assert_eq!(room_latency_ms(64, 5_900), 10);
+    // A slow substrate at 100 blocks/s ⇒ 640 ms.
+    assert_eq!(room_latency_ms(64, 100), 640);
+    // Never 0 while measured (a sub-ms batch still costs a tick of room).
+    assert_eq!(room_latency_ms(64, 1_000_000), 1);
+    // Cold = the shipped assumption.
+    assert_eq!(room_latency_ms(64, 0), PARK_BOUND_CEILING_MS);
+}
+
+/// `SQUEEZEFS_RECLAIM_CAP_PARK_MS` default: `clamp(4 × room_latency,
+/// 50 ms, 1000 ms)`. A parked producer that saw no room edge in four
+/// batches' worth of drain time is waiting on a STALLED drain, not a slow
+/// one (room is made per coalesced range, so a live drain at any rate
+/// makes room within one batch-time) — overflow is then the right answer.
+/// Floor 50 ms = the worker's manners tick (its coarsest scheduling
+/// quantum: the at-cap wake short-circuits it, but a bound below the
+/// guaranteed cadence could trip on a healthy worker whose wake sat behind
+/// a saturated blocking pool). Ceiling 1000 ms = the shipped constant —
+/// the derived bound never parks a producer LONGER than the shipped
+/// posture did (never-regress applied to a tail bound).
+#[test]
+fn reclaim_park_bound_derives_from_the_drains_room_latency() {
+    use squeezefs::block_reclaim::{
+        derived_park_bound_ms, room_latency_ms, PARK_BOUND_BATCHES, PARK_BOUND_CEILING_MS,
+        PARK_BOUND_FLOOR_MS,
+    };
+    assert_eq!(PARK_BOUND_BATCHES, 4);
+    assert_eq!(PARK_BOUND_FLOOR_MS, 50);
+    assert_eq!(PARK_BOUND_CEILING_MS, 1000);
+    // Fleet under load: 4 × 35 = 140 ms — 7× below the shipped 1 s tail.
+    assert_eq!(derived_park_bound_ms(room_latency_ms(64, 1_800)), 140);
+    // Idle/fast drains floor at the manners tick.
+    assert_eq!(derived_park_bound_ms(room_latency_ms(64, 5_900)), 50);
+    assert_eq!(derived_park_bound_ms(room_latency_ms(64, 100_000)), 50);
+    // A slow substrate never parks longer than shipped.
+    assert_eq!(derived_park_bound_ms(room_latency_ms(64, 100)), 1000);
+    // Cold = shipped.
+    assert_eq!(derived_park_bound_ms(room_latency_ms(64, 0)), 1000);
+    // Monotone in room latency between the clamps.
+    assert!(derived_park_bound_ms(20) < derived_park_bound_ms(30));
+}
+
+/// `SQUEEZEFS_RECLAIM_QUEUE_MAX_BLOCKS` default: `clamp(displacement_rate
+/// × room_latency, 4096, ram_ceiling)` — the blocks the write side
+/// displaces while the drain makes one batch of room, i.e. the buffer a
+/// keeping-pace drain needs so producers never park. Floor 4096 = the
+/// shipped posture (never regress below). The ceiling is RAM: entries
+/// are bookkeeping (no payload — the deferred bytes live on the device
+/// and are gauged as `queue_bytes`), so the queue may hold 1/1024 of the
+/// R5 budget, capped at the registry's 2^20 admissible maximum.
+#[test]
+fn reclaim_queue_cap_derives_from_displacement_rate_and_room_latency() {
+    use squeezefs::block_reclaim::{
+        derived_queue_cap_blocks, queue_cap_ceiling_blocks, reclaim_entry_ram_bytes,
+        room_latency_ms, QUEUE_CAP_FLOOR_BLOCKS, QUEUE_RAM_SHARE_DIVISOR,
+    };
+    assert_eq!(QUEUE_CAP_FLOOR_BLOCKS, 4096);
+    assert_eq!(QUEUE_RAM_SHARE_DIVISOR, 1024);
+    let room_load = room_latency_ms(64, 1_800); // 35 ms
+                                                // The fleet shape: 19 GB/s of 4 MiB rewrite displaces ~4,750
+                                                // blocks/s; over 35 ms of room latency that is ~166 blocks — the
+                                                // shipped floor governs (the cap was never the fleet's lever; the
+                                                // park bound is — the drain cannot keep pace there at ANY cap).
+    assert_eq!(
+        derived_queue_cap_blocks(4_750, room_load, FIELD_BUDGET),
+        QUEUE_CAP_FLOOR_BLOCKS
+    );
+    // The same bandwidth on 64 KiB blocks: ~300k blocks/s × 35 ms =
+    // 10,500 — the derivation lifts the cap above the floor (it scales
+    // with the rate input).
+    assert_eq!(
+        derived_queue_cap_blocks(300_000, room_load, FIELD_BUDGET),
+        10_500
+    );
+    // Linear in the rate above the floor.
+    assert_eq!(
+        derived_queue_cap_blocks(600_000, room_load, FIELD_BUDGET),
+        21_000
+    );
+    // Linear in the room latency too (a slower drain needs more buffer).
+    assert_eq!(
+        derived_queue_cap_blocks(300_000, 2 * room_load, FIELD_BUDGET),
+        21_000
+    );
+    // Cold room latency (1 s) with a measured/seeded rate: one second of
+    // displacement — the shipped bound's assumption made explicit.
+    assert_eq!(
+        derived_queue_cap_blocks(19_000, room_latency_ms(64, 0), FIELD_BUDGET),
+        19_000
+    );
+    // Rate 0 (nothing displacing yet) ⇒ the floor.
+    assert_eq!(
+        derived_queue_cap_blocks(0, room_load, FIELD_BUDGET),
+        QUEUE_CAP_FLOOR_BLOCKS
+    );
+
+    // The RAM ceiling: budget/1024 ÷ per-entry RAM, floored at the shipped
+    // cap and capped at the registry maximum.
+    let entry = reclaim_entry_ram_bytes();
+    assert!(
+        (64..=512).contains(&entry),
+        "a reclaim entry is bookkeeping-sized ({entry} B): Arc + in-flight \
+         guard + device path + offset/size + queue slot"
+    );
+    // Field: 176 GiB / 1024 = 176 MiB ÷ ~entry ⇒ past the 2^20 registry
+    // maximum ⇒ 2^20.
+    assert_eq!(queue_cap_ceiling_blocks(FIELD_BUDGET), 1 << 20);
+    // Floor box: 2.8 GiB / 1024 = 2.8 MiB ÷ entry — a few thousand to a
+    // few tens of thousands; equals the formula and never dips below the
+    // shipped floor.
+    let floor_ceiling = queue_cap_ceiling_blocks(FLOOR_BUDGET);
+    assert_eq!(
+        floor_ceiling,
+        (FLOOR_BUDGET / QUEUE_RAM_SHARE_DIVISOR / entry).clamp(QUEUE_CAP_FLOOR_BLOCKS, 1 << 20)
+    );
+    assert!(floor_ceiling >= QUEUE_CAP_FLOOR_BLOCKS);
+    assert!(floor_ceiling < 1 << 20);
+    // The ceiling binds: a runaway rate on the floor box clamps to it.
+    assert_eq!(
+        derived_queue_cap_blocks(u64::MAX / 4, 1000, FLOOR_BUDGET),
+        floor_ceiling
+    );
+    // A zero/unknown budget degrades to the floor (never 0, never below
+    // shipped).
+    assert_eq!(queue_cap_ceiling_blocks(0), QUEUE_CAP_FLOOR_BLOCKS);
+    assert_eq!(
+        derived_queue_cap_blocks(300_000, room_load, 0),
+        QUEUE_CAP_FLOOR_BLOCKS
+    );
+}
+
+/// Explicit knobs win verbatim over the derivation (the ipc-cap precedence
+/// law); an out-of-range or malformed value falls through to the derived
+/// default in-process (the startup gate refuses it before a mount).
+#[test]
+fn reclaim_knobs_explicit_wins_verbatim_over_derived() {
+    use squeezefs::block_reclaim::{resolve_park_bound_ms, resolve_queue_cap_blocks};
+    // Cap: the A0 lever (4096 restores the shipped constant exactly).
+    assert_eq!(resolve_queue_cap_blocks(Some("4096"), 21_000), 4096);
+    assert_eq!(resolve_queue_cap_blocks(Some("96"), 21_000), 96);
+    assert_eq!(resolve_queue_cap_blocks(None, 21_000), 21_000);
+    assert_eq!(
+        resolve_queue_cap_blocks(Some("0"), 21_000),
+        21_000,
+        "below range"
+    );
+    assert_eq!(resolve_queue_cap_blocks(Some("junk"), 21_000), 21_000);
+    // Park bound: `0` = never park (immediate soft overflow) stays a valid
+    // explicit posture; 1000 restores the shipped constant exactly.
+    assert_eq!(resolve_park_bound_ms(Some("1000"), 140), 1000);
+    assert_eq!(resolve_park_bound_ms(Some("0"), 140), 0);
+    assert_eq!(resolve_park_bound_ms(None, 140), 140);
+    assert_eq!(
+        resolve_park_bound_ms(Some("60001"), 140),
+        140,
+        "above range"
+    );
+    assert_eq!(resolve_park_bound_ms(Some("soon"), 140), 140);
+}

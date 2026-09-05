@@ -736,6 +736,211 @@ async fn narrow_off_restores_the_pre_campaign_class() {
     assert_eq!(read_at(&h, ino, BS, 4096).await, over);
 }
 
+// ---------------------------------------------------------------------------
+// In-process rows (release build; run explicitly):
+//   cargo test --release --test write_stream_guard_tests rows_ -- --ignored --nocapture
+// ---------------------------------------------------------------------------
+
+/// Bucket snapshot of a histogram (per-row tails need a delta, the
+/// histograms are process-cumulative).
+fn buckets(h: &squeezefs::fuse_client::LatencyHistogram) -> Vec<u64> {
+    h.buckets
+        .iter()
+        .map(|b| b.load(Ordering::Relaxed))
+        .collect()
+}
+
+/// Highest power-of-two µs bucket that gained samples between two
+/// snapshots (the tail reading the note quotes beside the exact mean).
+fn max_bucket_delta(a: &[u64], b: &[u64]) -> &'static str {
+    let mut last = "0";
+    for (i, (x, y)) in a.iter().zip(b).enumerate() {
+        if y > x {
+            last = squeezefs::latency_core::LATENCY_BUCKET_LABELS[i];
+        }
+    }
+    last
+}
+
+struct WaitHold {
+    wait_sh: (u64, u64),
+    wait_ex: (u64, u64),
+    hold: [(u64, u64); 3],
+    hold_buckets: [Vec<u64>; 2],
+}
+
+fn wait_hold() -> WaitHold {
+    WaitHold {
+        hold_buckets: [
+            buckets(&METRICS.write_lock_hold_shared),
+            buckets(&METRICS.write_lock_hold_metaprep),
+        ],
+        wait_sh: (
+            METRICS.write_lock_wait_shared.count(),
+            METRICS.write_lock_wait_shared.sum_ns(),
+        ),
+        wait_ex: (
+            METRICS.write_lock_wait_exclusive.count(),
+            METRICS.write_lock_wait_exclusive.sum_ns(),
+        ),
+        hold: [
+            (
+                METRICS.write_lock_hold_shared.count(),
+                METRICS.write_lock_hold_shared.sum_ns(),
+            ),
+            (
+                METRICS.write_lock_hold_metaprep.count(),
+                METRICS.write_lock_hold_metaprep.sum_ns(),
+            ),
+            (
+                METRICS.write_lock_hold_entire.count(),
+                METRICS.write_lock_hold_entire.sum_ns(),
+            ),
+        ],
+    }
+}
+
+fn mean_ns(a: (u64, u64), b: (u64, u64)) -> (u64, u64) {
+    let c = b.0 - a.0;
+    (c, (b.1 - a.1).checked_div(c).unwrap_or(0))
+}
+
+/// One row: `files` striped files × `qd` cursor-driven stream tasks each,
+/// `blocks` blocks per file written as `segs` sub-block segments (the
+/// field's 1 MiB-into-4 MiB shape at BS/4), under the given posture.
+async fn stream_row(h: &H, label: &str, narrow: bool, files: u64, qd: u64, blocks: u64, segs: u64) {
+    set_write_guard_narrow_for_tests(narrow);
+    let mut inos = Vec::new();
+    for f in 0..files {
+        let ino = create(h, &format!("{label}_{f}")).await;
+        grow_striped(h, ino, 2).await;
+        inos.push(ino);
+    }
+    let seg_len = BS / segs;
+    let a = wait_hold();
+    let t0 = Instant::now();
+    let mut tasks = Vec::new();
+    for &ino in &inos {
+        let cursor = Arc::new(AtomicU64::new(2 * segs));
+        for _ in 0..qd {
+            let fs = h.fs.clone();
+            let req = h.req;
+            let cursor = cursor.clone();
+            tasks.push(tokio::spawn(async move {
+                let data = vec![0x5Cu8; seg_len as usize];
+                loop {
+                    let s = cursor.fetch_add(1, Ordering::Relaxed);
+                    if s >= (2 + blocks) * segs {
+                        break;
+                    }
+                    write_at(&fs, req, ino, s * seg_len, &data).await;
+                }
+            }));
+        }
+    }
+    for t in tasks {
+        t.await.expect("stream task");
+    }
+    let wall = t0.elapsed();
+    let b = wait_hold();
+    let writes = files * blocks * segs;
+    let (wsh_n, wsh_mean) = mean_ns(a.wait_sh, b.wait_sh);
+    let (wex_n, wex_mean) = mean_ns(a.wait_ex, b.wait_ex);
+    let holds: Vec<(u64, u64)> = (0..3).map(|i| mean_ns(a.hold[i], b.hold[i])).collect();
+    let bytes = writes * seg_len;
+    eprintln!(
+        "| {label} | narrow={} | {files}×qd{qd}, {blocks} blk × {segs} seg | {writes} | {:.1} ms | {:.2} GiB/s | wait_sh n={wsh_n} mean={wsh_mean} ns | wait_ex n={wex_n} mean={wex_mean} ns | hold_sh n={} mean={} ns (max {}) | hold_mp n={} mean={} ns (max {}) | hold_en n={} mean={} ns |",
+        narrow as u8,
+        wall.as_secs_f64() * 1e3,
+        bytes as f64 / wall.as_secs_f64() / (1u64 << 30) as f64,
+        holds[0].0,
+        holds[0].1,
+        max_bucket_delta(&a.hold_buckets[0], &b.hold_buckets[0]),
+        holds[1].0,
+        holds[1].1,
+        max_bucket_delta(&a.hold_buckets[1], &b.hold_buckets[1]),
+        holds[2].0,
+        holds[2].1,
+    );
+    for &ino in &inos {
+        quiesce(h, ino).await;
+    }
+}
+
+/// The concurrency contract's shape as a row: K concurrent extends into K
+/// fresh blocks of one ino under a `stall` block-window park — wall vs
+/// K × stall, and the hold sum vs one stall, per posture.
+async fn stalled_row(h: &H, label: &str, narrow: bool, k: u64, stall: Duration) {
+    set_write_guard_narrow_for_tests(narrow);
+    let ino = create(h, label).await;
+    grow_striped(h, ino, 2).await;
+    set_test_checkout_stall_ms(stall.as_millis() as u64);
+    let a = wait_hold();
+    let t0 = Instant::now();
+    let mut tasks = Vec::new();
+    for i in 0..k {
+        let fs = h.fs.clone();
+        let req = h.req;
+        tasks.push(tokio::spawn(async move {
+            let b = 2 + i;
+            write_at(&fs, req, ino, b * BS, &block_pattern(0x3C, b, BS as usize)).await;
+        }));
+    }
+    for t in tasks {
+        t.await.expect("writer");
+    }
+    let wall = t0.elapsed();
+    set_test_checkout_stall_ms(0);
+    let b = wait_hold();
+    let hold_sum_ns: u64 = (0..3).map(|i| b.hold[i].1 - a.hold[i].1).sum();
+    let (wsh_n, wsh_mean) = mean_ns(a.wait_sh, b.wait_sh);
+    let (wex_n, wex_mean) = mean_ns(a.wait_ex, b.wait_ex);
+    eprintln!(
+        "| {label} | narrow={} | K={k} extends, stall {stall:?} | wall {:.1} ms (K×stall = {:.0} ms) | Σ hold {} µs | wait_sh n={wsh_n} mean={wsh_mean} ns | wait_ex n={wex_n} mean={wex_mean} ns |",
+        narrow as u8,
+        wall.as_secs_f64() * 1e3,
+        stall.as_secs_f64() * 1e3 * k as f64,
+        hold_sum_ns / 1000,
+    );
+    quiesce(h, ino).await;
+}
+
+/// The in-process rows behind the evidence note's tables: the convoy
+/// shape (one ino, deep qd) and the field shape (many inos, qd 16), each
+/// A-B-B-A across the posture within one process.
+#[tokio::test(flavor = "multi_thread", worker_threads = 16)]
+#[ignore = "release-build row printer (see the module comment above)"]
+async fn rows_in_process_release() {
+    let _s = SERIAL.lock().await;
+    let _reset = SeamReset;
+    set_write_shared_for_tests(true);
+    let h = make("wsg_rows").await;
+    eprintln!("| contract row | posture | shape | wall | Σ hold | wait shared | wait exclusive |");
+    for (i, narrow) in [false, true, true, false].into_iter().enumerate() {
+        stalled_row(
+            &h,
+            &format!("k8_stall200_{i}"),
+            narrow,
+            8,
+            Duration::from_millis(200),
+        )
+        .await;
+    }
+    eprintln!("| row | posture | shape | writes | wall | GiB/s | wait shared | wait exclusive | hold shared | hold metaprep | hold entire |");
+    // A-B-B-A: one ino, qd 16, 512 blocks × 4 segments.
+    for (i, narrow) in [false, true, true, false].into_iter().enumerate() {
+        stream_row(&h, &format!("one_ino_qd16_{i}"), narrow, 1, 16, 512, 4).await;
+    }
+    // A-B-B-A: 24 inos × qd 16, 32 blocks × 4 segments each.
+    for (i, narrow) in [false, true, true, false].into_iter().enumerate() {
+        stream_row(&h, &format!("24_inos_qd16_{i}"), narrow, 24, 16, 32, 4).await;
+    }
+    // A-B-B-A: one ino, qd 64 (the deep convoy), 512 blocks × 4 segments.
+    for (i, narrow) in [false, true, true, false].into_iter().enumerate() {
+        stream_row(&h, &format!("one_ino_qd64_{i}"), narrow, 1, 64, 512, 4).await;
+    }
+}
+
 /// `SQUEEZEFS_WRITE_SHARED=0` dominates: no Shared dispatch at all, the
 /// narrow posture notwithstanding.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

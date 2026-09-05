@@ -2050,9 +2050,7 @@ pub fn reset_for_test() {
     }
     test_set_demand(None);
     test_set_pass_elastic(None);
-    for b in &RESIDENCE_MS.buckets {
-        b.store(0, Ordering::Relaxed);
-    }
+    RESIDENCE_MS.reset();
     RUNWAY_MS.store(u64::MAX, Ordering::Relaxed);
     LADDER.reset();
     test_set_ack_pipeline(None);

@@ -4782,6 +4782,17 @@ impl LatencyHistogram {
         self.sum_ns().checked_div(self.count()).unwrap_or(0)
     }
 
+    /// Zero every word — buckets AND the exact count/sum. The one reset
+    /// path, so a seam can never clear half an instrument (the
+    /// `free_grace::reset_for_test` residence bleed).
+    pub fn reset(&self) {
+        for b in &self.buckets {
+            b.store(0, Ordering::Relaxed);
+        }
+        self.count.store(0, Ordering::Relaxed);
+        self.sum_ns.store(0, Ordering::Relaxed);
+    }
+
     pub fn to_json(&self) -> serde_json::Value {
         let buckets: [u64; crate::latency_core::LATENCY_BUCKETS] =
             std::array::from_fn(|i| self.buckets[i].load(Ordering::Relaxed));

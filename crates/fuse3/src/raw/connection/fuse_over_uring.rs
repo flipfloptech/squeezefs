@@ -207,6 +207,13 @@ pub(crate) struct CommitMsg {
     /// per-ent retain flag at mint (the handler armed it via
     /// `zc_commit_retain` strictly before replying).
     retain: bool,
+    /// fd-SOURCE body (R-4 read-zc-serve): `Some((fd, off))` = `reply_body`
+    /// is ALSO reachable at `off` on `fd` (the filesystem's memfd fill
+    /// pool). On a zc queue the worker bridges it into the request's
+    /// pages FROM THERE (`READ_FIXED(fd @ off → slot)`) — the bounce
+    /// staging copy is skipped; `reply_body` is the keepalive (held in
+    /// the pend until the bridge CQE) and the fallback source.
+    body_fd: Option<(RawFd, u64)>,
 }
 
 /// A handler-initiated zc device fetch (the direct read leg): DMA `len`
@@ -3238,6 +3245,35 @@ impl FuseOverUring {
         header: Vec<u8>,
         reply_body: Bytes,
     ) -> io::Result<()> {
+        self.submit_reply_inner(slot, header, reply_body, None)
+    }
+
+    /// [`Self::submit_reply`] with an fd-SOURCE body (R-4 read-zc-serve):
+    /// `reply_body` is ALSO reachable at `off` on `fd`, and on a zc queue
+    /// the worker bridges it into the request's pages from there —
+    /// `READ_FIXED(fd @ off → slot)` — without the filesystem's copy into
+    /// the bounce slot. `reply_body` travels VERBATIM (no `copy_from_slice`
+    /// — the `write_vectored` path's heap copy would defeat the point) and
+    /// is the keepalive + the fallback source. On a non-zc queue the body
+    /// commits exactly like a plain reply (the fd is ignored).
+    pub fn submit_reply_fd_body(
+        &self,
+        slot: ReplySlot,
+        header: Vec<u8>,
+        reply_body: Bytes,
+        fd: RawFd,
+        off: u64,
+    ) -> io::Result<()> {
+        self.submit_reply_inner(slot, header, reply_body, Some((fd, off)))
+    }
+
+    fn submit_reply_inner(
+        &self,
+        slot: ReplySlot,
+        header: Vec<u8>,
+        reply_body: Bytes,
+        body_fd: Option<(RawFd, u64)>,
+    ) -> io::Result<()> {
         let ReplySlot::Ring {
             qid,
             ent_idx,
@@ -3280,6 +3316,7 @@ impl FuseOverUring {
                 reply_body,
                 prefilled: None,
                 retain,
+                body_fd,
             }))
             .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "uring commit closed"))?;
         // Wake the drain thread. L3 lever B at group scope: the channel
@@ -3616,6 +3653,7 @@ impl FuseOverUring {
                 reply_body: Bytes::new(),
                 prefilled: Some(payload_len),
                 retain: false,
+                body_fd: None,
             }))
             .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "uring commit closed"))?;
         if g.wake_coalescer.arm() {
@@ -4731,27 +4769,45 @@ fn queue_worker(
                     batch.note_commit_opcode(ent.last_opcode);
                     return submit_commit(ring, batch, slots, watch, qid, gent, msg.commit_id);
                 }
-                // Stage into the bounce slot; dest-armed serves already
+                // The bridge SOURCE (R-4 fd-source serve): an fd-addressed
+                // body is bridged straight from the filesystem's fill
+                // pool memfd — the staging copy below is SKIPPED and
+                // `reply_body` is the keepalive; every other body stages
+                // into the bounce slot first. Dest-armed serves already
                 // wrote there (`get_payload_buffer` hands out the bounce
-                // in zc mode), so the common warm path elides this copy
-                // exactly like `apply_reply`'s ptr-equality elision.
-                if !std::ptr::eq(msg.reply_body.as_ptr(), dst) {
-                    // SAFETY: dst is this ent's bounce slot (exclusively
-                    // this request's between two commits — the §5.4
-                    // ownership argument) and `body_len ≤ stride` was
-                    // checked above.
-                    unsafe {
-                        std::ptr::copy_nonoverlapping(msg.reply_body.as_ptr(), dst, body_len);
+                // in zc mode), so the common warm copy path elides the
+                // staging copy exactly like `apply_reply`'s ptr-equality
+                // elision.
+                let (src_fd, src_off, fd_source) = match msg.body_fd {
+                    Some((fd, foff)) => {
+                        kmbuf::note_zc_fd_body_reply();
+                        (fd, foff, true)
                     }
-                }
+                    None => {
+                        if !std::ptr::eq(msg.reply_body.as_ptr(), dst) {
+                            // SAFETY: dst is this ent's bounce slot
+                            // (exclusively this request's between two
+                            // commits — the §5.4 ownership argument) and
+                            // `body_len ≤ stride` was checked above.
+                            unsafe {
+                                std::ptr::copy_nonoverlapping(
+                                    msg.reply_body.as_ptr(),
+                                    dst,
+                                    body_len,
+                                );
+                            }
+                        }
+                        (zb.fd(), off, false)
+                    }
+                };
                 let entry = Entry128::from(
                     opcode::ReadFixed::new(
-                        types::Fd(zb.fd()),
+                        types::Fd(src_fd),
                         std::ptr::null_mut(),
                         body_len as u32,
                         idx as u16,
                     )
-                    .offset(off)
+                    .offset(src_off)
                     .build()
                     .user_data(encode_user_data(RingOp::Fetch, gent)),
                 );
@@ -4763,6 +4819,7 @@ fn queue_worker(
                             body: msg.reply_body,
                             commit_id: msg.commit_id,
                             len: body_len as u32,
+                            fd_source,
                         });
                         if deadlines.stamp(idx, crate::raw::read_phase::transport_now_ns()) {
                             *pend_delta += 1;
@@ -4852,6 +4909,7 @@ fn queue_worker(
                 body,
                 commit_id,
                 len,
+                fd_source,
             }) => {
                 if res == len as i32 {
                     apply_reply_zc(ent, &header, len);
@@ -4859,6 +4917,31 @@ fn queue_worker(
                     batch.note_commit_opcode(ent.last_opcode);
                     submit_commit(ring, batch, slots, watch, qid, gent, commit_id)?;
                     return Ok(None);
+                }
+                if fd_source {
+                    // R-4 fd-source bridge failed (a short read on the
+                    // pool memfd, a torn-down request, a source the ring
+                    // could not name): RE-STAGE the very same body through
+                    // the bounce — one plain bridge, the shipped path —
+                    // so the reply is never lost. The caller re-runs the
+                    // commit routing with the fd address dropped; counted
+                    // on the must-stay-≈0 `fuse3_zc_fd_body_fallbacks`.
+                    kmbuf::note_zc_fd_body_fallback();
+                    warn!(
+                        "fuse-over-uring qid={qid} ent={idx}: zc fd-source bridge failed \
+                         (res={res}, want={len}) — re-staging through the bounce \
+                         (fuse3_zc_fd_body_fallbacks)"
+                    );
+                    return Ok(Some(PendDone::Restage(CommitMsg {
+                        qid,
+                        ent_idx: idx as u16,
+                        commit_id,
+                        header,
+                        reply_body: body,
+                        prefilled: None,
+                        retain: false,
+                        body_fd: None,
+                    })));
                 }
                 // The opcode-mirror safety net: a slot with no registered
                 // pages (the kernel served this op copyable) errors here —
@@ -4975,6 +5058,12 @@ fn queue_worker(
         /// An at-delivery extraction FAILED: the request cannot be
         /// served — the caller synthesizes its EIO (row-5 discipline).
         DeliverFailed,
+        /// An fd-SOURCE bridge FAILED (R-4): re-run the commit routing for
+        /// the SAME reply with the fd address dropped, so it stages
+        /// through the bounce and bridges once more — the reply is never
+        /// lost. Routed by the caller because the re-park stamps the
+        /// bridge deadline the caller clears right after this returns.
+        Restage(CommitMsg),
     }
     // Membership lookup, not offset arithmetic: groups are node-membership
     // SETS (interleaved numberings are the field norm). A linear scan over
@@ -6180,18 +6269,36 @@ fn queue_worker(
                             if m.bridge_deadlines.clear(ent_idx) {
                                 pend_delta -= 1;
                             }
-                            if matches!(pend, Some(PendDone::DeliverFailed)) {
-                                fail_ent(
+                            match pend {
+                                Some(PendDone::DeliverFailed) => {
+                                    fail_ent(
+                                        &mut ring,
+                                        &mut batch,
+                                        &mut m.slots,
+                                        &mut m.ents[ent_idx],
+                                        &m.lease_states[ent_idx],
+                                        pool.slot_watch_cell(qid, ent_idx),
+                                        qid,
+                                        gent,
+                                        libc::EIO,
+                                    )?;
+                                }
+                                Some(PendDone::Restage(msg)) => commit_ready_reply(
                                     &mut ring,
                                     &mut batch,
                                     &mut m.slots,
                                     &mut m.ents[ent_idx],
-                                    &m.lease_states[ent_idx],
+                                    &mut m.zc_pend[ent_idx],
+                                    &mut m.bridge_deadlines,
+                                    &mut pend_delta,
+                                    zc_bounce.as_ref(),
+                                    zc_track,
                                     pool.slot_watch_cell(qid, ent_idx),
                                     qid,
                                     gent,
-                                    libc::EIO,
-                                )?;
+                                    msg,
+                                )?,
+                                _ => {}
                             }
                         }
                         zc::CancelCqeAction::Restamp => {
@@ -6244,18 +6351,36 @@ fn queue_worker(
                     if m.bridge_deadlines.clear(ent_idx) {
                         pend_delta -= 1;
                     }
-                    if matches!(pend, Some(PendDone::DeliverFailed)) {
-                        fail_ent(
+                    match pend {
+                        Some(PendDone::DeliverFailed) => {
+                            fail_ent(
+                                &mut ring,
+                                &mut batch,
+                                &mut m.slots,
+                                &mut m.ents[ent_idx],
+                                &m.lease_states[ent_idx],
+                                pool.slot_watch_cell(qid, ent_idx),
+                                qid,
+                                gent,
+                                libc::EIO,
+                            )?;
+                        }
+                        Some(PendDone::Restage(msg)) => commit_ready_reply(
                             &mut ring,
                             &mut batch,
                             &mut m.slots,
                             &mut m.ents[ent_idx],
-                            &m.lease_states[ent_idx],
+                            &mut m.zc_pend[ent_idx],
+                            &mut m.bridge_deadlines,
+                            &mut pend_delta,
+                            zc_bounce.as_ref(),
+                            zc_track,
                             pool.slot_watch_cell(qid, ent_idx),
                             qid,
                             gent,
-                            libc::EIO,
-                        )?;
+                            msg,
+                        )?,
+                        _ => {}
                     }
                     continue;
                 }
@@ -6581,6 +6706,27 @@ fn queue_worker(
                                 libc::EIO,
                             )?;
                         }
+                        PendDone::Restage(msg) => {
+                            // R-4: an fd-source bridge failed — the same
+                            // reply re-routes through the bounce (its fd
+                            // address dropped), re-parking with a fresh
+                            // deadline stamp.
+                            commit_ready_reply(
+                                &mut ring,
+                                &mut batch,
+                                &mut m.slots,
+                                &mut m.ents[ent_idx],
+                                &mut m.zc_pend[ent_idx],
+                                &mut m.bridge_deadlines,
+                                &mut pend_delta,
+                                zc_bounce.as_ref(),
+                                zc_track,
+                                pool.slot_watch_cell(qid, ent_idx),
+                                qid,
+                                gent,
+                                msg,
+                            )?;
+                        }
                     }
                 }
                 continue;
@@ -6894,8 +7040,19 @@ fn queue_worker(
                 // instant and (on demote) the mint instant are the same
                 // point by construction.
                 let now_ns = crate::raw::read_phase::transport_now_ns();
-                match (d.probe)(nodeid, r_fh, r_off, r_size, r_flags, dest) {
-                    crate::raw::reply::FastReadProbe::Served(body) => {
+                // R-4: a served probe is bytes in the window (`Served`) or
+                // the pool slice with its fd address (`ServedFd` — the
+                // worker bridges it from the memfd; the clamp below keeps
+                // the fd offset, a prefix slice starts at the same byte).
+                let served = match (d.probe)(nodeid, r_fh, r_off, r_size, r_flags, dest) {
+                    crate::raw::reply::FastReadProbe::Served(body) => Some((body, None)),
+                    crate::raw::reply::FastReadProbe::ServedFd { body, fd, off } => {
+                        Some((body, Some((fd, off))))
+                    }
+                    crate::raw::reply::FastReadProbe::Demote => None,
+                };
+                match served {
+                    Some((body, body_fd)) => {
                         // The handler's clamp: never more than asked.
                         let body = if body.len() > r_size as usize {
                             body.slice(..r_size as usize)
@@ -6926,6 +7083,7 @@ fn queue_worker(
                                 reply_body: body,
                                 prefilled: None,
                                 retain: false,
+                                body_fd,
                             },
                         )?;
                         STATS_REPLIES.add(1);
@@ -6936,7 +7094,7 @@ fn queue_worker(
                         );
                         continue;
                     }
-                    crate::raw::reply::FastReadProbe::Demote => {
+                    None => {
                         let fut = (d.mint)(InboundUringReq {
                             header_and_op,
                             payload,
@@ -7369,6 +7527,7 @@ fn queue_worker(
                         reply_body: Bytes::new(),
                         prefilled: None,
                         retain: false,
+                        body_fd: None,
                     },
                     true,
                 ));

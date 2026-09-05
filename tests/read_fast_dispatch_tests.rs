@@ -196,6 +196,9 @@ fn pattern(len: usize, tag: u8) -> Vec<u8> {
 fn served(p: FastReadProbe) -> bytes::Bytes {
     match p {
         FastReadProbe::Served(b) => b,
+        // R-4 fd-source serve (SQUEEZEFS_READ_ZC_SERVE, off in this
+        // suite): unreachable here, but the bytes are the body either way.
+        FastReadProbe::ServedFd { body, .. } => body,
         FastReadProbe::Demote => panic!("expected Served, got Demote"),
     }
 }

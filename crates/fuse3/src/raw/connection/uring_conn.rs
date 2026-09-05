@@ -539,6 +539,41 @@ impl FuseConnection {
         ))
     }
 
+    /// R-4 fd-source body reply: commit `reply_body` whose bytes are ALSO
+    /// reachable at `off` on `fd` — on a zc session the worker bridges
+    /// them into the request's pages from there (no bounce staging copy)
+    /// — see [`super::fuse_over_uring::FuseOverUring::submit_reply_fd_body`].
+    #[cfg(target_os = "linux")]
+    pub fn submit_reply_fd_body(
+        &self,
+        slot: crate::raw::ReplySlot,
+        header: Vec<u8>,
+        reply_body: bytes::Bytes,
+        fd: std::os::fd::RawFd,
+        off: u64,
+    ) -> io::Result<()> {
+        let pool = self
+            .over_uring
+            .get()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotConnected, "no over-uring pool"))?;
+        pool.submit_reply_fd_body(slot, header, reply_body, fd, off)
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    pub fn submit_reply_fd_body(
+        &self,
+        _slot: crate::raw::ReplySlot,
+        _header: Vec<u8>,
+        _reply_body: bytes::Bytes,
+        _fd: std::os::fd::RawFd,
+        _off: u64,
+    ) -> io::Result<()> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "no FUSE-over-io_uring transport on this platform",
+        ))
+    }
+
     #[cfg(not(target_os = "linux"))]
     pub fn over_uring_ready(&self) -> bool {
         false

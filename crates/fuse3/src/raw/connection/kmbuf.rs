@@ -881,6 +881,40 @@ pub fn note_zc_fallback() {
     ZC_FALLBACKS.fetch_add(1, Ordering::Relaxed);
 }
 
+// R-4 fd-source READ serve (read-zc-serve, 2026-09-05): per-worker
+// sharded like ZC_REPLIES — one count per fd-bridged commit.
+static ZC_FD_BODY_REPLIES: crate::raw::read_phase::ShardedCounter =
+    crate::raw::read_phase::ShardedCounter::new();
+static ZC_FD_BODY_FALLBACKS: AtomicU64 = AtomicU64::new(0);
+
+/// Count one reply whose body the worker bridged into the request's
+/// pages STRAIGHT from the filesystem's fd-addressable fill pool
+/// (`CommitMsg::body_fd` — the staging copy into the bounce skipped).
+pub fn note_zc_fd_body_reply() {
+    ZC_FD_BODY_REPLIES.add(1);
+}
+
+/// `fuse3_zc_fd_body_replies` (stats inode): the transport-side vehicle
+/// count of the fd-source serve; the daemon's `read_zc_pool_serve_bytes`
+/// is the byte face, counted at the router — their difference is the
+/// composed-window residue (≈ 0).
+pub fn zc_fd_body_replies() -> u64 {
+    ZC_FD_BODY_REPLIES.load()
+}
+
+/// Count one fd-source bridge that FAILED and re-staged through the
+/// bounce (the reply was not lost — it paid the copy it meant to skip).
+pub fn note_zc_fd_body_fallback() {
+    ZC_FD_BODY_FALLBACKS.fetch_add(1, Ordering::Relaxed);
+}
+
+/// `fuse3_zc_fd_body_fallbacks` (stats inode): must stay ≈ 0 — growth
+/// means the pool memfd stopped answering full-length reads for slots
+/// the daemon believes addressable (stop and read the worker's line).
+pub fn zc_fd_body_fallbacks() -> u64 {
+    ZC_FD_BODY_FALLBACKS.load(Ordering::Relaxed)
+}
+
 /// `fuse3_zc_fallbacks` (stats inode): must stay ≈ 0 on a healthy zc
 /// session.
 pub fn zc_fallbacks() -> u64 {

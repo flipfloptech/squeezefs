@@ -5559,6 +5559,34 @@ pub enum SyncServeArm {
     Cache,
 }
 
+/// R-4 fd-source serve gate at a dest-armed serve site: `true` when the
+/// request rides a zc-armed ring slot (`zc` minted), a transport dest
+/// exists (the bounce slot — the copy this gate elides), and `src` is
+/// fill-pool memory the queue worker can name as the bridge SOURCE
+/// (`SQUEEZEFS_READ_ZC_SERVE` built the memfd pool). The caller then
+/// hands back the `Bytes` slice itself — the transport bridges it into
+/// the request's pages and the daemon copy is deleted. Every other case
+/// copies as before.
+#[inline]
+fn zc_fd_source(zc: Option<&ZcReadServe>, dest_addr: Option<u64>, src: &[u8]) -> bool {
+    zc.is_some()
+        && dest_addr.is_some()
+        && crate::cache::pool::zc_fill_fd_offset(src.as_ptr(), src.len()).is_some()
+}
+
+/// Account one validated fd-source serve (`warm` = the hot/hold arms).
+#[inline]
+fn note_zc_pool_serve(len: usize, warm: bool) {
+    METRICS
+        .read_zc_pool_serve_bytes
+        .fetch_add(len as u64, Ordering::Relaxed);
+    if warm {
+        METRICS
+            .read_zc_pool_serve_warm_bytes
+            .fetch_add(len as u64, Ordering::Relaxed);
+    }
+}
+
 /// The dest-arm serve copy (read-copy-count 2026-08-02): NT-policied for
 /// registered uring ent payload dests (the counted +11 % EXA-cold-read
 /// win — `SQUEEZEFS_NT_READ_SERVE`, default on, floor 256 KiB), CACHED
@@ -14417,7 +14445,12 @@ impl DataRouter {
             let start = rel_s.min(hot.len());
             let end = rel_e.min(hot.len());
             METRICS.hot_block_hits.fetch_add(1, Ordering::Relaxed);
-            out.write_at(0, &hot[start..end]);
+            // R-4 fd-source serve: a zc reply window takes the pool-backed
+            // slice itself (bridged by fd — no window copy); every other
+            // sink copies.
+            if !out.offer_fd_body(&hot, start..end) {
+                out.write_at(0, &hot[start..end]);
+            }
             // Read-lane coverage credit (il hold-probe campaign,
             // 2026-08-03 — the handler hot arm's rule mirrored): this
             // consumption path retires the hold's copy too (no-op when
@@ -14459,7 +14492,10 @@ impl DataRouter {
                 METRICS
                     .ipc_hold_probe_serves
                     .fetch_add(1, Ordering::Relaxed);
-                out.write_at(0, &held[start..end]);
+                // R-4 fd-source serve (see the hot leg).
+                if !out.offer_fd_body(&held, start..end) {
+                    out.write_at(0, &held[start..end]);
+                }
                 self.cache
                     .read_lane_hold
                     .credit(b_key, (end - start) as u64);
@@ -16467,7 +16503,15 @@ impl DataRouter {
                                         hot.len(),
                                     );
                                     let slice_t0 = std::time::Instant::now();
-                                    let data = if let Some(dest) = dest_addr {
+                                    // R-4 fd-source serve: a pool-backed hot
+                                    // entry on a zc-armed request is handed
+                                    // back as the slice itself (the transport
+                                    // bridges the tier buffer into the pages);
+                                    // counted below, only on a proven serve.
+                                    let fd_source = zc_fd_source(zc, dest_addr, &hot[start..end]);
+                                    let data = if fd_source {
+                                        hot.slice(start..end)
+                                    } else if let Some(dest) = dest_addr {
                                         let len = end - start;
                                         let dest_ptr = dest as *mut u8;
                                         // Copy ledger: the lawful serve
@@ -16522,6 +16566,9 @@ impl DataRouter {
                                     if still_bound {
                                         METRICS.cache_hits.fetch_add(1, Ordering::Relaxed);
                                         METRICS.hot_block_hits.fetch_add(1, Ordering::Relaxed);
+                                        if fd_source {
+                                            note_zc_pool_serve(end - start, true);
+                                        }
                                         if hint.odirect {
                                             // Hybrid I/O: O_DIRECT serves
                                             // from OUR tiers by directive
@@ -16578,7 +16625,12 @@ impl DataRouter {
                                             held.len(),
                                         );
                                         let slice_t0 = std::time::Instant::now();
-                                        let data = if let Some(dest) = dest_addr {
+                                        // R-4 fd-source serve (see the hot arm).
+                                        let fd_source =
+                                            zc_fd_source(zc, dest_addr, &held[start..end]);
+                                        let data = if fd_source {
+                                            held.slice(start..end)
+                                        } else if let Some(dest) = dest_addr {
                                             let len = end - start;
                                             let dest_ptr = dest as *mut u8;
                                             // Copy ledger + NT lever
@@ -16628,6 +16680,9 @@ impl DataRouter {
                                         );
                                         if still_bound {
                                             METRICS.cache_hits.fetch_add(1, Ordering::Relaxed);
+                                            if fd_source {
+                                                note_zc_pool_serve(end - start, true);
+                                            }
                                             METRICS
                                                 .read_lane_serves
                                                 .fetch_add(1, Ordering::Relaxed);
@@ -17046,6 +17101,9 @@ impl DataRouter {
                             // the cold leg; `block_fetch` spans each fetch
                             // await below, `slice_out` the reply copies.)
                             read_serve_phase_record(ReadServePhase::ClassifyProbe, probe_t0);
+                            // R-4: the fd-source slice a cold slice-out arm
+                            // handed back instead of copying (see the arms).
+                            let mut fd_slice: Option<bytes::Bytes> = None;
                             let downloaded: Option<crate::cache::pool::ReadBlockValue> =
                                 match b_key_opt {
                                     Some(b_key) => {
@@ -17208,66 +17266,88 @@ impl DataRouter {
                                                                 .read_lane_hold
                                                                 .credit(b_key, len as u64);
                                                         }
-                                                        let dest_ptr = dest as *mut u8;
-                                                        // SAFETY: the destination window this serve was bounded against at
-                                                        // entry (`ReadDest::checked_ptr`, FUSE-4e) — writes stay within
-                                                        // `cap`, and §5.4 lease exclusivity (kernel path) / session arena
-                                                        // custody (il path) makes this request its only writer.
-                                                        unsafe {
-                                                            // Copy ledger +
-                                                            // NT lever (see
-                                                            // the hot arm) —
-                                                            // the EXA cold
-                                                            // slice_out.
-                                                            if serve_copy_to_dest(
-                                                                dest_ptr,
-                                                                val[start..end].as_ptr(),
-                                                                len,
-                                                                hint.dest_arena,
-                                                            ) {
+                                                        // R-4 fd-source serve: a pool-backed
+                                                        // fill on a zc-armed request hands
+                                                        // back the slice itself (the
+                                                        // transport bridges the fill buffer
+                                                        // into the pages) — the EXA cold
+                                                        // slice_out DELETED. The full block
+                                                        // stays the backing.
+                                                        if let crate::cache::pool::ReadBlockValue::Bytes(b) = &val {
+                                                            if zc_fd_source(zc, dest_addr, &b[start..end]) {
+                                                                fd_slice = Some(b.slice(start..end));
+                                                            }
+                                                        }
+                                                        if fd_slice.is_some() {
+                                                            read_serve_phase_record(
+                                                                ReadServePhase::SliceOut,
+                                                                slice_t0,
+                                                            );
+                                                            Some(val)
+                                                        } else {
+                                                            let dest_ptr = dest as *mut u8;
+                                                            // SAFETY: the destination window this serve was bounded against at
+                                                            // entry (`ReadDest::checked_ptr`, FUSE-4e) — writes stay within
+                                                            // `cap`, and §5.4 lease exclusivity (kernel path) / session arena
+                                                            // custody (il path) makes this request its only writer.
+                                                            unsafe {
+                                                                // Copy ledger +
+                                                                // NT lever (see
+                                                                // the hot arm) —
+                                                                // the EXA cold
+                                                                // slice_out.
+                                                                if serve_copy_to_dest(
+                                                                    dest_ptr,
+                                                                    val[start..end].as_ptr(),
+                                                                    len,
+                                                                    hint.dest_arena,
+                                                                ) {
+                                                                    METRICS
+                                                                        .nt_read_serve_bytes
+                                                                        .fetch_add(
+                                                                            len as u64,
+                                                                            Ordering::Relaxed,
+                                                                        );
+                                                                }
                                                                 METRICS
-                                                                    .nt_read_serve_bytes
+                                                                    .read_copy_dest_bytes
                                                                     .fetch_add(
                                                                         len as u64,
                                                                         Ordering::Relaxed,
                                                                     );
+                                                                // R-4 per-arm split: the cold
+                                                                // whole-block fill → dest
+                                                                // slice-out (the EXA row's
+                                                                // one daemon pass).
+                                                                METRICS
+                                                                    .read_copy_fill_slice_bytes
+                                                                    .fetch_add(
+                                                                        len as u64,
+                                                                        Ordering::Relaxed,
+                                                                    );
+                                                                // Unwritten remainder of the reused
+                                                                // uring dest region must never replay
+                                                                // a previous reply's bytes.
+                                                                if len < slice_len as usize {
+                                                                    std::ptr::write_bytes(
+                                                                        dest_ptr.add(len),
+                                                                        0,
+                                                                        slice_len as usize - len,
+                                                                    );
+                                                                }
                                                             }
-                                                            METRICS.read_copy_dest_bytes.fetch_add(
-                                                                len as u64,
-                                                                Ordering::Relaxed,
+                                                            read_serve_phase_record(
+                                                                ReadServePhase::SliceOut,
+                                                                slice_t0,
                                                             );
-                                                            // R-4 per-arm split: the cold
-                                                            // whole-block fill → dest
-                                                            // slice-out (the EXA row's
-                                                            // one daemon pass).
-                                                            METRICS
-                                                                .read_copy_fill_slice_bytes
-                                                                .fetch_add(
-                                                                    len as u64,
-                                                                    Ordering::Relaxed,
-                                                                );
-                                                            // Unwritten remainder of the reused
-                                                            // uring dest region must never replay
-                                                            // a previous reply's bytes.
-                                                            if len < slice_len as usize {
-                                                                std::ptr::write_bytes(
-                                                                    dest_ptr.add(len),
-                                                                    0,
-                                                                    slice_len as usize - len,
-                                                                );
-                                                            }
-                                                        }
-                                                        read_serve_phase_record(
-                                                            ReadServePhase::SliceOut,
-                                                            slice_t0,
-                                                        );
-                                                        let b =
+                                                            let b =
                                                             // SAFETY: the destination window this serve was bounded against at
                                                             // entry (`ReadDest::checked_ptr`, FUSE-4e) — writes stay within
                                                             // `cap`, and §5.4 lease exclusivity (kernel path) / session arena
                                                             // custody (il path) makes this request its only writer.
                                                             unsafe { dest_bytes(dest_ptr, len) };
-                                                        Some(crate::cache::pool::ReadBlockValue::Bytes(b))
+                                                            Some(crate::cache::pool::ReadBlockValue::Bytes(b))
+                                                        }
                                                     }
                                                     (Some(val), None) => Some(val),
                                                     (None, _) => None,
@@ -17308,52 +17388,76 @@ impl DataRouter {
                                                     val.len(),
                                                 );
                                                 let len = end - start;
-                                                let dest_ptr = dest as *mut u8;
-                                                // SAFETY: the destination window this serve was bounded against at
-                                                // entry (`ReadDest::checked_ptr`, FUSE-4e) — writes stay within
-                                                // `cap`, and §5.4 lease exclusivity (kernel path) / session arena
-                                                // custody (il path) makes this request its only writer.
-                                                unsafe {
-                                                    // Copy ledger + NT lever
-                                                    // (see the hot arm).
-                                                    if serve_copy_to_dest(
-                                                        dest_ptr,
-                                                        val[start..end].as_ptr(),
-                                                        len,
-                                                        hint.dest_arena,
-                                                    ) {
-                                                        METRICS.nt_read_serve_bytes.fetch_add(
+                                                // R-4 fd-source serve (see the
+                                                // fetch-loop slice arm).
+                                                if let crate::cache::pool::ReadBlockValue::Bytes(
+                                                    b,
+                                                ) = &val
+                                                {
+                                                    if zc_fd_source(zc, dest_addr, &b[start..end]) {
+                                                        fd_slice = Some(b.slice(start..end));
+                                                    }
+                                                }
+                                                if fd_slice.is_some() {
+                                                    read_serve_phase_record(
+                                                        ReadServePhase::SliceOut,
+                                                        slice_t0,
+                                                    );
+                                                    Some(val)
+                                                } else {
+                                                    let dest_ptr = dest as *mut u8;
+                                                    // SAFETY: the destination window this serve was bounded against at
+                                                    // entry (`ReadDest::checked_ptr`, FUSE-4e) — writes stay within
+                                                    // `cap`, and §5.4 lease exclusivity (kernel path) / session arena
+                                                    // custody (il path) makes this request its only writer.
+                                                    unsafe {
+                                                        // Copy ledger + NT lever
+                                                        // (see the hot arm).
+                                                        if serve_copy_to_dest(
+                                                            dest_ptr,
+                                                            val[start..end].as_ptr(),
+                                                            len,
+                                                            hint.dest_arena,
+                                                        ) {
+                                                            METRICS.nt_read_serve_bytes.fetch_add(
+                                                                len as u64,
+                                                                Ordering::Relaxed,
+                                                            );
+                                                        }
+                                                        METRICS.read_copy_dest_bytes.fetch_add(
                                                             len as u64,
                                                             Ordering::Relaxed,
                                                         );
+                                                        // R-4 per-arm split: the
+                                                        // stale-absent face of the
+                                                        // cold fill → dest slice-out.
+                                                        METRICS
+                                                            .read_copy_fill_slice_bytes
+                                                            .fetch_add(
+                                                                len as u64,
+                                                                Ordering::Relaxed,
+                                                            );
+                                                        if len < slice_len as usize {
+                                                            std::ptr::write_bytes(
+                                                                dest_ptr.add(len),
+                                                                0,
+                                                                slice_len as usize - len,
+                                                            );
+                                                        }
                                                     }
-                                                    METRICS
-                                                        .read_copy_dest_bytes
-                                                        .fetch_add(len as u64, Ordering::Relaxed);
-                                                    // R-4 per-arm split: the
-                                                    // stale-absent face of the
-                                                    // cold fill → dest slice-out.
-                                                    METRICS
-                                                        .read_copy_fill_slice_bytes
-                                                        .fetch_add(len as u64, Ordering::Relaxed);
-                                                    if len < slice_len as usize {
-                                                        std::ptr::write_bytes(
-                                                            dest_ptr.add(len),
-                                                            0,
-                                                            slice_len as usize - len,
-                                                        );
-                                                    }
+                                                    read_serve_phase_record(
+                                                        ReadServePhase::SliceOut,
+                                                        slice_t0,
+                                                    );
+                                                    // SAFETY: the destination window this serve was bounded against at
+                                                    // entry (`ReadDest::checked_ptr`, FUSE-4e) — writes stay within
+                                                    // `cap`, and §5.4 lease exclusivity (kernel path) / session arena
+                                                    // custody (il path) makes this request its only writer.
+                                                    let b = unsafe { dest_bytes(dest_ptr, len) };
+                                                    Some(crate::cache::pool::ReadBlockValue::Bytes(
+                                                        b,
+                                                    ))
                                                 }
-                                                read_serve_phase_record(
-                                                    ReadServePhase::SliceOut,
-                                                    slice_t0,
-                                                );
-                                                // SAFETY: the destination window this serve was bounded against at
-                                                // entry (`ReadDest::checked_ptr`, FUSE-4e) — writes stay within
-                                                // `cap`, and §5.4 lease exclusivity (kernel path) / session arena
-                                                // custody (il path) makes this request its only writer.
-                                                let b = unsafe { dest_bytes(dest_ptr, len) };
-                                                Some(crate::cache::pool::ReadBlockValue::Bytes(b))
                                             }
                                             (Some(val), None) => Some(val),
                                             (None, _) => None,
@@ -17390,6 +17494,14 @@ impl DataRouter {
                                             );
                                             self.cache.read_lane_hold.credit(bk, served);
                                         }
+                                    }
+                                    // R-4 fd-source serve: the slice-out arm
+                                    // handed back the pool slice — reply it
+                                    // (the full fill stays the backing), the
+                                    // dest untouched.
+                                    if let Some(b) = fd_slice {
+                                        note_zc_pool_serve(b.len(), false);
+                                        return Ok((b, Some(std::sync::Arc::new(downloaded))));
                                     }
                                     if let Some(dest) = dest_addr {
                                         let len = (end_offset - offset) as usize;

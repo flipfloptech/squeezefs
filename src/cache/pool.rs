@@ -362,6 +362,12 @@ impl AsRef<[u8]> for ReadBlockValue {
 struct SlabRegion {
     base: *mut u8,
     len: usize,
+    /// R-4 fd-source zc serve: the memfd this slab is a `MAP_SHARED`
+    /// mapping of — the SAME bytes reachable by VA (fills, decode,
+    /// slicing) and by fd (`READ_FIXED(fd → slot)` on the transport
+    /// ring). `None` = a heap slab (the PERF-4 (b) registered-buffer
+    /// shape).
+    memfd: Option<std::os::fd::OwnedFd>,
 }
 
 impl SlabRegion {
@@ -369,6 +375,17 @@ impl SlabRegion {
         let p = ptr as usize;
         let b = self.base as usize;
         p >= b && p < b + self.len
+    }
+
+    /// `(fd, byte offset)` of `[ptr, ptr + len)` inside a memfd-backed
+    /// slab; `None` off the slab, past its end, or on a heap slab.
+    fn fd_offset_of(&self, ptr: *const u8, len: usize) -> Option<(std::os::fd::RawFd, u64)> {
+        use std::os::fd::AsRawFd;
+        let fd = self.memfd.as_ref()?;
+        let p = ptr as usize;
+        let b = self.base as usize;
+        let end = p.checked_add(len)?;
+        (p >= b && end <= b + self.len).then(|| (fd.as_raw_fd(), (p - b) as u64))
     }
 }
 
@@ -492,9 +509,76 @@ impl AlignedBufPool {
         Self {
             queue: ArrayQueue::new(capacity),
             slab_queue: Some(slab_queue),
-            slab: Some(SlabRegion { base, len: total }),
+            slab: Some(SlabRegion {
+                base,
+                len: total,
+                memfd: None,
+            }),
             buf_size,
         }
+    }
+
+    /// R-4 fd-source zc serve (`SQUEEZEFS_READ_ZC_SERVE`): the slab is a
+    /// `MAP_SHARED` mapping of ONE memfd, so every slot — and every
+    /// `Bytes` slice of one — has an `(fd, offset)` the transport's queue
+    /// ring can name as a `READ_FIXED` SOURCE straight into the request's
+    /// registered pages (the `ZcBounce` two-way-reachability law applied
+    /// to the fill pool). Same geometry, alignment and zeroed-at-birth
+    /// contract as [`Self::new_slabbed`]; pages commit on first touch
+    /// (no `MAP_POPULATE` — the heap pool is lazily committed too).
+    /// Over-capacity handouts stay fresh heap backings (not
+    /// fd-addressable — their serves take the copy path, counted).
+    pub fn new_memfd_slabbed(capacity: usize, buf_size: usize) -> std::io::Result<Self> {
+        use std::os::fd::{AsRawFd, FromRawFd};
+        let total = capacity
+            .checked_mul(buf_size)
+            .ok_or_else(|| std::io::Error::other("memfd slab geometry overflow"))?;
+        // SAFETY: memfd_create with a static name; the fd is fresh.
+        let raw = unsafe { libc::memfd_create(c"sqz-read-fill-pool".as_ptr(), libc::MFD_CLOEXEC) };
+        if raw < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        // SAFETY: `raw` is a fresh owned descriptor.
+        let memfd = unsafe { std::os::fd::OwnedFd::from_raw_fd(raw) };
+        // SAFETY: sizing our own fresh memfd.
+        if unsafe { libc::ftruncate(memfd.as_raw_fd(), total as libc::off_t) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        // SAFETY: a fresh shared RW mapping over the memfd we just sized.
+        let base = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                total,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED,
+                memfd.as_raw_fd(),
+                0,
+            )
+        };
+        if base == libc::MAP_FAILED {
+            return Err(std::io::Error::last_os_error());
+        }
+        let base = base as *mut u8;
+        debug_assert_eq!(
+            base as usize % POOLED_BUF_ALIGN,
+            0,
+            "mmap violated the pooled-buffer alignment contract"
+        );
+        let slab_queue = ArrayQueue::new(capacity);
+        for i in 0..capacity {
+            // SAFETY: `i * buf_size < total` — inside the mapping.
+            let _ = slab_queue.push(unsafe { base.add(i * buf_size) });
+        }
+        Ok(Self {
+            queue: ArrayQueue::new(capacity),
+            slab_queue: Some(slab_queue),
+            slab: Some(SlabRegion {
+                base,
+                len: total,
+                memfd: Some(memfd),
+            }),
+            buf_size,
+        })
     }
 
     /// The pool's registerable slab window `(base, len)`, when slab-backed
@@ -502,6 +586,19 @@ impl AlignedBufPool {
     /// registration over this range can never dangle.
     pub fn slab_range(&self) -> Option<(usize, usize)> {
         self.slab.as_ref().map(|s| (s.base as usize, s.len))
+    }
+
+    /// R-4: `(fd, byte offset)` naming `[ptr, ptr + len)` on this pool's
+    /// memfd — `Some` iff the pool is memfd-slabbed and the range lies
+    /// inside the slab. Any `Bytes` slice of a slab handout qualifies
+    /// (the offset shifts with the slice); fresh over-capacity backings,
+    /// heap slabs and foreign memory answer `None` and take the copy
+    /// path. The fd lives as long as the pool (process lifetime for the
+    /// statics), so an answer never dangles; the BYTES stay valid as
+    /// long as the caller's `Bytes` clone does (the buffer-lease law —
+    /// recycle happens only on the last owner's drop).
+    pub fn fd_offset_of(&self, ptr: *const u8, len: usize) -> Option<(std::os::fd::RawFd, u64)> {
+        self.slab.as_ref()?.fd_offset_of(ptr, len)
     }
 
     /// R5 gauge: bytes of IDLE (queued) pool backings (see
@@ -634,10 +731,18 @@ impl Drop for AlignedBufPool {
             while sq.pop().is_some() {}
         }
         if let Some(slab) = self.slab.take() {
-            // SAFETY: `base` came from `alloc_pooled(len)` in
-            // `new_slabbed`; outstanding handouts hold an `Arc` to the
-            // pool, so by Drop time none exist.
-            unsafe { dealloc_pooled(slab.base, slab.len) };
+            // Outstanding handouts hold an `Arc` to the pool, so by Drop
+            // time none exist.
+            if slab.memfd.is_some() {
+                // SAFETY: `base..base + len` is the `MAP_SHARED` mapping
+                // `new_memfd_slabbed` created; unmapped once. The memfd
+                // closes with its `OwnedFd`.
+                unsafe { libc::munmap(slab.base as *mut libc::c_void, slab.len) };
+            } else {
+                // SAFETY: `base` came from `alloc_pooled(len)` in
+                // `new_slabbed`.
+                unsafe { dealloc_pooled(slab.base, slab.len) };
+            }
         }
     }
 }
@@ -647,6 +752,49 @@ pub static ALIGNED_BUF_POOL: Lazy<Arc<AlignedBufPool>> = Lazy::new(|| {
     let capacity = block_pool_capacity_from(crate::cpu::process_parallelism());
     Arc::new(AlignedBufPool::new(capacity, 4 * 1024 * 1024))
 });
+
+/// R-4 fd-source zc READ serve (`SQUEEZEFS_READ_ZC_SERVE`, default off —
+/// a measurement lever until the field row adjudicates): the whole-block
+/// READ FILL pool as a memfd slab, so fills, hot-tier entries and
+/// read-lane holds (all `Bytes` over these slots) are fd-addressable and
+/// an armed session's out-paged reply can name the tier buffer ITSELF as
+/// the `READ_FIXED` source — deleting the daemon's tier → bounce copy.
+/// `None` = lever off (every read fill rides [`ALIGNED_BUF_POOL`], the
+/// shipped shape byte-identically) or the memfd could not be built
+/// (logged loud; the lever declines rather than fail the mount — it
+/// changes copy economics, never correctness). A SEPARATE pool from
+/// [`ALIGNED_BUF_POOL`] on purpose: the write path's `ActiveBlockBuf`
+/// backings keep their substrate, so an A/B on this lever moves the
+/// READ serve and nothing else. Same derived capacity (the DIVIDED root).
+pub static ZC_FILL_POOL: Lazy<Option<Arc<AlignedBufPool>>> = Lazy::new(|| {
+    if !crate::env_knobs::bool_knob("SQUEEZEFS_READ_ZC_SERVE", false) {
+        return None;
+    }
+    let capacity = block_pool_capacity_from(crate::cpu::process_parallelism());
+    match AlignedBufPool::new_memfd_slabbed(capacity, 4 * 1024 * 1024) {
+        Ok(p) => Some(Arc::new(p)),
+        Err(e) => {
+            log::error!(
+                "SQUEEZEFS_READ_ZC_SERVE: memfd fill pool ({capacity} × 4 MiB) could not be \
+                 built ({e}) — the fd-source zc serve declines; reads ride the heap pool"
+            );
+            None
+        }
+    }
+});
+
+/// The armed fd-source fill pool, if any (see [`ZC_FILL_POOL`]).
+pub fn zc_fill_pool() -> Option<&'static Arc<AlignedBufPool>> {
+    ZC_FILL_POOL.as_ref()
+}
+
+/// `(fd, offset)` of `[ptr, ptr + len)` on the armed fill pool's memfd —
+/// the ONE probe every fd-source serve site runs (router arms, the fast
+/// probe, the FUSE handler's reply). `None` when the lever is off or the
+/// bytes are not pool-slab memory: the copy path serves.
+pub fn zc_fill_fd_offset(ptr: *const u8, len: usize) -> Option<(std::os::fd::RawFd, u64)> {
+    ZC_FILL_POOL.as_ref()?.fd_offset_of(ptr, len)
+}
 
 /// Sub-block read-bounce pool (2026-07-25 ipc-miss-path fix): R3 ranged
 /// reads bounce their LBA window through an aligned pooled buffer, and the
@@ -675,11 +823,13 @@ pub static RANGED_BUF_POOL: Lazy<Arc<AlignedBufPool>> = Lazy::new(|| {
 
 /// Pick the read-bounce pool for a device read of `size` bytes (routing
 /// contract pinned by `read_bounce_pool_routing_and_home_recycle`).
+/// Whole-block fills ride the armed fd-source pool when the R-4 lever
+/// built one ([`ZC_FILL_POOL`]), else [`ALIGNED_BUF_POOL`].
 pub fn read_bounce_pool(size: usize) -> &'static Arc<AlignedBufPool> {
     if size <= RANGED_BUF_SIZE {
         &RANGED_BUF_POOL
     } else {
-        &ALIGNED_BUF_POOL
+        ZC_FILL_POOL.as_ref().unwrap_or(&ALIGNED_BUF_POOL)
     }
 }
 
@@ -787,6 +937,90 @@ mod tests {
         let r = pool.alloc_raw() as usize;
         let (base, len) = pool.slab_range().unwrap();
         assert!(r >= base && r < base + len);
+    }
+
+    /// R-4 memfd slab: the same slab laws as the heap slab (slot handout
+    /// inside the window, recycle to the slab queue, trim keeps slots),
+    /// PLUS fd-addressability — every slot and sub-slice answers
+    /// `(fd, offset)` on ONE fd, heap slabs and fresh over-capacity
+    /// backings answer `None`, and a drop of the pool unmaps without
+    /// touching the allocator (a memfd region is not `dealloc`able).
+    #[test]
+    fn memfd_slab_is_fd_addressable_and_keeps_the_slab_laws() {
+        let pool = Arc::new(AlignedBufPool::new_memfd_slabbed(2, 8192).expect("memfd slab"));
+        let (base, len) = pool.slab_range().expect("slab window");
+        assert_eq!(len, 2 * 8192);
+        assert_eq!(base % POOLED_BUF_ALIGN, 0);
+        assert_eq!(pool.allocated_bytes(), 2 * 8192);
+
+        let s1 = pool.alloc_raw();
+        let s2 = pool.alloc_raw();
+        let f1 = pool.alloc_raw(); // exhausted slab → fresh heap backing
+        let (fd1, o1) = pool.fd_offset_of(s1, 8192).expect("slot 1 addressable");
+        let (fd2, o2) = pool.fd_offset_of(s2, 8192).expect("slot 2 addressable");
+        assert_eq!(fd1, fd2, "one memfd names the whole slab");
+        assert_ne!(o1, o2);
+        assert!(o1 < len as u64 && o2 < len as u64);
+        // Sub-slice → shifted offset; crossing the slot end is still inside
+        // the slab (slots are contiguous), crossing the slab end is not.
+        // SAFETY: inside slot 1.
+        assert_eq!(
+            pool.fd_offset_of(unsafe { s1.add(4096) }, 100),
+            Some((fd1, o1 + 4096))
+        );
+        let last = (base + len - 4096) as *const u8;
+        assert_eq!(
+            pool.fd_offset_of(last, 4096).map(|(_, o)| o),
+            Some((len - 4096) as u64)
+        );
+        assert_eq!(pool.fd_offset_of(last, 4097), None);
+        assert_eq!(
+            pool.fd_offset_of(f1, 8192),
+            None,
+            "fresh backings are not fd-addressable"
+        );
+
+        // Two-way reachability: bytes written through the VA read back
+        // through the fd at the answered offset.
+        // SAFETY: s1 is this test's exclusive 8192-byte handout.
+        unsafe {
+            for i in 0..8192usize {
+                *s1.add(i) = (i % 251) as u8;
+            }
+        }
+        let mut back = vec![0u8; 8192];
+        // SAFETY: `back` is 8192 writable bytes; fd1 is the live memfd.
+        let n = unsafe { libc::pread(fd1, back.as_mut_ptr().cast(), 8192, o1 as libc::off_t) };
+        assert_eq!(n, 8192);
+        assert!(back.iter().enumerate().all(|(i, &b)| b == (i % 251) as u8));
+
+        // SAFETY: each pointer came from this pool's `alloc_raw` above and
+        // is returned exactly once, still unaliased.
+        unsafe {
+            pool.recycle(f1);
+            pool.recycle(s1);
+            pool.recycle(s2);
+        }
+        pool.trim_to(0);
+        assert_eq!(
+            pool.allocated_bytes(),
+            2 * 8192,
+            "trim keeps memfd slab slots"
+        );
+        let r = pool.alloc_raw() as usize;
+        assert!(
+            r >= base && r < base + len,
+            "slab slots recycle to the slab queue"
+        );
+        // SAFETY: returned exactly once.
+        unsafe { pool.recycle(r as *mut u8) };
+        drop(pool); // munmap + close — must not reach `dealloc`.
+
+        let heap = Arc::new(AlignedBufPool::new_slabbed(1, 4096));
+        let h = heap.alloc_raw();
+        assert_eq!(heap.fd_offset_of(h, 4096), None, "heap slabs have no fd");
+        // SAFETY: returned exactly once.
+        unsafe { heap.recycle(h) };
     }
 
     /// Non-slab pools advertise no slab window (the register arm in

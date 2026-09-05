@@ -5208,7 +5208,7 @@ async fn read_handler_body<FS: Filesystem + Send + Sync + 'static>(
         request.unique, nodeid, read_in
     );
 
-    let (mut reply_data, backing, zc_prefilled) = match fs
+    let (mut reply_data, backing, zc_prefilled, zc_fd_body) = match fs
         .read(
             request,
             nodeid,
@@ -5225,7 +5225,12 @@ async fn read_handler_body<FS: Filesystem + Send + Sync + 'static>(
             return;
         }
 
-        Ok(reply_data) => (reply_data.data, reply_data.backing, reply_data.zc_prefilled),
+        Ok(reply_data) => (
+            reply_data.data,
+            reply_data.backing,
+            reply_data.zc_prefilled,
+            reply_data.zc_fd_body,
+        ),
     };
 
     // zc direct leg (K1 kill): the payload already sits in the
@@ -5313,6 +5318,26 @@ async fn read_handler_body<FS: Filesystem + Send + Sync + 'static>(
     // anything else is logged loud — the session's dispatch task
     // observes a dead connection through its own read path.
     match reply_conn.filter(|c| c.over_uring_ready()) {
+        // R-4 fd-source body: the body travels VERBATIM with its fd
+        // address (the `write_vectored` path would heap-copy it) — the
+        // worker bridges it into the request's pages from the memfd.
+        Some(conn) if zc_fd_body.is_some() && !reply_data.is_empty() => {
+            let (fd, off) = zc_fd_body.expect("checked above");
+            resp_sender.mark_replied();
+            if let Err(err) = conn.submit_reply_fd_body(request.slot, data_buf, reply_data, fd, off)
+            {
+                if err.kind() == ErrorKind::NotFound {
+                    warn!(
+                        "may reply interrupted fuse request, ignore this error {}",
+                        err
+                    );
+                } else {
+                    error!("fd-source read reply failed {}", err);
+                }
+            }
+            crate::raw::read_phase::note_read_inplace_reply();
+            drop(backing);
+        }
         Some(conn) => {
             resp_sender.mark_replied();
             if let Err(err) = conn

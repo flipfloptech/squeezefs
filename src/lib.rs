@@ -523,6 +523,16 @@ pub trait PayloadSink {
     fn write_at(&self, off: usize, bytes: &[u8]);
     /// Zero `len` bytes at `off` (hole/short-tail composition).
     fn zero_at(&self, off: usize, len: usize);
+    /// R-4 fd-source serve offer: instead of copying `src[range]` into the
+    /// sink, hand the sink that slice ITSELF when the sink's consumer can
+    /// take it by fd (a zc-armed transport reply window whose worker
+    /// bridges fill-pool memory into the request's pages). `true` = taken
+    /// (the caller writes nothing); the default `false` keeps every other
+    /// sink (il arena windows, heap stand-ins) on the copy path at zero
+    /// cost — no clone is made unless the sink accepts.
+    fn offer_fd_body(&self, _src: &bytes::Bytes, _range: std::ops::Range<usize>) -> bool {
+        false
+    }
 }
 
 pub fn build_fs_key(suffix: &str) -> FsKey {

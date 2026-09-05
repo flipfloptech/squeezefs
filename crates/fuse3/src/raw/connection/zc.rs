@@ -275,15 +275,22 @@ pub(crate) struct BridgeCqe {
 /// carries at most one of these at a time because an ent serves one
 /// request between two commits).
 pub(crate) enum ZcPend {
-    /// A reply whose body sits in the bounce slot: `READ_FIXED(memfd →
-    /// slot)` is in flight; the ORIGINAL commit message is kept whole so
-    /// a failed bridge can fall back to the kmbuf attachment (the
-    /// opcode-mirror safety net) instead of losing the reply.
+    /// A reply whose body is being bridged into the request's pages:
+    /// `READ_FIXED(memfd → slot)` is in flight — from the ent's BOUNCE
+    /// slot (`fd_source == false`: the body was staged there), or
+    /// DIRECTLY from the filesystem's fd-addressable fill pool
+    /// (`fd_source == true`, R-4 read-zc-serve: `body` IS the pool slice,
+    /// held here as the keepalive until the CQE). The ORIGINAL commit
+    /// message is kept whole so a failed bridge can fall back: an
+    /// fd-source bridge re-stages through the bounce (one plain bridge),
+    /// a bounce bridge falls back to the kmbuf attachment (the
+    /// opcode-mirror safety net) — never a lost reply.
     BounceFetch {
         header: Vec<u8>,
         body: bytes::Bytes,
         commit_id: u64,
         len: u32,
+        fd_source: bool,
     },
     /// A handler-initiated device fetch (`READ_FIXED(device → slot)`,
     /// the direct read leg): the handler task parks on the oneshot; the

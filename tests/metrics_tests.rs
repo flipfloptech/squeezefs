@@ -939,6 +939,11 @@ async fn fuse_zc_ledger_always_exports_under_metrics() {
         "read_copy_hold_serve_bytes",
         "read_copy_cache_serve_bytes",
         "read_copy_fill_slice_bytes",
+        // R-4 fd-source zc serve (SQUEEZEFS_READ_ZC_SERVE) engagement.
+        "read_zc_pool_serve_bytes",
+        "read_zc_pool_serve_warm_bytes",
+        "fuse3_zc_fd_body_replies",
+        "fuse3_zc_fd_body_fallbacks",
     ];
 
     let metrics = json

@@ -5498,6 +5498,25 @@ pub struct Metrics {
     /// READ bytes this delta does not account for is INVALID. 0 by
     /// construction on un-armed sessions (stock kernels, lever off).
     pub read_zc_serve_bytes: Align64<AtomicU64>,
+    /// Bytes served through the fd-SOURCE zc serve (R-4,
+    /// `SQUEEZEFS_READ_ZC_SERVE`, 2026-09-05): a hot-tier / read-lane-hold
+    /// / cold-fill-slice serve on a zc-armed session whose source `Bytes`
+    /// live in the memfd fill pool — the router (or the R-2 fast probe)
+    /// handed back the pool slice itself and its `(fd, offset)`, and the
+    /// queue worker bridged THAT into the request's pages: the daemon's
+    /// tier → bounce copy DELETED, one kernel pass. A NEW closure term:
+    /// on an armed row `zc_serve + zc_pool_serve + dest + bounce +
+    /// dest_dma ≈ served bytes`. Counted at the router's validated serve
+    /// (the copy it replaced was counted there too); the transport-side
+    /// vehicle count is `fuse3_zc_fd_body_replies`, and their difference
+    /// is the composed-window residue (a parked-run compose rebuilt the
+    /// body → ordinary reply), ≈ 0. 0 by construction with the lever
+    /// off, on un-armed sessions, and for every non-pool source.
+    pub read_zc_pool_serve_bytes: Align64<AtomicU64>,
+    /// The WARM subset of `read_zc_pool_serve_bytes` (hot + hold arms);
+    /// the cold fill-slice share is the difference — the per-arm A/B
+    /// against `read_copy_{hot,hold,fill_slice}_bytes`.
+    pub read_zc_pool_serve_warm_bytes: Align64<AtomicU64>,
     /// Device DMA into pooled fill intermediates (whole-block fills +
     /// ranged bounce windows) — the nvme-tcp RX-copy pricing denominator.
     pub read_fill_dma_bytes: Align64<AtomicU64>,
@@ -8323,7 +8342,15 @@ pub enum IpcReadProbe {
 /// (probes with no window — the in-process suites; the worker always
 /// has one).
 enum FastReadSink {
-    Window { addr: u64, cap: usize },
+    Window {
+        addr: u64,
+        cap: usize,
+        /// R-4 fd-source serve: the pool-backed slice a tier leg handed
+        /// back INSTEAD of copying into the window (`offer_fd_body`),
+        /// with its `(fd, offset)` — the probe answers
+        /// `FastReadProbe::ServedFd` and the queue worker bridges it.
+        fd_body: std::cell::RefCell<Option<(bytes::Bytes, std::os::fd::RawFd, u64)>>,
+    },
     Heap(std::cell::RefCell<Vec<u8>>),
 }
 
@@ -8333,7 +8360,7 @@ impl FastReadSink {
     /// its commit), or the heap buffer truncated to the serve.
     fn into_bytes(self, n: usize) -> bytes::Bytes {
         match self {
-            FastReadSink::Window { addr, cap } => {
+            FastReadSink::Window { addr, cap, .. } => {
                 let n = n.min(cap);
                 // SAFETY: `addr..addr + cap` is this request's registered
                 // reply window (the §5.4 ownership argument: exclusively
@@ -8354,9 +8381,28 @@ impl FastReadSink {
 }
 
 impl crate::PayloadSink for FastReadSink {
+    fn offer_fd_body(&self, src: &bytes::Bytes, range: std::ops::Range<usize>) -> bool {
+        let FastReadSink::Window { cap, fd_body, .. } = self else {
+            return false;
+        };
+        // The window bound (FUSE-4e) holds for the bridged length too: the
+        // kernel copies `len` bytes into the request's registered pages,
+        // which the window describes.
+        if range.end < range.start || range.end - range.start > *cap {
+            return false;
+        }
+        let slice = &src[range.clone()];
+        let Some((fd, off)) = crate::cache::pool::zc_fill_fd_offset(slice.as_ptr(), slice.len())
+        else {
+            return false;
+        };
+        *fd_body.borrow_mut() = Some((src.slice(range), fd, off));
+        true
+    }
+
     fn write_at(&self, off: usize, bytes: &[u8]) {
         match self {
-            FastReadSink::Window { addr, cap } => {
+            FastReadSink::Window { addr, cap, .. } => {
                 let end = off.saturating_add(bytes.len()).min(*cap);
                 if off < end {
                     // SAFETY: bounded to the window by `end ≤ cap`; the
@@ -8382,7 +8428,7 @@ impl crate::PayloadSink for FastReadSink {
 
     fn zero_at(&self, off: usize, len: usize) {
         match self {
-            FastReadSink::Window { addr, cap } => {
+            FastReadSink::Window { addr, cap, .. } => {
                 let end = off.saturating_add(len).min(*cap);
                 if off < end {
                     // SAFETY: as `write_at`.
@@ -10524,6 +10570,10 @@ impl SqueezefsFilesystem {
                 // FUSE-zc direct-leg engagement (K1 kill) — a NEW closure
                 // term; see the METRICS doc.
                 "read_zc_serve_bytes": METRICS.read_zc_serve_bytes.load(Ordering::Relaxed),
+                // R-4 fd-source zc serve engagement (SQUEEZEFS_READ_ZC_SERVE)
+                // — a closure term; warm = the hot/hold subset.
+                "read_zc_pool_serve_bytes": METRICS.read_zc_pool_serve_bytes.load(Ordering::Relaxed),
+                "read_zc_pool_serve_warm_bytes": METRICS.read_zc_pool_serve_warm_bytes.load(Ordering::Relaxed),
                 "read_fill_dma_bytes": METRICS.read_fill_dma_bytes.load(Ordering::Relaxed),
                 "ipc_arena_copy_bytes": METRICS.ipc_arena_copy_bytes.load(Ordering::Relaxed),
                 "ipc_read_dest_serves": METRICS.ipc_read_dest_serves.load(Ordering::Relaxed),
@@ -11086,6 +11136,11 @@ impl SqueezefsFilesystem {
                 "fuse3_zc_retained_outstanding": fuse3::zc_retained_outstanding(),
                 "fuse3_zc_replies": fuse3::zc_replies(),
                 "fuse3_zc_fallbacks": fuse3::zc_fallbacks(),
+                // R-4 fd-source serve: the transport-side vehicle count
+                // (beside read_zc_pool_serve_bytes) + its must-stay-≈0
+                // re-stage tripwire.
+                "fuse3_zc_fd_body_replies": fuse3::zc_fd_body_replies(),
+                "fuse3_zc_fd_body_fallbacks": fuse3::zc_fd_body_fallbacks(),
                 "fuse3_zc_slot_payload_skips": fuse3::zc_slot_payload_skips(),
                 // The WRITE engagement face (write-bracket, 2026-08-06):
                 // completed slot→memfd extractions + their payload bytes —
@@ -22300,7 +22355,11 @@ impl Filesystem for SqueezefsFilesystem {
                 if (size as usize) > cap {
                     return FastReadProbe::Demote;
                 }
-                FastReadSink::Window { addr, cap }
+                FastReadSink::Window {
+                    addr,
+                    cap,
+                    fd_body: std::cell::RefCell::new(None),
+                }
             }
             None => FastReadSink::Heap(std::cell::RefCell::new(vec![0u8; size as usize])),
         };
@@ -22313,35 +22372,60 @@ impl Filesystem for SqueezefsFilesystem {
         // guard — the served bytes are already captured (snapshot slice
         // or landed in the sink).
         drop(guard);
+        // R-4 fd-source serve: a tier leg handed the window sink the pool
+        // slice itself instead of copying (`offer_fd_body`).
+        let mut fd_body = None;
         let served = match probe {
             IpcReadProbe::Eof => bytes::Bytes::new(),
             IpcReadProbe::Hit(b) => b,
             IpcReadProbe::Served(n, arm) => {
-                // READ copy ledger (R-4): the tier leg's copy into the
-                // sink is a daemon CPU pass — into the reply window it
-                // is the lawful dest copy (the R-2 venue of the handler's
-                // dest arms), into the heap stand-in a bounce. Warm-tier
-                // arms split per arm exactly like the handler's.
-                let bucket = match &sink {
-                    FastReadSink::Window { .. } => &METRICS.read_copy_dest_bytes,
-                    FastReadSink::Heap(_) => &METRICS.read_copy_bounce_bytes,
+                let taken = match &sink {
+                    FastReadSink::Window { fd_body, .. } => fd_body.borrow_mut().take(),
+                    FastReadSink::Heap(_) => None,
                 };
-                bucket.fetch_add(n as u64, Ordering::Relaxed);
-                let arm_ctr = match arm {
-                    crate::routing::SyncServeArm::Hot => Some(&METRICS.read_copy_hot_serve_bytes),
-                    crate::routing::SyncServeArm::Hold => Some(&METRICS.read_copy_hold_serve_bytes),
-                    crate::routing::SyncServeArm::Cache => {
-                        Some(&METRICS.read_copy_cache_serve_bytes)
-                    }
-                    crate::routing::SyncServeArm::Staged => None,
-                };
-                if let Some(c) = arm_ctr {
+                if let Some((body, fd, off)) = taken {
+                    // The copy was DELETED: count the fd-source serve (the
+                    // hot/hold legs are the only offering legs — warm).
                     METRICS
-                        .read_copy_warm_serve_bytes
-                        .fetch_add(n as u64, Ordering::Relaxed);
-                    c.fetch_add(n as u64, Ordering::Relaxed);
+                        .read_zc_pool_serve_bytes
+                        .fetch_add(body.len() as u64, Ordering::Relaxed);
+                    METRICS
+                        .read_zc_pool_serve_warm_bytes
+                        .fetch_add(body.len() as u64, Ordering::Relaxed);
+                    fd_body = Some((fd, off));
+                    body
+                } else {
+                    // READ copy ledger (R-4): the tier leg's copy into the
+                    // sink is a daemon CPU pass — into the reply window it
+                    // is the lawful dest copy (the R-2 venue of the
+                    // handler's dest arms), into the heap stand-in a
+                    // bounce. Warm-tier arms split per arm exactly like
+                    // the handler's.
+                    let bucket = match &sink {
+                        FastReadSink::Window { .. } => &METRICS.read_copy_dest_bytes,
+                        FastReadSink::Heap(_) => &METRICS.read_copy_bounce_bytes,
+                    };
+                    bucket.fetch_add(n as u64, Ordering::Relaxed);
+                    let arm_ctr = match arm {
+                        crate::routing::SyncServeArm::Hot => {
+                            Some(&METRICS.read_copy_hot_serve_bytes)
+                        }
+                        crate::routing::SyncServeArm::Hold => {
+                            Some(&METRICS.read_copy_hold_serve_bytes)
+                        }
+                        crate::routing::SyncServeArm::Cache => {
+                            Some(&METRICS.read_copy_cache_serve_bytes)
+                        }
+                        crate::routing::SyncServeArm::Staged => None,
+                    };
+                    if let Some(c) = arm_ctr {
+                        METRICS
+                            .read_copy_warm_serve_bytes
+                            .fetch_add(n as u64, Ordering::Relaxed);
+                        c.fetch_add(n as u64, Ordering::Relaxed);
+                    }
+                    sink.into_bytes(n)
                 }
-                sink.into_bytes(n)
             }
             IpcReadProbe::Miss => return FastReadProbe::Demote,
         };
@@ -22364,7 +22448,14 @@ impl Filesystem for SqueezefsFilesystem {
                 false,
             );
         }
-        FastReadProbe::Served(served)
+        match fd_body {
+            Some((fd, off)) => FastReadProbe::ServedFd {
+                body: served,
+                fd,
+                off,
+            },
+            None => FastReadProbe::Served(served),
+        }
     }
 
     async fn init(&self, _req: Request) -> FuseResult<ReplyInit> {
@@ -22787,6 +22878,22 @@ impl Filesystem for SqueezefsFilesystem {
                     Arc::new(|| crate::cache::pool::RANGED_BUF_POOL.allocated_bytes()),
                     Arc::new(|target| crate::cache::pool::RANGED_BUF_POOL.trim_to(target)),
                 ));
+                // R-4 fd-source fill pool (SQUEEZEFS_READ_ZC_SERVE): the
+                // memfd slab's idle slots ride the same gauge/trim
+                // contract as the heap pools (slab slots are one mapping
+                // — trim frees over-capacity fresh backings only, the
+                // registered-slab law). Absent with the lever off.
+                if let Some(pool) = crate::cache::pool::zc_fill_pool() {
+                    let gauge = Arc::clone(pool);
+                    let trim = Arc::clone(pool);
+                    MEM_BUDGET.register(Component::new(
+                        "zc_fill_pool",
+                        16 * 4 * MIB,
+                        2,
+                        Arc::new(move || gauge.allocated_bytes()),
+                        Arc::new(move |target| trim.trim_to(target)),
+                    ));
+                }
             }
             crate::mem_budget::spawn_sampler();
         }
@@ -23509,6 +23616,7 @@ impl Filesystem for SqueezefsFilesystem {
                     data: buf.into(),
                     backing: None,
                     zc_prefilled: None,
+                    zc_fd_body: None,
                 });
             }
         }
@@ -24689,6 +24797,7 @@ impl Filesystem for SqueezefsFilesystem {
             data: target_bytes.into(),
             backing: None,
             zc_prefilled: None,
+            zc_fd_body: None,
         })
     }
 
@@ -29379,6 +29488,7 @@ impl SqueezefsFilesystem {
                     data: Vec::new().into(),
                     backing: None,
                     zc_prefilled: None,
+                    zc_fd_body: None,
                 });
             }
             let start = offset as usize;
@@ -29389,6 +29499,7 @@ impl SqueezefsFilesystem {
                 data: slice.to_vec().into(),
                 backing: None,
                 zc_prefilled: None,
+                zc_fd_body: None,
             });
         }
 
@@ -29404,6 +29515,7 @@ impl SqueezefsFilesystem {
                         data: buf.into(),
                         backing: None,
                         zc_prefilled: None,
+                        zc_fd_body: None,
                     });
                 }
                 Some(Err(e)) => return Err(map_squeezefs_err(e)),
@@ -29495,6 +29607,7 @@ impl SqueezefsFilesystem {
                     data: Vec::new().into(),
                     backing: None,
                     zc_prefilled: None,
+                    zc_fd_body: None,
                 });
             }
 
@@ -29550,6 +29663,7 @@ impl SqueezefsFilesystem {
                             data: bytes::Bytes::from(out),
                             backing: None,
                             zc_prefilled: None,
+                            zc_fd_body: None,
                         });
                     }
                     // Zero-copy CoW-stable snapshot: immutable for the
@@ -29584,6 +29698,7 @@ impl SqueezefsFilesystem {
                             data: bytes::Bytes::from(out),
                             backing: None,
                             zc_prefilled: None,
+                            zc_fd_body: None,
                         });
                     }
                     if contained {
@@ -29595,6 +29710,7 @@ impl SqueezefsFilesystem {
                             data: snapshot.slice(rel_offset..rel_end),
                             backing: None,
                             zc_prefilled: None,
+                            zc_fd_body: None,
                         });
                     }
                     drop(buf);
@@ -29639,6 +29755,7 @@ impl SqueezefsFilesystem {
                                         data: snap.slice(rel_offset..rel_end),
                                         backing: None,
                                         zc_prefilled: None,
+                                        zc_fd_body: None,
                                     });
                                 }
                                 // Vanished between fetch and fill — the lock
@@ -29656,6 +29773,7 @@ impl SqueezefsFilesystem {
                                         data: snap.slice(rel_offset..rel_end),
                                         backing: None,
                                         zc_prefilled: None,
+                                        zc_fd_body: None,
                                     });
                                 }
                             }
@@ -29942,13 +30060,27 @@ impl SqueezefsFilesystem {
                     data,
                     backing,
                     zc_prefilled: Some(n),
+                    zc_fd_body: None,
                 });
             }
         }
+        // R-4 fd-source serve: on a zc-armed ring slot a body that is
+        // fill-pool memory (the router's hot/hold/fill-slice arms handed
+        // back the slice instead of copying into the bounce) travels
+        // with its `(fd, offset)` — the queue worker bridges THAT into
+        // the request's pages. Re-probed HERE, at reply time: a
+        // parked-run compose above rebuilt the body on the heap, and a
+        // heap body is not fd-addressable — it takes the ordinary reply
+        // (the residue the router-side count carries, ≈ 0).
+        let zc_fd_body = zc_serve
+            .as_ref()
+            .filter(|_| !data.is_empty())
+            .and_then(|_| crate::cache::pool::zc_fill_fd_offset(data.as_ptr(), data.len()));
         Ok(ReplyData {
             data,
             backing,
             zc_prefilled: None,
+            zc_fd_body,
         })
     }
 }

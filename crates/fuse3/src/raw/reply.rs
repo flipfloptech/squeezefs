@@ -194,6 +194,16 @@ pub struct ReplyData {
     /// session; `None` everywhere else (the `From<Bytes>` and every
     /// existing constructor keep it `None`).
     pub zc_prefilled: Option<u32>,
+    /// fd-SOURCE body (R-4 read-zc-serve, `FUSE_URING_ZERO_COPY`
+    /// sessions): `Some((fd, off))` = `data`'s bytes are ALSO reachable at
+    /// byte offset `off` of `fd` (a `MAP_SHARED` memfd the filesystem's
+    /// fill pool lives on), and the queue worker may bridge them into the
+    /// request's pages with `READ_FIXED(fd @ off → slot)` DIRECTLY —
+    /// instead of the filesystem copying them into the bounce slot first.
+    /// `data` stays the body (and its keepalive: the bytes are valid for
+    /// as long as this `Bytes` lives, which the worker holds until the
+    /// bridge CQE). `None` everywhere else.
+    pub zc_fd_body: Option<(std::os::fd::RawFd, u64)>,
 }
 
 impl PartialEq for ReplyData {
@@ -228,6 +238,7 @@ impl From<Bytes> for ReplyData {
             data,
             backing: None,
             zc_prefilled: None,
+            zc_fd_body: None,
         }
     }
 }
@@ -243,6 +254,17 @@ pub enum FastReadProbe {
     /// commit elides that copy by pointer equality, exactly as the
     /// handler's dest-armed serves do.
     Served(Bytes),
+    /// The whole reply body as an fd-SOURCE (R-4 read-zc-serve): `body`'s
+    /// bytes are reachable at `off` on `fd` (the filesystem's memfd fill
+    /// pool) and were NOT copied into the window — on a zc session the
+    /// worker bridges them into the request's pages straight from there
+    /// (`READ_FIXED(fd @ off → slot)`), holding `body` alive until the
+    /// bridge CQE. See [`ReplyData::zc_fd_body`].
+    ServedFd {
+        body: Bytes,
+        fd: std::os::fd::RawFd,
+        off: u64,
+    },
     /// Not sync-servable — cold block, a writer holding the inode lock,
     /// an overlay, a multi-block span, a virtual inode, device-true
     /// O_DIRECT, … — the FULL handler runs on a lane, unchanged.

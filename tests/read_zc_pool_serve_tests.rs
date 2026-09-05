@@ -247,7 +247,9 @@ fn snap() -> Snap {
         fill_slice: METRICS.read_copy_fill_slice_bytes.load(Ordering::Relaxed),
         bounce: METRICS.read_copy_bounce_bytes.load(Ordering::Relaxed),
         pool: METRICS.read_zc_pool_serve_bytes.load(Ordering::Relaxed),
-        pool_warm: METRICS.read_zc_pool_serve_warm_bytes.load(Ordering::Relaxed),
+        pool_warm: METRICS
+            .read_zc_pool_serve_warm_bytes
+            .load(Ordering::Relaxed),
     }
 }
 
@@ -313,7 +315,7 @@ fn armed_fill_pool_is_fd_addressable_both_ways() {
         Some((fd, (span - 4096) as u64))
     );
     assert_eq!(pool.fd_offset_of(last_page, 8192), None);
-    let foreign = vec![0u8; 64];
+    let foreign = Box::new([0u8; 64]);
     assert_eq!(
         pool.fd_offset_of(foreign.as_ptr(), 64),
         None,
@@ -345,9 +347,12 @@ async fn fd_source_serve_elides_the_copy_on_pool_backed_arms_only() {
     let dest = AlignedDest::new(BS as usize);
 
     // ---- Contract 2: cold fill → the slice-out arm, UNALIGNED window
-    // (the direct leg declines; the fill lands in the armed pool).
+    // (the direct leg declines) ABOVE the ranged threshold (a sub-256 KiB
+    // window would take the §5.6 ranged bounce, whose 64 KiB pool is
+    // heap — a different arm); the whole-block fill lands in the armed
+    // pool and the slice-out arm hands back its slice.
     let off = 5 * BS + 1234;
-    let len = 8192usize;
+    let len = 384 * 1024usize;
     let zc = zc_handle();
     let s0 = snap();
     let (data, backing) =
@@ -365,7 +370,9 @@ async fn fd_source_serve_elides_the_copy_on_pool_backed_arms_only() {
             .expect("cold unaligned read");
     assert_eq!(data.len(), len);
     assert!(
-        data.iter().enumerate().all(|(i, &b)| b == pat(off + i as u64)),
+        data.iter()
+            .enumerate()
+            .all(|(i, &b)| b == pat(off + i as u64)),
         "contract 2: exact bytes"
     );
     assert!(
@@ -379,7 +386,11 @@ async fn fd_source_serve_elides_the_copy_on_pool_backed_arms_only() {
         data.to_vec(),
         "contract 2: the fd address names exactly the served bytes"
     );
-    assert_eq!(zc.served(), None, "no direct-leg serve on an unaligned window");
+    assert_eq!(
+        zc.served(),
+        None,
+        "no direct-leg serve on an unaligned window"
+    );
     let d = delta(&s0);
     assert_eq!(d.fill_slice, 0, "contract 2: the slice-out copy is DELETED");
     assert_eq!(d.dest, 0, "contract 2: no dest copy at all");
@@ -548,7 +559,11 @@ async fn fd_source_serve_elides_the_copy_on_pool_backed_arms_only() {
         "contract 7: without a zc handle the serve lands in the dest"
     );
     let d = delta(&s0);
-    assert_eq!(d.hot, 384 * 1024, "contract 7: the copy is paid and counted");
+    assert_eq!(
+        d.hot,
+        384 * 1024,
+        "contract 7: the copy is paid and counted"
+    );
     assert_eq!(d.pool, 0, "contract 7: the lever never engages off-session");
     drop(data);
 }

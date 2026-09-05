@@ -4453,7 +4453,7 @@ fn merge_time_max(cached: Timestamp, incoming: Timestamp) -> Timestamp {
 /// revalidated Shared class, write for everything else — and both modes
 /// drop at the SAME pre-dispatch point (KD-1). A holder never re-enters
 /// `active_inode_locks` on the same ino (§4.2 must-not).
-enum HeldWriteGuard<'a> {
+enum HeldGuardMode<'a> {
     Shared {
         _g: crate::sqz_sync::SqzRwLockReadGuard<'a, ()>,
     },
@@ -4462,9 +4462,49 @@ enum HeldWriteGuard<'a> {
     },
 }
 
-impl HeldWriteGuard<'_> {
+/// The WRITE handler's held order-1 guard plus its HOLD ledger (W-2,
+/// 2026-09-05): the acquisition instant is the wait's own end clock read
+/// (no extra read at entry), and `Drop` records `since.elapsed()` into
+/// the final-scope hold histogram the classifier selected
+/// (`write_lock_hold_{shared,metaprep,entire}`) — drop-based so every
+/// exit after classification records truthfully, and an unclassified
+/// exit (orphan-discard reply, lease/fetch error) records nothing, which
+/// is what keeps Σ hold ≡ Σ final scope.
+struct HeldWriteGuard<'a> {
+    mode: HeldGuardMode<'a>,
+    since: std::time::Instant,
+    hold_hist: Option<&'static LatencyHistogram>,
+}
+
+impl<'a> HeldWriteGuard<'a> {
+    fn new(mode: HeldGuardMode<'a>, since: std::time::Instant) -> Self {
+        HeldWriteGuard {
+            mode,
+            since,
+            hold_hist: None,
+        }
+    }
+
     fn is_exclusive(&self) -> bool {
-        matches!(self, HeldWriteGuard::Exclusive { .. })
+        matches!(self.mode, HeldGuardMode::Exclusive { .. })
+    }
+
+    /// Bind the hold to its FINAL scope's histogram (the KD-8 scope the
+    /// dispatch actually took).
+    fn classify(&mut self, scope: InodeWriteLockScope) {
+        self.hold_hist = Some(match scope {
+            InodeWriteLockScope::Shared => &METRICS.write_lock_hold_shared,
+            InodeWriteLockScope::MetaPrepOnly => &METRICS.write_lock_hold_metaprep,
+            InodeWriteLockScope::EntireOp => &METRICS.write_lock_hold_entire,
+        });
+    }
+}
+
+impl Drop for HeldWriteGuard<'_> {
+    fn drop(&mut self) {
+        if let Some(h) = self.hold_hist {
+            h.record(self.since.elapsed());
+        }
     }
 }
 
@@ -6600,6 +6640,19 @@ pub struct Metrics {
     /// op records once per acquisition, so twice).
     pub write_lock_wait_shared: Align64<LatencyHistogram>,
     pub write_lock_wait_exclusive: Align64<LatencyHistogram>,
+    // ---- Per-scope inode-guard HOLD histograms (W-2 write-stream-guard,
+    // 2026-09-05): acquisition → drop for the FINAL scope actually held
+    // (drop-based, so error exits after classification record
+    // truthfully; the unclassified early exits — orphan-discard, lease/
+    // fetch errors — record nothing). Closure: Σ hold counts ≡ Σ
+    // final-scope counts per row. The P1-8 conviction instrument: a
+    // `metaprep`/`shared` hold that reads device-length means the
+    // guard is held across a DMA; the healthy value is the meta-prep
+    // itself (µs). `entire` legitimately reads device-length (the
+    // inline/staged commit, layout promotions). ----
+    pub write_lock_hold_shared: Align64<LatencyHistogram>,
+    pub write_lock_hold_metaprep: Align64<LatencyHistogram>,
+    pub write_lock_hold_entire: Align64<LatencyHistogram>,
     pub block_lock_wait: Align64<LatencyHistogram>,
     pub lease_lock_wait: Align64<LatencyHistogram>,
     pub dlm_acquire_time: Align64<LatencyHistogram>,
@@ -11340,6 +11393,11 @@ impl SqueezefsFilesystem {
                 "write_lock_scope_shared_upgrades": METRICS.write_lock_scope_shared_upgrades.load(Ordering::Relaxed),
                 "write_lock_wait_shared": METRICS.write_lock_wait_shared.to_json(),
                 "write_lock_wait_exclusive": METRICS.write_lock_wait_exclusive.to_json(),
+                // W-2 (write-stream-guard): the per-final-scope HOLD
+                // histograms — the P1-8 instrument (Σ counts ≡ Σ scope).
+                "write_lock_hold_shared": METRICS.write_lock_hold_shared.to_json(),
+                "write_lock_hold_metaprep": METRICS.write_lock_hold_metaprep.to_json(),
+                "write_lock_hold_entire": METRICS.write_lock_hold_entire.to_json(),
                 "write_shared_enabled": if write_shared_enabled() { 1 } else { 0 },
                 "block_lock_wait": METRICS.block_lock_wait.to_json(),
                 "lease_lock_wait": METRICS.lease_lock_wait.to_json(),
@@ -23372,16 +23430,20 @@ impl Filesystem for SqueezefsFilesystem {
             // KD-6: the Shared admission record — the revalidated
             // metadata-cache size snapshot the Shared dispatch carries.
             let mut shared_snapshot: Option<u64> = None;
-            let guard: HeldWriteGuard = if admit_shared {
+            // The acquisition's end clock read doubles as the hold's
+            // start (`HeldWriteGuard::since`) — one read serves both the
+            // wait and the hold ledgers.
+            let mut guard: HeldWriteGuard = if admit_shared {
                 let start_wait = std::time::Instant::now();
                 let g = lock.read().await;
-                let waited = start_wait.elapsed();
+                let acquired = std::time::Instant::now();
+                let waited = acquired.duration_since(start_wait);
                 METRICS.write_lock_wait.record(waited);
                 METRICS.write_lock_wait_shared.record(waited);
                 match self.shared_write_probe(ino, offset, write_end) {
                     Some(size) => {
                         shared_snapshot = Some(size);
-                        HeldWriteGuard::Shared { _g: g }
+                        HeldWriteGuard::new(HeldGuardMode::Shared { _g: g }, acquired)
                     }
                     None => {
                         // The ONE upgrade (KD-2): the world moved between
@@ -23394,19 +23456,21 @@ impl Filesystem for SqueezefsFilesystem {
                             .fetch_add(1, Ordering::Relaxed);
                         let start_wait = std::time::Instant::now();
                         let g = lock.write().await;
-                        let waited = start_wait.elapsed();
+                        let acquired = std::time::Instant::now();
+                        let waited = acquired.duration_since(start_wait);
                         METRICS.write_lock_wait.record(waited);
                         METRICS.write_lock_wait_exclusive.record(waited);
-                        HeldWriteGuard::Exclusive { _g: g }
+                        HeldWriteGuard::new(HeldGuardMode::Exclusive { _g: g }, acquired)
                     }
                 }
             } else {
                 let start_wait = std::time::Instant::now();
                 let g = lock.write().await;
-                let waited = start_wait.elapsed();
+                let acquired = std::time::Instant::now();
+                let waited = acquired.duration_since(start_wait);
                 METRICS.write_lock_wait.record(waited);
                 METRICS.write_lock_wait_exclusive.record(waited);
-                HeldWriteGuard::Exclusive { _g: g }
+                HeldWriteGuard::new(HeldGuardMode::Exclusive { _g: g }, acquired)
             };
 
             prof.stamp_station(op_station::INODE_LOCK);
@@ -23586,6 +23650,9 @@ impl Filesystem for SqueezefsFilesystem {
                 InodeWriteLockScope::EntireOp => &METRICS.write_lock_scope_entire,
             }
             .fetch_add(1, Ordering::Relaxed);
+            // W-2: the hold ledger follows the FINAL scope (drop-based —
+            // recorded wherever this guard dies from here on).
+            guard.classify(lock_scope);
 
             // Kernel clock domain (fstests generic/423) — an attr-cache
             // time publish is a daemon-authored inode stamp like any

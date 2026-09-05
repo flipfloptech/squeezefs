@@ -11,7 +11,7 @@ drain-rate × acceptable-lag"). Contracts `tests/async_block_reclaim_tests.rs`
 §14–16; tie tests `tests/derivation_sweep_tests.rs` §W-4. Target release:
 **1.2.1**.
 
-Status: **mechanism landed, in-process rows measured, FIELD ROWS OWED**
+Status: **LANDED as derivation hygiene + instrument (§5); the board's tail claim is WITHDRAWN — on the shipped posture (discard elision on) the reclaim queue is off the rewrite path, so the 2026-09-01 field tail is unattributed and open**
 (§5).
 
 ## 1. The finding
@@ -185,25 +185,79 @@ overflows` 0.47 s, `derived_queue_cap_never_regresses` 0.01 s, contract 13
 `displacement_storm_never_caps_queue` 0.51 s; whole suite 7.05 s (21
 passed, 1 ignored).
 
-## 5. Field rows — OWED
+## 5. Field rows — MEASURED 2026-09-05 (dev box, tcp devsub, root)
 
-`w_rewrite` A-B-B-A on the **tcp devsub** (fabric-sensitive row — the
-two-substrate rule), SAME binary, `SQUEEZEFS_RECLAIM_QUEUE_MAX_BLOCKS=4096
-SQUEEZEFS_RECLAIM_CAP_PARK_MS=1000` (the shipped constants, pinned) vs
-both unset (derived). Columns per leg: GiB/s sustained ≥ 60 s, p99.9,
-`block_free_reclaim_cap_parks`, `block_free_reclaim_cap_overflow`,
-`block_free_reclaim_drain_rate`, `block_free_reclaim_arrival_rate`,
-`block_free_reclaim_park_bound_ms`, `block_free_reclaim_queue_cap`,
-`block_free_reclaim_park_tick_wakes` (≈ 0 is the lost-wake tripwire),
-`write_pipeline_phase_ns.displaced_free` (the park's residence face) and
-`write_pipeline_admission_waits`. Instrument stated per row (the standing
-lesson); amplification columns (device bytes ÷ user bytes, `wareq-sz`,
-`block_free_*`) per the write-row requirement. Expected shape from §3–4:
-p99.9 collapses from the ~1 s multiple to ≈ the derived bound (fleet
-under load ≈ 140 ms), `cap_overflow` rises in the pinned regime, ingest
-par-or-better (the permit is released ~7× sooner). Then the same bracket
-on the field cluster the 2026-09-01 fingerprint came from. The PARENT
-runs these.
+Rig `.benchmarks/rigs/2026-09-05-write-lever-abba-local.sh` (fresh format
+per leg, fio 3.42 libaio `direct=1`, 16 × qd16 × 1 MiB seq, 1 GiB/job;
+`w_fresh` then `w_rewrite` = the same job over the files it just wrote —
+4,096 displaced 1 MiB blocks per leg; P0 pre-aging leg per the W-2 lesson),
+same binary `d551f1ba`, order A B B A, three brackets; analyzer
+`2026-09-05-write-lever-abba-analyze.py`; artifacts
+`.benchmarks/rows-w4-reclaim-20260905/{w4-abba,w4-abba-atcap,w4-abba-queued}/`.
+
+### 5.1 The default posture — the queue is not on the rewrite path (`w4-abba`)
+
+A = derived / B = `QUEUE_MAX_BLOCKS=4096 CAP_PARK_MS=1000` (the shipped
+constants). **Every reclaim gauge is 0 on every leg** — `queued`,
+`cap_parks`, `cap_overflow`, `batches` — while `rewrite_blocks` = 4,096 and
+**`block_free_reclaim_elided` = 4,112**: since the rewrite program's Idea 4
+(`SQUEEZEFS_DISCARD_ELISION`, default ON) a BdevDiscard-class terminal
+free skips the reclaim queue entirely and becomes RAM-tracked debt drained
+at idle / the pressure watermark (`block_free_debt_pressure_drains` 50 on
+the row). The queue receives frees only on FilePunch (regular-file)
+volumes and under `SQUEEZEFS_DISCARD_ELISION=0`. Throughput/tails: A
+0.95/0.94, B 0.75/0.94 GiB/s on `w_fresh`; `w_rewrite` 0.79/0.80 vs
+0.79/0.84 — code-identical rows, venue noise.
+
+**This corrects the board.** Write #8's premise — "the 1,000 ms
+`CAP_PARK_MS` quantum IS the p99.9 tail" of the 2026-09-01 field rewrite
+rows (893 ms / 3.08 s read as multiples of the park) — was a shape
+hypothesis; on the shipped posture the park is unreachable on a rewrite,
+so **that tail is UNATTRIBUTED** and returns to the board as open (the
+companion gauges `block_free_reclaim_cap_parks` and
+`write_pipeline_phase_ns.displaced_free` beside the next field rewrite
+row will attribute it in one read).
+
+### 5.2 Forced at-cap, elision ON (`w4-abba-atcap`) — still inert
+
+`QUEUE_MAX_BLOCKS=64 LANES_PER_DEV=1 BATCH_BLOCKS=8` on both legs, B adds
+`CAP_PARK_MS=1000`: `queued` = 0 on every leg (the elision predicate is
+upstream of the cap). Recorded as the null it is.
+
+### 5.3 Forced at-cap, elision OFF (`w4-abba-queued`) — the lever's regime
+
+Same venue knobs plus `SQUEEZEFS_DISCARD_ELISION=0`; A = derived park
+bound / B = `CAP_PARK_MS=1000`. `w_rewrite`:
+
+| leg | GiB/s | clat mean | p99 | p99.9 | `queued` | `cap_parks` | `cap_overflow` | `park_bound_ms` | `drain_rate` blk/s | `park_tick_wakes` |
+|---|---|---|---|---|---|---|---|---|---|---|
+| A1 derived | 0.77 | 319 ms | 2,500 | 4,530 | 4,112 | 3,988 | 61 | 50 | 2,091 | 194 |
+| B1 1000 | 0.79 | 307 ms | 1,736 | 2,835 | 4,112 | 3,896 | 0 | 1000 | 2,382 | 93 |
+| B2 1000 | 0.68 | 360 ms | 2,466 | 3,506 | 4,112 | 4,003 | 0 | 1000 | 2,203 | 152 |
+| A2 derived | 0.79 | 306 ms | 2,022 | 3,406 | 4,112 | 3,923 | 20 | 50 | 2,159 | 93 |
+
+Engagement exact: every displaced block entered the queue (`queued ≡
+rewrite displacement + 16`), 95–97 % of enqueues parked at the forced
+cap, the drain-rate EWMA reads 2.1–2.4 k blocks/s (the serial 8-block
+lane on zram), and the **event-driven park is what ends the parks in
+BOTH arms** — 93–194 tick wakes of ~3,950 parks (2–5 %), the rest on the
+room edge — which is why the two bounds differ only in the soft-overflow
+column: the derived 50 ms bound (the floor; `4 × 8 ÷ 2,200 ≈ 15 ms` derives
+below it) expires 20–61 parks per leg, the 1 s bound none. Throughput and
+tails are par inside this regime's own spread (the two B legs differ by
+16 % GiB/s and 24 % p99.9 with identical knobs); the forced regime's tail
+is the drain's, not the bound's.
+
+**Verdict — LANDS as derivation hygiene + instrument; the tail claim is
+withdrawn.** Two free constants become derived values with the shipped
+posture as the floor (the derivation law; `SQUEEZEFS_RECLAIM_QUEUE_MAX_
+BLOCKS` / `_CAP_PARK_MS` stay the explicit overrides), the drain-rate and
+arrival-rate gauges land, and the at-cap park ends on the drain's room
+edge rather than a timer (the in-process row: p99.9 1,000 → 80 ms where the
+bound WAS the tail). No loss on any leg of any bracket. What this campaign
+did NOT do is move a field number, because on the shipped posture the
+mechanism it derives is off the rewrite path — the honest statement the
+board now carries.
 
 ## 6. Gates (final tree)
 
@@ -224,6 +278,15 @@ runs these.
 
 ## 7. Open
 
+- **The 2026-09-01 field rewrite tail (p99.9 893 ms / max 3.08 s at
+  ~19 GB/s) is UNATTRIBUTED.** Write #8 read it as multiples of the 1 s
+  park quantum; §5.1 shows the queue is not on the rewrite path with
+  elision on. The next field rewrite row must carry
+  `block_free_reclaim_cap_parks` (expect 0), `block_free_debt_pressure_
+  drains` (the elision ledger's drain venue — a pressure drain issues
+  discards inline on the drainer, a candidate), and
+  `write_pipeline_phase_ns.{displaced_free,admit_wait,publish}` to name
+  the term.
 - The **pinned-regime economics** are now explicit: overflow at the
   derived bound vs park to the drain rate. The alternative posture —
   never overflow, i.e. throttle the rewrite honestly to the target's

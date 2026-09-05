@@ -1,0 +1,16 @@
+[14:49:54] == leg P0 [SQUEEZEFS_RECLAIM_QUEUE_MAX_BLOCKS=64 SQUEEZEFS_RECLAIM_LANES_PER_DEV=1 SQUEEZEFS_RECLAIM_BATCH_BLOCKS=8] load=1.95 5.81 8.15
+  P0.w_fresh.json: 0.83 GiB/s  clat mean 290.33 ms  p99 1484.8 ms  p99.9 2197.8 ms
+  P0.w_rewrite.json: 0.91 GiB/s  clat mean 263.94 ms  p99 1182.8 ms  p99.9 1719.7 ms
+[14:50:33] == leg A1 [SQUEEZEFS_RECLAIM_QUEUE_MAX_BLOCKS=64 SQUEEZEFS_RECLAIM_LANES_PER_DEV=1 SQUEEZEFS_RECLAIM_BATCH_BLOCKS=8] load=5.21 6.17 8.17
+  A1.w_fresh.json: 0.84 GiB/s  clat mean 290.47 ms  p99 1283.5 ms  p99.9 2122.3 ms
+  A1.w_rewrite.json: 0.72 GiB/s  clat mean 338.65 ms  p99 1350.6 ms  p99.9 1820.3 ms
+[14:51:16] == leg B1 [SQUEEZEFS_RECLAIM_QUEUE_MAX_BLOCKS=64 SQUEEZEFS_RECLAIM_LANES_PER_DEV=1 SQUEEZEFS_RECLAIM_BATCH_BLOCKS=8 SQUEEZEFS_RECLAIM_CAP_PARK_MS=1000] load=7.36 6.61 8.24
+  B1.w_fresh.json: 0.82 GiB/s  clat mean 294.42 ms  p99 1468.0 ms  p99.9 2105.5 ms
+  B1.w_rewrite.json: 0.77 GiB/s  clat mean 317.93 ms  p99 1367.3 ms  p99.9 1686.1 ms
+[14:51:58] == leg B2 [SQUEEZEFS_RECLAIM_QUEUE_MAX_BLOCKS=64 SQUEEZEFS_RECLAIM_LANES_PER_DEV=1 SQUEEZEFS_RECLAIM_BATCH_BLOCKS=8 SQUEEZEFS_RECLAIM_CAP_PARK_MS=1000] load=8.71 7.17 8.36
+  B2.w_fresh.json: 0.90 GiB/s  clat mean 262.25 ms  p99 1400.9 ms  p99.9 1937.8 ms
+  B2.w_rewrite.json: 0.96 GiB/s  clat mean 248.12 ms  p99 1115.7 ms  p99.9 1837.1 ms
+[14:52:34] == leg A2 [SQUEEZEFS_RECLAIM_QUEUE_MAX_BLOCKS=64 SQUEEZEFS_RECLAIM_LANES_PER_DEV=1 SQUEEZEFS_RECLAIM_BATCH_BLOCKS=8] load=9.95 7.67 8.48
+  A2.w_fresh.json: 0.86 GiB/s  clat mean 275.35 ms  p99 1468.0 ms  p99.9 2164.3 ms
+  A2.w_rewrite.json: 0.87 GiB/s  clat mean 272.63 ms  p99 1283.5 ms  p99.9 1786.8 ms
+[14:53:13] == done; rows in /home/justin/Source/squeezefs/target/w4-abba-atcap

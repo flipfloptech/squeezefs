@@ -13,8 +13,10 @@
 #   sudo KNOBS_B="SQUEEZEFS_RECLAIM_QUEUE_MAX_BLOCKS=4096 SQUEEZEFS_RECLAIM_CAP_PARK_MS=1000" \
 #        OUT=target/w4-abba bash .benchmarks/rigs/2026-09-05-write-lever-abba-local.sh
 #
-# KNOB/A_VAL/B_VAL toggles one knob; KNOBS_B is the alternative form for
-# levers whose B leg pins several knobs (A leg = all unset = derived).
+# KNOB/A_VAL/B_VAL toggles one knob; KNOBS_A/KNOBS_B is the alternative
+# form for levers whose legs pin several knobs (a leg with none unset =
+# the derived defaults) — e.g. a forced-regime crucible pins the same
+# venue knobs on both legs and toggles only the lever.
 set -euo pipefail
 SQZ="${SQZ:-$PWD/target/release/squeezefs}"
 OUT="${OUT:-$PWD/target/write-lever-abba}"
@@ -23,7 +25,7 @@ DATA="${DATA:-sqdata:///dev/nvme5n1,/dev/nvme6n1,/dev/nvme7n1,/dev/nvme8n1}"
 MNT="${MNT:-/mnt/sqz-lever}"
 JOBS="${JOBS:-16}"; QD="${QD:-16}"; BS="${BS:-1M}"; SIZE="${SIZE:-1G}"
 RUNTIME="${RUNTIME:-30}"
-KNOB="${KNOB:-}"; A_VAL="${A_VAL:-}"; B_VAL="${B_VAL:-}"; KNOBS_B="${KNOBS_B:-}"
+KNOB="${KNOB:-}"; A_VAL="${A_VAL:-}"; B_VAL="${B_VAL:-}"; KNOBS_A="${KNOBS_A:-}"; KNOBS_B="${KNOBS_B:-}"
 mkdir -p "$OUT" "$MNT"
 [ "$(id -u)" = 0 ] || { echo "run as root" >&2; exit 2; }
 FIO="${FIO:-$(command -v fio || true)}"; [ -x "$FIO" ] || { echo "fio missing (set FIO=/path/to/fio)" >&2; exit 2; }
@@ -34,7 +36,7 @@ leg_env() {  # prints the env assignments for leg $1 (A|B)
   if [ -n "$KNOB" ]; then
     case $1 in A) echo "$KNOB=$A_VAL";; B) echo "$KNOB=$B_VAL";; esac
   else
-    case $1 in A) echo "";; B) echo "$KNOBS_B";; esac
+    case $1 in A) echo "$KNOBS_A";; B) echo "$KNOBS_B";; esac
   fi
 }
 fio_job() {  # $1 = row name

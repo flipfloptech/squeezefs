@@ -642,7 +642,18 @@ the S10 gate; the rest are carried, priced, and loud where they can fire.
    first captured on the acceptance row, post-valve). The open path is
    the free-loop sustain campaign: a lane-aware pressure signal + a
    demand-coupled release/harvest path, red-first, then this row from
-   zero. `.benchmarks/2026-08-18-s11-widthn-refs-fix.md`.
+   zero. `.benchmarks/2026-08-18-s11-widthn-refs-fix.md`. **2026-09-05
+   addendum (D-4)**: the sustain campaign LANDED 2026-08-25
+   (`docs/design-free-grace-sustain.md`, Status: Implemented — fleet
+   acceptance owed; PRs 1–4 `f992c2e1`/`11dafe2f`/`29788e55`/`69b2fe16`),
+   the row went GREEN once on the cloud venue (attempt 16b, 2026-08-30,
+   `8e4a2cab` — with findings 16–37 closed under it and the free loop
+   UNCOUPLED there: `demand_waits` 0, `bound_age` at the routine 23–29 s
+   composite), and the §3 rate equation closed in-process
+   (`.benchmarks/2026-09-05-d4-free-grace-sustain.md`). What stays open on
+   THIS item is the from-zero row on the finding-15 venue (2 × 32 GiB,
+   the coupled shape) with the sustain columns read — owed to the D-4
+   parent.
 2. **The `SQUEEZEFS_RANGE_CUSTODY` default flip** — upheld OFF three times
    (rungs 15/17/18). Preconditions now exactly two: residual 1 closed, and
    the `s11-range` + §9.5 row gates green ×3 from zero on the flipped

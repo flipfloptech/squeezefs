@@ -506,7 +506,7 @@ R (read), W (write), D (DLM/metadata), C (the shared conveyor).
 | 10 | `perf/write-stream-guard` | W-2 | W #6: order-1 guard narrowed on fresh/append | `w_fresh` qd16 post-f46 |
 | 11 | `perf/read-zc-serve` | R-4 | R #4/#5: `READ_FIXED` into folios (sqz kernel) | CPU/byte; `read_copy_*` closure; zc-capability gate |
 | 12 | `perf/zc-odirect-extraction` | W-3 | W #4 | `w_rewrite` O_DIRECT CPU/GiB |
-| 13 | `perf/free-grace-accept` | D-4 | DLM #6: accept the sustain campaign | its rig's rows |
+| 13 | `perf/free-grace-accept` | D-4 | DLM #6: accept the sustain campaign — **LANDED, FIELD OWED** (`.benchmarks/2026-09-05-d4-free-grace-sustain.md`): the campaign's five levers were already in the tree (PRs 1–4, 2026-08-25); D-4 closed the §3 rate equation IN-PROCESS on one deterministic clock — the shipped levers unbind a recycle-bound stream (80.0 MiB/s flat, 0 stalls vs 72.1 / 179; `bound_age` 8.6 s vs 11.8 s; forced = fences = 0), Little's law `rate ≈ spare ÷ bound_age` holds on live gauges, and the 2026-08-30 GREEN cloud row's 23–29 s `bound_age` is the UNCOUPLED routine composite (demand dark by design), not a campaign miss; finding D4-1 (the re-based runway's fleet-rate divisor asks the floor on mid-supply lanes — inventory, not throughput) priced and pinned | owed: the from-zero s11-mpiio row on the finding-15 venue with the sustain columns (the parent runs it; command + verdict columns in the note) |
 | 14 | `perf/reclaim-derivation` | W-4 | W #8: cap + park quantum derived | `w_rewrite` p99.9, `cap_parks` |
 | 15 | `perf/fsync-economy` | W-5 | W #9: `fsync_phase_ns` first, then touched-namespace flush + parallel meta legs | `w_durable` + fsync storm |
 | 16 | `perf/read-handler-economy` | R-5 | R #6/#7/#8/#9 batched | `kernel_op_economy_tests` alloc law; `rr_4k` CPU/op |
@@ -747,7 +747,7 @@ teardown instrument.
 | ~~3~~ | wake-hop inflation — **LANDED 2026-09-03 (C-2)**: the shared-lane `wake_hop` measured at 59–62 % of the journal write's round trip on the fleet, removed by the per-volume journal lane (`sqz-jrnl{N}` owning the volume's ring); `journal_ring_write` −34…−57 %, ingest PAR (the row's terms are the co-writer's and #7's) | the residue is the io-wq punt (two kernel wakes per window, 380–650 µs mean / 32 µs mode under saturation) | resident pass task on Notify and fan-out on the committer's lane stay unbuilt (not convicted); the io-wq residue's candidates are in the note's Owed |
 | 4 | 4a stripe collisions | 4096 stripes; guard held across the whole commit park | derive stripes from `possible_cpus × q_depth`; land the `LockClass::Dlm` histogram first |
 | 5 | F-B connections | see above | multiplex planes per node ×3–4; poll/uring venue removes the thread term |
-| 6 | free-grace ack cadence | recycle 65 MiB/s vs 2.2 GiB/s — sustain campaign ON but unaccepted | accept |
+| ~~6~~ | free-grace ack cadence — **LANDED, FIELD OWED (D-4, 2026-09-05)** | recycle 65 MiB/s vs 2.2 GiB/s was the PRE-campaign row; the levers landed 2026-08-25 and the in-process closed loop shows them unbinding a recycle-bound stream at zero fences (`.benchmarks/2026-09-05-d4-free-grace-sustain.md`) | the from-zero s11-mpiio row with the sustain columns is the parent's |
 | 7 | owner `spawn_meta_join` hop | ≤ 32 µs vs ≤ 8 µs read execute | execute on the accepting lane |
 | 8 | stop-and-wait frame depth 1 | — | pipeline |
 | 9–10 | copies / allocs | low | later |
@@ -764,7 +764,7 @@ teardown instrument.
 | authorities for 15 k members | ≥ 15 (readers) / ≥ 45 (co-writers) | 15,000 ÷ the above |
 | verbs/s per authority | 9,473 | F-A: 1 ÷ owner serial per-verb latency (≈ 106 µs) |
 | co-writer aggregate ingest | ≈ 2.6 GiB/s per authority, writer-count-independent | the S9-a publish-plane wall (`docs/design-full-multi-writer.md`) |
-| free-grace recycle | 65 MiB/s vs 2.2 GiB/s churn | the sustain campaign's rows |
+| free-grace recycle | 65 MiB/s vs 2.2 GiB/s churn (pre-campaign); post-campaign the loop's ceiling is `per-lane spare ÷ L_lag` with `L_lag` ≈ 8.6 s coupled (in-process, D-4) | the sustain campaign's rows; the field row is owed |
 | liveness | renew primitive at floor (30–38 ns); the fleet beat rate is bounded by F-B, not by the primitive | — |
 
 **Matrix:** M-1 … M-12 (carried into §6 as M-1 … M-6 by shape).

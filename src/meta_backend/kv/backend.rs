@@ -7304,9 +7304,10 @@ struct QueuedTx {
     /// D4.a: the `KvTx` construction site (counted on success).
     site: &'static std::panic::Location<'static>,
     /// Issue 13 (§5.5 revision 2): the tx's DLM I/D guards, held by THIS
-    /// entry until the tx's terminal outcome — dropped with the entry at
-    /// fan-out (post-result-send on success, post-rollback on failure).
-    /// Never read, only owned: the RAII hold IS the same-key exclusion.
+    /// entry until the tx's terminal outcome — dropped at fan-out, once
+    /// the outcome is computed and BEFORE it is sent (D-3; post-rollback
+    /// on failure). Never read, only owned: the RAII hold IS the same-key
+    /// exclusion.
     _guards: Arc<[DlmGuard]>,
     /// Fan-out channel. A dead receiver (dropped committer future) is
     /// harmless — semantically identical to timeout-fires-after-commit.
@@ -8100,15 +8101,25 @@ impl KvMetaBackend {
     }
 
     /// Fan out per-tx terminal outcomes; each entry's guard set is
-    /// released at ITS terminal outcome — post-result-send on success,
-    /// post-rollback on failure. op-trace `fanout`: a clock read per
-    /// TRACED member only (the untraced population pays a field compare).
+    /// released at ITS terminal outcome (post-rollback on failure) —
+    /// and, since D-3, BEFORE the result is sent: the outcome is terminal
+    /// either way, and a committer answered while its guards were still
+    /// held could re-ask for the same key (its next op on the same
+    /// parent) and park on its OWN previous tx for the send→drop gap —
+    /// the in-process storm measured that self-wait on 11 % of many-dirs
+    /// renames at 32 writers (`dlm_inode_key_waits`, p50 ≤ 16 µs). This
+    /// is the one 4a scoping the D5 co-ownership law permits: the hold
+    /// still spans every byte of the commit park. op-trace `fanout`: a
+    /// clock read per TRACED member only (the untraced population pays a
+    /// field compare).
     fn fan_out(outcomes: Vec<(QueuedTx, std::result::Result<(), KvError>)>) {
         for (q, outcome) in outcomes {
             if q.trace_id != 0 {
                 crate::op_trace::stamp_now(q.trace_id, crate::op_trace::Stage::Fanout);
             }
-            let _ = q.done.send(outcome);
+            let QueuedTx { _guards, done, .. } = q;
+            drop(_guards);
+            let _ = done.send(outcome);
         }
     }
 

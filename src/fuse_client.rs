@@ -4630,6 +4630,41 @@ pub fn set_write_shared_for_tests(on: bool) {
     WRITE_SHARED_OVERRIDE.store(if on { 2 } else { 1 }, Ordering::Relaxed);
 }
 
+/// The `SQUEEZEFS_WRITE_GUARD_NARROW` posture (W-2 write-stream-guard,
+/// 2026-09-05; registry entry in `src/env_knobs.rs`): does the Shared
+/// class admit EVERY cache-resident striped write — the extending
+/// (fresh/append) stream and hole-fills, not only the mapped within-EOF
+/// overwrite? The widening is sound because the exclusive meta-prep the
+/// stream used to take protected nothing the read guard does not: every
+/// inode-plane mutation the convoy design's KD-3 named (hole-fill
+/// allocation, `merge_block_mappings`, the size publish) runs AFTER the
+/// drop-before-I/O point on BOTH modes, under `BLOCK_FLUSH_LOCKS` (3) +
+/// `INODE_META_LOCKS` (3.5) — the `MetaPrepOnly` class already ran those
+/// concurrently across siblings. What the exclusive mode serialized was
+/// the RAM-only snapshot itself (lease hit, cache peeks, the
+/// classifier), i.e. the per-inode wake convoy of a qd-N stream for no
+/// invariant. `=0` restores the pre-campaign class (the same-binary
+/// A/B lever). Consulted only when `write_shared_enabled()`.
+pub fn write_guard_narrow_enabled() -> bool {
+    match WRITE_GUARD_NARROW_OVERRIDE.load(Ordering::Relaxed) {
+        1 => false,
+        2 => true,
+        _ => {
+            static MEMO: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            *MEMO.get_or_init(|| crate::env_knobs::bool_knob("SQUEEZEFS_WRITE_GUARD_NARROW", true))
+        }
+    }
+}
+
+static WRITE_GUARD_NARROW_OVERRIDE: std::sync::atomic::AtomicU8 =
+    std::sync::atomic::AtomicU8::new(0);
+
+/// Test override for the narrowed-guard posture (tests only; the
+/// `set_write_shared_for_tests` pattern).
+pub fn set_write_guard_narrow_for_tests(on: bool) {
+    WRITE_GUARD_NARROW_OVERRIDE.store(if on { 2 } else { 1 }, Ordering::Relaxed);
+}
+
 /// §5.4 lease-severance boundary (zero-copy write-path design, PR 5).
 ///
 /// FUSE_WRITE payloads arrive as zero-copy transport leases over the
@@ -11399,6 +11434,7 @@ impl SqueezefsFilesystem {
                 "write_lock_hold_metaprep": METRICS.write_lock_hold_metaprep.to_json(),
                 "write_lock_hold_entire": METRICS.write_lock_hold_entire.to_json(),
                 "write_shared_enabled": if write_shared_enabled() { 1 } else { 0 },
+                "write_guard_narrow_enabled": if write_guard_narrow_enabled() { 1 } else { 0 },
                 "block_lock_wait": METRICS.block_lock_wait.to_json(),
                 "lease_lock_wait": METRICS.lease_lock_wait.to_json(),
                 "dlm_acquire_time": METRICS.dlm_acquire_time.to_json(),

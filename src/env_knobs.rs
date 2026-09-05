@@ -189,6 +189,7 @@ pub static KNOBS: &[Knob] = &[
     k("SQUEEZEFS_DIRECT_DEVICE_TRUE", Kind::Bool, "off", "Strict device-true O_DIRECT (the amplification-measurement escape); default serves O_DIRECT like buffered."),
     // -- Copy economy ----------------------------------------------------
     k("SQUEEZEFS_WRITE_SHARED", Kind::Bool, "on", "Shared-mode write admission (design-write-inode-convoy): fully-mapped within-EOF striped overwrites take the inode READ guard (classify → acquire-as-classified → revalidate → at most one upgrade). Default ON — the 2026-08-11 elision-era A-B-B-A: +7-8% order-independent on kern AND il at 523-530k IOPS; `=0` is the measurement A/B lever."),
+    k("SQUEEZEFS_WRITE_GUARD_NARROW", Kind::Bool, "on", "W-2 write-stream-guard (2026-09-05): the Shared class widens to EVERY cache-resident striped write — the fresh/append (extending) stream and hole-fills included — so a stream's meta-prep takes the inode READ guard (its data path already ran under block locks only). `0` = the pre-campaign class (mapped within-EOF overwrites only; extends take the exclusive drop-before-I/O guard) — the same-binary A/B lever, never an operational escape. Inert under SQUEEZEFS_WRITE_SHARED=0."),
     k("SQUEEZEFS_NT_COPY", Kind::Bool, "on", "Non-temporal stores at the two DMA-destined copy sites; 0 = the A/B control."),
     k("SQUEEZEFS_NT_COPY_MIN", int(0, BYTES_MAX), "262144", "NT-store engagement floor, bytes."),
     k("SQUEEZEFS_NT_READ_SERVE", Kind::Bool, "on", "Non-temporal stores on dest-arm read serves; 0 = the A/B control."),

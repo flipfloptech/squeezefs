@@ -155,6 +155,29 @@
 //! control, which restores the pre-campaign shape verbatim: the routine
 //! bound, the pressure bound at the allocation cliff, and nothing else.
 //!
+//! # The hold-time campaign (2026-09-06, finding 15's remaining half)
+//!
+//! With the co-writer free path's supply leak closed, the s11 fleet row
+//! HELD the supply instead: `free_grace_bound_age_ms` 8,994 with every
+//! cadence at its 1 Hz floor and nothing starving
+//! (`.benchmarks/2026-09-06-free-grace-hold-time.md`). The hold is now
+//! DECOMPOSED per released offset (`free_grace_hold_phase_ns`:
+//! `defer→checkpointed` off the KV checkpoint mark, `checkpointed→min_acked`
+//! off [`publish_bound`]'s own advance, `min_acked→released`; exact-sum),
+//! with the live hold (`free_grace_hold_ms`) and the per-member ack lag
+//! (`free_grace_member_ack_lag_ms`) beside it. Measured at the fleet
+//! cadences, 6.0 s of the 8.6 s are the ladder's two DERIVED windows
+//! (`staleness + skew`, `staleness + D_purge` — each term a poll interval
+//! or the checkpoint ceiling), and the cadence terms around them are what
+//! two levers cut: **(b)** a promotion wakes the member's renewal loop
+//! and renews as CARRIAGE ([`crate::membership::request_renewal_now`],
+//! `SQUEEZEFS_FREE_GRACE_ACK_RENEWAL`), and **(d)** a binding member's
+//! advancing ack marks the bound dirty for the next harvest's recompute
+//! (`note_member_ack_advanced`, `SQUEEZEFS_FREE_GRACE_REFRESH_ON_ACK`)
+//! — together −922 ms in-process, closure exact, zero fences. A faster
+//! writer checkpoint cadence alone was measured INERT: the reader
+//! qualifies on the time bound, never on observing the checkpoint.
+//!
 //! # Cost when unarmed (the shipped default)
 //!
 //! `SQUEEZEFS_MEMBERSHIP_BIND=off` is the default, so the common mount must
@@ -710,8 +733,9 @@ pub fn hold_phase_json() -> serde_json::Value {
     serde_json::Value::Object(out)
 }
 
-/// Releases whose checkpoint stage could not be placed (see
-/// [`HOLD_UNPLACED`]).
+/// Releases one or more of whose stages could not be placed
+/// (`free_grace_hold_unplaced`; the exact-sum law reads over the placed
+/// population).
 pub fn hold_unplaced() -> u64 {
     HOLD_UNPLACED.load(Ordering::Relaxed)
 }

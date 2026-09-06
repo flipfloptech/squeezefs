@@ -2131,7 +2131,7 @@ impl MemberSession {
     /// Adopt a CARRIAGE renewal's grant (hold-time lever (b) — the renewal
     /// a promoted acknowledgement triggered ahead of the beat): the lease
     /// renews, a prod is honoured, the routine beat and the learned label
-    /// are left to the routine renewal ([`crate::lease_clock_core::MemberLeaseWords::renewed_carriage`]).
+    /// are left to the routine renewal (`MemberLeaseWords::renewed_carriage`).
     pub fn renewed_carriage(&self, grant: &Grant, anchor_ms: u64) {
         self.words.renewed_carriage(
             grant.epoch,

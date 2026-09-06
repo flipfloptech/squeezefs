@@ -1549,7 +1549,7 @@ impl KvMetaBackend {
         // §6.8 item 3's hold ledger: the record naming the new roots is on
         // the device — a reader's next poll adopts it — so this is the
         // instant every dereference committed before the cycle became
-        // observable (one relaxed load on a mount with no reader plane).
+        // observable (one `ArcSwap` load on a mount with no reader plane).
         crate::free_grace::note_checkpoint_completed(cycle_started.elapsed());
 
         if barrier_now {

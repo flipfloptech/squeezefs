@@ -241,6 +241,65 @@ static RESIDENCE_MS: once_cell::sync::Lazy<crate::fuse_client::LatencyHistogram>
 /// cheap accessor).
 static RESIDENCE_SAMPLES: AtomicU64 = AtomicU64::new(0);
 
+// -- the hold-time decomposition (2026-09-06 campaign) ----------------------
+//
+// Where a held offset's residence goes, per stage, READ off the machinery
+// rather than inferred from the cadences: `defer→checkpointed` (the first
+// KV checkpoint the authority completed after the defer — the instant the
+// dereference is durably in a root a reader can adopt), `checkpointed→
+// min_acked` (the first bound publish that covered the label — every
+// member acknowledged past it) and `min_acked→released` (the harvest's
+// visit); `total` is the residence. Exact-sum per sample when the
+// checkpoint stage is placeable.
+
+/// Owner-clock instants of completed checkpoints (any meta volume),
+/// oldest first. Pruned at each push to the routine fence bound — the
+/// longest an offset can be held — so the deque's population derives
+/// from `fence_ms ÷ the checkpoint period` (≈ 80–160 on the shipped
+/// clocks), never a constant. A leaf lock: taken for a push (≤ a few/s)
+/// or a bounded lookup pass per harvest, never across anything else.
+static CHECKPOINT_MARKS: parking_lot::Mutex<VecDeque<u64>> =
+    parking_lot::Mutex::new(VecDeque::new());
+/// Marks recorded since arm (`free_grace_checkpoint_marks`).
+static CHECKPOINT_MARK_COUNT: AtomicU64 = AtomicU64::new(0);
+/// `(bound, owner instant)` of every bound ADVANCE (`publish_bound` with a
+/// higher minimum than the published one), oldest first — both columns
+/// monotone by construction, so the covering publish of a label is one
+/// partition point. Pruned like the marks.
+static BOUND_ADVANCES: parking_lot::Mutex<VecDeque<(u64, u64)>> =
+    parking_lot::Mutex::new(VecDeque::new());
+/// The per-stage histograms (`free_grace_hold_phase_ns`).
+static HOLD_PHASES: once_cell::sync::Lazy<[crate::fuse_client::LatencyHistogram; HOLD_PHASES_N]> =
+    once_cell::sync::Lazy::new(|| {
+        std::array::from_fn(|_| crate::fuse_client::LatencyHistogram::default())
+    });
+/// Releases one or more of whose stages could not be placed: no recorded
+/// bound advance covers the label (`total` alone stamps), or no checkpoint
+/// mark sits between the defer and the cover — a plane armed without the
+/// KV hook, or a cover that preceded any recorded checkpoint (`total` and
+/// `min_acked_released` stamp). The exact-sum law reads over the placed
+/// population.
+static HOLD_UNPLACED: AtomicU64 = AtomicU64::new(0);
+/// The measured checkpoint cycle duration, EWMA in ns (fed by the hook).
+static CHECKPOINT_CYCLE_EWMA_NS: AtomicU64 = AtomicU64::new(0);
+/// The measured hold (`free_grace_hold_ms`): EWMA of the per-offset
+/// residence at release, folded per harvest batch.
+static HOLD_EWMA_MS: AtomicU64 = AtomicU64::new(0);
+
+const HOLD_PHASES_N: usize = 4;
+/// The stage names, in loop order; the JSON keys of
+/// `free_grace_hold_phase_ns`.
+pub const HOLD_PHASE_NAMES: [&str; HOLD_PHASES_N] = [
+    "defer_checkpointed",
+    "checkpointed_min_acked",
+    "min_acked_released",
+    "total",
+];
+const HOLD_DEFER_CHECKPOINTED: usize = 0;
+const HOLD_CHECKPOINTED_MIN_ACKED: usize = 1;
+const HOLD_MIN_ACKED_RELEASED: usize = 2;
+const HOLD_TOTAL: usize = 3;
+
 // -- the pressure valve's words (rung-20 residual 6) ------------------------
 
 /// Rung (a): grants handed a tightened renewal cadence.
@@ -479,14 +538,169 @@ pub fn disarm_owner_plane() {
 /// is accounted for in [`ack_cycle`].
 pub fn publish_bound(min_acked: u64, members: usize) {
     MEMBERS.store(members as u64, Ordering::Relaxed);
-    let has_plane = PLANE.load().is_some();
-    if members == 0 || !has_plane {
-        BOUND.store(u64::MAX, Ordering::Relaxed);
-        ARMED.store(false, Ordering::Release);
+    let plane = PLANE.load();
+    let published = if members == 0 || plane.is_none() {
+        u64::MAX
+    } else {
+        min_acked
+    };
+    let previous = BOUND.swap(published, Ordering::Relaxed);
+    ARMED.store(published != u64::MAX, Ordering::Release);
+    // The hold ledger's covering instants: every ADVANCE, including the
+    // one to `u64::MAX` (a disarm releases everything held, and those
+    // releases attribute to it).
+    if published > previous {
+        if let Some(plane) = plane.as_ref() {
+            let now = plane.clock.now_ms();
+            let mut advances = BOUND_ADVANCES.lock();
+            prune_marks_front(&mut advances, |&(_, at)| at, now, plane.fence_ms);
+            advances.push_back((published, now));
+        }
+    }
+}
+
+/// Drop the entries of an owner-instant-ordered deque older than the
+/// routine fence bound — the longest an offset can be held, so nothing a
+/// future release could attribute to is ever dropped.
+fn prune_marks_front<T>(
+    deque: &mut VecDeque<T>,
+    at: impl Fn(&T) -> u64,
+    now: u64,
+    fence_ms: u64,
+) {
+    let horizon = now.saturating_sub(fence_ms);
+    while deque.front().is_some_and(|e| at(e) < horizon) {
+        deque.pop_front();
+    }
+}
+
+/// **The KV checkpoint hook** (hold-time campaign): called by the
+/// checkpoint task once the ledger record naming the new roots has been
+/// written — the instant a reader's poll can adopt a root carrying every
+/// dereference committed before the cycle began. Records the owner-clock
+/// mark the `defer→checkpointed` stage is read against. No plane ⇒ one
+/// `ArcSwap` load and nothing else (a solo mount's checkpoint pays no
+/// lock); `cycle` is the cycle's own wall duration, the measured cost the
+/// coupled cadence is floored on.
+pub fn note_checkpoint_completed(cycle: Duration) {
+    let Some(plane) = PLANE.load_full() else {
+        return;
+    };
+    let now = plane.clock.now_ms();
+    {
+        let mut marks = CHECKPOINT_MARKS.lock();
+        prune_marks_front(&mut marks, |&at| at, now, plane.fence_ms);
+        marks.push_back(now);
+    }
+    CHECKPOINT_MARK_COUNT.fetch_add(1, Ordering::Relaxed);
+    // The measured cycle cost (EWMA α = 1/4, the `sample_alloc_rate`
+    // shape): the physical floor of the coupled checkpoint cadence — a
+    // cadence shorter than the cycle it schedules is not a cadence.
+    let inst = cycle.as_nanos().min(u64::MAX as u128) as u64;
+    let old = CHECKPOINT_CYCLE_EWMA_NS.load(Ordering::Relaxed);
+    let ewma = if old == 0 {
+        inst
+    } else {
+        old.saturating_sub(old.div_ceil(4)) + inst / 4
+    };
+    CHECKPOINT_CYCLE_EWMA_NS.store(ewma, Ordering::Relaxed);
+}
+
+/// The measured checkpoint cycle cost, ms (`free_grace_checkpoint_cycle_ms`;
+/// 0 until the first mark).
+pub fn checkpoint_cycle_ms() -> u64 {
+    CHECKPOINT_CYCLE_EWMA_NS.load(Ordering::Relaxed) / 1_000_000
+}
+
+/// Checkpoint marks recorded on the armed plane (`free_grace_checkpoint_marks`).
+pub fn checkpoint_marks() -> u64 {
+    CHECKPOINT_MARK_COUNT.load(Ordering::Relaxed)
+}
+
+/// Stamp one release into the hold-phase histograms: `label` is the
+/// offset's grace label (defer instant + 1), `released_at` the owner
+/// instant of the harvest. Called with the ring lock RELEASED.
+fn stamp_hold_phases(label: u64, released_at: u64) {
+    let defer_at = label.saturating_sub(1);
+    let total = released_at.saturating_sub(defer_at);
+    HOLD_PHASES[HOLD_TOTAL].record(Duration::from_millis(total));
+    // The covering publish: the first advance whose bound reaches the
+    // label (both columns monotone ⇒ one partition point).
+    let covered_at = {
+        let advances = BOUND_ADVANCES.lock();
+        let i = advances.partition_point(|&(bound, _)| bound < label);
+        advances.get(i).map(|&(_, at)| at)
+    };
+    let Some(covered_at) = covered_at else {
+        HOLD_UNPLACED.fetch_add(1, Ordering::Relaxed);
+        return;
+    };
+    HOLD_PHASES[HOLD_MIN_ACKED_RELEASED]
+        .record(Duration::from_millis(released_at.saturating_sub(covered_at)));
+    // The first checkpoint completed at or after the defer's own
+    // millisecond (the dereference commit precedes the free through the
+    // reclaim queue, so a cycle completing in that ms carries it).
+    let checkpointed_at = {
+        let marks = CHECKPOINT_MARKS.lock();
+        let i = marks.partition_point(|&at| at < defer_at);
+        marks.get(i).copied()
+    };
+    match checkpointed_at {
+        Some(ck) if ck <= covered_at => {
+            HOLD_PHASES[HOLD_DEFER_CHECKPOINTED].record(Duration::from_millis(ck - defer_at));
+            HOLD_PHASES[HOLD_CHECKPOINTED_MIN_ACKED]
+                .record(Duration::from_millis(covered_at - ck));
+        }
+        _ => {
+            HOLD_UNPLACED.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
+/// Fold one harvest batch's mean residence into the live hold gauge
+/// (`free_grace_hold_ms` — EWMA α = 1/4 over batches, the
+/// `sample_alloc_rate` shape): the MEASURED loop latency the capacity law
+/// multiplies the churn by. A batch is the natural sample — every offset
+/// in it was covered by the same bound advance.
+fn note_hold_sample(labels: &[u64], released_at: u64) {
+    if labels.is_empty() {
         return;
     }
-    BOUND.store(min_acked, Ordering::Relaxed);
-    ARMED.store(true, Ordering::Release);
+    let sum: u64 = labels
+        .iter()
+        .map(|&l| released_at.saturating_sub(l.saturating_sub(1)))
+        .sum();
+    let inst = sum / labels.len() as u64;
+    let old = HOLD_EWMA_MS.load(Ordering::Relaxed);
+    let ewma = if old == 0 {
+        inst
+    } else {
+        old.saturating_sub(old.div_ceil(4)) + inst / 4
+    };
+    HOLD_EWMA_MS.store(ewma, Ordering::Relaxed);
+}
+
+/// **The measured hold** (`free_grace_hold_ms`): the live EWMA of the
+/// per-offset residence at release — what a freed offset's lane share is
+/// tied up for. 0 until the first release.
+pub fn hold_ms() -> u64 {
+    HOLD_EWMA_MS.load(Ordering::Relaxed)
+}
+
+/// `free_grace_hold_phase_ns`: the per-stage histograms, keyed by
+/// [`HOLD_PHASE_NAMES`].
+pub fn hold_phase_json() -> serde_json::Value {
+    let mut out = serde_json::Map::new();
+    for (i, name) in HOLD_PHASE_NAMES.iter().enumerate() {
+        out.insert((*name).to_string(), HOLD_PHASES[i].to_json());
+    }
+    serde_json::Value::Object(out)
+}
+
+/// Releases whose checkpoint stage could not be placed (see
+/// [`HOLD_UNPLACED`]).
+pub fn hold_unplaced() -> u64 {
+    HOLD_UNPLACED.load(Ordering::Relaxed)
 }
 
 // ---------------------------------------------------------------------------
@@ -950,26 +1164,18 @@ impl GraceRing {
             }
         }
         let mut out = Vec::new();
+        let mut labels = Vec::new();
         let mut released_bytes = 0u64;
+        let release_now = owner_now_ms();
         {
-            let release_now = owner_now_ms();
             let mut guard = self.entries.lock();
             while out.len() < max {
                 match guard.front() {
                     Some(e) if e.label <= bound => {
                         let e = guard.pop_front().expect("front peeked");
                         released_bytes += e.size;
-                        // `free_grace_residence_ms` (sustain campaign §8):
-                        // the measured per-offset loop latency, stamped at
-                        // release — `now − (label − 1)` (the label is the
-                        // deferral instant + 1).
-                        if let Some(now) = release_now {
-                            RESIDENCE_MS.record(Duration::from_millis(
-                                now.saturating_sub(e.label.saturating_sub(1)),
-                            ));
-                            RESIDENCE_SAMPLES.fetch_add(1, Ordering::Relaxed);
-                        }
                         out.push(e.offset);
+                        labels.push(e.label);
                     }
                     _ => break,
                 }
@@ -983,6 +1189,21 @@ impl GraceRing {
             RELEASES.fetch_add(out.len() as u64, Ordering::Relaxed);
             if forced {
                 FORCED_RELEASES.fetch_add(out.len() as u64, Ordering::Relaxed);
+            }
+            // `free_grace_residence_ms` (sustain campaign §8) — the
+            // per-offset loop latency, `now − (label − 1)` — and its
+            // per-stage decomposition (hold-time campaign), stamped with
+            // the ring lock released: the stage lookups take the mark
+            // deques, leaf locks of their own.
+            if let Some(now) = release_now {
+                for &label in &labels {
+                    RESIDENCE_MS.record(Duration::from_millis(
+                        now.saturating_sub(label.saturating_sub(1)),
+                    ));
+                    RESIDENCE_SAMPLES.fetch_add(1, Ordering::Relaxed);
+                    stamp_hold_phases(label, now);
+                }
+                note_hold_sample(&labels, now);
             }
         }
         out
@@ -2015,7 +2236,54 @@ pub fn stats_snapshot() -> serde_json::Value {
         "free_grace_demand_pct": demand_pct(),
         "free_grace_demand_prods": demand_prods(),
         "free_grace_bound_refreshes": bound_refreshes(),
+        // The hold-time campaign's instruments: the per-stage
+        // decomposition of the residence, the checkpoint marks it is read
+        // against (with the measured cycle cost), the live hold, and the
+        // per-member acknowledgement lag (the min-composition's culprit
+        // finder; the census itself names peers, so it rides the key-
+        // census gate like `dlm_custody_grant_census`).
+        "free_grace_hold_phase_ns": hold_phase_json(),
+        "free_grace_hold_unplaced": hold_unplaced(),
+        "free_grace_hold_ms": hold_ms(),
+        "free_grace_checkpoint_marks": checkpoint_marks(),
+        "free_grace_checkpoint_cycle_ms": checkpoint_cycle_ms(),
+        "free_grace_member_ack_lag_ms": member_ack_lag_json(),
+        "free_grace_member_ack_lag_census": member_ack_lag_census_json(),
     })
+}
+
+/// `free_grace_member_ack_lag_ms`: max / mean / min of the owner's
+/// per-member acknowledgement lag ([`crate::membership::MembershipOwner::member_ack_lags`])
+/// plus the member count; all 0 with no owner or no members.
+fn member_ack_lag_json() -> serde_json::Value {
+    let lags: Vec<u64> = crate::membership::installed_owner()
+        .map(|o| o.member_ack_lags().into_iter().map(|(_, lag)| lag).collect())
+        .unwrap_or_default();
+    let n = lags.len() as u64;
+    serde_json::json!({
+        "max": lags.iter().copied().max().unwrap_or(0),
+        "mean": lags.iter().sum::<u64>().checked_div(n).unwrap_or(0),
+        "min": lags.iter().copied().min().unwrap_or(0),
+        "members": n,
+    })
+}
+
+/// The per-member census (`[{id, lag_ms}]`), opt-in behind
+/// `SQUEEZEFS_STATS_KEY_CENSUS=1` (VAL-7a — it names peers); `null`
+/// otherwise, so tooling can tell "gated" from "empty".
+fn member_ack_lag_census_json() -> serde_json::Value {
+    if !crate::fuse_client::stats_key_census_enabled() {
+        return serde_json::Value::Null;
+    }
+    let rows: Vec<serde_json::Value> = crate::membership::installed_owner()
+        .map(|o| {
+            o.member_ack_lags()
+                .into_iter()
+                .map(|(id, lag)| serde_json::json!({ "id": id, "lag_ms": lag }))
+                .collect()
+        })
+        .unwrap_or_default();
+    serde_json::Value::Array(rows)
 }
 
 /// **Test seam** (the [`crate::data_custody::test_clear_poison`]
@@ -2052,12 +2320,21 @@ pub fn reset_for_test() {
         &PASS_PROD_UNTIL_MS,
         &PASS_PRODS,
         &PASS_INTERVAL_MS,
+        &CHECKPOINT_MARK_COUNT,
+        &CHECKPOINT_CYCLE_EWMA_NS,
+        &HOLD_UNPLACED,
+        &HOLD_EWMA_MS,
     ] {
         c.store(0, Ordering::Relaxed);
     }
     test_set_demand(None);
     test_set_pass_elastic(None);
     RESIDENCE_MS.reset();
+    for h in HOLD_PHASES.iter() {
+        h.reset();
+    }
+    CHECKPOINT_MARKS.lock().clear();
+    BOUND_ADVANCES.lock().clear();
     RUNWAY_MS.store(u64::MAX, Ordering::Relaxed);
     LADDER.reset();
     test_set_ack_pipeline(None);

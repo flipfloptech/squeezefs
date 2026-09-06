@@ -1366,6 +1366,7 @@ impl KvMetaBackend {
         smo: &mut SmoContext,
         barrier_now: bool,
     ) -> Result<(), KvError> {
+        let cycle_started = std::time::Instant::now();
         let h = self.journal_ring().core().head();
         // The wedged-tail progress audit's inputs (see the barrier_now
         // block at the end): captured before the cycle mutates anything.
@@ -1545,6 +1546,11 @@ impl KvMetaBackend {
             .unwrap()
             .push((tail, self.barrier_push_epoch()));
         super::META_KV_CHECKPOINTS.fetch_add(1, Ordering::Relaxed);
+        // §6.8 item 3's hold ledger: the record naming the new roots is on
+        // the device — a reader's next poll adopts it — so this is the
+        // instant every dereference committed before the cycle became
+        // observable (one relaxed load on a mount with no reader plane).
+        crate::free_grace::note_checkpoint_completed(cycle_started.elapsed());
 
         if barrier_now {
             // Make THIS record durable now: reclamation (reusable_upto,

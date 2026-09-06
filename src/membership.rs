@@ -1358,6 +1358,9 @@ struct MemberState {
     boot: String,
     epoch: u64,
     join_seq: u64,
+    /// Owner-clock instant of the join — the floor of a member's §6.8
+    /// item-3 acknowledgement lag while it has acknowledged nothing.
+    joined_ms: u64,
     renewed_ms: u64,
     deadline_ms: u64,
     acked_free_epoch: u64,
@@ -1593,6 +1596,7 @@ impl MembershipOwner {
             boot: req.boot.clone(),
             epoch,
             join_seq,
+            joined_ms: now,
             renewed_ms: now,
             deadline_ms: now + self.clocks.t_owner.as_millis() as u64,
             acked_free_epoch: 0,
@@ -1824,6 +1828,23 @@ impl MembershipOwner {
     /// accounts for.
     pub fn refresh_free_grace_bound(&self) {
         crate::free_grace::publish_bound(self.min_acked_free_epoch(), self.len());
+    }
+
+    /// §6.8 item 3's per-member acknowledgement lag: owner-clock `now −
+    /// acked_free_epoch` for every live member (`now − joined` for one
+    /// that has acknowledged nothing). The bound is the MIN over members,
+    /// so the loop's latency is the largest of these — the culprit finder
+    /// behind `free_grace_member_ack_lag_ms` (hold-time campaign). One
+    /// O(members) walk; a stats read, never a hot op.
+    pub fn member_ack_lags(&self) -> Vec<(String, u64)> {
+        let now = self.clock.now_ms();
+        let mut out = Vec::new();
+        self.members.iter_sync(|id, st| {
+            let since = st.acked_free_epoch.max(st.joined_ms);
+            out.push((id.clone(), now.saturating_sub(since)));
+            true
+        });
+        out
     }
 
     /// The members that have NOT acknowledged `epoch` — item 3's laggard

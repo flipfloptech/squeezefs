@@ -198,26 +198,43 @@ task is unchanged and green.
   `fsck_tests` 22/22 · `kvmap_mw_hazard_tests` 7/7 · `kvmap_crossing_tests`
   9/9 · `write_through_coverage_tests` 8/8.
 
-## 6. Fleet row — OWED (parent)
+## 6. Fleet row — RUN 2026-09-06 00:15 (dev box, 32 CPUs): the leak and the storm are GONE; the shortage is now the recycle loop's own term
 
-`sudo tests/run_mw_matrix.sh s11-mpiio` on the same fleet (1 authority + 8
-co-writers, range custody, `SQZ_MWFLEET_OSS_GB=32`, tcp devsub, release
-default features), from zero on `1bed978d`+. PASS reads:
+`s11-mpiio` from zero on `34823f0d` (release), same fleet (1 authority +
+8 co-writers, range custody, `OSS_GB=32`); artifacts
+`.benchmarks/rows-leakfix-s11-20260906/`. Probe 1,606 MiB/s → 10 GiB file,
+12 iterations.
 
-* `block_untracked_free_refusals` on m0 ≈ 0 — only genuine double releases
-  (each named on the log line), and `meta_ship_publish.free_refused_blocks`
-  ≈ the same number; `publish_blob_orphan_reclaims` ≈ `publish_full_save_indirect`
-  per co-writer (one closure per own-mint save) with
-  `publish_blob_orphan_reclaim_dedups` carrying the re-arms that used to ship;
-  `CLAIM ANOMALY` lines 0 on every co-writer.
-* Lane ENOSPC refusals (`data volume … full — lane N of 16 is exhausted`)
-  → 0 per co-writer, and the supply arithmetic closes at capture:
-  Σ allocations − `del_obj` ≈ file blocks + `free_grace_offsets` + live
-  blobs (the ≈ 300-block residue gone); `cowriter.unpublished_recycles`
-  growing where `unpublished_abandons` used to.
-* If the leak was the whole shortage: the sustained-window gate PASSING
-  (finding 15 closed). If not: the remaining decay attributed to the
-  free-grace terms with the PR-1 instruments (`free_grace_bound_age_ms` vs
-  the 560 blocks/s churn against the 5,632 recyclable lane blocks — the
-  D-4 note's §3 arithmetic), which is the ack-cadence campaign's row, not
-  this fix's.
+| | before the fix (`4ca040aa`, `rows-wedgefix-s11-20260906/`) | after (`34823f0d`) |
+|---|---|---|
+| `block_untracked_free_refusals` (m0) | 3,449 | **148** (−96 %) — `meta_ship_publish.free_refused_blocks` 148, the same number; `free_served_blocks` 2,686 |
+| double-release refusals per co-writer (log) | 367–542 | **15–20** |
+| `publish_blob_orphan_reclaims` / `_dedups` per co-writer | one blob re-armed at every discard | 65–85 reclaims ≈ `publish_full_save_indirect` 30–77 (one closure per own-mint save), **256–321 dedups** carrying the re-arms that used to ship |
+| `cowriter.unpublished_{recycles,abandons}` | abandons | **recycles 5–10, abandons 0** |
+| `CLAIM ANOMALY` per co-writer | ×34 (m57) | 1 / 183 / 33 on m50 / m53 / m57 — NOT 0 (below) |
+| lane ENOSPC refusals per co-writer | 114–225 | **76–129** — the shortage PERSISTS |
+| watchdog reports | 2–4 | 0–2 |
+| ior | all 18 iterations ran; A1 NOT SUSTAINED 920 → 557 MiB/s | all 12 ran; **A1 NOT SUSTAINED 1,270 → 482 MiB/s** (iterations 1,860 / 1,932 / 914 / 965 / 554 / 1,580 / 790 / 250 / 776 / 584 / 263 / 600) |
+| free-grace at capture (m0) | deferrals 54,530 / releases 54,487 / **offsets 43** | deferrals 35,594 / releases 32,423 / **offsets 3,171 (≈ 12.4 GiB)**, `alloc_stalls` 0, `bound_tightenings` 185,054, `demand_waits` 49,528 |
+
+**Verdict — the fix does what it claims; finding 15 is not closed by it,
+and the row now says exactly why.** The refused-free storm is gone (−96 %,
+the residue named as genuine double releases), never-published mints
+recycle instead of abandoning, the blob lineages close once. With the
+leak plugged the ledger moves: the free-grace ring is now holding
+**3,171 offsets (a third of the 36 GiB lane supply) at capture** where it
+held 43 before — i.e. the supply is no longer leaking OUT of the loop, it
+is sitting IN the loop waiting to be released. That is D-4's rate term
+(release latency × churn against `cap/W`), the ack-cadence campaign's
+row, not this fix's — with the PR-1 instruments live: `bound_tightenings`
+185 k and `demand_waits` 49.5 k over a 3.5-minute phase say the valve is
+saturated and still cannot release fast enough for 1.6 GiB/s of CoW
+displacement into 4 GiB lanes. `CLAIM ANOMALY` did not reach 0 (183 on
+m53) — the residual 148 refusals' co-writer-side face; a smaller,
+separate item to name (which lineage still double-ships) before the next
+fleet row.
+
+**Disposition:** LANDS (a data-path correctness fix with a fleet-proven
+effect on its own ledger). Finding 15 proper moves to the free-grace
+release-latency campaign with a sharper premise: the loop's hold time,
+not a leak, and not the refused frees.

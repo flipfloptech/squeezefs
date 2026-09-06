@@ -1,0 +1,5 @@
+    69.48%  [kernel.kallsyms] 
+    26.53%  squeezefs         
+     2.05%  libc-2.28.so      
+     1.02%  libpthread-2.28.so
+     0.91%  [vdso]            

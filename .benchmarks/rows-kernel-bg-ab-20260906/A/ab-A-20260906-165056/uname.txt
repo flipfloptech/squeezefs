@@ -1,0 +1,1 @@
+Linux memp-s3ds-aqs-37 6.19.14-sqz #1 SMP PREEMPT_DYNAMIC Mon Aug 31 19:15:59 UTC 2026 x86_64 x86_64 x86_64 GNU/Linux

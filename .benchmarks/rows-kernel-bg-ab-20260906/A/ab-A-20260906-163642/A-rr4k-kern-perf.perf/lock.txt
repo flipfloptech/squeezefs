@@ -1,0 +1,13 @@
+# lock class shares (flat, self time) — the R-4 §2 ledger's 7.8 % + 3.1 %
+    12.56%  [kernel.kallsyms]   [k] native_queued_spin_lock_slowpath
+     3.28%  [kernel.kallsyms]   [k] _raw_spin_lock
+     0.53%  [kernel.kallsyms]   [k] fuse_request_end
+     0.32%  [kernel.kallsyms]   [k] fuse_uring_commit_fetch
+     0.08%  [kernel.kallsyms]   [k] fuse_uring_req_end
+     0.07%  [kernel.kallsyms]   [k] __raw_spin_lock_irqsave
+# callers of native_queued_spin_lock_slowpath (dwarf, 2 s)
+     0.52%  f3-ur0md   [kernel.kallsyms]
+            |
+            ---native_queued_spin_lock_slowpath
+               _raw_spin_lock
+# callers of _raw_spin_lock (dwarf, 2 s)

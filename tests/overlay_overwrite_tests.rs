@@ -2025,14 +2025,24 @@ async fn kill9_crash_matrix_ow1_to_ow7() {
                 }
                 // OW-6: FENCED pre-publish — the close publishes nothing
                 // and frees nothing (W5); successor recovery owns all.
+                // The GENUINE fence class (the D0 custody poison): a
+                // stale token alone is a process-local rotation the
+                // close now converges (rewrite_shadow_tests contract 4b).
                 "ow6" => {
                     write_at(&h, ino, 0, &newv).await;
                     eventually(|| open_epochs() > 0, "the detached feed").await;
                     let f0 = terminal_frees();
-                    let path = squeezefs::keys::inode_path(ino);
-                    let stale = squeezefs::dlm::test_bump_fencing_generation(&path) - 1;
-                    let res = h.fs.router.close_rewrite_epoch(ino, stale).await;
-                    assert!(res.is_err(), "a fenced close must refuse loud");
+                    let token = h.fs.dlm().get_fencing_token_ino(ino);
+                    squeezefs::data_custody::poison("ow6: the D0 fence fired");
+                    let res = h.fs.router.close_rewrite_epoch(ino, token).await;
+                    squeezefs::data_custody::test_clear_poison();
+                    assert!(
+                        matches!(
+                            res,
+                            Err(squeezefs::error::SqueezefsError::WriterGuardFenced)
+                        ),
+                        "a fenced close must refuse loud in the fence's class: {res:?}"
+                    );
                     assert_eq!(terminal_frees() - f0, 0, "W5: freed NOTHING");
                     false
                 }

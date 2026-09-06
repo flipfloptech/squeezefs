@@ -492,12 +492,21 @@ EOF
 fi
 
 # ---- persist row meta ------------------------------------------------------
+# A job may FIX a knob in its shape (exa_randread_iops.job pins bs=4k — the
+# IOPS shape); the meta records the value fio ran with, not the runner's
+# default for that flag.
+effective_knob() { # <key> <runner-value>
+    local v; v="$(grep -E "^$1=" "$GEN" | tail -1 | cut -d= -f2-)"
+    case "$v" in ""|*'$'*) echo "$2" ;; *) echo "$v" ;; esac
+}
+EFF_BS="$(effective_knob bs "$BS")"
+EFF_IODEPTH="$(effective_knob iodepth "$IODEPTH")"
 python3 - "$RESULTS/${LABEL}.meta.json" <<EOF
 import json, sys
 json.dump({
     "label": "$LABEL", "job": "$JOB", "generated_job": "$GEN",
     "instrument": "$FIO_VERSION", "engine": "$ENGINE",
-    "bs": "$BS", "iodepth": "$IODEPTH", "njobs_total": $NJOBS_TOTAL,
+    "bs": "$EFF_BS", "iodepth": "$EFF_IODEPTH", "njobs_total": $NJOBS_TOTAL,
     "size": "$SIZE", "runtime_s": $RUNTIME, "ramp_s": $RAMP,
     "numa_nodes": $NNODES, "numa_fanout": $USE_NUMA,
     "dir": "$DIR", "devices": "$DEVICES", "shim": "$SHIM",

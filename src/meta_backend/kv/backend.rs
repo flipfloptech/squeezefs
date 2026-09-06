@@ -7078,6 +7078,16 @@ pub type RecomputedReleases = Option<Vec<super::block_refs::BlockRef>>;
 /// verdict)`.
 pub type MergeOutcome = (bool, u64, RecomputedReleases);
 
+/// One recompute's output (rung 19/20): the ops that REPLACE the caller's
+/// frame in the transaction, plus the frame's RAM-only lifetimes (finding
+/// 15 — see `recompute_refs_against_map`), which are staged NOWHERE (no
+/// durable record ever existed) and travel only into the recompute's
+/// post-commit free set.
+struct RecomputedFrame {
+    ops: Vec<super::block_refs::BlockRefOp>,
+    ram_only_releases: Vec<super::block_refs::BlockRef>,
+}
+
 /// One crossing/migration train's accounting
 /// ([`KvMetaBackend::migrate_block_map_train`]): what the ledger counters
 /// (`map_migrate_records` / `publish_map_record_bytes`) and the A1
@@ -10736,6 +10746,9 @@ impl KvMetaBackend {
             // set's device frees then belong to the serve's post-commit
             // ladder, never to the caller's frame-derived stream.
             let mut refs_recomputed = false;
+            // Finding 15: the recompute's RAM-only releases (staged
+            // nowhere; freed with the released set).
+            let mut ram_only_releases: Vec<super::block_refs::BlockRef> = Vec::new();
             if existing {
                 match self.xattrs.lookup(&key).await {
                     Ok(Some(cur)) => {
@@ -10915,17 +10928,23 @@ impl KvMetaBackend {
                             // The accounting: this member's entries
                             // against the ACCUMULATED view (the memo's
                             // map, pre-apply).
-                            let mut composed_refs = if self.block_refs.is_some() {
-                                state.layout.block_map.as_ref().and_then(|memo_map| {
-                                    Self::recompute_refs_against_map(
-                                        memo_map,
-                                        &d.entries,
-                                        op.refs_owner,
-                                        &op.block_refs,
-                                    )
+                            let (mut composed_refs, composed_ram_only) = match self
+                                .block_refs
+                                .is_some()
+                                .then(|| {
+                                    state.layout.block_map.as_ref().and_then(|memo_map| {
+                                        Self::recompute_refs_against_map(
+                                            memo_map,
+                                            &d.entries,
+                                            op.refs_owner,
+                                            &op.block_refs,
+                                        )
+                                    })
                                 })
-                            } else {
-                                None
+                                .flatten()
+                            {
+                                Some(frame) => (Some(frame.ops), frame.ram_only_releases),
+                                None => (None, Vec::new()),
                             };
                             // Candidate = memo + this delta. Committed
                             // into the memo ONLY after its blob write
@@ -10991,6 +11010,7 @@ impl KvMetaBackend {
                             if let Some(refs) = composed_refs {
                                 op.block_refs = refs;
                                 refs_recomputed = true;
+                                ram_only_releases = composed_ram_only;
                             }
                             // Staging is certain from here: commit the
                             // candidate into the memo and record the name
@@ -11184,14 +11204,15 @@ impl KvMetaBackend {
                         // returns `None` on an indirect head).
                         if op.chain && self.block_refs.is_some() && !head_indirect {
                             if let Ok(d) = crate::layout_wire::LayoutDelta::decode(&op.delta_wire) {
-                                if let Some(refs) = Self::recompute_chained_refs(
+                                if let Some(frame) = Self::recompute_chained_refs(
                                     &cur,
                                     &d.entries,
                                     op.refs_owner,
                                     &op.block_refs,
                                 ) {
-                                    op.block_refs = refs;
+                                    op.block_refs = frame.ops;
                                     refs_recomputed = true;
+                                    ram_only_releases = frame.ram_only_releases;
                                 }
                             }
                             // The crossing's blob custody: ONE take for
@@ -11263,8 +11284,13 @@ impl KvMetaBackend {
             }
             // Finding 36: the recompute verdict travels with the member's
             // outcome — released DATA refs only (the map-blob transfers
-            // free through `displaced_blobs` below, never the ladder).
-            let recomputed = refs_recomputed.then(|| Self::released_data_refs(&op.block_refs));
+            // free through `displaced_blobs` below, never the ladder) plus
+            // the frame's RAM-only lifetimes (finding 15).
+            let recomputed = refs_recomputed.then(|| {
+                let mut released = Self::released_data_refs(&op.block_refs);
+                released.append(&mut ram_only_releases);
+                released
+            });
             staged.push((
                 op.done,
                 use_delta,
@@ -11363,7 +11389,7 @@ impl KvMetaBackend {
         entries: &[(u32, String)],
         ino: Ino,
         caller: &[super::block_refs::BlockRefOp],
-    ) -> Option<Vec<super::block_refs::BlockRefOp>> {
+    ) -> Option<RecomputedFrame> {
         let x = XattrValue::decode(cur).ok()?;
         let base = crate::layout_wire::decode_base_layout(&x.value).ok()?;
         let head = base.block_map.unwrap_or_default();
@@ -11376,12 +11402,23 @@ impl KvMetaBackend {
     /// Identical in-order composed-view transitions + the caller
     /// `is_map_blob()` verbatim-extend; `None` = no resolver armed (the
     /// caller's ops stand, byte-identical to the pre-rung-19 shape).
+    ///
+    /// Finding 15 (the co-writer supply leak): the frame's RAM-only
+    /// lifetimes travel back beside the ops
+    /// ([`RecomputedFrame::ram_only_releases`]) — a block the caller took
+    /// AND released inside this one frame that neither the head nor the
+    /// composed view names was never durably referenced, so the diff
+    /// cannot release it and the owner's post-commit ladder must free it
+    /// itself. The head/composed check is what keeps a skewed frame's
+    /// re-take of a durable block (whose release the diff already carries)
+    /// out of the set; it resolves the head's keys only when a candidate
+    /// exists (the steady-state frame has none).
     fn recompute_refs_against_map(
         head: &std::collections::HashMap<u32, String>,
         entries: &[(u32, String)],
         ino: Ino,
         caller: &[super::block_refs::BlockRefOp],
-    ) -> Option<Vec<super::block_refs::BlockRefOp>> {
+    ) -> Option<RecomputedFrame> {
         use super::block_refs::BlockRefOp;
         let resolver = super::block_refs::block_ref_resolver()?;
         let mut out: Vec<BlockRefOp> = Vec::with_capacity(entries.len() + 1);
@@ -11417,8 +11454,29 @@ impl KvMetaBackend {
             }
             view.insert(*idx, key);
         }
+        let mut ram_only_releases = super::block_refs::frame_ram_only_candidates(caller, &out);
+        if !ram_only_releases.is_empty() {
+            // Every block the head or the composed view names, resolved
+            // once: the composed view is `head` under `view`'s overrides.
+            let mut named: std::collections::HashSet<(u64, u64)> = std::collections::HashSet::new();
+            let mut name = |key: &str, idx: u32| {
+                if let Some(r) = resolver(key, ino, idx) {
+                    named.insert((r.vol_tag, r.block_idx));
+                }
+            };
+            for (idx, key) in head {
+                name(key, *idx);
+            }
+            for (idx, key) in &view {
+                name(key, *idx);
+            }
+            ram_only_releases.retain(|r| !named.contains(&(r.vol_tag, r.block_idx)));
+        }
         out.extend(caller.iter().filter(|o| o.reference.is_map_blob()).copied());
-        Some(out)
+        Some(RecomputedFrame {
+            ops: out,
+            ram_only_releases,
+        })
     }
 
     /// **The inline→oversize CROSSING arm** (the 2026-08-19
@@ -11553,6 +11611,9 @@ impl KvMetaBackend {
         // recomputed accounting — `None` keeps the caller's ops (the solo
         // path verbatim).
         let mut refs_override: Option<Vec<super::block_refs::BlockRefOp>> = None;
+        // Finding 15: the recompute's RAM-only releases (staged nowhere;
+        // freed with the released set).
+        let mut ram_only_releases: Vec<super::block_refs::BlockRef> = Vec::new();
         // Rung 20 residual 1 (the blob-aware compose): RES-9 custody for
         // the fresh CoW blob until the commit lands, and the displaced
         // predecessor's post-commit free.
@@ -11641,15 +11702,21 @@ impl KvMetaBackend {
                     // The accounting: the delta's entries against the
                     // FULL head (the map-entry half; the blob custody
                     // transfer joins once the fresh key exists).
-                    let mut composed_refs = if self.block_refs.is_some() {
-                        Self::recompute_refs_against_map(
-                            &full_map,
-                            &delta.entries,
-                            refs_owner,
-                            block_refs,
-                        )
-                    } else {
-                        None
+                    let (mut composed_refs, composed_ram_only) = match self
+                        .block_refs
+                        .is_some()
+                        .then(|| {
+                            Self::recompute_refs_against_map(
+                                &full_map,
+                                &delta.entries,
+                                refs_owner,
+                                block_refs,
+                            )
+                        })
+                        .flatten()
+                    {
+                        Some(frame) => (Some(frame.ops), frame.ram_only_releases),
+                        None => (None, Vec::new()),
                     };
                     let mut composed = head;
                     composed.block_map = Some(full_map);
@@ -11677,6 +11744,7 @@ impl KvMetaBackend {
                             ))
                         })?);
                     refs_override = composed_refs;
+                    ram_only_releases = composed_ram_only;
                     use_delta = false;
                     staged_version = 0;
                     fresh_blob_guard = Some(guard);
@@ -11736,8 +11804,12 @@ impl KvMetaBackend {
                 // head), and this call would clobber it back to `None`
                 // (`decode_base_layout` refuses indirect heads).
                 if chain && self.block_refs.is_some() && !head_indirect {
-                    refs_override =
-                        Self::recompute_chained_refs(&cur, &delta.entries, refs_owner, block_refs);
+                    if let Some(frame) =
+                        Self::recompute_chained_refs(&cur, &delta.entries, refs_owner, block_refs)
+                    {
+                        refs_override = Some(frame.ops);
+                        ram_only_releases = frame.ram_only_releases;
+                    }
                     // The crossing's blob custody: ONE take for the
                     // fresh blob — no released twin (the displaced head
                     // was INLINE, not a blob).
@@ -11809,8 +11881,13 @@ impl KvMetaBackend {
         }
         // Finding 36: `refs_override` is `Some` exactly when the staged
         // accounting was RECOMPUTED (rung 19/20) — the released set's
-        // device frees belong to the serve's post-commit ladder.
-        let recomputed = refs_override.as_deref().map(Self::released_data_refs);
+        // device frees belong to the serve's post-commit ladder, the
+        // frame's RAM-only lifetimes included (finding 15).
+        let recomputed = refs_override.as_deref().map(|ops| {
+            let mut released = Self::released_data_refs(ops);
+            released.append(&mut ram_only_releases);
+            released
+        });
         Ok((use_delta, staged_version, recomputed))
     }
 

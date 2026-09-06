@@ -2304,6 +2304,9 @@ async fn a_fenced_co_writers_staged_flush_cleanup_abandons_quietly() {
     let abandons_before = METRICS
         .cowriter_unpublished_abandons
         .load(Ordering::Relaxed);
+    let recycles_before = METRICS
+        .cowriter_unpublished_recycles
+        .load(Ordering::Relaxed);
     let refusals_before = METRICS.cowriter_accounting_refusals.load(Ordering::Relaxed);
     nvme_dev::set_fail_next_writes(1);
     let res = h.fs.fsync(h.req, ino, 0, false).await;
@@ -2313,14 +2316,25 @@ async fn a_fenced_co_writers_staged_flush_cleanup_abandons_quietly() {
         "the injected DMA failure surfaces (never-lossy: the acked bytes keep \
          their staged custody behind the loud fsync error)"
     );
+    // Finding 15: on a LIVE laned co-writer the sanctioned arm RECYCLES the
+    // never-published mint into this mount's own lane free list (quiet,
+    // counted); the abandon gauge is the poisoned-era / foreign-lane face.
+    assert_eq!(
+        METRICS
+            .cowriter_unpublished_recycles
+            .load(Ordering::Relaxed)
+            - recycles_before,
+        1,
+        "the staged flush's never-published cleanup exits through the ONE \
+         sanctioned arm (quiet, counted — recycled into the lane's own supply)"
+    );
     assert_eq!(
         METRICS
             .cowriter_unpublished_abandons
             .load(Ordering::Relaxed)
             - abandons_before,
-        1,
-        "the staged flush's never-published cleanup exits through the ONE \
-         sanctioned abandon arm (quiet, counted)"
+        0,
+        "nothing is abandoned to the next derivation on a live co-writer"
     );
     assert_eq!(
         METRICS.cowriter_accounting_refusals.load(Ordering::Relaxed) - refusals_before,
@@ -2378,6 +2392,9 @@ async fn a_co_writers_staged_spill_cleanup_abandons_quietly() {
     let abandons_before = METRICS
         .cowriter_unpublished_abandons
         .load(Ordering::Relaxed);
+    let recycles_before = METRICS
+        .cowriter_unpublished_recycles
+        .load(Ordering::Relaxed);
     let refusals_before = METRICS.cowriter_accounting_refusals.load(Ordering::Relaxed);
     let spills_before = METRICS.staged_spill_escalations.load(Ordering::Relaxed);
     nvme_dev::set_fail_next_writes(1);
@@ -2393,14 +2410,24 @@ async fn a_co_writers_staged_spill_cleanup_abandons_quietly() {
         "engagement: the fold under a full ring must take the counted \
          durable-spill leg — otherwise this row tested nothing"
     );
+    // Finding 15: the live laned co-writer RECYCLES (see the flush leg
+    // above); the abandon gauge stays flat.
+    assert_eq!(
+        METRICS
+            .cowriter_unpublished_recycles
+            .load(Ordering::Relaxed)
+            - recycles_before,
+        1,
+        "the spill's never-published cleanup exits through the ONE sanctioned \
+         arm (quiet, counted — recycled into the lane's own supply)"
+    );
     assert_eq!(
         METRICS
             .cowriter_unpublished_abandons
             .load(Ordering::Relaxed)
             - abandons_before,
-        1,
-        "the spill's never-published cleanup exits through the ONE sanctioned \
-         abandon arm (quiet, counted)"
+        0,
+        "nothing is abandoned to the next derivation on a live co-writer"
     );
     assert_eq!(
         METRICS.cowriter_accounting_refusals.load(Ordering::Relaxed) - refusals_before,

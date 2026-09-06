@@ -1502,9 +1502,12 @@ squeezefs_ipc::sqz_task_local! {
     static AUTHORITY_FREE_SCOPE: ();
 }
 
-/// Run `fut` under the authority-accounting scope. The ONE caller is the
-/// shipped-free executor; nothing else may enter it (a second caller would
-/// be a bypass of the ownership-accounting gate, not a venue).
+/// Run `fut` under the authority-accounting scope. Its callers are the
+/// authority's own accounting acts performed while SERVING a peer — the
+/// shipped-free executor, the lane harvest, and the served compose's
+/// displaced-blob free (`multi_writer::indirect_map_io_for`); nothing else
+/// may enter it (another caller would be a bypass of the ownership-
+/// accounting gate, not a venue).
 pub async fn with_authority_accounting<F>(fut: F) -> F::Output
 where
     F: std::future::Future,
@@ -1578,6 +1581,17 @@ pub fn retire_displaced_locally(router: &crate::routing::BackendRouter, block_ke
             continue; // the local ladder's silent skip (unparsable key)
         };
         if let Some(alloc) = router.allocator_for_be_id(&parts.be_id) {
+            // Finding 15: a frame key whose lifetime stamp is DEAD names
+            // a prior lifetime of the offset — the authority freed it
+            // (a RAM-only release at an earlier save) and this mount has
+            // since re-minted it. The live lifetime's tracking is not
+            // this key's to release.
+            if parts.incarnation != crate::routing::INCARNATION_NONE {
+                let live = alloc.live_incarnation(parts.offset);
+                if live != crate::routing::INCARNATION_NONE && live != parts.incarnation {
+                    continue;
+                }
+            }
             alloc.release_shipped_free_tracking(parts.offset);
         }
     }
@@ -1890,17 +1904,32 @@ pub async fn execute_shipped_frees(
                     FreeVerdict::Refused
                 }
                 None => {
+                    let already = if alloc.free_list_contains(idx) {
+                        Some("already on the free list")
+                    } else if alloc.grace_holds(offset) {
+                        Some("held in the freed-offset grace ring")
+                    } else if alloc.is_quarantined(offset) {
+                        Some("quarantined under a dead custody epoch")
+                    } else if alloc.inflight_contains(offset) {
+                        Some("in flight (mid-reclaim or a live owner's unpublished mint)")
+                    } else {
+                        None
+                    };
                     if populations[slot] > 0 {
                         FreeVerdict::NonTerminal
-                    } else if alloc.free_list_contains(idx)
-                        || alloc.grace_holds(offset)
-                        || alloc.is_quarantined(offset)
-                        || alloc.inflight_contains(offset)
-                    {
+                    } else if let Some(why) = already {
                         // Already free (or owed to grace / a dead epoch /
                         // the reclaimer): the double-release lineage. The
                         // UNSEEDED ladder refuses it on the existing
-                        // untracked tripwire — never a second free.
+                        // untracked tripwire — never a second free. The
+                        // class is named HERE (the tripwire's own line
+                        // cannot tell them apart): a refusal storm of one
+                        // class is a duplicate free ISSUER on the shipper.
+                        log::error!(
+                            "S9: shipped free of block {idx} (vol_tag {vol_tag:#016x}) names an \
+                             offset this authority tracks no reference for and that is {why} — \
+                             the double-release lineage; refused (block_untracked_free_refusals)"
+                        );
                         backend.free_block(&key).await?;
                         FreeVerdict::Refused
                     } else {
@@ -2188,6 +2217,7 @@ pub fn stats_json() -> serde_json::Value {
         "admission_refusals": METRICS.cowriter_admission_refusals.load(Ordering::Relaxed),
         "accounting_refusals": METRICS.cowriter_accounting_refusals.load(Ordering::Relaxed),
         "unpublished_abandons": METRICS.cowriter_unpublished_abandons.load(Ordering::Relaxed),
+        "unpublished_recycles": METRICS.cowriter_unpublished_recycles.load(Ordering::Relaxed),
         "local_commit_refusals": METRICS.cowriter_local_commit_refusals.load(Ordering::Relaxed),
         "custody_endpoint": declared_authority().unwrap_or_else(|| "none".to_string()),
     })

@@ -250,6 +250,64 @@ impl BlockRefOp {
     }
 }
 
+/// **The caller frame's RAM-only lifetimes** (finding 15's supply leak,
+/// `.benchmarks/2026-09-06-cowriter-free-refcount-leak.md`): the DATA
+/// blocks a publish frame both TAKES and RELEASES — a binding minted,
+/// bound in RAM, displaced by a later durable merge and never persisted in
+/// between (an epoch-fed overlay dest superseded by a write-through, a
+/// same-epoch re-record's parked prior key). An owner-side recompute
+/// replaces the frame with the head→composed diff, and that diff cannot
+/// name a block NEITHER map ever held — so without this walk the frame
+/// stands down (`recomputed`), the recompute frees only the head's
+/// binding, and the RAM-only block is freed by nobody: not referenced, on
+/// no free list, gone from the lane's recycle supply until an ownership
+/// recovery walk (which a co-writer never runs).
+///
+/// Returns the frame's net-zero blocks (≥ 1 take, takes == releases, in
+/// first-appearance order, deduped) that the recomputed op set does not
+/// already name — the recompute's own release of a head-named block is
+/// its business, and a block it TAKES is live. Map-blob custody is
+/// excluded (the displaced-blob post-commit arm owns it). The caller still
+/// filters out anything the head or the composed map names (a skewed frame
+/// can re-take a durable block — see `recompute_refs_against_map`).
+pub fn frame_ram_only_candidates(
+    caller: &[BlockRefOp],
+    recomputed: &[BlockRefOp],
+) -> Vec<BlockRef> {
+    let mut order: Vec<(u64, u64)> = Vec::new();
+    let mut tally: std::collections::HashMap<(u64, u64), (u32, u32, BlockRef)> =
+        std::collections::HashMap::new();
+    for op in caller {
+        if op.reference.is_map_blob() {
+            continue;
+        }
+        let id = (op.reference.vol_tag, op.reference.block_idx);
+        let slot = tally.entry(id).or_insert_with(|| {
+            order.push(id);
+            (0, 0, op.reference)
+        });
+        if op.take {
+            slot.0 += 1;
+        } else {
+            slot.1 += 1;
+        }
+    }
+    if order.is_empty() {
+        return Vec::new();
+    }
+    let named: std::collections::HashSet<(u64, u64)> = recomputed
+        .iter()
+        .map(|o| (o.reference.vol_tag, o.reference.block_idx))
+        .collect();
+    order
+        .into_iter()
+        .filter_map(|id| {
+            let (takes, releases, reference) = tally[&id];
+            (takes >= 1 && takes == releases && !named.contains(&id)).then_some(reference)
+        })
+        .collect()
+}
+
 /// Build a reference key (big-endian composite, §4.2 key discipline).
 pub fn block_ref_key(
     vol_tag: u64,

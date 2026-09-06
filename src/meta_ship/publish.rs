@@ -1026,6 +1026,7 @@ static REPLAYS: AtomicU64 = AtomicU64::new(0);
 // shipped mount by construction — nothing installs the verb's halves).
 static FREE_SHIPPED_BLOCKS: AtomicU64 = AtomicU64::new(0);
 static FREE_SERVED_BLOCKS: AtomicU64 = AtomicU64::new(0);
+static FREE_REFUSED_BLOCKS: AtomicU64 = AtomicU64::new(0);
 static FREE_RECOMPUTED_BLOCKS: AtomicU64 = AtomicU64::new(0);
 static FREE_REPLAYS: AtomicU64 = AtomicU64::new(0);
 static FREE_STALE_REFUSALS: AtomicU64 = AtomicU64::new(0);
@@ -1131,6 +1132,15 @@ pub struct PublishStats {
     /// `Freed` verdicts only, so shipped − served − non-terminal − refused
     /// closes per row.
     pub free_served_blocks: u64,
+    /// Shipped frees this owner answered `Refused` — the double-release
+    /// lineage (the block was already free, graced, quarantined,
+    /// mid-reclaim, or names a dead lifetime of a reallocated offset). The
+    /// owner-side face of the shipper's refusal log: `served + refused +
+    /// non-terminal ≡ the peers' shipped`, and a stream of it beside a
+    /// healthy rewrite is a duplicate free ISSUER on some peer, never a
+    /// leak (the refusal is the leak-safe arm) — finding 15's blob-reclaim
+    /// storm was 3,448 of these against 3,914 served.
+    pub free_refused_blocks: u64,
     /// Finding 36 (owner side): recompute-released device frees — blocks a
     /// served chained/composed merge's rung-19/20 recompute RELEASED whose
     /// terminal ladder ran on this authority post-commit (`Freed` verdicts
@@ -1256,6 +1266,7 @@ pub fn stats() -> PublishStats {
         replays: REPLAYS.load(Ordering::Relaxed),
         free_shipped_blocks: FREE_SHIPPED_BLOCKS.load(Ordering::Relaxed),
         free_served_blocks: FREE_SERVED_BLOCKS.load(Ordering::Relaxed),
+        free_refused_blocks: FREE_REFUSED_BLOCKS.load(Ordering::Relaxed),
         free_recomputed_blocks: FREE_RECOMPUTED_BLOCKS.load(Ordering::Relaxed),
         free_replays: FREE_REPLAYS.load(Ordering::Relaxed),
         free_stale_refusals: FREE_STALE_REFUSALS.load(Ordering::Relaxed),
@@ -1302,6 +1313,7 @@ pub fn stats_json() -> serde_json::Value {
         "replays": s.replays,
         "free_shipped_blocks": s.free_shipped_blocks,
         "free_served_blocks": s.free_served_blocks,
+        "free_refused_blocks": s.free_refused_blocks,
         "free_recomputed_blocks": s.free_recomputed_blocks,
         "free_replays": s.free_replays,
         "free_stale_refusals": s.free_stale_refusals,
@@ -3329,6 +3341,17 @@ struct ScopedBlobCustody {
     free_after_commit: Vec<String>,
 }
 
+/// The custody-scoped compose's verdict (`custody_scoped_layout`): the
+/// layout to stage, the recomputed accounting (`None` on every verbatim
+/// arm), the caller frame's RAM-only lifetimes (finding 15 — freed with the
+/// released set, staged nowhere) and the compose's blob custody.
+struct ScopedLayout {
+    layout: Vec<u8>,
+    recomputed: Option<Vec<BlockRefOp>>,
+    ram_only_releases: Vec<crate::meta_backend::kv::block_refs::BlockRef>,
+    blob_custody: ScopedBlobCustody,
+}
+
 /// What a SetLayoutAndSize serve's commit outcome must settle (D-1c — the
 /// FINISH half's input; see [`PublishService::finish_layout_publish`]).
 struct LayoutPostCommit {
@@ -4193,6 +4216,13 @@ impl PublishService {
                                 .count() as u64,
                             Ordering::Relaxed,
                         );
+                        FREE_REFUSED_BLOCKS.fetch_add(
+                            verdicts
+                                .iter()
+                                .filter(|v| **v == FreeVerdict::Refused)
+                                .count() as u64,
+                            Ordering::Relaxed,
+                        );
                         Ok(verdicts)
                     }
                     Ok(Err(e)) => Err(WireError::from_error(&e)),
@@ -4843,9 +4873,15 @@ impl PublishService {
         ino: u64,
         shipped: Vec<u8>,
         claims: &[BlockRefOp],
-    ) -> Result<(Vec<u8>, Option<Vec<BlockRefOp>>, ScopedBlobCustody)> {
+    ) -> Result<ScopedLayout> {
+        let verbatim = |shipped: Vec<u8>| ScopedLayout {
+            layout: shipped,
+            recomputed: None,
+            ram_only_releases: Vec::new(),
+            blob_custody: ScopedBlobCustody::default(),
+        };
         let Some(owner) = crate::data_grant::custody_owner() else {
-            return Ok((shipped, None, ScopedBlobCustody::default()));
+            return Ok(verbatim(shipped));
         };
         // Finding 35 (second half): the sticky range-episode predicate.
         // A WHOLE-FILE holder's Put was "fully authoritative" (verbatim)
@@ -4895,7 +4931,7 @@ impl PublishService {
                      releasing range custody (unscoped_put_refusals)"
                 )));
             }
-            _ => return Ok((shipped, None, ScopedBlobCustody::default())),
+            _ => return Ok(verbatim(shipped)),
         };
         let block = match owner.geometry_of(ino).await {
             Some((_size, block)) if block > 0 => block,
@@ -4918,7 +4954,7 @@ impl PublishService {
         let durable = match self.inner.getxattr(ino, "layout").await {
             Ok(Some(bytes)) => bytes,
             // no current layout — first Put, verbatim
-            _ => return Ok((shipped, None, ScopedBlobCustody::default())),
+            _ => return Ok(verbatim(shipped)),
         };
         let (cur_dec, new_dec) = (
             crate::layout_wire::decode_base_layout(&durable),
@@ -5005,7 +5041,7 @@ impl PublishService {
                 Ok(c) => c,
                 Err(_) if shipped_indirect => return Err(mixed_refusal("durable")),
                 // JSON-era/undecodable base: the legacy verbatim arm.
-                Err(_) => return Ok((shipped, None, ScopedBlobCustody::default())),
+                Err(_) => return Ok(verbatim(shipped)),
             }
         };
         let mut new = if shipped_indirect {
@@ -5015,7 +5051,7 @@ impl PublishService {
                 Ok(n) => n,
                 Err(_) if durable_indirect => return Err(mixed_refusal("shipped")),
                 // JSON-era/undecodable base: the legacy verbatim arm.
-                Err(_) => return Ok((shipped, None, ScopedBlobCustody::default())),
+                Err(_) => return Ok(verbatim(shipped)),
             }
         };
         let mut map = cur.block_map.take().unwrap_or_default();
@@ -5114,8 +5150,29 @@ impl PublishService {
                     resolve(prev, *b, false, &mut out);
                 }
             }
-            out
+            // Finding 15: the caller frame's RAM-only lifetimes — blocks
+            // it took AND released inside this frame that neither the
+            // head nor the composed map names (see the kv backend's
+            // `recompute_refs_against_map`, the same law on the merge
+            // arms). The head's keys resolve only when a candidate exists.
+            let mut ram_only =
+                crate::meta_backend::kv::block_refs::frame_ram_only_candidates(claims, &out);
+            if !ram_only.is_empty() {
+                let mut named: std::collections::HashSet<(u64, u64)> =
+                    std::collections::HashSet::new();
+                for (b, k) in head.iter().chain(map.iter()) {
+                    if let Some(r) = resolver(k, ino, *b) {
+                        named.insert((r.vol_tag, r.block_idx));
+                    }
+                }
+                ram_only.retain(|r| !named.contains(&(r.vol_tag, r.block_idx)));
+            }
+            (out, ram_only)
         });
+        let (refs, ram_only_releases) = match refs {
+            Some((ops, ram_only)) => (Some(ops), ram_only),
+            None => (None, Vec::new()),
+        };
         // Non-map fields follow the Put (same layout class); size never
         // regresses a peer's growth (truncation is the setattr plane's).
         new.size = new.size.max(cur.size);
@@ -5188,7 +5245,12 @@ impl PublishService {
             crate::fuse_client::METRICS
                 .publish_blob_composes
                 .fetch_add(1, Ordering::Relaxed);
-            return Ok((encoded, refs, blob_custody));
+            return Ok(ScopedLayout {
+                layout: encoded,
+                recomputed: refs,
+                ram_only_releases,
+                blob_custody,
+            });
         }
         // Scoped or not at all (rung 18): a re-encode failure refuses —
         // the retired fallback applied the shipped Put verbatim, which is
@@ -5244,9 +5306,19 @@ impl PublishService {
             crate::fuse_client::METRICS
                 .publish_compose_spills
                 .fetch_add(1, Ordering::Relaxed);
-            return Ok((encoded, refs, blob_custody));
+            return Ok(ScopedLayout {
+                layout: encoded,
+                recomputed: refs,
+                ram_only_releases,
+                blob_custody,
+            });
         }
-        Ok((encoded, refs, blob_custody))
+        Ok(ScopedLayout {
+            layout: encoded,
+            recomputed: refs,
+            ram_only_releases,
+            blob_custody,
+        })
     }
 
     /// The SetLayoutAndSize serve's PREPARE half (D-1c): everything before
@@ -5274,7 +5346,12 @@ impl PublishService {
         {
             return Ok(LayoutPrepare::Done(reply));
         }
-        let (layout, recomputed, blob_custody) = self
+        let ScopedLayout {
+            layout,
+            recomputed,
+            mut ram_only_releases,
+            blob_custody,
+        } = self
             .custody_scoped_layout(client, ino, layout, &refs)
             .await?;
         // Rung 19: on the SCOPED arm the accounting is the composition's
@@ -5298,6 +5375,9 @@ impl PublishService {
                     .filter(|o| !o.take && !o.reference.is_map_blob())
                     .map(|o| o.reference)
                     .collect();
+                // Finding 15: the frame's RAM-only lifetimes ride the
+                // same post-commit ladder (staged nowhere).
+                released_data.append(&mut ram_only_releases);
                 if !blob_custody.drop_caller_blob_ops {
                     r.extend(refs.iter().filter(|o| o.reference.is_map_blob()).copied());
                 }

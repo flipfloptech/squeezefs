@@ -4141,6 +4141,21 @@ pub struct DataRouterInner {
     /// custody inos and empty on every solo/authority mount by
     /// construction.
     pub(crate) publish_recomputed: std::sync::Arc<scc::HashMap<u64, ()>>,
+    /// Finding 15 (the blob-reclaim refusal storm): per ino, the own-mint
+    /// map blob whose reclaim this mount has ALREADY issued — a lineage
+    /// closes exactly once. The reclaim funnel (`reclaim_own_mint_blob`)
+    /// consults it, and the insert chokepoint clears a re-inserted stale
+    /// clone's `own_mint` bit when it names the closed lineage (a merge
+    /// that cloned the entry before a lock-free release-hook discard and
+    /// re-published it after: every later discard/replace re-armed the
+    /// same blob's free — the fleet's ~7 reclaims per own-mint save, one
+    /// accepted, the rest refused on the untracked tripwire). One slot per
+    /// ino: the get→insert pairs run under `INODE_META_LOCKS`, as does the
+    /// save that mints the successor, so a clone is never more than one
+    /// lineage behind. Bounded by the range-episode inos this co-writer
+    /// ever spilled (the sticky episode set's own class); empty on every
+    /// solo/authority mount by construction.
+    pub(crate) reclaimed_own_mints: std::sync::Arc<scc::HashMap<u64, std::sync::Arc<str>>>,
     /// PR 6a (design §12 option b — the honest write-map cap): the
     /// write-active kvmap inos and their estimated RAM map bytes. Upserted
     /// at the ONE map-mutation seam (`merge_block_mappings*`, the §5.3
@@ -6544,6 +6559,12 @@ impl DataRouter {
                         .as_deref()
                         .and_then(|id| id.strip_prefix("indirect:"))
                     {
+                        if !self.note_own_mint_reclaimed(ino, key) {
+                            METRICS
+                                .publish_blob_orphan_reclaim_dedups
+                                .fetch_add(1, Ordering::Relaxed);
+                            return;
+                        }
                         let key = key.to_string();
                         let br = std::sync::Arc::clone(&self.backend_router);
                         // f33b: the mint's LEDGER record may have committed
@@ -6607,15 +6628,55 @@ impl DataRouter {
         }
     }
 
+    /// Finding 15: record that `ino`'s own-mint blob `key` has its reclaim
+    /// issued (or is about to be freed by the save tail that displaced it).
+    /// `false` ⇔ the lineage was already closed — the caller must not
+    /// issue a second free.
+    fn note_own_mint_reclaimed(&self, ino: u64, key: &str) -> bool {
+        match self.inner.reclaimed_own_mints.entry_sync(ino) {
+            scc::hash_map::Entry::Occupied(mut occ) => {
+                if occ.get().as_ref() == key {
+                    return false;
+                }
+                *occ.get_mut() = std::sync::Arc::from(key);
+                true
+            }
+            scc::hash_map::Entry::Vacant(vac) => {
+                let _ = vac.insert_entry(std::sync::Arc::from(key));
+                true
+            }
+        }
+    }
+
+    /// Finding 15: `true` ⇔ `m` names an own-mint blob whose lineage this
+    /// mount already closed (a stale clone re-inserted after the reclaim).
+    fn names_closed_own_mint(&self, ino: u64, m: &CachedMetadata) -> bool {
+        m.block_map_id_own_mint
+            && m.block_map_id
+                .as_deref()
+                .and_then(|id| id.strip_prefix("indirect:"))
+                .is_some_and(|key| {
+                    self.inner
+                        .reclaimed_own_mints
+                        .read_sync(&ino, |_, closed| closed.as_ref() == key)
+                        .unwrap_or(false)
+                })
+    }
+
     /// Finding 35c: the layout-entry INSERT chokepoint — a replacing
     /// insert whose new entry names a DIFFERENT map blob reclaims the
     /// old entry's own mint first (same-key re-inserts and non-mint
-    /// entries pass straight through: one peek).
-    pub fn publish_layout_cache_entry(&self, ino: u64, m: CachedMetadata) {
+    /// entries pass straight through: one peek). Finding 15: an entry
+    /// naming a lineage this mount already closed is inserted with its
+    /// `own_mint` bit CLEARED, so it can never re-arm the blob's free.
+    pub fn publish_layout_cache_entry(&self, ino: u64, mut m: CachedMetadata) {
         if let Some(old) = self.metadata_cache.get(&ino) {
             if old.block_map_id_own_mint && old.block_map_id != m.block_map_id {
                 self.reclaim_own_mint_blob(ino, &old, "replacing insert");
             }
+        }
+        if self.names_closed_own_mint(ino, &m) {
+            m.block_map_id_own_mint = false;
         }
         self.metadata_cache.insert(ino, m);
     }
@@ -6988,7 +7049,7 @@ impl DataRouter {
                 .is_some_and(|be| crate::meta_ship::publish::publishes_locally(be, ino));
         if episode_compose {
             let _serve_window = crate::meta_ship::publish::hold_serve_window(ino).await;
-            if let Some((composed, swap_refs)) =
+            if let Some((composed, swap_refs, mut ram_only)) =
                 self.compose_episode_save(ino, m, block_refs).await?
             {
                 // Finding 36b (the authority-local arm): the episode
@@ -6996,12 +7057,14 @@ impl DataRouter {
                 // data blocks (a co-writer's mints included, which the
                 // local ladder cannot free unseeded) travel up for the
                 // post-guard shipped-free ladder, and the caller's
-                // frame-derived stream stands down.
-                let released: Vec<crate::meta_backend::kv::block_refs::BlockRef> = swap_refs
+                // frame-derived stream stands down. Finding 15: the
+                // claims' RAM-only lifetimes ride the same set.
+                let mut released: Vec<crate::meta_backend::kv::block_refs::BlockRef> = swap_refs
                     .iter()
                     .filter(|o| !o.take && !o.reference.is_map_blob())
                     .map(|o| o.reference)
                     .collect();
+                released.append(&mut ram_only);
                 // publish_entries = None: the composed map is full-save
                 // class BY LAW (the swap diff is exact against the whole
                 // head; a delta would re-stage the caller's claim list).
@@ -7054,6 +7117,7 @@ impl DataRouter {
         Option<(
             CachedMetadata,
             Vec<crate::meta_backend::kv::block_refs::BlockRefOp>,
+            Vec<crate::meta_backend::kv::block_refs::BlockRef>,
         )>,
     > {
         let Some((head_map, head_map_id, head_size)) = self.fetch_durable_layout_head(ino).await?
@@ -7096,6 +7160,22 @@ impl DataRouter {
             }
         }
         let swap_refs = self.block_ref_ops_for_map_swap(ino, Some(&head_map), Some(&composed));
+        // Finding 15: the claims' RAM-only lifetimes — taken and released
+        // inside this frame, named by neither the head nor the composed
+        // map — which the swap diff cannot release; they ride the
+        // released set to the post-guard free ladder (the kv backend's
+        // `recompute_refs_against_map` law, on the local arm).
+        let mut ram_only =
+            crate::meta_backend::kv::block_refs::frame_ram_only_candidates(&claims, &swap_refs);
+        if !ram_only.is_empty() {
+            let mut named: std::collections::HashSet<(u64, u64)> = std::collections::HashSet::new();
+            for (b, k) in head_map.iter().chain(composed.iter()) {
+                if let Some(r) = self.backend_router.block_ref_for(k, ino, *b) {
+                    named.insert((r.vol_tag, r.block_idx));
+                }
+            }
+            ram_only.retain(|r| !named.contains(&(r.vol_tag, r.block_idx)));
+        }
         let mut mc = m.clone();
         mc.block_map = Some(std::sync::Arc::new(composed));
         // The durable predecessor is what this commit stops naming — the
@@ -7116,7 +7196,7 @@ impl DataRouter {
         };
         // The composed head is full-save class: chain provenance resets.
         mc.layout_version = 0;
-        Ok(Some((mc, swap_refs)))
+        Ok(Some((mc, swap_refs, ram_only)))
     }
 
     /// Finding 35b: the DURABLE layout head — map, out-of-band map id and
@@ -8710,6 +8790,16 @@ impl DataRouter {
         // save minted the head's blob (the one mint site). A collapsed
         // (inline) head clears it; a kept foreign head keeps it false.
         cached.block_map_id_own_mint = new_indirect_key.is_some();
+        // Finding 15: when THIS save frees its own-mint predecessor (the
+        // tail below), that lineage is closed — the replacing insert's
+        // reclaim arm and every later stale-clone discard must not free
+        // it again (the second free came back `Refused` on the
+        // authority's untracked tripwire, one per re-arm).
+        if let Some(ref old_key) = old_indirect_to_free {
+            if m.block_map_id_own_mint && crate::fuse_client::co_writer_mount() {
+                self.note_own_mint_reclaimed(ino, old_key);
+            }
+        }
         self.publish_layout_cache_entry(ino, cached);
 
         if let Some(ref old_key) = old_indirect_to_free {
@@ -8897,6 +8987,7 @@ impl DataRouter {
                 rewrite_epochs: std::sync::Arc::new(scc::HashMap::new()),
                 epoch_sweeper_armed: std::sync::atomic::AtomicBool::new(false),
                 publish_recomputed: std::sync::Arc::new(scc::HashMap::new()),
+                reclaimed_own_mints: std::sync::Arc::new(scc::HashMap::new()),
                 kvmap_write_maps: std::sync::Arc::new(scc::HashMap::new()),
                 kvmap_sweep_corpses: std::sync::Arc::new(scc::HashMap::new()),
                 kvmap_overlays: std::sync::Arc::new(scc::HashMap::new()),

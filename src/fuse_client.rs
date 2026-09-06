@@ -6377,6 +6377,13 @@ pub struct Metrics {
     /// growth on a healthy co-writer means an upload path keeps failing
     /// its publishes.
     pub cowriter_unpublished_abandons: Align64<AtomicU64>,
+    /// Finding 15: never-published mints a LIVE co-writer returned to its
+    /// OWN lane free list instead of abandoning (the superseded overlay
+    /// destination, a failed-publish upload — no ledger anywhere ever
+    /// named them). The healthy-co-writer twin of
+    /// `cowriter_unpublished_abandons`, which now grows only around custody
+    /// loss or on an offset outside this mount's lanes.
+    pub cowriter_unpublished_recycles: Align64<AtomicU64>,
     /// LOCAL metadata commits refused on a co-writer — the mutations that
     /// reached the backend's write gate instead of the shipped publish
     /// path. **Should stay 0 on a healthy co-writer**: a nonzero value
@@ -6657,6 +6664,12 @@ pub struct Metrics {
     /// one finding). Growth tracks invalidation churn on range-shared
     /// co-writers; the leak face is `fsck` C2 staying 0.
     pub publish_blob_orphan_reclaims: Align64<AtomicU64>,
+    /// Finding 15: own-mint blob reclaims the router DECLINED because the
+    /// lineage was already closed (a stale clone of a reclaimed entry
+    /// re-inserted and discarded again). Growth is the re-arm shape being
+    /// caught; before it, every one of these shipped a free the authority
+    /// refused (the fleet's `block_untracked_free_refusals` storm).
+    pub publish_blob_orphan_reclaim_dedups: Align64<AtomicU64>,
     /// Finding 28: caller map entries DROPPED by the served publish's
     /// binding probe — the entry's stamped incarnation was DEAD (the
     /// offset freed and re-minted after the arbiter's fold displaced the
@@ -11266,6 +11279,7 @@ impl SqueezefsFilesystem {
                 "publish_compose_spills": METRICS.publish_compose_spills.load(Ordering::Relaxed),
                 "publish_blob_foreign_free_skips": METRICS.publish_blob_foreign_free_skips.load(Ordering::Relaxed),
                 "publish_blob_orphan_reclaims": METRICS.publish_blob_orphan_reclaims.load(Ordering::Relaxed),
+                "publish_blob_orphan_reclaim_dedups": METRICS.publish_blob_orphan_reclaim_dedups.load(Ordering::Relaxed),
                 "publish_stale_binding_drops": METRICS.publish_stale_binding_drops.load(Ordering::Relaxed),
                 "layout_delta_commits": crate::meta_backend::kv::META_KV_LAYOUT_DELTA_COMMITS.load(Ordering::Relaxed),
                 "layout_full_commits": crate::meta_backend::kv::META_KV_LAYOUT_FULL_COMMITS.load(Ordering::Relaxed),

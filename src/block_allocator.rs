@@ -2932,10 +2932,55 @@ impl BlockAllocator {
     /// tripwire. Never wire the HAPPY displaced-free path through this —
     /// published keys ship via
     /// [`crate::cowriter::ship_displaced_frees`].
+    ///
+    /// **Finding 15 (the recycle arm):** on a LIVE co-writer whose engaged
+    /// lane OWNS the offset, a never-published mint goes straight back to
+    /// this mount's own free list. Nothing durable ever named it, so no
+    /// ledger on any node moves — the act is the co-writer's private view
+    /// of its own lane supply, exactly what [`Self::adopt_lane_free_grant`]
+    /// performs for a harvested offset — and the next allocation serves it
+    /// with the full claim discipline (fresh refcount, fresh lifetime
+    /// stamp). Before it, every superseded overlay destination and every
+    /// failed-publish upload on a healthy co-writer was "abandoned to the
+    /// next derivation" — one block per event gone from the lane until a
+    /// remount, a steady leak on a fleet that never remounts (counted
+    /// `cowriter_unpublished_recycles`). The quiet abandon stays for the
+    /// shapes it was built for: a poisoned/fenced custody era (the
+    /// 2026-08-19 post-fence storm) and an offset outside this mount's
+    /// lanes.
     pub async fn abandon_unpublished_offset(&self, offset: u64) -> Result<()> {
         if crate::fuse_client::co_writer_mount()
             && !crate::cowriter::authority_accounting_scope_active()
         {
+            let idx = offset / self.chunk_size;
+            if self.lanes.get().is_some()
+                && self.lane_is_ours(idx)
+                && !crate::data_custody::poisoned()
+            {
+                let _ = self.refcounts.remove_sync(&offset);
+                self.mark_incarnation_unstable(offset);
+                if self.free_blocks.insert(idx) {
+                    crate::fuse_client::METRICS
+                        .cowriter_unpublished_recycles
+                        .fetch_add(1, Ordering::Relaxed);
+                    log::debug!(
+                        "co-writer recycle: never-published offset {offset} on volume '{}' back \
+                         on this mount's own lane free list",
+                        self._volume_id
+                    );
+                } else {
+                    log::error!(
+                        "co-writer recycle REFUSED: never-published offset {offset} on volume \
+                         '{}' is already on this mount's free list — the double-handout lineage \
+                         (cowriter_unpublished_abandons)",
+                        self._volume_id
+                    );
+                    crate::fuse_client::METRICS
+                        .cowriter_unpublished_abandons
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+                return Ok(());
+            }
             crate::fuse_client::METRICS
                 .cowriter_unpublished_abandons
                 .fetch_add(1, Ordering::Relaxed);

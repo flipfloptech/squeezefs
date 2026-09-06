@@ -287,7 +287,7 @@ pub fn router_range_geometry(
 ///   strictly post-commit); failure is a warn, never an error — the
 ///   ledger already released the reference, and `trim --full`/remount
 ///   derivation reclaims stragglers.
-fn indirect_map_io_for(
+pub fn indirect_map_io_for(
     backend: Arc<crate::routing::BackendRouter>,
 ) -> crate::meta_backend::kv::indirect_map::IndirectMapIo {
     use crate::meta_backend::kv::indirect_map::{IndirectBlobGuard, IndirectMapIo};
@@ -372,7 +372,17 @@ fn indirect_map_io_for(
         move |key: String| -> Pin<Box<dyn Future<Output = ()> + Send>> {
             let router = Arc::clone(&free_router);
             Box::pin(async move {
-                if let Err(e) = router.free_block(&key).await {
+                // The displaced blob is THIS authority's own lifecycle
+                // (its compose minted it), so the free is the authority's
+                // accounting act wherever the serve runs — the same scope
+                // the shipped-free executor enters. Without it a process
+                // whose posture latch reads co-writer (a partial authority
+                // serving its own volumes; a one-process venue) SHIPPED
+                // its own blob's free to the set authority, which refused
+                // it on the live-free shield, and the blob leaked.
+                let freed =
+                    crate::cowriter::with_authority_accounting(router.free_block(&key)).await;
+                if let Err(e) = freed {
                     log::warn!(
                         "rung 20: freeing displaced indirect map blob '{key}' failed ({e}) — \
                          the ledger already released it; trim --full / remount derivation \

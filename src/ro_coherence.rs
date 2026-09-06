@@ -66,7 +66,7 @@
 //! states both postures to operators in these terms. Do not describe an S5
 //! reader as "coherent" without saying which of the two it is.
 
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -74,6 +74,129 @@ use crate::cache::TieredCache;
 use crate::meta_backend::kv::backend::{KvMetaBackend, ReadOnlyCause};
 use crate::meta_backend::kv::node_cache::EpochPurgeSink;
 use crate::meta_backend::kv::revalidate::RevalidationPoller;
+
+// ---------------------------------------------------------------------------
+// The reader's purge GENERATION — the epoch-step stamp on the layout cache
+// (ladder re-derivation item 2, 2026-09-06 —
+// `.benchmarks/2026-09-06-free-grace-ladder-rederivation.md`)
+// ---------------------------------------------------------------------------
+
+/// The reader's purge generation: bumped once per epoch step, AFTER that
+/// volume's root adoption, drop pass and R-6 purge ([`ReaderEpochPurge`]).
+/// Every layout-cache entry is stamped with the generation read BEFORE its
+/// backend read ([`crate::routing::CachedMetadata::reader_step_gen`]), and
+/// an entry stamped below the current generation is a MISS
+/// ([`layout_entry_pre_step`]) — so no daemon cache can serve a
+/// pre-step binding after the step, and the acknowledgement ladder's drain
+/// no longer has to wait out the caches' TTL (`S`).
+///
+/// Never advances on a mount that revalidates nothing (a plain writer):
+/// every entry there is stamped 0 and the gate is `0 < 0`, false — one
+/// relaxed load and a compare, no behaviour change.
+///
+/// Ordering: the bump is `SeqCst` and the fetch-side capture is `Acquire`.
+/// A fetch whose capture read the bumped value synchronizes with the bump,
+/// which is sequenced after the root adoption, so its KV read sees the
+/// adopted roots (stamped new, content new); a fetch that read the old
+/// value is stamped old and misses after the bump regardless of what its
+/// read saw. Either way a pre-step binding never carries a post-step stamp.
+static READER_STEP_GEN: AtomicU64 = AtomicU64::new(0);
+
+/// Layout-cache entries the step gate refused (`reader_layout_step_misses`
+/// — item 2's engagement: each is one re-resolve a TTL would have deferred).
+static LAYOUT_STEP_MISSES: AtomicU64 = AtomicU64::new(0);
+
+/// The generation to STAMP a layout-cache entry with — read at the start
+/// of the entry's backend resolution, never after it (a step landing
+/// mid-read would otherwise give pre-step content a post-step stamp).
+#[inline]
+pub fn reader_step_generation() -> u64 {
+    READER_STEP_GEN.load(Ordering::Acquire)
+}
+
+/// The gate: `true` ⇔ an entry stamped `stamped_gen` predates the last
+/// epoch step and may not be served (the lever on). One relaxed load and a
+/// compare on the read hot path; the gate's own cost when unarmed is that
+/// load against a generation that never moved.
+#[inline]
+pub fn layout_entry_pre_step(stamped_gen: u64) -> bool {
+    if stamped_gen >= READER_STEP_GEN.load(Ordering::Relaxed) {
+        return false;
+    }
+    if !drain_epoch_stamp_enabled() {
+        return false;
+    }
+    LAYOUT_STEP_MISSES.fetch_add(1, Ordering::Relaxed);
+    true
+}
+
+/// `reader_layout_step_gen` (the generation; 0 on every mount that never
+/// stepped an epoch).
+pub fn reader_layout_step_gen() -> u64 {
+    READER_STEP_GEN.load(Ordering::Relaxed)
+}
+
+/// `reader_layout_step_misses`.
+pub fn reader_layout_step_misses() -> u64 {
+    LAYOUT_STEP_MISSES.load(Ordering::Relaxed)
+}
+
+/// The epoch step's bump — the purge sink's last act, after that volume's
+/// root adoption, drop pass and block-key purge.
+fn note_reader_epoch_step() {
+    READER_STEP_GEN.fetch_add(1, Ordering::SeqCst);
+}
+
+/// Test seam: an epoch step without a volume (the loop model and the
+/// cache-gate contracts).
+pub fn test_note_epoch_step() {
+    note_reader_epoch_step();
+}
+
+/// The `SQUEEZEFS_FREE_GRACE_DRAIN_EPOCH_STAMP` lever's latch (the
+/// `free_grace::ACK_PIPELINE` pattern): item 2 — the layout-cache step
+/// gate is live and the ladder's drain drops its `S` term. `0` = the
+/// caches serve to their TTL and the drain keeps `S` (the pre-change
+/// shape verbatim; the generation keeps counting — the instrument is not
+/// the mechanism).
+static DRAIN_EPOCH_STAMP: AtomicU8 = AtomicU8::new(0);
+
+pub fn drain_epoch_stamp_enabled() -> bool {
+    match DRAIN_EPOCH_STAMP.load(Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            let on = crate::env_knobs::bool_knob("SQUEEZEFS_FREE_GRACE_DRAIN_EPOCH_STAMP", true);
+            DRAIN_EPOCH_STAMP.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+            on
+        }
+    }
+}
+
+/// Test seam (the `free_grace::test_set_ack_pipeline` shape).
+pub fn test_set_drain_epoch_stamp(on: Option<bool>) {
+    DRAIN_EPOCH_STAMP.store(
+        match on {
+            Some(true) => 1,
+            Some(false) => 2,
+            None => 0,
+        },
+        Ordering::Relaxed,
+    );
+}
+
+/// Test seam: `true` ⇔ a preset was in force.
+pub fn test_clear_drain_epoch_stamp() -> bool {
+    DRAIN_EPOCH_STAMP.swap(0, Ordering::Relaxed) != 0
+}
+
+/// Test seam: return the generation and the gate's gauges to a fresh
+/// mount's (`free_grace::reset_for_test` calls it).
+pub fn reset_for_test() {
+    READER_STEP_GEN.store(0, Ordering::SeqCst);
+    LAYOUT_STEP_MISSES.store(0, Ordering::Relaxed);
+    test_set_drain_epoch_stamp(None);
+}
 
 /// The reader's poll cadence — the landed derivation
 /// (`revalidate::resolve_revalidate_interval_ms`: `max(writer flush
@@ -174,9 +297,15 @@ impl ReaderEpochPurge {
 impl EpochPurgeSink for ReaderEpochPurge {
     fn on_epoch_advance(&self, from_epoch: u64, to_epoch: u64) -> u64 {
         let purged = purge_reader_block_keys(&self.router.cache);
+        // Item 2: the step's LAST act — after this volume's root adoption
+        // (the node cache's `publish`, before this sink runs), its drop
+        // pass and the block-key purge — so a layout fetch that observes
+        // the new generation observes the adopted roots.
+        note_reader_epoch_step();
         log::debug!(
             "reader epoch {from_epoch} → {to_epoch}: {purged} cached block key(s) dropped \
-             (R-6 unified purge)"
+             (R-6 unified purge); layout-cache generation {}",
+            reader_layout_step_gen()
         );
         purged
     }

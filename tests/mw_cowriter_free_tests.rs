@@ -4509,6 +4509,7 @@ async fn a_local_episode_save_composes_onto_the_durable_head() {
             layout_base_token: 0,
             layout_version: 0,
             block_map_id_own_mint: false,
+            reader_step_gen: 0,
         },
     );
 

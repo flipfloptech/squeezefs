@@ -13279,6 +13279,11 @@ impl SqueezefsFilesystem {
             if meta.file_type != "striped" {
                 return Err(I::Meta);
             }
+            // Item 2: a pre-step entry is not a binding authority on a
+            // revalidating mount — the handler re-resolves.
+            if crate::ro_coherence::layout_entry_pre_step(meta.reader_step_gen) {
+                return Err(I::Meta);
+            }
             if end > meta.size {
                 return Err(I::Shape);
             }
@@ -13820,6 +13825,18 @@ impl SqueezefsFilesystem {
         // ONE get (op-economy campaign): the clone is reused by the tier
         // legs below — the former second get was one more per-op clone.
         let meta = self.router.metadata_cache.get(&ino);
+        // Item 2: a pre-step layout entry names bindings the writer may
+        // have freed — the sync tier legs may not resolve through it.
+        // Demote to the handler, whose `fetch_metadata` re-resolves (one
+        // relaxed load + compare; structurally false on a mount that
+        // never steps an epoch). The stale entry is not handed back
+        // either: the lane touch would issue ahead from its map.
+        if meta
+            .as_ref()
+            .is_some_and(|m| crate::ro_coherence::layout_entry_pre_step(m.reader_step_gen))
+        {
+            return (IpcReadProbe::Miss, None);
+        }
         if let Some(m) = &meta {
             file_size = m.size;
         }
@@ -23471,6 +23488,9 @@ impl Filesystem for SqueezefsFilesystem {
                     layout_base_token: 0,
                     layout_version: 0,
                     block_map_id_own_mint: false,
+                    // A create's seed is this mount's own state — current
+                    // by construction (a co-writer's create shipped).
+                    reader_step_gen: crate::ro_coherence::reader_step_generation(),
                 },
             );
             self.bump_dir_generation(parent);

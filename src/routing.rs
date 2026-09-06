@@ -280,6 +280,18 @@ pub struct CachedMetadata {
     /// per compose, and a duplicate landing after reallocation freed the
     /// LIVE successor lifetime.
     pub block_map_id_own_mint: bool,
+    /// The reader's purge generation this entry's bindings were resolved
+    /// under ([`crate::ro_coherence::reader_step_generation`], read BEFORE
+    /// the backend read that produced them; ladder re-derivation item 2).
+    /// An entry stamped below the current generation predates an epoch
+    /// step and is a miss on every binding-serving read
+    /// ([`crate::ro_coherence::layout_entry_pre_step`]) — what lets the
+    /// acknowledgement ladder's drain drop the caches' TTL term. `0` on
+    /// every mount that never steps an epoch (a plain writer), where the
+    /// gate is structurally false. A save's republish stamps the CURRENT
+    /// generation (the persisted state is at least as new as the step);
+    /// every other clone-and-modify keeps its source's stamp.
+    pub reader_step_gen: u64,
 }
 
 /// [`CachedMetadata::layout_delta_chain`] sentinel: the persisted base
@@ -289,11 +301,15 @@ pub const LAYOUT_DELTA_CHAIN_INELIGIBLE: u32 = u32::MAX;
 /// The `fetch_metadata` serve gate, extracted (P2 per-op economy): a
 /// DIRTY layout is the local authority (never re-validated — see the
 /// `fetch_metadata` doc comment for the aged-fsx loss class), a clean
-/// entry serves within its 1 s freshness horizon. Also gates the read
-/// handler's snapshot hint in
-/// [`DataRouter::read_file_range_zero_copy_with_meta`].
+/// entry serves within its 1 s freshness horizon AND only if it was
+/// resolved under the reader's current purge generation (item 2 — a
+/// pre-step entry is a miss; one relaxed load + compare, structurally
+/// false on a mount that never steps). Also gates the read handler's
+/// snapshot hint in [`DataRouter::read_file_range_zero_copy_with_meta`].
 pub fn metadata_entry_fresh_or_dirty(entry: &CachedMetadata) -> bool {
-    entry.layout_dirty || entry.cached_at.elapsed() < std::time::Duration::from_secs(1)
+    entry.layout_dirty
+        || (entry.cached_at.elapsed() < std::time::Duration::from_secs(1)
+            && !crate::ro_coherence::layout_entry_pre_step(entry.reader_step_gen))
 }
 
 impl Default for CachedMetadata {
@@ -312,6 +328,7 @@ impl Default for CachedMetadata {
             layout_base_token: 0,
             layout_version: 0,
             block_map_id_own_mint: false,
+            reader_step_gen: 0,
         }
     }
 }
@@ -6209,6 +6226,11 @@ impl DataRouter {
         &self,
         ino: u64,
     ) -> Result<Option<CachedMetadata>> {
+        // Item 2: the entry's step stamp is the generation BEFORE the
+        // backend read — a step landing mid-read then leaves the entry
+        // stamped old (a miss), never pre-step content under a post-step
+        // stamp.
+        let reader_step_gen = crate::ro_coherence::reader_step_generation();
         if let Some(backend) = self.inner.meta_backend.get() {
             let xattr_res = backend.getxattr(ino, "layout").await?;
             if let Some(bytes) = xattr_res {
@@ -6474,6 +6496,7 @@ impl DataRouter {
                         // mount's mint — on a range-shared ino its
                         // lifecycle is the owner's compose.
                         block_map_id_own_mint: false,
+                        reader_step_gen,
                     };
                     // Idea 1 refetch-compose (KD-1.9 — the eviction-hole
                     // belt): an open epoch's shadow bindings overlay the
@@ -8065,6 +8088,9 @@ impl DataRouter {
         cached.layout_version = 0;
         // No blob exists behind a kvmap head — nothing to own-mint.
         cached.block_map_id_own_mint = false;
+        // Item 2: the just-persisted state is at least as new as the
+        // current epoch step.
+        cached.reader_step_gen = crate::ro_coherence::reader_step_generation();
         if !partial && kvmap_size_over_budget(cached.size, bs) {
             cached.block_map = None;
             self.kvmap_partial_arm(ino);
@@ -8797,6 +8823,8 @@ impl DataRouter {
         // Lever A (2026-08-01): the republished entry IS the just-
         // persisted state — coherent with the save's fencing era.
         cached.layout_base_token = fencing_token;
+        // Item 2: and at least as new as the current epoch step.
+        cached.reader_step_gen = crate::ro_coherence::reader_step_generation();
         // §6.2 item 9: the RAM provenance follows the persisted head —
         // a delta save's next link claims the version just staged; a
         // full save re-based to a bare Put, whose next link claims 0
@@ -10594,6 +10622,14 @@ impl DataRouter {
                 settle(false);
                 return;
             }
+            // Item 2: the caller's map snapshot may predate an epoch step
+            // that landed while this task was parked — a pre-step map
+            // names bindings the writer may have freed, so there is
+            // nothing to warm from it (the demand serve re-resolves).
+            if crate::ro_coherence::layout_entry_pre_step(meta.reader_step_gen) {
+                settle(false);
+                return;
+            }
             // PERF-12: single-block resolve — no Vec/sort/clone per fetch.
             let key = match block_key_in(&meta, block) {
                 BlockKeyResolve::Key(k) => k.into_owned(),
@@ -11167,6 +11203,12 @@ impl DataRouter {
                 settle(false);
                 return;
             }
+            // Item 2: a pre-step map snapshot fetches nothing (see the
+            // prefetch task) — and re-drives no refill from it.
+            if crate::ro_coherence::layout_entry_pre_step(meta.reader_step_gen) {
+                settle(false);
+                return;
+            }
             // PERF-12: single-block resolve — no Vec/sort/clone per fetch.
             let key = match block_key_in(&meta, block) {
                 BlockKeyResolve::Key(k) => k.into_owned(),
@@ -11330,6 +11372,10 @@ impl DataRouter {
     /// least as fresh as every merge whose displaced key could have been
     /// reallocated by the time this runs. On a miss, `fetch_metadata`'s
     /// refill reads the backend under the same lock (serialized ≥ merges).
+    /// On a REVALIDATING mount the merges are the writer's and land only
+    /// through an epoch step, so a pre-step entry is NOT current — it is a
+    /// miss here too (item 2, `layout_entry_pre_step`; structurally false
+    /// on a mount that never steps).
     /// Whether a single-flight fill for `block_key` is registered right now
     /// — the observability face of the anti-churn ordering (PERF-11: the
     /// deferred tier publish OWNS the flight's guard, so the registry entry
@@ -11344,8 +11390,8 @@ impl DataRouter {
     async fn current_block_binding(&self, file_path: &str, b: u32) -> Result<Option<String>> {
         let ino = parse_inode_from_path(file_path);
         let meta = match self.metadata_cache.get(&ino) {
-            Some(m) => m,
-            None => self.fetch_metadata(file_path).await?,
+            Some(m) if !crate::ro_coherence::layout_entry_pre_step(m.reader_step_gen) => m,
+            _ => self.fetch_metadata(file_path).await?,
         };
         if meta.block_map.is_none() && meta.block_map_id.is_none() && meta.block_prefix.is_none() {
             // The file no longer carries a striped layout (concurrent
@@ -11378,8 +11424,8 @@ impl DataRouter {
     async fn block_binding_is(&self, file_path: &str, b: u32, expected: &str) -> Result<bool> {
         let ino = parse_inode_from_path(file_path);
         let meta = match self.metadata_cache.get(&ino) {
-            Some(m) => m,
-            None => self.fetch_metadata(file_path).await?,
+            Some(m) if !crate::ro_coherence::layout_entry_pre_step(m.reader_step_gen) => m,
+            _ => self.fetch_metadata(file_path).await?,
         };
         if meta.block_map.is_none() && meta.block_map_id.is_none() && meta.block_prefix.is_none() {
             return Ok(false);
@@ -12388,6 +12434,9 @@ impl DataRouter {
                 return Ok(entry);
             }
         }
+        // Item 2: the synthesized entry's stamp is captured before the
+        // backend read too (the same law as the fetched entry's).
+        let reader_step_gen = crate::ro_coherence::reader_step_generation();
         if let Some(m) = self.fetch_metadata_from_backend(ino).await? {
             self.publish_layout_cache_entry(ino, m.clone());
             return Ok(m);
@@ -12410,6 +12459,7 @@ impl DataRouter {
             layout_base_token: 0,
             layout_version: 0,
             block_map_id_own_mint: false,
+            reader_step_gen,
         };
         self.publish_layout_cache_entry(ino, m.clone());
         Ok(m)

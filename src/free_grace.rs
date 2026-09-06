@@ -2024,7 +2024,8 @@ pub struct AckInputs {
     /// landing ceiling + `skew_max` (item 1; `staleness_bound + skew_max`
     /// under the lever's `0`).
     pub qualify_lag_ms: u64,
-    /// `staleness_bound + D_purge`.
+    /// The drain window's timer — [`drain_lag_ms`]: `D_purge` (item 2;
+    /// `staleness_bound + D_purge` under the lever's `0`).
     pub drain_lag_ms: u64,
     /// The acknowledgement-refresh floor (`ack_refresh_floor` — the pass
     /// cadence's own floor): the PIPELINE DEPTH derivation's input
@@ -2089,11 +2090,35 @@ struct AckCandidate {
 ///    measured cycle term belongs. A pass that began earlier can adopt a
 ///    record that still names the freed block, and the reader would
 ///    re-resolve the binding immediately after purging it.
-/// 3. **Drained.** `staleness_bound + D_purge` must then elapse: the daemon
-///    layout/attr caches (whose reader TTL *is* the staleness bound —
-///    §6.8 item 4) must expire, and serves already in flight when the purge
-///    ran must finish. This is exactly §6.7's `D_purge` term ("observe,
-///    then finish"), which S6's clock arithmetic already reserves.
+/// 3. **Drained.** Two things must be true after the qualifying pass's
+///    purge before the label is honest: (a) no daemon cache may still
+///    serve a PRE-STEP binding `b → K`, and (b) every serve that resolved
+///    a binding before the step must have finished (its device read may
+///    otherwise land after the writer has reused `K`).
+///
+///    (a) was a TIMER — `staleness_bound` (`S`), the reader TTL of the
+///    daemon layout/attr caches (§6.8 item 4) — and is now an
+///    **epoch-step invalidation** (ladder re-derivation item 2): every
+///    layout-cache entry is stamped with the reader's purge generation
+///    read BEFORE its backend read
+///    ([`crate::ro_coherence::reader_step_generation`]), the step's last
+///    act bumps the generation (after that volume's root adoption, drop
+///    pass and R-6 purge), and every binding-serving read — the handler's
+///    `fetch_metadata` gate, the post-fetch binding recheck, the il sync
+///    probe, the direct-drive probe, the background fill tasks' map
+///    snapshots — refuses an entry stamped below the current generation
+///    ([`crate::ro_coherence::layout_entry_pre_step`]). A miss costs one
+///    re-resolve per cached ino per step (a step is at most one per
+///    volume per pass); the gate itself is one relaxed load and a compare,
+///    and adds no lock and no copy to the hot path. The attr/dentry caches
+///    keep their TTL: they map names to inos (never reused) and inos to
+///    sizes, never a block to an offset, and every binding they lead to
+///    is resolved through the gated layout cache. So `S` left the drain:
+///    [`drain_lag_ms`] is `D_purge` (and `S + D_purge` verbatim under
+///    `SQUEEZEFS_FREE_GRACE_DRAIN_EPOCH_STAMP=0`).
+///
+///    (b) is §6.7's `D_purge` term ("observe, then finish"), which S6's
+///    clock arithmetic already reserves.
 ///
 /// A newer label never displaces a pending one until it has been
 /// acknowledged, so the ladder cannot starve when the renewal cadence is
@@ -2443,6 +2468,12 @@ pub fn reader_pass_completed(pass_start_ms: u64, advanced: bool) -> Option<u64> 
         session.skew_max_ms(),
     );
     QUALIFY_LAG_MS.store(qualify, Ordering::Relaxed);
+    let drain = drain_lag_ms(
+        crate::ro_coherence::drain_epoch_stamp_enabled(),
+        staleness,
+        session.d_purge_ms(),
+    );
+    DRAIN_LAG_MS.store(drain, Ordering::Relaxed);
     let out = LADDER.note_pass(AckInputs {
         label,
         learned_at_ms,
@@ -2450,7 +2481,7 @@ pub fn reader_pass_completed(pass_start_ms: u64, advanced: bool) -> Option<u64> 
         now_ms: session.now_ms(),
         advanced,
         qualify_lag_ms: qualify,
-        drain_lag_ms: staleness + session.d_purge_ms(),
+        drain_lag_ms: drain,
         // The pass cadence's own floor (`ack_refresh_floor`'s arithmetic,
         // reader-side): the pipeline-depth derivation's input.
         refresh_floor_ms: (crate::ro_coherence::reader_revalidate_interval().as_millis() as u64)
@@ -2513,6 +2544,30 @@ static QUALIFY_LAG_MS: AtomicU64 = AtomicU64::new(0);
 /// `free_grace_qualify_lag_ms`.
 pub fn qualify_lag_in_force_ms() -> u64 {
     QUALIFY_LAG_MS.load(Ordering::Relaxed)
+}
+
+/// **Gate 3's timer — the drain lag** (ladder re-derivation item 2). With
+/// the `SQUEEZEFS_FREE_GRACE_DRAIN_EPOCH_STAMP` lever on, `D_purge` alone:
+/// the daemon's layout cache can no longer serve a pre-step binding after
+/// the epoch step ([`crate::ro_coherence::layout_entry_pre_step`] — every
+/// entry is stamped with the purge generation it was resolved under, and
+/// an older stamp is a miss), so the caches' TTL (`S`, the reader's
+/// staleness bound) no longer has to be waited out. Off: `S + D_purge`
+/// verbatim.
+pub fn drain_lag_ms(epoch_stamp_lever_on: bool, staleness_bound_ms: u64, d_purge_ms: u64) -> u64 {
+    if epoch_stamp_lever_on {
+        d_purge_ms
+    } else {
+        staleness_bound_ms.saturating_add(d_purge_ms)
+    }
+}
+
+/// The drain lag in force on this reader, ms (`free_grace_drain_lag_ms`).
+static DRAIN_LAG_MS: AtomicU64 = AtomicU64::new(0);
+
+/// `free_grace_drain_lag_ms`.
+pub fn drain_lag_in_force_ms() -> u64 {
+    DRAIN_LAG_MS.load(Ordering::Relaxed)
 }
 
 /// The `SQUEEZEFS_FREE_GRACE_QUALIFY_CEILING` lever's latch (the
@@ -2884,6 +2939,11 @@ pub fn stats_snapshot() -> serde_json::Value {
                 // in force — the writer's checkpoint ceiling + skew, or the
                 // retired staleness + skew under the lever's `0`.
                 "free_grace_qualify_lag_ms": qualify_lag_in_force_ms(),
+                "free_grace_drain_lag_ms": drain_lag_in_force_ms(),
+                // Item 2's cache-gate faces: the purge generation and the
+                // pre-step entries the gate refused (each one re-resolve).
+                "reader_layout_step_gen": crate::ro_coherence::reader_layout_step_gen(),
+                "reader_layout_step_misses": crate::ro_coherence::reader_layout_step_misses(),
             });
         }
         return serde_json::json!({ "free_grace_mode": "off" });
@@ -3049,6 +3109,7 @@ pub fn reset_for_test() {
         &LANE_SUPPLY_HINT,
         &LANE_PUSH_WAKES,
         &QUALIFY_LAG_MS,
+        &DRAIN_LAG_MS,
     ] {
         c.store(0, Ordering::Relaxed);
     }
@@ -3056,6 +3117,7 @@ pub fn reset_for_test() {
     test_set_ack_renewal(None);
     test_set_refresh_on_ack(None);
     test_set_qualify_ceiling(None);
+    crate::ro_coherence::reset_for_test();
     test_set_demand(None);
     test_set_pass_elastic(None);
     test_set_lane_push(None);

@@ -2146,3 +2146,28 @@ fn free_grace_qualify_ceiling_derives_from_the_checkpoint_trigger_and_tick() {
         2_022
     );
 }
+
+/// The writer→member checkpoint composite's two derivations — drift-is-red
+/// (`.benchmarks/2026-09-06-free-grace-checkpoint-composite.md`): the
+/// elastic checkpoint ceiling is `max(P/2, 2 × measured cycle)` capped at
+/// the writer's routine ceiling (half the reader's routine poll is the
+/// Nyquist bound that puts a new root in every pass window; a cycle may
+/// not run more than half the time — lever (d)'s law for the scan; never
+/// slower than the routine), and the live prod floor is
+/// `max(min(P, ceiling), skew)`, which at the routine ceiling IS the
+/// shipped `max(P, skew)`. No free constant sits in either.
+#[test]
+fn free_grace_elastic_checkpoint_ceiling_derives_from_the_poll_and_the_cycle() {
+    use squeezefs::free_grace::elastic_checkpoint_ceiling_ms;
+    // The shipped venue: P = 1 s, a ≈ 20 ms cycle ⇒ 500 ms.
+    assert_eq!(elastic_checkpoint_ceiling_ms(1_000, 20, 1_000), 500);
+    // The cycle-cost floor governs a slow device; the routine caps it.
+    assert_eq!(elastic_checkpoint_ceiling_ms(1_000, 300, 1_000), 600);
+    assert_eq!(elastic_checkpoint_ceiling_ms(1_000, 700, 1_000), 1_000);
+    // A 5 s flush venue: P = routine = 5 s ⇒ 2.5 s.
+    assert_eq!(elastic_checkpoint_ceiling_ms(5_000, 20, 5_000), 2_500);
+    // A reader polling below the writer's routine (the env override):
+    // half ITS poll; the physical minimum is one ms.
+    assert_eq!(elastic_checkpoint_ceiling_ms(300, 0, 1_000), 150);
+    assert_eq!(elastic_checkpoint_ceiling_ms(1, 0, 1_000), 1);
+}

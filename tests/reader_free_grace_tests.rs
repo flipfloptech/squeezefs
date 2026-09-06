@@ -156,6 +156,19 @@
 //!     = prods = stalls = 0`, `bound_age` at the routine composite under
 //!     every configuration — PR 5's gate (c) is a statement about a
 //!     COUPLED storm.
+//!
+//! ## The hold-time campaign (contracts 23–31) and the writer→member
+//! checkpoint composite (contracts 32–36, user decision 2026-09-06)
+//!
+//! Contracts 23–31 (`.benchmarks/2026-09-06-free-grace-hold-time.md`)
+//! decompose the hold per stage and land levers (b)/(d); contract 31
+//! measured a faster writer checkpoint INERT alone. Contracts 32–36
+//! (`.benchmarks/2026-09-06-free-grace-checkpoint-composite.md`) land it
+//! as the composite: the writer's ceiling follows the valve's ask (P/2),
+//! the grant carries it, the member's prod floor and L2b pass floor follow
+//! it — the cadences halve, the hold drops, the cost is the accepted 2×,
+//! the published staleness bound is honoured, and the lever off is the
+//! shipped H3 row to the tick.
 
 use squeezefs::block_allocator::BlockAllocator;
 use squeezefs::block_reclaim::{ReclaimEntry, ReclaimQueue};
@@ -1761,30 +1774,40 @@ fn the_pressure_signal_and_its_ladder_are_derived() {
         "the floor is the shortest interval at which the reader's answer can change"
     );
     assert_eq!(
-        prod.cadence_for(cycle),
+        prod.cadence_for(cycle, floor),
         None,
         "a runway of one whole cycle needs no prod: the routine beat already fits"
     );
     assert_eq!(
-        prod.cadence_for(u64::MAX),
+        prod.cadence_for(u64::MAX, floor),
         None,
         "no runway pressure, no prod"
     );
     assert_eq!(
-        prod.cadence_for(0),
+        prod.cadence_for(0, floor),
         Some(floor),
         "at the cliff the beat is the fastest one that can carry a new answer"
     );
     let mid = prod
-        .cadence_for(cycle - renew)
+        .cadence_for(cycle - renew, floor)
         .expect("a mid-pressure prod");
     assert!(
         (floor..renew).contains(&mid),
         "the prodded cadence {mid} must sit between the floor {floor} and the routine {renew}"
     );
     assert!(
-        prod.cadence_for(cycle - renew * 2).expect("more pressure") <= mid,
+        prod.cadence_for(cycle - renew * 2, floor)
+            .expect("more pressure")
+            <= mid,
         "the cadence must tighten monotonically as the runway shortens"
+    );
+    // The composite (adjudication item 4): the floor FOLLOWS the writer's
+    // advertised checkpoint ceiling — `max(min(P, ceiling), skew)` — so
+    // an owner asking under a halved ceiling asks at the halved floor.
+    assert_eq!(
+        prod.cadence_for(0, prod.floor_for(500)),
+        Some(500),
+        "at the cliff under a 500 ms writer ceiling the ask is 500 ms"
     );
 }
 
@@ -2326,21 +2349,29 @@ fn the_demand_lever_off_restores_the_shipped_valve_verbatim() {
 }
 
 /// **L2b — a prodded grant tightens the revalidation pass cadence, with
-/// the checkpoint ceiling as its physics floor** (OQ 3, user decision):
-/// `pass_interval = clamp(prodded renew_ms, CHECKPOINT_MAX_AGE_MS,
-/// routine)`, TTL'd like the prod; expiry restores the routine cadence;
+/// the WRITER'S ADVERTISED checkpoint ceiling as its physics floor** (OQ 3,
+/// user decision 2026-08-25; the floor's INPUT made live by the
+/// writer→member composite, user decision 2026-09-06):
+/// `pass_interval = clamp(prodded renew_ms, advertised ceiling, routine)`,
+/// TTL'd like the prod; the ceiling rides the same grant as the ask (a
+/// grant that advertised none — `0` — floors at `CHECKPOINT_MAX_AGE_MS`,
+/// the shipped law verbatim); expiry restores the routine cadence;
 /// `PASS_ELASTIC=0` is the routine cadence always; and on a venue whose
-/// routine interval already sits AT the floor the lever is structurally
-/// inert (`free_grace_pass_prods` stays 0 — the s11 venue's own shape).
+/// routine interval already sits AT the routine floor the lever is
+/// structurally inert UNTIL the writer's ceiling drops below it (the s11
+/// venue's own shape — which is exactly what the composite changes).
 #[test]
 fn a_prodded_grant_tightens_the_pass_cadence_with_the_checkpoint_floor() {
     let _serial = serial();
     free_grace::test_set_pass_elastic(Some(true));
+    free_grace::test_set_checkpoint_composite(Some(true));
+    let ceiling = squeezefs::meta_backend::kv::checkpoint::CHECKPOINT_MAX_AGE_MS as u64;
 
-    // A slow-flush venue: routine pass interval 5 s, prodded renew 1 s.
+    // A slow-flush venue: routine pass interval 5 s, prodded renew 1 s,
+    // no ceiling advertised (the pre-composite grant).
     let routine = Duration::from_millis(5_000);
     let prods_before = free_grace::pass_prods();
-    free_grace::note_prodded_renewal(1_000, 10_000);
+    free_grace::note_prodded_renewal(1_000, 0, 10_000);
     assert_eq!(
         free_grace::reader_pass_interval(routine, 10_500),
         Duration::from_millis(1_000),
@@ -2356,13 +2387,14 @@ fn a_prodded_grant_tightens_the_pass_cadence_with_the_checkpoint_floor() {
         "the cadence in force is published (the prod_renew_ms precedent)"
     );
 
-    // The physics floor: an ask below the checkpoint ceiling clamps UP —
-    // polling faster than the writer's 1 s checkpoint observes nothing.
-    free_grace::note_prodded_renewal(200, 11_000);
+    // The physics floor: an ask below the writer's ceiling clamps UP —
+    // a pass faster than the writer's checkpoint cadence finds nothing.
+    // Nothing advertised ⇒ the routine ceiling constant, as shipped.
+    free_grace::note_prodded_renewal(200, 0, 11_000);
     assert_eq!(
         free_grace::reader_pass_interval(routine, 11_100),
-        Duration::from_millis(1_000),
-        "the floor is CHECKPOINT_MAX_AGE_MS — physics, not tuning"
+        Duration::from_millis(ceiling),
+        "no ceiling advertised: the floor is CHECKPOINT_MAX_AGE_MS — the shipped law verbatim"
     );
 
     // Expiry: the routine cadence recovers within one reading TTL.
@@ -2373,24 +2405,67 @@ fn a_prodded_grant_tightens_the_pass_cadence_with_the_checkpoint_floor() {
     );
     assert_eq!(free_grace::pass_interval_ms(), 5_000);
 
-    // The floor venue (routine == ceiling): structurally inert.
-    let floor_routine = Duration::from_millis(1_000);
+    // The floor venue (routine == the routine ceiling): structurally inert
+    // while the writer advertises its routine ceiling…
+    let floor_routine = Duration::from_millis(ceiling);
     let prods_mid = free_grace::pass_prods();
-    free_grace::note_prodded_renewal(1_000, 70_000);
+    free_grace::note_prodded_renewal(ceiling, ceiling, 70_000);
     assert_eq!(
         free_grace::reader_pass_interval(floor_routine, 70_100),
         floor_routine,
-        "routine already AT the floor: nothing to tighten (the s11 venue)"
+        "routine already AT the routine floor: nothing to tighten (the s11 venue, no composite)"
     );
     assert_eq!(
         free_grace::pass_prods(),
         prods_mid,
         "structural inertness: no engagement counted where routine = floor"
     );
+    // …and the composite is what makes it pay THERE: a grant advertising
+    // a halved ceiling with a halved ask runs the pass at the halved
+    // cadence — the floor's input is the writer's LIVE ceiling.
+    free_grace::note_prodded_renewal(ceiling / 2, ceiling / 2, 71_000);
+    assert_eq!(
+        free_grace::reader_pass_interval(floor_routine, 71_100),
+        Duration::from_millis(ceiling / 2),
+        "an advertised P/2 ceiling floors the pass at P/2 (the composite)"
+    );
+    assert!(
+        free_grace::pass_prods() > prods_mid,
+        "the composite engages L2b on the floor venue (counted)"
+    );
+    // The re-stated law: an ask below the ADVERTISED ceiling clamps up to
+    // it — the physics is unchanged, the input is live.
+    free_grace::note_prodded_renewal(100, ceiling / 2, 72_000);
+    assert_eq!(
+        free_grace::reader_pass_interval(floor_routine, 72_100),
+        Duration::from_millis(ceiling / 2),
+        "an ask below the writer's advertised ceiling clamps up to it"
+    );
+    // A ceiling advertised ABOVE the routine constant (a slow-flush
+    // writer's honest routine — its tick) floors the pass there: a pass
+    // faster than that writer's checkpoints observes nothing.
+    free_grace::note_prodded_renewal(1_000, 5_000, 73_000);
+    assert_eq!(
+        free_grace::reader_pass_interval(routine, 73_100),
+        routine,
+        "a writer checkpointing every 5 s floors the pass at 5 s, whatever the ask"
+    );
+
+    // The composite lever off: the advertised ceiling is ignored — the
+    // shipped floor constant, byte for byte.
+    free_grace::test_set_checkpoint_composite(Some(false));
+    free_grace::note_prodded_renewal(ceiling / 2, ceiling / 2, 74_000);
+    assert_eq!(
+        free_grace::reader_pass_interval(floor_routine, 74_100),
+        floor_routine,
+        "CHECKPOINT_COMPOSITE=0: the shipped floor (the constant) verbatim"
+    );
+    assert!(free_grace::test_clear_checkpoint_composite());
+    free_grace::test_set_checkpoint_composite(Some(true));
 
     // The lever: routine verbatim, engagement 0.
     free_grace::test_set_pass_elastic(Some(false));
-    free_grace::note_prodded_renewal(1_000, 80_000);
+    free_grace::note_prodded_renewal(1_000, 0, 80_000);
     assert_eq!(
         free_grace::reader_pass_interval(routine, 80_100),
         routine,
@@ -2398,20 +2473,31 @@ fn a_prodded_grant_tightens_the_pass_cadence_with_the_checkpoint_floor() {
     );
     assert!(free_grace::test_clear_pass_elastic());
 
-    // The three numbers that deliberately DO NOT move under a prodded
-    // window (§5.2b's never-weakens argument): the published staleness
-    // bound is the ROUTINE derivation — structurally independent of the
-    // pass word (it reads no prodded state).
+    // The numbers that deliberately DO NOT move under a prodded window
+    // (§5.2b's never-weakens argument, KD-FG-11 as amended): the published
+    // staleness bound is the ROUTINE derivation — structurally independent
+    // of the pass word AND of the advertised ceiling (it reads neither).
     let bound_before = squeezefs::ro_coherence::reader_staleness_bound();
     free_grace::test_set_pass_elastic(Some(true));
-    free_grace::note_prodded_renewal(1_000, 90_000);
+    free_grace::note_prodded_renewal(ceiling / 2, ceiling / 2, 90_000);
     assert_eq!(
         squeezefs::ro_coherence::reader_staleness_bound(),
         bound_before,
         "the PUBLISHED staleness bound never flickers with load — it is \
          the guarantee in force, not the cadence in force"
     );
+    // …and the elastic cadence sits INSIDE it: a member passing at the
+    // advertised ceiling against a writer checkpointing at that ceiling
+    // is at most `pass + ceiling` stale — half the published bound.
+    let pass = free_grace::reader_pass_interval(floor_routine, 90_100);
+    assert!(
+        pass + Duration::from_millis(ceiling / 2) <= bound_before,
+        "the elastic cadence's worst-case staleness {:?} honours the published bound {:?}",
+        pass + Duration::from_millis(ceiling / 2),
+        bound_before
+    );
     assert!(free_grace::test_clear_pass_elastic());
+    assert!(free_grace::test_clear_checkpoint_composite());
 }
 
 /// **The loop-latency instruments (PR 1, §8 rows 1–2).** `bound_age_ms`
@@ -2524,6 +2610,11 @@ struct Levers {
     /// serves reaching zero) and `D_purge` only a tripwire (off = the
     /// `D_purge` timer).
     drain_observed: bool,
+    /// The writer→member checkpoint composite (adjudication item 4): the
+    /// writer's checkpoint ceiling follows the valve's ask (P/2 while an
+    /// ask is in force), the grant carries it, and the members' pass and
+    /// beat floors follow it.
+    composite: bool,
 }
 
 impl Levers {
@@ -2538,6 +2629,7 @@ impl Levers {
             qualify_ceiling: false,
             drain_epoch_stamp: false,
             drain_observed: false,
+            composite: false,
         }
     }
 
@@ -2560,22 +2652,27 @@ impl Levers {
             self.qualify_ceiling,
             self.drain_epoch_stamp,
             self.drain_observed,
+            self.composite,
         ) {
-            (false, false, false, false, false, false, false) => "A0 pipeline=0 demand=0",
-            (true, false, false, false, false, false, false) => "A1 pipeline=1 demand=0",
-            (false, true, false, false, false, false, false) => "A2 pipeline=0 demand=1",
-            (true, true, false, false, false, false, false) => {
+            (false, false, false, false, false, false, false, false) => "A0 pipeline=0 demand=0",
+            (true, false, false, false, false, false, false, false) => "A1 pipeline=1 demand=0",
+            (false, true, false, false, false, false, false, false) => "A2 pipeline=0 demand=1",
+            (true, true, false, false, false, false, false, false) => {
                 "A3 pipeline=1 demand=1 (hold-time levers off)"
             }
-            (true, true, true, false, false, false, false) => "H1 +ack_renewal",
-            (true, true, false, true, false, false, false) => "H2 +refresh_on_ack",
-            (true, true, true, true, false, false, false) => {
+            (true, true, true, false, false, false, false, false) => "H1 +ack_renewal",
+            (true, true, false, true, false, false, false, false) => "H2 +refresh_on_ack",
+            (true, true, true, true, false, false, false, false) => {
                 "H3 +ack_renewal +refresh_on_ack (hold-time shipped)"
             }
-            (true, true, true, true, true, false, false) => "R1 H3 +qualify_ceiling",
-            (true, true, true, true, true, true, false) => "R2 R1 +drain_epoch_stamp",
-            (true, true, true, true, true, true, true) => {
+            (true, true, true, true, true, false, false, false) => "R1 H3 +qualify_ceiling",
+            (true, true, true, true, true, true, false, false) => "R2 R1 +drain_epoch_stamp",
+            (true, true, true, true, true, true, true, false) => {
                 "R3 R2 +drain_observed (re-derivation shipped)"
+            }
+            (true, true, true, true, false, false, false, true) => "H4 H3 +checkpoint_composite",
+            (true, true, true, true, true, true, true, true) => {
+                "R4 R3 +checkpoint_composite (all four adjudication items)"
             }
             _ => "custom",
         }
@@ -2635,6 +2732,24 @@ struct LoopRow {
     ack_renewals: u64,
     /// Bound refreshes a binding ack triggered (lever d's engagement).
     refreshes_on_ack: u64,
+    /// The composite's cost ledger over the WHOLE run: the writer's
+    /// checkpoint cycles (the hold ledger's marks — 1:1 with
+    /// `meta_kv_checkpoints` on an armed writer) and the lease lane's
+    /// renewals (the product's `membership_renewals`), as rates.
+    checkpoints_per_s: f64,
+    renewals_per_s: f64,
+    /// Checkpoint cycles run with the elastic ceiling in force (the
+    /// composite's writer-side engagement).
+    elastic_cycles: u64,
+    /// L2b passes run on a tightened cadence (the composite's member-side
+    /// engagement — structurally 0 on this venue without it).
+    pass_prods: u64,
+    /// The smallest checkpoint ceiling the writer enforced during the run.
+    ceiling_min_ms: u64,
+    /// The worst `pass interval + ceiling in force` any pass ran under —
+    /// the elastic cadence's actual staleness, checked against the
+    /// PUBLISHED bound (which never moves).
+    staleness_worst_ms: u64,
 }
 
 impl LoopRow {
@@ -2646,7 +2761,9 @@ impl LoopRow {
              prods {p} demand_prods {dp} demand_waits {dw} refreshes {rf} tightenings {t} decays {dec} | \
              acks {acks} renewals {ren} | alloc freelist {fl} fresh {fr} | \
              hold defer→ckpt {hck:.0} ckpt→min_acked {hak:.0} min_acked→rel {hrel:.0} unplaced {hun} \
-             hold_ms {hold} ack_lag max {lmax} mean {lmean} | ack_renewals {ar} refreshes_on_ack {roa}",
+             hold_ms {hold} ack_lag max {lmax} mean {lmean} | ack_renewals {ar} refreshes_on_ack {roa} | \
+             cost checkpoints/s {cps:.2} renewals/s {rps:.2} elastic_cycles {ec} pass_prods {pp} \
+             ceiling_min {cm} ms staleness_worst {sw} ms",
             label = shape.label,
             config = self.config,
             mibs = self.steady_allocs_per_s * 4.0,
@@ -2682,6 +2799,12 @@ impl LoopRow {
             lmean = self.ack_lag_mean_ms,
             ar = self.ack_renewals,
             roa = self.refreshes_on_ack,
+            cps = self.checkpoints_per_s,
+            rps = self.renewals_per_s,
+            ec = self.elastic_cycles,
+            pp = self.pass_prods,
+            cm = self.ceiling_min_ms,
+            sw = self.staleness_worst_ms,
         )
     }
 }
@@ -2723,9 +2846,12 @@ const LOOP_STEP_MS: u64 = 1;
 /// displaces one lane-0 block into the ring. The storm (the co-writers'
 /// shipped frees) enters the same ring at its own rate and its releases
 /// pile up on the passed-global number, reachable to nobody here. Members
-/// pass once per revalidation interval (every pass advances the epoch —
-/// a storming writer checkpoints continuously) and renew on the cadence
-/// their last grant carried; the owner sweeps on `renew_interval`.
+/// pass on the cadence the product's L2b resolver answers (a pass
+/// advances iff a checkpoint landed since the previous one) and renew on
+/// the cadence their last grant carried; the owner sweeps on
+/// `renew_interval`. The writer checkpoints on the product's own decision
+/// — `elapsed ≥ the ceiling in force`, the checkpoint task's tick — with
+/// the composite lever deciding whether that ceiling follows the ask.
 fn run_closed_loop(shape: &LoopShape, levers: Levers) -> LoopRow {
     free_grace::reset_for_test();
     membership::uninstall();
@@ -2737,6 +2863,7 @@ fn run_closed_loop(shape: &LoopShape, levers: Levers) -> LoopRow {
         qualify_ceiling,
         drain_epoch_stamp,
         drain_observed,
+        composite,
     } = levers;
     free_grace::test_set_ack_pipeline(Some(pipeline));
     free_grace::test_set_demand(Some(demand));
@@ -2749,6 +2876,8 @@ fn run_closed_loop(shape: &LoopShape, levers: Levers) -> LoopRow {
         // The cadence task's spawn arms the ledger on a real mount.
         squeezefs::ro_coherence::test_arm_serve_ledger();
     }
+    free_grace::test_set_checkpoint_composite(Some(composite));
+    let renewals_metric_before = METRICS.membership_renewals.load(Ordering::Relaxed);
     let (clock, ticks) = manual_clock();
     let owner = armed_owner(&clock);
     free_grace::arm_owner_plane(clock.clone(), owner.clocks()).expect("derived bound");
@@ -2843,11 +2972,15 @@ fn run_closed_loop(shape: &LoopShape, levers: Levers) -> LoopRow {
     // re-runs the pressure harvest (finding 29's bounded wait).
     let mut parked_until_ms = 0u64;
     // The writer's checkpoint cadence (a storming writer always has
-    // dirty nodes, so the cycle runs at the max-age ceiling): each cycle
-    // marks the hold ledger, and a member's pass advances iff one landed
-    // since its previous pass.
-    let mut next_checkpoint_ms = t0 + shape.checkpoint_ms;
+    // dirty nodes, so the cycle runs at the ceiling): each cycle marks the
+    // hold ledger, and a member's pass advances iff one landed since its
+    // previous pass. Under the composite the ceiling is the product's
+    // decision (`checkpoint_ceiling_in_force_ms`, read per step the way
+    // the checkpoint task reads it per tick); otherwise the shape's.
     let mut last_checkpoint_ms = t0;
+    let mut ceiling_min_ms = u64::MAX;
+    let mut staleness_worst_ms = 0u64;
+    let pass_routine = Duration::from_millis(pass_ms);
     let mut ack_renewals = 0u64;
     let third_ms = shape.duration_ms / 3;
     let steady_from_ms = t0 + third_ms;
@@ -2870,10 +3003,19 @@ fn run_closed_loop(shape: &LoopShape, levers: Levers) -> LoopRow {
 
         // The writer's checkpoint (before the readers' passes: a pass at
         // the same instant adopts it).
-        if now >= next_checkpoint_ms {
+        let elastic = free_grace::checkpoint_ceiling_in_force_ms();
+        let ceiling_ms = if composite {
+            elastic.unwrap_or(shape.checkpoint_ms)
+        } else {
+            shape.checkpoint_ms
+        };
+        ceiling_min_ms = ceiling_min_ms.min(ceiling_ms);
+        if now - last_checkpoint_ms >= ceiling_ms {
             free_grace::note_checkpoint_completed(Duration::from_millis(20));
+            if composite && elastic.is_some() {
+                free_grace::note_elastic_checkpoint_cycle();
+            }
             last_checkpoint_ms = now;
-            next_checkpoint_ms = now + shape.checkpoint_ms;
         }
 
         // The storm: the co-writers' displaced frees, `finish_free`d at
@@ -2962,10 +3104,17 @@ fn run_closed_loop(shape: &LoopShape, levers: Levers) -> LoopRow {
                     // CARRIAGE renewal (the product wakes the renewal loop;
                     // the sim performs the wake's effect): the ack travels,
                     // the routine beat keeps its schedule and the label
-                    // stays the routine renewal's (`renewed_carriage`).
+                    // stays the routine renewal's (`renewed_carriage` —
+                    // which deposits the grant's ask + ceiling for the
+                    // pass resolver exactly like the routine renewal).
                     if free_grace::ack_renewal_enabled() {
                         match owner.renew(&r.id, r.epoch, r.acked) {
-                            RenewOutcome::Renewed(_) => {
+                            RenewOutcome::Renewed(grant) => {
+                                free_grace::note_prodded_renewal(
+                                    grant.renew_ms,
+                                    grant.checkpoint_ceiling_ms,
+                                    now,
+                                );
                                 renewals += 1;
                                 ack_renewals += 1;
                             }
@@ -2973,13 +3122,26 @@ fn run_closed_loop(shape: &LoopShape, levers: Levers) -> LoopRow {
                         }
                     }
                 }
-                r.next_pass_ms += pass_ms;
+                // The next pass on the product's L2b cadence (the
+                // revalidation loop's own sleep): the routine interval,
+                // or the prodded ask floored at the advertised ceiling.
+                let pass = free_grace::reader_pass_interval(pass_routine, now);
+                let pass_ms_now = pass.as_millis() as u64;
+                staleness_worst_ms = staleness_worst_ms.max(pass_ms_now + ceiling_ms);
+                r.next_pass_ms = now + pass_ms_now.max(LOOP_STEP_MS);
             }
             if now >= r.next_renew_ms {
                 match owner.renew(&r.id, r.epoch, r.acked) {
                     RenewOutcome::Renewed(grant) => {
                         r.learned = (grant.granted_at_owner_ms, now);
                         r.next_renew_ms = now + grant.renew_ms.max(LOOP_STEP_MS);
+                        // `MemberSession::renewed`'s deposit: the ask and
+                        // the ceiling it rode in with.
+                        free_grace::note_prodded_renewal(
+                            grant.renew_ms,
+                            grant.checkpoint_ceiling_ms,
+                            now,
+                        );
                         renewals += 1;
                     }
                     other => panic!("a healthy reader's renewal is admitted: {other:?}"),
@@ -3049,6 +3211,15 @@ fn run_closed_loop(shape: &LoopShape, levers: Levers) -> LoopRow {
         ack_lag_mean_ms: lag["mean"].as_u64().unwrap_or(0),
         ack_renewals,
         refreshes_on_ack: free_grace::bound_refreshes_on_ack(),
+        checkpoints_per_s: free_grace::checkpoint_marks() as f64
+            / (shape.duration_ms as f64 / 1_000.0),
+        renewals_per_s: (METRICS.membership_renewals.load(Ordering::Relaxed)
+            - renewals_metric_before) as f64
+            / (shape.duration_ms as f64 / 1_000.0),
+        elastic_cycles: free_grace::checkpoint_elastic_cycles(),
+        pass_prods: free_grace::pass_prods(),
+        ceiling_min_ms,
+        staleness_worst_ms,
     };
     drop(readers);
     assert!(free_grace::test_clear_ack_pipeline());
@@ -3058,6 +3229,7 @@ fn run_closed_loop(shape: &LoopShape, levers: Levers) -> LoopRow {
     assert!(free_grace::test_clear_qualify_ceiling());
     assert!(squeezefs::ro_coherence::test_clear_drain_epoch_stamp());
     assert!(squeezefs::ro_coherence::test_clear_drain_observed());
+    assert!(free_grace::test_clear_checkpoint_composite());
     row
 }
 
@@ -4822,4 +4994,487 @@ fn the_observed_drain_cuts_the_hold_by_the_lease_clock_reserve() {
         after.bound_age_mean_ms,
         h3.bound_age_mean_ms
     );
+}
+
+// ===========================================================================
+// The writer→member checkpoint composite (2026-09-06, adjudication item 4
+// — USER DECISION 2026-09-06; `.benchmarks/2026-09-06-free-grace-checkpoint-composite.md`)
+//
+// Contract 31 measured a faster writer checkpoint INERT alone: the reader
+// qualifies on a TIME bound, not on observing the checkpoint. It pays only
+// as the composite — the writer's live ceiling under the valve's ask
+// (P/2, the Nyquist bound against the reader's routine poll P) CARRIED to
+// every member on the grant, where it is the prod floor AND L2b's pass
+// floor, so passes and beats run at P/2 too. The user accepted the cost:
+// 2× lease-lane beats and 2× checkpoint cycles while an ask is in force.
+// ===========================================================================
+
+/// **Contract 32 — the composite's numbers derive; nothing is a constant
+/// of its own.** The elastic ceiling is `max(P/2, 2 × measured cycle)`
+/// capped at the writer's routine ceiling (a cycle may not run more than
+/// half the time — lever (d)'s law for the scan, applied to the
+/// checkpoint); the live prod floor is `max(min(P, ceiling), skew)` and
+/// reduces to the shipped `max(P, skew)` at the routine ceiling — the
+/// identity that makes "no ask ⇒ the shipped shape" structural.
+#[test]
+fn the_elastic_checkpoint_ceiling_and_the_live_prod_floor_derive() {
+    let _serial = serial();
+    use free_grace::elastic_checkpoint_ceiling_ms as elastic;
+    // The shipped venue: P = 1,000 ms, a ≈ 20 ms cycle ⇒ 500 ms.
+    assert_eq!(elastic(1_000, 20, 1_000), 500);
+    // The cycle-cost floor: a 300 ms cycle may not run more than half the
+    // time ⇒ 600 ms; a 600 ms cycle pins the ceiling at the routine.
+    assert_eq!(elastic(1_000, 300, 1_000), 600);
+    assert_eq!(elastic(1_000, 600, 1_000), 1_000);
+    // A slow-flush venue (5 s tick): P = 5,000, routine 5,000 ⇒ 2,500.
+    assert_eq!(elastic(5_000, 20, 5_000), 2_500);
+    // A reader polling faster than the writer's routine (the env
+    // override): half ITS poll, never below one ms.
+    assert_eq!(elastic(300, 0, 1_000), 150);
+    assert_eq!(elastic(1, 0, 1_000), 1);
+    // Never slower than the routine, whatever the inputs.
+    assert_eq!(elastic(20_000, 0, 1_000), 1_000);
+
+    let clocks = shipped_clocks();
+    let prod = free_grace::ProdParams::derive(&clocks);
+    let floor = free_grace::ack_refresh_floor(&clocks).as_millis() as u64;
+    let skew = clocks.skew_max.as_millis() as u64;
+    let routine = free_grace::writer_routine_checkpoint_ceiling_ms();
+    assert_eq!(
+        prod.floor_for(routine),
+        floor,
+        "at the writer's routine ceiling the live floor IS the shipped floor (the identity)"
+    );
+    assert_eq!(prod.floor_for(u64::MAX), floor, "a ceiling above P changes nothing");
+    assert_eq!(
+        prod.floor_for(500),
+        500,
+        "a halved ceiling halves the floor: a member's answer can now change every P/2"
+    );
+    assert_eq!(
+        prod.floor_for(1),
+        skew,
+        "…but never below the clock-skew bound — the wire's answer changes no faster"
+    );
+    assert_eq!(
+        prod.cadence_for(0, prod.floor_for(500)),
+        Some(500),
+        "the cliff ask under the halved ceiling is the halved floor"
+    );
+}
+
+/// **Contract 33 — the writer's ceiling follows the valve's ask, the grant
+/// carries it, and the prod floor follows.** No ask ⇒ no elastic ceiling
+/// (`None`: the checkpoint task runs its shipped constant/tick) and every
+/// grant advertises the writer's ROUTINE ceiling; an ask in force (a
+/// pressure harvest — rung (a) at the cliff) ⇒ the ceiling in force is
+/// P/2, the gauge reads it, the next grant carries it, and the next ask
+/// is the halved floor. The PROMISE: a grant that advertised an elastic
+/// ceiling is honoured for one routine ceiling past it even after the ask
+/// lapses (the writer relaxes no sooner than every advertised window has
+/// closed). `CHECKPOINT_COMPOSITE=0` ⇒ `None` and the routine ceiling on
+/// every grant, ask or no ask.
+#[test]
+fn an_ask_in_force_tightens_the_writers_ceiling_and_the_grant_carries_it() {
+    let _serial = serial();
+    free_grace::test_set_checkpoint_composite(Some(true));
+    let (clock, ticks) = manual_clock();
+    let owner = armed_owner(&clock);
+    free_grace::arm_owner_plane(clock.clone(), owner.clocks()).expect("derived bound");
+    let grant0 = join(&owner, "r-ceiling", MemberRole::Reader);
+    owner.refresh_free_grace_bound();
+    let routine = free_grace::writer_routine_checkpoint_ceiling_ms();
+    let poll = squeezefs::ro_coherence::reader_revalidate_interval().as_millis() as u64;
+    assert_eq!(
+        routine,
+        squeezefs::meta_backend::kv::checkpoint::CHECKPOINT_MAX_AGE_MS as u64,
+        "the shipped venue (50 ms flush): the routine writer ceiling IS the constant"
+    );
+
+    // No ask: the shipped posture, and the grant says so.
+    assert_eq!(
+        free_grace::checkpoint_ceiling_in_force_ms(),
+        None,
+        "no ask in force ⇒ no elastic ceiling (the checkpoint task's shipped decision)"
+    );
+    assert_eq!(free_grace::checkpoint_ceiling_ms(), routine, "the gauge reads the routine");
+    assert_eq!(
+        grant0.checkpoint_ceiling_ms, routine,
+        "a join grant advertises the routine ceiling"
+    );
+    let g = match owner.renew("r-ceiling", grant0.epoch, 0) {
+        RenewOutcome::Renewed(g) => g,
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(g.checkpoint_ceiling_ms, routine);
+    assert_eq!(free_grace::checkpoint_elastic_cycles(), 0);
+
+    // The ask: a held offset at the allocation cliff (the pressure
+    // harvest — rung (a) asks the floor cadence). Two harvests: the
+    // first computes its ask under the routine floor and puts the ask in
+    // force; the second reads the halved floor the ask enabled.
+    let ring = GraceRing::new(1024);
+    assert!(ring.defer(4 * 1024 * 1024, 4 * 1024 * 1024));
+    ticks.fetch_add(1, Ordering::SeqCst);
+    assert!(ring.harvest_pressure(free_grace::HARVEST_BATCH).is_empty());
+    assert_eq!(
+        free_grace::prod_renew_ms(),
+        routine.max(clock_skew_ms(&owner)),
+        "the first ask is the routine floor (the ceiling was routine when it was computed)"
+    );
+    assert_eq!(
+        free_grace::checkpoint_ceiling_in_force_ms(),
+        Some(poll / 2),
+        "an ask in force ⇒ the writer's ceiling is P/2 (the Nyquist bound)"
+    );
+    assert_eq!(free_grace::checkpoint_ceiling_ms(), poll / 2, "the gauge reads it");
+    assert!(ring.harvest_pressure(free_grace::HARVEST_BATCH).is_empty());
+    assert_eq!(
+        free_grace::prod_renew_ms(),
+        poll / 2,
+        "the next ask is the halved floor — the prod floor follows the live ceiling"
+    );
+    let g = match owner.renew("r-ceiling", grant0.epoch, 0) {
+        RenewOutcome::Renewed(g) => g,
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(
+        (g.renew_ms, g.checkpoint_ceiling_ms),
+        (poll / 2, poll / 2),
+        "the grant carries the halved beat AND the halved ceiling it rests on"
+    );
+    let snap = free_grace::stats_snapshot();
+    assert_eq!(
+        snap["free_grace_checkpoint_ceiling_ms"].as_u64(),
+        Some(poll / 2),
+        "the stats inode publishes the ceiling in force"
+    );
+    assert_eq!(snap["free_grace_checkpoint_elastic_cycles"].as_u64(), Some(0));
+    free_grace::note_elastic_checkpoint_cycle();
+    assert_eq!(
+        free_grace::stats_snapshot()["free_grace_checkpoint_elastic_cycles"].as_u64(),
+        Some(1),
+        "elastic cycles are counted"
+    );
+
+    // The promise outlives the ask by one routine ceiling: the last
+    // elastic grant was at `t_g`; the ask lapses (TTL = the routine beat,
+    // no harvest refreshes it) but the writer holds P/2 until `t_g +
+    // routine`, then relaxes.
+    let t_g = clock.now_ms();
+    let ttl = owner.clocks().renew_interval.as_millis() as u64;
+    ticks.fetch_add(ttl + 1, Ordering::SeqCst);
+    assert_eq!(free_grace::prod_renew_ms(), 0, "the ask lapsed");
+    // The lever is latched off to isolate the promise from the derivation
+    // (the decay arm would otherwise re-arm on the next renewal).
+    free_grace::test_set_checkpoint_composite(Some(false));
+    assert_eq!(
+        free_grace::checkpoint_ceiling_in_force_ms(),
+        None,
+        "past t_g + routine ({} ms) the promise has closed: the routine posture",
+        t_g + routine
+    );
+    // Re-run the promise with the clock inside the window.
+    free_grace::test_set_checkpoint_composite(Some(true));
+    assert!(ring.harvest_pressure(free_grace::HARVEST_BATCH).is_empty());
+    let g = match owner.renew("r-ceiling", grant0.epoch, 0) {
+        RenewOutcome::Renewed(g) => g,
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(g.checkpoint_ceiling_ms, poll / 2);
+    free_grace::test_set_checkpoint_composite(Some(false));
+    assert_eq!(
+        free_grace::checkpoint_ceiling_in_force_ms(),
+        Some(poll / 2),
+        "the advertised window is honoured after the derivation stopped asking"
+    );
+    ticks.fetch_add(routine - 1, Ordering::SeqCst);
+    assert_eq!(free_grace::checkpoint_ceiling_in_force_ms(), Some(poll / 2));
+    ticks.fetch_add(1, Ordering::SeqCst);
+    assert_eq!(
+        free_grace::checkpoint_ceiling_in_force_ms(),
+        None,
+        "…and closes exactly one routine ceiling after the grant"
+    );
+
+    // The lever off, an ask in force: the routine ceiling on every grant,
+    // no elastic ceiling, the routine floor — the shipped shape.
+    assert!(ring.harvest_pressure(free_grace::HARVEST_BATCH).is_empty());
+    assert!(ring.harvest_pressure(free_grace::HARVEST_BATCH).is_empty());
+    assert_eq!(free_grace::checkpoint_ceiling_in_force_ms(), None);
+    assert_eq!(
+        free_grace::prod_renew_ms(),
+        routine.max(clock_skew_ms(&owner)),
+        "CHECKPOINT_COMPOSITE=0: the ask is the shipped floor"
+    );
+    let g = match owner.renew("r-ceiling", grant0.epoch, 0) {
+        RenewOutcome::Renewed(g) => g,
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(
+        g.checkpoint_ceiling_ms, routine,
+        "CHECKPOINT_COMPOSITE=0: the grant advertises the routine ceiling"
+    );
+    assert!(free_grace::test_clear_checkpoint_composite());
+}
+
+/// The owner's clock-skew bound in ms (the floor's lower clamp).
+fn clock_skew_ms(owner: &MembershipOwner) -> u64 {
+    owner.clocks().skew_max.as_millis() as u64
+}
+
+/// **Contract 34 — the member adopts the advertised ceiling with its
+/// label.** `MemberSession::checkpoint_ceiling_ms` is the writer's ceiling
+/// advertised on the grant that carried the label `learned_label` reports
+/// (a join or a routine renewal); a CARRIAGE renewal learns no label and
+/// so learns no ceiling for the ladder — but deposits the grant's ask +
+/// ceiling for the pass resolver like the routine renewal does. A grant
+/// advertising nothing (`0` — an owner with no grace plane) falls back to
+/// `CHECKPOINT_MAX_AGE_MS`; `CHECKPOINT_COMPOSITE=0` reads the constant
+/// whatever was advertised.
+#[test]
+fn the_member_adopts_the_advertised_ceiling_with_its_label() {
+    let _serial = serial();
+    free_grace::test_set_checkpoint_composite(Some(true));
+    free_grace::test_set_pass_elastic(Some(true));
+    let constant = squeezefs::meta_backend::kv::checkpoint::CHECKPOINT_MAX_AGE_MS as u64;
+    let cl = shipped_clocks();
+    let grant = |epoch: u64, renew_ms: u64, ceiling: u64, at: u64| Grant {
+        epoch,
+        term: 1,
+        t_owner_ms: cl.t_owner.as_millis() as u64,
+        skew_max_ms: cl.skew_max.as_millis() as u64,
+        d_purge_ms: cl.d_purge.as_millis() as u64,
+        renew_ms,
+        granted_at_owner_ms: at,
+        lane_supply_blocks: 0,
+        checkpoint_ceiling_ms: ceiling,
+    };
+    let (clock, ticks) = manual_clock();
+    let session = MemberSession::adopt("m-ceiling", MemberRole::Reader, &grant(1, 10_000, 0, 100), 10_000, clock);
+    assert_eq!(
+        session.checkpoint_ceiling_ms(),
+        constant,
+        "nothing advertised ⇒ the constant (an owner with no grace plane)"
+    );
+    ticks.fetch_add(500, Ordering::SeqCst);
+    session.renewed(&grant(1, 500, 500, 600), 10_500);
+    assert_eq!(
+        session.checkpoint_ceiling_ms(),
+        500,
+        "a routine renewal learns the ceiling WITH the label"
+    );
+    assert_eq!(session.learned_label().0, 600);
+    ticks.fetch_add(200, Ordering::SeqCst);
+    session.renewed_carriage(&grant(1, 700, 700, 800), 10_700);
+    assert_eq!(
+        session.checkpoint_ceiling_ms(),
+        500,
+        "a carriage renewal learns no label and no ceiling for the ladder"
+    );
+    assert_eq!(session.learned_label().0, 600, "…the label stays the routine renewal's");
+    assert_eq!(
+        free_grace::reader_pass_interval(Duration::from_millis(5_000), 10_750),
+        Duration::from_millis(700),
+        "…but the pass resolver reads the carriage's ask + ceiling (the pass floor is about NOW)"
+    );
+    ticks.fetch_add(300, Ordering::SeqCst);
+    session.renewed(&grant(1, 10_000, 0, 1_100), 11_000);
+    assert_eq!(
+        session.checkpoint_ceiling_ms(),
+        constant,
+        "a later grant advertising nothing returns the member to the constant"
+    );
+    session.renewed(&grant(1, 500, 500, 1_200), 11_100);
+    free_grace::test_set_checkpoint_composite(Some(false));
+    assert_eq!(
+        session.checkpoint_ceiling_ms(),
+        constant,
+        "CHECKPOINT_COMPOSITE=0: the constant, whatever was advertised"
+    );
+    assert!(free_grace::test_clear_checkpoint_composite());
+    assert!(free_grace::test_clear_pass_elastic());
+}
+
+/// **Contract 35 — the composite on the fleet-cadence loop: the cadences
+/// halve, the hold drops, the cost is the accepted 2×, and no promise
+/// bends.** H4 = the shipped H3 plus the composite. Pinned: (i) the
+/// writer ran at P/2 (`ceiling_min` = 500, `elastic_cycles` > 0) and the
+/// members' passes tightened (`pass_prods` > 0 — L2b's first engagement on
+/// this venue, structurally impossible before); (ii) `bound_age` reads
+/// below H3's by the composite's predicted class (≥ 300 of the ≈ 600 ms
+/// forecast); (iii) checkpoints/s and renewals/s read ≈ 2× H3's — the
+/// cost the user accepted, measured; (iv) closure, `forced = fences = 0`,
+/// the stream never stalls more; (v) the published staleness bound (which
+/// never moves) is honoured by every pass the elastic cadence ran
+/// (`staleness_worst ≤ bound`); (vi) H3 itself (the lever off) is the
+/// hold-time note's row to the tick — the shipped shape, byte for byte.
+#[test]
+fn the_checkpoint_composite_halves_the_cadences_and_cuts_the_hold() {
+    let _serial = serial();
+    let shape = fleet_cadence_shape("composite(spare=256,8m)", 256);
+    let h3 = run_closed_loop(&shape, Levers::h3());
+    let h4 = run_closed_loop(
+        &shape,
+        Levers {
+            composite: true,
+            ..Levers::h3()
+        },
+    );
+    let staleness_ms = squeezefs::ro_coherence::reader_staleness_bound().as_millis() as u64;
+    for r in [&h3, &h4] {
+        println!("{}", r.render(&shape));
+        assert_eq!(r.deferrals, r.releases + r.held_end, "{}: closure", r.config);
+        assert_eq!((r.forced, r.fences), (0, 0), "{}: no fence", r.config);
+        assert_eq!(r.hold_unplaced, 0, "{}: every stage placed", r.config);
+        assert!(
+            r.staleness_worst_ms <= staleness_ms,
+            "{}: every pass honoured the published staleness bound ({} ≤ {staleness_ms} ms)",
+            r.config,
+            r.staleness_worst_ms
+        );
+    }
+    // (vi) The lever off is the shipped H3 row (the hold-time note's
+    // 7,724 ms — deterministic, bit-identical across runs).
+    assert!(
+        (h3.bound_age_mean_ms - 7_724.0).abs() <= 1.0,
+        "the composite off is the shipped H3 row verbatim ({:.0} ms)",
+        h3.bound_age_mean_ms
+    );
+    assert_eq!(h3.elastic_cycles, 0, "no elastic cycle without the composite");
+    assert_eq!(h3.pass_prods, 0, "L2b is structurally inert on this venue without it");
+    assert_eq!(h3.ceiling_min_ms, shape.checkpoint_ms);
+    // (i) Engagement.
+    assert_eq!(
+        h4.ceiling_min_ms, 500,
+        "the writer ran at P/2 while the ask was in force"
+    );
+    assert!(h4.elastic_cycles > 0, "elastic checkpoint cycles ran");
+    assert!(h4.pass_prods > 0, "the members' passes tightened (L2b engaged by the composite)");
+    // (ii) The hold.
+    assert!(
+        h4.bound_age_mean_ms <= h3.bound_age_mean_ms - 300.0,
+        "the composite cuts the hold: H4 {:.0} vs H3 {:.0} ms",
+        h4.bound_age_mean_ms,
+        h3.bound_age_mean_ms
+    );
+    assert!(
+        h4.hold_ms < h3.hold_ms,
+        "the live hold gauge follows ({} vs {} ms)",
+        h4.hold_ms,
+        h3.hold_ms
+    );
+    // (iii) The cost, measured: ≈ 2× checkpoints and ≈ 2× renewals.
+    let ck_ratio = h4.checkpoints_per_s / h3.checkpoints_per_s;
+    let rn_ratio = h4.renewals_per_s / h3.renewals_per_s;
+    println!(
+        "ROW composite-cost: checkpoints/s {:.2} → {:.2} ({ck_ratio:.2}×), renewals/s {:.2} → {:.2} ({rn_ratio:.2}×)",
+        h3.checkpoints_per_s, h4.checkpoints_per_s, h3.renewals_per_s, h4.renewals_per_s
+    );
+    assert!(
+        (1.6..=2.2).contains(&ck_ratio),
+        "the checkpoint cost is the accepted 2× ({ck_ratio:.2}×)"
+    );
+    assert!(
+        (1.6..=2.2).contains(&rn_ratio),
+        "the lease-lane cost is the accepted 2× ({rn_ratio:.2}×)"
+    );
+    // (iv) Never more stalls.
+    assert!(h4.stalls_steady <= h3.stalls_steady, "the composite never stalls the stream more");
+}
+
+/// **Contract 36 — the KV checkpoint TASK runs at the elastic ceiling
+/// under an ask, and at its shipped cadence without one.** A real
+/// `KvMetaBackend` (its checkpoint task ticking on the shipped 50 ms
+/// flush cadence) commits under a plane with no ask: no elastic cycle is
+/// ever counted and the gauge reads the routine. An ask in force (a
+/// pressure harvest) ⇒ the task's cycles are counted elastic and the
+/// ledger's marks grow at the halved period. `CHECKPOINT_COMPOSITE=0`
+/// under the same ask ⇒ no elastic cycle.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_checkpoint_task_runs_at_the_elastic_ceiling_under_an_ask() {
+    use squeezefs::meta_backend::kv::backend::KvMetaBackend;
+    use squeezefs::meta_backend::kv::builder::{format_v3, FormatV3Options};
+    use squeezefs::meta_backend::kv::node::DEFAULT_NODE_SIZE;
+    use squeezefs::meta_backend::Metadata;
+    let _serial = serial();
+    free_grace::test_set_checkpoint_composite(Some(true));
+    let file = tempfile::NamedTempFile::new().expect("temp volume");
+    file.as_file()
+        .set_len(64 * 1024 * 1024)
+        .expect("size volume");
+    format_v3(
+        file.path(),
+        64 * 1024 * 1024,
+        &FormatV3Options {
+            node_size: DEFAULT_NODE_SIZE,
+            journal_len_override: None,
+            force: false,
+            full_wipe: false,
+            format_config_xattr: None,
+        },
+    )
+    .await
+    .expect("format v3");
+    let be = KvMetaBackend::open(file.path()).await.expect("mount v3");
+    let (clock, _ticks) = manual_clock();
+    let owner = armed_owner(&clock);
+    free_grace::arm_owner_plane(clock.clone(), owner.clocks()).expect("derived bound");
+    let _r = join(&owner, "r-task", MemberRole::Reader);
+    owner.refresh_free_grace_bound();
+    let poll = squeezefs::ro_coherence::reader_revalidate_interval().as_millis() as u64;
+    let routine = free_grace::writer_routine_checkpoint_ceiling_ms();
+
+    // A commit stream for a little over one routine ceiling, no ask.
+    let commit_for = |be: Arc<KvMetaBackend>, tag: &'static str, ms: u64| async move {
+        let until = std::time::Instant::now() + Duration::from_millis(ms);
+        let mut i = 0u64;
+        while std::time::Instant::now() < until {
+            be.create(1, &format!("{tag}-{i}"), 0o644, 0, 0)
+                .await
+                .expect("create");
+            i += 1;
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    };
+    commit_for(Arc::clone(&be), "quiet", routine + routine / 4).await;
+    assert_eq!(
+        free_grace::checkpoint_elastic_cycles(),
+        0,
+        "no ask ⇒ the task ran its shipped cadence: no elastic cycle"
+    );
+    assert_eq!(free_grace::checkpoint_ceiling_ms(), routine);
+    assert!(free_grace::checkpoint_marks() >= 1, "the routine cycles marked the ledger");
+
+    // The ask (the allocation cliff), then the same stream.
+    let ring = GraceRing::new(1024);
+    assert!(ring.defer(4 * 1024 * 1024, 4 * 1024 * 1024));
+    assert!(ring.harvest_pressure(free_grace::HARVEST_BATCH).is_empty());
+    assert!(ring.harvest_pressure(free_grace::HARVEST_BATCH).is_empty());
+    assert_eq!(free_grace::checkpoint_ceiling_in_force_ms(), Some(poll / 2));
+    let marks_before = free_grace::checkpoint_marks();
+    commit_for(Arc::clone(&be), "asked", routine + routine / 4).await;
+    let elastic = free_grace::checkpoint_elastic_cycles();
+    let marks = free_grace::checkpoint_marks() - marks_before;
+    println!("ROW checkpoint-task: {marks} cycle(s) in {} ms under an ask, {elastic} elastic", routine + routine / 4);
+    assert!(
+        elastic >= 1,
+        "an ask in force ⇒ the task's cycles ran under the elastic ceiling ({elastic})"
+    );
+    assert!(
+        marks >= 2,
+        "at P/2 the task cycled at least twice in 1.25 routine ceilings ({marks})"
+    );
+
+    // The lever off under the same ask: the shipped cadence.
+    free_grace::test_set_checkpoint_composite(Some(false));
+    let elastic_before = free_grace::checkpoint_elastic_cycles();
+    commit_for(Arc::clone(&be), "off", routine + routine / 4).await;
+    assert_eq!(
+        free_grace::checkpoint_elastic_cycles(),
+        elastic_before,
+        "CHECKPOINT_COMPOSITE=0: no elastic cycle under an ask"
+    );
+    assert!(free_grace::test_clear_checkpoint_composite());
+    be.shutdown().await.expect("shutdown");
 }

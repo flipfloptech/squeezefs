@@ -2595,6 +2595,17 @@ by itself because allocation evaluates a **shorter** pressure deadline (one
 cycle, floored) and fences past it. `df` counts held offsets as **used**,
 which is honest: they are genuinely unavailable until acknowledged.
 
+**The wait is BOUNDED in wall time and TERMINAL past its wall** (the
+2026-09-05 s11 fleet wedge, `.benchmarks/2026-09-06-cowriter-enospc-wedge.md`):
+a write-path allocation parks on grace-held space for at most twice the
+routine fence bound (`free_grace_fence_bound_base_ms`), floored at one
+second — a duration, never the reallocation label — and on a co-writer only
+while the authority's last harvest reply reported a held ring
+(`free_grace_bound_age_ms` nonzero). Past the wall the `ENOSPC` stands for
+that write: the block stripe is released and the write replies. Before the
+fix a co-writer's exhausted-lane write parked forever under its block
+stripe (the field's 30-minute watchdog storm with `.stats` in D-state).
+
 **Live signals** (`.stats`, writer side). `free_grace_mode` is `off` (no
 plane — the shipped default), `idle` (armed, no members) or `armed`:
 
@@ -2605,6 +2616,7 @@ plane — the shipped default), `idle` (armed, no members) or `armed`:
 | `free_grace_forced_releases` | **the tripwire:** offsets released *without* an acknowledgement, i.e. past the bound or at the ring cap. 0 on a healthy fleet; nonzero means at least one reader was fenced, and only that reader's coherence was ever at stake |
 | `free_grace_laggard_fences` | readers evicted for not acknowledging. Investigate alongside `membership_renewals` — a reader renewing but not acknowledging is a revalidation problem, not a network one |
 | `free_grace_alloc_stalls` | allocations that refused ENOSPC with offsets held. Expected only on a genuinely full store; sustained growth means the readers are too slow for the write rate (raise capacity, or shorten the cycle with `SQUEEZEFS_MEMBERSHIP_LEASE_TTL_MS` / `SQUEEZEFS_META_REVALIDATE_MS`) |
+| `write_enospc_refusals` | WRITE replies refused `ENOSPC` — the synchronous face of exhaustion (a promotion or sparse-stripe mint the write itself owns; custody the never-lossy ladder ACKed reports at `fsync`, not here). Growth is honest pressure. Its complement is the tripwire: writes that neither reply nor count while `alloc_lane_enospc_refusals` climbs (`fuse_op_watchdog_overdue` growing on `write`) is the pre-fix wedge shape |
 | `free_grace_bound` | the label the writer may reallocate up to; `free_grace_fence_bound_ms` / `free_grace_pressure_bound_ms` / `free_grace_ring_cap` publish the derived numbers in force so this page cannot drift from them. **`free_grace_fence_bound_ms` is the deadline IN FORCE** — it moves as rung 2 tightens it — and `free_grace_fence_bound_base_ms` is the un-tightened derivation beside it |
 | `free_grace_pressure_pct` | the graded pressure reading: `0` = the supply outlives the routine bound at the measured deferral rate (quiet), `100` = it is already gone. It is a RATE-derived forecast, not an occupancy: a nearly-empty ring under a violent storm reads high, which is the point |
 | `free_grace_prods` (rung 1) | grants that carried a shortened renewal cadence to a member the writer was waiting on. `0` on a quiet writer; growth under a storm is the ladder working, and `free_grace_prod_renew_ms` is the cadence currently being handed out (`0` = none in force). **Growth with `free_grace_bound` flat is the stop-and-read signal**: the ask is being delivered and not answered, so expect the fence next — check that reader's `meta_kv_revalidate_epochs` and its `free_grace_reader_acks` |

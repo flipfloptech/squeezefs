@@ -13048,11 +13048,25 @@ impl DataRouter {
     /// elision: zero discards; clone-shared keys decrement-only) and the
     /// B guards drop. Returns `Ok(true)` when an epoch closed.
     ///
-    /// * **Fenced (W5)**: publish NOTHING, free NOTHING (the durable map
-    ///   may still reference parked A keys; an intermediate save may have
-    ///   published some B keys — successor accounting owns both), drop
-    ///   the ledger + guards, invalidate the RAM entry, count
-    ///   `rewrite_shadow_fence_drops`, propagate loud.
+    /// * **Fenced (W5)** — the GENUINE fence class only: the D0 custody
+    ///   poison ([`crate::data_custody::poisoned`]) or a `WriterGuardFenced`
+    ///   publish refusal (a dead custody era). Publish NOTHING, free
+    ///   NOTHING (the durable map may still reference parked A keys; an
+    ///   intermediate save may have published some B keys — successor
+    ///   accounting owns both), drop the ledger + guards, invalidate the
+    ///   RAM entry, count `rewrite_shadow_fence_drops`, propagate loud.
+    /// * **A process-local lease rotation** (`FencingTokenExpired` with a
+    ///   newer generation in THIS process) is NOT a fence: the epoch's
+    ///   RAM-only bindings are the newest acked custody in existence, so
+    ///   the save re-presents the ino's CURRENT generation and converges
+    ///   (`rewrite_shadow_close_retries`) — the 2026-08-06 tail-loss law
+    ///   (`tests/fsync_writeback_tail_loss_tests.rs`), which every other
+    ///   publish site already runs. The pre-law arm took W5 here on a LIVE
+    ///   mount: it discarded acked bytes, and it dropped the local hygiene
+    ///   of parked keys whose displacement an intermediate publish had
+    ///   ALREADY covered (and the authority had already freed) — the s11
+    ///   co-writers' `CLAIM ANOMALY` lineage
+    ///   (`.benchmarks/2026-09-06-cowriter-free-residual-lineage.md`).
     /// * **Transient save failure**: the epoch RE-REGISTERS (never-lossy
     ///   — bindings stay in RAM + registry; the next close trigger
     ///   retries).
@@ -13082,18 +13096,40 @@ impl DataRouter {
         // and this close never saw its return).
         let save_res: Result<(bool, Vec<crate::meta_backend::kv::block_refs::BlockRef>)> =
             match current {
+                _ if crate::data_custody::poisoned() => Err(SqueezefsError::WriterGuardFenced),
                 Some(mut cur) if cur.layout_dirty => {
                     cur.layout_dirty = false;
                     cur.cached_at = std::time::Instant::now();
-                    match self
-                        .save_metadata_to_backend_ext(ino, &cur, fencing_token, None, &[])
-                        .await
-                    {
-                        Ok(verdict) => {
-                            self.publish_layout_cache_entry(ino, cur);
-                            Ok(verdict)
+                    let mut token = fencing_token;
+                    loop {
+                        match self
+                            .save_metadata_to_backend_ext(ino, &cur, token, None, &[])
+                            .await
+                        {
+                            Ok(verdict) => {
+                                self.publish_layout_cache_entry(ino, cur);
+                                break Ok(verdict);
+                            }
+                            Err(SqueezefsError::FencingTokenExpired { .. }) => {
+                                let fresh = self.inner.dlm.get_fencing_token_ino(ino);
+                                if fresh <= token {
+                                    // Structurally unreachable (the read is
+                                    // monotone past every failed
+                                    // presentation) — the loud-safe
+                                    // direction is the transient arm below:
+                                    // the epoch re-registers, nothing drops.
+                                    break Err(SqueezefsError::FencingTokenExpired {
+                                        token,
+                                        expected: fresh,
+                                    });
+                                }
+                                METRICS
+                                    .rewrite_shadow_close_retries
+                                    .fetch_add(1, Ordering::Relaxed);
+                                token = fresh;
+                            }
+                            Err(e) => break Err(e),
                         }
-                        Err(e) => Err(e),
                     }
                 }
                 // Clean entry (an intermediate save — a flush-leg merge
@@ -13149,7 +13185,7 @@ impl DataRouter {
                 }
                 Ok(true)
             }
-            Err(e @ SqueezefsError::FencingTokenExpired { .. }) => {
+            Err(e @ SqueezefsError::WriterGuardFenced) => {
                 while epoch.displaced.pop().is_some() {}
                 while epoch.guards.pop().is_some() {}
                 self.discard_layout_cache(ino);

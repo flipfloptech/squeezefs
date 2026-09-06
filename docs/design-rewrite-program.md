@@ -443,6 +443,23 @@ construction: the D0 `failed` latch refuses the commit, and the
 reclaimer/trim fence-halt latch guarantees no destructive device command
 ever issues from the zombie.
 
+**The fence class is the GENUINE one only (2026-09-06,
+`.benchmarks/2026-09-06-cowriter-free-residual-lineage.md`):** the D0
+custody poison (`data_custody::poisoned`) or a `WriterGuardFenced`
+publish refusal (a dead custody era). A `FencingTokenExpired` from the
+swap's save is a PROCESS-LOCAL lease rotation — within one process it can
+only mean this daemon re-acquired the ino's lease between the closer's
+token capture and the revalidation (sibling handles, range stripe grants)
+— and the epoch's RAM-only bindings are the newest acked custody in
+existence, so the close re-presents the ino's current generation and
+converges (`rewrite_shadow_close_retries`), the 2026-08-06 tail-loss law
+every other publish site already runs. The pre-law arm took W5 on a live
+mount: it discarded acked bytes, and it dropped the local hygiene of
+parked A keys whose displacement an intermediate publish had already
+covered — on a co-writer, whose authority had already freed them, the
+lingering refcounts fired `CLAIM ANOMALY` on every re-harvest (the s11
+fleet's 850 of 913 anomalies, one fenced close per carrier).
+
 ### 5.5 Capacity (KD-1.7) + VL composition
 
 Bounded ≤ 2× per file by construction (each block: at most one parked A

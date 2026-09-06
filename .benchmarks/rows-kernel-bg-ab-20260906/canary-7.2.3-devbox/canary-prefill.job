@@ -1,0 +1,27 @@
+# tests/fio/exa_write_bw.job — EXAScaler client-validation write-BW shape.
+# Shape parity with the DDN exa-client kit's write_BW job: libaio, bs=1M,
+# iodepth=8, direct=1, time_based runtime=30 ramp=10, size=1g,
+# numjobs=nproc split across NUMA nodes.
+#
+# This file is the [global] SHAPE only — run it via
+# tests/fio/run_fio_row.sh, which discovers the NUMA topology at runtime
+# and appends one job section per node (numa_cpu_nodes/numa_mem_policy
+# only when >1 node exists; single-node boxes get one plain section).
+[global]
+group_reporting=1
+ioengine=${SQZ_FIO_ENGINE}
+readwrite=write
+direct=1
+bs=${SQZ_FIO_BS}
+size=${SQZ_FIO_SIZE}
+iodepth=${SQZ_FIO_IODEPTH}
+norandommap=0
+fallocate=none
+time_based
+runtime=${SQZ_FIO_RUNTIME}
+ramp_time=${SQZ_FIO_RAMP}
+filename_format=sqzfio.$jobnum.$filenum
+directory=${SQZ_FIO_DIR}
+
+[exa_write_bw]
+numjobs=32

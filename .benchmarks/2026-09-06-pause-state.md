@@ -41,6 +41,12 @@ mount (the A-arm rig reset the cluster; remount is part of every arm).
    194 µs, `fuse3-ur` µs/op vs 23, `lock.txt` slowpath share vs 12.6–13.1 %.
    If the patched kernel is the LAPTOP's (7.1/7.2 track), the laptop needs
    its own A arm first — it was not recorded (the rig's venue is the box).
+   **Update (same day, after the laptop reboot):** the laptop is on
+   `7.2.3-cachyos-lto` WITH the 7.2 patch — the patch's first runtime is
+   recorded as `docs/design-kernel-bg-per-queue.md` §5a (zc gate 149/149
+   both postures, a 779k-IOPS rand-4k load row, every tripwire 0, zero
+   fuse/uring kernel-log lines). The laptop cannot be an A/B venue (its
+   kernel moved 7.1.8 → 7.2.3 in the same boot); the B arm stays the box's.
 3. **Finding 15 term 1 — the user's decision**: the remaining 7.0 s of
    hold are the reader ack ladder's two derived coherence windows (qualify
    ≈ 2 s, drain ≈ 4 s, × min over 8 members). Four KD-FG-11 items

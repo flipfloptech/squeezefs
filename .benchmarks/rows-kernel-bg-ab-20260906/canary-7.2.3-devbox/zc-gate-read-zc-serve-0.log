@@ -1,0 +1,197 @@
+== zc-capability gate: 5 suites + the zcrx lib probes ==
+   kernel:           7.2.3-cachyos-lto
+   /dev/fuse:        present
+   enable_uring:     Y
+   NOTE: kernel name does not say 'sqz' — the zc arm decides:
+   a stock kernel refuses it and this gate then fails loudly.
+-- building test binaries as justin
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.14s
+  Executable tests/fuse_zc_write_fusion_tests.rs (target/debug/deps/fuse_zc_write_fusion_tests-40c0ea6ff4e13abd)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.13s
+  Executable tests/zc_bridge_cqe_wedge_tests.rs (target/debug/deps/zc_bridge_cqe_wedge_tests-faa62e1d0599612a)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.13s
+  Executable tests/zc_bridge_phase_tests.rs (target/debug/deps/zc_bridge_phase_tests-befda5128b5fbb51)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.13s
+  Executable tests/bench_tests.rs (target/debug/deps/bench_tests-4677910d37fa9f60)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.13s
+  Executable tests/wero_rtype_tests.rs (target/debug/deps/wero_rtype_tests-86e6580a51c922de)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.13s
+  Executable unittests src/lib.rs (target/debug/deps/squeezefs-a229a316d333f46e)
+  Executable unittests src/lib.rs (target/debug/deps/squeezefs_ipc-41800a748775ac44)
+  Executable unittests src/lib.rs (target/debug/deps/squeezefs_testkit-8d7f561a04f31c91)
+-- fuse_zc_write_fusion_tests (/home/justin/Source/squeezefs/target/debug/deps/fuse_zc_write_fusion_tests-40c0ea6ff4e13abd)
+
+running 5 tests
+test fused_write_lost_bridge_cqe_resolves_through_the_ladder ... ok
+test fusion_ceiling_bounds_inline_work_and_explicit_wins ... ok
+test fusion_lever_off_keeps_the_classic_dispatch ... ok
+test ineligible_growth_writes_extract_at_delivery_and_never_fuse ... ok
+test w1_eligible_overwrites_fuse_without_double_pay ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 9.14s
+
+-- zc_bridge_cqe_wedge_tests (/home/justin/Source/squeezefs/target/debug/deps/zc_bridge_cqe_wedge_tests-faa62e1d0599612a)
+
+running 3 tests
+test healthy_armed_mount_fires_no_bridge_tripwires ... ok
+test lost_overlay_store_cqe_resolves_through_the_deadline_ladder ... ok
+test lost_write_bridge_cqes_resolve_through_the_deadline_ladder ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 6.68s
+
+-- zc_bridge_phase_tests (/home/justin/Source/squeezefs/target/debug/deps/zc_bridge_phase_tests-befda5128b5fbb51)
+
+running 2 tests
+test cold_zc_reads_decompose_into_four_exact_hops_with_a_per_op_chain ... ok
+test composed_dispatch_law_partitions_every_read_on_a_zc_session ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 4.05s
+
+-- bench_tests (/home/justin/Source/squeezefs/target/debug/deps/bench_tests-4677910d37fa9f60)
+
+running 95 tests
+test test_auto_file_size_rounds_down_to_1mib ... ok
+test test_auto_sizing_counts_existing_dataset_as_free ... ok
+test test_auto_threads_clamp::case_1 ... ok
+test test_auto_threads_clamp::case_2 ... ok
+test test_auto_threads_clamp::case_3 ... ok
+test test_auto_threads_clamp::case_4 ... ok
+test test_auto_threads_clamp::case_5 ... ok
+test test_auto_threads_clamp::case_6 ... ok
+test test_auto_total_caps_at_quarter_of_free_space ... ok
+test test_auto_total_floor_and_per_thread_scaling ... ok
+test test_auto_total_too_small_filesystem_is_loud ... ok
+test test_bare_invocation_selects_the_saturation_suite ... ok
+test test_block_count_partial_tail ... ok
+test test_block_order_rand_is_full_coverage_permutation ... ok
+test test_block_order_sequential_is_identity ... ok
+test test_cli_bare_invocation_runs_suite_with_explicit_tiny_shape ... ok
+test test_cli_block_without_phases_is_refused ... ok
+test test_cli_direct_unaligned_block_rejected ... ok
+test test_cli_help_documents_fsync_units_time_and_auto ... ok
+test test_cli_new_surface_end_to_end ... ok
+test test_cli_old_flags_are_rejected::case_1_large_size ... ok
+test test_cli_old_flags_are_rejected::case_2_small_size ... ok
+test test_cli_old_flags_are_rejected::case_3_small_count ... ok
+test test_cli_old_flags_are_rejected::case_4_only ... ok
+test test_cli_old_flags_are_rejected::case_5_skip ... ok
+test test_cli_old_flags_are_rejected::case_6_small_only ... ok
+test test_cli_old_flags_are_rejected::case_7_large_only ... ok
+test test_cli_read_without_dataset_fails_loud_nonzero ... ok
+test test_dataset_layout_paths ... ok
+test test_del_on_mismatched_dataset_deletes_nothing ... ok
+test test_direct_100k_block_rejected_via_size_multiple_rule ... ok
+test test_direct_end_to_end_when_supported ... ok
+test test_direct_requires_block_multiple_of_4096 ... ok
+test test_direct_requires_size_multiple_of_block ... ok
+test test_end_to_end_all_four_phases ... ok
+test test_eof_partial_block_write_and_read ... ok
+test test_fill_block_deterministic_and_nonzero ... ok
+test test_parse_size_accepts_human_units::case_01 ... ok
+test test_parse_size_accepts_human_units::case_02 ... ok
+test test_parse_size_accepts_human_units::case_03 ... ok
+test test_parse_size_accepts_human_units::case_04 ... ok
+test test_parse_size_accepts_human_units::case_05 ... ok
+test test_parse_size_accepts_human_units::case_06 ... ok
+test test_parse_size_accepts_human_units::case_07 ... ok
+test test_parse_size_accepts_human_units::case_08 ... ok
+test test_parse_size_accepts_human_units::case_09 ... ok
+test test_parse_size_accepts_human_units::case_10 ... ok
+test test_parse_size_accepts_human_units::case_11 ... ok
+test test_parse_size_accepts_human_units::case_12 ... ok
+test test_parse_size_rejects_garbage::case_01 ... ok
+test test_parse_size_rejects_garbage::case_02 ... ok
+test test_parse_size_rejects_garbage::case_03 ... ok
+test test_parse_size_rejects_garbage::case_04 ... ok
+test test_parse_size_rejects_garbage::case_05 ... ok
+test test_parse_size_rejects_garbage::case_06 ... ok
+test test_parse_size_rejects_garbage::case_07 ... ok
+test test_parse_size_rejects_garbage::case_08 ... ok
+test test_parse_size_rejects_garbage::case_09 ... ok
+test test_parse_size_rejects_garbage::case_10 ... ok
+test test_phase_passes_inherit_rand_time_box_default ... ok
+test test_phase_selection_fixed_order::case_1 ... ok
+test test_phase_selection_fixed_order::case_2 ... ok
+test test_phase_selection_fixed_order::case_3 ... ok
+test test_phase_selection_fixed_order::case_4 ... ok
+test test_phase_selection_fixed_order::case_5 ... ok
+test test_phase_selection_fixed_order::case_6 ... ok
+test test_phase_selection_fixed_order::case_7 ... ok
+test test_phase_selection_fixed_order::case_8 ... ok
+test test_rand_write_full_coverage_content ... ok
+test test_read_missing_dataset_is_loud_and_creates_nothing ... ok
+test test_reread_same_dataset_with_different_block_sizes ... ok
+test test_resolve_shape_auto_defaults ... ok
+test test_resolve_shape_explicit_flags_always_override ... ok
+test test_resolve_time_box::case_1 ... ok
+test test_resolve_time_box::case_2 ... ok
+test test_resolve_time_box::case_3 ... ok
+test test_resolve_time_box::case_4 ... ok
+test test_resolve_time_box::case_5 ... ok
+test test_resolve_time_box::case_6 ... ok
+test test_run_invocation_rejects_zero_iterations ... ok
+test test_shape_rejects_zero_size_and_block ... ok
+test test_shape_rejects_zero_threads_and_files ... ok
+test test_single_phase_inherits_shape_against_written_dataset ... ok
+test test_stat_del_without_write_reuse_dataset ... ok
+test test_suite_lifecycle_direct_when_supported ... ok
+test test_suite_lifecycle_on_tiny_dataset ... ok
+test test_suite_pass_sequence_and_shapes ... ok
+test test_suite_refuses_explicit_block_and_rand ... ok
+test test_suite_time_flag_overrides_rand_boxes_only ... ok
+test test_time_box_expiry_yields_partial_coverage ... ok
+test test_validate_dataset_extra_files_is_loud ... ok
+test test_validate_dataset_missing_is_loud_and_creates_nothing ... ok
+test test_validate_dataset_ok_after_write ... ok
+test test_validate_dataset_wrong_size_is_loud ... ok
+test test_write_is_authoritative_over_stale_larger_files ... ok
+
+test result: ok. 95 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.75s
+
+-- wero_rtype_tests (/home/justin/Source/squeezefs/target/debug/deps/wero_rtype_tests-86e6580a51c922de)
+
+running 6 tests
+test an_exclusive_access_hold_never_reads_as_wero ... ok
+test live_wero_admits_registered_second_association_and_refuses_unregistered ... ok
+test wero_acquire_puts_nvme_rtype_3_on_the_wire ... ok
+test wero_admits_registered_non_holders_and_refuses_unregistered_hosts ... ok
+test write_exclusive_acquire_stays_nvme_rtype_1 ... ok
+test write_exclusive_still_admits_only_the_holder ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.55s
+
+-- zcrx lib probes (/home/justin/Source/squeezefs/target/debug/deps/squeezefs-a229a316d333f46e)
+test zcrx_lane::uring_zcrx::tests::slot_bag_drop_returns_every_ledger_ref ... ok
+
+test result: ok. 38 passed; 0 failed; 0 ignored; 0 measured; 279 filtered out; finished in 0.01s
+-- zcrx lib probes (/home/justin/Source/squeezefs/target/debug/deps/squeezefs-ee0401dbaa58026b)
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 3 filtered out; finished in 0.00s
+-- zcrx lib probes (/home/justin/Source/squeezefs/target/debug/deps/squeezefs-5f552cf2b7b080b4)
+test zcrx_lane::uring_zcrx::tests::slot_bag_drop_returns_every_ledger_ref ... ok
+
+test result: ok. 38 passed; 0 failed; 0 ignored; 0 measured; 279 filtered out; finished in 0.01s
+-- zcrx lib probes (/home/justin/Source/squeezefs/target/debug/deps/squeezefs-0604b06e225b898c)
+test zcrx_lane::uring_zcrx::tests::slot_bag_drop_returns_every_ledger_ref ... ok
+
+test result: ok. 38 passed; 0 failed; 0 ignored; 0 measured; 274 filtered out; finished in 0.01s
+-- zcrx lib probes (/home/justin/Source/squeezefs/target/debug/deps/squeezefs-c0318c9fb659a494)
+test zcrx_lane::uring_zcrx::tests::slot_bag_drop_returns_every_ledger_ref ... ok
+
+test result: ok. 38 passed; 0 failed; 0 ignored; 0 measured; 274 filtered out; finished in 0.01s
+-- zcrx lib probes (/home/justin/Source/squeezefs/target/debug/deps/squeezefs-a630fbedac77946c)
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 3 filtered out; finished in 0.00s
+-- zcrx lib probes (/home/justin/Source/squeezefs/target/debug/deps/squeezefs-ec2f473ccea59845)
+test zcrx_lane::uring_zcrx::tests::slot_bag_drop_returns_every_ledger_ref ... ok
+
+test result: ok. 38 passed; 0 failed; 0 ignored; 0 measured; 274 filtered out; finished in 0.01s
+-- zcrx lib probes (/home/justin/Source/squeezefs/target/debug/deps/squeezefs-c02e3980bb00fef3)
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 3 filtered out; finished in 0.00s
+
+skip ledger: EMPTY (no test declined to run)
+== zc-capability gate: PASS (the zero-copy surface executed) ==

@@ -264,6 +264,53 @@ queues are blocked, fusectl shrink under load) is the boot test's.
   scoping (its lock population is 32 workers + N local submitters on one
   target).
 
+### 5a. Runtime canary — the patch's first boot (2026-09-06, dev box, 7.2.3 + 0026)
+
+The verdict rule's red-first clause ("a B boot that WARNs … before any
+number counts") was checked the first time a patched kernel ran the
+daemon: the dev box booted `7.2.3-cachyos-lto` carrying the 7.2 track
+(`fuse_uring_bg*` symbols present in the loaded `fuse.ko`,
+`enable_uring=Y`, `fuse: init (API version 7.45)`), and the box's own
+kernel build for squeeze-test (`make -j16 binrpm-pkg`) was running
+alongside — so nothing below is a number, only a NO-WARN + engagement
+record. Artifacts: `.benchmarks/rows-kernel-bg-ab-20260906/canary-7.2.3-devbox/`.
+
+* **zc-capability gate** (`sudo tests/run_zc_capability_gate.sh`,
+  `REQUIRE_CAPABILITY=1`), both `SQUEEZEFS_READ_ZC_SERVE` postures on
+  `dev` `aed8374d`: **149/149 each**, skip ledger EMPTY, rc 0 (the same
+  five suites + zcrx lib probes the 1.2.1 gate counted).
+* **Load canary** on the loop dev substrate (4 mds null_blk + 4 oss zram),
+  `release` binary `a24b59a8`, cache-less format, kern path only, the
+  house runner (`tests/fio/run_fio_row.sh`, fio-3.42, libaio, direct=1):
+  the write_BW prefill (32 × 256 MiB, bs 1 MiB, qd8, 20 s: 2,799 MiB/s,
+  clat p50 77 ms / p99 300 ms) minted the set, then rand-4k 32 jobs ×
+  qd8 30 s (+5 s ramp): **779,395 IOPS**, clat p50 259 µs / p99 1.29 ms,
+  27.96 M `fuse3_zc_replies` — every read rode the zc direct leg (the
+  copy ledger's `read_copy_*`/`read_dest_*` terms all 0), with the
+  transport at 32 queues × depth 32, `transport_max_background` 1024
+  (fusectl `max_background=1024 congestion_threshold=768` — the
+  per-queue share under 0026 is 32).
+* **Tripwires after both rows:** `transport_cq_overflows` 0,
+  `fuse_op_watchdog_overdue` 0, `invariant_tripwires` 0,
+  `detached_task_panics` 0, `read_dest_overruns` 0, `open_count_stranded`
+  0, `fuse3_zc_fd_body_fallbacks` 0; the §5.4 park ledger closed exactly
+  (`transport_parked_commits` 59,844 ≡ `transport_unparked_commits`).
+  `transport_lease_overlong` = 36, all inside the prefill's first second
+  (leases held 1.07–1.17 s at 32 × qd8 × 1 MiB on a fresh zram set with a
+  kernel compile on the box — the loud-never-fatal backpressure class,
+  not the kernel's). Kernel log: **zero fuse/io_uring lines** across the
+  gate and the rows; the one WARNING in the boot's dmesg is `amdgpu`
+  display power management at 14:23, unrelated. Unmount 0.15 s via the
+  verb, no daemon left, substrate torn down clean.
+* **What it does not say:** nothing about the lock class — the dev box
+  has no A arm on this kernel (7.1.8 → 7.2.3 changed underneath), and the
+  IOPS figure is a laptop-substrate scoping row. The measured-real verdict
+  is still §5's A A B B on squeeze-test. The `run_fio_row.sh` meta used to
+  echo the runner's `--bs` default (`1M`) for a job whose shape FIXES
+  `bs=4k`; the runner now records the effective knob (this commit), and
+  the persisted canary meta was corrected to `4k` — the fio JSON beside it
+  (`bw_bytes ÷ iops` = 4096) was always the authority.
+
 ## 6. Backport ledger (7.1.6 and 6.19.14 — DONE 2026-09-06, both compile-proven three ways)
 
 The patch was authored where the design read was done (7.2.3). Both

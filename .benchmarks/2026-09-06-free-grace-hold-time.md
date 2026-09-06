@@ -3,7 +3,7 @@
 | | |
 |---|---|
 | **Branch** | `perf/free-grace-hold-time` off `dev` `a05998c5` |
-| **Commits** | `ba42f3f9` (red: the decomposition instrument) · `d570376a` (the instrument) · `c2163d04` (red: the fleet-cadence loop, the capacity law, levers b/d, the co-writer gauges) · `0104e7cb` (levers b + d, the capacity-law gauges) · `a1687b54` (lever (a) measured inert) · `7ec426b8` (lever (d)'s derivation + tie test) · docs commit |
+| **Commits** | `ba42f3f9` (red: the decomposition instrument) · `d570376a` (the instrument) · `c2163d04` (red: the fleet-cadence loop, the capacity law, levers b/d, the co-writer gauges) · `0104e7cb` (levers b + d, the capacity-law gauges) · `a1687b54` (lever (a) measured inert) · `7ec426b8` (lever (d)'s derivation + tie test) · `30041cd2` + `70d0ca6c` (docs) |
 | **Design** | `docs/design-free-grace-sustain.md` §"Hold-time campaign" (this note's home); the §3 rate equation is the input |
 | **Program input** | `.benchmarks/2026-09-06-cowriter-free-refcount-leak.md` §6 (the 2026-09-06 00:15 fleet row: the ring HOLDS the supply — `free_grace_bound_age_ms` 8,994 at every 1 Hz cadence, `offsets` 3,171, lane ENOSPC refusals 76–129 per co-writer, A1 not sustained 1,270 → 482 MiB/s); `.benchmarks/2026-09-05-d4-free-grace-sustain.md` (the closed-loop instrument this campaign extends); `.benchmarks/2026-08-25-s11-freeloop-stall.md` (finding 15) |
 | **Instrument** | `tests/reader_free_grace_tests.rs` §"The hold-time campaign" — the D-4 closed loop on the manual owner clock, now with the writer's checkpoint model (a member's pass advances iff a checkpoint landed since its previous pass), staggered pass AND renewal phases, and the per-stage decomposition read off the product's own `free_grace_hold_phase_ns`. Release build, `cargo test --release --all-features --test reader_free_grace_tests -- --nocapture --test-threads=1 the_hold_at_fleet the_hold_time_levers a_lane_exhausts a_faster_checkpoint`. No substrate, no wire, no wall clock; deterministic (bit-identical across runs and profiles). |
@@ -218,7 +218,7 @@ re-derivation (§7, ≈ 3.5 s): 495 (52 %).
 `tests/run_mw_matrix.sh s11-mpiio` from zero on the finding-15 venue (1
 authority + 8 co-writers, range custody, `SQZ_MWFLEET_OSS_GB=32`, nvmet-tcp
 devsub, release profile, quiet box, probe ≥ 750 MiB/s), binary at or after
-`7ec426b8`. Read the authority's `m0.stats.json` and every co-writer's:
+`70d0ca6c`. Read the authority's `m0.stats.json` and every co-writer's:
 
 | Column | PASS reads |
 |---|---|

@@ -3333,3 +3333,181 @@ async fn a_frozen_plane_bounds_the_park_by_wall_time() {
         "the backstop released nothing unacknowledged"
     );
 }
+
+// ===========================================================================
+// The hold-time campaign (finding 15's remaining half — `.benchmarks/
+// 2026-09-06-free-grace-hold-time.md`, design-free-grace-sustain §"Hold-time
+// campaign"): with the supply leak closed (`380ea732`) the s11 fleet row
+// HOLDS the supply in the ring — `free_grace_bound_age_ms` 8,994 with every
+// cadence at its 1 Hz floor and nothing starving. The contracts below pin
+// the decomposition instrument (WHERE the nine seconds go, per stage) and
+// then each lever that removes a cadence term.
+// ===========================================================================
+
+/// Read one phase of the `free_grace_hold_phase_ns` export: `(count,
+/// mean_ms)` — the histogram's exact words, never a bucket estimate.
+fn hold_phase(name: &str) -> (u64, f64) {
+    let snap = free_grace::stats_snapshot();
+    let phase = &snap["free_grace_hold_phase_ns"][name];
+    assert!(
+        phase.is_object(),
+        "free_grace_hold_phase_ns.{name} is exported on the owner side (got {phase})"
+    );
+    (
+        phase["count"].as_u64().unwrap_or(0),
+        phase["mean_ns"].as_u64().unwrap_or(0) as f64 / 1e6,
+    )
+}
+
+/// **Contract 23 — the hold decomposes into three stages that sum to the
+/// total, per offset.** An offset deferred at owner instant `t` (label
+/// `t+1`) is stamped at release with `defer→checkpointed` (the first
+/// checkpoint the authority completed AFTER the defer), `checkpointed→
+/// min_acked` (the first bound publish that covered the label — every
+/// member acknowledged past it) and `min_acked→released` (the harvest);
+/// `total` is `release − t`. The three stages are exact-sum with the
+/// total, and the instrument is READ, never inferred: the checkpoint
+/// instant comes from the KV checkpoint hook, the covering instant from
+/// `publish_bound`'s own advance.
+#[test]
+fn the_hold_decomposes_into_three_stages_that_sum_to_the_total() {
+    let _serial = serial();
+    let (clock, ticks) = manual_clock();
+    let owner = armed_owner(&clock);
+    free_grace::arm_owner_plane(clock.clone(), owner.clocks()).expect("derived bound");
+    let a = join(&owner, "r-hold-a", MemberRole::Reader);
+    let b = join(&owner, "r-hold-b", MemberRole::Reader);
+    owner.refresh_free_grace_bound();
+
+    let ring = GraceRing::new(1024);
+    let t0 = clock.now_ms();
+    let label = t0 + 1;
+    assert!(ring.defer(4 * 1024 * 1024, 4 * 1024 * 1024));
+
+    // The writer's next checkpoint lands 700 ms after the defer.
+    ticks.fetch_add(700, Ordering::SeqCst);
+    free_grace::note_checkpoint_completed(Duration::from_millis(20));
+    assert_eq!(free_grace::checkpoint_marks(), 1, "the hook recorded one mark");
+
+    // Reader A acknowledges at +3,000 (the bound stays 0: B has not).
+    ticks.fetch_add(2_300, Ordering::SeqCst);
+    ack(&owner, "r-hold-a", a.epoch, label);
+    assert!(
+        ring.harvest_with_supply(64, u64::MAX, u64::MAX).is_empty(),
+        "one of two readers acknowledging releases nothing"
+    );
+    // Reader B acknowledges a FRESHER label at +5,000: the bound advances
+    // past the offset's label — the covering instant.
+    ticks.fetch_add(2_000, Ordering::SeqCst);
+    ack(&owner, "r-hold-b", b.epoch, t0 + 2_001);
+    // The harvest runs 400 ms later (the allocation funnel's next visit).
+    ticks.fetch_add(400, Ordering::SeqCst);
+    let released = ring.harvest_with_supply(64, u64::MAX, u64::MAX);
+    assert_eq!(released.len(), 1, "the covered offset releases");
+
+    let (n_ck, ck) = hold_phase("defer_checkpointed");
+    let (n_ack, ackd) = hold_phase("checkpointed_min_acked");
+    let (n_rel, rel) = hold_phase("min_acked_released");
+    let (n_tot, tot) = hold_phase("total");
+    assert_eq!((n_ck, n_ack, n_rel, n_tot), (1, 1, 1, 1), "one sample per stage per release");
+    assert_eq!(ck as u64, 700, "defer→checkpointed = the first checkpoint after the defer");
+    assert_eq!(
+        ackd as u64,
+        4_300,
+        "checkpointed→min_acked = the first bound publish covering the label (at +5,000)"
+    );
+    assert_eq!(rel as u64, 400, "min_acked→released = the harvest's visit");
+    assert_eq!(tot as u64, 5_400, "total = release − defer");
+    assert_eq!(
+        (ck + ackd + rel) as u64,
+        tot as u64,
+        "the three stages are exact-sum with the total"
+    );
+}
+
+/// **Contract 24 — the per-member acknowledgement lag names the binding
+/// member.** The bound is a MIN over members, so the loop's latency is
+/// the slowest member's; `free_grace_member_ack_lag_ms` publishes
+/// `now − acked` per live member as max/mean/min (the census itself rides
+/// the `SQUEEZEFS_STATS_KEY_CENSUS` gate — it names peers). A member that
+/// has acknowledged nothing reads its whole membership as lag.
+#[test]
+fn member_ack_lag_names_the_binding_member() {
+    let _serial = serial();
+    let (clock, ticks) = manual_clock();
+    let owner = armed_owner(&clock);
+    free_grace::arm_owner_plane(clock.clone(), owner.clocks()).expect("derived bound");
+    let t0 = clock.now_ms();
+    let a = join(&owner, "r-lag-a", MemberRole::Reader);
+    let b = join(&owner, "r-lag-b", MemberRole::Reader);
+    owner.refresh_free_grace_bound();
+
+    ticks.fetch_add(3_000, Ordering::SeqCst);
+    ack(&owner, "r-lag-a", a.epoch, t0 + 1);
+    ticks.fetch_add(2_000, Ordering::SeqCst);
+    ack(&owner, "r-lag-b", b.epoch, t0 + 2_001);
+    ticks.fetch_add(400, Ordering::SeqCst);
+    // now = t0 + 5,400: A is 5,399 behind, B 3,399.
+    let lags = owner.member_ack_lags();
+    let mut by_id: std::collections::BTreeMap<String, u64> = lags.into_iter().collect();
+    assert_eq!(by_id.remove("r-lag-a"), Some(5_399), "A's lag = now − its acked label");
+    assert_eq!(by_id.remove("r-lag-b"), Some(3_399), "B's lag = now − its acked label");
+    assert!(by_id.is_empty(), "exactly the live members are named");
+
+    let snap = free_grace::stats_snapshot();
+    let agg = &snap["free_grace_member_ack_lag_ms"];
+    assert_eq!(agg["max"].as_u64(), Some(5_399), "max = the binding member (A)");
+    assert_eq!(agg["min"].as_u64(), Some(3_399));
+    assert_eq!(agg["mean"].as_u64(), Some(4_399));
+    assert_eq!(agg["members"].as_u64(), Some(2));
+
+    // A member that acknowledged nothing: its lag is its whole membership.
+    let _c = join(&owner, "r-lag-c", MemberRole::Reader);
+    ticks.fetch_add(600, Ordering::SeqCst);
+    let lags: std::collections::BTreeMap<String, u64> =
+        owner.member_ack_lags().into_iter().collect();
+    assert_eq!(lags.get("r-lag-c"), Some(&600), "acked nothing ⇒ lag = now − joined");
+}
+
+/// **Contract 25 — the KV checkpoint task marks the hold ledger.** The
+/// `defer→checkpointed` stage is READ off the checkpoint that actually
+/// ran: `KvMetaBackend::checkpoint_now` (the same cycle the cadence task
+/// runs) records one mark on the armed owner plane — and none when no
+/// plane is armed (the solo mount's cost stays one relaxed load).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_kv_checkpoint_marks_the_hold_ledger() {
+    use squeezefs::meta_backend::kv::backend::KvMetaBackend;
+    use squeezefs::meta_backend::kv::builder::{format_v3, FormatV3Options};
+    use squeezefs::meta_backend::kv::node::DEFAULT_NODE_SIZE;
+    use squeezefs::meta_backend::Metadata;
+    let _serial = serial();
+    let file = tempfile::NamedTempFile::new().expect("temp volume");
+    file.as_file().set_len(64 * 1024 * 1024).expect("size volume");
+    format_v3(
+        file.path(),
+        64 * 1024 * 1024,
+        &FormatV3Options {
+            node_size: DEFAULT_NODE_SIZE,
+            journal_len_override: None,
+            force: false,
+            full_wipe: false,
+            format_config_xattr: None,
+        },
+    )
+    .await
+    .expect("format v3");
+    let be = KvMetaBackend::open(file.path()).await.expect("mount v3");
+    be.create(1, "f", 0o644, 0, 0).await.expect("create");
+    be.checkpoint_now().await.expect("checkpoint");
+    assert_eq!(free_grace::checkpoint_marks(), 0, "no plane ⇒ no mark (one relaxed load)");
+
+    let (clock, _ticks) = manual_clock();
+    let owner = armed_owner(&clock);
+    free_grace::arm_owner_plane(clock.clone(), owner.clocks()).expect("derived bound");
+    let _r = join(&owner, "r-ckpt", MemberRole::Reader);
+    owner.refresh_free_grace_bound();
+    be.create(1, "g", 0o644, 0, 0).await.expect("create");
+    be.checkpoint_now().await.expect("checkpoint");
+    assert_eq!(free_grace::checkpoint_marks(), 1, "an armed plane records the checkpoint");
+    be.shutdown().await.expect("shutdown");
+}

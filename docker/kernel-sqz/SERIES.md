@@ -2,8 +2,10 @@
 
 The sqz kernel = **linux-6.19.14** (kernel.org stable, sha256
 `cde8bf6739be4a0777fedbbba5330b8188c55680c45a922a4dfa289cbec6f185`)
-+ the 30 patches in `patches/` + the client base config + `config-fragment`,
-built `LOCALVERSION=-sqz` → `uname -r` = `6.19.14-sqz`.
++ the 31 patches in `patches/` + the client base config + `config-fragment`,
+built `LOCALVERSION=-sqz` → `uname -r` = `6.19.14-sqz`. (**31 since
+2026-09-06**: **0031** is the per-queue background accounting backport —
+item 10 below; the 30-patch history above it is unchanged.)
 
 **v2 delta (2026-08-04 + 2026-08-09):** the 2026-08-04 scoping campaign
 authored **0028** (was 0027: `FUSE_TIME_LIMITS`). The 2026-08-09
@@ -183,10 +185,89 @@ applied clean.
    selective zc delivery, whose refusal is FINAL on measurement
    (2026-08-09) — that slot was never built, and this unrelated nvme
    patch takes the number.
+10. **patch 31 (NEW 2026-09-06; sqz-authored — fuse-uring per-queue
+    background accounting, the COMMIT-lock split)** — the **6.19.14
+    BACKPORT** of the 7.2-track's 0026 (authored on 7.2.3 first; design
+    `docs/design-kernel-bg-per-queue.md`, the backport ledger is its
+    §6). THIS track is the finding's venue: the R-4 ledger
+    (`.benchmarks/2026-09-03-r4-reap-thread-economy.md` §2, squeeze-test
+    on `6.19.14-sqz`) measured the FUSE-over-io_uring queue worker paying
+    **1.9 µs/op of spinlock contention** on `fuse_uring_req_end` (the
+    queue lock + `fc->bg_lock` nested in it) AND `fuse_request_end`
+    (`fc->bg_lock` again — on 6.19 the finish is INLINE in
+    `fuse_request_end()`, there is no `fuse_request_bg_finish()`, so a
+    uring completion took the connection-wide lock TWICE). 0031 gives
+    every `fuse_ring_queue` its own background ledger under `queue->lock`
+    (`num_background`, `active_background`, `bg_blocked`, `bg_waitq`) and
+    a per-queue budget = its share of `max_background` (floor 1), so
+    neither uring path takes `bg_lock`; the per-queue credit clears
+    `FR_BACKGROUND` under `queue->lock` BEFORE `fuse_request_end()` runs,
+    so its inline block (gated on `FR_BACKGROUND` alone — verified) is
+    skipped too. 6.19-specific adaptations (all mechanical): `struct
+    fuse_conn` owns the accounting (`fc->` for `fch->`, `ring->fc`,
+    `fuse_abort_conn()`); no `fuse_chan_{num,max}_background` accessors —
+    `file.c`'s two congestion checks (readahead 899 / writepages 2292)
+    read the new `fuse_num_background()` inline (`dev_uring_i.h`, both
+    CONFIG arms) and `control.c`'s inline `max_background` write gains
+    the `WRITE_ONCE` + `fuse_uring_bg_limit_changed()` re-gate hook
+    (`file.c`/`control.c` gain `#include "dev_uring_i.h"` like
+    `inode.c`); `fuse_block_alloc()` is one expression (the
+    `!fuse_uring_ready(fc)` clause added to its `blocked` arm);
+    `fuse_uring_entry_teardown()` `list_del_init`s `ent->fuse_req` under
+    `queue->lock` (verified) and the credit sits beside it; and — the one
+    tree-specific addition — 6.19's `fuse_uring_abort()` walks the queues
+    only under `queue_refs > 0` (7.1+ walk unconditionally), so its
+    `queue_refs == 0` arm gains `fuse_uring_bg_abort_waiters()` and a
+    per-queue gate can never hold a sleeper across an abort (the queued
+    requests' own fate on that arm is unchanged from this tree). Zero
+    uapi/Kconfig change; files `fs/fuse/{dev_uring.c,dev.c,dev_uring_i.h,
+    fuse_i.h,file.c,control.c}` + the fuse-io-uring rst; **zero hunk
+    overlap with 0001–0030**. gcc-8.5: the kernel's own floor is gcc 8.1
+    (`scripts/min-tool-version.sh`), the EL8 image builds with
+    gcc-toolset-14, and the patch uses nothing past gnu11 (no cleanup
+    attributes, no `__auto_type`, no C23) — "gcc-8.5-clean" is the
+    probes' requirement, not the series'. **Compile proof** (2026-09-06,
+    `~/sqz-kernel-scratch/build-6.19-*.log`): the EL8 base config +
+    `config-fragment` via the build script's own `olddefconfig` assembly
+    (gcc 15.3, out-of-tree `O=`) → `make -j16 fs/fuse/ io_uring/` on the
+    0001–0030 control AND on +0031: **0 compiler warnings / 0 errors on
+    both** (the one `warning:` line in every log is Kconfig's
+    `BOOTPARAM_SOFTLOCKUP_PANIC=0` note from the EL8 base itself,
+    identical on the control); `W=1` over all of `fs/fuse/` (23 TUs —
+    `fuse_i.h` changed), control vs +0031: **identical, empty warning
+    sets**; a second build with `CONFIG_PROVE_LOCKING=y
+    CONFIG_DEBUG_SPINLOCK=y CONFIG_DEBUG_LOCK_ALLOC=y CONFIG_LOCKDEP=y`:
+    **0 warnings / 0 errors**; the 31-patch chain re-applied
+    `patch -p1 --fuzz=0` **31/31** from the pristine base (fresh
+    kernel.org tarball, sha256 verified against both the pin above and
+    `v6.x/sha256sums.asc`), byte-identical to the `git am` tree.
+    **Not boot-tested** — the lever lands on the field A/B row
+    (`.benchmarks/rigs/2026-09-06-kernel-bg-per-queue-ab.sh`: kernel A =
+    0001–0030 vs B = +0031, same daemon, A A B B across reboots).
 
 `patches/` is the `git format-patch` export of the resolved transplant;
 `build-kernel.sh` applies it with `patch -p1 --fuzz=0` (any regression
 in the transplant fails loud at apply time).
+
+**The 7.1 track (`patches-7.1/`) is 31 patches too (2026-09-06):** its
+**0031** is the same backport on linux-7.1.6 (the CachyOS 7.1.x line
+this laptop boots). 7.1 is the middle shape — `struct fuse_conn` owns the
+accounting like 6.19, but `fuse_request_bg_finish(fc, req)` exists (it
+goes `static`, its declaration leaves `fuse_dev_i.h`) and
+`fuse_uring_abort()` already walks the queues unconditionally like 7.2,
+so the abort arm is 0026's verbatim; the three inline sites (`file.c`
+911/2306, `control.c` 133) take the same `fuse_num_background()` /
+`WRITE_ONCE` + re-gate hooks as 6.19. **Compile proof** (2026-09-06,
+`~/sqz-kernel-scratch/build-7.1-*.log`, `config-7.1.8-cachyos` →
+`olddefconfig`, gcc 15.3, `O=`): `make -j16 fs/fuse/ io_uring/` on the
+0001–0030 control and on +0031 — **0 warnings / 0 errors both**; `W=1`
+over all of `fs/fuse/`: **identical, empty warning sets**; the
+`PROVE_LOCKING`/`DEBUG_SPINLOCK`/`DEBUG_LOCK_ALLOC`/`LOCKDEP` build **0/0**;
+the 31-patch chain `patch -p1 --fuzz=0` **31/31** from a fresh pristine
+7.1.6 extraction (identical to `ref-7.1.6/`), byte-identical to the
+`git am` tree. Not boot-tested. The manager-ready concat for a 0031 boot
+is `cat patches-7.1/00*.patch` (31 files) — the v3 concat on disk is the
+30-patch A arm.
 
 ## The 7.2 track (`patches-7.2/`) — 26 patches on linux-7.2.3
 
@@ -253,7 +334,7 @@ stay in the series, as do the 7 FUSE consumer/sqz patches and 0030.
 | 0028 | 0023 | `FUSE_TIME_LIMITS` | applied clean — hunks verified in 7.2's `process_init_reply` `time_gran` block and `fuse_new_init` flag mask |
 | 0029 | 0024 | zc payload retention | **rebased**: `fuse_uring_release_payload()` takes `struct fuse_chan *fch` (`fch->ring` / `fch->connected`), loads the queue with `READ_ONCE(ring->queues[qid])`, dispatch passes `fch`; the RETAIN arm composes with the `ent->cmd` guard (`zero_copied && !retain && ent->cmd`) and the 7.2 `req_end` site passes `false` |
 | 0030 | 0025 | nvme host-scoped fabric subsystems | applied clean (identical patch-id — the region is code-identical 7.1.6 → 7.2.3) |
-| — | **0026** | **sqz: fuse-uring per-queue background accounting (COMMIT-lock split)** | **AUTHORED on 7.2.3, 2026-09-06** (no 7.1/6.19 original yet — backports owed, adaptation ledger in `docs/design-kernel-bg-per-queue.md` §6). `fs/fuse/{dev_uring.c,dev.c,dev_uring_i.h,fuse_dev_i.h}` + the fuse-io-uring rst; zero uapi/Kconfig change; zero hunk overlap with 0001–0025 (it edits `fuse_uring_req_end()`'s bg arm and `fuse_uring_queue_bq_req()`, which 0019/0024 only pass through). Applies `--fuzz=0` on the 0001–0025 tree; the 26-patch chain re-verified fuzz=0 on a fresh base and byte-identical to the git series tip |
+| — | **0026** | **sqz: fuse-uring per-queue background accounting (COMMIT-lock split)** | **AUTHORED on 7.2.3, 2026-09-06**; **backported the same day as 0031 on BOTH the 6.19.14 field track and the 7.1 track** (each compile-proven three ways — their rows above; the adaptation ledger is `docs/design-kernel-bg-per-queue.md` §6). `fs/fuse/{dev_uring.c,dev.c,dev_uring_i.h,fuse_dev_i.h}` + the fuse-io-uring rst; zero uapi/Kconfig change; zero hunk overlap with 0001–0025 (it edits `fuse_uring_req_end()`'s bg arm and `fuse_uring_queue_bq_req()`, which 0019/0024 only pass through). Applies `--fuzz=0` on the 0001–0025 tree; the 26-patch chain re-verified fuzz=0 on a fresh base and byte-identical to the git series tip |
 
 **Patch 0026 (sqz-authored, 2026-09-06 — the R-4 ledger's kernel item).**
 The e2e perf audit's reap-thread ledger
@@ -279,8 +360,9 @@ connection ledger and abort/teardown credit exactly what was charged (the
 five correctness points are in the commit message). **Semantics change
 stated:** a saturated queue blocks ITS submitters even while siblings have
 room. Design `docs/design-kernel-bg-per-queue.md`; A/B rig
-`.benchmarks/rigs/2026-09-06-kernel-bg-per-queue-ab.sh` (kernel A = 0001–0025
-vs B = +0026, same daemon, A A B B across reboots). **Compile-proven,
+`.benchmarks/rigs/2026-09-06-kernel-bg-per-queue-ab.sh` (kernel A = the
+track's series without it vs B = with it — 0026 on 7.2, 0031 on 6.19/7.1;
+same daemon, A A B B across reboots). **Compile-proven,
 not boot-tested** — the lever holds its slot on the field row.
 
 **Compile proof, 0026** (2026-09-06; `~/sqz-kernel-scratch/build-patched-0026*.log`):

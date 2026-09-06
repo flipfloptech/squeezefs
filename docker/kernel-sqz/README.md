@@ -36,6 +36,19 @@ fix; default off = byte-identical). Authored on the **7.1 track first**
 Design `docs/design-mw-multipath-kernel.md`; boot validation is rung
 6b's qemu guest.
 
+**0031 (2026-09-06): the series is 31 patches on BOTH the 6.19.14 field
+track and the 7.1 track** — the per-queue FUSE background accounting
+(the COMMIT-lock split), authored on the 7.2 track as **0026** and
+backported the same day. The finding was measured on the FIELD kernel
+(`6.19.14-sqz`: the R-4 ledger's 1.9 µs/op of `bg_lock` contention, paid
+TWICE per uring completion on 6.19 — `fuse_uring_req_end` + the inline
+finish in `fuse_request_end`). Compile-proven three ways per track
+(build clean, `W=1` identical to the 0001–0030 control, a
+`PROVE_LOCKING`/`DEBUG_SPINLOCK` build clean), **not boot-tested**; the
+lever lands on the field A/B row. Design + the per-track adaptation
+ledger: `docs/design-kernel-bg-per-queue.md` (§6); SERIES.md item 10 +
+the 7.1 paragraph.
+
 **Strata ruling (USER DECISION 2026-08-02): the kmod-sqzfuse stratum
 is KILLED.** There are exactly **two strata**: (1) **stock-graceful**
 — the daemon runs capability-probed on stock kernels, degrading
@@ -53,8 +66,8 @@ maintained; do not resurrect it.
 | `build-kernel.sh` | in-container: sha256-pinned tarball → the track's series → config assembly → checklist assertion (fail loud) → `make binrpm-pkg`. **`TRACK=6.19.14` (default, the FIELD build) / `7.1` / `7.2`** selects `patches-$TRACK/` + the pinned `KVER`/sha256 from its table — see *Build* below |
 | `SERIES.md` | the series manifest: message-ids, base ruling, conflict resolutions, 0025/0029, the 7.2 track's per-patch table |
 | `V2-CANDIDATES.md` | the v2 scoping manifest (ranked candidates; rank 1 = TIME_LIMITS, now patch 0028) |
-| `patches/` | `git format-patch` export (0001–0024 Koong + 0025 abort-race + 0026 docs + 0027 seam + 0028 TIME_LIMITS + 0029 retention + 0030 nvme host-scoped subsystems — rung 5b) |
-| `patches-7.1/` | the **linux-7.1.6 rebase** of the same 30 patches (the D13 latest-mainline track — 0030 was AUTHORED here first; see *The 7.1 track* below) |
+| `patches/` | `git format-patch` export (0001–0024 Koong + 0025 abort-race + 0026 docs + 0027 seam + 0028 TIME_LIMITS + 0029 retention + 0030 nvme host-scoped subsystems — rung 5b + **0031 per-queue bg accounting — the 6.19.14 backport of 7.2's 0026, 2026-09-06**) |
+| `patches-7.1/` | the **linux-7.1.6 rebase** of the same 30 patches (the D13 latest-mainline track — 0030 was AUTHORED here first; see *The 7.1 track* below) **+ 0031** (the 7.1 backport of the per-queue bg accounting, 2026-09-06) |
 | `patches-7.2/` | the **linux-7.2.3 rebase** — **26 patches**: the same series minus the five FUSE prep-refactors upstream 7.2 landed (renumbered contiguously; mapping in *The 7.2 track* below and SERIES.md) **plus 0026**, the per-queue background accounting (COMMIT-lock split) — the first patch AUTHORED on this track (2026-09-06; compile-proven, boot + A/B owed) |
 | `config-base-7.1.2-1.el8.elrepo.x86_64` | the field client's running config (the base; copied read-only 2026-08-01) |
 | `config-fragment` | the ENABLE CHECKLIST — every entry asserted in the final `.config` |
@@ -121,10 +134,12 @@ patches, semantically rebased 2026-08-06 onto 7.1.6 (0025/0029 landed
 2026-08-09; **0030 nvme host-scoped fabric subsystems was AUTHORED on
 this track first** — rung-5b authoring-order ruling 2026-08-15 — then
 backported to 6.19.14) for local zc-capable boots via the CachyOS
-kernel manager.
+kernel manager, **plus 0031 (2026-09-06)** — the per-queue background
+accounting backported FROM the 7.2 track's 0026 (the reverse of 0030's
+order: 0026 was authored where the `fuse_chan` design read was done).
 **6.19.14 stays the FIELD series** (the EL8 fleet RPMs, `patches/`); 7.1
 is the D13 latest-mainline track. Concatenated manager-ready form:
-`~/sqz-kmbuf-zc-7.1.6-v3.patch` = `cat patches-7.1/00*.patch` (v2 = the 29-patch predecessor) — applies
+`~/sqz-kmbuf-zc-7.1.6-v3.patch` = `cat patches-7.1/00*.patch` **as of 30 patches** (v2 = the 29-patch predecessor; a 31-file `cat` mints the 0031 arm when the box that boots it is chosen — v3 on disk is the A arm) — applies
 sequentially `patch -p1 --fuzz=0` clean (verified on a fresh pristine
 7.1.6 extraction). Compile-proof: `make io_uring/ fs/fuse/` with the
 running CachyOS 7.1.6 config, zero new warnings (0025 and 0029). The
@@ -185,6 +200,7 @@ patch carries its `[sqz 7.1.6 rebase]` note in the commit body.
 | 0027 seam (was 26) | ported as-is — **still required**: 7.1's `io_buffer_add_list()` is the int-returning stable form, and patch 03's register path inherits the unchecked call |
 | 0029 retention | `io_uring_sqe128_cmd`; cancel composes FRRS_RETAINED with 7.1's list_del+kfree AVAILABLE path; 6.19 cancel moves RETAINED to `ent_in_userspace` |
 | 0030 nvme host-scoped fabric subsystems | **authoring order reversed** (rung-5b ruling 2026-08-15): authored + compile-verified ON 7.1.6 first, then backported — the 6.19 adaptations are offsets-only (`subsys->awupf` / `kzalloc` idiom sit outside every hunk); first `drivers/nvme/` patch in the series |
+| **0031 per-queue bg accounting** (2026-09-06) | **backported FROM 7.2's 0026** (authored there — the `fuse_chan` design read): `fc->` for `fch->` / `ring->fc` / `fuse_abort_conn()`; `fuse_request_bg_finish(fc, req)` exists and goes `static` (declaration leaves `fuse_dev_i.h`); no `fuse_chan_{num,max}_background` accessors, so `file.c` 911/2306 read the new `fuse_num_background()` inline and `control.c` 133's inline write gains `WRITE_ONCE` + the re-gate hook (both files gain `#include "dev_uring_i.h"`); `fuse_block_alloc()` is one expression (the `!fuse_uring_ready(fc)` clause on its `blocked` arm); the abort arm is 0026's (7.1 already walks the queues unconditionally). Compile-proven with `config-7.1.8-cachyos` (clean, `W=1` identical to the 0001–0030 control, lockdep build clean); 31/31 chain fuzz=0 on a fresh 7.1.6. The 6.19 twin additionally gains the `queue_refs == 0` waiter release (SERIES.md item 10) |
 
 ### CachyOS kernel manager notes
 
@@ -323,8 +339,9 @@ working (details + the five correctness points: the patch's message,
 pristine, a `CONFIG_PROVE_LOCKING`/`DEBUG_SPINLOCK` build clean),
 **not boot-tested** — the lever lands on the field A/B row
 (`.benchmarks/rigs/2026-09-06-kernel-bg-per-queue-ab.sh`: kernel A =
-0001–0025 vs B = +0026, same daemon, A A B B across reboots). Backports
-to 7.1.6 and 6.19.14 are owed; the adaptation ledger (7.1's
+0001–0025 vs B = +0026, same daemon, A A B B across reboots). **Backports
+to 7.1.6 and 6.19.14 LANDED the same day as 0031 on each track**
+(compile-proven three ways each; the adaptation ledger — 7.1's
 `fuse_conn`-resident accounting with no accessors; 6.19's inline finish
-in `fuse_request_end` — the ledger's second caller) is the design note's
-§6.
+in `fuse_request_end`, the ledger's second caller, plus its
+`queue_refs == 0` abort arm — is the design note's §6, now "done").

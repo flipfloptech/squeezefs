@@ -827,7 +827,7 @@ impl BlockAllocator {
 
     /// `true` ⇔ `block_idx` is in a lane this mount may mint in (always
     /// `true` when unpartitioned — the shipped answer).
-    fn lane_is_ours(&self, block_idx: u64) -> bool {
+    pub(crate) fn lane_is_ours(&self, block_idx: u64) -> bool {
         match self.lanes.get() {
             None => true,
             Some(lanes) => {
@@ -2541,9 +2541,12 @@ impl BlockAllocator {
             // A lingering refcount entry at claim time means the offset was
             // free-listed while a tracked owner existed — the double-owner
             // mint observed from the OTHER side. Loud: this is never legal.
+            crate::fuse_client::METRICS
+                .block_claim_anomalies
+                .fetch_add(1, Ordering::Relaxed);
             log::error!(
                 "CLAIM ANOMALY: offset {offset} claimed from the free list while a \
-                 refcount entry lingers (count={:?})",
+                 refcount entry lingers (count={:?}) (block_claim_anomalies)",
                 self.refcount(offset)
             );
         }

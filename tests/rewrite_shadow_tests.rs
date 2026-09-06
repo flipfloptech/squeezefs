@@ -25,8 +25,12 @@
 //!    intact durably — a reopened volume reads the OLD bytes and the
 //!    recovery walk reclaims every B block (un-fsynced acked writes are
 //!    lost: the writeback-class contract, unchanged).
-//! 4. **W5 fenced close**: a stale-token close publishes NOTHING and
-//!    frees NOTHING (successor accounting), loudly counted.
+//! 4. **W5 fenced close**: a GENUINELY fenced close (the D0 custody
+//!    poison / `WriterGuardFenced`) publishes NOTHING and frees NOTHING
+//!    (successor accounting), loudly counted — while a PROCESS-LOCAL
+//!    lease rotation (a stale token with a newer generation in this
+//!    process) CONVERGES by re-presenting the current generation (4b;
+//!    the 2026-08-06 tail-loss law applied to the swap).
 //! 5. **ENOSPC early-close**: a mid-epoch StorageFull closes the epoch
 //!    (the swap frees parked A supply) and the rewrite converges;
 //!    counted `rewrite_shadow_fallbacks`.
@@ -495,6 +499,11 @@ async fn crash_pre_swap_leaves_a_intact_and_reclaims_b() {
 // Contract 4 — W5: a fenced close publishes nothing and frees nothing.
 // ---------------------------------------------------------------------------
 
+/// The GENUINE fence class (design-rewrite-program §5.4 KD-1.8: "the D0
+/// `failed` latch refuses the commit"): the process-wide custody poison
+/// the D0 fence sets. A poisoned holder's close publishes NOTHING, frees
+/// NOTHING, discards the epoch, and refuses `WriterGuardFenced` — the
+/// error class every other publish site treats as the fence.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn fenced_close_publishes_nothing_and_frees_nothing() {
     let _g = serial().await;
@@ -510,21 +519,24 @@ async fn fenced_close_publishes_nothing_and_frees_nothing() {
     quiesce(&h).await;
     assert!(open_epochs() > 0, "premise: the epoch is open");
 
-    // A STALE token (the wt_fencing pattern). The DLM generation-bump seam
-    // advances the file's generator under the write path's live whole-file
-    // lease; pre-S11 this was a `(0,1)` range lock, which byte-range
-    // custody now (correctly) treats as a conflict with that lease.
-    let path = squeezefs::keys::inode_path(ino);
-    let stale = squeezefs::dlm::test_bump_fencing_generation(&path) - 1;
+    struct Unpoison;
+    impl Drop for Unpoison {
+        fn drop(&mut self) {
+            squeezefs::data_custody::test_clear_poison();
+        }
+    }
+    let _unpoison = Unpoison;
+    squeezefs::data_custody::poison("contract 4: the D0 fence fired");
 
+    let token = h.fs.dlm().get_fencing_token_ino(ino);
     let (f0, fd0) = (terminal_frees(), shadow_fence_drops());
-    let res = h.fs.router.close_rewrite_epoch(ino, stale).await;
+    let res = h.fs.router.close_rewrite_epoch(ino, token).await;
     assert!(
         matches!(
             res,
-            Err(squeezefs::error::SqueezefsError::FencingTokenExpired { .. })
+            Err(squeezefs::error::SqueezefsError::WriterGuardFenced)
         ),
-        "a fenced close must refuse loudly: {res:?}"
+        "a fenced close must refuse loudly in the fence's own class: {res:?}"
     );
     assert_eq!(shadow_fence_drops() - fd0, 1, "counted fence drop");
     assert_eq!(
@@ -542,6 +554,90 @@ async fn fenced_close_publishes_nothing_and_frees_nothing() {
         );
     }
     assert_eq!(open_epochs(), 0, "the epoch is discarded (remount law)");
+}
+
+/// Contract 4b — a PROCESS-LOCAL lease rotation is not a fence (the
+/// 2026-08-06 tail-loss law, `tests/fsync_writeback_tail_loss_tests.rs`,
+/// applied to the swap): within one process `FencingTokenExpired` from
+/// the swap's save can only mean this same daemon re-acquired the ino's
+/// lease between the closer's token capture and the revalidation
+/// (sibling handles, stripe grants) — the epoch's RAM-only bindings are
+/// the newest acked custody in existence. The close RE-PRESENTS the
+/// current generation and converges: the swap persists (durable map =
+/// B), the parked A keys free, the retry is counted, and NO fence drop
+/// is recorded. Before this contract the stale token took the W5 arm on
+/// a live mount — acked bytes discarded, the covered A keys' local
+/// hygiene lost (the s11 co-writers' `CLAIM ANOMALY` lineage,
+/// `.benchmarks/2026-09-06-cowriter-free-residual-lineage.md`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_process_local_lease_rotation_converges_the_close() {
+    let _g = serial().await;
+    let _l = LeverGuard;
+    squeezefs::fuse_client::set_patch_max_bytes(0);
+    squeezefs::routing::set_rewrite_shadow(true);
+    let h = make_harness("shadow_rotation_converges").await;
+    let blocks = 3u64;
+    let ino = striped_fixture(&h, "f1", blocks, 4).await;
+    let map_a = ram_block_map(&h, ino).await;
+
+    let v1 = pattern(FBS as usize, 5);
+    write_at(&h, ino, 0, &v1).await;
+    quiesce(&h).await;
+    assert!(open_epochs() > 0, "premise: the epoch is open");
+    let map_b = ram_block_map(&h, ino).await;
+    assert_ne!(
+        map_b.get(&0),
+        map_a.get(&0),
+        "premise: block 0 is shadow-bound"
+    );
+
+    // The rotation: a newer lease in THIS process (the fsync-vs-sibling
+    // shape), the closer still holding the older token.
+    let path = squeezefs::keys::inode_path(ino);
+    let stale = squeezefs::dlm::test_bump_fencing_generation(&path) - 1;
+
+    let (f0, fd0, r0, s0) = (
+        terminal_frees(),
+        shadow_fence_drops(),
+        METRICS.rewrite_shadow_close_retries.load(Ordering::Relaxed),
+        shadow_swaps(),
+    );
+    let res = h.fs.router.close_rewrite_epoch(ino, stale).await;
+    assert!(
+        matches!(res, Ok(true)),
+        "a rotated token converges — the close publishes under the current generation: {res:?}"
+    );
+    assert_eq!(
+        METRICS.rewrite_shadow_close_retries.load(Ordering::Relaxed) - r0,
+        1,
+        "the convergence is counted"
+    );
+    assert_eq!(shadow_fence_drops() - fd0, 0, "a rotation is not a fence");
+    assert_eq!(shadow_swaps() - s0, 1, "the swap persisted");
+    assert_eq!(
+        terminal_frees() - f0,
+        1,
+        "the parked A key of the rewritten block freed after the swap"
+    );
+    let durable = durable_block_map(&h, ino).await;
+    assert_eq!(
+        durable.get(&0),
+        map_b.get(&0),
+        "the durable map names the epoch's B binding — the acked bytes are durable"
+    );
+    for b in 1..blocks as u32 {
+        assert_eq!(
+            durable.get(&b),
+            map_a.get(&b),
+            "block {b}: untouched blocks keep their A binding"
+        );
+    }
+    assert_eq!(open_epochs(), 0, "the epoch closed");
+    assert_eq!(
+        read_all(&h, ino, FBS as usize).await,
+        v1,
+        "the rewritten bytes read back (no fence-era discard)"
+    );
 }
 
 // ---------------------------------------------------------------------------

@@ -1641,6 +1641,20 @@ pub async fn ship_displaced_frees(
         };
         let vol_tag = crate::meta_backend::kv::block_refs::volume_tag(alloc.volume_id());
         let idx = parts.offset / alloc.chunk_size().max(1);
+        // The residual-refusal instrument (`.benchmarks/2026-09-06-cowriter-
+        // free-residual-lineage.md` §6): a free this mount ships for an
+        // offset in its OWN lane that it no longer tracks locally names a
+        // lifetime it already released once — the second displacement of
+        // a key a stale refetch resurrected. Its count against the
+        // authority's `free_refused_blocks` is what attributes the
+        // fleet's steady 15–30 refusals per co-writer; a foreign-lane key
+        // (a predecessor another writer minted) is untracked here by
+        // construction and is not counted.
+        if alloc.lane_is_ours(idx) && alloc.refcount(parts.offset).is_none() {
+            crate::fuse_client::METRICS
+                .cowriter_free_ship_own_lane_untracked
+                .fetch_add(1, Ordering::Relaxed);
+        }
         match groups
             .iter_mut()
             .find(|g| g.vol_tag == vol_tag && Arc::ptr_eq(&g.alloc, &alloc))
@@ -2218,6 +2232,9 @@ pub fn stats_json() -> serde_json::Value {
         "accounting_refusals": METRICS.cowriter_accounting_refusals.load(Ordering::Relaxed),
         "unpublished_abandons": METRICS.cowriter_unpublished_abandons.load(Ordering::Relaxed),
         "unpublished_recycles": METRICS.cowriter_unpublished_recycles.load(Ordering::Relaxed),
+        "free_ship_own_lane_untracked": METRICS
+            .cowriter_free_ship_own_lane_untracked
+            .load(Ordering::Relaxed),
         "local_commit_refusals": METRICS.cowriter_local_commit_refusals.load(Ordering::Relaxed),
         "custody_endpoint": declared_authority().unwrap_or_else(|| "none".to_string()),
     })

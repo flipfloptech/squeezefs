@@ -5661,6 +5661,14 @@ pub struct Metrics {
     /// lineage upstream — investigate beside
     /// `block_untracked_free_refusals`, leak-safe either way.
     pub block_live_free_refusals: Align64<AtomicU64>,
+    /// A block CLAIMED from the free list while this process's refcount
+    /// map still tracked it (`CLAIM ANOMALY` — the log line's counter).
+    /// **Must stay 0.** On an authority it is the double-owner mint seen
+    /// from the claimer's side; on a co-writer it names a displaced block
+    /// the authority freed (and re-harvested to this lane) whose LOCAL
+    /// hygiene never ran — the fenced-close lineage of
+    /// `.benchmarks/2026-09-06-cowriter-free-residual-lineage.md`.
+    pub block_claim_anomalies: Align64<AtomicU64>,
     /// Finding 25: a serialized settle attempt resolved from a CACHED
     /// head that a served direct commit had already superseded (the
     /// invalidation-vs-refill race on a serving authority) — the loss is
@@ -6391,6 +6399,17 @@ pub struct Metrics {
     /// `cowriter_unpublished_abandons`, which now grows only around custody
     /// loss or on an offset outside this mount's lanes.
     pub cowriter_unpublished_recycles: Align64<AtomicU64>,
+    /// Displaced-block frees this co-writer SHIPPED for an offset in its
+    /// OWN lane that it no longer tracked locally — a lifetime this mount
+    /// already released once (the first displacement retired the entry),
+    /// re-displaced by a key a stale layout refetch resurrected. Each is
+    /// answered `Refused` on the authority's untracked tripwire when the
+    /// first free's offset still sits in grace, so this is the co-writer
+    /// face of the fleet's residual `block_untracked_free_refusals`
+    /// (`.benchmarks/2026-09-06-cowriter-free-residual-lineage.md` §6).
+    /// Foreign-lane keys (predecessors another writer minted) are
+    /// untracked here by construction and are not counted.
+    pub cowriter_free_ship_own_lane_untracked: Align64<AtomicU64>,
     /// LOCAL metadata commits refused on a co-writer — the mutations that
     /// reached the backend's write gate instead of the shipped publish
     /// path. **Should stay 0 on a healthy co-writer**: a nonzero value
@@ -6504,9 +6523,22 @@ pub struct Metrics {
     /// KD-1.7). ≈ 0 except at genuine space pressure.
     pub rewrite_shadow_fallbacks: Align64<AtomicU64>,
     /// Fenced closes: published nothing, freed nothing (W5 — successor
-    /// accounting). **Must stay 0 on healthy mounts**; investigate
-    /// alongside `writer_guard_fenced`.
+    /// accounting). The GENUINE fence class only — the D0 custody poison
+    /// or a `WriterGuardFenced` publish refusal (a dead custody era).
+    /// **Must stay 0 on healthy mounts**; investigate alongside
+    /// `writer_guard_fenced`.
     pub rewrite_shadow_fence_drops: Align64<AtomicU64>,
+    /// Epoch closes whose presented token was superseded by a
+    /// PROCESS-LOCAL lease rotation and that CONVERGED by re-presenting
+    /// the ino's current generation (the 2026-08-06 tail-loss law applied
+    /// to the swap — `.benchmarks/2026-09-06-cowriter-free-residual-lineage.md`).
+    /// Before it, such a close took the W5 arm: the epoch's RAM-only
+    /// bindings (acked bytes) were discarded on a LIVE mount, and the
+    /// parked displaced keys an intermediate publish had already covered
+    /// lost their local hygiene — the co-writers' `CLAIM ANOMALY` lineage.
+    /// Growth is the multi-handle rotation shape (fsync racing sibling
+    /// stripe grants); it costs one extra fencing revalidation per close.
+    pub rewrite_shadow_close_retries: Align64<AtomicU64>,
     /// GAUGE: open rewrite epochs.
     pub rewrite_shadow_open_epochs: Align64<AtomicU64>,
     /// GAUGE: parked displaced-A bytes across open epochs (the VL
@@ -10631,6 +10663,7 @@ impl SqueezefsFilesystem {
                 "block_double_frees": METRICS.block_double_frees.load(Ordering::Relaxed),
                 "block_untracked_free_refusals": METRICS.block_untracked_free_refusals.load(Ordering::Relaxed),
                 "block_live_free_refusals": METRICS.block_live_free_refusals.load(Ordering::Relaxed),
+                "block_claim_anomalies": METRICS.block_claim_anomalies.load(Ordering::Relaxed),
                 "read_settle_stale_head_refetches": METRICS.read_settle_stale_head_refetches.load(Ordering::Relaxed),
                 "block_key_incarnation_refusals": METRICS.block_key_incarnation_refusals.load(Ordering::Relaxed),
                 "block_key_incarnation_unknown": METRICS.block_key_incarnation_unknown.load(Ordering::Relaxed),
@@ -11062,6 +11095,7 @@ impl SqueezefsFilesystem {
                 "rewrite_shadow_bytes": METRICS.rewrite_shadow_bytes.load(Ordering::Relaxed),
                 "rewrite_shadow_fallbacks": METRICS.rewrite_shadow_fallbacks.load(Ordering::Relaxed),
                 "rewrite_shadow_fence_drops": METRICS.rewrite_shadow_fence_drops.load(Ordering::Relaxed),
+                "rewrite_shadow_close_retries": METRICS.rewrite_shadow_close_retries.load(Ordering::Relaxed),
                 "rewrite_shadow_open_epochs": METRICS.rewrite_shadow_open_epochs.load(Ordering::Relaxed),
                 "rewrite_shadow_parked_bytes": METRICS.rewrite_shadow_parked_bytes.load(Ordering::Relaxed),
                 "rewrite_shadow_superseded": METRICS.rewrite_shadow_superseded.load(Ordering::Relaxed),

@@ -4091,3 +4091,68 @@ fn the_hold_time_levers_cut_the_hold_and_never_fence() {
         "the levers never stall the stream more"
     );
 }
+
+/// **Contract 31 — the writer's checkpoint cadence alone does not move
+/// the hold (candidate lever (a), measured inert).** The reader qualifies
+/// a label on a TIME bound — a pass beginning ≥ `learned + staleness +
+/// skew`, where the staleness bound derives from the checkpoint CEILING
+/// constant — not on observing the checkpoint; the checkpoint only has to
+/// have landed by then, and at the shipped cadences every pass already
+/// advances (the field: epochs ≈ polls on the storm volume). So a writer
+/// checkpointing twice as often reads the same `bound_age` to the tick,
+/// while a writer whose checkpoints land LESS often than the passes (the
+/// non-advancing-pass shape) pays the qualification rounding for it. A
+/// checkpoint-cadence lever pays only as the writer→member composite
+/// that also shortens the pass and beat floors — the adjudication item the
+/// note names, not a lever this campaign lands.
+#[test]
+fn a_faster_checkpoint_cadence_alone_leaves_the_hold_where_it_was() {
+    let _serial = serial();
+    let shipped = fleet_cadence_shape("ckpt-1000", 256);
+    let halved = LoopShape {
+        label: "ckpt-500",
+        checkpoint_ms: 500,
+        ..shipped
+    };
+    let sparse = LoopShape {
+        label: "ckpt-1650(epochs/polls≈0.6)",
+        checkpoint_ms: 1_650,
+        ..shipped
+    };
+    let levers = Levers {
+        ack_renewal: true,
+        refresh_on_ack: true,
+        ..Levers::d4(true, true)
+    };
+    let a = run_closed_loop(&shipped, levers);
+    let b = run_closed_loop(&halved, levers);
+    let c = run_closed_loop(&sparse, levers);
+    for (shape, r) in [(&shipped, &a), (&halved, &b), (&sparse, &c)] {
+        println!("{}", r.render(shape));
+        assert_eq!(
+            r.deferrals,
+            r.releases + r.held_end,
+            "{}: closure",
+            shape.label
+        );
+        assert_eq!((r.forced, r.fences), (0, 0), "{}: no fence", shape.label);
+    }
+    assert!(
+        (a.bound_age_mean_ms - b.bound_age_mean_ms).abs() <= 1.0,
+        "halving the checkpoint period moves nothing: {:.0} vs {:.0} ms",
+        a.bound_age_mean_ms,
+        b.bound_age_mean_ms
+    );
+    assert!(
+        b.hold_defer_ck_ms < a.hold_defer_ck_ms,
+        "…only the defer→checkpointed stage shortens ({:.0} vs {:.0} ms), in the shadow of the qualify window",
+        b.hold_defer_ck_ms,
+        a.hold_defer_ck_ms
+    );
+    assert!(
+        c.bound_age_mean_ms > a.bound_age_mean_ms + 250.0,
+        "checkpoints sparser than the passes DO cost the hold: {:.0} vs {:.0} ms",
+        c.bound_age_mean_ms,
+        a.bound_age_mean_ms
+    );
+}

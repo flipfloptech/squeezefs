@@ -281,6 +281,22 @@ Three terms remain, in the order the fleet decomposition ranks them:
    there (`cowriter.free_ship_own_lane_untracked`); the fleet row is
    owed.
 
+### 6.1 Term 2, followed — `.benchmarks/2026-09-06-free-grace-lane-visible.md`
+
+The instrument convicted the term: `released` IS the harvest's pop, and the
+authority's harvest is DEMAND-driven — so the 2.5 s mean is the fleet's
+quiet phases (the owner's 10 s sweep covers, the next iteration's first
+demand releases; the row's histogram is 76 % under 512 ms with 3,849 samples
+past 16 s), and behind it sits the co-writer's lane hop no ledger measured
+(a released lane block waits on the AUTHORITY's list for that co-writer's
+next harvest RPC — never issued while it holds supply above its watermark).
+Both are now instrumented (`alloc_lane_visible_phase_ns`) and both made
+event-driven off the acknowledgement (`SQUEEZEFS_FREE_GRACE_LANE_PUSH`:
+release on ack + the lane-supply hint on the renewal grant). Fleet-cadence
+model (3 s write / 21 s close): `min_acked→released` 3,408 → 0 ms, the lane
+hop 30.7 → 1.5 s, the hold 22.6 → 14.7 s. The from-zero row is OWED
+(parent) — the PASS reading is in that note's §6.
+
 ## 7. What this does NOT do — the adjudication items (the remaining 6 s)
 
 The levers landed remove ≈ 0.9 s of a 8.6 s hold; the shipped predicted

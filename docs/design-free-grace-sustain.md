@@ -5,7 +5,7 @@
 | **Title** | The free-grace sustain campaign: a demand-coupled acknowledgement loop — pipelined reader acks, demand-coupled bound publication, demand-armed prods, and ahead-of-stall lane refill |
 | **Author** | (design agent; adjudication owner: user) |
 | **Date** | 2026-08-25 |
-| **Status** | **Implemented — fleet acceptance NOT MET (2026-09-05); the HOLD-TIME campaign landed 2026-09-06 (§"Hold-time campaign" below, `.benchmarks/2026-09-06-free-grace-hold-time.md`): the coupled hold decomposed per stage on the stats inode, levers (b) + (d) −922 ms in-process, the capacity law published, the 6 s of derived windows named as adjudication items; the from-zero s11-mpiio row is OWED (parent). Prior status: (2026-09-05, `.benchmarks/2026-09-05-d4-free-grace-sustain.md` §6: finding 15 reproduces on the s11 venue at 23 s — lane ENOSPC storms — and five of eight co-writers wedge on the ENOSPC'd writes; the WEDGE is fixed 2026-09-06, `.benchmarks/2026-09-06-cowriter-enospc-wedge.md`: the finding-29 bounded-allocation park read the reallocation label as its wall and a harvest sink's presence as supply, so an exhausted co-writer lane parked forever under its block stripe — the row must now fail CLEANLY, fleet re-run owed).** PRs 1–4 landed 2026-08-25 (`f992c2e1` instruments · `11dafe2f` L1 · `29788e55` L4+L2+L2b+L3 · `69b2fe16` L5 + the OQ 2 horizon), followed by finding 18 (`6ce59456`, the prod decay) and finding 29 (`a50da1e4` + `37bf6036`, the bounded allocation park). The s11-mpiio row went GREEN once on the cloud venue (2026-08-30 16b, `8e4a2cab`, `.benchmarks/cloud/2026-08-30-094130`) — on a fleet whose lanes never coupled (`demand_waits` 0, `bound_age` 23–29 s, the routine composite). The §3 rate equation was closed in-process 2026-09-05 (D-4, `.benchmarks/2026-09-05-d4-free-grace-sustain.md`: the shipped levers unbind a recycle-bound stream at zero fences; Little's law holds on live gauges; finding D4-1 priced). **Owed**: the from-zero s11-mpiio row on the finding-15 venue with the sustain columns (PR 5's harness rung is NOT landed — the rig `.benchmarks/rigs/free-grace-sustain-rig.sh` reads the row's snapshots), run by the parent campaign |
+| **Status** | **Implemented — fleet acceptance NOT MET (2026-09-05); the LANE-VISIBLE campaign landed 2026-09-06 (§"Lane-visible campaign" below, `.benchmarks/2026-09-06-free-grace-lane-visible.md`): the fleet-only `min_acked→released` term convicted as the release's wait for DEMAND plus an unmeasured co-writer lane hop behind it, both instrumented (`alloc_lane_visible_phase_ns`) and both made event-driven off the acknowledgement (`SQUEEZEFS_FREE_GRACE_LANE_PUSH`) — 3,408 → 0 ms / 30.7 → 1.5 s in the fleet-cadence model, the from-zero row OWED (parent); the HOLD-TIME campaign landed 2026-09-06 (§"Hold-time campaign" below, `.benchmarks/2026-09-06-free-grace-hold-time.md`): the coupled hold decomposed per stage on the stats inode, levers (b) + (d) −922 ms in-process, the capacity law published, the 6 s of derived windows named as adjudication items; the from-zero s11-mpiio row is OWED (parent). Prior status: (2026-09-05, `.benchmarks/2026-09-05-d4-free-grace-sustain.md` §6: finding 15 reproduces on the s11 venue at 23 s — lane ENOSPC storms — and five of eight co-writers wedge on the ENOSPC'd writes; the WEDGE is fixed 2026-09-06, `.benchmarks/2026-09-06-cowriter-enospc-wedge.md`: the finding-29 bounded-allocation park read the reallocation label as its wall and a harvest sink's presence as supply, so an exhausted co-writer lane parked forever under its block stripe — the row must now fail CLEANLY, fleet re-run owed).** PRs 1–4 landed 2026-08-25 (`f992c2e1` instruments · `11dafe2f` L1 · `29788e55` L4+L2+L2b+L3 · `69b2fe16` L5 + the OQ 2 horizon), followed by finding 18 (`6ce59456`, the prod decay) and finding 29 (`a50da1e4` + `37bf6036`, the bounded allocation park). The s11-mpiio row went GREEN once on the cloud venue (2026-08-30 16b, `8e4a2cab`, `.benchmarks/cloud/2026-08-30-094130`) — on a fleet whose lanes never coupled (`demand_waits` 0, `bound_age` 23–29 s, the routine composite). The §3 rate equation was closed in-process 2026-09-05 (D-4, `.benchmarks/2026-09-05-d4-free-grace-sustain.md`: the shipped levers unbind a recycle-bound stream at zero fences; Little's law holds on live gauges; finding D4-1 priced). **Owed**: the from-zero s11-mpiio row on the finding-15 venue with the sustain columns (PR 5's harness rung is NOT landed — the rig `.benchmarks/rigs/free-grace-sustain-rig.sh` reads the row's snapshots), run by the parent campaign |
 | **Repo state audited** | branch `dev`, tip `894cc088` (finding-15 part 1 landed at `8d2bcd3b`; contracts `tests/mw_cowriter_free_tests.rs` §finding 15) — the design as written; landed state per the Status row |
 | **Program input** | `.benchmarks/2026-08-25-s11-freeloop-stall.md` (finding 15 + the same-day part-1/re-grade addendum); `docs/design-full-multi-writer.md` rung-20 residual board item 1 (re-attributed 2026-08-25) and item 2 (the `SQUEEZEFS_RANGE_CUSTODY` flip, which inherits this as a precondition) |
 | **Binding inputs** | AGENTS.md (one source of truth — DLM S6/S7/S9 families, ENG-10, the two-substrate + sustained-state row rules, the TDD law); `docs/pre-rc-engineering-spec.md` §6.8 item 3; `docs/operations.md` §Freed-offset grace period; `.benchmarks/2026-08-19-blob-aware-merge-and-fabric-venue.md` §3 (the 0→825 never-draining capture); the free-grace pressure valve (rung-20 residual 6, in tree) |
@@ -1190,16 +1190,104 @@ lanes at ≈ 50 % headroom. KD-FG-11 pinned (1)–(3) unmoved for L2b's sake
 (a load-dependent pass cadence must not re-derive them); revisiting their
 DERIVATIONS is the user's call.
 
+### Fleet acceptance — RUN 2026-09-06 09:57 (the note's §6): levers landed as priced, row still FAILS
+
+`s11-mpiio` from zero on `0723b3ea`: `free_grace_bound_age_ms` 8,994 →
+**7,936** (−12 %, the in-process prediction), engagement exact, closure
+exact, zero fences; the sustained-window gate still FAILS (1,214 → 410
+MiB/s) and three terms were named — the 6 s of derived windows (above), a
+**fleet-only `min_acked→released` of 2,500 ms** (the lane-visible campaign
+below), and the residual refused-free lineage (the sibling campaign).
+
+## Lane-visible campaign (2026-09-06, `perf/free-grace-lane-visible` — finding 15 term 2)
+
+**Input.** The fleet's `free_grace_hold_phase_ns.min_acked_released` read a
+2,500 ms MEAN (45,540 samples: 76 % under 512 ms, 3,849 past 16 s) where the
+D-4 model read 9 ms. Evidence note:
+`.benchmarks/2026-09-06-free-grace-lane-visible.md`.
+
+### What the third stage IS
+
+`released` is the harvest's pop — `GraceRing::harvest_with` stamps the hold
+ledger at the pop and the allocator publishes to its free list in the same
+synchronous act — so `min_acked→released` is **the wait for the next
+HARVEST EVENT after the cover**, and the authority's harvest is
+DEMAND-driven: a terminal free landing (a co-writer's shipped free), an
+allocation on the authority, or a co-writer's harvest RPC. Nothing harvests
+on a timer, and lever (d)'s dirty mark only recomputes INSIDE a harvest. In
+the fleet's quiet phases (a close, a fsync wedge — 250 of the row's 304 s)
+the cover comes from the owner's 10 s sweep and the release from the next
+iteration's first demand: the `> 16 s` tail. The D-4 model never had a
+quiet phase, hence 9 ms.
+
+Behind the release sits a hop no ledger measured: a released CO-WRITER-lane
+block is on the AUTHORITY's list, reachable only by that co-writer's next
+harvest RPC — its ENOSPC park slices (50 ms: a co-writer has no plane, so
+`pressure_park_slice_ms` clamps to its floor) or the 1 s watermark tick,
+which fires only while `lane_reachable < watermark` — never while the
+co-writer holds supply. The fleet's end-state (`reachable` 30–247 against
+`watermark` 0–13 on every co-writer) is that shape.
+
+### The instrument — `alloc_lane_visible_phase_ns`
+
+Per served lane block: `released_served` (authority clock — from the grace
+release's free-list publish, `BlockAllocator::publish_grace_release` →
+`free_grace::mark_lane_release`, to the lane take,
+`take_lane_free_blocks` → `take_lane_release`), `served_visible` (co-writer
+clock — the harvest round trip; adoption is the visibility instant),
+`total ≡ released_served + served_visible` per sample. The reply carries
+each block's age (`PublishReply::LaneFreeGrant::release_ages_ms`, publish
+schema 14), so the co-writer stamps the authority's measurement beside its
+own RTT and the two clocks never mix; the authority's `.stats` carries
+`released_served` alone. `alloc_lane_visible_unplaced` counts served blocks
+with no mark; `alloc_lane_release_marks` / `alloc_lane_supply_blocks` are
+the authority's held-for-peers supply. The hold ledger ends at the very
+instant this one begins (pinned:
+`a_deferred_lane_block_waits_for_the_ack_then_the_two_ledgers_chain`).
+
+### The lever — `SQUEEZEFS_FREE_GRACE_LANE_PUSH` (default on)
+
+| Half | Mechanism | Derivation |
+|---|---|---|
+| **release on ack** (authority) | `free_grace::note_member_ack_advanced` — lever (d)'s one-compare gate — runs the installed `ReleaseHook` (`multi_writer::release_hook`: every allocator's `harvest_grace_to_front`, the routine harvest repeated to the ring's uncovered front); the hook's harvest IS the dirty recompute, so the two arms are one act | rate-limited by exactly lever (d)'s `refresh_on_ack_interval_ms` (shares its refresh instant) |
+| **the lane-supply hint** (wire) | `Grant::lane_supply_blocks` on the membership RENEWAL grant (the 1 Hz prodded beat, lever (b)'s carriage included): the member's lane population on the authority's free lists, from the lane-counted free set's per-lane counters (`LaneCountedSet::per_lane`, one `fetch_add` beside the existing lane-owned one) through `multi_writer::lane_supply_source` — O(volumes) loads in the renewal hot op, never a scan (KD-FG-4 stands) | the assignment's `lane_of(member_id)`, the same id the custody path keys on |
+| **the pushed refill** (co-writer) | `MemberSession::renewed*` → `free_grace::note_lane_supply_hint` → `lane_supply_wake` (a `Notify` the ahead task and the bounded allocation park both wait on beside their cadence); `BlockAllocator::pushed_refill_tick` runs the SAME harvest when `lane_push_wants_harvest(hint, owed)` — owed ⇒ harvest, the watermark not consulted (a quiet lane's rate-derived watermark decays to 0, exactly when the tick goes dark) | pure, lever-gated; `0` = the tick and the slices verbatim |
+
+### Measured (the co-writer-lane model, `tests/free_grace_lane_visible_tests.rs`; release, deterministic)
+
+| Shape | lever | `min_acked→released` (mean / > 1 s) | lane hop `released→served` | hold total | `bound_age` | RPCs (empty / pushed) |
+|---|---|---|---|---|---|---|
+| fleet (8 cw × 50 blk/s, 3 s write / 21 s close) | off | **3,408 ms / 8,392 of 11,304** | **30,736 ms** (2,088 blocks still on the authority at the end) | 22,562 | 17,778 | 144 (0 / 0) |
+| | **on** | **0 ms / 0** | **1,540 ms** (66 left) | **14,746** | **10,446** | 237 (0 / 237) |
+| supply-adequate (8 cw × 20 blk/s, spare 2,000, continuous) | off | 20 ms | **never served** — 0 RPCs, 13,200 released blocks on the authority at the end | 9,107 | 8,668 | 0 |
+| | on | 0 ms | 361 ms | 8,219 | 7,500 | 817 (0 / 817) |
+| recycle-bound (8 cw × 50 blk/s, spare 200, continuous) | off | 19 ms | 747 ms (the grain: 64 adopted ⇒ 1.3 s before the next poll) | 15,240 | 12,553 | 11,544 (11,384 / 0) |
+| | on | 0 ms | 386 ms | 14,965 | 12,078 | 11,589 (11,429 / 70) |
+
+Closure exact, forced = fences = 0, every served block placed, throughput
+unchanged on every row. **Convicted: hypothesis (a) — with the correction
+that the parent's 2.5 s is the release's wait for DEMAND (the fleet's quiet
+phases; the sweep covers, the next iteration's first RPC releases), and the
+co-writer's lane hop behind it is larger still and was unmeasured.** (b)
+(the ladder) is excluded by the code: the label is stamped at
+`finish_free`, after the reclaim, and the fleet's frees ride the elided
+path; (c) (a durable commit) — nothing durable sits between the ack and
+the release (`membership_registration_commits` 20 over the row); (d)
+(lever (d)'s rate limit) — 493 of 560 refreshes were on-ack, and the
+limit is 125 ms at 8 members, not 2.5 s.
+
 ### Fleet acceptance — OWED (parent)
 
-The note's §6: `s11-mpiio` from zero on the finding-15 venue at or after
-`7ec426b8`; PASS reads `free_grace_bound_age_ms` ≈ 8.0 s (prediction; > 8.7 s
-= the levers did not engage), `free_grace_offsets` at capture ≪ 3,171
-(Little's law: ≈ 2,850 at the same churn), lane ENOSPC refusals → 0 with
-`alloc_lane_headroom_pct` > 0 through the storm, the sustained-window gate
-PASSING, `forced_releases` / `laggard_fences` / `alloc_stalls` 0, plus the
-per-lever A/B legs (`ACK_RENEWAL=0` ≈ +0.25 s, `REFRESH_ON_ACK=0` ≈ +0.65 s,
-both off = the 8,994 shape).
+`s11-mpiio` from zero on the finding-15 venue at or after this branch's
+tip; PASS reads `free_grace_hold_phase_ns.min_acked_released` mean **≤ 125
+ms** (lever (d)'s rate limit at 8 members — the model reads 0; > 500 ms =
+the release hook did not engage: check `free_grace_lane_push_releases`),
+`free_grace_bound_age_ms` below 7,936, `alloc_lane_visible_phase_ns.released_served`
+mean on m0 ≤ one prodded renewal cadence (1,000 ms) with
+`alloc_lane_pushed_harvests` > 0 on every co-writer, lane ENOSPC on the two
+clean co-writers (m50, m57 — no `CLAIM ANOMALY`) → 0, closure exact, forced
+= fences = stalls = 0, plus the A/B leg `SQUEEZEFS_FREE_GRACE_LANE_PUSH=0`
+(the 2,500 ms shape). The hold-time acceptance items above stand.
 
 ---
 

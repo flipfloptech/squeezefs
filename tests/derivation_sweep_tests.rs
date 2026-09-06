@@ -2073,3 +2073,31 @@ fn reclaim_knobs_explicit_wins_verbatim_over_derived() {
     );
     assert_eq!(resolve_park_bound_ms(Some("soon"), 140), 140);
 }
+
+/// The free-grace hold-time lever (d)'s rate limit derives from the plane's
+/// own numbers — drift-is-red (`.benchmarks/2026-09-06-free-grace-hold-time.md`):
+/// a bound recompute the dirty mark triggers is admitted no closer than
+/// `ack_refresh_floor ÷ members` (the rate the min can change at) and
+/// never closer than twice the scan's measured cost (a recompute may not
+/// run more than half the time). The floor term governs small fleets, the
+/// scan term the 15 k arithmetic; no free constant sits between them.
+#[test]
+fn free_grace_refresh_on_ack_interval_derives_from_floor_members_and_scan() {
+    use squeezefs::free_grace::refresh_on_ack_interval_ms;
+    // The s11 venue: 1 s floor, 8 members, a µs-class scan ⇒ 125 ms.
+    assert_eq!(refresh_on_ack_interval_ms(1_000, 8, 0), 125);
+    // A slower floor scales it; a single member reads the whole floor.
+    assert_eq!(refresh_on_ack_interval_ms(5_000, 8, 0), 625);
+    assert_eq!(refresh_on_ack_interval_ms(1_000, 1, 0), 1_000);
+    assert_eq!(
+        refresh_on_ack_interval_ms(1_000, 0, 0),
+        1_000,
+        "no members ⇒ the floor"
+    );
+    // 15 k members: floor ÷ members rounds to 0 and the scan term governs
+    // — twice its measured cost, never a busy recompute.
+    assert_eq!(refresh_on_ack_interval_ms(1_000, 15_000, 3), 6);
+    // The scan term is a floor on the floor term, never a replacement.
+    assert_eq!(refresh_on_ack_interval_ms(1_000, 8, 100), 200);
+    assert_eq!(refresh_on_ack_interval_ms(1_000, 8, 50), 125);
+}

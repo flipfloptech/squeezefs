@@ -1407,6 +1407,19 @@ pub(crate) fn note_member_ack_advanced(previous_acked: u64) {
     }
 }
 
+/// Lever (d)'s rate limit — the pure form (tie-tested in
+/// `tests/derivation_sweep_tests.rs`): the minimum over `members` can
+/// change at most `members` times per acknowledgement-refresh floor (each
+/// member's answer changes at most once per floor), so recomputes are
+/// admitted no closer than `floor ÷ members`; and a recompute costing
+/// `scan_ms` may not run more than half the time, so never closer than
+/// `2 × scan_ms`. No constant: at 8 members and a µs-class scan the floor
+/// term governs (125 ms on the shipped 1 s floor); at 15 k members the
+/// scan term does.
+pub fn refresh_on_ack_interval_ms(floor_ms: u64, members: u64, scan_ms: u64) -> u64 {
+    (floor_ms / members.max(1)).max(scan_ms.saturating_mul(2))
+}
+
 /// **Lever (d), the harvest's side**: recompute the bound when the dirty
 /// mark is set, rate-limited to the floor the min can honestly change at
 /// — `ack_refresh_floor ÷ members` (each member's answer changes at most
@@ -1427,11 +1440,11 @@ fn refresh_bound_on_dirty() {
         .map(|p| p.floor_ms)
         .unwrap_or(plane.reading_ttl_ms)
         .max(1);
-    let members = MEMBERS.load(Ordering::Relaxed).max(1);
+    let members = MEMBERS.load(Ordering::Relaxed);
     let scan_ms = BOUND_SCAN_EWMA_NS
         .load(Ordering::Relaxed)
         .div_ceil(1_000_000);
-    let interval = (floor_ms / members).max(scan_ms.saturating_mul(2));
+    let interval = refresh_on_ack_interval_ms(floor_ms, members, scan_ms);
     if now.saturating_sub(LAST_BOUND_REFRESH_MS.load(Ordering::Relaxed)) < interval {
         return;
     }

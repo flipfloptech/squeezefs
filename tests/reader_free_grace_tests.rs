@@ -2480,6 +2480,55 @@ struct LoopShape {
     /// Members' first renewals spread across one beat (the §3.2 T8 phase
     /// assumption) or all in phase (the mw rig's near-simultaneous start).
     staggered: bool,
+    /// The writer's ROUTINE checkpoint cadence, ms (`CHECKPOINT_MAX_AGE_MS`
+    /// on the shipped tree): a member's pass ADVANCES iff a checkpoint
+    /// landed since its previous pass — the field's `epochs ÷ polls`.
+    checkpoint_ms: u64,
+}
+
+/// The lever configuration one loop runs under: the D-4 pair
+/// (`ACK_PIPELINE`, `DEMAND`) plus the hold-time campaign's levers. Every
+/// arm is a product knob read through its test seam; the sim performs
+/// only the ACT the product would (a wake, a renewal), never the decision.
+#[derive(Debug, Clone, Copy)]
+struct Levers {
+    pipeline: bool,
+    demand: bool,
+    /// (b) a promotion triggers the member's renewal at once.
+    ack_renewal: bool,
+    /// (d) a binding member's advancing ack marks the bound dirty.
+    refresh_on_ack: bool,
+}
+
+impl Levers {
+    /// The D-4 matrix's configuration: the hold-time levers OFF (the
+    /// 2026-09-05 binary — the pre-campaign baseline for this campaign).
+    fn d4(pipeline: bool, demand: bool) -> Self {
+        Self {
+            pipeline,
+            demand,
+            ack_renewal: false,
+            refresh_on_ack: false,
+        }
+    }
+
+    fn config(&self) -> &'static str {
+        match (
+            self.pipeline,
+            self.demand,
+            self.ack_renewal,
+            self.refresh_on_ack,
+        ) {
+            (false, false, false, false) => "A0 pipeline=0 demand=0",
+            (true, false, false, false) => "A1 pipeline=1 demand=0",
+            (false, true, false, false) => "A2 pipeline=0 demand=1",
+            (true, true, false, false) => "A3 pipeline=1 demand=1 (hold-time levers off)",
+            (true, true, true, false) => "H1 +ack_renewal",
+            (true, true, false, true) => "H2 +refresh_on_ack",
+            (true, true, true, true) => "H3 +ack_renewal +refresh_on_ack (shipped)",
+            _ => "custom",
+        }
+    }
 }
 
 /// One measured row of the loop (the note's columns). Every `*_steady`
@@ -2518,6 +2567,23 @@ struct LoopRow {
     renewals_steady: u64,
     from_freelist: u64,
     fresh: u64,
+    /// The hold-time decomposition (`free_grace_hold_phase_ns` means, ms)
+    /// over the WHOLE run: defer→checkpointed, checkpointed→min_acked,
+    /// min_acked→released, and the samples the checkpoint stage could not
+    /// place.
+    hold_defer_ck_ms: f64,
+    hold_ck_acked_ms: f64,
+    hold_acked_rel_ms: f64,
+    hold_unplaced: u64,
+    /// `free_grace_hold_ms` at the end (the live EWMA).
+    hold_ms: u64,
+    /// The per-member ack lag at the end: max / mean.
+    ack_lag_max_ms: u64,
+    ack_lag_mean_ms: u64,
+    /// Renewals a promotion triggered (lever b's engagement).
+    ack_renewals: u64,
+    /// Bound refreshes a binding ack triggered (lever d's engagement).
+    refreshes_on_ack: u64,
 }
 
 impl LoopRow {
@@ -2527,7 +2593,9 @@ impl LoopRow {
              last {last:.2}) stalls {stalls} | deferrals {d} releases {r} held {h} closure {clo} | \
              forced {f} fences {fe} | bound_age mean {ba:.0} ms max {bam} ms residence mean {res:.0} ms | \
              prods {p} demand_prods {dp} demand_waits {dw} refreshes {rf} tightenings {t} decays {dec} | \
-             acks {acks} renewals {ren} | alloc freelist {fl} fresh {fr}",
+             acks {acks} renewals {ren} | alloc freelist {fl} fresh {fr} | \
+             hold defer→ckpt {hck:.0} ckpt→min_acked {hak:.0} min_acked→rel {hrel:.0} unplaced {hun} \
+             hold_ms {hold} ack_lag max {lmax} mean {lmean} | ack_renewals {ar} refreshes_on_ack {roa}",
             label = shape.label,
             config = self.config,
             mibs = self.steady_allocs_per_s * 4.0,
@@ -2554,6 +2622,15 @@ impl LoopRow {
             ren = self.renewals_steady,
             fl = self.from_freelist,
             fr = self.fresh,
+            hck = self.hold_defer_ck_ms,
+            hak = self.hold_ck_acked_ms,
+            hrel = self.hold_acked_rel_ms,
+            hun = self.hold_unplaced,
+            hold = self.hold_ms,
+            lmax = self.ack_lag_max_ms,
+            lmean = self.ack_lag_mean_ms,
+            ar = self.ack_renewals,
+            roa = self.refreshes_on_ack,
         )
     }
 }
@@ -2568,6 +2645,9 @@ struct SimReader {
     acked: u64,
     next_renew_ms: u64,
     next_pass_ms: u64,
+    /// The previous pass's instant: a pass advances iff a checkpoint
+    /// landed after it.
+    last_pass_ms: u64,
 }
 
 const LOOP_BLOCK: u64 = 4 * 1024 * 1024;
@@ -2595,11 +2675,19 @@ const LOOP_STEP_MS: u64 = 1;
 /// pass once per revalidation interval (every pass advances the epoch —
 /// a storming writer checkpoints continuously) and renew on the cadence
 /// their last grant carried; the owner sweeps on `renew_interval`.
-fn run_closed_loop(shape: &LoopShape, pipeline: bool, demand: bool) -> LoopRow {
+fn run_closed_loop(shape: &LoopShape, levers: Levers) -> LoopRow {
     free_grace::reset_for_test();
     membership::uninstall();
+    let Levers {
+        pipeline,
+        demand,
+        ack_renewal,
+        refresh_on_ack,
+    } = levers;
     free_grace::test_set_ack_pipeline(Some(pipeline));
     free_grace::test_set_demand(Some(demand));
+    free_grace::test_set_ack_renewal(Some(ack_renewal));
+    free_grace::test_set_refresh_on_ack(Some(refresh_on_ack));
     let (clock, ticks) = manual_clock();
     let owner = armed_owner(&clock);
     free_grace::arm_owner_plane(clock.clone(), owner.clocks()).expect("derived bound");
@@ -2617,10 +2705,16 @@ fn run_closed_loop(shape: &LoopShape, pipeline: bool, demand: bool) -> LoopRow {
         .map(|i| {
             let id = format!("sim-reader-{i}");
             let grant = join(&owner, &id, MemberRole::Reader);
-            let phase = if shape.staggered {
-                renew_ms * (i as u64 + 1) / shape.members as u64
+            // Staggered: renewal AND pass phases spread across one beat /
+            // one pass — every member's loops run on their own phase in
+            // the field (the §3.2 T8 assumption for both grids).
+            let (phase, pass_phase) = if shape.staggered {
+                (
+                    renew_ms * (i as u64 + 1) / shape.members as u64,
+                    pass_ms * i as u64 / shape.members as u64,
+                )
             } else {
-                renew_ms
+                (renew_ms, 0)
             };
             SimReader {
                 id,
@@ -2629,7 +2723,8 @@ fn run_closed_loop(shape: &LoopShape, pipeline: bool, demand: bool) -> LoopRow {
                 learned: (grant.granted_at_owner_ms, t0),
                 acked: 0,
                 next_renew_ms: t0 + phase,
-                next_pass_ms: t0 + pass_ms,
+                next_pass_ms: t0 + pass_ms + pass_phase,
+                last_pass_ms: t0,
             }
         })
         .collect();
@@ -2679,6 +2774,13 @@ fn run_closed_loop(shape: &LoopShape, pipeline: bool, demand: bool) -> LoopRow {
     // A refused allocation parks for the product's own slice before it
     // re-runs the pressure harvest (finding 29's bounded wait).
     let mut parked_until_ms = 0u64;
+    // The writer's checkpoint cadence (a storming writer always has
+    // dirty nodes, so the cycle runs at the max-age ceiling): each cycle
+    // marks the hold ledger, and a member's pass advances iff one landed
+    // since its previous pass.
+    let mut next_checkpoint_ms = t0 + shape.checkpoint_ms;
+    let mut last_checkpoint_ms = t0;
+    let mut ack_renewals = 0u64;
     let third_ms = shape.duration_ms / 3;
     let steady_from_ms = t0 + third_ms;
     let end = t0 + shape.duration_ms;
@@ -2696,6 +2798,14 @@ fn run_closed_loop(shape: &LoopShape, pipeline: bool, demand: bool) -> LoopRow {
                 free_grace::reader_acks(),
                 renewals,
             ));
+        }
+
+        // The writer's checkpoint (before the readers' passes: a pass at
+        // the same instant adopts it).
+        if now >= next_checkpoint_ms {
+            free_grace::note_checkpoint_completed(Duration::from_millis(20));
+            last_checkpoint_ms = now;
+            next_checkpoint_ms = now + shape.checkpoint_ms;
         }
 
         // The storm: the co-writers' displaced frees, `finish_free`d at
@@ -2757,13 +2867,28 @@ fn run_closed_loop(shape: &LoopShape, pipeline: bool, demand: bool) -> LoopRow {
                     learned_at_ms: r.learned.1,
                     pass_start_ms: now,
                     now_ms: now,
-                    advanced: true,
+                    advanced: last_checkpoint_ms > r.last_pass_ms,
                     qualify_lag_ms,
                     drain_lag_ms,
                     refresh_floor_ms,
                 });
+                r.last_pass_ms = now;
                 if let Some(label) = promoted {
                     r.acked = label;
+                    // Lever (b): the promotion carries itself home NOW as a
+                    // CARRIAGE renewal (the product wakes the renewal loop;
+                    // the sim performs the wake's effect): the ack travels,
+                    // the routine beat keeps its schedule and the label
+                    // stays the routine renewal's (`renewed_carriage`).
+                    if free_grace::ack_renewal_enabled() {
+                        match owner.renew(&r.id, r.epoch, r.acked) {
+                            RenewOutcome::Renewed(_) => {
+                                renewals += 1;
+                                ack_renewals += 1;
+                            }
+                            other => panic!("a carriage renewal is admitted: {other:?}"),
+                        }
+                    }
                 }
                 r.next_pass_ms += pass_ms;
             }
@@ -2799,13 +2924,16 @@ fn run_closed_loop(shape: &LoopShape, pipeline: bool, demand: bool) -> LoopRow {
         .unwrap_or(0) as f64
         / 1e6;
     let (stalls0, prods0, acks0, renewals0) = at_steady.expect("the loop ran past its fill");
+    let snap = free_grace::stats_snapshot();
+    let phase_mean_ms = |name: &str| -> f64 {
+        snap["free_grace_hold_phase_ns"][name]["mean_ns"]
+            .as_u64()
+            .unwrap_or(0) as f64
+            / 1e6
+    };
+    let lag = &snap["free_grace_member_ack_lag_ms"];
     let row = LoopRow {
-        config: match (pipeline, demand) {
-            (false, false) => "A0 pipeline=0 demand=0",
-            (true, false) => "A1 pipeline=1 demand=0",
-            (false, true) => "A2 pipeline=0 demand=1",
-            (true, true) => "A3 pipeline=1 demand=1",
-        },
+        config: levers.config(),
         steady_allocs_per_s: (allocs_by_third[1] + allocs_by_third[2]) as f64 / steady_secs,
         mid_third_per_s: allocs_by_third[1] as f64 / third_secs,
         last_third_per_s: allocs_by_third[2] as f64 / third_secs,
@@ -2829,10 +2957,21 @@ fn run_closed_loop(shape: &LoopShape, pipeline: bool, demand: bool) -> LoopRow {
         renewals_steady: renewals - renewals0,
         from_freelist,
         fresh,
+        hold_defer_ck_ms: phase_mean_ms("defer_checkpointed"),
+        hold_ck_acked_ms: phase_mean_ms("checkpointed_min_acked"),
+        hold_acked_rel_ms: phase_mean_ms("min_acked_released"),
+        hold_unplaced: free_grace::hold_unplaced(),
+        hold_ms: free_grace::hold_ms(),
+        ack_lag_max_ms: lag["max"].as_u64().unwrap_or(0),
+        ack_lag_mean_ms: lag["mean"].as_u64().unwrap_or(0),
+        ack_renewals,
+        refreshes_on_ack: free_grace::bound_refreshes_on_ack(),
     };
     drop(readers);
     assert!(free_grace::test_clear_ack_pipeline());
     assert!(free_grace::test_clear_demand());
+    assert!(free_grace::test_clear_ack_renewal());
+    assert!(free_grace::test_clear_refresh_on_ack());
     row
 }
 
@@ -2840,10 +2979,10 @@ fn run_closed_loop(shape: &LoopShape, pipeline: bool, demand: bool) -> LoopRow {
 /// A0 = the pre-campaign shape (`ACK_PIPELINE=0 DEMAND=0`), A3 = shipped.
 fn run_loop_matrix(shape: &LoopShape) -> [LoopRow; 4] {
     let rows = [
-        run_closed_loop(shape, false, false),
-        run_closed_loop(shape, true, false),
-        run_closed_loop(shape, false, true),
-        run_closed_loop(shape, true, true),
+        run_closed_loop(shape, Levers::d4(false, false)),
+        run_closed_loop(shape, Levers::d4(true, false)),
+        run_closed_loop(shape, Levers::d4(false, true)),
+        run_closed_loop(shape, Levers::d4(true, true)),
     ];
     for r in &rows {
         println!("{}", r.render(shape));
@@ -2883,6 +3022,7 @@ fn the_recycle_bound_loop_releases_faster_with_the_levers_and_never_fences() {
         storm_per_s: 500,
         duration_ms: 300_000,
         staggered: true,
+        checkpoint_ms: 1_000,
     };
     let rows = run_loop_matrix(&shape);
     for r in &rows {
@@ -2959,6 +3099,7 @@ fn a_still_bound_stream_runs_at_spare_over_latency_on_every_configuration() {
         storm_per_s: 500,
         duration_ms: 300_000,
         staggered: true,
+        checkpoint_ms: 1_000,
     };
     let rows = run_loop_matrix(&shape);
     for r in &rows {
@@ -3035,6 +3176,7 @@ fn a_mid_supply_lane_is_asked_at_the_floor_by_the_fleet_rate_divisor() {
         storm_per_s: 500,
         duration_ms: 300_000,
         staggered: true,
+        checkpoint_ms: 1_000,
     };
     let rows = run_loop_matrix(&shape);
     for r in &rows {
@@ -3137,6 +3279,7 @@ fn an_uncoupled_fleet_runs_the_routine_beat_and_the_demand_arm_stays_dark() {
         storm_per_s: 500,
         duration_ms: 300_000,
         staggered: true,
+        checkpoint_ms: 1_000,
     };
     let rows = run_loop_matrix(&shape);
     let renew_ms = shipped_clocks().renew_interval.as_millis() as f64;
@@ -3387,7 +3530,11 @@ fn the_hold_decomposes_into_three_stages_that_sum_to_the_total() {
     // The writer's next checkpoint lands 700 ms after the defer.
     ticks.fetch_add(700, Ordering::SeqCst);
     free_grace::note_checkpoint_completed(Duration::from_millis(20));
-    assert_eq!(free_grace::checkpoint_marks(), 1, "the hook recorded one mark");
+    assert_eq!(
+        free_grace::checkpoint_marks(),
+        1,
+        "the hook recorded one mark"
+    );
 
     // Reader A acknowledges at +3,000 (the bound stays 0: B has not).
     ticks.fetch_add(2_300, Ordering::SeqCst);
@@ -3409,11 +3556,17 @@ fn the_hold_decomposes_into_three_stages_that_sum_to_the_total() {
     let (n_ack, ackd) = hold_phase("checkpointed_min_acked");
     let (n_rel, rel) = hold_phase("min_acked_released");
     let (n_tot, tot) = hold_phase("total");
-    assert_eq!((n_ck, n_ack, n_rel, n_tot), (1, 1, 1, 1), "one sample per stage per release");
-    assert_eq!(ck as u64, 700, "defer→checkpointed = the first checkpoint after the defer");
     assert_eq!(
-        ackd as u64,
-        4_300,
+        (n_ck, n_ack, n_rel, n_tot),
+        (1, 1, 1, 1),
+        "one sample per stage per release"
+    );
+    assert_eq!(
+        ck as u64, 700,
+        "defer→checkpointed = the first checkpoint after the defer"
+    );
+    assert_eq!(
+        ackd as u64, 4_300,
         "checkpointed→min_acked = the first bound publish covering the label (at +5,000)"
     );
     assert_eq!(rel as u64, 400, "min_acked→released = the harvest's visit");
@@ -3450,13 +3603,25 @@ fn member_ack_lag_names_the_binding_member() {
     // now = t0 + 5,400: A is 5,399 behind, B 3,399.
     let lags = owner.member_ack_lags();
     let mut by_id: std::collections::BTreeMap<String, u64> = lags.into_iter().collect();
-    assert_eq!(by_id.remove("r-lag-a"), Some(5_399), "A's lag = now − its acked label");
-    assert_eq!(by_id.remove("r-lag-b"), Some(3_399), "B's lag = now − its acked label");
+    assert_eq!(
+        by_id.remove("r-lag-a"),
+        Some(5_399),
+        "A's lag = now − its acked label"
+    );
+    assert_eq!(
+        by_id.remove("r-lag-b"),
+        Some(3_399),
+        "B's lag = now − its acked label"
+    );
     assert!(by_id.is_empty(), "exactly the live members are named");
 
     let snap = free_grace::stats_snapshot();
     let agg = &snap["free_grace_member_ack_lag_ms"];
-    assert_eq!(agg["max"].as_u64(), Some(5_399), "max = the binding member (A)");
+    assert_eq!(
+        agg["max"].as_u64(),
+        Some(5_399),
+        "max = the binding member (A)"
+    );
     assert_eq!(agg["min"].as_u64(), Some(3_399));
     assert_eq!(agg["mean"].as_u64(), Some(4_399));
     assert_eq!(agg["members"].as_u64(), Some(2));
@@ -3466,7 +3631,11 @@ fn member_ack_lag_names_the_binding_member() {
     ticks.fetch_add(600, Ordering::SeqCst);
     let lags: std::collections::BTreeMap<String, u64> =
         owner.member_ack_lags().into_iter().collect();
-    assert_eq!(lags.get("r-lag-c"), Some(&600), "acked nothing ⇒ lag = now − joined");
+    assert_eq!(
+        lags.get("r-lag-c"),
+        Some(&600),
+        "acked nothing ⇒ lag = now − joined"
+    );
 }
 
 /// **Contract 25 — the KV checkpoint task marks the hold ledger.** The
@@ -3482,7 +3651,9 @@ async fn the_kv_checkpoint_marks_the_hold_ledger() {
     use squeezefs::meta_backend::Metadata;
     let _serial = serial();
     let file = tempfile::NamedTempFile::new().expect("temp volume");
-    file.as_file().set_len(64 * 1024 * 1024).expect("size volume");
+    file.as_file()
+        .set_len(64 * 1024 * 1024)
+        .expect("size volume");
     format_v3(
         file.path(),
         64 * 1024 * 1024,
@@ -3499,7 +3670,11 @@ async fn the_kv_checkpoint_marks_the_hold_ledger() {
     let be = KvMetaBackend::open(file.path()).await.expect("mount v3");
     be.create(1, "f", 0o644, 0, 0).await.expect("create");
     be.checkpoint_now().await.expect("checkpoint");
-    assert_eq!(free_grace::checkpoint_marks(), 0, "no plane ⇒ no mark (one relaxed load)");
+    assert_eq!(
+        free_grace::checkpoint_marks(),
+        0,
+        "no plane ⇒ no mark (one relaxed load)"
+    );
 
     let (clock, _ticks) = manual_clock();
     let owner = armed_owner(&clock);
@@ -3508,6 +3683,411 @@ async fn the_kv_checkpoint_marks_the_hold_ledger() {
     owner.refresh_free_grace_bound();
     be.create(1, "g", 0o644, 0, 0).await.expect("create");
     be.checkpoint_now().await.expect("checkpoint");
-    assert_eq!(free_grace::checkpoint_marks(), 1, "an armed plane records the checkpoint");
+    assert_eq!(
+        free_grace::checkpoint_marks(),
+        1,
+        "an armed plane records the checkpoint"
+    );
     be.shutdown().await.expect("shutdown");
+}
+
+/// The finding-15 fleet shape on the closed loop: the s11 venue's 8
+/// members, the shipped 1 s checkpoint / pass / floor cadences, a lane-0
+/// stream at 80 MiB/s against a 500 blk/s storm.
+fn fleet_cadence_shape(label: &'static str, lane_spare: u64) -> LoopShape {
+    LoopShape {
+        label,
+        members: 8,
+        lane_spare,
+        lane_demand_per_s: 20,
+        storm_per_s: 500,
+        duration_ms: 300_000,
+        staggered: true,
+        checkpoint_ms: 1_000,
+    }
+}
+
+/// **Contract 26 — the hold at fleet cadences reproduces in-process and
+/// decomposes exactly.** Every cadence at its 1 Hz floor (checkpoint,
+/// pass, prodded beat), the D-4 levers on, the hold-time levers off — the
+/// 2026-09-05 binary's shape: `bound_age` reads 6–9 s (the fleet's 8,994
+/// ms), `defer→checkpointed` is bounded by one checkpoint period, the
+/// harvest stage is below one pass, and the bulk sits in
+/// `checkpointed→min_acked` — the readers' qualify + drain windows plus
+/// the beat/pass/composition quantization. The three stage means sum to
+/// the residence mean (exact-sum over a fully placed population).
+#[test]
+fn the_hold_at_fleet_cadences_is_the_sum_of_its_stages() {
+    let _serial = serial();
+    let shape = fleet_cadence_shape("hold-fleet(spare=256,ckpt=1s,pass=1s,floor=1s,8m)", 256);
+    let row = run_closed_loop(&shape, Levers::d4(true, true));
+    println!("{}", row.render(&shape));
+    assert_eq!(row.deferrals, row.releases + row.held_end, "closure");
+    assert_eq!(
+        (row.forced, row.fences),
+        (0, 0),
+        "no fence on a healthy fleet"
+    );
+    assert_eq!(
+        row.hold_unplaced, 0,
+        "every release places all three stages"
+    );
+    assert!(
+        (6_000.0..=9_500.0).contains(&row.bound_age_mean_ms),
+        "the red shape: bound_age {:.0} ms at 1 Hz cadences (fleet 8,994)",
+        row.bound_age_mean_ms
+    );
+    assert!(
+        row.hold_defer_ck_ms <= shape.checkpoint_ms as f64,
+        "defer→checkpointed ≤ one checkpoint period ({:.0} ms)",
+        row.hold_defer_ck_ms
+    );
+    assert!(
+        row.hold_acked_rel_ms < 1_000.0,
+        "min_acked→released is below one pass: the harvest runs per free ({:.0} ms)",
+        row.hold_acked_rel_ms
+    );
+    assert!(
+        row.hold_ck_acked_ms > 5_000.0,
+        "checkpointed→min_acked carries the qualify + drain windows and the quantization ({:.0} ms)",
+        row.hold_ck_acked_ms
+    );
+    let sum = row.hold_defer_ck_ms + row.hold_ck_acked_ms + row.hold_acked_rel_ms;
+    assert!(
+        (sum - row.residence_mean_ms).abs() <= 1.0,
+        "exact-sum: {sum:.1} ms vs residence mean {:.1} ms",
+        row.residence_mean_ms
+    );
+    assert!(
+        (row.hold_ms as f64 - row.residence_mean_ms).abs() <= 0.25 * row.residence_mean_ms,
+        "the live hold gauge tracks the residence ({} vs {:.0} ms)",
+        row.hold_ms,
+        row.residence_mean_ms
+    );
+    assert!(
+        row.ack_lag_max_ms as f64 >= row.ack_lag_mean_ms as f64 && row.ack_lag_mean_ms > 6_000,
+        "the per-member lag names the composition: max {} mean {}",
+        row.ack_lag_max_ms,
+        row.ack_lag_mean_ms
+    );
+}
+
+/// **Contract 27 — the capacity law: a lane exhausts exactly when
+/// `hold × churn + live > cap/W`.** The stream's spare is `cap/W − live`;
+/// with the hold `H` MEASURED on the loop (`free_grace_hold_ms`), a spare
+/// below `demand × H` stalls (`free_grace_alloc_stalls` grows — the
+/// fleet's lane ENOSPC), a spare above it never does. Both halves on the
+/// same binary, the same cadences, the same measured `H`.
+#[test]
+fn a_lane_exhausts_exactly_when_hold_times_churn_exceeds_its_spare() {
+    let _serial = serial();
+    let probe = run_closed_loop(
+        &fleet_cadence_shape("capacity-probe(spare=256)", 256),
+        Levers::d4(true, true),
+    );
+    let hold_s = probe.hold_ms as f64 / 1_000.0;
+    assert!(hold_s > 1.0, "the probe measured a hold ({hold_s:.2} s)");
+    let inflight = 20.0 * hold_s; // demand × hold, blocks
+    let below = (0.6 * inflight) as u64;
+    let above = (1.5 * inflight) as u64;
+    let starved = run_closed_loop(
+        &fleet_cadence_shape("capacity-below(spare=0.6×demand×hold)", below),
+        Levers::d4(true, true),
+    );
+    let fed = run_closed_loop(
+        &fleet_cadence_shape("capacity-above(spare=1.5×demand×hold)", above),
+        Levers::d4(true, true),
+    );
+    println!(
+        "ROW capacity: hold {hold_s:.2} s × demand 20 blk/s = {inflight:.0} blocks in flight; \
+         spare {below} → stalls {} ({:.1} blk/s); spare {above} → stalls {} ({:.1} blk/s)",
+        starved.stalls_steady,
+        starved.steady_allocs_per_s,
+        fed.stalls_steady,
+        fed.steady_allocs_per_s
+    );
+    assert!(
+        starved.stalls_steady > 0 && starved.steady_allocs_per_s < 20.0,
+        "spare below demand × hold EXHAUSTS the lane (stalls {}, {:.2} blk/s)",
+        starved.stalls_steady,
+        starved.steady_allocs_per_s
+    );
+    assert_eq!(
+        fed.stalls_steady, 0,
+        "spare above demand × hold never exhausts"
+    );
+    assert!(
+        (fed.steady_allocs_per_s - 20.0).abs() < 0.5,
+        "…and the stream runs at its offered rate ({:.2} blk/s)",
+        fed.steady_allocs_per_s
+    );
+}
+
+/// **Contract 28 — lever (b): a promotion carries itself home at once.**
+/// The ack used to wait for the member's NEXT routine beat (≤ one prodded
+/// cadence — the T5 carry term); now `reader_pass_completed`'s promotion
+/// wakes the renewal loop (`membership::renewal_wake`), so the carry is
+/// one round trip. `SQUEEZEFS_FREE_GRACE_ACK_RENEWAL=0` restores the
+/// beat-only carriage verbatim (no wake, no count).
+#[test]
+fn a_promotion_carries_itself_home_at_once() {
+    let _serial = serial();
+    let (clock, ticks) = manual_clock();
+    let owner = armed_owner(&clock);
+    free_grace::arm_owner_plane(clock.clone(), owner.clocks()).expect("derived bound");
+    let grant = join(&owner, "r-carry", MemberRole::Reader);
+    owner.refresh_free_grace_bound();
+    let anchor = clock.now_ms();
+    let session = Arc::new(MemberSession::adopt(
+        "r-carry",
+        MemberRole::Reader,
+        &grant,
+        anchor,
+        clock.clone(),
+    ));
+    membership::install_member(Arc::clone(&session));
+    // Drain any stale permit: the wake must come from THIS promotion.
+    assert!(
+        !membership::renewal_wake().notified_raw().enable(),
+        "no renewal request is pending before the promotion"
+    );
+
+    let drive = |ticks: &Arc<AtomicU64>| -> Option<u64> {
+        // Qualify: an advancing pass ≥ learn + staleness + skew; then the
+        // drain window; then the promoting pass.
+        ticks.fetch_add(2_100, Ordering::SeqCst);
+        assert!(free_grace::reader_pass_completed(clock.now_ms(), true).is_none());
+        ticks.fetch_add(4_100, Ordering::SeqCst);
+        free_grace::reader_pass_completed(clock.now_ms(), true)
+    };
+
+    free_grace::test_set_ack_renewal(Some(true));
+    let promoted = drive(&ticks);
+    assert_eq!(
+        promoted,
+        Some(grant.granted_at_owner_ms),
+        "the label promotes"
+    );
+    assert!(
+        membership::renewal_wake().notified_raw().enable(),
+        "the promotion woke the renewal loop (a permit is stored)"
+    );
+    assert_eq!(
+        free_grace::ack_renewals(),
+        1,
+        "counted: free_grace_ack_renewals"
+    );
+    assert!(free_grace::test_clear_ack_renewal());
+
+    // The carriage renewal itself: the lease renews and the ack travels,
+    // but the routine beat keeps its schedule and the label stays the
+    // routine renewal's — a label learned just after a pass would qualify
+    // a whole pass later than one learned at the beat's own phase.
+    let learned_before = session.learned_label();
+    let beat_before = session.renew_at_ms();
+    ticks.fetch_add(100, Ordering::SeqCst);
+    let carriage_at = clock.now_ms();
+    let renewed = match owner.renew("r-carry", session.epoch(), session.acked_free_epoch()) {
+        RenewOutcome::Renewed(g) => g,
+        other => panic!("admitted: {other:?}"),
+    };
+    session.renewed_carriage(&renewed, carriage_at);
+    assert_eq!(
+        session.learned_label(),
+        learned_before,
+        "carriage learns no label"
+    );
+    assert_eq!(
+        session.renew_at_ms(),
+        beat_before,
+        "carriage keeps the routine beat"
+    );
+    assert_eq!(
+        session.t_self_deadline_ms(),
+        carriage_at + renewed.t_self_ms(),
+        "…and renews the lease"
+    );
+    // A prod riding the carriage grant IS honoured (the beat comes forward).
+    let mut prodded = renewed;
+    prodded.renew_ms = 1_000;
+    session.renewed_carriage(&prodded, carriage_at);
+    assert_eq!(
+        session.renew_at_ms(),
+        carriage_at + 1_000,
+        "a prod brings the beat forward"
+    );
+
+    // The lever off: the ack waits for the beat (no wake, no count).
+    free_grace::reset_for_test();
+    membership::uninstall();
+    let owner = armed_owner(&clock);
+    free_grace::arm_owner_plane(clock.clone(), owner.clocks()).expect("derived bound");
+    let grant = join(&owner, "r-carry-off", MemberRole::Reader);
+    owner.refresh_free_grace_bound();
+    let session = Arc::new(MemberSession::adopt(
+        "r-carry-off",
+        MemberRole::Reader,
+        &grant,
+        clock.now_ms(),
+        clock.clone(),
+    ));
+    membership::install_member(session);
+    // Consume the permit the first half stored.
+    let _ = membership::renewal_wake().notified_raw().enable();
+    free_grace::test_set_ack_renewal(Some(false));
+    assert!(drive(&ticks).is_some(), "the ladder still promotes");
+    assert_eq!(
+        free_grace::ack_renewals(),
+        0,
+        "ACK_RENEWAL=0: nothing counted"
+    );
+    assert!(free_grace::test_clear_ack_renewal());
+}
+
+/// **Contract 29 — lever (d): a binding member's advancing ack refreshes
+/// the bound on the next harvest, not on the next floor beat.** The bound
+/// is a min; only a member whose recorded ack sat at or below the
+/// published bound can move it, so `renew` marks the bound dirty for
+/// exactly those (one compare — no O(members) work in the plane's hot
+/// op) and the harvest recomputes when the mark is set, rate-limited by
+/// `floor ÷ members` (the rate the min can change at) and by twice the
+/// measured scan cost. `SQUEEZEFS_FREE_GRACE_REFRESH_ON_ACK=0` leaves the
+/// refresh on the floor cadence / the sweep verbatim.
+#[test]
+fn a_binding_members_ack_refreshes_the_bound_on_the_next_harvest() {
+    let _serial = serial();
+    for lever in [true, false] {
+        free_grace::reset_for_test();
+        membership::uninstall();
+        free_grace::test_set_refresh_on_ack(Some(lever));
+        let (clock, ticks) = manual_clock();
+        let owner = armed_owner(&clock);
+        free_grace::arm_owner_plane(clock.clone(), owner.clocks()).expect("derived bound");
+        let a = join(&owner, "r-d-a", MemberRole::Reader);
+        let b = join(&owner, "r-d-b", MemberRole::Reader);
+        owner.refresh_free_grace_bound();
+        let ring = GraceRing::new(1024);
+        let label = clock.now_ms() + 1;
+        assert!(ring.defer(4 * 1024 * 1024, 4 * 1024 * 1024));
+        ticks.fetch_add(3_000, Ordering::SeqCst);
+        // A acknowledges on its renewal (no sweep, no refresh): the bound
+        // stays 0 — B is the binding member.
+        assert!(matches!(
+            owner.renew("r-d-a", a.epoch, label),
+            RenewOutcome::Renewed(_)
+        ));
+        assert!(ring.harvest_with_supply(64, u64::MAX, u64::MAX).is_empty());
+        assert_eq!(free_grace::bound(), 0, "B has acknowledged nothing");
+        // B's ack arrives on ITS renewal: the binding member moved.
+        ticks.fetch_add(1_000, Ordering::SeqCst);
+        assert!(matches!(
+            owner.renew("r-d-b", b.epoch, label),
+            RenewOutcome::Renewed(_)
+        ));
+        let refreshes0 = free_grace::bound_refreshes_on_ack();
+        let released = ring.harvest_with_supply(64, u64::MAX, u64::MAX);
+        if lever {
+            assert_eq!(
+                released.len(),
+                1,
+                "REFRESH_ON_ACK=1: the harvest recomputed the min and released the offset"
+            );
+            assert_eq!(free_grace::bound(), label);
+            assert_eq!(
+                free_grace::bound_refreshes_on_ack() - refreshes0,
+                1,
+                "counted"
+            );
+        } else {
+            assert!(
+                released.is_empty(),
+                "REFRESH_ON_ACK=0: the bound waits for the sweep (verbatim)"
+            );
+            assert_eq!(free_grace::bound(), 0);
+            assert_eq!(free_grace::bound_refreshes_on_ack(), 0);
+            owner.refresh_free_grace_bound();
+            assert_eq!(ring.harvest_with_supply(64, u64::MAX, u64::MAX).len(), 1);
+        }
+        assert!(free_grace::test_clear_refresh_on_ack());
+    }
+}
+
+/// **Contract 30 — the hold-time levers on the fleet-cadence loop.** With
+/// the D-4 levers on, (b) and (d) each cut the hold and compose: H3 (the
+/// shipped configuration) reads a lower `bound_age` than A3 with every
+/// safety law intact — closure, `forced = fences = 0`, the stream never
+/// stalled more — and the engagement gauges account for the mechanism
+/// (`ack_renewals`, `bound_refreshes_on_ack`). The rows are the note's.
+#[test]
+fn the_hold_time_levers_cut_the_hold_and_never_fence() {
+    let _serial = serial();
+    let shape = fleet_cadence_shape("hold-levers(spare=256,ckpt=1s,8m)", 256);
+    let rows = [
+        run_closed_loop(&shape, Levers::d4(true, true)),
+        run_closed_loop(
+            &shape,
+            Levers {
+                ack_renewal: true,
+                ..Levers::d4(true, true)
+            },
+        ),
+        run_closed_loop(
+            &shape,
+            Levers {
+                refresh_on_ack: true,
+                ..Levers::d4(true, true)
+            },
+        ),
+        run_closed_loop(
+            &shape,
+            Levers {
+                ack_renewal: true,
+                refresh_on_ack: true,
+                ..Levers::d4(true, true)
+            },
+        ),
+    ];
+    for r in &rows {
+        println!("{}", r.render(&shape));
+        assert_eq!(
+            r.deferrals,
+            r.releases + r.held_end,
+            "{}: closure",
+            r.config
+        );
+        assert_eq!((r.forced, r.fences), (0, 0), "{}: no fence", r.config);
+        assert_eq!(r.hold_unplaced, 0, "{}: every stage placed", r.config);
+    }
+    let (a3, h1, h2, h3) = (&rows[0], &rows[1], &rows[2], &rows[3]);
+    assert!(
+        h1.ack_renewals > 0,
+        "H1: promotions carried themselves home"
+    );
+    assert!(
+        h2.refreshes_on_ack > 0,
+        "H2: binding acks refreshed the bound"
+    );
+    assert!(
+        h1.bound_age_mean_ms < a3.bound_age_mean_ms,
+        "lever (b) cuts the hold: {:.0} vs {:.0} ms",
+        h1.bound_age_mean_ms,
+        a3.bound_age_mean_ms
+    );
+    assert!(
+        h2.bound_age_mean_ms < a3.bound_age_mean_ms,
+        "lever (d) cuts the hold: {:.0} vs {:.0} ms",
+        h2.bound_age_mean_ms,
+        a3.bound_age_mean_ms
+    );
+    assert!(
+        h3.bound_age_mean_ms <= h1.bound_age_mean_ms.min(h2.bound_age_mean_ms),
+        "the levers compose (never undo each other): H3 {:.0} vs H1 {:.0} / H2 {:.0} ms",
+        h3.bound_age_mean_ms,
+        h1.bound_age_mean_ms,
+        h2.bound_age_mean_ms
+    );
+    assert!(
+        h3.stalls_steady <= a3.stalls_steady,
+        "the levers never stall the stream more"
+    );
 }

@@ -3052,6 +3052,81 @@ async fn the_ahead_decision_harvests_only_the_owing_starved_volume() {
     assert!(squeezefs::block_allocator::test_clear_harvest_ahead());
 }
 
+/// **The capacity law, published** (finding 15's remaining half — the
+/// hold-time campaign, `.benchmarks/2026-09-06-free-grace-hold-time.md`):
+/// a lane exhausts exactly when `churn × hold + live > cap/W`. The
+/// co-writer already holds every term — its claim-rate EWMA, the refill
+/// horizon (the authority's measured hold + RTT + one floor), its share
+/// and its reachable/owed stock — so it publishes
+/// `alloc_lane_share_needed_blocks = ceil(rate × horizon) + live` (with
+/// `live = share − reachable − owed`) and `alloc_lane_headroom_pct =
+/// (share − needed) ÷ share`, saturating at 0. An unpartitioned allocator
+/// reads 0/0 (the family's solo-inert convention).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_lane_share_needed_and_headroom_publish_the_capacity_law() {
+    let _serial = serial();
+    let _restore = restore();
+    let a = Arc::new(
+        squeezefs::block_allocator::BlockAllocator::new("vol-00000000000000fc")
+            .await
+            .expect("allocator"),
+    );
+    let chunk = a.chunk_size();
+    a.set_capacity_bytes(64 * chunk);
+    assert_eq!(
+        (a.lane_share_needed_blocks(), a.lane_headroom_pct()),
+        (0, 0),
+        "unpartitioned: the family is inert"
+    );
+    // 64-block device, 2 writers ⇒ this lane's share is 32.
+    let part = squeezefs::meta_backend::kv::journal::AppendPartition::new(2, 0)
+        .expect("a 2-writer partition");
+    a.engage_alloc_lanes(part).expect("engages");
+    let share = 32u64;
+    for _ in 0..20 {
+        a.allocate_block().await.expect("mint");
+    }
+    a.sample_alloc_rate(10_000);
+    for _ in 0..2 {
+        a.allocate_block().await.expect("mint");
+    }
+    // A measured hold from the authority: horizon = 4,000 + 0 + one floor.
+    a.note_harvest_hint(4_000, 0);
+    a.sample_alloc_rate(11_000);
+    let inflight = a.watermark_blocks();
+    assert!(inflight > 0, "a claiming writer needs blocks in flight");
+    let live = share - a.lane_reachable_blocks() - a.lane_owed_blocks();
+    assert_eq!(live, 22, "22 of the 32-block share are live");
+    assert_eq!(
+        a.lane_share_needed_blocks(),
+        inflight + live,
+        "needed = churn × hold + live"
+    );
+    assert_eq!(
+        a.lane_headroom_pct(),
+        (share - inflight - live) * 100 / share,
+        "headroom = (share − needed) ÷ share"
+    );
+    let m = &squeezefs::fuse_client::METRICS;
+    assert_eq!(
+        m.alloc_lane_share_needed_blocks.load(Ordering::Relaxed),
+        inflight + live,
+        "published on the stats inode"
+    );
+    assert_eq!(
+        m.alloc_lane_headroom_pct.load(Ordering::Relaxed),
+        (share - inflight - live) * 100 / share
+    );
+    // Burn the lane past the law: needed exceeds the share, headroom 0.
+    while a.allocate_block().await.is_ok() {}
+    a.sample_alloc_rate(12_000);
+    assert!(
+        a.lane_share_needed_blocks() >= share,
+        "at exhaustion needed ≥ share"
+    );
+    assert_eq!(a.lane_headroom_pct(), 0, "…and the headroom saturates at 0");
+}
+
 /// **The refill horizon is a MEASUREMENT with the derivation as its
 /// fallback** (OQ 2, user decision): a harvest reply carrying a nonzero
 /// bound-age hint sets `horizon = hint + RTT + one refresh floor` and is

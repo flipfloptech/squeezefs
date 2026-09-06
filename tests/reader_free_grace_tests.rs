@@ -2501,6 +2501,9 @@ struct Levers {
     /// Re-derivation item 1: qualify = the writer's checkpoint ceiling +
     /// skew (off = the pre-change `staleness + skew`).
     qualify_ceiling: bool,
+    /// Re-derivation item 2: the layout cache is epoch-step stamped, so
+    /// the drain drops its `S` term (off = `S + D_purge`).
+    drain_epoch_stamp: bool,
 }
 
 impl Levers {
@@ -2513,6 +2516,7 @@ impl Levers {
             ack_renewal: false,
             refresh_on_ack: false,
             qualify_ceiling: false,
+            drain_epoch_stamp: false,
         }
     }
 
@@ -2533,17 +2537,21 @@ impl Levers {
             self.ack_renewal,
             self.refresh_on_ack,
             self.qualify_ceiling,
+            self.drain_epoch_stamp,
         ) {
-            (false, false, false, false, false) => "A0 pipeline=0 demand=0",
-            (true, false, false, false, false) => "A1 pipeline=1 demand=0",
-            (false, true, false, false, false) => "A2 pipeline=0 demand=1",
-            (true, true, false, false, false) => "A3 pipeline=1 demand=1 (hold-time levers off)",
-            (true, true, true, false, false) => "H1 +ack_renewal",
-            (true, true, false, true, false) => "H2 +refresh_on_ack",
-            (true, true, true, true, false) => {
+            (false, false, false, false, false, false) => "A0 pipeline=0 demand=0",
+            (true, false, false, false, false, false) => "A1 pipeline=1 demand=0",
+            (false, true, false, false, false, false) => "A2 pipeline=0 demand=1",
+            (true, true, false, false, false, false) => {
+                "A3 pipeline=1 demand=1 (hold-time levers off)"
+            }
+            (true, true, true, false, false, false) => "H1 +ack_renewal",
+            (true, true, false, true, false, false) => "H2 +refresh_on_ack",
+            (true, true, true, true, false, false) => {
                 "H3 +ack_renewal +refresh_on_ack (hold-time shipped)"
             }
-            (true, true, true, true, true) => "R1 H3 +qualify_ceiling",
+            (true, true, true, true, true, false) => "R1 H3 +qualify_ceiling",
+            (true, true, true, true, true, true) => "R2 R1 +drain_epoch_stamp",
             _ => "custom",
         }
     }
@@ -2702,12 +2710,14 @@ fn run_closed_loop(shape: &LoopShape, levers: Levers) -> LoopRow {
         ack_renewal,
         refresh_on_ack,
         qualify_ceiling,
+        drain_epoch_stamp,
     } = levers;
     free_grace::test_set_ack_pipeline(Some(pipeline));
     free_grace::test_set_demand(Some(demand));
     free_grace::test_set_ack_renewal(Some(ack_renewal));
     free_grace::test_set_refresh_on_ack(Some(refresh_on_ack));
     free_grace::test_set_qualify_ceiling(Some(qualify_ceiling));
+    squeezefs::ro_coherence::test_set_drain_epoch_stamp(Some(drain_epoch_stamp));
     let (clock, ticks) = manual_clock();
     let owner = armed_owner(&clock);
     free_grace::arm_owner_plane(clock.clone(), owner.clocks()).expect("derived bound");
@@ -2722,7 +2732,11 @@ fn run_closed_loop(shape: &LoopShape, levers: Levers) -> LoopRow {
     let ceiling_ms = squeezefs::meta_backend::kv::checkpoint::checkpoint_landing_ceiling_derived();
     let qualify_lag_ms =
         free_grace::qualify_lag_ms(qualify_ceiling, ceiling_ms, staleness_ms, skew_ms);
-    let drain_lag_ms = staleness_ms + clocks.d_purge.as_millis() as u64;
+    let drain_lag_ms = free_grace::drain_lag_ms(
+        drain_epoch_stamp,
+        staleness_ms,
+        clocks.d_purge.as_millis() as u64,
+    );
     let refresh_floor_ms = pass_ms.max(skew_ms);
 
     let t0 = clock.now_ms();
@@ -2887,12 +2901,18 @@ fn run_closed_loop(shape: &LoopShape, levers: Levers) -> LoopRow {
         // The readers: passes (the ladder) and renewals (the carriage).
         for r in readers.iter_mut() {
             if now >= r.next_pass_ms {
+                let advanced = last_checkpoint_ms > r.last_pass_ms;
+                if advanced {
+                    // The product's purge sink steps the reader's layout
+                    // generation as the last act of every epoch step.
+                    squeezefs::ro_coherence::test_note_epoch_step();
+                }
                 let promoted = r.ladder.note_pass(AckInputs {
                     label: r.learned.0,
                     learned_at_ms: r.learned.1,
                     pass_start_ms: now,
                     now_ms: now,
-                    advanced: last_checkpoint_ms > r.last_pass_ms,
+                    advanced,
                     qualify_lag_ms,
                     drain_lag_ms,
                     refresh_floor_ms,
@@ -2998,6 +3018,7 @@ fn run_closed_loop(shape: &LoopShape, levers: Levers) -> LoopRow {
     assert!(free_grace::test_clear_ack_renewal());
     assert!(free_grace::test_clear_refresh_on_ack());
     assert!(free_grace::test_clear_qualify_ceiling());
+    assert!(squeezefs::ro_coherence::test_clear_drain_epoch_stamp());
     row
 }
 
@@ -4367,6 +4388,131 @@ fn the_rederived_qualify_window_cuts_the_hold_by_the_double_counted_term() {
     assert!(
         (500.0..=1_300.0).contains(&cut),
         "the qualify re-derivation removes ≈ the double-counted second: {:.0} → {:.0} ms (−{cut:.0})",
+        before.bound_age_mean_ms,
+        after.bound_age_mean_ms
+    );
+    assert!(
+        after.stalls_steady <= before.stalls_steady,
+        "never stalls the stream more"
+    );
+}
+
+/// **Contract 34 — item 2: the drain window carries no cache TTL once the
+/// layout cache is epoch-step stamped.** Gate 3's `S` term existed because
+/// the daemon's layout/attr caches (reader TTL = `S`) could serve a
+/// pre-step binding for up to `S` after the purge. With every layout-cache
+/// entry stamped with the purge generation it was resolved under and an
+/// older stamp a MISS (`tests/reader_layout_step_gate_tests.rs` pins the
+/// gate itself), no daemon cache can serve a pre-step binding after the
+/// step, so the drain is `D_purge` alone; `SQUEEZEFS_FREE_GRACE_DRAIN_EPOCH_STAMP=0`
+/// restores `S + D_purge` verbatim. End to end on a real member session:
+/// the promotion lands at `qualify_pass + D_purge`, where the retired
+/// window would still be waiting out `S`.
+#[test]
+fn the_drain_window_carries_no_cache_ttl_once_entries_are_step_stamped() {
+    let _serial = serial();
+    // The pure rule both the product and the loop model call.
+    assert_eq!(free_grace::drain_lag_ms(true, 2_000, 2_000), 2_000);
+    assert_eq!(free_grace::drain_lag_ms(false, 2_000, 2_000), 4_000);
+
+    for lever in [true, false] {
+        free_grace::reset_for_test();
+        membership::uninstall();
+        squeezefs::ro_coherence::test_set_drain_epoch_stamp(Some(lever));
+        let (clock, ticks) = manual_clock();
+        let owner = armed_owner(&clock);
+        let grant = join(&owner, "r-drain", MemberRole::Reader);
+        owner.refresh_free_grace_bound();
+        let anchor = clock.now_ms();
+        let session = Arc::new(MemberSession::adopt(
+            "r-drain",
+            MemberRole::Reader,
+            &grant,
+            anchor,
+            clock.clone(),
+        ));
+        membership::install_member(Arc::clone(&session));
+        let (label, _) = session.learned_label();
+        let staleness = squeezefs::ro_coherence::reader_staleness_bound().as_millis() as u64;
+        let d_purge = session.d_purge_ms();
+        let qualify = session.checkpoint_ceiling_ms() + session.skew_max_ms();
+
+        // Qualify.
+        ticks.fetch_add(qualify, Ordering::SeqCst);
+        let pass_start = clock.now_ms();
+        assert_eq!(free_grace::reader_pass_completed(pass_start, true), None);
+        assert_eq!(
+            reader_pending_label(),
+            label,
+            "qualified, awaiting the drain"
+        );
+        assert_eq!(
+            free_grace::stats_snapshot()["free_grace_drain_lag_ms"],
+            if lever { d_purge } else { staleness + d_purge },
+            "the drain window in force is published"
+        );
+        // `D_purge` elapses: the re-derived drain promotes; the retired
+        // one is still waiting out the caches' TTL.
+        ticks.fetch_add(d_purge, Ordering::SeqCst);
+        let at_d_purge = free_grace::reader_pass_completed(clock.now_ms(), false);
+        if lever {
+            assert_eq!(
+                at_d_purge,
+                Some(label),
+                "lever on: the drain is D_purge — promoted"
+            );
+        } else {
+            assert_eq!(at_d_purge, None, "lever off: S still owed");
+            ticks.fetch_add(staleness, Ordering::SeqCst);
+            assert_eq!(
+                free_grace::reader_pass_completed(clock.now_ms(), false),
+                Some(label),
+                "lever off: promoted at S + D_purge verbatim"
+            );
+        }
+        assert!(squeezefs::ro_coherence::test_clear_drain_epoch_stamp());
+    }
+}
+
+/// **Contract 35 — item 2 on the fleet-cadence loop: the drain's `S`
+/// leaves the hold.** R1 (item 1) against R1 + the step-stamped drain:
+/// `bound_age` falls by ≈ the 2,000 ms staleness bound, closure exact, no
+/// fence, the stream never stalled more. The loop's readers step their
+/// epoch on every advancing pass exactly as the product's sink does.
+#[test]
+fn the_step_stamped_drain_cuts_the_hold_by_the_cache_ttl() {
+    let _serial = serial();
+    let shape = fleet_cadence_shape("rederive-drain-stamp(spare=256,ckpt=1s,8m)", 256);
+    let before = run_closed_loop(
+        &shape,
+        Levers {
+            qualify_ceiling: true,
+            ..Levers::h3()
+        },
+    );
+    let after = run_closed_loop(
+        &shape,
+        Levers {
+            qualify_ceiling: true,
+            drain_epoch_stamp: true,
+            ..Levers::h3()
+        },
+    );
+    for r in [&before, &after] {
+        println!("{}", r.render(&shape));
+        assert_eq!(
+            r.deferrals,
+            r.releases + r.held_end,
+            "{}: closure",
+            r.config
+        );
+        assert_eq!((r.forced, r.fences), (0, 0), "{}: no fence", r.config);
+        assert_eq!(r.hold_unplaced, 0, "{}: every stage placed", r.config);
+    }
+    let cut = before.bound_age_mean_ms - after.bound_age_mean_ms;
+    assert!(
+        (1_500.0..=2_500.0).contains(&cut),
+        "the step-stamped drain removes ≈ the staleness bound: {:.0} → {:.0} ms (−{cut:.0})",
         before.bound_age_mean_ms,
         after.bound_age_mean_ms
     );

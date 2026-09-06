@@ -2024,13 +2024,26 @@ pub struct AckInputs {
     /// landing ceiling + `skew_max` (item 1; `staleness_bound + skew_max`
     /// under the lever's `0`).
     pub qualify_lag_ms: u64,
-    /// The drain window's timer — [`drain_lag_ms`]: `D_purge` (item 2;
-    /// `staleness_bound + D_purge` under the lever's `0`).
+    /// The drain window's TIMER — [`drain_lag_ms`]: the terms of
+    /// `staleness_bound + D_purge` that are still waited out by the clock
+    /// (0 with items 2 and 3 both on; `S + D_purge` with both off).
     pub drain_lag_ms: u64,
     /// The acknowledgement-refresh floor (`ack_refresh_floor` — the pass
     /// cadence's own floor): the PIPELINE DEPTH derivation's input
     /// (sustain campaign §5.1 — depth is derived, never a knob).
     pub refresh_floor_ms: u64,
+    /// Item 3 — the OBSERVED drain: the reader's purge generation after
+    /// this pass's steps ([`crate::ro_coherence::reader_step_generation`]).
+    /// A candidate this pass qualifies records it and promotes only once
+    /// every serve stamped below it has completed
+    /// ([`crate::ro_coherence::serve_drained_below`]). `0` = observation
+    /// not in force (the lever off, or the ledger unarmed) — the timer
+    /// alone decides.
+    pub drain_gen: u64,
+    /// `D_purge`, ms — with the observed drain in force it is only the
+    /// fail-stop budget the tripwire measures the drain against
+    /// (`free_grace_drain_overdue`); it never shortens the wait.
+    pub drain_budget_ms: u64,
 }
 
 /// One in-flight acknowledgement candidate (sustain campaign §5.1): its
@@ -2044,6 +2057,11 @@ struct AckCandidate {
     qualified_pass_now_ms: u64,
     /// `qualified_pass_now + drain_lag` (`0` = unset).
     ready_at_ms: u64,
+    /// Item 3: the purge generation the qualifying pass left; the
+    /// candidate's drain is observed below it (`0` = timer only).
+    drain_gen: u64,
+    /// The overdue tripwire fired for this candidate (once).
+    overdue_noted: bool,
 }
 
 /// The reader's acknowledgement ladder: it decides WHEN an echoed label
@@ -2113,12 +2131,31 @@ struct AckCandidate {
 ///    and adds no lock and no copy to the hot path. The attr/dentry caches
 ///    keep their TTL: they map names to inos (never reused) and inos to
 ///    sizes, never a block to an offset, and every binding they lead to
-///    is resolved through the gated layout cache. So `S` left the drain:
-///    [`drain_lag_ms`] is `D_purge` (and `S + D_purge` verbatim under
-///    `SQUEEZEFS_FREE_GRACE_DRAIN_EPOCH_STAMP=0`).
+///    is resolved through the gated layout cache. So `S` left the drain
+///    (`S + D_purge` verbatim under `SQUEEZEFS_FREE_GRACE_DRAIN_EPOCH_STAMP=0`).
 ///
-///    (b) is §6.7's `D_purge` term ("observe, then finish"), which S6's
-///    clock arithmetic already reserves.
+///    (b) was §6.7's `D_purge` term — "observe, then finish", the
+///    lease-clock fail-stop reserve S6 sizes as two revalidation cadences
+///    — reused as a serve drain, and is now **observed** (ladder
+///    re-derivation item 3): every read serve — the FUSE handler, the
+///    R-2 fast probe, the il sync probe, the direct-drive DMA until its
+///    CQE, the R2 prefetch and read-lane fill tasks, `copy_file_range`'s
+///    source read — stamps the purge generation it started under and
+///    counts itself in that generation's slot
+///    ([`crate::ro_coherence::ServeStamp`]); a candidate qualified after
+///    the step that left generation `G` promotes once every slot below
+///    `G` reads zero ([`crate::ro_coherence::serve_drained_below`]),
+///    re-checked on the next pass or on the completion wake of the last
+///    such serve. That is strictly safer than any timer — a timer bounds
+///    nothing a fabric timeout can stretch, the count is the serves
+///    themselves — and it completes in the serve residence (milliseconds)
+///    instead of two poll intervals. `D_purge` survives as the tripwire
+///    only: an observed drain outliving it counts `free_grace_drain_overdue`
+///    (and `invariant_tripwires`) and KEEPS waiting. The ordering proof
+///    (same-word pairs; the Dekker pair between the stamp and the step;
+///    slot aliasing poisoned, never unsafe) is `ro_coherence`'s serve
+///    ledger block. [`drain_lag_ms`] is what the clock still waits out: 0
+///    with both items on, `D_purge` under `SQUEEZEFS_FREE_GRACE_DRAIN_OBSERVED=0`.
 ///
 /// A newer label never displaces a pending one until it has been
 /// acknowledged, so the ladder cannot starve when the renewal cadence is
@@ -2208,6 +2245,8 @@ impl ReaderAckLadder {
                     learned_at_ms: i.learned_at_ms,
                     qualified_pass_now_ms: 0,
                     ready_at_ms: 0,
+                    drain_gen: 0,
+                    overdue_noted: false,
                 });
             }
         }
@@ -2221,19 +2260,62 @@ impl ReaderAckLadder {
             {
                 c.qualified_pass_now_ms = i.now_ms;
                 c.ready_at_ms = i.now_ms.saturating_add(i.drain_lag_ms);
+                c.drain_gen = i.drain_gen;
             }
         }
         // (3): promote the deepest qualified-and-drained prefix (learn
         // order = label order, and an advancing pass qualifies front-first,
         // so the prefix is the whole promotable set). ONE ack is emitted —
         // the max — because acking it subsumes everything beneath.
+        //
+        // Item 3 — the OBSERVED half: the wait word is published BEFORE
+        // the slots are read (the completion side's Dekker half), then a
+        // candidate is drained iff every serve stamped below its
+        // generation has completed. The `D_purge` budget is a tripwire on
+        // an observed drain: overdue is counted once per candidate and
+        // reported, and the candidate keeps waiting — the timer never
+        // shortens an observed wait.
+        let wait_gen = q
+            .iter()
+            .filter(|c| c.qualified_pass_now_ms != 0)
+            .map(|c| c.drain_gen)
+            .max()
+            .unwrap_or(0);
+        crate::ro_coherence::set_drain_wait_gen(wait_gen);
         let mut promoted: Option<AckCandidate> = None;
-        while let Some(front) = q.front() {
-            if front.qualified_pass_now_ms != 0 && i.now_ms >= front.ready_at_ms {
-                promoted = q.pop_front();
-            } else {
+        while let Some(front) = q.front_mut() {
+            if front.qualified_pass_now_ms == 0 || i.now_ms < front.ready_at_ms {
                 break;
             }
+            if front.drain_gen != 0 && !crate::ro_coherence::serve_drained_below(front.drain_gen) {
+                if !front.overdue_noted
+                    && i.now_ms.saturating_sub(front.qualified_pass_now_ms) >= i.drain_budget_ms
+                {
+                    front.overdue_noted = true;
+                    DRAIN_OVERDUE.fetch_add(1, Ordering::Relaxed);
+                    crate::note_invariant_tripwire(
+                        "free_grace_drain_overdue",
+                        &format!(
+                            "a read serve that started before purge generation {} is still in \
+                             flight {} ms after the qualifying pass — past the D_purge fail-stop \
+                             budget of {} ms; the acknowledgement of label {} keeps waiting on it \
+                             (a serve this long is a wedged I/O, never load)",
+                            front.drain_gen,
+                            i.now_ms.saturating_sub(front.qualified_pass_now_ms),
+                            i.drain_budget_ms,
+                            front.label
+                        ),
+                    );
+                }
+                break;
+            }
+            if front.drain_gen != 0 {
+                DRAIN_OBSERVED.fetch_add(1, Ordering::Relaxed);
+            }
+            promoted = q.pop_front();
+        }
+        if promoted.is_some() && q.iter().all(|c| c.qualified_pass_now_ms == 0) {
+            crate::ro_coherence::set_drain_wait_gen(0);
         }
         self.depth.store(q.len() as u64, Ordering::Relaxed);
         drop(q);
@@ -2468,8 +2550,13 @@ pub fn reader_pass_completed(pass_start_ms: u64, advanced: bool) -> Option<u64> 
         session.skew_max_ms(),
     );
     QUALIFY_LAG_MS.store(qualify, Ordering::Relaxed);
+    // Item 3: the drain is observed only where serves are being counted —
+    // the lever on AND the cadence task armed the ledger.
+    let observed =
+        crate::ro_coherence::drain_observed_enabled() && crate::ro_coherence::serve_ledger_armed();
     let drain = drain_lag_ms(
         crate::ro_coherence::drain_epoch_stamp_enabled(),
+        observed,
         staleness,
         session.d_purge_ms(),
     );
@@ -2482,6 +2569,14 @@ pub fn reader_pass_completed(pass_start_ms: u64, advanced: bool) -> Option<u64> 
         advanced,
         qualify_lag_ms: qualify,
         drain_lag_ms: drain,
+        // The generation AFTER this pass's steps: every serve stamped
+        // below it started before the last of them.
+        drain_gen: if observed {
+            crate::ro_coherence::reader_step_generation()
+        } else {
+            0
+        },
+        drain_budget_ms: session.d_purge_ms(),
         // The pass cadence's own floor (`ack_refresh_floor`'s arithmetic,
         // reader-side): the pipeline-depth derivation's input.
         refresh_floor_ms: (crate::ro_coherence::reader_revalidate_interval().as_millis() as u64)
@@ -2546,20 +2641,29 @@ pub fn qualify_lag_in_force_ms() -> u64 {
     QUALIFY_LAG_MS.load(Ordering::Relaxed)
 }
 
-/// **Gate 3's timer — the drain lag** (ladder re-derivation item 2). With
-/// the `SQUEEZEFS_FREE_GRACE_DRAIN_EPOCH_STAMP` lever on, `D_purge` alone:
-/// the daemon's layout cache can no longer serve a pre-step binding after
-/// the epoch step ([`crate::ro_coherence::layout_entry_pre_step`] — every
-/// entry is stamped with the purge generation it was resolved under, and
-/// an older stamp is a miss), so the caches' TTL (`S`, the reader's
-/// staleness bound) no longer has to be waited out. Off: `S + D_purge`
-/// verbatim.
-pub fn drain_lag_ms(epoch_stamp_lever_on: bool, staleness_bound_ms: u64, d_purge_ms: u64) -> u64 {
-    if epoch_stamp_lever_on {
-        d_purge_ms
+/// **Gate 3's TIMER — the drain lag** (ladder re-derivation items 2 and
+/// 3): the terms of the retired `staleness_bound + D_purge` still waited
+/// out by the clock. With `SQUEEZEFS_FREE_GRACE_DRAIN_EPOCH_STAMP` on the
+/// `S` term is gone (the daemon's layout cache can no longer serve a
+/// pre-step binding after the epoch step —
+/// [`crate::ro_coherence::layout_entry_pre_step`]); with
+/// `SQUEEZEFS_FREE_GRACE_DRAIN_OBSERVED` on (and the ledger armed) the
+/// `D_purge` term is gone too — the drain is OBSERVED
+/// ([`crate::ro_coherence::serve_drained_below`]) and `D_purge` is only
+/// the tripwire's budget. Both off: `S + D_purge` verbatim.
+pub fn drain_lag_ms(
+    epoch_stamp_lever_on: bool,
+    observed_drain_on: bool,
+    staleness_bound_ms: u64,
+    d_purge_ms: u64,
+) -> u64 {
+    let s = if epoch_stamp_lever_on {
+        0
     } else {
-        staleness_bound_ms.saturating_add(d_purge_ms)
-    }
+        staleness_bound_ms
+    };
+    let d = if observed_drain_on { 0 } else { d_purge_ms };
+    s.saturating_add(d)
 }
 
 /// The drain lag in force on this reader, ms (`free_grace_drain_lag_ms`).
@@ -2568,6 +2672,26 @@ static DRAIN_LAG_MS: AtomicU64 = AtomicU64::new(0);
 /// `free_grace_drain_lag_ms`.
 pub fn drain_lag_in_force_ms() -> u64 {
     DRAIN_LAG_MS.load(Ordering::Relaxed)
+}
+
+/// Item 3's engagement: promotions whose drain was decided by OBSERVATION
+/// — the pre-step in-flight count reaching zero (`free_grace_drain_observed`;
+/// ≈ `free_grace_reader_acks` on an armed reader, 0 under the lever's `0`).
+static DRAIN_OBSERVED: AtomicU64 = AtomicU64::new(0);
+
+/// Item 3's tripwire: candidates whose observed drain outlived the
+/// `D_purge` fail-stop budget (`free_grace_drain_overdue`, must-stay-0 —
+/// a serve that long is a wedged I/O; the wait is NOT shortened).
+static DRAIN_OVERDUE: AtomicU64 = AtomicU64::new(0);
+
+/// `free_grace_drain_observed`.
+pub fn drain_observed() -> u64 {
+    DRAIN_OBSERVED.load(Ordering::Relaxed)
+}
+
+/// `free_grace_drain_overdue`.
+pub fn drain_overdue() -> u64 {
+    DRAIN_OVERDUE.load(Ordering::Relaxed)
 }
 
 /// The `SQUEEZEFS_FREE_GRACE_QUALIFY_CEILING` lever's latch (the
@@ -2944,6 +3068,17 @@ pub fn stats_snapshot() -> serde_json::Value {
                 // pre-step entries the gate refused (each one re-resolve).
                 "reader_layout_step_gen": crate::ro_coherence::reader_layout_step_gen(),
                 "reader_layout_step_misses": crate::ro_coherence::reader_layout_step_misses(),
+                // Item 3's observed-drain faces: promotions decided by
+                // observation, the D_purge tripwire (must stay 0), the
+                // completion wakes, the serves in flight right now, the
+                // Dekker recheck's engagement and the slot-overrun tripwire
+                // (must stay 0).
+                "free_grace_drain_observed": drain_observed(),
+                "free_grace_drain_overdue": drain_overdue(),
+                "free_grace_drain_wakes": crate::ro_coherence::drain_wakes(),
+                "reader_serves_inflight": crate::ro_coherence::serves_inflight(),
+                "reader_serve_step_races": crate::ro_coherence::serve_step_races(),
+                "reader_serve_slot_overruns": crate::ro_coherence::serve_slot_overruns(),
             });
         }
         return serde_json::json!({ "free_grace_mode": "off" });
@@ -3110,6 +3245,8 @@ pub fn reset_for_test() {
         &LANE_PUSH_WAKES,
         &QUALIFY_LAG_MS,
         &DRAIN_LAG_MS,
+        &DRAIN_OBSERVED,
+        &DRAIN_OVERDUE,
     ] {
         c.store(0, Ordering::Relaxed);
     }

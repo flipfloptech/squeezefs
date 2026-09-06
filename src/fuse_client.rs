@@ -8295,9 +8295,15 @@ pub enum IpcDirectIneligible {
 
 /// The direct-drive prelude's 795 custody snapshot: everything the CQE
 /// revalidation needs to prove no custody transfer crossed the DMA
-/// window. Captured before submit, checked at completion.
-#[derive(Debug, Clone)]
+/// window. Captured before submit, checked at completion. Not `Clone`:
+/// it carries the serve's in-flight stamp (item 3), whose pair must land
+/// on one word exactly once.
+#[derive(Debug)]
 pub struct IpcDirectSnapshot {
+    /// Item 3: the serve's stamp in the reader's purge generation — taken
+    /// before the binding resolves, dropped with the `Pending` at its CQE
+    /// (the DMA is the in-flight serve the ladder's drain observes).
+    pub serve: crate::ro_coherence::ServeStamp,
     pub ino: u64,
     pub block: u32,
     /// The RAM-authoritative durable binding (whole-block, undecorated).
@@ -13265,6 +13271,9 @@ impl SqueezefsFilesystem {
             return Err(I::Shape); // multi-block
         }
         let b32 = b as u32;
+        // Item 3: stamped BEFORE the binding resolves below; the stamp
+        // rides the snapshot to the CQE.
+        let serve = crate::ro_coherence::ServeStamp::begin();
         // RAM-authoritative metadata only. The RAM entry is the binding
         // authority on a live mount (the write path updates it
         // synchronously; D0 excludes remote writers) — exactly the
@@ -13367,6 +13376,7 @@ impl SqueezefsFilesystem {
         };
         let be_id = compact_str::CompactString::from(be_id);
         Ok(IpcDirectSnapshot {
+            serve,
             ino,
             block: b32,
             key,
@@ -22450,6 +22460,10 @@ impl Filesystem for SqueezefsFilesystem {
         if is_virtual_ino(ino) || size == 0 {
             return FastReadProbe::Demote;
         }
+        // Item 3: a warm serve resolves its binding and captures its
+        // bytes synchronously — the stamp brackets exactly that (a Demote
+        // hands the serve to the handler, which stamps itself).
+        let _serve = crate::ro_coherence::ServeStamp::begin();
         let odirect = flags & (libc::O_DIRECT as u32) != 0;
         if odirect && self.router.direct_device_true() {
             return FastReadProbe::Demote;
@@ -23706,6 +23720,11 @@ impl Filesystem for SqueezefsFilesystem {
         size: u32,
         flags: u32,
     ) -> FuseResult<ReplyData> {
+        // Ladder re-derivation item 3: this serve counts itself in the
+        // reader's purge generation from here until the reply is built —
+        // the acknowledgement ladder's OBSERVED drain (one relaxed load on
+        // every mount that revalidates nothing).
+        let _serve = crate::ro_coherence::ServeStamp::begin();
         // Rung 17 (KD-MW-8): overlay this mount's RETAINED shared-block
         // extents onto the served bytes — read-your-writes for sub-block
         // writes of a DEMOTED block whose covering publish has not landed
@@ -25432,6 +25451,9 @@ impl Filesystem for SqueezefsFilesystem {
         _flags: u64,
     ) -> FuseResult<ReplyCopyFileRange> {
         self.ro_gate("copy_file_range")?;
+        // Item 3: the source read is a serve — a co-writer's cfr resolves
+        // the source binding and reads its bytes under this stamp.
+        let _serve = crate::ro_coherence::ServeStamp::begin();
         METRICS.fuse_ops.fetch_add(1, Ordering::Relaxed);
         METRICS.meta_updates.fetch_add(1, Ordering::Relaxed);
         // VL8 item 2: register BEFORE the guards — the live wedge's stuck

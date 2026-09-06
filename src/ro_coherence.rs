@@ -142,9 +142,353 @@ pub fn reader_layout_step_misses() -> u64 {
 }
 
 /// The epoch step's bump — the purge sink's last act, after that volume's
-/// root adoption, drop pass and block-key purge.
+/// root adoption, drop pass and block-key purge. `SeqCst`: it is the
+/// ladder's half of the Dekker pair with every serve stamp
+/// ([`ServeStamp::begin`]). With the serve ledger armed the new
+/// generation's slot is re-stamped, and a slot still holding occupants
+/// (a serve alive across [`SERVE_GEN_SLOTS`] steps) is POISONED: counted
+/// as pre-step for every candidate until it reads zero — over-conservative
+/// (a saturated reader may then wait for the whole slot), never unsafe.
 fn note_reader_epoch_step() {
-    READER_STEP_GEN.fetch_add(1, Ordering::SeqCst);
+    let new = READER_STEP_GEN.fetch_add(1, Ordering::SeqCst) + 1;
+    if !LEDGER_ARMED.load(Ordering::Relaxed) {
+        return;
+    }
+    let slot = (new % SERVE_GEN_SLOTS as u64) as usize;
+    if slot_total(slot) != 0 {
+        POISONED_SLOTS.fetch_or(1u64 << slot, Ordering::SeqCst);
+        SERVE_SLOT_OVERRUNS.fetch_add(1, Ordering::Relaxed);
+        crate::note_invariant_tripwire(
+            "reader_serve_slot_overrun",
+            &format!(
+                "a read serve stamped with purge generation {} is still in flight {} epoch \
+                 steps later — its slot is poisoned (counted pre-step until it drains) and the \
+                 acknowledgement ladder waits; a serve this old is a wedged I/O, not load",
+                new.saturating_sub(SERVE_GEN_SLOTS as u64),
+                SERVE_GEN_SLOTS
+            ),
+        );
+    }
+    SLOT_GEN[slot].store(new, Ordering::SeqCst);
+}
+
+// ---------------------------------------------------------------------------
+// The reader's in-flight SERVE ledger — the OBSERVED drain (ladder
+// re-derivation item 3, 2026-09-06)
+// ---------------------------------------------------------------------------
+//
+// Gate 3's second half — "every serve that resolved a binding before the
+// step has finished" — was a TIMER: §6.7's `D_purge = 2 × P` (2,000 ms on
+// the fleet), a lease-clock fail-stop reserve reused as a serve drain. No
+// timer bounds a serve (one stuck behind a fabric timeout takes seconds),
+// and the serves themselves finish in milliseconds, so the drain is made
+// EXACT instead: every read serve stamps the purge generation it started
+// under and counts itself in that generation's slot; the ladder's drained
+// condition for a candidate qualified after step `G` is "every slot whose
+// generation is below `G` reads zero". `D_purge` survives only as a loud
+// tripwire (`free_grace_drain_overdue`) that never shortens the wait.
+//
+// Why "reads zero" is a proof and not a race, in three parts:
+//
+// 1. **Pairs land on ONE word.** A stamp increments the word
+//    `shards[its thread's shard][gen % SLOTS]` and its completion
+//    decrements the SAME word (the stamp carries its shard), so every word
+//    is a non-negative count in its own modification order — a decrement
+//    can never be observed ahead of its increment — and a sum of zero over
+//    the pre-step slots means every observed start has completed.
+// 2. **A start the ladder did not observe is post-step (Dekker).** The
+//    step's generation bump is a `SeqCst` RMW on the revalidation task,
+//    sequenced before the ladder's `SeqCst` slot loads on that task; a
+//    stamp is a `SeqCst` increment followed by a `SeqCst` re-read of the
+//    generation. In the single total order of `SeqCst` operations, if the
+//    ladder's load precedes the increment then the bump precedes the
+//    re-read, so the re-read sees the bumped generation — and a load that
+//    reads the bump synchronizes with it, which is sequenced after the
+//    volume's root adoption: everything that serve resolves afterwards
+//    sees the adopted roots and the current generation
+//    ([`layout_entry_pre_step`]'s relaxed load is coherent after it).
+//    Either the ladder counts the serve or the serve is post-step.
+// 3. **Slot aliasing is detected and conservative.** A slot is reused
+//    every [`SERVE_GEN_SLOTS`] steps (≥ 64 s at one step per second per
+//    volume); a serve still alive then is a wedged I/O, its slot is
+//    poisoned at the re-stamp and counted pre-step for every candidate
+//    until the slot reads zero, and the tripwire names it.
+//
+// Per-op cost: one relaxed armed-word load, one relaxed generation load,
+// one thread-local shard index, one `SeqCst` increment, one `SeqCst`
+// generation re-read at the start; one `SeqCst` decrement and one relaxed
+// wait-word load at the end (a `lock xadd` is the same instruction at any
+// ordering on x86; the ARM fence is the price of the proof). No lock, no
+// copy, no clock read. Unarmed (every plain writer): one relaxed load.
+
+/// Generation slots: a serve stamped `g` is counted in slot `g % SLOTS`.
+/// `u64::BITS`, the poison mask's width — a representation bound, not a
+/// tuning: the slot count only has to exceed the number of epoch steps
+/// a serve can span before the fail-stop tripwire has long fired.
+const SERVE_GEN_SLOTS: usize = u64::BITS as usize;
+
+/// One thread's shard: its own 64 slot words on its own cache lines (the
+/// fuse3 `ShardedCounter` law — shards never share a line).
+#[repr(align(64))]
+struct ServeShard([std::sync::atomic::AtomicI64; SERVE_GEN_SLOTS]);
+
+/// `true` ⇔ a revalidating mount armed the ledger (the cadence task's
+/// spawn, with the observed-drain lever on). THE hot-path word.
+static LEDGER_ARMED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static SERVE_SHARDS: std::sync::OnceLock<Vec<ServeShard>> = std::sync::OnceLock::new();
+/// The generation each slot currently counts (re-stamped at the step).
+static SLOT_GEN: [AtomicU64; SERVE_GEN_SLOTS] = [const { AtomicU64::new(0) }; SERVE_GEN_SLOTS];
+/// Bitmask of slots that still held occupants when re-stamped.
+static POISONED_SLOTS: AtomicU64 = AtomicU64::new(0);
+/// The highest generation the ladder is waiting to drain below (0 = none):
+/// a completion below it re-sums its slot and wakes the revalidation task
+/// when the slot reached zero.
+static DRAIN_WAIT_GEN: AtomicU64 = AtomicU64::new(0);
+/// The revalidation task's drain wake (parked beside its cadence).
+static DRAIN_WAKE: squeezefs_ipc::sqz_notify::Notify = squeezefs_ipc::sqz_notify::Notify::new();
+/// Stamps whose generation re-read saw a step land between the stamp's
+/// generation load and its increment (`reader_serve_step_races` — the
+/// Dekker recheck engaging; such a serve is counted one slot early,
+/// conservative).
+static SERVE_STEP_RACES: AtomicU64 = AtomicU64::new(0);
+/// Slots poisoned at re-stamp (`reader_serve_slot_overruns`, must-stay-0).
+static SERVE_SLOT_OVERRUNS: AtomicU64 = AtomicU64::new(0);
+/// Completions that woke the revalidation task (`free_grace_drain_wakes`).
+static DRAIN_WAKES: AtomicU64 = AtomicU64::new(0);
+
+/// Shard count: the daemon's divided sizing root
+/// (`cpu::process_parallelism` — the KD-MW-14 fleet share applied) rounded
+/// up to a power of two, railed to [1, 64] (the fuse3 `read_phase::
+/// shard_count` derivation over the daemon's root).
+fn serve_shard_count() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        crate::cpu::process_parallelism()
+            .next_power_of_two()
+            .clamp(1, 64)
+    })
+}
+
+/// This thread's shard — assigned once per thread, round-robin (no
+/// `sched_getcpu` per op; a migrating thread keeps its line).
+fn serve_shard_index() -> usize {
+    static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    thread_local! {
+        static MINE: std::cell::Cell<usize> = const { std::cell::Cell::new(usize::MAX) };
+    }
+    MINE.with(|c| {
+        let mut v = c.get();
+        if v == usize::MAX {
+            v = NEXT.fetch_add(1, Ordering::Relaxed) % serve_shard_count();
+            c.set(v);
+        }
+        v
+    })
+}
+
+fn serve_shards() -> &'static [ServeShard] {
+    SERVE_SHARDS.get_or_init(|| {
+        (0..serve_shard_count())
+            .map(|_| {
+                ServeShard(std::array::from_fn(|_| {
+                    std::sync::atomic::AtomicI64::new(0)
+                }))
+            })
+            .collect()
+    })
+}
+
+/// One slot's total across shards (`SeqCst` loads — part of the proof's
+/// total order).
+fn slot_total(slot: usize) -> i64 {
+    serve_shards()
+        .iter()
+        .map(|s| s.0[slot].load(Ordering::SeqCst))
+        .sum()
+}
+
+/// A read serve's in-flight stamp: `begin` at the serve's START (before it
+/// resolves any binding), dropped when the serve — the bytes it delivers,
+/// or the fill it deposits — is complete. Inert (a no-op pair) when the
+/// ledger is not armed. Not `Clone` on purpose: a second increment for one
+/// serve would let the ladder observe the pair out of order across shards.
+#[derive(Debug)]
+pub struct ServeStamp {
+    /// The stamped generation + 1; `0` = inert.
+    gen_plus_one: u64,
+    /// The shard the increment landed on — the decrement's target.
+    shard: u32,
+}
+
+impl ServeStamp {
+    /// Stamp one serve (see the module block above for the ordering law).
+    #[inline]
+    pub fn begin() -> Self {
+        if !LEDGER_ARMED.load(Ordering::Relaxed) {
+            return Self::inert();
+        }
+        let gen = READER_STEP_GEN.load(Ordering::Relaxed);
+        let shard = serve_shard_index();
+        serve_shards()[shard].0[(gen % SERVE_GEN_SLOTS as u64) as usize]
+            .fetch_add(1, Ordering::SeqCst);
+        // The Dekker re-read: a step that landed between the load and the
+        // increment is observed here — the serve stays counted one slot
+        // early (pre-step for the candidate, conservative) and the ladder
+        // either saw the increment or this read saw the bump.
+        if READER_STEP_GEN.load(Ordering::SeqCst) != gen {
+            SERVE_STEP_RACES.fetch_add(1, Ordering::Relaxed);
+        }
+        Self {
+            gen_plus_one: gen + 1,
+            shard: shard as u32,
+        }
+    }
+
+    /// A stamp that counts nothing (the unarmed mount's, and the value a
+    /// caller holds before it decides to serve).
+    pub const fn inert() -> Self {
+        Self {
+            gen_plus_one: 0,
+            shard: 0,
+        }
+    }
+}
+
+impl Drop for ServeStamp {
+    #[inline]
+    fn drop(&mut self) {
+        if self.gen_plus_one == 0 {
+            return;
+        }
+        let gen = self.gen_plus_one - 1;
+        let slot = (gen % SERVE_GEN_SLOTS as u64) as usize;
+        serve_shards()[self.shard as usize].0[slot].fetch_sub(1, Ordering::SeqCst);
+        // Wake the ladder when this completion may have drained a slot it
+        // waits on: the wait word is stored `SeqCst` BEFORE the ladder's
+        // slot loads, so a completion the ladder's read missed sees the
+        // wait and re-sums (the last completion in the total order reads
+        // zero) — no lost wake by construction; the ticked park is the
+        // backstop regardless.
+        if gen < DRAIN_WAIT_GEN.load(Ordering::SeqCst) && slot_total(slot) == 0 {
+            DRAIN_WAKES.fetch_add(1, Ordering::Relaxed);
+            DRAIN_WAKE.notify_one();
+        }
+    }
+}
+
+/// Arm the ledger — the revalidation cadence task's spawn on a mount whose
+/// observed-drain lever is on. Never disarmed for the mount's life.
+pub fn arm_serve_ledger() {
+    LEDGER_ARMED.store(true, Ordering::SeqCst);
+}
+
+/// `true` ⇔ serves are being counted (the ladder's observed arm is live).
+pub fn serve_ledger_armed() -> bool {
+    LEDGER_ARMED.load(Ordering::Relaxed)
+}
+
+/// **The ladder's drained condition** for a candidate qualified after the
+/// pass whose steps left the generation at `gen`: every slot whose
+/// generation is below `gen` — or that is poisoned — reads zero. Clears the
+/// poison of a slot that reads zero (every occupant it ever held is done).
+/// `true` on an unarmed ledger (nothing was ever counted).
+pub fn serve_drained_below(gen: u64) -> bool {
+    if !LEDGER_ARMED.load(Ordering::Relaxed) {
+        return true;
+    }
+    let poisoned = POISONED_SLOTS.load(Ordering::SeqCst);
+    let mut inflight = 0i64;
+    let mut cleared = 0u64;
+    for slot in 0..SERVE_GEN_SLOTS {
+        let bit = 1u64 << slot;
+        if SLOT_GEN[slot].load(Ordering::SeqCst) >= gen && poisoned & bit == 0 {
+            continue;
+        }
+        let total = slot_total(slot);
+        if total == 0 {
+            cleared |= poisoned & bit;
+        } else {
+            inflight += total;
+        }
+    }
+    if cleared != 0 {
+        POISONED_SLOTS.fetch_and(!cleared, Ordering::SeqCst);
+    }
+    inflight == 0
+}
+
+/// The ladder publishes the highest generation it is waiting to drain
+/// below (0 = nothing waiting) BEFORE it reads the slots.
+pub fn set_drain_wait_gen(gen: u64) {
+    DRAIN_WAIT_GEN.store(gen, Ordering::SeqCst);
+}
+
+/// The drain wake the revalidation task parks on beside its cadence.
+pub fn drain_wake() -> &'static squeezefs_ipc::sqz_notify::Notify {
+    &DRAIN_WAKE
+}
+
+/// `reader_serves_inflight`: read serves counted right now, all slots.
+pub fn serves_inflight() -> i64 {
+    if !LEDGER_ARMED.load(Ordering::Relaxed) {
+        return 0;
+    }
+    (0..SERVE_GEN_SLOTS).map(slot_total).sum()
+}
+
+/// `reader_serve_step_races`.
+pub fn serve_step_races() -> u64 {
+    SERVE_STEP_RACES.load(Ordering::Relaxed)
+}
+
+/// `reader_serve_slot_overruns` (must-stay-0).
+pub fn serve_slot_overruns() -> u64 {
+    SERVE_SLOT_OVERRUNS.load(Ordering::Relaxed)
+}
+
+/// `free_grace_drain_wakes`.
+pub fn drain_wakes() -> u64 {
+    DRAIN_WAKES.load(Ordering::Relaxed)
+}
+
+/// The `SQUEEZEFS_FREE_GRACE_DRAIN_OBSERVED` lever's latch: item 3 — the
+/// drain is the observed in-flight condition and `D_purge` a tripwire.
+/// `0` = the `D_purge` timer (the pre-change shape verbatim; the ledger
+/// is not armed, so the hot path pays one relaxed load).
+static DRAIN_OBSERVED: AtomicU8 = AtomicU8::new(0);
+
+pub fn drain_observed_enabled() -> bool {
+    match DRAIN_OBSERVED.load(Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            let on = crate::env_knobs::bool_knob("SQUEEZEFS_FREE_GRACE_DRAIN_OBSERVED", true);
+            DRAIN_OBSERVED.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+            on
+        }
+    }
+}
+
+/// Test seam (the `free_grace::test_set_ack_pipeline` shape).
+pub fn test_set_drain_observed(on: Option<bool>) {
+    DRAIN_OBSERVED.store(
+        match on {
+            Some(true) => 1,
+            Some(false) => 2,
+            None => 0,
+        },
+        Ordering::Relaxed,
+    );
+}
+
+/// Test seam: `true` ⇔ a preset was in force.
+pub fn test_clear_drain_observed() -> bool {
+    DRAIN_OBSERVED.swap(0, Ordering::Relaxed) != 0
+}
+
+/// Test seam: arm the ledger without a revalidation task.
+pub fn test_arm_serve_ledger() {
+    arm_serve_ledger();
 }
 
 /// Test seam: an epoch step without a volume (the loop model and the
@@ -190,12 +534,31 @@ pub fn test_clear_drain_epoch_stamp() -> bool {
     DRAIN_EPOCH_STAMP.swap(0, Ordering::Relaxed) != 0
 }
 
-/// Test seam: return the generation and the gate's gauges to a fresh
-/// mount's (`free_grace::reset_for_test` calls it).
+/// Test seam: return the generation, the gate's gauges and the serve
+/// ledger to a fresh mount's (`free_grace::reset_for_test` calls it). A
+/// stamp still held across a reset would decrement a zeroed word — the
+/// contracts drop every stamp first.
 pub fn reset_for_test() {
     READER_STEP_GEN.store(0, Ordering::SeqCst);
     LAYOUT_STEP_MISSES.store(0, Ordering::Relaxed);
     test_set_drain_epoch_stamp(None);
+    test_set_drain_observed(None);
+    LEDGER_ARMED.store(false, Ordering::SeqCst);
+    if let Some(shards) = SERVE_SHARDS.get() {
+        for s in shards {
+            for w in &s.0 {
+                w.store(0, Ordering::SeqCst);
+            }
+        }
+    }
+    for g in SLOT_GEN.iter() {
+        g.store(0, Ordering::SeqCst);
+    }
+    POISONED_SLOTS.store(0, Ordering::SeqCst);
+    DRAIN_WAIT_GEN.store(0, Ordering::SeqCst);
+    for c in [&SERVE_STEP_RACES, &SERVE_SLOT_OVERRUNS, &DRAIN_WAKES] {
+        c.store(0, Ordering::Relaxed);
+    }
 }
 
 /// The reader's poll cadence — the landed derivation
@@ -437,12 +800,26 @@ pub fn spawn_reader_revalidation(
 ) -> squeezefs_ipc::sqz_channel::oneshot::Receiver<()> {
     let poller = RevalidationPoller::derived();
     let interval = poller.interval();
+    // Item 3: from here every read serve on this mount counts itself in
+    // the purge generation it started under, so the acknowledgement
+    // ladder's drain is OBSERVED (the pre-step in-flight count reaching
+    // zero) rather than timed. The lever's `0` leaves the ledger unarmed
+    // — one relaxed load per serve — and the ladder on the `D_purge`
+    // timer.
+    if drain_observed_enabled() {
+        arm_serve_ledger();
+    }
     log::info!(
         "reader revalidation armed: {} volume(s), every {:?} (the derived cadence — one \
-         ledger read per volume per pass; staleness bound {:?})",
+         ledger read per volume per pass; staleness bound {:?}; serve ledger {})",
         volumes.len(),
         interval,
         poller.staleness_bound(),
+        if serve_ledger_armed() {
+            "armed (observed drain)"
+        } else {
+            "off (D_purge timer)"
+        },
     );
     crate::meta_exec::spawn_meta_join("reader_revalidation", async move {
         loop {
@@ -454,11 +831,20 @@ pub fn spawn_reader_revalidation(
             // the qualify/promote vehicle runs more often; the qualify and
             // drain WINDOWS stay at their routine derivations, so the S5
             // staleness contract (an upper bound) only ever tightens.
+            // Item 3: the drain wake is the third arm — the completion of
+            // the last pre-step serve the ladder waits on wakes this task
+            // so the promotion follows the drain by a round trip, not by
+            // the rest of the pass cadence (the poller skips every volume
+            // not yet due, so an early pass costs no ledger read).
             let member_now = crate::membership::installed_member()
                 .map(|s| s.now_ms())
                 .unwrap_or(0);
             let sleep_for = crate::free_grace::reader_pass_interval(interval, member_now);
-            let _ = squeezefs_ipc::sqz_time::timeout(sleep_for, wake.notified()).await;
+            let _ = squeezefs_ipc::sqz_time::timeout(
+                sleep_for,
+                squeezefs_ipc::sqz_future::race2(wake.notified(), drain_wake().notified()),
+            )
+            .await;
             if stop_flag.load(Ordering::Acquire) {
                 log::info!("reader revalidation stopping (dismount)");
                 return;

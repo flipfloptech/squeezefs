@@ -889,6 +889,11 @@ impl DataPlaneSink {
     /// contention or in-guard miss.
     fn serve_read(&self, op: DataOp, completion: SlotCompletion) {
         let ino = op.binding.ino;
+        // Ladder re-derivation item 3: the sync legs below resolve a
+        // binding and serve on this thread — this stamp brackets them
+        // (the direct-drive snapshot carries its own to the CQE; the
+        // handoff's handler stamps itself).
+        let _serve = crate::ro_coherence::ServeStamp::begin();
         // Device-true parity (2026-07-25 ipc-miss-path fix): on a
         // `direct_device_true` mount, kernel O_DIRECT reads bypass every
         // tier — an O_DIRECT binding's ring reads must do the same, so

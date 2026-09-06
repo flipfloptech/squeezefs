@@ -10591,6 +10591,12 @@ impl DataRouter {
             if seam_ms > 0 {
                 squeezefs_ipc::sqz_time::sleep(Duration::from_millis(seam_ms)).await;
             }
+            // Item 3: a fill deposits bytes keyed by the offset it resolves
+            // below — it is a serve the reader's drain must observe, from
+            // its start (before the pre-step gate on `meta`, whose relaxed
+            // generation load is coherent after this stamp's re-read) to
+            // its deposit.
+            let _serve = crate::ro_coherence::ServeStamp::begin();
             let lane = &lanes.lanes[lane_idx];
             let settle = |completed: bool| {
                 // Parked-task screen closure: from here on the block's
@@ -11166,6 +11172,8 @@ impl DataRouter {
         use std::sync::atomic::Ordering::Relaxed;
         let router = self.clone();
         crate::bg_admit::spawn_bg(async move {
+            // Item 3: the lane fetch is a serve (see the prefetch task).
+            let _serve = crate::ro_coherence::ServeStamp::begin();
             let lane = &lanes.lanes[lane_idx];
             // Returns `true` when the settled task's lane is still live
             // (the completion-refill gate — an error/stale settle never

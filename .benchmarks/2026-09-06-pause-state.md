@@ -30,6 +30,16 @@ mount (the A-arm rig reset the cluster; remount is part of every arm).
    `/tmp/five/gate/taskcheck.{log,exit}`) — or, if `/tmp` did not survive
    the reboot, `cd ~/Source/squeezefs-gate && git checkout --detach
    08483c51 && task check`. ~50 min on a quiet box.
+   **DONE — GREEN on `6cbbd848`** (16:14–17:05, pinned worktree, from
+   zero): 357 suites / **4,721 tests**, every stage (root + fuse3 clippy
+   both configs, fmt, test, doc, bench smoke, loom build, fuzz check,
+   docs, audit — the one allowed warning is the adjudicated
+   RUSTSEC-2025-0141 `bincode 1.3.3`, rc-manifest §5). The intermediate
+   run on `7af1a0d2` went red ONLY in the bench-harness smoke: three
+   `record.rs` unit tests raced on the process-global
+   `META_KV_DELTA_ORPHANS` (serial in the test stage, parallel in the
+   bench harness) — fixed `66a71e35` (a test-module mutex on exactly
+   those three; 1/40 → 0/200), product path untouched. Item CLOSED.
 2. **Kernel A/B, B arm** — after `squeeze-test` boots the 6.19.14 series
    WITH 0031 (or whichever box carries the patched kernel): on the box,
    `cd /scratch/tmp/sqz-agent/k26 && sudo env ARM=B KERNEL_TAG=<uname -r

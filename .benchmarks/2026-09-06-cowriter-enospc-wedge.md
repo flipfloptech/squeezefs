@@ -6,7 +6,7 @@
 | **Commits** | `f3e6710d` (red repro suite, 8 of 9 time out against `dev`) · `09bdfb06` (fix) · docs commit |
 | **Evidence** | `.benchmarks/rows-d4-s11-20260905/` — `m57.log` (the 30-minute wedge), `m50.log`/`m50.stats.json`, `m53.log`, `m0.log`/`m0.stats.json` (the authority); recorded in `.benchmarks/2026-09-05-d4-free-grace-sustain.md` §6 |
 | **Class** | load-dependent hang on the write path — a first-class product bug (AGENTS.md); finding 15 (the lane exhaustion itself) stays OPEN |
-| **Fleet repro** | **OWED (parent)** — see §6 |
+| **Fleet repro** | RUN — see §6 (the wedge is gone; finding 15's root cause moved to `.benchmarks/2026-09-06-cowriter-free-refcount-leak.md`: the refusals were duplicate own-mint blob reclaims, the leak a RAM-only lifetime under recomputed publishes) |
 
 ## 1. The finding
 

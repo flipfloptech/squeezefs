@@ -243,6 +243,12 @@ behavior unchanged (no production reset path exists).
 
 ## 6. Fleet acceptance — RUN 2026-09-05 (post-reboot): **NOT MET — finding 15 reproduces, plus a co-writer wedge**
 
+> Follow-ups landed 2026-09-06: the co-writer wedge (item 1) in
+> `.benchmarks/2026-09-06-cowriter-enospc-wedge.md`; finding 15's supply
+> leak and the refused-free storm (item 2's correctness half) in
+> `.benchmarks/2026-09-06-cowriter-free-refcount-leak.md` — the fleet
+> re-run adjudicates what of the decay remains for this campaign's terms.
+
 Two from-zero runs on the restored 32-CPU box (`19a651ea`, release; fleet
 `SQZ_MWFLEET_OSS_GB=32 SQZ_MWFLEET_RANGE_CUSTODY=1 … --cowriters=8`, then
 `tests/run_mw_matrix.sh s11-mpiio`), both identical in outcome; evidence

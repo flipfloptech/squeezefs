@@ -594,13 +594,34 @@ instead of shipping it (S8's "the daemon is not switched onto the router" gap
 meeting a real workload). The free path's own rows ride the publish ledger
 (`meta_ship_publish.*`): `free_shipped_blocks` is the rewrite-engagement
 instrument (its delta must account for a rewrite workload's displaced
-blocks), `free_served_blocks` the authority's executed half, `free_replays`
-the exactly-once witness engaging (a lost-reply retry landing here is the
-mechanism working), `free_stale_refusals` the era fence firing around a
-revocation, and `free_ship_failures` ≈ 0 (each is a leak-safe
-unreturned-until-recovery offset). Read them beside the custody ledger
-(`dlm_custody.*`), the rest of the publish ledger (whose `refusals` must
-stay 0) and `data_plane_fence_mode` = 1.
+blocks), `free_served_blocks` the authority's executed half,
+`free_refused_blocks` the authority's `Refused` verdicts (a genuine double
+release — the block was already free, graced, quarantined, mid-reclaim or
+names a dead lifetime; `served + refused + non-terminal ≡ the peers'
+shipped`, and the authority's log names the class per refusal; a STREAM of
+them beside a healthy rewrite is a duplicate free ISSUER on a peer, never a
+leak — the 2026-09-06 s11 row's 3,449 were one own-mint map blob reclaimed
+≈ 7× per save, `.benchmarks/2026-09-06-cowriter-free-refcount-leak.md`),
+`free_recomputed_blocks` the displaced blocks the authority freed itself on
+recomputed publishes (since that note the caller frame's RAM-only lifetimes
+included — a binding minted, displaced and never persisted in between,
+which the head→composed diff cannot name), `free_replays` the exactly-once
+witness engaging (a lost-reply retry landing here is the mechanism working),
+`free_stale_refusals` the era fence firing around a revocation, and
+`free_ship_failures` ≈ 0 (each is a leak-safe unreturned-until-recovery
+offset). The co-writer's own blob hygiene reads on
+`publish_blob_orphan_reclaims` (own-mint map blobs whose lineage the
+mount closed) beside `publish_blob_orphan_reclaim_dedups` (re-arms of an
+already-closed lineage the router DECLINED — a stale clone of a reclaimed
+entry re-inserted and discarded again; every one of these used to ship a
+free the authority refused), and its never-published mints on
+`cowriter.unpublished_recycles` (a live laned co-writer's superseded overlay
+destination / failed-publish upload returned to its OWN lane free list — no
+ledger anywhere ever named it) beside `cowriter.unpublished_abandons`, which
+now grows only around custody loss or on an offset outside this mount's
+lanes. Read them beside the custody ledger (`dlm_custody.*`), the rest of
+the publish ledger (whose `refusals` must stay 0) and
+`data_plane_fence_mode` = 1.
 
 **What an end-to-end two-host write needs, plainly.** The machinery is
 complete — lane-granted allocation, custody-authorized DMA, shipped

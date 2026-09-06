@@ -5,7 +5,7 @@
 | **Title** | The free-grace sustain campaign: a demand-coupled acknowledgement loop — pipelined reader acks, demand-coupled bound publication, demand-armed prods, and ahead-of-stall lane refill |
 | **Author** | (design agent; adjudication owner: user) |
 | **Date** | 2026-08-25 |
-| **Status** | **Implemented — fleet acceptance NOT MET (2026-09-05); the LADDER RE-DERIVATION landed 2026-09-06 (user decision — §"The remaining 6 s" below, KD-FG-11 amended, `.benchmarks/2026-09-06-free-grace-ladder-rederivation.md`): adjudication items 1–3 — qualify = the writer's checkpoint landing ceiling + skew, the drain's `S` an epoch-step invalidation of the layout cache, its `D_purge` an OBSERVED in-flight drain with the reserve kept as a tripwire — H3 `bound_age` 7,724 → 2,724 ms in the fleet-cadence model, closure exact, zero fences; item 4 is the sibling's; the from-zero row OWED (parent); the LANE-VISIBLE campaign landed 2026-09-06 (§"Lane-visible campaign" below, `.benchmarks/2026-09-06-free-grace-lane-visible.md`): the fleet-only `min_acked→released` term convicted as the release's wait for DEMAND plus an unmeasured co-writer lane hop behind it, both instrumented (`alloc_lane_visible_phase_ns`) and both made event-driven off the acknowledgement (`SQUEEZEFS_FREE_GRACE_LANE_PUSH`) — 3,408 → 0 ms / 30.7 → 1.5 s in the fleet-cadence model, the from-zero row OWED (parent); the HOLD-TIME campaign landed 2026-09-06 (§"Hold-time campaign" below, `.benchmarks/2026-09-06-free-grace-hold-time.md`): the coupled hold decomposed per stage on the stats inode, levers (b) + (d) −922 ms in-process, the capacity law published, the 6 s of derived windows named as adjudication items; the from-zero s11-mpiio row is OWED (parent). Prior status: (2026-09-05, `.benchmarks/2026-09-05-d4-free-grace-sustain.md` §6: finding 15 reproduces on the s11 venue at 23 s — lane ENOSPC storms — and five of eight co-writers wedge on the ENOSPC'd writes; the WEDGE is fixed 2026-09-06, `.benchmarks/2026-09-06-cowriter-enospc-wedge.md`: the finding-29 bounded-allocation park read the reallocation label as its wall and a harvest sink's presence as supply, so an exhausted co-writer lane parked forever under its block stripe — the row must now fail CLEANLY, fleet re-run owed).** PRs 1–4 landed 2026-08-25 (`f992c2e1` instruments · `11dafe2f` L1 · `29788e55` L4+L2+L2b+L3 · `69b2fe16` L5 + the OQ 2 horizon), followed by finding 18 (`6ce59456`, the prod decay) and finding 29 (`a50da1e4` + `37bf6036`, the bounded allocation park). The s11-mpiio row went GREEN once on the cloud venue (2026-08-30 16b, `8e4a2cab`, `.benchmarks/cloud/2026-08-30-094130`) — on a fleet whose lanes never coupled (`demand_waits` 0, `bound_age` 23–29 s, the routine composite). The §3 rate equation was closed in-process 2026-09-05 (D-4, `.benchmarks/2026-09-05-d4-free-grace-sustain.md`: the shipped levers unbind a recycle-bound stream at zero fences; Little's law holds on live gauges; finding D4-1 priced). **Owed**: the from-zero s11-mpiio row on the finding-15 venue with the sustain columns (PR 5's harness rung is NOT landed — the rig `.benchmarks/rigs/free-grace-sustain-rig.sh` reads the row's snapshots), run by the parent campaign |
+| **Status** | **Implemented — fleet acceptance NOT MET (2026-09-05); the LADDER RE-DERIVATION landed 2026-09-06 (user decision — §"The remaining 6 s" below, KD-FG-11 amended, `.benchmarks/2026-09-06-free-grace-ladder-rederivation.md`): adjudication items 1–3 — qualify = the writer's checkpoint landing ceiling + skew, the drain's `S` an epoch-step invalidation of the layout cache, its `D_purge` an OBSERVED in-flight drain with the reserve kept as a tripwire — H3 `bound_age` 7,724 → 2,724 ms in the fleet-cadence model, closure exact, zero fences; the from-zero row OWED (parent); the CHECKPOINT-COMPOSITE campaign landed 2026-09-06 (adjudication item 4, user decision 2026-09-06 — §"The writer→member checkpoint composite", `.benchmarks/2026-09-06-free-grace-checkpoint-composite.md`: while the valve asks, the writer checkpoints at `P/2`, the grant carries the ceiling, the member's prod/pass/depth floors follow — in-process `bound_age` 7,724 → 6,750 ms at exactly 2× checkpoints/s and 2× lease-lane renewals/s, the accepted cost; `CLUSTER_WIRE_SCHEMA` 1 → 2; composed with items 1–3 at integration — the grant advertises the LANDING ceiling; the fleet row OWED (parent)); the LANE-VISIBLE campaign landed 2026-09-06 (§"Lane-visible campaign" below, `.benchmarks/2026-09-06-free-grace-lane-visible.md`): the fleet-only `min_acked→released` term convicted as the release's wait for DEMAND plus an unmeasured co-writer lane hop behind it, both instrumented (`alloc_lane_visible_phase_ns`) and both made event-driven off the acknowledgement (`SQUEEZEFS_FREE_GRACE_LANE_PUSH`) — 3,408 → 0 ms / 30.7 → 1.5 s in the fleet-cadence model, the from-zero row OWED (parent); the HOLD-TIME campaign landed 2026-09-06 (§"Hold-time campaign" below, `.benchmarks/2026-09-06-free-grace-hold-time.md`): the coupled hold decomposed per stage on the stats inode, levers (b) + (d) −922 ms in-process, the capacity law published, the 6 s of derived windows named as adjudication items; the from-zero s11-mpiio row is OWED (parent). Prior status: (2026-09-05, `.benchmarks/2026-09-05-d4-free-grace-sustain.md` §6: finding 15 reproduces on the s11 venue at 23 s — lane ENOSPC storms — and five of eight co-writers wedge on the ENOSPC'd writes; the WEDGE is fixed 2026-09-06, `.benchmarks/2026-09-06-cowriter-enospc-wedge.md`: the finding-29 bounded-allocation park read the reallocation label as its wall and a harvest sink's presence as supply, so an exhausted co-writer lane parked forever under its block stripe — the row must now fail CLEANLY, fleet re-run owed).** PRs 1–4 landed 2026-08-25 (`f992c2e1` instruments · `11dafe2f` L1 · `29788e55` L4+L2+L2b+L3 · `69b2fe16` L5 + the OQ 2 horizon), followed by finding 18 (`6ce59456`, the prod decay) and finding 29 (`a50da1e4` + `37bf6036`, the bounded allocation park). The s11-mpiio row went GREEN once on the cloud venue (2026-08-30 16b, `8e4a2cab`, `.benchmarks/cloud/2026-08-30-094130`) — on a fleet whose lanes never coupled (`demand_waits` 0, `bound_age` 23–29 s, the routine composite). The §3 rate equation was closed in-process 2026-09-05 (D-4, `.benchmarks/2026-09-05-d4-free-grace-sustain.md`: the shipped levers unbind a recycle-bound stream at zero fences; Little's law holds on live gauges; finding D4-1 priced). **Owed**: the from-zero s11-mpiio row on the finding-15 venue with the sustain columns (PR 5's harness rung is NOT landed — the rig `.benchmarks/rigs/free-grace-sustain-rig.sh` reads the row's snapshots), run by the parent campaign |
 | **Repo state audited** | branch `dev`, tip `894cc088` (finding-15 part 1 landed at `8d2bcd3b`; contracts `tests/mw_cowriter_free_tests.rs` §finding 15) — the design as written; landed state per the Status row |
 | **Program input** | `.benchmarks/2026-08-25-s11-freeloop-stall.md` (finding 15 + the same-day part-1/re-grade addendum); `docs/design-full-multi-writer.md` rung-20 residual board item 1 (re-attributed 2026-08-25) and item 2 (the `SQUEEZEFS_RANGE_CUSTODY` flip, which inherits this as a precondition) |
 | **Binding inputs** | AGENTS.md (one source of truth — DLM S6/S7/S9 families, ENG-10, the two-substrate + sustained-state row rules, the TDD law); `docs/pre-rc-engineering-spec.md` §6.8 item 3; `docs/operations.md` §Freed-offset grace period; `.benchmarks/2026-08-19-blob-aware-merge-and-fabric-venue.md` §3 (the 0→825 never-draining capture); the free-grace pressure valve (rung-20 residual 6, in tree) |
@@ -829,7 +829,8 @@ else is process-internal plus the operator surface:
 |---|---|---|---|
 | `SQUEEZEFS_FREE_GRACE_ACK_PIPELINE` | bool | on | L1. `0` = depth-1 ladder (pre-campaign, the A/B control) |
 | `SQUEEZEFS_FREE_GRACE_DEMAND` | bool | on | L2+L3+L4 as one arm (they are one mechanism: the signal and its two consumers), **including the runway's lane-reachable supply re-base** (§5.4 site 0). `0` = space-runway-only valve on the passed-global supply, sweep-only bound publish — the pre-campaign shape verbatim |
-| `SQUEEZEFS_FREE_GRACE_PASS_ELASTIC` | bool | on | L2b (§5.2b, OQ 3 user decision): a prodded member also tightens its revalidation pass cadence, floored at the 1 s checkpoint ceiling. `0` = the routine pass cadence always — pre-campaign S5 behavior verbatim (member-side, the `ACK_PIPELINE` pattern) |
+| `SQUEEZEFS_FREE_GRACE_PASS_ELASTIC` | bool | on | L2b (§5.2b, OQ 3 user decision): a prodded member also tightens its revalidation pass cadence, floored at the writer's checkpoint ceiling (the 1 s constant until the composite below advertises a live one). `0` = the routine pass cadence always — pre-campaign S5 behavior verbatim (member-side, the `ACK_PIPELINE` pattern) |
+| `SQUEEZEFS_FREE_GRACE_CHECKPOINT_COMPOSITE` | bool | on | The writer→member checkpoint composite (§"Hold-time campaign" → "The writer→member checkpoint composite", user decision 2026-09-06): while the valve is asking, the writer's checkpoint ceiling is `max(P/2, 2 × cycle)`, the grant carries it, and the member's prod floor / L2b pass floor / pipeline depth follow it. `0` = the shipped cadences exactly (both sides) |
 | `SQUEEZEFS_ALLOC_LANE_HARVEST_AHEAD` | bool | on | L5, **including the OQ 2 measured horizon** (the harvest-reply bound-age hint). `0` = ENOSPC-triggered harvest only, hint and all — restore-exactly |
 
 The existing `SQUEEZEFS_FREE_GRACE_VALVE=0` continues to disarm rungs (a)/(b)
@@ -1178,8 +1179,8 @@ per-member census rides `SQUEEZEFS_STATS_KEY_CENSUS`).
 | **(b) carriage renewal** — `SQUEEZEFS_FREE_GRACE_ACK_RENEWAL` | a promotion wakes the renewal loop (`membership::renewal_wake`, a first-party `Notify` beside the beat) and the tick renews as CARRIAGE (`MemberLeaseWords::renewed_carriage`: lease renewed, prod honoured, the beat only ever forward, **no label learned** — a label learned just after a pass qualifies a pass later, and the ladder adopts the LAST learned pair; the first cut that re-anchored the beat read +125 ms) | 8,646 → 8,396 |
 | **(d) refresh on a binding ack** — `SQUEEZEFS_FREE_GRACE_REFRESH_ON_ACK` | `MembershipOwner::renew` marks the bound dirty when a member whose recorded ack sat ≤ the published bound advances it (one compare — KD-FG-4 stands); the harvest recomputes when dirty, rate-limited by `refresh_on_ack_interval_ms = max(floor ÷ members, 2 × measured scan)` (tie-tested), and reads the bound AFTER both recompute arms | 8,646 → 7,974 |
 | **(b) + (d) — shipped** | | **7,724 (−922 ms, −10.7 %)**; residence 8,396 → 7,841; closure exact, forced = fences = 0, stalls 0 |
-| (a) checkpoint cadence — **measured inert, NOT landed** | halving the writer's checkpoint period moves `bound_age` by 0 ms to the tick (only the shadowed `defer→checkpointed` shortens); checkpoints SPARSER than the passes cost +662 ms. It pays only as the writer→member composite (live ceiling → prod floor → L2b pass floor at `P/2`), a pinned-law change (adjudication item 4) | 7,724 → 7,724 |
-| (c) sub-second prod floor — not landed | with (b) the beat carries only the LABEL, adopted at the next pass — a faster beat shortens only the free→learn term (mean 0.5 → 0.25 s) at 2× lease-lane load; belongs to the composite | — |
+| (a) checkpoint cadence — **measured inert ALONE; LANDED as the composite (below)** | halving the writer's checkpoint period moves `bound_age` by 0 ms to the tick (only the shadowed `defer→checkpointed` shortens); checkpoints SPARSER than the passes cost +662 ms. It pays only as the writer→member composite (live ceiling → prod floor → L2b pass floor at `P/2`), a pinned-law change — adjudication item 4, **approved by the user 2026-09-06 and landed** (`SQUEEZEFS_FREE_GRACE_CHECKPOINT_COMPOSITE`, §"The writer→member checkpoint composite" below) | 7,724 → 7,724 alone; **7,724 → 6,750 as the composite** |
+| (c) sub-second prod floor — **landed inside the composite** | with (b) the beat carries only the LABEL, adopted at the next pass — a faster beat shortens only the free→learn term (mean 0.5 → 0.25 s) at 2× lease-lane load; it belongs to the composite, whose live prod floor `max(min(P, ceiling), skew)` IS the sub-second floor when the writer's ceiling is `P/2` | (in the composite's row) |
 | **(e) the capacity law, published** | `alloc_lane_share_needed_blocks = ceil(claim-rate × horizon) + live` and `alloc_lane_headroom_pct = (share − needed) ÷ share` on every laned co-writer (0/0 unpartitioned); a lane exhausts exactly when the headroom reaches 0 — pinned on the loop with the MEASURED hold (spare 0.6× → 636 stalls; 1.5× → 0) | — |
 
 ### The remaining 6 s — adjudication items (coherence-proof changes, not levers)
@@ -1190,11 +1191,103 @@ double-counts `P` — the pass IS the poll, so the honest lag is
 layout/attr-cache TTL, which an epoch-step PURGE of those caches would
 replace with the purge's duration (−2.0 s); (3) `D_purge = 2 × P` is a
 lease-clock fail-stop reserve reused as an in-flight-serve drain, which is
-milliseconds (−1.9 s); (4) the writer→member `P/2` composite (−0.6 s).
-Together ≈ 6.0 → 1.1–1.5 s of windows — a fleet hold ≈ 3–3.5 s and 4 GiB
-lanes at ≈ 50 % headroom. KD-FG-11 pinned (1)–(3) unmoved for L2b's sake
-(a load-dependent pass cadence must not re-derive them); revisiting their
-DERIVATIONS is the user's call.
+milliseconds (−1.9 s); (4) the writer→member `P/2` composite (−0.6 s
+predicted; **LANDED 2026-09-06, measured −974 ms in-process** — the
+section below). Together ≈ 6.0 → 1.1–1.5 s of windows — a fleet hold
+≈ 3–3.5 s and 4 GiB lanes at ≈ 50 % headroom. KD-FG-11 pinned (1)–(3)
+unmoved for L2b's sake (a load-dependent pass cadence must not re-derive
+them); revisiting their DERIVATIONS is the user's call — items (1)–(3) are
+the sibling campaign `perf/free-grace-ladder-rederivation`.
+
+### The writer→member checkpoint composite (adjudication item 4 — USER DECISION 2026-09-06, LANDED)
+
+**Evidence note** `.benchmarks/2026-09-06-free-grace-checkpoint-composite.md`;
+branch `perf/free-grace-checkpoint-composite`; contracts 32–36 of
+`tests/reader_free_grace_tests.rs` + the `derivation_sweep_tests` tie test.
+
+**The mechanism, in the order the number travels.**
+
+1. **The writer's demand-elastic ceiling** (`src/free_grace.rs`
+   `checkpoint_ceiling_in_force_ms` → `src/meta_backend/kv/checkpoint.rs`
+   `tick`): while the valve is ASKING — a prod cadence in force, from rung
+   (a) off the space runway or rung a′ off the demand mark — the KV
+   checkpoint task's `elapsed ≥ CHECKPOINT_MAX_AGE_MS` decision compares
+   against the elastic ceiling `max(P/2, 2 × measured cycle)` instead
+   (`elastic_checkpoint_ceiling_ms`, tie-tested: half the reader's ROUTINE
+   poll `P` is the Nyquist bound that puts a new root in every pass window
+   however the two cadences phase; a cycle may not run more than half the
+   time — lever (d)'s law for the scan; never slower than the writer's
+   routine ceiling `max(flush tick, CHECKPOINT_MAX_AGE_MS)`), and the
+   task's tick tightens to the ceiling where the flush cadence is coarser
+   than it (a slow-flush venue — the decision is per tick). Compared
+   against the ELAPSED time, so a ceiling that tightens mid-interval fires
+   at once. No ask ⇒ `None` ⇒ the shipped constant and tick untouched.
+   **Why the prod and not the L4 demand mark alone**: site 0's age arm
+   needs the ring's front past the 8.02 s physics floor, which a healthy
+   coupled loop never reaches (the fleet-cadence shape holds 7.7 s), and
+   the fleet's demand came from the ENOSPC edges the composite exists to
+   remove; the prod is the ask both arms already deposit into one word —
+   the writer does its half of the ask exactly while the members are
+   asked for theirs.
+2. **Carriage** (`Grant::checkpoint_ceiling_ms`, `MembershipOwner::grant_for`
+   → `free_grace::advertise_checkpoint_ceiling`): every join and renewal
+   grant carries the ceiling in force — the routine one with no ask, `P/2`
+   under one, `0` from an owner with no grace plane. **It is a PROMISE**
+   ("every commit before this grant is checkpointed within this many ms of
+   it"), and the writer keeps it: an elastic advertisement opens or
+   tightens a promise pair (`min` advertised, `until` = now + one routine
+   ceiling) that the task's in-force reading takes the minimum with, so the
+   writer relaxes no sooner than every advertised window has closed —
+   whatever the ask or the lever did since. The membership vocabulary has
+   no schema of its own (its bincode bodies ride the transport's), so the
+   field bumps **`CLUSTER_WIRE_SCHEMA` 1 → 2** — a mixed fleet fails loud
+   at the handshake (KD-7), never a member running the constant against a
+   writer that advertised half of it. (`lane_supply_blocks`, added to the
+   same grant the same day without a bump, rides it too.)
+3. **The member** (`MemberSession::checkpoint_ceiling_ms`): the ceiling
+   advertised WITH the label `learned_label` reports (join + routine
+   renewals; a carriage renewal learns neither); falls back to the
+   constant when none was advertised or the lever is off. It is the INPUT
+   of three floors: the owner's live prod floor
+   (`ProdParams::floor_for` = `max(min(P, ceiling), skew)` — the shipped
+   `max(P, skew)` at the routine ceiling, the identity that makes "no ask
+   ⇒ shipped" structural; `note_pressure`, lever (d)'s and the lane push's
+   rate limits read it), L2b's pass floor (`reader_pass_interval`:
+   `clamp(ask, advertised ceiling, routine)`, the ceiling deposited beside
+   the ask by `note_prodded_renewal`), and the ack pipeline's depth input
+   (`reader_refresh_floor_ms`: labels arrive at the halved beat, so a
+   depth derived from the routine floor saturates and displaces
+   unqualified candidates — the first cut without it read the hold
+   +800 ms WORSE, which is the measurement that put it in).
+
+**Measured (release, deterministic; the fleet-cadence shape, H3 = the
+shipped hold-time pair):**
+
+| Row | `bound_age` mean / max | residence | `defer→ckpt` / `ckpt→min_acked` / `min_acked→rel` | ack lag max / mean | checkpoints/s | renewals/s | `elastic_cycles` / `pass_prods` | ceiling min | worst staleness |
+|---|---|---|---|---|---|---|---|---|---|
+| H3 (composite off) | 7,724 / 7,750 | 7,841 | 498 / 7,339 / 3 | 7,500 / 7,000 | 1.00 | 15.58 | 0 / 0 | 1,000 | 2,000 |
+| **H4 = H3 + composite** | **6,750 / 6,750** | **6,975** | 248 / 6,723 / 4 | 6,750 / 6,500 | **2.00** | **31.12** | 600 / 4,778 | **500** | 1,500 |
+
+**−974 ms (−12.6 %) on `bound_age`, −866 ms on the residence**, closure
+exact, `forced = laggard_fences = 0`, the stream at its offered rate with
+0 stalls on both rows, and the cost is EXACTLY the accepted 2× on both
+faces (checkpoints 1.00 → 2.00/s, lease-lane renewals 15.58 → 31.12/s).
+The −0.6 s forecast under-counted: with the ack pipeline's depth following
+the floor, the acknowledgement rate doubles too (acks 1,601 → 3,202), and
+the min-composition over 8 members tightens with it. The elastic cadence's
+worst-case staleness (`pass + ceiling` = 500 + 500 + the constant's
+rounding = 1,500 ms) sits inside the published 2,000 ms bound, which never
+moves. A real `KvMetaBackend`'s checkpoint task, ticking on the shipped
+50 ms flush: 2 cycles in 1.25 routine ceilings under an ask, both elastic;
+0 elastic cycles with no ask and 0 under the lever off (contract 36).
+`SQUEEZEFS_FREE_GRACE_CHECKPOINT_COMPOSITE=0` is the H3 row to the tick.
+
+**What it does NOT do**: the qualify and drain WINDOWS are untouched
+(items 1–3 — the sibling campaign owns `reader_pass_completed`'s lag
+computation; `MemberSession::checkpoint_ceiling_ms` is the method both
+campaigns add, with the composite's live value in place of the constant —
+see the note's §6 on the promise semantics that make an elastic qualify
+lag sound); the fleet row is the parent's.
 
 **USER DECISION 2026-09-06: re-derive them. Items (1)–(3) LANDED** on
 `perf/free-grace-ladder-rederivation` (`.benchmarks/2026-09-06-free-grace-ladder-rederivation.md`;
@@ -1422,34 +1515,54 @@ clean co-writers (m50, m57 — no `CLAIM ANOMALY`) → 0, closure exact, forced
   very signal §2.2's arithmetic leans on; `DEMAND=0` keeps the
   passed-global runway verbatim (the lever's restore-exactly contract).
 * **KD-FG-11 — Demand-elastic passes tighten the contract's REALITY, never
-  its TERMS (OQ 3, user decision 2026-08-25).** The prodded `renew_ms` is
-  itself the pass-cadence ask (no wire field — the prod is the signal), the
-  floor is the 1 s checkpoint ceiling (the derived minimum pass cost —
-  physics, not tuning), and because the S5 staleness contract is an UPPER
-  bound, shortening passes can only lower actual staleness. Three numbers
-  are pinned unmoved by contract: the published `reader_staleness_bound_ms`
-  (the guarantee must hold when a demand window ends mid-pass), the reader
-  TTLs it derives, and the ack ladder's qualify/drain lags (the
-  qualification argument rests on the WRITER's checkpoint ceiling, never
-  the reader's pass rate). Elastic passes buy more passes — finer stage
-  granularity — never shorter windows; structurally inert where the routine
-  interval is already at the floor (this venue).
-  **Amended 2026-09-06 (user decision — the ladder re-derivation,
-  `.benchmarks/2026-09-06-free-grace-ladder-rederivation.md`):** the
-  windows stay pinned against DEMAND exactly as above — no pass cadence,
-  prod or pressure signal may shorten them — but their DERIVATIONS are no
-  longer the reader's staleness bound. **Qualify = the writer's checkpoint
-  landing ceiling + skew** (the argument always rested on the WRITER's
-  ceiling; the staleness bound added the reader's poll interval on top of
-  it, and for qualification the pass IS the poll — `S` was never the
-  honest term). **Drain = an epoch-step invalidation of the reader's
-  layout cache + an observed in-flight drain** (the caches' TTL and the
-  `D_purge` reserve were timers standing in for an event and a count the
-  reader can observe exactly; `D_purge` survives only as the
-  `free_grace_drain_overdue` tripwire). The published
-  `reader_staleness_bound_ms` and the reader TTLs it derives are unchanged
-  — they state the S5 metadata-staleness contract, which this decision
-  does not touch.
+  its TERMS (OQ 3, user decision 2026-08-25; amended 2026-09-06).** The
+  prodded `renew_ms` is itself the pass-cadence ask, the floor is the
+  writer's checkpoint ceiling (the derived minimum pass cost — physics,
+  not tuning: a pass faster than the writer's checkpoints finds nothing),
+  and because the S5 staleness contract is an UPPER bound, shortening
+  passes can only lower actual staleness. Elastic passes buy more passes —
+  finer stage granularity — never shorter windows. **Amended 2026-09-06
+  (user decision — all four adjudication items of the hold-time campaign's
+  §7).** The windows stay pinned against DEMAND exactly as above — no pass
+  cadence, prod or pressure signal may shorten them — but their
+  DERIVATIONS are no longer the reader's staleness bound, and the floor's
+  INPUT is the writer's live ceiling, not a constant:
+  * **Qualify = the writer's advertised checkpoint LANDING ceiling + skew**
+    (items 1 + 4, `.benchmarks/2026-09-06-free-grace-ladder-rederivation.md`
+    + `.benchmarks/2026-09-06-free-grace-checkpoint-composite.md`). The
+    argument always rested on the WRITER's ceiling; the staleness bound
+    added the reader's poll interval on top of it, and for qualification
+    the pass IS the poll — `S` was never the honest term. The ceiling is
+    the LANDING one — the decision the checkpoint task enforces plus the
+    two tick-granularity terms `tick` evaluates behind
+    (`checkpoint_landing_ceiling_ms` = trigger + 2 × tick, 1,100 ms on the
+    shipped flush) — and it TRAVELS on every grant
+    (`Grant::checkpoint_ceiling_ms`; the "no wire field" clause is
+    retired, the prod stays the signal and the ceiling is its number): the
+    routine landing ceiling with no ask in force, the landing ceiling of
+    `max(P/2, 2 × measured cycle)` while the valve is asking
+    (`checkpoint_landing_ceiling_for_elastic` = `c + 2 × min(tick, c)`,
+    the task having tightened its tick to the decision). The
+    advertisement is a PROMISE the writer honours for one routine ceiling
+    past the grant, which is what lets the member's qualify term read it;
+    a grant advertising nothing falls back to the member's own routine
+    landing derivation.
+  * **Drain = an epoch-step invalidation of the reader's layout cache + an
+    observed in-flight drain** (items 2 + 3): the caches' TTL and the
+    `D_purge` reserve were timers standing in for an event and a count the
+    reader can observe exactly; `D_purge` survives only as the
+    `free_grace_drain_overdue` tripwire.
+  * **The pass floor, the prod floor and the ack pipeline's depth input
+    follow the advertised ceiling** (item 4), so while the valve asks,
+    passes and beats run at `P/2` — the accepted cost is ≈ 2× lease-lane
+    renewals and ≈ 2× checkpoint cycles for the duration of the ask; the
+    composite is what makes elastic passes pay on the venue whose routine
+    interval already sits at the constant.
+  Still pinned unmoved by contract: the published `reader_staleness_bound_ms`
+  (the guarantee must hold when a demand window ends mid-pass — the elastic
+  cadence sits INSIDE it, worst case `P/2 + P/2`) and the reader TTLs it
+  derives — they state the S5 metadata-staleness contract, which this
+  decision does not touch.
 * **KD-FG-7 — All new sizings derive; all new mechanisms have bool levers.**
   Pipeline depth, prod cadence, refresh rate, pass floor, horizon and
   watermark derive from the plane's published numbers or arrive measured

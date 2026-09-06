@@ -1,19 +1,24 @@
 #!/usr/bin/env bash
 # .benchmarks/rigs/2026-09-06-kernel-bg-per-queue-ab.sh — the kernel
-# COMMIT-lock split A/B (sqz 7.2-track patch 0026, per-queue FUSE background
-# accounting; docs/design-kernel-bg-per-queue.md §5).
+# COMMIT-lock split A/B (per-queue FUSE background accounting — sqz patch
+# 0026 on the 7.2 track, 0031 on the 6.19.14 field track and on 7.1;
+# docs/design-kernel-bg-per-queue.md §5).
 #
 # ONE boot per invocation. The arms are KERNELS, not daemons: the SAME
-# daemon binary + shim run under kernel A (the sqz series 0001-0025 — or the
-# running 6.19.14-sqz on the field box) and kernel B (the same series +
-# 0026). A-B-B-A across reboots is impossible, so the schedule is A A B B:
+# daemon binary + shim run under kernel A (the track's sqz series WITHOUT
+# the patch: 6.19/7.1 0001-0030, 7.2 0001-0025 — e.g. the running
+# 6.19.14-sqz on the field box) and kernel B (the same series WITH it).
+# A-B-B-A across reboots is impossible, so the schedule is A A B B:
 #   boot A → ARM=A bash …-ab.sh   (fresh cluster + prep, then the rows x2)
 #   boot A → ARM=A bash …-ab.sh   (RESET=1 again — same-state repeat)
 #   boot B → ARM=B bash …-ab.sh
 #   boot B → ARM=B bash …-ab.sh
 # The rig refuses to run if `uname -r` does not contain KERNEL_TAG (a
 # substring you set per arm, e.g. KERNEL_TAG=7.2.3-sqz-v2) so a row can never
-# be filed under the wrong kernel. Every row records the box's THERMAL state
+# be filed under the wrong kernel, and cross-checks ARM against the loaded
+# fuse module's symbol table: fuse_uring_bg_wait exists ONLY with the patch
+# and carries the SAME name on all three tracks (the track is derived from
+# uname -r for the row's label — 6.19/7.1 = 0031, 7.2 = 0026). Every row records the box's THERMAL state
 # (thermal zones + hwmon maxima), the box-wide /proc/stat busy and loadavg
 # beside its .row — the cross-reboot bracket has no A-B-B-A to cancel drift,
 # so the state is the control.
@@ -59,13 +64,29 @@ exec > >(tee -a "$OUT/driver.log") 2>&1
 echo "== kernel bg-per-queue A/B, ARM=$ARM: $(date -u +%FT%TZ) out=$OUT kernel=$(uname -r) bin=$BIN"
 "$BIN" --version
 uname -a > "$OUT/uname.txt"
+# the track (for the label only): which number the patch carries there
+case "$(uname -r)" in
+  6.19.*) PATCH_NO=0031 ;;
+  7.1.*)  PATCH_NO=0031 ;;
+  7.2.*)  PATCH_NO=0026 ;;
+  *)      PATCH_NO=unknown-track ;;
+esac
+echo "$PATCH_NO" > "$OUT/patch-no.txt"; echo "   track: $(uname -r) → the per-queue bg patch is $PATCH_NO here"
 # the kernel's own statement of which series it carries: the fuse module's
-# symbol table has fuse_uring_bg_wait only with 0026
-if grep -q " fuse_uring_bg_wait$" /proc/kallsyms 2>/dev/null; then echo "   kernel: fuse_uring_bg_wait PRESENT (0026 kernel)"; echo present > "$OUT/kernel-0026.txt";
-else echo "   kernel: fuse_uring_bg_wait absent (pre-0026 kernel)"; echo absent > "$OUT/kernel-0026.txt"; fi
-case "$ARM:$(cat "$OUT/kernel-0026.txt")" in
-  A:present) echo "ARM=A but the running kernel carries 0026 — refusing" >&2; exit 2 ;;
-  B:absent)  echo "ARM=B but the running kernel lacks 0026 (module not loaded yet? mount once and re-check) — continuing, re-verified after mount" ;;
+# symbol table has the patch's four non-static helpers only with the patch
+# (same names on every track). A module symbol's kallsyms line ends in
+# "\t[fuse]", and an LTO build may suffix ".llvm.N" — hence a WORD match,
+# never an end anchor. An LTO build (the CachyOS 7.1 line) may also INLINE
+# them all away: SYMCHECK=advisory demotes an "absent" verdict on ARM=B to a
+# loud line and KERNEL_TAG carries the arm alone (the gcc EL8 field build
+# keeps the symbols).
+SYMCHECK=${SYMCHECK:-strict}
+sym_present() { grep -Eqw "fuse_uring_bg_wait|fuse_uring_bg_limit_changed|fuse_uring_num_background|fuse_uring_bg_kick" /proc/kallsyms 2>/dev/null; }
+if sym_present; then echo "   kernel: fuse_uring_bg_wait PRESENT ($PATCH_NO kernel)"; echo present > "$OUT/kernel-patched.txt";
+else echo "   kernel: fuse_uring_bg_wait absent (pre-$PATCH_NO kernel, or fuse not loaded yet)"; echo absent > "$OUT/kernel-patched.txt"; fi
+case "$ARM:$(cat "$OUT/kernel-patched.txt")" in
+  A:present) echo "ARM=A but the running kernel carries $PATCH_NO — refusing" >&2; exit 2 ;;
+  B:absent)  echo "ARM=B but the running kernel lacks $PATCH_NO (module not loaded yet? re-verified after mount)" ;;
 esac
 
 if ps -eo args | grep -q "[s]queezefs[^ ]* mount"; then
@@ -101,10 +122,14 @@ import json,sys
 m=json.load(open(sys.argv[1]))["metrics"]
 print("   mount:", {k:m.get(k) for k in ["fuse3_zc_negotiated","fuse3_kmbuf_negotiated","transport_queues","transport_q_depth","transport_max_background","transport_max_write","data_read_lanes","build_profile"]})
 EOF
-  # with the fuse module loaded, the 0026 symbol check is authoritative
-  if grep -q " fuse_uring_bg_wait$" /proc/kallsyms; then echo present > "$OUT/kernel-0026.txt"; else echo absent > "$OUT/kernel-0026.txt"; fi
-  echo "   kernel-0026: $(cat "$OUT/kernel-0026.txt") (ARM=$ARM)"
-  if [ "$ARM" = B ] && [ "$(cat "$OUT/kernel-0026.txt")" != present ]; then echo "ARM=B without 0026 in the loaded fuse module — refusing" >&2; umount_it; exit 2; fi
+  # with the fuse module loaded, the symbol check is authoritative both ways
+  if sym_present; then echo present > "$OUT/kernel-patched.txt"; else echo absent > "$OUT/kernel-patched.txt"; fi
+  echo "   kernel-patched ($PATCH_NO): $(cat "$OUT/kernel-patched.txt") (ARM=$ARM)"
+  if [ "$ARM" = B ] && [ "$(cat "$OUT/kernel-patched.txt")" != present ]; then
+    if [ "$SYMCHECK" = advisory ]; then echo "   WARNING: ARM=B but none of the $PATCH_NO symbols is in the loaded fuse module (LTO inlining?) — trusting KERNEL_TAG=$KERNEL_TAG; the row is labeled symcheck=advisory"; echo advisory > "$OUT/kernel-patched.txt";
+    else echo "ARM=B without $PATCH_NO in the loaded fuse module — refusing (SYMCHECK=advisory overrides on an LTO kernel)" >&2; umount_it; exit 2; fi
+  fi
+  if [ "$ARM" = A ] && [ "$(cat "$OUT/kernel-patched.txt")" = present ]; then echo "ARM=A but the loaded fuse module carries $PATCH_NO — refusing" >&2; umount_it; exit 2; fi
   # the connection's max_background as the kernel sees it (fusectl) — the per-queue share is this / transport_queues
   for c in /sys/fs/fuse/connections/*/; do
     [ -r "$c/max_background" ] && echo "   fusectl $(basename "$c"): max_background=$(cat "$c/max_background") congestion_threshold=$(cat "$c/congestion_threshold")"
@@ -198,6 +223,6 @@ row "$T-seq1m-kern-2"  read_BW          kern 30 0
 row "$T-rr4k-kern-60"  randread_iops_60 kern 60 0
 row "$T-rr4k-kern-perf" randread_iops   kern 30 1
 umount_it
-echo "== done $(date -u +%FT%TZ) kernel=$(uname -r) ARM=$ARM kernel-0026=$(cat "$OUT/kernel-0026.txt")"
+echo "== done $(date -u +%FT%TZ) kernel=$(uname -r) ARM=$ARM patch=$PATCH_NO kernel-patched=$(cat "$OUT/kernel-patched.txt")"
 grep -h "^ROW" "$OUT"/*.row
 echo "== compare across boots: python3 $D/2026-09-03-r4-row-delta.py is per row; pair A*/B* dirs by tag and read fuse3-ur us/op, lock.txt shares, IOPS, p50/p99, thermal"

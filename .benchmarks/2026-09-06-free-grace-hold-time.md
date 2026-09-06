@@ -213,25 +213,60 @@ re-derivation (§7, ≈ 3.5 s): 495 (52 %).
   unchanged.
 * No `task check`, no root rigs (the parent's).
 
-## 6. Fleet acceptance — OWED (parent)
+## 6. Fleet acceptance — RUN 2026-09-06 09:57 (dev box, 32 CPUs): the levers do what they predicted; the row still fails; the fleet adds a term
 
-`tests/run_mw_matrix.sh s11-mpiio` from zero on the finding-15 venue (1
-authority + 8 co-writers, range custody, `SQZ_MWFLEET_OSS_GB=32`, nvmet-tcp
-devsub, release profile, quiet box, probe ≥ 750 MiB/s), binary at or after
-`70d0ca6c`. Read the authority's `m0.stats.json` and every co-writer's:
+`s11-mpiio` from zero on `0723b3ea` (release, both levers at their shipped
+defaults), same fleet (1 authority + 8 co-writers, range custody,
+`OSS_GB=32`); artifacts `.benchmarks/rows-holdtime-s11-20260906/`. Probe
+2,021 MiB/s → 10 GiB file, 15 iterations.
 
-| Column | PASS reads |
-|---|---|
-| `free_grace_bound_age_ms` (m0, at capture under the storm) | **≈ 8.0 s, well under the pre-campaign 8,994** — the in-process −922 ms transfers as −0.9 s (the levers remove cadence terms, which the fleet has in the same size); ≤ 8.2 s is the prediction, > 8.7 s means the levers did not engage (check the engagement row) |
-| `free_grace_hold_phase_ns` (m0) | `defer_checkpointed` mean ≤ 1 checkpoint period; `min_acked_released` ≪ 1 s; `checkpointed_min_acked` ≈ 7 s; the three means sum to `free_grace_residence_ms.mean_ns` within noise; `free_grace_hold_unplaced` ≈ 0 |
-| `free_grace_member_ack_lag_ms` (m0) | max − min ≤ 1 s (no laggard member); with `SQUEEZEFS_STATS_KEY_CENSUS=1` the census names the binding one |
-| `free_grace_offsets` at capture (m0) | **≪ 3,171** — Little's law: held = churn × hold, so ≈ −10 % (≈ 2,850 at the same churn); a larger fall means the row's churn fell too (read `deferrals` Δ ÷ wall beside it) |
-| `alloc_lane_enospc_refusals` (every co-writer) | **→ 0**, with `alloc_lane_headroom_pct` staying > 0 through the storm (it was ≈ 25 % at 9 s by the §4.6 arithmetic; the levers buy ≈ +6 points) — if the refusals persist with headroom reading 0, the remaining hold IS the 6 s of windows (§7), not a lever defect |
-| the sustained-window gate | **PASSING** (the last third within 30 % of the mean) |
-| engagement | `free_grace_ack_renewals` growing on every co-writer (≈ 1 per promotion — its `free_grace_reader_acks` slope); `free_grace_bound_refreshes_on_ack` growing on m0 (≤ 8 per floor beat by the limit; `free_grace_bound_scan_ms` ≈ 0); `free_grace_checkpoint_marks` ≈ `meta_kv_checkpoints`; `forced_releases` / `laggard_fences` / `alloc_stalls` **0** |
-| A/B legs (per lever knob, same fleet, A-B-B-A) | `SQUEEZEFS_FREE_GRACE_ACK_RENEWAL=0` on every mount: `bound_age` +≈ 0.25 s, `ack_renewals` 0; `SQUEEZEFS_FREE_GRACE_REFRESH_ON_ACK=0` on m0: +≈ 0.65 s, `bound_refreshes_on_ack` 0; both off: the pre-campaign 8,994 shape reproduces |
+| gauge (m0 unless noted) | pre-campaign (`380ea732`, 00:15 row) | this row | predicted |
+|---|---|---|---|
+| `free_grace_bound_age_ms` | 8,994 | **7,936 (−12 %)** | ≈ 8.0 s ✓ |
+| `free_grace_hold_ms` (residence estimator) | — | 8,809 | |
+| `free_grace_hold_phase_ns` mean: `defer→checkpointed` / `checkpointed→min_acked` / `min_acked→released` / total | — | **503 / 7,956 / 2,500 / 10,958 ms** (45,540 samples) | in-process: 498 / 7,888 / **9** / 8,396 |
+| engagement: `ack_renewals` per member / `bound_refreshes_on_ack` | — | 212–219 (= every ack rode a renewal) / 493 of 560 refreshes | |
+| closure | | deferrals 45,777 ≡ releases 45,545 + offsets 232 ✓; `forced_releases` 0, `alloc_stalls` 0, `laggard_fences` 0 | |
+| valve | tightenings 185,054 / demand waits 49,528 | 200,867 / 51,715 (saturated, `pressure_pct` 66 at capture) | |
+| lane ENOSPC refusals per co-writer | 76–129 | **23 / 99 / 120 / 109 / 133 / 77 / 130 / 30** (m50…m57) | → 0 ✗ |
+| `alloc_lane_headroom_pct` per co-writer | — | 0 / 4 / 3 / 5 / 0 / 10 / 23 / 6 — at the edge, as the capacity law computes | > 0 |
+| `CLAIM ANOMALY` per co-writer | 1 / 183 / 33 (three sampled) | 0 / 7 / 323 / 205 / 52 / 3 / 323 / 0 | |
+| sustained-window gate | FAIL 1,270 → 482 MiB/s | **FAIL 1,214 → 410 MiB/s** (iterations 1,920 / 1,880 / 1,160 / 1,048 / 770 / 805 / 697 / 260 / 240 / 618 / 582 / 569 / 249 / 252 / 570) | PASS ✗ |
 
-Recipe: `.benchmarks/2026-09-05-d4-free-grace-sustain.md` §6, unchanged.
+**Verdict — the levers LAND (measured, engaged, no loss); finding 15
+stays open with its terms now NAMED on the fleet.** Levers (b) and (d)
+took the fleet's hold from 8,994 to 7,936 ms — the −12 % the in-process
+rows priced, engagement exact, closure exact, nothing forced or stalled.
+The two co-writers with no `CLAIM ANOMALY` lineage (m50, m57) fell from
+129 / 76 refusals to **23 / 30** (−82 % / −61 %); the six that carry the
+residual refused-free lineage (7–323 anomalies) did not improve — the
+remaining leak (`block_untracked_free_refusals` 163, the 148 of the
+previous row) is concentrated on them and costs each its headroom.
+
+Three terms remain, in the order the fleet decomposition ranks them:
+
+1. **The coherence windows — 6 s of the 8 s `checkpointed→min_acked`
+   stage** (§7's four adjudication items: the qualify window's
+   double-counted `P`, the drain's `S` as a cache TTL a purge could
+   replace, `D_purge = 2P` reused as a serve drain, the writer→member
+   `P/2` composite). Together ≈ 3–3.5 s of fleet hold at the same
+   safety, 4 GiB lanes at ≈ 50 % headroom. **These are pinned
+   derivations (KD-FG-11); changing them is the user's call.**
+2. **A fleet-only `min_acked→released` term of 2.5 s** (9 ms in-process):
+   after every member has acked the epoch, the offset waits another 2.5 s
+   before it is released — a stage the in-process model does not have.
+   Candidate: released offsets re-enter the AUTHORITY's supply, but a
+   co-writer's LANE learns of recycled supply only on its own lane
+   refresh round trip (the raise/harvest cadence) — the co-writer side of
+   the loop, unmeasured until now. Red-first next: instrument the
+   release→lane-visible hop per co-writer, then make it event-driven
+   (the release carries the lane's refreshed frontier on the next
+   custody renewal, which now rides every ack).
+3. **The residual refused-free lineage** (`CLAIM ANOMALY` 3–323 per
+   co-writer; 163 refusals) — six of eight co-writers carry it, and their
+   ENOSPC did not move while the two clean ones fell 60–80 %. Named in
+   `2026-09-06-cowriter-free-refcount-leak.md` §6; now the co-writer's
+   supply-side face of finding 15.
 
 ## 7. What this does NOT do — the adjudication items (the remaining 6 s)
 

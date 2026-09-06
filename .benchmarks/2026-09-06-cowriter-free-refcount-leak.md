@@ -238,3 +238,18 @@ fleet row.
 effect on its own ledger). Finding 15 proper moves to the free-grace
 release-latency campaign with a sharper premise: the loop's hold time,
 not a leak, and not the refused frees.
+
+## 7. Follow-on — the `CLAIM ANOMALY` residue was NOT the refusals' face
+
+`.benchmarks/2026-09-06-cowriter-free-residual-lineage.md` (term 3): the
+anomalies correlate one-to-one with `rewrite_shadow_fence_drops` (one
+fenced epoch close per carrier → 200–323 anomalies; none → 0) and barely
+intersect the refused offsets. The shape: a co-writer's fsync whose token
+sibling stripe grants superseded ran its flush leg under the CURRENT
+generation (the covering publish the authority recomputed) and then its
+epoch close under the STALE one — the W5 arm dropped the parked keys'
+local hygiene and the uncovered acked bindings. Fixed by applying the
+2026-08-06 tail-loss law to the close (it re-presents the current
+generation; W5 is the genuine fence class only). The refused frees
+(148 → 163) are a separate residue, instrumented there as
+`cowriter.free_ship_own_lane_untracked`.

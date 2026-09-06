@@ -266,7 +266,20 @@ Three terms remain, in the order the fleet decomposition ranks them:
    co-writer; 163 refusals) — six of eight co-writers carry it, and their
    ENOSPC did not move while the two clean ones fell 60–80 %. Named in
    `2026-09-06-cowriter-free-refcount-leak.md` §6; now the co-writer's
-   supply-side face of finding 15.
+   supply-side face of finding 15. **Diagnosed and fixed on
+   `fix/cowriter-free-residual-lineage`
+   (`.benchmarks/2026-09-06-cowriter-free-residual-lineage.md`):** the
+   anomalies are NOT the refusals' face — they track
+   `rewrite_shadow_fence_drops` one-to-one (m52/m53/m56: one fenced
+   epoch close each → 323/205/323; m50/m57: none → 0). A co-writer's
+   fsync under a lease rotation published its flush leg under the
+   current generation (the authority recomputed the parked predecessors
+   free) and then fenced its epoch close on the stale token, dropping
+   those keys' local hygiene and the uncovered acked bindings; the close
+   now converges (the 2026-08-06 tail-loss law), W5 is the genuine fence
+   class only. The 163 refusals are a separate residue, instrumented
+   there (`cowriter.free_ship_own_lane_untracked`); the fleet row is
+   owed.
 
 ## 7. What this does NOT do — the adjudication items (the remaining 6 s)
 

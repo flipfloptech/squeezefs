@@ -151,18 +151,46 @@ allocator-level contracts and stays for the fleet row.
   · `cowriter_enospc_wedge_tests` 9/9 ×20.
 * No `task check`, no root rigs (parent's).
 
-## 6. Fleet repro — OWED (parent)
+## 6. Fleet repro — RUN 2026-09-05 22:03 (post-reboot, 32 CPUs): the wedge is GONE
 
-`tests/run_mw_matrix.sh s11-mpiio` on the same fleet (1 authority + 8
-co-writers, range custody) must now **FAIL CLEANLY**: ior sees ENOSPC/EIO
-(at fsync for ACKed custody, at the write for synchronous mints), **no
-watchdog storm** (`fuse_op_watchdog_overdue` flat on `write`), every mount's
-`.stats` answers, `write_pipeline_inflight_bytes` → 0 on every co-writer,
-`free_grace_pressure_parks` bounded per allocation (≤ ~20 slices at the 1 s
-wall on a co-writer), `write_enospc_refusals` accounting for the
-synchronous refusals. **Finding 15 itself — the lane exhaustion — stays
-open**; this note makes its failure mode a clean refusal instead of a hang.
+Same fleet (1 authority + 8 co-writers, range custody, `OSS_GB=32`),
+`tests/run_mw_matrix.sh s11-mpiio` from zero on `4ca040aa` (release);
+artifacts `.benchmarks/rows-wedgefix-s11-20260906/`.
 
+| | before (`8168e26e`, `rows-d4-s11-20260905/`) | after (this fix) |
+|---|---|---|
+| ior outcome | `fsync(15) failed` ×5, invocation FAILED at 23 s | **no fsync failure; all 18 iterations ran**; fails the sustained-window gate (below) |
+| `FUSE op watchdog` reports | 37,024 on m57; 5 of 8 co-writers wedged | **2–4 per co-writer** (single overdue ops, not a storm) |
+| mount responsiveness | m57 `waiting=135`, `.stats` in D-state 30 min | **every mount's `.stats` answered** at capture |
+| `write_pipeline_inflight_bytes` at capture | never drained | **0 on all 8** |
+| lane ENOSPC refusals (`volume … full`) | 2,366 on m57 | 114–225 per co-writer — the SHORTAGE persists (finding 15) |
+| `write_enospc_refusals` | — | 0: every refused mint was an ACK-early upload, reported at fsync/close per the custody law — and ior's fsync did NOT fail, so the re-present-and-retry ladder recovered every one within the row |
+
+**Verdict: the wedge is fixed** — an exhausted lane now costs a bounded
+park (≤ 1 s wall on a co-writer, refused if the authority holds nothing to
+release) and the mount stays alive; the row degrades to finding 15's
+ORIGINAL 08-19 signature instead of hanging: **phase A1 NOT SUSTAINED —
+the last third's mean decays 920 → 557 MiB/s (> 30 %)**, iterations
+bimodal (2,390 / 2,231 MiB/s while the lanes have room, 226–252 MiB/s in
+the lane-exhausted iterations, 600–1,000 in between).
+
+**What this run says about finding 15 — the leak, not the ack cadence.**
+The free-grace ring is NOT the bottleneck this time: `deferrals` 54,530 /
+`releases` 54,487 / `offsets` 43 outstanding at capture, `alloc_stalls`
+0, `forced_releases` 0. Yet the lanes exhaust. The authority refused
+**3,449 shipped frees** as `block_untracked_free_refusals` (367–542 per
+co-writer, the §7(b) "no refcount entry" class, mirrored on the co-writers
+as `CLAIM ANOMALY … refcount entry lingers`). A block whose shipped free
+is refused is neither referenced by a layout nor on the free list — it
+LEAKS from the lane's recycle supply until an ownership-recovery walk
+re-derives it, which a co-writer never runs. At ~4 MiB × 3,449 ≈ 13.5 GiB
+per row that is a third of the fleet's 36 GiB of lane supply gone in one
+phase — the shortage's arithmetic. **Finding 15's root cause is therefore
+most likely a correctness bug in the S9 co-writer free path (the
+authority's RAM refcount map not learning the reference a harvested
+offset took via the shipped publish), not a rate problem** — the next
+item, red-first: a harvested-then-published-then-freed block must be
+accepted by the authority's `FreeBlocks` and re-enter the lane's supply.
 ## 7. Recorded, not fixed (the pre-ENOSPC signals on the same rows)
 
 Chronology on m57 (every wedged co-writer shares it within seconds):

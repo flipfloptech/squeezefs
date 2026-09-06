@@ -1,0 +1,42 @@
+SqueezeFS version 1.2.1 (4ca040aa7d07 / 4ca040aa7d07775d834451ed00171ca61f89eb2a) built 1980-01-01T00:00:00Z profile release
+======================================================================
+  Mount Configuration Summary
+----------------------------------------------------------------------
+  Volume Name:         squeezefs
+  Capacity:            64.00 GiB
+  Block Size:          4.00 MiB
+  Compression:         none
+  Encryption:          none
+----------------------------------------------------------------------
+Metadata Volumes:
+  - [enabled] /dev/nvme1n1 (health: 1000)
+  - [enabled] /dev/nvme2n1 (health: 1000)
+Data Volumes:
+  - [enabled] /dev/nvme3n1 (health: 1000)
+  - [enabled] /dev/nvme4n1 (health: 1000)
+----------------------------------------------------------------------
+Cache/Staging:
+  Memory Cache Size:   1GB
+  Disk Cache Size:     10GB
+  Staging Paths:       none (cache-less)
+----------------------------------------------------------------------
+Mount Options:
+  Mountpoint:          "/mnt/sqz-mwfleet/m52"
+  Writeback Cache:     enabled
+  Allow Other:         enabled
+======================================================================
+[2026-09-06T01:56:12Z INFO  squeezefs] root subprocess PATH sanitized (VAL-7i): dropped relative/empty/group-or-world-writable entries; using '/run/wrappers/bin:/run/current-system/sw/bin:/nix/store/7a60q5dgnv6z96c279rc1nalyiw4mgqn-bash-interactive-5.3p15/bin:/nix/store/fpig164lz7fcipbndn61sfd2y2yq363n-patchelf-0.15.2/bin:/nix/store/w88q44gqd1qg5wmkk7v0h97rpiqvam0l-gcc-wrapper-15.3.0/bin:/nix/store/4yxdxw3kppr2pbic95p4mri520rkdag2-gcc-15.3.0/bin:/nix/store/axmdd5wlxg1c9dbblvj09pjhkawqxmqx-glibc-2.42-84-bin/bin:/nix/store/3qgy8q2j64v2m9jy3a5jmssacbblhd4r-coreutils-9.11/bin:/nix/store/rm982p6i9ry7rwq5jn638kdpv0a2331f-binutils-wrapper-2.46/bin:/nix/store/5pa1282x1sasbwhmnah6bny1g9pc2lj1-binutils-2.46/bin:/nix/store/dv55qwamlq68hdiprg1v104ymwh1c27r-cargo-1.97.1/bin:/nix/store/yaa1sq5g4jar7rvlspy7kk2wd98nj6qh-rustc-wrapper-1.97.1/bin:/nix/store/47k26k98v32x56rxiqawdk5qk0r0b6w1-rustfmt-1.97.1/bin:/nix/store/n4c4rzywa0wsfy239bqkgsx8lfhsfmwx-clippy-1.97.1/bin:/nix/store/bvzzl57kpmvzb6aj0v0yc45gvw8ggf2a-go-task-3.53.1/bin:/nix/store/3mkwfy7wnzdngx7nj8nvs60jj2r4gmmc-cargo-audit-0.22.2/bin:/nix/store/7fx93fz9c809w8yjxb0934zw6xcjis58-pkg-config-wrapper-0.29.2/bin:/nix/store/w021fbcg4z6vxihnp6gb6vijyifl051f-clang-wrapper-21.1.8/bin:/nix/store/603yaax3l2jmc0hfv6g3hgjr1qk5jfxk-clang-21.1.8/bin:/nix/store/vs80ag6hsr58wv5fn3nlq8qi32x9hwfi-binutils-wrapper-2.46/bin:/nix/store/06w7nc3znmzbw227ksbcj3kzv2dvnqpd-clang-21.1.8-dev/bin:/nix/store/cfmpcnlljlda8w2y0pw6shpbf7y84nz9-openmpi-5.0.10-dev/bin:/nix/store/b60ygklpk7cznna4bs0dcm6h6ncyh26z-openmpi-5.0.10/bin:/nix/store/b5bpi6zfajzzrwwpgba2q6li3nnya4bs-python3-3.14.7/bin:/nix/store/nsz342365nfvnvyfcjvds75rzw6rx520-nvme-cli-2.16/bin:/nix/store/f7cmpy9nszykh5gfjpxh5ks3pa78nssr-awscli2-2.35.11/bin:/nix/store/lbx1ba84hzgw5ixy47nmzvdmjp8ayqi4-liburing-2.14-bin/bin:/nix/store/wjvj88kk8gv0742k1lwazpxr7lnzgi1a-e2fsprogs-1.47.4-bin/bin:/nix/store/65ql38i4yki6adklv0d83amba6c5cd9i-util-linux-minimal-2.42.2-bin/bin:/nix/store/c4bh8ipd5jwxq44g4m630jswac1bqa6d-xfsprogs-7.1.1-bin/bin:/nix/store/yljbd9wmqsdg89pprp6r7ml0c5a109f7-btrfs-progs-7.1/bin:/nix/store/qhi7wvkfj6k2p38ds1ahc2bldypj5fr0-f2fs-tools-1.16.0/bin:/nix/store/xkwpln569xr659h2vzqv498cm2nvbwx7-exfatprogs-1.4.3/bin:/nix/store/zwv3i1aawb8zmxj029x7lyd0an5q4nj6-util-linux-2.42.2-bin/bin:/nix/store/ync7h8cyhw4nzw2laba4wra6b8mcn9by-compiler-rt-libc-21.1.8/bin:/nix/store/i4kjidyvl8ciwbcwm75g75sriq3knav0-findutils-4.11.0/bin:/nix/store/xw09m9cnc9ayb2j53y2rj8jhm1h7kkxa-diffutils-3.12/bin:/nix/store/4nylac9gazdpsid79qyk0jpqm312b2jx-gnused-4.10/bin:/nix/store/yhr4ps9rdmb55pgqaq246vlh7xfac1dx-gnugrep-3.12/bin:/nix/store/bpy2ps3f0f3gvgvqjwgqriw1j1n840wd-gawk-5.4.1/bin:/nix/store/w2mbg6mcq7k3j088sbwfziy8vsdhyk7v-gnutar-1.35/bin:/nix/store/sd9qcv5s2gxvd6hpp5hk5cixq2bd4jd1-gzip-1.14/bin:/nix/store/622jkvg8hgffly7dca6iif9drvimingx-bzip2-1.0.8-bin/bin:/nix/store/hd36xbvbc0vrn9f9idrfwxznri0ax427-gnumake-4.4.1/bin:/nix/store/9ipfvwnqp1q8ijnmi5sxvlx9r8w34lw3-bash-5.3p15/bin:/nix/store/1rcr9yyj9qlgm3dyin1j37xl7q84h15i-patch-2.8/bin:/nix/store/0fb3jrf20z28598alm6g7rrsw6dz2cqj-xz-5.8.3-bin/bin:/nix/store/xcab8m6wdrd30l10bw3hkz32yiibynzv-file-5.48/bin:/home/justin/.local/share/flatpak/exports/bin:/nix/store/444h3sfs9fk7fi8hif6wgg11rkc24vjd-ghostty-1.3.1/bin'
+Mounting as a CO-WRITER (DLM stage S9): this mount holds NO metadata authority — every metadata mutation ships to the authority that holds the D0 claim — and writes data only under custody that authority grants. Admission runs a five-rung ladder and refuses loudly naming the rung; see docs/operations.md §Multi-writer co-writer mounts.
+[2026-09-06T01:56:12Z INFO  squeezefs::nvme_dev] data volume /dev/nvme3n1: write_cache=write-through (durability barrier: io_uring Fsync/DATASYNC per device, coalesced)
+[2026-09-06T01:56:12Z INFO  squeezefs] writer-scoped staging ENGAGED: client scope w_1c4e7f3e0e89c39d.m54faa3bc (staging generation "v3:78d92c4688d04d14a57eec741f6054ff|v3:aeda952c8562497686dd35b6cb706697@node:1c4e7f3e0e89c39d.m54faa3bc") — staging keys carry the scope and this client's staging roots are bound to it
+[2026-09-06T01:56:12Z INFO  squeezefs::cache::gds] GPU Direct Storage: No discrete GPU environment found. GDS bypassed.
+[2026-09-06T01:56:12Z INFO  squeezefs] Registering data volume 'nvme3n1' at path /dev/nvme3n1 (state active)
+[2026-09-06T01:56:12Z INFO  squeezefs] Registering data volume 'nvme4n1' at path /dev/nvme4n1 (state active)
+[2026-09-06T01:56:12Z INFO  squeezefs::nvme_dev] data volume /dev/nvme4n1: write_cache=write-through (durability barrier: io_uring Fsync/DATASYNC per device, coalesced)
+[2026-09-06T01:56:12Z INFO  squeezefs::nvme_dev] NvmeBlockDev /dev/nvme3n1: read submission fan-out armed (16 lanes)
+[2026-09-06T01:56:12Z INFO  squeezefs::nvme_dev] NvmeBlockDev /dev/nvme3n1: write submission fan-out armed (16 lanes, 4194304 B affinity grain)
+[2026-09-06T01:56:12Z INFO  squeezefs::nvme_dev] NvmeBlockDev /dev/nvme4n1: read submission fan-out armed (16 lanes)
+[2026-09-06T01:56:12Z INFO  squeezefs::nvme_dev] NvmeBlockDev /dev/nvme4n1: write submission fan-out armed (16 lanes, 4194304 B affinity grain)
+[2026-09-06T01:56:13Z ERROR squeezefs::cowriter] co-writer admission REFUSED at rung 3: the durable claim set on /dev/nvme1n1 does not name this node 'node_1c4e7f3e0e89c39d.m54faa3bc'. Admission is by durable ENROLLMENT, never by a claim a joining node makes about itself: the `claim_set` record is a metadata commit, and a co-writer holds no metadata authority, so it CANNOT enroll itself. Add 'node_1c4e7f3e0e89c39d.m54faa3bc' to the AUTHORITY's SQUEEZEFS_MW_MEMBERS roster and re-arm it (one durable entry per rostered node, §6.2 item 7), then remount this node
+[91mERROR[0m mount refused: Invalid operation: co-writer admission REFUSED at rung 3: the durable claim set on /dev/nvme1n1 does not name this node 'node_1c4e7f3e0e89c39d.m54faa3bc'. Admission is by durable ENROLLMENT, never by a claim a joining node makes about itself: the `claim_set` record is a metadata commit, and a co-writer holds no metadata authority, so it CANNOT enroll itself. Add 'node_1c4e7f3e0e89c39d.m54faa3bc' to the AUTHORITY's SQUEEZEFS_MW_MEMBERS roster and re-arm it (one durable entry per rostered node, §6.2 item 7), then remount this node
+Error: InvalidOperation("co-writer admission REFUSED at rung 3: the durable claim set on /dev/nvme1n1 does not name this node 'node_1c4e7f3e0e89c39d.m54faa3bc'. Admission is by durable ENROLLMENT, never by a claim a joining node makes about itself: the `claim_set` record is a metadata commit, and a co-writer holds no metadata authority, so it CANNOT enroll itself. Add 'node_1c4e7f3e0e89c39d.m54faa3bc' to the AUTHORITY's SQUEEZEFS_MW_MEMBERS roster and re-arm it (one durable entry per rostered node, §6.2 item 7), then remount this node")

@@ -1444,8 +1444,16 @@ fn timeout_cycle(d: std::time::Duration) {
     let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
     let mut t = squeezefs_ipc::sqz_time::timeout(d, PendingOnce(false));
     let mut p = std::pin::Pin::new(&mut t);
-    assert!(std::future::Future::poll(p.as_mut(), &mut cx).is_pending());
-    assert!(std::future::Future::poll(p.as_mut(), &mut cx).is_ready());
+    // The ceremony is what is measured (arm, first poll, completion poll,
+    // drop); whether the first poll is Pending or the deadline already
+    // fired is a wall-clock race against scheduling latency (a 2 ms
+    // deadline vs a descheduled thread on a loaded box — the 2026-09-06
+    // gate smoke hit it with 8 threads), so it is observed, never asserted.
+    // The second poll is Ready either way: the inner future completes on
+    // its second poll, and an expired deadline is Ready on any poll.
+    if std::future::Future::poll(p.as_mut(), &mut cx).is_pending() {
+        assert!(std::future::Future::poll(p.as_mut(), &mut cx).is_ready());
+    }
     drop(t);
 }
 

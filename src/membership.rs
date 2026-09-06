@@ -1635,6 +1635,7 @@ impl MembershipOwner {
         let ttl = self.clocks.t_owner.as_millis() as u64;
         let mut seen_epoch = None;
         let mut seen_acked = 0u64;
+        let mut previous_acked = 0u64;
         let updated = self
             .members
             .update_sync(id, |_, st| {
@@ -1644,6 +1645,7 @@ impl MembershipOwner {
                 }
                 st.renewed_ms = now;
                 st.deadline_ms = now + ttl;
+                previous_acked = st.acked_free_epoch;
                 st.acked_free_epoch = st.acked_free_epoch.max(acked_free_epoch);
                 seen_acked = st.acked_free_epoch;
                 true
@@ -1669,6 +1671,12 @@ impl MembershipOwner {
             return RenewOutcome::UnknownLease { reason };
         }
         METRICS.membership_renewals.fetch_add(1, Ordering::Relaxed);
+        // §6.8 item 3, lever (d): an ADVANCING acknowledgement from a member
+        // that may have been the minimum marks the bound dirty for the
+        // harvest path — one compare here, the O(members) scan there.
+        if seen_acked > previous_acked {
+            crate::free_grace::note_member_ack_advanced(previous_acked);
+        }
         let mut grant = self.grant_for(epoch, now);
         // **§6.8 item 3's pressure valve, rung (a)** (rung-20 residual 6):
         // when the writer's freed-offset supply is running out faster than
@@ -2120,6 +2128,22 @@ impl MemberSession {
         crate::free_grace::note_prodded_renewal(grant.renew_ms, anchor_ms);
     }
 
+    /// Adopt a CARRIAGE renewal's grant (hold-time lever (b) — the renewal
+    /// a promoted acknowledgement triggered ahead of the beat): the lease
+    /// renews, a prod is honoured, the routine beat and the learned label
+    /// are left to the routine renewal ([`crate::lease_clock_core::MemberLeaseWords::renewed_carriage`]).
+    pub fn renewed_carriage(&self, grant: &Grant, anchor_ms: u64) {
+        self.words.renewed_carriage(
+            grant.epoch,
+            grant.t_self_ms(),
+            grant.renew_ms,
+            grant.skew_max_ms,
+            grant.d_purge_ms,
+            anchor_ms,
+        );
+        crate::free_grace::note_prodded_renewal(grant.renew_ms, anchor_ms);
+    }
+
     /// §6.8 item 3: the label last learned from the owner and the
     /// member-clock instant it arrived — the acknowledgement ladder's two
     /// inputs ([`crate::free_grace::ReaderAckLadder`]).
@@ -2244,6 +2268,23 @@ impl MemberSession {
 // ---------------------------------------------------------------------------
 // The process registry + the stats surface
 // ---------------------------------------------------------------------------
+
+/// §6.8 item 3, lever (b): the member's renewal loop parks on this beside
+/// its beat, so a promoted acknowledgement can carry itself home at once
+/// (`free_grace::reader_pass_completed` → [`request_renewal_now`]). A
+/// permit stored between two parks wakes the next one immediately — the
+/// send-then-wait race is safe by the primitive's own law.
+static RENEWAL_WAKE: squeezefs_ipc::sqz_notify::Notify = squeezefs_ipc::sqz_notify::Notify::new();
+
+/// The renewal loop's wake (the seam the contracts observe a request on).
+pub fn renewal_wake() -> &'static squeezefs_ipc::sqz_notify::Notify {
+    &RENEWAL_WAKE
+}
+
+/// Ask the member's renewal loop to renew NOW rather than at its beat.
+pub fn request_renewal_now() {
+    RENEWAL_WAKE.notify_one();
+}
 
 /// What this process is on the membership plane.
 enum Installed {
@@ -3002,12 +3043,33 @@ pub async fn member_renewal_tick(
     clock: &LeaseClock,
     on_purge: Option<&Arc<dyn Fn() + Send + Sync>>,
 ) -> RenewalTick {
+    member_renewal_tick_with(client, endpoint, secret, req, clock, on_purge, false).await
+}
+
+/// [`member_renewal_tick`] with the CARRIAGE flag (hold-time lever (b)):
+/// a tick the acknowledgement wake brought forward renews as carriage —
+/// the lease renews and the ack travels, but the routine beat and the
+/// learned label stay the routine renewal's.
+pub async fn member_renewal_tick_with(
+    client: &mut crate::membership_wire::MemberClient,
+    endpoint: &str,
+    secret: &[u8],
+    req: &JoinRequest,
+    clock: &LeaseClock,
+    on_purge: Option<&Arc<dyn Fn() + Send + Sync>>,
+    carriage: bool,
+) -> RenewalTick {
     let hold = TEST_RENEW_TICK_HOLD_MS.load(Ordering::Relaxed);
     if hold > 0 {
         squeezefs_ipc::sqz_time::sleep(Duration::from_millis(hold)).await;
     }
     let session = Arc::clone(client.session());
-    let Err(e) = client.renew().await else {
+    let renewed = if carriage {
+        client.renew_carriage().await
+    } else {
+        client.renew().await
+    };
+    let Err(e) = renewed else {
         return RenewalTick::Renewed;
     };
     if session.self_fence_due() {
@@ -3176,7 +3238,16 @@ fn spawn_member_renewal(
         loop {
             let now = clock.now_ms();
             let due = client.session().renew_at_ms().saturating_sub(now).max(1);
-            squeezefs_ipc::sqz_time::sleep(Duration::from_millis(due)).await;
+            // The beat is the authority; a wake (lever (b): a promoted
+            // acknowledgement) only brings the renewal forward — as a
+            // CARRIAGE renewal, which leaves the beat and the label to
+            // the routine one.
+            let carriage = squeezefs_ipc::sqz_time::timeout(
+                Duration::from_millis(due),
+                renewal_wake().notified(),
+            )
+            .await
+            .is_ok();
             if stop.load(Ordering::Acquire) {
                 let _ = client.leave().await;
                 return;
@@ -3193,13 +3264,14 @@ fn spawn_member_renewal(
                 .max(1);
             match squeezefs_ipc::sqz_time::timeout(
                 Duration::from_millis(bound),
-                member_renewal_tick(
+                member_renewal_tick_with(
                     &mut client,
                     &endpoint,
                     &secret,
                     &req,
                     &clock,
                     on_purge.as_ref(),
+                    carriage,
                 ),
             )
             .await

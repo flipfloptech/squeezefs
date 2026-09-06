@@ -164,6 +164,38 @@ impl MemberLeaseWords {
         }
     }
 
+    /// A CARRIAGE renewal (§6.8 item 3, hold-time lever (b)): the renewal a
+    /// promoted acknowledgement triggered ahead of the beat. It renews the
+    /// lease exactly like [`Self::renewed`] — epoch, deadline, the grant's
+    /// clocks — with two deliberate differences: the beat is only ever
+    /// brought FORWARD (`renew_at = min(scheduled, anchor + renew_ms)`, so
+    /// a prod riding this grant is honoured and a routine value never
+    /// pushes the routine beat later), and the grant's LABEL is NOT
+    /// learned. Learning is monotone-safe to skip; what it protects is the
+    /// ladder's qualification phase — a label learned just after a pass
+    /// (which is when a promotion happens) qualifies a whole pass later
+    /// than one the routine beat learns at its own phase, and the ladder
+    /// adopts the LAST learned pair. The routine beat stays the label
+    /// source; this renewal is pure carriage.
+    pub fn renewed_carriage(
+        &self,
+        epoch: u64,
+        t_self_ms: u64,
+        renew_ms: u64,
+        skew_max_ms: u64,
+        d_purge_ms: u64,
+        anchor_ms: u64,
+    ) {
+        self.epoch.store(epoch, Ordering::Release);
+        self.t_self_deadline_ms
+            .store(anchor_ms + t_self_ms, Ordering::Release);
+        self.renew_at_ms
+            .fetch_min(anchor_ms + renew_ms, Ordering::AcqRel);
+        self.renew_ms.store(renew_ms, Ordering::Release);
+        self.skew_max_ms.store(skew_max_ms, Ordering::Release);
+        self.d_purge_ms.store(d_purge_ms, Ordering::Release);
+    }
+
     /// §6.8 item 3: the label last learned from the owner and the
     /// member-clock instant it arrived — the acknowledgement ladder's two
     /// inputs. Label first (Acquire): observing a label pins its anchor.

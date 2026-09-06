@@ -6327,6 +6327,13 @@ pub struct Metrics {
     /// The refill horizon in force, ms (the `depth_target` publication
     /// precedent: the measured composition when hinted).
     pub alloc_lane_harvest_horizon_ms: Align64<AtomicU64>,
+    /// The capacity law, published (hold-time campaign): the blocks this
+    /// lane needs — `ceil(claim rate × refill horizon) + live` — against
+    /// its `cap/W` share, and the headroom `(share − needed) ÷ share` in
+    /// percent (saturating at 0). A lane exhausts exactly when the
+    /// headroom reaches 0. Last-sampled volume's, like the watermark.
+    pub alloc_lane_share_needed_blocks: Align64<AtomicU64>,
+    pub alloc_lane_headroom_pct: Align64<AtomicU64>,
     // DLM **S9** (spec §6.2 item 7's consumer half): the CO-WRITER mount
     // posture. All four are 0 on every shipped mount — the posture is
     // opt-in twice over (`SQUEEZEFS_MULTI_WRITER=1` +
@@ -11001,6 +11008,12 @@ impl SqueezefsFilesystem {
                     .load(Ordering::Relaxed),
                 "alloc_lane_harvest_horizon_ms": METRICS
                     .alloc_lane_harvest_horizon_ms
+                    .load(Ordering::Relaxed),
+                "alloc_lane_share_needed_blocks": METRICS
+                    .alloc_lane_share_needed_blocks
+                    .load(Ordering::Relaxed),
+                "alloc_lane_headroom_pct": METRICS
+                    .alloc_lane_headroom_pct
                     .load(Ordering::Relaxed),
                 // DLM S9 (spec §6.2 item 7's consumer half): the mount
                 // POSTURE and the co-writer ledger. `mount_posture` is the

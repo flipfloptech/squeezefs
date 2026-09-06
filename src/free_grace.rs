@@ -286,6 +286,24 @@ static CHECKPOINT_CYCLE_EWMA_NS: AtomicU64 = AtomicU64::new(0);
 /// residence at release, folded per harvest batch.
 static HOLD_EWMA_MS: AtomicU64 = AtomicU64::new(0);
 
+// -- the hold-time levers -----------------------------------------------------
+
+/// Lever (b): renewals a promotion triggered at once instead of waiting
+/// for the member's next beat (`free_grace_ack_renewals`, member-side).
+static ACK_RENEWALS: AtomicU64 = AtomicU64::new(0);
+/// Lever (d): `true` ⇔ a member whose recorded acknowledgement sat at or
+/// below the published bound has advanced it since the last recompute —
+/// the min MAY have moved. Set by the owner's renewal (one compare),
+/// consumed by the next harvest.
+static BOUND_DIRTY: AtomicBool = AtomicBool::new(false);
+/// Lever (d): recomputes the dirty mark triggered
+/// (`free_grace_bound_refreshes_on_ack`, ⊆ `free_grace_bound_refreshes`).
+static BOUND_REFRESHES_ON_ACK: AtomicU64 = AtomicU64::new(0);
+/// The measured cost of one O(members) minimum, EWMA in ns — the physical
+/// floor of the on-ack recompute's rate limit (a recompute may not run
+/// more than half the time).
+static BOUND_SCAN_EWMA_NS: AtomicU64 = AtomicU64::new(0);
+
 const HOLD_PHASES_N: usize = 4;
 /// The stage names, in loop order; the JSON keys of
 /// `free_grace_hold_phase_ns`.
@@ -562,12 +580,7 @@ pub fn publish_bound(min_acked: u64, members: usize) {
 /// Drop the entries of an owner-instant-ordered deque older than the
 /// routine fence bound — the longest an offset can be held, so nothing a
 /// future release could attribute to is ever dropped.
-fn prune_marks_front<T>(
-    deque: &mut VecDeque<T>,
-    at: impl Fn(&T) -> u64,
-    now: u64,
-    fence_ms: u64,
-) {
+fn prune_marks_front<T>(deque: &mut VecDeque<T>, at: impl Fn(&T) -> u64, now: u64, fence_ms: u64) {
     let horizon = now.saturating_sub(fence_ms);
     while deque.front().is_some_and(|e| at(e) < horizon) {
         deque.pop_front();
@@ -635,8 +648,9 @@ fn stamp_hold_phases(label: u64, released_at: u64) {
         HOLD_UNPLACED.fetch_add(1, Ordering::Relaxed);
         return;
     };
-    HOLD_PHASES[HOLD_MIN_ACKED_RELEASED]
-        .record(Duration::from_millis(released_at.saturating_sub(covered_at)));
+    HOLD_PHASES[HOLD_MIN_ACKED_RELEASED].record(Duration::from_millis(
+        released_at.saturating_sub(covered_at),
+    ));
     // The first checkpoint completed at or after the defer's own
     // millisecond (the dereference commit precedes the free through the
     // reclaim queue, so a cycle completing in that ms carries it).
@@ -648,8 +662,7 @@ fn stamp_hold_phases(label: u64, released_at: u64) {
     match checkpointed_at {
         Some(ck) if ck <= covered_at => {
             HOLD_PHASES[HOLD_DEFER_CHECKPOINTED].record(Duration::from_millis(ck - defer_at));
-            HOLD_PHASES[HOLD_CHECKPOINTED_MIN_ACKED]
-                .record(Duration::from_millis(covered_at - ck));
+            HOLD_PHASES[HOLD_CHECKPOINTED_MIN_ACKED].record(Duration::from_millis(covered_at - ck));
         }
         _ => {
             HOLD_UNPLACED.fetch_add(1, Ordering::Relaxed);
@@ -1072,7 +1085,6 @@ impl GraceRing {
         if self.len.load(Ordering::Acquire) == 0 {
             return Vec::new();
         }
-        let mut bound = bound();
         let (oldest, newest, runway) = {
             let guard = self.entries.lock();
             let ends = guard.front().zip(guard.back());
@@ -1131,6 +1143,13 @@ impl GraceRing {
         // pre-valve behaviour of this arm, reproduced rather than special-cased.
         let runway = if pressure { Some(0) } else { runway };
         note_pressure(runway, newest);
+        // Lever (d): a binding member's ack arrived since the last
+        // recompute — recompute now (rate-limited) rather than at the next
+        // floor beat. The bound is read AFTER both recompute arms (this one
+        // and `note_pressure`'s cadence arm), so a recompute this pass
+        // releases in THIS pass, not the next harvest's.
+        refresh_bound_on_dirty();
+        let mut bound = self::bound();
         let mut forced = false;
         if let Some(oldest) = oldest {
             if oldest > bound {
@@ -1346,12 +1365,78 @@ fn note_pressure(runway: Option<u64>, newest_label: u64) {
     // verbatim. The sweep stays as the idle-fleet backstop.
     let last = LAST_BOUND_REFRESH_MS.load(Ordering::Relaxed);
     if now.saturating_sub(last) >= cadence {
-        LAST_BOUND_REFRESH_MS.store(now, Ordering::Relaxed);
-        BOUND_REFRESHES.fetch_add(1, Ordering::Relaxed);
-        if let Some(owner) = crate::membership::installed_owner() {
-            owner.refresh_free_grace_bound();
-        }
+        recompute_bound(now);
     }
+}
+
+/// One rate-limited O(members) recompute of the published bound (L3's
+/// cadence arm and lever (d)'s dirty arm share it): stamps the refresh
+/// instant, counts the act, and folds the scan's own wall cost into the
+/// EWMA the dirty arm's floor reads.
+fn recompute_bound(now: u64) {
+    LAST_BOUND_REFRESH_MS.store(now, Ordering::Relaxed);
+    BOUND_REFRESHES.fetch_add(1, Ordering::Relaxed);
+    BOUND_DIRTY.store(false, Ordering::Relaxed);
+    if let Some(owner) = crate::membership::installed_owner() {
+        let t0 = std::time::Instant::now();
+        owner.refresh_free_grace_bound();
+        let inst = t0.elapsed().as_nanos().min(u64::MAX as u128) as u64;
+        let old = BOUND_SCAN_EWMA_NS.load(Ordering::Relaxed);
+        let ewma = if old == 0 {
+            inst
+        } else {
+            old.saturating_sub(old.div_ceil(4)) + inst / 4
+        };
+        BOUND_SCAN_EWMA_NS.store(ewma, Ordering::Relaxed);
+    }
+}
+
+/// **Lever (d), the owner's side of the ack**: called by
+/// `MembershipOwner::renew` when a member's recorded acknowledgement
+/// ADVANCED, with the value it advanced from. Only a member whose old
+/// value sat at or below the published bound can have been the minimum
+/// (or tied for it), so only those mark the bound dirty — one compare in
+/// the plane's hot op, never the O(members) scan (KD-FG-4's law stands:
+/// the scan runs on the harvest path, rate-limited).
+pub(crate) fn note_member_ack_advanced(previous_acked: u64) {
+    if !armed() || !refresh_on_ack_enabled() {
+        return;
+    }
+    if previous_acked <= bound() {
+        BOUND_DIRTY.store(true, Ordering::Relaxed);
+    }
+}
+
+/// **Lever (d), the harvest's side**: recompute the bound when the dirty
+/// mark is set, rate-limited to the floor the min can honestly change at
+/// — `ack_refresh_floor ÷ members` (each member's answer changes at most
+/// once per floor) — and never faster than twice the scan's own measured
+/// cost. A mark the limit defers stays set for the next harvest.
+fn refresh_bound_on_dirty() {
+    if !BOUND_DIRTY.load(Ordering::Relaxed) {
+        return;
+    }
+    let plane = PLANE.load();
+    let Some(plane) = plane.as_ref() else {
+        return;
+    };
+    let now = plane.clock.now_ms();
+    let floor_ms = plane
+        .prod
+        .as_ref()
+        .map(|p| p.floor_ms)
+        .unwrap_or(plane.reading_ttl_ms)
+        .max(1);
+    let members = MEMBERS.load(Ordering::Relaxed).max(1);
+    let scan_ms = BOUND_SCAN_EWMA_NS
+        .load(Ordering::Relaxed)
+        .div_ceil(1_000_000);
+    let interval = (floor_ms / members).max(scan_ms.saturating_mul(2));
+    if now.saturating_sub(LAST_BOUND_REFRESH_MS.load(Ordering::Relaxed)) < interval {
+        return;
+    }
+    BOUND_REFRESHES_ON_ACK.fetch_add(1, Ordering::Relaxed);
+    recompute_bound(now);
 }
 
 /// The tightened renewal cadence to grant `acked_free_epoch`'s member, and
@@ -1942,6 +2027,17 @@ pub fn reader_pass_completed(pass_start_ms: u64, advanced: bool) -> Option<u64> 
     });
     if let Some(label) = out {
         session.ack_free_epoch(label);
+        // Lever (b): the acknowledgement carries itself home NOW — the
+        // renewal loop is woken instead of sleeping out the rest of its
+        // beat (the T5 carry term becomes one round trip). The renewal
+        // re-anchors the beat, so the lease lane sees at most one extra
+        // renewal per promotion, and a promotion happens at most once per
+        // pass. Renewing early is always safe under §6.7 (T_self bounds
+        // NOT renewing).
+        if ack_renewal_enabled() {
+            crate::membership::request_renewal_now();
+            ACK_RENEWALS.fetch_add(1, Ordering::Relaxed);
+        }
         log::debug!(
             "freed-offset acknowledgement: this reader has FINISHED with everything freed at or \
              before label {label} (an epoch-step purge ran after the label was learned, and the \
@@ -1949,6 +2045,90 @@ pub fn reader_pass_completed(pass_start_ms: u64, advanced: bool) -> Option<u64> 
         );
     }
     out
+}
+
+/// The `SQUEEZEFS_FREE_GRACE_ACK_RENEWAL` lever's latch (the
+/// `ACK_PIPELINE` pattern): lever (b), a promotion wakes the renewal loop.
+static ACK_RENEWAL: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+pub fn ack_renewal_enabled() -> bool {
+    match ACK_RENEWAL.load(Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            let on = crate::env_knobs::bool_knob("SQUEEZEFS_FREE_GRACE_ACK_RENEWAL", true);
+            ACK_RENEWAL.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+            on
+        }
+    }
+}
+
+/// Test seam (the `test_set_ack_pipeline` shape).
+pub fn test_set_ack_renewal(on: Option<bool>) {
+    ACK_RENEWAL.store(
+        match on {
+            Some(true) => 1,
+            Some(false) => 2,
+            None => 0,
+        },
+        Ordering::Relaxed,
+    );
+}
+
+/// Test seam: `true` ⇔ a preset was in force.
+pub fn test_clear_ack_renewal() -> bool {
+    ACK_RENEWAL.swap(0, Ordering::Relaxed) != 0
+}
+
+/// Lever (b)'s engagement (`free_grace_ack_renewals`, member-side).
+pub fn ack_renewals() -> u64 {
+    ACK_RENEWALS.load(Ordering::Relaxed)
+}
+
+/// The `SQUEEZEFS_FREE_GRACE_REFRESH_ON_ACK` lever's latch: lever (d), a
+/// binding member's advancing acknowledgement marks the bound dirty and
+/// the next harvest recomputes it.
+static REFRESH_ON_ACK: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+fn refresh_on_ack_enabled() -> bool {
+    match REFRESH_ON_ACK.load(Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            let on = crate::env_knobs::bool_knob("SQUEEZEFS_FREE_GRACE_REFRESH_ON_ACK", true);
+            REFRESH_ON_ACK.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+            on
+        }
+    }
+}
+
+/// Test seam (the `test_set_ack_pipeline` shape).
+pub fn test_set_refresh_on_ack(on: Option<bool>) {
+    REFRESH_ON_ACK.store(
+        match on {
+            Some(true) => 1,
+            Some(false) => 2,
+            None => 0,
+        },
+        Ordering::Relaxed,
+    );
+}
+
+/// Test seam: `true` ⇔ a preset was in force.
+pub fn test_clear_refresh_on_ack() -> bool {
+    REFRESH_ON_ACK.swap(0, Ordering::Relaxed) != 0
+}
+
+/// Lever (d)'s engagement (`free_grace_bound_refreshes_on_ack`, ⊆
+/// `free_grace_bound_refreshes`).
+pub fn bound_refreshes_on_ack() -> u64 {
+    BOUND_REFRESHES_ON_ACK.load(Ordering::Relaxed)
+}
+
+/// The measured O(members) scan cost, ms (`free_grace_bound_scan_ms`; 0
+/// until the first recompute).
+pub fn bound_scan_ms() -> u64 {
+    BOUND_SCAN_EWMA_NS.load(Ordering::Relaxed) / 1_000_000
 }
 
 // ---------------------------------------------------------------------------
@@ -2196,6 +2376,8 @@ pub fn stats_snapshot() -> serde_json::Value {
                 // the cadence in force.
                 "free_grace_pass_prods": pass_prods(),
                 "free_grace_pass_interval_ms": pass_interval_ms(),
+                // Lever (b): promotions that carried themselves home.
+                "free_grace_ack_renewals": ack_renewals(),
             });
         }
         return serde_json::json!({ "free_grace_mode": "off" });
@@ -2249,6 +2431,9 @@ pub fn stats_snapshot() -> serde_json::Value {
         "free_grace_checkpoint_cycle_ms": checkpoint_cycle_ms(),
         "free_grace_member_ack_lag_ms": member_ack_lag_json(),
         "free_grace_member_ack_lag_census": member_ack_lag_census_json(),
+        // Lever (d)'s engagement and the scan cost its rate limit floors on.
+        "free_grace_bound_refreshes_on_ack": bound_refreshes_on_ack(),
+        "free_grace_bound_scan_ms": bound_scan_ms(),
     })
 }
 
@@ -2257,7 +2442,12 @@ pub fn stats_snapshot() -> serde_json::Value {
 /// plus the member count; all 0 with no owner or no members.
 fn member_ack_lag_json() -> serde_json::Value {
     let lags: Vec<u64> = crate::membership::installed_owner()
-        .map(|o| o.member_ack_lags().into_iter().map(|(_, lag)| lag).collect())
+        .map(|o| {
+            o.member_ack_lags()
+                .into_iter()
+                .map(|(_, lag)| lag)
+                .collect()
+        })
         .unwrap_or_default();
     let n = lags.len() as u64;
     serde_json::json!({
@@ -2324,9 +2514,15 @@ pub fn reset_for_test() {
         &CHECKPOINT_CYCLE_EWMA_NS,
         &HOLD_UNPLACED,
         &HOLD_EWMA_MS,
+        &ACK_RENEWALS,
+        &BOUND_REFRESHES_ON_ACK,
+        &BOUND_SCAN_EWMA_NS,
     ] {
         c.store(0, Ordering::Relaxed);
     }
+    BOUND_DIRTY.store(false, Ordering::Relaxed);
+    test_set_ack_renewal(None);
+    test_set_refresh_on_ack(None);
     test_set_demand(None);
     test_set_pass_elastic(None);
     RESIDENCE_MS.reset();

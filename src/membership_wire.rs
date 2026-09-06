@@ -572,6 +572,23 @@ impl MemberClient {
         Ok(())
     }
 
+    /// The CARRIAGE renewal (hold-time lever (b)): the same verb, the same
+    /// frame — the acknowledgement rides it now instead of at the beat —
+    /// adopted through [`MemberSession::renewed_carriage`] (lease renewed,
+    /// prod honoured; beat and label left to the routine renewal).
+    pub async fn renew_carriage(&mut self) -> Result<()> {
+        let anchor = self.clock.now_ms();
+        let body = encode(&RenewFrame {
+            id: self.id.clone(),
+            epoch: self.session.epoch(),
+            acked_free_epoch: self.session.acked_free_epoch(),
+        })?;
+        let reply = self.rpc.call(VERB_MEMBERSHIP_RENEW, body).await?;
+        let grant = Self::grant_or_error(reply, "renew")?;
+        self.session.renewed_carriage(&grant, anchor);
+        Ok(())
+    }
+
     /// One census page (`limit` clamped owner-side to
     /// [`CENSUS_PAGE_MAX`]).
     pub async fn census(

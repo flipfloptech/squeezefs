@@ -367,6 +367,12 @@ pub struct BlockAllocator {
     /// `ceil(rate × horizon)` capped at lane-share/4 — derived, never a
     /// knob (the A/B lever disarms the mechanism, not the number).
     harvest_watermark: AtomicU64,
+    /// The capacity law's two published faces (hold-time campaign):
+    /// `share_needed = ceil(rate × horizon) + live` and the headroom
+    /// percentage against this lane's share; re-derived with the
+    /// watermark at every rate sample.
+    share_needed_blocks: AtomicU64,
+    headroom_pct: AtomicU64,
     /// DLM **S9** blocker #3: this volume's **allocation partition**
     /// ([`crate::data_alloc_lane`]) — `None` on every mount today AND on
     /// every solo mount forever, which is what makes single-writer
@@ -586,6 +592,8 @@ impl BlockAllocator {
             rate_last_claims: AtomicU64::new(0),
             rate_mblk_per_s: AtomicU64::new(0),
             harvest_watermark: AtomicU64::new(0),
+            share_needed_blocks: AtomicU64::new(0),
+            headroom_pct: AtomicU64::new(0),
             lanes: std::sync::OnceLock::new(),
         })
     }
@@ -1823,17 +1831,47 @@ impl BlockAllocator {
         // blocks = (milli-blocks/s × ms) / 1e6; ceil so a slow-but-live
         // writer keeps a nonzero watermark. A zero rate derives zero.
         let horizon = self.harvest_horizon_ms();
-        let want = if ewma == 0 {
+        let inflight = if ewma == 0 {
             0
         } else {
-            ewma.saturating_mul(horizon)
-                .div_ceil(1_000_000)
-                .min(share / 4)
+            ewma.saturating_mul(horizon).div_ceil(1_000_000)
         };
+        let want = inflight.min(share / 4);
         self.harvest_watermark.store(want, Ordering::Relaxed);
-        crate::fuse_client::METRICS
-            .alloc_lane_harvest_watermark
+        let m = &crate::fuse_client::METRICS;
+        m.alloc_lane_harvest_watermark
             .store(want, Ordering::Relaxed);
+        // The capacity law (hold-time campaign): the lane holds `live`
+        // blocks in use (its share less what is reachable here or owed
+        // back from the authority) and needs `churn × hold` more in flight
+        // through the grace loop; it exhausts exactly when the sum exceeds
+        // the share — the headroom is the published distance from that.
+        let live = share.saturating_sub(self.lane_reachable_blocks() + self.lane_owed_blocks());
+        let needed = inflight.saturating_add(live);
+        let headroom_pct = if share == 0 {
+            0
+        } else {
+            share.saturating_sub(needed).saturating_mul(100) / share
+        };
+        self.share_needed_blocks.store(needed, Ordering::Relaxed);
+        self.headroom_pct.store(headroom_pct, Ordering::Relaxed);
+        m.alloc_lane_share_needed_blocks
+            .store(needed, Ordering::Relaxed);
+        m.alloc_lane_headroom_pct
+            .store(headroom_pct, Ordering::Relaxed);
+    }
+
+    /// The blocks this lane needs to sustain its churn through the grace
+    /// loop plus what it holds live (`alloc_lane_share_needed_blocks`;
+    /// 0 unpartitioned).
+    pub fn lane_share_needed_blocks(&self) -> u64 {
+        self.share_needed_blocks.load(Ordering::Relaxed)
+    }
+
+    /// `(share − needed) ÷ share` in percent, saturating at 0
+    /// (`alloc_lane_headroom_pct`; 0 unpartitioned).
+    pub fn lane_headroom_pct(&self) -> u64 {
+        self.headroom_pct.load(Ordering::Relaxed)
     }
 
     /// The derived watermark in force (blocks).

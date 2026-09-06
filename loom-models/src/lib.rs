@@ -3397,6 +3397,132 @@ mod models {
         });
     }
 
+    /// The futex hash bucket the cqe strand models below share: FUTEX_WAIT
+    /// reads the word and enqueues under the bucket lock; FUTEX_WAKE takes
+    /// the same lock and delivers only to a QUEUED sleeper (a wake paid
+    /// before the sleeper queued is lost — real futex semantics, which the
+    /// one-shot witnesses of the older models under-model).
+    struct FutexBucket {
+        queued: bool,
+        expected: u32,
+    }
+
+    /// FUTEX_WAKE toward the bucket, folded with the reap loop's post-wake
+    /// re-check: a delivered wake whose seq still equals the sleeper's
+    /// snapshot is SPURIOUS — the reaper re-checks `seq == expected` and
+    /// re-waits, so it stays queued (the pessimistic immediate re-wait; a
+    /// bump landing between the wake and the re-wait could only free it
+    /// sooner). A wake with the seq moved frees it for good.
+    fn futex_wake_folded(cqe: &ipc_cqe_core::CqeDoorbell, bucket: &loom::sync::Mutex<FutexBucket>) {
+        let mut g = bucket.lock().unwrap();
+        if g.queued && cqe.seq_word().fetch_add(0, Ordering::SeqCst) != g.expected {
+            g.queued = false;
+        }
+    }
+
+    /// Latch arm, the REAPED-PRIOR-COMPLETION shape (2026-09-06,
+    /// `.benchmarks/2026-09-06-cqe-doorbell-lost-wake.md`). The v3 era
+    /// argument assumed every completion whose seq bump the parker's
+    /// snapshot absorbs is FOUND by the parker's post-registration scan —
+    /// true only for ops in the parker's PENDING SET. The daemon publishes
+    /// a slot's DONE first and bumps the doorbell after, so a reaper that
+    /// consumed an op off its slot word in that gap (or a sync-lane op on
+    /// the same session) leaves a completion whose bump has nothing for the
+    /// scan to find: the bump is absorbed by the snapshot (admission
+    /// passes), yet its mark-passed CAS landed AFTER the v3 parker-side
+    /// latch clear — it wins the era's one wake toward a parker not yet
+    /// queued (lost), and the parker's REAL completion collapses. The
+    /// parker sleeps to its age bound.
+    ///
+    /// Two completers: D1 = the prior (already reaped) op's doorbell
+    /// completion, D2 = the pending op's serve + DONE + doorbell. One k=1
+    /// parker with the real client's shape: register-then-snapshot →
+    /// pending re-scan → FUTEX_WAIT under the bucket lock. Strand = the
+    /// parker is still queued after both completers finished.
+    #[test]
+    fn ipc_cqe_latched_reaped_prior_completion_never_strands() {
+        loom::model(|| {
+            let prior = Arc::new(ipc_slot_core::SlotCore::new());
+            let op = Arc::new(ipc_slot_core::SlotCore::new());
+            let cqe = Arc::new(ipc_cqe_core::CqeDoorbell::new());
+            let bucket = Arc::new(loom::sync::Mutex::new(FutexBucket {
+                queued: false,
+                expected: 0,
+            }));
+
+            // Sequential prologue: the PRIOR op ran its whole slot life —
+            // served, DONE-published, observed and reaped by the client —
+            // with only its doorbell completion outstanding on the daemon
+            // thread (the daemon publishes DONE, THEN bumps; the reaper saw
+            // DONE in that gap). Then the op the reaper parks for.
+            let gen_p = prior.try_claim().expect("prior claims");
+            prior.publish_submitted();
+            assert!(prior.try_begin_serve(), "prior serves");
+            let _ = prior.complete();
+            assert!(prior.is_done_for(gen_p), "prior DONE observed");
+            prior.release();
+            let gen = op.try_claim().expect("op claims");
+            op.publish_submitted();
+
+            // D1: the reaped prior op's outstanding doorbell completion.
+            let d1 = {
+                let cqe = Arc::clone(&cqe);
+                let bucket = Arc::clone(&bucket);
+                thread::spawn(move || {
+                    if matches!(cqe.complete(true), ipc_cqe_core::CompleteOutcome::Wake) {
+                        futex_wake_folded(&cqe, &bucket);
+                    }
+                })
+            };
+            // D2: serve the pending op, DONE-publish, doorbell.
+            let d2 = {
+                let op = Arc::clone(&op);
+                let cqe = Arc::clone(&cqe);
+                let bucket = Arc::clone(&bucket);
+                thread::spawn(move || {
+                    assert!(op.try_begin_serve(), "submitted op must serve");
+                    let _slot_waiter = op.complete();
+                    if matches!(cqe.complete(true), ipc_cqe_core::CompleteOutcome::Wake) {
+                        futex_wake_folded(&cqe, &bucket);
+                    }
+                })
+            };
+
+            // Reaper: register-then-snapshot → mandatory re-scan (only the
+            // pending op is in the set — the prior was reaped) → FUTEX_WAIT
+            // admission under the bucket lock (kernel-strength read).
+            let expected = cqe.park_begin();
+            let scan_found = op.is_done_for(gen);
+            let mut admitted = false;
+            if !scan_found {
+                let mut g = bucket.lock().unwrap();
+                if cqe.seq_word().fetch_add(0, Ordering::SeqCst) == expected {
+                    g.queued = true;
+                    g.expected = expected;
+                    admitted = true;
+                }
+            }
+            d1.join().unwrap();
+            d2.join().unwrap();
+            if admitted {
+                let g = bucket.lock().unwrap();
+                assert!(
+                    !g.queued,
+                    "latched cqe strand: reaper queued on snapshot {expected}, both \
+                     completions applied (seq {}), and no wake reached it — the \
+                     era's one wake was consumed toward a parker not yet asleep \
+                     (parked {}, wake_at {}, latch {})",
+                    cqe.seq(),
+                    cqe.parked(),
+                    cqe.wake_at(),
+                    cqe.wake_paid(),
+                );
+            }
+            cqe.park_end();
+            assert!(op.is_done_for(gen), "the op completed exactly once");
+        });
+    }
+
     /// IPC wake composition (`ipc_wake_core`, §5.3 protocol rule 3):
     /// the SHIPPED `wake_core::WakeCoalescer` composed with the SHIPPED
     /// `ipc_ring_core` publication, exactly as the session doorbell wires

@@ -711,7 +711,13 @@ async fn unparked_completions_elide_cqe_wakes() {
 /// client parks on the session's cqe doorbell (reaper_parked + seq
 /// snapshot, the disarm→scan law), a completion bumps the seq and pays
 /// exactly one wake (`ipc_cqe_wake_writes` moves), and the parked
-/// thread returns well inside the 5 s bound.
+/// thread returns well inside 2 s.
+///
+/// The wait bound is 30 s ON PURPOSE (2026-09-06,
+/// `.benchmarks/2026-09-06-cqe-doorbell-lost-wake.md`): the former 1 s
+/// bound MASKED a lost wake — a stranded reaper woke on its own timeout
+/// at ≈ 1 s, inside the 2 s assert. A lost wake now sleeps here for 30 s
+/// and fails the assert; the bound is never the mechanism.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn parked_reaper_is_woken_by_completion_cqe_wake() {
     let _serial = serial().await;
@@ -724,7 +730,10 @@ async fn parked_reaper_is_woken_by_completion_cqe_wake() {
     let dir = tempfile::tempdir().unwrap();
     let fd = buffered_standin(&fx, &dir, "standin.bin", ino);
     let (session, binding) = ClientSession::establish(&fx, &fd);
-    // Warm (first op may demote).
+    // Warm (first op may demote). The warm op is consumed off its SLOT
+    // word — its doorbell completion may still be outstanding on the
+    // daemon thread when the park below begins: exactly the reaped-prior
+    // shape the v3 flag latch stranded on.
     tokio::task::block_in_place(|| {
         let r = session.ring_pread_spin(binding, 0, 4096);
         assert_eq!(r, 4096);
@@ -732,8 +741,8 @@ async fn parked_reaper_is_woken_by_completion_cqe_wake() {
 
     let writes0 = METRICS.ipc_cqe_wake_writes.load(Ordering::Relaxed);
     let woke_in = tokio::task::block_in_place(|| {
-        // Reaper protocol, client side: submit WITHOUT spinning on the
-        // slot, then park on the cqe doorbell.
+        // Reaper protocol, client side (the shim's reap loop shape):
+        // submit WITHOUT spinning on the slot, park on the cqe doorbell.
         let header = session.header();
         let slot = session.slot(0);
         let gen = slot.core.try_claim().expect("slot 0 FREE");
@@ -748,46 +757,60 @@ async fn parked_reaper_is_woken_by_completion_cqe_wake() {
         // Park intent FIRST (the daemon observes it before serving),
         // then snapshot (park_begin = register-then-snapshot), then
         // publish the op.
-        let seq0 = header.cqe.park_begin();
+        let mut expected = header.cqe.park_begin();
         slot.core.publish_submitted();
         assert!(session.ring().push(0), "ring must accept");
         header.doorbell.fetch_add(1, Ordering::Release);
         futex_wake(&header.doorbell, 1);
-        // Bounded futex wait on the cqe word (no slot spin): a lost wake
-        // strands this for the full 5 s bound and fails the ≤ 2 s assert.
         let t0 = Instant::now();
-        let deadline = t0 + Duration::from_secs(5);
-        while header.cqe.seq() == seq0 {
+        loop {
+            // The mandatory post-registration re-scan of the pending set
+            // (this one op) before sleeping — the disarm→scan law.
+            if slot.core.is_done_for(gen) {
+                header.cqe.park_end();
+                break;
+            }
             assert!(
-                Instant::now() < deadline,
+                t0.elapsed() < Duration::from_secs(40),
                 "parked reaper never woken by the completion"
             );
             squeezefs::ipc_host::futex_wait_for_test(
                 header.cqe.seq_word(),
-                seq0,
-                Duration::from_secs(1),
+                expected,
+                Duration::from_secs(30),
             );
+            // Every return (wake, EAGAIN, timeout) deregisters; a return
+            // with nothing to reap is a spurious wake — a NEW park era,
+            // as the shim re-parks.
+            header.cqe.park_end();
+            if slot.core.is_done_for(gen) {
+                break;
+            }
+            expected = header.cqe.park_begin();
         }
-        header.cqe.park_end();
-        // Consume the completion.
-        let cdl = Instant::now() + Duration::from_secs(5);
-        while !slot.core.is_done_for(gen) {
-            assert!(Instant::now() < cdl, "op never completed");
-            std::hint::spin_loop();
-        }
+        let woke_in = t0.elapsed();
         let r = slot.result();
         slot.core.release();
         assert_eq!(r, 4096);
-        t0.elapsed()
+        // The daemon counts the wake AFTER the seq bump the reaper woke
+        // on (program order: bump → gate → count → FUTEX_WAKE), so a
+        // reaper that observed the bump without sleeping can read the
+        // counter before the increment lands — wait for the bookkeeping,
+        // bounded; the law is that it lands, not when.
+        let cdl = Instant::now() + Duration::from_secs(2);
+        while METRICS.ipc_cqe_wake_writes.load(Ordering::Relaxed) <= writes0 {
+            assert!(
+                Instant::now() < cdl,
+                "a completion toward a parked reaper must pay (and count) a cqe wake"
+            );
+            std::hint::spin_loop();
+        }
+        woke_in
     });
     assert!(
         woke_in < Duration::from_secs(2),
         "parked reaper took {woke_in:?} to observe the completion — the cqe \
          wake path must be prompt, not timeout-bounded"
-    );
-    assert!(
-        METRICS.ipc_cqe_wake_writes.load(Ordering::Relaxed) > writes0,
-        "a completion toward a parked reaper must pay (and count) a cqe wake"
     );
     fx.shutdown();
 

@@ -1,0 +1,50 @@
+== 19:31:30 fleet create load=4.69 21.17 22.51 cpus=32 env=[default]
+55   cowriter /mnt/sqz-mwfleet/m55     549673 up        -
+56   cowriter /mnt/sqz-mwfleet/m56     549831 up        -
+57   cowriter /mnt/sqz-mwfleet/m57     549985 up        -
+== 19:31:42 s11-mpiio
+[mwmatrix] s11-mpiio: 8 co-writer mounts x 4 procs = 32 ranks, ONE shared file, 4 MiB-aligned block-cyclic segments (ior 4.0.0 POSIX MPMD, -G 909395243); baseline = -F file-per-proc, SAME fleet/geometry; A-B-B-A
+[mwmatrix] instrument: ior 4.0.0 (sha256 510b7d4ad0f287375848121aa5a1f9842db077c1d81ad0dde738e96255298158) + mpirun (Open MPI) 5.0.10; substrate: tcp devsub (nvmet-tcp localhost)
+[mwmatrix] self-sizer wanted 43520 MiB — CAPPED to 10240 MiB (s=80): the 10 GiB zram-budget clamp (the indirect domain COMPOSES now — the rung-20 blob-aware owner-side merge; this cap is substrate budget, not a correctness boundary). Iteration ceiling raised to 128 to preserve the sustained window.
+[mwmatrix] probe: 1981.18 MiB/s aggregate -> file 10240 MiB (s=80), 15 iterations/phase (sustained window sized >=60 s + >=3 steady iterations)
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+[mwmatrix] ERROR: ior invocation failed (rc=0 — full output in /run/squeezefs-mwfleet/rows/s11mpiio-1788651102/A1.out)
+matrix rc=1
+== 19:51:52 capture
+/tmp/five/d4/run-keep.sh: line 19: 552172 Killed                     cat "$m/.stats" > "$KEEP/$n.stats.json" 2> /dev/null
+m0.log
+m0.stats.json
+m50.log
+m50.probe.log
+m50.stats.json
+m51.log
+m51.probe.log
+m51.stats.json
+m52.log
+m52.probe.log
+m52.stats.json
+m53.log
+m53.probe.log
+m53.stats.json
+m54.log
+m54.probe.log
+m54.stats.json
+m55.log
+m55.probe.log
+m55.stats.json
+m56.log
+m56.probe.log
+m56.stats.json
+m57.log
+m57.probe.log
+m57.stats.json
+matrix.log
+rows
+== 20:13:26 teardown
+[mwfleet] WARN: RESIDUE: nvmet subsystem nqn.2026-07.io.squeezefs:devsubtcpmwfleet-oss1 survived
+[mwfleet] ERROR: teardown left residue (see WARN lines above)
+== done rc=1 keep=/tmp/five/d4/keep-193130

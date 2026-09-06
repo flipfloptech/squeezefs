@@ -241,7 +241,63 @@ fixed binary's). Red: `the_residence_histogram_resets_with_the_plane`
 and exact words together — called by the seam (`39bdf9e6`). Product
 behavior unchanged (no production reset path exists).
 
-## 6. Fleet acceptance — OWED (attempted 2026-09-05, blocked by the box)
+## 6. Fleet acceptance — RUN 2026-09-05 (post-reboot): **NOT MET — finding 15 reproduces, plus a co-writer wedge**
+
+Two from-zero runs on the restored 32-CPU box (`19a651ea`, release; fleet
+`SQZ_MWFLEET_OSS_GB=32 SQZ_MWFLEET_RANGE_CUSTODY=1 … --cowriters=8`, then
+`tests/run_mw_matrix.sh s11-mpiio`), both identical in outcome; evidence
+(all nine daemon logs, every mount's `.stats` at the wedge, the ior
+output) in `.benchmarks/rows-d4-s11-20260905/`.
+
+* Probe **1,751 MiB/s** aggregate (well above the ≥ 750 floor; 26-CPU
+  caveat gone). File sized 10 GiB (the zram-budget clamp), 13 iterations.
+* **Phase A1 fails at 23 s**: `WARNING: fsync(15) failed` on 5 ranks; the
+  matrix declares the invocation failed. Chronology on m57 (worst): 13 s
+  after arm a fencing-token refusal on a write to the shared file
+  (`Lock expired or invalid fencing token: …366 (expected ≥ …367)`), 4 s
+  later `rewrite epoch for ino 2 FENCED at close … acked un-fsynced
+  rewrite bytes discard with the fenced era`, then the authority
+  refusing shipped frees as `already free/graced/quarantined` (the
+  double-release lineage — 174–252 refusals PER co-writer), then at 23 s
+  **`data volume 'nvme4n1' full: 8183 of 8192 blocks allocated — lane 6 of
+  16 is exhausted while 0 free block(s) belong to lanes this mount does
+  not own`** on every co-writer (m57: 2,366 refusals). This is the
+  08-25 note's signature verbatim (`2026-08-25-s11-freeloop-stall.md`:
+  m53 856 / m57 1,185 refusals, `8179 of 8192`): **the sustain levers
+  landed 08-25 (PRs 1–4) were never fleet-tested, and the row says they
+  do not close finding 15.** The authority at the wedge:
+  `free_grace_bound_tightenings` 280,447, `free_grace_demand_waits`
+  88,082, `free_grace_prods` 992, `deferrals` 26,395 / `releases` 26,121
+  / `offsets` 274 — the valve saturated and the loop still lost to the
+  churn (1.75 GiB/s of CoW displacement against 16 lanes of 4 GiB).
+* **A second, first-class finding — the co-writers WEDGE.** Five of eight
+  co-writers parked writes past station `route-dispatched` (m57: 37,024
+  watchdog reports, 100 writes to ino 2 in flight for 30 min); `write-
+  phase census … parked in phase entry` ×11,866 and `lock-wait census:
+  block/write_checkout … stripe genuinely held — hunt the holder` ×1,044
+  per block; m57's FUSE connection sat at `waiting=135`, a `cat .stats`
+  blocked in uninterruptible sleep for 30 min, and only the fleet
+  teardown's connection abort freed it. An ENOSPC'd write on a co-writer
+  lane must FAIL (the ENOSPC-not-corruption ruling — `StorageFull` is a
+  refusal), not park indefinitely holding the block stripe lock and its
+  write-pipeline in-flight budget; the park is what turns a full lane
+  into a dead mount. Load-dependent hangs are first-class product bugs
+  (AGENTS): this one has a deterministic repro (two of two).
+
+**Disposition.** D-4's product deliverable (the harness + seam fix) stays
+landed; the sustain design's Status goes back to **"Implemented — fleet
+acceptance NOT MET"**. Two follow-on items, in priority order:
+(1) **the co-writer ENOSPC wedge** — red-first: a co-writer whose lane is
+exhausted must return ENOSPC to the writer promptly, release the stripe
+lock and the pipeline permit, and keep the mount responsive (the fleet
+repro is `rows-d4-s11-20260905/`; an in-process repro needs a full-lane
+allocator on a co-writer posture); (2) **finding 15 proper** — either the
+loop's release latency (the design's §3 terms, now measurable on this
+fleet with the PR-1 instruments) or the capacity law (a lane of
+`cap/W` must hold the churn × release-latency product — the operator page
+must say so with the numbers), adjudicated on this venue from zero.
+
+### Prior attempt (2026-09-05 15:33, pre-reboot — blocked by the box)
 
 **Attempt 2026-09-05 15:33 (dev box, `perf/five` stack `d551f1ba`):**
 `sudo SQZ_MWFLEET_OSS_GB=32 SQZ_MWFLEET_RANGE_CUSTODY=1 tests/mw_fleet.sh

@@ -1320,6 +1320,19 @@ mod tests {
     use rand_chacha::ChaCha8Rng;
     use std::collections::BTreeMap;
     use std::sync::atomic::Ordering;
+    use std::sync::{Mutex, MutexGuard};
+
+    /// `META_KV_DELTA_ORPHANS` is process-global; the tests that assert a
+    /// before/after delta on it must not run concurrently with each other
+    /// (the bench-harness smoke runs this module in parallel — one
+    /// producer's +1 landed inside another test's "+0" window).
+    static ORPHAN_COUNTER_TESTS: Mutex<()> = Mutex::new(());
+
+    fn orphan_counter_guard() -> MutexGuard<'static, ()> {
+        ORPHAN_COUNTER_TESTS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
 
     /// Deterministic, field-distinct inode value for a test seed.
     fn iv(seed: u64) -> InodeValue {
@@ -1878,6 +1891,7 @@ mod tests {
 
     #[test]
     fn fold_tombstone_shadows_older_records_in_both_scan_shapes() {
+        let _serialized = orphan_counter_guard();
         let orphans_before = META_KV_DELTA_ORPHANS.load(Ordering::Relaxed);
 
         // Tombstone newest: shadows the older Put.
@@ -1955,6 +1969,7 @@ mod tests {
 
     #[test]
     fn fold_delta_without_base_is_a_counted_absent() {
+        let _serialized = orphan_counter_guard();
         let before = META_KV_DELTA_ORPHANS.load(Ordering::Relaxed);
         let recs = [dtimes(9, 90, 99), dtimes(5, 50, 55)];
         let folded = fold(&recs).expect("Δ-without-base folds to absent, not an error (§4.2)");
@@ -2010,6 +2025,7 @@ mod tests {
 
     #[test]
     fn compact_fold_emits_one_folded_put_or_nothing_per_key() {
+        let _serialized = orphan_counter_guard();
         // Delta + base ⇒ one folded Put carrying the newest seq.
         let recs = [dtimes(5, 50, 55), put(2, &iv(1))];
         let group: Vec<RecordRef<'_>> = recs.iter().map(|r| r.record_ref()).collect();

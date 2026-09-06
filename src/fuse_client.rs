@@ -7754,7 +7754,7 @@ pub struct Metrics {
     /// Wake-economy campaign L1 (design-il-wake-economy; instruments-
     /// first — the mechanism lands with the PR 2 wake-collapse latch):
     /// mark-passed completions toward a parked reaper whose FUTEX_WAKE
-    /// the per-era `wake_paid` latch elided. Extends the gauge's
+    /// the per-era `wake_paid_mark` latch elided. Extends the gauge's
     /// denominator to `writes/(writes+elided+collapsed)` (≤ 0.25 at
     /// 32×8 is the G2 target); structurally 0 until PR 2 lands and on
     /// `SQUEEZEFS_IPC_CQE_WAKE_LATCH=0` mounts.

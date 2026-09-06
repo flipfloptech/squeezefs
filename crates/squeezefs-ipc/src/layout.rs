@@ -61,6 +61,16 @@ use std::sync::atomic::{AtomicI64, AtomicU32, AtomicU64, Ordering};
 /// shim-side counters (`il_submit_harvested` / `il_park_eras` /
 /// `il_slot_reroutes` — the PR 3 scout's decision-gate instrument rides
 /// this bump because a bump-free PR cannot carry a page field).
+/// v6, revised 2026-09-06 WITHOUT a bump: the [`CqeDoorbell`]'s latch
+/// word became MARK-VALUED (`wake_paid_mark` — the mark the era's paid
+/// wake satisfied, initialised to a non-mark sentinel, never written by
+/// the client; the 0/1 flag with its parker-side clear stranded a parker
+/// whose snapshot absorbed an already-reaped op's late doorbell
+/// completion — `.benchmarks/2026-09-06-cqe-doorbell-lost-wake.md`).
+/// No layout change (16 bytes at the same header line, every offset
+/// unchanged); the skew guard for the word's meaning is KD-7 build-commit
+/// equality at HELLO, which already refuses a mixed pair — the coarse
+/// number moves for structure only.
 pub const IPC_ABI: u32 = 6;
 
 /// Session mapping magic: `SQZIPC01` little-endian.

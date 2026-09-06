@@ -68,6 +68,37 @@
 //! Weakening evidence re-verified 2026-08-08 with the batch model
 //! (`ipc_cqe_batch_parked_reaper_never_stranded`).
 //!
+//! ## Wake-collapse latch (wake-economy 2026-08-14; mark-valued since 2026-09-06)
+//!
+//! Under the latch arm a park era pays ONE `FUTEX_WAKE`: the first
+//! mark-passed completion pays, later ones `Collapsed`. The v3 latch was
+//! a per-era 0/1 flag cleared by `park_begin` — and its era argument
+//! assumed every completion whose bump the parker's snapshot absorbs is
+//! FOUND by the parker's post-registration scan. That holds only for ops
+//! in the parker's pending set: the daemon publishes a slot's DONE and
+//! bumps this doorbell AFTER, so an op the reaper consumed off its slot
+//! word in that gap (or a sync-lane op sharing the session) bumps with
+//! nothing left to scan. Its bump is absorbed by the snapshot (admission
+//! passes), yet its CAS could land after the clear — winning the era's
+//! one wake toward a parker not yet asleep (lost) — and the parker's real
+//! completion collapsed: a strand to the age bound
+//! (`ipc_cqe_latched_reaped_prior_completion_never_strands`,
+//! `.benchmarks/2026-09-06-cqe-doorbell-lost-wake.md`).
+//!
+//! The latch is therefore MARK-VALUED: `wake_paid_mark` records the mark
+//! the era's paid wake satisfied, and a mark-passed completion collapses
+//! iff the recorded pay was for the mark it just read. A pre-snapshot
+//! completer paying late read a STALE mark (the parker's mark follows its
+//! snapshot, which follows that bump — a fresh read elides it as
+//! unreached), so it records a mark the parker never set and covers
+//! nothing; the k-th post-snapshot completion always pays; two
+//! completers racing past one mark still pay once. No parker-side clear
+//! exists any more (an era is payable by arithmetic — a pay for the new
+//! mark needs the seq to have reached it, which the snapshot precedes),
+//! and the compose of an at-snapshot mark replaces it once its pay is
+//! recorded (kept, it would read as paid and collapse the next parker's
+//! first completion).
+//!
 //! ## Trust boundary (§5.3.1)
 //!
 //! Both words are client-writable shm. A hostile client scribbling
@@ -111,22 +142,39 @@ pub struct CqeDoorbell {
     /// restores the wake-per-completion posture — bounded self-harm.
     wake_at: AtomicU32,
     /// Wake-collapse latch (wake-economy campaign 2026-08-14, the
-    /// former `_pad` — struct stays 16 bytes, same header line): a
-    /// per-PARK-ERA once-flag. The daemon's mark-passed completion
-    /// CASes 0→1 — the winner pays the era's ONE `FUTEX_WAKE`
-    /// (breadth `i32::MAX`), losers collapse the syscall (the shipped
-    /// protocol re-paid on EVERY mark-passed completion until re-park —
-    /// the counted 0.94 wakes/op fan-in term). Cleared by
-    /// `park_begin[_batch]` AFTER the parked registration + fence and
-    /// BEFORE the seq snapshot (the ordering the loom strand models
-    /// pin); deliberately NOT cleared at `park_end` — a successor-less
-    /// era must not bequeath `wake_paid = 1` to the next parker
-    /// (`latch_new_era_is_payable`). Client-writable shm like its
-    /// siblings: scribbling 1 suppresses only the scribbler's own
-    /// reaper's wakes (bounded by its §5.3.1-rule-5 wait bound);
-    /// scribbling 0 restores wake-per-completion — bounded self-harm.
-    wake_paid: AtomicU32,
+    /// former `_pad` — struct stays 16 bytes, same header line): the
+    /// mark the most recent paid wake satisfied (mark-valued since
+    /// 2026-09-06 — the v3 0/1 era flag stranded a parker whose
+    /// snapshot absorbed an already-reaped op's late-paying completion,
+    /// module docs). A mark-passed completion collapses iff this equals
+    /// the mark it read; the winner of the update pays the era's ONE
+    /// `FUTEX_WAKE` (breadth `i32::MAX`), losers collapse the syscall
+    /// (the pre-latch protocol re-paid on EVERY mark-passed completion
+    /// until re-park — the counted 0.94 wakes/op fan-in term). Never
+    /// written by a parker: a new era is payable by arithmetic (a pay
+    /// for its mark needs the seq to have reached it). Client-writable
+    /// shm like its siblings: scribbling the scribbler's own live mark
+    /// suppresses only its own reaper's wakes (bounded by its
+    /// §5.3.1-rule-5 wait bound); any other value restores
+    /// wake-per-mark-passed — bounded self-harm.
+    wake_paid_mark: AtomicU32,
 }
+
+/// Wrapping "`seq` has reached `at`" (`at ≤ seq` within half the seq
+/// space) — the one comparison every mark and latch test uses.
+pub fn reached(seq: u32, at: u32) -> bool {
+    seq.wrapping_sub(at) < (1 << 31)
+}
+
+/// `wake_paid_mark`'s initial value: the one mark value the first park
+/// can never set. `wake_at` initialises to 0 and a fresh session's first
+/// mark is `snapshot + k ≥ 1`, so a completer reading the mark word
+/// before that first store (the stale-init read, at-or-behind the seq ⇒
+/// reads-as-reached) must find a record that is NOT that stale value —
+/// it over-pays one wake (the documented benign class) instead of
+/// collapsing against a pay nobody made. Equality with a live mark
+/// needs 2^32 completions to have wrapped the seq onto it.
+const NO_PAY_RECORDED: u32 = u32::MAX;
 
 /// Daemon-side completion outcome (replaces the former bool): `Wake` =
 /// pay the `FUTEX_WAKE` syscall; `Collapsed` = a parked reaper is
@@ -153,7 +201,7 @@ impl CqeDoorbell {
             seq: AtomicU32::new(0),
             parked: AtomicU32::new(0),
             wake_at: AtomicU32::new(0),
-            wake_paid: AtomicU32::new(0),
+            wake_paid_mark: AtomicU32::new(NO_PAY_RECORDED),
         }
     }
 
@@ -172,11 +220,11 @@ impl CqeDoorbell {
     /// `SQUEEZEFS_IPC_CQE_WAKE_LATCH` once and passes it. `false` = the
     /// shipped wake-per-mark-passed body verbatim (`Wake` on every
     /// mark-passed completion — the pre-campaign posture, the A/B
-    /// control). `true` = mark-passed completions CAS the per-era
-    /// `wake_paid` latch: the winner pays the era's one syscall,
-    /// losers return `Collapsed`. Strand-freedom under the latch is
-    /// the loom models' `ipc_cqe_latched_*` obligation (era-scoped
-    /// witnesses — module docs on the clear ordering).
+    /// control). `true` = a mark-passed completion collapses iff the
+    /// recorded pay was for the mark it read, else it records that mark
+    /// and pays the era's syscall. Strand-freedom under the latch is the
+    /// loom models' `ipc_cqe_latched_*` obligation (futex-bucket
+    /// fidelity — module docs).
     pub fn complete(&self, latch: bool) -> CompleteOutcome {
         // Store→load across two locations (the Dekker shape): the
         // explicit fence is LOAD-BEARING, not belt-and-braces — it is
@@ -195,7 +243,7 @@ impl CqeDoorbell {
         // reached and over-wakes: the pre-campaign posture, never a
         // strand.
         let at = self.wake_at.load(Ordering::SeqCst);
-        if seq.wrapping_sub(at) >= (1 << 31) {
+        if !reached(seq, at) {
             return CompleteOutcome::Elided;
         }
         if !latch {
@@ -204,10 +252,21 @@ impl CqeDoorbell {
             // `return true`).
             return CompleteOutcome::Wake;
         }
+        // Collapse iff the recorded pay was for THIS mark. What a 0/1
+        // flag could not express: a pre-snapshot completer paying late
+        // read a stale mark (a parker's mark follows its snapshot, which
+        // follows that bump), so it records one the parker never set
+        // and covers nothing (module docs). One update per mark: two
+        // completers racing past the same mark pay once.
         match self
-            .wake_paid
-            .compare_exchange(0, 1, Ordering::SeqCst, Ordering::SeqCst)
-        {
+            .wake_paid_mark
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |paid| {
+                if paid == at {
+                    None
+                } else {
+                    Some(at)
+                }
+            }) {
             // This era's ONE syscall.
             Ok(_) => CompleteOutcome::Wake,
             // A wake for this era is already paid/in flight: elide the
@@ -242,26 +301,12 @@ impl CqeDoorbell {
         // [`Self::complete`]).
         let prior = self.parked.fetch_add(1, Ordering::SeqCst);
         fence(Ordering::SeqCst);
-        // Wake-collapse era start (2026-08-14): clear the latch AFTER
-        // the registration + fence and BEFORE the snapshot (a completer
-        // whose bump follows the snapshot also follows this clear, so
-        // the era's first mark-passed completion always finds a payable
-        // latch — the strand argument's case 2). Honest weakening
-        // ledger (2026-08-14 runs): moving the clear BEFORE the
-        // registration passes the models — the design's prediction (a)
-        // was FALSIFIED, because a completer's parked-gate runs before
-        // its CAS, so a pre-registration clear can never be consumed by
-        // an eliding completer; the position is kept for the documented
-        // era definition, not by counterexample. DELETING the clear is
-        // the real teeth (`latch_new_era_is_payable` — a paid era would
-        // poison every successor); the two Dekker fence drops fail two
-        // models each (re-verified on the latched body). A completer racing the
-        // clear→mark window below reads the STALE previous mark
-        // (at-or-behind the seq ⇒ reads-as-reached) against the
-        // freshly cleared latch and over-pays one wake — benign,
-        // bounded, the same class as the racy `wake_at` store
-        // documented at the first-parker arm.
-        self.wake_paid.store(0, Ordering::SeqCst);
+        // No latch clear here (the v3 `wake_paid.store(0)` retired
+        // 2026-09-06): the mark-valued latch makes a new era payable by
+        // arithmetic — a pay for the mark set from this snapshot needs
+        // the seq to have reached it, which the snapshot precedes — and
+        // a parker-side clear was exactly what a pre-snapshot
+        // completer's late CAS could consume (module docs).
         let snap = self.seq.load(Ordering::SeqCst);
         let target = snap.wrapping_add(k);
         if prior == 0 {
@@ -275,11 +320,25 @@ impl CqeDoorbell {
         } else {
             // Compose by EARLIEST mark, wrapping-relative to our own
             // snapshot: a mark already behind the seq (stale era) reads
-            // as huge and is replaced; a live earlier mark is kept.
+            // as huge and is replaced; a live earlier mark is kept. A
+            // mark AT the snapshot has had its completion bump already:
+            // it stays live only while that completer may still be in
+            // flight before its mark read (unpaid — replacing it would
+            // elide the wake its parker is asleep on); once its pay is
+            // recorded the mark is SPENT and ours governs — kept, it
+            // would read as covered by exactly that pay and collapse
+            // our era's first completion.
             let _ = self
                 .wake_at
                 .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |cur| {
-                    if cur.wrapping_sub(snap) <= target.wrapping_sub(snap) {
+                    let ahead = cur.wrapping_sub(snap);
+                    if ahead == 0 {
+                        if self.wake_paid_mark.load(Ordering::SeqCst) == cur {
+                            Some(target)
+                        } else {
+                            None
+                        }
+                    } else if ahead <= target.wrapping_sub(snap) {
                         None
                     } else {
                         Some(target)
@@ -315,10 +374,11 @@ impl CqeDoorbell {
         self.wake_at.load(Ordering::SeqCst)
     }
 
-    /// Current wake-collapse latch state (diagnostics / model
-    /// assertions — the loom strand models' payable-era check).
-    pub fn wake_paid(&self) -> u32 {
-        self.wake_paid.load(Ordering::SeqCst)
+    /// The mark the most recent paid wake satisfied (diagnostics /
+    /// model assertions — the loom strand models' payable-era check: an
+    /// era is payable while this differs from its mark).
+    pub fn wake_paid_mark(&self) -> u32 {
+        self.wake_paid_mark.load(Ordering::SeqCst)
     }
 }
 
@@ -451,10 +511,9 @@ mod tests {
         );
     }
 
-    /// The new-era law (loom weakening (b)'s unit half): a fresh
-    /// `park_begin` re-arms the latch — the clear lives at era START,
-    /// never at `park_end`, so a successor-less era cannot bequeath
-    /// `wake_paid = 1` to the next parker.
+    /// The new-era law: a fresh `park_begin` starts payable with NO
+    /// parker-side write — the previous era's pay was for mark 1; the
+    /// new era's mark is 3, so the record covers nothing.
     #[test]
     fn latch_new_era_is_payable() {
         let d = CqeDoorbell::new();
@@ -462,15 +521,141 @@ mod tests {
         assert_eq!(d.complete(true), CompleteOutcome::Wake);
         assert_eq!(d.complete(true), CompleteOutcome::Collapsed);
         d.park_end();
-        // The era ended with the latch SET and no successor cleared it
-        // yet — the next park must start payable.
-        let _e2 = d.park_begin();
+        assert_eq!(d.wake_paid_mark(), 1, "the era's pay was for mark 1");
+        // The era ended with a pay recorded and nothing reset it — the
+        // next park must start payable by arithmetic.
+        let snap = d.park_begin();
+        assert_eq!(snap, 2);
+        assert_eq!(d.wake_at(), 3);
         assert_eq!(
             d.complete(true),
             CompleteOutcome::Wake,
             "a new park era's first mark-passed completion must pay, \
-             not inherit the previous era's paid latch"
+             not inherit the previous era's pay"
         );
+        d.park_end();
+    }
+
+    /// The 2026-09-06 strand class, sequential half: a pay recorded for a
+    /// STALE mark (what a pre-snapshot completer paying late reads — the
+    /// reaped prior op's doorbell completion) never covers the era whose
+    /// mark it is not. Modeled as: the parker snapshots at seq 1 with the
+    /// pay for mark 1 recorded — the era's mark is 2, and completion 2
+    /// must pay. (The interleaved half — the CAS landing after a v3
+    /// clear — is the loom model
+    /// `ipc_cqe_latched_reaped_prior_completion_never_strands`.)
+    #[test]
+    fn latch_pay_for_a_stale_mark_never_covers_the_era() {
+        let d = CqeDoorbell::new();
+        // Era A pays for mark 1 and ends.
+        let _a = d.park_begin();
+        assert_eq!(d.complete(true), CompleteOutcome::Wake);
+        d.park_end();
+        assert_eq!(d.wake_paid_mark(), 1);
+        // Era B snapshots at 1 — the recorded pay's mark is the
+        // snapshot seq, below B's mark.
+        let snap = d.park_begin();
+        assert_eq!(snap, 1);
+        assert_eq!(d.wake_at(), 2);
+        assert_eq!(
+            d.complete(true),
+            CompleteOutcome::Wake,
+            "a pay for mark 1 is not a pay for mark 2: it covers nothing"
+        );
+        assert_eq!(d.complete(true), CompleteOutcome::Collapsed);
+        d.park_end();
+    }
+
+    /// The initial record is never mistaken for a pay, wherever the seq
+    /// stands and whatever mark word a completer reads — including the
+    /// stale-init mark (0) a completer can read before the first parker's
+    /// mark store lands, which must over-pay (the benign class), never
+    /// collapse. Driven by a raw seq store — unparked completions elide
+    /// before the latch and never record a pay.
+    #[test]
+    fn latch_initial_record_never_collapses() {
+        let d = CqeDoorbell::new();
+        assert_eq!(d.wake_paid_mark(), NO_PAY_RECORDED, "never paid");
+        assert_ne!(
+            d.wake_at(),
+            NO_PAY_RECORDED,
+            "the initial record must differ from the initial mark word: a \
+             stale-init mark read must over-pay, not collapse"
+        );
+        d.seq.store((1 << 31) + 7, Ordering::SeqCst);
+        let snap = d.park_begin();
+        assert_eq!(snap, (1 << 31) + 7);
+        assert_eq!(
+            d.complete(true),
+            CompleteOutcome::Wake,
+            "no pay was ever recorded for this era's mark"
+        );
+        assert_eq!(d.complete(true), CompleteOutcome::Collapsed);
+        d.park_end();
+    }
+
+    /// Compose, the at-snapshot mark (two parkers, one registered
+    /// through the other's park): UNPAID it stays — its completer may
+    /// still be in flight before its mark read, and replacing it would
+    /// elide the wake its own parker sleeps on. Driven with the control
+    /// arm (`latch = false` bumps without recording a pay).
+    #[test]
+    fn compose_keeps_an_at_snapshot_mark_while_its_pay_is_unrecorded() {
+        let d = CqeDoorbell::new();
+        let _a = d.park_begin(); // A: snap 0, mark 1
+        assert_eq!(
+            d.complete(false),
+            CompleteOutcome::Wake,
+            "seq 1: control arm"
+        );
+        assert_eq!(
+            d.wake_paid_mark(),
+            NO_PAY_RECORDED,
+            "no pay recorded on the control arm"
+        );
+        let snap_b = d.park_begin_batch(2); // B: snap 1, cur 1 == snap
+        assert_eq!(snap_b, 1);
+        assert_eq!(d.wake_at(), 1, "the at-snapshot mark stays while unpaid");
+        assert_eq!(
+            d.complete(true),
+            CompleteOutcome::Wake,
+            "seq 2 reaches the kept mark; no pay is recorded for it"
+        );
+        d.park_end();
+        d.park_end();
+    }
+
+    /// Compose, the at-snapshot mark once its pay IS recorded: it is
+    /// SPENT and the new parker's own mark governs — kept, it would read
+    /// as paid and the new era's first completion would collapse (the
+    /// mark-valued latch's two-parker obligation).
+    #[test]
+    fn compose_replaces_a_spent_at_snapshot_mark() {
+        let d = CqeDoorbell::new();
+        let _a = d.park_begin(); // A: snap 0, mark 1
+        assert_eq!(
+            d.complete(true),
+            CompleteOutcome::Wake,
+            "seq 1 pays A's mark"
+        );
+        assert_eq!(d.wake_paid_mark(), 1);
+        // B registers while A is still registered (woken, not yet
+        // deregistered): snap 1, cur 1 == snap, pay recorded FOR it.
+        let snap_b = d.park_begin_batch(2);
+        assert_eq!(snap_b, 1);
+        assert_eq!(d.wake_at(), 3, "spent mark replaced by B's own (1 + 2)");
+        assert_eq!(
+            d.complete(true),
+            CompleteOutcome::Elided,
+            "seq 2: below B's mark"
+        );
+        assert_eq!(
+            d.complete(true),
+            CompleteOutcome::Wake,
+            "seq 3 reaches B's mark and the pay for mark 1 does not cover it"
+        );
+        assert_eq!(d.complete(true), CompleteOutcome::Collapsed);
+        d.park_end();
         d.park_end();
     }
 

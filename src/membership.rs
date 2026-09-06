@@ -1253,6 +1253,20 @@ pub struct Grant {
     /// that runs no partition. A HINT, never a grant: the blocks travel
     /// only on the harvest verb, under the lane checks it already runs.
     pub lane_supply_blocks: u64,
+    /// **The writer's checkpoint ceiling in force**, ms (the writer→member
+    /// checkpoint composite, §6.8 item 3 adjudication item 4 — user
+    /// decision 2026-09-06): the PROMISE that every commit before this
+    /// grant is checkpointed within this many ms of it, honoured by the
+    /// authority's checkpoint task for one routine ceiling past the grant
+    /// whatever the ask or the lever do since
+    /// ([`crate::free_grace::advertise_checkpoint_ceiling`]). The routine
+    /// ceiling (`max(flush tick, CHECKPOINT_MAX_AGE_MS)` — the constant on
+    /// the shipped 50 ms flush) with no ask in force; `P/2` against the
+    /// reader's routine poll while the valve is asking. On the member it
+    /// is the prod floor's and L2b's pass floor's input. `0` = not
+    /// advertised (an owner with no grace plane): the member falls back to
+    /// `CHECKPOINT_MAX_AGE_MS`. Rides the `CLUSTER_WIRE_SCHEMA` 2 grant.
+    pub checkpoint_ceiling_ms: u64,
 }
 
 impl Grant {
@@ -1479,6 +1493,10 @@ impl MembershipOwner {
             renew_ms: self.clocks.renew_interval.as_millis() as u64,
             granted_at_owner_ms: now,
             lane_supply_blocks: 0,
+            // The composite's wire half: the writer's checkpoint ceiling in
+            // force, and the promise its advertisement makes (a few relaxed
+            // atomics — KD-FG-4's no-scan-in-renew law stands).
+            checkpoint_ceiling_ms: crate::free_grace::advertise_checkpoint_ceiling(),
         }
     }
 
@@ -2082,6 +2100,13 @@ pub struct MemberSession {
     /// weakening-verified there.
     words: crate::lease_clock_core::MemberLeaseWords,
     clock: LeaseClock,
+    /// The writer's checkpoint ceiling advertised on the grant that
+    /// carried the label `learned_label` reports (the join, then every
+    /// ROUTINE renewal — a carriage renewal learns neither); `0` = none
+    /// advertised. Outside the loom-modelled core on purpose: it orders
+    /// against nothing — the ceiling and the label are read together only
+    /// by the revalidation task, which learns both from one grant.
+    checkpoint_ceiling_ms: AtomicU64,
 }
 
 impl MemberSession {
@@ -2107,6 +2132,7 @@ impl MemberSession {
                 anchor_ms,
             ),
             clock,
+            checkpoint_ceiling_ms: AtomicU64::new(grant.checkpoint_ceiling_ms),
         };
         log::info!(
             "membership member '{id}' ({}) holds lease epoch {} in term {}: owner deadline \
@@ -2136,12 +2162,21 @@ impl MemberSession {
             grant.granted_at_owner_ms,
             anchor_ms,
         );
+        // The composite: the writer's ceiling advertised WITH this label
+        // (one grant, one act) — the ladder's input beside the label.
+        self.checkpoint_ceiling_ms
+            .store(grant.checkpoint_ceiling_ms, Ordering::Relaxed);
         // L2b (design-free-grace-sustain §5.2b, OQ 3): the grant's
         // `renew_ms` IS the pass-cadence ask — a prodded (shortened) value
         // tightens the revalidation pass cadence too, clamped at the
-        // checkpoint ceiling; a routine value clamps to the routine pass
-        // interval and is inert. No wire field, no push channel.
-        crate::free_grace::note_prodded_renewal(grant.renew_ms, anchor_ms);
+        // writer's ADVERTISED checkpoint ceiling (the composite; the
+        // constant when none was advertised); a routine value clamps to
+        // the routine pass interval and is inert. No push channel.
+        crate::free_grace::note_prodded_renewal(
+            grant.renew_ms,
+            grant.checkpoint_ceiling_ms,
+            anchor_ms,
+        );
         // The lane-push lever (finding 15 term 2): the grant's lane-supply
         // hint wakes this co-writer's refill at once.
         crate::free_grace::note_lane_supply_hint(grant.lane_supply_blocks);
@@ -2150,7 +2185,9 @@ impl MemberSession {
     /// Adopt a CARRIAGE renewal's grant (hold-time lever (b) — the renewal
     /// a promoted acknowledgement triggered ahead of the beat): the lease
     /// renews, a prod is honoured, the routine beat and the learned label
-    /// are left to the routine renewal (`MemberLeaseWords::renewed_carriage`).
+    /// are left to the routine renewal (`MemberLeaseWords::renewed_carriage`)
+    /// — and so is the ceiling learned with the label; the pass resolver's
+    /// deposit (an ask about NOW) reads this grant's ask and ceiling.
     pub fn renewed_carriage(&self, grant: &Grant, anchor_ms: u64) {
         self.words.renewed_carriage(
             grant.epoch,
@@ -2160,7 +2197,11 @@ impl MemberSession {
             grant.d_purge_ms,
             anchor_ms,
         );
-        crate::free_grace::note_prodded_renewal(grant.renew_ms, anchor_ms);
+        crate::free_grace::note_prodded_renewal(
+            grant.renew_ms,
+            grant.checkpoint_ceiling_ms,
+            anchor_ms,
+        );
         crate::free_grace::note_lane_supply_hint(grant.lane_supply_blocks);
     }
 
@@ -2171,6 +2212,29 @@ impl MemberSession {
         self.words.learned_label()
     }
 
+    /// **The WRITER's checkpoint landing ceiling**, ms — the ack ladder's
+    /// qualify term (spec §6.8 item 3; ladder re-derivation item 1 composed
+    /// with adjudication item 4). The value the grant that carried
+    /// [`Self::learned_label`]'s label ADVERTISED (the writer→member
+    /// checkpoint composite: the promise that every commit before that
+    /// grant is checkpointed within this many ms of it — the landing
+    /// ceiling, `P/2 + 2 × min(tick, P/2)` while the valve is asking,
+    /// `CHECKPOINT_MAX_AGE_MS + 2 × tick` otherwise). Falls back to the
+    /// member's own derivation of the writer's routine landing ceiling
+    /// (`checkpoint_landing_ceiling_derived` — the one-flush-knob fleet
+    /// assumption the poll cadence already makes) when none was advertised
+    /// (an owner with no grace plane) and under
+    /// `SQUEEZEFS_FREE_GRACE_CHECKPOINT_COMPOSITE=0` (the shipped shape
+    /// reads its own derivation whatever travelled).
+    pub fn checkpoint_ceiling_ms(&self) -> u64 {
+        let advertised = self.checkpoint_ceiling_ms.load(Ordering::Relaxed);
+        if advertised != 0 && crate::free_grace::checkpoint_composite_enabled() {
+            advertised
+        } else {
+            crate::meta_backend::kv::checkpoint::checkpoint_landing_ceiling_derived()
+        }
+    }
+
     /// The grant's clock-skew bound, ms (the ladder's qualification term).
     pub fn skew_max_ms(&self) -> u64 {
         self.words.skew_max_ms()
@@ -2179,17 +2243,6 @@ impl MemberSession {
     /// The grant's `D_purge`, ms (the ladder's drain term).
     pub fn d_purge_ms(&self) -> u64 {
         self.words.d_purge_ms()
-    }
-
-    /// The WRITER's checkpoint landing ceiling, ms — the ack ladder's
-    /// qualify term (spec §6.8 item 3; ladder re-derivation item 1). Today
-    /// the reader's own derivation of the writer's machinery
-    /// (`checkpoint_landing_ceiling_derived`: the cadence trigger plus two
-    /// checkpoint-task tick periods, under the one-flush-knob fleet
-    /// assumption the poll cadence already makes); a writer-advertised,
-    /// demand-elastic value is adjudication item 4's, and lands here.
-    pub fn checkpoint_ceiling_ms(&self) -> u64 {
-        crate::meta_backend::kv::checkpoint::checkpoint_landing_ceiling_derived()
     }
 
     /// This member's own clock, in ms — the frame every wait above is

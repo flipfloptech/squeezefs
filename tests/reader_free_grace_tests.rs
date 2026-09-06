@@ -2816,6 +2816,10 @@ struct SimReader {
     epoch: u64,
     ladder: ReaderAckLadder,
     learned: (u64, u64),
+    /// The writer's checkpoint ceiling advertised on the grant that carried
+    /// `learned` (`MemberSession::checkpoint_ceiling_ms`'s word — the
+    /// constant when nothing was advertised).
+    ceiling_ms: u64,
     acked: u64,
     next_renew_ms: u64,
     next_pass_ms: u64,
@@ -2887,15 +2891,22 @@ fn run_closed_loop(shape: &LoopShape, levers: Levers) -> LoopRow {
     let staleness_ms = squeezefs::ro_coherence::reader_staleness_bound().as_millis() as u64;
     let pass_ms = squeezefs::ro_coherence::reader_revalidate_interval().as_millis() as u64;
     // The ladder's windows are the PRODUCT's derivations (the reader's
-    // `reader_pass_completed` computes exactly these); the writer's
-    // ceiling is the shipped derivation a real member session answers.
-    let ceiling_ms = squeezefs::meta_backend::kv::checkpoint::checkpoint_landing_ceiling_derived();
-    let qualify_lag_ms =
-        free_grace::qualify_lag_ms(qualify_ceiling, ceiling_ms, staleness_ms, skew_ms);
+    // `reader_pass_completed` computes exactly these). The writer's ceiling
+    // is what `MemberSession::checkpoint_ceiling_ms` answers: the value the
+    // grant ADVERTISED (the composite — P/2 while an ask is in force), the
+    // landing ceiling when none was or the composite lever is off.
+    let landing_ceiling_ms =
+        squeezefs::meta_backend::kv::checkpoint::checkpoint_landing_ceiling_derived();
+    let learned_ceiling = |advertised: u64| {
+        if advertised != 0 && composite {
+            advertised
+        } else {
+            landing_ceiling_ms
+        }
+    };
     let d_purge_ms = clocks.d_purge.as_millis() as u64;
     let drain_lag_ms =
         free_grace::drain_lag_ms(drain_epoch_stamp, drain_observed, staleness_ms, d_purge_ms);
-    let refresh_floor_ms = pass_ms.max(skew_ms);
 
     let t0 = clock.now_ms();
     let mut readers: Vec<SimReader> = (0..shape.members)
@@ -2918,6 +2929,7 @@ fn run_closed_loop(shape: &LoopShape, levers: Levers) -> LoopRow {
                 epoch: grant.epoch,
                 ladder: ReaderAckLadder::new(),
                 learned: (grant.granted_at_owner_ms, t0),
+                ceiling_ms: learned_ceiling(grant.checkpoint_ceiling_ms),
                 acked: 0,
                 next_renew_ms: t0 + phase,
                 next_pass_ms: t0 + pass_ms + pass_phase,
@@ -3084,9 +3096,21 @@ fn run_closed_loop(shape: &LoopShape, levers: Levers) -> LoopRow {
                     pass_start_ms: now,
                     now_ms: now,
                     advanced,
-                    qualify_lag_ms,
+                    qualify_lag_ms: free_grace::qualify_lag_ms(
+                        qualify_ceiling,
+                        r.ceiling_ms,
+                        staleness_ms,
+                        skew_ms,
+                    ),
                     drain_lag_ms,
-                    refresh_floor_ms,
+                    // `reader_pass_completed`'s derivation: the pass
+                    // cadence floored at the skew, with the ceiling this
+                    // member learned (the composite's depth input).
+                    refresh_floor_ms: free_grace::reader_refresh_floor_ms(
+                        pass_ms,
+                        r.ceiling_ms,
+                        skew_ms,
+                    ),
                     // Item 3: with the observed drain in force the pass
                     // records the generation its steps left (no serves run
                     // in this model, so the drain is the step itself).
@@ -3134,6 +3158,7 @@ fn run_closed_loop(shape: &LoopShape, levers: Levers) -> LoopRow {
                 match owner.renew(&r.id, r.epoch, r.acked) {
                     RenewOutcome::Renewed(grant) => {
                         r.learned = (grant.granted_at_owner_ms, now);
+                        r.ceiling_ms = learned_ceiling(grant.checkpoint_ceiling_ms);
                         r.next_renew_ms = now + grant.renew_ms.max(LOOP_STEP_MS);
                         // `MemberSession::renewed`'s deposit: the ask and
                         // the ceiling it rode in with.
@@ -5045,7 +5070,11 @@ fn the_elastic_checkpoint_ceiling_and_the_live_prod_floor_derive() {
         floor,
         "at the writer's routine ceiling the live floor IS the shipped floor (the identity)"
     );
-    assert_eq!(prod.floor_for(u64::MAX), floor, "a ceiling above P changes nothing");
+    assert_eq!(
+        prod.floor_for(u64::MAX),
+        floor,
+        "a ceiling above P changes nothing"
+    );
     assert_eq!(
         prod.floor_for(500),
         500,
@@ -5097,16 +5126,24 @@ fn an_ask_in_force_tightens_the_writers_ceiling_and_the_grant_carries_it() {
         None,
         "no ask in force ⇒ no elastic ceiling (the checkpoint task's shipped decision)"
     );
-    assert_eq!(free_grace::checkpoint_ceiling_ms(), routine, "the gauge reads the routine");
     assert_eq!(
-        grant0.checkpoint_ceiling_ms, routine,
-        "a join grant advertises the routine ceiling"
+        free_grace::checkpoint_ceiling_ms(),
+        routine,
+        "the gauge reads the routine"
+    );
+    // What travels is the LANDING ceiling (re-derivation item 1 composed
+    // with the composite): the routine decision + two flush ticks.
+    let routine_landing =
+        squeezefs::meta_backend::kv::checkpoint::checkpoint_landing_ceiling_derived();
+    assert_eq!(
+        grant0.checkpoint_ceiling_ms, routine_landing,
+        "a join grant advertises the routine landing ceiling"
     );
     let g = match owner.renew("r-ceiling", grant0.epoch, 0) {
         RenewOutcome::Renewed(g) => g,
         other => panic!("{other:?}"),
     };
-    assert_eq!(g.checkpoint_ceiling_ms, routine);
+    assert_eq!(g.checkpoint_ceiling_ms, routine_landing);
     assert_eq!(free_grace::checkpoint_elastic_cycles(), 0);
 
     // The ask: a held offset at the allocation cliff (the pressure
@@ -5127,7 +5164,11 @@ fn an_ask_in_force_tightens_the_writers_ceiling_and_the_grant_carries_it() {
         Some(poll / 2),
         "an ask in force ⇒ the writer's ceiling is P/2 (the Nyquist bound)"
     );
-    assert_eq!(free_grace::checkpoint_ceiling_ms(), poll / 2, "the gauge reads it");
+    assert_eq!(
+        free_grace::checkpoint_ceiling_ms(),
+        poll / 2,
+        "the gauge reads it"
+    );
     assert!(ring.harvest_pressure(free_grace::HARVEST_BATCH).is_empty());
     assert_eq!(
         free_grace::prod_renew_ms(),
@@ -5138,10 +5179,33 @@ fn an_ask_in_force_tightens_the_writers_ceiling_and_the_grant_carries_it() {
         RenewOutcome::Renewed(g) => g,
         other => panic!("{other:?}"),
     };
+    // The grant advertises the LANDING ceiling of the halved decision
+    // (re-derivation item 1 composed with the composite): the decision plus
+    // the two tick-granularity terms the task evaluates behind, with the
+    // tick tightened to the decision.
+    // The flush cadence in force, read back off the routine landing
+    // derivation (`trigger + 2 × tick`): the same tick the elastic landing
+    // rides.
+    let tick_ms = (squeezefs::meta_backend::kv::checkpoint::checkpoint_landing_ceiling_derived()
+        - squeezefs::meta_backend::kv::checkpoint::CHECKPOINT_MAX_AGE_MS as u64)
+        / 2;
+    let landing = poll / 2 + 2 * tick_ms.min(poll / 2);
+    assert_eq!(
+        landing,
+        squeezefs::meta_backend::kv::checkpoint::checkpoint_landing_ceiling_for_elastic(
+            poll / 2,
+            tick_ms,
+        ),
+        "the elastic landing derivation at the tick in force"
+    );
     assert_eq!(
         (g.renew_ms, g.checkpoint_ceiling_ms),
-        (poll / 2, poll / 2),
-        "the grant carries the halved beat AND the halved ceiling it rests on"
+        (poll / 2, landing),
+        "the grant carries the halved beat AND the landing ceiling of the halved decision"
+    );
+    assert!(
+        landing > poll / 2 && landing <= poll / 2 * 3,
+        "landing = decision + 2 × min(tick, decision): {landing}"
     );
     let snap = free_grace::stats_snapshot();
     assert_eq!(
@@ -5149,7 +5213,10 @@ fn an_ask_in_force_tightens_the_writers_ceiling_and_the_grant_carries_it() {
         Some(poll / 2),
         "the stats inode publishes the ceiling in force"
     );
-    assert_eq!(snap["free_grace_checkpoint_elastic_cycles"].as_u64(), Some(0));
+    assert_eq!(
+        snap["free_grace_checkpoint_elastic_cycles"].as_u64(),
+        Some(0)
+    );
     free_grace::note_elastic_checkpoint_cycle();
     assert_eq!(
         free_grace::stats_snapshot()["free_grace_checkpoint_elastic_cycles"].as_u64(),
@@ -5212,8 +5279,9 @@ fn an_ask_in_force_tightens_the_writers_ceiling_and_the_grant_carries_it() {
         other => panic!("{other:?}"),
     };
     assert_eq!(
-        g.checkpoint_ceiling_ms, routine,
-        "CHECKPOINT_COMPOSITE=0: the grant advertises the routine ceiling"
+        g.checkpoint_ceiling_ms,
+        squeezefs::meta_backend::kv::checkpoint::checkpoint_landing_ceiling_derived(),
+        "CHECKPOINT_COMPOSITE=0: the grant advertises the routine landing ceiling"
     );
     assert!(free_grace::test_clear_checkpoint_composite());
 }
@@ -5230,14 +5298,15 @@ fn clock_skew_ms(owner: &MembershipOwner) -> u64 {
 /// so learns no ceiling for the ladder — but deposits the grant's ask +
 /// ceiling for the pass resolver like the routine renewal does. A grant
 /// advertising nothing (`0` — an owner with no grace plane) falls back to
-/// `CHECKPOINT_MAX_AGE_MS`; `CHECKPOINT_COMPOSITE=0` reads the constant
-/// whatever was advertised.
+/// the member's own derivation of the routine LANDING ceiling
+/// (`checkpoint_landing_ceiling_derived`, re-derivation item 1);
+/// `CHECKPOINT_COMPOSITE=0` reads that derivation whatever was advertised.
 #[test]
 fn the_member_adopts_the_advertised_ceiling_with_its_label() {
     let _serial = serial();
     free_grace::test_set_checkpoint_composite(Some(true));
     free_grace::test_set_pass_elastic(Some(true));
-    let constant = squeezefs::meta_backend::kv::checkpoint::CHECKPOINT_MAX_AGE_MS as u64;
+    let constant = squeezefs::meta_backend::kv::checkpoint::checkpoint_landing_ceiling_derived();
     let cl = shipped_clocks();
     let grant = |epoch: u64, renew_ms: u64, ceiling: u64, at: u64| Grant {
         epoch,
@@ -5251,11 +5320,17 @@ fn the_member_adopts_the_advertised_ceiling_with_its_label() {
         checkpoint_ceiling_ms: ceiling,
     };
     let (clock, ticks) = manual_clock();
-    let session = MemberSession::adopt("m-ceiling", MemberRole::Reader, &grant(1, 10_000, 0, 100), 10_000, clock);
+    let session = MemberSession::adopt(
+        "m-ceiling",
+        MemberRole::Reader,
+        &grant(1, 10_000, 0, 100),
+        10_000,
+        clock,
+    );
     assert_eq!(
         session.checkpoint_ceiling_ms(),
         constant,
-        "nothing advertised ⇒ the constant (an owner with no grace plane)"
+        "nothing advertised ⇒ the member's own landing derivation (an owner with no grace plane)"
     );
     ticks.fetch_add(500, Ordering::SeqCst);
     session.renewed(&grant(1, 500, 500, 600), 10_500);
@@ -5272,7 +5347,11 @@ fn the_member_adopts_the_advertised_ceiling_with_its_label() {
         500,
         "a carriage renewal learns no label and no ceiling for the ladder"
     );
-    assert_eq!(session.learned_label().0, 600, "…the label stays the routine renewal's");
+    assert_eq!(
+        session.learned_label().0,
+        600,
+        "…the label stays the routine renewal's"
+    );
     assert_eq!(
         free_grace::reader_pass_interval(Duration::from_millis(5_000), 10_750),
         Duration::from_millis(700),
@@ -5283,14 +5362,14 @@ fn the_member_adopts_the_advertised_ceiling_with_its_label() {
     assert_eq!(
         session.checkpoint_ceiling_ms(),
         constant,
-        "a later grant advertising nothing returns the member to the constant"
+        "a later grant advertising nothing returns the member to its own landing derivation"
     );
     session.renewed(&grant(1, 500, 500, 1_200), 11_100);
     free_grace::test_set_checkpoint_composite(Some(false));
     assert_eq!(
         session.checkpoint_ceiling_ms(),
         constant,
-        "CHECKPOINT_COMPOSITE=0: the constant, whatever was advertised"
+        "CHECKPOINT_COMPOSITE=0: the member's own landing derivation, whatever was advertised"
     );
     assert!(free_grace::test_clear_checkpoint_composite());
     assert!(free_grace::test_clear_pass_elastic());
@@ -5324,7 +5403,12 @@ fn the_checkpoint_composite_halves_the_cadences_and_cuts_the_hold() {
     let staleness_ms = squeezefs::ro_coherence::reader_staleness_bound().as_millis() as u64;
     for r in [&h3, &h4] {
         println!("{}", r.render(&shape));
-        assert_eq!(r.deferrals, r.releases + r.held_end, "{}: closure", r.config);
+        assert_eq!(
+            r.deferrals,
+            r.releases + r.held_end,
+            "{}: closure",
+            r.config
+        );
         assert_eq!((r.forced, r.fences), (0, 0), "{}: no fence", r.config);
         assert_eq!(r.hold_unplaced, 0, "{}: every stage placed", r.config);
         assert!(
@@ -5341,8 +5425,14 @@ fn the_checkpoint_composite_halves_the_cadences_and_cuts_the_hold() {
         "the composite off is the shipped H3 row verbatim ({:.0} ms)",
         h3.bound_age_mean_ms
     );
-    assert_eq!(h3.elastic_cycles, 0, "no elastic cycle without the composite");
-    assert_eq!(h3.pass_prods, 0, "L2b is structurally inert on this venue without it");
+    assert_eq!(
+        h3.elastic_cycles, 0,
+        "no elastic cycle without the composite"
+    );
+    assert_eq!(
+        h3.pass_prods, 0,
+        "L2b is structurally inert on this venue without it"
+    );
     assert_eq!(h3.ceiling_min_ms, shape.checkpoint_ms);
     // (i) Engagement.
     assert_eq!(
@@ -5350,7 +5440,10 @@ fn the_checkpoint_composite_halves_the_cadences_and_cuts_the_hold() {
         "the writer ran at P/2 while the ask was in force"
     );
     assert!(h4.elastic_cycles > 0, "elastic checkpoint cycles ran");
-    assert!(h4.pass_prods > 0, "the members' passes tightened (L2b engaged by the composite)");
+    assert!(
+        h4.pass_prods > 0,
+        "the members' passes tightened (L2b engaged by the composite)"
+    );
     // (ii) The hold.
     assert!(
         h4.bound_age_mean_ms <= h3.bound_age_mean_ms - 300.0,
@@ -5380,7 +5473,10 @@ fn the_checkpoint_composite_halves_the_cadences_and_cuts_the_hold() {
         "the lease-lane cost is the accepted 2× ({rn_ratio:.2}×)"
     );
     // (iv) Never more stalls.
-    assert!(h4.stalls_steady <= h3.stalls_steady, "the composite never stalls the stream more");
+    assert!(
+        h4.stalls_steady <= h3.stalls_steady,
+        "the composite never stalls the stream more"
+    );
 }
 
 /// **Contract 36 — the KV checkpoint TASK runs at the elastic ceiling
@@ -5444,7 +5540,10 @@ async fn the_checkpoint_task_runs_at_the_elastic_ceiling_under_an_ask() {
         "no ask ⇒ the task ran its shipped cadence: no elastic cycle"
     );
     assert_eq!(free_grace::checkpoint_ceiling_ms(), routine);
-    assert!(free_grace::checkpoint_marks() >= 1, "the routine cycles marked the ledger");
+    assert!(
+        free_grace::checkpoint_marks() >= 1,
+        "the routine cycles marked the ledger"
+    );
 
     // The ask (the allocation cliff), then the same stream.
     let ring = GraceRing::new(1024);
@@ -5456,7 +5555,10 @@ async fn the_checkpoint_task_runs_at_the_elastic_ceiling_under_an_ask() {
     commit_for(Arc::clone(&be), "asked", routine + routine / 4).await;
     let elastic = free_grace::checkpoint_elastic_cycles();
     let marks = free_grace::checkpoint_marks() - marks_before;
-    println!("ROW checkpoint-task: {marks} cycle(s) in {} ms under an ask, {elastic} elastic", routine + routine / 4);
+    println!(
+        "ROW checkpoint-task: {marks} cycle(s) in {} ms under an ask, {elastic} elastic",
+        routine + routine / 4
+    );
     assert!(
         elastic >= 1,
         "an ask in force ⇒ the task's cycles ran under the elastic ceiling ({elastic})"

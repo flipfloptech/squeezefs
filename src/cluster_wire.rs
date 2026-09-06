@@ -156,7 +156,18 @@ use std::time::Duration;
 /// vocabulary — `job_wire::WIRE_SCHEMA` is at 3 for exactly that reason.
 /// One shared number would force an unrelated protocol's peers to
 /// re-enroll whenever the other one added a field.
-pub const CLUSTER_WIRE_SCHEMA: u32 = 1;
+///
+/// The S6 membership vocabulary (`membership_wire`) carries no schema of
+/// its own — its bincode bodies ride THIS number — so a membership frame
+/// change bumps it here. **2 since the lease grant began carrying the
+/// writer's checkpoint ceiling** ([`crate::membership::Grant::checkpoint_ceiling_ms`],
+/// the writer→member checkpoint composite, 2026-09-06; the grant's
+/// `lane_supply_blocks` of the same day rides the bump too). A peer that
+/// speaks 1 would decode a shorter grant (bincode is positional: a missing
+/// trailing field is EOF, an extra one is silently ignored), so the
+/// mismatch is a loud handshake refusal rather than a member running the
+/// constant against a writer that advertised half of it.
+pub const CLUSTER_WIRE_SCHEMA: u32 = 2;
 
 /// The **pre-authentication** frame class cap: a challenge/proof pair is a
 /// few hundred bytes, so this is all an unauthenticated peer gets to

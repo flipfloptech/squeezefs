@@ -1018,6 +1018,19 @@ pub fn checkpoint_landing_ceiling_derived() -> u64 {
     checkpoint_landing_ceiling_ms(crate::meta_backend::resolve_flush_interval_ms())
 }
 
+/// The landing ceiling for an ELASTIC decision ceiling (the writer→member
+/// checkpoint composite, adjudication item 4): the task compares elapsed
+/// time against `decision_ms` and tightens its tick to `min(period,
+/// decision)` (`checkpoint_task`), so the two tick-granularity terms are
+/// bounded by that tightened tick — `decision + 2 × min(tick, decision)`.
+/// This is what a grant ADVERTISES: the promise "every commit before this
+/// grant is checkpointed within this many ms of it" is honest only with
+/// the landing terms in it, and it is the qualify term the member's ack
+/// ladder adds its skew to.
+pub fn checkpoint_landing_ceiling_for_elastic(decision_ms: u64, flush_interval_ms: u64) -> u64 {
+    decision_ms + 2 * checkpoint_tick_period_ms(flush_interval_ms).min(decision_ms)
+}
+
 /// §4.7 wedged-tail audit bound (design-smo-replay-currency PR 4
 /// clause b; the [`KvMetaBackend::checkpoint_past`] precedent's shape):
 /// consecutive barriered cycles with retirements parked, none released,
@@ -1164,8 +1177,21 @@ async fn checkpoint_task(
             Ok(()) => std::time::Instant::now() >= next_tick,
             Err(_) => true,
         };
+        // The writer→member checkpoint composite (§6.8 item 3 adjudication
+        // item 4): while the freed-offset valve is asking its readers to
+        // answer sooner, the writer's checkpoint ceiling is the elastic one
+        // (`P/2` against the reader's poll) — read once per iteration, one
+        // `ArcSwap` load; `None` on every mount without an armed plane and
+        // whenever no ask is in force, which leaves the shipped constant
+        // and tick untouched. The tick tightens to the ceiling only where
+        // the flush cadence is coarser than it (a slow-flush venue): the
+        // decision below is evaluated per tick, so a ceiling finer than
+        // the tick would otherwise be unreachable.
+        let elastic_ceiling = crate::free_grace::checkpoint_ceiling_in_force_ms();
+        let period_now =
+            elastic_ceiling.map_or(period, |c| period.min(std::time::Duration::from_millis(c)));
         if cadence {
-            next_tick = std::time::Instant::now() + period;
+            next_tick = std::time::Instant::now() + period_now;
         }
         let Some(be) = weak.upgrade() else {
             return; // backend dropped without shutdown: exit, leak nothing
@@ -1187,9 +1213,17 @@ async fn checkpoint_task(
         // never a constant; the strict cadence's `0` drains one item per
         // wake, which is still progress). The shutdown tick is unbounded:
         // its final cycle must see every queued append.
-        let drain_deadline = (!shutting_down).then(|| std::time::Instant::now() + period);
+        let drain_deadline = (!shutting_down).then(|| std::time::Instant::now() + period_now);
         if cadence || shutting_down {
-            if let Err(e) = tick(&be, &mut last_checkpoint, shutting_down, drain_deadline).await {
+            if let Err(e) = tick(
+                &be,
+                &mut last_checkpoint,
+                shutting_down,
+                drain_deadline,
+                elastic_ceiling,
+            )
+            .await
+            {
                 // ENG-3 re-triage: error, not warn — a failed cycle can
                 // carry a failed allocator-bitmap page write (DUR-4's
                 // dirty-set exposure), and this line is the operator's
@@ -1261,12 +1295,14 @@ async fn maintenance_pass(
 /// barrier → checkpoint when due. `final_cycle` (shutdown) drains
 /// in-flight commits first and forces a full cycle with an immediate
 /// post-ledger barrier, leaving `tail == head` — an empty replay window
-/// for the next mount.
+/// for the next mount. `elastic_ceiling` is the freed-offset composite's
+/// checkpoint ceiling in force (`None` = the shipped `CHECKPOINT_MAX_AGE_MS`).
 async fn tick(
     be: &Arc<KvMetaBackend>,
     last_checkpoint: &mut std::time::Instant,
     final_cycle: bool,
     drain_deadline: Option<std::time::Instant>,
+    elastic_ceiling: Option<u64>,
 ) -> Result<(), KvError> {
     if final_cycle {
         // New mutations are already refused (`write_gate`); wait out the
@@ -1339,6 +1375,13 @@ async fn tick(
             dirty_nodes += 1;
         }
     });
+    // The freed-offset composite's ceiling in force replaces the constant
+    // while a reader ask is live (`P/2` — every reader pass finds a new
+    // root); `None` is the shipped decision verbatim. Compared against the
+    // ELAPSED time, so a ceiling that tightens mid-interval fires at once
+    // — what lets an advertised ceiling be a promise about commits that
+    // preceded the grant, not only about the ones that follow it.
+    let ceiling_ms = elastic_ceiling.map_or(CHECKPOINT_MAX_AGE_MS, u128::from);
     let due = final_cycle
         || ring_pressure
         // The cap is resolved ONCE at open (`KvMetaBackend::dirty_node_cap`
@@ -1347,13 +1390,16 @@ async fn tick(
         // sysinfo probes in `resolve_budget_now`) was an allocation stream
         // that broke the op-economy allocation-free contract (2026-08-02).
         || dirty_nodes > be.dirty_node_cap()
-        || last_checkpoint.elapsed().as_millis() >= CHECKPOINT_MAX_AGE_MS;
+        || last_checkpoint.elapsed().as_millis() >= ceiling_ms;
     if due && (final_cycle || dirty_nodes > 0 || distance > 0) {
         // Immediate post-ledger barrier under pressure or at shutdown:
         // reclamation must not lag a cycle when parkers wait on it.
         be.checkpoint_cycle(&mut smo, ring_pressure || final_cycle)
             .await?;
         *last_checkpoint = std::time::Instant::now();
+        if elastic_ceiling.is_some() {
+            crate::free_grace::note_elastic_checkpoint_cycle();
+        }
     }
     if final_cycle {
         // Shutdown guarantee (`KvMetaBackend::shutdown`: "tail == head ⇒

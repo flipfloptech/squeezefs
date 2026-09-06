@@ -176,7 +176,22 @@
 //! (`note_member_ack_advanced`, `SQUEEZEFS_FREE_GRACE_REFRESH_ON_ACK`)
 //! — together −922 ms in-process, closure exact, zero fences. A faster
 //! writer checkpoint cadence alone was measured INERT: the reader
-//! qualifies on the time bound, never on observing the checkpoint.
+//! qualifies on the time bound, never on observing the checkpoint. It
+//! pays as the **writer→member checkpoint composite** (adjudication
+//! item 4, user decision 2026-09-06): while the valve is ASKING (a prod
+//! in force) the writer's checkpoint ceiling is `P/2` against the
+//! reader's routine poll ([`elastic_checkpoint_ceiling_ms`],
+//! [`checkpoint_ceiling_in_force_ms`] — the KV checkpoint task reads it
+//! per tick), every grant CARRIES the live ceiling
+//! ([`crate::membership::Grant::checkpoint_ceiling_ms`] via
+//! [`advertise_checkpoint_ceiling`], a promise the writer honours for one
+//! routine ceiling past the grant), and on the member it is the prod
+//! floor ([`ProdParams::floor_for`]) and L2b's pass floor
+//! ([`reader_pass_interval`]) — so passes and beats run at `P/2` too, at
+//! the accepted cost of 2× lease-lane beats and 2× checkpoint cycles
+//! while an ask is in force. `SQUEEZEFS_FREE_GRACE_CHECKPOINT_COMPOSITE=0`
+//! is the shipped shape exactly; the published `reader_staleness_bound_ms`
+//! never moves (the elastic cadence sits inside it).
 //!
 //! # The ladder re-derivation (user decision 2026-09-06)
 //!
@@ -374,6 +389,44 @@ static BOUND_REFRESHES_ON_ACK: AtomicU64 = AtomicU64::new(0);
 /// more than half the time).
 static BOUND_SCAN_EWMA_NS: AtomicU64 = AtomicU64::new(0);
 
+// -- the writer→member checkpoint composite (adjudication item 4, 2026-09-06) --
+//
+// Contract 31 measured a faster writer checkpoint INERT alone: the reader
+// qualifies a label on a TIME bound, never on observing the checkpoint,
+// and at the shipped cadences every pass already advances. It pays only
+// as the COMPOSITE the user approved on 2026-09-06: while the valve is
+// ASKING members to answer sooner (a prod in force — rung (a) off the
+// space runway or rung a′ off the demand mark), the writer does its half
+// of the ask — its checkpoint ceiling becomes P/2 against the reader's
+// routine poll P (the Nyquist bound: a new root in every pass window) —
+// and the live ceiling travels to every member on the grant
+// (`Grant::checkpoint_ceiling_ms`), where it is the prod floor AND L2b's
+// pass floor, so passes and beats run at P/2 too: the learn, the
+// qualify-rounding and the carry terms of the hold halve. The accepted
+// cost: 2× lease-lane beats and 2× checkpoint cycles while an ask is in
+// force. `SQUEEZEFS_FREE_GRACE_CHECKPOINT_COMPOSITE=0` restores the
+// shipped shape exactly (KD-FG-7).
+
+/// Checkpoint cycles the task ran with the elastic ceiling in force
+/// (`free_grace_checkpoint_elastic_cycles` — the writer-side engagement).
+static CHECKPOINT_ELASTIC_CYCLES: AtomicU64 = AtomicU64::new(0);
+/// **The promise pair**: the smallest elastic ceiling advertised on a
+/// grant whose window is still open, and the owner instant that window
+/// closes — one routine ceiling past the LAST elastic advertisement. A
+/// grant advertising `c` at `t` promises "every commit before this grant
+/// is checkpointed within `c` of it"; the writer therefore enforces
+/// `min(the live derivation, this pair)` and relaxes no sooner than every
+/// advertised window has closed, whatever the ask or the lever did since.
+/// (Two words, no lock: a first-after-lapse race between two concurrent
+/// grants can keep the LARGER of two derivations taken µs apart — the
+/// same P/2 with at most the EWMA cycle floor's drift between them.)
+static PROMISED_CEILING_MS: AtomicU64 = AtomicU64::new(0);
+static PROMISED_UNTIL_MS: AtomicU64 = AtomicU64::new(0);
+/// L2b's pass FLOOR deposit (the composite's member side): the writer's
+/// checkpoint ceiling advertised on the grant that carried the ask in
+/// `PASS_PROD_MS` (`0` = none advertised — the routine constant applies).
+static PASS_FLOOR_MS: AtomicU64 = AtomicU64::new(0);
+
 // -- the lane-visible decomposition (finding 15 term 2, 2026-09-06) ----------
 //
 // Where a RELEASED offset goes before a co-writer can mint it: a released
@@ -545,6 +598,16 @@ struct Plane {
     /// ack ladder runs on; the explicit-bounds test seam approximates it
     /// with the pressure bound).
     demand_floor_ms: u64,
+    /// The reader's ROUTINE poll interval `P`
+    /// ([`crate::ro_coherence::reader_revalidate_interval`]), ms — the
+    /// Nyquist input of the elastic checkpoint ceiling. Resolved once at
+    /// arm: the derivation reads the environment.
+    reader_poll_ms: u64,
+    /// The writer's ROUTINE effective checkpoint ceiling
+    /// ([`writer_routine_checkpoint_ceiling_ms`]), ms — what a grant
+    /// advertises with no ask in force and the cap the elastic ceiling can
+    /// never exceed.
+    writer_routine_ceiling_ms: u64,
 }
 
 static PLANE: once_cell::sync::Lazy<ArcSwapOption<Plane>> =
@@ -667,6 +730,9 @@ fn arm_plane(
         valve,
         reading_ttl_ms,
         demand_floor_ms: demand_floor.as_millis() as u64,
+        reader_poll_ms: (crate::ro_coherence::reader_revalidate_interval().as_millis() as u64)
+            .max(1),
+        writer_routine_ceiling_ms: writer_routine_checkpoint_ceiling_ms(),
     })));
     if !valve {
         log::warn!(
@@ -782,6 +848,203 @@ pub fn checkpoint_cycle_ms() -> u64 {
 /// Checkpoint marks recorded on the armed plane (`free_grace_checkpoint_marks`).
 pub fn checkpoint_marks() -> u64 {
     CHECKPOINT_MARK_COUNT.load(Ordering::Relaxed)
+}
+
+// ---------------------------------------------------------------------------
+// The writer→member checkpoint composite (adjudication item 4)
+// ---------------------------------------------------------------------------
+
+/// **The writer's ROUTINE effective checkpoint ceiling**, ms: the KV
+/// checkpoint task decides `elapsed ≥ CHECKPOINT_MAX_AGE_MS` once per
+/// flush-cadence tick, so the cadence it actually keeps is
+/// `max(tick, CHECKPOINT_MAX_AGE_MS)` — the constant on every venue whose
+/// flush interval is below one second (the shipped 50 ms default), the
+/// tick itself on a slow-flush venue. The SAME derivation
+/// `resolve_revalidate_interval_ms` performs for the reader's poll (with
+/// no override), so the two cannot drift. What a grant advertises when no
+/// ask is in force — an honest number on every venue, where the constant
+/// alone is not.
+pub fn writer_routine_checkpoint_ceiling_ms() -> u64 {
+    crate::meta_backend::kv::revalidate::resolve_revalidate_interval_ms(
+        crate::meta_backend::resolve_flush_interval_ms(),
+        None,
+    )
+    .max(1)
+}
+
+/// **The elastic checkpoint ceiling — the pure form** (tie-tested in
+/// `tests/derivation_sweep_tests.rs`): half the reader's routine poll
+/// `P` — the Nyquist bound that puts a new root in every pass window
+/// however the two cadences phase — floored at twice the checkpoint
+/// cycle's own measured cost (a cycle may not run more than half the
+/// time: lever (d)'s law for the bound scan, applied to the checkpoint)
+/// and never slower than the writer's routine ceiling. One millisecond is
+/// the physical minimum (the clocks' grain).
+pub fn elastic_checkpoint_ceiling_ms(reader_poll_ms: u64, cycle_ms: u64, routine_ms: u64) -> u64 {
+    (reader_poll_ms / 2)
+        .max(cycle_ms.saturating_mul(2))
+        .max(1)
+        .min(routine_ms.max(1))
+}
+
+/// `true` ⇔ the valve is ASKING: a prod cadence is in force (rung (a) off
+/// the space runway or rung a′ off the demand mark — both deposit into the
+/// same word). The composite's engagement predicate: the writer does its
+/// half of the ask exactly while the members are asked for theirs. The
+/// L4 demand mark alone would not do — site 0's age arm needs the ring's
+/// front past the physics floor, which a healthy coupled loop (the fleet-
+/// cadence shape, hold ≈ 7.7 s against an 8.02 s floor) never reaches, and
+/// the fleet's demand came from the ENOSPC edges this composite exists to
+/// remove; the prod is the signal both arms already agree on.
+fn ask_in_force(plane: &Plane) -> bool {
+    plane.valve
+        && PROD_RENEW_MS.load(Ordering::Relaxed) != 0
+        && plane.clock.now_ms() < PROD_UNTIL_MS.load(Ordering::Relaxed)
+}
+
+/// The composite's live derivation on `plane`: `Some(ceiling)` while the
+/// lever is on and an ask is in force AND the derived ceiling actually sits
+/// below the routine (a cycle cost that pins it at the routine is not
+/// elastic); `None` otherwise.
+fn elastic_ceiling_now(plane: &Plane) -> Option<u64> {
+    if !checkpoint_composite_enabled() || !ask_in_force(plane) {
+        return None;
+    }
+    let c = elastic_checkpoint_ceiling_ms(
+        plane.reader_poll_ms,
+        checkpoint_cycle_ms(),
+        plane.writer_routine_ceiling_ms,
+    );
+    (c < plane.writer_routine_ceiling_ms).then_some(c)
+}
+
+/// The promise pair's reading at `now`: the smallest ceiling advertised on
+/// a grant whose window is still open.
+fn promised_ceiling_ms(now: u64) -> Option<u64> {
+    (now < PROMISED_UNTIL_MS.load(Ordering::Relaxed))
+        .then(|| PROMISED_CEILING_MS.load(Ordering::Relaxed))
+        .filter(|&c| c != 0)
+}
+
+/// **The checkpoint ceiling IN FORCE** — what the KV checkpoint task
+/// compares its elapsed-since-last-cycle against and tightens its tick to
+/// (`checkpoint.rs`). `None` = the routine posture: the task's shipped
+/// constant and tick, untouched. `Some(c)` = the smaller of the live
+/// derivation and the promise pair, so an advertised window is honoured
+/// after the ask lapses (or the lever is latched off) until it closes.
+/// One `ArcSwap` load and a few relaxed loads per tick; `None` on a
+/// plane-less mount before anything else is read.
+pub fn checkpoint_ceiling_in_force_ms() -> Option<u64> {
+    let plane = PLANE.load();
+    let plane = plane.as_ref()?;
+    let now = plane.clock.now_ms();
+    match (elastic_ceiling_now(plane), promised_ceiling_ms(now)) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (Some(a), None) => Some(a),
+        (None, Some(b)) => Some(b),
+        (None, None) => None,
+    }
+}
+
+/// **The published gauge** (`free_grace_checkpoint_ceiling_ms`, the
+/// `fence_bound_ms` precedent: the unadorned name is what the machinery is
+/// enforcing): the ceiling in force, else the writer's routine ceiling;
+/// the constant on a plane-less mount.
+pub fn checkpoint_ceiling_ms() -> u64 {
+    let plane = PLANE.load();
+    let Some(plane) = plane.as_ref() else {
+        return crate::meta_backend::kv::checkpoint::CHECKPOINT_MAX_AGE_MS as u64;
+    };
+    checkpoint_ceiling_in_force_ms().unwrap_or(plane.writer_routine_ceiling_ms)
+}
+
+/// **The grant's advertisement** — called by the membership owner at the
+/// ONE place a grant is minted (`MembershipOwner::grant_for`): the ceiling
+/// this grant promises, and the act of recording that promise. `0` on an
+/// owner with no grace plane (it has nothing honest to say about
+/// checkpoints — the member falls back to its own derivation of the
+/// landing ceiling). An elastic value opens (or tightens) the promise
+/// window for one routine ceiling from now; a routine value promises
+/// nothing beyond what the routine enforces.
+///
+/// What travels is the **landing** ceiling (ladder re-derivation item 1
+/// composed with this composite): the decision ceiling the task enforces
+/// plus the two tick-granularity terms its `tick` evaluates behind —
+/// `checkpoint_landing_ceiling_ms` for the routine posture (the trigger +
+/// 2 × the flush tick: 1,100 ms on the shipped 50 ms flush),
+/// `checkpoint_landing_ceiling_for_elastic` for an elastic one (the task
+/// tightens its tick to the decision, so `c + 2 × min(tick, c)`). The
+/// promise pair below is kept in DECISION terms — it is what the task
+/// compares elapsed time against.
+pub fn advertise_checkpoint_ceiling() -> u64 {
+    let plane = PLANE.load();
+    let Some(plane) = plane.as_ref() else {
+        return 0;
+    };
+    let flush_ms = crate::meta_backend::resolve_flush_interval_ms();
+    let Some(c) = elastic_ceiling_now(plane) else {
+        return crate::meta_backend::kv::checkpoint::checkpoint_landing_ceiling_ms(flush_ms);
+    };
+    let now = plane.clock.now_ms();
+    let until = now.saturating_add(plane.writer_routine_ceiling_ms);
+    let was_until = PROMISED_UNTIL_MS.fetch_max(until, Ordering::Relaxed);
+    if was_until <= now {
+        // No open window: this grant opens one at its own value.
+        PROMISED_CEILING_MS.store(c, Ordering::Relaxed);
+    } else {
+        // An open window: only ever tighten it (a larger promise is
+        // already honoured by the smaller one in force).
+        PROMISED_CEILING_MS.fetch_min(c, Ordering::Relaxed);
+    }
+    crate::meta_backend::kv::checkpoint::checkpoint_landing_ceiling_for_elastic(c, flush_ms)
+}
+
+/// Count one checkpoint cycle run with the elastic ceiling in force
+/// (called by the checkpoint task's tick beside the cycle).
+pub fn note_elastic_checkpoint_cycle() {
+    CHECKPOINT_ELASTIC_CYCLES.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Checkpoint cycles run with the elastic ceiling in force
+/// (`free_grace_checkpoint_elastic_cycles`; 0 without an ask, 0 under
+/// `CHECKPOINT_COMPOSITE=0`).
+pub fn checkpoint_elastic_cycles() -> u64 {
+    CHECKPOINT_ELASTIC_CYCLES.load(Ordering::Relaxed)
+}
+
+/// The `SQUEEZEFS_FREE_GRACE_CHECKPOINT_COMPOSITE` lever's latch (the
+/// `ACK_PIPELINE` pattern): the writer→member checkpoint composite. `0` =
+/// the writer's shipped checkpoint cadence, the routine ceiling on every
+/// grant, the constant as the member's floor — the shipped shape exactly.
+static CHECKPOINT_COMPOSITE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+pub(crate) fn checkpoint_composite_enabled() -> bool {
+    match CHECKPOINT_COMPOSITE.load(Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            let on = crate::env_knobs::bool_knob("SQUEEZEFS_FREE_GRACE_CHECKPOINT_COMPOSITE", true);
+            CHECKPOINT_COMPOSITE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+            on
+        }
+    }
+}
+
+/// Test seam (the `test_set_ack_pipeline` shape).
+pub fn test_set_checkpoint_composite(on: Option<bool>) {
+    CHECKPOINT_COMPOSITE.store(
+        match on {
+            Some(true) => 1,
+            Some(false) => 2,
+            None => 0,
+        },
+        Ordering::Relaxed,
+    );
+}
+
+/// Test seam: `true` ⇔ a preset was in force.
+pub fn test_clear_checkpoint_composite() -> bool {
+    CHECKPOINT_COMPOSITE.swap(0, Ordering::Relaxed) != 0
 }
 
 /// Stamp one release into the hold-phase histograms: `label` is the
@@ -1011,12 +1274,9 @@ fn release_on_ack() {
         return;
     };
     let now = plane.clock.now_ms();
-    let floor_ms = plane
-        .prod
-        .as_ref()
-        .map(|p| p.floor_ms)
-        .unwrap_or(plane.reading_ttl_ms)
-        .max(1);
+    // The floor in force (under the composite the members answer twice
+    // as often, so the min can change twice as often — the limit follows).
+    let floor_ms = live_prod_floor_ms(plane);
     let members = MEMBERS.load(Ordering::Relaxed);
     let scan_ms = BOUND_SCAN_EWMA_NS
         .load(Ordering::Relaxed)
@@ -1296,8 +1556,13 @@ pub struct ProdParams {
     /// The terms of the cycle a faster beat CANNOT shrink: the reader's
     /// three staleness bounds, the skew and `D_purge`.
     reader_lag_ms: u64,
-    /// [`ack_refresh_floor`].
+    /// [`ack_refresh_floor`] — the ROUTINE floor.
     floor_ms: u64,
+    /// The reader's routine pass interval `P` and the clock-skew bound —
+    /// the live floor's two inputs beside the writer's advertised ceiling
+    /// ([`Self::floor_for`]).
+    pass_ms: u64,
+    skew_ms: u64,
 }
 
 impl ProdParams {
@@ -1309,20 +1574,38 @@ impl ProdParams {
             renew_ms,
             reader_lag_ms: cycle_ms.saturating_sub(renew_ms.saturating_mul(3)),
             floor_ms: ack_refresh_floor(clocks).as_millis() as u64,
+            pass_ms: crate::ro_coherence::reader_revalidate_interval().as_millis() as u64,
+            skew_ms: clocks.skew_max.as_millis() as u64,
         }
     }
 
+    /// **The LIVE acknowledgement-refresh floor** for a writer whose
+    /// checkpoint ceiling is `checkpoint_ceiling_ms` (the composite): a
+    /// member's pass runs at `clamp(ask, ceiling, P)`, so its answer can
+    /// change every `min(P, ceiling)` — floored at the clock-skew bound
+    /// like the routine floor. At the writer's routine ceiling this IS
+    /// [`ack_refresh_floor`] (the two derive from the same cadence unless
+    /// an explicit `SQUEEZEFS_META_REVALIDATE_MS` polls SLOWER than the
+    /// writer checkpoints); the call sites consult it only while an
+    /// elastic ceiling is in force, so the routine posture is `floor_ms`
+    /// verbatim either way.
+    pub fn floor_for(&self, checkpoint_ceiling_ms: u64) -> u64 {
+        self.pass_ms.min(checkpoint_ceiling_ms).max(self.skew_ms)
+    }
+
     /// The cadence to grant a member the writer is waiting on, or `None`
-    /// when the routine one already fits inside the runway.
+    /// when the routine one already fits inside the runway. `floor_ms` is
+    /// the floor in force ([`Self::floor_for`]; the routine one is
+    /// [`ack_refresh_floor`]).
     ///
     /// `ack_cycle = 3 × beat + reader_lag`, so the beat that lets a whole
     /// acknowledgement cycle complete before the supply runs out is
     /// `(runway − reader_lag) / 3`. Below the floor the answer cannot
     /// arrive any sooner however hard the writer asks — that is when rung
     /// (b) takes over.
-    pub fn cadence_for(&self, runway_ms: u64) -> Option<u64> {
+    pub fn cadence_for(&self, runway_ms: u64, floor_ms: u64) -> Option<u64> {
         let want = runway_ms.saturating_sub(self.reader_lag_ms) / 3;
-        let cadence = want.clamp(self.floor_ms.min(self.renew_ms), self.renew_ms);
+        let cadence = want.clamp(floor_ms.min(self.renew_ms), self.renew_ms);
         (cadence < self.renew_ms).then_some(cadence)
     }
 }
@@ -1661,6 +1944,22 @@ impl GraceRing {
     }
 }
 
+/// **The acknowledgement-refresh floor IN FORCE** — rung (a)'s cadence
+/// floor and the rate-limit floor of lever (d) and the lane push: the
+/// routine [`ack_refresh_floor`] (resolved at arm into `ProdParams`), or,
+/// while the composite's elastic checkpoint ceiling is in force, the
+/// halved floor a member's pass can now follow ([`ProdParams::floor_for`]).
+/// The explicit-bounds seam (no `ProdParams`) reads its reading TTL as
+/// before. Never 0.
+fn live_prod_floor_ms(plane: &Plane) -> u64 {
+    let floor = match (plane.prod.as_ref(), checkpoint_ceiling_in_force_ms()) {
+        (Some(p), Some(ceiling)) => p.floor_for(ceiling),
+        (Some(p), None) => p.floor_ms,
+        (None, _) => plane.reading_ttl_ms,
+    };
+    floor.max(1)
+}
+
 /// **Rung (b)** — the fence deadline this harvest evaluates, and the
 /// counting of the act.
 ///
@@ -1729,14 +2028,18 @@ fn note_pressure(runway: Option<u64>, newest_label: u64) {
     // feeds rung (b): the fence deadline below tightens off the space
     // runway alone — a demand-prodded healthy reader is asked to answer
     // sooner, never fenced sooner (constraint 2, by construction).
-    let space_cadence = plane.prod.as_ref().and_then(|p| p.cadence_for(runway));
-    let demand = demand_enabled() && demand_live();
-    let floor_ms = plane
+    // The floor in force: the routine `ack_refresh_floor`, or — while the
+    // composite's elastic ceiling is in force — the halved one a member's
+    // pass can now follow (`ProdParams::floor_for`). Read once per
+    // harvest; the first ask under a fresh storm is computed at the
+    // routine floor and puts the ask in force, the next harvest reads the
+    // halved one.
+    let floor_ms = live_prod_floor_ms(plane);
+    let space_cadence = plane
         .prod
         .as_ref()
-        .map(|p| p.floor_ms)
-        .unwrap_or(plane.reading_ttl_ms)
-        .max(1);
+        .and_then(|p| p.cadence_for(runway, floor_ms));
+    let demand = demand_enabled() && demand_live();
     // `cadence_for` clamps into [floor, renew], so under demand the
     // effective cadence is exactly the floor — the strongest honest ask.
     let cadence = match (space_cadence, demand) {
@@ -1836,12 +2139,9 @@ fn refresh_bound_on_dirty() {
         return;
     };
     let now = plane.clock.now_ms();
-    let floor_ms = plane
-        .prod
-        .as_ref()
-        .map(|p| p.floor_ms)
-        .unwrap_or(plane.reading_ttl_ms)
-        .max(1);
+    // The floor in force (under the composite the members answer twice
+    // as often, so the min can change twice as often — the limit follows).
+    let floor_ms = live_prod_floor_ms(plane);
     let members = MEMBERS.load(Ordering::Relaxed);
     let scan_ms = BOUND_SCAN_EWMA_NS
         .load(Ordering::Relaxed)
@@ -2503,9 +2803,13 @@ fn demand_live() -> bool {
 /// **L2b, the member side** (§5.2b): a renewal grant adopted with a
 /// tightened `renew_ms` IS the pass-cadence ask — deposit it, TTL'd like
 /// the prod (two beats of the prodded cadence, so a quiet window restores
-/// the routine cadence within one reading TTL).
-pub fn note_prodded_renewal(renew_ms: u64, member_now_ms: u64) {
+/// the routine cadence within one reading TTL) — together with the
+/// writer's checkpoint ceiling the SAME grant advertised
+/// (`Grant::checkpoint_ceiling_ms`; `0` = none, the routine constant
+/// applies): the ask's floor (the composite, adjudication item 4).
+pub fn note_prodded_renewal(renew_ms: u64, checkpoint_ceiling_ms: u64, member_now_ms: u64) {
     PASS_PROD_MS.store(renew_ms, Ordering::Relaxed);
+    PASS_FLOOR_MS.store(checkpoint_ceiling_ms, Ordering::Relaxed);
     PASS_PROD_UNTIL_MS.store(
         member_now_ms.saturating_add(renew_ms.saturating_mul(2)),
         Ordering::Relaxed,
@@ -2513,12 +2817,15 @@ pub fn note_prodded_renewal(renew_ms: u64, member_now_ms: u64) {
 }
 
 /// **L2b, the pass-cadence resolver** — called by the revalidation loop
-/// once per iteration: `clamp(prodded renew_ms, CHECKPOINT_MAX_AGE_MS,
-/// routine)` while the deposit is live and the lever is on; the routine
-/// cadence otherwise. The floor is physics, not tuning (polling faster
-/// than the writer's checkpoint ceiling observes nothing new), and on a
-/// venue whose routine interval already sits AT the floor this is
-/// structurally inert (nothing to tighten — no engagement counted).
+/// once per iteration: `clamp(prodded renew_ms, the writer's advertised
+/// checkpoint ceiling, routine)` while the deposit is live and the lever
+/// is on; the routine cadence otherwise. The floor is physics, not tuning
+/// (a pass faster than the writer's checkpoint cadence finds nothing new);
+/// its INPUT is live since the composite (user decision 2026-09-06): a
+/// grant advertising no ceiling — or the composite lever off — floors at
+/// `CHECKPOINT_MAX_AGE_MS`, the shipped law verbatim. On a venue whose
+/// routine interval already sits AT the routine floor this is
+/// structurally inert until the writer's ceiling drops below it.
 pub fn reader_pass_interval(routine: Duration, member_now_ms: u64) -> Duration {
     let routine_ms = routine.as_millis() as u64;
     let out = 'tightened: {
@@ -2532,7 +2839,13 @@ pub fn reader_pass_interval(routine: Duration, member_now_ms: u64) -> Duration {
         if asked == 0 {
             break 'tightened routine_ms;
         }
-        let floor = crate::meta_backend::kv::checkpoint::CHECKPOINT_MAX_AGE_MS as u64;
+        let constant = crate::meta_backend::kv::checkpoint::CHECKPOINT_MAX_AGE_MS as u64;
+        let advertised = PASS_FLOOR_MS.load(Ordering::Relaxed);
+        let floor = if checkpoint_composite_enabled() && advertised != 0 {
+            advertised
+        } else {
+            constant
+        };
         let tightened = asked.max(floor).min(routine_ms);
         if tightened < routine_ms {
             PASS_PRODS.fetch_add(1, Ordering::Relaxed);
@@ -2541,6 +2854,24 @@ pub fn reader_pass_interval(routine: Duration, member_now_ms: u64) -> Duration {
     };
     PASS_INTERVAL_MS.store(out, Ordering::Relaxed);
     Duration::from_millis(out)
+}
+
+/// **The reader-side acknowledgement-refresh floor** — the pipeline-depth
+/// derivation's input ([`AckInputs::refresh_floor_ms`]): the member's pass
+/// cadence floored at the clock skew, `ProdParams::floor_for`'s law read
+/// with the ceiling this member learned. With the composite lever off the
+/// ceiling term is absent and this is the shipped `max(P, skew)` verbatim
+/// (a slow-flush venue's `P` above the constant must not shrink its depth
+/// input on the A/B control); with it on, an advertised P/2 halves the
+/// floor — labels arrive at the halved beat, and a depth derived from the
+/// routine floor would saturate and displace unqualified candidates.
+pub fn reader_refresh_floor_ms(pass_ms: u64, checkpoint_ceiling_ms: u64, skew_ms: u64) -> u64 {
+    let ceiling = if checkpoint_composite_enabled() {
+        checkpoint_ceiling_ms
+    } else {
+        u64::MAX
+    };
+    pass_ms.min(ceiling).max(skew_ms)
 }
 
 /// The mount's ladder (one reader per process — the
@@ -2597,9 +2928,17 @@ pub fn reader_pass_completed(pass_start_ms: u64, advanced: bool) -> Option<u64> 
         },
         drain_budget_ms: session.d_purge_ms(),
         // The pass cadence's own floor (`ack_refresh_floor`'s arithmetic,
-        // reader-side): the pipeline-depth derivation's input.
-        refresh_floor_ms: (crate::ro_coherence::reader_revalidate_interval().as_millis() as u64)
-            .max(session.skew_max_ms()),
+        // reader-side — `ProdParams::floor_for`'s law with the ceiling
+        // this member learned): the pipeline-depth derivation's input.
+        // Under the composite labels arrive at the halved beat, so the
+        // depth must derive from the halved floor or the queue saturates
+        // and displaces unqualified candidates (measured: the hold GREW
+        // 800 ms with the routine floor here).
+        refresh_floor_ms: reader_refresh_floor_ms(
+            crate::ro_coherence::reader_revalidate_interval().as_millis() as u64,
+            session.checkpoint_ceiling_ms(),
+            session.skew_max_ms(),
+        ),
     });
     if let Some(label) = out {
         session.ack_free_epoch(label);
@@ -3098,6 +3437,13 @@ pub fn stats_snapshot() -> serde_json::Value {
                 "reader_serves_inflight": crate::ro_coherence::serves_inflight(),
                 "reader_serve_step_races": crate::ro_coherence::serve_step_races(),
                 "reader_serve_slot_overruns": crate::ro_coherence::serve_slot_overruns(),
+                // The composite: the writer's LANDING ceiling this member
+                // learned with its label (the qualify term's and the pass
+                // floor's input) — named apart from the writer's own
+                // `free_grace_checkpoint_ceiling_ms`, which is the DECISION
+                // ceiling its task enforces (the landing one is that plus
+                // two ticks).
+                "free_grace_advertised_ceiling_ms": session.checkpoint_ceiling_ms(),
             });
         }
         return serde_json::json!({ "free_grace_mode": "off" });
@@ -3149,6 +3495,11 @@ pub fn stats_snapshot() -> serde_json::Value {
         "free_grace_hold_ms": hold_ms(),
         "free_grace_checkpoint_marks": checkpoint_marks(),
         "free_grace_checkpoint_cycle_ms": checkpoint_cycle_ms(),
+        // The composite (adjudication item 4): the checkpoint ceiling in
+        // force (the routine writer ceiling with no ask; P/2 under one)
+        // and the cycles run under the elastic one.
+        "free_grace_checkpoint_ceiling_ms": checkpoint_ceiling_ms(),
+        "free_grace_checkpoint_elastic_cycles": checkpoint_elastic_cycles(),
         "free_grace_member_ack_lag_ms": member_ack_lag_json(),
         "free_grace_member_ack_lag_census": member_ack_lag_census_json(),
         // Lever (d)'s engagement and the scan cost its rate limit floors on.
@@ -3266,6 +3617,10 @@ pub fn reset_for_test() {
         &DRAIN_LAG_MS,
         &DRAIN_OBSERVED,
         &DRAIN_OVERDUE,
+        &CHECKPOINT_ELASTIC_CYCLES,
+        &PROMISED_CEILING_MS,
+        &PROMISED_UNTIL_MS,
+        &PASS_FLOOR_MS,
     ] {
         c.store(0, Ordering::Relaxed);
     }
@@ -3277,6 +3632,7 @@ pub fn reset_for_test() {
     test_set_demand(None);
     test_set_pass_elastic(None);
     test_set_lane_push(None);
+    test_set_checkpoint_composite(None);
     uninstall_release_hook();
     uninstall_lane_supply_source();
     RESIDENCE_MS.reset();

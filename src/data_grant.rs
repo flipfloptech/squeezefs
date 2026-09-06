@@ -306,6 +306,9 @@ impl LeaseFrame {
             // the MEMBERSHIP renewal (the 1 Hz prodded beat), never this
             // slower lease.
             lane_supply_blocks: 0,
+            // Nor the writer's checkpoint ceiling — it rides the membership
+            // grant that carries the label it is a promise about.
+            checkpoint_ceiling_ms: 0,
         }
     }
 }

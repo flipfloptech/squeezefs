@@ -55,7 +55,7 @@ maintained; do not resurrect it.
 | `V2-CANDIDATES.md` | the v2 scoping manifest (ranked candidates; rank 1 = TIME_LIMITS, now patch 0028) |
 | `patches/` | `git format-patch` export (0001–0024 Koong + 0025 abort-race + 0026 docs + 0027 seam + 0028 TIME_LIMITS + 0029 retention + 0030 nvme host-scoped subsystems — rung 5b) |
 | `patches-7.1/` | the **linux-7.1.6 rebase** of the same 30 patches (the D13 latest-mainline track — 0030 was AUTHORED here first; see *The 7.1 track* below) |
-| `patches-7.2/` | the **linux-7.2.3 rebase** — **25 patches**: the same series minus the five FUSE prep-refactors upstream 7.2 landed (renumbered contiguously; mapping in *The 7.2 track* below and SERIES.md) |
+| `patches-7.2/` | the **linux-7.2.3 rebase** — **26 patches**: the same series minus the five FUSE prep-refactors upstream 7.2 landed (renumbered contiguously; mapping in *The 7.2 track* below and SERIES.md) **plus 0026**, the per-queue background accounting (COMMIT-lock split) — the first patch AUTHORED on this track (2026-09-06; compile-proven, boot + A/B owed) |
 | `config-base-7.1.2-1.el8.elrepo.x86_64` | the field client's running config (the base; copied read-only 2026-08-01) |
 | `config-fragment` | the ENABLE CHECKLIST — every entry asserted in the final `.config` |
 | `probes/` | capability probes (see below) |
@@ -90,7 +90,7 @@ All gcc-8.5-clean, no libnl/liburing — they compile on the field box.
 ```bash
 docker/kernel-sqz/build.sh            # podman or docker
 # → dist/kernel-sqz/kernel-*.rpm + config-6.19.14-sqz + SHA256SUMS
-TRACK=7.2 docker/kernel-sqz/build.sh  # the 7.2.3 track (25 patches) → config-7.2.3-sqz
+TRACK=7.2 docker/kernel-sqz/build.sh  # the 7.2.3 track (26 patches) → config-7.2.3-sqz
 ```
 
 `TRACK` (default `6.19.14` — **the FIELD build, unchanged**) selects the
@@ -212,8 +212,9 @@ extraction). **6.19.14 stays the FIELD series**; 7.1 and 7.2 are the
 D13 latest-mainline tracks (7.2 supersedes 7.1 as "latest"; 7.1 stays
 in the tree because it is the locally-booted CachyOS line).
 
-**The series is 25 patches on 7.2 — five DROPPED because upstream 7.2
-landed them.** Koong's FUSE prep refactors (v4 patches 13–17: next-req
+**The rebased series is 25 patches on 7.2 — five DROPPED because upstream
+7.2 landed them** (0026, authored here 2026-09-06, makes the track 26 —
+see below). Koong's FUSE prep refactors (v4 patches 13–17: next-req
 split, header copy to/from ring, enum header types, copy-state setup)
 merged in the 7.2 cycle as the `fuse-uring:` series (`6813da095068`,
 `6582f8a06698`, `ba7d47897fd8`, `b2bbd7dcd243`, `c0f9203732fc` — all
@@ -301,3 +302,29 @@ Unlisted patches applied identically (same patch-id). 7.2 numbers.
 7.2 lives in the same CachyOS kernel-manager posture as 7.1 (the notes
 above apply verbatim); the manager's next base bump to a 7.2.y is
 where this concat gets its first boot.
+
+### 0026 — per-queue background accounting (the COMMIT-lock split), 2026-09-06
+
+The first patch **authored on the 7.2 track** (every earlier 7.2 patch is
+a rebase). The e2e perf audit's R-4 ledger
+(`.benchmarks/2026-09-03-r4-reap-thread-economy.md` §2) measured the
+FUSE-over-io_uring queue worker paying **1.9 µs/op of spinlock
+contention** on the kern rand-4k row — `fuse_uring_req_end`'s queue lock
+with the connection-wide `fch->bg_lock` nested in it, plus
+`fuse_request_end`'s own `bg_lock` take — a lock every submitting fio
+thread also takes. 0026 moves background admission to a **per-queue
+ledger under `queue->lock`** (this queue's share of `max_background`;
+for SqueezeFS's `max_background = queues × q_depth` the share is exactly
+the queue's ent count) so neither uring path takes `bg_lock`; the
+classical `/dev/fuse` path, fusectl and the congestion checks keep
+working (details + the five correctness points: the patch's message,
+`docs/design-kernel-bg-per-queue.md`, SERIES.md's 0026 paragraph).
+**Compile-proven** (`make fs/fuse/ io_uring/` clean, `W=1` identical to
+pristine, a `CONFIG_PROVE_LOCKING`/`DEBUG_SPINLOCK` build clean),
+**not boot-tested** — the lever lands on the field A/B row
+(`.benchmarks/rigs/2026-09-06-kernel-bg-per-queue-ab.sh`: kernel A =
+0001–0025 vs B = +0026, same daemon, A A B B across reboots). Backports
+to 7.1.6 and 6.19.14 are owed; the adaptation ledger (7.1's
+`fuse_conn`-resident accounting with no accessors; 6.19's inline finish
+in `fuse_request_end` — the ledger's second caller) is the design note's
+§6.

@@ -188,7 +188,13 @@ applied clean.
 `build-kernel.sh` applies it with `patch -p1 --fuzz=0` (any regression
 in the transplant fails loud at apply time).
 
-## The 7.2 track (`patches-7.2/`) — 25 patches on linux-7.2.3
+## The 7.2 track (`patches-7.2/`) — 26 patches on linux-7.2.3
+
+**2026-09-06: the track is 26 patches** — **0026** (`sqz: fuse-uring
+per-queue background accounting (COMMIT-lock split)`) is the first patch
+AUTHORED on 7.2 (not rebased); see its row and paragraph below. The
+rebase record that follows describes the 25-patch import of 2026-09-03
+and is unchanged.
 
 **Base: linux-7.2.3** (kernel.org stable, the newest 7.2.y on
 2026-09-03 — `releases.json` `latest_stable`; sha256
@@ -247,6 +253,47 @@ stay in the series, as do the 7 FUSE consumer/sqz patches and 0030.
 | 0028 | 0023 | `FUSE_TIME_LIMITS` | applied clean — hunks verified in 7.2's `process_init_reply` `time_gran` block and `fuse_new_init` flag mask |
 | 0029 | 0024 | zc payload retention | **rebased**: `fuse_uring_release_payload()` takes `struct fuse_chan *fch` (`fch->ring` / `fch->connected`), loads the queue with `READ_ONCE(ring->queues[qid])`, dispatch passes `fch`; the RETAIN arm composes with the `ent->cmd` guard (`zero_copied && !retain && ent->cmd`) and the 7.2 `req_end` site passes `false` |
 | 0030 | 0025 | nvme host-scoped fabric subsystems | applied clean (identical patch-id — the region is code-identical 7.1.6 → 7.2.3) |
+| — | **0026** | **sqz: fuse-uring per-queue background accounting (COMMIT-lock split)** | **AUTHORED on 7.2.3, 2026-09-06** (no 7.1/6.19 original yet — backports owed, adaptation ledger in `docs/design-kernel-bg-per-queue.md` §6). `fs/fuse/{dev_uring.c,dev.c,dev_uring_i.h,fuse_dev_i.h}` + the fuse-io-uring rst; zero uapi/Kconfig change; zero hunk overlap with 0001–0025 (it edits `fuse_uring_req_end()`'s bg arm and `fuse_uring_queue_bq_req()`, which 0019/0024 only pass through). Applies `--fuzz=0` on the 0001–0025 tree; the 26-patch chain re-verified fuzz=0 on a fresh base and byte-identical to the git series tip |
+
+**Patch 0026 (sqz-authored, 2026-09-06 — the R-4 ledger's kernel item).**
+The e2e perf audit's reap-thread ledger
+(`.benchmarks/2026-09-03-r4-reap-thread-economy.md` §2, field
+6.19.14-sqz, kern rand-4k 24 × qd8): the FUSE-over-io_uring queue worker
+pays **1.9 µs/op of spinlock contention** on `fuse_uring_req_end`'s queue
+lock + the connection-wide `fch->bg_lock` nested in it and on
+`fuse_request_end`'s second `bg_lock` take — 32 workers ending requests
+against 24 submitters (`fuse_uring_queue_bq_req` takes the same lock).
+0026 gives every `fuse_ring_queue` its own background ledger under the
+`queue->lock` it already holds (`num_background`, `active_background`,
+`bg_blocked`, `bg_waitq`) and a per-queue budget = its share of
+`max_background` (`max_background / nr_queues`, remainder to the lowest
+qids, floor 1 — for SqueezeFS's INIT reply `max_background = queues ×
+q_depth` the share is exactly the queue's ent count), so neither the
+uring submit nor the uring end path takes `bg_lock`; `fuse_get_req`'s
+background wait moves to the submitting task's queue (`fuse_uring_bg_wait`);
+`fuse_chan_num_background` (fusectl, the congestion checks) sums the
+queues locklessly; fusectl `max_background` writes re-gate every queue;
+the classical path is verbatim; `FR_BG_URING` marks the ledger a request
+was charged to so the `fiq->ops` switch-over stragglers stay on the
+connection ledger and abort/teardown credit exactly what was charged (the
+five correctness points are in the commit message). **Semantics change
+stated:** a saturated queue blocks ITS submitters even while siblings have
+room. Design `docs/design-kernel-bg-per-queue.md`; A/B rig
+`.benchmarks/rigs/2026-09-06-kernel-bg-per-queue-ab.sh` (kernel A = 0001–0025
+vs B = +0026, same daemon, A A B B across reboots). **Compile-proven,
+not boot-tested** — the lever holds its slot on the field row.
+
+**Compile proof, 0026** (2026-09-06; `~/sqz-kernel-scratch/build-patched-0026*.log`):
+the 2026-09-03 patched 7.2.3 tree + 0026 (`patch -p1 --fuzz=0`) →
+`make -j16 fs/fuse/ io_uring/` — **0 warnings / 0 errors** (gcc 15.3,
+the same CachyOS `7.1.8-cachyos-lto`-derived config); `W=1` on the eight
+fs/fuse TUs that include the touched headers, patched vs pristine:
+**identical warning sets** (the only lines are cuse.c's pre-existing
+kernel-doc note, both trees); and a second **lockdep build**
+(`CONFIG_PROVE_LOCKING=y CONFIG_DEBUG_SPINLOCK=y CONFIG_DEBUG_LOCK_ALLOC=y
+CONFIG_LOCKDEP=y`, `O=` on the clean 0001–0026 git tree, `olddefconfig`) —
+**0 warnings / 0 errors**. `git diff --stat` of 0026 alone: 5 files,
++335/−44. The runtime lockdep run is the boot test's.
 
 **Compile proof** (2026-09-03): running CachyOS `7.1.8-cachyos-lto`
 config (`/proc/config.gz`; `CONFIG_FUSE_IO_URING=y`,
@@ -274,7 +321,9 @@ apply of the concat lands 0 rejects and produces a tree identical to
 the per-patch apply; the naive single-shot `--dry-run` of the whole
 file reports 92 false FAILED hunks (later hunks depending on earlier
 patches in the same file — the same control the 6.19 and 7.1
-artifacts show).
+artifacts show). **v1 is the 25-patch (0001–0025) artifact — the A arm
+of the 0026 A/B**; a `-v2` concat carrying 0026 is minted when the box
+that boots it is chosen (same `cat` recipe, 26 files).
 
 ## Config
 

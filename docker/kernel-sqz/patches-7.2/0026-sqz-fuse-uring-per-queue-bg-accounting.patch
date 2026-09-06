@@ -1,0 +1,771 @@
+From 3388ee16f5f2ae536894027bc78dfd07d32dae71 Mon Sep 17 00:00:00 2001
+From: sqz kernel recipe <sqz-kernel@squeezefs>
+Date: Sun, 6 Sep 2026 09:00:00 -0400
+Subject: [PATCH 26/26] sqz: fuse-uring per-queue background accounting
+ (COMMIT-lock split)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The finding (SqueezeFS e2e perf audit, R-4 reap-thread economy,
+.benchmarks/2026-09-03-r4-reap-thread-economy.md §2, field 6.19.14-sqz,
+kern rand-4k 24 jobs x qd8, FUSE-over-io_uring 32 x 32, zc + kmbuf): the
+queue worker (fuse3-ur*) costs 17.7 us per 4 KiB random read, 63 % of it
+in the kernel, and 1.9 us of that is pure spinlock contention -
+native_queued_spin_lock_slowpath 7.8 % + _raw_spin_lock 3.1 % of the
+worker's cycles, callers fuse_uring_req_end (3.8 %, the ring queue's lock
++ the connection's bg_lock nested in it) and fuse_request_end (3.1 %, the
+connection's bg_lock again) under fuse_uring_commit_fetch <- io_uring_cmd
+<- io_submit_sqes.  Every COMMIT_AND_FETCH ends a background request
+under a lock that the 24 submitting fio threads (fuse_uring_queue_bq_req)
+and the other 31 workers also take: struct fuse_chan owns ONE bg_lock for
+max_background / num_background / active_background / blocked, and the
+ring's per-CPU queues all share it.  The board item this discharges:
+"per-CPU/per-queue background accounting in patches - expected
+-1.5...-2 us/op on the worker and on every fio thread's submit path".
+
+Mechanism.  Each struct fuse_ring_queue gets its own background ledger
+under the queue->lock it already holds on both paths:
+
+  num_background     requests charged to this queue (FR_BG_URING)
+  active_background  the subset moved fuse_req_bg_queue -> fuse_req_queue
+  bg_blocked         this queue's admission gate
+  bg_waitq           this queue's exclusive waiters
+
+and a per-queue budget fuse_uring_bg_max() = its share of the connection's
+max_background: max_background / nr_queues, the remainder to the lowest
+qids (the shares sum to max_background exactly whenever it is >=
+nr_queues), never below 1 (the historic "one background request per
+queue" floor).  It is derived at each admission from a lockless
+READ_ONCE - max_background only moves through fusectl and abort
+(UINT_MAX) - so the hot paths carry no cache of it.
+
+  * fuse_uring_queue_bq_req(): charge the QUEUE (num_background++,
+    bg_blocked = num >= bg_max), flush against the queue's own budget.
+    No fch->bg_lock.
+  * fuse_uring_flush_bg(): admits while active_background < bg_max.  The
+    lockdep_assert_held(&fch->bg_lock) is gone with the lock.
+  * fuse_uring_req_end(): fuse_uring_bg_finish() - uncharge, re-open the
+    gate when num < bg_max, wake ONE exclusive waiter (the classical
+    wake chain, verbatim, with its waitqueue_active() argument), flush.
+    No fch->bg_lock.
+  * fuse_get_req(): the connection-level gates (INIT, ring readiness,
+    the classical fch->blocked) stay on blocked_waitq; once the ring is
+    ready a background allocation then waits on ITS queue's gate
+    (fuse_uring_bg_wait(), the queue fuse_uring_task_to_queue() names -
+    the queue the submit would land on).  fch->blocked governs the
+    classical path only; the uring paths never read or write it.
+  * fuse_chan_num_background() (fusectl, the readahead/writeback
+    congestion checks) = the classical ledger + a lockless sum of the
+    queues - exact, and off the request path.
+  * fuse_chan_max_background_set() (fusectl) re-gates every queue against
+    its new share outside bg_lock (fuse_uring_bg_limit_changed()).
+  * The classical /dev/fuse path (no ring) keeps the connection-wide
+    accounting verbatim; fuse_request_bg_finish() becomes static to it.
+  * No uapi change.  No Kconfig change.
+
+Correctness, preserved and reasoned:
+
+  (1) No lost wakeups.  Waiters sleep exclusively on the queue's
+      bg_waitq; every gate transition set->cleared happens under
+      queue->lock and is followed by a full wake_up(), and the
+      not-blocked arm's waitqueue_active() wake is safe for exactly the
+      reason the classical code gives: a waiter only sleeps after seeing
+      the gate set, so any waiter the transition's wake_up() did not see
+      observes the clear instead.  One new hazard is closed explicitly:
+      a woken waiter is placed by the CPU it runs on and may resubmit on
+      ANOTHER queue, so a queue's wake chain can run dry with waiters
+      left behind - the last charged request out of a queue wakes them
+      all (fuse_uring_bg_finish()'s drain-time wake_up_all()).  A slot a
+      woken task does not use (allocation failure, request dropped
+      unsent) is passed on (fuse_uring_bg_kick()) like before.
+  (2) Abort with requests queued per queue.  fuse_chan_abort() raises
+      max_background to UINT_MAX (now WRITE_ONCE), so
+      fuse_uring_abort_end_requests()'s flush moves every queued
+      background request to fuse_req_queue; the queue is stopped, its
+      gate opened and its waiters released under the same lock.  Every
+      path that ends a charged request WITHOUT fuse_uring_req_end() -
+      fuse_uring_abort_end_queue_requests() (fuse_req_queue ->
+      fuse_dev_end_requests()) and fuse_uring_entry_teardown() (requests
+      still attached to ents) - credits the queue under queue->lock
+      first (fuse_uring_bg_uncharge()), so num_background and
+      active_background return to zero and the connection ledger, which
+      was never charged for them, is never debited (the underflow the
+      naive split would have introduced).
+  (3) FR_BACKGROUND clear vs fuse_request_end()'s re-check.  The
+      per-queue credit clears FR_BACKGROUND under queue->lock in the
+      same task, before fuse_request_end(req) runs, so fuse_request_end()
+      never takes bg_lock for a queue-charged request - the same order
+      the 7.x fuse_request_bg_finish() split used.  FR_BG_URING (a new
+      internal request flag) marks the ledger a request was charged to:
+      a background request the classical flush_bg_queue() hands to the
+      ring across the fiq->ops switch-over (FR_BACKGROUND without
+      FR_BG_URING) stays on the connection's ledger and is credited by
+      fuse_request_end() exactly as before - the one remaining bg_lock
+      take on a uring end, only for that transitional class.  (Before
+      this patch that class also decremented queue->active_background it
+      never incremented.)
+  (4) max_background shrink at runtime.  fuse_uring_bg_limit_changed()
+      closes the gates of queues now over budget; they re-open as their
+      requests end.  Only charged requests are ever credited, so nothing
+      underflows; queued background requests admit only when
+      active_background < the new share, so the queue drains to it.  A
+      grow opens gates and hands one slot on per queue, like fusectl's
+      classical write.
+  (5) Semantics, stated plainly.  A queue whose share is exhausted
+      blocks ITS submitters even while other queues have room - the
+      original's "one bg request per queue, ignoring global limits"
+      locality made general.  For SqueezeFS's INIT reply
+      (max_background = clamp(queues x q_depth, 64, u16::MAX), the
+      delivered ring capacity) a queue's share is exactly its ent count,
+      so the only behavior change on that daemon is the locking.  A
+      daemon whose max_background is below nr_queues gets one slot per
+      queue (nr_queues in flight, not max_background) - the floor the
+      flush already granted to active_background, now also to admission.
+
+Lock order: queue->lock alone on both hot paths.  fuse_uring_bg_limit_changed()
+takes queue->lock after fuse_chan_max_background_set() dropped bg_lock, so
+no path nests queue->lock inside bg_lock (the historic nesting was the
+reverse).  Compile-proven with CONFIG_PROVE_LOCKING=y +
+CONFIG_DEBUG_SPINLOCK=y; runtime lockdep is the boot test's.
+
+The A/B row: same daemon, kernel A (sqz series 0001-0025) vs kernel B
+(+0026), field kern rand-4k 24 x qd8 30 s + the 1 MiB seq rows, A A B B
+across reboots with the box's thermal state recorded; columns
+daemon_cpu_ns_by_class[fuse3-ur] per op, read_transport_phase_ns, the
+perf ledger's native_queued_spin_lock_slowpath share on the workers, IOPS,
+clat p50/p99 (.benchmarks/rigs/2026-09-06-kernel-bg-per-queue-ab.sh).
+Expected on the ledger: -1.5...-2 us/op on the worker and on every
+submitter.  Not boot-tested here; the lever holds its slot on that row.
+
+Design note: docs/design-kernel-bg-per-queue.md.
+
+[sqz 7.2.3 authored] First patch authored on the 7.2 track (fuse_chan
+split: fch->bg_lock, fuse_chan_{num,max}_background accessors,
+fuse_request_bg_finish()).  7.1.6 carries the same shape on struct
+fuse_conn (fc->bg_lock, no accessors - file.c reads fc->num_background
+and control.c writes fc->max_background directly, so the backport hooks
+those sites); 6.19.14's fuse_request_end() performs the finish inline
+under fc->bg_lock (the ledger's second caller) - the backport's per-queue
+credit clears FR_BACKGROUND so that block is skipped.
+---
+ .../filesystems/fuse/fuse-io-uring.rst        |  26 ++
+ fs/fuse/dev.c                                 |  61 ++++-
+ fs/fuse/dev_uring.c                           | 246 +++++++++++++++---
+ fs/fuse/dev_uring_i.h                         |  34 +++
+ fs/fuse/fuse_dev_i.h                          |  12 +-
+ 5 files changed, 335 insertions(+), 44 deletions(-)
+
+diff --git a/Documentation/filesystems/fuse/fuse-io-uring.rst b/Documentation/filesystems/fuse/fuse-io-uring.rst
+index f9483f28c..37aaf2733 100644
+--- a/Documentation/filesystems/fuse/fuse-io-uring.rst
++++ b/Documentation/filesystems/fuse/fuse-io-uring.rst
+@@ -190,3 +190,29 @@ leaked retention is reclaimed at teardown (ratelimited ``pr_warn``). Page
+ lifetime follows the io_uring registration (see the folio-get / imu-release
+ contract); request lifetime follows FUSE. Neither trusts the other's
+ ordering.
++
++Per-queue background accounting
++===============================
++
++Background requests (readahead, writeback, direct I/O completions) are
++limited by the connection's ``max_background``. On the classical path that
++limit is one counter under one lock. Once the ring is ready, each ring
++queue instead admits against its own **share** of ``max_background`` — an
++even split across the queues, the remainder to the lowest qids, never below
++one — and keeps its own count, gate and waitqueue under ``queue->lock``.
++The submit path (``fuse_uring_queue_bq_req``) and the end path
++(``fuse_uring_req_end``, run by every COMMIT_AND_FETCH) therefore never take
++the connection-wide ``bg_lock``.
++
++The semantics that change: a queue whose share is exhausted blocks the
++tasks submitting on *that* queue (a task is placed on the queue of the CPU
++it runs on) even while other queues have room. For a server that sets
++``max_background`` to ``queues * queue_depth`` a queue's share is exactly
++its entry count, so only the locking changes. ``fusectl``'s
++``max_background`` is still the single knob — writing it re-gates every
++queue against its new share; reading ``num_background`` sums the queues.
++
++A background request the classical ``flush_bg_queue()`` hands to the ring
++across the ``fiq->ops`` switch-over stays on the connection's ledger and is
++credited by ``fuse_request_end()`` as before; ``FR_BG_URING`` marks the
++requests a queue charged.
+diff --git a/fs/fuse/dev.c b/fs/fuse/dev.c
+index e6d905f74..d09ccf200 100644
+--- a/fs/fuse/dev.c
++++ b/fs/fuse/dev.c
+@@ -83,6 +83,12 @@ void fuse_chan_set_initialized(struct fuse_chan *fch, struct fuse_chan_param *pa
+ 	wake_up_all(&fch->blocked_waitq);
+ }
+ 
++/*
++ * The connection-level allocation gates, all woken through blocked_waitq.
++ * Once the ring is ready, background admission moves to the per-queue
++ * gate (fuse_uring_bg_wait()); fch->blocked then only describes the
++ * classical residue still draining, which no new request joins.
++ */
+ static bool fuse_block_alloc(struct fuse_chan *fch, bool for_background)
+ {
+ 	if (!fch->initialized)
+@@ -91,8 +97,10 @@ static bool fuse_block_alloc(struct fuse_chan *fch, bool for_background)
+ 	/* Pairs with smp_wmb() in fuse_chan_set_initialized() */
+ 	smp_rmb();
+ 
+-	return (for_background && fch->blocked) ||
+-	       (fch->io_uring && fch->connected && !fuse_uring_ready(fch));
++	if (fch->io_uring && fch->connected && !fuse_uring_ready(fch))
++		return true;
++
++	return for_background && fch->blocked && !fuse_uring_ready(fch);
+ }
+ 
+ static void fuse_drop_waiting(struct fuse_chan *fch)
+@@ -126,6 +134,17 @@ static struct fuse_req *fuse_get_req(struct fuse_chan *fch, bool for_background)
+ 			goto out;
+ 	}
+ 
++	/*
++	 * The connection gates above are monotonic once the ring is ready,
++	 * so the per-queue background gate can be taken after them without
++	 * re-checking.
++	 */
++	if (for_background && fuse_uring_ready(fch)) {
++		err = -EINTR;
++		if (fuse_uring_bg_wait(fch))
++			goto out;
++	}
++
+ 	err = -ENOTCONN;
+ 	if (!fch->connected)
+ 		goto out;
+@@ -133,8 +152,12 @@ static struct fuse_req *fuse_get_req(struct fuse_chan *fch, bool for_background)
+ 	req = fuse_request_alloc(fch, GFP_KERNEL);
+ 	err = -ENOMEM;
+ 	if (!req) {
+-		if (for_background)
+-			wake_up(&fch->blocked_waitq);
++		if (for_background) {
++			if (fuse_uring_ready(fch))
++				fuse_uring_bg_kick(fch);
++			else
++				wake_up(&fch->blocked_waitq);
++		}
+ 		goto out;
+ 	}
+ 
+@@ -159,10 +182,14 @@ static void fuse_put_request(struct fuse_req *req)
+ 			 * We get here in the unlikely case that a background
+ 			 * request was allocated but not sent
+ 			 */
+-			spin_lock(&fch->bg_lock);
+-			if (!fch->blocked)
+-				wake_up(&fch->blocked_waitq);
+-			spin_unlock(&fch->bg_lock);
++			if (fuse_uring_ready(fch)) {
++				fuse_uring_bg_kick(fch);
++			} else {
++				spin_lock(&fch->bg_lock);
++				if (!fch->blocked)
++					wake_up(&fch->blocked_waitq);
++				spin_unlock(&fch->bg_lock);
++			}
+ 		}
+ 
+ 		if (test_bit(FR_WAITING, &req->flags)) {
+@@ -387,7 +414,8 @@ EXPORT_SYMBOL_GPL(fuse_dev_chan_new);
+ 
+ unsigned int fuse_chan_num_background(struct fuse_chan *fch)
+ {
+-	return READ_ONCE(fch->num_background);
++	/* the classical ledger plus the ring queues' per-queue ledgers */
++	return READ_ONCE(fch->num_background) + fuse_uring_num_background(fch);
+ }
+ 
+ unsigned int fuse_chan_max_background(struct fuse_chan *fch)
+@@ -398,11 +426,14 @@ unsigned int fuse_chan_max_background(struct fuse_chan *fch)
+ void fuse_chan_max_background_set(struct fuse_chan *fch, unsigned int val)
+ {
+ 	spin_lock(&fch->bg_lock);
+-	fch->max_background = val;
++	WRITE_ONCE(fch->max_background, val);
+ 	fch->blocked = fch->num_background >= fch->max_background;
+ 	if (!fch->blocked)
+ 		wake_up(&fch->blocked_waitq);
+ 	spin_unlock(&fch->bg_lock);
++
++	/* the ring queues derive their shares from max_background */
++	fuse_uring_bg_limit_changed(fch);
+ }
+ 
+ unsigned int fuse_chan_num_waiting(struct fuse_chan *fch)
+@@ -598,7 +629,12 @@ static void flush_bg_queue(struct fuse_chan *fch)
+ 	}
+ }
+ 
+-void fuse_request_bg_finish(struct fuse_chan *fch, struct fuse_req *req)
++/*
++ * The classical ledger's finish.  fuse-io-uring requests never reach it:
++ * they are credited to their queue (fuse_uring_bg_finish()) with
++ * FR_BACKGROUND cleared before fuse_request_end() runs.
++ */
++static void fuse_request_bg_finish(struct fuse_chan *fch, struct fuse_req *req)
+ {
+ 	lockdep_assert_held(&fch->bg_lock);
+ 
+@@ -2190,7 +2226,8 @@ void fuse_chan_abort(struct fuse_chan *fch, bool abort_with_err)
+ 		}
+ 		spin_lock(&fch->bg_lock);
+ 		fch->blocked = 0;
+-		fch->max_background = UINT_MAX;
++		/* also lifts every ring queue's share: fuse_uring_abort() flushes them */
++		WRITE_ONCE(fch->max_background, UINT_MAX);
+ 		flush_bg_queue(fch);
+ 		spin_unlock(&fch->bg_lock);
+ 
+diff --git a/fs/fuse/dev_uring.c b/fs/fuse/dev_uring.c
+index 2eff241c7..fe14cf8df 100644
+--- a/fs/fuse/dev_uring.c
++++ b/fs/fuse/dev_uring.c
+@@ -63,34 +63,105 @@ static struct fuse_ring_ent *uring_cmd_to_ring_ent(struct io_uring_cmd *cmd)
+ 	return pdu->ent;
+ }
+ 
+-static void fuse_uring_flush_bg(struct fuse_ring_queue *queue)
++/*
++ * This queue's share of the connection's max_background: an even split
++ * across the ring's queues, the remainder handed to the lowest qids so the
++ * shares sum to max_background exactly whenever it is at least nr_queues,
++ * and never below one so every queue can always make progress.  Derived at
++ * each admission from a lockless read - max_background moves only through
++ * fusectl and abort (UINT_MAX), and fuse_uring_bg_limit_changed() re-gates
++ * the queues when it does.
++ */
++static unsigned int fuse_uring_bg_max(struct fuse_ring_queue *queue)
+ {
+ 	struct fuse_ring *ring = queue->ring;
+-	struct fuse_chan *fch = ring->chan;
++	unsigned int max_background = READ_ONCE(ring->chan->max_background);
++	unsigned int nr_queues = ring->nr_queues;
++	unsigned int share = max_background / nr_queues;
++
++	if (queue->qid < max_background % nr_queues)
++		share++;
++
++	return max(share, 1U);
++}
++
++static void fuse_uring_flush_bg(struct fuse_ring_queue *queue)
++{
++	unsigned int bg_max = fuse_uring_bg_max(queue);
+ 
+ 	lockdep_assert_held(&queue->lock);
+-	lockdep_assert_held(&fch->bg_lock);
+ 
+ 	/*
+-	 * Allow one bg request per queue, ignoring global fc limits.
+-	 * This prevents a single queue from consuming all resources and
+-	 * eliminates the need for remote queue wake-ups when global
+-	 * limits are met but this queue has no more waiting requests.
++	 * Admit against this queue's own share only - no connection-wide
++	 * state is consulted, so a queue never needs a remote wake-up when
++	 * another queue's requests finish.  bg_max >= 1 keeps the historic
++	 * "at least one background request per queue" guarantee.
+ 	 */
+-	while ((fch->active_background < fch->max_background ||
+-		!queue->active_background) &&
+-	       (!list_empty(&queue->fuse_req_bg_queue))) {
++	while (queue->active_background < bg_max &&
++	       !list_empty(&queue->fuse_req_bg_queue)) {
+ 		struct fuse_req *req;
+ 
+ 		req = list_first_entry(&queue->fuse_req_bg_queue,
+ 				       struct fuse_req, list);
+-		fch->active_background++;
+ 		queue->active_background++;
+ 
+ 		list_move_tail(&req->list, &queue->fuse_req_queue);
+ 	}
+ }
+ 
++/*
++ * Credit the queue's ledger for a request charged by
++ * fuse_uring_queue_bq_req().  Clearing FR_BACKGROUND here is what keeps
++ * fuse_request_end() off fch->bg_lock for this request: the connection's
++ * ledger was never charged for it.
++ */
++static void fuse_uring_bg_uncharge(struct fuse_ring_queue *queue,
++				   struct fuse_req *req)
++{
++	lockdep_assert_held(&queue->lock);
++
++	clear_bit(FR_BG_URING, &req->flags);
++	clear_bit(FR_BACKGROUND, &req->flags);
++	queue->num_background--;
++	queue->active_background--;
++}
++
++/*
++ * A background request charged to this queue ended: uncharge it, re-open
++ * the queue's admission gate if its share has room again, hand the freed
++ * slot to one waiter, and let the next queued background request through.
++ *
++ * Waiters sleep exclusively on bg_waitq, so a wake_up() passes exactly
++ * one slot on (the wake chain the classical fuse_request_bg_finish() has
++ * always used).  The waitqueue_active() check in the unblocked arm is safe
++ * for the same reason it is there: a waiter only sleeps after seeing
++ * bg_blocked set, and every set->cleared transition is paired with a full
++ * wake_up().  A woken waiter may resubmit on a different queue (it is
++ * placed by the CPU it runs on), so a queue can drain with waiters left
++ * behind: the last request out wakes them all rather than strand them.
++ */
++static void fuse_uring_bg_finish(struct fuse_ring_queue *queue,
++				 struct fuse_req *req)
++{
++	lockdep_assert_held(&queue->lock);
++
++	fuse_uring_bg_uncharge(queue, req);
++
++	if (queue->num_background < fuse_uring_bg_max(queue)) {
++		if (queue->bg_blocked) {
++			WRITE_ONCE(queue->bg_blocked, false);
++			wake_up(&queue->bg_waitq);
++		} else if (waitqueue_active(&queue->bg_waitq)) {
++			wake_up(&queue->bg_waitq);
++		}
++	}
++
++	if (!queue->num_background && waitqueue_active(&queue->bg_waitq))
++		wake_up_all(&queue->bg_waitq);
++
++	fuse_uring_flush_bg(queue);
++}
++
+ static bool can_zero_copy_req(struct fuse_ring_ent *ent, struct fuse_req *req)
+ {
+ 	return ent->queue->use_zero_copy &&
+@@ -101,20 +172,19 @@ static void fuse_uring_req_end(struct fuse_ring_ent *ent, struct fuse_req *req,
+ 			       int error, unsigned issue_flags, bool retain)
+ {
+ 	struct fuse_ring_queue *queue = ent->queue;
+-	struct fuse_ring *ring = queue->ring;
+-	struct fuse_chan *fch = ring->chan;
+ 
+ 	lockdep_assert_not_held(&queue->lock);
+ 	spin_lock(&queue->lock);
+ 	ent->fuse_req = NULL;
+ 	list_del_init(&req->list);
+-	if (test_bit(FR_BACKGROUND, &req->flags)) {
+-		queue->active_background--;
+-		spin_lock(&fch->bg_lock);
+-		fuse_request_bg_finish(fch, req);
+-		fuse_uring_flush_bg(queue);
+-		spin_unlock(&fch->bg_lock);
+-	}
++	/*
++	 * Only requests this queue charged are credited here.  A background
++	 * request the classical flush_bg_queue() handed to the ring across
++	 * the fiq->ops switch-over (FR_BACKGROUND without FR_BG_URING) stays
++	 * on the connection's ledger and is credited by fuse_request_end().
++	 */
++	if (test_bit(FR_BG_URING, &req->flags))
++		fuse_uring_bg_finish(queue, req);
+ 
+ 	spin_unlock(&queue->lock);
+ 
+@@ -138,8 +208,16 @@ static void fuse_uring_abort_end_queue_requests(struct fuse_ring_queue *queue)
+ 	LIST_HEAD(req_list);
+ 
+ 	spin_lock(&queue->lock);
+-	list_for_each_entry(req, &queue->fuse_req_queue, list)
++	list_for_each_entry(req, &queue->fuse_req_queue, list) {
+ 		clear_bit(FR_PENDING, &req->flags);
++		/*
++		 * fuse_dev_end_requests() ends these through
++		 * fuse_request_end(), which only knows the connection's
++		 * ledger - credit the queue's here, under its lock.
++		 */
++		if (test_bit(FR_BG_URING, &req->flags))
++			fuse_uring_bg_uncharge(queue, req);
++	}
+ 	list_splice_init(&queue->fuse_req_queue, &req_list);
+ 	spin_unlock(&queue->lock);
+ 
+@@ -158,12 +236,18 @@ void fuse_uring_abort_end_requests(struct fuse_ring *ring)
+ 		if (!queue)
+ 			continue;
+ 
+-		WARN_ON_ONCE(fch->max_background != UINT_MAX);
++		/*
++		 * fuse_chan_abort() raised max_background to UINT_MAX, so
++		 * the flush below moves every queued background request to
++		 * fuse_req_queue for ending.  Nothing may sleep on a stopped
++		 * queue's gate: open it and release every waiter.
++		 */
++		WARN_ON_ONCE(READ_ONCE(fch->max_background) != UINT_MAX);
+ 		spin_lock(&queue->lock);
+ 		queue->stopped = true;
+-		spin_lock(&fch->bg_lock);
+ 		fuse_uring_flush_bg(queue);
+-		spin_unlock(&fch->bg_lock);
++		WRITE_ONCE(queue->bg_blocked, false);
++		wake_up_all(&queue->bg_waitq);
+ 		spin_unlock(&queue->lock);
+ 		fuse_uring_abort_end_queue_requests(queue);
+ 	}
+@@ -364,6 +448,7 @@ fuse_uring_create_queue(struct io_uring_cmd *cmd, struct fuse_ring *ring,
+ 	queue->qid = qid;
+ 	queue->ring = ring;
+ 	spin_lock_init(&queue->lock);
++	init_waitqueue_head(&queue->bg_waitq);
+ 
+ 	INIT_LIST_HEAD(&queue->ent_avail_queue);
+ 	INIT_LIST_HEAD(&queue->ent_commit_queue);
+@@ -436,6 +521,9 @@ static void fuse_uring_entry_teardown(struct fuse_ring_ent *ent)
+ 	if (req) {
+ 		/* remove entry from queue->fpq->processing */
+ 		list_del_init(&req->list);
++		/* ended below via fuse_request_end(): credit the queue now */
++		if (test_bit(FR_BG_URING, &req->flags))
++			fuse_uring_bg_uncharge(queue, req);
+ 	}
+ 
+ 	/*
+@@ -1934,17 +2022,23 @@ bool fuse_uring_queue_bq_req(struct fuse_req *req)
+ 	}
+ 
+ 	set_bit(FR_URING, &req->flags);
++	set_bit(FR_BG_URING, &req->flags);
+ 	req->ring_queue = queue;
+ 	list_add_tail(&req->list, &queue->fuse_req_bg_queue);
+ 
+ 	ent = list_first_entry_or_null(&queue->ent_avail_queue,
+ 				       struct fuse_ring_ent, list);
+-	spin_lock(&fch->bg_lock);
+-	fch->num_background++;
+-	if (fch->num_background == fch->max_background)
+-		fch->blocked = 1;
++	/*
++	 * Charge this queue's ledger, not the connection's: the queue's
++	 * share of max_background is the whole admission criterion, so a
++	 * saturated queue blocks its own submitters (fuse_uring_bg_wait())
++	 * while its siblings keep admitting.  ">=" absorbs the harmless
++	 * overshoot of submitters that passed the gate before it closed.
++	 */
++	queue->num_background++;
++	if (queue->num_background >= fuse_uring_bg_max(queue))
++		WRITE_ONCE(queue->bg_blocked, true);
+ 	fuse_uring_flush_bg(queue);
+-	spin_unlock(&fch->bg_lock);
+ 
+ 	/*
+ 	 * Due to bg_queue flush limits there might be other bg requests
+@@ -1966,6 +2060,100 @@ bool fuse_uring_queue_bq_req(struct fuse_req *req)
+ 	return true;
+ }
+ 
++/*
++ * The per-queue half of fuse_get_req()'s background gate: sleep until the
++ * queue this task would submit on has room in its share, or the connection
++ * died.  Exclusive, like the connection-wide wait it replaces - each ending
++ * request passes exactly one slot on (fuse_uring_bg_finish()).  The task may
++ * migrate while asleep and submit on another queue; fuse_uring_bg_finish()'s
++ * drain-time wake_up_all() is what keeps that from stranding the waiters it
++ * left behind.
++ */
++int fuse_uring_bg_wait(struct fuse_chan *fch)
++{
++	struct fuse_ring *ring = fch->ring;
++	struct fuse_ring_queue *queue;
++
++	queue = fuse_uring_task_to_queue(ring);
++	if (!queue || !READ_ONCE(queue->bg_blocked))
++		return 0;
++
++	return wait_event_state_exclusive(queue->bg_waitq,
++					  !READ_ONCE(queue->bg_blocked) ||
++					  !READ_ONCE(fch->connected),
++					  (TASK_KILLABLE | TASK_FREEZABLE));
++}
++
++/*
++ * A background slot this task was woken for will not be used (allocation
++ * failed, or the request is being dropped unsent): pass the wake on so the
++ * exclusive chain does not lose a link.  Lockless on purpose - a wake that
++ * races a gate closing is re-checked by the waiter, and the gate closing
++ * means requests are in flight to re-open it.
++ */
++void fuse_uring_bg_kick(struct fuse_chan *fch)
++{
++	struct fuse_ring_queue *queue = fuse_uring_task_to_queue(fch->ring);
++
++	if (queue && !READ_ONCE(queue->bg_blocked))
++		wake_up(&queue->bg_waitq);
++}
++
++/*
++ * max_background changed (fusectl, INIT is too early for a ring to exist):
++ * re-gate every queue against its new share.  A shrink closes gates that
++ * are now over budget - they re-open as their requests end, nothing is
++ * evicted and nothing underflows because only charged requests are ever
++ * credited.  A grow opens gates and hands one slot on per queue.  Runs
++ * outside fch->bg_lock: queue->lock never nests inside it.
++ */
++void fuse_uring_bg_limit_changed(struct fuse_chan *fch)
++{
++	struct fuse_ring *ring = smp_load_acquire(&fch->ring);
++	int qid;
++
++	if (!ring)
++		return;
++
++	for (qid = 0; qid < ring->nr_queues; qid++) {
++		struct fuse_ring_queue *queue = READ_ONCE(ring->queues[qid]);
++
++		if (!queue)
++			continue;
++
++		spin_lock(&queue->lock);
++		WRITE_ONCE(queue->bg_blocked,
++			   queue->num_background >= fuse_uring_bg_max(queue));
++		if (!queue->bg_blocked)
++			wake_up(&queue->bg_waitq);
++		spin_unlock(&queue->lock);
++	}
++}
++
++/*
++ * The ring's contribution to fuse_chan_num_background(): a lockless sum of
++ * the per-queue ledgers.  Read on the readahead/writeback congestion checks
++ * and by fusectl, never on the request path.
++ */
++unsigned int fuse_uring_num_background(struct fuse_chan *fch)
++{
++	struct fuse_ring *ring = smp_load_acquire(&fch->ring);
++	unsigned int sum = 0;
++	int qid;
++
++	if (!ring)
++		return 0;
++
++	for (qid = 0; qid < ring->nr_queues; qid++) {
++		struct fuse_ring_queue *queue = READ_ONCE(ring->queues[qid]);
++
++		if (queue)
++			sum += READ_ONCE(queue->num_background);
++	}
++
++	return sum;
++}
++
+ bool fuse_uring_remove_pending_req(struct fuse_req *req)
+ {
+ 	struct fuse_ring_queue *queue = req->ring_queue;
+diff --git a/fs/fuse/dev_uring_i.h b/fs/fuse/dev_uring_i.h
+index 15a03851d..5d2c583eb 100644
+--- a/fs/fuse/dev_uring_i.h
++++ b/fs/fuse/dev_uring_i.h
+@@ -131,7 +131,19 @@ struct fuse_ring_queue {
+ 
+ 	struct fuse_pqueue fpq;
+ 
++	/*
++	 * Per-queue background accounting, all under queue->lock: this
++	 * queue's share of fch->max_background (fuse_uring_bg_max()) is
++	 * admitted, blocked and woken here so that neither the submit nor
++	 * the end path takes the connection-wide fch->bg_lock.
++	 * num_background counts the FR_BG_URING requests charged to this
++	 * queue, active_background the subset already moved from
++	 * fuse_req_bg_queue to fuse_req_queue.
++	 */
++	unsigned int num_background;
+ 	unsigned int active_background;
++	bool bg_blocked;
++	wait_queue_head_t bg_waitq;
+ 
+ 	bool stopped;
+ 
+@@ -193,6 +205,10 @@ void fuse_uring_queue_fuse_req(struct fuse_iqueue *fiq, struct fuse_req *req);
+ bool fuse_uring_queue_bq_req(struct fuse_req *req);
+ bool fuse_uring_remove_pending_req(struct fuse_req *req);
+ bool fuse_uring_request_expired(struct fuse_chan *fch);
++int fuse_uring_bg_wait(struct fuse_chan *fch);
++void fuse_uring_bg_kick(struct fuse_chan *fch);
++void fuse_uring_bg_limit_changed(struct fuse_chan *fch);
++unsigned int fuse_uring_num_background(struct fuse_chan *fch);
+ 
+ static inline void fuse_uring_abort(struct fuse_chan *fch)
+ {
+@@ -248,6 +264,24 @@ static inline bool fuse_uring_request_expired(struct fuse_chan *fch)
+ 	return false;
+ }
+ 
++static inline int fuse_uring_bg_wait(struct fuse_chan *fch)
++{
++	return 0;
++}
++
++static inline void fuse_uring_bg_kick(struct fuse_chan *fch)
++{
++}
++
++static inline void fuse_uring_bg_limit_changed(struct fuse_chan *fch)
++{
++}
++
++static inline unsigned int fuse_uring_num_background(struct fuse_chan *fch)
++{
++	return 0;
++}
++
+ #endif /* CONFIG_FUSE_IO_URING */
+ 
+ #endif /* _FS_FUSE_DEV_URING_I_H */
+diff --git a/fs/fuse/fuse_dev_i.h b/fs/fuse/fuse_dev_i.h
+index 912903513..323d212d1 100644
+--- a/fs/fuse/fuse_dev_i.h
++++ b/fs/fuse/fuse_dev_i.h
+@@ -38,6 +38,8 @@ struct fuse_iqueue;
+  * @FR_PRIVATE:		request is on private list
+  * @FR_ASYNC:		request is asynchronous
+  * @FR_URING:		request is handled through fuse-io-uring
++ * @FR_BG_URING:	background request charged to its fuse-io-uring
++ *			queue's ledger (not the connection's)
+  */
+ enum fuse_req_flag {
+ 	FR_ISREPLY,
+@@ -53,6 +55,7 @@ enum fuse_req_flag {
+ 	FR_PRIVATE,
+ 	FR_ASYNC,
+ 	FR_URING,
++	FR_BG_URING,
+ };
+ 
+ /**
+@@ -205,10 +208,14 @@ struct fuse_chan {
+ 	/** List of device instances belonging to this connection */
+ 	struct list_head devices;
+ 
+-	/** Maximum number of outstanding background requests */
++	/** Maximum number of outstanding background requests.  Written
++	    under bg_lock; the fuse-io-uring queues read it locklessly to
++	    derive their per-queue shares */
+ 	unsigned max_background;
+ 
+-	/** Number of requests currently in the background */
++	/** Number of requests currently in the background on the classical
++	    path.  fuse-io-uring background requests are charged to their
++	    ring queue instead (fuse_ring_queue::num_background) */
+ 	unsigned num_background;
+ 
+ 	/** Number of background requests currently queued for userspace */
+@@ -376,7 +383,6 @@ unsigned int fuse_req_hash(u64 unique);
+ struct fuse_req *fuse_request_find(struct fuse_pqueue *fpq, u64 unique);
+ 
+ void fuse_dev_end_requests(struct list_head *head);
+-void fuse_request_bg_finish(struct fuse_chan *fch, struct fuse_req *req);
+ 
+ void fuse_copy_init(struct fuse_copy_state *cs, bool write,
+ 			   struct iov_iter *iter);
+-- 
+2.55.0
+

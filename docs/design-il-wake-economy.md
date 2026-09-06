@@ -188,6 +188,34 @@ L1 → L5 → L4 → L3 → L2, stated here as a parenthetical only.)
 
 ### Lever 1 — the wake-collapse latch (`CqeDoorbell` v3)
 
+> **Amendment 2026-09-06 — the latch is MARK-VALUED, the parker-side clear is gone**
+> (`.benchmarks/2026-09-06-cqe-doorbell-lost-wake.md`, commits `4d8b0fe7` / `d66e6a21`).
+> The v3 text below shipped and its strand argument (case 1, "bump visible to the
+> snapshot ⇒ the re-scan finds the DONE") holds only for ops in the parker's PENDING
+> SET. The daemon publishes a slot's DONE and bumps the doorbell AFTER, so an op the
+> reaper already consumed off its slot word (or a sync-lane op on the same session)
+> bumps with nothing left to scan: its bump is absorbed by the snapshot (admission
+> passes), its mark-passed CAS lands after the parker's clear and wins the era's one
+> wake toward a parker not yet asleep (lost), and the parker's real completion returns
+> `Collapsed` — a strand to the reap park's age bound (loom
+> `ipc_cqe_latched_reaped_prior_completion_never_strands`, red at iteration 2702 on the
+> v3 body). The word is now `wake_paid_mark`: the completer's latch step is
+> `fetch_update(|paid| if paid == at { None } else { Some(at) })` — collapse iff the
+> recorded pay was for the mark it read, else record that mark and pay. `park_begin`
+> writes nothing (an era is payable by arithmetic: a pay for its mark needs the seq to
+> have reached it, which the snapshot precedes); a pre-snapshot completer paying late
+> read a stale mark (the parker's mark store follows its snapshot, which follows that
+> bump) and records one the parker never set; two completers racing past one mark pay
+> once. The record initialises to `NO_PAY_RECORDED` (`u32::MAX`, never the mark word's
+> own 0 — a stale-init mark read over-pays, the benign class, instead of collapsing).
+> The compose gains one rule: an at-snapshot mark whose pay is recorded is SPENT and the
+> new parker's own mark governs; unpaid it stays. `IPC_ABI` stays 6 (no layout change;
+> KD-7 build-commit equality guards the word's meaning). The `latch = false` control
+> arm and the wake-economy law (wakes only toward parked reapers, ≤ 1 syscall per era,
+> `writes/(writes+elided+collapsed)`) are unchanged. Everything below that names the
+> clear, `wake_paid`, or the CAS 0→1 is the v3 history; the shipped protocol is
+> `cqe_core.rs`'s module docs.
+
 **The mechanism.** Repurpose the doorbell's `_pad` word (the struct stays 16 bytes at
 header offset 128 — the layout static asserts are untouched) as `wake_paid: AtomicU32`,
 a **per-park-era latch**:

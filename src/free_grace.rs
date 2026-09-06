@@ -1784,11 +1784,18 @@ pub fn pressure_park_slice_ms() -> u64 {
 }
 
 /// The park's WALL backstop (finding 29): a frozen owner clock cannot
-/// fence, so the park ends by wall time — twice the ROUTINE bound (the
-/// most patient number the plane publishes), floored at one second.
-/// Past it the refusal stands, loud: the plane is broken, not slow.
+/// fence, so the park ends by wall time — twice the ROUTINE fence bound
+/// (the most patient DURATION the plane publishes,
+/// `free_grace_fence_bound_base_ms`), floored at one second. Past it the
+/// refusal stands, loud: the plane is broken, not slow.
+///
+/// A duration, never [`bound`]: that is the reallocation LABEL — an
+/// owner-clock instant whose "nothing owed" sentinel is `u64::MAX` on
+/// every mount that is not an owner with members. Read as a wait it made
+/// the park unbounded on every co-writer and reader (the 2026-09-05 s11
+/// fleet wedge, `.benchmarks/2026-09-06-cowriter-enospc-wedge.md`).
 pub fn pressure_park_wall_ms() -> u64 {
-    (bound().saturating_mul(2)).max(1_000)
+    fence_bound_base_ms().saturating_mul(2).max(1_000)
 }
 
 pub fn alloc_stalls() -> u64 {

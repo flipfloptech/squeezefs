@@ -1894,11 +1894,20 @@ impl BlockAllocator {
     /// evaluates the pressure fence at the authority). The field
     /// re-measure convicted the local-ring-only condition: co-writer
     /// stalls parked ZERO times while their supply sat remote.
+    ///
+    /// The remote shape needs EVIDENCE, not a wire: the harvest reply's
+    /// `bound_age_hint_ms` is the authority's live bound age — nonzero iff
+    /// its ring holds offsets a fence can still release (`0` = nothing
+    /// held, no plane, or nothing owed). `harvest_lane_supply` deposits
+    /// every reply's hint before the verdict, so the word read here is
+    /// this pass's. The sink's mere presence made every exhausted
+    /// co-writer allocation park (the 2026-09-05 s11 fleet wedge).
     fn reclaimable_supply_exists(&self) -> bool {
         if !self.grace.is_empty() {
             return true;
         }
         self.lanes.get().is_some_and(|l| l.harvest.get().is_some())
+            && self.horizon_composed_ms.load(Ordering::Relaxed) != 0
     }
 
     async fn harvest_lane_supply(&self) -> u64 {
@@ -2278,23 +2287,35 @@ impl BlockAllocator {
     /// ([`crate::free_grace::pressure_park_wall_ms`]). On every unarmed
     /// mount the ring is structurally empty, so this is byte-identical
     /// to [`Self::allocate_block`] — one branch.
+    ///
+    /// The wall is measured in WALL time (the harvest RPC and the ENOSPC
+    /// valve's passes inside `allocate_block` count — a co-writer's pass
+    /// is one authority round trip, so a slice-sum accumulator under-read
+    /// the park by the RTT per pass), and every caller holds this park
+    /// under its `BLOCK_FLUSH_LOCKS` guard: past the wall the refusal is
+    /// TERMINAL for that write (`.benchmarks/2026-09-06-cowriter-enospc-wedge.md`).
     pub async fn allocate_block_grace_bounded(&self) -> Result<u64> {
-        let mut waited_ms: u64 = 0;
+        let started = std::time::Instant::now();
         loop {
             match self.allocate_block().await {
                 Err(e) if is_storage_full(&e) && self.reclaimable_supply_exists() => {
                     let wall = crate::free_grace::pressure_park_wall_ms();
+                    let waited_ms = started.elapsed().as_millis() as u64;
                     if waited_ms >= wall {
                         log::error!(
-                            "bounded allocation refusing StorageFull after {waited_ms} ms                              parked with {} offset(s) still in grace: the pressure deadline                              never fenced (a frozen/broken plane — the wall backstop is                              {wall} ms). The refusal is honest; investigate the membership                              plane (finding 29)",
-                            self.grace.len()
+                            "bounded allocation refusing StorageFull after {waited_ms} ms parked \
+                             with {} offset(s) still in grace locally (lane harvest horizon {} \
+                             ms): the pressure deadline never fenced within the wall backstop \
+                             ({wall} ms). The refusal is honest and terminal for this write; \
+                             investigate the membership plane (finding 29)",
+                            self.grace.len(),
+                            self.horizon_composed_ms.load(Ordering::Relaxed),
                         );
                         return Err(e);
                     }
                     let slice = crate::free_grace::pressure_park_slice_ms();
                     crate::free_grace::note_pressure_park();
                     squeezefs_ipc::sqz_time::sleep(std::time::Duration::from_millis(slice)).await;
-                    waited_ms = waited_ms.saturating_add(slice);
                 }
                 other => return other,
             }

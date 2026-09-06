@@ -5768,6 +5768,13 @@ pub struct Metrics {
     /// waiting for a reader (an inode nobody fsyncs again keeps its
     /// latch until unmount).
     pub writeback_errors_reported: Align64<AtomicU64>,
+    /// WRITE replies refused `ENOSPC` — the synchronous face of space
+    /// exhaustion (a promotion or sparse-stripe mint the write itself
+    /// owns). The never-lossy ladder's ACKed custody reports at fsync,
+    /// not here. Growth is honest pressure; the 2026-09-05 s11 fleet's
+    /// alternative was a write that never replied at all
+    /// (`.benchmarks/2026-09-06-cowriter-enospc-wedge.md`).
+    pub write_enospc_refusals: Align64<AtomicU64>,
     /// Writeback units resolved as SUPERSEDED no-ops (staged stamp no
     /// longer matches the unit's token: a newer write re-staged the block
     /// and owns its custody chain). The healthy churn outcome — the
@@ -10662,6 +10669,7 @@ impl SqueezefsFilesystem {
                 "dir_nlink_underflows": METRICS.dir_nlink_underflows.load(Ordering::Relaxed),
                 "writeback_errors_latched": METRICS.writeback_errors_latched.load(Ordering::Relaxed),
                 "writeback_errors_reported": METRICS.writeback_errors_reported.load(Ordering::Relaxed),
+                "write_enospc_refusals": METRICS.write_enospc_refusals.load(Ordering::Relaxed),
                 "fuse_reserved_xattr_refusals": METRICS.fuse_reserved_xattr_refusals.load(Ordering::Relaxed),
                 "pr_registrant_shared": METRICS.pr_registrant_shared.load(Ordering::Relaxed),
                 "job_submitted": METRICS.job_submitted.load(Ordering::Relaxed),
@@ -24302,7 +24310,13 @@ impl Filesystem for SqueezefsFilesystem {
             })
         };
 
-        write_future.await
+        let reply = write_future.await;
+        if reply == Err(Errno::from(libc::ENOSPC)) {
+            METRICS
+                .write_enospc_refusals
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        reply
     }
 
     async fn mkdir(

@@ -5,7 +5,7 @@
 | **Title** | The free-grace sustain campaign: a demand-coupled acknowledgement loop — pipelined reader acks, demand-coupled bound publication, demand-armed prods, and ahead-of-stall lane refill |
 | **Author** | (design agent; adjudication owner: user) |
 | **Date** | 2026-08-25 |
-| **Status** | **Implemented — fleet acceptance NOT MET (2026-09-05, `.benchmarks/2026-09-05-d4-free-grace-sustain.md` §6: finding 15 reproduces on the s11 venue at 23 s — lane ENOSPC storms — and five of eight co-writers wedge on the ENOSPC'd writes; the WEDGE is fixed 2026-09-06, `.benchmarks/2026-09-06-cowriter-enospc-wedge.md`: the finding-29 bounded-allocation park read the reallocation label as its wall and a harvest sink's presence as supply, so an exhausted co-writer lane parked forever under its block stripe — the row must now fail CLEANLY, fleet re-run owed).** PRs 1–4 landed 2026-08-25 (`f992c2e1` instruments · `11dafe2f` L1 · `29788e55` L4+L2+L2b+L3 · `69b2fe16` L5 + the OQ 2 horizon), followed by finding 18 (`6ce59456`, the prod decay) and finding 29 (`a50da1e4` + `37bf6036`, the bounded allocation park). The s11-mpiio row went GREEN once on the cloud venue (2026-08-30 16b, `8e4a2cab`, `.benchmarks/cloud/2026-08-30-094130`) — on a fleet whose lanes never coupled (`demand_waits` 0, `bound_age` 23–29 s, the routine composite). The §3 rate equation was closed in-process 2026-09-05 (D-4, `.benchmarks/2026-09-05-d4-free-grace-sustain.md`: the shipped levers unbind a recycle-bound stream at zero fences; Little's law holds on live gauges; finding D4-1 priced). **Owed**: the from-zero s11-mpiio row on the finding-15 venue with the sustain columns (PR 5's harness rung is NOT landed — the rig `.benchmarks/rigs/free-grace-sustain-rig.sh` reads the row's snapshots), run by the parent campaign |
+| **Status** | **Implemented — fleet acceptance NOT MET (2026-09-05); the HOLD-TIME campaign landed 2026-09-06 (§"Hold-time campaign" below, `.benchmarks/2026-09-06-free-grace-hold-time.md`): the coupled hold decomposed per stage on the stats inode, levers (b) + (d) −922 ms in-process, the capacity law published, the 6 s of derived windows named as adjudication items; the from-zero s11-mpiio row is OWED (parent). Prior status: (2026-09-05, `.benchmarks/2026-09-05-d4-free-grace-sustain.md` §6: finding 15 reproduces on the s11 venue at 23 s — lane ENOSPC storms — and five of eight co-writers wedge on the ENOSPC'd writes; the WEDGE is fixed 2026-09-06, `.benchmarks/2026-09-06-cowriter-enospc-wedge.md`: the finding-29 bounded-allocation park read the reallocation label as its wall and a harvest sink's presence as supply, so an exhausted co-writer lane parked forever under its block stripe — the row must now fail CLEANLY, fleet re-run owed).** PRs 1–4 landed 2026-08-25 (`f992c2e1` instruments · `11dafe2f` L1 · `29788e55` L4+L2+L2b+L3 · `69b2fe16` L5 + the OQ 2 horizon), followed by finding 18 (`6ce59456`, the prod decay) and finding 29 (`a50da1e4` + `37bf6036`, the bounded allocation park). The s11-mpiio row went GREEN once on the cloud venue (2026-08-30 16b, `8e4a2cab`, `.benchmarks/cloud/2026-08-30-094130`) — on a fleet whose lanes never coupled (`demand_waits` 0, `bound_age` 23–29 s, the routine composite). The §3 rate equation was closed in-process 2026-09-05 (D-4, `.benchmarks/2026-09-05-d4-free-grace-sustain.md`: the shipped levers unbind a recycle-bound stream at zero fences; Little's law holds on live gauges; finding D4-1 priced). **Owed**: the from-zero s11-mpiio row on the finding-15 venue with the sustain columns (PR 5's harness rung is NOT landed — the rig `.benchmarks/rigs/free-grace-sustain-rig.sh` reads the row's snapshots), run by the parent campaign |
 | **Repo state audited** | branch `dev`, tip `894cc088` (finding-15 part 1 landed at `8d2bcd3b`; contracts `tests/mw_cowriter_free_tests.rs` §finding 15) — the design as written; landed state per the Status row |
 | **Program input** | `.benchmarks/2026-08-25-s11-freeloop-stall.md` (finding 15 + the same-day part-1/re-grade addendum); `docs/design-full-multi-writer.md` rung-20 residual board item 1 (re-attributed 2026-08-25) and item 2 (the `SQUEEZEFS_RANGE_CUSTODY` flip, which inherits this as a precondition) |
 | **Binding inputs** | AGENTS.md (one source of truth — DLM S6/S7/S9 families, ENG-10, the two-substrate + sustained-state row rules, the TDD law); `docs/pre-rc-engineering-spec.md` §6.8 item 3; `docs/operations.md` §Freed-offset grace period; `.benchmarks/2026-08-19-blob-aware-merge-and-fabric-venue.md` §3 (the 0→825 never-draining capture); the free-grace pressure valve (rung-20 residual 6, in tree) |
@@ -1114,6 +1114,92 @@ bound age — the operator's "why is my fleet beating at 1 s" answer.
   decision. (Rung (b)'s runway *input* does change under the `DEMAND` lever
   — lane-reachable instead of passed-global, KD-FG-10 — a corrected reading
   under the unchanged law, restored verbatim by `DEMAND=0`.)
+
+---
+
+## Hold-time campaign (2026-09-06, `perf/free-grace-hold-time` — finding 15's remaining half)
+
+**Input.** With the supply leak closed (`380ea732`), the 2026-09-06 00:15 s11
+row no longer LOSES supply — it HOLDS it: `free_grace_offsets` 3,171 (13.3
+GB) at capture, `free_grace_bound_age_ms` **8,994** with every cadence at
+its 1 Hz floor (`prod_renew_ms` 1,000, passes 1/s, checkpoints ≈ 1/s),
+`alloc_stalls` 0 / `forced_releases` 0 / `laggard_fences` 0, and lane
+ENOSPC refusals 76–129 per co-writer — 200 MiB/s × 9 s ≈ 1.8 GiB in the
+ring plus 1.25 GiB live against a 4 GiB lane. Nothing was starving;
+everything was waiting. Evidence note: `.benchmarks/2026-09-06-free-grace-hold-time.md`.
+
+### The decomposition (what the nine seconds are)
+
+The reader's ladder waits out two DERIVED windows from the instant it
+LEARNED a label — it never observes the checkpoint:
+
+| Term | Fleet value | Derivation |
+|---|---|---|
+| qualify (gate 2) | `S + skew` = 2,022 ms | `S = P + CHECKPOINT_MAX_AGE_MS` = 1 + 1 s |
+| drain (gate 3) | `S + D_purge` = 4,000 ms | `D_purge = 2 × P` |
+
+Measured on the closed loop at the fleet cadences (release, deterministic;
+the 2026-09-05 binary's configuration): `bound_age` 8,646 ms = **6.0 s of
+windows** + ≈ 0.5 s label learn (≤ one beat) + ≈ 0.5 s qualify-pass grid
+rounding + ≈ 0.5 s carry to the next beat + ≈ 0.5 s bound refresh (≤ one
+floor), stacked by the min over 8 members; `defer→checkpointed` 498 ms sits
+in the qualify window's shadow, `min_acked→released` 9 ms (the harvest runs
+per free). §3.2's post-fix budget (≈ 9–12 s) is confirmed at its floor;
+§5.7's "≈ 6 s of coherence physics" is confirmed as the dominant term — and
+this campaign's finding is that those 6 s are not physics but four `P` /
+ceiling constants composed (below).
+
+### The instrument (`free_grace_hold_phase_ns` and friends)
+
+Per released offset, read off the machinery: `defer_checkpointed` (the KV
+checkpoint task marks the owner instant the ledger record naming the new
+roots is written — `free_grace::note_checkpoint_completed`, one `ArcSwap`
+load on a plane-less mount), `checkpointed_min_acked` (the first bound
+ADVANCE covering the label — `publish_bound` records it),
+`min_acked_released`, `total`; exact-sum per placed sample
+(`free_grace_hold_unplaced`). The mark deques prune to the routine fence
+bound, so their population derives from `fence ÷ period`. Beside it
+`free_grace_hold_ms` (the live residence EWMA — the measured hold),
+`free_grace_checkpoint_marks` / `free_grace_checkpoint_cycle_ms`, and
+`free_grace_member_ack_lag_ms` `{max, mean, min, members}` (owner clock
+`now − acked` per member — the min-composition's culprit finder; the
+per-member census rides `SQUEEZEFS_STATS_KEY_CENSUS`).
+
+### The levers (each its own bool knob, default on, the A/B pattern)
+
+| Lever | Mechanism | In-process (`bound_age`, fleet-cadence shape) |
+|---|---|---|
+| **(b) carriage renewal** — `SQUEEZEFS_FREE_GRACE_ACK_RENEWAL` | a promotion wakes the renewal loop (`membership::renewal_wake`, a first-party `Notify` beside the beat) and the tick renews as CARRIAGE (`MemberLeaseWords::renewed_carriage`: lease renewed, prod honoured, the beat only ever forward, **no label learned** — a label learned just after a pass qualifies a pass later, and the ladder adopts the LAST learned pair; the first cut that re-anchored the beat read +125 ms) | 8,646 → 8,396 |
+| **(d) refresh on a binding ack** — `SQUEEZEFS_FREE_GRACE_REFRESH_ON_ACK` | `MembershipOwner::renew` marks the bound dirty when a member whose recorded ack sat ≤ the published bound advances it (one compare — KD-FG-4 stands); the harvest recomputes when dirty, rate-limited by `refresh_on_ack_interval_ms = max(floor ÷ members, 2 × measured scan)` (tie-tested), and reads the bound AFTER both recompute arms | 8,646 → 7,974 |
+| **(b) + (d) — shipped** | | **7,724 (−922 ms, −10.7 %)**; residence 8,396 → 7,841; closure exact, forced = fences = 0, stalls 0 |
+| (a) checkpoint cadence — **measured inert, NOT landed** | halving the writer's checkpoint period moves `bound_age` by 0 ms to the tick (only the shadowed `defer→checkpointed` shortens); checkpoints SPARSER than the passes cost +662 ms. It pays only as the writer→member composite (live ceiling → prod floor → L2b pass floor at `P/2`), a pinned-law change (adjudication item 4) | 7,724 → 7,724 |
+| (c) sub-second prod floor — not landed | with (b) the beat carries only the LABEL, adopted at the next pass — a faster beat shortens only the free→learn term (mean 0.5 → 0.25 s) at 2× lease-lane load; belongs to the composite | — |
+| **(e) the capacity law, published** | `alloc_lane_share_needed_blocks = ceil(claim-rate × horizon) + live` and `alloc_lane_headroom_pct = (share − needed) ÷ share` on every laned co-writer (0/0 unpartitioned); a lane exhausts exactly when the headroom reaches 0 — pinned on the loop with the MEASURED hold (spare 0.6× → 636 stalls; 1.5× → 0) | — |
+
+### The remaining 6 s — adjudication items (coherence-proof changes, not levers)
+
+Each anchored in the note's §7 with its size: (1) the qualify window's `S`
+double-counts `P` — the pass IS the poll, so the honest lag is
+`CHECKPOINT_MAX_AGE_MS + skew` (−1.0 s); (2) the drain's `S` is the daemon
+layout/attr-cache TTL, which an epoch-step PURGE of those caches would
+replace with the purge's duration (−2.0 s); (3) `D_purge = 2 × P` is a
+lease-clock fail-stop reserve reused as an in-flight-serve drain, which is
+milliseconds (−1.9 s); (4) the writer→member `P/2` composite (−0.6 s).
+Together ≈ 6.0 → 1.1–1.5 s of windows — a fleet hold ≈ 3–3.5 s and 4 GiB
+lanes at ≈ 50 % headroom. KD-FG-11 pinned (1)–(3) unmoved for L2b's sake
+(a load-dependent pass cadence must not re-derive them); revisiting their
+DERIVATIONS is the user's call.
+
+### Fleet acceptance — OWED (parent)
+
+The note's §6: `s11-mpiio` from zero on the finding-15 venue at or after
+`7ec426b8`; PASS reads `free_grace_bound_age_ms` ≈ 8.0 s (prediction; > 8.7 s
+= the levers did not engage), `free_grace_offsets` at capture ≪ 3,171
+(Little's law: ≈ 2,850 at the same churn), lane ENOSPC refusals → 0 with
+`alloc_lane_headroom_pct` > 0 through the storm, the sustained-window gate
+PASSING, `forced_releases` / `laggard_fences` / `alloc_stalls` 0, plus the
+per-lever A/B legs (`ACK_RENEWAL=0` ≈ +0.25 s, `REFRESH_ON_ACK=0` ≈ +0.65 s,
+both off = the 8,994 shape).
 
 ---
 

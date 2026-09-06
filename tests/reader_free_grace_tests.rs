@@ -723,6 +723,8 @@ fn a_reader_acknowledges_only_after_the_purge_and_the_drain() {
         qualify_lag_ms: 2_000,
         drain_lag_ms: 4_000,
         refresh_floor_ms: 1_000,
+        drain_gen: 0,
+        drain_budget_ms: 2_000,
     };
 
     // Too early: the dereference need not be checkpointed yet.
@@ -1829,6 +1831,8 @@ fn a_tightened_renewal_cadence_never_starves_the_ack_ladder() {
             qualify_lag_ms: QUALIFY_LAG_MS,
             drain_lag_ms: DRAIN_LAG_MS,
             refresh_floor_ms: POLL_MS,
+            drain_gen: 0,
+            drain_budget_ms: 2_000,
         }) {
             acked.push(l);
         }
@@ -1870,6 +1874,8 @@ fn ack_inputs(label: u64, learned: u64, pass: u64, now: u64, adv: bool) -> AckIn
         qualify_lag_ms: 2_000,
         drain_lag_ms: 4_000,
         refresh_floor_ms: 1_000,
+        drain_gen: 0,
+        drain_budget_ms: 2_000,
     }
 }
 
@@ -2028,6 +2034,8 @@ fn prop_an_ack_is_never_emitted_before_its_labels_own_gates() {
                         qualify_lag_ms: 2_000,
                         drain_lag_ms: 4_000,
                         refresh_floor_ms: 1_000,
+                        drain_gen: 0,
+                        drain_budget_ms: 2_000,
                     });
                     if let Some(acked) = out {
                         let ready = qualified_at.get(&acked).ok_or_else(|| {
@@ -2082,6 +2090,8 @@ fn prop_the_candidate_queue_is_bounded_and_never_wedges() {
                         qualify_lag_ms: 2_000,
                         drain_lag_ms: 4_000,
                         refresh_floor_ms: 1_000,
+                        drain_gen: 0,
+                        drain_budget_ms: 2_000,
                     });
                     let _ = out;
                     now += 10;
@@ -2107,6 +2117,8 @@ fn prop_the_candidate_queue_is_bounded_and_never_wedges() {
                             qualify_lag_ms: 2_000,
                             drain_lag_ms: 4_000,
                             refresh_floor_ms: 1_000,
+                            drain_gen: 0,
+                            drain_budget_ms: 2_000,
                         })
                         .is_some()
                     {
@@ -2504,6 +2516,10 @@ struct Levers {
     /// Re-derivation item 2: the layout cache is epoch-step stamped, so
     /// the drain drops its `S` term (off = `S + D_purge`).
     drain_epoch_stamp: bool,
+    /// Re-derivation item 3: the drain is OBSERVED (the pre-step in-flight
+    /// serves reaching zero) and `D_purge` only a tripwire (off = the
+    /// `D_purge` timer).
+    drain_observed: bool,
 }
 
 impl Levers {
@@ -2517,6 +2533,7 @@ impl Levers {
             refresh_on_ack: false,
             qualify_ceiling: false,
             drain_epoch_stamp: false,
+            drain_observed: false,
         }
     }
 
@@ -2538,20 +2555,24 @@ impl Levers {
             self.refresh_on_ack,
             self.qualify_ceiling,
             self.drain_epoch_stamp,
+            self.drain_observed,
         ) {
-            (false, false, false, false, false, false) => "A0 pipeline=0 demand=0",
-            (true, false, false, false, false, false) => "A1 pipeline=1 demand=0",
-            (false, true, false, false, false, false) => "A2 pipeline=0 demand=1",
-            (true, true, false, false, false, false) => {
+            (false, false, false, false, false, false, false) => "A0 pipeline=0 demand=0",
+            (true, false, false, false, false, false, false) => "A1 pipeline=1 demand=0",
+            (false, true, false, false, false, false, false) => "A2 pipeline=0 demand=1",
+            (true, true, false, false, false, false, false) => {
                 "A3 pipeline=1 demand=1 (hold-time levers off)"
             }
-            (true, true, true, false, false, false) => "H1 +ack_renewal",
-            (true, true, false, true, false, false) => "H2 +refresh_on_ack",
-            (true, true, true, true, false, false) => {
+            (true, true, true, false, false, false, false) => "H1 +ack_renewal",
+            (true, true, false, true, false, false, false) => "H2 +refresh_on_ack",
+            (true, true, true, true, false, false, false) => {
                 "H3 +ack_renewal +refresh_on_ack (hold-time shipped)"
             }
-            (true, true, true, true, true, false) => "R1 H3 +qualify_ceiling",
-            (true, true, true, true, true, true) => "R2 R1 +drain_epoch_stamp",
+            (true, true, true, true, true, false, false) => "R1 H3 +qualify_ceiling",
+            (true, true, true, true, true, true, false) => "R2 R1 +drain_epoch_stamp",
+            (true, true, true, true, true, true, true) => {
+                "R3 R2 +drain_observed (re-derivation shipped)"
+            }
             _ => "custom",
         }
     }
@@ -2711,6 +2732,7 @@ fn run_closed_loop(shape: &LoopShape, levers: Levers) -> LoopRow {
         refresh_on_ack,
         qualify_ceiling,
         drain_epoch_stamp,
+        drain_observed,
     } = levers;
     free_grace::test_set_ack_pipeline(Some(pipeline));
     free_grace::test_set_demand(Some(demand));
@@ -2718,6 +2740,11 @@ fn run_closed_loop(shape: &LoopShape, levers: Levers) -> LoopRow {
     free_grace::test_set_refresh_on_ack(Some(refresh_on_ack));
     free_grace::test_set_qualify_ceiling(Some(qualify_ceiling));
     squeezefs::ro_coherence::test_set_drain_epoch_stamp(Some(drain_epoch_stamp));
+    squeezefs::ro_coherence::test_set_drain_observed(Some(drain_observed));
+    if drain_observed {
+        // The cadence task's spawn arms the ledger on a real mount.
+        squeezefs::ro_coherence::test_arm_serve_ledger();
+    }
     let (clock, ticks) = manual_clock();
     let owner = armed_owner(&clock);
     free_grace::arm_owner_plane(clock.clone(), owner.clocks()).expect("derived bound");
@@ -2732,11 +2759,9 @@ fn run_closed_loop(shape: &LoopShape, levers: Levers) -> LoopRow {
     let ceiling_ms = squeezefs::meta_backend::kv::checkpoint::checkpoint_landing_ceiling_derived();
     let qualify_lag_ms =
         free_grace::qualify_lag_ms(qualify_ceiling, ceiling_ms, staleness_ms, skew_ms);
-    let drain_lag_ms = free_grace::drain_lag_ms(
-        drain_epoch_stamp,
-        staleness_ms,
-        clocks.d_purge.as_millis() as u64,
-    );
+    let d_purge_ms = clocks.d_purge.as_millis() as u64;
+    let drain_lag_ms =
+        free_grace::drain_lag_ms(drain_epoch_stamp, drain_observed, staleness_ms, d_purge_ms);
     let refresh_floor_ms = pass_ms.max(skew_ms);
 
     let t0 = clock.now_ms();
@@ -2916,6 +2941,15 @@ fn run_closed_loop(shape: &LoopShape, levers: Levers) -> LoopRow {
                     qualify_lag_ms,
                     drain_lag_ms,
                     refresh_floor_ms,
+                    // Item 3: with the observed drain in force the pass
+                    // records the generation its steps left (no serves run
+                    // in this model, so the drain is the step itself).
+                    drain_gen: if drain_observed {
+                        squeezefs::ro_coherence::reader_step_generation()
+                    } else {
+                        0
+                    },
+                    drain_budget_ms: d_purge_ms,
                 });
                 r.last_pass_ms = now;
                 if let Some(label) = promoted {
@@ -3019,6 +3053,7 @@ fn run_closed_loop(shape: &LoopShape, levers: Levers) -> LoopRow {
     assert!(free_grace::test_clear_refresh_on_ack());
     assert!(free_grace::test_clear_qualify_ceiling());
     assert!(squeezefs::ro_coherence::test_clear_drain_epoch_stamp());
+    assert!(squeezefs::ro_coherence::test_clear_drain_observed());
     row
 }
 
@@ -4412,8 +4447,8 @@ fn the_rederived_qualify_window_cuts_the_hold_by_the_double_counted_term() {
 fn the_drain_window_carries_no_cache_ttl_once_entries_are_step_stamped() {
     let _serial = serial();
     // The pure rule both the product and the loop model call.
-    assert_eq!(free_grace::drain_lag_ms(true, 2_000, 2_000), 2_000);
-    assert_eq!(free_grace::drain_lag_ms(false, 2_000, 2_000), 4_000);
+    assert_eq!(free_grace::drain_lag_ms(true, false, 2_000, 2_000), 2_000);
+    assert_eq!(free_grace::drain_lag_ms(false, false, 2_000, 2_000), 4_000);
 
     for lever in [true, false] {
         free_grace::reset_for_test();
@@ -4519,5 +4554,268 @@ fn the_step_stamped_drain_cuts_the_hold_by_the_cache_ttl() {
     assert!(
         after.stalls_steady <= before.stalls_steady,
         "never stalls the stream more"
+    );
+}
+
+/// **Contract 36 — item 3: the drain is OBSERVED — a candidate promotes
+/// when every serve that started before its qualifying step has completed,
+/// and NOT before; `D_purge` is a tripwire, never a shorter wait.** The
+/// ledger counts every read serve in the purge generation it started
+/// under (`ServeStamp`); the ladder's drained condition for a candidate
+/// qualified after the step that left generation `G` is "every slot below
+/// `G` reads zero". A serve that started AFTER the step never blocks it.
+/// A pre-step serve outliving the fail-stop budget counts
+/// `free_grace_drain_overdue` (and `invariant_tripwires`) exactly once and
+/// the candidate KEEPS waiting. `SQUEEZEFS_FREE_GRACE_DRAIN_OBSERVED=0`
+/// restores the `D_purge` timer verbatim.
+#[test]
+fn the_drain_is_observed_and_never_promotes_over_a_pre_step_serve_in_flight() {
+    use squeezefs::ro_coherence::{self, ServeStamp};
+    let _serial = serial();
+    ro_coherence::test_arm_serve_ledger();
+
+    // The ledger alone: nothing in flight drains at once; a serve stamped
+    // before a step blocks the drain below that step until it completes;
+    // a serve stamped after the step never does.
+    assert!(ro_coherence::serve_drained_below(0));
+    let pre = ServeStamp::begin(); // generation 0
+    ro_coherence::test_note_epoch_step(); // → 1
+    let post = ServeStamp::begin(); // generation 1
+    assert_eq!(ro_coherence::serves_inflight(), 2);
+    assert!(
+        !ro_coherence::serve_drained_below(1),
+        "a serve that started before the step is in flight"
+    );
+    drop(pre);
+    assert!(
+        ro_coherence::serve_drained_below(1),
+        "the post-step serve does not block the drain below its own generation"
+    );
+    assert_eq!(ro_coherence::serves_inflight(), 1);
+    drop(post);
+    assert_eq!(ro_coherence::serves_inflight(), 0);
+
+    // The ladder on it: a bare ladder with the timer at 0 (both drain
+    // terms re-derived), a candidate qualifying at the pass that stepped
+    // to generation 2 while one pre-step serve is in flight.
+    let ladder = ReaderAckLadder::new();
+    let trips0 = METRICS.invariant_tripwires.load(Ordering::Relaxed);
+    let straggler = ServeStamp::begin(); // generation 1 — pre-step for the pass below
+    ro_coherence::test_note_epoch_step(); // → 2 (the qualifying pass's step)
+    let inputs = |pass_start: u64, now: u64, advanced: bool| AckInputs {
+        label: 5_000,
+        learned_at_ms: 1_000,
+        pass_start_ms: pass_start,
+        now_ms: now,
+        advanced,
+        qualify_lag_ms: 1_122,
+        drain_lag_ms: 0,
+        refresh_floor_ms: 1_000,
+        drain_gen: ro_coherence::reader_step_generation(),
+        drain_budget_ms: 2_000,
+    };
+    assert_eq!(
+        ladder.note_pass(inputs(2_200, 2_210, true)),
+        None,
+        "qualified, but the pre-step serve is in flight"
+    );
+    assert_eq!(ladder.pending(), 5_000);
+    // Time alone never promotes it — not at D_purge, not far past it —
+    // and the tripwire fires exactly once when the budget is exceeded.
+    assert_eq!(ladder.note_pass(inputs(4_000, 4_100, false)), None);
+    assert_eq!(
+        free_grace::drain_overdue(),
+        0,
+        "inside the budget: no tripwire"
+    );
+    assert_eq!(ladder.note_pass(inputs(4_300, 4_300, false)), None);
+    assert_eq!(
+        free_grace::drain_overdue(),
+        1,
+        "2,090 ms after the qualifying pass the D_purge budget is exceeded: the tripwire fires"
+    );
+    assert_eq!(
+        METRICS.invariant_tripwires.load(Ordering::Relaxed),
+        trips0 + 1,
+        "…and it is an invariant tripwire"
+    );
+    assert_eq!(ladder.note_pass(inputs(9_000, 9_000, false)), None);
+    assert_eq!(free_grace::drain_overdue(), 1, "counted once per candidate");
+    assert_eq!(free_grace::drain_observed(), 0);
+    // A serve that started AFTER the qualifying step changes nothing.
+    let later = ServeStamp::begin(); // generation 2
+    assert_eq!(ladder.note_pass(inputs(9_100, 9_100, false)), None);
+    // The straggler completes: the very next pass promotes — by
+    // observation, with the later serve still in flight.
+    drop(straggler);
+    assert_eq!(ladder.note_pass(inputs(9_200, 9_200, false)), Some(5_000));
+    assert_eq!(free_grace::drain_observed(), 1);
+    drop(later);
+
+    // The lever off (timer only): `drain_gen` 0 — the same in-flight serve
+    // does not hold the promotion, the D_purge timer does.
+    let ladder = ReaderAckLadder::new();
+    let held = ServeStamp::begin();
+    ro_coherence::test_note_epoch_step();
+    let timer = |pass_start: u64, now: u64, advanced: bool| AckInputs {
+        drain_gen: 0,
+        drain_lag_ms: 2_000,
+        ..inputs(pass_start, now, advanced)
+    };
+    assert_eq!(ladder.note_pass(timer(2_200, 2_210, true)), None);
+    assert_eq!(
+        ladder.note_pass(timer(4_000, 4_100, false)),
+        None,
+        "2,000 not yet elapsed"
+    );
+    assert_eq!(
+        ladder.note_pass(timer(4_300, 4_300, false)),
+        Some(5_000),
+        "lever off: the timer promotes over the in-flight serve (the pre-change shape)"
+    );
+    drop(held);
+    assert_eq!(
+        free_grace::drain_observed(),
+        1,
+        "a timer promotion is not an observed one"
+    );
+}
+
+/// **Contract 37 — item 3 end to end on a member session, and the
+/// completion wake.** With the ledger armed and nothing in flight the
+/// promotion lands AT the qualifying pass (the drain is the serves
+/// themselves — here none); with one pre-step serve in flight the
+/// qualifying pass does not promote, its completion wakes the
+/// revalidation task (`free_grace_drain_wakes`, the parked
+/// `drain_wake()`), and the woken pass promotes. The windows in force are
+/// published.
+#[test]
+fn a_qualified_candidate_promotes_at_the_pass_and_a_stragglers_completion_wakes_the_ladder() {
+    use squeezefs::ro_coherence::{self, ServeStamp};
+    let _serial = serial();
+    for straggle in [false, true] {
+        free_grace::reset_for_test();
+        membership::uninstall();
+        ro_coherence::test_set_drain_observed(Some(true));
+        ro_coherence::test_arm_serve_ledger();
+        let (clock, ticks) = manual_clock();
+        let owner = armed_owner(&clock);
+        let grant = join(&owner, "r-observed", MemberRole::Reader);
+        owner.refresh_free_grace_bound();
+        let anchor = clock.now_ms();
+        let session = Arc::new(MemberSession::adopt(
+            "r-observed",
+            MemberRole::Reader,
+            &grant,
+            anchor,
+            clock.clone(),
+        ));
+        membership::install_member(Arc::clone(&session));
+        let (label, _) = session.learned_label();
+        let qualify = session.checkpoint_ceiling_ms() + session.skew_max_ms();
+
+        let straggler = straggle.then(ServeStamp::begin);
+        ticks.fetch_add(qualify, Ordering::SeqCst);
+        // The pass's step (the product's sink bumps the generation as its
+        // last act), then the ladder at the pass's end.
+        ro_coherence::test_note_epoch_step();
+        let promoted = free_grace::reader_pass_completed(clock.now_ms(), true);
+        let snap = free_grace::stats_snapshot();
+        assert_eq!(snap["free_grace_drain_lag_ms"], 0, "no timer term remains");
+        assert_eq!(snap["free_grace_qualify_lag_ms"], qualify);
+        if !straggle {
+            assert_eq!(
+                promoted,
+                Some(label),
+                "nothing in flight: promoted AT the qualifying pass"
+            );
+            assert_eq!(free_grace::drain_observed(), 1);
+            assert_eq!(session.acked_free_epoch(), label);
+        } else {
+            assert_eq!(promoted, None, "a pre-step serve is in flight");
+            assert_eq!(reader_pending_label(), label);
+            let mut parked = ro_coherence::drain_wake().notified_raw();
+            assert!(!parked.enable(), "nothing has woken the task yet");
+            // A post-step serve completing wakes nobody (it is not waited on).
+            drop(ServeStamp::begin());
+            assert_eq!(ro_coherence::drain_wakes(), 0);
+            // The straggler completes: the last pre-step serve wakes the
+            // revalidation task, whose early pass promotes.
+            drop(straggler);
+            assert_eq!(ro_coherence::drain_wakes(), 1);
+            assert!(parked.enable(), "the parked revalidation task is woken");
+            assert_eq!(
+                free_grace::reader_pass_completed(clock.now_ms(), false),
+                Some(label),
+                "the woken pass promotes by observation"
+            );
+            assert_eq!(free_grace::drain_observed(), 1);
+            assert_eq!(free_grace::drain_overdue(), 0);
+        }
+        assert!(ro_coherence::test_clear_drain_observed());
+    }
+}
+
+/// **Contract 38 — item 3 on the fleet-cadence loop: the `D_purge` timer
+/// leaves the hold.** R2 (items 1 + 2) against R3 (+ the observed drain):
+/// `bound_age` falls by ≈ the 2,000 ms reserve, closure exact, no fence,
+/// the stream never stalled more. The model runs no serves, so its drain
+/// is the step itself; on a mount the term is the serve residence
+/// (milliseconds). The three rows together are the re-derivation's
+/// before/after: H3 → R3.
+#[test]
+fn the_observed_drain_cuts_the_hold_by_the_lease_clock_reserve() {
+    let _serial = serial();
+    let shape = fleet_cadence_shape("rederive-drain-observed(spare=256,ckpt=1s,8m)", 256);
+    let h3 = run_closed_loop(&shape, Levers::h3());
+    let before = run_closed_loop(
+        &shape,
+        Levers {
+            qualify_ceiling: true,
+            drain_epoch_stamp: true,
+            ..Levers::h3()
+        },
+    );
+    let after = run_closed_loop(
+        &shape,
+        Levers {
+            qualify_ceiling: true,
+            drain_epoch_stamp: true,
+            drain_observed: true,
+            ..Levers::h3()
+        },
+    );
+    for r in [&h3, &before, &after] {
+        println!("{}", r.render(&shape));
+        assert_eq!(
+            r.deferrals,
+            r.releases + r.held_end,
+            "{}: closure",
+            r.config
+        );
+        assert_eq!((r.forced, r.fences), (0, 0), "{}: no fence", r.config);
+        assert_eq!(r.hold_unplaced, 0, "{}: every stage placed", r.config);
+    }
+    let cut = before.bound_age_mean_ms - after.bound_age_mean_ms;
+    assert!(
+        (1_500.0..=2_500.0).contains(&cut),
+        "the observed drain removes ≈ D_purge: {:.0} → {:.0} ms (−{cut:.0})",
+        before.bound_age_mean_ms,
+        after.bound_age_mean_ms
+    );
+    assert!(
+        after.stalls_steady <= before.stalls_steady,
+        "never stalls the stream more"
+    );
+    assert_eq!(
+        free_grace::drain_overdue(),
+        0,
+        "no drain outlived the fail-stop budget"
+    );
+    assert!(
+        (2_500.0..=4_000.0).contains(&after.bound_age_mean_ms),
+        "the re-derived hold at fleet cadences: {:.0} ms (H3 {:.0})",
+        after.bound_age_mean_ms,
+        h3.bound_age_mean_ms
     );
 }

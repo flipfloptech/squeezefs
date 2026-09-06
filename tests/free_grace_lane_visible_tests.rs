@@ -901,6 +901,10 @@ fn run_lane_loop(shape: &LaneShape, lever: bool) -> LaneRow {
                     qualify_lag_ms,
                     drain_lag_ms,
                     refresh_floor_ms,
+                    // This model pins the lane-visible campaign on the
+                    // pre-re-derivation windows: the timer alone decides.
+                    drain_gen: 0,
+                    drain_budget_ms: clocks.d_purge.as_millis() as u64,
                 });
                 cw.last_pass_ms = now;
                 if let Some(label) = promoted {

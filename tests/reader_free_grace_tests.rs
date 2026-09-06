@@ -2498,6 +2498,9 @@ struct Levers {
     ack_renewal: bool,
     /// (d) a binding member's advancing ack marks the bound dirty.
     refresh_on_ack: bool,
+    /// Re-derivation item 1: qualify = the writer's checkpoint ceiling +
+    /// skew (off = the pre-change `staleness + skew`).
+    qualify_ceiling: bool,
 }
 
 impl Levers {
@@ -2509,6 +2512,17 @@ impl Levers {
             demand,
             ack_renewal: false,
             refresh_on_ack: false,
+            qualify_ceiling: false,
+        }
+    }
+
+    /// The hold-time campaign's shipped configuration (H3) with the
+    /// ladder re-derivation levers OFF — the 2026-09-06 hold-time binary.
+    fn h3() -> Self {
+        Self {
+            ack_renewal: true,
+            refresh_on_ack: true,
+            ..Self::d4(true, true)
         }
     }
 
@@ -2518,14 +2532,18 @@ impl Levers {
             self.demand,
             self.ack_renewal,
             self.refresh_on_ack,
+            self.qualify_ceiling,
         ) {
-            (false, false, false, false) => "A0 pipeline=0 demand=0",
-            (true, false, false, false) => "A1 pipeline=1 demand=0",
-            (false, true, false, false) => "A2 pipeline=0 demand=1",
-            (true, true, false, false) => "A3 pipeline=1 demand=1 (hold-time levers off)",
-            (true, true, true, false) => "H1 +ack_renewal",
-            (true, true, false, true) => "H2 +refresh_on_ack",
-            (true, true, true, true) => "H3 +ack_renewal +refresh_on_ack (shipped)",
+            (false, false, false, false, false) => "A0 pipeline=0 demand=0",
+            (true, false, false, false, false) => "A1 pipeline=1 demand=0",
+            (false, true, false, false, false) => "A2 pipeline=0 demand=1",
+            (true, true, false, false, false) => "A3 pipeline=1 demand=1 (hold-time levers off)",
+            (true, true, true, false, false) => "H1 +ack_renewal",
+            (true, true, false, true, false) => "H2 +refresh_on_ack",
+            (true, true, true, true, false) => {
+                "H3 +ack_renewal +refresh_on_ack (hold-time shipped)"
+            }
+            (true, true, true, true, true) => "R1 H3 +qualify_ceiling",
             _ => "custom",
         }
     }
@@ -2683,11 +2701,13 @@ fn run_closed_loop(shape: &LoopShape, levers: Levers) -> LoopRow {
         demand,
         ack_renewal,
         refresh_on_ack,
+        qualify_ceiling,
     } = levers;
     free_grace::test_set_ack_pipeline(Some(pipeline));
     free_grace::test_set_demand(Some(demand));
     free_grace::test_set_ack_renewal(Some(ack_renewal));
     free_grace::test_set_refresh_on_ack(Some(refresh_on_ack));
+    free_grace::test_set_qualify_ceiling(Some(qualify_ceiling));
     let (clock, ticks) = manual_clock();
     let owner = armed_owner(&clock);
     free_grace::arm_owner_plane(clock.clone(), owner.clocks()).expect("derived bound");
@@ -2696,7 +2716,12 @@ fn run_closed_loop(shape: &LoopShape, levers: Levers) -> LoopRow {
     let skew_ms = clocks.skew_max.as_millis() as u64;
     let staleness_ms = squeezefs::ro_coherence::reader_staleness_bound().as_millis() as u64;
     let pass_ms = squeezefs::ro_coherence::reader_revalidate_interval().as_millis() as u64;
-    let qualify_lag_ms = staleness_ms + skew_ms;
+    // The ladder's windows are the PRODUCT's derivations (the reader's
+    // `reader_pass_completed` computes exactly these); the writer's
+    // ceiling is the shipped derivation a real member session answers.
+    let ceiling_ms = squeezefs::meta_backend::kv::checkpoint::checkpoint_landing_ceiling_derived();
+    let qualify_lag_ms =
+        free_grace::qualify_lag_ms(qualify_ceiling, ceiling_ms, staleness_ms, skew_ms);
     let drain_lag_ms = staleness_ms + clocks.d_purge.as_millis() as u64;
     let refresh_floor_ms = pass_ms.max(skew_ms);
 
@@ -2972,6 +2997,7 @@ fn run_closed_loop(shape: &LoopShape, levers: Levers) -> LoopRow {
     assert!(free_grace::test_clear_demand());
     assert!(free_grace::test_clear_ack_renewal());
     assert!(free_grace::test_clear_refresh_on_ack());
+    assert!(free_grace::test_clear_qualify_ceiling());
     row
 }
 
@@ -4038,14 +4064,7 @@ fn the_hold_time_levers_cut_the_hold_and_never_fence() {
                 ..Levers::d4(true, true)
             },
         ),
-        run_closed_loop(
-            &shape,
-            Levers {
-                ack_renewal: true,
-                refresh_on_ack: true,
-                ..Levers::d4(true, true)
-            },
-        ),
+        run_closed_loop(&shape, Levers::h3()),
     ];
     for r in &rows {
         println!("{}", r.render(&shape));
@@ -4119,11 +4138,7 @@ fn a_faster_checkpoint_cadence_alone_leaves_the_hold_where_it_was() {
         checkpoint_ms: 1_650,
         ..shipped
     };
-    let levers = Levers {
-        ack_renewal: true,
-        refresh_on_ack: true,
-        ..Levers::d4(true, true)
-    };
+    let levers = Levers::h3();
     let a = run_closed_loop(&shipped, levers);
     let b = run_closed_loop(&halved, levers);
     let c = run_closed_loop(&sparse, levers);
@@ -4154,5 +4169,209 @@ fn a_faster_checkpoint_cadence_alone_leaves_the_hold_where_it_was() {
         "checkpoints sparser than the passes DO cost the hold: {:.0} vs {:.0} ms",
         c.bound_age_mean_ms,
         a.bound_age_mean_ms
+    );
+}
+
+// ===========================================================================
+// The ladder re-derivation (2026-09-06, user decision — finding 15 term 1,
+// `.benchmarks/2026-09-06-free-grace-ladder-rederivation.md`): the two
+// DERIVED windows the hold-time campaign named as adjudication items 1–3.
+// The windows stay pinned against DEMAND (KD-FG-11: elastic passes never
+// shorten them); what changes is their DERIVATION — each term traced to
+// the writer's machinery instead of to a poll interval that stood in for it.
+// ===========================================================================
+
+/// The reader's pending (qualified, undrained) label off its own stats
+/// face — 0 when nothing is qualified.
+fn reader_pending_label() -> u64 {
+    free_grace::stats_snapshot()["free_grace_reader_pending_label"]
+        .as_u64()
+        .unwrap_or(0)
+}
+
+/// **Contract 32 — item 1: the qualify window is the writer's checkpoint
+/// ceiling plus the skew bound; the poll interval is not in it.** Gate 2
+/// argues the pass's ledger read must post-date a checkpoint containing
+/// the dereference. The dereference commit precedes the free (the reclaim
+/// queue sits between), so it lands in the ledger within the writer's
+/// checkpoint LANDING ceiling of the label — the cadence trigger
+/// (`CHECKPOINT_MAX_AGE_MS`) plus the two tick-granularity terms the
+/// trigger is evaluated behind (the tick wait and the bounded maintenance
+/// drain, each ≤ one checkpoint-task period). The `P` in the staleness
+/// bound is the READER's poll interval — "how stale can a reader be" — but
+/// for qualification the pass itself IS the poll, so it was counted twice.
+/// `SQUEEZEFS_FREE_GRACE_QUALIFY_CEILING=0` restores `staleness + skew`
+/// verbatim.
+#[test]
+fn the_qualify_window_is_the_writers_ceiling_plus_skew_and_carries_no_poll_interval() {
+    use squeezefs::meta_backend::kv::checkpoint::{
+        checkpoint_landing_ceiling_ms, checkpoint_tick_period_ms, CHECKPOINT_MAX_AGE_MS,
+    };
+    let _serial = serial();
+    // The derivation, drift-is-red: the shipped 50 ms flush tick ⇒
+    // 1,000 + 2 × 50 = 1,100 ms; strict mode (0) reads the task's own
+    // 100 ms tick; a 5 s flush venue's tick IS the landing term.
+    assert_eq!(checkpoint_tick_period_ms(50), 50);
+    assert_eq!(checkpoint_tick_period_ms(0), 100);
+    assert_eq!(checkpoint_tick_period_ms(5_000), 5_000);
+    assert_eq!(
+        checkpoint_landing_ceiling_ms(50),
+        CHECKPOINT_MAX_AGE_MS as u64 + 100
+    );
+    assert_eq!(checkpoint_landing_ceiling_ms(0), 1_200);
+    assert_eq!(checkpoint_landing_ceiling_ms(5_000), 11_000);
+
+    // The pure rule both the product and the loop model call.
+    assert_eq!(
+        free_grace::qualify_lag_ms(true, 1_100, 2_000, 22),
+        1_122,
+        "lever on: ceiling + skew"
+    );
+    assert_eq!(
+        free_grace::qualify_lag_ms(false, 1_100, 2_000, 22),
+        2_022,
+        "lever off: the pre-change staleness + skew verbatim"
+    );
+
+    // End to end on a real member session: the accessor is the shipped
+    // derivation, it sits strictly below the staleness bound (the poll
+    // interval is NOT in it), and a pass beginning exactly at
+    // `learned + ceiling + skew` qualifies while one 1 ms earlier does not.
+    let (clock, ticks) = manual_clock();
+    // No free-grace OWNER plane in this process: the ladder is the
+    // member's alone, and the reader stats face is what is read below.
+    let owner = armed_owner(&clock);
+    let grant = join(&owner, "r-qualify", MemberRole::Reader);
+    owner.refresh_free_grace_bound();
+    let anchor = clock.now_ms();
+    let session = Arc::new(MemberSession::adopt(
+        "r-qualify",
+        MemberRole::Reader,
+        &grant,
+        anchor,
+        clock.clone(),
+    ));
+    membership::install_member(Arc::clone(&session));
+    let staleness = squeezefs::ro_coherence::reader_staleness_bound().as_millis() as u64;
+    let ceiling = session.checkpoint_ceiling_ms();
+    assert_eq!(
+        ceiling,
+        checkpoint_landing_ceiling_ms(50),
+        "the member's accessor IS the writer's landing derivation on the shipped tree"
+    );
+    assert!(
+        ceiling < staleness,
+        "the ceiling ({ceiling}) carries no poll interval; the staleness bound ({staleness}) does"
+    );
+    let (label, learned_at) = session.learned_label();
+    let qualify = ceiling + session.skew_max_ms();
+
+    free_grace::test_set_qualify_ceiling(Some(true));
+    // One ms too early: a checkpoint containing the dereference need not
+    // have landed.
+    ticks.fetch_add(qualify - 1, Ordering::SeqCst);
+    assert_eq!(
+        free_grace::reader_pass_completed(clock.now_ms(), true),
+        None
+    );
+    assert_eq!(
+        reader_pending_label(),
+        0,
+        "nothing qualified a millisecond before the ceiling"
+    );
+    // Exactly at it: the pass qualifies (the candidate now awaits its
+    // drain — this contract leaves the drain where item 1 found it).
+    ticks.fetch_add(1, Ordering::SeqCst);
+    let pass_start = clock.now_ms();
+    assert_eq!(pass_start, learned_at + qualify);
+    assert_eq!(free_grace::reader_pass_completed(pass_start, true), None);
+    assert_eq!(
+        reader_pending_label(),
+        label,
+        "the pass at learned + ceiling + skew QUALIFIED the label"
+    );
+    assert_eq!(
+        free_grace::stats_snapshot()["free_grace_qualify_lag_ms"],
+        qualify,
+        "the derivation in force is published"
+    );
+    assert!(free_grace::test_clear_qualify_ceiling());
+
+    // The lever off: the same pass instant does NOT qualify (the
+    // pre-change `staleness + skew` window), pinned against the same
+    // session so the A/B is exact.
+    free_grace::reset_for_test();
+    membership::uninstall();
+    free_grace::test_set_qualify_ceiling(Some(false));
+    let (clock, ticks) = manual_clock();
+    let owner = armed_owner(&clock);
+    let grant = join(&owner, "r-qualify-off", MemberRole::Reader);
+    owner.refresh_free_grace_bound();
+    let anchor = clock.now_ms();
+    let session = Arc::new(MemberSession::adopt(
+        "r-qualify-off",
+        MemberRole::Reader,
+        &grant,
+        anchor,
+        clock.clone(),
+    ));
+    membership::install_member(Arc::clone(&session));
+    ticks.fetch_add(qualify, Ordering::SeqCst);
+    assert_eq!(
+        free_grace::reader_pass_completed(clock.now_ms(), true),
+        None
+    );
+    assert_eq!(
+        reader_pending_label(),
+        0,
+        "lever off: learned + ceiling + skew is inside the old window — nothing qualifies"
+    );
+    assert_eq!(
+        free_grace::stats_snapshot()["free_grace_qualify_lag_ms"],
+        staleness + session.skew_max_ms(),
+    );
+    assert!(free_grace::test_clear_qualify_ceiling());
+}
+
+/// **Contract 33 — item 1 on the fleet-cadence loop: the hold drops by
+/// the double-counted term and nothing else moves.** The 2026-09-06
+/// hold-time binary (H3) against H3 + the re-derived qualify window: the
+/// `bound_age` falls by ≈ the removed 900 ms (the poll interval's 1,000 ms
+/// less the 100 ms of tick granularity the honest landing bound keeps),
+/// closure exact, `forced = fences = 0`, the stream never stalled more.
+/// The rows are the note's.
+#[test]
+fn the_rederived_qualify_window_cuts_the_hold_by_the_double_counted_term() {
+    let _serial = serial();
+    let shape = fleet_cadence_shape("rederive-qualify(spare=256,ckpt=1s,8m)", 256);
+    let before = run_closed_loop(&shape, Levers::h3());
+    let after = run_closed_loop(
+        &shape,
+        Levers {
+            qualify_ceiling: true,
+            ..Levers::h3()
+        },
+    );
+    for r in [&before, &after] {
+        println!("{}", r.render(&shape));
+        assert_eq!(
+            r.deferrals,
+            r.releases + r.held_end,
+            "{}: closure",
+            r.config
+        );
+        assert_eq!((r.forced, r.fences), (0, 0), "{}: no fence", r.config);
+        assert_eq!(r.hold_unplaced, 0, "{}: every stage placed", r.config);
+    }
+    let cut = before.bound_age_mean_ms - after.bound_age_mean_ms;
+    assert!(
+        (500.0..=1_300.0).contains(&cut),
+        "the qualify re-derivation removes ≈ the double-counted second: {:.0} → {:.0} ms (−{cut:.0})",
+        before.bound_age_mean_ms,
+        after.bound_age_mean_ms
+    );
+    assert!(
+        after.stalls_steady <= before.stalls_steady,
+        "never stalls the stream more"
     );
 }

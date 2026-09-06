@@ -2101,3 +2101,48 @@ fn free_grace_refresh_on_ack_interval_derives_from_floor_members_and_scan() {
     assert_eq!(refresh_on_ack_interval_ms(1_000, 8, 100), 200);
     assert_eq!(refresh_on_ack_interval_ms(1_000, 8, 50), 125);
 }
+
+/// The reader ack ladder's qualify window derives from the WRITER's
+/// checkpoint landing ceiling (ladder re-derivation item 1,
+/// `.benchmarks/2026-09-06-free-grace-ladder-rederivation.md`) — drift-is-red:
+/// the ceiling is the cadence trigger plus two checkpoint-task tick periods
+/// (the tick wait and the bounded maintenance drain the trigger is
+/// evaluated behind), and the tick period is the ONE derivation the
+/// checkpoint task and the reader's poll cadence both ride, so the three
+/// cannot drift apart.
+#[test]
+fn free_grace_qualify_ceiling_derives_from_the_checkpoint_trigger_and_tick() {
+    use squeezefs::meta_backend::kv::checkpoint::{
+        checkpoint_landing_ceiling_ms, checkpoint_tick_period_ms, CHECKPOINT_MAX_AGE_MS,
+    };
+    use squeezefs::meta_backend::kv::revalidate::resolve_revalidate_interval_ms;
+    for flush in [0u64, 1, 50, 250, 1_000, 5_000] {
+        let tick = checkpoint_tick_period_ms(flush);
+        assert_eq!(
+            checkpoint_landing_ceiling_ms(flush),
+            CHECKPOINT_MAX_AGE_MS as u64 + 2 * tick,
+            "flush {flush}: trigger + 2 × tick"
+        );
+        // The reader's poll interval rides the same tick derivation.
+        assert_eq!(
+            resolve_revalidate_interval_ms(flush, None),
+            tick.max(CHECKPOINT_MAX_AGE_MS as u64),
+            "flush {flush}: the poll cadence is max(tick, trigger) off the same tick"
+        );
+    }
+    // Strict mode reads the task's own 100 ms tick; the shipped 50 ms
+    // flush lands at 1,100 — strictly below the 2,000 ms staleness bound
+    // the pre-change window rode (the poll interval is not in it).
+    assert_eq!(checkpoint_landing_ceiling_ms(0), 1_200);
+    assert_eq!(checkpoint_landing_ceiling_ms(50), 1_100);
+    assert!(checkpoint_landing_ceiling_ms(50) < resolve_revalidate_interval_ms(50, None) + 1_000);
+    // The ladder's rule: lever on = ceiling + skew, off = staleness + skew.
+    assert_eq!(
+        squeezefs::free_grace::qualify_lag_ms(true, 1_100, 2_000, 22),
+        1_122
+    );
+    assert_eq!(
+        squeezefs::free_grace::qualify_lag_ms(false, 1_100, 2_000, 22),
+        2_022
+    );
+}

@@ -978,6 +978,46 @@ pub fn resolve_max_dirty_nodes(budget_bytes: u64, node_size: u64, env: Option<&s
 /// derives from this ceiling (`super::revalidate`).
 pub const CHECKPOINT_MAX_AGE_MS: u128 = 1000;
 
+/// The checkpoint task's tick period for a flush interval, ms: the knob
+/// verbatim, strict mode (`0`) reading as the task's own 100 ms tick. The
+/// ONE derivation [`spawn_checkpoint_task`] and the reader's poll cadence
+/// (`super::revalidate::resolve_revalidate_interval_ms`) both ride, so the
+/// two cannot drift.
+pub fn checkpoint_tick_period_ms(flush_interval_ms: u64) -> u64 {
+    match flush_interval_ms {
+        0 => 100,
+        ms => ms,
+    }
+}
+
+/// **The writer's checkpoint LANDING ceiling for a commit, ms** — the
+/// reader ack ladder's qualify term (spec §6.8 item 3; ladder
+/// re-derivation item 1, `.benchmarks/2026-09-06-free-grace-ladder-rederivation.md`).
+///
+/// [`CHECKPOINT_MAX_AGE_MS`] is the cadence TRIGGER, evaluated in `tick`
+/// behind two tick-granularity terms: the tick wait (the decision is
+/// taken once per period) and the bounded maintenance drain that precedes
+/// the decision in the same tick (finding 49: ≤ one period). A commit
+/// acked at `t` therefore has its checkpoint decided by
+/// `t + CHECKPOINT_MAX_AGE_MS + 2 × period`; the record lands after the
+/// cycle's own writes, a device-time term the reader cannot derive and
+/// that the published S5 staleness bound leaves unstated too (the
+/// writer-advertised ceiling of adjudication item 4 is where a measured
+/// cycle term belongs). On the shipped 50 ms flush this is 1,100 ms; on a
+/// slow-flush venue the tick IS the landing term (5 s ⇒ 11,000 ms), which
+/// the retired `staleness + skew` window (P + 1 s) never covered.
+pub fn checkpoint_landing_ceiling_ms(flush_interval_ms: u64) -> u64 {
+    CHECKPOINT_MAX_AGE_MS as u64 + 2 * checkpoint_tick_period_ms(flush_interval_ms)
+}
+
+/// [`checkpoint_landing_ceiling_ms`] at the flush cadence in force — the
+/// value a member session answers for its writer today (the fleet-config
+/// assumption the reader's poll cadence already makes: one flush knob
+/// across the set).
+pub fn checkpoint_landing_ceiling_derived() -> u64 {
+    checkpoint_landing_ceiling_ms(crate::meta_backend::resolve_flush_interval_ms())
+}
+
 /// §4.7 wedged-tail audit bound (design-smo-replay-currency PR 4
 /// clause b; the [`KvMetaBackend::checkpoint_past`] precedent's shape):
 /// consecutive barriered cycles with retirements parked, none released,
@@ -1010,10 +1050,7 @@ pub(super) fn spawn_checkpoint_task(be: &Arc<KvMetaBackend>) {
     // The EXISTING flusher cadence (§4.6): strict mode (interval 0) still
     // needs the background cycle for ring reclamation and SMO service —
     // it ticks at 100 ms; commits barrier themselves.
-    let interval = match crate::meta_backend::resolve_flush_interval_ms() {
-        0 => 100,
-        ms => ms,
-    };
+    let interval = checkpoint_tick_period_ms(crate::meta_backend::resolve_flush_interval_ms());
     // Stage 1c (design-sqz-sync): the checkpoint/SMO task is PLANE-
     // CRITICAL — a lost one stops journal reclamation and wedges every
     // committer at ring admission. It now runs on the sqz-meta lanes

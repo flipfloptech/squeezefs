@@ -2020,7 +2020,9 @@ pub struct AckInputs {
     pub now_ms: u64,
     /// `true` ⇔ the pass advanced the epoch, i.e. it ran the R-6 purge.
     pub advanced: bool,
-    /// `staleness_bound + skew_max`.
+    /// The qualify window — [`qualify_lag_ms`]: the writer's checkpoint
+    /// landing ceiling + `skew_max` (item 1; `staleness_bound + skew_max`
+    /// under the lever's `0`).
     pub qualify_lag_ms: u64,
     /// `staleness_bound + D_purge`.
     pub drain_lag_ms: u64,
@@ -2055,12 +2057,38 @@ struct AckCandidate {
 ///    about its block-key census, which is the half §6.3 calls
 ///    structurally undetectable.
 /// 2. **Late enough.** The pass must have BEGUN at least
-///    `staleness_bound + skew_max` after the label was learned. The label
-///    post-dates the free; the writer's checkpoint ceiling then says the
-///    dereference is durably checkpointed within the staleness bound, so
-///    the record this pass adopts contains it. A pass that began earlier
-///    can adopt a record that still names the freed block, and the reader
-///    would re-resolve the binding immediately after purging it.
+///    `checkpoint_ceiling + skew_max` after the label was learned
+///    ([`qualify_lag_ms`]; ladder re-derivation item 1, 2026-09-06 —
+///    `.benchmarks/2026-09-06-free-grace-ladder-rederivation.md`). The
+///    argument, in full: the dereference commit precedes the free (the
+///    reclaim queue sits between), and the free's label is the owner's
+///    instant at the free, so the dereference was ACKED before the label.
+///    The writer's checkpoint machinery lands a commit in the ledger within
+///    its LANDING ceiling — the cadence trigger plus the two tick-
+///    granularity terms the trigger is evaluated behind
+///    (`checkpoint::checkpoint_landing_ceiling_ms`) — so by owner instant
+///    `label + ceiling` a ledger record containing the dereference exists,
+///    and a pass whose ledger READ begins after that adopts it (or a
+///    newer one). The member measures from the instant it LEARNED the
+///    label (its send anchor): the label was minted no later than one
+///    trip after that anchor, and `skew_max ≥ the observed RTT` covers the
+///    trip plus the clocks' rate drift — so a member-clock pass start of
+///    `learned + ceiling + skew` is an owner-clock instant ≥ `label +
+///    ceiling`. A learn instant LATER than the label's (a slow beat) only
+///    pushes the pass later: conservative, never unsafe.
+///
+///    **Why the poll interval is not in this window** (the term the
+///    2026-08 derivation carried as `staleness_bound = P + ceiling`):
+///    `P` bounds how stale a reader may be BETWEEN polls — the S5
+///    staleness statement. For qualification the pass itself IS the poll:
+///    its read is the observation the window exists to place after the
+///    landing, so `P` bounded nothing and was counted on top of the
+///    ceiling. What DOES remain unstated is device time (the cycle's own
+///    writes) — the same residue the published S5 bound carries; the
+///    writer-advertised ceiling of adjudication item 4 is where a
+///    measured cycle term belongs. A pass that began earlier can adopt a
+///    record that still names the freed block, and the reader would
+///    re-resolve the binding immediately after purging it.
 /// 3. **Drained.** `staleness_bound + D_purge` must then elapse: the daemon
 ///    layout/attr caches (whose reader TTL *is* the staleness bound —
 ///    §6.8 item 4) must expire, and serves already in flight when the purge
@@ -2408,13 +2436,20 @@ pub fn reader_pass_completed(pass_start_ms: u64, advanced: bool) -> Option<u64> 
         return None;
     }
     let staleness = crate::ro_coherence::reader_staleness_bound().as_millis() as u64;
+    let qualify = qualify_lag_ms(
+        qualify_ceiling_enabled(),
+        session.checkpoint_ceiling_ms(),
+        staleness,
+        session.skew_max_ms(),
+    );
+    QUALIFY_LAG_MS.store(qualify, Ordering::Relaxed);
     let out = LADDER.note_pass(AckInputs {
         label,
         learned_at_ms,
         pass_start_ms,
         now_ms: session.now_ms(),
         advanced,
-        qualify_lag_ms: staleness + session.skew_max_ms(),
+        qualify_lag_ms: qualify,
         drain_lag_ms: staleness + session.d_purge_ms(),
         // The pass cadence's own floor (`ack_refresh_floor`'s arithmetic,
         // reader-side): the pipeline-depth derivation's input.
@@ -2441,6 +2476,77 @@ pub fn reader_pass_completed(pass_start_ms: u64, advanced: bool) -> Option<u64> 
         );
     }
     out
+}
+
+/// **Gate 2's window — the qualify lag** (ladder re-derivation item 1,
+/// 2026-09-06). The pure rule both [`reader_pass_completed`] and the
+/// closed-loop model compute: with the `SQUEEZEFS_FREE_GRACE_QUALIFY_CEILING`
+/// lever on, the WRITER's checkpoint landing ceiling plus the skew bound;
+/// off, the retired `staleness + skew` verbatim (the A/B control).
+///
+/// Why the poll interval is not in it: the dereference commit precedes the
+/// free (the reclaim queue sits between), so it is in the ledger within the
+/// writer's landing ceiling of the free's label; a pass BEGINNING that far
+/// after the label was learned reads a record that contains it. The
+/// staleness bound's `P` term is "how stale can a reader be between polls"
+/// — but for qualification the pass IS the poll, so `P` bounded nothing
+/// here. `skew_max` (≥ the observed RTT) covers the label being minted up
+/// to one trip AFTER the member-clock instant it is measured from.
+pub fn qualify_lag_ms(
+    ceiling_lever_on: bool,
+    checkpoint_ceiling_ms: u64,
+    staleness_bound_ms: u64,
+    skew_max_ms: u64,
+) -> u64 {
+    if ceiling_lever_on {
+        checkpoint_ceiling_ms.saturating_add(skew_max_ms)
+    } else {
+        staleness_bound_ms.saturating_add(skew_max_ms)
+    }
+}
+
+/// The qualify lag in force on this reader, ms (`free_grace_qualify_lag_ms`
+/// — published so the operator page cannot drift from the derivation the
+/// ladder enforces; 0 until the first pass).
+static QUALIFY_LAG_MS: AtomicU64 = AtomicU64::new(0);
+
+/// `free_grace_qualify_lag_ms`.
+pub fn qualify_lag_in_force_ms() -> u64 {
+    QUALIFY_LAG_MS.load(Ordering::Relaxed)
+}
+
+/// The `SQUEEZEFS_FREE_GRACE_QUALIFY_CEILING` lever's latch (the
+/// `ACK_PIPELINE` pattern): item 1, qualify = the writer's checkpoint
+/// ceiling + skew. `0` = `staleness + skew` (the pre-change window).
+static QUALIFY_CEILING: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+fn qualify_ceiling_enabled() -> bool {
+    match QUALIFY_CEILING.load(Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            let on = crate::env_knobs::bool_knob("SQUEEZEFS_FREE_GRACE_QUALIFY_CEILING", true);
+            QUALIFY_CEILING.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+            on
+        }
+    }
+}
+
+/// Test seam (the `test_set_ack_pipeline` shape).
+pub fn test_set_qualify_ceiling(on: Option<bool>) {
+    QUALIFY_CEILING.store(
+        match on {
+            Some(true) => 1,
+            Some(false) => 2,
+            None => 0,
+        },
+        Ordering::Relaxed,
+    );
+}
+
+/// Test seam: `true` ⇔ a preset was in force.
+pub fn test_clear_qualify_ceiling() -> bool {
+    QUALIFY_CEILING.swap(0, Ordering::Relaxed) != 0
 }
 
 /// The `SQUEEZEFS_FREE_GRACE_ACK_RENEWAL` lever's latch (the
@@ -2774,6 +2880,10 @@ pub fn stats_snapshot() -> serde_json::Value {
                 "free_grace_pass_interval_ms": pass_interval_ms(),
                 // Lever (b): promotions that carried themselves home.
                 "free_grace_ack_renewals": ack_renewals(),
+                // The ladder re-derivation (2026-09-06): the qualify window
+                // in force — the writer's checkpoint ceiling + skew, or the
+                // retired staleness + skew under the lever's `0`.
+                "free_grace_qualify_lag_ms": qualify_lag_in_force_ms(),
             });
         }
         return serde_json::json!({ "free_grace_mode": "off" });
@@ -2938,12 +3048,14 @@ pub fn reset_for_test() {
         &LANE_PUSH_HINTS,
         &LANE_SUPPLY_HINT,
         &LANE_PUSH_WAKES,
+        &QUALIFY_LAG_MS,
     ] {
         c.store(0, Ordering::Relaxed);
     }
     BOUND_DIRTY.store(false, Ordering::Relaxed);
     test_set_ack_renewal(None);
     test_set_refresh_on_ack(None);
+    test_set_qualify_ceiling(None);
     test_set_demand(None);
     test_set_pass_elastic(None);
     test_set_lane_push(None);

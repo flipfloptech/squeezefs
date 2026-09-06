@@ -110,11 +110,10 @@ pub fn resolve_revalidate_interval_ms(flush_interval_ms: u64, env: Option<&str>)
             }
         }
     }
-    let writer_cadence = match flush_interval_ms {
-        0 => 100, // strict mode: the checkpoint task's own tick
-        ms => ms,
-    };
-    writer_cadence.max(CHECKPOINT_MAX_AGE_MS as u64)
+    // Strict mode reads as the checkpoint task's own 100 ms tick — the
+    // one derivation the task itself rides (`checkpoint_tick_period_ms`).
+    super::checkpoint::checkpoint_tick_period_ms(flush_interval_ms)
+        .max(CHECKPOINT_MAX_AGE_MS as u64)
 }
 
 /// The bounded-cadence poll driver. Owns no task: the RO mount's own loop

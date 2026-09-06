@@ -2181,6 +2181,17 @@ impl MemberSession {
         self.words.d_purge_ms()
     }
 
+    /// The WRITER's checkpoint landing ceiling, ms — the ack ladder's
+    /// qualify term (spec §6.8 item 3; ladder re-derivation item 1). Today
+    /// the reader's own derivation of the writer's machinery
+    /// (`checkpoint_landing_ceiling_derived`: the cadence trigger plus two
+    /// checkpoint-task tick periods, under the one-flush-knob fleet
+    /// assumption the poll cadence already makes); a writer-advertised,
+    /// demand-elastic value is adjudication item 4's, and lands here.
+    pub fn checkpoint_ceiling_ms(&self) -> u64 {
+        crate::meta_backend::kv::checkpoint::checkpoint_landing_ceiling_derived()
+    }
+
     /// This member's own clock, in ms — the frame every wait above is
     /// measured in.
     pub fn now_ms(&self) -> u64 {

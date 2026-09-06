@@ -228,25 +228,26 @@ The 7 % anomaly residue without a fence (m54's two bursts 10 s after a
 clean-arm-latch shape's other face (a refused free leaves the entry
 lingering) and rides the same instrument.
 
-## 7. Fleet acceptance — OWED (parent)
+## 7. Fleet acceptance — RUN 2026-09-06 12:10: the fenced close is GONE; the residual lineage is now attributed
 
-`s11-mpiio` from zero on this branch's tip (release), same fleet (1
-authority + 8 co-writers, range custody, `OSS_GB=32`), the ×N discipline
-of the hold-time note. Predicted and required:
+Same row as the lane-visible note §6 (`rows-t2t3-s11-20260906/`).
 
-* `rewrite_shadow_fence_drops` **0** on every mount and
-  `rewrite_shadow_close_retries` ≥ the previous row's fence-drop count
-  on the carriers (the rotation shape now converges) — no `FENCED at
-  close` line anywhere;
-* `block_claim_anomalies` **0** on all eight co-writers (the counter,
-  not the grep) — the previous row's 913 were 850 fence-covered + 64 §6;
-* no `WARNING: fsync(15) failed` from a fence (ENOSPC-class fsync
-  failures are the hold-time campaign's, and should themselves fall as
-  the lanes stop losing an epoch's mints per fence);
-* lane ENOSPC refusals on the previously-affected six (m51–m56: 99 /
-  120 / 109 / 133 / 77 / 130) falling to the clean pair's level (23 /
-  30) or below;
-* `block_untracked_free_refusals` — expected UNCHANGED in kind (≈ 160,
-  §6), now paired with `cowriter.free_ship_own_lane_untracked` per
-  co-writer; if the two match, §6's attribution is confirmed and its fix
-  is the next item.
+| gauge | pre (hold-time row) | this row | predicted |
+|---|---|---|---|
+| `rewrite_shadow_fence_drops` (m0) / `FENCED at close` lines (all 8) | 3 fences on m52/m53/m56 | **0 / 0** | 0 ✓ |
+| fence-class fsync failures (ior `WARNING: fsync`) | — | **none** | none ✓ |
+| `rewrite_shadow_close_retries` per co-writer | — | 8 / 0 / 0 / 1 / 0 / 0 / 12 / 1 — the rotation CONVERGED 22 times where it used to fence | |
+| `CLAIM ANOMALY` / `block_claim_anomalies` (m50…m57) | 0 / 7 / 323 / 205 / 52 / 3 / 323 / 0 | **0 / 13 / 0 / 2 / 1 / 0 / 11 / 11** (−94 %; the ~7 % no-fence residue §6 named) | 0 ✗ (38 left) |
+| `block_untracked_free_refusals` (m0) vs Σ `cowriter.free_ship_own_lane_untracked` | 163 vs — | **154 vs 156** (19+17+19+24+19+15+22+21) — the attribution closes | attribution ✓ |
+| lane ENOSPC on the formerly affected six | 99–133 | 72–126 (`alloc_lane_enospc_refusals` 3,985–10,405) — not to the clean pair's level | ✗ |
+
+**Verdict — LANDS.** The live-mount data-loss face is closed on the
+fleet: no epoch is fenced at close by a rotated token, no acked bytes are
+discarded, no fsync fails; the anomaly lineage fell 94 % and its residue
+is the no-fence latch shape §6 named. The refused frees are now
+ATTRIBUTED by the per-co-writer counter (154 ≡ 156) — the next item is
+that lineage (an own-lane free of an offset this mount already released,
+resurrected by a stale layout refetch, reaching the wire on the
+non-recomputed paths). Lane ENOSPC did not fall to the clean pair's level
+because — as the lane-visible note §6 shows — exhaustion is governed by
+the coherence windows (term 1), not by these lineages.

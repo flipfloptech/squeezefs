@@ -178,28 +178,37 @@ refills" — the lever-on assertions are load-bearing.
   clean.
 * No `task check`, no root rigs (the parent's).
 
-## 6. Fleet acceptance — OWED (parent)
+## 6. Fleet acceptance — RUN 2026-09-06 12:10 (dev box, 32 CPUs): the hop collapses as predicted
 
-`s11-mpiio` from zero on the finding-15 venue at or after this branch's
-tip (release, `SQUEEZEFS_FREE_GRACE_LANE_PUSH` at its default). PASS reads:
+`s11-mpiio` from zero on the term-2 + term-3 stack (`a24b59a8`, release;
+`LANE_PUSH` on), same fleet; artifacts `.benchmarks/rows-t2t3-s11-20260906/`.
+Probe 1,802 MiB/s → 10 GiB, 14 iterations.
 
-* `free_grace_hold_phase_ns.min_acked_released` mean on m0 **≤ 125 ms**
-  (lever (d)'s rate limit at 8 members; the model reads 0 — the predicted
-  value). > 500 ms = the release hook did not engage: read
-  `free_grace_lane_push_releases` (must grow with the acks);
-* `free_grace_bound_age_ms` on m0 **below 7,936** (the model's quiet-shape
-  reading fell 17.8 → 10.4 s; the continuous shapes ≈ −0.2 s — expect the
-  fleet between, since its quiet phases are the wedges of §7);
-* `alloc_lane_visible_phase_ns.released_served` mean on m0 **≤ 1,000 ms**
-  (one prodded renewal cadence) with `alloc_lane_pushed_harvests` > 0 and
-  `free_grace_lane_push_wakes` > 0 on every co-writer, and the co-writer's
-  `total ≡ released_served + served_visible` (exact-sum);
-* lane ENOSPC on the two clean co-writers (m50, m57 — no `CLAIM ANOMALY`)
-  → **0**; `alloc_lane_visible_unplaced` ≈ 0; closure exact
-  (`deferrals ≡ releases + offsets`), `forced_releases` / `laggard_fences`
-  / `alloc_stalls` 0, `alloc_lane_raise_refusals` 0;
-* the A/B leg `SQUEEZEFS_FREE_GRACE_LANE_PUSH=0`: the 2,500 ms
-  `min_acked_released` shape and `released_served` in seconds.
+| gauge | pre (hold-time row `0723b3ea`) | this row | predicted |
+|---|---|---|---|
+| `free_grace_hold_phase_ns.min_acked→released` mean | **2,500 ms** | **15 ms** (42,012 samples) | ≤ 125 ✓ |
+| `free_grace_bound_age_ms` | 7,936 | **7,274** | < 7,936 ✓ |
+| hold total / `defer→checkpointed` / `checkpointed→min_acked` | 10,958 / 503 / 7,956 | 7,431 / 415 / **7,001** | |
+| `alloc_lane_pushed_harvests` per co-writer | — | 211–255 (every co-writer, engagement exact) | > 0 ✓ |
+| `alloc_lane_visible_phase_ns.released→served` mean (m0 clock) | — | 12,285 ms (35,561 samples) | ≤ 1,000 ✗ — see below |
+| closure | | deferrals 42,164 ≡ releases 42,012 + offsets 152 ✓; forced 0, stalls 0 | |
+| lane ENOSPC (log) m50 / m57 (the clean pair) | 23 / 30 | 110 / 163 (`alloc_lane_enospc_refusals` 9,640 / 15,958) | → 0 ✗ |
+| sustained gate | FAIL 1,214 → 410 | **FAIL 1,613 → 622 MiB/s** | |
+
+**Verdict — the lever LANDS (measured, engaged, no loss); the row's
+verdict is unchanged, as the in-process model predicted.** The third
+stage went 2,500 → 15 ms and the hold 10.9 → 7.4 s; the remaining
+7.0 s is the `checkpointed→min_acked` coherence windows (term 1 — the
+user's decision). `released→served` still reads 12.3 s on the authority's
+clock because it measures a released block's wait until SOME co-writer's
+harvest takes it — and with every co-writer's lane at 3–94 % headroom the
+demand is bursty (the iterations' bimodality), so blocks released during
+a co-writer's own-supply phase wait for the next exhaustion; the pushed
+refill (`pushed_harvests` 211–255) fires exactly when a lane runs dry,
+which is the law it was built to. Exhaustion did not move
+(`alloc_lane_enospc_refusals` 3,042–15,958 per co-writer, the correct
+counter — the earlier `volume … full` log count is a subsample), because
+hold × churn against `cap/W` is set by the 7 s that term 1 owns.
 
 ## 7. Found beside the term, not fixed here (for the parent)
 

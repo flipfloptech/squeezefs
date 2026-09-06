@@ -1,12 +1,15 @@
 # Kernel COMMIT-lock split — per-queue FUSE background accounting (sqz patch 0026, 7.2 track)
 
-**Status (2026-09-06): PATCH AUTHORED + COMPILE-PROVEN, boot + A/B OWED.**
+**Status (2026-09-06): PATCH AUTHORED + COMPILE-PROVEN ON ALL THREE TRACKS, boot + A/B OWED.**
 `docker/kernel-sqz/patches-7.2/0026-sqz-fuse-uring-per-queue-bg-accounting.patch`
 — the first patch AUTHORED on the 7.2 track (every earlier 7.2 patch is a
-rebase). Compile-proven three ways on linux-7.2.3 + 0001–0025 (§4); the
-26-patch chain re-verified `patch -p1 --fuzz=0` on a fresh base. Not
-booted: the box that boots it is the user's call, and the lever holds its
-slot on the field A/B row (§5) — never on this document.
+rebase), landed on `dev` (`9edcf624`); compile-proven three ways on
+linux-7.2.3 + 0001–0025 (§4), the 26-patch chain re-verified `patch -p1
+--fuzz=0` on a fresh base. **Backported the same day as 0031 on the
+6.19.14 FIELD track (`patches/`) and the 7.1 track (`patches-7.1/`)**,
+each compile-proven the same three ways (§6). Not booted: the box that
+boots it is the user's call, and the lever holds its slot on the field
+A/B row (§5) — never on this document.
 **Authority:** the perf law (AGENTS.md — a lever lands on counted A/B
 evidence; "the sqz kernel series is a first-class product surface",
 ruling D13: portability governs CPU/topology, never kernel version) + the
@@ -229,11 +232,15 @@ queues are blocked, fusectl shrink under load) is the boot test's.
 
 * **Arms:** the SAME daemon binary (a rocky8 `task build` of the dev tip,
   `release`, KD-7 shim pairing irrelevant — kern rows only + one il
-  control), **kernel A** = the sqz series 0001–0025 (7.2 track; or the
-  running 6.19.14-sqz if the row runs on the field box before the 7.2
-  boot) vs **kernel B** = the same series + 0026. A-B-B-A across reboots
-  is impossible, so **A A B B** (two boots), each boot: fresh cluster,
-  one `write_BW` prep pass minting the file set, then the rows twice.
+  control), **kernel A** = the track's sqz series WITHOUT the patch vs
+  **kernel B** = the same series WITH it — on the field track (the
+  finding's venue, `squeeze-test` on `6.19.14-sqz`) A = 0001–0030, B =
+  +0031; on 7.1 A = 0001–0030, B = +0031; on 7.2 A = 0001–0025, B =
+  +0026. The rig tells the arms apart by the loaded fuse module's
+  `fuse_uring_bg_wait` symbol (the same name on all three tracks).
+  A-B-B-A across reboots is impossible, so **A A B B** (two boots), each
+  boot: fresh cluster, one `write_BW` prep pass minting the file set,
+  then the rows twice.
 * **Rows per boot:** kern rand-4k 24 × qd8 30 s (+10 s ramp) × 2, the
   60 s sustained kern rand-4k, the 1 MiB seq `read_BW` qd16 × 2, one il
   rand-4k control (the shim does not take these locks — it should NOT
@@ -257,33 +264,80 @@ queues are blocked, fusectl shrink under load) is the boot test's.
   scoping (its lock population is 32 workers + N local submitters on one
   target).
 
-## 6. Backport ledger (7.1.6 and 6.19.14 — owed; deltas observed from `ref-7.1.6/` and the 6.19 series)
+## 6. Backport ledger (7.1.6 and 6.19.14 — DONE 2026-09-06, both compile-proven three ways)
 
-The patch was authored where the design read was done (7.2.3). The
-touched functions differ per track as follows — every difference is a
-mechanical re-expression, none changes the design:
+The patch was authored where the design read was done (7.2.3). Both
+backports landed the same day as **0031** on their tracks
+(`docker/kernel-sqz/patches/0031-sqz-fuse-uring-per-queue-bg-accounting.patch`,
+`docker/kernel-sqz/patches-7.1/0031-sqz-fuse-uring-per-queue-bg-accounting.patch`),
+field track first. Every difference below was a mechanical
+re-expression; the design (§1) and the five points (§2) transfer
+verbatim. What the compile proof and the tree reads taught, beyond the
+predicted table:
 
-| Site | 7.2.3 (authored) | 7.1.6 | 6.19.14 |
+* **6.19's `fuse_uring_abort()` is gated on `queue_refs > 0`** (7.1+ walk
+  the queues unconditionally — the upstream fix landed between the two).
+  On the `queue_refs == 0` arm 6.19 does not walk the queues at all, so
+  the 7.2 patch's gate-open-in-`abort_end_requests` would have left a
+  per-queue sleeper stranded across an abort. 6.19's 0031 adds
+  `fuse_uring_bg_abort_waiters(ring)` on that arm (open every gate,
+  `wake_up_all`); the queued requests' own fate on that arm is unchanged
+  from the tree (a pre-existing 6.19 gap — noted, not widened; adopting
+  7.1's unconditional walk on 6.19 is a separate decision).
+* **The verifications the ledger asked for hold on 6.19:**
+  `fuse_request_end()` gates its inline block on `FR_BACKGROUND` alone
+  (`dev.c` 480 `if (test_bit(FR_BACKGROUND, &req->flags))`, then
+  `bg_lock`, `clear_bit`, the wake logic, `num--`, `active--`,
+  `flush_bg_queue`), so the per-queue credit's clear skips it whole;
+  `fuse_uring_entry_teardown()` `list_del_init(&req->list)`s
+  `ent->fuse_req` under `queue->lock` — the credit sits beside it.
+  `wait_event_state_exclusive` + `TASK_FREEZABLE` exist on both trees.
+* **The accessor question resolved as an inline in `dev_uring_i.h`**:
+  `fuse_num_background(fc)` (both CONFIG arms) rather than an edit to
+  `fuse_i.h`'s include chain — `file.c` and `control.c` gain
+  `#include "dev_uring_i.h"` exactly as `inode.c` already has it.
+* 6.19's `fuse_uring_req_end()` keeps its unguarded
+  `io_buffer_unregister(ent->cmd, …)` (no `7d87a5a284bb` path there) and
+  its abort loop sets `stopped` outside the lock — both untouched.
+* **gcc 8.5:** the kernel's own floor is gcc 8.1
+  (`scripts/min-tool-version.sh`, `-std=gnu11`) on both 6.19 and 7.1, the
+  EL8 image compiles with gcc-toolset-14, and "all gcc-8.5-clean" in the
+  README is the field-box PROBES' requirement. The patch uses nothing past
+  gnu11 anyway (no cleanup attributes, no `__auto_type`, no C23, kernel
+  `max()`/`READ_ONCE`/`WRITE_ONCE` only). Not compiled with gcc 8.5 here
+  (no such toolchain on the box); compiled with gcc 15.3 per track.
+
+| Site | 7.2.3 (0026) | 7.1.6 (0031) — as landed | 6.19.14 (0031) — as landed |
 |---|---|---|---|
-| The ledger's owner | `struct fuse_chan *fch` (`fch->bg_lock`, `fuse_dev_i.h`) | `struct fuse_conn *fc` (`fc->bg_lock`, `fuse_i.h` ~700–722) — every `fch->` becomes `fc->`, `ring->chan` → `ring->fc` | same as 7.1 |
-| `fuse_uring_req_end()` | single nested `bg_lock` take: `queue->active_background--; bg_lock; fuse_request_bg_finish(fch); flush; unlock` | identical shape on `fc` (`dev_uring.c` ~86–96) | **no `fuse_request_bg_finish()`**: `req_end` takes `bg_lock` only for the flush; `fuse_request_end()` then takes it AGAIN for the inline finish (clear `FR_BACKGROUND`, `blocked` logic, `num--`, `active--`, `flush_bg_queue`). The per-queue credit clearing `FR_BACKGROUND` skips that whole block — verify the 6.19 `fuse_request_end()` gates on `FR_BACKGROUND` alone (it does upstream) |
-| `fuse_request_bg_finish()` → `static` | `dev.c` ~601, declared in `fuse_dev_i.h` | `dev.c` ~451, declared in `fuse_i.h` — same hunk, different header | does not exist; nothing to make static |
-| `fuse_chan_num_background()` sum | ONE accessor (`dev.c` ~388), callers `file.c` 933/2321 + `control.c` | **no accessor** — `file.c` 911/2306 read `fc->num_background` directly: add `fc->num_background + fuse_uring_num_background(fc)` at both sites (or introduce the accessor) | same as 7.1 |
-| `fuse_chan_max_background_set()` + re-gate hook | ONE setter (`dev.c` ~398), callers `control.c` write + `inode.c` INIT | **no setter** — `control.c` 133 writes `fc->max_background` under `fc->bg_lock` inline (and `inode.c`'s INIT path likewise): `WRITE_ONCE` + call `fuse_uring_bg_limit_changed(fc)` after the unlock at the fusectl site | same as 7.1 |
-| `fuse_block_alloc()` | three-clause form with `smp_rmb()` after `initialized` | one expression `!fc->initialized \|\| (for_background && fc->blocked) \|\| (fc->io_uring && fc->connected && !fuse_uring_ready(fc))` — add `&& !fuse_uring_ready(fc)` to the `blocked` clause | same as 7.1 |
-| `fuse_get_req()` two-stage wait, `fuse_put_request()` kick, alloc-failure kick | as authored | same code on `fc`; `wait_event_state_exclusive` + `TASK_FREEZABLE` present | verify `wait_event_state_exclusive` exists (it does from 6.x); else `wait_event_killable_exclusive` |
-| `fuse_uring_task_to_queue()` | exists | exists (`dev_uring.c` ~1276) | exists |
-| `struct fuse_ring_queue::active_background` + `fuse_req_bg_queue` | exist | exist (`dev_uring_i.h` 95/99) | exist |
-| `fuse_uring_abort_end_requests()` | `WARN_ON_ONCE(fch->max_background != UINT_MAX)` + nested `bg_lock` flush | same on `ring->fc` (`dev_uring.c` ~134–139) | same |
-| Request timeout scan of `bg_queue` | `req_timeout.c` under `fch->bg_lock` — untouched | `dev.c` ~92 under `fc->bg_lock` — untouched | untouched |
-| `fuse_uring_entry_teardown()` credit | added | same site | same site (verify the 6.19 teardown does `list_del_init(&req->list)` for `ent->fuse_req` — the credit goes beside it) |
-| The rst paragraph | `Documentation/filesystems/fuse/fuse-io-uring.rst` end | same file (0021 docs exist on both tracks) | same |
+| The ledger's owner | `struct fuse_chan *fch` (`fch->bg_lock`, `fuse_dev_i.h`) | `struct fuse_conn *fc` (`fc->bg_lock`, `fuse_i.h` ~700–722): `fch->` → `fc->`, `ring->chan` → `ring->fc`, `fuse_chan_abort()` → `fuse_abort_conn()` | same as 7.1 |
+| `fuse_uring_req_end()` | single nested `bg_lock` take (`fuse_request_bg_finish(fch)` + flush) → per-queue `fuse_uring_bg_finish()` | identical shape on `fc` (`dev_uring.c` ~98–120) → same replacement | **no `fuse_request_bg_finish()`**: `req_end` took `bg_lock` for the flush; `fuse_request_end()` took it AGAIN for the inline finish (the ledger's two callers). Same replacement; the inline block stays verbatim and is skipped by the cleared `FR_BACKGROUND` |
+| `fuse_request_bg_finish()` → `static` | `dev.c` ~601, declared in `fuse_dev_i.h` | `dev.c` ~451, declared in `fuse_dev_i.h` (86) — same hunk pair | does not exist; a comment above the inline block instead |
+| `fuse_chan_num_background()` sum | ONE accessor (`dev.c` ~388) | **no accessor** — `file.c` 911/2306 read `fuse_num_background(fc)` (new inline, `dev_uring_i.h`) | same as 7.1 (`file.c` 899/2292) |
+| `fuse_chan_max_background_set()` + re-gate hook | ONE setter (`dev.c` ~398) | **no setter** — `control.c` 133: `WRITE_ONCE` + `fuse_uring_bg_limit_changed(fc)` after the unlock; `inode.c`'s INIT write untouched (no ring can exist yet) | same as 7.1 |
+| `fuse_block_alloc()` | three-clause form with `smp_rmb()` | one expression — `&& !fuse_uring_ready(fc)` added to the `blocked` clause | same as 7.1 |
+| `fuse_get_req()` two-stage wait, `fuse_put_request()` kick, alloc-failure kick | as authored | same code on `fc` (`fuse_get_req(idmap, fm, …)`, `fc = fm->fc`; the per-queue wait sits after the tree's `smp_rmb()`) | same as 7.1 |
+| `fuse_uring_abort()` / `fuse_uring_abort_end_requests()` | unconditional walk; gate-open + `wake_up_all` under the queue lock | unconditional walk — 0026's arm verbatim (`WARN` reads `fc->max_background`) | **gated on `queue_refs > 0`** — gate-open inside the walk + `fuse_uring_bg_abort_waiters()` on the `== 0` arm |
+| `fuse_uring_num_background()` / `_limit_changed()` ring load | `smp_load_acquire(&fch->ring)` | `smp_load_acquire(&fc->ring)` (7.1 publishes with `smp_store_release`) | plain `fc->ring` (6.19's `fuse_uring_ready()` itself reads it plain) |
+| `fuse_uring_task_to_queue()`, `queue->active_background`, `fuse_req_bg_queue` | exist | exist | exist |
+| Request-timeout scan of `bg_queue` | `req_timeout.c` under `fch->bg_lock` — untouched | `dev.c` ~92 under `fc->bg_lock` — untouched | untouched |
+| The rst paragraph | appended after *Payload retention* | same | same |
+| Diffstat | 5 files, +335/−44 | 8 files, +340/−44 | 7 files, +376/−41 |
 
-Ordering law for the backports: 7.1 first (the locally-booted line), then
-6.19.14 (the field), each with its own `make io_uring/ fs/fuse/` proof and
-the `W=1` control — the 0030 precedent. The 6.19 backport is where the
-field's two-caller ledger (§0) is actually measured away, so the A/B's
-first real row is likely THAT track's.
+**Compile proofs (2026-09-06; `~/sqz-kernel-scratch/build-{6.19,7.1}-*.log`):**
+
+| Track | Config | Control (0001–0030) | +0031 | +0031 lockdep (`PROVE_LOCKING` `DEBUG_SPINLOCK` `DEBUG_LOCK_ALLOC` `LOCKDEP` =y) | `W=1` all `fs/fuse/` (23 TUs) | Chain |
+|---|---|---|---|---|---|---|
+| 6.19.14 (field) | EL8 base + `config-fragment`, the build script's own `olddefconfig` assembly, gcc 15.3, `O=` | 0 compiler warnings / 0 errors | 0 / 0 | 0 / 0 | identical empty sets | 31/31 `--fuzz=0` from the pristine tarball (sha256 verified against the pin and `v6.x/sha256sums.asc`), byte-identical to the `git am` tree |
+| 7.1.6 | `config-7.1.8-cachyos` → `olddefconfig`, gcc 15.3, `O=` | 0 / 0 | 0 / 0 | 0 / 0 | identical empty sets | 31/31 `--fuzz=0` from a fresh 7.1.6 (identical to `ref-7.1.6/`), byte-identical to the `git am` tree |
+
+(The 6.19 logs each carry ONE `warning:` line — Kconfig's
+`BOOTPARAM_SOFTLOCKUP_PANIC=0` note from the EL8 base config itself,
+present on the control too; no compiler warning on any leg.) The 30
+prior patches `git am` clean on both fresh bases. The 6.19 backport is
+where the field's two-caller ledger (§0) is actually measured away, so
+the A/B's first real row is that track's: kernel A = 0001–0030 vs B =
++0031, the rig's symbol check (`fuse_uring_bg_wait` in the loaded
+module — the same name on all three tracks) tells the arms apart.
 
 ## 7. What this document does not claim
 

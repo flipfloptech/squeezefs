@@ -44,10 +44,18 @@ backported the same day. The finding was measured on the FIELD kernel
 TWICE per uring completion on 6.19 — `fuse_uring_req_end` + the inline
 finish in `fuse_request_end`). Compile-proven three ways per track
 (build clean, `W=1` identical to the 0001–0030 control, a
-`PROVE_LOCKING`/`DEBUG_SPINLOCK` build clean), **not boot-tested**; the
-lever lands on the field A/B row. Design + the per-track adaptation
-ledger: `docs/design-kernel-bg-per-queue.md` (§6); SERIES.md item 10 +
-the 7.1 paragraph.
+`PROVE_LOCKING`/`DEBUG_SPINLOCK` build clean). **Boot-tested and
+MEASURED the same day** (`.benchmarks/2026-09-06-kernel-bg-per-queue-ab.md`,
+A A B B on squeeze-test, same 1.2.1 `dist` daemon): the `fuse3-ur`
+worker 17.4 → 14.3 µs/op (−18 %) with `native_queued_spin_lock_slowpath`
+12.8 % → 0.11 % of its cycles, kern rand-4k +9 % IOPS (508 → 556k
+sustained), p99 −13…−17 %, seq and il control par, zero fuse/io_uring
+kernel-log lines on both B boots — **B ships**; squeeze-test runs 0031
+from 2026-09-06 19:48 UTC. The 7.2 track's 0026 booted the dev box the
+same day (design §5a: zc gate 149/149, no WARN); 7.1's 0031 is
+compile-proven only. Design + the per-track adaptation ledger:
+`docs/design-kernel-bg-per-queue.md` (§5/§6); SERIES.md item 10 + the
+7.1 paragraph.
 
 **Strata ruling (USER DECISION 2026-08-02): the kmod-sqzfuse stratum
 is KILLED.** There are exactly **two strata**: (1) **stock-graceful**

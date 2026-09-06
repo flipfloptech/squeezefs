@@ -1,0 +1,214 @@
+== kernel bg-per-queue A/B, ARM=B: 2026-09-06T19:51:09Z out=/scratch/tmp/sqz-agent/k26/ab-B-20260906-195109 kernel=6.19.14-sqz bin=/scratch/tmp/squeezefs
+squeezefs 1.2.1 (27a396e18ada / 27a396e18ada20d6dfe806a7060f148d17de99b3, tag stable-2026.09.1) built 2026-09-05T04:53:56Z profile dist
+   track: 6.19.14-sqz → the per-queue bg patch is 0031 here
+   kernel: fuse_uring_bg_wait PRESENT (0031 kernel)
+== cluster reset
+Mounting Squeezefs at "/scratch/tmp/test"...
+[92mOK[0m Squeezefs is ready at "/scratch/tmp/test"
+   mount: {'fuse3_zc_negotiated': 1, 'fuse3_kmbuf_negotiated': 1, 'transport_queues': 32, 'transport_q_depth': 32, 'transport_max_background': 1024, 'transport_max_write': 1048576, 'data_read_lanes': 4, 'build_profile': None}
+   kernel-patched (0031): present (ARM=B)
+   fusectl 50: max_background=1024 congestion_threshold=768
+-- row prep-write: write_BW kern 30s (+10 ramp) perf=0 loadavg=0.32 0.07 0.02
+   box cpu: busy 70.3% (user 21.6 sys 42.4 irq 2.1 softirq 4.2 iowait 27.1)
+   thermal: hwmon mlx5 max_mC=47000 -> hwmon bnxt_en max_mC=48000
+Traceback (most recent call last):
+  File "/scratch/tmp/sqz-agent/k26/2026-09-03-r4-row-delta.py", line 32, in <module>
+    p50 = statistics.mean(j["read"]["clat_ns"]["percentile"]["50.000000"] for j in jobs) / 1000
+  File "/usr/lib64/python3.6/statistics.py", line 308, in mean
+    data = list(data)
+  File "/scratch/tmp/sqz-agent/k26/2026-09-03-r4-row-delta.py", line 32, in <genexpr>
+    p50 = statistics.mean(j["read"]["clat_ns"]["percentile"]["50.000000"] for j in jobs) / 1000
+KeyError: 'percentile'
+   dmesg (fuse/WARN/lockdep/BUG tail):
+     [Sun Sep  6 19:48:13 2026] PCI: Using host bridge windows from ACPI; if necessary, use "pci=nocrs" and report a bug
+     [Sun Sep  6 19:48:14 2026] fuse: init (API version 7.45)
+     [Sun Sep  6 19:48:15 2026] wmi_bus wmi_bus-PNP0C14:00: [Firmware Bug]: WMAA method block execution control method not found
+     [Sun Sep  6 19:48:15 2026] wmi_bus wmi_bus-PNP0C14:01: [Firmware Bug]: WQBC data block query control method not found
+     [Sun Sep  6 19:48:19 2026] systemd[1]: Proceeding WITHOUT firewalling in effect! (This warning is only shown for the first loaded unit using IP firewalling.)
+Unmounting squeezefs at /scratch/tmp/test...
+Sending SIGTERM to squeezefs daemon (PID 3858)...
+Successfully unmounted mountpoint /scratch/tmp/test
+Mounting Squeezefs at "/scratch/tmp/test"...
+[92mOK[0m Squeezefs is ready at "/scratch/tmp/test"
+   mount: {'fuse3_zc_negotiated': 1, 'fuse3_kmbuf_negotiated': 1, 'transport_queues': 32, 'transport_q_depth': 32, 'transport_max_background': 1024, 'transport_max_write': 1048576, 'data_read_lanes': 4, 'build_profile': None}
+   kernel-patched (0031): present (ARM=B)
+   fusectl 50: max_background=1024 congestion_threshold=768
+-- row B-rr4k-kern-1: randread_iops kern 30s (+10 ramp) perf=0 loadavg=24.17 6.59 2.24
+   box cpu: busy 71.9% (user 27.4 sys 32.4 irq 4.1 softirq 8.0 iowait 25.6)
+   thermal: hwmon bnxt_en max_mC=48000 -> hwmon bnxt_en max_mC=49000
+ROW B-rr4k-kern-1: iops=552181 bw=2.11GiB/s ops=16568745 clat_mean=334.9us p50=173.1 p99=3817.5 p99.9=11599.9 runtime=30s first/last third 2010/2123 MiB/s (+5.6 %)
+   cpu: total 587.00 s = 35.43 us/fio-op | 26.76 us/stats-op (stats ops 21939108); fuse3-ur=313.23s fuse3-tpc=273.56s sqz-timer=0.07s sqz-meta=0.06s sqz-blk=0.03s other=0.03s sqz-nvme=0.01s sqz-jrnl=0.00s
+   ledger: read_zc_serve_bytes=89862574080 fuse3_zc_replies=21939107 fuse3_read_inplace_replies=21939108 ranged_reads=24 read_dest_lease_bytes=98304 read_copy_dest_bytes=0 read_copy_bounce_bytes=0 read_dest_dma_bytes=98304 ipc_arena_copy_bytes=0 ipc_ops_read=0 ipc_bytes_out=0 ipc_fast_path_serves=0 ipc_async_handoffs=0 ipc_direct_inline_reaps=0 ipc_direct_reap_stalls=0 cache_hits=0 cache_misses=0 transport_wake_writes=23542386 transport_wakes_elided=20338957 transport_park_backstop_ticks=0 fuse3_fused_midpass_reaps=0 fuse3_fused_passbottom_reaps=21939105 transport_spin_absorbed=0 transport_spin_expired=0 transport_spin_ns=0 transport_spin_refused_busy=0 transport_commit_batch_flushes=13442580 transport_commit_batch_commits=21941982 dev_enters=208 dev_wake_batches=104 dev_fills=104 invariant_tripwires=0 fuse_op_watchdog_overdue=0 transport_cq_overflows=0 transport_lease_overlong=0 op_trace_samples=0 op_trace_dropped=0
+   per-op: transport_wake_writes=1.073 transport_spin_absorbed=0.000 transport_spin_expired=0.000 transport_commit_batch_flushes=0.613 dev_enters=0.000 dev_wake_batches=0.000 reap_blind=1.833 reap_blind_cqe=2.970 reap_park=0.772
+   spin: absorbed=0 expired=0 spin_us/op=0.00 refused_busy=0 window_us=0
+   commit batch: commits/flush=1.63 flushes/op=0.613 (ops_stats=21939108)
+   box cpu: busy 71.9% (user 27.4 sys 32.4 irq 4.1 softirq 8.0)
+   zc_bridge_phase_ns: device_cq=92.0us(n=21939105) msg_hop=24.9us(n=21939105) sq_wait=1.0us(n=21939105) total=153.9us(n=21939105) wake_hop=36.0us(n=21939105)
+   read_serve_phase_ns: block_fetch=154.5us(n=21939105) classify_probe=1.0us(n=24) key_resolve=0.3us(n=21939129) meta_resolve=1.4us(n=21939129) post_validate=0.3us(n=21939105) prelude=1.3us(n=21939129) total=163.8us(n=21939105)
+   read_fill_phase_ns: dev_queue=93.6us(n=104) dev_service=61.1us(n=104)
+   read_transport_phase_ns: dispatch_lag=41.6us(n=21939108) queue_wait=0.0us(n=21939108) reply_commit=2.1us(n=27) transport_total=207.2us(n=21939108)
+   fuse3_fused_timeline_ns: bridge_rtt=93.0us(n=21939105)
+   transport_reap_gap_ns: blind=4.7us(n=40209950) blind_cqe=11.4us(n=65162130) park=48.9us(n=16931610)
+   dmesg (fuse/WARN/lockdep/BUG tail):
+     [Sun Sep  6 19:48:13 2026] PCI: Using host bridge windows from ACPI; if necessary, use "pci=nocrs" and report a bug
+     [Sun Sep  6 19:48:14 2026] fuse: init (API version 7.45)
+     [Sun Sep  6 19:48:15 2026] wmi_bus wmi_bus-PNP0C14:00: [Firmware Bug]: WMAA method block execution control method not found
+     [Sun Sep  6 19:48:15 2026] wmi_bus wmi_bus-PNP0C14:01: [Firmware Bug]: WQBC data block query control method not found
+     [Sun Sep  6 19:48:19 2026] systemd[1]: Proceeding WITHOUT firewalling in effect! (This warning is only shown for the first loaded unit using IP firewalling.)
+-- row B-seq1m-kern-1: read_BW kern 30s (+10 ramp) perf=0 loadavg=29.92 10.32 3.68
+   box cpu: busy 84.8% (user 3.4 sys 62.9 irq 1.1 softirq 17.3 iowait 13.5)
+   thermal: hwmon bnxt_en max_mC=49000 -> hwmon bnxt_en max_mC=50000
+ROW B-seq1m-kern-1: iops=37085 bw=36.23GiB/s ops=1112853 clat_mean=10123.3us p50=8454.1 p99=33816.6 p99.9=115867.6 runtime=30s first/last third 33316/37200 MiB/s (+11.7 %)
+   cpu: total 116.39 s = 104.59 us/fio-op | 78.75 us/stats-op (stats ops 1477918); fuse3-ur=77.28s fuse3-tpc=38.74s sqz-timer=0.14s sqz-meta=0.10s sqz-blk=0.07s other=0.06s sqz-nvme=0.01s sqz-jrnl=0.00s
+   ledger: read_zc_serve_bytes=1549706199040 fuse3_zc_replies=1477917 fuse3_read_inplace_replies=1477918 ranged_reads=0 read_dest_lease_bytes=0 read_copy_dest_bytes=0 read_copy_bounce_bytes=0 read_dest_dma_bytes=0 ipc_arena_copy_bytes=0 ipc_ops_read=0 ipc_bytes_out=0 ipc_fast_path_serves=0 ipc_async_handoffs=0 ipc_direct_inline_reaps=0 ipc_direct_reap_stalls=0 cache_hits=0 cache_misses=0 transport_wake_writes=1362708 transport_wakes_elided=1596256 transport_park_backstop_ticks=1 fuse3_fused_midpass_reaps=0 fuse3_fused_passbottom_reaps=1477915 transport_spin_absorbed=0 transport_spin_expired=0 transport_spin_ns=0 transport_spin_refused_busy=0 transport_commit_batch_flushes=840710 transport_commit_batch_commits=1480793 dev_enters=160 dev_wake_batches=80 dev_fills=80 invariant_tripwires=0 fuse_op_watchdog_overdue=0 transport_cq_overflows=0 transport_lease_overlong=0 op_trace_samples=0 op_trace_dropped=0
+   per-op: transport_wake_writes=0.922 transport_spin_absorbed=0.000 transport_spin_expired=0.000 transport_commit_batch_flushes=0.569 dev_enters=0.000 dev_wake_batches=0.000 reap_blind=2.230 reap_blind_cqe=2.865 reap_park=1.316
+   spin: absorbed=0 expired=0 spin_us/op=0.00 refused_busy=0 window_us=0
+   commit batch: commits/flush=1.76 flushes/op=0.569 (ops_stats=1477918)
+   box cpu: busy 84.8% (user 3.4 sys 62.9 irq 1.1 softirq 17.3)
+   zc_bridge_phase_ns: device_cq=5815.7us(n=1477915) msg_hop=328.5us(n=1477915) sq_wait=5.8us(n=1477915) total=6691.5us(n=1477915) wake_hop=541.6us(n=1477915)
+   read_serve_phase_ns: block_fetch=6693.5us(n=1477915) key_resolve=1.2us(n=1477915) meta_resolve=48.2us(n=1477915) post_validate=2.2us(n=1477915) prelude=4.0us(n=1477915) total=6765.4us(n=1477915)
+   read_fill_phase_ns: dev_queue=230.8us(n=80) dev_service=733.1us(n=80)
+   read_transport_phase_ns: dispatch_lag=561.9us(n=1477918) queue_wait=0.0us(n=1477918) reply_commit=25.1us(n=3) transport_total=7336.4us(n=1477918)
+   fuse3_fused_timeline_ns: bridge_rtt=5821.5us(n=1477915)
+   transport_reap_gap_ns: blind=15.1us(n=3295675) blind_cqe=74.2us(n=4234386) park=527.3us(n=1945331)
+   dmesg (fuse/WARN/lockdep/BUG tail):
+     [Sun Sep  6 19:48:13 2026] PCI: Using host bridge windows from ACPI; if necessary, use "pci=nocrs" and report a bug
+     [Sun Sep  6 19:48:14 2026] fuse: init (API version 7.45)
+     [Sun Sep  6 19:48:15 2026] wmi_bus wmi_bus-PNP0C14:00: [Firmware Bug]: WMAA method block execution control method not found
+     [Sun Sep  6 19:48:15 2026] wmi_bus wmi_bus-PNP0C14:01: [Firmware Bug]: WQBC data block query control method not found
+     [Sun Sep  6 19:48:19 2026] systemd[1]: Proceeding WITHOUT firewalling in effect! (This warning is only shown for the first loaded unit using IP firewalling.)
+-- row B-rr4k-kern-2: randread_iops kern 30s (+10 ramp) perf=0 loadavg=46.92 16.95 6.18
+   box cpu: busy 72.8% (user 27.8 sys 32.9 irq 4.2 softirq 8.1 iowait 21.6)
+   thermal: hwmon bnxt_en max_mC=50000 -> hwmon bnxt_en max_mC=51000
+ROW B-rr4k-kern-2: iops=556123 bw=2.12GiB/s ops=16685373 clat_mean=333.0us p50=177.2 p99=3653.6 p99.9=11075.6 runtime=30s first/last third 2019/2074 MiB/s (+2.7 %)
+   cpu: total 594.28 s = 35.62 us/fio-op | 26.82 us/stats-op (stats ops 22161229); fuse3-ur=317.26s fuse3-tpc=276.85s sqz-timer=0.05s sqz-meta=0.05s sqz-blk=0.03s other=0.03s sqz-nvme=0.00s sqz-jrnl=0.00s
+   ledger: read_zc_serve_bytes=90772381696 fuse3_zc_replies=22161228 fuse3_read_inplace_replies=22161229 ranged_reads=0 read_dest_lease_bytes=0 read_copy_dest_bytes=0 read_copy_bounce_bytes=0 read_dest_dma_bytes=0 ipc_arena_copy_bytes=0 ipc_ops_read=0 ipc_bytes_out=0 ipc_fast_path_serves=0 ipc_async_handoffs=0 ipc_direct_inline_reaps=0 ipc_direct_reap_stalls=0 cache_hits=0 cache_misses=0 transport_wake_writes=23749329 transport_wakes_elided=20576380 transport_park_backstop_ticks=0 fuse3_fused_midpass_reaps=0 fuse3_fused_passbottom_reaps=22161226 transport_spin_absorbed=0 transport_spin_expired=0 transport_spin_ns=0 transport_spin_refused_busy=0 transport_commit_batch_flushes=13574600 transport_commit_batch_commits=22164227 dev_enters=180 dev_wake_batches=90 dev_fills=90 invariant_tripwires=0 fuse_op_watchdog_overdue=0 transport_cq_overflows=0 transport_lease_overlong=0 op_trace_samples=0 op_trace_dropped=0
+   per-op: transport_wake_writes=1.072 transport_spin_absorbed=0.000 transport_spin_expired=0.000 transport_commit_batch_flushes=0.613 dev_enters=0.000 dev_wake_batches=0.000 reap_blind=1.835 reap_blind_cqe=2.969 reap_park=0.775
+   spin: absorbed=0 expired=0 spin_us/op=0.00 refused_busy=0 window_us=0
+   commit batch: commits/flush=1.63 flushes/op=0.613 (ops_stats=22161229)
+   box cpu: busy 72.8% (user 27.8 sys 32.9 irq 4.2 softirq 8.1)
+   zc_bridge_phase_ns: device_cq=92.3us(n=22161226) msg_hop=25.2us(n=22161226) sq_wait=1.0us(n=22161226) total=154.5us(n=22161226) wake_hop=36.0us(n=22161226)
+   read_serve_phase_ns: block_fetch=155.1us(n=22161226) key_resolve=0.3us(n=22161226) meta_resolve=1.4us(n=22161226) post_validate=0.3us(n=22161226) prelude=1.3us(n=22161226) total=164.4us(n=22161226)
+   read_fill_phase_ns: dev_queue=55.6us(n=90) dev_service=51.1us(n=90)
+   read_transport_phase_ns: dispatch_lag=41.5us(n=22161229) queue_wait=0.0us(n=22161229) reply_commit=6.2us(n=3) transport_total=207.7us(n=22161229)
+   fuse3_fused_timeline_ns: bridge_rtt=93.3us(n=22161226)
+   transport_reap_gap_ns: blind=4.8us(n=40666785) blind_cqe=11.4us(n=65807123) park=47.5us(n=17184490)
+   dmesg (fuse/WARN/lockdep/BUG tail):
+     [Sun Sep  6 19:48:13 2026] PCI: Using host bridge windows from ACPI; if necessary, use "pci=nocrs" and report a bug
+     [Sun Sep  6 19:48:14 2026] fuse: init (API version 7.45)
+     [Sun Sep  6 19:48:15 2026] wmi_bus wmi_bus-PNP0C14:00: [Firmware Bug]: WMAA method block execution control method not found
+     [Sun Sep  6 19:48:15 2026] wmi_bus wmi_bus-PNP0C14:01: [Firmware Bug]: WQBC data block query control method not found
+     [Sun Sep  6 19:48:19 2026] systemd[1]: Proceeding WITHOUT firewalling in effect! (This warning is only shown for the first loaded unit using IP firewalling.)
+-- row B-rr4k-il: randread_iops il 30s (+10 ramp) perf=0 loadavg=42.70 19.85 7.66
+   box cpu: busy 81.2% (user 32.0 sys 33.1 irq 4.9 softirq 11.3 iowait 16.9)
+   thermal: hwmon bnxt_en max_mC=51000 -> hwmon mlx5 max_mC=51000
+ROW B-rr4k-il: iops=881628 bw=3.36GiB/s ops=26450592 clat_mean=216.9us p50=189.4 p99=553.0 p99.9=2310.1 runtime=30s first/last third 3466/3304 MiB/s (-4.7 %)
+   cpu: total 628.13 s = 23.75 us/fio-op | 17.81 us/stats-op (stats ops 35276156); sqz-ipc-svc=313.51s sqz-ipc-dd=184.62s fuse3-tpc=75.85s sqz-blk=37.67s sqz-meta=12.20s sqz-timer=2.31s other=1.19s sqz-nvme=0.75s fuse3-ur=0.00s sqz-jrnl=0.00s
+   ledger: read_zc_serve_bytes=0 fuse3_zc_replies=2 fuse3_read_inplace_replies=3 ranged_reads=30931810 read_dest_lease_bytes=0 read_copy_dest_bytes=19709952 read_copy_bounce_bytes=0 read_dest_dma_bytes=126696693760 ipc_arena_copy_bytes=17774731264 ipc_ops_read=35276156 ipc_bytes_out=144491134976 ipc_fast_path_serves=4339534 ipc_async_handoffs=7594 ipc_direct_inline_reaps=2480707 ipc_direct_reap_stalls=0 cache_hits=4109963 cache_misses=5049 transport_wake_writes=142 transport_wakes_elided=14 transport_park_backstop_ticks=0 fuse3_fused_midpass_reaps=0 fuse3_fused_passbottom_reaps=0 transport_spin_absorbed=0 transport_spin_expired=0 transport_spin_ns=0 transport_spin_refused_busy=0 transport_commit_batch_flushes=142 transport_commit_batch_commits=156 dev_enters=15279 dev_wake_batches=7706 dev_fills=7911 invariant_tripwires=0 fuse_op_watchdog_overdue=0 transport_cq_overflows=0 transport_lease_overlong=0 op_trace_samples=0 op_trace_dropped=0
+   per-op: transport_wake_writes=0.000 transport_spin_absorbed=0.000 transport_spin_expired=0.000 transport_commit_batch_flushes=0.000 dev_enters=0.000 dev_wake_batches=0.000 reap_blind=0.000 reap_blind_cqe=0.000 reap_park=0.000
+   spin: absorbed=0 expired=0 spin_us/op=0.00 refused_busy=0 window_us=0
+   commit batch: commits/flush=1.10 flushes/op=0.000 (ops_stats=35276156)
+   box cpu: busy 81.2% (user 32.0 sys 33.1 irq 4.9 softirq 11.3)
+   read_serve_phase_ns: binding_check=1.5us(n=4812) block_fetch=2365.3us(n=3026) classify_probe=2.4us(n=7594) key_resolve=1.1us(n=7594) meta_resolve=10831.3us(n=7594) post_validate=2.3us(n=7594) prelude=3.3us(n=7594) sf_wait=1781.5us(n=85) slice_out=1.6us(n=3052) total=13998.4us(n=7594)
+   read_fill_phase_ns: admission=1.0us(n=4815) decode=0.1us(n=5049) deposit=11.2us(n=4815) dev_queue=176.0us(n=7911) dev_service=2268.9us(n=7911) fetch_dma=4095.0us(n=5049) fill_total=4113.1us(n=5049)
+   read_transport_phase_ns: dispatch_lag=9.3us(n=3) queue_wait=0.0us(n=3) reply_commit=22.0us(n=3) transport_total=54.6us(n=3)
+   ipc_direct_phase_ns: admit=9.2us(n=30929028) device_cq=94.6us(n=30929028) finish=3.9us(n=30929028) inflight=112.9us(n=30929028) sq_wait=18.2us(n=30924819) total=125.9us(n=30929028)
+   transport_reap_gap_ns: blind=2.3us(n=424) blind_cqe=2.2us(n=300) park=2549704.7us(n=282)
+   ipc_ingress_ns: 85.3us(n=35276156)
+   dmesg (fuse/WARN/lockdep/BUG tail):
+     [Sun Sep  6 19:48:13 2026] PCI: Using host bridge windows from ACPI; if necessary, use "pci=nocrs" and report a bug
+     [Sun Sep  6 19:48:14 2026] fuse: init (API version 7.45)
+     [Sun Sep  6 19:48:15 2026] wmi_bus wmi_bus-PNP0C14:00: [Firmware Bug]: WMAA method block execution control method not found
+     [Sun Sep  6 19:48:15 2026] wmi_bus wmi_bus-PNP0C14:01: [Firmware Bug]: WQBC data block query control method not found
+     [Sun Sep  6 19:48:19 2026] systemd[1]: Proceeding WITHOUT firewalling in effect! (This warning is only shown for the first loaded unit using IP firewalling.)
+-- row B-seq1m-kern-2: read_BW kern 30s (+10 ramp) perf=0 loadavg=38.06 21.56 8.76
+   box cpu: busy 83.7% (user 3.7 sys 60.1 irq 1.3 softirq 18.6 iowait 14.6)
+   thermal: hwmon mlx5 max_mC=51000 -> hwmon mlx5 max_mC=51000
+ROW B-seq1m-kern-2: iops=40176 bw=39.25GiB/s ops=1212747 clat_mean=9334.6us p50=7569.4 p99=31850.5 p99.9=181403.6 runtime=30s first/last third 36079/38831 MiB/s (+7.6 %)
+   cpu: total 129.92 s = 107.13 us/fio-op | 80.78 us/stats-op (stats ops 1608357); fuse3-ur=85.36s fuse3-tpc=41.87s other=1.51s sqz-ipc-svc=0.80s sqz-timer=0.18s sqz-meta=0.09s sqz-blk=0.05s sqz-ipc-dd=0.04s sqz-nvme=0.00s sqz-jrnl=0.00s
+   ledger: read_zc_serve_bytes=1682519883776 fuse3_zc_replies=1608356 fuse3_read_inplace_replies=1604709 ranged_reads=0 read_dest_lease_bytes=0 read_copy_dest_bytes=136314880 read_copy_bounce_bytes=0 read_dest_dma_bytes=0 ipc_arena_copy_bytes=0 ipc_ops_read=0 ipc_bytes_out=0 ipc_fast_path_serves=0 ipc_async_handoffs=0 ipc_direct_inline_reaps=0 ipc_direct_reap_stalls=0 cache_hits=1300 cache_misses=0 transport_wake_writes=1550403 transport_wakes_elided=1661867 transport_park_backstop_ticks=47 fuse3_fused_midpass_reaps=0 fuse3_fused_passbottom_reaps=1604576 transport_spin_absorbed=0 transport_spin_expired=0 transport_spin_ns=0 transport_spin_refused_busy=0 transport_commit_batch_flushes=946299 transport_commit_batch_commits=1611086 dev_enters=160 dev_wake_batches=80 dev_fills=80 invariant_tripwires=0 fuse_op_watchdog_overdue=0 transport_cq_overflows=0 transport_lease_overlong=0 op_trace_samples=0 op_trace_dropped=0
+   per-op: transport_wake_writes=0.964 transport_spin_absorbed=0.000 transport_spin_expired=0.000 transport_commit_batch_flushes=0.588 dev_enters=0.000 dev_wake_batches=0.000 reap_blind=2.324 reap_blind_cqe=2.904 reap_park=1.368
+   spin: absorbed=0 expired=0 spin_us/op=0.00 refused_busy=0 window_us=0
+   commit batch: commits/flush=1.70 flushes/op=0.588 (ops_stats=1608357)
+   box cpu: busy 83.7% (user 3.7 sys 60.1 irq 1.3 softirq 18.6)
+   zc_bridge_phase_ns: device_cq=5678.5us(n=1604576) msg_hop=277.5us(n=1604576) sq_wait=6.0us(n=1604576) total=6415.6us(n=1604576) wake_hop=453.7us(n=1604576)
+   read_serve_phase_ns: binding_check=0.8us(n=130) block_fetch=6417.8us(n=1604576) classify_probe=1.8us(n=130) key_resolve=1.2us(n=1604706) meta_resolve=42.3us(n=1604706) post_validate=2.2us(n=1604706) prelude=4.0us(n=1604706) slice_out=391.8us(n=130) total=6484.0us(n=1604706)
+   read_fill_phase_ns: dev_queue=103.8us(n=80) dev_service=775.9us(n=80)
+   read_transport_phase_ns: dispatch_lag=468.4us(n=1608357) queue_wait=0.0us(n=1608357) reply_commit=5.1us(n=133) transport_total=6948.6us(n=1608357)
+   fuse3_fused_timeline_ns: bridge_rtt=5684.5us(n=1604576)
+   transport_reap_gap_ns: blind=15.2us(n=3737874) blind_cqe=75.7us(n=4671014) park=743.5us(n=2200770)
+   dmesg (fuse/WARN/lockdep/BUG tail):
+     [Sun Sep  6 19:48:13 2026] PCI: Using host bridge windows from ACPI; if necessary, use "pci=nocrs" and report a bug
+     [Sun Sep  6 19:48:14 2026] fuse: init (API version 7.45)
+     [Sun Sep  6 19:48:15 2026] wmi_bus wmi_bus-PNP0C14:00: [Firmware Bug]: WMAA method block execution control method not found
+     [Sun Sep  6 19:48:15 2026] wmi_bus wmi_bus-PNP0C14:01: [Firmware Bug]: WQBC data block query control method not found
+     [Sun Sep  6 19:48:19 2026] systemd[1]: Proceeding WITHOUT firewalling in effect! (This warning is only shown for the first loaded unit using IP firewalling.)
+-- row B-rr4k-kern-60: randread_iops_60 kern 60s (+10 ramp) perf=0 loadavg=50.69 26.85 11.07
+   box cpu: busy 73.8% (user 28.4 sys 33.1 irq 4.2 softirq 8.1 iowait 22.7)
+   thermal: hwmon mlx5 max_mC=51000 -> hwmon mlx5 max_mC=51000
+ROW B-rr4k-kern-60: iops=557116 bw=2.13GiB/s ops=33428637 clat_mean=332.7us p50=179.2 p99=3555.3 p99.9=10682.4 runtime=60s first/last third 2146/2293 MiB/s (+6.9 %)
+   cpu: total 1053.40 s = 31.51 us/fio-op | 27.11 us/stats-op (stats ops 38859843); fuse3-ur=563.36s fuse3-tpc=488.33s other=0.85s sqz-ipc-svc=0.55s sqz-timer=0.10s sqz-meta=0.10s sqz-blk=0.06s sqz-ipc-dd=0.04s sqz-jrnl=0.00s sqz-nvme=0.00s
+   ledger: read_zc_serve_bytes=158392356864 fuse3_zc_replies=38859842 fuse3_read_inplace_replies=38670012 ranged_reads=0 read_dest_lease_bytes=0 read_copy_dest_bytes=0 read_copy_bounce_bytes=0 read_dest_dma_bytes=0 ipc_arena_copy_bytes=0 ipc_ops_read=0 ipc_bytes_out=0 ipc_fast_path_serves=0 ipc_async_handoffs=0 ipc_direct_inline_reaps=0 ipc_direct_reap_stalls=0 cache_hits=0 cache_misses=0 transport_wake_writes=41265396 transport_wakes_elided=36080164 transport_park_backstop_ticks=0 fuse3_fused_midpass_reaps=0 fuse3_fused_passbottom_reaps=38670009 transport_spin_absorbed=0 transport_spin_expired=0 transport_spin_ns=0 transport_spin_refused_busy=0 transport_commit_batch_flushes=23710731 transport_commit_batch_commits=38864934 dev_enters=300 dev_wake_batches=150 dev_fills=150 invariant_tripwires=0 fuse_op_watchdog_overdue=0 transport_cq_overflows=0 transport_lease_overlong=0 op_trace_samples=0 op_trace_dropped=0
+   per-op: transport_wake_writes=1.062 transport_spin_absorbed=0.000 transport_spin_expired=0.000 transport_commit_batch_flushes=0.610 dev_enters=0.000 dev_wake_batches=0.000 reap_blind=1.828 reap_blind_cqe=2.959 reap_park=0.778
+   spin: absorbed=0 expired=0 spin_us/op=0.00 refused_busy=0 window_us=0
+   commit batch: commits/flush=1.64 flushes/op=0.610 (ops_stats=38859843)
+   box cpu: busy 73.8% (user 28.4 sys 33.1 irq 4.2 softirq 8.1)
+   zc_bridge_phase_ns: device_cq=92.5us(n=38670009) msg_hop=25.4us(n=38670009) sq_wait=1.0us(n=38670009) total=155.7us(n=38670009) wake_hop=36.8us(n=38670009)
+   read_serve_phase_ns: block_fetch=156.3us(n=38670009) key_resolve=0.3us(n=38670009) meta_resolve=1.4us(n=38670009) post_validate=0.3us(n=38670009) prelude=1.3us(n=38670009) total=165.8us(n=38670009)
+   read_fill_phase_ns: dev_queue=15.7us(n=150) dev_service=49.0us(n=150)
+   read_transport_phase_ns: dispatch_lag=41.9us(n=38859843) queue_wait=0.0us(n=38859843) reply_commit=16.1us(n=3) transport_total=208.7us(n=38859843)
+   fuse3_fused_timeline_ns: bridge_rtt=93.5us(n=38670009)
+   transport_reap_gap_ns: blind=4.9us(n=71039481) blind_cqe=12.0us(n=115003863) park=45.9us(n=30234217)
+   dmesg (fuse/WARN/lockdep/BUG tail):
+     [Sun Sep  6 19:48:13 2026] PCI: Using host bridge windows from ACPI; if necessary, use "pci=nocrs" and report a bug
+     [Sun Sep  6 19:48:14 2026] fuse: init (API version 7.45)
+     [Sun Sep  6 19:48:15 2026] wmi_bus wmi_bus-PNP0C14:00: [Firmware Bug]: WMAA method block execution control method not found
+     [Sun Sep  6 19:48:15 2026] wmi_bus wmi_bus-PNP0C14:01: [Firmware Bug]: WQBC data block query control method not found
+     [Sun Sep  6 19:48:19 2026] systemd[1]: Proceeding WITHOUT firewalling in effect! (This warning is only shown for the first loaded unit using IP firewalling.)
+-- row B-rr4k-kern-perf: randread_iops kern 30s (+10 ramp) perf=1 loadavg=44.12 29.83 13.32
+   perf: pid=9305 ur-tids=32
+   lock ledger:
+     # lock class shares (flat, self time) — the R-4 §2 ledger's 7.8 % + 3.1 %
+          2.38%  [kernel.kallsyms]   [k] _raw_spin_lock
+          0.24%  [kernel.kallsyms]   [k] fuse_uring_commit_fetch
+          0.20%  [kernel.kallsyms]   [k] fuse_uring_req_end
+          0.11%  [kernel.kallsyms]   [k] native_queued_spin_lock_slowpath
+          0.10%  [kernel.kallsyms]   [k] fuse_request_end
+    63.29%  [kernel.kallsyms] 
+    32.06%  squeezefs         
+     2.40%  libc-2.28.so      
+     1.16%  libpthread-2.28.so
+     1.08%  [vdso]            
+   box cpu: busy 67.4% (user 25.8 sys 30.5 irq 3.8 softirq 7.3 iowait 28.2)
+   thermal: hwmon mlx5 max_mC=51000 -> hwmon mlx5 max_mC=51000
+ROW B-rr4k-kern-perf: iops=499416 bw=1.91GiB/s ops=14984990 clat_mean=366.0us p50=154.6 p99=5079.0 p99.9=23724.0 runtime=30s first/last third 1939/1551 MiB/s (-20.0 %)
+   cpu: total 549.25 s = 36.65 us/fio-op | 26.83 us/stats-op (stats ops 20474262); fuse3-ur=295.41s fuse3-tpc=252.88s other=0.48s sqz-ipc-svc=0.31s sqz-timer=0.05s sqz-meta=0.05s sqz-blk=0.03s sqz-ipc-dd=0.02s sqz-jrnl=0.00s sqz-nvme=0.00s
+   ledger: read_zc_serve_bytes=83425509376 fuse3_zc_replies=20474261 fuse3_read_inplace_replies=20367559 ranged_reads=0 read_dest_lease_bytes=0 read_copy_dest_bytes=0 read_copy_bounce_bytes=0 read_dest_dma_bytes=0 ipc_arena_copy_bytes=0 ipc_ops_read=0 ipc_bytes_out=0 ipc_fast_path_serves=0 ipc_async_handoffs=0 ipc_direct_inline_reaps=0 ipc_direct_reap_stalls=0 cache_hits=0 cache_misses=0 transport_wake_writes=21809939 transport_wakes_elided=18928135 transport_park_backstop_ticks=149 fuse3_fused_midpass_reaps=0 fuse3_fused_passbottom_reaps=20367556 transport_spin_absorbed=0 transport_spin_expired=0 transport_spin_ns=0 transport_spin_refused_busy=0 transport_commit_batch_flushes=12525174 transport_commit_batch_commits=20476965 dev_enters=160 dev_wake_batches=80 dev_fills=80 invariant_tripwires=0 fuse_op_watchdog_overdue=0 transport_cq_overflows=0 transport_lease_overlong=0 op_trace_samples=0 op_trace_dropped=0
+   per-op: transport_wake_writes=1.065 transport_spin_absorbed=0.000 transport_spin_expired=0.000 transport_commit_batch_flushes=0.612 dev_enters=0.000 dev_wake_batches=0.000 reap_blind=1.792 reap_blind_cqe=2.960 reap_park=0.739
+   spin: absorbed=0 expired=0 spin_us/op=0.00 refused_busy=0 window_us=0
+   commit batch: commits/flush=1.63 flushes/op=0.612 (ops_stats=20474262)
+   box cpu: busy 67.4% (user 25.8 sys 30.5 irq 3.8 softirq 7.3)
+   zc_bridge_phase_ns: device_cq=93.2us(n=20367556) msg_hop=25.9us(n=20367556) sq_wait=1.0us(n=20367556) total=154.2us(n=20367556) wake_hop=34.1us(n=20367556)
+   read_serve_phase_ns: block_fetch=154.7us(n=20367556) key_resolve=0.3us(n=20367556) meta_resolve=1.5us(n=20367556) post_validate=0.3us(n=20367556) prelude=1.2us(n=20367556) total=164.0us(n=20367556)
+   read_fill_phase_ns: dev_queue=13.0us(n=80) dev_service=41.7us(n=80)
+   read_transport_phase_ns: dispatch_lag=39.9us(n=20474262) queue_wait=0.0us(n=20474262) reply_commit=23.0us(n=3) transport_total=204.7us(n=20474262)
+   fuse3_fused_timeline_ns: bridge_rtt=94.2us(n=20367556)
+   transport_reap_gap_ns: blind=4.8us(n=36685566) blind_cqe=11.4us(n=60609984) park=57.2us(n=15124519)
+   dmesg (fuse/WARN/lockdep/BUG tail):
+     [Sun Sep  6 19:48:13 2026] PCI: Using host bridge windows from ACPI; if necessary, use "pci=nocrs" and report a bug
+     [Sun Sep  6 19:48:14 2026] fuse: init (API version 7.45)
+     [Sun Sep  6 19:48:15 2026] wmi_bus wmi_bus-PNP0C14:00: [Firmware Bug]: WMAA method block execution control method not found
+     [Sun Sep  6 19:48:15 2026] wmi_bus wmi_bus-PNP0C14:01: [Firmware Bug]: WQBC data block query control method not found
+     [Sun Sep  6 19:48:19 2026] systemd[1]: Proceeding WITHOUT firewalling in effect! (This warning is only shown for the first loaded unit using IP firewalling.)
+Unmounting squeezefs at /scratch/tmp/test...
+Sending SIGTERM to squeezefs daemon (PID 9305)...
+Successfully unmounted mountpoint /scratch/tmp/test
+== done 2026-09-06T19:57:39Z kernel=6.19.14-sqz ARM=B patch=0031 kernel-patched=present
+ROW B-rr4k-il: iops=881628 bw=3.36GiB/s ops=26450592 clat_mean=216.9us p50=189.4 p99=553.0 p99.9=2310.1 runtime=30s first/last third 3466/3304 MiB/s (-4.7 %)
+ROW B-rr4k-kern-1: iops=552181 bw=2.11GiB/s ops=16568745 clat_mean=334.9us p50=173.1 p99=3817.5 p99.9=11599.9 runtime=30s first/last third 2010/2123 MiB/s (+5.6 %)
+ROW B-rr4k-kern-2: iops=556123 bw=2.12GiB/s ops=16685373 clat_mean=333.0us p50=177.2 p99=3653.6 p99.9=11075.6 runtime=30s first/last third 2019/2074 MiB/s (+2.7 %)
+ROW B-rr4k-kern-60: iops=557116 bw=2.13GiB/s ops=33428637 clat_mean=332.7us p50=179.2 p99=3555.3 p99.9=10682.4 runtime=60s first/last third 2146/2293 MiB/s (+6.9 %)
+ROW B-rr4k-kern-perf: iops=499416 bw=1.91GiB/s ops=14984990 clat_mean=366.0us p50=154.6 p99=5079.0 p99.9=23724.0 runtime=30s first/last third 1939/1551 MiB/s (-20.0 %)
+ROW B-seq1m-kern-1: iops=37085 bw=36.23GiB/s ops=1112853 clat_mean=10123.3us p50=8454.1 p99=33816.6 p99.9=115867.6 runtime=30s first/last third 33316/37200 MiB/s (+11.7 %)
+ROW B-seq1m-kern-2: iops=40176 bw=39.25GiB/s ops=1212747 clat_mean=9334.6us p50=7569.4 p99=31850.5 p99.9=181403.6 runtime=30s first/last third 36079/38831 MiB/s (+7.6 %)
+== compare across boots: python3 /scratch/tmp/sqz-agent/k26/2026-09-03-r4-row-delta.py is per row; pair A*/B* dirs by tag and read fuse3-ur us/op, lock.txt shares, IOPS, p50/p99, thermal

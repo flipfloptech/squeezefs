@@ -1,0 +1,13 @@
+ROW B-rr4k-kern-1: iops=552181 bw=2.11GiB/s ops=16568745 clat_mean=334.9us p50=173.1 p99=3817.5 p99.9=11599.9 runtime=30s first/last third 2010/2123 MiB/s (+5.6 %)
+   cpu: total 587.00 s = 35.43 us/fio-op | 26.76 us/stats-op (stats ops 21939108); fuse3-ur=313.23s fuse3-tpc=273.56s sqz-timer=0.07s sqz-meta=0.06s sqz-blk=0.03s other=0.03s sqz-nvme=0.01s sqz-jrnl=0.00s
+   ledger: read_zc_serve_bytes=89862574080 fuse3_zc_replies=21939107 fuse3_read_inplace_replies=21939108 ranged_reads=24 read_dest_lease_bytes=98304 read_copy_dest_bytes=0 read_copy_bounce_bytes=0 read_dest_dma_bytes=98304 ipc_arena_copy_bytes=0 ipc_ops_read=0 ipc_bytes_out=0 ipc_fast_path_serves=0 ipc_async_handoffs=0 ipc_direct_inline_reaps=0 ipc_direct_reap_stalls=0 cache_hits=0 cache_misses=0 transport_wake_writes=23542386 transport_wakes_elided=20338957 transport_park_backstop_ticks=0 fuse3_fused_midpass_reaps=0 fuse3_fused_passbottom_reaps=21939105 transport_spin_absorbed=0 transport_spin_expired=0 transport_spin_ns=0 transport_spin_refused_busy=0 transport_commit_batch_flushes=13442580 transport_commit_batch_commits=21941982 dev_enters=208 dev_wake_batches=104 dev_fills=104 invariant_tripwires=0 fuse_op_watchdog_overdue=0 transport_cq_overflows=0 transport_lease_overlong=0 op_trace_samples=0 op_trace_dropped=0
+   per-op: transport_wake_writes=1.073 transport_spin_absorbed=0.000 transport_spin_expired=0.000 transport_commit_batch_flushes=0.613 dev_enters=0.000 dev_wake_batches=0.000 reap_blind=1.833 reap_blind_cqe=2.970 reap_park=0.772
+   spin: absorbed=0 expired=0 spin_us/op=0.00 refused_busy=0 window_us=0
+   commit batch: commits/flush=1.63 flushes/op=0.613 (ops_stats=21939108)
+   box cpu: busy 71.9% (user 27.4 sys 32.4 irq 4.1 softirq 8.0)
+   zc_bridge_phase_ns: device_cq=92.0us(n=21939105) msg_hop=24.9us(n=21939105) sq_wait=1.0us(n=21939105) total=153.9us(n=21939105) wake_hop=36.0us(n=21939105)
+   read_serve_phase_ns: block_fetch=154.5us(n=21939105) classify_probe=1.0us(n=24) key_resolve=0.3us(n=21939129) meta_resolve=1.4us(n=21939129) post_validate=0.3us(n=21939105) prelude=1.3us(n=21939129) total=163.8us(n=21939105)
+   read_fill_phase_ns: dev_queue=93.6us(n=104) dev_service=61.1us(n=104)
+   read_transport_phase_ns: dispatch_lag=41.6us(n=21939108) queue_wait=0.0us(n=21939108) reply_commit=2.1us(n=27) transport_total=207.2us(n=21939108)
+   fuse3_fused_timeline_ns: bridge_rtt=93.0us(n=21939105)
+   transport_reap_gap_ns: blind=4.7us(n=40209950) blind_cqe=11.4us(n=65162130) park=48.9us(n=16931610)

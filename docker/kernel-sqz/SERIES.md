@@ -241,9 +241,13 @@ applied clean.
     `patch -p1 --fuzz=0` **31/31** from the pristine base (fresh
     kernel.org tarball, sha256 verified against both the pin above and
     `v6.x/sha256sums.asc`), byte-identical to the `git am` tree.
-    **Not boot-tested** — the lever lands on the field A/B row
+    **Boot-tested and measured 2026-09-06** on the field A/B row
     (`.benchmarks/rigs/2026-09-06-kernel-bg-per-queue-ab.sh`: kernel A =
-    0001–0030 vs B = +0031, same daemon, A A B B across reboots).
+    0001–0030 vs B = +0031, same daemon, A A B B across reboots —
+    `.benchmarks/2026-09-06-kernel-bg-per-queue-ab.md`): **B ships** —
+    worker −18 % µs/op, `native_queued_spin_lock_slowpath` 12.8 → 0.11 %,
+    kern rand-4k +9 % IOPS / p99 −13…−17 %, seq + il control par, no
+    WARN/lockdep on either B boot.
 
 `patches/` is the `git format-patch` export of the resolved transplant;
 `build-kernel.sh` applies it with `patch -p1 --fuzz=0` (any regression

@@ -1,0 +1,5 @@
+[Sun Sep  6 19:48:13 2026] PCI: Using host bridge windows from ACPI; if necessary, use "pci=nocrs" and report a bug
+[Sun Sep  6 19:48:14 2026] fuse: init (API version 7.45)
+[Sun Sep  6 19:48:15 2026] wmi_bus wmi_bus-PNP0C14:00: [Firmware Bug]: WMAA method block execution control method not found
+[Sun Sep  6 19:48:15 2026] wmi_bus wmi_bus-PNP0C14:01: [Firmware Bug]: WQBC data block query control method not found
+[Sun Sep  6 19:48:19 2026] systemd[1]: Proceeding WITHOUT firewalling in effect! (This warning is only shown for the first loaded unit using IP firewalling.)

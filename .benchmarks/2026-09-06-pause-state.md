@@ -47,6 +47,10 @@ mount (the A-arm rig reset the cluster; remount is part of every arm).
    both postures, a 779k-IOPS rand-4k load row, every tripwire 0, zero
    fuse/uring kernel-log lines). The laptop cannot be an A/B venue (its
    kernel moved 7.1.8 → 7.2.3 in the same boot); the B arm stays the box's.
+   **DONE (same day, 19:51–20:05 UTC):** both B boots on squeeze-test —
+   `.benchmarks/2026-09-06-kernel-bg-per-queue-ab.md`, **B ships**
+   (worker −18 % µs/op, slowpath 12.8 → 0.11 %, kern rand-4k +9 %, p99
+   −13…−17 %, controls par, no WARN). Item CLOSED.
 3. **Finding 15 term 1 — the user's decision**: the remaining 7.0 s of
    hold are the reader ack ladder's two derived coherence windows (qualify
    ≈ 2 s, drain ≈ 4 s, × min over 8 members). Four KD-FG-11 items

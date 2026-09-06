@@ -1,0 +1,408 @@
+[1m=============================================================================
+ RESET-V5 — THE CONVERGED EPOCH (user decision 2026-08-02)
+   1 meta + 2 data namespaces per node x 5 nodes
+   = 5 meta volumes + 10 data namespaces, every node symmetric
+ Node map (name -> fabric paths):
+   aqr37  -> 10.181.177.191 / 10.181.178.191   (aqr37-{m0,d0,d1})
+   aqr38  -> 10.181.177.192 / 10.181.178.192   (aqr38-{m0,d0,d1})
+   aqr39  -> 10.181.177.193 / 10.181.178.193   (aqr39-{m0,d0,d1})
+   aqs38  -> 10.181.177.195 / 10.181.178.195   (aqs38-{m0,d0,d1})
+   oss2   -> 10.181.177.196 / 10.181.178.196   (oss2-{m0,d0,d1})
+ Meta routing: DYNAMIC (KV_DYNAMIC_ROUTING bit 6) — width is DERIVED;
+   --meta-slots does not exist (naming it is a hard error).
+ Data backing: nullblk; format: cache-less
+=============================================================================
+[0mThis DESTROYS all data on the cluster volumes and rebuilds from scratch.
+
+[1m== 1/5 client: unmount + disconnect[0m
+
+[1m== 2/5 aqr37 (10.181.177.191): enumeration teardown + rebuild backings + re-share[0m
+Warning: Permanently added '10.181.177.191' (ECDSA) to the list of known hosts.
+  ledger unshare: nqn.2026-07.io.squeezefs:aqr37-m0
+[2026-09-06T19:51:11Z INFO  squeezefs] root subprocess PATH sanitized (VAL-7i): dropped relative/empty/group-or-world-writable entries; using '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin'
+Successfully stopped sharing target NQN 'nqn.2026-07.io.squeezefs:aqr37-m0'.
+  ledger unshare: nqn.2026-07.io.squeezefs:aqr37-d0
+[2026-09-06T19:51:11Z INFO  squeezefs] root subprocess PATH sanitized (VAL-7i): dropped relative/empty/group-or-world-writable entries; using '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin'
+Successfully stopped sharing target NQN 'nqn.2026-07.io.squeezefs:aqr37-d0'.
+  ledger unshare: nqn.2026-07.io.squeezefs:aqr37-d1
+[2026-09-06T19:51:11Z INFO  squeezefs] root subprocess PATH sanitized (VAL-7i): dropped relative/empty/group-or-world-writable entries; using '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin'
+Successfully stopped sharing target NQN 'nqn.2026-07.io.squeezefs:aqr37-d1'.
+Warning: Permanently added '10.181.177.191' (ECDSA) to the list of known hosts.
+Warning: Permanently added '10.181.177.191' (ECDSA) to the list of known hosts.
+[2026-09-06T19:51:11Z INFO  squeezefs] root subprocess PATH sanitized (VAL-7i): dropped relative/empty/group-or-world-writable entries; using '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin'
+[2026-09-06T19:51:11Z INFO  squeezefs::nvmeof] cross-stack duplicate guard: SPDK target RPC socket /run/squeezefs/nvmeof/spdk.sock not answering (socket file absent — target not running) — a stopped target serves nothing; no live SPDK state to reconcile
+note: kernel exposes no resv_enable knob for 'nqn.2026-07.io.squeezefs:aqr37-m0' — this namespace serves WITHOUT NVMe Persistent Reservations; the single-writer mount guard lands detection-grade here.
+Successfully shared '/dev/nullb0' as an NVMe-oF target (nvmet stack).
+Subsystem NQN: nqn.2026-07.io.squeezefs:aqr37-m0
+[2026-09-06T19:51:11Z INFO  squeezefs::nvmeof] nvmeof share: stack=nvmet nqn=nqn.2026-07.io.squeezefs:aqr37-m0 backing=/dev/nullb0 ns_uuid=924d0075-cde1-4eb7-bc80-f4b78adcd1b4 listeners=10.181.177.191:4420#53091,10.181.178.191:4420#53816 allow_hosts=0
+Namespace UUID: 924d0075-cde1-4eb7-bc80-f4b78adcd1b4
+Connection string for client nodes:
+  squeezefs nvmeof connect --ip 10.181.177.191 --port 4420 --subnqn nqn.2026-07.io.squeezefs:aqr37-m0
+Warning: Permanently added '10.181.177.191' (ECDSA) to the list of known hosts.
+[2026-09-06T19:51:12Z INFO  squeezefs] root subprocess PATH sanitized (VAL-7i): dropped relative/empty/group-or-world-writable entries; using '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin'
+[2026-09-06T19:51:12Z INFO  squeezefs::nvmeof] cross-stack duplicate guard: SPDK target RPC socket /run/squeezefs/nvmeof/spdk.sock not answering (socket file absent — target not running) — a stopped target serves nothing; no live SPDK state to reconcile
+note: kernel exposes no resv_enable knob for 'nqn.2026-07.io.squeezefs:aqr37-d0' — this namespace serves WITHOUT NVMe Persistent Reservations; the single-writer mount guard lands detection-grade here.
+[2026-09-06T19:51:12Z INFO  squeezefs::nvmeof] nvmeof share: stack=nvmet nqn=nqn.2026-07.io.squeezefs:aqr37-d0 backing=/dev/nullb1 ns_uuid=0115f89b-b7b5-4dd6-92e2-015ed295be6e listeners=10.181.177.191:4420#53091,10.181.178.191:4420#53816 allow_hosts=0
+Successfully shared '/dev/nullb1' as an NVMe-oF target (nvmet stack).
+Subsystem NQN: nqn.2026-07.io.squeezefs:aqr37-d0
+Namespace UUID: 0115f89b-b7b5-4dd6-92e2-015ed295be6e
+Connection string for client nodes:
+  squeezefs nvmeof connect --ip 10.181.177.191 --port 4420 --subnqn nqn.2026-07.io.squeezefs:aqr37-d0
+[2026-09-06T19:51:14Z INFO  squeezefs] root subprocess PATH sanitized (VAL-7i): dropped relative/empty/group-or-world-writable entries; using '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin'
+[2026-09-06T19:51:14Z INFO  squeezefs::nvmeof] cross-stack duplicate guard: SPDK target RPC socket /run/squeezefs/nvmeof/spdk.sock not answering (socket file absent — target not running) — a stopped target serves nothing; no live SPDK state to reconcile
+note: kernel exposes no resv_enable knob for 'nqn.2026-07.io.squeezefs:aqr37-d1' — this namespace serves WITHOUT NVMe Persistent Reservations; the single-writer mount guard lands detection-grade here.
+Successfully shared '/dev/nullb2' as an NVMe-oF target (nvmet stack).
+Subsystem NQN: nqn.2026-07.io.squeezefs:aqr37-d1
+Namespace UUID: d32e75b5-233c-44fd-bfd8-dad728edaea9
+Connection string for client nodes:
+  squeezefs nvmeof connect --ip 10.181.177.191 --port 4420 --subnqn nqn.2026-07.io.squeezefs:aqr37-d1
+[2026-09-06T19:51:14Z INFO  squeezefs::nvmeof] nvmeof share: stack=nvmet nqn=nqn.2026-07.io.squeezefs:aqr37-d1 backing=/dev/nullb2 ns_uuid=d32e75b5-233c-44fd-bfd8-dad728edaea9 listeners=10.181.177.191:4420#53091,10.181.178.191:4420#53816 allow_hosts=0
+
+[1m== 2/5 aqr38 (10.181.177.192): enumeration teardown + rebuild backings + re-share[0m
+Warning: Permanently added '10.181.177.192' (ECDSA) to the list of known hosts.
+  ledger unshare: nqn.2026-07.io.squeezefs:aqr38-m0
+[2026-09-06T19:51:14Z INFO  squeezefs] root subprocess PATH sanitized (VAL-7i): dropped relative/empty/group-or-world-writable entries; using '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin'
+Successfully stopped sharing target NQN 'nqn.2026-07.io.squeezefs:aqr38-m0'.
+  ledger unshare: nqn.2026-07.io.squeezefs:aqr38-d0
+[2026-09-06T19:51:14Z INFO  squeezefs] root subprocess PATH sanitized (VAL-7i): dropped relative/empty/group-or-world-writable entries; using '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin'
+Successfully stopped sharing target NQN 'nqn.2026-07.io.squeezefs:aqr38-d0'.
+  ledger unshare: nqn.2026-07.io.squeezefs:aqr38-d1
+[2026-09-06T19:51:14Z INFO  squeezefs] root subprocess PATH sanitized (VAL-7i): dropped relative/empty/group-or-world-writable entries; using '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin'
+Successfully stopped sharing target NQN 'nqn.2026-07.io.squeezefs:aqr38-d1'.
+Warning: Permanently added '10.181.177.192' (ECDSA) to the list of known hosts.
+Warning: Permanently added '10.181.177.192' (ECDSA) to the list of known hosts.
+[2026-09-06T19:51:14Z INFO  squeezefs] root subprocess PATH sanitized (VAL-7i): dropped relative/empty/group-or-world-writable entries; using '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin'
+[2026-09-06T19:51:14Z INFO  squeezefs::nvmeof] cross-stack duplicate guard: SPDK target RPC socket /run/squeezefs/nvmeof/spdk.sock not answering (socket file absent — target not running) — a stopped target serves nothing; no live SPDK state to reconcile
+note: kernel exposes no resv_enable knob for 'nqn.2026-07.io.squeezefs:aqr38-m0' — this namespace serves WITHOUT NVMe Persistent Reservations; the single-writer mount guard lands detection-grade here.
+Successfully shared '/dev/nullb0' as an NVMe-oF target (nvmet stack).
+Subsystem NQN: nqn.2026-07.io.squeezefs:aqr38-m0
+Namespace UUID: 192871ea-3d26-4873-8097-8941cff41581
+Connection string for client nodes:
+  squeezefs nvmeof connect --ip 10.181.177.192 --port 4420 --subnqn nqn.2026-07.io.squeezefs:aqr38-m0
+[2026-09-06T19:51:14Z INFO  squeezefs::nvmeof] nvmeof share: stack=nvmet nqn=nqn.2026-07.io.squeezefs:aqr38-m0 backing=/dev/nullb0 ns_uuid=192871ea-3d26-4873-8097-8941cff41581 listeners=10.181.177.192:4420#53504,10.181.178.192:4420#53803 allow_hosts=0
+Warning: Permanently added '10.181.177.192' (ECDSA) to the list of known hosts.
+[2026-09-06T19:51:16Z INFO  squeezefs] root subprocess PATH sanitized (VAL-7i): dropped relative/empty/group-or-world-writable entries; using '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin'
+[2026-09-06T19:51:16Z INFO  squeezefs::nvmeof] cross-stack duplicate guard: SPDK target RPC socket /run/squeezefs/nvmeof/spdk.sock not answering (socket file absent — target not running) — a stopped target serves nothing; no live SPDK state to reconcile
+note: kernel exposes no resv_enable knob for 'nqn.2026-07.io.squeezefs:aqr38-d0' — this namespace serves WITHOUT NVMe Persistent Reservations; the single-writer mount guard lands detection-grade here.
+[2026-09-06T19:51:16Z INFO  squeezefs::nvmeof] nvmeof share: stack=nvmet nqn=nqn.2026-07.io.squeezefs:aqr38-d0 backing=/dev/nullb1 ns_uuid=486d4f4e-7797-4baa-a8af-2dcfc107315f listeners=10.181.177.192:4420#53504,10.181.178.192:4420#53803 allow_hosts=0
+Successfully shared '/dev/nullb1' as an NVMe-oF target (nvmet stack).
+Subsystem NQN: nqn.2026-07.io.squeezefs:aqr38-d0
+Namespace UUID: 486d4f4e-7797-4baa-a8af-2dcfc107315f
+Connection string for client nodes:
+  squeezefs nvmeof connect --ip 10.181.177.192 --port 4420 --subnqn nqn.2026-07.io.squeezefs:aqr38-d0
+[2026-09-06T19:51:17Z INFO  squeezefs] root subprocess PATH sanitized (VAL-7i): dropped relative/empty/group-or-world-writable entries; using '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin'
+[2026-09-06T19:51:17Z INFO  squeezefs::nvmeof] cross-stack duplicate guard: SPDK target RPC socket /run/squeezefs/nvmeof/spdk.sock not answering (socket file absent — target not running) — a stopped target serves nothing; no live SPDK state to reconcile
+note: kernel exposes no resv_enable knob for 'nqn.2026-07.io.squeezefs:aqr38-d1' — this namespace serves WITHOUT NVMe Persistent Reservations; the single-writer mount guard lands detection-grade here.
+[2026-09-06T19:51:17Z INFO  squeezefs::nvmeof] nvmeof share: stack=nvmet nqn=nqn.2026-07.io.squeezefs:aqr38-d1 backing=/dev/nullb2 ns_uuid=5c24c820-7a99-4910-9bd7-94d80093b43a listeners=10.181.177.192:4420#53504,10.181.178.192:4420#53803 allow_hosts=0
+Successfully shared '/dev/nullb2' as an NVMe-oF target (nvmet stack).
+Subsystem NQN: nqn.2026-07.io.squeezefs:aqr38-d1
+Namespace UUID: 5c24c820-7a99-4910-9bd7-94d80093b43a
+Connection string for client nodes:
+  squeezefs nvmeof connect --ip 10.181.177.192 --port 4420 --subnqn nqn.2026-07.io.squeezefs:aqr38-d1
+
+[1m== 2/5 aqr39 (10.181.177.193): enumeration teardown + rebuild backings + re-share[0m
+Warning: Permanently added '10.181.177.193' (ECDSA) to the list of known hosts.
+  ledger unshare: nqn.2026-07.io.squeezefs:aqr39-m0
+[2026-09-06T19:51:17Z INFO  squeezefs] root subprocess PATH sanitized (VAL-7i): dropped relative/empty/group-or-world-writable entries; using '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin'
+Successfully stopped sharing target NQN 'nqn.2026-07.io.squeezefs:aqr39-m0'.
+  ledger unshare: nqn.2026-07.io.squeezefs:aqr39-d0
+[2026-09-06T19:51:18Z INFO  squeezefs] root subprocess PATH sanitized (VAL-7i): dropped relative/empty/group-or-world-writable entries; using '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin'
+Successfully stopped sharing target NQN 'nqn.2026-07.io.squeezefs:aqr39-d0'.
+  ledger unshare: nqn.2026-07.io.squeezefs:aqr39-d1
+[2026-09-06T19:51:18Z INFO  squeezefs] root subprocess PATH sanitized (VAL-7i): dropped relative/empty/group-or-world-writable entries; using '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin'
+Successfully stopped sharing target NQN 'nqn.2026-07.io.squeezefs:aqr39-d1'.
+Warning: Permanently added '10.181.177.193' (ECDSA) to the list of known hosts.
+Warning: Permanently added '10.181.177.193' (ECDSA) to the list of known hosts.
+[2026-09-06T19:51:18Z INFO  squeezefs] root subprocess PATH sanitized (VAL-7i): dropped relative/empty/group-or-world-writable entries; using '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin'
+[2026-09-06T19:51:18Z INFO  squeezefs::nvmeof] cross-stack duplicate guard: SPDK target RPC socket /run/squeezefs/nvmeof/spdk.sock not answering (socket file absent — target not running) — a stopped target serves nothing; no live SPDK state to reconcile
+note: kernel exposes no resv_enable knob for 'nqn.2026-07.io.squeezefs:aqr39-m0' — this namespace serves WITHOUT NVMe Persistent Reservations; the single-writer mount guard lands detection-grade here.
+[2026-09-06T19:51:18Z INFO  squeezefs::nvmeof] nvmeof share: stack=nvmet nqn=nqn.2026-07.io.squeezefs:aqr39-m0 backing=/dev/nullb0 ns_uuid=18759f82-1ea8-4616-b0c8-bf1d125af190 listeners=10.181.177.193:4420#53373,10.181.178.193:4420#53254 allow_hosts=0
+Successfully shared '/dev/nullb0' as an NVMe-oF target (nvmet stack).
+Subsystem NQN: nqn.2026-07.io.squeezefs:aqr39-m0
+Namespace UUID: 18759f82-1ea8-4616-b0c8-bf1d125af190
+Connection string for client nodes:
+  squeezefs nvmeof connect --ip 10.181.177.193 --port 4420 --subnqn nqn.2026-07.io.squeezefs:aqr39-m0
+Warning: Permanently added '10.181.177.193' (ECDSA) to the list of known hosts.
+[2026-09-06T19:51:19Z INFO  squeezefs] root subprocess PATH sanitized (VAL-7i): dropped relative/empty/group-or-world-writable entries; using '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin'
+[2026-09-06T19:51:19Z INFO  squeezefs::nvmeof] cross-stack duplicate guard: SPDK target RPC socket /run/squeezefs/nvmeof/spdk.sock not answering (socket file absent — target not running) — a stopped target serves nothing; no live SPDK state to reconcile
+note: kernel exposes no resv_enable knob for 'nqn.2026-07.io.squeezefs:aqr39-d0' — this namespace serves WITHOUT NVMe Persistent Reservations; the single-writer mount guard lands detection-grade here.
+[2026-09-06T19:51:19Z INFO  squeezefs::nvmeof] nvmeof share: stack=nvmet nqn=nqn.2026-07.io.squeezefs:aqr39-d0 backing=/dev/nullb1 ns_uuid=35418caf-f803-47a3-9751-fdd7b2ff036e listeners=10.181.177.193:4420#53373,10.181.178.193:4420#53254 allow_hosts=0
+Successfully shared '/dev/nullb1' as an NVMe-oF target (nvmet stack).
+Subsystem NQN: nqn.2026-07.io.squeezefs:aqr39-d0
+Namespace UUID: 35418caf-f803-47a3-9751-fdd7b2ff036e
+Connection string for client nodes:
+  squeezefs nvmeof connect --ip 10.181.177.193 --port 4420 --subnqn nqn.2026-07.io.squeezefs:aqr39-d0
+[2026-09-06T19:51:21Z INFO  squeezefs] root subprocess PATH sanitized (VAL-7i): dropped relative/empty/group-or-world-writable entries; using '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin'
+[2026-09-06T19:51:21Z INFO  squeezefs::nvmeof] cross-stack duplicate guard: SPDK target RPC socket /run/squeezefs/nvmeof/spdk.sock not answering (socket file absent — target not running) — a stopped target serves nothing; no live SPDK state to reconcile
+note: kernel exposes no resv_enable knob for 'nqn.2026-07.io.squeezefs:aqr39-d1' — this namespace serves WITHOUT NVMe Persistent Reservations; the single-writer mount guard lands detection-grade here.
+[2026-09-06T19:51:21Z INFO  squeezefs::nvmeof] nvmeof share: stack=nvmet nqn=nqn.2026-07.io.squeezefs:aqr39-d1 backing=/dev/nullb2 ns_uuid=4de91287-4b40-4e75-bef4-d75f512fed00 listeners=10.181.177.193:4420#53373,10.181.178.193:4420#53254 allow_hosts=0
+Successfully shared '/dev/nullb2' as an NVMe-oF target (nvmet stack).
+Subsystem NQN: nqn.2026-07.io.squeezefs:aqr39-d1
+Namespace UUID: 4de91287-4b40-4e75-bef4-d75f512fed00
+Connection string for client nodes:
+  squeezefs nvmeof connect --ip 10.181.177.193 --port 4420 --subnqn nqn.2026-07.io.squeezefs:aqr39-d1
+
+[1m== 2/5 aqs38 (10.181.177.195): enumeration teardown + rebuild backings + re-share[0m
+Warning: Permanently added '10.181.177.195' (ECDSA) to the list of known hosts.
+  ledger unshare: nqn.2026-07.io.squeezefs:aqs38-m0
+[2026-09-06T19:51:21Z INFO  squeezefs] root subprocess PATH sanitized (VAL-7i): dropped relative/empty/group-or-world-writable entries; using '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin'
+Successfully stopped sharing target NQN 'nqn.2026-07.io.squeezefs:aqs38-m0'.
+  ledger unshare: nqn.2026-07.io.squeezefs:aqs38-d0
+[2026-09-06T19:51:21Z INFO  squeezefs] root subprocess PATH sanitized (VAL-7i): dropped relative/empty/group-or-world-writable entries; using '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin'
+Successfully stopped sharing target NQN 'nqn.2026-07.io.squeezefs:aqs38-d0'.
+  ledger unshare: nqn.2026-07.io.squeezefs:aqs38-d1
+[2026-09-06T19:51:21Z INFO  squeezefs] root subprocess PATH sanitized (VAL-7i): dropped relative/empty/group-or-world-writable entries; using '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin'
+Successfully stopped sharing target NQN 'nqn.2026-07.io.squeezefs:aqs38-d1'.
+Warning: Permanently added '10.181.177.195' (ECDSA) to the list of known hosts.
+Warning: Permanently added '10.181.177.195' (ECDSA) to the list of known hosts.
+[2026-09-06T19:51:21Z INFO  squeezefs] root subprocess PATH sanitized (VAL-7i): dropped relative/empty/group-or-world-writable entries; using '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin'
+[2026-09-06T19:51:21Z INFO  squeezefs::nvmeof] cross-stack duplicate guard: SPDK target RPC socket /run/squeezefs/nvmeof/spdk.sock not answering (socket file absent — target not running) — a stopped target serves nothing; no live SPDK state to reconcile
+note: kernel exposes no resv_enable knob for 'nqn.2026-07.io.squeezefs:aqs38-m0' — this namespace serves WITHOUT NVMe Persistent Reservations; the single-writer mount guard lands detection-grade here.
+[2026-09-06T19:51:21Z INFO  squeezefs::nvmeof] nvmeof share: stack=nvmet nqn=nqn.2026-07.io.squeezefs:aqs38-m0 backing=/dev/nullb0 ns_uuid=a63bb446-9696-4cdd-b5a8-2c7c9f3e2e10 listeners=10.181.177.195:4420#53275,10.181.178.195:4420#53384 allow_hosts=0
+Successfully shared '/dev/nullb0' as an NVMe-oF target (nvmet stack).
+Subsystem NQN: nqn.2026-07.io.squeezefs:aqs38-m0
+Namespace UUID: a63bb446-9696-4cdd-b5a8-2c7c9f3e2e10
+Connection string for client nodes:
+  squeezefs nvmeof connect --ip 10.181.177.195 --port 4420 --subnqn nqn.2026-07.io.squeezefs:aqs38-m0
+Warning: Permanently added '10.181.177.195' (ECDSA) to the list of known hosts.
+[2026-09-06T19:51:23Z INFO  squeezefs] root subprocess PATH sanitized (VAL-7i): dropped relative/empty/group-or-world-writable entries; using '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin'
+[2026-09-06T19:51:23Z INFO  squeezefs::nvmeof] cross-stack duplicate guard: SPDK target RPC socket /run/squeezefs/nvmeof/spdk.sock not answering (socket file absent — target not running) — a stopped target serves nothing; no live SPDK state to reconcile
+note: kernel exposes no resv_enable knob for 'nqn.2026-07.io.squeezefs:aqs38-d0' — this namespace serves WITHOUT NVMe Persistent Reservations; the single-writer mount guard lands detection-grade here.
+[2026-09-06T19:51:23Z INFO  squeezefs::nvmeof] nvmeof share: stack=nvmet nqn=nqn.2026-07.io.squeezefs:aqs38-d0 backing=/dev/nullb1 ns_uuid=2eb92930-7b21-4d68-8d4e-8b6d9f65cbf3 listeners=10.181.177.195:4420#53275,10.181.178.195:4420#53384 allow_hosts=0
+Successfully shared '/dev/nullb1' as an NVMe-oF target (nvmet stack).
+Subsystem NQN: nqn.2026-07.io.squeezefs:aqs38-d0
+Namespace UUID: 2eb92930-7b21-4d68-8d4e-8b6d9f65cbf3
+Connection string for client nodes:
+  squeezefs nvmeof connect --ip 10.181.177.195 --port 4420 --subnqn nqn.2026-07.io.squeezefs:aqs38-d0
+[2026-09-06T19:51:24Z INFO  squeezefs] root subprocess PATH sanitized (VAL-7i): dropped relative/empty/group-or-world-writable entries; using '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin'
+[2026-09-06T19:51:24Z INFO  squeezefs::nvmeof] cross-stack duplicate guard: SPDK target RPC socket /run/squeezefs/nvmeof/spdk.sock not answering (socket file absent — target not running) — a stopped target serves nothing; no live SPDK state to reconcile
+note: kernel exposes no resv_enable knob for 'nqn.2026-07.io.squeezefs:aqs38-d1' — this namespace serves WITHOUT NVMe Persistent Reservations; the single-writer mount guard lands detection-grade here.
+Successfully shared '/dev/nullb2' as an NVMe-oF target (nvmet stack).
+Subsystem NQN: nqn.2026-07.io.squeezefs:aqs38-d1
+Namespace UUID: e5a48261-ba39-48c2-912a-e878f8311e64
+Connection string for client nodes:
+  squeezefs nvmeof connect --ip 10.181.177.195 --port 4420 --subnqn nqn.2026-07.io.squeezefs:aqs38-d1
+[2026-09-06T19:51:24Z INFO  squeezefs::nvmeof] nvmeof share: stack=nvmet nqn=nqn.2026-07.io.squeezefs:aqs38-d1 backing=/dev/nullb2 ns_uuid=e5a48261-ba39-48c2-912a-e878f8311e64 listeners=10.181.177.195:4420#53275,10.181.178.195:4420#53384 allow_hosts=0
+
+[1m== 2/5 oss2 (10.181.177.196): enumeration teardown + rebuild backings + re-share[0m
+Warning: Permanently added '10.181.177.196' (ECDSA) to the list of known hosts.
+  ledger unshare: nqn.2026-07.io.squeezefs:oss2-m0
+[2026-09-06T19:51:24Z INFO  squeezefs] root subprocess PATH sanitized (VAL-7i): dropped relative/empty/group-or-world-writable entries; using '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin'
+Successfully stopped sharing target NQN 'nqn.2026-07.io.squeezefs:oss2-m0'.
+  ledger unshare: nqn.2026-07.io.squeezefs:oss2-d0
+[2026-09-06T19:51:24Z INFO  squeezefs] root subprocess PATH sanitized (VAL-7i): dropped relative/empty/group-or-world-writable entries; using '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin'
+Successfully stopped sharing target NQN 'nqn.2026-07.io.squeezefs:oss2-d0'.
+  ledger unshare: nqn.2026-07.io.squeezefs:oss2-d1
+[2026-09-06T19:51:24Z INFO  squeezefs] root subprocess PATH sanitized (VAL-7i): dropped relative/empty/group-or-world-writable entries; using '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin'
+Successfully stopped sharing target NQN 'nqn.2026-07.io.squeezefs:oss2-d1'.
+Warning: Permanently added '10.181.177.196' (ECDSA) to the list of known hosts.
+Warning: Permanently added '10.181.177.196' (ECDSA) to the list of known hosts.
+[2026-09-06T19:51:25Z INFO  squeezefs] root subprocess PATH sanitized (VAL-7i): dropped relative/empty/group-or-world-writable entries; using '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin'
+[2026-09-06T19:51:25Z INFO  squeezefs::nvmeof] cross-stack duplicate guard: SPDK target RPC socket /run/squeezefs/nvmeof/spdk.sock not answering (socket file absent — target not running) — a stopped target serves nothing; no live SPDK state to reconcile
+note: kernel exposes no resv_enable knob for 'nqn.2026-07.io.squeezefs:oss2-m0' — this namespace serves WITHOUT NVMe Persistent Reservations; the single-writer mount guard lands detection-grade here.
+[2026-09-06T19:51:25Z INFO  squeezefs::nvmeof] nvmeof share: stack=nvmet nqn=nqn.2026-07.io.squeezefs:oss2-m0 backing=/dev/nullb0 ns_uuid=1f81163b-074f-4484-906e-333127061813 listeners=10.181.177.196:4420#53048,10.181.178.196:4420#53143 allow_hosts=0
+Successfully shared '/dev/nullb0' as an NVMe-oF target (nvmet stack).
+Subsystem NQN: nqn.2026-07.io.squeezefs:oss2-m0
+Namespace UUID: 1f81163b-074f-4484-906e-333127061813
+Connection string for client nodes:
+  squeezefs nvmeof connect --ip 10.181.177.196 --port 4420 --subnqn nqn.2026-07.io.squeezefs:oss2-m0
+Warning: Permanently added '10.181.177.196' (ECDSA) to the list of known hosts.
+[2026-09-06T19:51:26Z INFO  squeezefs] root subprocess PATH sanitized (VAL-7i): dropped relative/empty/group-or-world-writable entries; using '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin'
+[2026-09-06T19:51:26Z INFO  squeezefs::nvmeof] cross-stack duplicate guard: SPDK target RPC socket /run/squeezefs/nvmeof/spdk.sock not answering (socket file absent — target not running) — a stopped target serves nothing; no live SPDK state to reconcile
+note: kernel exposes no resv_enable knob for 'nqn.2026-07.io.squeezefs:oss2-d0' — this namespace serves WITHOUT NVMe Persistent Reservations; the single-writer mount guard lands detection-grade here.
+[2026-09-06T19:51:26Z INFO  squeezefs::nvmeof] nvmeof share: stack=nvmet nqn=nqn.2026-07.io.squeezefs:oss2-d0 backing=/dev/nullb1 ns_uuid=568fabc7-ca11-4fef-914e-36a32b3746e7 listeners=10.181.177.196:4420#53048,10.181.178.196:4420#53143 allow_hosts=0
+Successfully shared '/dev/nullb1' as an NVMe-oF target (nvmet stack).
+Subsystem NQN: nqn.2026-07.io.squeezefs:oss2-d0
+Namespace UUID: 568fabc7-ca11-4fef-914e-36a32b3746e7
+Connection string for client nodes:
+  squeezefs nvmeof connect --ip 10.181.177.196 --port 4420 --subnqn nqn.2026-07.io.squeezefs:oss2-d0
+[2026-09-06T19:51:28Z INFO  squeezefs] root subprocess PATH sanitized (VAL-7i): dropped relative/empty/group-or-world-writable entries; using '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin'
+[2026-09-06T19:51:28Z INFO  squeezefs::nvmeof] cross-stack duplicate guard: SPDK target RPC socket /run/squeezefs/nvmeof/spdk.sock not answering (socket file absent — target not running) — a stopped target serves nothing; no live SPDK state to reconcile
+note: kernel exposes no resv_enable knob for 'nqn.2026-07.io.squeezefs:oss2-d1' — this namespace serves WITHOUT NVMe Persistent Reservations; the single-writer mount guard lands detection-grade here.
+Successfully shared '/dev/nullb2' as an NVMe-oF target (nvmet stack).
+Subsystem NQN: nqn.2026-07.io.squeezefs:oss2-d1
+Namespace UUID: afb26cf8-c3cd-4a06-b41b-3d5ecde1c437
+Connection string for client nodes:
+  squeezefs nvmeof connect --ip 10.181.177.196 --port 4420 --subnqn nqn.2026-07.io.squeezefs:oss2-d1
+[2026-09-06T19:51:28Z INFO  squeezefs::nvmeof] nvmeof share: stack=nvmet nqn=nqn.2026-07.io.squeezefs:oss2-d1 backing=/dev/nullb2 ns_uuid=afb26cf8-c3cd-4a06-b41b-3d5ecde1c437 listeners=10.181.177.196:4420#53048,10.181.178.196:4420#53143 allow_hosts=0
+
+[1m== 3/5 client: connect both paths per subsystem (15 subsystems x 2 paths)[0m
+Connecting to NVMe-oF target at 10.181.177.191:4420...
+nvme version 1.16
+Connection successful!
+Attached Remote Disk: /dev/nvme0n1
+Connecting to NVMe-oF target at 10.181.178.191:4420...
+nvme version 1.16
+Connection successful!
+Attached Remote Disk: /dev/nvme0n1
+Connecting to NVMe-oF target at 10.181.177.192:4420...
+nvme version 1.16
+Connection successful!
+Attached Remote Disk: /dev/nvme2n1
+Connecting to NVMe-oF target at 10.181.178.192:4420...
+nvme version 1.16
+Connection successful!
+Attached Remote Disk: /dev/nvme2n1
+Connecting to NVMe-oF target at 10.181.177.193:4420...
+nvme version 1.16
+Connection successful!
+Attached Remote Disk: /dev/nvme4n1
+Connecting to NVMe-oF target at 10.181.178.193:4420...
+nvme version 1.16
+Connection successful!
+Attached Remote Disk: /dev/nvme4n1
+Connecting to NVMe-oF target at 10.181.177.195:4420...
+nvme version 1.16
+Connection successful!
+Attached Remote Disk: /dev/nvme6n1
+Connecting to NVMe-oF target at 10.181.178.195:4420...
+nvme version 1.16
+Connection successful!
+Attached Remote Disk: /dev/nvme6n1
+Connecting to NVMe-oF target at 10.181.177.196:4420...
+nvme version 1.16
+Connection successful!
+Attached Remote Disk: /dev/nvme8n1
+Connecting to NVMe-oF target at 10.181.178.196:4420...
+nvme version 1.16
+Connection successful!
+Attached Remote Disk: /dev/nvme8n1
+Connecting to NVMe-oF target at 10.181.177.191:4420...
+nvme version 1.16
+Connection successful!
+Attached Remote Disk: /dev/nvme10n1
+Connecting to NVMe-oF target at 10.181.178.191:4420...
+nvme version 1.16
+Connection successful!
+Attached Remote Disk: /dev/nvme10n1
+Connecting to NVMe-oF target at 10.181.177.191:4420...
+nvme version 1.16
+Connection successful!
+Attached Remote Disk: /dev/nvme12n1
+Connecting to NVMe-oF target at 10.181.178.191:4420...
+nvme version 1.16
+Connection successful!
+Attached Remote Disk: /dev/nvme12n1
+Connecting to NVMe-oF target at 10.181.177.192:4420...
+nvme version 1.16
+Connection successful!
+Attached Remote Disk: /dev/nvme14n1
+Connecting to NVMe-oF target at 10.181.178.192:4420...
+nvme version 1.16
+Connection successful!
+Attached Remote Disk: /dev/nvme14n1
+Connecting to NVMe-oF target at 10.181.177.192:4420...
+nvme version 1.16
+Connection successful!
+Attached Remote Disk: /dev/nvme16n1
+Connecting to NVMe-oF target at 10.181.178.192:4420...
+nvme version 1.16
+Connection successful!
+Attached Remote Disk: /dev/nvme16n1
+Connecting to NVMe-oF target at 10.181.177.193:4420...
+nvme version 1.16
+Connection successful!
+Attached Remote Disk: /dev/nvme18n1
+Connecting to NVMe-oF target at 10.181.178.193:4420...
+nvme version 1.16
+Connection successful!
+Attached Remote Disk: /dev/nvme18n1
+Connecting to NVMe-oF target at 10.181.177.193:4420...
+nvme version 1.16
+Connection successful!
+Attached Remote Disk: /dev/nvme20n1
+Connecting to NVMe-oF target at 10.181.178.193:4420...
+nvme version 1.16
+Connection successful!
+Attached Remote Disk: /dev/nvme20n1
+Connecting to NVMe-oF target at 10.181.177.195:4420...
+nvme version 1.16
+Connection successful!
+Attached Remote Disk: /dev/nvme22n1
+Connecting to NVMe-oF target at 10.181.178.195:4420...
+nvme version 1.16
+Connection successful!
+Attached Remote Disk: /dev/nvme22n1
+Connecting to NVMe-oF target at 10.181.177.195:4420...
+nvme version 1.16
+Connection successful!
+Attached Remote Disk: /dev/nvme24n1
+Connecting to NVMe-oF target at 10.181.178.195:4420...
+nvme version 1.16
+Connection successful!
+Attached Remote Disk: /dev/nvme24n1
+Connecting to NVMe-oF target at 10.181.177.196:4420...
+nvme version 1.16
+Connection successful!
+Attached Remote Disk: /dev/nvme26n1
+Connecting to NVMe-oF target at 10.181.178.196:4420...
+nvme version 1.16
+Connection successful!
+Attached Remote Disk: /dev/nvme26n1
+Connecting to NVMe-oF target at 10.181.177.196:4420...
+nvme version 1.16
+Connection successful!
+Attached Remote Disk: /dev/nvme28n1
+Connecting to NVMe-oF target at 10.181.178.196:4420...
+nvme version 1.16
+Connection successful!
+Attached Remote Disk: /dev/nvme28n1
+  nqn.2026-07.io.squeezefs:aqr37-m0 -> /dev/nvme0n1
+  nqn.2026-07.io.squeezefs:aqr38-m0 -> /dev/nvme2n1
+  nqn.2026-07.io.squeezefs:aqr39-m0 -> /dev/nvme4n1
+  nqn.2026-07.io.squeezefs:aqs38-m0 -> /dev/nvme6n1
+  nqn.2026-07.io.squeezefs:oss2-m0 -> /dev/nvme8n1
+  nqn.2026-07.io.squeezefs:aqr37-d0 -> /dev/nvme10n1
+  nqn.2026-07.io.squeezefs:aqr37-d1 -> /dev/nvme12n1
+  nqn.2026-07.io.squeezefs:aqr38-d0 -> /dev/nvme14n1
+  nqn.2026-07.io.squeezefs:aqr38-d1 -> /dev/nvme16n1
+  nqn.2026-07.io.squeezefs:aqr39-d0 -> /dev/nvme18n1
+  nqn.2026-07.io.squeezefs:aqr39-d1 -> /dev/nvme20n1
+  nqn.2026-07.io.squeezefs:aqs38-d0 -> /dev/nvme22n1
+  nqn.2026-07.io.squeezefs:aqs38-d1 -> /dev/nvme24n1
+  nqn.2026-07.io.squeezefs:oss2-d0 -> /dev/nvme26n1
+  nqn.2026-07.io.squeezefs:oss2-d1 -> /dev/nvme28n1
+
+[1m== 4/5 format (derived meta routing width; 5 meta volumes, 10 data namespaces)[0m
+  cache-less format (CACHE_DIR empty)
+Total physical data volume capacity: 480.00 GiB
+Meta routing: derived virtual width W = 65536 over 5 volume(s), mint spread 64 slots/volume — grow any time with `volume add-meta` / `migrate-meta-slot` (no planning knob; pre-dynamic-routing binaries refuse this set).
+Multi-writer-capable (the default): stamping the nine multi-writer format bits (7,8,9,10,11,12,13,14,15) on every metadata volume — one act (KD-MW-1). Pre-multi-writer binaries refuse this set loud; solo mounts behave identically (opt out with --single-writer).
+[2026-09-06T19:51:29Z INFO  squeezefs] Successfully formatted (v3) and recorded config on metadata volume.
+SqueezeFS version 1.2.1 (27a396e18ada / 27a396e18ada20d6dfe806a7060f148d17de99b3, tag stable-2026.09.1) built 2026-09-05T04:53:56Z profile dist
+======================================================================
+  Format Configuration Summary
+----------------------------------------------------------------------
+  Volume Name:         squeezefs
+  Capacity:            480.00 GiB
+  Block Size:          4.00 MiB
+  Compression:         none
+  Encryption:          none
+----------------------------------------------------------------------
+Metadata Volumes:
+  - [enabled] /dev/nvme0n1 (health: 1000)
+  - [enabled] /dev/nvme2n1 (health: 1000)
+  - [enabled] /dev/nvme4n1 (health: 1000)
+  - [enabled] /dev/nvme6n1 (health: 1000)
+  - [enabled] /dev/nvme8n1 (health: 1000)
+Data Volumes:
+  - [enabled] /dev/nvme10n1 (health: 1000)
+  - [enabled] /dev/nvme12n1 (health: 1000)
+  - [enabled] /dev/nvme14n1 (health: 1000)
+  - [enabled] /dev/nvme16n1 (health: 1000)
+  - [enabled] /dev/nvme18n1 (health: 1000)
+  - [enabled] /dev/nvme20n1 (health: 1000)
+  - [enabled] /dev/nvme22n1 (health: 1000)
+  - [enabled] /dev/nvme24n1 (health: 1000)
+  - [enabled] /dev/nvme26n1 (health: 1000)
+  - [enabled] /dev/nvme28n1 (health: 1000)
+----------------------------------------------------------------------
+Cache/Staging:
+  Memory Cache Size:   1GB
+  Disk Cache Size:     10GB
+  Staging Paths:       none (cache-less)
+======================================================================
+Format complete.
+
+[1m== 5/5 mount + verify[0m
+/scratch/tmp/squeezefs mount sqmeta:///dev/nvme0n1,/dev/nvme2n1,/dev/nvme4n1,/dev/nvme6n1,/dev/nvme8n1 /scratch/tmp/test --daemon --interception --allow-other --log-file /scratch/tmp/logs/sqz.log

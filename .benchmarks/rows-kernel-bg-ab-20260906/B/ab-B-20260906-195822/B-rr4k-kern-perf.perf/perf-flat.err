@@ -1,0 +1,2 @@
+[ perf record: Woken up 34 times to write data ]
+[ perf record: Captured and wrote 13.826 MB /scratch/tmp/sqz-agent/k26/ab-B-20260906-195822/B-rr4k-kern-perf.perf/ur-flat.data (361057 samples) ]

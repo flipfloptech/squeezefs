@@ -224,7 +224,20 @@ The `lockdep_assert_held(&queue->lock)` lines stay on every helper.
 +335/−44. The runtime lockdep run (PROVE_LOCKING under load, abort while
 queues are blocked, fusectl shrink under load) is the boot test's.
 
-## 5. The A/B row (owed — the parent runs it once the user boots a patched kernel)
+## 5. The A/B row — RUN 2026-09-06, verdict B SHIPS
+
+**Result** (`.benchmarks/2026-09-06-kernel-bg-per-queue-ab.md`, the
+A A B B on squeeze-test, 6.19.14 0001–0030 vs +0031, same 1.2.1 `dist`
+daemon): every clause below met on both B boots — the `fuse3-ur`
+worker **17.4 → 14.3 µs per transport op (−18 %)** with
+`native_queued_spin_lock_slowpath` **12.8 % → 0.11 %** of its cycles
+(`_raw_spin_lock` 3.3 → 2.3 %); kern rand-4k **+9.0…+9.4 % IOPS**
+(508–510k → 555–557k; the 60 s sustained row +9.1 % and flat), p50
+−9…−11 %, p99 −13…−17 %; seq 1 MiB par on throughput with p99 −8…−15 %;
+the il control +1.0 % (par — the attribution pin: the shim never enters
+the FUSE request path); box busy −3 points at +9 % delivered; zero
+fuse/io_uring kernel-log lines, no WARN, no lockdep, every daemon
+tripwire 0 on all 14 rows. The rule as written:
 
 **Rig:** `.benchmarks/rigs/2026-09-06-kernel-bg-per-queue-ab.sh` (the
 `2026-09-03-r4-field-abba.sh` / `-field-perf.sh` pattern; reuses

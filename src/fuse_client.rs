@@ -6326,6 +6326,11 @@ pub struct Metrics {
     /// Ahead-of-stall harvests fired by the watermark task (0 under
     /// `SQUEEZEFS_ALLOC_LANE_HARVEST_AHEAD=0` — the ENOSPC-only shape).
     pub alloc_lane_ahead_harvests: Align64<AtomicU64>,
+    /// PUSHED harvests (finding 15 term 2, `SQUEEZEFS_FREE_GRACE_LANE_PUSH`):
+    /// refills a renewal grant's lane-supply hint woke — the co-writer
+    /// engagement instrument beside `free_grace_lane_push_wakes` (0 with
+    /// the lever off, and on every mount that is not a laned co-writer).
+    pub alloc_lane_pushed_harvests: Align64<AtomicU64>,
     /// The derived watermark in force (blocks; `ceil(rate × horizon)`
     /// capped at lane-share/4 — derived, never a knob).
     pub alloc_lane_harvest_watermark: Align64<AtomicU64>,
@@ -11033,6 +11038,9 @@ impl SqueezefsFilesystem {
                 "alloc_lane_ahead_harvests": METRICS
                     .alloc_lane_ahead_harvests
                     .load(Ordering::Relaxed),
+                "alloc_lane_pushed_harvests": METRICS
+                    .alloc_lane_pushed_harvests
+                    .load(Ordering::Relaxed),
                 "alloc_lane_harvest_watermark": METRICS
                     .alloc_lane_harvest_watermark
                     .load(Ordering::Relaxed),
@@ -11995,6 +12003,21 @@ impl SqueezefsFilesystem {
             // exception-free).
             if let Some(reachable) = self.router.backend_router.lane_reachable_blocks_sum() {
                 metrics.insert("alloc_lane_reachable_blocks".to_string(), reachable.into());
+                // Finding 15 term 2 — the lane-visible decomposition
+                // (released → served → visible) and the lane-push lever's
+                // co-writer faces, under the same engagement gate; plus
+                // the authority's held-for-peers supply (foreign-lane
+                // free-listed blocks — what the co-writers' next harvests
+                // will take).
+                if let Some(gauges) = crate::free_grace::lane_visible_stats().as_object() {
+                    for (k, v) in gauges {
+                        metrics.insert(k.clone(), v.clone());
+                    }
+                }
+                metrics.insert(
+                    "alloc_lane_supply_blocks".to_string(),
+                    self.router.backend_router.lane_supply_blocks_sum().into(),
+                );
             }
             // D-3: the stripe-collision census — every striped lock
             // table's width + false-sharing vs same-key contended

@@ -217,6 +217,7 @@ fn bench_member_clock(c: &mut Criterion) {
         d_purge_ms: cl.d_purge.as_millis() as u64,
         renew_ms: cl.renew_interval.as_millis() as u64,
         granted_at_owner_ms: 1_000,
+        lane_supply_blocks: 0,
     };
     let ticks = Arc::new(AtomicU64::new(1_000));
     let clock = LeaseClock::manual(Arc::clone(&ticks));

@@ -302,6 +302,10 @@ impl LeaseFrame {
             d_purge_ms: self.d_purge_ms,
             renew_ms: self.renew_ms,
             granted_at_owner_ms: self.granted_at_owner_ms,
+            // The custody lease carries no lane-supply hint: the hint rides
+            // the MEMBERSHIP renewal (the 1 Hz prodded beat), never this
+            // slower lease.
+            lane_supply_blocks: 0,
         }
     }
 }

@@ -205,7 +205,18 @@ use std::sync::Arc;
 /// malformed). A 12-speaker reads a `Vec` where it expects one call in
 /// either direction — the mismatch refuses loud at the first frame
 /// (KD-7 same-commit fleets).
-pub const PUBLISH_SCHEMA: u32 = 13;
+///
+/// **14 since the harvest reply carries each granted block's release age**
+/// (finding 15 term 2, `.benchmarks/2026-09-06-free-grace-lane-visible.md`):
+/// [`PublishReply::LaneFreeGrant`] gained `release_ages_ms` — per block,
+/// the ms it sat on the authority's free list since its grace release,
+/// measured on the AUTHORITY's clock — so the co-writer can stamp the
+/// `released_served` stage of `alloc_lane_visible_phase_ns` beside its
+/// own round trip without either node reading the other's clock. A
+/// 13-speaker cannot decode the widened reply — the mismatch refuses loud
+/// at the first frame (KD-7 same-commit fleets), the schema-8 posture
+/// verbatim.
+pub const PUBLISH_SCHEMA: u32 = 14;
 
 /// First verb of S9's publish block. S3's ping is 0, S8's metadata verbs
 /// are 16/17, S6's membership owns `0x0100..=0x01FF`, S9's custody
@@ -833,9 +844,17 @@ pub enum PublishReply {
     /// Since schema 8 the reply also carries the authority's live
     /// `free_grace_bound_age_ms` (0 = nothing held), so the co-writer's
     /// refill horizon reads the loop latency actually in force (OQ 2).
+    /// Since schema 14 it also carries, per granted block in `blocks`
+    /// order, the ms that block sat on the authority's free list since
+    /// its grace release (`release_ages_ms`,
+    /// [`crate::free_grace::LANE_RELEASE_AGE_UNPLACED`] = no mark) — the
+    /// lane-visible ledger's `released_served` stage, measured on the
+    /// authority's clock and stamped by the co-writer beside its own
+    /// round trip (finding 15 term 2).
     LaneFreeGrant {
         blocks: Vec<u64>,
         bound_age_ms: u64,
+        release_ages_ms: Vec<u64>,
     },
     /// `block_ref_population`: per-index reference populations summed over
     /// the SERVING node's owned volumes, in request order.
@@ -2944,15 +2963,18 @@ fn free_executor() -> Option<FreeExecutor> {
 
 /// The owner-side lane-free HARVEST executor (rung 10, residual 2):
 /// `(vol_tag, lane, writers, max, lease_epoch)` → the handed-out block
-/// indices ([`crate::cowriter::execute_lane_harvest`] over the authority's
-/// data-plane router).
+/// indices, each with its release age (ms on the authority's list since
+/// its grace release — the lane-visible ledger's `released_served` stage,
+/// finding 15 term 2; [`crate::free_grace::LANE_RELEASE_AGE_UNPLACED`] =
+/// no mark) — [`crate::cowriter::execute_lane_harvest_aged`] over the
+/// authority's data-plane router.
 ///
 /// Installed by the multi-writer AUTHORITY arm beside the free executor —
 /// the two are halves of one rewrite economy: the free RETURNS a co-writer's
 /// displaced offset to the lane's supply, the harvest is what makes that
 /// supply REACHABLE again.
 pub type HarvestExecutor = Arc<
-    dyn Fn(u64, u16, u16, u64, u64) -> Pin<Box<dyn Future<Output = Result<Vec<u64>>> + Send>>
+    dyn Fn(u64, u16, u16, u64, u64) -> Pin<Box<dyn Future<Output = Result<Vec<(u64, u64)>>> + Send>>
         + Send
         + Sync,
 >;
@@ -3081,9 +3103,10 @@ fn extent_flush_executor() -> Option<ExtentFlushExec> {
 /// [`ship_free_blocks`]'s does: `(lease_epoch, request_id)` is the owner's
 /// dedup key — a resend after a lost reply answers the winner's own grant,
 /// and a retry never re-keys across a re-join.
-/// Returns `(handed-out block indices, the authority's bound-age hint in
-/// ms)` — the hint is schema 8's OQ 2 field (0 = the authority's ring
-/// holds nothing; the caller falls back to its derivation).
+/// Returns the grant: the handed-out block indices, the authority's
+/// bound-age hint in ms (schema 8's OQ 2 field — 0 = the authority's ring
+/// holds nothing; the caller falls back to its derivation) and, since
+/// schema 14, each block's release age on the authority's list.
 pub async fn ship_harvest_lane_free(
     endpoint: &str,
     vol_tag: u64,
@@ -3092,7 +3115,7 @@ pub async fn ship_harvest_lane_free(
     max: u64,
     lease_epoch: u64,
     request_id: u64,
-) -> Result<(Vec<u64>, u64)> {
+) -> Result<LaneFreeGrant> {
     let Some(client) = CLIENT.load_full() else {
         REFUSALS.fetch_add(1, Ordering::Relaxed);
         let msg = format!(
@@ -3114,9 +3137,14 @@ pub async fn ship_harvest_lane_free(
         PublishReply::LaneFreeGrant {
             blocks,
             bound_age_ms,
+            release_ages_ms,
         } => {
             HARVEST_SHIPPED_BLOCKS.fetch_add(blocks.len() as u64, Ordering::Relaxed);
-            Ok((blocks, bound_age_ms))
+            Ok(LaneFreeGrant {
+                blocks,
+                bound_age_ms,
+                release_ages_ms,
+            })
         }
         other => Err(protocol_error(
             "harvest_lane_free",
@@ -3124,6 +3152,20 @@ pub async fn ship_harvest_lane_free(
             "a lane free grant",
         )),
     }
+}
+
+/// A shipped lane-free harvest's answer ([`ship_harvest_lane_free`]): the
+/// [`PublishReply::LaneFreeGrant`] fields, owned.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LaneFreeGrant {
+    /// The handed-out block indices of the caller's lane.
+    pub blocks: Vec<u64>,
+    /// The authority's live `free_grace_bound_age_ms` (0 = nothing held).
+    pub bound_age_ms: u64,
+    /// Per block in `blocks` order: ms on the authority's free list since
+    /// its grace release ([`crate::free_grace::LANE_RELEASE_AGE_UNPLACED`]
+    /// = no mark).
+    pub release_ages_ms: Vec<u64>,
 }
 
 /// Count `blocks` abandoned shipped frees (`free_ship_failures` — the
@@ -3456,7 +3498,7 @@ pub struct PublishService {
     /// The HARVEST verb's exactly-once witness — the same pattern, its own
     /// window (a grant and a verdict list are different outcomes; sharing
     /// one window would make their id spaces collide).
-    harvest_dedup: DedupWindow<std::result::Result<Vec<u64>, WireError>>,
+    harvest_dedup: DedupWindow<std::result::Result<Vec<(u64, u64)>, WireError>>,
     self_ref: std::sync::OnceLock<std::sync::Weak<PublishService>>,
 }
 
@@ -4293,9 +4335,9 @@ impl PublishService {
                 )
                 .await
                 {
-                    Ok(Ok(idxs)) => {
-                        HARVEST_SERVED_BLOCKS.fetch_add(idxs.len() as u64, Ordering::Relaxed);
-                        Ok(idxs)
+                    Ok(Ok(aged)) => {
+                        HARVEST_SERVED_BLOCKS.fetch_add(aged.len() as u64, Ordering::Relaxed);
+                        Ok(aged)
                     }
                     Ok(Err(e)) => Err(WireError::from_error(&e)),
                     Err(e) => {
@@ -4316,10 +4358,15 @@ impl PublishService {
         // OQ 2 (schema 8): the reply carries the authority's LIVE bound
         // age — the loop latency in force — so the co-writer's refill
         // horizon is a measurement (0 = nothing held, and the ship side
-        // then keeps its derivation).
-        PublishCallOutcome::Done(outcome.map(|blocks| PublishReply::LaneFreeGrant {
-            blocks,
-            bound_age_ms: crate::free_grace::bound_age_ms(),
+        // then keeps its derivation). Schema 14: each block's release age
+        // beside it (the lane-visible ledger's authority-clock stage).
+        PublishCallOutcome::Done(outcome.map(|aged| {
+            let (blocks, release_ages_ms) = aged.into_iter().unzip();
+            PublishReply::LaneFreeGrant {
+                blocks,
+                bound_age_ms: crate::free_grace::bound_age_ms(),
+                release_ages_ms,
+            }
         }))
     }
 

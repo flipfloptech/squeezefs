@@ -1398,7 +1398,7 @@ async fn a_harvested_offset_published_then_displaced_frees_and_is_reharvested() 
         // HARVEST: the authority hands out the lane's free supply; the
         // co-writer adopts it and its free-list-first funnel serves one.
         request_id += 1;
-        let (got, _hint) = publish::ship_harvest_lane_free(
+        let got = publish::ship_harvest_lane_free(
             &auth.endpoint,
             tag,
             lane_id as u16,
@@ -1408,7 +1408,8 @@ async fn a_harvested_offset_published_then_displaced_frees_and_is_reharvested() 
             request_id,
         )
         .await
-        .expect("the harvest ships");
+        .expect("the harvest ships")
+        .blocks;
         assert!(
             !got.is_empty(),
             "{shape} round {round}: the lane has harvestable supply"

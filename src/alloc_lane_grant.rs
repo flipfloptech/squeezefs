@@ -346,19 +346,35 @@ pub async fn engage_allocator_lane(
         // the loop's answers changes faster). Exits when the allocator
         // drops (the Weak upgrade fails) — nothing joins it, so
         // `detached::contain` owns its panic accounting (RES-8).
+        //
+        // The lane-push lever (finding 15 term 2): the tick ALSO parks
+        // on the lane-supply wake — a renewal grant saying this lane has
+        // supply on the authority's list runs the PUSHED refill at once
+        // (owed ⇒ harvest, the watermark not consulted), so the refill
+        // rides the renewal round trip instead of this cadence. With the
+        // lever off nothing ever notifies and the loop is the shipped tick
+        // verbatim.
         let weak = Arc::downgrade(alloc);
         crate::meta_exec::spawn_meta_join("alloc_lane_ahead_refill", async move {
             let origin = std::time::Instant::now();
             loop {
-                squeezefs_ipc::sqz_time::sleep(std::time::Duration::from_millis(
-                    crate::meta_backend::kv::checkpoint::CHECKPOINT_MAX_AGE_MS as u64,
-                ))
-                .await;
+                let pushed = squeezefs_ipc::sqz_time::timeout(
+                    std::time::Duration::from_millis(
+                        crate::meta_backend::kv::checkpoint::CHECKPOINT_MAX_AGE_MS as u64,
+                    ),
+                    crate::free_grace::lane_supply_wake().notified(),
+                )
+                .await
+                .is_ok();
                 let Some(alloc) = weak.upgrade() else {
                     return;
                 };
                 let now_ms = origin.elapsed().as_millis() as u64;
-                let _ = alloc.ahead_refill_tick(now_ms).await;
+                if pushed {
+                    let _ = alloc.pushed_refill_tick(now_ms).await;
+                } else {
+                    let _ = alloc.ahead_refill_tick(now_ms).await;
+                }
             }
         });
     }

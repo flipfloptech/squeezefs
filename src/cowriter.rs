@@ -1987,6 +1987,28 @@ pub async fn execute_lane_harvest(
     max: u64,
     lease_epoch: u64,
 ) -> Result<Vec<u64>> {
+    Ok(
+        execute_lane_harvest_aged(backend, vol_tag, lane, writers, max, lease_epoch)
+            .await?
+            .into_iter()
+            .map(|(idx, _age)| idx)
+            .collect(),
+    )
+}
+
+/// [`execute_lane_harvest`] with each handed-out block's RELEASE AGE — the
+/// ms it sat on this authority's free list since its grace release
+/// ([`crate::free_grace::take_lane_release`]; the lane-visible ledger's
+/// `released_served` stage, finding 15 term 2) — the form the
+/// [`crate::meta_ship::publish::HarvestExecutor`] carries onto the reply.
+pub async fn execute_lane_harvest_aged(
+    backend: &Arc<crate::routing::BackendRouter>,
+    vol_tag: u64,
+    lane: u16,
+    writers: u16,
+    max: u64,
+    lease_epoch: u64,
+) -> Result<Vec<(u64, u64)>> {
     let Some((_be_id, alloc)) = backend.allocator_for_volume_tag(vol_tag) else {
         return Err(SqueezefsError::InvalidOperation(format!(
             "S9: a lane free harvest names data volume tag {vol_tag:#016x}, which this \
@@ -1997,7 +2019,7 @@ pub async fn execute_lane_harvest(
     let backend = Arc::clone(backend);
     with_authority_accounting(async move {
         let max = max.max(1) as usize;
-        let mut out: Vec<u64> = Vec::new();
+        let mut out: Vec<(u64, u64)> = Vec::new();
         for pass in 0..3u8 {
             // Finding 15 (`.benchmarks/2026-08-25-s11-freeloop-stall.md`):
             // this is a REMOTE allocation funnel, so it runs the same
@@ -2030,31 +2052,17 @@ pub async fn execute_lane_harvest(
                     alloc.harvest_grace_pressure();
                 }
             }
-            let mut candidates: Vec<u64> = alloc
-                .free_block_indices()
-                .into_iter()
-                .filter(|idx| {
-                    crate::data_alloc_lane::block_lane_of(*idx, writers) == u64::from(lane)
-                })
-                .collect();
-            // Lowest-first: deterministic, and it keeps the handed-out run
-            // as dense as a strided lane allows (the contiguity posture).
-            candidates.sort_unstable();
-            for idx in candidates {
-                if out.len() >= max {
-                    break;
-                }
-                if alloc.take_free_for_lane_grant(idx) {
-                    out.push(idx);
-                }
-            }
+            // Lowest-first, exactly-once, each with its release age (the
+            // allocator's own pass — the lane-visible ledger's authority
+            // stage is stamped inside it).
+            out = alloc.take_lane_free_blocks(lane, writers, max);
             if !out.is_empty() {
                 break;
             }
         }
         if !out.is_empty() {
             let chunk = alloc.chunk_size();
-            let offsets: Vec<u64> = out.iter().map(|idx| idx * chunk).collect();
+            let offsets: Vec<u64> = out.iter().map(|(idx, _)| idx * chunk).collect();
             crate::data_grant::note_lane_handouts(lease_epoch, &offsets);
             log::info!(
                 "S9: lane free harvest served {} block(s) of lane {lane}/{writers} on vol_tag \
@@ -2080,7 +2088,7 @@ pub fn router_harvest_executor(
         move |vol_tag: u64, lane: u16, writers: u16, max: u64, lease_epoch: u64| {
             let backend = Arc::clone(&backend);
             Box::pin(async move {
-                execute_lane_harvest(&backend, vol_tag, lane, writers, max, lease_epoch).await
+                execute_lane_harvest_aged(&backend, vol_tag, lane, writers, max, lease_epoch).await
             })
         },
     )

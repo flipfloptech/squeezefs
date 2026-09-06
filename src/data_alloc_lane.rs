@@ -510,6 +510,12 @@ pub struct LaneHarvest {
     pub bound_age_hint_ms: u64,
     /// This harvest's measured round trip, ms.
     pub rtt_ms: u64,
+    /// Per granted block, in `blocks` order: ms it sat on the authority's
+    /// free list since its grace release, as the AUTHORITY measured it
+    /// (`crate::free_grace::LANE_RELEASE_AGE_UNPLACED` = no release mark)
+    /// — the lane-visible ledger's `released_served` stage (finding 15
+    /// term 2). Empty from a sink that carries none.
+    pub release_ages_ms: Vec<u64>,
 }
 
 pub type LaneHarvestSink = Arc<
@@ -552,11 +558,12 @@ pub fn routed_harvest_sink(volume_id: &str, part: AppendPartition) -> LaneHarves
                 )
                 .await
                 {
-                    Ok((blocks, bound_age_hint_ms)) => {
+                    Ok(grant) => {
                         return Ok(LaneHarvest {
-                            blocks,
-                            bound_age_hint_ms,
+                            blocks: grant.blocks,
+                            bound_age_hint_ms: grant.bound_age_ms,
                             rtt_ms: t0.elapsed().as_millis() as u64,
+                            release_ages_ms: grant.release_ages_ms,
                         });
                     }
                     Err(e) => {

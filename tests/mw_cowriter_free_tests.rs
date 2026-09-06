@@ -1758,9 +1758,10 @@ async fn a_harvest_is_exactly_once_lane_scoped_and_quarantines_undischarged_hand
     );
 
     // The harvest: lane-scoped, exactly-once, removed from the source list.
-    let (got, _hint) = publish::ship_harvest_lane_free(&auth.endpoint, tag, 1, 2, 16, epoch, 9001)
+    let got = publish::ship_harvest_lane_free(&auth.endpoint, tag, 1, 2, 16, epoch, 9001)
         .await
-        .expect("the harvest ships");
+        .expect("the harvest ships")
+        .blocks;
     assert!(got.contains(&a_idx), "the lane-1 supply came back: {got:?}");
     assert!(got.iter().all(|i| lane::block_lane_of(*i, 2) == 1));
     assert!(
@@ -1770,10 +1771,10 @@ async fn a_harvest_is_exactly_once_lane_scoped_and_quarantines_undischarged_hand
 
     // Replay (the lost-reply retry): the SAME witness answers the SAME grant.
     let replays_before = publish::stats().harvest_replays;
-    let (again, _hint) =
-        publish::ship_harvest_lane_free(&auth.endpoint, tag, 1, 2, 16, epoch, 9001)
-            .await
-            .expect("the replay is absorbed");
+    let again = publish::ship_harvest_lane_free(&auth.endpoint, tag, 1, 2, 16, epoch, 9001)
+        .await
+        .expect("the replay is absorbed")
+        .blocks;
     assert_eq!(
         again, got,
         "the dedup window answered the winner's own grant"
@@ -1781,10 +1782,10 @@ async fn a_harvest_is_exactly_once_lane_scoped_and_quarantines_undischarged_hand
     assert_eq!(publish::stats().harvest_replays - replays_before, 1);
 
     // A fresh id finds the supply gone.
-    let (empty, _hint) =
-        publish::ship_harvest_lane_free(&auth.endpoint, tag, 1, 2, 16, epoch, 9002)
-            .await
-            .expect("the second harvest ships");
+    let empty = publish::ship_harvest_lane_free(&auth.endpoint, tag, 1, 2, 16, epoch, 9002)
+        .await
+        .expect("the second harvest ships")
+        .blocks;
     assert!(empty.is_empty(), "exactly-once: {empty:?}");
 
     // DISCHARGE: the co-writer reuses A, rewrites away again, and ships its
@@ -1831,9 +1832,10 @@ async fn a_harvest_is_exactly_once_lane_scoped_and_quarantines_undischarged_hand
     // Harvest A once more and let the epoch DIE with the handout
     // undischarged: A must be named in the death cohort (the quarantine's
     // input), exactly like a declared in-flight destination.
-    let (got2, _hint) = publish::ship_harvest_lane_free(&auth.endpoint, tag, 1, 2, 16, epoch, 9003)
+    let got2 = publish::ship_harvest_lane_free(&auth.endpoint, tag, 1, 2, 16, epoch, 9003)
         .await
-        .expect("the third harvest ships");
+        .expect("the third harvest ships")
+        .blocks;
     assert!(got2.contains(&a_idx));
     let dead = auth
         .owner
@@ -2959,9 +2961,10 @@ async fn the_owed_ledger_tracks_freed_verdicts_and_harvest_adoptions() {
     assert!(auth.free_listed(a_idx), "the supply sits on the authority");
     let epoch = cwr.client.lease_epoch();
     let tag = volume_tag(DATA_VOL);
-    let (got, _hint) = publish::ship_harvest_lane_free(&auth.endpoint, tag, 1, 2, 16, epoch, 9101)
+    let got = publish::ship_harvest_lane_free(&auth.endpoint, tag, 1, 2, 16, epoch, 9101)
         .await
-        .expect("the harvest ships");
+        .expect("the harvest ships")
+        .blocks;
     assert!(got.contains(&a_idx));
     assert_eq!(cwr.alloc.adopt_lane_free_grant(&got), got.len() as u64);
     assert_eq!(
@@ -3198,13 +3201,21 @@ async fn the_harvest_reply_carries_the_authoritys_bound_age() {
     // force-release the offset (rung c) and the hint would honestly read
     // a drained ring's 0.
     st.ticks.store(14_000, Ordering::SeqCst);
-    let (_blocks, hint) =
+    let grant =
         publish::ship_harvest_lane_free(&st.auth.endpoint, tag, 1, 2, 8, st.lease_epoch, 9201)
             .await
             .expect("the harvest ships");
+    let hint = grant.bound_age_ms;
     assert!(
         hint >= 10_000,
         "the reply's hint is the authority's live bound age (got {hint})"
+    );
+    // Schema 14 (finding 15 term 2): one release age per granted block,
+    // in block order — the lane-visible ledger's authority-clock stage.
+    assert_eq!(
+        grant.release_ages_ms.len(),
+        grant.blocks.len(),
+        "the reply carries one release age per granted block"
     );
 }
 

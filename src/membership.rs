@@ -1243,6 +1243,16 @@ pub struct Grant {
     /// member NEVER anchors on a foreign clock's value; it anchors on its
     /// own send instant).
     pub granted_at_owner_ms: u64,
+    /// **The lane-supply hint** (finding 15 term 2, the lane-push lever):
+    /// on a RENEWAL grant to a co-writer, the blocks of that member's
+    /// data-plane allocation lane sitting on the authority's free lists —
+    /// released from the freed-offset grace period, unserved, reachable by
+    /// that member alone. A nonzero hint wakes the member's lane refill at
+    /// once ([`crate::free_grace::note_lane_supply_hint`]). 0 on a join
+    /// grant, to a reader, with the lever off, and on every authority
+    /// that runs no partition. A HINT, never a grant: the blocks travel
+    /// only on the harvest verb, under the lane checks it already runs.
+    pub lane_supply_blocks: u64,
 }
 
 impl Grant {
@@ -1468,6 +1478,7 @@ impl MembershipOwner {
             d_purge_ms: self.clocks.d_purge.as_millis() as u64,
             renew_ms: self.clocks.renew_interval.as_millis() as u64,
             granted_at_owner_ms: now,
+            lane_supply_blocks: 0,
         }
     }
 
@@ -1692,6 +1703,11 @@ impl MembershipOwner {
         if let Some(prod_ms) = crate::free_grace::take_prod_cadence(seen_acked) {
             grant.renew_ms = prod_ms;
         }
+        // The lane-push lever's wire half (finding 15 term 2): this
+        // member's lane supply on the authority's free lists — O(1) per
+        // volume through the installed source, never a scan (KD-FG-4); 0
+        // on every mount that is not a partitioned authority.
+        grant.lane_supply_blocks = crate::free_grace::lane_supply_for_member(id);
         RenewOutcome::Renewed(grant)
     }
 
@@ -2126,6 +2142,9 @@ impl MemberSession {
         // checkpoint ceiling; a routine value clamps to the routine pass
         // interval and is inert. No wire field, no push channel.
         crate::free_grace::note_prodded_renewal(grant.renew_ms, anchor_ms);
+        // The lane-push lever (finding 15 term 2): the grant's lane-supply
+        // hint wakes this co-writer's refill at once.
+        crate::free_grace::note_lane_supply_hint(grant.lane_supply_blocks);
     }
 
     /// Adopt a CARRIAGE renewal's grant (hold-time lever (b) — the renewal
@@ -2142,6 +2161,7 @@ impl MemberSession {
             anchor_ms,
         );
         crate::free_grace::note_prodded_renewal(grant.renew_ms, anchor_ms);
+        crate::free_grace::note_lane_supply_hint(grant.lane_supply_blocks);
     }
 
     /// §6.8 item 3: the label last learned from the owner and the

@@ -415,6 +415,7 @@ enum ArbReply {
     LaneFreeGrant {
         blocks: Vec<u64>,
         bound_age_ms: u64,
+        release_ages_ms: Vec<u64>,
     },
     Populations(Vec<u64>),
     MapMigrated {
@@ -517,9 +518,11 @@ fn reply_from(r: ArbReply) -> PublishReply {
         ArbReply::LaneFreeGrant {
             blocks,
             bound_age_ms,
+            release_ages_ms,
         } => PublishReply::LaneFreeGrant {
             blocks,
             bound_age_ms,
+            release_ages_ms,
         },
         ArbReply::Populations(p) => PublishReply::Populations(p),
         ArbReply::MapMigrated {

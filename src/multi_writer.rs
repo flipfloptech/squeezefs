@@ -492,6 +492,8 @@ impl MultiWriterArm {
         // assembler refuses loud rather than acking bytes nobody merges).
         publish::uninstall_free_executor();
         publish::uninstall_harvest_executor();
+        crate::free_grace::uninstall_release_hook();
+        crate::free_grace::uninstall_lane_supply_source();
         publish::uninstall_extent_merge_executor();
         publish::uninstall_extent_flush_executor();
         publish::uninstall_served_layout_invalidation();
@@ -583,6 +585,47 @@ pub async fn arm_mount_multi_writer(
         return Ok(None);
     }
     arm_multi_writer(meta, data_paths, read_only, quarantine, backend, pv).await
+}
+
+/// The authority's release-on-ack hook over its data router (the
+/// lane-push lever's authority half — [`crate::free_grace::ReleaseHook`]):
+/// every allocator's grace ring harvested to its uncovered front. RAM
+/// only; installed beside the harvest executor.
+pub fn release_hook(backend: Arc<crate::routing::BackendRouter>) -> crate::free_grace::ReleaseHook {
+    Arc::new(move || {
+        for alloc in backend.lane_allocators() {
+            alloc.harvest_grace_to_front();
+        }
+    })
+}
+
+/// The authority's per-member lane-supply source (the lever's wire half —
+/// [`crate::free_grace::LaneSupplySource`]): a member id → its lane under
+/// this era's assignment → the sum over this router's allocators of that
+/// lane's free-listed population (the free set's per-lane counters). A
+/// member with no lane (a reader, an unknown id) reads 0.
+pub fn lane_supply_source(
+    backend: Arc<crate::routing::BackendRouter>,
+    assignment: Arc<crate::alloc_lane_grant::LaneAssignment>,
+) -> crate::free_grace::LaneSupplySource {
+    Arc::new(move |member_id: &str| {
+        let Some(lane) = assignment.lane_of(member_id) else {
+            return 0;
+        };
+        // The default slot aliases the first registered backend on real
+        // mounts (the `lane_reachable_blocks_sum` dedup): count each
+        // allocator once.
+        let mut seen: Vec<Arc<crate::block_allocator::BlockAllocator>> = Vec::new();
+        let mut sum = 0u64;
+        for alloc in backend.lane_allocators() {
+            if seen.iter().any(|s| Arc::ptr_eq(s, &alloc)) {
+                continue;
+            }
+            sum = sum.saturating_add(alloc.lane_free_count(lane));
+            seen.push(alloc);
+        }
+        sum
+    })
 }
 
 /// **Arm the multi-writer planes, or refuse naming what is missing.**
@@ -884,12 +927,26 @@ pub async fn arm_multi_writer(
         publish::install_harvest_executor(crate::cowriter::router_harvest_executor(Arc::clone(
             backend,
         )));
+        // The lane-push lever's authority half (finding 15 term 2,
+        // `.benchmarks/2026-09-06-free-grace-lane-visible.md`): a binding
+        // acknowledgement releases the covered offsets on arrival (every
+        // ring harvested to its uncovered front), and the renewal grant
+        // carries each co-writer's lane supply — the blocks of its lane
+        // on these free lists, read off the free set's per-lane counters
+        // (O(volumes) loads in the renewal hot op, never a scan).
+        crate::free_grace::install_release_hook(release_hook(Arc::clone(backend)));
+        crate::free_grace::install_lane_supply_source(lane_supply_source(
+            Arc::clone(backend),
+            Arc::clone(&assignment),
+        ));
         if let Err(e) =
             crate::alloc_lane_grant::engage_authority_lanes(authority_lane, backend, meta).await
         {
             crate::alloc_lane_grant::uninstall_frontier_source();
             publish::uninstall_free_executor();
             publish::uninstall_harvest_executor();
+            crate::free_grace::uninstall_release_hook();
+            crate::free_grace::uninstall_lane_supply_source();
             if let Some(hold) = wero {
                 data_custody::release_hold(hold).await;
             }

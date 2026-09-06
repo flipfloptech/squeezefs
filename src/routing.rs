@@ -3591,6 +3591,25 @@ impl BackendRouter {
         )
     }
 
+    /// Free-listed blocks in lanes this mount does NOT own, summed over
+    /// its allocators (deduplicated like [`Self::lane_reachable_blocks_sum`])
+    /// — on an authority, the supply it holds FOR its co-writers
+    /// (`alloc_lane_supply_blocks`, finding 15 term 2). 0 unpartitioned.
+    pub fn lane_supply_blocks_sum(&self) -> u64 {
+        let mut allocs: Vec<std::sync::Arc<crate::block_allocator::BlockAllocator>> =
+            vec![self.default_allocator.clone()];
+        for entry in self.backends.iter() {
+            let a = entry.value().block_allocator.clone();
+            if !allocs.iter().any(|seen| std::sync::Arc::ptr_eq(seen, &a)) {
+                allocs.push(a);
+            }
+        }
+        allocs
+            .iter()
+            .map(|a| a.foreign_lane_free_blocks())
+            .fold(0u64, u64::saturating_add)
+    }
+
     pub fn allocator_for_volume_tag(
         &self,
         vol_tag: u64,

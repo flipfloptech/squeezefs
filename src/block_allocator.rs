@@ -464,6 +464,12 @@ struct LaneCountedSet {
     set: dashmap::DashSet<u64>,
     /// Free-listed blocks in lanes this mount owns.
     lane_owned: AtomicU64,
+    /// Free-listed blocks PER LANE (finding 15 term 2 — the lane-supply
+    /// hint's O(1) input: a co-writer's renewal grant carries its lane's
+    /// count, so this is what keeps the count out of the renewal hot op
+    /// and off the free-list scan). Maintained beside `lane_owned` by the
+    /// same insert/remove deltas; meaningful only when `writers > 0`.
+    per_lane: [AtomicU64; crate::alloc_lane_grant::MAX_LANES as usize],
     /// Partition width in force (0 = unpartitioned — everything is ours).
     writers: AtomicU64,
     /// Owned-lane bitmask (meaningful only when `writers > 0`).
@@ -471,24 +477,37 @@ struct LaneCountedSet {
 }
 
 impl LaneCountedSet {
+    /// The lane of `idx` under the partition in force (`None` when
+    /// unpartitioned).
     #[inline]
-    fn is_ours(&self, idx: u64) -> bool {
+    fn lane_of(&self, idx: u64) -> Option<usize> {
         let writers = self.writers.load(Ordering::Acquire);
         if writers == 0 {
-            return true;
+            return None;
         }
-        self.owned_mask.load(Ordering::Acquire)
-            & (1u64 << crate::data_alloc_lane::block_lane_of(idx, writers as u16))
-            != 0
+        Some(crate::data_alloc_lane::block_lane_of(idx, writers as u16) as usize)
+    }
+
+    #[inline]
+    fn is_ours(&self, idx: u64) -> bool {
+        match self.lane_of(idx) {
+            None => true,
+            Some(lane) => self.owned_mask.load(Ordering::Acquire) & (1u64 << lane) != 0,
+        }
     }
 
     /// `DashSet::insert` shape: `true` ⇔ newly inserted (and then, and only
-    /// then, the lane-owned count moves — each mutator adjusts by exactly
-    /// its own membership delta, so the count stays exact under races).
+    /// then, the lane counts move — each mutator adjusts by exactly its own
+    /// membership delta, so the counts stay exact under races).
     fn insert(&self, idx: u64) -> bool {
         let new = self.set.insert(idx);
-        if new && self.is_ours(idx) {
-            self.lane_owned.fetch_add(1, Ordering::AcqRel);
+        if new {
+            if let Some(lane) = self.lane_of(idx) {
+                self.per_lane[lane].fetch_add(1, Ordering::AcqRel);
+            }
+            if self.is_ours(idx) {
+                self.lane_owned.fetch_add(1, Ordering::AcqRel);
+            }
         }
         new
     }
@@ -496,10 +515,24 @@ impl LaneCountedSet {
     /// `DashSet::remove` shape: `Some` ⇔ this caller removed it.
     fn remove(&self, idx: &u64) -> Option<u64> {
         let out = self.set.remove(idx);
-        if out.is_some() && self.is_ours(*idx) {
-            self.lane_owned.fetch_sub(1, Ordering::AcqRel);
+        if out.is_some() {
+            if let Some(lane) = self.lane_of(*idx) {
+                self.per_lane[lane].fetch_sub(1, Ordering::AcqRel);
+            }
+            if self.is_ours(*idx) {
+                self.lane_owned.fetch_sub(1, Ordering::AcqRel);
+            }
         }
         out
+    }
+
+    /// The free-listed population of one lane (0 unpartitioned).
+    #[inline]
+    fn lane_count(&self, lane: u16) -> u64 {
+        self.per_lane
+            .get(lane as usize)
+            .map(|c| c.load(Ordering::Acquire))
+            .unwrap_or(0)
     }
 
     #[inline]
@@ -525,8 +558,20 @@ impl LaneCountedSet {
     fn set_partition(&self, writers: u16, owned_mask: u64) {
         self.writers.store(u64::from(writers), Ordering::Release);
         self.owned_mask.store(owned_mask, Ordering::Release);
-        let count = self.set.iter().filter(|idx| self.is_ours(**idx)).count() as u64;
-        self.lane_owned.store(count, Ordering::Release);
+        let mut per_lane = [0u64; crate::alloc_lane_grant::MAX_LANES as usize];
+        let mut owned = 0u64;
+        for idx in self.set.iter() {
+            if let Some(lane) = self.lane_of(*idx) {
+                per_lane[lane] += 1;
+            }
+            if self.is_ours(*idx) {
+                owned += 1;
+            }
+        }
+        for (c, n) in self.per_lane.iter().zip(per_lane) {
+            c.store(n, Ordering::Release);
+        }
+        self.lane_owned.store(owned, Ordering::Release);
     }
 
     /// The lane-owned free-list population (the counting half of the
@@ -810,19 +855,14 @@ impl BlockAllocator {
     /// Free blocks this mount can never hand out because they belong to
     /// lanes it does not own — the number the ENOSPC refusal prints, and
     /// what an operator reads when "the device has space but writes fail".
-    /// `0` when unpartitioned.
+    /// `0` when unpartitioned. On an authority this is also the supply it
+    /// holds FOR its co-writers (`alloc_lane_supply_blocks`) — read off the
+    /// free set's maintained counts, never a scan.
     pub fn foreign_lane_free_blocks(&self) -> u64 {
-        let Some(lanes) = self.lanes.get() else {
+        if self.lanes.get().is_none() {
             return 0;
-        };
-        let owned = lanes.owned.load(Ordering::Acquire);
-        let writers = lanes.part.writers();
-        self.free_blocks
-            .iter()
-            .filter(|idx| {
-                owned & (1u64 << crate::data_alloc_lane::block_lane_of(**idx, writers)) == 0
-            })
-            .count() as u64
+        }
+        (self.free_blocks.len() as u64).saturating_sub(self.free_blocks.lane_owned())
     }
 
     /// `true` ⇔ `block_idx` is in a lane this mount may mint in (always
@@ -1059,7 +1099,7 @@ impl BlockAllocator {
                 if self.grace.defer(*offset, self.chunk_size) {
                     self.harvest_grace();
                 } else {
-                    self.publish_free_list(*offset);
+                    self.publish_grace_release(*offset);
                 }
             }
         }
@@ -1298,6 +1338,31 @@ impl BlockAllocator {
     /// C6-style per-lane recount.
     pub fn lane_owned_free_blocks(&self) -> u64 {
         self.free_blocks.lane_owned()
+    }
+
+    /// The free-listed population of one lane (finding 15 term 2 — the
+    /// lane-supply hint's input): on an authority, lane `w`'s count is the
+    /// supply released to co-writer `w` that its next harvest RPC will
+    /// take. 0 unpartitioned.
+    pub fn lane_free_count(&self, lane: u16) -> u64 {
+        self.free_blocks.lane_count(lane)
+    }
+
+    /// This volume's durable tag (the lane-visible ledger's key half).
+    fn vol_tag(&self) -> u64 {
+        crate::meta_backend::kv::block_refs::volume_tag(&self._volume_id)
+    }
+
+    /// Publish one grace-released offset to the free list and, when it is
+    /// a co-writer's (a lane this mount does not own), mark its release
+    /// for the lane-visible ledger (`alloc_lane_visible_phase_ns`): the
+    /// block now waits on THIS list for that co-writer's harvest RPC.
+    fn publish_grace_release(&self, offset: u64) {
+        self.publish_free_list(offset);
+        let idx = offset / self.chunk_size;
+        if self.lanes.get().is_some() && !self.lane_is_ours(idx) {
+            crate::free_grace::mark_lane_release(self.vol_tag(), idx);
+        }
     }
 
     /// **The lane-reachable supply** (design-free-grace-sustain §5.4/§8):
@@ -1913,6 +1978,31 @@ impl BlockAllocator {
         self.harvest_lane_supply().await
     }
 
+    /// **The PUSHED refill** (finding 15 term 2, the lane-push lever's
+    /// co-writer half): the authority's renewal grant said this lane has
+    /// supply on its list and this allocator is OWED blocks — harvest NOW,
+    /// on the wake, instead of at the next watermark tick (which a quiet
+    /// lane's decayed rate turns dark) or the next ENOSPC. The SAME harvest
+    /// (sink → adopt → hint deposit); the decision is
+    /// [`crate::free_grace::lane_push_wants_harvest`]. Returns the count
+    /// adopted (0 = the decision declined, or an empty grant).
+    pub async fn pushed_refill_tick(&self, now_ms: u64) -> u64 {
+        self.sample_alloc_rate(now_ms);
+        if self.lanes.get().and_then(|l| l.harvest.get()).is_none() {
+            return 0;
+        }
+        if !crate::free_grace::lane_push_wants_harvest(
+            crate::free_grace::lane_supply_hint(),
+            self.lane_owed_blocks(),
+        ) {
+            return 0;
+        }
+        crate::fuse_client::METRICS
+            .alloc_lane_pushed_harvests
+            .fetch_add(1, Ordering::Relaxed);
+        self.harvest_lane_supply().await
+    }
+
     /// **The lane free harvest** (rung 10): when this mount's lane is
     /// exhausted, ask the authority for the lane's freed supply — the
     /// offsets this mount's own shipped frees returned to "the free supply
@@ -1963,7 +2053,16 @@ impl BlockAllocator {
                 // OQ 2: every harvest reply refreshes the refill horizon —
                 // the measured loop latency plus this trip's own RTT.
                 self.note_harvest_hint(harvest.bound_age_hint_ms, harvest.rtt_ms);
-                self.adopt_lane_free_grant(&harvest.blocks)
+                let adopted = self.adopt_lane_free_grant(&harvest.blocks);
+                // The lane-visible ledger's co-writer half (finding 15
+                // term 2): each adopted block's wait on the authority's
+                // list (as the authority measured it) beside this trip's
+                // own round trip — the instant of adoption is the instant
+                // the allocator can mint it.
+                for age in &harvest.release_ages_ms {
+                    crate::free_grace::note_lane_visible(*age, harvest.rtt_ms);
+                }
+                adopted
             }
             Err(e) => {
                 log::warn!(
@@ -2353,7 +2452,17 @@ impl BlockAllocator {
                     }
                     let slice = crate::free_grace::pressure_park_slice_ms();
                     crate::free_grace::note_pressure_park();
-                    squeezefs_ipc::sqz_time::sleep(std::time::Duration::from_millis(slice)).await;
+                    // The lane-push lever (finding 15 term 2): a renewal
+                    // grant's lane-supply hint ends the slice at once, so
+                    // the retry's harvest runs on the hint's heels rather
+                    // than at the slice's own cadence. Inert with the lever
+                    // off (nothing ever notifies) and on every mount that
+                    // is not a co-writer.
+                    let _ = squeezefs_ipc::sqz_time::timeout(
+                        std::time::Duration::from_millis(slice),
+                        crate::free_grace::lane_supply_wake().notified(),
+                    )
+                    .await;
                 }
                 other => return other,
             }
@@ -2852,8 +2961,68 @@ impl BlockAllocator {
             self.grace
                 .harvest_with_supply(crate::free_grace::HARVEST_BATCH, supply, lane_reachable)
         {
-            self.publish_free_list(offset);
+            self.publish_grace_release(offset);
         }
+    }
+
+    /// **The release-on-ack harvest** (finding 15 term 2, the lane-push
+    /// lever's authority half — `crate::free_grace::ReleaseHook`): the
+    /// routine harvest repeated until the ring's front is uncovered, so a
+    /// binding acknowledgement releases EVERY offset it covered, not the
+    /// first batch. Bounded by the covered population (each pass pops ≤
+    /// `HARVEST_BATCH`, and a pass that pops fewer has reached the front).
+    pub fn harvest_grace_to_front(&self) {
+        loop {
+            if self.grace.is_empty() {
+                return;
+            }
+            let supply = self.grace_supply_blocks();
+            let lane_reachable = self.lane_reachable_blocks();
+            let released = self.grace.harvest_with_supply(
+                crate::free_grace::HARVEST_BATCH,
+                supply,
+                lane_reachable,
+            );
+            let n = released.len();
+            for offset in released {
+                self.publish_grace_release(offset);
+            }
+            if n < crate::free_grace::HARVEST_BATCH {
+                return;
+            }
+        }
+    }
+
+    /// **Take up to `max` free-listed blocks of lane `lane`/`writers` for a
+    /// lane-harvest handout** (the AUTHORITY side of
+    /// `crate::cowriter::execute_lane_harvest`, one pass): lowest-first
+    /// (deterministic, and as dense as a strided lane allows), each removed
+    /// through [`Self::take_free_for_lane_grant`] (exactly-once), each with
+    /// its release AGE for the lane-visible ledger — ms the block sat on
+    /// this list since its grace release, or
+    /// [`crate::free_grace::LANE_RELEASE_AGE_UNPLACED`] for a block that
+    /// reached the list some other way.
+    pub fn take_lane_free_blocks(&self, lane: u16, writers: u16, max: usize) -> Vec<(u64, u64)> {
+        let mut candidates: Vec<u64> = self
+            .free_blocks
+            .iter()
+            .map(|item| *item)
+            .filter(|idx| crate::data_alloc_lane::block_lane_of(*idx, writers) == u64::from(lane))
+            .collect();
+        candidates.sort_unstable();
+        let vol_tag = self.vol_tag();
+        let mut out = Vec::new();
+        for idx in candidates {
+            if out.len() >= max {
+                break;
+            }
+            if self.take_free_for_lane_grant(idx) {
+                let age = crate::free_grace::take_lane_release(vol_tag, idx)
+                    .unwrap_or(crate::free_grace::LANE_RELEASE_AGE_UNPLACED);
+                out.push((idx, age));
+            }
+        }
+        out
     }
 
     /// The supply number the grace runway reads (KD-FG-10's re-base):
@@ -2900,7 +3069,7 @@ impl BlockAllocator {
             .harvest_pressure(crate::free_grace::HARVEST_BATCH);
         let n = released.len();
         for offset in released {
-            self.publish_free_list(offset);
+            self.publish_grace_release(offset);
         }
         n
     }

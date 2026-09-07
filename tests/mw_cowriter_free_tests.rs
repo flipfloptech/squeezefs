@@ -2980,17 +2980,25 @@ async fn the_owed_ledger_tracks_freed_verdicts_and_harvest_adoptions() {
 }
 
 /// **The ahead-harvest decision is rate-gated, watermark-bounded, and
-/// routes only to the owing, starving volume** (§5.5): harvest when
-/// `reachable < watermark ∧ owed > 0` for THAT allocator, where
-/// `watermark = ceil(rate × horizon)` capped at lane-share/4 — derived,
-/// never a knob. A quiet writer (rate 0) never harvests ahead; a volume
-/// owed nothing is never asked (no wasted RTT); `AHEAD=0` restores the
-/// ENOSPC-only shape verbatim.
+/// routes only to the starving volume with a supply witness** (§5.5):
+/// harvest when `reachable < watermark ∧ (owed > 0 ∨ hint > 0)` for THAT
+/// allocator, where `watermark = ceil(rate × horizon)` capped at
+/// lane-share/4 — derived, never a knob. A quiet writer (rate 0) never
+/// harvests ahead; with no advertised supply (`free_grace_lane_supply_hint`
+/// 0 — this fixture never learns a grant) a volume owed nothing is never
+/// asked (no wasted RTT); `AHEAD=0` restores the ENOSPC-only shape
+/// verbatim. The hint-armed arm is `tests/mw_data_alloc_lane_tests.rs`
+/// §9 (`.benchmarks/2026-09-07-lane-refill-hint-gate.md`).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_ahead_decision_harvests_only_the_owing_starved_volume() {
     let _serial = serial();
     let _restore = restore();
     squeezefs::block_allocator::test_set_harvest_ahead(Some(true));
+    assert_eq!(
+        squeezefs::free_grace::lane_supply_hint(),
+        0,
+        "this fixture learns no grant: the owed word is the only supply witness"
+    );
     let a = Arc::new(
         squeezefs::block_allocator::BlockAllocator::new("vol-00000000000000fa")
             .await
@@ -3023,11 +3031,12 @@ async fn the_ahead_decision_harvests_only_the_owing_starved_volume() {
         a.watermark_blocks()
     );
 
-    // Nothing owed yet: never ask (the no-wasted-RTT half).
+    // Nothing owed and no advertised supply: never ask (the no-wasted-RTT
+    // half — the quiet-lane posture).
     assert_eq!(
         a.should_harvest_ahead(),
         None,
-        "a volume owed nothing is never harvested"
+        "a volume owed nothing with no advertised supply is never harvested"
     );
     a.note_owed_freed(4);
     assert!(

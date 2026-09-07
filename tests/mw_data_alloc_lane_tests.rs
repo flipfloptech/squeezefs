@@ -27,7 +27,12 @@
 //! 7. **composition** — the lifetime-stamp funnel, S7's quarantine, the
 //!    reclaim window, and fsck's reconciliation all still hold;
 //! 8. **hygiene** — the capability bit this gates on (no new bit is taken)
-//!    and the reservation grain's derivation.
+//!    and the reservation grain's derivation;
+//! 9. **the refill gate** — a co-writer's two PROACTIVE lane refills (the
+//!    ahead tick, the pushed refill) arm on the authority's ADVERTISED
+//!    supply (the renewal grant's lane-supply hint), never on the owed
+//!    ledger alone; the ENOSPC-path harvest is unchanged
+//!    (`.benchmarks/2026-09-07-lane-refill-hint-gate.md`).
 //!
 //! **No numbers here — ruling D11.** The bench coverage
 //! (`benches/write_path_bench.rs::alloc_lane`) is written and NOT run; every
@@ -38,9 +43,11 @@ use squeezefs::block_allocator::BlockAllocator;
 use squeezefs::data_alloc_lane as lane;
 use squeezefs::data_custody::declare_dead_epoch;
 use squeezefs::error::SqueezefsError;
+use squeezefs::free_grace;
 use squeezefs::fuse_client::METRICS;
 use squeezefs::meta_backend::kv::journal::AppendPartition;
 use squeezefs::meta_backend::kv::superblock as sb;
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -1179,4 +1186,294 @@ fn the_mount_partition_installs_once_and_refuses_a_swap() {
     let err = lane::install_mount_partition(part(4, 2)).expect_err("a swap must refuse");
     assert!(err.to_string().contains("already writer 1 of 4"), "{err}");
     lane::test_reset_mount_partition();
+}
+
+// ---------------------------------------------------------------------------
+// 9. The refill gate: the proactive arms fire on the ADVERTISED supply
+// ---------------------------------------------------------------------------
+
+/// Restores the process-global refill posture this section moves (the
+/// free-grace words — the hint, the lane-push and refill-hint levers — and
+/// the ahead lever), so a panicking assertion never leaves the binary armed.
+struct RefillRestore;
+
+impl Drop for RefillRestore {
+    fn drop(&mut self) {
+        free_grace::reset_for_test();
+        squeezefs::block_allocator::test_clear_harvest_ahead();
+    }
+}
+
+fn refill_restore() -> RefillRestore {
+    free_grace::reset_for_test();
+    squeezefs::block_allocator::test_clear_harvest_ahead();
+    RefillRestore
+}
+
+/// The authority's lane list as a co-writer's harvest sink sees it: a
+/// queue of lane block indices served up to the ask, every ask recorded.
+#[derive(Default)]
+struct Supply {
+    blocks: Mutex<VecDeque<u64>>,
+    asks: Mutex<Vec<u64>>,
+}
+
+impl Supply {
+    fn sink(self: &Arc<Self>) -> lane::LaneHarvestSink {
+        let me = Arc::clone(self);
+        Arc::new(move |max: u64| {
+            let me = Arc::clone(&me);
+            Box::pin(async move {
+                me.asks.lock().unwrap().push(max);
+                let mut q = me.blocks.lock().unwrap();
+                let n = (max as usize).min(q.len());
+                let blocks: Vec<u64> = q.drain(..n).collect();
+                Ok(lane::LaneHarvest {
+                    blocks,
+                    bound_age_hint_ms: 0,
+                    rtt_ms: 1,
+                    release_ages_ms: Vec::new(),
+                })
+            })
+        })
+    }
+
+    fn held(&self) -> u64 {
+        self.blocks.lock().unwrap().len() as u64
+    }
+
+    fn asks(&self) -> Vec<u64> {
+        self.asks.lock().unwrap().clone()
+    }
+}
+
+/// A co-writer's allocator (lane 1 of 2 on a 64-block device — a 32-block
+/// lane share, watermark cap 8) wired to `supply`, with `minted` lane
+/// blocks claimed and a claim rate sampled so the derived watermark reads
+/// its cap: `reachable` = the lane's virgin remainder.
+async fn laned_co_writer(id: &str, supply: &Arc<Supply>, minted: u64) -> Arc<BlockAllocator> {
+    let a = allocator(id, 64).await;
+    a.engage_alloc_lanes(part(2, 1)).expect("lane 1 of 2");
+    a.set_lane_harvest_sink(supply.sink());
+    // 20 claims seed the rate snapshots; the rest land inside one second
+    // (10 blk/s ⇒ EWMA 2.5 blk/s ⇒ `ceil(rate × horizon)` past the
+    // lane-share/4 cap on any derived horizon).
+    let seed = minted.min(20);
+    for _ in 0..seed {
+        a.allocate_block().await.expect("mint");
+    }
+    a.sample_alloc_rate(10_000);
+    for _ in seed..minted {
+        a.allocate_block().await.expect("mint");
+    }
+    a.sample_alloc_rate(11_000);
+    a
+}
+
+/// Contract (the refill-hint gate, finding 15 — the s11 fleet's second
+/// starvation case): **the ahead tick fires on the hint alone.** The
+/// authority's renewal grant says this lane has supply on its lists
+/// (`free_grace_lane_supply_hint`); this allocator is OWED nothing (its
+/// displaced blocks returned through the authority's publish recompute,
+/// which notes nothing owed — ≈ 90 % of them on the s11 fleet); its
+/// lane-reachable stock sits below the derived watermark ⇒ the ahead tick
+/// harvests, asking for the full grain (never fewer than the grain when
+/// the hint is larger), counted as an ahead harvest AND a hint refill. The
+/// watermark law is untouched: stocked above it, a nonzero hint fires
+/// nothing. Hint 0 ∧ owed 0 fires nothing (the quiet-lane posture — no RPC
+/// storms on an idle lane). `SQUEEZEFS_ALLOC_LANE_REFILL_HINT=0` is the
+/// retired owed-only gate verbatim; `HARVEST_AHEAD=0` the ENOSPC-only
+/// shape.
+#[tokio::test]
+async fn the_ahead_refill_fires_on_the_hint_alone_below_the_watermark() {
+    let _serial = serial();
+    let _restore = refill_restore();
+    squeezefs::block_allocator::test_set_harvest_ahead(Some(true));
+    free_grace::test_set_lane_push(Some(true));
+    let supply = Arc::new(Supply::default());
+    let a = laned_co_writer("lane-hint-ahead", &supply, 30).await;
+    // The ask the allocator derives at engagement (`reserve_grain_blocks`
+    // over the device's capacity and the width).
+    let grain = lane::reserve_grain_blocks(64, 2).max(1);
+    assert_eq!(
+        a.watermark_blocks(),
+        8,
+        "a 10 blk/s claimer derives the lane-share/4 cap on any horizon"
+    );
+    assert_eq!(
+        a.lane_reachable_blocks(),
+        2,
+        "30 of the 32-block share minted"
+    );
+    assert_eq!(a.lane_owed_blocks(), 0, "nothing shipped ⇒ nothing owed");
+
+    let m = &METRICS;
+    let harvests0 = m.alloc_lane_harvests.load(Ordering::Relaxed);
+    let ahead0 = m.alloc_lane_ahead_harvests.load(Ordering::Relaxed);
+    let hint_refills0 = m.alloc_lane_hint_refills.load(Ordering::Relaxed);
+    let harvested0 = m.alloc_lane_harvested_blocks.load(Ordering::Relaxed);
+
+    // (3) hint 0 ∧ owed 0 ⇒ no proactive harvest, no RPC.
+    assert_eq!(free_grace::lane_supply_hint(), 0);
+    assert_eq!(
+        a.should_harvest_ahead(),
+        None,
+        "no advertised supply and nothing owed ⇒ the tick stays dark"
+    );
+    assert_eq!(a.ahead_refill_tick(12_000).await, 0);
+    assert!(supply.asks().is_empty(), "a dark tick sends no RPC");
+    assert_eq!(m.alloc_lane_harvests.load(Ordering::Relaxed), harvests0);
+
+    // (1) the authority's list holds 10 of this lane's blocks — the
+    // co-writer's own displaced mints, recomputed there (their local
+    // retire is finding 36's, noting nothing owed) — and the renewal grant
+    // says so.
+    let chunk = a.chunk_size();
+    let displaced: Vec<u64> = (0..10u64).map(|i| 2 * i + 1).collect();
+    for idx in &displaced {
+        assert_eq!(lane::block_lane_of(*idx, 2), 1, "a lane-1 block");
+        a.retire_shipped_free_tracking(idx * chunk);
+    }
+    supply
+        .blocks
+        .lock()
+        .unwrap()
+        .extend(displaced.iter().copied());
+    free_grace::note_lane_supply_hint(supply.held());
+    assert_eq!(free_grace::lane_supply_hint(), 10);
+    assert_eq!(
+        a.should_harvest_ahead(),
+        Some(grain),
+        "hint > 0 ∧ owed 0 ∧ reachable < watermark ⇒ the tick fires, asking a full grain"
+    );
+    let adopted = a.ahead_refill_tick(13_000).await;
+    assert_eq!(adopted, 10, "the advertised supply is adopted");
+    assert_eq!(
+        supply.asks(),
+        vec![grain],
+        "one RPC, asking the grain — never fewer than the grain when the hint is larger"
+    );
+    assert_eq!(m.alloc_lane_harvests.load(Ordering::Relaxed), harvests0 + 1);
+    assert_eq!(
+        m.alloc_lane_ahead_harvests.load(Ordering::Relaxed),
+        ahead0 + 1
+    );
+    assert_eq!(
+        m.alloc_lane_hint_refills.load(Ordering::Relaxed),
+        hint_refills0 + 1,
+        "a proactive harvest the owed gate would have declined is a HINT refill"
+    );
+    assert_eq!(
+        m.alloc_lane_harvested_blocks.load(Ordering::Relaxed),
+        harvested0 + 10
+    );
+    assert_eq!(
+        a.lane_owed_blocks(),
+        0,
+        "the owed ledger is the explicit arm's face — untouched"
+    );
+    assert_eq!(a.lane_reachable_blocks(), 12, "2 virgin + 10 adopted");
+
+    // The watermark law is untouched: stocked above it, the hint fires
+    // nothing (the hint is a supply witness, not a demand).
+    assert!(free_grace::lane_supply_hint() > 0);
+    assert_eq!(
+        a.should_harvest_ahead(),
+        None,
+        "reachable ≥ watermark ⇒ no harvest, hint or not"
+    );
+    assert_eq!(a.ahead_refill_tick(14_000).await, 0);
+    assert_eq!(supply.asks().len(), 1, "no second RPC");
+
+    // Below the watermark again with the A/B control off: the retired
+    // owed-only gate declines the hint; one owed block re-arms it.
+    for _ in 0..10 {
+        a.allocate_block()
+            .await
+            .expect("re-mint the adopted supply");
+    }
+    assert_eq!(a.lane_reachable_blocks(), 2);
+    supply.blocks.lock().unwrap().push_back(21);
+    free_grace::note_lane_supply_hint(supply.held());
+    free_grace::test_set_refill_hint(Some(false));
+    assert_eq!(
+        a.should_harvest_ahead(),
+        None,
+        "REFILL_HINT=0: owed nothing ⇒ never harvested (the retired gate verbatim)"
+    );
+    a.note_owed_freed(1);
+    assert_eq!(
+        a.should_harvest_ahead(),
+        Some(grain),
+        "REFILL_HINT=0: owed > 0 ∧ reachable < watermark still fires"
+    );
+    assert!(free_grace::test_clear_refill_hint());
+    assert_eq!(a.should_harvest_ahead(), Some(grain));
+
+    // The ahead lever off restores the ENOSPC-only shape, hint included.
+    squeezefs::block_allocator::test_set_harvest_ahead(Some(false));
+    assert_eq!(
+        a.should_harvest_ahead(),
+        None,
+        "HARVEST_AHEAD=0: shipped shape"
+    );
+    assert_eq!(a.ahead_refill_tick(15_000).await, 0);
+    assert_eq!(supply.asks().len(), 1);
+}
+
+/// Contract (4): **the ENOSPC-path harvest is unchanged** — an exhausted
+/// lane's allocation still runs the harvest inline before its verdict
+/// (one RPC, adopt, retry through the funnel) with hint 0 and owed 0, and
+/// that harvest is neither an ahead nor a pushed nor a HINT refill: the new
+/// gauge counts only the proactive arms the hint armed.
+#[tokio::test]
+async fn the_enospc_path_harvest_is_unchanged_and_never_a_hint_refill() {
+    let _serial = serial();
+    let _restore = refill_restore();
+    squeezefs::block_allocator::test_set_harvest_ahead(Some(true));
+    free_grace::test_set_lane_push(Some(true));
+    let supply = Arc::new(Supply::default());
+    let a = laned_co_writer("lane-hint-enospc", &supply, 32).await;
+    assert_eq!(a.lane_reachable_blocks(), 0, "the whole share minted");
+    let chunk = a.chunk_size();
+    // Three displaced blocks sit on the authority's list; no grant has
+    // advertised them yet and nothing was shipped.
+    for idx in [1u64, 3, 5] {
+        a.retire_shipped_free_tracking(idx * chunk);
+        supply.blocks.lock().unwrap().push_back(idx);
+    }
+    assert_eq!(free_grace::lane_supply_hint(), 0);
+    assert_eq!(a.lane_owed_blocks(), 0);
+    assert_eq!(a.should_harvest_ahead(), None, "the proactive arm is dark");
+
+    let m = &METRICS;
+    let harvests0 = m.alloc_lane_harvests.load(Ordering::Relaxed);
+    let ahead0 = m.alloc_lane_ahead_harvests.load(Ordering::Relaxed);
+    let pushed0 = m.alloc_lane_pushed_harvests.load(Ordering::Relaxed);
+    let hint_refills0 = m.alloc_lane_hint_refills.load(Ordering::Relaxed);
+    let refusals0 = m.alloc_lane_enospc_refusals.load(Ordering::Relaxed);
+
+    let off = a
+        .allocate_block()
+        .await
+        .expect("the ENOSPC-path harvest feeds the funnel before the verdict");
+    assert_eq!(off / chunk, 1, "the first harvested block mints");
+    assert_eq!(supply.asks().len(), 1, "one inline harvest RPC");
+    assert_eq!(m.alloc_lane_harvests.load(Ordering::Relaxed), harvests0 + 1);
+    assert_eq!(m.alloc_lane_ahead_harvests.load(Ordering::Relaxed), ahead0);
+    assert_eq!(
+        m.alloc_lane_pushed_harvests.load(Ordering::Relaxed),
+        pushed0
+    );
+    assert_eq!(
+        m.alloc_lane_hint_refills.load(Ordering::Relaxed),
+        hint_refills0,
+        "the ENOSPC arm is never a hint refill"
+    );
+    assert_eq!(
+        m.alloc_lane_enospc_refusals.load(Ordering::Relaxed),
+        refusals0,
+        "a fed funnel refuses nothing"
+    );
+    assert_eq!(a.lane_reachable_blocks(), 2, "the other two adopted blocks");
 }

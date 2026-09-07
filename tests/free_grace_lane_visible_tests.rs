@@ -262,7 +262,14 @@ fn the_co_writer_stamps_three_stages_that_sum_exactly() {
 }
 
 /// **The pushed-refill decision is pure and lever-gated**: harvest ⇔ the
-/// lever is on, the hint says supply exists, and the allocator is owed.
+/// lever is on and the hint says supply exists. The hint ALONE suffices
+/// (the refill-hint gate, `.benchmarks/2026-09-07-lane-refill-hint-gate.md`):
+/// the authority's own count of this lane's blocks on its lists is the
+/// ground truth, and the owed ledger — the explicit-ship arm's face — is a
+/// strict subset of it (on the s11 fleet ≈ 90 % of a co-writer's displaced
+/// blocks return through the authority's publish recompute, which notes
+/// nothing owed). `SQUEEZEFS_ALLOC_LANE_REFILL_HINT=0` restores the
+/// owed-only gate verbatim (the A/B control).
 #[test]
 fn the_pushed_refill_decision_is_pure_and_lever_gated() {
     let _serial = serial();
@@ -273,13 +280,32 @@ fn the_pushed_refill_decision_is_pure_and_lever_gated() {
         "no supply ⇒ no RPC"
     );
     assert!(
-        !free_grace::lane_push_wants_harvest(3, 0),
-        "owed nothing ⇒ no RPC"
+        free_grace::lane_push_wants_harvest(3, 0),
+        "the hint alone suffices — the push exists because the authority said the lane has supply"
     );
+    assert!(
+        !free_grace::lane_push_wants_harvest(0, 0),
+        "hint 0 and owed 0 ⇒ no RPC (the quiet-lane posture)"
+    );
+    // The refill-hint lever off: the retired owed-only gate.
+    free_grace::test_set_refill_hint(Some(false));
+    assert!(
+        !free_grace::lane_push_wants_harvest(3, 0),
+        "REFILL_HINT=0: owed nothing ⇒ no RPC (the retired gate verbatim)"
+    );
+    assert!(
+        free_grace::lane_push_wants_harvest(3, 1),
+        "REFILL_HINT=0: hint + owed still pushes"
+    );
+    assert!(free_grace::test_clear_refill_hint());
     free_grace::test_set_lane_push(Some(false));
     assert!(
         !free_grace::lane_push_wants_harvest(3, 1),
         "the lever off never pushes — the watermark tick and the park slices stand"
+    );
+    assert!(
+        !free_grace::lane_push_wants_harvest(3, 0),
+        "…and the hint alone cannot push with the lever off"
     );
     // The hint itself is inert with the lever off: nothing stored, nothing
     // woken.
@@ -459,6 +485,119 @@ async fn a_deferred_lane_block_waits_for_the_ack_then_the_two_ledgers_chain() {
     // And the block is now mintable by the co-writer — in its lane.
     let off = cw.allocate_block().await.expect("the adopted block mints");
     assert_eq!(off / chunk, idx, "the very block the authority released");
+}
+
+/// **The pushed refill fires on the hint alone** (the refill-hint gate,
+/// `.benchmarks/2026-09-07-lane-refill-hint-gate.md`): a lane-1 block the
+/// AUTHORITY freed without the co-writer ever shipping it — the publish
+/// recompute's arm, `meta_ship_publish.free_recomputed_blocks`, which on
+/// the s11 fleet is ≈ 90 % of a co-writer's displaced blocks — is on the
+/// authority's list with the co-writer OWED nothing. The renewal grant's
+/// hint says the lane has supply; the pushed refill harvests it, counted
+/// as a hint refill (`alloc_lane_hint_refills` — a proactive harvest the
+/// owed gate would have declined), and the owed ledger never moves (it is
+/// the explicit-ship arm's face, not the gate). Before the fix this
+/// block was reachable only from inside an ENOSPC park.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_pushed_refill_fires_on_the_hint_alone_for_a_recomputed_free() {
+    let _serial = serial();
+    free_grace::test_set_lane_push(Some(true));
+    let auth = Arc::new(
+        BlockAllocator::new("vol-00000000000000c2")
+            .await
+            .expect("allocator"),
+    );
+    let chunk = auth.chunk_size();
+    auth.set_capacity_bytes(64 * chunk);
+    auth.engage_alloc_lanes(part(2, 0)).expect("lane 0 of 2");
+    let cw = Arc::new(
+        BlockAllocator::new("vol-00000000000000c2")
+            .await
+            .expect("allocator"),
+    );
+    cw.set_capacity_bytes(64 * chunk);
+    cw.engage_alloc_lanes(part(2, 1)).expect("lane 1 of 2");
+    cw.set_lane_harvest_sink(authority_sink(&auth, 1, 2));
+
+    // No plane armed: the authority's terminal free publishes straight to
+    // its free list — the recompute arm's effect as the co-writer sees it
+    // (nothing shipped, nothing noted owed).
+    let idx = 11u64;
+    assert_eq!(idx % 2, 1, "a lane-1 block");
+    auth.finish_free(idx * chunk);
+    assert_eq!(
+        auth.lane_free_count(1),
+        1,
+        "on the authority's list, lane 1"
+    );
+    assert_eq!(cw.lane_owed_blocks(), 0, "the co-writer is owed NOTHING");
+
+    let pushed0 = METRICS.alloc_lane_pushed_harvests.load(Ordering::Relaxed);
+    let hint_refills0 = METRICS.alloc_lane_hint_refills.load(Ordering::Relaxed);
+    let owed_gauge0 = METRICS.alloc_lane_owed_blocks.load(Ordering::Relaxed);
+
+    // A wake with hint 0 (the authority's list holds nothing of this lane)
+    // pushes nothing: the quiet-lane posture — no RPC storms on an idle lane.
+    free_grace::note_lane_supply_hint(0);
+    assert_eq!(
+        cw.pushed_refill_tick(1).await,
+        0,
+        "hint 0 ∧ owed 0 ⇒ no RPC"
+    );
+    assert_eq!(
+        METRICS.alloc_lane_pushed_harvests.load(Ordering::Relaxed),
+        pushed0,
+        "no pushed harvest counted"
+    );
+
+    // The renewal grant carries the authority's count: the push fires.
+    free_grace::note_lane_supply_hint(auth.lane_free_count(1));
+    assert_eq!(
+        cw.pushed_refill_tick(2).await,
+        1,
+        "the recomputed block is adopted"
+    );
+    assert_eq!(
+        METRICS.alloc_lane_pushed_harvests.load(Ordering::Relaxed),
+        pushed0 + 1,
+        "the pushed harvest is counted"
+    );
+    assert_eq!(
+        METRICS.alloc_lane_hint_refills.load(Ordering::Relaxed),
+        hint_refills0 + 1,
+        "…and as a HINT refill: the owed gate would have declined it"
+    );
+    assert_eq!(cw.lane_owed_blocks(), 0, "the owed ledger is untouched");
+    assert_eq!(
+        METRICS.alloc_lane_owed_blocks.load(Ordering::Relaxed),
+        owed_gauge0,
+        "the sum gauge too (nothing to pay down)"
+    );
+    assert_eq!(
+        auth.lane_free_count(1),
+        0,
+        "the authority's list is drained"
+    );
+    let off = cw.allocate_block().await.expect("the adopted block mints");
+    assert_eq!(off / chunk, idx, "the very block the authority recomputed");
+
+    // The A/B control: `REFILL_HINT=0` is the owed-only gate — the same
+    // shape declines the push with owed 0.
+    let idx2 = 13u64;
+    auth.finish_free(idx2 * chunk);
+    free_grace::note_lane_supply_hint(auth.lane_free_count(1));
+    free_grace::test_set_refill_hint(Some(false));
+    assert_eq!(
+        cw.pushed_refill_tick(3).await,
+        0,
+        "REFILL_HINT=0: owed nothing ⇒ the retired gate declines"
+    );
+    assert!(free_grace::test_clear_refill_hint());
+    assert_eq!(
+        METRICS.alloc_lane_hint_refills.load(Ordering::Relaxed),
+        hint_refills0 + 1,
+        "a declined push is not a hint refill"
+    );
 }
 
 // ---------------------------------------------------------------------------

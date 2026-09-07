@@ -219,6 +219,7 @@ fn bench_member_clock(c: &mut Criterion) {
         granted_at_owner_ms: 1_000,
         lane_supply_blocks: 0,
         checkpoint_ceiling_ms: 0,
+        lane_supply_volumes: Vec::new(),
     };
     let ticks = Arc::new(AtomicU64::new(1_000));
     let clock = LeaseClock::manual(Arc::clone(&ticks));

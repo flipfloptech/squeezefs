@@ -2164,7 +2164,7 @@ impl BlockAllocator {
     }
 
     /// The refill's supply witness for this allocator: the authority's
-    /// advertised lane supply on this volume ([`Self::lane_supply_hint`])
+    /// advertised lane supply on this volume (`lane_supply_hint_for`)
     /// or this allocator's owed word
     /// ([`crate::free_grace::lane_supply_witnessed`]).
     fn lane_supply_witnessed(&self) -> bool {
@@ -2422,7 +2422,7 @@ impl BlockAllocator {
     /// or the next ENOSPC. The SAME harvest (sink → adopt → hint deposit);
     /// the decision is
     /// [`crate::free_grace::lane_push_wants_harvest_on_volume`] over THIS
-    /// VOLUME's advertised share ([`Self::lane_supply_hint`]): the hint
+    /// VOLUME's advertised share (`lane_supply_hint_for` on its `vol_tag`): the hint
     /// alone suffices (the owed word is the retired gate's witness), and a
     /// DRY volume asks even when owed nothing — but a volume the authority
     /// advertises 0 for does not, however large the sibling's share made

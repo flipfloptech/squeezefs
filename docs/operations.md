@@ -355,8 +355,11 @@ Read both rows:
   ```
 
   where `hold_time` is the writer's `free_grace_hold_ms` (≈ 8 s on the
-  shipped cadences — six seconds of it the readers' derived qualify and
-  drain windows) and `churn_rate` the co-writer's own displacement rate. The
+  shipped cadences before the 2026-09-06 ladder re-derivation — six seconds
+  of it the readers' derived qualify and drain windows, since re-derived to
+  ≈ 1.1 s of qualify plus an observed drain of milliseconds: ≈ 2.7 s in
+  the fleet-cadence model, `.benchmarks/2026-09-06-free-grace-ladder-rederivation.md`;
+  the fleet row is owed) and `churn_rate` the co-writer's own displacement rate. The
   co-writer publishes the law live: **`alloc_lane_share_needed_blocks`**
   (`ceil(claim rate × refill horizon) + live`) and
   **`alloc_lane_headroom_pct`** (`(share − needed) ÷ share`, saturating at
@@ -2582,9 +2585,14 @@ is held out of the free list until **every live registered reader has
 acknowledged passing it**. The acknowledgement rides the lease renewal a
 reader already sends, so it costs no metadata write and no extra round trip,
 and it means *"I have finished using anything freed at or before this"* —
-emitted only after a revalidation pass that actually ran the block-key purge,
-and only after the drain window in which pre-purge serves finish and the
-reader's own layout/attr caches expire.
+emitted only after a revalidation pass that actually ran the block-key purge
+(one that BEGAN at least the writer's checkpoint landing ceiling + skew
+after the label was learned, so the record it adopted carries the
+dereference), and only after the drain: the reader's layout cache refuses
+every entry resolved before that step (stamped with the purge generation —
+no TTL to wait out), and every read serve that started before the step
+has completed (counted, not timed — the 2026-09-06 ladder re-derivation;
+`D_purge` survives as the `free_grace_drain_overdue` tripwire).
 
 **A laggard is fenced, not waited on.** A reader that keeps renewing but
 stops acknowledging would otherwise turn into the writer's ENOSPC, so past
@@ -2678,7 +2686,7 @@ plane — the shipped default), `idle` (armed, no members) or `armed`:
 | `free_grace_demand_prods` | rung a′'s share of `free_grace_prods` (⊆): members asked to renew at the FLOOR cadence because recycle coupling — not space scarcity — is live. The fence deadline never tightens off this arm: asked sooner, never fenced sooner |
 | `free_grace_bound_refreshes` | bound recomputes run on the demand/prod harvest path (T7 collapsed to the floor beat). Law: ≤ elapsed ÷ the floor — a breach is a bug |
 | `free_grace_bound_age_ms` / `free_grace_residence_ms` | the loop-latency instruments (owner-clock `now − BOUND` while holding; the per-release residence histogram). Post-campaign target on a coupled storm: bound age ≤ 12 s sustained |
-| `free_grace_hold_phase_ns` | **the hold DECOMPOSED** (the hold-time campaign, `.benchmarks/2026-09-06-free-grace-hold-time.md`): per released offset, `defer_checkpointed` (the first KV checkpoint completed after the free — the instant a reader's poll could adopt a root carrying the dereference), `checkpointed_min_acked` (until the first bound publish that covered the label — every member acknowledged past it) and `min_acked_released` (the harvest); `total` is the residence and the three are exact-sum with it over the placed population (`free_grace_hold_unplaced` counts the rest). On the s11 shape the middle stage carries ≈ 7 s — the readers' qualify (`staleness + skew`) and drain (`staleness + D_purge`) windows plus their pass/beat quantization — and the other two are sub-second; a large FIRST stage means the writer is not checkpointing (check `meta_kv_checkpoints`), a large LAST stage means nothing is allocating or freeing (the harvest runs per free and per allocation) |
+| `free_grace_hold_phase_ns` | **the hold DECOMPOSED** (the hold-time campaign, `.benchmarks/2026-09-06-free-grace-hold-time.md`): per released offset, `defer_checkpointed` (the first KV checkpoint completed after the free — the instant a reader's poll could adopt a root carrying the dereference), `checkpointed_min_acked` (until the first bound publish that covered the label — every member acknowledged past it) and `min_acked_released` (the harvest); `total` is the residence and the three are exact-sum with it over the placed population (`free_grace_hold_unplaced` counts the rest). On the s11 shape the middle stage carried ≈ 7 s before the 2026-09-06 ladder re-derivation — the readers' qualify (`staleness + skew`) and drain (`staleness + D_purge`) windows plus their pass/beat quantization; since it, the qualify window is the writer's checkpoint ceiling + skew (≈ 1.1 s) and the drain is observed (milliseconds), so the stage reads ≈ 2.3 s in the fleet-cadence model — and the other two are sub-second; a large FIRST stage means the writer is not checkpointing (check `meta_kv_checkpoints`), a large LAST stage means nothing is allocating or freeing (the harvest runs per free and per allocation) |
 | `free_grace_hold_ms` | the live hold — the EWMA of the residence at release — the number the capacity law multiplies your churn by (below) |
 | `free_grace_member_ack_lag_ms` (`max` / `mean` / `min` / `members`) | owner-clock `now − acked` per live member (`now − joined` for one that has acknowledged nothing). The bound is the MIN over members, so `max` is the member holding the free list; `max − min` well above one beat names a laggard. With `SQUEEZEFS_STATS_KEY_CENSUS=1` the per-member census `free_grace_member_ack_lag_census` names it |
 | `free_grace_checkpoint_marks` / `free_grace_checkpoint_cycle_ms` | the checkpoint marks the first stage is read against (≈ `meta_kv_checkpoints` on an armed writer) and the measured checkpoint cycle cost |

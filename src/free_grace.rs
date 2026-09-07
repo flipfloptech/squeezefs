@@ -178,6 +178,25 @@
 //! writer checkpoint cadence alone was measured INERT: the reader
 //! qualifies on the time bound, never on observing the checkpoint.
 //!
+//! # The ladder re-derivation (user decision 2026-09-06)
+//!
+//! The two windows were then RE-DERIVED
+//! (`.benchmarks/2026-09-06-free-grace-ladder-rederivation.md`; the
+//! design's KD-FG-11 as amended) — still pinned against demand, but each
+//! term traced to the writer's machinery or to an observed event:
+//! **qualify** = the writer's checkpoint LANDING ceiling + skew
+//! ([`qualify_lag_ms`]; the staleness bound's poll interval bounded
+//! nothing — the pass IS the poll), **drain** = an epoch-step invalidation
+//! of the reader's layout cache
+//! ([`crate::ro_coherence::layout_entry_pre_step`] — no TTL to wait out)
+//! plus an OBSERVED in-flight drain ([`crate::ro_coherence::ServeStamp`]
+//! / [`crate::ro_coherence::serve_drained_below`] — every read serve
+//! counted in the purge generation it started under; `D_purge` kept only
+//! as the `free_grace_drain_overdue` tripwire). Fleet-cadence model:
+//! `bound_age` 7,724 → 2,724 ms, closure exact, zero fences. Each of the
+//! three levers (`SQUEEZEFS_FREE_GRACE_{QUALIFY_CEILING,DRAIN_EPOCH_STAMP,
+//! DRAIN_OBSERVED}`) restores its retired term verbatim.
+//!
 //! # Term 2 — the fleet-only `min_acked→released` hop, and the lane behind it
 //!
 //! The fleet row (`.benchmarks/2026-09-06-free-grace-hold-time.md` §6) read

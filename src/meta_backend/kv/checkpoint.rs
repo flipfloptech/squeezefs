@@ -980,7 +980,7 @@ pub const CHECKPOINT_MAX_AGE_MS: u128 = 1000;
 
 /// The checkpoint task's tick period for a flush interval, ms: the knob
 /// verbatim, strict mode (`0`) reading as the task's own 100 ms tick. The
-/// ONE derivation [`spawn_checkpoint_task`] and the reader's poll cadence
+/// ONE derivation the checkpoint task's spawn and the reader's poll cadence
 /// (`super::revalidate::resolve_revalidate_interval_ms`) both ride, so the
 /// two cannot drift.
 pub fn checkpoint_tick_period_ms(flush_interval_ms: u64) -> u64 {

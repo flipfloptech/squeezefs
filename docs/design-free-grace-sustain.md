@@ -5,7 +5,7 @@
 | **Title** | The free-grace sustain campaign: a demand-coupled acknowledgement loop — pipelined reader acks, demand-coupled bound publication, demand-armed prods, and ahead-of-stall lane refill |
 | **Author** | (design agent; adjudication owner: user) |
 | **Date** | 2026-08-25 |
-| **Status** | **Implemented — fleet acceptance NOT MET (2026-09-05); the LANE-VISIBLE campaign landed 2026-09-06 (§"Lane-visible campaign" below, `.benchmarks/2026-09-06-free-grace-lane-visible.md`): the fleet-only `min_acked→released` term convicted as the release's wait for DEMAND plus an unmeasured co-writer lane hop behind it, both instrumented (`alloc_lane_visible_phase_ns`) and both made event-driven off the acknowledgement (`SQUEEZEFS_FREE_GRACE_LANE_PUSH`) — 3,408 → 0 ms / 30.7 → 1.5 s in the fleet-cadence model, the from-zero row OWED (parent); the HOLD-TIME campaign landed 2026-09-06 (§"Hold-time campaign" below, `.benchmarks/2026-09-06-free-grace-hold-time.md`): the coupled hold decomposed per stage on the stats inode, levers (b) + (d) −922 ms in-process, the capacity law published, the 6 s of derived windows named as adjudication items; the from-zero s11-mpiio row is OWED (parent). Prior status: (2026-09-05, `.benchmarks/2026-09-05-d4-free-grace-sustain.md` §6: finding 15 reproduces on the s11 venue at 23 s — lane ENOSPC storms — and five of eight co-writers wedge on the ENOSPC'd writes; the WEDGE is fixed 2026-09-06, `.benchmarks/2026-09-06-cowriter-enospc-wedge.md`: the finding-29 bounded-allocation park read the reallocation label as its wall and a harvest sink's presence as supply, so an exhausted co-writer lane parked forever under its block stripe — the row must now fail CLEANLY, fleet re-run owed).** PRs 1–4 landed 2026-08-25 (`f992c2e1` instruments · `11dafe2f` L1 · `29788e55` L4+L2+L2b+L3 · `69b2fe16` L5 + the OQ 2 horizon), followed by finding 18 (`6ce59456`, the prod decay) and finding 29 (`a50da1e4` + `37bf6036`, the bounded allocation park). The s11-mpiio row went GREEN once on the cloud venue (2026-08-30 16b, `8e4a2cab`, `.benchmarks/cloud/2026-08-30-094130`) — on a fleet whose lanes never coupled (`demand_waits` 0, `bound_age` 23–29 s, the routine composite). The §3 rate equation was closed in-process 2026-09-05 (D-4, `.benchmarks/2026-09-05-d4-free-grace-sustain.md`: the shipped levers unbind a recycle-bound stream at zero fences; Little's law holds on live gauges; finding D4-1 priced). **Owed**: the from-zero s11-mpiio row on the finding-15 venue with the sustain columns (PR 5's harness rung is NOT landed — the rig `.benchmarks/rigs/free-grace-sustain-rig.sh` reads the row's snapshots), run by the parent campaign |
+| **Status** | **Implemented — fleet acceptance NOT MET (2026-09-05); the LADDER RE-DERIVATION landed 2026-09-06 (user decision — §"The remaining 6 s" below, KD-FG-11 amended, `.benchmarks/2026-09-06-free-grace-ladder-rederivation.md`): adjudication items 1–3 — qualify = the writer's checkpoint landing ceiling + skew, the drain's `S` an epoch-step invalidation of the layout cache, its `D_purge` an OBSERVED in-flight drain with the reserve kept as a tripwire — H3 `bound_age` 7,724 → 2,724 ms in the fleet-cadence model, closure exact, zero fences; item 4 is the sibling's; the from-zero row OWED (parent); the LANE-VISIBLE campaign landed 2026-09-06 (§"Lane-visible campaign" below, `.benchmarks/2026-09-06-free-grace-lane-visible.md`): the fleet-only `min_acked→released` term convicted as the release's wait for DEMAND plus an unmeasured co-writer lane hop behind it, both instrumented (`alloc_lane_visible_phase_ns`) and both made event-driven off the acknowledgement (`SQUEEZEFS_FREE_GRACE_LANE_PUSH`) — 3,408 → 0 ms / 30.7 → 1.5 s in the fleet-cadence model, the from-zero row OWED (parent); the HOLD-TIME campaign landed 2026-09-06 (§"Hold-time campaign" below, `.benchmarks/2026-09-06-free-grace-hold-time.md`): the coupled hold decomposed per stage on the stats inode, levers (b) + (d) −922 ms in-process, the capacity law published, the 6 s of derived windows named as adjudication items; the from-zero s11-mpiio row is OWED (parent). Prior status: (2026-09-05, `.benchmarks/2026-09-05-d4-free-grace-sustain.md` §6: finding 15 reproduces on the s11 venue at 23 s — lane ENOSPC storms — and five of eight co-writers wedge on the ENOSPC'd writes; the WEDGE is fixed 2026-09-06, `.benchmarks/2026-09-06-cowriter-enospc-wedge.md`: the finding-29 bounded-allocation park read the reallocation label as its wall and a harvest sink's presence as supply, so an exhausted co-writer lane parked forever under its block stripe — the row must now fail CLEANLY, fleet re-run owed).** PRs 1–4 landed 2026-08-25 (`f992c2e1` instruments · `11dafe2f` L1 · `29788e55` L4+L2+L2b+L3 · `69b2fe16` L5 + the OQ 2 horizon), followed by finding 18 (`6ce59456`, the prod decay) and finding 29 (`a50da1e4` + `37bf6036`, the bounded allocation park). The s11-mpiio row went GREEN once on the cloud venue (2026-08-30 16b, `8e4a2cab`, `.benchmarks/cloud/2026-08-30-094130`) — on a fleet whose lanes never coupled (`demand_waits` 0, `bound_age` 23–29 s, the routine composite). The §3 rate equation was closed in-process 2026-09-05 (D-4, `.benchmarks/2026-09-05-d4-free-grace-sustain.md`: the shipped levers unbind a recycle-bound stream at zero fences; Little's law holds on live gauges; finding D4-1 priced). **Owed**: the from-zero s11-mpiio row on the finding-15 venue with the sustain columns (PR 5's harness rung is NOT landed — the rig `.benchmarks/rigs/free-grace-sustain-rig.sh` reads the row's snapshots), run by the parent campaign |
 | **Repo state audited** | branch `dev`, tip `894cc088` (finding-15 part 1 landed at `8d2bcd3b`; contracts `tests/mw_cowriter_free_tests.rs` §finding 15) — the design as written; landed state per the Status row |
 | **Program input** | `.benchmarks/2026-08-25-s11-freeloop-stall.md` (finding 15 + the same-day part-1/re-grade addendum); `docs/design-full-multi-writer.md` rung-20 residual board item 1 (re-attributed 2026-08-25) and item 2 (the `SQUEEZEFS_RANGE_CUSTODY` flip, which inherits this as a precondition) |
 | **Binding inputs** | AGENTS.md (one source of truth — DLM S6/S7/S9 families, ENG-10, the two-substrate + sustained-state row rules, the TDD law); `docs/pre-rc-engineering-spec.md` §6.8 item 3; `docs/operations.md` §Freed-offset grace period; `.benchmarks/2026-08-19-blob-aware-merge-and-fabric-venue.md` §3 (the 0→825 never-draining capture); the free-grace pressure valve (rung-20 residual 6, in tree) |
@@ -363,6 +363,12 @@ began ≥ `S + skew` after `L` was learned, and (ii) `S + D_purge` elapsed
 since that pass. Pipelining changes only *how many labels* ride the ladder
 concurrently; no label's own gates move. The single-candidate ladder is the
 depth-1 special case, which is exactly what the A/B lever restores.
+(The two windows named here are the L1-era derivations; since the
+2026-09-06 re-derivation — §"The remaining 6 s" below, KD-FG-11 as
+amended — gate (i)'s window is the writer's checkpoint landing ceiling +
+skew and gate (ii) is an epoch-step invalidation plus an observed
+in-flight drain. The pipelining argument is unchanged: it is about how
+many candidates ride, not what their gates are.)
 
 **Structure**: the candidate queue lives behind a `parking_lot::Mutex` inside
 `ReaderAckLadder` — `note_pass` runs once per second on the revalidation
@@ -1190,6 +1196,26 @@ lanes at ≈ 50 % headroom. KD-FG-11 pinned (1)–(3) unmoved for L2b's sake
 (a load-dependent pass cadence must not re-derive them); revisiting their
 DERIVATIONS is the user's call.
 
+**USER DECISION 2026-09-06: re-derive them. Items (1)–(3) LANDED** on
+`perf/free-grace-ladder-rederivation` (`.benchmarks/2026-09-06-free-grace-ladder-rederivation.md`;
+the design's KD-FG-11 amended below); item (4) is the sibling campaign's.
+The windows stay pinned against DEMAND — an elastic pass never shortens
+them — and each DERIVATION now traces to the writer's machinery or to an
+observed event instead of to a poll interval standing in for one:
+
+| Item | Was | Is (default on; each lever `0` = the retired shape verbatim, KD-FG-7) | Commits |
+|---|---|---|---|
+| (1) qualify | `S + skew` = `P + CHECKPOINT_MAX_AGE_MS + skew` = 2,022 ms | **the writer's checkpoint LANDING ceiling + skew** — the cadence trigger plus the two checkpoint-task tick periods the trigger is evaluated behind (`checkpoint::checkpoint_landing_ceiling_ms`, 1,100 ms on the shipped 50 ms flush; the tick period is ONE function the checkpoint task and the reader's poll cadence both ride), read through the one accessor `MemberSession::checkpoint_ceiling_ms` (item 4's writer-advertised, demand-elastic value lands there). `P` bounded nothing for qualification — the pass IS the poll. What stays unstated is device time (the cycle's own writes), the residue the published S5 bound carries too. Lever `SQUEEZEFS_FREE_GRACE_QUALIFY_CEILING`; gauge `free_grace_qualify_lag_ms` | `74cdd880` (red) · `31ec8e45` |
+| (2) drain, the `S` term | a TTL: the daemon layout/attr caches could serve a PRE-STEP binding for up to `S` after the purge | **an epoch-step invalidation**: every `CachedMetadata` carries the reader's purge generation it was resolved under (read BEFORE the backend read — a step mid-fetch leaves a miss, never pre-step content under a post-step stamp), the purge sink's last act bumps the generation `SeqCst`, and every binding-serving read (the handler resolve, the post-fetch binding recheck, the il sync probe, the direct-drive prelude, the R2/read-lane fill tasks' map snapshots) refuses an older stamp (`ro_coherence::layout_entry_pre_step` — one relaxed load and a compare; structurally false on a mount that never steps). Attr/dentry caches keep their TTL: they never map a block to an offset. Cost one re-resolve per cached ino per step. Lever `SQUEEZEFS_FREE_GRACE_DRAIN_EPOCH_STAMP`; gauges `free_grace_drain_lag_ms`, `reader_layout_step_{gen,misses}` | `9f4c4dc0` (red) · `92ee9094` |
+| (3) drain, the `D_purge` term | a timer: §6.7's lease-clock fail-stop reserve (2 × P) reused as "serves in flight when the purge ran must finish" | **an OBSERVED drain**: every read serve (the FUSE handler, the R-2 fast probe, the il sync probe, the direct-drive DMA to its CQE, the prefetch/read-lane fills, `copy_file_range`'s source read) counts itself in the purge generation it started under (`ro_coherence::ServeStamp` — one `SeqCst` increment on this thread's shard word at the start, one `SeqCst` decrement on the SAME word at the end, no lock, no copy, no clock; an unarmed mount pays one relaxed load); a candidate qualified after the step that left generation `G` promotes once every slot below `G` reads zero — at the qualifying pass when nothing is in flight, else on the completion wake of the last such serve. The proof is `ro_coherence`'s serve-ledger block: same-word pairs (a decrement is never observed ahead of its increment), the Dekker pair between the stamp's re-read and the step's bump (a start the ladder did not observe is post-step), slot aliasing poisoned (over-conservative, never unsafe). `D_purge` survives ONLY as the must-stay-0 tripwire `free_grace_drain_overdue` — it never shortens the wait. Lever `SQUEEZEFS_FREE_GRACE_DRAIN_OBSERVED`; gauges `free_grace_drain_{observed,overdue,wakes}`, `reader_serves_inflight`, `reader_serve_{step_races,slot_overruns}` | `4fdc15ae` (red) · `324677ba` |
+
+In-process (release, the fleet-cadence shape, deterministic): H3
+`bound_age` **7,724 → 6,724 → 4,724 → 2,724 ms** (residence 7,841 →
+2,838; `checkpointed→min_acked` 7,339 → 2,336), closure exact, forced =
+fences = overdue = 0 on every row. The model runs no serves, so its drain
+is the step itself; on a mount the drain is the serve residence
+(milliseconds) plus one wake. The fleet row is the parent's (OWED).
+
 ### Fleet acceptance — RUN 2026-09-06 09:57 (the note's §6): levers landed as priced, row still FAILS
 
 `s11-mpiio` from zero on `0723b3ea`: `free_grace_bound_age_ms` 8,994 →
@@ -1408,6 +1434,22 @@ clean co-writers (m50, m57 — no `CLAIM ANOMALY`) → 0, closure exact, forced
   the reader's pass rate). Elastic passes buy more passes — finer stage
   granularity — never shorter windows; structurally inert where the routine
   interval is already at the floor (this venue).
+  **Amended 2026-09-06 (user decision — the ladder re-derivation,
+  `.benchmarks/2026-09-06-free-grace-ladder-rederivation.md`):** the
+  windows stay pinned against DEMAND exactly as above — no pass cadence,
+  prod or pressure signal may shorten them — but their DERIVATIONS are no
+  longer the reader's staleness bound. **Qualify = the writer's checkpoint
+  landing ceiling + skew** (the argument always rested on the WRITER's
+  ceiling; the staleness bound added the reader's poll interval on top of
+  it, and for qualification the pass IS the poll — `S` was never the
+  honest term). **Drain = an epoch-step invalidation of the reader's
+  layout cache + an observed in-flight drain** (the caches' TTL and the
+  `D_purge` reserve were timers standing in for an event and a count the
+  reader can observe exactly; `D_purge` survives only as the
+  `free_grace_drain_overdue` tripwire). The published
+  `reader_staleness_bound_ms` and the reader TTLs it derives are unchanged
+  — they state the S5 metadata-staleness contract, which this decision
+  does not touch.
 * **KD-FG-7 — All new sizings derive; all new mechanisms have bool levers.**
   Pipeline depth, prod cadence, refresh rate, pass floor, horizon and
   watermark derive from the plane's published numbers or arrive measured

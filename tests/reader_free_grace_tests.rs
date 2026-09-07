@@ -703,13 +703,17 @@ async fn the_ring_cap_forces_progress_through_the_fence() {
 /// * an **epoch step** (a revalidation pass that advanced, i.e. one that
 ///   ran the R-6 purge) — an inert poll purges nothing, so it proves
 ///   nothing about cached bytes keyed by a reused bare offset;
-/// * whose pass **began** at least `staleness_bound + skew_max` after the
-///   label was learned, so the writer's dereference is durably
-///   checkpointed and therefore in the record the pass adopts;
-/// * plus a **drain wait** of `staleness_bound + D_purge` — the daemon
-///   layout/attr caches (whose reader TTL *is* the staleness bound) must
-///   expire and in-flight serves must finish. §6.7's `D_purge` is exactly
-///   the "observe, then finish" term.
+/// * whose pass **began** at least the qualify window after the label was
+///   learned, so the writer's dereference is durably checkpointed and
+///   therefore in the record the pass adopts;
+/// * plus the **drain**: the daemon layout cache may serve no pre-step
+///   binding and every pre-step serve must have finished.
+///
+/// This contract drives the ladder with the L1-era numbers (qualify 2,000,
+/// drain 4,000, timer only) — the gates' MECHANICS; their derivations are
+/// the 2026-09-06 re-derivation's (contracts 32–38): qualify = the writer's
+/// checkpoint landing ceiling + skew, drain = an epoch-step invalidation
+/// plus an observed in-flight drain.
 #[test]
 fn a_reader_acknowledges_only_after_the_purge_and_the_drain() {
     let _serial = serial();

@@ -605,6 +605,30 @@ lane"* is structural rather than a convention.
   retire, the recovery walk) still refuse locally on a co-writer
   (`cowriter.accounting_refusals` counts exactly those), so a rewrite
   displaces through the router and never through them;
+* a displaced block's **local hygiene** (the co-writer's own refcount
+  entry + incarnation word — the `claim_block_idx` tripwire's input, never
+  accounting) follows the arm that freed it. On the **explicit-ship arm**
+  the `Freed` verdict retires it inside `ship_displaced_frees`, one RTT
+  after the free. On the **recompute arm** — a served publish whose owner
+  replaced the frame with its own head→composed diff and freed the true
+  displaced set itself (≈ 98 % of a rewriting co-writer's displaced blocks
+  on the s11 fleet) — the reply carries the offsets the owner's ladder
+  actually free-listed (`freed`, publish schema 15), and
+  `DataRouter::retire_recomputed_parked` retires exactly those parked
+  rewrite-epoch keys AT THE REPLY, under the same `retire_shipped_free_
+  tracking` discipline, counted `cowriter.recomputed_retires`. Before
+  schema 15 the reply said only "recomputed" and those keys waited for
+  the epoch CLOSE; the freed offset's grace ring → lane harvest → claim
+  loop beat the close ~1 % of the time and `claim_block_idx` found the
+  entry lingering (`block_claim_anomalies` 1,156–1,402 per fpp phase Σ 8
+  co-writers, `.benchmarks/2026-09-07-cowriter-claim-anomaly-lineage.md`).
+  The retire is a LIFETIME act: a parked key whose stamp is no longer the
+  offset's live incarnation names a lifetime this mount already re-minted
+  (the harvest beat a delayed reply) and touches nothing of the live one.
+  Keys the owner did not free (NonTerminal, refused, out of custody) stay
+  parked for the close's existing arm. Leaving the park also un-counts the
+  key from the supply-coupled close's yield estimate (`parked_bytes`),
+  which had been counting blocks the authority already held free;
 * a raise that cannot be made durable **gives the offset back** — and on a
   co-writer that give-back is itself refused (a free), so the index is skipped
   rather than returned. Bounded by raise failures, which are loud

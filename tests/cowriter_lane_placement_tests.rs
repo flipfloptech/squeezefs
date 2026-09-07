@@ -108,6 +108,7 @@ impl Drop for Restore {
     fn drop(&mut self) {
         squeezefs::block_allocator::test_set_cowriter_lane_placement(None);
         squeezefs::block_allocator::test_set_harvest_ahead(None);
+        squeezefs::block_allocator::test_clear_harvest_single_flight();
         free_grace::reset_for_test();
     }
 }
@@ -622,13 +623,66 @@ async fn both_lanes_exhausted_and_nothing_held_refuses_at_once_after_asking_both
 /// Contract 3b: both lanes exhausted, both authorities empty but reporting a
 /// HELD ring (the field's m50 shape, bound age 15,096 ms). The placed
 /// allocation PARKS (finding 29's promise — the retries drive the
-/// authority's fence), re-runs the harvest on both volumes each slice, and
+/// authority's fence), retries the harvest on both volumes each slice, and
 /// refuses `StorageFull` at the wall: exactly today's bounded allocation,
-/// over the set instead of one volume.
+/// over the set instead of one volume. Each volume's retries are that
+/// volume's single-flight (finding 15 phase B1): with no grant arriving,
+/// each authority is asked ONCE and every later slice declines on the
+/// fresh empty reply — two independent declines, one per allocator.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn both_lanes_exhausted_with_a_held_ring_parks_then_refuses_at_the_wall() {
     let _s = serial();
     let _r = restore();
+    let rig = rig(true).await;
+    rig.a.authority.hint_ms.store(15_096, Ordering::Relaxed);
+    rig.b.authority.hint_ms.store(15_096, Ordering::Relaxed);
+    rig.a.exhaust().await;
+    rig.b.exhaust().await;
+    rig.router.refresh_placement_table();
+
+    let g0 = gauges();
+    let declined0 = METRICS
+        .alloc_lane_harvest_declined_stale
+        .load(Ordering::Relaxed);
+    let wall = free_grace::pressure_park_wall_ms();
+    let t0 = Instant::now();
+    let e = refused(
+        tokio::time::timeout(BOUND, rig.router.allocate_placed_block())
+            .await
+            .expect("THE WEDGE: the bounded allocation must end within the bound"),
+        "still no supply",
+    );
+    let elapsed = t0.elapsed();
+    assert!(is_storage_full(&e), "the verdict stays StorageFull: {e}");
+    let g1 = gauges();
+    assert!(g1.parks > g0.parks, "the park engaged");
+    assert_eq!(
+        (rig.a.authority.calls(), rig.b.authority.calls()),
+        (1, 1),
+        "each volume's authority asked once; every later slice declined on its empty reply"
+    );
+    assert!(
+        METRICS
+            .alloc_lane_harvest_declined_stale
+            .load(Ordering::Relaxed)
+            >= declined0 + 2,
+        "both allocators declined their retries"
+    );
+    assert!(
+        elapsed.as_millis() as u64 <= wall + 2_000,
+        "the park ends at the wall ({wall} ms) — took {elapsed:?}"
+    );
+    assert_eq!(g1.failovers, g0.failovers);
+}
+
+/// Contract 3b's A/B control: `SQUEEZEFS_ALLOC_LANE_HARVEST_SINGLE_FLIGHT=0`
+/// re-runs the harvest on BOTH volumes each park slice — the shipped shape
+/// verbatim, over the set.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_single_flight_lever_off_re_runs_both_harvests_every_slice() {
+    let _s = serial();
+    let _r = restore();
+    squeezefs::block_allocator::test_set_harvest_single_flight(Some(false));
     let rig = rig(true).await;
     rig.a.authority.hint_ms.store(15_096, Ordering::Relaxed);
     rig.b.authority.hint_ms.store(15_096, Ordering::Relaxed);
@@ -642,7 +696,7 @@ async fn both_lanes_exhausted_with_a_held_ring_parks_then_refuses_at_the_wall() 
     let e = refused(
         tokio::time::timeout(BOUND, rig.router.allocate_placed_block())
             .await
-            .expect("THE WEDGE: the bounded allocation must end within the bound"),
+            .expect("the bounded allocation must end within the bound"),
         "still no supply",
     );
     let elapsed = t0.elapsed();
@@ -651,7 +705,7 @@ async fn both_lanes_exhausted_with_a_held_ring_parks_then_refuses_at_the_wall() 
     assert!(g1.parks > g0.parks, "the park engaged");
     assert!(
         rig.a.authority.calls() > 1 && rig.b.authority.calls() > 1,
-        "each park slice re-ran the harvest on BOTH volumes ({} / {})",
+        "lever off: each park slice re-ran the harvest on BOTH volumes ({} / {})",
         rig.a.authority.calls(),
         rig.b.authority.calls()
     );
@@ -659,7 +713,7 @@ async fn both_lanes_exhausted_with_a_held_ring_parks_then_refuses_at_the_wall() 
         elapsed.as_millis() as u64 <= wall + 2_000,
         "the park ends at the wall ({wall} ms) — took {elapsed:?}"
     );
-    assert_eq!(g1.failovers, g0.failovers);
+    assert!(squeezefs::block_allocator::test_clear_harvest_single_flight());
 }
 
 // ===========================================================================

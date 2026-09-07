@@ -28,7 +28,11 @@
 //!    whenever a harvest SINK was installed — the existence of the wire,
 //!    not evidence of supply. The allocator therefore parked every
 //!    exhausted co-writer allocation forever, one authority harvest RPC per
-//!    50 ms slice (m50: 16,899 harvests for 16,769 refusals).
+//!    50 ms slice (m50: 16,899 harvests for 16,769 refusals). (The per-
+//!    slice RPC itself was retired by the single-flight harvest — finding
+//!    15 phase B1, `SQUEEZEFS_ALLOC_LANE_HARVEST_SINGLE_FLIGHT`: a parked
+//!    retry declines on a fresh empty reply until a grant moves the
+//!    advertisement; the lever off is the shape above.)
 //!
 //! # The contracts
 //!
@@ -115,6 +119,7 @@ impl Drop for Restore {
         write_pipeline::set_depth_override(None);
         free_grace::reset_for_test();
         membership::uninstall();
+        squeezefs::block_allocator::test_clear_harvest_single_flight();
     }
 }
 
@@ -214,6 +219,13 @@ fn is_storage_full(e: &SqueezefsError) -> bool {
 /// bounded allocation must PARK (finding 29's promise — the retries drive
 /// the authority's pressure fence) and then REFUSE at the wall. Against
 /// `dev` it never returns: the wall is `u64::MAX`.
+///
+/// The retries' harvests are single-flight with a fresh-empty decline
+/// (finding 15 phase B1, `SQUEEZEFS_ALLOC_LANE_HARVEST_SINGLE_FLIGHT`):
+/// with no grant arriving, the park re-issues NOTHING after the one empty
+/// reply — every slice's retry declines (`alloc_lane_harvest_declined_stale`)
+/// and the verdict lands at the same wall. The lever off restores one RPC
+/// per slice (the sibling test below).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_bounded_allocation_ends_on_an_exhausted_co_writer_lane() {
     let _s = serial();
@@ -229,9 +241,12 @@ async fn the_bounded_allocation_ends_on_an_exhausted_co_writer_lane() {
         METRICS.alloc_lane_enospc_refusals.load(Ordering::Relaxed) > refusals0,
         "the refusal is counted on alloc_lane_enospc_refusals"
     );
+    assert_eq!(authority.calls(), 1, "the exhausted allocation asked once");
 
     let parks0 = free_grace::pressure_parks();
-    let harvests0 = authority.calls();
+    let declined0 = METRICS
+        .alloc_lane_harvest_declined_stale
+        .load(Ordering::Relaxed);
     let wall = free_grace::pressure_park_wall_ms();
     let t0 = Instant::now();
     let verdict = tokio::time::timeout(BOUND, a.allocate_block_grace_bounded())
@@ -244,14 +259,57 @@ async fn the_bounded_allocation_ends_on_an_exhausted_co_writer_lane() {
         free_grace::pressure_parks() > parks0,
         "the park engaged (the retries are what drive the authority's fence)"
     );
+    assert_eq!(
+        authority.calls(),
+        1,
+        "the empty reply stands until a grant moves the advertisement: no slice re-issued"
+    );
     assert!(
-        authority.calls() > harvests0 + 1,
-        "each park slice re-ran the harvest"
+        METRICS
+            .alloc_lane_harvest_declined_stale
+            .load(Ordering::Relaxed)
+            > declined0,
+        "every slice's retry declined"
     );
     assert!(
         elapsed.as_millis() as u64 <= wall + 2_000,
         "the park ends at the wall ({wall} ms) — took {elapsed:?}"
     );
+}
+
+/// The A/B control: `SQUEEZEFS_ALLOC_LANE_HARVEST_SINGLE_FLIGHT=0` is the
+/// shipped shape verbatim — each park slice re-runs the harvest (the m50
+/// storm's mechanism: 16,899 harvests for 16,769 refusals), and the park
+/// still ends at the wall.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_lever_off_re_runs_the_harvest_every_park_slice() {
+    let _s = serial();
+    let _r = restore();
+    squeezefs::block_allocator::test_set_harvest_single_flight(Some(false));
+    let authority = EmptyAuthority::new(15_096);
+    let a = exhausted_co_writer("f15-wedge-park-off", 8, &authority).await;
+    let _ = a.allocate_block().await.expect_err("the lane is exhausted");
+
+    let parks0 = free_grace::pressure_parks();
+    let harvests0 = authority.calls();
+    let wall = free_grace::pressure_park_wall_ms();
+    let t0 = Instant::now();
+    let verdict = tokio::time::timeout(BOUND, a.allocate_block_grace_bounded())
+        .await
+        .expect("the bounded allocation must end within the bound");
+    let elapsed = t0.elapsed();
+    let e = verdict.expect_err("the lane is still exhausted");
+    assert!(is_storage_full(&e), "the verdict stays StorageFull: {e}");
+    assert!(free_grace::pressure_parks() > parks0, "the park engaged");
+    assert!(
+        authority.calls() > harvests0 + 1,
+        "lever off: each park slice re-ran the harvest"
+    );
+    assert!(
+        elapsed.as_millis() as u64 <= wall + 2_000,
+        "the park ends at the wall ({wall} ms) — took {elapsed:?}"
+    );
+    assert!(squeezefs::block_allocator::test_clear_harvest_single_flight());
 }
 
 /// An authority reporting NOTHING held (bound age 0) is genuine exhaustion

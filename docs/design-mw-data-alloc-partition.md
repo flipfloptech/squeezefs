@@ -314,11 +314,15 @@ share raised (≈ 20–30 % of a fpp co-writer's harvest RPCs came back
 empty). The engagement gauge is `alloc_lane_volume_hint_skips` — pushed
 decisions the vector declined that the sum would have fired.
 
-The same vector fixes the two per-volume gaps the epoch close and the
-harvest decline had: the supply-coupled rewrite-epoch close plans over the
-keys parked ON THE ASKING VOLUME (design-rewrite-program §5.3,
-`SQUEEZEFS_REWRITE_SUPPLY_CLOSE_PER_VOLUME`), and the single-flight
-decline's witness is per volume (§4.2 item 2).
+The same vector makes the single-flight decline's witness per volume (§4.2
+item 2). It does NOT make the supply-coupled rewrite-epoch close per
+volume: that was tried the same day and falsified on the D row
+(`.benchmarks/2026-09-07-cowriter-fpp-supply-residue.md` §8) — the
+lane-aware placement equalizes the volumes' STOCKS, so a parked key
+returning to either volume restocks the mount, and planning over the
+asking volume's keys only stranded the sibling's to the iteration
+boundary. Stock is fungible across a co-writer's volumes; live data is
+not — which is why the capacity law below is written per mount.
 
 ### 4.2 The harvest verb's client-side discipline — single-flight per allocator
 

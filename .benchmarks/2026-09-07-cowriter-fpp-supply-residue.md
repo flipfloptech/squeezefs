@@ -1,29 +1,40 @@
 # Finding 15 — the file-per-proc lane-ENOSPC residue on the passing tip: attribution and the per-volume fixes (2026-09-07)
 
-**Verdict.** On `886d4e31` the `s11-mpiio` fleet (authority + 8 co-writers,
-two 32 GiB data volumes, W = 16 ⇒ 512 blocks per lane per volume) sustains
-every phase, but the file-per-proc phases refuse 7,486–16,065 lane
-allocations per phase and A2 (the aged shared-file phase) up to 16,065
-(`.benchmarks/2026-09-07-f15-b1-squeeze-test-seq2.md` §2). The time series
-attributes them to **a lane at its capacity edge whose supply returns PER
-VOLUME while three co-writer mechanisms still planned MOUNT-wide**: every
-refusal is a park slice on a lane whose stock ran dry (never a synchronous
-`ENOSPC` — `write_enospc_refusals` 0 on every row), the counter reads 2 per
-50 ms slice per parked allocation (both volumes are tried and each refusal
-is counted), 92–97 % of the refusals are single-flight DECLINES (the
-authority was not asked because nothing it had advertised had moved), and
-at the burst instants the lane's own displaced keys were sitting (a) in the
-authority's grace ring, (b) parked in this mount's open rewrite epochs
-(A2: every refusal; fpp: ~20 %), or (c) on the authority's list for the
-SIBLING volume. Landed: the supply-coupled epoch close plans **per volume**
-(`SQUEEZEFS_REWRITE_SUPPLY_CLOSE_PER_VOLUME`), the renewal grant carries the
-lane-supply hint **per volume** (`Grant::lane_supply_volumes`,
-`CLUSTER_WIRE_SCHEMA` 3, `SQUEEZEFS_ALLOC_LANE_VOLUME_HINT`) so the pushed
-refill, the ahead witness and the single-flight decline are per volume, and
-`BackendRouter::lane_allocators` names the default slot's alias of the first
-volume once (the fleet was running TWO refill tasks on volume 1). The fleet
-row is the parent's on `squeeze-test`; this note claims the attribution and
-the in-process contracts only.
+**Verdict (re-stated after the D-C-C-D on squeeze-test, §8).** On
+`886d4e31` the `s11-mpiio` fleet (authority + 8 co-writers, two 32 GiB
+data volumes, W = 16 ⇒ 512 blocks per lane per volume) sustains every
+phase, but the file-per-proc phases refuse 7,486–16,065 lane allocations
+per phase and the aged shared-file phase A2 up to 16,065
+(`.benchmarks/2026-09-07-f15-b1-squeeze-test-seq2.md` §2). **The refusals
+are the capacity law of the venue, not code**: the matrix keeps the
+previous phase's file (`ior -k`), so through B1/B2/A2 each mount's lane
+holds 640 LIVE blocks (the 10 GiB shared file + the 10 GiB fpp files, 2.5
+GiB per mount) of its 1,024-block share, and the recycle loop's transit
+(parked → shipped free → the authority's grace ring ≈ 2.2 s → the lane list
+≈ 0.7 s → harvest) is ≈ 3.4 s, so ≈ 215 more blocks are in flight at the
+measured 63 blocks/s per mount; the ≈ 170 blocks left cannot carry an
+iteration's 4.5 s front of 80 blocks/s for the 3.4 s before its first
+displaced block comes back — the lane is dry for ≈ 1 s of every
+iteration, on every co-writer, and every refusal is a 50 ms park slice
+counted twice (both volumes tried). A1, the same workload with 320 live
+blocks, refuses nothing (5–18 per row). Every refusal is a park slice
+(never a synchronous `ENOSPC` — `write_enospc_refusals` 0 on every row),
+92–97 % are single-flight DECLINES bounded by the 500 ms prodded grant
+cadence, and the authority's list wait is 0.69 s mean on D and C alike.
+
+Of the three landings the first pass made (§5), the **per-volume lane-supply
+hint** (`Grant::lane_supply_volumes`, `CLUSTER_WIRE_SCHEMA` 3) engaged as
+priced — harvest RPCs −30 % at +25 % blocks per RPC, `alloc_lane_volume_hint_skips`
+205–434 per phase, the list wait unchanged — and stays; the
+**`lane_allocators` dedup** is a defect fix and stays; the **per-volume
+supply-coupled close** was FALSIFIED by the D row (its premise — a close's
+yield must land on the exhausted volume — is wrong because the lane-aware
+placement equalizes the volumes' stocks, and it stranded the covered
+sibling's parked keys to the iteration boundary: 14 % of the displaced
+keys released by the routine closes vs 0.3–1 % on both C rows) and is
+RETIRED (`0bd03455` → this branch). The fleet row is the parent's on
+`squeeze-test`; this note claims the attribution, the capacity statement
+and the in-process contracts.
 
 ## 1. Evidence
 
@@ -143,20 +154,17 @@ wake covers it at 2–4/s).
 
 ## 5. What landed (this branch, `perf/cowriter-fpp-supply-residue`)
 
-### 5.1 The supply-coupled close plans per volume
+### 5.1 The supply-coupled close plans per volume — RETIRED (§8)
 
-`SQUEEZEFS_REWRITE_SUPPLY_CLOSE_PER_VOLUME` (default on). `RewriteEpoch`
-counts its parked A keys per `vol_tag` at the park (the key's allocator is
-resolved once — `parked_by_volume`); the close sink captures the asking
-allocator's tag; `DataRouter::supply_close_epochs(vol_tag, deficit)` weighs
-each epoch by the keys it parks ON THAT VOLUME and runs the same
-`supply_close_plan` (largest first until the yield on that volume covers
-the deficit). An epoch parking only elsewhere is no candidate (never
-`bounded`); a tick with parked keys only elsewhere declines
-`rewrite_shadow_supply_close_declined_offvolume`. Face:
-`rewrite_shadow_supply_close_volume_blocks` (⊆ `_blocks`). `0` = the
-mount-wide plan verbatim. Every §5.6 crash window of the rewrite program
-holds: the close is `close_rewrite_epoch` unchanged.
+Landed as `SQUEEZEFS_REWRITE_SUPPLY_CLOSE_PER_VOLUME` (default on):
+`RewriteEpoch` counted its parked A keys per `vol_tag`, the close sink
+carried the asking allocator's tag, and the plan weighed each epoch by the
+keys it parked ON THAT VOLUME. The D row measured the harm (§8.3) and the
+premise was wrong (§8.4): the knob, the per-volume parked accounting and
+the two faces (`rewrite_shadow_supply_close_volume_blocks`,
+`…_declined_offvolume`) are deleted; the plan is mount-wide, as first
+landed, and contract 7 of `tests/rewrite_shadow_supply_close_tests.rs`
+now pins the mount-wide law on the two-volume rig.
 
 ### 5.2 The grant's lane-supply hint per volume
 
@@ -192,7 +200,7 @@ wasteful in its task and its OPEN round trip).
 
 | suite | new contracts | result |
 |---|---|---|
-| `tests/rewrite_shadow_supply_close_tests.rs` | 7: a starving volume closes the epoch whose keys live on it first (two-volume fs rig — F1 on A, F2 on B, B's tick publishes F2 and leaves F1 open, `volume_blocks` +2, a second B tick declines `offvolume`, A's tick then publishes F1); the lever-off twin (B's tick publishes the largest epoch, F1, restocks A, `bounded` +1, no volume gauge moves) | 10 passed |
+| `tests/rewrite_shadow_supply_close_tests.rs` | 7 (as re-pinned after §8): a starving volume publishes the MOUNT's largest epoch whose keys live on its sibling (two-volume fs rig — B four short, F1 4 keys on A, F2 2 on B: B's tick publishes F1, `bounded` +1, A restocks 2 → 6 and the next placed allocation lands on A with no refusal; the next B tick publishes F2). The first pass's per-volume contract pair is gone with the mechanism | 9 passed |
 | `tests/cowriter_lane_placement_tests.rs` | 7: the router names the aliased default allocator once | 12 passed |
 | `tests/mw_data_alloc_lane_tests.rs` | §11: a decline on A ends when A's advertised supply moves (a B-only grant leaves A declined and skips A's pushed tick — `alloc_lane_volume_hint_skips` +1 — while B harvests; an A grant ends A's decline for one RPC; an unnamed volume keeps the every-grant law); the lever-off twin reads the sum verbatim | 32 passed |
 | regression: `free_grace_lane_visible_tests` 10, `cluster_wire_tests` 23 (+1 ignored), `dlm_membership_tests` 51, `membership_renewal_isolation_tests` 5, `mw_cowriter_lane_tests` 26, `mw_cowriter_free_tests` 50, `mw_cowriter_free_leak_tests` 9, `dlm_cowriter_tests` 18, `dlm_multi_writer_tests` 16, `derivation_sweep_tests` 47, `env_knob_convention_tests` 21, `audit_instruments_tests` 26, `reader_free_grace_tests` 61 | | all green |
@@ -203,23 +211,157 @@ warnings" cargo doc --no-deps` (see the report).
 
 ## 7. What is NOT claimed
 
-* **The fleet row.** No `s11-mpiio` row was run on this branch; the
-  refusal, RPC and throughput effect of the three landings is the parent's
-  A-B-B-A on `squeeze-test`. The expected faces: `alloc_lane_volume_hint_skips`
-  ≈ the empty-RPC share (20–30 % of the pre-landing harvests),
-  `rewrite_shadow_supply_close_volume_blocks` ≈ `_blocks` (the yield lands
-  where the deficit is), `alloc_lane_pushed_harvests` ≈ 2 × wakes on a
-  two-volume mount.
-* **A refusal-count target.** The remainder row of §4 — the lane at its
-  capacity edge behind a ≈ 2 s grace hold — is the binding term on this
-  geometry and none of the three landings moves it; a lower count needs
-  the hold-time program's next rung or a larger share. The three landings
-  make the co-writer's supply decisions honest per volume and cut the
-  authority's empty serves; the parked-time effect is owed to the row.
+* **A refusal-count effect from any landing.** The D row (§8) shows none
+  of the three moved the fpp refusals, and the capacity statement (§8.5)
+  says none could: the binding terms are the venue's live occupancy and
+  the loop's hold. The per-volume hint's claim is the RPC economy it was
+  built for (−30 % harvests, +25 % blocks/RPC, skips 205–434/phase);
+  the dedup's is correctness; the per-volume close is retired.
 * **Anything about the decline's stickiness.** Its window was bounded by
-  the prodded grant cadence on every C phase; per-volume makes it honest
-  (a sibling's grant no longer re-arms an RPC here), not shorter.
+  the prodded grant cadence on every C phase and on D; per-volume made it
+  honest (a sibling's grant no longer re-arms an RPC here), not shorter.
+  The authority's list wait — `alloc_lane_visible_phase_ns.released_served`
+  — is 692/693/710 ms mean (D/2C/3C, B1), p50 ≤ 512 ms, p90 ≤ 2 s on all
+  three: the decline moved nothing the co-writer could have reached.
 * **The counter's shape.** `alloc_lane_enospc_refusals` keeps counting
-  each refused `allocate_block` — 2 per slice per parked allocation on a
-  two-volume mount; the note's arithmetic (÷ 40 per second) is the reading,
-  not a new gauge.
+  each refused `allocate_block` — 2 per 50 ms slice per parked allocation
+  on a two-volume mount; the note's arithmetic (÷ 40 per second) is the
+  reading, not a new gauge.
+* **The D-vs-C delta as a measured regression.** D's B1/A2 refusals per
+  second (224 / 350) sit above every C row (79–150 / 160–288 across four),
+  but the C rows themselves spread 2× and per-mount counts spread 2× within
+  one row; with one D row the 15–20 % lower supply-close rate (§8.3) is the
+  direction of the delta, not its measured size. The retirement stands on
+  the falsified premise and the stranding instrument, which are exact.
+
+## 8. The D-C-C-D re-attribution (squeeze-test, 2026-09-07 evening)
+
+D = `0bd03455` (the three landings), C = `886d4e31`; rows 1D 2C 3C, row 4D
+excluded (its sizing probe read 235 MiB/s). Snapshots
+`/tmp/five/d4/box-seq3/keep3-{1D,2C,3C}/rows/s11mpiio-*/m{0,50..57}_p{0..4}.json`
+(every mount), the authority + m50 logs, no per-second samples. Phase
+lengths differ (D 57/91/92/75 s, 2C 70/107/107/83 s, 3C 56/79/80/64 s —
+19/23/17 iterations), so the ledger below is per phase SECOND.
+
+### 8.1 The Σ8 ledger, per phase second
+
+| gauge (Σ8 co-writers, per s) | 1D A1 / B1 / B2 / A2 | 2C | 3C |
+|---|---|---|---|
+| `alloc_lane_enospc_refusals` | 0.1 / **224** / 103 / **350** | 0.3 / 115 / 127 / 160 | 0.1 / 150 / 133 / 288 |
+| `alloc_lane_harvest_declined_stale` | 0.1 / 218 / 100 / 345 | 0.2 / 110 / 121 / 156 | 0.2 / 142 / 127 / 280 |
+| `alloc_lane_harvests` (RPCs) | 18.9 / 25.2 / 25.7 / 24.6 | 23.9 / 33.0 / 33.1 / 31.4 | 20.6 / 32.4 / 31.0 / 31.3 |
+| `alloc_lane_harvested_blocks` | 815 / 756 / 753 / 702 | 808 / 791 / 793 / 771 | 728 / 779 / 776 / 738 |
+| blocks per harvest RPC | 43 / 30 / 29 / 29 | 34 / 24 / 24 / 25 | 35 / 24 / 25 / 24 |
+| `alloc_lane_pushed_harvests` ÷ `free_grace_lane_push_wakes` | 1.00 / 1.25 / 1.26 / 1.20 | 1.73 / 2.29 / 2.27 / 2.28 | 1.62 / 2.41 / 2.38 / 2.21 |
+| `alloc_lane_volume_hint_skips` | 3.6 / 4.8 / 4.5 / 4.5 | — | — |
+| `rewrite_blocks` (the churn) | 817 / 502 / 525 / 644 | 803 / 521 / 545 / 709 | 737 / 515 / 543 / 682 |
+| `rewrite_shadow_supply_closes` | 5.7 / 29.1 / 29.7 / 9.6 | 7.4 / 34.1 / 35.6 / 11.0 | 4.7 / 37.0 / 38.2 / 10.8 |
+| `rewrite_shadow_supply_close_blocks` | 373 / **430** / 433 / **497** | 504 / 516 / 537 / 626 | 318 / 513 / 529 / 600 |
+| `…_declined_covered` / `_no_parked` / `_offvolume` / `_bounded` (B1) | 10.7 / 10.2 / 0.5 / 2.9 | 17.2 / 15.4 / — / 8.1 | 14.0 / 15.0 / — / 7.7 |
+| `backend_placement_lane_failovers` / `_exhausted_picks` (B1) | 1.3 / 0 | 2.0 / 0 | 2.4 / 0 |
+| `write_enospc_refusals`, `free_grace_forced_releases`, `invariant_tripwires` | 0 | 0 | 0 |
+
+Authority faces, all three rows alike: `free_grace_hold_ms` 1,947–2,292,
+`free_grace_bound_age_ms` 2,080–2,737 at the phase ends,
+`free_grace_pressure_pct` 97–100, `free_grace_prod_renew_ms` 500
+throughout, `free_grace_offsets` 400–1,500 held, `alloc_lane_supply_blocks`
+(the co-writers' released, unharvested supply) 620–2,450.
+
+### 8.2 The lane-visible ledger — the decline moved nothing
+
+`alloc_lane_visible_phase_ns` (Σ8, B1): `released_served` — the time a
+released block sat on the authority's list before the co-writer's harvest
+took it — mean **692 / 693 / 710 ms** (D / 2C / 3C), p50 ≤ 512 ms, p90 ≤ 2 s
+on all three; `served_visible` (the harvest RTT to adoption) 6.0 / 7.8 /
+7.8 ms. The per-volume decline witness and the per-volume pushed decision
+changed WHEN the co-writer asks (fewer, better-aimed RPCs) and not how long
+its supply waited: hypothesis (b) — the witness moving too rarely — is
+falsified by the instrument built to test it. (The tail is by design: a
+volume above its watermark leaves released blocks on the list until it
+needs them.)
+
+### 8.3 The per-volume close stranded the covered sibling's keys
+
+Every displaced key leaves its epoch through exactly one close — a supply
+close (the refill tick's) or a routine close (fsync / coverage / the idle
+sweeper, the iteration boundary on fpp). `rewrite_shadow_bytes` counts
+the blocks each close swapped; `rewrite_shadow_supply_close_blocks` the
+keys the supply closes released:
+
+| row (B1) | closes: supply / routine | supply-closed keys | of the ≈ displaced (`rewrite_blocks` − the 2,560 fresh) | closes/s per mount |
+|---|---|---|---|---|
+| 1D | 2,655 / 53 | 39,287 | **91 %** — 3,927 keys (9 %) waited for the boundary; on the B-swapped count, 14 % | 3.65 |
+| 2C | 3,663 / 35 | 55,350 | ≈ 100 % (the count exceeds the estimate: same-epoch re-rewrites park their prior B key too) | 4.28 |
+| 3C | 2,925 / 12 | 40,570 | ≈ 100 % | 4.63 |
+
+On D the supply close released 430 blocks/s against 516 (2C) and 513 (3C)
+— 17 % fewer at the same churn — and ~4–6 k keys per fpp phase sat parked
+to the iteration boundary that both C rows released mid-iteration. The
+mechanism: the per-volume plan's candidates were the keys parked on the
+ASKING volume, and a volume whose stock sat above its own (lower)
+watermark declined `covered` (1.3/s per mount on D) — so an epoch whose
+keys lived mostly on the covered volume was neither the short volume's
+candidate (low weight → `bounded`, 264 in B1) nor the covered volume's
+(no tick) until the boundary. `offvolume` (0.5/s) is the visible corner
+of it; the stranding itself was invisible to the new faces. A2's doubling
+(350/s vs 160–288) is the same shape on the one shared-file epoch —
+`offvolume` 90, its highest, and supply-closed blocks/s 497 vs 600–626 —
+plus the row spread (§7).
+
+### 8.4 Why the premise was wrong
+
+The plan's premise — a close's yield must return to the EXHAUSTED volume
+— assumed a volume's stock is its own. It is not: the lane-aware placement
+(`.benchmarks/2026-09-07-cowriter-lane-aware-placement.md`) weighs each
+volume by its lane-reachable fraction and keeps the 90 %-of-max band, so
+the picks flow to whichever volume holds more stock until the stocks
+match, and the failover tries the sibling in the same attempt. A parked
+key returning to EITHER volume takes the mount's next write. The data
+placement per volume IS skewed (m50's lane-2 supply came back 75 / 25
+across the volumes on D, 71 / 29 on 2C, 53 / 47 on 3C; `data_write_lane_submits`
+76 / 24 for m50's B1 on D) — that skews where LIVE blocks sit, not where
+STOCK can be used. Stock is fungible across a co-writer's volumes; the
+capacity law is therefore written per MOUNT (§8.5), and the per-volume
+plan could only remove candidates. Retired: contract 7 now pins the
+mount-wide law on the two-volume rig (a starving volume publishes the
+mount's largest epoch whose keys live on its sibling; the yield restocks
+the sibling and the next placed allocation reaches it with no refusal).
+
+### 8.5 The capacity statement (why the remainder is not code)
+
+Per co-writer mount, B1 on D (the other rows within ±5 %):
+
+| term | value | source |
+|---|---|---|
+| lane share | **1,024 blocks** (4 GiB): 8,192 blocks per 32 GiB volume ÷ W = 16 = 512 per volume, two volumes | the venue |
+| live, A1 | 320 (the 10 GiB shared file ÷ 8 mounts, 1.25 GiB) | `ior -b 4m -t 4m -s 80`, 32 ranks, 4 per mount |
+| live, B1 / B2 / A2 | **640** — the shared file is KEPT (`-k`) under the fpp phase and the fpp files under A2 | `A1.out` / `B1.out` command lines (`-k`, distinct `-o` names) |
+| churn | 63 blocks/s (`rewrite_blocks` 45,774 ÷ 91 s ÷ 8) | Σ8 snapshots |
+| loop transit T | ≈ 3.4 s = parked ≈ 0.5 (1 ÷ (3.65 closes/s ÷ 4 epochs) ÷ 2) + ring hold 2.2 (`free_grace_hold_ms`) + list wait 0.69 (`released_served`) + RTT 0.006; the co-writer's own horizon reads 3,000–3,442 ms | authority + co-writer gauges |
+| in flight | ≈ 215 = churn × T (the authority's faces: 90–185 per mount in the ring, 80–225 on the lists) | derived, bracketed by gauges |
+| available (local + list) | ≈ **170** = 1,024 − 640 − 215 (observed local `alloc_lane_reachable_blocks` 101–384 at the phase ends) | derived |
+| iteration | 4.55 s; 4 ranks × 80 blocks = 320 blocks per mount at ≈ 80/s, then the barrier | `B1.out` (20 iterations / 91 s) |
+| the front | 80/s × 3.4 s ≈ **270 blocks** must come from stock before the iteration's first displaced block returns | derived |
+| dry time | (270 − 170) ÷ 80 ≈ **1.2 s per iteration**, ≈ 24 s per phase per mount; at 40 counted refusals per parked allocation-second and a few allocations parked, the observed 100–300 refusals/s fleet-wide | matches the morning row's 19 refusal-seconds per phase on m50 |
+| A1 check | 1,024 − 320 − 215 = 489 ≥ 270 → never dry | 5 / 18 / 6 refusals per row — ✓ |
+
+The remedies are the venue's, not the co-writer's: a lane share ≥ live +
+churn × T + the front ≈ 640 + 215 + 270 = **1,125 blocks** (the venue is
+≈ 10 % under — a third data volume, W = 8, or not keeping the previous
+phase's file all clear it), or a shorter ring hold (the free-grace
+program's `hold_ms` 2.2 s — the largest transit term, owned by
+`.benchmarks/2026-09-06-free-grace-hold-time.md`'s next rung). The parked
+term (≈ 30–55 blocks per mount) is the only co-writer-side one, and it is
+15–25 % of the available stock: closing every open epoch at every short
+tick would cut it to ≈ 16 and buy ≈ 0.25 s of the 1.2 s dry front — a
+candidate lever with a predicted magnitude, not landed (no evidence yet
+that its publish cost is free on the authority at 15 k).
+
+### 8.6 What changed on this branch
+
+The per-volume close is retired (knob, accounting, two faces; the plan is
+mount-wide as first landed); the per-volume hint and the `lane_allocators`
+dedup stay. Contract 7 re-pinned (`a_starving_volume_publishes_the_mounts_largest_epoch_whose_keys_restock_the_sibling`,
+RED against `0bd03455`). Not verified: any fleet row on the retired shape
+(the mount-wide plan's C rows are its evidence; a D′ row would confirm the
+close rate returns to ≈ 34–37/s).

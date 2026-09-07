@@ -9466,6 +9466,44 @@ impl DataRouter {
         }
     }
 
+    /// §5.7's SERVED-publish arm (finding 51, phase B1): a peer's served
+    /// layout commit displaced `indices` of `ino` on the backend directly
+    /// — a foreign durable `Merge` this primitive's hook never saw. Apply
+    /// the `Merge`-class containment to every open record on those
+    /// indices (the durable map is the authority the moment the commit
+    /// landed; the record's captured old binding is what the recompute
+    /// frees next) and schedule their detached retires. A LEGAL peer, so
+    /// no `overlay_foreign_merge` tripwire — counted on
+    /// `overlay_superseded_by_served_publish`. Not under (3.5): the
+    /// served commit already landed, and the sink invalidated this
+    /// router's RAM head before calling here. Returns the count marked.
+    pub(crate) fn overlay_supersede_served_displaced(&self, ino: u64, indices: &[u32]) -> u64 {
+        let Some(h) = self.overlay_hooks_live() else {
+            return 0;
+        };
+        let mut touched = Vec::new();
+        for &b in indices {
+            if (h.probe)(ino, b).is_some() && (h.supersede)(ino, b) {
+                touched.push(b);
+            }
+        }
+        let marked = touched.len() as u64;
+        if marked > 0 {
+            METRICS
+                .overlay_superseded_by_served_publish
+                .fetch_add(marked, Ordering::Relaxed);
+            log::error!(
+                "S11: a served publish displaced block(s) {touched:?} of ino {ino} while this \
+                 authority held open device-overlay record(s) on them — superseded (the durable \
+                 map is the authority; the records' captured old bindings are being freed). The \
+                 shape is a holder's whole-block write meeting the authority's assembly of its \
+                 shipped slices on one block (overlay_superseded_by_served_publish)"
+            );
+            self.overlay_schedule_retires(ino, touched);
+        }
+        marked
+    }
+
     /// The caller's post-3.5 retire venue (§5.7's MARK-only rule, other
     /// half): schedule one detached retire per hook-marked block. Call
     /// AFTER the primitive's `INODE_META_LOCKS` guard dropped.

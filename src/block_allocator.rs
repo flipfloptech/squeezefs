@@ -1855,6 +1855,19 @@ impl BlockAllocator {
     /// either a clone of a block already stable or a stale view the compose
     /// dropped. Unpartitioned allocators own every lane, so a solo mount
     /// never reaches the publish.
+    ///
+    /// What it does NOT touch — the cell's lifetime STAMP (`live_incarnation`,
+    /// the number `incarnation_ok` compares a key's `@stamp` against). The
+    /// seqlock word and the stamp are two fields: this publishes the word's
+    /// stable bit and leaves the stamp exactly as the authority's own mints
+    /// (`claim_block_idx`) or the mount walk (`seed_incarnation`) left it —
+    /// for a foreign-lane offset on a fresh fleet that is `INCARNATION_NONE`,
+    /// which `incarnation_ok` reads as "unknown, accept" (§6.3) before and
+    /// after this witness. The phase-B1 `STALE BLOCK-KEY BINDING` storm
+    /// (`.benchmarks/2026-09-07-read-settle-lost-serialized-authority.md`
+    /// §8) was therefore never this function's: every refused offset was
+    /// LANE 0 — the authority's own mints, whose stamps this function never
+    /// reaches (`lane_is_ours` returns before the publish).
     pub fn witness_served_binding(&self, block_idx: u64) -> bool {
         if self.lane_is_ours(block_idx) {
             return false;

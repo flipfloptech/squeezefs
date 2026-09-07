@@ -14354,6 +14354,23 @@ impl SqueezefsFilesystem {
                 fs.attr_cache.invalidate(&ino);
             },
         ));
+        // Finding 51, phase B1: the served-publish half of the §5.7
+        // one-authority screen — a peer's commit that displaces an index
+        // this fs holds an open overlay record on supersedes the record
+        // (its captured old binding is the key the recompute frees next;
+        // kept alive, its settle read a dead lifetime for ever). The RAM
+        // head is invalidated FIRST so an install racing this commit
+        // refetches the durable head instead of capturing the displaced
+        // key; a capture that slipped in between is what the probe below
+        // and the settle's dead-capture belt still catch.
+        let fs = self.clone();
+        crate::meta_ship::publish::install_served_displacement_sink(std::sync::Arc::new(
+            move |ino: u64, indices: &[u32]| {
+                fs.router.metadata_cache.remove(&ino);
+                fs.attr_cache.invalidate(&ino);
+                fs.router.overlay_supersede_served_displaced(ino, indices);
+            },
+        ));
     }
 
     /// Rung 17: install the CO-WRITER's extent hooks (the mount arm's
@@ -17134,7 +17151,34 @@ impl SqueezefsFilesystem {
         // PREFIX — the missing tail is holes (zeros below), never a
         // Frozen-forever wedge. See `read_nvme_block_old_image`.
         let old_image = match (gaps.is_empty(), rec.core.old_binding()) {
-            (false, Some(old_key)) => Some(self.router.read_nvme_block_old_image(old_key).await?),
+            (false, Some(old_key)) => {
+                // Finding 51, phase B1 — the DEAD-CAPTURE belt behind the
+                // served-publish screen: a captured old binding naming a
+                // dead lifetime of its offset (freed and re-minted since
+                // the capture) means a foreign durable publish displaced
+                // this block past the record — §5.7's `Merge`-class
+                // containment, applied at the one place the staleness is
+                // observable. Retrying the dead key is what the B1 row's
+                // write-arm settle did every 50 ms for nine minutes (10
+                // records, 28,039 refusals); the read-venue settle EIO'd
+                // every FlushExtents force of the ino instead. The probe's
+                // refusal count IS the detection.
+                if !self.router.backend_router.block_key_incarnation_ok(old_key) {
+                    METRICS
+                        .overlay_superseded_dead_old_binding
+                        .fetch_add(1, Ordering::Relaxed);
+                    error!(
+                        "device overlay on ino {ino} block {b}: the captured old binding \
+                         '{old_key}' names a DEAD lifetime of its offset — a durable publish \
+                         displaced the block past this record; superseded (the durable map \
+                         is the authority; overlay_superseded_dead_old_binding)"
+                    );
+                    rec.core.supersede();
+                    self.teardown_overlay_block_locked(ino, b, &rec).await;
+                    return Ok(false);
+                }
+                Some(self.router.read_nvme_block_old_image(old_key).await?)
+            }
             _ => None,
         };
         for &(gs, ge) in &gaps {

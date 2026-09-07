@@ -498,6 +498,7 @@ impl MultiWriterArm {
         publish::uninstall_extent_merge_executor();
         publish::uninstall_extent_flush_executor();
         publish::uninstall_served_layout_invalidation();
+        publish::uninstall_served_displacement_sink();
         // Rung 19: the refs resolver dies with the authority (it holds
         // the data router; a disarmed mount serves no composed commits).
         crate::meta_backend::kv::block_refs::uninstall_block_ref_resolver();

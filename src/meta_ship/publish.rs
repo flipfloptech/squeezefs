@@ -3148,6 +3148,72 @@ fn note_served_layout_commit(inos: &[u64]) {
     }
 }
 
+/// Finding 51, phase B1 (`.benchmarks/2026-09-07-read-settle-lost-
+/// serialized-authority.md` §8) — the SERVED-publish half of
+/// design-overlay-overwrite §5.7's one-authority screen: a served
+/// layout commit that DISPLACES block `b`'s binding is a foreign durable
+/// `Merge` on that index, and the authority's own device-overlay record
+/// on `(ino, b)` (the assembler's shipped-slice shape) captured the key
+/// the recompute is about to free. The routing primitive's hook never
+/// sees a served commit (it lands on the backend directly), so the serve
+/// wrapper hands the displaced indices to this sink — installed by the
+/// authority fs beside the rung-18 invalidation — which invalidates the
+/// fs's RAM head and supersedes the records (the durable map is the
+/// authority the moment the commit lands; kept alive, the record's
+/// settle would read a dead lifetime for ever — the B1 row's 28,039
+/// `STALE BLOCK-KEY BINDING` refusals). Called strictly AFTER the commit
+/// landed, before the recompute's frees run.
+pub type ServedDisplacementSink = Arc<dyn Fn(u64, &[u32]) + Send + Sync>;
+
+static SERVED_DISPLACEMENT_SINK: Lazy<arc_swap::ArcSwapOption<ServedDisplacementSink>> =
+    Lazy::new(arc_swap::ArcSwapOption::empty);
+
+/// Install the authority fs's served-displacement screen (the mount arm's
+/// act, beside the invalidation sink).
+pub fn install_served_displacement_sink(sink: ServedDisplacementSink) {
+    SERVED_DISPLACEMENT_SINK.store(Some(Arc::new(sink)));
+}
+
+/// Uninstall it (disarm / unmount / test teardown).
+pub fn uninstall_served_displacement_sink() {
+    SERVED_DISPLACEMENT_SINK.store(None);
+}
+
+/// The map indices of `ino` a refs frame RELEASES (map-blob custody
+/// excluded) — the bindings the commit displaced.
+fn displaced_indices(ino: u64, refs: &[BlockRefOp]) -> Vec<u32> {
+    let mut out: Vec<u32> = refs
+        .iter()
+        .filter(|o| !o.take && !o.reference.is_map_blob() && o.reference.owner_ino == ino)
+        .map(|o| o.reference.block_index)
+        .collect();
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
+/// [`displaced_indices`] over a recompute's released set.
+fn displaced_indices_of(ino: u64, released: &[BlockRef]) -> Vec<u32> {
+    let mut out: Vec<u32> = released
+        .iter()
+        .filter(|r| !r.is_map_blob() && r.owner_ino == ino)
+        .map(|r| r.block_index)
+        .collect();
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
+/// Hand a committed serve's displaced indices to the installed screen.
+fn note_served_displacements(ino: u64, indices: &[u32]) {
+    if indices.is_empty() {
+        return;
+    }
+    if let Some(sink) = SERVED_DISPLACEMENT_SINK.load_full() {
+        sink(ino, indices);
+    }
+}
+
 fn extent_flush_executor() -> Option<ExtentFlushExec> {
     EXTENT_FLUSH_EXEC.load_full().map(|e| (*e).clone())
 }
@@ -3461,6 +3527,10 @@ struct LayoutPostCommit {
     /// witness strictly after commit Ok (the peer's DMA behind each is
     /// complete; the serve is the authority's witness of it).
     taken_data: Vec<BlockRef>,
+    /// Finding 51, phase B1: the map indices the commit DISPLACED —
+    /// handed to the served-displacement screen strictly after commit Ok,
+    /// before the recompute frees their old bindings.
+    displaced: Vec<u32>,
     was_recomputed: bool,
 }
 
@@ -4679,6 +4749,7 @@ impl PublishService {
                 let released = o.released.len() as u64;
                 if !o.released.is_empty() {
                     MAP_RECOMPUTED_RELEASES.fetch_add(released, Ordering::Relaxed);
+                    note_served_displacements(ino, &displaced_indices_of(ino, &o.released));
                     free_recomputed_releases(ino, o.released).await;
                 }
                 Ok(Some(PublishReply::PutDone {
@@ -4842,6 +4913,7 @@ impl PublishService {
                     let released = o.released.len() as u64;
                     if !o.released.is_empty() {
                         MAP_RECOMPUTED_RELEASES.fetch_add(released, Ordering::Relaxed);
+                        note_served_displacements(ino, &displaced_indices_of(ino, &o.released));
                         free_recomputed_releases(ino, o.released).await;
                     }
                     Ok(PublishReply::MapMigrated {
@@ -5451,7 +5523,9 @@ impl PublishService {
             .try_scoped_kvmap_put(client, ino, &layout, size, &refs)
             .await?
         {
-            // Finding 51: the train committed the caller's claimed takes.
+            // Finding 51: the train committed the caller's claimed takes
+            // and displaced its claimed releases.
+            note_served_displacements(ino, &displaced_indices(ino, &refs));
             witness_taken(&taken_data_refs(&refs));
             return Ok(LayoutPrepare::Done(reply));
         }
@@ -5506,8 +5580,14 @@ impl PublishService {
         // verbatim, moved to the node whose journal admits the commit.
         const SERVE_REF_TX_CHUNK: usize = 512;
         // Finding 51: the whole frame's takes (chunked or not) are the
-        // commit's adopted data blocks — witnessed once the LAYOUT lands.
+        // commit's adopted data blocks — witnessed once the LAYOUT lands;
+        // its releases (the recompute's, or the caller's on a verbatim
+        // arm) are the indices the commit displaces — screened then too.
         let taken_data = taken_data_refs(&refs);
+        let mut displaced = displaced_indices(ino, &refs);
+        displaced.extend(displaced_indices_of(ino, &released_data));
+        displaced.sort_unstable();
+        displaced.dedup();
         while refs.len() > SERVE_REF_TX_CHUNK {
             let tail = refs.split_off(SERVE_REF_TX_CHUNK);
             let chunk = std::mem::replace(&mut refs, tail);
@@ -5524,6 +5604,7 @@ impl PublishService {
                 blob_custody,
                 released_data,
                 taken_data,
+                displaced,
                 was_recomputed,
             },
         }))
@@ -5549,9 +5630,14 @@ impl PublishService {
             mut blob_custody,
             released_data,
             taken_data,
+            displaced,
             was_recomputed,
         } = post;
         committed?;
+        // The screen runs BEFORE the recompute's frees: a record whose
+        // captured old binding this commit displaced is superseded
+        // before that binding's offset can be freed and re-minted.
+        note_served_displacements(ino, &displaced);
         witness_taken(&taken_data);
         if let Some(g) = blob_custody.fresh.as_mut() {
             g.disarm();
@@ -5628,8 +5714,11 @@ impl PublishService {
                 };
                 let refs: Vec<BlockRefOp> = refs.into_iter().map(BlockRefOp::from).collect();
                 // Finding 51: the caller's claimed takes are the blocks it
-                // DMA'd — witnessed once the chained merge commits.
+                // DMA'd — witnessed once the chained merge commits; its
+                // claimed releases (plus the merge's own recompute below)
+                // are the displaced indices the screen sees.
                 let taken_data = taken_data_refs(&refs);
+                let mut displaced = displaced_indices(ino, &refs);
                 // Rung 17 (KD-MW-8's composition law): a SHIPPED merge
                 // CHAINS ONTO THE DURABLE HEAD — the claim re-stamps
                 // under the backend's own 4a I-guard and the link
@@ -5649,6 +5738,12 @@ impl PublishService {
                         refs,
                     )
                     .await?;
+                if let Some(r) = released.as_deref() {
+                    displaced.extend(displaced_indices_of(ino, r));
+                    displaced.sort_unstable();
+                    displaced.dedup();
+                }
+                note_served_displacements(ino, &displaced);
                 witness_taken(&taken_data);
                 // Finding 36 (half 1): the recompute-released DATA blocks
                 // run this authority's OWN free ladder strictly AFTER
@@ -5723,6 +5818,7 @@ impl PublishService {
             PublishCall::CommitBlockRefs { ino, refs, .. } => {
                 let refs: Vec<BlockRefOp> = refs.into_iter().map(BlockRefOp::from).collect();
                 self.inner.commit_block_refs(ino, &refs).await?;
+                note_served_displacements(ino, &displaced_indices(ino, &refs));
                 witness_taken(&taken_data_refs(&refs));
                 Ok(PublishReply::Unit)
             }
@@ -5735,16 +5831,13 @@ impl PublishService {
                 base_gen,
                 ..
             } => {
-                let taken_data = taken_data_refs(
-                    &refs
-                        .iter()
-                        .copied()
-                        .map(BlockRefOp::from)
-                        .collect::<Vec<_>>(),
-                );
+                let frame: Vec<BlockRefOp> = refs.iter().copied().map(BlockRefOp::from).collect();
+                let taken_data = taken_data_refs(&frame);
+                let displaced = displaced_indices(ino, &frame);
                 let reply = self
                     .serve_map_train(client, ino, layout, size, entries, refs, base_gen)
                     .await?;
+                note_served_displacements(ino, &displaced);
                 witness_taken(&taken_data);
                 Ok(reply)
             }

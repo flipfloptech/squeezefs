@@ -154,6 +154,7 @@ impl Drop for Restore {
         publish::uninstall_extent_merge_executor();
         publish::uninstall_extent_flush_executor();
         publish::uninstall_served_layout_invalidation();
+        publish::uninstall_served_displacement_sink();
         ship::disarm_ownership();
         data_custody::test_reset_custody_generation();
         data_custody::test_clear_poison();

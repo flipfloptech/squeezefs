@@ -398,7 +398,8 @@ a durable map references a freed block.
 | **fsync / flush_inode_to_backend** | durability demanded now — close before the meta barrier (the flush legs never shadow-record: they demand durability, KD-1.10) |
 | **RELEASE (last close)** | the writeback-cache durability boundary |
 | **Shape-change ops** (truncate/punch prune, staging spill/promotion, extent-record commit, clone src/dst, setattr size) | those paths' merges keep their own durable primitive; closing first keeps one authority per family. (Movers need NO force-close: their `MergeExpected` supersession law skips silently when the epoch's RAM map outran their captured A key — re-plan revisits.) |
-| **ENOSPC early-close** (KD-1.7) | a mid-epoch `StorageFull` closes the epoch (the swap frees parked A supply), then retries the allocation once; still full ⇒ the never-lossy ladder + `rewrite_shadow_fallbacks` (the loud fallback to today's CoW) |
+| **ENOSPC early-close** (KD-1.7) | a mid-epoch `StorageFull` closes the epoch (the swap frees parked A supply), then retries the allocation once; still full ⇒ the never-lossy ladder + `rewrite_shadow_fallbacks` (the loud fallback to today's CoW). **Structurally late on a co-writer** — see the supply-coupled close below and the KD-1.7 amendment |
+| **Supply-coupled close (co-writer lanes)** — 2026-09-07, `.benchmarks/2026-09-07-rewrite-epoch-supply-close.md`; `SQUEEZEFS_REWRITE_SUPPLY_CLOSE` (default on) | the KD-1.7 early-close made AHEAD of the `StorageFull`, on the signal the lane refill already samples: a laned co-writer's ahead-refill tick (`BlockAllocator::ahead_refill_tick` / `pushed_refill_tick`, after the harvest) closes the mount's open epochs when `lane_reachable_blocks < watermark`, where `watermark = ceil(claim-rate EWMA × refill horizon)` capped at lane-share/4 is the ahead-harvest's own threshold — the blocks one loop transit consumes (design-free-grace-sustain §5.5). **Derivation**: the deficit `watermark − reachable` is what the closes must yield to restore one transit's cover (at exhaustion it IS the watermark); `routing::supply_close_plan` closes the LARGEST epoch first (parked count), accumulating until the yield covers the deficit — the fewest publishes for the most supply. **Bound**: every candidate yields ≥ 1 block, so closes per tick ≤ deficit ≤ watermark ≤ share/4 — a co-writer never publishes more epochs in a tick than blocks it is short; the storm shape (that many distinct epochs each parking one block) is exactly the one on which the un-shadowed path would already have published once per block. Candidates left open are counted (`rewrite_shadow_supply_close_bounded`). The close is `close_rewrite_epoch` verbatim (one whole-tx publish + the §5.2 deferred frees), so every §5.6 window stays true and nothing new is durable; never under the D0 fence (the W5 arm is the fence tripwires' story); idempotent against the dismount's own closes. Scope: installs only on a HARVESTING lane (`DataRouter::arm_rewrite_supply_close` → `BlockAllocator::set_lane_supply_close_sink`, from `cowriter::install_client_halves`) — a single writer and an authority keep KD-1.6/1.7 byte-identically (pinned). Ledger: `rewrite_shadow_supply_closes` / `_blocks`, `_declined_{covered,no_parked}`, `_bounded`. Contracts `tests/rewrite_shadow_supply_close_tests.rs` |
 | **Idle / size-stable** | epochs idle past the sweep horizon close on the maintenance tick — bounds crash exposure of RAM-only bindings and defends the (theoretical) moka TTI eviction of a dirty entry. Horizon derives as TTI/10 (the eviction horizon it defends against), never a standalone constant |
 | **Fence observed / unmount drain** | §5.4 / teardown |
 
@@ -469,6 +470,27 @@ honestly over-counts by the open epochs' parked bytes (gauged:
 `rewrite_shadow_parked_bytes`); the epoch registry drains at close and
 the preflight's checkpoint re-verification (`paused-capacity`) already
 tolerates transient occupancy (`evacuate_transient_bytes` precedent).
+
+**KD-1.7 amendment (2026-09-07 — the co-writer posture,
+`.benchmarks/2026-09-07-rewrite-epoch-supply-close.md`):** "ENOSPC →
+early-close, retry once" is a SINGLE-WRITER law. It rests on a close
+returning the parked A supply to the local free list at once, so the one
+retry finds it. On a co-writer the freed A key does not come back for one
+whole recycle-loop transit — the free ships to the authority (or is
+recomputed at the publish), enters the grace ring, is released to the
+authority's per-lane list, and returns only on a harvest RPC — so the
+retry finds nothing and the write falls into the never-lossy ladder / the
+`alloc_lane_enospc_refusals` storm. And the 2× bound above is a bound on
+a lane-PARTITIONED share: a co-writer rewriting a slice of a shared file
+never reaches full coverage, fsync/RELEASE come at the iteration boundary,
+so it parks its whole per-iteration displacement against a share that
+must also hold live + new + the previous burst still in flight (the s11
+fleet, `.benchmarks/2026-09-06-free-grace-term1-fleet.md` §3: 160 + 160 +
+≤ 160 + ≤ 160 against 512 per volume). The supply-coupled close (§5.3)
+is KD-1.7's remedy on that posture: the same close, fired on the lane's
+own supply signal BEFORE the `StorageFull`, so the parked term is bounded
+by the lane's headroom instead of the iteration's length. KD-1.7 itself
+is unchanged and still the last arm.
 
 ### 5.6 Crash-window table (KD-1.5 — every window pinned by a contract)
 
@@ -544,6 +566,7 @@ boundaries. Idea 8 names the classes (§9.3).
 | Idea 4 | `block_free_reclaim_elided`, `block_free_elided_debt_bytes` (gauge), `block_free_trim_discards`, `block_free_trim_bytes`, `block_free_debt_pressure_drains` | ledger identity `queued + elided ≡ terminal frees`; debt gauge returns toward 0 under trim/reuse; pressure drains ≈ 0 below watermark. |
 | Idea 2 | `write_pipeline_supersessions`, `write_pipeline_superseded_bytes` | stale in-flight completions that published nothing (the latest-wins engagement instrument, overlapping face). |
 | Idea 1 | `rewrite_shadow_swaps`, `rewrite_shadow_bytes`, `rewrite_shadow_fallbacks`, `rewrite_shadow_fence_drops`, `rewrite_shadow_open_epochs` (gauge), `rewrite_shadow_parked_bytes` (gauge), `rewrite_shadow_superseded` | swaps = closes that persisted; bytes = B bytes swapped; fallbacks = ENOSPC-degraded closes; fence_drops must stay 0 on healthy mounts; parked gauge = the VL preflight transient; superseded = stale shadow bindings evicted by mid-epoch durable publishes (KD-1.11 — growth is the two machineries composing correctly). |
+| Idea 1 — the supply-coupled close (co-writer lanes, 2026-09-07) | `rewrite_shadow_supply_closes`, `rewrite_shadow_supply_close_blocks`, `rewrite_shadow_supply_close_declined_covered`, `rewrite_shadow_supply_close_declined_no_parked`, `rewrite_shadow_supply_close_bounded` | closes the refill tick fired on the lane-supply signal (⊆ swaps) and the parked A keys they released (the engagement instrument: a rewriting co-writer whose lane ENOSPCs with this flat is parking its supply to the boundary); the decision ledger — `covered` = the lane covered one loop transit (the healthy per-tick beat; growing beside lane ENOSPC = the watermark is not reading the starvation), `no_parked` = starving with nothing to inject (the KD-1.7-only shape), `bounded` = candidates left open because larger epochs covered the deficit (growing beside lane ENOSPC = the deficit under-reads the need). ALL 0 on single-writer / authority mounts by construction. |
 
 ## 9. Design-only sections (implementation next campaign)
 

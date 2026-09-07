@@ -757,6 +757,37 @@ block a co-writer consumes costs its writers a full stop first.
   `alloc_lane_harvests` stays the RPC count, so `harvests + coalesced +
   declined_stale` accounts for every would-be call; `0` is one RPC per
   caller, the shipped shape verbatim (the fleet A/B control).
+* **The refill arms read their OWN volume's advertisement** (finding 15's
+  file-per-proc residue, 2026-09-07,
+  `.benchmarks/2026-09-07-cowriter-fpp-supply-residue.md`,
+  `SQUEEZEFS_ALLOC_LANE_VOLUME_HINT`). The grant's `lane_supply_blocks`
+  is the authority's count SUMMED over its data volumes, while every arm
+  above is per allocator — per volume — and a lane's supply is per
+  volume too (a displaced block returns to the lane list of the volume
+  it lives on; the fpp phases skewed lane 2's returns ~64/36 across the
+  fleet's two volumes). So the volume the authority held NOTHING for
+  asked on every wake because its sibling made the sum nonzero (≈ 20–30 %
+  of a fpp co-writer's harvest RPCs came back empty), and its
+  single-flight decline ended at every grant whether or not anything of
+  ITS lane had moved. The grant now also carries the vector
+  `Grant::lane_supply_volumes` = `(vol_tag, blocks)` per data volume
+  (`CLUSTER_WIRE_SCHEMA` 3 — KD-7 same-commit fleets; the authority's
+  `LaneSupplySource` answers the vector, the sum is derived from it), and
+  the member lands the vector BEFORE the sum (`note_lane_supply_volumes`
+  → `note_lane_supply_hint`, whose wake runs the pushed ticks). Each
+  allocator then reads `lane_supply_hint_for(vol_tag)` — its own entry —
+  for the pushed decision and the ahead witness, and its decline witness
+  is `lane_supply_hint_gen_for(vol_tag)`: +1 per grant advertising
+  NONZERO supply for that volume, +1 per grant whose vector did not name
+  it (the every-grant law survives for an un-advertised volume, and a
+  volume no vector ever named reads the mount-wide generation — the two
+  scales are seeded together so they never alias). A grant advertising 0
+  for volume A re-arms no RPC on A however large B's share made the sum;
+  a grant advertising A's supply ends A's decline for exactly one RPC.
+  Engagement: `alloc_lane_volume_hint_skips` — pushed decisions the
+  vector declined that the sum would have fired, i.e. the empty RPCs it
+  saves; `0` = the sum and the mount-wide generation for every volume
+  verbatim (the vector still travels).
 
 **Effect**: the refill RTT and the release-batch quantum leave the writer's
 critical path entirely; the co-writer's funnel sees a fed free list instead
@@ -969,6 +1000,7 @@ unarmed mount (the solo re-gate — pinned by the existing contract-1 shape in
 | `alloc_lane_reachable_blocks` | the **lane-reachable supply** (the counting-set wrapper's lane-owned count + lane-scoped virgin remainder, published as the sum) — the quantity that troughs on a recycle-bound stream (§2.2's corrected note) and the site-0/runway input from PR 3. The COUNT is maintained always (one atomic beside the set op — what makes the wrapper correct-by-construction); the GAUGE **exports only when a lane partition or the grace plane is engaged, absent otherwise** — the `alloc_lane_*` family's solo-inert convention (`alloc_lane_writers` 0 = unpartitioned), keeping this preamble's every-gauge-0-unarmed law true without exceptions and the PR 5 solo re-gate uncarved |
 | `alloc_lane_owed_blocks` | co-writer gauge: EXPLICITLY shipped frees' `Freed` verdicts − harvested back, accounted **per `(vol_tag, lane)`** (one word per allocator — §5.5) and published as the sum. The explicit-ship arm's face — a strict subset of the authority's advertised lane supply (`free_grace_lane_supply_hint`) and NOT the refill gate since 2026-09-07 (the refill-hint gate, §5.5) |
 | `alloc_lane_hint_refills` | the refill-hint gate's engagement: proactive harvests (ahead + pushed) that fired with the owed word at 0 — the ones the owed-only gate would have declined; 0 under `SQUEEZEFS_ALLOC_LANE_REFILL_HINT=0` |
+| `alloc_lane_volume_hint_skips` | the per-volume hint's engagement (§5.5, `SQUEEZEFS_ALLOC_LANE_VOLUME_HINT`): pushed decisions a volume declined because the grant's vector advertised 0 for it while the mount sum would have fired — each one an empty harvest RPC the vector saved; 0 with the lever off |
 | `alloc_lane_ahead_harvests` | L5's engagement counter (⊆ `alloc_lane_harvests`); ahead-harvests with zero co-located stall counters is the designed steady state |
 | `alloc_lane_harvest_watermark` | the derived watermark in force (the `depth_target` publication precedent) |
 

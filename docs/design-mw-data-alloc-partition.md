@@ -294,18 +294,31 @@ authority's allocators are NOT lane-governed (its lane-0 supply is its own
 free list; it wires no harvest), so its placement and every single-writer
 mount's stay the device-fill table byte-identically.
 
-The same per-volume shape governs the refill: the renewal grant's
-lane-supply hint (`Grant::lane_supply_blocks`) is SUMMED over the
-authority's volumes and cannot name the one holding the supply, so the
-pushed refill's decision is per volume
-(`free_grace::lane_push_wants_harvest_on_volume`) — a volume owed blocks
-asks, a DRY volume asks on any hint even when owed nothing (a peer's
-rewrites of this lane's blocks put supply on a list no owed ledger here
-knows), a stocked volume owed nothing never asks — and the ahead refill
-treats the hint as evidence beside the owed ledger. A per-volume hint vector
-on the grant would make both exact and is the deferred form: `Grant` is
-`Copy` and travels through 40-odd sites, and the dry-volume rule reaches the
-same volume at the cost of at most one RPC per dry volume per renewal.
+The same per-volume shape governs the refill. The pushed refill's decision
+is per volume (`free_grace::lane_push_wants_harvest_on_volume`) — a volume
+owed blocks asks, a DRY volume asks on a hint even when owed nothing (a
+peer's rewrites of this lane's blocks put supply on a list no owed ledger
+here knows), a stocked volume owed nothing never asks — and the ahead
+refill treats the hint as evidence beside the owed ledger. **Since
+2026-09-07 the hint each volume reads is its OWN** (finding 15's
+file-per-proc residue, `.benchmarks/2026-09-07-cowriter-fpp-supply-residue.md`;
+`SQUEEZEFS_ALLOC_LANE_VOLUME_HINT`): the renewal grant carries, beside the
+summed `lane_supply_blocks`, the vector `Grant::lane_supply_volumes` =
+`(vol_tag, blocks)` per data volume of the authority (`CLUSTER_WIRE_SCHEMA`
+3, KD-7 same-commit fleets; `Grant` gave up `Copy` for it — every site
+borrows), and `free_grace::lane_supply_hint_for(vol_tag)` answers a
+volume's entry, the sum only when no vector names it or the lever is off.
+Before it the sum could not name the volume holding the supply, so the
+volume the authority held nothing for asked on every wake its sibling's
+share raised (≈ 20–30 % of a fpp co-writer's harvest RPCs came back
+empty). The engagement gauge is `alloc_lane_volume_hint_skips` — pushed
+decisions the vector declined that the sum would have fired.
+
+The same vector fixes the two per-volume gaps the epoch close and the
+harvest decline had: the supply-coupled rewrite-epoch close plans over the
+keys parked ON THE ASKING VOLUME (design-rewrite-program §5.3,
+`SQUEEZEFS_REWRITE_SUPPLY_CLOSE_PER_VOLUME`), and the single-flight
+decline's witness is per volume (§4.2 item 2).
 
 ### 4.2 The harvest verb's client-side discipline — single-flight per allocator
 
@@ -338,18 +351,25 @@ on; `.benchmarks/2026-09-07-lane-harvest-single-flight.md`):
    outcome, and retries its own funnel against the refilled list
    (`alloc_lane_harvest_coalesced`). No lock is held across the RPC.
 2. **A fresh empty reply declines re-issue.** The reply stamps the supply
-   witness generation it answered — `free_grace::lane_supply_hint_gen()`
-   (+1 per renewal grant that reached this member, whatever the value and
-   whatever `SQUEEZEFS_FREE_GRACE_LANE_PUSH` says about it; a nonzero
-   hint's wake is one of them) plus the allocator's owed-arrival count
-   (+1 per `note_owed_freed`). Until either moves, a caller takes `0`
-   without a wire trip (`alloc_lane_harvest_declined_stale`): the
-   authority has told this mount nothing new about its lane. The next
-   grant ends the window for exactly one RPC, so the bound is the renewal
-   cadence (≤ 500 ms under an ask) and never a timer of the allocator's
-   own; the finding-29 promise that the parked retries drive the
-   authority's pressure fence holds once per grant per volume. An RPC
-   FAILURE stamps nothing — it is not an answer.
+   witness generation it answered — THIS VOLUME's advertisement
+   generation `free_grace::lane_supply_hint_gen_for(vol_tag)` (since
+   2026-09-07's per-volume hint: +1 per renewal grant whose vector
+   advertised NONZERO supply of this lane on this volume, +1 per grant
+   whose vector did not name the volume — so an un-advertised volume
+   keeps the every-grant law, and a volume no vector ever named, or every
+   volume under `SQUEEZEFS_ALLOC_LANE_VOLUME_HINT=0`, reads the mount-wide
+   `lane_supply_hint_gen()`: +1 per grant that reached this member,
+   whatever the value and whatever `SQUEEZEFS_FREE_GRACE_LANE_PUSH` says
+   about it) plus the allocator's owed-arrival count (+1 per
+   `note_owed_freed`). Until either moves, a caller takes `0` without a
+   wire trip (`alloc_lane_harvest_declined_stale`): the authority has told
+   this mount nothing new about its lane ON THIS VOLUME — a grant that
+   moved only the sibling's share re-arms nothing here. A grant
+   advertising this volume's supply ends the window for exactly one RPC,
+   so the bound is the renewal cadence (≤ 500 ms under an ask) and never
+   a timer of the allocator's own; the finding-29 promise that the parked
+   retries drive the authority's pressure fence holds once per grant per
+   volume. An RPC FAILURE stamps nothing — it is not an answer.
 3. **No caller waits past the wall.** A joiner's wait is bounded by
    `pressure_park_wall_ms`; past it the joiner takes its verdict with `0`
    (its park refuses at the same wall it always did) and the leader's own

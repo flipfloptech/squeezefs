@@ -1472,6 +1472,105 @@ clean co-writers (m50, m57 — no `CLAIM ANOMALY`) → 0, closure exact, forced
 
 ---
 
+## Renewal-isolation campaign (2026-09-07, `fix/membership-renewal-isolation` — finding 15 phase B1)
+
+Record: `.benchmarks/2026-09-07-membership-renewal-isolation.md`. Contracts:
+`tests/membership_renewal_isolation_tests.rs`.
+
+### The finding (day-2 fleet pair, §2)
+
+Authority + 8 co-writers, file-per-proc phase. Every co-writer's own
+`free_grace_acked_lag_ms` read ≤ 2.3 s while the authority's
+`free_grace_member_ack_lag_ms.max` climbed **1 s/s to 10–11.6 s** and its
+served `membership_renewals` collapsed **22/s → 0/s for 7 s**: the bound
+stalled, 3,200 offsets piled up, every lane starved. The parent asked
+WHERE the renewal's 10 s went — (a) the authority's serve, (b) the member's
+send venue, or (c) the wire — and ruled the answer must come from an
+instrument.
+
+### The ack carrier's liveness law (the design statement)
+
+**The renewal is the heartbeat AND the acknowledgement's carrier, and it
+must never queue behind bulk work — on either side — nor be made to wait
+one routine beat for a decision the plane has already taken.** Three
+consequences, each now pinned:
+
+1. **Authority side**: `MembershipService::call`'s RENEW arm is RAM-only
+   (one `scc` probe, a handful of atomics — `take_prod_cadence`,
+   `lane_supply_for_member`'s per-lane counters, `advertise_checkpoint_ceiling`)
+   on the connection's own `sqz-clw-conn` thread; nothing it touches is
+   held across a harvest, a free storm or a publish frame. Measured
+   in-process under 79,700 storm RPCs in 1.2 s plus parked meta lanes:
+   serve mean **28–42 µs**, the member's RTT mean **130–150 µs**, max
+   **< 0.5 ms** (contract 3, green before and after — (a) and (c) are not
+   where the time went).
+2. **Member side, the venue**: finding 2 gave the renewal's POLL the
+   dedicated `sqz-lease` thread; its socket round trip still hopped onto
+   the shared `sqz-blk` pool, FIFO behind every parked RPC round trip,
+   reclaim lane and crypto job of a co-writer under load. With the pool
+   parked solid the shipped send waited the bulk work's own duration
+   (measured **590 ms** `carry_wait` against a 600 ms hold). The round
+   trip now runs on ONE dedicated OS thread, `sqz-lease-io`
+   (`squeezefs_ipc::sqz_blocking::DedicatedWorker` — the `sqz-jrnl`
+   shape: liveness I/O owning its thread), spawned on the first renewal
+   of an armed member: `carry_wait` **64 µs** under the same parked pool
+   (contract 2). Lever `SQUEEZEFS_MEMBERSHIP_RENEW_LANE` (default on;
+   `0` = the shared pool, the A/B control); engagement
+   `membership_renew_lane_calls`. The custody renewal (S9) keeps its own
+   path — sharing one io thread would re-couple the two cadences.
+3. **The cadence decision — where the fleet's 10 s actually went (d)**:
+   `take_prod_cadence`'s caught-up arm ("a member that has acknowledged
+   past the label the writer is waiting on is not asked") answered
+   `None` — the ROUTINE 10 s cadence — for every member at the instant
+   the ring DRAINED (`free_grace_offsets` 24 → 0 → 0 at t = 99–101 s). A
+   member's LABEL source is the routine beat (a carriage renewal learns
+   none, §Hold-time lever (b)), so when the ring refilled two seconds
+   later (23 → 3,210 offsets) and `note_pressure` re-armed the ask, no
+   member could be TOLD for a full beat: served renewals 0/s, every
+   member's `acked_lag_ms` frozen at its last promote value (the "≤ 2.3 s"
+   read — a stored gauge, not a recent promotion), `member_ack_lag.max`
+   walking 1 s/s to the beat. No member logged a renewal failure,
+   timeout or fence in the whole run; the publish plane's 10 s timeouts
+   (another listener, another fix) were concurrent, not causal. The law
+   now: while the ask is LIVE (a reading within one TTL), a caught-up
+   member is RELAXED one doubling step of the cadence in force (finding
+   18's decay unit), capped strictly below routine — the refill is
+   learned within `2 × cadence`, a caught-up member still beats half as
+   often as a laggard (the economy's intent), and the ask's lifetime is
+   unchanged (past the TTL a drained ring retires it; the existing
+   contract). In-process (contract 1): control grant **10,000 ms** (the
+   hole), relaxed grant **3,318 ms** at an ask of 1,659 ms. Lever
+   `SQUEEZEFS_FREE_GRACE_CAUGHT_UP_RELAX` (default on; `0` = the snap);
+   engagement `free_grace_prods_caught_up`, disjoint from
+   `free_grace_prods`.
+
+### The instruments (always-on, the standard 26-bucket shape)
+
+* Member: `membership_renew_phase_ns` — `carry_wait` (the decision, a
+  beat's due instant or the promotion that asked for carriage → the
+  frame's send instant, stamped on the venue's thread), `rtt` (send →
+  reply), `total` (decision → grant adopted). `membership_renew_cadence_ms`
+  — the beat in force (the label source's cadence).
+* Authority: `membership_renew_serve_ns` — frame in → reply built.
+* The reading rule: all three spans small AND the serve small while the
+  member's cadence reads 10,000 and the authority's
+  `free_grace_prod_renew_ms` reads 500 is (d), not a stall; `carry_wait`
+  large with `rtt` small is (b); `rtt` large with the serve small is (c);
+  the serve large is (a).
+
+### What this campaign does NOT claim
+
+The fleet re-read (squeeze-test, the parent's) — the instruments are
+built to decide it; the samples here were read after the fact. The
+"first ask under a fresh storm is one beat late" cost of a plane that was
+QUIET for longer than one reading TTL (a genuinely drained ring retires
+the ask; a burst after that pays one routine beat) is unchanged and named
+as an open item. The `sqz-lease-io` venue is a structural completion of
+finding 2's law, not a fleet-convicted term — the samples show no venue
+wait (the beat explains the whole 10 s).
+
+---
+
 ## References
 
 * `.benchmarks/2026-08-25-s11-freeloop-stall.md` — finding 15 + part-1

@@ -519,6 +519,25 @@ static LANE_SUPPLY_HINT_GEN: AtomicU64 = AtomicU64::new(0);
 /// Cached knob `SQUEEZEFS_ALLOC_LANE_REFILL_HINT`: 0 = unread, 1 = on,
 /// 2 = off (the `LANE_PUSH` shape). Off = the retired owed-only gate.
 static REFILL_HINT: AtomicU64 = AtomicU64::new(0);
+/// Cached knob `SQUEEZEFS_ALLOC_LANE_VOLUME_HINT`: 0 = unread, 1 = on,
+/// 2 = off (the `LANE_PUSH` shape). Off = every per-volume reader answers
+/// the mount sum / the mount-wide arrival generation verbatim.
+static VOLUME_HINT: AtomicU64 = AtomicU64::new(0);
+/// **The per-volume advertisement** (co-writer side, finding 15's fpp
+/// residue): `vol_tag` → what the authority's latest grant said about THIS
+/// lane's supply on that volume. A decline and a pushed refill are per
+/// allocator, i.e. per volume, and the mount sum cannot say which volume
+/// holds the supply.
+static LANE_SUPPLY_VOLUMES: once_cell::sync::Lazy<scc::HashMap<u64, VolumeHint>> =
+    once_cell::sync::Lazy::new(scc::HashMap::new);
+/// The vector arrival count (+1 per [`note_lane_supply_volumes`]) — the
+/// stamp that says which entries the LATEST vector named.
+static LANE_SUPPLY_VOLUMES_GEN: AtomicU64 = AtomicU64::new(0);
+/// A vector arrived since the last mount-sum arrival (the two halves of
+/// one grant land vector-first): the sum's arrival then advances only the
+/// entries that vector did NOT name — the fallback law for a volume the
+/// authority does not advertise.
+static LANE_SUPPLY_VOLUMES_PENDING: AtomicBool = AtomicBool::new(false);
 /// Hints that woke a parked refill (`free_grace_lane_push_wakes`,
 /// co-writer side).
 static LANE_PUSH_WAKES: AtomicU64 = AtomicU64::new(0);
@@ -528,12 +547,30 @@ static LANE_PUSH_WAKES: AtomicU64 = AtomicU64::new(0);
 static LANE_SUPPLY_WAKE: squeezefs_ipc::sqz_notify::Notify =
     squeezefs_ipc::sqz_notify::Notify::new();
 
+/// One volume's row of the per-volume advertisement.
+struct VolumeHint {
+    /// Blocks of this lane on the authority's list for the volume, as the
+    /// latest grant naming it said.
+    blocks: AtomicU64,
+    /// The vector generation that last named this volume
+    /// (`== LANE_SUPPLY_VOLUMES_GEN` ⇔ the latest vector did).
+    named_at: AtomicU64,
+    /// This volume's decline witness: +1 per grant that advertised
+    /// NONZERO supply for it, and +1 per grant whose vector did not name
+    /// it (the mount-wide law, so an un-advertised volume is never
+    /// declined for longer than one cadence). Seeded from the mount-wide
+    /// generation at first naming so the two scales never alias.
+    gen: AtomicU64,
+}
+
 /// The authority-side release hook: harvest every ring to its uncovered
 /// front (RAM only — ring locks, free-list inserts, the mark ledgers).
 pub type ReleaseHook = Arc<dyn Fn() + Send + Sync>;
-/// The authority-side lane-supply source: a member id → the blocks of that
-/// member's lane on this mount's free lists (0 for a member with no lane).
-pub type LaneSupplySource = Arc<dyn Fn(&str) -> u64 + Send + Sync>;
+/// The authority-side lane-supply source: a member id → `(vol_tag, blocks)`
+/// per data volume, the blocks of that member's lane on this mount's free
+/// list for that volume (empty for a member with no lane). The grant
+/// carries the vector and its sum.
+pub type LaneSupplySource = Arc<dyn Fn(&str) -> Vec<(u64, u64)> + Send + Sync>;
 
 const HOLD_PHASES_N: usize = 4;
 /// The stage names, in loop order; the JSON keys of
@@ -1309,6 +1346,36 @@ pub fn test_clear_refill_hint() -> bool {
     REFILL_HINT.swap(0, Ordering::Relaxed) != 0
 }
 
+/// `SQUEEZEFS_ALLOC_LANE_VOLUME_HINT` (default on), read once and cached:
+/// the co-writer's per-volume readers ([`lane_supply_hint_for`],
+/// [`lane_supply_hint_gen_for`]) answer the volume's own entry of the
+/// grant's vector; `0` = the mount sum and the mount-wide arrival
+/// generation for every volume — the shipped shape
+/// (`.benchmarks/2026-09-07-cowriter-fpp-supply-residue.md`).
+pub fn volume_hint_enabled() -> bool {
+    match VOLUME_HINT.load(Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            let on = crate::env_knobs::bool_knob("SQUEEZEFS_ALLOC_LANE_VOLUME_HINT", true);
+            VOLUME_HINT.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+            on
+        }
+    }
+}
+
+/// Test seam (the `test_set_lane_push` shape).
+pub fn test_set_volume_hint(on: Option<bool>) {
+    VOLUME_HINT.store(
+        match on {
+            Some(true) => 1,
+            Some(false) => 2,
+            None => 0,
+        },
+        Ordering::Relaxed,
+    );
+}
+
 /// **The refill's supply witness** (co-writer side): is there supply of
 /// this lane to harvest from the authority? The renewal grant's hint is
 /// the authority's OWN count of the lane's blocks on its free lists —
@@ -1384,23 +1451,25 @@ pub fn uninstall_lane_supply_source() {
 
 /// **The renewal grant's lane-supply hint** (the lever's wire half, owner
 /// side): the blocks of `member_id`'s lane sitting on this authority's
-/// free lists — released, unserved, reachable by that member alone. O(1)
-/// per volume through the installed source (per-lane counters maintained
-/// inside the free set's insert/remove); 0 with the lever off, no source
-/// (every mount that is not a multi-writer authority), or a member with
-/// no lane (a reader). Never a scan in the renewal hot op (KD-FG-4).
-pub fn lane_supply_for_member(member_id: &str) -> u64 {
+/// free lists — released, unserved, reachable by that member alone — PER
+/// DATA VOLUME as `(vol_tag, blocks)` (the grant carries the vector and
+/// its sum). O(1) per volume through the installed source (per-lane
+/// counters maintained inside the free set's insert/remove); empty with
+/// the lever off, no source (every mount that is not a multi-writer
+/// authority), or a member with no lane (a reader). Never a scan in the
+/// renewal hot op (KD-FG-4).
+pub fn lane_supply_for_member(member_id: &str) -> Vec<(u64, u64)> {
     if !lane_push_enabled() {
-        return 0;
+        return Vec::new();
     }
     let Some(src) = LANE_SUPPLY_SOURCE.load_full() else {
-        return 0;
+        return Vec::new();
     };
-    let n = src(member_id);
-    if n > 0 {
+    let volumes = src(member_id);
+    if volumes.iter().any(|(_, n)| *n > 0) {
         LANE_PUSH_HINTS.fetch_add(1, Ordering::Relaxed);
     }
-    n
+    volumes
 }
 
 /// Grants that carried a nonzero hint (`free_grace_lane_push_hints`).
@@ -1416,6 +1485,19 @@ pub fn lane_push_hints() -> u64 {
 /// ([`lane_supply_hint_gen`]) is counted regardless — a grant reached
 /// this member, which is what ends a single-flight harvest's decline.
 pub fn note_lane_supply_hint(blocks: u64) {
+    // The per-volume witnesses' fallback half (finding 15's fpp residue):
+    // a grant that did not advertise a volume is, for that volume, an
+    // arrival like any other — its decline ends at this cadence. Every
+    // known volume advances unless the vector that landed just before
+    // this sum named it (then its own nonzero-advertisement rule ruled).
+    let vector_landed = LANE_SUPPLY_VOLUMES_PENDING.swap(false, Ordering::AcqRel);
+    let vec_gen = LANE_SUPPLY_VOLUMES_GEN.load(Ordering::Acquire);
+    LANE_SUPPLY_VOLUMES.iter_sync(|_, v| {
+        if !vector_landed || v.named_at.load(Ordering::Acquire) != vec_gen {
+            v.gen.fetch_add(1, Ordering::Release);
+        }
+        true
+    });
     LANE_SUPPLY_HINT_GEN.fetch_add(1, Ordering::Release);
     if !lane_push_enabled() {
         return;
@@ -1427,10 +1509,73 @@ pub fn note_lane_supply_hint(blocks: u64) {
     }
 }
 
+/// **The member learned the grant's per-volume vector** (co-writer side,
+/// finding 15's fpp residue — `.benchmarks/2026-09-07-cowriter-fpp-supply-residue.md`):
+/// `(vol_tag, blocks)` per data volume of the authority. Lands BEFORE the
+/// grant's mount sum ([`note_lane_supply_hint`] — whose wake runs the
+/// pushed ticks that read these entries). A volume advertised NONZERO
+/// advances its own decline witness; a volume advertised 0 does not (a
+/// decline on it holds until the authority says its list moved); a
+/// volume the vector does not name falls back to the mount-wide law at
+/// the sum's arrival. First naming seeds the witness from the mount-wide
+/// generation, so a volume that switches between the two scales never
+/// reads a stale stamp as fresh or a fresh one as stale.
+pub fn note_lane_supply_volumes(volumes: &[(u64, u64)]) {
+    let vec_gen = LANE_SUPPLY_VOLUMES_GEN.fetch_add(1, Ordering::AcqRel) + 1;
+    let mount_gen = LANE_SUPPLY_HINT_GEN.load(Ordering::Acquire);
+    for (tag, blocks) in volumes {
+        let advance = u64::from(*blocks > 0);
+        let seen = LANE_SUPPLY_VOLUMES
+            .read_sync(tag, |_, v| {
+                v.blocks.store(*blocks, Ordering::Relaxed);
+                v.named_at.store(vec_gen, Ordering::Release);
+                v.gen.fetch_add(advance, Ordering::Release);
+            })
+            .is_some();
+        if !seen {
+            match LANE_SUPPLY_VOLUMES.entry_sync(*tag) {
+                scc::hash_map::Entry::Occupied(occ) => {
+                    let v = occ.get();
+                    v.blocks.store(*blocks, Ordering::Relaxed);
+                    v.named_at.store(vec_gen, Ordering::Release);
+                    v.gen.fetch_add(advance, Ordering::Release);
+                }
+                scc::hash_map::Entry::Vacant(vac) => {
+                    vac.insert_entry(VolumeHint {
+                        blocks: AtomicU64::new(*blocks),
+                        named_at: AtomicU64::new(vec_gen),
+                        gen: AtomicU64::new(mount_gen + advance),
+                    });
+                }
+            }
+        }
+    }
+    LANE_SUPPLY_VOLUMES_PENDING.store(true, Ordering::Release);
+}
+
 /// The last learned hint (co-writer side; 0 = the authority's list holds
 /// nothing for this lane, or no hint has arrived).
 pub fn lane_supply_hint() -> u64 {
     LANE_SUPPLY_HINT.load(Ordering::Relaxed)
+}
+
+/// **This volume's advertised supply** (co-writer side): the blocks of the
+/// lane on the authority's list for `vol_tag` as the latest grant's vector
+/// said — or the mount sum when the latest vector did not name the volume,
+/// no vector has arrived, or `SQUEEZEFS_ALLOC_LANE_VOLUME_HINT=0` (the
+/// shipped reading). The pushed decision's and the ahead witness's input.
+pub fn lane_supply_hint_for(vol_tag: u64) -> u64 {
+    if !volume_hint_enabled() || !lane_push_enabled() {
+        return lane_supply_hint();
+    }
+    let vec_gen = LANE_SUPPLY_VOLUMES_GEN.load(Ordering::Acquire);
+    LANE_SUPPLY_VOLUMES
+        .read_sync(&vol_tag, |_, v| {
+            (v.named_at.load(Ordering::Acquire) == vec_gen)
+                .then(|| v.blocks.load(Ordering::Relaxed))
+        })
+        .flatten()
+        .unwrap_or_else(lane_supply_hint)
 }
 
 /// Grants that have carried the authority's advertisement to this member
@@ -1439,6 +1584,21 @@ pub fn lane_supply_hint() -> u64 {
 /// means no grant has arrived since.
 pub fn lane_supply_hint_gen() -> u64 {
     LANE_SUPPLY_HINT_GEN.load(Ordering::Acquire)
+}
+
+/// **This volume's decline witness** (co-writer side): grants that
+/// advertised NONZERO supply for `vol_tag` plus grants that did not name it
+/// (see [`note_lane_supply_volumes`]) — the mount-wide generation for a
+/// volume no vector ever named, and for every volume under
+/// `SQUEEZEFS_ALLOC_LANE_VOLUME_HINT=0`. Monotonic; equality with a stamped
+/// value means nothing the authority said about THIS volume has moved.
+pub fn lane_supply_hint_gen_for(vol_tag: u64) -> u64 {
+    if !volume_hint_enabled() {
+        return lane_supply_hint_gen();
+    }
+    LANE_SUPPLY_VOLUMES
+        .read_sync(&vol_tag, |_, v| v.gen.load(Ordering::Acquire))
+        .unwrap_or_else(lane_supply_hint_gen)
 }
 
 /// Hints that woke a refill (`free_grace_lane_push_wakes`).
@@ -3809,6 +3969,7 @@ pub fn reset_for_test() {
         &LANE_PUSH_HINTS,
         &LANE_SUPPLY_HINT,
         &LANE_SUPPLY_HINT_GEN,
+        &LANE_SUPPLY_VOLUMES_GEN,
         &LANE_PUSH_WAKES,
         &QUALIFY_LAG_MS,
         &DRAIN_LAG_MS,
@@ -3822,6 +3983,8 @@ pub fn reset_for_test() {
         c.store(0, Ordering::Relaxed);
     }
     BOUND_DIRTY.store(false, Ordering::Relaxed);
+    LANE_SUPPLY_VOLUMES_PENDING.store(false, Ordering::Relaxed);
+    LANE_SUPPLY_VOLUMES.clear_sync();
     test_set_ack_renewal(None);
     test_set_caught_up_relax(None);
     test_set_refresh_on_ack(None);
@@ -3831,6 +3994,7 @@ pub fn reset_for_test() {
     test_set_pass_elastic(None);
     test_set_lane_push(None);
     test_set_refill_hint(None);
+    test_set_volume_hint(None);
     test_set_checkpoint_composite(None);
     uninstall_release_hook();
     uninstall_lane_supply_source();

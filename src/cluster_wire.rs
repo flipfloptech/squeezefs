@@ -166,8 +166,15 @@ use std::time::Duration;
 /// speaks 1 would decode a shorter grant (bincode is positional: a missing
 /// trailing field is EOF, an extra one is silently ignored), so the
 /// mismatch is a loud handshake refusal rather than a member running the
-/// constant against a writer that advertised half of it.
-pub const CLUSTER_WIRE_SCHEMA: u32 = 2;
+/// constant against a writer that advertised half of it. **3 since the
+/// grant carries the lane-supply hint PER DATA VOLUME**
+/// ([`crate::membership::Grant::lane_supply_volumes`], finding 15's fpp
+/// residue, 2026-09-07): a 2-speaker's member would read the sum and never
+/// the vector — every volume falling back to the mount-wide law, the
+/// shipped shape, silently — and a 3-speaker's member against a 2-speaker
+/// authority would decode a trailing `Vec` from EOF; the mismatch refuses
+/// loud at the handshake (KD-7 same-commit fleets).
+pub const CLUSTER_WIRE_SCHEMA: u32 = 3;
 
 /// The **pre-authentication** frame class cap: a challenge/proof pair is a
 /// few hundred bytes, so this is all an unauthenticated peer gets to

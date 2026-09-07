@@ -603,24 +603,32 @@ pub fn release_hook(backend: Arc<crate::routing::BackendRouter>) -> crate::free_
 
 /// The authority's per-member lane-supply source (the lever's wire half —
 /// [`crate::free_grace::LaneSupplySource`]): a member id → its lane under
-/// this era's assignment → the sum over this router's allocators of that
-/// lane's free-listed population (the free set's per-lane counters). A
-/// member with no lane (a reader, an unknown id) reads 0.
+/// this era's assignment → PER DATA VOLUME, `(vol_tag, that lane's
+/// free-listed population on the volume)` off the free set's per-lane
+/// counters (finding 15's fpp residue: the grant names each volume's
+/// share, so the co-writer's per-volume decline and pushed refill read
+/// their own volume). A member with no lane (a reader, an unknown id)
+/// reads empty.
 pub fn lane_supply_source(
     backend: Arc<crate::routing::BackendRouter>,
     assignment: Arc<crate::alloc_lane_grant::LaneAssignment>,
 ) -> crate::free_grace::LaneSupplySource {
     Arc::new(move |member_id: &str| {
         let Some(lane) = assignment.lane_of(member_id) else {
-            return 0;
+            return Vec::new();
         };
         // `lane_allocators` names each allocator once (the default slot's
         // alias of the first registered backend is deduplicated there).
         backend
             .lane_allocators()
             .iter()
-            .map(|alloc| alloc.lane_free_count(lane))
-            .fold(0u64, u64::saturating_add)
+            .map(|alloc| {
+                (
+                    crate::meta_backend::kv::block_refs::volume_tag(alloc.volume_id()),
+                    alloc.lane_free_count(lane),
+                )
+            })
+            .collect()
     })
 }
 

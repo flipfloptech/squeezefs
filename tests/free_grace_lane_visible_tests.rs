@@ -910,13 +910,15 @@ fn run_lane_loop(shape: &LaneShape, lever: bool) -> LaneRow {
             a.lock().unwrap().harvest_to_front();
         }));
         let a = Arc::clone(&auth);
+        // One data volume in this model: the vector's single entry IS the
+        // sum (the grant carries both; the model reads the sum).
         free_grace::install_lane_supply_source(Arc::new(move |id: &str| {
             let lane: u64 = id
                 .rsplit('-')
                 .next()
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(0);
-            a.lock().unwrap().lane_supply(lane)
+            vec![(0u64, a.lock().unwrap().lane_supply(lane))]
         }));
     }
 

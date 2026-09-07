@@ -6382,6 +6382,15 @@ pub struct Metrics {
     /// authority's publish recompute put on its list. ⊆ `ahead + pushed`;
     /// 0 under `SQUEEZEFS_ALLOC_LANE_REFILL_HINT=0` by construction.
     pub alloc_lane_hint_refills: Align64<AtomicU64>,
+    /// The per-volume hint's engagement (finding 15's fpp residue,
+    /// `SQUEEZEFS_ALLOC_LANE_VOLUME_HINT` — `.benchmarks/2026-09-07-cowriter-fpp-supply-residue.md`):
+    /// pushed decisions a volume DECLINED because the grant's vector
+    /// advertised 0 for it while the mount sum — the sibling's share —
+    /// would have fired the shipped decision: each is one empty harvest
+    /// RPC the vector saved (≈ 20 % of a fpp co-writer's harvests on the
+    /// s11 fleet). 0 under `SQUEEZEFS_ALLOC_LANE_VOLUME_HINT=0` by
+    /// construction.
+    pub alloc_lane_volume_hint_skips: Align64<AtomicU64>,
     /// The derived watermark in force (blocks; `ceil(rate × horizon)`
     /// capped at lane-share/4 — derived, never a knob).
     pub alloc_lane_harvest_watermark: Align64<AtomicU64>,
@@ -11198,6 +11207,9 @@ impl SqueezefsFilesystem {
                     .load(Ordering::Relaxed),
                 "alloc_lane_hint_refills": METRICS
                     .alloc_lane_hint_refills
+                    .load(Ordering::Relaxed),
+                "alloc_lane_volume_hint_skips": METRICS
+                    .alloc_lane_volume_hint_skips
                     .load(Ordering::Relaxed),
                 "alloc_lane_harvest_watermark": METRICS
                     .alloc_lane_harvest_watermark

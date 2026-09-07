@@ -1224,7 +1224,7 @@ pub struct JoinRequest {
 }
 
 /// The lease grant: what the member needs to compute its stricter clock.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Grant {
     /// The member's lease epoch — monotone per owner, never reused. A
     /// renewal presenting a different epoch is not custody.
@@ -1267,6 +1267,18 @@ pub struct Grant {
     /// advertised (an owner with no grace plane): the member falls back to
     /// `CHECKPOINT_MAX_AGE_MS`. Rides the `CLUSTER_WIRE_SCHEMA` 2 grant.
     pub checkpoint_ceiling_ms: u64,
+    /// **The lane-supply hint PER DATA VOLUME** (finding 15's fpp residue,
+    /// `.benchmarks/2026-09-07-cowriter-fpp-supply-residue.md`):
+    /// `(vol_tag, blocks)` for every data volume the authority routes —
+    /// the addends of `lane_supply_blocks`, named. A co-writer's decline
+    /// and pushed refill are per allocator, i.e. per volume, and the sum
+    /// cannot say which volume holds the supply: on the s11 fleet the
+    /// volume the authority held nothing for asked on every wake because
+    /// its sibling made the sum nonzero. Empty wherever the sum is 0 by
+    /// construction (a join grant, a reader, the lever off, no partition).
+    /// `vol_tag` per KD-5 — the durable `vol-{16 hex}` decode, never a
+    /// path. Rides the `CLUSTER_WIRE_SCHEMA` 3 grant.
+    pub lane_supply_volumes: Vec<(u64, u64)>,
 }
 
 impl Grant {
@@ -1497,6 +1509,7 @@ impl MembershipOwner {
             // force, and the promise its advertisement makes (a few relaxed
             // atomics — KD-FG-4's no-scan-in-renew law stands).
             checkpoint_ceiling_ms: crate::free_grace::advertise_checkpoint_ceiling(),
+            lane_supply_volumes: Vec::new(),
         }
     }
 
@@ -1723,9 +1736,15 @@ impl MembershipOwner {
         }
         // The lane-push lever's wire half (finding 15 term 2): this
         // member's lane supply on the authority's free lists — O(1) per
-        // volume through the installed source, never a scan (KD-FG-4); 0
-        // on every mount that is not a partitioned authority.
-        grant.lane_supply_blocks = crate::free_grace::lane_supply_for_member(id);
+        // volume through the installed source, never a scan (KD-FG-4);
+        // empty on every mount that is not a partitioned authority. The
+        // vector names each volume's share; the sum is the mount word.
+        let volumes = crate::free_grace::lane_supply_for_member(id);
+        grant.lane_supply_blocks = volumes
+            .iter()
+            .map(|(_, n)| *n)
+            .fold(0u64, u64::saturating_add);
+        grant.lane_supply_volumes = volumes;
         RenewOutcome::Renewed(grant)
     }
 
@@ -2178,7 +2197,9 @@ impl MemberSession {
             anchor_ms,
         );
         // The lane-push lever (finding 15 term 2): the grant's lane-supply
-        // hint wakes this co-writer's refill at once.
+        // hint wakes this co-writer's refill at once — the per-volume
+        // vector FIRST (what the wake's pushed ticks read), then the sum.
+        crate::free_grace::note_lane_supply_volumes(&grant.lane_supply_volumes);
         crate::free_grace::note_lane_supply_hint(grant.lane_supply_blocks);
     }
 
@@ -2202,6 +2223,7 @@ impl MemberSession {
             grant.checkpoint_ceiling_ms,
             anchor_ms,
         );
+        crate::free_grace::note_lane_supply_volumes(&grant.lane_supply_volumes);
         crate::free_grace::note_lane_supply_hint(grant.lane_supply_blocks);
     }
 

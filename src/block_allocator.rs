@@ -2134,14 +2134,18 @@ impl BlockAllocator {
 
     /// **The supply witness generation** — the single-flight harvest's
     /// decline compares on it: the sum of two monotonic arrival counts,
-    /// the grants that carried the authority's advertisement to this
-    /// member ([`crate::free_grace::lane_supply_hint_gen`] — a nonzero
-    /// hint's wake is one of them) and this allocator's owed `Freed`
-    /// arrivals. Either moving moves the sum; neither moving means the
-    /// authority has told this mount nothing new about its lane's supply,
-    /// so a fresh empty harvest reply still stands.
+    /// the grants that moved the authority's advertisement of THIS
+    /// VOLUME's lane supply ([`crate::free_grace::lane_supply_hint_gen_for`]
+    /// — a nonzero advertisement of it, or a grant that did not name it;
+    /// the mount-wide arrival count under `SQUEEZEFS_ALLOC_LANE_VOLUME_HINT=0`)
+    /// and this allocator's owed `Freed` arrivals. Either moving moves the
+    /// sum; neither moving means the authority has told this mount nothing
+    /// new about its lane's supply ON THIS VOLUME, so a fresh empty
+    /// harvest reply still stands — a grant that only moved the sibling's
+    /// share re-arms no RPC here
+    /// (`.benchmarks/2026-09-07-cowriter-fpp-supply-residue.md`).
     fn supply_witness_gen(&self) -> u64 {
-        crate::free_grace::lane_supply_hint_gen()
+        crate::free_grace::lane_supply_hint_gen_for(self.vol_tag())
             .wrapping_add(self.owed_arrivals.load(Ordering::Acquire))
     }
 
@@ -2151,15 +2155,21 @@ impl BlockAllocator {
         self.lane_owed.load(Ordering::Acquire)
     }
 
+    /// The authority's advertised lane supply ON THIS VOLUME — the grant
+    /// vector's entry for it ([`crate::free_grace::lane_supply_hint_for`]),
+    /// the mount sum when no vector names it or under
+    /// `SQUEEZEFS_ALLOC_LANE_VOLUME_HINT=0`.
+    fn lane_supply_hint(&self) -> u64 {
+        crate::free_grace::lane_supply_hint_for(self.vol_tag())
+    }
+
     /// The refill's supply witness for this allocator: the authority's
-    /// advertised lane supply (the renewal grant's hint — per MOUNT,
-    /// summed over its data volumes, so a nonzero hint means SOME volume
-    /// holds supply and arms every laned allocator below its watermark;
-    /// an empty harvest on the other volume is one counted RPC) or this
-    /// allocator's owed word ([`crate::free_grace::lane_supply_witnessed`]).
+    /// advertised lane supply on this volume ([`Self::lane_supply_hint`])
+    /// or this allocator's owed word
+    /// ([`crate::free_grace::lane_supply_witnessed`]).
     fn lane_supply_witnessed(&self) -> bool {
         crate::free_grace::lane_supply_witnessed(
-            crate::free_grace::lane_supply_hint(),
+            self.lane_supply_hint(),
             self.lane_owed.load(Ordering::Acquire),
         )
     }
@@ -2317,11 +2327,12 @@ impl BlockAllocator {
     /// one-cadence-stale, mount-summed hint could only under-harvest);
     /// `None` = nothing to do (no witness / stocked / quiet / lever off).
     ///
-    /// The hint is SUMMED over volumes, so it cannot name the one that
-    /// holds the supply — a peer's rewrites of this lane's blocks land
-    /// there with no owed ledger knowing — so every low volume asks; a
-    /// volume that asked and got nothing has paid one RTT, and its stock
-    /// stays where the lane-aware placement can see it
+    /// The witness is THIS VOLUME's advertised share (the grant vector's
+    /// entry — `.benchmarks/2026-09-07-cowriter-fpp-supply-residue.md`), so
+    /// a low volume the authority holds nothing for does not ask; under
+    /// `SQUEEZEFS_ALLOC_LANE_VOLUME_HINT=0` the mount sum stands in and
+    /// every low volume asks — the volume that got nothing has paid one
+    /// RTT, and its stock stays where the lane-aware placement can see it
     /// (`.benchmarks/2026-09-07-cowriter-lane-aware-placement.md`).
     pub fn should_harvest_ahead(&self) -> Option<u64> {
         if !harvest_ahead_enabled() {
@@ -2410,21 +2421,29 @@ impl BlockAllocator {
     /// next watermark tick (which a quiet lane's decayed rate turns dark)
     /// or the next ENOSPC. The SAME harvest (sink → adopt → hint deposit);
     /// the decision is
-    /// [`crate::free_grace::lane_push_wants_harvest_on_volume`] — per
-    /// VOLUME, because the hint is summed: the hint alone suffices (the
-    /// owed word is the retired gate's witness), and a DRY volume asks
-    /// even when owed nothing. Returns the count adopted (0 = the decision
-    /// declined, or an empty grant).
+    /// [`crate::free_grace::lane_push_wants_harvest_on_volume`] over THIS
+    /// VOLUME's advertised share ([`Self::lane_supply_hint`]): the hint
+    /// alone suffices (the owed word is the retired gate's witness), and a
+    /// DRY volume asks even when owed nothing — but a volume the authority
+    /// advertises 0 for does not, however large the sibling's share made
+    /// the mount sum (`alloc_lane_volume_hint_skips` counts the decisions
+    /// the sum would have fired: the empty RPCs the vector saves). Returns
+    /// the count adopted (0 = the decision declined, or an empty grant).
     pub async fn pushed_refill_tick(&self, now_ms: u64) -> u64 {
         self.sample_alloc_rate(now_ms);
         if self.lanes.get().and_then(|l| l.harvest.get()).is_none() {
             return 0;
         }
-        let adopted = if crate::free_grace::lane_push_wants_harvest_on_volume(
-            crate::free_grace::lane_supply_hint(),
+        let (owed, reachable, watermark) = (
             self.lane_owed_blocks(),
             self.lane_reachable_blocks(),
             self.harvest_watermark.load(Ordering::Relaxed),
+        );
+        let adopted = if crate::free_grace::lane_push_wants_harvest_on_volume(
+            self.lane_supply_hint(),
+            owed,
+            reachable,
+            watermark,
         ) {
             crate::fuse_client::METRICS
                 .alloc_lane_pushed_harvests
@@ -2432,6 +2451,16 @@ impl BlockAllocator {
             self.note_proactive_harvest_witness();
             self.harvest_lane_supply().await
         } else {
+            if crate::free_grace::lane_push_wants_harvest_on_volume(
+                crate::free_grace::lane_supply_hint(),
+                owed,
+                reachable,
+                watermark,
+            ) {
+                crate::fuse_client::METRICS
+                    .alloc_lane_volume_hint_skips
+                    .fetch_add(1, Ordering::Relaxed);
+            }
             0
         };
         self.supply_close_tick().await;

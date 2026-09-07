@@ -1035,31 +1035,6 @@ pub fn set_rewrite_supply_close(on: bool) {
     rewrite_supply_close_cell().store(on, Ordering::Relaxed);
 }
 
-/// `SQUEEZEFS_REWRITE_SUPPLY_CLOSE_PER_VOLUME` cell (default ON; `0` = the
-/// mount-wide plan of the lever's first landing — the A/B control). A
-/// co-writer's lane exhausts and refills PER VOLUME and a closed epoch's
-/// parked keys return to the volume they live on, so the starving
-/// volume's tick plans over the keys parked ON THAT VOLUME
-/// (`.benchmarks/2026-09-07-cowriter-fpp-supply-residue.md`).
-fn rewrite_supply_close_per_volume_cell() -> &'static std::sync::atomic::AtomicBool {
-    static CELL: std::sync::OnceLock<std::sync::atomic::AtomicBool> = std::sync::OnceLock::new();
-    CELL.get_or_init(|| {
-        let on = crate::env_knobs::bool_knob("SQUEEZEFS_REWRITE_SUPPLY_CLOSE_PER_VOLUME", true);
-        std::sync::atomic::AtomicBool::new(on)
-    })
-}
-
-/// Whether the supply-coupled close plans over the asking volume's parked
-/// keys (on) or the mount's (off).
-pub fn rewrite_supply_close_per_volume_enabled() -> bool {
-    rewrite_supply_close_per_volume_cell().load(Ordering::Relaxed)
-}
-
-/// Set the per-volume plan lever (tests / A-B acceptance runs).
-pub fn set_rewrite_supply_close_per_volume(on: bool) {
-    rewrite_supply_close_per_volume_cell().store(on, Ordering::Relaxed);
-}
-
 /// **The supply-coupled close's PLAN** (pure — the product's decision and
 /// the closed-loop model's, one function): given the lane's deficit in
 /// blocks and the open epochs as `(ino, parked blocks)`, the inos to close
@@ -1134,12 +1109,6 @@ pub(crate) struct RewriteEpoch {
     recorded_bytes: std::sync::atomic::AtomicU64,
     /// Parked displaced bytes — the `rewrite_shadow_parked_bytes` share.
     parked_bytes: std::sync::atomic::AtomicU64,
-    /// Parked displaced BLOCKS per data volume (`vol_tag` → count): the
-    /// per-volume supply close's candidate weight — a closed epoch's keys
-    /// return to the volume each lives on, so a volume's deficit is
-    /// covered only by keys parked ON it. Written once per park under the
-    /// ino's meta lock, read by the refill tick's plan.
-    parked_by_volume: scc::HashMap<u64, std::sync::atomic::AtomicU64>,
     /// Idle clock (coarse ms) — the sweeper's close trigger.
     last_record_ms: std::sync::atomic::AtomicU64,
 }
@@ -1159,36 +1128,8 @@ impl RewriteEpoch {
             guards: crossbeam::queue::SegQueue::new(),
             recorded_bytes: std::sync::atomic::AtomicU64::new(0),
             parked_bytes: std::sync::atomic::AtomicU64::new(0),
-            parked_by_volume: scc::HashMap::new(),
             last_record_ms: std::sync::atomic::AtomicU64::new(epoch_coarse_ms()),
         }
-    }
-
-    /// Count one parked key against the volume it lives on.
-    fn note_parked_on(&self, vol_tag: u64) {
-        if self
-            .parked_by_volume
-            .read_sync(&vol_tag, |_, n| {
-                n.fetch_add(1, Ordering::Relaxed);
-            })
-            .is_none()
-        {
-            match self.parked_by_volume.entry_sync(vol_tag) {
-                scc::hash_map::Entry::Occupied(occ) => {
-                    occ.get().fetch_add(1, Ordering::Relaxed);
-                }
-                scc::hash_map::Entry::Vacant(vac) => {
-                    vac.insert_entry(std::sync::atomic::AtomicU64::new(1));
-                }
-            }
-        }
-    }
-
-    /// Parked keys living on `vol_tag`'s volume.
-    fn parked_on(&self, vol_tag: u64) -> u64 {
-        self.parked_by_volume
-            .read_sync(&vol_tag, |_, n| n.load(Ordering::Relaxed))
-            .unwrap_or(0)
     }
 }
 
@@ -13390,13 +13331,6 @@ impl DataRouter {
                 // durably referenced, so the close's free is legal a
                 // fortiori.
                 self.cache.purge_block_key(&p);
-                // The per-volume close's weight: the key returns to the
-                // lane of the volume it lives on.
-                if let Some((alloc, _)) = self.backend_router.allocator_for_key(&p) {
-                    epoch.note_parked_on(crate::meta_backend::kv::block_refs::volume_tag(
-                        alloc.volume_id(),
-                    ));
-                }
                 epoch.displaced.push(p);
                 epoch.parked_bytes.fetch_add(bs, Ordering::Relaxed);
                 METRICS
@@ -13834,61 +13768,38 @@ impl DataRouter {
     /// tripwires own that story) and idempotent against the dismount's own
     /// closes (the epoch registry's `remove_sync` under the meta lock).
     ///
-    /// **Per volume** (`SQUEEZEFS_REWRITE_SUPPLY_CLOSE_PER_VOLUME`, default
-    /// on — finding 15's fpp residue, `.benchmarks/2026-09-07-cowriter-fpp-supply-residue.md`):
-    /// a lane exhausts and refills PER VOLUME, and a closed epoch's keys
-    /// return to the volume each lives on, so the asking allocator's
-    /// `vol_tag` selects the candidates — an epoch's weight is the keys it
-    /// parks ON THAT VOLUME, the plan covers the deficit with that yield,
-    /// and an epoch parking only elsewhere is no candidate (never
-    /// `bounded`). The s11 fleet's file-per-proc phases skewed a lane's
-    /// supply ~64/36 across its two volumes, so the mount-wide plan of
-    /// the first landing spent about that share of every close's yield
-    /// restocking the volume that was not short. Faces:
-    /// `rewrite_shadow_supply_close_volume_blocks` (the yield that landed
-    /// on the asking volume) and `…_declined_offvolume` (parked keys
-    /// exist, none on it). Lever off = the mount-wide plan verbatim.
-    /// Returns the parked blocks released (every volume).
-    pub(crate) async fn supply_close_epochs(&self, vol_tag: u64, deficit_blocks: u64) -> u64 {
+    /// **Mount-wide by law** (finding 15's fpp re-attribution,
+    /// `.benchmarks/2026-09-07-cowriter-fpp-supply-residue.md` §8): parked
+    /// keys are counted across the mount's volumes and each returns to the
+    /// lane of the volume it lives on — which is the MOUNT's supply, because
+    /// the lane-aware placement equalizes the volumes' stocks (the §5.9
+    /// band + the failover) so a key restocking either volume takes the
+    /// next write. The per-volume plan the residue landing tried
+    /// (candidates = the keys parked on the asking volume, a "covered"
+    /// sibling's tick declining) stranded the keys parked on the covered
+    /// volume to the iteration boundary — the D row released 14 % of its
+    /// displaced keys through the routine closes against 0.3–1 % on both C
+    /// rows — and was retired the same day. Returns the parked blocks
+    /// released.
+    pub(crate) async fn supply_close_epochs(&self, deficit_blocks: u64) -> u64 {
         if crate::data_custody::poisoned() {
             return 0;
         }
-        let per_volume = rewrite_supply_close_per_volume_enabled();
         let bs = self.block_size.load(Ordering::Relaxed).max(1);
         let mut candidates: Vec<(u64, u64)> = Vec::new();
-        let mut parked_elsewhere = false;
         self.inner.rewrite_epochs.iter_sync(|ino, e| {
-            let mount_wide = e.parked_bytes.load(Ordering::Relaxed) / bs;
-            let weight = if per_volume {
-                let on_volume = e.parked_on(vol_tag);
-                parked_elsewhere |= on_volume == 0 && mount_wide > 0;
-                on_volume
-            } else {
-                mount_wide
-            };
-            candidates.push((*ino, weight));
+            candidates.push((*ino, e.parked_bytes.load(Ordering::Relaxed) / bs));
             true
         });
         let (to_close, left) = supply_close_plan(deficit_blocks, candidates);
         if to_close.is_empty() {
-            let face = if parked_elsewhere {
-                &METRICS.rewrite_shadow_supply_close_declined_offvolume
-            } else {
-                &METRICS.rewrite_shadow_supply_close_declined_no_parked
-            };
-            face.fetch_add(1, Ordering::Relaxed);
+            METRICS
+                .rewrite_shadow_supply_close_declined_no_parked
+                .fetch_add(1, Ordering::Relaxed);
             return 0;
         }
         let mut released = 0u64;
         for ino in to_close {
-            let on_volume = if per_volume {
-                self.inner
-                    .rewrite_epochs
-                    .read_sync(&ino, |_, e| e.parked_on(vol_tag))
-                    .unwrap_or(0)
-            } else {
-                0
-            };
             let token = self.inner.dlm.get_fencing_token_ino(ino);
             match self.close_rewrite_epoch_counted(ino, token).await {
                 Ok(Some(n)) => {
@@ -13898,9 +13809,6 @@ impl DataRouter {
                     METRICS
                         .rewrite_shadow_supply_close_blocks
                         .fetch_add(n, Ordering::Relaxed);
-                    METRICS
-                        .rewrite_shadow_supply_close_volume_blocks
-                        .fetch_add(on_volume, Ordering::Relaxed);
                     released += n;
                 }
                 Ok(None) => {} // closed by another trigger meanwhile
@@ -13930,9 +13838,6 @@ impl DataRouter {
     pub fn arm_rewrite_supply_close(&self) {
         for alloc in self.backend_router.lane_allocators() {
             let weak = std::sync::Arc::downgrade(&self.inner);
-            // The asking volume — the per-volume plan's key (KD-5's durable
-            // tag, the one the parked keys were counted under).
-            let vol_tag = crate::meta_backend::kv::block_refs::volume_tag(alloc.volume_id());
             let sink: crate::data_alloc_lane::SupplyCloseSink =
                 std::sync::Arc::new(move |deficit_blocks: u64| {
                     let weak = weak.clone();
@@ -13941,7 +13846,7 @@ impl DataRouter {
                             return 0;
                         };
                         DataRouter { inner }
-                            .supply_close_epochs(vol_tag, deficit_blocks)
+                            .supply_close_epochs(deficit_blocks)
                             .await
                     })
                 });

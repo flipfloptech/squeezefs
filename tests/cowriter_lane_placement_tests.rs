@@ -875,21 +875,29 @@ async fn the_pushed_refill_asks_a_dry_volume_on_a_hint_and_never_a_stocked_unowe
     assert_eq!(rig.a.alloc.lane_owed_blocks(), 0);
     assert_eq!(rig.b.alloc.lane_owed_blocks(), 0);
 
-    // The pure decision, per volume.
+    // The pure decision, per volume (`(hint, owed, reachable, watermark)`).
     assert!(
-        free_grace::lane_push_wants_harvest_on_volume(8, 0, 0),
+        free_grace::lane_push_wants_harvest_on_volume(8, 0, 0, 0),
         "hint > 0 ∧ dry ⇒ ask, owed or not"
     );
     assert!(
-        !free_grace::lane_push_wants_harvest_on_volume(8, 0, 4),
-        "hint > 0 ∧ stocked ∧ owed nothing ⇒ no wasted RTT"
+        !free_grace::lane_push_wants_harvest_on_volume(8, 0, 4, 0),
+        "hint > 0 ∧ stocked (quiet lane: no watermark) ∧ owed nothing ⇒ no wasted RTT"
     );
     assert!(
-        free_grace::lane_push_wants_harvest_on_volume(8, 2, 4),
+        free_grace::lane_push_wants_harvest_on_volume(8, 0, 4, 50),
+        "hint > 0 ∧ below the ahead watermark ⇒ ask (the transit is not covered)"
+    );
+    assert!(
+        !free_grace::lane_push_wants_harvest_on_volume(8, 0, 64, 50),
+        "hint > 0 ∧ above the watermark ∧ owed nothing ⇒ no wasted RTT"
+    );
+    assert!(
+        free_grace::lane_push_wants_harvest_on_volume(8, 2, 4, 0),
         "owed ⇒ ask (the shipped decision)"
     );
     assert!(
-        !free_grace::lane_push_wants_harvest_on_volume(0, 0, 0),
+        !free_grace::lane_push_wants_harvest_on_volume(0, 0, 0, 0),
         "no hint ⇒ nothing to ask for"
     );
 

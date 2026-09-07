@@ -2253,6 +2253,7 @@ impl BlockAllocator {
             crate::free_grace::lane_supply_hint(),
             self.lane_owed_blocks(),
             self.lane_reachable_blocks(),
+            self.harvest_watermark.load(Ordering::Relaxed),
         ) {
             crate::fuse_client::METRICS
                 .alloc_lane_pushed_harvests

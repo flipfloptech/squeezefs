@@ -518,6 +518,15 @@ async fn the_pushed_refill_fires_on_the_hint_alone_for_a_recomputed_free() {
     cw.set_capacity_bytes(64 * chunk);
     cw.engage_alloc_lanes(part(2, 1)).expect("lane 1 of 2");
     cw.set_lane_harvest_sink(authority_sink(&auth, 1, 2));
+    // The per-volume law (composed with the lane-aware placement): a
+    // pushed wake asks only when THIS volume's stock is LOW — dry, or
+    // below its ahead watermark — never while it covers its next transit.
+    // Mint the lane's 32 virgin blocks so the wake finds it dry: the shape
+    // in which the recompute arm's supply is what the co-writer needs.
+    for _ in 0..32 {
+        cw.allocate_block().await.expect("a virgin lane-1 block");
+    }
+    assert_eq!(cw.lane_reachable_blocks(), 0, "the lane is dry");
 
     // No plane armed: the authority's terminal free publishes straight to
     // its free list — the recompute arm's effect as the co-writer sees it

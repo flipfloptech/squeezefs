@@ -1,0 +1,44 @@
+[2026-09-07T00:51:17Z ERROR squeezefs::block_allocator] I/O error: data volume 'nvme3n1' full: 8185 of 8192 blocks allocated — lane 8 of 16 is exhausted while 0 free block(s) belong to lanes this moun
+[2026-09-07T00:51:18Z ERROR squeezefs::block_allocator] I/O error: data volume 'nvme4n1' full: 8185 of 8192 blocks allocated — lane 8 of 16 is exhausted while 0 free block(s) belong to lanes this moun
+[2026-09-07T00:51:19Z ERROR squeezefs::block_allocator] I/O error: data volume 'nvme4n1' full: 8185 of 8192 blocks allocated — lane 8 of 16 is exhausted while 0 free block(s) belong to lanes this moun
+[2026-09-07T00:51:19Z ERROR squeezefs::block_allocator] bounded allocation refusing StorageFull after 1006 ms parked with 0 offset(s) still in grace locally (lane harvest horizon 8985 ms): the pressur
+[2026-09-07T00:51:20Z ERROR squeezefs::block_allocator] I/O error: data volume 'nvme4n1' full: 8185 of 8192 blocks allocated — lane 8 of 16 is exhausted while 0 free block(s) belong to lanes this moun
+[2026-09-07T00:51:20Z ERROR squeezefs::block_allocator] bounded allocation refusing StorageFull after 1004 ms parked with 0 offset(s) still in grace locally (lane harvest horizon 8992 ms): the pressur
+[2026-09-07T00:51:20Z WARN  squeezefs::fuse_client] flush write-through failed for ino 2 block 2401 (Io(Custom { kind: StorageFull, error: "I/O error: data volume 'nvme4n1' full: 8185 of 8192 blocks a
+[2026-09-07T00:51:23Z ERROR squeezefs::block_allocator] I/O error: data volume 'nvme3n1' full: 8185 of 8192 blocks allocated — lane 8 of 16 is exhausted while 0 free block(s) belong to lanes this moun
+[2026-09-07T00:51:24Z ERROR squeezefs::block_allocator] I/O error: data volume 'nvme3n1' full: 8185 of 8192 blocks allocated — lane 8 of 16 is exhausted while 0 free block(s) belong to lanes this moun
+[2026-09-07T00:51:24Z ERROR squeezefs::block_allocator] bounded allocation refusing StorageFull after 1006 ms parked with 0 offset(s) still in grace locally (lane harvest horizon 8094 ms): the pressur
+[2026-09-07T00:51:24Z ERROR squeezefs::block_allocator] bounded allocation refusing StorageFull after 1019 ms parked with 0 offset(s) still in grace locally (lane harvest horizon 8095 ms): the pressur
+[2026-09-07T00:51:24Z ERROR squeezefs::block_allocator] bounded allocation refusing StorageFull after 1011 ms parked with 0 offset(s) still in grace locally (lane harvest horizon 8096 ms): the pressur
+[2026-09-07T00:51:24Z ERROR squeezefs::block_allocator] bounded allocation refusing StorageFull after 1018 ms parked with 0 offset(s) still in grace locally (lane harvest horizon 8096 ms): the pressur
+[2026-09-07T00:51:24Z ERROR squeezefs::block_allocator] bounded allocation refusing StorageFull after 1011 ms parked with 0 offset(s) still in grace locally (lane harvest horizon 8096 ms): the pressur
+[2026-09-07T00:51:24Z ERROR squeezefs::block_allocator] bounded allocation refusing StorageFull after 1017 ms parked with 0 offset(s) still in grace locally (lane harvest horizon 8096 ms): the pressur
+[2026-09-07T00:51:24Z ERROR squeezefs::block_allocator] bounded allocation refusing StorageFull after 1011 ms parked with 0 offset(s) still in grace locally (lane harvest horizon 8096 ms): the pressur
+[2026-09-07T00:51:24Z ERROR squeezefs::block_allocator] bounded allocation refusing StorageFull after 1008 ms parked with 0 offset(s) still in grace locally (lane harvest horizon 8096 ms): the pressur
+[2026-09-07T00:51:24Z ERROR squeezefs::block_allocator] bounded allocation refusing StorageFull after 1009 ms parked with 0 offset(s) still in grace locally (lane harvest horizon 8096 ms): the pressur
+[2026-09-07T00:51:24Z ERROR squeezefs::block_allocator] bounded allocation refusing StorageFull after 1009 ms parked with 0 offset(s) still in grace locally (lane harvest horizon 8097 ms): the pressur
+[2026-09-07T00:51:24Z ERROR squeezefs::block_allocator] bounded allocation refusing StorageFull after 1003 ms parked with 0 offset(s) still in grace locally (lane harvest horizon 8097 ms): the pressur
+[2026-09-07T00:51:24Z ERROR squeezefs::block_allocator] bounded allocation refusing StorageFull after 1028 ms parked with 0 offset(s) still in grace locally (lane harvest horizon 8108 ms): the pressur
+[2026-09-07T00:51:24Z ERROR squeezefs::block_allocator] bounded allocation refusing StorageFull after 1031 ms parked with 0 offset(s) still in grace locally (lane harvest horizon 8111 ms): the pressur
+[2026-09-07T00:51:26Z ERROR squeezefs::block_allocator] I/O error: data volume 'nvme3n1' full: 8185 of 8192 blocks allocated — lane 8 of 16 is exhausted while 0 free block(s) belong to lanes this moun
+[2026-09-07T00:51:31Z ERROR squeezefs::block_allocator] I/O error: data volume 'nvme4n1' full: 8185 of 8192 blocks allocated — lane 8 of 16 is exhausted while 0 free block(s) belong to lanes this moun
+[2026-09-07T00:52:22Z ERROR squeezefs::block_allocator] I/O error: data volume 'nvme3n1' full: 8185 of 8192 blocks allocated — lane 8 of 16 is exhausted while 0 free block(s) belong to lanes this moun
+[2026-09-07T00:52:23Z ERROR squeezefs::block_allocator] I/O error: data volume 'nvme3n1' full: 8185 of 8192 blocks allocated — lane 8 of 16 is exhausted while 0 free block(s) belong to lanes this moun
+[2026-09-07T00:52:23Z ERROR squeezefs::block_allocator] bounded allocation refusing StorageFull after 1044 ms parked with 0 offset(s) still in grace locally (lane harvest horizon 11658 ms): the pressu
+[2026-09-07T00:52:42Z ERROR squeezefs::block_allocator] I/O error: data volume 'nvme4n1' full: 8185 of 8192 blocks allocated — lane 8 of 16 is exhausted while 0 free block(s) belong to lanes this moun
+[2026-09-07T00:52:43Z ERROR squeezefs::block_allocator] I/O error: data volume 'nvme4n1' full: 8185 of 8192 blocks allocated — lane 8 of 16 is exhausted while 0 free block(s) belong to lanes this moun
+[2026-09-07T00:52:43Z ERROR squeezefs::block_allocator] bounded allocation refusing StorageFull after 1033 ms parked with 0 offset(s) still in grace locally (lane harvest horizon 8127 ms): the pressur
+[2026-09-07T00:52:43Z ERROR squeezefs::block_allocator] bounded allocation refusing StorageFull after 1033 ms parked with 0 offset(s) still in grace locally (lane harvest horizon 8127 ms): the pressur
+[2026-09-07T00:52:43Z ERROR squeezefs::block_allocator] bounded allocation refusing StorageFull after 1012 ms parked with 0 offset(s) still in grace locally (lane harvest horizon 8149 ms): the pressur
+[2026-09-07T00:52:43Z ERROR squeezefs::block_allocator] bounded allocation refusing StorageFull after 1011 ms parked with 0 offset(s) still in grace locally (lane harvest horizon 8149 ms): the pressur
+[2026-09-07T00:52:59Z ERROR squeezefs::block_allocator] I/O error: data volume 'nvme3n1' full: 8185 of 8192 blocks allocated — lane 8 of 16 is exhausted while 0 free block(s) belong to lanes this moun
+[2026-09-07T00:53:00Z ERROR squeezefs::block_allocator] I/O error: data volume 'nvme3n1' full: 8185 of 8192 blocks allocated — lane 8 of 16 is exhausted while 0 free block(s) belong to lanes this moun
+[2026-09-07T00:53:00Z ERROR squeezefs::block_allocator] bounded allocation refusing StorageFull after 1033 ms parked with 0 offset(s) still in grace locally (lane harvest horizon 8527 ms): the pressur
+[2026-09-07T00:53:01Z ERROR squeezefs::block_allocator] I/O error: data volume 'nvme3n1' full: 8185 of 8192 blocks allocated — lane 8 of 16 is exhausted while 0 free block(s) belong to lanes this moun
+[2026-09-07T00:53:01Z ERROR squeezefs::block_allocator] bounded allocation refusing StorageFull after 1025 ms parked with 0 offset(s) still in grace locally (lane harvest horizon 8235 ms): the pressur
+[2026-09-07T00:53:01Z WARN  squeezefs::fuse_client] fsync durable upload failed for ino 2 block 1696 (Io(Custom { kind: StorageFull, error: "I/O error: data volume 'nvme3n1' full: 8185 of 8192 blocks 
+[2026-09-07T00:53:02Z ERROR squeezefs::block_allocator] I/O error: data volume 'nvme3n1' full: 8185 of 8192 blocks allocated — lane 8 of 16 is exhausted while 0 free block(s) belong to lanes this moun
+[2026-09-07T00:53:02Z ERROR squeezefs::block_allocator] bounded allocation refusing StorageFull after 1005 ms parked with 0 offset(s) still in grace locally (lane harvest horizon 8239 ms): the pressur
+[2026-09-07T00:53:02Z ERROR squeezefs::fuse_client] FUSE Fsync failed for ino 2: Io(Custom { kind: StorageFull, error: "I/O error: data volume 'nvme3n1' full: 8185 of 8192 blocks allocated — lane 8 of
+[2026-09-07T00:53:02Z ERROR squeezefs::fuse_client] Squeezefs operational error: Io(Custom { kind: StorageFull, error: "I/O error: data volume 'nvme3n1' full: 8185 of 8192 blocks allocated — lane 8 of
+[2026-09-07T00:54:02Z ERROR squeezefs::block_allocator] I/O error: data volume 'nvme3n1' full: 8185 of 8192 blocks allocated — lane 8 of 16 is exhausted while 0 free block(s) belong to lanes this moun

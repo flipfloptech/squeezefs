@@ -40,6 +40,22 @@ mount (the A-arm rig reset the cluster; remount is part of every arm).
    `META_KV_DELTA_ORPHANS` (serial in the test stage, parallel in the
    bench harness) — fixed `66a71e35` (a test-module mutex on exactly
    those three; 1/40 → 0/200), product path untouched. Item CLOSED.
+1b. **Finding 15 term 1 — DONE on the mechanism, the row still FAILS
+   (`.benchmarks/2026-09-06-free-grace-term1-fleet.md`).** User decision
+   2026-09-06: all four KD-FG-11 re-derivations landed (`ee49cf04`, items
+   1–3 `7ff374ea`, item 4 + the landing-ceiling composition). Fleet, same
+   boot, baseline `6cbbd848` vs after: bound age 9,382 → 1,836 ms, member
+   ack lag 6.9 → 0.7 s, held offsets 537 → 68, zero fences — and the
+   s11-mpiio gate still NOT SUSTAINED (1,649 → 649; lane ENOSPC 50k → 35k).
+   The next binding term is UPSTREAM of the ring: displaced blocks park in
+   the co-writer's open rewrite epoch until it closes (KD-1.6 — no routine
+   trigger fires mid-iteration on a 1.25 GiB slice of a 10 GiB shared
+   file), so supply reaches the lanes in bursts with 9–31 s gaps. Owed:
+   (1) a per-second time-series sampler on the fleet row (rig change), (2)
+   the lever as a USER DECISION — a supply-coupled epoch close on
+   co-writers (KD-1.7's early-close made ahead of the StorageFull). Also
+   filed: `read_settle_lost_serialized` fires on the authority in both
+   rows (a standing must-stay-0 violation on this venue).
 2. **Kernel A/B, B arm** — after `squeeze-test` boots the 6.19.14 series
    WITH 0031 (or whichever box carries the patched kernel): on the box,
    `cd /scratch/tmp/sqz-agent/k26 && sudo env ARM=B KERNEL_TAG=<uname -r

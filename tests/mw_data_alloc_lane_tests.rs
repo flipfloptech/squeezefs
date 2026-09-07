@@ -32,7 +32,13 @@
 //!    ahead tick, the pushed refill) arm on the authority's ADVERTISED
 //!    supply (the renewal grant's lane-supply hint), never on the owed
 //!    ledger alone; the ENOSPC-path harvest is unchanged
-//!    (`.benchmarks/2026-09-07-lane-refill-hint-gate.md`).
+//!    (`.benchmarks/2026-09-07-lane-refill-hint-gate.md`);
+//! 10. **the single-flight harvest** — one in-flight harvest RPC per
+//!    allocator: concurrent callers join its outcome, a fresh EMPTY reply
+//!    declines re-issue until the authority's advertisement moves (a
+//!    grant, a wake, an owed `Freed`), two volumes are two flights, the
+//!    lever off is one RPC per caller, and no park outlives the wall
+//!    (`.benchmarks/2026-09-07-lane-harvest-single-flight.md`).
 //!
 //! **No numbers here — ruling D11.** The bench coverage
 //! (`benches/write_path_bench.rs::alloc_lane`) is written and NOT run; every
@@ -1480,4 +1486,500 @@ async fn the_enospc_path_harvest_is_unchanged_and_never_a_hint_refill() {
         "a fed funnel refuses nothing"
     );
     assert_eq!(a.lane_reachable_blocks(), 2, "the other two adopted blocks");
+}
+
+// ---------------------------------------------------------------------------
+// 10. The single-flight harvest: one in-flight RPC per allocator
+// ---------------------------------------------------------------------------
+//
+// Finding 15 phase B1 (`.benchmarks/2026-09-07-f15-day2-fleet-pair.md` §2):
+// on the 8-co-writer fleet the file-per-proc phase drove 124,240 lane
+// harvest RPCs in 9.5 minutes for 60,419 blocks — half of them empty —
+// because every parked allocation on a co-writer issued its OWN harvest
+// per park slice, and the authority's renewal serves (the liveness plane)
+// queued behind the storm. These contracts pin the lever that cuts the
+// storm by the park population: `SQUEEZEFS_ALLOC_LANE_HARVEST_SINGLE_FLIGHT`.
+
+/// Restores the single-flight lever beside the refill posture.
+struct FlightRestore {
+    _refill: RefillRestore,
+}
+
+impl Drop for FlightRestore {
+    fn drop(&mut self) {
+        squeezefs::block_allocator::test_clear_harvest_single_flight();
+    }
+}
+
+fn flight_restore() -> FlightRestore {
+    squeezefs::block_allocator::test_clear_harvest_single_flight();
+    FlightRestore {
+        _refill: refill_restore(),
+    }
+}
+
+/// The authority's lane list behind a GATE: every RPC parks inside the
+/// sink until `release()` — the shape that holds one harvest in flight
+/// while more callers arrive. `hint_ms` is the reply's bound-age hint
+/// (nonzero = the authority reports a held ring, so an empty reply parks
+/// the bounded allocation; 0 = nothing held, refuse at once).
+struct GatedSupply {
+    blocks: Mutex<VecDeque<u64>>,
+    asks: Mutex<Vec<u64>>,
+    gate: tokio::sync::watch::Sender<bool>,
+    hint_ms: u64,
+}
+
+impl GatedSupply {
+    fn new(blocks: impl IntoIterator<Item = u64>, hint_ms: u64) -> Arc<Self> {
+        let (gate, _) = tokio::sync::watch::channel(false);
+        Arc::new(Self {
+            blocks: Mutex::new(blocks.into_iter().collect()),
+            asks: Mutex::new(Vec::new()),
+            gate,
+            hint_ms,
+        })
+    }
+
+    fn sink(self: &Arc<Self>) -> lane::LaneHarvestSink {
+        let me = Arc::clone(self);
+        Arc::new(move |max: u64| {
+            let me = Arc::clone(&me);
+            Box::pin(async move {
+                me.asks.lock().unwrap().push(max);
+                let mut rx = me.gate.subscribe();
+                rx.wait_for(|open| *open).await.expect("gate sender lives");
+                let mut q = me.blocks.lock().unwrap();
+                let n = (max as usize).min(q.len());
+                let blocks: Vec<u64> = q.drain(..n).collect();
+                Ok(lane::LaneHarvest {
+                    release_ages_ms: vec![0; blocks.len()],
+                    blocks,
+                    bound_age_hint_ms: me.hint_ms,
+                    rtt_ms: 1,
+                })
+            })
+        })
+    }
+
+    fn release(&self) {
+        self.gate.send_replace(true);
+    }
+
+    fn asks(&self) -> usize {
+        self.asks.lock().unwrap().len()
+    }
+}
+
+struct FlightGauges {
+    harvests: u64,
+    coalesced: u64,
+    declined: u64,
+    harvested: u64,
+}
+
+fn flight_gauges() -> FlightGauges {
+    FlightGauges {
+        harvests: METRICS.alloc_lane_harvests.load(Ordering::Relaxed),
+        coalesced: METRICS.alloc_lane_harvest_coalesced.load(Ordering::Relaxed),
+        declined: METRICS
+            .alloc_lane_harvest_declined_stale
+            .load(Ordering::Relaxed),
+        harvested: METRICS.alloc_lane_harvested_blocks.load(Ordering::Relaxed),
+    }
+}
+
+/// A co-writer's allocator (lane 1 of 2 on a 64-block device) with its
+/// whole 32-block lane share minted: every allocation from here on is an
+/// ENOSPC-path harvest.
+async fn exhausted_co_writer(id: &str, sink: lane::LaneHarvestSink) -> Arc<BlockAllocator> {
+    let a = allocator(id, 64).await;
+    a.engage_alloc_lanes(part(2, 1)).expect("lane 1 of 2");
+    a.set_lane_harvest_sink(sink);
+    let share = lane::lane_capacity_blocks(64, 2, 1);
+    for _ in 0..share {
+        a.allocate_block().await.expect("mint the lane share");
+    }
+    assert_eq!(a.lane_reachable_blocks(), 0, "exhausted");
+    a
+}
+
+fn storage_full(e: &SqueezefsError) -> bool {
+    matches!(e, SqueezefsError::Io(io) if io.kind() == std::io::ErrorKind::StorageFull)
+}
+
+/// Spin (yielding) until `cond` holds or `bound` passes; `true` ⇔ it held.
+async fn wait_until(bound: std::time::Duration, mut cond: impl FnMut() -> bool) -> bool {
+    let t0 = std::time::Instant::now();
+    while !cond() {
+        if t0.elapsed() > bound {
+            return false;
+        }
+        tokio::task::yield_now().await;
+    }
+    true
+}
+
+/// Contract (1): **N concurrent parked allocations on one allocator with
+/// supply on the authority issue exactly ONE harvest RPC**, and all N
+/// allocate from its result. The first caller leads; the other N−1 arrive
+/// while the RPC is in flight and JOIN its outcome
+/// (`alloc_lane_harvest_coalesced`) instead of each issuing their own;
+/// `alloc_lane_harvests` counts the one RPC, so `harvests + coalesced`
+/// accounts for every would-be call.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn n_parked_allocations_on_one_allocator_issue_one_harvest_rpc() {
+    let _serial = serial();
+    let _restore = flight_restore();
+    const N: usize = 8;
+    // The authority holds 16 lane-1 blocks of this volume.
+    let held: Vec<u64> = (0..16u64).map(|i| 2 * i + 1).collect();
+    let supply = GatedSupply::new(held.iter().copied(), 0);
+    let a = exhausted_co_writer("sf-one-rpc", supply.sink()).await;
+    let chunk = a.chunk_size();
+    for idx in &held {
+        a.retire_shipped_free_tracking(idx * chunk);
+    }
+    let grain = lane::reserve_grain_blocks(64, 2).max(1) as usize;
+    let expect_adopted = grain.min(held.len());
+    assert!(
+        expect_adopted >= N,
+        "the fixture needs one grain to feed every caller (grain {grain})"
+    );
+
+    let g0 = flight_gauges();
+    let mut tasks = Vec::new();
+    for _ in 0..N {
+        let a = Arc::clone(&a);
+        tasks.push(tokio::spawn(async move {
+            a.allocate_block_grace_bounded().await
+        }));
+    }
+    // Every caller but the leader has joined the in-flight RPC.
+    assert!(
+        wait_until(std::time::Duration::from_secs(10), || {
+            flight_gauges().coalesced == g0.coalesced + (N as u64 - 1)
+        })
+        .await,
+        "N−1 callers join the one in-flight harvest (coalesced {} → {})",
+        g0.coalesced,
+        flight_gauges().coalesced
+    );
+    assert_eq!(supply.asks(), 1, "one RPC in flight, no second issued");
+    supply.release();
+
+    let mut got = Vec::new();
+    for t in tasks {
+        let off = t
+            .await
+            .expect("task")
+            .expect("every caller allocates from the one harvest");
+        let idx = off / chunk;
+        assert!(held.contains(&idx), "a harvested lane-1 block (idx {idx})");
+        got.push(idx);
+    }
+    got.sort_unstable();
+    got.dedup();
+    assert_eq!(got.len(), N, "N distinct offsets — no double handout");
+
+    let g1 = flight_gauges();
+    assert_eq!(supply.asks(), 1, "exactly ONE harvest RPC for N callers");
+    assert_eq!(
+        g1.harvests,
+        g0.harvests + 1,
+        "alloc_lane_harvests = the RPC count"
+    );
+    assert_eq!(g1.coalesced, g0.coalesced + (N as u64 - 1), "N−1 joiners");
+    assert_eq!(g1.declined, g0.declined, "a fed harvest declines nobody");
+    assert_eq!(
+        g1.harvested,
+        g0.harvested + expect_adopted as u64,
+        "one grain adopted"
+    );
+    assert_eq!(
+        a.lane_reachable_blocks(),
+        (expect_adopted - N) as u64,
+        "the rest of the grain is local now"
+    );
+}
+
+/// Contract (2) + (3): **a fresh EMPTY reply declines re-issue until the
+/// authority's advertisement moves.** After a harvest that returned 0
+/// blocks the next callers decline (`alloc_lane_harvest_declined_stale`,
+/// no RPC) until (a) a renewal grant refreshes the hint — the SAME value
+/// included, since the grant cadence is what bounds the decline (and the
+/// arrival counts whatever `SQUEEZEFS_FREE_GRACE_LANE_PUSH` says about the
+/// value), (b) a nonzero hint wakes the refill, or (c) an owed `Freed`
+/// verdict lands; each ends the window for exactly one RPC.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_empty_harvest_declines_re_issue_until_the_advertisement_moves() {
+    let _serial = serial();
+    let _restore = flight_restore();
+    free_grace::test_set_lane_push(Some(true));
+    let supply = GatedSupply::new([], 0);
+    supply.release();
+    let a = exhausted_co_writer("sf-decline", supply.sink()).await;
+    let chunk = a.chunk_size();
+    let g0 = flight_gauges();
+    let gen0 = free_grace::lane_supply_hint_gen();
+
+    // The first exhausted allocation asks (one RPC) and gets nothing.
+    let e = a.allocate_block().await.expect_err("exhausted");
+    assert!(storage_full(&e), "StorageFull: {e}");
+    assert_eq!(supply.asks(), 1);
+    assert_eq!(flight_gauges().harvests, g0.harvests + 1);
+
+    // The next two decline: the advertisement has not moved.
+    for i in 0..2 {
+        let e = a.allocate_block().await.expect_err("still exhausted");
+        assert!(storage_full(&e));
+        assert_eq!(supply.asks(), 1, "declined: no RPC (attempt {i})");
+    }
+    let g1 = flight_gauges();
+    assert_eq!(g1.harvests, g0.harvests + 1, "one RPC so far");
+    assert_eq!(g1.declined, g0.declined + 2, "two declined callers");
+    assert_eq!(g1.coalesced, g0.coalesced, "nothing was in flight to join");
+
+    // (a) A grant refresh with the SAME value (0) ends the window: the
+    // generation is the grant's arrival, the renewal cadence is the bound.
+    free_grace::note_lane_supply_hint(0);
+    assert_eq!(free_grace::lane_supply_hint_gen(), gen0 + 1, "one grant");
+    let _ = a.allocate_block().await.expect_err("still exhausted");
+    assert_eq!(supply.asks(), 2, "the grant re-armed exactly one RPC");
+    let _ = a.allocate_block().await.expect_err("still exhausted");
+    assert_eq!(supply.asks(), 2, "…and the empty reply declines again");
+
+    // The arrival counts with the lane-push lever OFF too (the value is
+    // dropped there; the grant still arrived).
+    free_grace::test_set_lane_push(Some(false));
+    free_grace::note_lane_supply_hint(0);
+    assert_eq!(free_grace::lane_supply_hint_gen(), gen0 + 2);
+    let _ = a.allocate_block().await.expect_err("still exhausted");
+    assert_eq!(
+        supply.asks(),
+        3,
+        "LANE_PUSH=0: a grant still ends the decline"
+    );
+    free_grace::test_set_lane_push(Some(true));
+
+    // (c) An owed Freed verdict ends the window.
+    let _ = a.allocate_block().await.expect_err("declined");
+    assert_eq!(supply.asks(), 3);
+    a.note_owed_freed(1);
+    let _ = a.allocate_block().await.expect_err("still empty");
+    assert_eq!(supply.asks(), 4, "owed moved ⇒ one RPC");
+
+    // (b) Supply lands and the grant says so: the wake ends the window and
+    // the harvest adopts it.
+    let idx = 7u64;
+    a.retire_shipped_free_tracking(idx * chunk);
+    supply.blocks.lock().unwrap().push_back(idx);
+    let _ = a
+        .allocate_block()
+        .await
+        .expect_err("declined until the hint");
+    assert_eq!(supply.asks(), 4);
+    free_grace::note_lane_supply_hint(1);
+    let off = a.allocate_block().await.expect("the advertised block");
+    assert_eq!(off / chunk, idx);
+    assert_eq!(supply.asks(), 5);
+    let g2 = flight_gauges();
+    assert_eq!(g2.harvests, g0.harvests + 5, "five RPCs in all");
+    assert_eq!(g2.harvested, g0.harvested + 1);
+    assert_eq!(
+        g2.harvests - g0.harvests + (g2.declined - g0.declined) + (g2.coalesced - g0.coalesced),
+        10,
+        "harvests + declined + coalesced accounts for every would-be call"
+    );
+}
+
+/// Contract (4): **two allocators (two volumes) are two independent
+/// flights.** A harvest in flight on volume A coalesces nobody on B, and
+/// A's empty-reply decline never declines B (nor B's decline A).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn two_volumes_are_independent_single_flights() {
+    let _serial = serial();
+    let _restore = flight_restore();
+    // A: gated, holding supply. B: open, empty.
+    let supply_a = GatedSupply::new([1u64, 3, 5, 7, 9, 11, 13, 15], 0);
+    let supply_b = GatedSupply::new([], 0);
+    supply_b.release();
+    let a = exhausted_co_writer("sf-vol-a", supply_a.sink()).await;
+    let b = exhausted_co_writer("sf-vol-b", supply_b.sink()).await;
+    for idx in [1u64, 3, 5, 7, 9, 11, 13, 15] {
+        a.retire_shipped_free_tracking(idx * a.chunk_size());
+    }
+    let g0 = flight_gauges();
+
+    // A's leader parks in its RPC.
+    let leader = {
+        let a = Arc::clone(&a);
+        tokio::spawn(async move { a.allocate_block_grace_bounded().await })
+    };
+    assert!(
+        wait_until(std::time::Duration::from_secs(10), || supply_a.asks() == 1).await,
+        "A's harvest is in flight"
+    );
+
+    // B's callers: their own RPC (empty), then B's decline — A's flight
+    // coalesces none of them.
+    let _ = b.allocate_block().await.expect_err("B exhausted");
+    assert_eq!(supply_b.asks(), 1, "B issued its own RPC");
+    let _ = b.allocate_block().await.expect_err("B exhausted");
+    assert_eq!(supply_b.asks(), 1, "B declined on B's empty reply");
+    let g1 = flight_gauges();
+    assert_eq!(g1.coalesced, g0.coalesced, "B never joined A's flight");
+    assert_eq!(g1.declined, g0.declined + 1, "B's decline is B's");
+
+    // A's second caller joins A's flight; B's decline does not touch it.
+    let joiner = {
+        let a = Arc::clone(&a);
+        tokio::spawn(async move { a.allocate_block_grace_bounded().await })
+    };
+    assert!(
+        wait_until(std::time::Duration::from_secs(10), || {
+            flight_gauges().coalesced == g0.coalesced + 1
+        })
+        .await,
+        "A's second caller joined A's flight"
+    );
+    supply_a.release();
+    leader.await.unwrap().expect("A's leader allocates");
+    joiner.await.unwrap().expect("A's joiner allocates");
+    let g2 = flight_gauges();
+    assert_eq!(supply_a.asks(), 1, "one RPC on A");
+    assert_eq!(g2.harvests, g0.harvests + 2, "one RPC per volume");
+    assert_eq!(g2.declined, g0.declined + 1, "only B's caller declined");
+    assert_eq!(g2.coalesced, g0.coalesced + 1, "only A's joiner coalesced");
+}
+
+/// Contract (5): **the lever off is one RPC per caller** — the shipped
+/// shape verbatim: N concurrent callers issue N RPCs, nobody joins, an
+/// empty reply declines nobody.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_lever_off_issues_one_rpc_per_caller() {
+    let _serial = serial();
+    let _restore = flight_restore();
+    squeezefs::block_allocator::test_set_harvest_single_flight(Some(false));
+    const N: usize = 4;
+    let held: Vec<u64> = (0..16u64).map(|i| 2 * i + 1).collect();
+    let supply = GatedSupply::new(held.iter().copied(), 0);
+    let a = exhausted_co_writer("sf-lever-off", supply.sink()).await;
+    let chunk = a.chunk_size();
+    for idx in &held {
+        a.retire_shipped_free_tracking(idx * chunk);
+    }
+    let g0 = flight_gauges();
+    let mut tasks = Vec::new();
+    for _ in 0..N {
+        let a = Arc::clone(&a);
+        tasks.push(tokio::spawn(async move {
+            a.allocate_block_grace_bounded().await
+        }));
+    }
+    // With the lever off every caller reaches the sink itself.
+    assert!(
+        wait_until(std::time::Duration::from_secs(10), || supply.asks() == N).await,
+        "N callers ⇒ N RPCs in flight (got {})",
+        supply.asks()
+    );
+    supply.release();
+    for t in tasks {
+        t.await.unwrap().expect("allocates");
+    }
+    let g1 = flight_gauges();
+    assert_eq!(g1.harvests, g0.harvests + N as u64, "one RPC per caller");
+    assert_eq!(
+        g1.coalesced, g0.coalesced,
+        "nobody joins with the lever off"
+    );
+
+    // An empty reply declines nobody: drain the supply, then two callers
+    // are two RPCs.
+    supply.blocks.lock().unwrap().clear();
+    while a.allocate_block().await.is_ok() {}
+    let asks = supply.asks();
+    let _ = a.allocate_block().await.expect_err("exhausted");
+    assert_eq!(supply.asks(), asks + 1);
+    let g2 = flight_gauges();
+    assert_eq!(g2.declined, g0.declined, "the lever off never declines");
+    assert!(squeezefs::block_allocator::test_clear_harvest_single_flight());
+}
+
+/// Contract (6): **the ENOSPC verdict's timing is unchanged — no caller
+/// waits past the wall.** A joiner whose leader's RPC outlives the wall
+/// gives up the join at the wall and takes its verdict (its bounded
+/// allocation refuses `StorageFull` within the wall) while the leader is
+/// still in flight; the leader's own outcome is unaffected. And a parked
+/// allocation whose declined retries never re-issue still ends at the
+/// wall: the decline shortens nothing and lengthens nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn no_caller_waits_past_the_wall() {
+    let _serial = serial();
+    let _restore = flight_restore();
+    let wall = free_grace::pressure_park_wall_ms();
+    let bound = std::time::Duration::from_millis(wall + 2_000);
+
+    // The joiner half: a leader parked in a slow RPC.
+    let supply = GatedSupply::new([1u64, 3, 5], 0);
+    let a = exhausted_co_writer("sf-wall-join", supply.sink()).await;
+    for idx in [1u64, 3, 5] {
+        a.retire_shipped_free_tracking(idx * a.chunk_size());
+    }
+    let g0 = flight_gauges();
+    let leader = {
+        let a = Arc::clone(&a);
+        tokio::spawn(async move { a.allocate_block_grace_bounded().await })
+    };
+    assert!(
+        wait_until(std::time::Duration::from_secs(10), || supply.asks() == 1).await,
+        "the leader's RPC is in flight"
+    );
+    let t0 = std::time::Instant::now();
+    let joined = tokio::time::timeout(bound, a.allocate_block_grace_bounded())
+        .await
+        .expect("the joiner must end within the wall bound");
+    let elapsed = t0.elapsed();
+    let e = joined.expect_err("the joiner takes its verdict without the leader's reply");
+    assert!(storage_full(&e), "{e}");
+    assert!(
+        elapsed.as_millis() as u64 <= wall + 1_000,
+        "the join gave up at the wall ({wall} ms) — took {elapsed:?}"
+    );
+    assert_eq!(supply.asks(), 1, "the joiner issued no RPC of its own");
+    assert_eq!(flight_gauges().coalesced, g0.coalesced + 1, "it joined");
+    supply.release();
+    leader
+        .await
+        .unwrap()
+        .expect("the leader's outcome is untouched by the joiner's wall");
+
+    // The park half: an exhausted lane whose authority reports a held ring
+    // (bound age nonzero) but hands out nothing — the field's m50 shape.
+    // The bounded allocation parks, its retries DECLINE (one RPC in all),
+    // and it refuses at the wall exactly as before.
+    let empty = GatedSupply::new([], 15_096);
+    empty.release();
+    let b = exhausted_co_writer("sf-wall-park", empty.sink()).await;
+    let parks0 = free_grace::pressure_parks();
+    let g0 = flight_gauges();
+    let t0 = std::time::Instant::now();
+    let verdict = tokio::time::timeout(bound, b.allocate_block_grace_bounded())
+        .await
+        .expect("the park must end within the wall bound");
+    let elapsed = t0.elapsed();
+    let e = verdict.expect_err("still exhausted");
+    assert!(storage_full(&e), "{e}");
+    assert!(free_grace::pressure_parks() > parks0, "the park engaged");
+    assert!(
+        elapsed.as_millis() as u64 <= wall + 1_000,
+        "the park ends at the wall ({wall} ms) — took {elapsed:?}"
+    );
+    let g1 = flight_gauges();
+    assert_eq!(empty.asks(), 1, "ONE RPC for the whole park");
+    assert_eq!(g1.harvests, g0.harvests + 1);
+    assert!(
+        g1.declined > g0.declined,
+        "every retry after the empty reply declined"
+    );
 }

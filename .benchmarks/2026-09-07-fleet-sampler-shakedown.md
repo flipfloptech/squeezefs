@@ -74,7 +74,8 @@ ranks at the barrier.
 
 ## What this row does not say
 
-It is a shakedown of the instrument, labeled as such (the box was quiet —
+It is a shakedown of the instrument on the DEV BOX (a scoping venue by
+the 2026-09-07 venue rule — heat soak), labeled as such (the box was quiet —
 the subagent builds it was meant to overlap had not started — so its
 numbers are usable, but it is not one of a same-boot A/B pair). The
 before/after pair for the two levers above is the parent's, on this rig,

@@ -1,6 +1,15 @@
 # Finding 15, day 2 — the S11 shared-file gate PASSES for the first time; the file-per-proc phase exposes the next term (2026-09-07)
 
-**Verdict.** On the same box and boot, back to back on the sampled rig
+> **Venue caveat (user directive 2026-09-07, after these rows were taken):
+> A/B and A-B-B-A rows run on `squeeze-test`, never the dev box — the
+> laptop heat-soaks across a row sequence and skews the second arm. The
+> two rows below were taken on the DEV BOX and are therefore SCOPING
+> evidence: they show the mechanisms engaging and the gate's shape
+> changing, not an acceptance verdict. The acceptance pair (A-B-B-A on
+> squeeze-test, same binaries) is recorded in
+> `.benchmarks/2026-09-07-f15-day2-squeeze-test-abba.md` when run.**
+
+**Verdict (scoping, dev box).** On the same box and boot, back to back on the sampled rig
 (`.benchmarks/rigs/2026-09-07-s11-fleet-row.sh`): row A = the tip before
 today (`c60746fb` — term 1 in, nothing from today) fails phase A1 exactly
 as every run since the campaign began (1,989 → 903 MiB/s); row B = the
@@ -107,4 +116,6 @@ the lane share per volume is the same) — the mechanism once tipped is.
   must-stay-0 whose lineage note is on the board. And the per-lever legs
   of the four landings on this rig, which this pair does not separate.
 * **Not claimed:** anything about B1 before today (it was never reached);
-  a fleet A-B-B-A (arms are binaries, two rows back to back, same boot).
+  an acceptance verdict — this is a dev-box A/B (two rows back to back,
+  same boot), and the dev box heat-soaks: the squeeze-test A-B-B-A is the
+  row that decides.

@@ -670,6 +670,24 @@ verdict, and each launch is individually approved by the user before
 `tests/cloud_bench_cluster.sh launch` is invoked. A gate/fix train never
 implies cloud approval.
 
+### Benchmark VENUE: A/B and A-B-B-A rows run on squeeze-test, never the dev box (user directive 2026-09-07)
+
+**Every A/B, A-B-B-A bracket, per-lever leg and acceptance row runs on
+`squeeze-test`** (the 32-core Xeon field box). The dev laptop has **heat
+soak**: its clocks fall as a row sequence runs, so the second arm of a
+pair is measured on a slower machine than the first and the delta is
+skewed — in most cases beyond the effect being measured. Dev-box rows are
+**scoping evidence only** (mechanism engagement, tripwires, a first read
+of a shape) and every note carrying one must say so; the acceptance
+pair is re-run on the box before any verdict is written. This is the
+same fact the criterion baselines already record ("the thermally-capped
+dev box gives relative truth only") applied to every measurement class.
+The multi-writer fleet rig runs on the box too (`tests/mw_fleet.sh` +
+`tests/run_mw_matrix.sh` over the dev substrate; Open MPI is the vendor
+build at `/usr/mpi/gcc/openmpi-*/bin`, put it on `PATH`; a user-level
+toolchain + bundle-fed checkout live under `/scratch/tmp/sqz-agent/`).
+Cloud runs still need expressed approval (below).
+
 ### Benchmark substrates: the two-substrate rule (2026-07-27)
 
 The 2026-07-27 amplification campaign proved the nvmet-**loop** rig HIDES bandwidth-economy and network-stack effects (the 1.85×-amplification field capture reproduced on nvmet-tcp and was invisible on loop — `.benchmarks/2026-07-27-shim-write-amplification.md`). Both substrates come from `tests/dev_substrate.sh` (same backings — memory-backed null_blk mds + zram oss; same create/teardown/status verbs; the two coexist on one box via disjoint names/state dirs/ports):

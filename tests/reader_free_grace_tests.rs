@@ -5021,6 +5021,65 @@ fn the_observed_drain_cuts_the_hold_by_the_lease_clock_reserve() {
     );
 }
 
+/// **Contract 39 — all four adjudication items composed (R4): the shape
+/// the fleet row is read against.** R3 (items 1–3) plus the checkpoint
+/// composite (item 4): the qualify term now reads the ADVERTISED landing
+/// ceiling (`P/2 + 2 × min(tick, P/2)` while the valve asks), and the
+/// members' pass and beat floors follow it. R4 holds no longer than R3 —
+/// the composite may only shorten the learn, qualify-rounding and carry
+/// terms — with closure exact, no fence, no overdue drain, and every
+/// coherence gate unchanged. The row is printed so the note can carry it.
+#[test]
+fn all_four_items_compose_to_the_shortest_hold() {
+    let _serial = serial();
+    let shape = fleet_cadence_shape("rederive-all-four(spare=256,ckpt=1s,8m)", 256);
+    let r3 = run_closed_loop(
+        &shape,
+        Levers {
+            qualify_ceiling: true,
+            drain_epoch_stamp: true,
+            drain_observed: true,
+            ..Levers::h3()
+        },
+    );
+    let r4 = run_closed_loop(
+        &shape,
+        Levers {
+            qualify_ceiling: true,
+            drain_epoch_stamp: true,
+            drain_observed: true,
+            composite: true,
+            ..Levers::h3()
+        },
+    );
+    for r in [&r3, &r4] {
+        println!("{}", r.render(&shape));
+        assert_eq!(
+            r.deferrals,
+            r.releases + r.held_end,
+            "{}: closure",
+            r.config
+        );
+        assert_eq!((r.forced, r.fences), (0, 0), "{}: no fence", r.config);
+        assert_eq!(r.hold_unplaced, 0, "{}: every stage placed", r.config);
+    }
+    assert_eq!(
+        free_grace::drain_overdue(),
+        0,
+        "no drain outlived the budget"
+    );
+    assert!(
+        r4.bound_age_mean_ms <= r3.bound_age_mean_ms,
+        "the composite never lengthens the re-derived hold: R3 {:.0} → R4 {:.0} ms",
+        r3.bound_age_mean_ms,
+        r4.bound_age_mean_ms
+    );
+    assert!(
+        r4.stalls_steady <= r3.stalls_steady,
+        "never stalls the stream more"
+    );
+}
+
 // ===========================================================================
 // The writer→member checkpoint composite (2026-09-06, adjudication item 4
 // — USER DECISION 2026-09-06; `.benchmarks/2026-09-06-free-grace-checkpoint-composite.md`)
@@ -5248,7 +5307,9 @@ fn an_ask_in_force_tightens_the_writers_ceiling_and_the_grant_carries_it() {
         RenewOutcome::Renewed(g) => g,
         other => panic!("{other:?}"),
     };
-    assert_eq!(g.checkpoint_ceiling_ms, poll / 2);
+    // The wire carries the LANDING ceiling of the halved decision; the
+    // promise pair (below) stays in DECISION terms — the task's own.
+    assert_eq!(g.checkpoint_ceiling_ms, landing);
     free_grace::test_set_checkpoint_composite(Some(false));
     assert_eq!(
         free_grace::checkpoint_ceiling_in_force_ms(),

@@ -338,19 +338,22 @@ pub async fn engage_allocator_lane(
         // The ahead-of-stall refill task (design-free-grace-sustain §5.5,
         // PR 4): single-flight per volume BY CONSTRUCTION (one task per
         // laned co-writer engagement), off the allocation path — it
-        // samples the claim rate each tick and harvests when this
-        // allocator is OWED supply and its lane-reachable stock sits
-        // below the derived watermark, so the refill RTT leaves the
-        // writer's critical path. Tick = the 1 s checkpoint ceiling (the
-        // same physics floor the elastic passes clamp to — nothing about
-        // the loop's answers changes faster). Exits when the allocator
-        // drops (the Weak upgrade fails) — nothing joins it, so
-        // `detached::contain` owns its panic accounting (RES-8).
+        // samples the claim rate each tick and harvests when supply of
+        // this lane is WITNESSED on the authority (the renewal grant's
+        // hint, or this allocator's owed word — never the owed word
+        // alone, `.benchmarks/2026-09-07-lane-refill-hint-gate.md`) and
+        // its lane-reachable stock sits below the derived watermark, so
+        // the refill RTT leaves the writer's critical path. Tick = the 1 s
+        // checkpoint ceiling (the same physics floor the elastic passes
+        // clamp to — nothing about the loop's answers changes faster).
+        // Exits when the allocator drops (the Weak upgrade fails) —
+        // nothing joins it, so `detached::contain` owns its panic
+        // accounting (RES-8).
         //
         // The lane-push lever (finding 15 term 2): the tick ALSO parks
         // on the lane-supply wake — a renewal grant saying this lane has
         // supply on the authority's list runs the PUSHED refill at once
-        // (owed ⇒ harvest, the watermark not consulted), so the refill
+        // (the hint ⇒ harvest, the watermark not consulted), so the refill
         // rides the renewal round trip instead of this cadence. With the
         // lever off nothing ever notifies and the loop is the shipped tick
         // verbatim.

@@ -348,10 +348,23 @@ pub struct BlockAllocator {
     grace: crate::free_grace::GraceRing,
     // --- The ahead-of-stall lane refill (design-free-grace-sustain §5.5,
     // PR 4) — all zero-cost words on unpartitioned mounts. ---
-    /// Blocks this mount is OWED on the authority's list: +1 per `Freed`
-    /// verdict its shipped displaced frees bring back, −1 per harvest
-    /// adoption. Per-allocator BY CONSTRUCTION (the two-volume law: a
-    /// global number cannot say which volume's authority holds supply).
+    /// **The explicit-ship arm's face**: blocks this mount's SHIPPED
+    /// displaced frees left on the authority's list — +1 per `Freed`
+    /// verdict `crate::cowriter::ship_displaced_frees` brings back, −1 per
+    /// harvest adoption (clamped). Per-allocator BY CONSTRUCTION (the
+    /// two-volume law: a global number cannot say which volume's authority
+    /// holds supply); published as the sum `alloc_lane_owed_blocks`.
+    ///
+    /// NOT the refill gate (2026-09-07,
+    /// `.benchmarks/2026-09-07-lane-refill-hint-gate.md`): a displaced
+    /// block the authority RECOMPUTES when it serves this mount's layout
+    /// publish reaches its list with nothing noted here — ≈ 90 % of a
+    /// rewriting co-writer's displaced blocks on the s11 fleet — so this
+    /// word is a strict subset of the authority's own count, which the
+    /// renewal grant carries (`crate::free_grace::lane_supply_hint`). The
+    /// proactive refills gate on either witness
+    /// (`crate::free_grace::lane_supply_witnessed`); this word alone would
+    /// leave every recomputed block reachable only from an ENOSPC park.
     lane_owed: AtomicU64,
     /// The COMPOSED measured refill horizon (`hint + RTT + one refresh
     /// floor`), 0 = use the member-local derivation (OQ 2's fallback —
@@ -1949,7 +1962,8 @@ impl BlockAllocator {
     /// §5.5 (the owed ledger's increment): `n` of this mount's shipped
     /// displaced frees came back `Freed` — the authority's list now holds
     /// supply this mount is owed. Called by
-    /// `crate::cowriter::ship_displaced_frees` per acknowledged group.
+    /// `crate::cowriter::ship_displaced_frees` per acknowledged group —
+    /// the explicit-ship arm ONLY (see the `lane_owed` field doc).
     pub fn note_owed_freed(&self, n: u64) {
         if n == 0 {
             return;
@@ -1960,9 +1974,34 @@ impl BlockAllocator {
             .fetch_add(n, Ordering::Relaxed);
     }
 
-    /// Blocks this mount is owed on the authority's free list (§5.5).
+    /// Blocks this mount's SHIPPED frees left on the authority's free list
+    /// (§5.5 — the explicit-ship arm's face, see the `lane_owed` field doc).
     pub fn lane_owed_blocks(&self) -> u64 {
         self.lane_owed.load(Ordering::Acquire)
+    }
+
+    /// The refill's supply witness for this allocator: the authority's
+    /// advertised lane supply (the renewal grant's hint — per MOUNT,
+    /// summed over its data volumes, so a nonzero hint means SOME volume
+    /// holds supply and arms every laned allocator below its watermark;
+    /// an empty harvest on the other volume is one counted RPC) or this
+    /// allocator's owed word ([`crate::free_grace::lane_supply_witnessed`]).
+    fn lane_supply_witnessed(&self) -> bool {
+        crate::free_grace::lane_supply_witnessed(
+            crate::free_grace::lane_supply_hint(),
+            self.lane_owed.load(Ordering::Acquire),
+        )
+    }
+
+    /// The hint-refill ledger (`alloc_lane_hint_refills`): a proactive
+    /// harvest fired with the owed word at 0 is one the retired owed gate
+    /// would have declined — the hint armed it.
+    fn note_proactive_harvest_witness(&self) {
+        if self.lane_owed.load(Ordering::Acquire) == 0 {
+            crate::fuse_client::METRICS
+                .alloc_lane_hint_refills
+                .fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     /// One refresh-floor beat, ms — the horizon's slack term (the reader's
@@ -2061,6 +2100,9 @@ impl BlockAllocator {
         // back from the authority) and needs `churn × hold` more in flight
         // through the grace loop; it exhausts exactly when the sum exceeds
         // the share — the headroom is the published distance from that.
+        // The owed word is the explicit-ship arm's face (a per-allocator
+        // number); the mount-summed hint cannot enter a per-volume law, so
+        // `live` over-reads by the recomputed supply the authority holds.
         let live = share.saturating_sub(self.lane_reachable_blocks() + self.lane_owed_blocks());
         let needed = inflight.saturating_add(live);
         let headroom_pct = if share == 0 {
@@ -2094,29 +2136,28 @@ impl BlockAllocator {
         self.harvest_watermark.load(Ordering::Relaxed)
     }
 
-    /// §5.5's decision: harvest ahead ⇔ the lever is armed, supply is
-    /// EXPECTED on the authority for this lane, and this allocator's
-    /// lane-reachable stock sits below the watermark. `Some(ask)` = the
-    /// grain-bounded batch to request; `None` = nothing to do (nothing
-    /// expected / stocked / quiet / lever off).
+    /// §5.5's decision: harvest ahead ⇔ the lever is armed, supply of this
+    /// lane is WITNESSED on the authority (the renewal grant's hint, or
+    /// this allocator's owed word — `lane_supply_witnessed`; never
+    /// the owed word alone, `.benchmarks/2026-09-07-lane-refill-hint-gate.md`),
+    /// and its lane-reachable stock sits below the watermark. `Some(ask)`
+    /// = the grain batch to request — the grain, never fewer (the serve is
+    /// bounded by what the authority holds, so a smaller ask against a
+    /// one-cadence-stale, mount-summed hint could only under-harvest);
+    /// `None` = nothing to do (no witness / stocked / quiet / lever off).
     ///
-    /// Supply is expected when this allocator is OWED blocks (its own
-    /// shipped frees came back `Freed`) OR the authority's last renewal
-    /// hint says the lane has supply on its lists
-    /// ([`crate::free_grace::lane_supply_hint`]). The hint is SUMMED over
-    /// volumes, so it cannot name the one that holds the supply — a peer's
-    /// rewrites of this lane's blocks land there with no owed ledger
-    /// knowing — so every low volume asks; a volume that asked and got
-    /// nothing has paid one RTT, and its stock stays where the lane-aware
-    /// placement can see it (`.benchmarks/2026-09-07-cowriter-lane-aware-
-    /// placement.md`).
+    /// The hint is SUMMED over volumes, so it cannot name the one that
+    /// holds the supply — a peer's rewrites of this lane's blocks land
+    /// there with no owed ledger knowing — so every low volume asks; a
+    /// volume that asked and got nothing has paid one RTT, and its stock
+    /// stays where the lane-aware placement can see it
+    /// (`.benchmarks/2026-09-07-cowriter-lane-aware-placement.md`).
     pub fn should_harvest_ahead(&self) -> Option<u64> {
         if !harvest_ahead_enabled() {
             return None;
         }
         let lanes = self.lanes.get()?;
-        if self.lane_owed.load(Ordering::Acquire) == 0 && crate::free_grace::lane_supply_hint() == 0
-        {
+        if !self.lane_supply_witnessed() {
             return None;
         }
         let watermark = self.harvest_watermark.load(Ordering::Relaxed);
@@ -2136,6 +2177,7 @@ impl BlockAllocator {
             crate::fuse_client::METRICS
                 .alloc_lane_ahead_harvests
                 .fetch_add(1, Ordering::Relaxed);
+            self.note_proactive_harvest_witness();
             self.harvest_lane_supply().await
         } else {
             0
@@ -2193,14 +2235,15 @@ impl BlockAllocator {
 
     /// **The PUSHED refill** (finding 15 term 2, the lane-push lever's
     /// co-writer half): the authority's renewal grant said this lane has
-    /// supply on its list and this allocator is OWED blocks — harvest NOW,
-    /// on the wake, instead of at the next watermark tick (which a quiet
-    /// lane's decayed rate turns dark) or the next ENOSPC. The SAME harvest
-    /// (sink → adopt → hint deposit); the decision is
+    /// supply on its list — harvest NOW, on the wake, instead of at the
+    /// next watermark tick (which a quiet lane's decayed rate turns dark)
+    /// or the next ENOSPC. The SAME harvest (sink → adopt → hint deposit);
+    /// the decision is
     /// [`crate::free_grace::lane_push_wants_harvest_on_volume`] — per
-    /// VOLUME, because the hint is summed: a DRY volume asks even when owed
-    /// nothing. Returns the count adopted (0 = the decision declined, or an
-    /// empty grant).
+    /// VOLUME, because the hint is summed: the hint alone suffices (the
+    /// owed word is the retired gate's witness), and a DRY volume asks
+    /// even when owed nothing. Returns the count adopted (0 = the decision
+    /// declined, or an empty grant).
     pub async fn pushed_refill_tick(&self, now_ms: u64) -> u64 {
         self.sample_alloc_rate(now_ms);
         if self.lanes.get().and_then(|l| l.harvest.get()).is_none() {
@@ -2214,6 +2257,7 @@ impl BlockAllocator {
             crate::fuse_client::METRICS
                 .alloc_lane_pushed_harvests
                 .fetch_add(1, Ordering::Relaxed);
+            self.note_proactive_harvest_witness();
             self.harvest_lane_supply().await
         } else {
             0

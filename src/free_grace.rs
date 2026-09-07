@@ -235,10 +235,22 @@
 //! [`ReleaseHook`], rate-limited by lever (d)'s law — and **the lane-supply
 //! hint** — the renewal grant carries the member's lane population on the
 //! authority's lists (per-lane counters, never a scan), and a co-writer
-//! learning a nonzero hint while owed wakes its refill at once
+//! learning a nonzero hint wakes its refill at once
 //! ([`lane_supply_wake`]). Model at the fleet cadences (3 s write / 21 s
 //! close): `min_acked→released` 3,408 → 0 ms, the lane hop 30.7 → 1.5 s,
 //! the hold 22.6 → 14.7 s; `.benchmarks/2026-09-06-free-grace-lane-visible.md`.
+//!
+//! **The hint IS the refill gate** (2026-09-07,
+//! `.benchmarks/2026-09-07-lane-refill-hint-gate.md`): both proactive
+//! arms — the pushed refill and the allocator's watermark tick — used to
+//! arm on the OWED ledger (+1 per `Freed` verdict of an explicitly shipped
+//! free), and on the s11 fleet ≈ 90 % of a co-writer's displaced blocks
+//! return through the authority's publish RECOMPUTE, which notes nothing
+//! owed — so both arms sat dark with the authority advertising hundreds of
+//! the lane's blocks, and every refill ran from inside an ENOSPC park.
+//! [`lane_supply_witnessed`] is the one predicate: the advertised supply
+//! or the owed ledger; `SQUEEZEFS_ALLOC_LANE_REFILL_HINT=0` is the retired
+//! owed-only gate (the A/B control).
 //!
 //! # Cost when unarmed (the shipped default)
 //!
@@ -493,8 +505,13 @@ static LANE_SUPPLY_SOURCE: once_cell::sync::Lazy<ArcSwapOption<LaneSupplySource>
 /// (`free_grace_lane_push_hints`, authority side).
 static LANE_PUSH_HINTS: AtomicU64 = AtomicU64::new(0);
 /// The last hint this member's renewal learned (co-writer side): blocks of
-/// its lane on the authority's free list.
+/// its lane on the authority's free lists, summed over the mount's data
+/// volumes — the SUPPLY WITNESS both proactive refill arms gate on
+/// ([`lane_push_wants_harvest`], `BlockAllocator::should_harvest_ahead`).
 static LANE_SUPPLY_HINT: AtomicU64 = AtomicU64::new(0);
+/// Cached knob `SQUEEZEFS_ALLOC_LANE_REFILL_HINT`: 0 = unread, 1 = on,
+/// 2 = off (the `LANE_PUSH` shape). Off = the retired owed-only gate.
+static REFILL_HINT: AtomicU64 = AtomicU64::new(0);
 /// Hints that woke a parked refill (`free_grace_lane_push_wakes`,
 /// co-writer side).
 static LANE_PUSH_WAKES: AtomicU64 = AtomicU64::new(0);
@@ -1246,6 +1263,54 @@ pub fn test_clear_lane_push() -> bool {
     LANE_PUSH.swap(0, Ordering::Relaxed) != 0
 }
 
+/// `SQUEEZEFS_ALLOC_LANE_REFILL_HINT` (default on), read once and cached:
+/// the two proactive lane refills arm on the authority's advertised lane
+/// supply ([`lane_supply_hint`]); `0` = the retired gate, which armed them
+/// on the explicit-ship arm's owed ledger alone
+/// (`.benchmarks/2026-09-07-lane-refill-hint-gate.md`).
+pub fn refill_hint_enabled() -> bool {
+    match REFILL_HINT.load(Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            let on = crate::env_knobs::bool_knob("SQUEEZEFS_ALLOC_LANE_REFILL_HINT", true);
+            REFILL_HINT.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+            on
+        }
+    }
+}
+
+/// Test seam (the `test_set_lane_push` shape).
+pub fn test_set_refill_hint(on: Option<bool>) {
+    REFILL_HINT.store(
+        match on {
+            Some(true) => 1,
+            Some(false) => 2,
+            None => 0,
+        },
+        Ordering::Relaxed,
+    );
+}
+
+/// Test seam: `true` ⇔ a preset was in force.
+pub fn test_clear_refill_hint() -> bool {
+    REFILL_HINT.swap(0, Ordering::Relaxed) != 0
+}
+
+/// **The refill's supply witness** (co-writer side): is there supply of
+/// this lane to harvest from the authority? The renewal grant's hint is
+/// the authority's OWN count of the lane's blocks on its free lists —
+/// per MOUNT (summed over its data volumes), fresh within one renewal
+/// cadence — and the explicit-ship arm's owed ledger is a strict subset
+/// of it (a block the authority RECOMPUTED when it served the co-writer's
+/// layout publish is on its list with nothing noted owed: ≈ 90 % of a
+/// rewriting co-writer's displaced blocks on the s11 fleet). Either
+/// witness arms a refill; `SQUEEZEFS_ALLOC_LANE_REFILL_HINT=0` keeps the
+/// owed ledger as the only one.
+pub fn lane_supply_witnessed(hint_blocks: u64, owed_blocks: u64) -> bool {
+    owed_blocks > 0 || (refill_hint_enabled() && hint_blocks > 0)
+}
+
 /// Install the authority's release hook (the multi-writer arm; the rigs).
 pub fn install_release_hook(hook: ReleaseHook) {
     RELEASE_HOOK.store(Some(Arc::new(hook)));
@@ -1364,13 +1429,16 @@ pub fn lane_supply_wake() -> &'static squeezefs_ipc::sqz_notify::Notify {
 }
 
 /// **The pushed-refill decision** (co-writer side, pure): harvest now ⇔
-/// the lever is on, the authority's last hint says the lane has supply on
-/// its list, and this allocator is OWED blocks (its shipped frees came back
-/// `Freed`). The watermark plays no part — a quiet lane's rate-derived
-/// watermark decays to 0, which is exactly when the routine ahead tick
-/// goes dark while the supply sits on the authority.
+/// the lever is on and the authority's last hint says the lane has supply
+/// on its lists — the push exists because the authority said so, and the
+/// hint is the sufficient condition ([`lane_supply_witnessed`]; the owed
+/// ledger stays a second witness under `SQUEEZEFS_ALLOC_LANE_REFILL_HINT=0`,
+/// the retired gate that left every recomputed block reachable only from
+/// an ENOSPC park). The watermark plays no part — a quiet lane's
+/// rate-derived watermark decays to 0, which is exactly when the routine
+/// ahead tick goes dark while the supply sits on the authority.
 pub fn lane_push_wants_harvest(hint_blocks: u64, owed_blocks: u64) -> bool {
-    lane_push_enabled() && hint_blocks > 0 && owed_blocks > 0
+    lane_push_enabled() && hint_blocks > 0 && lane_supply_witnessed(hint_blocks, owed_blocks)
 }
 
 /// **The pushed-refill decision, per VOLUME** (the two-volume law,
@@ -3651,6 +3719,7 @@ pub fn reset_for_test() {
     test_set_demand(None);
     test_set_pass_elastic(None);
     test_set_lane_push(None);
+    test_set_refill_hint(None);
     test_set_checkpoint_composite(None);
     uninstall_release_hook();
     uninstall_lane_supply_source();

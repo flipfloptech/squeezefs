@@ -6344,9 +6344,11 @@ pub struct Metrics {
     /// The split's other arm: virgin-tail mints at the fresh exit.
     pub alloc_fresh_mints: Align64<AtomicU64>,
     /// §5.5 (PR 4): the SUM of the per-allocator owed words — blocks this
-    /// mount's `Freed` verdicts left on authorities' free lists, not yet
-    /// harvested back. Climbing while `alloc_lane_harvested_blocks` is
-    /// flat = the refill is not keeping up (or `HARVEST_AHEAD=0`).
+    /// mount's SHIPPED frees' `Freed` verdicts left on authorities' free
+    /// lists, not yet harvested back: the explicit-ship arm's face, a
+    /// strict subset of the authority's advertised lane supply
+    /// (`free_grace_lane_supply_hint`) and NOT the refill gate since
+    /// 2026-09-07 (`BlockAllocator::lane_owed`).
     pub alloc_lane_owed_blocks: Align64<AtomicU64>,
     /// Ahead-of-stall harvests fired by the watermark task (0 under
     /// `SQUEEZEFS_ALLOC_LANE_HARVEST_AHEAD=0` — the ENOSPC-only shape).
@@ -6356,6 +6358,13 @@ pub struct Metrics {
     /// engagement instrument beside `free_grace_lane_push_wakes` (0 with
     /// the lever off, and on every mount that is not a laned co-writer).
     pub alloc_lane_pushed_harvests: Align64<AtomicU64>,
+    /// The refill-hint gate's engagement (2026-09-07,
+    /// `.benchmarks/2026-09-07-lane-refill-hint-gate.md`): proactive
+    /// harvests (ahead + pushed) that fired with the owed word at 0 — the
+    /// ones the retired owed-only gate would have declined, i.e. supply the
+    /// authority's publish recompute put on its list. ⊆ `ahead + pushed`;
+    /// 0 under `SQUEEZEFS_ALLOC_LANE_REFILL_HINT=0` by construction.
+    pub alloc_lane_hint_refills: Align64<AtomicU64>,
     /// The derived watermark in force (blocks; `ceil(rate × horizon)`
     /// capped at lane-share/4 — derived, never a knob).
     pub alloc_lane_harvest_watermark: Align64<AtomicU64>,
@@ -11107,6 +11116,9 @@ impl SqueezefsFilesystem {
                     .load(Ordering::Relaxed),
                 "alloc_lane_pushed_harvests": METRICS
                     .alloc_lane_pushed_harvests
+                    .load(Ordering::Relaxed),
+                "alloc_lane_hint_refills": METRICS
+                    .alloc_lane_hint_refills
                     .load(Ordering::Relaxed),
                 "alloc_lane_harvest_watermark": METRICS
                     .alloc_lane_harvest_watermark

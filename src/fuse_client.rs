@@ -6485,6 +6485,25 @@ pub struct Metrics {
     /// The explicit-ship arm's twin is the `Freed`-verdict retire inside
     /// `ship_displaced_frees`, which this counter never sees.
     pub cowriter_recomputed_retires: Align64<AtomicU64>,
+    /// Local tracking entries this co-writer released on the AUTHORITY's
+    /// lane-free notices (publish schema 16): blocks of this mount's lane
+    /// the authority displaced and freed through its OWN publishes — the
+    /// assembler's fold of this mount's shipped extents on the s11 fleet
+    /// (`.benchmarks/2026-09-07-cowriter-claim-anomaly-population.md`) —
+    /// a free no reply to this mount ever named, so the entry lingered
+    /// until the lane harvest handed the offset back and `claim_block_idx`
+    /// tripped (`block_claim_anomalies`, ≈ the authority's `fold_passes`
+    /// per fpp phase). Every reply frame the authority sends this client
+    /// carries the notices queued since the last one, so the frame that
+    /// hands an offset back can never precede its notice.
+    pub cowriter_lane_free_notices: Align64<AtomicU64>,
+    /// Lane-free notices that named an offset this mount had ALREADY
+    /// re-minted from a later harvest grant (the notice's `after_grants`
+    /// below the offset's grant sequence — a reply reordered across the
+    /// ship depth's sessions): the live lifetime was touched by nobody.
+    /// ≈ 0 in steady state; growth is the reorder race engaging, never a
+    /// correctness fault.
+    pub cowriter_lane_free_notices_reminted: Align64<AtomicU64>,
     /// LOCAL metadata commits refused on a co-writer — the mutations that
     /// reached the backend's write gate instead of the shipped publish
     /// path. **Should stay 0 on a healthy co-writer**: a nonzero value

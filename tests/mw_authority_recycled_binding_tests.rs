@@ -440,6 +440,9 @@ impl Authority {
 struct CoWriter {
     client: Arc<WriteCustodyClient>,
     alloc: Arc<BlockAllocator>,
+    meta: Arc<RoutedMetaBackend>,
+    node_id: String,
+    endpoint: String,
 }
 
 impl CoWriter {
@@ -474,7 +477,42 @@ impl CoWriter {
         })
         .await
         .expect("the granted lane engages");
-        CoWriter { client, alloc }
+        CoWriter {
+            client,
+            alloc,
+            meta,
+            node_id: node_id.to_string(),
+            endpoint: auth.endpoint.clone(),
+        }
+    }
+
+    /// The one-process venue's posture flip, OUT: the co-writer's
+    /// process-global halves stand down so the authority's fs can act as
+    /// the plain writer it is (the posture latch, the ownership map and
+    /// the client installs are all process-wide). The custody lease, the
+    /// allocator and its engaged lane stay — [`Self::rearm`] restores the
+    /// halves without re-joining.
+    fn stand_down(&self) {
+        data_grant::TEST_RANGE_CUSTODY_OVERRIDE.store(0, Ordering::Relaxed);
+        data_grant::uninstall_custody_client();
+        publish::uninstall_client();
+        ship::disarm_ownership();
+        fuse_client::set_mount_posture(MountPosture::Writer);
+    }
+
+    /// The posture flip, IN: the same installs [`Self::join`] performed,
+    /// on the same lease.
+    fn rearm(&self) {
+        fuse_client::set_mount_posture(MountPosture::CoWriter);
+        let map = OwnerMap::for_volumes(
+            &self.meta,
+            vec![(0, PeerOwner::new("mw-authority", self.endpoint.clone()))],
+        )
+        .expect("an all-foreign owner map");
+        ship::arm_ownership(map);
+        publish::install_client(publish::PublishClient::new(&self.node_id, SECRET.to_vec()));
+        data_grant::install_custody_client(Arc::clone(&self.client));
+        data_grant::TEST_RANGE_CUSTODY_OVERRIDE.store(1, Ordering::Relaxed);
     }
 }
 
@@ -1479,4 +1517,378 @@ async fn a_settle_whose_captured_old_binding_died_supersedes_instead_of_retrying
     let _ = (sc.old_off, &sc.old_key);
     drop(sc.a);
     sc.auth.stop().await;
+}
+
+// ===========================================================================
+// 4. The fpp anomaly population (2026-09-07, `.benchmarks/2026-09-07-
+//    cowriter-claim-anomaly-population.md`): the authority's ASSEMBLY of a
+//    co-writer's shipped extent displaces the co-writer's own block through
+//    the authority's LOCAL publish — a free no reply to the co-writer names
+// ===========================================================================
+
+/// The fleet shape to the moment of truth: the co-writer owns whole blocks
+/// `victims` of a striped file (its mints are the durable head, tracked
+/// `Some(1)` locally); the authority assembles one shipped slice of each
+/// (`assemble_shipped_extent`, the executor `install_extent_assembler`
+/// wires) and its fsync force folds and publishes (`flush_shipped_extents`
+/// — the co-writer's `FlushExtents`, or the authority's own background
+/// fold on the fleet): the fold mints an authority block per victim and
+/// the authority's LOCAL recompute frees the co-writer's block through its
+/// own ladder. The co-writer side stands down while the authority acts
+/// (the process posture latch is global) and is re-armed on return.
+struct AssemblerFold {
+    auth: Authority,
+    a: SideFs,
+    cwr: CoWriter,
+    w: SideFs,
+    ino: u64,
+    fh: u64,
+    bs: u64,
+    cap_blocks: u64,
+    /// `(block index, lane block idx)` of the co-writer's displaced mints.
+    victims: Vec<(u32, u64)>,
+}
+
+const AF_BLOCKS: u64 = 8;
+
+async fn assembler_fold(dir: &Path, tag: &str, victims: &[u64]) -> AssemblerFold {
+    std::env::remove_var("SQUEEZEFS_DEFAULT_BLOCK_SIZE");
+    fuse_client::set_patch_max_bytes(0);
+    // The write-through pipeline is the co-writer's vehicle (deterministic
+    // in-process); the authority's slice parks in the W2 extent overlay.
+    squeezefs::device_overlay::set_overlay_overwrite_for_tests(false);
+    let vol = fresh_volume(dir, tag).await;
+    let dev = data_device(dir, &format!("{tag}.dev"));
+    let auth = Authority::start(&vol, &dev, &[NODE_A]).await;
+    engage_stamped_keys(&auth);
+    let bs = auth.alloc.chunk_size();
+    auth.owner
+        .install_range_geometry(data_grant::fixed_range_geometry(AF_BLOCKS * bs, bs));
+    squeezefs::meta_backend::kv::indirect_map::install_indirect_map_io(
+        squeezefs::multi_writer::indirect_map_io_for(Arc::clone(&auth.br)),
+    );
+    let cap_blocks: u64 = 2 * AF_BLOCKS + 32;
+    auth.alloc.set_capacity_bytes(cap_blocks * bs);
+    let ino = seed_striped_file(&auth, "shared.bin", AF_BLOCKS).await;
+    let a = side_fs(&auth, &auth.alloc, &dev).await;
+    a.fs.install_extent_assembler();
+
+    // The co-writer's whole-block writes of the victims: its mints become
+    // the durable head at those indices.
+    let cwr = CoWriter::join(&auth, &vol, &dev, NODE_A).await;
+    cwr.alloc.set_capacity_bytes(cap_blocks * bs);
+    let lane_id = u64::from(cwr.client.lane_partition().writer_id());
+    let w = side_fs(&auth, &cwr.alloc, &dev).await;
+    data_grant::TEST_RANGE_CUSTODY_OVERRIDE.store(1, Ordering::Relaxed);
+    let fh =
+        w.fs.open(w.req, ino, libc::O_WRONLY as u32, 0)
+            .await
+            .expect("the co-writer opens the shared file")
+            .fh;
+    for &b in victims {
+        let wr =
+            w.fs.write(
+                w.req,
+                ino,
+                fh,
+                b * bs,
+                bytes::Bytes::from(round_pat(0, b, bs)),
+                0,
+                0,
+            )
+            .await
+            .unwrap_or_else(|e| panic!("block {b}: write failed: {e:?}"));
+        assert_eq!(wr.written as u64, bs, "block {b}: short write");
+    }
+    w.fs.fsync(w.req, ino, fh, false)
+        .await
+        .expect("the co-writer's fsync ships the publish");
+    assert!(
+        w.fs.write_pipeline.quiesce(Duration::from_secs(30)).await,
+        "the co-writer's pipeline drains"
+    );
+    auth.br.reclaim_drain().await;
+    let victim_blocks: Vec<(u32, u64)> = durable_blocks(&auth, ino)
+        .await
+        .into_iter()
+        .filter(|(b, _)| victims.contains(&u64::from(*b)))
+        .collect();
+    assert_eq!(
+        victim_blocks.len(),
+        victims.len(),
+        "premise: every victim is durably mapped"
+    );
+    for (b, idx) in &victim_blocks {
+        assert_eq!(
+            lane::block_lane_of(*idx, 2),
+            lane_id,
+            "premise: block {b} is a co-writer mint"
+        );
+        assert_eq!(
+            cwr.alloc.refcount(idx * bs),
+            Some(1),
+            "premise: the co-writer tracks its live mint {idx}"
+        );
+    }
+
+    // The authority acts: one 64 KiB slice of each victim assembled (the
+    // shipped-extent shape), then the fsync force folds + publishes —
+    // its LOCAL recompute displaces and frees the co-writer's blocks.
+    cwr.stand_down();
+    let recomputed_before = publish::stats().free_recomputed_blocks;
+    for &b in victims {
+        a.fs.assemble_shipped_extent(ino, b, OV_REL as u32, bytes::Bytes::from(pat(OV_LEN, 0xA5)))
+            .await
+            .expect("the authority assembles the shipped slice");
+    }
+    a.fs.flush_shipped_extents(ino)
+        .await
+        .expect("the fsync force folds and publishes the assembly");
+    auth.br.reclaim_drain().await;
+    assert_eq!(
+        publish::stats().free_recomputed_blocks - recomputed_before,
+        victims.len() as u64,
+        "the authority freed each displaced co-writer block by its LOCAL recompute"
+    );
+    let now = durable_blocks(&auth, ino).await;
+    for (b, idx) in &victim_blocks {
+        let cur = now
+            .iter()
+            .find(|(bb, _)| bb == b)
+            .map(|(_, i)| *i)
+            .expect("block still named");
+        assert_ne!(
+            cur, *idx,
+            "block {b}: the fold displaced the co-writer's mint {idx}"
+        );
+        assert_eq!(
+            lane::block_lane_of(cur, 2),
+            0,
+            "block {b}: the fold's block is the authority's own"
+        );
+        assert!(
+            auth.free_listed(*idx),
+            "block {b}: the co-writer's mint {idx} is on the authority's free list"
+        );
+        assert_eq!(
+            auth.population(*idx).await,
+            0,
+            "block {b}: the co-writer's mint {idx} holds no durable reference"
+        );
+        // THE FLEET'S STATE: nothing told the co-writer — its entry lingers.
+        assert_eq!(
+            cwr.alloc.refcount(idx * bs),
+            Some(1),
+            "premise: the co-writer still tracks {idx} — no reply named this free"
+        );
+    }
+    cwr.rearm();
+    AssemblerFold {
+        auth,
+        a,
+        cwr,
+        w,
+        ino,
+        fh,
+        bs,
+        cap_blocks,
+        victims: victim_blocks,
+    }
+}
+
+impl Authority {
+    async fn population(&self, block_idx: u64) -> usize {
+        cowriter::durable_block_refcount(&self.meta, volume_tag(DATA_VOL), block_idx)
+            .await
+            .expect("the ledger answers")
+    }
+
+    fn free_listed(&self, block_idx: u64) -> bool {
+        self.alloc.free_block_indices().contains(&block_idx)
+    }
+}
+
+/// Drain the co-writer's lane through the allocation funnel until every
+/// victim offset has come back through the harvest and been re-claimed;
+/// returns every offset handed out (the caller recycles them).
+async fn reclaim_victims(sc: &AssemblerFold) -> Vec<u64> {
+    let mut handed_out: Vec<u64> = Vec::new();
+    let mut seen = 0usize;
+    for _ in 0..sc.cap_blocks {
+        let off = sc
+            .cwr
+            .alloc
+            .allocate_block()
+            .await
+            .expect("the lane funnel serves (fresh, then harvested)");
+        handed_out.push(off);
+        if sc.victims.iter().any(|(_, idx)| idx * sc.bs == off) {
+            seen += 1;
+            if seen == sc.victims.len() {
+                break;
+            }
+        }
+    }
+    assert_eq!(
+        seen,
+        sc.victims.len(),
+        "every displaced victim came back through the harvest and was re-claimed"
+    );
+    handed_out
+}
+
+async fn recycle(sc: &AssemblerFold, handed_out: Vec<u64>) {
+    for off in handed_out {
+        sc.cwr
+            .alloc
+            .abandon_unpublished_offset(off)
+            .await
+            .expect("the probe mint recycles into its own lane");
+    }
+}
+
+async fn teardown(sc: AssemblerFold) {
+    let AssemblerFold {
+        auth,
+        a,
+        cwr,
+        w,
+        ino,
+        fh,
+        ..
+    } = sc;
+    w.fs.release(w.req, ino, fh, 0, 0, false)
+        .await
+        .expect("release");
+    assert!(
+        w.fs.write_pipeline.quiesce(Duration::from_secs(30)).await,
+        "the co-writer's pipeline drains"
+    );
+    drop(w);
+    drop(cwr);
+    drop(a);
+    auth.stop().await;
+}
+
+/// Contract (the population, frame-carried): after the authority's fold
+/// freed the co-writer's displaced blocks, the co-writer's NEXT publish-
+/// plane round trip of any kind — here a whole-block write + fsync of an
+/// unrelated block — carries the authority's lane-free notices, and the
+/// co-writer releases its local tracking of exactly those blocks at that
+/// reply (`cowriter.lane_free_notices` +N); the harvest then hands them
+/// back and every re-claim is clean (`block_claim_anomalies` +0). The
+/// day-2 rows: `block_claim_anomalies` 1,108 / 1,117 per fpp phase Σ 8
+/// co-writers against the authority's `fold_passes` 1,183 / 1,111 — the
+/// assembler's folds of the co-writers' first-iteration shipped slices,
+/// every one a co-writer block freed by a publish the co-writer never
+/// heard of. RED on dev 0bd03455: the two entries linger past the write's
+/// reply and both re-claims trip.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_authority_fold_of_shipped_slices_reaches_the_co_writers_tracking_on_its_next_reply() {
+    let _serial = serial();
+    let _restore = restore();
+    let dir = TempDir::new().unwrap();
+    let sc = assembler_fold(dir.path(), "assembler-fold-frame", &[2, 3]).await;
+    let anomalies_before = METRICS.block_claim_anomalies.load(Ordering::Relaxed);
+    let notices_before = METRICS.cowriter_lane_free_notices.load(Ordering::Relaxed);
+    let untracked_before = METRICS
+        .block_untracked_free_refusals
+        .load(Ordering::Relaxed);
+
+    // Any round trip on the publish plane: the co-writer writes block 5.
+    let wr =
+        sc.w.fs
+            .write(
+                sc.w.req,
+                sc.ino,
+                sc.fh,
+                5 * sc.bs,
+                bytes::Bytes::from(round_pat(1, 5, sc.bs)),
+                0,
+                0,
+            )
+            .await
+            .expect("the co-writer's unrelated write");
+    assert_eq!(wr.written as u64, sc.bs);
+    sc.w.fs
+        .fsync(sc.w.req, sc.ino, sc.fh, false)
+        .await
+        .expect("the fsync ships a publish frame");
+    assert!(
+        sc.w.fs
+            .write_pipeline
+            .quiesce(Duration::from_secs(30))
+            .await,
+        "the co-writer's pipeline drains"
+    );
+    for (b, idx) in &sc.victims {
+        assert_eq!(
+            sc.cwr.alloc.refcount(idx * sc.bs),
+            None,
+            "block {b}: the reply's lane-free notice released the co-writer's tracking of \
+             {idx} (RED: the entry lingers — nothing named the authority's free)"
+        );
+    }
+    assert_eq!(
+        METRICS.cowriter_lane_free_notices.load(Ordering::Relaxed) - notices_before,
+        sc.victims.len() as u64,
+        "cowriter.lane_free_notices names the two releases (RED)"
+    );
+
+    // The harvest hands both victims back; the claims are clean.
+    let handed_out = reclaim_victims(&sc).await;
+    assert_eq!(
+        METRICS.block_claim_anomalies.load(Ordering::Relaxed) - anomalies_before,
+        0,
+        "no re-claim found a lingering entry (CLAIM ANOMALY = 0 — RED: one per victim)"
+    );
+    recycle(&sc, handed_out).await;
+    assert_eq!(
+        METRICS
+            .block_untracked_free_refusals
+            .load(Ordering::Relaxed)
+            - untracked_before,
+        0,
+        "nothing shipped a free for a block the authority already freed"
+    );
+    teardown(sc).await;
+}
+
+/// Contract (the population, harvest-carried — the tightest ordering): with
+/// NO round trip between the authority's fold and the co-writer's harvest,
+/// the harvest reply frame itself carries the notice — the authority
+/// queues the notice BEFORE its ladder free-lists the block, so a reply
+/// that hands the offset back was built after the notice was queued and
+/// drains it — and the co-writer applies the frame's notices before the
+/// grant is adopted: the entry is gone before the claim
+/// (`block_claim_anomalies` +0, `cowriter.lane_free_notices` +1). RED on
+/// dev 0bd03455: the claim trips.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_harvest_that_hands_back_an_authority_freed_block_carries_its_notice_first() {
+    let _serial = serial();
+    let _restore = restore();
+    let dir = TempDir::new().unwrap();
+    let sc = assembler_fold(dir.path(), "assembler-fold-harvest", &[3]).await;
+    let anomalies_before = METRICS.block_claim_anomalies.load(Ordering::Relaxed);
+    let notices_before = METRICS.cowriter_lane_free_notices.load(Ordering::Relaxed);
+
+    let handed_out = reclaim_victims(&sc).await;
+    assert_eq!(
+        METRICS.block_claim_anomalies.load(Ordering::Relaxed) - anomalies_before,
+        0,
+        "the harvest frame carried the notice ahead of its grant (CLAIM ANOMALY = 0 — RED)"
+    );
+    assert_eq!(
+        METRICS.cowriter_lane_free_notices.load(Ordering::Relaxed) - notices_before,
+        1,
+        "one notice applied, on the harvest's own reply (RED)"
+    );
+    let (_, idx) = sc.victims[0];
+    assert_eq!(
+        sc.cwr.alloc.refcount(idx * sc.bs),
+        Some(1),
+        "the re-claimed lifetime is tracked exactly once"
+    );
+    recycle(&sc, handed_out).await;
+    teardown(sc).await;
 }

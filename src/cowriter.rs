@@ -2324,6 +2324,10 @@ pub fn stats_json() -> serde_json::Value {
             .cowriter_free_ship_own_lane_untracked
             .load(Ordering::Relaxed),
         "recomputed_retires": METRICS.cowriter_recomputed_retires.load(Ordering::Relaxed),
+        "lane_free_notices": METRICS.cowriter_lane_free_notices.load(Ordering::Relaxed),
+        "lane_free_notices_reminted": METRICS
+            .cowriter_lane_free_notices_reminted
+            .load(Ordering::Relaxed),
         "local_commit_refusals": METRICS.cowriter_local_commit_refusals.load(Ordering::Relaxed),
         "custody_endpoint": declared_authority().unwrap_or_else(|| "none".to_string()),
     })

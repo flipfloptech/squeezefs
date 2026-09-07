@@ -44,7 +44,8 @@ SCALARS = [
     # co-writer — the lane
     "alloc_lane_id", "alloc_lane_writers", "alloc_lane_reachable_blocks", "alloc_lane_enospc_refusals",
     "alloc_lane_harvests", "alloc_lane_harvested_blocks", "alloc_lane_pushed_harvests",
-    "alloc_lane_ahead_harvests", "alloc_lane_harvest_horizon_ms", "alloc_lane_harvest_watermark",
+    "alloc_lane_ahead_harvests", "alloc_lane_hint_refills", "alloc_lane_owed_blocks",
+    "alloc_lane_harvest_horizon_ms", "alloc_lane_harvest_watermark",
     "alloc_lane_headroom_pct", "free_grace_lane_supply_hint", "free_grace_lane_push_wakes",
     # rewrite epochs
     "rewrite_shadow_open_epochs", "rewrite_shadow_parked_bytes", "rewrite_shadow_swaps",

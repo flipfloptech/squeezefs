@@ -666,12 +666,30 @@ block a co-writer consumes costs its writers a full stop first.
 * A background single-flight-per-volume task (spawned only on laned
   co-writer engagements, `alloc_lane_grant::engage_allocator_lane` — the
   place the sinks are already wired) harvests when
-  `reachable < watermark && owed > 0` **for that volume's allocator**, where
-  `reachable` = local free list +
+  `reachable < watermark && (hint > 0 || owed > 0)` **for that volume's
+  allocator**, where `reachable` = local free list +
   the lane's virgin remainder (`virgin_bytes`, already lane-scoped), and
   `watermark = ceil(alloc_rate × horizon)` — `alloc_rate` an EWMA over the
   funnel's own claims, capped at lane-share/4. Derived, never a knob (the
   ENG-10 posture; the A/B lever disarms the mechanism, not the number).
+  **The gate's input is the ADVERTISED supply** (the refill-hint gate,
+  2026-09-07 — `.benchmarks/2026-09-07-lane-refill-hint-gate.md`,
+  `free_grace::lane_supply_witnessed`): `hint` is the renewal grant's
+  `lane_supply_blocks` (the authority's own count of this lane's blocks
+  on its free lists, per MOUNT — summed over the data volumes — fresh
+  within one renewal cadence) and the owed word above is its explicit-ship
+  SUBSET. As landed, PR 4 gated on `owed > 0` alone; on the s11 fleet
+  ≈ 90 % of a co-writer's displaced blocks return through the authority's
+  publish RECOMPUTE (`meta_ship_publish.free_recomputed_blocks`), which
+  notes nothing owed, so the tick sat dark while the authority advertised
+  hundreds of the lane's blocks and every refill ran from inside an ENOSPC
+  park (m50 @ 74–78 s: reachable 138 → 30 under a watermark of 128, hint
+  374, ahead harvests flat, 1,906 ENOSPC-path harvests). A nonzero hint
+  arms every laned allocator below its watermark (a volume without the
+  supply pays one empty, counted RPC — the per-volume routing is the
+  sibling placement campaign's); `SQUEEZEFS_ALLOC_LANE_REFILL_HINT=0` is
+  the owed-only gate verbatim (the A/B control), `alloc_lane_hint_refills`
+  the engagement (proactive harvests the owed gate would have declined).
 * **The horizon is a MEASUREMENT, with the derivation as the fallback**
   (OQ 2 — user decision 2026-08-25, choosing the non-default):
   `HarvestLaneFree`'s **reply** carries the authority's live
@@ -908,7 +926,8 @@ unarmed mount (the solo re-gate — pinned by the existing contract-1 shape in
 | `alloc_lane_harvest_horizon_ms` | the refill horizon in force (measured-with-fallback, §5.5 — the `depth_target` publication precedent); exported under the same engagement gate as `alloc_lane_reachable_blocks` |
 | `alloc_from_freelist` / `alloc_fresh_mints` | **the attribution split PR 1 exists for**: per-process counters at `try_allocate_block`'s two exits; with `alloc_lane_harvested_blocks` they decompose every allocation's source |
 | `alloc_lane_reachable_blocks` | the **lane-reachable supply** (the counting-set wrapper's lane-owned count + lane-scoped virgin remainder, published as the sum) — the quantity that troughs on a recycle-bound stream (§2.2's corrected note) and the site-0/runway input from PR 3. The COUNT is maintained always (one atomic beside the set op — what makes the wrapper correct-by-construction); the GAUGE **exports only when a lane partition or the grace plane is engaged, absent otherwise** — the `alloc_lane_*` family's solo-inert convention (`alloc_lane_writers` 0 = unpartitioned), keeping this preamble's every-gauge-0-unarmed law true without exceptions and the PR 5 solo re-gate uncarved |
-| `alloc_lane_owed_blocks` | co-writer gauge: shipped frees − harvested back, accounted **per `(vol_tag, lane)`** (one word per allocator — §5.5) and published as the sum (the recycle stock owed to this lane across the authorities' lists) |
+| `alloc_lane_owed_blocks` | co-writer gauge: EXPLICITLY shipped frees' `Freed` verdicts − harvested back, accounted **per `(vol_tag, lane)`** (one word per allocator — §5.5) and published as the sum. The explicit-ship arm's face — a strict subset of the authority's advertised lane supply (`free_grace_lane_supply_hint`) and NOT the refill gate since 2026-09-07 (the refill-hint gate, §5.5) |
+| `alloc_lane_hint_refills` | the refill-hint gate's engagement: proactive harvests (ahead + pushed) that fired with the owed word at 0 — the ones the owed-only gate would have declined; 0 under `SQUEEZEFS_ALLOC_LANE_REFILL_HINT=0` |
 | `alloc_lane_ahead_harvests` | L5's engagement counter (⊆ `alloc_lane_harvests`); ahead-harvests with zero co-located stall counters is the designed steady state |
 | `alloc_lane_harvest_watermark` | the derived watermark in force (the `depth_target` publication precedent) |
 
@@ -1372,7 +1391,7 @@ instant this one begins (pinned:
 |---|---|---|
 | **release on ack** (authority) | `free_grace::note_member_ack_advanced` — lever (d)'s one-compare gate — runs the installed `ReleaseHook` (`multi_writer::release_hook`: every allocator's `harvest_grace_to_front`, the routine harvest repeated to the ring's uncovered front); the hook's harvest IS the dirty recompute, so the two arms are one act | rate-limited by exactly lever (d)'s `refresh_on_ack_interval_ms` (shares its refresh instant) |
 | **the lane-supply hint** (wire) | `Grant::lane_supply_blocks` on the membership RENEWAL grant (the 1 Hz prodded beat, lever (b)'s carriage included): the member's lane population on the authority's free lists, from the lane-counted free set's per-lane counters (`LaneCountedSet::per_lane`, one `fetch_add` beside the existing lane-owned one) through `multi_writer::lane_supply_source` — O(volumes) loads in the renewal hot op, never a scan (KD-FG-4 stands) | the assignment's `lane_of(member_id)`, the same id the custody path keys on |
-| **the pushed refill** (co-writer) | `MemberSession::renewed*` → `free_grace::note_lane_supply_hint` → `lane_supply_wake` (a `Notify` the ahead task and the bounded allocation park both wait on beside their cadence); `BlockAllocator::pushed_refill_tick` runs the SAME harvest when `lane_push_wants_harvest(hint, owed)` — owed ⇒ harvest, the watermark not consulted (a quiet lane's rate-derived watermark decays to 0, exactly when the tick goes dark) | pure, lever-gated; `0` = the tick and the slices verbatim |
+| **the pushed refill** (co-writer) | `MemberSession::renewed*` → `free_grace::note_lane_supply_hint` → `lane_supply_wake` (a `Notify` the ahead task and the bounded allocation park both wait on beside their cadence); `BlockAllocator::pushed_refill_tick` runs the SAME harvest when `lane_push_wants_harvest(hint, owed)` — **the hint ⇒ harvest** (the refill-hint gate, 2026-09-07: the hint is the authority's own count and the sufficient condition; as landed the decision also required `owed > 0`, which ≈ 90 % of a rewriting co-writer's displaced blocks never touch — the recompute arm — so the push declined while the authority advertised the supply; `SQUEEZEFS_ALLOC_LANE_REFILL_HINT=0` restores that gate), the watermark not consulted (a quiet lane's rate-derived watermark decays to 0, exactly when the tick goes dark) | pure, lever-gated; `0` = the tick and the slices verbatim |
 
 ### Measured (the co-writer-lane model, `tests/free_grace_lane_visible_tests.rs`; release, deterministic)
 

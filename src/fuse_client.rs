@@ -6643,6 +6643,17 @@ pub struct Metrics {
     /// Growing beside lane ENOSPC refusals = the deficit under-reads the
     /// need.
     pub rewrite_shadow_supply_close_bounded: Align64<AtomicU64>,
+    /// The per-volume plan's yield (`SQUEEZEFS_REWRITE_SUPPLY_CLOSE_PER_VOLUME`,
+    /// finding 15's fpp residue): parked A keys a supply close released
+    /// that live ON THE VOLUME whose tick asked — ⊆
+    /// `rewrite_shadow_supply_close_blocks`; the difference is the yield
+    /// that restocked a volume that was not short. 0 with the lever off.
+    pub rewrite_shadow_supply_close_volume_blocks: Align64<AtomicU64>,
+    /// Starving ticks that found parked keys on the mount but NONE on the
+    /// asking volume — closing would restock a sibling, so nothing
+    /// closes; the volume's supply is its peers' frees and the loop's.
+    /// The per-volume face of `…_declined_no_parked`; 0 with the lever off.
+    pub rewrite_shadow_supply_close_declined_offvolume: Align64<AtomicU64>,
     /// Write-commit-economy lever 1 (2026-07-30): publish-conveyor
     /// passes committed (one save each). With
     /// `layout_publish_batched_blocks` gives the live coalesce factor —
@@ -11277,6 +11288,8 @@ impl SqueezefsFilesystem {
                 "rewrite_shadow_supply_close_declined_covered": METRICS.rewrite_shadow_supply_close_declined_covered.load(Ordering::Relaxed),
                 "rewrite_shadow_supply_close_declined_no_parked": METRICS.rewrite_shadow_supply_close_declined_no_parked.load(Ordering::Relaxed),
                 "rewrite_shadow_supply_close_bounded": METRICS.rewrite_shadow_supply_close_bounded.load(Ordering::Relaxed),
+                "rewrite_shadow_supply_close_volume_blocks": METRICS.rewrite_shadow_supply_close_volume_blocks.load(Ordering::Relaxed),
+                "rewrite_shadow_supply_close_declined_offvolume": METRICS.rewrite_shadow_supply_close_declined_offvolume.load(Ordering::Relaxed),
                 // Residence decomposition (2026-07-31 write-wall
                 // campaign, conviction 2): ALWAYS-ON per-phase histograms
                 // — admission → detach → lock → crypto → allocate → DMA

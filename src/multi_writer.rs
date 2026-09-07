@@ -614,19 +614,13 @@ pub fn lane_supply_source(
         let Some(lane) = assignment.lane_of(member_id) else {
             return 0;
         };
-        // The default slot aliases the first registered backend on real
-        // mounts (the `lane_reachable_blocks_sum` dedup): count each
-        // allocator once.
-        let mut seen: Vec<Arc<crate::block_allocator::BlockAllocator>> = Vec::new();
-        let mut sum = 0u64;
-        for alloc in backend.lane_allocators() {
-            if seen.iter().any(|s| Arc::ptr_eq(s, &alloc)) {
-                continue;
-            }
-            sum = sum.saturating_add(alloc.lane_free_count(lane));
-            seen.push(alloc);
-        }
-        sum
+        // `lane_allocators` names each allocator once (the default slot's
+        // alias of the first registered backend is deduplicated there).
+        backend
+            .lane_allocators()
+            .iter()
+            .map(|alloc| alloc.lane_free_count(lane))
+            .fold(0u64, u64::saturating_add)
     })
 }
 

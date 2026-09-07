@@ -33,6 +33,12 @@
 //!    `virgin_bytes` arithmetic.
 //! 7. **Fenced daemons never trim**: destructive device commands cease
 //!    permanently (the D0 `failed` latch, the reclaimer's law).
+//! 9. **A trim claim window is PENDING SUPPLY, never fullness** (the
+//!    overlay_overwrite_tests R7 flake, 2026-09-07): an allocation that
+//!    finds the free list entirely inside a claim window parks for its
+//!    return edge and lands on the returned offset; a LOST claim leaves
+//!    nothing to park on and a genuinely full store still refuses
+//!    promptly.
 //!
 //! RED against `a0f38a4`: no elision path exists — every bdev-class
 //! terminal free queues a device discard.
@@ -572,4 +578,130 @@ async fn a_fully_grace_held_backlog_paces_the_drainer() {
     let _ = ba.allocate_block().await.expect("harvesting allocation");
     let _ = ba.take_debt_batch(usize::MAX);
     assert_eq!(debt_gauge(), 0, "suite-clean: no leaked debt gauge bytes");
+}
+
+// ---------------------------------------------------------------------------
+// Contract 9 — a trim claim window is PENDING SUPPLY, never fullness
+// (`.benchmarks/2026-09-07-overlay-enospc-convergence-flake.md`). The
+// KD-4.4 protocol takes each debt offset OUT of the free list for the
+// duration of its device command (claim → issue → return). On a store
+// whose free list is ENTIRELY inside that window — a full store under
+// rewrite, where the virgin tail is 0 so the pressure venue drains on
+// every pass regardless of foreground — an allocation saw an empty list,
+// a cursor at the cap, nothing `pending` on the reclaim queue (the trim
+// rides none) and no grace ring, and refused `StorageFull`: TERMINAL for
+// that write (ENOSPC to the application) while the block was returned a
+// device command later. The claim window is one batch of device
+// commands, so its return edge is what the allocation must park on.
+// ---------------------------------------------------------------------------
+
+fn trim_window_parks() -> u64 {
+    METRICS.alloc_trim_window_parks.load(Ordering::Relaxed)
+}
+
+fn is_storage_full(r: &Result<u64, squeezefs::error::SqueezefsError>) -> bool {
+    matches!(
+        r,
+        Err(squeezefs::error::SqueezefsError::Io(e)) if e.kind() == std::io::ErrorKind::StorageFull
+    )
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn allocation_racing_a_trim_claim_window_parks_and_lands_on_the_returned_offset() {
+    let _g = serial().await;
+    // A bare allocator: the claim window is the allocator's own protocol
+    // (`claim_free_for_trim` … `return_from_trim`), and a router would
+    // only add the live drainer this contract holds still by hand.
+    let ba = Arc::new(
+        BlockAllocator::new("trim_claim_window_test")
+            .await
+            .expect("allocator"),
+    );
+
+    // A FULL store: capacity 2, both minted.
+    ba.set_capacity_bytes(2 * ba.chunk_size());
+    let o0 = ba.allocate_block().await.expect("alloc 0");
+    let o1 = ba.allocate_block().await.expect("alloc 1");
+    ba.publish_block(o0);
+    ba.publish_block(o1);
+    let full = ba.allocate_block().await;
+    assert!(
+        is_storage_full(&full),
+        "premise: the store is full ({full:?})"
+    );
+
+    // One elided terminal free — the allocator half of `free_block`'s
+    // elision arm verbatim (begin_free → debt record → finish_free),
+    // without waking the router's drainer: this contract holds the claim
+    // window BY HAND, so the live pressure venue must not race it for the
+    // same offset. `o1` is the free list's ONLY member and owes a discard.
+    assert!(ba.begin_free(o1), "terminal free");
+    ba.record_elided_debt(o1, ba.chunk_size());
+    ba.finish_free(o1);
+    assert_eq!(ba.free_block_indices(), vec![o1 / ba.chunk_size()]);
+
+    // Hold the trim's claim window open — exactly what `drain_debt_sync`
+    // does between its claim and return phases while the device command
+    // is in flight.
+    let claim = ba
+        .claim_free_for_trim(o1)
+        .expect("the trim claims the only free block");
+    assert!(
+        ba.free_block_indices().is_empty(),
+        "premise: the free list is entirely inside the claim window"
+    );
+
+    // The racing allocation must PARK on the window, never refuse.
+    let parks0 = trim_window_parks();
+    let alloc = {
+        let ba = ba.clone();
+        tokio::spawn(async move { ba.allocate_block().await })
+    };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while trim_window_parks() == parks0 && std::time::Instant::now() < deadline {
+        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+    }
+    assert!(
+        trim_window_parks() > parks0,
+        "the allocation found the supply inside a claim window and PARKED \
+         (alloc_trim_window_parks) — it never refused StorageFull"
+    );
+    assert!(
+        !alloc.is_finished(),
+        "the park holds while the claim window is open"
+    );
+
+    // The return edge ends the park: the allocation lands on the very
+    // offset the trim returned.
+    ba.return_from_trim(o1);
+    drop(claim);
+    let got = alloc.await.expect("allocation task");
+    assert_eq!(
+        got.as_ref().ok(),
+        Some(&o1),
+        "an allocation racing a trim claim window lands on the returned \
+         offset — a StorageFull here is the spurious ENOSPC the R7 loop \
+         hit ({got:?})"
+    );
+
+    // A LOST claim (the offset was reused) leaves no window to park on:
+    // a genuinely full store refuses promptly and counts no park.
+    assert!(
+        ba.claim_free_for_trim(o1).is_none(),
+        "the claim loses against the new owner"
+    );
+    let parks1 = trim_window_parks();
+    let started = std::time::Instant::now();
+    let refused = ba.allocate_block().await;
+    assert!(
+        is_storage_full(&refused),
+        "a full store with no claim window open refuses honestly ({refused:?})"
+    );
+    assert!(
+        started.elapsed() < std::time::Duration::from_millis(500),
+        "the honest refusal is prompt — a lost claim must not leave the \
+         window counter raised ({:?})",
+        started.elapsed()
+    );
+    assert_eq!(trim_window_parks(), parks1, "a lost claim parks nobody");
 }

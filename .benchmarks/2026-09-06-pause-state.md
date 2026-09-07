@@ -91,6 +91,21 @@ mount (the A-arm rig reset the cluster; remount is part of every arm).
    audits (the two allowed warnings = the rc-manifest §5 adjudicated
    unmaintained notices, `bincode` + `number_prefix`). The docs commits
    since (`5187da15` … `5ef89fcc`) are docs-only.
+1e. **B1 term LANDED (`886d4e31`) — gate GREEN** (13:12–14:17, pinned
+   worktree, from zero: 362 suites / **4,781 tests**, 18 stages, both
+   audits). The three B1 fixes: single-flight lane harvest (`7cf8433b`),
+   the finding-51 phase-B1 containment (`23d243a4` — the storm was the
+   authority's OWN open overlay records displaced by served publishes, not
+   the witness), the renewal cadence's caught-up relax + `sqz-lease-io`
+   venue + renew instruments (`61e45918`, `7d5c1958`). Box row 1C
+   (`886d4e31`): **the first full s11-mpiio matrix PASS** — A1 3,497 /
+   B1 2,324 / B2 2,301 / A2 2,842 MiB/s all sustained, stale refusals 0,
+   tripwires 0, fsck clean; `overlay_superseded_by_served_publish` 1,263 /
+   1,259 on the fpp phases. Residues: fpp-phase ENOSPC refusals still
+   8–15k per phase (sustained anyway), `block_claim_anomalies` 1,156–1,348
+   per fpp phase (the own-lane-untracked lineage). Sequence 2 (C-B-B-C +
+   six lever legs) running on the box; the overlay ENOSPC-convergence
+   flake (pre-existing, ~3–7 % order-dependent) under a subagent.
 2. **Kernel A/B, B arm** — after `squeeze-test` boots the 6.19.14 series
    WITH 0031 (or whichever box carries the patched kernel): on the box,
    `cd /scratch/tmp/sqz-agent/k26 && sudo env ARM=B KERNEL_TAG=<uname -r

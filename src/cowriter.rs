@@ -2250,6 +2250,7 @@ pub fn stats_json() -> serde_json::Value {
         "free_ship_own_lane_untracked": METRICS
             .cowriter_free_ship_own_lane_untracked
             .load(Ordering::Relaxed),
+        "recomputed_retires": METRICS.cowriter_recomputed_retires.load(Ordering::Relaxed),
         "local_commit_refusals": METRICS.cowriter_local_commit_refusals.load(Ordering::Relaxed),
         "custody_endpoint": declared_authority().unwrap_or_else(|| "none".to_string()),
     })

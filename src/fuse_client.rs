@@ -6466,6 +6466,16 @@ pub struct Metrics {
     /// Foreign-lane keys (predecessors another writer minted) are
     /// untracked here by construction and are not counted.
     pub cowriter_free_ship_own_lane_untracked: Align64<AtomicU64>,
+    /// Parked rewrite-epoch keys whose LOCAL tracking this co-writer
+    /// retired on a served publish reply's `freed` set (publish schema
+    /// 15) — the recompute arm's hygiene, run at the covering publish
+    /// instead of the epoch close (`.benchmarks/2026-09-07-cowriter-claim-
+    /// anomaly-lineage.md`: a block the authority freed by recompute
+    /// mid-epoch came back through the lane harvest and was re-claimed
+    /// while the entry still lingered — the fpp phases' `CLAIM ANOMALY`).
+    /// The explicit-ship arm's twin is the `Freed`-verdict retire inside
+    /// `ship_displaced_frees`, which this counter never sees.
+    pub cowriter_recomputed_retires: Align64<AtomicU64>,
     /// LOCAL metadata commits refused on a co-writer — the mutations that
     /// reached the backend's write gate instead of the shipped publish
     /// path. **Should stay 0 on a healthy co-writer**: a nonzero value

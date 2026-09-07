@@ -1291,6 +1291,552 @@ async fn a_rotated_fsync_token_converges_the_close_and_orphans_no_local_hygiene(
 }
 
 // ===========================================================================
+// 1c. The recompute arm's hygiene window — the fpp phases' CLAIM ANOMALY
+//     (`.benchmarks/2026-09-07-cowriter-claim-anomaly-lineage.md`)
+// ===========================================================================
+
+/// The §1b fixture up to the point where the rewrite epoch holds the
+/// round-1 bindings and the round-0 mints are PARKED: authority + co-writer
+/// + the production fs, the shared file seeded, round 0 written and
+/// fsynced, round 1 written (quiesced, epoch open, nothing published yet).
+struct ParkedEpoch {
+    auth: Authority,
+    cwr: CoWriter,
+    h: CoWriterFs,
+    ino: u64,
+    fh: u64,
+    bs: u64,
+    lane_id: u64,
+    cap_blocks: u64,
+    /// `(block index, block idx)` of the round-0 mints — the parked keys.
+    round0: Vec<(u32, u64)>,
+}
+
+const PE_BLOCKS: u64 = 8;
+const PE_RANGE: std::ops::Range<u64> = 2..6;
+
+async fn parked_epoch(dir: &Path, name: &str) -> ParkedEpoch {
+    std::env::remove_var("SQUEEZEFS_DEFAULT_BLOCK_SIZE");
+    fuse_client::set_patch_max_bytes(0);
+    // The write-through pipeline is the epoch's vehicle (the §1b shape).
+    squeezefs::device_overlay::set_overlay_overwrite_for_tests(false);
+    let vol = fresh_volume(dir, name).await;
+    let dev = data_device(dir, &format!("{name}.dev"));
+
+    let auth = Authority::start(&vol, &dev, &[NODE_A], 0).await;
+    let bs = auth.alloc.chunk_size();
+    auth.owner
+        .install_range_geometry(data_grant::fixed_range_geometry(PE_BLOCKS * bs, bs));
+    squeezefs::meta_backend::kv::indirect_map::install_indirect_map_io(
+        squeezefs::multi_writer::indirect_map_io_for(Arc::clone(&auth.br)),
+    );
+    let cap_blocks: u64 = 2 * PE_BLOCKS + 32;
+    auth.alloc.set_capacity_bytes(cap_blocks * bs);
+    let ino = seed_striped_file(&auth, "shared.bin", PE_BLOCKS).await;
+
+    let cwr = CoWriter::join(&auth, &vol, &dev, NODE_A).await;
+    cwr.alloc.set_capacity_bytes(cap_blocks * bs);
+    let lane_id = u64::from(cwr.client.lane_partition().writer_id());
+    let h = cowriter_fs(&auth, &cwr, &dev).await;
+    data_grant::TEST_RANGE_CUSTODY_OVERRIDE.store(1, Ordering::Relaxed);
+
+    let fh =
+        h.fs.open(h.req, ino, libc::O_WRONLY as u32, 0)
+            .await
+            .expect("the co-writer opens the shared file")
+            .fh;
+    // Round 0: the range becomes the co-writer's — its mints are the
+    // durable predecessors round 1 displaces.
+    for b in PE_RANGE {
+        write_whole_block(&h, ino, fh, b, bs, 0x11).await;
+    }
+    h.fs.fsync(h.req, ino, fh, false)
+        .await
+        .expect("round 0 fsync");
+    assert!(
+        h.fs.write_pipeline.quiesce(Duration::from_secs(30)).await,
+        "the round-0 pipeline drains"
+    );
+    let round0: Vec<(u32, u64)> = durable_blocks(&auth, ino)
+        .await
+        .into_iter()
+        .filter(|(b, _)| PE_RANGE.contains(&u64::from(*b)))
+        .collect();
+    assert_eq!(round0.len(), 4, "premise: the range is durably mapped");
+    for (b, idx) in &round0 {
+        assert_eq!(
+            lane::block_lane_of(*idx, 2),
+            lane_id,
+            "premise: block {b} is a co-writer mint"
+        );
+        assert_eq!(
+            cwr.alloc.refcount(idx * bs),
+            Some(1),
+            "premise: the co-writer tracks its live mint {idx}"
+        );
+    }
+    // Round 1: the rewrites feed the epoch (RAM-only bindings); the
+    // round-0 keys PARK in it. Nothing has published them yet.
+    for b in PE_RANGE {
+        write_whole_block(&h, ino, fh, b, bs, 0x22).await;
+    }
+    assert!(
+        h.fs.write_pipeline.quiesce(Duration::from_secs(30)).await,
+        "the round-1 pipeline drains"
+    );
+    assert!(
+        METRICS.rewrite_shadow_open_epochs.load(Ordering::Relaxed) > 0,
+        "premise: the rewrite epoch holds the round-1 bindings"
+    );
+    ParkedEpoch {
+        auth,
+        cwr,
+        h,
+        ino,
+        fh,
+        bs,
+        lane_id,
+        cap_blocks,
+        round0,
+    }
+}
+
+async fn write_whole_block(h: &CoWriterFs, ino: u64, fh: u64, b: u64, bs: u64, tag: u8) {
+    let w =
+        h.fs.write(
+            h.req,
+            ino,
+            fh,
+            b * bs,
+            bytes::Bytes::from(pat(bs as usize, tag)),
+            0,
+            0,
+        )
+        .await
+        .unwrap_or_else(|e| panic!("block {b}: write failed: {e:?}"));
+    assert_eq!(w.written as u64, bs, "block {b}: short write");
+}
+
+/// Contract (the fleet lineage, `.benchmarks/2026-09-07-cowriter-claim-
+/// anomaly-lineage.md`): a layout publish that COVERS an open rewrite
+/// epoch's bindings WITHOUT closing it — on the fleet the write-through
+/// merge / the flush leg / the overlay publish, here the writeback path's
+/// `persist_dirty_layout_if_needed` — ships the whole dirty map, the
+/// authority's custody-scoped compose recomputes the parked predecessors
+/// FREE through its own ladder (grace → free list → the lane harvest), and
+/// the co-writer must retire its local tracking of exactly those offsets
+/// AT THAT REPLY — not at the epoch close, which on the fleet fires
+/// seconds later, after the harvest has already handed the offset back
+/// and `claim_block_idx` found the entry lingering (`CLAIM ANOMALY`,
+/// 1,156–1,402 per fpp phase Σ 8 co-writers, `free_shipped_blocks` flat
+/// across the same phases). Pinned: right after the covering publish the
+/// epoch is still open, the round-0 mints are free on the authority at
+/// population 0, the co-writer tracks NONE of them, the parked-bytes gauge
+/// no longer counts them, `cowriter.recomputed_retires` names them, and
+/// no free SHIPPED (the retire is hygiene, never a verb); the harvest hands
+/// them back and re-claims them with `block_claim_anomalies` +0; the close
+/// then converges without touching them; the lane supply closes. RED on
+/// dev d603e7ae: four lingering `Some(1)` entries after the covering
+/// publish, four anomalies on the re-claims.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_covering_publish_mid_epoch_retires_the_parked_keys_the_authority_freed() {
+    let _serial = serial();
+    let _restore = restore();
+    let dir = TempDir::new().unwrap();
+    let ParkedEpoch {
+        auth,
+        cwr,
+        h,
+        ino,
+        fh,
+        bs,
+        lane_id,
+        cap_blocks,
+        round0,
+    } = parked_epoch(dir.path(), "covering-publish").await;
+
+    // The fixture holds eight live lane blocks outside the supply (the
+    // four durable round-0 mints, the four RAM-only round-1 mints).
+    let supply_before = lane_supply(&auth, &cwr, 2, lane_id, cap_blocks) + 8;
+    let untracked_before = METRICS
+        .block_untracked_free_refusals
+        .load(Ordering::Relaxed);
+    let anomalies_before = METRICS.block_claim_anomalies.load(Ordering::Relaxed);
+    let fence_drops_before = METRICS.rewrite_shadow_fence_drops.load(Ordering::Relaxed);
+    let enospc_before = METRICS.alloc_lane_enospc_refusals.load(Ordering::Relaxed);
+    let retires_before = METRICS.cowriter_recomputed_retires.load(Ordering::Relaxed);
+    let shipped_before = publish::stats().free_shipped_blocks;
+    let recomputed_before = publish::stats().free_recomputed_blocks;
+    let parked_before = METRICS.rewrite_shadow_parked_bytes.load(Ordering::Relaxed);
+    assert_eq!(
+        parked_before,
+        4 * bs,
+        "premise: the four round-0 keys are parked in the epoch"
+    );
+
+    // THE COVERING PUBLISH, epoch left open: the dirty RAM map (round-1
+    // bindings) ships under the current generation; the authority's
+    // compose displaces the round-0 predecessors and frees them itself.
+    let token = h.fs.dlm().get_fencing_token_ino(ino);
+    h.fs.router
+        .persist_dirty_layout_if_needed(&squeezefs::keys::inode_path(ino), token)
+        .await
+        .expect("the covering publish lands");
+    auth.br.reclaim_drain().await;
+    assert!(
+        METRICS.rewrite_shadow_open_epochs.load(Ordering::Relaxed) > 0,
+        "premise: the epoch is STILL open — the fleet's window"
+    );
+    assert_eq!(
+        publish::stats().free_recomputed_blocks - recomputed_before,
+        4,
+        "the authority freed the four round-0 predecessors by recompute"
+    );
+    for (b, idx) in &round0 {
+        assert!(
+            auth.free_listed(*idx),
+            "block {b}: the round-0 mint {idx} is on the authority's free list"
+        );
+        assert_eq!(
+            auth.population(*idx).await,
+            0,
+            "block {b}: the round-0 mint {idx} holds no durable reference"
+        );
+        assert_eq!(
+            cwr.alloc.refcount(idx * bs),
+            None,
+            "block {b}: the co-writer still tracks the mint {idx} the authority freed — \
+             the reply's freed set did not retire it (RED)"
+        );
+    }
+    assert_eq!(
+        METRICS.cowriter_recomputed_retires.load(Ordering::Relaxed) - retires_before,
+        4,
+        "cowriter.recomputed_retires names the four retired entries (RED)"
+    );
+    assert_eq!(
+        METRICS.rewrite_shadow_parked_bytes.load(Ordering::Relaxed),
+        parked_before - 4 * bs,
+        "the retired keys left the epoch's park (the supply close's yield is honest)"
+    );
+    assert_eq!(
+        publish::stats().free_shipped_blocks - shipped_before,
+        0,
+        "the retire is local hygiene — no free shipped"
+    );
+
+    // The anomaly venue: drain the lane's fresh supply so the funnel
+    // HARVESTS the freed round-0 offsets back and RE-CLAIMS them while the
+    // epoch is still open — the fleet's ordering exactly.
+    let mut handed_out: Vec<u64> = Vec::new();
+    let mut seen_round0 = 0usize;
+    for _ in 0..cap_blocks {
+        let off = cwr
+            .alloc
+            .allocate_block()
+            .await
+            .expect("the lane funnel serves (fresh, then harvested)");
+        handed_out.push(off);
+        if round0.iter().any(|(_, idx)| idx * bs == off) {
+            seen_round0 += 1;
+            if seen_round0 == round0.len() {
+                break;
+            }
+        }
+    }
+    assert_eq!(
+        seen_round0,
+        round0.len(),
+        "every freed round-0 offset came back through the harvest and was re-claimed"
+    );
+    assert_eq!(
+        METRICS.block_claim_anomalies.load(Ordering::Relaxed) - anomalies_before,
+        0,
+        "no re-claim found a lingering local refcount (CLAIM ANOMALY = 0 — RED: one per \
+         round-0 offset)"
+    );
+    assert!(
+        METRICS.rewrite_shadow_open_epochs.load(Ordering::Relaxed) > 0,
+        "the epoch is still open at the re-claim"
+    );
+    for off in handed_out {
+        cwr.alloc
+            .abandon_unpublished_offset(off)
+            .await
+            .expect("the probe mint recycles into its own lane");
+    }
+
+    // The close: converges under a live token, has nothing left to retire
+    // for the round-0 keys, and ships no free for them.
+    h.fs.fsync(h.req, ino, fh, false)
+        .await
+        .expect("the closing fsync");
+    auth.br.reclaim_drain().await;
+    assert_eq!(
+        METRICS.rewrite_shadow_open_epochs.load(Ordering::Relaxed),
+        0,
+        "the epoch closed"
+    );
+    assert_eq!(
+        METRICS.rewrite_shadow_fence_drops.load(Ordering::Relaxed) - fence_drops_before,
+        0
+    );
+    assert_eq!(
+        METRICS.cowriter_recomputed_retires.load(Ordering::Relaxed) - retires_before,
+        4,
+        "the close retired nothing twice"
+    );
+
+    // Closure: keep rewriting on the recycled + harvested supply.
+    for round in 2..8u8 {
+        for b in PE_RANGE {
+            write_whole_block(&h, ino, fh, b, bs, round.wrapping_mul(0x17)).await;
+        }
+        h.fs.fsync(h.req, ino, fh, false)
+            .await
+            .unwrap_or_else(|e| panic!("round {round}: fsync failed: {e:?}"));
+        auth.br.reclaim_drain().await;
+    }
+    h.fs.release(h.req, ino, fh, 0, 0, false)
+        .await
+        .expect("release");
+    assert!(
+        h.fs.write_pipeline.quiesce(Duration::from_secs(30)).await,
+        "the co-writer's pipeline drains"
+    );
+    auth.br.reclaim_drain().await;
+
+    assert_eq!(
+        METRICS.block_claim_anomalies.load(Ordering::Relaxed) - anomalies_before,
+        0,
+        "no offset was claimed while this mount still tracked it (CLAIM ANOMALY = 0)"
+    );
+    assert_eq!(
+        METRICS
+            .block_untracked_free_refusals
+            .load(Ordering::Relaxed)
+            - untracked_before,
+        0,
+        "no shipped free arrived for a block the authority already freed"
+    );
+    assert_eq!(
+        METRICS.alloc_lane_enospc_refusals.load(Ordering::Relaxed) - enospc_before,
+        0,
+        "the lane never starved"
+    );
+    let durable = durable_blocks(&auth, ino).await;
+    let live_lane_blocks = durable
+        .iter()
+        .filter(|(_, idx)| lane::block_lane_of(*idx, 2) == lane_id)
+        .count() as u64;
+    let supply_after = lane_supply(&auth, &cwr, 2, lane_id, cap_blocks);
+    assert_eq!(
+        supply_after + live_lane_blocks,
+        supply_before,
+        "the lane supply closes (leaked = {})",
+        supply_before as i64 - supply_after as i64 - live_lane_blocks as i64
+    );
+    for (_, idx) in &durable {
+        assert_eq!(
+            auth.population(*idx).await,
+            1,
+            "live block {idx} carries exactly one durable reference"
+        );
+    }
+
+    drop(h);
+    drop(cwr);
+    auth.stop().await;
+}
+
+/// Contract (the anomaly's INVERSE): a served reply's `freed` set names a
+/// LIFETIME, not an offset — if the harvest beat the reply (a lost reply's
+/// bounded resend, a grace ring released under pressure) and this mount
+/// has ALREADY re-minted the offset, the parked key names a dead lifetime
+/// and the retire must touch NOTHING of the live one: the fresh refcount
+/// entry stays, the live incarnation word stays, `recomputed_retires` does
+/// not count it — and neither does the epoch close afterwards. Staged
+/// through the product path: the round-0 offset is adopted and re-claimed
+/// on the co-writer BEFORE the covering publish (the one staged anomaly
+/// this re-claim fires is the precondition, asserted exactly), then the
+/// covering publish's reply names it freed. RED on dev d603e7ae only in
+/// its gauge (the counter does not exist); the inverse itself is what the
+/// fix must NOT break, pinned alongside.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_recompute_verdict_never_touches_a_lifetime_this_mount_re_minted() {
+    let _serial = serial();
+    let _restore = restore();
+    let dir = TempDir::new().unwrap();
+    let ParkedEpoch {
+        auth,
+        cwr,
+        h,
+        ino,
+        fh,
+        bs,
+        round0,
+        ..
+    } = parked_epoch(dir.path(), "reminted-lifetime").await;
+
+    let anomalies_before = METRICS.block_claim_anomalies.load(Ordering::Relaxed);
+    let retires_before = METRICS.cowriter_recomputed_retires.load(Ordering::Relaxed);
+    let recomputed_before = publish::stats().free_recomputed_blocks;
+    let (_, x_idx) = round0[0];
+    let x_off = x_idx * bs;
+    let parked_stamp = cwr.alloc.live_incarnation(x_off);
+    assert_ne!(
+        parked_stamp,
+        squeezefs::routing::INCARNATION_NONE,
+        "premise: lifetime stamps are engaged on the co-writer"
+    );
+
+    // The staging: the harvest hands X back while its parked key still
+    // lingers, and the claim re-mints it — the anomaly's own precondition,
+    // fired ONCE on purpose.
+    assert_eq!(cwr.alloc.adopt_lane_free_grant(&[x_idx]), 1);
+    let re_minted = cwr
+        .alloc
+        .allocate_block()
+        .await
+        .expect("the free list serves X first");
+    assert_eq!(re_minted, x_off, "premise: the re-claim took X");
+    assert_eq!(
+        METRICS.block_claim_anomalies.load(Ordering::Relaxed) - anomalies_before,
+        1,
+        "premise: the staged re-claim is the one anomaly this test fires"
+    );
+    let live_stamp = cwr.alloc.live_incarnation(x_off);
+    assert_ne!(
+        live_stamp, parked_stamp,
+        "premise: the re-claim minted a NEW lifetime for X"
+    );
+    assert_eq!(cwr.alloc.refcount(x_off), Some(1));
+
+    // The covering publish: the authority recomputes all four round-0
+    // predecessors free — X included — and the reply names them.
+    let token = h.fs.dlm().get_fencing_token_ino(ino);
+    h.fs.router
+        .persist_dirty_layout_if_needed(&squeezefs::keys::inode_path(ino), token)
+        .await
+        .expect("the covering publish lands");
+    auth.br.reclaim_drain().await;
+    assert_eq!(
+        publish::stats().free_recomputed_blocks - recomputed_before,
+        4,
+        "the authority freed the four round-0 predecessors by recompute"
+    );
+    assert_eq!(
+        METRICS.cowriter_recomputed_retires.load(Ordering::Relaxed) - retires_before,
+        3,
+        "three parked keys retired; X's names a dead lifetime and was NOT counted"
+    );
+    assert_eq!(
+        cwr.alloc.refcount(x_off),
+        Some(1),
+        "the live re-minted lifetime's refcount entry is untouched"
+    );
+    assert_eq!(
+        cwr.alloc.live_incarnation(x_off),
+        live_stamp,
+        "the live re-minted lifetime's incarnation word is untouched"
+    );
+    for (b, idx) in round0.iter().skip(1) {
+        assert_eq!(
+            cwr.alloc.refcount(idx * bs),
+            None,
+            "block {b}: the other three retired"
+        );
+    }
+
+    // The close does not touch X either (its parked key was dead).
+    h.fs.fsync(h.req, ino, fh, false)
+        .await
+        .expect("the closing fsync converges");
+    auth.br.reclaim_drain().await;
+    assert_eq!(
+        METRICS.rewrite_shadow_open_epochs.load(Ordering::Relaxed),
+        0,
+        "the epoch closed"
+    );
+    assert_eq!(cwr.alloc.refcount(x_off), Some(1));
+    assert_eq!(cwr.alloc.live_incarnation(x_off), live_stamp);
+    assert_eq!(
+        METRICS.block_claim_anomalies.load(Ordering::Relaxed) - anomalies_before,
+        1,
+        "no anomaly beyond the staged one"
+    );
+    assert_eq!(
+        METRICS.cowriter_recomputed_retires.load(Ordering::Relaxed) - retires_before,
+        3
+    );
+
+    // Hand the staged re-mint back (never published) and stop. The lane
+    // supply is deliberately NOT asserted here: the staging double-lists
+    // X by construction (this is a guard pin, not a closure pin).
+    h.fs.release(h.req, ino, fh, 0, 0, false)
+        .await
+        .expect("release");
+    cwr.alloc
+        .abandon_unpublished_offset(x_off)
+        .await
+        .expect("the staged re-mint recycles");
+    drop(h);
+    drop(cwr);
+    auth.stop().await;
+}
+
+/// Contract (KD-7 — the reply shape changed, so the vocabulary's schema
+/// moved): the three recompute replies (`PutDone`, `DeltaUsed`,
+/// `MapMigrated`) carry the authority's `Freed` offsets since publish
+/// schema 15, and a peer speaking the previous schema is refused at its
+/// FIRST frame with `PUBLISH_SCHEMA_MISMATCH` naming both numbers — never
+/// a reply whose freed set it would silently read as nothing. RED on dev
+/// d603e7ae: the schema reads 14.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_peer_speaking_the_previous_publish_schema_is_refused_at_the_first_frame() {
+    let _serial = serial();
+    let _restore = restore();
+    std::env::remove_var("SQUEEZEFS_DEFAULT_BLOCK_SIZE");
+    assert!(
+        publish::PUBLISH_SCHEMA >= 15,
+        "the freed set joined the recompute replies at schema 15 (KD-7: a mixed-commit \
+         fleet must fail loud, not read an absent field as empty)"
+    );
+    let dir = TempDir::new().unwrap();
+    let vol = fresh_volume(dir.path(), "schema-peer").await;
+    let dev = data_device(dir.path(), "schema-peer.dev");
+    let auth = Authority::start(&vol, &dev, &[NODE_A], 4 * 1024 * 1024).await;
+
+    let previous = publish::PUBLISH_SCHEMA - 1;
+    let body = publish::encode_request_frame(&publish::PublishRequestFrame {
+        schema: previous,
+        client: NODE_A.to_string(),
+        calls: vec![publish::PublishCall::XattrValueCap { ino: 1 }],
+    })
+    .expect("a previous-schema frame encodes");
+    let mut rpc = cw::RpcClient::connect(&auth.endpoint, SECRET, NODE_A, None)
+        .await
+        .expect("the previous-schema peer dials");
+    let reply = rpc
+        .call(publish::VERB_PUBLISH_CALL, body)
+        .await
+        .expect("the wire answers");
+    assert_eq!(
+        reply.status,
+        publish::PUBLISH_SCHEMA_MISMATCH,
+        "refused at the frame, before any call is read"
+    );
+    let detail = String::from_utf8_lossy(&reply.body).to_string();
+    assert!(
+        detail.contains(&previous.to_string())
+            && detail.contains(&publish::PUBLISH_SCHEMA.to_string()),
+        "the refusal names both schemas: {detail}"
+    );
+
+    auth.stop().await;
+}
+
+// ===========================================================================
 // 2. The router-level contract: harvest → publish → displace → free, both
 //    publish shapes, the supply closing every cycle
 // ===========================================================================
@@ -1742,6 +2288,7 @@ async fn a_genuine_double_release_is_refused_counted_and_named() {
     let untracked_before = METRICS
         .block_untracked_free_refusals
         .load(Ordering::Relaxed);
+    let recomputed_retires_before = METRICS.cowriter_recomputed_retires.load(Ordering::Relaxed);
 
     let first = publish::ship_free_blocks(&auth.endpoint, tag, vec![idx], epoch, 4_001)
         .await
@@ -1812,6 +2359,12 @@ async fn a_genuine_double_release_is_refused_counted_and_named() {
         "the wire refused it too — the two faces of one residual lineage"
     );
     assert!(auth.free_listed(idx), "still free exactly once");
+    assert_eq!(
+        METRICS.cowriter_recomputed_retires.load(Ordering::Relaxed) - recomputed_retires_before,
+        0,
+        "the explicit-ship arm's retire is its own (the Freed-verdict retire); the \
+         recompute arm's counter never moves on a shipped free"
+    );
 
     drop(cwr);
     auth.stop().await;

@@ -147,6 +147,13 @@ impl Drop for Restore {
         publish::uninstall_free_executor();
         publish::uninstall_harvest_executor();
         publish::uninstall_binding_witness();
+        // The rung-17 assembler pair + the rung-18 sink an authority fs
+        // installs (`install_extent_assembler`) capture THAT fs — left
+        // installed they would route a later test's served extents and
+        // invalidations to a dropped filesystem.
+        publish::uninstall_extent_merge_executor();
+        publish::uninstall_extent_flush_executor();
+        publish::uninstall_served_layout_invalidation();
         ship::disarm_ownership();
         data_custody::test_reset_custody_generation();
         data_custody::test_clear_poison();
@@ -541,7 +548,10 @@ async fn seed_striped_file(auth: &Authority, name: &str, blocks: u64) -> u64 {
     for b in 0..blocks {
         let off = auth.alloc.allocate_block().await.expect("seed mint");
         auth.alloc.publish_block(off);
-        map.insert(b as u32, off.to_string());
+        // The router's own naming: bare on an un-engaged router, the
+        // `offset@stamp` lifetime form once incarnation keys are engaged
+        // (`engage_stamped_keys`) — the fleet's authority keys.
+        map.insert(b as u32, auth.br.persist_block_key("backend_0", off));
         refs.push(BlockRefOp::taken(BlockRef {
             vol_tag: volume_tag(DATA_VOL),
             block_idx: off / bs,
@@ -566,8 +576,30 @@ async fn seed_striped_file(auth: &Authority, name: &str, blocks: u64) -> u64 {
     ino
 }
 
-/// Every block the durable layout of `ino` names, as `(index, block_idx)`.
-async fn durable_blocks(auth: &Authority, ino: u64) -> Vec<(u32, u64)> {
+/// Engage spec §6.2 item-6 incarnation keys on the authority's data plane
+/// — what `DataRouter::set_meta_backend` does on every armed mount whose
+/// volumes carry bit 13: persisted keys name their offset's lifetime
+/// (`offset@stamp`), and the read/free paths validate them. The rig's
+/// volumes are stamped; the era is the authority's own durable term.
+fn engage_stamped_keys(auth: &Authority) {
+    let era = auth
+        .meta
+        .volumes
+        .iter()
+        .map(|v| v.writer_term())
+        .max()
+        .unwrap_or(0);
+    assert!(era > 0, "the authority's D0 claim minted a durable term");
+    auth.br
+        .engage_incarnation_keys(
+            era,
+            squeezefs::meta_backend::kv::journal::AppendPartition::SOLO,
+        )
+        .expect("incarnation keys engage");
+}
+
+/// Every key the durable layout of `ino` names, as `(index, key)`.
+async fn durable_keys(auth: &Authority, ino: u64) -> Vec<(u32, String)> {
     use squeezefs::meta_backend::Metadata as _;
     let bytes = auth
         .meta
@@ -576,8 +608,7 @@ async fn durable_blocks(auth: &Authority, ino: u64) -> Vec<(u32, u64)> {
         .expect("layout read")
         .expect("a layout exists");
     let layout = squeezefs::layout_wire::decode_layout_any(&bytes).expect("a bincode layout");
-    let chunk = auth.alloc.chunk_size();
-    let entries: Vec<(u32, String)> = match layout
+    let mut out: Vec<(u32, String)> = match layout
         .block_map_id
         .as_deref()
         .and_then(|id| id.strip_prefix("indirect:"))
@@ -591,7 +622,15 @@ async fn durable_blocks(auth: &Authority, ino: u64) -> Vec<(u32, u64)> {
         }
         None => layout.block_map.unwrap_or_default().into_iter().collect(),
     };
-    let mut out: Vec<(u32, u64)> = entries
+    out.sort_unstable_by_key(|&(b, _)| b);
+    out
+}
+
+/// Every block the durable layout of `ino` names, as `(index, block_idx)`.
+async fn durable_blocks(auth: &Authority, ino: u64) -> Vec<(u32, u64)> {
+    let chunk = auth.alloc.chunk_size();
+    let mut out: Vec<(u32, u64)> = durable_keys(auth, ino)
+        .await
         .into_iter()
         .map(|(b, key)| {
             let cleaned = squeezefs::routing::clean_block_key(&key);
@@ -837,6 +876,53 @@ async fn an_authority_read_of_a_recycled_co_writer_block_validates_first_try() {
         publish::stats().harvest_served_blocks
     );
 
+    // A second publish naming the SAME (unchanged) bindings — a full Put
+    // re-stating the co-writer's map, the file-per-proc close shape — is
+    // served without a stale-binding refusal, and the authority still
+    // serves every recycled key first-try. (Pinned green from birth: the
+    // witness publishes the seqlock WORD only; the lifetime stamp
+    // `incarnation_ok` compares is a separate field it never touches, so
+    // a re-stated key can never disagree with itself.)
+    let refusals_before = METRICS
+        .block_key_incarnation_refusals
+        .load(Ordering::Relaxed);
+    let path = format!("inode_{ino}");
+    let mut entry =
+        w.fs.router
+            .fetch_metadata(&path)
+            .await
+            .expect("the co-writer resolves the head");
+    entry.layout_dirty = true;
+    w.fs.router.metadata_cache.insert(ino, entry);
+    let tok = w.fs.dlm().get_fencing_token_ino(ino);
+    w.fs.router
+        .persist_dirty_layout_if_needed(&path, tok)
+        .await
+        .expect("the re-stating Put ships and is served");
+    let before = read_ledger();
+    for b in RANGE {
+        let got = authority_read(&r, ino, b)
+            .await
+            .unwrap_or_else(|e| panic!("post-restate read of block {b} failed: {e}"));
+        assert!(
+            got == round_pat(ROUNDS - 1, b, bs),
+            "block {b}: not the last round's bytes"
+        );
+    }
+    assert_eq!(
+        read_ledger(),
+        before,
+        "the re-stated publish moved a loss counter"
+    );
+    assert_eq!(
+        METRICS
+            .block_key_incarnation_refusals
+            .load(Ordering::Relaxed)
+            - refusals_before,
+        0,
+        "re-stating the same keys is never a stale-binding refusal"
+    );
+
     // The DEFAULT read path (tiers engaged) on a FRESH authority reader —
     // the app-visible face of a `cat` on the authority — serves the last
     // round's bytes too.
@@ -989,4 +1075,407 @@ async fn the_binding_witness_never_publishes_an_own_lane_or_solo_word() {
         "the gauge counts the two foreign-lane publishes and neither own-lane refusal"
     );
     auth_alloc.finish_free(foreign_idx * bs);
+}
+
+// ===========================================================================
+// 3. Phase B1 (2026-09-07): a served publish displacing the captured old
+//    binding of an OPEN authority overlay record
+// ===========================================================================
+
+/// One phase-B1 scenario, built to the moment of truth: the authority
+/// holds an OPEN device-overlay record for block `B` of a striped file
+/// (an overwrite record whose captured `old_binding` is the authority's
+/// own STAMPED lane-0 key — the fleet's assembler shape); a co-writer's
+/// whole-block write of `B` is served (the owner's recompute frees the
+/// displaced authority block through the authority's own ladder); the
+/// authority re-mints the freed offset (free-list-first), so the captured
+/// key now names a DEAD lifetime of its offset. The co-writer side is torn
+/// down before the authority acts (the process posture latch is global).
+struct DisplacedOverlay {
+    auth: Authority,
+    a: SideFs,
+    ino: u64,
+    bs: u64,
+    old_key: String,
+    old_off: u64,
+    cw_pattern: Vec<u8>,
+    open_before: u64,
+    refusals_before: u64,
+    tripwires_before: u64,
+    screened_before: u64,
+    belt_before: u64,
+}
+
+/// The victim block and the overlay slice (a 64 KiB page-aligned segment
+/// in the block's interior — gaps on both sides, so the settle MUST seed
+/// from the captured old binding).
+const OV_BLOCK: u64 = 3;
+const OV_REL: usize = 1024 * 1024;
+const OV_LEN: usize = 64 * 1024;
+
+async fn displaced_overlay(dir: &Path, tag: &str, install_assembler: bool) -> DisplacedOverlay {
+    const BLOCKS: u64 = 8;
+    let vol = fresh_volume(dir, tag).await;
+    let dev = data_device(dir, &format!("{tag}.dev"));
+    let auth = Authority::start(&vol, &dev, &[NODE_A]).await;
+    engage_stamped_keys(&auth);
+    let bs = auth.alloc.chunk_size();
+    auth.owner
+        .install_range_geometry(data_grant::fixed_range_geometry(BLOCKS * bs, bs));
+    squeezefs::meta_backend::kv::indirect_map::install_indirect_map_io(
+        squeezefs::multi_writer::indirect_map_io_for(Arc::clone(&auth.br)),
+    );
+    let ino = seed_striped_file(&auth, "shared.bin", BLOCKS).await;
+    let (old_key, old_off) = {
+        let keys = durable_keys(&auth, ino).await;
+        let key = keys
+            .iter()
+            .find(|&&(b, _)| u64::from(b) == OV_BLOCK)
+            .map(|(_, k)| k.clone())
+            .expect("the seed names the victim block");
+        let parts = auth
+            .br
+            .parse_block_key_parts(&squeezefs::routing::clean_block_key(&key))
+            .expect("a stamped authority key");
+        assert!(
+            key.contains('@') && parts.incarnation != 0,
+            "premise: the authority's keys name their lifetime (key {key})"
+        );
+        assert_eq!(
+            auth.alloc.live_incarnation(parts.offset),
+            parts.incarnation,
+            "premise: the seed key IS the offset's live lifetime"
+        );
+        assert_eq!(
+            lane::block_lane_of(parts.offset / bs, 2),
+            0,
+            "an authority-lane block"
+        );
+        (key, parts.offset)
+    };
+
+    // The authority's fs (its reader AND its overlay holder), with the
+    // production assembler installs when the scenario asks for them —
+    // the rung-17 pair, the finding-28 probe, the rung-18 invalidation
+    // sink, and the served-displacement screen this file pins.
+    let a = side_fs(&auth, &auth.alloc, &dev).await;
+    if install_assembler {
+        a.fs.install_extent_assembler();
+    }
+    a.fs.router
+        .fetch_metadata(&format!("inode_{ino}"))
+        .await
+        .expect("the authority fs resolves the seeded layout");
+    let open_before = METRICS.overlay_open.load(Ordering::Relaxed);
+    let refusals_before = METRICS
+        .block_key_incarnation_refusals
+        .load(Ordering::Relaxed);
+    let tripwires_before = METRICS.invariant_tripwires.load(Ordering::Relaxed);
+    let screened_before = METRICS
+        .overlay_superseded_by_served_publish
+        .load(Ordering::Relaxed);
+    let belt_before = METRICS
+        .overlay_superseded_dead_old_binding
+        .load(Ordering::Relaxed);
+    // The open overwrite record (the assembler's shipped-slice shape),
+    // capturing the seed key as its old binding.
+    a.fs.test_install_overwrite_overlay(ino, OV_BLOCK as u32, OV_REL, &pat(OV_LEN, 0xA5))
+        .await
+        .expect("the overwrite record installs");
+    assert_eq!(
+        METRICS.overlay_open.load(Ordering::Relaxed),
+        open_before + 1,
+        "premise: one open overlay record"
+    );
+
+    // The co-writer's whole-block write of the victim block, served.
+    let cwr = CoWriter::join(&auth, &vol, &dev, NODE_A).await;
+    let w = side_fs(&auth, &cwr.alloc, &dev).await;
+    data_grant::TEST_RANGE_CUSTODY_OVERRIDE.store(1, Ordering::Relaxed);
+    let cw_pattern = pat(bs as usize, 0x5C);
+    let fh =
+        w.fs.open(w.req, ino, libc::O_WRONLY as u32, 0)
+            .await
+            .expect("the co-writer opens the shared file")
+            .fh;
+    let wr =
+        w.fs.write(
+            w.req,
+            ino,
+            fh,
+            OV_BLOCK * bs,
+            bytes::Bytes::from(cw_pattern.clone()),
+            0,
+            0,
+        )
+        .await
+        .expect("the co-writer's whole-block write");
+    assert_eq!(wr.written as u64, bs);
+    w.fs.fsync(w.req, ino, fh, false)
+        .await
+        .expect("the co-writer's fsync ships the publish");
+    w.fs.release(w.req, ino, fh, 0, 0, false)
+        .await
+        .expect("release");
+    assert!(
+        w.fs.write_pipeline.quiesce(Duration::from_secs(30)).await,
+        "the co-writer's pipeline drains"
+    );
+    auth.br.reclaim_drain().await;
+    // The durable head names the co-writer's block; the authority's own
+    // block was displaced and freed through its ladder (word retired,
+    // offset back on the lane-0 free list).
+    let cur = durable_keys(&auth, ino).await;
+    let cur_key = cur
+        .iter()
+        .find(|&&(b, _)| u64::from(b) == OV_BLOCK)
+        .map(|(_, k)| k.clone())
+        .expect("block still named");
+    assert_ne!(
+        cur_key, old_key,
+        "the served publish displaced the authority's block"
+    );
+    assert_eq!(
+        auth.alloc.refcount(old_off),
+        None,
+        "the recompute freed the displaced authority block"
+    );
+    // The authority re-mints the freed offset: the captured old binding
+    // now names a DEAD lifetime (the fleet: live stamp > key stamp, same
+    // era, all ten offsets lane 0). Free-list-first hands back the lowest
+    // free index — a superseded record's freed dest may sit beside the
+    // displaced block, so mint until the victim offset comes round.
+    let mut reminted = false;
+    for _ in 0..8 {
+        if auth
+            .alloc
+            .allocate_block()
+            .await
+            .expect("the authority mints")
+            == old_off
+        {
+            reminted = true;
+            break;
+        }
+    }
+    assert!(
+        reminted,
+        "the freed offset came back through the authority's own mint"
+    );
+    assert!(
+        !auth.br.block_key_incarnation_ok(&old_key),
+        "premise: the captured old binding is a dead lifetime now"
+    );
+    // The premise probe itself counted one refusal — rebase the ledger.
+    let refusals_before = refusals_before.max(
+        METRICS
+            .block_key_incarnation_refusals
+            .load(Ordering::Relaxed),
+    );
+
+    // The co-writer side leaves: the authority acts as the plain writer
+    // it is (the posture latch and the ownership map are process-global).
+    drop(w);
+    drop(cwr);
+    data_grant::TEST_RANGE_CUSTODY_OVERRIDE.store(0, Ordering::Relaxed);
+    data_grant::uninstall_custody_client();
+    publish::uninstall_client();
+    ship::disarm_ownership();
+    fuse_client::set_mount_posture(MountPosture::Writer);
+
+    DisplacedOverlay {
+        auth,
+        a,
+        ino,
+        bs,
+        old_key,
+        old_off,
+        cw_pattern,
+        open_before,
+        refusals_before,
+        tripwires_before,
+        screened_before,
+        belt_before,
+    }
+}
+
+/// Bounded wait for the detached overlay retire to converge the gauge.
+async fn wait_overlay_open(target: u64) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while METRICS.overlay_open.load(Ordering::Relaxed) > target
+        && std::time::Instant::now() < deadline
+    {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        METRICS.overlay_open.load(Ordering::Relaxed),
+        target,
+        "the superseded record's detached retire converges overlay_open"
+    );
+}
+
+/// Contract (phase B1, the screen): a SERVED layout publish that displaces
+/// block `b`'s binding is a foreign durable `Merge` on an open-overlay
+/// index — design-overlay-overwrite §5.7's containment applies (the
+/// durable map is the authority the moment the commit lands; the record is
+/// superseded and retired), performed by the authority's served-publish
+/// screen at the commit: the record's captured old binding is never read
+/// again, the gap read composes from the durable head (the co-writer's
+/// bytes), the authority's fsync settles nothing and returns, and
+/// `block_key_incarnation_refusals` stays flat. The served publisher is a
+/// LEGAL peer, so `invariant_tripwires` stays flat too (the
+/// `overlay_foreign_merge` tripwire is for code-path escapes).
+///
+/// RED on dev `a7cab076` (the B1 row's shape, 28,039 refusals on 10 wedged
+/// records): the record survives the displacement, its settle reads the
+/// dead old binding — `STALE BLOCK-KEY BINDING refused` — and the fsync's
+/// read-venue settle exhausts 24 attempts into EIO (the write arm retries
+/// for ever at 50 ms; the gap read EIOs).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_served_publish_displacing_an_open_overlays_old_binding_supersedes_it_at_the_commit() {
+    let _serial = serial();
+    let _restore = restore();
+    let dir = TempDir::new().unwrap();
+    let sc = displaced_overlay(dir.path(), "f51-b1-screen", true).await;
+    let path = format!("inode_{}", sc.ino);
+
+    // A gap read (block start — outside the overlay's slice) composes
+    // from the durable head: the co-writer's bytes, no dead-key serve.
+    let got =
+        sc.a.fs
+            .read(sc.a.req, sc.ino, 0, OV_BLOCK * sc.bs, 4096, 0)
+            .await
+            .unwrap_or_else(|e| panic!("the gap read on the authority failed: {e:?}"))
+            .data
+            .to_vec();
+    assert_eq!(
+        got,
+        &sc.cw_pattern[..4096],
+        "the gap read serves the durable authority's bytes (the served publish)"
+    );
+    // The fsync finds no live record to settle.
+    sc.a.fs
+        .fsync(sc.a.req, sc.ino, 0, false)
+        .await
+        .unwrap_or_else(|e| panic!("the authority's fsync failed: {e:?}"));
+    wait_overlay_open(sc.open_before).await;
+    assert_eq!(
+        METRICS
+            .block_key_incarnation_refusals
+            .load(Ordering::Relaxed)
+            - sc.refusals_before,
+        0,
+        "the captured old binding is never read: no STALE BLOCK-KEY BINDING refusal"
+    );
+    assert_eq!(
+        METRICS.invariant_tripwires.load(Ordering::Relaxed) - sc.tripwires_before,
+        0,
+        "a served publish is a legal foreign publisher — no one-authority-screen tripwire"
+    );
+    assert_eq!(
+        METRICS
+            .overlay_superseded_by_served_publish
+            .load(Ordering::Relaxed)
+            - sc.screened_before,
+        1,
+        "the screen counted exactly the one containment"
+    );
+    assert_eq!(
+        METRICS
+            .overlay_superseded_dead_old_binding
+            .load(Ordering::Relaxed)
+            - sc.belt_before,
+        0,
+        "the belt never had to fire — the screen caught the displacement at the commit"
+    );
+    // The whole block reads as the co-writer's durable content.
+    let got =
+        sc.a.fs
+            .read(sc.a.req, sc.ino, 0, OV_BLOCK * sc.bs, sc.bs as u32, 0)
+            .await
+            .expect("whole-block read")
+            .data
+            .to_vec();
+    assert!(
+        got == sc.cw_pattern,
+        "block {OV_BLOCK} is the durable authority's"
+    );
+    let _ = (&path, sc.old_off, &sc.old_key);
+    drop(sc.a);
+    sc.auth.stop().await;
+}
+
+/// Contract (phase B1, the belt): with NO served-publish screen installed
+/// (a served path the screen missed, or an install that captured a
+/// pre-commit RAM binding a moment before the sink invalidated it), the
+/// settle that finds its captured old binding DEAD supersedes the record
+/// instead of retrying the dead key — the fsync returns, the record
+/// retires, and the block reads as the durable authority's. The one
+/// refusal is the detection itself (the belt's own gauge names it).
+///
+/// RED on dev `a7cab076`: the read-venue settle exhausts 24 attempts into
+/// EIO, +24 refusals.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_settle_whose_captured_old_binding_died_supersedes_instead_of_retrying_the_dead_key() {
+    let _serial = serial();
+    let _restore = restore();
+    let dir = TempDir::new().unwrap();
+    let sc = displaced_overlay(dir.path(), "f51-b1-belt", false).await;
+
+    assert_eq!(
+        METRICS.overlay_open.load(Ordering::Relaxed),
+        sc.open_before + 1,
+        "premise: with no screen installed the record survived the served publish"
+    );
+    sc.a.fs
+        .fsync(sc.a.req, sc.ino, 0, false)
+        .await
+        .unwrap_or_else(|e| panic!("the authority's fsync failed: {e:?}"));
+    wait_overlay_open(sc.open_before).await;
+    assert_eq!(
+        METRICS
+            .overlay_superseded_dead_old_binding
+            .load(Ordering::Relaxed)
+            - sc.belt_before,
+        1,
+        "the belt superseded the record whose capture died"
+    );
+    assert_eq!(
+        METRICS
+            .overlay_superseded_by_served_publish
+            .load(Ordering::Relaxed)
+            - sc.screened_before,
+        0,
+        "no screen was installed on this authority"
+    );
+    assert_eq!(
+        METRICS
+            .block_key_incarnation_refusals
+            .load(Ordering::Relaxed)
+            - sc.refusals_before,
+        1,
+        "exactly ONE refusal — the detection — never the 24-attempt storm"
+    );
+    assert_eq!(
+        METRICS.invariant_tripwires.load(Ordering::Relaxed) - sc.tripwires_before,
+        0
+    );
+    // This scenario installed NO served-publish sinks at all, so the
+    // rung-18 invalidation never ran either: drop the fs's stale RAM head
+    // by hand (in production the two sinks are installed together).
+    sc.a.fs.router.discard_layout_cache(sc.ino);
+    let got =
+        sc.a.fs
+            .read(sc.a.req, sc.ino, 0, OV_BLOCK * sc.bs, sc.bs as u32, 0)
+            .await
+            .expect("whole-block read")
+            .data
+            .to_vec();
+    assert!(
+        got == sc.cw_pattern,
+        "block {OV_BLOCK} is the durable authority's"
+    );
+    let _ = (sc.old_off, &sc.old_key);
+    drop(sc.a);
+    sc.auth.stop().await;
 }

@@ -7682,6 +7682,30 @@ pub struct Metrics {
     /// (`overlay_foreign_merge`) — that pair must stay 0 on healthy
     /// mounts now that the settle's own publish is provenance-exempt.
     pub overlay_superseded_by_merge: Align64<AtomicU64>,
+    /// Finding 51, phase B1 (`.benchmarks/2026-09-07-read-settle-lost-
+    /// serialized-authority.md` §8): the §5.7 `Merge`-class containment
+    /// performed by the authority's SERVED-publish screen — a co-writer's
+    /// served layout publish displaced block `b`'s binding while this
+    /// authority held an open device-overlay record on `(ino, b)` (the
+    /// assembler's shipped-slice shape), so the record is superseded at
+    /// the served commit: the durable map is the authority the moment the
+    /// commit lands, and the recompute is about to free the record's
+    /// captured old binding. A LEGAL peer publisher, so it never trips
+    /// `invariant_tripwires`; growth names the S11 shape where a holder's
+    /// whole-block write and the authority's assembly of its shipped
+    /// slices meet on one block.
+    pub overlay_superseded_by_served_publish: Align64<AtomicU64>,
+    /// Finding 51, phase B1 — the BELT behind the screen above: a settle
+    /// found its record's captured old binding naming a DEAD lifetime of
+    /// its offset (freed and re-minted since the capture — a displacement
+    /// the screen did not see: a served path it missed, or an install
+    /// that captured a pre-commit RAM binding a moment before the sink
+    /// invalidated it) and superseded the record instead of reading the
+    /// dead key. The one `block_key_incarnation_refusals` it costs IS the
+    /// detection; the B1 row read 28,039 of them across 10 records whose
+    /// write-arm settle retried a dead key every 50 ms for 9 minutes.
+    /// 0 while the screen catches every displacement.
+    pub overlay_superseded_dead_old_binding: Align64<AtomicU64>,
     /// B4c-ii: OVERWRITE overlay records installed (the B4 engagement
     /// face — §11).
     pub overlay_overwrite_installs: Align64<AtomicU64>,
@@ -11770,6 +11794,8 @@ impl SqueezefsFilesystem {
                 "overlay_read_gap_bytes": METRICS.overlay_read_gap_bytes.load(Ordering::Relaxed),
                 "overlay_mover_skips": METRICS.overlay_mover_skips.load(Ordering::Relaxed),
                 "overlay_superseded_by_merge": METRICS.overlay_superseded_by_merge.load(Ordering::Relaxed),
+                "overlay_superseded_by_served_publish": METRICS.overlay_superseded_by_served_publish.load(Ordering::Relaxed),
+                "overlay_superseded_dead_old_binding": METRICS.overlay_superseded_dead_old_binding.load(Ordering::Relaxed),
                 "overlay_overwrite_installs": METRICS.overlay_overwrite_installs.load(Ordering::Relaxed),
                 "overlay_overwrite_bytes": METRICS.overlay_overwrite_bytes.load(Ordering::Relaxed),
                 "overlay_ineligible_shadow_bound": METRICS.overlay_ineligible_shadow_bound.load(Ordering::Relaxed),

@@ -1,0 +1,15 @@
+     83 bounded allocation refusing StorageFull after N ms parked with N offset(s) still in grace locally (lane harvest horizon N ms): the pressure 
+     35 transport payload lease held N ms (≥ N s) — overlong handler invocation or a §N.N severance escape; watch transport_lease_overlong / transpo
+     29 CLAIM ANOMALY: offset N claimed from the free list while a refcount entry lingers (count=Some(N)) (block_claim_anomalies)
+     16 I/O error: data volume 'nvmeNnN' full: N of N blocks allocated — lane N of N is exhausted while N free block(s) belong to lanes this mount d
+      8 SN: the authority refused N shipped free(s) (vol_tag NxcNeNdfN, request N): already free/graced/quarantined — the double-release lineage, su
+      5 SN: the authority refused N shipped free(s) (vol_tag NxadNbNdNbNbN, request N): already free/graced/quarantined — the double-release lineage
+      4   - [enabled] /dev/nvmeNnN (health: N)
+      4 ----------------------------------------------------------------------
+      3 Squeezefs operational error: Refused { errno: N, msg: "Lock expired or invalid fencing token: N (expected >= N)" }
+      3 data-plane allocation lane ENGAGED on volume 'nvmeNnN': lane N of N, resuming at block N (floor OPENED by the authority (this mount never wa
+      2 Squeezefs operational error: Io(Custom { kind: StorageFull, error: "I/O error: data volume 'nvmeNnN' full: N of N blocks allocated — lane N 
+      2 Registering data volume 'nvmeNnN' at path /dev/nvmeNnN (state active)
+      2 NvmeBlockDev /dev/nvmeNnN: write submission fan-out armed (N lanes, N B affinity grain)
+      2 NvmeBlockDev /dev/nvmeNnN: read submission fan-out armed (N lanes)
+      2 node cache armed for coherent reads at checkpoint epoch N (tail N): cached nodes are dropped on every epoch step, and this mount may not wri

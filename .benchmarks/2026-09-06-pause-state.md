@@ -60,6 +60,21 @@ mount (the A-arm rig reset the cluster; remount is part of every arm).
    worktree, from zero): 358 suites / **4,740 tests**, all 18 stages, both
    audits (the one allowed warning = RUSTSEC-2025-0141 `bincode`). The tip
    is releasable as 1.2.2 whenever the user calls it.
+1c. **Finding 15, day 2 (2026-09-07) — the S11 gate PASSES; the next
+   term is named** (`.benchmarks/2026-09-07-f15-day2-fleet-pair.md`).
+   User decision "2 and 3": landed the supply-coupled epoch close
+   (`2c0a90c1`), finding 51 (`d3cb44ac` — the authority's
+   `read_settle_lost_serialized` storm was its own retired word for a
+   recycled co-writer block; 101 fsync EIOs/row), lane-aware placement +
+   failover (`149821c7`), the refill-hint gate (`ac56ceb6`, composed
+   `b119ef78`), and the per-second fleet sampler rig (`73a133c8`). Fleet
+   A/B same boot: phase A1 (the S11 shared file) **steady 1,684 MiB/s over
+   89 s — first PASS ever**, lane-ENOSPC −96 %, tripwires 0. Phase B1 (the
+   file-per-proc reference, never reached before) FAILS 770 → 148: the
+   authority's renewal processing head-of-line blocks behind ~240 mostly
+   empty harvest RPCs/s (members' acks fresh, authority's view 10–11 s).
+   Next: single-flight harvest per allocator + renewal serve isolation;
+   the claim-anomaly lineage (1,620 in B1). Gate on `b119ef78` running.
 2. **Kernel A/B, B arm** — after `squeeze-test` boots the 6.19.14 series
    WITH 0031 (or whichever box carries the patched kernel): on the box,
    `cd /scratch/tmp/sqz-agent/k26 && sudo env ARM=B KERNEL_TAG=<uname -r

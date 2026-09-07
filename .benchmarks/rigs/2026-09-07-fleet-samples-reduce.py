@@ -26,8 +26,14 @@ import sys
 
 
 def load(path):
+    """A sampler file, plain or gzip-compressed (`.jsonl` / `.jsonl.gz` —
+    archived rows are compressed; the sampler writes plain)."""
+    import gzip
+    if not os.path.exists(path) and os.path.exists(path + ".gz"):
+        path += ".gz"
+    opener = gzip.open if path.endswith(".gz") else open
     rows = []
-    for line in open(path):
+    for line in opener(path, "rt"):
         line = line.strip()
         if line:
             rows.append(json.loads(line))

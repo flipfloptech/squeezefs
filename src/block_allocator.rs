@@ -269,6 +269,17 @@ pub struct BlockAllocator {
     /// watermark input; the process-wide gauge is
     /// `METRICS.block_free_elided_debt_bytes`).
     elided_debt_bytes: AtomicU64,
+    /// Offsets currently inside a trim CLAIM WINDOW (KD-4.4:
+    /// [`Self::claim_free_for_trim`] … [`Self::return_from_trim`]) — free
+    /// supply that has left the free list for the duration of one device
+    /// command and comes back. The allocation funnel reads it after an
+    /// empty scan: a full store whose whole free list sits inside a
+    /// window is NOT full, and refusing it was the spurious-ENOSPC race
+    /// (`.benchmarks/2026-09-07-overlay-enospc-convergence-flake.md`).
+    trim_claimed: AtomicU64,
+    /// The claim window's return edge (`return_from_trim`) — what a parked
+    /// allocation waits on. `notify_waiters` only: no permit accumulates.
+    trim_returned: squeezefs_ipc::sqz_notify::Notify,
     /// Per-offset incarnation seqlock: `gen << 1 | stable`.
     ///
     /// Block keys are plain offset strings, so when an offset is freed and
@@ -769,6 +780,8 @@ impl BlockAllocator {
             space_pending: std::sync::OnceLock::new(),
             elided_debt: scc::HashMap::new(),
             elided_debt_bytes: AtomicU64::new(0),
+            trim_claimed: AtomicU64::new(0),
+            trim_returned: squeezefs_ipc::sqz_notify::Notify::new(),
             incarnations: scc::HashMap::new(),
             stamps_present: std::sync::atomic::AtomicBool::new(false),
             incarnation_minter: std::sync::OnceLock::new(),
@@ -1399,17 +1412,59 @@ impl BlockAllocator {
     /// claim window from fsck C6's limbo reconciliation (a mid-trim
     /// offset must never be "completed" back onto the free list). `None`
     /// = lost the claim (reused / racing trim): the offset owes nothing.
+    ///
+    /// The window is COUNTED before the remove: an allocation that scans
+    /// the list empty and then reads `trim_claimed` must see the claim
+    /// that emptied it (`await_trim_return` — the funnel's park on the
+    /// window's return edge, `alloc_trim_window_parks`).
     pub fn claim_free_for_trim(self: &Arc<Self>, offset: u64) -> Option<InflightAllocGuard> {
         let idx = offset / self.chunk_size;
-        self.free_blocks
-            .remove(&idx)
-            .map(|_| self.inflight_register(offset))
+        self.trim_claimed.fetch_add(1, Ordering::SeqCst);
+        match self.free_blocks.remove(&idx) {
+            Some(_) => Some(self.inflight_register(offset)),
+            None => {
+                self.end_trim_claim();
+                None
+            }
+        }
     }
 
     /// Return a trim-claimed offset to the free list (the claim window
-    /// ends; the caller drops the in-flight guard after this).
+    /// ends; the caller drops the in-flight guard after this). The
+    /// insert precedes the count's release so a parked allocation that
+    /// reads the window closed finds the offset on its rescan.
     pub fn return_from_trim(&self, offset: u64) {
         self.free_blocks.insert(offset / self.chunk_size);
+        self.end_trim_claim();
+    }
+
+    fn end_trim_claim(&self) {
+        self.trim_claimed.fetch_sub(1, Ordering::SeqCst);
+        self.trim_returned.notify_waiters();
+    }
+
+    /// Park for an open trim claim window's return edge (contract 9,
+    /// `tests/discard_elision_tests.rs`). `false` = no window is open —
+    /// nothing to wait for, the caller's verdict stands. Registers BEFORE
+    /// the re-check (`notified` registers at creation), so a return edge
+    /// between the empty scan and the park is never lost. Bounded by the
+    /// reclaimer's shipped park ceiling: a window is one batch of device
+    /// commands, and one that outlives that ceiling is a STALLED trim —
+    /// the caller's attempt cap then owns the verdict.
+    async fn await_trim_return(&self) -> bool {
+        let returned = self.trim_returned.notified();
+        if self.trim_claimed.load(Ordering::SeqCst) == 0 {
+            return false;
+        }
+        crate::fuse_client::METRICS
+            .alloc_trim_window_parks
+            .fetch_add(1, Ordering::Relaxed);
+        let _ = squeezefs_ipc::sqz_time::timeout(
+            std::time::Duration::from_millis(crate::block_reclaim::PARK_BOUND_CEILING_MS),
+            returned,
+        )
+        .await;
+        true
     }
 
     /// Wire the ENOSPC pressure valve (see the field doc). Set once by
@@ -3018,7 +3073,7 @@ impl BlockAllocator {
                 return self.hand_out_reserved(ok).await;
             }
         }
-        if !is_storage_full(&e) || self.space_valve.get().is_none() {
+        if !is_storage_full(&e) {
             return Err(e);
         }
         // ENOSPC pressure: freed-but-queued reclaims own free space this
@@ -3036,6 +3091,17 @@ impl BlockAllocator {
         // progress, the try_allocate_block retry argument), or observes
         // nothing pending and refuses StorageFull honestly.
         //
+        // The trim venue's CLAIM WINDOW is the other pending supply
+        // (KD-4.4 — contract 9, tests/discard_elision_tests.rs): a debt
+        // offset leaves the free list for one device command and comes
+        // back, on no queue the valve can drain. A full store under
+        // rewrite (virgin tail 0 ⇒ the pressure venue drains on every
+        // pass) puts its ENTIRE free list inside that window at times,
+        // and the empty-scan verdict was then a spurious, TERMINAL
+        // StorageFull. So an open window parks this allocation on its
+        // return edge — before the valve, and whether or not a valve is
+        // wired (the window is the allocator's own protocol).
+        //
         // RES-1 5 (pre-RC engineering spec §7): the `pending` exit alone
         // is not a bound. Under concurrent reclaim traffic OTHER writers
         // keep the queue non-empty, so every pass observes `pending ==
@@ -3043,28 +3109,37 @@ impl BlockAllocator {
         // allocating task spins on a genuinely full store instead of
         // returning `StorageFull`. The attempt cap below is the
         // liveness floor: past it the verdict stands, loudly.
-        for attempt in 0..ENOSPC_VALVE_MAX_ATTEMPTS {
+        for _attempt in 0..ENOSPC_VALVE_MAX_ATTEMPTS {
             if let ok @ Ok(_) = self.try_allocate_block() {
                 return self.hand_out_reserved(ok).await;
             }
-            let pending = self.space_pending.get().map(|p| p()).unwrap_or(false);
-            if let Some(valve) = self.space_valve.get() {
-                valve().await;
+            if self.await_trim_return().await {
+                continue;
             }
+            let Some(valve) = self.space_valve.get() else {
+                return Err(e);
+            };
+            let pending = self.space_pending.get().map(|p| p()).unwrap_or(false);
+            valve().await;
             if !pending {
                 // Nothing was owed before the final drain: the verdict
-                // stands (genuine fullness refuses StorageFull).
+                // stands (genuine fullness refuses StorageFull) — unless
+                // a claim window opened DURING the drain, whose return
+                // edge is the next pass's to await.
                 let last = self.try_allocate_block();
+                if last.is_err() && self.trim_claimed.load(Ordering::SeqCst) > 0 {
+                    continue;
+                }
                 return self.hand_out_reserved(last).await;
             }
-            let _ = attempt;
         }
         log::error!(
             "allocate_block: the ENOSPC pressure valve ran {ENOSPC_VALVE_MAX_ATTEMPTS} \
-             drain-and-retry passes with reclaims still pending and never freed a \
-             block — refusing StorageFull rather than spinning (the store is full \
-             and the reclaimer is not gaining on it; check \
-             block_free_reclaim_queue_bytes and block_free_reclaim_fence_halts)"
+             drain-and-retry passes with reclaims still pending (queued, or inside a \
+             trim claim window) and never freed a block — refusing StorageFull rather \
+             than spinning (the store is full and the reclaimer is not gaining on it; \
+             check block_free_reclaim_queue_bytes, alloc_trim_window_parks and \
+             block_free_reclaim_fence_halts)"
         );
         let last = self.try_allocate_block();
         self.hand_out_reserved(last).await

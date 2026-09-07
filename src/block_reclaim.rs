@@ -627,7 +627,10 @@ impl Drop for DebtDrainer {
 /// nothing), register a live in-flight owner for the claim window (fsck
 /// C6 must never "complete" a mid-trim offset back onto the free list),
 /// issue, RETURN to the free list. Claim windows are bounded to one
-/// batch so the ENOSPC valve is never starved by a long trim.
+/// batch, and an allocation that finds the free list empty while one is
+/// open PARKS for its return edge (`BlockAllocator::await_trim_return`,
+/// `alloc_trim_window_parks`) — on a full store the window can hold the
+/// whole free list, and the empty scan alone was a spurious ENOSPC.
 pub(crate) fn drain_debt_sync(
     allocator: &Arc<BlockAllocator>,
     device_path: &str,

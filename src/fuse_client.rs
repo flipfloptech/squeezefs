@@ -6920,6 +6920,15 @@ pub struct Metrics {
     /// tail (KD-4.6) and the paced drain engaged under foreground.
     /// ≈ 0 on stores with fresh headroom.
     pub block_free_debt_pressure_drains: Align64<AtomicU64>,
+    /// Allocations that scanned the free list EMPTY while a trim claim
+    /// window (KD-4.4) held free supply, and PARKED for its return edge
+    /// instead of refusing `StorageFull` (contract 9,
+    /// `tests/discard_elision_tests.rs`; the R7 overlay flake,
+    /// `.benchmarks/2026-09-07-overlay-enospc-convergence-flake.md`).
+    /// Each is a spurious ENOSPC that was not; ≈ 0 except on a full
+    /// store under rewrite with elision engaged, where the pressure venue
+    /// trims every displaced block as it is freed.
+    pub alloc_trim_window_parks: Align64<AtomicU64>,
     /// Supply-pressure drain passes (finding 40 — fill-coupled reclaim
     /// pacing): the queued reclaim debt reached a material share (≥ half)
     /// of a device's remaining free supply, so the drain ran REGARDLESS
@@ -11523,6 +11532,7 @@ impl SqueezefsFilesystem {
                 "block_free_trim_bytes": METRICS.block_free_trim_bytes.load(Ordering::Relaxed),
                 "block_free_debt_pressure_drains": METRICS.block_free_debt_pressure_drains.load(Ordering::Relaxed),
                 "block_free_debt_drain_passes": METRICS.block_free_debt_drain_passes.load(Ordering::Relaxed),
+                "alloc_trim_window_parks": METRICS.alloc_trim_window_parks.load(Ordering::Relaxed),
                 "block_free_reclaim_supply_drains": METRICS.block_free_reclaim_supply_drains.load(Ordering::Relaxed),
                 // RW1 rand-write device-byte ledger (design-random-small-
                 // writes §1.2 buckets; always-on — the G-RW2 gate's

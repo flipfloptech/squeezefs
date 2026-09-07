@@ -2021,3 +2021,187 @@ async fn no_caller_waits_past_the_wall() {
         "every retry after the empty reply declined"
     );
 }
+
+// ---------------------------------------------------------------------------
+// 11. The PER-VOLUME lane-supply hint (finding 15's fpp residue —
+//     `.benchmarks/2026-09-07-cowriter-fpp-supply-residue.md`)
+// ---------------------------------------------------------------------------
+//
+// The renewal grant's `lane_supply_blocks` is SUMMED over the authority's
+// data volumes, while a decline and a pushed refill are per allocator (per
+// volume): on the s11 fleet the volume the authority held nothing for asked
+// on every wake because its sibling's supply made the sum nonzero (≈ 20 % of
+// a co-writer's harvest RPCs came back empty), and a decline on it ended at
+// every grant whether or not anything of ITS lane had moved. The grant now
+// carries the per-volume vector (`Grant::lane_supply_volumes`,
+// `CLUSTER_WIRE_SCHEMA` 3 — KD-7 same-commit fleets), and under
+// `SQUEEZEFS_ALLOC_LANE_VOLUME_HINT` (default on) the co-writer reads its
+// volume's entry: the pushed decision, the ahead witness and the
+// single-flight decline are per volume.
+
+/// Restores the volume-hint lever beside the flight posture.
+struct VolumeHintRestore {
+    _flight: FlightRestore,
+}
+
+impl Drop for VolumeHintRestore {
+    fn drop(&mut self) {
+        free_grace::test_set_volume_hint(None);
+    }
+}
+
+fn volume_hint_restore() -> VolumeHintRestore {
+    free_grace::test_set_volume_hint(None);
+    VolumeHintRestore {
+        _flight: flight_restore(),
+    }
+}
+
+/// A grant's arrival on the member: the per-volume vector FIRST (what the
+/// wake's pushed ticks read), then the mount sum (the wake) — the order
+/// `MemberSession::renewed` keeps.
+fn grant_arrives(volumes: &[(u64, u64)]) {
+    free_grace::note_lane_supply_volumes(volumes);
+    free_grace::note_lane_supply_hint(volumes.iter().map(|(_, n)| *n).sum());
+}
+
+fn vol_tag(alloc: &BlockAllocator) -> u64 {
+    squeezefs::meta_backend::kv::block_refs::volume_tag(alloc.volume_id())
+}
+
+/// Contract (1): **a decline on volume A ends when A's advertised supply
+/// moves, not when the sum does.** Both volumes exhausted, both authorities
+/// empty. A asks once (empty) and declines. A grant advertising supply on B
+/// ONLY leaves A declined (no RPC — B's supply is not A's) while B's pushed
+/// tick asks B and gets it; a grant advertising A's supply ends A's decline
+/// for exactly one RPC, which adopts it. A volume the vector does not name
+/// keeps the mount-wide law (every grant ends its decline). RED against
+/// d603e7ae: the witness was the mount-wide grant arrival count, so any
+/// grant re-armed A.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_decline_ends_when_that_volumes_advertised_supply_moves() {
+    let _serial = serial();
+    let _restore = volume_hint_restore();
+    free_grace::test_set_lane_push(Some(true));
+    free_grace::test_set_volume_hint(Some(true));
+    let supply_a = GatedSupply::new([], 0);
+    let supply_b = GatedSupply::new([], 0);
+    supply_a.release();
+    supply_b.release();
+    let a = exhausted_co_writer("vol-00000000000000a1", supply_a.sink()).await;
+    let b = exhausted_co_writer("vol-00000000000000b2", supply_b.sink()).await;
+    let (ta, tb) = (vol_tag(&a), vol_tag(&b));
+    assert_eq!((ta, tb), (0xa1, 0xb2), "premise: the durable tags");
+    let chunk = a.chunk_size();
+
+    // A asks once, gets nothing, declines.
+    let _ = a.allocate_block().await.expect_err("A exhausted");
+    assert_eq!(supply_a.asks(), 1);
+    let _ = a.allocate_block().await.expect_err("A exhausted");
+    assert_eq!(supply_a.asks(), 1, "A declined on A's empty reply");
+
+    // Supply lands on B's list and the grant says so — for B only.
+    b.retire_shipped_free_tracking(9 * chunk);
+    supply_b.blocks.lock().unwrap().push_back(9);
+    grant_arrives(&[(ta, 0), (tb, 1)]);
+    assert_eq!(free_grace::lane_supply_hint(), 1, "the mount sum");
+    assert_eq!(
+        free_grace::lane_supply_hint_for(ta),
+        0,
+        "A's volume: nothing"
+    );
+    assert_eq!(free_grace::lane_supply_hint_for(tb), 1, "B's volume: one");
+    let g0 = flight_gauges();
+    let _ = a.allocate_block().await.expect_err("A still exhausted");
+    assert_eq!(
+        supply_a.asks(),
+        1,
+        "A stays declined: the grant moved B's supply, not A's"
+    );
+    assert_eq!(flight_gauges().declined, g0.declined + 1);
+    // The wake's pushed tick: A (advertised 0) is skipped and counted, B
+    // (advertised 1, dry) asks and adopts.
+    let skips0 = METRICS.alloc_lane_volume_hint_skips.load(Ordering::Relaxed);
+    assert_eq!(a.pushed_refill_tick(1_000).await, 0);
+    assert_eq!(supply_a.asks(), 1, "no wasted RPC on A");
+    assert_eq!(
+        METRICS.alloc_lane_volume_hint_skips.load(Ordering::Relaxed),
+        skips0 + 1,
+        "the skip is counted (alloc_lane_volume_hint_skips)"
+    );
+    assert_eq!(b.pushed_refill_tick(1_000).await, 1, "B harvests its block");
+    assert_eq!(supply_b.asks(), 1);
+    assert_eq!(
+        b.allocate_block().await.expect("the adopted block") / chunk,
+        9
+    );
+
+    // A's supply lands and the grant says so: the decline ends for one RPC.
+    a.retire_shipped_free_tracking(3 * chunk);
+    supply_a.blocks.lock().unwrap().push_back(3);
+    grant_arrives(&[(ta, 1), (tb, 0)]);
+    assert_eq!(a.allocate_block().await.expect("A's block") / chunk, 3);
+    assert_eq!(supply_a.asks(), 2, "one RPC, on A's own advertisement");
+    // …and an empty reply declines again until A's entry moves: a grant
+    // that advertises 0 for A (whatever B says) re-arms nothing.
+    let _ = a.allocate_block().await.expect_err("A exhausted again");
+    assert_eq!(supply_a.asks(), 3, "the non-empty reply left no decline");
+    let _ = a.allocate_block().await.expect_err("A exhausted");
+    assert_eq!(supply_a.asks(), 3, "declined");
+    grant_arrives(&[(ta, 0), (tb, 4)]);
+    let _ = a.allocate_block().await.expect_err("A exhausted");
+    assert_eq!(supply_a.asks(), 3, "still declined: A's entry stayed 0");
+
+    // A volume the vector does not NAME keeps the mount-wide law: a grant
+    // naming B alone is, for A, a grant arrival like any other.
+    grant_arrives(&[(tb, 0)]);
+    let _ = a.allocate_block().await.expect_err("A exhausted");
+    assert_eq!(
+        supply_a.asks(),
+        4,
+        "unnamed by the vector ⇒ the arrival ends A's decline (the fallback)"
+    );
+}
+
+/// Contract (2): **the lever off reads the sum verbatim** — the vector
+/// travels but every decision is the mount-level one: a grant advertising
+/// B's supply ends A's decline and fires A's pushed tick (one wasted RPC on
+/// A), and `alloc_lane_volume_hint_skips` never moves.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_volume_hint_lever_off_reads_the_sum_verbatim() {
+    let _serial = serial();
+    let _restore = volume_hint_restore();
+    free_grace::test_set_lane_push(Some(true));
+    free_grace::test_set_volume_hint(Some(false));
+    let supply_a = GatedSupply::new([], 0);
+    supply_a.release();
+    let a = exhausted_co_writer("vol-00000000000000a1", supply_a.sink()).await;
+    let ta = vol_tag(&a);
+    let tb = 0xb2u64;
+    let _ = a.allocate_block().await.expect_err("A exhausted");
+    let _ = a.allocate_block().await.expect_err("A exhausted");
+    assert_eq!(supply_a.asks(), 1, "declined");
+    let skips0 = METRICS.alloc_lane_volume_hint_skips.load(Ordering::Relaxed);
+    grant_arrives(&[(ta, 0), (tb, 5)]);
+    assert_eq!(
+        free_grace::lane_supply_hint_for(ta),
+        5,
+        "lever off: the volume reads the SUM"
+    );
+    // The wake's pushed tick asks A on the sum (the grant's arrival ended
+    // A's decline; the reply is empty, so the decline re-arms) — the wasted
+    // RPC the vector saves under the lever.
+    assert_eq!(a.pushed_refill_tick(1_000).await, 0);
+    assert_eq!(supply_a.asks(), 2, "the pushed tick asked A on the sum");
+    assert_eq!(
+        METRICS.alloc_lane_volume_hint_skips.load(Ordering::Relaxed),
+        skips0,
+        "no skip counted with the lever off"
+    );
+    let _ = a.allocate_block().await.expect_err("A exhausted");
+    assert_eq!(
+        supply_a.asks(),
+        2,
+        "declined on the pushed RPC's empty reply"
+    );
+}

@@ -16,6 +16,13 @@
 //!   capacity on any host) — where `cpus` is the fleet-share-DIVIDED
 //!   sizing root the daemon feeds ([`set_sizing_parallelism`], KD-MW-14
 //!   rung 3c). Idle threads exit after `IDLE_REAP`.
+//! * [`DedicatedWorker`] — ONE named OS thread with its own FIFO, for
+//!   liveness-class blocking work that must never queue behind the
+//!   pool's bulk population (the shared pool is FIFO: a heartbeat's
+//!   socket round trip submitted behind `cap` parked RPC round trips
+//!   waits for one of them to finish). Same job wrapper, same
+//!   [`RunBlocking`] future, so a caller chooses the venue and nothing
+//!   else changes.
 
 use std::collections::VecDeque;
 use std::future::Future;
@@ -200,13 +207,77 @@ where
     F: FnOnce() -> R + Send + 'static,
     R: Send + 'static,
 {
+    let (job, fut) = wrap_job(f);
+    submit(job);
+    fut
+}
+
+/// The one job wrapper both venues share: catch_unwind + the oneshot the
+/// awaiter parks on.
+fn wrap_job<F, R>(f: F) -> (Job, RunBlocking<R>)
+where
+    F: FnOnce() -> R + Send + 'static,
+    R: Send + 'static,
+{
     let (tx, rx) = crate::sqz_channel::oneshot::channel();
-    submit(Box::new(move || {
+    let job: Job = Box::new(move || {
         let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
         // A dead awaiter is fine — the result is dropped.
         let _ = tx.send(out);
-    }));
-    RunBlocking { rx }
+    });
+    (job, RunBlocking { rx })
+}
+
+/// One named OS thread with its own FIFO — a blocking venue the shared
+/// pool's population can never clog. The thread is spawned on first use
+/// and lives for the process (a dedicated venue exists because its work
+/// is a standing cadence, not a burst); a job that panics re-panics in
+/// its awaiter exactly like [`run_blocking`]'s.
+pub struct DedicatedWorker {
+    name: &'static str,
+    tx: OnceLock<std::sync::mpsc::Sender<Job>>,
+}
+
+impl DedicatedWorker {
+    /// Declare the venue; nothing is spawned until the first [`Self::run`].
+    pub const fn new(name: &'static str) -> Self {
+        Self {
+            name,
+            tx: OnceLock::new(),
+        }
+    }
+
+    fn sender(&self) -> &std::sync::mpsc::Sender<Job> {
+        self.tx.get_or_init(|| {
+            let (tx, rx) = std::sync::mpsc::channel::<Job>();
+            std::thread::Builder::new()
+                .name(self.name.to_string())
+                .spawn(move || {
+                    while let Ok(job) = rx.recv() {
+                        job();
+                    }
+                })
+                .expect("dedicated blocking thread spawns");
+            tx
+        })
+    }
+
+    /// Run `f` on this venue's thread and await its result.
+    pub fn run<F, R>(&self, f: F) -> RunBlocking<R>
+    where
+        F: FnOnce() -> R + Send + 'static,
+        R: Send + 'static,
+    {
+        let (job, fut) = wrap_job(f);
+        // The receiver lives as long as the thread, which lives as long as
+        // the process (a job panic is caught inside the wrapper). Should a
+        // send ever fail, the job runs inline so the awaiter still gets
+        // its result.
+        if let Err(std::sync::mpsc::SendError(job)) = self.sender().send(job) {
+            job();
+        }
+        fut
+    }
 }
 
 type PanicPayload = Box<dyn std::any::Any + Send + 'static>;
@@ -294,5 +365,38 @@ mod tests {
             block_on(run_blocking(|| panic!("job panicked")));
         });
         assert!(res.is_err(), "panic must reach the awaiter");
+    }
+
+    /// A dedicated venue runs on ITS named thread, in submission order,
+    /// and survives a job panic (which reaches the awaiter). The "never
+    /// queues behind the parked pool" half is the root suite's
+    /// `membership_renewal_isolation_tests` contract — parking the pool
+    /// here would race this module's other tests.
+    #[test]
+    fn dedicated_worker_is_fifo_on_its_own_thread_and_survives_a_panic() {
+        static LANE: DedicatedWorker = DedicatedWorker::new("sqz-test-lane");
+        let order = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut futs = Vec::new();
+        for i in 0..8u8 {
+            let order = Arc::clone(&order);
+            futs.push(LANE.run(move || {
+                order.lock().unwrap().push(i);
+                std::thread::current().name().map(str::to_string)
+            }));
+        }
+        for f in futs {
+            assert_eq!(block_on(f).as_deref(), Some("sqz-test-lane"));
+        }
+        assert_eq!(*order.lock().unwrap(), (0..8u8).collect::<Vec<_>>(), "FIFO");
+
+        let res = std::panic::catch_unwind(|| {
+            block_on(LANE.run(|| panic!("lane job panicked")));
+        });
+        assert!(res.is_err(), "a lane job's panic reaches its awaiter");
+        assert_eq!(
+            block_on(LANE.run(|| 9u8)),
+            9,
+            "the lane survives a job panic"
+        );
     }
 }

@@ -716,6 +716,47 @@ block a co-writer consumes costs its writers a full stop first.
 * The harvest verb, grain, exactly-once handout ledger, and
   quarantine-on-death (`note_lane_handouts` / `discharge_lane_handouts`)
   are untouched — this is a *when*, not a *what*.
+* **The refill arms' RPC economy — single-flight per allocator** (finding
+  15 phase B1, 2026-09-07,
+  `.benchmarks/2026-09-07-lane-harvest-single-flight.md`,
+  `SQUEEZEFS_ALLOC_LANE_HARVEST_SINGLE_FLIGHT`). Every arm above and the
+  ENOSPC path below it converge on ONE function, `harvest_lane_supply`,
+  and before this rung each caller of it was its own RPC: a co-writer
+  with N allocations parked under `BLOCK_FLUSH_LOCKS` issued N harvests
+  per 50 ms park slice, each a three-pass `execute_lane_harvest_aged` on
+  the authority (a free-set scan + sort, a `reclaim_drain`, a pressure
+  harvest), and on the fleet's file-per-proc phase that was 124,240 RPCs
+  in 9.5 min for 60,419 blocks — half of them empty — behind which the
+  members' membership renewals (the acknowledgements the grace ring waits
+  on) queued: `membership_renewals` 22/s → 1–12/s, the bound ageing to
+  11 s with every member's own ack ≤ 2.3 s, the ring holding 3,200
+  offsets, every lane starved, more parks, more empty harvests. Now the
+  function is a rendezvous (`HarvestFlight`, one per laned allocator —
+  per co-writer, per data volume, so two volumes are two flights): the
+  caller that wins the in-flight CAS issues the one RPC; every concurrent
+  caller registers on the flight's notify, re-reads its generation (the
+  enable-then-check ordering) and awaits THAT outcome, then retries its
+  own `try_allocate_block` against the refilled list
+  (`alloc_lane_harvest_coalesced`). A reply that came back EMPTY stamps
+  the supply witness generation it answered — `free_grace::
+  lane_supply_hint_gen()` (+1 per grant that reached this member, value
+  moved or not, lever or not) plus the allocator's owed-arrival count —
+  and while that witness has not moved a caller DECLINES without a wire
+  trip (`alloc_lane_harvest_declined_stale`): the authority has told this
+  mount nothing new, so a fresh empty answer is the answer. The next
+  grant ends the window for exactly one RPC, so the bound is the renewal
+  cadence (≤ 500 ms under an ask) — never a timer of the allocator's own
+  — and the pressure fence the ENOSPC retries drive at the authority
+  (finding 29) is still driven, once per grant per volume instead of N
+  times per slice. A joiner's wait is bounded by the park wall
+  (`pressure_park_wall_ms`), so no parked allocation waits longer than it
+  would have on its own RPC and the verdict's timing is unchanged; an RPC
+  FAILURE stamps no decline (it is not an answer). Latch-free: an
+  `AtomicBool` for the flight, generation words, the first-party
+  `sqz_notify::Notify` for the waiters; no lock across the RPC.
+  `alloc_lane_harvests` stays the RPC count, so `harvests + coalesced +
+  declined_stale` accounts for every would-be call; `0` is one RPC per
+  caller, the shipped shape verbatim (the fleet A/B control).
 
 **Effect**: the refill RTT and the release-batch quantum leave the writer's
 critical path entirely; the co-writer's funnel sees a fed free list instead

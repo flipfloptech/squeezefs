@@ -307,6 +307,62 @@ on the grant would make both exact and is the deferred form: `Grant` is
 `Copy` and travels through 40-odd sites, and the dry-volume rule reaches the
 same volume at the cost of at most one RPC per dry volume per renewal.
 
+### 4.2 The harvest verb's client-side discipline — single-flight per allocator
+
+The harvest verb (`HarvestLaneFree`, §9a) is a remote allocation funnel
+with a real cost on the authority — `execute_lane_harvest_aged` is three
+passes: the grace-ring head, a `reclaim_drain` + rescan, a pressure
+harvest, each around a free-set scan + sort — and until 2026-09-07 the
+co-writer issued it per CALLER: an exhausted `allocate_block`, every park
+slice of every `allocate_block_grace_bounded` retry (N parked writes
+under `BLOCK_FLUSH_LOCKS` = N RPCs per 50 ms), the placed allocation's
+failover, the ahead and pushed refill ticks. Finding 15 phase B1
+(`.benchmarks/2026-09-07-f15-day2-fleet-pair.md` §2) is what that costs
+at fleet scale: 124,240 harvest RPCs in 9.5 min for 60,419 blocks, half
+empty, and the authority's membership renewals — the liveness plane, the
+acknowledgements the grace ring waits on — queued behind them (22/s →
+1–12/s, the ring's bound ageing to 11 s with every member's own ack
+fresh), starving every lane further: a positive feedback.
+
+The discipline now (`SQUEEZEFS_ALLOC_LANE_HARVEST_SINGLE_FLIGHT`, default
+on; `.benchmarks/2026-09-07-lane-harvest-single-flight.md`):
+
+1. **One in-flight harvest per allocator** — per co-writer, per data
+   volume (`HarvestFlight` lives in the allocator's `LanePartition`, so a
+   two-volume co-writer runs two independent flights, and a solo /
+   authority allocator has none). The caller that wins the flight's CAS
+   issues the RPC; every concurrent caller registers on the flight's
+   `sqz_notify::Notify` BEFORE re-reading its completion generation (a
+   leader finishing between the failed CAS and the registration is caught
+   by the generation, one finishing later by the wake), awaits the same
+   outcome, and retries its own funnel against the refilled list
+   (`alloc_lane_harvest_coalesced`). No lock is held across the RPC.
+2. **A fresh empty reply declines re-issue.** The reply stamps the supply
+   witness generation it answered — `free_grace::lane_supply_hint_gen()`
+   (+1 per renewal grant that reached this member, whatever the value and
+   whatever `SQUEEZEFS_FREE_GRACE_LANE_PUSH` says about it; a nonzero
+   hint's wake is one of them) plus the allocator's owed-arrival count
+   (+1 per `note_owed_freed`). Until either moves, a caller takes `0`
+   without a wire trip (`alloc_lane_harvest_declined_stale`): the
+   authority has told this mount nothing new about its lane. The next
+   grant ends the window for exactly one RPC, so the bound is the renewal
+   cadence (≤ 500 ms under an ask) and never a timer of the allocator's
+   own; the finding-29 promise that the parked retries drive the
+   authority's pressure fence holds once per grant per volume. An RPC
+   FAILURE stamps nothing — it is not an answer.
+3. **No caller waits past the wall.** A joiner's wait is bounded by
+   `pressure_park_wall_ms`; past it the joiner takes its verdict with `0`
+   (its park refuses at the same wall it always did) and the leader's own
+   outcome is untouched. The ENOSPC verdict's timing is unchanged.
+
+`alloc_lane_harvests` stays the RPC count: `harvests + coalesced +
+declined_stale` accounts for every would-be call. The lever off is one RPC
+per caller, the shipped shape verbatim (the fleet A/B control). Contracts:
+`tests/mw_data_alloc_lane_tests.rs` §10; the park-side pins in
+`tests/cowriter_enospc_wedge_tests.rs` and
+`tests/cowriter_lane_placement_tests.rs` (contract 3b) each carry a
+lever-off twin.
+
 ---
 
 ## 5. The stranded-capacity bound

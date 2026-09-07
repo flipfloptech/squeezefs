@@ -913,6 +913,57 @@ pub fn set_rewrite_shadow(on: bool) {
     rewrite_shadow_cell().store(on, Ordering::Relaxed);
 }
 
+/// `SQUEEZEFS_REWRITE_SUPPLY_CLOSE` cell (default ON; `0` = the shipped
+/// KD-1.6/1.7 triggers only — the A/B lever for the fleet row). The
+/// supply-coupled epoch close on co-writer lanes (finding 15's
+/// parked-supply term, `.benchmarks/2026-09-07-rewrite-epoch-supply-close.md`).
+fn rewrite_supply_close_cell() -> &'static std::sync::atomic::AtomicBool {
+    static CELL: std::sync::OnceLock<std::sync::atomic::AtomicBool> = std::sync::OnceLock::new();
+    CELL.get_or_init(|| {
+        let on = crate::env_knobs::bool_knob("SQUEEZEFS_REWRITE_SUPPLY_CLOSE", true);
+        std::sync::atomic::AtomicBool::new(on)
+    })
+}
+
+/// Whether a co-writer's refill tick may close open rewrite epochs on the
+/// lane-supply signal.
+pub fn rewrite_supply_close_enabled() -> bool {
+    rewrite_supply_close_cell().load(Ordering::Relaxed)
+}
+
+/// Set the supply-close lever (tests / A-B acceptance runs).
+pub fn set_rewrite_supply_close(on: bool) {
+    rewrite_supply_close_cell().store(on, Ordering::Relaxed);
+}
+
+/// **The supply-coupled close's PLAN** (pure — the product's decision and
+/// the closed-loop model's, one function): given the lane's deficit in
+/// blocks and the open epochs as `(ino, parked blocks)`, the inos to close
+/// in order and the count left open. Largest parked count first (ties by
+/// ino), closing until the accumulated yield covers the deficit — the
+/// fewest publishes for the most supply. Every candidate yields ≥ 1, so
+/// the closes per tick are bounded by the deficit itself (≤ the
+/// watermark ≤ share/4): a storm would need that many distinct open
+/// epochs each parking a single block, the shape on which the un-shadowed
+/// path would already have published once per block. Epochs parking
+/// nothing are never candidates; a zero deficit closes nothing.
+pub fn supply_close_plan(deficit_blocks: u64, mut candidates: Vec<(u64, u64)>) -> (Vec<u64>, u64) {
+    candidates.retain(|&(_, parked)| parked > 0);
+    candidates.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    let mut close = Vec::new();
+    let mut yielded = 0u64;
+    let mut left = 0u64;
+    for (ino, parked) in candidates {
+        if yielded >= deficit_blocks {
+            left += 1;
+            continue;
+        }
+        close.push(ino);
+        yielded = yielded.saturating_add(parked);
+    }
+    (close, left)
+}
+
 /// Coarse monotonic milliseconds since process start (the epoch idle
 /// clock — the sweeper's input).
 fn epoch_coarse_ms() -> u64 {
@@ -13148,13 +13199,26 @@ impl DataRouter {
     ///   — bindings stay in RAM + registry; the next close trigger
     ///   retries).
     pub async fn close_rewrite_epoch(&self, ino: u64, fencing_token: u64) -> Result<bool> {
+        self.close_rewrite_epoch_counted(ino, fencing_token)
+            .await
+            .map(|closed| closed.is_some())
+    }
+
+    /// [`Self::close_rewrite_epoch`] returning `Some(parked A keys the
+    /// swap released)` when an epoch closed — the supply-coupled close's
+    /// yield instrument (`rewrite_shadow_supply_close_blocks`).
+    async fn close_rewrite_epoch_counted(
+        &self,
+        ino: u64,
+        fencing_token: u64,
+    ) -> Result<Option<u64>> {
         if self
             .inner
             .rewrite_epochs
             .read_sync(&ino, |_, _| ())
             .is_none()
         {
-            return Ok(false);
+            return Ok(None);
         }
         let map_guard = meta_lock_acquire(ino).await;
         // Resolve the entry WHILE the epoch is still registered (a cache
@@ -13164,7 +13228,7 @@ impl DataRouter {
             None => self.fetch_metadata_from_backend(ino).await?,
         };
         let Some((_, epoch)) = self.inner.rewrite_epochs.remove_sync(&ino) else {
-            return Ok(false);
+            return Ok(None);
         };
         // Finding 36: the close's frees follow the verdict of the publish
         // that COVERED the recorded bindings — this save's own on the
@@ -13255,12 +13319,13 @@ impl DataRouter {
                 // Finding 36 (half 2, the epoch face): a covering publish
                 // whose accounting was recomputed owns these device frees
                 // — local hygiene only, never a frame-derived free.
+                let released = deferred.len() as u64;
                 if owner_recomputed {
                     crate::cowriter::retire_displaced_locally(&self.backend_router, &deferred);
                 } else {
                     self.free_deferred_keys(deferred).await;
                 }
-                Ok(true)
+                Ok(Some(released))
             }
             Err(e @ SqueezefsError::WriterGuardFenced) => {
                 while epoch.displaced.pop().is_some() {}
@@ -13324,6 +13389,102 @@ impl DataRouter {
             }
         }
         closed
+    }
+
+    /// **The supply-coupled epoch close** (finding 15's parked-supply term
+    /// — `.benchmarks/2026-09-06-free-grace-term1-fleet.md` §3; the lever
+    /// `.benchmarks/2026-09-07-rewrite-epoch-supply-close.md`;
+    /// design-rewrite-program §5.3, the KD-1.7 amendment): a CO-WRITER's
+    /// refill tick found its lane `deficit_blocks` short of the watermark
+    /// (`rate × horizon` — one loop transit's consumption), so the parked
+    /// A keys of this mount's open epochs are injected into the recycle
+    /// loop NOW, while there is still headroom for them to come back.
+    /// KD-1.7's own early-close fires only after the `StorageFull`, and on
+    /// a co-writer the keys it frees do not return for one whole loop
+    /// transit (ship → grace ring → lane list → harvest RPC), so its
+    /// "retry once" finds nothing: structurally late on this posture.
+    ///
+    /// The close is [`Self::close_rewrite_epoch`] verbatim — one whole-tx
+    /// publish + the deferred frees under the §5.2 law — so every §5.6
+    /// crash window stays true; nothing new is durable. Largest epoch
+    /// first until the yield covers the deficit ([`supply_close_plan`]),
+    /// the rest left open and counted (`rewrite_shadow_supply_close_bounded`).
+    /// Never under the D0 fence (a fenced close is the W5 arm — the fence
+    /// tripwires own that story) and idempotent against the dismount's own
+    /// closes (the epoch registry's `remove_sync` under the meta lock).
+    /// Parked keys are counted mount-wide: each returns to the lane of the
+    /// volume it lives on. Returns the parked blocks released.
+    pub(crate) async fn supply_close_epochs(&self, deficit_blocks: u64) -> u64 {
+        if crate::data_custody::poisoned() {
+            return 0;
+        }
+        let bs = self.block_size.load(Ordering::Relaxed).max(1);
+        let mut candidates: Vec<(u64, u64)> = Vec::new();
+        self.inner.rewrite_epochs.iter_sync(|ino, e| {
+            candidates.push((*ino, e.parked_bytes.load(Ordering::Relaxed) / bs));
+            true
+        });
+        let (to_close, left) = supply_close_plan(deficit_blocks, candidates);
+        if to_close.is_empty() {
+            METRICS
+                .rewrite_shadow_supply_close_declined_no_parked
+                .fetch_add(1, Ordering::Relaxed);
+            return 0;
+        }
+        let mut released = 0u64;
+        for ino in to_close {
+            let token = self.inner.dlm.get_fencing_token_ino(ino);
+            match self.close_rewrite_epoch_counted(ino, token).await {
+                Ok(Some(n)) => {
+                    METRICS
+                        .rewrite_shadow_supply_closes
+                        .fetch_add(1, Ordering::Relaxed);
+                    METRICS
+                        .rewrite_shadow_supply_close_blocks
+                        .fetch_add(n, Ordering::Relaxed);
+                    released += n;
+                }
+                Ok(None) => {} // closed by another trigger meanwhile
+                Err(e) => {
+                    log::warn!(
+                        "supply-coupled rewrite epoch close for ino {ino} failed ({e:?}); \
+                         the epoch keeps its routine triggers"
+                    );
+                }
+            }
+        }
+        if left > 0 {
+            METRICS
+                .rewrite_shadow_supply_close_bounded
+                .fetch_add(left, Ordering::Relaxed);
+        }
+        released
+    }
+
+    /// Wire the supply-coupled close on every harvesting (co-writer) lane
+    /// this router allocates from — `cowriter::install_client_halves`
+    /// calls it right after the lane engagement. The allocator's setter
+    /// enforces the scope (a harvest sink must be installed), so an
+    /// authority's lane-0 allocators and every unpartitioned mount are
+    /// left exactly as shipped. The sink holds the router WEAKLY: the
+    /// allocator outlives nothing here, and a tick after teardown no-ops.
+    pub fn arm_rewrite_supply_close(&self) {
+        for alloc in self.backend_router.lane_allocators() {
+            let weak = std::sync::Arc::downgrade(&self.inner);
+            let sink: crate::data_alloc_lane::SupplyCloseSink =
+                std::sync::Arc::new(move |deficit_blocks: u64| {
+                    let weak = weak.clone();
+                    Box::pin(async move {
+                        let Some(inner) = weak.upgrade() else {
+                            return 0;
+                        };
+                        DataRouter { inner }
+                            .supply_close_epochs(deficit_blocks)
+                            .await
+                    })
+                });
+            alloc.set_lane_supply_close_sink(sink);
+        }
     }
 
     /// Arm the idle-close sweeper (KD-1.6, lazily on the first epoch —

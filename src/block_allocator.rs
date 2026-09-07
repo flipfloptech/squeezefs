@@ -411,6 +411,13 @@ struct LanePartition {
     /// on the authority (its own free list already carries lane-0's
     /// supply) and everywhere unpartitioned.
     harvest: std::sync::OnceLock<crate::data_alloc_lane::LaneHarvestSink>,
+    /// The supply-coupled rewrite-epoch close (finding 15's parked-supply
+    /// term, design-rewrite-program §5.3) — installed only where a
+    /// harvest sink is (a co-writer's lane): the refill tick closes the
+    /// mount's open epochs when this lane's reachable supply sits below
+    /// the watermark, so the parked A keys enter the recycle loop ahead
+    /// of the `StorageFull` instead of at the iteration boundary.
+    supply_close: std::sync::OnceLock<crate::data_alloc_lane::SupplyCloseSink>,
 }
 
 /// The `SQUEEZEFS_ALLOC_LANE_HARVEST_AHEAD` lever's latch (the free-grace
@@ -688,6 +695,7 @@ impl BlockAllocator {
             grain: crate::data_alloc_lane::reserve_grain_blocks(cap, part.writers()),
             sink: std::sync::OnceLock::new(),
             harvest: std::sync::OnceLock::new(),
+            supply_close: std::sync::OnceLock::new(),
         };
         let grain = installed.grain;
         if self.lanes.set(installed).is_err() {
@@ -748,6 +756,33 @@ impl BlockAllocator {
         if let Some(lanes) = self.lanes.get() {
             let _ = lanes.harvest.set(sink);
         }
+    }
+
+    /// Wire the supply-coupled rewrite-epoch close
+    /// ([`crate::routing::DataRouter::arm_rewrite_supply_close`]). Installs
+    /// ONLY on a harvesting (co-writer) lane and returns whether it did:
+    /// the authority's own lane and every unpartitioned mount keep the
+    /// shipped KD-1.6/1.7 triggers exactly — the scope is enforced here,
+    /// in one place, not at each caller.
+    pub fn set_lane_supply_close_sink(
+        &self,
+        sink: crate::data_alloc_lane::SupplyCloseSink,
+    ) -> bool {
+        let Some(lanes) = self.lanes.get() else {
+            return false;
+        };
+        if lanes.harvest.get().is_none() {
+            return false;
+        }
+        lanes.supply_close.set(sink).is_ok()
+    }
+
+    /// Whether a supply-coupled close is wired on this allocator (the
+    /// scope contract's instrument).
+    pub fn lane_supply_close_installed(&self) -> bool {
+        self.lanes
+            .get()
+            .is_some_and(|l| l.supply_close.get().is_some())
     }
 
     /// This mount's partition, `None` ⇔ unpartitioned (every mount today).
@@ -1969,13 +2004,63 @@ impl BlockAllocator {
     /// SAME harvest the ENOSPC arm runs (sink → adopt → hint deposit).
     pub async fn ahead_refill_tick(&self, now_ms: u64) -> u64 {
         self.sample_alloc_rate(now_ms);
-        if self.should_harvest_ahead().is_none() {
-            return 0;
+        let adopted = if self.should_harvest_ahead().is_some() {
+            crate::fuse_client::METRICS
+                .alloc_lane_ahead_harvests
+                .fetch_add(1, Ordering::Relaxed);
+            self.harvest_lane_supply().await
+        } else {
+            0
+        };
+        // After the harvest, so a grant that just restocked the lane reads
+        // as covered.
+        self.supply_close_tick().await;
+        adopted
+    }
+
+    /// **The supply-coupled epoch close's decision** (finding 15's
+    /// parked-supply term, design-rewrite-program §5.3 — the KD-1.7
+    /// early-close made AHEAD of the `StorageFull`): `Some(deficit)` when
+    /// the lever is on, this is a co-writer's lane with the close wired,
+    /// and the lane's reachable supply sits below the watermark — the same
+    /// `rate × horizon` threshold the ahead harvest fires on, i.e. the
+    /// blocks one loop transit consumes. The deficit `watermark −
+    /// reachable` is what the closes must yield to restore the lane to one
+    /// transit's cover (at exhaustion it IS the watermark), and it is the
+    /// per-tick bound: every close yields ≥ 1 block, so a tick never
+    /// publishes more epochs than blocks it is short (≤ share/4).
+    ///
+    /// `None` with `rewrite_shadow_supply_close_declined_covered` counted
+    /// when the lane covers its transit (a quiet writer's watermark decays
+    /// to 0 — nothing to protect); `None` uncounted when the lever is off
+    /// or the close is not wired (the shipped shape, byte-identical).
+    pub fn supply_close_deficit(&self) -> Option<u64> {
+        if !crate::routing::rewrite_supply_close_enabled() {
+            return None;
         }
-        crate::fuse_client::METRICS
-            .alloc_lane_ahead_harvests
-            .fetch_add(1, Ordering::Relaxed);
-        self.harvest_lane_supply().await
+        self.lanes.get()?.supply_close.get()?;
+        let watermark = self.harvest_watermark.load(Ordering::Relaxed);
+        let reachable = self.lane_reachable_blocks();
+        if watermark == 0 || reachable >= watermark {
+            crate::fuse_client::METRICS
+                .rewrite_shadow_supply_close_declined_covered
+                .fetch_add(1, Ordering::Relaxed);
+            return None;
+        }
+        Some(watermark - reachable)
+    }
+
+    /// Run the supply-coupled close for this tick's deficit (the sink
+    /// closes largest-first until the yield covers it). Returns the parked
+    /// blocks released; 0 = declined or nothing wired.
+    async fn supply_close_tick(&self) -> u64 {
+        let Some(deficit) = self.supply_close_deficit() else {
+            return 0;
+        };
+        let Some(sink) = self.lanes.get().and_then(|l| l.supply_close.get()) else {
+            return 0;
+        };
+        sink(deficit).await
     }
 
     /// **The PUSHED refill** (finding 15 term 2, the lane-push lever's
@@ -1991,16 +2076,19 @@ impl BlockAllocator {
         if self.lanes.get().and_then(|l| l.harvest.get()).is_none() {
             return 0;
         }
-        if !crate::free_grace::lane_push_wants_harvest(
+        let adopted = if crate::free_grace::lane_push_wants_harvest(
             crate::free_grace::lane_supply_hint(),
             self.lane_owed_blocks(),
         ) {
-            return 0;
-        }
-        crate::fuse_client::METRICS
-            .alloc_lane_pushed_harvests
-            .fetch_add(1, Ordering::Relaxed);
-        self.harvest_lane_supply().await
+            crate::fuse_client::METRICS
+                .alloc_lane_pushed_harvests
+                .fetch_add(1, Ordering::Relaxed);
+            self.harvest_lane_supply().await
+        } else {
+            0
+        };
+        self.supply_close_tick().await;
+        adopted
     }
 
     /// **The lane free harvest** (rung 10): when this mount's lane is

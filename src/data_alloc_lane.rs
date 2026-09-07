@@ -524,6 +524,17 @@ pub type LaneHarvestSink = Arc<
         + Sync,
 >;
 
+/// The supply-coupled rewrite-epoch CLOSE sink (finding 15's parked-supply
+/// term — `crate::routing::DataRouter::arm_rewrite_supply_close` installs
+/// it on a co-writer's harvesting allocators): `deficit blocks` → the
+/// parked A keys the closes released into the recycle loop. Boxed async
+/// closure like [`LaneHarvestSink`], for the same reason — the allocator
+/// must not learn the router's epoch types, and the closes (publishes)
+/// are awaited on the refill tick, never on an allocation.
+pub type SupplyCloseSink = Arc<
+    dyn Fn(u64) -> std::pin::Pin<Box<dyn std::future::Future<Output = u64> + Send>> + Send + Sync,
+>;
+
 /// The production HARVEST sink (co-writer engagements only —
 /// [`crate::alloc_lane_grant::engage_allocator_lane`] wires it beside the
 /// reserve sink): ship one `HarvestLaneFree` verb under the CURRENT lease

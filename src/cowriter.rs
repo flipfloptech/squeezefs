@@ -1375,6 +1375,13 @@ pub(crate) async fn install_client_halves(
             lane.writer_id(),
             lane.writers()
         )));
+    } else {
+        // Finding 15's parked-supply term: a client posture's displaced A
+        // keys return only through the recycle loop, so its refill tick
+        // may close open rewrite epochs on the lane-supply signal
+        // (design-rewrite-program §5.3). Installs on the harvesting lanes
+        // just engaged — nothing on a solo lease.
+        router.arm_rewrite_supply_close();
     }
 
     spawn_custody_renewal(Arc::clone(&client), Arc::clone(stop));

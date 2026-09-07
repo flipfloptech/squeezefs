@@ -106,6 +106,19 @@ mount (the A-arm rig reset the cluster; remount is part of every arm).
    per fpp phase (the own-lane-untracked lineage). Sequence 2 (C-B-B-C +
    six lever legs) running on the box; the overlay ENOSPC-convergence
    flake (pre-existing, ~3–7 % order-dependent) under a subagent.
+1f. **squeeze-test sequence 2 (`.benchmarks/2026-09-07-f15-b1-squeeze-test-seq2.md`):**
+   C `886d4e31` passes the FULL four-phase matrix in both C positions
+   (1C: 3,497/2,324/2,301/2,842; 4C: 3,538/2,361/2,236/3,003 MiB/s), B
+   `b119ef78` passes A1 and fails B1 in both B positions; stale refusals
+   0, tripwires 0 everywhere. Lever legs: LANE_PLACEMENT load-bearing (A1
+   FAILS without it); SUPPLY_CLOSE and CAUGHT_UP_RELAX pay (−19…−24 % /
+   −21 % on the affected phases, 5–10× the refusals without them);
+   REFILL_HINT / SINGLE_FLIGHT / RENEW_LANE throughput-par (refusal / RPC
+   economy). Row 8C degenerate (probe on a busy box — the wrapper now
+   settles first). Residues: `block_claim_anomalies` 1.2–1.4k per fpp
+   phase; fpp lane-ENOSPC 7–16k per phase. Overlay ENOSPC-convergence
+   flake FIXED (`2a456a62`, a real trim-claim-window race); gate on
+   `2a456a62` running.
 2. **Kernel A/B, B arm** — after `squeeze-test` boots the 6.19.14 series
    WITH 0031 (or whichever box carries the patched kernel): on the box,
    `cd /scratch/tmp/sqz-agent/k26 && sudo env ARM=B KERNEL_TAG=<uname -r

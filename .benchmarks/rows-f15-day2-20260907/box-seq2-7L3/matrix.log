@@ -1,0 +1,22 @@
+[mwmatrix] s11-mpiio: 8 co-writer mounts x 4 procs = 32 ranks, ONE shared file, 4 MiB-aligned block-cyclic segments (ior 4.0.0 POSIX MPMD, -G 217893364); baseline = -F file-per-proc, SAME fleet/geometry; A-B-B-A
+[mwmatrix] instrument: ior 4.0.0 (sha256 510b7d4ad0f287375848121aa5a1f9842db077c1d81ad0dde738e96255298158) + mpirun (Open MPI) 4.1.5a1; substrate: tcp devsub (nvmet-tcp localhost)
+[mwmatrix] self-sizer wanted 71424 MiB — CAPPED to 10240 MiB (s=80): the 10 GiB zram-budget clamp (the indirect domain COMPOSES now — the rung-20 blob-aware owner-side merge; this cap is substrate budget, not a correctness boundary). Iteration ceiling raised to 128 to preserve the sustained window.
+[mwmatrix] probe: 3249.91 MiB/s aggregate -> file 10240 MiB (s=80), 24 iterations/phase (sustained window sized >=60 s + >=3 steady iterations)
+[mwmatrix] phase A1 (shared): steady 3607.4 MiB/s over 73s wall (iters: 4301 4772 3935 3776 3549.69 3151.55 3656 3264.28 3644 3733 3107.92 3556.89 3745 3359.26 3422.25 3772 3066.67 3328.04 3726 3670 3905 3780 3656 3393.60 )
+[mwmatrix] phase B1 (fpp): steady 2445.4 MiB/s over 105s wall (iters: 3368.90 3382.23 2872.65 2334.16 2212.39 2328.83 2228.37 2393.89 2449.99 2405.61 2326.94 2343.13 2323.66 2650.92 2354.04 2419.32 2330.99 2675.68 2231.56 2537.06 2473.65 2116.25 2434.92 2417.79 )
+[mwmatrix] phase B2 (fpp): steady 2342.2 MiB/s over 110s wall (iters: 2564.37 2320.80 2246.44 2482.76 2556.55 2137.39 2463.78 2445.34 2518.96 2080.76 2263.17 2237.40 2448.26 2191.70 2582.89 2208.38 2215.69 2674.58 2305.61 2150.98 2510.99 2276.71 2171.33 2380.87 )
+[mwmatrix] phase A2 (shared): steady 3067.1 MiB/s over 85s wall (iters: 4816 2691.40 2875.14 2799.42 3368.74 3066.63 2536.74 3517.99 2781.53 3146.28 3007.43 3144.13 3362.89 3467.93 3050.29 3268.88 3181.29 3078.02 3361.92 3095.58 2596.30 3589.52 2893.92 2660.44 )
+A-B-B-A: shared 3607 / disjoint 2445 = 1.475; shared 3067 / disjoint 2342 = 1.309
+S11 MPI-IO GATE: shared >= 0.8x disjoint in BOTH brackets (min 1.309)
+m50: ranged acquires+extensions d=26894 publish shipped d=146190
+m51: ranged acquires+extensions d=26712 publish shipped d=146101
+m52: ranged acquires+extensions d=26784 publish shipped d=145416
+m53: ranged acquires+extensions d=26948 publish shipped d=145463
+m54: ranged acquires+extensions d=26788 publish shipped d=145792
+m55: ranged acquires+extensions d=26544 publish shipped d=145409
+m56: ranged acquires+extensions d=26950 publish shipped d=145260
+m57: ranged acquires+extensions d=26600 publish shipped d=146005
+authority: grants d=52545 cap_refusals d=0 demotions d=0 conflicts d=0 desired_trims d=412 prs d=0 ors d=0
+S11 MPI-IO engagement GREEN (ranged engaged on every mount, Issue-19 column 0, zero fabricated sharing)
+[mwmatrix] read-back exact: 61991 MiB/s aggregate reorder-read, zero data-check errors
+[mwmatrix] s11-mpiio GREEN — the MPI-IO acceptance row (outputs + snapshots + fsck in /run/squeezefs-mwfleet/rows/s11mpiio-1788804252). Evidence tier: measured-simulated (one box, co-located members)

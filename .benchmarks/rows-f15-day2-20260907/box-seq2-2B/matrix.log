@@ -1,0 +1,7 @@
+[mwmatrix] s11-mpiio: 8 co-writer mounts x 4 procs = 32 ranks, ONE shared file, 4 MiB-aligned block-cyclic segments (ior 4.0.0 POSIX MPMD, -G 589706275); baseline = -F file-per-proc, SAME fleet/geometry; A-B-B-A
+[mwmatrix] instrument: ior 4.0.0 (sha256 510b7d4ad0f287375848121aa5a1f9842db077c1d81ad0dde738e96255298158) + mpirun (Open MPI) 4.1.5a1; substrate: tcp devsub (nvmet-tcp localhost)
+[mwmatrix] self-sizer wanted 53248 MiB — CAPPED to 10240 MiB (s=80): the 10 GiB zram-budget clamp (the indirect domain COMPOSES now — the rung-20 blob-aware owner-side merge; this cap is substrate budget, not a correctness boundary). Iteration ceiling raised to 128 to preserve the sustained window.
+[mwmatrix] probe: 2422.83 MiB/s aggregate -> file 10240 MiB (s=80), 18 iterations/phase (sustained window sized >=60 s + >=3 steady iterations)
+[mwmatrix] phase A1 (shared): steady 3419.0 MiB/s over 59s wall (iters: 4029 4320 2110.10 3455.91 3408.03 3919 3456.65 3516.85 3316.23 3530.21 3170.90 3231.54 3710 3485.42 3233.74 3270.07 3771 3218.18 )
+phase B1: NOT SUSTAINED — the last third's mean decays 2363 -> 1045 MiB/s (> 30%): a burst number that decays is a FAILED row
+[mwmatrix] ERROR: s11-mpiio: phase B1 failed the sustained-window gate

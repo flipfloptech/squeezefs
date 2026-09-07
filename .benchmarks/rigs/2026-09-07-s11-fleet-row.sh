@@ -22,6 +22,21 @@ SAMPLE_INTERVAL=${SAMPLE_INTERVAL:-1}
 MNT_ROOT=${SQZ_MWFLEET_MNT_ROOT:-/mnt/sqz-mwfleet}
 export SQZ_MWFLEET_MNT_ROOT="$MNT_ROOT"
 mkdir -p "$KEEP/samples"
+# Settle before the row: the matrix sizes its phases from a short probe
+# (file size + iterations from the probe's MiB/s), and a probe taken while
+# the previous row's teardown is still settling under-sizes the row (box
+# row 8C, 2026-09-07: probe 299 MiB/s ⇒ 5 iterations of 6.5 GiB, 12 s
+# phases — a degenerate control). Wait for the 1-minute load to fall
+# below a quarter of the CPUs, bounded by SETTLE_MAX_S (default 180).
+SETTLE_MAX_S=${SETTLE_MAX_S:-180}
+cpus=$(nproc); t0=$(date +%s)
+while :; do
+    load1=$(cut -d' ' -f1 /proc/loadavg)
+    awk -v l="$load1" -v c="$cpus" 'BEGIN{exit !(l*4 < c)}' && break
+    [ $(( $(date +%s) - t0 )) -ge "$SETTLE_MAX_S" ] && { echo "== settle: load $load1 after ${SETTLE_MAX_S}s — proceeding (row header carries the load)"; break; }
+    sleep 5
+done
+echo "== $(date +%T) settled: load=$(cut -d' ' -f1-3 /proc/loadavg) (waited $(( $(date +%s) - t0 ))s)"
 echo "== $(date +%T) fleet create host=$(hostname) kernel=$(uname -r) load=$(cut -d' ' -f1-3 /proc/loadavg) cpus=$(nproc) env=[${LEVERS:-default}] bin=${SQZ_BIN:-target/release/squeezefs} oss_gb=${SQZ_MWFLEET_OSS_GB:-32} mnt=$MNT_ROOT"
 SQZ_MWFLEET_OSS_GB=${SQZ_MWFLEET_OSS_GB:-32} SQZ_MWFLEET_RANGE_CUSTODY=${SQZ_MWFLEET_RANGE_CUSTODY:-1} \
     tests/mw_fleet.sh create N=1 --cowriters=8 2>&1 | tail -n 3

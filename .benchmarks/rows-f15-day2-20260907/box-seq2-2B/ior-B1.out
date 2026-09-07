@@ -1,0 +1,93 @@
+IOR-4.0.0: MPI Coordinated Test of Parallel I/O
+Began               : Mon Sep  7 17:25:47 2026
+Command line        : /scratch/tmp/sqz-agent/src-1.2/target/mw-ior/ior-4.0.0/src/ior -a POSIX -b 4m -t 4m -s 80 -w -e -k -E -G 589706275 -i 18 -F -o /scratch/tmp/sqz-agent/mwfleet-mnt/m50/s11-mpiio-fpp.dat
+Machine             : Linux memp-s3ds-aqs-37
+TestID              : 0
+StartTime           : Mon Sep  7 17:25:47 2026
+Path                : /scratch/tmp/sqz-agent/mwfleet-mnt/m50/s11-mpiio-fpp.dat.00000000
+FS                  : 64.0 GiB   Used FS: 98.1%   Inodes: 1.0 Mi   Used Inodes: 0.0%
+
+Options: 
+api                 : POSIX
+apiVersion          : 
+test filename       : /scratch/tmp/sqz-agent/mwfleet-mnt/m50/s11-mpiio-fpp.dat
+access              : file-per-process
+type                : independent
+segments            : 80
+ordering in a file  : sequential
+ordering inter file : no tasks offsets
+nodes               : 1
+tasks               : 32
+clients per node    : 32
+repetitions         : 18
+xfersize            : 4 MiB
+blocksize           : 4 MiB
+aggregate filesize  : 10 GiB
+
+Results: 
+
+access    bw(MiB/s)  IOPS       Latency(s)  block(KiB) xfer(KiB)  open(s)    wr/rd(s)   close(s)   total(s)   iter
+------    ---------  ----       ----------  ---------- ---------  --------   --------   --------   --------   ----
+write     3326.25    832.45     3.07        4096       4096       0.010675   3.08       1.64       3.08       0   
+WARNING: fsync(47) failed
+WARNING: fsync(67) failed
+WARNING: fsync(41) failed
+WARNING: fsync(139) failed
+write     1209.60    302.50     8.18        4096       4096       0.000283   8.46       7.16       8.47       1   
+WARNING: fsync(139) failed
+write     3460.94    865.30     2.68        4096       4096       0.000573   2.96       1.51       2.96       2   
+WARNING: fsync(139) failed
+write     2500.74    625.22     2.92        4096       4096       0.000242   4.09       2.14       4.09       3   
+WARNING: fsync(139) failed
+write     2701.24    675.44     3.57        4096       4096       0.000260   3.79       1.20       3.79       4   
+WARNING: fsync(139) failed
+write     1942.70    485.70     5.26        4096       4096       0.000416   5.27       2.16       5.27       5   
+WARNING: fsync(139) failed
+write     2290.42    572.64     2.90        4096       4096       0.000396   4.47       1.86       4.47       6   
+WARNING: fsync(139) failed
+write     2494.82    623.75     3.80        4096       4096       0.007435   4.10       1.03       4.10       7   
+WARNING: fsync(139) failed
+write     2497.13    624.31     3.35        4096       4096       0.000647   4.10       1.12       4.10       8   
+WARNING: fsync(139) failed
+WARNING: fsync(169) failed
+write     2293.23    573.33     4.10        4096       4096       0.000279   4.47       1.15       4.47       9   
+WARNING: fsync(169) failed
+WARNING: fsync(139) failed
+write     2472.49    618.17     3.73        4096       4096       0.000269   4.14       1.70       4.14       10  
+WARNING: fsync(169) failed
+WARNING: fsync(139) failed
+write     2202.42    550.93     3.53        4096       4096       0.000601   4.65       1.53       4.65       11  
+WARNING: fsync(169) failed
+WARNING: fsync(139) failed
+write     2247.56    561.92     3.91        4096       4096       0.001094   4.56       1.58       4.56       12  
+WARNING: fsync(40) failed
+WARNING: fsync(169) failed
+WARNING: fsync(139) failed
+write     2519.88    630.05     4.01        4096       4096       0.000366   4.06       1.56       4.06       13  
+WARNING: fsync(139) failed
+WARNING: fsync(157) failed
+WARNING: fsync(169) failed
+write     2220.92    555.26     4.10        4096       4096       0.002584   4.61       1.26       4.61       14  
+WARNING: fsync(169) failed
+WARNING: fsync(139) failed
+WARNING: fsync(157) failed
+WARNING: fsync(131) failed
+write     160.30     40.65      3.53        4096       4096       0.000416   62.98      60.85      63.88      15  
+WARNING: fsync(139) failed
+WARNING: fsync(169) failed
+WARNING: fsync(158) failed
+WARNING: fsync(151) failed
+WARNING: fsync(152) failed
+WARNING: fsync(162) failed
+WARNING: fsync(93) failed
+WARNING: fsync(157) failed
+write     161.05     40.26      1.87        4096       4096       0.000418   63.58      61.94      63.58      16  
+WARNING: fsync(169) failed
+WARNING: fsync(139) failed
+WARNING: fsync(157) failed
+write     161.37     40.34      1.74        4096       4096       0.000280   63.46      62.31      63.46      17  
+
+Summary of all tests:
+Operation   Max(MiB)   Min(MiB)  Mean(MiB)     StdDev   Max(OPs)   Min(OPs)  Mean(OPs)     StdDev    Mean(s) Stonewall(s) Stonewall(MiB) Test# #Tasks tPN reps fPP reord reordoff reordrand seed segcnt   blksiz    xsize aggs(MiB)   API RefNum
+write        3460.94     160.30    2047.95     962.52     865.24      40.08     511.99     240.63   14.31885         NA            NA     0     32  32   18   1     0        1         0    0     80  4194304  4194304   10240.0 POSIX      0
+Finished            : Mon Sep  7 17:30:06 2026

@@ -119,6 +119,13 @@ mount (the A-arm rig reset the cluster; remount is part of every arm).
    phase; fpp lane-ENOSPC 7–16k per phase. Overlay ENOSPC-convergence
    flake FIXED (`2a456a62`, a real trim-claim-window race); gate on
    `2a456a62` running.
+   **Gate on the trim-window tip — GREEN on `2a456a62`** (14:53–15:43,
+   pinned worktree, from zero, laptop idle: 362 suites / **4,782 tests**,
+   18 stages, both audits). Its first launch went red on the C-2
+   structural timing contract because my overlay-suite loop ran beside it
+   — the standing "no measurement beside a gate" hazard, not the code.
+   Every code landing of 2026-09-06/07 is now gated; the tip is
+   releasable as 1.2.2.
 2. **Kernel A/B, B arm** — after `squeeze-test` boots the 6.19.14 series
    WITH 0031 (or whichever box carries the patched kernel): on the box,
    `cd /scratch/tmp/sqz-agent/k26 && sudo env ARM=B KERNEL_TAG=<uname -r

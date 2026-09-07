@@ -1906,15 +1906,23 @@ async fn the_lever_off_issues_one_rpc_per_caller() {
             }
         }
     }
+    // The lever-off law is about the RPC COUNT (one per caller — below),
+    // not about refusing: the RPC that drained the grain feeds its caller
+    // and the N−1 empty replies used to refuse theirs while the rest of the
+    // grain sat on the local list — until the ENOSPC arm re-checked the
+    // list before its verdict (the trim-claim-window park,
+    // `.benchmarks/2026-09-07-overlay-enospc-convergence-flake.md`): a
+    // refusal with supply on the local list is never correct, so every
+    // caller is fed from the one grain.
     assert_eq!(
         (fed, refused),
-        (1, N - 1),
-        "the shipped shape: the RPC that drained the grain feeds its caller; the N−1 empty \
-         replies refuse theirs"
+        (N, 0),
+        "every caller is fed from the grain the first RPC drained; none refuses with \
+         supply on the local list"
     );
     assert_eq!(
         a.lane_reachable_blocks(),
-        held.len() as u64 - 1,
+        held.len() as u64 - N as u64,
         "…while the rest of the grain sits on the local list"
     );
     let g1 = flight_gauges();

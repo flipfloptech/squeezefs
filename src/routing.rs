@@ -8229,7 +8229,7 @@ impl DataRouter {
             .try_into()
             .expect("clamped to u32 range");
         let ref_for = |key: &str, idx: u32| self.backend_router.block_ref_for(key, ino, idx);
-        let outcome = match crate::meta_ship::publish::migrate_block_map(
+        let (outcome, owner_freed) = match crate::meta_ship::publish::migrate_block_map(
             backend,
             ino,
             &bytes,
@@ -8265,6 +8265,10 @@ impl DataRouter {
         if is_publish {
             publish_phase_record(PublishPhase::MetaCommit, t_commit);
         }
+        // Schema 15: the owner named what its train's recompute freed —
+        // the parked predecessors' local hygiene runs NOW (see
+        // `retire_recomputed_parked`), not at the epoch close.
+        self.retire_recomputed_parked(ino, &owner_freed);
         METRICS
             .map_migrate_records
             .fetch_add(outcome.records, Ordering::Relaxed);
@@ -8997,12 +9001,15 @@ impl DataRouter {
             )
             .await
             {
-                Ok((used, staged_version, recomputed, released)) => {
+                Ok((used, staged_version, verdict, released)) => {
                     // Finding 36: this publish's accounting was
                     // RECOMPUTED — the caller's frame-derived stream
                     // stands down; a LOCAL recompute's released set
-                    // travels up for the post-guard free (finding 36b).
-                    owner_recomputed = recomputed;
+                    // travels up for the post-guard free (finding 36b);
+                    // a SHIPPED recompute's freed offsets (schema 15)
+                    // retire the parked predecessors' local tracking now.
+                    owner_recomputed = verdict.recomputed;
+                    self.retire_recomputed_parked(ino, &verdict.freed);
                     local_released = released;
                     // Rung 17: on a CHAINED target the OWNER re-minted the
                     // staged link — the reply's version is the provenance
@@ -9038,8 +9045,13 @@ impl DataRouter {
                 // Finding 36b: the OWNER's custody-scoped compose
                 // recomputed this Put's accounting and owns its displaced
                 // device frees — the caller's frame-derived stream stands
-                // down (the s11-mpiio field arm).
-                Ok(recomputed) => owner_recomputed = recomputed,
+                // down (the s11-mpiio field arm), and the offsets the
+                // owner free-listed (schema 15) retire their parked
+                // keys' local tracking at this reply.
+                Ok(verdict) => {
+                    owner_recomputed = verdict.recomputed;
+                    self.retire_recomputed_parked(ino, &verdict.freed);
+                }
                 Err(e) => {
                     self.note_block_ref_ops(ino, refs);
                     self.reset_layout_provenance(ino);
@@ -13477,6 +13489,76 @@ impl DataRouter {
         self.close_rewrite_epoch_counted(ino, fencing_token)
             .await
             .map(|closed| closed.is_some())
+    }
+
+    /// **The recompute arm's local hygiene, at the covering publish**
+    /// (`.benchmarks/2026-09-07-cowriter-claim-anomaly-lineage.md`): a
+    /// served layout publish that COVERED this ino's open rewrite epoch
+    /// (any save ships the current RAM map, which no longer names the
+    /// parked predecessors) came back with the offsets the owner's
+    /// recompute ladder free-listed (`freed`, publish schema 15). Every
+    /// parked key naming one of them leaves the park NOW and retires its
+    /// local tracking under the `Freed`-verdict discipline
+    /// (`retire_shipped_free_tracking`: refcount entry gone, incarnation
+    /// word retired and republished under a new generation, read tiers
+    /// purged) — the same act `ship_displaced_frees` performs at an
+    /// explicit free's `Freed` reply. Before this, the parked keys waited
+    /// for the epoch CLOSE (`retire_displaced_locally` on `epoch.displaced`),
+    /// and on the fleet the authority's grace ring → the lane harvest → the
+    /// claim beat the close: `claim_block_idx` found the entry lingering
+    /// (`block_claim_anomalies`, 1,156–1,402 per fpp phase Σ 8 co-writers,
+    /// ~1 % of every recompute-freed block, `free_shipped_blocks` flat).
+    ///
+    /// The inverse guard (a lifetime, never an offset): a parked key whose
+    /// stamp is no longer the offset's LIVE incarnation names a lifetime
+    /// this mount has already re-minted (the harvest beat a delayed reply)
+    /// — the live owner's entry and word are untouched, and the dead key
+    /// leaves the park uncounted (its close-time free would have refused
+    /// on the dead incarnation anyway). Keys the owner did not free stay
+    /// parked for the close, so a NonTerminal / refused / out-of-custody
+    /// predecessor keeps the close's existing arm verbatim.
+    ///
+    /// Runs under the caller's held `INODE_META_LOCKS(ino)` (every save
+    /// body does) — the same lock every shadow record parks under, so the
+    /// pop/re-push walk sees a stable park. No device I/O, no free list:
+    /// hygiene only. Leaving the park also un-counts the key from the
+    /// supply-coupled close's yield estimate (`parked_bytes`), which had
+    /// been counting blocks the authority already held free. A no-op on
+    /// an empty `freed` (every local arm, every un-recomputed reply) and
+    /// on an ino with no open epoch (the close removed it before its own
+    /// save; its `deferred` list keeps the close-time arm).
+    pub(crate) fn retire_recomputed_parked(
+        &self,
+        ino: u64,
+        freed: &[crate::meta_ship::publish::WireFreedBlock],
+    ) {
+        if freed.is_empty() {
+            return;
+        }
+        let Some(epoch) = self.inner.rewrite_epochs.read_sync(&ino, |_, e| e.clone()) else {
+            return;
+        };
+        let mut parked: Vec<String> = Vec::new();
+        while let Some(k) = epoch.displaced.pop() {
+            parked.push(k);
+        }
+        if parked.is_empty() {
+            return;
+        }
+        let bs = self.block_size.load(Ordering::Relaxed);
+        let mut left_park = 0u64;
+        for key in parked {
+            match crate::cowriter::retire_recomputed_parked_key(&self.backend_router, &key, freed) {
+                crate::cowriter::RecomputedRetire::Kept => epoch.displaced.push(key),
+                crate::cowriter::RecomputedRetire::Retired
+                | crate::cowriter::RecomputedRetire::DeadLifetime => left_park += 1,
+            }
+        }
+        if left_park > 0 {
+            let bytes = left_park.saturating_mul(bs);
+            crate::gauge_core::sub_saturating(&epoch.parked_bytes, bytes);
+            crate::gauge_core::sub_saturating(&METRICS.rewrite_shadow_parked_bytes, bytes);
+        }
     }
 
     /// [`Self::close_rewrite_epoch`] returning `Some(parked A keys the

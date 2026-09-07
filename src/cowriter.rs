@@ -1580,6 +1580,79 @@ const FREE_SHIP_ATTEMPTS: u32 = 3;
 /// commands, no accounting: a frame key whose free already ran (the
 /// skewed-frame shape) simply has nothing left to purge, instead of coming
 /// back `Refused` on the authority's untracked tripwire.
+/// One parked key's verdict under
+/// `DataRouter::retire_recomputed_parked`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecomputedRetire {
+    /// The owner did not free this key's block (or the key is not this
+    /// router's) — it stays parked for the epoch close's arm.
+    Kept,
+    /// The key's lifetime is the offset's LIVE one and the owner freed the
+    /// block: local tracking retired (`cowriter.recomputed_retires`).
+    Retired,
+    /// The owner freed the block, but this mount has since RE-MINTED the
+    /// offset (the harvest beat the reply): the key names a dead lifetime —
+    /// the live owner's entry and word are untouched, the key is dropped.
+    DeadLifetime,
+}
+
+/// The per-key act of `DataRouter::retire_recomputed_parked`
+/// (the recompute arm's local hygiene at the covering publish): resolve the
+/// parked key against this router's allocator, match its `(vol_tag,
+/// block_idx)` against the owner's `freed` set, guard the LIFETIME (a key
+/// whose stamp is not the offset's live incarnation names a lifetime this
+/// mount already re-minted — the anomaly's inverse, touched by nobody), and
+/// retire under the `Freed`-verdict discipline of [`ship_displaced_frees`]:
+/// read tiers purged, [`crate::block_allocator::BlockAllocator::
+/// retire_shipped_free_tracking`] (entry gone, word retired and republished
+/// under a new generation). Unstamped keys (`INCARNATION_NONE`) retire on
+/// the match alone, exactly as [`retire_displaced_locally`] does.
+pub fn retire_recomputed_parked_key(
+    router: &crate::routing::BackendRouter,
+    key: &str,
+    freed: &[crate::meta_ship::publish::WireFreedBlock],
+) -> RecomputedRetire {
+    let cleaned = crate::routing::clean_block_key(key);
+    let Ok(parts) = router.parse_block_key_parts(&cleaned) else {
+        return RecomputedRetire::Kept;
+    };
+    let Some(alloc) = router.allocator_for_be_id(&parts.be_id) else {
+        return RecomputedRetire::Kept;
+    };
+    let vol_tag = crate::meta_backend::kv::block_refs::volume_tag(alloc.volume_id());
+    let block_idx = parts.offset / alloc.chunk_size().max(1);
+    if !freed
+        .iter()
+        .any(|f| f.vol_tag == vol_tag && f.block_idx == block_idx)
+    {
+        return RecomputedRetire::Kept;
+    }
+    if parts.incarnation != crate::routing::INCARNATION_NONE {
+        let live = alloc.live_incarnation(parts.offset);
+        if live != crate::routing::INCARNATION_NONE && live != parts.incarnation {
+            log::debug!(
+                "co-writer recompute retire: parked key '{cleaned}' names a dead lifetime of \
+                 offset {} (live {live:#x}) — the offset was re-minted here before the owner's \
+                 reply; the live lifetime is untouched",
+                parts.offset
+            );
+            return RecomputedRetire::DeadLifetime;
+        }
+    }
+    // A foreign-lane predecessor (a peer's mint this rewrite displaced) is
+    // untracked here by construction: its word still retires (the explicit
+    // arm's act, verbatim), but only an entry that existed is COUNTED.
+    let tracked = alloc.refcount(parts.offset).is_some();
+    router.purge_read_tiers(&cleaned);
+    alloc.retire_shipped_free_tracking(parts.offset);
+    if tracked {
+        crate::fuse_client::METRICS
+            .cowriter_recomputed_retires
+            .fetch_add(1, Ordering::Relaxed);
+    }
+    RecomputedRetire::Retired
+}
+
 pub fn retire_displaced_locally(router: &crate::routing::BackendRouter, block_keys: &[String]) {
     for key in block_keys {
         let cleaned = crate::routing::clean_block_key(key);

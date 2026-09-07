@@ -216,7 +216,21 @@ use std::sync::Arc;
 /// 13-speaker cannot decode the widened reply — the mismatch refuses loud
 /// at the first frame (KD-7 same-commit fleets), the schema-8 posture
 /// verbatim.
-pub const PUBLISH_SCHEMA: u32 = 14;
+///
+/// **15 since the recompute replies carry the authority's FREED offsets**
+/// (`.benchmarks/2026-09-07-cowriter-claim-anomaly-lineage.md`):
+/// [`PublishReply::PutDone`], [`PublishReply::DeltaUsed`] and
+/// [`PublishReply::MapMigrated`] gained `freed` — per served publish, the
+/// `(vol_tag, block_idx)` of every block the owner's recompute ladder
+/// answered `Freed` (the `MapMigrated` count became the list). Schemas
+/// 9/10/12 told the co-writer to stand its frame-derived frees DOWN but
+/// never WHICH offsets the authority had free-listed, so a parked
+/// rewrite-epoch predecessor's local tracking waited for the epoch CLOSE
+/// — and on the fleet the grace ring → lane harvest → claim loop beat the
+/// close (`block_claim_anomalies`, ~1 % of every recompute-freed block).
+/// A 14-speaker would read the widened reply as nothing freed and keep the
+/// lineage — the mismatch refuses loud at the first frame instead.
+pub const PUBLISH_SCHEMA: u32 = 15;
 
 /// First verb of S9's publish block. S3's ping is 0, S8's metadata verbs
 /// are 16/17, S6's membership owns `0x0100..=0x01FF`, S9's custody
@@ -290,6 +304,29 @@ impl From<WireBlockRefOp> for BlockRefOp {
             BlockRefOp::released(reference)
         }
     }
+}
+
+/// One device block the owner's recompute ladder answered `Freed` for
+/// (schema 15) — the durable identity (KD-5's `vol_tag`, the block index),
+/// never a key or a path: the co-writer resolves it against its OWN
+/// allocator and parked keys, which is where the lifetime stamp lives.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WireFreedBlock {
+    pub vol_tag: u64,
+    pub block_idx: u64,
+}
+
+/// The finding-36 verdict a shipped layout publish answers with, as the
+/// shipper consumes it: `recomputed` (the frame-derived free stream stands
+/// down) plus, since schema 15, the offsets the owner's ladder actually
+/// FREED — the co-writer's local-hygiene input
+/// (`DataRouter::retire_recomputed_parked`). Every LOCAL
+/// arm answers `Default` (its recompute's released set travels as
+/// `BlockRef`s for the caller's own ladder instead).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct OwnerVerdict {
+    pub recomputed: bool,
+    pub freed: Vec<WireFreedBlock>,
 }
 
 /// The publish path's calls, arguments verbatim from the non-trait surface.
@@ -796,9 +833,14 @@ pub enum PublishReply {
     /// accounting frame with the custody-scoped compose's own swap diff —
     /// `true` ⇔ the owner ran the released blocks through its own free
     /// ladder post-commit, so the caller's frame-derived displaced frees
-    /// must stand down for this publish.
+    /// must stand down for this publish. Since schema 15 `freed` names the
+    /// blocks that ladder answered `Freed` — the ones now in the owner's
+    /// free supply, which the co-writer's lane harvest can hand back — so
+    /// the shipper retires its local tracking of exactly those at THIS
+    /// reply (never at the epoch close the harvest can beat).
     PutDone {
         recomputed: bool,
+        freed: Vec<WireFreedBlock>,
     },
     /// `merge_layout_and_size`: whether a delta record was staged, and
     /// the STAGED LINK'S VERSION (0 on a full-Put commit) — rung 17's
@@ -814,6 +856,9 @@ pub enum PublishReply {
         /// free stream must stand down for this publish (local tier /
         /// tracking hygiene only).
         recomputed: bool,
+        /// Schema 15: the recompute ladder's `Freed` blocks (see
+        /// [`PublishReply::PutDone`]).
+        freed: Vec<WireFreedBlock>,
     },
     /// `write_extent` (rung 17): `covering_version` is `Some` **iff the
     /// covering publish has already run** — releasing the shipper's
@@ -864,17 +909,19 @@ pub enum PublishReply {
     /// `preexisting` is the A1 resumed verdict's input. Since schema 12
     /// (PR 5b) the reply also carries the f36b verdict: `recomputed`
     /// ⇔ the owner replaced the shipper's accounting frame with the
-    /// claims-scoped train's own swap diff and ran the `released`
-    /// displaced blocks through its OWN free ladder post-commit — the
-    /// caller's frame-derived displaced frees must stand down; and `gen`,
-    /// the committed head generation the shipper stamps as its next base
-    /// (the §11 belt's chain-without-refetch input).
+    /// claims-scoped train's own swap diff and ran the displaced blocks
+    /// through its OWN free ladder post-commit — the caller's
+    /// frame-derived displaced frees must stand down; `freed` (schema 15,
+    /// the schema-12 count became the list) the blocks that ladder
+    /// answered `Freed` (see [`PublishReply::PutDone`]); and `gen`, the
+    /// committed head generation the shipper stamps as its next base (the
+    /// §11 belt's chain-without-refetch input).
     MapMigrated {
         records: u64,
         record_bytes: u64,
         preexisting: u64,
         recomputed: bool,
-        released: u64,
+        freed: Vec<WireFreedBlock>,
         gen: u64,
     },
 }
@@ -2247,25 +2294,25 @@ fn protocol_error(what: &str, got: &str, want: &str) -> SqueezefsError {
 }
 
 /// Routed [`RoutedMetaBackend::set_layout_and_size`]. Returns the
-/// finding-36b owner-recompute verdict: `true` ⇔ the owner's
-/// custody-scoped compose replaced the caller's accounting frame and ran
-/// the displaced-block device frees through its own ladder, so the
-/// caller's frame-derived displaced frees must stand down for this
-/// publish. The local arm answers `false` (its own free path stays
-/// authoritative).
+/// finding-36b owner-recompute verdict ([`OwnerVerdict`]): `recomputed`
+/// ⇔ the owner's custody-scoped compose replaced the caller's accounting
+/// frame and ran the displaced-block device frees through its own ladder,
+/// so the caller's frame-derived displaced frees must stand down for this
+/// publish; `freed` the blocks that ladder free-listed (schema 15). The
+/// local arm answers `Default` (its own free path stays authoritative).
 pub async fn set_layout_and_size(
     be: &Arc<RoutedMetaBackend>,
     ino: Ino,
     layout: &[u8],
     size: u64,
     refs: &[BlockRefOp],
-) -> Result<bool> {
+) -> Result<OwnerVerdict> {
     match owner_of(be, ino)? {
         None => {
             note_local();
             let _serve_window = local_publish_guard(ino).await;
             be.set_layout_and_size(ino, layout, size, refs).await?;
-            Ok(false)
+            Ok(OwnerVerdict::default())
         }
         Some(peer) => {
             intent_barrier_inos(&[ino]).await?;
@@ -2282,7 +2329,9 @@ pub async fn set_layout_and_size(
             )
             .await?
             {
-                PublishReply::PutDone { recomputed } => Ok(recomputed),
+                PublishReply::PutDone { recomputed, freed } => {
+                    Ok(OwnerVerdict { recomputed, freed })
+                }
                 other => Err(protocol_error(
                     "set_layout_and_size",
                     &format!("{other:?}"),
@@ -2294,17 +2343,19 @@ pub async fn set_layout_and_size(
 }
 
 /// Routed [`RoutedMetaBackend::merge_layout_and_size`]. Returns
-/// `(use_delta, staged_version, owner_recomputed)` — the staged link's
-/// version (0 on a full-Put commit), which the caller stamps into the RAM
-/// provenance so the next delta claims the right base (rung 17's
-/// chain-without-refetch law; on the un-chained local arm the version is
-/// the delta's own), plus the finding-36 verdict: `true` ⇔ the publish's
-/// accounting was RECOMPUTED, so the caller's frame-derived displaced
-/// frees must stand down. The fourth element is the LOCAL chained arm's
-/// released set (finding 36b): the shipped arm's owner freed its own, so
-/// it travels back empty; a local recompute's releases must run the
-/// shipped-free ladder at the save's post-guard venue (RES-1: never
-/// inline — the caller may hold the 3.5 stripe).
+/// `(use_delta, staged_version, owner_verdict, local_released)` — the
+/// staged link's version (0 on a full-Put commit), which the caller stamps
+/// into the RAM provenance so the next delta claims the right base (rung
+/// 17's chain-without-refetch law; on the un-chained local arm the version
+/// is the delta's own), plus the finding-36 [`OwnerVerdict`]: `recomputed`
+/// ⇔ the publish's accounting was RECOMPUTED, so the caller's
+/// frame-derived displaced frees must stand down, and `freed` the blocks
+/// a SHIPPED recompute's owner free-listed (schema 15). The fourth element
+/// is the LOCAL chained arm's released set (finding 36b): the shipped
+/// arm's owner freed its own, so it travels back empty; a local
+/// recompute's releases must run the shipped-free ladder at the save's
+/// post-guard venue (RES-1: never inline — the caller may hold the 3.5
+/// stripe).
 pub async fn merge_layout_and_size(
     be: &Arc<RoutedMetaBackend>,
     ino: Ino,
@@ -2312,7 +2363,7 @@ pub async fn merge_layout_and_size(
     full_layout: bytes::Bytes,
     size: u64,
     refs: Vec<BlockRefOp>,
-) -> Result<(bool, u64, bool, Vec<BlockRef>)> {
+) -> Result<(bool, u64, OwnerVerdict, Vec<BlockRef>)> {
     match owner_of(be, ino)? {
         None => {
             note_local();
@@ -2343,8 +2394,11 @@ pub async fn merge_layout_and_size(
                 let (used, version, released) = be
                     .merge_layout_and_size_chained_accounted(ino, delta, full_layout, size, refs)
                     .await?;
-                let recomputed = released.is_some();
-                Ok((used, version, recomputed, released.unwrap_or_default()))
+                let verdict = OwnerVerdict {
+                    recomputed: released.is_some(),
+                    freed: Vec::new(),
+                };
+                Ok((used, version, verdict, released.unwrap_or_default()))
             } else {
                 let used = be
                     .merge_layout_and_size(ino, delta, full_layout, size, refs)
@@ -2352,7 +2406,7 @@ pub async fn merge_layout_and_size(
                 Ok((
                     used,
                     if used { delta.version } else { 0 },
-                    false,
+                    OwnerVerdict::default(),
                     Vec::new(),
                 ))
             }
@@ -2370,12 +2424,20 @@ pub async fn merge_layout_and_size(
             };
             match ship_witnessed(&peer, call).await? {
                 // The OWNER freed its recompute's releases (finding 36):
-                // nothing travels back for the caller to free.
+                // nothing travels back for the caller to FREE — what
+                // travels is which offsets it freed (schema 15), the
+                // caller's local-hygiene input.
                 PublishReply::DeltaUsed {
                     used,
                     version,
                     recomputed,
-                } => Ok((used, version, recomputed, Vec::new())),
+                    freed,
+                } => Ok((
+                    used,
+                    version,
+                    OwnerVerdict { recomputed, freed },
+                    Vec::new(),
+                )),
                 other => Err(protocol_error(
                     "merge_layout_and_size",
                     &format!("{other:?}"),
@@ -2504,6 +2566,12 @@ pub async fn commit_block_refs(
 /// back as a loud error rather than a silent local fallback: the CALLER
 /// probed engagement before consuming anything, so this arm firing means
 /// the ratchet failed mid-save — the never-lossy refill + retry owns it.
+///
+/// The second element is the SHIPPED arm's owner-freed set (schema 15 —
+/// the blocks the owner's recompute ladder free-listed, the caller's
+/// local-hygiene input); the local arm's released set stays inside the
+/// outcome (`released` / `released_keys`) for the caller's own ladder, so
+/// it answers an empty list here.
 pub async fn migrate_block_map(
     be: &Arc<RoutedMetaBackend>,
     ino: Ino,
@@ -2524,7 +2592,10 @@ pub async fn migrate_block_map(
     // by pre-fix a); the shipped arm ignores them (the wire carries
     // entries + the refs frame, and the owner derives its claims there).
     local_claims: Option<crate::meta_backend::kv::backend::MapTrainClaims>,
-) -> Result<crate::meta_backend::kv::backend::MapMigrateOutcome> {
+) -> Result<(
+    crate::meta_backend::kv::backend::MapMigrateOutcome,
+    Vec<WireFreedBlock>,
+)> {
     match owner_of(be, ino)? {
         None => {
             note_local();
@@ -2617,7 +2688,7 @@ pub async fn migrate_block_map(
                 )
                 .await?
             {
-                Some(outcome) => Ok(outcome),
+                Some(outcome) => Ok((outcome, Vec::new())),
                 None => Err(SqueezefsError::InvalidOperation(format!(
                     "kvmap crossing for ino {ino}: the block-map tree could not engage \
                      (the bit-16 ratchet failed) — nothing was committed; the caller's \
@@ -2653,26 +2724,30 @@ pub async fn migrate_block_map(
                     record_bytes,
                     preexisting,
                     recomputed,
-                    released: _,
+                    freed,
                     gen,
                 } => {
                     MAP_SHIPPED.fetch_add(1, Ordering::Relaxed);
                     // The owner freed its own recompute-released set —
-                    // nothing travels back for the caller to free.
-                    Ok(crate::meta_backend::kv::backend::MapMigrateOutcome {
-                        records,
-                        record_bytes,
-                        preexisting,
-                        gen,
-                        recomputed,
-                        released: Vec::new(),
-                        released_keys: Vec::new(),
-                        // Shipped trains never barrier (a live cursor on
-                        // the owner refuses retried-class instead).
-                        sweep_cursor: None,
-                        swept_records: 0,
-                        swept_freed: Vec::new(),
-                    })
+                    // nothing travels back for the caller to FREE; which
+                    // offsets it freed does (schema 15), beside the outcome.
+                    Ok((
+                        crate::meta_backend::kv::backend::MapMigrateOutcome {
+                            records,
+                            record_bytes,
+                            preexisting,
+                            gen,
+                            recomputed,
+                            released: Vec::new(),
+                            released_keys: Vec::new(),
+                            // Shipped trains never barrier (a live cursor on
+                            // the owner refuses retried-class instead).
+                            sweep_cursor: None,
+                            swept_records: 0,
+                            swept_freed: Vec::new(),
+                        },
+                        freed,
+                    ))
                 }
                 other => Err(protocol_error(
                     "migrate_block_map",
@@ -3304,11 +3379,20 @@ pub(crate) fn note_free_ship_failure(blocks: u64) {
 /// population validation, the grace ring, S7's quarantine and the reclaim
 /// manners compose unchanged, and a block still referenced elsewhere
 /// answers `NonTerminal` instead of a wrongful device free. `Freed`
-/// verdicts land on `free_recomputed_blocks` (the field engagement gauge).
-/// A missing executor or a failed ladder is LEAK-SAFE and loud: the
-/// offsets are durably unreferenced (the commit already released them) and
-/// the authority's next derivation returns them.
-pub(crate) async fn free_recomputed_releases(ino: u64, released: Vec<BlockRef>) {
+/// verdicts land on `free_recomputed_blocks` (the field engagement gauge)
+/// and are RETURNED — the reply's `freed` set (schema 15): exactly the
+/// blocks that entered this authority's free supply, which the shipper's
+/// lane harvest can hand back, so the shipper retires its local tracking
+/// of exactly those. `NonTerminal` (a clone sibling keeps the block alive)
+/// and `Refused` blocks never reach a free list and do not travel. A
+/// missing executor or a failed ladder is LEAK-SAFE and loud: the offsets
+/// are durably unreferenced (the commit already released them), nothing
+/// travels (nothing was free-listed), and the authority's next derivation
+/// returns them.
+pub(crate) async fn free_recomputed_releases(
+    ino: u64,
+    released: Vec<BlockRef>,
+) -> Vec<WireFreedBlock> {
     // Dedup on the durable identity: one transition can release the same
     // device block at two map indexes — its free runs once.
     let mut seen: std::collections::HashSet<(u64, u64)> = std::collections::HashSet::new();
@@ -3318,8 +3402,9 @@ pub(crate) async fn free_recomputed_releases(ino: u64, released: Vec<BlockRef>) 
             by_vol.entry(r.vol_tag).or_default().push(r.block_idx);
         }
     }
+    let mut freed_blocks: Vec<WireFreedBlock> = Vec::new();
     if by_vol.is_empty() {
-        return;
+        return freed_blocks;
     }
     let Some(exec) = free_executor() else {
         log::error!(
@@ -3328,17 +3413,25 @@ pub(crate) async fn free_recomputed_releases(ino: u64, released: Vec<BlockRef>) 
              authority's next derivation (leak-safe, loud)",
             seen.len()
         );
-        return;
+        return freed_blocks;
     };
     for (vol_tag, blocks) in by_vol {
         let count = blocks.len();
-        match exec(vol_tag, blocks).await {
+        match exec(vol_tag, blocks.clone()).await {
             Ok(verdicts) => {
-                let freed = verdicts
-                    .iter()
-                    .filter(|v| **v == FreeVerdict::Freed)
-                    .count() as u64;
-                FREE_RECOMPUTED_BLOCKS.fetch_add(freed, Ordering::Relaxed);
+                let before = freed_blocks.len();
+                freed_blocks.extend(
+                    blocks
+                        .iter()
+                        .zip(verdicts.iter())
+                        .filter(|(_, v)| **v == FreeVerdict::Freed)
+                        .map(|(block_idx, _)| WireFreedBlock {
+                            vol_tag,
+                            block_idx: *block_idx,
+                        }),
+                );
+                FREE_RECOMPUTED_BLOCKS
+                    .fetch_add((freed_blocks.len() - before) as u64, Ordering::Relaxed);
             }
             Err(e) => {
                 log::error!(
@@ -3349,6 +3442,7 @@ pub(crate) async fn free_recomputed_releases(ino: u64, released: Vec<BlockRef>) 
             }
         }
     }
+    freed_blocks
 }
 
 /// **Ship one displaced-free verb** to the authority at `endpoint` and
@@ -4747,13 +4841,15 @@ impl PublishService {
             Some(o) => {
                 MAP_SERVED.fetch_add(1, Ordering::Relaxed);
                 let released = o.released.len() as u64;
+                let mut freed = Vec::new();
                 if !o.released.is_empty() {
                     MAP_RECOMPUTED_RELEASES.fetch_add(released, Ordering::Relaxed);
                     note_served_displacements(ino, &displaced_indices_of(ino, &o.released));
-                    free_recomputed_releases(ino, o.released).await;
+                    freed = free_recomputed_releases(ino, o.released).await;
                 }
                 Ok(Some(PublishReply::PutDone {
                     recomputed: o.recomputed,
+                    freed,
                 }))
             }
             None => {
@@ -4909,19 +5005,21 @@ impl PublishService {
                     // Finding 36b (the kvmap twin): the recompute's
                     // released blocks run this authority's own ladder,
                     // strictly AFTER commit Ok; the reply's `recomputed`
-                    // stands the shipper's frame stream down.
+                    // stands the shipper's frame stream down and `freed`
+                    // (schema 15) names what the ladder free-listed.
                     let released = o.released.len() as u64;
+                    let mut freed = Vec::new();
                     if !o.released.is_empty() {
                         MAP_RECOMPUTED_RELEASES.fetch_add(released, Ordering::Relaxed);
                         note_served_displacements(ino, &displaced_indices_of(ino, &o.released));
-                        free_recomputed_releases(ino, o.released).await;
+                        freed = free_recomputed_releases(ino, o.released).await;
                     }
                     Ok(PublishReply::MapMigrated {
                         records: o.records,
                         record_bytes: o.record_bytes,
                         preexisting: o.preexisting,
                         recomputed: o.recomputed,
-                        released,
+                        freed,
                         gen: o.gen,
                     })
                 }
@@ -4970,7 +5068,7 @@ impl PublishService {
                         record_bytes: o.record_bytes,
                         preexisting: o.preexisting,
                         recomputed: o.recomputed,
-                        released: 0,
+                        freed: Vec::new(),
                         gen: o.gen,
                     })
                 }
@@ -5649,11 +5747,14 @@ impl PublishService {
                 }
             }
         }
-        if !released_data.is_empty() {
-            free_recomputed_releases(ino, released_data).await;
-        }
+        let freed = if released_data.is_empty() {
+            Vec::new()
+        } else {
+            free_recomputed_releases(ino, released_data).await
+        };
         Ok(PublishReply::PutDone {
             recomputed: was_recomputed,
+            freed,
         })
     }
 
@@ -5752,13 +5853,15 @@ impl PublishService {
                 // these device frees have exactly one owner. On commit
                 // Err the `?` above already returned: nothing is freed.
                 let recomputed = released.is_some();
-                if let Some(released) = released {
-                    free_recomputed_releases(ino, released).await;
-                }
+                let freed = match released {
+                    Some(released) => free_recomputed_releases(ino, released).await,
+                    None => Vec::new(),
+                };
                 Ok(PublishReply::DeltaUsed {
                     used,
                     version,
                     recomputed,
+                    freed,
                 })
             }
             PublishCall::WriteExtent {

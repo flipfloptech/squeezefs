@@ -1166,7 +1166,8 @@ async fn a_shipped_crossing_is_witnessed_owner_ratcheted_and_era_gated() {
         None,
     )
     .await
-    .expect("the helper ships");
+    .expect("the helper ships")
+    .0;
     assert_eq!(outcome.records, 0, "an identical map diffs to zero ops");
     assert_eq!(
         outcome.preexisting, 0,

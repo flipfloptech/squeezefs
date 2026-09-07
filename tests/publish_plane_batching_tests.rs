@@ -347,7 +347,10 @@ impl TwoNodes {
         &self,
         inos: &[u64],
         size_of: impl Fn(usize) -> u64,
-    ) -> (Vec<squeezefs::error::Result<bool>>, Duration) {
+    ) -> (
+        Vec<squeezefs::error::Result<publish::OwnerVerdict>>,
+        Duration,
+    ) {
         let started = Instant::now();
         let out = join_publishes(self.spawn_publishes(inos, size_of)).await;
         (out, started.elapsed())
@@ -360,7 +363,7 @@ impl TwoNodes {
         &self,
         inos: &[u64],
         size_of: impl Fn(usize) -> u64,
-    ) -> Vec<tokio::task::JoinHandle<squeezefs::error::Result<bool>>> {
+    ) -> Vec<tokio::task::JoinHandle<squeezefs::error::Result<publish::OwnerVerdict>>> {
         inos.iter()
             .enumerate()
             .map(|(i, &ino)| {
@@ -388,8 +391,8 @@ impl TwoNodes {
 
 /// Join the spawned publishes in ino order (a publish task never panics).
 async fn join_publishes(
-    handles: Vec<tokio::task::JoinHandle<squeezefs::error::Result<bool>>>,
-) -> Vec<squeezefs::error::Result<bool>> {
+    handles: Vec<tokio::task::JoinHandle<squeezefs::error::Result<publish::OwnerVerdict>>>,
+) -> Vec<squeezefs::error::Result<publish::OwnerVerdict>> {
     let mut out = Vec::with_capacity(handles.len());
     for h in handles {
         out.push(h.await.expect("a publish task never panics"));

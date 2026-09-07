@@ -1296,9 +1296,10 @@ async fn a_rotated_fsync_token_converges_the_close_and_orphans_no_local_hygiene(
 // ===========================================================================
 
 /// The §1b fixture up to the point where the rewrite epoch holds the
-/// round-1 bindings and the round-0 mints are PARKED: authority + co-writer
-/// + the production fs, the shared file seeded, round 0 written and
-/// fsynced, round 1 written (quiesced, epoch open, nothing published yet).
+/// round-1 bindings and the round-0 mints are PARKED: the authority, the
+/// co-writer and its production fs, the shared file seeded, round 0
+/// written and fsynced, round 1 written (quiesced, epoch open, nothing
+/// published yet).
 struct ParkedEpoch {
     auth: Authority,
     cwr: CoWriter,
@@ -1797,10 +1798,12 @@ async fn a_peer_speaking_the_previous_publish_schema_is_refused_at_the_first_fra
     let _serial = serial();
     let _restore = restore();
     std::env::remove_var("SQUEEZEFS_DEFAULT_BLOCK_SIZE");
-    assert!(
-        publish::PUBLISH_SCHEMA >= 15,
-        "the freed set joined the recompute replies at schema 15 (KD-7: a mixed-commit \
-         fleet must fail loud, not read an absent field as empty)"
+    assert_eq!(
+        publish::PUBLISH_SCHEMA,
+        15,
+        "the freed set joined the recompute replies at the schema-15 bump (KD-7: a \
+         mixed-commit fleet must fail loud, not read an absent field as empty); the next \
+         vocabulary change re-pins this"
     );
     let dir = TempDir::new().unwrap();
     let vol = fresh_volume(dir.path(), "schema-peer").await;

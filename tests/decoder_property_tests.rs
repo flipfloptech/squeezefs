@@ -47,7 +47,7 @@ use squeezefs::meta_backend::kv::superblock::SuperblockV3;
 use squeezefs::meta_ship::publish::{
     decode_reply_frame, decode_request_frame, encode_reply_frame, encode_request_frame,
     PublishCall, PublishCallOutcome, PublishReply, PublishReplyFrame, PublishRequestFrame,
-    WireBlockRefOp, PUBLISH_SCHEMA,
+    WireBlockRefOp, WireFreedBlock, PUBLISH_SCHEMA,
 };
 use squeezefs::meta_ship::wire::{
     decode_reclaim, decode_reply, decode_request, encode_reclaim, ReclaimFrame, WireError,
@@ -794,28 +794,37 @@ fn arb_publish_call() -> impl Strategy<Value = PublishCall> {
     ]
 }
 
+/// The schema-15 freed set: bounded, the durable identity pair.
+fn arb_freed() -> impl Strategy<Value = Vec<WireFreedBlock>> {
+    prop::collection::vec(
+        (any::<u64>(), any::<u64>())
+            .prop_map(|(vol_tag, block_idx)| WireFreedBlock { vol_tag, block_idx }),
+        0..8,
+    )
+}
+
 fn arb_publish_outcome() -> impl Strategy<Value = PublishCallOutcome> {
     prop_oneof![
         Just(PublishCallOutcome::Done(Ok(PublishReply::Unit))),
-        any::<bool>().prop_map(
-            |recomputed| PublishCallOutcome::Done(Ok(PublishReply::PutDone { recomputed }))
-        ),
+        (any::<bool>(), arb_freed()).prop_map(|(recomputed, freed)| {
+            PublishCallOutcome::Done(Ok(PublishReply::PutDone { recomputed, freed }))
+        }),
         (
             any::<u64>(),
             any::<u64>(),
             any::<u64>(),
             any::<bool>(),
-            any::<u64>(),
+            arb_freed(),
             any::<u64>()
         )
             .prop_map(
-                |(records, record_bytes, preexisting, recomputed, released, gen)| {
+                |(records, record_bytes, preexisting, recomputed, freed, gen)| {
                     PublishCallOutcome::Done(Ok(PublishReply::MapMigrated {
                         records,
                         record_bytes,
                         preexisting,
                         recomputed,
-                        released,
+                        freed,
                         gen,
                     }))
                 }

@@ -643,7 +643,8 @@ async fn a_sticky_head_local_train_under_live_range_grants_composes_claims_scope
         None,
     )
     .await
-    .expect("a sticky-head local train under live grants composes claims-scoped (item 4)");
+    .expect("a sticky-head local train under live grants composes claims-scoped (item 4)")
+    .0;
     assert_eq!(outcome.records, 1, "exactly the claimed transition staged");
     assert_eq!(outcome.gen, 1, "a committed mw-plane train bumps the belt");
 
@@ -672,7 +673,8 @@ async fn a_sticky_head_local_train_under_live_range_grants_composes_claims_scope
         None,
     )
     .await
-    .expect("an empty-claims subset train is legal");
+    .expect("an empty-claims subset train is legal")
+    .0;
     assert_eq!(
         noop.records, 0,
         "no claims ⇒ no ops — never delete-by-absence"
@@ -910,10 +912,15 @@ async fn a_scoped_put_served_over_a_kvmap_head_composes_claims_scoped() {
         )
         .await
         .expect("the S11 ∘ kvmap scoped Put composes (item 3's positive contract)");
-    assert_eq!(
-        reply,
-        publish::PublishReply::PutDone { recomputed: true },
-        "the compose recomputed the accounting — the caller's frame stream stands down"
+    assert!(
+        matches!(
+            reply,
+            publish::PublishReply::PutDone {
+                recomputed: true,
+                ..
+            }
+        ),
+        "the compose recomputed the accounting — the caller's frame stream stands down: {reply:?}"
     );
 
     // The claimed in-custody binding landed; everything unclaimed (and
@@ -1388,7 +1395,16 @@ async fn a_range_granted_kvmap_ino_composes_two_scoped_writers_and_the_episode_p
         )
         .await
         .expect("writer A's scoped Put lands");
-    assert_eq!(reply, publish::PublishReply::PutDone { recomputed: true });
+    assert!(
+        matches!(
+            reply,
+            publish::PublishReply::PutDone {
+                recomputed: true,
+                ..
+            }
+        ),
+        "writer A's scoped Put recomputed: {reply:?}"
+    );
 
     // Writer B: the sticky-head shipped TRAIN under LIVE grants (the
     // lifted f34 serve) — a STALE whole map (it lags A's rewrite) plus
@@ -1397,6 +1413,7 @@ async fn a_range_granted_kvmap_ino_composes_two_scoped_writers_and_the_episode_p
     rig.alloc.publish_block(b_new);
     let mut b_map = entries.clone();
     b_map[1] = (1, b_new.to_string());
+    let map_releases_before = publish::stats().map_recomputed_releases;
     let b_reply = pc_b
         .ship(
             &auth.endpoint,
@@ -1416,7 +1433,7 @@ async fn a_range_granted_kvmap_ino_composes_two_scoped_writers_and_the_episode_p
     let publish::PublishReply::MapMigrated {
         records,
         recomputed,
-        released,
+        freed,
         gen,
         ..
     } = b_reply
@@ -1428,7 +1445,19 @@ async fn a_range_granted_kvmap_ino_composes_two_scoped_writers_and_the_episode_p
         "B's claims-scoped diff stages exactly its claim"
     );
     assert!(recomputed, "the f36b recompute rides the lifted serve");
-    assert_eq!(released, 1, "old1 is the recompute's released set");
+    assert_eq!(
+        publish::stats().map_recomputed_releases - map_releases_before,
+        1,
+        "old1 is the recompute's released set"
+    );
+    // Schema 15: the reply carries what the owner's ladder FREED, not the
+    // released count — this rig installs no free executor, so nothing was
+    // free-listed (leak-safe, loud) and nothing travels for the shipper
+    // to retire.
+    assert!(
+        freed.is_empty(),
+        "no executor ⇒ nothing freed ⇒ an empty freed set: {freed:?}"
+    );
     assert_eq!(gen, 2);
 
     // The authority's OWN episode compose (the §11 row-1 arm, unchanged):

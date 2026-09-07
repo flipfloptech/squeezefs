@@ -36,7 +36,7 @@ use libfuzzer_sys::fuzz_target;
 use squeezefs::meta_ship::publish::{
     decode_reply_frame, decode_request_frame, encode_reply_frame, encode_request_frame,
     FreeVerdict, PublishCall, PublishCallOutcome, PublishReply, PublishReplyFrame,
-    PublishRequestFrame, WireBlockRefOp, PUBLISH_SCHEMA,
+    PublishRequestFrame, WireBlockRefOp, WireFreedBlock, PUBLISH_SCHEMA,
 };
 use squeezefs::meta_ship::wire::{WireDirEntry, WireError, WireInode};
 
@@ -94,6 +94,22 @@ impl From<ArbRef> for WireBlockRefOp {
 
 fn refs(v: Vec<ArbRef>) -> Vec<WireBlockRefOp> {
     v.into_iter().map(Into::into).collect()
+}
+
+/// The schema-15 freed set's element — the durable identity pair.
+#[derive(Arbitrary, Debug)]
+struct ArbFreed {
+    vol_tag: u64,
+    block_idx: u64,
+}
+
+fn freed(v: Vec<ArbFreed>) -> Vec<WireFreedBlock> {
+    v.into_iter()
+        .map(|f| WireFreedBlock {
+            vol_tag: f.vol_tag,
+            block_idx: f.block_idx,
+        })
+        .collect()
 }
 
 #[derive(Arbitrary, Debug)]
@@ -383,11 +399,13 @@ enum ArbReply {
     Unit,
     PutDone {
         recomputed: bool,
+        freed: Vec<ArbFreed>,
     },
     DeltaUsed {
         used: bool,
         version: u64,
         recomputed: bool,
+        freed: Vec<ArbFreed>,
     },
     ExtentAck {
         covering_version: Option<u64>,
@@ -423,7 +441,7 @@ enum ArbReply {
         record_bytes: u64,
         preexisting: u64,
         recomputed: bool,
-        released: u64,
+        freed: Vec<ArbFreed>,
         gen: u64,
     },
 }
@@ -450,15 +468,23 @@ struct ArbInput {
 fn reply_from(r: ArbReply) -> PublishReply {
     match r {
         ArbReply::Unit => PublishReply::Unit,
-        ArbReply::PutDone { recomputed } => PublishReply::PutDone { recomputed },
+        ArbReply::PutDone {
+            recomputed,
+            freed: f,
+        } => PublishReply::PutDone {
+            recomputed,
+            freed: freed(f),
+        },
         ArbReply::DeltaUsed {
             used,
             version,
             recomputed,
+            freed: f,
         } => PublishReply::DeltaUsed {
             used,
             version,
             recomputed,
+            freed: freed(f),
         },
         ArbReply::ExtentAck { covering_version } => PublishReply::ExtentAck { covering_version },
         ArbReply::FlushDone { covering_version } => PublishReply::FlushDone { covering_version },
@@ -530,14 +556,14 @@ fn reply_from(r: ArbReply) -> PublishReply {
             record_bytes,
             preexisting,
             recomputed,
-            released,
+            freed: f,
             gen,
         } => PublishReply::MapMigrated {
             records,
             record_bytes,
             preexisting,
             recomputed,
-            released,
+            freed: freed(f),
             gen,
         },
     }

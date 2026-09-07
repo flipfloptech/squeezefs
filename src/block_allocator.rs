@@ -1,5 +1,5 @@
 use crate::error::Result;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 
 /// RES-19 (pre-RC spec §7): retention of the free-forensics tape.
@@ -366,6 +366,12 @@ pub struct BlockAllocator {
     /// (`crate::free_grace::lane_supply_witnessed`); this word alone would
     /// leave every recomputed block reachable only from an ENOSPC park.
     lane_owed: AtomicU64,
+    /// Owed-ledger ARRIVALS (+1 per [`Self::note_owed_freed`]) — this
+    /// allocator's half of the single-flight harvest's decline witness
+    /// ([`Self::supply_witness_gen`]): the owed word itself falls at
+    /// adoption, so a monotonic arrival count is what "the owed ledger
+    /// moved" compares on.
+    owed_arrivals: AtomicU64,
     /// The COMPOSED measured refill horizon (`hint + RTT + one refresh
     /// floor`), 0 = use the member-local derivation (OQ 2's fallback —
     /// the pre-first-reply state, a zero hint, and a refused reply all
@@ -431,6 +437,87 @@ struct LanePartition {
     /// the watermark, so the parked A keys enter the recycle loop ahead
     /// of the `StorageFull` instead of at the iteration boundary.
     supply_close: std::sync::OnceLock<crate::data_alloc_lane::SupplyCloseSink>,
+    /// The single-flight harvest rendezvous (finding 15 phase B1,
+    /// `.benchmarks/2026-09-07-lane-harvest-single-flight.md`): one
+    /// in-flight harvest RPC per allocator; every concurrent caller joins
+    /// its outcome. Zero-cost words until a harvest runs.
+    flight: HarvestFlight,
+}
+
+/// **The single-flight harvest rendezvous** — one per laned allocator
+/// (finding 15 phase B1: on the 8-co-writer fleet every parked
+/// allocation issued its OWN harvest per park slice — 124k RPCs in 9.5
+/// min, half empty — and the authority's liveness serves queued behind
+/// them). Latch-free: the leader is whoever wins `inflight`'s CAS; joiners
+/// register on `notify` BEFORE re-reading `done_gen` (the enable-then-check
+/// ordering — a leader completing between the failed CAS and the
+/// registration is caught by the generation, one after it by the wake),
+/// and read the outcome from `last_adopted` after the generation moved.
+/// No lock is held across the RPC.
+///
+/// `empty_at_witness` is the DECLINE: the supply witness generation
+/// ([`BlockAllocator::supply_witness_gen`]) at which the last reply came
+/// back EMPTY (`u64::MAX` = none). While the witness has not moved —
+/// no grant, no wake, no owed `Freed` — a fresh empty answer is the
+/// answer, and a caller declines without a wire trip; the next grant
+/// (the renewal cadence, ≤ 500 ms under an ask) ends the window for
+/// exactly one RPC. An RPC FAILURE stamps nothing (it is not an answer).
+struct HarvestFlight {
+    inflight: AtomicBool,
+    /// +1 at every flight's terminal outcome.
+    done_gen: AtomicU64,
+    /// The last flight's adopted count, published before `done_gen` moves.
+    last_adopted: AtomicU64,
+    empty_at_witness: AtomicU64,
+    notify: squeezefs_ipc::sqz_notify::Notify,
+}
+
+impl HarvestFlight {
+    const fn new() -> Self {
+        Self {
+            inflight: AtomicBool::new(false),
+            done_gen: AtomicU64::new(0),
+            last_adopted: AtomicU64::new(0),
+            empty_at_witness: AtomicU64::new(u64::MAX),
+            notify: squeezefs_ipc::sqz_notify::Notify::new(),
+        }
+    }
+}
+
+/// The `SQUEEZEFS_ALLOC_LANE_HARVEST_SINGLE_FLIGHT` lever's latch (the
+/// `HARVEST_AHEAD` shape): one in-flight harvest RPC per allocator with
+/// the fresh-empty decline. `0` = one RPC per caller, the shipped shape —
+/// the fleet A/B control.
+static HARVEST_SINGLE_FLIGHT: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+fn harvest_single_flight_enabled() -> bool {
+    match HARVEST_SINGLE_FLIGHT.load(Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            let on =
+                crate::env_knobs::bool_knob("SQUEEZEFS_ALLOC_LANE_HARVEST_SINGLE_FLIGHT", true);
+            HARVEST_SINGLE_FLIGHT.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+            on
+        }
+    }
+}
+
+/// Test seam (the `test_set_harvest_ahead` shape).
+pub fn test_set_harvest_single_flight(on: Option<bool>) {
+    HARVEST_SINGLE_FLIGHT.store(
+        match on {
+            Some(true) => 1,
+            Some(false) => 2,
+            None => 0,
+        },
+        Ordering::Relaxed,
+    );
+}
+
+/// Test seam: `true` ⇔ a preset was in force.
+pub fn test_clear_harvest_single_flight() -> bool {
+    HARVEST_SINGLE_FLIGHT.swap(0, Ordering::Relaxed) != 0
 }
 
 /// The `SQUEEZEFS_ALLOC_LANE_HARVEST_AHEAD` lever's latch (the free-grace
@@ -688,6 +775,7 @@ impl BlockAllocator {
             quarantine: crate::data_custody::BlockQuarantine::new(),
             grace: crate::free_grace::GraceRing::derived(),
             lane_owed: AtomicU64::new(0),
+            owed_arrivals: AtomicU64::new(0),
             horizon_composed_ms: AtomicU64::new(0),
             alloc_claims: AtomicU64::new(0),
             rate_last_sample_ms: AtomicU64::new(0),
@@ -746,6 +834,7 @@ impl BlockAllocator {
             sink: std::sync::OnceLock::new(),
             harvest: std::sync::OnceLock::new(),
             supply_close: std::sync::OnceLock::new(),
+            flight: HarvestFlight::new(),
         };
         let grain = installed.grain;
         if self.lanes.set(installed).is_err() {
@@ -1969,9 +2058,23 @@ impl BlockAllocator {
             return;
         }
         self.lane_owed.fetch_add(n, Ordering::AcqRel);
+        self.owed_arrivals.fetch_add(1, Ordering::Release);
         crate::fuse_client::METRICS
             .alloc_lane_owed_blocks
             .fetch_add(n, Ordering::Relaxed);
+    }
+
+    /// **The supply witness generation** — the single-flight harvest's
+    /// decline compares on it: the sum of two monotonic arrival counts,
+    /// the grants that carried the authority's advertisement to this
+    /// member ([`crate::free_grace::lane_supply_hint_gen`] — a nonzero
+    /// hint's wake is one of them) and this allocator's owed `Freed`
+    /// arrivals. Either moving moves the sum; neither moving means the
+    /// authority has told this mount nothing new about its lane's supply,
+    /// so a fresh empty harvest reply still stands.
+    fn supply_witness_gen(&self) -> u64 {
+        crate::free_grace::lane_supply_hint_gen()
+            .wrapping_add(self.owed_arrivals.load(Ordering::Acquire))
     }
 
     /// Blocks this mount's SHIPPED frees left on the authority's free list
@@ -2283,9 +2386,11 @@ impl BlockAllocator {
     /// the REMOTE lane supply behind the harvest sink (its shipped
     /// frees land on the authority's list/ring; each bounded retry's
     /// `allocate_block` re-runs the harvest, whose serve-side pass 3
-    /// evaluates the pressure fence at the authority). The field
-    /// re-measure convicted the local-ring-only condition: co-writer
-    /// stalls parked ZERO times while their supply sat remote.
+    /// evaluates the pressure fence at the authority — once per grant
+    /// under the single-flight decline, not once per slice per parked
+    /// allocation). The field re-measure convicted the local-ring-only
+    /// condition: co-writer stalls parked ZERO times while their supply
+    /// sat remote.
     ///
     /// The remote shape needs EVIDENCE, not a wire: the harvest reply's
     /// `bound_age_hint_ms` is the authority's live bound age — nonzero iff
@@ -2302,6 +2407,22 @@ impl BlockAllocator {
             && self.horizon_composed_ms.load(Ordering::Relaxed) != 0
     }
 
+    ///
+    /// **Single-flight per allocator** (finding 15 phase B1,
+    /// `SQUEEZEFS_ALLOC_LANE_HARVEST_SINGLE_FLIGHT`, default on): every
+    /// caller — an ENOSPC-path allocation, a parked retry, the ahead or
+    /// pushed tick — goes through [`HarvestFlight`]: one RPC in flight,
+    /// concurrent callers join its outcome (`alloc_lane_harvest_coalesced`)
+    /// and retry their own funnel against the refilled list, and a fresh
+    /// EMPTY reply declines re-issue (`alloc_lane_harvest_declined_stale`)
+    /// until the supply witness moves ([`Self::supply_witness_gen`]). A
+    /// joiner's wait is bounded by the park wall
+    /// ([`crate::free_grace::pressure_park_wall_ms`]): past it the joiner
+    /// takes its verdict with `0`, so no parked allocation waits longer
+    /// than it would have on its own RPC. `alloc_lane_harvests` stays the
+    /// RPC count, so `harvests + coalesced + declined_stale` accounts for
+    /// every would-be call. Lever off = [`Self::issue_lane_harvest`] per
+    /// caller, the shipped shape verbatim.
     async fn harvest_lane_supply(&self) -> u64 {
         let Some(lanes) = self.lanes.get() else {
             return 0;
@@ -2309,10 +2430,87 @@ impl BlockAllocator {
         let Some(sink) = lanes.harvest.get() else {
             return 0;
         };
+        if !harvest_single_flight_enabled() {
+            return self
+                .issue_lane_harvest(lanes.grain, sink)
+                .await
+                .unwrap_or(0);
+        }
+        let flight = &lanes.flight;
+        let m = &crate::fuse_client::METRICS;
+        // The decline: the last reply was EMPTY and nothing the authority
+        // advertises has moved since — a wire trip would return the same
+        // answer. Read BEFORE the CAS so a leader's stamp names the witness
+        // its reply answered; a grant landing mid-flight makes the stamp
+        // stale at once (one conservative extra RPC, never a missed one).
+        let witness = self.supply_witness_gen();
+        if flight.empty_at_witness.load(Ordering::Acquire) == witness {
+            m.alloc_lane_harvest_declined_stale
+                .fetch_add(1, Ordering::Relaxed);
+            return 0;
+        }
+        let done0 = flight.done_gen.load(Ordering::Acquire);
+        if flight
+            .inflight
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            // The leader: one RPC, the outcome published to every joiner.
+            let outcome = self.issue_lane_harvest(lanes.grain, sink).await;
+            let adopted = outcome.unwrap_or(0);
+            flight.empty_at_witness.store(
+                if outcome == Some(0) {
+                    witness
+                } else {
+                    u64::MAX
+                },
+                Ordering::Release,
+            );
+            flight.last_adopted.store(adopted, Ordering::Release);
+            flight.done_gen.fetch_add(1, Ordering::AcqRel);
+            flight.inflight.store(false, Ordering::Release);
+            flight.notify.notify_waiters();
+            return adopted;
+        }
+        // A joiner: register FIRST (`notified()` registers at creation),
+        // then re-read the generation — a leader that finished between
+        // the failed CAS and the registration already moved it; one that
+        // finishes later wakes the registered waiter.
+        m.alloc_lane_harvest_coalesced
+            .fetch_add(1, Ordering::Relaxed);
+        let woken = flight.notify.notified();
+        if flight.done_gen.load(Ordering::Acquire) == done0 {
+            let wall = crate::free_grace::pressure_park_wall_ms();
+            if squeezefs_ipc::sqz_time::timeout(std::time::Duration::from_millis(wall), woken)
+                .await
+                .is_err()
+            {
+                // The leader's RPC outlived the wall: take the verdict now
+                // (the caller's park refuses at the same wall it always
+                // did); the leader's own outcome is untouched.
+                return 0;
+            }
+        }
+        flight.last_adopted.load(Ordering::Acquire)
+    }
+
+    /// **One harvest RPC** (the wire act [`Self::harvest_lane_supply`]
+    /// single-flights): ask the sink for a grain, deposit the reply's
+    /// horizon hint, adopt the blocks, stamp the lane-visible ledger.
+    /// `Some(adopted)` on a reply (`Some(0)` = the authority holds nothing
+    /// of this lane right now — an ANSWER, the decline's input); `None` on
+    /// a failure, which is absorbed into the caller's `0` (the honest
+    /// `StorageFull` stands; a harvest failure must never mask the
+    /// diagnosis) and stamps no decline.
+    async fn issue_lane_harvest(
+        &self,
+        grain: u64,
+        sink: &crate::data_alloc_lane::LaneHarvestSink,
+    ) -> Option<u64> {
         crate::fuse_client::METRICS
             .alloc_lane_harvests
             .fetch_add(1, Ordering::Relaxed);
-        match sink(lanes.grain.max(1)).await {
+        match sink(grain.max(1)).await {
             Ok(harvest) => {
                 // OQ 2: every harvest reply refreshes the refill horizon —
                 // the measured loop latency plus this trip's own RTT.
@@ -2326,7 +2524,7 @@ impl BlockAllocator {
                 for age in &harvest.release_ages_ms {
                     crate::free_grace::note_lane_visible(*age, harvest.rtt_ms);
                 }
-                adopted
+                Some(adopted)
             }
             Err(e) => {
                 log::warn!(
@@ -2335,7 +2533,7 @@ impl BlockAllocator {
                      the authority's list",
                     self._volume_id
                 );
-                0
+                None
             }
         }
     }
@@ -2695,6 +2893,11 @@ impl BlockAllocator {
     /// the park by the RTT per pass), and every caller holds this park
     /// under its `BLOCK_FLUSH_LOCKS` guard: past the wall the refusal is
     /// TERMINAL for that write (`.benchmarks/2026-09-06-cowriter-enospc-wedge.md`).
+    ///
+    /// The retries' harvests are SINGLE-FLIGHT per allocator with a
+    /// fresh-empty decline (`HarvestFlight`): N parked allocations on
+    /// one volume cost the authority one RPC per grant, not N per slice
+    /// (finding 15 phase B1 — the storm the liveness plane queued behind).
     pub async fn allocate_block_grace_bounded(&self) -> Result<u64> {
         let started = std::time::Instant::now();
         loop {

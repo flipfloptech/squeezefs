@@ -509,6 +509,13 @@ static LANE_PUSH_HINTS: AtomicU64 = AtomicU64::new(0);
 /// volumes — the SUPPLY WITNESS both proactive refill arms gate on
 /// ([`lane_push_wants_harvest`], `BlockAllocator::should_harvest_ahead`).
 static LANE_SUPPLY_HINT: AtomicU64 = AtomicU64::new(0);
+/// The ADVERTISEMENT generation (the single-flight harvest's decline
+/// witness, `.benchmarks/2026-09-07-lane-harvest-single-flight.md`): +1
+/// per grant that reached this member — the value's change or not, the
+/// lane-push lever or not — so "the authority's advertisement moved" is
+/// one compare, and a decline stamped at one generation ends at the next
+/// grant. Bounded by the renewal cadence by construction; never a timer.
+static LANE_SUPPLY_HINT_GEN: AtomicU64 = AtomicU64::new(0);
 /// Cached knob `SQUEEZEFS_ALLOC_LANE_REFILL_HINT`: 0 = unread, 1 = on,
 /// 2 = off (the `LANE_PUSH` shape). Off = the retired owed-only gate.
 static REFILL_HINT: AtomicU64 = AtomicU64::new(0);
@@ -1400,8 +1407,11 @@ pub fn lane_push_hints() -> u64 {
 /// the value is kept for the refill decision, and a nonzero one wakes
 /// every parked refill (the ahead task, a bounded allocation park) so the
 /// lane harvest runs on THIS round trip's heels rather than at its own
-/// cadence. Inert with the lever off.
+/// cadence. The value and the wake are the lever's; the ARRIVAL
+/// ([`lane_supply_hint_gen`]) is counted regardless — a grant reached
+/// this member, which is what ends a single-flight harvest's decline.
 pub fn note_lane_supply_hint(blocks: u64) {
+    LANE_SUPPLY_HINT_GEN.fetch_add(1, Ordering::Release);
     if !lane_push_enabled() {
         return;
     }
@@ -1416,6 +1426,14 @@ pub fn note_lane_supply_hint(blocks: u64) {
 /// nothing for this lane, or no hint has arrived).
 pub fn lane_supply_hint() -> u64 {
     LANE_SUPPLY_HINT.load(Ordering::Relaxed)
+}
+
+/// Grants that have carried the authority's advertisement to this member
+/// (the single-flight harvest's decline witness — see
+/// [`note_lane_supply_hint`]). Monotonic; equality with a stamped value
+/// means no grant has arrived since.
+pub fn lane_supply_hint_gen() -> u64 {
+    LANE_SUPPLY_HINT_GEN.load(Ordering::Acquire)
 }
 
 /// Hints that woke a refill (`free_grace_lane_push_wakes`).
@@ -3711,6 +3729,7 @@ pub fn reset_for_test() {
         &LANE_PUSH_RELEASES,
         &LANE_PUSH_HINTS,
         &LANE_SUPPLY_HINT,
+        &LANE_SUPPLY_HINT_GEN,
         &LANE_PUSH_WAKES,
         &QUALIFY_LAG_MS,
         &DRAIN_LAG_MS,

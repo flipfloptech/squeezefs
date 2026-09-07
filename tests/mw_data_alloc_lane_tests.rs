@@ -34,11 +34,11 @@
 //!    ledger alone; the ENOSPC-path harvest is unchanged
 //!    (`.benchmarks/2026-09-07-lane-refill-hint-gate.md`);
 //! 10. **the single-flight harvest** — one in-flight harvest RPC per
-//!    allocator: concurrent callers join its outcome, a fresh EMPTY reply
-//!    declines re-issue until the authority's advertisement moves (a
-//!    grant, a wake, an owed `Freed`), two volumes are two flights, the
-//!    lever off is one RPC per caller, and no park outlives the wall
-//!    (`.benchmarks/2026-09-07-lane-harvest-single-flight.md`).
+//!     allocator: concurrent callers join its outcome, a fresh EMPTY reply
+//!     declines re-issue until the authority's advertisement moves (a
+//!     grant, a wake, an owed `Freed`), two volumes are two flights, the
+//!     lever off is one RPC per caller, and no park outlives the wall
+//!     (`.benchmarks/2026-09-07-lane-harvest-single-flight.md`).
 //!
 //! **No numbers here — ruling D11.** The bench coverage
 //! (`benches/write_path_bench.rs::alloc_lane`) is written and NOT run; every
@@ -1855,7 +1855,12 @@ async fn two_volumes_are_independent_single_flights() {
 
 /// Contract (5): **the lever off is one RPC per caller** — the shipped
 /// shape verbatim: N concurrent callers issue N RPCs, nobody joins, an
-/// empty reply declines nobody.
+/// empty reply declines nobody. The same fixture as contract (1) makes the
+/// shipped cost legible: the first RPC to reach the authority drains the
+/// grain, the other N−1 come back EMPTY and their callers refuse
+/// `StorageFull` — with the harvested blocks sitting on the local free
+/// list — because a caller retries its funnel only after ITS OWN reply
+/// carried blocks. (Under the lever, contract (1): one RPC, all N fed.)
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_lever_off_issues_one_rpc_per_caller() {
     let _serial = serial();
@@ -1869,6 +1874,10 @@ async fn the_lever_off_issues_one_rpc_per_caller() {
     for idx in &held {
         a.retire_shipped_free_tracking(idx * chunk);
     }
+    assert!(
+        lane::reserve_grain_blocks(64, 2) >= held.len() as u64,
+        "one grain covers the whole held supply"
+    );
     let g0 = flight_gauges();
     let mut tasks = Vec::new();
     for _ in 0..N {
@@ -1884,9 +1893,30 @@ async fn the_lever_off_issues_one_rpc_per_caller() {
         supply.asks()
     );
     supply.release();
+    let (mut fed, mut refused) = (0usize, 0usize);
     for t in tasks {
-        t.await.unwrap().expect("allocates");
+        match t.await.unwrap() {
+            Ok(off) => {
+                assert!(held.contains(&(off / chunk)));
+                fed += 1;
+            }
+            Err(e) => {
+                assert!(storage_full(&e), "{e}");
+                refused += 1;
+            }
+        }
     }
+    assert_eq!(
+        (fed, refused),
+        (1, N - 1),
+        "the shipped shape: the RPC that drained the grain feeds its caller; the N−1 empty \
+         replies refuse theirs"
+    );
+    assert_eq!(
+        a.lane_reachable_blocks(),
+        held.len() as u64 - 1,
+        "…while the rest of the grain sits on the local list"
+    );
     let g1 = flight_gauges();
     assert_eq!(g1.harvests, g0.harvests + N as u64, "one RPC per caller");
     assert_eq!(

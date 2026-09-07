@@ -6329,7 +6329,24 @@ pub struct Metrics {
     /// Lane free HARVEST attempts (rung 10, residual 2): a co-writer's
     /// allocation funnel asking the authority for its lane's freed supply
     /// at lane exhaustion. 0 on every non-co-writer mount by construction.
+    /// The RPC count: with the two below, `harvests + coalesced +
+    /// declined_stale` accounts for every would-be call.
     pub alloc_lane_harvests: Align64<AtomicU64>,
+    /// The single-flight harvest's join ledger (finding 15 phase B1,
+    /// `SQUEEZEFS_ALLOC_LANE_HARVEST_SINGLE_FLIGHT`): callers — parked
+    /// allocations, the ahead/pushed ticks — that found a harvest RPC in
+    /// flight on their allocator and awaited ITS outcome instead of
+    /// issuing their own. Growth under a park is the lever working (each
+    /// one is an RPC the authority's serve plane never saw); 0 with the
+    /// lever off by construction.
+    pub alloc_lane_harvest_coalesced: Align64<AtomicU64>,
+    /// The single-flight harvest's decline ledger: callers that found the
+    /// last reply EMPTY with the authority's advertisement unmoved since
+    /// (no grant, no wake, no owed `Freed`) and took the `0` without a
+    /// wire trip. One per park slice per parked allocation on a starved
+    /// lane; the next grant ends the window for exactly one RPC. 0 with
+    /// the lever off by construction.
+    pub alloc_lane_harvest_declined_stale: Align64<AtomicU64>,
     /// Block indices ADOPTED from lane free harvests into this mount's own
     /// free list — the reuse-engagement instrument beside the publish
     /// ledger's `harvest_shipped_blocks` (a sustained-rewrite row past the
@@ -11098,6 +11115,14 @@ impl SqueezefsFilesystem {
                     .alloc_lane_stale_records_folded
                     .load(Ordering::Relaxed),
                 "alloc_lane_harvests": METRICS.alloc_lane_harvests.load(Ordering::Relaxed),
+                // The single-flight ledger (finding 15 phase B1): harvests
+                // + coalesced + declined_stale = every would-be call.
+                "alloc_lane_harvest_coalesced": METRICS
+                    .alloc_lane_harvest_coalesced
+                    .load(Ordering::Relaxed),
+                "alloc_lane_harvest_declined_stale": METRICS
+                    .alloc_lane_harvest_declined_stale
+                    .load(Ordering::Relaxed),
                 "alloc_lane_harvested_blocks": METRICS
                     .alloc_lane_harvested_blocks
                     .load(Ordering::Relaxed),

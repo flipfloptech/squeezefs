@@ -1,0 +1,9 @@
+Warning: SQZ_BIN is not a SqueezeFS knob (typo? `src/env_knobs.rs` is the registry) — ignored
+Warning: SQZ_DEVSUB_OSS_ALGO is not a SqueezeFS knob (typo? `src/env_knobs.rs` is the registry) — ignored
+Warning: SQZ_MWFLEET_MNT_ROOT is not a SqueezeFS knob (typo? `src/env_knobs.rs` is the registry) — ignored
+Warning: SQZ_MWFLEET_OSS_GB is not a SqueezeFS knob (typo? `src/env_knobs.rs` is the registry) — ignored
+[2026-09-07T22:54:10Z INFO  squeezefs] root subprocess PATH sanitized (VAL-7i): dropped relative/empty/group-or-world-writable entries; using '/usr/mpi/gcc/openmpi-4.1.5a1/bin:/scratch/tmp/sqz-agent/cargo/bin:/sbin:/bin:/usr/sbin:/usr/bin'
+fsck job 16859425-cd76-4783-bfb3-fa21a47bd93b running (report-only; watch `squeezefs job list`)…
+fsck (online mode): 2 inode(s), 11 tree page(s), 2561 block(s), 2561 refcount(s) checked in 0 s
+suspects: 0 raised, 0 cleared (0 epoch-exempt, 0 in-flight-exempt, 0 mover-ledger-exempt)
+findings: 0 (clean)

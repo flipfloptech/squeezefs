@@ -126,6 +126,21 @@ mount (the A-arm rig reset the cluster; remount is part of every arm).
    — the standing "no measurement beside a gate" hazard, not the code.
    Every code landing of 2026-09-06/07 is now gated; the tip is
    releasable as 1.2.2.
+1g. **Residues (user pick) — landed, box-adjudicated, NOT closed**
+   (`.benchmarks/2026-09-07-f15-residues-squeeze-test-seq3.md`): D
+   `0bd03455` = claim-anomaly lineage fix (reply carries the freed
+   offsets, publish schema 15, `89cb60b6`) + per-volume fpp supply (close
+   per volume, per-volume lane hint on the grant at `CLUSTER_WIRE_SCHEMA`
+   3, `lane_allocators` dedup, `0bd03455`). D-C-C-D: every row passes the
+   FULL matrix (tripwires 0, fsck clean); the mechanisms engage
+   (`recomputed_retires` 5.5–21k/phase, `volume_hint_skips`, 15–26k
+   per-volume close blocks) but `block_claim_anomalies` (1,108 / 1,117 on
+   D's fpp phases vs 1,035–1,478 on C) and the park slices (20k / 9k /
+   26k vs 12k / 11–14k / 13–18k) did NOT move. Both investigations RESUMED
+   against the per-mount snapshots (`fix/cowriter-claim-anomaly-population`,
+   `perf/cowriter-fpp-supply-reattribution`). Row 4D degenerate (probe
+   235 MiB/s — a 4.4 s cold start); the matrix probe now runs 2 iterations
+   and sizes from the warm one. Gate on `0bd03455` running.
 2. **Kernel A/B, B arm** — after `squeeze-test` boots the 6.19.14 series
    WITH 0031 (or whichever box carries the patched kernel): on the box,
    `cd /scratch/tmp/sqz-agent/k26 && sudo env ARM=B KERNEL_TAG=<uname -r

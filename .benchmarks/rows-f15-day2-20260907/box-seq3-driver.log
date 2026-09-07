@@ -1,0 +1,36 @@
+host memp-s3ds-aqs-37 kernel 6.19.14-sqz rig 0bd034557 2026-09-07T22:48:14Z
+baseline: nvmet: 0/0 daemons: 0 load: 2.66 1.92 0.78 pkg_temp_mC: 35000
+##### row 1D (D) start 2026-09-07T22:48:14Z  pre: nvmet: 0/0 daemons: 0 load: 2.66 1.92 0.78 pkg_temp_mC: 35000
+== 22:48:14 settled: load=2.66 1.92 0.78 (waited 0s)
+[mwmatrix] phase A1 (shared): steady 3592.2 MiB/s over 59s wall (iters: 4419 4325 4071 3847 3393.07 3427.77 3550.78 3552.19 3586.91 3284.21 3504.69 3393.32 3725 3715 3296.01 3750 3363.77 3351.53 3523.
+[mwmatrix] phase B1 (fpp): steady 2214.5 MiB/s over 91s wall (iters: 3371.48 2267.23 2031.93 2109.39 2063.94 2264.49 2231.20 2514.48 2133.88 2353.27 2229.12 2167.13 1907.22 1975.66 2342.31 2164.50 241
+[mwmatrix] phase B2 (fpp): steady 2239.0 MiB/s over 93s wall (iters: 2325.42 2738.50 1814.02 2434.60 2441.83 2296.08 2335.93 2194.84 2137.28 2072.60 2274.34 2165.92 2025.49 2110.74 2098.18 1991.63 232
+[mwmatrix] phase A2 (shared): steady 2851.4 MiB/s over 76s wall (iters: 4047 2203.98 3271.62 1053.15 3057.51 2926.76 3668 2807.94 3095.44 3177.55 3000.54 2721.13 2978.90 2877.02 2906.59 2877.31 2944.3
+sampler: 346 passes over 9 mounts into /scratch/tmp/sqz-agent/day2/keep3-1D/samples
+##### row 1D end rc=0 wall=397s  post: nvmet: 0/0 daemons: 0 load: 29.45 41.06 21.11 pkg_temp_mC: 37000
+##### row 2C (C) start 2026-09-07T22:54:51Z  pre: nvmet: 0/0 daemons: 0 load: 29.45 41.06 21.11 pkg_temp_mC: 37000
+== 22:56:11 settled: load=7.74 31.41 19.37 (waited 80s)
+[mwmatrix] phase A1 (shared): steady 3475.5 MiB/s over 72s wall (iters: 4337 4227 3557.82 3120.49 3490.44 3720 3594.41 3323.98 3832 3518.98 3097.44 3776 3554.07 3378.07 3599.26 3206.12 3197.87 3456.12
+[mwmatrix] phase B1 (fpp): steady 2276.4 MiB/s over 107s wall (iters: 3494.82 2610.04 2121.13 2356.90 1878.94 2569.21 2493.25 2376.22 2325.63 2228.63 2141.91 2185.43 1792.20 2626.32 2219.29 2501.74 24
+[mwmatrix] phase B2 (fpp): steady 2297.6 MiB/s over 108s wall (iters: 2380.99 2597.62 2541.62 2181.19 2341.47 2428.52 2516.99 2409.56 2145.48 2306.87 2243.60 2569.83 2251.07 2223.84 2284.64 2417.27 20
+[mwmatrix] phase A2 (shared): steady 3061.3 MiB/s over 84s wall (iters: 1820.83 3454.21 3104.57 2675.13 2998.65 3077.09 2905.37 3057.09 3033.82 2627.75 2723.43 3230.05 3226.97 2941.89 2931.82 3575.73 
+sampler: 395 passes over 9 mounts into /scratch/tmp/sqz-agent/day2/keep3-2C/samples
+##### row 2C end rc=0 wall=531s  post: nvmet: 0/0 daemons: 0 load: 35.58 59.71 39.59 pkg_temp_mC: 38000
+##### row 3C (C) start 2026-09-07T23:03:42Z  pre: nvmet: 0/0 daemons: 0 load: 35.58 59.71 39.59 pkg_temp_mC: 38000
+== 23:05:12 settled: load=7.92 44.17 35.93 (waited 90s)
+[mwmatrix] phase A1 (shared): steady 3268.2 MiB/s over 57s wall (iters: 4495 3840 3629 3285.70 3424.53 3404.92 3333.00 3523.45 3239.12 3348.92 2966.82 3527.85 2805.49 2830.58 2997.72 3112.65 3020.94 )
+[mwmatrix] phase B1 (fpp): steady 2287.8 MiB/s over 79s wall (iters: 3637 2614.01 2273.16 2236.62 2319.50 2196.79 2222.14 2456.89 2224.57 2331.62 2281.80 2272.19 2089.49 2327.82 2356.08 2124.22 2277.7
+[mwmatrix] phase B2 (fpp): steady 2321.3 MiB/s over 80s wall (iters: 2476.58 2811.91 2274.28 2065.13 2365.63 2273.06 2176.68 2139.46 2533.94 2227.20 2187.67 2464.03 2171.53 2223.57 2511.80 2213.65 250
+[mwmatrix] phase A2 (shared): steady 2970.4 MiB/s over 65s wall (iters: 2135.49 2757.45 3055.84 2784.10 3563.90 2744.71 2995.50 3044.76 3000.35 3039.23 3113.04 2911.74 3020.27 2717.37 2631.37 3042.75 
+sampler: 312 passes over 9 mounts into /scratch/tmp/sqz-agent/day2/keep3-3C/samples
+##### row 3C end rc=0 wall=451s  post: nvmet: 0/0 daemons: 0 load: 37.55 57.25 45.67 pkg_temp_mC: 38000
+##### row 4D (D) start 2026-09-07T23:11:13Z  pre: nvmet: 0/0 daemons: 0 load: 37.55 57.25 45.67 pkg_temp_mC: 38000
+== 23:12:48 settled: load=7.69 41.64 41.22 (waited 95s)
+[mwmatrix] phase A1 (shared): steady 3376.8 MiB/s over 11s wall (iters: 4599 2393.63 3423.06 4468 3222.61 )
+[mwmatrix] phase B1 (fpp): steady 3827.4 MiB/s over 12s wall (iters: 2750.00 3565.39 4575 3681 3488.02 )
+[mwmatrix] phase B2 (fpp): steady 3155.0 MiB/s over 12s wall (iters: 3546.25 2740.56 3874 3201.98 2803.53 )
+[mwmatrix] phase A2 (shared): steady 3338.6 MiB/s over 12s wall (iters: 2642.92 3073.25 3860 3048.25 3373.05 )
+sampler: 89 passes over 9 mounts into /scratch/tmp/sqz-agent/day2/keep3-4D/samples
+##### row 4D end rc=0 wall=216s  post: nvmet: 0/0 daemons: 0 load: 15.54 35.05 38.94 pkg_temp_mC: 37000
+final: nvmet: 0/0 daemons: 0 load: 15.54 35.05 38.94 pkg_temp_mC: 37000
+ALL_DONE 2026-09-07T23:14:49Z

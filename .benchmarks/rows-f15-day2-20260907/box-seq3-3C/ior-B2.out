@@ -1,0 +1,84 @@
+IOR-4.0.0: MPI Coordinated Test of Parallel I/O
+Began               : Mon Sep  7 23:07:54 2026
+Command line        : /scratch/tmp/sqz-agent/src-1.2/target/mw-ior/ior-4.0.0/src/ior -a POSIX -b 4m -t 4m -s 80 -w -e -k -E -G 439967972 -i 17 -F -o /scratch/tmp/sqz-agent/mwfleet-mnt/m50/s11-mpiio-fpp.dat
+Machine             : Linux memp-s3ds-aqs-37
+TestID              : 0
+StartTime           : Mon Sep  7 23:07:54 2026
+Path                : /scratch/tmp/sqz-agent/mwfleet-mnt/m50/s11-mpiio-fpp.dat.00000000
+FS                  : 64.0 GiB   Used FS: 98.7%   Inodes: 1.0 Mi   Used Inodes: 0.0%
+
+Options: 
+api                 : POSIX
+apiVersion          : 
+test filename       : /scratch/tmp/sqz-agent/mwfleet-mnt/m50/s11-mpiio-fpp.dat
+access              : file-per-process
+type                : independent
+segments            : 80
+ordering in a file  : sequential
+ordering inter file : no tasks offsets
+nodes               : 1
+tasks               : 32
+clients per node    : 32
+repetitions         : 17
+xfersize            : 4 MiB
+blocksize           : 4 MiB
+aggregate filesize  : 10 GiB
+
+Results: 
+WARNING: The file "/scratch/tmp/sqz-agent/mwfleet-mnt/m51/s11-mpiio-fpp.dat.00000007" exists already and will be overwritten
+WARNING: The file "/scratch/tmp/sqz-agent/mwfleet-mnt/m53/s11-mpiio-fpp.dat.00000013" exists already and will be overwritten
+WARNING: The file "/scratch/tmp/sqz-agent/mwfleet-mnt/m51/s11-mpiio-fpp.dat.00000006" exists already and will be overwritten
+WARNING: The file "/scratch/tmp/sqz-agent/mwfleet-mnt/m52/s11-mpiio-fpp.dat.00000008" exists already and will be overwritten
+WARNING: The file "/scratch/tmp/sqz-agent/mwfleet-mnt/m52/s11-mpiio-fpp.dat.00000009" exists already and will be overwritten
+WARNING: The file "/scratch/tmp/sqz-agent/mwfleet-mnt/m52/s11-mpiio-fpp.dat.00000010" exists already and will be overwritten
+WARNING: The file "/scratch/tmp/sqz-agent/mwfleet-mnt/m54/s11-mpiio-fpp.dat.00000017" exists already and will be overwritten
+WARNING: The file "/scratch/tmp/sqz-agent/mwfleet-mnt/m57/s11-mpiio-fpp.dat.00000030" exists already and will be overwritten
+WARNING: The file "/scratch/tmp/sqz-agent/mwfleet-mnt/m57/s11-mpiio-fpp.dat.00000031" exists already and will be overwritten
+WARNING: The file "/scratch/tmp/sqz-agent/mwfleet-mnt/m56/s11-mpiio-fpp.dat.00000027" exists already and will be overwritten
+WARNING: The file "/scratch/tmp/sqz-agent/mwfleet-mnt/m50/s11-mpiio-fpp.dat.00000002" exists already and will be overwritten
+WARNING: The file "/scratch/tmp/sqz-agent/mwfleet-mnt/m55/s11-mpiio-fpp.dat.00000020" exists already and will be overwritten
+WARNING: The file "/scratch/tmp/sqz-agent/mwfleet-mnt/m56/s11-mpiio-fpp.dat.00000024" exists already and will be overwritten
+WARNING: The file "/scratch/tmp/sqz-agent/mwfleet-mnt/m51/s11-mpiio-fpp.dat.00000004" exists already and will be overwritten
+WARNING: The file "/scratch/tmp/sqz-agent/mwfleet-mnt/m53/s11-mpiio-fpp.dat.00000014" exists already and will be overwritten
+WARNING: The file "/scratch/tmp/sqz-agent/mwfleet-mnt/m51/s11-mpiio-fpp.dat.00000005" exists already and will be overwritten
+WARNING: The file "/scratch/tmp/sqz-agent/mwfleet-mnt/m53/s11-mpiio-fpp.dat.00000015" exists already and will be overwritten
+WARNING: The file "/scratch/tmp/sqz-agent/mwfleet-mnt/m53/s11-mpiio-fpp.dat.00000012" exists already and will be overwritten
+WARNING: The file "/scratch/tmp/sqz-agent/mwfleet-mnt/m52/s11-mpiio-fpp.dat.00000011" exists already and will be overwritten
+WARNING: The file "/scratch/tmp/sqz-agent/mwfleet-mnt/m55/s11-mpiio-fpp.dat.00000022" exists already and will be overwritten
+WARNING: The file "/scratch/tmp/sqz-agent/mwfleet-mnt/m50/s11-mpiio-fpp.dat.00000001" exists already and will be overwritten
+WARNING: The file "/scratch/tmp/sqz-agent/mwfleet-mnt/m54/s11-mpiio-fpp.dat.00000016" exists already and will be overwritten
+WARNING: The file "/scratch/tmp/sqz-agent/mwfleet-mnt/m54/s11-mpiio-fpp.dat.00000018" exists already and will be overwritten
+WARNING: The file "/scratch/tmp/sqz-agent/mwfleet-mnt/m56/s11-mpiio-fpp.dat.00000025" exists already and will be overwritten
+WARNING: The file "/scratch/tmp/sqz-agent/mwfleet-mnt/m55/s11-mpiio-fpp.dat.00000021" exists already and will be overwritten
+WARNING: The file "/scratch/tmp/sqz-agent/mwfleet-mnt/m54/s11-mpiio-fpp.dat.00000019" exists already and will be overwritten
+WARNING: The file "/scratch/tmp/sqz-agent/mwfleet-mnt/m50/s11-mpiio-fpp.dat.00000000" exists already and will be overwritten
+
+access    bw(MiB/s)  IOPS       Latency(s)  block(KiB) xfer(KiB)  open(s)    wr/rd(s)   close(s)   total(s)   iter
+------    ---------  ----       ----------  ---------- ---------  --------   --------   --------   --------   ----
+WARNING: The file "/scratch/tmp/sqz-agent/mwfleet-mnt/m50/s11-mpiio-fpp.dat.00000003" exists already and will be overwritten
+WARNING: The file "/scratch/tmp/sqz-agent/mwfleet-mnt/m57/s11-mpiio-fpp.dat.00000028" exists already and will be overwritten
+WARNING: The file "/scratch/tmp/sqz-agent/mwfleet-mnt/m56/s11-mpiio-fpp.dat.00000026" exists already and will be overwritten
+WARNING: The file "/scratch/tmp/sqz-agent/mwfleet-mnt/m57/s11-mpiio-fpp.dat.00000029" exists already and will be overwritten
+WARNING: The file "/scratch/tmp/sqz-agent/mwfleet-mnt/m55/s11-mpiio-fpp.dat.00000023" exists already and will be overwritten
+write     2476.58    619.19     1.86        4096       4096       0.000223   4.13       2.77       4.13       0   
+write     2811.91    703.61     2.49        4096       4096       0.000277   3.64       1.65       3.64       1   
+write     2274.28    568.67     3.16        4096       4096       0.005748   4.50       1.48       4.50       2   
+write     2065.13    516.32     4.16        4096       4096       0.000473   4.96       1.79       4.96       3   
+write     2365.63    591.56     3.90        4096       4096       0.000392   4.33       1.62       4.33       4   
+write     2273.06    568.30     3.80        4096       4096       0.000450   4.50       1.35       4.50       5   
+write     2176.68    544.20     3.96        4096       4096       0.000261   4.70       1.43       4.70       6   
+write     2139.46    534.90     4.26        4096       4096       0.000278   4.79       1.62       4.79       7   
+write     2533.94    633.52     3.28        4096       4096       0.000334   4.04       0.926756   4.04       8   
+write     2227.20    556.82     4.14        4096       4096       0.000344   4.60       1.48       4.60       9   
+write     2187.67    546.97     3.00        4096       4096       0.000551   4.68       1.69       4.68       10  
+write     2464.03    616.05     3.78        4096       4096       0.001684   4.16       1.08       4.16       11  
+write     2171.53    542.91     3.75        4096       4096       0.002220   4.72       1.13       4.72       12  
+write     2223.57    555.91     4.01        4096       4096       0.000502   4.61       1.35       4.61       13  
+write     2511.80    627.98     3.58        4096       4096       0.000353   4.08       1.10       4.08       14  
+write     2213.65    553.44     4.13        4096       4096       0.000358   4.63       1.62       4.63       15  
+write     2501.01    625.66     3.87        4096       4096       0.001135   4.09       0.841796   4.09       16  
+
+Summary of all tests:
+Operation   Max(MiB)   Min(MiB)  Mean(MiB)     StdDev   Max(OPs)   Min(OPs)  Mean(OPs)     StdDev    Mean(s) Stonewall(s) Stonewall(MiB) Test# #Tasks tPN reps fPP reord reordoff reordrand seed segcnt   blksiz    xsize aggs(MiB)   API RefNum
+write        2811.91    2065.13    2330.42     186.92     702.98     516.28     582.60      46.73    4.42088         NA            NA     0     32  32   17   1     0        1         0    0     80  4194304  4194304   10240.0 POSIX      0
+Finished            : Mon Sep  7 23:09:09 2026

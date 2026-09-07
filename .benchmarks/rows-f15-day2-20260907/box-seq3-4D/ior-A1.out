@@ -1,0 +1,61 @@
+IOR-4.0.0: MPI Coordinated Test of Parallel I/O
+Began               : Mon Sep  7 23:13:14 2026
+Command line        : /scratch/tmp/sqz-agent/src-1.2/target/mw-ior/ior-4.0.0/src/ior -a POSIX -b 4m -t 4m -s 40 -w -e -k -E -G 51935450 -i 5 -o /scratch/tmp/sqz-agent/mwfleet-mnt/m50/s11-mpiio.dat
+Machine             : Linux memp-s3ds-aqs-37
+TestID              : 0
+StartTime           : Mon Sep  7 23:13:14 2026
+Path                : /scratch/tmp/sqz-agent/mwfleet-mnt/m50/s11-mpiio.dat
+FS                  : 64.0 GiB   Used FS: 3.2%   Inodes: 1.0 Mi   Used Inodes: 0.0%
+
+Options: 
+api                 : POSIX
+apiVersion          : 
+test filename       : /scratch/tmp/sqz-agent/mwfleet-mnt/m50/s11-mpiio.dat
+access              : single-shared-file
+type                : independent
+segments            : 40
+ordering in a file  : sequential
+ordering inter file : no tasks offsets
+nodes               : 1
+tasks               : 32
+clients per node    : 32
+repetitions         : 5
+xfersize            : 4 MiB
+blocksize           : 4 MiB
+aggregate filesize  : 5 GiB
+
+Results: 
+WARNING: The file "/scratch/tmp/sqz-agent/mwfleet-mnt/m50/s11-mpiio.dat" exists already and will be overwritten
+
+access    bw(MiB/s)  IOPS       Latency(s)  block(KiB) xfer(KiB)  open(s)    wr/rd(s)   close(s)   total(s)   iter
+------    ---------  ----       ----------  ---------- ---------  --------   --------   --------   --------   ----
+WARNING: inconsistent file size by different tasks
+WARNING: Expected aggregate file size       = 5368709120
+WARNING: Stat() of aggregate file size      = 5251268608
+WARNING: Using actual aggregate bytes moved = 5368709120
+write     4599       1149.96    0.859098    4096       4096       0.001547   1.11       0.450009   1.11       0   
+WARNING: inconsistent file size by different tasks
+WARNING: Expected aggregate file size       = 5368709120
+WARNING: Stat() of aggregate file size      = 5251268608
+WARNING: Using actual aggregate bytes moved = 5368709120
+write     2393.63    598.46     0.778195    4096       4096       0.000228   2.14       1.48       2.14       1   
+WARNING: inconsistent file size by different tasks
+WARNING: Expected aggregate file size       = 5368709120
+WARNING: Stat() of aggregate file size      = 5251268608
+WARNING: Using actual aggregate bytes moved = 5368709120
+write     3423.06    855.85     0.870561    4096       4096       0.000268   1.50       0.907257   1.50       2   
+WARNING: inconsistent file size by different tasks
+WARNING: Expected aggregate file size       = 5368709120
+WARNING: Stat() of aggregate file size      = 5251268608
+WARNING: Using actual aggregate bytes moved = 5368709120
+write     4468       1117.24    1.15        4096       4096       0.000422   1.15       0.544943   1.15       3   
+WARNING: inconsistent file size by different tasks
+WARNING: Expected aggregate file size       = 5368709120
+WARNING: Stat() of aggregate file size      = 5251268608
+WARNING: Using actual aggregate bytes moved = 5368709120
+write     3222.61    805.73     1.13        4096       4096       0.000303   1.59       0.943094   1.59       4   
+
+Summary of all tests:
+Operation   Max(MiB)   Min(MiB)  Mean(MiB)     StdDev   Max(OPs)   Min(OPs)  Mean(OPs)     StdDev    Mean(s) Stonewall(s) Stonewall(MiB) Test# #Tasks tPN reps fPP reord reordoff reordrand seed segcnt   blksiz    xsize aggs(MiB)   API RefNum
+write        4598.69    2393.63    3621.25     821.96    1149.67     598.41     905.31     205.49    1.49655         NA            NA     0     32  32    5   0     0        1         0    0     40  4194304  4194304    5120.0 POSIX      0
+Finished            : Mon Sep  7 23:13:21 2026

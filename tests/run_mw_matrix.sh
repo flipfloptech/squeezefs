@@ -4663,11 +4663,20 @@ leg_s11_mpiio() {
     probe_bytes=$((ranks * 4 * s_probe))
     truncate -s "$((probe_bytes * 1024 * 1024))" "$w_mnt/s11-mpiio.dat" ||
         die "s11-mpiio: authority could not create the shared file"
+    # Two probe iterations, size from the FASTER: the first write of a fresh
+    # fleet is its cold start (lane opens, first grants, first mints) and
+    # twice on squeeze-test (2026-09-07 rows 8C, 4D) that one iteration took
+    # 4.4 s for 1 GiB instead of 0.35 s, sizing the row to 5 iterations of
+    # a 5–6 GiB file with 12 s phases — a degenerate row the sustained gate
+    # then read as PASS. The warm iteration is the rate the phases run at.
     run_ior "$rowdir/probe.out" "$S11_PROCS" "s11-mpiio.dat" \
-        -b 4m -t 4m -s "$s_probe" -w -e -k -E -G "$sig" -i 1
-    local bw_probe
-    bw_probe="$(ior_iter_bws "$rowdir/probe.out" write | head -1)"
+        -b 4m -t 4m -s "$s_probe" -w -e -k -E -G "$sig" -i 2
+    local bw_probe bw_probe_cold
+    bw_probe_cold="$(ior_iter_bws "$rowdir/probe.out" write | head -1)"
+    bw_probe="$(ior_iter_bws "$rowdir/probe.out" write | sort -g | tail -1)"
     [ -n "$bw_probe" ] || die "s11-mpiio: probe parsed no write bandwidth ($rowdir/probe.out)"
+    [ -n "$bw_probe_cold" ] && [ "$bw_probe_cold" != "$bw_probe" ] &&
+        log "probe cold-start iteration $bw_probe_cold MiB/s discarded (sizing from the warm $bw_probe MiB/s)"
     if [ "$EXT_MODE" = "1" ]; then
         local __post
         for idx in "${cws[@]}"; do

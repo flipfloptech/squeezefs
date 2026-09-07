@@ -1,0 +1,40 @@
+IOR-4.0.0: MPI Coordinated Test of Parallel I/O
+Began               : Mon Sep  7 23:13:25 2026
+Command line        : /scratch/tmp/sqz-agent/src-1.2/target/mw-ior/ior-4.0.0/src/ior -a POSIX -b 4m -t 4m -s 40 -w -e -k -E -G 51935450 -i 5 -F -o /scratch/tmp/sqz-agent/mwfleet-mnt/m50/s11-mpiio-fpp.dat
+Machine             : Linux memp-s3ds-aqs-37
+TestID              : 0
+StartTime           : Mon Sep  7 23:13:25 2026
+Path                : /scratch/tmp/sqz-agent/mwfleet-mnt/m50/s11-mpiio-fpp.dat.00000000
+FS                  : 64.0 GiB   Used FS: 78.5%   Inodes: 1.0 Mi   Used Inodes: 0.0%
+
+Options: 
+api                 : POSIX
+apiVersion          : 
+test filename       : /scratch/tmp/sqz-agent/mwfleet-mnt/m50/s11-mpiio-fpp.dat
+access              : file-per-process
+type                : independent
+segments            : 40
+ordering in a file  : sequential
+ordering inter file : no tasks offsets
+nodes               : 1
+tasks               : 32
+clients per node    : 32
+repetitions         : 5
+xfersize            : 4 MiB
+blocksize           : 4 MiB
+aggregate filesize  : 5 GiB
+
+Results: 
+
+access    bw(MiB/s)  IOPS       Latency(s)  block(KiB) xfer(KiB)  open(s)    wr/rd(s)   close(s)   total(s)   iter
+------    ---------  ----       ----------  ---------- ---------  --------   --------   --------   --------   ----
+write     2750.00    688.21     0.963380    4096       4096       0.007676   1.86       1.04       1.86       0   
+write     3565.39    891.50     0.916313    4096       4096       0.000359   1.44       0.706868   1.44       1   
+write     4575       1144.03    0.912439    4096       4096       0.003418   1.12       0.532352   1.12       2   
+write     3681       920.74     0.824995    4096       4096       0.000340   1.39       0.820873   1.39       3   
+write     3488.02    872.30     1.07        4096       4096       0.000317   1.47       0.695385   1.47       4   
+
+Summary of all tests:
+Operation   Max(MiB)   Min(MiB)  Mean(MiB)     StdDev   Max(OPs)   Min(OPs)  Mean(OPs)     StdDev    Mean(s) Stonewall(s) Stonewall(MiB) Test# #Tasks tPN reps fPP reord reordoff reordrand seed segcnt   blksiz    xsize aggs(MiB)   API RefNum
+write        4575.40    2750.00    3611.98     581.98    1143.85     687.50     902.99     145.50    1.45513         NA            NA     0     32  32    5   1     0        1         0    0     40  4194304  4194304    5120.0 POSIX      0
+Finished            : Mon Sep  7 23:13:33 2026

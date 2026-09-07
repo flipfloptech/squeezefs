@@ -86,6 +86,11 @@ mount (the A-arm rig reset the cluster; remount is part of every arm).
    (`fix/finding-51-adopt-key-incarnation`, `perf/lane-harvest-single-flight`,
    `fix/membership-renewal-isolation`); the A-B-B-A re-runs on their tip,
    with the per-lever legs.
+   **Gate on the day-2 code tip — GREEN on `b119ef78`** (10:47–11:44, pinned
+   worktree, from zero): 361 suites / **4,763 tests**, all 18 stages, both
+   audits (the two allowed warnings = the rc-manifest §5 adjudicated
+   unmaintained notices, `bincode` + `number_prefix`). The docs commits
+   since (`5187da15` … `5ef89fcc`) are docs-only.
 2. **Kernel A/B, B arm** — after `squeeze-test` boots the 6.19.14 series
    WITH 0031 (or whichever box carries the patched kernel): on the box,
    `cd /scratch/tmp/sqz-agent/k26 && sudo env ARM=B KERNEL_TAG=<uname -r

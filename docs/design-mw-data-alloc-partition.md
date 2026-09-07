@@ -266,6 +266,47 @@ The refusal deliberately keeps the `StorageFull` error class, so the ENOSPC
 pressure valve, the reclaim drain-and-retry ladder and every caller's
 handling are unchanged.
 
+### 4.1 A lane exhausts PER VOLUME — the placement consequence
+
+The partition is declared per volume (`engage_alloc_lanes` runs once per
+allocator; the record is `alloc_lane:{vol_tag}:{lane}`), so on a set of N
+data volumes a writer owns N independent shares — and frees are lane-blind
+per volume too: a displaced block returns to the free list of the volume it
+lives on, and a co-writer's harvest asks one `vol_tag` at a time. Step 1 of
+the ladder above is therefore "THIS volume's lane free list", and a
+`StorageFull` from one volume says nothing about its sibling.
+
+The §5.9 write placement did not know that until 2026-09-07
+(`.benchmarks/2026-09-07-cowriter-lane-aware-placement.md`): it weighed
+volumes by DEVICE fill — ≈ 0 on every volume of a dense-full co-writer view,
+so the band was noise and stale for the 5 s health-worker cadence while the
+lane supply churned — and allocated on the picked volume only, so a pick
+landing on the lane-exhausted volume paid a wasted harvest RPC and refused
+the write while hundreds of blocks of the same lane sat reachable on the
+sibling. Now, on a laned CO-WRITER's allocator (`lane_placement_governed`:
+the partition plus the harvest sink; `SQUEEZEFS_COWRITER_LANE_PLACEMENT`),
+the placement weight is the lane-reachable fraction of the lane share, the
+pick reads the lane-reachable counter (a drained volume leaves the pick at
+once, a refilled one is reached at once), and `BackendRouter::
+allocate_placed_block` fails over to the remaining volumes before the
+bounded park — design-volume-lifecycle §5.9's co-writer clause. The
+authority's allocators are NOT lane-governed (its lane-0 supply is its own
+free list; it wires no harvest), so its placement and every single-writer
+mount's stay the device-fill table byte-identically.
+
+The same per-volume shape governs the refill: the renewal grant's
+lane-supply hint (`Grant::lane_supply_blocks`) is SUMMED over the
+authority's volumes and cannot name the one holding the supply, so the
+pushed refill's decision is per volume
+(`free_grace::lane_push_wants_harvest_on_volume`) — a volume owed blocks
+asks, a DRY volume asks on any hint even when owed nothing (a peer's
+rewrites of this lane's blocks put supply on a list no owed ledger here
+knows), a stocked volume owed nothing never asks — and the ahead refill
+treats the hint as evidence beside the owed ledger. A per-volume hint vector
+on the grant would make both exact and is the deferred form: `Grant` is
+`Copy` and travels through 40-odd sites, and the dry-volume rule reaches the
+same volume at the cost of at most one RPC per dry volume per renewal.
+
 ---
 
 ## 5. The stranded-capacity bound

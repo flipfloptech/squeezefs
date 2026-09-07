@@ -36,23 +36,144 @@
 //! `ceil(N/page)` round trips off the metadata plane instead of
 //! `listxattr(1)` plus one `getxattr` per client under a shared `I{1}`
 //! lock (§6.5 item 3's "the read side is worse").
+//!
+//! # The renewal's venue and its instruments (finding 15 phase B1)
+//!
+//! The renewal is the heartbeat AND the freed-offset acknowledgement's
+//! carrier (§6.8 item 3), so its liveness law is "never queue behind bulk
+//! work, on either side" (`docs/design-free-grace-sustain.md`). Finding 2
+//! isolated the member's POLL venue (`sqz-lease`); the SEND still hopped
+//! onto the shared `sqz-blk` pool — FIFO behind every parked RPC round
+//! trip, reclaim lane and crypto job of a co-writer under load. Since
+//! 2026-09-07 the round trip runs on ONE dedicated OS thread (`LEASE_IO`,
+//! `sqz-lease-io`; `SQUEEZEFS_MEMBERSHIP_RENEW_LANE=0` = the shared pool,
+//! the A/B control). The always-on instruments that decide WHERE a slow
+//! renewal's time went: `membership_renew_phase_ns` on the member —
+//! `carry_wait` (the decision, a beat's due instant or a promotion → the
+//! frame's send instant: lane scheduling + venue wait), `rtt` (send →
+//! reply), `total` (decision → grant adopted) — and
+//! `membership_renew_serve_ns` on the authority (frame in → reply built,
+//! inside [`MembershipService::call`]). The fleet's 10 s
+//! (`.benchmarks/2026-09-07-membership-renewal-isolation.md`) was in none
+//! of them: it was the routine BEAT handed out at a drained instant
+//! (`free_grace::take_prod_cadence`'s caught-up arm).
 
 use crate::cluster_wire::{
     ClusterPeer, RpcClient, RpcListener, RpcListenerConfig, RpcRequest, RpcResponse, RpcService,
     RPC_OK, RPC_UNKNOWN_VERB,
 };
 use crate::error::{Result, SqueezefsError};
+use crate::fuse_client::LatencyHistogram;
 use crate::membership::{
     self, Grant, JoinOutcome, JoinRequest, LeaseClock, MemberRole, MemberSession, MemberSnapshot,
     MembershipOwner, RenewOutcome,
 };
 use crate::meta_backend::kv::backend::{KvMetaBackend, MountRegistration};
 use bincode::Options as _;
+use once_cell::sync::Lazy;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+// ---------------------------------------------------------------------------
+// The renewal's instruments and venue
+// ---------------------------------------------------------------------------
+
+/// Member-side phases of one renewal (`membership_renew_phase_ns`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(usize)]
+pub enum RenewPhase {
+    /// Decision (the beat's due instant, or the promotion that asked for
+    /// carriage) → the request frame's send instant: the lease lane's
+    /// scheduling lag plus the blocking venue's wait.
+    CarryWait = 0,
+    /// Send → reply (the wire plus the authority's serve).
+    Rtt = 1,
+    /// Decision → grant adopted.
+    Total = 2,
+}
+
+const RENEW_PHASES: usize = 3;
+const RENEW_PHASE_NAMES: [&str; RENEW_PHASES] = ["carry_wait", "rtt", "total"];
+
+static RENEW_PROF: Lazy<[LatencyHistogram; RENEW_PHASES]> =
+    Lazy::new(|| std::array::from_fn(|_| LatencyHistogram::default()));
+
+/// Authority-side: frame in → reply built, for `VERB_MEMBERSHIP_RENEW`
+/// (`membership_renew_serve_ns`).
+static RENEW_SERVE: Lazy<LatencyHistogram> = Lazy::new(LatencyHistogram::default);
+
+/// Renewal round trips that ran on [`LEASE_IO`] (`membership_renew_lane_calls`).
+static RENEW_LANE_CALLS: AtomicU64 = AtomicU64::new(0);
+
+/// The renewal's dedicated blocking venue: one OS thread, spawned on the
+/// first renewal of an armed member, hosting exactly the lease lane's
+/// socket round trips.
+static LEASE_IO: squeezefs_ipc::sqz_blocking::DedicatedWorker =
+    squeezefs_ipc::sqz_blocking::DedicatedWorker::new("sqz-lease-io");
+
+/// The `SQUEEZEFS_MEMBERSHIP_RENEW_LANE` lever's latch (the free-grace
+/// levers' shape): 0 = unread, 1 = on, 2 = off.
+static RENEW_LANE: AtomicU8 = AtomicU8::new(0);
+
+fn renew_lane_enabled() -> bool {
+    match RENEW_LANE.load(Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            let on = crate::env_knobs::bool_knob("SQUEEZEFS_MEMBERSHIP_RENEW_LANE", true);
+            RENEW_LANE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+            on
+        }
+    }
+}
+
+/// Test seam: `Some(on)` presets the lever's latch; `None` returns it to
+/// the knob.
+pub fn test_set_renew_lane(on: Option<bool>) {
+    RENEW_LANE.store(
+        match on {
+            Some(true) => 1,
+            Some(false) => 2,
+            None => 0,
+        },
+        Ordering::Relaxed,
+    );
+}
+
+/// `membership_renew_phase_ns` — the member-side decomposition.
+pub fn renew_phase_json() -> serde_json::Value {
+    let mut phases = serde_json::Map::new();
+    for (i, name) in RENEW_PHASE_NAMES.iter().enumerate() {
+        phases.insert((*name).to_string(), RENEW_PROF[i].to_json());
+    }
+    serde_json::Value::Object(phases)
+}
+
+/// `membership_renew_serve_ns` — the authority-side serve.
+pub fn renew_serve_json() -> serde_json::Value {
+    RENEW_SERVE.to_json()
+}
+
+/// Renewal round trips that rode the dedicated `sqz-lease-io` thread
+/// (0 under `SQUEEZEFS_MEMBERSHIP_RENEW_LANE=0`).
+pub fn renew_lane_calls() -> u64 {
+    RENEW_LANE_CALLS.load(Ordering::Relaxed)
+}
+
+/// Test seam: zero the renewal instruments and return the lever to the
+/// knob, so one process can run the contracts independently.
+pub fn reset_renew_instruments_for_test() {
+    for h in RENEW_PROF.iter() {
+        h.reset();
+    }
+    RENEW_SERVE.reset();
+    RENEW_LANE_CALLS.store(0, Ordering::Relaxed);
+    test_set_renew_lane(None);
+}
 
 // ---------------------------------------------------------------------------
 // Verbs and statuses
@@ -213,24 +334,29 @@ impl RpcService for MembershipService {
                 },
                 Err(e) => Self::refuse(req.id, RPC_MEMBERSHIP_BAD_REQUEST, e.to_string(), 0),
             },
-            VERB_MEMBERSHIP_RENEW => match decode::<RenewFrame>(&req.body) {
-                Ok(r) => match self.owner.renew(&r.id, r.epoch, r.acked_free_epoch) {
-                    RenewOutcome::Renewed(grant) => RpcResponse {
-                        id: req.id,
-                        status: RPC_OK,
-                        body: encode(&grant).unwrap_or_default(),
+            VERB_MEMBERSHIP_RENEW => {
+                let t0 = Instant::now();
+                let reply = match decode::<RenewFrame>(&req.body) {
+                    Ok(r) => match self.owner.renew(&r.id, r.epoch, r.acked_free_epoch) {
+                        RenewOutcome::Renewed(grant) => RpcResponse {
+                            id: req.id,
+                            status: RPC_OK,
+                            body: encode(&grant).unwrap_or_default(),
+                        },
+                        RenewOutcome::UnknownLease { reason } => Self::refuse(
+                            req.id,
+                            RPC_MEMBERSHIP_UNKNOWN_LEASE,
+                            reason,
+                            // No retry-after: the correct response is
+                            // self-fence then re-join, not a retry.
+                            0,
+                        ),
                     },
-                    RenewOutcome::UnknownLease { reason } => Self::refuse(
-                        req.id,
-                        RPC_MEMBERSHIP_UNKNOWN_LEASE,
-                        reason,
-                        // No retry-after: the correct response is
-                        // self-fence then re-join, not a retry.
-                        0,
-                    ),
-                },
-                Err(e) => Self::refuse(req.id, RPC_MEMBERSHIP_BAD_REQUEST, e.to_string(), 0),
-            },
+                    Err(e) => Self::refuse(req.id, RPC_MEMBERSHIP_BAD_REQUEST, e.to_string(), 0),
+                };
+                RENEW_SERVE.record(t0.elapsed());
+                reply
+            }
             VERB_MEMBERSHIP_LEAVE => match decode::<LeaveFrame>(&req.body) {
                 Ok(l) => {
                     let left = self.owner.leave(&l.id);
@@ -558,34 +684,48 @@ impl MemberClient {
 
     /// Renew — the heartbeat. Carries the member's acknowledged
     /// freed-offset epoch (§6.8 item 3) and re-anchors the member's own
-    /// deadline on THIS send instant.
+    /// deadline on THIS send instant. The decision instant is now (the
+    /// renewal loop passes the beat's due instant through
+    /// [`Self::renew_decided`]).
     pub async fn renew(&mut self) -> Result<()> {
-        let anchor = self.clock.now_ms();
-        let body = encode(&RenewFrame {
-            id: self.id.clone(),
-            epoch: self.session.epoch(),
-            acked_free_epoch: self.session.acked_free_epoch(),
-        })?;
-        let reply = self.rpc.call(VERB_MEMBERSHIP_RENEW, body).await?;
-        let grant = Self::grant_or_error(reply, "renew")?;
-        self.session.renewed(&grant, anchor);
-        Ok(())
+        self.renew_decided(Instant::now(), false).await
     }
 
-    /// The CARRIAGE renewal (hold-time lever (b)): the same verb, the same
-    /// frame — the acknowledgement rides it now instead of at the beat —
-    /// adopted through [`MemberSession::renewed_carriage`] (lease renewed,
-    /// prod honoured; beat and label left to the routine renewal).
-    pub async fn renew_carriage(&mut self) -> Result<()> {
+    /// One renewal round trip, routine or CARRIAGE (hold-time lever (b):
+    /// the same verb, the same frame — the acknowledgement rides it now
+    /// instead of at the beat — adopted through
+    /// [`MemberSession::renewed_carriage`]: lease renewed, prod honoured,
+    /// beat and label left to the routine renewal), attributed from the
+    /// instant it was DECIDED (`decided`: the beat's due instant, or the
+    /// promotion that requested carriage) — `membership_renew_phase_ns`'s
+    /// three spans. The round trip runs on the dedicated `sqz-lease-io`
+    /// thread (`SQUEEZEFS_MEMBERSHIP_RENEW_LANE`, default on) so its send
+    /// never waits behind the shared pool's bulk population; `0` = the
+    /// shared pool, the A/B control.
+    pub async fn renew_decided(&mut self, decided: Instant, carriage: bool) -> Result<()> {
         let anchor = self.clock.now_ms();
         let body = encode(&RenewFrame {
             id: self.id.clone(),
             epoch: self.session.epoch(),
             acked_free_epoch: self.session.acked_free_epoch(),
         })?;
-        let reply = self.rpc.call(VERB_MEMBERSHIP_RENEW, body).await?;
+        let lane = renew_lane_enabled().then_some(&LEASE_IO);
+        if lane.is_some() {
+            RENEW_LANE_CALLS.fetch_add(1, Ordering::Relaxed);
+        }
+        let (reply, timing) = self
+            .rpc
+            .call_timed_on(VERB_MEMBERSHIP_RENEW, body, lane)
+            .await?;
+        RENEW_PROF[RenewPhase::CarryWait as usize].record(timing.sent.duration_since(decided));
+        RENEW_PROF[RenewPhase::Rtt as usize].record(timing.replied.duration_since(timing.sent));
         let grant = Self::grant_or_error(reply, "renew")?;
-        self.session.renewed_carriage(&grant, anchor);
+        if carriage {
+            self.session.renewed_carriage(&grant, anchor);
+        } else {
+            self.session.renewed(&grant, anchor);
+        }
+        RENEW_PROF[RenewPhase::Total as usize].record(decided.elapsed());
         Ok(())
     }
 

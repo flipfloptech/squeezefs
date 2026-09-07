@@ -2629,6 +2629,23 @@ impl RpcClient {
     /// preserved; the roundtrip runs on the blocking pool with the reply
     /// wait bounded by the socket read timeout.
     pub async fn call(&mut self, verb: u16, body: Vec<u8>) -> Result<RpcResponse> {
+        self.call_timed_on(verb, body, None).await.map(|(r, _)| r)
+    }
+
+    /// [`Self::call`] with the round trip's two instants reported and the
+    /// blocking VENUE chosen by the caller: `None` = the shared pool
+    /// (`call`'s venue); `Some(lane)` = a dedicated thread the pool's
+    /// population cannot clog — the liveness-class shape (the membership
+    /// renewal, whose send must never wait behind a parked bulk round
+    /// trip). `sent` is stamped on the venue's thread just before the
+    /// frame is written, so `sent − decision` is exactly the caller's
+    /// venue wait.
+    pub async fn call_timed_on(
+        &mut self,
+        verb: u16,
+        body: Vec<u8>,
+        lane: Option<&squeezefs_ipc::sqz_blocking::DedicatedWorker>,
+    ) -> Result<(RpcResponse, CallTiming)> {
         self.next_id += 1;
         let id = self.next_id;
         let mut io = self.io.take().ok_or_else(|| {
@@ -2636,14 +2653,31 @@ impl RpcClient {
                 "cluster wire: session I/O lost to an earlier panicked call — reconnect".into(),
             )
         })?;
-        let (io, out) = squeezefs_ipc::sqz_blocking::run_blocking(move || {
+        let job = move || {
+            let sent = std::time::Instant::now();
             let out = io.roundtrip(id, verb, body);
-            (io, out)
-        })
-        .await;
+            let replied = std::time::Instant::now();
+            (io, out, CallTiming { sent, replied })
+        };
+        let (io, out, timing) = match lane {
+            Some(lane) => lane.run(job).await,
+            None => squeezefs_ipc::sqz_blocking::run_blocking(job).await,
+        };
         self.io = Some(io);
-        out
+        out.map(|r| (r, timing))
     }
+}
+
+/// The two instants of one [`RpcClient::call_timed_on`] round trip, stamped
+/// on the blocking venue's thread: `sent` just before the request frame
+/// is written, `replied` when the reply frame has been read (or the wait
+/// gave up).
+#[derive(Debug, Clone, Copy)]
+pub struct CallTiming {
+    /// The request frame is about to be written.
+    pub sent: std::time::Instant,
+    /// The reply arrived (or the bounded wait expired).
+    pub replied: std::time::Instant,
 }
 
 // ---------------------------------------------------------------------------

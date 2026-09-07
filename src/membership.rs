@@ -2360,6 +2360,13 @@ impl MemberSession {
 /// send-then-wait race is safe by the primitive's own law.
 static RENEWAL_WAKE: squeezefs_ipc::sqz_notify::Notify = squeezefs_ipc::sqz_notify::Notify::new();
 
+/// The instant the EARLIEST unserved carriage request was made — the
+/// carriage renewal's decision instant for
+/// `membership_renew_phase_ns.carry_wait`. Written once per promotion,
+/// taken once per carriage tick.
+static RENEWAL_REQUESTED_AT: parking_lot::Mutex<Option<std::time::Instant>> =
+    parking_lot::Mutex::new(None);
+
 /// The renewal loop's wake (the seam the contracts observe a request on).
 pub fn renewal_wake() -> &'static squeezefs_ipc::sqz_notify::Notify {
     &RENEWAL_WAKE
@@ -2367,7 +2374,15 @@ pub fn renewal_wake() -> &'static squeezefs_ipc::sqz_notify::Notify {
 
 /// Ask the member's renewal loop to renew NOW rather than at its beat.
 pub fn request_renewal_now() {
+    RENEWAL_REQUESTED_AT
+        .lock()
+        .get_or_insert_with(std::time::Instant::now);
     RENEWAL_WAKE.notify_one();
+}
+
+/// The carriage tick takes the request instant it is serving.
+fn take_renewal_request_instant() -> Option<std::time::Instant> {
+    RENEWAL_REQUESTED_AT.lock().take()
 }
 
 /// What this process is on the membership plane.
@@ -3143,16 +3158,39 @@ pub async fn member_renewal_tick_with(
     on_purge: Option<&Arc<dyn Fn() + Send + Sync>>,
     carriage: bool,
 ) -> RenewalTick {
+    member_renewal_tick_decided(
+        client,
+        endpoint,
+        secret,
+        req,
+        clock,
+        on_purge,
+        carriage,
+        std::time::Instant::now(),
+    )
+    .await
+}
+
+/// [`member_renewal_tick_with`] attributed from the instant the renewal
+/// was DECIDED (the beat's due instant, or the promotion that requested
+/// carriage) — `membership_renew_phase_ns.carry_wait`'s origin.
+#[allow(clippy::too_many_arguments)] // the tick's inputs plus the one instant
+async fn member_renewal_tick_decided(
+    client: &mut crate::membership_wire::MemberClient,
+    endpoint: &str,
+    secret: &[u8],
+    req: &JoinRequest,
+    clock: &LeaseClock,
+    on_purge: Option<&Arc<dyn Fn() + Send + Sync>>,
+    carriage: bool,
+    decided: std::time::Instant,
+) -> RenewalTick {
     let hold = TEST_RENEW_TICK_HOLD_MS.load(Ordering::Relaxed);
     if hold > 0 {
         squeezefs_ipc::sqz_time::sleep(Duration::from_millis(hold)).await;
     }
     let session = Arc::clone(client.session());
-    let renewed = if carriage {
-        client.renew_carriage().await
-    } else {
-        client.renew().await
-    };
+    let renewed = client.renew_decided(decided, carriage).await;
     let Err(e) = renewed else {
         return RenewalTick::Renewed;
     };
@@ -3322,6 +3360,9 @@ fn spawn_member_renewal(
         loop {
             let now = clock.now_ms();
             let due = client.session().renew_at_ms().saturating_sub(now).max(1);
+            // The beat's due instant — a routine renewal's DECISION
+            // instant for `membership_renew_phase_ns.carry_wait`.
+            let beat_due = std::time::Instant::now() + Duration::from_millis(due);
             // The beat is the authority; a wake (lever (b): a promoted
             // acknowledgement) only brings the renewal forward — as a
             // CARRIAGE renewal, which leaves the beat and the label to
@@ -3342,13 +3383,21 @@ fn spawn_member_renewal(
             METRICS
                 .membership_renew_sched_lag_ms
                 .fetch_max(woke.saturating_sub(now + due), Ordering::Relaxed);
+            // A carriage renewal was decided when the promotion asked for
+            // it; a routine one at its beat. Either renewal carries the
+            // current acknowledgement, so a pending request is served by
+            // whichever runs — the stamp is taken on both arms.
+            let decided = match take_renewal_request_instant() {
+                Some(requested) if carriage => requested,
+                _ => beat_due,
+            };
             let session = Arc::clone(client.session());
             let bound = (session.t_self_deadline_ms().saturating_sub(woke) / 3)
                 .max(session.renew_interval_ms())
                 .max(1);
             match squeezefs_ipc::sqz_time::timeout(
                 Duration::from_millis(bound),
-                member_renewal_tick_with(
+                member_renewal_tick_decided(
                     &mut client,
                     &endpoint,
                     &secret,
@@ -3356,6 +3405,7 @@ fn spawn_member_renewal(
                     &clock,
                     on_purge.as_ref(),
                     carriage,
+                    decided,
                 ),
             )
             .await
@@ -3423,6 +3473,12 @@ pub fn stats_snapshot() -> serde_json::Value {
                 "membership_self_deadline_ms": s.t_self_deadline_ms(),
                 "membership_self_fenced": s.fenced(),
                 "membership_acked_free_epoch": s.acked_free_epoch(),
+                // The BEAT in force — the label source's cadence. Read it
+                // beside the authority's `free_grace_prod_renew_ms`: the
+                // routine 10,000 here while the authority asks for 500 is
+                // the finding-15 B1 hole (an ask undelivered until this
+                // beat).
+                "membership_renew_cadence_ms": s.renew_interval_ms(),
             }),
         },
     }

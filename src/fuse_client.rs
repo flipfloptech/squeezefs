@@ -11221,6 +11221,21 @@ impl SqueezefsFilesystem {
                 // heartbeat venue is losing its cadence; read it BEFORE
                 // `membership_self_fences` moves.
                 "membership_renew_sched_lag_ms": METRICS.membership_renew_sched_lag_ms.load(Ordering::Relaxed),
+                // Finding 15 phase B1 (2026-09-07): WHERE a renewal's time
+                // goes, always-on. Member: carry_wait (decision → send —
+                // lane scheduling + blocking venue), rtt (send → reply),
+                // total (decision → grant adopted). Authority: the serve
+                // (frame in → reply built). Read them with the member's
+                // `membership_renew_cadence_ms` against the authority's
+                // `free_grace_prod_renew_ms`: all three spans small while
+                // the cadences disagree is the drained-instant beat hole,
+                // not a stall.
+                "membership_renew_phase_ns": crate::membership_wire::renew_phase_json(),
+                "membership_renew_serve_ns": crate::membership_wire::renew_serve_json(),
+                // Renewal round trips that rode the dedicated `sqz-lease-io`
+                // thread (SQUEEZEFS_MEMBERSHIP_RENEW_LANE's engagement; 0
+                // under `=0`, where the send queues on the shared pool).
+                "membership_renew_lane_calls": crate::membership_wire::renew_lane_calls(),
                 // Idea 2 — latest-wins supersession
                 // (design-rewrite-program §4).
                 "write_pipeline_supersessions": METRICS.write_pipeline_supersessions.load(Ordering::Relaxed),

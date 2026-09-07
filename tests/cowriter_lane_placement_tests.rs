@@ -999,3 +999,69 @@ async fn the_pushed_refill_asks_a_dry_volume_on_a_hint_and_never_a_stocked_unowe
         "owed ⇒ fires as before"
     );
 }
+
+/// Contract 7: **the router names each allocator ONCE**. On a real mount the
+/// default slot ALIASES the first registered data volume's allocator (the
+/// same `Arc` — `BackendRouter::build_backend`'s first-volume bare-key
+/// invariant), and every lane path iterates `lane_allocators()`: the
+/// co-writer engagement (`engage_co_writer_lanes`), the supply-close arm,
+/// the authority's lane-supply source, the release hook. Un-deduplicated,
+/// the first volume was ENGAGED TWICE (the fleet's co-writer logs carry two
+/// "lane ENGAGED on volume 'nvme32n1'" lines per mount lifetime beside one
+/// for 'nvme33n1' — `.benchmarks/2026-09-07-cowriter-fpp-supply-residue.md`):
+/// two ahead-refill tasks on one allocator, so every renewal wake ran THREE
+/// pushed decisions on a two-volume mount (one of them a coalesced or
+/// declined duplicate) and the claim-rate EWMA was sampled twice per tick.
+/// RED against `d603e7ae`: the list carried the alias twice.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_router_names_the_aliased_default_allocator_once() {
+    let _s = serial();
+    let dir = tempfile::tempdir().unwrap();
+    let default_path = dev_file(dir.path(), "default.img");
+    let default_dev = Arc::new(NvmeBlockDev::new(default_path.to_str().unwrap()));
+    let default_alloc = allocator("vol-00000000000000d0").await;
+    let router = Arc::new(BackendRouter::new(
+        Arc::clone(&default_alloc),
+        Arc::clone(&default_dev),
+        Arc::new(AtomicU64::new(squeezefs::block_allocator::CHUNK_SIZE)),
+    ));
+    // The first volume: the mount-time registration REUSES the default
+    // slot's Arcs (`build_backend` on the default device).
+    router
+        .publish_backend(
+            "volA",
+            Arc::new(StorageBackend {
+                device: Arc::clone(&default_dev),
+                block_allocator: Arc::clone(&default_alloc),
+            }),
+        )
+        .unwrap();
+    let b_path = dev_file(dir.path(), "volB.img");
+    let b_alloc = allocator("vol-00000000000000b2").await;
+    router
+        .publish_backend(
+            "volB",
+            Arc::new(StorageBackend {
+                device: Arc::new(NvmeBlockDev::new(b_path.to_str().unwrap())),
+                block_allocator: Arc::clone(&b_alloc),
+            }),
+        )
+        .unwrap();
+    let allocs = router.lane_allocators();
+    assert_eq!(
+        allocs.len(),
+        2,
+        "two data volumes ⇒ two allocators, the alias named once"
+    );
+    assert!(
+        Arc::ptr_eq(&allocs[0], &default_alloc) && Arc::ptr_eq(&allocs[1], &b_alloc),
+        "registration order, the default slot first"
+    );
+    // A bare router (nothing registered) still names its default allocator.
+    let bare = BackendRouter::new(
+        allocator("vol-00000000000000d1").await,
+        Arc::new(NvmeBlockDev::new(default_path.to_str().unwrap())),
+        Arc::new(AtomicU64::new(squeezefs::block_allocator::CHUNK_SIZE)),
+    );
+    assert_eq!(bare.lane_allocators().len(), 1);
+}

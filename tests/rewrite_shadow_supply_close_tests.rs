@@ -49,10 +49,21 @@
 //!    watermark arithmetic, the product's planner) at the fleet's measured
 //!    loop latencies — the lever bounds the parked term by the lane's
 //!    headroom instead of the iteration's length.
+//! 7. **The close is PER VOLUME** (`SQUEEZEFS_REWRITE_SUPPLY_CLOSE_PER_VOLUME`,
+//!    finding 15's fpp residue — `.benchmarks/2026-09-07-cowriter-fpp-supply-residue.md`):
+//!    a lane exhausts and refills PER VOLUME, and a closed epoch's keys
+//!    return to the volume they live on — so a starving volume's tick
+//!    closes the epochs whose parked keys live ON THAT VOLUME, largest
+//!    first, until the yield ON THAT VOLUME covers its deficit
+//!    (`rewrite_shadow_supply_close_volume_blocks`); an epoch parking
+//!    only on other volumes is no candidate (never `bounded`), and a
+//!    tick with parked keys only elsewhere declines `offvolume`. The
+//!    lever off is the mount-wide plan verbatim.
 //!
 //! RED against `2a486273`: no supply-coupled trigger exists — a
 //! co-writer's parked keys wait for the iteration boundary or the
-//! `StorageFull`.
+//! `StorageFull`. Contract 7 RED against `d603e7ae`: the plan counted
+//! parked keys mount-wide.
 
 use fuse3::raw::prelude::Filesystem;
 use fuse3::raw::Request;
@@ -89,6 +100,7 @@ impl Drop for LeverGuard {
     fn drop(&mut self) {
         squeezefs::routing::set_rewrite_shadow(true);
         squeezefs::routing::set_rewrite_supply_close(true);
+        squeezefs::routing::set_rewrite_supply_close_per_volume(true);
         squeezefs::fuse_client::set_patch_max_bytes(512 * 1024);
         squeezefs::device_overlay::clear_device_overlay_for_tests();
         squeezefs::block_reclaim::set_elision_class_all(false);
@@ -236,6 +248,93 @@ async fn make_harness(test_id: &str, capacity_blocks: u64, posture: Posture) -> 
     }
 }
 
+/// The TWO-VOLUME co-writer (the s11 fleet's shape: two data volumes, one
+/// lane share PER VOLUME — `.benchmarks/2026-09-07-cowriter-fpp-supply-residue.md`):
+/// the default slot aliases volume A's allocator exactly as a real mount's
+/// registration does (`BackendRouter::build_backend` on the default device
+/// — bare keys), volume B is a second registered backend with its own
+/// device and laned allocator, and BOTH harvest from an empty authority.
+struct H2 {
+    /// Volume A's view — `h.alloc` IS volume A's allocator, so every
+    /// single-volume helper works verbatim over the two-volume mount.
+    h: H,
+    b: Arc<BlockAllocator>,
+    _backing_b: NamedTempFile,
+}
+
+async fn make_two_volume_harness(test_id: &str, capacity_blocks: u64) -> H2 {
+    let h = make_harness(test_id, capacity_blocks, Posture::CoWriter).await;
+    let backing_b = NamedTempFile::new().unwrap();
+    std::fs::File::create(backing_b.path())
+        .unwrap()
+        .set_len(256 * 1024 * 1024)
+        .unwrap();
+    let dev_b = Arc::new(squeezefs::nvme_dev::NvmeBlockDev::new(
+        backing_b.path().to_str().unwrap(),
+    ));
+    let b = Arc::new(
+        BlockAllocator::new(&format!("{test_id}_volb"))
+            .await
+            .unwrap(),
+    );
+    b.set_capacity_bytes(capacity_blocks * b.chunk_size());
+    b.engage_alloc_lanes(part(2, 1)).expect("lane 1 of 2 on B");
+    b.set_lane_harvest_sink(EmptyAuthority::new().sink());
+    let router = &h.fs.router.backend_router;
+    // Volume A = the default slot's alias (the first-volume registration).
+    let (_, dev_a) = router.get_backend("backend_0").expect("default slot");
+    router
+        .publish_backend(
+            "volA",
+            Arc::new(squeezefs::routing::StorageBackend {
+                device: dev_a,
+                block_allocator: Arc::clone(&h.alloc),
+            }),
+        )
+        .expect("register A");
+    router
+        .publish_backend(
+            "volB",
+            Arc::new(squeezefs::routing::StorageBackend {
+                device: dev_b,
+                block_allocator: Arc::clone(&b),
+            }),
+        )
+        .expect("register B");
+    // The product's wiring point, re-run over the now two-volume router
+    // (the single-volume harness armed A already; the setter is a
+    // OnceLock, so A keeps its sink and B gains one).
+    h.fs.router.arm_rewrite_supply_close();
+    assert!(h.alloc.lane_supply_close_installed() && b.lane_supply_close_installed());
+    H2 {
+        h,
+        b,
+        _backing_b: backing_b,
+    }
+}
+
+/// Take `n` lane blocks off `alloc`'s reachable supply and HOLD them (the
+/// live-data shape: minted, never freed) — what parks a volume's lane at a
+/// chosen stock so the §5.9 lane-aware pick lands on its sibling.
+async fn hold_lane_blocks(alloc: &BlockAllocator, n: u64) -> Vec<u64> {
+    let mut held = Vec::new();
+    for _ in 0..n {
+        held.push(alloc.allocate_block().await.expect("lane block"));
+    }
+    held
+}
+
+/// Give held blocks back to the lane's LOCAL free list (the harvest that
+/// already landed — `adopt_lane_free_grant` after the shipped-free retire,
+/// the placement suite's `adopt_locally` shape).
+fn release_held(alloc: &BlockAllocator, held: &[u64]) {
+    let idxs: Vec<u64> = held.iter().map(|o| o / alloc.chunk_size()).collect();
+    for off in held {
+        alloc.retire_shipped_free_tracking(*off);
+    }
+    assert_eq!(alloc.adopt_lane_free_grant(&idxs), idxs.len() as u64);
+}
+
 fn pattern(len: usize, seed: u8) -> Vec<u8> {
     (0..len)
         .map(|i| ((i as u64 * 7 + seed as u64) % 251) as u8)
@@ -335,6 +434,11 @@ struct Ledger {
     declined_covered: u64,
     declined_no_parked: u64,
     bounded: u64,
+    /// The per-volume plan's faces (contract 7): parked A keys a close
+    /// released ON THE ASKING VOLUME, and ticks declined because the
+    /// mount parked keys only on OTHER volumes.
+    volume_blocks: u64,
+    declined_offvolume: u64,
     swaps: u64,
     fallbacks: u64,
     open_epochs: u64,
@@ -356,6 +460,12 @@ fn ledger() -> Ledger {
             .load(Ordering::Relaxed),
         bounded: METRICS
             .rewrite_shadow_supply_close_bounded
+            .load(Ordering::Relaxed),
+        volume_blocks: METRICS
+            .rewrite_shadow_supply_close_volume_blocks
+            .load(Ordering::Relaxed),
+        declined_offvolume: METRICS
+            .rewrite_shadow_supply_close_declined_offvolume
             .load(Ordering::Relaxed),
         swaps: METRICS.rewrite_shadow_swaps.load(Ordering::Relaxed),
         fallbacks: METRICS.rewrite_shadow_fallbacks.load(Ordering::Relaxed),
@@ -763,6 +873,306 @@ async fn many_small_epochs_close_largest_first_and_the_deficit_bounds_the_tick()
     assert_eq!(l3.swaps - l2.swaps, 4);
     assert_eq!(l3.open_epochs, l0.open_epochs);
     assert_eq!(l3.supply_closes, l2.supply_closes);
+}
+
+// ---------------------------------------------------------------------------
+// Contract 7 — the close is PER VOLUME (finding 15's fpp residue,
+// `.benchmarks/2026-09-07-cowriter-fpp-supply-residue.md`).
+// ---------------------------------------------------------------------------
+
+/// Two volumes, F1 (5 blocks) placed on A and F2 (3 blocks) on B; rewrite 4
+/// of F1 and 2 of F2 so two epochs park 4 A-volume keys and 2 B-volume
+/// keys. Returns the fixture with both epochs open and the lane stocks
+/// the fixture arithmetic predicts: `a_stock = 32 − 5 − new_a`, `b_stock =
+/// 32 − 3 − new_b`, where `new_a`/`new_b` count the rewrites' fresh B keys
+/// the round-robin pick placed on each volume.
+struct ParkedFixture {
+    h2: H2,
+    f1: u64,
+    f2: u64,
+    a_stock: u64,
+    b_stock: u64,
+}
+
+async fn two_volume_parked_fixture(test_id: &str) -> ParkedFixture {
+    let h2 = make_two_volume_harness(test_id, 64).await;
+    let (a, b) = (&h2.h.alloc, &h2.b);
+    a.sample_alloc_rate(1_000);
+    b.sample_alloc_rate(1_000);
+    // F1 on A: B's whole lane held, so the lane-aware pick admits only A.
+    let held_b = hold_lane_blocks(b, b.lane_reachable_blocks()).await;
+    assert_eq!(b.lane_reachable_blocks(), 0, "premise: B's lane is dry");
+    let f1 = striped_fixture(&h2.h, "f1", 5, 3).await;
+    for key in ram_block_map(&h2.h, f1).await.values() {
+        assert!(
+            !key.contains("://"),
+            "premise: F1's block {key} is on A (bare key)"
+        );
+    }
+    release_held(b, &held_b);
+    // F2 on B: A's remaining lane held.
+    let held_a = hold_lane_blocks(a, a.lane_reachable_blocks()).await;
+    assert_eq!(a.lane_reachable_blocks(), 0, "premise: A's lane is dry");
+    let f2 = striped_fixture(&h2.h, "f2", 3, 5).await;
+    for key in ram_block_map(&h2.h, f2).await.values() {
+        assert!(
+            key.starts_with("volB://"),
+            "premise: F2's block {key} is on B"
+        );
+    }
+    release_held(a, &held_a);
+    // Partial rewrites (coverage stays partial — no KD-1.6 close): F1's
+    // four displaced keys park on A, F2's two on B.
+    let l0 = ledger();
+    write_at(&h2.h, f1, 0, &pattern((4 * FBS) as usize, 11)).await;
+    write_at(&h2.h, f2, 0, &pattern((2 * FBS) as usize, 13)).await;
+    quiesce(&h2.h).await;
+    let l1 = ledger();
+    assert_eq!(
+        l1.open_epochs - l0.open_epochs,
+        2,
+        "premise: two open epochs"
+    );
+    assert_eq!(
+        l1.parked_bytes - l0.parked_bytes,
+        6 * FBS,
+        "premise: 4 + 2 parked"
+    );
+    assert_eq!(l1.swaps, l0.swaps, "premise: nothing closed yet");
+    // The fresh B keys' placement (the round-robin pick, both volumes in
+    // band) — what the stock arithmetic below needs.
+    let f1_ram = ram_block_map(&h2.h, f1).await;
+    let f2_ram = ram_block_map(&h2.h, f2).await;
+    let fresh = (0..4u32)
+        .map(|blk| f1_ram[&blk].as_str())
+        .chain((0..2u32).map(|blk| f2_ram[&blk].as_str()));
+    let new_b = fresh.clone().filter(|k| k.starts_with("volB://")).count() as u64;
+    let new_a = fresh.count() as u64 - new_b;
+    let a_stock = 32 - 5 - new_a;
+    let b_stock = 32 - 3 - new_b;
+    assert_eq!(
+        settled_reachable(a, a_stock).await,
+        a_stock,
+        "premise: A's stock"
+    );
+    assert_eq!(
+        settled_reachable(b, b_stock).await,
+        b_stock,
+        "premise: B's stock"
+    );
+    ParkedFixture {
+        h2,
+        f1,
+        f2,
+        a_stock,
+        b_stock,
+    }
+}
+
+/// The lane's reachable count once the debt drainer's transient trim
+/// claims have returned (KD-4.4: with the virgin tail minted, the pressure
+/// venue claims an elided-debt offset OUT of the free list for one device
+/// command and puts it back — a read mid-command under-counts by the
+/// batch). Bounded spin; returns the last read.
+async fn settled_reachable(alloc: &BlockAllocator, expect: u64) -> u64 {
+    let t0 = std::time::Instant::now();
+    loop {
+        let n = alloc.lane_reachable_blocks();
+        if n == expect || t0.elapsed() > std::time::Duration::from_secs(10) {
+            return n;
+        }
+        tokio::task::yield_now().await;
+    }
+}
+
+/// Park volume `alloc`'s lane at `reachable` blocks (from `stock`) and arm
+/// its watermark at the share/4 cap (8): the tick's deficit is `8 −
+/// reachable`.
+async fn starve_to(alloc: &BlockAllocator, stock: u64, reachable: u64) -> u64 {
+    assert!(
+        stock >= reachable,
+        "premise: {stock} stocked, want {reachable}"
+    );
+    let _held = hold_lane_blocks(alloc, stock - reachable).await;
+    assert_eq!(settled_reachable(alloc, reachable).await, reachable);
+    let wm = arm_watermark_at_cap(alloc, 32, 2_000);
+    wm - reachable
+}
+
+/// A starving volume's tick closes the epoch whose parked keys live ON
+/// THAT VOLUME — not the mount's largest epoch. B is 4 short with F1 (4
+/// keys, all on A) and F2 (2 keys, all on B) open: the mount-wide plan
+/// would publish F1 and restock A; the per-volume plan publishes F2 and
+/// restocks B, leaves F1 open (it is no candidate on B — not `bounded`),
+/// and a later B tick with nothing left on B declines `offvolume` instead
+/// of touching F1. RED against `d603e7ae`: the plan counted parked keys
+/// mount-wide, so the yield landed on whichever volume the largest epoch's
+/// keys lived on.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_starving_volume_closes_the_epoch_whose_keys_live_on_it_first() {
+    let _g = serial().await;
+    let _l = LeverGuard;
+    squeezefs::fuse_client::set_patch_max_bytes(0);
+    squeezefs::routing::set_rewrite_shadow(true);
+    squeezefs::routing::set_rewrite_supply_close(true);
+    squeezefs::routing::set_rewrite_supply_close_per_volume(true);
+    let fx = two_volume_parked_fixture("supply_close_per_volume").await;
+    let (h2, f1, f2) = (&fx.h2, fx.f1, fx.f2);
+    let (a, b) = (&h2.h.alloc, &h2.b);
+    let f2_ram = ram_block_map(&h2.h, f2).await;
+    let deficit = starve_to(b, fx.b_stock, 4).await;
+    assert_eq!(deficit, 4, "premise: B is 4 blocks short of its watermark");
+    assert!(
+        fx.a_stock >= 8,
+        "premise: A covers its transit ({})",
+        fx.a_stock
+    );
+
+    let l1 = ledger();
+    let adopted = b.ahead_refill_tick(2_000).await;
+    assert_eq!(adopted, 0, "the empty authority granted nothing");
+    let l2 = ledger();
+    assert_eq!(
+        l2.supply_closes - l1.supply_closes,
+        1,
+        "ONE close: F2's epoch"
+    );
+    assert_eq!(
+        l2.supply_close_blocks - l1.supply_close_blocks,
+        2,
+        "F2's two parked keys released"
+    );
+    assert_eq!(
+        l2.volume_blocks - l1.volume_blocks,
+        2,
+        "…and both landed on the asking volume (rewrite_shadow_supply_close_volume_blocks)"
+    );
+    assert_eq!(
+        l2.bounded, l1.bounded,
+        "F1 is no candidate on B — it is not `bounded`, it is simply not B's"
+    );
+    assert_eq!(l2.declined_offvolume, l1.declined_offvolume);
+    assert_eq!(l1.open_epochs - l2.open_epochs, 1, "F2 closed, F1 open");
+    assert_eq!(
+        l1.parked_bytes - l2.parked_bytes,
+        2 * FBS,
+        "F1's four keys stay parked"
+    );
+    // The yield went to B (the one-process loop lands elided frees back on
+    // the lane at once): 4 → 6. A is untouched.
+    assert_eq!(settled_reachable(b, 6).await, 6, "B restocked by ITS keys");
+    assert_eq!(
+        settled_reachable(a, fx.a_stock).await,
+        fx.a_stock,
+        "A untouched"
+    );
+    // F2's swap is durable; F1's RAM map still differs from its durable one.
+    let f2_durable = durable_block_map(&h2.h, f2).await;
+    for blk in 0..2u32 {
+        assert_eq!(
+            f2_durable.get(&blk),
+            f2_ram.get(&blk),
+            "F2 block {blk} swapped"
+        );
+    }
+    assert_ne!(
+        durable_block_map(&h2.h, f1).await.get(&0),
+        ram_block_map(&h2.h, f1).await.get(&0),
+        "F1's epoch is still open (RAM ≠ durable)"
+    );
+
+    // B is still 2 short and nothing parked lives on B any more: the tick
+    // declines `offvolume` — F1's keys would restock A, not B.
+    let l3 = ledger();
+    b.ahead_refill_tick(2_000).await;
+    let l4 = ledger();
+    assert_eq!(l4.supply_closes, l3.supply_closes, "no close");
+    assert_eq!(
+        l4.declined_offvolume - l3.declined_offvolume,
+        1,
+        "parked keys exist, none on B (rewrite_shadow_supply_close_declined_offvolume)"
+    );
+    assert_eq!(
+        l4.declined_no_parked, l3.declined_no_parked,
+        "not the no-parked shape: F1 IS parking"
+    );
+
+    // A's own starving tick closes F1 — A's keys — and the volume ledger
+    // says so.
+    let _ = starve_to(a, fx.a_stock, 4).await;
+    let l5 = ledger();
+    a.ahead_refill_tick(2_000).await;
+    let l6 = ledger();
+    assert_eq!(
+        l6.supply_closes - l5.supply_closes,
+        1,
+        "F1 closes on A's tick"
+    );
+    assert_eq!(l6.supply_close_blocks - l5.supply_close_blocks, 4);
+    assert_eq!(l6.volume_blocks - l5.volume_blocks, 4);
+    assert_eq!(
+        settled_reachable(a, 8).await,
+        8,
+        "A restocked by ITS keys: 4 → 8"
+    );
+    assert_eq!(l6.open_epochs, l1.open_epochs - 2, "both epochs closed");
+}
+
+/// The lever off is the mount-wide plan verbatim: B's tick publishes the
+/// LARGEST epoch (F1, 4 keys on A), leaves F2 `bounded`, restocks A and
+/// nothing on B, and neither per-volume gauge moves.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_per_volume_lever_off_plans_mount_wide_verbatim() {
+    let _g = serial().await;
+    let _l = LeverGuard;
+    squeezefs::fuse_client::set_patch_max_bytes(0);
+    squeezefs::routing::set_rewrite_shadow(true);
+    squeezefs::routing::set_rewrite_supply_close(true);
+    squeezefs::routing::set_rewrite_supply_close_per_volume(false);
+    let fx = two_volume_parked_fixture("supply_close_mount_wide").await;
+    let (h2, f1) = (&fx.h2, fx.f1);
+    let (a, b) = (&h2.h.alloc, &h2.b);
+    let f1_ram = ram_block_map(&h2.h, f1).await;
+    let deficit = starve_to(b, fx.b_stock, 4).await;
+    assert_eq!(deficit, 4);
+
+    let l1 = ledger();
+    b.ahead_refill_tick(2_000).await;
+    let l2 = ledger();
+    assert_eq!(
+        l2.supply_closes - l1.supply_closes,
+        1,
+        "ONE close: the largest, F1"
+    );
+    assert_eq!(l2.supply_close_blocks - l1.supply_close_blocks, 4);
+    assert_eq!(
+        l2.bounded - l1.bounded,
+        1,
+        "F2 left open — the mount-wide plan's 4 ≥ 4 covered the deficit"
+    );
+    assert_eq!(
+        l2.volume_blocks, l1.volume_blocks,
+        "lever off: no volume ledger"
+    );
+    assert_eq!(l2.declined_offvolume, l1.declined_offvolume);
+    assert_eq!(
+        settled_reachable(b, 4).await,
+        4,
+        "B — the volume that asked — got nothing"
+    );
+    assert_eq!(
+        settled_reachable(a, fx.a_stock + 4).await,
+        fx.a_stock + 4,
+        "the yield restocked A instead"
+    );
+    let f1_durable = durable_block_map(&h2.h, f1).await;
+    for blk in 0..4u32 {
+        assert_eq!(
+            f1_durable.get(&blk),
+            f1_ram.get(&blk),
+            "F1 block {blk} swapped"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------

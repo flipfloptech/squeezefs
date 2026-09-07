@@ -791,6 +791,25 @@ pub fn health_effective(device_health: u32, fill_ratio: f64, set_mean_fill: f64)
     device_health.saturating_sub(balance_penalty(fill_ratio, set_mean_fill))
 }
 
+/// A laned co-writer's placement weight for one volume
+/// (`.benchmarks/2026-09-07-cowriter-lane-aware-placement.md`): the
+/// lane-reachable fraction of the lane share on `health_effective`'s
+/// 0..1000 scale — `reachable × 1000 ÷ share`, clamped to 1000 (an
+/// unbounded allocator reports `u64::MAX` reachable: space is not a
+/// constraint there), 0 for a lane with no share.
+pub fn lane_placement_weight(lane_reachable_blocks: u64, lane_share_blocks: u64) -> u32 {
+    if lane_reachable_blocks == u64::MAX {
+        return 1000;
+    }
+    if lane_share_blocks == 0 {
+        return 0;
+    }
+    if lane_reachable_blocks >= lane_share_blocks {
+        return 1000;
+    }
+    (lane_reachable_blocks.saturating_mul(1000) / lane_share_blocks) as u32
+}
+
 /// One backend row of the [`PlacementTable`] snapshot (design-
 /// volume-lifecycle §5.9/§10): the per-backend placement gauges plus the
 /// Arcs a pick hands to the write path.
@@ -851,6 +870,19 @@ impl PlacementTable {
     /// `unhealthy_backends` fail-stop mark stays authoritative and
     /// INSTANT even against a stale snapshot). Takes ONLY the snapshot —
     /// structurally no router, no filesystem, no syscalls.
+    ///
+    /// **Lane-governed rows** (a laned co-writer's volumes,
+    /// `BlockAllocator::lane_placement_governed`) add the two events the
+    /// refresh cadence is too slow for, read off the allocator's O(1)
+    /// counters — never a rebuild: a banded volume whose lane-reachable
+    /// supply an allocation just drained is skipped (pass 1), and an
+    /// out-of-band volume a harvest just refilled is reached (pass 2,
+    /// entered only when pass 1 found nothing). Pass 3 is the shipped
+    /// round-robin verbatim — a dry set still places, so the picked
+    /// volume's ENOSPC harvest and the failover/park run there. On every
+    /// unpartitioned row `lane_supply_admits` is one `OnceLock` probe, so
+    /// single-writer and authority mounts pay one acquire load per
+    /// candidate and take pass 1's first healthy row exactly as before.
     pub fn pick<F: Fn(&str) -> bool>(
         &self,
         healthy: F,
@@ -866,12 +898,79 @@ impl PlacementTable {
         let start = self.rr.fetch_add(1, Ordering::Relaxed);
         for i in 0..n {
             let row = &self.rows[self.band[start.wrapping_add(i) % n]];
+            if healthy(&row.id) && row.lane_supply_admits() {
+                return Some(row.take());
+            }
+        }
+        for row in &self.rows {
+            if row.eligible
+                && healthy(&row.id)
+                && row.allocator.lane_placement_governed()
+                && row.allocator.lane_reachable_blocks() > 0
+            {
+                return Some(row.take());
+            }
+        }
+        for i in 0..n {
+            let row = &self.rows[self.band[start.wrapping_add(i) % n]];
             if healthy(&row.id) {
-                row.picks.fetch_add(1, Ordering::Relaxed);
-                return Some((row.id.clone(), row.allocator.clone(), row.device.clone()));
+                return Some(row.take());
             }
         }
         None
+    }
+
+    /// The eligible, healthy rows other than `picked` — the placed
+    /// allocation's failover order: lane-governed rows that still hold
+    /// lane-reachable supply first, then the rest (whose ENOSPC harvest
+    /// may still reach supply the authority holds for them). A cold path:
+    /// entered only after the picked volume refused `StorageFull`.
+    fn failover_candidates<F: Fn(&str) -> bool>(
+        &self,
+        picked: &str,
+        healthy: F,
+    ) -> Vec<(
+        String,
+        std::sync::Arc<crate::block_allocator::BlockAllocator>,
+        std::sync::Arc<crate::nvme_dev::NvmeBlockDev>,
+    )> {
+        let mut stocked = Vec::new();
+        let mut dry = Vec::new();
+        for row in &self.rows {
+            if row.id == picked || !row.eligible || !healthy(&row.id) {
+                continue;
+            }
+            if row.allocator.lane_placement_governed() && row.allocator.lane_reachable_blocks() == 0
+            {
+                dry.push(row.take());
+            } else {
+                stocked.push(row.take());
+            }
+        }
+        stocked.extend(dry);
+        stocked
+    }
+}
+
+impl PlacementRow {
+    /// Hand this row to the write path, counting the pick.
+    fn take(
+        &self,
+    ) -> (
+        String,
+        std::sync::Arc<crate::block_allocator::BlockAllocator>,
+        std::sync::Arc<crate::nvme_dev::NvmeBlockDev>,
+    ) {
+        self.picks.fetch_add(1, Ordering::Relaxed);
+        (self.id.clone(), self.allocator.clone(), self.device.clone())
+    }
+
+    /// Pass-1 admission: an ungoverned row always admits; a lane-governed
+    /// row admits while its lane has reachable supply (two atomic loads +
+    /// one `OnceLock` probe on the allocator's maintained counters).
+    #[inline]
+    fn lane_supply_admits(&self) -> bool {
+        !self.allocator.lane_placement_governed() || self.allocator.lane_reachable_blocks() > 0
     }
 }
 
@@ -1828,10 +1927,23 @@ impl BackendRouter {
                 // The device/health score: the free-fraction × 1000 the
                 // write path has always ranked on, census-sourced.
                 let device_health = ((1.0 - fill_ratio).max(0.0) * 1000.0) as u32;
-                let weight = if c.eligible {
-                    health_effective(device_health, fill_ratio, set_mean)
-                } else {
+                let weight = if !c.eligible {
                     0
+                } else if c.allocator.lane_placement_governed() {
+                    // A laned co-writer's volume: the device fill says
+                    // nothing about THIS mount's lane on it (its share
+                    // exhausts and refills per volume, independently of
+                    // the device), so the weight is the lane-reachable
+                    // fraction of the lane share on the same 0..1000
+                    // scale — an exhausted lane leaves the band. No
+                    // balance penalty: the set-mean term is a device
+                    // statement too.
+                    lane_placement_weight(
+                        c.allocator.lane_reachable_blocks(),
+                        c.allocator.lane_share_blocks(),
+                    )
+                } else {
+                    health_effective(device_health, fill_ratio, set_mean)
                 };
                 let picks = self
                     .placement_picks
@@ -2377,6 +2489,93 @@ impl BackendRouter {
             std::io::ErrorKind::NotConnected,
             "No healthy storage backends available for write",
         )))
+    }
+
+    /// **The write path's placement + allocation as ONE act**: the §5.9
+    /// pick ([`Self::get_active_backend`]) and the finding-29 bounded
+    /// allocation on the picked volume — `(be_id, allocator, device,
+    /// offset)`. Every fresh-block site (write-through, overlay, flush and
+    /// fold uploads, spills, blobs) calls this instead of pairing the two
+    /// itself.
+    ///
+    /// On a mount whose picked allocator is NOT lane-governed
+    /// (`BlockAllocator::lane_placement_governed` — every single-writer and
+    /// authority mount, and every co-writer under
+    /// `SQUEEZEFS_COWRITER_LANE_PLACEMENT=0`) this IS the shipped pair,
+    /// instruction for instruction: the pick, then that allocator's
+    /// `allocate_block_grace_bounded`. "Full" is full there — every
+    /// volume's whole free list is this mount's.
+    ///
+    /// On a laned co-writer (`.benchmarks/2026-09-07-cowriter-lane-aware-
+    /// placement.md`) the lane's share exhausts and refills PER VOLUME, so a
+    /// `StorageFull` from the picked volume says nothing about its sibling:
+    /// the remaining eligible volumes are tried IN THE SAME ATTEMPT (each
+    /// `allocate_block` runs its own ENOSPC harvest against the authority,
+    /// so supply the authority holds for this lane on ANY volume is reached
+    /// here), and only when every volume refused does the allocation park —
+    /// the same bounded park as today (`park_for_reclaimable_supply`, with
+    /// the set's reclaimable verdict), retrying the whole set each slice.
+    /// Ledger: `backend_placement_lane_failovers` (allocations that landed
+    /// on a volume other than the pick) and
+    /// `backend_placement_lane_exhausted_picks` (picks that landed on a
+    /// lane-exhausted volume while a sibling had lane supply — ≈ 0 by
+    /// construction of the pick; growth = predicate rot).
+    pub async fn allocate_placed_block(
+        &self,
+    ) -> Result<(
+        String,
+        std::sync::Arc<crate::block_allocator::BlockAllocator>,
+        std::sync::Arc<crate::nvme_dev::NvmeBlockDev>,
+        u64,
+    )> {
+        let (be_id, allocator, device) = self.get_active_backend()?;
+        if !allocator.lane_placement_governed() {
+            let offset = allocator.allocate_block_grace_bounded().await?;
+            return Ok((be_id, allocator, device, offset));
+        }
+        let metrics = &crate::fuse_client::METRICS;
+        let siblings = self
+            .placement_table
+            .load()
+            .failover_candidates(&be_id, |id| self.is_backend_healthy(id));
+        if allocator.lane_reachable_blocks() == 0
+            && siblings
+                .iter()
+                .any(|(_, a, _)| a.lane_reachable_blocks() > 0)
+        {
+            metrics
+                .backend_placement_lane_exhausted_picks
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        let started = std::time::Instant::now();
+        loop {
+            let e = match allocator.allocate_block().await {
+                Ok(offset) => return Ok((be_id, allocator, device, offset)),
+                Err(e) if crate::block_allocator::is_storage_full(&e) => e,
+                Err(e) => return Err(e),
+            };
+            for (sib_id, sib_alloc, sib_dev) in &siblings {
+                match sib_alloc.allocate_block().await {
+                    Ok(offset) => {
+                        metrics
+                            .backend_placement_lane_failovers
+                            .fetch_add(1, Ordering::Relaxed);
+                        return Ok((sib_id.clone(), sib_alloc.clone(), sib_dev.clone(), offset));
+                    }
+                    Err(e) if crate::block_allocator::is_storage_full(&e) => continue,
+                    Err(e) => return Err(e),
+                }
+            }
+            // No volume has supply: the park is for exactly this, and it
+            // is bounded by the same wall as the single-volume form.
+            let reclaimable = allocator.reclaimable_supply_exists()
+                || siblings
+                    .iter()
+                    .any(|(_, a, _)| a.reclaimable_supply_exists());
+            allocator
+                .park_for_reclaimable_supply(e, started, reclaimable)
+                .await?;
+        }
     }
 
     /// The VL4 mover's destination pick (design-volume-lifecycle
@@ -8548,8 +8747,8 @@ impl DataRouter {
                     }
                 }
             }
-            let (be_id, block_allocator, nvme_writer) = self.backend_router.get_active_backend()?;
-            let offset = block_allocator.allocate_block_grace_bounded().await?;
+            let (be_id, block_allocator, nvme_writer, offset) =
+                self.backend_router.allocate_placed_block().await?;
             _blob_inflight = Some(block_allocator.inflight_register(offset));
             // RES-9 mint guard: any `?` between here and the layout commit
             // frees the fresh blob instead of leaking an allocated block
@@ -12687,8 +12886,7 @@ impl DataRouter {
             .get_crypto()
             .process_write_async(bytes::Bytes::from(raw))
             .await?;
-        let (be_id, allocator, writer) = self.backend_router.get_active_backend()?;
-        if processed.len() as u64 > allocator.chunk_size() {
+        if processed.len() as u64 > crate::block_allocator::CHUNK_SIZE {
             // FIND-RW4-A: unreachable post-fix (the store-raw escape bounds
             // every stored image by `max_stored_image_len`, and the mount
             // geometry gate guarantees that fits the chunk). Staying
@@ -12700,11 +12898,12 @@ impl DataRouter {
                  allocator chunk — FIND-RW4-A geometry invariant violated; file stays \
                  ring-resident (readable, never promoted)",
                 processed.len(),
-                allocator.chunk_size()
+                crate::block_allocator::CHUNK_SIZE
             );
             return Ok(false);
         }
-        let offset = allocator.allocate_block_grace_bounded().await?;
+        let (be_id, allocator, writer, offset) =
+            self.backend_router.allocate_placed_block().await?;
         // PR VL6a: live owner registration for the allocate→commit window
         // (drops at function end, after the layout commit below).
         let _inflight = allocator.inflight_register(offset);
@@ -15798,14 +15997,13 @@ impl DataRouter {
                         .process_write_async(shared_data.clone())
                         .await?;
 
-                    let (be_id, block_allocator, nvme_writer) =
-                        self.backend_router.get_active_backend()?;
                     crate::block_allocator::ensure_stored_block_image_fits(
                         processed_data.len(),
-                        block_allocator.chunk_size(),
+                        crate::block_allocator::CHUNK_SIZE,
                         "staged spill",
                     )?;
-                    let be_offset = block_allocator.allocate_block_grace_bounded().await?;
+                    let (be_id, block_allocator, nvme_writer, be_offset) =
+                        self.backend_router.allocate_placed_block().await?;
                     // PR VL6a: in-flight until `save_metadata_to_backend`
                     // below publishes the spill layout (scope-held).
                     let _inflight = block_allocator.inflight_register(be_offset);
@@ -15919,9 +16117,9 @@ impl DataRouter {
         let mut inflight_guards: Vec<crate::block_allocator::InflightAllocGuard> = Vec::new();
 
         for (block_idx, chunk) in chunks {
-            let (be_id, block_allocator, nvme_writer) =
-                match self.backend_router.get_active_backend() {
-                    Ok(res) => res,
+            let (be_id, block_allocator, nvme_writer, offset) =
+                match self.backend_router.allocate_placed_block().await {
+                    Ok(placed) => placed,
                     Err(e) => {
                         for k in &allocated_keys {
                             let _ = self.backend_router.free_block(k).await;
@@ -15929,16 +16127,6 @@ impl DataRouter {
                         return Err(e);
                     }
                 };
-
-            let offset = match block_allocator.allocate_block_grace_bounded().await {
-                Ok(o) => o,
-                Err(e) => {
-                    for k in &allocated_keys {
-                        let _ = self.backend_router.free_block(k).await;
-                    }
-                    return Err(e);
-                }
-            };
             let stored_block_key = self.backend_router.persist_block_key(&be_id, offset);
             allocated_keys.push(stored_block_key.clone());
             inflight_guards.push(block_allocator.inflight_register(offset));
@@ -16185,9 +16373,8 @@ impl DataRouter {
                     block_data.into_bytes()
                 };
 
-                let (be_id, block_allocator, nvme_writer) =
-                    router_clone.backend_router.get_active_backend()?;
-                let offset = block_allocator.allocate_block_grace_bounded().await?;
+                let (be_id, block_allocator, nvme_writer, offset) =
+                    router_clone.backend_router.allocate_placed_block().await?;
                 // PR VL6a: live-owner registration rides the task result
                 // back to the caller, which holds it across the merge.
                 let inflight = block_allocator.inflight_register(offset);
@@ -18385,14 +18572,13 @@ impl DataRouter {
                     .get_crypto()
                     .process_write_async(bytes::Bytes::from(img))
                     .await?;
-                let (be_id, block_allocator, nvme_writer) =
-                    self.backend_router.get_active_backend()?;
                 crate::block_allocator::ensure_stored_block_image_fits(
                     processed.len(),
-                    block_allocator.chunk_size(),
+                    crate::block_allocator::CHUNK_SIZE,
                     "rider-fold spill",
                 )?;
-                let be_offset = block_allocator.allocate_block_grace_bounded().await?;
+                let (be_id, block_allocator, nvme_writer, be_offset) =
+                    self.backend_router.allocate_placed_block().await?;
                 // PR VL6a: in-flight until the layout commit below.
                 let _inflight = block_allocator.inflight_register(be_offset);
                 let stored_block_key = format!(
@@ -18686,14 +18872,13 @@ impl DataRouter {
                             .get_crypto()
                             .process_write_async(bytes::Bytes::from(data))
                             .await?;
-                        let (be_id, block_allocator, nvme_writer) =
-                            self.backend_router.get_active_backend()?;
                         crate::block_allocator::ensure_stored_block_image_fits(
                             processed.len(),
-                            block_allocator.chunk_size(),
+                            crate::block_allocator::CHUNK_SIZE,
                             "staged-clone spill",
                         )?;
-                        let be_offset = block_allocator.allocate_block_grace_bounded().await?;
+                        let (be_id, block_allocator, nvme_writer, be_offset) =
+                            self.backend_router.allocate_placed_block().await?;
                         // PR VL6a: in-flight until the caller's dest-layout
                         // commit below publishes the mapping (scope-held —
                         // this fn commits `updated_meta` before returning).
@@ -19359,14 +19544,13 @@ impl DataRouter {
                     if img.len() as u64 > new_size {
                         let clipped = img.slice(0..new_size as usize);
                         let processed = self.get_crypto().process_write_async(clipped).await?;
-                        let (be_id, allocator, writer) =
-                            self.backend_router.get_active_backend()?;
                         crate::block_allocator::ensure_stored_block_image_fits(
                             processed.len(),
-                            allocator.chunk_size(),
+                            crate::block_allocator::CHUNK_SIZE,
                             "staged truncate durable clip",
                         )?;
-                        let offset = allocator.allocate_block_grace_bounded().await?;
+                        let (be_id, allocator, writer, offset) =
+                            self.backend_router.allocate_placed_block().await?;
                         _clip_inflight = Some(allocator.inflight_register(offset));
                         // Size-carrying mapping (`bk:0:packed_len` — see
                         // `parse_block_mapping`).

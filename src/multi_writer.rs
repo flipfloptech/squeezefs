@@ -338,11 +338,11 @@ pub fn indirect_map_io_for(
                 }
                 let aligned_len = (serialized.len() + 4095) & !4095;
                 serialized.resize(aligned_len, 0);
-                let (be_id, block_allocator, nvme_writer) = router.get_active_backend()?;
                 // Finding 29: the serve-side blob mint rides the bounded
                 // form too — an authority mid grace-storm must park for
                 // the fence, not fail the served publish.
-                let offset = block_allocator.allocate_block_grace_bounded().await?;
+                let (be_id, block_allocator, nvme_writer, offset) =
+                    router.allocate_placed_block().await?;
                 let inflight = block_allocator.inflight_register(offset);
                 // RES-9: any `?` between here and the caller's naming commit
                 // frees the fresh blob instead of leaking an allocated block

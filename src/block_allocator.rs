@@ -183,7 +183,7 @@ pub type SpacePending = Arc<dyn Fn() -> bool + Send + Sync>;
 /// `pending` true.
 const ENOSPC_VALVE_MAX_ATTEMPTS: u32 = 32;
 
-fn is_storage_full(e: &crate::error::SqueezefsError) -> bool {
+pub(crate) fn is_storage_full(e: &crate::error::SqueezefsError) -> bool {
     matches!(e, crate::error::SqueezefsError::Io(io) if io.kind() == std::io::ErrorKind::StorageFull)
 }
 
@@ -453,6 +453,43 @@ pub fn test_set_harvest_ahead(on: Option<bool>) {
 /// Test seam: `true` ⇔ a preset was in force.
 pub fn test_clear_harvest_ahead() -> bool {
     HARVEST_AHEAD.swap(0, Ordering::Relaxed) != 0
+}
+
+/// The `SQUEEZEFS_COWRITER_LANE_PLACEMENT` lever's latch (same shape):
+/// lane-aware write placement + allocation failover on a laned co-writer
+/// (`.benchmarks/2026-09-07-cowriter-lane-aware-placement.md`). `0` = the
+/// shipped device-fill pick and no failover, the fleet A/B control.
+static COWRITER_LANE_PLACEMENT: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// Whether a laned co-writer's placement is lane-governed (one relaxed
+/// load after the first read).
+pub fn cowriter_lane_placement_enabled() -> bool {
+    match COWRITER_LANE_PLACEMENT.load(Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            let on = crate::env_knobs::bool_knob("SQUEEZEFS_COWRITER_LANE_PLACEMENT", true);
+            COWRITER_LANE_PLACEMENT.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+            on
+        }
+    }
+}
+
+/// Test seam (the `test_set_harvest_ahead` shape).
+pub fn test_set_cowriter_lane_placement(on: Option<bool>) {
+    COWRITER_LANE_PLACEMENT.store(
+        match on {
+            Some(true) => 1,
+            Some(false) => 2,
+            None => 0,
+        },
+        Ordering::Relaxed,
+    );
+}
+
+/// Test seam: `true` ⇔ a preset was in force.
+pub fn test_clear_cowriter_lane_placement() -> bool {
+    COWRITER_LANE_PLACEMENT.swap(0, Ordering::Relaxed) != 0
 }
 
 /// **The lane-counted free set** (sustain campaign KD-FG-10,
@@ -1416,6 +1453,41 @@ impl BlockAllocator {
         (virgin / self.chunk_size).saturating_add(self.free_blocks.lane_owned())
     }
 
+    /// **Lane-governed placement** (`.benchmarks/2026-09-07-cowriter-lane-
+    /// aware-placement.md`): `true` ⇔ this is a laned CO-WRITER's allocator
+    /// — a partition engaged AND the lane free harvest wired (only the
+    /// co-writer engagement wires it, `alloc_lane_grant::
+    /// engage_allocator_lane`) — with `SQUEEZEFS_COWRITER_LANE_PLACEMENT`
+    /// on. The §5.9 placement table then weighs this volume by its
+    /// lane-reachable supply instead of the device fill, and the write
+    /// path's allocation fails over to a sibling before it parks. Every
+    /// single-writer and authority allocator answers `false` in one
+    /// `OnceLock` probe, which is what keeps their placement byte-identical.
+    pub fn lane_placement_governed(&self) -> bool {
+        match self.lanes.get() {
+            Some(lanes) if lanes.harvest.get().is_some() => cowriter_lane_placement_enabled(),
+            _ => false,
+        }
+    }
+
+    /// The blocks of this device the owned lanes hold in total (the
+    /// lane-reachable supply's denominator — `lane_reachable_blocks ×
+    /// 1000 ÷ lane_share_blocks` is the lane-governed placement weight).
+    /// 0 unpartitioned or unbounded.
+    pub fn lane_share_blocks(&self) -> u64 {
+        let Some(lanes) = self.lanes.get() else {
+            return 0;
+        };
+        let cap = self.capacity_blocks.load(Ordering::Relaxed);
+        let owned = lanes.owned.load(Ordering::Acquire);
+        (0..lanes.part.writers())
+            .filter(|lane| owned & (1u64 << lane) != 0)
+            .map(|lane| {
+                crate::data_alloc_lane::lane_capacity_blocks(cap, lanes.part.writers(), lane)
+            })
+            .fold(0u64, u64::saturating_add)
+    }
+
     /// PR VL6b (design-volume-lifecycle §5.6a, C3 **recount-and-set** /
     /// the C2-lost allocator-repair tail): set `offset`'s refcount to the
     /// verified counted-reference value. Repair-only seam — callers hold
@@ -2022,16 +2094,29 @@ impl BlockAllocator {
         self.harvest_watermark.load(Ordering::Relaxed)
     }
 
-    /// §5.5's decision: harvest ahead ⇔ the lever is armed, this allocator
-    /// is OWED supply, and its lane-reachable stock sits below the
-    /// watermark. `Some(ask)` = the grain-bounded batch to request; `None`
-    /// = nothing to do (owed nothing / stocked / quiet / lever off).
+    /// §5.5's decision: harvest ahead ⇔ the lever is armed, supply is
+    /// EXPECTED on the authority for this lane, and this allocator's
+    /// lane-reachable stock sits below the watermark. `Some(ask)` = the
+    /// grain-bounded batch to request; `None` = nothing to do (nothing
+    /// expected / stocked / quiet / lever off).
+    ///
+    /// Supply is expected when this allocator is OWED blocks (its own
+    /// shipped frees came back `Freed`) OR the authority's last renewal
+    /// hint says the lane has supply on its lists
+    /// ([`crate::free_grace::lane_supply_hint`]). The hint is SUMMED over
+    /// volumes, so it cannot name the one that holds the supply — a peer's
+    /// rewrites of this lane's blocks land there with no owed ledger
+    /// knowing — so every low volume asks; a volume that asked and got
+    /// nothing has paid one RTT, and its stock stays where the lane-aware
+    /// placement can see it (`.benchmarks/2026-09-07-cowriter-lane-aware-
+    /// placement.md`).
     pub fn should_harvest_ahead(&self) -> Option<u64> {
         if !harvest_ahead_enabled() {
             return None;
         }
         let lanes = self.lanes.get()?;
-        if self.lane_owed.load(Ordering::Acquire) == 0 {
+        if self.lane_owed.load(Ordering::Acquire) == 0 && crate::free_grace::lane_supply_hint() == 0
+        {
             return None;
         }
         let watermark = self.harvest_watermark.load(Ordering::Relaxed);
@@ -2112,16 +2197,19 @@ impl BlockAllocator {
     /// on the wake, instead of at the next watermark tick (which a quiet
     /// lane's decayed rate turns dark) or the next ENOSPC. The SAME harvest
     /// (sink → adopt → hint deposit); the decision is
-    /// [`crate::free_grace::lane_push_wants_harvest`]. Returns the count
-    /// adopted (0 = the decision declined, or an empty grant).
+    /// [`crate::free_grace::lane_push_wants_harvest_on_volume`] — per
+    /// VOLUME, because the hint is summed: a DRY volume asks even when owed
+    /// nothing. Returns the count adopted (0 = the decision declined, or an
+    /// empty grant).
     pub async fn pushed_refill_tick(&self, now_ms: u64) -> u64 {
         self.sample_alloc_rate(now_ms);
         if self.lanes.get().and_then(|l| l.harvest.get()).is_none() {
             return 0;
         }
-        let adopted = if crate::free_grace::lane_push_wants_harvest(
+        let adopted = if crate::free_grace::lane_push_wants_harvest_on_volume(
             crate::free_grace::lane_supply_hint(),
             self.lane_owed_blocks(),
+            self.lane_reachable_blocks(),
         ) {
             crate::fuse_client::METRICS
                 .alloc_lane_pushed_harvests
@@ -2161,7 +2249,7 @@ impl BlockAllocator {
     /// every reply's hint before the verdict, so the word read here is
     /// this pass's. The sink's mere presence made every exhausted
     /// co-writer allocation park (the 2026-09-05 s11 fleet wedge).
-    fn reclaimable_supply_exists(&self) -> bool {
+    pub(crate) fn reclaimable_supply_exists(&self) -> bool {
         if !self.grace.is_empty() {
             return true;
         }
@@ -2566,38 +2654,58 @@ impl BlockAllocator {
         let started = std::time::Instant::now();
         loop {
             match self.allocate_block().await {
-                Err(e) if is_storage_full(&e) && self.reclaimable_supply_exists() => {
-                    let wall = crate::free_grace::pressure_park_wall_ms();
-                    let waited_ms = started.elapsed().as_millis() as u64;
-                    if waited_ms >= wall {
-                        log::error!(
-                            "bounded allocation refusing StorageFull after {waited_ms} ms parked \
-                             with {} offset(s) still in grace locally (lane harvest horizon {} \
-                             ms): the pressure deadline never fenced within the wall backstop \
-                             ({wall} ms). The refusal is honest and terminal for this write; \
-                             investigate the membership plane (finding 29)",
-                            self.grace.len(),
-                            self.horizon_composed_ms.load(Ordering::Relaxed),
-                        );
-                        return Err(e);
-                    }
-                    let slice = crate::free_grace::pressure_park_slice_ms();
-                    crate::free_grace::note_pressure_park();
-                    // The lane-push lever (finding 15 term 2): a renewal
-                    // grant's lane-supply hint ends the slice at once, so
-                    // the retry's harvest runs on the hint's heels rather
-                    // than at the slice's own cadence. Inert with the lever
-                    // off (nothing ever notifies) and on every mount that
-                    // is not a co-writer.
-                    let _ = squeezefs_ipc::sqz_time::timeout(
-                        std::time::Duration::from_millis(slice),
-                        crate::free_grace::lane_supply_wake().notified(),
-                    )
-                    .await;
+                Err(e) if is_storage_full(&e) => {
+                    self.park_for_reclaimable_supply(e, started, self.reclaimable_supply_exists())
+                        .await?;
                 }
                 other => return other,
             }
         }
+    }
+
+    /// One park decision of the bounded allocation
+    /// ([`Self::allocate_block_grace_bounded`]), shared with the
+    /// router-level placed allocation (`BackendRouter::allocate_placed_block`
+    /// — which parks only after EVERY eligible volume refused, and passes the
+    /// set's `reclaimable` verdict). `Err(e)` = the refusal is terminal (no
+    /// reclaimable supply, or the wall passed); `Ok(())` = one slice parked,
+    /// the caller retries.
+    pub(crate) async fn park_for_reclaimable_supply(
+        &self,
+        e: crate::error::SqueezefsError,
+        started: std::time::Instant,
+        reclaimable: bool,
+    ) -> Result<()> {
+        if !reclaimable {
+            return Err(e);
+        }
+        let wall = crate::free_grace::pressure_park_wall_ms();
+        let waited_ms = started.elapsed().as_millis() as u64;
+        if waited_ms >= wall {
+            log::error!(
+                "bounded allocation refusing StorageFull after {waited_ms} ms parked with {} \
+                 offset(s) still in grace locally (lane harvest horizon {} ms): the pressure \
+                 deadline never fenced within the wall backstop ({wall} ms). The refusal is \
+                 honest and terminal for this write; investigate the membership plane \
+                 (finding 29)",
+                self.grace.len(),
+                self.horizon_composed_ms.load(Ordering::Relaxed),
+            );
+            return Err(e);
+        }
+        let slice = crate::free_grace::pressure_park_slice_ms();
+        crate::free_grace::note_pressure_park();
+        // The lane-push lever (finding 15 term 2): a renewal grant's
+        // lane-supply hint ends the slice at once, so the retry's harvest
+        // runs on the hint's heels rather than at the slice's own cadence.
+        // Inert with the lever off (nothing ever notifies) and on every
+        // mount that is not a co-writer.
+        let _ = squeezefs_ipc::sqz_time::timeout(
+            std::time::Duration::from_millis(slice),
+            crate::free_grace::lane_supply_wake().notified(),
+        )
+        .await;
+        Ok(())
     }
 
     pub async fn allocate_block(&self) -> Result<u64> {

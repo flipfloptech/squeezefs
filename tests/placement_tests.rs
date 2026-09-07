@@ -970,6 +970,18 @@ async fn stats_inode_carries_the_placement_family() {
             .is_some_and(|v| v.is_number()),
         "backend_fill_spread gauge missing: {placement}"
     );
+    // The laned co-writer's placement ledger rides the same object and
+    // reads 0 on every other posture (this fixture is a single writer).
+    for key in [
+        "backend_placement_lane_failovers",
+        "backend_placement_lane_exhausted_picks",
+    ] {
+        assert_eq!(
+            placement.get(key).and_then(|v| v.as_u64()),
+            Some(0),
+            "{key} must export as 0 on a single-writer mount: {placement}"
+        );
+    }
     let backends = placement
         .get("backends")
         .and_then(|v| v.as_array())

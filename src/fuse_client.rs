@@ -5891,6 +5891,19 @@ pub struct Metrics {
     /// a per-write cost — steady-state picks leave this flat (pinned in
     /// tests/placement_tests.rs).
     pub placement_table_refreshes: Align64<AtomicU64>,
+    /// Lane-aware placement on a laned co-writer
+    /// (`.benchmarks/2026-09-07-cowriter-lane-aware-placement.md`;
+    /// `BackendRouter::allocate_placed_block`): placed allocations that
+    /// landed on a volume OTHER than the §5.9 pick because the pick's lane
+    /// refused `StorageFull` and a sibling's lane had supply. 0 on every
+    /// single-writer / authority mount and under
+    /// `SQUEEZEFS_COWRITER_LANE_PLACEMENT=0` by construction.
+    pub backend_placement_lane_failovers: Align64<AtomicU64>,
+    /// Picks that landed on a volume whose lane-reachable supply was 0
+    /// while another eligible volume's was not — the lane-aware pick's
+    /// miss ledger. ≈ 0 by construction (the pick reads the same O(1)
+    /// counters); growth = predicate rot.
+    pub backend_placement_lane_exhausted_picks: Align64<AtomicU64>,
     /// PR VL6a `fsck_*` family (design-volume-lifecycle §10, §5.6):
     /// cumulative across runs on this daemon. **`fsck_findings` must be
     /// 0 on a healthy volume — the tripwire.**
@@ -10469,6 +10482,14 @@ impl SqueezefsFilesystem {
             .collect();
         let placement_obj = serde_json::json!({
             "backend_fill_spread": placement_table.fill_spread,
+            // Lane-aware placement on a laned co-writer: both 0 on every
+            // other posture by construction.
+            "backend_placement_lane_failovers": METRICS
+                .backend_placement_lane_failovers
+                .load(Ordering::Relaxed),
+            "backend_placement_lane_exhausted_picks": METRICS
+                .backend_placement_lane_exhausted_picks
+                .load(Ordering::Relaxed),
             "backends": placement_backends,
         });
 
@@ -16172,42 +16193,47 @@ impl SqueezefsFilesystem {
                 // owners (fsck visibility + the law-9 mint rollback,
                 // KD-OV-11), then the reader-visible record (law 1: the
                 // record is installed before this write can ACK).
-                let (be_id, allocator, device) = self.router.backend_router.get_active_backend()?;
-                if payload.slot().is_some() && device.zc_write_fd().is_none() {
-                    return Ok(false);
-                }
                 write_phase(ino, offset_hint, b, WP_OV_ALLOC);
-                let dest_offset = match allocator.allocate_block_grace_bounded().await {
-                    Ok(o) => o,
-                    // KD-B4-8, extended to BOTH shapes (round 4,
-                    // 2026-08-15): a StorageFull mint DECLINES to
-                    // accumulation. The overwrite rationale is unchanged
-                    // (the parked-A population is the free supply the
-                    // epoch's KD-1.7 ENOSPC early-close ladder recycles).
-                    // The fresh shape's former loud path ("no parked
-                    // supply exists to recycle") converted TRANSIENT
-                    // space pressure — reclaim lag under settle/publish
-                    // churn — into a hard write EIO, while every other
-                    // write shape rides the never-lossy accumulation
-                    // ladder under the same pressure (park → staging →
-                    // R5; genuine exhaustion still surfaces loud at the
-                    // durability boundaries that own it). Declining IS
-                    // the parked supply.
-                    Err(SqueezefsError::Io(ref e))
-                        if e.kind() == std::io::ErrorKind::StorageFull =>
-                    {
-                        METRICS
-                            .overlay_enospc_declines
-                            .fetch_add(1, Ordering::Relaxed);
-                        return Ok(false);
-                    }
-                    Err(e) => return Err(e),
-                };
+                let (be_id, allocator, device, dest_offset) =
+                    match self.router.backend_router.allocate_placed_block().await {
+                        Ok(placed) => placed,
+                        // KD-B4-8, extended to BOTH shapes (round 4,
+                        // 2026-08-15): a StorageFull mint DECLINES to
+                        // accumulation. The overwrite rationale is unchanged
+                        // (the parked-A population is the free supply the
+                        // epoch's KD-1.7 ENOSPC early-close ladder recycles).
+                        // The fresh shape's former loud path ("no parked
+                        // supply exists to recycle") converted TRANSIENT
+                        // space pressure — reclaim lag under settle/publish
+                        // churn — into a hard write EIO, while every other
+                        // write shape rides the never-lossy accumulation
+                        // ladder under the same pressure (park → staging →
+                        // R5; genuine exhaustion still surfaces loud at the
+                        // durability boundaries that own it). Declining IS
+                        // the parked supply.
+                        Err(SqueezefsError::Io(ref e))
+                            if e.kind() == std::io::ErrorKind::StorageFull =>
+                        {
+                            METRICS
+                                .overlay_enospc_declines
+                                .fetch_add(1, Ordering::Relaxed);
+                            return Ok(false);
+                        }
+                        Err(e) => return Err(e),
+                    };
                 let fsck_guard = allocator.inflight_register(dest_offset);
                 let mint_owner = crate::assembly_tasks::MintedBlockGuard::new(
                     std::sync::Arc::clone(&allocator),
                     dest_offset,
                 );
+                // A slot payload needs the destination device's zc write
+                // fd; a device without one declines to the ordinary path.
+                // Checked on the PLACED device (the pick and the
+                // allocation are one act now), and the mint guard's drop
+                // gives the offset back.
+                if payload.slot().is_some() && device.zc_write_fd().is_none() {
+                    return Ok(false);
+                }
                 // §5.1 (normative): the OVERWRITE capture and the
                 // registry install execute inside ONE
                 // `INODE_META_LOCKS(ino)` section, taken under the
@@ -17476,8 +17502,8 @@ impl SqueezefsFilesystem {
                      the overwrite shape requires one"
                 ))
             })?;
-        let (be_id, allocator, device) = self.router.backend_router.get_active_backend()?;
-        let dest_offset = allocator.allocate_block_grace_bounded().await?;
+        let (be_id, allocator, device, dest_offset) =
+            self.router.backend_router.allocate_placed_block().await?;
         let fsck_guard = allocator.inflight_register(dest_offset);
         let mint_owner = crate::assembly_tasks::MintedBlockGuard::new(
             std::sync::Arc::clone(&allocator),
@@ -19674,23 +19700,23 @@ impl SqueezefsFilesystem {
         processed: bytes::Bytes,
         auth: crate::data_custody::CustodyEpoch,
     ) -> Result<UploadDmaOut, SqueezefsError> {
-        let (be_id, block_allocator, nvme_writer) =
-            self.router.backend_router.get_active_backend()?;
         let processed_len = processed.len() as u64;
         crate::block_allocator::ensure_stored_block_image_fits(
             processed.len(),
-            block_allocator.chunk_size(),
+            crate::block_allocator::CHUNK_SIZE,
             "write-through block upload",
         )?;
         // Marks the key's incarnation unstable: racing validated cache fills
         // of a reused key fail their seqlock check instead of caching
         // pre-DMA bytes.
         // Residence phase: the span deliberately includes ENOSPC-valve
-        // engagements — reclaim leaking onto fresh paths shows HERE.
+        // engagements — reclaim leaking onto fresh paths shows HERE. The
+        // §5.9 pick rides inside the same act (lane-aware failover on a
+        // laned co-writer — `allocate_placed_block`).
         let t_alloc = std::time::Instant::now();
-        let alloc_res = block_allocator.allocate_block_grace_bounded().await;
+        let alloc_res = self.router.backend_router.allocate_placed_block().await;
         pipeline_phase_record(PipelinePhase::Allocate, t_alloc);
-        let offset = alloc_res?;
+        let (be_id, block_allocator, nvme_writer, offset) = alloc_res?;
         // PR VL6a: live-owner registration across the allocate→merge
         // window (rides the returned custody; drops after the publish is
         // visible — or with the caller's orphan free).
@@ -28745,44 +28771,44 @@ impl SqueezefsFilesystem {
             .get_crypto()
             .process_write_async(block_bytes.clone())
             .await?;
-        let (be_id, block_allocator, nvme_writer) = router.backend_router.get_active_backend()?;
         crate::block_allocator::ensure_stored_block_image_fits(
             processed_block.len(),
-            block_allocator.chunk_size(),
+            crate::block_allocator::CHUNK_SIZE,
             "staging-refusal durable escalation",
         )?;
         let pipe_t0 = std::time::Instant::now();
-        let offset = match block_allocator.allocate_block_grace_bounded().await {
-            Ok(o) => o,
-            Err(e)
-                if matches!(&e, SqueezefsError::Io(io)
+        let (be_id, block_allocator, nvme_writer, offset) =
+            match router.backend_router.allocate_placed_block().await {
+                Ok(placed) => placed,
+                Err(e)
+                    if matches!(&e, SqueezefsError::Io(io)
                     if io.kind() == std::io::ErrorKind::StorageFull) =>
-            {
-                // Contract-9 brim (generic/590): genuine space failure —
-                // the valve already drained queued reclaims — on a block
-                // whose CURRENT mapping is sole-owned/undecorated/
-                // passthrough converges IN PLACE at its own offset. The
-                // flush legs' size posture: never grow the size floor
-                // (the 795 SIZE-NEVER-LEADS-DATA law).
-                let token = router.dlm.get_fencing_token_ino(ino);
-                if self
-                    .try_inplace_rewrite(
-                        ino,
-                        b,
-                        processed_block.clone(),
-                        token,
-                        false,
-                        pipe_t0,
-                        true,
-                    )
-                    .await?
                 {
-                    return self.upload_invalidation_tail(ino, b).await;
+                    // Contract-9 brim (generic/590): genuine space failure —
+                    // the valve already drained queued reclaims — on a block
+                    // whose CURRENT mapping is sole-owned/undecorated/
+                    // passthrough converges IN PLACE at its own offset. The
+                    // flush legs' size posture: never grow the size floor
+                    // (the 795 SIZE-NEVER-LEADS-DATA law).
+                    let token = router.dlm.get_fencing_token_ino(ino);
+                    if self
+                        .try_inplace_rewrite(
+                            ino,
+                            b,
+                            processed_block.clone(),
+                            token,
+                            false,
+                            pipe_t0,
+                            true,
+                        )
+                        .await?
+                    {
+                        return self.upload_invalidation_tail(ino, b).await;
+                    }
+                    return Err(e);
                 }
-                return Err(e);
-            }
-            Err(e) => return Err(e),
-        };
+                Err(e) => return Err(e),
+            };
         // RES-9 mint guard: this unit runs inside the fsync/dismount flush
         // fan-outs whose first-error unwind drops siblings mid-await (the
         // live-statfs drift class — see flush_one_active_block).
@@ -28849,13 +28875,13 @@ async fn fold_upload_block(
     router: &DataRouter,
 ) -> Result<(), SqueezefsError> {
     let processed_block = router.get_crypto().process_write_async(block_bytes).await?;
-    let (be_id, block_allocator, nvme_writer) = router.backend_router.get_active_backend()?;
     crate::block_allocator::ensure_stored_block_image_fits(
         processed_block.len(),
-        block_allocator.chunk_size(),
+        crate::block_allocator::CHUNK_SIZE,
         "fold block upload",
     )?;
-    let offset = block_allocator.allocate_block_grace_bounded().await?;
+    let (be_id, block_allocator, nvme_writer, offset) =
+        router.backend_router.allocate_placed_block().await?;
     // RES-9 mint guard (see upload_active_block_bytes).
     let mut minted = crate::assembly_tasks::MintedBlockGuard::new(block_allocator.clone(), offset);
     // PR VL6a: live-owner registration for the allocate→merge window.
@@ -29022,8 +29048,8 @@ async fn flush_one_active_block(
             }
         }
 
-        let (be_id, block_allocator, nvme_writer) = router.backend_router.get_active_backend()?;
-        let offset = block_allocator.allocate_block_grace_bounded().await?;
+        let (be_id, block_allocator, nvme_writer, offset) =
+            router.backend_router.allocate_placed_block().await?;
         // RES-9 mint guard (the live-statfs ENOSPC-drift fix,
         // tests/statfs_live_accounting_tests.rs): the fsync flush fan-out
         // (`flush_due_active_blocks_for_inode`'s `buffer_unordered` +

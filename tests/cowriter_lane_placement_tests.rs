@@ -60,7 +60,7 @@ use squeezefs::free_grace;
 use squeezefs::fuse_client::METRICS;
 use squeezefs::meta_backend::kv::journal::AppendPartition;
 use squeezefs::nvme_dev::NvmeBlockDev;
-use squeezefs::routing::{health_effective, BackendRouter, StorageBackend};
+use squeezefs::routing::{health_effective, lane_placement_weight, BackendRouter, StorageBackend};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -198,7 +198,12 @@ impl Vol {
     async fn exhaust(&self) -> Vec<u64> {
         let share = lane::lane_capacity_blocks(CAP, W, LANE);
         let minted = self.mint(share).await;
-        assert_eq!(self.alloc.lane_reachable_blocks(), 0, "{}: exhausted", self.id);
+        assert_eq!(
+            self.alloc.lane_reachable_blocks(),
+            0,
+            "{}: exhausted",
+            self.id
+        );
         minted
     }
 
@@ -215,7 +220,11 @@ impl Vol {
     /// Put `idxs` on the AUTHORITY's list for this volume (shipped there).
     fn park_at_authority(&self, idxs: &[u64]) {
         self.ship_frees(idxs);
-        self.authority.supply.lock().unwrap().extend_from_slice(idxs);
+        self.authority
+            .supply
+            .lock()
+            .unwrap()
+            .extend_from_slice(idxs);
     }
 
     /// A harvest that already landed: `idxs` are on THIS allocator's free
@@ -260,11 +269,7 @@ async fn rig(laned: bool) -> Rig {
     let dir = tempfile::tempdir().unwrap();
     let default_path = dev_file(dir.path(), "default.img");
     let default_dev = Arc::new(NvmeBlockDev::new(default_path.to_str().unwrap()));
-    let default_alloc = Arc::new(
-        BlockAllocator::new("lane-placement-default")
-            .await
-            .unwrap(),
-    );
+    let default_alloc = Arc::new(BlockAllocator::new("lane-placement-default").await.unwrap());
     let router = Arc::new(BackendRouter::new(
         default_alloc,
         default_dev,
@@ -314,6 +319,17 @@ fn is_storage_full(e: &SqueezefsError) -> bool {
     matches!(e, SqueezefsError::Io(io) if io.kind() == std::io::ErrorKind::StorageFull)
 }
 
+type Placed = (String, Arc<BlockAllocator>, Arc<NvmeBlockDev>, u64);
+
+/// `expect_err` for the placed-allocation tuple (whose Arcs carry no
+/// `Debug`).
+fn refused(r: Result<Placed, SqueezefsError>, why: &str) -> SqueezefsError {
+    match r {
+        Err(e) => e,
+        Ok((be_id, _, _, off)) => panic!("{why}: allocated {off} on {be_id}"),
+    }
+}
+
 struct Gauges {
     refusals: u64,
     parks: u64,
@@ -355,6 +371,32 @@ fn band(router: &BackendRouter) -> Vec<String> {
 }
 
 // ===========================================================================
+// 0. The weight, pure
+// ===========================================================================
+
+/// The lane-governed weight is the lane-reachable fraction of the lane
+/// share on `health_effective`'s 0..1000 scale: exhausted = 0, full share
+/// (or more, after an adoption) = 1000, an unbounded allocator (reachable
+/// `u64::MAX` — space is not a constraint) = 1000 whatever its share.
+#[test]
+fn the_lane_placement_weight_is_the_reachable_fraction_of_the_share() {
+    assert_eq!(lane_placement_weight(0, 32), 0);
+    assert_eq!(lane_placement_weight(8, 32), 250);
+    assert_eq!(lane_placement_weight(32, 32), 1000);
+    assert_eq!(
+        lane_placement_weight(40, 32),
+        1000,
+        "adopted lanes never exceed the scale"
+    );
+    assert_eq!(
+        lane_placement_weight(u64::MAX, 0),
+        1000,
+        "unbounded: space is no constraint"
+    );
+    assert_eq!(lane_placement_weight(5, 0), 0, "no share, no weight");
+}
+
+// ===========================================================================
 // 1. Lane-aware weights: supply on B only ⇒ every allocation lands on B
 // ===========================================================================
 
@@ -393,19 +435,37 @@ async fn supply_on_one_volume_places_every_allocation_there() {
             .allocate_placed_block()
             .await
             .unwrap_or_else(|e| panic!("placed allocation {i} must succeed: {e}"));
-        assert_eq!(be_id, "volB", "allocation {i} lands where the lane has supply");
+        assert_eq!(
+            be_id, "volB",
+            "allocation {i} lands where the lane has supply"
+        );
         assert!(Arc::ptr_eq(&alloc, &rig.b.alloc));
         assert_eq!((off / alloc.chunk_size()) % u64::from(W), u64::from(LANE));
     }
     let g1 = gauges();
     assert_eq!(g1.refusals, g0.refusals, "no StorageFull anywhere");
     assert_eq!(g1.parks, g0.parks, "no park");
-    assert_eq!(rig.a.authority.calls(), 0, "no wasted harvest RPC on the dry volume");
-    assert_eq!(rig.b.authority.calls(), 0, "no RPC where the supply is local");
-    assert_eq!(g1.exhausted_picks, g0.exhausted_picks, "the pick never landed dry");
+    assert_eq!(
+        rig.a.authority.calls(),
+        0,
+        "no wasted harvest RPC on the dry volume"
+    );
+    assert_eq!(
+        rig.b.authority.calls(),
+        0,
+        "no RPC where the supply is local"
+    );
+    assert_eq!(
+        g1.exhausted_picks, g0.exhausted_picks,
+        "the pick never landed dry"
+    );
     assert_eq!(g1.failovers, g0.failovers, "nothing needed failing over");
     assert_eq!(g1.refreshes, g0.refreshes, "picks never rebuild the table");
-    assert_eq!(rig.b.alloc.lane_reachable_blocks(), 0, "B's supply is spent");
+    assert_eq!(
+        rig.b.alloc.lane_reachable_blocks(),
+        0,
+        "B's supply is spent"
+    );
 }
 
 // ===========================================================================
@@ -438,7 +498,10 @@ async fn an_allocation_draining_the_last_lane_block_moves_the_pick_before_the_re
     // snapshot still names it.
     rig.a.mint(8).await;
     assert_eq!(rig.a.alloc.lane_reachable_blocks(), 0);
-    assert!(band(&rig.router).contains(&"volA".to_string()), "the table is stale");
+    assert!(
+        band(&rig.router).contains(&"volA".to_string()),
+        "the table is stale"
+    );
 
     let g0 = gauges();
     for i in 0..8 {
@@ -451,9 +514,19 @@ async fn an_allocation_draining_the_last_lane_block_moves_the_pick_before_the_re
     }
     let g1 = gauges();
     assert_eq!(g1.refusals, g0.refusals);
-    assert_eq!(g1.refreshes, g0.refreshes, "no rebuild — the pick is table-only");
-    assert_eq!(rig.a.authority.calls(), 0, "the drained volume is never asked");
-    assert_eq!(g1.failovers, g0.failovers, "the pick was right the first time");
+    assert_eq!(
+        g1.refreshes, g0.refreshes,
+        "no rebuild — the pick is table-only"
+    );
+    assert_eq!(
+        rig.a.authority.calls(),
+        0,
+        "the drained volume is never asked"
+    );
+    assert_eq!(
+        g1.failovers, g0.failovers,
+        "the pick was right the first time"
+    );
     assert_eq!(g1.exhausted_picks, g0.exhausted_picks);
 }
 
@@ -490,7 +563,11 @@ async fn a_harvest_refilling_an_out_of_band_volume_is_reachable_before_the_refre
     let g1 = gauges();
     assert_eq!(g1.refusals, g0.refusals, "no refusal");
     assert_eq!(g1.refreshes, g0.refreshes, "no rebuild");
-    assert_eq!(rig.a.authority.calls() + rig.b.authority.calls(), 0, "no RPC");
+    assert_eq!(
+        rig.a.authority.calls() + rig.b.authority.calls(),
+        0,
+        "no RPC"
+    );
 }
 
 // ===========================================================================
@@ -513,10 +590,12 @@ async fn both_lanes_exhausted_and_nothing_held_refuses_at_once_after_asking_both
 
     let g0 = gauges();
     let t0 = Instant::now();
-    let e = tokio::time::timeout(BOUND, rig.router.allocate_placed_block())
-        .await
-        .expect("must terminate")
-        .expect_err("no volume has supply");
+    let e = refused(
+        tokio::time::timeout(BOUND, rig.router.allocate_placed_block())
+            .await
+            .expect("must terminate"),
+        "no volume has supply",
+    );
     assert!(is_storage_full(&e), "the verdict is StorageFull: {e}");
     assert!(
         t0.elapsed() < Duration::from_millis(500),
@@ -524,9 +603,20 @@ async fn both_lanes_exhausted_and_nothing_held_refuses_at_once_after_asking_both
     );
     let g1 = gauges();
     assert_eq!(g1.parks, g0.parks, "no park on nothing held");
-    assert_eq!(rig.a.authority.calls(), 1, "the dry pick asked its authority once");
-    assert_eq!(rig.b.authority.calls(), 1, "the failover asked the sibling once");
-    assert_eq!(g1.failovers, g0.failovers, "a failed failover is not a failover");
+    assert_eq!(
+        rig.a.authority.calls(),
+        1,
+        "the dry pick asked its authority once"
+    );
+    assert_eq!(
+        rig.b.authority.calls(),
+        1,
+        "the failover asked the sibling once"
+    );
+    assert_eq!(
+        g1.failovers, g0.failovers,
+        "a failed failover is not a failover"
+    );
 }
 
 /// Contract 3b: both lanes exhausted, both authorities empty but reporting a
@@ -549,10 +639,12 @@ async fn both_lanes_exhausted_with_a_held_ring_parks_then_refuses_at_the_wall() 
     let g0 = gauges();
     let wall = free_grace::pressure_park_wall_ms();
     let t0 = Instant::now();
-    let e = tokio::time::timeout(BOUND, rig.router.allocate_placed_block())
-        .await
-        .expect("THE WEDGE: the bounded allocation must end within the bound")
-        .expect_err("still no supply");
+    let e = refused(
+        tokio::time::timeout(BOUND, rig.router.allocate_placed_block())
+            .await
+            .expect("THE WEDGE: the bounded allocation must end within the bound"),
+        "still no supply",
+    );
     let elapsed = t0.elapsed();
     assert!(is_storage_full(&e), "the verdict stays StorageFull: {e}");
     let g1 = gauges();
@@ -615,19 +707,28 @@ async fn a_single_writer_router_keeps_the_device_fill_weights_and_never_fails_ov
     for _ in 0..16 {
         rig.a.alloc.allocate_block().await.unwrap();
     }
-    for _ in 0..64 {
+    // B: 63 more — the placed allocation above took one.
+    for _ in 0..63 {
         rig.b.alloc.allocate_block().await.unwrap();
     }
     rig.router.refresh_placement_table();
-    let e = tokio::time::timeout(BOUND, rig.router.allocate_placed_block())
-        .await
-        .expect("terminates")
-        .expect_err("a full single-writer set refuses");
+    let e = refused(
+        tokio::time::timeout(BOUND, rig.router.allocate_placed_block())
+            .await
+            .expect("terminates"),
+        "a full single-writer set refuses",
+    );
     assert!(is_storage_full(&e), "{e}");
     let g1 = gauges();
     assert_eq!(g1.failovers, g0.failovers, "no failover on a single writer");
-    assert_eq!(g1.exhausted_picks, g0.exhausted_picks, "no lane gauge on a single writer");
-    assert_eq!(g1.refusals, g0.refusals, "no lane refusal — the mount has no lane");
+    assert_eq!(
+        g1.exhausted_picks, g0.exhausted_picks,
+        "no lane gauge on a single writer"
+    );
+    assert_eq!(
+        g1.refusals, g0.refusals,
+        "no lane refusal — the mount has no lane"
+    );
 }
 
 // ===========================================================================
@@ -676,12 +777,24 @@ async fn the_lever_off_restores_the_shipped_pick_and_no_failover() {
         }
     }
     let g1 = gauges();
-    assert!(refused >= 1, "the stale round-robin lands on the drained volume");
+    assert!(
+        refused >= 1,
+        "the stale round-robin lands on the drained volume"
+    );
     assert!(on_b >= 1, "and on the stocked one");
-    assert!(rig.a.authority.calls() >= 1, "each dry pick pays its harvest RPC");
-    assert!(g1.refusals > g0.refusals, "counted on alloc_lane_enospc_refusals");
+    assert!(
+        rig.a.authority.calls() >= 1,
+        "each dry pick pays its harvest RPC"
+    );
+    assert!(
+        g1.refusals > g0.refusals,
+        "counted on alloc_lane_enospc_refusals"
+    );
     assert_eq!(g1.failovers, g0.failovers, "the lever off never fails over");
-    assert_eq!(g1.exhausted_picks, g0.exhausted_picks, "the lever off never counts picks");
+    assert_eq!(
+        g1.exhausted_picks, g0.exhausted_picks,
+        "the lever off never counts picks"
+    );
     assert!(squeezefs::block_allocator::test_clear_cowriter_lane_placement());
 }
 
@@ -709,19 +822,33 @@ async fn the_allocation_harvests_the_volume_whose_authority_holds_the_supply() {
         .await
         .expect("terminates")
         .expect("the supply is reachable through the harvest");
-    assert_eq!(be_id, "volB", "the allocation lands where the authority held supply");
+    assert_eq!(
+        be_id, "volB",
+        "the allocation lands where the authority held supply"
+    );
     let g1 = gauges();
-    assert_eq!(rig.b.authority.calls(), 1, "B's authority was harvested once");
+    assert_eq!(
+        rig.b.authority.calls(),
+        1,
+        "B's authority was harvested once"
+    );
     assert_eq!(g1.harvested, g0.harvested + 8, "the grain adopted into B");
     assert_eq!(rig.b.authority.holds(), 0);
-    assert!(rig.a.authority.calls() <= 1, "at most one wasted RPC on the dry sibling");
+    assert!(
+        rig.a.authority.calls() <= 1,
+        "at most one wasted RPC on the dry sibling"
+    );
     assert_eq!(
         g1.failovers - g0.failovers,
         rig.a.authority.calls(),
         "a dry pick on A is exactly one failover; a pick on B none"
     );
     assert_eq!(g1.parks, g0.parks, "no park — the supply existed");
-    assert_eq!(rig.b.alloc.lane_reachable_blocks(), 7, "the rest is local now");
+    assert_eq!(
+        rig.b.alloc.lane_reachable_blocks(),
+        7,
+        "the rest is local now"
+    );
 }
 
 /// Contract 6b: the PUSHED refill's per-volume decision. The renewal grant's
@@ -772,7 +899,10 @@ async fn the_pushed_refill_asks_a_dry_volume_on_a_hint_and_never_a_stocked_unowe
     assert_eq!(adopted_b, 0, "the stocked, unowed volume asked nothing");
     assert_eq!(rig.b.authority.calls(), 0, "no RPC to B's authority");
     let adopted_a = rig.a.alloc.pushed_refill_tick(1_000).await;
-    assert_eq!(adopted_a, 8, "the dry volume asked and the supply was there");
+    assert_eq!(
+        adopted_a, 8,
+        "the dry volume asked and the supply was there"
+    );
     assert_eq!(rig.a.authority.calls(), 1);
     assert_eq!(
         METRICS.alloc_lane_pushed_harvests.load(Ordering::Relaxed),
@@ -786,7 +916,10 @@ async fn the_pushed_refill_asks_a_dry_volume_on_a_hint_and_never_a_stocked_unowe
     rig.b.alloc.sample_alloc_rate(10_000);
     rig.b.mint(3).await;
     rig.b.alloc.sample_alloc_rate(11_000);
-    assert!(rig.b.alloc.watermark_blocks() > 0, "a claiming writer derives a watermark");
+    assert!(
+        rig.b.alloc.watermark_blocks() > 0,
+        "a claiming writer derives a watermark"
+    );
     assert_eq!(rig.b.alloc.lane_reachable_blocks(), 1);
     assert!(
         rig.b.alloc.should_harvest_ahead().is_some(),
@@ -799,5 +932,8 @@ async fn the_pushed_refill_asks_a_dry_volume_on_a_hint_and_never_a_stocked_unowe
         "no hint, owed nothing ⇒ never asked (the shipped no-wasted-RTT half)"
     );
     rig.b.alloc.note_owed_freed(1);
-    assert!(rig.b.alloc.should_harvest_ahead().is_some(), "owed ⇒ fires as before");
+    assert!(
+        rig.b.alloc.should_harvest_ahead().is_some(),
+        "owed ⇒ fires as before"
+    );
 }

@@ -1373,6 +1373,25 @@ pub fn lane_push_wants_harvest(hint_blocks: u64, owed_blocks: u64) -> bool {
     lane_push_enabled() && hint_blocks > 0 && owed_blocks > 0
 }
 
+/// **The pushed-refill decision, per VOLUME** (the two-volume law,
+/// `.benchmarks/2026-09-07-cowriter-lane-aware-placement.md`): the hint is
+/// SUMMED over the authority's volumes, so it cannot name the one holding
+/// the supply — and a peer's rewrites of this lane's blocks put supply on
+/// a list no owed ledger here knows about. Harvest ⇔
+/// [`lane_push_wants_harvest`] (owed), OR the hint is nonzero and THIS
+/// volume's lane-reachable stock is 0: a dry volume asking is one RPC that
+/// either refills it or proves the supply is its sibling's (which the
+/// lane-aware placement carries meanwhile). A stocked volume owed nothing
+/// never asks (no wasted RTT).
+pub fn lane_push_wants_harvest_on_volume(
+    hint_blocks: u64,
+    owed_blocks: u64,
+    reachable_blocks: u64,
+) -> bool {
+    lane_push_wants_harvest(hint_blocks, owed_blocks)
+        || (lane_push_enabled() && hint_blocks > 0 && reachable_blocks == 0)
+}
+
 // ---------------------------------------------------------------------------
 // Derivations
 // ---------------------------------------------------------------------------

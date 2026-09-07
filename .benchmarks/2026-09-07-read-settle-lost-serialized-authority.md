@@ -3,10 +3,10 @@
 | | |
 |---|---|
 | **Branch** | `fix/read-settle-lost-serialized-authority` off `dev` 2a486273 |
-| **Commits** | `e531455f` (red contract) · `39ad5135` (fix) · docs commit |
+| **Commits** | `bf826a29` (red contract) · `10388c45` (fix) · `d3cb44ac` (docs) — on `dev`; **§8 (phase B1)**: `fix/finding-51-adopt-key-incarnation` off `dev` a7cab076 — `ca8c287d` (red contracts + gauges) · `fc561927` (fix) · docs commit |
 | **Evidence** | `/tmp/five/d4/keep-t1-all4/` (m0 + m50–m57 `.log` / `.stats.json`, `rows/s11mpiio-1788742525/A1.out`) and the baseline row `/tmp/five/d4/keep-t1-baseline/`; `tests/run_mw_matrix.sh s11-mpiio` on the 1 + 8 range-custody fleet, tcp devsub |
 | **Class** | data-path correctness — a structural validation failure on the authority for every co-writer block that has been through the authority's free ladder once: the authority cannot read or fold a RECYCLED co-writer block (EIO), which under S11 is every co-writer's `fsync(2)` that holds a retained extent |
-| **Fleet row** | **OWED (parent)** — see §7 |
+| **Fleet row** | A1 **PASSED** on `dev` (day-2 row B: `read_settle_lost_serialized` 0, `served_binding_witnesses` 101,299, fsync EIOs 0, the S11 gate met for the first time); **B1 exposed §8 — its re-run is OWED (parent)** |
 
 ## 1. What the evidence says (read before any code)
 
@@ -208,3 +208,174 @@ parent's.
   errors are finding 15's supply terms, not this finding's.
 * No claim about the co-writer's own tiers: finding 30's local
   retire+publish stands as shipped.
+
+## 8. Regression found by phase B1 — a served publish displacing an OPEN authority overlay record's captured old binding
+
+### 8.1 What B1 saw
+
+The fix above let the s11-mpiio row pass A1 for the first time, so the
+matrix ran **B1** — the `-F` file-per-proc reference (32 ranks × 320 MiB
+files, same fleet) — for the first time ever (row A, pre-fix, died at A1
+and never reached it). B1 collapsed 770 → 148 MiB/s from iteration 7 on
+(`rows/*/B1.out`: 1,562 / 899 / 658 / 262 / 1,264 / 1,250 / 1,279 then
+157 / 148 / 157 / 152 / 148 / 148 / 145 MiB/s), while the authority
+logged **28,039 `STALE BLOCK-KEY BINDING refused`** lines
+(`block_key_incarnation_refusals` 28,015) between 14:35:08 and 14:43:22
+(`/tmp/five/d4/keep-day2-B/m0.log`). The working hypothesis handed to this
+branch was that §3's witness re-stabilizes a seqlock word whose
+incarnation NUMBER is the authority's, so every later validation of the
+co-writer's key is refused as stale. **The code and the log refute it:**
+
+| question | answer | source |
+|---|---|---|
+| does the witness touch the number `incarnation_ok` compares? | **No.** `IncarnationCell` has two fields — the seqlock `word` and the lifetime `stamp`. `witness_served_binding` → `publish_block` sets the word's stable bit (`incarnation_core::publish`); `live_incarnation` reads the STAMP, which only `claim_block_idx` (own mints) and `seed_incarnation` (the mount walk) ever write. For a foreign-lane offset on a fresh fleet the stamp is `INCARNATION_NONE` before and after the witness — "unknown, accept" | `src/block_allocator.rs` |
+| whose offsets were refused? | **10 distinct keys / 10 offsets, ALL lane 0** — the authority's own mints, which `witness_served_binding` never reaches (`lane_is_ours` returns before the publish). Every line: live stamp > key stamp, same era (the offset was freed and re-minted by the authority itself) | m0.log, `off ÷ 4 MiB mod 16` |
+| who validated them 28,039 times? | **the device-overlay settle.** `write-arm settle for ino 23223 block 11 failed attempt 1 … 8192` (and 89203:22, 166896:15, 101360:30 — 4 records at power-of-two cadence; 10 records in all): `settle_overlay_block_write_arm` retrying a DEAD captured old binding every 50 ms for nine minutes, plus the read-venue settle the co-writers' `FlushExtents` forces ran (`FUSE Fsync: FlushExtents barrier for ino N failed: … names a dead incarnation` ×37 — EIO after 24 attempts) | m0.log, m5x.log |
+| was it ever a regression? | the phase never ran before this fix; row A logged 0 because it died at A1. B's own A1 phase logged 0. **First exposure, not regression** | `keep-day2-A/matrix.log`, `keep-day2-B/matrix.log` |
+| a re-stated same-key publish refused? | **No** — pinned green from birth in `an_authority_read_of_a_recycled_co_writer_block_validates_first_try` (a full Put re-stating the unchanged map is served with `block_key_incarnation_refusals` Δ0) | the test |
+
+### 8.2 The mechanism (`src/fuse_client.rs::settle_overlay_block_locked`, `src/meta_ship/publish.rs` owner side, design-overlay-overwrite §5.7)
+
+design-overlay-overwrite §5.7 states the law: *"a durable map mutation
+of an overlaid index by a path that does not run the settle screen would
+strand `old_binding` pointing at a key the durable path displaced and
+will free"* — the KD-1.11 resurrection class — and wires the one-authority
+screen into the ROUTING primitive's op arms (`overlay_screen_merge`:
+foreign `Merge` on an open-overlay index ⇒ supersede). A **served
+publish never runs that primitive**: the owner-side compose commits on the
+KV backend directly (rung 18's own words) and only invalidates the
+authority fs's RAM head afterwards. So, on B1:
+
+1. the authority's assembler holds an OPEN overwrite record on
+   `(ino 23223, block 11)` — a shipped slice (m54, lane 7, shipped 912
+   extents in this phase while its lane sat at `StorageFull`) — whose
+   captured `old_binding` is the authority's own stamped lane-0 block
+   `8925478912@163bqi69j`;
+2. the co-writer's whole-block publish of block 11 is SERVED; the
+   custody-scoped compose adopts its key and RECOMPUTES the displaced set;
+   `free_recomputed_releases` → the executor → `begin_free(8925478912)`
+   (RAM-tracked, population 0 after the commit — the finding-23 shield
+   passes) → the offset returns to the lane-0 free list;
+3. the authority's next mint (another overlay dest) re-mints it — live
+   stamp `…5115`, the record's key still `…4919`;
+4. every settle of the record reads its old image through the captured
+   key: `read_nvme_block_old_image` → `incarnation_ok` → **refused**. The
+   write-arm form (`settle_overlay_block_write_arm`, entered by any write
+   to a block with a live overlay — a new shipped slice for block 11)
+   retries FOREVER under the held block guard at 50 ms — 20 refusals/s per
+   record, the `WriteExtent` serve never returns, the co-writer's
+   `write(2)` hangs; the read-venue form (the `FlushExtents` force)
+   exhausts 24 attempts into fsync EIO.
+
+Why B1 and not A1: in the shared-file phase the authority's assembly of a
+block and the co-writer's whole-block write of the SAME block do not meet
+(one rank owns each block); in file-per-proc they do — a holder's shipped
+slices and its own local whole-block writes of one file interleave (the
+S11 grant shape under a clamped range — `range_custody_stretch_ceiling_
+clamps` — is the residual board's item, not this note's).
+
+### 8.3 The fix — the served-publish half of the §5.7 screen, plus a dead-capture belt
+
+* **The screen** (`publish::install_served_displacement_sink`, installed
+  by the authority fs beside the rung-18 invalidation in
+  `install_extent_assembler`, uninstalled with it on disarm): every
+  served layout-class commit hands the indices it DISPLACED (the final
+  refs frame's releases — the recompute's on a scoped/chained arm, the
+  caller's on a verbatim arm — plus the recompute's released set) to the
+  sink strictly after commit Ok and BEFORE the recompute's frees. The sink
+  invalidates the fs's RAM head first (an install racing the commit
+  refetches the durable head instead of capturing the displaced key), then
+  `DataRouter::overlay_supersede_served_displaced` applies §5.7's
+  `Merge`-class containment through the same probe/supersede/retire hooks
+  the primitive uses: the record is superseded and retired detached. A
+  LEGAL peer publisher, so no `overlay_foreign_merge` tripwire; counted on
+  **`overlay_superseded_by_served_publish`** with a loud line naming the
+  S11 shape.
+* **The belt** (`settle_overlay_block_locked`): before reading a record's
+  captured old image, `block_key_incarnation_ok(old_key)`; a DEAD
+  lifetime means a durable publish displaced the block past the record —
+  supersede + teardown, `Ok(false)`, counted on
+  **`overlay_superseded_dead_old_binding`**. The one refusal it costs is
+  the detection (0 while the screen catches every displacement); the
+  write arm converges in one attempt instead of never.
+
+Both follow §5.7's own disposition for a foreign `Merge` ("the durable map
+is the authority the moment the foreign merge commits; keeping the record
+alive would serve dest bytes the durable authority displaced"). The
+rejected alternative — re-capturing the record onto the block's CURRENT
+binding and settling over it — would apply the record's slice over the
+displacing whole block: right when the slice is the newer write, wrong
+when the whole block is (the same write(2) shape — a kernel-split 4 MiB
+write whose first segment shipped — is the ambiguous one), and §5.7's
+no-revalidation-word argument depends on the capture staying immutable.
+Which of the two writes is newer is the S11 holder's knowledge, not the
+authority's — the design question the residual board owns.
+
+### 8.4 The repro (`tests/mw_authority_recycled_binding_tests.rs`, `displaced_overlay`)
+
+The scenario: an authority whose keys are STAMPED (`engage_stamped_keys`
+— the fleet's `set_meta_backend` act), a seeded striped file, an OPEN
+overwrite record on block 3 through the B4 seam (captured old binding =
+the seed's stamped lane-0 key), a co-writer's served whole-block write of
+block 3 (its fs write + fsync), the recompute's free, the authority's
+re-mint of the offset (mint until the victim offset comes round), the
+premise probe `!block_key_incarnation_ok(old_key)`, then the co-writer
+side torn down.
+
+* `a_served_publish_displacing_an_open_overlays_old_binding_supersedes_it_at_the_commit`
+  (assembler installed): a gap read on the authority serves the
+  co-writer's bytes, the fsync settles nothing, `overlay_open` converges,
+  `block_key_incarnation_refusals` Δ0, `invariant_tripwires` Δ0, the
+  screen gauge Δ1, the belt gauge Δ0, the whole block reads as the
+  durable authority's. **RED on a7cab076: the gap read EIOs** (`Errno(5)`).
+* `a_settle_whose_captured_old_binding_died_supersedes_instead_of_retrying_the_dead_key`
+  (no sinks installed — the escape shape): the record survives the served
+  publish (premise), the fsync returns, the belt gauge Δ1, exactly ONE
+  refusal, tripwires Δ0, the block reads as the durable authority's.
+  **RED on a7cab076: the fsync EIOs** after the 24-attempt settle.
+
+Both red runs were taken one test per process: in the red state a
+panicked scenario leaves its authority un-stopped and its ino-2 range
+grants in the process-global lock map, which made the FOLLOWING tests in
+the same process fail on unrelated writes — the pollution is a property
+of the red, and the whole file runs green together on the fix (4/4).
+
+### 8.5 What B1's application saw, before and after
+
+Before: from iteration 7 the co-writers' `write(2)`s on blocks whose
+served publish had displaced an open authority overlay record HUNG
+behind the authority's write-arm settle (the `WriteExtent` serve parked on
+the held block guard, never returning), and every `fsync(2)` of those
+inos returned **EIO** (`FlushExtents barrier … names a dead incarnation`,
+37×); aggregate ingest 770 → 148 MiB/s; the authority's log 20 refusal
+lines/s per wedged record. After: the served commit supersedes the
+record — the slice's bytes yield to the durable whole block (§5.7's
+newest-wins for a foreign `Merge`), the co-writer's retention releases at
+its next force (the head version covers), no settle ever reads a dead
+key, writes and fsyncs return.
+
+### 8.6 NOT claimed
+
+* **The B1 re-run is owed (parent):** `block_key_incarnation_refusals`
+  0 on m0, `overlay_superseded_by_served_publish` > 0 (the shape is real
+  in file-per-proc), `overlay_superseded_dead_old_binding` 0 (the screen
+  catches every displacement), no `write-arm settle … failed` lines, the
+  B1 sustained gate.
+* **The S11 straddle** — why a file-per-proc holder ships slices of a
+  block it also writes whole (the clamped-grant share on a single-writer
+  file, `range_custody_stretch_ceiling_clamps`), and which of the two
+  writes is newer — is not adjudicated here; the containment follows
+  §5.7's stated disposition and the ordering question goes to the
+  residual board.
+* **Adopting the key's stamp at the witness** (the hypothesis's remedy) is
+  NOT implemented: it fixes nothing in B1 (lane-0 offsets), and done
+  naively it would make the finding-28 probe (`retain_live_bindings` →
+  `block_key_incarnation_ok`) DROP every recycled co-writer key as "dead"
+  at the compose (a recorded older stamp vs the re-minted key's newer
+  one), which is a live-binding loss. The §6.3 gap it would close on a
+  REMOUNTED authority — `seed_incarnation` at the mount walk records a
+  co-writer's stamp for a foreign-lane offset, and the co-writer's later
+  re-mint then reads as dead — is real and named for the board; a lane-
+  aware probe semantics is the prerequisite, not this branch's change.
+* The 144 `begin_free REFUSED untracked offset` lines and the m54 lane
+  `StorageFull` in B1 are finding 15's supply terms.

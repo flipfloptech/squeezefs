@@ -553,6 +553,11 @@ const HOLD_TOTAL: usize = 3;
 
 /// Rung (a): grants handed a tightened renewal cadence.
 static PRODS: AtomicU64 = AtomicU64::new(0);
+/// Finding 15 phase B1: grants handed the RELAXED ask (one doubling step
+/// of the cadence in force) to a member that had acknowledged everything
+/// held — the drain-instant class the shipped arm snapped to routine.
+/// Disjoint from `PRODS` (those are laggards the writer waits on).
+static PRODS_CAUGHT_UP: AtomicU64 = AtomicU64::new(0);
 /// Rung (b): harvests that evaluated a deadline below the routine bound.
 static BOUND_TIGHTENINGS: AtomicU64 = AtomicU64::new(0);
 /// The live pressure reading — how long the writer's supply lasts at the
@@ -2275,10 +2280,30 @@ fn refresh_bound_on_dirty() {
 /// the act of counting the ask (rung (a)'s engagement instrument) —
 /// called at the ONE place a cadence is handed out, the owner's renewal.
 ///
-/// `None` when no prod is in force, when this member has already
-/// acknowledged past everything the plane holds (prodding a member that
-/// is not holding the free list would buy nothing and cost it beats), or
-/// when an expired ask has finished its decay.
+/// `None` when no prod is in force, or when an expired ask has finished
+/// its decay. A member that has already acknowledged past everything the
+/// plane holds is RELAXED one doubling step of the ask rather than asked at
+/// the laggards' cadence — see the caught-up arm below.
+///
+/// **Finding 15 phase B1 — the caught-up member is relaxed, never snapped
+/// to routine while the ask is live**
+/// (`.benchmarks/2026-09-07-membership-renewal-isolation.md`): the shipped
+/// arm answered `None` for a member whose acknowledgement covered every
+/// held label, so at the instant the ring DRAINED every member drew the
+/// ROUTINE cadence — and a member's LABEL source is that routine beat (a
+/// carriage renewal learns none). The ring refilled within two seconds,
+/// the ask re-armed, and nobody could be told for 10 s: `membership_renewals`
+/// 0/s for 7 s, `member_ack_lag.max` walking to the beat, 3,200 offsets
+/// held, every lane starved. Being caught up at ONE beat says nothing
+/// about the writer's next free; while the reading is live (a storm
+/// within one TTL) the honest answer is finding 18's decay unit — one
+/// doubling step of the cadence in force, capped below routine — so the
+/// refill is learned within `2 × cadence`, and a caught-up member still
+/// beats half as often as a laggard (the economy's intent). The ask's own
+/// lifetime is unchanged: past the reading TTL a drained ring retires it
+/// and routine returns. `SQUEEZEFS_FREE_GRACE_CAUGHT_UP_RELAX=0` restores
+/// the snap (the A/B control); `free_grace_prods_caught_up` counts the
+/// relaxed asks apart from the laggards' `free_grace_prods`.
 ///
 /// **Finding 18 — an expired ask DECAYS, it never snaps**
 /// (`.benchmarks/2026-08-25-s11-freeloop-stall.md` §Finding 18): under a
@@ -2345,7 +2370,22 @@ pub fn take_prod_cadence(acked_free_epoch: u64) -> Option<u64> {
         }
     }
     if acked_free_epoch >= PROD_LABEL.load(Ordering::Relaxed) {
-        return None;
+        // Caught up under a live ask: one relaxed step, never the routine
+        // hole (finding 15 phase B1, the module doc above). The step is
+        // capped strictly below routine — reaching it IS routine.
+        if !caught_up_relax_enabled() {
+            return None;
+        }
+        let routine = PLANE
+            .load()
+            .as_ref()
+            .and_then(|p| p.prod.as_ref().map(|p| p.renew_ms))?;
+        let relaxed = cadence.saturating_mul(2);
+        if relaxed >= routine {
+            return None;
+        }
+        PRODS_CAUGHT_UP.fetch_add(1, Ordering::Relaxed);
+        return Some(relaxed);
     }
     PRODS.fetch_add(1, Ordering::Relaxed);
     // Rung a′'s share of the ledger (⊆ prods): the cadence in force came
@@ -3241,6 +3281,41 @@ pub fn ack_renewals() -> u64 {
     ACK_RENEWALS.load(Ordering::Relaxed)
 }
 
+/// The `SQUEEZEFS_FREE_GRACE_CAUGHT_UP_RELAX` lever's latch (the
+/// `ACK_RENEWAL` shape): finding 15 phase B1 — a caught-up member under a
+/// live ask is relaxed one step, never snapped to routine.
+static CAUGHT_UP_RELAX: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+fn caught_up_relax_enabled() -> bool {
+    match CAUGHT_UP_RELAX.load(Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            let on = crate::env_knobs::bool_knob("SQUEEZEFS_FREE_GRACE_CAUGHT_UP_RELAX", true);
+            CAUGHT_UP_RELAX.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+            on
+        }
+    }
+}
+
+/// Test seam (the `test_set_ack_pipeline` shape).
+pub fn test_set_caught_up_relax(on: Option<bool>) {
+    CAUGHT_UP_RELAX.store(
+        match on {
+            Some(true) => 1,
+            Some(false) => 2,
+            None => 0,
+        },
+        Ordering::Relaxed,
+    );
+}
+
+/// Grants that carried the relaxed ask to a caught-up member
+/// (`free_grace_prods_caught_up`; 0 under the lever's `0`).
+pub fn prods_caught_up() -> u64 {
+    PRODS_CAUGHT_UP.load(Ordering::Relaxed)
+}
+
 /// The `SQUEEZEFS_FREE_GRACE_REFRESH_ON_ACK` lever's latch: lever (d), a
 /// binding member's advancing acknowledgement marks the bound dirty and
 /// the next harvest recomputes it.
@@ -3587,6 +3662,9 @@ pub fn stats_snapshot() -> serde_json::Value {
         "free_grace_ring_cap": derived_ring_cap(),
         "free_grace_pressure_pct": pressure_pct(),
         "free_grace_prods": prods(),
+        // Finding 15 phase B1: relaxed asks to caught-up members — the
+        // drain-instant grants that used to be the routine hole.
+        "free_grace_prods_caught_up": prods_caught_up(),
         "free_grace_pressure_parks": pressure_parks(),
         "free_grace_prod_decays": prod_decays(),
         "free_grace_bound_tightenings": bound_tightenings(),
@@ -3700,6 +3778,7 @@ pub fn reset_for_test() {
         &HELD_BYTES,
         &READER_ACKS,
         &PRODS,
+        &PRODS_CAUGHT_UP,
         &BOUND_TIGHTENINGS,
         &RUNWAY_UNTIL_MS,
         &PROD_RENEW_MS,
@@ -3744,6 +3823,7 @@ pub fn reset_for_test() {
     }
     BOUND_DIRTY.store(false, Ordering::Relaxed);
     test_set_ack_renewal(None);
+    test_set_caught_up_relax(None);
     test_set_refresh_on_ack(None);
     test_set_qualify_ceiling(None);
     crate::ro_coherence::reset_for_test();

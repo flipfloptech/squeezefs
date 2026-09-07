@@ -1,0 +1,26 @@
+host memp-s3ds-aqs-37 kernel 6.19.14-sqz rig a7cab0763 2026-09-07T15:09:40Z
+baseline: nvmet subsystems: 0 ports: 0 daemons: 0 zram: 0 nullb: 0 load: 0.64 2.41 1.35 pkg_temp_mC: 35000
+##### row 1A start 2026-09-07T15:09:40Z  pre: nvmet subsystems: 0 ports: 0 daemons: 0 zram: 0 nullb: 0 load: 0.64 2.41 1.35 pkg_temp_mC: 35000
+phase A1: NOT SUSTAINED — the last third's mean decays 2087 -> 1062 MiB/s (> 30%): a burst number that decays is a FAILED row
+[mwmatrix] ERROR: s11-mpiio: phase A1 failed the sustained-window gate
+sampler: 221 passes over 9 mounts into /scratch/tmp/sqz-agent/day2/keep-1A/samples
+##### row 1A end rc=0 wall=253s  post: nvmet subsystems: 0 ports: 0 daemons: 0 zram: 1 nullb: 1 load: 32.67 22.80 10.07 pkg_temp_mC: 39000
+##### row 2B start 2026-09-07T15:13:53Z  pre: nvmet subsystems: 0 ports: 0 daemons: 0 zram: 1 nullb: 1 load: 32.67 22.80 10.07 pkg_temp_mC: 40000
+[mwmatrix] phase A1 (shared): steady 3193.4 MiB/s over 72s wall (iters: 4167 3962 2048.56 3659 3233.03 3557.87 3357.09 2969.31 3304.64 3053.86 3095.32 3333.93 3082.56 3118.38 3457.45 2755.94 3045.24 3
+phase B1: NOT SUSTAINED — the last third's mean decays 1023 -> 513 MiB/s (> 30%): a burst number that decays is a FAILED row
+[mwmatrix] ERROR: s11-mpiio: phase B1 failed the sustained-window gate
+sampler: 590 passes over 9 mounts into /scratch/tmp/sqz-agent/day2/keep-2B/samples
+##### row 2B end rc=0 wall=630s  post: nvmet subsystems: 0 ports: 0 daemons: 0 zram: 1 nullb: 1 load: 25.99 33.26 23.84 pkg_temp_mC: 39000
+##### row 3B start 2026-09-07T15:24:23Z  pre: nvmet subsystems: 0 ports: 0 daemons: 0 zram: 1 nullb: 1 load: 25.99 33.26 23.84 pkg_temp_mC: 39000
+[mwmatrix] phase A1 (shared): steady 3417.5 MiB/s over 102s wall (iters: 4131 4517 1878.93 3509.05 287.96 4204 5084 2781.19 3719 3403.88 3244.59 3663 3445.74 3569.05 3048.85 3550.98 3605 3263.29 3644 
+phase B1: NOT SUSTAINED — the last third's mean decays 2271 -> 332 MiB/s (> 30%): a burst number that decays is a FAILED row
+[mwmatrix] ERROR: s11-mpiio: phase B1 failed the sustained-window gate
+sampler: 687 passes over 9 mounts into /scratch/tmp/sqz-agent/day2/keep-3B/samples
+##### row 3B end rc=0 wall=727s  post: nvmet subsystems: 0 ports: 0 daemons: 0 zram: 1 nullb: 1 load: 23.10 33.81 31.35 pkg_temp_mC: 39000
+##### row 4A start 2026-09-07T15:36:30Z  pre: nvmet subsystems: 0 ports: 0 daemons: 0 zram: 1 nullb: 1 load: 23.10 33.81 31.35 pkg_temp_mC: 39000
+phase A1: NOT SUSTAINED — the last third's mean decays 2162 -> 919 MiB/s (> 30%): a burst number that decays is a FAILED row
+[mwmatrix] ERROR: s11-mpiio: phase A1 failed the sustained-window gate
+sampler: 251 passes over 9 mounts into /scratch/tmp/sqz-agent/day2/keep-4A/samples
+##### row 4A end rc=0 wall=290s  post: nvmet subsystems: 0 ports: 0 daemons: 0 zram: 1 nullb: 1 load: 26.48 32.72 31.67 pkg_temp_mC: 39000
+final: nvmet subsystems: 0 ports: 0 daemons: 0 zram: 1 nullb: 1 load: 26.48 32.72 31.67 pkg_temp_mC: 40000
+ALL_DONE 2026-09-07T15:41:20Z

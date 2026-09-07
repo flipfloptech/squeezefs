@@ -1,0 +1,15 @@
+    179 CLAIM ANOMALY: offset N claimed from the free list while a refcount entry lingers (count=Some(N)) (block_claim_anomalies)
+     68 transport payload lease held N ms (≥ N s) — overlong handler invocation or a §N.N severance escape; watch transport_lease_overlong / transpo
+     62 bounded allocation refusing StorageFull after N ms parked with N offset(s) still in grace locally (lane harvest horizon N ms): the pressure 
+     35 I/O error: data volume 'nvmeNnN' full: N of N blocks allocated — lane N of N is exhausted while N free block(s) belong to lanes this mount d
+     17 SN: the authority refused N shipped free(s) (vol_tag NxfNbNeNaNaNdNb, request N): already free/graced/quarantined — the double-release linea
+     14 SN: the authority refused N shipped free(s) (vol_tag NxfNddNeeNdN, request N): already free/graced/quarantined — the double-release lineage,
+     13 Squeezefs operational error: Refused { errno: N, msg: "I/O error: block key 'N@NbqiNvy' names a dead incarnation of its device offset (spec 
+     13 FUSE Fsync: FlushExtents barrier for ino N failed: Refused { errno: N, msg: "I/O error: block key 'N@NbqiNvy' names a dead incarnation of it
+      9 Squeezefs operational error: Io(Custom { kind: StorageFull, error: "I/O error: data volume 'nvmeNnN' full: N of N blocks allocated — lane N 
+      9 FUSE Fsync failed for ino N: Io(Custom { kind: StorageFull, error: "I/O error: data volume 'nvmeNnN' full: N of N blocks allocated — lane N 
+      9 fsync durable upload failed for ino N block N (Io(Custom { kind: StorageFull, error: "I/O error: data volume 'nvmeNnN' full: N of N blocks a
+      4   - [enabled] /dev/nvmeNnN (health: N)
+      4 ----------------------------------------------------------------------
+      3 data-plane allocation lane ENGAGED on volume 'nvmeNnN': lane N of N, resuming at block N (floor OPENED by the authority (this mount never wa
+      2 Registering data volume 'nvmeNnN' at path /dev/nvmeNnN (state active)

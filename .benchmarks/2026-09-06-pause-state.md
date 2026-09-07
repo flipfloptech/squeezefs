@@ -75,6 +75,17 @@ mount (the A-arm rig reset the cluster; remount is part of every arm).
    empty harvest RPCs/s (members' acks fresh, authority's view 10–11 s).
    Next: single-flight harvest per allocator + renewal serve isolation;
    the claim-anomaly lineage (1,620 in B1). Gate on `b119ef78` running.
+1d. **squeeze-test A-B-B-A (the deciding row, 2026-09-07 15:09–15:41Z —
+   `.benchmarks/2026-09-07-f15-day2-squeeze-test-abba.md`):** A
+   `c60746fb` FAILS A1 in positions 1 and 4 (2,087 → 1,062; 2,162 → 919);
+   B `b119ef78` PASSES A1 in positions 2 and 3 (steady 3,193 MiB/s / 72 s;
+   3,417 / 102 s), tripwires 0, anomalies 0, ENOSPC +0/+656 on m50 vs 116k–
+   130k on A. Thermally flat 35 → 39 °C. **The S11 gate is MET on
+   b119ef78.** B1 fails on B (6,964 / 11,564 STALE refusals = the
+   finding-51 regression + the harvest storm) — three fixes in flight
+   (`fix/finding-51-adopt-key-incarnation`, `perf/lane-harvest-single-flight`,
+   `fix/membership-renewal-isolation`); the A-B-B-A re-runs on their tip,
+   with the per-lever legs.
 2. **Kernel A/B, B arm** — after `squeeze-test` boots the 6.19.14 series
    WITH 0031 (or whichever box carries the patched kernel): on the box,
    `cd /scratch/tmp/sqz-agent/k26 && sudo env ARM=B KERNEL_TAG=<uname -r

@@ -1,0 +1,15 @@
+    566 bounded allocation refusing StorageFull after N ms parked with N offset(s) still in grace locally (lane harvest horizon N ms): the pressure 
+    172 write-through failed for ino N block N (Io(Custom { kind: StorageFull, error: "I/O error: data volume 'nvmeNnN' full: N of N blocks allocate
+    107 transport payload lease held N ms (≥ N s) — overlong handler invocation or a §N.N severance escape; watch transport_lease_overlong / transpo
+     43 rewrite epoch close for ino N failed transiently (Io(Custom { kind: StorageFull, error: "I/O error: data volume 'nvmeNnN' full: N of N block
+     41 I/O error: data volume 'nvmeNnN' full: N of N blocks allocated — lane N of N is exhausted while N free block(s) belong to lanes this mount d
+     25 flush write-through failed for ino N block N (Io(Custom { kind: StorageFull, error: "I/O error: data volume 'nvmeNnN' full: N of N blocks al
+     14 fuse-over-uring qid=N ent=N: unique=N delivered N ms ago and still unreplied — the caller is in uninterruptible sleep (transport_slots_overd
+     11 SN: the authority refused N shipped free(s) (vol_tag NxfNddNeeNdN, request N): already free/graced/quarantined — the double-release lineage,
+      9 SN: the authority refused N shipped free(s) (vol_tag NxfNbNeNaNaNdNb, request N): already free/graced/quarantined — the double-release linea
+      4 Squeezefs operational error: Io(Custom { kind: StorageFull, error: "I/O error: data volume 'nvmeNnN' full: N of N blocks allocated — lane N 
+      4 FUSE Fsync failed for ino N: Io(Custom { kind: StorageFull, error: "I/O error: data volume 'nvmeNnN' full: N of N blocks allocated — lane N 
+      4 fsync durable upload failed for ino N block N (Io(Custom { kind: StorageFull, error: "I/O error: data volume 'nvmeNnN' full: N of N blocks a
+      4   - [enabled] /dev/nvmeNnN (health: N)
+      4 ----------------------------------------------------------------------
+      3 data-plane allocation lane ENGAGED on volume 'nvmeNnN': lane N of N, resuming at block N (floor OPENED by the authority (this mount never wa

@@ -56,6 +56,10 @@ mount (the A-arm rig reset the cluster; remount is part of every arm).
    co-writers (KD-1.7's early-close made ahead of the StorageFull). Also
    filed: `read_settle_lost_serialized` fires on the authority in both
    rows (a standing must-stay-0 violation on this venue).
+   **Gate on the term-1 tip — GREEN on `c60746fb`** (21:20–22:13, pinned
+   worktree, from zero): 358 suites / **4,740 tests**, all 18 stages, both
+   audits (the one allowed warning = RUSTSEC-2025-0141 `bincode`). The tip
+   is releasable as 1.2.2 whenever the user calls it.
 2. **Kernel A/B, B arm** — after `squeeze-test` boots the 6.19.14 series
    WITH 0031 (or whichever box carries the patched kernel): on the box,
    `cd /scratch/tmp/sqz-agent/k26 && sudo env ARM=B KERNEL_TAG=<uname -r

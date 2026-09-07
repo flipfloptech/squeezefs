@@ -2996,6 +2996,62 @@ fn harvest_executor() -> Option<HarvestExecutor> {
     HARVEST_EXECUTOR.load_full().map(|e| (*e).clone())
 }
 
+/// The owner-side BINDING WITNESS (finding 51,
+/// `.benchmarks/2026-09-07-read-settle-lost-serialized-authority.md`): the
+/// data-plane reaction to a SERVED layout commit — called with the DATA
+/// references the commit TOOK, after the commit landed. The authority's
+/// router publishes its incarnation word for every foreign-lane block
+/// among them ([`crate::routing::BackendRouter::witness_served_bindings`]):
+/// a co-writer publishes strictly after its DMA, so the serve is the one
+/// event on the authority that witnesses the peer's device write behind a
+/// key the authority can never mint — and without it the authority's word
+/// for a RECYCLED co-writer block (retired by its own `begin_free` of the
+/// previous lifetime) stayed unstable for ever, failing every later fill
+/// of the key (the s11-mpiio row's `read_settle_lost_serialized` storm and
+/// fsync EIOs).
+///
+/// Installed by the multi-writer AUTHORITY arm beside the free executor —
+/// the free RETIRES a displaced offset's word, the witness RE-PUBLISHES it
+/// when a peer's publish adopts the offset again: the two halves of one
+/// lifetime, both on the authority's own data plane. Absent = no data
+/// plane wired (solo mounts serve no publishes; a test rig without one
+/// keeps the pre-f51 words).
+pub type BindingWitness = Arc<dyn Fn(&[BlockRef]) + Send + Sync>;
+
+static BINDING_WITNESS: Lazy<arc_swap::ArcSwapOption<BindingWitness>> =
+    Lazy::new(arc_swap::ArcSwapOption::empty);
+
+/// Install the process's served-binding witness (the authority arm's act).
+pub fn install_binding_witness(witness: BindingWitness) {
+    BINDING_WITNESS.store(Some(Arc::new(witness)));
+}
+
+/// Uninstall it (disarm / unmount / test teardown).
+pub fn uninstall_binding_witness() {
+    BINDING_WITNESS.store(None);
+}
+
+/// The DATA references a refs frame TAKES (map-blob custody excluded — a
+/// blob is this authority's own lifecycle, never a peer's DMA).
+fn taken_data_refs(refs: &[BlockRefOp]) -> Vec<BlockRef> {
+    refs.iter()
+        .filter(|o| o.take && !o.reference.is_map_blob())
+        .map(|o| o.reference)
+        .collect()
+}
+
+/// Hand a committed serve's taken data references to the installed
+/// witness. Called strictly AFTER the commit landed: a refused or failed
+/// serve adopted nothing, so it witnesses nothing.
+fn witness_taken(taken: &[BlockRef]) {
+    if taken.is_empty() {
+        return;
+    }
+    if let Some(w) = BINDING_WITNESS.load_full() {
+        (*w)(taken);
+    }
+}
+
 /// One shipped extent as the owner-side assembler executor receives it
 /// (rung 17): the wire frame's fields plus the shipper's identity (the
 /// coverage ledger's key).
@@ -3401,6 +3457,10 @@ struct LayoutPostCommit {
     /// Finding 36b: the scoped compose's released DATA blocks — freed
     /// through this authority's own ladder strictly after commit Ok.
     released_data: Vec<BlockRef>,
+    /// Finding 51: the DATA blocks the commit TAKES — handed to the binding
+    /// witness strictly after commit Ok (the peer's DMA behind each is
+    /// complete; the serve is the authority's witness of it).
+    taken_data: Vec<BlockRef>,
     was_recomputed: bool,
 }
 
@@ -5391,6 +5451,8 @@ impl PublishService {
             .try_scoped_kvmap_put(client, ino, &layout, size, &refs)
             .await?
         {
+            // Finding 51: the train committed the caller's claimed takes.
+            witness_taken(&taken_data_refs(&refs));
             return Ok(LayoutPrepare::Done(reply));
         }
         let ScopedLayout {
@@ -5443,6 +5505,9 @@ impl PublishService {
         // report-only fsck C8 residue (space-safe, data-safe) — f38's law
         // verbatim, moved to the node whose journal admits the commit.
         const SERVE_REF_TX_CHUNK: usize = 512;
+        // Finding 51: the whole frame's takes (chunked or not) are the
+        // commit's adopted data blocks — witnessed once the LAYOUT lands.
+        let taken_data = taken_data_refs(&refs);
         while refs.len() > SERVE_REF_TX_CHUNK {
             let tail = refs.split_off(SERVE_REF_TX_CHUNK);
             let chunk = std::mem::replace(&mut refs, tail);
@@ -5458,6 +5523,7 @@ impl PublishService {
             post: LayoutPostCommit {
                 blob_custody,
                 released_data,
+                taken_data,
                 was_recomputed,
             },
         }))
@@ -5471,7 +5537,9 @@ impl PublishService {
     /// durable blob is freed only NOW (the DUR-6 CoW law), and the
     /// compose's released data blocks run this authority's own free
     /// ladder strictly after commit Ok (finding 36b, half 1 — the reply's
-    /// `recomputed` stands the caller's frame stream down).
+    /// `recomputed` stands the caller's frame stream down), and the taken
+    /// data blocks reach the binding witness (finding 51) — the serve's
+    /// two data-plane reactions, retire and re-publish, both post-commit.
     async fn finish_layout_publish(
         ino: u64,
         committed: Result<()>,
@@ -5480,9 +5548,11 @@ impl PublishService {
         let LayoutPostCommit {
             mut blob_custody,
             released_data,
+            taken_data,
             was_recomputed,
         } = post;
         committed?;
+        witness_taken(&taken_data);
         if let Some(g) = blob_custody.fresh.as_mut() {
             g.disarm();
         }
@@ -5557,6 +5627,9 @@ impl PublishService {
                     full_layout
                 };
                 let refs: Vec<BlockRefOp> = refs.into_iter().map(BlockRefOp::from).collect();
+                // Finding 51: the caller's claimed takes are the blocks it
+                // DMA'd — witnessed once the chained merge commits.
+                let taken_data = taken_data_refs(&refs);
                 // Rung 17 (KD-MW-8's composition law): a SHIPPED merge
                 // CHAINS ONTO THE DURABLE HEAD — the claim re-stamps
                 // under the backend's own 4a I-guard and the link
@@ -5576,6 +5649,7 @@ impl PublishService {
                         refs,
                     )
                     .await?;
+                witness_taken(&taken_data);
                 // Finding 36 (half 1): the recompute-released DATA blocks
                 // run this authority's OWN free ladder strictly AFTER
                 // commit Ok (the displaced-blob post-commit pattern) —
@@ -5649,6 +5723,7 @@ impl PublishService {
             PublishCall::CommitBlockRefs { ino, refs, .. } => {
                 let refs: Vec<BlockRefOp> = refs.into_iter().map(BlockRefOp::from).collect();
                 self.inner.commit_block_refs(ino, &refs).await?;
+                witness_taken(&taken_data_refs(&refs));
                 Ok(PublishReply::Unit)
             }
             PublishCall::MigrateBlockMap {
@@ -5660,8 +5735,18 @@ impl PublishService {
                 base_gen,
                 ..
             } => {
-                self.serve_map_train(client, ino, layout, size, entries, refs, base_gen)
-                    .await
+                let taken_data = taken_data_refs(
+                    &refs
+                        .iter()
+                        .copied()
+                        .map(BlockRefOp::from)
+                        .collect::<Vec<_>>(),
+                );
+                let reply = self
+                    .serve_map_train(client, ino, layout, size, entries, refs, base_gen)
+                    .await?;
+                witness_taken(&taken_data);
+                Ok(reply)
             }
             PublishCall::ParkWriteTimes {
                 ino, mtime, ctime, ..

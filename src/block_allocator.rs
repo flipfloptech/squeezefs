@@ -1652,10 +1652,53 @@ impl BlockAllocator {
         }
     }
 
+    /// **The served publish's DMA witness for a FOREIGN-lane offset**
+    /// (finding 51, `.benchmarks/2026-09-07-read-settle-lost-serialized-
+    /// authority.md`): the authority just committed a peer's layout publish
+    /// that binds `block_idx`, so the peer's device write behind it is
+    /// complete (a co-writer publishes strictly after its DMA) — publish
+    /// this allocator's word for the offset exactly as the local writer's
+    /// DMA-complete [`Self::publish_block`] would. Returns `true` ⇔ the
+    /// word was published.
+    ///
+    /// Why the authority needs it: the incarnation seqlock is per PROCESS.
+    /// A co-writer's displaced block is freed THROUGH the authority
+    /// ([`Self::begin_free`] retires the authority's word), returns to the
+    /// lane's supply, is harvested by the co-writer and minted again — and
+    /// the co-writer's own `publish_block` stabilizes the co-writer's word,
+    /// never this one. The authority can never claim a foreign-lane
+    /// offset, so without this witness its word stayed retired for ever
+    /// and every later fill of the recycled key failed validation: the
+    /// s11-mpiio row's 326 `read_settle_lost_serialized` tripwires and 101
+    /// fsync EIOs, every one a co-writer block the authority had freed once.
+    ///
+    /// The two edges it keeps: between the authority's free of the offset
+    /// and this witness the word stays RETIRED (a straggler fill of the
+    /// dead lifetime during the co-writer's DMA must not publish into the
+    /// authority's tiers — the seqlock's whole purpose), and an OWN-lane
+    /// offset is never touched (`false`): its word belongs to the local
+    /// claim → DMA → publish protocol, and a peer's publish naming one is
+    /// either a clone of a block already stable or a stale view the compose
+    /// dropped. Unpartitioned allocators own every lane, so a solo mount
+    /// never reaches the publish.
+    pub fn witness_served_binding(&self, block_idx: u64) -> bool {
+        if self.lane_is_ours(block_idx) {
+            return false;
+        }
+        self.publish_block(block_idx.saturating_mul(self.chunk_size));
+        true
+    }
+
     /// Snapshot the incarnation word for a fill. `None` while unstable
     /// (in-flight write or retired/free) — the fill must not publish. Offsets
     /// with no recorded incarnation (written before this process / by another
     /// node) are treated as stable.
+    ///
+    /// On an AUTHORITY the recorded incarnations include every foreign-lane
+    /// offset it ever freed for a peer; those words are re-published by
+    /// the served publish that re-adopts the offset
+    /// ([`Self::witness_served_binding`]), so "unstable" here means
+    /// mid-transition on SOME node, never "this node cannot know".
     pub fn fill_incarnation(&self, offset: u64) -> Option<u64> {
         match self
             .incarnations

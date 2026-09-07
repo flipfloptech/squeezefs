@@ -5678,6 +5678,18 @@ pub struct Metrics {
     /// tripwire is reserved for backend-fresh losses (the only shape
     /// that still means a mutator outside the stripe/merge disciplines).
     pub read_settle_stale_head_refetches: Align64<AtomicU64>,
+    /// Finding 51: incarnation words this AUTHORITY published because a
+    /// SERVED layout publish adopted a FOREIGN-lane block — the serve is
+    /// the authority's witness that the co-writer's DMA behind the key
+    /// completed, and the only publisher its word for an offset it can
+    /// never mint will ever have (its own `begin_free` of the offset's
+    /// previous lifetime retired it). Engagement: on a co-writer rewrite
+    /// row the delta accounts for every foreign-lane block the served
+    /// publishes inserted; 0 by construction on a solo mount (no serves)
+    /// and on a co-writer (it serves nothing). A recycled co-writer block
+    /// the authority reads with this flat is the s11-mpiio row's shape —
+    /// `read_settle_lost_serialized` and the fsync EIO.
+    pub served_binding_witnesses: Align64<AtomicU64>,
     /// Pre-RC engineering spec §6.2 item 6 / §6.3: reads and frees REFUSED
     /// because the block key named a **dead incarnation** of its device
     /// offset — the offset was freed and reissued to a different file, and
@@ -10703,6 +10715,7 @@ impl SqueezefsFilesystem {
                 "block_live_free_refusals": METRICS.block_live_free_refusals.load(Ordering::Relaxed),
                 "block_claim_anomalies": METRICS.block_claim_anomalies.load(Ordering::Relaxed),
                 "read_settle_stale_head_refetches": METRICS.read_settle_stale_head_refetches.load(Ordering::Relaxed),
+                "served_binding_witnesses": METRICS.served_binding_witnesses.load(Ordering::Relaxed),
                 "block_key_incarnation_refusals": METRICS.block_key_incarnation_refusals.load(Ordering::Relaxed),
                 "block_key_incarnation_unknown": METRICS.block_key_incarnation_unknown.load(Ordering::Relaxed),
                 "block_key_incarnation_exhausted": METRICS.block_key_incarnation_exhausted.load(Ordering::Relaxed),

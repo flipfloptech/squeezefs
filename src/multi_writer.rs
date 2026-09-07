@@ -492,6 +492,7 @@ impl MultiWriterArm {
         // assembler refuses loud rather than acking bytes nobody merges).
         publish::uninstall_free_executor();
         publish::uninstall_harvest_executor();
+        publish::uninstall_binding_witness();
         crate::free_grace::uninstall_release_hook();
         crate::free_grace::uninstall_lane_supply_source();
         publish::uninstall_extent_merge_executor();
@@ -927,6 +928,19 @@ pub async fn arm_multi_writer(
         publish::install_harvest_executor(crate::cowriter::router_harvest_executor(Arc::clone(
             backend,
         )));
+        // The lifetime's other half (finding 51): a served publish that
+        // ADOPTS a foreign-lane block is this authority's witness that the
+        // co-writer's DMA behind it completed — it re-publishes the word
+        // the executor's `begin_free` retired when the offset's previous
+        // lifetime was displaced. Without it a recycled co-writer block is
+        // unreadable and un-foldable from the authority for ever (the
+        // s11-mpiio `read_settle_lost_serialized` storm + fsync EIOs).
+        {
+            let br = Arc::clone(backend);
+            publish::install_binding_witness(Arc::new(move |taken| {
+                br.witness_served_bindings(taken);
+            }));
+        }
         // The lane-push lever's authority half (finding 15 term 2,
         // `.benchmarks/2026-09-06-free-grace-lane-visible.md`): a binding
         // acknowledgement releases the covered offsets on arrival (every
@@ -945,6 +959,7 @@ pub async fn arm_multi_writer(
             crate::alloc_lane_grant::uninstall_frontier_source();
             publish::uninstall_free_executor();
             publish::uninstall_harvest_executor();
+            publish::uninstall_binding_witness();
             crate::free_grace::uninstall_release_hook();
             crate::free_grace::uninstall_lane_supply_source();
             if let Some(hold) = wero {

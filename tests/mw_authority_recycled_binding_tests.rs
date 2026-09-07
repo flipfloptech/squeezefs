@@ -146,6 +146,7 @@ impl Drop for Restore {
         publish::uninstall_client();
         publish::uninstall_free_executor();
         publish::uninstall_harvest_executor();
+        publish::uninstall_binding_witness();
         ship::disarm_ownership();
         data_custody::test_reset_custody_generation();
         data_custody::test_clear_poison();
@@ -368,7 +369,8 @@ impl Authority {
         .expect("the authority engages its own lane");
         // The production arm's data-plane installs, mirrored (the
         // fixture-truth discipline): the shipped-free executor, the lane
-        // harvest, the finding-28 binding probe, the rung-19 resolver.
+        // harvest, the finding-28 binding probe, the finding-51 binding
+        // witness, the rung-19 resolver.
         publish::install_free_executor(cowriter::router_free_executor(
             Arc::clone(&br),
             Arc::clone(&meta),
@@ -378,6 +380,12 @@ impl Authority {
         {
             let br = Arc::clone(&br);
             publish::install_binding_probe(Arc::new(move |k: &str| br.block_key_incarnation_ok(k)));
+        }
+        {
+            let br = Arc::clone(&br);
+            publish::install_binding_witness(Arc::new(move |taken: &[BlockRef]| {
+                br.witness_served_bindings(taken);
+            }));
         }
         {
             let br = Arc::clone(&br);
@@ -707,6 +715,7 @@ async fn an_authority_read_of_a_recycled_co_writer_block_validates_first_try() {
             .await
             .expect("the co-writer opens the shared file")
             .fh;
+    let witnesses_before = METRICS.served_binding_witnesses.load(Ordering::Relaxed);
     let mut ever_freed: BTreeSet<u64> = BTreeSet::new();
     let mut recycled_reads = 0u32;
     let mut prev: Vec<(u32, u64)> = durable_blocks(&auth, ino).await;
@@ -810,9 +819,19 @@ async fn an_authority_read_of_a_recycled_co_writer_block_validates_first_try() {
          lane share (harvest_served_blocks {})",
         publish::stats().harvest_served_blocks
     );
+    // Engagement: every served publish's adopted foreign-lane block is one
+    // witness — four per round, fresh mints (a first STABLE word) and
+    // recycled offsets (the retired word re-published) alike.
+    let witnesses = METRICS.served_binding_witnesses.load(Ordering::Relaxed) - witnesses_before;
+    assert_eq!(
+        witnesses,
+        u64::from(ROUNDS) * (RANGE.end - RANGE.start),
+        "served_binding_witnesses accounts for every foreign-lane block the served \
+         publishes adopted"
+    );
     eprintln!(
         "finding 51 loop: {ROUNDS} rounds, {} recycled-block serves, {} offsets ever freed by \
-         the authority, harvest served {}",
+         the authority, harvest served {}, binding witnesses {witnesses}",
         recycled_reads,
         ever_freed.len(),
         publish::stats().harvest_served_blocks
@@ -854,4 +873,120 @@ async fn an_authority_read_of_a_recycled_co_writer_block_validates_first_try() {
     drop(w);
     drop(cwr);
     auth.stop().await;
+}
+
+// ===========================================================================
+// 2. The witness's two edges: own-lane words untouched, retire kept
+// ===========================================================================
+
+/// Contract (finding 51's edges, pinned green): the binding witness
+/// publishes words for FOREIGN-lane blocks only. An authority-lane offset
+/// the authority freed (its word retired by the local protocol) stays
+/// retired when a served frame names it — the local claim → DMA → publish
+/// protocol owns own-lane words, and a peer's take on one is a clone of an
+/// already-stable block or a stale view the compose dropped, never a DMA
+/// this witness may vouch for. An unpartitioned allocator (a solo mount)
+/// owns every lane and publishes nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_binding_witness_never_publishes_an_own_lane_or_solo_word() {
+    let _serial = serial();
+    let _restore = restore();
+    let dir = TempDir::new().unwrap();
+    let dev = data_device(dir.path(), "f51-edges.dev");
+    let tag = volume_tag(DATA_VOL);
+    let reference = |block_idx: u64| BlockRef {
+        vol_tag: tag,
+        block_idx,
+        owner_ino: 2,
+        block_index: 0,
+    };
+
+    // A SOLO allocator (no partition): every lane is its own.
+    let (solo, solo_br) = data_plane(&dev).await;
+    let bs = solo.chunk_size();
+    let solo_off = solo.allocate_block().await.expect("solo mint");
+    assert_eq!(
+        solo.fill_incarnation(solo_off),
+        None,
+        "a claimed, un-published offset reads unstable"
+    );
+    assert_eq!(
+        solo_br.witness_served_bindings(&[reference(solo_off / bs)]),
+        0,
+        "a solo allocator owns every lane — the witness publishes nothing"
+    );
+    assert_eq!(
+        solo.fill_incarnation(solo_off),
+        None,
+        "the solo word is untouched"
+    );
+
+    // A PARTITIONED authority allocator (W = 2, lane 0): its own lane's
+    // retired word stays retired; a foreign-lane block's word publishes.
+    let (auth_alloc, auth_br) = data_plane(&dev).await;
+    auth_alloc
+        .engage_alloc_lanes(
+            squeezefs::meta_backend::kv::journal::AppendPartition::new(2, 0).expect("partition"),
+        )
+        .expect("engage lane 0");
+    let own_off = auth_alloc.allocate_block().await.expect("own-lane mint");
+    assert_eq!(lane::block_lane_of(own_off / bs, 2), 0);
+    assert_eq!(auth_alloc.fill_incarnation(own_off), None);
+    let witnesses_before = METRICS.served_binding_witnesses.load(Ordering::Relaxed);
+    assert_eq!(
+        auth_br.witness_served_bindings(&[reference(own_off / bs)]),
+        0,
+        "an own-lane reference is the local protocol's — never witnessed"
+    );
+    assert_eq!(
+        auth_alloc.fill_incarnation(own_off),
+        None,
+        "the own-lane word stays retired"
+    );
+    // A foreign-lane offset the authority never saw: the witness records
+    // its first STABLE word (a fresh co-writer mint's publish).
+    let foreign_idx = (own_off / bs) + 1;
+    assert_eq!(lane::block_lane_of(foreign_idx, 2), 1);
+    // A never-seen offset reads unknown-stable (§6.3's honest degradation:
+    // the `u64::MAX` sentinel, no recorded word).
+    assert_eq!(
+        auth_alloc.fill_incarnation(foreign_idx * bs),
+        Some(u64::MAX),
+        "a never-seen offset reads unknown-stable"
+    );
+    assert_eq!(
+        auth_br.witness_served_bindings(&[reference(foreign_idx)]),
+        1,
+        "a foreign-lane reference is witnessed"
+    );
+    assert!(
+        auth_alloc
+            .fill_incarnation(foreign_idx * bs)
+            .is_some_and(|w| w != u64::MAX),
+        "the foreign-lane word is now a recorded STABLE word"
+    );
+    // The retire edge: the authority's free of that offset (the executor's
+    // `begin_free`) retires the word; the NEXT witness re-publishes it.
+    assert!(auth_alloc.seed_shipped_free_reference(foreign_idx * bs));
+    assert!(auth_alloc.begin_free(foreign_idx * bs), "terminal free");
+    assert_eq!(
+        auth_alloc.fill_incarnation(foreign_idx * bs),
+        None,
+        "the freed lifetime's word is retired — a straggler fill of the dead binding \
+         must not publish"
+    );
+    assert_eq!(
+        auth_br.witness_served_bindings(&[reference(foreign_idx)]),
+        1
+    );
+    assert!(
+        auth_alloc.fill_incarnation(foreign_idx * bs).is_some(),
+        "the re-adopting serve re-publishes the word under its new generation"
+    );
+    assert_eq!(
+        METRICS.served_binding_witnesses.load(Ordering::Relaxed) - witnesses_before,
+        2,
+        "the gauge counts the two foreign-lane publishes and neither own-lane refusal"
+    );
+    auth_alloc.finish_free(foreign_idx * bs);
 }

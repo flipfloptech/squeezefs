@@ -3718,6 +3718,34 @@ impl BackendRouter {
         }
     }
 
+    /// A SERVED layout publish committed the durable references `taken`
+    /// (finding 51): publish this authority's incarnation word for every
+    /// FOREIGN-lane block among them — the peer's DMA behind each is
+    /// complete, and the serve is the only event on this node that
+    /// witnesses it ([`crate::block_allocator::BlockAllocator::
+    /// witness_served_binding`]). Own-lane and unknown-volume references
+    /// are skipped. Returns the number of words published (the
+    /// `served_binding_witnesses` engagement gauge).
+    pub fn witness_served_bindings(
+        &self,
+        taken: &[crate::meta_backend::kv::block_refs::BlockRef],
+    ) -> u64 {
+        let mut published = 0u64;
+        for r in taken {
+            if let Some((_, alloc)) = self.allocator_for_volume_tag(r.vol_tag) {
+                if alloc.witness_served_binding(r.block_idx) {
+                    published += 1;
+                }
+            }
+        }
+        if published > 0 {
+            crate::fuse_client::METRICS
+                .served_binding_witnesses
+                .fetch_add(published, std::sync::atomic::Ordering::Relaxed);
+        }
+        published
+    }
+
     /// Incarnation snapshot for a validated cache fill (None = unstable, do not
     /// publish what you read).
     pub fn fill_incarnation(&self, block_key: &str) -> Option<u64> {
@@ -12067,6 +12095,16 @@ impl DataRouter {
                     // backend inside the window — a mutator outside the
                     // stripe/merge disciplines (RES-22: loud, never
                     // fatal; the caller re-resolves from scratch).
+                    // Finding 51 narrowed what reaches here: on an
+                    // authority a foreign-lane key's word is retired by
+                    // its own `begin_free` of the offset's previous
+                    // lifetime and re-published by the served publish
+                    // that adopts the offset again (the binding witness,
+                    // `BackendRouter::witness_served_bindings`) — so a
+                    // recycled co-writer block is a stable word here, not
+                    // a structural loss. What remains is the genuine
+                    // class: a retire/claim of a CURRENTLY-BOUND key
+                    // outside (3)/(3.5)/the serve stripe.
                     crate::note_invariant_tripwire(
                         "read_settle_lost_serialized",
                         &format!(

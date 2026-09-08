@@ -1098,11 +1098,30 @@ cd "$XFSTESTS_DIR"
 # deterministic (the resume rule, user directive 2026-07-23).
 ORDER_FILE="$XFSTESTS_DIR/vl10_full_list.order"
 
+# SQUEEZEFS_FSTESTS_EXCLUDE: space-separated tests a VENUE cannot run, each
+# named loudly in the summary. The only standing entry is generic/650 on the
+# Strix Halo laptop — its CPU-hotplug storm trips the firmware (2026-07-17
+# dead cores until reboot; 2026-09-05 latched cores; 2026-09-08 two hard
+# hangs on kernel 7.2.3 within seconds of the test starting). It is a
+# platform hazard, never a SqueezeFS verdict: 650 itself PASSED at M11 and
+# on the 1.2.1 gate's 7.1.8 kernel. An exclusion is stated in the gate
+# record with this reasoning; the release gate on a box without the hazard
+# runs it.
 expand_full_list() {
     mapfile -t FULL_LIST < <(./check -n -g auto 2>/dev/null | grep -oE '^[a-z]+/[0-9]+')
     if [ "${#FULL_LIST[@]}" -lt 100 ]; then
         echo "ERROR: -g auto expansion produced only ${#FULL_LIST[@]} tests — refusing" >&2
         exit 1
+    fi
+    if [ -n "${SQUEEZEFS_FSTESTS_EXCLUDE:-}" ]; then
+        local kept=() t x hit
+        for t in "${FULL_LIST[@]}"; do
+            hit=0
+            for x in $SQUEEZEFS_FSTESTS_EXCLUDE; do [ "$t" = "$x" ] && hit=1; done
+            [ $hit -eq 0 ] && kept+=("$t")
+        done
+        echo "VENUE EXCLUSION (SQUEEZEFS_FSTESTS_EXCLUDE): ${SQUEEZEFS_FSTESTS_EXCLUDE} — $(( ${#FULL_LIST[@]} - ${#kept[@]} )) test(s) dropped from the expansion; the gate record MUST name them and the reason"
+        FULL_LIST=("${kept[@]}")
     fi
 }
 

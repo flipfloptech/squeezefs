@@ -184,6 +184,39 @@ mount (the A-arm rig reset the cluster; remount is part of every arm).
    `fix/assembler-contracts-notice-poll` (a `test_set_notice_poll` seam
    held off in exactly the pre-ack-state contracts + a real finding-27
    coverage contract); the gate on the resulting tip is the next act.
+1j. **D-5's fleet row RUN — the lever SHIPS OFF** (`af6f49cb`,
+   `.benchmarks/2026-09-08-d5-fleet-squeeze-test.md`): two same-binary
+   A-B-B-A brackets on the squeeze-test 8-co-writer fleet, both orders.
+   `SQUEEZEFS_META_SHIP_INLINE_SERVE=1` deletes the two lane hops exactly
+   (0.5–0.7 ms) but the served work runs 0.6–0.9 ms SLOWER on the
+   connection thread (in-work wakes become OS unparks, `sqz-jrnl`
+   +17–25 %): co-writer publish latency +15–49 %, ingest −1.5…−7 %,
+   verbs/s par. The in-process win needed an artificial lane hog; the
+   fleet's lanes run at ρ ≈ 0.2. Audit row 18 + DLM #7 closed; the
+   remaining owner-dispatch term is `run` itself (the verb-plane
+   grouping rung). All four campaign mechanisms are now field-rowed.
+   **Gate GREEN on `9e785b6d`** (06:14–07:06, pinned worktree, from
+   zero, laptop idle: 365 suites / **4,835 tests**, 18 stages, both
+   audits — 1 allowed warning = the adjudicated bincode advisory).
+   It took SIX runs; every red was a distinct timing-shaped contract
+   fixed test-side, plus one fmt slip and one exec bit (logs
+   `/tmp/five/gate/taskcheck.<sha>-red.log`): `e0bdd35f` the assembler
+   contracts (the accept tick unmasked the finding-27 notice poll —
+   `69a120dd`, with the poll's ask derived inside the reply bound +
+   `dlm_custody_notice_poll_failures`); `69a120dd`
+   `il_direct_write_tests` (the batch contract had been reading the
+   warm-up's late deferred dispatch as its 1 — `ce879a57`, + the fixture
+   shuts down on drop); `ce879a57` fmt (`d39775c4`); `d39775c4` the
+   delegation red half (the channel's re-assert re-stamped the grant
+   after the conflict — `64b4df5d`); `64b4df5d` exec bit (`4e91c45a`);
+   `4e91c45a` the free-grace checkpoint lever-off arm (an in-flight
+   elastic cycle landing after the sample — `3e6bf333`); `3e6bf333` the
+   delegation own-grant contract (same re-assert class — `9e785b6d`).
+   The laptop was thermally throttling (98–100 °C, down to 3.67 GHz)
+   through these gates; the contracts that broke are the ones that
+   sample a counter whose increment the product DEFERS past the
+   observable the test waits on. Every code landing of 2026-09-08 is
+   gated; `dev` = `origin/dev` = `9e785b6d`.
 2. **Kernel A/B, B arm** — after `squeeze-test` boots the 6.19.14 series
    WITH 0031 (or whichever box carries the patched kernel): on the box,
    `cd /scratch/tmp/sqz-agent/k26 && sudo env ARM=B KERNEL_TAG=<uname -r

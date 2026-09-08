@@ -187,11 +187,10 @@ a transport failure on either half poisons the WHOLE session and fails every
 parked call (the pooled "drop on error" law, one session wide), so the
 publish plane's resend discipline is unchanged.
 
-**The publish plane**: `SQUEEZEFS_PUBLISH_SHIP_MULTIPLEX` (default **on**)
-rides the D-1b depth on ONE `MuxSession` per authority; `0` = the D-1b
-session pool. Engagement `meta_ship_publish.ship_mux_frames` (≡
-`ship_frames` on the default), and `ship_session_dials` reads 1 per
-authority instead of `depth`.
+**The publish plane**: `SQUEEZEFS_PUBLISH_SHIP_MULTIPLEX=1` rides the D-1b
+depth on ONE `MuxSession` per authority; `0`/unset = the D-1b session pool.
+Engagement `meta_ship_publish.ship_mux_frames` (≡ `ship_frames` when
+engaged), and `ship_session_dials` reads 1 per authority instead of `depth`.
 
 **Measured**: 8 pipelined 40 ms calls on one session serve in **41 ms**
 (`live_connections` 1, `requests_served` 8, every reply to its own caller);
@@ -202,11 +201,51 @@ wire benefited from Nagle). The publish contract: depth 4 with the owner's
 pass held — 5 frames, `ship_depth_waits` 1, multiplexed **1 dial** vs the
 pool's **4**, every publish lands, 24 journal entries, both arms.
 
-**A/B at equal depth (in-process, release) — see the addendum below**: the
-mechanism is landed on its contracts and its connection-count evidence; the
-latency-at-equal-depth adjudication needs a quiet box (both rolls so far ran
-under a foreign build at load 23–48, and the same-arm spread exceeded the
-arm difference).
+**A/B at equal depth — the lever SHIPS OFF.** The acceptance rule was
+"par-or-better latency at equal depth with fewer connections". In-process
+release, the same 24 × 8 publish burst, a fresh client per leg (the lever is
+read at the lane's first frame), A-B-B-A (mux / pool / pool / mux) × four
+rolls under a stationary foreign load (box load 36–41 throughout — every
+leg of a roll saw the same box, and the 16 legs agree in sign):
+
+| roll | mux | pool | pool | mux |
+|---|---|---|---|---|
+| 1 | 12,278 /s (1,955 µs/round) | 25,094 (956) | 12,893 (1,862) | 11,197 (2,144) |
+| 2 | 12,217 (1,965) | 19,414 (1,236) | 19,898 (1,206) | 11,957 (2,007) |
+| 3 | 9,562 (2,510) | 13,950 (1,721) | 17,072 (1,406) | 11,182 (2,146) |
+| 4 | 14,420 (1,664) | 19,102 (1,256) | 15,294 (1,569) | 12,695 (1,891) |
+
+Multiplexed median **12.1 k publishes/s** vs pool **18.2 k** (≈ 1.5× for the
+pool; the pool wins 8 of 8 adjacent pairs). The reason is structural, not a
+bug: **the connection thread is the execution venue** (the D-5 inline law
+above), so a multiplexed session serves its K in-flight frames on ONE owner
+thread — interleaved at await points — where the pool served them on K
+threads; the frames' CPU work (decode / compose / encode, the group's
+prepare) serializes, and on a CPU-contended authority that is the term.
+Latency at equal depth is therefore NOT par, and the default stays the
+pool. The lever is landed as the CAPABILITY arm: on a fleet where the
+authority's connection cap (`clamp(cpus × 16, 64, 1024)` — F-B) binds before
+its CPU, `SQUEEZEFS_PUBLISH_SHIP_MULTIPLEX=1` trades per-co-writer owner
+parallelism for depth-independent connection count. The owner-side session
+lane (read-ahead) is not a lever — a stop-and-wait peer costs what it did
+(the same-load pre/post bracket below).
+
+**The owner-side session lane is par for the stop-and-wait shape** (the
+one change here that is NOT behind a lever): same-load pre/post bracket,
+release, A-B-B-A (pre = `35fbab7c`'s `block_on` loop, post = the session
+lane; box load 25–29 throughout; the S8 quiet rows, inline arm):
+
+| leg | verbs/s (legs 1 / 4) | dispatch mean |
+|---|---|---|
+| pre | 36,734 / 41,073 | 52.5 / 49.6 µs |
+| post | 41,001 / 38,945 | 46.8 / 51.4 |
+| post | 38,188 / 40,396 | 50.6 / 51.3 |
+| pre | 37,845 / 45,196 | 48.8 / 44.9 |
+
+Inside the leg spread in both orders; the hogged rows read identically on
+both binaries (inline 4.86–4.93 k verbs/s, hop 2.53–2.57 k; hop dispatch
+766–781 µs). The lane costs a stop-and-wait peer two `poll(2)` calls per
+frame and nothing else.
 
 ## Laws written into the code
 
@@ -235,7 +274,9 @@ arm difference).
   in-process on a loaded dev box: scoping evidence.
 - The in-process verbs/s under the hog is a FLOOR (the client side shares
   the hogged pool in one process).
-- The multiplex lever's latency-at-equal-depth verdict (addendum).
+- The multiplex lever's fleet value: its in-process verdict is "not par at
+  equal depth" on a CPU-contended box; whether a connection-cap-bound
+  fleet prefers it is the fabric venue's row.
 - `task check` (the full gate) — deferred by instruction; the targeted
   suites, fmt, both clippy configs and rustdoc ran (below).
 

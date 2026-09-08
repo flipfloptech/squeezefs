@@ -342,6 +342,18 @@ impl Fixture {
     }
 }
 
+/// A red assertion unwinds past the explicit `fx.shutdown()`; without this
+/// the host (and the engine `test_ddw_cq_ready` peeks through the weak
+/// registry) outlives its test and the NEXT contract's fixture fails on
+/// it (the 2026-09-08 gate: `teardown_completes…` EIO'd in its setup
+/// write behind `drain_batch_coalesces…`'s panic). `shutdown` is
+/// idempotent, so the explicit calls stay.
+impl Drop for Fixture {
+    fn drop(&mut self) {
+        self.host.shutdown();
+    }
+}
+
 /// Buffered stand-in fd on a real filesystem, host expected st_dev
 /// re-pointed, ino translation registered (the op-economy shape).
 fn rw_standin(fx: &Fixture, dir: &tempfile::TempDir, name: &str, fs_ino: u64) -> OwnedFd {
@@ -684,7 +696,12 @@ macro_rules! delta {
 /// `killpriv` arm — the clearing obligation is async metadata work the
 /// sync probe must not pay; the handler latches it). After one warm-up,
 /// eligible writes MUST serve direct. Returns when a probe write
-/// direct-serves.
+/// direct-serves AND its drain batch's deferred tail has landed: the
+/// times-park dispatch is pushed AFTER the ACK and dispatched after the
+/// batch's last ACK by design (`finish_write` step 7 → `drain_cq_locked`'s
+/// tail), so a contract that snapshots `dd_times_dispatches` right after
+/// the warm write's ACK would absorb the warm batch's dispatch into its
+/// own delta (the 2026-09-08 gate red: `drain_batch_coalesces…` read 2).
 fn warm_direct_lane(session: &ClientSession, binding: u64, base: &mut [u8], offsets: &[u64]) {
     let deadline = Instant::now() + Duration::from_secs(20);
     for (i, &off) in offsets.iter().enumerate() {
@@ -694,6 +711,11 @@ fn warm_direct_lane(session: &ClientSession, binding: u64, base: &mut [u8], offs
         assert_eq!(r, 4096, "warm write must land");
         base[off as usize..off as usize + 4096].copy_from_slice(&p);
         if delta!(snap(), before, dd_serves) == 1 {
+            wait_counter_at_least(
+                &|| METRICS.ipc_dd_write_times_dispatches.load(Ordering::Relaxed),
+                before.dd_times_dispatches + 1,
+                "the warm batch's deferred times-park dispatch never landed",
+            );
             return;
         }
         assert!(
@@ -1595,6 +1617,16 @@ async fn drain_batch_coalesces_the_times_park_dispatch() {
             let r = session.wait_slot(i as u32, *gen, "batched op");
             assert_eq!(r, 4096, "batched op {i} must ack its full length");
         }
+        // The dispatch is the batch's DEFERRED tail — past the last ACK
+        // by design — so the acks above do not imply it has landed; wait
+        // for it, then pin the count. (Before this wait the contract read
+        // its 1 off the warm-up batch's late tail while this batch's own
+        // tail landed after the snapshot; the 2026-09-08 gate read both.)
+        wait_counter_at_least(
+            &|| METRICS.ipc_dd_write_times_dispatches.load(Ordering::Relaxed),
+            before.dd_times_dispatches + 1,
+            "the batch's times-park dispatch never landed",
+        );
         let after = snap();
 
         assert_eq!(
@@ -1607,7 +1639,8 @@ async fn drain_batch_coalesces_the_times_park_dispatch() {
             1,
             "ONE drain batch dispatches ONE times-park handoff — the \
              pre-split per-op dispatch (the 208k/s dd→tpc wake edge) is \
-             the regression this rail pins out"
+             the regression this rail pins out; the hold queued every \
+             completion, so one consumer drains them in ONE pass"
         );
     });
 

@@ -1331,12 +1331,12 @@ async fn patch_bytes_never_lost_to_overlay_publish() {
     // gap serves include the PATCHED bytes.
     let old_b = pattern((2 * FBS) as usize, 48);
     let ino2 = striped_fixture_with(&h, "fb", &old_b).await;
-    let pw0 = m64(&METRICS.patch_writes);
+    let pw0 = METRICS.patch_writes.load(Ordering::Relaxed);
     let patch2 = vec![0xC3u8; PAGE as usize];
     write_at(&h, ino2, 0, &patch2).await;
     quiesce(&h).await;
     assert!(
-        m64(&METRICS.patch_writes) > pw0,
+        METRICS.patch_writes.load(Ordering::Relaxed) > pw0,
         "order B premise: the first write PATCHED in place (no overlay yet)"
     );
     let seg = vec![0xD4u8; PAGE as usize];
@@ -2526,7 +2526,7 @@ async fn range_shared_span_refuses_both_patch_and_overlay() {
         ow_range_shared(),
         m64(&METRICS.patch_ineligible_oversize),
         ow_installs(),
-        m64(&METRICS.patch_writes),
+        METRICS.patch_writes.load(Ordering::Relaxed),
     );
     let q = pattern(PAGE as usize, 0xC8);
     h.fs.write_file_staged(ino, 3 * PAGE, bytes::Bytes::from(q.clone()), size, token)
@@ -2550,7 +2550,11 @@ async fn range_shared_span_refuses_both_patch_and_overlay() {
         "clause 7 never evaluated"
     );
     assert_eq!(ow_installs() - i1, 0, "no overlay record installed");
-    assert_eq!(m64(&METRICS.patch_writes) - pw1, 0, "no patch happened");
+    assert_eq!(
+        METRICS.patch_writes.load(Ordering::Relaxed) - pw1,
+        0,
+        "no patch happened"
+    );
 
     // ---- Sub-cap class: the patch ladder ARMED (the suite posture
     // disarms it) with a cap above the page — W1 is the candidate.
@@ -2560,7 +2564,7 @@ async fn range_shared_span_refuses_both_patch_and_overlay() {
         ow_range_shared(),
         m64(&METRICS.overlay_ineligible_sub_cap),
         ow_installs(),
-        m64(&METRICS.patch_writes),
+        METRICS.patch_writes.load(Ordering::Relaxed),
     );
     let p = pattern(PAGE as usize, 0xC7);
     h.fs.write_file_staged(ino, 2 * PAGE, bytes::Bytes::from(p.clone()), size, token)
@@ -2584,7 +2588,11 @@ async fn range_shared_span_refuses_both_patch_and_overlay() {
         "the range clause was never evaluated"
     );
     assert_eq!(ow_installs() - i0, 0, "no overlay record installed");
-    assert_eq!(m64(&METRICS.patch_writes) - pw0, 0, "no patch happened");
+    assert_eq!(
+        METRICS.patch_writes.load(Ordering::Relaxed) - pw0,
+        0,
+        "no patch happened"
+    );
     assert_eq!(
         m64(&METRICS.overlay_ineligible_shadow_bound) - sb0,
         0,

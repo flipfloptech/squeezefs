@@ -316,8 +316,8 @@ fn ledger() -> Ledger {
         write_block_revisits: l(&METRICS.write_block_revisits),
         staging_sibling_probes: l(&METRICS.staging_sibling_probes),
         write_through_bytes: l(&METRICS.write_through_bytes),
-        patch_writes: l(&METRICS.patch_writes),
-        patch_write_bytes: l(&METRICS.patch_write_bytes),
+        patch_writes: METRICS.patch_writes.load(Ordering::Relaxed),
+        patch_write_bytes: METRICS.patch_write_bytes.load(Ordering::Relaxed),
         patch_edge_rmw_reads: l(&METRICS.patch_edge_rmw_reads),
     }
 }

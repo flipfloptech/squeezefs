@@ -743,11 +743,8 @@ async fn narrow_off_restores_the_pre_campaign_class() {
 
 /// Bucket snapshot of a histogram (per-row tails need a delta, the
 /// histograms are process-cumulative).
-fn buckets(h: &squeezefs::fuse_client::LatencyHistogram) -> Vec<u64> {
-    h.buckets
-        .iter()
-        .map(|b| b.load(Ordering::Relaxed))
-        .collect()
+fn buckets(h: &squeezefs::fuse_client::ShardedLatencyHistogram) -> Vec<u64> {
+    h.buckets().to_vec()
 }
 
 /// Highest power-of-two µs bucket that gained samples between two

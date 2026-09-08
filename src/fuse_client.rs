@@ -4594,7 +4594,7 @@ enum HeldGuardMode<'a> {
 struct HeldWriteGuard<'a> {
     mode: HeldGuardMode<'a>,
     since: std::time::Instant,
-    hold_hist: Option<&'static LatencyHistogram>,
+    hold_hist: Option<&'static ShardedLatencyHistogram>,
 }
 
 impl<'a> HeldWriteGuard<'a> {
@@ -4883,6 +4883,115 @@ impl ShardedAtomic {
     /// single atomic.
     pub fn load(&self, order: Ordering) -> u64 {
         self.stripes.iter().map(|s| s.load(order)).sum()
+    }
+}
+
+/// A per-thread-striped `LatencyHistogram` for the per-op histograms on
+/// the WRITE hot path (W-6, e2e perf audit write board #7 — the PERF-3 /
+/// R-4 argument applied to the handler: a `record` is three RMWs, and a
+/// tight distribution lands nearly every op of a class in the SAME bucket
+/// word, so the inode-lock wait/hold and block-lock wait histograms were
+/// ~15 process-global RMWs per write on lines every handler lane shared —
+/// `Align64` stops false sharing, not TRUE sharing). Each thread records
+/// into its [`ShardedAtomic`] stripe (one uncontended RMW triple on a
+/// core-local line); every reader folds the stripes, so the exported
+/// histogram — buckets, exact `count` / `sum_ns`, p99 — is unchanged
+/// (addition commutes; a fold mid-record can miss a just-recorded sample
+/// exactly as a single histogram could). 64 stripes × 28 words = 14 KiB
+/// per histogram, heap-allocated at first use.
+pub struct ShardedLatencyHistogram {
+    stripes: Box<[LatencyHistogram]>,
+}
+
+impl Default for ShardedLatencyHistogram {
+    fn default() -> Self {
+        Self {
+            stripes: (0..SHARDED_ATOMIC_STRIPES)
+                .map(|_| LatencyHistogram::default())
+                .collect(),
+        }
+    }
+}
+
+impl ShardedLatencyHistogram {
+    /// Record on this thread's stripe (three relaxed RMWs, core-local).
+    #[inline]
+    pub fn record(&self, duration: Duration) {
+        self.stripes[ShardedAtomic::stripe_index()].record(duration);
+    }
+
+    /// The folded bucket counts (index-aligned with
+    /// `latency_core::LATENCY_BUCKET_LABELS`).
+    pub fn buckets(&self) -> [u64; crate::latency_core::LATENCY_BUCKETS] {
+        let mut out = [0u64; crate::latency_core::LATENCY_BUCKETS];
+        for s in self.stripes.iter() {
+            for (o, b) in out.iter_mut().zip(s.buckets.iter()) {
+                *o += b.load(Ordering::Relaxed);
+            }
+        }
+        out
+    }
+
+    /// Spans recorded (exact, folded).
+    pub fn count(&self) -> u64 {
+        self.stripes.iter().map(LatencyHistogram::count).sum()
+    }
+
+    /// Σ recorded spans, ns (exact, folded).
+    pub fn sum_ns(&self) -> u64 {
+        self.stripes.iter().map(LatencyHistogram::sum_ns).sum()
+    }
+
+    /// `sum_ns / count` (0 on an empty histogram).
+    pub fn mean_ns(&self) -> u64 {
+        self.sum_ns().checked_div(self.count()).unwrap_or(0)
+    }
+
+    /// Zero every stripe's words (the one reset path — see
+    /// [`LatencyHistogram::reset`]).
+    pub fn reset(&self) {
+        for s in self.stripes.iter() {
+            s.reset();
+        }
+    }
+
+    pub fn to_json(&self) -> serde_json::Value {
+        histogram_json(&self.buckets(), self.count(), self.sum_ns())
+    }
+}
+
+/// The per-thread-striped [`QueueDepthHistogram`] (W-6 — the writeback
+/// queue-depth sample every WRITE records; same fold law as
+/// [`ShardedLatencyHistogram`]).
+pub struct ShardedQueueDepthHistogram {
+    stripes: Box<[QueueDepthHistogram]>,
+}
+
+impl Default for ShardedQueueDepthHistogram {
+    fn default() -> Self {
+        Self {
+            stripes: (0..SHARDED_ATOMIC_STRIPES)
+                .map(|_| QueueDepthHistogram::default())
+                .collect(),
+        }
+    }
+}
+
+impl ShardedQueueDepthHistogram {
+    /// Record on this thread's stripe (one relaxed RMW, core-local).
+    #[inline]
+    pub fn record(&self, depth: usize) {
+        self.stripes[ShardedAtomic::stripe_index()].record(depth);
+    }
+
+    pub fn to_json(&self) -> serde_json::Value {
+        let mut folded = QueueDepthHistogram::default();
+        for s in self.stripes.iter() {
+            for (f, b) in folded.buckets.iter_mut().zip(s.buckets.iter()) {
+                *f.get_mut() += b.load(Ordering::Relaxed);
+            }
+        }
+        folded.to_json()
     }
 }
 
@@ -7023,7 +7132,7 @@ pub struct Metrics {
     /// coalescer stopped coalescing.
     pub data_device_sync_requests: Align64<AtomicU64>,
     /// Histograms for lock wait times and queue depths.
-    pub write_lock_wait: Align64<LatencyHistogram>,
+    pub write_lock_wait: ShardedLatencyHistogram,
     // ---- Write lock-scope CANDIDATE ledger (design-write-inode-convoy
     // §7 / KD-8, PR 1): what the §4.1 classifier WOULD admit, counted
     // while every class still takes today's exclusive guard. PR 3 adds
@@ -7032,24 +7141,24 @@ pub struct Metrics {
     // gate. A rand-overwrite row classifying below ~99 % shared here =
     // predicate rot (the patch_ineligible_* pattern). ----
     /// §4.1 candidates: fully-mapped within-EOF striped overwrites.
-    pub write_lock_candidate_shared: Align64<AtomicU64>,
+    pub write_lock_candidate_shared: ShardedAtomic,
     /// §4.1 candidates: striped-but-not-Shared + the folded staged
     /// bypass (write guard, dropped before data I/O).
-    pub write_lock_candidate_metaprep: Align64<AtomicU64>,
+    pub write_lock_candidate_metaprep: ShardedAtomic,
     /// §4.1 candidates: inline / staged-transition / unknown layouts
     /// (write guard, whole op).
-    pub write_lock_candidate_entire: Align64<AtomicU64>,
+    pub write_lock_candidate_entire: ShardedAtomic,
     // ---- FINAL-scope ledger (KD-8, PR 3): the guard mode actually HELD
     // after held-guard revalidation — the engagement instrument. Closure
     // law: Σ scope ≡ Σ candidate ≡ classified writes (per row); an
     // upgraded op counts its POST-upgrade class here plus one
     // `shared_upgrades`. ----
     /// Writes DISPATCHED on the shared (read) guard.
-    pub write_lock_scope_shared: Align64<AtomicU64>,
+    pub write_lock_scope_shared: ShardedAtomic,
     /// Writes dispatched on the exclusive guard, drop-before-data-I/O.
-    pub write_lock_scope_metaprep: Align64<AtomicU64>,
+    pub write_lock_scope_metaprep: ShardedAtomic,
     /// Writes dispatched holding the exclusive guard for the whole op.
-    pub write_lock_scope_entire: Align64<AtomicU64>,
+    pub write_lock_scope_entire: ShardedAtomic,
     /// Shared admissions that failed held-guard revalidation and took
     /// the ONE upgrade to exclusive (KD-2). Zero on fully-mapped
     /// overwrite rows = floor healthy; nonzero around truncate storms =
@@ -7060,8 +7169,8 @@ pub struct Metrics {
     /// into an unmetered `read().await`. The aggregate
     /// `write_lock_wait` keeps recording every acquisition (an upgraded
     /// op records once per acquisition, so twice).
-    pub write_lock_wait_shared: Align64<LatencyHistogram>,
-    pub write_lock_wait_exclusive: Align64<LatencyHistogram>,
+    pub write_lock_wait_shared: ShardedLatencyHistogram,
+    pub write_lock_wait_exclusive: ShardedLatencyHistogram,
     // ---- Per-scope inode-guard HOLD histograms (W-2 write-stream-guard,
     // 2026-09-05): acquisition → drop for the FINAL scope actually held
     // (drop-based, so error exits after classification record
@@ -7072,13 +7181,13 @@ pub struct Metrics {
     // guard is held across a DMA; the healthy value is the meta-prep
     // itself (µs). `entire` legitimately reads device-length (the
     // inline/staged commit, layout promotions). ----
-    pub write_lock_hold_shared: Align64<LatencyHistogram>,
-    pub write_lock_hold_metaprep: Align64<LatencyHistogram>,
-    pub write_lock_hold_entire: Align64<LatencyHistogram>,
-    pub block_lock_wait: Align64<LatencyHistogram>,
+    pub write_lock_hold_shared: ShardedLatencyHistogram,
+    pub write_lock_hold_metaprep: ShardedLatencyHistogram,
+    pub write_lock_hold_entire: ShardedLatencyHistogram,
+    pub block_lock_wait: ShardedLatencyHistogram,
     pub lease_lock_wait: Align64<LatencyHistogram>,
     pub dlm_acquire_time: Align64<LatencyHistogram>,
-    pub writeback_queue_depth: Align64<QueueDepthHistogram>,
+    pub writeback_queue_depth: ShardedQueueDepthHistogram,
     /// Deferred-flusher device barriers issued (timer path), vs
     /// strict/fsync barriers which land in `meta_device_syncs` directly.
     pub meta_flush_deferred: Align64<AtomicU64>,
@@ -7290,9 +7399,9 @@ pub struct Metrics {
     // for the phase-2 edge path and is a G-RW2 gate clause at 0).
     // -----------------------------------------------------------------
     /// Sole-owner in-place patches (one aligned sub-block DMA each).
-    pub patch_writes: Align64<AtomicU64>,
+    pub patch_writes: ShardedAtomic,
     /// User bytes delivered by patches (== Σ patched lengths).
-    pub patch_write_bytes: Align64<AtomicU64>,
+    pub patch_write_bytes: ShardedAtomic,
     /// Phase-2 unaligned-edge RMW seed reads. **Must stay 0 in v1**
     /// (aligned-only): any growth is an alignment/predicate regression
     /// (G-RW2 gate clause).

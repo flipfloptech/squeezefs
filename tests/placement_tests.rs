@@ -759,7 +759,7 @@ fn ledger() -> PatchLedger {
         ineligible_transform: l(&METRICS.patch_ineligible_transform),
         ineligible_adjacent: l(&METRICS.patch_ineligible_adjacent),
         ineligible_oversize: l(&METRICS.patch_ineligible_oversize),
-        patch_writes: l(&METRICS.patch_writes),
+        patch_writes: METRICS.patch_writes.load(Ordering::Relaxed),
         edge_rmw_reads: l(&METRICS.patch_edge_rmw_reads),
         seed_read_bytes: l(&METRICS.write_path_seed_read_bytes),
     }

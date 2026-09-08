@@ -298,8 +298,8 @@ struct Snap {
 fn snap() -> Snap {
     let l = |c: &std::sync::atomic::AtomicU64| c.load(Ordering::Relaxed);
     Snap {
-        patch_writes: l(&METRICS.patch_writes),
-        patch_write_bytes: l(&METRICS.patch_write_bytes),
+        patch_writes: METRICS.patch_writes.load(Ordering::Relaxed),
+        patch_write_bytes: METRICS.patch_write_bytes.load(Ordering::Relaxed),
         patch_edge_rmw_reads: l(&METRICS.patch_edge_rmw_reads),
         unmapped: l(&METRICS.patch_ineligible_unmapped),
         decorated: l(&METRICS.patch_ineligible_decorated),

@@ -962,11 +962,16 @@ async fn two_volume_parked_fixture(test_id: &str) -> ParkedFixture {
     }
 }
 
-/// The lane's reachable count once the debt drainer's transient trim
-/// claims have returned (KD-4.4: with the virgin tail minted, the pressure
-/// venue claims an elided-debt offset OUT of the free list for one device
-/// command and puts it back — a read mid-command under-counts by the
-/// batch). Bounded spin; returns the last read.
+/// The lane's reachable count once the closed epoch's freed keys have
+/// landed on the lane's free list (the close's frees are terminal frees
+/// whose `finish_free` runs behind the tick). The debt drainer's trim
+/// claim windows (KD-4.4: with the virgin tail minted, the pressure venue
+/// claims an elided-debt offset OUT of the free list for one device command
+/// and puts it back) do not move this count — a windowed offset is
+/// reachable supply the funnel parks for, and reading the batch as a
+/// deficit was the 2026-09-08 placement-refresh flake
+/// (`.benchmarks/2026-09-08-placement-refresh-race.md`). Bounded spin;
+/// returns the last read.
 async fn settled_reachable(alloc: &BlockAllocator, expect: u64) -> u64 {
     let t0 = std::time::Instant::now();
     loop {

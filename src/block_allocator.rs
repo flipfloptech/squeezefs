@@ -638,16 +638,32 @@ pub fn test_clear_cowriter_lane_placement() -> bool {
 /// Unpartitioned mounts (`writers == 0`) count everything, so the two
 /// quantities coincide there. The fsck C6 per-lane recount is the drift
 /// tripwire (`tests/mw_cowriter_free_tests.rs`).
+///
+/// The two trim edges (KD-4.4 — `remove_for_trim` … `insert_from_trim`)
+/// move MEMBERSHIP but not the reachable count: a claimed offset leaves
+/// the list for one device command and comes back, and the allocation
+/// funnel parks on that return edge rather than refusing, so it is
+/// pending supply, never a deficit. Before this (`.benchmarks/2026-09-08-
+/// placement-refresh-race.md`) the count dipped by the trim batch for the
+/// command's duration and a §5.9 refresh inside the window banded the
+/// restocked volume's sibling alone.
 #[derive(Debug, Default)]
 struct LaneCountedSet {
     set: dashmap::DashSet<u64>,
-    /// Free-listed blocks in lanes this mount owns.
-    lane_owned: AtomicU64,
+    /// Blocks in lanes this mount owns that the allocation funnel can
+    /// REACH: free-listed, or inside an open trim claim window. One load
+    /// serves `lane_reachable_blocks`; the membership-exact lane-owned
+    /// count is derived (`lane_owned`) by subtracting the owned windows.
+    reachable_owned: AtomicU64,
+    /// The open trim claim windows' block indices — the recount's input
+    /// (a windowed block is a member of nothing else) and the return
+    /// edge's witness that a claim preceded it.
+    trim_windowed: dashmap::DashSet<u64>,
     /// Free-listed blocks PER LANE (finding 15 term 2 — the lane-supply
     /// hint's O(1) input: a co-writer's renewal grant carries its lane's
     /// count, so this is what keeps the count out of the renewal hot op
-    /// and off the free-list scan). Maintained beside `lane_owned` by the
-    /// same insert/remove deltas; meaningful only when `writers > 0`.
+    /// and off the free-list scan). Membership-exact — the trim edges move
+    /// it; meaningful only when `writers > 0`.
     per_lane: [AtomicU64; crate::alloc_lane_grant::MAX_LANES as usize],
     /// Partition width in force (0 = unpartitioned — everything is ours).
     writers: AtomicU64,
@@ -685,7 +701,7 @@ impl LaneCountedSet {
                 self.per_lane[lane].fetch_add(1, Ordering::AcqRel);
             }
             if self.is_ours(idx) {
-                self.lane_owned.fetch_add(1, Ordering::AcqRel);
+                self.reachable_owned.fetch_add(1, Ordering::AcqRel);
             }
         }
         new
@@ -699,10 +715,50 @@ impl LaneCountedSet {
                 self.per_lane[lane].fetch_sub(1, Ordering::AcqRel);
             }
             if self.is_ours(*idx) {
-                self.lane_owned.fetch_sub(1, Ordering::AcqRel);
+                self.reachable_owned.fetch_sub(1, Ordering::AcqRel);
             }
         }
         out
+    }
+
+    /// The trim CLAIM (KD-4.4): membership out, the reachable count
+    /// untouched — the offset is inside a window the funnel parks for.
+    /// The set's `remove` arbitrates the claim; only the winner records
+    /// the window, so a racing venue's lost claim never erases it.
+    fn remove_for_trim(&self, idx: &u64) -> Option<u64> {
+        let out = self.set.remove(idx);
+        if out.is_some() {
+            if let Some(lane) = self.lane_of(*idx) {
+                self.per_lane[lane].fetch_sub(1, Ordering::AcqRel);
+            }
+            self.trim_windowed.insert(*idx);
+        }
+        out
+    }
+
+    /// The trim RETURN: membership back, the reachable count untouched
+    /// for a block the window (or the recount that ran across it) already
+    /// counts. `true` ⇔ a claim window closed. Without a preceding claim
+    /// this is a plain `insert` — the accumulation shape the seeding
+    /// contracts use — and no window ends.
+    fn insert_from_trim(&self, idx: u64) -> bool {
+        let windowed = self.trim_windowed.remove(&idx).is_some();
+        let new = self.set.insert(idx);
+        if new {
+            if let Some(lane) = self.lane_of(idx) {
+                self.per_lane[lane].fetch_add(1, Ordering::AcqRel);
+            }
+        }
+        if self.is_ours(idx) {
+            if !windowed && new {
+                self.reachable_owned.fetch_add(1, Ordering::AcqRel);
+            } else if windowed && !new {
+                // Re-listed mid-window (a plain insert already counted the
+                // member): the window's share leaves with the window.
+                self.reachable_owned.fetch_sub(1, Ordering::AcqRel);
+            }
+        }
+        windowed
     }
 
     /// The free-listed population of one lane (0 unpartitioned).
@@ -750,14 +806,35 @@ impl LaneCountedSet {
         for (c, n) in self.per_lane.iter().zip(per_lane) {
             c.store(n, Ordering::Release);
         }
-        self.lane_owned.store(owned, Ordering::Release);
+        // A windowed block is on its way back to the list under the mask
+        // in force NOW (an adoption mid-trim owns it from here), and its
+        // return moves nothing — so the recount counts it here.
+        let windowed_owned = self.windowed_owned();
+        self.reachable_owned
+            .store(owned + windowed_owned, Ordering::Release);
     }
 
-    /// The lane-owned free-list population (the counting half of the
-    /// lane-reachable supply).
+    /// The owned blocks inside open trim claim windows (the recount's and
+    /// the derived membership count's term; a scan of ≤ one trim batch).
+    fn windowed_owned(&self) -> u64 {
+        self.trim_windowed
+            .iter()
+            .filter(|idx| self.is_ours(**idx))
+            .count() as u64
+    }
+
+    /// The lane-owned REACHABLE population (free-listed + windowed) — the
+    /// counting half of the lane-reachable supply, one load.
     #[inline]
+    fn reachable_owned(&self) -> u64 {
+        self.reachable_owned.load(Ordering::Acquire)
+    }
+
+    /// The lane-owned FREE-LISTED population (membership-exact — the
+    /// KD-FG-10 drift tripwire's quantity): the reachable count less the
+    /// owned windows. A diagnostic read, never on the pick path.
     fn lane_owned(&self) -> u64 {
-        self.lane_owned.load(Ordering::Acquire)
+        self.reachable_owned().saturating_sub(self.windowed_owned())
     }
 }
 
@@ -1069,7 +1146,8 @@ impl BlockAllocator {
     /// what an operator reads when "the device has space but writes fail".
     /// `0` when unpartitioned. On an authority this is also the supply it
     /// holds FOR its co-writers (`alloc_lane_supply_blocks`) — read off the
-    /// free set's maintained counts, never a scan.
+    /// free set's maintained counts (plus the ≤ one-trim-batch window scan
+    /// the membership-exact owned count subtracts), never a free-list scan.
     pub fn foreign_lane_free_blocks(&self) -> u64 {
         if self.lanes.get().is_none() {
             return 0;
@@ -1441,11 +1519,15 @@ impl BlockAllocator {
     /// The window is COUNTED before the remove: an allocation that scans
     /// the list empty and then reads `trim_claimed` must see the claim
     /// that emptied it (`await_trim_return` — the funnel's park on the
-    /// window's return edge, `alloc_trim_window_parks`).
+    /// window's return edge, `alloc_trim_window_parks`). The claim moves
+    /// membership only: the offset stays in [`Self::lane_reachable_blocks`]
+    /// (`LaneCountedSet::remove_for_trim`) because the funnel reaches it —
+    /// a §5.9 refresh or a watermark tick inside the window must not read
+    /// the batch as a deficit (`.benchmarks/2026-09-08-placement-refresh-race.md`).
     pub fn claim_free_for_trim(self: &Arc<Self>, offset: u64) -> Option<InflightAllocGuard> {
         let idx = offset / self.chunk_size;
         self.trim_claimed.fetch_add(1, Ordering::SeqCst);
-        match self.free_blocks.remove(&idx) {
+        match self.free_blocks.remove_for_trim(&idx) {
             Some(_) => Some(self.inflight_register(offset)),
             None => {
                 self.end_trim_claim();
@@ -1457,10 +1539,13 @@ impl BlockAllocator {
     /// Return a trim-claimed offset to the free list (the claim window
     /// ends; the caller drops the in-flight guard after this). The
     /// insert precedes the count's release so a parked allocation that
-    /// reads the window closed finds the offset on its rescan.
+    /// reads the window closed finds the offset on its rescan. A return
+    /// no claim preceded is a plain free-list insert (the accumulation
+    /// shape the seeding contracts use) and ends no window.
     pub fn return_from_trim(&self, offset: u64) {
-        self.free_blocks.insert(offset / self.chunk_size);
-        self.end_trim_claim();
+        if self.free_blocks.insert_from_trim(offset / self.chunk_size) {
+            self.end_trim_claim();
+        }
     }
 
     fn end_trim_claim(&self) {
@@ -1587,9 +1672,9 @@ impl BlockAllocator {
     }
 
     /// The LANE-OWNED free-list population (sustain campaign KD-FG-10 —
-    /// the counting-set's maintained count; equals `free_blocks_count` on
-    /// unpartitioned mounts). The drift contract asserts it against the
-    /// C6-style per-lane recount.
+    /// membership-exact: a block inside a trim claim window is not
+    /// listed; equals `free_blocks_count` on unpartitioned mounts). The
+    /// drift contract asserts it against the C6-style per-lane recount.
     pub fn lane_owned_free_blocks(&self) -> u64 {
         self.free_blocks.lane_owned()
     }
@@ -1620,8 +1705,11 @@ impl BlockAllocator {
     }
 
     /// **The lane-reachable supply** (design-free-grace-sustain §5.4/§8):
-    /// exactly `try_allocate_block`'s own reachable set — the lane-owned
-    /// free-list population plus the lane-scoped virgin remainder
+    /// exactly `allocate_block`'s own reachable set — the lane-owned
+    /// free-list population, the lane-owned blocks inside an open trim
+    /// claim window (KD-4.4: the funnel parks on the window's return edge,
+    /// so they are pending supply — `.benchmarks/2026-09-08-placement-
+    /// refresh-race.md`), plus the lane-scoped virgin remainder
     /// (`virgin_bytes` already divides by the partition width). This is
     /// the quantity that troughs on a recycle-bound stream; the
     /// passed-global `free_supply_blocks` accumulates foreign-lane
@@ -1632,7 +1720,7 @@ impl BlockAllocator {
         if virgin == u64::MAX {
             return u64::MAX;
         }
-        (virgin / self.chunk_size).saturating_add(self.free_blocks.lane_owned())
+        (virgin / self.chunk_size).saturating_add(self.free_blocks.reachable_owned())
     }
 
     /// **Lane-governed placement** (`.benchmarks/2026-09-07-cowriter-lane-

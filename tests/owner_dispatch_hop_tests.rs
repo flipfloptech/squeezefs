@@ -39,6 +39,9 @@ use squeezefs::data_custody;
 use squeezefs::data_grant::{self, WriteCustodyClient, WriteCustodyOwner};
 use squeezefs::layout_wire::LayoutMetadata;
 use squeezefs::membership::{LeaseClock, LeaseClocks};
+use squeezefs::meta_backend::kv::backend::{
+    test_conveyor_hold_release, TEST_CONVEYOR_HOLD_PRE_DRAIN, TEST_CONVEYOR_HOLD_STAGE,
+};
 use squeezefs::meta_backend::kv::{META_CONVEYOR_LEADER_PASSES, META_KV_JOURNAL_ENTRIES};
 use squeezefs::meta_backend::{
     open_routed_meta_set, plan_meta_slot_set, Metadata, RoutedMetaBackend,
@@ -314,7 +317,7 @@ impl S8Nodes {
     }
 }
 
-/// 1. **The split sums exactly, and the frame's `dispatch` IS the hop's
+/// Contract 1 — **The split sums exactly, and the frame's `dispatch` IS the hop's
 /// `total`** on single-chain frames — on both arms of the lever.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn s8_dispatch_split_sums_exactly_and_the_frame_dispatch_is_its_total() {
@@ -353,7 +356,7 @@ async fn s8_dispatch_split_sums_exactly_and_the_frame_dispatch_is_its_total() {
     }
 }
 
-/// 2. **The lever's engagement and its zero hops**: on the accepting venue
+/// Contract 2 — **The lever's engagement and its zero hops**: on the accepting venue
 /// `queue_hop` and `wake_hop` are 0 to the ns and `owner_dispatch_inline`
 /// accounts every frame; the control arm pays the hops and accounts them on
 /// `owner_dispatch_hops`. Nothing else in the ledger moves.
@@ -416,7 +419,7 @@ async fn s8_inline_serve_has_zero_hops_and_the_control_pays_them() {
     nodes.stop().await;
 }
 
-/// 3. **Chain order + the dedup window + the co-queue law hold on the
+/// Contract 3 — **Chain order + the dedup window + the co-queue law hold on the
 /// accepting venue** — the D-1 contracts re-asserted with the lever ON: a
 /// same-ino chain applies in submission order beside 61 independent
 /// siblings that co-queue (≤ FRAME/4 passes, FRAME journal entries), and
@@ -642,7 +645,7 @@ fn layout_bytes(size: u64) -> Vec<u8> {
     .expect("serialize layout")
 }
 
-/// 4. **The publish plane's dispatches ride the same split, and a frame is
+/// Contract 4 — **The publish plane's dispatches ride the same split, and a frame is
 /// still one conveyor group on the accepting venue**: 24 concurrent
 /// publishes → every outcome lands, 24 journal entries, ≥ 1 frame group,
 /// every dispatch inline (0 hops, `queue_hop ≡ wake_hop ≡ 0`), the split
@@ -706,7 +709,7 @@ async fn publish_dispatches_ride_the_split_and_a_frame_is_one_group_inline() {
     nodes.stop().await;
 }
 
-/// 5. **STATUS_PANIC containment on the accepting venue**: a shipped verb
+/// Contract 5 — **STATUS_PANIC containment on the accepting venue**: a shipped verb
 /// whose executor UNWINDS answers the loud PANIC outcome (counted on
 /// `owner_panics`, cached in the witness window), and the connection
 /// thread SURVIVES — the next call on the same pooled session lands with
@@ -775,6 +778,122 @@ async fn publish_panic_inline_answers_status_panic_and_the_session_survives() {
         "the replay re-runs nothing"
     );
     nodes.stop().await;
+}
+
+/// Contract 5b — **DLM #8's single-connection half** (`SQUEEZEFS_PUBLISH_SHIP_
+/// MULTIPLEX`, default on): at depth 4, a burst of 24 concurrent publishes
+/// ships ≥ 2 frames in flight on ONE session — `ship_session_dials` grows
+/// by exactly 1 for the endpoint, `ship_mux_frames ≡ ship_frames`, every
+/// publish lands, one tx = one journal entry. On the control (`0`) the
+/// same burst dials up to `depth` request/reply sessions and ships no
+/// multiplexed frame — the D-1b shape, byte-identical.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn publish_depth_costs_one_connection_when_multiplexed_and_depth_when_pooled() {
+    let _serial = serial();
+    let _restore = restore();
+    for (arm, expect_mux) in [("1", true), ("0", false)] {
+        let _lever = EnvVarGuard::set(publish::SHIP_MULTIPLEX_ENV, arm);
+        let dir = tempfile::tempdir().unwrap();
+        let owner_be = sandbox(dir.path(), "own").await;
+        let client_be = sandbox(dir.path(), "cli").await;
+        let auth = start_authority(Arc::clone(&owner_be));
+        let foreign: Vec<(usize, PeerOwner)> = (0..client_be.volumes.len())
+            .map(|v| (v, PeerOwner::new(AUTHORITY, &auth.endpoint)))
+            .collect();
+        ship::arm_ownership(OwnerMap::for_volumes(&client_be, foreign).expect("owner map"));
+        // Depth 4, explicitly: the shape the pool would pay 4 sessions for.
+        publish::install_client(publish::PublishClient::with_depth(NODE, SECRET.to_vec(), 4));
+        let client = WriteCustodyClient::connect(&auth.endpoint, SECRET, NODE)
+            .await
+            .expect("the co-writer joins the custody plane");
+        data_grant::install_custody_client(Arc::clone(&client));
+        let nodes = PublishNodes {
+            owner_be,
+            client_be,
+            auth,
+            client,
+        };
+        let inos = mint(&nodes.owner_be, 24, "mux").await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        // The owner's apply pass is HELD (the M7 seam), so the frames the
+        // burst forms stay in flight until the depth bound parks the drain
+        // — depth frames provably in flight at once, on both arms.
+        TEST_CONVEYOR_HOLD_STAGE.store(TEST_CONVEYOR_HOLD_PRE_DRAIN, Ordering::SeqCst);
+        let s0 = publish::stats();
+        let live_0 = nodes.auth.listener.stats().live_connections;
+        let entries_0 = META_KV_JOURNAL_ENTRIES.load(Ordering::SeqCst);
+        // Arrivals spaced apart so each early one finds the drain idle and
+        // ships as its own frame (the streaming shape, one save at a time)
+        // until `depth` frames are parked at the held owner.
+        let mut handles = Vec::with_capacity(inos.len());
+        for &ino in &inos {
+            let be = Arc::clone(&nodes.client_be);
+            handles.push(tokio::spawn(async move {
+                publish::set_layout_and_size(&be, ino, &layout_bytes(8192), 8192, &[]).await
+            }));
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while publish::stats().ship_depth_waits == s0.ship_depth_waits {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "arm {arm}: the drain never reached the depth bound"
+            );
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        let inflight_dials = publish::stats().ship_session_dials - s0.ship_session_dials;
+        TEST_CONVEYOR_HOLD_STAGE.store(0, Ordering::SeqCst);
+        test_conveyor_hold_release();
+        let mut outcomes = Vec::with_capacity(handles.len());
+        for h in handles {
+            outcomes.push(h.await.expect("a publish task never panics"));
+        }
+        let s1 = publish::stats();
+        let entries = META_KV_JOURNAL_ENTRIES.load(Ordering::SeqCst) - entries_0;
+
+        for (ino, out) in inos.iter().zip(&outcomes) {
+            assert!(
+                out.is_ok(),
+                "arm {arm}: ino {ino}: the publish lands: {out:?}"
+            );
+        }
+        assert_eq!(entries, 24, "arm {arm}: one tx = one journal entry");
+        let frames = s1.ship_frames - s0.ship_frames;
+        let dials = s1.ship_session_dials - s0.ship_session_dials;
+        let mux = s1.ship_mux_frames - s0.ship_mux_frames;
+        println!(
+            "D-5 mux row (multiplex={arm}): 24 publishes — frames {frames}, dials {dials} (at \
+             the depth bound: {inflight_dials}), mux frames {mux}, depth waits {}",
+            s1.ship_depth_waits - s0.ship_depth_waits
+        );
+        assert!(
+            frames >= 4,
+            "arm {arm}: depth frames were in flight before the drain parked: {frames}"
+        );
+        if expect_mux {
+            assert_eq!(
+                inflight_dials, 1,
+                "multiplexed: depth 4 in flight costs ONE connection"
+            );
+            assert_eq!(dials, 1, "…and the burst's tail reused it");
+            assert_eq!(mux, frames, "every frame rode the pipelined session");
+        } else {
+            assert_eq!(mux, 0, "the pool ships no multiplexed frame");
+            assert_eq!(
+                inflight_dials, 4,
+                "the pool dials one session per in-flight frame — depth connections"
+            );
+        }
+        // Every dialed publish session is a live connection — one owner
+        // thread each — on top of the custody plane's.
+        assert_eq!(
+            nodes.auth.listener.stats().live_connections - live_0,
+            dials,
+            "arm {arm}: the authority holds one thread per live session"
+        );
+        nodes.stop().await;
+        reset_planes();
+    }
 }
 
 // ===========================================================================
@@ -929,7 +1048,7 @@ async fn s8_row(
     }
 }
 
-/// 7. **The isolation contract**: under four 2 ms serve bursts saturating
+/// Contract 7 — **The isolation contract**: under four 2 ms serve bursts saturating
 /// both `sqz-meta` lanes, a frame served on the accepting venue never waits
 /// for a lane — its `dispatch` mean stays under a quarter burst — while the
 /// hop control lands behind the bursts (printed beside it, the RED shape
@@ -1061,10 +1180,45 @@ async fn ab_rows() {
             );
         }
     }
+
+    // DLM #8's single-connection half: the same publish burst on ONE
+    // pipelined session vs the D-1b session pool, equal depth, A-B-B-A. A
+    // fresh client per leg (the lever is read at the lane's first frame);
+    // each leg warms its own session(s) first.
+    println!("-- publish plane: multiplexed session vs session pool (equal depth)");
+    for arm in ["1", "0", "0", "1"] {
+        let _lever = EnvVarGuard::set(publish::SHIP_MULTIPLEX_ENV, arm);
+        publish::install_client(publish::PublishClient::new(NODE, SECRET.to_vec()));
+        for round in 1..=3u64 {
+            for out in nodes.publish_concurrently(&warm, round * 64).await {
+                out.expect("the warm publish lands");
+            }
+        }
+        let s0 = publish::stats();
+        let t0 = std::time::Instant::now();
+        for round in 1..=8u64 {
+            for out in nodes.publish_concurrently(&inos, round * 8192).await {
+                out.expect("the publish lands");
+            }
+        }
+        let wall = t0.elapsed();
+        let s1 = publish::stats();
+        println!(
+            "  {:<7} publishes/s {:>7.0} | wall/round {:>8.1} µs | frames {} mux {} dials {} depth \
+             waits {}",
+            if arm == "1" { "mux" } else { "pool" },
+            (24 * 8) as f64 / wall.as_secs_f64(),
+            wall.as_secs_f64() * 1e6 / 8.0,
+            s1.ship_frames - s0.ship_frames,
+            s1.ship_mux_frames - s0.ship_mux_frames,
+            s1.ship_session_dials - s0.ship_session_dials,
+            s1.ship_depth_waits - s0.ship_depth_waits,
+        );
+    }
     nodes.stop().await;
 }
 
-/// 6. **The stats-inode shape**: `meta_ship_owner_dispatch_ns` exports the
+/// Contract 6 — **The stats-inode shape**: `meta_ship_owner_dispatch_ns` exports the
 /// four phases in the ONE histogram shape (buckets + count + sum_ns +
 /// mean_ns), Σ buckets ≡ count; the engagement pair is on `meta_ship`.
 #[test]

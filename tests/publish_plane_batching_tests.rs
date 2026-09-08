@@ -1093,10 +1093,16 @@ async fn same_ino_calls_in_one_frame_keep_submission_order() {
 /// completes. The owner is parked by holding the served inos' serve
 /// stripes (`serve_ino_guard`), which is exactly where a served
 /// layout publish parks.
+///
+/// This is the SESSION-POOL shape's contract (D-1b), pinned verbatim under
+/// `SQUEEZEFS_PUBLISH_SHIP_MULTIPLEX=0`; since D-5 the default rides the
+/// depth on ONE pipelined session (`tests/owner_dispatch_hop_tests.rs`
+/// pins that arm: depth frames in flight, one dial).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_in_flight_frame_depth_is_pipelined_and_bounded() {
     let _serial = serial();
     let _restore = restore();
+    let _pool = EnvVarGuard::set(publish::SHIP_MULTIPLEX_ENV, "0");
     let dir = TempDir::new().unwrap();
     let pc = publish::PublishClient::with_depth(NODE, SECRET.to_vec(), 2);
     // No warm-up: a fresh lane, so every session this test sees is one

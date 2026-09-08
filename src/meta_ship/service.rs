@@ -29,7 +29,7 @@
 //! §6.7 is explicit: owner-side RPC handling runs on its own threads,
 //! **never on the conveyor's task**. The frame arrives on the connection's
 //! own OS thread (`sqz-clw-conn`); the batch's *execution* goes through
-//! [`super::owner_dispatch`] — the ONE door that records the dispatch's
+//! `meta_ship::owner_dispatch` — the ONE door that records the dispatch's
 //! decomposition (`meta_ship_owner_dispatch_ns`) and selects its venue.
 //!
 //! **Since D-5 (e2e perf audit DLM #7) the default venue is the accepting

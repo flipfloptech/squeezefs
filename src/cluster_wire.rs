@@ -77,15 +77,25 @@
 //! ~0.78 ms server at ρ ≈ 0.92, and an RPC on it would multiply through
 //! the queueing formula. Since the rip-tokio conversion the venue is
 //! **one named OS thread per admitted connection** (`sqz-clw-conn`,
-//! accepted by the `sqz-clw-accept` poll loop — the names are
-//! load-bearing for `pidstat`/`perf` attribution, the `fuse3-tpcN`
-//! lesson), bounded by the same [`ConnGate`] connection cap that already
-//! bounded the accept loop. [`RpcService::call`] is **synchronous by
-//! contract**, because §6.7's lock arbitration is RAM-only (an `scc`
-//! probe plus one atomic); anything that must await is a type,
-//! [`RpcAsyncService`], whose future is polled to completion on the
-//! connection's own thread (S8's own service hops to the runtime that
-//! owns the metadata backend's tasks itself, visibly).
+//! accepted by the `sqz-clw-accept` thread, which waits ON the listening
+//! socket — the names are load-bearing for `pidstat`/`perf` attribution,
+//! the `fuse3-tpcN` lesson), bounded by the same [`ConnGate`] connection
+//! cap that already bounded the accept loop. [`RpcService::call`] is
+//! **synchronous by contract**, because §6.7's lock arbitration is
+//! RAM-only (an `scc` probe plus one atomic); anything that must await is
+//! a type, [`RpcAsyncService`], whose future is polled on the connection's
+//! own thread (S8's own service executes there by default since D-5 —
+//! `crate::meta_ship::owner_dispatch`).
+//!
+//! **Since D-5 (e2e perf audit §5.3 row 18) the connection's thread is a
+//! LANE** (`SessionPark`): a [`squeezefs_ipc::sqz_exec::LaneExec`] whose
+//! park waits on the socket and a wake eventfd through one `poll(2)`, so
+//! every ready frame is read and its serve spawned as a lane task, and a
+//! peer that PIPELINES calls on one session ([`MuxSession`]) is served
+//! concurrently — K frames in flight cost one connection instead of K. A
+//! stop-and-wait peer costs exactly what it did. Both sockets run
+//! `TCP_NODELAY` (one write per frame; a pipelined session's back-to-back
+//! frames must not wait for the peer's delayed ACK — measured 40 ms steps).
 //!
 //! Deliberately **not** io_uring: TLS peers and network TCP/TLS stacks are
 //! the sanctioned non-uring exception (AGENTS "Not uring" row).
@@ -1097,7 +1107,14 @@ pub(crate) fn dial_tcp(endpoint: &str, deadline: Duration) -> std::io::Result<Tc
     let mut last: Option<std::io::Error> = None;
     for addr in addrs {
         match TcpStream::connect_timeout(&addr, deadline) {
-            Ok(s) => return Ok(s),
+            Ok(s) => {
+                // Every frame is one write; nothing here benefits from
+                // Nagle, and a PIPELINED session (`MuxSession`) is
+                // destroyed by it — back-to-back small frames wait for the
+                // peer's delayed ACK (measured: 40 ms steps per reply).
+                s.set_nodelay(true)?;
+                return Ok(s);
+            }
             Err(e) => last = Some(e),
         }
     }
@@ -1434,20 +1451,6 @@ enum ServiceArm {
     Async(Arc<dyn RpcAsyncService>),
 }
 
-impl ServiceArm {
-    fn call(&self, req: RpcRequest) -> RpcResponse {
-        match self {
-            ServiceArm::Sync(svc) => svc.call(req),
-            // The awaiting arm (S8's metadata verbs) is polled to
-            // completion ON this connection's own thread — never on the
-            // conveyor's task (§6.7's venue rule, unchanged): an
-            // implementation that needs a different runtime for its work
-            // performs that hop itself, visibly.
-            ServiceArm::Async(svc) => squeezefs_ipc::sqz_blocking::block_on(svc.call(req)),
-        }
-    }
-}
-
 /// The built-in ping service: the RTT instrument's server half, and the
 /// reference shape for S4's implementations (the listener owns the
 /// `requests_served` gauge, so the service itself counts nothing).
@@ -1699,6 +1702,27 @@ impl ClusterStream {
         match &self.0 {
             StreamInner::Tcp(s) => s,
             StreamInner::Tls(t) => t.sock(),
+        }
+    }
+
+    /// Does the stream hold DECRYPTED bytes the socket no longer shows?
+    /// Plaintext TCP never does (the framer reads exactly its frame);
+    /// rustls may hold a whole record beyond the frame just read, so a
+    /// readiness poll on the socket alone would leave that frame waiting
+    /// for the next arrival.
+    pub(crate) fn has_buffered_plaintext(&mut self) -> bool {
+        match &mut self.0 {
+            StreamInner::Tcp(_) => false,
+            StreamInner::Tls(t) => match &mut **t {
+                TlsConn::Server(s) => s
+                    .conn
+                    .process_new_packets()
+                    .is_ok_and(|st| st.plaintext_bytes_to_read() > 0),
+                TlsConn::Client(s) => s
+                    .conn
+                    .process_new_packets()
+                    .is_ok_and(|st| st.plaintext_bytes_to_read() > 0),
+            },
         }
     }
 
@@ -2111,6 +2135,12 @@ impl RpcListener {
                 log::warn!("cluster wire: dropping {peer} — set_nonblocking(false) failed: {e}");
                 continue;
             }
+            // The dial side's law (`dial_tcp`): one write per frame, and a
+            // pipelining peer's replies must not wait for its delayed ACK.
+            if let Err(e) = tcp.set_nodelay(true) {
+                log::warn!("cluster wire: dropping {peer} — set_nodelay failed: {e}");
+                continue;
+            }
             let conn_id = self.next_conn.fetch_add(1, Ordering::SeqCst);
             if let Ok(nudge) = tcp.try_clone() {
                 self.conn_socks.lock().insert(conn_id, nudge);
@@ -2292,73 +2322,377 @@ impl RpcListener {
             }
         );
 
-        // Session posture: the idle bound rides the socket read timeout
-        // (the prefix wait), the write bound rides the socket write
-        // timeout, and the whole-body deadline is enforced inside the
-        // framer between chunks.
-        let _ = stream.set_read_timeout(Some(self.cfg.session_idle_timeout));
+        // Session posture: a stalled frame body is bounded at the socket
+        // (read AND write timeouts); the idle bound is enforced by the
+        // session lane's park (`SessionPark`), which waits ON the socket.
+        let _ = stream.set_read_timeout(Some(self.cfg.frame_body_timeout));
         let _ = stream.set_write_timeout(Some(self.cfg.frame_body_timeout));
 
         // Authenticated session loop. Every frame is MAC'd, so the
         // session cannot be hijacked, reordered or replayed mid-flight.
-        let (mut tx, mut rx) = session_framers(&key, Role::Coordinator);
+        let (tx, rx) = session_framers(&key, Role::Coordinator);
+        let Some(park) = SessionPark::new(
+            Arc::clone(self),
+            SessionIo { stream, tx, rx },
+            peer_id.clone(),
+        ) else {
+            log::warn!("cluster wire: {peer}: session wake eventfd refused — dropped");
+            return;
+        };
+        let exec = squeezefs_ipc::sqz_exec::LaneExec::with_park(
+            Arc::clone(&park) as Arc<dyn squeezefs_ipc::sqz_exec::LanePark>
+        );
+        park.arm(exec.clone());
+        // The lane runs on THIS thread until the session closes (EOF, an
+        // error, the idle bound, or the listener's shutdown nudge) and its
+        // last in-flight serve has replied.
+        exec.run();
+        // Break the park ↔ exec reference cycle so the session's socket
+        // closes with the thread.
+        park.disarm();
+    }
+}
+
+/// The authenticated session's I/O — the frame reader (the lane's
+/// `service` hook) and every reply writer (a serve task) share it on the
+/// connection's ONE thread, so the mutex is never contended; it exists
+/// because a lane task must be `Send`.
+struct SessionIo {
+    stream: ClusterStream,
+    tx: FrameTx,
+    rx: FrameRx,
+}
+
+/// The session lane's liveness words.
+struct SessionState {
+    /// The last frame's arrival (the idle bound's anchor).
+    last_frame_at: std::time::Instant,
+    /// Serves admitted and not yet replied.
+    inflight: usize,
+    /// No more frames will be read (EOF / error / idle / shutdown); the
+    /// lane exits once `inflight` reaches 0.
+    closing: bool,
+}
+
+/// **The owner-side session as a lane** (e2e perf audit D-5, DLM #8's
+/// single-connection half): one authenticated connection is one
+/// [`squeezefs_ipc::sqz_exec::LaneExec`] on the connection's own thread
+/// whose park WAITS ON THE SOCKET — `poll(2)` over the socket and a wake
+/// eventfd — so a frame arrival and a serve task's wake arrive through one
+/// wait. The `service` hook (every loop iteration, never blocking on an
+/// empty socket) reads every frame that is ready and spawns its serve as
+/// a lane task; the task writes its reply when its verb completes. A peer
+/// that PIPELINES calls on one session is therefore served concurrently —
+/// K frames in flight no longer cost K connections (the F-B cap) — and a
+/// stop-and-wait peer costs exactly what it did: one thread, the serve
+/// polled on it, no extra hop (the venue [`crate::meta_ship::owner_dispatch`]
+/// executes on). §6.7's rule — never the conveyor's task — is untouched.
+///
+/// Liveness: the idle bound is the park's timeout while nothing is in
+/// flight; EOF / a read error / a MAC failure / the listener's shutdown
+/// nudge (`shutdown(Both)` on the dup'd socket wakes the poll) flip
+/// `closing`, and the lane shuts down when the last in-flight serve has
+/// replied (a dropped serve future mid-commit would be a cancellation the
+/// D5 law tolerates but nothing needs). A serve that unwinds is contained
+/// by the lane (`task_panics`); its `InflightGuard` still retires it.
+struct SessionPark {
+    host: Arc<RpcListener>,
+    io: parking_lot::Mutex<SessionIo>,
+    peer_id: String,
+    sock_fd: std::os::fd::RawFd,
+    wake: std::os::fd::OwnedFd,
+    state: parking_lot::Mutex<SessionState>,
+    /// The lane this park serves — set once the lane exists, cleared when
+    /// it exits (the park ↔ exec cycle must not outlive the thread).
+    exec: parking_lot::Mutex<Option<squeezefs_ipc::sqz_exec::LaneExec>>,
+    /// The serve tasks hold the park by `Arc`; the `&self` hooks reach it
+    /// through this.
+    me: std::sync::OnceLock<std::sync::Weak<SessionPark>>,
+}
+
+/// Retires one in-flight serve on EVERY exit path (reply written, write
+/// failed, or the serve unwound) and closes the lane when it was the last
+/// one of a closing session.
+struct InflightGuard {
+    park: Arc<SessionPark>,
+}
+
+impl Drop for InflightGuard {
+    fn drop(&mut self) {
+        let mut st = self.park.state.lock();
+        st.inflight -= 1;
+        let last = st.closing && st.inflight == 0;
+        drop(st);
+        if last {
+            self.park.shutdown_lane();
+        }
+    }
+}
+
+impl SessionPark {
+    fn new(host: Arc<RpcListener>, io: SessionIo, peer_id: String) -> Option<Arc<Self>> {
+        use std::os::fd::{AsRawFd, FromRawFd};
+        let sock_fd = io.stream.sock().as_raw_fd();
+        // SAFETY: eventfd(2) with a zero count and the close-on-exec flag;
+        // a negative return is the error arm, never wrapped.
+        let raw = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
+        if raw < 0 {
+            return None;
+        }
+        // SAFETY: `raw` is a fresh, valid fd this process owns exclusively.
+        let wake = unsafe { std::os::fd::OwnedFd::from_raw_fd(raw) };
+        let park = Arc::new(Self {
+            host,
+            io: parking_lot::Mutex::new(io),
+            peer_id,
+            sock_fd,
+            wake,
+            state: parking_lot::Mutex::new(SessionState {
+                last_frame_at: std::time::Instant::now(),
+                inflight: 0,
+                closing: false,
+            }),
+            exec: parking_lot::Mutex::new(None),
+            me: std::sync::OnceLock::new(),
+        });
+        let _ = park.me.set(Arc::downgrade(&park));
+        Some(park)
+    }
+
+    fn arm(&self, exec: squeezefs_ipc::sqz_exec::LaneExec) {
+        *self.exec.lock() = Some(exec);
+    }
+
+    fn disarm(&self) {
+        *self.exec.lock() = None;
+    }
+
+    fn self_arc(&self) -> Option<Arc<Self>> {
+        self.me.get().and_then(std::sync::Weak::upgrade)
+    }
+
+    fn shutdown_lane(&self) {
+        if let Some(exec) = self.exec.lock().as_ref() {
+            exec.shutdown();
+        }
+    }
+
+    /// Flip `closing`; shut the lane down at once if nothing is in flight.
+    fn close(&self) {
+        let mut st = self.state.lock();
+        if st.closing {
+            return;
+        }
+        st.closing = true;
+        let now = st.inflight == 0;
+        drop(st);
+        if now {
+            self.shutdown_lane();
+        }
+    }
+
+    /// Is a frame ready to read without blocking on an empty socket: the
+    /// socket is readable, or (mTLS) rustls holds decrypted plaintext the
+    /// socket no longer shows.
+    fn frame_ready(&self, io: &mut SessionIo) -> bool {
+        if io.stream.has_buffered_plaintext() {
+            return true;
+        }
+        let mut fds = libc::pollfd {
+            fd: self.sock_fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: a valid one-element pollfd array; zero timeout never
+        // blocks.
+        let n = unsafe { libc::poll(&mut fds, 1, 0) };
+        n > 0 && fds.revents != 0
+    }
+
+    /// Read every ready frame and spawn its serve on the lane.
+    fn read_ready_frames(self: &Arc<Self>) {
         loop {
-            if self.shutdown.load(Ordering::SeqCst) {
+            if self.state.lock().closing {
                 return;
             }
+            let mut io = self.io.lock();
+            if !self.frame_ready(&mut io) {
+                return;
+            }
+            let SessionIo { stream, rx, .. } = &mut *io;
             let frame = match rx.recv::<_, RpcFrame>(
-                &mut stream,
+                stream,
                 FrameClass::Bulk.cap(),
-                Some(self.cfg.frame_body_timeout),
+                Some(self.host.cfg.frame_body_timeout),
             ) {
                 Ok(Some(f)) => f,
-                Ok(None) => break,
-                Err(e) if io_timed_out(&e) => {
-                    log::warn!(
-                        "cluster wire: peer '{peer_id}' sent no frame within {:?} — closing \
-                         the idle session",
-                        self.cfg.session_idle_timeout
-                    );
-                    break;
+                Ok(None) => {
+                    drop(io);
+                    self.close();
+                    return;
                 }
                 Err(e) => {
-                    if e.to_string().contains("mac") {
-                        self.counters.mac_failures.fetch_add(1, Ordering::SeqCst);
+                    drop(io);
+                    if io_timed_out(&e) {
                         log::warn!(
-                            "cluster wire: peer '{peer_id}' frame failed authentication \
-                             ({e}) — closing the session"
+                            "cluster wire: peer '{}' stalled a frame past {:?} — closing the \
+                             session",
+                            self.peer_id,
+                            self.host.cfg.frame_body_timeout
+                        );
+                    } else if e.to_string().contains("mac") {
+                        self.host
+                            .counters
+                            .mac_failures
+                            .fetch_add(1, Ordering::SeqCst);
+                        log::warn!(
+                            "cluster wire: peer '{}' frame failed authentication ({e}) — \
+                             closing the session",
+                            self.peer_id
                         );
                     } else {
-                        log::warn!("cluster wire: peer '{peer_id}' session read error: {e}");
+                        log::warn!(
+                            "cluster wire: peer '{}' session read error: {e}",
+                            self.peer_id
+                        );
                     }
-                    break;
+                    self.close();
+                    return;
                 }
             };
+            drop(io);
             let RpcFrame::Call { id, verb, body } = frame else {
-                log::warn!("cluster wire: peer '{peer_id}' sent a non-Call frame — ignored");
+                log::warn!(
+                    "cluster wire: peer '{}' sent a non-Call frame — ignored",
+                    self.peer_id
+                );
                 continue;
             };
-            // The service runs HERE — on this connection's own thread,
-            // which is §6.7's venue rule: it never migrates the work
-            // onto the conveyor's task. An awaiting arm (S8's metadata
-            // verbs) is polled to completion on this thread; other
-            // sessions keep serving on their own threads meanwhile.
-            let reply = self.service.call(RpcRequest { id, verb, body });
-            self.counters.served.fetch_add(1, Ordering::SeqCst);
-            if tx
-                .send(
-                    &mut stream,
+            {
+                let mut st = self.state.lock();
+                st.last_frame_at = std::time::Instant::now();
+                st.inflight += 1;
+            }
+            let Some(exec) = self.exec.lock().clone() else {
+                return;
+            };
+            let park = Arc::clone(self);
+            exec.spawn(async move {
+                let _guard = InflightGuard {
+                    park: Arc::clone(&park),
+                };
+                // The service runs HERE — on this connection's own
+                // thread, §6.7's venue rule: never the conveyor's task. An
+                // awaiting arm (S8's metadata verbs) is polled on this
+                // lane beside the session's other in-flight serves.
+                let req = RpcRequest { id, verb, body };
+                let reply = match &park.host.service {
+                    ServiceArm::Sync(svc) => svc.call(req),
+                    ServiceArm::Async(svc) => svc.call(req).await,
+                };
+                park.host.counters.served.fetch_add(1, Ordering::SeqCst);
+                let mut io = park.io.lock();
+                let SessionIo { stream, tx, .. } = &mut *io;
+                let sent = tx.send(
+                    stream,
                     FrameClass::Bulk,
                     &RpcFrame::Reply {
                         id: reply.id,
                         status: reply.status,
                         body: reply.body,
                     },
+                );
+                drop(io);
+                if sent.is_err() {
+                    park.close();
+                }
+            });
+        }
+    }
+}
+
+impl squeezefs_ipc::sqz_exec::LanePark for SessionPark {
+    fn park(&self, tick: Duration) -> bool {
+        let timeout = {
+            let st = self.state.lock();
+            if st.inflight == 0 && !st.closing {
+                tick.min(
+                    self.host
+                        .cfg
+                        .session_idle_timeout
+                        .saturating_sub(st.last_frame_at.elapsed()),
                 )
-                .is_err()
-            {
-                break;
+            } else {
+                tick
             }
+        };
+        use std::os::fd::AsRawFd;
+        let mut fds = [
+            libc::pollfd {
+                fd: self.sock_fd,
+                events: libc::POLLIN,
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: self.wake.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            },
+        ];
+        let timeout_ms =
+            libc::c_int::try_from(timeout.as_millis().max(1)).unwrap_or(libc::c_int::MAX);
+        // SAFETY: a valid two-element pollfd array that outlives the call;
+        // both fds are owned for the session's lifetime.
+        let n = unsafe { libc::poll(fds.as_mut_ptr(), 2, timeout_ms) };
+        if fds[1].revents != 0 {
+            let mut count = [0u8; 8];
+            // SAFETY: an 8-byte read of the non-blocking eventfd counter
+            // into a valid buffer; EAGAIN is an already-drained counter.
+            let _ = unsafe {
+                libc::read(
+                    self.wake.as_raw_fd(),
+                    count.as_mut_ptr().cast(),
+                    count.len(),
+                )
+            };
+        }
+        n == 0
+    }
+
+    fn unpark(&self) {
+        use std::os::fd::AsRawFd;
+        let one = 1u64.to_ne_bytes();
+        // SAFETY: an 8-byte write to the eventfd from a valid buffer; the
+        // counter saturates far above any wake population, and a full
+        // counter still leaves it readable, so a failed write loses no wake.
+        let _ = unsafe { libc::write(self.wake.as_raw_fd(), one.as_ptr().cast(), one.len()) };
+    }
+
+    fn service(&self) {
+        if self.host.shutdown.load(Ordering::SeqCst) {
+            self.close();
+            return;
+        }
+        // `service` is a `&self` hook; the reader needs the `Arc` for the
+        // serve tasks it spawns.
+        let Some(me) = self.self_arc() else {
+            self.shutdown_lane();
+            return;
+        };
+        me.read_ready_frames();
+        let idle = {
+            let st = self.state.lock();
+            st.inflight == 0
+                && !st.closing
+                && st.last_frame_at.elapsed() >= self.host.cfg.session_idle_timeout
+        };
+        if idle {
+            log::warn!(
+                "cluster wire: peer '{}' sent no frame within {:?} — closing the idle session",
+                self.peer_id,
+                self.host.cfg.session_idle_timeout
+            );
+            self.close();
         }
     }
 }
@@ -2699,6 +3033,266 @@ impl RpcClient {
         };
         self.io = Some(io);
         out.map(|r| (r, timing))
+    }
+}
+
+/// A parked [`MuxSession::call`]: its reply slot and when it was sent (the
+/// per-call reply bound's anchor).
+struct MuxPending {
+    reply: squeezefs_ipc::sqz_channel::oneshot::Sender<Result<RpcResponse>>,
+    sent_at: std::time::Instant,
+}
+
+/// The multiplexed session's write half: the framer's MAC sequence is per
+/// direction, so every send takes this lock; `None` once the session is
+/// dead.
+type MuxWriter = parking_lot::Mutex<Option<(ClusterWriteHalf, FrameTx)>>;
+
+/// **A dialed session that PIPELINES calls on one socket** (e2e perf audit
+/// D-5, DLM #8's single-connection half). [`RpcClient`] is request/reply:
+/// one call in flight per session, so K frames in flight cost K sessions
+/// — K connections, K owner threads, K slots of the F-B connection cap.
+/// Here every call carries its own id, a dedicated reader thread
+/// (`sqz-clw-mux`) demultiplexes the replies by id onto parked oneshots,
+/// and the owner's session lane (`SessionPark`) serves the in-flight
+/// calls concurrently — so K in flight costs ONE connection.
+///
+/// Same handshake, same per-frame MAC, same reply bound (`DIAL_TIMEOUT`
+/// per call, enforced by the reader on its read-timeout tick); a
+/// transport failure on either half kills the WHOLE session (`is_dead`)
+/// and fails every parked call — the pooled session's "drop on error"
+/// law, one session wide — so a caller's resend discipline is unchanged.
+pub struct MuxSession {
+    writer: MuxWriter,
+    pending: parking_lot::Mutex<HashMap<u64, MuxPending>>,
+    next_id: AtomicU64,
+    dead: AtomicBool,
+    authn: SessionAuthn,
+    /// Dup'd socket for the poison nudge (`shutdown(Both)` wakes the
+    /// reader out of its parked read).
+    nudge: TcpStream,
+    reader: parking_lot::Mutex<Option<std::thread::JoinHandle<()>>>,
+}
+
+impl std::fmt::Debug for MuxSession {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MuxSession")
+            .field("authn", &self.authn)
+            .field("calls", &self.next_id.load(Ordering::Relaxed))
+            .field("pending", &self.pending.lock().len())
+            .field("dead", &self.dead.load(Ordering::Relaxed))
+            .finish_non_exhaustive()
+    }
+}
+
+impl MuxSession {
+    /// Dial + prove (exactly [`RpcClient::connect`]), then split the
+    /// session into its pipelined form.
+    pub async fn connect(
+        endpoint: &str,
+        secret: &[u8],
+        peer_id: &str,
+        security: Option<&ClusterSecurityConfig>,
+    ) -> Result<Arc<Self>> {
+        let client = RpcClient::connect(endpoint, secret, peer_id, security).await?;
+        client.into_mux()
+    }
+
+    /// The reader's park bound per read: a quarter of the per-call reply
+    /// bound, so an expired call is failed within `DIAL_TIMEOUT × 1.25`
+    /// of its send at worst (the parked read wakes this often when idle).
+    fn reader_tick() -> Duration {
+        DIAL_TIMEOUT / 4
+    }
+
+    /// The reader holds the session WEAKLY between reads: when every user
+    /// has dropped its `Arc` the session's `Drop` poisons it (nudging this
+    /// read awake) and the failed upgrade ends the thread — a session
+    /// nobody holds never outlives its last user by more than one read.
+    fn reader_loop(weak: &std::sync::Weak<Self>, mut rx: FrameRx, mut half: ClusterReadHalf) {
+        loop {
+            let Some(me) = weak.upgrade() else {
+                return;
+            };
+            if me.dead.load(Ordering::Acquire) {
+                break;
+            }
+            match rx.recv::<_, RpcFrame>(&mut half, FrameClass::Bulk.cap(), Some(DIAL_TIMEOUT)) {
+                Ok(Some(RpcFrame::Reply { id, status, body })) => {
+                    match me.pending.lock().remove(&id) {
+                        Some(p) => {
+                            let _ = p.reply.send(Ok(RpcResponse { id, status, body }));
+                        }
+                        None => log::warn!(
+                            "cluster wire: multiplexed session received a reply for unknown \
+                             call {id} — dropped (a late reply to an expired call)"
+                        ),
+                    }
+                }
+                Ok(Some(other)) => {
+                    log::warn!(
+                        "cluster wire: multiplexed session received a non-Reply frame — \
+                         ignored: {other:?}"
+                    );
+                }
+                Ok(None) => break,
+                Err(e) if io_timed_out(&e) => {
+                    // The tick: fail every call past its reply bound; an
+                    // idle session simply re-parks.
+                    let expired: Vec<MuxPending> = {
+                        let mut p = me.pending.lock();
+                        let ids: Vec<u64> = p
+                            .iter()
+                            .filter(|(_, v)| v.sent_at.elapsed() >= DIAL_TIMEOUT)
+                            .map(|(k, _)| *k)
+                            .collect();
+                        ids.into_iter().filter_map(|id| p.remove(&id)).collect()
+                    };
+                    for p in expired {
+                        let _ = p.reply.send(Err(SqueezefsError::InvalidOperation(format!(
+                            "cluster wire: no reply to a multiplexed call within {DIAL_TIMEOUT:?}"
+                        ))));
+                    }
+                }
+                Err(e) => {
+                    log::warn!("cluster wire: multiplexed session read error: {e}");
+                    break;
+                }
+            }
+        }
+        if let Some(me) = weak.upgrade() {
+            me.poison();
+        }
+    }
+
+    /// Kill the session: no more sends, every parked call fails, the
+    /// reader wakes out of its read and exits.
+    fn poison(&self) {
+        if self.dead.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        *self.writer.lock() = None;
+        let _ = self.nudge.shutdown(Shutdown::Both);
+        let parked: Vec<MuxPending> = self.pending.lock().drain().map(|(_, p)| p).collect();
+        for p in parked {
+            let _ = p.reply.send(Err(SqueezefsError::InvalidOperation(
+                "cluster wire: the multiplexed session closed before the reply".into(),
+            )));
+        }
+    }
+
+    /// Has the session died (a transport failure on either half, the
+    /// owner's idle reaper, or [`Self::close`])? A dead session is replaced,
+    /// never reused — the pooled `dead_on_arrival` law, one session wide.
+    pub fn is_dead(&self) -> bool {
+        self.dead.load(Ordering::Acquire)
+    }
+
+    /// This session's authentication state.
+    pub fn authn(&self) -> &SessionAuthn {
+        &self.authn
+    }
+
+    /// Calls in flight (parked on their replies).
+    pub fn inflight(&self) -> usize {
+        self.pending.lock().len()
+    }
+
+    /// Issue one authenticated request and await its reply, beside every
+    /// other call in flight on this session. The send runs on the blocking
+    /// pool under the writer lock (one frame at a time on the wire, as the
+    /// MAC sequence requires); the reply arrives through the reader.
+    pub async fn call(self: &Arc<Self>, verb: u16, body: Vec<u8>) -> Result<RpcResponse> {
+        if self.is_dead() {
+            return Err(SqueezefsError::InvalidOperation(
+                "cluster wire: the multiplexed session is dead — reconnect".into(),
+            ));
+        }
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed) + 1;
+        let (tx, rx) = squeezefs_ipc::sqz_channel::oneshot::channel();
+        self.pending.lock().insert(
+            id,
+            MuxPending {
+                reply: tx,
+                sent_at: std::time::Instant::now(),
+            },
+        );
+        let me = Arc::clone(self);
+        let sent = squeezefs_ipc::sqz_blocking::run_blocking(move || {
+            let mut w = me.writer.lock();
+            match w.as_mut() {
+                Some((half, ftx)) => ftx
+                    .send(half, FrameClass::Bulk, &RpcFrame::Call { id, verb, body })
+                    .map_err(SqueezefsError::from),
+                None => Err(SqueezefsError::InvalidOperation(
+                    "cluster wire: the multiplexed session is dead — reconnect".into(),
+                )),
+            }
+        })
+        .await;
+        if let Err(e) = sent {
+            self.pending.lock().remove(&id);
+            self.poison();
+            return Err(e);
+        }
+        rx.await.map_err(|_| {
+            SqueezefsError::InvalidOperation(
+                "cluster wire: the multiplexed session closed before the reply".into(),
+            )
+        })?
+    }
+
+    /// Close the session and join its reader (teardown; a dropped session
+    /// poisons itself and the reader exits on its own).
+    pub fn close(&self) {
+        self.poison();
+        if let Some(h) = self.reader.lock().take() {
+            let _ = h.join();
+        }
+    }
+}
+
+impl Drop for MuxSession {
+    fn drop(&mut self) {
+        // Nudge the reader awake; its next upgrade fails and it exits.
+        self.poison();
+    }
+}
+
+impl RpcClient {
+    /// Convert a freshly dialed request/reply session into a pipelined
+    /// [`MuxSession`]: split the stream, hand the read half to a named
+    /// reader thread, keep the write half under the writer lock.
+    pub fn into_mux(mut self) -> Result<Arc<MuxSession>> {
+        let io = self.io.take().ok_or_else(|| {
+            SqueezefsError::InvalidOperation(
+                "cluster wire: session I/O lost to an earlier panicked call — reconnect".into(),
+            )
+        })?;
+        let ClientIo { stream, tx, rx, .. } = io;
+        let nudge = stream.nudge_handle()?;
+        let (mut rhalf, whalf) = stream.split()?;
+        rhalf.set_read_timeout(Some(MuxSession::reader_tick()))?;
+        let session = Arc::new(MuxSession {
+            writer: parking_lot::Mutex::new(Some((whalf, tx))),
+            pending: parking_lot::Mutex::new(HashMap::new()),
+            next_id: AtomicU64::new(0),
+            dead: AtomicBool::new(false),
+            authn: self.authn,
+            nudge,
+            reader: parking_lot::Mutex::new(None),
+        });
+        let reader_me = Arc::downgrade(&session);
+        let handle = std::thread::Builder::new()
+            .name("sqz-clw-mux".to_string())
+            .spawn(move || MuxSession::reader_loop(&reader_me, rx, rhalf))
+            .map_err(|e| {
+                SqueezefsError::InvalidOperation(format!(
+                    "cluster wire: multiplexed session reader thread refused: {e}"
+                ))
+            })?;
+        *session.reader.lock() = Some(handle);
+        Ok(session)
     }
 }
 

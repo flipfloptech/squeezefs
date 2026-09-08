@@ -1125,6 +1125,95 @@ async fn a_dial_never_waits_for_the_accept_tick() {
     host.shutdown();
 }
 
+/// D-5, DLM #8's single-connection half: K calls PIPELINED on one
+/// authenticated session are served CONCURRENTLY by the owner and
+/// demultiplexed by id on the client — K in flight costs one connection.
+///
+/// The service parks each call 40 ms (an awaiting arm, the S8 shape); 8
+/// concurrent calls on one `MuxSession` must all answer with their own
+/// bodies in ≈ one park, not eight (the request/reply session serialized
+/// them at the owner: 8 × 40 = 320 ms), on ONE live connection.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pipelined_calls_on_one_session_are_served_concurrently_and_demuxed_by_id() {
+    struct Parking;
+    impl cw::RpcAsyncService for Parking {
+        fn call<'a>(
+            &'a self,
+            req: cw::RpcRequest,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = cw::RpcResponse> + Send + 'a>>
+        {
+            Box::pin(async move {
+                squeezefs_ipc::sqz_time::sleep(Duration::from_millis(40)).await;
+                cw::RpcResponse {
+                    id: req.id,
+                    status: 0,
+                    body: req.body,
+                }
+            })
+        }
+    }
+    let host = cw::RpcListener::start_async(listener_cfg(), SECRET.to_vec(), Arc::new(Parking))
+        .expect("listener starts");
+    let endpoint = host.endpoint().to_string();
+    let session = cw::MuxSession::connect(&endpoint, SECRET, "mux-peer", None)
+        .await
+        .expect("storage-trust enrollment");
+    assert!(session.authn().authenticated());
+
+    let t0 = std::time::Instant::now();
+    let calls: Vec<_> = (0..8u8)
+        .map(|i| {
+            let s = Arc::clone(&session);
+            tokio::spawn(async move { (i, s.call(cw::VERB_PING, vec![i; 32]).await) })
+        })
+        .collect();
+    for c in calls {
+        let (i, reply) = c.await.expect("call task");
+        let reply = reply.expect("a pipelined call answers");
+        assert_eq!(reply.status, 0);
+        assert_eq!(
+            reply.body,
+            vec![i; 32],
+            "call {i} got ITS reply (demux by id)"
+        );
+    }
+    let wall = t0.elapsed();
+    println!("D-5 mux row: 8 pipelined 40 ms calls on one session — wall {wall:?}");
+    // 8 × 40 ms serialized = 320 ms; concurrent = one park. The bound is
+    // two parks: it also catches the Nagle + delayed-ACK shape a pipelined
+    // session meets without TCP_NODELAY (measured 41 ms → 123 ms).
+    assert!(
+        wall < Duration::from_millis(80),
+        "the owner serves the pipelined calls concurrently: {wall:?} for 8 × 40 ms parks"
+    );
+    let stats = host.stats();
+    assert_eq!(
+        stats.sessions_admitted, 1,
+        "one connection carried all 8 calls"
+    );
+    assert_eq!(stats.live_connections, 1);
+    assert_eq!(stats.requests_served, 8, "engagement is exact: {stats:?}");
+    assert_eq!(session.inflight(), 0, "every parked call was answered");
+    assert!(!session.is_dead());
+
+    // The session dies whole: shutting the owner down fails nothing in
+    // flight here and marks the session dead for its next user.
+    host.shutdown();
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while !session.is_dead() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the reader observes the close"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    let err = session
+        .call(cw::VERB_PING, vec![9])
+        .await
+        .expect_err("a dead session refuses, never reuses");
+    assert!(format!("{err}").contains("dead"), "{err}");
+}
+
 // ---------------------------------------------------------------------------
 // The RTT row instrument, on demand
 // ---------------------------------------------------------------------------

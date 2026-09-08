@@ -1176,6 +1176,10 @@ static SHIP_FRAMES: AtomicU64 = AtomicU64::new(0);
 static SHIP_FRAMED_CALLS: AtomicU64 = AtomicU64::new(0);
 static SHIP_DEPTH_WAITS: AtomicU64 = AtomicU64::new(0);
 static SHIP_SESSION_DIALS: AtomicU64 = AtomicU64::new(0);
+// D-5 — frames shipped on a MULTIPLEXED session (the single-connection
+// lever's engagement: ≡ `ship_frames` on the default, 0 under
+// `SQUEEZEFS_PUBLISH_SHIP_MULTIPLEX=0`).
+static SHIP_MUX_FRAMES: AtomicU64 = AtomicU64::new(0);
 static SERVED_FRAMES: AtomicU64 = AtomicU64::new(0);
 static SERVED_FRAME_CALLS: AtomicU64 = AtomicU64::new(0);
 static SERVED_CHAINS: AtomicU64 = AtomicU64::new(0);
@@ -1354,6 +1358,12 @@ pub struct PublishStats {
     /// owner's idle reaper. Bounded by `depth` per endpoint at steady
     /// state; steady growth means sessions are dying between frames.
     pub ship_session_dials: u64,
+    /// D-5 (client side): frames shipped on the endpoint's ONE pipelined
+    /// session (`SQUEEZEFS_PUBLISH_SHIP_MULTIPLEX`, default on) — ≡
+    /// `ship_frames` on the default; 0 on the session-pool control. With
+    /// it, `ship_session_dials` reads 1 per endpoint at steady state
+    /// instead of `depth`.
+    pub ship_mux_frames: u64,
     /// D-1b (owner side): publish frames served.
     pub served_frames: u64,
     /// D-1b (owner side): calls those frames carried (`shipped ≡ served`
@@ -1411,6 +1421,7 @@ pub fn stats() -> PublishStats {
         ship_framed_calls: SHIP_FRAMED_CALLS.load(Ordering::Relaxed),
         ship_depth_waits: SHIP_DEPTH_WAITS.load(Ordering::Relaxed),
         ship_session_dials: SHIP_SESSION_DIALS.load(Ordering::Relaxed),
+        ship_mux_frames: SHIP_MUX_FRAMES.load(Ordering::Relaxed),
         served_frames: SERVED_FRAMES.load(Ordering::Relaxed),
         served_frame_calls: SERVED_FRAME_CALLS.load(Ordering::Relaxed),
         served_chains: SERVED_CHAINS.load(Ordering::Relaxed),
@@ -1460,6 +1471,7 @@ pub fn stats_json() -> serde_json::Value {
         "ship_framed_calls": s.ship_framed_calls,
         "ship_depth_waits": s.ship_depth_waits,
         "ship_session_dials": s.ship_session_dials,
+        "ship_mux_frames": s.ship_mux_frames,
         "served_frames": s.served_frames,
         "served_frame_calls": s.served_frame_calls,
         "served_chains": s.served_chains,
@@ -1514,6 +1526,21 @@ pub fn publish_ship_depth_from(explicit: Option<usize>, cpus: usize) -> usize {
     cpus.div_ceil(8).clamp(2, 8)
 }
 
+/// D-5 (DLM #8's single-connection half): the in-flight frames ride ONE
+/// pipelined session per authority ([`crate::cluster_wire::MuxSession`] —
+/// replies demultiplexed by id, the owner's session lane serving them
+/// concurrently) instead of one request/reply session each. `depth` keeps
+/// its meaning (frames in flight); what it no longer costs is a
+/// connection per frame — F-B's `max_connections` cap counts sessions, so
+/// a co-writer at depth 8 held 8 of the authority's slots. `0` = the D-1b
+/// session pool (the same-binary A/B control).
+pub const SHIP_MULTIPLEX_ENV: &str = "SQUEEZEFS_PUBLISH_SHIP_MULTIPLEX";
+
+/// Read the lever (once per publish lane, at its first frame).
+fn publish_ship_multiplex() -> bool {
+    crate::env_knobs::bool_knob(SHIP_MULTIPLEX_ENV, true)
+}
+
 /// The per-frame call cap — S8's frame cap, for the same reason: a frame's
 /// calls become that many transactions on the owner's conveyor, so sizing a
 /// frame past what one pass drains buys queueing, not throughput.
@@ -1546,14 +1573,21 @@ struct PublishLane {
 }
 
 /// What every frame shipper on one lane shares: the endpoint, the
-/// identity, the depth bound and the idle-session pool (≤ depth sessions
-/// by construction — only a permit holder ever dials one).
+/// identity, the depth bound and the sessions — the idle-session POOL (≤
+/// depth request/reply sessions by construction — only a permit holder
+/// ever dials one), or under [`SHIP_MULTIPLEX_ENV`] ONE pipelined session
+/// every in-flight frame rides.
 struct LaneShared {
     endpoint: String,
     peer_id: Arc<str>,
     secret: Arc<Vec<u8>>,
     depth: Arc<squeezefs_ipc::sqz_semaphore::Semaphore>,
     pool: parking_lot::Mutex<Vec<RpcClient>>,
+    /// D-5: frames multiplexed on one socket (`true`) or one session per
+    /// in-flight frame (`false`, the D-1b pool). Read once per lane.
+    multiplex: bool,
+    /// The lane's one pipelined session (`multiplex`); replaced when dead.
+    mux: parking_lot::Mutex<Option<Arc<crate::cluster_wire::MuxSession>>>,
 }
 
 /// The client half: per authority endpoint, one framing lane and a pool of
@@ -1614,6 +1648,8 @@ impl PublishClient {
                 secret: Arc::clone(&self.secret),
                 depth: Arc::new(squeezefs_ipc::sqz_semaphore::Semaphore::new(self.depth)),
                 pool: parking_lot::Mutex::new(Vec::with_capacity(self.depth)),
+                multiplex: publish_ship_multiplex(),
+                mux: parking_lot::Mutex::new(None),
             });
             // The drain rides the sqz-meta pool — the venue that owns the
             // daemon's plane tasks; it ends when the client (and hence the
@@ -1909,44 +1945,22 @@ impl LaneShared {
         let attempts = if resend_safe { 2 } else { 1 };
         let mut last_err: Option<SqueezefsError> = None;
         for attempt in 0..attempts {
-            // Finding 14: a POOLED session the idle reaper closed is
-            // provably dead BEFORE the send — replacing it here costs no
-            // attempt and touches no retry law. The pool guard is a
-            // statement-scoped short hold, never across an await.
-            let pooled = self.pool.lock().pop();
-            let mut session = match pooled {
-                Some(s) if !s.dead_on_arrival() => s,
-                _ => match RpcClient::connect(&self.endpoint, &self.secret, &self.peer_id, None)
-                    .await
-                {
-                    Ok(c) => {
-                        SHIP_SESSION_DIALS.fetch_add(1, Ordering::Relaxed);
-                        c
-                    }
-                    Err(e) => {
-                        last_err = Some(e);
-                        continue;
-                    }
-                },
-            };
-            // Rung 9 (S8-a attribution): a publish frame pays the same
-            // authenticated round trip as an S8 verb frame, so it records
-            // the SAME `meta_ship_phase_ns.rtt` phase.
-            let t_rtt = std::time::Instant::now();
             let bytes = if attempt + 1 == attempts {
                 std::mem::take(&mut body)
             } else {
                 body.clone()
             };
-            let out = session.call(VERB_PUBLISH_CALL, bytes).await;
-            super::phase_record(super::ShipPhase::Rtt, t_rtt);
+            // Rung 9 (S8-a attribution): a publish frame pays the same
+            // authenticated round trip as an S8 verb frame, so it records
+            // the SAME `meta_ship_phase_ns.rtt` phase.
+            let out = if self.multiplex {
+                self.exchange_multiplexed(bytes).await
+            } else {
+                self.exchange_pooled(bytes).await
+            };
             match out {
-                Ok(r) => {
-                    self.pool.lock().push(session);
-                    return Ok(r);
-                }
+                Ok(r) => return Ok(r),
                 Err(e) => {
-                    drop(session);
                     if attempt + 1 < attempts {
                         log::warn!(
                             "S9: a {n}-call publish frame to {} failed ({e}) — reconnecting and \
@@ -1965,6 +1979,69 @@ impl LaneShared {
                 self.endpoint
             ))
         }))
+    }
+
+    /// One attempt on the D-1b session POOL: a pooled request/reply session
+    /// (or a fresh dial), the round trip, and the session's return to the
+    /// pool on success; a transport failure drops the session.
+    async fn exchange_pooled(&self, bytes: Vec<u8>) -> Result<RpcResponse> {
+        // Finding 14: a POOLED session the idle reaper closed is provably
+        // dead BEFORE the send — replacing it here costs no attempt and
+        // touches no retry law. The pool guard is a statement-scoped short
+        // hold, never across an await.
+        let pooled = self.pool.lock().pop();
+        let mut session = match pooled {
+            Some(s) if !s.dead_on_arrival() => s,
+            _ => {
+                let c =
+                    RpcClient::connect(&self.endpoint, &self.secret, &self.peer_id, None).await?;
+                SHIP_SESSION_DIALS.fetch_add(1, Ordering::Relaxed);
+                c
+            }
+        };
+        let t_rtt = std::time::Instant::now();
+        let out = session.call(VERB_PUBLISH_CALL, bytes).await;
+        super::phase_record(super::ShipPhase::Rtt, t_rtt);
+        if out.is_ok() {
+            self.pool.lock().push(session);
+        }
+        out
+    }
+
+    /// One attempt on the lane's ONE pipelined session (D-5): the frame
+    /// travels beside every other in-flight frame on the same socket; a
+    /// dead session (a transport failure on any frame, the owner's idle
+    /// reaper) is replaced by the next frame's dial — a racing pair of
+    /// dials keeps the first one stored (a wasted dial, never a wrong
+    /// session).
+    async fn exchange_multiplexed(&self, bytes: Vec<u8>) -> Result<RpcResponse> {
+        let live = self.mux.lock().clone().filter(|s| !s.is_dead());
+        let session = match live {
+            Some(s) => s,
+            None => {
+                let fresh = crate::cluster_wire::MuxSession::connect(
+                    &self.endpoint,
+                    &self.secret,
+                    &self.peer_id,
+                    None,
+                )
+                .await?;
+                SHIP_SESSION_DIALS.fetch_add(1, Ordering::Relaxed);
+                let mut slot = self.mux.lock();
+                match slot.as_ref().filter(|s| !s.is_dead()) {
+                    Some(raced_in) => Arc::clone(raced_in),
+                    None => {
+                        *slot = Some(Arc::clone(&fresh));
+                        fresh
+                    }
+                }
+            }
+        };
+        SHIP_MUX_FRAMES.fetch_add(1, Ordering::Relaxed);
+        let t_rtt = std::time::Instant::now();
+        let out = session.call(VERB_PUBLISH_CALL, bytes).await;
+        super::phase_record(super::ShipPhase::Rtt, t_rtt);
+        out
     }
 }
 
@@ -3883,7 +3960,7 @@ enum KvmapClaimScope {
 /// The publish path executed for a peer, against the volumes this node has
 /// authority over.
 ///
-/// The **venue** is S8's, verbatim ([`super::owner_dispatch`], D-5): the
+/// The **venue** is S8's, verbatim (`meta_ship::owner_dispatch`, D-5): the
 /// frame arrives on the connection's own thread and every call / group /
 /// free / harvest dispatch goes through the one door that records the
 /// dispatch-hop split and selects the venue — the accepting thread itself

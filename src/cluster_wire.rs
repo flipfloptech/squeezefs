@@ -1125,10 +1125,36 @@ fn require_ca(security: &ClusterSecurityConfig) -> Result<ClusterCa> {
 // Accept/serve thread posture (§6.7: never the conveyor's task)
 // ---------------------------------------------------------------------------
 
-/// Accept-poll cadence: the listener socket is non-blocking and the named
-/// accept thread wakes this often to observe the shutdown latch (the
-/// simple-and-loud stop protocol — no self-connect nudge needed).
+/// The accept thread's shutdown-latch observation bound: the listener
+/// socket is non-blocking and the named accept thread WAITS ON IT
+/// (`poll(2)`, [`wait_for_accept`]) so a connection arrival wakes it at
+/// once; this tick bounds only how long `shutdown()` can wait for the
+/// thread to notice the latch (the simple-and-loud stop protocol — no
+/// self-connect nudge needed). Before D-5 (e2e perf audit §5.3 row 18)
+/// the thread SLEPT this long between accept attempts, so every sequential
+/// dial paid the whole tick (measured 100.09–100.71 ms per dial): a
+/// fleet-start / reconnect / first-beat term on every plane the wire
+/// carries. A liveness constant, never a latency term.
 pub(crate) const ACCEPT_POLL_TICK: Duration = Duration::from_millis(100);
+
+/// Park the accept thread until `listener` is readable (a pending
+/// connection) or `tick` elapses. `poll(2)` on the listening fd — a
+/// readable listening socket IS an accept-ready one. Any poll error is
+/// reported to the caller's accept, which classifies it (an `EINTR` simply
+/// re-polls).
+fn wait_for_accept(listener: &std::net::TcpListener, tick: Duration) {
+    use std::os::fd::AsRawFd;
+    let mut fds = libc::pollfd {
+        fd: listener.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let timeout_ms = libc::c_int::try_from(tick.as_millis()).unwrap_or(libc::c_int::MAX);
+    // SAFETY: `fds` is a valid, initialized pollfd array of length 1 that
+    // outlives the call; the fd is owned by `listener` for the call's
+    // duration.
+    let _ = unsafe { libc::poll(&mut fds, 1, timeout_ms) };
+}
 
 /// Lock-held read-attempt slice for a **split** TLS stream: sync rustls
 /// cannot read and write one connection from two threads, so the halves
@@ -2040,7 +2066,8 @@ impl RpcListener {
     }
 
     fn accept_loop(self: Arc<Self>, listener: std::net::TcpListener) {
-        // The listener is non-blocking; the poll tick is how this thread
+        // The listener is non-blocking: the thread waits ON the socket
+        // (an arrival wakes it at once) and the poll tick is only how it
         // observes the shutdown latch (simple and loud — no self-connect
         // nudge protocol).
         let mut backoff: Option<Duration> = None;
@@ -2054,7 +2081,7 @@ impl RpcListener {
                     x
                 }
                 Err(e) if io_timed_out(&e) => {
-                    std::thread::sleep(ACCEPT_POLL_TICK);
+                    wait_for_accept(&listener, ACCEPT_POLL_TICK);
                     continue;
                 }
                 Err(e) => {

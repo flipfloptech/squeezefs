@@ -343,6 +343,12 @@ fn metric(c: &squeezefs::fuse_client::Align64<std::sync::atomic::AtomicU64>) -> 
     c.load(Ordering::Relaxed)
 }
 
+/// The W-6 per-thread-striped counters (`patch_writes` since the WRITE
+/// handler's per-op words went core-local) fold on read.
+fn striped(c: &squeezefs::fuse_client::ShardedAtomic) -> u64 {
+    c.load(Ordering::Relaxed)
+}
+
 // ---------------------------------------------------------------------------
 // 1 — the instrument
 // ---------------------------------------------------------------------------
@@ -554,10 +560,10 @@ async fn in_place_dma_shapes_stamp_their_namespace() {
     fsync(&fx, ino).await; // settle: the next fsync starts clean
 
     // W1 patch: one aligned LBA overwrite inside block 1.
-    let p0 = metric(&METRICS.patch_writes);
+    let p0 = striped(&METRICS.patch_writes);
     write_at(&fx, ino, BS + 8192, &pattern(LBA, 0x45)).await;
     assert_eq!(
-        metric(&METRICS.patch_writes) - p0,
+        striped(&METRICS.patch_writes) - p0,
         1,
         "premise: the aligned overwrite rode the W1 patch"
     );

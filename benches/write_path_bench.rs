@@ -2273,8 +2273,318 @@ fn bench_cowriter_free(c: &mut Criterion) {
     group.finish();
 }
 
+/// W-6 (e2e perf audit write board #7, lever B — the per-op counter
+/// set): the words a W1 patch write bumps on the way through the handler
+/// — the inode-lock wait pair (2 histograms), the hold histogram, the
+/// block-lock wait histogram, the writeback queue-depth sample, the
+/// scope candidate/final counters and the patch pair — 20 RMWs per op.
+/// `global_lines` is the shipped posture (one `LatencyHistogram` /
+/// `Align64<AtomicU64>` per word, every thread on the same lines);
+/// `striped` is the landed one (`ShardedLatencyHistogram` /
+/// `ShardedAtomic`, one core-local stripe per thread). Reported per
+/// BATCH of `THREADS × PER_THREAD` ops; the elements throughput is the
+/// per-op read. THREADS = the field box's handler-lane population
+/// (32 possible CPUs); the 8-thread row is the qd-8 fio job shape.
+fn bench_write_handler_counters(c: &mut Criterion) {
+    use squeezefs::fuse_client::{
+        Align64, LatencyHistogram, QueueDepthHistogram, ShardedAtomic, ShardedLatencyHistogram,
+        ShardedQueueDepthHistogram,
+    };
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    const PER_THREAD: usize = 20_000;
+
+    #[derive(Default)]
+    struct Global {
+        wait: Align64<LatencyHistogram>,
+        wait_class: Align64<LatencyHistogram>,
+        hold: Align64<LatencyHistogram>,
+        block_wait: Align64<LatencyHistogram>,
+        depth: Align64<QueueDepthHistogram>,
+        candidate: Align64<AtomicU64>,
+        scope: Align64<AtomicU64>,
+        patch_writes: Align64<AtomicU64>,
+        patch_bytes: Align64<AtomicU64>,
+    }
+    #[derive(Default)]
+    struct Striped {
+        wait: ShardedLatencyHistogram,
+        wait_class: ShardedLatencyHistogram,
+        hold: ShardedLatencyHistogram,
+        block_wait: ShardedLatencyHistogram,
+        depth: ShardedQueueDepthHistogram,
+        candidate: ShardedAtomic,
+        scope: ShardedAtomic,
+        patch_writes: ShardedAtomic,
+        patch_bytes: ShardedAtomic,
+    }
+
+    // The W1 shape's spans: sub-µs waits (the ≤1 µs bucket — the tight
+    // distribution that puts every op on ONE bucket word), a µs-grade
+    // hold, depth 0.
+    let wait = Duration::from_nanos(180);
+    let hold = Duration::from_micros(3);
+
+    for threads in [8usize, 32] {
+        let mut group = c.benchmark_group(format!("write_handler_counters_{threads}t"));
+        group.throughput(Throughput::Elements((threads * PER_THREAD) as u64));
+
+        group.bench_function("global_lines", |b| {
+            let g = Arc::new(Global::default());
+            b.iter(|| {
+                let hs: Vec<_> = (0..threads)
+                    .map(|_| {
+                        let g = Arc::clone(&g);
+                        std::thread::spawn(move || {
+                            for _ in 0..PER_THREAD {
+                                g.wait.record(wait);
+                                g.wait_class.record(wait);
+                                g.hold.record(hold);
+                                g.block_wait.record(wait);
+                                g.depth.record(0);
+                                g.candidate.fetch_add(1, Ordering::Relaxed);
+                                g.scope.fetch_add(1, Ordering::Relaxed);
+                                g.patch_writes.fetch_add(1, Ordering::Relaxed);
+                                g.patch_bytes.fetch_add(4096, Ordering::Relaxed);
+                            }
+                        })
+                    })
+                    .collect();
+                for h in hs {
+                    h.join().unwrap();
+                }
+                black_box(g.patch_writes.load(Ordering::Relaxed))
+            });
+        });
+
+        group.bench_function("striped", |b| {
+            let s = Arc::new(Striped::default());
+            b.iter(|| {
+                let hs: Vec<_> = (0..threads)
+                    .map(|_| {
+                        let s = Arc::clone(&s);
+                        std::thread::spawn(move || {
+                            for _ in 0..PER_THREAD {
+                                s.wait.record(wait);
+                                s.wait_class.record(wait);
+                                s.hold.record(hold);
+                                s.block_wait.record(wait);
+                                s.depth.record(0);
+                                s.candidate.fetch_add(1, Ordering::Relaxed);
+                                s.scope.fetch_add(1, Ordering::Relaxed);
+                                s.patch_writes.fetch_add(1, Ordering::Relaxed);
+                                s.patch_bytes.fetch_add(4096, Ordering::Relaxed);
+                            }
+                        })
+                    })
+                    .collect();
+                for h in hs {
+                    h.join().unwrap();
+                }
+                black_box(s.patch_writes.load(Ordering::Relaxed))
+            });
+        });
+
+        group.finish();
+    }
+}
+
+/// W-6 — the END-TO-END kernel WRITE handler on the W1 patch shape (the
+/// `kernel_op_economy_tests` fixture verbatim: 512 KiB blocks, a
+/// striped file, warm 4 KiB overwrites at a fixed block offset — the
+/// random-small-write population's per-op cost through
+/// `Filesystem::write`, the in-process `rw_4k` CPU-per-op read). Two
+/// rows: one writer (the serial per-op cost) and eight writers on eight
+/// inos on a 4-worker runtime (the per-op cost under handler-lane
+/// concurrency — where the striped counters and the deleted allocations
+/// pay). File-backed volume: the device leg is a page-cache write, so
+/// the row is the DAEMON's per-op work, never a device number.
+fn bench_write_handler_e2e(c: &mut Criterion) {
+    use fuse3::raw::prelude::Filesystem;
+    use fuse3::raw::Request;
+    use squeezefs::block_allocator::BlockAllocator;
+    use squeezefs::cache::TieredCache;
+    use squeezefs::dlm::DlmClient;
+    use squeezefs::meta_backend::kv::backend::KvMetaBackend;
+    use squeezefs::meta_backend::kv::builder::{BuilderConfig, ImageBuilder};
+    use squeezefs::meta_backend::kv::node::DEFAULT_NODE_SIZE;
+    use squeezefs::meta_backend::RoutedMetaBackend;
+    use squeezefs::nvme_dev::NvmeBlockDev;
+    use squeezefs::routing::DataRouter;
+    use std::ffi::OsStr;
+    use std::sync::Arc;
+
+    const BS: u64 = 512 * 1024;
+    const WRITERS: usize = 8;
+
+    std::env::set_var("SQUEEZEFS_DEFAULT_BLOCK_SIZE", BS.to_string());
+    std::env::set_var("SQUEEZEFS_READ_PREFETCH_WINDOW", "0");
+    std::env::set_var("SQUEEZEFS_READ_RANGED_THRESHOLD", "0");
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(4)
+        .enable_all()
+        .build()
+        .expect("bench runtime");
+
+    let backing = tempfile::NamedTempFile::new().expect("backing");
+    backing
+        .as_file()
+        .set_len(256 * 1024 * 1024)
+        .expect("size backing");
+    let meta = tempfile::NamedTempFile::new().expect("meta");
+    meta.as_file()
+        .set_len(128 * 1024 * 1024)
+        .expect("size meta");
+    let staging = tempfile::tempdir().expect("staging");
+
+    let (fs, req) = rt.block_on(async {
+        let dlm = DlmClient::new().expect("dlm");
+        let nvme = Arc::new(NvmeBlockDev::new(
+            backing.path().to_str().expect("backing path"),
+        ));
+        let ba = Arc::new(
+            BlockAllocator::new("write_handler_e2e_bench")
+                .await
+                .expect("allocator"),
+        );
+        let cache = TieredCache::new(
+            vec![staging.path().to_path_buf()],
+            Some("64MB"),
+            Some("64MB"),
+            Some("128MB"),
+            Some("128MB"),
+            ba.clone(),
+            nvme.clone(),
+            None,
+        )
+        .await
+        .expect("cache");
+        let router = DataRouter::new(dlm.clone(), cache, ba, nvme);
+        let mut fs = squeezefs::fuse_client::SqueezefsFilesystem::new(router, dlm, 1000, 1000);
+        ImageBuilder::new(BuilderConfig {
+            node_size: DEFAULT_NODE_SIZE,
+            journal_len_override: None,
+            hash_seed: 0xC0FF_EE00_9911_2233,
+            uuid: *b"write-e2e-bench1",
+        })
+        .expect("image builder")
+        .build(meta.path(), 128 * 1024 * 1024)
+        .await
+        .expect("format");
+        let be = KvMetaBackend::open(meta.path()).await.expect("open meta");
+        let routed: Arc<RoutedMetaBackend> = Arc::new(RoutedMetaBackend::new(vec![be]));
+        fs.router.set_meta_backend(routed.clone());
+        fs.meta_backend = Some(routed);
+        let req = Request {
+            unique: 1,
+            uid: unsafe { libc::getuid() },
+            gid: unsafe { libc::getgid() },
+            pid: 1,
+            ..Default::default()
+        };
+        (Arc::new(fs), req)
+    });
+
+    // Striped fixtures: three full blocks each, fsync'd; then eight warm
+    // 4 KiB overwrites so the patch predicates are on their steady path.
+    let payload = bytes::Bytes::from(vec![0xC4u8; 4096]);
+    let inos: Vec<u64> = rt.block_on(async {
+        let mut inos = Vec::with_capacity(WRITERS);
+        for i in 0..WRITERS {
+            let ino = fs
+                .create(
+                    req,
+                    1,
+                    OsStr::new(&format!("w1_{i}.bin")),
+                    libc::S_IFREG | 0o644,
+                    0,
+                )
+                .await
+                .expect("create")
+                .attr
+                .ino;
+            for b in 0..3u64 {
+                fs.write(
+                    req,
+                    ino,
+                    0,
+                    b * BS,
+                    bytes::Bytes::from(vec![0x6Du8; BS as usize]),
+                    0,
+                    0,
+                )
+                .await
+                .expect("fixture write");
+            }
+            fs.fsync(req, ino, 0, false).await.expect("fsync");
+            for _ in 0..8 {
+                fs.write(req, ino, 0, 8192, payload.clone(), 0, 0)
+                    .await
+                    .expect("warm write");
+            }
+            inos.push(ino);
+        }
+        inos
+    });
+
+    let mut group = c.benchmark_group("write_handler_e2e");
+
+    group.throughput(Throughput::Elements(1));
+    group.bench_function("w1_patch_4k_serial", |b| {
+        let fs = Arc::clone(&fs);
+        let ino = inos[0];
+        let payload = payload.clone();
+        b.to_async(&rt).iter(|| {
+            let fs = Arc::clone(&fs);
+            let payload = payload.clone();
+            async move {
+                let w = fs
+                    .write(req, ino, 0, 8192, payload, 0, 0)
+                    .await
+                    .expect("write");
+                black_box(w.written)
+            }
+        });
+    });
+
+    group.throughput(Throughput::Elements(WRITERS as u64));
+    group.bench_function(format!("w1_patch_4k_{WRITERS}_writers"), |b| {
+        let fs = Arc::clone(&fs);
+        let inos = inos.clone();
+        let payload = payload.clone();
+        b.to_async(&rt).iter(|| {
+            let fs = Arc::clone(&fs);
+            let inos = inos.clone();
+            let payload = payload.clone();
+            async move {
+                let mut set = Vec::with_capacity(WRITERS);
+                for &ino in &inos {
+                    let fs = Arc::clone(&fs);
+                    let payload = payload.clone();
+                    set.push(tokio::spawn(async move {
+                        fs.write(req, ino, 0, 8192, payload, 0, 0)
+                            .await
+                            .expect("write")
+                            .written
+                    }));
+                }
+                for h in set {
+                    black_box(h.await.expect("join"));
+                }
+            }
+        });
+    });
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
+    bench_write_handler_counters,
+    bench_write_handler_e2e,
     bench_writer_scope,
     bench_ro_gate,
     bench_free_grace_gate,

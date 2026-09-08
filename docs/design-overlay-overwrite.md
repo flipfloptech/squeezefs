@@ -778,6 +778,30 @@ block_size` only when app coverage completed the block, else 0 — the
 generic/795 size-never-leads-data floor, verbatim from the fresh arm
 (`:13457-13464`).
 
+**The seed-bytes law (W-6, e2e perf audit write board #10, 2026-09-08 —
+`.benchmarks/2026-09-08-w6-write-handler-economy.md`).** "One pooled read
+per gap run" above described the seed WRITES; the seed's SOURCE was one
+whole-image read of `old_binding` per settle whatever the gaps summed to
+— a 4 MiB block with one 64 KiB hole read 4 MiB to seed 64 KiB, and
+`overlay_gap_seed_old_bytes` (seeded bytes) never showed it. The law now
+in force: on a passthrough volume with an UNDECORATED old binding, the K
+bytes a gap needs are sourced by ONE ranged device read of exactly K
+bytes (`DataRouter::read_nvme_block_old_image_range` over the read
+path's `read_block_range`; gaps are OVERLAY_PAGE-aligned, so the window
+is already LBA-aligned), with the whole funnel's short-read tolerance (a
+tail past the backing is holes ⇒ zeros). The whole-image read survives
+exactly where it is cheaper (Σ gaps at or past the block window) or the
+only correct form (a decorated `bk:off:len` binding, whose short-image
+prefix discipline the whole funnel owns; transformed volumes never reach
+the overlay by the §5.1 shape screen, and the eligibility probe's
+passthrough clause is the belt). `SQUEEZEFS_GAP_SEED_RANGED=0` is the A/B
+control (the whole read, byte-identical seeds). Instruments:
+`overlay_gap_seed_read_bytes` — device bytes READ per seed, the
+amplification numerator (= the block window per old-sourced settle on
+the control arm) — and `overlay_gap_seed_ranged_bytes` ⊆
+`overlay_gap_seed_old_bytes`, the lever's engagement. Contracts:
+`tests/overlay_gap_seed_ranged_tests.rs`.
+
 ### 5.9 Sequence (the common case: 4 MiB aligned overwrite, ACK-early)
 
 ```mermaid
@@ -929,6 +953,7 @@ family (`src/fuse_client.rs:5854+`):
 | `overlay_overwrite_installs` / `overlay_overwrite_bytes` | the B4 engagement face. **`overlay_overwrite_bytes` counts at the store CQE** — it is the overwrite-arm SUBSET of `overlay_store_bytes` (which is counted exactly once per landed segment on both the inline and ACK-early arms, `src/fuse_client.rs:13120-13122/:13280-13282/:13364-13367`), so the closure equation is well-formed: on the governing row `overlay_store_bytes ≈ user bytes` (= overwrite subset + fresh-arm subset — the 96.6 % collapse instrument). `overlay_ack_early_bytes` is **not** a term of the closure (an ACK-early store increments it at ACK AND `overlay_store_bytes` at CQE — summing them double-counts); it is the separate ACK-early-share check, `overlay_ack_early_bytes ≈ overlay_store_bytes` on an ACK-early-armed row |
 | `overlay_epoch_feeds` / `overlay_feed_fallbacks` | arm (a) vs the shadow-off degenerate; `fallbacks > 0` with the lever ON is a bug |
 | `overlay_gap_seed_old_bytes` | the §5.8 falsifier instrument (subset of `overlay_gap_seed_bytes`); ≈ 0 on sequential shapes |
+| `overlay_gap_seed_read_bytes` / `overlay_gap_seed_ranged_bytes` | the §5.8 seed-bytes law (W-6): device bytes READ to source gap seeds (the amplification numerator — `read ÷ old` ≈ 1 with the ranged seed engaged, = block window ÷ Σ gaps on the `SQUEEZEFS_GAP_SEED_RANGED=0` control) / the old-sourced seed bytes that rode the ranged funnel (⊆ `overlay_gap_seed_old_bytes`; 0 with the lever off, on decorated bindings and where Σ gaps ≥ the window) |
 | `overlay_ineligible_shadow_bound`, `overlay_enospc_declines` | the two new decline ledgers (§5.1) |
 | `overlay_ineligible_range_shared` | the S11 rung-16 range clause (§5.1) — the W1 clause-7 twin, kept apart from `patch_ineligible_range_shared` and from `overlay_ineligible_shadow_bound` (the ledgers must not merge). **0 on every shipped mount** (whole-file leases ARE whole-inode custody; no verb issues ranges without the mw arm) and **0 on block-aligned ranged rows** (`design-full-multi-writer.md` §9.5's MPI-IO gate: nothing should share a block) — growth means range custody engaged on sub-block-shared blocks (rung 17's demotion territory) or the predicate rotted |
 | `overlay_ineligible_sub_cap` | the §5.1 **length floor** (finding 47): aligned single-block passthrough segments every other shape conjunct admitted but whose length is ≤ the W1 cap (`patch_max_bytes()`, block_size/8) — sent down the W1/W2 ladder instead, BOTH shapes. Grows ≈ per sub-cap aligned write on overlay-armed mounts by design; `overlay_gap_seed_old_bytes` growing on a rand-4k row while this stays flat is the predicate rotting. 0 under `SQUEEZEFS_PATCH_MAX_BYTES=0` (cap 0 empties the sub-cap class) |

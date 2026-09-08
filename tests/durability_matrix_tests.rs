@@ -354,16 +354,28 @@ async fn acked_bytes_survive_a_data_device_power_cut(#[case] row: Row, #[case] u
     // which is their whole claim.
     let writes = dev_power_cut::next_write_seq(&h.dev_path);
     let epoch = dev_power_cut::barrier_epoch(&h.dev_path);
-    assert!(epoch >= 1, "{row:?}: fsync issued no data-device barrier");
     match row {
-        Row::Inline | Row::Staged => assert_eq!(
-            writes, 0,
-            "{row:?}: this layout must never put payload on the data device"
-        ),
-        _ => assert!(
-            writes > 0,
-            "{row:?}: no device write was journaled — the row is vacuous"
-        ),
+        // W-5 (touched-namespace fsync): a layout that never put payload
+        // on the data device has nothing there to barrier — the fsync
+        // requests NO device Fsync for it (the shipped shape barriered
+        // every namespace regardless).
+        Row::Inline | Row::Staged => {
+            assert_eq!(
+                writes, 0,
+                "{row:?}: this layout must never put payload on the data device"
+            );
+            assert_eq!(
+                epoch, 0,
+                "{row:?}: fsync barriered a data device this layout never wrote"
+            );
+        }
+        _ => {
+            assert!(
+                writes > 0,
+                "{row:?}: no device write was journaled — the row is vacuous"
+            );
+            assert!(epoch >= 1, "{row:?}: fsync issued no data-device barrier");
+        }
     }
 
     // Everything acked before the fsync is covered by its barrier.

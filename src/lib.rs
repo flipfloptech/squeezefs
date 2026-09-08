@@ -136,6 +136,9 @@ pub mod extent_ship;
 pub mod fleet_worker;
 pub mod free_grace;
 pub mod fsck;
+// W-5 (e2e perf audit row 15): the fsync ladder's instrument, the
+// touched-namespace table and the barrier plan.
+pub mod fsync_economy;
 pub mod fuse_client;
 pub(crate) mod gauge_core;
 // DLM S11's byte-range custody core (spec §6.9's fourth named loom

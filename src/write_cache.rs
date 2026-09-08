@@ -66,6 +66,27 @@ impl WriteCacheClass {
     pub fn is_volatile(&self) -> bool {
         !matches!(self, WriteCacheClass::WriteThrough)
     }
+
+    /// Dense code for an atomic cell (`from_u8` inverts it; anything
+    /// out of range reads `Unknown` — never a guess toward power-safe).
+    pub fn as_u8(&self) -> u8 {
+        match self {
+            WriteCacheClass::WriteBack => 0,
+            WriteCacheClass::WriteThrough => 1,
+            WriteCacheClass::FileBacked => 2,
+            WriteCacheClass::Unknown => 3,
+        }
+    }
+
+    /// Inverse of [`Self::as_u8`].
+    pub fn from_u8(code: u8) -> Self {
+        match code {
+            0 => WriteCacheClass::WriteBack,
+            1 => WriteCacheClass::WriteThrough,
+            2 => WriteCacheClass::FileBacked,
+            _ => WriteCacheClass::Unknown,
+        }
+    }
 }
 
 impl std::fmt::Display for WriteCacheClass {
@@ -151,5 +172,19 @@ mod tests {
         assert!(WriteCacheClass::FileBacked.is_volatile());
         assert!(WriteCacheClass::Unknown.is_volatile());
         assert!(!WriteCacheClass::WriteThrough.is_volatile());
+    }
+
+    #[test]
+    fn u8_codec_round_trips_and_out_of_range_is_unknown() {
+        for c in [
+            WriteCacheClass::WriteBack,
+            WriteCacheClass::WriteThrough,
+            WriteCacheClass::FileBacked,
+            WriteCacheClass::Unknown,
+        ] {
+            assert_eq!(WriteCacheClass::from_u8(c.as_u8()), c);
+        }
+        assert_eq!(WriteCacheClass::from_u8(200), WriteCacheClass::Unknown);
+        assert!(WriteCacheClass::from_u8(200).is_volatile());
     }
 }

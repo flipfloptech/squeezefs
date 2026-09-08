@@ -7209,6 +7209,32 @@ pub struct Metrics {
     /// that collapses to 1.0 under concurrent fsync load means the
     /// coalescer stopped coalescing.
     pub data_device_sync_requests: Align64<AtomicU64>,
+    // ---- W-5 fsync economy (e2e perf audit row 15; the phase family
+    // is `fsync_phase_ns`, `crate::fsync_economy`). ----
+    /// FUSE `fsync` handler invocations on real inodes.
+    pub fsync_calls: Align64<AtomicU64>,
+    /// fsyncs whose data legs found nothing to barrier — no staged
+    /// payload, no namespace touched since the last covering barrier —
+    /// so no data-device barrier was requested (the meta barrier still
+    /// runs). 0 by construction with the touched-namespace lever off.
+    pub fsync_noop_clean: Align64<AtomicU64>,
+    /// Σ per fsync of the data namespaces the ino touched (write-through
+    /// ones included). Against `fsync_data_namespaces_flushed` and the
+    /// mount's namespace count (`data_volume_write_cache`) it is the
+    /// measured "flushes ALL namespaces" ratio.
+    pub fsync_data_namespaces_touched: Align64<AtomicU64>,
+    /// Σ per fsync of the device barriers the step requested.
+    pub fsync_data_namespaces_flushed: Align64<AtomicU64>,
+    /// Touched namespaces skipped because the device's write cache is
+    /// write-through (acknowledged writes are power-safe on completion).
+    pub fsync_write_through_skips: Align64<AtomicU64>,
+    /// Stamps that resolved to NO listed device (an unknown backend or a
+    /// device past the table's ordinal capacity) and fell back to the
+    /// ALL bit — every namespace barriers for that ino. Should stay 0.
+    pub fsync_touched_unresolved: Align64<AtomicU64>,
+    /// Barrier steps that joined ≥ 2 legs concurrently — the
+    /// parallel-legs lever's engagement.
+    pub fsync_parallel_joins: Align64<AtomicU64>,
     /// Histograms for lock wait times and queue depths.
     pub write_lock_wait: ShardedLatencyHistogram,
     // ---- Write lock-scope CANDIDATE ledger (design-write-inode-convoy
@@ -12324,6 +12350,18 @@ impl SqueezefsFilesystem {
                 "data_volume_write_cache": self.router.backend_router.data_volume_write_caches(),
                 "data_device_syncs": METRICS.data_device_syncs.load(Ordering::Relaxed),
                 "data_device_sync_requests": METRICS.data_device_sync_requests.load(Ordering::Relaxed),
+                // W-5 fsync economy: the ladder's exact-sum decomposition
+                // and the touched-namespace ledger (`fsync_data_namespaces_
+                // flushed ÷ touched ÷ calls` against the namespace count
+                // above is the measured "flushes ALL namespaces" ratio).
+                "fsync_phase_ns": crate::fsync_economy::fsync_phase_json(),
+                "fsync_calls": METRICS.fsync_calls.load(Ordering::Relaxed),
+                "fsync_noop_clean": METRICS.fsync_noop_clean.load(Ordering::Relaxed),
+                "fsync_data_namespaces_touched": METRICS.fsync_data_namespaces_touched.load(Ordering::Relaxed),
+                "fsync_data_namespaces_flushed": METRICS.fsync_data_namespaces_flushed.load(Ordering::Relaxed),
+                "fsync_write_through_skips": METRICS.fsync_write_through_skips.load(Ordering::Relaxed),
+                "fsync_touched_unresolved": METRICS.fsync_touched_unresolved.load(Ordering::Relaxed),
+                "fsync_parallel_joins": METRICS.fsync_parallel_joins.load(Ordering::Relaxed),
                 // Constant "3" per volume (v3 is the only metadata
                 // format); kept as a field because operators key on it.
                 "meta_format_version": self
@@ -16185,6 +16223,13 @@ impl SqueezefsFilesystem {
 
         match dma {
             Ok(()) => {
+                // W-5: an in-place DMA changes no block-map key, so the
+                // publish-path stamp never sees it — stamp the namespace
+                // here (after the DMA completed) or the next fsync would
+                // skip its barrier.
+                self.router
+                    .backend_router
+                    .note_fsync_touched_device(ino, &device);
                 METRICS.patch_writes.fetch_add(1, Ordering::Relaxed);
                 METRICS
                     .patch_write_bytes
@@ -19908,6 +19953,12 @@ impl SqueezefsFilesystem {
         allocator.publish_block(dev_offset);
         self.router.cache.purge_block_key(&mapping);
         dma?;
+        // W-5: the same-key merge below changes no map key, so the
+        // publish-path stamp cannot see this DMA — stamp the namespace
+        // here for the ino's next fsync barrier.
+        self.router
+            .backend_router
+            .note_fsync_touched_device(ino, &device);
         // Same-key merge (no displacement — the merge skips equal keys):
         // the size floor and layout coherence ride the §5.3 one-merge
         // discipline exactly like the CoW arm. A merge failure after the
@@ -20455,10 +20506,41 @@ impl SqueezefsFilesystem {
 
     /// Public flush of staged active blocks + dirty layout for an inode.
     /// Propagates I/O errors so callers (fsync, tests) can fail the durable op.
+    /// Runs the ladder under its own `fsync_phase_ns` clock (the handler
+    /// passes its own through `flush_inode_to_backend_prof`).
     pub async fn flush_inode_to_backend(
         &self,
         ino: u64,
         fencing_token: u64,
+    ) -> Result<(), SqueezefsError> {
+        let mut prof = crate::fsync_economy::FsyncProf::begin();
+        self.flush_inode_to_backend_prof(ino, fencing_token, &mut prof)
+            .await
+    }
+
+    /// The fsync ladder proper — `data_flush` → `data_barrier` →
+    /// `meta_publish` → `meta_barrier` on the caller's phase clock.
+    ///
+    /// **W-5 (e2e perf audit row 15)**: the barrier step barriers only the
+    /// data namespaces this ino's bytes landed on since its last covering
+    /// barrier (`fsync_economy::TouchedTable`, stamped at every layout
+    /// publish and at the two in-place DMA shapes), skips write-through
+    /// namespaces (acknowledged writes are power-safe on completion —
+    /// DUR-2's own classification), and issues the staged-payload sync
+    /// and the per-namespace device Fsyncs CONCURRENTLY, awaiting every
+    /// leg to completion (never cancelling a sibling: a dropped barrier
+    /// future would fail the coalescer's queued waiters on that device).
+    /// Both levers default on; `SQUEEZEFS_FSYNC_TOUCHED_NAMESPACES=0` /
+    /// `SQUEEZEFS_FSYNC_PARALLEL_LEGS=0` restore the shipped serialized
+    /// all-namespace shape. The DUR-1 law is untouched: the WHOLE barrier
+    /// step completes — every leg Ok — strictly before the meta legs that
+    /// name the blocks, and a failed leg fails the fsync with the touched
+    /// bits left set for the retry.
+    pub(crate) async fn flush_inode_to_backend_prof(
+        &self,
+        ino: u64,
+        fencing_token: u64,
+        prof: &mut crate::fsync_economy::FsyncProf,
     ) -> Result<(), SqueezefsError> {
         // Device-overlay §6.2: freeze → complete → seed zeros → data
         // barrier → publish, per open overlay on this ino, BEFORE the
@@ -20486,6 +20568,7 @@ impl SqueezefsFilesystem {
             .metadata_cache
             .get(&ino)
             .and_then(|m| m.file_id.clone());
+        prof.mark(crate::fsync_economy::FsyncPhase::DataFlush);
 
         // DUR-1 ORDERING (pre-RC spec §1): the data barrier completes
         // STRICTLY BEFORE the metadata barrier that names its blocks.
@@ -20499,17 +20582,70 @@ impl SqueezefsFilesystem {
 
         // 1. Data plane. Staged-layout payloads (`file_id`) live in the
         //    staging segment; striped/patched blocks live on the data
-        //    device(s) and need the DUR-2 barrier.
-        if let Some(file_id) = file_id_opt {
-            let key_bytes = bytes::Bytes::copy_from_slice(file_id.as_bytes());
-            self.router
-                .cache
-                .nvme
-                .staging_nvme_cache
-                .sync_key(&key_bytes)
-                .await?;
+        //    device(s) and need the DUR-2 barrier — W-5: on the touched
+        //    namespaces only, the legs joined. The table word is observed
+        //    HERE, after every DMA this fsync owns has completed and
+        //    published (the flush above), and strictly before any barrier
+        //    starts; it is cleared only once every leg succeeded, and the
+        //    clear fails harmlessly if a stamp landed meanwhile.
+        let touched_lever = crate::fsync_economy::touched_namespaces_enabled();
+        let step = self
+            .router
+            .backend_router
+            .fsync_barrier_step(ino, touched_lever);
+        METRICS
+            .fsync_data_namespaces_touched
+            .fetch_add(step.plan.touched as u64, Ordering::Relaxed);
+        METRICS
+            .fsync_data_namespaces_flushed
+            .fetch_add(step.targets.len() as u64, Ordering::Relaxed);
+        METRICS
+            .fsync_write_through_skips
+            .fetch_add(step.plan.write_through_skips as u64, Ordering::Relaxed);
+        let staging_key =
+            file_id_opt.map(|file_id| bytes::Bytes::copy_from_slice(file_id.as_bytes()));
+        let legs = usize::from(staging_key.is_some()) + step.targets.len();
+        if legs == 0 && step.plan.touched == 0 {
+            METRICS.fsync_noop_clean.fetch_add(1, Ordering::Relaxed);
         }
-        self.router.backend_router.flush_data_devices().await?;
+        let staging = &self.router.cache.nvme.staging_nvme_cache;
+        let barrier_out: Result<(), SqueezefsError> =
+            if legs >= 2 && crate::fsync_economy::parallel_legs_enabled() {
+                METRICS.fsync_parallel_joins.fetch_add(1, Ordering::Relaxed);
+                type Leg<'a> = std::pin::Pin<
+                    Box<dyn std::future::Future<Output = Result<(), SqueezefsError>> + Send + 'a>,
+                >;
+                let mut futs: Vec<Leg<'_>> = Vec::with_capacity(legs);
+                if let Some(key) = staging_key.as_ref() {
+                    futs.push(Box::pin(staging.sync_key(key)));
+                }
+                for dev in &step.targets {
+                    futs.push(Box::pin(dev.flush()));
+                }
+                // Every leg runs to completion; the first error wins.
+                futures::future::join_all(futs)
+                    .await
+                    .into_iter()
+                    .find(Result::is_err)
+                    .unwrap_or(Ok(()))
+            } else {
+                let mut out = Ok(());
+                if let Some(key) = staging_key.as_ref() {
+                    out = staging.sync_key(key).await;
+                }
+                for dev in &step.targets {
+                    if out.is_err() {
+                        break;
+                    }
+                    out = dev.flush().await;
+                }
+                out
+            };
+        barrier_out?;
+        self.router
+            .backend_router
+            .fsync_barrier_done(ino, step.observed);
+        prof.mark(crate::fsync_economy::FsyncPhase::DataBarrier);
 
         // 2. Metadata plane, only once the data it names is durable.
         //    Idea 1 (KD-1.6): fsync/flush is a swap trigger — the epoch
@@ -20520,9 +20656,11 @@ impl SqueezefsFilesystem {
         self.router
             .persist_dirty_layout_if_needed(&crate::keys::inode_path(ino), fencing_token)
             .await?;
+        prof.mark(crate::fsync_economy::FsyncPhase::MetaPublish);
         if let Some(backend) = self.meta_backend.as_ref() {
             backend.sync_device_for_ino(ino).await?;
         }
+        prof.mark(crate::fsync_economy::FsyncPhase::MetaBarrier);
         Ok(())
     }
 
@@ -26766,20 +26904,31 @@ impl Filesystem for SqueezefsFilesystem {
         // `fsync` is the contract point for "did everything land?", and
         // the failure it names happened before this call (a backgrounded
         // RELEASE flush). Consumed here, so the next fsync is clean.
+        METRICS.fsync_calls.fetch_add(1, Ordering::Relaxed);
         if let Some(errno) = self.take_writeback_error(ino) {
             error!("FUSE Fsync: reporting latched writeback error for ino {ino}: {errno}");
             return Err(Errno::from(errno));
         }
 
+        // W-5: the ladder's phase clock (`fsync_phase_ns`, exact-sum —
+        // recorded on drop, every exit).
+        let mut fprof = crate::fsync_economy::FsyncProf::begin();
+
         // Rung 13 (KD-MW-13): fsync of a PENDING intent-minted file forces
         // the intent flush first (the file's existence must be durable for
         // its data durability to mean anything); a DESTROYED mint answers
         // the owner's latched errno (the §8.2 child poison). One relaxed
-        // load on every mount without pending intents.
+        // load on every mount without pending intents. Deliberately
+        // SEQUENTIAL and first (W-5): its errno short-circuits the whole
+        // op, and overlapping it would buy only the DMA leg of a
+        // co-writer's rare intent-pending fsync — the layout publish
+        // inside the flush barriers the same lane anyway
+        // (`publish::intent_barrier_inos`).
         if let Err(errno) = crate::meta_ship::intents::fsync_ino_barrier(ino).await {
             error!("FUSE Fsync: intent barrier for ino {ino} reports errno {errno}");
             return Err(Errno::from(errno));
         }
+        fprof.mark(crate::fsync_economy::FsyncPhase::IntentBarrier);
 
         // P0-3: durable ops must not mask backend write failures.
         let prof = OpProf::begin(FuseOpKind::Fsync, ino);
@@ -26804,24 +26953,59 @@ impl Filesystem for SqueezefsFilesystem {
         // unit keeps its bytes in staging and is retried forever, so a
         // sticky per-ino poison map would report errors for data that is
         // safe — and did: the multi-volume bench-suite EIO cascade).
-        if let Err(e) = self.flush_inode_to_backend(ino, fencing_token).await {
-            error!("FUSE Fsync failed for ino {}: {:?}", ino, e);
-            return Err(map_squeezefs_err(e));
-        }
+        //
         // Rung 17 (§9.3's retention law): a sub-block writer's fsync
         // CHAINS through the AUTHORITY's publish barrier for every
         // retained extent — the synchronous FlushExtents force, whose
         // reply's covering version releases the retention (release path
         // 3). One relaxed load on every mount with no retention, which
-        // is every shipped mount by construction.
-        if crate::extent_ship::any_retained() && crate::extent_ship::retained_count(ino) > 0 {
-            if let Some(backend) = self.meta_backend.as_ref() {
-                if let Err(e) = crate::extent_ship::flush_ino(backend, ino).await {
-                    error!("FUSE Fsync: FlushExtents barrier for ino {ino} failed: {e:?}");
-                    return Err(map_squeezefs_err(e));
-                }
+        // is every shipped mount by construction. W-5: the force is
+        // independent of the local ladder (the extents' bytes are at the
+        // authority; the local flush DMAs this mount's own blocks), so
+        // with the parallel lever it OVERLAPS the local ladder — both legs
+        // run to completion, the local outcome is answered first (the
+        // shipped precedence) — and `extent_barrier` reads the residual
+        // wait past the local ladder.
+        let extent_backend =
+            if crate::extent_ship::any_retained() && crate::extent_ship::retained_count(ino) > 0 {
+                self.meta_backend.as_ref()
+            } else {
+                None
+            };
+        let (local, extents) = match extent_backend {
+            Some(backend) if crate::fsync_economy::parallel_legs_enabled() => {
+                let (local, extents) = futures::join!(
+                    self.flush_inode_to_backend_prof(ino, fencing_token, &mut fprof),
+                    crate::extent_ship::flush_ino(backend, ino)
+                );
+                (local, Some(extents))
             }
+            Some(backend) => {
+                let local = self
+                    .flush_inode_to_backend_prof(ino, fencing_token, &mut fprof)
+                    .await;
+                let extents = if local.is_ok() {
+                    Some(crate::extent_ship::flush_ino(backend, ino).await)
+                } else {
+                    None
+                };
+                (local, extents)
+            }
+            None => (
+                self.flush_inode_to_backend_prof(ino, fencing_token, &mut fprof)
+                    .await,
+                None,
+            ),
+        };
+        if let Err(e) = local {
+            error!("FUSE Fsync failed for ino {}: {:?}", ino, e);
+            return Err(map_squeezefs_err(e));
         }
+        if let Some(Err(e)) = extents {
+            error!("FUSE Fsync: FlushExtents barrier for ino {ino} failed: {e:?}");
+            return Err(map_squeezefs_err(e));
+        }
+        fprof.mark(crate::fsync_economy::FsyncPhase::ExtentBarrier);
         prof.mark_backend_done();
 
         Ok(())

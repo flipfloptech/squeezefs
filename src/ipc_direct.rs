@@ -2144,6 +2144,13 @@ impl DirectDriveEngine {
         // when the queue empties or the tenure hits its bound).
         let train_key = (snap.ino, snap.block);
         if exact {
+            // W-5: an in-place DMA changes no block-map key — stamp the
+            // namespace for the ino's next fsync barrier (the publish
+            // path's stamp never sees this write).
+            self.fs
+                .router
+                .backend_router
+                .note_fsync_touched_keys(snap.ino, std::iter::once(snap.key.as_str()));
             // A direct write IS a patch write (the W1 ledger) + the
             // lane's own engagement instruments + the charter-rule-4
             // data-plane accounting.

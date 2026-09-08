@@ -88,6 +88,11 @@ struct DevJournal {
     /// `uring_fs::arm_barrier_error`. Writes and reads proceed untouched,
     /// exactly like a device that accepts I/O and rejects the flush.
     barrier_error: Option<i32>,
+    /// Armed barrier latency: every flush on this device completes no
+    /// earlier than this after it was issued (a SLOW device, never a
+    /// parked one — the `uring_fs::arm_device_latency` shape for the
+    /// data plane). The W-5 parallel-legs contract's clock.
+    barrier_latency: Option<std::time::Duration>,
     /// Still-volatile writes, in admission order.
     entries: Vec<Entry>,
     /// Sequence of the next journaled write.
@@ -215,6 +220,32 @@ pub fn disarm_barrier_error(device_path: impl AsRef<Path>) {
     if let Some(j) = STATE.lock().unwrap().get_mut(device_path.as_ref()) {
         j.barrier_error = None;
     }
+}
+
+/// Arm a barrier latency on `device_path`: every data-device flush takes
+/// at least `latency` (writes untouched). Arms tracking too, so the
+/// device's barrier epoch counts. Cleared by [`clear_faults`] /
+/// [`clear_faults_for`].
+pub fn arm_barrier_latency(device_path: impl AsRef<Path>, latency: std::time::Duration) {
+    let mut st = STATE.lock().unwrap();
+    st.entry(device_path.as_ref().to_path_buf())
+        .or_default()
+        .barrier_latency = Some(latency);
+    ARMED.store(true, Ordering::Relaxed);
+}
+
+/// The armed barrier latency for `device_path`, if any — consulted by
+/// [`crate::nvme_dev::NvmeBlockDev::flush`] before it submits.
+#[inline]
+pub(crate) fn barrier_latency(device_path: &str) -> Option<std::time::Duration> {
+    if !ARMED.load(Ordering::Relaxed) {
+        return None;
+    }
+    STATE
+        .lock()
+        .unwrap()
+        .get(Path::new(device_path))
+        .and_then(|j| j.barrier_latency)
 }
 
 /// The armed barrier errno for `device_path`, if any — consulted by

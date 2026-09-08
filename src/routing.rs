@@ -1176,6 +1176,20 @@ pub(crate) enum ShadowRecordOutcome {
     },
 }
 
+/// W-5: one fsync's planned data-barrier step (see
+/// [`BackendRouter::fsync_barrier_step`]).
+pub(crate) struct FsyncBarrierStep {
+    /// The touched-table word as observed before the barriers started —
+    /// the CAS witness for the post-success clear.
+    pub observed: u64,
+    /// The devices to barrier (touched, volatile — or every device when
+    /// the lever is off / the plan fell back to ALL).
+    pub targets: Vec<std::sync::Arc<crate::nvme_dev::NvmeBlockDev>>,
+    /// The plan's counters (`fsync_data_namespaces_touched`,
+    /// `fsync_write_through_skips`).
+    pub plan: crate::fsync_economy::BarrierPlan,
+}
+
 #[derive(Clone)]
 pub struct BackendRouter {
     pub default_allocator: std::sync::Arc<crate::block_allocator::BlockAllocator>,
@@ -1246,6 +1260,9 @@ pub struct BackendRouter {
     /// D11 window opens — in which case the gate belongs in the caller
     /// (hoisted per publish batch), not on the per-key path.
     incarnation_era: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// W-5: the next fsync touched-namespace ordinal to hand a distinct
+    /// data device (`fsync_economy::TouchedTable`); shared across clones.
+    fsync_ordinals: std::sync::Arc<std::sync::atomic::AtomicU32>,
 }
 
 #[cold]
@@ -1746,11 +1763,109 @@ impl BackendRouter {
             reclaim,
             debt,
             incarnation_era: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            fsync_ordinals: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
         };
+        router.assign_fsync_ordinal(&router.default_device);
         // Seed the table so bare routers place without waiting for a
         // worker tick (construction-time probe, never per-write).
         router.refresh_placement_table();
         router
+    }
+
+    /// W-5: give `dev` its bit in the fsync touched-namespace table. A
+    /// device already carrying one keeps it; a SECOND `NvmeBlockDev` on a
+    /// path this router already lists (the default-slot alias built from
+    /// the same record) shares the listed device's ordinal, so its stamps
+    /// land on the bit the barrier plan resolves; past the table's
+    /// capacity the device stays unassigned and its stamps set ALL
+    /// (`fsync_touched_unresolved` counts them).
+    fn assign_fsync_ordinal(&self, dev: &std::sync::Arc<crate::nvme_dev::NvmeBlockDev>) {
+        if dev.fsync_ordinal().is_some() {
+            return;
+        }
+        let same_path = self
+            .distinct_data_devices()
+            .into_iter()
+            .find(|d| d.device_path == dev.device_path)
+            .and_then(|d| d.fsync_ordinal());
+        if let Some(n) = same_path {
+            dev.set_fsync_ordinal(n);
+            return;
+        }
+        let n = self
+            .fsync_ordinals
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        if n <= crate::fsync_economy::TouchedTable::MAX_ORDINAL {
+            dev.set_fsync_ordinal(n);
+        }
+    }
+
+    /// W-5: the touched-namespace bit a block key stamps — its backend's
+    /// device ordinal, or the ALL bit (counted) when the key names no
+    /// device this router lists.
+    fn fsync_touched_bit_for_key(&self, key: &str) -> u64 {
+        let cleaned = clean_block_key(key);
+        let ordinal = self.split_block_key(&cleaned).ok().and_then(|(be_id, _)| {
+            if be_id == "backend_0" {
+                self.default_device.fsync_ordinal()
+            } else {
+                self.backends
+                    .get(be_id)
+                    .and_then(|be| be.device.fsync_ordinal())
+            }
+        });
+        let bit = crate::fsync_economy::TouchedTable::bit_for_ordinal(ordinal);
+        if bit == crate::fsync_economy::ALL_BIT {
+            METRICS
+                .fsync_touched_unresolved
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        bit
+    }
+
+    /// W-5: record that `ino`'s bytes landed under `key`'s device (the
+    /// layout-publish stamp — every `(index, key, taken)` change of a
+    /// block map passes `DataRouter::block_ref_ops`, which calls this once
+    /// per batch with the OR of its keys' bits).
+    pub(crate) fn note_fsync_touched_keys<'a>(
+        &self,
+        ino: u64,
+        taken_keys: impl Iterator<Item = &'a str>,
+    ) {
+        let mut bits = 0u64;
+        let mut last: Option<(&str, u64)> = None;
+        for key in taken_keys {
+            // Consecutive keys of one batch almost always share a backend
+            // prefix: resolve once per run.
+            let prefix = key.split_once("://").map(|(be, _)| be).unwrap_or("");
+            let bit = match last {
+                Some((p, b)) if p == prefix => b,
+                _ => {
+                    let b = self.fsync_touched_bit_for_key(key);
+                    last = Some((prefix, b));
+                    b
+                }
+            };
+            bits |= bit;
+        }
+        crate::fsync_economy::touched_table().stamp(ino, bits);
+    }
+
+    /// W-5: record that `ino`'s bytes were DMA'd to `dev` — the stamp for
+    /// the shapes that change no block-map key (the W1 sole-owner patch,
+    /// the in-place full-block overwrite).
+    pub fn note_fsync_touched_device(
+        &self,
+        ino: u64,
+        dev: &std::sync::Arc<crate::nvme_dev::NvmeBlockDev>,
+    ) {
+        let bit = crate::fsync_economy::TouchedTable::bit_for_ordinal(dev.fsync_ordinal());
+        if bit == crate::fsync_economy::ALL_BIT {
+            METRICS
+                .fsync_touched_unresolved
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        crate::fsync_economy::touched_table().stamp(ino, bit);
     }
 
     /// Wire an allocator's ENOSPC pressure valve to this router's reclaim
@@ -2104,7 +2219,9 @@ impl BackendRouter {
     /// Every distinct data device this router can write to (the default
     /// device plus every registered backend, deduped by device path).
     /// The DUR-2 barrier fan-out and the write-cache gauge share it.
-    fn distinct_data_devices(&self) -> Vec<std::sync::Arc<crate::nvme_dev::NvmeBlockDev>> {
+    pub(crate) fn distinct_data_devices(
+        &self,
+    ) -> Vec<std::sync::Arc<crate::nvme_dev::NvmeBlockDev>> {
         let mut out = vec![self.default_device.clone()];
         for entry in self.backends.iter() {
             let dev = &entry.value().device;
@@ -2208,6 +2325,38 @@ impl BackendRouter {
         Ok(())
     }
 
+    /// W-5: plan one fsync's data-barrier step for `ino` — observe the
+    /// touched-namespace word (BEFORE any barrier starts) and resolve it
+    /// against the listed devices. `touched_lever` off = the shipped
+    /// shape: every device, write-through ones included.
+    pub(crate) fn fsync_barrier_step(&self, ino: u64, touched_lever: bool) -> FsyncBarrierStep {
+        let devices = self.distinct_data_devices();
+        let observed = crate::fsync_economy::touched_table().observe(ino);
+        let bits = if touched_lever {
+            crate::fsync_economy::TouchedTable::bits(observed)
+        } else {
+            crate::fsync_economy::ALL_BIT
+        };
+        let ordinals: Vec<Option<u32>> = devices.iter().map(|d| d.fsync_ordinal()).collect();
+        let volatile: Vec<bool> = devices
+            .iter()
+            .map(|d| !touched_lever || d.write_cache().is_volatile())
+            .collect();
+        let plan = crate::fsync_economy::plan_barriers(bits, &ordinals, &volatile);
+        let targets = plan.targets.iter().map(|&i| devices[i].clone()).collect();
+        FsyncBarrierStep {
+            observed,
+            targets,
+            plan,
+        }
+    }
+
+    /// W-5: every leg of the planned step succeeded — clear the observed
+    /// bits (a stamp that landed since the observation keeps them).
+    pub(crate) fn fsync_barrier_done(&self, ino: u64, observed: u64) {
+        crate::fsync_economy::touched_table().clear_observed(ino, observed);
+    }
+
     /// Insert a built backend into the routing set under its durable id:
     /// write placement, key resolution, and health-worker coverage start
     /// here. Duplicate ids and the reserved `backend_0` alias refuse.
@@ -2218,6 +2367,11 @@ impl BackendRouter {
                     .to_string(),
             ));
         }
+        // W-5: the device's touched-namespace bit, BEFORE the backend is
+        // visible to any writer (a stamp must never find an unassigned
+        // device on a listed backend) — and OUTSIDE the entry guard below
+        // (the assignment walks `backends`, which the guard write-locks).
+        self.assign_fsync_ordinal(&backend.device);
         match self.backends.entry(id.to_string()) {
             dashmap::mapref::entry::Entry::Occupied(_) => Err(SqueezefsError::InvalidOperation(
                 format!("data volume '{id}' is already registered"),
@@ -7480,6 +7634,17 @@ impl DataRouter {
                 }
             }
         }
+        // W-5: the fsync touched-namespace stamp rides the SAME
+        // translation the durable-reference ledger does — every block a
+        // layout gains is a block whose device the ino's next fsync must
+        // barrier, and the C8 oracle is what proves this set complete.
+        self.backend_router.note_fsync_touched_keys(
+            ino,
+            changes
+                .iter()
+                .filter(|(_, _, take)| *take)
+                .map(|(_, key, _)| key.as_str()),
+        );
         out
     }
 

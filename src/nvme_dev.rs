@@ -1526,6 +1526,14 @@ pub struct NvmeBlockDev {
     /// Volatile-write-cache classification probed once at construction
     /// (`data_volume_write_cache` on the stats inode).
     write_cache: crate::write_cache::WriteCacheClass,
+    /// Test seam over the probe ([`Self::override_write_cache_for_test`]):
+    /// `0` = none, else `class as u8 + 1`. Shared across clones.
+    write_cache_override: Arc<std::sync::atomic::AtomicU8>,
+    /// W-5: this device's bit in the fsync touched-namespace table
+    /// (`fsync_economy::TouchedTable`), assigned by the owning
+    /// `BackendRouter` at registration; `u32::MAX` = unassigned (stamps
+    /// for it set the ALL bit). Shared across clones.
+    fsync_ordinal: Arc<std::sync::atomic::AtomicU32>,
     /// zcrx read lane session (docs/design-zcrx-read-lane.md §6): armed
     /// lazily on the first eligible read (`SQUEEZEFS_ZCRX_LANE=1` +
     /// capability probes), `None` cached on any arm refusal — the kernel
@@ -1654,6 +1662,8 @@ impl NvmeBlockDev {
             // One-shot sysfs read at construction (never on a cadence or
             // a per-op path — the derived-defaults law).
             write_cache: crate::write_cache::probe_data_volume(std::path::Path::new(device_path)),
+            write_cache_override: Arc::new(std::sync::atomic::AtomicU8::new(0)),
+            fsync_ordinal: Arc::new(std::sync::atomic::AtomicU32::new(u32::MAX)),
             lane: Arc::new(squeezefs_ipc::sqz_once::OnceCell::new()),
             fence: Arc::new(DeviceFence::new()),
             zc_fd: Arc::new(std::sync::OnceLock::new()),
@@ -1977,9 +1987,51 @@ impl NvmeBlockDev {
     }
 
     /// The device's probed volatile-write-cache class
-    /// (`data_volume_write_cache`).
+    /// (`data_volume_write_cache`), or the test override when one is set.
     pub fn write_cache(&self) -> crate::write_cache::WriteCacheClass {
-        self.write_cache
+        match self
+            .write_cache_override
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            0 => self.write_cache,
+            n => crate::write_cache::WriteCacheClass::from_u8(n - 1),
+        }
+    }
+
+    /// Test seam: present `class` as this device's write-cache class
+    /// (`None` returns to the probe). The test fleet has no write-through
+    /// device, and the W-5 barrier skip keys on the class.
+    pub fn override_write_cache_for_test(
+        &self,
+        class: Option<crate::write_cache::WriteCacheClass>,
+    ) {
+        self.write_cache_override.store(
+            class.map(|c| c.as_u8() + 1).unwrap_or(0),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
+
+    /// W-5: this device's fsync touched-namespace ordinal, if the owning
+    /// router assigned one.
+    pub fn fsync_ordinal(&self) -> Option<u32> {
+        match self
+            .fsync_ordinal
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            u32::MAX => None,
+            n => Some(n),
+        }
+    }
+
+    /// W-5: assign the ordinal once (first assignment wins — clones and
+    /// the default-slot alias describe the same device).
+    pub fn set_fsync_ordinal(&self, ordinal: u32) {
+        let _ = self.fsync_ordinal.compare_exchange(
+            u32::MAX,
+            ordinal,
+            std::sync::atomic::Ordering::AcqRel,
+            std::sync::atomic::Ordering::Relaxed,
+        );
     }
 
     /// **DUR-2 — the data-device durability barrier.** Completes only
@@ -2019,6 +2071,11 @@ impl NvmeBlockDev {
                     return Err(crate::error::SqueezefsError::Io(
                         std::io::Error::from_raw_os_error(code),
                     ));
+                }
+                // Test seam (armed only): a SLOW device — the barrier
+                // completes no earlier than the armed latency.
+                if let Some(lat) = crate::dev_power_cut::barrier_latency(&self.device_path) {
+                    squeezefs_ipc::sqz_time::sleep(lat).await;
                 }
                 // The cross-lane drain — BEFORE the coverage frontier and
                 // the Fsync, so every prior write is at the device when

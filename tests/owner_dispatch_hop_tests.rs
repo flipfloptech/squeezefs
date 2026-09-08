@@ -777,6 +777,293 @@ async fn publish_panic_inline_answers_status_panic_and_the_session_survives() {
     nodes.stop().await;
 }
 
+// ===========================================================================
+// The lane hog — the fleet's saturated sqz-meta lanes, made a controlled
+// load (the C-2 harness's shape: N detached tasks on the sqz-meta pool,
+// each spinning `burst` of CPU per poll and yielding). Every wake delivered
+// onto a hogged lane waits behind the bursts queued ahead of it — the
+// run-queue term the finding names.
+// ===========================================================================
+
+fn spin_for(d: Duration) {
+    let t0 = std::time::Instant::now();
+    while t0.elapsed() < d {
+        std::hint::spin_loop();
+    }
+}
+
+struct LaneHog {
+    stop: Arc<AtomicBool>,
+}
+
+impl LaneHog {
+    fn start(tasks: usize, burst: Duration) -> Self {
+        let stop = Arc::new(AtomicBool::new(false));
+        for _ in 0..tasks {
+            let stop = stop.clone();
+            squeezefs::meta_exec::spawn_meta("d5_lane_hog", async move {
+                while !stop.load(Ordering::Relaxed) {
+                    spin_for(burst);
+                    tokio::task::yield_now().await;
+                }
+            });
+        }
+        Self { stop }
+    }
+}
+
+impl Drop for LaneHog {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        // Let the last bursts drain before the next row arms its own.
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// The bucketed p99 (µs, upper bucket bound) of a histogram DELTA.
+fn p99_us(after: &serde_json::Value, before: &serde_json::Value) -> u64 {
+    let labels = squeezefs::latency_core::LATENCY_BUCKET_LABELS;
+    let d: Vec<u64> = labels
+        .iter()
+        .map(|l| {
+            after["buckets"][*l].as_u64().unwrap_or(0) - before["buckets"][*l].as_u64().unwrap_or(0)
+        })
+        .collect();
+    let total: u64 = d.iter().sum();
+    if total == 0 {
+        return 0;
+    }
+    let rank = total - total / 100;
+    let mut seen = 0;
+    for (i, c) in d.iter().enumerate() {
+        seen += c;
+        if seen >= rank {
+            return if i == 0 { 1 } else { 1u64 << i };
+        }
+    }
+    unreachable!()
+}
+
+/// One S8 row: `clients` concurrent routers (each its own identity and
+/// session) × `per` one-verb setattr frames against the one authority.
+struct S8Row {
+    frames: u64,
+    wall: Duration,
+    split: (Split, Split),
+    dispatch_p99_us: u64,
+}
+
+impl S8Row {
+    fn verbs_per_s(&self) -> f64 {
+        self.frames as f64 / self.wall.as_secs_f64()
+    }
+    fn mean(&self, f: impl Fn(&Split) -> (u64, u64)) -> f64 {
+        mean_us(delta(f(&self.split.1), f(&self.split.0)))
+    }
+    fn line(&self, label: &str) -> String {
+        format!(
+            "{label:<22} verbs/s {:>8.0} | dispatch mean {:>8.1} µs p99 {:>6} µs | queue_hop \
+             {:>7.1} run {:>8.1} wake_hop {:>7.1} total {:>8.1} µs | inline {} hops {}",
+            self.verbs_per_s(),
+            self.mean(|s| s.dispatch),
+            self.dispatch_p99_us,
+            self.mean(|s| s.queue_hop),
+            self.mean(|s| s.run),
+            self.mean(|s| s.wake_hop),
+            self.mean(|s| s.total),
+            self.split.1.inline - self.split.0.inline,
+            self.split.1.hops - self.split.0.hops,
+        )
+    }
+}
+
+async fn s8_row(
+    owner_endpoint: &str,
+    client_be: &Arc<RoutedMetaBackend>,
+    inos: &[u64],
+    clients: usize,
+    per: usize,
+) -> S8Row {
+    let routers: Vec<Arc<MetaShipRouter>> = (0..clients)
+        .map(|c| {
+            MetaShipRouter::new(
+                Arc::clone(client_be),
+                &format!("client-{c}"),
+                SECRET.to_vec(),
+            )
+        })
+        .collect();
+    for r in &routers {
+        r.getattr(1).await.expect("warm the session");
+    }
+    let _ = owner_endpoint;
+    let before = split();
+    let disp_before = ship::owner_phase_json()["dispatch"].clone();
+    let t0 = std::time::Instant::now();
+    let tasks: Vec<_> = routers
+        .into_iter()
+        .enumerate()
+        .map(|(c, r)| {
+            let inos = inos.to_vec();
+            tokio::spawn(async move {
+                for i in 0..per {
+                    let ino = inos[(c * per + i) % inos.len()];
+                    r.setattr(ino, Some(FILE), None, None, None, None, None, None)
+                        .await
+                        .unwrap_or_else(|e| panic!("client {c} frame {i}: {e}"));
+                }
+            })
+        })
+        .collect();
+    for t in tasks {
+        t.await.expect("client task");
+    }
+    let wall = t0.elapsed();
+    let after = split();
+    let disp_after = ship::owner_phase_json()["dispatch"].clone();
+    S8Row {
+        frames: (clients * per) as u64,
+        wall,
+        split: (before, after),
+        dispatch_p99_us: p99_us(&disp_after, &disp_before),
+    }
+}
+
+/// 7. **The isolation contract**: under four 2 ms serve bursts saturating
+/// both `sqz-meta` lanes, a frame served on the accepting venue never waits
+/// for a lane — its `dispatch` mean stays under a quarter burst — while the
+/// hop control lands behind the bursts (printed beside it, the RED shape
+/// this campaign attacks: on the fleet 2.0–2.3 ms per verb).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn s8_inline_serve_is_isolated_from_the_lane_hog() {
+    let _serial = serial();
+    let _restore = restore();
+    let dir = tempfile::tempdir().unwrap();
+    let nodes = S8Nodes::start(dir.path()).await;
+    let inos = mint(&nodes.owner_be, 32, "iso").await;
+    let endpoint = nodes.listener.endpoint().to_string();
+    const BURST: Duration = Duration::from_millis(2);
+
+    let hog = LaneHog::start(4, BURST);
+    let _lever = EnvVarGuard::set(ship::INLINE_SERVE_ENV, "0");
+    let control = s8_row(&endpoint, &nodes.client_be, &inos, 2, 32).await;
+    drop(_lever);
+    let _lever = EnvVarGuard::set(ship::INLINE_SERVE_ENV, "1");
+    let inline = s8_row(&endpoint, &nodes.client_be, &inos, 2, 32).await;
+    drop(hog);
+    println!("D-5 isolation (4 × 2 ms lane hog, 2 clients × 32 one-verb frames):");
+    println!("  {}", control.line("hop (control)"));
+    println!("  {}", inline.line("inline"));
+    let inline_dispatch_us = inline.mean(|s| s.dispatch);
+    assert!(
+        inline_dispatch_us < BURST.as_secs_f64() * 1e6 / 4.0,
+        "a frame served on the accepting venue never waits for a hogged lane: dispatch mean \
+         {inline_dispatch_us:.1} µs against {BURST:?} bursts"
+    );
+    assert_eq!(
+        inline.split.1.hops, inline.split.0.hops,
+        "inline paid no hop"
+    );
+    nodes.stop().await;
+}
+
+/// **The counted A/B rows** (run by name, release — a measurement is not a
+/// gate):
+///
+/// ```text
+/// cargo test --release --all-features --test owner_dispatch_hop_tests -- \
+///     --ignored --nocapture ab_rows
+/// ```
+///
+/// Four legs in A-B-B-A order per venue (inline / hop / hop / inline):
+/// quiet, then under a 4 × 200 µs serve hog on the `sqz-meta` lanes (the
+/// fleet's saturated lanes at a controlled burst). Columns: verbs/s,
+/// `meta_ship_owner_phase_ns.dispatch` mean/p99, the split's means, and
+/// the engagement pair. Plus the publish plane's row: 24 concurrent layout
+/// publishes × 8 rounds from one co-writer, inline vs hop, under the hog.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "measurement, not a gate: run by name (see the doc comment)"]
+async fn ab_rows() {
+    let _serial = serial();
+    let _restore = restore();
+    let dir = tempfile::tempdir().unwrap();
+    let nodes = S8Nodes::start(dir.path()).await;
+    let inos = mint(&nodes.owner_be, 64, "ab").await;
+    let endpoint = nodes.listener.endpoint().to_string();
+    const CLIENTS: usize = 4;
+    const PER: usize = 256;
+    let profile = if cfg!(debug_assertions) {
+        "debug"
+    } else {
+        "release"
+    };
+    println!(
+        "D-5 A/B rows ({profile}, {} cpus): {CLIENTS} clients × {PER} one-verb setattr frames",
+        std::thread::available_parallelism().map_or(0, |n| n.get())
+    );
+    for (venue, hog) in [
+        ("quiet", None),
+        ("hog 4 × 200 µs", Some((4usize, Duration::from_micros(200)))),
+    ] {
+        let _hog = hog.map(|(tasks, burst)| LaneHog::start(tasks, burst));
+        println!("-- {venue}");
+        for arm in ["1", "0", "0", "1"] {
+            let _lever = EnvVarGuard::set(ship::INLINE_SERVE_ENV, arm);
+            let row = s8_row(&endpoint, &nodes.client_be, &inos, CLIENTS, PER).await;
+            println!("  {}", row.line(if arm == "1" { "inline" } else { "hop" }));
+        }
+    }
+    nodes.stop().await;
+
+    // The publish plane.
+    let dir = tempfile::tempdir().unwrap();
+    let nodes = PublishNodes::start(dir.path()).await;
+    let warm = mint(&nodes.owner_be, 8, "warm").await;
+    for round in 1..=3u64 {
+        for out in nodes.publish_concurrently(&warm, round).await {
+            out.expect("the warm publish lands");
+        }
+    }
+    let inos = mint(&nodes.owner_be, 24, "pub").await;
+    println!("-- publish plane: 24 concurrent layout publishes × 8 rounds, one co-writer");
+    for (venue, hog) in [
+        ("quiet", None),
+        ("hog 4 × 200 µs", Some((4usize, Duration::from_micros(200)))),
+    ] {
+        let _hog = hog.map(|(tasks, burst)| LaneHog::start(tasks, burst));
+        for arm in ["1", "0", "0", "1"] {
+            let _lever = EnvVarGuard::set(ship::INLINE_SERVE_ENV, arm);
+            let before = split();
+            let frames_0 = nodes.auth.listener.stats().requests_served;
+            let t0 = std::time::Instant::now();
+            for round in 1..=8u64 {
+                for out in nodes.publish_concurrently(&inos, round * 4096).await {
+                    out.expect("the publish lands");
+                }
+            }
+            let wall = t0.elapsed();
+            let after = split();
+            let frames = nodes.auth.listener.stats().requests_served - frames_0;
+            println!(
+                "  {venue:<16} {:<7} publishes/s {:>7.0} | wall/round {:>8.1} µs | frames {frames} \
+                 | dispatch run {:>8.1} µs queue_hop {:>7.1} wake_hop {:>7.1} total {:>8.1} µs \
+                 (n={}) | inline {} hops {}",
+                if arm == "1" { "inline" } else { "hop" },
+                (24 * 8) as f64 / wall.as_secs_f64(),
+                wall.as_secs_f64() * 1e6 / 8.0,
+                mean_us(delta(after.run, before.run)),
+                mean_us(delta(after.queue_hop, before.queue_hop)),
+                mean_us(delta(after.wake_hop, before.wake_hop)),
+                mean_us(delta(after.total, before.total)),
+                after.total.1 - before.total.1,
+                after.inline - before.inline,
+                after.hops - before.hops,
+            );
+        }
+    }
+    nodes.stop().await;
+}
+
 /// 6. **The stats-inode shape**: `meta_ship_owner_dispatch_ns` exports the
 /// four phases in the ONE histogram shape (buckets + count + sum_ns +
 /// mean_ns), Σ buckets ≡ count; the engagement pair is on `meta_ship`.

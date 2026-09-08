@@ -4026,19 +4026,6 @@ pub fn discharge_lane_handouts(offsets: &[u64]) {
     }
 }
 
-/// **S4's foreign-home seam, resolved.**
-///
-/// S4 counted the round trip and then refused, because *"granting a foreign
-/// home locally would be two nodes each believing they hold exclusive
-/// custody"*. S9 makes the round trip real: the acquire travels to the
-/// home's authority, and what comes back is custody that authority issued.
-///
-/// With no client armed the refusal stands, and it now names the missing
-/// half rather than a future stage.
-/// **S11 rung 15**: ship a required/desired range acquire to the home's
-/// owner (the [`acquire_remote`] pattern for the range face), mapping the
-/// wire outcome back into the local [`crate::dlm::RangeAcquired`] shape
-/// the homing entry point answers with.
 /// The standing poll's arming latch: `0` = the product (armed), `2` =
 /// withheld by [`test_set_notice_poll`], `1` = explicitly armed by it.
 static NOTICE_POLL_PRESET: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
@@ -4140,6 +4127,19 @@ async fn notice_poll_run(weak: std::sync::Weak<WriteCustodyClient>) {
     }
 }
 
+/// **S4's foreign-home seam, resolved.**
+///
+/// S4 counted the round trip and then refused, because *"granting a foreign
+/// home locally would be two nodes each believing they hold exclusive
+/// custody"*. S9 makes the round trip real: the acquire travels to the
+/// home's authority, and what comes back is custody that authority issued.
+///
+/// With no client armed the refusal stands, and it now names the missing
+/// half rather than a future stage.
+/// **S11 rung 15**: ship a required/desired range acquire to the home's
+/// owner (the [`acquire_remote`] pattern for the range face), mapping the
+/// wire outcome back into the local [`crate::dlm::RangeAcquired`] shape
+/// the homing entry point answers with.
 pub async fn acquire_remote_range(
     ino: u64,
     required: (u64, u64),

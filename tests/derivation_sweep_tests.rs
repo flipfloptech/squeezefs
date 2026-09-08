@@ -314,6 +314,38 @@ fn dlm_stripe_width_derives_from_possible_cpus_times_q_depth() {
     assert_eq!(derived_stripe_width(4096, 192, 32), 131_072);
 }
 
+/// W-6: the transport's delivered-concurrency ceiling
+/// (`stripe_locks::transport_inflight_ceiling`) is `possible_cpus ×
+/// q_depth` — the same two terms the D-3 width law multiplies, WITHOUT the
+/// load factor and the power-of-two rounding (it bounds a population, not
+/// a mask). Its one consumer is the write-phase census map's retained
+/// capacity (`2 ×` — the unit key + one block key per in-flight write),
+/// which is what keeps a quiet mount from re-allocating that map's
+/// bucket array on every write. Pinned against the process's own
+/// `possible_cpus` and the sizing depth the D-3 law reads (the explicit
+/// `SQUEEZEFS_FUSE_OVER_IO_URING_Q_DEPTH` clamped to the transport's
+/// `1..=Q_DEPTH_DESIRED`, else `Q_DEPTH_DESIRED`) — drift in either term
+/// is red here.
+#[test]
+fn transport_inflight_ceiling_is_possible_cpus_times_q_depth() {
+    use squeezefs::stripe_locks::transport_inflight_ceiling;
+    let cpus = squeezefs::cpu::possible_cpus().max(1);
+    let depth = std::env::var("SQUEEZEFS_FUSE_OVER_IO_URING_Q_DEPTH")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .map(|d| d.clamp(1, fuse3::raw::Q_DEPTH_DESIRED))
+        .unwrap_or(fuse3::raw::Q_DEPTH_DESIRED);
+    assert_eq!(
+        transport_inflight_ceiling(),
+        cpus * depth,
+        "the ceiling is possible_cpus × q_depth, no factor, no rounding"
+    );
+    assert!(
+        transport_inflight_ceiling() >= 1,
+        "never zero — a zero minimum capacity is exactly the shrink-to-zero shape"
+    );
+}
+
 /// `SQUEEZEFS_DLM_STRIPES` resolution: explicit wins verbatim (a non-power
 /// of two rounds UP — the index is a mask), else the derived law. `4096`
 /// is the shipped-4a control and `1` the everything-serializes crucible.

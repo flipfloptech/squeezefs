@@ -279,6 +279,8 @@ async fn striped_fixture(h: &H, name: &str) -> u64 {
 /// binary pair):
 ///   * pre-PERF-12:  **14.05** allocs/op
 ///   * post-PERF-12: **8.05** allocs/op  (−43 %)
+///   * post-R-5:     **0.00** allocs/op  (the whole prelude AND the serve
+///     off the allocator — `.benchmarks/2026-09-08-r5-read-handler-economy.md`)
 ///
 /// What PERF-12 removed, per op: the `inode_{ino}` layout-identity `String`
 /// (1), the handler's `active_block:…` key (`CompactString` + `String`, 2),
@@ -286,12 +288,16 @@ async fn striped_fixture(h: &H, name: &str) -> u64 {
 /// `Vec` + key clone (`load_striped_block_keys` for a single block, 2 — the
 /// recheck now compares against the live map by reference).
 ///
-/// The eight that remain are named by the trace mode and are follow-on work
-/// (`ReadCustodyFp::build_sync` ×2, the serve's own `load_striped_block_keys`
-/// resolve ×2, `get_block_for_index`'s owned binding, `staged_extent_runs_in`'s
-/// `active_block_ext:` key, the reply body, one moka guard). The bar is set
-/// at 9/op — above the shipped number so incidental churn cannot flake it,
-/// far below the pre-fix 14.
+/// What R-5 removed, per op: the custody fingerprint's `Vec<u64>` epochs
+/// ×2 (inline for the ≤ 4-block windows a kernel READ covers), the
+/// serve's own single-block `load_striped_block_keys` (`Vec` + key clone
+/// — the serve arm resolves through `block_key_in` by reference), the
+/// W2 overlay probe's heap key (the stack-key existence gate runs first),
+/// the fetch ladder's owned key copy and its recheck's owned resolve
+/// (borrowed key + `block_binding_is`), and the vestigial `backing` Arc
+/// the ladder return minted since the 2026-06 transmuted-slice era (the
+/// body has refcounted its own bytes since E-IL1). The bar is 1/op —
+/// headroom for incidental churn, red on the PERF-12 tree by eight.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn warm_kernel_read_prelude_allocation_budget() {
     let h = make().await;
@@ -332,10 +338,11 @@ async fn warm_kernel_read_prelude_allocation_budget() {
         per_op_centi % 100
     );
     assert!(
-        per_op_centi <= 900,
-        "warm kernel READ serve allocates {}.{:02} per op — the PERF-12 \
-         budget is 9.00 (prelude work must not allocate: stack keys, \
-         borrowed single-block resolve, no per-op layout String)",
+        per_op_centi <= 100,
+        "warm kernel READ serve allocates {}.{:02} per op — the R-5 budget \
+         is 1.00 (prelude AND serve must not allocate: stack keys, borrowed \
+         single-block resolve, inline custody epochs, borrowed fetch-ladder \
+         key, no backing Arc on the reply)",
         per_op_centi / 100,
         per_op_centi % 100
     );
@@ -350,8 +357,10 @@ async fn warm_kernel_read_prelude_allocation_budget() {
 /// kernel's work and not what this ledger prices. Its `Box::pin` is the
 /// one structural allocation the injected shape carries (the live
 /// connection arm awaits the transport's own future unboxed).
-fn zc_ready_serve() -> squeezefs::routing::ZcReadServe {
-    squeezefs::routing::ZcReadServe::new(Box::new(|_fd, _off, len| Box::pin(async move { Ok(len) })))
+fn zc_ready_serve() -> squeezefs::routing::ZcReadServe<'static> {
+    squeezefs::routing::ZcReadServe::new(Box::new(|_fd, _off, len| {
+        Box::pin(async move { Ok(len) })
+    }))
 }
 
 /// **The kernel READ lane's COLD zc-leg allocation budget** (R-5).
@@ -396,11 +405,8 @@ async fn cold_kernel_read_zc_leg_allocation_budget() {
     async fn read_cold(
         h: &H,
         path: &str,
-        zc: &squeezefs::routing::ZcReadServe,
-    ) -> squeezefs::error::Result<(
-        bytes::Bytes,
-        Option<Arc<dyn std::any::Any + Send + Sync>>,
-    )> {
+        zc: &squeezefs::routing::ZcReadServe<'_>,
+    ) -> squeezefs::error::Result<bytes::Bytes> {
         h.fs.router
             .read_file_range_zero_copy_with_meta(
                 path,
@@ -415,8 +421,11 @@ async fn cold_kernel_read_zc_leg_allocation_budget() {
     }
     for _ in 0..8 {
         let zc = zc_ready_serve();
-        let (data, _) = read_cold(&h, &path, &zc).await.expect("cold zc read");
-        assert!(data.is_empty(), "a zc-served read replies with an empty body");
+        let data = read_cold(&h, &path, &zc).await.expect("cold zc read");
+        assert!(
+            data.is_empty(),
+            "a zc-served read replies with an empty body"
+        );
         assert_eq!(zc.served(), Some(4096), "the direct leg must engage");
     }
 

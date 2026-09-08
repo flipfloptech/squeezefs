@@ -343,24 +343,33 @@ async fn ledger_closes_and_cold_none_dest_slice_is_zero_copy() {
     );
     assert_eq!(d.dest, 0, "phase A: no dest was offered");
     assert_eq!(d.dest_dma, 0, "phase A: no dest was offered");
-    // The zero-copy proof itself: the reply bytes point INTO the returned
-    // backing (pre-fix they were a fresh heap copy).
-    let backing = reply
-        .backing
-        .as_ref()
-        .expect("cold serve carries its backing")
-        .clone();
-    let block = backing
-        .downcast_ref::<squeezefs::cache::pool::ReadBlockValue>()
-        .expect("backing is the block value");
-    let backing_range =
-        block.as_ref().as_ptr() as usize..block.as_ref().as_ptr() as usize + block.len();
+    // The zero-copy proof itself: the reply bytes point INTO the fill
+    // (pre-fix they were a fresh heap copy). The fill's deposit in the
+    // hot tier IS the fill's `Bytes` (a refcount clone), so the reply
+    // must alias the block the tier now holds — the `ReplyData.backing`
+    // vehicle the pre-R-5 proof read is gone (the body refcounts its own
+    // bytes; the router minted that Arc for nothing since E-IL1).
+    assert!(
+        reply.backing.is_none(),
+        "phase A: the reply carries no backing — the body is its own keepalive"
+    );
+    let block_key = _map
+        .get(&1)
+        .expect("block 1 of the striped fixture is mapped");
+    let hot =
+        h.fs.router
+            .cache
+            .hot_block
+            .get_no_promote(block_key)
+            .expect("phase A's fill deposited block 1 in the hot tier");
+    let fill_range = hot.as_ptr() as usize..hot.as_ptr() as usize + hot.len();
     let data_ptr = reply.data.as_ptr() as usize;
     assert!(
-        backing_range.contains(&data_ptr),
-        "phase A: reply bytes must alias the fill backing (zero-copy slice), \
-         got data ptr {data_ptr:#x} outside backing {backing_range:x?}"
+        fill_range.contains(&data_ptr),
+        "phase A: reply bytes must alias the fill (zero-copy slice), \
+         got data ptr {data_ptr:#x} outside the tier's block {fill_range:x?}"
     );
+    drop(hot);
     drop(reply);
 
     // ---- Phase B (the kernel-path warm shape): hot-tier serve INTO a
@@ -369,7 +378,7 @@ async fn ledger_closes_and_cold_none_dest_slice_is_zero_copy() {
     let s0 = snap();
     let hot0 = METRICS.hot_block_hits.load(Ordering::Relaxed);
     let nt0 = METRICS.nt_read_serve_bytes.load(Ordering::Relaxed);
-    let (data, _backing) =
+    let data =
         h.fs.router
             .read_file_range_zero_copy_with_meta(
                 &path,
@@ -420,7 +429,7 @@ async fn ledger_closes_and_cold_none_dest_slice_is_zero_copy() {
     // ---- Phase C (the zero-daemon-copy cold leg): full-block read with
     // an aligned dest — raw device DMA straight into the dest.
     let s0 = snap();
-    let (data, _backing) =
+    let data =
         h.fs.router
             .read_file_range_zero_copy_with_meta(
                 &path,
@@ -454,7 +463,7 @@ async fn ledger_closes_and_cold_none_dest_slice_is_zero_copy() {
     // ---- Phase D (the cold kernel-path partial shape — the EXA row's
     // dominant serve): pooled fill + one serve copy into the dest.
     let s0 = snap();
-    let (data, _backing) =
+    let data =
         h.fs.router
             .read_file_range_zero_copy_with_meta(
                 &path,
@@ -492,7 +501,7 @@ async fn ledger_closes_and_cold_none_dest_slice_is_zero_copy() {
     // with a dest — window DMA straight into the dest.
     let s0 = snap();
     let rr0 = METRICS.ranged_reads.load(Ordering::Relaxed);
-    let (data, _backing) =
+    let data =
         h.fs.router
             .read_file_range_zero_copy_with_meta(
                 &path,
@@ -566,7 +575,7 @@ async fn warm_tier_serves_split_out_of_the_dest_bucket() {
     // ---- Phase A: cold fill + slice-out into the dest (block 5) —
     // the cold residual: dest counts, warm must NOT.
     let s0 = snap();
-    let (data, _backing) =
+    let data =
         h.fs.router
             .read_file_range_zero_copy_with_meta(
                 &path,
@@ -597,7 +606,7 @@ async fn warm_tier_serves_split_out_of_the_dest_bucket() {
     // deposited block 5 in hot probation) — the A1 target population.
     let s0 = snap();
     let hot0 = METRICS.hot_block_hits.load(Ordering::Relaxed);
-    let (data, _backing) =
+    let data =
         h.fs.router
             .read_file_range_zero_copy_with_meta(
                 &path,
@@ -640,7 +649,7 @@ async fn warm_tier_serves_split_out_of_the_dest_bucket() {
         .cache_read_block(&k7, bytes::Bytes::from(block7))
         .expect("phase C: disk-tier plant must land");
     let s0 = snap();
-    let (data, _backing) =
+    let data =
         h.fs.router
             .read_file_range_zero_copy_with_meta(
                 &path,
@@ -715,7 +724,7 @@ async fn warm_arms_and_the_cold_fill_slice_are_attributed_per_arm() {
 
     // ---- Phase A: cold fill + slice-out into the dest (block 5).
     let s0 = snap();
-    let (data, _backing) =
+    let data =
         h.fs.router
             .read_file_range_zero_copy_with_meta(
                 &path,
@@ -750,7 +759,7 @@ async fn warm_arms_and_the_cold_fill_slice_are_attributed_per_arm() {
     // probation).
     let s0 = snap();
     let hot0 = METRICS.hot_block_hits.load(Ordering::Relaxed);
-    let (data, _backing) =
+    let data =
         h.fs.router
             .read_file_range_zero_copy_with_meta(
                 &path,
@@ -795,7 +804,7 @@ async fn warm_arms_and_the_cold_fill_slice_are_attributed_per_arm() {
         .insert(&k6, bytes::Bytes::from(block6), 64 * 1024 * 1024);
     let s0 = snap();
     let serves0 = METRICS.read_lane_serves.load(Ordering::Relaxed);
-    let (data, _backing) =
+    let data =
         h.fs.router
             .read_file_range_zero_copy_with_meta(
                 &path,
@@ -846,7 +855,7 @@ async fn warm_arms_and_the_cold_fill_slice_are_attributed_per_arm() {
         .cache_read_block(&k7, bytes::Bytes::from(block7))
         .expect("phase D: disk-tier plant must land");
     let s0 = snap();
-    let (data, _backing) =
+    let data =
         h.fs.router
             .read_file_range_zero_copy_with_meta(
                 &path,

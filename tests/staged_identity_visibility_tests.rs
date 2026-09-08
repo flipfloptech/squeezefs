@@ -174,7 +174,7 @@ async fn reader_loop(
     while !stop.load(Ordering::Acquire) {
         let ino = ino_src.load(Ordering::Acquire);
         let file_path = squeezefs::keys::inode_path(ino);
-        let (data, _backing) = router
+        let data = router
             .read_file_range_zero_copy(
                 &file_path,
                 0,
@@ -503,7 +503,7 @@ async fn striped_pressure_storm_reads_never_stale_or_zeros() {
                 let file_path = squeezefs::keys::inode_path(ino);
                 let mut reads = 0u64;
                 while !stop.load(Ordering::Acquire) {
-                    let (data, _b) = router
+                    let data = router
                         .read_file_range_zero_copy(
                             &file_path,
                             off,
@@ -713,7 +713,7 @@ async fn warm_read_loop_yields_to_peer_tasks_on_one_worker() {
 
     // Warm the serve once: the loop below must be all-RAM Ready-immediate.
     let file_path = squeezefs::keys::inode_path(ino);
-    let (data, _b) =
+    let data =
         h.fs.router
             .read_file_range_zero_copy(
                 &file_path,
@@ -736,7 +736,7 @@ async fn warm_read_loop_yields_to_peer_tasks_on_one_worker() {
         tokio::spawn(async move {
             let mut iters = 0u32;
             while iters < 100_000 {
-                let (data, _b) = router
+                let data = router
                     .read_file_range_zero_copy(
                         &file_path,
                         0,

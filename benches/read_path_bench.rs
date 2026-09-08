@@ -587,12 +587,22 @@ fn bench_read_handler_economy(c: &mut Criterion) {
     });
     group.bench_function("custody_fp_pair_matches", |b| {
         b.iter(|| {
-            let before =
-                ReadCustodyFp::build_sync(black_box(&meta), ino, BLOCK as u64, 7 * BLOCK as u64, 4096)
-                    .expect("striped window has a custody chain");
-            let after =
-                ReadCustodyFp::build_sync(black_box(&meta), ino, BLOCK as u64, 7 * BLOCK as u64, 4096)
-                    .expect("striped window has a custody chain");
+            let before = ReadCustodyFp::build_sync(
+                black_box(&meta),
+                ino,
+                BLOCK as u64,
+                7 * BLOCK as u64,
+                4096,
+            )
+            .expect("striped window has a custody chain");
+            let after = ReadCustodyFp::build_sync(
+                black_box(&meta),
+                ino,
+                BLOCK as u64,
+                7 * BLOCK as u64,
+                4096,
+            )
+            .expect("striped window has a custody chain");
             black_box(before.matches(&after))
         })
     });

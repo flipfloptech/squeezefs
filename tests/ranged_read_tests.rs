@@ -542,7 +542,7 @@ async fn raw_dest_leg_refuses_transform_configs() {
 
     // Full-block read WITH a payload dest — the raw dest leg's exact
     // trigger shape (slice_start == 0 && slice_len == block_size && dest).
-    let (data, _backing) =
+    let data =
         h.fs.router
             .read_file_range_zero_copy(
                 &path,

@@ -293,7 +293,7 @@ async fn read_windows(h: &H, path: &str, blocks: u64, hint: ReadClassHint) -> u6
             let off = b * BS + w * WIN;
             let s_win = snap();
             let dest = AlignedDest::new(WIN as usize);
-            let (data, _backing) =
+            let data =
                 h.fs.router
                     .read_file_range_zero_copy_with_meta(
                         path,
@@ -396,7 +396,7 @@ async fn dest_lease_serves_cold_windows_by_dma_and_stands_the_fill_machinery_dow
     let uoff = 5 * BS; // still cold: phase A lease serves deposit nothing
     let dest = AlignedDest::new(ulen);
     let s0 = snap();
-    let (data, _backing) =
+    let data =
         h.fs.router
             .read_file_range_zero_copy_with_meta(
                 &path_a,

@@ -215,7 +215,7 @@ impl Drop for AlignedDest {
 /// A zc handle whose device fetch is never expected on these arms (the
 /// direct leg declines unaligned windows and warm blocks): any fetch
 /// fails loud.
-fn zc_handle() -> ZcReadServe {
+fn zc_handle() -> ZcReadServe<'static> {
     ZcReadServe::new(Box::new(|_fd, _off, _len| {
         Box::pin(async {
             Err(std::io::Error::other(
@@ -355,7 +355,7 @@ async fn fd_source_serve_elides_the_copy_on_pool_backed_arms_only() {
     let len = 384 * 1024usize;
     let zc = zc_handle();
     let s0 = snap();
-    let (data, backing) =
+    let data =
         h.fs.router
             .read_file_range_zero_copy_with_meta(
                 &path,
@@ -401,13 +401,12 @@ async fn fd_source_serve_elides_the_copy_on_pool_backed_arms_only() {
     );
     assert_eq!(d.pool_warm, 0, "contract 2: a cold serve is not warm");
     drop(data);
-    drop(backing);
 
     // ---- Contract 3: the hot arm (block 5 is hot from the fill above).
     let zc = zc_handle();
     let s0 = snap();
     let hot0 = METRICS.hot_block_hits.load(Ordering::Relaxed);
-    let (data, _b) =
+    let data =
         h.fs.router
             .read_file_range_zero_copy_with_meta(
                 &path,
@@ -465,7 +464,7 @@ async fn fd_source_serve_elides_the_copy_on_pool_backed_arms_only() {
     let zc = zc_handle();
     let s0 = snap();
     let serves0 = METRICS.read_lane_serves.load(Ordering::Relaxed);
-    let (data, _b) =
+    let data =
         h.fs.router
             .read_file_range_zero_copy_with_meta(
                 &path,
@@ -513,7 +512,7 @@ async fn fd_source_serve_elides_the_copy_on_pool_backed_arms_only() {
         .expect("disk-tier plant");
     let zc = zc_handle();
     let s0 = snap();
-    let (data, _b) =
+    let data =
         h.fs.router
             .read_file_range_zero_copy_with_meta(
                 &path,
@@ -540,7 +539,7 @@ async fn fd_source_serve_elides_the_copy_on_pool_backed_arms_only() {
     // ---- Contract 7: no zc handle (an un-armed session) ⇒ the hot arm
     // copies into the dest exactly as before, lever notwithstanding.
     let s0 = snap();
-    let (data, _b) =
+    let data =
         h.fs.router
             .read_file_range_zero_copy_with_meta(
                 &path,
@@ -579,7 +578,7 @@ async fn fast_probe_answers_served_fd_for_pool_backed_hot_blocks() {
     let dest = AlignedDest::new(BS as usize);
 
     // Warm block 2 through an ordinary (un-armed) read.
-    let (fill, _b) =
+    let fill =
         h.fs.router
             .read_file_range_zero_copy_with_meta(
                 &path,

@@ -476,7 +476,7 @@ async fn multiblock_read_zeroes_hole_into_reused_dest() {
     let read_off = BS / 2;
     let read_len = (2 * BS) as usize; // spans blocks 0(tail), 1(hole), 2(head)
     let mut dest = vec![0xAAu8; read_len];
-    let (data, _backing) = h
+    let data = h
         .fs
         .router
         .read_file_range_zero_copy(

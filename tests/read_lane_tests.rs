@@ -421,7 +421,7 @@ async fn dest_armed_loop_serves_credit_true_block_coverage() {
     // Cold, dest-armed, slice_start = 128 KiB: the primary rides the
     // validated fetch loop, deposits the 512 KiB fill in the hold, and
     // must credit THIS op's block coverage — 128 KiB.
-    let (data, _b) =
+    let data =
         h.fs.router
             .read_file_range_zero_copy_with_meta(
                 &path,
@@ -451,7 +451,7 @@ async fn dest_armed_loop_serves_credit_true_block_coverage() {
     // entry RETIRES — memory converges by consumption, not eviction.
     let r0 = METRICS.read_lane_hold_retired.load(Ordering::Relaxed);
     for off in [0u64, 256 * 1024, 384 * 1024] {
-        let (d, _b) =
+        let d =
             h.fs.router
                 .read_file_range_zero_copy_with_meta(
                     &path,

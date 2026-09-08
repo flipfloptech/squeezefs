@@ -1333,14 +1333,24 @@ pub fn is_damaged_mapping(mapping_str: &str) -> bool {
 /// `pub` since PR VL7: the defrag census tooling and its tests'
 /// independent recomputation parse mappings through the ONE cleaner.
 pub fn clean_block_key(bk: &str) -> String {
+    clean_block_key_ref(bk).to_string()
+}
+
+/// [`clean_block_key`] by reference (R-5 read-handler economy): the
+/// cleaned key is always a SUB-SLICE of the stored value — the `damaged:`
+/// marker is a prefix strip and the per-block decoration a suffix cut at
+/// the first `:` after the offset — so the hot resolvers (`allocator_for_key`
+/// and the incarnation probes it serves, three per cold zc READ) borrow it
+/// instead of minting a `String` per parse.
+pub fn clean_block_key_ref(bk: &str) -> &str {
     let bk = bk.strip_prefix(DAMAGED_MAPPING_PREFIX).unwrap_or(bk);
-    if let Some(pos) = bk.find("://") {
-        let proto = &bk[..pos];
-        let rest = &bk[pos + 3..];
-        let offset = rest.split(':').next().unwrap_or(rest);
-        format!("{}://{}", proto, offset)
-    } else {
-        bk.split(':').next().unwrap_or(bk).to_string()
+    match bk.find("://") {
+        Some(pos) => {
+            let rest = &bk[pos + 3..];
+            let offset_len = rest.find(':').unwrap_or(rest.len());
+            &bk[..pos + 3 + offset_len]
+        }
+        None => bk.split(':').next().unwrap_or(bk),
     }
 }
 
@@ -1483,6 +1493,24 @@ fn attach_incarnation(body: String, inc: u64) -> String {
 pub struct BlockKeyParts {
     /// Backend id (`backend_0` for the default-slot alias forms).
     pub be_id: String,
+    /// Device offset in bytes.
+    pub offset: u64,
+    /// The offset's lifetime this key names, or [`INCARNATION_NONE`].
+    pub incarnation: u64,
+}
+
+/// [`BlockKeyParts`] BORROWING its backend id from the key it was parsed
+/// from (R-5 read-handler economy): the same three fields from the same
+/// extraction core (`BackendRouter::split_key`), minus the `String` the
+/// owned form mints — which the cold zc READ leg paid four times per op
+/// (`zc_device_resolve`, `key_incarnation_tracked`, `fill_incarnation`,
+/// `fill_incarnation_still`). Every hot resolver takes this; the owned
+/// form stays the public face for the census/fsck/mover callers that
+/// hold parts past the key's lifetime.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BlockKeyRef<'a> {
+    /// Backend id (`backend_0` for the default-slot alias forms).
+    pub be_id: &'a str,
     /// Device offset in bytes.
     pub offset: u64,
     /// The offset's lifetime this key names, or [`INCARNATION_NONE`].
@@ -2677,9 +2705,20 @@ impl BackendRouter {
     /// hold their pre-item-6 values; falsification is either of them moving
     /// past the bench group threshold once measurement is allowed.
     pub fn parse_block_key_parts(&self, block_key: &str) -> Result<BlockKeyParts> {
-        let (be_id, offset, incarnation) = Self::split_key(block_key)?;
+        let r = self.split_block_key_ref(block_key)?;
         Ok(BlockKeyParts {
-            be_id: be_id.to_string(),
+            be_id: r.be_id.to_string(),
+            offset: r.offset,
+            incarnation: r.incarnation,
+        })
+    }
+
+    /// [`Self::parse_block_key_parts`] borrowing the backend id from
+    /// `block_key` — the allocation-free form the hot resolvers use.
+    pub fn split_block_key_ref<'a>(&self, block_key: &'a str) -> Result<BlockKeyRef<'a>> {
+        let (be_id, offset, incarnation) = Self::split_key(block_key)?;
+        Ok(BlockKeyRef {
+            be_id,
             offset,
             incarnation,
         })
@@ -2823,10 +2862,10 @@ impl BackendRouter {
     /// attribution bundle (which mover class retired/moved the word).
     /// Cold path only (a settle loss), never on a serve.
     pub(crate) fn binding_move_diagnosis(&self, block_key: &str) -> String {
-        let Ok(parts) = self.parse_block_key_parts(&clean_block_key(block_key)) else {
+        let Ok(parts) = self.split_block_key_ref(clean_block_key_ref(block_key)) else {
             return "unparseable key".to_string();
         };
-        let alloc = match self.allocator_for_be_id(&parts.be_id) {
+        let alloc = match self.allocator_for_be_id(parts.be_id) {
             Some(a) => a,
             None => return format!("no allocator for be_id '{}'", parts.be_id),
         };
@@ -2846,17 +2885,17 @@ impl BackendRouter {
     }
 
     pub fn block_key_incarnation_ok(&self, block_key: &str) -> bool {
-        let Ok(parts) = self.parse_block_key_parts(&clean_block_key(block_key)) else {
+        let Ok(parts) = self.split_block_key_ref(clean_block_key_ref(block_key)) else {
             return true; // unparseable keys are refused by the resolver itself
         };
-        self.incarnation_ok(&parts, block_key)
+        self.incarnation_ok(parts, block_key)
     }
 
-    fn incarnation_ok(&self, parts: &BlockKeyParts, block_key: &str) -> bool {
+    fn incarnation_ok(&self, parts: BlockKeyRef<'_>, block_key: &str) -> bool {
         if parts.incarnation == INCARNATION_NONE {
             return true;
         }
-        let live = self.live_incarnation_for(&parts.be_id, parts.offset);
+        let live = self.live_incarnation_for(parts.be_id, parts.offset);
         if live == INCARNATION_NONE {
             crate::fuse_client::METRICS
                 .block_key_incarnation_unknown
@@ -2965,16 +3004,16 @@ impl BackendRouter {
             dest_addr.is_none_or(|d| d % 4096 == 0),
             "ranged O_DIRECT dest must be 4 KiB-aligned"
         );
-        let parts = self.parse_block_key_parts(block_key)?;
+        let parts = self.split_block_key_ref(block_key)?;
         // Spec §6.2 item 6: a key whose lifetime is dead names a device
         // offset that has been reissued to a different file — the §6.3
         // silent cross-file serve. Refuse before the DMA.
-        if !self.incarnation_ok(&parts, block_key) {
+        if !self.incarnation_ok(parts, block_key) {
             return Err(Self::err_stale_incarnation(block_key));
         }
         let (be_id, offset) = (parts.be_id, parts.offset);
 
-        if !self.is_backend_healthy(&be_id) {
+        if !self.is_backend_healthy(be_id) {
             return Err(crate::error::SqueezefsError::Io(std::io::Error::new(
                 std::io::ErrorKind::AddrNotAvailable,
                 format!("Storage volume '{}' is disabled/offline", be_id),
@@ -2985,7 +3024,7 @@ impl BackendRouter {
             self.default_device
                 .read_block_with_dest(offset + rel_start, len, dest_addr)
                 .await
-        } else if let Some(be) = self.backends.get(&be_id) {
+        } else if let Some(be) = self.backends.get(be_id) {
             be.device
                 .read_block_with_dest(offset + rel_start, len, dest_addr)
                 .await
@@ -3003,16 +3042,16 @@ impl BackendRouter {
         size: usize,
         dest_addr: Option<u64>,
     ) -> Result<bytes::Bytes> {
-        let parts = self.parse_block_key_parts(block_key)?;
+        let parts = self.split_block_key_ref(block_key)?;
         // Spec §6.2 item 6 / §6.3: the serve proof's second premise made
         // structural — a stale binding is refused instead of serving
         // another file's bytes with no error and no counter.
-        if !self.incarnation_ok(&parts, block_key) {
+        if !self.incarnation_ok(parts, block_key) {
             return Err(Self::err_stale_incarnation(block_key));
         }
         let (be_id, offset) = (parts.be_id, parts.offset);
 
-        if !self.is_backend_healthy(&be_id) {
+        if !self.is_backend_healthy(be_id) {
             return Err(crate::error::SqueezefsError::Io(std::io::Error::new(
                 std::io::ErrorKind::AddrNotAvailable,
                 format!("Storage volume '{}' is disabled/offline", be_id),
@@ -3023,7 +3062,7 @@ impl BackendRouter {
             self.default_device
                 .read_block_with_dest(offset, size, dest_addr)
                 .await
-        } else if let Some(be) = self.backends.get(&be_id) {
+        } else if let Some(be) = self.backends.get(be_id) {
             be.device
                 .read_block_with_dest(offset, size, dest_addr)
                 .await
@@ -3046,19 +3085,19 @@ impl BackendRouter {
     /// incarnation-still + binding recheck — this resolve is the address
     /// half only.
     pub fn zc_device_resolve(&self, block_key: &str) -> Option<(std::os::unix::io::RawFd, u64)> {
-        let parts = self.parse_block_key_parts(block_key).ok()?;
-        if !self.incarnation_ok(&parts, block_key) {
+        let parts = self.split_block_key_ref(block_key).ok()?;
+        if !self.incarnation_ok(parts, block_key) {
             return None;
         }
         let (be_id, offset) = (parts.be_id, parts.offset);
-        if !self.is_backend_healthy(&be_id) {
+        if !self.is_backend_healthy(be_id) {
             return None;
         }
         if be_id == "backend_0" {
             self.default_device.zc_read_fd().map(|fd| (fd, offset))
         } else {
             self.backends
-                .get(&be_id)?
+                .get(be_id)?
                 .device
                 .zc_read_fd()
                 .map(|fd| (fd, offset))
@@ -3072,19 +3111,8 @@ impl BackendRouter {
     pub fn increment_refcount(&self, block_key: &str) -> bool {
         // Decoration-tolerant (`bk:off:len` size-carrying mappings — see
         // `parse_block_mapping`): the refcount belongs to the BASE block.
-        let cleaned = clean_block_key(block_key);
-        let block_key: &str = &cleaned;
-        if let Ok((be_id, offset)) = self.parse_block_key(block_key) {
-            if be_id == "backend_0" {
-                self.default_allocator.increment_refcount(offset)
-            } else if let Some(be) = self.backends.get(&be_id) {
-                be.block_allocator.increment_refcount(offset)
-            } else {
-                false
-            }
-        } else {
-            false
-        }
+        self.with_allocator_for_key(block_key, |alloc, offset| alloc.increment_refcount(offset))
+            .unwrap_or(false)
     }
 
     /// Resolve a (possibly decorated) block key into the **durable block
@@ -3787,18 +3815,8 @@ impl BackendRouter {
         use crate::block_allocator::PinOutcome;
         // Decoration-tolerant, like `increment_refcount`: pin + word both
         // belong to the BASE block.
-        let cleaned = clean_block_key(block_key);
-        if let Ok((be_id, offset)) = self.parse_block_key(&cleaned) {
-            if be_id == "backend_0" {
-                self.default_allocator.pin_block_validated(offset)
-            } else if let Some(be) = self.backends.get(&be_id) {
-                be.block_allocator.pin_block_validated(offset)
-            } else {
-                PinOutcome::Refused
-            }
-        } else {
-            PinOutcome::Refused
-        }
+        self.with_allocator_for_key(block_key, |alloc, offset| alloc.pin_block_validated(offset))
+            .unwrap_or(PinOutcome::Refused)
     }
 
     /// The allocator that owns a block key's offset (see incarnation seqlock in
@@ -3807,18 +3825,34 @@ impl BackendRouter {
         &self,
         block_key: &str,
     ) -> Option<(std::sync::Arc<crate::block_allocator::BlockAllocator>, u64)> {
-        // Decoration-tolerant (FIND-RW2-A, fixed in RW4): size-carrying
-        // `bk:off:len` mappings track their BASE offset's incarnation —
-        // the decorated window's content dies exactly when the base block
-        // is freed/reallocated. (Same rule `free_block` already applies.)
-        let cleaned = clean_block_key(block_key);
-        let (be_id, offset) = self.parse_block_key(&cleaned).ok()?;
+        self.with_allocator_for_key(block_key, |alloc, offset| (alloc.clone(), offset))
+    }
+
+    /// Run `f` against the allocator that owns `block_key`'s offset —
+    /// the ALLOCATION-FREE form of [`Self::allocator_for_key`] (R-5
+    /// read-handler economy): the key is cleaned and split by reference
+    /// and the allocator is borrowed for the call instead of `Arc`-cloned,
+    /// so the incarnation probes the cold zc leg runs three times per op
+    /// (`key_incarnation_tracked`, `fill_incarnation`,
+    /// `fill_incarnation_still`) touch neither the heap nor a shared
+    /// refcount line. `None` = unparsable key / unknown backend.
+    ///
+    /// Decoration-tolerant (FIND-RW2-A, fixed in RW4): size-carrying
+    /// `bk:off:len` mappings track their BASE offset's incarnation — the
+    /// decorated window's content dies exactly when the base block is
+    /// freed/reallocated (the same rule `free_block` applies).
+    fn with_allocator_for_key<R>(
+        &self,
+        block_key: &str,
+        f: impl FnOnce(&std::sync::Arc<crate::block_allocator::BlockAllocator>, u64) -> R,
+    ) -> Option<R> {
+        let (be_id, offset) = self.split_block_key(clean_block_key_ref(block_key)).ok()?;
         if be_id == "backend_0" {
-            Some((self.default_allocator.clone(), offset))
+            Some(f(&self.default_allocator, offset))
         } else {
             self.backends
-                .get(&be_id)
-                .map(|be| (be.block_allocator.clone(), offset))
+                .get(be_id)
+                .map(|be| f(&be.block_allocator, offset))
         }
     }
 
@@ -3910,9 +3944,7 @@ impl BackendRouter {
     /// Owner's durable device write for this block-key incarnation completed;
     /// validated cache fills may now publish bytes for it.
     pub fn publish_block(&self, block_key: &str) {
-        if let Some((alloc, offset)) = self.allocator_for_key(block_key) {
-            alloc.publish_block(offset);
-        }
+        self.with_allocator_for_key(block_key, |alloc, offset| alloc.publish_block(offset));
     }
 
     /// A SERVED layout publish committed the durable references `taken`
@@ -3946,16 +3978,16 @@ impl BackendRouter {
     /// Incarnation snapshot for a validated cache fill (None = unstable, do not
     /// publish what you read).
     pub fn fill_incarnation(&self, block_key: &str) -> Option<u64> {
-        self.allocator_for_key(block_key)
-            .and_then(|(alloc, offset)| alloc.fill_incarnation(offset))
+        self.with_allocator_for_key(block_key, |alloc, offset| alloc.fill_incarnation(offset))
+            .flatten()
     }
 
     /// True if the incarnation is unchanged since the pre-read snapshot.
     pub fn fill_incarnation_still(&self, block_key: &str, before: u64) -> bool {
-        match self.allocator_for_key(block_key) {
-            Some((alloc, offset)) => alloc.fill_incarnation_still(offset, before),
-            None => false,
-        }
+        self.with_allocator_for_key(block_key, |alloc, offset| {
+            alloc.fill_incarnation_still(offset, before)
+        })
+        .unwrap_or(false)
     }
 
     /// Whether `block_key` names an allocator-managed offset at all. Legacy
@@ -3965,7 +3997,7 @@ impl BackendRouter {
     /// them (a fill of such a key is always serve-valid; it is still never
     /// cache-published, preserving the historical publish gate).
     pub(crate) fn key_incarnation_tracked(&self, block_key: &str) -> bool {
-        self.allocator_for_key(block_key).is_some()
+        self.with_allocator_for_key(block_key, |_, _| ()).is_some()
     }
 
     /// Free one reference on a block key. The device-range reclaim
@@ -4001,14 +4033,13 @@ impl BackendRouter {
         // Decoration-tolerant: size-carrying mappings (`bk:off:len` — see
         // `parse_block_mapping`) free their BASE block; a raw parse of the
         // decorated string would err and silently leak the block.
-        let cleaned = clean_block_key(block_key);
-        let parts = self.parse_block_key_parts(&cleaned)?;
+        let parts = self.split_block_key_ref(clean_block_key_ref(block_key))?;
         // Spec §6.2 item 6: a free under a DEAD lifetime is the §6.3
         // hazard's destructive face — it would release (and queue a
         // discard for) an offset the allocator has already reissued to
         // another file. Refuse, loudly and counted; the leak-safe
         // direction, exactly like the untracked-free refusal below it.
-        if !self.incarnation_ok(&parts, block_key) {
+        if !self.incarnation_ok(parts, block_key) {
             return Err(Self::err_stale_incarnation(block_key));
         }
         let (be_id, offset) = (parts.be_id, parts.offset);
@@ -4018,7 +4049,7 @@ impl BackendRouter {
                 self.default_allocator.clone(),
                 self.default_device.device_path.clone(),
             )
-        } else if let Some(be) = self.backends.get(&be_id) {
+        } else if let Some(be) = self.backends.get(be_id) {
             (be.block_allocator.clone(), be.device.device_path.clone())
         } else {
             return Ok(());
@@ -5499,17 +5530,49 @@ pub type ZcFetchFn = dyn Fn(
 /// sits in the caller's pages), an un-served one replies through the
 /// ordinary ladder (whose bytes bridge through the transport's bounce,
 /// overwriting anything a failed/stale direct fetch may have landed).
-pub struct ZcReadServe {
-    fetch: Box<ZcFetchFn>,
+pub struct ZcReadServe<'c> {
+    fetch: ZcFetchSource<'c>,
     /// Served payload length; `u32::MAX` = not served (0 is untaken by
     /// construction — the leg requires a nonzero aligned window).
     served: std::sync::atomic::AtomicU32,
 }
 
-impl ZcReadServe {
+/// Where a [`ZcReadServe`] gets its fetch primitive (R-5 read-handler
+/// economy): the LIVE arm borrows the handler's armed connection for the
+/// handler invocation and awaits the transport's own future — the boxed
+/// closure it replaced was one heap allocation per kernel READ (minted
+/// before the warm/cold decision, so every warm serve paid it too) plus a
+/// `Box::pin` and an `Arc` clone per cold fetch. The boxed arm stays for
+/// the injected primitive the in-process suites drive (the sqz kernel is
+/// the only live venue for the real op).
+enum ZcFetchSource<'c> {
+    Conn {
+        conn: &'c fuse3::raw::connection::FuseConnection,
+        slot: fuse3::raw::ReplySlot,
+    },
+    Boxed(Box<ZcFetchFn>),
+}
+
+impl ZcReadServe<'static> {
+    /// An injected fetch primitive (tests).
     pub fn new(fetch: Box<ZcFetchFn>) -> Self {
         ZcReadServe {
-            fetch,
+            fetch: ZcFetchSource::Boxed(fetch),
+            served: std::sync::atomic::AtomicU32::new(u32::MAX),
+        }
+    }
+}
+
+impl<'c> ZcReadServe<'c> {
+    /// The live transport arm: `slot`'s request on the zc-armed `conn`
+    /// (no allocation — the handler holds the connection for the whole
+    /// invocation).
+    pub fn for_connection(
+        conn: &'c fuse3::raw::connection::FuseConnection,
+        slot: fuse3::raw::ReplySlot,
+    ) -> Self {
+        ZcReadServe {
+            fetch: ZcFetchSource::Conn { conn, slot },
             served: std::sync::atomic::AtomicU32::new(u32::MAX),
         }
     }
@@ -5521,7 +5584,10 @@ impl ZcReadServe {
         off: u64,
         len: u32,
     ) -> std::io::Result<u32> {
-        (self.fetch)(fd, off, len).await
+        match &self.fetch {
+            ZcFetchSource::Conn { conn, slot } => conn.zc_device_fetch(*slot, fd, off, len).await,
+            ZcFetchSource::Boxed(f) => f(fd, off, len).await,
+        }
     }
 
     /// Record a validated direct serve of `len` bytes.
@@ -5960,7 +6026,7 @@ pub enum SyncServeArm {
 /// the request's pages and the daemon copy is deleted. Every other case
 /// copies as before.
 #[inline]
-fn zc_fd_source(zc: Option<&ZcReadServe>, dest_addr: Option<u64>, src: &[u8]) -> bool {
+fn zc_fd_source(zc: Option<&ZcReadServe<'_>>, dest_addr: Option<u64>, src: &[u8]) -> bool {
     zc.is_some()
         && dest_addr.is_some()
         && crate::cache::pool::zc_fill_fd_offset(src.as_ptr(), src.len()).is_some()
@@ -12126,9 +12192,19 @@ impl DataRouter {
         // against the freshest map before any hole verdict; only a
         // fresh-map absence serves zeros. (Rebind-loop absences below are
         // fresh by construction — they come from current_block_binding.)
-        let mut key: Option<String> = match resolved_key {
-            Some(k) => Some(k.to_string()),
-            None => self.current_block_binding(file_path, b).await?,
+        // R-5: the first attempt BORROWS the caller's resolved key and the
+        // recheck compares against the live map in place
+        // (`block_binding_is`) — the ladder's hit path (a RAM-tier serve,
+        // every non-zc cold fill) minted two `String`s per op here: the
+        // key copy and the recheck's owned resolve. Only a LOSS
+        // materializes the current binding, because only a loss needs it
+        // as the next attempt's key.
+        let mut key: Option<std::borrow::Cow<'_, str>> = match resolved_key {
+            Some(k) => Some(std::borrow::Cow::Borrowed(k)),
+            None => self
+                .current_block_binding(file_path, b)
+                .await?
+                .map(std::borrow::Cow::Owned),
         };
         let mut losses = 0usize;
         for attempt in 0..ladder_cap {
@@ -12176,7 +12252,7 @@ impl DataRouter {
                     // wrong-bytes fill; propagate only when the CURRENT map
                     // still binds this key (a real I/O/corruption error).
                     let current = self.current_block_binding(file_path, b).await?;
-                    if current.as_deref() == Some(cur_key.as_str()) {
+                    if current.as_deref() == Some(&*cur_key) {
                         return Err(e);
                     }
                     losses += 1;
@@ -12188,7 +12264,7 @@ impl DataRouter {
                          current={:?} err={e}",
                         file_path, b, cur_key, current
                     );
-                    key = current;
+                    key = current.map(std::borrow::Cow::Owned);
                     continue;
                 }
             };
@@ -12200,11 +12276,14 @@ impl DataRouter {
                 squeezefs_ipc::sqz_time::sleep(Duration::from_millis(recheck_delay)).await;
             }
             let bind_t0 = std::time::Instant::now();
-            let current = self.current_block_binding(file_path, b).await?;
+            let still_bound = self.block_binding_is(file_path, b, &cur_key).await?;
             read_serve_phase_record(ReadServePhase::BindingCheck, bind_t0);
-            if incarnation_valid && current.as_deref() == Some(cur_key.as_str()) {
+            if incarnation_valid && still_bound {
                 return Ok(Some(val));
             }
+            // A loss: resolve the CURRENT binding (owned — it is the next
+            // attempt's key) for the retry and the tape.
+            let current = self.current_block_binding(file_path, b).await?;
             losses += 1;
             METRICS
                 .stale_binding_rebinds
@@ -12213,7 +12292,7 @@ impl DataRouter {
                 "stale-binding rebind: file={} block={} resolved_key={} current={:?} fill_valid={} escalated={}",
                 file_path, b, cur_key, current, incarnation_valid, escalated
             );
-            key = current;
+            key = current.map(std::borrow::Cow::Owned);
         }
         if escalate_contended {
             // Pure-read exhaustion = starvation under LEGAL writer churn,
@@ -16730,10 +16809,7 @@ impl DataRouter {
         size: u32,
         dest: Option<ReadDest>,
         hint: ReadClassHint,
-    ) -> Result<(
-        bytes::Bytes,
-        Option<std::sync::Arc<dyn std::any::Any + Send + Sync>>,
-    )> {
+    ) -> Result<bytes::Bytes> {
         self.read_file_range_zero_copy_with_meta(file_path, offset, size, dest, hint, None, None)
             .await
     }
@@ -16755,11 +16831,8 @@ impl DataRouter {
         dest: Option<ReadDest>,
         hint: ReadClassHint,
         meta_hint: Option<CachedMetadata>,
-        zc: Option<&ZcReadServe>,
-    ) -> Result<(
-        bytes::Bytes,
-        Option<std::sync::Arc<dyn std::any::Any + Send + Sync>>,
-    )> {
+        zc: Option<&ZcReadServe<'_>>,
+    ) -> Result<bytes::Bytes> {
         // OQ-5 (lost-wakeup wedge, 2026-07-30): the warm all-RAM serve legs
         // below (fresh/dirty moka meta + staging-ring mmap / hot-block RAM
         // tier) can complete with ZERO tokio coop-budget leaves — a caller
@@ -16854,7 +16927,7 @@ impl DataRouter {
             match meta.file_type.as_str() {
                 "inline" => {
                     if offset >= meta.size {
-                        return Ok((bytes::Bytes::new(), None));
+                        return Ok(bytes::Bytes::new());
                     }
                     let want = (std::cmp::min(offset + size as u64, meta.size) - offset) as usize;
                     let dlen = meta.data_key.as_ref().map(|d| d.len()).unwrap_or(0);
@@ -16866,7 +16939,7 @@ impl DataRouter {
                             &meta.data_key.as_ref().expect("dlen > 0")[start..end],
                         );
                     }
-                    return Ok((bytes::Bytes::from(out), None));
+                    return Ok(bytes::Bytes::from(out));
                 }
                 "staged" => {
                     let file_id = meta.file_id.clone().ok_or_else(|| {
@@ -16882,7 +16955,7 @@ impl DataRouter {
                         // phase 2), so a hit needs no further validation.
                         METRICS.cache_hits.fetch_add(1, Ordering::Relaxed);
                         if offset >= meta.size {
-                            return Ok((bytes::Bytes::new(), None));
+                            return Ok(bytes::Bytes::new());
                         }
                         // Full below-EOF length; the blob may be shorter than the
                         // logical size (truncate-up hole tail) — pad with zeros.
@@ -16907,7 +16980,7 @@ impl DataRouter {
                                 let lo = abs - offset as usize;
                                 out[lo..lo + d.len()].copy_from_slice(&d);
                             }
-                            let (data, backing) = if let Some(dest) = dest_addr {
+                            let data = if let Some(dest) = dest_addr {
                                 let dest_ptr = dest as *mut u8;
                                 // SAFETY: the destination window this serve was bounded against at
                                 // entry (`ReadDest::checked_ptr`, FUSE-4e) — writes stay within
@@ -16919,15 +16992,14 @@ impl DataRouter {
                                         dest_ptr,
                                         out.len(),
                                     );
-                                    let d = dest_bytes(dest_ptr, out.len());
-                                    (d, None)
+                                    dest_bytes(dest_ptr, out.len())
                                 }
                             } else {
-                                (bytes::Bytes::from(out), None)
+                                bytes::Bytes::from(out)
                             };
-                            return Ok((data, backing));
+                            return Ok(data);
                         }
-                        let (data, backing) = if let Some(dest) = dest_addr {
+                        let data = if let Some(dest) = dest_addr {
                             let dest_ptr = dest as *mut u8;
                             // SAFETY: the destination window this serve was bounded against at
                             // entry (`ReadDest::checked_ptr`, FUSE-4e) — writes stay within
@@ -16942,21 +17014,19 @@ impl DataRouter {
                                 if want > phys {
                                     std::ptr::write_bytes(dest_ptr.add(phys), 0, want - phys);
                                 }
-                                let d = dest_bytes(dest_ptr, want);
-                                (d, None)
+                                dest_bytes(dest_ptr, want)
                             }
                         } else if phys == want {
                             let mut sliced_guard = guard;
                             sliced_guard.offset += start;
                             sliced_guard.len = phys;
-                            let d = bytes::Bytes::copy_from_slice(&sliced_guard);
-                            (d, None)
+                            bytes::Bytes::copy_from_slice(&sliced_guard)
                         } else {
                             let mut out = vec![0u8; want];
                             out[..phys].copy_from_slice(&guard[start..end]);
-                            (bytes::Bytes::from(out), None)
+                            bytes::Bytes::from(out)
                         };
-                        return Ok((data, backing));
+                        return Ok(data);
                     }
 
                     // Ring miss. A LIVE staged identity is reachable through
@@ -16968,7 +17038,7 @@ impl DataRouter {
                     // degrade to zeros ONLY for a stable lost identity.
                     if let Some(bk) = self.staged_block_mapping(file_path, &meta).await {
                         if offset >= meta.size {
-                            return Ok((bytes::Bytes::new(), None));
+                            return Ok(bytes::Bytes::new());
                         }
                         let fetched = self.read_promoted_staged_block(&bk).await;
                         // Binding revalidation (the promoted-mapping ABA — same
@@ -17018,7 +17088,7 @@ impl DataRouter {
                                     let lo = abs - offset as usize;
                                     out[lo..lo + d.len()].copy_from_slice(&d);
                                 }
-                                return Ok((bytes::Bytes::from(out), None));
+                                return Ok(bytes::Bytes::from(out));
                             }
                             Err(e) if still_bound => return Err(e),
                             _ => {
@@ -17073,19 +17143,19 @@ impl DataRouter {
                     // semantics), loudly.
                     let len = lost_staged_range_len(meta.size, offset, size);
                     self.note_lost_staged_payload(file_path, &file_id);
-                    return Ok((bytes::Bytes::from(vec![0u8; len]), None));
+                    return Ok(bytes::Bytes::from(vec![0u8; len]));
                 }
                 "striped" => {
                     let block_size = self.block_size.load(std::sync::atomic::Ordering::Relaxed);
                     let file_size = meta.size;
 
                     if offset >= file_size {
-                        return Ok((bytes::Bytes::new(), None));
+                        return Ok(bytes::Bytes::new());
                     }
 
                     let end_offset = std::cmp::min(offset + size as u64, file_size);
                     if offset >= end_offset {
-                        return Ok((bytes::Bytes::new(), None));
+                        return Ok(bytes::Bytes::new());
                     }
 
                     let start_block = (offset / block_size) as u32;
@@ -17161,7 +17231,7 @@ impl DataRouter {
                                 for (abs, d) in ext_runs {
                                     out[abs - rel_s..abs - rel_s + d.len()].copy_from_slice(&d);
                                 }
-                                let (data, backing) = if let Some(dest) = dest_addr {
+                                let data = if let Some(dest) = dest_addr {
                                     let dest_ptr = dest as *mut u8;
                                     // SAFETY: the destination window this serve was bounded against at
                                     // entry (`ReadDest::checked_ptr`, FUSE-4e) — writes stay within
@@ -17173,13 +17243,12 @@ impl DataRouter {
                                             dest_ptr,
                                             out.len(),
                                         );
-                                        let d = dest_bytes(dest_ptr, out.len());
-                                        (d, None)
+                                        dest_bytes(dest_ptr, out.len())
                                     }
                                 } else {
-                                    (bytes::Bytes::from(out), None)
+                                    bytes::Bytes::from(out)
                                 };
-                                return Ok((data, backing));
+                                return Ok(data);
                             }
                         }
 
@@ -17189,7 +17258,7 @@ impl DataRouter {
                             let end =
                                 std::cmp::min((slice_start + slice_len as u64) as usize, guard.len);
                             let len = end - start;
-                            let (data, backing) = if let Some(dest) = dest_addr {
+                            let data = if let Some(dest) = dest_addr {
                                 let dest_ptr = dest as *mut u8;
                                 // SAFETY: the destination window this serve was bounded against at
                                 // entry (`ReadDest::checked_ptr`, FUSE-4e) — writes stay within
@@ -17201,17 +17270,15 @@ impl DataRouter {
                                         dest_ptr,
                                         len,
                                     );
-                                    let d = dest_bytes(dest_ptr, len);
-                                    (d, None)
+                                    dest_bytes(dest_ptr, len)
                                 }
                             } else {
                                 let mut sliced_guard = guard;
                                 sliced_guard.offset += start;
                                 sliced_guard.len = len;
-                                let d = bytes::Bytes::copy_from_slice(&sliced_guard);
-                                (d, None)
+                                bytes::Bytes::copy_from_slice(&sliced_guard)
                             };
-                            return Ok((data, backing));
+                            return Ok(data);
                         }
 
                         // Check the RAM tiers, then the NVMe read block cache
@@ -17219,9 +17286,30 @@ impl DataRouter {
                         // resolve; `classify_probe` runs from here to the
                         // serve-or-fetch decision).
                         let key_t0 = std::time::Instant::now();
-                        let block_keys = self
-                            .load_striped_block_keys(file_path, &meta, start_block, end_block)
-                            .await?;
+                        // R-5: the single-block resolve borrows straight
+                        // out of the live map (`block_key_in`) — the
+                        // span-resolving `load_striped_block_keys` (a
+                        // `Vec`, a key clone and a one-element sort per
+                        // READ) is reached only for the shapes it alone
+                        // can answer (the partial store, the anomalous
+                        // map-id-without-map entry).
+                        let resolved_key: Option<std::borrow::Cow<'_, str>> =
+                            match block_key_in(&meta, start_block) {
+                                BlockKeyResolve::Key(k) => Some(k),
+                                BlockKeyResolve::Hole => None,
+                                BlockKeyResolve::NeedsAuthority => self
+                                    .load_striped_block_keys(
+                                        file_path,
+                                        &meta,
+                                        start_block,
+                                        end_block,
+                                    )
+                                    .await?
+                                    .pop()
+                                    .and_then(|(_, k)| k)
+                                    .map(std::borrow::Cow::Owned),
+                            };
+                        let b_key_opt: Option<&str> = resolved_key.as_deref();
                         read_serve_phase_record(ReadServePhase::KeyResolve, key_t0);
                         let probe_t0 = std::time::Instant::now();
                         // Hybrid-I/O diagnostic escape (user directive
@@ -17294,8 +17382,7 @@ impl DataRouter {
                         // same law, same stamp (a pooled fill for a window
                         // the demand read DMAs itself is a double-fetch).
                         if !device_true && !hint.lane_pre_fed {
-                            let first_key = block_keys.first().and_then(|(_, k)| k.as_deref());
-                            let will_wait = first_key.is_some_and(|k| {
+                            let will_wait = b_key_opt.is_some_and(|k| {
                                 self.inflight_block_reads.read_sync(k, |_, _| ()).is_some()
                             });
                             self.pipeline_touch(
@@ -17307,12 +17394,12 @@ impl DataRouter {
                                 start_block,
                                 end_block,
                                 will_wait,
-                                first_key,
+                                b_key_opt,
                                 true,
                                 dest_leaseable || zc_geometry,
                             );
                         }
-                        if let Some((_, b_key_opt)) = block_keys.first() {
+                        {
                             // R4 hot-block fast path (§5.4): a hot hit takes
                             // the SAME binding recheck as the NVMe-tier hit
                             // below — hot entries hold current-incarnation
@@ -17421,7 +17508,7 @@ impl DataRouter {
                                                 .read_lane_hold
                                                 .credit(b_key, (end - start) as u64);
                                         }
-                                        return Ok((data, None));
+                                        return Ok(data);
                                     }
                                     METRICS
                                         .stale_binding_rebinds
@@ -17556,7 +17643,7 @@ impl DataRouter {
                                                 self.hold_serve_admission(b_key, &held, class)
                                                     .await;
                                             }
-                                            return Ok((data, None));
+                                            return Ok(data);
                                         }
                                         METRICS
                                             .stale_binding_rebinds
@@ -17653,7 +17740,7 @@ impl DataRouter {
                                         if self.read_lane.enabled() {
                                             self.cache.read_lane_hold.credit(b_key, len as u64);
                                         }
-                                        return Ok((data, None));
+                                        return Ok(data);
                                     }
                                     METRICS
                                         .stale_binding_rebinds
@@ -17731,7 +17818,7 @@ impl DataRouter {
                                                             Ordering::Relaxed,
                                                         );
                                                         zcs.mark_served(n);
-                                                        return Ok((bytes::Bytes::new(), None));
+                                                        return Ok(bytes::Bytes::new());
                                                     }
                                                     METRICS
                                                         .stale_binding_rebinds
@@ -17783,7 +17870,7 @@ impl DataRouter {
                             // than a second device fetch of bytes a
                             // completing fill already carries.
                             let lease_admits = dest_leaseable
-                                && b_key_opt.as_ref().is_some_and(|k| {
+                                && b_key_opt.is_some_and(|k| {
                                     self.inflight_block_reads.read_sync(k, |_, _| ()).is_none()
                                 });
                             if b_key_opt.is_some()
@@ -17904,7 +17991,7 @@ impl DataRouter {
                                                 }
                                             },
                                         };
-                                        return Ok((data, None));
+                                        return Ok(data);
                                     }
                                     None => {
                                         // Hole in the current map: zeros.
@@ -17922,7 +18009,7 @@ impl DataRouter {
                                         } else {
                                             bytes::Bytes::from(vec![0u8; len])
                                         };
-                                        return Ok((data, None));
+                                        return Ok(data);
                                     }
                                 }
                             }
@@ -18335,7 +18422,7 @@ impl DataRouter {
                                     // dest untouched.
                                     if let Some(b) = fd_slice {
                                         note_zc_pool_serve(b.len(), false);
-                                        return Ok((b, Some(std::sync::Arc::new(downloaded))));
+                                        return Ok(b);
                                     }
                                     if let Some(dest) = dest_addr {
                                         let len = (end_offset - offset) as usize;
@@ -18344,7 +18431,7 @@ impl DataRouter {
                                         // `cap`, and §5.4 lease exclusivity (kernel path) / session arena
                                         // custody (il path) makes this request its only writer.
                                         let data = unsafe { dest_bytes(dest as *mut u8, len) };
-                                        return Ok((data, Some(std::sync::Arc::new(downloaded))));
+                                        return Ok(data);
                                     } else {
                                         let slice_t0 = std::time::Instant::now();
                                         let start =
@@ -18378,7 +18465,7 @@ impl DataRouter {
                                             }
                                         };
                                         read_serve_phase_record(ReadServePhase::SliceOut, slice_t0);
-                                        return Ok((data, Some(std::sync::Arc::new(downloaded))));
+                                        return Ok(data);
                                     }
                                 }
                                 None => {
@@ -18400,7 +18487,7 @@ impl DataRouter {
                                         hole_pooled.resize(len, 0);
                                         bytes::Bytes::copy_from_slice(&hole_pooled)
                                     };
-                                    return Ok((data, None));
+                                    return Ok(data);
                                 }
                             }
                         }
@@ -18688,7 +18775,7 @@ impl DataRouter {
                     // bounce is gone); the payload arm hands out the same
                     // `UringBufOwner` view as before. Every writer joined
                     // above, so the view is quiescent.
-                    return Ok((dest.into_bytes(), None));
+                    return Ok(dest.into_bytes());
                 }
                 _ => {
                     return Err(SqueezefsError::InvalidOperation(format!(
@@ -18998,10 +19085,13 @@ impl DataRouter {
         start: usize,
         end: usize,
     ) -> Vec<(usize, Vec<u8>)> {
-        let key = crate::keys::active_block_ext_for_path(file_path, b);
-        if !self.cache.nvme.has_staged_extent_record(&key) {
+        // The existence gate runs on the stack key (R-5): every striped
+        // READ probes here and the record is absent on a clean block, so
+        // the heap key is minted only when a record exists to read.
+        if !self.has_staged_extent_runs(file_path, b) {
             return Vec::new();
         }
+        let key = crate::keys::active_block_ext_for_path(file_path, b);
         match self.cache.nvme.read_extent_record(&key) {
             Some(Ok(rec)) => rec
                 .extents

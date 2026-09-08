@@ -2474,17 +2474,64 @@ pub enum ReadCustodyFp {
     Map {
         map: std::sync::Arc<std::collections::HashMap<u32, String>>,
         start: u32,
-        epochs: Vec<u64>,
+        epochs: CustodyEpochs,
     },
     /// `block_prefix` files: keys are pure functions of the prefix.
     Prefix {
         prefix: String,
         start: u32,
-        epochs: Vec<u64>,
+        epochs: CustodyEpochs,
     },
     /// Authoritative async fallback (the anomalous map-id-without-map
     /// shape): owned resolved keys, the historical representation.
     Owned(Vec<(u32, Option<String>, u64)>),
+}
+
+/// The covered window's custody-epoch words, INLINE for the windows a
+/// kernel READ actually covers (R-5 read-handler economy): the negotiated
+/// `max_write` is ≤ 1 MiB against a 4 MiB production block, so a READ
+/// spans one block — two when it straddles a boundary — and the `Vec<u64>`
+/// this used to be was two heap allocations per op (the fingerprint is
+/// built before AND after the router) for one or two words. Wider windows
+/// (small-block fixtures, the GDS ioctl) spill to the heap arm.
+#[derive(Debug, Clone)]
+pub enum CustodyEpochs {
+    Inline { len: u8, words: [u64; 4] },
+    Heap(Vec<u64>),
+}
+
+impl CustodyEpochs {
+    fn collect(iter: impl Iterator<Item = u64>) -> Self {
+        let mut words = [0u64; 4];
+        let mut len = 0usize;
+        let mut iter = iter.peekable();
+        while len < words.len() {
+            match iter.next() {
+                Some(w) => {
+                    words[len] = w;
+                    len += 1;
+                }
+                None => break,
+            }
+        }
+        if iter.peek().is_none() {
+            return CustodyEpochs::Inline {
+                len: len as u8,
+                words,
+            };
+        }
+        let mut v = Vec::with_capacity(len + 4);
+        v.extend_from_slice(&words[..len]);
+        v.extend(iter);
+        CustodyEpochs::Heap(v)
+    }
+
+    fn as_slice(&self) -> &[u64] {
+        match self {
+            CustodyEpochs::Inline { len, words } => &words[..usize::from(*len)],
+            CustodyEpochs::Heap(v) => v,
+        }
+    }
 }
 
 /// A covered block's binding key, borrowed from its fingerprint — the
@@ -2533,7 +2580,7 @@ impl ReadCustodyFp {
         }
         let start = (offset / block_size) as u32;
         let end = ((offset + len as u64 - 1) / block_size) as u32;
-        let epochs: Vec<u64> = (start..=end).map(|b| block_custody_epoch(ino, b)).collect();
+        let epochs = CustodyEpochs::collect((start..=end).map(|b| block_custody_epoch(ino, b)));
         if let Some(map) = &meta.block_map {
             Some(ReadCustodyFp::Map {
                 map: map.clone(),
@@ -2554,14 +2601,16 @@ impl ReadCustodyFp {
     fn window(&self) -> (u32, usize) {
         match self {
             ReadCustodyFp::Map { start, epochs, .. }
-            | ReadCustodyFp::Prefix { start, epochs, .. } => (*start, epochs.len()),
+            | ReadCustodyFp::Prefix { start, epochs, .. } => (*start, epochs.as_slice().len()),
             ReadCustodyFp::Owned(v) => (v.first().map(|(b, _, _)| *b).unwrap_or(0), v.len()),
         }
     }
 
     fn epoch(&self, i: usize) -> u64 {
         match self {
-            ReadCustodyFp::Map { epochs, .. } | ReadCustodyFp::Prefix { epochs, .. } => epochs[i],
+            ReadCustodyFp::Map { epochs, .. } | ReadCustodyFp::Prefix { epochs, .. } => {
+                epochs.as_slice()[i]
+            }
             ReadCustodyFp::Owned(v) => v[i].2,
         }
     }
@@ -26195,7 +26244,7 @@ impl Filesystem for SqueezefsFilesystem {
         // capture the parked runs before AND after the base read (the
         // moving-custody protocol's two sandwich halves).
         let src_pre_runs = self.capture_parked_runs(inode, off_in, effective_len);
-        let (src_data, _src_backing) = self
+        let src_data = self
             .router
             .read_file_range_zero_copy(
                 &src_path,
@@ -30228,7 +30277,7 @@ impl SqueezefsFilesystem {
                         drop(buf);
                         let mut out = vec![0u8; read_len];
                         if deferred && !covered {
-                            let (base, _backing) = self
+                            let base = self
                                 .router
                                 .read_file_range_zero_copy(
                                     &file_path,
@@ -30435,18 +30484,13 @@ impl SqueezefsFilesystem {
         // ring slots only: il arena overrides never ride FUSE replies,
         // and `dest` still points at the transport BOUNCE, so every warm/
         // ineligible serve keeps its venue unchanged.
+        // R-5: the handle BORROWS the connection the guard above holds for
+        // this invocation — no box, no `Arc` clone per READ.
         let zc_serve = conn_guard
             .as_ref()
             .as_ref()
             .filter(|c| c.zc_armed() && _req.slot.is_ring() && arena_dest.is_none())
-            .map(|conn| {
-                let conn = conn.clone();
-                let slot = _req.slot;
-                crate::routing::ZcReadServe::new(Box::new(move |fd, off, len| {
-                    let conn = conn.clone();
-                    Box::pin(async move { conn.zc_device_fetch(slot, fd, off, len).await })
-                }))
-            });
+            .map(|conn| crate::routing::ZcReadServe::for_connection(conn, _req.slot));
 
         // OVERLAY NEVER INVISIBLE — the moving-custody read protocol
         // (fstests generic/795, VL10 release gate). A block's acked bytes
@@ -30499,7 +30543,7 @@ impl SqueezefsFilesystem {
         // the leg and re-reads through the ordinary ladder, whose reply
         // bridges through the transport bounce and OVERWRITES the pages.
         let mut zc_enabled = true;
-        let (data, backing, router_done_at) = loop {
+        let (data, router_done_at) = loop {
             let pre_runs = self.capture_parked_runs(ino, offset, read_len);
 
             // The zc leg composes with the overlay-never-invisible law by
@@ -30529,7 +30573,7 @@ impl SqueezefsFilesystem {
             let read_res = read_future.await;
             prof.mark_backend_done();
             let router_done_at = std::time::Instant::now();
-            let (data, backing) = match read_res {
+            let data = match read_res {
                 Ok(res) => res,
                 Err(e) => {
                     error!("FUSE Read error: {:?}", e);
@@ -30555,7 +30599,7 @@ impl SqueezefsFilesystem {
                     && overlay_live.is_empty()
                     && read_custody_fp_matches(&bindings_after, &bindings_before)
                 {
-                    break (data, backing, router_done_at);
+                    break (data, router_done_at);
                 }
                 zc_enabled = false;
                 bindings_before = bindings_after;
@@ -30603,7 +30647,7 @@ impl SqueezefsFilesystem {
             if overlay_blocks.is_empty()
                 && read_custody_fp_matches(&bindings_after, &bindings_before)
             {
-                break (data, backing, router_done_at);
+                break (data, router_done_at);
             }
             if overlay_blocks.is_empty() && attempts < 2 {
                 // Benign fingerprint churn (a publish landed mid-window):
@@ -30632,7 +30676,7 @@ impl SqueezefsFilesystem {
                 .read_window_settled(ino, &file_path, offset, read_len)
                 .await
                 .map_err(map_squeezefs_err)?;
-            break (settled, None, router_done_at);
+            break (settled, router_done_at);
         };
         // Last iteration's overlay-apply + fingerprint re-check span, then
         // the whole per-op residence.
@@ -30645,7 +30689,7 @@ impl SqueezefsFilesystem {
             if let Some(n) = zc_serve.as_ref().and_then(|z| z.served()) {
                 return Ok(ReplyData {
                     data,
-                    backing,
+                    backing: None,
                     zc_prefilled: Some(n),
                     zc_fd_body: None,
                 });
@@ -30665,7 +30709,7 @@ impl SqueezefsFilesystem {
             .and_then(|_| crate::cache::pool::zc_fill_fd_offset(data.as_ptr(), data.len()));
         Ok(ReplyData {
             data,
-            backing,
+            backing: None,
             zc_prefilled: None,
             zc_fd_body,
         })

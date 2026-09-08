@@ -67,7 +67,7 @@ impl Drop for AlignedDest {
     }
 }
 
-fn zc_handle() -> ZcReadServe {
+fn zc_handle() -> ZcReadServe<'static> {
     ZcReadServe::new(Box::new(|_fd, _off, _len| {
         Box::pin(async { Err(std::io::Error::other("no device fetch on the warm row")) })
     }))
@@ -159,7 +159,7 @@ async fn warm_hot_loop_row() {
     for pass in 0..2 {
         for &blk in &ORDER {
             let h0 = METRICS.hot_block_hits.load(Ordering::Relaxed);
-            let (d, _b) = fs
+            let d = fs
                 .router
                 .read_file_range_zero_copy_with_meta(
                     &path,
@@ -200,7 +200,7 @@ async fn warm_hot_loop_row() {
     for i in 0..LOOPS {
         let blk = ORDER[i % BLOCKS as usize];
         let zc = zc_handle();
-        let (d, _b) = fs
+        let d = fs
             .router
             .read_file_range_zero_copy_with_meta(
                 &path,

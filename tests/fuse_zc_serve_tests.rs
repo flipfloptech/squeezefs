@@ -200,7 +200,7 @@ impl FakePages {
         }
     }
 
-    fn serve(&self, fail: bool) -> ZcReadServe {
+    fn serve(&self, fail: bool) -> ZcReadServe<'static> {
         let captured = Arc::clone(&self.captured);
         let fetches = Arc::clone(&self.fetches);
         ZcReadServe::new(Box::new(move |fd, off, len| {
@@ -253,7 +253,7 @@ async fn zc_direct_leg_engagement_and_fallbacks() {
     let pages = FakePages::new();
     let zc = pages.serve(false);
     let zc0 = METRICS.read_zc_serve_bytes.load(Ordering::Relaxed);
-    let (data, _backing) =
+    let data =
         h.fs.router
             .read_file_range_zero_copy_with_meta(
                 &path,
@@ -298,7 +298,7 @@ async fn zc_direct_leg_engagement_and_fallbacks() {
     // ---- Contract 1b: whole-block shape (block 1). ----
     let zc = pages.serve(false);
     let zc0 = METRICS.read_zc_serve_bytes.load(Ordering::Relaxed);
-    let (data, _backing) =
+    let data =
         h.fs.router
             .read_file_range_zero_copy_with_meta(
                 &path,
@@ -328,7 +328,7 @@ async fn zc_direct_leg_engagement_and_fallbacks() {
 
     // ---- Contract 2: warm serves keep their venue. ----
     // Warm block 2 through an ordinary read (fills the RAM tier)…
-    let (warm_fill, _b) =
+    let warm_fill =
         h.fs.router
             .read_file_range_zero_copy_with_meta(
                 &path,
@@ -346,7 +346,7 @@ async fn zc_direct_leg_engagement_and_fallbacks() {
     let zc = pages.serve(false);
     let zc0 = METRICS.read_zc_serve_bytes.load(Ordering::Relaxed);
     let f0 = pages.fetches.load(Ordering::Relaxed);
-    let (data, _b) =
+    let data =
         h.fs.router
             .read_file_range_zero_copy_with_meta(
                 &path,
@@ -380,7 +380,7 @@ async fn zc_direct_leg_engagement_and_fallbacks() {
     let zc0 = METRICS.read_zc_serve_bytes.load(Ordering::Relaxed);
     let off = 3 * BS + 1234;
     let len = 8192u32;
-    let (data, _b) =
+    let data =
         h.fs.router
             .read_file_range_zero_copy_with_meta(
                 &path,
@@ -419,7 +419,7 @@ async fn zc_fetch_failure_falls_through_to_the_ordinary_ladder() {
     let pages = FakePages::new();
     let zc = pages.serve(true);
     let zc0 = METRICS.read_zc_serve_bytes.load(Ordering::Relaxed);
-    let (data, _b) =
+    let data =
         h.fs.router
             .read_file_range_zero_copy_with_meta(
                 &path,

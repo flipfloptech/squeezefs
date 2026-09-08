@@ -2,7 +2,7 @@
 # The require-mount gate (spec §11 TEST-2) — the release-gate leg that
 # makes "all green" mean "the live-mount surface actually ran".
 #
-# Twelve test binaries drive a real FUSE-over-io_uring mount. Before this
+# Thirteen test binaries drive a real FUSE-over-io_uring mount. Before this
 # gate they self-skipped and reported PASS on a box without /dev/fuse,
 # `fuse.enable_uring`, or fusermount3 — so `cargo test --all-features`
 # could be green with the product's core mechanism entirely unexecuted,
@@ -15,7 +15,7 @@
 # stay skips here — pass SQUEEZEFS_TEST_REQUIRE_ALL=1 to promote them too.
 #
 # Usage:
-#   tests/run_require_mount_gate.sh            # the twelve mount suites
+#   tests/run_require_mount_gate.sh            # the thirteen mount suites
 #   tests/run_require_mount_gate.sh --ledger-only   # just print the ledger
 #   SQZ_REQUIRE_GATE_TESTS="statfs_tests" tests/run_require_mount_gate.sh
 set -euo pipefail
@@ -30,6 +30,7 @@ mkdir -p "$(dirname "$LEDGER")"
 DEFAULT_TESTS=(
   cache_path_policy_tests
   cli_clients_df_tests
+  commit_wake_loss_tests
   format_guard_tests
   mount_owner_override_tests
   multi_queue_tests

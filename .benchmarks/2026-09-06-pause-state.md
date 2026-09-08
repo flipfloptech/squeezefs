@@ -157,6 +157,10 @@ mount (the A-arm rig reset the cluster; remount is part of every arm).
    received ≡ the authority's `fold_passes` ±2; reminted 0; throughput
    par. Board item opened: the range grant's coverage rule (why a
    whole-block writer ships an extent). Gate on `96f8d873` running.
+   **Gate on the round-2 tip — GREEN on `96f8d873`** (20:42–21:37, pinned
+   worktree, from zero, laptop idle: 362 suites / **4,792 tests**, 18
+   stages, both audits). Every code landing of 2026-09-06 → 09-08 is
+   gated; `dev` = `1cb1d122` (docs over it). Releasable as 1.2.2.
 2. **Kernel A/B, B arm** — after `squeeze-test` boots the 6.19.14 series
    WITH 0031 (or whichever box carries the patched kernel): on the box,
    `cd /scratch/tmp/sqz-agent/k26 && sudo env ARM=B KERNEL_TAG=<uname -r

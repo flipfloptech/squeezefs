@@ -1,0 +1,42 @@
+IOR-4.0.0: MPI Coordinated Test of Parallel I/O
+Began               : Tue Sep  8 00:46:11 2026
+Command line        : /scratch/tmp/sqz-agent/src-1.2/target/mw-ior/ior-4.0.0/src/ior -a POSIX -b 4m -t 4m -s 8 -w -e -k -E -G 243525162 -i 2 -o /scratch/tmp/sqz-agent/mwfleet-mnt/m50/s11-mpiio.dat
+Machine             : Linux memp-s3ds-aqs-37
+TestID              : 0
+StartTime           : Tue Sep  8 00:46:11 2026
+Path                : /scratch/tmp/sqz-agent/mwfleet-mnt/m50/s11-mpiio.dat
+FS                  : 64.0 GiB   Used FS: 0.0%   Inodes: 1.0 Mi   Used Inodes: 0.0%
+
+Options: 
+api                 : POSIX
+apiVersion          : 
+test filename       : /scratch/tmp/sqz-agent/mwfleet-mnt/m50/s11-mpiio.dat
+access              : single-shared-file
+type                : independent
+segments            : 8
+ordering in a file  : sequential
+ordering inter file : no tasks offsets
+nodes               : 1
+tasks               : 32
+clients per node    : 32
+repetitions         : 2
+xfersize            : 4 MiB
+blocksize           : 4 MiB
+aggregate filesize  : 1 GiB
+
+Results: 
+WARNING: The file "/scratch/tmp/sqz-agent/mwfleet-mnt/m50/s11-mpiio.dat" exists already and will be overwritten
+
+access    bw(MiB/s)  IOPS       Latency(s)  block(KiB) xfer(KiB)  open(s)    wr/rd(s)   close(s)   total(s)   iter
+------    ---------  ----       ----------  ---------- ---------  --------   --------   --------   --------   ----
+write     2435.01    609.05     0.165903    4096       4096       0.000831   0.420328   0.285581   0.420533   0   
+WARNING: fsync(62) failed
+WARNING: fsync(38) failed
+WARNING: fsync(140) failed
+WARNING: fsync(48) failed
+write     16.69      4.18       30.60       4096       4096       0.000400   61.25      61.25      61.34      1   
+
+Summary of all tests:
+Operation   Max(MiB)   Min(MiB)  Mean(MiB)     StdDev   Max(OPs)   Min(OPs)  Mean(OPs)     StdDev    Mean(s) Stonewall(s) Stonewall(MiB) Test# #Tasks tPN reps fPP reord reordoff reordrand seed segcnt   blksiz    xsize aggs(MiB)   API RefNum
+write        2435.01      16.69    1225.85    1209.16     608.75       4.17     306.46     302.29   30.87856         NA            NA     0     32  32    2   0     0        1         0    0      8  4194304  4194304    1024.0 POSIX      0
+Finished            : Tue Sep  8 00:47:13 2026

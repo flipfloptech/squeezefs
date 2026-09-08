@@ -1,0 +1,56 @@
+IOR-4.0.0: MPI Coordinated Test of Parallel I/O
+Began               : Tue Sep  8 01:03:43 2026
+Command line        : /scratch/tmp/sqz-agent/src-1.2/target/mw-ior/ior-4.0.0/src/ior -a POSIX -b 4m -t 4m -s 80 -w -e -k -E -G 1068491920 -i 20 -F -o /scratch/tmp/sqz-agent/mwfleet-mnt/m50/s11-mpiio-fpp.dat
+Machine             : Linux memp-s3ds-aqs-37
+TestID              : 0
+StartTime           : Tue Sep  8 01:03:43 2026
+Path                : /scratch/tmp/sqz-agent/mwfleet-mnt/m50/s11-mpiio-fpp.dat.00000000
+FS                  : 64.0 GiB   Used FS: 95.3%   Inodes: 1.0 Mi   Used Inodes: 0.0%
+
+Options: 
+api                 : POSIX
+apiVersion          : 
+test filename       : /scratch/tmp/sqz-agent/mwfleet-mnt/m50/s11-mpiio-fpp.dat
+access              : file-per-process
+type                : independent
+segments            : 80
+ordering in a file  : sequential
+ordering inter file : no tasks offsets
+nodes               : 1
+tasks               : 32
+clients per node    : 32
+repetitions         : 20
+xfersize            : 4 MiB
+blocksize           : 4 MiB
+aggregate filesize  : 10 GiB
+
+Results: 
+
+access    bw(MiB/s)  IOPS       Latency(s)  block(KiB) xfer(KiB)  open(s)    wr/rd(s)   close(s)   total(s)   iter
+------    ---------  ----       ----------  ---------- ---------  --------   --------   --------   --------   ----
+write     3449.55    863.00     1.21        4096       4096       0.007212   2.97       1.76       2.97       0   
+write     2744.08    686.56     1.63        4096       4096       0.000312   3.73       2.50       3.73       1   
+write     2035.24    508.89     3.78        4096       4096       0.000435   5.03       2.61       5.03       2   
+write     2497.11    624.47     3.90        4096       4096       0.001649   4.10       1.39       4.10       3   
+write     2508.73    627.22     3.69        4096       4096       0.000397   4.08       1.16       4.08       4   
+write     2295.85    573.99     3.62        4096       4096       0.001187   4.46       1.41       4.46       5   
+write     2527.62    631.93     3.80        4096       4096       0.000363   4.05       1.04       4.05       6   
+write     2737.67    684.47     3.53        4096       4096       0.000668   3.74       1.05       3.74       7   
+write     2094.80    523.73     3.62        4096       4096       0.000333   4.89       1.95       4.89       8   
+write     2112.25    528.47     3.93        4096       4096       0.000331   4.84       1.81       4.85       9   
+write     2290.59    572.69     3.31        4096       4096       0.000364   4.47       1.33       4.47       10  
+write     2244.05    561.05     4.23        4096       4096       0.000420   4.56       1.63       4.56       11  
+WARNING: fsync(137) failed
+write     2315.86    579.00     4.26        4096       4096       0.000354   4.42       1.75       4.42       12  
+write     2364.01    591.35     3.61        4096       4096       0.000268   4.33       1.19       4.33       13  
+write     2600.40    650.14     3.66        4096       4096       0.000247   3.94       0.694655   3.94       14  
+write     2337.03    584.61     3.48        4096       4096       0.001676   4.38       1.07       4.38       15  
+write     2371.46    592.89     4.32        4096       4096       0.000584   4.32       1.73       4.32       16  
+write     2131.99    533.02     3.58        4096       4096       0.000288   4.80       2.08       4.80       17  
+write     1783.75    445.95     4.45        4096       4096       0.000302   5.74       2.49       5.74       18  
+write     2568.64    642.66     3.98        4096       4096       0.000333   3.98       1.01       3.99       19  
+
+Summary of all tests:
+Operation   Max(MiB)   Min(MiB)  Mean(MiB)     StdDev   Max(OPs)   Min(OPs)  Mean(OPs)     StdDev    Mean(s) Stonewall(s) Stonewall(MiB) Test# #Tasks tPN reps fPP reord reordoff reordrand seed segcnt   blksiz    xsize aggs(MiB)   API RefNum
+write        3449.55    1783.75    2400.53     336.23     862.39     445.94     600.13      84.06    4.34284         NA            NA     0     32  32   20   1     0        1         0    0     80  4194304  4194304   10240.0 POSIX      0
+Finished            : Tue Sep  8 01:05:10 2026

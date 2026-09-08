@@ -141,6 +141,22 @@ mount (the A-arm rig reset the cluster; remount is part of every arm).
    `perf/cowriter-fpp-supply-reattribution`). Row 4D degenerate (probe
    235 MiB/s — a 4.4 s cold start); the matrix probe now runs 2 iterations
    and sizes from the warm one. Gate on `0bd03455` running.
+1h. **Residues, round 2 — CLOSED on the box** (`.benchmarks/2026-09-08-f15-residues-squeeze-test-seq4.md`):
+   E `96f8d873` = the lane-free notice channel (every reply frame carries
+   the authority's frees of the client's blocks — the population was the
+   AUTHORITY's OWN publishes: a co-writer's first-iteration kernel-split
+   segment ships as an extent, the S11 assembler folds it, the recompute
+   frees the displaced block with no reply naming it; publish schema 16;
+   `f64f448a`/`265d69df`/`96f8d873`) + the per-volume epoch close RETIRED
+   (`f230eb3a`: stock is fungible across a co-writer's volumes; the plan
+   stranded 9–14 % of parked keys) + the fpp park slices written as the
+   capacity law (`-k` keeps 640/1,024 live, 3.4 s transit, ~10 % under).
+   E-C-C-E, two-iteration probe (no degenerate row): all four rows pass
+   the full matrix; **`block_claim_anomalies` 0 on every phase of both E
+   rows** (C: 842–1,246 per fpp phase); notices queued ≡ shipped ≡
+   received ≡ the authority's `fold_passes` ±2; reminted 0; throughput
+   par. Board item opened: the range grant's coverage rule (why a
+   whole-block writer ships an extent). Gate on `96f8d873` running.
 2. **Kernel A/B, B arm** — after `squeeze-test` boots the 6.19.14 series
    WITH 0031 (or whichever box carries the patched kernel): on the box,
    `cd /scratch/tmp/sqz-agent/k26 && sudo env ARM=B KERNEL_TAG=<uname -r

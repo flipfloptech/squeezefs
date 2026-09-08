@@ -160,6 +160,22 @@ latch). Same row after: **128 µs / 201 µs / 840 µs** (min / median / max).
 Contract `a_dial_never_waits_for_the_accept_tick` (median < 10 ms, p90 <
 40 ms).
 
+**What the accept tick unmasked** (follow-up
+`.benchmarks/2026-09-08-assembler-contracts-notice-poll.md`): the tick was
+also holding a co-writer's finding-27 standing notice poll OFF the
+authority for the first ~100 ms after `WriteCustodyClient::connect` — the
+poll's notice session dials lazily on its first round, right after the
+workload session's accept, and the accept thread had just gone back to
+sleep — and two S11 range-custody contracts written eleven days before the
+poll existed observed their pre-ack state inside exactly that window. With
+the tick gone the poll hears B's demotion and acks it ~2 ms after the mark,
+which is finding 27 working, and `the_renewal_carries_the_notice_…` /
+`an_unacked_demotion_resolves_at_lease_expiry_…` went red (a third, MW-13,
+had been passing vacuously on an absolute-threshold sampler). Not a
+regression: a fixture artifact the tick had been hiding, resolved by
+holding the poll off through a test seam in exactly the contracts that pin
+the barrier's other arms.
+
 ## The single-connection half (DLM #8) — landed
 
 **Owner**: the authenticated session is a LANE on the connection's own

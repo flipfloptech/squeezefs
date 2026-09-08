@@ -298,8 +298,13 @@ missing piece), `SQUEEZEFS_MW_BIND` (`auto` — the default — / `addr:port` /
 (the pull-based revocation channel firing), `dlm_custody_self_fences`,
 `dlm_custody_quarantined_offsets` / `_drain_proofs`,
 `dlm_custody_generation` / `dlm_custody_epoch_advances`,
-`dlm_custody_phase_ns` (rtt / arbitrate / adopt / renew), and
-`meta_ship_publish.{shipped,local,served,refusals,owner_panics}` — where
+`dlm_custody_phase_ns` (rtt / arbitrate / adopt / renew), the standing
+notice poll's `dlm_custody_notice_polls` / `_poll_notices` /
+`_poll_failures` (a co-writer's channel liveness, its quiet-incumbent
+engagement, and the rounds that died — each failure is a dropped notice
+session plus a 500 ms window with no parked poll, so steady growth on a
+quiet co-writer is session churn; `.benchmarks/2026-09-08-assembler-contracts-notice-poll.md`),
+and `meta_ship_publish.{shipped,local,served,refusals,owner_panics}` — where
 **`refusals` and `owner_panics` must stay 0** on an armed mount (a refusal
 means the ownership plane was armed without its publish half, which is
 refused rather than executed locally). Every one of these is 0 with

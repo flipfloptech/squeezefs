@@ -107,6 +107,34 @@ static OVERWRITE: AtomicU8 = AtomicU8::new(0);
 /// OQ-5: barrier-before-close for overlay-fed epochs (default OFF —
 /// the deliberately-not-taken stronger posture; B4d prices it).
 static CLOSE_BARRIER: AtomicU8 = AtomicU8::new(0);
+/// W-6 (e2e perf audit write board #10): the settle's gap seed sources
+/// a partial overwrite's uncovered ranges by RANGED reads of the old
+/// binding (default ON); `0` = the whole-image read, the A/B control.
+static GAP_SEED_RANGED: AtomicU8 = AtomicU8::new(0);
+
+/// The `SQUEEZEFS_GAP_SEED_RANGED` lever (registry entry in
+/// `src/env_knobs.rs`; design-overlay-overwrite §5.8's seed-bytes law).
+/// Default ON: a K-byte uncovered span costs a K-byte device read per
+/// gap instead of the whole block image. The eligibility screen
+/// (`DataRouter::old_image_ranged_eligible` + Σ gaps below the block
+/// window) composes with this at the settle.
+pub fn gap_seed_ranged_enabled() -> bool {
+    match GAP_SEED_RANGED.load(Ordering::Relaxed) {
+        1 => false,
+        2 => true,
+        _ => {
+            let on = crate::env_knobs::bool_knob("SQUEEZEFS_GAP_SEED_RANGED", true);
+            GAP_SEED_RANGED.store(if on { 2 } else { 1 }, Ordering::Relaxed);
+            on
+        }
+    }
+}
+
+/// Test override for the ranged gap seed (the
+/// `set_device_overlay_for_tests` pattern — no env-order coupling).
+pub fn set_gap_seed_ranged_for_tests(enabled: bool) {
+    GAP_SEED_RANGED.store(if enabled { 2 } else { 1 }, Ordering::Relaxed);
+}
 
 /// The `SQUEEZEFS_OVERLAY_OVERWRITE` lever (registry entry in
 /// `src/env_knobs.rs`). Engagement additionally requires an armed
@@ -192,6 +220,7 @@ pub fn clear_device_overlay_for_tests() {
     BYTES_VEHICLE.store(0, Ordering::Relaxed);
     OVERWRITE.store(0, Ordering::Relaxed);
     CLOSE_BARRIER.store(0, Ordering::Relaxed);
+    GAP_SEED_RANGED.store(0, Ordering::Relaxed);
 }
 
 /// Whether `WritePayload::Bytes` may ride the overlay store.

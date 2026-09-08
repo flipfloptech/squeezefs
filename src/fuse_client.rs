@@ -7719,6 +7719,18 @@ pub struct Metrics {
     /// sequential shapes; material growth = eligibility narrows before
     /// the ladder proceeds (never a steady-state RMW engine).
     pub overlay_gap_seed_old_bytes: Align64<AtomicU64>,
+    /// W-6 (e2e perf audit write board #10): the SUBSET of
+    /// [`Self::overlay_gap_seed_old_bytes`] sourced through the RANGED
+    /// old-image funnel (one device read per gap, the gap's own bytes)
+    /// — the `SQUEEZEFS_GAP_SEED_RANGED` lever's engagement; 0 with the
+    /// lever off and on every decorated/whole-cheaper shape.
+    pub overlay_gap_seed_ranged_bytes: Align64<AtomicU64>,
+    /// W-6: device bytes READ to source gap seeds — the amplification
+    /// NUMERATOR (`overlay_gap_seed_old_bytes` is what the seeds
+    /// consumed; this is what the device delivered for them): the whole
+    /// block window per old-sourced settle on the whole-image arm, Σ of
+    /// the gap windows on the ranged arm.
+    pub overlay_gap_seed_read_bytes: Align64<AtomicU64>,
     /// §5.6(1) (B4c-i): open-overlay compose serves whose gap ranges
     /// came from the captured old binding (overwrite records).
     pub overlay_read_gap_serves: Align64<AtomicU64>,
@@ -11866,6 +11878,8 @@ impl SqueezefsFilesystem {
                 "overlay_epoch_feeds": METRICS.overlay_epoch_feeds.load(Ordering::Relaxed),
                 "overlay_feed_fallbacks": METRICS.overlay_feed_fallbacks.load(Ordering::Relaxed),
                 "overlay_gap_seed_old_bytes": METRICS.overlay_gap_seed_old_bytes.load(Ordering::Relaxed),
+                "overlay_gap_seed_ranged_bytes": METRICS.overlay_gap_seed_ranged_bytes.load(Ordering::Relaxed),
+                "overlay_gap_seed_read_bytes": METRICS.overlay_gap_seed_read_bytes.load(Ordering::Relaxed),
                 "overlay_read_gap_serves": METRICS.overlay_read_gap_serves.load(Ordering::Relaxed),
                 "overlay_read_gap_bytes": METRICS.overlay_read_gap_bytes.load(Ordering::Relaxed),
                 "overlay_mover_skips": METRICS.overlay_mover_skips.load(Ordering::Relaxed),
@@ -17231,6 +17245,26 @@ impl SqueezefsFilesystem {
         // fix): a tail-resident RAW short image must yield its readable
         // PREFIX — the missing tail is holes (zeros below), never a
         // Frozen-forever wedge. See `read_nvme_block_old_image`.
+        //
+        // W-6 (e2e perf audit write board #10 — the seed-bytes law,
+        // §5.8): the old bytes a gap needs are the gap's own, so on a
+        // passthrough undecorated binding each gap is sourced by ONE
+        // ranged device read of exactly its bytes
+        // (`read_nvme_block_old_image_range`) — the whole-image fetch
+        // read the entire block to seed a hole of any size (4 MiB for a
+        // 64 KiB gap). The whole read survives where it is cheaper (Σ
+        // gaps at or past the block window) or the only correct form (a
+        // decorated `bk:off:len` binding, whose short-image prefix law
+        // the whole funnel owns). `SQUEEZEFS_GAP_SEED_RANGED=0` is the
+        // A/B control; `overlay_gap_seed_read_bytes` is the device-byte
+        // face on both arms.
+        let gap_bytes_total: u64 = gaps.iter().map(|&(gs, ge)| u64::from(ge - gs)).sum();
+        let seed_ranged = rec.core.old_binding().is_some_and(|old_key| {
+            !gaps.is_empty()
+                && crate::device_overlay::gap_seed_ranged_enabled()
+                && self.router.old_image_ranged_eligible(old_key)
+                && gap_bytes_total < self.router.device_block_window() as u64
+        });
         let old_image = match (gaps.is_empty(), rec.core.old_binding()) {
             (false, Some(old_key)) => {
                 // Finding 51, phase B1 — the DEAD-CAPTURE belt behind the
@@ -17258,7 +17292,16 @@ impl SqueezefsFilesystem {
                     self.teardown_overlay_block_locked(ino, b, &rec).await;
                     return Ok(false);
                 }
-                Some(self.router.read_nvme_block_old_image(old_key).await?)
+                if seed_ranged {
+                    // The ranged arm reads per gap below.
+                    None
+                } else {
+                    let image = self.router.read_nvme_block_old_image(old_key).await?;
+                    METRICS
+                        .overlay_gap_seed_read_bytes
+                        .fetch_add(image.len() as u64, Ordering::Relaxed);
+                    Some(image)
+                }
             }
             _ => None,
         };
@@ -17278,6 +17321,29 @@ impl SqueezefsFilesystem {
                 if lo < hi {
                     buf.backing_mut()[..hi - lo].copy_from_slice(&old[lo..hi]);
                 }
+                METRICS
+                    .overlay_gap_seed_old_bytes
+                    .fetch_add(glen as u64, Ordering::Relaxed);
+            } else if seed_ranged {
+                let old_key = rec
+                    .core
+                    .old_binding()
+                    .expect("seed_ranged implies an old binding");
+                // Short-tolerant like the whole form: a prefix shorter
+                // than the gap means the tail sat past the backing —
+                // holes, which stay zeros.
+                let got = self
+                    .router
+                    .read_nvme_block_old_image_range(old_key, u64::from(gs), glen)
+                    .await?;
+                let n = got.len().min(glen);
+                buf.backing_mut()[..n].copy_from_slice(&got[..n]);
+                METRICS
+                    .overlay_gap_seed_read_bytes
+                    .fetch_add(got.len() as u64, Ordering::Relaxed);
+                METRICS
+                    .overlay_gap_seed_ranged_bytes
+                    .fetch_add(glen as u64, Ordering::Relaxed);
                 METRICS
                     .overlay_gap_seed_old_bytes
                     .fetch_add(glen as u64, Ordering::Relaxed);

@@ -9680,6 +9680,54 @@ impl DataRouter {
         }
     }
 
+    /// Whether a device overlay's captured old binding may be sourced by
+    /// RANGED reads (W-6, e2e perf audit write board #10): a passthrough
+    /// volume (the stored image IS the block, byte-addressable) and an
+    /// UNDECORATED whole-block key (a `bk:off:len` decoration names a
+    /// shorter stored image whose bytes beyond `len` are holes — the
+    /// whole-image funnel's prefix discipline owns that shape). The
+    /// device overlay is passthrough-only by its shape screen, so the
+    /// crypto clause is a belt: a transformed image has no addressable
+    /// sub-range and must stay on the whole-image read.
+    pub(crate) fn old_image_ranged_eligible(&self, block_key: &str) -> bool {
+        self.get_crypto().is_passthrough() && is_whole_block_mapping(block_key)
+    }
+
+    /// RANGED twin of [`Self::read_nvme_block_old_image`] for the device
+    /// overlay's gap consumers (W-6): read `len` bytes at `rel_start`
+    /// WITHIN the block behind an UNDECORATED passthrough key (the
+    /// caller screened with [`Self::old_image_ranged_eligible`]; gaps are
+    /// OVERLAY_PAGE-aligned, so both arguments are already LBA-aligned).
+    /// Same short-tolerance as the whole form: a window past the
+    /// backing's tail yields its readable PREFIX (the consumer seeds
+    /// zeros for the rest — holes), never an error; the window only
+    /// shrinks, so the retry terminates. Raw bytes, no decode, no cache
+    /// publish — the ranged device leg, `read_block_range`, verbatim.
+    pub(crate) async fn read_nvme_block_old_image_range(
+        &self,
+        block_key: &str,
+        rel_start: u64,
+        len: usize,
+    ) -> Result<bytes::Bytes> {
+        let mut window = len;
+        loop {
+            if window == 0 {
+                return Ok(bytes::Bytes::new());
+            }
+            match self
+                .backend_router
+                .read_block_range(block_key, rel_start, window, None)
+                .await
+            {
+                Ok(raw) => return Ok(raw),
+                Err(e) => match crate::nvme_dev::short_read_prefix_len(&e) {
+                    Some(got) if (got & !4095) < window => window = got & !4095,
+                    _ => return Err(e),
+                },
+            }
+        }
+    }
+
     /// Device window for an UNDECORATED (whole-block) read. Passthrough
     /// volumes read exactly `block_size` (byte-identity — §5.6 ranged
     /// reads and the zero-copy raw-DMA leg depend on it). Transformed

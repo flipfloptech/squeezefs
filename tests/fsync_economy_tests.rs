@@ -954,6 +954,12 @@ async fn fsync_storm_rows() {
 #[test]
 fn touched_table_word_law() {
     use fsync_economy::{TouchedTable, ALL_BIT};
+    // The process table's width is the D-3 DLM law — a derivation reused,
+    // never a constant of its own.
+    assert_eq!(
+        fsync_economy::touched_table().width(),
+        squeezefs::stripe_locks::dlm_stripe_width()
+    );
     let t = TouchedTable::new(16);
     assert_eq!(t.width(), 16);
     let ino = 42u64;

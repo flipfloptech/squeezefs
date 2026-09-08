@@ -612,11 +612,30 @@ async fn red_half_without_the_law_a_delegated_holder_serves_stale() {
         .await
         .expect("owner create");
     catch_up(&fx).await;
+    let rounds0 = deleg().channel_rounds;
     // Earn the delegation and prove it serves.
     fx.router.lookup(dir_ino, "old").await.expect("lookup");
     let hits0 = deleg().hits;
     fx.router.lookup(dir_ino, "old").await.expect("lookup");
     assert!(deleg().hits > hits0, "the delegation must be serving");
+    // The recall channel spun up on grant absorption and its CONNECT
+    // re-asserts the held grant with the owner's CURRENT commit
+    // watermark (`absorb_reassert_reply`). Let that round land before the
+    // conflict: a re-assert that arrives after the create re-stamps the
+    // grant ABOVE the holder's view, and the currency law then declines
+    // the serve — the holder ships and answers the fresh truth, which is
+    // the law working, not the staleness this half exists to show (the
+    // 2026-09-08 gate under a throttled CPU: view 669 < stamp 859). The
+    // green half waits for the same round for the same reason.
+    wait_for("the recall channel's first round", || {
+        deleg().channel_rounds > rounds0
+    })
+    .await;
+    fx.router.lookup(dir_ino, "old").await.expect("lookup");
+    assert!(
+        deleg().hits > hits0 + 1,
+        "the delegation must still serve after the channel's re-assert"
+    );
 
     // THE CONFLICTING MUTATION, law disabled: no recall reaches the holder.
     let revokes0 = lane().issued;

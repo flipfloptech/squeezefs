@@ -10704,6 +10704,13 @@ impl SqueezefsFilesystem {
             t_slots_overdue,
             t_replies_oversize,
         ) = (0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64);
+        // The bounded park's rescue ledger (generic/795 wedge, 2026-09-08;
+        // see the export below).
+        #[cfg(target_os = "linux")]
+        let (t_park_tick_commit_rescues, t_park_tick_cqe_rescues) =
+            fuse3::transport_park_tick_rescues();
+        #[cfg(not(target_os = "linux"))]
+        let (t_park_tick_commit_rescues, t_park_tick_cqe_rescues) = (0u64, 0u64);
         // R-4 spin-before-park ledger (see the export below).
         #[cfg(target_os = "linux")]
         let (t_spin_absorbed, t_spin_expired, t_spin_ns, t_spin_refused_busy, t_spin_window_us) =
@@ -11929,12 +11936,19 @@ impl SqueezefsFilesystem {
                 "transport_replies_dropped_no_slot": t_dropped_no_slot,
                 "transport_ents_retired": t_ents_retired,
                 "transport_slots_overdue": t_slots_overdue,
-                // Stage-1b bounded-park backstop: pend/fused-holding
-                // workers self-clock their deadline scans (100 ms EXT_ARG
-                // park bound) — growth under bridge traffic is the
-                // backstop working, never a wedge.
+                // Stage-1b bounded-park backstop, generalized 2026-09-08
+                // (generic/795 wedge): a worker holding bridge pends,
+                // fused residents or ANY owed reply self-clocks its pass
+                // (100 ms EXT_ARG park bound) — growth under traffic is
+                // the backstop working, never a wedge. The rescue pair
+                // is the lost-wake TRIPWIRE: what the pass after a tick
+                // found that a wake should have delivered (queued
+                // WorkerMsgs with no wake CQE / completions the tick's
+                // own enter surfaced) — ≈ 0 on a healthy mount.
                 "transport_park_backstop_ticks":
                     fuse3::transport_park_backstop_ticks(),
+                "transport_park_tick_commit_rescues": t_park_tick_commit_rescues,
+                "transport_park_tick_cqe_rescues": t_park_tick_cqe_rescues,
                 // R-4 spin-before-park on the queue workers (module doc
                 // `fuse3::raw::connection::fuse_over_uring::spin`):
                 // `absorbed` = parks the spin deleted (an event caught

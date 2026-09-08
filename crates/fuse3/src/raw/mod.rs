@@ -23,7 +23,8 @@ pub use connection::fuse_over_uring::{
     over_uring_classical_sideband, over_uring_commit_batch_stats, over_uring_geometry,
     over_uring_negotiated_write, over_uring_sessions_active, over_uring_stats,
     transport_cq_overflow_stats, transport_lease_stats, transport_park_backstop_ticks,
-    transport_reply_integrity_stats, transport_wake_stats, COMMIT_BATCH_LABELS, Q_DEPTH_DESIRED,
+    transport_park_tick_rescues, transport_reply_integrity_stats, transport_wake_stats,
+    COMMIT_BATCH_LABELS, Q_DEPTH_DESIRED,
 };
 #[cfg(all(target_os = "linux", feature = "tokio-runtime"))]
 pub use connection::kmbuf::{

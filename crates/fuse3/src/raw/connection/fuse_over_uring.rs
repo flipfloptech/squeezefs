@@ -54,7 +54,7 @@
 
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -282,28 +282,54 @@ pub(crate) enum WorkerMsg {
 /// `transport_debug`-gated stale-pending scan it replaces was off in
 /// production, which is why nine of the eleven lost-reply paths had no
 /// detector at all).
-#[derive(Default)]
+///
+/// The cell also keeps its drain group's OWED-REPLY count
+/// (`GroupHandle::owed` — the generalized park bound's gate, generic/795
+/// wedge 2026-09-08): `set`/`clear` are the only two mutators of the
+/// cell, so maintaining the count HERE is what makes every site correct
+/// by construction — no caller pairs a clear with a decrement.
 struct SlotWatch {
     /// Unique of the request the slot owes a reply for; 0 = owes nothing.
     unique: AtomicU64,
     /// Transport-epoch ns of the delivery (`transport_now_ns`).
     since_ns: AtomicU64,
+    /// The owning drain group's owed-reply count (shared with its
+    /// [`GroupHandle`] and every sibling cell of the group).
+    owed: Arc<AtomicU32>,
 }
 
 impl SlotWatch {
-    /// Publish "this slot owes a reply for `unique`" (two relaxed stores
-    /// — the whole cost of the observation side-channel that replaced a
-    /// sharded-mutex map insert).
+    fn new(owed: Arc<AtomicU32>) -> Self {
+        Self {
+            unique: AtomicU64::new(0),
+            since_ns: AtomicU64::new(0),
+            owed,
+        }
+    }
+
+    /// Publish "this slot owes a reply for `unique`" (a relaxed store and
+    /// one swap — the whole cost of the observation side-channel that
+    /// replaced a sharded-mutex map insert). Only the 0→unique
+    /// transition counts toward the group: a delivery onto a slot that
+    /// still owes (row 10) leaves the slot owing exactly one.
     #[inline]
     fn set(&self, unique: u64, now_ns: u64) {
         self.since_ns.store(now_ns, Ordering::Relaxed);
-        self.unique.store(unique, Ordering::Release);
+        if self.unique.swap(unique, Ordering::AcqRel) == 0 && unique != 0 {
+            self.owed.fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     /// Publish "this slot owes nothing" (its commit was submitted).
+    /// Returns whether the cell HELD a unique — the group count moves
+    /// only then, so a clear of an already-clear cell never underflows.
     #[inline]
-    fn clear(&self) {
-        self.unique.store(0, Ordering::Release);
+    fn clear(&self) -> bool {
+        let held = self.unique.swap(0, Ordering::AcqRel) != 0;
+        if held {
+            self.owed.fetch_sub(1, Ordering::Relaxed);
+        }
+        held
     }
 }
 
@@ -313,6 +339,12 @@ impl SlotWatch {
 /// per-op latency lives in the daemon — D1.b).
 const SLOT_WATCHDOG_INTERVAL: Duration = Duration::from_secs(5);
 const SLOT_OVERDUE_NS: u64 = 5_000_000_000;
+/// The bounded park's tick cadence (the ipc dd-reaper's shipped 100 ms
+/// backstop; the 2026-08-13 zc bridge law, generalized 2026-09-08 to any
+/// owed reply) and the rescue attribution WARN's per-worker rate limit
+/// (the first rescue logs, then at most one per interval).
+const PARK_BACKSTOP_TICK: Duration = Duration::from_millis(100);
+const RESCUE_LOG_INTERVAL: Duration = Duration::from_secs(60);
 
 // ---------------------------------------------------------------------------
 // FUSE-2 ⊕ PERF-16 — the per-`(qid, ent_idx)` slot state machine
@@ -845,6 +877,17 @@ struct GroupHandle {
     /// not a contiguous range — interleaved node numberings are the
     /// field norm; see [`drain_group_plan`]).
     qids: Vec<u16>,
+    /// Slots of this group currently OWING a reply (delivered, commit not
+    /// yet pushed) — maintained by the member cells' [`SlotWatch`]
+    /// transitions, read by the worker's park gate (nonzero ⇒ the park is
+    /// bounded; the generic/795 wedge, 2026-09-08) and by the overdue
+    /// scan's attribution line.
+    owed: Arc<AtomicU32>,
+    /// The worker's ring fd, published once at worker start (−1 until
+    /// then) so the overdue scan can read its `/proc/self/fdinfo` heads
+    /// and armed-poll count beside the wake eventfd's counter — the two
+    /// reads the 2026-09-08 capture could not make.
+    ring_fd: AtomicI32,
 }
 
 // ---------------------------------------------------------------------------
@@ -1639,6 +1682,30 @@ fn test_drop_write_cqe() -> bool {
         .is_ok()
 }
 
+/// TEST SEAM budget (`SQUEEZEFS_TEST_DROP_COMMIT_WAKES`): how many reply
+/// eventfd wake writes to SKIP after arming the coalescer — the commit
+/// message stays queued and the worker's wake-fd PollAdd never fires,
+/// the deterministic lost-commit-wake interleave of the generic/795
+/// wedge (`tests/commit_wake_loss_tests.rs`). Returns `true` when THIS
+/// write must be skipped. Production cost: one relaxed load of a
+/// process-lifetime zero (the `test_drop_write_cqe` pattern).
+fn test_drop_commit_wake() -> bool {
+    static BUDGET: std::sync::OnceLock<AtomicU64> = std::sync::OnceLock::new();
+    let b = BUDGET.get_or_init(|| {
+        AtomicU64::new(
+            std::env::var("SQUEEZEFS_TEST_DROP_COMMIT_WAKES")
+                .ok()
+                .and_then(|v| v.trim().parse::<u64>().ok())
+                .unwrap_or(0),
+        )
+    });
+    if b.load(Ordering::Relaxed) == 0 {
+        return false;
+    }
+    b.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| v.checked_sub(1))
+        .is_ok()
+}
+
 /// `SQUEEZEFS_TRANSPORT_DEBUG=1` — per-request transport tracing to stderr
 /// (delivery / reply / commit / CQE errors) for stuck-request forensics.
 pub fn transport_debug() -> bool {
@@ -2060,17 +2127,91 @@ static TRANSPORT_REPLIES_DROPPED_NO_SLOT: AtomicU64 = AtomicU64::new(0);
 static TRANSPORT_ENTS_RETIRED: AtomicU64 = AtomicU64::new(0);
 static TRANSPORT_SLOTS_OVERDUE: AtomicU64 = AtomicU64::new(0);
 static TRANSPORT_REPLIES_OVERSIZE: AtomicU64 = AtomicU64::new(0);
-/// Bounded-park backstop ticks (Stage-1b field wedge fix, 2026-08-13):
-/// a worker holding live bridge pends / resident fused tasks parked its
-/// 100 ms EXT_ARG bound out and re-ran its pass (deadline scan + rq
-/// drain) under its OWN clock. Nonzero under bridge traffic is the
-/// backstop WORKING; the deadline ladder no longer depends on a
+/// Bounded-park backstop ticks (Stage-1b field wedge fix, 2026-08-13;
+/// generalized 2026-09-08): a worker holding live bridge pends /
+/// resident fused tasks / ANY owed reply parked its 100 ms EXT_ARG bound
+/// out and re-ran its pass (deadline scan + rq drain + WorkerMsg pump)
+/// under its OWN clock. Nonzero under traffic is the backstop WORKING;
+/// neither the deadline ladder nor a reply's commit depends on a
 /// cross-thread wake reaching a parked worker.
 static TRANSPORT_PARK_BACKSTOP_TICKS: AtomicU64 = AtomicU64::new(0);
+/// The rescue ledger (generic/795 wedge, 2026-09-08 —
+/// `.benchmarks/2026-09-08-generic-795-lookup-wedge.md`): what the pass
+/// AFTER a backstop tick found that a wake should have delivered.
+/// `commit_rescues` = WorkerMsgs pumped by that pass with NO wake-fd CQE
+/// reaped at the tick (the userspace half of the chain — commit_tx push
+/// → coalescer arm → eventfd write → PollAdd — did not deliver);
+/// `cqe_rescues` = completions the tick's own enter surfaced (posted
+/// kernel-side, the worker never woken for them). A pass that finds
+/// nothing after a tick is a plain tick. Both are lost-wake TRIPWIRES:
+/// ≈ 0 on a healthy mount (a wake landing in the microseconds between
+/// the tick's expiry and the pump is the only benign source).
+static TRANSPORT_PARK_TICK_COMMIT_RESCUES: AtomicU64 = AtomicU64::new(0);
+static TRANSPORT_PARK_TICK_CQE_RESCUES: AtomicU64 = AtomicU64::new(0);
 
 /// The bounded-park backstop's engagement gauge (stats surface).
 pub fn transport_park_backstop_ticks() -> u64 {
     TRANSPORT_PARK_BACKSTOP_TICKS.load(Ordering::Relaxed)
+}
+
+/// The rescue ledger (stats surface): `(commit_rescues, cqe_rescues)` —
+/// the lost-wake tripwires, ≈ 0 on a healthy mount.
+pub fn transport_park_tick_rescues() -> (u64, u64) {
+    (
+        TRANSPORT_PARK_TICK_COMMIT_RESCUES.load(Ordering::Relaxed),
+        TRANSPORT_PARK_TICK_CQE_RESCUES.load(Ordering::Relaxed),
+    )
+}
+
+/// One-line `/proc/self/fdinfo/<fd>` digest for the wake-chain
+/// attribution lines: an eventfd's `eventfd-count`, or a ring's
+/// `SqHead`/`SqTail`/`CachedSqHead`/`CqHead`/`CqTail` words plus the
+/// number of armed polls on its `PollList` (`op=` entries). Never
+/// panics; an unreadable file reads as its error text.
+fn fdinfo_snapshot(fd: RawFd) -> String {
+    let text = match std::fs::read_to_string(format!("/proc/self/fdinfo/{fd}")) {
+        Ok(t) => t,
+        Err(e) => return format!("fdinfo unreadable ({e})"),
+    };
+    let mut out = String::new();
+    let mut polls = 0usize;
+    let mut is_ring = false;
+    for line in text.lines() {
+        let t = line.trim();
+        if t.starts_with("PollList") {
+            is_ring = true;
+            continue;
+        }
+        if t.starts_with("op=") {
+            polls += 1;
+            continue;
+        }
+        let Some((k, v)) = t.split_once(':') else {
+            continue;
+        };
+        if matches!(
+            k,
+            "eventfd-count" | "SqHead" | "SqTail" | "CachedSqHead" | "CqHead" | "CqTail"
+        ) {
+            if !out.is_empty() {
+                out.push(' ');
+            }
+            out.push_str(k);
+            out.push('=');
+            out.push_str(v.trim());
+        }
+    }
+    if is_ring {
+        if !out.is_empty() {
+            out.push(' ');
+        }
+        out.push_str(&format!("PollList={polls}"));
+    }
+    if out.is_empty() {
+        "fdinfo carries no eventfd/ring lines".to_string()
+    } else {
+        out
+    }
 }
 
 // FUSE-3f: completion-queue loss. `transport_cq_overflows` is a
@@ -2876,9 +3017,19 @@ impl FuseOverUring {
                 _wake: wake,
                 wake_coalescer: Arc::new(WakeCoalescer::new()),
                 qids: qids.clone(),
+                owed: Arc::new(AtomicU32::new(0)),
+                ring_fd: AtomicI32::new(-1),
             });
             commit_rxs.push(commit_rx);
         }
+        // Every cell of a queue shares its drain group's owed count.
+        let slot_watch: Vec<SlotWatch> = (0..nqueues * depth)
+            .map(|i| {
+                SlotWatch::new(Arc::clone(
+                    &group_handles[group_of[i / depth] as usize].owed,
+                ))
+            })
+            .collect();
 
         // §5.3 D3.b: SQPOLL posture, read once per session from the same
         // knobs the classical INIT/notify rings honor. Knob unset ⇒ None ⇒
@@ -2905,7 +3056,7 @@ impl FuseOverUring {
             queues_registered: AtomicU64::new(0),
             nqueues: nqueues as u16,
             inbound,
-            slot_watch: (0..nqueues * depth).map(|_| SlotWatch::default()).collect(),
+            slot_watch,
             retain_next: (0..nqueues * depth)
                 .map(|_| AtomicBool::new(false))
                 .collect(),
@@ -3141,9 +3292,14 @@ impl FuseOverUring {
                 _wake: wake,
                 wake_coalescer: Arc::new(WakeCoalescer::new()),
                 qids: vec![qid],
+                owed: Arc::new(AtomicU32::new(0)),
+                ring_fd: AtomicI32::new(-1),
             });
             commit_rxs.push(commit_rx);
         }
+        let slot_watch: Vec<SlotWatch> = (0..nqueues as usize * Self::SIM_DEPTH)
+            .map(|i| SlotWatch::new(Arc::clone(&groups[i / Self::SIM_DEPTH].owed)))
+            .collect();
         let pool = Arc::new(Self {
             ready: AtomicBool::new(false),
             active: AtomicBool::new(true),
@@ -3151,9 +3307,7 @@ impl FuseOverUring {
             queues_registered: AtomicU64::new(0),
             nqueues,
             inbound,
-            slot_watch: (0..nqueues as usize * Self::SIM_DEPTH)
-                .map(|_| SlotWatch::default())
-                .collect(),
+            slot_watch,
             retain_next: (0..nqueues as usize * Self::SIM_DEPTH)
                 .map(|_| AtomicBool::new(false))
                 .collect(),
@@ -3325,9 +3479,22 @@ impl FuseOverUring {
         // queue between two worker passes cost one write (wake_core
         // protocol, loom-verified send→arm→write order).
         if g.wake_coalescer.arm() {
-            let one: u64 = 1;
-            let _ = unsafe { libc::write(g.wake_fd, &one as *const u64 as *const _, 8) };
-            TRANSPORT_WAKE_WRITES.fetch_add(1, Ordering::Relaxed);
+            // TEST SEAM (commit-wake-loss): skip the write, leave the
+            // coalescer armed — the message sits in commit_rx with no
+            // wake in flight, the exact generic/795 posture. Env-gated
+            // (`SQUEEZEFS_TEST_DROP_COMMIT_WAKES`); one relaxed load in
+            // production.
+            if test_drop_commit_wake() {
+                error!(
+                    "fuse-over-uring qid={qid} ent={ent_idx}: TEST SEAM dropping commit wake \
+                     write (cid={commit_id}) — the commit message stays queued and the \
+                     coalescer stays armed"
+                );
+            } else {
+                let one: u64 = 1;
+                let _ = unsafe { libc::write(g.wake_fd, &one as *const u64 as *const _, 8) };
+                TRANSPORT_WAKE_WRITES.fetch_add(1, Ordering::Relaxed);
+            }
         } else {
             TRANSPORT_WAKES_ELIDED.fetch_add(1, Ordering::Relaxed);
         }
@@ -3784,7 +3951,7 @@ impl FuseOverUring {
     }
 
     /// Publish a slot's owed-reply state for the watchdog (`unique == 0`
-    /// clears it).
+    /// clears it). The group's owed count rides the cell's transitions.
     #[inline]
     fn publish_slot_owed(&self, qid: u16, ent_idx: usize, unique: u64) {
         if let Some(w) = self.slot_watch_cell(qid, ent_idx) {
@@ -3794,6 +3961,41 @@ impl FuseOverUring {
                 w.set(unique, crate::raw::read_phase::transport_now_ns());
             }
         }
+    }
+
+    /// Slots of drain group `group_idx` currently owing a reply (0 for an
+    /// unknown group).
+    fn group_owed(&self, group_idx: usize) -> u32 {
+        self.groups
+            .get(group_idx)
+            .map(|g| g.owed.load(Ordering::Relaxed))
+            .unwrap_or(0)
+    }
+
+    /// The wake-chain attribution snapshot of one drain group — the two
+    /// `/proc` reads the 2026-09-08 capture could not make while the
+    /// wedge was live (the stats inode hung): the group's owed count and
+    /// coalescer state, the wake eventfd's counter, and the worker ring's
+    /// head/tail words + armed-poll count. A nonzero `eventfd-count` with
+    /// the worker parked is the "written, never delivered" branch in one
+    /// read; a zero count with the coalescer armed is "never written".
+    fn group_wake_snapshot(&self, group_idx: usize) -> String {
+        let Some(g) = self.groups.get(group_idx) else {
+            return format!("group={group_idx}: unknown");
+        };
+        let ring_fd = g.ring_fd.load(Ordering::Relaxed);
+        let ring = if ring_fd < 0 {
+            "unset".to_string()
+        } else {
+            format!("{ring_fd}: {}", fdinfo_snapshot(ring_fd))
+        };
+        format!(
+            "group={group_idx} owed={} wake_armed={} wake_fd={}: {} ring_fd={ring}",
+            self.group_owed(group_idx),
+            g.wake_coalescer.is_armed(),
+            g.wake_fd,
+            fdinfo_snapshot(g.wake_fd)
+        )
     }
 
     /// FUSE-2's ungated stale-slot watchdog pass: name every slot that
@@ -3832,13 +4034,23 @@ impl FuseOverUring {
                 }
                 (state, ready)
             };
+            // The wake-chain snapshot of the slot's group (generic/795,
+            // 2026-09-08): what the next field occurrence needs at the
+            // 5 s mark to be self-attributing.
+            let wake_snapshot = self
+                .group_of
+                .get(qid)
+                .map(|&gi| self.group_wake_snapshot(gi as usize))
+                .unwrap_or_else(|| "group=unknown".to_string());
             warn!(
                 "fuse-over-uring qid={qid} ent={ent}: unique={unique} delivered {} ms ago and \
                  still unreplied — the caller is in uninterruptible sleep \
                  (transport_slots_overdue; {fused_state}, fused_ready_total={ready_total}, \
                  zc_bridge_pends={}, scan_passes={}, scan_pends_seen={}, \
                  scan_orphans_seen={}, pend_max_age_ms={}, cancel_latched={}, \
-                 park_backstop_ticks={}, zc_msgs_sent={}, zc_msgs_taken={})",
+                 park_backstop_ticks={}, park_tick_commit_rescues={}, \
+                 park_tick_cqe_rescues={}, zc_msgs_sent={}, zc_msgs_taken={}; \
+                 {wake_snapshot})",
                 now.saturating_sub(since) / 1_000_000,
                 self.zc_bridge_pends.load(Ordering::Relaxed),
                 self.scan_passes.load(Ordering::Relaxed),
@@ -3847,6 +4059,8 @@ impl FuseOverUring {
                 self.scan_max_age_ms.load(Ordering::Relaxed),
                 self.scan_cancel_latched.load(Ordering::Relaxed),
                 TRANSPORT_PARK_BACKSTOP_TICKS.load(Ordering::Relaxed),
+                TRANSPORT_PARK_TICK_COMMIT_RESCUES.load(Ordering::Relaxed),
+                TRANSPORT_PARK_TICK_CQE_RESCUES.load(Ordering::Relaxed),
                 self.zc_msgs_sent.load(Ordering::Relaxed),
                 self.zc_msgs_taken.load(Ordering::Relaxed)
             );
@@ -4439,6 +4653,11 @@ fn queue_worker(
     // the group containing qid 0 is the leader).
     let mut ring: Ring =
         build_queue_ring(sq_entries, first_qid, pool.sqpoll.as_ref(), &pool.active)?;
+    // Publish the ring fd for the overdue scan's `/proc/self/fdinfo`
+    // attribution read (heads + armed-poll count beside the wake eventfd).
+    pool.groups[group_idx]
+        .ring_fd
+        .store(ring.as_raw_fd(), Ordering::Relaxed);
     // FUSE-3f: probe the feature word ONCE per ring (portable-by-default:
     // probe, never a kernel-version check) and watch the overflow counter
     // after every `cq.sync()` below. A dropped completion is a REGISTER or
@@ -4527,6 +4746,9 @@ fn queue_worker(
         bridge_deadlines: zc::BridgeDeadlines,
     }
     let wake_coalescer = Arc::clone(&pool.groups[group_idx].wake_coalescer);
+    // The group's owed-reply count — the generalized park bound's gate
+    // (maintained by the member cells' SlotWatch transitions).
+    let group_owed = Arc::clone(&pool.groups[group_idx].owed);
     // zc-write-fusion (2026-08-07): the per-worker fused lane — a bounded
     // executor that runs SMALL armed-WRITE handler futures on THIS thread
     // (the store/extract bridge round trip then pays zero cross-thread
@@ -5206,8 +5428,32 @@ fn queue_worker(
     // parked worker still ticks every 100 ms while any pend lives.
     let scan_period_ns = (zc_bridge_timeout_ns() / 1024).max(1);
     let mut last_scan_ns: u64 = 0;
+    // The rescue ledger's pass-to-pass carry (generic/795, 2026-09-08):
+    // set when the bounded park ticked out, read by the NEXT pass top —
+    // whatever that pass pumps is work a wake should have delivered.
+    let mut tick_rescue_pending = false;
+    // Attribution WARN rate limit: the first commit rescue on this worker
+    // logs, then at most one per minute.
+    let mut last_rescue_log: Option<Instant> = None;
 
     while pool.active.load(Ordering::Relaxed) {
+        // Post-tick attribution capture, BEFORE the drain/disarm below
+        // erase the evidence: did the tick's own reap see the wake-fd CQE
+        // (the wake was delivered, merely late), is a producer armed (a
+        // wake was published), and what does the eventfd counter read
+        // (written but never delivered vs never written). The `/proc` read
+        // runs only on a post-tick pass with an armed producer and an
+        // eligible log slot — never on the hot path.
+        let after_tick = std::mem::take(&mut tick_rescue_pending);
+        let tick_wake_seen = wake_cqe_seen;
+        let tick_armed = wake_coalescer.is_armed();
+        let tick_owed = group_owed.load(Ordering::Relaxed);
+        let rescue_log_eligible = match last_rescue_log {
+            None => true,
+            Some(t) => t.elapsed() >= RESCUE_LOG_INTERVAL,
+        };
+        let tick_efd_snapshot =
+            (after_tick && tick_armed && rescue_log_eligible).then(|| fdinfo_snapshot(wake_fd));
         // Drain the eventfd FIRST. The wake-fd PollAdd re-arm is deferred to
         // the loop-bottom submit_and_wait (S2), so during the passes below
         // the poll may be unarmed — consuming a wake AFTER scanning its
@@ -5954,29 +6200,40 @@ fn queue_worker(
             .filter_map(|m| m.slots.next_retry_deadline())
             .min();
         // The bounded-park law (Stage-1b field wedge, 2026-08-13 —
-        // docs/design-sqz-sync.md §attribution): a worker holding LIVE
-        // BRIDGE PENDS or RESIDENT FUSED TASKS must never park
-        // unbounded. Their resolutions arrive via the cross-thread
-        // wake chain (foreign oneshot -> FusedWaker -> rq push ->
-        // coalescer -> eventfd -> wake-fd PollAdd), and the field
-        // capture proved that chain CAN lose exactly one wake under
-        // load — zc_bridge_pends=4 with zero deadline cancels for
-        // 435 s, the worker asleep in cq-wait while the watch thread
-        // ticked. Owning the clock removes the dependence: the park is
-        // EXT_ARG-bounded (the ipc dd-reaper's shipped 100 ms backstop
-        // cadence), so the pass — deadline scan, rq drain — is
-        // self-clocked. Idle workers (no pends, no fused residents)
-        // keep the zero-cost unbounded park.
+        // docs/design-sqz-sync.md §attribution; GENERALIZED 2026-09-08 —
+        // `.benchmarks/2026-09-08-generic-795-lookup-wedge.md`): a worker
+        // holding LIVE BRIDGE PENDS, RESIDENT FUSED TASKS, or ANY OWED
+        // REPLY must never park unbounded. Their resolutions arrive via
+        // a cross-thread wake chain (foreign oneshot -> FusedWaker -> rq
+        // push -> coalescer -> eventfd -> wake-fd PollAdd for the bridge;
+        // handler reply -> commit_tx push -> coalescer -> eventfd ->
+        // PollAdd -> task_work for an ordinary commit), and the field
+        // captures proved those chains CAN lose exactly one wake under
+        // load — zc_bridge_pends=4 with zero deadline cancels for 435 s
+        // (2026-08-13), then two delivered LOOKUPs whose handlers
+        // REPLIED sitting unpumped in queue 16's commit_rx for 23 min
+        // while every worker slept in cq-wait (generic/795, 2026-09-08:
+        // the bound engaged only for pends/fused, so an ordinary
+        // in-flight request had no clock at all). Owning the clock
+        // removes the dependence: the park is EXT_ARG-bounded (the ipc
+        // dd-reaper's shipped 100 ms backstop cadence), so the pass —
+        // deadline scan, rq drain, WorkerMsg pump — is self-clocked.
+        // Idle workers (no pends, no fused residents, nothing owed) keep
+        // the zero-cost unbounded park.
         // Gate on the POOL pend counter, not the per-member ledgers:
         // the 2026-08-13 live capture (all 62 workers parked UNBOUNDED
         // at zc_bridge_pends=4) proved a pend can be pool-visible while
         // every local ledger reads 0 — whatever that accounting drift
         // is, the liveness backstop must not depend on it. Coarse on
         // purpose: every worker of the pool ticks 100 ms while ANY
-        // bridge pend lives; pends are rare and deadline-bounded.
+        // bridge pend lives; pends are rare and deadline-bounded. The
+        // owed gate is the GROUP's count (this worker's own slots — the
+        // reply can only ever reach this ring), maintained by the
+        // SlotWatch cells' set/clear transitions.
         let park_backstop = (fused_lane.len() > 0
-            || pool.zc_bridge_pends.load(Ordering::Relaxed) > 0)
-            .then(|| Duration::from_millis(100));
+            || pool.zc_bridge_pends.load(Ordering::Relaxed) > 0
+            || group_owed.load(Ordering::Relaxed) > 0)
+            .then_some(PARK_BACKSTOP_TICK);
         // R-2 reap-gap gauge: the pass-bottom enter is THE completion-
         // surfacing syscall — bracket it (blind window closes here; a
         // blocking arm is a park sample).
@@ -5986,6 +6243,33 @@ fn queue_worker(
         // a spin ran first — the `park` sample stays the blocking wall).
         let mut park_began = enter_began;
         let mut spin_ran = false;
+        // Rescue ledger, commit half (generic/795, 2026-09-08): this pass
+        // followed a backstop tick and pumped WorkerMsgs with NO wake-fd
+        // CQE reaped at that tick — the userspace wake chain (commit_tx
+        // push → coalescer arm → eventfd write → PollAdd) did not deliver
+        // them; the tick did. The first on this worker (then one per
+        // minute) carries the attribution snapshot the field capture
+        // could not make: was a producer armed, what the eventfd counter
+        // read before the drain (nonzero = written-never-delivered, zero
+        // = never written), and the ring's heads + armed-poll count.
+        if after_tick && pass_msgs > 0 && !tick_wake_seen {
+            TRANSPORT_PARK_TICK_COMMIT_RESCUES.fetch_add(pass_msgs as u64, Ordering::Relaxed);
+            if rescue_log_eligible {
+                last_rescue_log = Some(Instant::now());
+                let ring_fd = ring.as_raw_fd();
+                warn!(
+                    "fuse-over-uring qids={qids:?}: the bounded park's tick RESCUED {pass_msgs} \
+                     queued WorkerMsg(s) no wake delivered — a LOST commit wake \
+                     (transport_park_tick_commit_rescues); at pass top: wake_armed={tick_armed} \
+                     wake_cqe_seen={tick_wake_seen} owed={tick_owed} wake_fd={wake_fd}: {}; \
+                     ring_fd={ring_fd}: {}",
+                    tick_efd_snapshot
+                        .as_deref()
+                        .unwrap_or("not sampled (coalescer unarmed at pass top)"),
+                    fdinfo_snapshot(ring_fd)
+                );
+            }
+        }
         let work_in_hand = !deferred_cqes.is_empty() || pass_polls > 0 || pass_msgs > 0;
         // R-4 spin-before-park (module doc on `spin`): where this pass
         // would BLOCK, first spin a bounded, derived window — while ops
@@ -6099,6 +6383,9 @@ fn queue_worker(
                         Err(e) if e.raw_os_error() == Some(libc::ETIME) => {
                             if backstop.is_some() {
                                 TRANSPORT_PARK_BACKSTOP_TICKS.fetch_add(1, Ordering::Relaxed);
+                                // The rescue ledger reads what this
+                                // tick's reap and the next pass find.
+                                tick_rescue_pending = true;
                             }
                             Ok(0)
                         }
@@ -6172,6 +6459,13 @@ fn queue_worker(
             completed.extend(cq.map(|c| (c.user_data(), c.result(), c.flags())));
             popped_ns
         };
+        // Rescue ledger, CQE half: a tick's own enter surfacing completions
+        // means they were posted kernel-side and this worker was never
+        // woken for them (a blocking park always follows an empty CQ, and
+        // a tick returns ETIME only when no wake arrived).
+        if tick_rescue_pending && !completed.is_empty() {
+            TRANSPORT_PARK_TICK_CQE_RESCUES.fetch_add(completed.len() as u64, Ordering::Relaxed);
+        }
 
         // Reclaim list — group-local ent ids (member recovered by
         // `gent / depth` at the re-REGISTER pass).

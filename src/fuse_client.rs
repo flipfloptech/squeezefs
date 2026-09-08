@@ -5234,8 +5234,9 @@ impl LatencyHistogram {
 /// word: the ten `read_serve_phase_ns` phases were seven process-global
 /// three-RMW records per warm READ (bucket + count + sum) on lines shared
 /// by every handler lane — true sharing, which `Align64` cannot prevent.
-/// Each thread records into its own stripe ([`sharded_stripe_index`]; a
-/// stripe is a whole padded histogram, so no two stripes share a line);
+/// Each thread records into its own stripe (the round-robin thread-local
+/// stripe index [`ShardedAtomic`] uses; a stripe is a whole padded
+/// histogram, so no two stripes share a line);
 /// the read side folds the stripes. The export is unchanged: addition
 /// commutes, so `count` / `sum_ns` / every bucket are the exact sums the
 /// unsharded word would have held (a snapshot taken mid-record can miss a

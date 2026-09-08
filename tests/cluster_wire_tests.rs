@@ -1069,6 +1069,63 @@ async fn rpc_service_calls_execute_on_the_connections_own_named_thread() {
 }
 
 // ---------------------------------------------------------------------------
+// D-5 (e2e perf audit §5.3 row 18): a dial never waits for the accept tick
+// ---------------------------------------------------------------------------
+
+/// The accept loop parked on a 100 ms `ACCEPT_POLL_TICK` sleep between
+/// non-blocking `accept()` attempts, so every dial paid up to 100 ms of
+/// accept latency (the D-1b note measured 98–100 ms walls on any row that
+/// dialed a session): a fleet-start / reconnect / first-beat term on every
+/// plane the wire carries. The accept thread must WAIT ON THE SOCKET (a
+/// connection arrival wakes it at once) and keep the tick only as the
+/// shutdown-latch observation bound.
+///
+/// The pin is statistical on purpose: 16 sequential dials, and the MEDIAN
+/// connect+handshake must be milliseconds, not the tick. Measured RED on
+/// the sleep-poll: every sequential dial paid the WHOLE tick (min 100.09,
+/// median 100.17, max 100.71 ms) — the loop re-polls right after an
+/// accept, finds nothing, and sleeps, so the next arrival always lands
+/// inside the sleep. GREEN on a socket wait at ≈ 0.3 ms on loopback.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_dial_never_waits_for_the_accept_tick() {
+    let host = cw::RpcListener::start(listener_cfg(), SECRET.to_vec(), Arc::new(cw::PingService))
+        .expect("listener starts");
+    let endpoint = host.endpoint().to_string();
+    let mut walls: Vec<Duration> = Vec::with_capacity(16);
+    let mut sessions = Vec::with_capacity(16);
+    for i in 0..16 {
+        let t0 = std::time::Instant::now();
+        let client = cw::RpcClient::connect(&endpoint, SECRET, &format!("dial-{i}"), None)
+            .await
+            .expect("storage-trust enrollment");
+        walls.push(t0.elapsed());
+        sessions.push(client);
+    }
+    walls.sort();
+    let median = walls[walls.len() / 2];
+    let p90 = walls[walls.len() * 9 / 10];
+    println!(
+        "D-5 accept row: 16 dials — min {:?}, median {:?}, p90 {:?}, max {:?}",
+        walls[0],
+        median,
+        p90,
+        walls[walls.len() - 1]
+    );
+    assert!(
+        median < Duration::from_millis(10),
+        "a dial must not pay the accept tick: median {median:?} (the sleep-poll paid the whole \
+         100 ms tick on every sequential dial)"
+    );
+    assert!(
+        p90 < Duration::from_millis(40),
+        "p90 {p90:?} — the arrivals wake the accept thread, they do not wait for its tick"
+    );
+    assert_eq!(host.stats().sessions_admitted, 16);
+    drop(sessions);
+    host.shutdown();
+}
+
+// ---------------------------------------------------------------------------
 // The RTT row instrument, on demand
 // ---------------------------------------------------------------------------
 

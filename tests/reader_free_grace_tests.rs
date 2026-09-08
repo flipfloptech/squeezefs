@@ -5630,8 +5630,16 @@ async fn the_checkpoint_task_runs_at_the_elastic_ceiling_under_an_ask() {
         "at P/2 the task cycled at least twice in 1.25 routine ceilings ({marks})"
     );
 
-    // The lever off under the same ask: the shipped cadence.
+    // The lever off under the same ask: the shipped cadence. The task
+    // reads the ceiling at the START of a tick and notes the cycle elastic
+    // AFTER it ran (`checkpoint_task`), so a tick decided under the ask
+    // before the flip lands its note after it — within the landing ceiling
+    // by the product's own law (the routine-derived one bounds the elastic
+    // one: a tighter decision only tightens the tick). Let that cycle land
+    // before sampling (the 2026-09-08 gate on a throttled CPU read 3 vs 2).
     free_grace::test_set_checkpoint_composite(Some(false));
+    let landing = squeezefs::meta_backend::kv::checkpoint::checkpoint_landing_ceiling_derived();
+    tokio::time::sleep(Duration::from_millis(landing)).await;
     let elastic_before = free_grace::checkpoint_elastic_cycles();
     commit_for(Arc::clone(&be), "off", routine + routine / 4).await;
     assert_eq!(

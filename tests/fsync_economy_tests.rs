@@ -140,6 +140,11 @@ struct Fx {
     _staging: TempDir,
 }
 
+/// Sparse backing size per data volume. The allocator chunk is 4 MiB
+/// whatever the block size, so every 64 KiB block here costs a chunk of
+/// capacity: 4 GiB = 1,024 blocks per volume (the rows write 384).
+const DEV_BYTES: u64 = 4 << 30;
+
 /// Mount-shaped fixture with `n` data volumes (the placement_tests shape):
 /// records registered, the first record's device is the default slot.
 /// The checkpoint timer is parked so no background tick lands in the
@@ -151,13 +156,7 @@ async fn open_fx(n: usize, tag: &str) -> Fx {
     let dir = tempfile::tempdir().unwrap();
     let meta = make_dev_file(dir.path(), &format!("meta-{tag}"), 256 * 1024 * 1024);
     let paths: Vec<PathBuf> = (0..n)
-        .map(|i| {
-            make_dev_file(
-                dir.path(),
-                &format!("oss{}-{tag}", i + 1),
-                128 * 1024 * 1024,
-            )
-        })
+        .map(|i| make_dev_file(dir.path(), &format!("oss{}-{tag}", i + 1), DEV_BYTES))
         .collect();
     let refs: Vec<&Path> = paths.iter().map(|p| p.as_path()).collect();
     format_meta(&meta, &refs).await;
@@ -931,6 +930,9 @@ async fn fsync_storm_rows() {
     let dev_lat = Duration::from_millis(3);
     let meta_lat = Duration::from_millis(1);
     for (label, touched, parallel) in [
+        // The first leg pays the process's cold start (uring workers,
+        // allocator, blocking pool): discarded.
+        ("warm-up (discarded)", false, false),
         ("A shipped (off/off)", false, false),
         ("B levers (on/on)", true, true),
         ("B levers (on/on)", true, true),

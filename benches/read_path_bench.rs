@@ -529,6 +529,121 @@ fn bench_fill_issue_economy(c: &mut Criterion) {
     group.finish();
 }
 
+/// **R-5 read-handler economy** (e2e perf audit §3.4 Read #6/#7; the
+/// campaign note `.benchmarks/2026-09-08-r5-read-handler-economy.md`) —
+/// the per-op prelude primitives of the KERNEL READ handler, priced one
+/// at a time so the alloc law (`tests/kernel_op_economy_tests.rs`) has its
+/// ns/op face:
+///
+/// * `custody_fp_build_1block` / `custody_fp_pair_matches` — the
+///   generic/795 custody fingerprint, built twice per READ (before the
+///   router, after) and compared: the field shape is ONE covered block
+///   (a 4 KiB window on the 4 MiB production block).
+/// * `key_resolve_fill_incarnation` / `key_resolve_zc_device` — the cold
+///   leg's per-op key resolves (`fill_incarnation`, `zc_device_resolve`,
+///   the same `clean → split → allocator` ladder `key_incarnation_tracked`
+///   and `fill_incarnation_still` run): the bare default-slot key every
+///   single-volume filesystem persists.
+/// * `serve_phase_record_1thread` / `serve_phase_record_8threads` — one
+///   `read_serve_phase_ns` record (the handler crosses 7 of them per warm
+///   serve) uncontended, and hammered from 8 threads the way 8 handler
+///   lanes hit the family's cache lines at the field's per-core lane
+///   shape.
+fn bench_read_handler_economy(c: &mut Criterion) {
+    use squeezefs::block_allocator::BlockAllocator;
+    use squeezefs::fuse_client::{read_serve_phase_record, ReadCustodyFp, ReadServePhase};
+    use squeezefs::nvme_dev::NvmeBlockDev;
+    use squeezefs::routing::{BackendRouter, CachedMetadata};
+    use std::sync::atomic::AtomicU64;
+    use std::sync::Arc;
+    use tokio::runtime::Runtime;
+
+    let mut group = c.benchmark_group("read_handler_economy");
+    group.throughput(Throughput::Elements(1));
+
+    // One striped 64-block file with bare default-slot keys — the
+    // single-volume field shape.
+    let mut map = std::collections::HashMap::new();
+    for b in 0..64u32 {
+        map.insert(b, (u64::from(b) * BLOCK as u64).to_string());
+    }
+    let meta = CachedMetadata {
+        file_type: "striped".into(),
+        size: 64 * BLOCK as u64,
+        block_map: Some(Arc::new(map)),
+        ..Default::default()
+    };
+    let ino = 4242u64;
+    group.bench_function("custody_fp_build_1block", |b| {
+        b.iter(|| {
+            black_box(ReadCustodyFp::build_sync(
+                black_box(&meta),
+                ino,
+                BLOCK as u64,
+                black_box(7 * BLOCK as u64 + 8192),
+                4096,
+            ))
+        })
+    });
+    group.bench_function("custody_fp_pair_matches", |b| {
+        b.iter(|| {
+            let before =
+                ReadCustodyFp::build_sync(black_box(&meta), ino, BLOCK as u64, 7 * BLOCK as u64, 4096)
+                    .expect("striped window has a custody chain");
+            let after =
+                ReadCustodyFp::build_sync(black_box(&meta), ino, BLOCK as u64, 7 * BLOCK as u64, 4096)
+                    .expect("striped window has a custody chain");
+            black_box(before.matches(&after))
+        })
+    });
+
+    let rt = Runtime::new().unwrap();
+    let backing = tempfile::NamedTempFile::new().expect("backing");
+    let (alloc, router) = rt.block_on(async {
+        let alloc = Arc::new(
+            BlockAllocator::new("bench_read_handler_economy")
+                .await
+                .expect("allocator"),
+        );
+        let dev = Arc::new(NvmeBlockDev::new(backing.path().to_str().unwrap()));
+        let router = BackendRouter::new(alloc.clone(), dev, Arc::new(AtomicU64::new(BLOCK as u64)));
+        (alloc, router)
+    });
+    alloc.set_capacity_bytes(64 * 1024 * 1024 * 1024);
+    group.bench_function("key_resolve_fill_incarnation", |b| {
+        b.iter(|| black_box(router.fill_incarnation(black_box("4194304"))))
+    });
+    group.bench_function("key_resolve_zc_device", |b| {
+        b.iter(|| black_box(router.zc_device_resolve(black_box("4194304"))))
+    });
+
+    group.bench_function("serve_phase_record_1thread", |b| {
+        let t0 = std::time::Instant::now();
+        b.iter(|| read_serve_phase_record(ReadServePhase::Prelude, black_box(t0)))
+    });
+    const THREADS: usize = 8;
+    const PER_THREAD: usize = 4_096;
+    group.throughput(Throughput::Elements((THREADS * PER_THREAD) as u64));
+    group.bench_function("serve_phase_record_8threads", |b| {
+        b.iter(|| {
+            let hs: Vec<_> = (0..THREADS)
+                .map(|_| {
+                    std::thread::spawn(move || {
+                        let t0 = std::time::Instant::now();
+                        for _ in 0..PER_THREAD {
+                            read_serve_phase_record(ReadServePhase::SliceOut, black_box(t0));
+                        }
+                    })
+                })
+                .collect();
+            for h in hs {
+                h.join().unwrap();
+            }
+        })
+    });
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_read_dest_bound,
@@ -537,7 +652,8 @@ criterion_group!(
     bench_assembly_join,
     bench_sparse_lseek,
     bench_tier_publish_hop,
-    bench_fill_issue_economy
+    bench_fill_issue_economy,
+    bench_read_handler_economy
 );
 
 criterion_main!(benches);

@@ -342,6 +342,124 @@ async fn warm_kernel_read_prelude_allocation_budget() {
 }
 
 // ---------------------------------------------------------------------------
+// READ — the cold FUSE-zc direct leg (the field kern rand-4k posture)
+// ---------------------------------------------------------------------------
+
+/// The injected zc fetch primitive: the transport's `READ_FIXED(device →
+/// slot)` stands in as an immediately-ready `Ok(len)` — the DMA is the
+/// kernel's work and not what this ledger prices. Its `Box::pin` is the
+/// one structural allocation the injected shape carries (the live
+/// connection arm awaits the transport's own future unboxed).
+fn zc_ready_serve() -> squeezefs::routing::ZcReadServe {
+    squeezefs::routing::ZcReadServe::new(Box::new(|_fd, _off, len| Box::pin(async move { Ok(len) })))
+}
+
+/// **The kernel READ lane's COLD zc-leg allocation budget** (R-5).
+///
+/// Shape: the field kern rand-4k posture on the sqz kernel — every tier
+/// probe misses and the router's FUSE-zc direct leg DMAs the 4 KiB
+/// window straight into the caller's pages (`zc_device_resolve` →
+/// incarnation snapshot → fetch → still-check → binding recheck). The
+/// leg deposits nothing, so every read of the window is cold again;
+/// the fixture is the router primitive with an injected fetch (the
+/// `fuse_zc_serve_tests` venue).
+///
+/// Measured on this box (dev profile, 2,000 ops, counted A-B on the same
+/// binary pair):
+///   * pre-R-5:  **11.00** allocs/op — the W2 overlay key (1), the
+///     single-block `load_striped_block_keys` (`Vec` + key clone, 2),
+///     and FOUR key re-parses that each minted a `String` (and three of
+///     them a `clean_block_key` `String` first): `zc_device_resolve` (1),
+///     `key_incarnation_tracked` (2), `fill_incarnation` (2),
+///     `fill_incarnation_still` (2) — plus the injected fetch's `Box::pin`.
+///   * post-R-5: **1.00** allocs/op — the injected fetch's `Box::pin`
+///     alone (the live connection arm carries no box either).
+///
+/// The bar is 2/op — headroom for incidental churn, red on the pre-R-5
+/// tree by a factor of five.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cold_kernel_read_zc_leg_allocation_budget() {
+    let h = make().await;
+    let ino = striped_fixture(&h, "cold_zc.bin").await;
+    let path = squeezefs::keys::inode_path(ino);
+    let map =
+        h.fs.router
+            .fetch_metadata(&path)
+            .await
+            .expect("layout")
+            .block_map
+            .expect("striped fixture carries an inline map");
+    for key in map.values() {
+        h.fs.router.cache.purge_block_key(key);
+    }
+
+    async fn read_cold(
+        h: &H,
+        path: &str,
+        zc: &squeezefs::routing::ZcReadServe,
+    ) -> squeezefs::error::Result<(
+        bytes::Bytes,
+        Option<Arc<dyn std::any::Any + Send + Sync>>,
+    )> {
+        h.fs.router
+            .read_file_range_zero_copy_with_meta(
+                path,
+                4096,
+                4096,
+                None,
+                squeezefs::routing::ReadClassHint::default(),
+                None,
+                Some(zc),
+            )
+            .await
+    }
+    for _ in 0..8 {
+        let zc = zc_ready_serve();
+        let (data, _) = read_cold(&h, &path, &zc).await.expect("cold zc read");
+        assert!(data.is_empty(), "a zc-served read replies with an empty body");
+        assert_eq!(zc.served(), Some(4096), "the direct leg must engage");
+    }
+
+    if trace_enabled() {
+        let zc = zc_ready_serve();
+        TRACE.store(true, Ordering::SeqCst);
+        let a0 = allocs_now();
+        for _ in 0..32 {
+            let _ = read_cold(&h, &path, &zc).await;
+        }
+        let allocs = allocs_now() - a0;
+        TRACE.store(false, Ordering::SeqCst);
+        println!("traced cold zc READ window: {allocs} allocs / 32 ops");
+        print_site_table();
+        return;
+    }
+
+    const OPS: u64 = 2_000;
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    let zc = zc_ready_serve();
+    let a0 = allocs_now();
+    for _ in 0..OPS {
+        let _ = read_cold(&h, &path, &zc).await;
+    }
+    let allocs = allocs_now() - a0;
+    assert_eq!(zc.served(), Some(4096), "the direct leg served every op");
+    let per_op_centi = allocs * 100 / OPS;
+    println!(
+        "kernel READ cold zc leg: {allocs} allocs / {OPS} ops = {}.{:02} per op",
+        per_op_centi / 100,
+        per_op_centi % 100
+    );
+    assert!(
+        per_op_centi <= 200,
+        "cold kernel READ zc leg allocates {}.{:02} per op — the R-5 budget \
+         is 2.00 (one borrowed key resolve per op, no per-parse Strings, \
+         no Vec for a single-block map probe)",
+        per_op_centi / 100,
+        per_op_centi % 100
+    );
+}
+
+// ---------------------------------------------------------------------------
 // WRITE — the sub-block overwrite of a striped block
 // ---------------------------------------------------------------------------
 

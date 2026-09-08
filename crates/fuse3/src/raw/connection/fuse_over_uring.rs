@@ -8962,6 +8962,72 @@ mod tests {
         assert!(!pool.is_ready() && !pool.is_active());
     }
 
+    /// The drain group's OWED-REPLY count — the generalized park bound's
+    /// gate (generic/795 wedge, 2026-09-08,
+    /// `.benchmarks/2026-09-08-generic-795-lookup-wedge.md`): a worker
+    /// whose group owes any reply parks BOUNDED. The count follows the
+    /// slot-watch transitions exactly — a set that moves a cell 0→unique
+    /// is +1, a clear of a HELD cell is −1, and neither a re-set of a
+    /// held cell (row 10's displaced delivery: the slot still owes
+    /// exactly one) nor a clear of an already-clear cell moves it, so it
+    /// can never underflow.
+    #[test]
+    fn group_owed_count_follows_the_slot_watch_transitions() {
+        let pool = FuseOverUring::sim_inert(1);
+        assert_eq!(pool.group_owed(0), 0, "a fresh group owes nothing");
+        pool.publish_slot_owed(0, 0, 41);
+        assert_eq!(pool.group_owed(0), 1, "set 0→unique is +1");
+        pool.publish_slot_owed(0, 1, 42);
+        assert_eq!(pool.group_owed(0), 2, "two ents owing = 2");
+        // Row 10: a delivery onto a slot that still owes — the cell holds
+        // the new unique, the group still owes exactly two.
+        pool.publish_slot_owed(0, 1, 43);
+        assert_eq!(
+            pool.group_owed(0),
+            2,
+            "a re-set of a held cell moves nothing"
+        );
+        pool.publish_slot_owed(0, 1, 0);
+        assert_eq!(pool.group_owed(0), 1, "a clear of a held cell is −1");
+        pool.publish_slot_owed(0, 1, 0);
+        assert_eq!(
+            pool.group_owed(0),
+            1,
+            "a clear of an already-clear cell moves nothing"
+        );
+        pool.publish_slot_owed(0, 0, 0);
+        assert_eq!(
+            pool.group_owed(0),
+            0,
+            "the last clear returns the group to idle"
+        );
+        pool.publish_slot_owed(0, 0, 0);
+        assert_eq!(pool.group_owed(0), 0, "never underflows");
+    }
+
+    /// The cell's own clear reports whether it HELD a unique — the word
+    /// the group count's decrement keys on (a clear of a clear cell is a
+    /// no-op, never a −1).
+    #[test]
+    fn slot_watch_clear_reports_whether_the_cell_held_a_unique() {
+        let owed = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let w = SlotWatch::new(Arc::clone(&owed));
+        assert!(!w.clear(), "a fresh cell holds nothing");
+        assert_eq!(owed.load(Ordering::Relaxed), 0);
+        w.set(7, 1);
+        assert_eq!(owed.load(Ordering::Relaxed), 1);
+        w.set(8, 2);
+        assert_eq!(
+            owed.load(Ordering::Relaxed),
+            1,
+            "re-set of a held cell: still one"
+        );
+        assert!(w.clear(), "the cell held unique 8");
+        assert_eq!(owed.load(Ordering::Relaxed), 0);
+        assert!(!w.clear(), "second clear: nothing held");
+        assert_eq!(owed.load(Ordering::Relaxed), 0, "never underflows");
+    }
+
     /// The venue predicates' truth table on the pool's own atomics
     /// (contract 2's pool half): `is_ready` = ready && active — never
     /// true pre-ready, never true post-shutdown.

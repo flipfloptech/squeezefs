@@ -355,6 +355,81 @@ fn fuse3_sharded_fold_is_exact() {
     assert_eq!(hist_sum_ns(h), after[phase_idx].sum_ns);
 }
 
+/// R-5 read-handler economy: the two always-on per-op READ families
+/// (`read_serve_phase_ns`, `read_fill_phase_ns`) record into per-thread
+/// STRIPES (the fuse3 PERF-3 layout brought to the root crate) and the
+/// stats export folds them — count, sum_ns and every bucket are the exact
+/// sums the process-global word held, to the ns, from N recording
+/// threads. The phase names and the JSON shape are byte-identical.
+#[test]
+fn read_serve_phase_sharded_fold_is_exact() {
+    use squeezefs::fuse_client::{
+        read_serve_phase_json, read_serve_phase_record_at, ReadServePhase,
+    };
+    use std::time::Instant;
+    const THREADS: u64 = 6;
+    const PER_THREAD: u64 = 400;
+    let before = read_serve_phase_json();
+    let (c0, s0) = phase_words(&before, "sf_wait");
+    let hs: Vec<_> = (0..THREADS)
+        .map(|t| {
+            std::thread::spawn(move || {
+                let now = Instant::now();
+                for i in 0..PER_THREAD {
+                    // Distinct ns spans so a bucket-midpoint estimate could
+                    // never reproduce the sum by accident.
+                    let ns = 1_000 * (t + 1) + 7 * i;
+                    read_serve_phase_record_at(
+                        ReadServePhase::SfWait,
+                        now - Duration::from_nanos(ns),
+                        now,
+                    );
+                }
+            })
+        })
+        .collect();
+    for h in hs {
+        h.join().unwrap();
+    }
+    let after = read_serve_phase_json();
+    let (c1, s1) = phase_words(&after, "sf_wait");
+    let want_count = THREADS * PER_THREAD;
+    let want_sum: u64 = (0..THREADS)
+        .flat_map(|t| (0..PER_THREAD).map(move |i| 1_000 * (t + 1) + 7 * i))
+        .sum();
+    assert_eq!(c1 - c0, want_count, "count folds exactly across stripes");
+    assert_eq!(s1 - s0, want_sum, "sum_ns folds exactly across stripes");
+    assert_eq!(
+        bucket_sum(&after["sf_wait"]) - bucket_sum(&before["sf_wait"]),
+        want_count,
+        "Σ buckets ≡ count on the fold too"
+    );
+    // The family's names and shape are unchanged by the sharding.
+    let names: Vec<&str> = after
+        .as_object()
+        .expect("family object")
+        .keys()
+        .map(|k| k.as_str())
+        .collect();
+    for want in [
+        "prelude",
+        "meta_resolve",
+        "key_resolve",
+        "classify_probe",
+        "sf_wait",
+        "block_fetch",
+        "binding_check",
+        "slice_out",
+        "post_validate",
+        "total",
+    ] {
+        assert!(names.contains(&want), "phase {want} present");
+    }
+    for k in HIST_KEYS {
+        assert!(after["sf_wait"].get(k).is_some(), "sharded JSON lacks {k}");
+    }
+}
+
 // ---------------------------------------------------------------------------
 // B — write-side device split + journal split
 // ---------------------------------------------------------------------------

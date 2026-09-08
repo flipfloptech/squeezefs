@@ -4184,11 +4184,13 @@ const READ_FILL_PHASE_NAMES: [&str; READ_FILL_PHASES] = [
     "fill_total",
 ];
 
-static READ_SERVE_PROF: Lazy<[LatencyHistogram; READ_SERVE_PHASES]> =
-    Lazy::new(|| std::array::from_fn(|_| LatencyHistogram::default()));
+// Sharded per recording thread (R-5 read-handler economy): the two
+// always-on per-op read families — see `ShardedLatencyHistogram`.
+static READ_SERVE_PROF: Lazy<[ShardedLatencyHistogram; READ_SERVE_PHASES]> =
+    Lazy::new(|| std::array::from_fn(|_| ShardedLatencyHistogram::default()));
 
-static READ_FILL_PROF: Lazy<[LatencyHistogram; READ_FILL_PHASES]> =
-    Lazy::new(|| std::array::from_fn(|_| LatencyHistogram::default()));
+static READ_FILL_PROF: Lazy<[ShardedLatencyHistogram; READ_FILL_PHASES]> =
+    Lazy::new(|| std::array::from_fn(|_| ShardedLatencyHistogram::default()));
 
 /// Direct-drive residence sub-phases (`ipc_direct_phase_ns` — the
 /// shim-iops campaign's rand-4k il decomposition instrument,
@@ -4355,10 +4357,29 @@ const READ_FILL_STAGE: [Option<crate::op_trace::Stage>; READ_FILL_PHASES] = [
 
 /// Record one serve-residence span started at `t0` (always-on; see the
 /// module block above for the cost contract). The ONE clock read also
-/// stamps the phase's op-trace stage for the task-scoped op.
+/// stamps the phase's op-trace stage for the task-scoped op, and is
+/// RETURNED so the next phase starts from it (R-5 span-form chaining:
+/// phases that abut share their boundary instant instead of each reading
+/// the clock twice — a warm serve went from 12 reads to 8).
 #[inline]
-pub fn read_serve_phase_record(phase: ReadServePhase, t0: std::time::Instant) {
+pub fn read_serve_phase_record(
+    phase: ReadServePhase,
+    t0: std::time::Instant,
+) -> std::time::Instant {
     let now = std::time::Instant::now();
+    read_serve_phase_record_at(phase, t0, now);
+    now
+}
+
+/// [`read_serve_phase_record`] with the end instant the caller already
+/// read (two phases ending at the same boundary — `post_validate` and
+/// `total` — share one clock read).
+#[inline]
+pub fn read_serve_phase_record_at(
+    phase: ReadServePhase,
+    t0: std::time::Instant,
+    now: std::time::Instant,
+) {
     READ_SERVE_PROF[phase as usize].record(now.saturating_duration_since(t0));
     crate::op_trace::stamp_current(READ_SERVE_STAGE[phase as usize], now);
 }
@@ -4907,23 +4928,26 @@ impl Default for ShardedAtomic {
     }
 }
 
-impl ShardedAtomic {
-    /// The calling thread's stripe index: assigned round-robin on first
-    /// use, cached in a thread-local (one relaxed global RMW per thread
-    /// lifetime, then a plain TLS read per op).
-    fn stripe_index() -> usize {
-        thread_local! {
-            static STRIPE: usize = {
-                static NEXT: std::sync::atomic::AtomicUsize =
-                    std::sync::atomic::AtomicUsize::new(0);
-                NEXT.fetch_add(1, Ordering::Relaxed) % SHARDED_ATOMIC_STRIPES
-            };
-        }
-        STRIPE.with(|s| *s)
+/// The calling thread's stripe index for every per-thread-sharded
+/// instrument in this crate ([`ShardedAtomic`], [`ShardedLatencyHistogram`]):
+/// assigned round-robin on first use, cached in a thread-local (one
+/// relaxed global RMW per thread lifetime, then a plain TLS read per op).
+/// A migrating thread keeps counting into a line it owns (the
+/// `wake_core`/pool-index precedent — never `sched_getcpu` per op).
+fn sharded_stripe_index() -> usize {
+    thread_local! {
+        static STRIPE: usize = {
+            static NEXT: std::sync::atomic::AtomicUsize =
+                std::sync::atomic::AtomicUsize::new(0);
+            NEXT.fetch_add(1, Ordering::Relaxed) % SHARDED_ATOMIC_STRIPES
+        };
     }
+    STRIPE.with(|s| *s)
+}
 
+impl ShardedAtomic {
     pub fn fetch_add(&self, val: u64, order: Ordering) {
-        self.stripes[Self::stripe_index()].fetch_add(val, order);
+        self.stripes[sharded_stripe_index()].fetch_add(val, order);
     }
 
     /// Sum of all stripes. Relaxed per-stripe loads: exact for counts
@@ -5203,6 +5227,78 @@ impl LatencyHistogram {
     }
 }
 
+/// [`LatencyHistogram`] SHARDED per recording thread — the PERF-3 layout
+/// the fuse3 transport tables use, for the root crate's per-op read
+/// families (R-5 read-handler economy). A latency distribution is tight by
+/// construction, so nearly every op of a phase lands in the SAME bucket
+/// word: the ten `read_serve_phase_ns` phases were seven process-global
+/// three-RMW records per warm READ (bucket + count + sum) on lines shared
+/// by every handler lane — true sharing, which `Align64` cannot prevent.
+/// Each thread records into its own stripe ([`sharded_stripe_index`]; a
+/// stripe is a whole padded histogram, so no two stripes share a line);
+/// the read side folds the stripes. The export is unchanged: addition
+/// commutes, so `count` / `sum_ns` / every bucket are the exact sums the
+/// unsharded word would have held (a snapshot taken mid-record can miss a
+/// just-recorded sample exactly as before).
+///
+/// Stripes are allocated on first use (a `Lazy` family table of ten
+/// phases × 64 stripes × 256 B = 160 KiB would otherwise sit in the binary
+/// for every process, mount or not).
+pub struct ShardedLatencyHistogram {
+    stripes: std::sync::OnceLock<Vec<HistStripe>>,
+}
+
+/// One stripe: a histogram padded to whole cache lines (224 B → 256 B) so
+/// adjacent stripes never share a line.
+#[repr(align(256))]
+struct HistStripe(LatencyHistogram);
+
+impl Default for ShardedLatencyHistogram {
+    fn default() -> Self {
+        Self {
+            stripes: std::sync::OnceLock::new(),
+        }
+    }
+}
+
+impl ShardedLatencyHistogram {
+    fn stripes(&self) -> &[HistStripe] {
+        self.stripes.get_or_init(|| {
+            (0..SHARDED_ATOMIC_STRIPES)
+                .map(|_| HistStripe(LatencyHistogram::default()))
+                .collect()
+        })
+    }
+
+    /// Record one span on this thread's stripe (three uncontended relaxed
+    /// RMWs on a core-local line).
+    #[inline]
+    pub fn record(&self, duration: Duration) {
+        self.stripes()[sharded_stripe_index()].0.record(duration);
+    }
+
+    /// Spans recorded (exact — Σ over stripes).
+    pub fn count(&self) -> u64 {
+        self.stripes().iter().map(|s| s.0.count()).sum()
+    }
+
+    /// Σ recorded spans, ns (exact — Σ over stripes).
+    pub fn sum_ns(&self) -> u64 {
+        self.stripes().iter().map(|s| s.0.sum_ns()).sum()
+    }
+
+    /// The fold, rendered through the ONE histogram export shape.
+    pub fn to_json(&self) -> serde_json::Value {
+        let mut buckets = [0u64; crate::latency_core::LATENCY_BUCKETS];
+        for s in self.stripes() {
+            for (b, a) in buckets.iter_mut().zip(s.0.buckets.iter()) {
+                *b += a.load(Ordering::Relaxed);
+            }
+        }
+        histogram_json(&buckets, self.count(), self.sum_ns())
+    }
+}
+
 pub struct QueueDepthHistogram {
     pub buckets: [AtomicU64; 15],
 }
@@ -5337,8 +5433,8 @@ pub struct Metrics {
     pub put_obj: Align64<AtomicU64>,
     pub get_obj: Align64<AtomicU64>,
     pub del_obj: Align64<AtomicU64>,
-    pub cache_hits: Align64<AtomicU64>,
-    pub cache_misses: Align64<AtomicU64>,
+    pub cache_hits: ShardedAtomic,
+    pub cache_misses: ShardedAtomic,
     /// Striped serves whose block-index→key binding (or device-fill
     /// incarnation) moved between resolution and fetch and were re-resolved
     /// instead of served (the reused-key stale-fill family, `8e3995e`
@@ -5389,7 +5485,7 @@ pub struct Metrics {
     /// count victims leaving the clock ring; probation_drops counts
     /// never-read probation victims DROPPED by the dehydration gate —
     /// stays 0 until PR 4 flips the protected-only policy.
-    pub hot_block_hits: Align64<AtomicU64>,
+    pub hot_block_hits: ShardedAtomic,
     pub hot_block_misses: Align64<AtomicU64>,
     pub hot_block_evictions: Align64<AtomicU64>,
     pub hot_block_probation_drops: Align64<AtomicU64>,
@@ -5497,7 +5593,7 @@ pub struct Metrics {
     pub read_tier_admissions: Align64<AtomicU64>,
     pub read_tier_admission_ghost_hits: Align64<AtomicU64>,
     pub read_streams_classified: Align64<AtomicU64>,
-    pub read_odirect_requests: Align64<AtomicU64>,
+    pub read_odirect_requests: ShardedAtomic,
     /// Hybrid I/O (user directive 2026-07-15): O_DIRECT requests served
     /// from the single-block RAM/NVMe tier fast paths (the 416–492k IOPS
     /// class signature — ≈ 0 on a warm O_DIRECT workload means the hybrid
@@ -5506,7 +5602,7 @@ pub struct Metrics {
     /// device-true diagnostic reads (`-o direct_device_true` /
     /// `SQUEEZEFS_DIRECT_DEVICE_TRUE` — adoption signal for the escape:
     /// > 0 on a mount that should be hybrid means the escape is armed).
-    pub read_odirect_tier_serves: Align64<AtomicU64>,
+    pub read_odirect_tier_serves: ShardedAtomic,
     pub read_odirect_ghost_admits: Align64<AtomicU64>,
     pub read_device_true_reads: Align64<AtomicU64>,
     /// R2 pipeline (docs/design-read-path.md §5.5): issued/completed/
@@ -5542,8 +5638,8 @@ pub struct Metrics {
     pub read_lane_fetches: Align64<AtomicU64>,
     pub read_lane_fetch_bytes: Align64<AtomicU64>,
     pub read_lane_holds: Align64<AtomicU64>,
-    pub read_lane_serves: Align64<AtomicU64>,
-    pub read_lane_serve_bytes: Align64<AtomicU64>,
+    pub read_lane_serves: ShardedAtomic,
+    pub read_lane_serve_bytes: ShardedAtomic,
     pub read_lane_hold_retired: Align64<AtomicU64>,
     pub read_lane_hold_evicted_unconsumed: Align64<AtomicU64>,
     /// Ahead-class (lane-fetch) subset of the evicted-unconsumed ledger
@@ -5578,7 +5674,7 @@ pub struct Metrics {
     /// destination (registered uring ent payload / il arena dest) — the
     /// ONE lawful serve copy on the kernel path (hot/hold/tier/cold
     /// slice-out arms).
-    pub read_copy_dest_bytes: Align64<AtomicU64>,
+    pub read_copy_dest_bytes: ShardedAtomic,
     /// A1 warm-serve split (third-party read-audit adjudication
     /// 2026-08-04, D12 board item 5): the SUBSET of
     /// `read_copy_dest_bytes` whose source was a WARM tier buffer — the
@@ -5594,7 +5690,7 @@ pub struct Metrics {
     /// this counter's share of a warm row's dest bytes prices the
     /// auditor's claim in — re-priced from this split, never the
     /// +15–25 % blanket.
-    pub read_copy_warm_serve_bytes: Align64<AtomicU64>,
+    pub read_copy_warm_serve_bytes: ShardedAtomic,
     /// R-4 per-ARM split (e2e perf audit read board #4/#5,
     /// `perf/read-zc-serve`, 2026-09-05): the three tier arms PARTITION
     /// `read_copy_warm_serve_bytes` exactly — `hot + hold + cache ≡
@@ -5604,9 +5700,9 @@ pub struct Metrics {
     /// recycle race needs a post-CQE generation check). Counted AT the
     /// copy, like the buckets they split, so the partition is exact even
     /// under a rebind retry.
-    pub read_copy_hot_serve_bytes: Align64<AtomicU64>,
-    pub read_copy_hold_serve_bytes: Align64<AtomicU64>,
-    pub read_copy_cache_serve_bytes: Align64<AtomicU64>,
+    pub read_copy_hot_serve_bytes: ShardedAtomic,
+    pub read_copy_hold_serve_bytes: ShardedAtomic,
+    pub read_copy_cache_serve_bytes: ShardedAtomic,
     /// R-4: the cold whole-block fill → dest SLICE-OUT — the EXA cold
     /// row's ONE daemon pass (the 2.69 passes/byte ledger: RX 0.69 +
     /// slice-out 1.00 + kernel commit/bridge 1.00). A SUBSET of the cold
@@ -5614,7 +5710,7 @@ pub struct Metrics {
     /// legs, ranged escalation slices and multi-block assembly slices,
     /// which stay unnamed by design). This is the arm an fd-addressable
     /// fill pool deletes on an armed session, so it is priced apart.
-    pub read_copy_fill_slice_bytes: Align64<AtomicU64>,
+    pub read_copy_fill_slice_bytes: ShardedAtomic,
     /// POSIX-14: inodes that reached their FINAL forget (the kernel
     /// certifying it holds no reference, which requires every handle
     /// closed) with a nonzero daemon open count — i.e. a lost RELEASE.
@@ -5637,11 +5733,11 @@ pub struct Metrics {
     /// mmap-guard copy-outs). After the zero-copy cold slice, a
     /// `Bytes`-backed cold fill served without a dest contributes 0 here
     /// — growth on il cold rows means the slice bounce regressed.
-    pub read_copy_bounce_bytes: Align64<AtomicU64>,
+    pub read_copy_bounce_bytes: ShardedAtomic,
     /// Device DMA landing DIRECTLY in the final destination (raw
     /// full-block dest leg, ranged zero-copy leg, ipc direct-drive) —
     /// the zero-daemon-copy engagement gauge.
-    pub read_dest_dma_bytes: Align64<AtomicU64>,
+    pub read_dest_dma_bytes: ShardedAtomic,
     /// Bytes served through the READ dest-window LEASE (read
     /// copy-elimination phase 1, 2026-08-06): cold sub-block windows
     /// whose fill DMA'd device bytes straight into the request's own
@@ -5653,7 +5749,7 @@ pub struct Metrics {
     /// aligned kernel row expect `read_copy_dest_bytes → ~0` with this
     /// counter carrying the row. 0 by construction under
     /// `SQUEEZEFS_READ_DEST_LEASE=0` and for hints without `dest_lease`.
-    pub read_dest_lease_bytes: Align64<AtomicU64>,
+    pub read_dest_lease_bytes: ShardedAtomic,
     /// Bytes served through the FUSE-zc DIRECT leg (K1 kill, 2026-08-06,
     /// `SQUEEZEFS_FUSE_ZC=1` on the sqz kernel): cold aligned passthrough
     /// windows whose device bytes DMA'd STRAIGHT into the caller's pages
@@ -5665,7 +5761,7 @@ pub struct Metrics {
     /// engagement instrument for the zc campaign — an armed row whose
     /// READ bytes this delta does not account for is INVALID. 0 by
     /// construction on un-armed sessions (stock kernels, lever off).
-    pub read_zc_serve_bytes: Align64<AtomicU64>,
+    pub read_zc_serve_bytes: ShardedAtomic,
     /// Bytes served through the fd-SOURCE zc serve (R-4,
     /// `SQUEEZEFS_READ_ZC_SERVE`, 2026-09-05): a hot-tier / read-lane-hold
     /// / cold-fill-slice serve on a zc-armed session whose source `Bytes`
@@ -5680,11 +5776,11 @@ pub struct Metrics {
     /// is the composed-window residue (a parked-run compose rebuilt the
     /// body → ordinary reply), ≈ 0. 0 by construction with the lever
     /// off, on un-armed sessions, and for every non-pool source.
-    pub read_zc_pool_serve_bytes: Align64<AtomicU64>,
+    pub read_zc_pool_serve_bytes: ShardedAtomic,
     /// The WARM subset of `read_zc_pool_serve_bytes` (hot + hold arms);
     /// the cold fill-slice share is the difference — the per-arm A/B
     /// against `read_copy_{hot,hold,fill_slice}_bytes`.
-    pub read_zc_pool_serve_warm_bytes: Align64<AtomicU64>,
+    pub read_zc_pool_serve_warm_bytes: ShardedAtomic,
     /// Device DMA into pooled fill intermediates (whole-block fills +
     /// ranged bounce windows) — the nvme-tcp RX-copy pricing denominator.
     pub read_fill_dma_bytes: Align64<AtomicU64>,
@@ -5705,7 +5801,7 @@ pub struct Metrics {
     /// the destination is CPU-read by the kernel commit copy, so NT here
     /// trades the RFO for a possible consumer DRAM miss; counted A/B
     /// only).
-    pub nt_read_serve_bytes: Align64<AtomicU64>,
+    pub nt_read_serve_bytes: ShardedAtomic,
     /// zcrx read lane (docs/design-zcrx-read-lane.md §9). `zcrx_lane_armed`
     /// is 0/1 per mount; `zcrx_fill_bytes` is the fill-provenance engagement
     /// gauge (a lane row is INVALID unless its delta accounts for the row's
@@ -30679,9 +30775,9 @@ impl SqueezefsFilesystem {
             break (settled, router_done_at);
         };
         // Last iteration's overlay-apply + fingerprint re-check span, then
-        // the whole per-op residence.
-        read_serve_phase_record(ReadServePhase::PostValidate, router_done_at);
-        read_serve_phase_record(ReadServePhase::Total, serve_t0);
+        // the whole per-op residence — both end HERE, one clock read.
+        let done = read_serve_phase_record(ReadServePhase::PostValidate, router_done_at);
+        read_serve_phase_record_at(ReadServePhase::Total, serve_t0, done);
         // FUSE-zc direct serve: reply header + length only (the session's
         // prefilled commit) — the payload already sits in the caller's
         // pages.

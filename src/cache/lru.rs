@@ -237,6 +237,12 @@ impl LruCache {
         self.inner.get_no_promote(key.as_bytes())
     }
 
+    /// Residency probe with the clock-bit refresh of [`Self::get_no_promote`]
+    /// and none of its `Bytes` clone (the R2 consume-time detector's form).
+    pub fn touch_no_promote(&self, key: &str) -> bool {
+        self.inner.touch_no_promote(key.as_bytes())
+    }
+
     /// Non-promoting get WITH payback credit — real reader serves pass
     /// the user bytes they served so the entry's eventual eviction can be
     /// classified earned-vs-waste by the admission governor. Probes and

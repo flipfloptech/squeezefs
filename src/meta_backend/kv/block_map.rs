@@ -498,6 +498,17 @@ impl KvmapHead {
     }
 }
 
+/// Is `s` the canonical decimal rendering of SOME unsigned integer — non-
+/// empty, ASCII digits only, no leading zero unless it is exactly `0`?
+/// Exactly the strings `u32::to_string`/`u64::to_string` produce, decided
+/// WITHOUT rendering the parsed value back (R-5 read-handler economy: the
+/// former `v.to_string() != s` check was one `String` per segment, two per
+/// head parse, on a partial-store resolve that runs per READ).
+fn is_canonical_decimal(s: &str) -> bool {
+    let b = s.as_bytes();
+    !b.is_empty() && b.iter().all(u8::is_ascii_digit) && (b.len() == 1 || b[0] != b'0')
+}
+
 /// Parse a canonical decimal — the exact-grammar guard: `u32::from_str`
 /// alone would accept `007`/`+7`, forms [`KvmapHead::encode`] never
 /// produces, and a parser wider than its encoder is a format hole.
@@ -505,7 +516,7 @@ fn parse_canonical_u32(s: &str, what: &str) -> Result<u32, KvError> {
     let v: u32 = s
         .parse()
         .map_err(|_| KvError::Corrupt(format!("kvmap head {what} {s:?} is not a u32")))?;
-    if v.to_string() != s {
+    if !is_canonical_decimal(s) {
         return Err(KvError::Corrupt(format!(
             "kvmap head {what} {s:?} is not canonical decimal"
         )));
@@ -519,7 +530,7 @@ fn parse_canonical_u64(s: &str, what: &str) -> Result<u64, KvError> {
     let v: u64 = s
         .parse()
         .map_err(|_| KvError::Corrupt(format!("kvmap head {what} {s:?} is not a u64")))?;
-    if v.to_string() != s {
+    if !is_canonical_decimal(s) {
         return Err(KvError::Corrupt(format!(
             "kvmap head {what} {s:?} is not canonical decimal"
         )));
@@ -593,6 +604,46 @@ mod tests {
         assert_eq!(decode_block_map_key(&lo).unwrap(), (9, 4));
         assert!(decode_block_map_key(&hi).is_err(), "the bound is not a key");
         assert!(lo < hi);
+    }
+
+    /// The canonical-decimal guard decides exactly what `to_string() == s`
+    /// decided (R-5 replaced the render with a scan): every form the
+    /// grammar must refuse and every one it must accept, at both widths.
+    #[test]
+    fn canonical_decimal_guard_matches_the_render_check() {
+        for s in [
+            "0",
+            "7",
+            "4294967295",
+            "18446744073709551615",
+            "007",
+            "+7",
+            "",
+            "-1",
+            "1_000",
+            "00",
+        ] {
+            let render_u64 = s.parse::<u64>().ok().is_some_and(|v| v.to_string() == s);
+            let render_u32 = s.parse::<u32>().ok().is_some_and(|v| v.to_string() == s);
+            assert_eq!(
+                parse_canonical_u64(s, "t").is_ok(),
+                render_u64,
+                "u64 verdict for {s:?}"
+            );
+            assert_eq!(
+                parse_canonical_u32(s, "t").is_ok(),
+                render_u32,
+                "u32 verdict for {s:?}"
+            );
+        }
+        assert_eq!(
+            parse_kvmap_head("kvmap:1;sweep:12;gen:9").unwrap(),
+            KvmapHead {
+                sweep_cursor: Some(12),
+                gen: 9
+            }
+        );
+        assert!(parse_kvmap_head("kvmap:1;sweep:012").is_err());
     }
 
     /// Kind discriminants are pinned and distinct — the on-disk format.

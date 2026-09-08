@@ -458,6 +458,22 @@ impl MemoryCache {
         self.shards[idx].get(key, false, 0)
     }
 
+    /// [`Self::get_no_promote`] as a RESIDENCY probe (R-5 read-handler
+    /// economy): the same reader-class lookup and the same clock-bit
+    /// refresh, minus the `Bytes` clone a caller that only asks "is it
+    /// here?" dropped on the floor (two refcount RMWs on the payload's
+    /// shared line per probe — the R2 consume-time detector ran two of
+    /// them per pipelined block).
+    pub fn touch_no_promote(&self, key: &[u8]) -> bool {
+        let idx = self.get_shard_idx(key);
+        self.shards[idx]
+            .map
+            .read_sync(key, |_, (_, state)| {
+                state.referenced.store(true, Ordering::Relaxed);
+            })
+            .is_some()
+    }
+
     /// [`Self::get_no_promote`] plus payback credit: a real reader serve
     /// of `served_bytes` user bytes accrues on the entry (the admission
     /// governor's waste basis, reported with the victim at eviction).

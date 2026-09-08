@@ -592,6 +592,13 @@ pub(crate) type KvmapOverlay = std::collections::BTreeMap<u32, Option<String>>;
 /// One warm read-span of a partial-mode ino's map: `[lo, hi)` was filled
 /// COMPLETELY from the tree, so an index in-range but absent from
 /// `entries` is a definitive HOLE (zeros), never a PartialMiss.
+///
+/// The bindings live in ONE arena (R-5 read-handler economy, R #8): a
+/// fill expands up to `KVMAP_WINDOW_FILL_INDICES_MAX` indices, and one
+/// `String` per index was O(4096) heap allocations per window fill; the
+/// keys now sit back-to-back in `arena` with `entries` holding
+/// `(index, start, len)` sorted by index — a fill is two growable buffers,
+/// a probe is a binary search and one slice.
 pub(crate) struct KvmapWindowSpan {
     lo: u32,
     /// Exclusive coverage bound (`u32::MAX` = the tree is exhausted above
@@ -601,8 +608,20 @@ pub(crate) struct KvmapWindowSpan {
     /// write mounts — always valid); an epoch step invalidates the span
     /// (§8 #6's drop arm).
     epoch: Option<u64>,
-    entries: std::collections::BTreeMap<u32, String>,
+    /// `(block index, arena start, key length)`, ascending by index, one
+    /// entry per bound index.
+    entries: Vec<(u32, u32, u32)>,
+    arena: String,
     bytes: u64,
+}
+
+impl KvmapWindowSpan {
+    /// The bound key at `b`, if `b` is bound inside this span.
+    fn key_at(&self, b: u32) -> Option<&str> {
+        let i = self.entries.binary_search_by_key(&b, |e| e.0).ok()?;
+        let (_, start, len) = self.entries[i];
+        Some(&self.arena[start as usize..(start + len) as usize])
+    }
 }
 
 /// A partial-mode ino's warm windows (≤ [`KVMAP_WINDOW_SPANS_PER_INO`],
@@ -1417,9 +1436,18 @@ pub fn incarnation_era(inc: u64) -> u64 {
 /// leading zeros, so one lifetime has exactly one key string (two spellings
 /// would break the map-binding equality this design rests on).
 pub fn encode_incarnation(inc: u64) -> String {
+    let mut out = String::new();
+    push_incarnation(&mut out, inc);
+    out
+}
+
+/// [`encode_incarnation`] appended to `out` — the arena form (R-5 window
+/// fill): no intermediate `String`.
+fn push_incarnation(out: &mut String, inc: u64) {
     const DIGITS: &[u8; 36] = b"0123456789abcdefghijklmnopqrstuvwxyz";
     if inc == 0 {
-        return "0".to_string();
+        out.push('0');
+        return;
     }
     let mut buf = [0u8; 13];
     let mut n = inc;
@@ -1429,8 +1457,8 @@ pub fn encode_incarnation(inc: u64) -> String {
         buf[i] = DIGITS[(n % 36) as usize];
         n /= 36;
     }
-    // SAFETY-free: every byte written is ASCII from DIGITS.
-    String::from_utf8(buf[i..].to_vec()).expect("base36 digits are ASCII")
+    // Every byte written is ASCII from DIGITS.
+    out.push_str(std::str::from_utf8(&buf[i..]).expect("base36 digits are ASCII"));
 }
 
 /// Parse a canonical base-36 incarnation. `None` = not canonical (empty,
@@ -3251,6 +3279,114 @@ impl BackendRouter {
                 ))
             }
         }
+    }
+
+    /// [`Self::map_entry_block_key_at`] APPENDED to `out` (R-5 read-handler
+    /// economy, R #8): the same key bytes, formatted straight into the
+    /// window arena — no backend-id `String`, no body `String`, no stamped
+    /// re-`format!`; the former per-index resolve was three heap
+    /// allocations per expanded index of a 4,096-index window fill.
+    /// `false` = unresolvable (the caller refuses loud, exactly as for
+    /// `None`); nothing is appended then.
+    pub(crate) fn map_entry_block_key_at_into(
+        &self,
+        entry: &crate::meta_backend::kv::block_map::MapEntry,
+        delta: u32,
+        out: &mut String,
+    ) -> bool {
+        use crate::meta_backend::kv::block_map::MapEntry;
+        if delta > 0 && u64::from(delta) >= u64::from(entry.run_len()) {
+            return false;
+        }
+        let (vol_tag, offset, incarnation) = match entry {
+            MapEntry::String(bytes) => {
+                return match std::str::from_utf8(bytes) {
+                    Ok(s) => {
+                        out.push_str(s);
+                        true
+                    }
+                    Err(_) => false,
+                };
+            }
+            MapEntry::Point { vol_tag, offset } => (*vol_tag, *offset, INCARNATION_NONE),
+            MapEntry::PointStamped {
+                vol_tag,
+                offset,
+                incarnation,
+            } => (*vol_tag, *offset, *incarnation),
+            MapEntry::Run {
+                vol_tag,
+                start_offset,
+                ..
+            } => {
+                let Some(stride) = self.run_stride_for_tag(*vol_tag) else {
+                    return false;
+                };
+                let Some(offset) = stride
+                    .checked_mul(u64::from(delta))
+                    .and_then(|d| start_offset.checked_add(d))
+                else {
+                    return false;
+                };
+                (*vol_tag, offset, INCARNATION_NONE)
+            }
+            MapEntry::RunStamped {
+                vol_tag,
+                start_offset,
+                start_incarnation,
+                ..
+            } => {
+                let Some(stride) = self.run_stride_for_tag(*vol_tag) else {
+                    return false;
+                };
+                let (Some(offset), Some(inc)) = (
+                    stride
+                        .checked_mul(u64::from(delta))
+                        .and_then(|d| start_offset.checked_add(d)),
+                    start_incarnation.checked_add(u64::from(delta)),
+                ) else {
+                    return false;
+                };
+                (*vol_tag, offset, inc)
+            }
+        };
+        if !self.push_block_key_body_for_tag(vol_tag, offset, out) {
+            return false;
+        }
+        if incarnation != INCARNATION_NONE {
+            out.push(BLOCK_KEY_INCARNATION_SEP);
+            push_incarnation(out, incarnation);
+        }
+        true
+    }
+
+    /// `persist_block_key_body(be_id_for_tag(vol_tag), offset)` appended to
+    /// `out` without either intermediate (the naming law verbatim: the
+    /// default slot — by tag or by alias — writes the bare offset, every
+    /// other volume `name://offset`). `false` = unknown tag, nothing
+    /// appended.
+    fn push_block_key_body_for_tag(&self, vol_tag: u64, offset: u64, out: &mut String) -> bool {
+        use std::fmt::Write;
+        let tag_of = |alloc: &crate::block_allocator::BlockAllocator| {
+            crate::meta_backend::kv::block_refs::volume_tag(alloc.volume_id())
+        };
+        if tag_of(&self.default_allocator) == vol_tag {
+            let _ = write!(out, "{offset}");
+            return true;
+        }
+        for be in self.backends.iter() {
+            if tag_of(&be.value().block_allocator) == vol_tag {
+                if std::sync::Arc::ptr_eq(&be.value().device, &self.default_device)
+                    && std::sync::Arc::ptr_eq(&be.value().block_allocator, &self.default_allocator)
+                {
+                    let _ = write!(out, "{offset}");
+                } else {
+                    let _ = write!(out, "{}://{}", be.key(), offset);
+                }
+                return true;
+            }
+        }
+        false
     }
 
     /// The backend id whose data volume carries `vol_tag` (KD-5 census):
@@ -7901,7 +8037,7 @@ impl DataRouter {
                 w.spans
                     .iter()
                     .find(|s| s.epoch == epoch_now && s.lo <= b && u64::from(b) < u64::from(s.hi))
-                    .map(|s| s.entries.get(&b).cloned())
+                    .map(|s| s.key_at(b).map(str::to_string))
             })
             .flatten();
         if hit.is_some() {
@@ -7946,8 +8082,13 @@ impl DataRouter {
                 .map(|(i, e)| u64::from(*i) + u64::from(e.run_len()))
                 .unwrap_or(u64::from(b) + 1)
         };
-        let mut entries: std::collections::BTreeMap<u32, String> =
-            std::collections::BTreeMap::new();
+        // Arena fill (R #8): keys are appended back-to-back, indexed by
+        // `(index, start, len)`; the index list is sorted afterwards and a
+        // LATER record for the same index wins the dedup — key order makes
+        // a later exact record override its covering run's derived binding
+        // (the §2 read law), exactly as the former map insert did.
+        let mut arena = String::new();
+        let mut entries: Vec<(u32, u32, u32)> = Vec::new();
         'fill: for (idx, entry) in &page {
             for delta in 0..entry.run_len() {
                 let at = u64::from(*idx) + u64::from(delta);
@@ -7964,7 +8105,11 @@ impl DataRouter {
                     hi = hi.min(clip);
                     break 'fill;
                 }
-                let Some(key) = self.backend_router.map_entry_block_key_at(entry, delta) else {
+                let start = arena.len();
+                if !self
+                    .backend_router
+                    .map_entry_block_key_at_into(entry, delta, &mut arena)
+                {
                     return Err(SqueezefsError::Io(std::io::Error::new(
                         std::io::ErrorKind::InvalidData,
                         format!(
@@ -7972,21 +8117,30 @@ impl DataRouter {
                              ({entry:?} + {delta}) — refusing to serve a fabricated hole"
                         ),
                     )));
-                };
-                // Key order makes a later exact record override its
-                // covering run's derived binding (the §2 read law).
-                entries.insert(at as u32, key);
+                }
+                entries.push((at as u32, start as u32, (arena.len() - start) as u32));
             }
         }
-        let answer = entries.get(&b).cloned();
+        // Stable sort keeps append order within an index; keep the LAST.
+        entries.sort_by_key(|e| e.0);
+        entries.dedup_by(|later, earlier| {
+            if later.0 == earlier.0 {
+                *earlier = *later;
+                true
+            } else {
+                false
+            }
+        });
         let bytes = (entries.len() as u64).saturating_mul(KVMAP_WRITE_MAP_ENTRY_EST);
         let span = KvmapWindowSpan {
             lo: b,
             hi: hi.min(u64::from(u32::MAX)) as u32,
             epoch,
             entries,
+            arena,
             bytes,
         };
+        let answer = span.key_at(b).map(str::to_string);
         METRICS
             .block_map_window_fills
             .fetch_add(1, Ordering::Relaxed);
@@ -10717,8 +10871,13 @@ impl DataRouter {
             // Consume-time evicted-unconsumed detection (see doc comment).
             if start_block >= issued_base && start_block < issued_edge {
                 if let Some(k) = first_key {
-                    let resident = self.cache.hot_block.get_no_promote(k).is_some()
-                        || self.cache.read_lru.get_no_promote(k).is_some()
+                    // R-5 (R #9): existence probes — the two RAM tiers
+                    // refresh their clock bit exactly as `get_no_promote`
+                    // did, without cloning a `Bytes` this decision never
+                    // read. Short-circuit order unchanged: a hot hit is one
+                    // probe; the full ladder runs only for a miss.
+                    let resident = self.cache.hot_block.touch_no_promote(k)
+                        || self.cache.read_lru.touch_no_promote(k)
                         || self.cache.nvme.has_cached_read_block(k)
                         // Read-lane hold residency (2026-08-01): a
                         // lane-held fill is findable — without this arm
@@ -17310,8 +17469,7 @@ impl DataRouter {
                                     .map(std::borrow::Cow::Owned),
                             };
                         let b_key_opt: Option<&str> = resolved_key.as_deref();
-                        read_serve_phase_record(ReadServePhase::KeyResolve, key_t0);
-                        let probe_t0 = std::time::Instant::now();
+                        let probe_t0 = read_serve_phase_record(ReadServePhase::KeyResolve, key_t0);
                         // Hybrid-I/O diagnostic escape (user directive
                         // 2026-07-15): device-true O_DIRECT requests skip
                         // the classifier/pipeline (prefetch fills are
@@ -17414,7 +17572,7 @@ impl DataRouter {
                                 if let Some(hot) =
                                     self.cache.hot_block.get_serving(b_key, slice_len as u64)
                                 {
-                                    read_serve_phase_record(
+                                    let slice_t0 = read_serve_phase_record(
                                         ReadServePhase::ClassifyProbe,
                                         probe_t0,
                                     );
@@ -17423,7 +17581,6 @@ impl DataRouter {
                                         (slice_start + slice_len as u64) as usize,
                                         hot.len(),
                                     );
-                                    let slice_t0 = std::time::Instant::now();
                                     // R-4 fd-source serve: a pool-backed hot
                                     // entry on a zc-armed request is handed
                                     // back as the slice itself (the transport
@@ -17478,8 +17635,8 @@ impl DataRouter {
                                     } else {
                                         hot.slice(start..end)
                                     };
-                                    read_serve_phase_record(ReadServePhase::SliceOut, slice_t0);
-                                    let bind_t0 = std::time::Instant::now();
+                                    let bind_t0 =
+                                        read_serve_phase_record(ReadServePhase::SliceOut, slice_t0);
                                     let still_bound = self
                                         .block_binding_is(file_path, start_block, b_key)
                                         .await?;
@@ -17536,7 +17693,7 @@ impl DataRouter {
                                     if let Some((held, ledger_visible)) =
                                         self.cache.read_lane_hold.serve_with_provenance(b_key, 0)
                                     {
-                                        read_serve_phase_record(
+                                        let slice_t0 = read_serve_phase_record(
                                             ReadServePhase::ClassifyProbe,
                                             probe_t0,
                                         );
@@ -17545,7 +17702,6 @@ impl DataRouter {
                                             (slice_start + slice_len as u64) as usize,
                                             held.len(),
                                         );
-                                        let slice_t0 = std::time::Instant::now();
                                         // R-4 fd-source serve (see the hot arm).
                                         let fd_source =
                                             zc_fd_source(zc, dest_addr, &held[start..end]);
@@ -17590,8 +17746,10 @@ impl DataRouter {
                                         } else {
                                             held.slice(start..end)
                                         };
-                                        read_serve_phase_record(ReadServePhase::SliceOut, slice_t0);
-                                        let bind_t0 = std::time::Instant::now();
+                                        let bind_t0 = read_serve_phase_record(
+                                            ReadServePhase::SliceOut,
+                                            slice_t0,
+                                        );
                                         let still_bound = self
                                             .block_binding_is(file_path, start_block, b_key)
                                             .await?;
@@ -17673,12 +17831,11 @@ impl DataRouter {
                                     )
                                 {
                                     METRICS.cache_hits.fetch_add(1, Ordering::Relaxed);
-                                    read_serve_phase_record(
+                                    let slice_t0 = read_serve_phase_record(
                                         ReadServePhase::ClassifyProbe,
                                         probe_t0,
                                     );
                                     let len = guard.len();
-                                    let slice_t0 = std::time::Instant::now();
                                     let data = if let Some(dest) = dest_addr {
                                         let dest_ptr = dest as *mut u8;
                                         // Copy ledger + NT lever (see
@@ -17723,8 +17880,8 @@ impl DataRouter {
                                         bytes::Bytes::copy_from_slice(&guard)
                                     };
                                     drop(guard);
-                                    read_serve_phase_record(ReadServePhase::SliceOut, slice_t0);
-                                    let bind_t0 = std::time::Instant::now();
+                                    let bind_t0 =
+                                        read_serve_phase_record(ReadServePhase::SliceOut, slice_t0);
                                     let still_bound = self
                                         .block_binding_is(file_path, start_block, b_key)
                                         .await?;
@@ -17784,7 +17941,16 @@ impl DataRouter {
                                                 self.backend_router.key_incarnation_tracked(b_key);
                                             let before =
                                                 self.backend_router.fill_incarnation(b_key);
-                                            let fetch_t0 = std::time::Instant::now();
+                                            // The probes ended here (R-5: the
+                                            // leg used to skip its
+                                            // `classify_probe` record, leaving
+                                            // the span unattributed inside
+                                            // `total`); its end is the fetch's
+                                            // start — one clock read.
+                                            let fetch_t0 = read_serve_phase_record(
+                                                ReadServePhase::ClassifyProbe,
+                                                probe_t0,
+                                            );
                                             match zcs
                                                 .fetch(fd, dev_base + slice_start, slice_len)
                                                 .await
@@ -18021,14 +18187,15 @@ impl DataRouter {
                             // (read_serve_phase_ns: every probe missed —
                             // the cold leg; `block_fetch` spans each fetch
                             // await below, `slice_out` the reply copies.)
-                            read_serve_phase_record(ReadServePhase::ClassifyProbe, probe_t0);
+                            let probe_end =
+                                read_serve_phase_record(ReadServePhase::ClassifyProbe, probe_t0);
                             // R-4: the fd-source slice a cold slice-out arm
                             // handed back instead of copying (see the arms).
                             let mut fd_slice: Option<bytes::Bytes> = None;
                             let downloaded: Option<crate::cache::pool::ReadBlockValue> =
                                 match b_key_opt {
                                     Some(b_key) => {
-                                        let fetch_t0 = std::time::Instant::now();
+                                        let fetch_t0 = probe_end;
                                         let mut resolved = None;
                                         if let Some(dest) = dest_addr {
                                             // §5.6 sibling-leg hygiene: this raw
@@ -18153,11 +18320,10 @@ impl DataRouter {
                                                         true,
                                                     )
                                                     .await?;
-                                                read_serve_phase_record(
+                                                let slice_t0 = read_serve_phase_record(
                                                     ReadServePhase::BlockFetch,
                                                     fetch_t0,
                                                 );
-                                                let slice_t0 = std::time::Instant::now();
                                                 match (val, dest_addr) {
                                                     (Some(val), Some(dest)) => {
                                                         let start = std::cmp::min(
@@ -18285,7 +18451,7 @@ impl DataRouter {
                                     // re-resolves freshest-first; only a
                                     // fresh-map absence is a hole.
                                     None => {
-                                        let fetch_t0 = std::time::Instant::now();
+                                        let fetch_t0 = probe_end;
                                         let val = self
                                             .get_block_for_index(
                                                 file_path,
@@ -18295,11 +18461,10 @@ impl DataRouter {
                                                 true,
                                             )
                                             .await?;
-                                        read_serve_phase_record(
+                                        let slice_t0 = read_serve_phase_record(
                                             ReadServePhase::BlockFetch,
                                             fetch_t0,
                                         );
-                                        let slice_t0 = std::time::Instant::now();
                                         match (val, dest_addr) {
                                             (Some(val), Some(dest)) => {
                                                 let start =

@@ -97,6 +97,9 @@ struct Restore;
 
 impl Drop for Restore {
     fn drop(&mut self) {
+        // The standing notice poll is the product posture; the pre-ack
+        // contracts that held it off restore it for their siblings.
+        data_grant::test_set_notice_poll(None);
         data_grant::uninstall_custody_client();
         data_grant::uninstall_custody_owner();
         publish::uninstall_client();
@@ -730,10 +733,22 @@ async fn an_unacked_demotion_resolves_when_the_incumbents_grant_dies() {
 /// BEFORE the mark simply pushes it to the next renewal); the client's
 /// renewal machinery quiesces, marks the region locally, and ACKS —
 /// only then does B's grant issue.
+///
+/// **The standing notice poll is held off** (finding 27 landed after this
+/// contract; `.benchmarks/2026-09-08-assembler-contracts-notice-poll.md`):
+/// armed, the incumbent's parked poll hears B's demotion the instant the
+/// mark lands, quiesces and acks — B's grant issues before the sampler
+/// below can observe the pending mark. That is the product working, not a
+/// bug; but the RENEWAL-carried arm this contract pins is observable only
+/// while the poll is not there to ack first. Until D-5's accept tick the
+/// poll's lazy first dial sat in the listener backlog for the whole 100 ms
+/// tick, which is the only reason this contract ever passed with the poll
+/// nominally armed.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_renewal_carries_the_notice_and_the_ack_releases_the_parked_grant() {
     let _serial = serial();
     let _restore = restore();
+    data_grant::test_set_notice_poll(Some(false));
     let dir = TempDir::new().unwrap();
     let (owner_be, _p) = sandbox(dir.path(), "own", true).await;
     let (client_be, _p2) = sandbox(dir.path(), "cli", false).await;
@@ -786,6 +801,9 @@ async fn the_renewal_carries_the_notice_and_the_ack_releases_the_parked_grant() 
             prior_epoch: None,
         })
         .expect("B joins");
+    // The ledger is process-global (sibling tests moved it): every read
+    // below is a delta against this baseline, taken BEFORE B is spawned.
+    let d0 = squeezefs::dlm::range_custody_stats();
     let b_task = {
         let owner = Arc::clone(&auth.owner);
         let b_epoch = b_lease.epoch;
@@ -807,10 +825,9 @@ async fn the_renewal_carries_the_notice_and_the_ack_releases_the_parked_grant() 
                 .await
         })
     };
-    let d0 = squeezefs::dlm::range_custody_stats();
     let mut marked = false;
     for _ in 0..300 {
-        if squeezefs::dlm::range_custody_stats().demotions >= 1
+        if squeezefs::dlm::range_custody_stats().demotions > d0.demotions
             && !squeezefs::dlm::demotion_notices_for(ino, a_token).is_empty()
         {
             marked = true;
@@ -870,10 +887,18 @@ async fn the_renewal_carries_the_notice_and_the_ack_releases_the_parked_grant() 
 /// Contract: an incumbent that NEVER acks resolves at its lease expiry
 /// on the AUTHORITY's clock — the owner-side sweep retires its grants,
 /// the pending resolves through the fence column, and B's grant issues.
+///
+/// **The standing notice poll is held off**: "an incumbent that NEVER
+/// acks" is unreachable with the poll armed — the poll hears the pending
+/// demotion at once and acks it (the product working), and the ledger
+/// would close through the ACK column instead of the fence column this
+/// contract pins. See `the_renewal_carries_the_notice_…` for why this
+/// passed for eleven days regardless.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_unacked_demotion_resolves_at_lease_expiry_on_the_owners_clock() {
     let _serial = serial();
     let _restore = restore();
+    data_grant::test_set_notice_poll(Some(false));
     let dir = TempDir::new().unwrap();
     let (owner_be, _p) = sandbox(dir.path(), "own", true).await;
     let (client_be, _p2) = sandbox(dir.path(), "cli", false).await;
@@ -967,10 +992,22 @@ async fn an_unacked_demotion_resolves_at_lease_expiry_on_the_owners_clock() {
 /// The pending state was RAM and dies with it; A re-asserts its ORIGINAL
 /// block-aligned grant in the successor's grace window; B's acquire
 /// re-issues against the successor and the demotion RESTARTS from zero.
+///
+/// **The standing notice poll is held off**: "the authority dies with the
+/// demotion PENDING" needs A un-acked at the kill, and both halves resolve
+/// the restarted demotion through A's RENEWAL — with the poll armed A acks
+/// within milliseconds of each mark, B's first grant ISSUES before the
+/// kill (the `b1.is_err()` pin inverts) and the successor's demotion is
+/// acked before `renew_all` runs. This contract used to pass in the full
+/// suite only because its sampler read the process-global ledger against
+/// an ABSOLUTE threshold (`demotions >= 1`, already true from the sibling
+/// tests), so it exited before B had even parked; in isolation it failed
+/// on the tip. Deltas now, and the poll held off.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn mw13_authority_death_mid_demotion_a_reasserts_and_the_demotion_restarts() {
     let _serial = serial();
     let _restore = restore();
+    data_grant::test_set_notice_poll(Some(false));
     let dir = TempDir::new().unwrap();
     let (owner_be, _p) = sandbox(dir.path(), "own", true).await;
     let (client_be, _p2) = sandbox(dir.path(), "cli", false).await;
@@ -993,7 +1030,10 @@ async fn mw13_authority_death_mid_demotion_a_reasserts_and_the_demotion_restarts
         .expect("B joins authority 1");
     // B's parked acquire, bounded: the kill lands while it parks, so it
     // resolves as a refusal (the park re-issues against the successor —
-    // MW-13's "B's parked acquire re-issues" is the CLIENT's retry).
+    // MW-13's "B's parked acquire re-issues" is the CLIENT's retry). The
+    // ledger baseline is taken BEFORE B is spawned: the counter is
+    // process-global, so only a delta says THIS demotion marked.
+    let d0 = squeezefs::dlm::range_custody_stats();
     let b_task = {
         let owner = Arc::clone(&auth1.owner);
         let b_epoch = b_lease.epoch;
@@ -1015,13 +1055,18 @@ async fn mw13_authority_death_mid_demotion_a_reasserts_and_the_demotion_restarts
                 .await
         })
     };
-    let d0 = squeezefs::dlm::range_custody_stats();
+    let mut marked = false;
     for _ in 0..300 {
-        if squeezefs::dlm::range_custody_stats().demotions >= 1 {
+        if squeezefs::dlm::range_custody_stats().demotions > d0.demotions {
+            marked = true;
             break;
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
+    assert!(
+        marked,
+        "B's block-sharing acquire marked a demotion pending"
+    );
     assert!(!b_task.is_finished(), "B is parked mid-demotion");
 
     // THE KILL: authority 1 dies with the demotion pending. In-process,

@@ -47,6 +47,7 @@ use squeezefs::block_allocator::BlockAllocator;
 use squeezefs::cache::TieredCache;
 use squeezefs::data_grant::{self, WriteCustodyClient, WriteCustodyOwner};
 use squeezefs::dlm::DlmClient;
+use squeezefs::extent_ship;
 use squeezefs::fuse_client::{SqueezefsFilesystem, METRICS};
 use squeezefs::membership::{LeaseClock, LeaseClocks};
 use squeezefs::meta_backend::kv::backend::KvMetaBackend;
@@ -92,6 +93,10 @@ struct Restore;
 impl Drop for Restore {
     fn drop(&mut self) {
         data_grant::TEST_RANGE_CUSTODY_OVERRIDE.store(0, Ordering::Relaxed);
+        // The standing notice poll is the product posture; a contract
+        // that held it off restores it for its siblings.
+        data_grant::test_set_notice_poll(None);
+        extent_ship::uninstall_quiesce_hook();
         data_grant::uninstall_custody_client();
         data_grant::uninstall_custody_owner();
         publish::uninstall_client();
@@ -1370,11 +1375,22 @@ async fn the_acquire_replys_trim_teaches_the_ceiling_without_a_shrink_round() {
 /// Both phases close through the ACK column with the fence column FLAT —
 /// the ledger law `tail_shrinks ≡ acks + fence_resolves` holding on the
 /// healthy side, which is the entire point of the fix.
+///
+/// **The standing notice poll is held off here** (finding 27 landed after
+/// this contract, `.benchmarks/2026-09-08-assembler-contracts-notice-poll.md`):
+/// with the poll armed the incumbent hears each shrink on its parked poll
+/// and acks it milliseconds after the mark — BEFORE the far acquire is
+/// even issued and before the release drains — so both "the acquire /
+/// release reply carried it" assertions were satisfied by the poll's ack
+/// (the product working, not a bug) and pinned neither carrier. Held off,
+/// the two f16a replies are the ONLY carriers, which is what this
+/// contract claims.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn shrink_notices_ride_acquire_and_release_replies_not_just_renewals() {
     let _ = env_logger::builder().is_test(true).try_init();
     let _serial = serial();
     let _restore = Restore;
+    data_grant::test_set_notice_poll(Some(false));
     let h = Arc::new(make(*b"ranged-ladder-09", "ranged-ladder-9").await);
     let auth = start_authority_be(
         "ladder-authority-9",
@@ -1792,6 +1808,293 @@ async fn the_notice_polls_park_never_starves_the_clients_own_verbs() {
 
     drop(c);
     listener.shutdown();
+}
+
+/// The finding-27 fixture: a manual-clock authority whose derived renewal
+/// cadence is the fleet's 10 s (`min(10 s, T_self/3)` at a 60 s TTL), the
+/// range geometry armed ("no geometry, no barrier"), two service threads.
+fn quiet_clock_authority(tag: &str) -> (Arc<squeezefs::cluster_wire::RpcListener>, String) {
+    let ms = Arc::new(AtomicU64::new(1_000));
+    let clock = LeaseClock::manual(Arc::clone(&ms));
+    let clocks = LeaseClocks::with_params(
+        Duration::from_secs(60),
+        Duration::from_secs(1),
+        Duration::from_secs(1),
+    )
+    .expect("positive T_self");
+    let owner = WriteCustodyOwner::arm(
+        tag,
+        squeezefs::dlm::durable_term() + 1,
+        squeezefs::dlm::durable_term(),
+        clocks,
+        clock,
+        None,
+    )
+    .expect("the custody authority arms");
+    owner.install_range_geometry(data_grant::fixed_range_geometry(
+        64 * 4 * 1024 * 1024,
+        4 * 1024 * 1024,
+    ));
+    data_grant::install_custody_owner(Arc::clone(&owner));
+    let router = data_grant::AsyncVerbRouter::new().with_custody(owner);
+    let listener = squeezefs::cluster_wire::RpcListener::start_async(
+        squeezefs::cluster_wire::RpcListenerConfig {
+            bind_addr: "127.0.0.1:0".parse().unwrap(),
+            service_threads: 2,
+            ..squeezefs::cluster_wire::RpcListenerConfig::default()
+        },
+        SECRET.to_vec(),
+        Arc::new(router),
+    )
+    .expect("the authority listens");
+    let endpoint = listener.endpoint().to_string();
+    (listener, endpoint)
+}
+
+fn poll_gauges() -> (u64, u64) {
+    let s = data_grant::stats_json();
+    (
+        s["dlm_custody_notice_polls"]
+            .as_u64()
+            .expect("dlm_custody_notice_polls exports"),
+        s["dlm_custody_notice_poll_notices"]
+            .as_u64()
+            .expect("dlm_custody_notice_poll_notices exports"),
+    )
+}
+
+/// Finding 27's in-process coverage made REAL (2026-09-08,
+/// `.benchmarks/2026-09-08-assembler-contracts-notice-poll.md`). Until
+/// D-5's accept tick (`863a4304`) the notice session's lazy first dial
+/// sat in the listener's backlog for the whole 100 ms `ACCEPT_POLL_TICK`
+/// — the accept thread had just taken the workload session and gone back
+/// to sleep — so every in-process contract whose observation window
+/// closed inside that tick ran with the poll structurally absent, and two
+/// S11 contracts passed for eleven days on exactly that absence. This
+/// contract pins the channel by its LEDGER, on both arms:
+///
+/// * **poll armed** (the product): a QUIET incumbent — one grant, then no
+///   verb of its own — hears a block-sharing peer's demotion on its
+///   standing poll (`dlm_custody_notice_polls` and
+///   `dlm_custody_notice_poll_notices` both move), runs the quiesce hook
+///   and ACKS; the peer's grant issues at poll latency, far inside the
+///   10 s renewal cadence this fixture derives.
+/// * **poll withheld** (`data_grant::test_set_notice_poll(Some(false))`,
+///   the seam the S11 pre-ack contracts stand on): the SAME shape leaves
+///   the peer parked for its whole budget with the poll gauges flat and
+///   nobody acking — the pre-f27 dip, verbatim. That proves the seam
+///   holds the poll off (a seam that did nothing would make every
+///   contract built on it vacuous) and that the poll is the quiet
+///   incumbent's ONLY carrier.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_standing_poll_is_the_quiet_incumbents_only_carrier_and_its_ledger_moves() {
+    let _ = env_logger::builder().is_test(true).try_init();
+    let _serial = serial();
+    let _restore = Restore;
+    const INO_ARMED: u64 = 77_000_171;
+    const INO_WITHHELD: u64 = 77_000_172;
+    const MIB: u64 = 1024 * 1024;
+    let (listener, endpoint) = quiet_clock_authority("f27c-authority");
+
+    let quiesced = Arc::new(AtomicU64::new(0));
+    {
+        let quiesced = Arc::clone(&quiesced);
+        extent_ship::install_quiesce_hook(Arc::new(move |_ino| {
+            let quiesced = Arc::clone(&quiesced);
+            Box::pin(async move {
+                quiesced.fetch_add(1, Ordering::Relaxed);
+            })
+        }));
+    }
+
+    // ---- Arm 1: the poll armed (the product posture) ----
+    let (polls0, notices0) = poll_gauges();
+    let s0 = squeezefs::dlm::range_custody_stats();
+    let a = WriteCustodyClient::connect(&endpoint, SECRET, "f27c-node-a")
+        .await
+        .expect("incumbent joins");
+    data_grant::install_custody_client(Arc::clone(&a));
+    let ga = a
+        .acquire_range(INO_ARMED, (0, MIB), (0, MIB), Duration::from_secs(3))
+        .await
+        .expect("the incumbent's grant");
+    // The incumbent is now QUIET: it sends nothing of its own.
+    let b = WriteCustodyClient::connect(&endpoint, SECRET, "f27c-node-b")
+        .await
+        .expect("asker joins");
+    let t0 = std::time::Instant::now();
+    let rb = b
+        .acquire_range(
+            INO_ARMED,
+            (2 * MIB, 3 * MIB),
+            (2 * MIB, 3 * MIB),
+            Duration::from_secs(3),
+        )
+        .await;
+    let waited = t0.elapsed();
+    assert!(
+        rb.is_ok(),
+        "the asker's grant issues on the incumbent's standing poll (after {waited:?} of a \
+         3 s budget: {rb:?})"
+    );
+    assert!(
+        waited < Duration::from_secs(2),
+        "poll latency, never the 10 s renewal cadence (waited {waited:?})"
+    );
+    let (polls1, notices1) = poll_gauges();
+    assert!(
+        polls1 > polls0,
+        "the standing poll completed a round while the incumbent held custody \
+         (dlm_custody_notice_polls {polls0} -> {polls1})"
+    );
+    assert!(
+        notices1 > notices0,
+        "a poll round CARRIED the demotion (dlm_custody_notice_poll_notices {notices0} -> \
+         {notices1})"
+    );
+    assert!(
+        quiesced.load(Ordering::Relaxed) >= 1,
+        "the incumbent ran the quiesce hook before its ack"
+    );
+    let s1 = squeezefs::dlm::range_custody_stats();
+    assert_eq!(s1.demotions - s0.demotions, 1, "one region demoted");
+    assert_eq!(
+        s1.demotion_acks - s0.demotion_acks,
+        1,
+        "the ledger closed through the ACK column — the poll's absorb acked"
+    );
+    drop(rb);
+    drop(ga);
+    drop(b);
+    drop(a);
+
+    // ---- Arm 2: the poll WITHHELD (the seam) ----
+    data_grant::test_set_notice_poll(Some(false));
+    let (polls_w0, notices_w0) = poll_gauges();
+    let quiesced_w0 = quiesced.load(Ordering::Relaxed);
+    let s_w0 = squeezefs::dlm::range_custody_stats();
+    let a2 = WriteCustodyClient::connect(&endpoint, SECRET, "f27c-node-a2")
+        .await
+        .expect("the poll-less incumbent joins");
+    data_grant::install_custody_client(Arc::clone(&a2));
+    let ga2 = a2
+        .acquire_range(INO_WITHHELD, (0, MIB), (0, MIB), Duration::from_secs(3))
+        .await
+        .expect("the poll-less incumbent's grant");
+    let b2 = WriteCustodyClient::connect(&endpoint, SECRET, "f27c-node-b2")
+        .await
+        .expect("the second asker joins");
+    let t0 = std::time::Instant::now();
+    let rb2 = b2
+        .acquire_range(
+            INO_WITHHELD,
+            (2 * MIB, 3 * MIB),
+            (2 * MIB, 3 * MIB),
+            Duration::from_secs(1),
+        )
+        .await;
+    let waited = t0.elapsed();
+    assert!(
+        rb2.is_err(),
+        "with the poll withheld a QUIET incumbent has no carrier: the asker burns its whole \
+         budget (the pre-f27 dip) — but it was granted after {waited:?}: {rb2:?}"
+    );
+    assert!(
+        waited >= Duration::from_millis(900),
+        "the asker parked its full 1 s budget, not a refusal (waited {waited:?})"
+    );
+    let (polls_w1, notices_w1) = poll_gauges();
+    assert_eq!(
+        (polls_w1, notices_w1),
+        (polls_w0, notices_w0),
+        "the seam held the poll off: its gauges never moved"
+    );
+    assert_eq!(
+        quiesced.load(Ordering::Relaxed),
+        quiesced_w0,
+        "nothing quiesced — no carrier reached the incumbent"
+    );
+    let s_w1 = squeezefs::dlm::range_custody_stats();
+    assert_eq!(
+        s_w1.demotions - s_w0.demotions,
+        1,
+        "the barrier engaged exactly as in arm 1"
+    );
+    assert_eq!(
+        s_w1.demotion_acks, s_w0.demotion_acks,
+        "nobody acked: the pending mark stands until the incumbent's lease dies on the \
+         owner's clock"
+    );
+    drop(rb2);
+    drop(ga2);
+    drop(b2);
+    drop(a2);
+    listener.shutdown();
+}
+
+/// **The standing poll's ask sits strictly inside the wire's reply bound.**
+/// The authority clamps the park to its renewal cadence, which on the
+/// fleet is exactly the wire's 10 s reply bound (`min(10 s, T_self/3)`);
+/// the poll asked for the same 10 s, so a QUIET round was a zero-margin
+/// race — the owner's reply lands at park + RTT + its wake, the client's
+/// socket read timeout fires at the bound — that the client can lose on
+/// any venue whose RTT plus owner wake exceeds the kernel's SO_RCVTIMEO
+/// rounding (every measured venue is loopback, where it wins by that
+/// rounding). Losing it drops the notice session and leaves the incumbent
+/// without a parked poll for the 500 ms backoff plus a re-dial. The ask
+/// is derived from the bound with half of it as margin; this tie test is
+/// what makes drift red.
+#[test]
+fn the_standing_polls_ask_sits_inside_the_wires_reply_bound() {
+    let ask = data_grant::notice_poll_park();
+    let bound = squeezefs::cluster_wire::call_reply_bound();
+    assert!(ask > Duration::ZERO, "the ask is a park, never a spin");
+    assert!(
+        ask * 2 <= bound,
+        "the poll's ask ({ask:?}) must leave at least half the wire's reply bound ({bound:?}) \
+         as margin for the owner's reply to land"
+    );
+}
+
+/// **A poll round that dies is counted, never silent.** Every failed round
+/// (a wire error, a refusal) costs the incumbent its notice session and a
+/// 500 ms backoff with NO parked poll — a demotion landing in that window
+/// waits for the re-dial. Before this gauge the loop only counted answered
+/// rounds, so a fleet whose quiet rounds were all losing the reply-bound
+/// race read as "the channel lives, fewer notices" rather than as churn.
+/// Here the authority goes away under a parked poll: the round fails and
+/// `dlm_custody_notice_poll_failures` moves.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_poll_round_that_dies_is_counted_not_silent() {
+    let _ = env_logger::builder().is_test(true).try_init();
+    let _serial = serial();
+    let _restore = Restore;
+    let (listener, endpoint) = quiet_clock_authority("f27d-authority");
+    let failures = || {
+        data_grant::stats_json()["dlm_custody_notice_poll_failures"]
+            .as_u64()
+            .expect("dlm_custody_notice_poll_failures exports")
+    };
+    let f0 = failures();
+    let c = WriteCustodyClient::connect(&endpoint, SECRET, "f27d-node")
+        .await
+        .expect("client joins");
+    // The notice session must be admitted before the authority goes
+    // away, or the failure would be a dial refusal rather than a parked
+    // round losing its owner — the same counter, a weaker pin. Admitted
+    // sessions: the workload session, then the notice session.
+    wait_until(9, "the notice session never reached the authority", || {
+        listener.stats().sessions_admitted >= 2
+    })
+    .await;
+    listener.shutdown();
+    wait_until(
+        9,
+        "the parked poll's death was not counted (dlm_custody_notice_poll_failures)",
+        || failures() > f0,
+    )
+    .await;
+    drop(c);
 }
 
 /// Finding 31 (`.benchmarks/2026-08-25-s11-freeloop-stall.md`, attempt

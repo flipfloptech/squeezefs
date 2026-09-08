@@ -764,10 +764,28 @@ async fn a_mutating_holders_own_grant_dies_with_the_reply_not_the_wire() {
         .await
         .expect("owner create");
     catch_up(&fx).await;
+    let rounds0 = deleg().channel_rounds;
     fx.router.lookup(dir_ino, "seed").await.expect("lookup");
     let hits0 = deleg().hits;
     fx.router.lookup(dir_ino, "seed").await.expect("lookup");
     assert!(deleg().hits > hits0, "the delegation must be serving");
+    // The recall channel's CONNECT re-asserts the held grant and drops any
+    // entry the owner no longer holds (`absorb_reassert_reply`). Let that
+    // round land first: under load it can arrive between the owner's
+    // surrender and this holder's processing of the reply, dropping the
+    // entry before the reply's revoke finds it — the grant still dies, but
+    // `reply_revokes` counts only a LIVE entry, and this contract pins the
+    // CARRIER (the 2026-09-08 gate on a throttled CPU). The sibling
+    // contracts wait for the same round for the same reason.
+    wait_for("the recall channel's first round", || {
+        deleg().channel_rounds > rounds0
+    })
+    .await;
+    fx.router.lookup(dir_ino, "seed").await.expect("lookup");
+    assert!(
+        deleg().hits > hits0 + 1,
+        "the delegation must still serve after the channel's re-assert"
+    );
 
     let issued0 = lane().issued;
     let surrenders0 = lane().surrenders;

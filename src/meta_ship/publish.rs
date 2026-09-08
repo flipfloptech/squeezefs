@@ -1177,8 +1177,8 @@ static SHIP_FRAMED_CALLS: AtomicU64 = AtomicU64::new(0);
 static SHIP_DEPTH_WAITS: AtomicU64 = AtomicU64::new(0);
 static SHIP_SESSION_DIALS: AtomicU64 = AtomicU64::new(0);
 // D-5 — frames shipped on a MULTIPLEXED session (the single-connection
-// lever's engagement: ≡ `ship_frames` on the default, 0 under
-// `SQUEEZEFS_PUBLISH_SHIP_MULTIPLEX=0`).
+// lever's engagement: ≡ `ship_frames` under
+// `SQUEEZEFS_PUBLISH_SHIP_MULTIPLEX=1`, 0 on the shipped pool).
 static SHIP_MUX_FRAMES: AtomicU64 = AtomicU64::new(0);
 static SERVED_FRAMES: AtomicU64 = AtomicU64::new(0);
 static SERVED_FRAME_CALLS: AtomicU64 = AtomicU64::new(0);
@@ -1359,10 +1359,10 @@ pub struct PublishStats {
     /// state; steady growth means sessions are dying between frames.
     pub ship_session_dials: u64,
     /// D-5 (client side): frames shipped on the endpoint's ONE pipelined
-    /// session (`SQUEEZEFS_PUBLISH_SHIP_MULTIPLEX`, default on) — ≡
-    /// `ship_frames` on the default; 0 on the session-pool control. With
-    /// it, `ship_session_dials` reads 1 per endpoint at steady state
-    /// instead of `depth`.
+    /// session (`SQUEEZEFS_PUBLISH_SHIP_MULTIPLEX=1`) — ≡ `ship_frames`
+    /// with the lever engaged; 0 on the shipped session pool. With it,
+    /// `ship_session_dials` reads 1 per endpoint at steady state instead
+    /// of `depth`.
     pub ship_mux_frames: u64,
     /// D-1b (owner side): publish frames served.
     pub served_frames: u64,
@@ -1532,13 +1532,20 @@ pub fn publish_ship_depth_from(explicit: Option<usize>, cpus: usize) -> usize {
 /// concurrently) instead of one request/reply session each. `depth` keeps
 /// its meaning (frames in flight); what it no longer costs is a
 /// connection per frame — F-B's `max_connections` cap counts sessions, so
-/// a co-writer at depth 8 held 8 of the authority's slots. `0` = the D-1b
-/// session pool (the same-binary A/B control).
+/// a co-writer at depth 8 held 8 of the authority's slots.
+///
+/// **Ships OFF on measurement** (`.benchmarks/2026-09-08-d5-owner-hop-and-
+/// depth.md`): the connection thread is the execution venue, so one
+/// session serves its K in-flight frames on ONE owner thread where the
+/// pool served them on K — in-process at equal depth 4 the pool ran ≈ 1.5×
+/// the multiplexed publish rate (16 A-B-B-A legs, four rolls). The lever
+/// is the CAPABILITY arm for fleets where the authority's connection cap
+/// binds before its CPU does; `1` engages it, `0`/unset = the D-1b pool.
 pub const SHIP_MULTIPLEX_ENV: &str = "SQUEEZEFS_PUBLISH_SHIP_MULTIPLEX";
 
 /// Read the lever (once per publish lane, at its first frame).
 fn publish_ship_multiplex() -> bool {
-    crate::env_knobs::bool_knob(SHIP_MULTIPLEX_ENV, true)
+    crate::env_knobs::bool_knob(SHIP_MULTIPLEX_ENV, false)
 }
 
 /// The per-frame call cap — S8's frame cap, for the same reason: a frame's

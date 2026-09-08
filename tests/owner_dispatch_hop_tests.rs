@@ -939,15 +939,38 @@ impl Drop for LaneHog {
     }
 }
 
-/// The bucketed p99 (µs, upper bucket bound) of a histogram DELTA.
-fn p99_us(after: &serde_json::Value, before: &serde_json::Value) -> u64 {
-    let labels = squeezefs::latency_core::LATENCY_BUCKET_LABELS;
-    let d: Vec<u64> = labels
+/// The per-bucket DELTA of a histogram export.
+fn bucket_delta(after: &serde_json::Value, before: &serde_json::Value) -> Vec<u64> {
+    squeezefs::latency_core::LATENCY_BUCKET_LABELS
         .iter()
         .map(|l| {
             after["buckets"][*l].as_u64().unwrap_or(0) - before["buckets"][*l].as_u64().unwrap_or(0)
         })
-        .collect();
+        .collect()
+}
+
+/// The share (0..=1) of a bucketed delta's samples in buckets whose LOWER
+/// bound is ≥ `threshold_us` — samples that took at least that long
+/// (bucket `i` covers `(2^(i-1), 2^i]` µs; the C-2 harness's statistic: a
+/// mean is skewed by one multi-ms stall on a loaded gate box, a share of
+/// burst-late samples is not).
+fn share_at_or_above_us(d: &[u64], threshold_us: u64) -> f64 {
+    let total: u64 = d.iter().sum();
+    if total == 0 {
+        return 0.0;
+    }
+    let above: u64 = d
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| (if *i == 0 { 0 } else { 1u64 << (i - 1) }) >= threshold_us)
+        .map(|(_, c)| *c)
+        .sum();
+    above as f64 / total as f64
+}
+
+/// The bucketed p99 (µs, upper bucket bound) of a histogram DELTA.
+fn p99_us(after: &serde_json::Value, before: &serde_json::Value) -> u64 {
+    let d = bucket_delta(after, before);
     let total: u64 = d.iter().sum();
     if total == 0 {
         return 0;
@@ -970,6 +993,8 @@ struct S8Row {
     wall: Duration,
     split: (Split, Split),
     dispatch_p99_us: u64,
+    /// The row's `dispatch` bucket delta (the burst-share statistic's input).
+    dispatch_buckets: Vec<u64>,
 }
 
 impl S8Row {
@@ -1045,14 +1070,19 @@ async fn s8_row(
         wall,
         split: (before, after),
         dispatch_p99_us: p99_us(&disp_after, &disp_before),
+        dispatch_buckets: bucket_delta(&disp_after, &disp_before),
     }
 }
 
 /// Contract 7 — **The isolation contract**: under four 2 ms serve bursts saturating
 /// both `sqz-meta` lanes, a frame served on the accepting venue never waits
-/// for a lane — its `dispatch` mean stays under a quarter burst — while the
-/// hop control lands behind the bursts (printed beside it, the RED shape
-/// this campaign attacks: on the fleet 2.0–2.3 ms per verb).
+/// for a lane, while the hop control lands behind the bursts (the RED shape
+/// this campaign attacks: on the fleet 2.0–2.3 ms per verb). The statistic
+/// is the C-2 harness's burst SHARE — the fraction of dispatches that took
+/// at least one full burst: a hop-landed frame waits ≥ a burst nearly every
+/// time (share ≈ 1), an isolated one only on a scheduler stall of the
+/// loaded gate box (a mean would flip on one multi-ms stall) — beside the
+/// ratio of the two arms' means.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn s8_inline_serve_is_isolated_from_the_lane_hog() {
     let _serial = serial();
@@ -1073,11 +1103,24 @@ async fn s8_inline_serve_is_isolated_from_the_lane_hog() {
     println!("D-5 isolation (4 × 2 ms lane hog, 2 clients × 32 one-verb frames):");
     println!("  {}", control.line("hop (control)"));
     println!("  {}", inline.line("inline"));
-    let inline_dispatch_us = inline.mean(|s| s.dispatch);
+    let burst_us = BURST.as_micros() as u64;
+    let inline_share = share_at_or_above_us(&inline.dispatch_buckets, burst_us);
+    let control_share = share_at_or_above_us(&control.dispatch_buckets, burst_us);
+    println!(
+        "  burst-late share (≥ {BURST:?}): control {control_share:.2}, inline {inline_share:.2}"
+    );
     assert!(
-        inline_dispatch_us < BURST.as_secs_f64() * 1e6 / 4.0,
-        "a frame served on the accepting venue never waits for a hogged lane: dispatch mean \
-         {inline_dispatch_us:.1} µs against {BURST:?} bursts"
+        inline_share < 0.25,
+        "a frame served on the accepting venue never waits for a hogged lane: {:.0} % of its \
+         dispatches took ≥ one {BURST:?} burst (the hop control: {:.0} %)",
+        inline_share * 100.0,
+        control_share * 100.0
+    );
+    assert!(
+        inline.mean(|s| s.dispatch) * 2.0 < control.mean(|s| s.dispatch),
+        "the lane's cost is removed, not moved: inline dispatch mean {:.1} µs vs the hop's {:.1}",
+        inline.mean(|s| s.dispatch),
+        control.mean(|s| s.dispatch)
     );
     assert_eq!(
         inline.split.1.hops, inline.split.0.hops,

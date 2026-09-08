@@ -26,6 +26,11 @@
 //! and the reply framing is legitimately one allocation. What the budgets
 //! pin is that the PRELUDE — key minting, layout classification, binding
 //! resolution — stays off the allocator.
+//!
+//! The WRITE lane got its own campaign 2026-09-08 (W-6, e2e perf audit
+//! write board #7 — `.benchmarks/2026-09-08-w6-write-handler-economy.md`):
+//! the W1 patch write went 14.6 → 3 allocs/op, and its budget is now the
+//! device layer's three (see the write test's doc).
 
 use fuse3::raw::prelude::Filesystem;
 use fuse3::raw::Request;
@@ -221,19 +226,23 @@ async fn create(h: &H, name: &str) -> u64 {
 }
 
 async fn write_at(h: &H, ino: u64, off: u64, data: &[u8]) {
+    write_bytes_at(h, ino, off, bytes::Bytes::copy_from_slice(data)).await;
+}
+
+/// The measured-window form: the caller owns the payload `Bytes` (minted
+/// once, cloned per op) so the harness itself allocates NOTHING inside
+/// the window — the kernel path hands the handler a `Bytes::from_owner`
+/// payload lease whose clone is a refcount bump, and a per-op
+/// `copy_from_slice` here would add the harness's own `Vec` plus the
+/// first-clone promotion of a `Vec`-backed `Bytes` (two allocations the
+/// field never pays) to the handler's ledger.
+async fn write_bytes_at(h: &H, ino: u64, off: u64, data: bytes::Bytes) {
+    let len = data.len();
     let w =
-        h.fs.write(
-            h.req,
-            ino,
-            0,
-            off,
-            bytes::Bytes::copy_from_slice(data),
-            0,
-            0,
-        )
-        .await
-        .expect("write");
-    assert_eq!(w.written as usize, data.len());
+        h.fs.write(h.req, ino, 0, off, data, 0, 0)
+            .await
+            .expect("write");
+    assert_eq!(w.written as usize, len);
 }
 
 async fn read_at(h: &H, ino: u64, off: u64, size: u32) -> usize {
@@ -341,31 +350,51 @@ async fn warm_kernel_read_prelude_allocation_budget() {
 /// Shape: 4 KiB sub-block overwrites of an already-striped block — the W1
 /// sole-owner patch shape, the random-small-write population.
 ///
-/// Measured on this box (dev profile, 1,000 ops, counted A-B):
+/// Measured on this box (dev profile, 1,000 ops, counted A-B on the same
+/// binary pair):
 ///   * pre-PERF-12:  **31.15** allocs/op
-///   * post-PERF-12: **29.09** allocs/op
+///   * post-PERF-12: **29.09** allocs/op (30.00 budget)
+///   * pre-W-6 (this harness form, 2026-09-08): **14.60** allocs/op
+///     (the 16.14 the old harness read minus its own per-op payload
+///     mint — see `write_bytes_at`)
+///   * post-W-6: **3.00** allocs/op
 ///
-/// PERF-12 removes the handler PRELUDE's two (the `inode_{ino}` `String` and
-/// the layout-type clone); the other ~29 live BELOW the handler in the
-/// patch / extent / DLM machinery and are named by the trace mode for
-/// follow-on work. This budget exists so they cannot silently grow: the
-/// write lane is the next campaign's target, and 30/op is the line it must
-/// not cross meanwhile.
+/// What W-6 (e2e perf audit write board #7) removed, per op, all named
+/// by the trace mode: the stage-1b write-phase census's scc bucket array
+/// (3 — the map shrank to ZERO between writes and re-allocated its array
+/// on every `write_phase_begin`; it now keeps a derived minimum capacity),
+/// the per-block `active_block:` key (`FsKey` + `String`, 2 → the stack
+/// key), the per-block `inode_{ino}` `String` (1 → the stack key), the
+/// single-block future `Vec` + `try_join_all`'s boxed slice (2 → the one
+/// block future is awaited inline), and the W1 patch's three: its
+/// `active_block_ext:` probe key (→ stack key), its owned
+/// `parse_block_key` backend id (→ the borrow form) and its block-key
+/// `String` clone out of the map (→ borrowed from the map's `Arc`).
+///
+/// The three that remain live BELOW the handler in the device layer —
+/// `PooledBuf::into_bytes`'s `Bytes::from_owner` box (the DMA payload's
+/// owner), the uring worker's completion oneshot (`Arc<Shared>`), and the
+/// worker thread's per-request record — and are follow-on work. The bar
+/// is 4/op: above the shipped number so incidental churn cannot flake
+/// it, red on the pre-W-6 tree (14.60).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn warm_kernel_write_prelude_allocation_budget() {
     let h = make().await;
     let ino = striped_fixture(&h, "warm_write.bin").await;
 
-    let payload = vec![0xC4u8; 4096];
+    // Minted once; the first clone promotes the Vec-backed `Bytes` to its
+    // shared form OUTSIDE the window, every later clone is a refcount bump
+    // (the transport lease's shape).
+    let payload = bytes::Bytes::from(vec![0xC4u8; 4096]);
     for _ in 0..8 {
-        write_at(&h, ino, 8192, &payload).await;
+        write_bytes_at(&h, ino, 8192, payload.clone()).await;
     }
 
     if trace_enabled() {
         TRACE.store(true, Ordering::SeqCst);
         let a0 = allocs_now();
         for _ in 0..32 {
-            write_at(&h, ino, 8192, &payload).await;
+            write_bytes_at(&h, ino, 8192, payload.clone()).await;
         }
         let allocs = allocs_now() - a0;
         TRACE.store(false, Ordering::SeqCst);
@@ -378,7 +407,7 @@ async fn warm_kernel_write_prelude_allocation_budget() {
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     let a0 = allocs_now();
     for _ in 0..OPS {
-        write_at(&h, ino, 8192, &payload).await;
+        write_bytes_at(&h, ino, 8192, payload.clone()).await;
     }
     let allocs = allocs_now() - a0;
     let per_op_centi = allocs * 100 / OPS;
@@ -388,9 +417,10 @@ async fn warm_kernel_write_prelude_allocation_budget() {
         per_op_centi % 100
     );
     assert!(
-        per_op_centi <= 3_000,
-        "warm kernel WRITE handler allocates {}.{:02} per op — the PERF-12 \
-         budget is 30.00 (the handler prelude must not allocate; growth \
+        per_op_centi <= 400,
+        "warm kernel WRITE handler allocates {}.{:02} per op — the W-6 \
+         budget is 4.00 (stack keys, a capacity-floored phase census, an \
+         inline single-block future, a borrow-only patch prelude; growth \
          past this is a regression, run with SQZ_ALLOC_TRACE=1 for sites)",
         per_op_centi / 100,
         per_op_centi % 100

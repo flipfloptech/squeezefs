@@ -161,6 +161,29 @@ mount (the A-arm rig reset the cluster; remount is part of every arm).
    worktree, from zero, laptop idle: 362 suites / **4,792 tests**, 18
    stages, both audits). Every code landing of 2026-09-06 → 09-08 is
    gated; `dev` = `1cb1d122` (docs over it). Releasable as 1.2.2.
+1i. **Campaign board (user pick 2026-09-08) — four mechanisms landed on
+   `dev` (W-6 `c88bdf7f`, R-5 `1ca9ab67`, W-5 `ab669857`, D-5 `fce9aa5f`
+   + the trim-window gauge fix `e0bdd35f`); the field rows for THREE are
+   MET** (`.benchmarks/2026-09-08-campaign-rows-squeeze-test.md`, E F F E
+   binaries `96f8d873` vs `e0bdd35f` on squeeze-test, kernel 0031, the
+   5-node nvme-tcp set): `rr_4k` kern +6.8 % IOPS / CPU −9.6 % (R-5),
+   `rw_4k` kern +13.2 % / CPU −12.2 % (W-6), fsync storm +23.8 % fsyncs/s,
+   p50 −22.9 %, data sync requests 10 → 1 per fsync (W-5), `w_durable`
+   par by construction, tripwires 0. **Still owed: D-5's fleet A-B-B-A**
+   (`SQUEEZEFS_META_SHIP_INLINE_SERVE` on the mw rig). New write board
+   item 11: fsync of a partial active block escalates the whole block
+   (16× per fsync, 80 % of the field fsync — pre-existing, both arms).
+   **The gate on `e0bdd35f` is RED** (exit 201, 2 of 21 in
+   `mw_authority_assembler_tests`): bisected to D-5's accept-tick commit
+   `863a4304`, which made the finding-27 standing custody notice poll
+   LIVE in the in-process fixture (it was dead there before: `polls` 0 →
+   5) — the poll hears the demotion, the client quiesces + acks, and the
+   grant releases before the contracts' 10 ms sampler sees the pending
+   mark. The field rows (48–51 poll rounds per row) say the poll always
+   worked; fixture artifact, not a product regression. Fix in flight on
+   `fix/assembler-contracts-notice-poll` (a `test_set_notice_poll` seam
+   held off in exactly the pre-ack-state contracts + a real finding-27
+   coverage contract); the gate on the resulting tip is the next act.
 2. **Kernel A/B, B arm** — after `squeeze-test` boots the 6.19.14 series
    WITH 0031 (or whichever box carries the patched kernel): on the box,
    `cd /scratch/tmp/sqz-agent/k26 && sudo env ARM=B KERNEL_TAG=<uname -r

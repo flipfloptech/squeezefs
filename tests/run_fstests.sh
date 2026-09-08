@@ -999,17 +999,67 @@ failure_is_expected_shape() {
     return 1
 }
 
+# A test whose FUSE mount WEDGED cannot score clean (2026-09-08,
+# `.benchmarks/2026-09-08-generic-795-lookup-wedge.md`: generic/795 stranded
+# two delivered LOOKUPs for 23 minutes, cleared only when the harness's
+# teardown aborted the connection, and the test's own diff was empty — the
+# runner read it as clean). The daemon logs are appended across a pass, so
+# the check is against the lines a test ADDED: a transport overdue-slot line
+# whose age reached the wedge bound is an UNEXPECTED FAILURE with the daemon
+# lines preserved beside the test's results. (A dismount that reports
+# unflushed staged files is NOT a verdict here — 47 of the pass's 407
+# dismounts report 1–2 and four report 200+; that residue is its own open
+# question, noted, never a pass/fail.)
+WEDGE_OVERDUE_MS=60000
+daemon_log_marks() { # "path:lines" per daemon log, space-separated
+    local f
+    for f in /tmp/squeezefs_fstests_*.log; do
+        [ -f "$f" ] && printf '%s:%s ' "$f" "$(wc -l < "$f")"
+    done
+}
+wedge_verdict() { # $1 = test, $2 = marks before the test; returns 1 on a wedge
+    local t="$1" marks="$2" entry f n fresh worst staged verdict=""
+    for entry in $marks; do
+        f="${entry%%:*}"; n="${entry##*:}"
+        [ -f "$f" ] || continue
+        fresh="$(tail -n +"$((n + 1))" "$f")"
+        [ -n "$fresh" ] || continue
+        worst="$(printf '%s\n' "$fresh" | grep -oE 'delivered [0-9]+ ms ago and still unreplied' | grep -oE '[0-9]+' | sort -n | tail -n 1)"
+        if [ -n "$worst" ] && [ "$worst" -ge "$WEDGE_OVERDUE_MS" ]; then
+            verdict="$verdict a delivered request stayed unreplied ${worst} ms ($(basename "$f"));"
+        fi
+        staged="$(printf '%s\n' "$fresh" | grep -oE 'Remaining local staged files: [0-9]+' | grep -oE '[0-9]+' | sort -n | tail -n 1)"
+        if [ -n "$staged" ] && [ "$staged" -ge 100 ]; then
+            echo "NOTE: $t dismounted with ${staged} unflushed staged files ($(basename "$f")) — recorded, not a verdict"
+        fi
+        if [ -n "$verdict" ]; then
+            mkdir -p "results/$(dirname "$t")"
+            printf '%s\n' "$fresh" > "results/$t.daemon-$(basename "$f" .log).log"
+        fi
+    done
+    [ -z "$verdict" ] && return 0
+    echo "==================================================================" >&2
+    echo "WEDGE: $t passed its own check but its FUSE mount wedged:$verdict" >&2
+    echo "  the daemon lines the test added: results/$t.daemon-*.log" >&2
+    echo "  (a load-dependent hang is a first-class product bug — fix red-first," >&2
+    echo "   then --resume-from $t)" >&2
+    echo "==================================================================" >&2
+    return 1
+}
+
 # Per-test driver: abort on the first unexpected failure.
 run_check_failfast() {
     local ran=0 clean=0 shaped=0
-    local t rc
+    local t rc marks
     for t in "$@"; do
         ran=$((ran + 1))
+        marks="$(daemon_log_marks)"
         set +e
         ./check "$t"
         rc=$?
         set -e
         if [ $rc -eq 0 ]; then
+            wedge_verdict "$t" "$marks" || return 1
             clean=$((clean + 1))
             continue
         fi

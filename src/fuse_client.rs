@@ -24274,11 +24274,6 @@ impl Filesystem for SqueezefsFilesystem {
                 .and_then(|conn| conn.zc_write_held_len(_req.slot))
                 .zip(conn_guard.as_ref().as_ref())
                 .map(|(len, conn)| {
-                    let slot = _req.slot;
-                    let store_conn = conn.clone();
-                    let extract_conn = conn.clone();
-                    let retain_conn = conn.clone();
-                    let release_conn = conn.clone();
                     // The §3.4 stability class: O_DIRECT deliveries
                     // carry GUP user pages (post-ACK reuse scribbles
                     // them). FUSE_WRITE_CACHE is the kernel writing
@@ -24288,23 +24283,16 @@ impl Filesystem for SqueezefsFilesystem {
                     // is page-cache-sound.
                     let sound = (flags as i32) & libc::O_DIRECT == 0
                         || write_flags & fuse3::raw::flags::FUSE_WRITE_CACHE != 0;
-                    crate::routing::ZcWriteSlot::new_with_ack_early(
+                    // W-6: the connection vehicle — one `Arc` clone; the
+                    // four boxed closures (each capturing its own `Arc`
+                    // clone, each store/extract call `Box::pin`ning a
+                    // future) this mint used to build per zc WRITE are
+                    // gone with it.
+                    crate::routing::ZcWriteSlot::from_connection(
                         len,
                         sound,
-                        Box::new(move |fd, dev_off| {
-                            let c = store_conn.clone();
-                            Box::pin(async move { c.zc_write_store(slot, fd, dev_off).await })
-                        }),
-                        Box::new(move || {
-                            let c = extract_conn.clone();
-                            Box::pin(async move { c.zc_write_extract(slot).await })
-                        }),
-                        Box::new(move || retain_conn.zc_commit_retain(slot)),
-                        Box::new(move || {
-                            if let Err(e) = release_conn.zc_release_payload(slot) {
-                                warn!("zc release_payload failed (teardown race): {e}");
-                            }
-                        }),
+                        conn.clone(),
+                        _req.slot,
                     )
                 })
         };

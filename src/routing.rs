@@ -5574,8 +5574,7 @@ pub type ZcReleaseFn = dyn Fn() + Send + Sync;
 /// loop must never pay a second extraction).
 pub struct ZcWriteSlot {
     len: u32,
-    store: Box<ZcStoreFn>,
-    extract: Box<ZcExtractFn>,
+    vehicle: ZcSlotVehicle,
     // Stage-1b: migrated with the exemption CLOSED — this memo lock sits
     // inside the write holder's critical section (under the ino's block
     // stripe), exactly where the exec1b wedge autopsy looked.
@@ -5587,22 +5586,46 @@ pub struct ZcWriteSlot {
     /// which snapshots at ACK rather than DMA'ing the live GUP).
     /// Stamped at mint from the write's open flags.
     ack_early_sound: bool,
-    /// The ACK-early transport face (`None` on sessions without the
-    /// retention machinery — every such write keeps ACK-after-CQE).
-    retain: Option<Box<ZcRetainFn>>,
-    release: Option<Box<ZcReleaseFn>>,
+}
+
+/// How a held slot reaches its transport verbs (W-6, e2e perf audit
+/// write board #7). The production mint is the `Connection` arm — the
+/// armed connection plus the request's slot id, ONE `Arc` clone per
+/// WRITE, every verb a direct method call — because the closure form it
+/// replaced minted FOUR boxed closures capturing FOUR `Arc` clones of
+/// the same connection per zc WRITE, and `Box::pin`ned a future per
+/// store/extract call on top. The closure arm survives for the
+/// injected sources the in-process suites drive (the sqz-kernel ring is
+/// the only live venue for the other).
+enum ZcSlotVehicle {
+    /// The transport's own verbs on the request's held slot.
+    Connection {
+        conn: std::sync::Arc<fuse3::raw::connection::FuseConnection>,
+        slot: fuse3::raw::ReplySlot,
+    },
+    /// Injected store/extract (+ optional ACK-early face) closures.
+    Closures {
+        store: Box<ZcStoreFn>,
+        extract: Box<ZcExtractFn>,
+        /// The ACK-early transport face (`None` = no retention
+        /// machinery — every such write keeps ACK-after-CQE).
+        retain: Option<Box<ZcRetainFn>>,
+        release: Option<Box<ZcReleaseFn>>,
+    },
 }
 
 impl ZcWriteSlot {
     pub fn new(len: u32, store: Box<ZcStoreFn>, extract: Box<ZcExtractFn>) -> std::sync::Arc<Self> {
         std::sync::Arc::new(ZcWriteSlot {
             len,
-            store,
-            extract,
+            vehicle: ZcSlotVehicle::Closures {
+                store,
+                extract,
+                retain: None,
+                release: None,
+            },
             materialized: crate::sqz_sync::SqzMutex::new(None),
             ack_early_sound: false,
-            retain: None,
-            release: None,
         })
     }
 
@@ -5618,12 +5641,33 @@ impl ZcWriteSlot {
     ) -> std::sync::Arc<Self> {
         std::sync::Arc::new(ZcWriteSlot {
             len,
-            store,
-            extract,
+            vehicle: ZcSlotVehicle::Closures {
+                store,
+                extract,
+                retain: Some(retain),
+                release: Some(release),
+            },
             materialized: crate::sqz_sync::SqzMutex::new(None),
             ack_early_sound,
-            retain: Some(retain),
-            release: Some(release),
+        })
+    }
+
+    /// The production mint (the FUSE WRITE handler on a zc-armed session
+    /// whose delivery HELD the payload): the connection's own
+    /// `zc_write_store` / `zc_write_extract` / `zc_commit_retain` /
+    /// `zc_release_payload` on `slot`, with the §3.4 class stamp. One
+    /// `Arc` clone, no boxed closures.
+    pub fn from_connection(
+        len: u32,
+        ack_early_sound: bool,
+        conn: std::sync::Arc<fuse3::raw::connection::FuseConnection>,
+        slot: fuse3::raw::ReplySlot,
+    ) -> std::sync::Arc<Self> {
+        std::sync::Arc::new(ZcWriteSlot {
+            len,
+            vehicle: ZcSlotVehicle::Connection { conn, slot },
+            materialized: crate::sqz_sync::SqzMutex::new(None),
+            ack_early_sound,
         })
     }
 
@@ -5635,14 +5679,27 @@ impl ZcWriteSlot {
     /// Arm RETAIN for this request's commit — `false` = no retention
     /// (stock kernel / lever off / no ack-early face): ACK-after-CQE.
     pub fn commit_retain(&self) -> bool {
-        self.retain.as_ref().map(|f| f()).unwrap_or(false)
+        match &self.vehicle {
+            ZcSlotVehicle::Connection { conn, slot } => conn.zc_commit_retain(*slot),
+            ZcSlotVehicle::Closures { retain, .. } => retain.as_ref().map(|f| f()).unwrap_or(false),
+        }
     }
 
     /// Release the retained slot (exactly once, by the store
-    /// continuation).
+    /// continuation). A connection-arm failure is the teardown race
+    /// (the session is gone with the slot), logged, never fatal.
     pub fn release_payload(&self) {
-        if let Some(f) = self.release.as_ref() {
-            f();
+        match &self.vehicle {
+            ZcSlotVehicle::Connection { conn, slot } => {
+                if let Err(e) = conn.zc_release_payload(*slot) {
+                    log::warn!("zc release_payload failed (teardown race): {e}");
+                }
+            }
+            ZcSlotVehicle::Closures { release, .. } => {
+                if let Some(f) = release.as_ref() {
+                    f();
+                }
+            }
         }
     }
 
@@ -5661,7 +5718,12 @@ impl ZcWriteSlot {
     /// `Ok(n)` — the caller treats `n != len()` as a failed leg and
     /// falls back to [`Self::materialize`].
     pub async fn store(&self, fd: std::os::unix::io::RawFd, dev_off: u64) -> std::io::Result<u32> {
-        (self.store)(fd, dev_off).await
+        match &self.vehicle {
+            ZcSlotVehicle::Connection { conn, slot } => {
+                conn.zc_write_store(*slot, fd, dev_off).await
+            }
+            ZcSlotVehicle::Closures { store, .. } => store(fd, dev_off).await,
+        }
     }
 
     /// Materialize the payload bytes (the extraction vehicle), memoized:
@@ -5681,7 +5743,10 @@ impl ZcWriteSlot {
             0,
             self.len as u64,
         );
-        let b = (self.extract)().await?;
+        let b = match &self.vehicle {
+            ZcSlotVehicle::Connection { conn, slot } => conn.zc_write_extract(*slot).await?,
+            ZcSlotVehicle::Closures { extract, .. } => extract().await?,
+        };
         drop(_census);
         *slot = Some(b.clone());
         Ok(b)

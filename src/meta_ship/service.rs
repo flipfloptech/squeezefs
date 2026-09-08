@@ -26,21 +26,31 @@
 //!
 //! # The venue
 //!
-//! §6.7 is explicit: owner-side RPC handling runs on the pinned service
-//! threads, **never on the conveyor's task**. The frame arrives on a
-//! `sqz-cluster-svc{n}` lane; the batch's *execution* is then handed to
-//! the **sqz-meta pool** ([`crate::meta_exec::spawn_meta_join`]), and the
-//! lane awaits the join.
+//! §6.7 is explicit: owner-side RPC handling runs on its own threads,
+//! **never on the conveyor's task**. The frame arrives on the connection's
+//! own OS thread (`sqz-clw-conn`); the batch's *execution* goes through
+//! [`super::owner_dispatch`] — the ONE door that records the dispatch's
+//! decomposition (`meta_ship_owner_dispatch_ns`) and selects its venue.
 //!
-//! That hop is deliberate and its reason is mechanical: `commit_tx`
-//! spawns the per-volume conveyor **pass task** on the sqz-meta pool the
-//! first time a volume needs one (`kv/backend.rs`) — the pool IS the venue
-//! that owns the backend's tasks. A verb executed inline on a lane would
-//! give the volume's entire commit conveyor a lane-lifetime venue — and
-//! take it down with the lane. The IPC handoff-economy campaign's lesson
-//! (never hand off onto a foreign runtime's global inject queue) is
-//! respected in the other direction: this hop lands on the pool that
-//! already owns every task the verb will interact with.
+//! **Since D-5 (e2e perf audit DLM #7) the default venue is the accepting
+//! thread itself.** The shipped shape hopped the batch onto the two shared
+//! `sqz-meta` lanes ([`crate::meta_exec::spawn_meta_join`]) and awaited
+//! the join; C-2's fleet attribution measured that hop at 2.0–2.3 ms per
+//! verb — a cross-thread wake into lanes the co-writers' publish storms
+//! saturate, and one back — the owner's largest term once the conveyor
+//! stopped binding. The hop's original reason was mechanical and is gone:
+//! it existed while `commit_tx` spawned the volume's conveyor pass task on
+//! the AMBIENT runtime of whoever committed first, so a verb executed
+//! inline on a lane would have given the conveyor a lane-lifetime venue.
+//! Since rip-tokio-total every task the verb touches spawns on an explicit
+//! process-global venue (the pass on the volume's `sqz-jrnl` lane or the
+//! `sqz-meta` pool, never the caller's), task-locals are executor-agnostic,
+//! and the connection thread is dedicated and parked for exactly this
+//! reply — so polling the frame there deletes both hops and turns every
+//! wake inside the frame into a direct unpark. The panic containment the
+//! hop had is applied per dispatch (an unwinding verb answers
+//! `STATUS_PANIC`; the session serves on). `SQUEEZEFS_META_SHIP_INLINE_
+//! SERVE=0` restores the hop as the same-binary A/B control.
 //!
 //! # Cross-owner shapes
 //!
@@ -671,10 +681,10 @@ impl MetaShipService {
         }
         super::owner_phase_record(OwnerPhase::Admit, t_admit);
 
-        // The handoff (see the module docs): execution lands on the
-        // sqz-meta pool — the venue that owns the backend's tasks; this
-        // lane awaits it.
-        let t_dispatch = Instant::now();
+        // The dispatch (see the module docs): on the accepting venue —
+        // this connection's own thread — by default, or hopped onto the
+        // sqz-meta pool and joined under the A/B control; either way
+        // through the ONE door that records the split.
         let Some(me) = self.owned() else {
             return self.refuse(
                 req.id,
@@ -682,11 +692,12 @@ impl MetaShipService {
                 "S8 owner service is shutting down — no handle to dispatch the batch on".into(),
             );
         };
-        let joined = crate::meta_exec::spawn_meta_join("meta_ship_verb", async move {
-            me.run_batch(frame).await
+        let inline = super::inline_serve_enabled();
+        let (joined, stamps) = super::owner_dispatch("meta_ship_verb", inline, async move {
+            me.run_batch(frame, inline).await
         })
         .await;
-        super::owner_phase_record(OwnerPhase::Dispatch, t_dispatch);
+        super::owner_phase_record_span(OwnerPhase::Dispatch, stamps.total());
         let results = match joined {
             Ok(Some(results)) => results,
             Ok(None) => {
@@ -769,7 +780,17 @@ impl MetaShipService {
     /// surrenders it performs accumulate into each op's reply. The
     /// per-chain revoke scope is what keeps one chain's surrenders out of
     /// a concurrent sibling's reply.
-    async fn run_batch(self: Arc<Self>, frame: MetaRequestFrame) -> Option<Vec<MetaOpResult>> {
+    ///
+    /// **The chains' venue follows the frame's** (D-5): on the accepting
+    /// venue the chains are polled concurrently IN this task (`join_all`,
+    /// each contained — the publish plane's shape), so a frame's whole
+    /// execution wakes the one parked connection thread; under the hop
+    /// control each chain is its own `sqz-meta` task, as D-1 landed it.
+    async fn run_batch(
+        self: Arc<Self>,
+        frame: MetaRequestFrame,
+        inline: bool,
+    ) -> Option<Vec<MetaOpResult>> {
         let client_epoch = frame.client_epoch;
         let client_id = Arc::<str>::from(frame.client_id.as_str());
         let ops = frame.ops;
@@ -785,29 +806,51 @@ impl MetaShipService {
         for (idx, (op, chain)) in ops.into_iter().zip(chains).enumerate() {
             per_chain[chain].push((idx, op));
         }
-        let mut joins = Vec::with_capacity(per_chain.len());
-        for chain in per_chain {
+        let chain_futs = per_chain.into_iter().map(|chain| {
             let me = Arc::clone(&self);
             let client_id = Arc::clone(&client_id);
-            joins.push(crate::meta_exec::spawn_meta_join(
-                "meta_ship_verb_chain",
-                async move {
-                    let (idxs, calls): (Vec<usize>, Vec<MetaOp>) = chain.into_iter().unzip();
-                    let results = me.run_chain(client_epoch, client_id, calls).await;
-                    idxs.into_iter().zip(results).collect::<Vec<_>>()
-                },
-            ));
-        }
+            async move {
+                let (idxs, calls): (Vec<usize>, Vec<MetaOp>) = chain.into_iter().unzip();
+                let results = me.run_chain(client_epoch, client_id, calls).await;
+                idxs.into_iter().zip(results).collect::<Vec<_>>()
+            }
+        });
+        let joined: Vec<std::result::Result<Vec<(usize, MetaOpResult)>, ()>> = if inline {
+            futures::future::join_all(chain_futs.map(|fut| async move {
+                // A chain's unwind is contained HERE (the hop arm's
+                // `contain` did it on the lane): the frame refuses whole,
+                // the connection thread survives.
+                futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(fut))
+                    .await
+                    .map_err(|_| {
+                        log::error!(
+                            "S8 owner: a dispatched verb chain PANICKED on the accepting \
+                             connection thread — the frame refuses whole (STATUS_PANIC), the \
+                             session serves on"
+                        );
+                    })
+            }))
+            .await
+        } else {
+            let joins: Vec<_> = chain_futs
+                .map(|fut| crate::meta_exec::spawn_meta_join("meta_ship_verb_chain", fut))
+                .collect();
+            let mut out = Vec::with_capacity(joins.len());
+            for join in joins {
+                out.push(join.await.map_err(|_| ()));
+            }
+            out
+        };
         let mut out: Vec<Option<MetaOpResult>> = (0..n).map(|_| None).collect();
         let mut unwound = false;
-        for join in joins {
-            match join.await {
+        for chain_out in joined {
+            match chain_out {
                 Ok(results) => {
                     for (idx, res) in results {
                         out[idx] = Some(res);
                     }
                 }
-                Err(_) => unwound = true,
+                Err(()) => unwound = true,
             }
         }
         if unwound {

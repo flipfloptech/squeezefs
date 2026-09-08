@@ -161,6 +161,42 @@ where
     rx
 }
 
+/// The two LANE-side instants of a joined task (e2e perf audit D-5, the
+/// `uring_fs::WriteOutcome` pattern): `picked_at` is the task's first poll
+/// on its lane — the end of the spawn → lane queue → pop hop — and
+/// `done_at` is the instant its body finished, just before the outcome is
+/// sent; the awaiter's own `Instant::now()` on observing the outcome
+/// closes the wake hop. Carried in the oneshot payload, so the split
+/// costs two clock reads and no allocation.
+#[derive(Debug, Clone, Copy)]
+pub struct JoinStamps {
+    pub picked_at: std::time::Instant,
+    pub done_at: std::time::Instant,
+}
+
+/// [`spawn_meta_join`] with the lane-side instants in the payload — the
+/// instrumented form the owner planes' dispatch-hop split reads
+/// (`meta_ship_owner_dispatch_ns`). Same venue, same containment, same
+/// `Err(RecvError)` face on an unwind (whose lane-side instants die with
+/// the task).
+pub fn spawn_meta_join_stamped<F, T>(
+    site: &'static str,
+    fut: F,
+) -> squeezefs_ipc::sqz_channel::oneshot::Receiver<(T, JoinStamps)>
+where
+    F: Future<Output = T> + Send + 'static,
+    T: Send + 'static,
+{
+    let (tx, rx) = squeezefs_ipc::sqz_channel::oneshot::channel();
+    spawn_meta(site, async move {
+        let picked_at = std::time::Instant::now();
+        let out = fut.await;
+        let done_at = std::time::Instant::now();
+        let _ = tx.send((out, JoinStamps { picked_at, done_at }));
+    });
+    rx
+}
+
 /// Drop-guarded completion signal for JOINED plane tasks (checkpoint /
 /// times drain): sends `true` on a clean exit (the task's final cycle
 /// ran) and `false` on an unwind — the shutdown join keeps the old

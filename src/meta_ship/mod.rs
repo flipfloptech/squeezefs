@@ -401,6 +401,14 @@ pub(crate) static OWNER_PANICS: AtomicU64 = AtomicU64::new(0);
 pub(crate) static DLM_RPCS_META: AtomicU64 = AtomicU64::new(0);
 /// Mints redirected to an owned volume (the §6.10 R4 constraint engaging).
 pub(crate) static MINT_REDIRECTS: AtomicU64 = AtomicU64::new(0);
+/// Owner-side dispatches (both planes) executed ON the accepting
+/// connection's thread — the D-5 lever's engagement
+/// (`SQUEEZEFS_META_SHIP_INLINE_SERVE`, default on).
+static OWNER_DISPATCH_INLINE: AtomicU64 = AtomicU64::new(0);
+/// Owner-side dispatches that HOPPED onto the shared `sqz-meta` lanes and
+/// were joined from the connection thread (the shipped shape; the A/B
+/// control under `SQUEEZEFS_META_SHIP_INLINE_SERVE=0`).
+static OWNER_DISPATCH_HOPS: AtomicU64 = AtomicU64::new(0);
 /// Volume ownership records WRITTEN by the offline `volume set-owners`
 /// verb (§11.1). 0 on every mount by construction — a mount never
 /// assigns; only the verb's own process moves this.
@@ -466,6 +474,13 @@ pub struct ShipStatsSnapshot {
     pub owner_assignments: u64,
     pub owner_assign_refusals: u64,
     pub subtree_roots_minted: u64,
+    /// D-5: owner-side dispatches (S8 frames, S9 publish calls / groups /
+    /// frees / harvests) executed on the accepting connection's thread vs
+    /// hopped onto the `sqz-meta` lanes. `inline + hops` ≡
+    /// `meta_ship_owner_dispatch_ns.total.count` (an unwound HOP records no
+    /// split — its lane-side instants die with the task).
+    pub owner_dispatch_inline: u64,
+    pub owner_dispatch_hops: u64,
 }
 
 /// Read the ledger.
@@ -494,6 +509,8 @@ pub fn stats() -> ShipStatsSnapshot {
         owner_assignments: OWNER_ASSIGNMENTS.load(Ordering::Relaxed),
         owner_assign_refusals: OWNER_ASSIGN_REFUSALS.load(Ordering::Relaxed),
         subtree_roots_minted: SUBTREE_ROOTS_MINTED.load(Ordering::Relaxed),
+        owner_dispatch_inline: OWNER_DISPATCH_INLINE.load(Ordering::Relaxed),
+        owner_dispatch_hops: OWNER_DISPATCH_HOPS.load(Ordering::Relaxed),
     }
 }
 
@@ -528,6 +545,11 @@ pub fn stats_json() -> serde_json::Value {
         "owner_assignments": s.owner_assignments,
         "owner_assign_refusals": s.owner_assign_refusals,
         "subtree_roots_minted": s.subtree_roots_minted,
+        // D-5: which venue served the owner's dispatches (both planes).
+        // `inline` ≡ every dispatch on the default; `hops` carries them
+        // under SQUEEZEFS_META_SHIP_INLINE_SERVE=0.
+        "owner_dispatch_inline": s.owner_dispatch_inline,
+        "owner_dispatch_hops": s.owner_dispatch_hops,
         "dlm_rpcs_meta": s.dlm_rpcs_meta,
         "dlm_grace_reclaims": s.grace_reclaims,
         "dlm_grace_conflicts": s.grace_conflicts,
@@ -640,6 +662,21 @@ pub fn owner_phase_record(phase: OwnerPhase, t0: std::time::Instant) {
     OWNER_PROF[phase as usize].record(t0.elapsed());
 }
 
+/// Record an owner-side phase as an already-measured span (the frame's
+/// `dispatch` is its hop's `total` — the same instants, so the two tables
+/// agree to the ns).
+#[inline]
+pub(crate) fn owner_phase_record_span(phase: OwnerPhase, span: std::time::Duration) {
+    OWNER_PROF[phase as usize].record(span);
+}
+
+/// Exact `(sum_ns, count)` of one owner-side phase (the in-process
+/// harness's instrument; the stats inode carries the same words as JSON).
+pub fn owner_phase_totals(phase: OwnerPhase) -> (u64, u64) {
+    let h = &OWNER_PROF[phase as usize];
+    (h.sum_ns(), h.count())
+}
+
 /// `meta_ship_owner_phase_ns` — the owner-side decomposition.
 pub fn owner_phase_json() -> serde_json::Value {
     let mut phases = serde_json::Map::new();
@@ -647,6 +684,195 @@ pub fn owner_phase_json() -> serde_json::Value {
         phases.insert((*name).to_string(), OWNER_PROF[i].to_json());
     }
     serde_json::Value::Object(phases)
+}
+
+// ---------------------------------------------------------------------------
+// The owner's dispatch — its venue and its decomposition (e2e perf audit
+// D-5, DLM board #7; `docs/design-e2e-perf-audit.md` §5.3 row 18).
+//
+// A served frame is admitted on the connection's own thread
+// (`sqz-clw-conn`, one per connection) and then DISPATCHED onto the two
+// shared `sqz-meta` lanes and awaited: a cross-thread wake into the lanes
+// the co-writers' publish storms saturate, and one back. Quiet ≤ 32 µs;
+// on the fleet the S8 frame's `dispatch` read 2.0–2.3 ms per verb — the
+// same class C-2 removed from the journal path. `meta_ship_owner_dispatch_
+// ns` splits the hop at its two thread boundaries, exact-sum, always-on,
+// zero-alloc (the `uring_fs_write_phase_ns` pattern):
+//
+//   queue_hop : submitted → the lane's first poll (the spawn → lane queue
+//               → pop wait, behind whatever the lanes hold);
+//   run       : first poll → the work's last instruction — the frame's
+//               own execution, INCLUDING every wake it takes back onto a
+//               lane (a conveyor fan-out, a 4a guard) while it runs there;
+//   wake_hop  : done → the awaiting connection thread resumed (the
+//               oneshot's waker → `thread::unpark` → dispatch);
+//   total     : submitted → observed (≡ the S8 frame's `dispatch`).
+//
+// The lever: EXECUTE ON THE ACCEPTING VENUE. The connection thread is
+// dedicated and parked for exactly this reply, so polling the frame's
+// future there (`sqz_blocking::block_on` already is its executor) deletes
+// both hops AND turns every wake inside `run` into a direct unpark of a
+// parked thread instead of a lane-queue wait. Nothing the venue rule
+// protected depends on the lane any more: since rip-tokio-total every
+// task the verb touches spawns on an explicit process-global venue (the
+// conveyor's pass on the volume's `sqz-jrnl` lane or `spawn_meta`, the
+// checkpoint/times tasks on `spawn_meta`), task-locals are executor-
+// agnostic, and the panic containment `contain` gave the hop is applied
+// here per dispatch (an unwinding verb answers PANIC and the session
+// serves on). `SQUEEZEFS_META_SHIP_INLINE_SERVE=0` is the shipped hop,
+// the same-binary A/B control.
+// ---------------------------------------------------------------------------
+
+/// The venue lever: `1`/on (default) = a served dispatch is polled on the
+/// accepting connection's thread; `0` = the shipped `spawn_meta_join` hop.
+pub const INLINE_SERVE_ENV: &str = "SQUEEZEFS_META_SHIP_INLINE_SERVE";
+
+/// Read the lever (once per served frame — one getenv per wire round trip,
+/// the `SQUEEZEFS_PUBLISH_CONVEYOR_GROUP` precedent).
+pub(crate) fn inline_serve_enabled() -> bool {
+    crate::env_knobs::bool_knob(INLINE_SERVE_ENV, true)
+}
+
+/// Phases of `meta_ship_owner_dispatch_ns`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(usize)]
+pub enum OwnerDispatchPhase {
+    QueueHop = 0,
+    Run = 1,
+    WakeHop = 2,
+    Total = 3,
+}
+
+const OWNER_DISPATCH_PHASES: usize = 4;
+const OWNER_DISPATCH_PHASE_NAMES: [&str; OWNER_DISPATCH_PHASES] =
+    ["queue_hop", "run", "wake_hop", "total"];
+
+static OWNER_DISPATCH_PROF: Lazy<[LatencyHistogram; OWNER_DISPATCH_PHASES]> =
+    Lazy::new(|| std::array::from_fn(|_| LatencyHistogram::default()));
+
+/// `meta_ship_owner_dispatch_ns` — the dispatch-hop decomposition.
+pub fn owner_dispatch_json() -> serde_json::Value {
+    let mut phases = serde_json::Map::new();
+    for (i, name) in OWNER_DISPATCH_PHASE_NAMES.iter().enumerate() {
+        phases.insert((*name).to_string(), OWNER_DISPATCH_PROF[i].to_json());
+    }
+    serde_json::Value::Object(phases)
+}
+
+/// Exact `(sum_ns, count)` of one dispatch phase.
+pub fn owner_dispatch_totals(phase: OwnerDispatchPhase) -> (u64, u64) {
+    let h = &OWNER_DISPATCH_PROF[phase as usize];
+    (h.sum_ns(), h.count())
+}
+
+/// The four instants of one owner-side dispatch.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct DispatchStamps {
+    pub submitted_at: std::time::Instant,
+    pub picked_at: std::time::Instant,
+    pub done_at: std::time::Instant,
+    pub observed_at: std::time::Instant,
+}
+
+impl DispatchStamps {
+    /// `submitted → observed`.
+    pub fn total(&self) -> std::time::Duration {
+        self.observed_at
+            .saturating_duration_since(self.submitted_at)
+    }
+
+    fn record(&self) {
+        let prof = &*OWNER_DISPATCH_PROF;
+        prof[OwnerDispatchPhase::QueueHop as usize]
+            .record(self.picked_at.saturating_duration_since(self.submitted_at));
+        prof[OwnerDispatchPhase::Run as usize]
+            .record(self.done_at.saturating_duration_since(self.picked_at));
+        prof[OwnerDispatchPhase::WakeHop as usize]
+            .record(self.observed_at.saturating_duration_since(self.done_at));
+        prof[OwnerDispatchPhase::Total as usize].record(self.total());
+    }
+}
+
+/// An owner-side dispatch whose work UNWOUND (the `JoinError` face the
+/// `spawn_meta_join` receiver had): the caller counts it on its plane's
+/// `owner_panics` and answers the PANIC outcome.
+#[derive(Debug)]
+pub(crate) struct DispatchUnwound {
+    site: &'static str,
+}
+
+impl std::fmt::Display for DispatchUnwound {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "owner dispatch '{}' unwound", self.site)
+    }
+}
+
+/// **The one door every owner-side dispatch goes through** (both planes):
+/// run `fut` on the venue the lever selects and record its decomposition.
+///
+/// `inline` (the default): poll `fut` HERE, on the accepting connection's
+/// thread, with its unwind contained — `queue_hop` and `wake_hop` are 0
+/// by construction and `run` is the work. Otherwise: the shipped hop —
+/// spawn onto the `sqz-meta` pool and join, the lane-side instants riding
+/// the oneshot (`meta_exec::spawn_meta_join_stamped`). Returns the
+/// outcome and the stamps; an unwound hop records no split (its lane-side
+/// instants died with the task) but is still counted on `hops`.
+pub(crate) async fn owner_dispatch<F, T>(
+    site: &'static str,
+    inline: bool,
+    fut: F,
+) -> (std::result::Result<T, DispatchUnwound>, DispatchStamps)
+where
+    F: std::future::Future<Output = T> + Send + 'static,
+    T: Send + 'static,
+{
+    let submitted_at = std::time::Instant::now();
+    if inline {
+        OWNER_DISPATCH_INLINE.fetch_add(1, Ordering::Relaxed);
+        let out = futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(fut)).await;
+        let done_at = std::time::Instant::now();
+        let stamps = DispatchStamps {
+            submitted_at,
+            picked_at: submitted_at,
+            done_at,
+            observed_at: done_at,
+        };
+        stamps.record();
+        let out = out.map_err(|_| {
+            // The `contain` discipline, on this venue: the panic is a bug
+            // and the record of lost work; the connection serves on.
+            log::error!(
+                "owner dispatch '{site}' PANICKED on the accepting connection thread — the \
+                 verb's work is LOST; the frame answers PANIC and the session serves on"
+            );
+            DispatchUnwound { site }
+        });
+        return (out, stamps);
+    }
+    OWNER_DISPATCH_HOPS.fetch_add(1, Ordering::Relaxed);
+    let joined = crate::meta_exec::spawn_meta_join_stamped(site, fut).await;
+    let observed_at = std::time::Instant::now();
+    match joined {
+        Ok((out, lane)) => {
+            let stamps = DispatchStamps {
+                submitted_at,
+                picked_at: lane.picked_at,
+                done_at: lane.done_at,
+                observed_at,
+            };
+            stamps.record();
+            (Ok(out), stamps)
+        }
+        Err(_) => (
+            Err(DispatchUnwound { site }),
+            DispatchStamps {
+                submitted_at,
+                picked_at: observed_at,
+                done_at: observed_at,
+                observed_at,
+            },
+        ),
+    }
 }
 
 // ---------------------------------------------------------------------------

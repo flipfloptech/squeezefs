@@ -3883,13 +3883,15 @@ enum KvmapClaimScope {
 /// The publish path executed for a peer, against the volumes this node has
 /// authority over.
 ///
-/// The **venue rule** is S8's, verbatim and for the same mechanical reason:
-/// the frame arrives on a pinned `sqz-cluster-svc{n}` lane, and the
-/// execution is handed to the **sqz-meta pool**
-/// ([`crate::meta_exec::spawn_meta_join`]) — the venue that owns the
-/// backend's tasks, because `commit_tx` spawns the per-volume conveyor pass
-/// task there, and a verb executed inline on a lane would give a volume's
-/// whole commit conveyor a venue whose lifetime is the lane's.
+/// The **venue** is S8's, verbatim ([`super::owner_dispatch`], D-5): the
+/// frame arrives on the connection's own thread and every call / group /
+/// free / harvest dispatch goes through the one door that records the
+/// dispatch-hop split and selects the venue — the accepting thread itself
+/// by default, the shipped `sqz-meta` hop under
+/// `SQUEEZEFS_META_SHIP_INLINE_SERVE=0`. The hop's mechanical reason (the
+/// conveyor pass task once spawned on the committer's AMBIENT runtime) is
+/// gone since rip-tokio-total: every task a served commit touches lives on
+/// an explicit process-global venue.
 pub struct PublishService {
     inner: Arc<RoutedMetaBackend>,
     authority: Vec<bool>,
@@ -4050,12 +4052,15 @@ impl PublishService {
         let chains = super::service::chains_by_named_inos(&named);
         let chain_count = chains.iter().copied().max().map_or(0, |m| m + 1);
         SERVED_CHAINS.fetch_add(chain_count as u64, Ordering::Relaxed);
+        // D-5: the dispatch venue, read once per frame (see
+        // `super::owner_dispatch`).
+        let inline = super::inline_serve_enabled();
         let outcomes: Vec<PublishCallOutcome> = if chain_count <= 1 {
             // One chain (the one-call frame, or one hot object): the
             // serial form, in-task.
             let mut out = Vec::with_capacity(n);
             for call in frame.calls {
-                out.push(self.serve_call(&client, call).await);
+                out.push(self.serve_call(&client, call, inline).await);
             }
             out
         } else {
@@ -4080,10 +4085,12 @@ impl PublishService {
                     let others_fut =
                         futures::future::join_all(others.into_iter().map(|(idx, call)| {
                             let client = Arc::clone(&client);
-                            async move { (idx, self.serve_call(&client, call).await) }
+                            async move { (idx, self.serve_call(&client, call, inline).await) }
                         }));
-                    let (others_out, (group_out, committed)) =
-                        futures::join!(others_fut, self.serve_layout_group(&client, layouts));
+                    let (others_out, (group_out, committed)) = futures::join!(
+                        others_fut,
+                        self.serve_layout_group(&client, layouts, inline)
+                    );
                     grouped |= committed;
                     for (idx, outcome) in others_out.into_iter().chain(group_out) {
                         slots[idx] = Some(outcome);
@@ -4099,7 +4106,7 @@ impl PublishService {
                     async move {
                         let mut out = Vec::with_capacity(chain.len());
                         for (idx, call) in chain {
-                            out.push((idx, self.serve_call(&client, call).await));
+                            out.push((idx, self.serve_call(&client, call, inline).await));
                         }
                         out
                     }
@@ -4188,8 +4195,14 @@ impl PublishService {
 
     /// Serve ONE call of a frame — the gates in their landed order, then
     /// the class's own serve path. Refusals are per call and apply
-    /// nothing; a sibling call in the same frame is untouched.
-    async fn serve_call(&self, client: &str, call: PublishCall) -> PublishCallOutcome {
+    /// nothing; a sibling call in the same frame is untouched. `inline` is
+    /// the frame's dispatch venue (D-5, [`super::owner_dispatch`]).
+    async fn serve_call(
+        &self,
+        client: &str,
+        call: PublishCall,
+        inline: bool,
+    ) -> PublishCallOutcome {
         if let Some(refusal) = self.screen(client, &call) {
             return refusal;
         }
@@ -4199,7 +4212,7 @@ impl PublishService {
         // weaken.
         if let Some((epoch, request_id)) = call.witness() {
             return self
-                .serve_layout_publish(epoch, request_id, client.to_string(), call)
+                .serve_layout_publish(epoch, request_id, client.to_string(), call, inline)
                 .await;
         }
         // DLM S9's allocation-lane seam: the ONE verb whose argument reaches a
@@ -4242,7 +4255,7 @@ impl PublishService {
                 return Self::refuse(PUBLISH_LANE_REFUSED, reason);
             }
             return self
-                .serve_harvest(client, *lease_epoch, *request_id, call)
+                .serve_harvest(client, *lease_epoch, *request_id, call, inline)
                 .await;
         }
         // The co-writer FREE path: retried (like the harvest above and only
@@ -4264,7 +4277,7 @@ impl PublishService {
                 return Self::refuse(PUBLISH_STALE_LEASE, reason);
             }
             return self
-                .serve_free(client, *lease_epoch, *request_id, call)
+                .serve_free(client, *lease_epoch, *request_id, call, inline)
                 .await;
         }
         let Some(me) = self.owned() else {
@@ -4275,7 +4288,7 @@ impl PublishService {
         };
         let name = call.name();
         let client = client.to_string();
-        let joined = crate::meta_exec::spawn_meta_join("meta_ship_publish_verb", async move {
+        let (joined, _) = super::owner_dispatch("meta_ship_publish_verb", inline, async move {
             me.execute(&client, call).await
         })
         .await;
@@ -4312,6 +4325,7 @@ impl PublishService {
         request_id: u64,
         client: String,
         call: PublishCall,
+        inline: bool,
     ) -> PublishCallOutcome {
         let Some(me) = self.owned() else {
             return Self::refuse(
@@ -4331,41 +4345,43 @@ impl PublishService {
         }
         let outcome = slot
             .get_or_init(|| async move {
-                // The venue rule, verbatim (see serve_call/serve_free): the
-                // commit runs on the sqz-meta pool, never inline on a
-                // `sqz-cluster-svc{n}` lane.
-                match crate::meta_exec::spawn_meta_join("meta_ship_publish_verb", async move {
-                    // Rung 17: per-ino serialization across the whole
-                    // serve (the scoped Put's read + commit — see
-                    // `SERVE_INO_LOCKS`). Rung 18: the EXTENT verbs are
-                    // exempt HERE — their executors run the fs's own
-                    // write path, whose local layout publishes now take
-                    // this very stripe at the funnel
-                    // (`local_publish_guard`), so holding it across the
-                    // executor would self-deadlock the FlushExtents fold;
-                    // extent merges carry their own per-block stripe
-                    // discipline.
-                    let ino = call.named_inos().first().copied().unwrap_or(0);
-                    let _ino_guard = if call.is_extent() {
-                        None
-                    } else {
-                        Some(serve_ino_guard(ino).await)
-                    };
-                    // Rung 18: a committed layout-class serve invalidates
-                    // the authority fs's RAM view of the named inos (the
-                    // served commit bypassed it — see the sink's doc).
-                    let inval_inos = call
-                        .serves_mutate_layout()
-                        .then(|| call.named_inos())
-                        .unwrap_or_default();
-                    let out = me.execute(&client, call).await;
-                    if out.is_ok() {
-                        note_served_layout_commit(&inval_inos);
-                    }
-                    out
-                })
-                .await
-                {
+                // The dispatch door (D-5): the commit runs on the venue the
+                // lever selects, its unwind contained INSIDE the witness
+                // init so a replay meets a cached outcome, never a claimed
+                // slot nobody completes.
+                let (joined, _) =
+                    super::owner_dispatch("meta_ship_publish_verb", inline, async move {
+                        // Rung 17: per-ino serialization across the whole
+                        // serve (the scoped Put's read + commit — see
+                        // `SERVE_INO_LOCKS`). Rung 18: the EXTENT verbs are
+                        // exempt HERE — their executors run the fs's own
+                        // write path, whose local layout publishes now take
+                        // this very stripe at the funnel
+                        // (`local_publish_guard`), so holding it across the
+                        // executor would self-deadlock the FlushExtents fold;
+                        // extent merges carry their own per-block stripe
+                        // discipline.
+                        let ino = call.named_inos().first().copied().unwrap_or(0);
+                        let _ino_guard = if call.is_extent() {
+                            None
+                        } else {
+                            Some(serve_ino_guard(ino).await)
+                        };
+                        // Rung 18: a committed layout-class serve invalidates
+                        // the authority fs's RAM view of the named inos (the
+                        // served commit bypassed it — see the sink's doc).
+                        let inval_inos = call
+                            .serves_mutate_layout()
+                            .then(|| call.named_inos())
+                            .unwrap_or_default();
+                        let out = me.execute(&client, call).await;
+                        if out.is_ok() {
+                            note_served_layout_commit(&inval_inos);
+                        }
+                        out
+                    })
+                    .await;
+                match joined {
                     Ok(out) => out.map_err(|e| WireError::from_error(&e)),
                     Err(e) => {
                         // RES-7/RES-8: the unwind is recorded — and CACHED,
@@ -4403,6 +4419,7 @@ impl PublishService {
         &self,
         client: &Arc<str>,
         calls: Vec<(usize, PublishCall)>,
+        inline: bool,
     ) -> (Vec<(usize, PublishCallOutcome)>, bool) {
         let mut out = Vec::with_capacity(calls.len());
         if calls.is_empty() {
@@ -4435,17 +4452,20 @@ impl PublishService {
         }
         let serial_fut = futures::future::join_all(serial.into_iter().map(|(idx, call)| {
             let client = Arc::clone(client);
-            async move { (idx, self.serve_call(&client, call).await) }
+            async move { (idx, self.serve_call(&client, call, inline).await) }
         }));
-        let (serial_out, (group_out, committed)) =
-            futures::join!(serial_fut, self.execute_layout_group(client, members));
+        let (serial_out, (group_out, committed)) = futures::join!(
+            serial_fut,
+            self.execute_layout_group(client, members, inline)
+        );
         out.extend(serial_out);
         out.extend(group_out);
         (out, committed)
     }
 
-    /// Execute the claimed members of a round as one group: ONE hop onto
-    /// the sqz-meta pool (the venue rule) running
+    /// Execute the claimed members of a round as one group: ONE dispatch
+    /// ([`super::owner_dispatch`] — the accepting venue by default, one hop
+    /// onto the sqz-meta pool under the control) running
     /// [`Self::run_layout_group`]; every member's witness completes with
     /// its own outcome (a parked replay wakes with it), and an unwind is
     /// recorded AND cached per member — a replay answers the same loud
@@ -4455,6 +4475,7 @@ impl PublishService {
         &self,
         client: &Arc<str>,
         members: Vec<GroupMember>,
+        inline: bool,
     ) -> (Vec<(usize, PublishCallOutcome)>, bool) {
         if members.is_empty() {
             return (Vec::new(), false);
@@ -4483,7 +4504,7 @@ impl PublishService {
             work.push(m.call);
         }
         let client = client.to_string();
-        let joined = crate::meta_exec::spawn_meta_join("meta_ship_publish_group", async move {
+        let (joined, _) = super::owner_dispatch("meta_ship_publish_group", inline, async move {
             me.run_layout_group(&client, work).await
         })
         .await;
@@ -4635,6 +4656,7 @@ impl PublishService {
         lease_epoch: u64,
         request_id: u64,
         call: PublishCall,
+        inline: bool,
     ) -> PublishCallOutcome {
         let PublishCall::FreeBlocks {
             vol_tag, blocks, ..
@@ -4668,16 +4690,13 @@ impl PublishService {
         }
         let outcome = slot
             .get_or_init(|| async move {
-                // The venue rule, verbatim: the ladder runs on the
-                // sqz-meta pool — the venue that owns the backend's tasks
-                // (the reclaim queue's worker and the conveyor live
-                // there), never inline on a `sqz-cluster-svc{n}` lane.
-                match crate::meta_exec::spawn_meta_join(
-                    "shipped_free_ladder",
-                    exec(vol_tag, blocks),
-                )
-                .await
-                {
+                // The dispatch door (D-5): the ladder runs on the venue the
+                // lever selects; its unwind is contained inside the witness
+                // init (see `serve_layout_publish`).
+                let (joined, _) =
+                    super::owner_dispatch("shipped_free_ladder", inline, exec(vol_tag, blocks))
+                        .await;
+                match joined {
                     Ok(Ok(verdicts)) => {
                         FREE_SERVED_BLOCKS.fetch_add(
                             verdicts
@@ -4726,6 +4745,7 @@ impl PublishService {
         lease_epoch: u64,
         request_id: u64,
         call: PublishCall,
+        inline: bool,
     ) -> PublishCallOutcome {
         let PublishCall::HarvestLaneFree {
             vol_tag,
@@ -4758,13 +4778,14 @@ impl PublishService {
         let client_owned = client.to_string();
         let outcome = slot
             .get_or_init(|| async move {
-                // The venue rule, verbatim (see serve_free).
-                match crate::meta_exec::spawn_meta_join(
+                // The dispatch door (D-5), as `serve_free`.
+                let (joined, _) = super::owner_dispatch(
                     "shipped_lane_harvest",
+                    inline,
                     exec(vol_tag, lane, writers, max, lease_epoch),
                 )
-                .await
-                {
+                .await;
+                match joined {
                     Ok(Ok(aged)) => {
                         HARVEST_SERVED_BLOCKS.fetch_add(aged.len() as u64, Ordering::Relaxed);
                         // Schema 16: the grant's sequence — bumped strictly

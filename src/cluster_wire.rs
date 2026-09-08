@@ -2808,6 +2808,17 @@ impl std::fmt::Debug for RpcClient {
 /// Bound on the dial-side connect + handshake and on one call's reply.
 const DIAL_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// The reply bound every [`RpcClient::call`] waits under — the socket read
+/// timeout installed at dial time, so it is the wall from the client's
+/// send to the first reply byte. A verb the SERVER parks for this long
+/// (the custody notice poll's park is clamped to the renewal cadence,
+/// which on the fleet is exactly this value) is a race the client loses
+/// by the RTT plus the owner's wake; a parking verb's ask must derive from
+/// this with margin (`data_grant::notice_poll_park`).
+pub fn call_reply_bound() -> Duration {
+    DIAL_TIMEOUT
+}
+
 impl RpcClient {
     /// Dial, prove storage membership against the coordinator's
     /// **server-issued** challenge, derive the session key, and return the

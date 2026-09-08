@@ -485,9 +485,10 @@ pub struct NoticePollFrame {
     pub schema: u32,
     pub client: String,
     pub lease_epoch: u64,
-    /// The client's requested park bound; the authority clamps it to one
-    /// renewal cadence (the S6 venue discipline — no unbounded parks on a
-    /// service lane).
+    /// The client's requested park bound ([`notice_poll_park`] — inside
+    /// the wire's reply bound, so the client outlives the park); the
+    /// authority clamps it to one renewal cadence (the S6 venue
+    /// discipline — no unbounded parks on a service lane).
     pub park_ms: u64,
 }
 
@@ -623,6 +624,15 @@ static NOTICE_POLL_ROUNDS: AtomicU64 = AtomicU64::new(0);
 /// engagement instrument — the renewal remains the worst-case carrier, so
 /// growth here is the poll beating the cadence).
 static NOTICE_POLL_NOTICES: AtomicU64 = AtomicU64::new(0);
+/// Standing-poll rounds that ended WITHOUT an answered park — a wire
+/// error or a refusal. Each one costs the incumbent its notice session
+/// and a 500 ms backoff with no parked poll, so a demotion landing in
+/// that window waits for the re-dial. Rounds alone could not show this
+/// (`.benchmarks/2026-09-08-assembler-contracts-notice-poll.md`): a fleet
+/// whose quiet rounds all lost the reply-bound race read as "the channel
+/// lives, fewer notices". Steady growth on a quiet co-writer is session
+/// churn.
+static NOTICE_POLL_FAILURES: AtomicU64 = AtomicU64::new(0);
 static RANGE_EXTENSIONS_CLIENT: AtomicU64 = AtomicU64::new(0);
 /// Finding 34 (rung 1): ranged release verbs DEFERRED by the release gate
 /// because their ino's publish pipeline was not yet quiescent — each one
@@ -721,9 +731,11 @@ pub fn stats_json() -> serde_json::Value {
         // publish drain — the ordering fix's engagement gauge.
         "dlm_custody_releases_deferred": RELEASES_DEFERRED.load(Ordering::Relaxed),
         // Finding 27: the standing notice poll (rounds = channel
-        // liveness; notices = the quiet-incumbent engagement).
+        // liveness; notices = the quiet-incumbent engagement; failures =
+        // rounds that died — session churn, a dark window each).
         "dlm_custody_notice_polls": NOTICE_POLL_ROUNDS.load(Ordering::Relaxed),
         "dlm_custody_notice_poll_notices": NOTICE_POLL_NOTICES.load(Ordering::Relaxed),
+        "dlm_custody_notice_poll_failures": NOTICE_POLL_FAILURES.load(Ordering::Relaxed),
         "dlm_custody_held": OWNER
             .load()
             .as_ref()
@@ -2990,9 +3002,12 @@ impl WriteCustodyClient {
         // custody client, so a QUIET incumbent (no verbs in flight)
         // hears a pending demotion/shrink at poll latency instead of its
         // renewal cadence. The task holds a Weak: the client's last drop
-        // ends the channel.
-        let weak = Arc::downgrade(&client);
-        crate::meta_exec::spawn_meta("custody_notice_poll", notice_poll_run(weak));
+        // ends the channel. Read once per connect; only the test seam can
+        // withhold it.
+        if notice_poll_armed() {
+            let weak = Arc::downgrade(&client);
+            crate::meta_exec::spawn_meta("custody_notice_poll", notice_poll_run(weak));
+        }
         Ok(client)
     }
 
@@ -4024,6 +4039,51 @@ pub fn discharge_lane_handouts(offsets: &[u64]) {
 /// owner (the [`acquire_remote`] pattern for the range face), mapping the
 /// wire outcome back into the local [`crate::dlm::RangeAcquired`] shape
 /// the homing entry point answers with.
+/// The standing poll's arming latch: `0` = the product (armed), `2` =
+/// withheld by [`test_set_notice_poll`], `1` = explicitly armed by it.
+static NOTICE_POLL_PRESET: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+fn notice_poll_armed() -> bool {
+    NOTICE_POLL_PRESET.load(Ordering::SeqCst) != 2
+}
+
+/// Test seam — NOT a knob: `Some(false)` withholds the standing notice
+/// poll from every client [`WriteCustodyClient::connect`] builds until
+/// `None` (or `Some(true)`) restores the product posture. The product has
+/// no opt-out, because a co-writer without its poll hears a demotion only
+/// at its renewal cadence (finding 27's half-bandwidth dip). The seam
+/// exists for the contracts that pin the barrier's OTHER arms — the
+/// renewal-carried notice, the owner-clock expiry, the f16a acquire /
+/// release-reply carriers — which are observable only while the poll is
+/// not there to ack first (`.benchmarks/2026-09-08-assembler-contracts-notice-poll.md`).
+pub fn test_set_notice_poll(on: Option<bool>) {
+    NOTICE_POLL_PRESET.store(
+        match on {
+            Some(true) => 1,
+            Some(false) => 2,
+            None => 0,
+        },
+        Ordering::SeqCst,
+    );
+}
+
+/// The standing poll's park ASK: half the wire's reply bound
+/// ([`crate::cluster_wire::call_reply_bound`]). The authority clamps the
+/// park to its renewal cadence, and on the fleet that cadence
+/// (`min(10 s, T_self/3)`) is exactly the wire's 10 s bound — so an ask AT
+/// the bound made every QUIET round a zero-margin race: the owner's reply
+/// lands at park + RTT + its wake, the client's socket read timeout fires
+/// at the bound, and the loss is a dropped notice session plus a 500 ms
+/// window with no parked poll (counted in `dlm_custody_notice_poll_failures`).
+/// Every measured venue is loopback, where the reply wins by the kernel's
+/// SO_RCVTIMEO rounding; a fabric RTT or a busy owner loses it. Half the
+/// bound leaves the other half as margin; the cost is one small frame per
+/// half-bound per quiet co-writer. Derived, never a constant of its own —
+/// the tie test is `the_standing_polls_ask_sits_inside_the_wires_reply_bound`.
+pub fn notice_poll_park() -> Duration {
+    crate::cluster_wire::call_reply_bound() / 2
+}
+
 /// Finding 27: the standing notice poll's client loop. Each round parks
 /// one RPC on the authority (bounded there by one renewal cadence) and
 /// absorbs whatever notices the reply carries — `absorb_notices` runs the
@@ -4041,7 +4101,7 @@ async fn notice_poll_run(weak: std::sync::Weak<WriteCustodyClient>) {
             schema: CUSTODY_SCHEMA,
             client: client.id.clone(),
             lease_epoch: client.lease_epoch.load(Ordering::Acquire),
-            park_ms: 10_000,
+            park_ms: notice_poll_park().as_millis() as u64,
         };
         let body = match encode(&frame, "notice poll") {
             Ok(b) => b,
@@ -4069,6 +4129,7 @@ async fn notice_poll_run(weak: std::sync::Weak<WriteCustodyClient>) {
                 // Unknown lease / schema refusal / wire error: the
                 // renewal path owns diagnosis and re-join — this channel
                 // only backs off so a flapping authority is not hammered.
+                NOTICE_POLL_FAILURES.fetch_add(1, Ordering::Relaxed);
                 backoff = Some(Duration::from_millis(500));
             }
         }

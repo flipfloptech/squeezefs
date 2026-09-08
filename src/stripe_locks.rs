@@ -397,6 +397,21 @@ pub fn dlm_stripe_width() -> usize {
     })
 }
 
+/// The transport's delivered-concurrency ceiling — `possible_cpus ×
+/// q_depth`, the most requests the FUSE-over-io_uring ring can present at
+/// once (one queue per possible CPU, the sizing depth per queue). The
+/// population bound every per-in-flight-op census derives its retained
+/// capacity from (W-6: the write-phase census map keeps this many entries
+/// of capacity so a quiet mount never re-allocates its table per op).
+pub fn transport_inflight_ceiling() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        crate::cpu::possible_cpus()
+            .max(1)
+            .saturating_mul(transport_q_depth_for_sizing().max(1))
+    })
+}
+
 /// The lease-waiter / grant-floor / serve-stripe width in force (the
 /// same law and knob as [`dlm_stripe_width`] over the 1024 shipped floor).
 pub fn lease_stripe_width() -> usize {

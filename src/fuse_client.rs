@@ -3242,8 +3242,18 @@ pub const WP_OV_POOLED: u32 = 17;
 /// W-3: parked in write-pipeline admission ahead of an overlay store.
 pub const WP_OV_ADMIT: u32 = 18;
 
-static WRITE_PHASE_MAP: Lazy<scc::HashMap<(u64, u64, u32), (u32, u64)>> =
-    Lazy::new(scc::HashMap::new);
+/// Retained capacity = two keys (the unit key + one block key) per
+/// in-flight write at the transport's delivered-concurrency ceiling. W-6
+/// (e2e perf audit write board #7): built with `new()` the map's minimum
+/// capacity was 0, so `scc` DROPPED its bucket array whenever the last
+/// live write's guard removed the last entry and re-allocated it on the
+/// next `write_phase_begin` — three heap allocations per write on any
+/// mount quiet enough for writes not to overlap (the op-economy suite's
+/// site table, 3 of 14.6/op). A nonzero minimum is never shrunk below,
+/// so the array persists; the map still grows past it under load.
+static WRITE_PHASE_MAP: Lazy<scc::HashMap<(u64, u64, u32), (u32, u64)>> = Lazy::new(|| {
+    scc::HashMap::with_capacity(crate::stripe_locks::transport_inflight_ceiling().saturating_mul(2))
+});
 
 /// Finding 34 (rung 1): per-ino latch of a KICKED release-gate flush —
 /// the gate's `false` verdict spawns at most one detached flush per ino
@@ -15783,7 +15793,7 @@ impl SqueezefsFilesystem {
                 .router
                 .cache
                 .nvme
-                .has_staged_extent_record(&crate::keys::active_block_ext(ino, b as u64))
+                .has_staged_extent_record(&crate::keys::active_block_ext_stack(ino, b as u64))
         {
             // W2: a staged extent record is an overlay too — its extents
             // are NEWER than the base block, so an in-place patch under it
@@ -15826,7 +15836,11 @@ impl SqueezefsFilesystem {
         // merges are excluded by predicate 2 — their staged source exists
         // until after the merge publishes). Cache miss falls back to the
         // backend, which the merge discipline keeps current for `b`.
-        let mapping = {
+        // W-6: the mapping is BORROWED from the map's `Arc` for the whole
+        // patch (the map `Arc` is held, not the key cloned; the backend id
+        // is the borrow-form parse) — three heap allocations per patch
+        // before, for values every consumer takes as `&str`.
+        let block_map = {
             let cached = self
                 .router
                 .metadata_cache
@@ -15841,16 +15855,17 @@ impl SqueezefsFilesystem {
                     .ok()
                     .filter(|m| m.file_type == "striped"),
             };
-            meta.and_then(|m| m.block_map.as_ref().and_then(|bm| bm.get(&b).cloned()))
+            meta.and_then(|m| m.block_map)
         };
-        let Some(mapping) = mapping else {
+        let Some(mapping) = block_map.as_ref().and_then(|bm| bm.get(&b)) else {
             // Hole / not striped / indirect-mapped: nothing to patch.
             METRICS
                 .patch_ineligible_unmapped
                 .fetch_add(1, Ordering::Relaxed);
             return Ok(false);
         };
-        if !crate::routing::is_whole_block_mapping(&mapping) {
+        let mapping: &str = mapping;
+        if !crate::routing::is_whole_block_mapping(mapping) {
             // Decorated `bk:off:len` (promoted staged): patch arithmetic
             // must never scribble relative to a decorated window.
             METRICS
@@ -15858,13 +15873,13 @@ impl SqueezefsFilesystem {
                 .fetch_add(1, Ordering::Relaxed);
             return Ok(false);
         }
-        let Ok((be_id, dev_offset)) = self.router.backend_router.parse_block_key(&mapping) else {
+        let Ok((be_id, dev_offset)) = self.router.backend_router.split_block_key(mapping) else {
             METRICS
                 .patch_ineligible_unmapped
                 .fetch_add(1, Ordering::Relaxed);
             return Ok(false);
         };
-        let Ok((allocator, device)) = self.router.backend_router.get_backend(&be_id) else {
+        let Ok((allocator, device)) = self.router.backend_router.get_backend(be_id) else {
             METRICS
                 .patch_ineligible_unmapped
                 .fetch_add(1, Ordering::Relaxed);
@@ -15963,7 +15978,7 @@ impl SqueezefsFilesystem {
         // RAM LRU / hot-block / NVMe read tier / GDS under the block key,
         // plus the stale whole-file snapshots under the path.
         allocator.publish_block(dev_offset);
-        self.router.cache.purge_block_key(&mapping);
+        self.router.cache.purge_block_key(mapping);
         self.router.cache.write_lru.remove(file_path);
         self.router.cache.read_lru.remove(file_path);
 
@@ -16286,7 +16301,7 @@ impl SqueezefsFilesystem {
                 .router
                 .cache
                 .nvme
-                .has_staged_extent_record(&crate::keys::active_block_ext(ino, b as u64))
+                .has_staged_extent_record(&crate::keys::active_block_ext_stack(ino, b as u64))
         {
             return Ok(false);
         }
@@ -18091,7 +18106,12 @@ impl SqueezefsFilesystem {
             payload.materialize().await.map_err(SqueezefsError::Io)?
         };
 
+        // W-6: the single-block shape (every W1 patch / overlay / small
+        // write — the whole random-small-write population) awaits its ONE
+        // block future inline; only a span pays the `Vec` + the
+        // `try_join_all` boxed slice (two allocations per write before).
         let mut futures = Vec::new();
+        let mut single = None;
         let mut data_cursor = 0usize;
         for b in start_block..=end_block {
             let b_start_offset = b * block_size;
@@ -18118,7 +18138,12 @@ impl SqueezefsFilesystem {
             };
             data_cursor += slice_len;
 
-            let cache_key = crate::keys::active_block(ino, b as u64).to_string();
+            // W-6: STACK keys (the op-economy law) — the heap `String`s
+            // this loop minted per block were three allocations per write
+            // for values every consumer takes as `&str`; the slow arms
+            // that need an OWNED key (park / staged-sibling handoffs)
+            // mint it there.
+            let cache_key_stack = crate::keys::active_block_stack(ino, b as u64);
             let needs_existing_data = Self::block_write_needs_existing_data(
                 existing_size,
                 b_start_offset,
@@ -18127,9 +18152,11 @@ impl SqueezefsFilesystem {
                 write_end,
             );
 
-            let file_path = crate::keys::inode_path(ino);
+            let file_path_stack = crate::keys::inode_path_stack(ino);
 
-            futures.push(async move {
+            let block_future = async move {
+                let cache_key: &str = cache_key_stack.as_str();
+                let file_path: &str = file_path_stack.as_str();
                 // 0. Acquire Block-level Lock to prevent concurrent modification to the same block
                 // (RW1: per-site wait attribution — the write_checkout site;
                 // the returned wait keeps feeding the always-on global
@@ -18157,8 +18184,8 @@ impl SqueezefsFilesystem {
                             b as u32,
                             rel,
                             &patch_payload,
-                            &cache_key,
-                            &file_path,
+                            cache_key,
+                            file_path,
                             fencing_token,
                         )
                         .await
@@ -18192,7 +18219,7 @@ impl SqueezefsFilesystem {
                             rel,
                             slice_len,
                             &patch_payload,
-                            &cache_key,
+                            cache_key,
                             fencing_token,
                         )
                         .await
@@ -18344,7 +18371,7 @@ impl SqueezefsFilesystem {
                             rel,
                             file_data_slice,
                             needs_existing_data,
-                            &cache_key,
+                            cache_key,
                             stream_adjacent,
                             fencing_token,
                         )
@@ -18372,7 +18399,7 @@ impl SqueezefsFilesystem {
                 // across an await), and this block's BLOCK_FLUSH_LOCKS
                 // guard (held) excludes every other mutator.
                 let wp_checkout = write_phase_start();
-                if self.active_block_buffers.contains_key(&cache_key) {
+                if self.active_block_buffers.contains_key(cache_key) {
                     // RW1 ledger: an overlay already owned this block —
                     // the §1.2 block-revisit discount, quantified.
                     METRICS.write_block_revisits.fetch_add(1, Ordering::Relaxed);
@@ -18403,7 +18430,7 @@ impl SqueezefsFilesystem {
                     // Fresh zeros complement.
                     let block_has_existing_bytes = live_mapped
                         || std::cmp::min(live_existing_size, b_end_offset) > b_start_offset;
-                    let seed = if let Some(d) = self.router.cache.nvme.read_staged(&cache_key) {
+                    let seed = if let Some(d) = self.router.cache.nvme.read_staged(cache_key) {
                         METRICS.write_block_revisits.fetch_add(1, Ordering::Relaxed);
                         crate::cache::active_block::ActiveBlockBuf::seeded(&d, block_size as usize)
                     } else if let Some(shared) = self.placed_assemblies.take_for_adoption(
@@ -18455,7 +18482,7 @@ impl SqueezefsFilesystem {
                             .fetch_add(1, Ordering::Relaxed);
                         crate::cache::active_block::ActiveBlockBuf::deferred(block_size as usize)
                     };
-                    self.park_overlay_entry(cache_key.clone(), seed);
+                    self.park_overlay_entry(cache_key.to_string(), seed);
                 }
                 write_phase_record(WritePhase::Checkout, wp_checkout);
                 // TEST SEAM: hold this write inside its guarded window
@@ -18480,7 +18507,7 @@ impl SqueezefsFilesystem {
                     if self.router.cache.nvme.has_staged_extent_record(&ext_key) {
                         if let Some(rec) = self.read_valid_extent_record(&ext_key) {
                             let bs_usize = block_size as usize;
-                            if let Some(mut e) = self.active_block_buffers.get_mut(&cache_key) {
+                            if let Some(mut e) = self.active_block_buffers.get_mut(cache_key) {
                                 for (s, d) in &rec.extents {
                                     if (*s as usize) + d.len() <= bs_usize {
                                         e.value_mut().absorb_older_extent(*s as usize, d);
@@ -18545,9 +18572,9 @@ impl SqueezefsFilesystem {
                     METRICS
                         .staging_sibling_probes
                         .fetch_add(1, Ordering::Relaxed);
-                    if self.router.cache.nvme.has_staged_active_block(&cache_key) {
+                    if self.router.cache.nvme.has_staged_active_block(cache_key) {
                         let nvme = self.router.cache.nvme.clone();
-                        let key = cache_key.clone();
+                        let key = cache_key.to_string();
                         write_phase(ino, offset, b as u32, WP_ACCUMULATE);
                         let removed = squeezefs_ipc::sqz_blocking::run_blocking(move || {
                             nvme.remove_active_block(&key)
@@ -18584,7 +18611,7 @@ impl SqueezefsFilesystem {
                 let coverage_completed = {
                     let mut entry = self
                         .active_block_buffers
-                        .get_mut(&cache_key)
+                        .get_mut(cache_key)
                         .expect("parked entry cannot vanish under the held block lock");
                     // Placed-sever merge elision (shim-parity 2026-07-28,
                     // the pointer proof): the payload region IS the
@@ -18646,7 +18673,7 @@ impl SqueezefsFilesystem {
                         self.write_through_complete_block(
                             ino,
                             b as u32,
-                            &cache_key,
+                            cache_key,
                             fencing_token,
                             block_guard,
                         )
@@ -18681,7 +18708,7 @@ impl SqueezefsFilesystem {
                             op_profile_enabled().then_some(t_admit),
                         );
                         let fs = self.clone();
-                        let key = cache_key.clone();
+                        let key = cache_key.to_string();
                         // The fuse3 per-core handler lanes — the venue pin
                         // (the 2026-07-26 handoff-economy law: never a
                         // runtime-handle spawn onto the global inject
@@ -18715,17 +18742,27 @@ impl SqueezefsFilesystem {
                     // map); run the R5 byte-budget admission pass.
                     let wp_park = write_phase_start();
                     write_phase(ino, offset, b as u32, WP_PARK_ADMIT);
-                    self.admit_parked_active_block(&cache_key, fencing_token)
+                    self.admit_parked_active_block(cache_key, fencing_token)
                         .await;
                     write_phase_record(WritePhase::ParkSpill, wp_park);
                     std::mem::drop(block_guard);
                 }
 
                 Ok::<(), SqueezefsError>(())
-            });
+            };
+            if start_block == end_block {
+                single = Some(block_future);
+            } else {
+                futures.push(block_future);
+            }
         }
 
-        futures::future::try_join_all(futures).await?;
+        match single {
+            Some(one) => one.await?,
+            None => {
+                futures::future::try_join_all(futures).await?;
+            }
+        }
 
         Ok(())
     }

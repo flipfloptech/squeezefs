@@ -403,11 +403,11 @@ pub(crate) static DLM_RPCS_META: AtomicU64 = AtomicU64::new(0);
 pub(crate) static MINT_REDIRECTS: AtomicU64 = AtomicU64::new(0);
 /// Owner-side dispatches (both planes) executed ON the accepting
 /// connection's thread — the D-5 lever's engagement
-/// (`SQUEEZEFS_META_SHIP_INLINE_SERVE`, default on).
+/// (`SQUEEZEFS_META_SHIP_INLINE_SERVE=1`; ships OFF on the 2026-09-08
+/// fleet row).
 static OWNER_DISPATCH_INLINE: AtomicU64 = AtomicU64::new(0);
 /// Owner-side dispatches that HOPPED onto the shared `sqz-meta` lanes and
-/// were joined from the connection thread (the shipped shape; the A/B
-/// control under `SQUEEZEFS_META_SHIP_INLINE_SERVE=0`).
+/// were joined from the connection thread (the shipped default).
 static OWNER_DISPATCH_HOPS: AtomicU64 = AtomicU64::new(0);
 /// Volume ownership records WRITTEN by the offline `volume set-owners`
 /// verb (§11.1). 0 on every mount by construction — a mount never
@@ -546,8 +546,8 @@ pub fn stats_json() -> serde_json::Value {
         "owner_assign_refusals": s.owner_assign_refusals,
         "subtree_roots_minted": s.subtree_roots_minted,
         // D-5: which venue served the owner's dispatches (both planes).
-        // `inline` ≡ every dispatch on the default; `hops` carries them
-        // under SQUEEZEFS_META_SHIP_INLINE_SERVE=0.
+        // `hops` ≡ every dispatch on the default; `inline` carries them
+        // under SQUEEZEFS_META_SHIP_INLINE_SERVE=1.
         "owner_dispatch_inline": s.owner_dispatch_inline,
         "owner_dispatch_hops": s.owner_dispatch_hops,
         "dlm_rpcs_meta": s.dlm_rpcs_meta,
@@ -719,18 +719,31 @@ pub fn owner_phase_json() -> serde_json::Value {
 // checkpoint/times tasks on `spawn_meta`), task-locals are executor-
 // agnostic, and the panic containment `contain` gave the hop is applied
 // here per dispatch (an unwinding verb answers PANIC and the session
-// serves on). `SQUEEZEFS_META_SHIP_INLINE_SERVE=0` is the shipped hop,
-// the same-binary A/B control.
+// serves on).
+//
+// SHIPS OFF on measurement (the 2026-09-08 squeeze-test fleet row,
+// `.benchmarks/2026-09-08-d5-fleet-squeeze-test.md`, two same-binary
+// A-B-B-A brackets in both orders): the venue deletes the two hops exactly
+// (queue_hop 332–459 + wake_hop 183–237 µs → 0) but the served work itself
+// runs 0.6–0.9 ms SLOWER on the connection thread (`run` 536–770 →
+// 1,211–1,473 µs, p99 bucket 16 → 32 ms) — every wake inside the work is
+// now an OS unpark of a dedicated thread instead of a lane re-queue, and
+// the durability lane's fan-out pays it (`sqz-jrnl` +17–25 %). Net: the
+// dispatch total par-to-worse, co-writer publish latency +15–49 %, ingest
+// −1.5…−7 %, verbs/s par. The in-process win was measured under an
+// artificial 4 × 200 µs lane hog; the field's lanes run at ρ ≈ 0.2. The
+// hop is the shipped default; `SQUEEZEFS_META_SHIP_INLINE_SERVE=1` is the
+// same-binary A/B lever for a venue whose lanes ARE saturated.
 // ---------------------------------------------------------------------------
 
-/// The venue lever: `1`/on (default) = a served dispatch is polled on the
-/// accepting connection's thread; `0` = the shipped `spawn_meta_join` hop.
+/// The venue lever: `0`/off (default) = the shipped `spawn_meta_join` hop;
+/// `1` = a served dispatch is polled on the accepting connection's thread.
 pub const INLINE_SERVE_ENV: &str = "SQUEEZEFS_META_SHIP_INLINE_SERVE";
 
 /// Read the lever (once per served frame — one getenv per wire round trip,
 /// the `SQUEEZEFS_PUBLISH_CONVEYOR_GROUP` precedent).
 pub(crate) fn inline_serve_enabled() -> bool {
-    crate::env_knobs::bool_knob(INLINE_SERVE_ENV, true)
+    crate::env_knobs::bool_knob(INLINE_SERVE_ENV, false)
 }
 
 /// Phases of `meta_ship_owner_dispatch_ns`.

@@ -12238,10 +12238,11 @@ impl SqueezefsFilesystem {
                 "meta_ship_owner_phase_ns": crate::meta_ship::owner_phase_json(),
                 // D-5 (e2e perf audit DLM #7): the owner's dispatch split —
                 // queue_hop / run / wake_hop / total per owner-side
-                // dispatch on both planes, exact-sum. On the default
-                // (`SQUEEZEFS_META_SHIP_INLINE_SERVE`) the two hops are 0
-                // by construction; the `meta_ship.owner_dispatch_{inline,
-                // hops}` pair says which venue served.
+                // dispatch on both planes, exact-sum. Under
+                // `SQUEEZEFS_META_SHIP_INLINE_SERVE=1` the two hops are 0
+                // by construction (ships OFF on the fleet row); the
+                // `meta_ship.owner_dispatch_{inline,hops}` pair says which
+                // venue served.
                 "meta_ship_owner_dispatch_ns": crate::meta_ship::owner_dispatch_json(),
                 // DLM S10 rung 11 (design-full-multi-writer PR row 11;
                 // spec R5): the RECALL LANE + THRASH VALVE, landed BEFORE

@@ -65,10 +65,15 @@ leg() { # label lever
     [ -f "$STATE/members.tsv" ] && { echo "residue after teardown" >&2; exit 1; }
     echo "[d5-lever] leg $label torn down to zero residue"
 }
-leg L1a 1
-leg L0a 0
-leg L0b 0
-leg L1b 1
+# LEGS = "<label>:<lever> ..." — the A-B-B-A order; the reverse bracket
+# (0 1 1 0) is the second bracket's, so a position effect cannot pose as
+# the lever's.
+LEGS="${LEGS:-L1a:1 L0a:0 L0b:0 L1b:1}"
+labels=()
+for spec in $LEGS; do
+    leg "${spec%%:*}" "${spec##*:}"
+    labels+=("${spec%%:*}")
+done
 echo "loadavg at end: $(cut -d' ' -f1-3 /proc/loadavg)" | tee -a "$TOP/box.log"
-for l in L1a L0a L0b L1b; do echo "--- $l"; grep -E "aggregate|owner :" "$TOP/$l/table.txt"; done
-python3 "$REPO/.benchmarks/rigs/2026-09-08-d5-fleet-analyze.py" "$TOP" L1a L0a L0b L1b | tee "$TOP/analysis.txt"
+for l in "${labels[@]}"; do echo "--- $l"; grep -E "aggregate|owner :" "$TOP/$l/table.txt"; done
+python3 "$REPO/.benchmarks/rigs/2026-09-08-d5-fleet-analyze.py" "$TOP" "${labels[@]}" | tee "$TOP/analysis.txt"

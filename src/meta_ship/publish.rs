@@ -3970,12 +3970,13 @@ enum KvmapClaimScope {
 /// The **venue** is S8's, verbatim (`meta_ship::owner_dispatch`, D-5): the
 /// frame arrives on the connection's own thread and every call / group /
 /// free / harvest dispatch goes through the one door that records the
-/// dispatch-hop split and selects the venue — the accepting thread itself
-/// by default, the shipped `sqz-meta` hop under
-/// `SQUEEZEFS_META_SHIP_INLINE_SERVE=0`. The hop's mechanical reason (the
-/// conveyor pass task once spawned on the committer's AMBIENT runtime) is
-/// gone since rip-tokio-total: every task a served commit touches lives on
-/// an explicit process-global venue.
+/// dispatch-hop split and selects the venue — the shipped `sqz-meta` hop
+/// by default, the accepting thread itself under
+/// `SQUEEZEFS_META_SHIP_INLINE_SERVE=1` (the field row priced the inline
+/// venue slower: `src/meta_ship/mod.rs`, the dispatch section). The hop's
+/// mechanical reason (the conveyor pass task once spawned on the
+/// committer's AMBIENT runtime) is gone since rip-tokio-total: every task
+/// a served commit touches lives on an explicit process-global venue.
 pub struct PublishService {
     inner: Arc<RoutedMetaBackend>,
     authority: Vec<bool>,

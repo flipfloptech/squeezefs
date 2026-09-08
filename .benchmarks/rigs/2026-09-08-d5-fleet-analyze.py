@@ -54,7 +54,7 @@ def mean_us(a, b, fam, ph):
 
 
 def bucket_p99(a, b, fam, ph):
-    counts = [delta(a, b, f"{fam}.{ph}.{lab}") for lab in BUCKET_LABELS]
+    counts = [delta(a, b, f"{fam}.{ph}.buckets.{lab}") for lab in BUCKET_LABELS]
     total = sum(counts)
     if not total:
         return "—"
@@ -97,7 +97,7 @@ def leg(out, name):
     print(f"  VENUE: {venue} — dispatches {disp['total'][1]} (inline {inline}, hops {hops}); "
           f"refusals {refusals}, owner panics {panics}")
     print("  RUNG: owner_dispatch_ns " + ", ".join(f"{ph} {m:.0f} us" for ph, (m, _) in disp.items())
-          + f"; total p99 bucket {bucket_p99(a, b, fam, 'total')}")
+          + f"; p99 buckets run {bucket_p99(a, b, fam, 'run')} / total {bucket_p99(a, b, fam, 'total')}")
     print(f"  S8 frame: owner_phase_ns.dispatch {s8:.0f} us (n={s8n}), execute {s8e:.0f} us, total {s8t:.0f} us")
     print(f"  conveyor: rho(apply) {rho:.3f}, passes {passes} ({passes / sframes if sframes else 0:.3f}/served frame), "
           f"tx_queue_wait {q:.0f} us, pass_total {pt:.0f} us")

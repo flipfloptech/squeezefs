@@ -20,14 +20,17 @@
 //! (≡ Σ). On the S8 plane the frame-level `meta_ship_owner_phase_ns.
 //! dispatch` is that hop's `total` on every single-chain frame.
 //!
-//! **The lever** (`SQUEEZEFS_META_SHIP_INLINE_SERVE`, default on): execute
-//! on the ACCEPTING venue — the connection's thread is dedicated and
-//! parked for exactly this reply, so the frame's future is polled there
+//! **The lever** (`SQUEEZEFS_META_SHIP_INLINE_SERVE`, ships OFF): `1` =
+//! execute on the ACCEPTING venue — the connection's thread is dedicated
+//! and parked for exactly this reply, so the frame's future is polled there
 //! and every wake inside it (the conveyor's fan-out, a 4a guard, a
 //! blocking hop) unparks that thread directly. `queue_hop` and `wake_hop`
 //! are 0 by construction, and the engagement pair `meta_ship.
 //! owner_dispatch_{inline,hops}` says which arm served. `0` = the shipped
-//! hop (the same-binary A/B control). Everything the hop carried is
+//! hop — the default since the 2026-09-08 squeeze-test fleet row priced
+//! the inline venue's `run` 0.6–0.9 ms slower than the hops it deletes
+//! (`src/meta_ship/mod.rs`, the dispatch section). Every contract below
+//! sets the arm it judges explicitly. Everything the hop carried is
 //! preserved and pinned here: chain order, the dedup window, one conveyor
 //! group per publish frame, and the STATUS_PANIC containment (a verb that
 //! unwinds on the accepting venue answers PANIC and the session survives).

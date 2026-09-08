@@ -1580,6 +1580,68 @@ const FREE_SHIP_ATTEMPTS: u32 = 3;
 /// commands, no accounting: a frame key whose free already ran (the
 /// skewed-frame shape) simply has nothing left to purge, instead of coming
 /// back `Refused` on the authority's untracked tripwire.
+/// The lane-free notice targets (publish schema 16): every allocator this
+/// mount engaged a CO-WRITER lane on, by its volume tag — registered at the
+/// engagement ([`register_lane_free_target`], the one act that makes an
+/// allocator a lane's owner on this mount), held weakly so a dropped
+/// allocator is simply skipped.
+static LANE_FREE_TARGETS: once_cell::sync::Lazy<
+    scc::HashMap<u64, std::sync::Weak<crate::block_allocator::BlockAllocator>>,
+> = once_cell::sync::Lazy::new(scc::HashMap::new);
+
+/// Register `alloc` as the notice target for its volume tag (the lane
+/// engagement's act, `alloc_lane_grant::engage_allocator_lane` on the
+/// co-writer posture). A re-engagement of the same volume replaces the
+/// target.
+pub fn register_lane_free_target(alloc: &Arc<crate::block_allocator::BlockAllocator>) {
+    let vol_tag = crate::meta_backend::kv::block_refs::volume_tag(alloc.volume_id());
+    let weak = Arc::downgrade(alloc);
+    match LANE_FREE_TARGETS.entry_sync(vol_tag) {
+        scc::hash_map::Entry::Occupied(mut occ) => *occ.get_mut() = weak,
+        scc::hash_map::Entry::Vacant(vac) => {
+            let _ = vac.insert_entry(weak);
+        }
+    }
+}
+
+/// **Apply a reply frame's lane-free notices** (publish schema 16 — the
+/// co-writer half): for every notice, the lane allocator registered for
+/// its volume releases its local tracking of the block
+/// ([`crate::block_allocator::BlockAllocator::apply_lane_free_notice`]).
+/// Runs in the publish client's frame shipper BEFORE any of the frame's
+/// outcomes reaches its caller — so a harvest grant in the same frame is
+/// adopted only after the notices its blocks' frees queued have released
+/// the stale entries, and `claim_block_idx` finds nothing lingering.
+pub fn apply_lane_free_notices(notices: &[crate::meta_ship::publish::WireLaneFree]) {
+    for n in notices {
+        let Some(alloc) = LANE_FREE_TARGETS
+            .read_sync(&n.vol_tag, |_, w| w.upgrade())
+            .flatten()
+        else {
+            log::debug!(
+                "lane-free notice for block {} on vol_tag {:#016x} names a volume this mount \
+                 engages no lane on — ignored",
+                n.block_idx,
+                n.vol_tag
+            );
+            continue;
+        };
+        match alloc.apply_lane_free_notice(n.block_idx, n.after_grants) {
+            crate::block_allocator::LaneFreeNotice::Released => {
+                crate::fuse_client::METRICS
+                    .cowriter_lane_free_notices
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            crate::block_allocator::LaneFreeNotice::ReMinted => {
+                crate::fuse_client::METRICS
+                    .cowriter_lane_free_notices_reminted
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            crate::block_allocator::LaneFreeNotice::Untracked => {}
+        }
+    }
+}
+
 /// One parked key's verdict under
 /// `DataRouter::retire_recomputed_parked`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

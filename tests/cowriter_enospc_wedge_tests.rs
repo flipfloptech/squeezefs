@@ -170,6 +170,7 @@ impl EmptyAuthority {
                     bound_age_hint_ms: me.hint_ms.load(Ordering::Relaxed),
                     rtt_ms: 1,
                     release_ages_ms: Vec::new(),
+                    grant_seq: 0,
                 })
             })
         })

@@ -36,7 +36,7 @@ use libfuzzer_sys::fuzz_target;
 use squeezefs::meta_ship::publish::{
     decode_reply_frame, decode_request_frame, encode_reply_frame, encode_request_frame,
     FreeVerdict, PublishCall, PublishCallOutcome, PublishReply, PublishReplyFrame,
-    PublishRequestFrame, WireBlockRefOp, WireFreedBlock, PUBLISH_SCHEMA,
+    PublishRequestFrame, WireBlockRefOp, WireFreedBlock, WireLaneFree, PUBLISH_SCHEMA,
 };
 use squeezefs::meta_ship::wire::{WireDirEntry, WireError, WireInode};
 
@@ -434,6 +434,7 @@ enum ArbReply {
         blocks: Vec<u64>,
         bound_age_ms: u64,
         release_ages_ms: Vec<u64>,
+        grant_seq: u64,
     },
     Populations(Vec<u64>),
     MapMigrated {
@@ -444,6 +445,15 @@ enum ArbReply {
         freed: Vec<ArbFreed>,
         gen: u64,
     },
+}
+
+/// The schema-16 lane-free notice — the durable identity pair plus the
+/// grant-sequence witness.
+#[derive(Arbitrary, Debug)]
+struct ArbLaneFree {
+    vol_tag: u64,
+    block_idx: u64,
+    after_grants: u64,
 }
 
 #[derive(Arbitrary, Debug)]
@@ -463,6 +473,7 @@ struct ArbInput {
     client: String,
     calls: Vec<ArbCall>,
     outcomes: Vec<ArbOutcome>,
+    lane_frees: Vec<ArbLaneFree>,
 }
 
 fn reply_from(r: ArbReply) -> PublishReply {
@@ -545,10 +556,12 @@ fn reply_from(r: ArbReply) -> PublishReply {
             blocks,
             bound_age_ms,
             release_ages_ms,
+            grant_seq,
         } => PublishReply::LaneFreeGrant {
             blocks,
             bound_age_ms,
             release_ages_ms,
+            grant_seq,
         },
         ArbReply::Populations(p) => PublishReply::Populations(p),
         ArbReply::MapMigrated {
@@ -617,6 +630,15 @@ fuzz_target!(|data: &[u8]| {
                 ArbOutcome::Refused { status, detail } => {
                     PublishCallOutcome::Refused { status, detail }
                 }
+            })
+            .collect(),
+        lane_frees: input
+            .lane_frees
+            .into_iter()
+            .map(|n| WireLaneFree {
+                vol_tag: n.vol_tag,
+                block_idx: n.block_idx,
+                after_grants: n.after_grants,
             })
             .collect(),
     };

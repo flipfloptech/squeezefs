@@ -13669,7 +13669,8 @@ impl DataRouter {
                 // shipped-free ladder post-guard (RES-1), post-commit
                 // (§5.2).
                 if !local_released.is_empty() {
-                    crate::meta_ship::publish::free_recomputed_releases(ino, local_released).await;
+                    crate::meta_ship::publish::free_recomputed_releases(ino, local_released, None)
+                        .await;
                 }
                 // Finding 36 (half 2, the epoch face): a covering publish
                 // whose accounting was recomputed owns these device frees
@@ -14466,7 +14467,7 @@ impl DataRouter {
         // guard dropped (RES-1) and strictly after the commit (§5.2).
         let (owner_recomputed, local_released) = save_res?;
         if !local_released.is_empty() {
-            crate::meta_ship::publish::free_recomputed_releases(ino, local_released).await;
+            crate::meta_ship::publish::free_recomputed_releases(ino, local_released, None).await;
         }
         if owner_recomputed {
             crate::cowriter::retire_displaced_locally(&self.backend_router, &displaced);
@@ -14980,7 +14981,7 @@ impl DataRouter {
         // shipped-free ladder strictly after the 3.5 guard dropped
         // (RES-1) and strictly after the commit (§5.2).
         if !local_released.is_empty() {
-            crate::meta_ship::publish::free_recomputed_releases(ino, local_released).await;
+            crate::meta_ship::publish::free_recomputed_releases(ino, local_released, None).await;
         }
     }
 

@@ -516,6 +516,12 @@ pub struct LaneHarvest {
     /// — the lane-visible ledger's `released_served` stage (finding 15
     /// term 2). Empty from a sink that carries none.
     pub release_ages_ms: Vec<u64>,
+    /// The authority's per-client grant sequence this grant was served
+    /// under (publish schema 16) — the tag the adopted blocks carry so a
+    /// later lane-free notice below it is read as the offset's PREVIOUS
+    /// lifetime. `0` from a sink that carries none (an untagged adoption
+    /// never shields a re-mint).
+    pub grant_seq: u64,
 }
 
 pub type LaneHarvestSink = Arc<
@@ -575,6 +581,7 @@ pub fn routed_harvest_sink(volume_id: &str, part: AppendPartition) -> LaneHarves
                             bound_age_hint_ms: grant.bound_age_ms,
                             rtt_ms: t0.elapsed().as_millis() as u64,
                             release_ages_ms: grant.release_ages_ms,
+                            grant_seq: grant.grant_seq,
                         });
                     }
                     Err(e) => {

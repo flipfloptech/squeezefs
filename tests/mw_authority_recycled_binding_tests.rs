@@ -1892,3 +1892,114 @@ async fn a_harvest_that_hands_back_an_authority_freed_block_carries_its_notice_f
     recycle(&sc, handed_out).await;
     teardown(sc).await;
 }
+
+/// Contract (the notice's INVERSE — a lifetime, never an offset): a notice
+/// whose `after_grants` is BELOW the grant sequence this mount re-minted
+/// the offset under names the offset's PREVIOUS lifetime (the reply that
+/// carried it was reordered behind the grant's, across the ship depth's
+/// sessions) and touches nothing — the live entry stays, the tag stays,
+/// `cowriter.lane_free_notices_reminted` counts it; a notice at or above
+/// the grant sequence names THIS lifetime (the authority freed the re-mint
+/// too) and releases it. Driven through the co-writer's apply function on
+/// the offsets the harvest tagged.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_lane_free_notice_below_the_offsets_grant_sequence_touches_nothing() {
+    let _serial = serial();
+    let _restore = restore();
+    let dir = TempDir::new().unwrap();
+    let sc = assembler_fold(dir.path(), "assembler-fold-inverse", &[3]).await;
+    let handed_out = reclaim_victims(&sc).await;
+    let (_, idx) = sc.victims[0];
+    let off = idx * sc.bs;
+    let tag = sc
+        .cwr
+        .alloc
+        .harvest_grant_tag(idx)
+        .expect("the harvest tagged the re-minted lifetime with its grant sequence");
+    assert!(tag >= 1, "a served grant's sequence is 1-based: {tag}");
+    assert_eq!(
+        sc.cwr.alloc.refcount(off),
+        Some(1),
+        "premise: the re-mint is tracked"
+    );
+    let vol_tag = volume_tag(DATA_VOL);
+    let applied_before = METRICS.cowriter_lane_free_notices.load(Ordering::Relaxed);
+    let reminted_before = METRICS
+        .cowriter_lane_free_notices_reminted
+        .load(Ordering::Relaxed);
+
+    // A notice from BEFORE the grant (the reordered reply): untouched.
+    cowriter::apply_lane_free_notices(&[publish::WireLaneFree {
+        vol_tag,
+        block_idx: idx,
+        after_grants: tag - 1,
+    }]);
+    assert_eq!(
+        sc.cwr.alloc.refcount(off),
+        Some(1),
+        "the live re-minted lifetime's entry is untouched by a notice older than its grant"
+    );
+    assert_eq!(
+        sc.cwr.alloc.harvest_grant_tag(idx),
+        Some(tag),
+        "its tag stays"
+    );
+    assert_eq!(
+        METRICS
+            .cowriter_lane_free_notices_reminted
+            .load(Ordering::Relaxed)
+            - reminted_before,
+        1,
+        "the reorder guard counted the skip"
+    );
+    assert_eq!(
+        METRICS.cowriter_lane_free_notices.load(Ordering::Relaxed) - applied_before,
+        0
+    );
+
+    // A notice from AFTER the grant (the authority freed the re-mint too):
+    // released, the tag pruned with the lifetime.
+    cowriter::apply_lane_free_notices(&[publish::WireLaneFree {
+        vol_tag,
+        block_idx: idx,
+        after_grants: tag,
+    }]);
+    assert_eq!(
+        sc.cwr.alloc.refcount(off),
+        None,
+        "a notice at or above the grant sequence names this lifetime and releases it"
+    );
+    assert_eq!(
+        sc.cwr.alloc.harvest_grant_tag(idx),
+        None,
+        "the tag died with the lifetime"
+    );
+    assert_eq!(
+        METRICS.cowriter_lane_free_notices.load(Ordering::Relaxed) - applied_before,
+        1
+    );
+    // A repeat is a no-op (untracked), counted on neither gauge.
+    cowriter::apply_lane_free_notices(&[publish::WireLaneFree {
+        vol_tag,
+        block_idx: idx,
+        after_grants: tag,
+    }]);
+    assert_eq!(
+        METRICS.cowriter_lane_free_notices.load(Ordering::Relaxed) - applied_before,
+        1
+    );
+    assert_eq!(
+        METRICS
+            .cowriter_lane_free_notices_reminted
+            .load(Ordering::Relaxed)
+            - reminted_before,
+        1
+    );
+
+    // The staged re-mint's entry is gone; hand the rest back and stop
+    // (the victim itself was released above — recycling it again would
+    // double-list it).
+    let rest: Vec<u64> = handed_out.into_iter().filter(|o| *o != off).collect();
+    recycle(&sc, rest).await;
+    teardown(sc).await;
+}

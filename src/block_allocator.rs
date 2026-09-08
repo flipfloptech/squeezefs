@@ -202,6 +202,21 @@ pub enum PinOutcome {
     Refused,
 }
 
+/// Outcome of [`BlockAllocator::apply_lane_free_notice`] (publish schema
+/// 16).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LaneFreeNotice {
+    /// The offset's local tracking released (`cowriter.lane_free_notices`).
+    Released,
+    /// The offset was re-minted here from a grant served AFTER the notice
+    /// was queued — the live lifetime is untouched
+    /// (`cowriter.lane_free_notices_reminted`).
+    ReMinted,
+    /// No local tracking existed (a foreign predecessor, or a lifetime some
+    /// other arm already retired).
+    Untracked,
+}
+
 pub struct BlockAllocator {
     _volume_id: Box<str>,
     chunk_size: u64,
@@ -377,6 +392,15 @@ pub struct BlockAllocator {
     /// (`crate::free_grace::lane_supply_witnessed`); this word alone would
     /// leave every recomputed block reachable only from an ENOSPC park.
     lane_owed: AtomicU64,
+    /// Publish schema 16: per harvested block index, the authority's
+    /// per-client grant sequence it was adopted under
+    /// ([`Self::adopt_lane_free_grant_at`]) — the ordering witness a
+    /// lane-free notice's `after_grants` is compared against
+    /// ([`Self::apply_lane_free_notice`]). An entry lives as long as the
+    /// lifetime it tags: pruned when the local tracking retires, releases
+    /// to zero, or recycles. Fresh mints carry no tag (a fresh offset was
+    /// never handed out, so no notice can be ordered after its grant).
+    harvest_grants: scc::HashMap<u64, u64>,
     /// Owed-ledger ARRIVALS (+1 per [`Self::note_owed_freed`]) — this
     /// allocator's half of the single-flight harvest's decline witness
     /// ([`Self::supply_witness_gen`]): the owed word itself falls at
@@ -788,6 +812,7 @@ impl BlockAllocator {
             quarantine: crate::data_custody::BlockQuarantine::new(),
             grace: crate::free_grace::GraceRing::derived(),
             lane_owed: AtomicU64::new(0),
+            harvest_grants: scc::HashMap::new(),
             owed_arrivals: AtomicU64::new(0),
             horizon_composed_ms: AtomicU64::new(0),
             alloc_claims: AtomicU64::new(0),
@@ -2068,8 +2093,22 @@ impl BlockAllocator {
     /// with nobody's). A foreign-lane index is refused loud (the authority
     /// mis-serving a lane is exactly the collision the partition forbids);
     /// a duplicate is refused loud (a double handout is the two-owners
-    /// lineage). Returns the count adopted.
+    /// lineage). Returns the count adopted. The untagged form (grant
+    /// sequence 0 — a lifetime no lane-free notice can ever be ordered
+    /// after); the harvest RPC adopts through
+    /// [`Self::adopt_lane_free_grant_at`].
     pub fn adopt_lane_free_grant(&self, block_idxs: &[u64]) -> u64 {
+        self.adopt_lane_free_grant_at(block_idxs, 0)
+    }
+
+    /// [`Self::adopt_lane_free_grant`] under the authority's per-client
+    /// `grant_seq` (publish schema 16): every adopted block is tagged with
+    /// it BEFORE it reaches the free list, so a lane-free notice whose
+    /// `after_grants` is below the tag is recognised as naming the offset's
+    /// PREVIOUS lifetime — the one this grant replaced — and touches
+    /// nothing ([`Self::apply_lane_free_notice`]). A tag of 0 records
+    /// nothing.
+    pub fn adopt_lane_free_grant_at(&self, block_idxs: &[u64], grant_seq: u64) -> u64 {
         let mut adopted = 0u64;
         for idx in block_idxs {
             if !self.lane_is_ours(*idx) {
@@ -2079,6 +2118,14 @@ impl BlockAllocator {
                     self._volume_id
                 );
                 continue;
+            }
+            if grant_seq != 0 {
+                match self.harvest_grants.entry_sync(*idx) {
+                    scc::hash_map::Entry::Occupied(mut occ) => *occ.get_mut() = grant_seq,
+                    scc::hash_map::Entry::Vacant(vac) => {
+                        let _ = vac.insert_entry(grant_seq);
+                    }
+                }
             }
             if !self.free_blocks.insert(*idx) {
                 log::error!(
@@ -2612,7 +2659,7 @@ impl BlockAllocator {
                 // OQ 2: every harvest reply refreshes the refill horizon —
                 // the measured loop latency plus this trip's own RTT.
                 self.note_harvest_hint(harvest.bound_age_hint_ms, harvest.rtt_ms);
-                let adopted = self.adopt_lane_free_grant(&harvest.blocks);
+                let adopted = self.adopt_lane_free_grant_at(&harvest.blocks, harvest.grant_seq);
                 // The lane-visible ledger's co-writer half (finding 15
                 // term 2): each adopted block's wait on the authority's
                 // list (as the authority measured it) beside this trip's
@@ -2652,6 +2699,9 @@ impl BlockAllocator {
     /// [`Self::release_shipped_free_tracking`].
     pub fn retire_shipped_free_tracking(&self, offset: u64) {
         let _ = self.refcounts.remove_sync(&offset);
+        let _ = self
+            .harvest_grants
+            .remove_sync(&(offset / self.chunk_size.max(1)));
         self.mark_incarnation_unstable(offset);
         // Finding 30: restore stability under a NEW generation (the W1
         // patch-fence idiom) — the poison above already invalidated every
@@ -2683,7 +2733,51 @@ impl BlockAllocator {
             .unwrap_or(false);
         if drop_entry {
             let _ = self.refcounts.remove_sync(&offset);
+            let _ = self
+                .harvest_grants
+                .remove_sync(&(offset / self.chunk_size.max(1)));
         }
+    }
+
+    /// **Apply one lane-free notice** (publish schema 16 — the AUTHORITY
+    /// freed a block of this mount's lane through its OWN publish, a free no
+    /// served reply names: the assembler's fold of this mount's shipped
+    /// slices on the fleet). The offset's reference this mount held is gone
+    /// on the authority, so its local tracking releases — the
+    /// `retire_displaced_locally` decrement, never the incarnation word
+    /// (the notice precedes the ladder's verdict, and a NonTerminal block's
+    /// word must stay). The one guard is the LIFETIME: an offset whose
+    /// harvest-grant tag is ABOVE `after_grants` was re-minted here from a
+    /// grant the authority served after queuing the notice (the reply
+    /// carrying the notice was reordered behind the grant's) — the live
+    /// lifetime is touched by nobody.
+    pub fn apply_lane_free_notice(&self, block_idx: u64, after_grants: u64) -> LaneFreeNotice {
+        let offset = block_idx.saturating_mul(self.chunk_size);
+        let tag = self
+            .harvest_grants
+            .read_sync(&block_idx, |_, g| *g)
+            .unwrap_or(0);
+        if tag > after_grants {
+            log::debug!(
+                "lane-free notice for block {block_idx} on volume '{}' names a previous \
+                 lifetime (re-minted under grant {tag} > notice's {after_grants}); the live \
+                 lifetime is untouched",
+                self._volume_id
+            );
+            return LaneFreeNotice::ReMinted;
+        }
+        if self.refcount(offset).is_none() {
+            return LaneFreeNotice::Untracked;
+        }
+        self.release_shipped_free_tracking(offset);
+        LaneFreeNotice::Released
+    }
+
+    /// The harvest-grant tag block `block_idx`'s live lifetime carries
+    /// (`None` = a fresh mint or an untagged adoption) — the instrument the
+    /// notice pins read.
+    pub fn harvest_grant_tag(&self, block_idx: u64) -> Option<u64> {
+        self.harvest_grants.read_sync(&block_idx, |_, g| *g)
     }
 
     /// W1 patch fence, steps 1a+1b of the §5.1 mechanism (the normative
@@ -3772,6 +3866,7 @@ impl BlockAllocator {
                 && !crate::data_custody::poisoned()
             {
                 let _ = self.refcounts.remove_sync(&offset);
+                let _ = self.harvest_grants.remove_sync(&idx);
                 self.mark_incarnation_unstable(offset);
                 if self.free_blocks.insert(idx) {
                     crate::fuse_client::METRICS

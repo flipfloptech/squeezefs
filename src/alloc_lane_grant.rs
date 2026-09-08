@@ -335,6 +335,11 @@ pub async fn engage_allocator_lane(
             alloc.volume_id(),
             part,
         ));
+        // Publish schema 16: the same engagement makes this allocator the
+        // target of the authority's lane-free notices for its volume — the
+        // frees the authority's OWN publishes perform on this lane's
+        // blocks, which no served reply can carry.
+        crate::cowriter::register_lane_free_target(alloc);
         // The ahead-of-stall refill task (design-free-grace-sustain §5.5,
         // PR 4): single-flight per volume BY CONSTRUCTION (one task per
         // laned co-writer engagement), off the allocation path — it

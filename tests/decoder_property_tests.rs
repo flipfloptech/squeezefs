@@ -47,7 +47,7 @@ use squeezefs::meta_backend::kv::superblock::SuperblockV3;
 use squeezefs::meta_ship::publish::{
     decode_reply_frame, decode_request_frame, encode_reply_frame, encode_request_frame,
     PublishCall, PublishCallOutcome, PublishReply, PublishReplyFrame, PublishRequestFrame,
-    WireBlockRefOp, WireFreedBlock, PUBLISH_SCHEMA,
+    WireBlockRefOp, WireFreedBlock, WireLaneFree, PUBLISH_SCHEMA,
 };
 use squeezefs::meta_ship::wire::{
     decode_reclaim, decode_reply, decode_request, encode_reclaim, ReclaimFrame, WireError,
@@ -640,12 +640,18 @@ proptest! {
     }
 
     /// A publish reply frame round-trips one outcome per call, `MapMigrated
-    /// { recomputed, gen, … }` included.
+    /// { recomputed, gen, … }` included, plus its lane-free notices.
     #[test]
     fn publish_reply_frame_round_trips(
         outcomes in prop::collection::vec(arb_publish_outcome(), 0..6),
+        lane_frees in prop::collection::vec(
+            (any::<u64>(), any::<u64>(), any::<u64>()).prop_map(
+                |(vol_tag, block_idx, after_grants)| WireLaneFree { vol_tag, block_idx, after_grants }
+            ),
+            0..6,
+        ),
     ) {
-        let frame = PublishReplyFrame { schema: PUBLISH_SCHEMA, outcomes };
+        let frame = PublishReplyFrame { schema: PUBLISH_SCHEMA, outcomes, lane_frees };
         let enc = encode_reply_frame(&frame).expect("encodes");
         prop_assert_eq!(decode_reply_frame(&enc).expect("decodes"), frame);
     }

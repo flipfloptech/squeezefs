@@ -1800,10 +1800,10 @@ async fn a_peer_speaking_the_previous_publish_schema_is_refused_at_the_first_fra
     std::env::remove_var("SQUEEZEFS_DEFAULT_BLOCK_SIZE");
     assert_eq!(
         publish::PUBLISH_SCHEMA,
-        15,
-        "the freed set joined the recompute replies at the schema-15 bump (KD-7: a \
-         mixed-commit fleet must fail loud, not read an absent field as empty); the next \
-         vocabulary change re-pins this"
+        16,
+        "the freed set joined the recompute replies at the schema-15 bump and the reply \
+         frame's lane-free notices at 16 (KD-7: a mixed-commit fleet must fail loud, not \
+         read an absent field as empty); the next vocabulary change re-pins this"
     );
     let dir = TempDir::new().unwrap();
     let vol = fresh_volume(dir.path(), "schema-peer").await;

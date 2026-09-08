@@ -341,6 +341,7 @@ fn authority_sink(auth: &Arc<BlockAllocator>, lane: u16, writers: u16) -> LaneHa
                 bound_age_hint_ms: free_grace::bound_age_ms(),
                 rtt_ms: 2,
                 release_ages_ms,
+                grant_seq: 0,
             })
         })
     })

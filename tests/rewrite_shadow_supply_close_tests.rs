@@ -136,6 +136,7 @@ impl EmptyAuthority {
                     bound_age_hint_ms: 0,
                     rtt_ms: 1,
                     release_ages_ms: Vec::new(),
+                    grant_seq: 0,
                 })
             })
         })

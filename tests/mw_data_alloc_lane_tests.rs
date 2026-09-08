@@ -1239,6 +1239,7 @@ impl Supply {
                     bound_age_hint_ms: 0,
                     rtt_ms: 1,
                     release_ages_ms: Vec::new(),
+                    grant_seq: 0,
                 })
             })
         })
@@ -1557,6 +1558,7 @@ impl GatedSupply {
                     blocks,
                     bound_age_hint_ms: me.hint_ms,
                     rtt_ms: 1,
+                    grant_seq: 0,
                 })
             })
         })

@@ -652,7 +652,34 @@ lane"* is structural rather than a convention.
   Keys the owner did not free (NonTerminal, refused, out of custody) stay
   parked for the close's existing arm. Leaving the park also un-counts the
   key from the supply-coupled close's yield estimate (`parked_bytes`),
-  which had been counting blocks the authority already held free;
+  which had been counting blocks the authority already held free. The
+  **third arm** is the authority's OWN publish displacing a co-writer's
+  block — the S11 assembler's fold of the co-writer's shipped slices
+  (`fold_upload_block` → the range-episode compose → `free_recomputed_
+  releases`), a free no served reply can carry because no call of the
+  co-writer's produced it; on the day-2 fleet it was ≈ 100 % of the fpp
+  phases' `block_claim_anomalies` (the count within ±7 % of the authority's
+  `fold_passes`, `.benchmarks/2026-09-07-cowriter-claim-anomaly-
+  population.md`). Since publish schema 16 the authority keeps a
+  per-client **lane-free notice** ledger — `WireLaneFree { vol_tag,
+  block_idx, after_grants }`, queued BEFORE the free ladder runs by
+  `note_lane_frees` for every released block in another co-writer's lane
+  (the served requester's own blocks ride the per-call `freed` set) — and
+  drains it into EVERY reply frame to that client
+  (`PublishReplyFrame::lane_frees`), so the reply that hands an offset back
+  through a harvest was built after its notice was queued and carries it;
+  the co-writer applies a frame's notices before any outcome reaches its
+  caller (`cowriter::apply_lane_free_notices` → the lane allocator
+  registered at the engagement → `apply_lane_free_notice`, the
+  `retire_displaced_locally` decrement — the notice precedes the verdict,
+  so never the word; `cowriter.lane_free_notices`). The inverse is a grant
+  sequence: `LaneFreeGrant.grant_seq` (bumped strictly after the harvest
+  executor hands out, part of the dedup-cached outcome) tags every adopted
+  block, and a notice whose `after_grants` is below the tag names a
+  lifetime this mount already re-minted from a later grant and touches
+  nothing (`cowriter.lane_free_notices_reminted` ≈ 0). Not a harvest mark:
+  the party that freed reports the free to the lane's owner on the plane's
+  next reply, and the claim tripwire keeps its meaning;
 * a raise that cannot be made durable **gives the offset back** — and on a
   co-writer that give-back is itself refused (a free), so the index is skipped
   rather than returned. Bounded by raise failures, which are loud

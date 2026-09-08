@@ -234,7 +234,7 @@ the root/fleet rigs, `task check:fuse3`, `task audit`.
   on every co-writer across all four phases, `cowriter.recomputed_retires`
   ≈ the authority's own-lane `free_recomputed_blocks` share, the s11 gate
   unchanged) runs on squeeze-test, A-B-B-A, the parent's — dev-box rows are
-  scoping evidence only (2026-09-07 venue ruling).
+  scoping evidence only (2026-09-07 venue ruling). **Run — see §8.**
 * **The lane ENOSPC refusals** (7–16 k per fpp phase, the parent's other
   residue) — unchanged by design here; the supply-coupled close's now-honest
   yield estimate may move them and must be measured, not assumed.
@@ -245,3 +245,27 @@ the root/fleet rigs, `task check:fuse3`, `task audit`.
   onto the freed set is a follow-on, not a correctness item.
 * **A 14-speaker.** A mixed-commit fleet fails loud at the first publish
   frame (KD-7); there is no compatibility shim and none is owed.
+
+## 8. Fleet verdict — RUN 2026-09-07 (row 1D of a D-C-C-D on squeeze-test, D = `0bd03455`): the retire engaged, the gauge did not move
+
+| gauge | 1D (this mechanism) | 2C / 3C (without) |
+|---|---|---|
+| `cowriter.recomputed_retires` Σ8 over A1/B1/B2/A2 | **21,386 / 5,555 / 7,338 / 8,871** — the mechanism engages exactly as its contract says | 0 |
+| `block_claim_anomalies` Σ8 | **0 / 1,108 / 1,117 / 73** | 0 / 1,478 / 1,411 / 67 · 2 / 1,035 / 956 / 58 |
+| tripwires, stale refusals, fsck, the s11 gate | 0 / 0 / clean / pass | same |
+
+**Verdict — the parked-key retire is correct and necessary and is NOT
+the fleet's population.** §2's elimination was right about the ARM (the
+recompute's `free_recomputed_releases`) and wrong about its CALLER: it
+read `free_recomputed_blocks` as the SERVED arm's gauge, and that gauge
+also counts the authority-local arm — the assembler's fold of a
+co-writer's shipped slices, whose local recompute frees the co-writer's
+displaced block through a publish the co-writer never issued and no reply
+names. On every fpp phase of three rows the anomaly count sits within ±7 %
+of the authority's `fold_passes`. That population, its fix (publish
+schema 16 — every reply frame carries the authority's lane-free notices,
+queued before the ladder runs) and its contracts are
+`.benchmarks/2026-09-07-cowriter-claim-anomaly-population.md`. What
+schema 15 closed stays closed: a parked key the SERVED recompute frees
+mid-epoch reaches the co-writer at that reply, and on the D row 5.5–8.9 k
+per phase did.

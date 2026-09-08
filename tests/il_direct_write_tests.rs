@@ -712,7 +712,11 @@ fn warm_direct_lane(session: &ClientSession, binding: u64, base: &mut [u8], offs
         base[off as usize..off as usize + 4096].copy_from_slice(&p);
         if delta!(snap(), before, dd_serves) == 1 {
             wait_counter_at_least(
-                &|| METRICS.ipc_dd_write_times_dispatches.load(Ordering::Relaxed),
+                &|| {
+                    METRICS
+                        .ipc_dd_write_times_dispatches
+                        .load(Ordering::Relaxed)
+                },
                 before.dd_times_dispatches + 1,
                 "the warm batch's deferred times-park dispatch never landed",
             );
@@ -1623,7 +1627,11 @@ async fn drain_batch_coalesces_the_times_park_dispatch() {
         // its 1 off the warm-up batch's late tail while this batch's own
         // tail landed after the snapshot; the 2026-09-08 gate read both.)
         wait_counter_at_least(
-            &|| METRICS.ipc_dd_write_times_dispatches.load(Ordering::Relaxed),
+            &|| {
+                METRICS
+                    .ipc_dd_write_times_dispatches
+                    .load(Ordering::Relaxed)
+            },
             before.dd_times_dispatches + 1,
             "the batch's times-park dispatch never landed",
         );

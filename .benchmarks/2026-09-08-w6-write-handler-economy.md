@@ -3,7 +3,9 @@
 **Branch** `perf/write-handler-economy` (worktree off dev `36d517f3`). RED
 `33b977a1` → lever A `1eeacaac` (alloc diet) → lever C `40f99e6d` (ranged
 gap seed) → lever B `ea9b26b5` (striped per-op words) → lever D `370e981f`
-(zc slot connection vehicle) → benches + docs (this note's commit).
+(zc slot connection vehicle) → benches + docs `06244f2d` → the
+derivation tie test for `transport_inflight_ceiling` `79ec0789`
+(`tests/derivation_sweep_tests.rs`).
 Campaign: `docs/design-e2e-perf-audit.md` §3.4 Tier 3 **Write #7** ("per-
 WRITE 4 Box + 4 Arc slot closures, per-block `String`s, ~30 atomics") and
 **Write #10** ("gap seeding re-reads the whole old block"), §5.3 ladder

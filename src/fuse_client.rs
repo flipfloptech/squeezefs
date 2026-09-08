@@ -4959,80 +4959,6 @@ impl ShardedAtomic {
     }
 }
 
-/// A per-thread-striped `LatencyHistogram` for the per-op histograms on
-/// the WRITE hot path (W-6, e2e perf audit write board #7 — the PERF-3 /
-/// R-4 argument applied to the handler: a `record` is three RMWs, and a
-/// tight distribution lands nearly every op of a class in the SAME bucket
-/// word, so the inode-lock wait/hold and block-lock wait histograms were
-/// ~15 process-global RMWs per write on lines every handler lane shared —
-/// `Align64` stops false sharing, not TRUE sharing). Each thread records
-/// into its [`ShardedAtomic`] stripe (one uncontended RMW triple on a
-/// core-local line); every reader folds the stripes, so the exported
-/// histogram — buckets, exact `count` / `sum_ns`, p99 — is unchanged
-/// (addition commutes; a fold mid-record can miss a just-recorded sample
-/// exactly as a single histogram could). 64 stripes × 28 words = 14 KiB
-/// per histogram, heap-allocated at first use.
-pub struct ShardedLatencyHistogram {
-    stripes: Box<[LatencyHistogram]>,
-}
-
-impl Default for ShardedLatencyHistogram {
-    fn default() -> Self {
-        Self {
-            stripes: (0..SHARDED_ATOMIC_STRIPES)
-                .map(|_| LatencyHistogram::default())
-                .collect(),
-        }
-    }
-}
-
-impl ShardedLatencyHistogram {
-    /// Record on this thread's stripe (three relaxed RMWs, core-local).
-    #[inline]
-    pub fn record(&self, duration: Duration) {
-        self.stripes[ShardedAtomic::stripe_index()].record(duration);
-    }
-
-    /// The folded bucket counts (index-aligned with
-    /// `latency_core::LATENCY_BUCKET_LABELS`).
-    pub fn buckets(&self) -> [u64; crate::latency_core::LATENCY_BUCKETS] {
-        let mut out = [0u64; crate::latency_core::LATENCY_BUCKETS];
-        for s in self.stripes.iter() {
-            for (o, b) in out.iter_mut().zip(s.buckets.iter()) {
-                *o += b.load(Ordering::Relaxed);
-            }
-        }
-        out
-    }
-
-    /// Spans recorded (exact, folded).
-    pub fn count(&self) -> u64 {
-        self.stripes.iter().map(LatencyHistogram::count).sum()
-    }
-
-    /// Σ recorded spans, ns (exact, folded).
-    pub fn sum_ns(&self) -> u64 {
-        self.stripes.iter().map(LatencyHistogram::sum_ns).sum()
-    }
-
-    /// `sum_ns / count` (0 on an empty histogram).
-    pub fn mean_ns(&self) -> u64 {
-        self.sum_ns().checked_div(self.count()).unwrap_or(0)
-    }
-
-    /// Zero every stripe's words (the one reset path — see
-    /// [`LatencyHistogram::reset`]).
-    pub fn reset(&self) {
-        for s in self.stripes.iter() {
-            s.reset();
-        }
-    }
-
-    pub fn to_json(&self) -> serde_json::Value {
-        histogram_json(&self.buckets(), self.count(), self.sum_ns())
-    }
-}
-
 /// The per-thread-striped [`QueueDepthHistogram`] (W-6 — the writeback
 /// queue-depth sample every WRITE records; same fold law as
 /// [`ShardedLatencyHistogram`]).
@@ -5054,7 +4980,7 @@ impl ShardedQueueDepthHistogram {
     /// Record on this thread's stripe (one relaxed RMW, core-local).
     #[inline]
     pub fn record(&self, depth: usize) {
-        self.stripes[ShardedAtomic::stripe_index()].record(depth);
+        self.stripes[sharded_stripe_index()].record(depth);
     }
 
     pub fn to_json(&self) -> serde_json::Value {
@@ -5288,15 +5214,21 @@ impl ShardedLatencyHistogram {
         self.stripes().iter().map(|s| s.0.sum_ns()).sum()
     }
 
-    /// The fold, rendered through the ONE histogram export shape.
-    pub fn to_json(&self) -> serde_json::Value {
+    /// The folded bucket counts (index-aligned with
+    /// `latency_core::LATENCY_BUCKET_LABELS`; exact — Σ over stripes).
+    pub fn buckets(&self) -> [u64; crate::latency_core::LATENCY_BUCKETS] {
         let mut buckets = [0u64; crate::latency_core::LATENCY_BUCKETS];
         for s in self.stripes() {
             for (b, a) in buckets.iter_mut().zip(s.0.buckets.iter()) {
                 *b += a.load(Ordering::Relaxed);
             }
         }
-        histogram_json(&buckets, self.count(), self.sum_ns())
+        buckets
+    }
+
+    /// The fold, rendered through the ONE histogram export shape.
+    pub fn to_json(&self) -> serde_json::Value {
+        histogram_json(&self.buckets(), self.count(), self.sum_ns())
     }
 }
 

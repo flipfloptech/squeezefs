@@ -47,11 +47,24 @@
 //!    lanes locally dry, the allocation harvests the volume the authority
 //!    holds blocks on; the pushed refill asks a DRY volume on a hint even
 //!    when it is owed nothing, and never a stocked one it is owed nothing on;
-//!    the ahead refill treats the hint as evidence beside the owed ledger.
+//!    the ahead refill treats the hint as evidence beside the owed ledger;
+//! 8. **a trim claim window is reachable supply, not a deficit**
+//!    (`.benchmarks/2026-09-08-placement-refresh-race.md`): the KD-4.4 trim
+//!    protocol takes a debt offset OUT of the free list for one device
+//!    command and puts it back, and the allocation funnel PARKS on that
+//!    window's return edge rather than refusing — so the lane-reachable
+//!    count, the §5.9 weight it feeds and every watermark decision read the
+//!    windowed blocks as supply; the membership-exact lane-owned count (the
+//!    KD-FG-10 tripwire) still excludes them; the lane recount across an
+//!    open window (an adoption mid-trim) stays exact.
 //!
 //! RED against `dev` (2a486273): `BackendRouter::allocate_placed_block`,
 //! `BlockAllocator::lane_placement_governed` / `lane_share_blocks`, the
 //! lever and the two gauges do not exist; the table weighs device fill.
+//! Contract 8 RED against `36d517f3`: `lane_reachable_blocks` read the
+//! free-list membership, so a refresh during the pressure venue's claim
+//! window weighed the restocked volume by `listed − batch` and banded its
+//! sibling alone (the fpp re-attribution contract's 5/12 flake).
 
 use squeezefs::block_allocator::BlockAllocator;
 use squeezefs::data_alloc_lane::{self as lane, LaneHarvest, LaneHarvestSink};
@@ -1065,4 +1078,217 @@ async fn the_router_names_the_aliased_default_allocator_once() {
         Arc::new(AtomicU64::new(squeezefs::block_allocator::CHUNK_SIZE)),
     );
     assert_eq!(bare.lane_allocators().len(), 1);
+}
+
+// ===========================================================================
+// 8. A trim claim window is reachable supply, not a placement deficit
+// ===========================================================================
+
+/// Contract 8a — the fpp re-attribution contract's numbers
+/// (`rewrite_shadow_supply_close_tests::a_starving_volume_publishes_…`):
+/// A holds 6 of its 32-block share (weight 187), B holds 4 (125), so the
+/// 90 %-of-max cutoff (168) leaves B out of the band. The pressure venue's
+/// claim phase (`drain_debt_sync`, held open by hand — four of A's six
+/// leave the free list for one device command) must move NOTHING the
+/// placement or the watermark decisions read: `lane_reachable_blocks` stays
+/// 6 (the funnel parks on the window's return edge — KD-4.4 contract 9 —
+/// so a claimed offset is pending supply), a refresh DURING the window
+/// weighs A at 187 and bands it alone, and the placed allocation lands on
+/// A's listed remainder with no refusal, park, RPC or failover. The
+/// membership-exact lane-owned count (KD-FG-10's tripwire) reads 2
+/// throughout, and the return edge restores it without moving the gauge.
+///
+/// RED against `36d517f3`: the gauge read the membership, the refresh
+/// weighed A at `2 × 1000 ÷ 32 = 62`, B alone carried the band and the pick
+/// landed on B — deterministically here, 5/12 on the live drainer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_trim_claim_window_is_reachable_supply_not_a_placement_deficit() {
+    let _s = serial();
+    let _r = restore();
+    let rig = rig(true).await;
+    let chunk = rig.a.alloc.chunk_size();
+    let minted_a = rig.a.exhaust().await;
+    let minted_b = rig.b.exhaust().await;
+    rig.a.adopt_locally(&minted_a[..6]);
+    rig.b.adopt_locally(&minted_b[..4]);
+    assert_eq!(
+        rig.a.alloc.lane_reachable_blocks(),
+        6,
+        "premise: A restocked"
+    );
+    assert_eq!(rig.b.alloc.lane_reachable_blocks(), 4, "premise: B's stock");
+    let sum0 = rig.router.lane_reachable_blocks_sum();
+
+    // The claim phase, verbatim: four of A's six leave the free list.
+    let windowed = &minted_a[..4];
+    let claims: Vec<_> = windowed
+        .iter()
+        .map(|idx| {
+            rig.a
+                .alloc
+                .claim_free_for_trim(idx * chunk)
+                .expect("the trim claims a listed block")
+        })
+        .collect();
+    assert_eq!(
+        rig.a.alloc.free_block_indices().len(),
+        2,
+        "premise: four of A's six are inside the claim window"
+    );
+    assert_eq!(
+        rig.a.alloc.lane_reachable_blocks(),
+        6,
+        "the reachable count is the funnel's: a windowed offset comes back \
+         one device command later and the allocation parks for it, so it is \
+         supply, not a deficit"
+    );
+    assert_eq!(
+        rig.a.alloc.lane_owned_free_blocks(),
+        2,
+        "the membership-exact lane-owned count excludes the window (KD-FG-10)"
+    );
+    assert_eq!(
+        rig.a.alloc.foreign_lane_free_blocks(),
+        0,
+        "an owned window is not foreign supply"
+    );
+    assert_eq!(
+        rig.router.lane_reachable_blocks_sum(),
+        sum0,
+        "the router gauge does not dip either"
+    );
+
+    // A refresh while the window is open: the fpp numbers, not `2/32`.
+    rig.router.refresh_placement_table();
+    assert_eq!(
+        weight_of(&rig.router, "volA"),
+        187,
+        "6 × 1000 ÷ 32: the window is invisible to the weight"
+    );
+    assert_eq!(weight_of(&rig.router, "volB"), 125, "4 × 1000 ÷ 32");
+    assert_eq!(
+        band(&rig.router),
+        vec!["volA".to_string()],
+        "B sits under 90 % of A's weight and leaves the band"
+    );
+
+    // The placed allocation reaches A's listed remainder — no park (the
+    // window holds only four of six), no RPC, no failover, no rebuild.
+    let g0 = gauges();
+    let (be_id, alloc, _dev, off) = rig
+        .router
+        .allocate_placed_block()
+        .await
+        .expect("A's listed remainder is reachable at once");
+    assert_eq!(be_id, "volA", "the pick reached the restocked volume");
+    assert!(Arc::ptr_eq(&alloc, &rig.a.alloc));
+    assert!(
+        !windowed.contains(&(off / chunk)),
+        "a windowed offset is never handed out mid-command"
+    );
+    let g1 = gauges();
+    assert_eq!(g1.refusals, g0.refusals, "no StorageFull");
+    assert_eq!(g1.parks, g0.parks, "no park");
+    assert_eq!(g1.failovers, g0.failovers, "no failover");
+    assert_eq!(g1.exhausted_picks, g0.exhausted_picks);
+    assert_eq!(g1.refreshes, g0.refreshes, "the pick never rebuilds");
+    assert_eq!(rig.a.authority.calls(), 0, "no harvest RPC");
+    assert_eq!(rig.b.authority.calls(), 0);
+    assert_eq!(rig.a.alloc.lane_reachable_blocks(), 5, "one block spent");
+    assert_eq!(rig.a.alloc.lane_owned_free_blocks(), 1);
+
+    // The return edge: membership comes back, the gauge does not move.
+    for (claim, idx) in claims.into_iter().zip(windowed) {
+        rig.a.alloc.return_from_trim(idx * chunk);
+        drop(claim);
+    }
+    assert_eq!(rig.a.alloc.lane_reachable_blocks(), 5);
+    assert_eq!(rig.a.alloc.lane_owned_free_blocks(), 5);
+    assert_eq!(rig.a.alloc.free_block_indices().len(), 5);
+}
+
+/// Contract 8b — the recount across an open window. `adopt_lane` recounts
+/// the lane-owned population under the new mask; a block inside a claim
+/// window is a member of neither the free list nor the recount's walk, so
+/// the recount must add the windowed blocks of the lanes it now owns and
+/// their return must then move nothing: B holds 4 lane-1 blocks and one
+/// lane-0 block a peer's accumulation shape left on its list; one of each
+/// enters a window; lane 0 is adopted mid-window. Reachable reads 4 before
+/// the adoption (the foreign windowed block was never ours), 5 after it,
+/// and 5 with the membership-exact count back at 5 once both return.
+/// RED against `36d517f3`: reachable read 3 with the window open.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_lane_recount_across_an_open_trim_window_stays_exact() {
+    let _s = serial();
+    let _r = restore();
+    let rig = rig(true).await;
+    let chunk = rig.b.alloc.chunk_size();
+    let minted_b = rig.b.exhaust().await;
+    rig.b.adopt_locally(&minted_b[..4]);
+    // A lane-0 (foreign) entry, planted the way the drift contract plants
+    // one: a return without a claim is a plain free-list insert.
+    let foreign_idx = (0..CAP)
+        .find(|i| lane::block_lane_of(*i, W) == 0)
+        .expect("a lane-0 index exists");
+    rig.b.alloc.return_from_trim(foreign_idx * chunk);
+    assert_eq!(rig.b.alloc.lane_reachable_blocks(), 4);
+    assert_eq!(rig.b.alloc.lane_owned_free_blocks(), 4);
+    assert_eq!(rig.b.alloc.foreign_lane_free_blocks(), 1);
+
+    let own_claim = rig
+        .b
+        .alloc
+        .claim_free_for_trim(minted_b[0] * chunk)
+        .expect("the trim claims our listed block");
+    let foreign_claim = rig
+        .b
+        .alloc
+        .claim_free_for_trim(foreign_idx * chunk)
+        .expect("the trim claims the foreign listed block");
+    assert_eq!(
+        rig.b.alloc.lane_reachable_blocks(),
+        4,
+        "our windowed block stays reachable; the foreign one never was"
+    );
+    assert_eq!(rig.b.alloc.lane_owned_free_blocks(), 3);
+    assert_eq!(
+        rig.b.alloc.foreign_lane_free_blocks(),
+        0,
+        "the foreign block is inside the window, not on the list"
+    );
+
+    let proof = squeezefs::data_custody::declare_dead_epoch("recount across a trim window");
+    assert!(rig.b.alloc.adopt_lane(0, proof), "lane 0 adopts");
+    assert_eq!(
+        rig.b.alloc.lane_reachable_blocks(),
+        5,
+        "the recount counts the adopted lane's windowed block as reachable"
+    );
+    assert_eq!(
+        rig.b.alloc.lane_owned_free_blocks(),
+        3,
+        "membership: three listed, two inside the window"
+    );
+
+    rig.b.alloc.return_from_trim(minted_b[0] * chunk);
+    drop(own_claim);
+    rig.b.alloc.return_from_trim(foreign_idx * chunk);
+    drop(foreign_claim);
+    assert_eq!(
+        rig.b.alloc.lane_reachable_blocks(),
+        5,
+        "the return edge moves nothing the recount already counted"
+    );
+    assert_eq!(rig.b.alloc.lane_owned_free_blocks(), 5);
+    let listed_owned = rig
+        .b
+        .alloc
+        .free_block_indices()
+        .into_iter()
+        .filter(|idx| lane::block_lane_of(*idx, W) <= 1)
+        .count() as u64;
+    assert_eq!(
+        listed_owned, 5,
+        "the C6-style recount agrees at quiescence (KD-FG-10)"
+    );
 }

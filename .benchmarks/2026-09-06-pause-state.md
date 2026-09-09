@@ -217,6 +217,41 @@ mount (the A-arm rig reset the cluster; remount is part of every arm).
    sample a counter whose increment the product DEFERS past the
    observable the test waits on. Every code landing of 2026-09-08 is
    gated; `dev` = `origin/dev` = `9e785b6d`.
+1k. **1.2.2 TAGGED — `stable-2026.09.2` = `e3635557`** (docs over the
+   tested `d08959f2`, whose product tree == `6ca29ea4`; record
+   `.benchmarks/2026-09-08-1.2.2-release-gate.md`). The gate ran TWICE:
+   run 1 on the bump `49964d7a` was green by the runners' rules and its
+   fstests leg exposed the **`generic/795` FUSE wedge** (two delivered
+   LOOKUPs unanswered 23 min, every daemon thread idle, cleared only by
+   the harness abort, scored "clean") — the user held the tag for
+   attribution + a red-first fix. Attribution: the class (a queue worker
+   parked UNBOUNDED in cq-wait with one lost wake — the 2026-08-07 zc
+   bounded-outcome law, which covered only zc pends) but NOT the wake's
+   loser (kernel task-work wake vs daemon; 48 fresh-mount storms with the
+   live capture armed did not recur — rigs under
+   `/tmp/release-1.2.2/wedge795/`, capture under
+   `/var/tmp/squeezefs_forensics/`). Fix (`8efc7e1b`→`1834bed4`): the park
+   is bounded (100 ms) while the drain group owes any reply; rescue ledger
+   `transport_park_tick_{commit,cqe}_rescues` (≈ 0 healthy = the lost-wake
+   tripwire) + fdinfo attribution snapshot in the first-rescue WARN and the
+   5 s overdue-slot WARN; seam `SQUEEZEFS_TEST_DROP_COMMIT_WAKES`; suite
+   `commit_wake_loss_tests` (RED strand / GREEN one tick — weakening check
+   reproduced independently). Runner: wedge verdict (`5a28c592`, replayed
+   RED on the tape) + `SQUEEZEFS_FSTESTS_EXCLUDE` (`6ca29ea4` —
+   generic/650 hard-hangs this laptop twice: platform hazard). Run 2 from
+   zero on the fix: task check 366/4,841; fstests 787/783/4/0 ONE pass;
+   pjdfstests 8,798; LTP 174/0/0; require-mount 13/82; zc 187 ledger EMPTY
+   (one test-only red first: the `wake_hop` sample law — `d08959f2`); fuzz
+   424.0 M execs / 0 crashes. Box zc leg NOT rerun on the final commit
+   (squeeze-test's toolchain/checkout were removed in a cleanup, no network
+   to rustup/crates.io) — owed when a rocky8 build can be shipped.
+   **Next: `task dist:all` (running), ship the rocky8 pair to the box +
+   `cluster_reset_v4.sh` remount (rollback `squeezefs.1.2.1` already
+   there), remove the release worktree, bench baseline compare + save on a
+   cool box, scoreboard on 1.2.2.** Open P1s: the wake's loser; dismounts
+   with unflushed staged files (4 of 407 at 200+, the fstests test device
+   2,193 every cycle); the NOTE line in the runner is noisy (per-test) —
+   quiet it to once per distinct value.
 2. **Kernel A/B, B arm** — after `squeeze-test` boots the 6.19.14 series
    WITH 0031 (or whichever box carries the patched kernel): on the box,
    `cd /scratch/tmp/sqz-agent/k26 && sudo env ARM=B KERNEL_TAG=<uname -r

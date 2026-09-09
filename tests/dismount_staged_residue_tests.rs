@@ -34,6 +34,14 @@
 //!    stays 0 and it reports no moved-mount-point residue, and (d) the
 //!    unmount still lands its census well inside the default wait (each
 //!    promotion is one block + one metadata commit).
+//! 3. **A promoted file OWNS its block in the durable ledger** (FIND-PK-2,
+//!    the packing design review 2026-09-09): the promotion's commit stages
+//!    the block's C8 reference, so a remount with the oracle armed reads
+//!    `meta_kv_block_refs_drift == 0` and fresh striped allocation after
+//!    the remount never re-mints a promoted block. Pre-fix the block arm
+//!    published its mapping with no reference op; a ledger-seeded remount
+//!    recovered every promoted block FREE and the next striped write
+//!    overwrote promoted files.
 //!
 //! Mount-class: self-skips through the testkit where a mount is not
 //! possible and rides the require-mount gate
@@ -249,12 +257,13 @@ impl Drop for Mount {
 
 /// Spawn the real daemon on the probe's posture (zc OFF — the fstests
 /// runner's default; a modest staging ring; the DEFAULT dismount wait) and
-/// wait for the stats inode.
-fn spawn_mount(meta: &Path, mnt: &Path, log: &Path) -> Mount {
+/// wait for the stats inode. `extra_env` rides on top of the posture.
+fn spawn_mount(meta: &Path, mnt: &Path, log: &Path, extra_env: &[(&str, &str)]) -> Mount {
     std::fs::create_dir_all(mnt).expect("create mountpoint");
     let logf = std::fs::File::create(log).expect("create log");
     let child = Command::new(bin())
         .arg("mount")
+        .envs(extra_env.iter().copied())
         .arg(format!("sqmeta://{}", meta.display()))
         .arg(mnt)
         .arg("--uid")
@@ -369,7 +378,7 @@ fn a_mount_holding_only_staged_layout_files_unmounts_without_the_drain_wait() {
     let meta = format_volume(&base, &staging);
     let mnt = base.join("mnt");
     let log = base.join("mount.log");
-    let mut mount = spawn_mount(&meta, &mnt, &log);
+    let mut mount = spawn_mount(&meta, &mnt, &log, &[]);
 
     populate_staged_files(&mnt);
 
@@ -419,7 +428,7 @@ fn a_clean_unmount_promotes_every_staged_layout_file_for_other_clients() {
     let meta = format_volume(&base, &staging);
     let mnt = base.join("mnt");
     let log = base.join("mount.log");
-    let mut mount = spawn_mount(&meta, &mnt, &log);
+    let mut mount = spawn_mount(&meta, &mnt, &log, &[]);
 
     populate_staged_files(&mnt);
 
@@ -454,7 +463,7 @@ fn a_clean_unmount_promotes_every_staged_layout_file_for_other_clients() {
     // the only source of every byte.
     let mnt2 = base.join("mnt2");
     let log2 = base.join("mount2.log");
-    let mut mount2 = spawn_mount(&meta, &mnt2, &log2);
+    let mut mount2 = spawn_mount(&meta, &mnt2, &log2, &[]);
     let mut zero_reads = 0usize;
     let mut mismatches = 0usize;
     for idx in 0..FILES {
@@ -492,6 +501,116 @@ fn a_clean_unmount_promotes_every_staged_layout_file_for_other_clients() {
         "the origin's staging root still held live staged custody after a clean unmount \
          (\"{RESIDUE_REPORT}\"); log: {}",
         log2.display()
+    );
+
+    mount2.umount_timed();
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// The striped anchor: one file past the block size, so the volume's
+/// durable block-reference ledger is NON-EMPTY when the promoted files
+/// join it (an empty ledger is declined at mount and the layout walk
+/// backfills — the shape that hid contract 3 from every other suite).
+const ANCHOR: &str = "anchor_striped.bin";
+const BLOCK: usize = 4 * 1024 * 1024;
+
+fn write_fsync(path: &Path, bytes: &[u8]) {
+    let mut f =
+        std::fs::File::create(path).unwrap_or_else(|e| panic!("create {}: {e}", path.display()));
+    f.write_all(bytes)
+        .unwrap_or_else(|e| panic!("write {}: {e}", path.display()));
+    f.sync_all()
+        .unwrap_or_else(|e| panic!("fsync {}: {e}", path.display()));
+}
+
+/// Contract 3 (FIND-PK-2, found by the packing design review 2026-09-09):
+/// **a promoted staged-layout file's block is OWNED in the durable
+/// block-reference ledger.** `promote_staged_file`'s block arm publishes
+/// `bk:0:len` through `save_metadata_to_backend` with NO reference op —
+/// the 2026-08-02 wiring named "the staged whole-image promotion" among the
+/// map-swap sites and wired four others. On a volume whose ledger is
+/// non-empty (any striped file), the next mount seeds ownership from the
+/// durable records ALONE (`recover_durable_block_refs`), so every
+/// promoted block recovers FREE: the C8 oracle reads one drift per
+/// promoted file, and the first striped allocation after the remount is
+/// handed a promoted file's offset — that file's only copy is overwritten.
+/// The dismount pass (contract 2) made the shape deterministic; the
+/// pressure-driven merge promotion has carried it since bit 9 became the
+/// default format.
+///
+/// Red: `meta_kv_block_refs_drift == FILES` and the post-remount striped
+/// write clobbers promoted files. Green: drift 0 and every promoted file
+/// stays byte-exact under fresh allocation.
+#[test]
+fn a_promoted_staged_file_owns_its_block_in_the_durable_ledger() {
+    if !mount_supported(site!()) {
+        return;
+    }
+    let base = scratch("ledger");
+    let staging = base.join("staging");
+    let meta = format_volume(&base, &staging);
+    let mnt = base.join("mnt");
+    let log = base.join("mount.log");
+    let mut mount = spawn_mount(&meta, &mnt, &log, &[]);
+
+    // The striped anchor first: its blocks are the ledger's population.
+    let anchor = pattern(usize::MAX, BLOCK + 64 * 1024);
+    write_fsync(&mnt.join(ANCHOR), &anchor);
+    populate_staged_files(&mnt);
+    mount.umount_timed();
+    assert!(
+        log_contains(&log, &format!("promoted {FILES} staged-layout file(s)")),
+        "the teardown must have promoted all {FILES} files; log: {}",
+        log.display()
+    );
+
+    // Remount elsewhere with the C8 oracle armed: durable vs derived.
+    let mnt2 = base.join("mnt2");
+    let log2 = base.join("mount2.log");
+    let mut mount2 = spawn_mount(&meta, &mnt2, &log2, &[("SQUEEZEFS_BLOCK_REFS_VERIFY", "1")]);
+    let s = stats_json(&mnt2);
+    let drift = s["metrics"]["meta_kv_block_refs_drift"]
+        .as_u64()
+        .expect("meta_kv_block_refs_drift exported");
+    let recovered = s["metrics"]["meta_kv_block_refs_recovered"]
+        .as_u64()
+        .unwrap_or(0);
+    assert_eq!(
+        drift,
+        0,
+        "{drift} promoted blocks are referenced by a layout but absent from the durable \
+         ledger (meta_kv_block_refs_drift; {recovered} recovered from the ledger) — the \
+         promotion published its mapping without its C8 reference; log: {}",
+        log2.display()
+    );
+
+    // The data-loss shape: fresh striped allocation on the remount. A
+    // ledger-blind promoted block recovers FREE and is minted here.
+    for i in 0..4 {
+        write_fsync(
+            &mnt2.join(format!("fresh_{i}.bin")),
+            &pattern(1_000_000 + i, BLOCK + 4096),
+        );
+    }
+    let mut clobbered = 0usize;
+    for idx in 0..FILES {
+        let path = mnt2.join(file_name(idx));
+        let got = std::fs::read(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+        if got != pattern(idx, file_len(idx)) {
+            clobbered += 1;
+        }
+    }
+    assert_eq!(
+        clobbered,
+        0,
+        "{clobbered} of {FILES} promoted files read wrong after fresh striped allocation on \
+         the remount — their blocks were re-minted under new owners; log: {}",
+        log2.display()
+    );
+    assert_eq!(
+        std::fs::read(mnt2.join(ANCHOR)).expect("read anchor"),
+        anchor,
+        "the striped anchor is intact"
     );
 
     mount2.umount_timed();

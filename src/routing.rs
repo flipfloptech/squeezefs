@@ -13707,7 +13707,20 @@ impl DataRouter {
             updated.size = updated.size.max(raw_len as u64);
             updated.layout_dirty = false;
             updated.cached_at = std::time::Instant::now();
-            self.save_metadata_to_backend(ino, &updated, fencing_token)
+            // FIND-PK-2: the promoted block's durable reference rides THIS
+            // commit (spec §6.2 item 1 — one tx = the layout that
+            // justifies it). Without it the ledger never learned the
+            // block: a remount whose ledger is non-empty seeds ownership
+            // from durable records alone, recovers the block FREE and
+            // re-mints it under the next striped write — the promoted
+            // file's only copy overwritten. Pinned by
+            // `dismount_staged_residue_tests` contract 3.
+            let refs = self.block_ref_ops_for_map_swap(
+                ino,
+                current.block_map.as_deref(),
+                updated.block_map.as_deref(),
+            );
+            self.save_metadata_to_backend_refs(ino, &updated, fencing_token, &refs)
                 .await?;
             self.publish_layout_cache_entry(ino, updated);
             if let Some(prev) = displaced {

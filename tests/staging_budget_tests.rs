@@ -73,6 +73,10 @@ struct H {
 
 async fn make_with_write_cap(write_disk_cap: &str) -> H {
     std::env::set_var("SQUEEZEFS_DEFAULT_BLOCK_SIZE", BLOCK_SIZE.to_string());
+    // The staged-layout contracts run at the SHIPPED inline ceiling (the
+    // A/B control): the 2026-09-09 raise derives it from the KV geometry,
+    // under which this suite's sub-block files would be inline.
+    squeezefs::routing::set_inline_max_bytes_override(Some(squeezefs::routing::INLINE_MAX_FLOOR));
     let dlm = DlmClient::new().unwrap();
 
     let b = NamedTempFile::new().unwrap();

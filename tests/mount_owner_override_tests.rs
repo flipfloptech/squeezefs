@@ -403,10 +403,16 @@ fn test_sudo_format_stamps_invoking_user_then_user_mount_works_without_chown() {
          under the sudo-formatted root: {isolated:?}"
     );
 
-    // A staged-window write (16 KiB: > inline, < block size) must actually
-    // ride the staging tier — proving the dirs are usable, not just present.
-    write_read_delete(&mnt, "staged_probe.bin", 16 * 1024, 0x5A);
-    std::fs::write(mnt.join("staged_resident.bin"), vec![0xA5u8; 16 * 1024])
+    // A staged-window write (one page past the inline ceiling the mount
+    // publishes — derived from the KV geometry since the 2026-09-09 raise —
+    // and under the block size) must actually ride the staging tier —
+    // proving the dirs are usable, not just present.
+    let staged_len = stats_json(&mnt)["inline_max_bytes"]
+        .as_u64()
+        .expect("inline_max_bytes") as usize
+        + 4096;
+    write_read_delete(&mnt, "staged_probe.bin", staged_len, 0x5A);
+    std::fs::write(mnt.join("staged_resident.bin"), vec![0xA5u8; staged_len])
         .expect("staged-window write on the sudo-formatted staging");
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {

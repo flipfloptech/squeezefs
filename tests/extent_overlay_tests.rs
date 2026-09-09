@@ -77,6 +77,9 @@ struct H {
 /// posture — extent parking is chosen only where the patch is ineligible).
 fn reset_knobs() {
     std::env::set_var("SQUEEZEFS_DEFAULT_BLOCK_SIZE", BS.to_string());
+    // The staged-layout rider contracts run at the shipped inline ceiling
+    // (the A/B control) — under the derived one a sub-block file is inline.
+    squeezefs::routing::set_inline_max_bytes_override(Some(squeezefs::routing::INLINE_MAX_FLOOR));
     squeezefs::fuse_client::set_patch_max_bytes(512 * 1024);
     squeezefs::fuse_client::set_fold_max_extents(64);
     squeezefs::fuse_client::set_fold_max_bytes(1024 * 1024);

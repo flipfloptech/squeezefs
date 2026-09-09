@@ -75,6 +75,7 @@ impl Drop for LeverGuard {
         fsync_economy::test_set_touched_namespaces(None);
         fsync_economy::test_set_parallel_legs(None);
         fsync_economy::test_set_promote_staged(None);
+        squeezefs::routing::set_inline_max_bytes_override(None);
         squeezefs::fuse_client::set_inplace_overwrite(false);
         squeezefs::dev_power_cut::clear_faults();
     }
@@ -1011,6 +1012,12 @@ async fn staged_promotion_lever_promotes_exactly_once_on_fsync() {
     // Touched-namespace barriers ON: the promoted block's device is
     // barriered only if the promotion STAMPED it.
     fsync_economy::test_set_touched_namespaces(Some(true));
+    // The staged-layout legs run at the SHIPPED inline ceiling (the A/B
+    // control): under the derived one (60 KiB at this node size) the
+    // 16 KiB fixture file is inline — and the promotion's size dispatch
+    // sends a staged file at or under the ceiling INTO INLINE, which the
+    // last leg pins by lifting the override.
+    squeezefs::routing::set_inline_max_bytes_override(Some(squeezefs::routing::INLINE_MAX_FLOOR));
     let fx = open_fx(1, "promote").await;
     squeezefs::dev_power_cut::arm_power_cut(fx.dev_path(0));
     let sp = FsyncPhase::StagedPromote as usize;
@@ -1100,6 +1107,76 @@ async fn staged_promotion_lever_promotes_exactly_once_on_fsync() {
     assert_eq!(files3, files2, "an entry that is gone promotes nothing");
     assert_eq!(fail3, fail2, "…and is not a failure");
     assert_eq!(noop3 - noop2, 1, "…it is the counted no-op");
+
+    // The size dispatch (the inline raise): a file STAGED under the shipped
+    // ceiling, fsync'd under the derived one, promotes INTO INLINE — the
+    // payload rides the layout record, no block is allocated, no device is
+    // barriered for it, and the bytes read back through `data_key`.
+    let (ino_in, fid_in) = staged_file(&fx, "inline.bin", 0x24).await;
+    squeezefs::routing::set_inline_max_bytes_override(None);
+    assert!(
+        fx.fs.router.inline_max_bytes(ino_in) >= 16 * 1024,
+        "the derived ceiling admits the 16 KiB file"
+    );
+    let allocated0 = fx.fs.router.backend_router.allocated_bytes();
+    let (files4, bytes4, fail4, noop4) = promote_gauges();
+    let (pi0, pb0) = (
+        metric(&METRICS.layout_promoted_inline),
+        metric(&METRICS.layout_promoted_block),
+    );
+    let (fi0, epoch1) = (
+        metric(&METRICS.fsync_promoted_inline_files),
+        barrier_epoch(&fx.dev_path(0)),
+    );
+    fsync(&fx, ino_in).await;
+    let (files5, bytes5, fail5, noop5) = promote_gauges();
+    assert_eq!(files5 - files4, 1, "one promotion");
+    assert_eq!(bytes5 - bytes4, 16 * 1024);
+    assert_eq!((fail5, noop5), (fail4, noop4));
+    assert_eq!(
+        metric(&METRICS.fsync_promoted_inline_files) - fi0,
+        1,
+        "the fsync promotion was the INLINE dispatch"
+    );
+    assert_eq!(metric(&METRICS.layout_promoted_inline) - pi0, 1);
+    assert_eq!(
+        metric(&METRICS.layout_promoted_block),
+        pb0,
+        "no block promotion"
+    );
+    assert_eq!(
+        fx.fs.router.backend_router.allocated_bytes(),
+        allocated0,
+        "the inline dispatch allocates no block"
+    );
+    assert_eq!(
+        barrier_epoch(&fx.dev_path(0)),
+        epoch1,
+        "nothing landed on the data device — no data barrier for it"
+    );
+    assert!(
+        fx.fs.router.cache.nvme.read_staged(&fid_in).is_none(),
+        "the ring entry is released"
+    );
+    let m = fx.fs.router.metadata_cache.get(&ino_in).expect("layout");
+    assert_eq!(m.file_type, "inline");
+    assert!(m.block_map.is_none() && m.file_id.is_none());
+    assert_eq!(
+        m.data_key.as_deref().map(<[u8]>::len),
+        Some(16 * 1024),
+        "the payload rides the layout record"
+    );
+    let reply = fx
+        .fs
+        .read(req(), ino_in, 0, 0, 16 * 1024, 0)
+        .await
+        .expect("read inline-promoted file");
+    assert_eq!(reply.data.as_ref(), &pattern(16 * 1024, 0x24)[..]);
+    // And the block arm's gauge for the block-path promotion above.
+    assert!(
+        pb0 >= 1,
+        "the block promotions above counted on layout_promoted_block"
+    );
 
     fx.close().await;
 }

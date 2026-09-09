@@ -397,9 +397,14 @@ fn test_mount_adopts_format_declared_cache_paths() {
         "the isolated staging dir must carry the generation marker: {isolated:?}"
     );
 
-    // A staged-window write (16 KiB: > inline, < block size) rides staging.
+    // A staged-window write (one page past the inline ceiling the mount
+    // publishes — the 2026-09-09 raise derives it from the KV geometry —
+    // and under the block size) rides staging.
+    let inline_max = stats_json(&mnt)["inline_max_bytes"]
+        .as_u64()
+        .expect("inline_max_bytes") as usize;
     let f = mnt.join("staged_probe.bin");
-    std::fs::write(&f, vec![0x5Au8; 16 * 1024]).expect("staged-window write");
+    std::fs::write(&f, vec![0x5Au8; inline_max + 4096]).expect("staged-window write");
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         let staged = stats_json(&mnt)["metrics"]["layout_staged_writes"]
@@ -465,7 +470,8 @@ fn test_cacheless_mount_small_large_io_cycle() {
         "cache-less mount conjured the default staging dir {conjured:?}"
     );
 
-    // Small + large I/O cycle: inline (1 KiB), staged-window (16 KiB),
+    // Small + large I/O cycle: inline (1 KiB and 16 KiB — the latter was
+    // the staged window before the derived inline ceiling),
     // multi-block striped with a partial tail (10 MiB @ 4 MiB blocks).
     write_read_delete(&mnt, "small_inline.bin", 1024, 0x11);
     write_read_delete(&mnt, "small_would_be_staged.bin", 16 * 1024, 0x22);

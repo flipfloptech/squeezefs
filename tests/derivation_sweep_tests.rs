@@ -436,6 +436,66 @@ fn fold_max_bytes_derives_from_block_size() {
 }
 
 // ---------------------------------------------------------------------------
+// The inline-layout ceiling: the KV value cap minus the layout framing
+// ---------------------------------------------------------------------------
+
+/// `SQUEEZEFS_INLINE_MAX_BYTES` default (the 2026-09-09 inline raise):
+/// the volume's xattr value cap `min(64 KiB, node_size/4)` minus the
+/// layout wire's 4 KiB framing headroom — the largest payload whose
+/// `layout` record still fits one KV value; per node size. 60 KiB at the
+/// shipped 256 KiB node, 12 KiB at the 64 KiB floor; the shipped 4 KiB is
+/// the floor (never-regress) and the override's lower bound; the
+/// override's upper bound is the cap any volume can hold.
+#[test]
+fn inline_max_bytes_derives_from_the_kv_value_cap() {
+    use squeezefs::meta_backend::kv::node::{
+        xattr_value_cap, DEFAULT_NODE_SIZE, MAX_NODE_SIZE, MIN_NODE_SIZE,
+    };
+    use squeezefs::routing::{
+        derived_inline_max_bytes, INLINE_MAX_CEILING, INLINE_MAX_FLOOR, LAYOUT_INLINE_HEADROOM,
+    };
+    assert_eq!(INLINE_MAX_FLOOR, 4096, "the shipped ceiling is the floor");
+    assert_eq!(
+        derived_inline_max_bytes(xattr_value_cap(DEFAULT_NODE_SIZE)),
+        60 * KIB as usize,
+        "shipped 256 KiB node: 64 KiB cap − 4 KiB framing"
+    );
+    assert_eq!(
+        derived_inline_max_bytes(xattr_value_cap(MIN_NODE_SIZE)),
+        12 * KIB as usize,
+        "64 KiB node floor: 16 KiB cap − 4 KiB framing"
+    );
+    assert_eq!(
+        derived_inline_max_bytes(xattr_value_cap(MAX_NODE_SIZE)),
+        INLINE_MAX_CEILING,
+        "the 1 MiB node hits the XATTR_SIZE_MAX cap: the override's top"
+    );
+    for node in [
+        MIN_NODE_SIZE,
+        128 * KIB as usize,
+        DEFAULT_NODE_SIZE,
+        MAX_NODE_SIZE,
+    ] {
+        let cap = xattr_value_cap(node);
+        let ceiling = derived_inline_max_bytes(cap);
+        assert_eq!(ceiling, cap - LAYOUT_INLINE_HEADROOM, "node {node}");
+        assert!((INLINE_MAX_FLOOR..=INLINE_MAX_CEILING).contains(&ceiling));
+        // The layout-delta wire carries the data key behind a u16 length.
+        assert!(ceiling <= u16::MAX as usize);
+    }
+    // The registered range is exactly [floor, ceiling].
+    let knob = squeezefs::env_knobs::lookup("SQUEEZEFS_INLINE_MAX_BYTES")
+        .expect("SQUEEZEFS_INLINE_MAX_BYTES is registered");
+    assert_eq!(
+        knob.kind,
+        squeezefs::env_knobs::Kind::Int {
+            lo: INLINE_MAX_FLOOR as i128,
+            hi: INLINE_MAX_CEILING as i128,
+        }
+    );
+}
+
+// ---------------------------------------------------------------------------
 // A11 — parked-write budget: budget fraction over block size, shipped floor
 // ---------------------------------------------------------------------------
 

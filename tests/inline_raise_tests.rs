@@ -439,8 +439,9 @@ fn a_small_fsynced_file_is_inline_and_a_live_reader_mount_sees_it() {
         .as_u64()
         .expect("the stats inode publishes inline_max_bytes") as usize;
     assert!(
-        ceiling >= SMALL && ceiling > SHIPPED_CEILING,
-        "the derived ceiling must admit a {SMALL}-byte file (got {ceiling})"
+        ceiling >= SMALL,
+        "the derived ceiling must admit a {SMALL}-byte file (above the shipped \
+         {SHIPPED_CEILING}; got {ceiling})"
     );
     assert!(
         ceiling <= KV_VALUE_CAP_CEILING - LAYOUT_INLINE_HEADROOM,

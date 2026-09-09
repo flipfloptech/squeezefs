@@ -49,7 +49,7 @@ const LEVER: &str = "SQUEEZEFS_FSYNC_PROMOTE_STAGED";
 /// Files per contract: enough to make a missed promotion or a double
 /// promotion visible in the gauges, small enough for a per-commit suite.
 const FILES: usize = 40;
-/// Sizes strictly above `MAX_INLINE_SIZE` (4 KiB) and far below the 4 MiB
+/// Sizes strictly above the shipped 4 KiB inline ceiling and far below the 4 MiB
 /// block — the staged layout by construction.
 const SIZES_KIB: [usize; 4] = [8, 16, 32, 64];
 /// The mount's default `--dismount-wait` — the daemon-side bound the
@@ -251,6 +251,11 @@ fn spawn_mount(meta: &Path, mnt: &Path, log: &Path, lever: Option<&str>) -> Moun
         .arg("--disk-cache-size")
         .arg("500MB")
         .env("SQUEEZEFS_FUSE_ZC", "0")
+        // The staged-layout contracts run at the SHIPPED inline ceiling
+        // (the A/B control): the 2026-09-09 inline raise derives 60 KiB
+        // from the KV geometry, under which this suite's 8–64 KiB files
+        // would be inline and never staged.
+        .env("SQUEEZEFS_INLINE_MAX_BYTES", "4096")
         .env_remove(LEVER)
         .stdout(Stdio::from(logf.try_clone().expect("clone log fd")))
         .stderr(Stdio::from(logf));

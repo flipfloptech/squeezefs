@@ -4704,8 +4704,6 @@ impl Drop for HeldWriteGuard<'_> {
 /// Already-striped files use block-level locks on the data path, so the full-inode
 /// write lock need only cover short meta-prep. Inline and non-striped (layout
 /// transition / whole-buffer RMW) paths keep the lock for the entire operation.
-pub const MAX_INLINE_SIZE: u64 = 4096;
-
 /// The one write lock-scope classifier (design-write-inode-convoy §4.1;
 /// the lock-scope half of design-one-path's "one admission, cheapest
 /// legal"). Inputs are RAM-cache probes only — a probe miss (`None`)
@@ -5825,6 +5823,15 @@ pub struct Metrics {
     pub layout_inline_writes: Align64<AtomicU64>,
     pub layout_staged_writes: Align64<AtomicU64>,
     pub layout_striped_writes: Align64<AtomicU64>,
+    /// Layout mix, the PROMOTION outcomes (`DataRouter::promote_staged_file`'s
+    /// size dispatch, every promoter — pressure, dismount, the fsync lever):
+    /// a staged file whose size fits the inline ceiling promotes INTO INLINE
+    /// (its payload rides the layout record — no block), a larger one into
+    /// one placed striped block. `inline` growing where `block` used to is
+    /// the inline raise engaging (`.benchmarks/2026-09-09-fsync-promote-staged-ab.md`
+    /// §3's 64× space law is the `block` arm applied to small files).
+    pub layout_promoted_inline: Align64<AtomicU64>,
+    pub layout_promoted_block: Align64<AtomicU64>,
     /// FIND-RW5-A: never-lossy StorageFull escalations — a staged
     /// whole-image/fold/clone arm found the staging ring unable to admit
     /// its image and degraded to the durable direct-block spill instead of
@@ -7443,6 +7450,9 @@ pub struct Metrics {
     /// a mount that held staged-layout files must move `files` by that
     /// population.
     pub dismount_promoted_files: Align64<AtomicU64>,
+    /// ⊆ `dismount_promoted_files`: the ones the size dispatch promoted
+    /// INTO INLINE (no block allocated).
+    pub dismount_promoted_inline_files: Align64<AtomicU64>,
     pub dismount_promoted_bytes: Align64<AtomicU64>,
     pub dismount_promote_failures: Align64<AtomicU64>,
     /// The fsync-promotes-staged lever (`SQUEEZEFS_FSYNC_PROMOTE_STAGED`,
@@ -7456,6 +7466,8 @@ pub struct Metrics {
     /// got there first; exactly-once by `promote_staged_file`'s
     /// generation-gated commit). All 0 with the lever off.
     pub fsync_promoted_files: Align64<AtomicU64>,
+    /// ⊆ `fsync_promoted_files`: promoted INTO INLINE (no block).
+    pub fsync_promoted_inline_files: Align64<AtomicU64>,
     pub fsync_promoted_bytes: Align64<AtomicU64>,
     pub fsync_promote_failures: Align64<AtomicU64>,
     pub fsync_promote_noops: Align64<AtomicU64>,
@@ -10919,6 +10931,12 @@ impl SqueezefsFilesystem {
             "nvme_staged_write_file_count": nvme_staged_write_file_count,
             "nvme_read_cache_block_count": nvme_read_cache_block_count,
             "active_write_block_count": active_write_block_count,
+            // The inline-layout ceiling in force for every ino of the set
+            // (the minimum over the meta volumes' derivations, or the
+            // `SQUEEZEFS_INLINE_MAX_BYTES` override) — the boundary the
+            // layout mix (`layout_inline_writes` / `layout_staged_writes`)
+            // and the size-dispatching promotion read.
+            "inline_max_bytes": self.router.inline_max_bytes_set(),
             // VAL-7a: the KEY census — empty unless
             // `SQUEEZEFS_STATS_KEY_CENSUS=1`. Fields stay present (with
             // empty values) so an operator can always key on them.
@@ -11104,6 +11122,8 @@ impl SqueezefsFilesystem {
                 "zcrx_dest_gather_bytes": METRICS.zcrx_dest_gather_bytes.load(Ordering::Relaxed),
                 "layout_inline_writes": METRICS.layout_inline_writes.load(Ordering::Relaxed),
                 "layout_staged_writes": METRICS.layout_staged_writes.load(Ordering::Relaxed),
+                "layout_promoted_inline": METRICS.layout_promoted_inline.load(Ordering::Relaxed),
+                "layout_promoted_block": METRICS.layout_promoted_block.load(Ordering::Relaxed),
                 "staged_spill_escalations": METRICS.staged_spill_escalations.load(Ordering::Relaxed),
                 "block_double_frees": METRICS.block_double_frees.load(Ordering::Relaxed),
                 "block_untracked_free_refusals": METRICS.block_untracked_free_refusals.load(Ordering::Relaxed),
@@ -11866,9 +11886,11 @@ impl SqueezefsFilesystem {
                 "staging_put_bytes_teardown": METRICS.staging_put_bytes_teardown.load(Ordering::Relaxed),
                 "staging_put_bytes_wt_fallback": METRICS.staging_put_bytes_wt_fallback.load(Ordering::Relaxed),
                 "dismount_promoted_files": METRICS.dismount_promoted_files.load(Ordering::Relaxed),
+                "dismount_promoted_inline_files": METRICS.dismount_promoted_inline_files.load(Ordering::Relaxed),
                 "dismount_promoted_bytes": METRICS.dismount_promoted_bytes.load(Ordering::Relaxed),
                 "dismount_promote_failures": METRICS.dismount_promote_failures.load(Ordering::Relaxed),
                 "fsync_promoted_files": METRICS.fsync_promoted_files.load(Ordering::Relaxed),
+                "fsync_promoted_inline_files": METRICS.fsync_promoted_inline_files.load(Ordering::Relaxed),
                 "fsync_promoted_bytes": METRICS.fsync_promoted_bytes.load(Ordering::Relaxed),
                 "fsync_promote_failures": METRICS.fsync_promote_failures.load(Ordering::Relaxed),
                 "fsync_promote_noops": METRICS.fsync_promote_noops.load(Ordering::Relaxed),
@@ -20627,7 +20649,24 @@ impl SqueezefsFilesystem {
             .await?;
         self.flush_active_blocks_with_retry(ino, fencing_token)
             .await?;
-        let staged_identity = self.router.metadata_cache.get(&ino).map(|m| {
+        let promote_lever = crate::fsync_economy::promote_staged_enabled();
+        let layout = match self.router.metadata_cache.get(&ino) {
+            Some(m) => Some(m),
+            // A COLD ino (recovered staged custody nothing has touched
+            // since the mount — the inline-raise contract (e) found the
+            // RAM-only read promoting nothing): with the lever on, the
+            // layout is fetched so the promotion can see it; off, the
+            // ladder keeps its RAM-only shape (the `sync_key` leg of a
+            // never-touched ring entry syncs bytes the recovery already
+            // read durable).
+            None if promote_lever => self
+                .router
+                .fetch_metadata(&crate::keys::inode_path(ino))
+                .await
+                .ok(),
+            None => None,
+        };
+        let staged_identity = layout.map(|m| {
             (
                 m.file_id.clone(),
                 // A staged-layout file whose payload still lives ONLY in
@@ -20655,20 +20694,29 @@ impl SqueezefsFilesystem {
         // same shape the staged active-block flush above takes). A
         // failure never fails the fsync: the entry stays resident and the
         // `sync_key` leg below is the pre-lever local-durability contract.
+        // The primitive dispatches on size: a file under the inline
+        // ceiling promotes INTO INLINE (the layout commit carries the
+        // bytes — no block, nothing for the data barrier), a larger one
+        // into a block.
         if let Some((Some(file_id), true, size)) = staged_identity.as_ref() {
-            if crate::fsync_economy::promote_staged_enabled() {
+            if promote_lever {
                 match self
                     .router
                     .promote_staged_file(&crate::keys::inode_path(ino), file_id, fencing_token)
                     .await
                 {
-                    Ok(true) => {
+                    Ok(Some(into)) => {
                         METRICS.fsync_promoted_files.fetch_add(1, Ordering::Relaxed);
+                        if into == crate::routing::PromotedInto::Inline {
+                            METRICS
+                                .fsync_promoted_inline_files
+                                .fetch_add(1, Ordering::Relaxed);
+                        }
                         METRICS
                             .fsync_promoted_bytes
                             .fetch_add(*size, Ordering::Relaxed);
                     }
-                    Ok(false) => {
+                    Ok(None) => {
                         METRICS.fsync_promote_noops.fetch_add(1, Ordering::Relaxed);
                     }
                     Err(e) => {
@@ -22202,6 +22250,7 @@ impl SqueezefsFilesystem {
         use futures::StreamExt;
         const ERROR_SAMPLES: usize = 3;
         let mut promoted_bytes = 0u64;
+        let mut promoted_inline = 0u64;
         while let Some(res) = tasks.next().await {
             match res {
                 Err(join_err) => {
@@ -22218,16 +22267,22 @@ impl SqueezefsFilesystem {
                         summary.error_samples.push(format!("{e:?}"));
                     }
                 }
-                Ok(Ok((true, bytes))) => {
+                Ok(Ok((Some(into), bytes))) => {
                     summary.flushed += 1;
                     promoted_bytes += bytes;
+                    if into == crate::routing::PromotedInto::Inline {
+                        promoted_inline += 1;
+                    }
                 }
-                Ok(Ok((false, _))) => summary.skipped += 1,
+                Ok(Ok((None, _))) => summary.skipped += 1,
             }
         }
         METRICS
             .dismount_promoted_files
             .fetch_add(summary.flushed as u64, Ordering::Relaxed);
+        METRICS
+            .dismount_promoted_inline_files
+            .fetch_add(promoted_inline, Ordering::Relaxed);
         METRICS
             .dismount_promoted_bytes
             .fetch_add(promoted_bytes, Ordering::Relaxed);
@@ -22258,8 +22313,9 @@ impl SqueezefsFilesystem {
         } else {
             info!(
                 "FUSE Daemon: dismount promoted {} staged-layout file(s) ({promoted_bytes} B) \
-                 to the shared backend.",
-                summary.flushed
+                 to the shared backend: {promoted_inline} inline, {} to blocks.",
+                summary.flushed,
+                summary.flushed as u64 - promoted_inline
             );
         }
         summary
@@ -23528,7 +23584,8 @@ impl Filesystem for SqueezefsFilesystem {
                         crate::routing::SyncServeArm::Cache => {
                             Some(&METRICS.read_copy_cache_serve_bytes)
                         }
-                        crate::routing::SyncServeArm::Staged => None,
+                        crate::routing::SyncServeArm::Staged
+                        | crate::routing::SyncServeArm::Inline => None,
                     };
                     if let Some(c) = arm_ctr {
                         METRICS
@@ -25027,6 +25084,7 @@ impl Filesystem for SqueezefsFilesystem {
             let file_path = crate::keys::inode_path_stack(ino);
             let file_path: &str = &file_path;
             let block_size = self.router.block_size.load(Ordering::Relaxed);
+            let inline_max = self.router.inline_max_bytes(ino) as u64;
             // Prefer hot caches for path selection (avoids meta RTT on every small write).
             // write_file still loads authoritative layout when it mutates data.
             //
@@ -25047,7 +25105,7 @@ impl Filesystem for SqueezefsFilesystem {
                 if cached_at.elapsed() < Duration::from_secs(1) {
                     let ft = if attr.size > block_size {
                         "striped"
-                    } else if attr.size > MAX_INLINE_SIZE {
+                    } else if attr.size > inline_max {
                         "staged"
                     } else {
                         "inline"
@@ -25075,9 +25133,8 @@ impl Filesystem for SqueezefsFilesystem {
             let bytes_written = wlen as u32;
             let expected_new_size = std::cmp::max(old_size, offset + bytes_written as u64);
 
-            let fits_inline = expected_new_size <= MAX_INLINE_SIZE
-                && file_type != "staged"
-                && file_type != "striped";
+            let fits_inline =
+                expected_new_size <= inline_max && file_type != "staged" && file_type != "striped";
             let fits_staged = expected_new_size <= block_size
                 && !self.router.cache.nvme.staging_dirs().is_empty()
                 && file_type != "striped";

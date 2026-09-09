@@ -2206,9 +2206,10 @@ impl NvmeStaging {
         });
     }
 
-    /// Promote every distinct pending staged file to a durable backend block
-    /// through the owning router (coherent RAM + backend layout commit).
-    /// Conservative on any miss: the entry stays resident and budget-counted.
+    /// Promote every distinct pending staged file out of the ring through
+    /// the owning router (coherent RAM + backend layout commit; the router
+    /// dispatches on size — inline record or durable block). Conservative
+    /// on any miss: the entry stays resident and budget-counted.
     async fn promote_batch(
         data_router: &std::sync::OnceLock<std::sync::Weak<crate::routing::DataRouterInner>>,
         batch: &mut Vec<PendingStagedWrite>,
@@ -2231,11 +2232,16 @@ impl NvmeStaging {
                 .promote_staged_file(&item.file_path, &item.file_id, item.fencing_token)
                 .await
             {
-                Ok(true) => info!(
-                    "NVMe Staging: promoted staged file {} (ID: {}) to durable block",
-                    item.file_path, item.file_id
+                Ok(Some(into)) => info!(
+                    "NVMe Staging: promoted staged file {} (ID: {}) {}",
+                    item.file_path,
+                    item.file_id,
+                    match into {
+                        crate::routing::PromotedInto::Inline => "inline (layout record)",
+                        crate::routing::PromotedInto::Block => "to durable block",
+                    }
                 ),
-                Ok(false) => {}
+                Ok(None) => {}
                 Err(e) => error!(
                     "NVMe Staging: promotion failed for {} (ID: {}): {:?} — entry stays resident",
                     item.file_path, item.file_id, e

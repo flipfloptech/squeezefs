@@ -470,6 +470,12 @@ async fn test_cli_clone_staged_source_refuses_loudly() {
     let staging = tempfile::tempdir().expect("staging");
     let ino = {
         std::env::set_var("SQUEEZEFS_DEFAULT_BLOCK_SIZE", BLOCK.to_string());
+        // The staged-source contract runs at the shipped inline ceiling
+        // (the A/B control): the 2026-09-09 raise moved the class boundary,
+        // not the class — a 16 KiB file is inline under the derived one.
+        squeezefs::routing::set_inline_max_bytes_override(Some(
+            squeezefs::routing::INLINE_MAX_FLOOR,
+        ));
         let dlm = DlmClient::new().expect("dlm");
         let first = &recs[0];
         let dev = Arc::new(NvmeBlockDev::new(&first.backing_dev));

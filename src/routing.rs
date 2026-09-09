@@ -1,7 +1,89 @@
 use crate::cache::{TieredCache, BUFFER_POOL};
 use crate::dlm::DlmClient;
 
-pub const MAX_INLINE_SIZE: usize = 4096;
+/// The inline-layout ceiling's FLOOR — the shipped 4 KiB posture (one
+/// page; the value the ceiling was a free constant at until the 2026-09-09
+/// raise). The never-regress-below-shipped floor: the explicit override's
+/// lower bound and the derivation's, never a tuning value. Reachable as
+/// `SQUEEZEFS_INLINE_MAX_BYTES=4096` — the A/B control.
+pub const INLINE_MAX_FLOOR: usize = 4096;
+
+/// The inline ceiling a volume with xattr value cap `value_cap` derives
+/// (`.benchmarks/2026-09-09-fsync-promote-staged-ab.md` §4 (iii)): the
+/// LARGEST payload whose `layout` record still fits ONE KV value. The
+/// payload IS the record's `data_key`, the record's other fields ride the
+/// same value, and the value cap (`min(64 KiB, node_size/4)` — the format's
+/// bound) is the room; `LAYOUT_INLINE_HEADROOM` is the layout wire's own
+/// framing allowance (type, size, ids, the record envelope — the same 4 KiB
+/// the inline block-map ceiling budgets), so this is the FORMAT bound, not
+/// a tuning choice. Anything smaller trades metadata-plane bytes per small
+/// write against a block per small file — the override's (and the phase-B
+/// threshold sweep's) decision, never this derivation's. 60 KiB at the
+/// shipped 256 KiB node; 12 KiB at the 64 KiB node floor.
+pub fn derived_inline_max_bytes(value_cap: usize) -> usize {
+    value_cap
+        .saturating_sub(LAYOUT_INLINE_HEADROOM)
+        .max(INLINE_MAX_FLOOR)
+}
+
+/// What a staged file promoted INTO — `DataRouter::promote_staged_file`'s
+/// size dispatch: `Inline` = its payload now rides the layout record (no
+/// block), `Block` = one placed striped block.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PromotedInto {
+    Inline,
+    Block,
+}
+
+/// The largest ceiling ANY volume can hold — the registered override's
+/// upper bound (`RECORD_VALUE_CAP_CEILING` is Linux `XATTR_SIZE_MAX`, the
+/// value cap at every node size ≥ 256 KiB).
+pub const INLINE_MAX_CEILING: usize =
+    crate::meta_backend::kv::node::RECORD_VALUE_CAP_CEILING - LAYOUT_INLINE_HEADROOM;
+
+/// The `SQUEEZEFS_INLINE_MAX_BYTES` override cell: 0 = none (derive).
+/// Read once from the environment (registered; out of range refuses the
+/// process at startup); the test seam presets it.
+fn inline_max_override_cell() -> &'static std::sync::atomic::AtomicUsize {
+    static CELL: std::sync::OnceLock<std::sync::atomic::AtomicUsize> = std::sync::OnceLock::new();
+    CELL.get_or_init(|| {
+        std::sync::atomic::AtomicUsize::new(
+            crate::env_knobs::opt_int_knob::<usize>("SQUEEZEFS_INLINE_MAX_BYTES").unwrap_or(0),
+        )
+    })
+}
+
+/// Test seam: `Some(bytes)` presets the inline ceiling override (`4096` =
+/// the shipped posture the staged-layout contracts run at); `None` returns
+/// it to the derivation.
+pub fn set_inline_max_bytes_override(bytes: Option<usize>) {
+    inline_max_override_cell().store(bytes.unwrap_or(0), Ordering::Relaxed);
+}
+
+/// The inline ceiling in force for a volume with xattr value cap
+/// `value_cap`: the explicit override verbatim, bounded by the volume's
+/// format bound ([`derived_inline_max_bytes`] — a payload above it has no
+/// record that can hold it; the startup gate validates the override's
+/// range against the LARGEST node size, and a smaller-node volume's bound
+/// is applied here, logged once), else the derivation.
+pub fn inline_max_bytes_for_cap(value_cap: usize) -> usize {
+    let bound = derived_inline_max_bytes(value_cap);
+    match inline_max_override_cell().load(Ordering::Relaxed) {
+        0 => bound,
+        explicit if explicit <= bound => explicit,
+        explicit => {
+            static CLAMPED: std::sync::Once = std::sync::Once::new();
+            CLAMPED.call_once(|| {
+                log::warn!(
+                    "SQUEEZEFS_INLINE_MAX_BYTES={explicit} exceeds this volume's format bound \
+                     ({bound} B = its KV value cap minus the layout framing headroom) — the \
+                     bound applies"
+                );
+            });
+            bound
+        }
+    }
+}
 
 use crate::error::{Result, SqueezefsError};
 use crate::fuse_client::{
@@ -6298,10 +6380,14 @@ pub struct ReadClassHint {
 /// warm armed row fails closure by the ledger's own rule. `Staged` is
 /// the write-side custody station (the staging mmap ring), counted as a
 /// dest copy but outside the warm-tier partition, like the handler's
-/// staged serves.
+/// staged serves; `Inline` is the layout record's own payload (RAM-
+/// authoritative — the write path publishes it synchronously), the same
+/// station class (the 2026-09-09 inline raise moved the whole small-file
+/// population onto it; before it every inline read demoted).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SyncServeArm {
     Staged,
+    Inline,
     Hot,
     Hold,
     Cache,
@@ -6869,6 +6955,37 @@ impl DataRouter {
             br.run_stride_for_tag(tag)
         }));
         let _ = self.inner.meta_backend.set(meta_backend);
+    }
+
+    /// The inline-layout ceiling in force for `ino` — [`inline_max_bytes_for_cap`]
+    /// over its home volume's xattr value cap (a mixed-`node_size` set
+    /// derives per volume, exactly as the inline block-map spill does). A
+    /// router without a meta backend (the in-RAM test constructors) uses
+    /// the default node's cap.
+    pub fn inline_max_bytes(&self, ino: u64) -> usize {
+        let cap = match self.inner.meta_backend.get() {
+            Some(be) => be.xattr_value_cap(ino),
+            None => crate::meta_backend::kv::node::xattr_value_cap(
+                crate::meta_backend::kv::node::DEFAULT_NODE_SIZE,
+            ),
+        };
+        inline_max_bytes_for_cap(cap)
+    }
+
+    /// The ceiling EVERY ino of the set is guaranteed — the minimum over
+    /// the mounted meta volumes (the stats inode's `inline_max_bytes`).
+    pub fn inline_max_bytes_set(&self) -> usize {
+        let cap = self
+            .inner
+            .meta_backend
+            .get()
+            .and_then(|be| be.volumes.iter().map(|v| v.xattr_value_cap()).min())
+            .unwrap_or_else(|| {
+                crate::meta_backend::kv::node::xattr_value_cap(
+                    crate::meta_backend::kv::node::DEFAULT_NODE_SIZE,
+                )
+            });
+        inline_max_bytes_for_cap(cap)
     }
 
     /// Decode a staged/promoted block mapping. Two forms:
@@ -13397,13 +13514,25 @@ impl DataRouter {
         Ok(())
     }
 
-    /// Promote a resident staged file to a durable backend block and release
-    /// its staging-ring entry + budget (merge-worker path, capacity pressure).
+    /// Promote a resident staged file OUT of the staging ring — into the
+    /// layout its size belongs to — and release its ring entry + budget.
+    /// The one primitive every promoter runs: the merge worker (capacity
+    /// pressure), the dismount pass, the fsync lever.
     ///
-    /// Returns `Ok(true)` when the entry was promoted and released. Any
-    /// identity/generation mismatch is a benign skip (`Ok(false)`): the entry
-    /// either no longer exists or a racing re-stage/layout-transition now
-    /// owns it. Ordering:
+    /// **Size dispatch** (`.benchmarks/2026-09-09-fsync-promote-staged-ab.md`
+    /// §3–4 — one whole 4 MiB block per promoted small file was a 64× space
+    /// law): a file whose logical size fits the inline ceiling
+    /// ([`DataRouter::inline_max_bytes`]) promotes INTO INLINE — the payload
+    /// becomes the layout record's `data_key` in the SAME commit that flips
+    /// the type, no block allocated, no durable reference; a larger file
+    /// takes the block path (one placed striped block, a size-carrying
+    /// `bk:0:len` mapping). Every client reads the file from the shared
+    /// volume set after either.
+    ///
+    /// Returns `Ok(Some(into))` when the entry was promoted and released.
+    /// Any identity/generation mismatch is a benign skip (`Ok(None)`): the
+    /// entry either no longer exists or a racing re-stage/layout-transition
+    /// now owns it. Ordering (block path):
     ///
     /// 1. Block data I/O first (io_uring, no locks held).
     /// 2. Layout commit (backend + RAM cache together) under the per-inode
@@ -13411,15 +13540,18 @@ impl DataRouter {
     ///    under that lock.
     /// 3. Ring entry + budget release only if the stage generation is still
     ///    the one we promoted (`remove_staged_if_generation`).
+    ///
+    /// The inline path has no step 1: steps 2–3 run under the same lock with
+    /// the same re-checks.
     pub(crate) async fn promote_staged_file(
         &self,
         file_path: &str,
         file_id: &str,
         fencing_token: u64,
-    ) -> Result<bool> {
+    ) -> Result<Option<PromotedInto>> {
         let nvme = &self.cache.nvme;
         let Some(gen) = nvme.staged_generation(file_id).await else {
-            return Ok(false);
+            return Ok(None);
         };
         let Some(raw) = nvme.read_staged(file_id) else {
             // Counted but not resident (should not happen): reconcile so the
@@ -13428,7 +13560,7 @@ impl DataRouter {
             let _ = nvme
                 .remove_staged_if_generation_async(file_id.to_string(), gen)
                 .await;
-            return Ok(false);
+            return Ok(None);
         };
 
         // W2 rider fence: a file with a LIVE extent record never promotes —
@@ -13442,10 +13574,34 @@ impl DataRouter {
         let promote_ino = parse_inode_from_path(file_path);
         let rider_key = crate::keys::active_block_ext(promote_ino, 0).to_string();
         if self.cache.nvme.has_staged_extent_record(&rider_key) {
-            return Ok(false);
+            return Ok(None);
         }
 
         let raw_len = raw.len();
+
+        // The dispatch: the file's LOGICAL size — the image, or the larger
+        // cached size (a truncate-up hole tail the inline layout carries
+        // as an implicit-zero tail exactly as the staged one does) —
+        // against the ino's inline ceiling. Read before any lock; the
+        // inline arm re-checks it under the commit lock.
+        let inline_max = self.inline_max_bytes(promote_ino);
+        let logical = self
+            .metadata_cache
+            .peek_with(&promote_ino, |m| m.size)
+            .unwrap_or(0)
+            .max(raw_len as u64);
+        if logical <= inline_max as u64 {
+            return self
+                .promote_staged_file_inline(
+                    file_path,
+                    promote_ino,
+                    file_id,
+                    gen,
+                    raw,
+                    fencing_token,
+                )
+                .await;
+        }
         let processed = self
             .get_crypto()
             .process_write_async(bytes::Bytes::from(raw))
@@ -13464,7 +13620,7 @@ impl DataRouter {
                 processed.len(),
                 crate::block_allocator::CHUNK_SIZE
             );
-            return Ok(false);
+            return Ok(None);
         }
         let (be_id, allocator, writer, offset) =
             self.backend_router.allocate_placed_block().await?;
@@ -13507,13 +13663,13 @@ impl DataRouter {
                 None => self.fetch_metadata_from_backend(ino).await?,
             };
             let Some(current) = current else {
-                return Ok::<bool, SqueezefsError>(false);
+                return Ok::<Option<PromotedInto>, SqueezefsError>(None);
             };
             if current.file_type != "staged"
                 || current.file_id.as_deref() != Some(file_id)
                 || nvme.staged_generation(file_id).await != Some(gen)
             {
-                return Ok(false);
+                return Ok(None);
             }
             let mut updated = current.clone();
             let mut block_map = updated.block_map.take().unwrap_or_default();
@@ -13563,7 +13719,7 @@ impl DataRouter {
             let _ = nvme
                 .remove_staged_if_generation_async(file_id.to_string(), gen)
                 .await;
-            Ok(true)
+            Ok(Some(PromotedInto::Block))
         }
         .await;
 
@@ -13575,16 +13731,104 @@ impl DataRouter {
         // abandon (d575be03 sweep; a co-writer's refused shipped commit is
         // the post-fence storm's per-block cleanup).
         match commit {
-            Ok(true) => Ok(true),
-            Ok(false) => {
+            Ok(Some(into)) => {
+                METRICS
+                    .layout_promoted_block
+                    .fetch_add(1, Ordering::Relaxed);
+                Ok(Some(into))
+            }
+            Ok(None) => {
                 let _ = allocator.abandon_unpublished_offset(offset).await;
-                Ok(false)
+                Ok(None)
             }
             Err(e) => {
                 let _ = allocator.abandon_unpublished_offset(offset).await;
                 Err(e)
             }
         }
+    }
+
+    /// The inline arm of [`Self::promote_staged_file`]: the staged image
+    /// becomes the layout record's `data_key` in ONE commit that flips the
+    /// type `staged → inline` (the payload rides the record, so the commit
+    /// IS the durable data write — no block, no allocation, no durable
+    /// reference; a displaced older durable copy is released exactly as the
+    /// write path's own staged → inline transition releases it). Under the
+    /// per-inode metadata lock with the block arm's re-checks, plus a
+    /// re-check of the size against the ceiling (a truncate-up racing this
+    /// promotion makes the file the block arm's — `Ok(None)`, the next
+    /// promotion takes it there).
+    async fn promote_staged_file_inline(
+        &self,
+        file_path: &str,
+        ino: u64,
+        file_id: &str,
+        gen: u64,
+        raw: Vec<u8>,
+        fencing_token: u64,
+    ) -> Result<Option<PromotedInto>> {
+        let nvme = &self.cache.nvme;
+        let raw_len = raw.len() as u64;
+        // RES-1: displaced keys are freed after the guard drops.
+        let mut deferred: Vec<String> = Vec::new();
+        let commit = async {
+            let _meta_guard = meta_lock_acquire(ino).await;
+            let current = match self.metadata_cache.get(&ino) {
+                Some(m) => Some(m),
+                None => self.fetch_metadata_from_backend(ino).await?,
+            };
+            let Some(current) = current else {
+                return Ok::<Option<PromotedInto>, SqueezefsError>(None);
+            };
+            if current.file_type != "staged"
+                || current.file_id.as_deref() != Some(file_id)
+                || nvme.staged_generation(file_id).await != Some(gen)
+            {
+                return Ok(None);
+            }
+            let size = current.size.max(raw_len);
+            if size > self.inline_max_bytes(ino) as u64 {
+                return Ok(None);
+            }
+            let mut updated = current.clone();
+            updated.file_type = "inline".into();
+            updated.size = size;
+            updated.data_key = Some(bytes::Bytes::from(raw));
+            updated.file_id = None;
+            updated.block_map = None;
+            updated.layout_dirty = false;
+            updated.cached_at = std::time::Instant::now();
+            // Spec §6.2 item 1: an older durable copy this inline record
+            // stops naming releases its reference in the same tx.
+            let refs = self.block_ref_ops_for_map_swap(ino, current.block_map.as_deref(), None);
+            self.save_metadata_to_backend_refs(ino, &updated, fencing_token, &refs)
+                .await?;
+            // The RAM snapshots of the staged era are superseded by the
+            // record's own payload (the read path serves `data_key`).
+            self.cache.write_lru.remove(file_path);
+            self.cache.read_lru.remove(file_path);
+            self.publish_layout_cache_entry(ino, updated);
+            if let Some(old_map) = current.block_map.as_deref() {
+                for bk in old_map.values() {
+                    self.cache.purge_block_key(bk);
+                    deferred.push(bk.clone());
+                }
+            }
+            // The ring-entry release INSIDE the commit's lock section —
+            // the block arm's leg-5 law verbatim, generation-gated.
+            let _ = nvme
+                .remove_staged_if_generation_async(file_id.to_string(), gen)
+                .await;
+            Ok(Some(PromotedInto::Inline))
+        }
+        .await;
+        self.free_deferred_keys(deferred).await;
+        if let Ok(Some(_)) = &commit {
+            METRICS
+                .layout_promoted_inline
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        commit
     }
 
     /// Resolve the durable mapping (`block_map[0]`) of a staged file whose
@@ -15620,6 +15864,23 @@ impl DataRouter {
             }
             return Some((read_len, SyncServeArm::Staged));
         }
+        // The INLINE layout — mirror of the handler's inline serve: the
+        // payload is the layout record's `data_key` (RAM-authoritative;
+        // every inline write publishes it synchronously), a shorter
+        // payload than the logical size zero-pads (the truncate-up hole
+        // tail). Since the inline raise this is the whole small-file
+        // population's warm serve; without the arm every one demoted.
+        if meta.file_type == "inline" {
+            let payload: &[u8] = meta.data_key.as_deref().unwrap_or(&[]);
+            let start = (offset as usize).min(payload.len());
+            let end = (offset as usize + read_len).min(payload.len());
+            METRICS.cache_hits.fetch_add(1, Ordering::Relaxed);
+            out.write_at(0, &payload[start..end]);
+            if end - start < read_len {
+                out.zero_at(end - start, read_len - (end - start));
+            }
+            return Some((read_len, SyncServeArm::Inline));
+        }
         if meta.file_type != "striped" {
             return None;
         }
@@ -15965,9 +16226,11 @@ impl DataRouter {
         }
 
         let end_offset = (offset as usize) + data.len();
+        // The inline ceiling in force for this ino's volume (derived from
+        // its KV value cap; `SQUEEZEFS_INLINE_MAX_BYTES` overrides).
+        let inline_max = self.inline_max_bytes(ino);
         let _staged_block_guard = if meta.file_type == "staged"
-            || (meta.file_type == "inline"
-                && end_offset > crate::fuse_client::MAX_INLINE_SIZE as usize)
+            || (meta.file_type == "inline" && end_offset > inline_max)
         {
             // RW1: the staged_write lock site (the FIND-VS-B staged-layout
             // sibling shape) — same lock, rig-attributed.
@@ -16091,7 +16354,7 @@ impl DataRouter {
         }
 
         let stripe_threshold = if self.cache.nvme.staging_dirs().is_empty() {
-            MAX_INLINE_SIZE
+            inline_max
         } else {
             self.block_size.load(Ordering::Acquire) as usize
         };
@@ -16467,11 +16730,12 @@ impl DataRouter {
                 existing_data.resize(end_offset, 0);
             }
             existing_data[offset as usize..end_offset].copy_from_slice(&data);
-            if new_size <= MAX_INLINE_SIZE {
+            if new_size <= inline_max {
                 // The inline arm RETAINS its payload (meta.data_key + both
-                // RAM LRUs): re-materialize exact-size so a tiny inline
+                // RAM LRUs): re-materialize exact-size so a small inline
                 // file never pins the pooled 4 MiB backing (the flood in
-                // retention clothes). ≤ MAX_INLINE bytes — trivial.
+                // retention clothes). ≤ the inline ceiling — bounded by
+                // one KV value.
                 let exact = bytes::Bytes::copy_from_slice(&existing_data);
                 drop(existing_data); // recycle the pooled backing now
                 exact
@@ -16484,7 +16748,7 @@ impl DataRouter {
             }
         };
 
-        if new_size <= MAX_INLINE_SIZE {
+        if new_size <= inline_max {
             // Layout: inline — RAM only until fsync/release (writeback).
             crate::fuse_client::METRICS
                 .layout_inline_writes
@@ -16743,7 +17007,7 @@ impl DataRouter {
             self.cache.read_lru.put(file_path, shared_data);
         }
         // No further arm: past the promotion branch `new_size <=
-        // stripe_threshold`, which is MAX_INLINE_SIZE on cache-less volumes
+        // stripe_threshold`, which is the inline ceiling on cache-less volumes
         // (inline arm always matches) and block_size when staging dirs exist
         // (staged arm always matches).
 

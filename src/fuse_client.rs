@@ -7433,14 +7433,15 @@ pub struct Metrics {
     pub staging_put_bytes_flush: Align64<AtomicU64>,
     pub staging_put_bytes_teardown: Align64<AtomicU64>,
     pub staging_put_bytes_wt_fallback: Align64<AtomicU64>,
-    /// The dismount promotion pass (`.benchmarks/2026-09-09-dismount-
-    /// staged-residue.md` §7 item 3): staged-LAYOUT files the clean
-    /// unmount promoted to the shared backend (`files` / their ring-entry
-    /// `bytes`) and the ones whose promotion FAILED (they stay resident,
-    /// recovered by the next mount at this mount point; `failures` growth
-    /// pairs with the ERROR line naming the first causes). The engagement
-    /// gauge: a clean unmount of a mount that held staged-layout files
-    /// must move `files` by that population.
+    /// The dismount promotion pass
+    /// (`.benchmarks/2026-09-09-dismount-staged-residue.md` §7 item 3):
+    /// staged-LAYOUT files the clean unmount promoted to the shared
+    /// backend (`files` / their ring-entry `bytes`) and the ones whose
+    /// promotion FAILED (they stay resident, recovered by the next mount
+    /// at this mount point; `failures` growth pairs with the ERROR line
+    /// naming the first causes). The engagement gauge: a clean unmount of
+    /// a mount that held staged-layout files must move `files` by that
+    /// population.
     pub dismount_promoted_files: Align64<AtomicU64>,
     pub dismount_promoted_bytes: Align64<AtomicU64>,
     pub dismount_promote_failures: Align64<AtomicU64>,
@@ -22068,11 +22069,12 @@ impl SqueezefsFilesystem {
         Ok(self.flush_all_staged_blocks_to_backend().await)
     }
 
-    /// The dismount promotion pass (`.benchmarks/2026-09-09-dismount-
-    /// staged-residue.md` §7 item 3): promote every resident staged-LAYOUT
-    /// file — the `staged_ledger` population, whose whole payload is one
-    /// `file_id` ring entry and whose ONLY copy is this host's staging root
-    /// — to the shared backend through the merge worker's own primitive
+    /// The dismount promotion pass
+    /// (`.benchmarks/2026-09-09-dismount-staged-residue.md` §7 item 3):
+    /// promote every resident staged-LAYOUT file — the `staged_ledger`
+    /// population, whose whole payload is one `file_id` ring entry and
+    /// whose ONLY copy is this host's staging root — to the shared
+    /// backend through the merge worker's own primitive
     /// (`DataRouter::promote_staged_file`: one backend block + one layout
     /// commit + the ring-entry release, per file). A clean unmount is a
     /// durability boundary for every other custody class this teardown

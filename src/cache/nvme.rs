@@ -1020,8 +1020,10 @@ pub struct NvmeStaging {
     /// remove (O(1); `scc::HashMap::len` walks the bucket array) and
     /// polled by the dismount drain wait. `staged_writes_in_flight` is NOT
     /// that predicate: it counts every ring key, and a resident
-    /// staged-LAYOUT `file_id` entry is retired by no teardown step, so a
-    /// wait on it ran to the timer on every unmount of such a mount
+    /// staged-LAYOUT `file_id` entry is retired by no teardown WAIT (the
+    /// dismount promotion pass that drains that population is a work
+    /// step, awaited to completion), so a wait on it ran to the timer on
+    /// every unmount of such a mount
     /// (.benchmarks/2026-09-09-dismount-staged-residue.md §1.3).
     active_block_custody: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     /// Router hook for the merge worker: promotion must commit layout through
@@ -1569,29 +1571,54 @@ impl NvmeStaging {
     /// is held across a shard-write wait must park this TASK, never the
     /// executor thread. Both callers are `stage_write` (async context).
     async fn kick_promotion(&self, exclude_file_id: &str, max_items: usize) {
+        for item in self
+            .collect_resident_staged(Some(exclude_file_id), max_items)
+            .await
+        {
+            if self.write_tx.try_send(item).is_err() {
+                break;
+            }
+        }
+    }
+
+    /// Up to `max_items` budget-counted staged-layout entries (minus
+    /// `exclude_file_id`), each with its ring header's path and stage-time
+    /// fencing token — the promotion work list. An entry whose header is
+    /// unreadable is left out (the ring is authoritative; the ledger row
+    /// alone cannot name the inode). Async by the ledger-lock invariant
+    /// (`stage_write`'s prior-cost read).
+    async fn collect_resident_staged(
+        &self,
+        exclude_file_id: Option<&str>,
+        max_items: usize,
+    ) -> Vec<PendingStagedWrite> {
         let mut pending: Vec<(String, u64)> = Vec::new();
         self.staged_ledger
             .iter_async(|file_id, (cost, _)| {
-                if file_id != exclude_file_id {
+                if exclude_file_id != Some(file_id.as_str()) {
                     pending.push((file_id.clone(), *cost));
                 }
                 pending.len() < max_items
             })
             .await;
-        for (file_id, cost) in pending {
-            let Some(meta) = self.staged_meta_of(&file_id) else {
-                continue;
-            };
-            let item = PendingStagedWrite {
-                file_path: meta.file_path,
-                file_id,
-                fencing_token: meta.fencing_token,
-                padded_size: cost,
-            };
-            if self.write_tx.try_send(item).is_err() {
-                break;
-            }
-        }
+        pending
+            .into_iter()
+            .filter_map(|(file_id, cost)| {
+                let meta = self.staged_meta_of(&file_id)?;
+                Some(PendingStagedWrite {
+                    file_path: meta.file_path,
+                    file_id,
+                    fencing_token: meta.fencing_token,
+                    padded_size: cost,
+                })
+            })
+            .collect()
+    }
+
+    /// Every resident staged-layout entry — the dismount promotion pass's
+    /// work list (`SqueezefsFilesystem::promote_all_staged_files_at_dismount`).
+    pub(crate) async fn resident_staged_files(&self) -> Vec<PendingStagedWrite> {
+        self.collect_resident_staged(None, usize::MAX).await
     }
 
     /// Read the staged header for `file_id` from the ring (no payload copy).

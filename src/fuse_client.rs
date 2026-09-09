@@ -7433,6 +7433,17 @@ pub struct Metrics {
     pub staging_put_bytes_flush: Align64<AtomicU64>,
     pub staging_put_bytes_teardown: Align64<AtomicU64>,
     pub staging_put_bytes_wt_fallback: Align64<AtomicU64>,
+    /// The dismount promotion pass (`.benchmarks/2026-09-09-dismount-
+    /// staged-residue.md` §7 item 3): staged-LAYOUT files the clean
+    /// unmount promoted to the shared backend (`files` / their ring-entry
+    /// `bytes`) and the ones whose promotion FAILED (they stay resident,
+    /// recovered by the next mount at this mount point; `failures` growth
+    /// pairs with the ERROR line naming the first causes). The engagement
+    /// gauge: a clean unmount of a mount that held staged-layout files
+    /// must move `files` by that population.
+    pub dismount_promoted_files: Align64<AtomicU64>,
+    pub dismount_promoted_bytes: Align64<AtomicU64>,
+    pub dismount_promote_failures: Align64<AtomicU64>,
     /// Writeback-queue admissions by driver (the §1.2 attribution honesty
     /// check: on the pure O_DIRECT rand shape the foreground write path
     /// enqueues NOTHING — `wt_fallback` stays 0 and the queued durable
@@ -8635,13 +8646,20 @@ pub struct WritebackRequest {
     pub attempts: u32,
 }
 
-/// Aggregated result of the dismount active-block force-flush: one report
-/// per unmount, never a log line per block.
+/// Aggregated result of a dismount pass (the active-block force-flush,
+/// the staged-layout promotion): one report per unmount, never a log line
+/// per entry.
 #[derive(Debug, Default)]
 pub struct TeardownFlushSummary {
     pub attempted: usize,
+    /// Entries the pass moved to the backend (flushed blocks / promoted
+    /// files).
     pub flushed: usize,
     pub failed: usize,
+    /// Entries the pass declined without error — the promotion pass's
+    /// identity-moved / no-inode / live-extent-record skips, which stay
+    /// resident (the census names them). Always 0 for the block flush.
+    pub skipped: usize,
     /// First few failure reasons (bounded) for the aggregated log line.
     pub error_samples: Vec<String>,
 }
@@ -11832,6 +11850,9 @@ impl SqueezefsFilesystem {
                 "staging_put_bytes_flush": METRICS.staging_put_bytes_flush.load(Ordering::Relaxed),
                 "staging_put_bytes_teardown": METRICS.staging_put_bytes_teardown.load(Ordering::Relaxed),
                 "staging_put_bytes_wt_fallback": METRICS.staging_put_bytes_wt_fallback.load(Ordering::Relaxed),
+                "dismount_promoted_files": METRICS.dismount_promoted_files.load(Ordering::Relaxed),
+                "dismount_promoted_bytes": METRICS.dismount_promoted_bytes.load(Ordering::Relaxed),
+                "dismount_promote_failures": METRICS.dismount_promote_failures.load(Ordering::Relaxed),
                 "writeback_enqueued_drain": METRICS.writeback_enqueued_drain.load(Ordering::Relaxed),
                 "writeback_enqueued_flush": METRICS.writeback_enqueued_flush.load(Ordering::Relaxed),
                 "writeback_enqueued_teardown": METRICS.writeback_enqueued_teardown.load(Ordering::Relaxed),
@@ -22047,6 +22068,131 @@ impl SqueezefsFilesystem {
         Ok(self.flush_all_staged_blocks_to_backend().await)
     }
 
+    /// The dismount promotion pass (`.benchmarks/2026-09-09-dismount-
+    /// staged-residue.md` §7 item 3): promote every resident staged-LAYOUT
+    /// file — the `staged_ledger` population, whose whole payload is one
+    /// `file_id` ring entry and whose ONLY copy is this host's staging root
+    /// — to the shared backend through the merge worker's own primitive
+    /// (`DataRouter::promote_staged_file`: one backend block + one layout
+    /// commit + the ring-entry release, per file). A clean unmount is a
+    /// durability boundary for every other custody class this teardown
+    /// drains (rewrite epochs, overlays, active blocks); before this pass
+    /// only staging-pool pressure ever promoted these, so every other
+    /// client of the volume set read them as zeros indefinitely.
+    ///
+    /// Concurrency: `bg_admit::striped_block_concurrency`, the active-block
+    /// sweep's own law. Fencing: each promotion presents the ino's CURRENT
+    /// generation (the supersession-aware law — FIND-M11-A): the ring
+    /// header's stage-time token can trail a later lease on the same ino,
+    /// and this is the mount's own authoritative exit. Outcome per file:
+    /// promoted (counted, `dismount_promoted_*`), skipped (`Ok(false)` —
+    /// no inode record / identity moved / a live extent record: the entry
+    /// stays resident and the census names it), or failed (counted,
+    /// sampled, the entry stays resident — recovered at the next mount
+    /// exactly as before). Nothing here is ever swallowed.
+    pub async fn promote_all_staged_files_at_dismount(&self) -> TeardownFlushSummary {
+        let pending = self.router.cache.nvme.resident_staged_files().await;
+        let mut summary = TeardownFlushSummary {
+            attempted: pending.len(),
+            ..Default::default()
+        };
+        if pending.is_empty() {
+            return summary;
+        }
+        info!(
+            "FUSE Daemon: promoting {} resident staged-layout file(s) to the shared backend \
+             at dismount...",
+            pending.len()
+        );
+
+        let sem = std::sync::Arc::new(squeezefs_ipc::sqz_semaphore::Semaphore::new(
+            crate::bg_admit::striped_block_concurrency(),
+        ));
+        let mut tasks = futures::stream::FuturesUnordered::new();
+        for item in pending {
+            let sem_clone = sem.clone();
+            let router_clone = self.router.clone();
+            let dlm_clone = self.dlm.clone();
+            tasks.push(crate::meta_exec::spawn_meta_join(
+                "dismount_staged_promote",
+                async move {
+                    let _permit = sem_clone.acquire().await.ok();
+                    let ino = crate::routing::parse_inode_from_path(&item.file_path);
+                    let token = dlm_clone.get_fencing_token_ino(ino);
+                    router_clone
+                        .promote_staged_file(&item.file_path, &item.file_id, token)
+                        .await
+                        .map(|promoted| (promoted, item.padded_size))
+                },
+            ));
+        }
+
+        use futures::StreamExt;
+        const ERROR_SAMPLES: usize = 3;
+        let mut promoted_bytes = 0u64;
+        while let Some(res) = tasks.next().await {
+            match res {
+                Err(join_err) => {
+                    summary.failed += 1;
+                    if summary.error_samples.len() < ERROR_SAMPLES {
+                        summary
+                            .error_samples
+                            .push(format!("task panicked: {join_err:?}"));
+                    }
+                }
+                Ok(Err(e)) => {
+                    summary.failed += 1;
+                    if summary.error_samples.len() < ERROR_SAMPLES {
+                        summary.error_samples.push(format!("{e:?}"));
+                    }
+                }
+                Ok(Ok((true, bytes))) => {
+                    summary.flushed += 1;
+                    promoted_bytes += bytes;
+                }
+                Ok(Ok((false, _))) => summary.skipped += 1,
+            }
+        }
+        METRICS
+            .dismount_promoted_files
+            .fetch_add(summary.flushed as u64, Ordering::Relaxed);
+        METRICS
+            .dismount_promoted_bytes
+            .fetch_add(promoted_bytes, Ordering::Relaxed);
+        METRICS
+            .dismount_promote_failures
+            .fetch_add(summary.failed as u64, Ordering::Relaxed);
+
+        // One aggregated report per class, never a line per file (the
+        // caller owns the ERROR-level verdict on `failed`).
+        if summary.failed > 0 {
+            warn!(
+                "dismount: staged-layout promotion: {} promoted, {} failed, {} skipped of {} \
+                 (first errors: {:?}) — failed and skipped entries stay in local staging and \
+                 are recovered by the next mount at this mount point",
+                summary.flushed,
+                summary.failed,
+                summary.skipped,
+                summary.attempted,
+                summary.error_samples
+            );
+        } else if summary.skipped > 0 {
+            warn!(
+                "dismount: staged-layout promotion: {} promoted, {} skipped of {} (no inode \
+                 record, identity moved, or a live extent record) — skipped entries stay in \
+                 local staging and are recovered by the next mount at this mount point",
+                summary.flushed, summary.skipped, summary.attempted
+            );
+        } else {
+            info!(
+                "FUSE Daemon: dismount promoted {} staged-layout file(s) ({promoted_bytes} B) \
+                 to the shared backend.",
+                summary.flushed
+            );
+        }
+        summary
+    }
+
     /// Whether dismount teardown has begun (destroy runs once per unmount;
     /// duplicate per-queue invocations are no-ops).
     pub fn dismount_started(&self) -> bool {
@@ -22904,11 +23050,12 @@ impl SqueezefsFilesystem {
         // Wait up to `dismount_wait` for the writeback worker to retire the
         // active-block custody the sweep above did not (its own requeues,
         // a unit mid-flight). The predicate is the active-block-family
-        // population — the ONLY ring records a teardown step retires.
+        // population — the ring records the sweep and the worker retire.
         // `staged_writes_in_flight` counts every ring key, and a resident
-        // staged-LAYOUT `file_id` entry is drained by nothing here, so a
-        // wait on it ran to the timer on every unmount of a mount holding
-        // one (.benchmarks/2026-09-09-dismount-staged-residue.md §1.3).
+        // staged-LAYOUT `file_id` entry is drained by neither, so a wait
+        // on it ran to the timer on every unmount of a mount holding one
+        // (.benchmarks/2026-09-09-dismount-staged-residue.md §1.3); the
+        // staged-layout population has its own WORK pass below, not a wait.
         let start_wait = std::time::Instant::now();
         let max_wait = std::time::Duration::from_secs(self.dismount_wait);
         loop {
@@ -22922,6 +23069,30 @@ impl SqueezefsFilesystem {
             }
             let notify = self.router.cache.nvme.staged_drained_notify.clone();
             let _ = squeezefs_ipc::sqz_time::timeout(remaining, notify.notified()).await;
+        }
+
+        // The staged-layout promotion pass (§7 item 3): every resident
+        // staged-layout file becomes one shared-backend block, so the
+        // segment is EMPTY at "Dismount clean" and every other client of
+        // the set can read the files. Ordered here on purpose: after the
+        // active-block retire (a file's staged sibling never races its
+        // promotion), before the finding-48 data barrier (the promoted
+        // blocks' DMA is under it — DUR-1) and before the reclaim drain
+        // (a re-promotion's displaced copy is one of the frees it must
+        // return). Composition with `dismount_wait`: the teardown's
+        // PARKING steps (the pipeline quiesce, the drain wait above) are
+        // each bounded by it; its WORK steps (the block sweep, this pass)
+        // run to completion, bounded by the work itself — one block + one
+        // metadata commit per file — and the process-exit guard
+        // (`dismount_wait + 60 s`, `run_mount`) bounds the whole teardown.
+        let promoted = self.promote_all_staged_files_at_dismount().await;
+        if promoted.failed > 0 {
+            error!(
+                "dismount: {} of {} staged-layout files failed to promote (first errors: \
+                 {:?}) — they stay in local staging, recovered by the next mount at this \
+                 mount point and read as ZEROS by every other client until then",
+                promoted.failed, promoted.attempted, promoted.error_samples
+            );
         }
 
         // Finding 48: a clean unmount is a durability boundary for every
@@ -22950,11 +23121,13 @@ impl SqueezefsFilesystem {
 
         // The census, in its two classes. `active_block:` records are
         // unflushed write custody — the WARN. Everything else is a
-        // staged-LAYOUT file: acked bytes whose ONLY copy is this host's
-        // staging root, recovered byte-exact by the next mount at this
-        // mount point and invisible (zeros) to every other client of the
-        // set until promoted — a fact to state exactly, not a loss to
-        // warn about (.benchmarks/2026-09-09-dismount-staged-residue.md §6).
+        // staged-LAYOUT file the promotion pass above left resident
+        // (failed or skipped — a clean unmount promotes them all): acked
+        // bytes whose ONLY copy is this host's staging root, recovered
+        // byte-exact by the next mount at this mount point and invisible
+        // (zeros) to every other client of the set until promoted — a fact
+        // to state exactly, not a loss to warn about
+        // (.benchmarks/2026-09-09-dismount-staged-residue.md §6).
         let keys = self.router.cache.nvme.list_staged_files();
         let mut staged_count = 0;
         let mut active_writes_count = 0;
@@ -22970,13 +23143,15 @@ impl SqueezefsFilesystem {
             let nvme = &self.router.cache.nvme;
             info!(
                 "staged-layout files resident in local staging at dismount: {staged_count} \
-                 ({} B) — acked bytes whose ONLY copy is this host's staging root {}; \
-                 recovered byte-exact by the next mount at this mount point (or adopted with \
-                 -o client_slot=…), NOT promoted to the shared backend (promotion is \
-                 pool-pressure-driven), and read as ZEROS by every other client of this \
-                 volume set until promoted. Unmount is clean for the data-plane custody \
+                 ({} B) — NOT promoted by this dismount ({} failed, {} skipped; see the \
+                 promotion report above): acked bytes whose ONLY copy is this host's staging \
+                 root {}; recovered byte-exact by the next mount at this mount point (or \
+                 adopted with -o client_slot=…), and read as ZEROS by every other client of \
+                 this volume set until promoted. Unmount is clean for the data-plane custody \
                  ({active_writes_count} active write blocks remain).",
                 nvme.current_staged_write_bytes.load(Ordering::Relaxed),
+                promoted.failed,
+                promoted.skipped,
                 nvme.staging_dirs()
                     .first()
                     .map(|p| p.display().to_string())

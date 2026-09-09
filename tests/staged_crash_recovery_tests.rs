@@ -6,9 +6,10 @@
 //!
 //! - **acked+fsynced** staged data is `fsync`-durable ON THE RING: fsync
 //!   syncs the ring shard and commits the staged layout, it does NOT
-//!   promote (promotion is staging-pool-pressure-driven —
-//!   `.benchmarks/2026-09-09-dismount-staged-residue.md` §1.2), so after a
-//!   crash the same-root remount recovers it byte-exact from the ring;
+//!   promote (promotion happens at the mount's clean unmount or under
+//!   staging-pool pressure — `.benchmarks/2026-09-09-dismount-staged-residue.md`
+//!   §1.2/§7), so after a crash the same-root remount recovers it
+//!   byte-exact from the ring;
 //! - **acked-unfsynced** staged data MAY be lost by the crash, but a
 //!   remount must never turn it into an error: recover what is intact,
 //!   discard-and-log what is torn, and reads of a staged file whose

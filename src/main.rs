@@ -7379,11 +7379,12 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             // Prompt the user if not forced and stdin is a TTY. Two classes
             // (.benchmarks/2026-09-09-dismount-staged-residue.md §6): active
             // write blocks are custody the daemon's writeback DRAINS, so
-            // waiting can succeed; staged-LAYOUT files are drained by
-            // nothing — they stay in this host's staging root (recovered by
-            // the next mount at this mount point, read as zeros by every
-            // other client until promoted), so "[w] Wait" is never offered
-            // for them alone: it could only run to the timer.
+            // waiting can succeed; staged-LAYOUT files are drained by no
+            // wait — the daemon's dismount teardown PROMOTES them to the
+            // shared backend (one block + one commit each), and until then
+            // their only copy is this host's staging root — so "[w] Wait"
+            // is never offered for them alone: it could only run to the
+            // timer.
             if has_unflushed && !force && std::io::stdin().is_terminal() {
                 let can_drain = active_writes_count > 0;
                 if can_drain {
@@ -7401,10 +7402,11 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                         "Staged-layout files resident in this host's local staging: {staged_count}"
                     );
                     println!(
-                        "  Their only copy is this host's staging root: the next mount at this \
-                         mount point recovers them byte-exact; other clients of the volume set \
-                         read them as zeros until promoted (promotion is pool-pressure-driven \
-                         — an unmount wait cannot drain them)."
+                        "  Their only copy is this host's staging root until the daemon's unmount \
+                         teardown promotes them to the shared backend (part of the unmount — an \
+                         unmount wait does not drain them); a file the promotion cannot move is \
+                         recovered by the next mount at this mount point and read as zeros by \
+                         other clients until then."
                     );
                 }
                 println!("\nChoose an option:");
@@ -7413,7 +7415,10 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                         "  [w] Wait for active write blocks to flush to the NVMe-oF backend (recommended)"
                     );
                 }
-                println!("  [c] Continue unmount now (staged data stays on disk; the next mount recovers it)");
+                println!(
+                    "  [c] Continue unmount now (the daemon's teardown promotes staged-layout files \
+                     and flushes what it can; the next mount recovers the rest)"
+                );
                 println!("  [a] Abort unmount");
                 if can_drain {
                     print!("Select option [w/c/a]: ");

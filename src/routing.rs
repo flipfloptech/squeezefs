@@ -13603,9 +13603,9 @@ impl DataRouter {
         log::warn!(
             "staged payload for {file_path} (file id {file_id}) is not resident in THIS \
              client's staging root and was never promoted to the shared backend — another \
-             client's local staged-layout custody (promoted only under that client's \
-             staging-pool pressure), or a crash discarded it; serving size-consistent zeros \
-             (D0 degrade contract)"
+             client's live local staged-layout custody (promoted at that client's clean \
+             unmount or under its staging-pool pressure), or a crash discarded it; serving \
+             size-consistent zeros (D0 degrade contract)"
         );
     }
 

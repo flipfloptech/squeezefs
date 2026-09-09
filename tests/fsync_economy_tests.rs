@@ -5,10 +5,10 @@
 //! Contracts (red-first):
 //!
 //! 1. **The instrument** — `fsync_phase_ns` is always-on and EXACT-SUM:
-//!    `intent_barrier + data_flush + data_barrier + meta_publish +
-//!    meta_barrier + extent_barrier ≡ total` to the ns, every phase's
-//!    count ≡ total's count, rendered through the one histogram shape on
-//!    the stats inode beside the `fsync_*` counters.
+//!    `intent_barrier + data_flush + staged_promote + data_barrier +
+//!    meta_publish + meta_barrier + extent_barrier ≡ total` to the ns,
+//!    every phase's count ≡ total's count, rendered through the one
+//!    histogram shape on the stats inode beside the `fsync_*` counters.
 //! 2. **Touched-namespace flush** — an ino whose blocks all live on volume
 //!    A never barriers volume B (per-device barrier epochs are the
 //!    witness); a clean fsync is a counted DATA no-op (zero device
@@ -26,6 +26,11 @@
 //! 6. **Durability ordering is untouched** — a faulted data barrier fails
 //!    the fsync and the meta barrier never runs (the DUR-1 leg, restated
 //!    on the new ladder).
+//! 7. **The staged-promotion lever** (`SQUEEZEFS_FSYNC_PROMOTE_STAGED`,
+//!    default off) — on, the fsync of a staged-layout file promotes it
+//!    exactly once in its own `staged_promote` leg; an entry a racing
+//!    promoter already released is a counted no-op, never an error; off,
+//!    the entry stays resident and no gauge moves.
 
 use fuse3::raw::prelude::Filesystem;
 use fuse3::raw::Request;
@@ -69,6 +74,7 @@ impl Drop for LeverGuard {
     fn drop(&mut self) {
         fsync_economy::test_set_touched_namespaces(None);
         fsync_economy::test_set_parallel_legs(None);
+        fsync_economy::test_set_promote_staged(None);
         squeezefs::fuse_client::set_inplace_overwrite(false);
         squeezefs::dev_power_cut::clear_faults();
     }
@@ -365,6 +371,7 @@ async fn fsync_phase_family_is_exact_sum_and_rides_the_stats_inode() {
         [
             "intent_barrier",
             "data_flush",
+            "staged_promote",
             "data_barrier",
             "meta_publish",
             "meta_barrier",
@@ -372,7 +379,7 @@ async fn fsync_phase_family_is_exact_sum_and_rides_the_stats_inode() {
             "total",
         ]
     );
-    assert_eq!(FsyncPhase::Total as usize, 6);
+    assert_eq!(FsyncPhase::Total as usize, 7);
     let fx = open_fx(1, "phase").await;
     let ino = create(&fx, "phase.bin").await;
     write_at(&fx, ino, 0, &pattern((2 * BS) as usize, 0x11)).await;
@@ -948,6 +955,153 @@ async fn fsync_storm_rows() {
     ] {
         storm_leg(label, touched, parallel, files, streams, dev_lat, meta_lat).await;
     }
+}
+
+// ---------------------------------------------------------------------------
+// 7 — the staged-promotion lever (`SQUEEZEFS_FSYNC_PROMOTE_STAGED`)
+// ---------------------------------------------------------------------------
+
+/// A staged-layout file (4 KiB < size < BS on this fixture's staging dir):
+/// its RAM layout says `staged`/`file_id`, no `block_map[0]`, and the
+/// ring holds its payload.
+async fn staged_file(fx: &Fx, name: &str, tag: u8) -> (u64, String) {
+    let ino = create(fx, name).await;
+    write_at(fx, ino, 0, &pattern(16 * 1024, tag)).await;
+    let m = fx
+        .fs
+        .router
+        .metadata_cache
+        .get(&ino)
+        .expect("RAM layout published by the write");
+    assert_eq!(m.file_type, "staged", "fixture premise: staged layout");
+    let file_id = m
+        .file_id
+        .as_deref()
+        .expect("staged layout carries file_id")
+        .to_string();
+    assert!(
+        fx.fs.router.cache.nvme.read_staged(&file_id).is_some(),
+        "fixture premise: payload resident in the ring"
+    );
+    (ino, file_id)
+}
+
+fn promote_gauges() -> (u64, u64, u64, u64) {
+    (
+        metric(&METRICS.fsync_promoted_files),
+        metric(&METRICS.fsync_promoted_bytes),
+        metric(&METRICS.fsync_promote_failures),
+        metric(&METRICS.fsync_promote_noops),
+    )
+}
+
+/// Lever on: the fsync promotes the file (block_map[0] named, ring entry
+/// released, `fsync_promoted_*` moved, the `staged_promote` leg carries
+/// the time and the family stays exact-sum); a second fsync has nothing
+/// to move (no second promotion, no no-op — the map says promoted); an
+/// fsync of a staged file whose ring entry is GONE before the promotion
+/// commits (the racing-promoter shape: `promote_staged_file`'s
+/// generation-gated commit refuses) is a counted no-op that does not fail
+/// the fsync. Lever off: the fsync leaves the entry resident and moves no
+/// gauge.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn staged_promotion_lever_promotes_exactly_once_on_fsync() {
+    let _g = serial().await;
+    let _l = LeverGuard;
+    // Touched-namespace barriers ON: the promoted block's device is
+    // barriered only if the promotion STAMPED it.
+    fsync_economy::test_set_touched_namespaces(Some(true));
+    let fx = open_fx(1, "promote").await;
+    squeezefs::dev_power_cut::arm_power_cut(fx.dev_path(0));
+    let sp = FsyncPhase::StagedPromote as usize;
+    let total = FsyncPhase::Total as usize;
+
+    // Off (the shipped default): resident, nothing promoted.
+    fsync_economy::test_set_promote_staged(Some(false));
+    let (ino_off, fid_off) = staged_file(&fx, "off.bin", 0x21).await;
+    let g0 = promote_gauges();
+    fsync(&fx, ino_off).await;
+    assert!(
+        fx.fs.router.cache.nvme.read_staged(&fid_off).is_some(),
+        "lever off: the fsync'd staged-layout file stays resident"
+    );
+    assert_eq!(promote_gauges(), g0, "lever off: no promotion gauge moves");
+
+    // On: promoted exactly once, in its own leg — and the promoted
+    // block's device is barriered by THIS fsync (the DMA stamped the
+    // touched table; DUR-1: the barrier precedes the meta barrier that
+    // names the block).
+    fsync_economy::test_set_promote_staged(Some(true));
+    let (ino, fid) = staged_file(&fx, "on.bin", 0x22).await;
+    let before = phase_words();
+    let (files0, bytes0, fail0, noop0) = promote_gauges();
+    let epoch0 = barrier_epoch(&fx.dev_path(0));
+    let flushed0 = metric(&METRICS.fsync_data_namespaces_flushed);
+    fsync(&fx, ino).await;
+    let after = phase_words();
+    let (files1, bytes1, fail1, noop1) = promote_gauges();
+    assert_eq!(files1 - files0, 1, "one promotion");
+    assert_eq!(bytes1 - bytes0, 16 * 1024, "the file's size at promotion");
+    assert_eq!((fail1, noop1), (fail0, noop0), "no failure, no no-op");
+    assert_eq!(
+        barrier_epoch(&fx.dev_path(0)) - epoch0,
+        1,
+        "the promoting fsync barriers the device the promoted block landed on (stamped)"
+    );
+    assert_eq!(
+        metric(&METRICS.fsync_data_namespaces_flushed) - flushed0,
+        1,
+        "one touched namespace flushed by the promoting fsync"
+    );
+    assert!(
+        fx.fs.router.cache.nvme.read_staged(&fid).is_none(),
+        "the ring entry is released by the promotion"
+    );
+    let m = fx.fs.router.metadata_cache.get(&ino).expect("layout");
+    assert!(
+        m.block_map.as_ref().is_some_and(|bm| bm.contains_key(&0)),
+        "block_map[0] names the promoted block"
+    );
+    assert_eq!(after.count[sp] - before.count[sp], 1);
+    assert!(
+        after.sum_ns[sp] > before.sum_ns[sp],
+        "the staged_promote leg carries the promotion's time"
+    );
+    let leg_sum: u64 = (0..total).map(|i| after.sum_ns[i] - before.sum_ns[i]).sum();
+    assert_eq!(
+        leg_sum,
+        after.sum_ns[total] - before.sum_ns[total],
+        "Σ legs ≡ total with the new leg"
+    );
+    // The promoted bytes read back through the durable mapping.
+    let reply = fx
+        .fs
+        .read(req(), ino, 0, 0, 16 * 1024, 0)
+        .await
+        .expect("read promoted file");
+    assert_eq!(reply.data.as_ref(), &pattern(16 * 1024, 0x22)[..]);
+
+    // A second fsync: already promoted, nothing to move, nothing counted.
+    fsync(&fx, ino).await;
+    assert_eq!(
+        promote_gauges(),
+        (files1, bytes1, fail1, noop1),
+        "a second fsync of a promoted file is not a promotion and not a no-op"
+    );
+
+    // The racing-promoter shape: the entry is gone, the RAM layout still
+    // says staged/no map (a peer's promotion has not published yet, or
+    // the crash-discard shape) — a counted no-op, the fsync succeeds.
+    let (ino_gone, fid_gone) = staged_file(&fx, "gone.bin", 0x23).await;
+    fx.fs.router.cache.nvme.remove_staged(&fid_gone);
+    let (files2, _, fail2, noop2) = promote_gauges();
+    fsync(&fx, ino_gone).await;
+    let (files3, _, fail3, noop3) = promote_gauges();
+    assert_eq!(files3, files2, "an entry that is gone promotes nothing");
+    assert_eq!(fail3, fail2, "…and is not a failure");
+    assert_eq!(noop3 - noop2, 1, "…it is the counted no-op");
+
+    fx.close().await;
 }
 
 // ---------------------------------------------------------------------------

@@ -7445,6 +7445,20 @@ pub struct Metrics {
     pub dismount_promoted_files: Align64<AtomicU64>,
     pub dismount_promoted_bytes: Align64<AtomicU64>,
     pub dismount_promote_failures: Align64<AtomicU64>,
+    /// The fsync-promotes-staged lever (`SQUEEZEFS_FSYNC_PROMOTE_STAGED`,
+    /// default off — the pricing arm of the same note's §7 item 3):
+    /// staged-LAYOUT files an fsync promoted to the shared backend
+    /// (`files` / the file's size at promotion in `bytes`), promotions
+    /// that FAILED (the fsync still succeeded on the local durability;
+    /// the entry stays resident, WARN-logged) and the counted NO-OPS — an
+    /// fsync that found the entry already gone by the time its promotion
+    /// committed (a racing fsync, the merge worker or the dismount pass
+    /// got there first; exactly-once by `promote_staged_file`'s
+    /// generation-gated commit). All 0 with the lever off.
+    pub fsync_promoted_files: Align64<AtomicU64>,
+    pub fsync_promoted_bytes: Align64<AtomicU64>,
+    pub fsync_promote_failures: Align64<AtomicU64>,
+    pub fsync_promote_noops: Align64<AtomicU64>,
     /// Writeback-queue admissions by driver (the §1.2 attribution honesty
     /// check: on the pure O_DIRECT rand shape the foreground write path
     /// enqueues NOTHING — `wt_fallback` stays 0 and the queued durable
@@ -11854,6 +11868,10 @@ impl SqueezefsFilesystem {
                 "dismount_promoted_files": METRICS.dismount_promoted_files.load(Ordering::Relaxed),
                 "dismount_promoted_bytes": METRICS.dismount_promoted_bytes.load(Ordering::Relaxed),
                 "dismount_promote_failures": METRICS.dismount_promote_failures.load(Ordering::Relaxed),
+                "fsync_promoted_files": METRICS.fsync_promoted_files.load(Ordering::Relaxed),
+                "fsync_promoted_bytes": METRICS.fsync_promoted_bytes.load(Ordering::Relaxed),
+                "fsync_promote_failures": METRICS.fsync_promote_failures.load(Ordering::Relaxed),
+                "fsync_promote_noops": METRICS.fsync_promote_noops.load(Ordering::Relaxed),
                 "writeback_enqueued_drain": METRICS.writeback_enqueued_drain.load(Ordering::Relaxed),
                 "writeback_enqueued_flush": METRICS.writeback_enqueued_flush.load(Ordering::Relaxed),
                 "writeback_enqueued_teardown": METRICS.writeback_enqueued_teardown.load(Ordering::Relaxed),
@@ -20609,12 +20627,64 @@ impl SqueezefsFilesystem {
             .await?;
         self.flush_active_blocks_with_retry(ino, fencing_token)
             .await?;
-        let file_id_opt = self
-            .router
-            .metadata_cache
-            .get(&ino)
-            .and_then(|m| m.file_id.clone());
+        let staged_identity = self.router.metadata_cache.get(&ino).map(|m| {
+            (
+                m.file_id.clone(),
+                // A staged-layout file whose payload still lives ONLY in
+                // the ring: no `block_map[0]` yet. Once promoted the map
+                // names the block and a later fsync has nothing to move.
+                m.file_type == "staged"
+                    && m.file_id.is_some()
+                    && !m.block_map.as_ref().is_some_and(|bm| bm.contains_key(&0)),
+                m.size,
+            )
+        });
+        let file_id_opt = staged_identity.as_ref().and_then(|(f, _, _)| f.clone());
         prof.mark(crate::fsync_economy::FsyncPhase::DataFlush);
+
+        // The staged-layout promotion leg (`SQUEEZEFS_FSYNC_PROMOTE_STAGED`,
+        // .benchmarks/2026-09-09-dismount-staged-residue.md §7 item 3):
+        // with the lever on, the fsync of a staged-layout file also moves
+        // it to the shared backend — the merge worker's / dismount pass's
+        // own primitive (one block DMA + one layout commit + the ring-entry
+        // release, generation-gated so a racing promoter's commit is a
+        // counted no-op, never a double). Placed HERE, before the barrier
+        // step: the DMA stamps the block's device into the touched table
+        // (`promote_staged_file`), so the data barrier below covers the
+        // promoted block and the meta barrier last names it (DUR-1 — the
+        // same shape the staged active-block flush above takes). A
+        // failure never fails the fsync: the entry stays resident and the
+        // `sync_key` leg below is the pre-lever local-durability contract.
+        if let Some((Some(file_id), true, size)) = staged_identity.as_ref() {
+            if crate::fsync_economy::promote_staged_enabled() {
+                match self
+                    .router
+                    .promote_staged_file(&crate::keys::inode_path(ino), file_id, fencing_token)
+                    .await
+                {
+                    Ok(true) => {
+                        METRICS.fsync_promoted_files.fetch_add(1, Ordering::Relaxed);
+                        METRICS
+                            .fsync_promoted_bytes
+                            .fetch_add(*size, Ordering::Relaxed);
+                    }
+                    Ok(false) => {
+                        METRICS.fsync_promote_noops.fetch_add(1, Ordering::Relaxed);
+                    }
+                    Err(e) => {
+                        METRICS
+                            .fsync_promote_failures
+                            .fetch_add(1, Ordering::Relaxed);
+                        warn!(
+                            "fsync: staged-layout promotion of ino {ino} (file id {file_id}) \
+                             failed ({e:?}) — the file stays durable in local staging (the \
+                             pre-lever contract); a clean unmount or pool pressure promotes it"
+                        );
+                    }
+                }
+            }
+        }
+        prof.mark(crate::fsync_economy::FsyncPhase::StagedPromote);
 
         // DUR-1 ORDERING (pre-RC spec §1): the data barrier completes
         // STRICTLY BEFORE the metadata barrier that names its blocks.
@@ -29131,26 +29201,53 @@ pub async fn start_mount<P: AsRef<Path>>(
                     }
                 }
 
+                // Two classes, the `squeezefs umount` verb's rule
+                // (.benchmarks/2026-09-09-dismount-staged-residue.md §6):
+                // active write blocks are custody the flush below DRAINS,
+                // so "[w] Wait" is offered only for them; staged-LAYOUT
+                // files are drained by no wait — the dismount teardown
+                // that follows PROMOTES them to the shared backend.
                 let has_unflushed = staged_count > 0 || active_writes_count > 0;
                 if has_unflushed {
                     if std::io::stdin().is_terminal() {
-                        println!(
-                            "\n{}",
-                            "WARNING: There are unflushed staged writes on this node!"
-                                .red()
-                                .bold()
-                        );
-                        println!("Remaining local staged files: {}", staged_count);
-                        println!(
-                            "Active write transaction directories: {}",
-                            active_writes_count
-                        );
-                        println!("If you unmount now, other nodes will not see this data.");
+                        let can_drain = active_writes_count > 0;
+                        if can_drain {
+                            println!(
+                                "\n{}",
+                                "WARNING: There is unflushed write custody on this node!"
+                                    .red()
+                                    .bold()
+                            );
+                            println!(
+                                "Active write blocks awaiting writeback: {active_writes_count}"
+                            );
+                            println!("Other nodes will NOT see this data if you exit now.");
+                        }
+                        if staged_count > 0 {
+                            println!(
+                                "Staged-layout files resident in this host's local staging: \
+                                 {staged_count} — promoted to the shared backend by the dismount \
+                                 teardown that follows (an exit wait does not drain them); a file \
+                                 the promotion cannot move is recovered by the next mount at this \
+                                 mount point."
+                            );
+                        }
                         println!("\nChoose an option:");
-                        println!("  [w] Wait for staged files to drain/flush to NVMe-oF backend");
-                        println!("  [c] Continue/force unmount immediately (unsafe)");
+                        if can_drain {
+                            println!(
+                                "  [w] Wait for active write blocks to flush to the NVMe-oF backend"
+                            );
+                        }
+                        println!(
+                            "  [c] Continue unmount now (the dismount teardown promotes \
+                             staged-layout files and flushes what it can)"
+                        );
                         println!("  [a] Abort unmount and continue running mount");
-                        print!("Select option [w/c/a]: ");
+                        if can_drain {
+                            print!("Select option [w/c/a]: ");
+                        } else {
+                            print!("Select option [c/a]: ");
+                        }
                         let _ = std::io::stdout().flush();
 
                         let mut input = String::new();
@@ -29163,8 +29260,8 @@ pub async fn start_mount<P: AsRef<Path>>(
                         if choice == "a" || choice == "abort" {
                             println!("Aborting exit. Resuming squeezefs mount.");
                             continue;
-                        } else if choice == "w" || choice == "wait" {
-                            println!("Waiting for staged writes to drain. Press Ctrl+C again to force exit.");
+                        } else if can_drain && (choice == "w" || choice == "wait") {
+                            println!("Waiting for active write blocks to drain. Press Ctrl+C again to force exit.");
                             let cancel = async {
                                 match sig_rx.as_mut() {
                                     Some(rx) => {
@@ -29186,9 +29283,7 @@ pub async fn start_mount<P: AsRef<Path>>(
                                             summary.flushed, summary.failed, summary.error_samples
                                         );
                                     } else {
-                                        println!(
-                                            "\nAll staged files and active writes drained cleanly!"
-                                        );
+                                        println!("\nAll active write blocks drained cleanly!");
                                     }
                                 }
                                 squeezefs_ipc::sqz_future::Either::Right(()) => {
@@ -29199,9 +29294,18 @@ pub async fn start_mount<P: AsRef<Path>>(
                             println!("Continuing with unmount.");
                         }
                     } else {
-                        // Non-interactive/daemon mode: flush all staged files automatically before exiting
-                        info!("FUSE Daemon: Non-interactive shutdown. Automatically flushing staged files to backend...");
-                        let _ = fs.flush_all_staged_blocks_to_backend().await;
+                        // Non-interactive/daemon mode: flush the active
+                        // blocks before exiting (the staged-layout files
+                        // are the dismount teardown's promotion pass).
+                        info!("FUSE Daemon: Non-interactive shutdown. Automatically flushing staged active blocks to backend...");
+                        let summary = fs.flush_all_staged_blocks_to_backend().await;
+                        if summary.failed > 0 {
+                            error!(
+                                "shutdown: {} of {} staged active blocks failed to flush (first \
+                                 errors: {:?}) — the dismount teardown retries them",
+                                summary.failed, summary.attempted, summary.error_samples
+                            );
+                        }
                     }
                 }
                 should_exit = true;

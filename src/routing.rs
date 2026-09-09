@@ -13486,6 +13486,12 @@ impl DataRouter {
             return Err(e);
         }
         allocator.publish_block(offset);
+        // W-5: the promoted image is this ino's bytes DMA'd to `writer`'s
+        // device — the stamp every DMA site owes the fsync touched table,
+        // so the next covering barrier (the fsync-promotion leg's own
+        // data-barrier step included) barriers that namespace.
+        self.backend_router
+            .note_fsync_touched_device(promote_ino, &writer);
 
         let ino = parse_inode_from_path(file_path);
         // RES-1: keys displaced under the commit's level-3.5 guard are

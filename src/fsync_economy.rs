@@ -36,10 +36,14 @@
 //!   are power-safe on completion — `data_volume_write_cache`), an ALL
 //!   or unmatched bit barriers every volatile device.
 //!
-//! The two levers (`SQUEEZEFS_FSYNC_TOUCHED_NAMESPACES`,
+//! The two W-5 levers (`SQUEEZEFS_FSYNC_TOUCHED_NAMESPACES`,
 //! `SQUEEZEFS_FSYNC_PARALLEL_LEGS`, default on; `0` = the shipped
-//! serialized all-namespace shape) latch on first read; the test seams
-//! preset the latch.
+//! serialized all-namespace shape) and the staged-promotion lever
+//! (`SQUEEZEFS_FSYNC_PROMOTE_STAGED`, default OFF — the pricing arm of
+//! `.benchmarks/2026-09-09-dismount-staged-residue.md` §7 item 3: the
+//! fsync of a staged-layout file also promotes it, in its own
+//! `staged_promote` leg) latch on first read; the test seams preset the
+//! latch.
 
 use crate::fuse_client::LatencyHistogram;
 use once_cell::sync::Lazy;
@@ -52,13 +56,14 @@ use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 /// Lever latches (the free-grace levers' shape): 0 = unread, 1 = on, 2 = off.
 static TOUCHED_NAMESPACES: AtomicU8 = AtomicU8::new(0);
 static PARALLEL_LEGS: AtomicU8 = AtomicU8::new(0);
+static PROMOTE_STAGED: AtomicU8 = AtomicU8::new(0);
 
-fn latched(cell: &AtomicU8, knob: &str) -> bool {
+fn latched(cell: &AtomicU8, knob: &str, default: bool) -> bool {
     match cell.load(Ordering::Relaxed) {
         1 => true,
         2 => false,
         _ => {
-            let on = crate::env_knobs::bool_knob(knob, true);
+            let on = crate::env_knobs::bool_knob(knob, default);
             cell.store(if on { 1 } else { 2 }, Ordering::Relaxed);
             on
         }
@@ -80,13 +85,24 @@ fn preset(cell: &AtomicU8, on: Option<bool>) {
 /// this ino's blocks landed on since its last covering barrier (default
 /// on); off = every namespace, every fsync (the shipped shape).
 pub fn touched_namespaces_enabled() -> bool {
-    latched(&TOUCHED_NAMESPACES, "SQUEEZEFS_FSYNC_TOUCHED_NAMESPACES")
+    latched(
+        &TOUCHED_NAMESPACES,
+        "SQUEEZEFS_FSYNC_TOUCHED_NAMESPACES",
+        true,
+    )
 }
 
 /// `SQUEEZEFS_FSYNC_PARALLEL_LEGS`: issue the independent barrier legs
 /// concurrently and await them all (default on); off = one after another.
 pub fn parallel_legs_enabled() -> bool {
-    latched(&PARALLEL_LEGS, "SQUEEZEFS_FSYNC_PARALLEL_LEGS")
+    latched(&PARALLEL_LEGS, "SQUEEZEFS_FSYNC_PARALLEL_LEGS", true)
+}
+
+/// `SQUEEZEFS_FSYNC_PROMOTE_STAGED`: the fsync of a staged-layout file also
+/// promotes it to the shared backend (default OFF — the pricing arm; the
+/// default is decided on the counted squeeze-test A/B).
+pub fn promote_staged_enabled() -> bool {
+    latched(&PROMOTE_STAGED, "SQUEEZEFS_FSYNC_PROMOTE_STAGED", false)
 }
 
 /// Test seam: `Some(on)` presets the touched-namespace latch; `None`
@@ -99,6 +115,12 @@ pub fn test_set_touched_namespaces(on: Option<bool>) {
 /// it to the knob.
 pub fn test_set_parallel_legs(on: Option<bool>) {
     preset(&PARALLEL_LEGS, on);
+}
+
+/// Test seam: `Some(on)` presets the staged-promotion latch; `None`
+/// returns it to the knob.
+pub fn test_set_promote_staged(on: Option<bool>) {
+    preset(&PROMOTE_STAGED, on);
 }
 
 // ---------------------------------------------------------------------------
@@ -264,28 +286,35 @@ pub enum FsyncPhase {
     /// The local data flush: overlay drain, memory-buffer flush, staged
     /// active-block uploads (the DMAs this fsync awaits), lease acquire.
     DataFlush = 1,
+    /// The staged-layout promotion (`SQUEEZEFS_FSYNC_PROMOTE_STAGED`):
+    /// one block DMA + one layout commit through
+    /// `DataRouter::promote_staged_file`, so the A/B reads exactly what
+    /// the promotion costs per fsync. One relaxed load (≈ 0 ns) with the
+    /// lever off or on a non-staged ino.
+    StagedPromote = 2,
     /// The barrier step: the staged payload sync plus one device Fsync
     /// per touched volatile namespace (joined when the lever is on — the
     /// span is then ≈ max(legs), not Σ).
-    DataBarrier = 2,
+    DataBarrier = 3,
     /// The meta legs that NAME the data: the rewrite-epoch close and the
     /// dirty-layout persist (journal commits, no barrier).
-    MetaPublish = 3,
+    MetaPublish = 4,
     /// `sync_device_for_ino` — the coalesced meta-volume barrier.
-    MetaBarrier = 4,
+    MetaBarrier = 5,
     /// The S11 `FlushExtents` force through the authority — the RESIDUAL
     /// wait past the local ladder when the lever overlaps it.
-    ExtentBarrier = 5,
-    /// Handler entry → the last boundary (≡ Σ of the six legs).
-    Total = 6,
+    ExtentBarrier = 6,
+    /// Handler entry → the last boundary (≡ Σ of the seven legs).
+    Total = 7,
 }
 
-const FSYNC_PHASES: usize = 7;
+const FSYNC_PHASES: usize = 8;
 
 /// Export order of the family (a pinned contract).
 pub const FSYNC_PHASE_NAMES: [&str; FSYNC_PHASES] = [
     "intent_barrier",
     "data_flush",
+    "staged_promote",
     "data_barrier",
     "meta_publish",
     "meta_barrier",
@@ -297,7 +326,7 @@ static FSYNC_PROF: Lazy<[LatencyHistogram; FSYNC_PHASES]> =
     Lazy::new(|| std::array::from_fn(|_| LatencyHistogram::default()));
 
 /// One fsync's phase clock: every `mark` records the span since the
-/// previous boundary and moves the boundary, so the six legs partition
+/// previous boundary and moves the boundary, so the seven legs partition
 /// entry → last boundary exactly. Dropping it records `total` and a
 /// 0 ns sample for every leg that never ran (equal counts per phase; a
 /// leg an error skipped contributes nothing and neither does `total`

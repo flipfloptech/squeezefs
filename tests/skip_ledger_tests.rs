@@ -321,13 +321,14 @@ fn no_test_file_carries_a_private_skip_ladder() {
 
 #[test]
 fn the_mount_gated_suites_all_use_the_shared_gate() {
-    // The thirteen live-mount files (the surface a phantom-green run hides).
+    // The fourteen live-mount files (the surface a phantom-green run hides).
     // If a file leaves this list, it must be because it no longer needs a
     // mount — not because it grew its own ladder.
     const MOUNT_GATED: &[&str] = &[
         "cache_path_policy_tests.rs",
         "cli_clients_df_tests.rs",
         "commit_wake_loss_tests.rs",
+        "dismount_staged_residue_tests.rs",
         "format_guard_tests.rs",
         "mount_owner_override_tests.rs",
         "multi_queue_tests.rs",

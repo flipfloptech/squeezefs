@@ -280,6 +280,50 @@ mount (the A-arm rig reset the cluster; remount is part of every arm).
    prompt (`fuse_client.rs` ≈ 28913) still offers "[w] Wait for staged
    files" with the stale wording; AGENTS.md's "writeback/flush promotes"
    sentence.
+1n. **Step (3) priced and REJECTED; the inline raise built and priced OUT;
+   packing is the answer (2026-09-09).** (a) The fsync-promotion lever
+   (`SQUEEZEFS_FSYNC_PROMOTE_STAGED`, registered, default OFF) on
+   squeeze-test A B B A (`.benchmarks/2026-09-09-fsync-promote-staged-ab.md`):
+   smallf-fsync −16.7 % files/s, fsync +26 %, p99.9 +122 % — and the
+   finding is the SPACE LAW: `promote_staged_file`'s block arm takes one 4 MiB
+   block per file (140,183 promotions filled the 480 GiB set in 8 s; the
+   landed dismount pass pays the same 64× on its 2,193 files). Options
+   A/B/C all share the primitive → rejected; owner: keep step (2), fix via
+   the raise. (b) The inline raise (`aec1241f`): derived ceiling
+   `inline_max_bytes_ceiling` (format bound = `value_cap − headroom` =
+   61,440 on the 256 KiB node), `SQUEEZEFS_INLINE_MAX_BYTES` (4096..=bound,
+   refusal outside), size-dispatching `promote_staged_file →
+   Result<Option<PromotedInto>>` (≤ ceiling → INLINE in one commit), the
+   READ fast-probe inline arm (a pre-existing hole), 7 red-first contracts
+   (`tests/inline_raise_tests.rs`). The local sweep
+   (`.benchmarks/2026-09-09-inline-raise-sweep-local.md`, tcp devsub,
+   scoping) priced it OUT as a default: inline payload rides the meta plane
+   twice — 16 KiB = −34 % files/s and 59× meta bytes/file, 32 KiB = −68 %,
+   117×, and a 1 GiB meta volume heap-exhausted and FAIL-STOPPED
+   (`Metadata volume 1 is disabled`, EIO) → **default flipped back to one
+   page** (`00942fd2`, `INLINE_MAX_FLOOR` = the derived default; the format
+   bound is the override's maximum). **New P1: a FULL metadata volume
+   fail-stops (EIO) instead of answering ENOSPC** — the sweep's T=32768 leg.
+   (c) **PACKING design in progress**: `docs/design-small-file-packing.md`
+   (design-skill loop, writer/reviewer rounds; the deliverable is the
+   design + PR plan, PK1–PK7, lever `SQUEEZEFS_SMALL_FILE_PACKING` OFF
+   until the squeeze-test rows). Its round-1 review found **FIND-PK-2, a
+   P0**: the block arm of `promote_staged_file` published `bk:0:len` with NO
+   durable block reference (the 2026-08-02 wiring `4db827c6` named "the
+   staged whole-image promotion" and never wired it) — on a ledger-seeded
+   remount every promoted block recovers FREE and the next striped write
+   overwrites promoted files (red repro: drift 200/200, 8 of 200 files
+   clobbered by four fresh writes). **FIXED `bfcf1e57`** (the map-swap diff
+   rides the promotion's commit; contract 3 of
+   `dismount_staged_residue_tests`; note
+   `.benchmarks/2026-09-09-promotion-durable-ref-hole.md`). Shipped 1.2.2
+   carries the pressure-driven half (staging-dir volumes under the 75 %
+   high-water arm); the field fleet is cache-less and unaffected; 1.2.3
+   carries the fix with the dismount pass. Also fixed test-side today, both
+   the timing/parallel-harness class: the mux one-connection contract
+   (`2836fa8b`, the documented cold-dial race) and the fork's `op_trace`
+   unit tests under the parallel bench harness (`cf4ba9e1`). Gate on
+   `bfcf1e57` = the day's landing gate.
 2. **Kernel A/B, B arm** — after `squeeze-test` boots the 6.19.14 series
    WITH 0031 (or whichever box carries the patched kernel): on the box,
    `cd /scratch/tmp/sqz-agent/k26 && sudo env ARM=B KERNEL_TAG=<uname -r

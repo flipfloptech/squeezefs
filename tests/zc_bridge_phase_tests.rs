@@ -405,7 +405,13 @@ fn cold_zc_reads_decompose_into_four_exact_hops_with_a_per_op_chain() {
     // The chain's spans vs the histograms' means (the stitch tool's
     // containment law): exact for the first three (shared clock reads);
     // `wake_hop`'s chain end is `block_fetched`, read a few hundred ns
-    // after the handler's own `wake_hop` end, so it may only be LONGER.
+    // after the handler's own `wake_hop` end, so PER OP it may only be
+    // LONGER. The comparison below is a 1-in-`divisor` SAMPLE's mean
+    // against the POPULATION's mean, so the per-op fact is a bound only
+    // once the sample is large; at n = 13 a 12 % dip is ordinary sampling
+    // (the 2026-09-08 release gate read 7,057 vs 7,991 ns on a passing
+    // tree, 8/8 green on rerun). The ≥ 0.9 arm applies from 64 samples;
+    // below that the sample rides the loose band every other phase uses.
     let n = bridged.len() as u64;
     for (i, p) in BRIDGE_PHASES.iter().enumerate() {
         let (n0, s0) = phase(&pre, "zc_bridge_phase_ns", p);
@@ -413,8 +419,11 @@ fn cold_zc_reads_decompose_into_four_exact_hops_with_a_per_op_chain() {
         let hist_mean = (s1 - s0) as f64 / (n1 - n0) as f64;
         let trace_mean = span_sums[i] as f64 / n as f64;
         let ratio = trace_mean / hist_mean.max(1.0);
-        if *p == "wake_hop" {
-            assert!(ratio >= 0.9, "{p}: trace {trace_mean} vs hist {hist_mean}");
+        if *p == "wake_hop" && n >= 64 {
+            assert!(
+                ratio >= 0.9,
+                "{p}: trace {trace_mean} vs hist {hist_mean} (n={n})"
+            );
         } else if n >= 8 {
             // A 1-in-N sample of a tight distribution: loose bound, the
             // exact law is the sum check above.

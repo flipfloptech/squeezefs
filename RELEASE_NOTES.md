@@ -1,3 +1,225 @@
+# SqueezeFS 1.2.2
+
+_Release date: 2026-09-08 (tag `stable-2026.09.2`)_
+
+1.2.2 is a point release on the 1.2 train whose headline is the multi-writer
+data path: the co-writer bugs the single-node proving fleet surfaced — a
+write-path hang, a supply leak, a live-mount data loss, a read storm on the
+authority — are fixed, each pinned by a test that reproduces it, and the S11
+shared-file gate that exposed them passes its full matrix on the acceptance
+box. Eight performance campaigns land — five with field rows on the
+acceptance box — and one kernel-side patch joins the sqz series. Nothing on
+disk changes; the cluster wire does.
+
+## 1.2.2 — what changed
+
+**Upgrading from 1.2.1.** No on-disk format change — the superblock and its
+incompat bits are untouched; every volume mounts byte-identically under
+either binary. The **cluster wire changed**: the publish plane's schema went
+13 → 16 (the reply names the offsets the authority freed; every reply frame
+carries the authority's lane-free notices) and `CLUSTER_WIRE_SCHEMA` 1 → 3
+(the membership grant carries the checkpoint ceiling in force and a
+per-volume lane-supply hint); the shim's `IPC_ABI` stays 6. So the
+same-commit fleet rule (KD-7) governs: **the daemon, the shim, and every
+authority, co-writer and reader of one volume set upgrade together** — a
+peer on another commit is refused loud at its handshake or first frame. A
+plain single-writer mount arms none of these planes and is unaffected. The
+wire change is also why this release's gate includes the fuzz campaign.
+
+**Multi-writer data path — correctness (the headline).** Every fix came out
+of `tests/run_mw_matrix.sh s11-mpiio` on the 1-authority + 8-co-writer
+range-custody fleet and landed red-first with its own contract suite.
+
+- **Co-writers hung forever on a full lane** (`09bdfb06`): the "bounded"
+  allocation park read a reallocation *label* as a duration — `u64::MAX` ms
+  on every co-writer; five of eight sat with 100 writes in flight for 30 min.
+  The park is now twice the routine fence bound (floor 1 s) and past it the
+  write fails ENOSPC (`write_enospc_refusals`) instead of hanging. Fleet:
+  wedge gone (`ac717c7f`). `.benchmarks/2026-09-06-cowriter-enospc-wedge.md`
+- **The co-writer free path leaked supply and stormed the authority**
+  (`e8d9e675`): a block lifetime under a recomputed publish was freed by
+  nobody; a map blob's lineage re-armed a free at every discard. Fleet:
+  refused frees 3,449 → 148 (`380ea732`). `.benchmarks/2026-09-06-cowriter-free-refcount-leak.md`
+- **Acked bytes discarded on a live mount — data loss** (`b6c5e8d5`): a
+  rewrite epoch's close read its own process-local lease rotation as the
+  genuine cross-mount fence, **discarded acked, un-fsynced bytes while the
+  mount was alive**, and `fsync` returned EIO. It now re-presents the current
+  generation; the discard arm fires only on the genuine fence class. Fleet:
+  fenced closes 3 → 0, no fsync failures (`8326bb81`).
+  `.benchmarks/2026-09-06-cowriter-free-residual-lineage.md`
+- **The authority could not read a recycled co-writer block** — finding 51
+  (`10388c45`, `23d243a4`): its own `begin_free` had retired the block's
+  incarnation word and the served publish adopting the offset never
+  re-published it — 326 tripwires, 101 fsync EIOs in one 150 s row. The
+  served publish is now the authority's DMA witness (`served_binding_witnesses`)
+  and supersedes the open overlay record it displaces.
+  `.benchmarks/2026-09-07-read-settle-lost-serialized-authority.md`
+- **The `CLAIM ANOMALY` lineage** (`d90fcaab`, `265d69df` — publish schemas
+  15/16): a co-writer's tracking of a block the authority had freed outlived
+  the free. The served reply now names what the authority freed, and every
+  reply frame carries the frees the authority's own publishes did on the
+  client's blocks; `block_claim_anomalies` reads 0 on every phase.
+  `.benchmarks/2026-09-07-cowriter-claim-anomaly-lineage.md`,
+  `.benchmarks/2026-09-07-cowriter-claim-anomaly-population.md`
+- **Three smaller ones.** A full store refused ENOSPC while its free list
+  sat inside a discard-elision trim window — pending supply, not fullness
+  (`1c895aef`, `1304a3bc`; `.benchmarks/2026-09-07-overlay-enospc-convergence-flake.md`).
+  The shim's completion doorbell could lose a wake to an already-reaped
+  completion — a p99 tail, never a hang; loom-pinned now (`6cc0454d`;
+  `.benchmarks/2026-09-06-cqe-doorbell-lost-wake.md`). The S11 notice poll's
+  park ask equalled the wire's reply timeout — a zero-margin race on a real
+  fabric; now half the bound (`07b51047`; `.benchmarks/2026-09-08-assembler-contracts-notice-poll.md`).
+- **Finding 15 — the co-writer supply loop, from "never sustains" to the
+  gate met.** A co-writer's freed blocks return only through the authority's
+  grace ring; that loop was slow in five places, each fixed and fleet-rowed:
+  the reader-ack ladder re-derived (bound age 9,382 → 1,836 ms, ack lag
+  6.9 → 0.7 s; `ee49cf04`), the release following the ack (2,500 → 15 ms;
+  `4fdfbdcb`), **lane-aware placement + allocation failover** (`7d8b9ed2` —
+  load-bearing: the gate fails without it), refills gated on the authority's
+  advertised supply (`d0421372`, `b119ef78`), one harvest RPC in flight per
+  volume instead of 124,240 in 9.5 min (`6e866be6`), rewrite epochs closed
+  on the lane-supply signal (`37861895`), the renewal — the ack's carrier —
+  on its own thread (`7d5c1958`, `61e45918`); each commit names its
+  evidence note under `.benchmarks/`. **On squeeze-test** the S11 gate
+  passes in both B positions of an A-B-B-A (3,193 MiB/s over 72 s, 3,417
+  over 102 s; the pre-2026-09-07 tip decays 2,087 → 1,062 —
+  `.benchmarks/2026-09-07-f15-day2-squeeze-test-abba.md`) and the **full
+  four-phase `s11-mpiio` matrix passes in both control positions** (A1 3,497
+  / B1 2,324 / B2 2,301 / A2 2,842 MiB/s steady; tripwires, stale refusals,
+  forced releases 0; fsck clean) — the first full passes recorded,
+  `.benchmarks/2026-09-07-f15-b1-squeeze-test-seq2.md`.
+
+**Performance — campaigns with field rows.** Same-binary A-B-B-A on
+`squeeze-test` (32-core Xeon, 5-node nvme-tcp fabric), medians of both
+orders, exact means from `.stats` deltas; the first three share the record
+`.benchmarks/2026-09-08-campaign-rows-squeeze-test.md`.
+
+- **R-5 read-handler economy** (`28308f5c`, `eb2c6c67`): the kernel READ
+  handler went 8 → 0 allocations per warm op, 11 → 1 on the cold zero-copy
+  leg. `rr4k-kern`: **+6.8 % IOPS, −9.6 % daemon CPU/op**.
+  `.benchmarks/2026-09-08-r5-read-handler-economy.md`
+- **W-6 write-handler economy** (`1eeacaac`, `ea9b26b5`, `40f99e6d`): the
+  in-place patch write went 14.6 → 3.06 allocations per op, its per-op
+  counters became core-local, a partial overwrite's settle reads only the
+  uncovered span. `rw4k-kern`: **+13.2 % IOPS, p50 −12.9 %, −12.2 % daemon
+  CPU/op**. `.benchmarks/2026-09-08-w6-write-handler-economy.md`
+- **W-5 fsync economy** (`8becf5bc`): an fsync barriers only the data
+  namespaces the file touched and runs its independent legs joined;
+  `fsync_phase_ns` names where the time goes. Fsync storm: **+23.8 %
+  fsyncs/s, p50 −22.9 %**, barrier requests 10 → 1 per fsync; streaming
+  `w_durable` par. `.benchmarks/2026-09-08-w5-fsync-economy.md`
+- **D-5 owner dispatch** (`80bcd162`, `af6f49cb`, `0687dc91`): the served
+  dispatch is split into hops (`meta_ship_owner_dispatch_ns`), the accept
+  thread waits on its socket (a dial 100 ms → 0.2 ms), both sockets run
+  `TCP_NODELAY`. The two venue levers **ship OFF on the fleet row** (inline
+  serve: co-writer publish latency +15–49 %, ingest −1.5…−7 %; one
+  multiplexed session ≈ 1.5× slower than the pool).
+  `.benchmarks/2026-09-08-d5-fleet-squeeze-test.md`,
+  `.benchmarks/2026-09-08-d5-owner-hop-and-depth.md`
+- **Three derivation-class landings** (dev-box rows before the venue rule;
+  throughput par on each): **D-3** (`d2cf0211`) — the DLM lock tables' width
+  derives from the transport's concurrency (16,384 on a 32-CPU box, not a
+  free 4,096), with a false-sharing census; mdstorm collisions −76 %, guard
+  wait −58 %/op. **W-2** (`838c288a`) — a fresh/append stream's meta-prep
+  runs under the inode's read guard; 16,384 exclusive waits per leg → 241.
+  **W-4** (`6a5a5053`) — the reclaim queue cap and park bound derive from
+  measured rates (4,096 / 1,000 ms become floor and ceiling).
+  `.benchmarks/2026-09-05-d3-dlm-stripe-derivation.md`,
+  `.benchmarks/2026-09-05-w2-write-stream-guard.md`,
+  `.benchmarks/2026-09-05-w4-reclaim-derivation.md`
+- **R-4 read zero-copy serve** (`2f0fc361`, `4c626fa9`): on a zc-armed
+  session warm and cold-slice READ serves hand the transport the tier
+  buffer's own fd instead of a bounce copy — daemon CPU per GiB −24 % cold /
+  −25 % warm; default ON. `.benchmarks/2026-09-05-r4-read-zc-serve.md`
+- **Kernel: per-queue FUSE background accounting** (`843048fd`, `241cb239`)
+  — **a kernel-side change, not a daemon one**: sqz series patch `0031`
+  (6.19.14 field track and 7.1; `0026` on 7.2) under `docker/kernel-sqz/`,
+  design `docs/design-kernel-bg-per-queue.md`. The connection's `bg_lock`,
+  taken twice per ring completion, becomes a per-queue budget: queue-worker
+  µs/op −18 %, kern rand-4k **+9 % IOPS** (510 k → 556 k sustained). An
+  unpatched kernel is correct and merely pays the lock.
+  `.benchmarks/2026-09-06-kernel-bg-per-queue-ab.md`
+
+**New operator surface.** Defaults are right; each lever exists so an A/B
+can be counted. Two existing knobs changed default — `SQUEEZEFS_RECLAIM_QUEUE_MAX_BLOCKS`
+/ `SQUEEZEFS_RECLAIM_CAP_PARK_MS` are now derived (floor 4096 / 50–1000 ms);
+an explicit value still wins. Complete registry: [docs/operations.md → Environment knobs](docs/operations.md#environment-knobs--the-complete-registry).
+
+| Knob | Default | Purpose |
+|---|---|---|
+| `SQUEEZEFS_READ_ZC_SERVE`, `SQUEEZEFS_GAP_SEED_RANGED`, `SQUEEZEFS_FSYNC_TOUCHED_NAMESPACES`, `SQUEEZEFS_FSYNC_PARALLEL_LEGS`, `SQUEEZEFS_WRITE_GUARD_NARROW` | on | The R-4 / W-6 / W-5 / W-2 A/B controls: `0` = that campaign's prior shape. |
+| `SQUEEZEFS_DLM_STRIPES` | derived | Explicit stripe count for the DLM-class lock tables; `4096` = the 1.2.1 width. |
+| `SQUEEZEFS_META_SHIP_INLINE_SERVE`, `SQUEEZEFS_PUBLISH_SHIP_MULTIPLEX` | off | D-5 venue levers; a fleet running either is running an experiment. |
+| `SQUEEZEFS_COWRITER_LANE_PLACEMENT` | on | Lane-aware placement on a co-writer; `0` fails the S11 gate — a control, not a setting. |
+| `SQUEEZEFS_ALLOC_LANE_{REFILL_HINT,HARVEST_SINGLE_FLIGHT,VOLUME_HINT}`, `SQUEEZEFS_REWRITE_SUPPLY_CLOSE`, `SQUEEZEFS_MEMBERSHIP_RENEW_LANE` | on | The co-writer supply loop's levers: refill hint gate, one harvest RPC in flight, per-volume hint, supply-coupled epoch close, the renewal on its own `sqz-lease-io` thread. |
+| `SQUEEZEFS_FREE_GRACE_{ACK_RENEWAL,REFRESH_ON_ACK,QUALIFY_CEILING,DRAIN_EPOCH_STAMP,DRAIN_OBSERVED,CHECKPOINT_COMPOSITE,LANE_PUSH,CAUGHT_UP_RELAX}` | on | The freed-offset grace loop's hold-time levers; each `0` restores that one retired term. |
+
+New `.stats` families (semantics in [docs/operations.md](docs/operations.md)): `fsync_phase_ns` + `fsync_{calls,noop_clean,data_namespaces_touched,data_namespaces_flushed,write_through_skips,parallel_joins}`;
+`meta_ship_owner_dispatch_ns`; `membership_renew_phase_ns` / `membership_renew_serve_ns`; `free_grace_hold_phase_ns`, `free_grace_hold_ms`, `free_grace_member_ack_lag_ms`;
+the lock census `<table>_stripe_collisions` / `<table>_key_waits` + `lock_phase_ns.dlm_guard_wait`; `block_free_reclaim_{drain_rate,arrival_rate,queue_cap,park_bound_ms}`;
+and the fix tripwires `write_enospc_refusals`, `alloc_trim_window_parks`, `served_binding_witnesses`, `rewrite_shadow_close_retries`, `block_claim_anomalies`, `overlay_superseded_by_served_publish`, `dlm_custody_notice_poll_failures`.
+
+**FUSE transport — the queue worker's park is bounded while a reply is owed**
+(`8efc7e1b` → `1834bed4`, found by this release's own gate). Inside fstests
+`generic/795` (drop_caches × fsstress × rm/cp/cmp on a fresh mount) two
+delivered LOOKUPs were never answered for 23 minutes, every daemon thread
+idle, the mount cleared only by the harness aborting the connection; the
+runner scored the test clean. The class is the one the 2026-08-07 zc-bridge
+campaign closed for zero-copy pends — a worker asleep in cq-wait that lost
+exactly one wake — but an ordinary in-flight request had no bound. Now the
+park is EXT_ARG-bounded (100 ms) while the worker's drain group owes any
+reply; a tick that finds work a wake should have delivered is counted
+(`transport_park_tick_{commit,cqe}_rescues`, ≈ 0 on a healthy mount —
+nonzero **is** the lost-wake tripwire) and the first rescue, like the 5 s
+overdue-slot line, logs the attribution snapshot (coalescer state,
+`eventfd-count`, the ring's queue heads and pending poll list). Seam
+`SQUEEZEFS_TEST_DROP_COMMIT_WAKES`; suite `tests/commit_wake_loss_tests.rs`
+(red on the unfixed tree: the stat strands; green: it lands in one tick).
+The fstests runner now fails a test whose mount logged a request unreplied
+≥ 60 s. `.benchmarks/2026-09-08-generic-795-lookup-wedge.md`
+
+**Known limitations — what this release does not claim.**
+
+- **Scale.** What ships is one write mount per volume set, any number of
+  read-only mounts and opt-in co-writer mounts; the S11 rows are nine
+  co-located mounts on one box. Every scale claim carries its evidence tier in
+  [docs/rc-manifest.md](docs/rc-manifest.md#2-guarantee-table-by-evidence-tier-ruling-d1); 15 k nodes has never been measured.
+- **The s11 venue's remaining ENOSPC refusals are capacity, not code**: with
+  the previous phase's file kept, each lane holds 640 live blocks of a
+  1,024-block share against a ≈ 3.4 s recycle transit (≈ 10 % under) —
+  `.benchmarks/2026-09-07-cowriter-fpp-supply-residue.md` §8.5,
+  [docs/operations.md → Multi-writer capacity planning](docs/operations.md#multi-writer-capacity-planning--the-data-plane-allocation-partition).
+- **fsync of a partial active block escalates the whole block**: every
+  256 KiB write + fsync reads and uploads 4 MiB (18.4× the user bytes, 80 %
+  of the 6.9 ms fsync). Pre-existing, named by W-5's instrument, not fixed —
+  write board #11 in [docs/design-e2e-perf-audit.md](docs/design-e2e-perf-audit.md).
+- **The lost wake's loser is not named.** The `generic/795` wedge is bounded
+  (a lost wake now costs ≤ 100 ms and is counted), but whether the kernel's
+  task-work wake or the daemon's coalescer lost it is unattributed — 48
+  fresh-mount storms with the live capture armed did not recur. The rescue
+  snapshot names it at the next exposure.
+- **Dismounts reporting unflushed staged files**: 47 of one fstests pass's
+  407 dismounts reported 1–2, four reported 200+. Orphans of deleted files
+  or acked bytes lost at umount is unanswered; the runner records it as a
+  NOTE, never a verdict.
+
+**Verification.** Every leg of the release gate ran from zero on the tested
+tree in one unattended chain — `task check`, fstests `-g auto` (with
+`generic/650` excluded on the gate laptop: its CPU-hotplug storm hangs that
+box's firmware — a platform hazard, stated in the record), pjdfstests, LTP,
+require-mount, the zc-capability leg on the sqz kernel — **plus the fuzz
+campaign over the twelve `fuzz/fuzz_targets/` decoders**, because the
+publish and cluster wire schemas changed (`publish_wire` and
+`cluster_wire_frame` are two of the twelve). The gate ran twice: the first
+candidate's fstests leg found the `generic/795` wedge above and the tag was
+held for the fix; the second candidate is the release. Record:
+[.benchmarks/2026-09-08-1.2.2-release-gate.md](.benchmarks/2026-09-08-1.2.2-release-gate.md).
+
+The rest of this document is the 1.2.1 and 1.2.0 record, which 1.2.2
+inherits.
+
+---
+
 # SqueezeFS 1.2.1
 
 _Release date: 2026-09-05 (tag `stable-2026.09.1`)_

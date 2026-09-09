@@ -121,8 +121,13 @@ def row(res, label):
         r["dsync_per"] = (d("data_device_syncs") or 0) / fs
         r["msync_per"] = (d("meta_device_syncs") or 0) / fs
         r["joins"] = d("fsync_parallel_joins")
-        for ph in ("data_flush", "data_barrier", "meta_barrier", "meta_publish", "total"):
+        for ph in ("data_flush", "staged_promote", "data_barrier", "meta_barrier", "meta_publish", "total"):
             r[f"fs_{ph}"] = phase_mean(s0, s1, "fsync_phase_ns", ph)
+        # The fsync-promotes-staged lever (2026-09-09): promotions per fsync +
+        # the staged-layout population the row created.
+        r["promoted"] = d("fsync_promoted_files")
+        r["promote_fail"] = d("fsync_promote_failures")
+        r["staged_writes"] = d("layout_staged_writes")
     return r
 
 
@@ -135,7 +140,10 @@ FSYNC = [("sync_mean", "sync mean µs", "{:.0f}"), ("sync_p50", "sync p50 µs", 
          ("sync_p99", "sync p99 µs", "{:.0f}"), ("fsyncs", "fsyncs", "{:,.0f}"),
          ("dreq_per", "data sync req/fsync", "{:.2f}"), ("dsync_per", "data syncs/fsync", "{:.2f}"),
          ("msync_per", "meta syncs/fsync", "{:.2f}"), ("joins", "parallel joins", "{:,.0f}"),
-         ("fs_data_flush", "fs data_flush µs", "{:.0f}"), ("fs_data_barrier", "fs data_barrier µs", "{:.0f}"),
+         ("promoted", "fsync promotions", "{:,.0f}"), ("promote_fail", "promote fail", "{:,.0f}"),
+         ("staged_writes", "staged-layout writes", "{:,.0f}"),
+         ("fs_data_flush", "fs data_flush µs", "{:.0f}"), ("fs_staged_promote", "fs staged_promote µs", "{:.0f}"),
+         ("fs_data_barrier", "fs data_barrier µs", "{:.0f}"),
          ("fs_meta_barrier", "fs meta_barrier µs", "{:.0f}"), ("fs_meta_publish", "fs meta_publish µs", "{:.0f}"),
          ("fs_total", "fs total µs", "{:.0f}")]
 
@@ -183,9 +191,9 @@ def main():
             tags.setdefault(tag, {}).setdefault(arm, []).append((pos, row(res, label)))
     for tag in sorted(tags):
         cols = list(BASE)
-        if "kern" in tag and ("rw" in tag or "wdur" in tag) or "fsync" in tag:
+        if "kern" in tag and ("rw" in tag or "wdur" in tag) or "fsync" in tag or "smallf" in tag:
             cols += WRITE
-        if "fsync" in tag or "wdur" in tag:
+        if "fsync" in tag or "wdur" in tag or "smallf" in tag:
             cols += FSYNC
         table(tag, tags[tag], cols)
 

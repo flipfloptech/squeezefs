@@ -13586,20 +13586,26 @@ impl DataRouter {
     /// concurrent promotion/spill commit, so fall back to the freshest cached
     /// entry and finally the authoritative backend before declaring the
     /// payload unreachable.
-    /// Loud marker for a staged file whose payload is GONE — no ring entry
-    /// (crash-torn → discarded by segment recovery, or lost before it ever
-    /// hit the segment) and no promoted mapping. Per the D0 staging degrade
-    /// contract the read path serves size-consistent zeros; this records
-    /// the loss once per read in the log and the stats surface
-    /// (`staged_payload_lost_reads`).
+    /// Loud marker for a staged file whose payload is UNREACHABLE from this
+    /// client — no entry in THIS client's ring and no promoted mapping. Two
+    /// causes, neither distinguishable here: the file is another client's
+    /// live staged-layout custody (its sole copy sits in that client's
+    /// staging root — the healthy cross-client shape of an un-promoted
+    /// staged-layout file, `.benchmarks/2026-09-09-dismount-staged-residue.md`
+    /// §2), or a crash discarded it (torn → dropped by segment recovery, or
+    /// lost before it hit the segment). Per the D0 staging degrade contract
+    /// the read path serves size-consistent zeros; this records it once per
+    /// read in the log and the stats surface (`staged_payload_lost_reads`).
     fn note_lost_staged_payload(&self, file_path: &str, file_id: &str) {
         crate::fuse_client::METRICS
             .staged_payload_lost_reads
             .fetch_add(1, Ordering::Relaxed);
         log::warn!(
-            "staged payload for {file_path} (file id {file_id}) is gone from local staging \
-             and was never promoted — a crash discarded acked-unfsynced data; serving \
-             size-consistent zeros (D0 degrade contract)"
+            "staged payload for {file_path} (file id {file_id}) is not resident in THIS \
+             client's staging root and was never promoted to the shared backend — another \
+             client's local staged-layout custody (promoted only under that client's \
+             staging-pool pressure), or a crash discarded it; serving size-consistent zeros \
+             (D0 degrade contract)"
         );
     }
 

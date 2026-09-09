@@ -7358,15 +7358,12 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             // staged object key and per-inode write custody in a
             // world-readable file, and this CLI only ever needed the
             // counts.
-            fn read_mount_staging_stats(mountpoint: &Path) -> Option<(usize, usize, u64)> {
+            fn read_mount_staging_stats(mountpoint: &Path) -> Option<(usize, usize)> {
                 let stats_str = std::fs::read_to_string(mountpoint.join(".stats")).ok()?;
                 let v: serde_json::Value = serde_json::from_str(&stats_str).ok()?;
                 let staged = v["nvme_staged_write_file_count"].as_u64().unwrap_or(0) as usize;
                 let active = v["active_write_block_count"].as_u64().unwrap_or(0) as usize;
-                let bytes = v["metrics"]["nvme_staging_current_bytes"]
-                    .as_u64()
-                    .unwrap_or(0);
-                Some((staged, active, bytes))
+                Some((staged, active))
             }
 
             // Resolve dismount_wait limit (default: 10) and find active daemon PID
@@ -7374,39 +7371,61 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             let mut daemon_pid: Option<u32> = None;
 
             let initial_stats = read_mount_staging_stats(&mountpoint);
-            let (staged_count, active_writes_count, total_bytes_at_start) =
-                initial_stats.unwrap_or((0, 0, 0));
+            let (staged_count, active_writes_count) = initial_stats.unwrap_or((0, 0));
 
             let has_unflushed = staged_count > 0 || active_writes_count > 0;
             let mut choice = "continue"; // default non-interactive behavior
 
-            // Prompt the user if not forced and stdin is a TTY
+            // Prompt the user if not forced and stdin is a TTY. Two classes
+            // (.benchmarks/2026-09-09-dismount-staged-residue.md §6): active
+            // write blocks are custody the daemon's writeback DRAINS, so
+            // waiting can succeed; staged-LAYOUT files are drained by
+            // nothing — they stay in this host's staging root (recovered by
+            // the next mount at this mount point, read as zeros by every
+            // other client until promoted), so "[w] Wait" is never offered
+            // for them alone: it could only run to the timer.
             if has_unflushed && !force && std::io::stdin().is_terminal() {
-                println!(
-                    "{}",
-                    "WARNING: There are unflushed staged writes on this node!"
-                        .red()
-                        .bold()
-                );
-                println!("Remaining local staged files: {}", staged_count);
-                println!(
-                    "Active write transaction directories: {}",
-                    active_writes_count
-                );
-                println!("Other nodes will NOT see this data if you unmount now.");
+                let can_drain = active_writes_count > 0;
+                if can_drain {
+                    println!(
+                        "{}",
+                        "WARNING: There is unflushed write custody on this node!"
+                            .red()
+                            .bold()
+                    );
+                    println!("Active write blocks awaiting writeback: {active_writes_count}");
+                    println!("Other nodes will NOT see this data if you unmount now.");
+                }
+                if staged_count > 0 {
+                    println!(
+                        "Staged-layout files resident in this host's local staging: {staged_count}"
+                    );
+                    println!(
+                        "  Their only copy is this host's staging root: the next mount at this \
+                         mount point recovers them byte-exact; other clients of the volume set \
+                         read them as zeros until promoted (promotion is pool-pressure-driven \
+                         — an unmount wait cannot drain them)."
+                    );
+                }
                 println!("\nChoose an option:");
-                println!(
-                    "  [w] Wait for staged files to drain/flush to NVMe-oF backend (recommended)"
-                );
+                if can_drain {
+                    println!(
+                        "  [w] Wait for active write blocks to flush to the NVMe-oF backend (recommended)"
+                    );
+                }
                 println!("  [c] Continue unmount now (staged data stays on disk; the next mount recovers it)");
                 println!("  [a] Abort unmount");
-                print!("Select option [w/c/a]: ");
+                if can_drain {
+                    print!("Select option [w/c/a]: ");
+                } else {
+                    print!("Select option [c/a]: ");
+                }
                 let _ = std::io::stdout().flush();
 
                 let mut input = String::new();
                 if std::io::stdin().read_line(&mut input).is_ok() {
                     let trimmed = input.trim().to_lowercase();
-                    if trimmed == "w" || trimmed == "wait" {
+                    if can_drain && (trimmed == "w" || trimmed == "wait") {
                         choice = "wait";
                     } else if trimmed == "c" || trimmed == "continue" {
                         choice = "continue";
@@ -7424,7 +7443,7 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                     return Ok(());
                 }
                 "wait" => {
-                    println!("Waiting for staged writes to drain (limit: {}s). Press 's' and Enter to skip wait.", dismount_wait);
+                    println!("Waiting for active write blocks to drain (limit: {}s). Press 's' and Enter to skip wait.", dismount_wait);
                     let start_wait = std::time::Instant::now();
                     let max_wait = std::time::Duration::from_secs(dismount_wait);
                     let (tx, mut rx) = squeezefs_ipc::sqz_channel::mpsc::channel(10);
@@ -7443,9 +7462,12 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                         .expect("stdin watcher thread spawns");
 
                     let mut skipped = false;
-                    let mut current_staged = staged_count;
                     let mut current_active = active_writes_count;
 
+                    // The wait's population is the ACTIVE-block custody the
+                    // daemon's writeback drains; the staged-layout count is
+                    // deliberately not in the exit condition (nothing drains
+                    // it — the prompt above said so).
                     loop {
                         while let Ok(msg) = rx.try_recv() {
                             if msg == "s" || msg == "skip" {
@@ -7457,46 +7479,24 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                             break;
                         }
 
-                        let current_bytes = match read_mount_staging_stats(&mountpoint) {
-                            Some((s, a, b)) => {
-                                current_staged = s;
-                                current_active = a;
-                                b
-                            }
+                        match read_mount_staging_stats(&mountpoint) {
+                            Some((_, a)) => current_active = a,
                             None => {
                                 // Mount gone / daemon unreachable: nothing
                                 // left to poll — proceed with the unmount.
                                 break;
                             }
-                        };
+                        }
 
-                        if current_staged == 0 && current_active == 0 {
-                            println!("\nAll staged files and active writes drained cleanly!");
+                        if current_active == 0 {
+                            println!("\nAll active write blocks drained cleanly!");
                             break;
                         }
 
-                        let elapsed = start_wait.elapsed().as_secs_f64();
-                        let bytes_flushed = total_bytes_at_start.saturating_sub(current_bytes);
-                        let speed = if elapsed > 0.1 {
-                            bytes_flushed as f64 / elapsed
-                        } else {
-                            0.0
-                        };
-                        let speed_mb = speed / (1024.0 * 1024.0);
-
-                        let progress_pct = if total_bytes_at_start > 0 {
-                            100.0 * bytes_flushed as f64 / total_bytes_at_start as f64
-                        } else {
-                            100.0
-                        };
-
                         print!(
-                            "\rProgress: {:.1}% | Remaining: {} files, {:.2} MB | Speed: {:.2} MB/s | Elapsed: {}s / Limit: {}s (Press 's' to skip)",
-                            progress_pct,
-                            current_staged,
-                            current_bytes as f64 / 1024.0 / 1024.0,
-                            speed_mb,
-                            elapsed.round(),
+                            "\rRemaining: {} active write block(s) | Elapsed: {}s / Limit: {}s (Press 's' to skip)",
+                            current_active,
+                            start_wait.elapsed().as_secs_f64().round(),
                             dismount_wait
                         );
                         let _ = std::io::stdout().flush();
@@ -7508,7 +7508,7 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                         squeezefs_ipc::sqz_time::sleep(std::time::Duration::from_millis(500)).await;
                     }
 
-                    if skipped || current_staged > 0 || current_active > 0 {
+                    if skipped || current_active > 0 {
                         if skipped {
                             println!("\nWait skipped by user.");
                         }

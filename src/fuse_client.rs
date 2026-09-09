@@ -7379,12 +7379,14 @@ pub struct Metrics {
     /// KD-8: staging drain barriers run before meta set changes (each =
     /// verify-custody-empty + generation restamp).
     pub staging_drain_barriers: Align64<AtomicU64>,
-    /// Reads of a `staged` file whose payload is GONE — no staging-ring
-    /// entry (crash-torn → discarded by segment index recovery, or lost
-    /// before a kill) and no promoted mapping. Served as size-consistent
-    /// zeros per the D0 staging degrade contract (acked-unfsynced staged
-    /// data MAY be lost, must never error). Nonzero after a crash remount
-    /// = data loss happened and was degraded, not errored.
+    /// Reads of a `staged` file whose payload is unreachable from THIS
+    /// client — no entry in its staging ring and no promoted mapping.
+    /// Served as size-consistent zeros per the D0 staging degrade
+    /// contract (never an error). Two populations: another client's live
+    /// un-promoted staged-layout custody (the cross-client shape,
+    /// `.benchmarks/2026-09-09-dismount-staged-residue.md` §2), and
+    /// payload a crash discarded (torn → dropped by segment recovery, or
+    /// lost before a kill). Nonzero on a same-root remount = the latter.
     pub staged_payload_lost_reads: Align64<AtomicU64>,
     /// Staged reads that lost a race with an identity transition (re-stage /
     /// promotion / spill / layout flip) and re-resolved the fresh identity
@@ -22035,10 +22037,14 @@ impl SqueezefsFilesystem {
         summary
     }
 
-    pub async fn force_flush_all_staged_data(&self) -> Result<(), SqueezefsError> {
-        let _ = self.flush_all_memory_buffers_to_staging().await;
-        let _ = self.flush_all_staged_blocks_to_backend().await;
-        Ok(())
+    /// The teardown flush pair: RAM buffers → staging, then staged active
+    /// blocks → the backend. Returns the sweep's summary — its `failed`
+    /// count is the caller's only record of entries left staged.
+    pub async fn force_flush_all_staged_data(
+        &self,
+    ) -> Result<TeardownFlushSummary, SqueezefsError> {
+        self.flush_all_memory_buffers_to_staging().await?;
+        Ok(self.flush_all_staged_blocks_to_backend().await)
     }
 
     /// Whether dismount teardown has begun (destroy runs once per unmount;
@@ -22880,19 +22886,33 @@ impl SqueezefsFilesystem {
             }
         }
 
-        // Phase 1 & 2: Force flush memory buffers to staging, then staged blocks to NVMe-oF backend
-        let _ = self.force_flush_all_staged_data().await;
+        // Phase 1 & 2: memory buffers → staging, then staged active blocks
+        // → the backend. The summary is the teardown's only record of a
+        // failed flush (each failed entry stays staged and is recovered at
+        // the next mount) — never discarded on this path.
+        match self.force_flush_all_staged_data().await {
+            Ok(summary) if summary.failed > 0 => error!(
+                "dismount: {} of {} staged active blocks failed to flush to the backend \
+                 (first errors: {:?}) — they stay in local staging and are recovered by \
+                 the next mount at this mount point",
+                summary.failed, summary.attempted, summary.error_samples
+            ),
+            Ok(_) => {}
+            Err(e) => error!("dismount: memory-buffer flush to staging failed: {e:?}"),
+        }
 
-        // Gracefully wait up to self.dismount_wait seconds for background workers to drain staged writes and active writes to NVMe-oF backend
+        // Wait up to `dismount_wait` for the writeback worker to retire the
+        // active-block custody the sweep above did not (its own requeues,
+        // a unit mid-flight). The predicate is the active-block-family
+        // population — the ONLY ring records a teardown step retires.
+        // `staged_writes_in_flight` counts every ring key, and a resident
+        // staged-LAYOUT `file_id` entry is drained by nothing here, so a
+        // wait on it ran to the timer on every unmount of a mount holding
+        // one (.benchmarks/2026-09-09-dismount-staged-residue.md §1.3).
         let start_wait = std::time::Instant::now();
         let max_wait = std::time::Duration::from_secs(self.dismount_wait);
         loop {
-            let n = self
-                .router
-                .cache
-                .nvme
-                .staged_writes_in_flight
-                .load(Ordering::Acquire);
+            let n = self.router.cache.nvme.active_block_custody_count();
             if n == 0 || start_wait.elapsed() >= max_wait {
                 break;
             }
@@ -22928,7 +22948,13 @@ impl SqueezefsFilesystem {
         // frees).
         self.router.backend_router.reclaim_drain().await;
 
-        // Gather final count for warnings/statistics
+        // The census, in its two classes. `active_block:` records are
+        // unflushed write custody — the WARN. Everything else is a
+        // staged-LAYOUT file: acked bytes whose ONLY copy is this host's
+        // staging root, recovered byte-exact by the next mount at this
+        // mount point and invisible (zeros) to every other client of the
+        // set until promoted — a fact to state exactly, not a loss to
+        // warn about (.benchmarks/2026-09-09-dismount-staged-residue.md §6).
         let keys = self.router.cache.nvme.list_staged_files();
         let mut staged_count = 0;
         let mut active_writes_count = 0;
@@ -22940,12 +22966,31 @@ impl SqueezefsFilesystem {
             }
         }
 
-        if staged_count > 0 || active_writes_count > 0 {
-            warn!(
-                "WARNING: SqueezeFS dismounted with unflushed data! Remaining local staged files: {}, active write directories: {}. Other nodes may see inconsistent filesystem state until these are recovered or flushed.",
-                staged_count, active_writes_count
+        if staged_count > 0 {
+            let nvme = &self.router.cache.nvme;
+            info!(
+                "staged-layout files resident in local staging at dismount: {staged_count} \
+                 ({} B) — acked bytes whose ONLY copy is this host's staging root {}; \
+                 recovered byte-exact by the next mount at this mount point (or adopted with \
+                 -o client_slot=…), NOT promoted to the shared backend (promotion is \
+                 pool-pressure-driven), and read as ZEROS by every other client of this \
+                 volume set until promoted. Unmount is clean for the data-plane custody \
+                 ({active_writes_count} active write blocks remain).",
+                nvme.current_staged_write_bytes.load(Ordering::Relaxed),
+                nvme.staging_dirs()
+                    .first()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_default(),
             );
-        } else {
+        }
+        if active_writes_count > 0 {
+            warn!(
+                "unflushed write custody at dismount: {active_writes_count} active write \
+                 block(s) remain in local staging — acked bytes not yet on the shared \
+                 backend; the next mount at this mount point flushes them (other clients \
+                 see the pre-write contents until then)"
+            );
+        } else if staged_count == 0 {
             info!("FUSE Daemon: Dismount clean. All write staged blocks successfully flushed to backend.");
         }
 

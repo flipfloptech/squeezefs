@@ -4,8 +4,11 @@
 //! The staging ring is the SOLE copy of acked-but-not-yet-promoted staged
 //! payloads. Kill-9 (D0) semantics for it:
 //!
-//! - **acked+fsynced** staged data is promoted to durable blocks by fsync
-//!   and does not depend on the ring after remount;
+//! - **acked+fsynced** staged data is `fsync`-durable ON THE RING: fsync
+//!   syncs the ring shard and commits the staged layout, it does NOT
+//!   promote (promotion is staging-pool-pressure-driven —
+//!   `.benchmarks/2026-09-09-dismount-staged-residue.md` §1.2), so after a
+//!   crash the same-root remount recovers it byte-exact from the ring;
 //! - **acked-unfsynced** staged data MAY be lost by the crash, but a
 //!   remount must never turn it into an error: recover what is intact,
 //!   discard-and-log what is torn, and reads of a staged file whose

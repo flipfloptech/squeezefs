@@ -1014,13 +1014,28 @@ pub struct NvmeStaging {
     /// flush of stale staged bytes — the corruption direction, excluded by
     /// construction. Seeded from the recovered ring at startup.
     active_block_index: std::sync::Arc<scc::HashMap<String, ()>>,
+    /// Population of `active_block_index` — OUR `active_block[_ext]:`
+    /// custody records, i.e. exactly the set the dismount sweep and the
+    /// writeback worker retire. Maintained beside every index insert/
+    /// remove (O(1); `scc::HashMap::len` walks the bucket array) and
+    /// polled by the dismount drain wait. `staged_writes_in_flight` is NOT
+    /// that predicate: it counts every ring key, and a resident
+    /// staged-LAYOUT `file_id` entry is retired by no teardown step, so a
+    /// wait on it ran to the timer on every unmount of such a mount
+    /// (.benchmarks/2026-09-09-dismount-staged-residue.md §1.3).
+    active_block_custody: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     /// Router hook for the merge worker: promotion must commit layout through
     /// `DataRouter` (RAM metadata cache + backend coherently, under the
     /// per-inode metadata lock). Weak — the router owns this cache.
     data_router:
         std::sync::Arc<std::sync::OnceLock<std::sync::Weak<crate::routing::DataRouterInner>>>,
     pub space_freed_notify: std::sync::Arc<squeezefs_ipc::sqz_notify::Notify>,
+    /// Every ring key (staged-layout `file_id`s AND active-block-family
+    /// records; seeded from the recovered ring). A gauge, not the dismount
+    /// wait's predicate — see `active_block_custody`.
     pub staged_writes_in_flight: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    /// Woken when `active_block_custody` reaches 0 — the dismount drain
+    /// wait's wake.
     pub staged_drained_notify: std::sync::Arc<squeezefs_ipc::sqz_notify::Notify>,
 
     // Hypertier NVMe cache instances
@@ -1242,6 +1257,7 @@ impl NvmeStaging {
         let active_block_index: std::sync::Arc<scc::HashMap<String, ()>> =
             std::sync::Arc::new(scc::HashMap::new());
         let mut initial_write_bytes = 0u64;
+        let mut initial_active_block_custody = 0usize;
         let mut foreign_scope_records = 0usize;
         for key in staging_nvme_cache.list_keys() {
             // §6.2 item 8 — the record-level classification, applied
@@ -1263,7 +1279,9 @@ impl NvmeStaging {
                 // extent records: occupancy-indexed (the lock-free probes),
                 // never budget-counted (custody overlays, not staged files).
                 if let Ok(k) = std::str::from_utf8(&key) {
-                    let _ = active_block_index.insert_sync(k.to_string(), ());
+                    if active_block_index.insert_sync(k.to_string(), ()).is_ok() {
+                        initial_active_block_custody += 1;
+                    }
                 }
                 continue;
             }
@@ -1316,6 +1334,9 @@ impl NvmeStaging {
             )),
             staged_ledger,
             active_block_index,
+            active_block_custody: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(
+                initial_active_block_custody,
+            )),
             data_router: std::sync::Arc::new(std::sync::OnceLock::new()),
             space_freed_notify: std::sync::Arc::new(squeezefs_ipc::sqz_notify::Notify::new()),
             staged_writes_in_flight: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(
@@ -1617,12 +1638,8 @@ impl NvmeStaging {
                 return false;
             }
             if self.staging_nvme_cache.remove(&key_bytes[..]).is_some() {
-                let prev = self
-                    .staged_writes_in_flight
+                self.staged_writes_in_flight
                     .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
-                if prev == 1 {
-                    self.staged_drained_notify.notify_waiters();
-                }
             }
             let _ = entry.remove();
             cost
@@ -1751,6 +1768,10 @@ impl NvmeStaging {
             .active_block_index
             .insert_sync(key.to_string(), ())
             .is_ok();
+        if indexed_here {
+            self.active_block_custody
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
         let is_new = self.staging_nvme_cache.get(&key_bytes).is_none();
         let admitted = self.staging_nvme_cache.reserve_and_write(
             key_bytes,
@@ -1768,7 +1789,9 @@ impl NvmeStaging {
             // put/remove callers hold the block's BLOCK_FLUSH_LOCKS stripe,
             // so a pre-existing entry — insert refused — belongs to a live
             // staged sibling and must survive this refusal.)
-            self.active_block_index.remove_sync(key);
+            if self.active_block_index.remove_sync(key).is_some() {
+                self.release_active_block_custody();
+            }
         }
         admitted
     }
@@ -1869,22 +1892,39 @@ impl NvmeStaging {
         self.active_block_index.read_sync(key, |_, _| ()).is_some()
     }
 
+    /// One `active_block_index` entry left: credit the custody population
+    /// and wake the dismount drain wait on the last one.
+    fn release_active_block_custody(&self) {
+        let prev = self
+            .active_block_custody
+            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        if prev == 1 {
+            self.staged_drained_notify.notify_waiters();
+        }
+    }
+
+    /// Our `active_block[_ext]:` custody records still staged — the
+    /// population the dismount sweep and the writeback worker retire, and
+    /// therefore the dismount drain wait's predicate.
+    pub fn active_block_custody_count(&self) -> usize {
+        self.active_block_custody
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
     /// Remove a packed active block write from staging_nvme_cache.
     pub fn remove_active_block(&self, key: &str) -> Option<Vec<u8>> {
         let val = self.read_staged(key);
         if self.staging_nvme_cache.remove(key.as_bytes()).is_some() {
-            let prev = self
-                .staged_writes_in_flight
+            self.staged_writes_in_flight
                 .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
-            if prev == 1 {
-                self.staged_drained_notify.notify_waiters();
-            }
         }
         // Occupancy index: un-index strictly AFTER the ring removal
         // (conservative-present — see the field doc). `remove_staged`
         // routes plain file_id keys here too; those were never indexed and
         // the remove is a no-op for them.
-        self.active_block_index.remove_sync(key);
+        if self.active_block_index.remove_sync(key).is_some() {
+            self.release_active_block_custody();
+        }
         // Return the budget of a counted staged entry (unlink, spill purge,
         // layout transition). Active-block keys are never in the ledger.
         if let Some((_, (cost, _))) = self.staged_ledger.remove_sync(key) {

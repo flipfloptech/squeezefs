@@ -260,6 +260,26 @@ mount (the A-arm rig reset the cluster; remount is part of every arm).
    rescues 0/0 everywhere, closure exact). Box back on 1.2.2 `dist`, fresh
    set. Staged-residue investigation (dismounts reporting unflushed staged
    files) in flight — subagent + laptop live probe.
+1m. **Dismount staged residue — steps (1)+(2) LANDED and GATED** (`9ac570ab`;
+   gate 09:46–10:41, 367 suites / 4,843 tests, 18 stages). (1) the drain
+   wait polls `active_block_custody_count()` (the custody the teardown
+   retires; notify on its zero transition) — census 10.4 s → 348 ms; the
+   teardown flush returns its summary, `failed > 0` → ERROR; the census
+   names two classes (staged-layout INFO / active custody WARN); the
+   lost-payload message no longer blames a crash; `umount [w]` only with
+   active blocks; ops.md paragraph. (2) `promote_all_staged_files_at_dismount`
+   drains the staged ledger through `promote_staged_file` under
+   `striped_block_concurrency` with the ino's current token — "Dismount
+   clean" now means every other client reads the files (the red: a
+   different-mount-point remount read 200 files as zeros); gauges
+   `dismount_promoted_{files,bytes}`, `dismount_promote_failures`.
+   Suite `tests/dismount_staged_residue_tests.rs` (require-mount gate).
+   **Step (3) — should `fsync` promote — is the OWNER's decision**
+   (`.benchmarks/2026-09-09-dismount-staged-residue.md` §7 item 3): a
+   counted A/B on squeeze-test. Left for it: the daemon's own SIGTERM TTY
+   prompt (`fuse_client.rs` ≈ 28913) still offers "[w] Wait for staged
+   files" with the stale wording; AGENTS.md's "writeback/flush promotes"
+   sentence.
 2. **Kernel A/B, B arm** — after `squeeze-test` boots the 6.19.14 series
    WITH 0031 (or whichever box carries the patched kernel): on the box,
    `cd /scratch/tmp/sqz-agent/k26 && sudo env ARM=B KERNEL_TAG=<uname -r

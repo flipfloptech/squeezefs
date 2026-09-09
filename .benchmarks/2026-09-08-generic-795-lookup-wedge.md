@@ -161,7 +161,14 @@ is `kern.bt`.
   write after arming — the exact observed posture: armed coalescer,
   stranded commit) in `tests/commit_wake_loss_tests.rs`. What this does
   NOT do is name the wake's loser (kernel task-work wake vs daemon); the
-  snapshot line names it at the next exposure.
+  snapshot line names it at the next exposure. **Field row (2026-09-09,
+  `.benchmarks/2026-09-09-dist-121-vs-122-squeeze-test.md`): the 1.2.1 vs
+  1.2.2 `dist` binaries E-F-F-E on squeeze-test — the bounded park ticked
+  7–339 times per 30 s row across 32 workers, every tick found nothing
+  (`commit_rescues` = `cqe_rescues` = 0 on all ten rows), no slot overdue,
+  `parked ≡ unparked` exact; IOPS / CPU-per-op indistinguishable from the
+  pre-fix rows. The fix's field cost is below the instrument's
+  resolution.**
 * **Open beside it (P1):** four of the pass's 407 dismounts reported
   200+ unflushed staged files and 47 reported 1–2 ("dismounted with
   unflushed data") — orphans of deleted files or acked bytes lost at

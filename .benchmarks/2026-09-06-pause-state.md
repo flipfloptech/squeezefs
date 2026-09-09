@@ -252,6 +252,14 @@ mount (the A-arm rig reset the cluster; remount is part of every arm).
    with unflushed staged files (4 of 407 at 200+, the fstests test device
    2,193 every cycle); the NOTE line in the runner is noisy (per-test) —
    quiet it to once per distinct value.
+1l. **Post-tag (2026-09-09).** 1.2.1-vs-1.2.2 `dist` E-F-F-E on squeeze-test
+   (`.benchmarks/2026-09-09-dist-121-vs-122-squeeze-test.md`): the campaign
+   rows reproduce on the shipped profile (rr4k +6.3 %/CPU −9.3 %, rw4k
+   +13.3 %/CPU −11.9 %, fsync storm +24.4 %, wdur par, il control +1.7 %)
+   and the bounded-park fix's owed field row is MET (ticks 7–339 per row,
+   rescues 0/0 everywhere, closure exact). Box back on 1.2.2 `dist`, fresh
+   set. Staged-residue investigation (dismounts reporting unflushed staged
+   files) in flight — subagent + laptop live probe.
 2. **Kernel A/B, B arm** — after `squeeze-test` boots the 6.19.14 series
    WITH 0031 (or whichever box carries the patched kernel): on the box,
    `cd /scratch/tmp/sqz-agent/k26 && sudo env ARM=B KERNEL_TAG=<uname -r

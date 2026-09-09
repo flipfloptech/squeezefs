@@ -496,6 +496,17 @@ mod tests {
 
     static SERIAL: Mutex<()> = Mutex::new(());
 
+    /// The pool is process-global and `traced()` answers every op while
+    /// a divisor-1 arm is up, so another module's test thread that runs a
+    /// hook site (fast_dispatch's `record_served`) stamps INTO this
+    /// module's pool whenever the harness runs tests in parallel (the
+    /// fork's bench smoke does — it found a third sample in a
+    /// two-stamp drain, gate 2026-09-09). Every assertion here therefore
+    /// reads only the samples this test minted.
+    fn own(samples: Vec<Sample>, ids: impl Fn(u64) -> bool) -> Vec<Sample> {
+        samples.into_iter().filter(|s| ids(s.op_id)).collect()
+    }
+
     fn arm_all(rings: usize, cap: usize) {
         arm(ArmConfig {
             rings,
@@ -512,7 +523,7 @@ mod tests {
         disarm();
         let _ = drain();
         stamp(5, Stage::Dispatch, Instant::now());
-        assert!(drain().is_empty());
+        assert!(own(drain(), |id| id == 5).is_empty());
         assert_eq!(traced(5), 0);
         arm_all(2, 16);
         assert_eq!(traced(5), 5);
@@ -524,7 +535,7 @@ mod tests {
             Stage::TransportRecv,
             t - std::time::Duration::from_nanos(10),
         );
-        let got = drain();
+        let got = own(drain(), |id| id == 5);
         assert_eq!(got.len(), 2);
         assert_eq!(got[0].stage, Stage::TransportRecv as u16);
         assert_eq!(got[1].mono_ns - got[0].mono_ns, 10);
@@ -572,10 +583,16 @@ mod tests {
         for i in 0..10u64 {
             stamp(100 + i, Stage::Dispatch, t);
         }
-        assert_eq!(dropped() - base, 6);
-        assert_eq!(drain().len(), 4);
+        // This thread's ring holds the last 4 of its 10 stamps and dropped
+        // the other 6; a foreign thread's stamps on a ONE-ring pool land in
+        // `dropped_unringed`, so the global count is a floor here, and the
+        // ring's own contents are exact.
+        let after = dropped();
+        assert!(after - base >= 6, "6 of this thread's 10 stamps dropped");
+        assert_eq!(own(drain(), |id| (100..110).contains(&id)).len(), 4);
         // Re-arm, same geometry: the divisor changes, the pool stays (the
-        // per-thread ring claim survives, so the counters continue).
+        // per-thread ring claim survives, so the counters continue rather
+        // than restart from zero).
         arm(ArmConfig {
             rings: 1,
             ring_capacity: 4,
@@ -584,7 +601,7 @@ mod tests {
             epoch_mono_ns: 0,
         });
         assert_eq!(divisor(), 3);
-        assert_eq!(dropped() - base, 6, "same pool, same counters");
+        assert!(dropped() >= after, "same pool, same counters");
         disarm();
         let _ = drain();
     }
@@ -603,7 +620,9 @@ mod tests {
             b.push(id);
         }
         b.stamp(Stage::PassBegin, Instant::now());
-        let got = drain();
+        let got = own(drain(), |id| {
+            (1..=TracedBatch::CAP as u64 + 3).contains(&id)
+        });
         assert_eq!(got.len(), TracedBatch::CAP, "capped members");
         assert!(got.iter().all(|s| s.stage == Stage::PassBegin as u16));
         disarm();

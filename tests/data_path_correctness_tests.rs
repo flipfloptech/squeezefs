@@ -69,9 +69,9 @@ async fn make_single_writer() -> H {
 async fn make_inner(single_writer: bool) -> H {
     // Block size 64 KiB so we cover all three layouts:
     // inline <=4 KiB, staged 4 KiB..64 KiB, striped >64 KiB — at the
-    // SHIPPED inline ceiling (the A/B control; the 2026-09-09 raise derives
-    // 60 KiB from the KV geometry, which would leave a 4 KiB staged window
-    // on this 64 KiB block).
+    // one-page inline ceiling (the default since the phase-B sweep,
+    // .benchmarks/2026-09-09-inline-raise-sweep-local.md — pinned explicitly
+    // so an environment override cannot move the staged window).
     std::env::set_var("SQUEEZEFS_DEFAULT_BLOCK_SIZE", "65536");
     squeezefs::routing::set_inline_max_bytes_override(Some(squeezefs::routing::INLINE_MAX_FLOOR));
     // Default W1 patch posture per test (a prior test in this binary may

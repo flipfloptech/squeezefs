@@ -86,9 +86,10 @@ struct H {
 /// cache-less (`staging_dirs` empty — the field venue).
 async fn make_harness(test_id: &str, staged: bool) -> H {
     std::env::set_var("SQUEEZEFS_DEFAULT_BLOCK_SIZE", FBS.to_string());
-    // The staged-layout contracts run at the SHIPPED inline ceiling (the
-    // A/B control): the 2026-09-09 raise derives it from the KV geometry,
-    // under which this suite's sub-block files would be inline.
+    // The staged-layout contracts pin the inline ceiling at one page — the
+    // default since the phase-B sweep (.benchmarks/2026-09-09-inline-raise-
+    // sweep-local.md) — explicitly, so a SQUEEZEFS_INLINE_MAX_BYTES override
+    // in the environment cannot move this suite's sub-block files inline.
     squeezefs::routing::set_inline_max_bytes_override(Some(squeezefs::routing::INLINE_MAX_FLOOR));
     let dlm = DlmClient::new().unwrap();
     let backing = NamedTempFile::new().unwrap();

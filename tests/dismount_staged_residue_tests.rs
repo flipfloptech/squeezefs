@@ -2,7 +2,7 @@
 //! (`.benchmarks/2026-09-09-dismount-staged-residue.md`).
 //!
 //! A file whose size lands in `(inline ceiling, block_size]` (the shipped
-//! 4 KiB ceiling here — the suite pins the A/B control) on a
+//! one-page ceiling, the default — the suite pins it explicitly) on a
 //! volume formatted with a staging dir takes the STAGED layout: its whole
 //! payload is one entry in this host's local staging ring, keyed by the
 //! layout's `file_id`, and the shared data backend holds nothing for it
@@ -47,7 +47,7 @@ use std::time::{Duration, Instant};
 
 /// The probe's population (§3): 200 small files, all staged-layout.
 const FILES: usize = 200;
-/// Sizes strictly above the shipped 4 KiB inline ceiling and far below the 4 MiB
+/// Sizes strictly above the one-page inline ceiling and far below the 4 MiB
 /// block — the staged layout by construction (§1). 4 KiB itself would be
 /// inline, so it is excluded.
 const SIZES_KIB: [usize; 4] = [8, 16, 32, 64];
@@ -265,10 +265,10 @@ fn spawn_mount(meta: &Path, mnt: &Path, log: &Path) -> Mount {
         .arg("--disk-cache-size")
         .arg("500MB")
         .env("SQUEEZEFS_FUSE_ZC", "0")
-        // The staged-layout contracts run at the SHIPPED inline ceiling
-        // (the A/B control): the 2026-09-09 inline raise derives 60 KiB
-        // from the KV geometry, under which this suite's 8–64 KiB files
-        // would be inline and never staged.
+        // The staged-layout contracts pin the inline ceiling at one page
+        // (the default since the phase-B sweep) explicitly, so an
+        // environment override cannot move this suite's 8–64 KiB files
+        // inline.
         .env("SQUEEZEFS_INLINE_MAX_BYTES", "4096")
         .stdout(Stdio::from(logf.try_clone().expect("clone log fd")))
         .stderr(Stdio::from(logf))

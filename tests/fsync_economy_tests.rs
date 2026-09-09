@@ -1012,11 +1012,11 @@ async fn staged_promotion_lever_promotes_exactly_once_on_fsync() {
     // Touched-namespace barriers ON: the promoted block's device is
     // barriered only if the promotion STAMPED it.
     fsync_economy::test_set_touched_namespaces(Some(true));
-    // The staged-layout legs run at the SHIPPED inline ceiling (the A/B
-    // control): under the derived one (60 KiB at this node size) the
-    // 16 KiB fixture file is inline — and the promotion's size dispatch
-    // sends a staged file at or under the ceiling INTO INLINE, which the
-    // last leg pins by lifting the override.
+    // The staged-layout legs run at the one-page inline ceiling (the
+    // default since the phase-B sweep, pinned explicitly so an override in
+    // the environment cannot move the 16 KiB fixture file inline); the
+    // last leg RAISES the ceiling over the file to pin the promotion's
+    // inline dispatch.
     squeezefs::routing::set_inline_max_bytes_override(Some(squeezefs::routing::INLINE_MAX_FLOOR));
     let fx = open_fx(1, "promote").await;
     squeezefs::dev_power_cut::arm_power_cut(fx.dev_path(0));
@@ -1108,15 +1108,17 @@ async fn staged_promotion_lever_promotes_exactly_once_on_fsync() {
     assert_eq!(fail3, fail2, "…and is not a failure");
     assert_eq!(noop3 - noop2, 1, "…it is the counted no-op");
 
-    // The size dispatch (the inline raise): a file STAGED under the shipped
-    // ceiling, fsync'd under the derived one, promotes INTO INLINE — the
-    // payload rides the layout record, no block is allocated, no device is
-    // barriered for it, and the bytes read back through `data_key`.
+    // The size dispatch: a file STAGED under the default ceiling, fsync'd
+    // under a RAISED one (the operator's override — never the default,
+    // the sweep's verdict), promotes INTO INLINE — the payload rides the
+    // layout record, no block is allocated, no device is barriered for
+    // it, and the bytes read back through `data_key`.
     let (ino_in, fid_in) = staged_file(&fx, "inline.bin", 0x24).await;
-    squeezefs::routing::set_inline_max_bytes_override(None);
-    assert!(
-        fx.fs.router.inline_max_bytes(ino_in) >= 16 * 1024,
-        "the derived ceiling admits the 16 KiB file"
+    squeezefs::routing::set_inline_max_bytes_override(Some(16 * 1024));
+    assert_eq!(
+        fx.fs.router.inline_max_bytes(ino_in),
+        16 * 1024,
+        "the raised ceiling admits the 16 KiB file"
     );
     let allocated0 = fx.fs.router.backend_router.allocated_bytes();
     let (files4, bytes4, fail4, noop4) = promote_gauges();

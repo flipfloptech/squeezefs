@@ -1,26 +1,43 @@
 use crate::cache::{TieredCache, BUFFER_POOL};
 use crate::dlm::DlmClient;
 
-/// The inline-layout ceiling's FLOOR — the shipped 4 KiB posture (one
-/// page; the value the ceiling was a free constant at until the 2026-09-09
-/// raise). The never-regress-below-shipped floor: the explicit override's
-/// lower bound and the derivation's, never a tuning value. Reachable as
-/// `SQUEEZEFS_INLINE_MAX_BYTES=4096` — the A/B control.
+/// The inline-layout ceiling's FLOOR and DEFAULT — one page (4 KiB). The
+/// default is DERIVED from what an inline byte costs, not chosen: an
+/// inline file's payload IS its layout record, so every write of it rides
+/// the metadata plane twice (the checksummed journal entry + the CoW node
+/// append — ≈ 2× the payload in bytes) against the staged layout's fixed
+/// ≈ 0.3 KB of metadata per file whatever its size; one page is where the
+/// record's payload costs about what a block mapping does, and above it
+/// the metadata plane becomes a data plane for small files, which it is
+/// not sized to be (`.benchmarks/2026-09-09-inline-raise-sweep-local.md`:
+/// 16 KiB inline −34 % files/s and 59× the metadata bytes per file, 32 KiB
+/// −68 %/117× and a fail-stopped 1 GiB metadata volume in 20 s). Also the
+/// never-regress-below-shipped floor and the override's lower bound.
 pub const INLINE_MAX_FLOOR: usize = 4096;
 
-/// The inline ceiling a volume with xattr value cap `value_cap` derives
-/// (`.benchmarks/2026-09-09-fsync-promote-staged-ab.md` §4 (iii)): the
-/// LARGEST payload whose `layout` record still fits ONE KV value. The
-/// payload IS the record's `data_key`, the record's other fields ride the
-/// same value, and the value cap (`min(64 KiB, node_size/4)` — the format's
-/// bound) is the room; `LAYOUT_INLINE_HEADROOM` is the layout wire's own
-/// framing allowance (type, size, ids, the record envelope — the same 4 KiB
-/// the inline block-map ceiling budgets), so this is the FORMAT bound, not
-/// a tuning choice. Anything smaller trades metadata-plane bytes per small
-/// write against a block per small file — the override's (and the phase-B
-/// threshold sweep's) decision, never this derivation's. 60 KiB at the
-/// shipped 256 KiB node; 12 KiB at the 64 KiB node floor.
+/// The inline ceiling a volume derives by DEFAULT: [`INLINE_MAX_FLOOR`] at
+/// every node size — the cost the default prices is per payload byte on
+/// the metadata plane, not per node, so the geometry does not move it
+/// (`value_cap` is the argument because the ceiling in force is
+/// [`inline_max_bytes_for_cap`]'s, which bounds an override by the
+/// volume's format bound; the derivation itself is geometry-blind by the
+/// sweep's finding).
 pub fn derived_inline_max_bytes(value_cap: usize) -> usize {
+    INLINE_MAX_FLOOR.min(inline_max_bytes_ceiling(value_cap))
+}
+
+/// The FORMAT BOUND — the largest inline ceiling a volume with xattr value
+/// cap `value_cap` can hold, i.e. the MAXIMUM `SQUEEZEFS_INLINE_MAX_BYTES`
+/// may name for it: the largest payload whose `layout` record still fits
+/// ONE KV value. The payload IS the record's `data_key`, the record's
+/// other fields ride the same value, the value cap (`min(64 KiB,
+/// node_size/4)`) is the room, and `LAYOUT_INLINE_HEADROOM` is the layout
+/// wire's own framing allowance (type, size, ids, the record envelope —
+/// the same 4 KiB the inline block-map ceiling budgets). 60 KiB at the
+/// shipped 256 KiB node; 12 KiB at the 64 KiB node floor. A bound, never
+/// the default (the raise's phase A shipped it as the default and the
+/// phase-B sweep priced that out — see [`INLINE_MAX_FLOOR`]).
+pub fn inline_max_bytes_ceiling(value_cap: usize) -> usize {
     value_cap
         .saturating_sub(LAYOUT_INLINE_HEADROOM)
         .max(INLINE_MAX_FLOOR)
@@ -35,13 +52,13 @@ pub enum PromotedInto {
     Block,
 }
 
-/// The largest ceiling ANY volume can hold — the registered override's
-/// upper bound (`RECORD_VALUE_CAP_CEILING` is Linux `XATTR_SIZE_MAX`, the
-/// value cap at every node size ≥ 256 KiB).
+/// The largest format bound ANY volume can hold — the registered
+/// override's upper bound (`RECORD_VALUE_CAP_CEILING` is Linux
+/// `XATTR_SIZE_MAX`, the value cap at every node size ≥ 256 KiB).
 pub const INLINE_MAX_CEILING: usize =
     crate::meta_backend::kv::node::RECORD_VALUE_CAP_CEILING - LAYOUT_INLINE_HEADROOM;
 
-/// The `SQUEEZEFS_INLINE_MAX_BYTES` override cell: 0 = none (derive).
+/// The `SQUEEZEFS_INLINE_MAX_BYTES` override cell: 0 = none (the default).
 /// Read once from the environment (registered; out of range refuses the
 /// process at startup); the test seam presets it.
 fn inline_max_override_cell() -> &'static std::sync::atomic::AtomicUsize {
@@ -54,22 +71,24 @@ fn inline_max_override_cell() -> &'static std::sync::atomic::AtomicUsize {
 }
 
 /// Test seam: `Some(bytes)` presets the inline ceiling override (`4096` =
-/// the shipped posture the staged-layout contracts run at); `None` returns
-/// it to the derivation.
+/// one page, the default the staged-layout contracts pin explicitly; a
+/// larger value raises the ceiling for a mechanism contract); `None`
+/// returns it to the default.
 pub fn set_inline_max_bytes_override(bytes: Option<usize>) {
     inline_max_override_cell().store(bytes.unwrap_or(0), Ordering::Relaxed);
 }
 
 /// The inline ceiling in force for a volume with xattr value cap
 /// `value_cap`: the explicit override verbatim, bounded by the volume's
-/// format bound ([`derived_inline_max_bytes`] — a payload above it has no
+/// format bound ([`inline_max_bytes_ceiling`] — a payload above it has no
 /// record that can hold it; the startup gate validates the override's
 /// range against the LARGEST node size, and a smaller-node volume's bound
-/// is applied here, logged once), else the derivation.
+/// is applied here, logged once), else the default
+/// ([`derived_inline_max_bytes`] — one page).
 pub fn inline_max_bytes_for_cap(value_cap: usize) -> usize {
-    let bound = derived_inline_max_bytes(value_cap);
+    let bound = inline_max_bytes_ceiling(value_cap);
     match inline_max_override_cell().load(Ordering::Relaxed) {
-        0 => bound,
+        0 => derived_inline_max_bytes(value_cap),
         explicit if explicit <= bound => explicit,
         explicit => {
             static CLAMPED: std::sync::Once = std::sync::Once::new();

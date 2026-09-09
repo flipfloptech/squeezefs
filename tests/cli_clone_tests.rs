@@ -470,9 +470,9 @@ async fn test_cli_clone_staged_source_refuses_loudly() {
     let staging = tempfile::tempdir().expect("staging");
     let ino = {
         std::env::set_var("SQUEEZEFS_DEFAULT_BLOCK_SIZE", BLOCK.to_string());
-        // The staged-source contract runs at the shipped inline ceiling
-        // (the A/B control): the 2026-09-09 raise moved the class boundary,
-        // not the class — a 16 KiB file is inline under the derived one.
+        // The staged-source contract pins the inline ceiling at one page
+        // (the default since the phase-B sweep) explicitly, so an
+        // environment override cannot move the 16 KiB source inline.
         squeezefs::routing::set_inline_max_bytes_override(Some(
             squeezefs::routing::INLINE_MAX_FLOOR,
         ));

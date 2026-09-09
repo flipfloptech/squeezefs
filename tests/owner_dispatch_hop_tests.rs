@@ -790,6 +790,16 @@ async fn publish_panic_inline_answers_status_panic_and_the_session_survives() {
 /// publish lands, one tx = one journal entry. On the control (`0`) the
 /// same burst dials up to `depth` request/reply sessions and ships no
 /// multiplexed frame — the D-1b shape, byte-identical.
+///
+/// The contract is the SESSION's, not the cold dial's: `exchange_multiplexed`
+/// documents that two frames racing a cold lane may both dial (the first
+/// stored, the second a wasted dial — never a wrong session), so the burst's
+/// first frame runs alone until its session is stored and carrying it
+/// (`ship_session_dials` + 1 AND `ship_mux_frames` + 1 — the frame counter
+/// moves only after the slot store), and the tail's 23 frames are what the
+/// one-connection assertion counts. Before this the tail started 2 ms after
+/// the first spawn, and a dial slower than that on a throttled box counted
+/// the documented race as a failure (gate 2026-09-09).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn publish_depth_costs_one_connection_when_multiplexed_and_depth_when_pooled() {
     let _serial = serial();
@@ -828,15 +838,32 @@ async fn publish_depth_costs_one_connection_when_multiplexed_and_depth_when_pool
         // Arrivals spaced apart so each early one finds the drain idle and
         // ships as its own frame (the streaming shape, one save at a time)
         // until `depth` frames are parked at the held owner.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
         let mut handles = Vec::with_capacity(inos.len());
-        for &ino in &inos {
+        for (i, &ino) in inos.iter().enumerate() {
             let be = Arc::clone(&nodes.client_be);
             handles.push(tokio::spawn(async move {
                 publish::set_layout_and_size(&be, ino, &layout_bytes(8192), 8192, &[]).await
             }));
+            if i == 0 && expect_mux {
+                // The first frame's dial is the lane's cold dial; the tail
+                // starts only once its session is stored and carrying it.
+                loop {
+                    let s = publish::stats();
+                    if s.ship_session_dials > s0.ship_session_dials
+                        && s.ship_mux_frames > s0.ship_mux_frames
+                    {
+                        break;
+                    }
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "arm {arm}: the first frame never dialed the pipelined session"
+                    );
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+            }
             tokio::time::sleep(Duration::from_millis(2)).await;
         }
-        let deadline = std::time::Instant::now() + Duration::from_secs(10);
         while publish::stats().ship_depth_waits == s0.ship_depth_waits {
             assert!(
                 std::time::Instant::now() < deadline,

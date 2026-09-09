@@ -1,41 +1,49 @@
-//! The **inline raise** — phase A of the small-file program the fsync-
-//! promotion pricing decided (`.benchmarks/2026-09-09-fsync-promote-staged-ab.md`
-//! §3–4: promoting a small staged file into a WHOLE 4 MiB striped block is
-//! a 64× space law; the owner's answer is "what does a small file promote
-//! INTO" — the inline layout, whose ceiling was a free 4 KiB constant).
+//! The **inline ceiling** — its default, its override, and the mechanism
+//! behind the override (phase A of the small-file program,
+//! `.benchmarks/2026-09-09-fsync-promote-staged-ab.md` §3–4, priced by
+//! the phase-B sweep `.benchmarks/2026-09-09-inline-raise-sweep-local.md`).
 //!
-//! The inline ceiling is now DERIVED from the KV geometry
-//! (`routing::derived_inline_max_bytes`: the volume's xattr value cap
-//! `min(64 KiB, node_size/4)` minus the layout wire's framing headroom —
-//! the largest payload whose `layout` record still fits ONE KV value; 60 KiB
-//! at the shipped 256 KiB node), with the explicit override
-//! `SQUEEZEFS_INLINE_MAX_BYTES` (4096 = the shipped ceiling, the A/B
-//! control). A file up to the ceiling is INLINE — its bytes ride the
-//! layout commit, visible to every client of the set at that commit, no
-//! block and no promotion step — and `promote_staged_file` dispatches on
-//! size: a staged file at or under the ceiling promotes INTO INLINE (no
-//! block allocated), a larger one takes the block path exactly as before.
+//! The DEFAULT ceiling is one page (`routing::INLINE_MAX_FLOOR`, 4 KiB —
+//! the derived default): an inline file's payload IS its layout record, so
+//! every write of it rides the metadata plane twice (journal entry + CoW
+//! node append, ≈ 2× the payload) against the staged path's fixed ≈ 0.3 KB
+//! per file — the sweep read −34 % files/s and 59× the metadata bytes per
+//! file at 16 KiB, −68 % and 117× at 32 KiB, and a fail-stopped 1 GiB
+//! metadata volume. The override `SQUEEZEFS_INLINE_MAX_BYTES` (range
+//! 4096..=the format bound `value_cap − 4 KiB`, 61440 at the shipped node)
+//! is the operator's lever (generously sized metadata volumes + a hard
+//! small-file cross-client-visibility need) and the measurement lever. A
+//! file up to the ceiling in force is INLINE — its bytes ride the layout
+//! commit, visible to every client of the set at that commit, no block and
+//! no promotion step — and `promote_staged_file` dispatches on size: a
+//! staged file at or under the ceiling promotes INTO INLINE (no block
+//! allocated), a larger one takes the block path.
 //!
-//! Contracts (red-first, live mounts):
-//! (a) a 16 KiB file written + fsync'd is inline (`layout_inline_writes`
-//!     moves, `nvme_staged_write_file_count` stays 0) and a LIVE read-only
-//!     mount of the same set — the other client, beside the writer — reads
-//!     it byte-exact with no promotion having happened. RED today: staged,
-//!     the reader serves zeros.
-//! (b) `SQUEEZEFS_INLINE_MAX_BYTES=4096`: the same file is staged (the
-//!     shipped behavior, pinned as the A/B control) and the stats inode
-//!     publishes the ceiling in force.
-//! (c) growth: the inline file appended past the ceiling becomes staged,
-//!     appended past the block becomes striped — durably (contents intact
-//!     across a kill-9 remount elsewhere, the C8 oracle's drift 0).
+//! Contracts (live mounts):
+//! (a) ceiling RAISED (override 16 KiB): a 16 KiB file written + fsync'd
+//!     is inline (`layout_inline_writes` moves, `nvme_staged_write_file_count`
+//!     stays 0) and a LIVE read-only mount of the same set — the other
+//!     client, beside the writer — reads it byte-exact with no promotion
+//!     having happened.
+//! (b) THE DEFAULT: with no override a 16 KiB fsync'd file is STAGED and
+//!     the stats inode publishes `inline_max_bytes` = 4096 — the sweep's
+//!     verdict, pinned so the default cannot drift to the format bound
+//!     again.
+//! (c) growth (ceiling raised): the inline file appended past the ceiling
+//!     becomes staged, appended past the block becomes striped — durably
+//!     (contents intact across a kill-9 remount elsewhere, the C8 oracle's
+//!     drift 0).
 //! (d) the dismount promotion of N small staged files (staged under the
-//!     4 KiB control, recovered by a default-ceiling mount, then cleanly
+//!     default, recovered by a RAISED-ceiling mount, then cleanly
 //!     unmounted) allocates ZERO blocks and counts them inline; the next
 //!     mount reads them.
-//! (e) the fsync lever on + small staged files → the inline dispatch: no
-//!     block, no `StorageFull` possible, `fsync_promote_failures` 0.
-//! (f) `SQUEEZEFS_INLINE_MAX_BYTES` above the KV cap refuses the process
-//!     at startup naming the range.
+//! (e) the fsync lever on + a raised ceiling + small staged files → the
+//!     inline dispatch: no block, no `StorageFull` possible,
+//!     `fsync_promote_failures` 0.
+//! (f) `SQUEEZEFS_INLINE_MAX_BYTES` above the format bound refuses the
+//!     process at startup naming the range.
+//! (g) the override AT the format bound (61440) is accepted and published
+//!     verbatim.
 //!
 //! Mount-class: self-skips through the testkit where a mount is not
 //! possible and rides the require-mount gate.
@@ -48,16 +56,24 @@ use std::time::{Duration, Instant};
 
 const CEILING_KNOB: &str = "SQUEEZEFS_INLINE_MAX_BYTES";
 const LEVER_KNOB: &str = "SQUEEZEFS_FSYNC_PROMOTE_STAGED";
-/// The shipped inline ceiling — the A/B control the override reaches.
-const SHIPPED_CEILING: usize = 4096;
+/// The DEFAULT inline ceiling — one page (`routing::INLINE_MAX_FLOOR`),
+/// the sweep's verdict.
+const DEFAULT_CEILING: usize = 4096;
+/// The raised ceiling the mechanism contracts run at: admits `SMALL`,
+/// stays far under the format bound.
+const RAISED_CEILING: usize = 16 * 1024;
+const RAISED: &str = "16384";
+/// A raised ceiling covering every size in `SIZES_KIB` (the dismount /
+/// fsync populations dispatch inline only when they fit the ceiling).
+const RAISED_ALL: &str = "32768";
 /// The Linux `XATTR_SIZE_MAX` = the KV record-value cap's ceiling; the
-/// registered range's top is this minus the layout framing headroom.
+/// registered range's top — the format bound — is this minus the layout
+/// framing headroom.
 const KV_VALUE_CAP_CEILING: usize = 65_536;
 const LAYOUT_INLINE_HEADROOM: usize = 4096;
-/// The small file every contract writes first: above the shipped 4 KiB,
-/// under the derived ceiling at every admissible node size ≥ 128 KiB
-/// (12 KiB at the 64 KiB floor would make it staged — the format default
-/// is 256 KiB).
+const FORMAT_BOUND: usize = KV_VALUE_CAP_CEILING - LAYOUT_INLINE_HEADROOM;
+/// The small file every contract writes first: above the default ceiling,
+/// at the raised one.
 const SMALL: usize = 16 * 1024;
 /// The default format block size (the striped-transition boundary).
 const BLOCK: u64 = 4 * 1024 * 1024;
@@ -363,12 +379,12 @@ fn wait_reader_matches(reader: &Path, path: &Path, want: &[u8]) -> Result<(), Ve
     }
 }
 
-/// Write `FILES` small files under the SHIPPED ceiling (so they are
+/// Write `FILES` small files under the DEFAULT ceiling (so they are
 /// staged), then SIGKILL — the population survives in the mount point's
-/// staging slot for the next mount at the same point to recover. Returns
-/// the paths (relative names are the same on every mount point).
-fn stage_small_files_under_shipped_ceiling(meta: &Path, mnt: &Path, log: &Path) {
-    let mut a = spawn_mount(meta, mnt, log, &[(CEILING_KNOB, "4096")], false);
+/// staging slot for the next mount at the same point to recover. Relative
+/// names are the same on every mount point.
+fn stage_small_files_under_default_ceiling(meta: &Path, mnt: &Path, log: &Path) {
+    let mut a = spawn_mount(meta, mnt, log, &[], false);
     for idx in 0..FILES {
         let path = mnt.join(file_name(idx));
         std::fs::File::create(&path)
@@ -384,7 +400,7 @@ fn stage_small_files_under_shipped_ceiling(meta: &Path, mnt: &Path, log: &Path) 
         assert_eq!(rc, 0, "syncfs failed");
     }
     // The layouts must be DURABLE before the kill (release persists them
-    // in the background): fsync each file — under the 4 KiB control the
+    // in the background): fsync each file — under the default ceiling the
     // fsync syncs the ring shard and commits the staged layout, nothing
     // more.
     for idx in 0..FILES {
@@ -396,7 +412,7 @@ fn stage_small_files_under_shipped_ceiling(meta: &Path, mnt: &Path, log: &Path) 
     assert_eq!(
         staged_count(&stats_json(mnt)),
         FILES as u64,
-        "fixture premise: under the shipped ceiling the population is staged"
+        "fixture premise: under the default ceiling the population is staged"
     );
     a.kill9();
 }
@@ -419,7 +435,8 @@ fn verify_files(mnt: &Path) -> (usize, usize) {
 }
 
 // ---------------------------------------------------------------------------
-// (a) the raise: a small fsync'd file is inline and visible to a live reader
+// (a) the raised ceiling: a small fsync'd file is inline and visible to a
+//     live reader
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -432,20 +449,15 @@ fn a_small_fsynced_file_is_inline_and_a_live_reader_mount_sees_it() {
     let meta = format_volume(&base, &staging);
     let mnt = base.join("mnt");
     let log = base.join("mount.log");
-    let mut writer = spawn_mount(&meta, &mnt, &log, &[], false);
+    let mut writer = spawn_mount(&meta, &mnt, &log, &[(CEILING_KNOB, RAISED)], false);
 
     let before = stats_json(&mnt);
     let ceiling = before["inline_max_bytes"]
         .as_u64()
         .expect("the stats inode publishes inline_max_bytes") as usize;
-    assert!(
-        ceiling >= SMALL,
-        "the derived ceiling must admit a {SMALL}-byte file (above the shipped \
-         {SHIPPED_CEILING}; got {ceiling})"
-    );
-    assert!(
-        ceiling <= KV_VALUE_CAP_CEILING - LAYOUT_INLINE_HEADROOM,
-        "the ceiling must leave the layout framing inside one KV value (got {ceiling})"
+    assert_eq!(
+        ceiling, RAISED_CEILING,
+        "the override is published verbatim as the ceiling in force"
     );
 
     let want = pattern(1, SMALL);
@@ -496,41 +508,97 @@ fn a_small_fsynced_file_is_inline_and_a_live_reader_mount_sees_it() {
 }
 
 // ---------------------------------------------------------------------------
-// (b) the A/B control: the override at the shipped ceiling
+// (b) THE DEFAULT: one page — the sweep's verdict
 // ---------------------------------------------------------------------------
 
+/// With no override the ceiling in force is one page: a 16 KiB fsync'd
+/// file is STAGED (its bytes never ride the metadata plane), a 4 KiB one
+/// is inline, and the stats inode publishes 4096. Pinned against the
+/// derivation returning the format bound again
+/// (`.benchmarks/2026-09-09-inline-raise-sweep-local.md`: −34 % files/s
+/// and 59× the metadata bytes per file at 16 KiB, −68 %/117× at 32 KiB, a
+/// fail-stopped 1 GiB metadata volume).
 #[test]
-fn the_shipped_ceiling_override_keeps_the_small_file_staged() {
+fn the_default_ceiling_is_one_page_and_keeps_the_small_file_staged() {
     if !mount_supported(site!()) {
         return;
     }
-    let base = scratch("control");
+    let base = scratch("default");
     let staging = base.join("staging");
     let meta = format_volume(&base, &staging);
     let mnt = base.join("mnt");
     let log = base.join("mount.log");
-    let mut writer = spawn_mount(&meta, &mnt, &log, &[(CEILING_KNOB, "4096")], false);
+    let mut writer = spawn_mount(&meta, &mnt, &log, &[], false);
 
     let stats = stats_json(&mnt);
     assert_eq!(
         stats["inline_max_bytes"].as_u64(),
-        Some(SHIPPED_CEILING as u64),
-        "the override must be published verbatim as the ceiling in force"
+        Some(DEFAULT_CEILING as u64),
+        "the DEFAULT inline ceiling is one page (the sweep's verdict), published as such"
     );
     write_and_fsync(&mnt.join("small.bin"), &pattern(2, SMALL));
     let after = stats_json(&mnt);
     assert_eq!(
         staged_count(&after),
         1,
-        "under the shipped ceiling a {SMALL}-byte file is STAGED (the A/B control); log: {}",
+        "under the default ceiling a {SMALL}-byte file is STAGED — its payload must not \
+         ride the metadata plane; log: {}",
         log.display()
     );
-    // And a file at the ceiling itself is still inline.
-    write_and_fsync(&mnt.join("tiny.bin"), &pattern(3, SHIPPED_CEILING));
+    // And a file at the ceiling itself is inline.
+    write_and_fsync(&mnt.join("page.bin"), &pattern(3, DEFAULT_CEILING));
     assert_eq!(
         staged_count(&stats_json(&mnt)),
         1,
         "a file exactly at the ceiling is inline"
+    );
+
+    writer.umount_clean();
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+// ---------------------------------------------------------------------------
+// (g) the override at the format bound
+// ---------------------------------------------------------------------------
+
+/// The top of the range — the format bound `value_cap − 4 KiB` — is
+/// accepted and published verbatim, and a file at it is inline (the one
+/// KV value holds it).
+#[test]
+fn the_override_at_the_format_bound_is_accepted_and_published() {
+    if !mount_supported(site!()) {
+        return;
+    }
+    let base = scratch("bound");
+    let staging = base.join("staging");
+    let meta = format_volume(&base, &staging);
+    let mnt = base.join("mnt");
+    let log = base.join("mount.log");
+    let mut writer = spawn_mount(
+        &meta,
+        &mnt,
+        &log,
+        &[(CEILING_KNOB, &FORMAT_BOUND.to_string())],
+        false,
+    );
+
+    assert_eq!(
+        stats_json(&mnt)["inline_max_bytes"].as_u64(),
+        Some(FORMAT_BOUND as u64),
+        "the format bound is admissible and published verbatim"
+    );
+    let want = pattern(7, FORMAT_BOUND);
+    write_and_fsync(&mnt.join("bound.bin"), &want);
+    assert_eq!(
+        staged_count(&stats_json(&mnt)),
+        0,
+        "a file at the format bound is inline; log: {}",
+        log.display()
+    );
+    assert_eq!(
+        std::fs::read(mnt.join("bound.bin")).expect("read back"),
+        want,
+        "the largest inline payload reads back byte-exact"
     );
 
     writer.umount_clean();
@@ -551,10 +619,11 @@ fn growth_past_the_inline_ceiling_promotes_durably() {
     let meta = format_volume(&base, &staging);
     let mnt = base.join("mnt");
     let log = base.join("mount.log");
-    let mut writer = spawn_mount(&meta, &mnt, &log, &[], false);
+    let mut writer = spawn_mount(&meta, &mnt, &log, &[(CEILING_KNOB, RAISED)], false);
     let ceiling = stats_json(&mnt)["inline_max_bytes"]
         .as_u64()
         .expect("inline_max_bytes") as usize;
+    assert_eq!(ceiling, RAISED_CEILING);
 
     // Inline first.
     let head = pattern(4, SMALL);
@@ -668,12 +737,13 @@ fn dismount_promotes_small_staged_files_inline_without_blocks() {
     let staging = base.join("staging");
     let meta = format_volume(&base, &staging);
     let mnt = base.join("mnt");
-    stage_small_files_under_shipped_ceiling(&meta, &mnt, &base.join("mountA.log"));
+    stage_small_files_under_default_ceiling(&meta, &mnt, &base.join("mountA.log"));
 
-    // The default-ceiling mount at the SAME point recovers the population
-    // staged, and its clean unmount promotes it.
+    // The RAISED-ceiling mount at the SAME point recovers the population
+    // staged, and its clean unmount promotes it — every file now fits the
+    // ceiling in force, so the dispatch is the inline one.
     let log_b = base.join("mountB.log");
-    let mut b = spawn_mount(&meta, &mnt, &log_b, &[], false);
+    let mut b = spawn_mount(&meta, &mnt, &log_b, &[(CEILING_KNOB, RAISED_ALL)], false);
     assert_eq!(
         staged_count(&stats_json(&mnt)),
         FILES as u64,
@@ -748,10 +818,18 @@ fn the_fsync_lever_dispatches_small_staged_files_inline() {
     let staging = base.join("staging");
     let meta = format_volume(&base, &staging);
     let mnt = base.join("mnt");
-    stage_small_files_under_shipped_ceiling(&meta, &mnt, &base.join("mountA.log"));
+    stage_small_files_under_default_ceiling(&meta, &mnt, &base.join("mountA.log"));
 
+    // The lever on AND the ceiling raised over every file in the
+    // population: the fsync promotion's dispatch is the inline one.
     let log_b = base.join("mountB.log");
-    let mut b = spawn_mount(&meta, &mnt, &log_b, &[(LEVER_KNOB, "1")], false);
+    let mut b = spawn_mount(
+        &meta,
+        &mnt,
+        &log_b,
+        &[(LEVER_KNOB, "1"), (CEILING_KNOB, RAISED_ALL)],
+        false,
+    );
     assert_eq!(
         staged_count(&stats_json(&mnt)),
         FILES as u64,
@@ -819,12 +897,12 @@ fn the_fsync_lever_dispatches_small_staged_files_inline() {
 // (f) the knob's range
 // ---------------------------------------------------------------------------
 
-/// Above the KV value cap (minus the framing headroom) the value cannot
-/// be stored in one record — refused at startup, naming the range, before
-/// anything is opened (the ONE parsing convention).
+/// Above the format bound (the KV value cap minus the framing headroom)
+/// the value cannot be stored in one record — refused at startup, naming
+/// the range, before anything is opened (the ONE parsing convention).
 #[test]
 fn an_inline_ceiling_above_the_kv_cap_refuses_the_process() {
-    let too_big = (KV_VALUE_CAP_CEILING - LAYOUT_INLINE_HEADROOM + 1).to_string();
+    let too_big = (FORMAT_BOUND + 1).to_string();
     let out = Command::new(bin())
         .arg("--version")
         .env(CEILING_KNOB, &too_big)
@@ -837,25 +915,18 @@ fn an_inline_ceiling_above_the_kv_cap_refuses_the_process() {
     );
     assert!(stderr.contains(CEILING_KNOB), "{stderr}");
     assert!(
-        stderr.contains(&format!(
-            "{}..={}",
-            SHIPPED_CEILING,
-            KV_VALUE_CAP_CEILING - LAYOUT_INLINE_HEADROOM
-        )),
+        stderr.contains(&format!("{DEFAULT_CEILING}..={FORMAT_BOUND}")),
         "the refusal must name the admissible range: {stderr}"
     );
-    // Below the shipped floor is refused too.
+    // Below the one-page floor is refused too.
     let out = Command::new(bin())
         .arg("--version")
         .env(CEILING_KNOB, "512")
         .output()
         .expect("spawn squeezefs");
-    assert!(!out.status.success(), "512 is below the shipped floor");
-    // The top of the range and the control are accepted.
-    for v in [
-        SHIPPED_CEILING,
-        KV_VALUE_CAP_CEILING - LAYOUT_INLINE_HEADROOM,
-    ] {
+    assert!(!out.status.success(), "512 is below the one-page floor");
+    // The floor, a raised value and the format bound are accepted.
+    for v in [DEFAULT_CEILING, RAISED_CEILING, FORMAT_BOUND] {
         let out = Command::new(bin())
             .arg("--version")
             .env(CEILING_KNOB, v.to_string())

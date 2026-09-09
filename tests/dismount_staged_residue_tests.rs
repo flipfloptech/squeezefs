@@ -22,6 +22,17 @@
 //!    stays under 3 s. Pre-fix it is 10.08 s. The retired "dismounted with
 //!    unflushed data" WARN — which described this steady state as a loss —
 //!    must not appear.
+//! 2. **A clean unmount is a durability boundary for staged-layout files**
+//!    (§7 item 3), as it already is for rewrite epochs, overlays and
+//!    active blocks: the teardown promotes every resident staged-layout
+//!    entry to the shared backend, so (a) the census reads "Dismount
+//!    clean" with no resident staged-layout report, (b) a remount at a
+//!    DIFFERENT mount point — a client the origin's staging root is
+//!    invisible to — reads all N files byte-exact (pre-fix: size-consistent
+//!    ZEROS, §3 legs A/B), (c) that remount's `staged_payload_lost_reads`
+//!    stays 0 and it reports no moved-mount-point residue, and (d) the
+//!    unmount still lands its census well inside the default wait (each
+//!    promotion is one block + one metadata commit).
 //!
 //! Mount-class: self-skips through the testkit where a mount is not
 //! possible and rides the require-mount gate
@@ -337,8 +348,8 @@ fn populate_staged_files(mnt: &Path) {
 }
 
 /// Contract 1: with N resident staged-layout files and zero active
-/// blocks, `squeezefs umount` (default 10 s dismount wait) completes —
-/// daemon EXITED — in ≪ the wait. Pre-fix the drain loop waits on
+/// blocks, `squeezefs umount` (default 10 s dismount wait) reaches its
+/// teardown census in ≪ the wait. Pre-fix the drain loop waits on
 /// `staged_writes_in_flight`, which counts every ring key and which no
 /// teardown step decrements for this population, so the unmount runs to
 /// the timer: 10.08 s on the probe.
@@ -372,5 +383,111 @@ fn a_mount_holding_only_staged_layout_files_unmounts_without_the_drain_wait() {
         log.display()
     );
 
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// The census arm that names an un-promoted population (must not fire on
+/// a clean unmount once the teardown promotes).
+const RESIDENT_REPORT: &str = "staged-layout files resident in local staging at dismount";
+/// The clean verdict.
+const CLEAN_VERDICT: &str = "Dismount clean";
+/// The remount-side residue report a stranded origin root would earn.
+const RESIDUE_REPORT: &str = "MOVED-MOUNT-POINT STAGING RESIDUE";
+
+/// Contract 2: the clean unmount PROMOTES the staged ledger. After N
+/// staged-layout files + syncfs + `squeezefs umount`: the census is
+/// "Dismount clean" with no resident report, and a remount at a
+/// DIFFERENT mount point — which opens its own staging root and can see
+/// nothing of the origin's ring, exactly another host's view — reads
+/// every file byte-exact from the shared backend with
+/// `staged_payload_lost_reads == 0`. Pre-fix the promotion never happens
+/// (only pool pressure promotes), the census reports N resident, and the
+/// second mount serves size-consistent zeros for all N.
+#[test]
+fn a_clean_unmount_promotes_every_staged_layout_file_for_other_clients() {
+    if !mount_supported(site!()) {
+        return;
+    }
+    let base = scratch("promote");
+    let staging = base.join("staging");
+    let meta = format_volume(&base, &staging);
+    let mnt = base.join("mnt");
+    let log = base.join("mount.log");
+    let mut mount = spawn_mount(&meta, &mnt, &log);
+
+    populate_staged_files(&mnt);
+
+    // (d) the promotions ride the teardown, still well inside the wait.
+    let elapsed = mount.umount_timed();
+    assert!(
+        elapsed < UNMOUNT_BOUND,
+        "unmount with {FILES} staged-layout files to promote took {elapsed:?} to its census \
+         (bound {UNMOUNT_BOUND:?}); log: {}",
+        log.display()
+    );
+    // (a) the census: nothing resident, the ledger promoted.
+    assert!(
+        !log_contains(&log, RESIDENT_REPORT),
+        "a clean unmount left staged-layout files resident in local staging — the \
+         teardown did not promote the staged ledger; log: {}",
+        log.display()
+    );
+    assert!(
+        log_contains(&log, CLEAN_VERDICT),
+        "the census must read \"{CLEAN_VERDICT}\" after the promotions; log: {}",
+        log.display()
+    );
+    assert!(
+        log_contains(&log, &format!("promoted {FILES} staged-layout file(s)")),
+        "the teardown must report promoting all {FILES} files (the engagement line); log: {}",
+        log.display()
+    );
+
+    // (b) another client's view: a fresh mount point ⇒ a fresh staging
+    // slot; the origin's ring is not adopted, so the shared backend is
+    // the only source of every byte.
+    let mnt2 = base.join("mnt2");
+    let log2 = base.join("mount2.log");
+    let mut mount2 = spawn_mount(&meta, &mnt2, &log2);
+    let mut zero_reads = 0usize;
+    let mut mismatches = 0usize;
+    for idx in 0..FILES {
+        let path = mnt2.join(file_name(idx));
+        let got = std::fs::read(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+        let want = pattern(idx, file_len(idx));
+        if got != want {
+            mismatches += 1;
+            if got.len() == want.len() && got.iter().all(|&b| b == 0) {
+                zero_reads += 1;
+            }
+        }
+    }
+    assert_eq!(
+        mismatches,
+        0,
+        "{mismatches} of {FILES} staged-layout files read wrong from a second mount point \
+         ({zero_reads} as size-consistent ZEROS — the un-promoted staged-layout shape: the \
+         bytes exist only in the origin's staging root); remount log: {}",
+        log2.display()
+    );
+    // (c) the reader never degraded, and the origin root holds no live
+    // custody the second mount had to report.
+    let lost = stats_json(&mnt2)["metrics"]["staged_payload_lost_reads"]
+        .as_u64()
+        .expect("staged_payload_lost_reads exported");
+    assert_eq!(
+        lost,
+        0,
+        "the second mount degraded {lost} reads to zeros (staged_payload_lost_reads); log: {}",
+        log2.display()
+    );
+    assert!(
+        !log_contains(&log2, RESIDUE_REPORT),
+        "the origin's staging root still held live staged custody after a clean unmount \
+         (\"{RESIDUE_REPORT}\"); log: {}",
+        log2.display()
+    );
+
+    mount2.umount_timed();
     let _ = std::fs::remove_dir_all(&base);
 }

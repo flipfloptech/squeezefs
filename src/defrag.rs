@@ -144,6 +144,12 @@ pub struct PackReport {
     pub worst_occupancy: f64,
     /// Mean occupancy over the pack blocks (1.0 when none exists).
     pub mean_occupancy: f64,
+    /// Rows the wire view left out (`to_bounded_json`): `rows.len() +
+    /// rows_elided ≡ blocks`. 0 on the full report.
+    #[serde(default)]
+    pub rows_elided: u64,
+    /// One row per pack block, WORST occupancy first — the order an
+    /// operator acts in, and the order a bounded view keeps.
     pub rows: Vec<PackBlockRow>,
 }
 
@@ -156,6 +162,48 @@ pub struct DefragReport {
     pub d4: Vec<D4Volume>,
     /// The D1 pack face (PK6).
     pub pack: PackReport,
+}
+
+impl DefragReport {
+    /// The admin-lane view: the report served within `max_bytes`. The
+    /// aggregates are exact; the pack rows are the longest fitting
+    /// worst-occupancy prefix with `rows_elided` counting the rest — the
+    /// fsck report's precedent (`FsckReport::to_bounded_json`). Found by
+    /// the PK7 rig: the legacy one-block-per-file volume carried one row
+    /// per block and the lane refused the whole reply ("reply too large").
+    /// `None` only if even the row-less skeleton exceeds `max_bytes`.
+    pub fn to_bounded_json(&self, max_bytes: usize) -> Option<String> {
+        let full = serde_json::to_string(self).ok()?;
+        if full.len() <= max_bytes {
+            return Some(full);
+        }
+        // Binary-search the longest fitting prefix — encoding is
+        // monotone in the prefix length (rows only ever add bytes).
+        let mut view = self.clone();
+        let (mut lo, mut hi) = (0usize, self.pack.rows.len());
+        let mut best: Option<String> = None;
+        while lo < hi {
+            let mid = lo + (hi - lo).div_ceil(2);
+            view.pack.rows = self.pack.rows[..mid].to_vec();
+            view.pack.rows_elided = self.pack.rows_elided + (self.pack.rows.len() - mid) as u64;
+            match serde_json::to_string(&view) {
+                Ok(body) if body.len() <= max_bytes => {
+                    best = Some(body);
+                    lo = mid;
+                }
+                _ => hi = mid - 1,
+            }
+        }
+        if best.is_none() {
+            view.pack.rows = Vec::new();
+            view.pack.rows_elided = self.pack.rows_elided + self.pack.rows.len() as u64;
+            let body = serde_json::to_string(&view).ok()?;
+            if body.len() <= max_bytes {
+                best = Some(body);
+            }
+        }
+        best
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -334,7 +382,14 @@ pub(crate) fn measure_pack_occupancy(
             victim: is_pack_victim(live),
         });
     }
-    rows.sort_by(|a, b| a.vol.cmp(&b.vol).then(a.offset.cmp(&b.offset)));
+    // Worst occupancy first (ties by volume, offset): the compaction
+    // order, and what a wire-bounded view keeps.
+    rows.sort_by(|a, b| {
+        a.live_bytes
+            .cmp(&b.live_bytes)
+            .then(a.vol.cmp(&b.vol))
+            .then(a.offset.cmp(&b.offset))
+    });
     let blocks = rows.len() as u64;
     let live_bytes = rows.iter().map(|r| r.live_bytes).sum::<u64>();
     let reclaimable_bytes = rows.iter().map(|r| chunk - r.live_bytes).sum::<u64>();
@@ -354,6 +409,7 @@ pub(crate) fn measure_pack_occupancy(
         reclaimable_bytes,
         worst_occupancy: worst,
         mean_occupancy: mean,
+        rows_elided: 0,
         rows,
     }
 }

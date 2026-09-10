@@ -1599,8 +1599,17 @@ impl crate::ipc_host::AdminSink for FabricAdminSink {
                         let report = crate::defrag::measure(meta, &fs.router)
                             .await
                             .map_err(|e| format!("defrag measurement failed: {e}"))?;
-                        return serde_json::to_string(&report)
-                            .map_err(|e| format!("report encode: {e}"));
+                        // Bounded on the wire: the pack face carries one
+                        // row per pack block (a legacy one-block-per-file
+                        // volume = one per FILE) and the lane refuses any
+                        // body past the cap — serve the aggregates + the
+                        // worst-occupancy prefix that fits, `rows_elided`
+                        // counting the rest (the fsck report's precedent).
+                        return report
+                            .to_bounded_json(squeezefs_ipc::wire::ADMIN_BODY_MAX)
+                            .ok_or_else(|| {
+                                "defrag report skeleton exceeds the admin body cap".to_string()
+                            });
                     }
                     let job_type = match mode {
                         "data" => crate::jobs::JobType::DefragData { volume_id: volume },

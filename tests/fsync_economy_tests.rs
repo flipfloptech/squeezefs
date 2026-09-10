@@ -75,6 +75,7 @@ impl Drop for LeverGuard {
         fsync_economy::test_set_touched_namespaces(None);
         fsync_economy::test_set_parallel_legs(None);
         fsync_economy::test_set_promote_staged(None);
+        squeezefs::routing::test_set_small_file_packing(None);
         squeezefs::routing::set_inline_max_bytes_override(None);
         squeezefs::fuse_client::set_inplace_overwrite(false);
         squeezefs::dev_power_cut::clear_faults();
@@ -1012,6 +1013,12 @@ async fn staged_promotion_lever_promotes_exactly_once_on_fsync() {
     // Touched-namespace barriers ON: the promoted block's device is
     // barriered only if the promotion STAMPED it.
     fsync_economy::test_set_touched_namespaces(Some(true));
+    // The ONE-BLOCK promotion arm (`SQUEEZEFS_SMALL_FILE_PACKING=0`, the A/B
+    // control since PK7's flip): this contract's subject is the fsync
+    // lever and its barrier/stamp accounting on a promoted BLOCK
+    // (`layout_promoted_block`, `block_map[0]`); the packed arm's fsync
+    // shape is `small_file_packing_tests`'.
+    squeezefs::routing::test_set_small_file_packing(Some(false));
     // The staged-layout legs run at the one-page inline ceiling (the
     // default since the phase-B sweep, pinned explicitly so an override in
     // the environment cannot move the 16 KiB fixture file inline); the

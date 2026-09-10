@@ -2062,9 +2062,15 @@ fn on_a_live_mount_report_only_reads_the_legacy_population_and_defrag_pack_compa
         log0.display()
     );
 
-    // Lever OFF remount: measured, refused, untouched.
+    // Lever OFF remount (`SQUEEZEFS_SMALL_FILE_PACKING=0`, the A/B control
+    // since PK7's flip): measured, refused, untouched.
     let log1 = base.join("mount1.log");
-    let mut m1 = spawn_mount(&meta, &mnt, &log1, &[("SQUEEZEFS_BLOCK_REFS_VERIFY", "1")]);
+    let mut m1 = spawn_mount(
+        &meta,
+        &mnt,
+        &log1,
+        &[(LEVER, "0"), ("SQUEEZEFS_BLOCK_REFS_VERIFY", "1")],
+    );
     assert_eq!(stat_u64(&mnt, "meta_kv_block_refs_drift"), 0);
     assert_eq!(used_chunks(&mnt), ANCHOR_BLOCKS + FILES as u64);
     let out = defrag(&mnt, &["--report-only", "--json"]);

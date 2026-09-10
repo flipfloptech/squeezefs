@@ -105,15 +105,16 @@ static SMALL_FILE_PACKING: std::sync::atomic::AtomicU8 = std::sync::atomic::Atom
 /// The small-file packing lever (design-small-file-packing §6): gates the
 /// PROMOTION arm only — `true` = a staged file whose slot fits
 /// [`pack_max_slot_bytes`] promotes INTO the volume's open pack block,
-/// `false` = today's one-block-per-file block arm, byte-identical. Default
-/// OFF through PK6 (PK7's counted rows decide the flip). The read funnel
-/// honours a packed mapping under either setting.
+/// `false` = the one-block-per-file block arm, byte-identical to the
+/// pre-flip shape. Default ON since PK7's counted flip (2026-09-10,
+/// `.benchmarks/2026-09-10-packing-rows-squeeze-test.md`); `0` is the A/B
+/// control. The read funnel honours a packed mapping under either setting.
 pub fn small_file_packing_enabled() -> bool {
     match SMALL_FILE_PACKING.load(Ordering::Relaxed) {
         1 => true,
         2 => false,
         _ => {
-            let on = crate::env_knobs::bool_knob("SQUEEZEFS_SMALL_FILE_PACKING", false);
+            let on = crate::env_knobs::bool_knob("SQUEEZEFS_SMALL_FILE_PACKING", true);
             SMALL_FILE_PACKING.store(if on { 1 } else { 2 }, Ordering::Relaxed);
             on
         }

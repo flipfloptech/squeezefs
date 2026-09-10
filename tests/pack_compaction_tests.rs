@@ -53,6 +53,9 @@
 //!     reads the legacy population; `defrag --pack` is REFUSED under the
 //!     lever OFF and compacts it under the lever ON; a remount with the
 //!     C8 oracle armed reads drift 0 and every file byte-exact.
+//! 14. The report is BOUNDED on the wire: `DefragReport::to_bounded_json`
+//!     serves exact aggregates + the worst-occupancy row prefix that fits
+//!     under `ADMIN_BODY_MAX` + `rows_elided` (the fsck precedent).
 
 use fuse3::raw::{Filesystem, Request};
 use squeezefs::block_allocator::{BlockAllocator, CHUNK_SIZE};
@@ -1626,6 +1629,20 @@ async fn lever_off_gates_the_whole_arm_and_report_only_moves_nothing() {
         .expect("report");
     assert_eq!(report.pack.blocks, N as u64);
     assert_eq!(report.pack.below_half, N as u64);
+    assert_eq!(
+        report.pack.rows.len(),
+        N,
+        "one row per pack block on the full report"
+    );
+    assert_eq!(report.pack.rows_elided, 0);
+    assert!(
+        report
+            .pack
+            .rows
+            .windows(2)
+            .all(|w| w[0].occupancy <= w[1].occupancy),
+        "the constructor orders rows worst occupancy first"
+    );
     assert_eq!(metric(&METRICS.pack_blocks_below_half), N as u64);
     assert_eq!(
         metric(&METRICS.pack_reclaimable_bytes),
@@ -2161,4 +2178,120 @@ fn on_a_live_mount_report_only_reads_the_legacy_population_and_defrag_pack_compa
     assert_eq!(std::fs::read(mnt.join(ANCHOR)).unwrap(), anchor_bytes());
     m3.umount();
     let _ = std::fs::remove_dir_all(&base);
+}
+
+/// Contract 14 — **the report is BOUNDED on the wire** (found by the PK7
+/// local rig 2026-09-10: `defrag --report-only --json` on the LEGACY
+/// 2,000-block population answered "reply too large" — the admin lane
+/// refuses any body past `ADMIN_BODY_MAX`, and the pack face carried one
+/// row per block, unbounded). The fsck report's precedent (the PR 8
+/// "152-finding wart") governs: `DefragReport::to_bounded_json(cap)`
+/// serves the aggregates EXACT, the longest fitting WORST-OCCUPANCY row
+/// prefix (the rows an operator acts on first), and `rows_elided`
+/// counting the rest; the durable per-block table is the offline probe's.
+#[test]
+fn defrag_report_serves_a_bounded_view_under_the_admin_body_cap() {
+    use squeezefs::defrag::{DefragReport, PackBlockRow, PackReport};
+    let chunk = CHUNK_SIZE;
+    let rows: Vec<PackBlockRow> = (0..5000u64)
+        .map(|i| {
+            let live = 16 * 1024 + (i % 200) * 4096;
+            PackBlockRow {
+                vol: format!("vol-{:016x}", i % 4),
+                offset: (i / 4) * chunk,
+                base_key: format!("nvme{}n1://{}@{:x}", 5 + i % 4, (i / 4) * chunk, i),
+                tenants: 1 + i % 7,
+                windows: 1 + i % 7,
+                live_bytes: live,
+                occupancy: live as f64 / chunk as f64,
+                victim: true,
+            }
+        })
+        .collect();
+    // The constructor's order (contract 12 pins it): worst occupancy first.
+    let mut rows = rows;
+    rows.sort_by(|a, b| {
+        a.live_bytes
+            .cmp(&b.live_bytes)
+            .then(a.vol.cmp(&b.vol))
+            .then(a.offset.cmp(&b.offset))
+    });
+    let live_total: u64 = rows.iter().map(|r| r.live_bytes).sum();
+    let report = DefragReport {
+        d1: Vec::new(),
+        d2: squeezefs::defrag::D2Report {
+            files: 0,
+            pairs: 0,
+            local_pairs: 0,
+            locality: 1.0,
+        },
+        d3: squeezefs::defrag::D3Report {
+            parked_extent_bytes: 0,
+            spilled_records: 0,
+            spilled_record_bytes: 0,
+            pressure_bytes: 0,
+        },
+        d4: Vec::new(),
+        pack: PackReport {
+            blocks: 5000,
+            below_half: 5000,
+            live_bytes: live_total,
+            reclaimable_bytes: 5000 * chunk - live_total,
+            worst_occupancy: (16 * 1024) as f64 / chunk as f64,
+            mean_occupancy: 0.1,
+            rows_elided: 0,
+            rows,
+        },
+    };
+    let full = serde_json::to_string(&report).unwrap();
+    let cap = squeezefs_ipc::wire::ADMIN_BODY_MAX;
+    assert!(
+        full.len() > cap,
+        "the fixture must exceed the cap ({} vs {cap})",
+        full.len()
+    );
+
+    let body = report
+        .to_bounded_json(cap)
+        .expect("a bounded view always fits: the skeleton is a few hundred bytes");
+    assert!(body.len() <= cap, "bounded body {} > cap {cap}", body.len());
+    let view: DefragReport = serde_json::from_str(&body).expect("the bounded view decodes");
+    // Aggregates EXACT.
+    assert_eq!(view.pack.blocks, 5000);
+    assert_eq!(view.pack.below_half, 5000);
+    assert_eq!(view.pack.live_bytes, live_total);
+    assert_eq!(view.pack.reclaimable_bytes, 5000 * chunk - live_total);
+    // The prefix + the elided count close against the population.
+    assert!(
+        !view.pack.rows.is_empty(),
+        "at least one row fits under a 60 KiB cap"
+    );
+    assert!(view.pack.rows.len() < 5000);
+    assert_eq!(
+        view.pack.rows.len() as u64 + view.pack.rows_elided,
+        5000,
+        "kept + elided ≡ blocks"
+    );
+    // Worst occupancy first: the kept rows are the least-occupied ones.
+    let kept_max = view.pack.rows.iter().map(|r| r.live_bytes).max().unwrap();
+    assert!(
+        view.pack
+            .rows
+            .windows(2)
+            .all(|w| w[0].occupancy <= w[1].occupancy),
+        "kept rows are sorted worst-first"
+    );
+    assert!(kept_max <= 16 * 1024 + 199 * 4096);
+    // A report that fits is served verbatim (rows_elided stays 0).
+    let small = DefragReport {
+        pack: PackReport {
+            rows: report.pack.rows[..3].to_vec(),
+            ..report.pack.clone()
+        },
+        ..report.clone()
+    };
+    let small_body = small.to_bounded_json(cap).unwrap();
+    let small_view: DefragReport = serde_json::from_str(&small_body).unwrap();
+    assert_eq!(small_view.pack.rows.len(), 3);
+    assert_eq!(small_view.pack.rows_elided, 0);
 }

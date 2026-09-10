@@ -713,13 +713,41 @@ fn fsync_in_background(path: PathBuf) -> std::thread::JoinHandle<()> {
     h
 }
 
+/// Stage `files` as DURABLE staged-layout files: written and fsync'd on a
+/// mount with the promotion lever OFF (the fsync persists the staged layout
+/// — `file_type = staged`, `file_id`, size — and promotes nothing), then
+/// kill-9'd so no dismount pass promotes them. The same-mount-point remount
+/// recovers the ring entries (the residue note's §2 contract).
+///
+/// Why the crash legs need this: a file that was only `write` + `close`d
+/// has a RAM-only layout until the RELEASE handler's BACKGROUND persist
+/// lands, and the fsync-with-lever handler runs its promotion leg (and the
+/// stall seam) AHEAD of its own layout persist — so a kill inside the
+/// window can land before any layout was ever durable, and the file reads
+/// as size 0 afterwards. That is the POSIX "fsync never returned" case, not
+/// §5.4's: the crash contract is about a TENANT whose staged layout is
+/// durable and whose only copy is the ring.
+fn stage_durable(meta: &Path, mnt: &Path, log: &Path, files: &[(&str, usize, usize)]) {
+    let mut m = spawn_mount(meta, mnt, log, &[(LEVER, "1")]);
+    for (name, idx, len) in files {
+        write_fsync(&mnt.join(name), &pattern(*idx, *len));
+    }
+    assert_eq!(
+        stat_u64(mnt, "layout_promoted_packed"),
+        0,
+        "the staging mount promotes nothing (fsync lever off)"
+    );
+    m.kill9();
+}
+
 /// Leg A — kill-9 between the FIRST tenant's DMA and its commit: nothing
 /// committed, so the pack block recovers FREE (no record names it), the
 /// file stays ring-resident and byte-exact, fsck/oracle empty. Leg B —
 /// kill-9 between two tenants' commits (tenant 1 committed, tenant 2
 /// mid-window): the block recovers with exactly the committed tenant,
 /// tenant 2 stays ring-resident, both byte-exact; at the next clean unmount
-/// the resident files promote and pack.
+/// the resident files promote and pack. Every crashed tenant enters its
+/// window with a DURABLE staged layout (`stage_durable`).
 #[test]
 fn kill9_inside_the_pack_windows_loses_nothing_and_leaks_nothing() {
     if !mount_supported(site!()) {
@@ -734,6 +762,12 @@ fn kill9_inside_the_pack_windows_loses_nothing_and_leaks_nothing() {
     let c_len = 8 * KIB;
 
     // ---- Leg A: the first tenant's window --------------------------------
+    let log_a0 = base.join("a0.log");
+    let mut m = spawn_mount(&meta, &mnt, &log_a0, &[(LEVER, "1")]);
+    write_fsync(&mnt.join(ANCHOR), &anchor_bytes());
+    m.kill9();
+    stage_durable(&meta, &mnt, &base.join("a1.log"), &[("a.bin", 1, a_len)]);
+
     let log_a = base.join("a.log");
     let mut m = spawn_mount(
         &meta,
@@ -745,8 +779,11 @@ fn kill9_inside_the_pack_windows_loses_nothing_and_leaks_nothing() {
             ("SQUEEZEFS_TEST_PACK_COMMIT_STALL_MS", STALL_MS),
         ],
     );
-    write_fsync(&mnt.join(ANCHOR), &anchor_bytes());
-    write_close(&mnt.join("a.bin"), &pattern(1, a_len));
+    assert_eq!(
+        std::fs::read(mnt.join("a.bin")).unwrap(),
+        pattern(1, a_len),
+        "leg A precondition: the durable staged file is ring-resident on the remount"
+    );
     let h = fsync_in_background(mnt.join("a.bin"));
     // The pack block is allocated and the tenant DMA'd: the mid-window state.
     assert_eq!(stat_u64(&mnt, "pack_blocks_opened"), 1, "the pack opened");
@@ -796,6 +833,14 @@ fn kill9_inside_the_pack_windows_loses_nothing_and_leaks_nothing() {
     );
 
     // ---- Leg B: between two tenants' commits ------------------------------
+    // Tenant 2 and the bystander enter the leg with DURABLE staged layouts,
+    // ring-resident, un-promoted.
+    stage_durable(
+        &meta,
+        &mnt,
+        &base.join("b0.log"),
+        &[("b2.bin", 3, b_len), ("c.bin", 4, c_len)],
+    );
     let log_b = base.join("b.log");
     let mut m = spawn_mount(
         &meta,
@@ -816,10 +861,8 @@ fn kill9_inside_the_pack_windows_loses_nothing_and_leaks_nothing() {
         "tenant 1 committed"
     );
     assert_eq!(used_chunks(&mnt), used1 + 1, "one pack block opened");
-    // Tenant 2 is DMA'd into the same open block and parked; a third file
-    // is plain staged (never fsync'd).
-    write_close(&mnt.join("b2.bin"), &pattern(3, b_len));
-    write_close(&mnt.join("c.bin"), &pattern(4, c_len));
+    // Tenant 2 is DMA'd into the same open block and parked; the bystander
+    // stays plain staged (never re-fsync'd).
     let h = fsync_in_background(mnt.join("b2.bin"));
     assert_eq!(
         stat_u64(&mnt, "pack_blocks_opened"),

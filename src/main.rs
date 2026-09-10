@@ -2548,6 +2548,13 @@ fn print_fsck_report(report: &squeezefs::fsck::FsckReport, json: bool) {
         c.mover_ledger_exempted,
         c.pack_ledger_exempted,
     );
+    if c.tenant_overlap_findings > 0 {
+        println!(
+            "tenant ranges (C12): {} verified finding(s) — REPORT-ONLY, the layouts stay as \
+             found (design-small-file-packing §5.9)",
+            c.tenant_overlap_findings,
+        );
+    }
     if c.scrub_blocks_scanned > 0 {
         println!(
             "scrub: {} block(s) / {} B — {} AEAD-verified, {} frame-verified, \

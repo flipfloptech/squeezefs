@@ -2,7 +2,7 @@
 //! KD-9/KD-17; repair is VL6b and consumes the findings this module
 //! verifies).
 //!
-//! Check classes (C1–C11; C8–C11 postdate the VL6a seven):
+//! Check classes (C1–C12; C8–C12 postdate the VL6a seven):
 //!
 //! | Class | What | Source of truth |
 //! |---|---|---|
@@ -49,6 +49,56 @@
 //! lease (the train holds 4a across sweep → chunks → flip, so a lease
 //! held here brackets out any live train) | the tree-7 owner skip-scan
 //! vs the inode records + layout heads; the census's kvmap extraction |
+//! | C12 | **tenant-range consistency** (small-file packing,
+//! `docs/design-small-file-packing.md` §5.9): two live mappings on one
+//! block whose `[off, off + ceil(len))` windows intersect at DIFFERENT
+//! `off` (a slot minted inside another slot — `C12Overlap`), or a
+//! decorated mapping whose window reaches past the chunk, starts off the
+//! LBA grain, or does not decode (`C12Overrun`). **REPORT-ONLY** (the C8
+//! posture). | the census mapping list itself — one interval sort per
+//! `(vol, offset, incarnation)`, no new walk |
+//!
+//! ## C12 — tenant-range consistency (the packing class)
+//!
+//! The C8 ledger says HOW MANY references a block has; nothing said their
+//! windows sit inside the block and nest legally. The packer mints slots
+//! by one `fetch_add` on a block one mount owns, so it can never produce
+//! two windows sharing a start, and the two LEGAL sharing classes both
+//! keep the SAME `off`: the identical-window clone share (a promoted
+//! source's clone carries its mapping verbatim) and that clone composed
+//! with the passthrough clip (same `off`, shorter `len` — the shorter is a
+//! prefix of the same image). Same-`off` can ONLY arise from clone + clip;
+//! different-`off` intersection can ONLY arise from a defect — so the
+//! corruption class and the legal classes are disjoint by construction,
+//! and two whole-block referencers (both `[0, chunk)`) collapse like any
+//! same-`off` pair.
+//!
+//! The decorated window is decoded by the class's OWN tolerant decoder,
+//! never the read funnel's: `parse_block_mapping` refuses every violation
+//! with `EIO` (the read path's contract), while the census resolves the
+//! BASE through `clean_block_key` and counts the reference — so
+//! `bk:garbage:len` is healthy for C2 and unreadable for every reader, and
+//! without the Overrun arm fsck would never say so.
+//!
+//! **Zero false positives.** A finding is a SUSPECT first: the census read
+//! the two layouts at different instants, and between them a block may
+//! have been freed, recycled as a fresh pack and refilled, so the census's
+//! "intersection" can name two lifetimes of one offset. The settle, then a
+//! FRESH re-read of BOTH layouts under their inos' exclusive 4a leases
+//! held together (one canonical acquisition; a layout publish takes the
+//! same lease, so the pair is a consistent cut) must reproduce the
+//! different-`off` intersection on the CURRENT mappings; a bit-13 volume
+//! additionally keys the group on the incarnation the mappings name. An
+//! OPEN pack block is exempt (its slots are being minted right now: the
+//! tenants mid-flight ride the in-flight registry, the pack the pack-open
+//! ledger), counted on `pack_ledger_exempted` / `inflight_exempted`.
+//!
+//! **Repair is REFUSED**: two tenants overlapping at different `off` means
+//! at least one is wrong and nothing on the volume says which — quarantining
+//! both would destroy the right one; an unreadable window's base block IS
+//! referenced and restating the window would fabricate a mapping. The
+//! counter `fsck_tenant_overlap_findings` is the live must-stay-0
+//! tripwire; `fsck_repair_classC12` is structurally 0.
 //!
 //! ## C9 — unreferenced inodes (the class S3.5 left owed)
 //!
@@ -470,7 +520,7 @@ impl FsckOptions {
 /// the input VL6b's repair planner consumes.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct FsckFinding {
-    /// `"C1"`..`"C11"`.
+    /// `"C1"`..`"C12"`.
     pub class: String,
     /// The object's identity (ino / key / volume+offset / path).
     pub object: String,
@@ -583,6 +633,31 @@ pub enum FindingId {
         ino: u64,
         run_start: u32,
         idx: u32,
+    },
+    /// C12 (design-small-file-packing §5.9): two live tenant windows on
+    /// one `(vol, offset)` intersect at DIFFERENT `off` — a slot minted
+    /// inside another slot. The two referencers are the identity (the
+    /// block alone would collapse every pair on it into one). REPORT-ONLY:
+    /// at least one tenant is wrong and nothing on the volume says which.
+    C12Overlap {
+        vol: String,
+        offset: u64,
+        ino_a: u64,
+        block_idx_a: u32,
+        ino_b: u64,
+        block_idx_b: u32,
+    },
+    /// C12: a decorated mapping whose window breaks the size-carrying
+    /// form's law — `off + ceil(len) > CHUNK_SIZE`, `off % LBA_GRAIN != 0`,
+    /// or a decoration present but undecodable. The census resolves its
+    /// BASE and counts the reference (C2 is silent); only a read refuses
+    /// it, so this arm is the only report of it. REPORT-ONLY.
+    C12Overrun {
+        vol: String,
+        offset: u64,
+        ino: u64,
+        block_idx: u32,
+        mapping: String,
     },
 }
 
@@ -698,6 +773,12 @@ pub struct FsckCounters {
     /// — the map plane's `inflight_exempted`. Growth under live crossings
     /// is the proof the shield is not vacuous.
     pub crossing_exempted: u64,
+    /// C12 (design-small-file-packing §5.9): verified tenant-range
+    /// findings — both arms (two windows on one block intersecting at
+    /// DIFFERENT `off`; a decorated window past the chunk, off the LBA
+    /// grain, or undecodable). **Must stay 0** on healthy volumes: the
+    /// live `fsck_tenant_overlap_findings` tripwire.
+    pub tenant_overlap_findings: u64,
     pub findings: u64,
     pub scan_secs: u64,
     pub scrub_blocks_scanned: u64,
@@ -1310,6 +1391,103 @@ enum SuspectKind {
         run_start: u32,
         idx: u32,
     },
+    /// C12: two referencers of one block whose windows intersect at
+    /// DIFFERENT `off` (design-small-file-packing §5.9). `a` is the
+    /// window that reached furthest before `b` started inside it.
+    C12Overlap {
+        vol: String,
+        offset: u64,
+        a: TenantWindow,
+        b: TenantWindow,
+    },
+    /// C12: a decorated mapping whose window violates the law or does not
+    /// decode (`why` names the arm).
+    C12Overrun {
+        vol: String,
+        offset: u64,
+        ino: u64,
+        block_idx: u32,
+        mapping: String,
+        why: String,
+    },
+}
+
+/// One referencer's device window on its block, as C12 judges it:
+/// `[off, end)` in bytes within the chunk (a bare whole-block key is
+/// `[0, CHUNK_SIZE)`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct TenantWindow {
+    ino: u64,
+    block_idx: u32,
+    mapping: String,
+    off: u64,
+    end: u64,
+}
+
+impl TenantWindow {
+    fn intersects_at_different_off(&self, other: &Self) -> bool {
+        self.off != other.off && self.off < other.end && other.off < self.end
+    }
+}
+
+/// What C12's decoder says about one mapping's window.
+enum WindowClass {
+    /// A window inside the chunk starting on the LBA grain.
+    Window { off: u64, end: u64 },
+    /// C12Overrun — the decoration is present but breaks the law or does
+    /// not decode.
+    Overrun(String),
+}
+
+/// C12's OWN tolerant decoder of the size-carrying form `base:off:len`
+/// (base = `[proto://]offset[@inc]`) — deliberately NOT
+/// [`crate::routing::DataRouter::parse_block_mapping`]: that one refuses
+/// every violation with `EIO`, which is the READ path's contract; fsck
+/// must REPORT what a read refuses, naming which law broke. The arithmetic
+/// is the read law's verbatim (`LBA_GRAIN` alignment, `pack_slot_len`, the
+/// allocator chunk), and it never panics on a hostile value (a `len` past
+/// the chunk is refused before the grain round-up could overflow).
+fn tenant_window_class(mapping: &str, chunk: u64) -> WindowClass {
+    use crate::routing::{pack_slot_len, LBA_GRAIN};
+    let rest = match mapping.find("://") {
+        Some(pos) => &mapping[pos + 3..],
+        None => mapping,
+    };
+    let mut parts = rest.split(':');
+    let _base = parts.next();
+    let Some(off_text) = parts.next() else {
+        // Bare whole-block key.
+        return WindowClass::Window { off: 0, end: chunk };
+    };
+    let (Some(len_text), None) = (parts.next(), parts.next()) else {
+        return WindowClass::Overrun(format!(
+            "decoration has {} component(s) after the base, not `off:len` — undecodable",
+            rest.split(':').count() - 1
+        ));
+    };
+    let Ok(off) = off_text.parse::<u64>() else {
+        return WindowClass::Overrun(format!("undecodable rel_off '{off_text}'"));
+    };
+    let Ok(len) = len_text.parse::<u64>() else {
+        return WindowClass::Overrun(format!("undecodable packed_len '{len_text}'"));
+    };
+    if off % LBA_GRAIN != 0 {
+        return WindowClass::Overrun(format!(
+            "rel_off {off} is not LBA_GRAIN ({LBA_GRAIN})-aligned"
+        ));
+    }
+    if len > chunk {
+        return WindowClass::Overrun(format!(
+            "packed_len {len} reaches past the {chunk}-byte chunk on its own"
+        ));
+    }
+    let end = off.saturating_add(pack_slot_len(len));
+    if end > chunk {
+        return WindowClass::Overrun(format!(
+            "rel_off {off} + ceil(packed_len {len}) = {end} reaches past the {chunk}-byte chunk"
+        ));
+    }
+    WindowClass::Window { off, end }
 }
 
 struct Suspect {
@@ -1551,6 +1729,12 @@ pub async fn run(ctx: &FsckCtx, opts: &FsckOptions) -> Result<FsckReport> {
             // the same unsharded posture.
             evaluate_c11_run_coverage(ctx, &mut counters, &mut suspects).await;
             evaluate_c11_empty_heads(&census, &mut counters, &mut suspects, &ctx.meta);
+            // C12 (design-small-file-packing §5.9): tenant-range
+            // consistency over the SAME census mapping list — a shard's
+            // residue would see one tenant of a pair and judge nothing, so
+            // the class rides the unsharded run (and the fleet finalize's
+            // merged list), the C8 posture.
+            evaluate_c12_tenant_ranges(&census, &mut suspects);
         }
 
         // C9 (the class design-cow-kv-metadata §4.10a owed): live
@@ -1766,6 +1950,7 @@ pub fn merge_reports(reports: &[FsckReport]) -> FsckReport {
         counters.map_empty_heads += r.counters.map_empty_heads;
         counters.map_run_foreign_shadows += r.counters.map_run_foreign_shadows;
         counters.crossing_exempted += r.counters.crossing_exempted;
+        counters.tenant_overlap_findings += r.counters.tenant_overlap_findings;
         counters.scrub_blocks_scanned += r.counters.scrub_blocks_scanned;
         counters.scrub_bytes_scanned += r.counters.scrub_bytes_scanned;
         counters.scrub_aead_verified += r.counters.scrub_aead_verified;
@@ -1841,6 +2026,9 @@ fn fold_finalize_counters(dst: &mut FsckCounters, fin: &FsckCounters) {
     dst.map_empty_heads += fin.map_empty_heads;
     dst.map_run_foreign_shadows += fin.map_run_foreign_shadows;
     dst.crossing_exempted += fin.crossing_exempted;
+    // C12 rides the finalize like C8 (the merged mapping list is the one
+    // whole census; shards judge no tenant ranges).
+    dst.tenant_overlap_findings += fin.tenant_overlap_findings;
     // **The inode plane's counters are the union of the ADMITTED shards
     // and this finalize** (KD-PV-16, §5.8.2 F4 — the premise that the
     // plane "exists only here" is what that decision retires). The two
@@ -2305,6 +2493,9 @@ pub async fn run_fleet(
             &mut fin_suspects,
         );
         evaluate_c8(ctx, &mut fin_suspects).await;
+        // C12 over the fleet-merged mapping list — the one place a pair of
+        // tenants split across two members' residues meets.
+        evaluate_c12_tenant_ranges(&census, &mut fin_suspects);
         // C11 (a) rides the finalize like C8 — the orphan skip-scan is
         // self-contained, so a fleet pass never covers less than the
         // coordinator's own unsharded run. The (b) arm follows the
@@ -2578,6 +2769,7 @@ fn fold_worker_counters(dst: &mut FsckCounters, src: &FsckCounters) {
     dst.mover_ledger_exempted += src.mover_ledger_exempted;
     dst.pack_ledger_exempted += src.pack_ledger_exempted;
     dst.foreign_lane_exempted += src.foreign_lane_exempted;
+    dst.tenant_overlap_findings += src.tenant_overlap_findings;
     dst.scrub_blocks_scanned += src.scrub_blocks_scanned;
     dst.scrub_bytes_scanned += src.scrub_bytes_scanned;
     dst.scrub_aead_verified += src.scrub_aead_verified;
@@ -3814,6 +4006,87 @@ fn evaluate_c11_empty_heads(
     }
 }
 
+/// C12 — tenant-range consistency (design-small-file-packing §5.9). Rides
+/// the census mapping list — NO new walk: one interval sort per
+/// `(vol, offset, incarnation)` with same-`off` windows collapsed to their
+/// longest, then a sweep for a window that starts inside the furthest
+/// reach so far at a DIFFERENT `off`. Same-`off` windows of any lengths
+/// are the two legal share classes (the clone's identical window; the
+/// clone + passthrough clip's nested prefix) and never nominate; two
+/// whole-block referencers are both `[0, chunk)` and collapse. A key on a
+/// bit-13 volume names a LIFETIME, so two mappings naming different
+/// incarnations of one offset are not one block and never meet here.
+/// Every decorated mapping is also judged against the window law
+/// (C12Overrun — including the undecodable decoration the census resolves
+/// through its base and would otherwise never report). Quarantined
+/// (`damaged:`) mappings are the repair, not a window.
+fn evaluate_c12_tenant_ranges(census: &CensusOut, suspects: &mut Vec<Suspect>) {
+    let chunk = crate::block_allocator::CHUNK_SIZE;
+    let mut groups: HashMap<(&str, u64, u64), Vec<TenantWindow>> = HashMap::new();
+    for m in census.mappings.iter().filter(|m| !m.damaged) {
+        match tenant_window_class(&m.mapping, chunk) {
+            WindowClass::Overrun(why) => suspects.push(Suspect {
+                kind: SuspectKind::C12Overrun {
+                    vol: m.vol.clone(),
+                    offset: m.offset,
+                    ino: m.ino,
+                    block_idx: m.block_idx,
+                    mapping: m.mapping.clone(),
+                    why,
+                },
+            }),
+            WindowClass::Window { off, end } => {
+                let inc = crate::routing::block_key_incarnation(&m.mapping)
+                    .unwrap_or(crate::routing::INCARNATION_NONE);
+                groups
+                    .entry((m.vol.as_str(), m.offset, inc))
+                    .or_default()
+                    .push(TenantWindow {
+                        ino: m.ino,
+                        block_idx: m.block_idx,
+                        mapping: m.mapping.clone(),
+                        off,
+                        end,
+                    });
+            }
+        }
+    }
+    for ((vol, offset, _inc), mut windows) in groups {
+        if windows.len() < 2 {
+            continue;
+        }
+        // Ascending `off`, longest first within an `off`: the first window
+        // of each `off` IS the group's `max(len)` collapse.
+        windows.sort_by(|a, b| a.off.cmp(&b.off).then(b.end.cmp(&a.end)));
+        let mut reach: Option<&TenantWindow> = None;
+        let mut current_off: Option<u64> = None;
+        for w in &windows {
+            if current_off == Some(w.off) {
+                continue;
+            }
+            current_off = Some(w.off);
+            match reach {
+                None => reach = Some(w),
+                Some(r) => {
+                    if w.intersects_at_different_off(r) {
+                        suspects.push(Suspect {
+                            kind: SuspectKind::C12Overlap {
+                                vol: vol.to_string(),
+                                offset,
+                                a: r.clone(),
+                                b: w.clone(),
+                            },
+                        });
+                    }
+                    if w.end > r.end {
+                        reach = Some(w);
+                    }
+                }
+            }
+        }
+    }
+}
+
 fn evaluate_allocator_classes(
     vols: &[VolAlloc],
     census: &CensusOut,
@@ -4164,6 +4437,33 @@ async fn recheck_suspects(
                 }
                 if ledger.iter().any(|k| k == &key || k == &clean_key(&key)) {
                     counters.mover_ledger_exempted += 1;
+                    counters.suspects_cleared += 1;
+                    continue;
+                }
+                if pack_open(&alloc, *offset) {
+                    counters.pack_ledger_exempted += 1;
+                    counters.suspects_cleared += 1;
+                    continue;
+                }
+                pending.push(s);
+            }
+            // C12: an OPEN pack block is exempt — its slots are being
+            // minted right now (design-small-file-packing §5.9): the
+            // tenants mid-flight ride the in-flight registry, the pack
+            // itself the pack-open ledger. Same hook boundary as C2/C3 so
+            // a test can race the census against the verify.
+            SuspectKind::C12Overlap { vol, offset, .. }
+            | SuspectKind::C12Overrun { vol, offset, .. } => {
+                let Some(alloc) = alloc_of(vol) else {
+                    pending.push(s);
+                    continue;
+                };
+                let key = ctx.router.backend_router.persist_block_key(vol, *offset);
+                if online {
+                    fire_pre_registry_hook(&key);
+                }
+                if online && alloc.inflight_contains(*offset) {
+                    counters.inflight_exempted += 1;
                     counters.suspects_cleared += 1;
                     continue;
                 }
@@ -5008,6 +5308,129 @@ async fn recheck_suspects(
                     }),
                 })
             }
+            SuspectKind::C12Overlap { vol, offset, a, b } => {
+                // The census read the two layouts at different instants:
+                // between them the block may have been freed, recycled as
+                // a fresh pack and refilled, so the "intersection" names
+                // two lifetimes. Post-settle the exemptions are re-read,
+                // then BOTH layouts are re-read under their inos'
+                // exclusive 4a leases (one canonical acquisition — a
+                // layout publish takes the same lease, so the pair is a
+                // consistent cut) and the finding stands only if the
+                // CURRENT mappings still name this block and still
+                // intersect at different `off`.
+                if let Some(alloc) = alloc_of(vol) {
+                    if online && alloc.inflight_contains(*offset) {
+                        counters.inflight_exempted += 1;
+                        counters.suspects_cleared += 1;
+                        continue;
+                    }
+                    if pack_open(&alloc, *offset) {
+                        counters.pack_ledger_exempted += 1;
+                        counters.suspects_cleared += 1;
+                        continue;
+                    }
+                }
+                let fresh = current_tenant_windows(
+                    ctx,
+                    online,
+                    &[(a.ino, a.block_idx), (b.ino, b.block_idx)],
+                )
+                .await;
+                let (Some((va, fa)), Some((vb, fb))) = (&fresh[0], &fresh[1]) else {
+                    counters.suspects_cleared += 1;
+                    continue;
+                };
+                let same_block = va.0 == *vol
+                    && va.1 == *offset
+                    && vb.0 == *vol
+                    && vb.1 == *offset
+                    && va.2 == vb.2;
+                if !same_block || !fa.intersects_at_different_off(fb) {
+                    counters.suspects_cleared += 1;
+                    continue;
+                }
+                counters.tenant_overlap_findings += 1;
+                Some(FsckFinding {
+                    class: "C12".to_string(),
+                    object: format!("{vol}:{offset}"),
+                    evidence: format!(
+                        "tenant windows on one block intersect at DIFFERENT offsets: ino {} \
+                         block {} '{}' → [{}, {}) vs ino {} block {} '{}' → [{}, {}) — a slot \
+                         minted inside another slot (design-small-file-packing §5.9), \
+                         reproduced on a fresh re-read of both layouts under their leases. \
+                         REPORT-ONLY: at least one tenant is wrong and nothing on the volume \
+                         says which; quarantining both would destroy the right one",
+                        fa.ino,
+                        fa.block_idx,
+                        fa.mapping,
+                        fa.off,
+                        fa.end,
+                        fb.ino,
+                        fb.block_idx,
+                        fb.mapping,
+                        fb.off,
+                        fb.end
+                    ),
+                    identity: Some(FindingId::C12Overlap {
+                        vol: vol.clone(),
+                        offset: *offset,
+                        ino_a: fa.ino,
+                        block_idx_a: fa.block_idx,
+                        ino_b: fb.ino,
+                        block_idx_b: fb.block_idx,
+                    }),
+                })
+            }
+            SuspectKind::C12Overrun {
+                vol,
+                offset,
+                ino,
+                block_idx,
+                mapping,
+                why,
+            } => {
+                if let Some(alloc) = alloc_of(vol) {
+                    if online && alloc.inflight_contains(*offset) {
+                        counters.inflight_exempted += 1;
+                        counters.suspects_cleared += 1;
+                        continue;
+                    }
+                    if pack_open(&alloc, *offset) {
+                        counters.pack_ledger_exempted += 1;
+                        counters.suspects_cleared += 1;
+                        continue;
+                    }
+                }
+                // Verbatim presence on the fresh read under the ino's lease
+                // is the whole re-check: the same string decodes the same
+                // way, so the violation reproduces iff the mapping does.
+                let fresh = current_tenant_mappings(ctx, online, &[(*ino, *block_idx)]).await;
+                let still_present = fresh[0].as_ref().is_some_and(|m| m.mapping == *mapping);
+                if !still_present {
+                    counters.suspects_cleared += 1;
+                    continue;
+                }
+                counters.tenant_overlap_findings += 1;
+                Some(FsckFinding {
+                    class: "C12".to_string(),
+                    object: format!("{vol}:{offset}"),
+                    evidence: format!(
+                        "tenant window law violated by ino {ino} block {block_idx} '{mapping}': \
+                         {why} — every read of it refuses (EIO, `packed_mapping_refusals`) \
+                         while the census counts its base reference (design-small-file-packing \
+                         §5.9 C12Overrun). REPORT-ONLY: the base block IS referenced; only the \
+                         window is unreadable, and the right repair is the owner's, not a guess"
+                    ),
+                    identity: Some(FindingId::C12Overrun {
+                        vol: vol.clone(),
+                        offset: *offset,
+                        ino: *ino,
+                        block_idx: *block_idx,
+                        mapping: mapping.clone(),
+                    }),
+                })
+            }
             SuspectKind::C5Generation { dir, why } => {
                 // Re-read the marker (a live restamp clears).
                 let expected = ctx.expected_generation.as_deref().unwrap_or("");
@@ -5444,6 +5867,8 @@ fn publish_metrics(c: &FsckCounters) {
         .fetch_add(c.map_run_foreign_shadows, Ordering::Relaxed);
     m.fsck_crossing_exempted
         .fetch_add(c.crossing_exempted, Ordering::Relaxed);
+    m.fsck_tenant_overlap_findings
+        .fetch_add(c.tenant_overlap_findings, Ordering::Relaxed);
     m.fsck_findings.fetch_add(c.findings, Ordering::Relaxed);
     m.fsck_scan_secs.store(c.scan_secs, Ordering::Relaxed);
     m.scrub_blocks_scanned
@@ -5883,26 +6308,61 @@ fn planned_action(id: &FindingId) -> (&'static str, String) {
                  the §2 read law and the next full publish re-canonicalizes"
             ),
         ),
+        FindingId::C12Overlap {
+            vol,
+            offset,
+            ino_a,
+            block_idx_a,
+            ino_b,
+            block_idx_b,
+        } => (
+            "report-only",
+            format!(
+                "tenant windows of ino {ino_a} block {block_idx_a} and ino {ino_b} block \
+                 {block_idx_b} intersect at different offsets on {vol}:{offset}: REPORT-ONLY \
+                 (design-small-file-packing §5.9, the C8 posture) — at least one tenant is \
+                 wrong and nothing on the volume says which; quarantining both would destroy \
+                 the right one"
+            ),
+        ),
+        FindingId::C12Overrun {
+            vol,
+            offset,
+            ino,
+            block_idx,
+            mapping,
+        } => (
+            "report-only",
+            format!(
+                "the window of ino {ino} block {block_idx} ('{mapping}') on {vol}:{offset} \
+                 breaks the size-carrying mapping's law: REPORT-ONLY — the base block IS \
+                 referenced and only the window is unreadable (reads refuse EIO); the right \
+                 repair is the owner's, not a guess"
+            ),
+        ),
     }
 }
 
-/// Is the ino's CURRENT layout still carrying `mapping` (verbatim,
-/// non-quarantined) at `block_idx`? The identity-precise
-/// verify-before-repair re-check for the mapping classes.
-async fn current_mapping_present(ctx: &FsckCtx, ino: u64, block_idx: u32, mapping: &str) -> bool {
+/// The ino's CURRENT layout through the census's own extraction (the
+/// identity-precise fresh read every mapping-class re-check runs):
+/// every referenced mapping, resolvable or not. Empty when the ino has
+/// no decodable layout.
+async fn probe_layout_mappings(ctx: &FsckCtx, ino: u64) -> Vec<MappingRef> {
     let (vol_idx, local) = ctx.meta.route_ino(ino);
     let Some(kv) = ctx.meta.volumes.get(vol_idx) else {
-        return false;
+        return Vec::new();
     };
     let Ok(Some(bytes)) = kv.getxattr(local, "layout").await else {
-        return false;
+        return Vec::new();
     };
     let layout: Option<crate::routing::LayoutMetadata> = if bytes.starts_with(b"{") {
         serde_json::from_slice(&bytes).ok()
     } else {
         bincode::deserialize(&bytes).ok()
     };
-    let Some(layout) = layout else { return false };
+    let Some(layout) = layout else {
+        return Vec::new();
+    };
     let block_size = ctx
         .router
         .block_size
@@ -5910,11 +6370,97 @@ async fn current_mapping_present(ctx: &FsckCtx, ino: u64, block_idx: u32, mappin
     let mut probe = probe_census();
     let tree_entries = kvmap_entries_for(ctx, kv, local, &layout).await;
     census_layout(ctx, ino, &layout, block_size, tree_entries, &mut probe).await;
-    probe
-        .mappings
+    let mut out = probe.mappings;
+    out.append(&mut probe.unresolvable);
+    out
+}
+
+/// Is the ino's CURRENT layout still carrying `mapping` (verbatim,
+/// non-quarantined) at `block_idx`? The identity-precise
+/// verify-before-repair re-check for the mapping classes.
+async fn current_mapping_present(ctx: &FsckCtx, ino: u64, block_idx: u32, mapping: &str) -> bool {
+    probe_layout_mappings(ctx, ino)
+        .await
         .iter()
-        .chain(probe.unresolvable.iter())
         .any(|m| m.ino == ino && m.block_idx == block_idx && m.mapping == mapping && !m.damaged)
+}
+
+/// C12's fresh read: each target's CURRENT non-quarantined mapping at its
+/// block index, all read under the inos' exclusive 4a leases held
+/// TOGETHER (online) — one consistent cut, acquired in the DLM's one
+/// canonical order (ascending volume index, `lock_many` inside each: a
+/// pair sharing a stripe is one acquisition, never a self-deadlock). A
+/// layout publish takes the same lease, so nothing can move either
+/// layout between the two reads. Offline nothing is in flight and no
+/// lease is taken.
+async fn current_tenant_mappings(
+    ctx: &FsckCtx,
+    online: bool,
+    targets: &[(u64, u32)],
+) -> Vec<Option<MappingRef>> {
+    use crate::meta_backend::dlm::LockMode;
+    let mut by_vol: std::collections::BTreeMap<usize, Vec<(u64, LockMode)>> =
+        std::collections::BTreeMap::new();
+    if online {
+        for &(ino, _) in targets {
+            let (vol_idx, local) = ctx.meta.route_ino(ino);
+            by_vol
+                .entry(vol_idx)
+                .or_default()
+                .push((local, LockMode::Exclusive));
+        }
+    }
+    let mut guards = Vec::new();
+    for (vol_idx, inos) in &by_vol {
+        if let Some(kv) = ctx.meta.volumes.get(*vol_idx) {
+            guards.extend(kv.dlm().lock_many(inos, &[]).await);
+        }
+    }
+    let mut out = Vec::with_capacity(targets.len());
+    for &(ino, block_idx) in targets {
+        out.push(
+            probe_layout_mappings(ctx, ino)
+                .await
+                .into_iter()
+                .find(|m| m.block_idx == block_idx && !m.damaged),
+        );
+    }
+    drop(guards);
+    out
+}
+
+/// [`current_tenant_mappings`] decoded to C12's terms: the block each
+/// target names NOW as `(vol, offset, incarnation)` and its window. `None`
+/// when the target no longer maps that index or its mapping is no longer
+/// a decodable window (an overrun is C12Overrun's, never an overlap's).
+async fn current_tenant_windows(
+    ctx: &FsckCtx,
+    online: bool,
+    targets: &[(u64, u32)],
+) -> Vec<Option<((String, u64, u64), TenantWindow)>> {
+    let chunk = crate::block_allocator::CHUNK_SIZE;
+    current_tenant_mappings(ctx, online, targets)
+        .await
+        .into_iter()
+        .map(|m| {
+            let m = m?;
+            let WindowClass::Window { off, end } = tenant_window_class(&m.mapping, chunk) else {
+                return None;
+            };
+            let inc = crate::routing::block_key_incarnation(&m.mapping)
+                .unwrap_or(crate::routing::INCARNATION_NONE);
+            Some((
+                (m.vol, m.offset, inc),
+                TenantWindow {
+                    ino: m.ino,
+                    block_idx: m.block_idx,
+                    mapping: m.mapping,
+                    off,
+                    end,
+                },
+            ))
+        })
+        .collect()
 }
 
 /// Flip a mapping to its §5.6a `damaged:` quarantine marker — one
@@ -6299,6 +6845,54 @@ pub async fn repair(
                          [{run_start}, …) on vol{vol} ino {ino} is REPORTED, never \
                          auto-repaired — REPORT-ONLY (design §12): the point supersedes \
                          by the read law and the next full publish re-canonicalizes"
+                    ),
+                );
+                continue;
+            }
+            // ------------------------------------ C12 tenant ranges (packing)
+            //
+            // REFUSED, deliberately — the C8 posture (design-small-file-
+            // packing §5.9): two tenants overlapping at different `off`
+            // means at least one is wrong and nothing on the volume says
+            // which, so quarantining both would destroy the one that is
+            // right; an unreadable window's base block IS referenced, and
+            // guessing a window would fabricate a mapping. The layouts
+            // stay exactly as found for the owner to adjudicate.
+            FindingId::C12Overlap {
+                vol,
+                offset,
+                ino_a,
+                block_idx_a,
+                ino_b,
+                block_idx_b,
+            } => {
+                refuse(
+                    &mut out,
+                    f,
+                    format!(
+                        "the overlapping tenant windows of ino {ino_a} block {block_idx_a} \
+                         and ino {ino_b} block {block_idx_b} on {vol}:{offset} are REPORTED, \
+                         never auto-repaired — REPORT-ONLY: at least one is wrong and nothing \
+                         on the volume says which; both layouts stay as found"
+                    ),
+                );
+                continue;
+            }
+            FindingId::C12Overrun {
+                vol,
+                offset,
+                ino,
+                block_idx,
+                mapping,
+            } => {
+                refuse(
+                    &mut out,
+                    f,
+                    format!(
+                        "the window of ino {ino} block {block_idx} ('{mapping}') on \
+                         {vol}:{offset} is REPORTED, never auto-repaired — REPORT-ONLY: the \
+                         base block is referenced and only the window is unreadable; \
+                         restating it would fabricate a mapping"
                     ),
                 );
                 continue;

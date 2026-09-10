@@ -6311,6 +6311,20 @@ pub struct Metrics {
     /// reported and never auto-repaired (restating the ledger from the
     /// walk would erase the evidence of why it broke).
     pub fsck_repair_class: Align64<[AtomicU64; 10]>,
+    // PK5 — fsck class C12, tenant-range consistency
+    // (design-small-file-packing §5.9 / §10).
+    /// C12: verified tenant-range findings — two windows on one block
+    /// intersecting at DIFFERENT `off` (a slot minted inside another
+    /// slot), or a decorated window past the chunk / off the LBA grain /
+    /// undecodable. Same-`off` windows (the clone share and the clone +
+    /// clip nested share) never count. **Must stay 0** — the live
+    /// tripwire (`pack_tenant_overlap_findings` in the design's table).
+    pub fsck_tenant_overlap_findings: Align64<AtomicU64>,
+    /// `fsck_repair_classC12` — **structurally 0**, the C8 posture: two
+    /// overlapping tenants means at least one is wrong and nothing on the
+    /// volume says which, so the class is reported and never
+    /// auto-repaired (no arm of the repair engine increments this).
+    pub fsck_repair_class_c12: Align64<AtomicU64>,
     /// PR VL7 defrag family (design-volume-lifecycle §5.7/§10, KD-11).
     /// Distinct blocks moved by the D1/D2 defrag objective (the same
     /// `move_one` engine as `evacuate_*` — a defrag move counts BOTH
@@ -11437,6 +11451,10 @@ impl SqueezefsFilesystem {
                 "fsck_repair_classC8": METRICS.fsck_repair_class[7].load(Ordering::Relaxed),
                 "fsck_repair_classC9": METRICS.fsck_repair_class[8].load(Ordering::Relaxed),
                 "fsck_repair_classC10": METRICS.fsck_repair_class[9].load(Ordering::Relaxed),
+                // PK5 — C12 (tenant-range consistency): the must-stay-0
+                // tripwire and the structurally-0 repair gauge (report-only).
+                "fsck_tenant_overlap_findings": METRICS.fsck_tenant_overlap_findings.load(Ordering::Relaxed),
+                "fsck_repair_classC12": METRICS.fsck_repair_class_c12.load(Ordering::Relaxed),
                 // PR VL7 defrag family (§5.7 / §10, KD-11). Ratio gauges
                 // decode permille+1 (null = never measured); worst-volume
                 // semantics — per-volume rows ride `defrag --report-only`.

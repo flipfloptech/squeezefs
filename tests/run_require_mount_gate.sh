@@ -37,6 +37,7 @@ DEFAULT_TESTS=(
   inline_raise_tests
   mount_owner_override_tests
   multi_queue_tests
+  pack_compaction_tests
   pack_tenant_ops_tests
   packed_mapping_wire_tests
   phantom_backend0_tests

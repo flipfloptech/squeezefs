@@ -536,6 +536,7 @@ fn pack_max_slot_default_is_half_the_chunk_and_the_grain_is_the_lba_law() {
     use squeezefs::routing::{
         pack_max_slot_bytes, pack_slot_len, set_pack_max_slot_bytes_override,
     };
+    let _serial = pack_knob_serial();
 
     // The default is the break-even, and it is CHUNK-derived (a 4 MiB
     // chunk ⇒ 2 MiB; the tie is the ratio, so a chunk change moves it).
@@ -590,6 +591,59 @@ fn pack_max_slot_default_is_half_the_chunk_and_the_grain_is_the_lba_law() {
         .expect("SQUEEZEFS_SMALL_FILE_PACKING is registered");
     assert_eq!(lever.kind, squeezefs::env_knobs::Kind::Bool);
     assert_eq!(lever.default, "off", "the lever ships OFF through PK6");
+}
+
+/// PK6 (design-small-file-packing §5.5, §5.8, KD-5): the compaction
+/// VICTIM threshold IS the own-block threshold — ONE law, two faces. A
+/// block is worth compacting iff copying its live bytes reclaims at least
+/// as many (`live ≤ CHUNK − live ⇔ live ≤ CHUNK/2`), which is exactly the
+/// break-even that sizes the largest slot the packer shares a block for;
+/// the measurement override moves BOTH faces together, so a knob value
+/// can never make the mover chase blocks packing itself would not have
+/// filled. Drift between the two functions is red here. (The seam is
+/// process-global: this test and its neighbour above serialize on the
+/// same lock.)
+#[test]
+fn pack_compaction_victim_threshold_is_the_own_block_threshold() {
+    use squeezefs::block_allocator::CHUNK_SIZE;
+    use squeezefs::defrag::{is_pack_victim, pack_victim_max_live_bytes};
+    use squeezefs::routing::{pack_max_slot_bytes, set_pack_max_slot_bytes_override};
+    let _serial = pack_knob_serial();
+
+    set_pack_max_slot_bytes_override(None);
+    assert_eq!(
+        pack_victim_max_live_bytes(),
+        pack_max_slot_bytes(),
+        "the compaction trigger IS the own-block threshold (one derived law)"
+    );
+    assert_eq!(pack_victim_max_live_bytes(), CHUNK_SIZE / 2);
+    // The break-even itself: at exactly half, copying `live` reclaims
+    // `CHUNK − live = live` — worth it; one byte past half it is not.
+    assert!(is_pack_victim(CHUNK_SIZE / 2));
+    assert!(!is_pack_victim(CHUNK_SIZE / 2 + 1));
+    assert!(is_pack_victim(4096), "a legacy one-LBA tenant block");
+    assert!(
+        is_pack_victim(0),
+        "an empty block is trivially below the line"
+    );
+
+    // The measurement lever moves both faces in lockstep.
+    set_pack_max_slot_bytes_override(Some(4096));
+    assert_eq!(pack_victim_max_live_bytes(), pack_max_slot_bytes());
+    assert_eq!(pack_victim_max_live_bytes(), 4096);
+    assert!(is_pack_victim(4096));
+    assert!(!is_pack_victim(8192));
+    set_pack_max_slot_bytes_override(Some(CHUNK_SIZE));
+    assert_eq!(pack_victim_max_live_bytes(), CHUNK_SIZE);
+    assert!(is_pack_victim(CHUNK_SIZE));
+    set_pack_max_slot_bytes_override(None);
+    assert_eq!(pack_victim_max_live_bytes(), CHUNK_SIZE / 2);
+}
+
+/// The two pack-threshold ties share one process-global override seam.
+fn pack_knob_serial() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock().unwrap_or_else(|p| p.into_inner())
 }
 
 // ---------------------------------------------------------------------------

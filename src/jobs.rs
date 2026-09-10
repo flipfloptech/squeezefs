@@ -3307,8 +3307,9 @@ enum MoveOutcome {
 /// key (`:rel_off:packed_len` size-carrying forms) — preserved verbatim
 /// on the destination mapping so the stored-image geometry survives the
 /// move (the §5.4 "same mapping shape" law: a whole-block mapping stays
-/// whole-block, a decorated one stays decorated).
-fn decoration_suffix<'a>(mapping: &'a str, base: &str) -> &'a str {
+/// whole-block, a decorated one stays decorated). `pub` for the packed-
+/// mapping wire-law contracts (`tests/packed_mapping_wire_tests.rs`).
+pub fn decoration_suffix<'a>(mapping: &'a str, base: &str) -> &'a str {
     mapping.strip_prefix(base).unwrap_or("")
 }
 

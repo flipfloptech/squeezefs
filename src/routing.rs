@@ -15,6 +15,16 @@ use crate::dlm::DlmClient;
 /// never-regress-below-shipped floor and the override's lower bound.
 pub const INLINE_MAX_FLOOR: usize = 4096;
 
+/// The device-window grain EVERY ranged device read assumes — the
+/// conservative 4 KiB LBA (design-read-path OQ #1: the O_DIRECT device fd
+/// refuses windows that are not LBA-multiples, and no per-device
+/// 512-native probe exists until `ranged_read_unaligned_bounces` shows real
+/// waste). A physical constant, not tuning: the one grain the ranged
+/// funnel's asserts, the size-carrying mapping's window law
+/// (`rel_off % LBA_GRAIN == 0`, `rel_off + ceil(len) ≤ CHUNK_SIZE`) and the
+/// packer's slot alignment all share (design-small-file-packing KD-6).
+pub const LBA_GRAIN: u64 = 4096;
+
 /// The inline ceiling a volume derives by DEFAULT: [`INLINE_MAX_FLOOR`] at
 /// every node size — the cost the default prices is per payload byte on
 /// the metadata plane, not per node, so the geometry does not move it
@@ -3278,13 +3288,17 @@ impl BackendRouter {
         dest_addr: Option<u64>,
     ) -> Result<bytes::Bytes> {
         debug_assert_eq!(
-            rel_start % 4096,
+            rel_start % LBA_GRAIN,
             0,
             "ranged window start must be LBA-aligned"
         );
-        debug_assert_eq!(len % 4096, 0, "ranged window length must be LBA-aligned");
+        debug_assert_eq!(
+            len as u64 % LBA_GRAIN,
+            0,
+            "ranged window length must be LBA-aligned"
+        );
         debug_assert!(
-            dest_addr.is_none_or(|d| d % 4096 == 0),
+            dest_addr.is_none_or(|d| d % LBA_GRAIN == 0),
             "ranged O_DIRECT dest must be 4 KiB-aligned"
         );
         let parts = self.split_block_key_ref(block_key)?;
@@ -3685,7 +3699,7 @@ impl BackendRouter {
     }
 
     /// PR 3 (kvmap, Rev 1.3 #3): the ENCODE direction of
-    /// [`Self::map_entry_block_key`] — the tree-7 record form for one
+    /// `map_entry_block_key` — the tree-7 record form for one
     /// router-true block-key string. Undecorated backend keys (the bare
     /// default-slot offset / `name://offset` forms) become the 18-byte
     /// binary POINT; everything else — `damaged:` markers, size-carrying
@@ -3705,10 +3719,10 @@ impl BackendRouter {
     /// back exactly as recorded and never re-attached from the live map
     /// (a re-attach would let a record naming a freed-and-reissued offset
     /// pass the staleness refusal the stamp exists to fire).
-    pub(crate) fn block_key_map_entry(
-        &self,
-        key: &str,
-    ) -> crate::meta_backend::kv::block_map::MapEntry {
+    ///
+    /// `pub` for the packed-mapping wire-law contracts: a size-carrying
+    /// decoration must ride STRING verbatim at every `(off, len)`.
+    pub fn block_key_map_entry(&self, key: &str) -> crate::meta_backend::kv::block_map::MapEntry {
         use crate::meta_backend::kv::block_map::MapEntry;
         if let Ok((be_id, offset, incarnation)) = Self::split_key(key) {
             let vol_tag = if be_id == "backend_0" {
@@ -7023,7 +7037,11 @@ impl DataRouter {
     ///
     /// The base key may itself contain `://` (non-default backends), so the
     /// decoration is parsed strictly AFTER that prefix.
-    fn parse_block_mapping(&self, mapping_str: &str) -> Result<(u64, u64, usize, bool)> {
+    ///
+    /// `pub` for the wire-law contracts (`tests/packed_mapping_wire_tests.rs`,
+    /// design-small-file-packing §7): the decoder every read funnel runs is
+    /// the one the tests pin, never a re-implementation of its grammar.
+    pub fn parse_block_mapping(&self, mapping_str: &str) -> Result<(u64, u64, usize, bool)> {
         // §5.6a quarantined mapping: fsck repair replaced this block with an
         // explicit damaged marker — reads are EIO by contract (never
         // fabricated zeros, never a stale-bytes serve). Every striped read
@@ -13118,7 +13136,6 @@ impl DataRouter {
         hint: ReadClassHint,
     ) -> Result<Option<crate::cache::pool::ReadBlockValue>> {
         const MAX_REBINDS: usize = 8;
-        const LBA: u64 = 4096;
         let device_true = self.direct_device_true() && hint.odirect;
         // Hybrid second-touch escalation (see doc comment). Checked ONCE
         // per request against the resolved key — the check itself records
@@ -13194,12 +13211,12 @@ impl DataRouter {
             "ranged request escapes its block"
         );
         debug_assert_eq!(
-            block_size % LBA,
+            block_size % LBA_GRAIN,
             0,
             "ranged dispatch requires LBA-multiple block sizes"
         );
-        let aligned_start = rel_range.start & !(LBA - 1);
-        let aligned_end = std::cmp::min(rel_range.end.div_ceil(LBA) * LBA, block_size);
+        let aligned_start = rel_range.start & !(LBA_GRAIN - 1);
+        let aligned_end = std::cmp::min(rel_range.end.div_ceil(LBA_GRAIN) * LBA_GRAIN, block_size);
         let window = (aligned_end - aligned_start) as usize;
         let bounced = window != req_len;
         // The zero-copy leg's contract: window == request and the dest is

@@ -183,8 +183,14 @@ use std::time::Duration;
 /// the vector — every volume falling back to the mount-wide law, the
 /// shipped shape, silently — and a 3-speaker's member against a 2-speaker
 /// authority would decode a trailing `Vec` from EOF; the mismatch refuses
-/// loud at the handshake (KD-7 same-commit fleets).
-pub const CLUSTER_WIRE_SCHEMA: u32 = 3;
+/// loud at the handshake (KD-7 same-commit fleets). **4 since the grant
+/// advertises the set authority's pack-group posture**
+/// ([`crate::membership::Grant::pack_group_available`], small-file packing
+/// PR PK4): a 3-speaker's co-writer would read the flag as absent and run
+/// one-block-per-file for ever — the shipped PK2 shape, silently — and a
+/// 4-speaker against a 3-speaker authority would decode the trailing bool
+/// from EOF; the mismatch refuses loud at the handshake.
+pub const CLUSTER_WIRE_SCHEMA: u32 = 4;
 
 /// The **pre-authentication** frame class cap: a challenge/proof pair is a
 /// few hundred bytes, so this is all an unauthenticated peer gets to

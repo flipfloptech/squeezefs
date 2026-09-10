@@ -310,6 +310,9 @@ impl LeaseFrame {
             // Nor the writer's checkpoint ceiling — it rides the membership
             // grant that carries the label it is a promise about.
             checkpoint_ceiling_ms: 0,
+            // Nor the pack-group posture (PK4): the SET authority's
+            // membership grant advertises it; this frame is custody only.
+            pack_group_available: false,
         }
     }
 }

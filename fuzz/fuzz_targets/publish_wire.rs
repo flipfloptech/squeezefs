@@ -474,6 +474,8 @@ struct ArbInput {
     calls: Vec<ArbCall>,
     outcomes: Vec<ArbOutcome>,
     lane_frees: Vec<ArbLaneFree>,
+    // Schema 17: the co-writer pack-group flag.
+    pack_group: bool,
 }
 
 fn reply_from(r: ArbReply) -> PublishReply {
@@ -609,6 +611,7 @@ fuzz_target!(|data: &[u8]| {
         schema,
         client: input.client,
         calls: input.calls.into_iter().map(Into::into).collect(),
+        pack_group: input.pack_group,
     };
     // Past the CONTROL cap the encoder REFUSES (a layout that large rides
     // the indirect map blob, never the wire) — that refusal is the

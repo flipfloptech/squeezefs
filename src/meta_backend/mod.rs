@@ -104,6 +104,16 @@ pub struct DirEntry {
     pub file_type: u32,
 }
 
+/// What a layout publish GROUP commit answered
+/// ([`RoutedMetaBackend::set_layout_and_size_pack_group`]).
+pub enum LayoutGroupCommit {
+    /// One outcome per item, input order.
+    Committed(Vec<Result<()>>),
+    /// PK4's single-volume law refused the set after the slot gate: the
+    /// members route to `volumes` home meta volumes. Nothing committed.
+    Split { volumes: usize },
+}
+
 /// One member of a [`RoutedMetaBackend::set_layout_and_size_group`]: the
 /// single verb's arguments, owned (the group stages its members
 /// concurrently, so each carries its own bytes).
@@ -3522,10 +3532,47 @@ impl RoutedMetaBackend {
     /// is refused loud (its later occurrence) rather than serialized: two
     /// staged txs for one ino in one group would race on the RAM view.
     pub async fn set_layout_and_size_group(&self, items: Vec<LayoutPublish>) -> Vec<Result<()>> {
+        match self.set_layout_and_size_group_inner(items, false).await {
+            LayoutGroupCommit::Committed(results) => results,
+            // Unreachable: the single-volume law is only asked for.
+            LayoutGroupCommit::Split { volumes } => {
+                vec![Err(crate::error::SqueezefsError::InvalidOperation(
+                    format!(
+                        "layout publish group reported a {volumes}-volume split without the \
+                     single-volume law (unreachable)"
+                    ),
+                ))]
+            }
+        }
+    }
+
+    /// **[`Self::set_layout_and_size_group`] under the PACK-GROUP law**
+    /// (design-small-file-packing §5.6, PK4): the items must route to ONE
+    /// home meta volume, judged AFTER the §5.5.2a slot gate — the gate's own
+    /// law ("parks can span a flip, so callers must re-derive routes taken
+    /// before the call") is exactly the window an online `migrate-meta-slot`
+    /// cutover can land in between a co-writer's partition and this serve.
+    /// A frame whose members bucket into two volumes would be two
+    /// independently committed sub-groups, i.e. the publish-after-terminal-
+    /// free window the law closes — so it commits NOTHING and answers
+    /// [`LayoutGroupCommit::Split`] (the owner refuses the frame
+    /// `PUBLISH_PACK_GROUP_SPLIT`). One check, after routing, under the gate.
+    pub async fn set_layout_and_size_pack_group(
+        &self,
+        items: Vec<LayoutPublish>,
+    ) -> LayoutGroupCommit {
+        self.set_layout_and_size_group_inner(items, true).await
+    }
+
+    async fn set_layout_and_size_group_inner(
+        &self,
+        items: Vec<LayoutPublish>,
+        single_home_volume: bool,
+    ) -> LayoutGroupCommit {
         let n = items.len();
         let mut results: Vec<Option<Result<()>>> = (0..n).map(|_| None).collect();
         if n == 0 {
-            return Vec::new();
+            return LayoutGroupCommit::Committed(Vec::new());
         }
         let inos: Vec<Ino> = items.iter().map(|it| it.ino).collect();
         // S10 coherence law (rung 12) — the single verb's gate over the
@@ -3568,6 +3615,13 @@ impl RoutedMetaBackend {
                 .entry(v_idx)
                 .or_default()
                 .push((i, local_ino, item));
+        }
+        // PK4: the post-gate single-volume check — the routes above are the
+        // re-derived ones (taken after the gate admitted the set).
+        if single_home_volume && per_volume.len() > 1 {
+            return LayoutGroupCommit::Split {
+                volumes: per_volume.len(),
+            };
         }
 
         // Every volume's sub-group runs independently and concurrently: a
@@ -3627,18 +3681,20 @@ impl RoutedMetaBackend {
                 results[i] = Some(out);
             }
         }
-        results
-            .into_iter()
-            .map(|slot| {
-                slot.unwrap_or_else(|| {
-                    Err(crate::error::SqueezefsError::InvalidOperation(
-                        "layout publish group: a member reached no outcome (unreachable — \
-                         every member is refused, staged-and-failed, or committed)"
-                            .to_string(),
-                    ))
+        LayoutGroupCommit::Committed(
+            results
+                .into_iter()
+                .map(|slot| {
+                    slot.unwrap_or_else(|| {
+                        Err(crate::error::SqueezefsError::InvalidOperation(
+                            "layout publish group: a member reached no outcome (unreachable — \
+                             every member is refused, staged-and-failed, or committed)"
+                                .to_string(),
+                        ))
+                    })
                 })
-            })
-            .collect()
+                .collect(),
+        )
     }
 
     /// Spec §6.2 item 1: commit a standalone durable block-reference

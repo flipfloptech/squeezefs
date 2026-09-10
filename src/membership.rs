@@ -1279,6 +1279,19 @@ pub struct Grant {
     /// `vol_tag` per KD-5 — the durable `vol-{16 hex}` decode, never a
     /// path. Rides the `CLUSTER_WIRE_SCHEMA` 3 grant.
     pub lane_supply_volumes: Vec<(u64, u64)>,
+    /// **Whether this authority serves co-writer PACK GROUPS**
+    /// (design-small-file-packing §5.6 (a), PR PK4): its D-1c
+    /// conveyor-group lever (`SQUEEZEFS_PUBLISH_CONVEYOR_GROUP`) in force
+    /// at the grant — the `checkpoint_ceiling_ms` precedent for "a decision
+    /// in force, carried on the lease". A co-writer whose grant does not
+    /// advertise it runs the FIXED block arm for every promotion (one block
+    /// per file, byte-identical to PK2) and counts
+    /// `pack_cowriter_group_unavailable`. The grant is the SET authority's
+    /// (the slot-0 owner mints every lease, D20), so on a K-owner fleet a
+    /// PARTIAL authority's lever is covered by the frame refusal alone
+    /// (`PUBLISH_PACK_GROUP_UNAVAILABLE`). Rides the `CLUSTER_WIRE_SCHEMA`
+    /// 4 grant.
+    pub pack_group_available: bool,
 }
 
 impl Grant {
@@ -1510,6 +1523,9 @@ impl MembershipOwner {
             // atomics — KD-FG-4's no-scan-in-renew law stands).
             checkpoint_ceiling_ms: crate::free_grace::advertise_checkpoint_ceiling(),
             lane_supply_volumes: Vec::new(),
+            // PK4: the set authority's pack-group posture (one relaxed knob
+            // read — KD-FG-4's no-scan-in-renew law stands).
+            pack_group_available: crate::meta_ship::publish::conveyor_group_enabled(),
         }
     }
 
@@ -2126,7 +2142,18 @@ pub struct MemberSession {
     /// against nothing — the ceiling and the label are read together only
     /// by the revalidation task, which learns both from one grant.
     checkpoint_ceiling_ms: AtomicU64,
+    /// PK4: whether the set authority serves pack groups, as the LATEST
+    /// grant (join, routine or carriage renewal) advertised — the
+    /// co-writer's batch driver reads it before every packed promotion.
+    pack_group_available: AtomicBool,
 }
+
+/// PK4: grants adopted by ANY member session in this process (the join,
+/// every renewal) — process-monotone, so the batch driver's UNAVAILABLE
+/// latch keyed on it lapses at the next grant and never survives a re-join
+/// ("until the next grant says otherwise" is a counter compare, never a
+/// timer).
+static GRANT_GENERATION: AtomicU64 = AtomicU64::new(0);
 
 impl MemberSession {
     /// Adopt a grant. `anchor_ms` is the instant the member SENT the
@@ -2152,7 +2179,9 @@ impl MemberSession {
             ),
             clock,
             checkpoint_ceiling_ms: AtomicU64::new(grant.checkpoint_ceiling_ms),
+            pack_group_available: AtomicBool::new(grant.pack_group_available),
         };
+        GRANT_GENERATION.fetch_add(1, Ordering::Relaxed);
         log::info!(
             "membership member '{id}' ({}) holds lease epoch {} in term {}: owner deadline \
              {} ms, MY deadline {} ms (T_owner − 2·skew_max − D_purge, anchored on my send \
@@ -2185,6 +2214,9 @@ impl MemberSession {
         // (one grant, one act) — the ladder's input beside the label.
         self.checkpoint_ceiling_ms
             .store(grant.checkpoint_ceiling_ms, Ordering::Relaxed);
+        self.pack_group_available
+            .store(grant.pack_group_available, Ordering::Relaxed);
+        GRANT_GENERATION.fetch_add(1, Ordering::Relaxed);
         // L2b (design-free-grace-sustain §5.2b, OQ 3): the grant's
         // `renew_ms` IS the pass-cadence ask — a prodded (shortened) value
         // tightens the revalidation pass cadence too, clamped at the
@@ -2218,6 +2250,10 @@ impl MemberSession {
             grant.d_purge_ms,
             anchor_ms,
         );
+        // The pack-group posture is a decision about NOW, like the ask.
+        self.pack_group_available
+            .store(grant.pack_group_available, Ordering::Relaxed);
+        GRANT_GENERATION.fetch_add(1, Ordering::Relaxed);
         crate::free_grace::note_prodded_renewal(
             grant.renew_ms,
             grant.checkpoint_ceiling_ms,
@@ -2260,6 +2296,12 @@ impl MemberSession {
     /// The grant's clock-skew bound, ms (the ladder's qualification term).
     pub fn skew_max_ms(&self) -> u64 {
         self.words.skew_max_ms()
+    }
+
+    /// PK4: does the set authority serve co-writer pack groups, per the
+    /// latest grant ([`Grant::pack_group_available`])?
+    pub fn pack_group_available(&self) -> bool {
+        self.pack_group_available.load(Ordering::Relaxed)
     }
 
     /// The grant's `D_purge`, ms (the ladder's drain term).
@@ -2471,6 +2513,19 @@ pub fn installed_member_session() -> Option<Arc<MemberSession>> {
 /// S9 co-writer admission's rung-4 evidence field.
 pub fn installed_member_epoch() -> u64 {
     installed_member_session().map(|s| s.epoch()).unwrap_or(0)
+}
+
+/// PK4: does this member's LATEST grant advertise pack groups
+/// ([`Grant::pack_group_available`])? `false` with no member session — a
+/// co-writer whose lease does not say so runs the block arm (never-wrong).
+pub fn pack_group_available() -> bool {
+    installed_member_session().is_some_and(|s| s.pack_group_available())
+}
+
+/// PK4: the process's grant generation (every membership grant any member
+/// session adopted) — a latch keyed on it lapses at the next grant.
+pub fn pack_group_grant_generation() -> u64 {
+    GRANT_GENERATION.load(Ordering::Relaxed)
 }
 
 // ---------------------------------------------------------------------------

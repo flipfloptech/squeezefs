@@ -64,6 +64,9 @@ fn pinned_errno(e: &SqueezefsError) -> libc::c_int {
         // DLM S6: a fail-stopped lease reaching a data path is the same
         // class as a fenced writer guard — the I/O must not proceed.
         SqueezefsError::MembershipLeaseNotCustody(_) => libc::EIO,
+        // PK4: a shipped publish the authority did not land — the class
+        // is the lane's, the errno is the honest "could not do it".
+        SqueezefsError::PublishFailure { .. } => libc::EIO,
         SqueezefsError::GdsError(_) => libc::EIO,
         SqueezefsError::CacheOverflow => libc::ENOMEM,
         SqueezefsError::Timeout => libc::ETIMEDOUT,
@@ -125,6 +128,14 @@ fn one_of_each() -> Vec<SqueezefsError> {
         SqueezefsError::GdsError("gds".into()),
         SqueezefsError::CacheOverflow,
         SqueezefsError::Timeout,
+        SqueezefsError::PublishFailure {
+            class: squeezefs::error::PublishFailureClass::TransportOutcomeUnknown,
+            msg: "lost".into(),
+        },
+        SqueezefsError::PublishFailure {
+            class: squeezefs::error::PublishFailureClass::FrameRefused(0x57),
+            msg: "refused".into(),
+        },
     ]
 }
 

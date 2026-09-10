@@ -633,8 +633,9 @@ proptest! {
     fn publish_request_frame_round_trips(
         client in "[a-z0-9:-]{1,24}",
         calls in prop::collection::vec(arb_publish_call(), 1..6),
+        pack_group in any::<bool>(),
     ) {
-        let frame = PublishRequestFrame { schema: PUBLISH_SCHEMA, client, calls };
+        let frame = PublishRequestFrame { schema: PUBLISH_SCHEMA, client, calls, pack_group };
         let enc = encode_request_frame(&frame).expect("encodes");
         prop_assert_eq!(decode_request_frame(&enc).expect("decodes"), frame);
     }

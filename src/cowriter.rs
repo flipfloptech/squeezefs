@@ -2236,6 +2236,27 @@ pub fn router_harvest_executor(
     )
 }
 
+/// A [`crate::meta_ship::publish::ReleasedBlockProbe`] over this authority's
+/// data router — the served-publish SCREEN's probe (design-small-file-packing
+/// §5.6 (2), PK4), installed beside the free executor: `true` iff this
+/// authority holds `(vol_tag, block_idx)` on its free list, in the
+/// freed-offset grace ring or in S7 quarantine — the same three probes
+/// [`execute_shipped_frees`]' untracked arm composes. A volume this router
+/// does not route answers `false` (the not-owner screen owns that class).
+pub fn router_released_block_probe(
+    backend: Arc<crate::routing::BackendRouter>,
+) -> crate::meta_ship::publish::ReleasedBlockProbe {
+    Arc::new(move |vol_tag: u64, block_idx: u64| {
+        let Some((_, alloc)) = backend.allocator_for_volume_tag(vol_tag) else {
+            return false;
+        };
+        let offset = block_idx.saturating_mul(alloc.chunk_size());
+        alloc.free_list_contains(block_idx)
+            || alloc.grace_holds(offset)
+            || alloc.is_quarantined(offset)
+    })
+}
+
 /// A [`crate::meta_ship::publish::FreeExecutor`] over this authority's data
 /// router + metadata set — what `multi_writer::arm_multi_writer` installs
 /// beside the frontier source (and the rigs install directly). The

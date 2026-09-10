@@ -80,7 +80,7 @@ use super::wire::{WireDirEntry, WireError, WireInode};
 use crate::cluster_wire::{
     RpcAsyncService, RpcClient, RpcRequest, RpcResponse, RPC_OK, RPC_UNKNOWN_VERB,
 };
-use crate::error::{Result, SqueezefsError};
+use crate::error::{PublishFailureClass, Result, SqueezefsError};
 use crate::meta_backend::kv::block_refs::{BlockRef, BlockRefOp};
 use crate::meta_backend::{DirEntry, Ino, Inode, LayoutPublish, RoutedMetaBackend};
 use bincode::Options as _;
@@ -247,7 +247,17 @@ use std::sync::Arc;
 /// lifetime the co-writer already re-minted, and touches nothing). A
 /// 15-speaker would read the notices as absent and keep the lineage — the
 /// mismatch refuses loud at the first frame (KD-7 same-commit fleets).
-pub const PUBLISH_SCHEMA: u32 = 16;
+///
+/// **17 since the request frame carries the `pack_group` flag**
+/// (design-small-file-packing §5.6, PR PK4): a co-writer's pack of
+/// small-file tenants ships its `SetLayoutAndSize` calls as ONE flagged
+/// frame the owner must serve as ONE conveyor group on ONE home volume —
+/// or refuse ([`PUBLISH_PACK_GROUP_UNAVAILABLE`] /
+/// [`PUBLISH_PACK_GROUP_SPLIT`]). A 16-speaker would decode the flag as
+/// absent and serve the frame per chain, silently reopening the
+/// publish-after-terminal-free window the flag exists to close — the
+/// mismatch refuses loud instead.
+pub const PUBLISH_SCHEMA: u32 = 17;
 
 /// First verb of S9's publish block. S3's ping is 0, S8's metadata verbs
 /// are 16/17, S6's membership owns `0x0100..=0x01FF`, S9's custody
@@ -281,6 +291,27 @@ pub const PUBLISH_LANE_REFUSED: u16 = 0x55;
 /// answered from a cached outcome, and a dead era's first attempt must
 /// never execute.
 pub const PUBLISH_STALE_LEASE: u16 = 0x56;
+/// Status (frame-level, PK4): a `pack_group` frame reached an owner whose
+/// D-1c conveyor-group lever is `0` (or one too old to know the flag).
+/// Serving it per chain would silently reopen the publish-after-terminal-
+/// free window (design-small-file-packing §5.6 (1)), so the owner refuses
+/// the WHOLE frame: nothing applied, KNOWN. The co-writer abandons the
+/// never-published pack and promotes those tenants one-block-per-file.
+pub const PUBLISH_PACK_GROUP_UNAVAILABLE: u16 = 0x57;
+/// Status (frame-level, PK4): the owner's post-slot-gate route
+/// re-derivation found a `pack_group` frame's tenants on MORE THAN ONE home
+/// meta volume — an online `migrate-meta-slot` cutover landed between the
+/// co-writer's partition and this serve. Two per-volume sub-groups would
+/// be the window itself, so the frame is refused whole: nothing applied,
+/// KNOWN. The co-writer abandons the pack and re-`prepare`s every tenant.
+pub const PUBLISH_PACK_GROUP_SPLIT: u16 = 0x58;
+/// Status (per call, PK4 — the authority's served-publish SCREEN, §5.6
+/// (2)): a served layout publish would ADOPT a data block this authority
+/// holds on its free list, in the freed-offset grace ring or in S7
+/// quarantine. Refused, never re-claimed (`served_publish_free_block_
+/// refusals`, must stay 0): under the per-volume group law the shape is
+/// unreachable, so a hit is a bug worth a stop-and-read signal.
+pub const PUBLISH_FREE_BLOCK_REFUSED: u16 = 0x59;
 
 /// One durable block-reference operation on the wire — a mirror of
 /// [`BlockRefOp`] on purpose: the internal struct may gain fields without
@@ -978,6 +1009,12 @@ pub struct PublishRequestFrame {
     /// The frame's calls, in submission order; the reply answers one
     /// [`PublishCallOutcome`] per call in the same order. Never empty.
     pub calls: Vec<PublishCall>,
+    /// Schema 17 (PK4): the frame is a co-writer PACK GROUP — every call a
+    /// `SetLayoutAndSize` on a distinct ino, all on ONE home meta volume,
+    /// to be served as ONE conveyor group or refused whole
+    /// ([`PUBLISH_PACK_GROUP_UNAVAILABLE`] / [`PUBLISH_PACK_GROUP_SPLIT`]).
+    /// Never served per chain.
+    pub pack_group: bool,
 }
 
 /// One call's answer inside a [`PublishReplyFrame`] (schema 13): the
@@ -1195,8 +1232,70 @@ static FRAME_GROUPS: AtomicU64 = AtomicU64::new(0);
 /// contract can flip it in-process.
 pub const CONVEYOR_GROUP_ENV: &str = "SQUEEZEFS_PUBLISH_CONVEYOR_GROUP";
 
-fn conveyor_group_enabled() -> bool {
+/// The D-1c lever in force. `pub(crate)`: the membership grant advertises
+/// it as `Grant::pack_group_available` (PK4 — the set authority's
+/// posture, carried on the lease so a co-writer never ships a pack group
+/// an owner would refuse).
+pub(crate) fn conveyor_group_enabled() -> bool {
     crate::env_knobs::bool_knob(CONVEYOR_GROUP_ENV, true)
+}
+
+/// **Test seam** (PK4 contract 8): a hook the owner runs on every
+/// `pack_group` frame it accepts past the lever check, BEFORE the serve —
+/// the injection point for a slot cutover landing between the co-writer's
+/// partition and the owner's route re-derivation. Returns the undo the
+/// owner runs after the frame's outcome is decided. `None` = no hook.
+pub type PackGroupServeHook = Arc<dyn Fn() -> Option<Box<dyn FnOnce() + Send>> + Send + Sync>;
+
+static TEST_PACK_GROUP_SERVE_HOOK: Lazy<arc_swap::ArcSwapOption<PackGroupServeHook>> =
+    Lazy::new(arc_swap::ArcSwapOption::empty);
+
+/// Install / clear the owner's pack-group serve hook (tests only).
+pub fn test_install_pack_group_serve_hook(hook: Option<PackGroupServeHook>) {
+    TEST_PACK_GROUP_SERVE_HOOK.store(hook.map(Arc::new));
+}
+
+/// **Test seam** (PK4 contract 9, FIND-PK-4): the client LOSES this many
+/// LAYOUT-PUBLISH frame replies (a `pack_group` frame, or a frame whose
+/// every call is `SetLayoutAndSize` / `MergeLayoutAndSize`) after the owner
+/// answered — the sent-then-lost ambiguity, made deterministic. Each lost
+/// reply is one transport failure to the witnessed resend ladder (the
+/// owner's window answers the resend from cache); past the ladder the
+/// failure is `TransportOutcomeUnknown`. Scoped to the layout class so the
+/// lane raise / harvest / free verbs a promotion also rides stay answered.
+/// 0 = none; `u64::MAX` = every reply.
+pub static TEST_LOSE_LAYOUT_PUBLISH_REPLIES: AtomicU64 = AtomicU64::new(0);
+
+fn lose_reply_for_test(frame: &PublishRequestFrame) -> bool {
+    if TEST_LOSE_LAYOUT_PUBLISH_REPLIES.load(Ordering::Relaxed) == 0 {
+        return false;
+    }
+    let layout_class = frame.pack_group
+        || frame.calls.iter().all(|c| {
+            matches!(
+                c,
+                PublishCall::SetLayoutAndSize { .. } | PublishCall::MergeLayoutAndSize { .. }
+            )
+        });
+    if !layout_class {
+        return false;
+    }
+    let mut cur = TEST_LOSE_LAYOUT_PUBLISH_REPLIES.load(Ordering::Relaxed);
+    loop {
+        if cur == 0 {
+            return false;
+        }
+        let next = if cur == u64::MAX { cur } else { cur - 1 };
+        match TEST_LOSE_LAYOUT_PUBLISH_REPLIES.compare_exchange_weak(
+            cur,
+            next,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => return true,
+            Err(seen) => cur = seen,
+        }
+    }
 }
 
 /// The at-budget W2 spill's counter (incremented by
@@ -1574,9 +1673,44 @@ struct Submission {
     queued_at: std::time::Instant,
 }
 
+/// One queued PACK GROUP (PK4, [`PublishClient::ship_group`]): N witnessed
+/// `SetLayoutAndSize` calls that travel as ONE `pack_group` frame — never
+/// split, never mixed with other calls — and are answered as one (the
+/// outer `Result` is the frame's fate, the inner one each call's).
+struct GroupSubmission {
+    calls: Vec<PublishCall>,
+    reply: squeezefs_ipc::sqz_channel::oneshot::Sender<Result<Vec<Result<PublishReply>>>>,
+    queued_at: std::time::Instant,
+}
+
+/// What the lane queue carries: an ordinary call, or an indivisible group.
+enum Queued {
+    Call(Submission),
+    PackGroup(GroupSubmission),
+}
+
 /// One endpoint's lane: the bounded submission queue its drain serves.
 struct PublishLane {
-    tx: squeezefs_ipc::sqz_channel::mpsc::Sender<Submission>,
+    tx: squeezefs_ipc::sqz_channel::mpsc::Sender<Queued>,
+}
+
+/// The largest co-writer pack (design-small-file-packing §5.6 "Batch
+/// sizing"): `min(frame_call_cap, frame_byte_budget ÷ one tenant call's
+/// wire hint)` — both DERIVED from the wire, never a constant. A tenant's
+/// `SetLayoutAndSize` is one staged layout (its inline map is one
+/// mapping; the wire hint takes the layout wire's own framing headroom,
+/// `LAYOUT_INLINE_HEADROOM`) plus at most two reference ops (the take and
+/// a displaced older copy's release). A pack sized by this never refuses
+/// at submission; the submission-time refusal is the belt.
+pub fn pack_group_tenant_cap() -> usize {
+    let tenant_hint = 4 * INT_HINT
+        + INT_HINT
+        + crate::routing::LAYOUT_INLINE_HEADROOM
+        + INT_HINT
+        + 2 * (4 * INT_HINT + 1);
+    let client_len = CLIENT.load_full().map(|c| c.peer_id.len()).unwrap_or(0);
+    let by_bytes = frame_byte_budget(client_len) / tenant_hint;
+    frame_call_cap().min(by_bytes).max(1)
 }
 
 /// What every frame shipper on one lane shares: the endpoint, the
@@ -1645,8 +1779,7 @@ impl PublishClient {
         // so a saturated authority backpressures its clients instead of
         // growing a queue without limit; a stuck one surfaces as the
         // wire's reply timeout on the frame, never as unbounded queueing.
-        let (tx, rx) =
-            squeezefs_ipc::sqz_channel::mpsc::channel::<Submission>(frame_call_cap() * 8);
+        let (tx, rx) = squeezefs_ipc::sqz_channel::mpsc::channel::<Queued>(frame_call_cap() * 8);
         let lane = Arc::new(PublishLane { tx });
         let spawn_drain = || {
             let shared = Arc::new(LaneShared {
@@ -1704,13 +1837,13 @@ impl PublishClient {
         let lane = self.lane(endpoint);
         let (tx, rx) = squeezefs_ipc::sqz_channel::oneshot::channel();
         lane.tx
-            .send(Submission {
+            .send(Queued::Call(Submission {
                 resend_safe: call.transport_resend_safe(),
                 size_hint: call.wire_size_hint(),
                 call,
                 reply: tx,
                 queued_at: std::time::Instant::now(),
-            })
+            }))
             .await
             .map_err(|_| {
                 SqueezefsError::InvalidOperation(format!(
@@ -1720,6 +1853,76 @@ impl PublishClient {
         rx.await.map_err(|_| {
             SqueezefsError::InvalidOperation(format!(
                 "S9: the publish lane to {endpoint} dropped a frame's outcomes"
+            ))
+        })?
+    }
+
+    /// Ship a co-writer PACK GROUP to `endpoint` (design-small-file-packing
+    /// §5.6, PK4): `calls` — witnessed `SetLayoutAndSize` calls on distinct
+    /// inos, all routing to ONE home meta volume of ONE owner — join the
+    /// lane as ONE push (the `enqueue_many` shape mirrored on the client:
+    /// no drain ever sees a partial group), travel as ONE frame flagged
+    /// `pack_group` that carries nothing else, and are answered as one.
+    /// The frame is refused at SUBMISSION when it would not fit the wire
+    /// (past [`frame_call_cap`] or the byte budget) — the batch driver
+    /// sizes packs by [`pack_group_tenant_cap`], so this is the belt.
+    ///
+    /// The outer `Result` is the FRAME's fate, typed
+    /// ([`SqueezefsError::PublishFailure`]): a transport failure is
+    /// `TransportOutcomeUnknown`, an owner's frame-level refusal
+    /// `FrameRefused(status)`, an unusable reply `Protocol`; the inner
+    /// results are the per-call outcomes (a per-call refusal is
+    /// `CallRefused(status)`, an era refusal `WriterGuardFenced`).
+    pub async fn ship_group(
+        &self,
+        endpoint: &str,
+        calls: Vec<PublishCall>,
+    ) -> Result<Vec<Result<PublishReply>>> {
+        if calls.is_empty() {
+            return Ok(Vec::new());
+        }
+        let cap = frame_call_cap();
+        let bytes: usize = calls.iter().map(PublishCall::wire_size_hint).sum();
+        if calls.len() > cap || bytes > frame_byte_budget(self.peer_id.len()) {
+            return Err(SqueezefsError::PublishFailure {
+                class: PublishFailureClass::Protocol,
+                msg: format!(
+                    "S9: a {}-call pack group ({bytes} B) exceeds one publish frame (cap {cap} \
+                     calls / {} B) — the batch driver must size packs by pack_group_tenant_cap",
+                    calls.len(),
+                    frame_byte_budget(self.peer_id.len())
+                ),
+            });
+        }
+        if let Some(bad) = calls
+            .iter()
+            .find(|c| !matches!(c, PublishCall::SetLayoutAndSize { .. }) || c.witness().is_none())
+        {
+            return Err(SqueezefsError::PublishFailure {
+                class: PublishFailureClass::Protocol,
+                msg: format!(
+                    "S9: a pack group carries only witnessed SetLayoutAndSize calls, not {}",
+                    bad.name()
+                ),
+            });
+        }
+        let lane = self.lane(endpoint);
+        let (tx, rx) = squeezefs_ipc::sqz_channel::oneshot::channel();
+        lane.tx
+            .send(Queued::PackGroup(GroupSubmission {
+                calls,
+                reply: tx,
+                queued_at: std::time::Instant::now(),
+            }))
+            .await
+            .map_err(|_| {
+                SqueezefsError::InvalidOperation(format!(
+                    "S9: the publish lane to {endpoint} is gone"
+                ))
+            })?;
+        rx.await.map_err(|_| {
+            SqueezefsError::InvalidOperation(format!(
+                "S9: the publish lane to {endpoint} dropped a pack group's outcomes"
             ))
         })?
     }
@@ -1734,11 +1937,16 @@ impl PublishClient {
 /// timer and no added delay on a quiet one. A frame is cut at the call
 /// cap, at the byte budget, and where the resend class changes (the item
 /// that would have crossed a boundary heads the next frame).
+///
+/// **A pack group is indivisible** (PK4): it heads its OWN frame — the
+/// frame under construction is cut before it, and its frame carries
+/// nothing else — so the owner's single-volume check judges exactly the
+/// group and a per-call neighbour can never split it.
 async fn lane_drain(
     shared: Arc<LaneShared>,
-    mut rx: squeezefs_ipc::sqz_channel::mpsc::Receiver<Submission>,
+    mut rx: squeezefs_ipc::sqz_channel::mpsc::Receiver<Queued>,
 ) {
-    let mut carry: Option<Submission> = None;
+    let mut carry: Option<Queued> = None;
     loop {
         let first = match carry.take() {
             Some(s) => s,
@@ -1762,16 +1970,33 @@ async fn lane_drain(
                     Err(_) => {
                         // The semaphore is never closed; refuse loud
                         // rather than strand the waiter if it ever is.
-                        let _ = first
-                            .reply
-                            .send(Err(SqueezefsError::InvalidOperation(format!(
-                                "S9: the publish lane to {} lost its depth bound",
-                                shared.endpoint
-                            ))));
+                        let msg = format!(
+                            "S9: the publish lane to {} lost its depth bound",
+                            shared.endpoint
+                        );
+                        match first {
+                            Queued::Call(s) => {
+                                let _ = s.reply.send(Err(SqueezefsError::InvalidOperation(msg)));
+                            }
+                            Queued::PackGroup(g) => {
+                                let _ = g.reply.send(Err(SqueezefsError::InvalidOperation(msg)));
+                            }
+                        }
                         return;
                     }
                 }
             }
+        };
+        let first = match first {
+            Queued::PackGroup(group) => {
+                let shared = Arc::clone(&shared);
+                crate::meta_exec::spawn_meta("meta_ship_publish_pack_group", async move {
+                    ship_pack_group_frame(&shared, group).await;
+                    drop(permit);
+                });
+                continue;
+            }
+            Queued::Call(s) => s,
         };
         let cap = frame_call_cap();
         let budget = frame_byte_budget(shared.peer_id.len());
@@ -1780,9 +2005,13 @@ async fn lane_drain(
         let mut frame = vec![first];
         while frame.len() < cap {
             match rx.try_recv() {
-                Ok(next) => {
+                Ok(Queued::PackGroup(g)) => {
+                    carry = Some(Queued::PackGroup(g));
+                    break;
+                }
+                Ok(Queued::Call(next)) => {
                     if next.resend_safe != class || bytes.saturating_add(next.size_hint) > budget {
-                        carry = Some(next);
+                        carry = Some(Queued::Call(next));
                         break;
                     }
                     bytes += next.size_hint;
@@ -1807,12 +2036,160 @@ struct Waiter {
     presented: Option<u64>,
 }
 
-fn fail_all(waiters: Vec<Waiter>, msg: &str) {
+/// Fail every waiter of a frame with ONE typed class (PK4 — the class is
+/// what a co-writer's pack release keys `Known`/`Unknown` on; the message
+/// stays for logs).
+fn fail_all(waiters: Vec<Waiter>, class: PublishFailureClass, msg: &str) {
     for w in waiters {
-        let _ = w
-            .reply
-            .send(Err(SqueezefsError::InvalidOperation(msg.to_string())));
+        let _ = w.reply.send(Err(SqueezefsError::PublishFailure {
+            class,
+            msg: msg.to_string(),
+        }));
     }
+}
+
+/// Interpret one decoded per-call outcome for its caller (the landed
+/// per-call law: `Done` errno-preserving, an era refusal composing the
+/// fence, every other refusal typed on its status).
+fn interpret_outcome(
+    shared: &LaneShared,
+    name: &'static str,
+    presented: Option<u64>,
+    outcome: PublishCallOutcome,
+) -> Result<PublishReply> {
+    match outcome {
+        PublishCallOutcome::Done(r) => r.map_err(WireError::into_error),
+        PublishCallOutcome::Refused { status, detail } if status == PUBLISH_STALE_LEASE => {
+            let fenced = match (presented, crate::data_grant::custody_client()) {
+                (Some(epoch), Some(client)) => client.note_publish_era_refused(epoch, &detail),
+                _ => false,
+            };
+            log::error!(
+                "S9: the authority at {} refused {} BY ERA ({detail}) — nothing was applied{}",
+                shared.endpoint,
+                name,
+                if fenced {
+                    "; this epoch was our CURRENT lease, so the full fence composed (custody \
+                     poisoned — re-admission is by remount)"
+                } else {
+                    " (the refused epoch is not this mount's current lease — a dead frame, not \
+                     a dead era)"
+                }
+            );
+            Err(SqueezefsError::WriterGuardFenced)
+        }
+        PublishCallOutcome::Refused { status, detail } => Err(SqueezefsError::PublishFailure {
+            class: PublishFailureClass::CallRefused(status),
+            msg: format!(
+                "S9: the owner at {} refused {} (status {status}): {detail}",
+                shared.endpoint, name
+            ),
+        }),
+    }
+}
+
+/// The frame exchange's outcome, classified (PK4): the decoded reply
+/// frame, or the typed class + message every waiter shares.
+async fn exchange_frame(
+    shared: &LaneShared,
+    frame: PublishRequestFrame,
+    resend_safe: bool,
+) -> std::result::Result<PublishReplyFrame, (PublishFailureClass, String)> {
+    let n = frame.calls.len();
+    let body =
+        encode_request_frame(&frame).map_err(|e| (PublishFailureClass::Protocol, e.to_string()))?;
+    let reply = shared
+        .exchange(body, resend_safe, n)
+        .await
+        .map_err(|e| (PublishFailureClass::TransportOutcomeUnknown, e.to_string()))?;
+    if lose_reply_for_test(&frame) {
+        return Err((
+            PublishFailureClass::TransportOutcomeUnknown,
+            format!(
+                "S9: the reply to a {n}-call publish frame (pack_group = {}) from {} was LOST \
+                 (test seam)",
+                frame.pack_group, shared.endpoint
+            ),
+        ));
+    }
+    // Calls that travelled to an owner — per call, whatever the status
+    // (today's ledger semantics, one frame later).
+    SHIPPED.fetch_add(n as u64, Ordering::Relaxed);
+    if reply.status != PUBLISH_OK {
+        // A FRAME-level refusal (schema / malformed / a pack-group
+        // refusal): every call shares it.
+        return Err((
+            PublishFailureClass::FrameRefused(reply.status),
+            format!(
+                "S9: the owner at {} refused a {n}-call publish frame (status {}): {}",
+                shared.endpoint,
+                reply.status,
+                String::from_utf8_lossy(&reply.body)
+            ),
+        ));
+    }
+    let decoded = decode_reply_frame(&reply.body)
+        .map_err(|e| (PublishFailureClass::Protocol, e.to_string()))?;
+    if decoded.schema != PUBLISH_SCHEMA {
+        return Err((
+            PublishFailureClass::Protocol,
+            format!(
+                "S9: the owner at {} replied in publish schema {} (this build speaks \
+                 {PUBLISH_SCHEMA})",
+                shared.endpoint, decoded.schema
+            ),
+        ));
+    }
+    if decoded.outcomes.len() != n {
+        return Err((
+            PublishFailureClass::Protocol,
+            format!(
+                "S9 publish protocol violation: the owner at {} answered a {n}-call frame with \
+                 {} outcomes — refusing every call rather than guessing which is whose",
+                shared.endpoint,
+                decoded.outcomes.len()
+            ),
+        ));
+    }
+    Ok(decoded)
+}
+
+/// Ship one PACK GROUP as its own flagged frame and answer the group
+/// (PK4). The frame is resend-safe by construction (every call is
+/// witnessed).
+async fn ship_pack_group_frame(shared: &LaneShared, group: GroupSubmission) {
+    super::phase_record(super::ShipPhase::QueueWait, group.queued_at);
+    let n = group.calls.len();
+    SHIP_FRAMES.fetch_add(1, Ordering::Relaxed);
+    SHIP_FRAMED_CALLS.fetch_add(n as u64, Ordering::Relaxed);
+    let names: Vec<&'static str> = group.calls.iter().map(PublishCall::name).collect();
+    let presented: Vec<Option<u64>> = group
+        .calls
+        .iter()
+        .map(PublishCall::presented_epoch)
+        .collect();
+    let frame = PublishRequestFrame {
+        schema: PUBLISH_SCHEMA,
+        client: shared.peer_id.to_string(),
+        calls: group.calls,
+        pack_group: true,
+    };
+    let out = match exchange_frame(shared, frame, true).await {
+        Ok(decoded) => {
+            crate::cowriter::apply_lane_free_notices(&decoded.lane_frees);
+            Ok(decoded
+                .outcomes
+                .into_iter()
+                .zip(names)
+                .zip(presented)
+                .map(|((outcome, name), presented)| {
+                    interpret_outcome(shared, name, presented, outcome)
+                })
+                .collect())
+        }
+        Err((class, msg)) => Err(SqueezefsError::PublishFailure { class, msg }),
+    };
+    let _ = group.reply.send(out);
 }
 
 /// Ship one formed frame and fan every call's outcome back to its caller.
@@ -1832,105 +2209,26 @@ async fn ship_frame(shared: &LaneShared, frame: Vec<Submission>) {
     }
     SHIP_FRAMES.fetch_add(1, Ordering::Relaxed);
     SHIP_FRAMED_CALLS.fetch_add(n as u64, Ordering::Relaxed);
-    let body = match encode_request_frame(&PublishRequestFrame {
+    let frame = PublishRequestFrame {
         schema: PUBLISH_SCHEMA,
         client: shared.peer_id.to_string(),
         calls,
-    }) {
-        Ok(b) => b,
-        Err(e) => {
-            fail_all(waiters, &e.to_string());
+        pack_group: false,
+    };
+    let decoded = match exchange_frame(shared, frame, resend_safe).await {
+        Ok(d) => d,
+        Err((class, msg)) => {
+            fail_all(waiters, class, &msg);
             return;
         }
     };
-    let reply = match shared.exchange(body, resend_safe, n).await {
-        Ok(r) => r,
-        Err(e) => {
-            fail_all(waiters, &e.to_string());
-            return;
-        }
-    };
-    // Calls that travelled to an owner — per call, whatever the status
-    // (today's ledger semantics, one frame later).
-    SHIPPED.fetch_add(n as u64, Ordering::Relaxed);
-    if reply.status != PUBLISH_OK {
-        // A FRAME-level refusal (schema / malformed): every call shares it.
-        fail_all(
-            waiters,
-            &format!(
-                "S9: the owner at {} refused a {n}-call publish frame (status {}): {}",
-                shared.endpoint,
-                reply.status,
-                String::from_utf8_lossy(&reply.body)
-            ),
-        );
-        return;
-    }
-    let decoded = match decode_reply_frame(&reply.body) {
-        Ok(f) => f,
-        Err(e) => {
-            fail_all(waiters, &e.to_string());
-            return;
-        }
-    };
-    if decoded.schema != PUBLISH_SCHEMA {
-        fail_all(
-            waiters,
-            &format!(
-                "S9: the owner at {} replied in publish schema {} (this build speaks \
-                 {PUBLISH_SCHEMA})",
-                shared.endpoint, decoded.schema
-            ),
-        );
-        return;
-    }
-    if decoded.outcomes.len() != n {
-        fail_all(
-            waiters,
-            &format!(
-                "S9 publish protocol violation: the owner at {} answered a {n}-call frame with \
-                 {} outcomes — refusing every call rather than guessing which is whose",
-                shared.endpoint,
-                decoded.outcomes.len()
-            ),
-        );
-        return;
-    }
     // Schema 16: the frame's lane-free notices apply BEFORE any outcome
     // reaches its caller — a harvest grant in this frame is adopted only
     // after the notices its blocks' frees queued have released this mount's
     // stale tracking of them.
     crate::cowriter::apply_lane_free_notices(&decoded.lane_frees);
     for (w, outcome) in waiters.into_iter().zip(decoded.outcomes) {
-        let out = match outcome {
-            PublishCallOutcome::Done(r) => r.map_err(WireError::into_error),
-            PublishCallOutcome::Refused { status, detail } if status == PUBLISH_STALE_LEASE => {
-                let fenced = match (w.presented, crate::data_grant::custody_client()) {
-                    (Some(epoch), Some(client)) => client.note_publish_era_refused(epoch, &detail),
-                    _ => false,
-                };
-                log::error!(
-                    "S9: the authority at {} refused {} BY ERA ({detail}) — nothing was \
-                     applied{}",
-                    shared.endpoint,
-                    w.name,
-                    if fenced {
-                        "; this epoch was our CURRENT lease, so the full fence composed \
-                         (custody poisoned — re-admission is by remount)"
-                    } else {
-                        " (the refused epoch is not this mount's current lease — a dead \
-                         frame, not a dead era)"
-                    }
-                );
-                Err(SqueezefsError::WriterGuardFenced)
-            }
-            PublishCallOutcome::Refused { status, detail } => {
-                Err(SqueezefsError::InvalidOperation(format!(
-                    "S9: the owner at {} refused {} (status {status}): {detail}",
-                    shared.endpoint, w.name
-                )))
-            }
-        };
+        let out = interpret_outcome(shared, w.name, w.presented, outcome);
         let _ = w.reply.send(out);
     }
 }
@@ -2412,6 +2710,20 @@ async fn ship_witnessed(peer: &Arc<super::PeerOwner>, call: PublishCall) -> Resu
         match ship(peer, call.clone()).await {
             Ok(reply) => return Ok(reply),
             Err(e @ SqueezefsError::WriterGuardFenced) => return Err(e),
+            // PK4: a typed DEFINITE refusal (the owner refused the frame or
+            // the call, or answered unusably) is KNOWN — a resend of the
+            // same frame would refuse identically. Only the outcome-unknown
+            // class rides the ladder; every untyped error keeps the landed
+            // retry law verbatim.
+            Err(
+                e @ SqueezefsError::PublishFailure {
+                    class:
+                        PublishFailureClass::FrameRefused(_)
+                        | PublishFailureClass::CallRefused(_)
+                        | PublishFailureClass::Protocol,
+                    ..
+                },
+            ) => return Err(e),
             Err(e) => {
                 attempt += 1;
                 if current_lease_epoch() != epoch || attempt >= PUBLISH_SHIP_ATTEMPTS {
@@ -2419,6 +2731,53 @@ async fn ship_witnessed(peer: &Arc<super::PeerOwner>, call: PublishCall) -> Resu
                 }
                 squeezefs_ipc::sqz_time::sleep(std::time::Duration::from_millis(10)).await;
             }
+        }
+    }
+}
+
+/// [`ship_witnessed`] for a PACK GROUP (PK4): the SAME frame — same
+/// request ids, same payload — resent under the bounded epoch-stable
+/// ladder on a TRANSPORT failure only (the owner's witness window answers
+/// a resend from cache, so the group applies at most once); a definite
+/// frame-level refusal, an unusable reply and an era move end the ladder
+/// at once. Past the budget the failure IS `TransportOutcomeUnknown` — the
+/// class the co-writer's pack release abandons WITHOUT recycle on.
+async fn ship_group_witnessed(
+    peer: &Arc<super::PeerOwner>,
+    calls: Vec<PublishCall>,
+) -> Result<Vec<Result<PublishReply>>> {
+    let Some(client) = CLIENT.load_full() else {
+        REFUSALS.fetch_add(1, Ordering::Relaxed);
+        let msg = format!(
+            "S9: a {}-call pack group on volumes owned by {} cannot be published — the \
+             ownership plane is armed but no publish client is installed",
+            calls.len(),
+            peer.peer_id
+        );
+        log::error!("{msg}");
+        return Err(SqueezefsError::InvalidOperation(msg));
+    };
+    let epoch = calls
+        .first()
+        .and_then(PublishCall::presented_epoch)
+        .unwrap_or(0);
+    let mut attempt = 0u32;
+    loop {
+        match client.ship_group(&peer.endpoint, calls.clone()).await {
+            Ok(outcomes) => return Ok(outcomes),
+            Err(
+                e @ SqueezefsError::PublishFailure {
+                    class: PublishFailureClass::TransportOutcomeUnknown,
+                    ..
+                },
+            ) => {
+                attempt += 1;
+                if current_lease_epoch() != epoch || attempt >= PUBLISH_SHIP_ATTEMPTS {
+                    return Err(e);
+                }
+                squeezefs_ipc::sqz_time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            Err(e) => return Err(e),
         }
     }
 }
@@ -2486,6 +2845,92 @@ pub async fn set_layout_and_size(
             }
         }
     }
+}
+
+/// One tenant of a co-writer PACK GROUP publish
+/// ([`set_layout_and_size_pack_group`]): the staged layout wire and its
+/// accounting frame, exactly [`set_layout_and_size`]'s arguments, owned.
+pub struct PackGroupItem {
+    pub ino: Ino,
+    pub layout: Vec<u8>,
+    pub size: u64,
+    pub refs: Vec<BlockRefOp>,
+}
+
+/// **Ship a co-writer pack's tenant publishes as ONE `pack_group` frame**
+/// (design-small-file-packing §5.6, PK4): every item must route to the
+/// SAME foreign owner (the batch driver partitioned by `(owner endpoint,
+/// home volume)`; a local-home or mixed-owner group refuses HERE, nothing
+/// shipped — a co-writer never commits a layout locally). Runs the S10
+/// intent barrier over the whole set, mints one witness per call, ships
+/// through [`ship_group_witnessed`], and answers one [`OwnerVerdict`] per
+/// item in input order. The outer `Err` is the frame's typed fate.
+pub async fn set_layout_and_size_pack_group(
+    be: &Arc<RoutedMetaBackend>,
+    items: Vec<PackGroupItem>,
+) -> Result<Vec<Result<OwnerVerdict>>> {
+    if items.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut peer: Option<Arc<super::PeerOwner>> = None;
+    for it in &items {
+        match owner_of(be, it.ino)? {
+            None => {
+                return Err(SqueezefsError::InvalidOperation(format!(
+                    "S9: pack group tenant ino {} routes to a LOCAL volume — a co-writer pack \
+                     group ships to one foreign owner; the batch driver's partition is broken",
+                    it.ino
+                )));
+            }
+            Some(p) => match &peer {
+                None => peer = Some(p),
+                Some(first) if first.endpoint == p.endpoint => {}
+                Some(first) => {
+                    return Err(SqueezefsError::InvalidOperation(format!(
+                        "S9: pack group tenants route to two owners ({} and {}) — the batch \
+                         driver's (owner, home volume) partition is broken",
+                        first.endpoint, p.endpoint
+                    )));
+                }
+            },
+        }
+    }
+    let Some(peer) = peer else {
+        // Unreachable by construction (a non-empty set either resolved an
+        // owner or refused above); a refusal, never a panic, in a handler.
+        return Err(SqueezefsError::InvalidOperation(
+            "S9: pack group resolved no owner for a non-empty tenant set".into(),
+        ));
+    };
+    let inos: Vec<Ino> = items.iter().map(|it| it.ino).collect();
+    intent_barrier_inos(&inos).await?;
+    let epoch = current_lease_epoch();
+    let calls: Vec<PublishCall> = items
+        .into_iter()
+        .map(|it| PublishCall::SetLayoutAndSize {
+            ino: it.ino,
+            layout: it.layout,
+            size: it.size,
+            refs: wire_refs(&it.refs),
+            lease_epoch: epoch,
+            request_id: crate::cowriter::next_ship_request_id(),
+        })
+        .collect();
+    let outcomes = ship_group_witnessed(&peer, calls).await?;
+    Ok(outcomes
+        .into_iter()
+        .map(|o| match o {
+            Ok(PublishReply::PutDone { recomputed, freed }) => {
+                Ok(OwnerVerdict { recomputed, freed })
+            }
+            Ok(other) => Err(protocol_error(
+                "set_layout_and_size (pack group)",
+                &format!("{other:?}"),
+                "a Put acknowledgement",
+            )),
+            Err(e) => Err(e),
+        })
+        .collect())
 }
 
 /// Routed [`RoutedMetaBackend::merge_layout_and_size`]. Returns
@@ -3354,6 +3799,44 @@ pub fn uninstall_binding_witness() {
     BINDING_WITNESS.store(None);
 }
 
+/// **The served-publish SCREEN's probe** (design-small-file-packing §5.6
+/// (2), PK4): `(vol_tag, block_idx) → true` iff this authority holds the
+/// block on its free list, in the freed-offset grace ring or in S7
+/// quarantine — the probes `execute_shipped_frees` already composes. A
+/// served layout publish whose frame TAKES such a block is refused
+/// [`PUBLISH_FREE_BLOCK_REFUSED`] before anything is staged: the authority
+/// has released that lifetime, and adopting it would make a co-writer's
+/// tenant a second owner of an offset the next mint hands out. Installed by
+/// the multi-writer AUTHORITY arm beside the binding witness; absent = no
+/// data plane wired (nothing to screen against).
+pub type ReleasedBlockProbe = Arc<dyn Fn(u64, u64) -> bool + Send + Sync>;
+
+static RELEASED_BLOCK_PROBE: Lazy<arc_swap::ArcSwapOption<ReleasedBlockProbe>> =
+    Lazy::new(arc_swap::ArcSwapOption::empty);
+
+/// Install the process's released-block probe (the authority arm's act).
+pub fn install_released_block_probe(probe: ReleasedBlockProbe) {
+    RELEASED_BLOCK_PROBE.store(Some(Arc::new(probe)));
+}
+
+/// Uninstall it (disarm / unmount / test teardown).
+pub fn uninstall_released_block_probe() {
+    RELEASED_BLOCK_PROBE.store(None);
+}
+
+/// The first TAKEN data reference of `refs` this authority has released
+/// (`Some(block_idx)`), through the installed probe; `None` with no probe
+/// or a clean frame.
+fn released_block_taken(refs: &[WireBlockRefOp]) -> Option<u64> {
+    let probe = RELEASED_BLOCK_PROBE.load_full()?;
+    refs.iter()
+        .filter(|r| {
+            r.take && r.block_index != crate::meta_backend::kv::block_refs::BLOCK_INDEX_MAP_BLOB
+        })
+        .find(|r| (*probe)(r.vol_tag, r.block_idx))
+        .map(|r| r.block_idx)
+}
+
 /// The DATA references a refs frame TAKES (map-blob custody excluded — a
 /// blob is this authority's own lifecycle, never a peer's DMA).
 fn taken_data_refs(refs: &[BlockRefOp]) -> Vec<BlockRef> {
@@ -3940,6 +4423,15 @@ impl Drop for WitnessLease {
     }
 }
 
+/// What [`PublishService::run_layout_group`] answers: one outcome per
+/// member (input order), whether a group was committed, and — PK4 — whether
+/// a `single_volume` group was refused SPLIT (nothing applied).
+struct LayoutGroupRun {
+    outcomes: Vec<std::result::Result<PublishReply, WireError>>,
+    committed: bool,
+    split: bool,
+}
+
 /// One claimed member of a round's layout group: its frame slot, the
 /// call, and the witness it owns.
 struct GroupMember {
@@ -4133,6 +4625,11 @@ impl PublishService {
         SERVED_FRAMES.fetch_add(1, Ordering::Relaxed);
         SERVED_FRAME_CALLS.fetch_add(n as u64, Ordering::Relaxed);
         let client: Arc<str> = Arc::from(frame.client.as_str());
+        if frame.pack_group {
+            return self
+                .serve_pack_group_frame(req.id, &client, frame.calls)
+                .await;
+        }
         let named: Vec<Vec<u64>> = frame.calls.iter().map(PublishCall::named_inos).collect();
         let chains = super::service::chains_by_named_inos(&named);
         let chain_count = chains.iter().copied().max().map_or(0, |m| m + 1);
@@ -4235,6 +4732,127 @@ impl PublishService {
         }
     }
 
+    /// Serve a `pack_group` frame (design-small-file-packing §5.6, PK4): a
+    /// co-writer pack's tenant publishes, to be served as ONE conveyor
+    /// group on ONE home meta volume — or refused WHOLE, nothing applied:
+    ///
+    /// * [`PUBLISH_PACK_GROUP_UNAVAILABLE`] — this owner's D-1c lever is
+    ///   `0`: serving per chain would silently reopen the window the flag
+    ///   exists to close, and overriding the lever for flagged frames would
+    ///   perturb the owner's A/B row;
+    /// * [`PUBLISH_MALFORMED`] — a call that is not a witnessed
+    ///   `SetLayoutAndSize`, or two calls naming one ino;
+    /// * [`PUBLISH_PACK_GROUP_SPLIT`] — the post-slot-gate route
+    ///   re-derivation ([`RoutedMetaBackend::set_layout_and_size_pack_group`])
+    ///   found the tenants on more than one home volume (an online
+    ///   `migrate-meta-slot` cutover between partition and serve).
+    ///
+    /// Otherwise the calls run the D-1c group path exactly as a round's
+    /// layout calls do (screen, witness claim, one dispatch, one
+    /// `lock_many`, one `commit_tx_group`), with the single-volume
+    /// precondition enforced INSIDE the gate.
+    async fn serve_pack_group_frame(
+        &self,
+        id: u64,
+        client: &Arc<str>,
+        calls: Vec<PublishCall>,
+    ) -> RpcResponse {
+        crate::fuse_client::METRICS
+            .served_pack_group_frames
+            .fetch_add(1, Ordering::Relaxed);
+        if !conveyor_group_enabled() {
+            crate::fuse_client::METRICS
+                .served_pack_group_unavailable
+                .fetch_add(1, Ordering::Relaxed);
+            return Self::refuse_frame(
+                id,
+                PUBLISH_PACK_GROUP_UNAVAILABLE,
+                format!(
+                    "a {}-call pack_group frame from {client} reached an owner whose \
+                     {CONVEYOR_GROUP_ENV} lever is 0 — a pack group is served as ONE conveyor \
+                     group or not at all (design-small-file-packing §5.6); the co-writer \
+                     promotes those tenants one-block-per-file",
+                    calls.len()
+                ),
+            );
+        }
+        let mut seen = std::collections::HashSet::with_capacity(calls.len());
+        for call in &calls {
+            let ok = matches!(call, PublishCall::SetLayoutAndSize { .. })
+                && call.witness().is_some()
+                && call
+                    .named_inos()
+                    .first()
+                    .is_some_and(|ino| seen.insert(*ino));
+            if !ok {
+                return Self::refuse_frame(
+                    id,
+                    PUBLISH_MALFORMED,
+                    format!(
+                        "a pack_group frame carries witnessed SetLayoutAndSize calls on distinct \
+                         inos only; got {}",
+                        call.name()
+                    ),
+                );
+            }
+        }
+        // The cutover-injection seam (contract 8): a hook may flip this
+        // owner's slot map now — between the co-writer's partition and the
+        // route re-derivation below — and undo it once the frame is judged.
+        let undo = TEST_PACK_GROUP_SERVE_HOOK.load_full().and_then(|h| (*h)());
+        let inline = super::inline_serve_enabled();
+        let indexed: Vec<(usize, PublishCall)> = calls.into_iter().enumerate().collect();
+        let n = indexed.len();
+        let (mut out, committed, split) = self
+            .serve_layout_group_with(client, indexed, inline, true)
+            .await;
+        if let Some(undo) = undo {
+            undo();
+        }
+        if split {
+            crate::fuse_client::METRICS
+                .served_pack_group_splits
+                .fetch_add(1, Ordering::Relaxed);
+            return Self::refuse_frame(
+                id,
+                PUBLISH_PACK_GROUP_SPLIT,
+                format!(
+                    "a {n}-call pack_group frame from {client} names tenants on more than one \
+                     home meta volume after this owner's route re-derivation (an online \
+                     migrate-meta-slot cutover landed between the co-writer's partition and \
+                     this serve) — refused whole, nothing applied; the co-writer abandons the \
+                     pack and re-prepares every tenant"
+                ),
+            );
+        }
+        if committed {
+            FRAME_GROUPS.fetch_add(1, Ordering::Relaxed);
+        }
+        out.sort_unstable_by_key(|(idx, _)| *idx);
+        let outcomes: Vec<PublishCallOutcome> = out.into_iter().map(|(_, o)| o).collect();
+        if outcomes.len() != n {
+            return Self::refuse_frame(
+                id,
+                PUBLISH_MALFORMED,
+                "S9 publish owner: a pack group's outcomes do not cover its calls (unreachable)"
+                    .into(),
+            );
+        }
+        let reply = PublishReplyFrame {
+            schema: PUBLISH_SCHEMA,
+            outcomes,
+            lane_frees: take_lane_frees(client),
+        };
+        match encode_reply_frame(&reply) {
+            Ok(body) => RpcResponse {
+                id,
+                status: PUBLISH_OK,
+                body,
+            },
+            Err(e) => Self::refuse_frame(id, PUBLISH_MALFORMED, format!("reply encode: {e}")),
+        }
+    }
+
     /// The two gates every call passes first, in their landed order: the
     /// not-owner screen, then the ERA gate. `Some` = the call's refusal
     /// (nothing applied). Shared by [`Self::serve_call`] and the D-1c
@@ -4273,6 +4891,30 @@ impl PublishService {
                     STALE_REFUSALS.fetch_add(1, Ordering::Relaxed);
                 }
                 return Some(Self::refuse(PUBLISH_STALE_LEASE, reason));
+            }
+        }
+        // PK4 — the served-publish SCREEN (design-small-file-packing §5.6
+        // (2), the belt under the per-volume group law): a layout publish
+        // whose frame ADOPTS a block this authority has RELEASED (free
+        // list / grace ring / quarantine) refuses before anything is
+        // staged — never re-claims (a re-claim would race a concurrent
+        // mint of the same offset). Must stay 0.
+        if let PublishCall::SetLayoutAndSize { ino, refs, .. }
+        | PublishCall::MergeLayoutAndSize { ino, refs, .. } = call
+        {
+            if let Some(block_idx) = released_block_taken(refs) {
+                crate::fuse_client::METRICS
+                    .served_publish_free_block_refusals
+                    .fetch_add(1, Ordering::Relaxed);
+                return Some(Self::refuse(
+                    PUBLISH_FREE_BLOCK_REFUSED,
+                    format!(
+                        "a layout publish for ino {ino} from {client} adopts data block \
+                         {block_idx}, which this authority holds RELEASED (free list / grace \
+                         ring / quarantine) — refused, never re-claimed \
+                         (served_publish_free_block_refusals)"
+                    ),
+                ));
             }
         }
         None
@@ -4506,9 +5148,27 @@ impl PublishService {
         calls: Vec<(usize, PublishCall)>,
         inline: bool,
     ) -> (Vec<(usize, PublishCallOutcome)>, bool) {
+        let (out, committed, _split) = self
+            .serve_layout_group_with(client, calls, inline, false)
+            .await;
+        (out, committed)
+    }
+
+    /// [`Self::serve_layout_group`] with the PACK-GROUP law (PK4):
+    /// `single_volume` makes the group commit refuse — nothing applied —
+    /// when the members' post-gate routes span more than one home meta
+    /// volume; the third element reports that verdict (`false` on the
+    /// round path, where a frame legitimately spans volumes).
+    async fn serve_layout_group_with(
+        &self,
+        client: &Arc<str>,
+        calls: Vec<(usize, PublishCall)>,
+        inline: bool,
+        single_volume: bool,
+    ) -> (Vec<(usize, PublishCallOutcome)>, bool, bool) {
         let mut out = Vec::with_capacity(calls.len());
         if calls.is_empty() {
-            return (out, false);
+            return (out, false, false);
         }
         let mut members: Vec<GroupMember> = Vec::with_capacity(calls.len());
         let mut serial: Vec<(usize, PublishCall)> = Vec::new();
@@ -4539,13 +5199,13 @@ impl PublishService {
             let client = Arc::clone(client);
             async move { (idx, self.serve_call(&client, call, inline).await) }
         }));
-        let (serial_out, (group_out, committed)) = futures::join!(
+        let (serial_out, (group_out, committed, split)) = futures::join!(
             serial_fut,
-            self.execute_layout_group(client, members, inline)
+            self.execute_layout_group(client, members, inline, single_volume)
         );
         out.extend(serial_out);
         out.extend(group_out);
-        (out, committed)
+        (out, committed, split)
     }
 
     /// Execute the claimed members of a round as one group: ONE dispatch
@@ -4561,9 +5221,10 @@ impl PublishService {
         client: &Arc<str>,
         members: Vec<GroupMember>,
         inline: bool,
-    ) -> (Vec<(usize, PublishCallOutcome)>, bool) {
+        single_volume: bool,
+    ) -> (Vec<(usize, PublishCallOutcome)>, bool, bool) {
         if members.is_empty() {
-            return (Vec::new(), false);
+            return (Vec::new(), false, false);
         }
         let mut out = Vec::with_capacity(members.len());
         let Some(me) = self.owned() else {
@@ -4578,7 +5239,7 @@ impl PublishService {
                     ),
                 ));
             }
-            return (out, false);
+            return (out, false, false);
         };
         let mut idxs = Vec::with_capacity(members.len());
         let mut leases = Vec::with_capacity(members.len());
@@ -4590,17 +5251,21 @@ impl PublishService {
         }
         let client = client.to_string();
         let (joined, _) = super::owner_dispatch("meta_ship_publish_group", inline, async move {
-            me.run_layout_group(&client, work).await
+            me.run_layout_group(&client, work, single_volume).await
         })
         .await;
         match joined {
-            Ok((outcomes, committed)) => {
+            Ok(LayoutGroupRun {
+                outcomes,
+                committed,
+                split,
+            }) => {
                 for ((idx, lease), outcome) in idxs.into_iter().zip(leases).zip(outcomes) {
                     lease.complete(outcome.clone());
                     SERVED.fetch_add(1, Ordering::Relaxed);
                     out.push((idx, PublishCallOutcome::Done(outcome)));
                 }
-                (out, committed)
+                (out, committed, split)
             }
             Err(e) => {
                 // RES-7/RES-8: the unwind is recorded — and CACHED per
@@ -4616,7 +5281,7 @@ impl PublishService {
                     SERVED.fetch_add(1, Ordering::Relaxed);
                     out.push((idx, PublishCallOutcome::Done(failure.clone())));
                 }
-                (out, false)
+                (out, false, false)
             }
         }
     }
@@ -4637,16 +5302,47 @@ impl PublishService {
     /// other multi-acquirer (`lock_many`) and every single-stripe holder.
     /// Returns one outcome per member (input order) and whether a group
     /// was committed.
+    ///
+    /// **PK4 — `single_volume`** (a `pack_group` frame): the members must
+    /// share ONE home meta volume. A cheap pre-check before the prepare
+    /// half spares the work in the common split case; the AUTHORITATIVE
+    /// check runs inside the commit, after the §5.5.2a slot gate
+    /// ([`RoutedMetaBackend::set_layout_and_size_pack_group`] — a park can
+    /// span a flip, so routes taken before the gate are re-derived). A
+    /// split commits NOTHING: every member's outcome is the refusal, the
+    /// prepared posts drop (a fresh blob's guard drops armed and frees it),
+    /// and `split` reports the frame-level verdict.
     async fn run_layout_group(
         &self,
         client: &str,
         work: Vec<PublishCall>,
-    ) -> (Vec<std::result::Result<PublishReply, WireError>>, bool) {
+        single_volume: bool,
+    ) -> LayoutGroupRun {
         let n = work.len();
         let inos: Vec<u64> = work
             .iter()
             .map(|c| c.named_inos().first().copied().unwrap_or(0))
             .collect();
+        let split_run = |why: &str| {
+            let e = WireError::from_error(&SqueezefsError::PublishFailure {
+                class: PublishFailureClass::FrameRefused(PUBLISH_PACK_GROUP_SPLIT),
+                msg: why.to_string(),
+            });
+            LayoutGroupRun {
+                outcomes: (0..n).map(|_| Err(e.clone())).collect(),
+                committed: false,
+                split: true,
+            }
+        };
+        if single_volume {
+            let homes: std::collections::BTreeSet<usize> =
+                inos.iter().map(|&i| self.inner.route_ino(i).0).collect();
+            if homes.len() > 1 {
+                return split_run(
+                    "pack group tenants route to more than one home meta volume (pre-gate)",
+                );
+            }
+        }
         // (stripe, ino): dedup by stripe keeps the FIRST member as the
         // stripe's census identity — an in-group collision is one acquire,
         // never a self-collision.
@@ -4697,7 +5393,20 @@ impl PublishService {
         }
         let committed = !items.is_empty();
         if committed {
-            let results = self.inner.set_layout_and_size_group(items).await;
+            let results = if single_volume {
+                match self.inner.set_layout_and_size_pack_group(items).await {
+                    crate::meta_backend::LayoutGroupCommit::Committed(results) => results,
+                    crate::meta_backend::LayoutGroupCommit::Split { volumes } => {
+                        drop(stripe_guards);
+                        return split_run(&format!(
+                            "pack group tenants route to {volumes} home meta volumes after the \
+                             slot gate"
+                        ));
+                    }
+                }
+            } else {
+                self.inner.set_layout_and_size_group(items).await
+            };
             for ((i, post), committed) in item_slots.into_iter().zip(posts).zip(results) {
                 let out = Self::finish_layout_publish(client, inos[i], committed, post).await;
                 if out.is_ok() {
@@ -4726,7 +5435,11 @@ impl PublishService {
                 })
             })
             .collect();
-        (outcomes, committed)
+        LayoutGroupRun {
+            outcomes,
+            committed,
+            split: false,
+        }
     }
 
     /// Serve one [`PublishCall::FreeBlocks`] through the dedup window: the

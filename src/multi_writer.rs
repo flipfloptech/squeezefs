@@ -493,6 +493,7 @@ impl MultiWriterArm {
         publish::uninstall_free_executor();
         publish::uninstall_harvest_executor();
         publish::uninstall_binding_witness();
+        publish::uninstall_released_block_probe();
         crate::free_grace::uninstall_release_hook();
         crate::free_grace::uninstall_lane_supply_source();
         publish::uninstall_extent_merge_executor();
@@ -944,6 +945,14 @@ pub async fn arm_multi_writer(
                 br.witness_served_bindings(taken);
             }));
         }
+        // The served-publish SCREEN's probe (small-file packing PK4,
+        // design-small-file-packing §5.6 (2)): a peer's layout publish
+        // that would ADOPT a block this authority has RELEASED (free list /
+        // grace ring / quarantine) is refused before anything is staged —
+        // the belt under the co-writer's per-volume group law.
+        publish::install_released_block_probe(crate::cowriter::router_released_block_probe(
+            Arc::clone(backend),
+        ));
         // The lane-push lever's authority half (finding 15 term 2,
         // `.benchmarks/2026-09-06-free-grace-lane-visible.md`): a binding
         // acknowledgement releases the covered offsets on arrival (every
@@ -963,6 +972,7 @@ pub async fn arm_multi_writer(
             publish::uninstall_free_executor();
             publish::uninstall_harvest_executor();
             publish::uninstall_binding_witness();
+            publish::uninstall_released_block_probe();
             crate::free_grace::uninstall_release_hook();
             crate::free_grace::uninstall_lane_supply_source();
             if let Some(hold) = wero {

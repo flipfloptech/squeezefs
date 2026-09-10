@@ -1800,10 +1800,12 @@ async fn a_peer_speaking_the_previous_publish_schema_is_refused_at_the_first_fra
     std::env::remove_var("SQUEEZEFS_DEFAULT_BLOCK_SIZE");
     assert_eq!(
         publish::PUBLISH_SCHEMA,
-        16,
-        "the freed set joined the recompute replies at the schema-15 bump and the reply \
-         frame's lane-free notices at 16 (KD-7: a mixed-commit fleet must fail loud, not \
-         read an absent field as empty); the next vocabulary change re-pins this"
+        17,
+        "the freed set joined the recompute replies at the schema-15 bump, the reply \
+         frame's lane-free notices at 16, and the request frame's `pack_group` flag at 17 \
+         (small-file packing PK4 — KD-7: a mixed-commit fleet must fail loud, not read an \
+         absent field as empty / serve a pack group per chain); the next vocabulary change \
+         re-pins this"
     );
     let dir = TempDir::new().unwrap();
     let vol = fresh_volume(dir.path(), "schema-peer").await;
@@ -1815,6 +1817,7 @@ async fn a_peer_speaking_the_previous_publish_schema_is_refused_at_the_first_fra
         schema: previous,
         client: NODE_A.to_string(),
         calls: vec![publish::PublishCall::XattrValueCap { ino: 1 }],
+        pack_group: false,
     })
     .expect("a previous-schema frame encodes");
     let mut rpc = cw::RpcClient::connect(&auth.endpoint, SECRET, NODE_A, None)

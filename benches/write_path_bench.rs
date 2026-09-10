@@ -2117,6 +2117,7 @@ fn bench_alloc_lane_grant(c: &mut Criterion) {
         schema: squeezefs::meta_ship::publish::PUBLISH_SCHEMA,
         client: "node_00000000deadbeef".to_string(),
         calls: vec![call.clone()],
+        pack_group: false,
     };
     group.bench_function("raise_frame_named_inos", |b| {
         b.iter(|| black_box(call.named_inos()))
@@ -2214,6 +2215,7 @@ fn bench_cowriter_free(c: &mut Criterion) {
             lease_epoch: 42,
             request_id: 7,
         }],
+        pack_group: false,
     };
     let one = frame_of(vec![1_650]);
     let batch = frame_of((0..64u64).map(|i| 1_650 + i * 4).collect());

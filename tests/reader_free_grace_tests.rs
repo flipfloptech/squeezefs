@@ -5380,6 +5380,7 @@ fn the_member_adopts_the_advertised_ceiling_with_its_label() {
         lane_supply_blocks: 0,
         checkpoint_ceiling_ms: ceiling,
         lane_supply_volumes: Vec::new(),
+        pack_group_available: false,
     };
     let (clock, ticks) = manual_clock();
     let session = MemberSession::adopt(

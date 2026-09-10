@@ -5,6 +5,26 @@ use thiserror::Error;
 #[error("Mock Metadata Error")]
 pub struct MockRedisError;
 
+/// Why a shipped publish did not land ([`SqueezefsError::PublishFailure`]).
+/// Exactly one class is outcome-UNKNOWN; every other class means the
+/// owner applied NOTHING (or said exactly what it did).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PublishFailureClass {
+    /// The transport failed past the resend ladder against an owner that
+    /// MAY have applied the frame — the true sent-then-lost ambiguity.
+    TransportOutcomeUnknown,
+    /// The owner refused the whole FRAME with this wire status (schema,
+    /// malformed, the pack-group refusals): nothing was applied.
+    FrameRefused(u16),
+    /// The owner refused THIS call with this `PUBLISH_*` status before
+    /// executing it: nothing was applied.
+    CallRefused(u16),
+    /// A protocol violation (an unencodable frame, an undecodable reply, a
+    /// schema or outcome-count mismatch): unreachable on a KD-7 same-commit
+    /// fleet, classed KNOWN by design-small-file-packing §5.3.
+    Protocol,
+}
+
 #[derive(Error, Debug)]
 pub enum SqueezefsError {
     #[error("I/O error: {0}")]
@@ -69,6 +89,18 @@ pub enum SqueezefsError {
     /// never a retry (`membership::member_renewal_tick`).
     #[error("membership lease is not custody: {0}")]
     MembershipLeaseNotCustody(String),
+
+    /// A shipped publish (DLM S9's layout-publish lane) did not land, with
+    /// its outcome CLASS carried structurally (design-small-file-packing
+    /// §5.3 — the lane's first typed failure class): a co-writer's pack
+    /// release keys `Known`/`Unknown` on it, and the pack-group refusal
+    /// latch keys on the wire STATUS — never on the message, which stays
+    /// prose for logs.
+    #[error("publish failed ({class:?}): {msg}")]
+    PublishFailure {
+        class: PublishFailureClass,
+        msg: String,
+    },
 
     #[error("GPU Direct Storage error: {0}")]
     GdsError(String),
@@ -149,6 +181,12 @@ impl SqueezefsError {
             // A fail-stopped lease reaching a data path is the same class
             // as a fenced writer guard: the I/O must not proceed.
             SqueezefsError::MembershipLeaseNotCustody(_) => libc::EIO,
+            // A publish the authority did not land is "the filesystem
+            // could not do it" — the class is for the lane's own arms,
+            // never a userspace contract (before it was typed this face
+            // read EINVAL through `InvalidOperation`, a refusal shape no
+            // application could act on).
+            SqueezefsError::PublishFailure { .. } => libc::EIO,
             SqueezefsError::GdsError(_) => libc::EIO,
             SqueezefsError::CacheOverflow => libc::ENOMEM,
             SqueezefsError::Timeout => libc::ETIMEDOUT,

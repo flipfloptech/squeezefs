@@ -777,74 +777,63 @@ async fn test_active_block_snapshots_stable_under_concurrent_writers(
 // inline→striped and staged→striped growth stays byte-exact.
 // ---------------------------------------------------------------------------
 
-/// RED until PR 6 lands — the slice-reuse contract itself: when a striped
-/// write through `DataRouter::write_file` fully covers a block
-/// (`rel_start == 0 && rel_end == block_size`), the per-block task must use
-/// the payload slice directly as the block bytes instead of copying it into
-/// a `PooledBuf` (routing copy, audit #12). Observable without new API: the
-/// plaintext block the task caches in the read LRU under the new block key
-/// is then a zero-copy slice of the caller's payload allocation — pointer
-/// containment proves the copy is gone. Lease-safe by construction: the
-/// §5.4 severance boundary guarantees no transport lease ever reaches
-/// `DataRouter::write_file`, so retaining the slice retains a private copy.
+/// The router owns NO striped write route (2026-09-10, the
+/// overlay-vs-growth data loss — `routing::WriteFileOutcome`): a
+/// `DataRouter::write_file` on a striped layout — the stale-cache striped
+/// dispatch, the one product shape that reached the retired guard-less
+/// `write_striped` RMW — answers `LayoutStriped` and mutates NOTHING: the
+/// map keeps its bindings, no block is minted, the content is unchanged,
+/// and the caller re-dispatches through the block-guarded striped path.
+/// (The PR 6 slice-reuse pin that lived here pinned that RMW's per-block
+/// task; it retired with the path.)
 #[tokio::test]
-async fn test_striped_full_coverage_write_reuses_payload_slice() {
+async fn test_router_write_on_striped_layout_redirects_without_mutating() {
     let h = make().await;
     let block = 65536usize;
-    let ino = create(&h, "slice_reuse").await;
+    let ino = create(&h, "striped_redirect").await;
     let path = format!("inode_{ino}");
 
     // Stripe the file (4 blocks: 3 full + tail) through the FUSE handler.
-    write_at(&h, ino, 0, &pattern(200_000)).await;
-    let meta = h.fs.router.fetch_metadata(&path).await.expect("meta");
-    assert_eq!(meta.file_type, "striped", "seed file must be striped");
+    let expected = pattern(200_000);
+    write_at(&h, ino, 0, &expected).await;
+    let before = h.fs.router.fetch_metadata(&path).await.expect("meta");
+    assert_eq!(before.file_type, "striped", "seed file must be striped");
+    let map_before = before
+        .block_map
+        .as_ref()
+        .expect("striped block map")
+        .clone();
+    let used_before = h.fs.router.backend_router.allocated_bytes();
 
-    // One payload covering blocks 0 and 1 completely, written through the
-    // router route the design keeps live (promotions / copy_file_range /
-    // stale-cache striped dispatch).
     let payload_vec: Vec<u8> = (0..2 * block).map(|i| ((i % 239) as u8) ^ 0x5A).collect();
-    let payload = bytes::Bytes::from(payload_vec);
     let token = h.fs.router.dlm.get_fencing_token_ino(ino);
-    h.fs.router
-        .write_file(&path, 0, payload.clone(), token)
-        .await
-        .expect("router striped write");
+    let outcome =
+        h.fs.router
+            .write_file(&path, 0, bytes::Bytes::from(payload_vec), token)
+            .await
+            .expect("router write on a striped layout");
+    assert_eq!(
+        outcome,
+        squeezefs::routing::WriteFileOutcome::LayoutStriped,
+        "a striped layout is the striped write path's — the router hands it back"
+    );
 
-    let payload_base = payload.as_ptr() as usize;
-    let payload_range = payload_base..payload_base + payload.len();
-
-    let meta = h.fs.router.fetch_metadata(&path).await.expect("meta");
-    let block_map = meta.block_map.as_ref().expect("striped block map");
-    for b in [0u32, 1u32] {
-        let key = block_map
-            .get(&b)
-            .unwrap_or_else(|| panic!("block {b} missing from block map"));
-        let cached =
-            h.fs.router
-                .cache
-                .read_lru
-                .get(key)
-                .unwrap_or_else(|| panic!("block {b} (key {key}) not in read LRU after write"));
-        assert_eq!(
-            &cached[..],
-            &payload[b as usize * block..(b as usize + 1) * block],
-            "block {b}: cached plaintext differs from the payload slice"
-        );
-        let ptr = cached.as_ptr() as usize;
-        assert!(
-            payload_range.contains(&ptr),
-            "block {b}: full-coverage striped write still copies the payload \
-             into a pooled buffer (cached block at {ptr:#x} is outside the \
-             payload allocation {payload_range:?}) — §5.6 slice reuse must \
-             hand data_slice through as block_bytes"
-        );
-    }
-
-    // The reuse must not change what readers observe.
-    let mut expected = pattern(200_000);
-    expected[..2 * block].copy_from_slice(&payload);
-    let got = read_at(&h, ino, 0, 200_000).await;
-    assert_eq!(got, expected, "content mismatch after slice-reuse write");
+    let after = h.fs.router.fetch_metadata(&path).await.expect("meta");
+    assert_eq!(
+        after.block_map.as_deref(),
+        Some(&*map_before),
+        "the router must not have published a block-map merge for a striped layout"
+    );
+    assert_eq!(
+        h.fs.router.backend_router.allocated_bytes(),
+        used_before,
+        "the router must not have minted a block for a striped layout"
+    );
+    assert_eq!(
+        read_at(&h, ino, 0, 200_000).await,
+        expected,
+        "content unchanged: nothing was written on the redirect"
+    );
 }
 
 /// Equivalence pin for the `is_aligned` direct-leg deletion: block-aligned

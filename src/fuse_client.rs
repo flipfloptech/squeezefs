@@ -18658,6 +18658,87 @@ impl SqueezefsFilesystem {
         Ok(())
     }
 
+    /// The WRITE handler's ONE striped dispatch — no inode guard held.
+    /// Shared by the handler's striped arm and by a router route whose
+    /// layout flipped striped under it
+    /// ([`crate::routing::WriteFileOutcome::LayoutStriped`]), so the two
+    /// entries cannot drift.
+    ///
+    /// Rung 17 (KD-MW-8): a write touching a RANGE-SHARED block on an
+    /// armed co-writer ships those blocks' bytes as EXTENTS to the
+    /// AUTHORITY — the block's single publisher — and retains them until
+    /// coverage; unshared slices keep the ordinary striped path. Two
+    /// relaxed loads + an empty-map probe on every shipped mount
+    /// (KD-MW-12), and unreachable on any mount until a demotion marks
+    /// sharing.
+    ///
+    /// The ordinary path is [`Self::write_file_staged`] with FIND-RW5-A
+    /// face 3's one fresh-lease retry — a transient adjacent-bump fence
+    /// (our own lease churn — single-writer mount) retries once with a
+    /// fresh lease instead of surfacing EIO; a second fence is genuine
+    /// and stays loud. `effective_old_size` is the size the postlude
+    /// claims against: the retry re-resolves it (KD-6 — the fence is the
+    /// evidence the world moved; no guard is held here, so the
+    /// fetch-capable resolution is legal).
+    #[allow(clippy::too_many_arguments)]
+    async fn dispatch_striped_write(
+        &self,
+        prof: &OpProf,
+        ino: u64,
+        file_path: &str,
+        offset: u64,
+        payload: crate::routing::WritePayload,
+        wlen: usize,
+        effective_old_size: &mut u64,
+        mut token: u64,
+    ) -> FuseResult<()> {
+        if self.range_write_engaged(ino)
+            && self.write_touches_shared_block(ino, offset, wlen as u64, token)
+        {
+            // §5.4 lease-severance: retention outlives this handler
+            // invocation, so the payload materializes and severs before
+            // anything is retained/shipped.
+            let slot_bytes = payload.materialize().await.map_err(|e| {
+                error!("FUSE Write: slot payload materialize failed: {e}");
+                Errno::from(libc::EIO)
+            })?;
+            let data_bytes = sever_payload(&slot_bytes);
+            prof.stamp_station(op_station::MATERIALIZE);
+            return self
+                .write_shared_striped(ino, offset, data_bytes, *effective_old_size, token)
+                .await
+                .map_err(map_squeezefs_err);
+        }
+        let mut attempt = 0u32;
+        loop {
+            match self
+                .write_file_staged(ino, offset, payload.clone(), *effective_old_size, token)
+                .await
+            {
+                Ok(()) => return Ok(()),
+                Err(e @ SqueezefsError::FencingTokenExpired { .. }) => {
+                    self.invalidate_local_lease(ino);
+                    if attempt >= 1 {
+                        return Err(map_squeezefs_err(e));
+                    }
+                    attempt += 1;
+                    // S11 rung 15: the re-acquire stays span-aware — a
+                    // whole-file re-acquire on a range-custody co-writer
+                    // would conflict with a PEER's live ranges and turn a
+                    // transient fence into EIO.
+                    token = self
+                        .acquire_write_lease_for_span(ino, offset, wlen as u64)
+                        .await
+                        .map_err(map_squeezefs_err)?;
+                    if let Ok(m) = self.router.fetch_metadata(file_path).await {
+                        *effective_old_size = m.size;
+                    }
+                }
+                Err(e) => return Err(map_squeezefs_err(e)),
+            }
+        }
+    }
+
     pub async fn write_file_staged(
         &self,
         ino: u64,
@@ -19971,9 +20052,18 @@ impl SqueezefsFilesystem {
             // router write path. It reads the authoritative base (staging for
             // staged, data_key for inline) and rewrites the range as zeros.
             let zeros = bytes::Bytes::from(vec![0u8; (end - offset) as usize]);
-            self.router
-                .write_file(&file_path, offset, zeros, fencing_token)
-                .await?;
+            if self
+                .router
+                .write_file(&file_path, offset, zeros.clone(), fencing_token)
+                .await?
+                == crate::routing::WriteFileOutcome::LayoutStriped
+            {
+                // A pressure promotion flipped the layout under the held
+                // inode guard: the zeros ride the striped write path (the
+                // partial-edge arm above, over the whole range).
+                self.write_file_staged(ino, offset, zeros, size_floor, fencing_token)
+                    .await?;
+            }
         }
         Ok(())
     }
@@ -25563,6 +25653,13 @@ impl Filesystem for SqueezefsFilesystem {
             let mut effective_old_size = old_size;
 
             prof.stamp_station(op_station::ROUTE);
+            // Whether the bytes landed through the STRIPED write path — the
+            // striped arm below, or a router route whose layout flipped
+            // striped under it and was re-dispatched. That path defers its
+            // durable size persist to the flush cadence, so the postlude's
+            // RAM size floor is its only size publish; the router's own
+            // commits carry theirs.
+            let mut landed_striped = !use_router_write;
             if use_router_write {
                 // §5.4 lease-severance boundary — the single sever route:
                 // the router's inline/staged commits retain the payload
@@ -25614,13 +25711,13 @@ impl Filesystem for SqueezefsFilesystem {
                 }
                 let mut token = fencing_token;
                 let mut attempt = 0u32;
-                loop {
+                let outcome = loop {
                     match self
                         .router
                         .write_file(file_path, offset, data_bytes.clone(), token)
                         .await
                     {
-                        Ok(()) => break,
+                        Ok(outcome) => break outcome,
                         Err(e @ SqueezefsError::FencingTokenExpired { .. }) => {
                             self.invalidate_local_lease(ino);
                             if attempt >= 1 {
@@ -25645,8 +25742,32 @@ impl Filesystem for SqueezefsFilesystem {
                         }
                         Err(e) => return Err(map_squeezefs_err(e)),
                     }
-                }
+                };
                 drop(held_guard);
+                if outcome == crate::routing::WriteFileOutcome::LayoutStriped {
+                    // The layout flipped striped between this handler's
+                    // classification and the router's fetch (a sibling
+                    // segment's promotion): the router wrote nothing, and
+                    // the payload rides the one striped write path — under
+                    // `BLOCK_FLUSH_LOCKS`, where an open device-overlay
+                    // record on the block is joined or settled before any
+                    // seed, and the coverage union accumulates the rest.
+                    // (The retired router-side striped RMW ran guard-less
+                    // here and its whole-block `Merge` displaced the
+                    // overlay's acked bytes — the 2026-09-10 data loss.)
+                    landed_striped = true;
+                    self.dispatch_striped_write(
+                        &prof,
+                        ino,
+                        file_path,
+                        offset,
+                        crate::routing::WritePayload::Bytes(data_bytes),
+                        wlen,
+                        &mut effective_old_size,
+                        token,
+                    )
+                    .await?;
+                }
             } else {
                 // `use_router_write` is unconditionally true for
                 // `file_type == "inline" || "staged"` (the condition names
@@ -25667,82 +25788,17 @@ impl Filesystem for SqueezefsFilesystem {
                 // BLOCK_FLUSH_LOCKS serialize the data path.
                 drop(guard);
                 write_phase_record(WritePhase::RouteClassify, wp_route);
-                // Rung 17 (KD-MW-8): a write touching a RANGE-SHARED
-                // block on an armed co-writer ships those blocks' bytes
-                // as EXTENTS to the AUTHORITY — the block's single
-                // publisher — and retains them until coverage; unshared
-                // slices keep the ordinary striped path. Two relaxed
-                // loads + an empty-map probe on every shipped mount
-                // (KD-MW-12), and unreachable on any mount until a
-                // demotion marks sharing.
-                if self.range_write_engaged(ino)
-                    && self.write_touches_shared_block(ino, offset, wlen as u64, fencing_token)
-                {
-                    // §5.4 lease-severance: retention outlives this
-                    // handler invocation, so the payload materializes and
-                    // severs before anything is retained/shipped.
-                    let slot_bytes = payload.materialize().await.map_err(|e| {
-                        error!("FUSE Write: slot payload materialize failed: {e}");
-                        Errno::from(libc::EIO)
-                    })?;
-                    let data_bytes = sever_payload(&slot_bytes);
-                    prof.stamp_station(op_station::MATERIALIZE);
-                    self.write_shared_striped(
-                        ino,
-                        offset,
-                        data_bytes,
-                        effective_old_size,
-                        fencing_token,
-                    )
-                    .await
-                    .map_err(map_squeezefs_err)?;
-                } else {
-                    // FIND-RW5-A face 3: a transient adjacent-bump fence
-                    // (our own lease churn — single-writer mount) retries
-                    // once with a fresh lease instead of surfacing EIO; a
-                    // second fence is genuine and stays loud.
-                    let mut token = fencing_token;
-                    let mut attempt = 0u32;
-                    loop {
-                        match self
-                            .write_file_staged(
-                                ino,
-                                offset,
-                                payload.clone(),
-                                effective_old_size,
-                                token,
-                            )
-                            .await
-                        {
-                            Ok(()) => break,
-                            Err(e @ SqueezefsError::FencingTokenExpired { .. }) => {
-                                self.invalidate_local_lease(ino);
-                                if attempt >= 1 {
-                                    return Err(map_squeezefs_err(e));
-                                }
-                                attempt += 1;
-                                // S11 rung 15: the re-acquire stays
-                                // span-aware — a whole-file re-acquire on
-                                // a range-custody co-writer would conflict
-                                // with a PEER's live ranges and turn a
-                                // transient fence into EIO.
-                                token = self
-                                    .acquire_write_lease_for_span(ino, offset, wlen as u64)
-                                    .await
-                                    .map_err(map_squeezefs_err)?;
-                                // KD-6: the retry re-runs the protocol
-                                // against the CURRENT world, never the
-                                // entry-time snapshot (no guard is held
-                                // here — the fetch-capable resolution is
-                                // legal).
-                                if let Ok(m) = self.router.fetch_metadata(file_path).await {
-                                    effective_old_size = m.size;
-                                }
-                            }
-                            Err(e) => return Err(map_squeezefs_err(e)),
-                        }
-                    }
-                }
+                self.dispatch_striped_write(
+                    &prof,
+                    ino,
+                    file_path,
+                    offset,
+                    payload,
+                    wlen,
+                    &mut effective_old_size,
+                    fencing_token,
+                )
+                .await?;
             }
 
             prof.mark_backend_done();
@@ -25769,7 +25825,7 @@ impl Filesystem for SqueezefsFilesystem {
             // (KD-6): a fenced retry re-derived `effective_old_size`, so
             // a claim the current world does not justify never publishes.
             let publish_expected = std::cmp::max(effective_old_size, write_end);
-            if !use_router_write && publish_expected > effective_old_size {
+            if landed_striped && publish_expected > effective_old_size {
                 self.router
                     .update_metadata_cache_size(file_path, publish_expected)
                     .await;
@@ -27198,7 +27254,19 @@ impl Filesystem for SqueezefsFilesystem {
                 // like the WRITE handler's attr fallback.
                 dest_size > self.router.block_size.load(Ordering::Relaxed)
             });
-        if dest_is_striped {
+        let landed_striped = if dest_is_striped {
+            true
+        } else {
+            // A `LayoutStriped` verdict means the layout flipped between
+            // the classification above and the router's fetch (a sibling
+            // write's promotion): nothing landed, the striped path owns it.
+            self.router
+                .write_file(&dest_path, off_out, chunk.clone(), target_fencing_token)
+                .await
+                .map_err(map_squeezefs_err)?
+                == crate::routing::WriteFileOutcome::LayoutStriped
+        };
+        if landed_striped {
             self.write_file_staged(inode_out, off_out, chunk, dest_size, target_fencing_token)
                 .await
                 .map_err(map_squeezefs_err)?;
@@ -27210,11 +27278,6 @@ impl Filesystem for SqueezefsFilesystem {
                     .update_metadata_cache_size(&dest_path, new_dest_size)
                     .await;
             }
-        } else {
-            self.router
-                .write_file(&dest_path, off_out, chunk, target_fencing_token)
-                .await
-                .map_err(map_squeezefs_err)?;
         }
 
         // POSIX-10: the destination was MODIFIED, so it owes mtime and

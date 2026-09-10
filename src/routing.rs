@@ -1276,6 +1276,29 @@ pub fn set_publish_commit_group_override(v: Option<usize>) {
     );
 }
 
+/// [`DataRouter::write_file`]'s verdict. The router owns the inline and
+/// staged layouts and their promotions; a STRIPED layout belongs to the
+/// block-guarded striped write path (`write_file_staged`), and the router
+/// hands it back rather than running its own RMW: the retired
+/// `write_striped` seeded from a start-of-call binding and published a
+/// whole-block `Merge` holding no `BLOCK_FLUSH_LOCKS` — a second,
+/// unserialized RMW authority over blocks the guarded path (overlay
+/// records, `ActiveBlockBuf` accumulation, the flush) mutates under the
+/// guard. A stale handler-time classification reached it whenever a
+/// sibling segment's promotion flipped the layout under the write (the
+/// 2026-09-10 `overlay_foreign_merge` data loss), and its `Merge` then
+/// displaced the open overlay's acked bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WriteFileOutcome {
+    /// The write landed (inline / staged / spill / the staged→striped
+    /// promotion).
+    Written,
+    /// The layout is striped — at entry, or flipped while this write
+    /// waited on the block-0 guard. NOTHING was written or published; the
+    /// caller dispatches the same payload through the striped write path.
+    LayoutStriped,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LayoutFlip {
     /// Flush-path merges (`flush_single_active_block`, `flush_due_…`,
@@ -1283,13 +1306,6 @@ pub enum LayoutFlip {
     /// `file_type = "striped"` but PRESERVE `file_id` / `data_key` —
     /// today's exact field writes. Behavior-preserving by construction.
     ToStripedKeepStagedIdentity,
-    /// Layout transitions (routing striped merge): `file_type = "striped"`
-    /// AND clear `file_id` / `data_key`. Staged-identity release
-    /// bookkeeping (`release_superseded_staged` — ring-entry/budget
-    /// release) stays with the CALLER: the primitive never releases staged
-    /// identity itself, so a clear is never paired with zero or two
-    /// releases.
-    ToStripedClearStagedIdentity,
     /// Truncate / fallocate / defrag mutations: leave `file_type`,
     /// `file_id`, `data_key` untouched (truncate's inline/staged handling
     /// stays in its caller — the primitive only owns the striped map +
@@ -17236,11 +17252,6 @@ impl DataRouter {
             LayoutFlip::ToStripedKeepStagedIdentity => {
                 current.file_type = "striped".into();
             }
-            LayoutFlip::ToStripedClearStagedIdentity => {
-                current.file_type = "striped".into();
-                current.file_id = None;
-                current.data_key = None;
-            }
             LayoutFlip::KeepLayout => {}
         }
 
@@ -17684,11 +17695,6 @@ impl DataRouter {
             match op.flip {
                 LayoutFlip::ToStripedKeepStagedIdentity => {
                     current.file_type = "striped".into();
-                }
-                LayoutFlip::ToStripedClearStagedIdentity => {
-                    current.file_type = "striped".into();
-                    current.file_id = None;
-                    current.data_key = None;
                 }
                 LayoutFlip::KeepLayout => {}
             }
@@ -18220,17 +18226,23 @@ impl DataRouter {
     /// Write path with phased meta connections (P1-10): Redis/Garnet work uses
     /// short-lived connections; durable NVMe / staging I/O never holds a pooled
     /// meta connection across the await.
+    /// The inline / staged write path and their promotions. A STRIPED
+    /// layout — found at entry or after the block-0 guard wait — is
+    /// answered with [`WriteFileOutcome::LayoutStriped`] and nothing is
+    /// written: every striped mutation runs under `BLOCK_FLUSH_LOCKS` in
+    /// the one striped write path, whose per-block screen settles an open
+    /// device-overlay record before it seeds and merges (see
+    /// [`WriteFileOutcome`]).
     pub async fn write_file(
         &self,
         file_path: &str,
         offset: u64,
         data: bytes::Bytes,
         fencing_token: u64,
-    ) -> Result<()> {
+    ) -> Result<WriteFileOutcome> {
         METRICS.meta_updates.fetch_add(1, Ordering::Relaxed);
 
         let ino = parse_inode_from_path(file_path);
-        let meta_key = crate::keys::metadata_for_path(file_path);
 
         let current_fencing = self.dlm.get_fencing_token_ino(ino);
         if fencing_token < current_fencing
@@ -18246,12 +18258,9 @@ impl DataRouter {
 
         let meta = self.fetch_metadata(file_path).await?;
         if meta.file_type == "striped" {
-            self.write_striped(file_path, &meta_key, offset, data, fencing_token)
-                .await?;
-            crate::fuse_client::METRICS
-                .layout_striped_writes
-                .fetch_add(1, Ordering::Relaxed);
-            return Ok(());
+            // A stale handler-time classification (the layout flipped
+            // between the caller's probe and this fetch).
+            return Ok(WriteFileOutcome::LayoutStriped);
         }
 
         let end_offset = (offset as usize) + data.len();
@@ -18285,15 +18294,12 @@ impl DataRouter {
         let meta = if _staged_block_guard.is_some() {
             let fresh = self.fetch_metadata(file_path).await?;
             if fresh.file_type == "striped" {
-                // The layout flipped striped while we waited: this write
-                // belongs to the striped path now.
-                drop(_staged_block_guard);
-                self.write_striped(file_path, &meta_key, offset, data, fencing_token)
-                    .await?;
-                crate::fuse_client::METRICS
-                    .layout_striped_writes
-                    .fetch_add(1, Ordering::Relaxed);
-                return Ok(());
+                // The layout flipped striped while we waited (a sibling
+                // segment's promotion ran under this guard): this write
+                // belongs to the striped path now. The guard drops at the
+                // return; the caller re-dispatches and the striped path
+                // re-acquires it per block.
+                return Ok(WriteFileOutcome::LayoutStriped);
             }
             fresh
         } else {
@@ -18372,7 +18378,7 @@ impl DataRouter {
                                 crate::fuse_client::METRICS
                                     .extent_spill_bytes
                                     .fetch_add(data.len() as u64, Ordering::Relaxed);
-                                return Ok(());
+                                return Ok(WriteFileOutcome::Written);
                             }
                             // Ring refused (never-lossy backpressure): the
                             // whole-image path below owns the write.
@@ -18749,7 +18755,7 @@ impl DataRouter {
             crate::fuse_client::METRICS
                 .layout_striped_writes
                 .fetch_add(1, Ordering::Relaxed);
-            return Ok(());
+            return Ok(WriteFileOutcome::Written);
         }
 
         // Small-layout patch/assemble. `end_offset <= new_size <=
@@ -18972,8 +18978,8 @@ impl DataRouter {
                     // write and the layout commit — used to abandon this
                     // offset with refcount 1 and no map naming it (a leak
                     // only fsck could find). The mint guard frees it on
-                    // any exit before custody transfers, exactly as the
-                    // `write_striped` arm two functions away already did.
+                    // any exit before custody transfers (the RES-9
+                    // discipline every minting task carries).
                     let mut minted = crate::assembly_tasks::MintedBlockGuard::new(
                         block_allocator.clone(),
                         be_offset,
@@ -19049,7 +19055,7 @@ impl DataRouter {
         // (inline arm always matches) and block_size when staging dirs exist
         // (staged arm always matches).
 
-        Ok(())
+        Ok(WriteFileOutcome::Written)
     }
 
     /// Persist a SPARSE set of `(block_idx, chunk)` stripe blocks on the
@@ -19132,312 +19138,6 @@ impl DataRouter {
         }
 
         Ok((block_mappings, inflight_guards))
-    }
-
-    /// Striped RMW. P1-10: meta connections are phased — open for block-map
-    /// reads, **dropped** before durable block I/O, re-acquired only for the
-    /// atomic map/size commit and refcount cleanup (frees run after redis work).
-    async fn write_striped(
-        &self,
-        file_path: &str,
-        _meta_key: &str,
-        offset: u64,
-        data: bytes::Bytes,
-        _fencing_token: u64,
-    ) -> Result<()> {
-        let ino = parse_inode_from_path(file_path);
-        let block_size = self.block_size.load(std::sync::atomic::Ordering::Relaxed);
-        let end_pos = offset + data.len() as u64;
-        let start_block = (offset / block_size) as u32;
-        let end_block = if data.is_empty() {
-            start_block
-        } else {
-            ((end_pos - 1) / block_size) as u32
-        };
-
-        if data.is_empty() {
-            return Ok(());
-        }
-
-        let meta = self.fetch_metadata(file_path).await?;
-        let existing_size = meta.size;
-        // PR 6c-i: a PARTIAL entry's span resolves through the bounded
-        // ladder (overlay → window → tree) — reading its absent map as
-        // all-holes would seed every RMW with zeros over live tree-mapped
-        // bytes (the §14 silent-wrong bomb). Whole-map entries keep the
-        // direct per-index read verbatim.
-        let mut old_block_keys: Vec<Option<String>> = Vec::new();
-        if self.entry_is_partial(ino, &meta) {
-            for b in start_block..=end_block {
-                old_block_keys.push(self.resolve_partial_block_binding(ino, &meta, b).await?);
-            }
-        } else {
-            let block_map = meta.block_map.clone().unwrap_or_default();
-            for b in start_block..=end_block {
-                old_block_keys.push(block_map.get(&b).cloned());
-            }
-        }
-
-        // Spawn tasks to modify affected blocks concurrently. The old
-        // main-thread cache pre-resolve is gone: a pre-resolved buffer is a
-        // binding snapshot that ages while the task waits to run — exactly
-        // the reused-key stale-fill window — so every RMW seed now resolves
-        // through the binding-validated fetch inside its task.
-        //
-        // MEM-2/RES-9: the per-block RMW tasks are OWNED. Outer cancellation
-        // (this future dropped mid-write) must not detach tasks that go on
-        // to allocate + publish blocks no map will ever name: the salvage
-        // hook frees every surfaced (block, key) on the cancel path, and
-        // each task's mint guard frees its own offset when the task errors
-        // or is aborted inside the allocate→publish window.
-        let salvage_router = self.clone();
-        let mut tasks = crate::assembly_tasks::OwnedTaskSet::with_salvage(
-            "striped block write",
-            Box::new(
-                move |outs: Vec<(u32, String, crate::block_allocator::InflightAllocGuard)>|
-                      -> futures::future::BoxFuture<'static, ()> {
-                    Box::pin(async move {
-                        if outs.is_empty() {
-                            return;
-                        }
-                        log::warn!(
-                            "write_striped cancelled mid-assembly: freeing {} surfaced \
-                             minted block(s) (RES-9)",
-                            outs.len()
-                        );
-                        for (_b, key, _inflight) in outs {
-                            let _ = salvage_router.backend_router.free_block(&key).await;
-                        }
-                    })
-                },
-            ),
-        );
-        let sem = std::sync::Arc::new(squeezefs_ipc::sqz_semaphore::Semaphore::new(
-            crate::bg_admit::striped_block_concurrency(),
-        ));
-
-        let mut old_keys_iter = old_block_keys.into_iter();
-        for b in start_block..=end_block {
-            let old_block_key = old_keys_iter.next().unwrap();
-
-            let block_start_file_offset = b as u64 * block_size;
-            let block_end_file_offset = block_start_file_offset + block_size;
-
-            let overlap_start = std::cmp::max(block_start_file_offset, offset);
-            let overlap_end = std::cmp::min(block_end_file_offset, end_pos);
-
-            let rel_start = (overlap_start - block_start_file_offset) as usize;
-            let rel_end = (overlap_end - block_start_file_offset) as usize;
-
-            // SAFETY: `overlap_start..overlap_end` was clamped to
-            // `offset..end_pos` two lines above, so the sub-slice is in bounds of
-            // `data`, and `slice_ref` requires exactly that (it re-derives the
-            // offset from the parent buffer).
-            let data_slice = unsafe {
-                let sub = data.get_unchecked(
-                    (overlap_start - offset) as usize..(overlap_end - offset) as usize,
-                );
-                data.slice_ref(sub)
-            };
-
-            let router_clone = self.clone();
-            let crypto = self.get_crypto().clone();
-            let read_lru = self.cache.read_lru.clone();
-            let file_path_clone = file_path.to_string();
-
-            let needs_existing = {
-                let existing_block_end = std::cmp::min(existing_size, block_end_file_offset);
-                existing_block_end > block_start_file_offset
-                    && (overlap_start > block_start_file_offset || overlap_end < existing_block_end)
-            };
-
-            // §5.6 (PR 6) full-coverage slice reuse (kills audit #12 here):
-            // when the overlap covers the whole block there is no existing
-            // data to RMW-seed (`needs_existing` is provably false) — the
-            // payload slice IS the block, so it flows to crypto/DMA and into
-            // the read LRU directly instead of being copied into a
-            // `PooledBuf` first. Lease-safe by construction: the §5.4
-            // severance boundary guarantees no transport lease ever reaches
-            // `DataRouter::write_file`, so retaining `data_slice` retains a
-            // private copy. The RMW-seed copy below (partial coverage,
-            // audit #13) is untouched by design.
-            let full_coverage = rel_start == 0 && rel_end == block_size as usize;
-
-            let sem_clone = sem.clone();
-            tasks.spawn(async move {
-                let _permit = sem_clone.acquire().await.map_err(|e| {
-                    SqueezefsError::Io(std::io::Error::other(format!(
-                        "Semaphore acquire error: {:?}",
-                        e
-                    )))
-                })?;
-
-                let block_bytes = if full_coverage {
-                    data_slice
-                } else {
-                    let mut block_data = if needs_existing {
-                        // Binding-validated RMW seed (reused-key stale-fill
-                        // family): the resolved key may have been displaced,
-                        // freed and reallocated to ANOTHER block by the time
-                        // this task runs — seeding from it would merge user
-                        // data over a foreign block's bytes and upload the
-                        // result (persistent corruption). A hole rebind
-                        // seeds zeros.
-                        match router_clone
-                            .get_block_for_index(
-                                &file_path_clone,
-                                b,
-                                old_block_key.as_deref(),
-                                false,
-                                // Write-side RMW seed: no contention
-                                // escalation (VL8 item 7) — write-vs-patch
-                                // of one block already serialize on its
-                                // stripe; escalating from a write task
-                                // risks a same-stripe self-wait.
-                                false,
-                            )
-                            .await?
-                        {
-                            Some(crate::cache::pool::ReadBlockValue::Pooled(p)) => p,
-                            Some(crate::cache::pool::ReadBlockValue::Bytes(b)) => {
-                                let mut pooled = BUFFER_POOL.alloc();
-                                pooled.resize(b.len(), 0);
-                                pooled.copy_from_slice(&b);
-                                pooled
-                            }
-                            None => {
-                                let mut pooled = BUFFER_POOL.alloc();
-                                pooled.resize(rel_end, 0);
-                                pooled
-                            }
-                        }
-                    } else {
-                        let mut pooled = BUFFER_POOL.alloc();
-                        pooled.resize(rel_end, 0);
-                        pooled
-                    };
-
-                    if block_data.len() < rel_end {
-                        block_data.resize(rel_end, 0);
-                    }
-
-                    // SAFETY: `block_data` was just resized to at least `rel_end`, and
-                    // `rel_start <= rel_end` by construction (both derive from the same
-                    // clamped overlap), so the range is in bounds; `data_slice` has
-                    // exactly `rel_end - rel_start` bytes.
-                    unsafe {
-                        block_data
-                            .get_unchecked_mut(rel_start..rel_end)
-                            .copy_from_slice(&data_slice);
-                    }
-
-                    block_data.into_bytes()
-                };
-
-                let (be_id, block_allocator, nvme_writer, offset) =
-                    router_clone.backend_router.allocate_placed_block().await?;
-                // PR VL6a: live-owner registration rides the task result
-                // back to the caller, which holds it across the merge.
-                let inflight = block_allocator.inflight_register(offset);
-                // RES-9 mint guard: any exit between here and the Ok return
-                // that surfaces this block — a `?` error, a panic, or a
-                // JoinSet abort landing at one of the awaits below — frees
-                // the minted offset instead of leaking an allocated(-and-
-                // possibly-published) block only fsck could find.
-                let mut minted =
-                    crate::assembly_tasks::MintedBlockGuard::new(block_allocator.clone(), offset);
-                let stored_new_block_key = router_clone
-                    .backend_router
-                    .persist_block_key(&be_id, offset);
-
-                let processed_block = crypto.process_write_async(block_bytes.clone()).await?;
-                if let Err(e) = crate::block_allocator::ensure_stored_block_image_fits(
-                    processed_block.len(),
-                    block_allocator.chunk_size(),
-                    "striped RMW block write",
-                ) {
-                    // Synchronous release (pre-existing behavior); disarm
-                    // so the mint guard does not double-free.
-                    // Never-published: co-writer-aware abandon (d575be03
-                    // sweep).
-                    minted.disarm();
-                    let _ = block_allocator.abandon_unpublished_offset(offset).await;
-                    return Err(e);
-                }
-                nvme_writer.write_block(offset, processed_block).await?;
-
-                // Cache + publish only after the device write: a racing
-                // validated fill for this key must either see the durable bytes
-                // or fail its incarnation check — never observe (and cache) the
-                // pre-write contents of a reused offset. The fresh put covers
-                // the RAM tier; the NVMe read tier must be PURGED like the
-                // no-put owners do (`upload_full_block`) — a validated fill of
-                // the key's dying incarnation may have published there before
-                // our allocate, and a put-owner that only overwrites RAM
-                // leaves that entry to serve dead bytes once the RAM entry
-                // evicts.
-                router_clone.cache.purge_block_key(&stored_new_block_key);
-                read_lru.put(&stored_new_block_key, block_bytes);
-                block_allocator.publish_block(offset);
-                // Published and about to surface to the caller (or the
-                // cancel-path salvage hook): custody transfers.
-                minted.disarm();
-
-                Ok::<_, SqueezefsError>((b, stored_new_block_key, inflight))
-            });
-        }
-
-        // MEM-2: join EVERY task — never short-circuits. The first inner
-        // error / panic is reported only after the last sibling joined, so
-        // the error path below frees a COMPLETE set of surfaced keys.
-        // Cancellation mid-join hands the surfaced outputs to the salvage
-        // hook above (RES-9).
-        let (outputs, first_err) = tasks.join_all().await;
-        let mut results = Vec::with_capacity(outputs.len());
-        // Held across the merge below (VL6a live-owner window); dropped
-        // with the function — after the publish — or on the error path
-        // where the blocks are freed.
-        let mut _inflight_guards: Vec<crate::block_allocator::InflightAllocGuard> =
-            Vec::with_capacity(outputs.len());
-        for (b, key, guard) in outputs {
-            results.push((b, key));
-            _inflight_guards.push(guard);
-        }
-        if let Some(e) = first_err {
-            for (_b, new_key) in &results {
-                let _ = self.backend_router.free_block(new_key).await;
-            }
-            return Err(e);
-        }
-
-        // Atomic per-inode layout merge through the shared primitive (§5.3
-        // one merge discipline): read→merge→save serialized under
-        // INODE_META_LOCKS against every other striped-map writer, merging
-        // into the *current* map — never into our start-of-call snapshot,
-        // which would drop concurrent writers' entries and revert blocks to
-        // freed keys. The block data I/O above ran concurrently (COW to
-        // fresh keys); displaced-from-current keys are freed only after the
-        // new map is published (durable + cached), so no reader can resolve
-        // a block to a key we are freeing.
-        let displaced_keys = self
-            .merge_block_mappings(
-                ino,
-                BlockMapOp::Merge(&results),
-                end_pos,
-                LayoutFlip::ToStripedClearStagedIdentity,
-                _fencing_token,
-            )
-            .await?;
-        for bk in displaced_keys {
-            let _ = self.backend_router.free_block(&bk).await;
-        }
-
-        // Drop any whole-file RAM snapshot: patching a shared whole-file buffer
-        // under concurrent writers is itself a lost-update hazard. Reads
-        // re-resolve through the now-consistent block map.
-        self.cache.write_lru.remove(file_path);
-        self.cache.read_lru.remove(file_path);
-        Ok(())
     }
 
     pub async fn read_file_range_zero_copy(

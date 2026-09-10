@@ -740,16 +740,6 @@ pub mod keys {
         FsKey(s)
     }
 
-    /// Layout meta hash key for a path that is already `inode_N` (or similar):
-    /// `metadata:{file_path}`.
-    #[inline]
-    pub fn metadata_for_path(file_path: &str) -> FsKey {
-        let mut s = CompactString::with_capacity(10 + file_path.len());
-        s.push_str("metadata:");
-        s.push_str(file_path);
-        FsKey(s)
-    }
-
     /// Inline payload key: `inline_data:{file_path}`.
     #[inline]
     pub fn inline_data(file_path: &str) -> FsKey {
@@ -1330,11 +1320,6 @@ mod tests {
     fn test_layout_key_shapes_match_historical_format() {
         assert_eq!(keys::inode_path(42), "inode_42");
         assert_eq!(&*keys::metadata_for_inode(42), "metadata:inode_42");
-        assert_eq!(&*keys::metadata_for_path("inode_7"), "metadata:inode_7");
-        assert_eq!(
-            &*keys::metadata_for_path(&keys::inode_path(7)),
-            &*keys::metadata_for_inode(7)
-        );
         assert_eq!(&*keys::inline_data("inode_1"), "inline_data:inode_1");
         assert_eq!(&*keys::block_map("abc"), "block_map:abc");
         assert_eq!(&*keys::mapping("fid"), "mapping:fid");

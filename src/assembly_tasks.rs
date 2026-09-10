@@ -2,7 +2,9 @@
 //! engineering spec §2 / §7).
 //!
 //! Two rules this module enforces for the multi-block fan-out paths in
-//! `routing.rs` (the read assembly and `write_striped`):
+//! `routing.rs` (the read assembly; the router's guard-less striped RMW
+//! `write_striped` was the salvage hook's consumer until its 2026-09-10
+//! retirement — see `routing::WriteFileOutcome`):
 //!
 //! 1. **The destination is an owned object, never a laundered
 //!    pointer.** [`AssemblyDest`] is the reviewed `Send` wrapper (the
@@ -29,9 +31,10 @@
 //!    bounds the mid-poll window with a TICK-bounded quiesce — the
 //!    same non-instant window tokio's `abort` had. With a salvage hook
 //!    installed, a detached reaper first quiesces the cancelled set
-//!    and hands every SURFACED output to the hook — `write_striped`'s
-//!    RES-9 face, where each output is a minted-and-published block
-//!    key that must be freed rather than leaked to fsck.
+//!    and hands every SURFACED output to the hook — the RES-9 face for
+//!    a fan-out whose outputs are minted-and-published block keys that
+//!    must be freed rather than leaked to fsck (contracts:
+//!    `tests/assembly_ownership_tests.rs`).
 //!
 //! `MintedBlockGuard` covers the task-interior window RES-9 names:
 //! between `allocate_block` and the `Ok` return that surfaces the block
@@ -241,8 +244,8 @@ impl<T: Send + 'static> OwnedTaskSet<T> {
     }
 
     /// A set whose cancel path hands every surfaced output to
-    /// `salvage` (the `write_striped` shape: outputs are minted block
-    /// keys that must be freed, RES-9).
+    /// `salvage` (the minted-block fan-out shape: outputs are published
+    /// block keys that must be freed, RES-9).
     pub fn with_salvage(context: &'static str, salvage: Salvage<T>) -> Self {
         Self::build(context, Some(salvage))
     }

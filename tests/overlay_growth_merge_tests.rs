@@ -480,6 +480,15 @@ fn a_segment_redirected_by_a_sibling_promotion_never_displaces_the_overlays_acke
         "the writer log carries \"{TRIPWIRE_LINE}\"; log: {}",
         log.display()
     );
+    // The record reached a PUBLISHING terminal state (the epoch feed or
+    // the durable-merge degenerate) — the composition, not a supersede.
+    let settled = metric(&mnt, "overlay_epoch_feeds") + metric(&mnt, "overlay_publishes");
+    assert!(
+        settled >= 1,
+        "D's overlay record never settled through a publish (overlay_epoch_feeds + \
+         overlay_publishes = {settled}); log: {}",
+        log.display()
+    );
     drop(f);
     mount.umount();
 

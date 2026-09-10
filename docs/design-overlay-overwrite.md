@@ -719,6 +719,38 @@ opposite custody semantics**:
   the moment the foreign merge commits; keeping the record alive would
   serve dest bytes the durable authority displaced).
 
+  **The one escape this claim had, closed 2026-09-10
+  (`tests/overlay_growth_merge_tests.rs`).** "Unreachable past the
+  one-authority screen" assumed every `Merge`-class publisher of new
+  bytes runs under `BLOCK_FLUSH_LOCKS`, where the screen lives. One did
+  not: `DataRouter::write_striped`, the router's own striped RMW, which
+  seeded from a start-of-call binding and published a whole-block
+  `Merge` holding no block guard. It was reachable from the shipped
+  default write path whenever a segment's handler-time classification
+  ("staged within block" — `MetaPrepOnly`, inode guard dropped) went
+  stale across a sibling segment's staged→striped promotion: the
+  router's "layout flipped striped while we waited" arm dropped the
+  block-0 guard and ran it. A kernel-split 4 MiB + 64 KiB writeback
+  (five concurrent 1 MiB WRITEs) reaches that shape ≈ 1 in 80–100 runs;
+  a sibling classified AFTER the flip meanwhile installed an overwrite
+  record on the promoted block 0, and the RMW's un-marked `Merge` was
+  read HERE as foreign — the containment superseded the record and freed
+  its acked destination (the never-lossy violation), and the durable map
+  named the RMW's image, whose bytes for the overlay's range were zeros.
+  The fix is structural, not an exemption: `write_striped` is deleted,
+  `DataRouter::write_file` answers `WriteFileOutcome::LayoutStriped`
+  (nothing written) for any striped layout, and the caller re-dispatches
+  the payload through the one striped write path — under the guard,
+  where the open record is JOINED or settled before any seed. Widening
+  the KD-B4-11 provenance exemption to that merge would have lost the
+  OTHER segment instead (the record's later feed displaces the RMW's
+  image): two unserialized whole-block RMWs of one block cannot both
+  win, so the answer had to be serialization, not provenance. The
+  tripwire keeps its meaning for the genuinely foreign class, and the
+  claim above is now true by construction: every `Merge`-class publisher
+  of new bytes (write-through, flush, fold, the settle) runs under the
+  block guard.
+
 **MARK-only rule (normative).** The hook runs inside the primitive's
 `INODE_META_LOCKS` section: it may only CAS the record state
 (`supersede()`, `src/overlay_core.rs:432`) and collect the touched

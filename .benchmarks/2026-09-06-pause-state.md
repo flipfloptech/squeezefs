@@ -323,7 +323,49 @@ mount (the A-arm rig reset the cluster; remount is part of every arm).
    the timing/parallel-harness class: the mux one-connection contract
    (`2836fa8b`, the documented cold-dial race) and the fork's `op_trace`
    unit tests under the parallel bench harness (`cf4ba9e1`). Gate on
-   `bfcf1e57` = the day's landing gate.
+   `bfcf1e57` GREEN (18:21–19:13, 369 suites / 4,855 tests).
+1o. **Packing PK1 + PK2 LANDED and GATED (2026-09-09 → 10; gate on
+   `0934582b` 22:31–23:27, 371 suites / 4,876 tests, 18 stages, both
+   audits).** Two subagents in isolated worktrees off `2185f658`, merged
+   PK1 first, PK2 rebased onto it (one `LBA_GRAIN`). **PK1** (`f4f4396a`,
+   live, lever-independent): ONE ranged ROUTED read funnel
+   `read_mapping_window{,_raw}` replaces the two decorated-mapping arms —
+   **FIND-PK-0 REPRODUCED as a P1**: promoted staged files placed on a
+   non-default data volume read as ZEROS from every other client (8/8 on a
+   live 2-volume fixture; the old arm read `self.nvme_writer`); FIND-PK-1's
+   4 MiB prefix read → one grain; `parse_block_mapping` refuses four
+   malformed shapes (`packed_mapping_refusals`, incl. the `unwrap_or(0)` that
+   resolved a bad `rel_off` to tenant 0's window); FIND-PK-3 the promoted-
+   source clone pins the shared block (+ the ring-resident copy arm that
+   inherited `block_map`); `tests/packed_mapping_wire_tests.rs` (7; proptest
+   512 × 3). **PK2** (`0934582b`, ships DARK — `SQUEEZEFS_SMALL_FILE_PACKING`
+   off): `src/pack.rs` (`OpenPack`/`Packer`: `fetch_add` reservation,
+   single-flighted refill, pin = tenants + 1, per-tenant inflight guards,
+   seal FULL/DISMOUNT, the OQ-1 stop latch — owner: stop the pack arm on
+   `StorageFull`, remaining files resident-and-counted, one WARN),
+   `PromotedInto::Packed` via `prepare_promotion`/`commit_promotion`,
+   `stage`/`ship`/`finish` save halves (`stage` never publishes RAM),
+   `BlockAllocator::release_pack_reference(router, key, outcome)`, the
+   pack-open fsck ledger, `SQUEEZEFS_PACK_MAX_SLOT_BYTES` (derived
+   `CHUNK/2`, tie test), 17 gauges, 13 contracts
+   (`tests/small_file_packing_tests.rs`: 200 files → 5 blocks vs 202,
+   byte-exact from a second mount, kill-9 both windows, online fsck ×10
+   under live packing). It also fixed a REAL fsck C8 false positive (the
+   two-epoch stability check assumed consecutive publishes land on
+   different blocks). My integration fix: contract 7's premise — crashed
+   tenants now enter the window with DURABLE staged layouts (the fsync-
+   lever handler runs its promotion ahead of its own layout persist; a
+   never-fsynced file lost at kill-9 is POSIX, not §5.4). **Board:** a
+   once-observed (0/80 since) wrong read of a lever-independent STRIPED
+   anchor on remount right after ONE `overlay_foreign_merge` tripwire fired
+   during its write on the loaded laptop — tape
+   `/tmp/sqfs_pack_dismount_214805/`; looks like a pre-existing
+   device-overlay race on the staged→striped transition under load;
+   contract 1 pins `invariant_tripwires = 0` on the writer so a recurrence
+   fails loud. **Next:** PK3 (truncate/clone arms + mover interplay), PK4
+   (co-writer per-(owner, home volume) group pack + typed publish outcome
+   + served-publish screen), PK5 (fsck C12) — development-parallel per the
+   plan; then PK6 compaction, PK7 squeeze-test rows + the default flip.
 2. **Kernel A/B, B arm** — after `squeeze-test` boots the 6.19.14 series
    WITH 0031 (or whichever box carries the patched kernel): on the box,
    `cd /scratch/tmp/sqz-agent/k26 && sudo env ARM=B KERNEL_TAG=<uname -r

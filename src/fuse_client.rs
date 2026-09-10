@@ -5832,6 +5832,52 @@ pub struct Metrics {
     /// §3's 64× space law is the `block` arm applied to small files).
     pub layout_promoted_inline: Align64<AtomicU64>,
     pub layout_promoted_block: Align64<AtomicU64>,
+    /// Small-file packing (design-small-file-packing §10, PR PK2): tenants
+    /// packed into a shared open pack block — the ENGAGEMENT instrument:
+    /// `packed + block + inline ≡ promotions` on every row (with the lever
+    /// OFF this stays 0 and `block` carries the population).
+    pub layout_promoted_packed: Align64<AtomicU64>,
+    /// Promotions whose slot exceeded `pack_max_slot_bytes` and took their
+    /// own block under the lever (`= 0` on a ≤ CHUNK/2 population).
+    pub pack_own_block_promotions: Align64<AtomicU64>,
+    /// Image bytes packed, and the LBA pad bytes those slots carried
+    /// (`slot − image`) — the internal-fragmentation ledger, Alt G's
+    /// instrument: `pad / bytes` is the 4 KiB-grain tax.
+    pub pack_promoted_bytes: Align64<AtomicU64>,
+    pub pack_slot_pad_bytes: Align64<AtomicU64>,
+    /// The open-block life cycle: blocks opened by a refill; sealed FULL
+    /// (the overflowing reservation) / at DISMOUNT; and ABANDONED — a seal
+    /// whose pin release was TERMINAL with no committed tenant (every
+    /// tenant failed its commit; ≈ 0).
+    pub pack_blocks_opened: Align64<AtomicU64>,
+    pub pack_blocks_sealed_full: Align64<AtomicU64>,
+    pub pack_blocks_sealed_dismount: Align64<AtomicU64>,
+    pub pack_blocks_abandoned: Align64<AtomicU64>,
+    /// Single-flighted refills run (≈ `pack_blocks_opened`); refills that
+    /// hit `StorageFull` (OQ-1 — the pack arm stopped for the batch);
+    /// promotions answered resident-and-counted while the arm was stopped;
+    /// slots whose tenant commit was refused or whose DMA failed (dead
+    /// space until compaction).
+    pub pack_reservation_refills: Align64<AtomicU64>,
+    pub pack_refill_storage_full: Align64<AtomicU64>,
+    pub pack_arm_stopped_promotions: Align64<AtomicU64>,
+    pub pack_slots_abandoned: Align64<AtomicU64>,
+    /// Tenant releases through the router ladder: nonterminal (the block
+    /// stays allocated for its siblings) vs the block's LAST —
+    /// `partial + terminal ≡ tenant releases` on a row.
+    pub pack_partial_frees: Align64<AtomicU64>,
+    pub pack_terminal_frees: Align64<AtomicU64>,
+    /// `release_pack_reference` on an entry `retire_shipped_free_tracking`
+    /// already removed (§5.3): expected only on a co-writer whose tenants
+    /// were all deleted between the group landing and the seal. **Must
+    /// stay 0 on single-writer rows** — on the authority the pin's own
+    /// reference keeps the entry alive until the seal releases it.
+    pub pack_release_untracked_noops: Align64<AtomicU64>,
+    /// Promotions a CO-WRITER ran one-block-per-file because no pack group
+    /// is available to it — in PK2 every co-writer promotion (the
+    /// batch-scoped co-writer pack is PK4's); afterwards, a grant that does
+    /// not advertise pack groups. The never-wrong fallback, counted.
+    pub pack_cowriter_group_unavailable: Align64<AtomicU64>,
     /// FIND-RW5-A: never-lossy StorageFull escalations — a staged
     /// whole-image/fold/clone arm found the staging ring unable to admit
     /// its image and degraded to the durable direct-block spill instead of
@@ -6130,6 +6176,11 @@ pub struct Metrics {
     pub fsck_inflight_exempted: Align64<AtomicU64>,
     /// C3 suspects exempted by the §5.4-step-2 mover pre-publish ledger.
     pub fsck_mover_ledger_exempted: Align64<AtomicU64>,
+    /// C2/C3 suspects exempted by the small-file packer's pack-open ledger
+    /// (design-small-file-packing §5.3): the +1 PIN of an OPEN pack block,
+    /// one per open pack — the tenants' transient references ride
+    /// `fsck_inflight_exempted`.
+    pub fsck_pack_ledger_exempted: Align64<AtomicU64>,
     /// DLM S9 (rung-10 finding #5): block-plane verdicts declined because
     /// the object lives in an allocation LANE this mount does not own —
     /// C2's foreign-lane exemptions plus C6's whole-census decline under
@@ -10848,6 +10899,13 @@ impl SqueezefsFilesystem {
             .as_ref()
             .is_some_and(|mb| !mb.volumes.is_empty());
 
+        // The small-file packer's open-block gauges (design-small-file-packing
+        // §5.3/§10): open packs (≤ data volumes), the oldest one's age and
+        // the least-filled one's occupancy (permille of the chunk) — the
+        // idle-tail instrument. The census row rides the opt-in key census.
+        let (pack_open_blocks, pack_open_block_age_ms, pack_open_block_occupancy) =
+            self.router.packer.gauges();
+
         // Volume-lifecycle gauge rows (design-volume-lifecycle §10, PR
         // VL3): durable records joined with live allocator accounting.
         let volume_states: Vec<serde_json::Value> = self
@@ -10971,6 +11029,13 @@ impl SqueezefsFilesystem {
             "nvme_staged_write_file_ids": nvme_staged_write_file_ids,
             "nvme_read_cache_block_keys": nvme_read_cache_block_keys,
             "active_writes": active_writes,
+            // The open pack blocks' base keys (design-small-file-packing
+            // §5.3) — device offsets, so census-gated like every key row.
+            "pack_open_blocks_census": if key_census {
+                self.router.packer.open_block_keys()
+            } else {
+                Vec::new()
+            },
             "active_leases_count": self.active_leases.len(),
             "volume_states": volume_states,
             "placement": placement_obj,
@@ -11149,6 +11214,26 @@ impl SqueezefsFilesystem {
                 "layout_staged_writes": METRICS.layout_staged_writes.load(Ordering::Relaxed),
                 "layout_promoted_inline": METRICS.layout_promoted_inline.load(Ordering::Relaxed),
                 "layout_promoted_block": METRICS.layout_promoted_block.load(Ordering::Relaxed),
+                "layout_promoted_packed": METRICS.layout_promoted_packed.load(Ordering::Relaxed),
+                "pack_own_block_promotions": METRICS.pack_own_block_promotions.load(Ordering::Relaxed),
+                "pack_promoted_bytes": METRICS.pack_promoted_bytes.load(Ordering::Relaxed),
+                "pack_slot_pad_bytes": METRICS.pack_slot_pad_bytes.load(Ordering::Relaxed),
+                "pack_blocks_opened": METRICS.pack_blocks_opened.load(Ordering::Relaxed),
+                "pack_blocks_sealed_full": METRICS.pack_blocks_sealed_full.load(Ordering::Relaxed),
+                "pack_blocks_sealed_dismount": METRICS.pack_blocks_sealed_dismount.load(Ordering::Relaxed),
+                "pack_blocks_abandoned": METRICS.pack_blocks_abandoned.load(Ordering::Relaxed),
+                "pack_reservation_refills": METRICS.pack_reservation_refills.load(Ordering::Relaxed),
+                "pack_refill_storage_full": METRICS.pack_refill_storage_full.load(Ordering::Relaxed),
+                "pack_arm_stopped_promotions": METRICS.pack_arm_stopped_promotions.load(Ordering::Relaxed),
+                "pack_slots_abandoned": METRICS.pack_slots_abandoned.load(Ordering::Relaxed),
+                "pack_partial_frees": METRICS.pack_partial_frees.load(Ordering::Relaxed),
+                "pack_terminal_frees": METRICS.pack_terminal_frees.load(Ordering::Relaxed),
+                "pack_release_untracked_noops": METRICS.pack_release_untracked_noops.load(Ordering::Relaxed),
+                "pack_cowriter_group_unavailable": METRICS.pack_cowriter_group_unavailable.load(Ordering::Relaxed),
+                "pack_open_blocks": pack_open_blocks,
+                "pack_open_block_age_ms": pack_open_block_age_ms,
+                "pack_open_block_occupancy": pack_open_block_occupancy,
+                "pack_arm_stopped": self.router.packer.arm_stopped(),
                 "staged_spill_escalations": METRICS.staged_spill_escalations.load(Ordering::Relaxed),
                 "block_double_frees": METRICS.block_double_frees.load(Ordering::Relaxed),
                 "block_untracked_free_refusals": METRICS.block_untracked_free_refusals.load(Ordering::Relaxed),
@@ -11294,6 +11379,7 @@ impl SqueezefsFilesystem {
                 "fsck_epoch_exempted": METRICS.fsck_epoch_exempted.load(Ordering::Relaxed),
                 "fsck_inflight_exempted": METRICS.fsck_inflight_exempted.load(Ordering::Relaxed),
                 "fsck_mover_ledger_exempted": METRICS.fsck_mover_ledger_exempted.load(Ordering::Relaxed),
+                "fsck_pack_ledger_exempted": METRICS.fsck_pack_ledger_exempted.load(Ordering::Relaxed),
                 "fsck_foreign_lane_exempted": METRICS.fsck_foreign_lane_exempted.load(Ordering::Relaxed),
                 "fsck_dentry_refs_indexed": METRICS.fsck_dentry_refs_indexed.load(Ordering::Relaxed),
                 "fsck_current_era_exempted": METRICS.fsck_current_era_exempted.load(Ordering::Relaxed),
@@ -22252,6 +22338,9 @@ impl SqueezefsFilesystem {
              at dismount...",
             pending.len()
         );
+        // The pass is one promotion BATCH (design-small-file-packing OQ-1):
+        // a StorageFull refill stops the pack arm for its remainder.
+        self.router.packer.begin_promotion_batch();
 
         let sem = std::sync::Arc::new(squeezefs_ipc::sqz_semaphore::Semaphore::new(
             crate::bg_admit::striped_block_concurrency(),
@@ -22279,6 +22368,7 @@ impl SqueezefsFilesystem {
         const ERROR_SAMPLES: usize = 3;
         let mut promoted_bytes = 0u64;
         let mut promoted_inline = 0u64;
+        let mut promoted_packed = 0u64;
         while let Some(res) = tasks.next().await {
             match res {
                 Err(join_err) => {
@@ -22298,8 +22388,10 @@ impl SqueezefsFilesystem {
                 Ok(Ok((Some(into), bytes))) => {
                     summary.flushed += 1;
                     promoted_bytes += bytes;
-                    if into == crate::routing::PromotedInto::Inline {
-                        promoted_inline += 1;
+                    match into {
+                        crate::routing::PromotedInto::Inline => promoted_inline += 1,
+                        crate::routing::PromotedInto::Packed => promoted_packed += 1,
+                        crate::routing::PromotedInto::Block => {}
                     }
                 }
                 Ok(Ok((None, _))) => summary.skipped += 1,
@@ -22341,9 +22433,10 @@ impl SqueezefsFilesystem {
         } else {
             info!(
                 "FUSE Daemon: dismount promoted {} staged-layout file(s) ({promoted_bytes} B) \
-                 to the shared backend: {promoted_inline} inline, {} to blocks.",
+                 to the shared backend: {promoted_inline} inline, {promoted_packed} packed, \
+                 {} to blocks.",
                 summary.flushed,
-                summary.flushed as u64 - promoted_inline
+                summary.flushed as u64 - promoted_inline - promoted_packed
             );
         }
         summary
@@ -23242,6 +23335,15 @@ impl SqueezefsFilesystem {
         // metadata commit per file — and the process-exit guard
         // (`dismount_wait + 60 s`, `run_mount`) bounds the whole teardown.
         let promoted = self.promote_all_staged_files_at_dismount().await;
+        // Every open pack seals AFTER the pass's last promotion and before
+        // "Dismount clean" (design-small-file-packing §5.3 (b)): the pin
+        // releases and the block reads `refcount = tenants` — what the next
+        // mount's ledger seed recovers. Runs whether or not the pass had
+        // files — the fsync lever and the merge worker open packs too.
+        let sealed_packs = self.router.seal_open_packs().await;
+        if sealed_packs > 0 {
+            info!("FUSE Daemon: dismount sealed {sealed_packs} open pack block(s).");
+        }
         if promoted.failed > 0 {
             error!(
                 "dismount: {} of {} staged-layout files failed to promote (first errors: \

@@ -3349,6 +3349,32 @@ pub fn test_mover_ledger_remove(key: &str) {
     mover_ledger_remove(key);
 }
 
+// The pack-open ledger (design-small-file-packing §5.3): the base keys of
+// the small-file packer's OPEN pack blocks, entered at OPEN (before any
+// window in which the block's +1 pin is declared to nobody) and left after
+// the seal's pin release lands. fsck's shared C2/C3 arm consults it beside
+// the mover pre-publish ledger: the pin is the ONLY discrepancy it ever has
+// to excuse — the tenants' transient references are the in-flight
+// registry's (one registration per tenant from reserve to commit).
+static PACK_OPEN_LEDGER: parking_lot::Mutex<Vec<String>> = parking_lot::Mutex::new(Vec::new());
+
+pub(crate) fn pack_ledger_insert(key: &str) {
+    PACK_OPEN_LEDGER.lock().push(key.to_string());
+}
+
+pub(crate) fn pack_ledger_remove(key: &str) {
+    let mut l = PACK_OPEN_LEDGER.lock();
+    if let Some(pos) = l.iter().position(|k| k == key) {
+        l.swap_remove(pos);
+    }
+}
+
+/// Snapshot of the pack-open ledger — fsck's shared C2/C3 consultation and
+/// the stats census read it.
+pub fn pack_open_ledger() -> Vec<String> {
+    PACK_OPEN_LEDGER.lock().clone()
+}
+
 // ---------------------------------------------------------------------------
 // Rebalance planning (§5.3 step 6 / §5.7 bounded pass)
 // ---------------------------------------------------------------------------

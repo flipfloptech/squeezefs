@@ -1,0 +1,524 @@
+//! The small-file packer's **open pack block**
+//! (`docs/design-small-file-packing.md` §5.2–§5.4, PR PK2).
+//!
+//! A staged-layout file whose stored image's slot fits
+//! [`crate::routing::pack_max_slot_bytes`] no longer promotes into a whole
+//! 4 MiB block of its own (the 64× space law of
+//! `.benchmarks/2026-09-09-fsync-promote-staged-ab.md`): it reserves an
+//! `LBA_GRAIN`-aligned **slot** in the mount's current
+//! open pack block — ONE `fetch_add` on the block's cursor — DMAs its image
+//! at `base + off`, and commits the size-carrying mapping `bk:off:len` the
+//! read path already decodes, with its C8 reference in the same
+//! transaction. N tenants of one block are N durable references; the block
+//! frees terminally when the population reaches 0 — the arithmetic the
+//! allocator already runs (KD-2).
+//!
+//! **RAM-only, pinned by a refcount** (KD-3): `allocate_placed_block` hands
+//! the packer the block at refcount 1 — that reference is the packer's PIN
+//! for the open lifetime (`move_one`'s discipline). Every tenant takes its
+//! own reference at reserve, so while a pack is open
+//! `refcount = committed + mid-flight tenants + 1` and, on the authority,
+//! no sequence of tenant deletes can free the block under a DMA the packer
+//! has not finished. The seal releases the pin through
+//! [`crate::block_allocator::BlockAllocator::release_pack_reference`] —
+//! nonterminal while tenants live, the ordinary terminal free otherwise.
+//! No pack-level in-flight guard: every TENANT holds its own
+//! `inflight_register(base)` from reserve to commit (the registry is a
+//! per-offset counter, so N holders compose), and the pin alone is
+//! declared to fsck's shared C2/C3 arm through the pack-open ledger
+//! ([`crate::jobs::pack_open_ledger`]), entered at OPEN.
+//!
+//! **Crash contract** (§5.4): nothing durable records the open block. A
+//! crash leaves committed tenants (each with its layout + C8 record —
+//! the block recovers ALLOCATED at `refcount = N`) and an uncommitted
+//! tail that is dead bytes inside a live block, or — with no tenant
+//! committed — a block that recovers FREE. Torn slot DMAs are invisible
+//! (no layout names them).
+//!
+//! **Sealing** (§5.3): on FULL (the reservation that overflows the chunk
+//! — the first sealer runs the seal) and at DISMOUNT (after the promotion
+//! pass, before "Dismount clean"). Not on idle in v1 — one half-empty
+//! block per data volume for the life of the mount is the stated cost,
+//! made visible by `pack_open_block_{age_ms,occupancy}`.
+//!
+//! **OQ-1 (owner, 2026-09-09):** a refill that hits `StorageFull` STOPS
+//! the pack arm for the rest of the promotion batch — every remaining
+//! file stays resident-and-counted (the never-wrong degrade), ONE
+//! aggregated WARN, and the own-block arm is NOT retried (it needs the
+//! same space). The next batch (`begin_promotion_batch`) re-arms it.
+//!
+//! Hot-path law: the packer runs on the merge worker, the dismount pass
+//! and the fsync leg — never the WRITE/READ hot path. Its shared words are
+//! the `fetch_add` cursor, the allocator's refcount and the incarnation
+//! word (all latch-free); the refill is single-flighted on the R1a shape
+//! (`sqz_flight`); no lock is held across the allocation's park.
+
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::Arc;
+use std::time::Instant;
+
+use crate::block_allocator::{BlockAllocator, InflightAllocGuard, CHUNK_SIZE};
+use crate::error::{Result, SqueezefsError};
+use crate::fuse_client::METRICS;
+use crate::nvme_dev::NvmeBlockDev;
+use crate::routing::BackendRouter;
+
+/// One OPEN pack block — the slot cursor N concurrent promotions append
+/// into. RAM-only: a crash leaves the committed tenants (each with its
+/// durable layout + C8 record) and an unreferenced tail (§5.4).
+pub struct OpenPack {
+    /// The data volume the block was placed on (the routed backend id).
+    pub(crate) be_id: String,
+    pub(crate) allocator: Arc<BlockAllocator>,
+    pub(crate) device: Arc<NvmeBlockDev>,
+    /// Device offset of the block.
+    pub(crate) base: u64,
+    /// The persisted base key (`be://offset[@inc]`) — every tenant mapping's
+    /// prefix, the pack-open ledger's entry and the pin release's key.
+    pub(crate) base_key: String,
+    /// Next free slot offset within the block; reservation is ONE
+    /// `fetch_add`, so the cursor is monotone and every reservation after
+    /// the overflowing one overflows too.
+    next_slot: AtomicU64,
+    /// GAUGE ONLY (`pack_blocks_abandoned`, `pack_open_block_occupancy`):
+    /// tenants whose layout commit succeeded. The seal's terminal-vs-
+    /// nonterminal outcome is what the REFCOUNT says (a tenant mid-DMA
+    /// holds a reference with `committed == 0`), never this word.
+    committed: AtomicU32,
+    opened_at: Instant,
+    /// Set once by the first sealer (a CAS); a sealed pack takes no
+    /// reservation and its slot in the table is being vacated.
+    sealed: AtomicBool,
+}
+
+impl OpenPack {
+    /// ONE `fetch_add`: `Some(off)` ⇔ the caller owns `[off, off + slot)`.
+    fn try_reserve(&self, slot: u64) -> Option<u64> {
+        let prev = self.next_slot.fetch_add(slot, Ordering::AcqRel);
+        (prev.saturating_add(slot) <= CHUNK_SIZE).then_some(prev)
+    }
+
+    /// CAS `false → true`; `true` ⇔ this caller is THE sealer.
+    fn seal(&self) -> bool {
+        self.sealed
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
+
+    fn is_sealed(&self) -> bool {
+        self.sealed.load(Ordering::Acquire)
+    }
+
+    /// A tenant's layout commit succeeded (gauge only).
+    pub(crate) fn note_committed(&self) {
+        self.committed.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Reserved bytes (the cursor, clamped to the chunk once overflowed).
+    pub fn reserved_bytes(&self) -> u64 {
+        self.next_slot.load(Ordering::Relaxed).min(CHUNK_SIZE)
+    }
+
+    /// Reserved permille of the chunk — the occupancy gauge's unit.
+    pub fn occupancy_permille(&self) -> u64 {
+        self.reserved_bytes() * 1000 / CHUNK_SIZE
+    }
+
+    pub fn age_ms(&self) -> u64 {
+        self.opened_at.elapsed().as_millis() as u64
+    }
+
+    pub fn committed(&self) -> u32 {
+        self.committed.load(Ordering::Relaxed)
+    }
+}
+
+/// A reserved slot — the tenant's handle from reserve to commit. It holds
+/// the tenant's OWN in-flight registration on the base (dropped with the
+/// handle: after the commit is durable and visible, or when the failure
+/// path releases) and stands for the tenant's RAM reference, which the
+/// layout commit's C8 record justifies on success and
+/// `DataRouter::release_pack_tenant` gives back on
+/// failure. No `Drop` release on purpose: a committed tenant's reference
+/// STAYS (the layout owns it now).
+pub struct PackTenant {
+    pub(crate) pack: Arc<OpenPack>,
+    /// The slot's offset within the block (`LBA_GRAIN`-aligned).
+    pub(crate) off: u64,
+    _inflight: InflightAllocGuard,
+}
+
+/// What a refill answered its cohort: a pack is open (retry the
+/// reservation), a `StorageFull` refusal (the arm stops for the batch), or
+/// another allocation error.
+#[derive(Clone)]
+enum RefillOutcome {
+    Opened,
+    Full,
+    Failed(String),
+}
+
+/// Why a pack sealed (the `pack_blocks_sealed_*` split).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SealKind {
+    /// The reservation that overflowed the chunk.
+    Full,
+    /// The dismount teardown, after the promotion pass.
+    Dismount,
+}
+
+/// The packer: the router's per-data-volume open packs, the single-flighted
+/// refill, the batch-scoped `StorageFull` stop and the dismount close.
+pub struct Packer {
+    /// One slot per data volume the packer has opened a block on, keyed by
+    /// the routed backend id `allocate_placed_block` answered — so at most
+    /// one open pack per data volume (the G-PK1 tail bound).
+    open: scc::HashMap<String, Arc<arc_swap::ArcSwapOption<OpenPack>>>,
+    /// The single-flighted refill (the R1a `inflight_block_reads` shape):
+    /// the leader allocates and installs, the cohort awaits its outcome and
+    /// retries the reservation. One flight per router — a refill is one
+    /// allocation, and two volumes' refills serialize harmlessly.
+    refill: arc_swap::ArcSwapOption<squeezefs_ipc::sqz_flight::Sender<RefillOutcome>>,
+    /// OQ-1: a refill hit `StorageFull` — the pack arm is STOPPED for the
+    /// rest of the promotion batch; `begin_promotion_batch` re-arms.
+    stopped: AtomicBool,
+}
+
+impl Default for Packer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Packer {
+    pub fn new() -> Self {
+        Self {
+            open: scc::HashMap::new(),
+            refill: arc_swap::ArcSwapOption::from(None),
+            stopped: AtomicBool::new(false),
+        }
+    }
+
+    /// A promotion BATCH begins (the merge worker's `promote_batch`, the
+    /// dismount pass): re-arm the pack arm after an OQ-1 stop. The fsync
+    /// lever is a promotion of one and never re-arms — a stopped arm
+    /// answers its promotions resident-and-counted until the next batch.
+    pub fn begin_promotion_batch(&self) {
+        self.stopped.store(false, Ordering::Relaxed);
+    }
+
+    /// `true` while an OQ-1 `StorageFull` stop is in force.
+    pub fn arm_stopped(&self) -> bool {
+        self.stopped.load(Ordering::Relaxed)
+    }
+
+    /// Reserve a `slot`-byte slot in an open pack — steps 3 of §5.2's
+    /// `prepare`: the reservation (one `fetch_add`), the tenant's own
+    /// in-flight registration and its reference. `Ok(None)` = the arm is
+    /// stopped (OQ-1): the caller answers the promotion resident-and-
+    /// counted. A `StorageFull` refill stops the arm and answers `None`;
+    /// any other allocation error propagates.
+    pub async fn reserve(&self, router: &BackendRouter, slot: u64) -> Result<Option<PackTenant>> {
+        loop {
+            if self.stopped.load(Ordering::Relaxed) {
+                return Ok(None);
+            }
+            if let Some(pack) = self.any_open() {
+                match pack.try_reserve(slot) {
+                    Some(off) => {
+                        let inflight = pack.allocator.inflight_register(pack.base);
+                        if pack.allocator.increment_refcount(pack.base) {
+                            return Ok(Some(PackTenant {
+                                pack,
+                                off,
+                                _inflight: inflight,
+                            }));
+                        }
+                        // Refused ⇒ the count already hit 0: a concurrent
+                        // overflow sealed the pack between this thread's
+                        // reservation and its reference, and the sealer's
+                        // pin release was the block's LAST reference (no
+                        // committed tenant held it). Nothing was DMA'd into
+                        // the slot; the block is free-listed by that
+                        // release. Vacate WITHOUT a second release and retry
+                        // on a fresh pack.
+                        log::debug!(
+                            "packing: reservation on {} raced its seal (the pin release was \
+                             terminal) — re-reserving",
+                            pack.base_key
+                        );
+                        pack.seal();
+                        self.vacate(&pack);
+                        continue;
+                    }
+                    None => {
+                        // The overflowing reservation seals; the first
+                        // sealer runs the seal (§5.3 (a)), everyone else
+                        // proceeds to the refill.
+                        if pack.seal() {
+                            self.run_seal(router, &pack, SealKind::Full).await;
+                        }
+                        continue;
+                    }
+                }
+            }
+            match self.refill(router).await {
+                // A leader that died without answering (its sender gone):
+                // this waiter re-runs the loop and claims the next flight.
+                None | Some(RefillOutcome::Opened) => continue,
+                Some(RefillOutcome::Full) => return Ok(None),
+                Some(RefillOutcome::Failed(why)) => {
+                    return Err(SqueezefsError::InvalidOperation(format!(
+                        "packing: the open pack block's refill failed: {why}"
+                    )));
+                }
+            }
+        }
+    }
+
+    /// Any UNSEALED open pack (≤ one per data volume — a tiny scan).
+    fn any_open(&self) -> Option<Arc<OpenPack>> {
+        let mut found = None;
+        self.open.iter_sync(|_, slot| {
+            if let Some(p) = slot.load_full() {
+                if !p.is_sealed() {
+                    found = Some(p);
+                    return false;
+                }
+            }
+            true
+        });
+        found
+    }
+
+    /// Vacate `pack`'s table slot if it still holds it (idempotent —
+    /// the sealer and a refill leader may both reach for it).
+    fn vacate(&self, pack: &Arc<OpenPack>) {
+        if let Some(slot) = self.open.read_sync(&pack.be_id, |_, s| s.clone()) {
+            let cur = slot.load();
+            if cur.as_ref().is_some_and(|p| Arc::ptr_eq(p, pack)) {
+                let _ = slot.compare_and_swap(&*cur, None);
+            }
+        }
+    }
+
+    /// The refill: single-flighted — the leader allocates ONE placed block,
+    /// enters it in the pack-open ledger (under a transient in-flight
+    /// registration, so the block is never uncovered) and installs it;
+    /// the cohort awaits the outcome. No lock is held across the
+    /// allocation's park (an ENOSPC park is bounded by
+    /// `free_grace::pressure_park_wall_ms`).
+    async fn refill(&self, router: &BackendRouter) -> Option<RefillOutcome> {
+        let (tx, _rx) = squeezefs_ipc::sqz_flight::channel::<RefillOutcome>();
+        let flight = Arc::new(tx);
+        let prev = self
+            .refill
+            .compare_and_swap(&None::<Arc<_>>, Some(flight.clone()));
+        if let Some(existing) = prev.as_ref() {
+            // Waiter: the leader's outcome, or — its sender gone without a
+            // send (the leader died) — `None`: re-run the reservation loop.
+            let rx = existing.subscribe();
+            return rx.wait().await.ok();
+        }
+        // Leader. A pack another leader installed between this thread's
+        // scan and its claim serves the cohort without an allocation.
+        let outcome = if self.any_open().is_some() {
+            RefillOutcome::Opened
+        } else {
+            match router.allocate_placed_block().await {
+                Ok((be_id, allocator, device, offset)) => {
+                    let base_key = router.persist_block_key(&be_id, offset);
+                    // The pack-open ledger entry precedes any window in
+                    // which the block's +1 pin is declared to nobody: the
+                    // allocation's own registration covers the insert.
+                    let cover = allocator.inflight_register(offset);
+                    crate::jobs::pack_ledger_insert(&base_key);
+                    drop(cover);
+                    let pack = Arc::new(OpenPack {
+                        be_id: be_id.clone(),
+                        allocator,
+                        device,
+                        base: offset,
+                        base_key,
+                        next_slot: AtomicU64::new(0),
+                        committed: AtomicU32::new(0),
+                        opened_at: Instant::now(),
+                        sealed: AtomicBool::new(false),
+                    });
+                    METRICS
+                        .pack_reservation_refills
+                        .fetch_add(1, Ordering::Relaxed);
+                    self.install(pack).await
+                }
+                Err(e) if crate::block_allocator::is_storage_full(&e) => {
+                    // OQ-1: stop the pack arm for the batch — ONE WARN per
+                    // stop, never one per file (the 132 k-line anti-pattern).
+                    if !self.stopped.swap(true, Ordering::Relaxed) {
+                        log::warn!(
+                            "packing: the open pack block's refill hit StorageFull — the pack \
+                             arm stops for the rest of this promotion batch; the remaining \
+                             staged-layout files stay ring-resident (readable here, promoted \
+                             by a later batch or the next clean unmount); the own-block arm is \
+                             not retried (it needs the same space)"
+                        );
+                    }
+                    METRICS
+                        .pack_refill_storage_full
+                        .fetch_add(1, Ordering::Relaxed);
+                    RefillOutcome::Full
+                }
+                Err(e) => RefillOutcome::Failed(format!("{e:?}")),
+            }
+        };
+        // Clear the flight BEFORE the send: a waiter arriving after the
+        // send finds no flight and runs its own reservation loop.
+        self.refill.store(None);
+        flight.send(outcome.clone());
+        Some(outcome)
+    }
+
+    /// Install a freshly opened pack under its volume's slot. A slot that
+    /// already holds an UNSEALED pack keeps it — the fresh block is
+    /// abandoned (never published, nothing durable named it) and the
+    /// cohort is served the existing one.
+    async fn install(&self, pack: Arc<OpenPack>) -> RefillOutcome {
+        let slot = match self.open.entry_sync(pack.be_id.clone()) {
+            scc::hash_map::Entry::Occupied(occ) => occ.get().clone(),
+            scc::hash_map::Entry::Vacant(vac) => {
+                let s = Arc::new(arc_swap::ArcSwapOption::from(None));
+                let _ = vac.insert_entry(s.clone());
+                s
+            }
+        };
+        loop {
+            let cur = slot.load();
+            match cur.as_ref() {
+                Some(existing) if !existing.is_sealed() => {
+                    crate::jobs::pack_ledger_remove(&pack.base_key);
+                    let _ = pack.allocator.abandon_unpublished_offset(pack.base).await;
+                    return RefillOutcome::Opened;
+                }
+                _ => {
+                    let prev = slot.compare_and_swap(&*cur, Some(pack.clone()));
+                    let unchanged = match (prev.as_ref(), cur.as_ref()) {
+                        (None, None) => true,
+                        (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+                        _ => false,
+                    };
+                    if unchanged {
+                        METRICS.pack_blocks_opened.fetch_add(1, Ordering::Relaxed);
+                        return RefillOutcome::Opened;
+                    }
+                }
+            }
+        }
+    }
+
+    /// The seal (§5.3): vacate the table slot, release the packer's PIN
+    /// through the allocator's one release primitive — OUTSIDE every 3.5
+    /// guard (the reservation runs in `prepare`, the dismount seal after
+    /// the pass) — then leave the pack-open ledger (the block is never
+    /// uncovered while the pin is live: `refcount = tenants` once the
+    /// release lands, which is what the census sees). A terminal release
+    /// with no committed tenant is an ABANDONED pack (every tenant failed
+    /// its commit; ≈ 0).
+    async fn run_seal(&self, router: &BackendRouter, pack: &Arc<OpenPack>, kind: SealKind) {
+        self.vacate(pack);
+        let verdict = pack
+            .allocator
+            .release_pack_reference(
+                router,
+                &pack.base_key,
+                crate::block_allocator::PackPublishOutcome::Known,
+            )
+            .await;
+        crate::jobs::pack_ledger_remove(&pack.base_key);
+        match kind {
+            SealKind::Full => METRICS
+                .pack_blocks_sealed_full
+                .fetch_add(1, Ordering::Relaxed),
+            SealKind::Dismount => METRICS
+                .pack_blocks_sealed_dismount
+                .fetch_add(1, Ordering::Relaxed),
+        };
+        match verdict {
+            Ok(crate::block_allocator::PackRelease::Terminal) if pack.committed() == 0 => {
+                METRICS
+                    .pack_blocks_abandoned
+                    .fetch_add(1, Ordering::Relaxed);
+                log::debug!(
+                    "packing: sealed pack block {} ({kind:?}) with no committed tenant — \
+                     abandoned (terminal release)",
+                    pack.base_key
+                );
+            }
+            Ok(_) => {}
+            Err(e) => log::error!(
+                "packing: the pin release of sealed pack block {} ({kind:?}) failed: {e:?} — \
+                 the block's RAM refcount stays one above its tenants until remount (space, \
+                 never data; fsck C3 reads the +1 once the ledger entry is gone)",
+                pack.base_key
+            ),
+        }
+    }
+
+    /// The dismount seal (§5.3 (b)): every open pack seals — after the
+    /// promotion pass's last promotion, before "Dismount clean". A
+    /// promotion that runs later opens a fresh pack whose pin is RAM and
+    /// dies with the process (the block recovers at `refcount = tenants`
+    /// — nothing durable records a pin, §5.4), so no close latch is
+    /// needed. Returns the number sealed.
+    pub async fn seal_all(&self, router: &BackendRouter) -> u64 {
+        let mut packs = Vec::new();
+        self.open.iter_sync(|_, slot| {
+            if let Some(p) = slot.load_full() {
+                packs.push(p);
+            }
+            true
+        });
+        let mut sealed = 0u64;
+        for pack in packs {
+            if pack.seal() {
+                self.run_seal(router, &pack, SealKind::Dismount).await;
+                sealed += 1;
+            }
+        }
+        sealed
+    }
+
+    /// The open-block gauges: `(open packs, worst age ms, least-filled
+    /// occupancy permille)` — the idle-tail instrument (§5.3).
+    pub fn gauges(&self) -> (u64, u64, u64) {
+        let mut open = 0u64;
+        let mut age = 0u64;
+        let mut occupancy = 1000u64;
+        self.open.iter_sync(|_, slot| {
+            if let Some(p) = slot.load_full() {
+                if !p.is_sealed() {
+                    open += 1;
+                    age = age.max(p.age_ms());
+                    occupancy = occupancy.min(p.occupancy_permille());
+                }
+            }
+            true
+        });
+        if open == 0 {
+            occupancy = 0;
+        }
+        (open, age, occupancy)
+    }
+
+    /// The open packs' base keys (the opt-in census row).
+    pub fn open_block_keys(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        self.open.iter_sync(|_, slot| {
+            if let Some(p) = slot.load_full() {
+                if !p.is_sealed() {
+                    out.push(p.base_key.clone());
+                }
+            }
+            true
+        });
+        out
+    }
+}

@@ -120,6 +120,15 @@ pub fn small_file_packing_enabled() -> bool {
     }
 }
 
+/// `SQUEEZEFS_TEST_PACK_COMMIT_STALL_MS` (test seam, registered): a packed
+/// tenant parks this long between its slot DMA and its layout commit —
+/// the kill-9 crash harness's deterministic window. Read once; 0 = none.
+fn pack_commit_stall_ms() -> u64 {
+    static CELL: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *CELL
+        .get_or_init(|| crate::env_knobs::int_knob::<u64>("SQUEEZEFS_TEST_PACK_COMMIT_STALL_MS", 0))
+}
+
 /// Test seam: `Some(on)` presets the packing lever; `None` returns it to
 /// the knob.
 pub fn test_set_small_file_packing(on: Option<bool>) {
@@ -143,6 +152,50 @@ pub enum PromotedInto {
     Inline,
     Packed,
     Block,
+}
+
+/// A staged promotion after its `prepare` half (`DataRouter::prepare_promotion`)
+/// — what the `commit` half (`DataRouter::commit_promotion`) consumes. The
+/// inline arm has no device step (its commit IS the durable write); the
+/// device arm carries the image's landing site with the block's in-flight
+/// registration held until the commit is durable and visible.
+pub enum PreparedPromotion {
+    Inline {
+        file_path: String,
+        ino: u64,
+        file_id: String,
+        gen: u64,
+        raw: Vec<u8>,
+    },
+    Device(PreparedDevicePromotion),
+}
+
+/// The device arm's prepared state: the transformed image is on the
+/// device (its block's incarnation word published), `block_key` is the
+/// size-carrying mapping the commit publishes, and the site holds the
+/// block's in-flight registration, which shields the allocate → commit
+/// window from fsck's C2/C3 adjudication (§5.6 registry contract —
+/// dropped only after the publish is visible, or when the failure path
+/// releases the offset).
+pub struct PreparedDevicePromotion {
+    ino: u64,
+    file_id: String,
+    gen: u64,
+    raw_len: usize,
+    block_key: String,
+    site: PreparedSite,
+}
+
+/// Where a prepared device promotion's image landed — its own placed
+/// block (the block arm: `bk:0:len`) or a slot of the open pack block (the
+/// packed arm: `bk:off:len`, design-small-file-packing §5.2).
+pub enum PreparedSite {
+    Block {
+        allocator: std::sync::Arc<crate::block_allocator::BlockAllocator>,
+        offset: u64,
+        _inflight: crate::block_allocator::InflightAllocGuard,
+    },
+    Packed(crate::pack::PackTenant),
 }
 
 /// The largest format bound ANY volume can hold — the registered
@@ -491,6 +544,53 @@ pub struct CachedMetadata {
 /// [`CachedMetadata::layout_delta_chain`] sentinel: the persisted base
 /// cannot fold a delta (JSON/indirect/unknown provenance).
 pub const LAYOUT_DELTA_CHAIN_INELIGIBLE: u32 = u32::MAX;
+
+/// The `stage` half's verdict (`DataRouter::stage_layout_save`): `Done` =
+/// the kvmap arm — its own publish vehicle (tree-7 records) — served the
+/// save whole and this is its verdict pair; `Pending` = the save is
+/// prepared up to the wire and waits for `ship` + `finish`.
+pub(crate) enum StagedLayoutSave<'a> {
+    Done((bool, Vec<crate::meta_backend::kv::block_refs::BlockRef>)),
+    Pending(Box<PendingLayoutSave<'a>>),
+}
+
+/// A layout save prepared by `stage` and not yet shipped: the encoded
+/// layout value (inline or indirect), the transaction's remaining
+/// reference ops (the finding-38 tail — every over-chunk prefix already
+/// committed), the delta when the caller half of the eligibility ladder
+/// holds, the CoW map-blob custody guards (the RES-9 mint guard fires on
+/// drop until `finish` disarms it; the in-flight registration drops with
+/// this struct — after the publish is visible), and the class verdicts
+/// `finish`'s RAM republish needs. Holds no lock; names no RAM entry.
+pub(crate) struct PendingLayoutSave<'a> {
+    ino: u64,
+    m: &'a CachedMetadata,
+    fencing_token: u64,
+    is_publish: bool,
+    bytes: Vec<u8>,
+    layout_block_map_id: Option<String>,
+    refs: Vec<crate::meta_backend::kv::block_refs::BlockRefOp>,
+    delta: Option<crate::layout_wire::LayoutDelta>,
+    minted_version: u64,
+    needs_indirect: bool,
+    max_chain: u32,
+    old_indirect_to_free: Option<String>,
+    new_indirect_key: Option<String>,
+    _blob_inflight: Option<crate::block_allocator::InflightAllocGuard>,
+    blob_minted: Option<crate::assembly_tasks::MintedBlockGuard>,
+}
+
+/// What `ship` learned from the reply: which vehicle persisted (`delta_used`),
+/// the link version the RAM provenance must claim, the finding-36
+/// recompute verdict with a LOCAL recompute's released set, and the
+/// commit instant for the publish-phase ledger.
+pub(crate) struct ShippedLayoutSave {
+    delta_used: bool,
+    minted_version: u64,
+    owner_recomputed: bool,
+    local_released: Vec<crate::meta_backend::kv::block_refs::BlockRef>,
+    t_commit: std::time::Instant,
+}
 
 /// The `fetch_metadata` serve gate, extracted (P2 per-op economy): a
 /// DIRTY layout is the local authority (never re-validated — see the
@@ -4326,7 +4426,7 @@ impl BackendRouter {
 
     /// The allocator that owns a block key's offset (see incarnation seqlock in
     /// [`crate::block_allocator::BlockAllocator`]).
-    fn allocator_for_key(
+    pub(crate) fn allocator_for_key(
         &self,
         block_key: &str,
     ) -> Option<(std::sync::Arc<crate::block_allocator::BlockAllocator>, u64)> {
@@ -4523,6 +4623,30 @@ impl BackendRouter {
     /// on this path: free ACCOUNTING is synchronous; only space RETURN is
     /// deferred.
     pub async fn free_block(&self, block_key: &str) -> Result<()> {
+        self.free_block_verdict(block_key).await.map(|_terminal| ())
+    }
+
+    /// The device offset a block key names (decoration-tolerant — a
+    /// size-carrying `bk:off:len` mapping resolves to its BASE), on
+    /// whichever backend routes it.
+    pub(crate) fn block_key_offset(&self, block_key: &str) -> Result<u64> {
+        Ok(self
+            .split_block_key_ref(clean_block_key_ref(block_key))?
+            .offset)
+    }
+
+    /// [`Self::free_block`] with the verdict: `true` ⇔ the release was the
+    /// block's TERMINAL one (the destructive reclaim window opened). A
+    /// co-writer's shipped free answers `false` here — its verdict is the
+    /// authority's (`crate::cowriter::ship_displaced_frees`).
+    ///
+    /// The tenant-release ledger rides here (design-small-file-packing
+    /// §10): a release of a TENANT-shaped key — a size-carrying mapping,
+    /// i.e. a decorated key (a whole-block `bk` / `bk:0:len` spanning the
+    /// chunk is a one-tenant pack by the design's own accounting) — counts
+    /// `pack_partial_frees` (nonterminal) or `pack_terminal_frees` (the
+    /// block's last), so `partial + terminal ≡ tenant releases` on a row.
+    pub async fn free_block_verdict(&self, block_key: &str) -> Result<bool> {
         // DLM S9 — the co-writer FREE path: a terminal free's accounting
         // ladder belongs to the AUTHORITY's ledger, so on a co-writer this
         // SHIPS as a verb instead of refusing at `begin_free`'s gate (the
@@ -4533,12 +4657,15 @@ impl BackendRouter {
         if crate::fuse_client::co_writer_mount()
             && !crate::cowriter::authority_accounting_scope_active()
         {
-            return crate::cowriter::ship_displaced_frees(self, &[block_key]).await;
+            crate::cowriter::ship_displaced_frees(self, &[block_key]).await?;
+            return Ok(false);
         }
         // Decoration-tolerant: size-carrying mappings (`bk:off:len` — see
         // `parse_block_mapping`) free their BASE block; a raw parse of the
         // decorated string would err and silently leak the block.
-        let parts = self.split_block_key_ref(clean_block_key_ref(block_key))?;
+        let cleaned = clean_block_key_ref(block_key);
+        let tenant_shaped = cleaned.len() < block_key.len();
+        let parts = self.split_block_key_ref(cleaned)?;
         // Spec §6.2 item 6: a free under a DEAD lifetime is the §6.3
         // hazard's destructive face — it would release (and queue a
         // discard for) an offset the allocator has already reissued to
@@ -4557,11 +4684,24 @@ impl BackendRouter {
         } else if let Some(be) = self.backends.get(be_id) {
             (be.block_allocator.clone(), be.device.device_path.clone())
         } else {
-            return Ok(());
+            return Ok(false);
         };
 
         log::debug!("router free_block: key={block_key} offset={offset}");
-        if allocator.begin_free(offset) {
+        let tracked = allocator.refcount(offset).is_some();
+        let terminal = allocator.begin_free(offset);
+        if tenant_shaped {
+            if terminal {
+                crate::fuse_client::METRICS
+                    .pack_terminal_frees
+                    .fetch_add(1, Ordering::Relaxed);
+            } else if tracked {
+                crate::fuse_client::METRICS
+                    .pack_partial_frees
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        if terminal {
             // Terminal release: `begin_free` has retired the incarnation, so
             // sweep the read tiers HERE — after the retire, before the
             // offset becomes reallocatable. A straggler validated-fill
@@ -4590,7 +4730,7 @@ impl BackendRouter {
                     .block_free_reclaim_elided
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 self.debt.record(&allocator, &device_path);
-                return Ok(());
+                return Ok(true);
             }
             // Queue the reclaim + finish_free; the in-flight registration
             // shields the begin_free-limbo offset from fsck's C2/C3/C6
@@ -4606,7 +4746,7 @@ impl BackendRouter {
                 })
                 .await;
         }
-        Ok(())
+        Ok(terminal)
     }
 
     /// Outstanding elided-discard debt bytes across this router's
@@ -5030,6 +5170,12 @@ pub struct DataRouterInner {
     /// §8 window cache) — clean derived state, dropped at will (R5
     /// `block_map_window`, floor 0) and on every local map mutation.
     pub(crate) kvmap_windows: std::sync::Arc<scc::HashMap<u64, KvmapWindows>>,
+    /// The small-file packer (design-small-file-packing §5.2–§5.4): the
+    /// per-data-volume OPEN pack blocks the packed promotion arm reserves
+    /// slots in, RAM-only, pinned by a refcount. Every driver's batch
+    /// begins with [`crate::pack::Packer::begin_promotion_batch`]; the
+    /// dismount teardown seals through [`DataRouter::seal_open_packs`].
+    pub packer: crate::pack::Packer,
 }
 
 #[derive(Clone)]
@@ -9221,6 +9367,18 @@ impl DataRouter {
     /// must run through the shipped-free ladder (RES-1: never freed under
     /// the caller's 3.5 stripe). Empty on every shipped arm — the owner
     /// freed its own.
+    ///
+    /// ONE save body in three halves (design-small-file-packing §5.2,
+    /// KD-10 — the owner's `prepare_layout_publish` / `finish_layout_publish`
+    /// shape mirrored on the client): [`Self::stage_layout_save`]
+    /// (everything up to and excluding the wire), [`Self::ship_layout_save`]
+    /// (the one publish call), [`Self::finish_layout_save`] (the reply's
+    /// post-actions — RAM publish, blob tail, the recompute latch). The
+    /// per-file save IS `stage → ship(1) → finish`; a batch driver composes
+    /// `stage × N → ship_group → finish × N` over the same halves. **`stage`
+    /// never publishes the RAM layout entry — `finish` does, after the
+    /// reply** (the invariant the co-writer group law's FIFO argument rests
+    /// on).
     async fn save_metadata_to_backend_body(
         &self,
         ino: u64,
@@ -9229,6 +9387,34 @@ impl DataRouter {
         publish_entries: Option<&[(u32, String)]>,
         block_refs: &[crate::meta_backend::kv::block_refs::BlockRefOp],
     ) -> Result<(bool, Vec<crate::meta_backend::kv::block_refs::BlockRef>)> {
+        match self
+            .stage_layout_save(ino, m, fencing_token, publish_entries, block_refs)
+            .await?
+        {
+            StagedLayoutSave::Done(verdict) => Ok(verdict),
+            StagedLayoutSave::Pending(mut pending) => {
+                let shipped = self.ship_layout_save(&mut pending).await?;
+                Ok(self.finish_layout_save(*pending, shipped).await)
+            }
+        }
+    }
+
+    /// The `stage` half of [`Self::save_metadata_to_backend_body`]: the
+    /// fencing / range-token check, the reclaim-in-flight NotFound refusal,
+    /// the kvmap arm (its own publish vehicle — `Done` when it served the
+    /// save whole), inline/indirect sizing and encoding, the CoW blob
+    /// write + barrier, the deferred-note drain, the finding-38 ref
+    /// chunking and the blob custody ops, the delta construction. Returns
+    /// the prepared save with its wire form and post-actions; nothing here
+    /// touches the RAM layout cache.
+    async fn stage_layout_save<'a>(
+        &self,
+        ino: u64,
+        m: &'a CachedMetadata,
+        fencing_token: u64,
+        publish_entries: Option<&'a [(u32, String)]>,
+        block_refs: &[crate::meta_backend::kv::block_refs::BlockRefOp],
+    ) -> Result<StagedLayoutSave<'a>> {
         let backend = self.inner.meta_backend.get().ok_or_else(|| {
             SqueezefsError::InvalidOperation("Metadata backend not initialized".to_string())
         })?;
@@ -9306,7 +9492,7 @@ impl DataRouter {
                 .kvmap_publish(ino, m, fencing_token, publish_entries, block_refs, true)
                 .await?
             {
-                return Ok(verdict);
+                return Ok(StagedLayoutSave::Done(verdict));
             }
             // Unreachable today — the sticky arm owns the publish past
             // its engagement gate (`Ok(None)` is the NEW-crossing
@@ -9404,7 +9590,7 @@ impl DataRouter {
                 .kvmap_publish(ino, m, fencing_token, publish_entries, block_refs, false)
                 .await?
             {
-                return Ok(verdict);
+                return Ok(StagedLayoutSave::Done(verdict));
             }
         }
 
@@ -9689,21 +9875,15 @@ impl DataRouter {
             }
         }
 
-        let t_commit = std::time::Instant::now();
-        // Spec §6.2 item 9: the link this save will stage, if the delta
-        // path engages — declared out here so the republish below can
-        // stamp the RAM provenance to exactly what was persisted.
+        // The delta, when the caller half of the ladder holds. §6.2 item 9:
+        // name the base DURABLY — the delta claims the version of the
+        // persisted state this RAM entry descends from (0 = unknown
+        // provenance ⇒ the backend re-bases on a versioned volume) and
+        // carries its own freshly-minted, era-composed link version. The
+        // mint always runs (cheap); the backend strips the pair on
+        // un-stamped volumes so their wire stays byte-identical.
         let mut minted_version = 0u64;
-        // Finding 36: whether this publish's staged accounting was
-        // RECOMPUTED (a shipped chained/composed merge, the custody-scoped
-        // Put, or a local recomputed arm) — surfaced to the displaced-free
-        // sites so the caller-frame stream stands down. Assigned on every
-        // Ok path of both publish classes below.
-        let owner_recomputed;
-        // Finding 36b: a LOCAL recompute's released set (empty on shipped
-        // arms — the owner freed its own).
-        let mut local_released: Vec<crate::meta_backend::kv::block_refs::BlockRef> = Vec::new();
-        let delta_used = if delta_eligible {
+        let delta = if delta_eligible {
             let mut delta = crate::layout_wire::LayoutDelta::from_final_state(
                 &layout.file_type,
                 m.size,
@@ -9715,15 +9895,59 @@ impl DataRouter {
                     .expect("delta_eligible requires entries")
                     .to_vec(),
             );
-            // §6.2 item 9: name the base DURABLY — the delta claims the
-            // version of the persisted state this RAM entry descends
-            // from (0 = unknown provenance ⇒ the backend re-bases on a
-            // versioned volume) and carries its own freshly-minted,
-            // era-composed link version. The mint always runs (cheap);
-            // the backend strips the pair on un-stamped volumes so
-            // their wire stays byte-identical.
             minted_version = crate::dlm::mint_layout_version();
             delta.set_versions(m.layout_version, minted_version);
+            Some(delta)
+        } else {
+            None
+        };
+        Ok(StagedLayoutSave::Pending(Box::new(PendingLayoutSave {
+            ino,
+            m,
+            fencing_token,
+            is_publish,
+            bytes,
+            layout_block_map_id: layout.block_map_id,
+            refs,
+            delta,
+            minted_version,
+            needs_indirect,
+            max_chain,
+            old_indirect_to_free,
+            new_indirect_key,
+            _blob_inflight,
+            blob_minted,
+        })))
+    }
+
+    /// The `ship` half of [`Self::save_metadata_to_backend_body`]: the one
+    /// publish call — the O(batch) delta merge or the whole-layout Put —
+    /// with the never-lossy refill on failure (a save that did not commit
+    /// must not consume the accounting its map change still owes; the
+    /// next persist owns it) and the provenance reset. Consumes the
+    /// staged refs; touches no RAM layout entry.
+    async fn ship_layout_save(
+        &self,
+        pending: &mut PendingLayoutSave<'_>,
+    ) -> Result<ShippedLayoutSave> {
+        let backend = self.inner.meta_backend.get().ok_or_else(|| {
+            SqueezefsError::InvalidOperation("Metadata backend not initialized".to_string())
+        })?;
+        let ino = pending.ino;
+        let m = pending.m;
+        let refs = std::mem::take(&mut pending.refs);
+        let t_commit = std::time::Instant::now();
+        // Finding 36: whether this publish's staged accounting was
+        // RECOMPUTED (a shipped chained/composed merge, the custody-scoped
+        // Put, or a local recomputed arm) — surfaced to the displaced-free
+        // sites so the caller-frame stream stands down. Assigned on every
+        // Ok path of both publish classes below.
+        let owner_recomputed;
+        // Finding 36b: a LOCAL recompute's released set (empty on shipped
+        // arms — the owner freed its own).
+        let mut local_released: Vec<crate::meta_backend::kv::block_refs::BlockRef> = Vec::new();
+        let mut minted_version = pending.minted_version;
+        let delta_used = if let Some(delta) = pending.delta.as_ref() {
             // The full layout moves as `Bytes` (Lever B: the aggregated
             // conveyor parks it as the always-correct fallback — a move,
             // never a per-save copy).
@@ -9731,10 +9955,11 @@ impl DataRouter {
             // save that did not commit must not consume the accounting its
             // map change still owes — the next persist owns it.
             let refill = refs.clone();
+            let bytes = std::mem::take(&mut pending.bytes);
             match crate::meta_ship::publish::merge_layout_and_size(
                 backend,
                 ino,
-                &delta,
+                delta,
                 bytes::Bytes::from(bytes),
                 m.size,
                 refs,
@@ -9778,7 +10003,11 @@ impl DataRouter {
             }
         } else {
             match crate::meta_ship::publish::set_layout_and_size(
-                backend, ino, &bytes, m.size, &refs,
+                backend,
+                ino,
+                &pending.bytes,
+                m.size,
+                &refs,
             )
             .await
             {
@@ -9800,6 +10029,51 @@ impl DataRouter {
             }
             false
         };
+        Ok(ShippedLayoutSave {
+            delta_used,
+            minted_version,
+            owner_recomputed,
+            local_released,
+            t_commit,
+        })
+    }
+
+    /// The `finish` half of [`Self::save_metadata_to_backend_body`]: the
+    /// reply's post-actions — the blob mint guard's disarm (custody
+    /// transferred), the publish-phase ledger, the RAM republish with its
+    /// chain / provenance / blob-pointer accounting (the ONE place a
+    /// staged save publishes its layout entry), the predecessor blob's
+    /// free, the finding-36 recompute latch. Returns the verdict pair the
+    /// body documents.
+    async fn finish_layout_save(
+        &self,
+        pending: PendingLayoutSave<'_>,
+        shipped: ShippedLayoutSave,
+    ) -> (bool, Vec<crate::meta_backend::kv::block_refs::BlockRef>) {
+        let PendingLayoutSave {
+            ino,
+            m,
+            fencing_token,
+            is_publish,
+            bytes: _,
+            layout_block_map_id,
+            refs: _,
+            delta: _,
+            minted_version: _,
+            needs_indirect,
+            max_chain,
+            old_indirect_to_free,
+            new_indirect_key,
+            _blob_inflight,
+            mut blob_minted,
+        } = pending;
+        let ShippedLayoutSave {
+            delta_used,
+            minted_version,
+            owner_recomputed,
+            local_released,
+            t_commit,
+        } = shipped;
         // DUR-6: the commit named the fresh blob — custody transferred.
         if let Some(mut guard) = blob_minted.take() {
             guard.disarm();
@@ -9848,7 +10122,7 @@ impl DataRouter {
         // leaked blob incarnation per merge; ~130 orphans per 700-block
         // spill burst measured). Sequential inline uploads masked it —
         // the pipeline's size-bump/merge interleaving exposed it.
-        cached.block_map_id = layout.block_map_id.clone().map(Into::into);
+        cached.block_map_id = layout_block_map_id.map(Into::into);
         cached.cached_at = std::time::Instant::now();
         // Lever A (2026-08-01): the republished entry IS the just-
         // persisted state — coherent with the save's fencing era.
@@ -9892,7 +10166,7 @@ impl DataRouter {
         } else {
             let _ = self.inner.publish_recomputed.remove_sync(&ino);
         }
-        Ok((owner_recomputed, local_released))
+        (owner_recomputed, local_released)
     }
 
     pub fn new(
@@ -10069,6 +10343,7 @@ impl DataRouter {
                 kvmap_sweep_corpses: std::sync::Arc::new(scc::HashMap::new()),
                 kvmap_overlays: std::sync::Arc::new(scc::HashMap::new()),
                 kvmap_windows: std::sync::Arc::new(scc::HashMap::new()),
+                packer: crate::pack::Packer::new(),
             }),
         };
         // Merge-worker promotion commits layout through the router (weak:
@@ -13830,12 +14105,38 @@ impl DataRouter {
     ///
     /// The inline path has no step 1: steps 2–3 run under the same lock with
     /// the same re-checks.
-    pub(crate) async fn promote_staged_file(
+    ///
+    /// ONE primitive, two halves (design-small-file-packing §5.2, KD-10):
+    /// [`Self::prepare_promotion`] (steps 1 — the image read, the transform,
+    /// the size dispatch, the device DMA) and [`Self::commit_promotion`]
+    /// (steps 2–3 under the ino's guard). The per-file call is their
+    /// composition — the degenerate batch of one; a batch driver composes
+    /// `prepare × N → commit × N` over the same halves.
+    pub async fn promote_staged_file(
         &self,
         file_path: &str,
         file_id: &str,
         fencing_token: u64,
     ) -> Result<Option<PromotedInto>> {
+        match self.prepare_promotion(file_path, file_id).await? {
+            Some(prepared) => self.commit_promotion(prepared, fencing_token).await,
+            None => Ok(None),
+        }
+    }
+
+    /// The `prepare` half of [`Self::promote_staged_file`]: read the ring
+    /// image (the W2 rider fence and the identity read exactly as before),
+    /// dispatch on size, and for the device arm transform + DMA the image
+    /// into its placed block (io_uring, no locks held) and publish the
+    /// block's incarnation word. `Ok(None)` = nothing to promote (the entry
+    /// is gone, or a live extent record defers it). The returned value
+    /// holds the block's in-flight registration until the commit is
+    /// durable and visible (or its failure path abandons the offset).
+    pub async fn prepare_promotion(
+        &self,
+        file_path: &str,
+        file_id: &str,
+    ) -> Result<Option<PreparedPromotion>> {
         let nvme = &self.cache.nvme;
         let Some(gen) = nvme.staged_generation(file_id).await else {
             return Ok(None);
@@ -13878,16 +14179,13 @@ impl DataRouter {
             .unwrap_or(0)
             .max(raw_len as u64);
         if logical <= inline_max as u64 {
-            return self
-                .promote_staged_file_inline(
-                    file_path,
-                    promote_ino,
-                    file_id,
-                    gen,
-                    raw,
-                    fencing_token,
-                )
-                .await;
+            return Ok(Some(PreparedPromotion::Inline {
+                file_path: file_path.to_string(),
+                ino: promote_ino,
+                file_id: file_id.to_string(),
+                gen,
+                raw,
+            }));
         }
         let processed = self
             .get_crypto()
@@ -13909,6 +14207,30 @@ impl DataRouter {
             );
             return Ok(None);
         }
+
+        // The size dispatch's second leg (design-small-file-packing §5.2
+        // step 2): under the lever, an image whose LBA-rounded slot fits
+        // the own-block threshold packs into the shared open pack block;
+        // a larger one takes its own block. A CO-WRITER never packs in PK2
+        // (its batch-scoped pack is PK4's) — its promotions run the block
+        // arm, counted as the never-wrong fallback.
+        if small_file_packing_enabled() {
+            let slot = pack_slot_len(processed.len() as u64);
+            if slot > pack_max_slot_bytes() {
+                METRICS
+                    .pack_own_block_promotions
+                    .fetch_add(1, Ordering::Relaxed);
+            } else if crate::fuse_client::co_writer_mount() {
+                METRICS
+                    .pack_cowriter_group_unavailable
+                    .fetch_add(1, Ordering::Relaxed);
+            } else {
+                return self
+                    .prepare_packed_promotion(promote_ino, file_id, gen, raw_len, processed, slot)
+                    .await;
+            }
+        }
+
         let (be_id, allocator, writer, offset) =
             self.backend_router.allocate_placed_block().await?;
         // PR VL6a: live owner registration for the allocate→commit window
@@ -13935,8 +14257,163 @@ impl DataRouter {
         // data-barrier step included) barriers that namespace.
         self.backend_router
             .note_fsync_touched_device(promote_ino, &writer);
+        Ok(Some(PreparedPromotion::Device(PreparedDevicePromotion {
+            ino: promote_ino,
+            file_id: file_id.to_string(),
+            gen,
+            raw_len,
+            block_key,
+            site: PreparedSite::Block {
+                allocator,
+                offset,
+                _inflight,
+            },
+        })))
+    }
 
-        let ino = parse_inode_from_path(file_path);
+    /// The PACKED arm's `prepare` (design-small-file-packing §5.2 steps
+    /// 3–4): reserve a slot in the open pack block (one `fetch_add`; the
+    /// tenant's own in-flight registration and reference ride the handle),
+    /// DMA the image at `base + off` — ONE write of exactly the slot (the
+    /// device's unaligned arm zero-fills `[len, slot)`) — and publish the
+    /// block's incarnation word (idempotent: the FIRST tenant's publish
+    /// stabilizes it, later ones are no-ops — KD-3, the block-granular
+    /// word is stable for its committed keys from the first DMA on). A
+    /// DMA error releases the tenant's reference (no guard is held here)
+    /// and returns the error — nothing published, nothing lost. `Ok(None)`
+    /// = the arm is stopped (OQ-1) or closed: the entry stays resident,
+    /// counted.
+    async fn prepare_packed_promotion(
+        &self,
+        ino: u64,
+        file_id: &str,
+        gen: u64,
+        raw_len: usize,
+        image: bytes::Bytes,
+        slot: u64,
+    ) -> Result<Option<PreparedPromotion>> {
+        let Some(tenant) = self.packer.reserve(&self.backend_router, slot).await? else {
+            METRICS
+                .pack_arm_stopped_promotions
+                .fetch_add(1, Ordering::Relaxed);
+            return Ok(None);
+        };
+        let image_len = image.len();
+        let block_key = format!("{}:{}:{}", tenant.pack.base_key, tenant.off, image_len);
+        if let Err(e) = tenant
+            .pack
+            .device
+            .write_block(tenant.pack.base + tenant.off, image)
+            .await
+        {
+            self.release_pack_tenant(tenant).await;
+            return Err(e);
+        }
+        tenant.pack.allocator.publish_block(tenant.pack.base);
+        // W-5: the stamp every DMA site owes the fsync touched table.
+        self.backend_router
+            .note_fsync_touched_device(ino, &tenant.pack.device);
+        METRICS
+            .pack_promoted_bytes
+            .fetch_add(image_len as u64, Ordering::Relaxed);
+        METRICS
+            .pack_slot_pad_bytes
+            .fetch_add(slot - image_len as u64, Ordering::Relaxed);
+        Ok(Some(PreparedPromotion::Device(PreparedDevicePromotion {
+            ino,
+            file_id: file_id.to_string(),
+            gen,
+            raw_len,
+            block_key,
+            site: PreparedSite::Packed(tenant),
+        })))
+    }
+
+    /// Give a reserved slot's reference back (design-small-file-packing
+    /// §5.2 step 6 / §5.3): a refused commit or a failed DMA. Through the
+    /// allocator's ONE release primitive, OUTSIDE every 3.5 guard (RES-1 —
+    /// the release is TERMINAL when the pack sealed and every sibling was
+    /// deleted meanwhile, and a terminal free's reclaim enqueue parks at
+    /// the cap). The slot's bytes are dead space until compaction —
+    /// counted `pack_slots_abandoned`. An authority's outcome is always
+    /// known (its commit is local).
+    async fn release_pack_tenant(&self, tenant: crate::pack::PackTenant) {
+        METRICS.pack_slots_abandoned.fetch_add(1, Ordering::Relaxed);
+        if let Err(e) = tenant
+            .pack
+            .allocator
+            .release_pack_reference(
+                &self.backend_router,
+                &tenant.pack.base_key,
+                crate::block_allocator::PackPublishOutcome::Known,
+            )
+            .await
+        {
+            log::error!(
+                "packing: releasing an abandoned tenant slot's reference on {} failed: {e:?} — \
+                 the block's RAM refcount stays one above its tenants until remount (space, \
+                 never data)",
+                tenant.pack.base_key
+            );
+        }
+    }
+
+    /// The dismount seal (design-small-file-packing §5.3 (b)): every open
+    /// pack seals — after the promotion pass, before "Dismount clean".
+    /// Returns the number sealed.
+    pub async fn seal_open_packs(&self) -> u64 {
+        self.packer.seal_all(&self.backend_router).await
+    }
+
+    /// The `commit` half of [`Self::promote_staged_file`]: the layout
+    /// commit under the ino's `INODE_META_LOCKS` guard (3.5) with the
+    /// staged identity + generation re-checked under it, the durable
+    /// reference riding the same tx, the ring-entry release inside the
+    /// guarded section (leg 5), displaced keys freed after the guard drops
+    /// (RES-1), and — on a refused or failed commit — the block arm's
+    /// never-published offset abandoned / the packed arm's tenant
+    /// reference released (both after the guard).
+    pub async fn commit_promotion(
+        &self,
+        prepared: PreparedPromotion,
+        fencing_token: u64,
+    ) -> Result<Option<PromotedInto>> {
+        let PreparedDevicePromotion {
+            ino,
+            file_id,
+            gen,
+            raw_len,
+            block_key,
+            site,
+        } = match prepared {
+            PreparedPromotion::Inline {
+                file_path,
+                ino,
+                file_id,
+                gen,
+                raw,
+            } => {
+                return self
+                    .promote_staged_file_inline(&file_path, ino, &file_id, gen, raw, fencing_token)
+                    .await;
+            }
+            PreparedPromotion::Device(d) => d,
+        };
+        let into = match &site {
+            PreparedSite::Block { .. } => PromotedInto::Block,
+            PreparedSite::Packed(_) => PromotedInto::Packed,
+        };
+        // Test seam (`SQUEEZEFS_TEST_PACK_COMMIT_STALL_MS`): a packed tenant
+        // parks between its DMA and its commit — the kill-9 crash harness's
+        // deterministic window (design §5.4: a slot no layout names).
+        if into == PromotedInto::Packed {
+            let stall = pack_commit_stall_ms();
+            if stall > 0 {
+                squeezefs_ipc::sqz_time::sleep(std::time::Duration::from_millis(stall)).await;
+            }
+        }
+        let nvme = &self.cache.nvme;
+        let file_id = file_id.as_str();
         // RES-1: keys displaced under the commit's level-3.5 guard are
         // collected here and freed after it drops (`free_block`'s at-cap
         // enqueue parks up to `SQUEEZEFS_RECLAIM_CAP_PARK_MS`).
@@ -14019,31 +14496,50 @@ impl DataRouter {
             let _ = nvme
                 .remove_staged_if_generation_async(file_id.to_string(), gen)
                 .await;
-            Ok(Some(PromotedInto::Block))
+            Ok(Some(into))
         }
         .await;
 
         // RES-1: the commit's guard is gone with its future — free now.
         self.free_deferred_keys(deferred).await;
 
-        // The promotion's blob never took the mapping (identity moved /
-        // commit refused): the offset is never-published — co-writer-aware
-        // abandon (d575be03 sweep; a co-writer's refused shipped commit is
-        // the post-fence storm's per-block cleanup).
+        // The promotion's image never took the mapping (identity moved /
+        // commit refused / the save failed). Block arm: the offset is
+        // never-published — co-writer-aware abandon (d575be03 sweep; a
+        // co-writer's refused shipped commit is the post-fence storm's
+        // per-block cleanup). Packed arm: the tenant's reference releases
+        // (§5.2 step 6 — after the guard, which is gone with the future;
+        // terminal when the pack sealed and every sibling was deleted).
+        // A committed tenant KEEPS its reference — the layout owns it — and
+        // its in-flight registration drops with `site` at return, after
+        // the publish is visible.
         match commit {
             Ok(Some(into)) => {
-                METRICS
-                    .layout_promoted_block
-                    .fetch_add(1, Ordering::Relaxed);
+                match &site {
+                    PreparedSite::Block { .. } => {
+                        METRICS
+                            .layout_promoted_block
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
+                    PreparedSite::Packed(tenant) => {
+                        tenant.pack.note_committed();
+                        METRICS
+                            .layout_promoted_packed
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
+                }
                 Ok(Some(into))
             }
-            Ok(None) => {
-                let _ = allocator.abandon_unpublished_offset(offset).await;
-                Ok(None)
-            }
-            Err(e) => {
-                let _ = allocator.abandon_unpublished_offset(offset).await;
-                Err(e)
+            outcome => {
+                match site {
+                    PreparedSite::Block {
+                        allocator, offset, ..
+                    } => {
+                        let _ = allocator.abandon_unpublished_offset(offset).await;
+                    }
+                    PreparedSite::Packed(tenant) => self.release_pack_tenant(tenant).await,
+                }
+                outcome
             }
         }
     }
@@ -21274,7 +21770,11 @@ impl DataRouter {
             for (b, bk) in block_map.iter() {
                 self.cache.purge_block_key(bk);
                 ref_changes.push((*b, bk.clone(), false));
-                blocks_to_free.push(clean_block_key(bk));
+                // The mapping VERBATIM: every free consumer cleans the key
+                // itself, and the router's tenant-release ledger
+                // (`pack_{partial,terminal}_frees`) reads the size-carrying
+                // shape a packed tenant's mapping carries.
+                blocks_to_free.push(bk.clone());
             }
         }
 
@@ -21329,12 +21829,12 @@ impl DataRouter {
             while let Some(k) = epoch.displaced.pop() {
                 blocks_to_free.push(clean_block_key(&k));
             }
-            let mapped: std::collections::HashSet<&str> =
-                blocks_to_free.iter().map(|s| s.as_str()).collect();
+            let mapped: std::collections::HashSet<String> =
+                blocks_to_free.iter().map(|s| clean_block_key(s)).collect();
             let mut shadow_only: Vec<String> = Vec::new();
             epoch.shadow.iter_sync(|_, k| {
                 let cleaned = clean_block_key(k);
-                if !mapped.contains(cleaned.as_str()) {
+                if !mapped.contains(&cleaned) {
                     shadow_only.push(cleaned);
                 }
                 true

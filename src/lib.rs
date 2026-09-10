@@ -228,6 +228,7 @@ pub mod block_allocator;
 pub mod block_reclaim;
 pub mod jobs;
 pub mod meta_exec;
+pub mod pack;
 pub mod signals;
 pub mod sqz_sync;
 /// Crate-neutral alias: `#[path]`-shared modules (sqz_sync, sqz_fdwatch)

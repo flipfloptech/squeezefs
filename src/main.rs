@@ -2540,12 +2540,13 @@ fn print_fsck_report(report: &squeezefs::fsck::FsckReport, json: bool) {
     );
     println!(
         "suspects: {} raised, {} cleared ({} epoch-exempt, {} in-flight-exempt, \
-         {} mover-ledger-exempt)",
+         {} mover-ledger-exempt, {} pack-ledger-exempt)",
         c.suspects,
         c.suspects_cleared,
         c.epoch_exempted,
         c.inflight_exempted,
         c.mover_ledger_exempted,
+        c.pack_ledger_exempted,
     );
     if c.scrub_blocks_scanned > 0 {
         println!(

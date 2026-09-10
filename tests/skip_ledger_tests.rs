@@ -337,6 +337,7 @@ fn the_mount_gated_suites_all_use_the_shared_gate() {
         "packed_mapping_wire_tests.rs",
         "phantom_backend0_tests.rs",
         "posix_mount_semantics_tests.rs",
+        "small_file_packing_tests.rs",
         "statfs_tests.rs",
         "transport_concurrency_tests.rs",
         "transport_geometry_tests.rs",

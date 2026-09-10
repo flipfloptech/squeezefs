@@ -668,6 +668,11 @@ pub struct FsckCounters {
     pub epoch_exempted: u64,
     pub inflight_exempted: u64,
     pub mover_ledger_exempted: u64,
+    /// C2/C3 suspects excused by the small-file packer's pack-open ledger
+    /// (design-small-file-packing §5.3): the +1 PIN of an OPEN pack block —
+    /// exactly one per open pack, so a quiet mount reads `= open packs`;
+    /// the tenants' transient references ride `inflight_exempted`.
+    pub pack_ledger_exempted: u64,
     /// DLM S9 (rung-10 finding #5): block-plane verdicts DECLINED because
     /// the object lives in an allocation lane this mount does not own —
     /// a live peer writer's blocks are durably referenced and
@@ -1755,6 +1760,7 @@ pub fn merge_reports(reports: &[FsckReport]) -> FsckReport {
         counters.epoch_exempted += r.counters.epoch_exempted;
         counters.inflight_exempted += r.counters.inflight_exempted;
         counters.mover_ledger_exempted += r.counters.mover_ledger_exempted;
+        counters.pack_ledger_exempted += r.counters.pack_ledger_exempted;
         counters.foreign_lane_exempted += r.counters.foreign_lane_exempted;
         counters.map_orphan_records += r.counters.map_orphan_records;
         counters.map_empty_heads += r.counters.map_empty_heads;
@@ -1827,6 +1833,7 @@ fn fold_finalize_counters(dst: &mut FsckCounters, fin: &FsckCounters) {
     dst.epoch_exempted += fin.epoch_exempted;
     dst.inflight_exempted += fin.inflight_exempted;
     dst.mover_ledger_exempted += fin.mover_ledger_exempted;
+    dst.pack_ledger_exempted += fin.pack_ledger_exempted;
     dst.foreign_lane_exempted += fin.foreign_lane_exempted;
     // C11 runs ONLY in the finalize (shards skip the map plane, so the
     // shard reports carry zeros — no double count).
@@ -2569,6 +2576,7 @@ fn fold_worker_counters(dst: &mut FsckCounters, src: &FsckCounters) {
     dst.epoch_exempted += src.epoch_exempted;
     dst.inflight_exempted += src.inflight_exempted;
     dst.mover_ledger_exempted += src.mover_ledger_exempted;
+    dst.pack_ledger_exempted += src.pack_ledger_exempted;
     dst.foreign_lane_exempted += src.foreign_lane_exempted;
     dst.scrub_blocks_scanned += src.scrub_blocks_scanned;
     dst.scrub_bytes_scanned += src.scrub_bytes_scanned;
@@ -4103,12 +4111,33 @@ async fn recheck_suspects(
         .into_iter()
         .map(|k| clean_key(&k))
         .collect();
+    // The small-file packer's OPEN pack blocks (design-small-file-packing
+    // §5.3): each holds the packer's +1 PIN — a RAM reference no layout
+    // justifies while the block is open — so an open pack reads C3 (RAM
+    // refcount = tenants + 1 vs the census's tenants) or, before its first
+    // tenant committed, C2Leaked (refcount 1, no referencer). The ledger
+    // excuses exactly that pin; the tenants' transient references are
+    // the registry's (checked first).
+    // Resolved to `(allocator, offset)` through the router — the ledger's
+    // key spelling is the PACKER's (`persist_block_key` of the placement
+    // pick's backend id), which need not match the census's volume id on
+    // a bare router; allocator identity + offset is the one comparison
+    // every spelling reduces to.
+    let pack_ledger: Vec<(Arc<BlockAllocator>, u64)> = crate::jobs::pack_open_ledger()
+        .iter()
+        .filter_map(|k| ctx.router.backend_router.allocator_for_key(k))
+        .collect();
+    let pack_open = |alloc: &Arc<BlockAllocator>, offset: u64| {
+        pack_ledger
+            .iter()
+            .any(|(a, o)| Arc::ptr_eq(a, alloc) && *o == offset)
+    };
     let alloc_of = |vol: &str| vols.iter().find(|v| v.id == vol).map(|v| v.alloc.clone());
 
     // Phase A (C2/C3): epoch filter, then — for two-epoch survivors —
-    // the in-flight registry, THEN the mover ledger. Registry-absence
-    // strictly precedes the Phase-B reference re-read (the §5.6
-    // normative order; the hook marks the boundary).
+    // the in-flight registry, THEN the mover ledger, THEN the pack-open
+    // ledger. Registry-absence strictly precedes the Phase-B reference
+    // re-read (the §5.6 normative order; the hook marks the boundary).
     let mut pending: Vec<Suspect> = Vec::new();
     for s in suspects {
         match &s.kind {
@@ -4135,6 +4164,11 @@ async fn recheck_suspects(
                 }
                 if ledger.iter().any(|k| k == &key || k == &clean_key(&key)) {
                     counters.mover_ledger_exempted += 1;
+                    counters.suspects_cleared += 1;
+                    continue;
+                }
+                if pack_open(&alloc, *offset) {
+                    counters.pack_ledger_exempted += 1;
                     counters.suspects_cleared += 1;
                     continue;
                 }
@@ -4379,10 +4413,34 @@ async fn recheck_suspects(
                 let fresh = c8_fresh.as_deref().unwrap_or(&[]);
                 let chunk = ctx.router.backend_router.default_allocator.chunk_size();
                 let idx = offset / chunk.max(1);
-                fresh
-                    .iter()
-                    .any(|(v, i, _, _)| v == vol && *i == idx)
-                    .then(|| {
+                let still_drifts = fresh.iter().any(|(v, i, _, _)| v == vol && *i == idx);
+                // The comparison reads the durable scan and the layout walk
+                // at DIFFERENT instants, so a block a publish lands on
+                // between the two reads one reference apart — a transient
+                // the two-epoch check excludes when the next publish moves
+                // to another block, which it always did until the small-
+                // file packer made ONE block the landing site of every
+                // promotion in a batch (design-small-file-packing §5.3):
+                // the open pack block re-drifts by a DIFFERENT commit on
+                // both passes. An OPEN pack (the pack-open ledger) or a
+                // block with a live in-flight owner is under publication
+                // by construction — excused, counted, judged once it seals
+                // or its owners deregister. Zero-FP in the report-only
+                // direction; the quiesced mount-init verify is untouched.
+                if still_drifts && alloc_of(vol).is_some_and(|alloc| pack_open(&alloc, *offset)) {
+                    counters.pack_ledger_exempted += 1;
+                    counters.suspects_cleared += 1;
+                    continue;
+                }
+                if still_drifts
+                    && online
+                    && alloc_of(vol).is_some_and(|alloc| alloc.inflight_contains(*offset))
+                {
+                    counters.inflight_exempted += 1;
+                    counters.suspects_cleared += 1;
+                    continue;
+                }
+                still_drifts.then(|| {
                         crate::meta_backend::kv::META_KV_BLOCK_REFS_DRIFT
                             .fetch_add(1, Ordering::Relaxed);
                         FsckFinding {
@@ -5374,6 +5432,8 @@ fn publish_metrics(c: &FsckCounters) {
         .fetch_add(c.inflight_exempted, Ordering::Relaxed);
     m.fsck_mover_ledger_exempted
         .fetch_add(c.mover_ledger_exempted, Ordering::Relaxed);
+    m.fsck_pack_ledger_exempted
+        .fetch_add(c.pack_ledger_exempted, Ordering::Relaxed);
     m.fsck_foreign_lane_exempted
         .fetch_add(c.foreign_lane_exempted, Ordering::Relaxed);
     m.fsck_map_orphan_records

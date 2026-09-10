@@ -2221,6 +2221,10 @@ impl NvmeStaging {
             return;
         };
         let router = crate::routing::DataRouter::from_inner(router);
+        // A promotion BATCH (design-small-file-packing OQ-1): re-arm the
+        // pack arm after a StorageFull stop; a stop inside this batch
+        // leaves its remaining entries resident-and-counted.
+        router.packer.begin_promotion_batch();
 
         let mut seen = std::collections::HashSet::new();
         for item in batch.drain(..) {

@@ -40,6 +40,7 @@ DEFAULT_TESTS=(
   packed_mapping_wire_tests
   phantom_backend0_tests
   posix_mount_semantics_tests
+  small_file_packing_tests
   statfs_tests
   transport_concurrency_tests
   transport_geometry_tests

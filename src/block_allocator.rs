@@ -4002,6 +4002,108 @@ impl BlockAllocator {
         self.free_block(offset).await
     }
 
+    /// The quiet leak-safe abandon arm of [`Self::abandon_unpublished_offset`]
+    /// WITHOUT the finding-15 lane recycle: the private entry is dropped,
+    /// the word left unstable, and the offset stays out of every local
+    /// allocation path until a harvest or remount re-derives it from the
+    /// ledger. The disposition for a co-writer pack whose publishes have an
+    /// UNKNOWN outcome (§5.3 — FIND-PK-4's closure): durable layouts MAY
+    /// name the block on the owner, so recycling it into this mount's lane
+    /// free list would mint a double owner. Counted
+    /// `cowriter_unpublished_abandons`.
+    fn abandon_without_recycle(&self, offset: u64) {
+        let idx = offset / self.chunk_size;
+        let _ = self.refcounts.remove_sync(&offset);
+        let _ = self.harvest_grants.remove_sync(&idx);
+        self.mark_incarnation_unstable(offset);
+        crate::fuse_client::METRICS
+            .cowriter_unpublished_abandons
+            .fetch_add(1, Ordering::Relaxed);
+        log::debug!(
+            "co-writer abandon (outcome unknown): offset {offset} on volume '{}' left to the \
+             next derivation, never recycled",
+            self._volume_id
+        );
+    }
+
+    /// **The pack block's ONE release primitive**
+    /// (design-small-file-packing §5.3): the packer's pin at the seal, a
+    /// refused tenant's reference and a failed DMA's reference all release
+    /// through here. Runs OUTSIDE every 3.5 guard (RES-1 — the terminal
+    /// arm's reclaim enqueue parks at the reclaim cap) and dispatches on
+    /// posture, on the entry's state and on whether the pack's publishes
+    /// have a KNOWN outcome:
+    ///
+    /// * **authority / solo**: the ROUTER ladder
+    ///   ([`crate::routing::BackendRouter::free_block`]) for nonterminal
+    ///   and terminal alike — a pack block's end of life is byte-identical
+    ///   to a striped block's (read-tier purge, incarnation retire,
+    ///   reclaim-queue enqueue, discard-elision debt, grace ring and S7
+    ///   quarantine composed); an authority's outcome is always known.
+    ///   Untracked is unreachable here (the pin keeps the entry alive until
+    ///   this release) — counted `pack_release_untracked_noops`, logged
+    ///   ERROR.
+    /// * **co-writer**: nonterminal → a PRIVATE release of the mount's own
+    ///   view (nothing ships — nothing durable ever named the pin);
+    ///   terminal + KNOWN → [`Self::abandon_unpublished_offset`] (the
+    ///   never-published arm: the lane recycle); terminal + UNKNOWN →
+    ///   `abandon_without_recycle`; untracked → a counted no-op
+    ///   (the last committed tenant's shipped `Freed` already ran
+    ///   `retire_shipped_free_tracking` — the authority owns the offset
+    ///   now, and a terminal arm here would hand it to this lane a SECOND
+    ///   time). PK2's co-writer posture never packs (PK4 lands the batch
+    ///   pack); these arms are exercised directly.
+    /// * a **reader** promotes nothing and never reaches this.
+    pub async fn release_pack_reference(
+        &self,
+        router: &crate::routing::BackendRouter,
+        block_key: &str,
+        outcome: PackPublishOutcome,
+    ) -> Result<PackRelease> {
+        let offset = router.block_key_offset(block_key)?;
+        let Some(count) = self.refcount(offset) else {
+            crate::fuse_client::METRICS
+                .pack_release_untracked_noops
+                .fetch_add(1, Ordering::Relaxed);
+            if crate::fuse_client::co_writer_mount()
+                && !crate::cowriter::authority_accounting_scope_active()
+            {
+                log::debug!(
+                    "packing: release of untracked pack block {block_key} on a co-writer — the \
+                     last committed tenant's shipped free retired it; no-op"
+                );
+            } else {
+                log::error!(
+                    "packing: release of UNTRACKED pack block {block_key} on the authority — \
+                     the pin's own reference should have kept the entry alive; no-op \
+                     (pack_release_untracked_noops)"
+                );
+            }
+            return Ok(PackRelease::UntrackedNoop);
+        };
+        if crate::fuse_client::co_writer_mount()
+            && !crate::cowriter::authority_accounting_scope_active()
+        {
+            if count > 1 {
+                self.release_shipped_free_tracking(offset);
+                return Ok(PackRelease::Nonterminal);
+            }
+            match outcome {
+                PackPublishOutcome::Known => {
+                    self.abandon_unpublished_offset(offset).await?;
+                }
+                PackPublishOutcome::Unknown => self.abandon_without_recycle(offset),
+            }
+            return Ok(PackRelease::Terminal);
+        }
+        let terminal = router.free_block_verdict(block_key).await?;
+        Ok(if terminal {
+            PackRelease::Terminal
+        } else {
+            PackRelease::Nonterminal
+        })
+    }
+
     pub fn get_used_blocks(&self) -> u64 {
         let highest = self.highest_block.load(Ordering::Relaxed);
         let free = self.free_blocks.len() as u64;
@@ -4514,6 +4616,33 @@ pub(crate) struct LayoutWalkSummary {
     pub(crate) checked: u64,
     pub(crate) valid_inodes: u64,
     pub(crate) layouts_found: u64,
+}
+
+/// Whether a pack block's publishes have a KNOWN outcome when its
+/// reference releases (design-small-file-packing §5.3): an authority's
+/// commit is local — always `Known`; on a co-writer a shipped commit
+/// whose transport failed past the resend ladder against an owner that
+/// MAY have applied it is `Unknown` (FIND-PK-4 — PK4 lands the typed
+/// publish outcome that mints it), and the terminal arm then abandons
+/// WITHOUT the lane recycle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PackPublishOutcome {
+    Known,
+    Unknown,
+}
+
+/// What [`BlockAllocator::release_pack_reference`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PackRelease {
+    /// References remain (tenants live): one reference released.
+    Nonterminal,
+    /// The block's last reference: the terminal free (the router ladder
+    /// on the authority; the abandon arm on a co-writer).
+    Terminal,
+    /// No refcount entry: nothing to release (counted
+    /// `pack_release_untracked_noops` — expected only on a co-writer whose
+    /// tenants were all deleted between the group landing and the seal).
+    UntrackedNoop,
 }
 
 /// RAII registration in the [`BlockAllocator::inflight_register`]

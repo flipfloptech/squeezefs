@@ -52,11 +52,14 @@ survivors into a third of the blocks.
 `SQUEEZEFS_FSYNC_PROMOTE_STAGED=1` on BOTH arms (promotion at fsync); fio
 psync, create + fsync-on-close, 16 KiB, 8 jobs × 250 files = 2,000 files
 (bounded by count — the A arm's space law fills the volume otherwise).
+files/s = fio aggregate `bw_bytes` ÷ 16 KiB (the rig's first version
+divided by fio's `job_runtime`, which under `group_reporting` is the SUM
+over jobs — an 8× under-read; the ratio was unaffected).
 
 | arm | files/s | clat p50 / p99.9 µs | fsync total (staged_promote) µs | promoted (packed) | **blocks** | device/user bytes | wareq-sz | daemon CPU µs/file |
 |---|---|---|---|---|---|---|---|---|
-| A | 828 | 38 / 204 | 200 (110) | 2,000 (0) | **2,000** | 1.00× | 16 KiB | 695 |
-| B | 942 | 33 / 245 | 192 (99) | 2,000 (2,000) | **8** | 1.00× | 16 KiB | 589 |
+| A | 6,557 | 38 / 204 | 200 (110) | 2,000 (0) | **2,000** | 1.00× | 16 KiB | 695 |
+| B | 7,435 | 33 / 245 | 192 (99) | 2,000 (2,000) | **8** | 1.00× | 16 KiB | 589 |
 
 Oracle drift 0 on both remounts; fsck 0; `invariant_tripwires` 0. The
 write-amplification columns are identical (a 16 KiB tenant is one 16 KiB

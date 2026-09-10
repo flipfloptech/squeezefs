@@ -158,14 +158,16 @@ EOF
 import json,sys
 p,arm,files,used,writes,dbytes=sys.argv[1],sys.argv[2],int(sys.argv[3]),int(sys.argv[4]),int(sys.argv[5]),int(sys.argv[6])
 a=json.load(open(p+".stats0"))["metrics"]; b=json.load(open(p+".stats1"))["metrics"]
-J=json.load(open(p+".fio.json"))["jobs"][0]; j=J["write"]; secs=J["job_runtime"]/1000
+J=json.load(open(p+".fio.json"))["jobs"][0]; j=J["write"]
+# group_reporting: job_runtime is the SUM over jobs; the aggregate rate is bw_bytes/filesize.
+files_per_s=j["bw_bytes"]/16384
 def d(k): return (b.get(k) or 0)-(a.get(k) or 0)
 def pm(fam,ph):
     f0=a.get(fam) or {}; f1=b.get(fam) or {}
     c=(f1.get(ph) or {}).get("count",0)-(f0.get(ph) or {}).get("count",0); s=(f1.get(ph) or {}).get("sum_ns",0)-(f0.get(ph) or {}).get("sum_ns",0)
     return s/c/1e3 if c else 0.0
 n=j["total_ios"]; user=n*16384
-row=dict(row="fsyncrow",arm=arm,files=n,files_per_s=n/secs,clat_p50_us=j["clat_ns"]["percentile"]["50.000000"]/1e3,
+row=dict(row="fsyncrow",arm=arm,files=n,files_per_s=files_per_s,clat_p50_us=j["clat_ns"]["percentile"]["50.000000"]/1e3,
   clat_p999_us=j["clat_ns"]["percentile"]["99.900000"]/1e3,fsync_total_us=pm("fsync_phase_ns","total"),
   fsync_staged_promote_us=pm("fsync_phase_ns","staged_promote"),promoted=d("fsync_promoted_files"),
   promoted_packed=d("layout_promoted_packed"),blocks=used,dev_write_bytes=dbytes,user_bytes=user,

@@ -16,6 +16,22 @@ from pathlib import Path
 
 def load(out: Path):
     rows = [json.loads(l) for l in (out / "rows.jsonl").read_text().splitlines() if l.strip()]
+    # files/s is re-derived from the row's fio JSON: with group_reporting,
+    # fio's job_runtime is the SUM over jobs, and the first rig version
+    # divided by it (an N-jobs under-read). bw_bytes / filesize is the
+    # aggregate rate on either version.
+    # Rows and their fio files pair up in position order per arm (the box
+    # rig tags `fsyncrow-A1`, `fsyncrow-A4`; the local rig `fsyncrow-A`).
+    pending = {}
+    for arm in ("A", "B"):
+        files = sorted(out.glob(f"fsyncrow-{arm}*.fio.json"), key=lambda p: p.name)
+        pending[arm] = [p for p in files if "verify" not in p.name]
+    for r in rows:
+        if r.get("row") != "fsyncrow" or not pending.get(r["arm"]):
+            continue
+        j = json.loads(pending[r["arm"]].pop(0).read_text())["jobs"][0]["write"]
+        if j["total_ios"] == r["files"]:
+            r["files_per_s"] = j["bw_bytes"] / 16384
     host = ""
     for l in (out / "driver.log").read_text().splitlines():
         if l.startswith("[") and "== packing rows (" in l:
@@ -41,10 +57,9 @@ def main(outs):
     print("| pos | arm | files | umount wall s | blocks after | drift | mismatches | fsck | daemon summary |")
     print("|---|---|---|---|---|---|---|---|---|")
     for i, (_, _, rows) in enumerate(runs, 1):
-        for r in rows:
-            if r["row"] != "dismount":
-                continue
-            print(f"| {i} | {r['arm']} | {r['files']} | {r['umount_wall_s']:.2f} | {r['blocks_after']} | {r['drift']} | "
+        for k, r in enumerate((r for r in rows if r["row"] == "dismount"), 1):
+            pos = k if len(runs) == 1 else i
+            print(f"| {pos} | {r['arm']} | {r['files']} | {r['umount_wall_s']:.2f} | {r['blocks_after']} | {r['drift']} | "
                   f"{r['mismatches']} | {r['fsck_findings']} | {r['summary']} |")
     print()
 
@@ -53,12 +68,11 @@ def main(outs):
     print("| pos | arm | blocks before → after | freed | tenants moved | mismatches | fsck | drift after | report pack |")
     print("|---|---|---|---|---|---|---|---|---|")
     for i, (_, _, rows) in enumerate(runs, 1):
-        for r in rows:
-            if r["row"] != "compact":
-                continue
+        for k, r in enumerate((r for r in rows if r["row"] == "compact"), 1):
+            pos = k if len(runs) == 1 else i
             rep = dict(r.get("report_pack") or {})
             rep.pop("rows", None)  # the per-block table stays in <OUT>/compact-<arm>.report.json
-            print(f"| {i} | {r['arm']} | {r['blocks_before']} → {r['blocks_after']} | {r['freed']} | {r['moved']} | "
+            print(f"| {pos} | {r['arm']} | {r['blocks_before']} → {r['blocks_after']} | {r['freed']} | {r['moved']} | "
                   f"{r['mismatches']} | {r['fsck_findings']} | {r['drift_after']} | `{json.dumps(rep)}` |")
     print()
 
@@ -68,11 +82,10 @@ def main(outs):
     print("|---|---|---|---|---|---|---|---|---|---|---|---|---|")
     per_arm = {}
     for i, (_, _, rows) in enumerate(runs, 1):
-        for r in rows:
-            if r["row"] != "fsyncrow":
-                continue
+        for k, r in enumerate((r for r in rows if r["row"] == "fsyncrow"), 1):
+            pos = k if len(runs) == 1 else i
             per_arm.setdefault(r["arm"], []).append(r)
-            print(f"| {i} | {r['arm']} | {r['files']} | {r['files_per_s']:,.0f} | {r['clat_p50_us']:.0f} | {r['clat_p999_us']:.0f} | "
+            print(f"| {pos} | {r['arm']} | {r['files']} | {r['files_per_s']:,.0f} | {r['clat_p50_us']:.0f} | {r['clat_p999_us']:.0f} | "
                   f"{r['fsync_total_us']:.0f} ({r['fsync_staged_promote_us']:.0f}) | {r['promoted']} ({r['promoted_packed']}) | "
                   f"{r['blocks']} | {r['amp']:.2f}× | {r['wareq_kib']:.0f} | {r['daemon_cpu_us_per_file']:.0f} | {r['tripwires']} |")
     print()

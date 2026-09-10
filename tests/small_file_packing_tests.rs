@@ -539,6 +539,12 @@ fn a_clean_unmount_packs_the_population_into_shared_blocks_other_clients_read_ex
         before, ANCHOR_BLOCKS,
         "only the anchor is on the data plane"
     );
+    assert_eq!(
+        stat_u64(&mnt, "invariant_tripwires"),
+        0,
+        "no concurrency-outcome tripwire fired on the writer; log: {}",
+        log.display()
+    );
     mount.umount_timed();
 
     // The engagement line: every file packed, none took its own block.
@@ -625,7 +631,19 @@ fn a_clean_unmount_packs_the_population_into_shared_blocks_other_clients_read_ex
          block was re-minted under a new owner; log: {}",
         log2.display()
     );
-    assert_eq!(std::fs::read(mnt2.join(ANCHOR)).unwrap(), anchor_bytes());
+    let got = std::fs::read(mnt2.join(ANCHOR)).unwrap();
+    let want = anchor_bytes();
+    if got != want {
+        let first = got.iter().zip(&want).position(|(a, b)| a != b);
+        let zeros = got.iter().filter(|&&b| b == 0).count();
+        panic!(
+            "the striped anchor read wrong: len {} vs {}, first diff at {:?}, {zeros} zero              bytes; log: {}",
+            got.len(),
+            want.len(),
+            first,
+            log2.display()
+        );
+    }
     assert_eq!(stat_u64(&mnt2, "block_untracked_free_refusals"), 0);
     assert_eq!(stat_u64(&mnt2, "pack_release_untracked_noops"), 0);
     mount2.umount_timed();
@@ -728,7 +746,6 @@ fn kill9_inside_the_pack_windows_loses_nothing_and_leaks_nothing() {
         ],
     );
     write_fsync(&mnt.join(ANCHOR), &anchor_bytes());
-    let used0 = used_chunks(&mnt);
     write_close(&mnt.join("a.bin"), &pattern(1, a_len));
     let h = fsync_in_background(mnt.join("a.bin"));
     // The pack block is allocated and the tenant DMA'd: the mid-window state.
@@ -753,9 +770,11 @@ fn kill9_inside_the_pack_windows_loses_nothing_and_leaks_nothing() {
         0,
         "leg A: the oracle"
     );
+    // Read on the REMOUNT (a live mount's count can carry a displaced
+    // block still in the reclaim queue): only the anchor is allocated.
     assert_eq!(
         used_chunks(&mnt),
-        used0,
+        ANCHOR_BLOCKS,
         "leg A: a pack block no tenant committed recovers FREE"
     );
     assert_eq!(

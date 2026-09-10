@@ -7401,6 +7401,25 @@ pub struct Metrics {
     /// transient-zeros family). A live health signal, not an error: bounded
     /// retries that converge. Sustained growth without churn = investigate.
     pub staged_identity_retries: Align64<AtomicU64>,
+    /// Size-carrying (`bk:rel_off:packed_len`) mapping reads through the
+    /// ONE ranged, routed funnel (`DataRouter::read_mapping_window` —
+    /// design-small-file-packing §5.10): every promoted staged file's
+    /// device read, and every packed tenant's. `packed_read_bytes` is the
+    /// DEVICE window those reads cost — `≤ Σ ceil(image)` (+ the
+    /// sub-window law on passthrough) is G-PK2's amplification bound; a
+    /// packed-read row is INVALID unless `packed_reads` accounts for its
+    /// reads.
+    pub packed_reads: ShardedAtomic,
+    pub packed_read_bytes: ShardedAtomic,
+    /// Size-carrying mappings REFUSED at the single decode choke point
+    /// (`parse_block_mapping`): a device window past the block
+    /// (`rel_off + ceil(len) > CHUNK`), a grain-misaligned `rel_off`, or
+    /// an undecodable decoration (non-numeric `rel_off`/`packed_len` —
+    /// which used to resolve to tenant 0's window / a whole-block read).
+    /// Each is `EIO`, never another tenant's bytes. **Must stay 0**: a
+    /// nonzero count is a corrupt or mis-minted mapping (fsck C12Overrun
+    /// names it).
+    pub packed_mapping_refusals: Align64<AtomicU64>,
     // -----------------------------------------------------------------
     // RW1 rand-write device-byte ledger (docs/design-random-small-writes.md
     // §1.2 point 3–4 buckets — the corrected leg drivers). Always-on
@@ -11179,6 +11198,9 @@ impl SqueezefsFilesystem {
                 "staging_drain_barriers": METRICS.staging_drain_barriers.load(Ordering::Relaxed),
                 "staged_payload_lost_reads": METRICS.staged_payload_lost_reads.load(Ordering::Relaxed),
                 "staged_identity_retries": METRICS.staged_identity_retries.load(Ordering::Relaxed),
+                "packed_reads": METRICS.packed_reads.load(Ordering::Relaxed),
+                "packed_read_bytes": METRICS.packed_read_bytes.load(Ordering::Relaxed),
+                "packed_mapping_refusals": METRICS.packed_mapping_refusals.load(Ordering::Relaxed),
                 "nvme_unaligned_write_fallbacks": METRICS.nvme_unaligned_write_fallbacks.load(Ordering::Relaxed),
                 "lease_acquire_ok": METRICS.lease_acquire_ok.load(Ordering::Relaxed),
                 "lease_acquire_fail": METRICS.lease_acquire_fail.load(Ordering::Relaxed),

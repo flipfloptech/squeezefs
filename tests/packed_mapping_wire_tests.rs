@@ -227,12 +227,13 @@ impl H {
         assert_eq!(w.written as usize, data.len(), "short write at {off}");
     }
 
+    /// `Err` is the POSITIVE errno (fuse3 carries the kernel's negated form).
     async fn read(&self, ino: u64, off: u64, len: usize) -> Result<Vec<u8>, i32> {
         self.fs
             .read(self.req, ino, 0, off, len as u32, 0)
             .await
             .map(|r| r.data.to_vec())
-            .map_err(i32::from)
+            .map_err(|e| i32::from(e).abs())
     }
 
     /// Whole-file read in 1 MiB pieces (the kernel's max_read shape).

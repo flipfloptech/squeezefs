@@ -3184,6 +3184,23 @@ impl BackendRouter {
         self.incarnation_ok(parts, block_key)
     }
 
+    /// The pure predicate half of [`Self::incarnation_ok`] — no counter, no
+    /// log: `true` ⇔ `block_key` names a lifetime that is NOT its offset's
+    /// live one (the offset was freed and reissued). For a classifier that
+    /// runs AFTER the funnel's own counted, logged refusal and must not
+    /// count it twice; an unparseable key or one naming no lifetime is
+    /// never "dead" here (the resolver refuses the former itself).
+    pub(crate) fn block_key_lifetime_dead(&self, block_key: &str) -> bool {
+        let Ok(parts) = self.split_block_key_ref(clean_block_key_ref(block_key)) else {
+            return false;
+        };
+        if parts.incarnation == INCARNATION_NONE {
+            return false;
+        }
+        let live = self.live_incarnation_for(parts.be_id, parts.offset);
+        live != INCARNATION_NONE && live != parts.incarnation
+    }
+
     fn incarnation_ok(&self, parts: BlockKeyRef<'_>, block_key: &str) -> bool {
         if parts.incarnation == INCARNATION_NONE {
             return true;
@@ -7038,6 +7055,19 @@ impl DataRouter {
     /// The base key may itself contain `://` (non-default backends), so the
     /// decoration is parsed strictly AFTER that prefix.
     ///
+    /// The size-carrying form's WINDOW LAW (design-small-file-packing §5.1,
+    /// KD-6 — `rel_off` takes values other than 0 under packing): the
+    /// tenant's device window `[rel_off, rel_off + ceil(len))` must start
+    /// on [`LBA_GRAIN`] and lie inside the allocator chunk. Three refusals
+    /// at this ONE choke point, each `EIO` exactly as the `damaged:` marker
+    /// is and counted on `packed_mapping_refusals`: an undecodable
+    /// `rel_off` (it used to `unwrap_or(0)` — tenant 0's window served as
+    /// this tenant's bytes), an undecodable `packed_len` (it used to degrade
+    /// to a whole-block inexact read), and a window that violates the law
+    /// (a read would run past its block into a neighbour's, or hand the
+    /// O_DIRECT device an unaligned window). A read must never resolve a
+    /// malformed decoration to a DIFFERENT tenant's bytes.
+    ///
     /// `pub` for the wire-law contracts (`tests/packed_mapping_wire_tests.rs`,
     /// design-small-file-packing §7): the decoder every read funnel runs is
     /// the one the tests pin, never a re-implementation of its grammar.
@@ -7062,11 +7092,36 @@ impl DataRouter {
             let bk = self
                 .backend_router
                 .parse_block_offset(&format!("{prefix}{}", parts[0]))?;
-            let off = parts[1].parse::<u64>().unwrap_or(0);
-            match parts[2].parse::<usize>() {
-                Ok(sz) => Ok((bk, off, sz, true)),
-                Err(_) => Ok((bk, off, default_size, false)),
+            let refuse = |what: &str| {
+                METRICS
+                    .packed_mapping_refusals
+                    .fetch_add(1, Ordering::Relaxed);
+                log::error!(
+                    "size-carrying block mapping '{mapping_str}' refused: {what} — serving it \
+                     would read another tenant's window or past the block (fsck C12Overrun; \
+                     see packed_mapping_refusals)"
+                );
+                SqueezefsError::Io(std::io::Error::from_raw_os_error(libc::EIO))
+            };
+            let off = parts[1]
+                .parse::<u64>()
+                .map_err(|_| refuse("undecodable rel_off"))?;
+            let sz = parts[2]
+                .parse::<usize>()
+                .map_err(|_| refuse("undecodable packed_len"))?;
+            if off % LBA_GRAIN != 0 {
+                return Err(refuse("rel_off is not LBA_GRAIN-aligned"));
             }
+            let window_end = (sz as u64)
+                .div_ceil(LBA_GRAIN)
+                .saturating_mul(LBA_GRAIN)
+                .saturating_add(off);
+            if window_end > crate::block_allocator::CHUNK_SIZE {
+                return Err(refuse(
+                    "rel_off + ceil(packed_len) reaches past the allocator chunk",
+                ));
+            }
+            Ok((bk, off, sz, true))
         } else {
             let bk = self.backend_router.parse_block_offset(mapping_str)?;
             Ok((bk, 0, default_size, false))
@@ -10214,24 +10269,137 @@ impl DataRouter {
         // carry — used to reach `parse_block_key` verbatim and fail
         // `Invalid block offset`, breaking every deferred-seed
         // materialize (and fold seed) over such blocks. Decode the
-        // decoration here, at the single device-fetch funnel: read the
-        // LBA-aligned window covering the EXACT stored image and slice it
-        // (`read_promoted_staged_block`'s discipline), so passthrough
-        // tails of recycled tenants are never served as payload.
-        let (_base, off, sz, exact) = self.parse_block_mapping(block_key)?;
-        if exact {
-            // Window covering [off, off+sz), LBA-rounded (device reads are
-            // O_DIRECT-aligned); every real publish uses off == 0.
-            let read_len = (off as usize + sz).div_ceil(4096) * 4096;
-            let cleaned = clean_block_key(block_key);
-            let raw = self.backend_router.read_block(&cleaned, read_len).await?;
-            let start = (off as usize).min(raw.len());
-            let end = (off as usize + sz).min(raw.len());
-            return Ok(raw.slice(start..end));
+        // decoration here, at the single device-fetch funnel, and read
+        // exactly the tenant's window (FIND-PK-1: the arm used to read
+        // `ceil(off + len)` from the BLOCK START — a 4 MiB read for a
+        // 4 KiB tail tenant once `off` is real).
+        Ok(self.read_mapping_window_raw(block_key, None).await?.0)
+    }
+
+    /// **The ONE device read behind a block mapping** (design-small-file-
+    /// packing §5.10, FIND-PK-0/PK-1). For the size-carrying form
+    /// `bk:rel_off:packed_len`: the RAW stored image — or, on a passthrough
+    /// volume with `rel` given, the [`LBA_GRAIN`]-aligned sub-window
+    /// covering `rel` of it — as ONE ranged, ROUTED read at
+    /// `base + rel_off (+ floor(rel.start))` through
+    /// [`BackendRouter::read_block_range`] (the mapping's backend routes;
+    /// never `self.nvme_writer`, the default device, which is where a
+    /// promotion placed on any other volume read the wrong device's
+    /// bytes). Transformed volumes read the whole slot (the frame must
+    /// decode) and ignore `rel`. Returns the image bytes for
+    /// `[rel.start, min(rel.end, len))` on passthrough, `[0, len)`
+    /// otherwise — device padding is never served. A bare whole-block key
+    /// reads the routed device window (`device_block_window`) verbatim.
+    /// The second value is the IMAGE offset the returned bytes begin at:
+    /// `rel.start` on the passthrough sub-window arm, 0 on every
+    /// whole-image arm.
+    ///
+    /// The stale-incarnation refusal (`incarnation_ok`) propagates: a key
+    /// naming a dead lifetime is refused before the DMA, never served.
+    /// Callers inside a binding-revalidation loop classify it with
+    /// [`Self::classify_bound_mapping_error`].
+    async fn read_mapping_window_raw(
+        &self,
+        mapping: &str,
+        rel: Option<std::ops::Range<usize>>,
+    ) -> Result<(bytes::Bytes, usize)> {
+        let (_base, off, sz, exact) = self.parse_block_mapping(mapping)?;
+        if !exact {
+            let raw = self
+                .backend_router
+                .read_block(mapping, self.device_block_window())
+                .await?;
+            return Ok((raw, 0));
         }
-        self.backend_router
-            .read_block(block_key, self.device_block_window())
-            .await
+        let cleaned = clean_block_key_ref(mapping);
+        // The image span this read must cover: the caller's sub-range on
+        // passthrough (the stored image IS the plaintext, byte-addressable),
+        // the whole image otherwise.
+        let (img_start, img_end) = match rel {
+            Some(r) if self.get_crypto().is_passthrough() => (r.start.min(sz), r.end.min(sz)),
+            _ => (0, sz),
+        };
+        if img_start >= img_end {
+            return Ok((bytes::Bytes::new(), img_start));
+        }
+        let grain = LBA_GRAIN as usize;
+        let win_start = img_start / grain * grain;
+        let win_end = img_end.div_ceil(grain) * grain;
+        let raw = self
+            .backend_router
+            .read_block_range(cleaned, off + win_start as u64, win_end - win_start, None)
+            .await?;
+        METRICS.packed_reads.fetch_add(1, Ordering::Relaxed);
+        METRICS
+            .packed_read_bytes
+            .fetch_add((win_end - win_start) as u64, Ordering::Relaxed);
+        let lo = (img_start - win_start).min(raw.len());
+        let hi = (img_end - win_start).min(raw.len());
+        Ok((raw.slice(lo..hi), img_start))
+    }
+
+    /// [`Self::read_mapping_window_raw`] DECODED — the promoted/spilled
+    /// durable copy of a staged file (`block_map[0]`) as plaintext image
+    /// bytes for `rel` (the request's sub-range; `None` = the whole
+    /// image). On a transformed volume the whole slot is read and decoded
+    /// and `rel` is sliced out of the plaintext; on passthrough the
+    /// sub-window read IS the slice. A bare legacy mapping has lost the
+    /// packed length: its whole-block window's tail is device garbage a
+    /// passthrough transform cannot strip — callers bound what they
+    /// consume (the read path clamps to `meta.size`). The caller owns
+    /// binding revalidation: these bytes may belong to a
+    /// freed-and-reused block if the identity moved while the read was in
+    /// flight.
+    async fn read_mapping_window(
+        &self,
+        mapping: &str,
+        rel: Option<std::ops::Range<usize>>,
+    ) -> Result<bytes::Bytes> {
+        let crypto = self.get_crypto();
+        let (raw, img_start) = self.read_mapping_window_raw(mapping, rel.clone()).await?;
+        let plain = if crypto.is_passthrough() {
+            raw
+        } else {
+            crypto.process_read_async(raw).await?
+        };
+        Ok(match rel {
+            Some(r) => {
+                let lo = r.start.saturating_sub(img_start).min(plain.len());
+                let hi = r.end.saturating_sub(img_start).min(plain.len());
+                plain.slice(lo..hi)
+            }
+            None => plain,
+        })
+    }
+
+    /// The §5.10 stale-incarnation disposition for a funnel error inside a
+    /// binding-revalidation loop whose FRESH identity STILL binds
+    /// `mapping`: a refusal because the mapping names a dead lifetime is a
+    /// contradiction — a live layout naming a retired lifetime, the
+    /// finding-51 class — reported through `invariant_tripwires` and
+    /// surfaced as `EIO`, never as zeros and never as the reissued
+    /// offset's bytes. Every other error propagates unchanged (a real I/O
+    /// error on a stable binding). A refusal on a mapping the fresh
+    /// identity NO LONGER binds is the ordinary movement arm and never
+    /// reaches here.
+    fn classify_bound_mapping_error(
+        &self,
+        file_path: &str,
+        mapping: &str,
+        e: SqueezefsError,
+    ) -> SqueezefsError {
+        if !self.backend_router.block_key_lifetime_dead(mapping) {
+            return e;
+        }
+        crate::note_invariant_tripwire(
+            "read_stale_bound_mapping",
+            &format!(
+                "{file_path}: the CURRENT layout binds mapping '{mapping}', whose block-key \
+                 lifetime is dead (freed and reissued) — refusing EIO instead of serving the \
+                 offset's new owner's bytes ({e})"
+            ),
+        );
+        SqueezefsError::Io(std::io::Error::from_raw_os_error(libc::EIO))
     }
 
     /// SHORT-TOLERANT old-image fetch for the device overlay's two gap
@@ -13940,32 +14108,6 @@ impl DataRouter {
         self.fetch_metadata_from_backend(ino).await.ok().flatten()
     }
 
-    /// Fetch + decode the promoted/spilled durable copy of a staged file
-    /// (`block_map[0]`). The caller owns binding revalidation: these bytes
-    /// may belong to a freed-and-reused block if the identity moved while
-    /// the read was in flight.
-    async fn read_promoted_staged_block(&self, block_key: &str) -> Result<bytes::Bytes> {
-        // Size-carrying (`bk:0:packed_len`) mappings decode to EXACTLY the
-        // promoted payload: read the 4 KiB-aligned window covering the image
-        // (device reads are LBA-aligned) and slice the exact image before
-        // the transform. A bare legacy key has lost the packed length: the
-        // whole-block read's tail is device garbage that a passthrough
-        // (no-compression) `process_read` cannot strip — callers must bound
-        // what they consume (the read path clamps to `meta.size`).
-        let (offset_u64, off, sz, exact) = self.parse_block_mapping(block_key)?;
-        let read_len = if exact { sz.div_ceil(4096) * 4096 } else { sz };
-        let packed_bytes = self
-            .nvme_writer
-            .read_block(offset_u64 + off, read_len)
-            .await?;
-        let packed_bytes = if exact && packed_bytes.len() > sz {
-            packed_bytes.slice(0..sz)
-        } else {
-            packed_bytes
-        };
-        self.get_crypto().process_read_async(packed_bytes).await
-    }
-
     /// Release the artifacts of a superseded staged layout *after* the new
     /// layout is published (backend as applicable + RAM cache): the staging
     /// ring entry (returns its budget) and any promoted/spilled durable
@@ -16504,7 +16646,7 @@ impl DataRouter {
                                          {attempts} re-resolves (offset {offset})"
                                     )));
                                 }
-                                let fetched = self.read_promoted_staged_block(&mapping_str).await;
+                                let fetched = self.read_mapping_window(&mapping_str, None).await;
                                 let fresh = self.freshest_layout_identity(file_path).await;
                                 let still_bound = fresh.as_ref().is_some_and(|f| {
                                     f.file_type == "staged"
@@ -16533,7 +16675,13 @@ impl DataRouter {
                                         existing_data.copy_from_slice(&plain);
                                         break;
                                     }
-                                    Err(e) if still_bound => return Err(e),
+                                    Err(e) if still_bound => {
+                                        return Err(self.classify_bound_mapping_error(
+                                            file_path,
+                                            &mapping_str,
+                                            e,
+                                        ))
+                                    }
                                     _ => {
                                         // Binding moved (or the fetch hit the
                                         // freed window): re-resolve. A ring
@@ -17689,7 +17837,19 @@ impl DataRouter {
                         if offset >= meta.size {
                             return Ok(bytes::Bytes::new());
                         }
-                        let fetched = self.read_promoted_staged_block(&bk).await;
+                        // Full below-EOF length: the promoted image may be
+                        // shorter than the logical size — its tail (and any
+                        // in-bounds offset past the physical end) is an
+                        // implicit-zero hole.
+                        let want =
+                            (std::cmp::min(offset + size as u64, meta.size) - offset) as usize;
+                        // ONE ranged, routed window for exactly the request's
+                        // sub-range of the image (§5.10 — on passthrough the
+                        // device read is the LBA_GRAIN-aligned window covering
+                        // it, not the whole image).
+                        let fetched = self
+                            .read_mapping_window(&bk, Some(offset as usize..offset as usize + want))
+                            .await;
                         // Binding revalidation (the promoted-mapping ABA — same
                         // serve rule as the striped binding-validated fetch):
                         // the durable copy is freed the moment a newer identity
@@ -17699,7 +17859,9 @@ impl DataRouter {
                         // the fetch completed, the fetched bytes are the live
                         // incarnation. On movement: re-resolve and retry — a
                         // fetch error is surfaced only for a stable binding
-                        // (real I/O error, not freed-and-reused bytes).
+                        // (real I/O error, not freed-and-reused bytes; a stale-
+                        // lifetime refusal on a still-bound mapping is the
+                        // classified contradiction, EIO + invariant_tripwires).
                         let fresh = self.freshest_layout_identity(file_path).await;
                         let still_bound = fresh.as_ref().is_some_and(|f| {
                             f.file_type == "staged"
@@ -17710,20 +17872,10 @@ impl DataRouter {
                                     .is_some_and(|cur| *cur == bk)
                         });
                         match fetched {
-                            Ok(decompressed) if still_bound => {
-                                // Full below-EOF length: the promoted block may
-                                // be shorter than the logical size — its tail
-                                // (and any in-bounds offset past the physical
-                                // end) is an implicit-zero hole.
-                                let want = (std::cmp::min(offset + size as u64, meta.size) - offset)
-                                    as usize;
-                                let dlen = decompressed.len();
-                                let start = std::cmp::min(offset as usize, dlen);
-                                let end = std::cmp::min(offset as usize + want, dlen);
+                            Ok(window) if still_bound => {
+                                let got = window.len().min(want);
                                 let mut out = vec![0u8; want];
-                                if start < end {
-                                    out[..end - start].copy_from_slice(&decompressed[start..end]);
-                                }
+                                out[..got].copy_from_slice(&window[..got]);
                                 // W2 rider: the record's runs are newer
                                 // than the promoted image (the crash
                                 // window between a promotion's publish
@@ -17739,7 +17891,9 @@ impl DataRouter {
                                 }
                                 return Ok(bytes::Bytes::from(out));
                             }
-                            Err(e) if still_bound => return Err(e),
+                            Err(e) if still_bound => {
+                                return Err(self.classify_bound_mapping_error(file_path, &bk, e))
+                            }
                             _ => {
                                 METRICS
                                     .staged_identity_retries
@@ -19491,7 +19645,7 @@ impl DataRouter {
             if self.cache.nvme.read_staged_into(&fid, &mut buf) {
                 buf.to_vec()
             } else if let Some(bk) = self.staged_block_mapping(&file_path, &meta).await {
-                let fetched = self.read_promoted_staged_block(&bk).await?;
+                let fetched = self.read_mapping_window(&bk, None).await?;
                 let fresh = self.freshest_layout_identity(&file_path).await;
                 let still_bound = fresh.as_ref().is_some_and(|f| {
                     f.file_type == "staged"
@@ -20506,7 +20660,7 @@ impl DataRouter {
                              {attempts} re-resolves (new_size {new_size})"
                         )));
                     }
-                    let fetched = self.read_promoted_staged_block(&old_bk).await;
+                    let fetched = self.read_mapping_window(&old_bk, None).await;
                     let fresh = self.freshest_layout_identity(&file_path).await;
                     let fresh_bk = match fresh {
                         Some(ref f) if f.file_type == "staged" && f.file_id == snapshot_file_id => {
@@ -20519,7 +20673,9 @@ impl DataRouter {
                             img = Some(i);
                             break;
                         }
-                        (Err(e), Some(ref bk)) if *bk == old_bk => return Err(e),
+                        (Err(e), Some(ref bk)) if *bk == old_bk => {
+                            return Err(self.classify_bound_mapping_error(&file_path, &old_bk, e))
+                        }
                         (_, Some(bk)) => {
                             crate::fuse_client::METRICS
                                 .staged_identity_retries

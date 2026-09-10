@@ -8,6 +8,7 @@
 //! | Axis | Metric (this module) | Mover |
 //! |------|----------------------|-------|
 //! | **D1** free-space contiguity | per volume, over the ALLOCATED offset space `[0, highest)`: `contiguity = largest_free_run / total_free`, `reclaimable_tail = trailing_free_run / total_free` | `JobType::DefragData` — tail blocks into low-offset same-backend gaps (`move_one` + `DestPick::CompactLow`) |
+//! | **D1 pack** (PK6) | per PACK block — a block whose every referencer is a staged-layout tenant's size-carrying mapping: `occupancy = Σ_{distinct off} pack_slot_len(max len) / CHUNK`, same-`off` windows (the clone share, the nested prefix share) counted ONCE; a VICTIM iff `live ≤ pack_max_slot_bytes()` (§5.5's one law) | `JobType::DefragPack` — re-pack the victims' live windows into the open pack (`squeezefs defrag --pack`) |
 //! | **D2** file locality | fraction of logically-adjacent striped block pairs whose physical mappings are same-backend ascending | `JobType::DefragData` — refcount-1 quiescent rewrites onto one backend (`DestPick::BackendAscending`) |
 //! | **D3** staged-extent pressure | parked overlay bytes (`parked_extent_bytes`) + spilled `active_block_ext:` record bytes | `JobType::DefragFold` — the W2 fold machinery kicked to completion |
 //! | **D4** meta node occupancy | per meta volume: dead (superseded) records vs distinct keys in the serialized bset logs (`KvMetaBackend::dead_bset_census`) | `JobType::DefragMeta` — leaf compaction through the SMO serialization |
@@ -23,9 +24,12 @@
 //! never measured ⇒ the stats JSON emits `null`), worst-volume semantics
 //! for the per-volume axes. D1/D3 are cheap (allocator snapshot + record
 //! lens) and refresh on the [`spawn_gauge_worker`] cadence plus after
-//! every defrag mover pass; D2/D4 are walk-priced and refresh whenever
-//! [`measure`] runs (`--report-only`, the defrag verbs) — stale-until-
-//! measured by design, never silently guessed.
+//! every defrag mover pass; D2/D4 — and the D1 pack face
+//! (`frag_d1_pack_occupancy[_mean]`, `pack_reclaimable_bytes`,
+//! `pack_blocks_below_half`) — are walk-priced and refresh whenever
+//! [`measure`] runs (`--report-only`, the defrag verbs) and after every
+//! compaction pass — stale-until-measured by design, never silently
+//! guessed.
 
 use crate::error::{Result, SqueezefsError};
 use crate::fuse_client::METRICS;
@@ -100,6 +104,49 @@ pub struct D4Volume {
     pub dead_bset_ratio: f64,
 }
 
+/// One PACK block's occupancy row (PK6, design-small-file-packing §5.8).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PackBlockRow {
+    /// The registered (canonical) data volume id.
+    pub vol: String,
+    /// The block's device byte offset.
+    pub offset: u64,
+    /// Clean base key (`clean_block_key` form).
+    pub base_key: String,
+    /// Referencers (the C8 prefix population).
+    pub tenants: u64,
+    /// Distinct `off` groups — the slots actually occupied.
+    pub windows: u64,
+    /// `Σ_{distinct off} pack_slot_len(max len at that off)`, clamped to
+    /// the chunk.
+    pub live_bytes: u64,
+    /// `live_bytes / CHUNK_SIZE`.
+    pub occupancy: f64,
+    /// `live_bytes ≤ pack_max_slot_bytes()` — the compaction trigger.
+    pub victim: bool,
+}
+
+/// The D1 PACK face (PK6): the set-level pack occupancy report.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PackReport {
+    /// Pack blocks measured (a block whose EVERY referencer is a
+    /// staged-layout tenant's size-carrying mapping — the legacy
+    /// one-tenant `bk:0:len` block included).
+    pub blocks: u64,
+    /// Victims: pack blocks at or below the derived half-chunk line.
+    pub below_half: u64,
+    /// Σ live bytes over the pack blocks.
+    pub live_bytes: u64,
+    /// `Σ_{pack blocks} (CHUNK − live)` — the `pack_reclaimable_bytes`
+    /// gauge.
+    pub reclaimable_bytes: u64,
+    /// The least-occupied pack block (1.0 when none exists).
+    pub worst_occupancy: f64,
+    /// Mean occupancy over the pack blocks (1.0 when none exists).
+    pub mean_occupancy: f64,
+    pub rows: Vec<PackBlockRow>,
+}
+
 /// The full four-axis report — the `--report-only` JSON body.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DefragReport {
@@ -107,6 +154,8 @@ pub struct DefragReport {
     pub d2: D2Report,
     pub d3: D3Report,
     pub d4: Vec<D4Volume>,
+    /// The D1 pack face (PK6).
+    pub pack: PackReport,
 }
 
 // ---------------------------------------------------------------------------
@@ -166,6 +215,193 @@ pub fn measure_d1(router: &DataRouter) -> Vec<D1Volume> {
     }
     rows.sort_by(|a, b| a.id.cmp(&b.id));
     rows
+}
+
+// ---------------------------------------------------------------------------
+// D1 pack face — pack occupancy over the mover census (PK6, census-walk
+// priced: the SAME `census_for` walk the movers plan from, no new walker)
+// ---------------------------------------------------------------------------
+
+/// The compaction VICTIM threshold: the largest live-byte count a pack
+/// block may hold and still be worth re-packing — and it IS the own-block
+/// threshold (design-small-file-packing §5.5, KD-5: ONE derived law, two
+/// faces). Copying `live` bytes reclaims `CHUNK − live`; the copy pays
+/// for itself iff `live ≤ CHUNK/2`, which is exactly the break-even that
+/// sizes the largest slot the packer shares a block for. Reading it
+/// through [`crate::routing::pack_max_slot_bytes`] means the measurement
+/// override moves both faces together. Drift-is-red tie:
+/// `tests/derivation_sweep_tests.rs`
+/// (`pack_compaction_victim_threshold_is_the_own_block_threshold`).
+pub fn pack_victim_max_live_bytes() -> u64 {
+    crate::routing::pack_max_slot_bytes()
+}
+
+/// Is a pack block with `live_bytes` live a compaction victim?
+pub fn is_pack_victim(live_bytes: u64) -> bool {
+    live_bytes <= pack_victim_max_live_bytes()
+}
+
+/// One live WINDOW of a pack block — a distinct `off`, occupied once by
+/// every referencer that names it (the identical-window clone share and
+/// the nested same-`off` prefix share, §5.7/§5.9's two legal classes).
+pub(crate) struct PackWindow {
+    pub(crate) off: u64,
+    /// The longest referencer's stored-image length — the bytes a
+    /// compaction copies for this window.
+    pub(crate) max_len: u64,
+    /// `pack_slot_len(max_len)` — the device slot the window occupies.
+    pub(crate) slot: u64,
+    /// Index (into the block's `refs`) of the referencer whose mapping
+    /// carries `max_len` — the ranged read's source.
+    pub(crate) longest: usize,
+    /// Indices (into the block's `refs`) of every referencer at this
+    /// `off`, ascending `(ino, block_idx)`.
+    pub(crate) refs: Vec<usize>,
+}
+
+/// The pack shape of one census block: `Some(windows)` iff EVERY
+/// referencer is a staged-layout tenant's decodable size-carrying mapping
+/// at `block_map[0]` (a striped file's blocks, a bare legacy `bk`, a
+/// quarantined `damaged:` marker or an undecodable decoration make the
+/// block NOT a pack block — never a victim; C12Overrun owns the last).
+/// Windows are grouped by `off` (ascending) at the max `len` seen there;
+/// the referencer order inside a window is the census's `(ino, block_idx)`
+/// order, so the mover's ascending-ino publish law holds per window.
+pub(crate) fn pack_windows(
+    router: &DataRouter,
+    refs: &[crate::jobs::MoveRef],
+) -> Option<Vec<PackWindow>> {
+    let mut by_off: std::collections::BTreeMap<u64, PackWindow> = std::collections::BTreeMap::new();
+    for (i, r) in refs.iter().enumerate() {
+        if !r.staged || r.block_idx != 0 {
+            return None;
+        }
+        let (_base, off, sz, exact) = router.parse_block_mapping(&r.mapping).ok()?;
+        if !exact {
+            return None;
+        }
+        let len = sz as u64;
+        let w = by_off.entry(off).or_insert_with(|| PackWindow {
+            off,
+            max_len: 0,
+            slot: 0,
+            longest: i,
+            refs: Vec::new(),
+        });
+        if len > w.max_len {
+            w.max_len = len;
+            w.slot = crate::routing::pack_slot_len(len);
+            w.longest = i;
+        }
+        w.refs.push(i);
+    }
+    Some(by_off.into_values().collect())
+}
+
+/// Live bytes of a pack block from its windows — `Σ slot`, clamped to the
+/// chunk (a corrupt population whose windows overlap at different `off`
+/// — C12's finding — can sum past it; occupancy never reads above 1.0).
+pub(crate) fn pack_live_bytes(windows: &[PackWindow]) -> u64 {
+    windows
+        .iter()
+        .map(|w| w.slot)
+        .fold(0u64, |a, b| a.saturating_add(b))
+        .min(crate::block_allocator::CHUNK_SIZE)
+}
+
+/// The fold (design-small-file-packing §5.8): over the census's distinct
+/// blocks, keep the pack-shaped ones, group each by `off` at `max(len)`,
+/// sum the slots. Pure — the census is the input, the report the output.
+pub(crate) fn measure_pack_occupancy(
+    router: &DataRouter,
+    tasks: &[crate::jobs::MoveTask],
+) -> PackReport {
+    let chunk = crate::block_allocator::CHUNK_SIZE;
+    let mut rows: Vec<PackBlockRow> = Vec::new();
+    for t in tasks {
+        let Some(windows) = pack_windows(router, &t.refs) else {
+            continue;
+        };
+        let live = pack_live_bytes(&windows);
+        rows.push(PackBlockRow {
+            vol: t.src_id.clone(),
+            offset: t.src_offset,
+            base_key: t.base_key.clone(),
+            tenants: t.refs.len() as u64,
+            windows: windows.len() as u64,
+            live_bytes: live,
+            occupancy: live as f64 / chunk as f64,
+            victim: is_pack_victim(live),
+        });
+    }
+    rows.sort_by(|a, b| a.vol.cmp(&b.vol).then(a.offset.cmp(&b.offset)));
+    let blocks = rows.len() as u64;
+    let live_bytes = rows.iter().map(|r| r.live_bytes).sum::<u64>();
+    let reclaimable_bytes = rows.iter().map(|r| chunk - r.live_bytes).sum::<u64>();
+    let below_half = rows.iter().filter(|r| r.victim).count() as u64;
+    let (worst, mean) = if rows.is_empty() {
+        (1.0, 1.0)
+    } else {
+        (
+            rows.iter().map(|r| r.occupancy).fold(1.0, f64::min),
+            rows.iter().map(|r| r.occupancy).sum::<f64>() / rows.len() as f64,
+        )
+    };
+    PackReport {
+        blocks,
+        below_half,
+        live_bytes,
+        reclaimable_bytes,
+        worst_occupancy: worst,
+        mean_occupancy: mean,
+        rows,
+    }
+}
+
+/// Every registered data volume id — the whole-set census scope.
+fn all_volume_ids(router: &DataRouter) -> Vec<String> {
+    let mut ids: Vec<String> = router
+        .backend_router
+        .backends
+        .iter()
+        .map(|e| e.key().clone())
+        .collect();
+    ids.sort();
+    ids
+}
+
+/// Measure the D1 pack face over the whole set and publish its gauges
+/// (`frag_d1_pack_occupancy[_mean]` worst/mean permille+1,
+/// `pack_reclaimable_bytes`, `pack_blocks_below_half`, `frag_d1_pack_blocks`).
+/// The `--report-only` engine and the compaction mover's post-pass refresh
+/// run this; it moves nothing.
+pub async fn measure_pack(
+    meta: &Arc<RoutedMetaBackend>,
+    router: &DataRouter,
+) -> Result<PackReport> {
+    let scope = all_volume_ids(router);
+    let census = crate::jobs::census_for(meta, router, &scope).await?;
+    let report = measure_pack_occupancy(router, &census.tasks);
+    publish_pack_gauges(&report);
+    Ok(report)
+}
+
+fn publish_pack_gauges(report: &PackReport) {
+    METRICS
+        .frag_d1_pack_occupancy
+        .store(encode_ratio(report.worst_occupancy), Ordering::Relaxed);
+    METRICS
+        .frag_d1_pack_occupancy_mean
+        .store(encode_ratio(report.mean_occupancy), Ordering::Relaxed);
+    METRICS
+        .frag_d1_pack_blocks
+        .store(report.blocks, Ordering::Relaxed);
+    METRICS
+        .pack_reclaimable_bytes
+        .store(report.reclaimable_bytes, Ordering::Relaxed);
+    METRICS
+        .pack_blocks_below_half
+        .store(report.below_half, Ordering::Relaxed);
 }
 
 // ---------------------------------------------------------------------------
@@ -414,6 +650,7 @@ pub async fn measure(meta: &Arc<RoutedMetaBackend>, router: &DataRouter) -> Resu
         squeezefs_ipc::sqz_blocking::run_blocking(move || measure_d3(&r)).await
     };
     let d4 = measure_d4(meta).await?;
+    let pack = measure_pack(meta, router).await?;
 
     publish_d1_gauges(&d1);
     METRICS
@@ -427,7 +664,13 @@ pub async fn measure(meta: &Arc<RoutedMetaBackend>, router: &DataRouter) -> Resu
         .frag_d4_dead_bset_ratio
         .store(encode_ratio(worst_d4), Ordering::Relaxed);
 
-    Ok(DefragReport { d1, d2, d3, d4 })
+    Ok(DefragReport {
+        d1,
+        d2,
+        d3,
+        d4,
+        pack,
+    })
 }
 
 /// Publish the worst-volume D1 gauges from measured rows (an empty set
@@ -552,7 +795,7 @@ async fn offline_mover_body(
         routed.clone(),
         2,
         100,
-        Some(crate::jobs::MoverCtx::router_only(router)),
+        Some(crate::jobs::MoverCtx::router_only(router.clone())),
     )
     .await?;
     let job_id = fabric
@@ -567,6 +810,11 @@ async fn offline_mover_body(
         .wait_terminal(&job_id, std::time::Duration::from_secs(7 * 24 * 3600))
         .await?;
     fabric.shutdown_abrupt().await;
+    // PK6: a compaction's destination is this coordinator's open pack —
+    // seal it (the dismount discipline: the pin released, the ledger
+    // left) before the guard goes; the pin is RAM either way.
+    router.seal_open_packs().await;
+    router.backend_router.reclaim_drain().await;
     if end != crate::jobs::JobState::Completed {
         return Err(SqueezefsError::InvalidOperation(format!(
             "offline defrag job {job_id} ended {end:?} (see the log above)"

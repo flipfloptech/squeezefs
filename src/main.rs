@@ -345,7 +345,15 @@ enum Commands {
         /// D1/D2: compact free space + rewrite poor-locality files
         #[arg(long)]
         data: bool,
-        /// Restrict --data to one volume id (see `squeezefs volume list`)
+        // Anchor: design-small-file-packing §5.8 (the D1 pack face, PK6).
+        /// D1 pack: re-pack the live tenants of low-occupancy pack blocks
+        /// (the legacy one-block-per-file population included) into the
+        /// open pack block and free the victims; gated by
+        /// SQUEEZEFS_SMALL_FILE_PACKING
+        #[arg(long)]
+        pack: bool,
+        /// Restrict --data / --pack to one volume id (see `squeezefs
+        /// volume list`)
         #[arg(long)]
         volume: Option<String>,
         // Anchor: the KV SMO compactor (design-cow-kv-metadata).
@@ -2632,6 +2640,7 @@ fn print_fsck_report(report: &squeezefs::fsck::FsckReport, json: bool) {
 /// The `squeezefs defrag` verb's flag lattice (PR VL7, §5.7).
 struct DefragVerbArgs {
     data: bool,
+    pack: bool,
     volume: Option<String>,
     meta: bool,
     fold: bool,
@@ -2663,6 +2672,16 @@ fn print_defrag_report(report: &squeezefs::defrag::DefragReport, json: bool) {
             r.largest_free_run,
         );
     }
+    println!(
+        "  D1 pack: {} pack block(s), {} below half — occupancy worst {:.3} / mean {:.3}, \
+         {} B live, {} B reclaimable (`defrag --pack`)",
+        report.pack.blocks,
+        report.pack.below_half,
+        report.pack.worst_occupancy,
+        report.pack.mean_occupancy,
+        report.pack.live_bytes,
+        report.pack.reclaimable_bytes,
+    );
     println!(
         "  D2 locality {:.3} ({} local of {} adjacent pairs over {} file(s))",
         report.d2.locality, report.d2.local_pairs, report.d2.pairs, report.d2.files
@@ -2711,6 +2730,7 @@ async fn run_defrag_verb(
     squeezefs::set_fs_prefix("squeezefs");
     let modes = [
         args.data,
+        args.pack,
         args.meta,
         args.fold,
         args.rebalance,
@@ -2721,13 +2741,17 @@ async fn run_defrag_verb(
     .count();
     if modes != 1 {
         return Err(
-            "pick exactly one of --data / --meta / --fold / --rebalance / --report-only \
-             (each §5.7 axis is independently invocable)"
+            "pick exactly one of --data / --pack / --meta / --fold / --rebalance / \
+             --report-only (each axis is independently invocable)"
                 .into(),
         );
     }
-    if args.volume.is_some() && !args.data {
-        return Err("--volume only scopes --data (D1/D2 are the per-volume movers)".into());
+    if args.volume.is_some() && !args.data && !args.pack {
+        return Err(
+            "--volume only scopes --data / --pack (D1/D2 and the pack face are the \
+             per-volume movers)"
+                .into(),
+        );
     }
     let live = !target.starts_with("sqmeta://");
 
@@ -2741,6 +2765,8 @@ async fn run_defrag_verb(
         }
         let mode = if args.data {
             "data"
+        } else if args.pack {
+            "pack"
         } else if args.meta {
             "meta"
         } else if args.fold {
@@ -2786,8 +2812,22 @@ async fn run_defrag_verb(
                 .into(),
         );
     }
+    if args.pack && !squeezefs::routing::small_file_packing_enabled() {
+        // PK6: the packing lever gates the whole compaction arm — offline
+        // the lever is this process's environment.
+        return Err(
+            "defrag --pack refused: SQUEEZEFS_SMALL_FILE_PACKING is off in this process — the \
+             compaction arm is gated by the packing lever (design-small-file-packing §6, \
+             PK6); nothing moved"
+                .into(),
+        );
+    }
     let job_type = if args.data {
         squeezefs::jobs::JobType::DefragData {
+            volume_id: args.volume.clone(),
+        }
+    } else if args.pack {
+        squeezefs::jobs::JobType::DefragPack {
             volume_id: args.volume.clone(),
         }
     } else if args.meta {
@@ -5215,6 +5255,7 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         Commands::Defrag {
             target,
             data,
+            pack,
             volume,
             meta,
             fold,
@@ -5227,6 +5268,7 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 &target,
                 DefragVerbArgs {
                     data,
+                    pack,
                     volume,
                     meta,
                     fold,

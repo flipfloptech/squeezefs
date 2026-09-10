@@ -201,6 +201,23 @@ pub enum JobType {
     DefragData {
         volume_id: Option<String>,
     },
+    /// PK6 (design-small-file-packing §5.8 / §5.11 — the D1 PACK face):
+    /// the re-pack compaction mover, `squeezefs defrag --pack`. Plan =
+    /// pack blocks whose live bytes fit the derived half-chunk line
+    /// (`defrag::is_pack_victim` — the own-block threshold's other face),
+    /// ascending; per victim, each distinct live `off` window is read once
+    /// at its `max(len)` and re-packed into the OPEN pack block
+    /// (`DataRouter::repack_window`), every referencer republished to the
+    /// shared destination `off'` with its own `len` under its CURRENT
+    /// token, and the victim frees only when its population reaches 0
+    /// through the ordinary terminal ladder. The legacy one-block-per-file
+    /// population is its first customer. Gated by the packing lever (the
+    /// whole arm); mover-class (the VL9 serialize-loud pin); crash-resume
+    /// by plan regeneration (KD-6). `volume_id = None` covers every
+    /// placement-eligible volume.
+    DefragPack {
+        volume_id: Option<String>,
+    },
     /// PR VL7 (§5.7 D4): nudge dead-bset-heavy KV leaves through the
     /// EXISTING SMO compactor (`KvMetaBackend::defrag_compact_nodes` —
     /// never a new compactor), per meta volume.
@@ -232,6 +249,7 @@ impl JobType {
             | JobType::MigrateMetaSlot { .. }
             | JobType::Fsck { .. }
             | JobType::DefragData { .. }
+            | JobType::DefragPack { .. }
             | JobType::DefragMeta
             | JobType::DefragFold
             | JobType::KvmapSweep { .. } => 0,
@@ -248,13 +266,16 @@ impl JobType {
     fn mover_scope(&self) -> Option<MoverScope> {
         match self {
             JobType::EvacuateVolume { volume_id } => Some(MoverScope::Volume(volume_id.clone())),
-            JobType::DefragData { volume_id: Some(v) } => Some(MoverScope::Volume(v.clone())),
+            JobType::DefragData { volume_id: Some(v) } | JobType::DefragPack { volume_id: Some(v) } => {
+                Some(MoverScope::Volume(v.clone()))
+            }
             // Whole-set movers: rebalance plans sources/destinations
             // across the set; an unscoped defrag covers every
-            // placement-eligible volume.
-            JobType::Rebalance | JobType::DefragData { volume_id: None } => {
-                Some(MoverScope::WholeSet)
-            }
+            // placement-eligible volume (the compaction's destination —
+            // the open pack — is placed set-wide too).
+            JobType::Rebalance
+            | JobType::DefragData { volume_id: None }
+            | JobType::DefragPack { volume_id: None } => Some(MoverScope::WholeSet),
             JobType::Noop { .. }
             | JobType::MigrateMetaSlot { .. }
             | JobType::Fsck { .. }
@@ -755,25 +776,31 @@ pub async fn adopt_kvmap_sweeps(
 
 /// One referencer of a victim block.
 #[derive(Clone, Debug)]
-struct MoveRef {
-    ino: u64,
-    block_idx: u32,
+pub(crate) struct MoveRef {
+    pub(crate) ino: u64,
+    pub(crate) block_idx: u32,
     /// The mapping string VERBATIM as persisted (decoration included).
-    mapping: String,
+    pub(crate) mapping: String,
+    /// The referencer's layout is the STAGED layout (a promoted/spilled
+    /// small file whose whole payload is `block_map[0]`) — the population
+    /// the pack occupancy face measures and the compaction mover moves
+    /// (design-small-file-packing §5.8; a striped file's blocks are never
+    /// pack tenants — its tail is a live write target, Non-Goals).
+    pub(crate) staged: bool,
 }
 
 /// One move task: a distinct source base offset and every referencer —
 /// a shared block moves ONCE (§5.4 step 2).
-struct MoveTask {
+pub(crate) struct MoveTask {
     /// Clean base key (`clean_block_key` form) on the source volume.
-    base_key: String,
+    pub(crate) base_key: String,
     /// The source volume the base key parses to (rebalance uses it to
     /// exclude the source from destination picks).
-    src_id: String,
+    pub(crate) src_id: String,
     /// The source's parsed device byte offset (the VL7 compaction
     /// objective bounds its destination pick by it).
-    src_offset: u64,
-    refs: Vec<MoveRef>,
+    pub(crate) src_offset: u64,
+    pub(crate) refs: Vec<MoveRef>,
     /// Rebalance: the planned destination volume id (`None` = the
     /// lowest-fill eligible pick).
     dest_hint: Option<String>,
@@ -808,8 +835,8 @@ enum DestPick {
 }
 
 /// A census pass over the durable inode trees.
-struct Census {
-    tasks: Vec<MoveTask>,
+pub(crate) struct Census {
+    pub(crate) tasks: Vec<MoveTask>,
     /// Global inos whose INDIRECT block-map blob lives on a source
     /// volume — relocated by an empty merge (the save path reallocates
     /// blobs off non-active volumes).
@@ -829,8 +856,10 @@ fn key_owned_by(be_id: &str, victim: &str, victim_is_default_slot: bool) -> bool
 /// Walk every meta volume's live inode tree and collect the blocks
 /// whose keys parse to one of `sources` (the `df` census walk shape —
 /// tree-walk-derived ground truth, deduped by offset: the §5.2 dedupe
-/// census and the §5.4 move-once grouping in one pass).
-async fn census_for(
+/// census and the §5.4 move-once grouping in one pass). Also the pack
+/// occupancy face's input (`crate::defrag::measure_pack_occupancy`, PK6)
+/// — one walk, every referencer of every block with its mapping verbatim.
+pub(crate) async fn census_for(
     meta: &Arc<RoutedMetaBackend>,
     router: &crate::routing::DataRouter,
     sources: &[String],
@@ -950,6 +979,7 @@ async fn census_for(
                     blob_relocations.push(global_ino);
                     blob_blocks += 1;
                 }
+                let staged = layout.file_type == "staged";
                 for (b, mapping) in entries {
                     let Some((src_id, clean, offset)) = owner_of(&mapping) else {
                         continue;
@@ -969,6 +999,7 @@ async fn census_for(
                             ino: global_ino,
                             block_idx: b,
                             mapping,
+                            staged,
                         });
                 }
             }
@@ -1952,6 +1983,10 @@ impl JobFabric {
             JobType::Rebalance => self.run_mover(job_id, ctl, MoverObjective::Rebalance).await,
             JobType::DefragData { volume_id } => {
                 self.run_mover(job_id, ctl, MoverObjective::Defrag { volume_id })
+                    .await
+            }
+            JobType::DefragPack { volume_id } => {
+                self.run_defrag_pack(job_id, ctl, volume_id.as_deref())
                     .await
             }
             JobType::DefragMeta => self.run_defrag_meta(job_id, ctl).await,
@@ -3327,6 +3362,537 @@ impl JobFabric {
             MoveOutcome::Superseded
         }
     }
+
+    // -----------------------------------------------------------------
+    // PK6: the re-pack compaction mover (design-small-file-packing §5.8)
+    // -----------------------------------------------------------------
+
+    /// `squeezefs defrag --pack` — one victim at a time, throttled (KD-3),
+    /// checkpointed on the fabric cadence, converging by re-plan (KD-6:
+    /// the plan is regenerated from CURRENT durable state every pass —
+    /// idempotent by construction, so a kill-9 mid-pass costs nothing but
+    /// the pass) and completing best-effort at the first no-progress pass
+    /// or the defrag pass cap. Gated by the packing lever: the WHOLE arm —
+    /// a lever-OFF mount refuses loud (an adopted record from a lever-ON
+    /// era included) and moves nothing.
+    async fn run_defrag_pack(&self, job_id: &str, ctl: &JobCtl, volume_id: Option<&str>) {
+        let Some(ctx) = self.mover.as_ref() else {
+            self.fail_job(
+                job_id,
+                ctl,
+                "defrag --pack needs a mover context (not wired on this fabric)",
+            )
+            .await;
+            return;
+        };
+        if !crate::routing::small_file_packing_enabled() {
+            self.fail_job(
+                job_id,
+                ctl,
+                "defrag --pack refused: SQUEEZEFS_SMALL_FILE_PACKING is off on this mount — the \
+                 compaction arm is gated by the packing lever (design-small-file-packing §6, \
+                 PK6); nothing moved",
+            )
+            .await;
+            return;
+        }
+        let mut last_checkpoint = std::time::Instant::now();
+        let mut since_checkpoint = 0u64;
+        let mut passes = 0u32;
+        loop {
+            if ctl.cancelled.load(Ordering::SeqCst) {
+                let _ = self.checkpoint_as(job_id, ctl, JobState::Cancelled).await;
+                ctl.set_state(JobState::Cancelled);
+                return;
+            }
+            if ctl.paused.load(Ordering::SeqCst) {
+                self.park_paused(job_id, ctl).await;
+                return;
+            }
+            // The planner reads free-list state through the census's
+            // refcounts; displaced-source frees ride the reclaim queue —
+            // settle them first (the mover cadence, never the write path).
+            ctx.router.backend_router.reclaim_drain().await;
+            // A compaction pass IS a promotion batch of the packer's: an
+            // OQ-1 `StorageFull` stop from an earlier batch re-arms here
+            // (the pass frees space as it goes).
+            ctx.router.packer.begin_promotion_batch();
+            let plan = match plan_pack_compaction(&self.meta, ctx, volume_id).await {
+                Ok(p) => p,
+                Err(e) => {
+                    self.fail_job(job_id, ctl, &format!("defrag --pack plan failed: {e}"))
+                        .await;
+                    return;
+                }
+            };
+            ctl.tasks_total.store(
+                ctl.done.load(Ordering::Relaxed) + plan.victims.len() as u64,
+                Ordering::Relaxed,
+            );
+            if plan.victims.is_empty() {
+                if plan.skipped_lone_victim {
+                    log::info!(
+                        "job {job_id}: defrag --pack found one victim and no open pack with \
+                         room for it — re-packing it into a fresh block would free nothing \
+                         this pass (design-small-file-packing §5.8); nothing moved"
+                    );
+                }
+                break;
+            }
+            METRICS.pack_compactions.fetch_add(1, Ordering::Relaxed);
+            log::info!(
+                "job {job_id}: defrag --pack pass {}: {} victim block(s), {} live B to re-pack, \
+                 {} B reclaimable",
+                passes + 1,
+                plan.victims.len(),
+                plan.victims.iter().map(|v| v.live_bytes).sum::<u64>(),
+                plan.victims
+                    .iter()
+                    .map(|v| crate::block_allocator::CHUNK_SIZE - v.live_bytes)
+                    .sum::<u64>()
+            );
+            let mut moved_this_pass = 0u64;
+            let mut deferred_this_pass = 0u64;
+            for victim in &plan.victims {
+                if ctl.cancelled.load(Ordering::SeqCst) || ctl.paused.load(Ordering::SeqCst) {
+                    break;
+                }
+                let start = std::time::Instant::now();
+                match self.compact_one(ctx, victim).await {
+                    MoveOutcome::Moved => {
+                        moved_this_pass += 1;
+                        ctl.done.fetch_add(1, Ordering::Relaxed);
+                        METRICS.job_tasks_done.fetch_add(1, Ordering::Relaxed);
+                    }
+                    MoveOutcome::Deferred => {
+                        deferred_this_pass += 1;
+                        METRICS
+                            .pack_compaction_deferred
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
+                    MoveOutcome::Superseded => {}
+                }
+                since_checkpoint += 1;
+                if since_checkpoint >= CHECKPOINT_TASKS
+                    || last_checkpoint.elapsed() >= Duration::from_secs(CHECKPOINT_SECS)
+                {
+                    let _ = self.checkpoint(job_id, ctl).await;
+                    since_checkpoint = 0;
+                    last_checkpoint = std::time::Instant::now();
+                }
+                // KD-3: duty-cycle throttle, live re-read per victim.
+                Self::duty_park(ctl, start.elapsed()).await;
+            }
+            // Space RETURNED, not merely queued, before the gauges re-read.
+            ctx.router.backend_router.reclaim_drain().await;
+            let _ = self.checkpoint(job_id, ctl).await;
+            passes += 1;
+            if ctl.cancelled.load(Ordering::SeqCst) || ctl.paused.load(Ordering::SeqCst) {
+                continue;
+            }
+            if moved_this_pass == 0 || passes >= DEFRAG_MAX_PASSES {
+                if passes >= DEFRAG_MAX_PASSES {
+                    log::info!(
+                        "job {job_id}: defrag --pack completed at the {DEFRAG_MAX_PASSES}-pass \
+                         cap with work remaining — re-invoke to continue (KD-6 re-plan)"
+                    );
+                }
+                break;
+            }
+            if deferred_this_pass > 0 {
+                squeezefs_ipc::sqz_time::sleep(REPLAN_BACKOFF).await;
+            }
+        }
+        if ctl.cancelled.load(Ordering::SeqCst) {
+            let _ = self.checkpoint_as(job_id, ctl, JobState::Cancelled).await;
+            ctl.set_state(JobState::Cancelled);
+            return;
+        }
+        if ctl.paused.load(Ordering::SeqCst) {
+            self.park_paused(job_id, ctl).await;
+            return;
+        }
+        // The pack face re-gauges from the moved state (walk-priced, the
+        // D2/D4 precedent) beside the cheap D1/D3 refresh.
+        if let Err(e) = crate::defrag::measure_pack(&self.meta, &ctx.router).await {
+            log::warn!("job {job_id}: pack occupancy re-measure after compaction failed: {e}");
+        }
+        let router = ctx.router.clone();
+        squeezefs_ipc::sqz_blocking::run_blocking(move || {
+            crate::defrag::refresh_d1_d3_gauges(&router)
+        })
+        .await;
+        let _ = self.checkpoint_as(job_id, ctl, JobState::Completed).await;
+        METRICS.job_completed.fetch_add(1, Ordering::Relaxed);
+        ctl.set_state(JobState::Completed);
+    }
+
+    /// Compact ONE victim pack block (design-small-file-packing §5.8 —
+    /// `move_one`'s discipline with the three stated deviations): the
+    /// open-pack and quiescence gates, the source pin (the mover ledger
+    /// covers it), then per distinct live `off` window one ranged read at
+    /// `max(len)` re-packed into the open pack through the router's
+    /// primitive, the destination's reference count raised to the window's
+    /// REFERENCER count before any publish, every referencer republished
+    /// `MergeExpected(old → dst:off':len_i)` under its flush lock + the
+    /// quiesce re-check + its CURRENT token (ascending ino), each published
+    /// referencer freeing its source reference (nonterminal — the pin holds
+    /// the victim) and each refused one releasing one destination
+    /// reference; the pin's release is the victim's LAST reference iff every
+    /// tenant left — the terminal free through the ordinary ladder (never a
+    /// direct free). Every reference release runs outside the 3.5 guard
+    /// (RES-1: the merge primitive drops it before returning).
+    async fn compact_one(&self, ctx: &MoverCtx, victim: &PackVictim) -> MoveOutcome {
+        let router = &ctx.router;
+        let br = &router.backend_router;
+        let chunk = crate::block_allocator::CHUNK_SIZE;
+
+        // §5.8 (3): never an OPEN pack — the packer is still filling it
+        // (the pass's own destination included).
+        if pack_ledger_contains(&victim.base_key)
+            || br
+                .allocator_for_key(&victim.base_key)
+                .is_some_and(|(alloc, offset)| alloc.inflight_contains(offset))
+        {
+            METRICS
+                .pack_mover_open_defers
+                .fetch_add(1, Ordering::Relaxed);
+            return MoveOutcome::Deferred;
+        }
+        // §5.8 (3): every referencer quiescent — the mount's probe carries
+        // the resident-ring clause (`pack_mover_resident_defers`).
+        for r in &victim.refs {
+            if !(ctx.quiesce)(r.ino, r.block_idx as u64) {
+                return MoveOutcome::Deferred;
+            }
+        }
+        // Pin the source for the copy window (`move_one`'s discipline);
+        // an unstable word defers, a freed-meanwhile block is superseded,
+        // an untracked one moves pin-less.
+        let mut pinned = true;
+        match br.pin_block_validated(&victim.base_key) {
+            crate::block_allocator::PinOutcome::Pinned => {}
+            crate::block_allocator::PinOutcome::PinnedUnstable => {
+                let _ = br.free_block(&victim.base_key).await;
+                return MoveOutcome::Deferred;
+            }
+            crate::block_allocator::PinOutcome::Refused => {
+                if br.block_refcount(&victim.base_key).is_some() {
+                    return MoveOutcome::Superseded;
+                }
+                log::info!(
+                    "defrag --pack: victim {} is allocator-untracked — re-packing pin-less \
+                     (the physical block is not reclaimable here)",
+                    victim.base_key
+                );
+                pinned = false;
+            }
+        }
+        if pinned {
+            mover_ledger_insert(&victim.base_key);
+        }
+        let _charge = CopyCharge::new(victim.live_bytes);
+
+        let mut published_total = 0usize;
+        let mut deferred = false;
+        for w in &victim.windows {
+            let longest = &victim.refs[w.longest];
+            let repacked = match router.repack_window(longest.ino, &longest.mapping).await {
+                Ok(Some(r)) => r,
+                Ok(None) => {
+                    // OQ-1: the pack arm is stopped (`StorageFull`) — the
+                    // rest of this victim waits for the next pass.
+                    deferred = true;
+                    break;
+                }
+                Err(e) => {
+                    log::warn!(
+                        "defrag --pack: re-packing window {}:{} of {} deferred: {e}",
+                        w.off,
+                        w.max_len,
+                        victim.base_key
+                    );
+                    deferred = true;
+                    continue;
+                }
+            };
+            // Pre-publish reference transfer (§5.8 deviation 2): the
+            // destination carries one reference per REFERENCER before any
+            // publish — the handle's own plus `refs − 1` raised. The pack's
+            // pin is live (the block is open), so a refusal is structural.
+            let mut raised = 0usize;
+            for _ in 1..w.refs.len() {
+                if br.increment_refcount(&repacked.base_key) {
+                    raised += 1;
+                } else {
+                    break;
+                }
+            }
+            if raised + 1 < w.refs.len() {
+                crate::note_invariant_tripwire(
+                    "pack_compaction_raise_refused",
+                    &format!(
+                        "the open pack {} refused a pre-publish reference raise",
+                        repacked.base_key
+                    ),
+                );
+                for _ in 0..raised {
+                    let _ = repacked
+                        .tenant
+                        .pack
+                        .allocator
+                        .release_pack_reference(
+                            br,
+                            &repacked.base_key,
+                            crate::block_allocator::PackPublishOutcome::Known,
+                        )
+                        .await;
+                }
+                router.abandon_repacked_window(repacked).await;
+                deferred = true;
+                continue;
+            }
+            // Publish per referencer, ascending ino, each with its OWN len
+            // at the shared destination slot.
+            let mut published = 0usize;
+            let mut released = 0usize;
+            for &ri in &w.refs {
+                let r = &victim.refs[ri];
+                let len_i = match router.parse_block_mapping(&r.mapping) {
+                    Ok((_, _, sz, true)) => sz as u64,
+                    _ => {
+                        released += 1;
+                        continue;
+                    }
+                };
+                fire_pre_publish_hook(r.ino, r.block_idx).await;
+                let flush_lock = crate::fuse_client::BLOCK_FLUSH_LOCKS.get_lock(r.ino, r.block_idx);
+                let _flush_guard = flush_lock.lock().await;
+                let ok = if !(ctx.quiesce)(r.ino, r.block_idx as u64) {
+                    false
+                } else {
+                    let new_mapping = format!("{}:{}:{len_i}", repacked.base_key, repacked.off);
+                    let entries = [(r.block_idx, r.mapping.clone(), new_mapping)];
+                    let token = router.dlm.get_fencing_token_ino(r.ino);
+                    match router
+                        .merge_block_mappings(
+                            r.ino,
+                            crate::routing::BlockMapOp::MergeExpected(&entries),
+                            0,
+                            crate::routing::LayoutFlip::KeepLayout,
+                            token,
+                        )
+                        .await
+                    {
+                        Ok(displaced) if displaced.iter().any(|d| d == &r.mapping) => {
+                            // The source reference moves: nonterminal
+                            // while the pin (and any sibling) lives.
+                            let _ = br.free_block(&r.mapping).await;
+                            true
+                        }
+                        Ok(_) => {
+                            METRICS
+                                .evacuate_stale_token_noops
+                                .fetch_add(1, Ordering::Relaxed);
+                            false
+                        }
+                        Err(crate::error::SqueezefsError::FencingTokenExpired { .. }) => {
+                            METRICS
+                                .evacuate_stale_token_noops
+                                .fetch_add(1, Ordering::Relaxed);
+                            false
+                        }
+                        Err(e) => {
+                            log::warn!("defrag --pack: publish for ino {} deferred: {e}", r.ino);
+                            false
+                        }
+                    }
+                };
+                drop(_flush_guard);
+                if ok {
+                    published += 1;
+                } else {
+                    released += 1;
+                }
+            }
+            // Settle the destination references the refused referencers
+            // did not take — OUTSIDE the flush lock and the merge's 3.5
+            // guard (RES-1). The handle's own reference is the LAST one
+            // released (a window nobody took is an abandoned slot).
+            for _ in 0..released.min(raised) {
+                let _ = repacked
+                    .tenant
+                    .pack
+                    .allocator
+                    .release_pack_reference(
+                        br,
+                        &repacked.base_key,
+                        crate::block_allocator::PackPublishOutcome::Known,
+                    )
+                    .await;
+            }
+            if published == 0 {
+                router.abandon_repacked_window(repacked).await;
+                deferred = true;
+                continue;
+            }
+            repacked.tenant.pack.note_committed();
+            METRICS
+                .pack_compaction_windows_copied
+                .fetch_add(1, Ordering::Relaxed);
+            METRICS
+                .pack_compaction_bytes_copied
+                .fetch_add(w.max_len, Ordering::Relaxed);
+            published_total += published;
+            // The committed window's handle drops here — its in-flight
+            // registration ends after the publishes are visible; the
+            // reference it stood for is the layouts' now.
+            drop(repacked);
+        }
+        METRICS
+            .pack_compaction_tenants_moved
+            .fetch_add(published_total as u64, Ordering::Relaxed);
+
+        // The pin's release: the victim's LAST reference iff every tenant
+        // left (moved here or deleted meanwhile) — the terminal free through
+        // the ordinary ladder, reclaim queue and grace composed.
+        if pinned {
+            mover_ledger_remove(&victim.base_key);
+            match br.free_block_verdict(&victim.base_key).await {
+                Ok(true) => {
+                    METRICS
+                        .pack_compaction_blocks_freed
+                        .fetch_add(1, Ordering::Relaxed);
+                    METRICS
+                        .pack_compaction_bytes_reclaimed
+                        .fetch_add(chunk - victim.live_bytes, Ordering::Relaxed);
+                }
+                Ok(false) => {}
+                Err(e) => log::warn!(
+                    "defrag --pack: releasing the source pin on {} failed: {e}",
+                    victim.base_key
+                ),
+            }
+        }
+        if published_total > 0 {
+            MoveOutcome::Moved
+        } else if deferred {
+            MoveOutcome::Deferred
+        } else {
+            MoveOutcome::Superseded
+        }
+    }
+}
+
+/// One compaction victim (PK6): a pack block at or below the half-chunk
+/// line, its live windows and every referencer.
+struct PackVictim {
+    /// Clean base key (`clean_block_key` form).
+    base_key: String,
+    /// `Σ slot` over the live windows.
+    live_bytes: u64,
+    windows: Vec<crate::defrag::PackWindow>,
+    refs: Vec<MoveRef>,
+}
+
+/// A compaction plan: the victims (ascending live bytes) and whether a
+/// lone victim was left alone because moving it would free nothing.
+struct PackPlan {
+    victims: Vec<PackVictim>,
+    skipped_lone_victim: bool,
+}
+
+/// Plan one compaction pass (design-small-file-packing §5.8): the census
+/// over the scope (the named volume or every placement-eligible one), the
+/// pack-shaped blocks folded by `off` at `max(len)`, victims = those at
+/// or below the derived half-chunk line, ascending. A plan executes only
+/// if it frees ≥ 1 block: two or more victims always net one (each is ≤
+/// half a chunk, so two fit one block); a single victim frees one iff the
+/// open pack already has room for its live windows — otherwise re-packing
+/// it into a fresh block would trade one low block for another.
+async fn plan_pack_compaction(
+    meta: &Arc<RoutedMetaBackend>,
+    ctx: &MoverCtx,
+    volume_id: Option<&str>,
+) -> Result<PackPlan, String> {
+    let br = &ctx.router.backend_router;
+    let mut scope: Vec<String> = Vec::new();
+    match volume_id {
+        Some(v) => {
+            if br.backends.get(v).is_none() {
+                return Err(format!(
+                    "unknown data volume '{v}' (see `squeezefs volume list`)"
+                ));
+            }
+            if !br.placement_eligible(v) {
+                return Err(format!(
+                    "volume '{v}' is not placement-eligible \
+                     (draining/retired/unhealthy) — defrag --pack needs a writable volume"
+                ));
+            }
+            scope.push(v.to_string());
+        }
+        None => {
+            for entry in br.backends.iter() {
+                if br.placement_eligible(entry.key()) {
+                    scope.push(entry.key().clone());
+                }
+            }
+            scope.sort();
+        }
+    }
+    let mut plan = PackPlan {
+        victims: Vec::new(),
+        skipped_lone_victim: false,
+    };
+    if scope.is_empty() {
+        return Ok(plan);
+    }
+    let census = census_for(meta, &ctx.router, &scope)
+        .await
+        .map_err(|e| format!("defrag --pack census failed: {e}"))?;
+    for t in census.tasks {
+        let Some(windows) = crate::defrag::pack_windows(&ctx.router, &t.refs) else {
+            continue;
+        };
+        let live = crate::defrag::pack_live_bytes(&windows);
+        if !crate::defrag::is_pack_victim(live) {
+            continue;
+        }
+        // §5.8 (3) / §5.11: an OPEN pack is never a victim — the packer is
+        // still filling it (this pass's own destination included), so it
+        // is deferred at the plan, counted; `compact_one` re-checks as the
+        // belt for a pack that opens between plan and move.
+        if pack_ledger_contains(&t.base_key)
+            || br
+                .allocator_for_key(&t.base_key)
+                .is_some_and(|(alloc, offset)| alloc.inflight_contains(offset))
+        {
+            METRICS
+                .pack_mover_open_defers
+                .fetch_add(1, Ordering::Relaxed);
+            METRICS
+                .pack_compaction_deferred
+                .fetch_add(1, Ordering::Relaxed);
+            continue;
+        }
+        plan.victims.push(PackVictim {
+            base_key: t.base_key,
+            live_bytes: live,
+            windows,
+            refs: t.refs,
+        });
+    }
+    plan.victims.sort_by(|a, b| {
+        a.live_bytes
+            .cmp(&b.live_bytes)
+            .then(a.base_key.cmp(&b.base_key))
+    });
+    if plan.victims.len() == 1 && ctx.router.packer.open_room_bytes() < plan.victims[0].live_bytes {
+        plan.victims.clear();
+        plan.skipped_lone_victim = true;
+    }
+    Ok(plan)
 }
 
 enum MoverObjective {
@@ -3423,6 +3989,17 @@ pub fn pack_open_ledger() -> Vec<String> {
 /// (§5.11) — one lock, no clone.
 fn pack_ledger_contains(key: &str) -> bool {
     PACK_OPEN_LEDGER.lock().iter().any(|k| k == key)
+}
+
+/// Test seam — the in-process kill-9 analog's teardown: a real kill-9
+/// loses this process-global ledger with the process, but an in-process
+/// "crash" (the fixture dropped without a seal) leaves the dead mount's
+/// open-pack entries behind, and a fresh fixture in the same process mints
+/// the SAME stamped base keys (fresh volume ⇒ same era and sequence), so
+/// a stale entry would make the compaction mover defer a live block as
+/// "open" (the pack_compaction suite's crash contract).
+pub fn test_pack_ledger_clear() {
+    PACK_OPEN_LEDGER.lock().clear();
 }
 
 // ---------------------------------------------------------------------------
@@ -3669,6 +4246,7 @@ async fn plan_defrag(
                     ino: f.ino,
                     block_idx: *idx,
                     mapping: mapping.clone(),
+                    staged: false,
                 }],
                 dest_hint: None,
                 dest_pick: DestPick::BackendAscending {

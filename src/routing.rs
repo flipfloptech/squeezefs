@@ -316,6 +316,20 @@ pub(crate) struct LandedImage {
     pub(crate) site: PreparedSite,
 }
 
+/// One live window of a compaction victim RE-PACKED into the open pack
+/// (`DataRouter::repack_window`, PK6): the destination slot and the tenant
+/// handle — one reference + the in-flight registration on the pack — the
+/// compaction mover settles per referencer (a committed referencer's
+/// publish owns a reference; a refused one's is released).
+pub(crate) struct RepackedWindow {
+    /// The destination pack's persisted base key (`be://offset[@inc]`) —
+    /// every republished mapping's prefix.
+    pub(crate) base_key: String,
+    /// The slot's offset within the pack (`LBA_GRAIN`-aligned).
+    pub(crate) off: u64,
+    pub(crate) tenant: crate::pack::PackTenant,
+}
+
 /// `DataRouter::truncate_layout`'s durable clip of a promoted/spilled staged
 /// image (design-small-file-packing §5.7), decided before the commit and
 /// applied under the ino's guard iff `block_map[0]` still reads `old`.
@@ -14829,6 +14843,98 @@ impl DataRouter {
         }
     }
 
+    /// **The compaction mover's per-WINDOW re-pack primitive** (PK6,
+    /// design-small-file-packing §5.8 deviation 1): read ONE live window of
+    /// a victim pack block — `mapping` is the referencer carrying the
+    /// window's `max(len)` — as its RAW stored image (one ranged, routed
+    /// device read; transform-opaque — movers copy stored bytes verbatim,
+    /// VL §9), reserve a slot of exactly that image's `pack_slot_len` in the
+    /// OPEN pack block ([`crate::pack::Packer::reserve`] — the tenant's own
+    /// in-flight registration and reference ride the handle) and land it
+    /// there through the packer's own DMA ([`Self::land_tenant`] — never a
+    /// private copy of it), then VERIFY by a routed read-back of the slot
+    /// against the source image's xxh3 (`move_one`'s discipline). The
+    /// destination is pre-allocated (the refill minted it) and the slot is
+    /// UNPUBLISHED until the caller republishes the window's referencers
+    /// to `base_key:off:len_i` (each with its OWN `len`) and settles the
+    /// handle's reference — kept on a commit, released on a refusal. A
+    /// failed read-back releases the tenant (`pack_slots_abandoned`) and
+    /// errors. `Ok(None)` = the pack arm is stopped (OQ-1 `StorageFull`):
+    /// the caller defers the victim.
+    pub(crate) async fn repack_window(
+        &self,
+        ino: u64,
+        mapping: &str,
+    ) -> Result<Option<RepackedWindow>> {
+        let (_base, _off, sz, exact) = self.parse_block_mapping(mapping)?;
+        if !exact {
+            return Err(SqueezefsError::InvalidOperation(format!(
+                "pack compaction: '{mapping}' is not a size-carrying mapping"
+            )));
+        }
+        let (raw, _) = self.read_mapping_window_raw(mapping, None).await?;
+        if raw.len() != sz {
+            return Err(SqueezefsError::Io(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                format!(
+                    "pack compaction: short window read of '{mapping}' ({} of {sz} B)",
+                    raw.len()
+                ),
+            )));
+        }
+        let len = raw.len() as u64;
+        let slot = pack_slot_len(len);
+        let src_hash = xxhash_rust::xxh3::xxh3_64(&raw);
+        let Some(tenant) = self.packer.reserve(&self.backend_router, slot).await? else {
+            return Ok(None);
+        };
+        let LandedImage { site, .. } = self.land_tenant(tenant, ino, raw, slot).await?;
+        let PreparedSite::Packed(tenant) = site else {
+            return Err(SqueezefsError::InvalidOperation(
+                "pack compaction: the packed landing answered a block-arm site".to_string(),
+            ));
+        };
+        let base_key = tenant.pack.base_key.clone();
+        let off = tenant.off;
+        match self
+            .backend_router
+            .read_block_range(&base_key, off, slot as usize, None)
+            .await
+        {
+            Ok(back)
+                if back.len() >= len as usize
+                    && xxhash_rust::xxh3::xxh3_64(&back[..len as usize]) == src_hash => {}
+            Ok(_) => {
+                log::error!(
+                    "pack compaction: verify MISMATCH of the re-packed window of '{mapping}' at \
+                     {base_key}:{off} — slot released, source untouched"
+                );
+                self.release_pack_tenant(tenant).await;
+                return Err(SqueezefsError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "pack compaction: destination read-back mismatch",
+                )));
+            }
+            Err(e) => {
+                self.release_pack_tenant(tenant).await;
+                return Err(e);
+            }
+        }
+        Ok(Some(RepackedWindow {
+            base_key,
+            off,
+            tenant,
+        }))
+    }
+
+    /// The compaction mover's settlement of a re-packed window's reference
+    /// that NO referencer took (every publish of the window refused): the
+    /// slot is dead space until the next compaction, released through the
+    /// allocator's one release primitive OUTSIDE every 3.5 guard (RES-1).
+    pub(crate) async fn abandon_repacked_window(&self, window: RepackedWindow) {
+        self.release_pack_tenant(window.tenant).await;
+    }
+
     /// The dismount seal (design-small-file-packing §5.3 (b)): every open
     /// pack seals — after the promotion pass, before "Dismount clean".
     /// Returns the number sealed.
@@ -15865,6 +15971,38 @@ impl DataRouter {
             }
         }
         deferred
+    }
+
+    /// FIND-PK-5 (spec §6.2 item 1 for the DIRTY release sites): a write
+    /// that supersedes a promoted/spilled durable copy and leaves the layout
+    /// DIRTY (`block_map: None`, persisted later) frees the copy's RAM
+    /// reference at once — the durable `−ref` must be NOTED for whichever
+    /// save persists the map (the rewrite-shadow site's discipline,
+    /// `note_block_ref_ops`), because that save computes its own delta
+    /// against the RAM map, which no longer names the copy. Un-noted, the
+    /// record survived whenever the re-promotion landed in a DIFFERENT
+    /// block (same block ⇒ same record key ⇒ overwritten), and the next
+    /// mount seeded the old block one reference above its tenants — a block
+    /// that never frees. Called inside the caller's `INODE_META_LOCKS`
+    /// section with the LAST PUBLISHED map (the `release_superseded_staged`
+    /// input); `keep` is the one key the new layout still names, if any.
+    fn note_superseded_map_release(
+        &self,
+        ino: u64,
+        old_map: Option<&std::collections::HashMap<u32, String>>,
+        keep: Option<&str>,
+    ) {
+        let Some(map) = old_map else {
+            return;
+        };
+        // One record per (index, key): every index's reference releases.
+        let changes: Vec<(u32, String, bool)> = map
+            .iter()
+            .filter(|(_, bk)| keep != Some(bk.as_str()))
+            .map(|(&idx, bk)| (idx, bk.clone(), false))
+            .collect();
+        let ops = self.block_ref_ops(ino, &changes);
+        self.note_block_ref_ops(ino, ops);
     }
 
     /// RES-1: free block keys collected under `INODE_META_LOCKS` **after**
@@ -18670,13 +18808,13 @@ impl DataRouter {
                 self.cache.read_lru.put(file_path, shared_data);
                 self.publish_layout_cache_entry(ino, updated_meta);
                 // A truncated-then-rewritten staged/spilled file leaves a ring
-                // entry and/or a durable copy behind: release them.
-                self.release_superseded_staged(
-                    meta.file_id.as_deref(),
-                    fresh.as_ref().and_then(|f| f.block_map.as_deref()),
-                    None,
-                )
-                .await
+                // entry and/or a durable copy behind: release them. The
+                // layout is DIRTY (persisted later), so the durable `−ref`
+                // is NOTED for that save (FIND-PK-5).
+                let old_map = fresh.as_ref().and_then(|f| f.block_map.as_deref());
+                self.note_superseded_map_release(ino, old_map, None);
+                self.release_superseded_staged(meta.file_id.as_deref(), old_map, None)
+                    .await
             };
             // RES-1: guard dropped — free the displaced keys now.
             self.free_deferred_keys(deferred).await;
@@ -18760,14 +18898,17 @@ impl DataRouter {
                     self.cache.read_lru.remove(file_path);
                     // The fresh stage supersedes any promoted/spilled durable
                     // copy of older content — release it ONLY when the ring
-                    // entry actually survives to be authoritative.
+                    // entry actually survives to be authoritative. The
+                    // layout is DIRTY (`block_map: None`, persisted by a
+                    // later save / promotion), so the copy's durable `−ref`
+                    // is NOTED for that save (FIND-PK-5: computed against
+                    // the RAM map alone, the promotion's swap never saw the
+                    // old record, which then outlived its reference in
+                    // every block but the one the re-promotion landed in).
                     let deferred = if ring_resident {
-                        self.release_superseded_staged(
-                            None,
-                            fresh.as_ref().and_then(|f| f.block_map.as_deref()),
-                            None,
-                        )
-                        .await
+                        let old_map = fresh.as_ref().and_then(|f| f.block_map.as_deref());
+                        self.note_superseded_map_release(ino, old_map, None);
+                        self.release_superseded_staged(None, old_map, None).await
                     } else {
                         Vec::new()
                     };

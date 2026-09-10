@@ -5944,6 +5944,40 @@ pub struct Metrics {
     /// — `PUBLISH_FREE_BLOCK_REFUSED`. **Must stay 0**: the belt catching
     /// what the per-volume group law makes unreachable.
     pub served_publish_free_block_refusals: Align64<AtomicU64>,
+    // PK6 (design-small-file-packing §5.8 / §10 — the D1 pack face and the
+    // re-pack compaction mover).
+    /// The D1 pack occupancy gauges — WALK-priced (refreshed by `measure`
+    /// / `--report-only` and after every compaction pass; permille+1 like
+    /// `frag_d1_contiguity`, raw 0 = never measured ⇒ `null`): the
+    /// least-occupied pack block and the mean over pack blocks, where a
+    /// pack block's occupancy is `Σ_{distinct off} pack_slot_len(max len) /
+    /// CHUNK` (a clone share / nested prefix share counts its slot once).
+    pub frag_d1_pack_occupancy: Align64<AtomicU64>,
+    pub frag_d1_pack_occupancy_mean: Align64<AtomicU64>,
+    /// Pack blocks measured (every block whose referencers are all
+    /// staged-layout tenants — the legacy one-tenant `bk:0:len` block
+    /// included), `Σ (CHUNK − live)` over them, and how many sit at or
+    /// below the derived half-chunk line (`defrag::is_pack_victim` — the
+    /// own-block threshold's other face, KD-5): what `defrag --pack` can
+    /// reclaim.
+    pub frag_d1_pack_blocks: Align64<AtomicU64>,
+    pub pack_reclaimable_bytes: Align64<AtomicU64>,
+    pub pack_blocks_below_half: Align64<AtomicU64>,
+    /// The compaction mover (`JobType::DefragPack`): passes that executed
+    /// a plan; tenants republished to a fresh slot; distinct windows
+    /// copied (`windows_copied ≤ tenants_moved` — both share classes are
+    /// copied once per `off`); image bytes copied vs `Σ (CHUNK − live)`
+    /// over the victims freed (`copied ≤ reclaimed` on every pass — the
+    /// break-even law made visible); victims freed through the terminal
+    /// ladder at population 0; victims deferred (an open pack, a
+    /// ring-resident tenant, an unstable word, a stopped pack arm).
+    pub pack_compactions: Align64<AtomicU64>,
+    pub pack_compaction_tenants_moved: Align64<AtomicU64>,
+    pub pack_compaction_windows_copied: Align64<AtomicU64>,
+    pub pack_compaction_bytes_copied: Align64<AtomicU64>,
+    pub pack_compaction_bytes_reclaimed: Align64<AtomicU64>,
+    pub pack_compaction_blocks_freed: Align64<AtomicU64>,
+    pub pack_compaction_deferred: Align64<AtomicU64>,
     /// FIND-RW5-A: never-lossy StorageFull escalations — a staged
     /// whole-image/fold/clone arm found the staging ring unable to admit
     /// its image and degraded to the durable direct-block spill instead of
@@ -11338,6 +11372,19 @@ impl SqueezefsFilesystem {
                 "served_pack_group_splits": METRICS.served_pack_group_splits.load(Ordering::Relaxed),
                 "served_pack_group_unavailable": METRICS.served_pack_group_unavailable.load(Ordering::Relaxed),
                 "served_publish_free_block_refusals": METRICS.served_publish_free_block_refusals.load(Ordering::Relaxed),
+                // PK6
+                "frag_d1_pack_occupancy": crate::defrag::decode_ratio(METRICS.frag_d1_pack_occupancy.load(Ordering::Relaxed)),
+                "frag_d1_pack_occupancy_mean": crate::defrag::decode_ratio(METRICS.frag_d1_pack_occupancy_mean.load(Ordering::Relaxed)),
+                "frag_d1_pack_blocks": METRICS.frag_d1_pack_blocks.load(Ordering::Relaxed),
+                "pack_reclaimable_bytes": METRICS.pack_reclaimable_bytes.load(Ordering::Relaxed),
+                "pack_blocks_below_half": METRICS.pack_blocks_below_half.load(Ordering::Relaxed),
+                "pack_compactions": METRICS.pack_compactions.load(Ordering::Relaxed),
+                "pack_compaction_tenants_moved": METRICS.pack_compaction_tenants_moved.load(Ordering::Relaxed),
+                "pack_compaction_windows_copied": METRICS.pack_compaction_windows_copied.load(Ordering::Relaxed),
+                "pack_compaction_bytes_copied": METRICS.pack_compaction_bytes_copied.load(Ordering::Relaxed),
+                "pack_compaction_bytes_reclaimed": METRICS.pack_compaction_bytes_reclaimed.load(Ordering::Relaxed),
+                "pack_compaction_blocks_freed": METRICS.pack_compaction_blocks_freed.load(Ordering::Relaxed),
+                "pack_compaction_deferred": METRICS.pack_compaction_deferred.load(Ordering::Relaxed),
                 "pack_open_blocks": pack_open_blocks,
                 "pack_open_block_age_ms": pack_open_block_age_ms,
                 "pack_open_block_occupancy": pack_open_block_occupancy,

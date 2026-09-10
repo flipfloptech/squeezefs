@@ -1552,7 +1552,7 @@ impl crate::ipc_host::AdminSink for FabricAdminSink {
                 // -----------------------------------------------------
                 "defrag" => {
                     const USAGE: &str = "usage: defrag report | defrag \
-                                         data|meta|fold|rebalance [vol <id>] [throttle <pct>]";
+                                         data|pack|meta|fold|rebalance [vol <id>] [throttle <pct>]";
                     let mut parts = arg.split_whitespace();
                     let mode = parts.next().ok_or_else(|| USAGE.to_string())?;
                     let mut volume: Option<String> = None;
@@ -1573,8 +1573,22 @@ impl crate::ipc_host::AdminSink for FabricAdminSink {
                             other => return Err(format!("{USAGE} (unknown token '{other}')")),
                         }
                     }
-                    if volume.is_some() && mode != "data" {
-                        return Err("vol <id> is only valid with `defrag data`".to_string());
+                    if volume.is_some() && mode != "data" && mode != "pack" {
+                        return Err(
+                            "vol <id> is only valid with `defrag data` / `defrag pack`".to_string()
+                        );
+                    }
+                    // PK6: the packing lever gates the WHOLE compaction
+                    // arm — refuse at submission (the runner re-checks for
+                    // adopted records), never a job that silently moves
+                    // nothing.
+                    if mode == "pack" && !crate::routing::small_file_packing_enabled() {
+                        return Err(
+                            "defrag --pack refused: SQUEEZEFS_SMALL_FILE_PACKING is off on this \
+                             mount — the compaction arm is gated by the packing lever \
+                             (design-small-file-packing §6, PK6); nothing moved"
+                                .to_string(),
+                        );
                     }
                     if mode == "report" {
                         let fs = need_fs()?;
@@ -1590,6 +1604,7 @@ impl crate::ipc_host::AdminSink for FabricAdminSink {
                     }
                     let job_type = match mode {
                         "data" => crate::jobs::JobType::DefragData { volume_id: volume },
+                        "pack" => crate::jobs::JobType::DefragPack { volume_id: volume },
                         "meta" => crate::jobs::JobType::DefragMeta,
                         "fold" => crate::jobs::JobType::DefragFold,
                         "rebalance" => crate::jobs::JobType::Rebalance,

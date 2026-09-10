@@ -3377,6 +3377,7 @@ impl JobWireWorker {
                     | JobType::MigrateMetaSlot { .. }
                     | JobType::Fsck { .. }
                     | JobType::DefragData { .. }
+                    | JobType::DefragPack { .. }
                     | JobType::DefragMeta
                     | JobType::DefragFold
                     | JobType::KvmapSweep { .. } => {

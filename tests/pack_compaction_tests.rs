@@ -312,12 +312,16 @@ impl Fx {
     }
 
     /// Kill-9 analog (the VL4 crash shape): nothing seals, nothing drains
-    /// — the worker future is dropped wherever it parked.
+    /// — the worker future is dropped wherever it parked. The
+    /// process-global pack-open ledger is cleared the way a real kill-9
+    /// loses it with the process (a fresh fixture mints the same stamped
+    /// base keys, so a stale entry would read as an open pack later).
     async fn crash(self) {
         self.fabric.shutdown_abrupt().await;
         for vol in &self.meta.volumes {
             let _ = vol.shutdown().await;
         }
+        squeezefs::jobs::test_pack_ledger_clear();
     }
 
     fn alloc(&self, idx: usize) -> Arc<BlockAllocator> {

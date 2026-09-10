@@ -658,6 +658,17 @@ impl Packer {
         (open, age, occupancy)
     }
 
+    /// Unreserved bytes of the UNSEALED open pack (0 = none open) — the
+    /// compaction plan's lone-victim rule (design §5.8: a plan executes
+    /// only if it frees ≥ 1 block, and a SINGLE victim frees one iff the
+    /// open pack already has room for its live windows; two or more
+    /// victims below half always net a block).
+    pub fn open_room_bytes(&self) -> u64 {
+        self.any_open()
+            .map(|p| CHUNK_SIZE.saturating_sub(p.reserved_bytes()))
+            .unwrap_or(0)
+    }
+
     /// The open packs' base keys (the opt-in census row).
     pub fn open_block_keys(&self) -> Vec<String> {
         let mut out = Vec::new();

@@ -1017,6 +1017,23 @@ pub fn set_test_inval_tail_stall_ms(ms: u64) {
     test_inval_tail_stall_cell().store(ms, Ordering::Relaxed);
 }
 
+/// TEST SEAM (`SQUEEZEFS_TEST_ROUTER_DISPATCH_STALL_MS`, the 2026-09-10
+/// overlay-vs-growth data-loss repro): a router-route WRITE the handler
+/// classified as a within-block STAGED write (the MetaPrepOnly class —
+/// inode guard dropped) parks this long between its classification and
+/// `DataRouter::write_file` — the stale-classification window a sibling
+/// segment's staged→striped promotion flips the layout in
+/// (`tests/overlay_growth_merge_tests.rs`). Load selects that schedule
+/// (≈ 1 in 80–100 kernel-split writebacks of a 4 MiB + 64 KiB file); this
+/// lever selects it deterministically. Read once; never set in
+/// production.
+fn test_router_dispatch_stall_ms() -> u64 {
+    static CELL: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *CELL.get_or_init(|| {
+        crate::env_knobs::int_knob::<u64>("SQUEEZEFS_TEST_ROUTER_DISPATCH_STALL_MS", 0)
+    })
+}
+
 /// TEST SEAM (B4c-ii, design-overlay-overwrite §5.1): stall INSIDE the
 /// overwrite install's ONE `INODE_META_LOCKS` capture+install section —
 /// after the mapping capture, before the registry install. The §5.1
@@ -25578,6 +25595,23 @@ impl Filesystem for SqueezefsFilesystem {
                 } else {
                     Some(guard)
                 };
+                // TEST SEAM: the stale-classification window — this write
+                // was classified staged-within-block and dropped its guard;
+                // a sibling's promotion may flip the layout before the
+                // router sees it (never stalls a held EntireOp guard).
+                if held_guard.is_none() {
+                    let stall = test_router_dispatch_stall_ms();
+                    if stall > 0 {
+                        // The suite sequences its sibling writes on this
+                        // line (the park is the deterministic window).
+                        info!(
+                            "TEST SEAM: router-dispatch stall parked at offset {offset} \
+                             (ino {ino}, {stall} ms)"
+                        );
+                        squeezefs_ipc::sqz_time::sleep(std::time::Duration::from_millis(stall))
+                            .await;
+                    }
+                }
                 let mut token = fencing_token;
                 let mut attempt = 0u32;
                 loop {

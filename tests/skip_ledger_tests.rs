@@ -334,6 +334,7 @@ fn the_mount_gated_suites_all_use_the_shared_gate() {
         "inline_raise_tests.rs",
         "mount_owner_override_tests.rs",
         "multi_queue_tests.rs",
+        "overlay_growth_merge_tests.rs",
         "pack_compaction_tests.rs",
         "pack_tenant_ops_tests.rs",
         "packed_mapping_wire_tests.rs",

@@ -158,6 +158,19 @@ async fn create(h: &H, name: &str) -> u64 {
 /// mount, not an O(logical size) signal. Without the warm-up the FIRST
 /// device write in the process absorbs the pool init into its RSS delta.
 async fn warm_io_pools(h: &H) {
+    // Force the three lazily-built block pools BEFORE the measurement. The
+    // heap pools are `alloc_zeroed` per buffer, and under the `--all-features`
+    // gate build `dhat::Alloc` does not override `alloc_zeroed`, so the
+    // default `alloc` + `write_bytes` TOUCHES every page: 512 × 4 MiB
+    // (`block_pool_capacity_from(32)`) = exactly the 2 GiB VmHWM jump the
+    // batch gate read on ~1 in 15 runs, whenever a background fetch first
+    // reached the read-fill pool inside the window (the warm-up's own read
+    // is served warm and never fills). A pool's commit is a process fact,
+    // not a hole materialized.
+    std::hint::black_box(&*squeezefs::cache::pool::BUFFER_POOL);
+    std::hint::black_box(&*squeezefs::cache::pool::ALIGNED_BUF_POOL);
+    std::hint::black_box(&*squeezefs::cache::pool::RANGED_BUF_POOL);
+    std::hint::black_box(squeezefs::cache::pool::zc_fill_pool());
     let ino = create(h, "pool_warmup").await;
     let buf = vec![b'w'; 3 * BS as usize]; // > BS => striped, 3 blocks
     write_at(h, ino, 0, &buf).await;

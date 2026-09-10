@@ -362,10 +362,63 @@ mount (the A-arm rig reset the cluster; remount is part of every arm).
    `/tmp/sqfs_pack_dismount_214805/`; looks like a pre-existing
    device-overlay race on the staged→striped transition under load;
    contract 1 pins `invariant_tripwires = 0` on the writer so a recurrence
-   fails loud. **Next:** PK3 (truncate/clone arms + mover interplay), PK4
-   (co-writer per-(owner, home volume) group pack + typed publish outcome
-   + served-publish screen), PK5 (fsck C12) — development-parallel per the
-   plan; then PK6 compaction, PK7 squeeze-test rows + the default flip.
+   fails loud.
+1p. **Packing PK3 + PK4 + PK5 LANDED and GATED (2026-09-10; gate on
+   `82f78ccd` 09:41–10:38, 374 suites / 4,903 tests, 18 stages, both
+   audits).** Three subagents in isolated worktrees off `a0e0da4b`, merged
+   narrow → wide (PK5 → PK3 → PK4; PK4's agent did its own rebase onto
+   PK3 — the two had restructured the same promotion halves; composition:
+   PK3's landing helpers `land_own_block`/`land_stored_image`/
+   `land_packed_image`/`release_landed_site` are the primitives, PK4's
+   `read_promotion_image` + batch driver sit on top, ONE DMA primitive
+   `land_tenant`, `commit_promotion`'s failure arm carries both fixes).
+   **PK5** (`1310342b`): fsck class **C12** report-only — Overlap = two
+   live windows on one `(vol, offset)` intersecting at DIFFERENT `off`
+   (same-`off` identical/nested windows = the two legal share classes,
+   never a finding; striped clones never a finding; `damaged:` filtered);
+   Overrun = past the chunk / misaligned / UNDECODABLE decoration (its own
+   tolerant decoder — C2 alone never saw `bk:garbage:len`); zero-FP by
+   settle + fresh re-read under both inos' 4a leases + open-pack exemption;
+   repair REFUSED (the C8 posture); `fsck_tenant_overlap_findings`
+   (must-stay-0), `fsck_repair_classC12` (structurally 0); 8 contracts
+   in-process. **PK3** (`27285f6a`): passthrough truncate-shrink of a
+   decorated mapping = a pure mapping re-description (zero device writes,
+   population + refcount unchanged — made LEVER-INDEPENDENT: strictly fewer
+   DMAs for today's `bk:0:len` population too); transformed shrink lands
+   the clipped image as a NEW tenant; truncate-up size-only; both spill
+   escalations (staged-clone, rider-fold) dispatch through the packed arm;
+   clone of a promoted tenant shares the window (nested clone+clip too);
+   `move_one` defers an OPEN pack block and **SEALS it when a drain targets
+   the volume** (`SealKind::Drain` — the red run proved a drain never
+   converges against a pinned open pack) and defers ring-resident tenants;
+   gauges `pack_mapping_clips`, `pack_mover_{open,resident}_defers`,
+   `pack_blocks_sealed_drain`; 8 contracts (`tests/pack_tenant_ops_tests.rs`).
+   **PK4** (`82f78ccd`, dark — the lever still OFF): the co-writer
+   batch-scoped pack — `prepare × N → commit_group → seal`, partitioned per
+   `(owner endpoint, home meta volume)` as ONE atomically-enqueued conveyor
+   group; the `pack_group` frame flag (`PUBLISH_SCHEMA` 16 → 17) with the
+   owner's `PUBLISH_PACK_GROUP_UNAVAILABLE` 0x57 (conveyor grouping off)
+   and post-gate `PUBLISH_PACK_GROUP_SPLIT` 0x58 (a slot cutover between
+   partition and serve → abandon + re-`prepare` once → one-block-per-file);
+   "at most ONE `pack_group` frame ever names a pack block" pinned by a
+   trace keyed on the pack LIFETIME (`OpenPack::seq`); the typed
+   `SqueezefsError::PublishFailure { TransportOutcomeUnknown | FrameRefused
+   | CallRefused | Protocol }` preserved by `fail_all`/`ship_witnessed`
+   (source-pinned: no string parsing; errno EIO), `ship_witnessed` stops
+   retrying typed DEFINITE refusals; the authority's served-publish
+   free-block screen (`PUBLISH_FREE_BLOCK_REFUSED` 0x59); `Grant::
+   pack_group_available` (`CLUSTER_WIRE_SCHEMA` 3 → 4); 13 contracts in 11
+   tests (`tests/mw_cowriter_pack_tests.rs`). **It also closed a latent
+   PK2-era hole**: a FAILED promotion save re-noted its own `+ref` through
+   the never-lossy refill, so the next persist would have committed a
+   durable reference to an abandoned block (C8 drift) — `retract_block_
+   ref_ops` now covers the per-file arm and PK3's spill/clone save-failure
+   arms (FIND-PK-4's abandon-without-recycle on `TransportOutcomeUnknown`
+   rides the same arm). My integration change: one library `expect()` in
+   the pack-group ship path → a `let … else` refusal. **PK6 in flight**
+   (compaction on the defrag D1 axis; first customer = the legacy
+   one-block-per-file population); then PK7 (squeeze-test rows + the
+   default flip).
 2. **Kernel A/B, B arm** — after `squeeze-test` boots the 6.19.14 series
    WITH 0031 (or whichever box carries the patched kernel): on the box,
    `cd /scratch/tmp/sqz-agent/k26 && sudo env ARM=B KERNEL_TAG=<uname -r

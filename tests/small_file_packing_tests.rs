@@ -654,9 +654,10 @@ fn a_clean_unmount_packs_the_population_into_shared_blocks_other_clients_read_ex
 // Contract 12 (mount face): lever OFF is byte-identical to the block arm
 // ---------------------------------------------------------------------------
 
-/// With the lever OFF (the shipped default) the dismount pass takes one
-/// block per file — the FIXED block arm, its `+ref` staged (drift 0) — and
-/// reports `0 packed`; the space law reads N blocks.
+/// With the lever OFF (`SQUEEZEFS_SMALL_FILE_PACKING=0` — the A/B control
+/// since the PK7 flip; the shipped default through PK6) the dismount pass
+/// takes one block per file — the FIXED block arm, its `+ref` staged
+/// (drift 0) — and reports `0 packed`; the space law reads N blocks.
 #[test]
 fn lever_off_promotes_one_block_per_file_and_packs_nothing() {
     if !mount_supported(site!()) {
@@ -667,7 +668,7 @@ fn lever_off_promotes_one_block_per_file_and_packs_nothing() {
     let meta = format_volume(&base, &staging);
     let mnt = base.join("mnt");
     let log = base.join("mount.log");
-    let mut mount = spawn_mount(&meta, &mnt, &log, &[]);
+    let mut mount = spawn_mount(&meta, &mnt, &log, &[(LEVER, "0")]);
     assert_eq!(stats_json(&mnt)["small_file_packing"], false);
     write_fsync(&mnt.join(ANCHOR), &anchor_bytes());
     populate_staged_files(&mnt);
@@ -687,6 +688,58 @@ fn lever_off_promotes_one_block_per_file_and_packs_nothing() {
         used_chunks(&mnt2),
         ANCHOR_BLOCKS + FILES as u64,
         "one block per file — the 64× law the lever leaves in force when OFF"
+    );
+    assert_eq!(verify_files(&mnt2), 0);
+    mount2.umount_timed();
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+// ---------------------------------------------------------------------------
+// Contract 15: the DEFAULT packs (PK7's flip, 2026-09-10)
+// ---------------------------------------------------------------------------
+
+/// A plain mount — no lever in its environment — PACKS: `small_file_packing`
+/// reads true on `.stats`, the dismount pass reports `N packed, 0 to
+/// blocks`, the space law reads ≈ Σ slots / CHUNK blocks (not N), and every
+/// file is byte-exact from a second mount point with the oracle clean. The
+/// counted decision: `.benchmarks/2026-09-10-packing-rows-squeeze-test.md`
+/// (A-B-B-A on the acceptance venue — files/s +0.5 %, fsync −3.7 %,
+/// device/user bytes 1.00× both arms, 96,000 → 375 blocks). Red on the
+/// pre-flip registry default (`off`).
+#[test]
+fn a_plain_mount_packs_by_default() {
+    if !mount_supported(site!()) {
+        return;
+    }
+    let base = scratch("default");
+    let staging = base.join("staging");
+    let meta = format_volume(&base, &staging);
+    let mnt = base.join("mnt");
+    let log = base.join("mount.log");
+    let mut mount = spawn_mount(&meta, &mnt, &log, &[]);
+    assert_eq!(
+        stats_json(&mnt)["small_file_packing"],
+        true,
+        "the lever's registry default is ON since PK7"
+    );
+    write_fsync(&mnt.join(ANCHOR), &anchor_bytes());
+    populate_staged_files(&mnt);
+    mount.umount_timed();
+    assert!(
+        log_contains(&log, &format!("{FILES} packed, 0 to blocks")),
+        "the default dismount pass packs every staged file; log: {}",
+        log.display()
+    );
+
+    let mnt2 = base.join("mnt2");
+    let log2 = base.join("mount2.log");
+    let mut mount2 = spawn_mount(&meta, &mnt2, &log2, &[("SQUEEZEFS_BLOCK_REFS_VERIFY", "1")]);
+    assert_eq!(stat_u64(&mnt2, "meta_kv_block_refs_drift"), 0);
+    let used = used_chunks(&mnt2);
+    assert!(
+        used < ANCHOR_BLOCKS + FILES as u64 / 8,
+        "packed: {used} blocks for {FILES} files (+ {ANCHOR_BLOCKS} anchor) — the one-block-per-file law would read {}",
+        ANCHOR_BLOCKS + FILES as u64
     );
     assert_eq!(verify_files(&mnt2), 0);
     mount2.umount_timed();

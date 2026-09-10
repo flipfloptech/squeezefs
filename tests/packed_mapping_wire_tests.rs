@@ -292,6 +292,11 @@ impl H {
     /// dismount pass's own primitive, `promote_staged_file`). Returns the
     /// promoted mapping (`bk@inc:0:len`).
     async fn staged_promoted(&self, name: &str, content: &[u8]) -> (u64, String) {
+        // The ONE-BLOCK arm (`SQUEEZEFS_SMALL_FILE_PACKING=0`, the A/B
+        // control since PK7's flip): this suite's subject is the bare
+        // `bk:0:len` wire and the whole-block RAM pin; the packed arm's
+        // wire is `small_file_packing_tests`'.
+        squeezefs::routing::test_set_small_file_packing(Some(false));
         squeezefs::fsync_economy::test_set_promote_staged(Some(true));
         let before = self.metric("fsync_promoted_files").await;
         let ino = self.create(name).await;
@@ -313,7 +318,7 @@ impl H {
             .expect("promoted mapping decodes");
         assert!(
             exact && off == 0,
-            "today's promotion publishes bk:0:len ({mapping})"
+            "the one-block arm publishes bk:0:len ({mapping})"
         );
         assert_eq!(sz, content.len(), "passthrough image length ({mapping})");
         (ino, mapping)

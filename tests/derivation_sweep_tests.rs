@@ -584,13 +584,14 @@ fn pack_max_slot_default_is_half_the_chunk_and_the_grain_is_the_lba_law() {
         knob.default
     );
 
-    // The lever itself: a registered Bool, OFF until PK7's flip (PK2–PK6
-    // ship dark — a plain mount's promotion is byte-identical to the
-    // one-block-per-file block arm).
+    // The lever itself: a registered Bool, ON since PK7's counted flip
+    // (`.benchmarks/2026-09-10-packing-rows-squeeze-test.md`); `0` is the
+    // A/B control — the one-block-per-file block arm, byte-identical to
+    // the pre-flip shape.
     let lever = squeezefs::env_knobs::lookup("SQUEEZEFS_SMALL_FILE_PACKING")
         .expect("SQUEEZEFS_SMALL_FILE_PACKING is registered");
     assert_eq!(lever.kind, squeezefs::env_knobs::Kind::Bool);
-    assert_eq!(lever.default, "off", "the lever ships OFF through PK6");
+    assert_eq!(lever.default, "on", "the lever ships ON since PK7");
 }
 
 /// PK6 (design-small-file-packing §5.5, §5.8, KD-5): the compaction

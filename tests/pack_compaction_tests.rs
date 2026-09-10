@@ -2048,9 +2048,11 @@ fn on_a_live_mount_report_only_reads_the_legacy_population_and_defrag_pack_compa
     let meta = format_volume(&base, &staging);
     let mnt = base.join("mnt");
 
-    // The legacy population: promoted one-per-block at a lever-OFF dismount.
+    // The legacy population: promoted one-per-block at a lever-OFF dismount
+    // (`SQUEEZEFS_SMALL_FILE_PACKING=0` — the pre-flip shape every volume
+    // the shipped code touched carries).
     let log0 = base.join("mount0.log");
-    let mut m0 = spawn_mount(&meta, &mnt, &log0, &[]);
+    let mut m0 = spawn_mount(&meta, &mnt, &log0, &[(LEVER, "0")]);
     write_fsync(&mnt.join(ANCHOR), &anchor_bytes());
     populate_staged_files(&mnt);
     m0.umount();

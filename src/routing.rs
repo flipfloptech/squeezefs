@@ -19926,6 +19926,95 @@ impl DataRouter {
         &self.cache
     }
 
+    /// [`Self::clone_file`]'s ring-RESIDENT staged arm: the source's
+    /// current image (its ring entry composed with its W2 rider runs) is
+    /// staged under the dest's own `file_id`; a refused destination stage
+    /// takes the FIND-RW5-A durable-spill escalation (backend block +
+    /// `block_map[0]`). The dest's layout names ONLY what this arm gave
+    /// it: its own ring entry, or the spilled block — never the source's
+    /// older promoted mapping (a resident entry supersedes that mapping,
+    /// and carrying it across would be a second reference the dest holds
+    /// no pin for, which the dest's own promotion would then displace and
+    /// FREE under the source — FIND-PK-3's other arm). Returns the spilled
+    /// block's in-flight registration (PR VL6a), which the caller holds
+    /// until its dest-layout commit publishes the mapping.
+    async fn clone_staged_resident(
+        &self,
+        src: &str,
+        dest: &str,
+        new_file_id: &str,
+        mut data: Vec<u8>,
+        dest_token: u64,
+        updated_meta: &mut CachedMetadata,
+    ) -> Result<Option<crate::block_allocator::InflightAllocGuard>> {
+        // W2: the clone's image must carry the source's rider record
+        // extents (newer than the ring image).
+        let src_ino = parse_inode_from_path(src);
+        for (s0, d) in
+            self.staged_extent_runs_in(&crate::keys::inode_path(src_ino), 0, 0, usize::MAX)
+        {
+            if data.len() < s0 + d.len() {
+                data.resize(s0 + d.len(), 0);
+            }
+            data[s0..s0 + d.len()].copy_from_slice(&d);
+        }
+        updated_meta.block_map = None;
+        // FIND-RW5-A: a refused destination stage takes the durable-spill
+        // escalation (backend block + `block_map[0]` mapping) — a clone
+        // must never surface StorageFull because the staging ring is full
+        // of OTHER files' live custody.
+        match self
+            .cache
+            .nvme
+            .stage_write(
+                dest,
+                new_file_id,
+                bytes::Bytes::from(data.clone()),
+                dest_token,
+            )
+            .await
+        {
+            Ok(_) => Ok(None),
+            Err(SqueezefsError::Io(ref e)) if e.kind() == std::io::ErrorKind::StorageFull => {
+                crate::fuse_client::METRICS
+                    .staged_spill_escalations
+                    .fetch_add(1, Ordering::Relaxed);
+                let processed = self
+                    .get_crypto()
+                    .process_write_async(bytes::Bytes::from(data))
+                    .await?;
+                crate::block_allocator::ensure_stored_block_image_fits(
+                    processed.len(),
+                    crate::block_allocator::CHUNK_SIZE,
+                    "staged-clone spill",
+                )?;
+                let (be_id, block_allocator, nvme_writer, be_offset) =
+                    self.backend_router.allocate_placed_block().await?;
+                // PR VL6a: in-flight until the caller's dest-layout commit
+                // publishes the mapping (returned to `clone_file`, which
+                // commits `updated_meta` before dropping it).
+                let inflight = block_allocator.inflight_register(be_offset);
+                let stored_block_key = format!(
+                    "{}:0:{}",
+                    self.backend_router.persist_block_key(&be_id, be_offset),
+                    processed.len()
+                );
+                if let Err(e) = nvme_writer.write_block(be_offset, processed).await {
+                    // Never-published: co-writer-aware abandon (d575be03
+                    // sweep).
+                    let _ = block_allocator.abandon_unpublished_offset(be_offset).await;
+                    return Err(e);
+                }
+                block_allocator.publish_block(be_offset);
+                let mut block_map = std::collections::HashMap::new();
+                block_map.insert(0, stored_block_key);
+                updated_meta.block_map = Some(std::sync::Arc::new(block_map));
+                Ok(Some(inflight))
+            }
+            Err(e) => Err(e),
+        }
+    }
+
     /// Clone a file metadata-only. If it's inline, copy the inline data.
     /// If it's staged, copy the staging folder/files and mapping.
     /// If it's striped, copy the block map and increment all block reference counts.
@@ -19969,80 +20058,86 @@ impl DataRouter {
         self.close_rewrite_epoch(_src_ino, _resolved_src_token)
             .await?;
 
-        let meta = self.fetch_metadata(src).await?;
+        let mut meta = self.fetch_metadata(src).await?;
 
         let mut updated_meta = meta.clone();
+        // PR VL6a: a staged-clone spill's allocate→commit window stays
+        // registered until the dest-layout commit below (scope-held).
+        let mut _spill_inflight: Option<crate::block_allocator::InflightAllocGuard> = None;
         if meta.file_type == "staged" {
-            let file_id = meta.file_id.as_ref().ok_or_else(|| {
+            let file_id = meta.file_id.clone().ok_or_else(|| {
                 SqueezefsError::InvalidOperation("Missing file_id for staged file".to_string())
             })?;
             let new_file_id = Uuid::new_v4().to_string();
-            if let Some(mut data) = self.cache.nvme.read_staged(file_id) {
-                // W2: the clone's image must carry the source's rider
-                // record extents (newer than the ring image).
-                let src_ino = parse_inode_from_path(src);
-                for (s0, d) in
-                    self.staged_extent_runs_in(&crate::keys::inode_path(src_ino), 0, 0, usize::MAX)
-                {
-                    if data.len() < s0 + d.len() {
-                        data.resize(s0 + d.len(), 0);
-                    }
-                    data[s0..s0 + d.len()].copy_from_slice(&d);
+            // The source's custody is ONE of: its ring entry (copy it under
+            // the dest's own id), its promoted durable mapping (SHARE it —
+            // two inos, one window), or nothing (a lost payload: the clone
+            // carries the size, an implicit-zero image). Resolved in a
+            // bounded loop because the promoted arm's pin can be refused
+            // under a racing re-promotion / RMW supersede that freed the
+            // mapping — the identity is then re-read and the arm re-chosen.
+            let mut attempt = 0usize;
+            loop {
+                if let Some(data) = self.cache.nvme.read_staged(&file_id) {
+                    _spill_inflight = self
+                        .clone_staged_resident(
+                            src,
+                            dest,
+                            &new_file_id,
+                            data,
+                            resolved_dest_token,
+                            &mut updated_meta,
+                        )
+                        .await?;
+                    break;
                 }
-                // FIND-RW5-A: a refused destination stage takes the
-                // durable-spill escalation (backend block + `block_map[0]`
-                // mapping) — a clone must never surface StorageFull because
-                // the staging ring is full of OTHER files' live custody.
-                match self
-                    .cache
-                    .nvme
-                    .stage_write(
-                        dest,
-                        &new_file_id,
-                        bytes::Bytes::from(data.clone()),
-                        resolved_dest_token,
-                    )
-                    .await
-                {
-                    Ok(_) => {}
-                    Err(SqueezefsError::Io(ref e))
-                        if e.kind() == std::io::ErrorKind::StorageFull =>
-                    {
-                        crate::fuse_client::METRICS
-                            .staged_spill_escalations
-                            .fetch_add(1, Ordering::Relaxed);
-                        let processed = self
-                            .get_crypto()
-                            .process_write_async(bytes::Bytes::from(data))
-                            .await?;
-                        crate::block_allocator::ensure_stored_block_image_fits(
-                            processed.len(),
-                            crate::block_allocator::CHUNK_SIZE,
-                            "staged-clone spill",
-                        )?;
-                        let (be_id, block_allocator, nvme_writer, be_offset) =
-                            self.backend_router.allocate_placed_block().await?;
-                        // PR VL6a: in-flight until the caller's dest-layout
-                        // commit below publishes the mapping (scope-held —
-                        // this fn commits `updated_meta` before returning).
-                        let _inflight = block_allocator.inflight_register(be_offset);
-                        let stored_block_key = format!(
-                            "{}:0:{}",
-                            self.backend_router.persist_block_key(&be_id, be_offset),
-                            processed.len()
-                        );
-                        if let Err(e) = nvme_writer.write_block(be_offset, processed).await {
-                            // Never-published: co-writer-aware abandon
-                            // (d575be03 sweep).
-                            let _ = block_allocator.abandon_unpublished_offset(be_offset).await;
-                            return Err(e);
-                        }
-                        block_allocator.publish_block(be_offset);
-                        let mut block_map = std::collections::HashMap::new();
-                        block_map.insert(0, stored_block_key);
-                        updated_meta.block_map = Some(std::sync::Arc::new(block_map));
+                let Some(bk) = meta.block_map.as_ref().and_then(|bm| bm.get(&0)).cloned() else {
+                    // Lost payload (D0 crash degrade): nothing durable, nothing
+                    // resident — the clone carries the size alone.
+                    updated_meta.block_map = None;
+                    break;
+                };
+                // FIND-PK-3 (design-small-file-packing §1.3): the clone of a
+                // PROMOTED source SHARES its `bk:off:len` mapping durably
+                // (the dest's save stages the +1 C8 record below) and must
+                // hold the matching RAM reference — the striped arm's
+                // `pin_block_validated` discipline. Without it the RAM count
+                // read 1 for a block two inos reference, so the source's
+                // later delete was TERMINAL: the block freed (and its
+                // incarnation retired) under the live clone until a remount
+                // re-derived the count.
+                let why = match self.backend_router.pin_block_validated(&bk) {
+                    crate::block_allocator::PinOutcome::Pinned => break,
+                    crate::block_allocator::PinOutcome::PinnedUnstable => {
+                        // The reference WAS taken; a writer may be mid-DMA on
+                        // the block (its word unstable) — unpin and retry
+                        // against the fresh identity.
+                        let _ = self.backend_router.free_block(&bk).await;
+                        "unstable under a racing writer"
                     }
-                    Err(e) => return Err(e),
+                    crate::block_allocator::PinOutcome::Refused => "freed concurrently",
+                };
+                attempt += 1;
+                if attempt >= 3 {
+                    return Err(SqueezefsError::InvalidOperation(format!(
+                        "clone source {src} promoted mapping {bk} {why} (identity still \
+                         contended after {attempt} attempts); aborting to avoid an unpinned \
+                         clone"
+                    )));
+                }
+                match self.freshest_layout_identity(src).await {
+                    Some(fresh)
+                        if fresh.file_type == "staged"
+                            && fresh.file_id.as_deref() == Some(&file_id[..]) =>
+                    {
+                        meta = fresh;
+                        updated_meta = meta.clone();
+                    }
+                    _ => {
+                        return Err(SqueezefsError::InvalidOperation(format!(
+                            "clone source {src} changed layout mid-clone; retry the clone"
+                        )))
+                    }
                 }
             }
             updated_meta.file_id = Some(new_file_id.into());

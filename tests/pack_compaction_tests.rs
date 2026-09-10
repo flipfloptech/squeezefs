@@ -581,9 +581,11 @@ impl Fx {
     }
 
     async fn assert_clean(&self, what: &str) {
+        let drift = self.drift().await;
         assert!(
-            self.drift().await.is_empty(),
-            "{what}: the C8 oracle must be clean"
+            drift.is_empty(),
+            "{what}: the C8 oracle must be clean — drifting (vol, offset, durable, derived): \
+             {drift:?}"
         );
         let findings = self.fsck_findings().await;
         assert!(
@@ -838,12 +840,21 @@ async fn victims_below_half_repack_into_one_fresh_pack_and_free_while_a_block_ab
     assert_eq!(fx.read(t2, big).await, pattern(15, big));
     fx.assert_clean("after the compaction pass").await;
 
-    // A second pass finds nothing: the open pack is not a candidate.
+    // A second pass moves nothing: the OPEN pack (now the only low block)
+    // is deferred, never touched (`pack_mover_open_defers` moves).
     let c2 = counters();
     assert_eq!(fx.compact().await, JobState::Completed);
+    let c3 = counters();
+    assert_eq!(c3.tenants_moved, c2.tenants_moved, "nothing moved");
+    assert_eq!(c3.blocks_freed, c2.blocks_freed);
+    assert!(
+        c3.open_defers > c2.open_defers,
+        "the open pack is deferred, not compacted into itself"
+    );
     assert_eq!(
-        metric(&METRICS.pack_compaction_tenants_moved),
-        c2.tenants_moved
+        alloc.refcount(fx.offset_of(&dst)),
+        Some(3 + 1),
+        "the open pack is untouched"
     );
     fx.close().await;
 }
@@ -1132,6 +1143,71 @@ async fn a_tenant_re_staged_mid_plan_is_deferred_not_copied() {
     assert_eq!(fx.read(a, 16 * KIB).await, pattern(61, 16 * KIB));
     assert_eq!(fx.read(b, 16 * KIB).await, pattern(52, 16 * KIB));
     fx.assert_clean("after the deferred victim re-packed").await;
+    fx.close().await;
+}
+
+// ---------------------------------------------------------------------------
+// FIND-PK-5 (found by contract 6): an overwritten tenant re-promoted into
+// ANOTHER block must release its old durable reference
+// ---------------------------------------------------------------------------
+
+/// The staged RMW re-stages a promoted tenant (`block_map: None`, dirty)
+/// and frees its old slot's RAM reference — but the durable `−ref` was
+/// never NOTED for the save that persists the dirty layout, so a later
+/// promotion (whose swap is computed against the RAM map) orphaned the
+/// old C8 record whenever the new tenant landed in a DIFFERENT block
+/// (same block ⇒ same record KEY ⇒ the `+ref` overwrote it, which is why
+/// the open-pack overwrite contract never saw it). Compaction makes the
+/// different-block case the common one: the block a re-promotion lands in
+/// is whichever pack is open. Pinned here as the shape compaction depends
+/// on — sealed pack {a, b}; overwrite a; fsync a (re-promoted into the
+/// fresh open pack): the oracle is clean, P1's population is exactly {b}.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_overwritten_tenant_re_promoted_into_another_block_releases_its_old_reference() {
+    let _g = serial().await;
+    let _l = arm_levers(true);
+    let dir = tempfile::tempdir().unwrap();
+    let (meta, fx) = open_fresh(dir.path(), 1, 4 << 30, "findpk5").await;
+    let alloc = fx.alloc(0);
+
+    let a = fx.promoted_file("a.bin", 16 * KIB, 151).await;
+    let b = fx.promoted_file("b.bin", 16 * KIB, 152).await;
+    fx.seal().await;
+    let (p1, _, _) = fx.mapping(a).await;
+    assert_eq!(alloc.refcount(fx.offset_of(&p1)), Some(2));
+
+    fx.write_at(a, 0, &pattern(161, 16 * KIB)).await;
+    assert_eq!(
+        alloc.refcount(fx.offset_of(&p1)),
+        Some(1),
+        "a's old slot released (RAM)"
+    );
+    fx.fsync(a).await;
+    let (dst, _, _) = fx.mapping(a).await;
+    assert_ne!(
+        fx.offset_of(&dst),
+        fx.offset_of(&p1),
+        "re-promoted into a fresh pack"
+    );
+    assert!(
+        fx.drift().await.is_empty(),
+        "the old tenant's durable record must leave with its RAM reference: {:?}",
+        fx.drift().await
+    );
+    assert_eq!(fx.read(a, 16 * KIB).await, pattern(161, 16 * KIB));
+    assert_eq!(fx.read(b, 16 * KIB).await, pattern(152, 16 * KIB));
+
+    // The remount face: the ledger seeds P1 at exactly {b}, never {a, b}
+    // — a stale record would pin P1 one above its tenants forever.
+    let records = fx.records.clone();
+    fx.close().await;
+    let fx = open_at(&meta, &records).await;
+    assert_eq!(
+        fx.alloc(0).refcount(fx.offset_of(&p1)),
+        Some(1),
+        "after remount P1's population is b alone"
+    );
+    assert!(fx.drift().await.is_empty());
     fx.close().await;
 }
 

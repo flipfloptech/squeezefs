@@ -198,6 +198,39 @@ pub enum PreparedSite {
     Packed(crate::pack::PackTenant),
 }
 
+/// A stored image LANDED on the data plane (`DataRouter::land_stored_image`
+/// and its two arms): the size-carrying mapping the caller's layout commit
+/// publishes, and the site — held until that commit is durable and visible
+/// (its in-flight registration / tenant handle), given back through
+/// `DataRouter::release_landed_site` when the mapping never took the layout.
+pub(crate) struct LandedImage {
+    pub(crate) block_key: String,
+    pub(crate) site: PreparedSite,
+}
+
+/// `DataRouter::truncate_layout`'s durable clip of a promoted/spilled staged
+/// image (design-small-file-packing §5.7), decided before the commit and
+/// applied under the ino's guard iff `block_map[0]` still reads `old`.
+enum DurableClip {
+    /// Passthrough: the SAME reference re-described — `base:off:len'`; no
+    /// data I/O, and nothing to free or release on either outcome.
+    Mapping { old: String, new: String },
+    /// Transformed: the clipped image re-encoded and landed as a new tenant
+    /// (or own block); the old reference releases on publish (a partial
+    /// free), the landing site releases if the commit never took it.
+    Image { old: String, landed: LandedImage },
+}
+
+impl DurableClip {
+    /// `(the mapping to displace, the mapping that replaces it)`.
+    fn keys(&self) -> (&str, &str) {
+        match self {
+            Self::Mapping { old, new } => (old, new),
+            Self::Image { old, landed } => (old, &landed.block_key),
+        }
+    }
+}
+
 /// The largest format bound ANY volume can hold — the registered
 /// override's upper bound (`RECORD_VALUE_CAP_CEILING` is Linux
 /// `XATTR_SIZE_MAX`, the value cap at every node size ≥ 256 KiB).
@@ -14231,44 +14264,112 @@ impl DataRouter {
             }
         }
 
-        let (be_id, allocator, writer, offset) =
-            self.backend_router.allocate_placed_block().await?;
-        // PR VL6a: live owner registration for the allocate→commit window
-        // (drops at function end, after the layout commit below).
-        let _inflight = allocator.inflight_register(offset);
-        // Size-carrying mapping (`bk:0:packed_len`): without the exact
-        // stored-image length, a passthrough transform cannot strip the
-        // whole-block read's recycled-tenant tail (see
-        // `parse_block_mapping`).
-        let block_key = format!(
-            "{}:0:{}",
-            self.backend_router.persist_block_key(&be_id, offset),
-            processed.len()
-        );
-        if let Err(e) = writer.write_block(offset, processed).await {
-            // Never-published: co-writer-aware abandon (d575be03 sweep).
-            let _ = allocator.abandon_unpublished_offset(offset).await;
-            return Err(e);
-        }
-        allocator.publish_block(offset);
-        // W-5: the promoted image is this ino's bytes DMA'd to `writer`'s
-        // device — the stamp every DMA site owes the fsync touched table,
-        // so the next covering barrier (the fsync-promotion leg's own
-        // data-barrier step included) barriers that namespace.
-        self.backend_router
-            .note_fsync_touched_device(promote_ino, &writer);
+        let LandedImage { block_key, site } = self.land_own_block(promote_ino, processed).await?;
         Ok(Some(PreparedPromotion::Device(PreparedDevicePromotion {
             ino: promote_ino,
             file_id: file_id.to_string(),
             gen,
             raw_len,
             block_key,
+            site,
+        })))
+    }
+
+    /// The OWN-BLOCK arm of a stored-image landing: one placed block, the
+    /// image DMA'd at its start, the size-carrying mapping `bk:0:len`
+    /// (without the exact stored-image length a passthrough transform
+    /// cannot strip the whole-block read's recycled-tenant tail — see
+    /// `parse_block_mapping`), the block's incarnation word published, and
+    /// its in-flight registration held on the returned site for the
+    /// allocate→commit window (PR VL6a). A failed DMA abandons the
+    /// never-published offset (co-writer-aware, d575be03 sweep) and
+    /// propagates.
+    async fn land_own_block(&self, ino: u64, image: bytes::Bytes) -> Result<LandedImage> {
+        let (be_id, allocator, writer, offset) =
+            self.backend_router.allocate_placed_block().await?;
+        let _inflight = allocator.inflight_register(offset);
+        let block_key = format!(
+            "{}:0:{}",
+            self.backend_router.persist_block_key(&be_id, offset),
+            image.len()
+        );
+        if let Err(e) = writer.write_block(offset, image).await {
+            let _ = allocator.abandon_unpublished_offset(offset).await;
+            return Err(e);
+        }
+        allocator.publish_block(offset);
+        // W-5: the image is this ino's bytes DMA'd to `writer`'s device —
+        // the stamp every DMA site owes the fsync touched table, so the
+        // next covering barrier barriers that namespace.
+        self.backend_router.note_fsync_touched_device(ino, &writer);
+        Ok(LandedImage {
+            block_key,
             site: PreparedSite::Block {
                 allocator,
                 offset,
                 _inflight,
             },
-        })))
+        })
+    }
+
+    /// Where a TRANSFORMED stored image lands when it MUST land — the size
+    /// dispatch the escalations share with the promotion's `prepare`
+    /// (design-small-file-packing §5.2 step 2, §5.7): under the lever, an
+    /// image whose LBA-rounded slot fits the own-block threshold packs into
+    /// the open pack block (a co-writer never packs before PK4's batch
+    /// driver); a larger one — and any image the OQ-1 `StorageFull` stop
+    /// has closed the pack arm to — takes a placed block of its own, whose
+    /// allocation surfaces the same `StorageFull` the caller already
+    /// propagates. Run by the staged-clone spill, the rider-fold spill and
+    /// the transformed truncate clip: each is a promotion of a composed or
+    /// clipped image under another name, and a private copy of the block
+    /// arm here would be the 64× space law applied to every spill. The
+    /// promotion's own `prepare` composes the same two arms with its
+    /// promotion counters and its resident-and-counted answer to a stopped
+    /// arm.
+    async fn land_stored_image(&self, ino: u64, image: bytes::Bytes) -> Result<LandedImage> {
+        if small_file_packing_enabled() && !crate::fuse_client::co_writer_mount() {
+            let slot = pack_slot_len(image.len() as u64);
+            if slot <= pack_max_slot_bytes() {
+                if let Some(landed) = self.land_packed_image(ino, image.clone(), slot).await? {
+                    return Ok(landed);
+                }
+            }
+        }
+        self.land_own_block(ino, image).await
+    }
+
+    /// The tenant of a landed image committed (its layout now names the
+    /// mapping and owns the reference): the packed arm's engagement
+    /// (`layout_promoted_packed`, the pack's committed gauge). The own-block
+    /// arm's counters are each caller's — a promotion counts
+    /// `layout_promoted_block`, a spill its escalation.
+    fn note_landed_tenant_committed(&self, site: &PreparedSite) {
+        if let PreparedSite::Packed(tenant) = site {
+            tenant.pack.note_committed();
+            METRICS
+                .layout_promoted_packed
+                .fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// A landed image whose mapping never took the layout (the commit was
+    /// refused, failed, or a racing publish won): the own-block arm's
+    /// offset is never-published — the co-writer-aware abandon (d575be03
+    /// sweep); the packed arm's tenant reference releases through the
+    /// allocator's one release primitive (§5.2 step 6). OUTSIDE every 3.5
+    /// guard (RES-1 — the packed release is terminal when the pack sealed
+    /// and every sibling was deleted, and a terminal free's reclaim enqueue
+    /// parks at the cap).
+    async fn release_landed_site(&self, site: PreparedSite) {
+        match site {
+            PreparedSite::Block {
+                allocator, offset, ..
+            } => {
+                let _ = allocator.abandon_unpublished_offset(offset).await;
+            }
+            PreparedSite::Packed(tenant) => self.release_pack_tenant(tenant).await,
+        }
     }
 
     /// The PACKED arm's `prepare` (design-small-file-packing §5.2 steps
@@ -14292,10 +14393,36 @@ impl DataRouter {
         image: bytes::Bytes,
         slot: u64,
     ) -> Result<Option<PreparedPromotion>> {
-        let Some(tenant) = self.packer.reserve(&self.backend_router, slot).await? else {
+        let Some(LandedImage { block_key, site }) =
+            self.land_packed_image(ino, image, slot).await?
+        else {
             METRICS
                 .pack_arm_stopped_promotions
                 .fetch_add(1, Ordering::Relaxed);
+            return Ok(None);
+        };
+        Ok(Some(PreparedPromotion::Device(PreparedDevicePromotion {
+            ino,
+            file_id: file_id.to_string(),
+            gen,
+            raw_len,
+            block_key,
+            site,
+        })))
+    }
+
+    /// The PACKED arm's landing (`prepare_packed_promotion`'s body, shared
+    /// with the escalations through [`Self::land_stored_image`]): the
+    /// reservation, the slot DMA, the word publish, the pack ledgers.
+    /// `Ok(None)` ⇔ the arm is stopped (OQ-1) or closed — the caller decides
+    /// between resident-and-counted and the own-block arm.
+    async fn land_packed_image(
+        &self,
+        ino: u64,
+        image: bytes::Bytes,
+        slot: u64,
+    ) -> Result<Option<LandedImage>> {
+        let Some(tenant) = self.packer.reserve(&self.backend_router, slot).await? else {
             return Ok(None);
         };
         let image_len = image.len();
@@ -14319,14 +14446,10 @@ impl DataRouter {
         METRICS
             .pack_slot_pad_bytes
             .fetch_add(slot - image_len as u64, Ordering::Relaxed);
-        Ok(Some(PreparedPromotion::Device(PreparedDevicePromotion {
-            ino,
-            file_id: file_id.to_string(),
-            gen,
-            raw_len,
+        Ok(Some(LandedImage {
             block_key,
             site: PreparedSite::Packed(tenant),
-        })))
+        }))
     }
 
     /// Give a reserved slot's reference back (design-small-file-packing
@@ -14363,6 +14486,42 @@ impl DataRouter {
     /// Returns the number sealed.
     pub async fn seal_open_packs(&self) -> u64 {
         self.packer.seal_all(&self.backend_router).await
+    }
+
+    /// The drain mover found an OPEN pack block on its victim volume
+    /// (design-small-file-packing §5.11): seal it — the pin released, the
+    /// ledger left — so the next re-plan moves it. An open pack on a
+    /// draining volume would otherwise keep taking tenants the drain then
+    /// has to move again, and a quiet mount's would never seal (v1 has no
+    /// idle seal), leaving the drain deferring for ever. `base_key` is the
+    /// block's clean base key (the pack ledger's). `true` ⇔ this call
+    /// sealed it. Runs outside every 3.5 guard (the mover holds none at
+    /// its quiesce gate — RES-1 for the pin's possibly-terminal release).
+    pub async fn seal_open_pack_block(&self, base_key: &str) -> bool {
+        self.packer.seal_block(&self.backend_router, base_key).await
+    }
+
+    /// The mover quiesce probes' resident-tenant clause (design-small-file-
+    /// packing §5.8 (3), §5.11): is `(ino, b)` a staged-layout tenant whose
+    /// `file_id` has a RESIDENT ring entry? A resident entry means a newer
+    /// image is about to supersede the durable tenant (the RMW's commit
+    /// publishes it and releases the mapping), so a mover that copied the
+    /// block now would copy dead bytes. One RAM-cache probe, latch-free; an
+    /// evicted entry answers `false` — the deferral is an economy, and the
+    /// mover's expected-mismatch publish is what keeps the move correct
+    /// either way.
+    pub fn staged_tenant_ring_resident(&self, ino: u64, b: u64) -> bool {
+        if b != 0 {
+            return false;
+        }
+        self.metadata_cache
+            .peek_with(&ino, |m| {
+                m.file_type == "staged"
+                    && m.file_id
+                        .as_deref()
+                        .is_some_and(|fid| self.cache.nvme.staged_len(fid).is_some())
+            })
+            .unwrap_or(false)
     }
 
     /// The `commit` half of [`Self::promote_staged_file`]: the layout
@@ -14515,30 +14674,16 @@ impl DataRouter {
         // the publish is visible.
         match commit {
             Ok(Some(into)) => {
-                match &site {
-                    PreparedSite::Block { .. } => {
-                        METRICS
-                            .layout_promoted_block
-                            .fetch_add(1, Ordering::Relaxed);
-                    }
-                    PreparedSite::Packed(tenant) => {
-                        tenant.pack.note_committed();
-                        METRICS
-                            .layout_promoted_packed
-                            .fetch_add(1, Ordering::Relaxed);
-                    }
+                if let PreparedSite::Block { .. } = &site {
+                    METRICS
+                        .layout_promoted_block
+                        .fetch_add(1, Ordering::Relaxed);
                 }
+                self.note_landed_tenant_committed(&site);
                 Ok(Some(into))
             }
             outcome => {
-                match site {
-                    PreparedSite::Block {
-                        allocator, offset, ..
-                    } => {
-                        let _ = allocator.abandon_unpublished_offset(offset).await;
-                    }
-                    PreparedSite::Packed(tenant) => self.release_pack_tenant(tenant).await,
-                }
+                self.release_landed_site(site).await;
                 outcome
             }
         }
@@ -20296,22 +20441,14 @@ impl DataRouter {
                     crate::block_allocator::CHUNK_SIZE,
                     "rider-fold spill",
                 )?;
-                let (be_id, block_allocator, nvme_writer, be_offset) =
-                    self.backend_router.allocate_placed_block().await?;
-                // PR VL6a: in-flight until the layout commit below.
-                let _inflight = block_allocator.inflight_register(be_offset);
-                let stored_block_key = format!(
-                    "{}:0:{}",
-                    self.backend_router.persist_block_key(&be_id, be_offset),
-                    processed.len()
-                );
-                if let Err(e) = nvme_writer.write_block(be_offset, processed).await {
-                    // Never-published: co-writer-aware abandon (d575be03
-                    // sweep).
-                    let _ = block_allocator.abandon_unpublished_offset(be_offset).await;
-                    return Err(e);
-                }
-                block_allocator.publish_block(be_offset);
+                // The shared landing dispatch: a packed tenant under the
+                // lever, an own block otherwise. The site (PR VL6a's
+                // registration / the tenant reference) is held until the
+                // layout commit below publishes the mapping.
+                let LandedImage {
+                    block_key: stored_block_key,
+                    site,
+                } = self.land_stored_image(ino, processed).await?;
 
                 // Spill takes a FRESH file_id (the spill identity
                 // discipline): the stale ring entry must never shadow this
@@ -20328,10 +20465,12 @@ impl DataRouter {
                     // Identity moved under the fold (promotion/re-stage
                     // committed meanwhile): that commit folded-first, so
                     // the record is stale-duplicate custody — release our
-                    // orphan upload and let the next drain re-resolve.
-                    // Never-published: co-writer-aware abandon (d575be03
-                    // sweep).
-                    let _ = block_allocator.abandon_unpublished_offset(be_offset).await;
+                    // orphan landing and let the next drain re-resolve.
+                    // RES-1: the release can be a terminal free (the packed
+                    // arm's reclaim enqueue parks at the cap) — never under
+                    // the 3.5 guard.
+                    drop(meta_guard);
+                    self.release_landed_site(site).await;
                     return Ok(false);
                 }
                 let mut block_map = std::collections::HashMap::new();
@@ -20353,9 +20492,18 @@ impl DataRouter {
                     meta.block_map.as_deref(),
                     updated_meta.block_map.as_deref(),
                 );
-                self.save_metadata_to_backend_refs(ino, &updated_meta, merge_token, &refs)
-                    .await?;
+                if let Err(e) = self
+                    .save_metadata_to_backend_refs(ino, &updated_meta, merge_token, &refs)
+                    .await
+                {
+                    // The mapping never took the layout: release the landing
+                    // after the guard (RES-1).
+                    drop(meta_guard);
+                    self.release_landed_site(site).await;
+                    return Err(e);
+                }
                 self.publish_layout_cache_entry(ino, updated_meta);
+                self.note_landed_tenant_committed(&site);
                 self.cache.write_lru.remove(&file_path);
                 self.cache.read_lru.remove(&file_path);
                 // Release the superseded ring entry + any older durable copy.
@@ -20367,7 +20515,9 @@ impl DataRouter {
                     )
                     .await;
                 // RES-1: drop the level-3.5 guard BEFORE the device frees
-                // — each one can park at the reclaim cap.
+                // — each one can park at the reclaim cap. The landing site
+                // (the tenant's in-flight registration) drops with this
+                // arm, after the publish is visible.
                 drop(meta_guard);
                 self.free_deferred_keys(deferred).await;
             }
@@ -20508,15 +20658,18 @@ impl DataRouter {
     /// [`Self::clone_file`]'s ring-RESIDENT staged arm: the source's
     /// current image (its ring entry composed with its W2 rider runs) is
     /// staged under the dest's own `file_id`; a refused destination stage
-    /// takes the FIND-RW5-A durable-spill escalation (backend block +
-    /// `block_map[0]`). The dest's layout names ONLY what this arm gave
-    /// it: its own ring entry, or the spilled block — never the source's
-    /// older promoted mapping (a resident entry supersedes that mapping,
-    /// and carrying it across would be a second reference the dest holds
-    /// no pin for, which the dest's own promotion would then displace and
-    /// FREE under the source — FIND-PK-3's other arm). Returns the spilled
-    /// block's in-flight registration (PR VL6a), which the caller holds
-    /// until its dest-layout commit publishes the mapping.
+    /// takes the FIND-RW5-A durable-spill escalation through the shared
+    /// landing dispatch ([`Self::land_stored_image`] — a packed tenant
+    /// under the lever, an own block otherwise) + `block_map[0]`. The
+    /// dest's layout names ONLY what this arm gave it: its own ring entry,
+    /// or the spilled image — never the source's older promoted mapping (a
+    /// resident entry supersedes that mapping, and carrying it across would
+    /// be a second reference the dest holds no pin for, which the dest's
+    /// own promotion would then displace and FREE under the source —
+    /// FIND-PK-3's other arm). Returns the spilled image's landing site
+    /// (its in-flight registration / tenant reference, PR VL6a), which the
+    /// caller holds until its dest-layout commit publishes the mapping and
+    /// releases if that commit fails.
     async fn clone_staged_resident(
         &self,
         src: &str,
@@ -20525,7 +20678,7 @@ impl DataRouter {
         mut data: Vec<u8>,
         dest_token: u64,
         updated_meta: &mut CachedMetadata,
-    ) -> Result<Option<crate::block_allocator::InflightAllocGuard>> {
+    ) -> Result<Option<PreparedSite>> {
         // W2: the clone's image must carry the source's rider record
         // extents (newer than the ring image).
         let src_ino = parse_inode_from_path(src);
@@ -20567,28 +20720,16 @@ impl DataRouter {
                     crate::block_allocator::CHUNK_SIZE,
                     "staged-clone spill",
                 )?;
-                let (be_id, block_allocator, nvme_writer, be_offset) =
-                    self.backend_router.allocate_placed_block().await?;
-                // PR VL6a: in-flight until the caller's dest-layout commit
-                // publishes the mapping (returned to `clone_file`, which
-                // commits `updated_meta` before dropping it).
-                let inflight = block_allocator.inflight_register(be_offset);
-                let stored_block_key = format!(
-                    "{}:0:{}",
-                    self.backend_router.persist_block_key(&be_id, be_offset),
-                    processed.len()
-                );
-                if let Err(e) = nvme_writer.write_block(be_offset, processed).await {
-                    // Never-published: co-writer-aware abandon (d575be03
-                    // sweep).
-                    let _ = block_allocator.abandon_unpublished_offset(be_offset).await;
-                    return Err(e);
-                }
-                block_allocator.publish_block(be_offset);
+                // The site (its registration / tenant reference) is held by
+                // `clone_file` until the dest-layout commit publishes the
+                // mapping.
+                let dest_ino = parse_inode_from_path(dest);
+                let LandedImage { block_key, site } =
+                    self.land_stored_image(dest_ino, processed).await?;
                 let mut block_map = std::collections::HashMap::new();
-                block_map.insert(0, stored_block_key);
+                block_map.insert(0, block_key);
                 updated_meta.block_map = Some(std::sync::Arc::new(block_map));
-                Ok(Some(inflight))
+                Ok(Some(site))
             }
             Err(e) => Err(e),
         }
@@ -20640,9 +20781,10 @@ impl DataRouter {
         let mut meta = self.fetch_metadata(src).await?;
 
         let mut updated_meta = meta.clone();
-        // PR VL6a: a staged-clone spill's allocate→commit window stays
-        // registered until the dest-layout commit below (scope-held).
-        let mut _spill_inflight: Option<crate::block_allocator::InflightAllocGuard> = None;
+        // PR VL6a: a staged-clone spill's landing site (its allocate→commit
+        // registration / tenant reference) is held until the dest-layout
+        // commit below publishes the mapping — released if it does not.
+        let mut spill_site: Option<PreparedSite> = None;
         if meta.file_type == "staged" {
             let file_id = meta.file_id.clone().ok_or_else(|| {
                 SqueezefsError::InvalidOperation("Missing file_id for staged file".to_string())
@@ -20658,7 +20800,7 @@ impl DataRouter {
             let mut attempt = 0usize;
             loop {
                 if let Some(data) = self.cache.nvme.read_staged(&file_id) {
-                    _spill_inflight = self
+                    spill_site = self
                         .clone_staged_resident(
                             src,
                             dest,
@@ -20856,13 +20998,24 @@ impl DataRouter {
             .map(|m| m.iter().map(|(b, k)| (*b, k.clone(), true)).collect())
             .unwrap_or_default();
         let clone_refs = self.block_ref_ops(dest_ino, &clone_changes);
-        self.save_metadata_to_backend_refs(
-            dest_ino,
-            &updated_meta,
-            resolved_dest_token,
-            &clone_refs,
-        )
-        .await?;
+        let saved = self
+            .save_metadata_to_backend_refs(
+                dest_ino,
+                &updated_meta,
+                resolved_dest_token,
+                &clone_refs,
+            )
+            .await;
+        // The spilled image's site: committed with the dest layout (the
+        // packed arm's engagement counts), or released when the commit
+        // failed (the offset/reference would otherwise leak until the next
+        // derivation). No 3.5 guard is held here.
+        match (&saved, spill_site.take()) {
+            (Ok(_), Some(site)) => self.note_landed_tenant_committed(&site),
+            (Err(_), Some(site)) => self.release_landed_site(site).await,
+            (_, None) => {}
+        }
+        saved?;
 
         let mut cached_opt = self.cache.write_lru.get(src);
         if cached_opt.is_none() {
@@ -21300,96 +21453,39 @@ impl DataRouter {
 
         // Phase 2 (unlocked, data I/O before the meta flip — P0 layout
         // atomicity): on a genuine shrink, a promoted/spilled durable whole
-        // image longer than new_size must be clip-rewritten. Failure is
-        // LOUD (`?`): a truncate that cannot prove the durable tail is gone
-        // must fail the SETATTR, never silently leave resurrection bait.
+        // image longer than new_size must be clipped. Failure is LOUD
+        // (`?`): a truncate that cannot prove the durable tail is gone must
+        // fail the SETATTR, never silently leave resurrection bait.
         // (`new_size == 0` needs no clip: the commit's prune drops
         // `block_map[0]` entirely — block start 0 >= 0.)
-        let mut clipped_bk: Option<(String, String)> = None; // (old, new)
-                                                             // PR VL6a: live-owner guard for the clip block's
-                                                             // allocate→commit window (drops at function end).
-        let mut _clip_inflight: Option<crate::block_allocator::InflightAllocGuard> = None;
+        //
+        // Two clip arms (design-small-file-packing §5.7): on a PASSTHROUGH
+        // volume the stored image IS the plaintext, so a size-carrying
+        // mapping clips by RE-DESCRIPTION alone — `base:off:len'` — no read,
+        // no DMA, no allocation, the same reference; the bytes past `len'`
+        // are dead in the slot and never served (`exact` slicing). A
+        // TRANSFORMED image is a frame that must decode whole, so it is
+        // re-encoded from the clipped plaintext and LANDED as a new tenant
+        // (or own block) through the shared landing dispatch, the old
+        // reference released on publish (a partial free).
+        let mut clip: Option<DurableClip> = None;
         if new_size < pre_size && new_size > 0 {
             if let Some(old_bk) = self.staged_block_mapping(&file_path, &meta).await {
-                // The mapping can be displaced under our feet by a racing
-                // re-promotion (merge worker — not FUSE-serialized) freeing
-                // `old_bk`: a failed read re-resolves the freshest binding
-                // once and retries; an error on a STABLE binding is real.
-                // Binding-revalidated fetch (the promoted-mapping ABA, same
-                // serve rule as the read path and the RMW seed): a mapping
-                // can be displaced-and-freed while our read is in flight and
-                // the offset instantly re-tenanted by the next promotion —
-                // an error-only revalidation misses the poisoned SUCCESS
-                // (freed+rewritten bytes read back fine). Only a fetch whose
-                // binding still holds after the read may be clipped; on
-                // movement re-resolve and retry, bounded, then loud.
-                let mut old_bk = old_bk;
-                let mut img = None;
-                let mut attempts = 0u32;
-                loop {
-                    attempts += 1;
-                    if attempts > 64 {
-                        return Err(SqueezefsError::InvalidOperation(format!(
-                            "truncate durable clip of {file_path} kept moving after \
-                             {attempts} re-resolves (new_size {new_size})"
-                        )));
-                    }
-                    let fetched = self.read_mapping_window(&old_bk, None).await;
-                    let fresh = self.freshest_layout_identity(&file_path).await;
-                    let fresh_bk = match fresh {
-                        Some(ref f) if f.file_type == "staged" && f.file_id == snapshot_file_id => {
-                            f.block_map.as_ref().and_then(|bm| bm.get(&0).cloned())
-                        }
-                        _ => None,
-                    };
-                    match (fetched, fresh_bk) {
-                        (Ok(i), Some(ref bk)) if *bk == old_bk => {
-                            img = Some(i);
-                            break;
-                        }
-                        (Err(e), Some(ref bk)) if *bk == old_bk => {
-                            return Err(self.classify_bound_mapping_error(&file_path, &old_bk, e))
-                        }
-                        (_, Some(bk)) => {
-                            crate::fuse_client::METRICS
-                                .staged_identity_retries
-                                .fetch_add(1, Ordering::Relaxed);
-                            old_bk = bk;
-                        }
-                        (_, None) => break,
-                    }
-                }
-                if let Some(img) = img {
-                    if img.len() as u64 > new_size {
-                        let clipped = img.slice(0..new_size as usize);
-                        let processed = self.get_crypto().process_write_async(clipped).await?;
-                        crate::block_allocator::ensure_stored_block_image_fits(
-                            processed.len(),
-                            crate::block_allocator::CHUNK_SIZE,
-                            "staged truncate durable clip",
-                        )?;
-                        let (be_id, allocator, writer, offset) =
-                            self.backend_router.allocate_placed_block().await?;
-                        _clip_inflight = Some(allocator.inflight_register(offset));
-                        // Size-carrying mapping (`bk:0:packed_len` — see
-                        // `parse_block_mapping`).
-                        let new_bk = format!(
-                            "{}:0:{}",
-                            self.backend_router.persist_block_key(&be_id, offset),
-                            processed.len()
-                        );
-                        if let Err(e) = writer.write_block(offset, processed).await {
-                            // Never-published: co-writer-aware abandon
-                            // (d575be03 sweep).
-                            let _ = allocator.abandon_unpublished_offset(offset).await;
-                            return Err(e);
-                        }
-                        allocator.publish_block(offset);
-                        crate::fuse_client::METRICS
-                            .staged_truncate_durable_clips
-                            .fetch_add(1, Ordering::Relaxed);
-                        clipped_bk = Some((old_bk, new_bk));
-                    }
+                if let Some(new_bk) = self.passthrough_mapping_clip(&old_bk, new_size) {
+                    clip = Some(DurableClip::Mapping {
+                        old: old_bk,
+                        new: new_bk,
+                    });
+                } else {
+                    clip = self
+                        .transformed_durable_clip(
+                            ino,
+                            &file_path,
+                            old_bk,
+                            &snapshot_file_id,
+                            new_size,
+                        )
+                        .await?;
                 }
             }
         }
@@ -21418,18 +21514,28 @@ impl DataRouter {
             let pre_prune_map: Option<std::collections::HashMap<u32, String>> =
                 updated.block_map.as_deref().cloned();
             let mut blocks_to_free: Vec<String> = Vec::new();
-            // Published = our clipped block took `block_map[0]`. A racing
-            // promotion that re-published the mapping since our snapshot
-            // wins (its image was read post-clip, hence ≤ clip ≤ new_size —
-            // never stale-long); our clip block is then discarded below.
+            // Published = our clip took `block_map[0]`. A racing promotion
+            // that re-published the mapping since our snapshot wins (its
+            // image was read post-clip, hence ≤ clip ≤ new_size — never
+            // stale-long); a landed clip image is then released below, a
+            // mapping clip has nothing to release.
             let mut published = false;
             if updated.file_type == "staged" && updated.file_id == snapshot_file_id {
-                if let Some((ref old_bk, ref new_bk)) = clipped_bk {
+                if let Some(c) = clip.as_ref() {
+                    let (old_bk, new_bk) = c.keys();
                     if let Some(ref mut bm) = updated.block_map {
                         // CoW publish (item A): mutate a uniquely-owned copy.
-                        if bm.get(&0) == Some(old_bk) {
-                            std::sync::Arc::make_mut(bm).insert(0, new_bk.clone());
-                            blocks_to_free.push(old_bk.clone());
+                        if bm.get(&0).map(String::as_str) == Some(old_bk) {
+                            std::sync::Arc::make_mut(bm).insert(0, new_bk.to_string());
+                            // The landed image displaces the old tenant
+                            // reference (freed after the guard — a partial
+                            // free while siblings live). A mapping clip
+                            // re-describes the SAME reference: freeing the
+                            // old mapping would decrement a reference that
+                            // never moved (§5.7).
+                            if matches!(c, DurableClip::Image { .. }) {
+                                blocks_to_free.push(old_bk.to_string());
+                            }
                             published = true;
                         }
                     }
@@ -21453,7 +21559,11 @@ impl DataRouter {
             updated.cached_at = std::time::Instant::now();
             // Spec §6.2 item 1: the prune's whole-map swap (the pruned
             // `block_map[0]` loses its durable reference in the same
-            // transaction that stops naming it).
+            // transaction that stops naming it). A mapping clip's
+            // `bk:off:len → bk:off:len'` compares unequal as strings and
+            // emits a released + a taken op for the SAME reference — a
+            // same-key Delete+Put in one tx, staged in order: the record
+            // survives, the population is unchanged (§5.7).
             let refs = self.block_ref_ops_for_map_swap(
                 ino,
                 pre_prune_map.as_ref(),
@@ -21470,11 +21580,15 @@ impl DataRouter {
 
             // Displaced/pruned durable copies die only AFTER the publish
             // (release-superseded order): purge read tiers here (the
-            // ordering-sensitive half), free after the guard drops.
+            // ordering-sensitive half), free after the guard drops. The
+            // mappings travel VERBATIM (decoration included) so a tenant-
+            // shaped release counts on the pack ledger
+            // (`pack_{partial,terminal}_frees`); `free_block` resolves the
+            // base itself.
             for bk in &blocks_to_free {
                 self.cache.purge_block_key(bk);
             }
-            deferred.extend(blocks_to_free.iter().map(|bk| clean_block_key(bk)));
+            deferred.extend(blocks_to_free);
             Ok::<bool, SqueezefsError>(published)
         }
         .await;
@@ -21484,22 +21598,132 @@ impl DataRouter {
 
         match commit {
             Ok(published) => {
-                if !published {
-                    // The clipped block never took the mapping (racing
-                    // promotion won, or the mapping was pruned): free it.
-                    if let Some((_, new_bk)) = clipped_bk {
-                        let _ = self.backend_router.free_block(&new_bk).await;
+                match clip {
+                    Some(DurableClip::Mapping { .. }) if published => {
+                        crate::fuse_client::METRICS
+                            .pack_mapping_clips
+                            .fetch_add(1, Ordering::Relaxed);
                     }
+                    Some(DurableClip::Image { landed, .. }) if published => {
+                        self.note_landed_tenant_committed(&landed.site);
+                    }
+                    // The landed image never took the mapping (a racing
+                    // promotion won, or the mapping was pruned): release
+                    // its site — after the guard (RES-1).
+                    Some(DurableClip::Image { landed, .. }) => {
+                        self.release_landed_site(landed.site).await;
+                    }
+                    _ => {}
                 }
                 Ok(())
             }
             Err(e) => {
-                if let Some((_, new_bk)) = clipped_bk {
-                    let _ = self.backend_router.free_block(&new_bk).await;
+                if let Some(DurableClip::Image { landed, .. }) = clip {
+                    self.release_landed_site(landed.site).await;
                 }
                 Err(e)
             }
         }
+    }
+
+    /// The passthrough MAPPING clip (design-small-file-packing §5.7): a
+    /// size-carrying mapping whose stored image (= the plaintext, on a
+    /// passthrough volume) is longer than `new_size` re-describes as
+    /// `base:off:new_size` — the same base, the same slot, the same
+    /// reference; no data-plane I/O. `None` = not this arm (a transformed
+    /// volume, a bare legacy mapping whose image length is unknown, or an
+    /// image already within `new_size`).
+    fn passthrough_mapping_clip(&self, old_bk: &str, new_size: u64) -> Option<String> {
+        if !self.get_crypto().is_passthrough() {
+            return None;
+        }
+        let (_, off, len, exact) = self.parse_block_mapping(old_bk).ok()?;
+        (exact && len as u64 > new_size)
+            .then(|| format!("{}:{off}:{new_size}", clean_block_key_ref(old_bk)))
+    }
+
+    /// The TRANSFORMED durable clip: read the bound image (binding-
+    /// revalidated), re-encode `[0, new_size)` and LAND it through the
+    /// shared dispatch — a tenant of the open pack under the lever, an own
+    /// block otherwise. `Ok(None)` = the image is already within `new_size`
+    /// (or the identity moved away from a staged layout under this id —
+    /// nothing to clip).
+    async fn transformed_durable_clip(
+        &self,
+        ino: u64,
+        file_path: &str,
+        old_bk: String,
+        snapshot_file_id: &Option<std::sync::Arc<str>>,
+        new_size: u64,
+    ) -> Result<Option<DurableClip>> {
+        // The mapping can be displaced under our feet by a racing
+        // re-promotion (merge worker — not FUSE-serialized) freeing
+        // `old_bk`: a failed read re-resolves the freshest binding once and
+        // retries; an error on a STABLE binding is real. Binding-
+        // revalidated fetch (the promoted-mapping ABA, same serve rule as
+        // the read path and the RMW seed): a mapping can be displaced-and-
+        // freed while our read is in flight and the offset instantly
+        // re-tenanted by the next promotion — an error-only revalidation
+        // misses the poisoned SUCCESS (freed+rewritten bytes read back
+        // fine). Only a fetch whose binding still holds after the read may
+        // be clipped; on movement re-resolve and retry, bounded, then loud.
+        let mut old_bk = old_bk;
+        let mut img = None;
+        let mut attempts = 0u32;
+        loop {
+            attempts += 1;
+            if attempts > 64 {
+                return Err(SqueezefsError::InvalidOperation(format!(
+                    "truncate durable clip of {file_path} kept moving after \
+                     {attempts} re-resolves (new_size {new_size})"
+                )));
+            }
+            let fetched = self.read_mapping_window(&old_bk, None).await;
+            let fresh = self.freshest_layout_identity(file_path).await;
+            let fresh_bk = match fresh {
+                Some(ref f) if f.file_type == "staged" && f.file_id == *snapshot_file_id => {
+                    f.block_map.as_ref().and_then(|bm| bm.get(&0).cloned())
+                }
+                _ => None,
+            };
+            match (fetched, fresh_bk) {
+                (Ok(i), Some(ref bk)) if *bk == old_bk => {
+                    img = Some(i);
+                    break;
+                }
+                (Err(e), Some(ref bk)) if *bk == old_bk => {
+                    return Err(self.classify_bound_mapping_error(file_path, &old_bk, e))
+                }
+                (_, Some(bk)) => {
+                    crate::fuse_client::METRICS
+                        .staged_identity_retries
+                        .fetch_add(1, Ordering::Relaxed);
+                    old_bk = bk;
+                }
+                (_, None) => break,
+            }
+        }
+        let Some(img) = img else {
+            return Ok(None);
+        };
+        if img.len() as u64 <= new_size {
+            return Ok(None);
+        }
+        let clipped = img.slice(0..new_size as usize);
+        let processed = self.get_crypto().process_write_async(clipped).await?;
+        crate::block_allocator::ensure_stored_block_image_fits(
+            processed.len(),
+            crate::block_allocator::CHUNK_SIZE,
+            "staged truncate durable clip",
+        )?;
+        let landed = self.land_stored_image(ino, processed).await?;
+        crate::fuse_client::METRICS
+            .staged_truncate_durable_clips
+            .fetch_add(1, Ordering::Relaxed);
+        Ok(Some(DurableClip::Image {
+            old: old_bk,
+            landed,
+        }))
     }
 
     /// Hole-punch a set of WHOLE striped block indices: remove them from the

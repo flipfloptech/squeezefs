@@ -165,6 +165,9 @@ pub enum SealKind {
     Full,
     /// The dismount teardown, after the promotion pass.
     Dismount,
+    /// The drain mover found the pack open on its victim volume (PK3,
+    /// §5.11): sealed so the next re-plan moves it as a unit.
+    Drain,
 }
 
 /// The packer: the router's per-data-volume open packs, the single-flighted
@@ -440,6 +443,9 @@ impl Packer {
             SealKind::Dismount => METRICS
                 .pack_blocks_sealed_dismount
                 .fetch_add(1, Ordering::Relaxed),
+            SealKind::Drain => METRICS
+                .pack_blocks_sealed_drain
+                .fetch_add(1, Ordering::Relaxed),
         };
         match verdict {
             Ok(crate::block_allocator::PackRelease::Terminal) if pack.committed() == 0 => {
@@ -484,6 +490,33 @@ impl Packer {
             }
         }
         sealed
+    }
+
+    /// The drain seal (§5.11): seal the open pack whose block is `base_key`
+    /// (the clean base key the mover census resolved — the pack ledger's
+    /// own key), if it is open — the drain mover's arm for a pack block on
+    /// its victim (`DataRouter::seal_open_pack_block`). `true` ⇔ this call
+    /// was the sealer; no such open pack, or a racing FULL/dismount seal,
+    /// answers `false`.
+    pub async fn seal_block(&self, router: &BackendRouter, base_key: &str) -> bool {
+        let mut found = None;
+        self.open.iter_sync(|_, slot| {
+            if let Some(p) = slot.load_full() {
+                if p.base_key == base_key {
+                    found = Some(p);
+                    return false;
+                }
+            }
+            true
+        });
+        let Some(pack) = found else {
+            return false;
+        };
+        if !pack.seal() {
+            return false;
+        }
+        self.run_seal(router, &pack, SealKind::Drain).await;
+        true
     }
 
     /// The open-block gauges: `(open packs, worst age ms, least-filled

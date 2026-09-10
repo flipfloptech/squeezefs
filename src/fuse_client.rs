@@ -5878,6 +5878,28 @@ pub struct Metrics {
     /// batch-scoped co-writer pack is PK4's); afterwards, a grant that does
     /// not advertise pack groups. The never-wrong fallback, counted.
     pub pack_cowriter_group_unavailable: Align64<AtomicU64>,
+    // PK3 (design-small-file-packing §5.7 / §5.11 — the tenant ops + the
+    // mover interplay).
+    /// Passthrough truncate-shrinks of a size-carrying mapping that
+    /// re-described the SAME reference (`base:off:len'`) with no data-plane
+    /// I/O — the durable population and the RAM refcount unchanged (a
+    /// same-key Delete+Put in the clip's tx). `staged_truncate_durable_clips`
+    /// keeps counting the transformed re-encode arm.
+    pub pack_mapping_clips: Align64<AtomicU64>,
+    /// `move_one` deferrals of an OPEN pack block (the pack-open ledger or a
+    /// tenant's in-flight registration names its base — the packer is still
+    /// filling it); a drain victim's open pack is SEALED by the deferring
+    /// pass so the next re-plan moves it (`pack_blocks_sealed_drain`).
+    pub pack_mover_open_defers: Align64<AtomicU64>,
+    /// Mover quiesce-probe deferrals of a staged-layout tenant whose
+    /// `file_id` has a RESIDENT ring entry — a newer image is about to
+    /// supersede the durable tenant, so a copy now would copy dead bytes.
+    pub pack_mover_resident_defers: Align64<AtomicU64>,
+    /// Open packs sealed by the drain mover (the third seal cause beside
+    /// FULL and DISMOUNT): an open pack on a draining volume would keep
+    /// taking tenants the drain then has to move again, and a quiet mount's
+    /// would never seal — the deferring pass seals it, the next moves it.
+    pub pack_blocks_sealed_drain: Align64<AtomicU64>,
     /// FIND-RW5-A: never-lossy StorageFull escalations — a staged
     /// whole-image/fold/clone arm found the staging ring unable to admit
     /// its image and degraded to the durable direct-block spill instead of
@@ -10392,8 +10414,12 @@ impl SqueezefsFilesystem {
 
     /// The mover quiescence probe (§5.4 step 3) for THIS mount: a block
     /// is quiescent when it has no live RAM `ActiveBlockBuf`, no staged
-    /// `active_block:` ring entry, and no spilled `active_block_ext:`
-    /// record.
+    /// `active_block:` ring entry, no spilled `active_block_ext:` record,
+    /// and — a staged-layout tenant's block — no RESIDENT ring entry under
+    /// the ino's `file_id` (design-small-file-packing §5.11: a resident
+    /// entry means a newer image is about to supersede the durable tenant,
+    /// so a copy now would copy dead bytes; counted
+    /// `pack_mover_resident_defers`).
     pub fn mover_quiesce_probe(&self) -> crate::jobs::QuiesceProbe {
         let bufs = self.active_block_buffers.clone();
         let router = self.router.clone();
@@ -10425,6 +10451,12 @@ impl SqueezefsFilesystem {
                         return false;
                     }
                 }
+            }
+            if router.staged_tenant_ring_resident(ino, b) {
+                METRICS
+                    .pack_mover_resident_defers
+                    .fetch_add(1, Ordering::Relaxed);
+                return false;
             }
             let key = crate::keys::active_block(ino, b).to_string();
             let ext = crate::keys::active_block_ext(ino, b).to_string();
@@ -11244,6 +11276,11 @@ impl SqueezefsFilesystem {
                 "pack_terminal_frees": METRICS.pack_terminal_frees.load(Ordering::Relaxed),
                 "pack_release_untracked_noops": METRICS.pack_release_untracked_noops.load(Ordering::Relaxed),
                 "pack_cowriter_group_unavailable": METRICS.pack_cowriter_group_unavailable.load(Ordering::Relaxed),
+                // PK3
+                "pack_mapping_clips": METRICS.pack_mapping_clips.load(Ordering::Relaxed),
+                "pack_mover_open_defers": METRICS.pack_mover_open_defers.load(Ordering::Relaxed),
+                "pack_mover_resident_defers": METRICS.pack_mover_resident_defers.load(Ordering::Relaxed),
+                "pack_blocks_sealed_drain": METRICS.pack_blocks_sealed_drain.load(Ordering::Relaxed),
                 "pack_open_blocks": pack_open_blocks,
                 "pack_open_block_age_ms": pack_open_block_age_ms,
                 "pack_open_block_occupancy": pack_open_block_occupancy,

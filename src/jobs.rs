@@ -576,6 +576,15 @@ impl MoverCtx {
     pub fn router_only(router: crate::routing::DataRouter) -> Self {
         let probe_router = router.clone();
         let quiesce: QuiesceProbe = Arc::new(move |ino, b| {
+            // A staged-layout tenant with a RESIDENT ring entry is about
+            // to be superseded (design-small-file-packing §5.11) — the
+            // mover would copy dead bytes.
+            if probe_router.staged_tenant_ring_resident(ino, b) {
+                METRICS
+                    .pack_mover_resident_defers
+                    .fetch_add(1, Ordering::Relaxed);
+                return false;
+            }
             let key = crate::keys::active_block(ino, b).to_string();
             let ext = crate::keys::active_block_ext(ino, b).to_string();
             !probe_router.cache.nvme.has_staged_active_block(&key)
@@ -2977,6 +2986,41 @@ impl JobFabric {
         let br = &router.backend_router;
         let block_size = router.block_size.load(Ordering::Relaxed);
 
+        // An OPEN pack block defers (design-small-file-packing §5.11): the
+        // pack-open ledger names its base while the packer's pin is live,
+        // and a tenant between reserve and commit holds an in-flight
+        // registration on it. A copy now would republish the committed
+        // tenants elsewhere, drop the source to the packer's pin, and the
+        // packer's next tenant would land in a block this pass just tried
+        // to vacate — correct, but the pass's work wasted. One relaxed
+        // probe per candidate. When the source is the DRAIN's victim the
+        // pack is sealed here (the pin released, the ledger left) so the
+        // next re-plan moves it: left open, a draining volume's pack keeps
+        // taking tenants and a quiet mount's never seals.
+        if pack_ledger_contains(&task.base_key)
+            || br
+                .allocator_for_key(&task.base_key)
+                .is_some_and(|(alloc, offset)| alloc.inflight_contains(offset))
+        {
+            METRICS
+                .pack_mover_open_defers
+                .fetch_add(1, Ordering::Relaxed);
+            METRICS
+                .evacuate_deferred_staged_blocks
+                .fetch_add(1, Ordering::Relaxed);
+            if drain_victim == Some(task.src_id.as_str())
+                && router.seal_open_pack_block(&task.base_key).await
+            {
+                log::info!(
+                    "mover: sealed the open pack block {} on draining volume '{}' — moved at \
+                     the next re-plan",
+                    task.base_key,
+                    task.src_id
+                );
+            }
+            return MoveOutcome::Deferred;
+        }
+
         // Quiescent-first (§5.4 step 3): every referencer must be free
         // of live buffers / parked extents / spilled records.
         for r in &task.refs {
@@ -3373,6 +3417,12 @@ pub(crate) fn pack_ledger_remove(key: &str) {
 /// the stats census read it.
 pub fn pack_open_ledger() -> Vec<String> {
     PACK_OPEN_LEDGER.lock().clone()
+}
+
+/// Is `key` an OPEN pack block's base key? The mover's per-candidate probe
+/// (§5.11) — one lock, no clone.
+fn pack_ledger_contains(key: &str) -> bool {
+    PACK_OPEN_LEDGER.lock().iter().any(|k| k == key)
 }
 
 // ---------------------------------------------------------------------------

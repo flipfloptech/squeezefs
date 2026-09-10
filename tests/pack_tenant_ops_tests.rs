@@ -906,9 +906,15 @@ impl Fx {
         ino
     }
 
-    /// `block_map[0]` verbatim.
-    fn mapping_str(&self, ino: u64) -> String {
-        let m = self.fs.router.metadata_cache.get(&ino).expect("layout");
+    /// `block_map[0]` verbatim — the RAM layout, or the durable one on a
+    /// fresh reopen.
+    async fn mapping_str(&self, ino: u64) -> String {
+        let m = self
+            .fs
+            .router
+            .fetch_metadata(&squeezefs::keys::inode_path(ino))
+            .await
+            .unwrap_or_else(|e| panic!("layout of ino {ino}: {e:?}"));
         m.block_map
             .as_ref()
             .and_then(|bm| bm.get(&0).cloned())
@@ -917,8 +923,8 @@ impl Fx {
 
     /// The tenant mapping `block_map[0]` of a promoted file, decoded:
     /// `(base key, off, len)`.
-    fn mapping(&self, ino: u64) -> (String, u64, usize) {
-        let s = self.mapping_str(ino);
+    async fn mapping(&self, ino: u64) -> (String, u64, usize) {
+        let s = self.mapping_str(ino).await;
         let (prefix, rest) = match s.find("://") {
             Some(p) => s.split_at(p + 3),
             None => ("", s.as_str()),
@@ -1001,7 +1007,7 @@ async fn truncate_shrink_of_a_passthrough_tenant_is_a_mapping_clip_with_zero_dev
         fx.packed_file("c1.bin", len, 101).await,
         fx.packed_file("c2.bin", len, 102).await,
     ];
-    let (base, off1, len1) = fx.mapping(inos[1]);
+    let (base, off1, len1) = fx.mapping(inos[1]).await;
     assert_eq!(len1, len);
     let offset = fx.offset_of(&base);
     let alloc = fx.alloc(0);
@@ -1019,7 +1025,7 @@ async fn truncate_shrink_of_a_passthrough_tenant_is_a_mapping_clip_with_zero_dev
     seam.disarm("the passthrough clip");
 
     assert_eq!(
-        fx.mapping(inos[1]),
+        fx.mapping(inos[1]).await,
         (base.clone(), off1, NEW),
         "the mapping clip: same base, same slot, len' = new_size"
     );
@@ -1064,7 +1070,7 @@ async fn truncate_shrink_of_a_passthrough_tenant_is_a_mapping_clip_with_zero_dev
         "after reopen: one record per tenant — the clipped tenant's survived its Delete+Put"
     );
     assert!(fx.drift().await.is_empty());
-    assert_eq!(fx.mapping(inos[1]), (base, off1, NEW));
+    assert_eq!(fx.mapping(inos[1]).await, (base, off1, NEW));
     assert_eq!(fx.read(inos[1], NEW).await, pattern(101, NEW));
     assert_eq!(fx.read(inos[0], len).await, pattern(100, len));
     assert_eq!(fx.read(inos[2], len).await, pattern(102, len));
@@ -1100,8 +1106,8 @@ async fn transformed_truncate_shrink_lands_the_clipped_image_as_a_new_tenant() {
     let len = 24 * KIB;
     let a = fx.packed_file("z0.bin", len, 110).await;
     let b = fx.packed_file("z1.bin", len, 111).await;
-    let (base, off_a, _) = fx.mapping(a);
-    let (base_b, off_b, _) = fx.mapping(b);
+    let (base, off_a, _) = fx.mapping(a).await;
+    let (base_b, off_b, _) = fx.mapping(b).await;
     assert_eq!(base, base_b, "one pack");
     assert_ne!(off_a, off_b);
     let offset = fx.offset_of(&base);
@@ -1118,7 +1124,7 @@ async fn transformed_truncate_shrink_lands_the_clipped_image_as_a_new_tenant() {
     const NEW: usize = 10_000;
     fx.truncate(a, NEW as u64).await;
 
-    let (base2, off_a2, len_a2) = fx.mapping(a);
+    let (base2, off_a2, len_a2) = fx.mapping(a).await;
     assert_eq!(
         base2, base,
         "the clipped image landed in the SAME open pack"
@@ -1168,7 +1174,7 @@ async fn transformed_truncate_shrink_lands_the_clipped_image_as_a_new_tenant() {
     // Truncate-UP is size-only.
     fx.truncate(a, len as u64).await;
     assert_eq!(
-        fx.mapping(a),
+        fx.mapping(a).await,
         (base, off_a2, len_a2),
         "the mapping is untouched"
     );
@@ -1190,7 +1196,7 @@ async fn truncate_up_of_a_packed_tenant_is_size_only() {
     let (_meta, fx) = open_fresh(dir.path(), 1, 4 << 30, "up", ROOMY_RING).await;
     let len = 16 * KIB;
     let ino = fx.packed_file("u0.bin", len, 120).await;
-    let mapping0 = fx.mapping(ino);
+    let mapping0 = fx.mapping(ino).await;
     let offset = fx.offset_of(&mapping0.0);
     let alloc = fx.alloc(0);
     let gauges0 = fx.pack_gauges();
@@ -1206,7 +1212,7 @@ async fn truncate_up_of_a_packed_tenant_is_size_only() {
     seam.disarm("truncate-up");
 
     assert_eq!(fx.size(ino), UP as u64);
-    assert_eq!(fx.mapping(ino), mapping0, "the mapping is untouched");
+    assert_eq!(fx.mapping(ino).await, mapping0, "the mapping is untouched");
     assert_eq!(
         fx.read(ino, UP).await,
         clipped_then_zero(120, len, UP),
@@ -1250,7 +1256,7 @@ async fn the_drain_defers_an_open_pack_block_seals_it_and_moves_it_as_a_unit() {
     for i in 0..4 {
         inos.push(fx.packed_file(&format!("od{i}.bin"), len, 130 + i).await);
     }
-    let (base, _, _) = fx.mapping(inos[0]);
+    let (base, _, _) = fx.mapping(inos[0]).await;
     let victim_id = fx.records[1].id.clone();
     assert!(
         base.starts_with(&format!("{victim_id}://")),
@@ -1309,7 +1315,7 @@ async fn the_drain_defers_an_open_pack_block_seals_it_and_moves_it_as_a_unit() {
 
     let mut dst_bases = std::collections::HashSet::new();
     for (i, &ino) in inos.iter().enumerate() {
-        let (b, off, l) = fx.mapping(ino);
+        let (b, off, l) = fx.mapping(ino).await;
         assert!(
             !b.starts_with(&format!("{victim_id}://")),
             "moved off the victim: {b}"
@@ -1345,7 +1351,7 @@ async fn the_drain_defers_an_open_pack_block_seals_it_and_moves_it_as_a_unit() {
         1,
         "a fresh pack"
     );
-    let (fresh_base, _, _) = fx.mapping(fresh);
+    let (fresh_base, _, _) = fx.mapping(fresh).await;
     assert!(!fresh_base.starts_with(&format!("{victim_id}://")));
     assert_ne!(fresh_base, dst_base, "never into the moved (sealed) block");
     assert_eq!(fx.read(fresh, len).await, pattern(140, len));
@@ -1418,7 +1424,7 @@ async fn spill_run(fx: &Fx, tag: usize) -> (u64, u64, (String, u64, usize), (Str
         want,
         "the clone's composed image"
     );
-    let dst_mapping = fx.mapping(dst);
+    let dst_mapping = fx.mapping(dst).await;
 
     // (b) the rider-fold spill.
     let spills1 = metric(&METRICS.staged_spill_escalations);
@@ -1434,7 +1440,7 @@ async fn spill_run(fx: &Fx, tag: usize) -> (u64, u64, (String, u64, usize), (Str
         "premise: the fold took the durable-spill escalation"
     );
     assert_eq!(fx.read(src, img_len).await, want, "the folded source");
-    let src_mapping = fx.mapping(src);
+    let src_mapping = fx.mapping(src).await;
     (dst, src, dst_mapping, src_mapping)
 }
 
@@ -1517,8 +1523,8 @@ async fn a_clone_of_a_promoted_packed_tenant_shares_its_window() {
     let len = 16 * KIB;
     let src = fx.packed_file("cl_src.bin", len, 150).await;
     let sib = fx.packed_file("cl_sib.bin", len, 151).await;
-    let src_mapping = fx.mapping_str(src);
-    let (base, _, _) = fx.mapping(src);
+    let src_mapping = fx.mapping_str(src).await;
+    let (base, _, _) = fx.mapping(src).await;
     let offset = fx.offset_of(&base);
     let alloc = fx.alloc(0);
     assert_eq!(alloc.refcount(offset), Some(3), "2 tenants + the pin");
@@ -1528,7 +1534,7 @@ async fn a_clone_of_a_promoted_packed_tenant_shares_its_window() {
     let dst = fx.create("cl_dst.bin").await;
     fx.clone_whole(src, dst, len).await;
     assert_eq!(
-        fx.mapping_str(dst),
+        fx.mapping_str(dst).await,
         src_mapping,
         "two inos, one identical `bk:off:len` window"
     );
@@ -1605,7 +1611,7 @@ async fn clone_then_clip_and_clip_then_clone_yield_nested_same_off_windows() {
     let len = 24 * KIB;
     let a = fx.packed_file("n_a.bin", len, 160).await;
     let s = fx.packed_file("n_s.bin", 8 * KIB, 161).await;
-    let (base, off_a, _) = fx.mapping(a);
+    let (base, off_a, _) = fx.mapping(a).await;
     let offset = fx.offset_of(&base);
     let alloc = fx.alloc(0);
     assert_eq!(alloc.refcount(offset), Some(3), "A + S + the pin");
@@ -1616,15 +1622,15 @@ async fn clone_then_clip_and_clip_then_clone_yield_nested_same_off_windows() {
     // Clone-then-clip.
     let b = fx.create("n_b.bin").await;
     fx.clone_whole(a, b, len).await;
-    assert_eq!(fx.mapping(b), (base.clone(), off_a, len));
+    assert_eq!(fx.mapping(b).await, (base.clone(), off_a, len));
     fx.truncate(b, 10_000).await;
     assert_eq!(
-        fx.mapping(b),
+        fx.mapping(b).await,
         (base.clone(), off_a, 10_000),
         "B: nested, same off"
     );
     assert_eq!(
-        fx.mapping(a),
+        fx.mapping(a).await,
         (base.clone(), off_a, len),
         "A: the full window"
     );
@@ -1636,17 +1642,17 @@ async fn clone_then_clip_and_clip_then_clone_yield_nested_same_off_windows() {
 
     // Clip-then-clone.
     fx.truncate(a, 15_000).await;
-    assert_eq!(fx.mapping(a), (base.clone(), off_a, 15_000));
+    assert_eq!(fx.mapping(a).await, (base.clone(), off_a, 15_000));
     let c = fx.create("n_c.bin").await;
     fx.clone_whole(a, c, 15_000).await;
     assert_eq!(
-        fx.mapping(c),
+        fx.mapping(c).await,
         (base.clone(), off_a, 15_000),
         "C shares the clipped window"
     );
     fx.truncate(c, 6_000).await;
     assert_eq!(
-        fx.mapping(c),
+        fx.mapping(c).await,
         (base.clone(), off_a, 6_000),
         "C: nested inside A's"
     );
@@ -1685,7 +1691,7 @@ async fn clone_then_clip_and_clip_then_clone_yield_nested_same_off_windows() {
         "B + S from the ledger"
     );
     assert!(fx.drift().await.is_empty());
-    assert_eq!(fx.mapping(b), (base, off_a, 10_000));
+    assert_eq!(fx.mapping(b).await, (base, off_a, 10_000));
     assert_eq!(fx.read(b, 10_000).await, pattern(160, 10_000));
     assert_eq!(fx.read(s, 8 * KIB).await, pattern(161, 8 * KIB));
     fx.close().await;

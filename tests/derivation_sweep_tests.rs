@@ -515,6 +515,78 @@ fn inline_max_bytes_default_is_one_page_and_the_bound_is_the_kv_value_cap() {
 }
 
 // ---------------------------------------------------------------------------
+// The small-file packer's own-block threshold: CHUNK/2 by the block
+// economy; slots on the ranged-read LBA grain
+// ---------------------------------------------------------------------------
+
+/// `SQUEEZEFS_PACK_MAX_SLOT_BYTES` (design-small-file-packing §5.5, KD-5):
+/// the largest slot the packer shares a block for DERIVES from the block
+/// economy — a tenant that takes its OWN block wastes `CHUNK − slot`
+/// forever (a staged file never grows in place), a packed tenant costs
+/// one compaction copy of `slot`, and the saving covers the copy iff
+/// `slot ≤ CHUNK/2`. The same break-even is the compaction trigger. The
+/// slot GRAIN is the conservative 4 KiB LBA every ranged device read
+/// already assumes (design-read-path OQ #1, KD-6): `pack_slot_len` rounds
+/// an image up to it, and the knob's floor is exactly one grain (the
+/// one-LBA-tenants measurement posture). The knob is the measurement
+/// lever — `CHUNK_SIZE` packs everything — never an operational posture.
+#[test]
+fn pack_max_slot_default_is_half_the_chunk_and_the_grain_is_the_lba_law() {
+    use squeezefs::block_allocator::CHUNK_SIZE;
+    use squeezefs::routing::{pack_max_slot_bytes, pack_slot_len, set_pack_max_slot_bytes_override};
+
+    // The default is the break-even, and it is CHUNK-derived (a 4 MiB
+    // chunk ⇒ 2 MiB; the tie is the ratio, so a chunk change moves it).
+    set_pack_max_slot_bytes_override(None);
+    assert_eq!(pack_max_slot_bytes(), CHUNK_SIZE / 2, "own-block threshold = CHUNK/2");
+    assert_eq!(CHUNK_SIZE, 4 * MIB, "the shipped allocator chunk");
+
+    // The slot grain: one LBA (4 KiB). An image is rounded UP to the
+    // grain — 1 byte costs one grain, an exact multiple costs itself, one
+    // byte past a multiple costs the next grain — and the pad is the
+    // `pack_slot_pad_bytes` ledger's per-tenant term.
+    assert_eq!(pack_slot_len(1), 4096);
+    assert_eq!(pack_slot_len(4096), 4096);
+    assert_eq!(pack_slot_len(4097), 8192);
+    assert_eq!(pack_slot_len(64 * 1024 + 1), 68 * 1024);
+    assert_eq!(pack_slot_len(CHUNK_SIZE), CHUNK_SIZE);
+
+    // The explicit override wins verbatim (the measurement lever) and the
+    // seam returns to the derivation.
+    set_pack_max_slot_bytes_override(Some(4096));
+    assert_eq!(pack_max_slot_bytes(), 4096, "one-LBA tenants only");
+    set_pack_max_slot_bytes_override(Some(CHUNK_SIZE));
+    assert_eq!(pack_max_slot_bytes(), CHUNK_SIZE, "pack everything");
+    set_pack_max_slot_bytes_override(None);
+    assert_eq!(pack_max_slot_bytes(), CHUNK_SIZE / 2);
+
+    // The registered range is exactly [one grain, the chunk], and the
+    // documented default names the derivation.
+    let knob = squeezefs::env_knobs::lookup("SQUEEZEFS_PACK_MAX_SLOT_BYTES")
+        .expect("SQUEEZEFS_PACK_MAX_SLOT_BYTES is registered");
+    assert_eq!(
+        knob.kind,
+        squeezefs::env_knobs::Kind::Int {
+            lo: 4096,
+            hi: CHUNK_SIZE as i128,
+        }
+    );
+    assert!(
+        knob.default.contains("CHUNK_SIZE/2"),
+        "the default line names the derivation, got {:?}",
+        knob.default
+    );
+
+    // The lever itself: a registered Bool, OFF until PK7's flip (PK2–PK6
+    // ship dark — a plain mount's promotion is byte-identical to the
+    // one-block-per-file block arm).
+    let lever = squeezefs::env_knobs::lookup("SQUEEZEFS_SMALL_FILE_PACKING")
+        .expect("SQUEEZEFS_SMALL_FILE_PACKING is registered");
+    assert_eq!(lever.kind, squeezefs::env_knobs::Kind::Bool);
+    assert_eq!(lever.default, "off", "the lever ships OFF through PK6");
+}
+
+// ---------------------------------------------------------------------------
 // A11 — parked-write budget: budget fraction over block size, shipped floor
 // ---------------------------------------------------------------------------
 

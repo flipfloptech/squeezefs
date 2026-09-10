@@ -106,6 +106,14 @@ fn park_knobs() -> Vec<EnvGuard> {
     ]
 }
 
+/// The packing seam returns to the knob on drop.
+struct PackLeverGuard;
+impl Drop for PackLeverGuard {
+    fn drop(&mut self) {
+        squeezefs::routing::test_set_small_file_packing(None);
+    }
+}
+
 struct H {
     fs: Arc<SqueezefsFilesystem>,
     req: Request,
@@ -348,6 +356,15 @@ async fn staged_truncate_commit_frees_after_the_meta_lock_drops() {
     let _knobs = park_knobs();
     squeezefs::fuse_client::set_patch_max_bytes(0);
     squeezefs::routing::set_rewrite_shadow(false);
+    // The ONE-BLOCK promotion arm (`SQUEEZEFS_SMALL_FILE_PACKING=0`, the A/B
+    // control since PK7's flip): this contract's premise is a TERMINAL
+    // free the truncate commit issues — the whole promoted block entering
+    // the reclaim queue and parking at its cap. A packed tenant's truncate
+    // is a nonterminal reference release (the block stays held by the open
+    // pack's pin), so nothing would ever park; the packed arm's RES-1 shape
+    // is `pack_tenant_ops_tests`'.
+    squeezefs::routing::test_set_small_file_packing(Some(false));
+    let _pack = PackLeverGuard;
     let h = make_harness("res1_staged_truncate", "1MB").await;
 
     let ino = create(&h, "s1").await;

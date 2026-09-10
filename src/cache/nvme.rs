@@ -2238,6 +2238,7 @@ impl NvmeStaging {
                     item.file_id,
                     match into {
                         crate::routing::PromotedInto::Inline => "inline (layout record)",
+                        crate::routing::PromotedInto::Packed => "into the open pack block",
                         crate::routing::PromotedInto::Block => "to durable block",
                     }
                 ),

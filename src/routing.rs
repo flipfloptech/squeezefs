@@ -53,12 +53,95 @@ pub fn inline_max_bytes_ceiling(value_cap: usize) -> usize {
         .max(INLINE_MAX_FLOOR)
 }
 
+/// A stored image's SLOT: its length rounded up to [`LBA_GRAIN`] — the
+/// device window a packed tenant's DMA touches and its mapping's read
+/// covers (`design-small-file-packing` §5.1 invariant 1). The pad
+/// `slot − len` is the `pack_slot_pad_bytes` ledger's per-tenant term.
+pub fn pack_slot_len(image_len: u64) -> u64 {
+    image_len.div_ceil(LBA_GRAIN) * LBA_GRAIN
+}
+
+/// The `SQUEEZEFS_PACK_MAX_SLOT_BYTES` override cell: 0 = none (the
+/// derived default). Read once (registered; out of range refuses the
+/// process at startup); the test seam presets it.
+fn pack_max_slot_override_cell() -> &'static std::sync::atomic::AtomicU64 {
+    static CELL: std::sync::OnceLock<std::sync::atomic::AtomicU64> = std::sync::OnceLock::new();
+    CELL.get_or_init(|| {
+        std::sync::atomic::AtomicU64::new(
+            crate::env_knobs::opt_int_knob::<u64>("SQUEEZEFS_PACK_MAX_SLOT_BYTES").unwrap_or(0),
+        )
+    })
+}
+
+/// Test seam: `Some(bytes)` presets the own-block threshold override;
+/// `None` returns it to the derivation.
+pub fn set_pack_max_slot_bytes_override(bytes: Option<u64>) {
+    pack_max_slot_override_cell().store(bytes.unwrap_or(0), Ordering::Relaxed);
+}
+
+/// The largest slot the packer shares a block for — DERIVED from the block
+/// economy (design-small-file-packing §5.5, KD-5): an own block wastes
+/// `CHUNK − slot` forever (a staged file never grows in place — every
+/// rewrite re-stages the whole image and re-promotes), a packed tenant
+/// costs one compaction copy of `slot` over its lifetime; the saving
+/// covers the copy iff `slot ≤ CHUNK/2` (also the largest class for which
+/// a second tenant of the same class can share, i.e. for which packing
+/// can halve anything). The same break-even is the compaction trigger.
+/// Drift-is-red tie: `tests/derivation_sweep_tests.rs`
+/// (`pack_max_slot_default_is_half_the_chunk_and_the_grain_is_the_lba_law`).
+pub fn pack_max_slot_bytes() -> u64 {
+    match pack_max_slot_override_cell().load(Ordering::Relaxed) {
+        // Registered range LBA_GRAIN..=CHUNK_SIZE: 4096 packs one-LBA
+        // tenants only, CHUNK_SIZE packs everything — measurement levers.
+        0 => crate::block_allocator::CHUNK_SIZE / 2,
+        explicit => explicit,
+    }
+}
+
+/// `SQUEEZEFS_SMALL_FILE_PACKING` latch: 0 = unread, 1 = on, 2 = off (the
+/// `fsync_economy` levers' shape; read once per process).
+static SMALL_FILE_PACKING: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// The small-file packing lever (design-small-file-packing §6): gates the
+/// PROMOTION arm only — `true` = a staged file whose slot fits
+/// [`pack_max_slot_bytes`] promotes INTO the volume's open pack block,
+/// `false` = today's one-block-per-file block arm, byte-identical. Default
+/// OFF through PK6 (PK7's counted rows decide the flip). The read funnel
+/// honours a packed mapping under either setting.
+pub fn small_file_packing_enabled() -> bool {
+    match SMALL_FILE_PACKING.load(Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            let on = crate::env_knobs::bool_knob("SQUEEZEFS_SMALL_FILE_PACKING", false);
+            SMALL_FILE_PACKING.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+            on
+        }
+    }
+}
+
+/// Test seam: `Some(on)` presets the packing lever; `None` returns it to
+/// the knob.
+pub fn test_set_small_file_packing(on: Option<bool>) {
+    SMALL_FILE_PACKING.store(
+        match on {
+            Some(true) => 1,
+            Some(false) => 2,
+            None => 0,
+        },
+        Ordering::Relaxed,
+    );
+}
+
 /// What a staged file promoted INTO — `DataRouter::promote_staged_file`'s
 /// size dispatch: `Inline` = its payload now rides the layout record (no
-/// block), `Block` = one placed striped block.
+/// block), `Packed` = a slot of the volume's shared open pack block (the
+/// size-carrying `bk:off:len` mapping with a live `off`), `Block` = one
+/// placed striped block of its own.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PromotedInto {
     Inline,
+    Packed,
     Block,
 }
 

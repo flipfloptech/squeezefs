@@ -10956,6 +10956,12 @@ impl SqueezefsFilesystem {
             // layout mix (`layout_inline_writes` / `layout_staged_writes`)
             // and the size-dispatching promotion read.
             "inline_max_bytes": self.router.inline_max_bytes_set(),
+            // The packer's own-block threshold in force (the derived
+            // CHUNK/2 or the `SQUEEZEFS_PACK_MAX_SLOT_BYTES` override) and
+            // the lever's posture — the boundary `layout_promoted_packed`
+            // vs `pack_own_block_promotions` reads.
+            "pack_max_slot_bytes": crate::routing::pack_max_slot_bytes(),
+            "small_file_packing": crate::routing::small_file_packing_enabled(),
             // VAL-7a: the KEY census — empty unless
             // `SQUEEZEFS_STATS_KEY_CENSUS=1`. Fields stay present (with
             // empty values) so an operator can always key on them.

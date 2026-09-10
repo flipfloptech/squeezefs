@@ -533,12 +533,18 @@ fn inline_max_bytes_default_is_one_page_and_the_bound_is_the_kv_value_cap() {
 #[test]
 fn pack_max_slot_default_is_half_the_chunk_and_the_grain_is_the_lba_law() {
     use squeezefs::block_allocator::CHUNK_SIZE;
-    use squeezefs::routing::{pack_max_slot_bytes, pack_slot_len, set_pack_max_slot_bytes_override};
+    use squeezefs::routing::{
+        pack_max_slot_bytes, pack_slot_len, set_pack_max_slot_bytes_override,
+    };
 
     // The default is the break-even, and it is CHUNK-derived (a 4 MiB
     // chunk ⇒ 2 MiB; the tie is the ratio, so a chunk change moves it).
     set_pack_max_slot_bytes_override(None);
-    assert_eq!(pack_max_slot_bytes(), CHUNK_SIZE / 2, "own-block threshold = CHUNK/2");
+    assert_eq!(
+        pack_max_slot_bytes(),
+        CHUNK_SIZE / 2,
+        "own-block threshold = CHUNK/2"
+    );
     assert_eq!(CHUNK_SIZE, 4 * MIB, "the shipped allocator chunk");
 
     // The slot grain: one LBA (4 KiB). An image is rounded UP to the

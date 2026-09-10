@@ -1163,6 +1163,53 @@ async fn fsck_reports_no_durable_reference_drift_on_a_healthy_volume() {
         .await
         .expect("truncate");
 
+    // The PACKED population (design-small-file-packing §5.2, PR PK2): three
+    // staged-layout files promoted into ONE shared pack block — N tenants =
+    // N references, each staged in its tenant's own layout tx through
+    // `block_ref_ops_for_map_swap` + `save_metadata_to_backend_refs` (the
+    // FIND-PK-2 template); the open pack's +1 RAM pin is the pack-open
+    // ledger's to excuse (C2/C3), never the ledger's to record (C8 reads
+    // exactly N).
+    squeezefs::routing::set_inline_max_bytes_override(Some(squeezefs::routing::INLINE_MAX_FLOOR));
+    squeezefs::routing::test_set_small_file_packing(Some(true));
+    let mut packed_base: Option<String> = None;
+    for i in 0..3u8 {
+        let ino = rig.mk_file(&format!("fsck_packed_{i}")).await;
+        let path = squeezefs::keys::inode_path(ino);
+        let image: Vec<u8> = (0..12 * 1024).map(|b| (b as u8) ^ (0x30 + i)).collect();
+        rig.router
+            .write_file(&path, 0, bytes::Bytes::from(image), rig.token(ino))
+            .await
+            .expect("staged write");
+        let file_id = rig
+            .router
+            .metadata_cache
+            .get(&ino)
+            .and_then(|m| m.file_id.as_deref().map(str::to_string))
+            .expect("a staged layout carries file_id");
+        let into = rig
+            .router
+            .promote_staged_file(&path, &file_id, rig.token(ino))
+            .await
+            .expect("promotion")
+            .expect("promoted");
+        assert_eq!(into, squeezefs::routing::PromotedInto::Packed);
+        let mapping = rig
+            .router
+            .metadata_cache
+            .get(&ino)
+            .and_then(|m| m.block_map.as_ref().and_then(|bm| bm.get(&0).cloned()))
+            .expect("the tenant mapping");
+        let base = squeezefs::routing::clean_block_key(&mapping);
+        assert_eq!(
+            *packed_base.get_or_insert_with(|| base.clone()),
+            base,
+            "every tenant shares one pack block"
+        );
+    }
+    squeezefs::routing::test_set_small_file_packing(None);
+    squeezefs::routing::set_inline_max_bytes_override(None);
+
     let report = squeezefs::fsck::run(
         &FsckCtx {
             meta: rig.routed.clone(),
@@ -1188,6 +1235,33 @@ async fn fsck_reports_no_durable_reference_drift_on_a_healthy_volume() {
     assert!(
         rig.drift().await.is_empty(),
         "the comparison itself must be exact"
+    );
+    // The pack block's durable population is exactly its tenants — and the
+    // open pack's pin was the ledger's excuse, not a C8 record.
+    let packed_offset = rig
+        .router
+        .backend_router
+        .parse_block_offset(packed_base.as_deref().expect("a pack block"))
+        .expect("the pack base parses");
+    assert_eq!(
+        rig.durable_refcount(packed_offset).await,
+        3,
+        "three tenants, three records"
+    );
+    assert_eq!(
+        rig.alloc.refcount(packed_offset),
+        Some(4),
+        "tenants + the open pin"
+    );
+    assert_eq!(
+        report.counters.pack_ledger_exempted, 1,
+        "the pin excused exactly once"
+    );
+    rig.router.seal_open_packs().await;
+    assert_eq!(
+        rig.alloc.refcount(packed_offset),
+        Some(3),
+        "sealed: refcount = tenants"
     );
     rig.shutdown().await;
 }

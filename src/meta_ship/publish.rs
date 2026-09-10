@@ -1864,7 +1864,7 @@ impl PublishClient {
     /// no drain ever sees a partial group), travel as ONE frame flagged
     /// `pack_group` that carries nothing else, and are answered as one.
     /// The frame is refused at SUBMISSION when it would not fit the wire
-    /// (past [`frame_call_cap`] or the byte budget) — the batch driver
+    /// (past the frame call cap or the byte budget) — the batch driver
     /// sizes packs by [`pack_group_tenant_cap`], so this is the belt.
     ///
     /// The outer `Result` is the FRAME's fate, typed
@@ -2863,7 +2863,7 @@ pub struct PackGroupItem {
 /// home volume)`; a local-home or mixed-owner group refuses HERE, nothing
 /// shipped — a co-writer never commits a layout locally). Runs the S10
 /// intent barrier over the whole set, mints one witness per call, ships
-/// through [`ship_group_witnessed`], and answers one [`OwnerVerdict`] per
+/// through the witnessed group ladder, and answers one [`OwnerVerdict`] per
 /// item in input order. The outer `Err` is the frame's typed fate.
 pub async fn set_layout_and_size_pack_group(
     be: &Arc<RoutedMetaBackend>,

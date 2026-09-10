@@ -34,7 +34,24 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// 3. `BLOCK_FLUSH_LOCKS` (per block) — active-block flush mutual exclusion
 /// 3.5. `INODE_META_LOCKS` (routing, per-inode `Mutex`) — the striped
 ///    block-map merge domain (`DataRouter::merge_block_mappings`, §5.3 one
-///    merge discipline)
+///    merge discipline). **Never held across a terminal `free_block`**
+///    (RES-1: the at-cap reclaim enqueue parks; collect displaced keys under
+///    the guard, free after it drops).
+///
+///    **The 3.5 multi-holder convention** (small-file packing PK4,
+///    design-small-file-packing §5.6 — `routing::meta_lock_acquire_many`):
+///    a SET of inos' guards is ONE canonical acquisition — ascending
+///    `inode_meta_stripe`, deduped (two distinct inos may share a stripe of
+///    the 4096-way table; one guard covers both, and a per-ino acquisition
+///    would self-deadlock on the second) — the `dlm::lock_many` law of 4a
+///    applied to this layer. A multi-holder enters holding no other 3.5
+///    guard, so the ascending order is the whole acyclicity argument
+///    against every other multi-acquirer and every single-stripe holder;
+///    it holds ≤ one publish frame's worth of stripes across ONE shipped
+///    round trip (the co-writer pack `commit_group` — the per-file
+///    promotion's one-guard-across-the-wire shape × N, bounded by the wire)
+///    and releases them all before any pack reference or displaced key is
+///    freed (RES-1, again).
 /// 4. MetaLV metadata-transaction locks, acquired in this sub-order:
 ///    - a. DLM `I{ino}` / `D{parent:name}` (per-object; MetaLV `DlmLockManager`)
 ///    - b. **format v2**: dentry bucket lock (`dentry_bucket_locks`) — in-RAM

@@ -5873,10 +5873,10 @@ pub struct Metrics {
     /// stay 0 on single-writer rows** — on the authority the pin's own
     /// reference keeps the entry alive until the seal releases it.
     pub pack_release_untracked_noops: Align64<AtomicU64>,
-    /// Promotions a CO-WRITER ran one-block-per-file because no pack group
-    /// is available to it — in PK2 every co-writer promotion (the
-    /// batch-scoped co-writer pack is PK4's); afterwards, a grant that does
-    /// not advertise pack groups. The never-wrong fallback, counted.
+    /// Promotions a CO-WRITER ran one-block-per-file because its membership
+    /// grant does not advertise pack groups (`Grant::pack_group_available`
+    /// — the set authority's D-1c lever posture, PK4). The never-wrong
+    /// fallback, counted; 0 on a same-commit fleet with the default lever.
     pub pack_cowriter_group_unavailable: Align64<AtomicU64>,
     // PK3 (design-small-file-packing §5.7 / §5.11 — the tenant ops + the
     // mover interplay).
@@ -5900,6 +5900,50 @@ pub struct Metrics {
     /// taking tenants the drain then has to move again, and a quiet mount's
     /// would never seal — the deferring pass seals it, the next moves it.
     pub pack_blocks_sealed_drain: Align64<AtomicU64>,
+    // PK4 — the co-writer per-(owner, home volume) group pack
+    // (design-small-file-packing §5.6, §10).
+    /// Co-writer batch packs sealed at their frame reply (§5.3 (c)).
+    pub pack_blocks_sealed_batch: Align64<AtomicU64>,
+    /// Co-writer promotion BATCHES the group driver ran
+    /// (`DataRouter::promote_staged_batch` on the co-writer posture).
+    pub pack_cowriter_batches: Align64<AtomicU64>,
+    /// Every `pack_group` frame a co-writer shipped — served or refused
+    /// (a transport resend of the same frame is not a second frame).
+    pub pack_cowriter_frames: Align64<AtomicU64>,
+    /// `pack_group` frames whose group LANDED, and the tenants they
+    /// committed: `tenants ÷ frames` is the live pack width on a co-writer
+    /// (a frame per tenant means the batch driver regressed to per-file
+    /// commits).
+    pub pack_batch_frames: Align64<AtomicU64>,
+    pub pack_batch_tenants: Align64<AtomicU64>,
+    /// The `(owner endpoint, home meta volume)` partitions a co-writer batch
+    /// was split into, counted only when there was more than one (≈ meta
+    /// volumes per batch on a round-robin-minted population — the stated
+    /// pack-ratio cost, §5.6).
+    pub pack_batch_volume_splits: Align64<AtomicU64>,
+    /// Promotions a co-writer ran one-block-per-file because the owner
+    /// refused a `pack_group` frame `PUBLISH_PACK_GROUP_UNAVAILABLE` (the
+    /// `SQUEEZEFS_PUBLISH_CONVEYOR_GROUP=0` control arm or an older owner;
+    /// the endpoint is latched until the next grant). 0 on a same-commit
+    /// fleet with the default lever.
+    pub pack_cowriter_group_refusals: Align64<AtomicU64>,
+    /// Promotions a co-writer ran one-block-per-file because a `pack_group`
+    /// frame was refused `PUBLISH_PACK_GROUP_SPLIT` a SECOND time (a
+    /// migration still in flight) — the first SPLIT re-`prepare`s every
+    /// tenant into fresh packs (`pack_blocks_abandoned` ticks with it). 0
+    /// with no `migrate-meta-slot` in flight.
+    pub pack_cowriter_group_splits: Align64<AtomicU64>,
+    /// The owner side: `pack_group` frames received; refused SPLIT (the
+    /// post-gate route re-derivation found two home volumes); refused
+    /// UNAVAILABLE (this owner's D-1c lever is `0`).
+    pub served_pack_group_frames: Align64<AtomicU64>,
+    pub served_pack_group_splits: Align64<AtomicU64>,
+    pub served_pack_group_unavailable: Align64<AtomicU64>,
+    /// The authority's served-publish SCREEN (§5.6 (2)) refused a publish
+    /// adopting a block it holds RELEASED (free list / grace / quarantine)
+    /// — `PUBLISH_FREE_BLOCK_REFUSED`. **Must stay 0**: the belt catching
+    /// what the per-volume group law makes unreachable.
+    pub served_publish_free_block_refusals: Align64<AtomicU64>,
     /// FIND-RW5-A: never-lossy StorageFull escalations — a staged
     /// whole-image/fold/clone arm found the staging ring unable to admit
     /// its image and degraded to the durable direct-block spill instead of
@@ -11281,6 +11325,19 @@ impl SqueezefsFilesystem {
                 "pack_mover_open_defers": METRICS.pack_mover_open_defers.load(Ordering::Relaxed),
                 "pack_mover_resident_defers": METRICS.pack_mover_resident_defers.load(Ordering::Relaxed),
                 "pack_blocks_sealed_drain": METRICS.pack_blocks_sealed_drain.load(Ordering::Relaxed),
+                // PK4
+                "pack_blocks_sealed_batch": METRICS.pack_blocks_sealed_batch.load(Ordering::Relaxed),
+                "pack_cowriter_batches": METRICS.pack_cowriter_batches.load(Ordering::Relaxed),
+                "pack_cowriter_frames": METRICS.pack_cowriter_frames.load(Ordering::Relaxed),
+                "pack_batch_frames": METRICS.pack_batch_frames.load(Ordering::Relaxed),
+                "pack_batch_tenants": METRICS.pack_batch_tenants.load(Ordering::Relaxed),
+                "pack_batch_volume_splits": METRICS.pack_batch_volume_splits.load(Ordering::Relaxed),
+                "pack_cowriter_group_refusals": METRICS.pack_cowriter_group_refusals.load(Ordering::Relaxed),
+                "pack_cowriter_group_splits": METRICS.pack_cowriter_group_splits.load(Ordering::Relaxed),
+                "served_pack_group_frames": METRICS.served_pack_group_frames.load(Ordering::Relaxed),
+                "served_pack_group_splits": METRICS.served_pack_group_splits.load(Ordering::Relaxed),
+                "served_pack_group_unavailable": METRICS.served_pack_group_unavailable.load(Ordering::Relaxed),
+                "served_publish_free_block_refusals": METRICS.served_publish_free_block_refusals.load(Ordering::Relaxed),
                 "pack_open_blocks": pack_open_blocks,
                 "pack_open_block_age_ms": pack_open_block_age_ms,
                 "pack_open_block_occupancy": pack_open_block_occupancy,
@@ -22397,34 +22454,69 @@ impl SqueezefsFilesystem {
         // a StorageFull refill stops the pack arm for its remainder.
         self.router.packer.begin_promotion_batch();
 
-        let sem = std::sync::Arc::new(squeezefs_ipc::sqz_semaphore::Semaphore::new(
-            crate::bg_admit::striped_block_concurrency(),
-        ));
-        let mut tasks = futures::stream::FuturesUnordered::new();
-        for item in pending {
-            let sem_clone = sem.clone();
-            let router_clone = self.router.clone();
-            let dlm_clone = self.dlm.clone();
-            tasks.push(crate::meta_exec::spawn_meta_join(
-                "dismount_staged_promote",
-                async move {
-                    let _permit = sem_clone.acquire().await.ok();
-                    let ino = crate::routing::parse_inode_from_path(&item.file_path);
-                    let token = dlm_clone.get_fencing_token_ino(ino);
-                    router_clone
-                        .promote_staged_file(&item.file_path, &item.file_id, token)
-                        .await
-                        .map(|promoted| (promoted, item.padded_size))
-                },
-            ));
-        }
-
         use futures::StreamExt;
         const ERROR_SAMPLES: usize = 3;
         let mut promoted_bytes = 0u64;
         let mut promoted_inline = 0u64;
         let mut promoted_packed = 0u64;
-        while let Some(res) = tasks.next().await {
+        // PK4: a CO-WRITER's dismount pass is ONE batch through the group
+        // driver (`DataRouter::promote_staged_batch` — partitioned by
+        // (owner, home volume) into group packs, sequenced by the driver);
+        // the authority keeps its concurrent per-file pass (its shared pack
+        // is pinned authoritatively and spans the whole pass).
+        // Per file: `Err(panic)` (a joined task unwound) or the promotion's
+        // own outcome with the entry's padded size.
+        type Promoted = Result<(Option<crate::routing::PromotedInto>, u64), SqueezefsError>;
+        let mut results: Vec<Result<Promoted, String>> = Vec::new();
+        if crate::routing::small_file_packing_enabled() && co_writer_mount() {
+            let sizes: Vec<u64> = pending.iter().map(|item| item.padded_size).collect();
+            let items: Vec<crate::routing::StagedPromotionItem> = pending
+                .into_iter()
+                .map(|item| {
+                    let ino = crate::routing::parse_inode_from_path(&item.file_path);
+                    crate::routing::StagedPromotionItem {
+                        fencing_token: self.dlm.get_fencing_token_ino(ino),
+                        file_path: item.file_path,
+                        file_id: item.file_id,
+                    }
+                })
+                .collect();
+            for (out, bytes) in self
+                .router
+                .promote_staged_batch(items)
+                .await
+                .into_iter()
+                .zip(sizes)
+            {
+                results.push(Ok(out.map(|promoted| (promoted, bytes))));
+            }
+        } else {
+            let sem = std::sync::Arc::new(squeezefs_ipc::sqz_semaphore::Semaphore::new(
+                crate::bg_admit::striped_block_concurrency(),
+            ));
+            let mut tasks = futures::stream::FuturesUnordered::new();
+            for item in pending {
+                let sem_clone = sem.clone();
+                let router_clone = self.router.clone();
+                let dlm_clone = self.dlm.clone();
+                tasks.push(crate::meta_exec::spawn_meta_join(
+                    "dismount_staged_promote",
+                    async move {
+                        let _permit = sem_clone.acquire().await.ok();
+                        let ino = crate::routing::parse_inode_from_path(&item.file_path);
+                        let token = dlm_clone.get_fencing_token_ino(ino);
+                        router_clone
+                            .promote_staged_file(&item.file_path, &item.file_id, token)
+                            .await
+                            .map(|promoted| (promoted, item.padded_size))
+                    },
+                ));
+            }
+            while let Some(res) = tasks.next().await {
+                results.push(res.map_err(|join_err| format!("{join_err:?}")));
+            }
+        }
+        for res in results {
             match res {
                 Err(join_err) => {
                     summary.failed += 1;

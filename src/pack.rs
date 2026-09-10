@@ -89,7 +89,14 @@ pub struct OpenPack {
     /// Set once by the first sealer (a CAS); a sealed pack takes no
     /// reservation and its slot in the table is being vacated.
     sealed: AtomicBool,
+    /// This pack's OPEN sequence (process-monotone): the identity of one
+    /// pack LIFETIME — a recycled offset re-opened as a fresh pack is a new
+    /// one. The pack trace's key (KD-4's "at most one frame per block" is a
+    /// law about lifetimes, and un-stamped keys cannot tell two apart).
+    seq: u64,
 }
+
+static PACK_OPEN_SEQ: AtomicU64 = AtomicU64::new(0);
 
 impl OpenPack {
     /// ONE `fetch_add`: `Some(off)` ⇔ the caller owns `[off, off + slot)`.
@@ -131,6 +138,11 @@ impl OpenPack {
     pub fn committed(&self) -> u32 {
         self.committed.load(Ordering::Relaxed)
     }
+
+    /// The pack lifetime's open sequence (see the field).
+    pub fn seq(&self) -> u64 {
+        self.seq
+    }
 }
 
 /// A reserved slot — the tenant's handle from reserve to commit. It holds
@@ -168,6 +180,8 @@ pub enum SealKind {
     /// The drain mover found the pack open on its victim volume (PK3,
     /// §5.11): sealed so the next re-plan moves it as a unit.
     Drain,
+    /// A co-writer's batch-scoped pack at its frame reply (§5.3 (c), PK4).
+    Batch,
 }
 
 /// The packer: the router's per-data-volume open packs, the single-flighted
@@ -328,46 +342,15 @@ impl Packer {
         let outcome = if self.any_open().is_some() {
             RefillOutcome::Opened
         } else {
-            match router.allocate_placed_block().await {
-                Ok((be_id, allocator, device, offset)) => {
-                    let base_key = router.persist_block_key(&be_id, offset);
-                    // The pack-open ledger entry precedes any window in
-                    // which the block's +1 pin is declared to nobody: the
-                    // allocation's own registration covers the insert.
-                    let cover = allocator.inflight_register(offset);
-                    crate::jobs::pack_ledger_insert(&base_key);
-                    drop(cover);
-                    let pack = Arc::new(OpenPack {
-                        be_id: be_id.clone(),
-                        allocator,
-                        device,
-                        base: offset,
-                        base_key,
-                        next_slot: AtomicU64::new(0),
-                        committed: AtomicU32::new(0),
-                        opened_at: Instant::now(),
-                        sealed: AtomicBool::new(false),
-                    });
+            match self.open_block(router).await {
+                Ok(pack) => {
                     METRICS
                         .pack_reservation_refills
                         .fetch_add(1, Ordering::Relaxed);
                     self.install(pack).await
                 }
                 Err(e) if crate::block_allocator::is_storage_full(&e) => {
-                    // OQ-1: stop the pack arm for the batch — ONE WARN per
-                    // stop, never one per file (the 132 k-line anti-pattern).
-                    if !self.stopped.swap(true, Ordering::Relaxed) {
-                        log::warn!(
-                            "packing: the open pack block's refill hit StorageFull — the pack \
-                             arm stops for the rest of this promotion batch; the remaining \
-                             staged-layout files stay ring-resident (readable here, promoted \
-                             by a later batch or the next clean unmount); the own-block arm is \
-                             not retried (it needs the same space)"
-                        );
-                    }
-                    METRICS
-                        .pack_refill_storage_full
-                        .fetch_add(1, Ordering::Relaxed);
+                    self.stop_for_batch();
                     RefillOutcome::Full
                 }
                 Err(e) => RefillOutcome::Failed(format!("{e:?}")),
@@ -378,6 +361,120 @@ impl Packer {
         self.refill.store(None);
         flight.send(outcome.clone());
         Some(outcome)
+    }
+
+    /// Allocate ONE placed block as a fresh pack: the pack-open ledger entry
+    /// under a transient in-flight registration (the block is never
+    /// uncovered), the cursor at 0, the pin = the allocation's own
+    /// reference. Shared by the table refill and the co-writer's private
+    /// packs; the caller owns the `StorageFull` disposition.
+    async fn open_block(&self, router: &BackendRouter) -> Result<Arc<OpenPack>> {
+        let (be_id, allocator, device, offset) = router.allocate_placed_block().await?;
+        let base_key = router.persist_block_key(&be_id, offset);
+        // The pack-open ledger entry precedes any window in which the
+        // block's +1 pin is declared to nobody: the allocation's own
+        // registration covers the insert.
+        let cover = allocator.inflight_register(offset);
+        crate::jobs::pack_ledger_insert(&base_key);
+        drop(cover);
+        Ok(Arc::new(OpenPack {
+            be_id,
+            allocator,
+            device,
+            base: offset,
+            base_key,
+            next_slot: AtomicU64::new(0),
+            committed: AtomicU32::new(0),
+            opened_at: Instant::now(),
+            sealed: AtomicBool::new(false),
+            seq: PACK_OPEN_SEQ.fetch_add(1, Ordering::Relaxed) + 1,
+        }))
+    }
+
+    /// OQ-1: a refill hit `StorageFull` — stop the pack arm for the batch,
+    /// ONE WARN per stop, never one per file (the 132 k-line anti-pattern).
+    fn stop_for_batch(&self) {
+        if !self.stopped.swap(true, Ordering::Relaxed) {
+            log::warn!(
+                "packing: the open pack block's refill hit StorageFull — the pack arm stops for \
+                 the rest of this promotion batch; the remaining staged-layout files stay \
+                 ring-resident (readable here, promoted by a later batch or the next clean \
+                 unmount); the own-block arm is not retried (it needs the same space)"
+            );
+        }
+        METRICS
+            .pack_refill_storage_full
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// **A co-writer's PRIVATE pack** (design-small-file-packing §5.6, PK4):
+    /// a fresh block that never enters the per-volume table — batch-scoped
+    /// to ONE `(owner endpoint, home meta volume)` partition, filled by
+    /// [`Self::reserve_in`], sealed by [`Self::seal_private`] at the frame
+    /// reply. `Ok(None)` = `StorageFull` (the arm stops for the batch,
+    /// OQ-1); any other allocation error propagates.
+    pub async fn open_private(&self, router: &BackendRouter) -> Result<Option<Arc<OpenPack>>> {
+        if self.stopped.load(Ordering::Relaxed) {
+            return Ok(None);
+        }
+        match self.open_block(router).await {
+            Ok(pack) => {
+                METRICS.pack_blocks_opened.fetch_add(1, Ordering::Relaxed);
+                Ok(Some(pack))
+            }
+            Err(e) if crate::block_allocator::is_storage_full(&e) => {
+                self.stop_for_batch();
+                Ok(None)
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Reserve a `slot`-byte slot in a GIVEN (private) pack — the tenant's
+    /// registration and reference ride the handle exactly as
+    /// [`Self::reserve`]'s. `None` = the pack is full (the caller opens the
+    /// next one; the overflowing reservation is not a seal here — the
+    /// batch driver seals at the frame reply).
+    pub fn reserve_in(pack: &Arc<OpenPack>, slot: u64) -> Option<PackTenant> {
+        let off = pack.try_reserve(slot)?;
+        let inflight = pack.allocator.inflight_register(pack.base);
+        // The pin is this driver's own private reference, so the count can
+        // never have reached 0 under it; a refusal is a structural bug.
+        if !pack.allocator.increment_refcount(pack.base) {
+            crate::note_invariant_tripwire(
+                "pack_private_reserve_refused",
+                &format!(
+                    "a private pack block {} lost its pin before its batch sealed",
+                    pack.base_key
+                ),
+            );
+            return None;
+        }
+        Some(PackTenant {
+            pack: Arc::clone(pack),
+            off,
+            _inflight: inflight,
+        })
+    }
+
+    /// Seal a private pack at its frame reply (§5.3 (c)) with the frame's
+    /// typed outcome class: the pin releases through the allocator's one
+    /// release primitive — nonterminal while committed tenants live,
+    /// terminal + `Known` = the lane recycle (every tenant refused or
+    /// abandoned), terminal + `Unknown` = the leak-safe abandon without
+    /// recycle (FIND-PK-4), untracked = the counted no-op (a tenant deleted
+    /// between the landing and this seal retired the entry). OUTSIDE every
+    /// 3.5 guard (RES-1).
+    pub async fn seal_private(
+        &self,
+        router: &BackendRouter,
+        pack: &Arc<OpenPack>,
+        outcome: crate::block_allocator::PackPublishOutcome,
+    ) {
+        if pack.seal() {
+            self.run_seal_release(router, pack, SealKind::Batch, outcome)
+                .await;
+        }
     }
 
     /// Install a freshly opened pack under its volume's slot. A slot that
@@ -427,13 +524,30 @@ impl Packer {
     /// its commit; ≈ 0).
     async fn run_seal(&self, router: &BackendRouter, pack: &Arc<OpenPack>, kind: SealKind) {
         self.vacate(pack);
+        self.run_seal_release(
+            router,
+            pack,
+            kind,
+            crate::block_allocator::PackPublishOutcome::Known,
+        )
+        .await;
+    }
+
+    /// The seal's release half — the pin through the allocator's one release
+    /// primitive with the pack's publish OUTCOME class (an authority's is
+    /// always `Known`; a co-writer's batch pack carries the typed frame
+    /// fate), then the pack-open ledger exit and the `pack_blocks_sealed_*`
+    /// row.
+    async fn run_seal_release(
+        &self,
+        router: &BackendRouter,
+        pack: &Arc<OpenPack>,
+        kind: SealKind,
+        outcome: crate::block_allocator::PackPublishOutcome,
+    ) {
         let verdict = pack
             .allocator
-            .release_pack_reference(
-                router,
-                &pack.base_key,
-                crate::block_allocator::PackPublishOutcome::Known,
-            )
+            .release_pack_reference(router, &pack.base_key, outcome)
             .await;
         crate::jobs::pack_ledger_remove(&pack.base_key);
         match kind {
@@ -445,6 +559,9 @@ impl Packer {
                 .fetch_add(1, Ordering::Relaxed),
             SealKind::Drain => METRICS
                 .pack_blocks_sealed_drain
+                .fetch_add(1, Ordering::Relaxed),
+            SealKind::Batch => METRICS
+                .pack_blocks_sealed_batch
                 .fetch_add(1, Ordering::Relaxed),
         };
         match verdict {

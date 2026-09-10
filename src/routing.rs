@@ -160,14 +160,122 @@ pub enum PromotedInto {
 /// device arm carries the image's landing site with the block's in-flight
 /// registration held until the commit is durable and visible.
 pub enum PreparedPromotion {
-    Inline {
-        file_path: String,
-        ino: u64,
-        file_id: String,
-        gen: u64,
-        raw: Vec<u8>,
-    },
+    Inline(InlinePromotion),
     Device(PreparedDevicePromotion),
+}
+
+/// The inline arm's prepared state: the raw ring image, which the commit
+/// makes the layout record's `data_key` (no device step).
+pub struct InlinePromotion {
+    file_path: String,
+    ino: u64,
+    file_id: String,
+    gen: u64,
+    raw: Vec<u8>,
+}
+
+/// A staged file's image after `read_promotion_image`'s dispatch: the
+/// inline arm's raw payload, or the device arm's TRANSFORMED image with its
+/// LBA slot — before any allocation or DMA (the landing site is the
+/// caller's decision: its own block, the shared pack, a batch pack).
+enum PromotionImage {
+    Inline(InlinePromotion),
+    Device(DeviceImage),
+}
+
+/// The device arm's transformed image and identity (see [`PromotionImage`]).
+struct DeviceImage {
+    ino: u64,
+    file_id: String,
+    gen: u64,
+    raw_len: usize,
+    /// `pack_slot_len(image.len())`.
+    slot: u64,
+    image: bytes::Bytes,
+}
+
+/// One staged-layout file for [`DataRouter::promote_staged_batch`].
+#[derive(Debug, Clone)]
+pub struct StagedPromotionItem {
+    pub file_path: String,
+    pub file_id: String,
+    pub fencing_token: u64,
+}
+
+/// A pack-group tenant re-checked and composed under the group's guards,
+/// awaiting the save body's `stage`/`ship`/`finish` halves.
+struct StagedTenant {
+    /// The item's index in the batch.
+    i: usize,
+    prepared: PreparedDevicePromotion,
+    updated: CachedMetadata,
+    refs: Vec<crate::meta_backend::kv::block_refs::BlockRefOp>,
+    /// The older durable mapping this commit displaces, if any.
+    displaced: Option<String>,
+}
+
+/// What a pack's group commit hands the driver: done (every tenant
+/// answered), or a frame-level refusal with the item indices to re-drive.
+enum PackGroupFate {
+    Done,
+    /// `PUBLISH_PACK_GROUP_UNAVAILABLE`: one-block-per-file, the endpoint
+    /// latched until the next grant.
+    Unavailable(Vec<usize>),
+    /// `PUBLISH_PACK_GROUP_SPLIT`: re-`prepare` into fresh packs once, then
+    /// one-block-per-file.
+    Split(Vec<usize>),
+}
+
+impl PreparedDevicePromotion {
+    /// The packed arm's reserved slot handle, for a tenant whose commit did
+    /// not land (the block arm's site is abandoned by its own path).
+    fn into_pack_tenant(self) -> Option<crate::pack::PackTenant> {
+        match self.site {
+            PreparedSite::Packed(t) => Some(t),
+            PreparedSite::Block { .. } => None,
+        }
+    }
+}
+
+// PK4: outcome-class arms begin
+/// The publish OUTCOME class a failed layout save leaves a never-published
+/// landing in (design-small-file-packing §5.3, FIND-PK-4): only a transport
+/// failure past the witnessed ladder — the owner MAY have applied the
+/// layout — is `Unknown`; every decoded refusal, protocol error and local
+/// failure is `Known`. Keyed on the typed class, never a message string.
+fn pack_publish_outcome(err: &SqueezefsError) -> crate::block_allocator::PackPublishOutcome {
+    match err {
+        SqueezefsError::PublishFailure {
+            class: crate::error::PublishFailureClass::TransportOutcomeUnknown,
+            ..
+        } => crate::block_allocator::PackPublishOutcome::Unknown,
+        _ => crate::block_allocator::PackPublishOutcome::Known,
+    }
+}
+// PK4: outcome-class arms end
+
+/// The UNAVAILABLE latch (design-small-file-packing §5.6 (b)): owner
+/// endpoints that refused a `pack_group` frame under the CURRENT membership
+/// grant, keyed on the typed status at the refusal — never a message
+/// string. A latched endpoint gets one-block-per-file until the next grant
+/// ([`crate::membership::pack_group_grant_generation`] moves), which may
+/// say otherwise.
+static PACK_GROUP_UNAVAILABLE: once_cell::sync::Lazy<
+    parking_lot::Mutex<std::collections::HashMap<String, u64>>,
+> = once_cell::sync::Lazy::new(|| parking_lot::Mutex::new(std::collections::HashMap::new()));
+
+fn pack_group_endpoint_latched(endpoint: &str) -> bool {
+    PACK_GROUP_UNAVAILABLE
+        .lock()
+        .get(endpoint)
+        .is_some_and(|gen| *gen == crate::membership::pack_group_grant_generation())
+}
+
+fn latch_pack_group_endpoint(endpoint: &str) {
+    PACK_GROUP_UNAVAILABLE.lock().insert(
+        endpoint.to_string(),
+        crate::membership::pack_group_grant_generation(),
+    );
 }
 
 /// The device arm's prepared state: the transformed image is on the
@@ -353,6 +461,109 @@ pub async fn meta_lock_acquire(ino: u64) -> crate::fuse_client::MetaLockGuard {
         ino,
     )
     .await
+}
+
+/// **The 3.5 multi-holder convention** (design-small-file-packing §5.6,
+/// PK4; documented beside the lock-order table in `src/stripe_locks.rs`):
+/// the `INODE_META_LOCKS` guards of a SET of inos, taken as ONE canonical
+/// acquisition — ascending [`inode_meta_stripe`], deduped (two distinct inos
+/// may share a stripe of the 4096-way table; one guard covers both, and a
+/// per-ino acquisition would self-deadlock on the second) — the
+/// `dlm::lock_many` law applied to this layer. Every guard rides the same
+/// census door as a single acquisition, so the D-3 collision classification
+/// and the `lock_phase_ns` 3.5 face see a group's waits and holds. The one
+/// caller is the co-writer's pack `commit_group`; a caller must hold no
+/// other 3.5 guard when it enters (the ascending order is the whole
+/// acyclicity argument against every single-stripe holder).
+pub async fn meta_lock_acquire_many(inos: &[u64]) -> Vec<crate::fuse_client::MetaLockGuard> {
+    let mut stripes: Vec<(usize, u64)> = inos
+        .iter()
+        .map(|&ino| (INODE_META_LOCKS.shard_index(ino), ino))
+        .collect();
+    stripes.sort_unstable_by_key(|&(s, _)| s);
+    stripes.dedup_by_key(|&mut (s, _)| s);
+    let mut guards = Vec::with_capacity(stripes.len());
+    for (stripe, ino) in stripes {
+        guards.push(
+            crate::fuse_client::census_meta_lock_acquire(
+                INODE_META_LOCKS.get_by_index(stripe),
+                &INODE_META_CENSUS_TABLE,
+                stripe,
+                ino,
+            )
+            .await,
+        );
+    }
+    guards
+}
+
+/// **Test seam — the pack trace** (PK4 contracts 2, 8, 10, 13): the
+/// ordered events of the co-writer batch driver a suite asserts the
+/// §5.6 laws over. Recorded only while armed (one relaxed load per event
+/// site; the RAM-publish site is the one on a hot path and pays that load
+/// alone).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PackTrace {
+    /// A tenant's image DMA'd into a pack block (`pack` = the pack
+    /// lifetime's open sequence, `OpenPack::seq`).
+    Dma {
+        pack: u64,
+        base_key: String,
+        ino: u64,
+    },
+    /// A `pack_group` frame naming `base_key`'s tenants left the mount
+    /// (refused or served alike — recorded at the ship, before any reply).
+    FrameDeparture {
+        pack: u64,
+        base_key: String,
+        inos: Vec<u64>,
+    },
+    /// A layout entry published into the RAM cache.
+    RamPublish { ino: u64 },
+    /// A group's canonical 3.5 guard set was taken (`stripes` deduped).
+    GuardsHeld { stripes: usize },
+    /// The group's guards dropped.
+    GuardsDropped,
+    /// A pack reference release (a tenant's or the pin's) ran.
+    PinRelease { base_key: String },
+}
+
+static PACK_TRACE_ARMED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static PACK_TRACE: parking_lot::Mutex<Vec<PackTrace>> = parking_lot::Mutex::new(Vec::new());
+
+/// Arm / disarm the pack trace (tests only).
+pub fn test_arm_pack_trace(on: bool) {
+    PACK_TRACE_ARMED.store(on, Ordering::Relaxed);
+    if !on {
+        PACK_TRACE.lock().clear();
+    }
+}
+
+/// Take the recorded trace (tests only).
+pub fn test_take_pack_trace() -> Vec<PackTrace> {
+    std::mem::take(&mut *PACK_TRACE.lock())
+}
+
+fn pack_trace(event: impl FnOnce() -> PackTrace) {
+    if PACK_TRACE_ARMED.load(Ordering::Relaxed) {
+        PACK_TRACE.lock().push(event());
+    }
+}
+
+/// **Test seam — the pre-seal hook** (PK4 contract 5): awaited by the
+/// batch driver after a pack's group landed and its guards dropped, BEFORE
+/// the pack seals — the window a tenant delete can land in. `None` = no
+/// hook.
+pub type PackPreSealHook = std::sync::Arc<
+    dyn Fn(String) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> + Send + Sync,
+>;
+
+static PACK_PRE_SEAL_HOOK: once_cell::sync::Lazy<arc_swap::ArcSwapOption<PackPreSealHook>> =
+    once_cell::sync::Lazy::new(arc_swap::ArcSwapOption::empty);
+
+/// Install / clear the pre-seal hook (tests only).
+pub fn test_install_pack_pre_seal_hook(hook: Option<PackPreSealHook>) {
+    PACK_PRE_SEAL_HOOK.store(hook.map(std::sync::Arc::new));
 }
 
 /// Per-inode (striped, collision-tolerant) LAYOUT-PRUNE EPOCH — a latch-free
@@ -7880,6 +8091,7 @@ impl DataRouter {
     /// naming a lineage this mount already closed is inserted with its
     /// `own_mint` bit CLEARED, so it can never re-arm the blob's free.
     pub fn publish_layout_cache_entry(&self, ino: u64, mut m: CachedMetadata) {
+        pack_trace(|| PackTrace::RamPublish { ino });
         if let Some(old) = self.metadata_cache.get(&ino) {
             if old.block_map_id_own_mint && old.block_map_id != m.block_map_id {
                 self.reclaim_own_mint_blob(ino, &old, "replacing insert");
@@ -8188,6 +8400,39 @@ impl DataRouter {
             scc::hash_map::Entry::Vacant(vac) => {
                 let _ = vac.insert_entry(ops);
             }
+        }
+    }
+
+    /// Retract a FAILED promotion's own reference ops from the ino's
+    /// deferred notes (PK4 — the refill's promotion-shaped hole): the save
+    /// body's never-lossy refill re-notes EVERY staged op on failure, which
+    /// is right for a dirty-layout persist (the RAM map already carries the
+    /// change; the next persist owes the same accounting) and wrong for a
+    /// promotion — `stage` never published the RAM entry, the block is
+    /// abandoned, and the next persist carries the OLD map, so its `+ref`
+    /// (and a displaced copy's `−ref`) would land as C8 drift on a block no
+    /// layout names. One occurrence of each op is removed; the drained
+    /// deferred notes the same save carried stay owed.
+    pub(crate) fn retract_block_ref_ops(
+        &self,
+        ino: u64,
+        ops: &[crate::meta_backend::kv::block_refs::BlockRefOp],
+    ) {
+        if ops.is_empty() {
+            return;
+        }
+        let mut drop_now = false;
+        if let Some(mut occ) = self.pending_block_refs.get_sync(&ino) {
+            let pending = occ.get_mut();
+            for op in ops {
+                if let Some(pos) = pending.iter().position(|p| p == op) {
+                    pending.remove(pos);
+                }
+            }
+            drop_now = pending.is_empty();
+        }
+        if drop_now {
+            let _ = self.pending_block_refs.remove_sync(&ino);
         }
     }
 
@@ -14151,6 +14396,33 @@ impl DataRouter {
         file_id: &str,
         fencing_token: u64,
     ) -> Result<Option<PromotedInto>> {
+        // A CO-WRITER's per-file promotion is the batch driver's degenerate
+        // batch of one (design-small-file-packing §5.2/§5.6): its packed
+        // arm is the batch-scoped group pack, never the shared open pack
+        // (whose pin is not authoritative there).
+        if small_file_packing_enabled() && crate::fuse_client::co_writer_mount() {
+            return self
+                .promote_cowriter_batch(vec![StagedPromotionItem {
+                    file_path: file_path.to_string(),
+                    file_id: file_id.to_string(),
+                    fencing_token,
+                }])
+                .await
+                .pop()
+                .unwrap_or(Ok(None));
+        }
+        self.promote_staged_file_per_file(file_path, file_id, fencing_token)
+            .await
+    }
+
+    /// The per-file composition `prepare → commit` — the degenerate batch
+    /// of one on every posture whose packed arm is the shared open pack.
+    async fn promote_staged_file_per_file(
+        &self,
+        file_path: &str,
+        file_id: &str,
+        fencing_token: u64,
+    ) -> Result<Option<PromotedInto>> {
         match self.prepare_promotion(file_path, file_id).await? {
             Some(prepared) => self.commit_promotion(prepared, fencing_token).await,
             None => Ok(None),
@@ -14170,6 +14442,44 @@ impl DataRouter {
         file_path: &str,
         file_id: &str,
     ) -> Result<Option<PreparedPromotion>> {
+        let img = match self.read_promotion_image(file_path, file_id).await? {
+            None => return Ok(None),
+            Some(PromotionImage::Inline(inline)) => {
+                return Ok(Some(PreparedPromotion::Inline(inline)));
+            }
+            Some(PromotionImage::Device(img)) => img,
+        };
+        // The size dispatch's second leg (design-small-file-packing §5.2
+        // step 2): under the lever, an image whose LBA-rounded slot fits
+        // the own-block threshold packs into the shared open pack block;
+        // a larger one takes its own block. A CO-WRITER's packed arm is
+        // the batch driver's (`promote_staged_batch` — its pin is a
+        // private word, so the shared table never serves it); this per-file
+        // half runs the block arm there.
+        if small_file_packing_enabled() {
+            if img.slot > pack_max_slot_bytes() {
+                METRICS
+                    .pack_own_block_promotions
+                    .fetch_add(1, Ordering::Relaxed);
+            } else if !crate::fuse_client::co_writer_mount() {
+                return self.prepare_packed_promotion(img).await;
+            }
+        }
+        self.prepare_block_from_image(img).await.map(Some)
+    }
+
+    /// The image half of `prepare` (design-small-file-packing §5.2 step 1):
+    /// the ring read (the W2 rider fence and the identity read exactly as
+    /// before), the size dispatch, and — for the device arm — the
+    /// transform. Nothing is allocated or DMA'd yet: the DEVICE arm's
+    /// landing site (its own block, the shared pack, or a co-writer's
+    /// batch pack) is the caller's decision. `Ok(None)` = nothing to
+    /// promote.
+    async fn read_promotion_image(
+        &self,
+        file_path: &str,
+        file_id: &str,
+    ) -> Result<Option<PromotionImage>> {
         let nvme = &self.cache.nvme;
         let Some(gen) = nvme.staged_generation(file_id).await else {
             return Ok(None);
@@ -14212,13 +14522,13 @@ impl DataRouter {
             .unwrap_or(0)
             .max(raw_len as u64);
         if logical <= inline_max as u64 {
-            return Ok(Some(PreparedPromotion::Inline {
+            return Ok(Some(PromotionImage::Inline(InlinePromotion {
                 file_path: file_path.to_string(),
                 ino: promote_ino,
                 file_id: file_id.to_string(),
                 gen,
                 raw,
-            }));
+            })));
         }
         let processed = self
             .get_crypto()
@@ -14240,39 +14550,37 @@ impl DataRouter {
             );
             return Ok(None);
         }
-
-        // The size dispatch's second leg (design-small-file-packing §5.2
-        // step 2): under the lever, an image whose LBA-rounded slot fits
-        // the own-block threshold packs into the shared open pack block;
-        // a larger one takes its own block. A CO-WRITER never packs in PK2
-        // (its batch-scoped pack is PK4's) — its promotions run the block
-        // arm, counted as the never-wrong fallback.
-        if small_file_packing_enabled() {
-            let slot = pack_slot_len(processed.len() as u64);
-            if slot > pack_max_slot_bytes() {
-                METRICS
-                    .pack_own_block_promotions
-                    .fetch_add(1, Ordering::Relaxed);
-            } else if crate::fuse_client::co_writer_mount() {
-                METRICS
-                    .pack_cowriter_group_unavailable
-                    .fetch_add(1, Ordering::Relaxed);
-            } else {
-                return self
-                    .prepare_packed_promotion(promote_ino, file_id, gen, raw_len, processed, slot)
-                    .await;
-            }
-        }
-
-        let LandedImage { block_key, site } = self.land_own_block(promote_ino, processed).await?;
-        Ok(Some(PreparedPromotion::Device(PreparedDevicePromotion {
+        Ok(Some(PromotionImage::Device(DeviceImage {
             ino: promote_ino,
             file_id: file_id.to_string(),
             gen,
             raw_len,
+            slot: pack_slot_len(processed.len() as u64),
+            image: processed,
+        })))
+    }
+
+    /// The BLOCK arm's `prepare`: the FIXED own-block landing
+    /// ([`Self::land_own_block`] — one placed block, `bk:0:len`, its `+ref`
+    /// staged at the commit) wrapped in the promotion's prepared state.
+    async fn prepare_block_from_image(&self, img: DeviceImage) -> Result<PreparedPromotion> {
+        let DeviceImage {
+            ino,
+            file_id,
+            gen,
+            raw_len,
+            image,
+            ..
+        } = img;
+        let LandedImage { block_key, site } = self.land_own_block(ino, image).await?;
+        Ok(PreparedPromotion::Device(PreparedDevicePromotion {
+            ino,
+            file_id,
+            gen,
+            raw_len,
             block_key,
             site,
-        })))
+        }))
     }
 
     /// The OWN-BLOCK arm of a stored-image landing: one placed block, the
@@ -14316,17 +14624,17 @@ impl DataRouter {
     /// dispatch the escalations share with the promotion's `prepare`
     /// (design-small-file-packing §5.2 step 2, §5.7): under the lever, an
     /// image whose LBA-rounded slot fits the own-block threshold packs into
-    /// the open pack block (a co-writer never packs before PK4's batch
-    /// driver); a larger one — and any image the OQ-1 `StorageFull` stop
-    /// has closed the pack arm to — takes a placed block of its own, whose
-    /// allocation surfaces the same `StorageFull` the caller already
-    /// propagates. Run by the staged-clone spill, the rider-fold spill and
-    /// the transformed truncate clip: each is a promotion of a composed or
-    /// clipped image under another name, and a private copy of the block
-    /// arm here would be the 64× space law applied to every spill. The
-    /// promotion's own `prepare` composes the same two arms with its
-    /// promotion counters and its resident-and-counted answer to a stopped
-    /// arm.
+    /// the open pack block (a co-writer's shared table never serves — its
+    /// packed arm is the batch driver's, `promote_staged_batch`); a larger
+    /// one — and any image the OQ-1 `StorageFull` stop has closed the pack
+    /// arm to — takes a placed block of its own, whose allocation surfaces
+    /// the same `StorageFull` the caller already propagates. Run by the
+    /// staged-clone spill, the rider-fold spill and the transformed
+    /// truncate clip: each is a promotion of a composed or clipped image
+    /// under another name, and a private copy of the block arm here would
+    /// be the 64× space law applied to every spill. The promotion's own
+    /// `prepare` composes the same two arms with its promotion counters and
+    /// its resident-and-counted answer to a stopped arm.
     async fn land_stored_image(&self, ino: u64, image: bytes::Bytes) -> Result<LandedImage> {
         if small_file_packing_enabled() && !crate::fuse_client::co_writer_mount() {
             let slot = pack_slot_len(image.len() as u64);
@@ -14356,43 +14664,48 @@ impl DataRouter {
     /// A landed image whose mapping never took the layout (the commit was
     /// refused, failed, or a racing publish won): the own-block arm's
     /// offset is never-published — the co-writer-aware abandon (d575be03
-    /// sweep); the packed arm's tenant reference releases through the
-    /// allocator's one release primitive (§5.2 step 6). OUTSIDE every 3.5
-    /// guard (RES-1 — the packed release is terminal when the pack sealed
-    /// and every sibling was deleted, and a terminal free's reclaim enqueue
-    /// parks at the cap).
-    async fn release_landed_site(&self, site: PreparedSite) {
+    /// sweep) keyed on the publish OUTCOME class (FIND-PK-4,
+    /// design-small-file-packing §5.3: a co-writer recycles the offset into
+    /// its lane only when the shipped save's outcome is KNOWN; a transport
+    /// failure past the ladder MAY have applied the layout on the owner, so
+    /// that class abandons without recycle); the packed arm's tenant
+    /// reference releases through the allocator's one release primitive
+    /// (§5.2 step 6). OUTSIDE every 3.5 guard (RES-1 — the packed release
+    /// is terminal when the pack sealed and every sibling was deleted, and a
+    /// terminal free's reclaim enqueue parks at the cap).
+    async fn release_landed_site(
+        &self,
+        site: PreparedSite,
+        outcome: crate::block_allocator::PackPublishOutcome,
+    ) {
         match site {
             PreparedSite::Block {
                 allocator, offset, ..
             } => {
-                let _ = allocator.abandon_unpublished_offset(offset).await;
+                let _ = allocator
+                    .abandon_unpublished_offset_with(offset, outcome)
+                    .await;
             }
             PreparedSite::Packed(tenant) => self.release_pack_tenant(tenant).await,
         }
     }
 
     /// The PACKED arm's `prepare` (design-small-file-packing §5.2 steps
-    /// 3–4): reserve a slot in the open pack block (one `fetch_add`; the
-    /// tenant's own in-flight registration and reference ride the handle),
-    /// DMA the image at `base + off` — ONE write of exactly the slot (the
-    /// device's unaligned arm zero-fills `[len, slot)`) — and publish the
-    /// block's incarnation word (idempotent: the FIRST tenant's publish
-    /// stabilizes it, later ones are no-ops — KD-3, the block-granular
-    /// word is stable for its committed keys from the first DMA on). A
-    /// DMA error releases the tenant's reference (no guard is held here)
-    /// and returns the error — nothing published, nothing lost. `Ok(None)`
-    /// = the arm is stopped (OQ-1) or closed: the entry stays resident,
-    /// counted.
+    /// 3–4): the shared open pack's landing ([`Self::land_packed_image`])
+    /// wrapped in the promotion's prepared state. `Ok(None)` = the arm is
+    /// stopped (OQ-1) or closed: the entry stays resident, counted.
     async fn prepare_packed_promotion(
         &self,
-        ino: u64,
-        file_id: &str,
-        gen: u64,
-        raw_len: usize,
-        image: bytes::Bytes,
-        slot: u64,
+        img: DeviceImage,
     ) -> Result<Option<PreparedPromotion>> {
+        let DeviceImage {
+            ino,
+            file_id,
+            gen,
+            raw_len,
+            slot,
+            image,
+        } = img;
         let Some(LandedImage { block_key, site }) =
             self.land_packed_image(ino, image, slot).await?
         else {
@@ -14403,7 +14716,7 @@ impl DataRouter {
         };
         Ok(Some(PreparedPromotion::Device(PreparedDevicePromotion {
             ino,
-            file_id: file_id.to_string(),
+            file_id,
             gen,
             raw_len,
             block_key,
@@ -14411,11 +14724,11 @@ impl DataRouter {
         })))
     }
 
-    /// The PACKED arm's landing (`prepare_packed_promotion`'s body, shared
-    /// with the escalations through [`Self::land_stored_image`]): the
-    /// reservation, the slot DMA, the word publish, the pack ledgers.
-    /// `Ok(None)` ⇔ the arm is stopped (OQ-1) or closed — the caller decides
-    /// between resident-and-counted and the own-block arm.
+    /// The PACKED arm's landing in the SHARED open pack (the promotion's
+    /// `prepare` and the escalations through [`Self::land_stored_image`]):
+    /// the reservation, then [`Self::land_tenant`]. `Ok(None)` ⇔ the arm
+    /// is stopped (OQ-1) or closed — the caller decides between
+    /// resident-and-counted and the own-block arm.
     async fn land_packed_image(
         &self,
         ino: u64,
@@ -14425,8 +14738,32 @@ impl DataRouter {
         let Some(tenant) = self.packer.reserve(&self.backend_router, slot).await? else {
             return Ok(None);
         };
+        self.land_tenant(tenant, ino, image, slot).await.map(Some)
+    }
+
+    /// A reserved tenant's DMA (§5.2 step 4), shared by the authority's
+    /// shared pack and a co-writer's batch pack: ONE write of exactly the
+    /// slot at `base + off` (the device's unaligned arm zero-fills
+    /// `[len, slot)`), the block's incarnation word published (idempotent:
+    /// the FIRST tenant's publish stabilizes it — KD-3, the block-granular
+    /// word is stable for its committed keys from the first DMA on), the
+    /// W-5 stamp, the pad ledger. A DMA error releases the tenant's
+    /// reference (no guard is held here) and returns the error — nothing
+    /// published, nothing lost.
+    async fn land_tenant(
+        &self,
+        tenant: crate::pack::PackTenant,
+        ino: u64,
+        image: bytes::Bytes,
+        slot: u64,
+    ) -> Result<LandedImage> {
         let image_len = image.len();
         let block_key = format!("{}:{}:{}", tenant.pack.base_key, tenant.off, image_len);
+        pack_trace(|| PackTrace::Dma {
+            pack: tenant.pack.seq(),
+            base_key: tenant.pack.base_key.clone(),
+            ino,
+        });
         if let Err(e) = tenant
             .pack
             .device
@@ -14446,10 +14783,10 @@ impl DataRouter {
         METRICS
             .pack_slot_pad_bytes
             .fetch_add(slot - image_len as u64, Ordering::Relaxed);
-        Ok(Some(LandedImage {
+        Ok(LandedImage {
             block_key,
             site: PreparedSite::Packed(tenant),
-        }))
+        })
     }
 
     /// Give a reserved slot's reference back (design-small-file-packing
@@ -14462,6 +14799,17 @@ impl DataRouter {
     /// known (its commit is local).
     async fn release_pack_tenant(&self, tenant: crate::pack::PackTenant) {
         METRICS.pack_slots_abandoned.fetch_add(1, Ordering::Relaxed);
+        self.release_pack_tenant_reference(tenant).await;
+    }
+
+    /// The reference release itself (no `pack_slots_abandoned` row): a
+    /// tenant of a REFUSED pack-group frame gives its reference back so the
+    /// seal's release is terminal — the whole block is abandoned
+    /// (`pack_blocks_abandoned`), not its slots one by one.
+    async fn release_pack_tenant_reference(&self, tenant: crate::pack::PackTenant) {
+        pack_trace(|| PackTrace::PinRelease {
+            base_key: tenant.pack.base_key.clone(),
+        });
         if let Err(e) = tenant
             .pack
             .allocator
@@ -14524,6 +14872,617 @@ impl DataRouter {
             .unwrap_or(false)
     }
 
+    /// **The promotion BATCH driver** (design-small-file-packing §5.6, PR
+    /// PK4) — the entry every batch promoter runs (the merge worker's
+    /// `promote_batch`, the dismount pass; the fsync lever and every other
+    /// per-file call reach it as a batch of one on a co-writer). Returns one
+    /// outcome per item, input order.
+    ///
+    /// On an authority / solo writer it is the per-file composition
+    /// verbatim (the shared open pack's pin is authoritative there; the
+    /// pack may span batches and meta volumes). On a **CO-WRITER** under the
+    /// lever it is the batch-scoped group pack: every packable tenant's
+    /// image is read and transformed, the tenants are PARTITIONED by
+    /// `(owner endpoint, route_ino(ino).0)`, each partition fills
+    /// successive PRIVATE packs (≤ [`crate::meta_ship::publish::pack_group_tenant_cap`]
+    /// tenants and one chunk each), every tenant DMAs BEFORE any publish,
+    /// and each pack commits as ONE `pack_group` frame the owner serves as
+    /// ONE conveyor group on ONE home volume — or refuses whole. A refused
+    /// pack is ABANDONED (KNOWN → the lane recycle) and its tenants are
+    /// re-`prepare`d into FRESH packs (SPLIT, once — new partition, new
+    /// reservation, new DMA, one new frame per pack) or promoted
+    /// one-block-per-file (UNAVAILABLE, a second SPLIT): **at most ONE
+    /// `pack_group` frame ever names a given pack block** (KD-4). A
+    /// transport failure past the resend ladder (`TransportOutcomeUnknown`)
+    /// abandons the pack WITHOUT recycle (FIND-PK-4).
+    pub async fn promote_staged_batch(
+        &self,
+        items: Vec<StagedPromotionItem>,
+    ) -> Vec<Result<Option<PromotedInto>>> {
+        if !(small_file_packing_enabled() && crate::fuse_client::co_writer_mount()) {
+            let mut out = Vec::with_capacity(items.len());
+            for it in &items {
+                out.push(
+                    self.promote_staged_file_per_file(&it.file_path, &it.file_id, it.fencing_token)
+                        .await,
+                );
+            }
+            return out;
+        }
+        self.promote_cowriter_batch(items).await
+    }
+
+    /// The co-writer arm of [`Self::promote_staged_batch`]: two passes of
+    /// [`Self::drive_cowriter_pack_batch`] — the second is the ONE retry a
+    /// SPLIT refusal buys.
+    async fn promote_cowriter_batch(
+        &self,
+        items: Vec<StagedPromotionItem>,
+    ) -> Vec<Result<Option<PromotedInto>>> {
+        METRICS
+            .pack_cowriter_batches
+            .fetch_add(1, Ordering::Relaxed);
+        let n = items.len();
+        let mut results: Vec<Option<Result<Option<PromotedInto>>>> = (0..n).map(|_| None).collect();
+        let first_pass: Vec<usize> = (0..n).collect();
+        let split_retry = self
+            .drive_cowriter_pack_batch(&items, first_pass, &mut results, true)
+            .await;
+        if !split_retry.is_empty() {
+            // The ONE retry after a SPLIT refusal: fresh packs on the
+            // now-current routes; a second SPLIT inside falls back
+            // one-block-per-file (`allow_split_retry = false`).
+            let again = self
+                .drive_cowriter_pack_batch(&items, split_retry, &mut results, false)
+                .await;
+            debug_assert!(again.is_empty(), "the second pass never asks for a third");
+        }
+        results.into_iter().map(|r| r.unwrap_or(Ok(None))).collect()
+    }
+
+    /// One pass of the co-writer driver over `idxs` (a subset of `items`):
+    /// read + dispatch every item (inline and own-block classes commit
+    /// per-file at once), partition the packable tenants, commit each
+    /// partition's packs. Returns the item indices a SPLIT refusal handed
+    /// back for the one retry (empty when `allow_split_retry` is false —
+    /// those fell back one-block-per-file inside).
+    async fn drive_cowriter_pack_batch(
+        &self,
+        items: &[StagedPromotionItem],
+        idxs: Vec<usize>,
+        results: &mut [Option<Result<Option<PromotedInto>>>],
+        allow_split_retry: bool,
+    ) -> Vec<usize> {
+        let grant_ok = crate::membership::pack_group_available();
+        let mut partitions: std::collections::BTreeMap<(String, usize), Vec<(usize, DeviceImage)>> =
+            std::collections::BTreeMap::new();
+        for i in idxs {
+            let it = &items[i];
+            let img = match self.read_promotion_image(&it.file_path, &it.file_id).await {
+                Err(e) => {
+                    results[i] = Some(Err(e));
+                    continue;
+                }
+                Ok(None) => {
+                    results[i] = Some(Ok(None));
+                    continue;
+                }
+                Ok(Some(PromotionImage::Inline(inline))) => {
+                    results[i] = Some(
+                        self.commit_promotion(PreparedPromotion::Inline(inline), it.fencing_token)
+                            .await,
+                    );
+                    continue;
+                }
+                Ok(Some(PromotionImage::Device(img))) => img,
+            };
+            if img.slot > pack_max_slot_bytes() {
+                METRICS
+                    .pack_own_block_promotions
+                    .fetch_add(1, Ordering::Relaxed);
+                results[i] = Some(self.promote_image_own_block(img, it.fencing_token).await);
+                continue;
+            }
+            if !grant_ok {
+                // The grant does not advertise pack groups (§5.6 (a)): the
+                // FIXED block arm, byte-identical to PK2, counted.
+                METRICS
+                    .pack_cowriter_group_unavailable
+                    .fetch_add(1, Ordering::Relaxed);
+                results[i] = Some(self.promote_image_own_block(img, it.fencing_token).await);
+                continue;
+            }
+            let home = self
+                .inner
+                .meta_backend
+                .get()
+                .map(|be| be.route_ino(img.ino).0);
+            let owner = home.and_then(crate::meta_ship::owner_of_volume);
+            let (Some(v_idx), Some(owner)) = (home, owner) else {
+                // A local-home ino on a co-writer (no owner routes it): the
+                // per-file arm's own refusal law governs — never a pack.
+                results[i] = Some(self.promote_image_own_block(img, it.fencing_token).await);
+                continue;
+            };
+            if pack_group_endpoint_latched(&owner.endpoint) {
+                // The owner refused a pack group as UNAVAILABLE under the
+                // current grant: one-block-per-file until the next grant.
+                METRICS
+                    .pack_cowriter_group_refusals
+                    .fetch_add(1, Ordering::Relaxed);
+                results[i] = Some(self.promote_image_own_block(img, it.fencing_token).await);
+                continue;
+            }
+            partitions
+                .entry((owner.endpoint.clone(), v_idx))
+                .or_default()
+                .push((i, img));
+        }
+        if partitions.len() > 1 {
+            METRICS
+                .pack_batch_volume_splits
+                .fetch_add(partitions.len() as u64, Ordering::Relaxed);
+        }
+        let mut split_retry = Vec::new();
+        for ((endpoint, _), members) in partitions {
+            split_retry.extend(
+                self.promote_partition(items, &endpoint, members, results, allow_split_retry)
+                    .await,
+            );
+        }
+        split_retry
+    }
+
+    /// The FIXED block arm for one prepared image (the co-writer's
+    /// never-wrong fallback): its own block, `bk:0:len`, the per-file commit.
+    async fn promote_image_own_block(
+        &self,
+        img: DeviceImage,
+        fencing_token: u64,
+    ) -> Result<Option<PromotedInto>> {
+        let prepared = self.prepare_block_from_image(img).await?;
+        self.commit_promotion(prepared, fencing_token).await
+    }
+
+    /// One-block-per-file for an item whose pack was refused: the ring
+    /// entry is still resident (nothing committed), so the image is re-read
+    /// and the item runs the per-file composition from the start.
+    async fn promote_item_own_block(
+        &self,
+        it: &StagedPromotionItem,
+    ) -> Result<Option<PromotedInto>> {
+        match self
+            .read_promotion_image(&it.file_path, &it.file_id)
+            .await?
+        {
+            None => Ok(None),
+            Some(PromotionImage::Inline(inline)) => {
+                self.commit_promotion(PreparedPromotion::Inline(inline), it.fencing_token)
+                    .await
+            }
+            Some(PromotionImage::Device(img)) => {
+                self.promote_image_own_block(img, it.fencing_token).await
+            }
+        }
+    }
+
+    /// One `(owner endpoint, home volume)` partition: fill successive
+    /// private packs (the frame cap, the chunk), each tenant DMA'd at its
+    /// reservation, then commit every pack as its own group and seal it.
+    /// Returns the item indices handed back for the SPLIT retry.
+    async fn promote_partition(
+        &self,
+        items: &[StagedPromotionItem],
+        endpoint: &str,
+        members: Vec<(usize, DeviceImage)>,
+        results: &mut [Option<Result<Option<PromotedInto>>>],
+        allow_split_retry: bool,
+    ) -> Vec<usize> {
+        let cap = crate::meta_ship::publish::pack_group_tenant_cap().max(1);
+        let mut packs: Vec<(
+            std::sync::Arc<crate::pack::OpenPack>,
+            Vec<(usize, PreparedDevicePromotion)>,
+        )> = Vec::new();
+        let mut current: Option<(
+            std::sync::Arc<crate::pack::OpenPack>,
+            Vec<(usize, PreparedDevicePromotion)>,
+        )> = None;
+        let mut queue: std::collections::VecDeque<(usize, DeviceImage)> = members.into();
+        while let Some((i, img)) = queue.pop_front() {
+            let need_new = match &current {
+                None => true,
+                Some((_, tenants)) => tenants.len() >= cap,
+            };
+            if need_new {
+                if let Some(done) = current.take() {
+                    packs.push(done);
+                }
+                match self.packer.open_private(&self.backend_router).await {
+                    Ok(Some(pack)) => current = Some((pack, Vec::new())),
+                    Ok(None) => {
+                        // OQ-1: StorageFull stops the arm — this tenant and
+                        // every remaining one stay resident, counted.
+                        results[i] = Some(Ok(None));
+                        METRICS
+                            .pack_arm_stopped_promotions
+                            .fetch_add(1 + queue.len() as u64, Ordering::Relaxed);
+                        for (j, _) in queue.drain(..) {
+                            results[j] = Some(Ok(None));
+                        }
+                        break;
+                    }
+                    Err(e) => {
+                        results[i] = Some(Err(e));
+                        continue;
+                    }
+                }
+            }
+            let Some((pack, tenants)) = current.as_mut() else {
+                continue;
+            };
+            match crate::pack::Packer::reserve_in(pack, img.slot) {
+                Some(tenant) => {
+                    let DeviceImage {
+                        ino,
+                        file_id,
+                        gen,
+                        raw_len,
+                        slot,
+                        image,
+                    } = img;
+                    // The one landing primitive the shared pack uses too.
+                    match self.land_tenant(tenant, ino, image, slot).await {
+                        Ok(LandedImage { block_key, site }) => tenants.push((
+                            i,
+                            PreparedDevicePromotion {
+                                ino,
+                                file_id,
+                                gen,
+                                raw_len,
+                                block_key,
+                                site,
+                            },
+                        )),
+                        Err(e) => results[i] = Some(Err(e)),
+                    }
+                }
+                None => {
+                    // This pack is full: it closes here; the tenant heads
+                    // the next one.
+                    if let Some(done) = current.take() {
+                        packs.push(done);
+                    }
+                    queue.push_front((i, img));
+                }
+            }
+        }
+        if let Some(done) = current.take() {
+            packs.push(done);
+        }
+        let mut split_retry = Vec::new();
+        for (pack, tenants) in packs {
+            match self.commit_pack_group(items, &pack, tenants, results).await {
+                PackGroupFate::Done => {}
+                PackGroupFate::Unavailable(idxs) => {
+                    latch_pack_group_endpoint(endpoint);
+                    for i in idxs {
+                        METRICS
+                            .pack_cowriter_group_refusals
+                            .fetch_add(1, Ordering::Relaxed);
+                        results[i] = Some(self.promote_item_own_block(&items[i]).await);
+                    }
+                }
+                PackGroupFate::Split(idxs) => {
+                    if allow_split_retry {
+                        split_retry.extend(idxs);
+                    } else {
+                        for i in idxs {
+                            METRICS
+                                .pack_cowriter_group_splits
+                                .fetch_add(1, Ordering::Relaxed);
+                            results[i] = Some(self.promote_item_own_block(&items[i]).await);
+                        }
+                    }
+                }
+            }
+        }
+        split_retry
+    }
+
+    /// **`commit_group`** for one private pack (design-small-file-packing
+    /// §5.2/§5.6, KD-10): the tenants' 3.5 guards as ONE canonical
+    /// acquisition ([`meta_lock_acquire_many`]), every tenant re-checked and
+    /// its layout STAGED under them by the save body's `stage` half (no RAM
+    /// entry published — the FIFO argument's one line), the N calls shipped
+    /// as ONE `pack_group` frame, every reply `finish`ed (the RAM publish,
+    /// the displaced older copy's purge, the ring-entry release — leg 5,
+    /// inside the guarded section), then — after the guards drop — the
+    /// displaced keys freed and every uncommitted tenant's reference
+    /// released (RES-1), the pre-seal seam, and the SEAL with the frame's
+    /// typed outcome class. A frame-level UNAVAILABLE / SPLIT refusal hands
+    /// every tenant back to the driver.
+    async fn commit_pack_group(
+        &self,
+        items: &[StagedPromotionItem],
+        pack: &std::sync::Arc<crate::pack::OpenPack>,
+        tenants: Vec<(usize, PreparedDevicePromotion)>,
+        results: &mut [Option<Result<Option<PromotedInto>>>],
+    ) -> PackGroupFate {
+        let nvme = &self.cache.nvme;
+        let mut fate = PackGroupFate::Done;
+        let mut outcome = crate::block_allocator::PackPublishOutcome::Known;
+        // RES-1: displaced keys and refused tenants' references leave the
+        // guarded section and settle after it.
+        let mut deferred: Vec<String> = Vec::new();
+        let mut give_back: Vec<crate::pack::PackTenant> = Vec::new();
+        let mut staged: Vec<StagedTenant> = Vec::with_capacity(tenants.len());
+        // Per staged tenant: its layout committed (the reference is the
+        // layout's now; everything else gives its reference back).
+        let mut committed: Vec<bool> = Vec::new();
+        let guards = if tenants.is_empty() {
+            Vec::new()
+        } else {
+            let inos: Vec<u64> = tenants.iter().map(|(_, t)| t.ino).collect();
+            let guards = meta_lock_acquire_many(&inos).await;
+            pack_trace(|| PackTrace::GuardsHeld {
+                stripes: guards.len(),
+            });
+            // Re-check + compose every tenant's layout under the guards.
+            for (i, prepared) in tenants {
+                let ino = prepared.ino;
+                let fid = prepared.file_id.as_str();
+                let current = match self.metadata_cache.get(&ino) {
+                    Some(m) => Some(m),
+                    None => match self.fetch_metadata_from_backend(ino).await {
+                        Ok(m) => m,
+                        Err(e) => {
+                            results[i] = Some(Err(e));
+                            give_back.extend(prepared.into_pack_tenant());
+                            continue;
+                        }
+                    },
+                };
+                let Some(current) = current else {
+                    results[i] = Some(Ok(None));
+                    give_back.extend(prepared.into_pack_tenant());
+                    continue;
+                };
+                if current.file_type != "staged"
+                    || current.file_id.as_deref() != Some(fid)
+                    || nvme.staged_generation(fid).await != Some(prepared.gen)
+                {
+                    results[i] = Some(Ok(None));
+                    give_back.extend(prepared.into_pack_tenant());
+                    continue;
+                }
+                let mut updated = current.clone();
+                let mut block_map = updated.block_map.take().unwrap_or_default();
+                let displaced =
+                    std::sync::Arc::make_mut(&mut block_map).insert(0, prepared.block_key.clone());
+                updated.block_map = Some(block_map);
+                updated.size = updated.size.max(prepared.raw_len as u64);
+                updated.layout_dirty = false;
+                updated.cached_at = std::time::Instant::now();
+                let refs = self.block_ref_ops_for_map_swap(
+                    ino,
+                    current.block_map.as_deref(),
+                    updated.block_map.as_deref(),
+                );
+                staged.push(StagedTenant {
+                    i,
+                    prepared,
+                    updated,
+                    refs,
+                    displaced,
+                });
+            }
+            committed = vec![false; staged.len()];
+            // `stage` × N — nothing here touches the RAM layout cache.
+            let mut pendings: Vec<Option<Box<PendingLayoutSave<'_>>>> =
+                Vec::with_capacity(staged.len());
+            for t in &staged {
+                let token = items[t.i].fencing_token;
+                match self
+                    .stage_layout_save(t.prepared.ino, &t.updated, token, None, &t.refs)
+                    .await
+                {
+                    Ok(StagedLayoutSave::Pending(p)) => pendings.push(Some(p)),
+                    Ok(StagedLayoutSave::Done(_)) => {
+                        // The kvmap train served the save whole — committed
+                        // (unreachable for a one-mapping staged file).
+                        pendings.push(None);
+                        committed[pendings.len() - 1] = true;
+                    }
+                    Err(e) => {
+                        pendings.push(None);
+                        results[t.i] = Some(Err(e));
+                    }
+                }
+            }
+            // `ship_group`: the pending saves as ONE frame.
+            let mut group_items = Vec::new();
+            let mut group_k: Vec<usize> = Vec::new();
+            let mut refills: Vec<Vec<crate::meta_backend::kv::block_refs::BlockRefOp>> = Vec::new();
+            for (k, p) in pendings.iter_mut().enumerate() {
+                if let Some(p) = p.as_mut() {
+                    debug_assert!(
+                        p.delta.is_none(),
+                        "a promotion save is never delta-eligible (publish_entries = None)"
+                    );
+                    let refs = std::mem::take(&mut p.refs);
+                    refills.push(refs.clone());
+                    group_items.push(crate::meta_ship::publish::PackGroupItem {
+                        ino: p.ino,
+                        layout: std::mem::take(&mut p.bytes),
+                        size: p.m.size,
+                        refs,
+                    });
+                    group_k.push(k);
+                }
+            }
+            let shipped: Result<Vec<Result<crate::meta_ship::publish::OwnerVerdict>>> =
+                if group_items.is_empty() {
+                    Ok(Vec::new())
+                } else {
+                    match self.inner.meta_backend.get() {
+                        None => Err(SqueezefsError::InvalidOperation(
+                            "Metadata backend not initialized".to_string(),
+                        )),
+                        Some(backend) => {
+                            pack_trace(|| PackTrace::FrameDeparture {
+                                pack: pack.seq(),
+                                base_key: pack.base_key.clone(),
+                                inos: group_items.iter().map(|g| g.ino).collect(),
+                            });
+                            METRICS.pack_cowriter_frames.fetch_add(1, Ordering::Relaxed);
+                            crate::meta_ship::publish::set_layout_and_size_pack_group(
+                                backend,
+                                group_items,
+                            )
+                            .await
+                        }
+                    }
+                };
+            let t_commit = std::time::Instant::now();
+            // `finish` × N under the still-held guards.
+            match shipped {
+                Ok(verdicts) => {
+                    for ((k, refill), verdict) in group_k.into_iter().zip(refills).zip(verdicts) {
+                        let t = &staged[k];
+                        let Some(pending) = pendings[k].take() else {
+                            continue;
+                        };
+                        match verdict {
+                            Ok(v) => {
+                                self.retire_recomputed_parked(t.prepared.ino, &v.freed);
+                                let shipped_save = ShippedLayoutSave {
+                                    delta_used: false,
+                                    minted_version: pending.minted_version,
+                                    owner_recomputed: v.recomputed,
+                                    local_released: Vec::new(),
+                                    t_commit,
+                                };
+                                let _ = self.finish_layout_save(*pending, shipped_save).await;
+                                committed[k] = true;
+                            }
+                            Err(e) => {
+                                // The never-lossy refill (the drained notes
+                                // stay owed) MINUS this promotion's own ops:
+                                // its block is abandoned and no map names it.
+                                self.note_block_ref_ops(t.prepared.ino, refill);
+                                self.retract_block_ref_ops(t.prepared.ino, &t.refs);
+                                self.reset_layout_provenance(t.prepared.ino);
+                                results[t.i] = Some(Err(e));
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    for (k, refill) in group_k.into_iter().zip(refills) {
+                        let t = &staged[k];
+                        pendings[k] = None;
+                        self.note_block_ref_ops(t.prepared.ino, refill);
+                        self.retract_block_ref_ops(t.prepared.ino, &t.refs);
+                        self.reset_layout_provenance(t.prepared.ino);
+                    }
+                    let handed_back: Vec<usize> = staged.iter().map(|t| t.i).collect();
+                    // PK4: outcome-class arms begin
+                    match &e {
+                        SqueezefsError::PublishFailure {
+                            class: crate::error::PublishFailureClass::FrameRefused(status),
+                            ..
+                        } if *status
+                            == crate::meta_ship::publish::PUBLISH_PACK_GROUP_UNAVAILABLE =>
+                        {
+                            fate = PackGroupFate::Unavailable(handed_back);
+                        }
+                        SqueezefsError::PublishFailure {
+                            class: crate::error::PublishFailureClass::FrameRefused(status),
+                            ..
+                        } if *status == crate::meta_ship::publish::PUBLISH_PACK_GROUP_SPLIT => {
+                            fate = PackGroupFate::Split(handed_back);
+                        }
+                        SqueezefsError::PublishFailure { class, msg } => {
+                            if *class == crate::error::PublishFailureClass::TransportOutcomeUnknown
+                            {
+                                outcome = crate::block_allocator::PackPublishOutcome::Unknown;
+                            }
+                            for i in handed_back {
+                                results[i] = Some(Err(SqueezefsError::PublishFailure {
+                                    class: *class,
+                                    msg: msg.clone(),
+                                }));
+                            }
+                        }
+                        // PK4: outcome-class arms end
+                        other => {
+                            for i in handed_back {
+                                results[i] = Some(Err(SqueezefsError::InvalidOperation(format!(
+                                    "packing: the pack group's publish failed: {other}"
+                                ))));
+                            }
+                        }
+                    }
+                }
+            }
+            // The committed tenants' post-actions: the displaced older
+            // copy's purge (its free after the guards), the ring-entry
+            // release INSIDE the guarded section (leg 5), the ledger rows.
+            for (k, t) in staged.iter().enumerate() {
+                if !committed[k] {
+                    continue;
+                }
+                if let Some(prev) = t.displaced.as_ref() {
+                    if *prev != t.prepared.block_key {
+                        self.cache.purge_block_key(prev);
+                        deferred.push(prev.clone());
+                    }
+                }
+                let _ = nvme
+                    .remove_staged_if_generation_async(t.prepared.file_id.clone(), t.prepared.gen)
+                    .await;
+                self.note_landed_tenant_committed(&t.prepared.site);
+                results[t.i] = Some(Ok(Some(PromotedInto::Packed)));
+            }
+            drop(pendings);
+            guards
+        };
+        // RES-1: the guards drop with the section; every release below runs
+        // with none held.
+        drop(guards);
+        pack_trace(|| PackTrace::GuardsDropped);
+        self.free_deferred_keys(deferred).await;
+        let committed_n = committed.iter().filter(|c| **c).count() as u64;
+        for (k, t) in staged.into_iter().enumerate() {
+            if committed[k] {
+                // The layout owns the reference; the in-flight registration
+                // drops with the handle here, after the publish is visible.
+                drop(t.prepared);
+            } else {
+                give_back.extend(t.prepared.into_pack_tenant());
+            }
+        }
+        for tenant in give_back {
+            self.release_pack_tenant_reference(tenant).await;
+        }
+        if committed_n > 0 {
+            METRICS.pack_batch_frames.fetch_add(1, Ordering::Relaxed);
+            METRICS
+                .pack_batch_tenants
+                .fetch_add(committed_n, Ordering::Relaxed);
+        }
+        if let Some(hook) = PACK_PRE_SEAL_HOOK.load_full() {
+            (*hook)(pack.base_key.clone()).await;
+        }
+        pack_trace(|| PackTrace::PinRelease {
+            base_key: pack.base_key.clone(),
+        });
+        self.packer
+            .seal_private(&self.backend_router, pack, outcome)
+            .await;
+        fate
+    }
+
     /// The `commit` half of [`Self::promote_staged_file`]: the layout
     /// commit under the ino's `INODE_META_LOCKS` guard (3.5) with the
     /// staged identity + generation re-checked under it, the durable
@@ -14545,13 +15504,13 @@ impl DataRouter {
             block_key,
             site,
         } = match prepared {
-            PreparedPromotion::Inline {
+            PreparedPromotion::Inline(InlinePromotion {
                 file_path,
                 ino,
                 file_id,
                 gen,
                 raw,
-            } => {
+            }) => {
                 return self
                     .promote_staged_file_inline(&file_path, ino, &file_id, gen, raw, fencing_token)
                     .await;
@@ -14624,8 +15583,16 @@ impl DataRouter {
                 current.block_map.as_deref(),
                 updated.block_map.as_deref(),
             );
-            self.save_metadata_to_backend_refs(ino, &updated, fencing_token, &refs)
-                .await?;
+            if let Err(e) = self
+                .save_metadata_to_backend_refs(ino, &updated, fencing_token, &refs)
+                .await
+            {
+                // The save's never-lossy refill re-noted this promotion's
+                // own ops; the block is abandoned below and no map names
+                // it, so they come back out (PK4 — see the retraction).
+                self.retract_block_ref_ops(ino, &refs);
+                return Err(e);
+            }
             self.publish_layout_cache_entry(ino, updated);
             if let Some(prev) = displaced {
                 if prev != block_key {
@@ -14683,7 +15650,16 @@ impl DataRouter {
                 Ok(Some(into))
             }
             outcome => {
-                self.release_landed_site(site).await;
+                // FIND-PK-4 (design-small-file-packing §5.3): the block
+                // arm's never-published offset is recycled into a
+                // co-writer's lane only when the shipped save's outcome is
+                // KNOWN (`pack_publish_outcome`); the packed arm's tenant
+                // reference releases either way.
+                let publish_outcome = match &outcome {
+                    Err(e) => pack_publish_outcome(e),
+                    Ok(_) => crate::block_allocator::PackPublishOutcome::Known,
+                };
+                self.release_landed_site(site, publish_outcome).await;
                 outcome
             }
         }
@@ -20470,7 +21446,11 @@ impl DataRouter {
                     // arm's reclaim enqueue parks at the cap) — never under
                     // the 3.5 guard.
                     drop(meta_guard);
-                    self.release_landed_site(site).await;
+                    self.release_landed_site(
+                        site,
+                        crate::block_allocator::PackPublishOutcome::Known,
+                    )
+                    .await;
                     return Ok(false);
                 }
                 let mut block_map = std::collections::HashMap::new();
@@ -20496,10 +21476,14 @@ impl DataRouter {
                     .save_metadata_to_backend_refs(ino, &updated_meta, merge_token, &refs)
                     .await
                 {
-                    // The mapping never took the layout: release the landing
-                    // after the guard (RES-1).
+                    // The mapping never took the layout: the save's refill
+                    // re-noted this spill's own ops, which no map names
+                    // (PK4's retraction); release the landing after the
+                    // guard (RES-1), keyed on the publish outcome class.
+                    self.retract_block_ref_ops(ino, &refs);
                     drop(meta_guard);
-                    self.release_landed_site(site).await;
+                    self.release_landed_site(site, pack_publish_outcome(&e))
+                        .await;
                     return Err(e);
                 }
                 self.publish_layout_cache_entry(ino, updated_meta);
@@ -21012,7 +21996,13 @@ impl DataRouter {
         // derivation). No 3.5 guard is held here.
         match (&saved, spill_site.take()) {
             (Ok(_), Some(site)) => self.note_landed_tenant_committed(&site),
-            (Err(_), Some(site)) => self.release_landed_site(site).await,
+            (Err(e), Some(site)) => {
+                // The failed save's refill re-noted the clone's own ops,
+                // which no dest map names (PK4's retraction).
+                self.retract_block_ref_ops(dest_ino, &clone_refs);
+                self.release_landed_site(site, pack_publish_outcome(e))
+                    .await;
+            }
             (_, None) => {}
         }
         saved?;
@@ -21611,7 +22601,11 @@ impl DataRouter {
                     // promotion won, or the mapping was pruned): release
                     // its site — after the guard (RES-1).
                     Some(DurableClip::Image { landed, .. }) => {
-                        self.release_landed_site(landed.site).await;
+                        self.release_landed_site(
+                            landed.site,
+                            crate::block_allocator::PackPublishOutcome::Known,
+                        )
+                        .await;
                     }
                     _ => {}
                 }
@@ -21619,7 +22613,8 @@ impl DataRouter {
             }
             Err(e) => {
                 if let Some(DurableClip::Image { landed, .. }) = clip {
-                    self.release_landed_site(landed.site).await;
+                    self.release_landed_site(landed.site, pack_publish_outcome(&e))
+                        .await;
                 }
                 Err(e)
             }

@@ -4002,6 +4002,29 @@ impl BlockAllocator {
         self.free_block(offset).await
     }
 
+    /// [`Self::abandon_unpublished_offset`] keyed on the publish OUTCOME
+    /// class (design-small-file-packing §5.3, FIND-PK-4 — PK4): a
+    /// never-published offset whose shipped publish had a KNOWN outcome
+    /// (refused, or never sent) takes the lane recycle; one whose transport
+    /// failed against an owner that MAY have applied it (`Unknown`) is
+    /// abandoned WITHOUT recycle — durable layouts may name it there, and
+    /// recycling it into this lane would mint a double owner. On every
+    /// posture but a live co-writer's the class is moot (the free is local).
+    pub async fn abandon_unpublished_offset_with(
+        &self,
+        offset: u64,
+        outcome: PackPublishOutcome,
+    ) -> Result<()> {
+        if outcome == PackPublishOutcome::Unknown
+            && crate::fuse_client::co_writer_mount()
+            && !crate::cowriter::authority_accounting_scope_active()
+        {
+            self.abandon_without_recycle(offset);
+            return Ok(());
+        }
+        self.abandon_unpublished_offset(offset).await
+    }
+
     /// The quiet leak-safe abandon arm of [`Self::abandon_unpublished_offset`]
     /// WITHOUT the finding-15 lane recycle: the private entry is dropped,
     /// the word left unstable, and the offset stays out of every local
@@ -4051,8 +4074,9 @@ impl BlockAllocator {
     ///   (the last committed tenant's shipped `Freed` already ran
     ///   `retire_shipped_free_tracking` — the authority owns the offset
     ///   now, and a terminal arm here would hand it to this lane a SECOND
-    ///   time). PK2's co-writer posture never packs (PK4 lands the batch
-    ///   pack); these arms are exercised directly.
+    ///   time). The co-writer's batch-scoped pack (PK4,
+    ///   `DataRouter::promote_staged_batch`) seals through these arms at
+    ///   its frame reply with the frame's typed outcome class.
     /// * a **reader** promotes nothing and never reaches this.
     pub async fn release_pack_reference(
         &self,
@@ -4622,9 +4646,10 @@ pub(crate) struct LayoutWalkSummary {
 /// reference releases (design-small-file-packing §5.3): an authority's
 /// commit is local — always `Known`; on a co-writer a shipped commit
 /// whose transport failed past the resend ladder against an owner that
-/// MAY have applied it is `Unknown` (FIND-PK-4 — PK4 lands the typed
-/// publish outcome that mints it), and the terminal arm then abandons
-/// WITHOUT the lane recycle.
+/// MAY have applied it is `Unknown` (FIND-PK-4 — minted from the typed
+/// publish outcome `PublishFailureClass::TransportOutcomeUnknown`, never
+/// from a message string), and the terminal arm then abandons WITHOUT
+/// the lane recycle.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PackPublishOutcome {
     Known,

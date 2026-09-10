@@ -75,7 +75,7 @@
 use fuse3::raw::prelude::Filesystem;
 use fuse3::raw::Request;
 use squeezefs::alloc_lane_grant::{self as grant, LaneFloor};
-use squeezefs::block_allocator::{BlockAllocator, CHUNK_SIZE};
+use squeezefs::block_allocator::BlockAllocator;
 use squeezefs::cache::TieredCache;
 use squeezefs::cluster_wire as cw;
 use squeezefs::cowriter;
@@ -95,7 +95,7 @@ use squeezefs::meta_backend::kv::block_refs::{volume_tag, BlockRef, BlockRefOp};
 use squeezefs::meta_backend::kv::builder::{format_v3_stamped, FormatV3Options};
 use squeezefs::meta_backend::kv::superblock as sb;
 use squeezefs::meta_backend::kv::{META_CONVEYOR_GROUP_COMMITS, META_CONVEYOR_GROUP_TXS};
-use squeezefs::meta_backend::{plan_meta_slot_set, RoutedMetaBackend};
+use squeezefs::meta_backend::{plan_meta_slot_set, Metadata as _, RoutedMetaBackend};
 use squeezefs::meta_ship::{self as ship, publish, OwnerMap, PeerOwner};
 use squeezefs::nvme_dev::NvmeBlockDev;
 use squeezefs::routing::{
@@ -152,7 +152,7 @@ impl Drop for Restore {
         routing::test_arm_pack_trace(false);
         routing::test_install_pack_pre_seal_hook(None);
         publish::test_install_pack_group_serve_hook(None);
-        publish::TEST_PACK_GROUP_LOSE_REPLIES.store(0, Ordering::Relaxed);
+        publish::TEST_LOSE_LAYOUT_PUBLISH_REPLIES.store(0, Ordering::Relaxed);
         std::env::remove_var(publish::CONVEYOR_GROUP_ENV);
         std::env::remove_var(squeezefs::meta_ship::router::BATCH_MAX_ENV);
         lane::test_reset_mount_partition();
@@ -168,6 +168,7 @@ impl Drop for Restore {
         publish::uninstall_served_layout_invalidation();
         publish::uninstall_served_displacement_sink();
         ship::disarm_ownership();
+        ship::uninstall_daemon_verb_router();
         ship::tokens::TEST_DELEGATION_OVERRIDE.store(0, Ordering::SeqCst);
         data_custody::test_reset_custody_generation();
         data_custody::test_clear_poison();
@@ -383,7 +384,9 @@ fn install_member_grant(pack_group_available: bool) {
 
 struct Authority {
     listeners: Vec<Arc<cw::RpcListener>>,
-    owner: Arc<WriteCustodyOwner>,
+    /// Held: the custody authority lives as long as the rig (the lane
+    /// assignment and the lease epochs the co-writer presents are its).
+    _owner: Arc<WriteCustodyOwner>,
     meta: Arc<RoutedMetaBackend>,
     endpoints: Vec<String>,
     alloc: Arc<BlockAllocator>,
@@ -455,10 +458,14 @@ impl Authority {
             &br,
         )));
 
-        let router = Arc::new(
+        // ONE listener carrying the S8 metadata block (the co-writer's
+        // creates/unlinks ship through it) beside custody + publish —
+        // `arm_multi_writer`'s composition.
+        let router: Arc<dyn cw::RpcAsyncService> = Arc::new(
             data_grant::AsyncVerbRouter::new()
                 .with_custody(Arc::clone(&owner))
-                .with_publish(publish::PublishService::new(Arc::clone(&meta))),
+                .with_publish(publish::PublishService::new(Arc::clone(&meta)))
+                .with_meta(ship::MetaShipService::new(Arc::clone(&meta))),
         );
         let mut listeners = Vec::with_capacity(endpoints);
         let mut eps = Vec::with_capacity(endpoints);
@@ -478,12 +485,31 @@ impl Authority {
         }
         Authority {
             listeners,
-            owner,
+            _owner: owner,
             meta,
             endpoints: eps,
             alloc,
             br,
         }
+    }
+
+    /// Create empty regular files ON THE AUTHORITY, before the co-writer
+    /// arms the process's ownership map: the authority's round-robin mint
+    /// spreads them across the set's meta volumes (`pick_mint_volume` —
+    /// which, in this one-process venue, sees the CO-WRITER's all-foreign
+    /// map once armed and turns parent-sticky). Returns the inos.
+    async fn pre_create(&self, names: &[String]) -> Vec<u64> {
+        let mut inos = Vec::with_capacity(names.len());
+        for name in names {
+            inos.push(
+                self.meta
+                    .create_with_rdev(1, name, libc::S_IFREG | 0o644, 0, 0, 0)
+                    .await
+                    .unwrap_or_else(|e| panic!("authority create {name}: {e:?}"))
+                    .ino,
+            );
+        }
+        inos
     }
 
     /// The durable reference population of one block.
@@ -537,7 +563,7 @@ impl CoWriter {
                 (
                     v,
                     PeerOwner::new(
-                        &format!("mw-authority-{}", v % auth.endpoints.len()),
+                        format!("mw-authority-{}", v % auth.endpoints.len()),
                         auth.endpoints[v % auth.endpoints.len()].clone(),
                     ),
                 )
@@ -545,6 +571,13 @@ impl CoWriter {
             .collect();
         let map = OwnerMap::for_volumes(&meta, owners).expect("an all-foreign owner map");
         ship::arm_ownership(map);
+        // `cowriter::arm`'s S8 half: the daemon verb router over the
+        // co-writer's own backend (its creates / unlinks / destroys SHIP).
+        ship::install_daemon_verb_router(ship::MetaShipRouter::new(
+            Arc::clone(&meta),
+            node_id,
+            SECRET.to_vec(),
+        ));
         publish::install_client(publish::PublishClient::new(node_id, SECRET.to_vec()));
         let client = WriteCustodyClient::connect(&auth.endpoints[0], SECRET, node_id)
             .await
@@ -605,6 +638,13 @@ impl CoWriter {
     /// ring, no map): returns `(ino, file_id)`.
     async fn staged_file(&self, name: &str, len: usize, tag: usize) -> (u64, String) {
         let ino = self.create(name).await;
+        let fid = self.stage_into(ino, len, tag).await;
+        (ino, fid)
+    }
+
+    /// Stage `len` bytes into an existing (empty) ino through the
+    /// production write path: returns its `file_id`.
+    async fn stage_into(&self, ino: u64, len: usize, tag: usize) -> String {
         let written = self
             .fs
             .write(
@@ -617,7 +657,7 @@ impl CoWriter {
                 0,
             )
             .await
-            .unwrap_or_else(|e| panic!("write {name} failed: {e:?}"))
+            .unwrap_or_else(|e| panic!("write ino {ino} failed: {e:?}"))
             .written;
         assert_eq!(written as usize, len, "short write");
         let m = self.fs.router.metadata_cache.get(&ino).expect("RAM layout");
@@ -627,7 +667,7 @@ impl CoWriter {
             self.fs.router.cache.nvme.read_staged(&fid).is_some(),
             "fixture premise: ring-resident"
         );
-        (ino, fid)
+        fid
     }
 
     fn item(&self, ino: u64, fid: &str) -> StagedPromotionItem {
@@ -822,28 +862,48 @@ fn frames(trace: &[PackTrace]) -> Vec<(String, Vec<u64>)> {
     trace
         .iter()
         .filter_map(|t| match t {
-            PackTrace::FrameDeparture { base_key, inos } => Some((base_key.clone(), inos.clone())),
+            PackTrace::FrameDeparture { base_key, inos, .. } => {
+                Some((base_key.clone(), inos.clone()))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// The frame departures keyed by pack LIFETIME: `(pack seq, base key)`.
+fn frame_packs(trace: &[PackTrace]) -> Vec<(u64, String)> {
+    trace
+        .iter()
+        .filter_map(|t| match t {
+            PackTrace::FrameDeparture { pack, base_key, .. } => Some((*pack, base_key.clone())),
             _ => None,
         })
         .collect()
 }
 
 /// KD-4's invariant over a trace: no two frame departures name one pack
-/// base, and no DMA on a base follows a frame naming it.
+/// LIFETIME (a recycled offset re-opened as a fresh pack is a new one —
+/// these fixture keys carry no incarnation stamp, so the open sequence is
+/// the identity), and no DMA into a pack follows a frame naming it.
 fn assert_frame_invariants(trace: &[PackTrace]) {
-    let mut named: BTreeSet<String> = BTreeSet::new();
+    let mut named: BTreeSet<u64> = BTreeSet::new();
     for t in trace {
         match t {
-            PackTrace::FrameDeparture { base_key, .. } => {
+            PackTrace::FrameDeparture { pack, base_key, .. } => {
                 assert!(
-                    named.insert(base_key.clone()),
-                    "pack base {base_key} named by a SECOND pack_group frame — KD-4's invariant"
+                    named.insert(*pack),
+                    "pack {pack} ({base_key}) named by a SECOND pack_group frame — KD-4's \
+                     invariant"
                 );
             }
-            PackTrace::Dma { base_key, ino } => {
+            PackTrace::Dma {
+                pack,
+                base_key,
+                ino,
+            } => {
                 assert!(
-                    !named.contains(base_key),
-                    "DMA of ino {ino} into {base_key} AFTER a frame named that base — \
+                    !named.contains(pack),
+                    "DMA of ino {ino} into pack {pack} ({base_key}) AFTER a frame named it — \
                      DMA-before-publish broken"
                 );
             }
@@ -863,14 +923,12 @@ fn assert_stage_never_publishes_ram(trace: &[PackTrace]) {
                 dma_seen.insert(*ino);
             }
             PackTrace::FrameDeparture { inos, .. } => departed.extend(inos.iter().copied()),
-            PackTrace::RamPublish { ino } => {
-                if dma_seen.contains(ino) {
-                    assert!(
-                        departed.contains(ino),
-                        "tenant ino {ino}'s RAM layout entry published BEFORE its frame \
-                         departed — `stage` published what only `finish` may"
-                    );
-                }
+            PackTrace::RamPublish { ino } if dma_seen.contains(ino) => {
+                assert!(
+                    departed.contains(ino),
+                    "tenant ino {ino}'s RAM layout entry published BEFORE its frame departed — \
+                     `stage` published what only `finish` may"
+                );
             }
             _ => {}
         }
@@ -884,7 +942,10 @@ fn assert_guard_discipline(trace: &[PackTrace], cap: usize) {
     for t in trace {
         match t {
             PackTrace::GuardsHeld { stripes } => {
-                assert!(*stripes <= cap, "{stripes} 3.5 guards held > frame cap {cap}");
+                assert!(
+                    *stripes <= cap,
+                    "{stripes} 3.5 guards held > frame cap {cap}"
+                );
                 held = true;
             }
             PackTrace::GuardsDropped => held = false,
@@ -908,19 +969,37 @@ struct Rig {
 }
 
 async fn rig(tag: &str, volumes: usize, endpoints: usize, pack_group_available: bool) -> Rig {
+    rig_with_files(tag, volumes, endpoints, pack_group_available, &[])
+        .await
+        .0
+}
+
+/// [`rig`] with `names` pre-created on the authority (spread across the
+/// volumes) before the co-writer joins; returns their inos beside the rig.
+async fn rig_with_files(
+    tag: &str,
+    volumes: usize,
+    endpoints: usize,
+    pack_group_available: bool,
+    names: &[String],
+) -> (Rig, Vec<u64>) {
     let dir = TempDir::new().unwrap();
     let vols = fresh_set(dir.path(), tag, volumes).await;
     let dev = data_device(dir.path(), &format!("{tag}.dev"));
     let auth = Authority::start(&vols, &dev, &[NODE_A], endpoints).await;
+    let inos = auth.pre_create(names).await;
     let cwr = CoWriter::join(&auth, &vols, &dev, NODE_A).await;
     install_member_grant(pack_group_available);
     arm_levers();
-    Rig {
-        auth,
-        cwr,
-        dev,
-        _dir: dir,
-    }
+    (
+        Rig {
+            auth,
+            cwr,
+            dev,
+            _dir: dir,
+        },
+        inos,
+    )
 }
 
 // ===========================================================================
@@ -956,8 +1035,10 @@ async fn a_co_writers_batch_packs_into_one_lane_block_as_one_frame() {
     let group_txs0 = META_CONVEYOR_GROUP_TXS.load(Ordering::Relaxed);
     routing::test_take_pack_trace();
 
-    let items: Vec<StagedPromotionItem> =
-        files.iter().map(|(ino, fid)| r.cwr.item(*ino, fid)).collect();
+    let items: Vec<StagedPromotionItem> = files
+        .iter()
+        .map(|(ino, fid)| r.cwr.item(*ino, fid))
+        .collect();
     let outcomes = r.cwr.fs.router.promote_staged_batch(items).await;
     for (i, out) in outcomes.iter().enumerate() {
         assert!(
@@ -993,7 +1074,11 @@ async fn a_co_writers_batch_packs_into_one_lane_block_as_one_frame() {
     let (base, off0, len0) = r.cwr.mapping(files[0].0);
     assert_eq!((off0, len0), (0, len));
     let idx = r.cwr.block_idx(&base);
-    assert_eq!(idx % writers, lane_id, "the pack block is in the co-writer's lane (b % W)");
+    assert_eq!(
+        idx % writers,
+        lane_id,
+        "the pack block is in the co-writer's lane (b % W)"
+    );
     let mut offs = BTreeSet::new();
     for (ino, fid) in &files {
         let (b, off, l) = r.cwr.mapping(*ino);
@@ -1006,7 +1091,11 @@ async fn a_co_writers_batch_packs_into_one_lane_block_as_one_frame() {
             "the ring entry released at the commit"
         );
     }
-    assert_eq!(r.auth.population(idx).await, N, "N tenants = N durable references");
+    assert_eq!(
+        r.auth.population(idx).await,
+        N,
+        "N tenants = N durable references"
+    );
     assert!(!r.auth.free_listed(idx));
     assert_eq!(
         r.cwr.alloc.refcount(idx * r.cwr.alloc.chunk_size()),
@@ -1033,13 +1122,20 @@ async fn a_co_writers_batch_packs_into_one_lane_block_as_one_frame() {
 
     // Contract 11: the co-writer is gone; the authority reads byte-exact.
     let Rig {
-        auth, cwr, dev, _dir,
+        auth,
+        cwr,
+        dev,
+        _dir,
     } = r;
     drop(cwr);
     let reader = authority_reader(&auth, &dev).await;
     for (i, (ino, _)) in files.iter().enumerate() {
         let got = reader.read(*ino, len).await;
-        assert_eq!(got, pattern(10 + i, len), "tenant {i} byte-exact from the authority");
+        assert_eq!(
+            got,
+            pattern(10 + i, len),
+            "tenant {i} byte-exact from the authority"
+        );
     }
     assert_eq!(metric(&METRICS.staged_payload_lost_reads), 0);
     auth.stop().await;
@@ -1058,15 +1154,23 @@ async fn a_co_writers_batch_packs_into_one_lane_block_as_one_frame() {
 async fn a_batch_partitions_by_home_meta_volume_one_group_per_pack() {
     let _serial = serial();
     let _restore = restore();
-    let r = rig("volumes", 2, 1, true).await;
     const N: usize = 8;
+    let names: Vec<String> = (0..N).map(|i| format!("v{i}.bin")).collect();
+    let (r, inos) = rig_with_files("volumes", 2, 1, true, &names).await;
     let len = 8 * KIB;
     let mut files = Vec::new();
-    for i in 0..N {
-        files.push(r.cwr.staged_file(&format!("v{i}.bin"), len, 20 + i).await);
+    for (i, ino) in inos.into_iter().enumerate() {
+        files.push((ino, r.cwr.stage_into(ino, len, 20 + i).await));
     }
-    let homes: BTreeSet<usize> = files.iter().map(|(ino, _)| r.cwr.meta.route_ino(*ino).0).collect();
-    assert_eq!(homes.len(), 2, "fixture premise: the population spans both volumes");
+    let homes: BTreeSet<usize> = files
+        .iter()
+        .map(|(ino, _)| r.cwr.meta.route_ino(*ino).0)
+        .collect();
+    assert_eq!(
+        homes.len(),
+        2,
+        "fixture premise: the population spans both volumes"
+    );
     let before = flat();
     let splits0 = metric(&METRICS.pack_batch_volume_splits);
     let frames0 = metric(&METRICS.pack_batch_frames);
@@ -1074,8 +1178,10 @@ async fn a_batch_partitions_by_home_meta_volume_one_group_per_pack() {
     let group_txs0 = META_CONVEYOR_GROUP_TXS.load(Ordering::Relaxed);
     routing::test_take_pack_trace();
 
-    let items: Vec<StagedPromotionItem> =
-        files.iter().map(|(ino, fid)| r.cwr.item(*ino, fid)).collect();
+    let items: Vec<StagedPromotionItem> = files
+        .iter()
+        .map(|(ino, fid)| r.cwr.item(*ino, fid))
+        .collect();
     for out in r.cwr.fs.router.promote_staged_batch(items).await {
         assert!(matches!(out, Ok(Some(PromotedInto::Packed))), "{out:?}");
     }
@@ -1084,7 +1190,11 @@ async fn a_batch_partitions_by_home_meta_volume_one_group_per_pack() {
         2,
         "the batch was split into two (owner, home volume) partitions"
     );
-    assert_eq!(metric(&METRICS.pack_batch_frames) - frames0, 2, "frames = packs");
+    assert_eq!(
+        metric(&METRICS.pack_batch_frames) - frames0,
+        2,
+        "frames = packs"
+    );
     assert_eq!(
         META_CONVEYOR_GROUP_COMMITS.load(Ordering::Relaxed) - groups0,
         2,
@@ -1105,7 +1215,11 @@ async fn a_batch_partitions_by_home_meta_volume_one_group_per_pack() {
     }
     assert_eq!(by_base.len(), 2, "two pack blocks");
     for (base, vols) in &by_base {
-        assert_eq!(vols.len(), 1, "pack {base} names tenants of one home volume only");
+        assert_eq!(
+            vols.len(),
+            1,
+            "pack {base} names tenants of one home volume only"
+        );
     }
     let trace = routing::test_take_pack_trace();
     assert_eq!(frames(&trace).len(), 2);
@@ -1126,7 +1240,11 @@ async fn a_partition_past_the_frame_cap_splits_into_successive_packs() {
     let _restore = restore();
     let _cap = EnvVarGuard::set(squeezefs::meta_ship::router::BATCH_MAX_ENV, "2");
     let r = rig("framecap", 1, 1, true).await;
-    assert_eq!(publish::pack_group_tenant_cap(), 2, "the cap derives from the frame cap");
+    assert_eq!(
+        publish::pack_group_tenant_cap(),
+        2,
+        "the cap derives from the frame cap"
+    );
     const N: usize = 5;
     let len = 8 * KIB;
     let mut files = Vec::new();
@@ -1136,13 +1254,23 @@ async fn a_partition_past_the_frame_cap_splits_into_successive_packs() {
     let frames0 = metric(&METRICS.pack_batch_frames);
     let sealed0 = metric(&METRICS.pack_blocks_sealed_batch);
     routing::test_take_pack_trace();
-    let items: Vec<StagedPromotionItem> =
-        files.iter().map(|(ino, fid)| r.cwr.item(*ino, fid)).collect();
+    let items: Vec<StagedPromotionItem> = files
+        .iter()
+        .map(|(ino, fid)| r.cwr.item(*ino, fid))
+        .collect();
     for out in r.cwr.fs.router.promote_staged_batch(items).await {
         assert!(matches!(out, Ok(Some(PromotedInto::Packed))), "{out:?}");
     }
-    assert_eq!(metric(&METRICS.pack_batch_frames) - frames0, 3, "⌈5/2⌉ frames");
-    assert_eq!(metric(&METRICS.pack_blocks_sealed_batch) - sealed0, 3, "each sealed");
+    assert_eq!(
+        metric(&METRICS.pack_batch_frames) - frames0,
+        3,
+        "⌈5/2⌉ frames"
+    );
+    assert_eq!(
+        metric(&METRICS.pack_blocks_sealed_batch) - sealed0,
+        3,
+        "each sealed"
+    );
     let bases: BTreeSet<String> = files.iter().map(|(ino, _)| r.cwr.mapping(*ino).0).collect();
     assert_eq!(bases.len(), 3, "three pack blocks");
     let trace = routing::test_take_pack_trace();
@@ -1164,17 +1292,29 @@ async fn a_partition_past_the_frame_cap_splits_into_successive_packs() {
 async fn a_batch_never_packs_tenants_of_two_owner_endpoints_together() {
     let _serial = serial();
     let _restore = restore();
-    let r = rig("owners", 2, 2, true).await;
     const N: usize = 6;
+    let names: Vec<String> = (0..N).map(|i| format!("o{i}.bin")).collect();
+    let (r, inos) = rig_with_files("owners", 2, 2, true, &names).await;
     let len = 8 * KIB;
     let mut files = Vec::new();
-    for i in 0..N {
-        files.push(r.cwr.staged_file(&format!("o{i}.bin"), len, 40 + i).await);
+    for (i, ino) in inos.into_iter().enumerate() {
+        files.push((ino, r.cwr.stage_into(ino, len, 40 + i).await));
     }
+    let homes: BTreeSet<usize> = files
+        .iter()
+        .map(|(ino, _)| r.cwr.meta.route_ino(*ino).0)
+        .collect();
+    assert_eq!(
+        homes.len(),
+        2,
+        "fixture premise: the population spans both volumes"
+    );
     let frames0 = metric(&METRICS.pack_batch_frames);
     routing::test_take_pack_trace();
-    let items: Vec<StagedPromotionItem> =
-        files.iter().map(|(ino, fid)| r.cwr.item(*ino, fid)).collect();
+    let items: Vec<StagedPromotionItem> = files
+        .iter()
+        .map(|(ino, fid)| r.cwr.item(*ino, fid))
+        .collect();
     for out in r.cwr.fs.router.promote_staged_batch(items).await {
         assert!(matches!(out, Ok(Some(PromotedInto::Packed))), "{out:?}");
     }
@@ -1183,12 +1323,19 @@ async fn a_batch_never_packs_tenants_of_two_owner_endpoints_together() {
     for (ino, _) in &files {
         let (base, _, _) = r.cwr.mapping(*ino);
         let v = r.cwr.meta.route_ino(*ino).0;
-        let ep = ship::owner_of_volume(v).expect("all-foreign").endpoint.clone();
+        let ep = ship::owner_of_volume(v)
+            .expect("all-foreign")
+            .endpoint
+            .clone();
         by_base.entry(base).or_default().insert(ep);
     }
     assert_eq!(by_base.len(), 2);
     for (base, eps) in &by_base {
-        assert_eq!(eps.len(), 1, "pack {base} names tenants of one owner endpoint only");
+        assert_eq!(
+            eps.len(),
+            1,
+            "pack {base} names tenants of one owner endpoint only"
+        );
     }
     assert_frame_invariants(&routing::test_take_pack_trace());
     let Rig { auth, cwr, .. } = r;
@@ -1241,7 +1388,11 @@ async fn a_tenant_deleted_before_the_seal_makes_the_release_a_counted_noop() {
         .router
         .promote_staged_batch(vec![r.cwr.item(ino, &fid)])
         .await;
-    assert!(matches!(out[0], Ok(Some(PromotedInto::Packed))), "{:?}", out[0]);
+    assert!(
+        matches!(out[0], Ok(Some(PromotedInto::Packed))),
+        "{:?}",
+        out[0]
+    );
     assert!(hook_ran.load(Ordering::SeqCst), "the pre-seal hook ran");
     routing::test_install_pack_pre_seal_hook(None);
     assert_eq!(
@@ -1277,15 +1428,25 @@ async fn a_tenant_deleted_before_the_seal_makes_the_release_a_counted_noop() {
         .router
         .promote_staged_batch(vec![r.cwr.item(a, &fa), r.cwr.item(b, &fb)])
         .await;
-    assert!(outs.iter().all(|o| matches!(o, Ok(Some(PromotedInto::Packed)))));
+    assert!(outs
+        .iter()
+        .all(|o| matches!(o, Ok(Some(PromotedInto::Packed)))));
     let (base2, _, _) = r.cwr.mapping(a);
     assert_eq!(r.cwr.mapping(b).0, base2, "one pack");
     let idx2 = r.cwr.block_idx(&base2);
     let refused1 = publish::stats().free_refused_blocks;
     r.cwr.unlink("pair_a.bin", a).await;
-    assert_eq!(r.auth.population(idx2).await, 1, "NonTerminal: the sibling's reference stays");
+    assert_eq!(
+        r.auth.population(idx2).await,
+        1,
+        "NonTerminal: the sibling's reference stays"
+    );
     assert!(!r.auth.free_listed(idx2));
-    assert_eq!(publish::stats().free_refused_blocks - refused1, 0, "free_refused_blocks = 0");
+    assert_eq!(
+        publish::stats().free_refused_blocks - refused1,
+        0,
+        "free_refused_blocks = 0"
+    );
     r.cwr.unlink("pair_b.bin", b).await;
     r.auth.br.reclaim_drain().await;
     assert_eq!(r.auth.population(idx2).await, 0, "Freed at population 0");
@@ -1304,7 +1465,7 @@ async fn a_tenant_deleted_before_the_seal_makes_the_release_a_counted_noop() {
         writers as u16,
         64,
         epoch,
-        cowriter::next_ship_request_id(),
+        0xF00D_0001,
     )
     .await
     .expect("the harvest ships");
@@ -1332,14 +1493,27 @@ async fn a_tenant_deleted_before_the_seal_makes_the_release_a_counted_noop() {
 async fn the_served_publish_screen_refuses_a_publish_adopting_a_released_block() {
     let _serial = serial();
     let _restore = restore();
-    let r = rig("screen", 1, 1, true).await;
-    // A block the authority minted and RELEASED: on its free list.
-    let off = r.auth.alloc.allocate_block().await.expect("mint");
-    let idx = off / r.auth.alloc.chunk_size();
-    r.auth.alloc.publish_block(off);
-    r.auth.br.free_block(&off.to_string()).await.expect("free");
-    r.auth.br.reclaim_drain().await;
-    assert!(r.auth.free_listed(idx), "fixture premise: free-listed");
+    // The authority first (the process posture is the writer's here): a
+    // block it minted and RELEASED — on its free list — then the co-writer.
+    let dir = TempDir::new().unwrap();
+    let vols = fresh_set(dir.path(), "screen", 1).await;
+    let dev = data_device(dir.path(), "screen.dev");
+    let auth = Authority::start(&vols, &dev, &[NODE_A], 1).await;
+    let off = auth.alloc.allocate_block().await.expect("mint");
+    let idx = off / auth.alloc.chunk_size();
+    auth.alloc.publish_block(off);
+    auth.br.free_block(&off.to_string()).await.expect("free");
+    auth.br.reclaim_drain().await;
+    assert!(auth.free_listed(idx), "fixture premise: free-listed");
+    let cwr = CoWriter::join(&auth, &vols, &dev, NODE_A).await;
+    install_member_grant(true);
+    arm_levers();
+    let r = Rig {
+        auth,
+        cwr,
+        dev,
+        _dir: dir,
+    };
 
     let ino = r.cwr.create("adopter.bin").await;
     let mut map = std::collections::HashMap::new();
@@ -1370,9 +1544,15 @@ async fn the_served_publish_screen_refuses_a_publish_adopting_a_released_block()
         ),
         other => panic!("expected the screen's refusal, got {other:?}"),
     }
-    assert_eq!(metric(&METRICS.served_publish_free_block_refusals) - refusals0, 1);
+    assert_eq!(
+        metric(&METRICS.served_publish_free_block_refusals) - refusals0,
+        1
+    );
     assert_eq!(r.auth.population(idx).await, 0, "nothing staged");
-    assert!(r.auth.free_listed(idx), "the block stays free — never re-claimed");
+    assert!(
+        r.auth.free_listed(idx),
+        "the block stays free — never re-claimed"
+    );
     let Rig { auth, cwr, .. } = r;
     drop(cwr);
     auth.stop().await;
@@ -1412,8 +1592,10 @@ async fn an_owner_on_the_control_arm_refuses_the_frame_and_the_co_writer_falls_b
     routing::test_take_pack_trace();
     {
         let _lever = EnvVarGuard::set(publish::CONVEYOR_GROUP_ENV, "0");
-        let items: Vec<StagedPromotionItem> =
-            files.iter().map(|(ino, fid)| r.cwr.item(*ino, fid)).collect();
+        let items: Vec<StagedPromotionItem> = files
+            .iter()
+            .map(|(ino, fid)| r.cwr.item(*ino, fid))
+            .collect();
         for out in r.cwr.fs.router.promote_staged_batch(items).await {
             assert!(
                 matches!(out, Ok(Some(PromotedInto::Block))),
@@ -1421,24 +1603,56 @@ async fn an_owner_on_the_control_arm_refuses_the_frame_and_the_co_writer_falls_b
             );
         }
     }
-    assert_eq!(metric(&METRICS.served_pack_group_unavailable) - unavailable0, 1);
-    assert_eq!(metric(&METRICS.pack_cowriter_group_refusals) - refusals0, N as u64);
-    assert_eq!(metric(&METRICS.cowriter_unpublished_recycles) - recycles0, 1);
+    assert_eq!(
+        metric(&METRICS.served_pack_group_unavailable) - unavailable0,
+        1
+    );
+    assert_eq!(
+        metric(&METRICS.pack_cowriter_group_refusals) - refusals0,
+        N as u64
+    );
+    assert_eq!(
+        metric(&METRICS.cowriter_unpublished_recycles) - recycles0,
+        1
+    );
     assert_eq!(metric(&METRICS.pack_blocks_abandoned) - abandoned0, 1);
     assert_eq!(metric(&METRICS.layout_promoted_block) - block0, N as u64);
     assert_eq!(metric(&METRICS.layout_promoted_packed) - packed0, 0);
     let trace = routing::test_take_pack_trace();
     let fr = frames(&trace);
-    assert_eq!(fr.len(), 1, "exactly one (refused) pack_group frame departed");
-    let abandoned_idx = r.cwr.block_idx(&fr[0].0);
-    assert!(
-        r.cwr.alloc.free_block_indices().contains(&abandoned_idx),
-        "the abandoned pack block is back on the co-writer's lane free list"
+    assert_eq!(
+        fr.len(),
+        1,
+        "exactly one (refused) pack_group frame departed"
     );
-    assert_eq!(r.auth.population(abandoned_idx).await, 0, "no layout ever named it");
+    // The abandoned pack block went back to the co-writer's lane free list
+    // (the KNOWN recycle) — where the fallback's own mints may have taken
+    // it again as a FRESH lifetime: either it is still free, or exactly one
+    // fallback file's own block IS it (population 1, `bk:0:len`).
+    let abandoned_idx = r.cwr.block_idx(&fr[0].0);
+    let mut fallback_blocks = Vec::new();
     for (ino, _) in &files {
-        let (_, off, _) = r.cwr.mapping(*ino);
+        let (base, off, _) = r.cwr.mapping(*ino);
         assert_eq!(off, 0, "one-block-per-file: bk:0:len");
+        fallback_blocks.push(r.cwr.block_idx(&base));
+    }
+    let reminted = fallback_blocks
+        .iter()
+        .filter(|b| **b == abandoned_idx)
+        .count();
+    if reminted == 0 {
+        assert!(
+            r.cwr.alloc.free_block_indices().contains(&abandoned_idx),
+            "the abandoned pack block is back on the co-writer's lane free list"
+        );
+        assert_eq!(
+            r.auth.population(abandoned_idx).await,
+            0,
+            "no layout ever named it"
+        );
+    } else {
+        assert_eq!(reminted, 1, "a recycled block is minted to ONE new owner");
+        assert_eq!(r.auth.population(abandoned_idx).await, 1);
     }
     assert_frame_invariants(&trace);
     assert_flat(&before);
@@ -1460,9 +1674,20 @@ async fn an_owner_on_the_control_arm_refuses_the_frame_and_the_co_writer_falls_b
         .router
         .promote_staged_batch(vec![r.cwr.item(g, &gf)])
         .await;
-    assert!(matches!(out[0], Ok(Some(PromotedInto::Block))), "{:?}", out[0]);
-    assert_eq!(metric(&METRICS.pack_cowriter_group_unavailable) - grant_unavail0, 1);
-    assert_eq!(metric(&METRICS.pack_cowriter_frames) - frames0, 0, "no frame shipped");
+    assert!(
+        matches!(out[0], Ok(Some(PromotedInto::Block))),
+        "{:?}",
+        out[0]
+    );
+    assert_eq!(
+        metric(&METRICS.pack_cowriter_group_unavailable) - grant_unavail0,
+        1
+    );
+    assert_eq!(
+        metric(&METRICS.pack_cowriter_frames) - frames0,
+        0,
+        "no frame shipped"
+    );
     let Rig { auth, cwr, .. } = r;
     drop(cwr);
     auth.stop().await;
@@ -1482,12 +1707,13 @@ async fn an_owner_on_the_control_arm_refuses_the_frame_and_the_co_writer_falls_b
 async fn a_slot_cutover_between_partition_and_serve_draws_split_and_re_prepares_once() {
     let _serial = serial();
     let _restore = restore();
-    let r = rig("split", 2, 1, true).await;
-    let len = 8 * KIB;
     const N: usize = 4;
+    let names: Vec<String> = (0..N).map(|i| format!("s{i}.bin")).collect();
+    let (r, inos) = rig_with_files("split", 2, 1, true, &names).await;
+    let len = 8 * KIB;
     let mut files = Vec::new();
-    for i in 0..N {
-        files.push(r.cwr.staged_file(&format!("s{i}.bin"), len, 80 + i).await);
+    for (i, ino) in inos.into_iter().enumerate() {
+        files.push((ino, r.cwr.stage_into(ino, len, 80 + i).await));
     }
     // The cutover: flip the FIRST tenant's slot onto the other volume on
     // the OWNER's table for the duration of the next pack_group serve (a
@@ -1525,37 +1751,55 @@ async fn a_slot_cutover_between_partition_and_serve_draws_split_and_re_prepares_
     let groups0 = META_CONVEYOR_GROUP_COMMITS.load(Ordering::Relaxed);
     routing::test_take_pack_trace();
 
-    let items: Vec<StagedPromotionItem> =
-        files.iter().map(|(ino, fid)| r.cwr.item(*ino, fid)).collect();
+    let items: Vec<StagedPromotionItem> = files
+        .iter()
+        .map(|(ino, fid)| r.cwr.item(*ino, fid))
+        .collect();
     for out in r.cwr.fs.router.promote_staged_batch(items).await {
         assert!(matches!(out, Ok(Some(PromotedInto::Packed))), "{out:?}");
     }
-    assert_eq!(metric(&METRICS.served_pack_group_splits) - splits0, 1, "one SPLIT refusal");
-    assert_eq!(metric(&METRICS.pack_cowriter_group_splits) - cw_splits0, 0, "no fallback");
+    assert_eq!(
+        metric(&METRICS.served_pack_group_splits) - splits0,
+        1,
+        "one SPLIT refusal"
+    );
+    assert_eq!(
+        metric(&METRICS.pack_cowriter_group_splits) - cw_splits0,
+        0,
+        "no fallback"
+    );
     assert_eq!(metric(&METRICS.layout_promoted_packed) - packed0, N as u64);
     let trace = routing::test_take_pack_trace();
     let fr = frames(&trace);
-    // The victim's home volume: the frame that carried it was refused, its
-    // pack abandoned; the retry frames (one per partition) landed.
-    let refused_base = fr[0].0.clone();
-    let abandoned = fr
-        .iter()
-        .filter(|(b, _)| *b == refused_base)
-        .count();
-    assert_eq!(abandoned, 1, "the refused pack's base is named by ONE frame only");
+    let packs = frame_packs(&trace);
+    // The first frame carried the victim and was refused; its pack was
+    // abandoned (the lane recycle) — the retry frames landed on FRESH packs
+    // (new lifetimes; the recycled offset may be one of them, re-minted).
+    let (refused_pack, refused_base) = packs[0].clone();
+    assert_eq!(
+        packs.iter().filter(|(p, _)| *p == refused_pack).count(),
+        1,
+        "the refused pack lifetime is named by ONE frame only"
+    );
     assert!(
         metric(&METRICS.pack_blocks_abandoned) - abandoned0 >= 1,
         "the refused pack was abandoned"
     );
     let refused_idx = r.cwr.block_idx(&refused_base);
-    assert!(
-        r.cwr.alloc.free_block_indices().contains(&refused_idx),
-        "X is back on the lane free list"
-    );
-    assert_eq!(r.auth.population(refused_idx).await, 0, "no layout names X");
-    for (ino, _) in &files {
-        let (base, _, _) = r.cwr.mapping(*ino);
-        assert_ne!(base, refused_base, "no tenant's layout names the refused block");
+    let reminted = packs[1..].iter().any(|(_, b)| *b == refused_base);
+    if !reminted {
+        assert!(
+            r.cwr.alloc.free_block_indices().contains(&refused_idx),
+            "X is back on the lane free list"
+        );
+        assert_eq!(r.auth.population(refused_idx).await, 0, "no layout names X");
+        for (ino, _) in &files {
+            let (base, _, _) = r.cwr.mapping(*ino);
+            assert_ne!(
+                base, refused_base,
+                "no tenant's layout names the refused block"
+            );
+        }
     }
     // Every tenant of the refused frame was DMA'd TWICE (fresh reservation,
     // fresh DMA) — once into X, once into its retry pack.
@@ -1592,8 +1836,10 @@ async fn a_slot_cutover_between_partition_and_serve_draws_split_and_re_prepares_
             .filter(|(ino, _)| auth_meta.slot_of_ino(*ino) as usize == victim_slot)
             .count();
         let cw_splits1 = metric(&METRICS.pack_cowriter_group_splits);
-        let items: Vec<StagedPromotionItem> =
-            second.iter().map(|(ino, fid)| r.cwr.item(*ino, fid)).collect();
+        let items: Vec<StagedPromotionItem> = second
+            .iter()
+            .map(|(ino, fid)| r.cwr.item(*ino, fid))
+            .collect();
         let outs = r.cwr.fs.router.promote_staged_batch(items).await;
         if victim_slot_hits > 0 && victim_slot_hits < second.len() {
             for out in &outs {
@@ -1640,11 +1886,13 @@ async fn a_lost_reply_after_the_owner_applied_abandons_without_recycle() {
     let abandons0 = metric(&METRICS.cowriter_unpublished_abandons);
     let recycles0 = metric(&METRICS.cowriter_unpublished_recycles);
     routing::test_take_pack_trace();
-    publish::TEST_PACK_GROUP_LOSE_REPLIES.store(u64::MAX, Ordering::Relaxed);
-    let items: Vec<StagedPromotionItem> =
-        files.iter().map(|(ino, fid)| r.cwr.item(*ino, fid)).collect();
+    publish::TEST_LOSE_LAYOUT_PUBLISH_REPLIES.store(u64::MAX, Ordering::Relaxed);
+    let items: Vec<StagedPromotionItem> = files
+        .iter()
+        .map(|(ino, fid)| r.cwr.item(*ino, fid))
+        .collect();
     let outs = r.cwr.fs.router.promote_staged_batch(items).await;
-    publish::TEST_PACK_GROUP_LOSE_REPLIES.store(0, Ordering::Relaxed);
+    publish::TEST_LOSE_LAYOUT_PUBLISH_REPLIES.store(0, Ordering::Relaxed);
     for out in &outs {
         match out {
             Err(SqueezefsError::PublishFailure { class, .. }) => assert_eq!(
@@ -1660,10 +1908,17 @@ async fn a_lost_reply_after_the_owner_applied_abandons_without_recycle() {
         1,
         "the seal abandoned WITHOUT recycle"
     );
-    assert_eq!(metric(&METRICS.cowriter_unpublished_recycles) - recycles0, 0);
+    assert_eq!(
+        metric(&METRICS.cowriter_unpublished_recycles) - recycles0,
+        0
+    );
     let trace = routing::test_take_pack_trace();
     let fr = frames(&trace);
-    assert_eq!(fr.len(), 1, "one frame (its resends re-send the same request ids)");
+    assert_eq!(
+        fr.len(),
+        1,
+        "one frame (its resends re-send the same request ids)"
+    );
     let base = fr[0].0.clone();
     let idx = r.cwr.block_idx(&base);
     assert!(
@@ -1682,7 +1937,11 @@ async fn a_lost_reply_after_the_owner_applied_abandons_without_recycle() {
     // The authority reads every tenant byte-exact.
     let reader = authority_reader(&r.auth, &r.dev).await;
     for (i, (ino, _)) in files.iter().enumerate() {
-        assert_eq!(reader.read(*ino, len).await, pattern(100 + i, len), "tenant {i}");
+        assert_eq!(
+            reader.read(*ino, len).await,
+            pattern(100 + i, len),
+            "tenant {i}"
+        );
     }
     drop(reader);
 
@@ -1691,14 +1950,14 @@ async fn a_lost_reply_after_the_owner_applied_abandons_without_recycle() {
     let (b, fb) = r.cwr.staged_file("block_unknown.bin", len, 110).await;
     let abandons1 = metric(&METRICS.cowriter_unpublished_abandons);
     let recycles1 = metric(&METRICS.cowriter_unpublished_recycles);
-    publish::TEST_PACK_GROUP_LOSE_REPLIES.store(u64::MAX, Ordering::Relaxed);
+    publish::TEST_LOSE_LAYOUT_PUBLISH_REPLIES.store(u64::MAX, Ordering::Relaxed);
     let out = r
         .cwr
         .fs
         .router
         .promote_staged_batch(vec![r.cwr.item(b, &fb)])
         .await;
-    publish::TEST_PACK_GROUP_LOSE_REPLIES.store(0, Ordering::Relaxed);
+    publish::TEST_LOSE_LAYOUT_PUBLISH_REPLIES.store(0, Ordering::Relaxed);
     assert!(
         matches!(
             out[0],
@@ -1710,8 +1969,14 @@ async fn a_lost_reply_after_the_owner_applied_abandons_without_recycle() {
         "{:?}",
         out[0]
     );
-    assert_eq!(metric(&METRICS.cowriter_unpublished_abandons) - abandons1, 1);
-    assert_eq!(metric(&METRICS.cowriter_unpublished_recycles) - recycles1, 0);
+    assert_eq!(
+        metric(&METRICS.cowriter_unpublished_abandons) - abandons1,
+        1
+    );
+    assert_eq!(
+        metric(&METRICS.cowriter_unpublished_recycles) - recycles1,
+        0
+    );
     let Rig { auth, cwr, .. } = r;
     drop(cwr);
     auth.stop().await;
@@ -1746,9 +2011,12 @@ async fn frame_and_call_refusals_surface_typed() {
         ino: 2,
         refs: Vec::new(),
         lease_epoch: r.cwr.client.lease_epoch(),
-        request_id: cowriter::next_ship_request_id(),
+        request_id: 0xF00D_0002,
     };
-    match client.ship(listener.endpoint(), call.clone()).await {
+    match client
+        .ship(&listener.endpoint().to_string(), call.clone())
+        .await
+    {
         Err(SqueezefsError::PublishFailure { class, .. }) => assert_eq!(
             class,
             PublishFailureClass::CallRefused(publish::PUBLISH_NOT_OWNER)
@@ -1763,7 +2031,7 @@ async fn frame_and_call_refusals_surface_typed() {
         size: 0,
         refs: Vec::new(),
         lease_epoch: r.cwr.client.lease_epoch(),
-        request_id: cowriter::next_ship_request_id(),
+        request_id: 0xF00D_0003,
     };
     match client
         .ship_group(&r.auth.endpoints[0], vec![group_call])
@@ -1788,20 +2056,30 @@ async fn frame_and_call_refusals_surface_typed() {
 fn the_outcome_class_arms_never_parse_a_message_string() {
     let src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/routing.rs"))
         .expect("read src/routing.rs");
-    let begin = src
-        .find("// PK4: outcome-class arms begin")
-        .expect("the arms' begin marker");
-    let end = src
-        .find("// PK4: outcome-class arms end")
-        .expect("the arms' end marker");
-    assert!(begin < end, "markers in order");
-    let region = &src[begin..end];
+    const BEGIN: &str = "// PK4: outcome-class arms begin";
+    const END: &str = "// PK4: outcome-class arms end";
+    let mut regions = 0;
+    let mut cursor = 0;
+    while let Some(b) = src[cursor..].find(BEGIN) {
+        let begin = cursor + b;
+        let end = begin
+            + src[begin..]
+                .find(END)
+                .expect("every begin marker has its end marker");
+        let region = &src[begin..end];
+        assert!(
+            !region.contains("to_string()") && !region.contains(".contains("),
+            "an outcome-class arm parses a message string:\n{region}"
+        );
+        assert!(
+            region.contains("PublishFailureClass::TransportOutcomeUnknown"),
+            "the arms key on the typed class:\n{region}"
+        );
+        regions += 1;
+        cursor = end + END.len();
+    }
     assert!(
-        !region.contains("to_string()") && !region.contains(".contains("),
-        "the outcome-class arms parse a message string:\n{region}"
-    );
-    assert!(
-        region.contains("PublishFailureClass::TransportOutcomeUnknown"),
-        "the arms key on the typed class"
+        regions >= 2,
+        "the helper and the driver's frame arm are both marked ({regions})"
     );
 }

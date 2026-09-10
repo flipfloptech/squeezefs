@@ -415,10 +415,54 @@ mount (the A-arm rig reset the cluster; remount is part of every arm).
    ref_ops` now covers the per-file arm and PK3's spill/clone save-failure
    arms (FIND-PK-4's abandon-without-recycle on `TransportOutcomeUnknown`
    rides the same arm). My integration change: one library `expect()` in
-   the pack-group ship path → a `let … else` refusal. **PK6 in flight**
-   (compaction on the defrag D1 axis; first customer = the legacy
-   one-block-per-file population); then PK7 (squeeze-test rows + the
-   default flip).
+   the pack-group ship path → a `let … else` refusal.
+1q. **PK6 landed; PK7 steps 1+2 done locally; a P0 data-loss race found
+   and fixed on the way (2026-09-10).** **PK6** (`5848073a`): the D1
+   pack-occupancy face (`frag_d1_pack_*`, `pack_reclaimable_bytes`,
+   `pack_blocks_below_half`; same-`off` windows counted once), the victim
+   law = `pack_max_slot_bytes()` (tie test), `JobType::DefragPack` +
+   `compact_one` (`move_one`'s discipline: pin → per-tenant re-pack through
+   `Packer::reserve` + `land_tenant` → republish with the C8 delta →
+   release the moved reference nonterminal → pin dropped LAST = the
+   terminal free through the ladder), `defrag --pack` / `--report-only`, 13
+   contracts; **FIND-PK-5** fixed with its own red (the staged RMW + inline
+   write arms released a superseded promoted copy's RAM reference without
+   noting its durable `−ref` — hidden by same-block re-promotion, routine
+   under compaction). **PK7 step 1** (local scoping, `.benchmarks/2026-09-10-
+   packing-rows-local.md`, rig `rigs/2026-09-10-packing-rows-local.sh`):
+   dismount 2,000 files → **15 blocks** (A: 2,000), fsync-row → **8**
+   (A: 2,000), the legacy volume **2,000 → 15** with one `defrag --pack`,
+   half-deleted packs 15 → 5; drift 0 / fsck 0 / byte-exact from a second
+   mount point everywhere; device/user bytes 1.00× both arms. **FIND-PK-6**
+   (`defrag --report-only` on the legacy volume = "reply too large" — one
+   row per block on the admin lane) fixed `4fc4aa59` (`to_bounded_json` +
+   `rows_elided`, worst-first — the fsck precedent). **Step 2**: fstests
+   QUICK 45 ran / 42 clean / 3 expected-shape / **0 unexpected** under BOTH
+   postures. **THE P0** (`.benchmarks/2026-09-10-overlay-vs-growth-merge-
+   data-loss.md`, fixed `d914b673`, red `1432bf7e`): the gate on `4fc4aa59`
+   caught, ON TAPE, the anomaly PK2's run saw once — a buffered
+   4 MiB + 64 KiB file loses its 3–4 MiB kernel-split segment (ZEROS after a
+   successful fsync) with ONE `overlay_foreign_merge` tripwire. Verified
+   mechanism: NOT the promotion — `write_striped`, the router's own
+   GUARD-LESS striped RMW, reached when a segment's handler classification
+   went stale across a sibling's promotion; it seeded from the device
+   (never composing the open overlay record) and published a `Merge` with
+   no block guard, so the one-authority screen superseded the overlay's
+   acked bytes. Fix: `write_striped` DELETED, `write_file →
+   WriteFileOutcome::{Written, LayoutStriped}`, every caller re-dispatches
+   through the ONE guarded striped path (`dispatch_striped_write`) where
+   the record is joined; deterministic repro `tests/overlay_growth_merge_
+   tests.rs` (seam `SQUEEZEFS_TEST_ROUTER_DISPATCH_STALL_MS`) red ×3 on the
+   unfixed product, green ×10 fixed; design-overlay-overwrite §5.7 amended.
+   1.2.2 SHIPS this race (≈ 1 % of such files on staging-dir volumes; the
+   cache-less fleet is unaffected); 1.2.3 carries the fix. Also: the
+   `sparse_write_bounded_tests::cacheless_far_write_is_bounded_and_omap`
+   gate red is a PRE-EXISTING flake (2/20 pre-PK6, 0/20 on the tip; an
+   exact ~2 GiB VmHWM jump = a lazily-committed pool's first touch the
+   warm-up misses — board). **Next:** gate on `d914b673`; then PK7 step 3
+   (the squeeze-test A-B-B-A bracket — rig `rigs/2026-09-10-packing-rows-
+   box.sh`, its manifest lists everything it creates on the box), then the
+   default-flip decision, then the 1.2.3 release-gate trio.
 2. **Kernel A/B, B arm** — after `squeeze-test` boots the 6.19.14 series
    WITH 0031 (or whichever box carries the patched kernel): on the box,
    `cd /scratch/tmp/sqz-agent/k26 && sudo env ARM=B KERNEL_TAG=<uname -r

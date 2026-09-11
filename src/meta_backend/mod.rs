@@ -1582,39 +1582,73 @@ impl RoutedMetaBackend {
         Ok(())
     }
 
-    /// Partition `inos` (global; caller order kept) into
-    /// [`Self::destroy_inodes`] chunks that each fit ONE journal entry per
-    /// volume: every ino is priced by its home volume
-    /// ([`kv::backend::KvMetaBackend::destroy_entry_bytes`] — the inode
-    /// `Delete` plus one per xattr, in the admission's own framing) and a
-    /// chunk closes when the next ino would push any volume's share past
-    /// [`kv::journal::entry_payload_cap`]. The mount-time corpse sweep's
-    /// planner: 68,099 corpses were ONE 6 MB entry against the 128 KiB cap
-    /// on the 1.2.3 release chain, refused at every mount forever. An ino
-    /// whose own records exceed the cap sits alone in its chunk, and that
-    /// chunk's destroy fails loud exactly as today.
-    pub async fn plan_destroy_chunks(&self, inos: &[Ino]) -> Result<Vec<Vec<Ino>>> {
-        let cap = kv::journal::entry_payload_cap();
-        let mut chunks: Vec<Vec<Ino>> = Vec::new();
-        let mut current: Vec<Ino> = Vec::new();
-        let mut per_volume: std::collections::HashMap<usize, u64> =
-            std::collections::HashMap::new();
-        for &ino in inos {
-            let (v_idx, local_ino) = self.route_ino(ino);
-            self.check_volume_enabled(v_idx)?;
-            let bytes = self.volumes[v_idx].destroy_entry_bytes(local_ino).await?;
-            let used = per_volume.get(&v_idx).copied().unwrap_or(0);
-            if !current.is_empty() && used + bytes > cap {
-                chunks.push(std::mem::take(&mut current));
-                per_volume.clear();
+    /// The journal payload `ino`'s destroy stages on its home volume —
+    /// the inode `Delete` plus one per xattr, in the admission's own
+    /// framing ([`kv::backend::KvMetaBackend::destroy_entry_bytes`]). The
+    /// reclaim planner's record term; the release term is
+    /// [`kv::block_refs::release_records_bytes`].
+    pub async fn destroy_entry_bytes(&self, ino: Ino) -> Result<u64> {
+        let (v_idx, local_ino) = self.route_ino(ino);
+        self.check_volume_enabled(v_idx)?;
+        self.volumes[v_idx].destroy_entry_bytes(local_ino).await
+    }
+
+    /// RECLAIM-ATOMIC: [`Self::destroy_inodes`] with every ino's durable
+    /// reference releases riding the SAME journal entry
+    /// ([`kv::backend::KvMetaBackend::destroy_inodes_releasing`]). ONE
+    /// entry, so `items` must share a home volume — the reclaim planner
+    /// groups by [`Self::route_ino`] first; a set spanning volumes is
+    /// refused before anything commits (a later volume's failure could
+    /// otherwise lose an earlier volume's verdicts).
+    pub async fn destroy_inodes_releasing(
+        &self,
+        items: &[(Ino, &[kv::block_refs::BlockRefOp])],
+    ) -> Result<Vec<(Ino, kv::block_refs::DestroyVerdict)>> {
+        let Some(&(first, _)) = items.first() else {
+            return Ok(Vec::new());
+        };
+        let inos: Vec<Ino> = items.iter().map(|&(ino, _)| ino).collect();
+        let _gate = self.slot_gate_enter(&inos).await;
+        let (v_idx, _) = self.route_ino(first);
+        let mut locals: Vec<(Ino, &[kv::block_refs::BlockRefOp])> = Vec::with_capacity(items.len());
+        for &(ino, ops) in items {
+            let (v, local_ino) = self.route_ino(ino);
+            if v != v_idx {
+                return Err(crate::error::SqueezefsError::InvalidOperation(format!(
+                    "destroy_inodes_releasing: ino {ino} homes on volume {v}, the set's first \
+                     ino {first} on {v_idx} — one entry cannot span volumes (group by home \
+                     volume first)"
+                )));
             }
-            *per_volume.entry(v_idx).or_insert(0) += bytes;
-            current.push(ino);
+            locals.push((local_ino, ops));
         }
-        if !current.is_empty() {
-            chunks.push(current);
+        self.check_volume_enabled(v_idx)?;
+        let out = self.volumes[v_idx].destroy_inodes_releasing(&locals).await;
+        if out.is_err() {
+            self.mirror_volume_failure(v_idx);
         }
-        Ok(chunks)
+        Ok(inos.into_iter().zip(out?).collect())
+    }
+
+    /// RECLAIM-ATOMIC residual B: routed
+    /// [`kv::backend::KvMetaBackend::destroy_inode_chunked`] — one ino
+    /// whose releases + xattrs + record exceed the whole-entry cap,
+    /// destroyed across entries on its home volume.
+    pub async fn destroy_inode_chunked(
+        &self,
+        ino: Ino,
+        refs: &[kv::block_refs::BlockRefOp],
+    ) -> Result<kv::block_refs::ChunkedDestroy> {
+        let _gate = self.slot_gate_enter(&[ino]).await;
+        let (v_idx, local_ino) = self.route_ino(ino);
+        self.check_volume_enabled(v_idx)?;
+        let out = self.volumes[v_idx]
+            .destroy_inode_chunked(local_ino, refs)
+            .await;
+        if out.is_err() {
+            self.mirror_volume_failure(v_idx);
+        }
+        out
     }
 
     /// [`Self::destroy_inodes`] for records that no dentry names — fsck

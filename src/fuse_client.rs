@@ -23184,11 +23184,14 @@ impl SqueezefsFilesystem {
     /// Preserves today's per-ino split around the destroy:
     /// - admission re-checks (reserved / open / getattr / nlink) per ino —
     ///   the drain-time complement of `queue_reclaim_inode`'s enqueue check;
-    /// - `router.delete_file` (data-path teardown) runs BEFORE admission,
-    ///   log-and-proceed on failure exactly as today (its result was always
-    ///   discarded; gating on it would leak the slot forever under a
-    ///   persistently failing data teardown — the slot zero is the
-    ///   authoritative reclaim, blocks are refcount-recoverable);
+    /// - the data-path teardown (`router.prepare_reclaim`) runs BEFORE the
+    ///   destroy, and the ino's reference releases ride the destroy's own
+    ///   journal entry (`router.reclaim_destroy`, RECLAIM-ATOMIC): a
+    ///   destroy is REFUSED — record, layout and references retained for
+    ///   the next reclaim — when that entry does not commit or the layout
+    ///   cannot be read (the old log-and-proceed destroyed the record and
+    ///   orphaned its references on the ledger forever; v3 never reuses an
+    ///   ino, so a retained record leaks no slot);
     /// - lease / POSIX-lock / cache teardown runs per ino AFTER the batch's
     ///   commit, on success AND failure alike (invalidating before a
     ///   now-deferred zero would let a straggling getattr repopulate
@@ -23299,7 +23302,7 @@ impl SqueezefsFilesystem {
             admitted.push(ino);
         }
         if !admitted.is_empty() {
-            self.reclaim_admitted_batch(backend, admitted).await;
+            self.reclaim_admitted_batch(admitted).await;
         }
         // Every claim this batch held is released above (both edges of
         // the destroy run the per-ino teardown), so waiting here can never
@@ -23334,14 +23337,10 @@ impl SqueezefsFilesystem {
     /// The admitted set's teardown + destroy — every ino here is claimed
     /// by this batch and released again by `reclaim_teardown` on both
     /// edges of the destroy.
-    async fn reclaim_admitted_batch(
-        &self,
-        backend: &std::sync::Arc<crate::meta_backend::RoutedMetaBackend>,
-        admitted: Vec<u64>,
-    ) {
+    async fn reclaim_admitted_batch(&self, admitted: Vec<u64>) {
         // RAM-parked overlay teardown FIRST (the 2026-08-05 field leak:
         // 230 GiB of `parked_full_buffer_bytes` flat at idle, every entry
-        // keyed by a dead ino). `delete_file` below removes the STAGED
+        // keyed by a dead ino). The reclaim below removes the STAGED
         // overlay families and frees the mapped blocks, but the FUSE-layer
         // `active_block_buffers` map — whose `ActiveBlockBuf` values
         // RAII-charge the parked byte gauges — was never touched at
@@ -23353,35 +23352,56 @@ impl SqueezefsFilesystem {
         // applied to RAM custody — the admitted set is `nlink == 0`,
         // FORGET'd, not open, single-drive-claimed — never a loss of live
         // acked data. Ordering is load-bearing: retiring the overlays
-        // BEFORE `delete_file`'s block-map walk closes the pipeline
+        // BEFORE `prepare_reclaim`'s block-map walk closes the pipeline
         // publish source (a detached upload revalidating under the block
         // lock finds its entry retired and frees its orphan block) so the
         // walk cannot miss a mapping published behind it.
         self.drop_parked_overlays_for_inos(&admitted).await;
 
-        // Data-path teardown per ino, before admission — log-and-proceed.
+        // RECLAIM-ATOMIC: prepare each ino's data-path teardown (the layout
+        // read, its releases and free candidates enumerated, its RAM-only
+        // custody torn down) — then ONE router primitive commits the
+        // destroys with the releases riding the same entries, bisecting a
+        // failed group down to the ino that fails (one persistently bad
+        // ino wedges only itself, never 63 innocents) and REFUSING that
+        // one: its record, layout and references survive together for
+        // the next reclaim. A prepare failure is the same refusal (the
+        // layout could not be read, so its releases cannot be staged —
+        // destroying would orphan them; ino slots are never reused, so a
+        // retained record costs its bytes, never a slot).
+        let mut plans: Vec<crate::routing::ReclaimPlan> = Vec::with_capacity(admitted.len());
         for &ino in &admitted {
-            let file_path = crate::keys::inode_path(ino);
-            if let Err(e) = self.router.delete_file(&file_path).await {
-                debug!(
-                    "RECLAIM: delete_file({}) failed (proceeding to destroy): {:?}",
-                    ino, e
-                );
+            match self
+                .router
+                .prepare_reclaim(&crate::keys::inode_path(ino))
+                .await
+            {
+                Ok(Some(plan)) => plans.push(plan),
+                // PR 6b (design §3/A2): an over-threshold kvmap corpse's
+                // teardown took the sweep handoff — its record + cursor
+                // head ARE the durable plan, so the destroy is WITHHELD
+                // here (the sweep job's terminal chunk owns it); the
+                // per-ino teardown tail still runs.
+                Ok(None) => self.reclaim_teardown(ino).await,
+                Err(e) => {
+                    METRICS
+                        .reclaim_destroy_refused_release_failed
+                        .fetch_add(1, Ordering::Relaxed);
+                    warn!(
+                        "RECLAIM: preparing ino {ino} failed ({e}); destroy WITHHELD — the \
+                         record is retained with its references and the next reclaim retries \
+                         (reclaim_destroy_refused_release_failed)"
+                    );
+                    self.reclaim_teardown(ino).await;
+                }
             }
         }
-
-        // PR 6b (design §3/A2): an over-threshold kvmap corpse's
-        // `delete_file` took the sweep handoff — its record + cursor head
-        // ARE the durable plan, so the destroy is WITHHELD here (the
-        // sweep job's terminal chunk owns it); the per-ino teardown tail
-        // (lease release, cache invalidation) still runs.
-        let (deferred, destroyable): (Vec<u64>, Vec<u64>) = admitted
-            .iter()
-            .partition(|&&i| self.router.kvmap_sweep_corpse_pending(i));
-        for ino in deferred {
+        for (ino, verdict) in self.router.reclaim_destroy(plans).await {
+            if let crate::routing::ReclaimVerdict::Refused(why) = &verdict {
+                debug!("RECLAIM: destroy of ino {ino} withheld ({why}); slot retained");
+            }
             self.reclaim_teardown(ino).await;
         }
-        self.destroy_batch_bisect(backend, &destroyable).await;
     }
 
     /// Retire EVERY RAM-parked overlay owned by the reclaim batch's inos —
@@ -23422,47 +23442,6 @@ impl SqueezefsFilesystem {
         for (ino, b, key) in victims {
             let _block_guard = block_lock_acquire(ino, b, BlockLockSite::OverlayPrune).await;
             self.retire_parked_overlay(&key);
-        }
-    }
-
-    /// Destroy `inos` as one batch; on commit failure bisect and retry the
-    /// halves, terminating at size-1 sub-batches whose behavior is
-    /// byte-for-byte today's per-ino path (§4.5: one persistently bad
-    /// sector must wedge only its own ino, never 63 innocents). The per-ino
-    /// teardown runs on BOTH edges — only `free()` (inside
-    /// `destroy_inodes`) is withheld on failure.
-    async fn destroy_batch_bisect(
-        &self,
-        backend: &std::sync::Arc<crate::meta_backend::RoutedMetaBackend>,
-        inos: &[u64],
-    ) {
-        if inos.is_empty() {
-            return;
-        }
-        // S9: routed and grouped by owner (destroy is per-ino by
-        // construction, so a set spanning two authorities is two commits).
-        match crate::meta_ship::publish::destroy_inodes(backend, inos).await {
-            Ok(()) => {
-                for &ino in inos {
-                    self.reclaim_teardown(ino).await;
-                }
-            }
-            Err(e) if inos.len() == 1 => {
-                // Today's per-ino path discarded this error silently; the
-                // batched path logs it (a strict logging improvement) and
-                // still runs the teardown — leaving leases to TTL expiry and
-                // stale cache entries would diverge from today's behavior.
-                warn!(
-                    "RECLAIM: destroy failed for ino {} (slot retained, free() withheld): {:?}",
-                    inos[0], e
-                );
-                self.reclaim_teardown(inos[0]).await;
-            }
-            Err(_) => {
-                let mid = inos.len() / 2;
-                Box::pin(self.destroy_batch_bisect(backend, &inos[..mid])).await;
-                Box::pin(self.destroy_batch_bisect(backend, &inos[mid..])).await;
-            }
         }
     }
 

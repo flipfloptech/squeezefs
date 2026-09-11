@@ -280,6 +280,52 @@ pub enum ReleaseWitness {
     Ledger(Vec<BlockRef>),
 }
 
+/// The journal payload `n` reference-release `Delete`s stage — the
+/// admission's own framing, the destroy planner's release term
+/// (RECLAIM-ATOMIC: a reclaimed ino's releases ride its destroy entry, so
+/// the entry is priced with them).
+pub fn release_records_bytes(n: usize) -> u64 {
+    n as u64 * super::journal::record_frame_len(BLOCK_REF_KEY_LEN, 0)
+}
+
+/// Per-ino verdict of a joint release + destroy entry
+/// (`KvMetaBackend::destroy_inodes_releasing`, RECLAIM-ATOMIC).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DestroyVerdict {
+    /// The record and its xattrs are gone and the ino's reference
+    /// releases rode the SAME entry. `held` is the release WITNESS —
+    /// every released reference whose record existed at commit time —
+    /// or `None` on a volume without the ledger (the derived posture).
+    Destroyed { held: Option<Vec<BlockRef>> },
+    /// Nothing was staged for this ino — it is live (`nlink > 0`) or has
+    /// no record — so its references, if any, stand and nothing may free.
+    Skipped,
+}
+
+/// The outcome of a single-ino destroy that may span SEVERAL journal
+/// entries (`KvMetaBackend::destroy_inode_chunked`, RECLAIM-ATOMIC
+/// residual B): a corpse whose releases + xattrs + record exceed the
+/// whole-entry cap is destroyed in the order releases → other xattrs →
+/// `layout` xattr + inode record, so every committed prefix is a corpse
+/// the next sweep converges on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChunkedDestroy {
+    /// Nothing was staged: the ino is live (`nlink > 0`) or has no record
+    /// (the [`DestroyVerdict::Skipped`] shape) — nothing may free.
+    pub skipped: bool,
+    /// `true` ⇔ the LAST entry (the layout + the record) committed.
+    pub completed: bool,
+    /// The witnessed releases whose `Delete` COMMITTED — the whole
+    /// witness when `completed`, the committed prefix otherwise (the
+    /// RAM-decrement budget either way). `None` = no ledger.
+    pub held: Option<Vec<BlockRef>>,
+    /// Journal entries committed.
+    pub entries: u32,
+    /// Why the destroy stopped after `entries` (`None` when `completed`,
+    /// or when the ino was live/missing and nothing was staged).
+    pub stopped: Option<String>,
+}
+
 /// **The caller frame's RAM-only lifetimes** (finding 15's supply leak,
 /// `.benchmarks/2026-09-06-cowriter-free-refcount-leak.md`): the DATA
 /// blocks a publish frame both TAKES and RELEASES — a binding minted,

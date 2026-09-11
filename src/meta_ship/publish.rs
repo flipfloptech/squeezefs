@@ -3413,6 +3413,54 @@ pub async fn park_write_times(
     }
 }
 
+/// `true` ⇔ `ino`'s home volume belongs to a PEER (its metadata verbs
+/// ship) — the reclaim planner's partition predicate: a peer-owned ino's
+/// release and destroy travel as two verbs (release first, the destroy
+/// refused if the release did not land), a local one's ride ONE entry.
+pub fn is_peer_owned(be: &Arc<RoutedMetaBackend>, ino: Ino) -> Result<bool> {
+    Ok(owner_of(be, ino)?.is_some())
+}
+
+/// RECLAIM-ATOMIC: routed [`RoutedMetaBackend::destroy_inodes_releasing`]
+/// — LOCAL inos only (the caller partitioned with [`is_peer_owned`]; a
+/// peer-owned member is refused before anything commits, because the
+/// joint entry cannot cross the wire).
+pub async fn destroy_inodes_releasing(
+    be: &Arc<RoutedMetaBackend>,
+    items: &[(Ino, &[BlockRefOp])],
+) -> Result<Vec<(Ino, crate::meta_backend::kv::block_refs::DestroyVerdict)>> {
+    for &(ino, _) in items {
+        if let Some(peer) = owner_of(be, ino)? {
+            return Err(SqueezefsError::InvalidOperation(format!(
+                "destroy_inodes_releasing: ino {ino} is owned by {} — a peer-owned ino's \
+                 release and destroy ship as two verbs, never one local entry",
+                peer.peer_id
+            )));
+        }
+    }
+    note_local();
+    be.destroy_inodes_releasing(items).await
+}
+
+/// RECLAIM-ATOMIC residual B: routed
+/// [`RoutedMetaBackend::destroy_inode_chunked`] — local inos only (see
+/// [`destroy_inodes_releasing`]).
+pub async fn destroy_inode_chunked(
+    be: &Arc<RoutedMetaBackend>,
+    ino: Ino,
+    refs: &[BlockRefOp],
+) -> Result<crate::meta_backend::kv::block_refs::ChunkedDestroy> {
+    if let Some(peer) = owner_of(be, ino)? {
+        return Err(SqueezefsError::InvalidOperation(format!(
+            "destroy_inode_chunked: ino {ino} is owned by {} — a peer-owned ino's release \
+             and destroy ship as two verbs",
+            peer.peer_id
+        )));
+    }
+    note_local();
+    be.destroy_inode_chunked(ino, refs).await
+}
+
 /// Routed [`RoutedMetaBackend::destroy_inodes`].
 ///
 /// The set is grouped by owner — destroy is per-ino by construction, so a

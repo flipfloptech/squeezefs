@@ -9454,7 +9454,32 @@ impl KvMetaBackend {
     /// free: v3 never reuses (§4.8), which deletes the v2
     /// free-strictly-after-durable ordering rule whole.
     pub async fn destroy_inodes(&self, inos: &[Ino]) -> Result<()> {
-        self.destroy_inode_records(inos, true).await
+        let items: Vec<(Ino, &[super::block_refs::BlockRefOp])> =
+            inos.iter().map(|&ino| (ino, &[][..])).collect();
+        self.destroy_inode_records(&items, true).await.map(|_| ())
+    }
+
+    /// RECLAIM-ATOMIC: [`Self::destroy_inodes`] with each ino's durable
+    /// reference RELEASES riding the SAME journal entry as its record and
+    /// xattr `Delete`s — the reclaim path's commit. A release can then
+    /// never land without its destroy (the released-but-undestroyed
+    /// corpse the ledger gate makes harmless) and a destroy can never
+    /// land without its release (the inode gone, its references on the
+    /// ledger forever — the corpse-sweep record's residual A). Every
+    /// release is WITNESSED under the ino's exclusive 4a guard before the
+    /// commit ([`super::block_refs::DestroyVerdict::Destroyed`]'s `held`),
+    /// the RAM-decrement budget the caller frees under. A live or missing
+    /// ino stages NOTHING — not even its releases — and answers `Skipped`.
+    ///
+    /// One entry: the caller packs `items` to [`super::journal::
+    /// entry_payload_cap`] with [`Self::destroy_entry_bytes`] +
+    /// [`super::block_refs::release_records_bytes`]; a single ino past the
+    /// cap takes [`Self::destroy_inode_chunked`].
+    pub async fn destroy_inodes_releasing(
+        &self,
+        items: &[(Ino, &[super::block_refs::BlockRefOp])],
+    ) -> Result<Vec<super::block_refs::DestroyVerdict>> {
+        self.destroy_inode_records(items, true).await
     }
 
     /// [`Self::destroy_inodes`] **without** the live-`nlink` skip — fsck
@@ -9475,7 +9500,9 @@ impl KvMetaBackend {
     /// filesystem holds an `nlink == 0` unreferenced inode, which no class
     /// claims and nothing would ever reclaim.
     pub async fn destroy_unreferenced_inodes(&self, inos: &[Ino]) -> Result<()> {
-        self.destroy_inode_records(inos, false).await
+        let items: Vec<(Ino, &[super::block_refs::BlockRefOp])> =
+            inos.iter().map(|&ino| (ino, &[][..])).collect();
+        self.destroy_inode_records(&items, false).await.map(|_| ())
     }
 
     /// The journal payload bytes [`Self::destroy_inodes`] stages for
@@ -9500,49 +9527,106 @@ impl KvMetaBackend {
         Ok(bytes)
     }
 
-    async fn destroy_inode_records(&self, inos: &[Ino], skip_live: bool) -> Result<()> {
-        self.write_gate()?;
-        if inos.is_empty() {
-            return Ok(());
+    /// Every xattr key of `ino`, in tree order.
+    async fn xattr_keys_of(&self, ino: Ino) -> std::result::Result<Vec<Vec<u8>>, KvError> {
+        let start = xattr_key(ino, 0, 0);
+        let end = xattr_key(ino, HASH56_MAX, u8::MAX);
+        let mut cursor: Vec<u8> = start.to_vec();
+        let mut keys = Vec::new();
+        loop {
+            let page = self.xattrs.range(&cursor, &end, SCAN_PAGE).await?;
+            let Some((last, _)) = page.last() else { break };
+            cursor = key_successor(last);
+            keys.extend(page.into_iter().map(|(k, _)| k.to_vec()));
         }
-        let lock_plan: Vec<(u64, LockMode)> =
-            inos.iter().map(|&ino| (ino, LockMode::Exclusive)).collect();
+        Ok(keys)
+    }
+
+    /// The release WITNESS (the generic/749 ledger gate): which of the
+    /// released references have a record RIGHT NOW — point lookups on the
+    /// RAM-authoritative tree under the caller's exclusive 4a guard.
+    /// `None` on a volume without the ledger.
+    async fn witness_releases(
+        &self,
+        ops: &[super::block_refs::BlockRefOp],
+    ) -> Result<Option<Vec<super::block_refs::BlockRef>>> {
+        let Some(tree) = self.block_refs.as_ref() else {
+            return Ok(None);
+        };
+        let mut held = Vec::new();
+        for op in ops.iter().filter(|op| !op.take) {
+            if tree.lookup(&op.reference.key()).await?.is_some() {
+                held.push(op.reference);
+            }
+        }
+        Ok(Some(held))
+    }
+
+    async fn destroy_inode_records(
+        &self,
+        items: &[(Ino, &[super::block_refs::BlockRefOp])],
+        skip_live: bool,
+    ) -> Result<Vec<super::block_refs::DestroyVerdict>> {
+        use super::block_refs::DestroyVerdict;
+        self.write_gate()?;
+        if items.is_empty() {
+            return Ok(Vec::new());
+        }
+        if items.iter().any(|(_, ops)| ops.iter().any(|op| !op.take)) {
+            Self::reclaim_release_seam_gate()?;
+        }
+        let lock_plan: Vec<(u64, LockMode)> = items
+            .iter()
+            .map(|&(ino, _)| (ino, LockMode::Exclusive))
+            .collect();
         let guards: Arc<[DlmGuard]> = Arc::from(self.dlm.lock_many(&lock_plan, &[]).await);
 
         let mut tx = KvTx::new();
         let mut doomed = 0usize;
-        for &ino in inos {
+        let mut releases = 0usize;
+        let mut verdicts = Vec::with_capacity(items.len());
+        for &(ino, ops) in items {
             match self.read_inode_value(ino).await? {
                 Some(v) if skip_live && v.nlink > 0 => {
                     log::debug!("destroy_inodes: ino {ino} has nlink {}, skipping", v.nlink);
+                    verdicts.push(DestroyVerdict::Skipped);
                 }
                 Some(_) => {
                     doomed += 1;
+                    // RECLAIM-ATOMIC: the ino's reference releases ride
+                    // THIS entry (witnessed first, under the guard the
+                    // commit holds). Silently skipped on a volume without
+                    // the ledger — its ownership answers stay derived.
+                    let held = self.witness_releases(ops).await?;
+                    if self.block_refs.is_some() && !ops.is_empty() {
+                        tx.stage_block_refs(ops);
+                        releases += ops.iter().filter(|op| !op.take).count();
+                    }
                     tx.stage_delete(TREE_INODES, inode_key(ino));
                     // Reap the corpse's xattrs in the SAME entry (§4.8).
-                    let start = xattr_key(ino, 0, 0);
-                    let end = xattr_key(ino, HASH56_MAX, u8::MAX);
-                    let mut cursor: Vec<u8> = start.to_vec();
-                    loop {
-                        let page = self.xattrs.range(&cursor, &end, SCAN_PAGE).await?;
-                        let Some((last, _)) = page.last() else { break };
-                        cursor = key_successor(last);
-                        for (k, _) in &page {
-                            tx.stage_delete(TREE_XATTRS, k.to_vec());
-                        }
+                    for k in self.xattr_keys_of(ino).await? {
+                        tx.stage_delete(TREE_XATTRS, k);
                     }
+                    verdicts.push(DestroyVerdict::Destroyed { held });
                 }
-                None => {} // missing or already destroyed: nothing to do
+                // Missing or already destroyed: nothing to do — and its
+                // releases stand (no record can justify a decrement).
+                None => verdicts.push(DestroyVerdict::Skipped),
             }
         }
         if doomed == 0 {
-            return Ok(());
+            return Ok(verdicts);
         }
         crate::fuse_client::METRICS
             .meta_reclaim_batch_size
             .record(doomed);
         tx.hold_guards(guards.clone());
         self.commit_tx(tx).await?;
+        if releases > 0 {
+            crate::fuse_client::METRICS
+                .reclaim_release_destroy_joint_commits
+                .fetch_add(1, Ordering::Relaxed);
+        }
         // POSIX-1: the live-inode gauge moves only on a COMMITTED destroy
         // (a failed commit leaves the records live, and the bisect retry
         // re-counts the halves it actually lands).
@@ -9551,10 +9635,198 @@ impl KvMetaBackend {
         // PR M6: a destroyed corpse's pending times refinement is moot —
         // GC it under the exclusive locks (the drain would drop it on the
         // missing-inode read anyway; this keeps the map tight).
-        for &ino in inos {
+        for &(ino, _) in items {
             self.retire_pending_times(ino);
         }
-        Ok(())
+        Ok(verdicts)
+    }
+
+    /// RECLAIM-ATOMIC residual B: destroy ONE ino whose releases + xattrs
+    /// + record exceed the whole-entry cap, across several entries under
+    /// one held exclusive 4a guard, in the order that keeps every
+    /// committed prefix a corpse the next sweep converges on:
+    ///
+    /// 1. the reference releases (their RAM frees follow each commit —
+    ///    the ledger says free, so RAM must);
+    /// 2. every xattr but `layout` (inert to the reclaim);
+    /// 3. the `layout` xattr and the inode record, LAST.
+    ///
+    /// A crash (or a failed entry) after step 1 or mid-step 2 leaves the
+    /// record with its layout: the next sweep re-reads the layout, its
+    /// releases witness NO record and are counted skipped, the remaining
+    /// xattrs and the record destroy — no leak, no second free. Packed
+    /// greedily to [`super::journal::entry_payload_cap`] in the admission's
+    /// own framing; an ino that fits one entry commits one.
+    pub async fn destroy_inode_chunked(
+        &self,
+        ino: Ino,
+        refs: &[super::block_refs::BlockRefOp],
+    ) -> Result<super::block_refs::ChunkedDestroy> {
+        use super::block_refs::{ChunkedDestroy, BLOCK_REF_KEY_LEN};
+        use super::journal::record_frame_len;
+        self.write_gate()?;
+        if refs.iter().any(|op| !op.take) {
+            Self::reclaim_release_seam_gate()?;
+        }
+        let guards: Arc<[DlmGuard]> = Arc::from(vec![self.dlm.lock_inode_exclusive(ino).await]);
+        let skipped = ChunkedDestroy {
+            skipped: true,
+            completed: false,
+            held: None,
+            entries: 0,
+            stopped: None,
+        };
+        match self.read_inode_value(ino).await? {
+            Some(v) if v.nlink > 0 => {
+                log::debug!(
+                    "destroy_inode_chunked: ino {ino} has nlink {}, skipping",
+                    v.nlink
+                );
+                return Ok(skipped);
+            }
+            Some(_) => {}
+            None => return Ok(skipped),
+        }
+        // The witness, once, under the guard: per release op, whether its
+        // record existed before THIS destroy touched anything.
+        let witnessed: Option<Vec<Option<super::block_refs::BlockRef>>> =
+            match self.block_refs.as_ref() {
+                None => None,
+                Some(tree) => {
+                    let mut w = Vec::with_capacity(refs.len());
+                    for op in refs {
+                        w.push(if op.take {
+                            None
+                        } else {
+                            tree.lookup(&op.reference.key())
+                                .await?
+                                .map(|_| op.reference)
+                        });
+                    }
+                    Some(w)
+                }
+            };
+        let layout_key = {
+            let probe = KvTx::empty();
+            let (present, key) = self.xattr_slot(&probe, ino, "layout").await?;
+            present.then_some(key.to_vec())
+        };
+        let other_xattrs: Vec<Vec<u8>> = self
+            .xattr_keys_of(ino)
+            .await?
+            .into_iter()
+            .filter(|k| layout_key.as_ref() != Some(k))
+            .collect();
+
+        enum Rec<'a> {
+            Release(&'a super::block_refs::BlockRefOp),
+            Xattr(Vec<u8>),
+            Inode,
+        }
+        let cap = super::journal::entry_payload_cap();
+        let ledger = self.block_refs.is_some();
+        let mut records: Vec<(Rec<'_>, u64)> = Vec::new();
+        if ledger {
+            records.extend(
+                refs.iter()
+                    .map(|op| (Rec::Release(op), record_frame_len(BLOCK_REF_KEY_LEN, 0))),
+            );
+        }
+        records.extend(
+            other_xattrs
+                .into_iter()
+                .chain(layout_key)
+                .map(|k| (Rec::Xattr(k), record_frame_len(XATTR_KEY_LEN, 0))),
+        );
+        records.push((Rec::Inode, record_frame_len(INODE_KEY_LEN, 0)));
+
+        let stop_after = {
+            let seam = TEST_DESTROY_CHUNK_STOP_AFTER.load(Ordering::Relaxed);
+            if seam != 0 {
+                seam
+            } else {
+                crate::env_knobs::int_knob("SQUEEZEFS_TEST_DESTROY_CHUNK_STOP_AFTER", 0u32)
+            }
+        };
+        let mut out = ChunkedDestroy {
+            skipped: false,
+            completed: false,
+            held: ledger.then(Vec::new),
+            entries: 0,
+            stopped: None,
+        };
+        let mut tx = KvTx::new();
+        let mut tx_bytes = 0u64;
+        let mut staged_releases = 0usize;
+        let mut committed_releases = 0usize;
+        let total = records.len();
+        for (i, (rec, len)) in records.into_iter().enumerate() {
+            if tx_bytes > 0 && tx_bytes + len > cap {
+                tx.hold_guards(Arc::clone(&guards));
+                if let Err(e) = self
+                    .commit_tx(std::mem::replace(&mut tx, KvTx::new()))
+                    .await
+                {
+                    out.stopped = Some(e.to_string());
+                    break;
+                }
+                out.entries += 1;
+                committed_releases = staged_releases;
+                tx_bytes = 0;
+                if stop_after != 0 && out.entries >= stop_after {
+                    out.stopped = Some(format!(
+                        "stopped after {} entr(ies) by SQUEEZEFS_TEST_DESTROY_CHUNK_STOP_AFTER \
+                         (test seam)",
+                        out.entries
+                    ));
+                    break;
+                }
+            }
+            match rec {
+                Rec::Release(op) => {
+                    tx.stage_block_refs(std::slice::from_ref(op));
+                    staged_releases += 1;
+                }
+                Rec::Xattr(k) => tx.stage_delete(TREE_XATTRS, k),
+                Rec::Inode => tx.stage_delete(TREE_INODES, inode_key(ino)),
+            }
+            tx_bytes += len;
+            if i + 1 == total {
+                tx.hold_guards(Arc::clone(&guards));
+                match self
+                    .commit_tx(std::mem::replace(&mut tx, KvTx::new()))
+                    .await
+                {
+                    Ok(()) => {
+                        out.entries += 1;
+                        committed_releases = staged_releases;
+                        out.completed = true;
+                    }
+                    Err(e) => out.stopped = Some(e.to_string()),
+                }
+            }
+        }
+        if let (Some(held), Some(w)) = (out.held.as_mut(), witnessed.as_ref()) {
+            held.extend(w.iter().take(committed_releases).filter_map(|r| *r));
+        }
+        if out.completed {
+            crate::fuse_client::METRICS
+                .meta_reclaim_batch_size
+                .record(1);
+            self.destroyed_inodes.fetch_add(1, Ordering::Relaxed);
+            self.retire_pending_times(ino);
+        }
+        if out.entries > 1 || (out.entries == 1 && !out.completed) {
+            crate::fuse_client::METRICS
+                .reclaim_single_ino_chunked_destroys
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        if committed_releases > 0 {
+            crate::fuse_client::METRICS
+                .reclaim_release_destroy_joint_commits
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        Ok(out)
     }
 
     // -----------------------------------------------------------------

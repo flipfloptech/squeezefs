@@ -143,6 +143,57 @@ pub fn test_set_small_file_packing(on: Option<bool>) {
     );
 }
 
+/// A reclaimed ino's data-path teardown, PREPARED (the layout read, its
+/// reference releases and freeable blocks enumerated, its RAM-only custody
+/// torn down) but not yet COMMITTED — `DataRouter::prepare_reclaim`'s
+/// output, `DataRouter::reclaim_destroy`'s input (RECLAIM-ATOMIC): the
+/// releases ride the destroy's journal entry, and the RAM frees run
+/// AFTER that entry lands, under the release witness it produced.
+pub struct ReclaimPlan {
+    ino: u64,
+    /// The reference releases (deduped), staged into the destroy entry.
+    refs: Vec<crate::meta_backend::kv::block_refs::BlockRefOp>,
+    /// Pending TAKEs this process bound in RAM without persisting — a RAM
+    /// refcount entry with no durable record yet; budgeted beside the
+    /// witness (the witness cannot see them).
+    ram_only_takes: Vec<crate::meta_backend::kv::block_refs::BlockRef>,
+    /// Every key the layout (and the torn-down epoch) names, VERBATIM —
+    /// the free candidates the witness budget retains from.
+    blocks_to_free: Vec<String>,
+    /// The mapped indices (the staged-overlay key list's defense-in-depth
+    /// term).
+    map_indices: Vec<u32>,
+    /// The layout's block map lives in the kvmap tree (PR 2): its records
+    /// are swept once the head is destroyed.
+    kvmap_head: bool,
+}
+
+/// `DataRouter::reclaim_destroy`'s per-ino verdict.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReclaimVerdict {
+    /// The record and its xattrs are destroyed; its releases rode the same
+    /// entry (a peer-owned ino's shipped ahead of its shipped destroy).
+    Destroyed,
+    /// The destroy was WITHHELD: the record survives with its layout and
+    /// its references (or, for a chunked destroy, the un-committed rest of
+    /// them), and the next reclaim/sweep retries the pair. The reason.
+    Refused(String),
+    /// Nothing to destroy under the guard — the ino is live (`nlink > 0`)
+    /// or has no record; nothing freed.
+    Skipped,
+}
+
+/// What `DataRouter::finish_reclaim` may free after the commit that
+/// carried (or did not carry) the plan's releases.
+enum ReclaimFreeGate {
+    /// Every candidate (the derived posture / a shipped release).
+    All,
+    /// Only what the witness says this ino held (plus the RAM-only takes).
+    Ledger(Vec<crate::meta_backend::kv::block_refs::BlockRef>),
+    /// Nothing — no release landed.
+    Nothing,
+}
+
 /// What a staged file promoted INTO — `DataRouter::promote_staged_file`'s
 /// size dispatch: `Inline` = its payload now rides the layout record (no
 /// block), `Packed` = a slot of the volume's shared open pack block (the
@@ -8187,31 +8238,42 @@ impl DataRouter {
     /// (`fuse_client::reclaim_orphaned_batch`), minus the parts that
     /// cannot exist at mount init: no RAM-parked overlays, no open
     /// handles, no reclaim-latch contention (the latch is FUSE-wired and
-    /// nothing publishes yet). `delete_file` releases the durable
-    /// references and frees the blocks; `destroy_inodes` erases the
-    /// records — its live-nlink skip is a second guard on the corpse
+    /// nothing publishes yet). Each corpse is PREPARED
+    /// ([`Self::prepare_reclaim`]) and destroyed with its reference
+    /// releases riding the destroy entry ([`Self::reclaim_destroy`]) —
+    /// `destroy_inodes`' live-nlink skip is a second guard on the corpse
     /// classification.
     ///
-    /// **The work is CHUNKED to the journal's whole-entry cap** (fstests
+    /// **The work is PACKED to the journal's whole-entry cap** (fstests
     /// generic/749 on the 1.2.3 release chain, 2026-09-11): the population
-    /// is partitioned by `plan_destroy_chunks` — each chunk's destroy
-    /// records priced in the admission's own framing — and each chunk runs
-    /// release + free, then ITS destroy, before the next chunk starts. The
-    /// prior shape ran every corpse's `delete_file` and then ONE destroy
-    /// for the whole population: at 68,099 corpses that entry was 6 MB
-    /// against the 128 KiB cap, refused at every mount, so every corpse
-    /// record survived with its references released and its blocks
-    /// free-listed — and the next mount's retry decremented the LIVE
-    /// owners that had re-minted those offsets (the double release
-    /// `delete_file`'s ledger gate now refuses). A chunk's destroy failure
-    /// is loud and STOPS the sweep: the chunks behind it are untouched
-    /// (leak-safe), the failed chunk's corpses are the gated shape, and
-    /// the next mount retries.
+    /// is prepared in batches no larger than the most corpses one entry
+    /// could carry, and `reclaim_destroy` prices every corpse in the
+    /// admission's own framing — record + xattr `Delete`s AND its release
+    /// `Delete`s — packing them into one entry per group. The prior shape
+    /// ran every corpse's `delete_file` and then ONE destroy for the whole
+    /// population: at 68,099 corpses that entry was 6 MB against the
+    /// 128 KiB cap, refused at every mount, so every corpse record survived
+    /// with its references released and its blocks free-listed — and the
+    /// next mount's retry decremented the LIVE owners that had re-minted
+    /// those offsets (the double release the release witness now refuses).
+    /// Since RECLAIM-ATOMIC a release cannot land without its destroy, so
+    /// that state is minted by nothing here; a corpse whose own destroy
+    /// exceeds the cap is destroyed across entries (releases first, layout
+    /// and record last); a corpse whose entry is refused is RETAINED with
+    /// its references (counted, one WARN) and retried by the next mount.
+    /// Returns the number of corpses destroyed.
     pub async fn sweep_unlinked_corpses(&self) -> Result<u64> {
+        use crate::meta_backend::kv::journal::{entry_payload_cap, record_frame_len};
+        use crate::meta_backend::kv::record::INODE_KEY_LEN;
         let Some(backend) = self.inner.meta_backend.get() else {
             return Ok(0);
         };
         let mut swept = 0u64;
+        // The most corpses one entry could ever carry (the cheapest corpse
+        // is its bare inode `Delete`): preparing more per batch buys no
+        // packing and holds every plan's key list in RAM for nothing.
+        let prepare_batch =
+            (entry_payload_cap() / record_frame_len(INODE_KEY_LEN, 0)).max(1) as usize;
         for (v_idx, be) in backend
             .volumes
             .iter()
@@ -8243,57 +8305,63 @@ impl DataRouter {
             if corpses.is_empty() {
                 continue;
             }
-            let chunks = backend.plan_destroy_chunks(&corpses).await?;
             log::warn!(
                 "mount-time corpse sweep: {} unlinked inode(s) a prior era never \
                  reclaimed on {} (lost final FORGET — abort-unmount, kill -9, or \
-                 kernel cache retention); releasing their references and blocks in \
-                 {} destroy chunk(s)",
+                 kernel cache retention); releasing their references and blocks \
+                 with each destroy entry",
                 corpses.len(),
                 be.device_path().display(),
-                chunks.len()
             );
             let fail_destroy =
                 crate::env_knobs::bool_knob("SQUEEZEFS_TEST_CORPSE_SWEEP_FAIL_DESTROY", false);
-            for chunk in chunks {
-                for &ino in &chunk {
-                    let file_path = crate::keys::inode_path(ino);
-                    if let Err(e) = self.delete_file(&file_path).await {
-                        // Log-and-proceed, the reclaim batch's own posture:
-                        // whatever this corpse's teardown could not release
-                        // is exactly what fsck C2/C8 name, and the destroy
-                        // below still erases the record.
-                        log::warn!(
-                            "corpse sweep: delete_file(ino {ino}) failed (proceeding to \
-                             destroy): {e:?}"
-                        );
-                    }
-                }
-                // PR 6b: a corpse whose delete_file took the A2 sweep
-                // handoff keeps its record + cursor head — the sweep job's
-                // terminal chunk owns the destroy; destroying here would
-                // orphan every remaining record and strand its references.
-                let destroyable: Vec<u64> = chunk
-                    .iter()
-                    .copied()
-                    .filter(|&i| !self.kvmap_sweep_corpse_pending(i))
-                    .collect();
-                if destroyable.is_empty() {
-                    continue;
-                }
-                // Test seam (`SQUEEZEFS_TEST_CORPSE_SWEEP_FAIL_DESTROY`):
-                // the destroy fails after the chunk's `delete_file`s ran —
-                // the released-references-with-live-records state the
-                // next mount's sweep must find harmless.
+            for batch in corpses.chunks(prepare_batch) {
+                // Test seam (`SQUEEZEFS_TEST_CORPSE_SWEEP_FAIL_DESTROY`): the
+                // PRE-FIX two-commit shape with its destroy refused — every
+                // corpse's references released and blocks freed in a
+                // standalone commit, its record left live. The state a
+                // 1.2.3 volume carries into this binary; the release
+                // witness must find it harmless on the next mount.
                 if fail_destroy {
+                    for &ino in batch {
+                        let _ = self.delete_file(&crate::keys::inode_path(ino)).await;
+                    }
                     return Err(SqueezefsError::InvalidOperation(
                         "corpse sweep destroy refused by SQUEEZEFS_TEST_CORPSE_SWEEP_FAIL_DESTROY \
                          (test seam)"
                             .to_string(),
                     ));
                 }
-                crate::meta_ship::publish::destroy_inodes(backend, &destroyable).await?;
-                swept += destroyable.len() as u64;
+                let mut plans: Vec<ReclaimPlan> = Vec::with_capacity(batch.len());
+                for &ino in batch {
+                    match self.prepare_reclaim(&crate::keys::inode_path(ino)).await {
+                        Ok(Some(plan)) => plans.push(plan),
+                        // PR 6b: the A2 sweep handoff keeps the record +
+                        // cursor head — the sweep job's terminal chunk owns
+                        // the destroy; destroying here would orphan every
+                        // remaining record and strand its references.
+                        Ok(None) => {}
+                        Err(e) => {
+                            // The layout could not be read, so its releases
+                            // cannot be staged: destroying would orphan
+                            // them. Retained for the next mount, counted.
+                            crate::fuse_client::METRICS
+                                .reclaim_destroy_refused_release_failed
+                                .fetch_add(1, Ordering::Relaxed);
+                            log::warn!(
+                                "corpse sweep: preparing ino {ino} failed ({e}); its record is \
+                                 RETAINED with its references and the next mount retries \
+                                 (reclaim_destroy_refused_release_failed)"
+                            );
+                        }
+                    }
+                }
+                swept += self
+                    .reclaim_destroy(plans)
+                    .await
+                    .iter()
+                    .filter(|(_, v)| matches!(v, ReclaimVerdict::Destroyed))
+                    .count() as u64;
             }
         }
         Ok(swept)
@@ -22798,8 +22866,54 @@ impl DataRouter {
         Ok(())
     }
 
-    /// Safely delete all underlying storage files/blocks associated with the file.
+    /// Safely delete all underlying storage files/blocks associated with
+    /// the file — the standalone form: [`Self::prepare_reclaim`], the
+    /// ino's reference releases in their OWN commit, then the finish half
+    /// (the RAM frees) under that commit's witness. The reclaim
+    /// batch and the mount-time sweep do NOT use it (their releases ride
+    /// the destroy entry — [`Self::reclaim_destroy`]); fsck C9's repair
+    /// does, and it destroys only on `Ok`.
+    ///
+    /// `Err` ⇔ the releases did NOT commit (or the layout could not be
+    /// read): the caller must not destroy the record — its references are
+    /// still on the ledger, and a destroy would orphan them forever
+    /// (RECLAIM-ATOMIC residual A). The RAM/staging teardown still ran
+    /// (nameless, `nlink == 0`, not open: orphan custody either way).
     pub async fn delete_file(&self, file_path: &str) -> Result<()> {
+        let Some(plan) = self.prepare_reclaim(file_path).await? else {
+            return Ok(());
+        };
+        let gate = if plan.refs.is_empty() {
+            ReclaimFreeGate::All
+        } else {
+            use crate::meta_backend::kv::block_refs::ReleaseWitness;
+            match self.release_block_refs(plan.ino, &plan.refs).await {
+                Ok(ReleaseWitness::Derived) | Ok(ReleaseWitness::Shipped) => ReclaimFreeGate::All,
+                Ok(ReleaseWitness::Ledger(held)) => ReclaimFreeGate::Ledger(held),
+                Err(e) => {
+                    let ino = plan.ino;
+                    log::warn!(
+                        "durable block-reference release failed for reclaimed ino {ino}: {e} \
+                         (the record and its references survive — nothing freed, nothing \
+                         destroyed; the next reclaim retries the pair)"
+                    );
+                    self.finish_reclaim(plan, ReclaimFreeGate::Nothing, false)
+                        .await;
+                    return Err(e);
+                }
+            }
+        };
+        self.finish_reclaim(plan, gate, true).await;
+        Ok(())
+    }
+
+    /// The reclaim's PREPARE half (RECLAIM-ATOMIC): read the ino's layout,
+    /// enumerate its reference releases and freeable blocks, tear down its
+    /// RAM-only custody (the open rewrite epoch, the staged image) — and
+    /// commit NOTHING to the ledger. `None` = the over-threshold kvmap
+    /// corpse took the PR 6b sweep handoff (its own O(1) commit; the sweep
+    /// job's terminal chunk owns the destroy).
+    pub async fn prepare_reclaim(&self, file_path: &str) -> Result<Option<ReclaimPlan>> {
         // Reclaim-latch serialization point (the live-statfs drift fix):
         // the caller set the ino's reclaim latch BEFORE calling here
         // (`reclaim_inflight` admission claim / fsck repair's exclusive
@@ -22832,38 +22946,33 @@ impl DataRouter {
         // close (which re-registers under this same lock on a transient
         // failure). The epoch's parked custody joins the corpse's frees
         // below; its deferred accounting notes join the corpse's release
-        // commit (both the FIND-M11-A reclaimed-ino orphan-discard law —
+        // set (both the FIND-M11-A reclaimed-ino orphan-discard law —
         // nlink is 0 and nothing is open, never live acked data).
-        let ino_for_fence = parse_inode_from_path(file_path);
+        let ino = parse_inode_from_path(file_path);
         // PR 6b (design §3/A2 + Rev 1.6's corpse design point): probe the
         // over-threshold kvmap CORPSE handoff BEFORE `fetch_metadata` —
         // the fetch rehydrates the FULL tree-resolved map (Rev 1.3 #2),
         // which for the PB class is exactly the O(records) work the
         // handoff exists to defer. Probed on the durable head alone.
-        let corpse_handoff = self.kvmap_corpse_handoff_qualifies(ino_for_fence).await;
+        let corpse_handoff = self.kvmap_corpse_handoff_qualifies(ino).await;
         let reclaimed_epoch = {
-            let fence = meta_lock_acquire(ino_for_fence).await;
-            let epoch = self
-                .inner
-                .rewrite_epochs
-                .remove_sync(&ino_for_fence)
-                .map(|(_, e)| e);
+            let fence = meta_lock_acquire(ino).await;
+            let epoch = self.inner.rewrite_epochs.remove_sync(&ino).map(|(_, e)| e);
             drop(fence);
             epoch
         };
         if corpse_handoff {
-            return self
-                .kvmap_corpse_sweep_handoff(ino_for_fence, file_path, reclaimed_epoch)
-                .await;
+            self.kvmap_corpse_sweep_handoff(ino, file_path, reclaimed_epoch)
+                .await?;
+            return Ok(None);
         }
         let meta = self.fetch_metadata(file_path).await?;
 
         let mut blocks_to_free: Vec<String> = Vec::new();
-        // Spec §6.2 item 1: the corpse's durable references, released
-        // before its blocks are. See the release ordering note at the
-        // `release_block_refs` call below.
-        let ino = parse_inode_from_path(file_path);
+        // Spec §6.2 item 1: the corpse's durable references — released
+        // in the SAME journal entry as its record (RECLAIM-ATOMIC).
         let mut ref_changes: Vec<(u32, String, bool)> = Vec::new();
+        let mut map_indices: Vec<u32> = Vec::new();
 
         if let Some(ref block_map) = meta.block_map {
             for (b, bk) in block_map.iter() {
@@ -22874,6 +22983,7 @@ impl DataRouter {
                 // (`pack_{partial,terminal}_frees`) reads the size-carrying
                 // shape a packed tenant's mapping carries.
                 blocks_to_free.push(bk.clone());
+                map_indices.push(*b);
             }
         }
 
@@ -22900,8 +23010,9 @@ impl DataRouter {
                 blocks_to_free.push(block_key.to_string());
             } else if map_id.starts_with(kvmap_head_prefix()) {
                 // PR 2 (Rev 1.1 #4): the corpse's tree-7 records are swept
-                // below — there is no blob to free; the data blocks ride
-                // `meta.block_map` (the fetch rehydrated the full map).
+                // by the finish half once the head is destroyed — there is
+                // no blob to free; the data blocks ride `meta.block_map`
+                // (the fetch rehydrated the full map).
                 kvmap_head = true;
             }
         }
@@ -22944,33 +23055,30 @@ impl DataRouter {
             blocks_to_free.dedup();
         }
 
-        // Spec §6.2 item 1 — release the corpse's durable references
-        // BEFORE the blocks themselves, and in their own commit.
+        // Spec §6.2 item 1 — the corpse's durable references, released in
+        // the SAME entry as its record and xattrs (RECLAIM-ATOMIC, closing
+        // the corpse-sweep record's residual A). The two halves of the old
+        // two-commit shape each had a failure mode:
         //
-        // Ordering rationale (the two crash windows, both safe):
-        //
-        // * **release → crash → no destroy.** The corpse record and its
-        //   layout survive with their references gone (the derived oracle
-        //   COUNTS a corpse's layout since the 2026-08-23 census
-        //   correction, so this reads as C8 drift until the next mount's
-        //   sweep destroys the record). That retry re-reads the surviving
-        //   layout — and its frees MUST be gated on the release witness
-        //   below: the blocks are already free or already another owner's
-        //   (the generic/749 double release, 2026-09-11).
-        // * **crash → no release.** The corpse's references survive, so
-        //   recovery keeps its blocks ALLOCATED — conservative in the safe
-        //   direction (a leak, never a double-owner mint). Existing
-        //   machinery reclaims it: fsck C2 (`allocated with zero
-        //   referencers`, whose referencer walk also skips corpses) and the
-        //   C8 drift ledger name it.
-        //
-        // Its own transaction, deliberately: unlink/reclaim is not the
-        // publish path (the no-second-commit rule is about the block
-        // publish), and `destroy_inodes` is a batched multi-ino commit that
-        // does not — and should not — decode layouts to learn block keys.
+        // * **release landed, destroy did not** (the over-cap sweep entry,
+        //   a kill between the commits): the record and its layout survived
+        //   with their references gone — the state the release WITNESS
+        //   makes harmless on retry (a release with no record behind it is
+        //   a counted no-op, never a RAM decrement: the generic/749 double
+        //   release, 2026-09-11). That state is now reachable only from a
+        //   pre-fix volume or a crash between the entries of a chunked
+        //   single-ino destroy, and the gate still stands for both.
+        // * **release did not land, destroy did** (ring admission, a
+        //   fail-stopped volume's barrier, an I/O error — and every file
+        //   whose release set alone exceeded the whole-entry cap, since the
+        //   standalone release was never chunked): the inode was gone with
+        //   its references on the ledger FOREVER — the block could never
+        //   free, fsck C8 drifted at every mount. One entry makes that
+        //   unrepresentable: a refused entry leaves record, layout and
+        //   references together, and the next reclaim retries the pair.
         //
         // The corpse's DEFERRED accounting notes drain into this same
-        // release commit (the C8 conviction's other half): the snapshot map
+        // release set (the C8 conviction's other half): the snapshot map
         // above may carry bindings whose durable counterpart is still the
         // PREVIOUS key — the notes are the exact durable→RAM delta — so
         // releases computed from the map alone delete records that were
@@ -22988,7 +23096,7 @@ impl DataRouter {
         // is a block this process minted (or pinned) and bound in RAM
         // without persisting — its RAM refcount entry exists (allocation
         // seeded it) while its durable record does not YET. The witness
-        // below cannot see those, so they are budgeted here, before the
+        // cannot see those, so they are budgeted beside it, before the
         // dedup folds the take into the map-derived release of the same
         // reference.
         let ram_only_takes: Vec<crate::meta_backend::kv::block_refs::BlockRef> = pending
@@ -23008,80 +23116,92 @@ impl DataRouter {
                 }
             }
         }
-        // The double-release gate (fstests generic/749 on the 1.2.3 release
-        // chain, 2026-09-11): the release commit WITNESSES which of this
-        // ino's records existed, and only those references — plus the
-        // RAM-only takes above — may decrement a RAM refcount below. The
-        // RAM count was seeded from the records that exist, so a release
-        // with no record behind it is not a reference this ino holds: its
-        // decrement would land on whichever LIVE owner holds the offset
-        // now (a corpse a prior sweep released but never destroyed — the
-        // over-cap destroy — naming the pack block every promotion lands
-        // in), terminally freeing that owner's block under its layout. A
-        // volume without the ledger keeps the derived posture (the layout
-        // walk seeded every surviving layout's references, corpses
-        // included); a peer-owned ino's frees ship, and the authority's
-        // executor validates them against its own ledger.
-        let free_budget: Option<std::collections::HashMap<(u64, u64), usize>> = if refs.is_empty() {
-            None
-        } else {
-            use crate::meta_backend::kv::block_refs::ReleaseWitness;
-            match self.release_block_refs(ino, &refs).await {
-                Ok(ReleaseWitness::Derived) | Ok(ReleaseWitness::Shipped) => None,
-                Ok(ReleaseWitness::Ledger(held)) => {
-                    let mut budget: std::collections::HashMap<(u64, u64), usize> =
-                        std::collections::HashMap::new();
-                    for r in held.iter().chain(ram_only_takes.iter()) {
-                        *budget.entry((r.vol_tag, r.block_idx)).or_insert(0) += 1;
-                    }
-                    Some(budget)
+        Ok(Some(ReclaimPlan {
+            ino,
+            refs,
+            ram_only_takes,
+            blocks_to_free,
+            map_indices,
+            kvmap_head,
+        }))
+    }
+
+    /// The reclaim's FINISH half: the RAM frees the commit's witness
+    /// admits, the kvmap record sweep (once the head is destroyed —
+    /// `sweep_map_records`), the staged-overlay teardown and the cache
+    /// invalidations. Runs on every edge of the destroy — a REFUSED destroy
+    /// frees nothing (`ReclaimFreeGate::Nothing`) and sweeps no records
+    /// (the head survives), but still retires the ino's RAM/staging
+    /// residue, which is orphan custody either way (nameless, `nlink == 0`,
+    /// not open — the FIND-M11-A reclaimed-ino discard law).
+    async fn finish_reclaim(
+        &self,
+        plan: ReclaimPlan,
+        gate: ReclaimFreeGate,
+        sweep_map_records: bool,
+    ) {
+        let ReclaimPlan {
+            ino,
+            refs: _,
+            ram_only_takes,
+            mut blocks_to_free,
+            map_indices,
+            kvmap_head,
+        } = plan;
+        let file_path = crate::keys::inode_path(ino);
+        match gate {
+            ReclaimFreeGate::All => {}
+            ReclaimFreeGate::Nothing => blocks_to_free.clear(),
+            ReclaimFreeGate::Ledger(held) => {
+                // The double-release gate (fstests generic/749 on the 1.2.3
+                // release chain, 2026-09-11): only the references the
+                // commit WITNESSED — plus the RAM-only takes — may
+                // decrement a RAM refcount. The RAM count was seeded from
+                // the records that exist, so a release with no record
+                // behind it is not a reference this ino holds: its
+                // decrement would land on whichever LIVE owner holds the
+                // offset now (a corpse a prior era released but never
+                // destroyed, naming the pack block every promotion lands
+                // in), terminally freeing that owner's block under its
+                // layout. A volume without the ledger keeps the derived
+                // posture (`All`); a peer-owned ino's frees ship, and the
+                // authority's executor validates them against its ledger.
+                let mut budget: std::collections::HashMap<(u64, u64), usize> =
+                    std::collections::HashMap::new();
+                for r in held.iter().chain(ram_only_takes.iter()) {
+                    *budget.entry((r.vol_tag, r.block_idx)).or_insert(0) += 1;
                 }
-                Err(e) => {
-                    // Never block the reclaim on the ledger — but never
-                    // free on an unwitnessed release either: the records
-                    // survive, so the next mount seeds these references
-                    // again and its sweep frees them under a witness (the
-                    // conservative window above; fsck C2/C8 name the
-                    // residue meanwhile).
+                let mut skipped = 0u64;
+                blocks_to_free.retain(|bk| {
+                    // An unresolvable key is not the ledger's to gate (the
+                    // same class the mount-time walk skips); the free
+                    // funnel refuses it on its own.
+                    let Some(r) = self.backend_router.block_ref_for(bk, ino, 0) else {
+                        return true;
+                    };
+                    match budget.get_mut(&(r.vol_tag, r.block_idx)) {
+                        Some(n) if *n > 0 => {
+                            *n -= 1;
+                            true
+                        }
+                        _ => {
+                            skipped += 1;
+                            false
+                        }
+                    }
+                });
+                if skipped > 0 {
+                    crate::fuse_client::METRICS
+                        .block_release_skipped_no_record
+                        .fetch_add(skipped, Ordering::Relaxed);
                     log::warn!(
-                        "durable block-reference release failed for reclaimed ino {ino}: {e} \
-                         (the corpse's references survive — its blocks stay accounted and \
-                         the next mount's sweep frees them; fsck C2/C8 name them meanwhile)"
+                        "reclaim of ino {ino}: {skipped} block release(s) skipped — the layout \
+                         names blocks this ino holds no durable reference to (a prior era \
+                         released them without destroying the record); their RAM refcounts \
+                         belong to the offsets' live owners and are untouched \
+                         (block_release_skipped_no_record)"
                     );
-                    Some(std::collections::HashMap::new())
                 }
-            }
-        };
-        if let Some(mut budget) = free_budget {
-            let mut skipped = 0u64;
-            blocks_to_free.retain(|bk| {
-                // An unresolvable key is not the ledger's to gate (the same
-                // class the mount-time walk skips); the free funnel refuses
-                // it on its own.
-                let Some(r) = self.backend_router.block_ref_for(bk, ino, 0) else {
-                    return true;
-                };
-                match budget.get_mut(&(r.vol_tag, r.block_idx)) {
-                    Some(n) if *n > 0 => {
-                        *n -= 1;
-                        true
-                    }
-                    _ => {
-                        skipped += 1;
-                        false
-                    }
-                }
-            });
-            if skipped > 0 {
-                crate::fuse_client::METRICS
-                    .block_release_skipped_no_record
-                    .fetch_add(skipped, Ordering::Relaxed);
-                log::warn!(
-                    "reclaim of ino {ino}: {skipped} block release(s) skipped — the layout names \
-                     blocks this ino holds no durable reference to (a prior era released them \
-                     without destroying the record); their RAM refcounts belong to the offsets' \
-                     live owners and are untouched (block_release_skipped_no_record)"
-                );
             }
         }
 
@@ -23090,8 +23210,10 @@ impl DataRouter {
         // NEVER silent residue: a failure is loud and the records stay
         // for fsck to name (leak-safe — they reference blocks the frees
         // below reclaim, so the worst residue is a stale record, exactly
-        // the class the A1 crossing prologue re-sweeps).
-        if kvmap_head {
+        // the class the A1 crossing prologue re-sweeps). Only once the
+        // head is gone: swept records under a surviving head would leave
+        // the next sweep no map to derive the releases from.
+        if kvmap_head && sweep_map_records {
             if let Some(backend) = self.inner.meta_backend.get() {
                 if let Err(e) = backend.sweep_block_map(ino, map_migrate_chunk()).await {
                     log::warn!(
@@ -23106,12 +23228,6 @@ impl DataRouter {
             let free_refs: Vec<&str> = blocks_to_free.iter().map(|s| s.as_str()).collect();
             let _ = self.backend_router.free_blocks(&free_refs).await;
         }
-
-        // No per-corpse `removexattr("layout")` transaction here: the sole
-        // caller is inode reclaim, whose batched `destroy_inodes` kills the
-        // whole xattr block inside its own commit (one transaction per batch
-        // instead of one per corpse — the extra commit's sector guards
-        // collided with foreground unlinks under delete storms).
 
         // Staged-overlay teardown is O(PRESENT + map), never O(logical
         // size): the pre-fix sweep enumerated EVERY logical block
@@ -23136,11 +23252,9 @@ impl DataRouter {
                 .nvme
                 .staged_keys_with_prefix(&format!("active_block_ext:{file_path}:")),
         );
-        if let Some(ref block_map) = meta.block_map {
-            for &b in block_map.keys() {
-                keys.push(crate::keys::active_block_for_path(file_path, b).to_string());
-                keys.push(crate::keys::active_block_ext_for_path(file_path, b).to_string());
-            }
+        for b in map_indices {
+            keys.push(crate::keys::active_block_for_path(&file_path, b).to_string());
+            keys.push(crate::keys::active_block_ext_for_path(&file_path, b).to_string());
         }
         keys.sort_unstable();
         keys.dedup();
@@ -23153,15 +23267,272 @@ impl DataRouter {
         keys.retain(|k| crate::writer_scope::key_is_mine(k));
         let _ = self.cache.nvme.remove_active_blocks_async(keys).await;
 
-        self.cache.write_lru.remove(file_path);
-        self.cache.read_lru.remove(file_path);
+        self.cache.write_lru.remove(&file_path);
+        self.cache.read_lru.remove(&file_path);
         // PR 6c-i hygiene: partial-mode inos route through the corpse
         // handoff, so a registry entry here is clean-by-construction —
         // it goes with the ino either way.
-        self.kvmap_partial_teardown(parse_inode_from_path(file_path));
-        self.metadata_cache
-            .invalidate(&parse_inode_from_path(file_path));
-        Ok(())
+        self.kvmap_partial_teardown(ino);
+        self.metadata_cache.invalidate(&ino);
+    }
+
+    /// RECLAIM-ATOMIC: destroy the prepared corpses with their reference
+    /// releases riding the destroy entries — the reclaim batch's and the
+    /// mount-time sweep's ONE commit primitive. Every plan reaches a
+    /// terminal verdict; the caller's per-ino tail (the FUSE claim release,
+    /// lease/cache teardown) runs on every verdict.
+    ///
+    /// * Local plans are grouped by home volume and PACKED to the journal's
+    ///   whole-entry cap in the admission's own framing (the record term
+    ///   [`crate::meta_backend::RoutedMetaBackend::destroy_entry_bytes`] +
+    ///   the release term
+    ///   [`crate::meta_backend::kv::block_refs::release_records_bytes`]) —
+    ///   one entry per group; a failed group BISECTS (one persistently
+    ///   failing ino must wedge only itself, never its batch-mates) and a
+    ///   singleton failure is a REFUSED destroy: record, layout and
+    ///   references survive together, retried by the next reclaim/sweep,
+    ///   counted `reclaim_destroy_refused_release_failed`, one WARN.
+    /// * A single plan past the cap takes the chunked destroy
+    ///   ([`KvMetaBackend::destroy_inode_chunked`]: releases first, the
+    ///   layout and the record last); a destroy that stopped between its
+    ///   entries frees exactly the committed, witnessed releases and is
+    ///   refused for the rest.
+    /// * A peer-owned plan ships its release FIRST and its destroy only if
+    ///   the release landed (the joint entry cannot cross the wire); its
+    ///   frees ship too, validated by the authority's ledger.
+    ///
+    /// [`KvMetaBackend::destroy_inode_chunked`]: crate::meta_backend::kv::backend::KvMetaBackend::destroy_inode_chunked
+    pub async fn reclaim_destroy(&self, plans: Vec<ReclaimPlan>) -> Vec<(u64, ReclaimVerdict)> {
+        let mut out: Vec<(u64, ReclaimVerdict)> = Vec::with_capacity(plans.len());
+        let Some(backend) = self.inner.meta_backend.get() else {
+            for plan in plans {
+                let ino = plan.ino;
+                self.finish_reclaim(plan, ReclaimFreeGate::Nothing, false)
+                    .await;
+                out.push((
+                    ino,
+                    ReclaimVerdict::Refused("metadata backend not initialized".to_string()),
+                ));
+            }
+            return out;
+        };
+        let backend = backend.clone();
+        let mut shipped: Vec<ReclaimPlan> = Vec::new();
+        // Home volume → its plans, in arrival order.
+        let mut by_volume: Vec<(usize, Vec<ReclaimPlan>)> = Vec::new();
+        for plan in plans {
+            match crate::meta_ship::publish::is_peer_owned(&backend, plan.ino) {
+                Ok(true) => shipped.push(plan),
+                Ok(false) => {
+                    let (v_idx, _) = backend.route_ino(plan.ino);
+                    match by_volume.iter_mut().find(|(v, _)| *v == v_idx) {
+                        Some((_, group)) => group.push(plan),
+                        None => by_volume.push((v_idx, vec![plan])),
+                    }
+                }
+                Err(e) => {
+                    let ino = plan.ino;
+                    self.refuse_reclaim(plan, &e.to_string(), &mut out).await;
+                    log::debug!("reclaim of ino {ino}: ownership route refused: {e}");
+                }
+            }
+        }
+        for plan in shipped {
+            self.reclaim_destroy_shipped(&backend, plan, &mut out).await;
+        }
+        for (_, group) in by_volume {
+            self.reclaim_destroy_local(&backend, group, &mut out).await;
+        }
+        out
+    }
+
+    /// The REFUSED arm: the record survives with its layout and its
+    /// references; nothing frees; one WARN; the gauge.
+    async fn refuse_reclaim(
+        &self,
+        plan: ReclaimPlan,
+        why: &str,
+        out: &mut Vec<(u64, ReclaimVerdict)>,
+    ) {
+        let ino = plan.ino;
+        let refs = plan.refs.len();
+        crate::fuse_client::METRICS
+            .reclaim_destroy_refused_release_failed
+            .fetch_add(1, Ordering::Relaxed);
+        log::warn!(
+            "reclaim of ino {ino}: destroy WITHHELD — the entry carrying its {refs} reference \
+             release(s) did not commit ({why}); the record, its layout and its references \
+             survive together and the next reclaim/sweep retries the pair \
+             (reclaim_destroy_refused_release_failed)"
+        );
+        self.finish_reclaim(plan, ReclaimFreeGate::Nothing, false)
+            .await;
+        out.push((ino, ReclaimVerdict::Refused(why.to_string())));
+    }
+
+    /// A peer-owned corpse: release (shipped, witnessed `Shipped`), then
+    /// destroy (shipped) — the destroy only if the release landed.
+    async fn reclaim_destroy_shipped(
+        &self,
+        backend: &std::sync::Arc<crate::meta_backend::RoutedMetaBackend>,
+        plan: ReclaimPlan,
+        out: &mut Vec<(u64, ReclaimVerdict)>,
+    ) {
+        use crate::meta_backend::kv::block_refs::ReleaseWitness;
+        let ino = plan.ino;
+        let gate = if plan.refs.is_empty() {
+            ReclaimFreeGate::All
+        } else {
+            match crate::meta_ship::publish::release_block_refs_witnessed(backend, ino, &plan.refs)
+                .await
+            {
+                Ok(ReleaseWitness::Ledger(held)) => ReclaimFreeGate::Ledger(held),
+                Ok(_) => ReclaimFreeGate::All,
+                Err(e) => {
+                    self.refuse_reclaim(plan, &e.to_string(), out).await;
+                    return;
+                }
+            }
+        };
+        self.finish_reclaim(plan, gate, true).await;
+        match crate::meta_ship::publish::destroy_inodes(backend, &[ino]).await {
+            Ok(()) => out.push((ino, ReclaimVerdict::Destroyed)),
+            Err(e) => {
+                // Released, not destroyed: the owner's next sweep re-reads
+                // the surviving layout, its releases witness no record
+                // (counted skipped) and the destroy completes — the
+                // ledger-gated retry, never a leak.
+                log::warn!(
+                    "reclaim of ino {ino}: the shipped release landed but the shipped destroy \
+                     failed ({e}); the owner's next sweep destroys the record under the \
+                     release witness"
+                );
+                out.push((ino, ReclaimVerdict::Refused(e.to_string())));
+            }
+        }
+    }
+
+    /// One home volume's plans: pack to the cap, commit each group as ONE
+    /// entry (bisecting on failure), chunk the singles past the cap.
+    async fn reclaim_destroy_local(
+        &self,
+        backend: &std::sync::Arc<crate::meta_backend::RoutedMetaBackend>,
+        plans: Vec<ReclaimPlan>,
+        out: &mut Vec<(u64, ReclaimVerdict)>,
+    ) {
+        use crate::meta_backend::kv::block_refs::{release_records_bytes, DestroyVerdict};
+        let cap = crate::meta_backend::kv::journal::entry_payload_cap();
+        let mut groups: Vec<Vec<ReclaimPlan>> = Vec::new();
+        let mut overcap: Vec<ReclaimPlan> = Vec::new();
+        let mut current: Vec<ReclaimPlan> = Vec::new();
+        let mut current_bytes = 0u64;
+        for plan in plans {
+            let bytes = match backend.destroy_entry_bytes(plan.ino).await {
+                Ok(b) => b + release_records_bytes(plan.refs.len()),
+                Err(e) => {
+                    self.refuse_reclaim(plan, &format!("pricing the destroy failed: {e}"), out)
+                        .await;
+                    continue;
+                }
+            };
+            if bytes > cap {
+                overcap.push(plan);
+                continue;
+            }
+            if !current.is_empty() && current_bytes + bytes > cap {
+                groups.push(std::mem::take(&mut current));
+                current_bytes = 0;
+            }
+            current.push(plan);
+            current_bytes += bytes;
+        }
+        if !current.is_empty() {
+            groups.push(current);
+        }
+
+        // Bisect stack: a failed group splits; a failed singleton refuses.
+        groups.reverse();
+        while let Some(group) = groups.pop() {
+            let items: Vec<(u64, &[crate::meta_backend::kv::block_refs::BlockRefOp])> =
+                group.iter().map(|p| (p.ino, p.refs.as_slice())).collect();
+            match crate::meta_ship::publish::destroy_inodes_releasing(backend, &items).await {
+                Ok(verdicts) => {
+                    for (plan, (_, verdict)) in group.into_iter().zip(verdicts) {
+                        let ino = plan.ino;
+                        match verdict {
+                            DestroyVerdict::Destroyed { held } => {
+                                let gate = match held {
+                                    Some(h) => ReclaimFreeGate::Ledger(h),
+                                    None => ReclaimFreeGate::All,
+                                };
+                                self.finish_reclaim(plan, gate, true).await;
+                                out.push((ino, ReclaimVerdict::Destroyed));
+                            }
+                            DestroyVerdict::Skipped => {
+                                self.finish_reclaim(plan, ReclaimFreeGate::Nothing, false)
+                                    .await;
+                                out.push((ino, ReclaimVerdict::Skipped));
+                            }
+                        }
+                    }
+                }
+                Err(e) if group.len() > 1 => {
+                    let mut group = group;
+                    let tail = group.split_off(group.len() / 2);
+                    groups.push(tail);
+                    groups.push(group);
+                    log::debug!("reclaim destroy group failed ({e}); bisecting");
+                }
+                Err(e) => {
+                    // A singleton by the arm above (groups are never empty);
+                    // a refusal, never a panic, on a reclaim path.
+                    let Some(plan) = group.into_iter().next() else {
+                        continue;
+                    };
+                    self.refuse_reclaim(plan, &e.to_string(), out).await;
+                }
+            }
+        }
+
+        for plan in overcap {
+            let ino = plan.ino;
+            match crate::meta_ship::publish::destroy_inode_chunked(backend, ino, &plan.refs).await {
+                Ok(cd) if cd.skipped => {
+                    self.finish_reclaim(plan, ReclaimFreeGate::Nothing, false)
+                        .await;
+                    out.push((ino, ReclaimVerdict::Skipped));
+                }
+                Ok(cd) => {
+                    // What may free: the witnessed releases whose entry
+                    // COMMITTED (the ledger says free, so RAM must). On a
+                    // volume without the ledger a stopped destroy frees
+                    // nothing — the next mount's walk re-seeds the
+                    // surviving layout's references anyway.
+                    let gate = match (cd.completed, cd.held) {
+                        (_, Some(h)) => ReclaimFreeGate::Ledger(h),
+                        (true, None) => ReclaimFreeGate::All,
+                        (false, None) => ReclaimFreeGate::Nothing,
+                    };
+                    if cd.completed {
+                        self.finish_reclaim(plan, gate, true).await;
+                        out.push((ino, ReclaimVerdict::Destroyed));
+                    } else {
+                        let why = cd
+                            .stopped
+                            .unwrap_or_else(|| "stopped before its last entry".to_string());
+                        log::warn!(
+                            "reclaim of ino {ino}: chunked destroy stopped after {} committed \
+                             entr(ies) ({why}); the record and its layout survive — the next \
+                             sweep finishes it under the release witness",
+                            cd.entries
+                        );
+                        self.finish_reclaim(plan, gate, false).await;
+                        out.push((ino, ReclaimVerdict::Refused(why)));
+                    }
+                }
+                Err(e) => self.refuse_reclaim(plan, &e.to_string(), out).await,
+            }
+        }
     }
 
     /// Resolve a logical filesystem path (e.g., "/dir1/file.txt") to its FUSE inode number.

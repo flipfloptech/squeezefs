@@ -2074,6 +2074,141 @@ fn bench_crossvol_tx(c: &mut Criterion) {
     group.finish();
 }
 
+/// **The §4.6a merge sweep's projection walk** — one lap's census cost
+/// per RESIDENT leaf (`KvTree::merge_candidate_census`: the sweep's
+/// count phase and the D4 census's predicate, `is_merge_candidate` =
+/// one `fold_bytes_upper_with` per leaf, NO merges). This is the work
+/// `merge_sweep_budget_ms` bounds per checkpoint cycle (finding 49's
+/// drain law) and `meta_kv_merge_sweep_{ns,projections}` prices live.
+///
+/// Field-derived shapes (design-cow-kv-metadata §4.6a (e), finalized):
+///
+/// * `shipped_256k/*` — the shipped geometry with the XATTR/layout tree's
+///   shape: 256 KiB nodes, 4 KiB values (~50 records per ¾-fill leaf). The
+///   node cache's derived default is `max(budget/16, 512 MiB)` ≈ **2,048
+///   resident 256 KiB nodes**, so a full lap on a field cache costs ≈
+///   2,048 × a row's ns/leaf; the fixture holds 64 leaves (16 MiB) —
+///   per-leaf cost is per leaf.
+/// * `shipped_256k_dense/*` — the shipped geometry with the INODE/DENTRY
+///   tree's shape: 256 KiB nodes, 80 B values (≈ 100 B records, ~1,900
+///   per ¾-fill leaf). The projection walks every record group, so this
+///   row is the one to scale a field lap by (the sparse rows show the
+///   per-GROUP cost is what scales, not the node size); 32 leaves.
+/// * `small_64k/*` — the small-volume shape the space-recovery
+///   contracts run at: 64 KiB nodes, 1 KiB values (~45 records per leaf),
+///   128 leaves.
+///
+/// Three candidate densities per shape, the delete-heavy volume's
+/// spectrum: `0pct` (a fill-only tree — every leaf projects full),
+/// `10pct` / `90pct` (that share of leaves 95 %-deleted, tombstones
+/// COVERED by the durable tail so they project as elided — the estimator
+/// still walks every record group, and a deleted leaf carries its Puts
+/// AND its Deletes in the base until it compacts, which is why the dense
+/// rows cost MORE per leaf than the fill-only one). Throughput is in
+/// leaves, so Criterion reports ns/leaf directly.
+fn bench_kv_merge_sweep(c: &mut Criterion) {
+    let rt = Runtime::new().unwrap();
+    let mut group = c.benchmark_group("kv_merge_sweep");
+
+    struct Shape {
+        label: &'static str,
+        node_size: usize,
+        value_len: usize,
+        leaves: u64,
+    }
+    let shapes = [
+        Shape {
+            label: "shipped_256k",
+            node_size: DEFAULT_NODE_SIZE,
+            value_len: 4096,
+            leaves: 64,
+        },
+        Shape {
+            label: "shipped_256k_dense",
+            node_size: DEFAULT_NODE_SIZE,
+            value_len: 80,
+            leaves: 32,
+        },
+        Shape {
+            label: "small_64k",
+            node_size: 64 * 1024,
+            value_len: 1024,
+            leaves: 128,
+        },
+    ];
+    for shape in &shapes {
+        for pct in [0u64, 10, 90] {
+            let file = NamedTempFile::new().expect("temp volume");
+            let extents = shape.leaves * 8;
+            file.as_file()
+                .set_len(extents * shape.node_size as u64)
+                .expect("size volume");
+            let layout = NodeLayout::new(shape.node_size).expect("layout");
+            let cache = NodeCache::new(NodeCacheConfig {
+                path: file.path().to_path_buf(),
+                layout,
+                heap_base: 0,
+                budget_bytes: extents * shape.node_size as u64,
+                writeback_delta_bytes: DEFAULT_WRITEBACK_DELTA_BYTES,
+            });
+            let alloc = Arc::new(ExtentAllocator::format(extents, 0, 65_536));
+            let seq = Arc::new(AtomicU64::new(0));
+            let mut ctx = SmoContext::new(alloc.clone());
+            // Records per leaf at the split's ¾ fill, then enough keys for
+            // the leaf count; deletes make the chosen share of leaves
+            // 95 %-empty; every retirement covered (the K5 stand-in for a
+            // checkpoint) so the tombstones project as elided.
+            let per_leaf = (layout.split_part_capacity() / (shape.value_len + 32)).max(2) as u64;
+            let keys = per_leaf * shape.leaves;
+            let tree = rt.block_on(async {
+                let tree = KvTree::create(cache.clone(), &mut ctx, TREE_INODES, seq.clone())
+                    .await
+                    .expect("create");
+                for i in 0..keys {
+                    let mut v = vec![0u8; shape.value_len];
+                    v[..8].copy_from_slice(&i.to_le_bytes());
+                    tree.insert(&inode_key(i), v).await.expect("insert");
+                    if i % 64 == 63 {
+                        while tree.maintenance_pending() {
+                            tree.run_maintenance(&mut ctx).await.expect("maintenance");
+                        }
+                        alloc.advance_durable(seq.load(std::sync::atomic::Ordering::Relaxed));
+                    }
+                }
+                tree.flush_dirty(&mut ctx).await.expect("flush");
+                for i in 0..keys {
+                    let leaf_ix = i / per_leaf;
+                    if leaf_ix % 100 < pct && i % 20 != 0 {
+                        tree.delete(&inode_key(i)).await.expect("delete");
+                    }
+                }
+                tree.flush_dirty(&mut ctx).await.expect("flush deletes");
+                let s = seq.load(std::sync::atomic::Ordering::Relaxed);
+                cache.set_durable_tail(s);
+                alloc.advance_durable(s);
+                tree
+            });
+            let resident: u64 = {
+                let mut n = 0u64;
+                cache.for_each_node(|node| {
+                    if node.level() == 0 {
+                        n += 1;
+                    }
+                });
+                n
+            };
+            group.throughput(criterion::Throughput::Elements(resident));
+            group.bench_function(
+                BenchmarkId::new(shape.label, format!("{pct}pct_candidates")),
+                |b| {
+                    b.iter(|| black_box(tree.merge_candidate_census()));
+                },
+            );
+        }
+    }
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_kv_meta_metadata,
@@ -2091,6 +2226,7 @@ criterion_group!(
     bench_crossvol_tx,
     bench_xattr_name_screen,
     bench_superblock_cycle,
-    bench_append_partition
+    bench_append_partition,
+    bench_kv_merge_sweep
 );
 criterion_main!(benches);

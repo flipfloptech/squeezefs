@@ -463,6 +463,35 @@ mount (the A-arm rig reset the cluster; remount is part of every arm).
    (the squeeze-test A-B-B-A bracket — rig `rigs/2026-09-10-packing-rows-
    box.sh`, its manifest lists everything it creates on the box), then the
    default-flip decision, then the 1.2.3 release-gate trio.
+1r. **1.2.3 RELEASED — `stable-2026.09.3` = `fff56fcb` over the tested
+   `86eff517` (2026-09-11).** The flip landed (`fe714e6b`: packing ON by
+   default, `0` = the rollback; five one-block-arm contracts pin `=0`;
+   AGENTS.md program section, operations rows, design status Implemented).
+   The release chain ran THREE times from zero (record `.benchmarks/2026-09-
+   11-1.2.3-release-gate.md`): attempt 1 red in `task check` on the hoist
+   contract's one-block premise (`cc8258b9`; a `--no-fail-fast` pass of the
+   whole stage then attributed + closed the two load flakes — the 2 GiB
+   VmHWM = `dhat::Alloc`'s non-overridden `alloc_zeroed` touching the
+   lazily-built 512 × 4 MiB read-fill pool; the hop span band 25 % on box-hog
+   rows — `3c71742e`); attempt 2 red in fstests `generic/749` = **the
+   corpse-sweep double release, a P0 on the shipped path**
+   (`.benchmarks/2026-09-11-corpse-sweep-double-release.md`, fixed `86eff517`:
+   the release WITNESS gates RAM decrements on the durable records that
+   existed, a failed release frees nothing, the sweep's destroys are chunked
+   to the entry cap with release→free→destroy per chunk; accepted on the
+   failing run's own 68,099-corpse scratch volume); attempt 3 ALL GREEN —
+   `task check` 377 suites / 4,926 tests, fstests 787/783/4/**0**,
+   pjdfstests 8,798, LTP 174/0 (resumed once after the `/tmp` LTP tree aged
+   out under systemd-tmpfiles — venue, not product; board: the runners'
+   `/tmp` trees vs the 10-day cleaner), require-mount, zc 187 tests (this
+   laptop's sqz kernel), fuzz 401 M execs / 0 crashes. Release act
+   `fff56fcb`: train 1.2.2 → 1.2.3 across five crates + lockfiles + the four
+   doc version lines, RELEASE_NOTES 1.2.3 section, the gate record. Also
+   freed 386 GB of subagent `target/` dirs (`/home` 98 % → 77 %). **Then:**
+   `task dist:all` from the release worktree at the tag → ship the rocky8
+   pair to squeeze-test as `/scratch/tmp/squeezefs` + `libsqueezefs_il.so`
+   (the reset script's `SQZ` path, empty since the 2026-09-09 cleanup) —
+   documented; the box is NOT remounted (owner: least box use).
 2. **Kernel A/B, B arm** — after `squeeze-test` boots the 6.19.14 series
    WITH 0031 (or whichever box carries the patched kernel): on the box,
    `cd /scratch/tmp/sqz-agent/k26 && sudo env ARM=B KERNEL_TAG=<uname -r

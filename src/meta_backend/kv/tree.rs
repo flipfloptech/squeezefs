@@ -50,10 +50,7 @@
 use super::alloc_ext::{alloc_record, free_record, ExtentAllocator};
 use super::bset::{compact, BsetView};
 use super::journal::{entry_len_for, tag_for, JournalRing};
-use super::node::{
-    key_successor, load_node, split_node, write_node, NodeWriteParams, SplitDest, BSET_FRAME_LEN,
-    NODE_PAGE,
-};
+use super::node::{key_successor, load_node, split_node, write_node, NodeWriteParams, SplitDest};
 use super::node_cache::{CachedNode, LiveLookup, NodeCache, OwnedRec};
 use super::record::{Record, RecordKind};
 use super::KvError;
@@ -314,7 +311,13 @@ impl KvTree {
             cache.durable_tail(),
         )
         .await?;
-        let node = CachedNode::from_loaded(loaded, true, cache.charge_gauge(), cache.node_env())?;
+        let node = CachedNode::from_loaded(
+            loaded,
+            true,
+            cache.charge_gauge(),
+            cache.heap_promise_gauge(),
+            cache.node_env(),
+        )?;
         cache.publish(node);
         Ok(Self {
             tree_id,
@@ -1192,12 +1195,12 @@ impl KvTree {
         // Split parts fill to ~3/4 so appends have headroom (§4.4 fill
         // accounting); a single-part rewrite may fill the node (it fit
         // before folding, folding only shrinks).
-        let usable = layout.node_size() - NODE_PAGE - BSET_FRAME_LEN - super::bset::BSET_HEADER_LEN;
+        let usable = layout.fold_capacity();
         let total: usize = folded.iter().map(|r| r.record_ref().encoded_len()).sum();
         let parts: Vec<&[Record]> = if total <= usable {
             vec![&folded[..]]
         } else {
-            partition_records(&folded, usable * 3 / 4)
+            partition_records(&folded, layout.split_part_capacity())
         };
 
         // Claim fresh extents (internal class, §4.7) + write images.
@@ -1300,6 +1303,7 @@ impl KvTree {
                     loaded,
                     pinned,
                     self.cache.charge_gauge(),
+                    self.cache.heap_promise_gauge(),
                     self.cache.node_env(),
                 )?);
             }
@@ -1376,6 +1380,7 @@ impl KvTree {
                     loaded,
                     true,
                     self.cache.charge_gauge(),
+                    self.cache.heap_promise_gauge(),
                     self.cache.node_env(),
                 )?)
             } else {
@@ -1705,6 +1710,12 @@ impl KvTree {
 
     fn is_root(&self, node: &Arc<CachedNode>) -> bool {
         self.root().addr == node.addr()
+    }
+
+    /// Whether `addr` is this tree's current root (the heap admission's
+    /// root-split projection: a root leaf's split also mints a new root).
+    pub(crate) fn is_root_addr(&self, addr: u64) -> bool {
+        self.root().addr == addr
     }
 
     fn next_seq(&self) -> u64 {

@@ -693,6 +693,93 @@ impl NodeSnapshot {
         lo..hi
     }
 
+    /// An upper bound on the encoded bytes a compaction fold of this
+    /// snapshot PLUS `extra` (records about to be applied, in apply order
+    /// — newer than everything here) produces: §4.7 heap admission's
+    /// compaction-vs-split projection. Per distinct key across the base
+    /// bsets, both overlay runs and `extra`, the records at-or-above the
+    /// newest base-establishing record (`Put`/`Delete`) — everything below
+    /// is shadowed by the fold algebra, everything above folds INTO the
+    /// output (a `Delta` chain can only grow its base by at most its own
+    /// encoding). A pending `Delete`/`Put` therefore SHADOWS the key's
+    /// resident records — what makes a delete into a full leaf project as
+    /// the compaction it is. Tombstones count their own encoding: elision
+    /// needs the durable tail, which this estimate does not consult. One
+    /// linear merge over key-ascending sources (`extra` is sorted here);
+    /// runs once per node fill (only when the log is projected to
+    /// overflow), so its cost is amortized over the bytes that filled it.
+    pub fn fold_bytes_upper_with(&self, extra: &mut [(&[u8], RecordKind, usize)]) -> usize {
+        // Stable: same-key extra records keep apply order (newest last).
+        extra.sort_by(|a, b| a.0.cmp(b.0));
+        let base = &self.base;
+        let (mut b, mut s, mut t, mut x) = (0usize, 0usize, 0usize, 0usize);
+        let mut total = 0usize;
+        let establishes = |k: RecordKind| matches!(k, RecordKind::Put | RecordKind::Delete);
+        loop {
+            let kb = (b < base.entries.len()).then(|| base.key_at(&base.entries[b]));
+            let ks = self.stable.get(s).map(|r| &r.key[..]);
+            let kt = self.tail.get(t).map(|r| &r.key[..]);
+            let kx = extra.get(x).map(|r| r.0);
+            let Some(key) = [kb, ks, kt, kx].into_iter().flatten().min() else {
+                break;
+            };
+            let be = base.entries[b..]
+                .iter()
+                .take_while(|e| base.key_at(e) == key)
+                .count();
+            let se = self.stable[s..]
+                .iter()
+                .take_while(|r| r.key[..] == *key)
+                .count();
+            let te = self.tail[t..]
+                .iter()
+                .take_while(|r| r.key[..] == *key)
+                .count();
+            let xe = extra[x..].iter().take_while(|r| r.0 == key).count();
+            // The pending records are newer than every resident one: the
+            // newest pending base-establisher shadows the whole resident
+            // group; otherwise the resident group folds under its own
+            // newest establisher and every pending Delta rides on top.
+            let pending_base = extra[x..x + xe].iter().rposition(|r| establishes(r.1));
+            match pending_base {
+                Some(p) => {
+                    total += extra[x + p..x + xe].iter().map(|r| r.2).sum::<usize>();
+                }
+                None => {
+                    let base_seq = base.entries[b..b + be]
+                        .iter()
+                        .filter(|e| establishes(e.kind))
+                        .map(|e| e.seq)
+                        .chain(
+                            self.stable[s..s + se]
+                                .iter()
+                                .chain(&self.tail[t..t + te])
+                                .filter(|r| establishes(r.kind))
+                                .map(|r| r.seq),
+                        )
+                        .max()
+                        .unwrap_or(0);
+                    total += (b..b + be)
+                        .filter(|i| base.entries[*i].seq >= base_seq)
+                        .map(|i| base.record_ref(i).encoded_len())
+                        .sum::<usize>();
+                    total += self.stable[s..s + se]
+                        .iter()
+                        .chain(&self.tail[t..t + te])
+                        .filter(|r| r.seq >= base_seq)
+                        .map(|r| r.record_ref().encoded_len())
+                        .sum::<usize>();
+                    total += extra[x..x + xe].iter().map(|r| r.2).sum::<usize>();
+                }
+            }
+            b += be;
+            s += se;
+            t += te;
+            x += xe;
+        }
+        total
+    }
+
     /// The newest seq this node holds for `key` across every source —
     /// overlay runs AND the on-disk base bsets — or `None` when the key is
     /// unknown here. Order-independent by construction (max per group), so
@@ -1015,6 +1102,16 @@ pub struct NodeDirty {
     charged: u64,
     /// The owning cache's budget gauge (`NodeCache::cached_bytes`).
     charge: Arc<AtomicU64>,
+    /// §4.7 heap admission: extents PROMISED to the SMO this node's
+    /// pending bytes will need at the flush (0 = the pending bytes append
+    /// in place). Granted under the node write lock by the commit pass
+    /// against the volume's claimable budget; consumed by the SMO that
+    /// replaces the node ([`Self::take_overlay`]) or released when an
+    /// in-place append leaves the remainder fitting; Drop-owned like the
+    /// charge, so a dying object never strands ledger budget.
+    promised: u64,
+    /// The owning cache's promise ledger (`NodeCache::heap_promised`).
+    heap_promised: Arc<AtomicU64>,
 }
 
 /// A frozen-but-unwritten delta (§4.6 pt 1 snapshot-then-write).
@@ -1068,12 +1165,57 @@ impl NodeDirty {
         self.snap_tail.clear();
         let out = std::mem::take(&mut self.overlay);
         self.resync_charge();
+        // The SMO taking the delta is the one the promise was for: its
+        // claims already drew the budget the promise held.
+        self.release_promise();
         out
     }
 
     /// Node-relative unwritten-tail offset.
     pub fn tail_offset(&self) -> usize {
         self.tail_offset
+    }
+
+    /// Where this node's log would end after appending everything pending
+    /// plus `extra_bytes` more encoded record bytes: the in-flight frozen
+    /// frame (if any) and one append frame over the open delta + `extra`.
+    /// `> node_size` ⇒ the flush needs an SMO (§4.7 heap admission's
+    /// projection; conservative — a frozen delta and the open delta cost
+    /// two frames' headers where one flush might merge them).
+    pub fn projected_log_end(&self, layout: &NodeLayout, extra_bytes: usize) -> usize {
+        let frozen = self.frozen.as_ref().map_or(0, |f| f.frame_len);
+        self.tail_offset + frozen + layout.append_frame_len(self.overlay_bytes + extra_bytes)
+    }
+
+    /// Encoded bytes of the frozen delta awaiting its append (0 = none);
+    /// with the open delta they are the node's not-yet-serialized fold
+    /// input.
+    pub fn frozen_bytes(&self) -> usize {
+        self.frozen.as_ref().map_or(0, |f| {
+            f.records.iter().map(|r| r.record_ref().encoded_len()).sum()
+        })
+    }
+
+    /// Extents currently promised to this node's next SMO.
+    pub fn promised(&self) -> u64 {
+        self.promised
+    }
+
+    /// Promise `extents` more to this node's next SMO — the caller checked
+    /// the budget against the ledger under this node's write lock.
+    pub fn promise(&mut self, extents: u64) {
+        self.promised += extents;
+        self.heap_promised.fetch_add(extents, Ordering::AcqRel);
+    }
+
+    /// Return this node's promise to the ledger (the SMO consumed it, or
+    /// the pending bytes fit in place after an append).
+    pub fn release_promise(&mut self) {
+        if self.promised > 0 {
+            self.heap_promised
+                .fetch_sub(self.promised, Ordering::AcqRel);
+            self.promised = 0;
+        }
     }
 
     /// PR M9 (§5.7): bring the cache budget gauge in line with this open
@@ -1103,6 +1245,7 @@ impl Drop for NodeDirty {
         if self.charged > 0 {
             self.charge.fetch_sub(self.charged, Ordering::AcqRel);
         }
+        self.release_promise();
     }
 }
 
@@ -1166,11 +1309,13 @@ impl CachedNode {
     /// [`Self::apply_locked`] under the SMO's lock window (the §4.6
     /// "bounded second merge"). `charge` is the owning cache's budget
     /// gauge ([`NodeCache::cached_bytes`] — §5.7: overlay + memo bytes
-    /// ride the node-cache budget).
+    /// ride the node-cache budget); `heap_promised` is its §4.7 promise
+    /// ledger ([`NodeCache::heap_promised`]).
     pub fn from_loaded(
         loaded: LoadedNode,
         pinned: bool,
         charge: Arc<AtomicU64>,
+        heap_promised: Arc<AtomicU64>,
         env: Arc<NodeEnv>,
     ) -> Result<Arc<Self>, KvError> {
         let (header, buf, bset_ranges, tail_offset) = loaded.into_parts();
@@ -1203,6 +1348,8 @@ impl CachedNode {
                 tail_offset,
                 charged: 0,
                 charge: charge.clone(),
+                promised: 0,
+                heap_promised,
             }),
             ref_bit: AtomicBool::new(true),
             pinned: AtomicBool::new(pinned),
@@ -2048,6 +2195,15 @@ pub struct NodeCache {
     /// a dying snapshot's memo bytes leave when its readers do). Arc'd so
     /// nodes charge without a back-reference cycle.
     cached_bytes: Arc<AtomicU64>,
+    /// §4.7 heap admission's promise ledger: Σ extents promised to the
+    /// SMOs the resident nodes' pending bytes will need at their flush
+    /// ([`NodeDirty::promise`]). The commit pass admits growth only while
+    /// `claimable − promised − need ≥ floor`, which is what makes every
+    /// acked record FLUSHABLE — the flush pass's claims are budget the
+    /// admission already set aside, never a race against user growth.
+    /// Owned by the dirty halves through this handle (Drop-exact, like
+    /// the charge).
+    heap_promised: Arc<AtomicU64>,
     /// The shared per-cache environment (`epoch_core`): the **durable
     /// journal tail** (§4.5 torn-tail classifier input, §4.2 tombstone
     /// elision floor — K6b's checkpoint advances it, tests drive it
@@ -2101,6 +2257,7 @@ impl NodeCache {
             inflight: scc::HashMap::default(),
             clock: scc::Queue::default(),
             cached_bytes: Arc::new(AtomicU64::new(0)),
+            heap_promised: Arc::new(AtomicU64::new(0)),
             env: Arc::new(NodeEnv::new(0)),
             purge_sink: OnceLock::new(),
             retired: scc::HashSet::default(),
@@ -2142,6 +2299,18 @@ impl NodeCache {
     /// tree layer builds SMO successors and fresh roots itself.
     pub(crate) fn charge_gauge(&self) -> Arc<AtomicU64> {
         self.cached_bytes.clone()
+    }
+
+    /// The shared §4.7 promise ledger handle — what
+    /// [`CachedNode::from_loaded`] takes beside the charge gauge.
+    pub(crate) fn heap_promise_gauge(&self) -> Arc<AtomicU64> {
+        self.heap_promised.clone()
+    }
+
+    /// Extents promised to pending SMOs right now (`meta_kv_heap_promised`;
+    /// the heap admission's `claimable − promised` term).
+    pub fn heap_promised(&self) -> u64 {
+        self.heap_promised.load(Ordering::Acquire)
     }
 
     /// The cache's placement/policy config.
@@ -2536,6 +2705,7 @@ impl NodeCache {
                 loaded,
                 false,
                 self.cached_bytes.clone(),
+                self.heap_promised.clone(),
                 self.env.clone(),
             )?;
             if node.level() > 0 {
@@ -2788,6 +2958,15 @@ impl NodeCache {
                 let mut g = node.lock().write().await;
                 g.tail_offset = new_tail;
                 g.frozen = None;
+                // §4.7 heap admission: the promise covers the SMO the
+                // node's PENDING bytes need. Re-project the remainder
+                // (records applied since the freeze) — fitting in place
+                // means no SMO is owed and the budget returns; still
+                // overflowing means the promise stays with the node for
+                // the flush that will need it.
+                if g.projected_log_end(&self.cfg.layout, 0) <= self.cfg.layout.node_size() {
+                    g.release_promise();
+                }
                 drop(g);
                 node.state().end_freeze();
                 Ok(true)

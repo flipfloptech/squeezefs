@@ -13388,6 +13388,32 @@ impl SqueezefsFilesystem {
                     "meta_kv_pending_free".into(),
                     per_volume(&|be| be.pending_free_extents()),
                 );
+                // META-FULL (2026-09-11, design §4.7 amended): the full-
+                // volume posture. `heap_full` (0/1 per volume) = growth
+                // needing a new leaf answers ENOSPC — the SPACE standstill
+                // class, never a fail-stop; `enospc_refusals` = user
+                // commits refused at heap admission; `heap_full_cycles` =
+                // checkpoint cycles whose flush pass deferred a node for
+                // NoSpace (the residual the admission's promises did not
+                // cover — ≈ 0 on a healthy full volume); `heap_promised` =
+                // extents promised to pending SMOs (the admission's
+                // `claimable − promised` term; 0 at quiesce).
+                metrics.insert(
+                    "meta_kv_heap_full".into(),
+                    per_volume(&|be| u64::from(be.heap_full())),
+                );
+                metrics.insert(
+                    "meta_kv_enospc_refusals".into(),
+                    per_volume(&|be| be.enospc_refusals()),
+                );
+                metrics.insert(
+                    "meta_kv_heap_full_cycles".into(),
+                    per_volume(&|be| be.heap_full_cycles()),
+                );
+                metrics.insert(
+                    "meta_kv_heap_promised".into(),
+                    per_volume(&|be| be.heap_promised()),
+                );
                 // PR M1 — the single-writer mount guard (design
                 // §9 Observability): per-volume guarantee class + the
                 // fence / PTPL-reacquire counters.

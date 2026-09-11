@@ -151,6 +151,19 @@ pub fn compaction_reserve_extents(total: u64) -> u64 {
     (total / 50).max(8)
 }
 
+/// The §4.7 reserve's split for the commit-time **heap admission**
+/// (`KvMetaBackend::run_batch_pipeline`): a user commit whose flush needs
+/// a NEW leaf (a split) is admitted only while the WHOLE reserve stays
+/// clear; one whose flush is a net-zero COMPACTION (deletes, overwrites,
+/// a dead-heavy leaf) is admitted down to this floor — half the reserve
+/// — so deletes keep committing on a full volume while the other half
+/// stays the flush pass's own (interior SMOs, mount-time SMOs, the
+/// projection's under-estimates). Derived from the reserve, never a
+/// constant; tie-tested in `tests/meta_volume_full_tests.rs`.
+pub fn compaction_floor_extents(reserve: u64) -> u64 {
+    reserve / 2
+}
+
 /// The bitmap partition map an [`AppendPartition`] implies (spec §6.2
 /// item 3): pages are the partition unit, so the map is
 /// `writers`-way over [`ALLOC_PAGE_BITS`]-extent pages. Solo collapses to

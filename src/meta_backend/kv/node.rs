@@ -209,6 +209,49 @@ impl NodeLayout {
     pub fn xattr_value_cap(&self) -> usize {
         xattr_value_cap(self.node_size)
     }
+
+    /// Encoded record bytes ONE node image can hold after its header page
+    /// and one bset frame: the SMO's compaction-vs-split line (§4.4 fill
+    /// accounting — a fold at-or-under this rewrites 1:1, above it splits)
+    /// and the heap admission's projection of the same decision.
+    pub fn fold_capacity(&self) -> usize {
+        self.node_size - NODE_PAGE - BSET_FRAME_LEN - super::bset::BSET_HEADER_LEN
+    }
+
+    /// The SMO's per-part fill target on a split: parts fill to ¾ of
+    /// [`Self::fold_capacity`] so appends have headroom (§4.4 fill
+    /// accounting) — the divisor the heap admission's part-count
+    /// projection shares with `KvTree::smo_replace`.
+    pub fn split_part_capacity(&self) -> usize {
+        self.fold_capacity() * 3 / 4
+    }
+
+    /// Extents the SMO of a leaf whose fold measures `fold_bytes` claims
+    /// (§4.7 heap admission's promise): one for a compaction (the fold
+    /// fits one node), else the greedy ¾-fill part count plus one — the
+    /// greedy packer may open one more part than the byte quotient when a
+    /// record straddles a part boundary, and over-promising by an extent
+    /// only refuses growth an extent early (the surplus releases at the
+    /// SMO); under-promising is what lets a flush pass run the heap to
+    /// zero. A ROOT leaf's split also mints a new root (+1, the caller's).
+    pub fn smo_extents_for_fold(&self, fold_bytes: usize) -> u64 {
+        if fold_bytes <= self.fold_capacity() {
+            1
+        } else {
+            fold_bytes.div_ceil(self.split_part_capacity()) as u64 + 1
+        }
+    }
+
+    /// On-disk length of the append frame `bytes` of encoded records
+    /// produce (`encode_bset_frame`'s geometry: frame + bset headers,
+    /// padded to the 4 KiB append granularity); 0 for no records.
+    pub fn append_frame_len(&self, bytes: usize) -> usize {
+        if bytes == 0 {
+            0
+        } else {
+            page_align(BSET_FRAME_LEN + super::bset::BSET_HEADER_LEN + bytes)
+        }
+    }
 }
 
 /// Decoded node header (§4.1). `min_key`/`max_key` are the node's inclusive

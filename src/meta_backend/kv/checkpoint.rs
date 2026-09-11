@@ -1284,6 +1284,13 @@ async fn maintenance_pass(
                 Err(KvError::JournalReserveExhausted { .. } | KvError::PendingFreeFull { .. }) => {
                     be.checkpoint_cycle(&mut smo, true).await?;
                 }
+                Err(e @ KvError::NoSpace { .. }) => {
+                    // §4.7 space class: the node stays dirty (its floor
+                    // restored), the cadence cycle's flush pass owns the
+                    // retry — never a per-tick WARN storm.
+                    be.enter_heap_full(&format!("threshold maintenance: {e}"));
+                    break;
+                }
                 Err(e) => return Err(e),
             }
         }
@@ -1348,6 +1355,12 @@ async fn tick(
                 Err(KvError::JournalReserveExhausted { .. } | KvError::PendingFreeFull { .. }) => {
                     be.checkpoint_cycle(&mut smo, true).await?;
                     *last_checkpoint = std::time::Instant::now();
+                }
+                Err(e @ KvError::NoSpace { .. }) => {
+                    // §4.7 space class (see `maintenance_pass`): the
+                    // cycle below owns the retry.
+                    be.enter_heap_full(&format!("threshold maintenance: {e}"));
+                    break;
                 }
                 Err(e) => return Err(e),
             }
@@ -1466,6 +1479,9 @@ impl KvMetaBackend {
                 dirty.push((n.tree_id(), n.addr()));
             }
         });
+        // Nodes this pass could not flush because the allocator answered
+        // `NoSpace` — the wedged-tail audit's class discriminator below.
+        let mut deferred_for_space = 0u64;
         for (tree_id, addr) in dirty {
             let tree = self
                 .all_trees()
@@ -1492,14 +1508,17 @@ impl KvMetaBackend {
                     // checkpoint_flush_node): the cycle completes,
                     // barriers, drains every retirement its tail covers,
                     // and the NEXT cycle's claim finds the returned
-                    // budget. A heap where nothing ever drains presents
-                    // as the audit's loud terminal, now with an honest
-                    // ENOSPC face in the log.
-                    log::warn!(
+                    // budget. Since the §4.7 heap admission (2026-09-11)
+                    // every acked record has its SMO's extents promised,
+                    // so this arm is the RESIDUAL — a foreign claimant,
+                    // an under-projection, an interior cascade past the
+                    // reserve — and it is the SPACE standstill class:
+                    // counted, latched loud once, never the terminal.
+                    deferred_for_space += 1;
+                    log::debug!(
                         "checkpoint: metadata heap exhausted (free={free}, \
                          reserve={reserve}) at node {addr:#x}; compaction deferred to \
-                         the next cycle (parked pending-free retirements release at \
-                         this cycle's barrier and return budget)"
+                         the next cycle"
                     );
                 }
                 // NOTE: `KvError::PendingFreeFull` is structurally
@@ -1516,6 +1535,20 @@ impl KvMetaBackend {
                 // deferral.
                 Err(e) => return Err(e),
             }
+        }
+        // §4.7 heap-full posture: a pass that deferred for space is the
+        // space class (counted per cycle, latched loud once); a pass that
+        // deferred nothing clears the latch once the growth floor is
+        // clear again (a full volume whose deletes only free record space
+        // stays latched — honest: no new leaf can be minted).
+        if deferred_for_space > 0 {
+            self.heap_full_cycles.fetch_add(1, Ordering::Relaxed);
+            self.enter_heap_full(&format!(
+                "the flush pass deferred {deferred_for_space} node(s) whose SMO could not \
+                 claim an extent"
+            ));
+        } else if self.heap_growth_floor_clear() {
+            self.leave_heap_full("a flush pass deferred nothing and the growth floor is clear");
         }
 
         // ---- Dirty bitmap pages, stamped with this checkpoint's seq
@@ -1657,9 +1690,27 @@ impl KvMetaBackend {
             // Never an unbounded retry loop, and — post-fix — never
             // latched by the RESOLVABLE pinned-floor shape (its floor
             // discharges in cycle 1, its tail advances in cycle 2).
+            //
+            // TWO CLASSES (2026-09-11, the inline-raise sweep's P1): a
+            // cycle that deferred a node for `NoSpace` has its tail
+            // pinned by a node it could not flush for want of an EXTENT
+            // — a SPACE standstill, capacity, not corruption. It says
+            // nothing about a wedge (the tail is legitimately pinned), so
+            // it neither advances nor resets the wedge rung; it is
+            // counted on `heap_full_cycles`, latched loud once on
+            // `heap_full`, and clears when budget returns (a delete's
+            // compaction, a released claim). The FAILED terminal is
+            // reserved for the WEDGE class: nothing deferred for space,
+            // retirements parked, no release, no tail advance.
             let pending_after = self.allocator().pending_count();
             if pending_after == 0 || pending_after < pending_before || tail > tail_before {
                 self.pending_free_stalled_cycles.store(0, Ordering::Release);
+            } else if deferred_for_space > 0 {
+                log::debug!(
+                    "checkpoint: space standstill — {deferred_for_space} node(s) deferred for \
+                     NoSpace, {pending_after} retirements parked behind their floors (tail \
+                     {tail}); not a wedge, the volume stays writable for deletes"
+                );
             } else {
                 let stalled = self
                     .pending_free_stalled_cycles

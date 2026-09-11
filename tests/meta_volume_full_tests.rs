@@ -148,11 +148,14 @@ async fn full_metadata_volume_is_enospc_not_a_failstop() {
         "every ENOSPC refusal is counted on the volume"
     );
 
-    // ---- (b) never FAILED — and more refusals stay ENOSPC, not EIO.
+    // ---- (b) never FAILED — and more refusals stay ENOSPC, not EIO. (A
+    // probe may land when a cycle returned a promise's surplus; those
+    // files are the newest and go with the deletes below.)
     assert!(!be.is_failed(), "a full heap is not a fail-stop class");
+    let mut probes_landed: Vec<u32> = Vec::new();
     for i in 0..8 {
         match put_file(&be, 900_000 + i).await {
-            Ok(()) => {}
+            Ok(()) => probes_landed.push(900_000 + i),
             Err(e) => assert_eq!(
                 e.to_errno(),
                 libc::ENOSPC,
@@ -182,7 +185,7 @@ async fn full_metadata_volume_is_enospc_not_a_failstop() {
     // ---- (c) deletes make progress on the full volume: the newest third
     // (their records sit in the rightmost leaves, where growth lands).
     let delete_from = landed - landed / 3;
-    for i in delete_from..landed {
+    for i in (delete_from..landed).chain(probes_landed) {
         let ino = be
             .unlink(ROOT_INO, &name(i))
             .await
@@ -200,11 +203,16 @@ async fn full_metadata_volume_is_enospc_not_a_failstop() {
             .expect("checkpoint cycles run on a full volume");
     }
 
-    // ---- (d) the ledger closes.
+    // ---- (d) the ledger closes: retirements drained, promises consumed.
     assert_eq!(
         be.pending_free_extents(),
         0,
         "pending-free retirements must drain once the deletes' compactions barriered"
+    );
+    assert_eq!(
+        be.heap_promised(),
+        0,
+        "every promised SMO ran (or its remainder fit in place) — the ledger is 0 at quiesce"
     );
     assert!(
         squeezefs::meta_backend::kv::META_KV_CHECKPOINTS.load(Ordering::Relaxed) > checkpoints0,
@@ -289,8 +297,9 @@ async fn full_metadata_volume_is_enospc_not_a_failstop() {
 /// recover once the budget returns.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn space_standstill_is_counted_not_terminal_and_clears_when_budget_returns() {
-    // Park the cadence (the kv_smo_crash_completeness precedent): the
-    // cycles below are the ones this test drives.
+    // Slow the cadence (the kv_smo_crash_completeness precedent): the
+    // cycles below are the ones this test drives; the shutdown's final
+    // tick bounds the wait.
     struct Cleanup;
     impl Drop for Cleanup {
         fn drop(&mut self) {
@@ -299,7 +308,7 @@ async fn space_standstill_is_counted_not_terminal_and_clears_when_budget_returns
             *TEST_SMO_BUILD_PAUSED.lock().expect("seam mutex") = None;
         }
     }
-    std::env::set_var("SQUEEZEFS_META_FLUSH_INTERVAL_MS", "60000");
+    std::env::set_var("SQUEEZEFS_META_FLUSH_INTERVAL_MS", "2000");
     let _cleanup = Cleanup;
 
     let (be, _file) = fresh_volume().await;
@@ -399,6 +408,54 @@ async fn space_standstill_is_counted_not_terminal_and_clears_when_budget_returns
         .await
         .expect("growth resumes once the budget returned");
     be.shutdown().await.unwrap();
+}
+
+/// The heap admission's derivations, tie-tested so drift is red
+/// (`tests/derivation_sweep_tests.rs`'s convention): the compaction floor
+/// is HALF the §4.7 reserve — never a constant of its own — and the SMO
+/// extent projection follows the SMO's own geometry: one for a fold that
+/// fits, else the greedy ¾-fill part count plus the packer's slack.
+#[test]
+fn heap_admission_floors_derive_from_the_reserve_and_the_split_geometry() {
+    use squeezefs::meta_backend::kv::alloc_ext::{
+        compaction_floor_extents, compaction_reserve_extents,
+    };
+    use squeezefs::meta_backend::kv::node::{NodeLayout, DEFAULT_NODE_SIZE};
+    // The field shape: 1 GiB volume of 256 KiB extents ⇒ 4096-extent heap,
+    // 2 % reserve = 81, compaction floor 40. The floor shape: the 8-extent
+    // reserve floor ⇒ compaction floor 4.
+    assert_eq!(compaction_reserve_extents(4096), 81);
+    assert_eq!(
+        compaction_floor_extents(compaction_reserve_extents(4096)),
+        40
+    );
+    assert_eq!(compaction_floor_extents(8), 4);
+    assert_eq!(compaction_floor_extents(0), 0);
+    for total in [64u64, 4096, 65_536, 1 << 20] {
+        let reserve = compaction_reserve_extents(total);
+        assert_eq!(compaction_floor_extents(reserve), reserve / 2);
+    }
+
+    let layout = NodeLayout::new(DEFAULT_NODE_SIZE).unwrap();
+    let cap = layout.fold_capacity();
+    assert_eq!(cap, DEFAULT_NODE_SIZE - 4096 - 32 - 32);
+    assert_eq!(layout.split_part_capacity(), cap * 3 / 4);
+    // A fold that fits is one compaction extent; one byte over is the
+    // smallest split: two ¾ parts plus the slack extent.
+    assert_eq!(layout.smo_extents_for_fold(0), 1);
+    assert_eq!(layout.smo_extents_for_fold(cap), 1);
+    assert_eq!(layout.smo_extents_for_fold(cap + 1), 3);
+    // A fold worth 3.5 parts packs into 4 parts (+1 slack).
+    assert_eq!(
+        layout.smo_extents_for_fold(layout.split_part_capacity() * 7 / 2),
+        5
+    );
+    // The append frame is the bset frame's geometry: headers + bytes,
+    // page-aligned; nothing pending costs nothing.
+    assert_eq!(layout.append_frame_len(0), 0);
+    assert_eq!(layout.append_frame_len(1), 4096);
+    assert_eq!(layout.append_frame_len(4096 - 64), 4096);
+    assert_eq!(layout.append_frame_len(4096 - 63), 8192);
 }
 
 /// The no-space class carries `ENOSPC` structurally through every mapping

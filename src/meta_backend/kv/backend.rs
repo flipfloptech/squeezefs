@@ -138,7 +138,8 @@ use super::journal::{checkpoint_reserve_bytes, entry_len_for, untag, JournalRing
 use super::journal_core::{AdmissionClass, Reservation};
 use super::node::{key_successor, NodeLayout};
 use super::node_cache::{
-    CachedNode, LiveLookup, NodeCache, NodeCacheConfig, OwnedRec, DEFAULT_WRITEBACK_DELTA_BYTES,
+    CachedNode, LiveLookup, NodeCache, NodeCacheConfig, NodeDirty, OwnedRec,
+    DEFAULT_WRITEBACK_DELTA_BYTES,
 };
 use super::record::{
     decode_dentry_key, decode_inode_key, decode_readdir_cookie, decode_xattr_key, dentry_key,
@@ -2857,6 +2858,12 @@ impl KvMetaBackend {
     /// deferred ≥ 1 node because the allocator answered `NoSpace`.
     pub fn heap_full_cycles(&self) -> u64 {
         self.heap_full_cycles.load(Ordering::Relaxed)
+    }
+
+    /// `meta_kv_heap_promised`: extents the heap admission promised to
+    /// pending SMOs ([`NodeCache::heap_promised`]) — 0 at quiesce.
+    pub fn heap_promised(&self) -> u64 {
+        self.cache.heap_promised()
     }
 
     /// The volume path.
@@ -8445,6 +8452,9 @@ impl KvMetaBackend {
         // over every attempt (`lock_phase_ns.leaf_lock_wait`).
         let mut leaf_wait = std::time::Duration::ZERO;
         let mut attempt = 0usize;
+        // §4.7 heap admission: whether this pass already spent its ONE
+        // checkpoint cycle trying to return budget for a refused member.
+        let mut cycled_for_space = false;
         let (res, undo, failed) = loop {
             attempt += 1;
             if attempt > COMMIT_RETRY_BUDGET {
@@ -8515,6 +8525,71 @@ impl KvMetaBackend {
                 record_hold();
                 drop(guards);
                 super::META_KV_COMMIT_SMO_RETRIES.fetch_add(1, Ordering::Relaxed);
+                continue;
+            }
+
+            // (3b) §4.7 HEAP ADMISSION, under the locks (design §4.7
+            // "ENOSPC semantics", amended 2026-09-11): a user commit does
+            // not claim an extent — its records land in leaf overlays and
+            // the checkpoint's flush pass claims for the SMOs they force —
+            // so the reserve was consumed by acked user growth, the pass
+            // ran out of heap mid-flush, the deferred nodes pinned the
+            // tail, and the wedged-tail audit fail-stopped a FULL volume
+            // (the 2026-09-09 sweep's P1). Every acked record must be
+            // FLUSHABLE: per leaf this member's records land on, project
+            // the flush — fits in place (no SMO, nothing to promise) or
+            // needs an SMO, whose extents are PROMISED now against the
+            // claimable budget minus every outstanding promise, split at
+            // the reserve (net-growth) or the compaction floor (net-zero);
+            // a member that cannot be promised refuses `NoSpace` ALONE,
+            // before anything is reserved or applied.
+            let refused = self.admit_heap_locked(&s.entries, &leaves, &lock_set, &mut guards);
+            if !refused.is_empty() {
+                record_hold();
+                drop(guards);
+                let adm = s.admission.take().expect("admission held until reserve");
+                self.ring.core().release(adm);
+                // Budget a checkpoint cycle can RETURN — promises held by
+                // nodes the flush pass has not reached yet (released at
+                // their SMO/append) and retirements parked on the tail
+                // (released at the barrier) — earns the refused members
+                // ONE retry after one cycle: on a full volume a burst of
+                // deletes would otherwise trip over its own outstanding
+                // compaction promises between two cadence ticks. A refusal
+                // that survives the cycle (or finds nothing to return) is
+                // final: ENOSPC. No node lock is held across the cycle.
+                let returnable = self.cache.heap_promised() > 0 || self.alloc.pending_count() > 0;
+                if !cycled_for_space && returnable {
+                    cycled_for_space = true;
+                    if let Err(e) = self.checkpoint_now().await {
+                        log::warn!(
+                            "meta volume {}: checkpoint cycle for heap headroom failed: {e} \
+                             (the refused members will be answered on the retry)",
+                            self.path.display()
+                        );
+                    }
+                } else {
+                    // Fan the refusals out (pre-reserve terminal outcomes).
+                    for (qi, e) in refused.into_iter().rev() {
+                        self.enospc_refusals.fetch_add(1, Ordering::Relaxed);
+                        self.enter_heap_full(&format!("a user commit was refused: {e}"));
+                        let q = s.entries.remove(qi);
+                        s.outcomes.push((q, Err(e)));
+                    }
+                    if s.entries.is_empty() {
+                        return;
+                    }
+                }
+                // Re-admit the ring budget — no node lock held across the
+                // park (§4.4 pt 5) — and re-resolve everything.
+                let survivors_len: u64 = s.entries.iter().map(|q| q.len).sum();
+                match self.admit_user_budget(survivors_len).await {
+                    Ok(adm) => s.admission = Some(adm),
+                    Err(e) => {
+                        self.fail_batch(s, &e);
+                        return;
+                    }
+                }
                 continue;
             }
 
@@ -9042,6 +9117,178 @@ impl KvMetaBackend {
         }
     }
 
+    /// **The §4.7 heap admission** (step 3b of the pass, under the union
+    /// leaf write locks). Per member in queue order, per leaf its records
+    /// land on: project where the leaf's log ends after everything already
+    /// pending on it (frozen delta, open delta, this batch's earlier
+    /// members) plus this member's bytes. Fits ⇒ the flush appends in
+    /// place, nothing to promise. Overflows ⇒ the flush needs an SMO:
+    /// a fold at-or-under the node's capacity is a net-zero COMPACTION
+    /// (1 extent, transient — the old one returns at the barrier) admitted
+    /// down to the compaction floor; above it a SPLIT (the ¾-fill part
+    /// count plus the packer's slack, plus a new root for a root leaf —
+    /// the tree grows) admitted only above the whole reserve. The extents
+    /// are PROMISED on the node ([`NodeDirty::promise`]) so the flush
+    /// pass's claims are budget this admission set aside; the projection
+    /// is deliberately conservative (a promise whose remainder fits in
+    /// place releases at the append; the surplus of an over-promise
+    /// releases at the SMO; interior cascades draw on the flush pass's
+    /// half of the reserve). Returns the members refused `NoSpace` with the index they
+    /// hold in `entries`, ascending — side-effect-free on the refusal
+    /// counters (the caller finalizes: a refusal may earn one retry after
+    /// a checkpoint cycle); promises granted to the survivors stay on their
+    /// nodes across the caller's retry (the re-projection finds them
+    /// already covered).
+    fn admit_heap_locked(
+        &self,
+        entries: &[QueuedTx],
+        leaves: &[Vec<Arc<CachedNode>>],
+        lock_set: &[Arc<CachedNode>],
+        guards: &mut [crate::sqz_sync::SqzRwLockWriteGuard<'_, NodeDirty>],
+    ) -> Vec<(usize, KvError)> {
+        let layout = self.cache.config().layout;
+        let node_size = layout.node_size();
+        let reserve = self.alloc.reserve_extents();
+        let compaction_floor = super::alloc_ext::compaction_floor_extents(reserve);
+        // Per locked leaf: this batch's ADMITTED members' records landing
+        // on it, in apply order — the fold projection's pending input.
+        let mut pending: Vec<Vec<(&[u8], RecordKind, usize)>> =
+            (0..lock_set.len()).map(|_| Vec::new()).collect();
+        // Per member: (leaf slot, bytes) — small, deduped by slot.
+        let mut member: Vec<(usize, usize)> = Vec::new();
+        let mut refused: Vec<(usize, KvError)> = Vec::new();
+        for (qi, (q, entry_leaves)) in entries.iter().zip(leaves).enumerate() {
+            member.clear();
+            for ((_, r), leaf) in q.recs.iter().zip(entry_leaves) {
+                let gi = lock_set
+                    .iter()
+                    .position(|n| n.addr() == leaf.addr())
+                    .expect("leaf is locked");
+                let bytes = r.record_ref().encoded_len();
+                match member.iter_mut().find(|(g, _)| *g == gi) {
+                    Some((_, b)) => *b += bytes,
+                    None => member.push((gi, bytes)),
+                }
+            }
+            let mut verdict: Option<KvError> = None;
+            for &(gi, bytes) in &member {
+                let pending_bytes: usize = pending[gi].iter().map(|r| r.2).sum();
+                if guards[gi].projected_log_end(&layout, pending_bytes + bytes) <= node_size {
+                    continue; // in-place append at the flush
+                }
+                let mut extra: Vec<(&[u8], RecordKind, usize)> = pending[gi].clone();
+                extra.extend(
+                    q.recs
+                        .iter()
+                        .zip(entry_leaves)
+                        .filter(|(_, leaf)| leaf.addr() == lock_set[gi].addr())
+                        .map(|((_, r), _)| (&r.key[..], r.kind, r.record_ref().encoded_len())),
+                );
+                let fold = lock_set[gi].snapshot().fold_bytes_upper_with(&mut extra);
+                let mut need = layout.smo_extents_for_fold(fold);
+                let is_split = need > 1;
+                if is_split
+                    && self
+                        .tree_by_id(lock_set[gi].tree_id())
+                        .is_root_addr(lock_set[gi].addr())
+                {
+                    need += 1; // a root leaf's split also mints a new root
+                }
+                let delta = need.saturating_sub(guards[gi].promised());
+                if delta == 0 {
+                    continue; // already promised by an earlier member/attempt
+                }
+                let floor = if is_split { reserve } else { compaction_floor };
+                let claimable = self
+                    .alloc
+                    .free_extents()
+                    .saturating_sub(self.cache.heap_promised());
+                if claimable.saturating_sub(delta) >= floor {
+                    guards[gi].promise(delta);
+                    if is_split {
+                        // A leaf was just minted-in-budget: the growth
+                        // floor is clear.
+                        self.leave_heap_full("a growth commit was admitted a new leaf");
+                    }
+                } else {
+                    log::debug!(
+                        "heap admission refused: tree {} leaf {:#x} projects a fold of {fold} B \
+                         (capacity {}) needing {need} extent(s), {} promised; claimable {claimable} \
+                         − {delta} < floor {floor}",
+                        lock_set[gi].tree_id(),
+                        lock_set[gi].addr(),
+                        layout.fold_capacity(),
+                        guards[gi].promised(),
+                    );
+                    verdict = Some(KvError::NoSpace {
+                        free: claimable,
+                        reserve: floor,
+                    });
+                    break;
+                }
+            }
+            match verdict {
+                None => {
+                    for ((_, r), leaf) in q.recs.iter().zip(entry_leaves) {
+                        let gi = lock_set
+                            .iter()
+                            .position(|n| n.addr() == leaf.addr())
+                            .expect("leaf is locked");
+                        pending[gi].push((&r.key[..], r.kind, r.record_ref().encoded_len()));
+                    }
+                }
+                Some(e) => refused.push((qi, e)),
+            }
+        }
+        refused
+    }
+
+    /// Latch the §4.7 heap-full posture (`meta_kv_heap_full` = 1) — loud
+    /// ONCE per transition, never terminal: growth needing a new leaf is
+    /// ENOSPC from here; reads, deletes and in-place appends continue.
+    pub(super) fn enter_heap_full(&self, why: &str) {
+        if !self.heap_full.swap(true, Ordering::AcqRel) {
+            log::warn!(
+                "meta volume {}: metadata heap FULL — {why} (free={} claimable, {} promised to \
+                 pending SMOs, reserve={}); growth needing a new leaf answers ENOSPC, reads and \
+                 deletes continue, the volume is NOT failed (§4.7 space standstill class)",
+                self.path.display(),
+                self.alloc.free_extents(),
+                self.cache.heap_promised(),
+                self.alloc.reserve_extents(),
+            );
+        }
+    }
+
+    /// Clear the heap-full posture (loud once per transition).
+    pub(super) fn leave_heap_full(&self, why: &str) {
+        if self.heap_full.swap(false, Ordering::AcqRel) {
+            log::info!(
+                "meta volume {}: metadata heap no longer full — {why} (free={} claimable, {} \
+                 promised, reserve={})",
+                self.path.display(),
+                self.alloc.free_extents(),
+                self.cache.heap_promised(),
+                self.alloc.reserve_extents(),
+            );
+        }
+    }
+
+    /// Whether the growth floor is clear right now: the SMALLEST split (a
+    /// fold one byte over capacity — two parts, plus the packer's slack
+    /// extent) could be promised above the reserve — the same arithmetic
+    /// the admission runs, so the posture word and the refusals agree
+    /// (the checkpoint cycle's re-check).
+    pub(super) fn heap_growth_floor_clear(&self) -> bool {
+        let layout = self.cache.config().layout;
+        let min_split = layout.smo_extents_for_fold(layout.fold_capacity() + 1);
+        self.alloc
+            .free_extents()
+            .saturating_sub(self.cache.heap_promised())
+            .saturating_sub(min_split)
+            >= self.alloc.reserve_extents()
+    }
+
     /// Fail every remaining batch member with (a clone of) one error —
     /// the batch-as-a-unit failure paths (pre-reserve). The outcomes are
     /// terminal: nothing was reserved or applied for these members.
@@ -9066,6 +9313,12 @@ impl KvMetaBackend {
             KvError::Io(other) => KvError::Io(crate::error::SqueezefsError::Io(
                 std::io::Error::other(other.to_string()),
             )),
+            // §4.7: the no-space class owes userspace ENOSPC (POSIX-6) —
+            // flattening it to `Corrupt` read as EINVAL.
+            KvError::NoSpace { free, reserve } => KvError::NoSpace {
+                free: *free,
+                reserve: *reserve,
+            },
             other => KvError::Corrupt(other.to_string()),
         }
     }

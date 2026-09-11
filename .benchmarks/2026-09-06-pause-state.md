@@ -492,6 +492,33 @@ mount (the A-arm rig reset the cluster; remount is part of every arm).
    pair to squeeze-test as `/scratch/tmp/squeezefs` + `libsqueezefs_il.so`
    (the reset script's `SQZ` path, empty since the 2026-09-09 cleanup) —
    documented; the box is NOT remounted (owner: least box use).
+1s. **Post-1.2.3 board items 2–4 LANDED and GATED (2026-09-11; gate on
+   `862b8077` 09:48–10:52, 379 suites / 4,946 tests).** Record
+   `.benchmarks/2026-09-11-post-123-board-items-2-4.md`. Three parallel
+   red-first subagents off the 1.2.3 tip, merged narrow → wide. **(2)**
+   a full metadata heap = ENOSPC, never FAILED (`862b8077`): `claim_user`
+   had NO production caller (user growth spent the reserve through the
+   checkpoint's floor-0 SMO claims) → commit-time heap admission with
+   PROMISED SMO extents (compaction floor reserve/2, splits above the
+   reserve), refusal `NoSpace → ENOSPC` pre-reservation, the §4.7 wedged-
+   tail bound split into a space class (counted, non-terminal) and the
+   wedge class (FAILED); gauges `meta_kv_heap_{full,full_cycles,promised}`,
+   `meta_kv_enospc_refusals`; limitation: v1 never merges leaves. **(3)**
+   reclaim atomicity (`d7573e5b`): the release rides the destroy entry (N+1
+   → 1 journal entries per reclaim; refuse-and-retain fallback), one
+   over-cap corpse destroys across entries (layout + record LAST) — and a
+   1.2.3 SHIPPED finding: every unlink of a ≳ 3,000-reference file
+   deterministically orphaned its ledger (the standalone release was never
+   chunked). **(4)** PK8 (`445525e1`): the direct-drive arm for packed
+   tenants on the mapping's backend fd, lever `SQUEEZEFS_IPC_DD_PACKED` ON,
+   99.93 % direct on the local scoping row — and a 1.2.3 SHIPPED wrong-bytes
+   exposure: the whole-block direct-drive arm served a reissued offset's
+   bytes for a dead-lifetime key (stable fill word across plan → CQE); the
+   dead-lifetime screen now covers both arms. All three fixes are 1.2.4-
+   bound. Board left: (1) the runners' `/tmp` trees vs the 10-day tmpfiles
+   cleaner; (5) bench baseline compare + save; (6) scoreboard on 1.2.3; (7)
+   the owner's box cleanup list (`/scratch/tmp/squeezefs-pk7`, `rigs/`,
+   `campaign/`, `logs/`); leaf merge (the v1 tree) as a new item.
 2. **Kernel A/B, B arm** — after `squeeze-test` boots the 6.19.14 series
    WITH 0031 (or whichever box carries the patched kernel): on the box,
    `cd /scratch/tmp/sqz-agent/k26 && sudo env ARM=B KERNEL_TAG=<uname -r

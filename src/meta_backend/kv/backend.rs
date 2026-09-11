@@ -9135,9 +9135,10 @@ impl KvMetaBackend {
     /// place, nothing to promise. Overflows ⇒ the flush needs an SMO:
     /// a fold at-or-under the node's capacity is a net-zero COMPACTION
     /// (1 extent, transient — the old one returns at the barrier) admitted
-    /// down to the compaction floor; above it a SPLIT (the ¾-fill part
-    /// count plus the packer's slack, plus a new root for a root leaf —
-    /// the tree grows) admitted only above the whole reserve. The extents
+    /// down to the compaction floor; above it a SPLIT (the greedy ¾-fill
+    /// part count plus the rounding and cascade extents, plus a new root
+    /// for a root leaf — the tree grows) admitted only above the whole
+    /// reserve. The extents
     /// are PROMISED on the node ([`NodeDirty::promise`]) so the flush
     /// pass's claims are budget this admission set aside; the projection
     /// is deliberately conservative (a promise whose remainder fits in
@@ -9348,8 +9349,8 @@ impl KvMetaBackend {
     }
 
     /// Whether the growth floor is clear right now: the SMALLEST split (a
-    /// fold one byte over capacity — two parts, plus the packer's slack
-    /// extent) could be promised above the reserve — the same arithmetic
+    /// fold one byte over capacity — two parts, plus the rounding and
+    /// cascade extents) could be promised above the reserve — the same arithmetic
     /// the admission runs, so the posture word and the refusals agree
     /// (the checkpoint cycle's re-check).
     pub(super) fn heap_growth_floor_clear(&self) -> bool {

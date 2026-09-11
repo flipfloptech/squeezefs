@@ -144,8 +144,8 @@ use super::record::{
     decode_dentry_key, decode_inode_key, decode_readdir_cookie, decode_xattr_key, dentry_key,
     dentry_name_hash54, encode_readdir_cookie, first_free_coll_seq, inode_key, xattr_key,
     xattr_name_hash56, DentryValue, InodeDelta, InodeValue, ReaddirPos, Record, RecordKind,
-    XattrValue, HASH54_MAX, HASH56_MAX, TREE_ALLOC_RESERVED, TREE_DENTRIES, TREE_INODES,
-    TREE_XATTRS,
+    XattrValue, HASH54_MAX, HASH56_MAX, INODE_KEY_LEN, TREE_ALLOC_RESERVED, TREE_DENTRIES,
+    TREE_INODES, TREE_XATTRS, XATTR_KEY_LEN,
 };
 use super::superblock::{classify_volume, SuperblockV3, VolumeFormat};
 use super::tree::{decode_interior_value, KvTree, RootPtr, SmoContext, SmoJournal};
@@ -9449,6 +9449,28 @@ impl KvMetaBackend {
     /// claims and nothing would ever reclaim.
     pub async fn destroy_unreferenced_inodes(&self, inos: &[Ino]) -> Result<()> {
         self.destroy_inode_records(inos, false).await
+    }
+
+    /// The journal payload bytes [`Self::destroy_inodes`] stages for
+    /// `ino`: its inode `Delete` plus one `Delete` per xattr key (empty
+    /// values), priced with the admission's own record framing
+    /// ([`super::journal::record_frame_len`]) — the corpse sweep's chunk
+    /// planner input, so a planned chunk fits ONE entry by the arithmetic
+    /// the commit enforces rather than by a guessed constant. A live or
+    /// missing ino prices as if destroyed (the destroy stages nothing for
+    /// it — an over-estimate in the safe direction).
+    pub async fn destroy_entry_bytes(&self, ino: Ino) -> Result<u64> {
+        let mut bytes = super::journal::record_frame_len(INODE_KEY_LEN, 0);
+        let start = xattr_key(ino, 0, 0);
+        let end = xattr_key(ino, HASH56_MAX, u8::MAX);
+        let mut cursor: Vec<u8> = start.to_vec();
+        loop {
+            let page = self.xattrs.range(&cursor, &end, SCAN_PAGE).await?;
+            let Some((last, _)) = page.last() else { break };
+            cursor = key_successor(last);
+            bytes += page.len() as u64 * super::journal::record_frame_len(XATTR_KEY_LEN, 0);
+        }
+        Ok(bytes)
     }
 
     async fn destroy_inode_records(&self, inos: &[Ino], skip_live: bool) -> Result<()> {

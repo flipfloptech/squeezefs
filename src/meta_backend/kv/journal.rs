@@ -294,6 +294,21 @@ pub fn partitioned_ring_geometry_ok(total_pages: u64, writers: u16) -> Result<()
     Ok(())
 }
 
+/// The journal bytes ONE staged record costs inside an entry's payload:
+/// the `tree_id: u8` tag plus the K1 record framing (header + key +
+/// value). [`entry_len_for`] sums exactly this, so a planner that sizes a
+/// transaction ahead of staging it (the corpse sweep's destroy chunks)
+/// derives from the SAME arithmetic the admission enforces.
+pub fn record_frame_len(key_len: usize, value_len: usize) -> u64 {
+    1 + (super::record::RECORD_HEADER_LEN + key_len + value_len) as u64
+}
+
+/// The payload bytes one entry can carry: [`MAX_ENTRY_LEN`] less the
+/// entry header — the bound a pre-sized transaction plans against.
+pub fn entry_payload_cap() -> u64 {
+    MAX_ENTRY_LEN - ENTRY_HDR_LEN
+}
+
 /// Exact whole-entry size (header + payload) for staged records — the
 /// admission size of §4.4 pt 5 ("a committer's staged records fix its exact
 /// entry size before any lock is taken"). Errors when the entry would
@@ -301,7 +316,7 @@ pub fn partitioned_ring_geometry_ok(total_pages: u64, writers: u16) -> Result<()
 pub fn entry_len_for(records: &[(u8, Record)]) -> Result<u64, KvError> {
     let payload: u64 = records
         .iter()
-        .map(|(_, r)| 1 + r.record_ref().encoded_len() as u64)
+        .map(|(_, r)| record_frame_len(r.key.len(), r.value.len()))
         .sum();
     let len = ENTRY_HDR_LEN + payload;
     if len > MAX_ENTRY_LEN {

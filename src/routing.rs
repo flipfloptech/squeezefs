@@ -8191,6 +8191,22 @@ impl DataRouter {
     /// references and frees the blocks; `destroy_inodes` erases the
     /// records — its live-nlink skip is a second guard on the corpse
     /// classification.
+    ///
+    /// **The work is CHUNKED to the journal's whole-entry cap** (fstests
+    /// generic/749 on the 1.2.3 release chain, 2026-09-11): the population
+    /// is partitioned by `plan_destroy_chunks` — each chunk's destroy
+    /// records priced in the admission's own framing — and each chunk runs
+    /// release + free, then ITS destroy, before the next chunk starts. The
+    /// prior shape ran every corpse's `delete_file` and then ONE destroy
+    /// for the whole population: at 68,099 corpses that entry was 6 MB
+    /// against the 128 KiB cap, refused at every mount, so every corpse
+    /// record survived with its references released and its blocks
+    /// free-listed — and the next mount's retry decremented the LIVE
+    /// owners that had re-minted those offsets (the double release
+    /// `delete_file`'s ledger gate now refuses). A chunk's destroy failure
+    /// is loud and STOPS the sweep: the chunks behind it are untouched
+    /// (leak-safe), the failed chunk's corpses are the gated shape, and
+    /// the next mount retries.
     pub async fn sweep_unlinked_corpses(&self) -> Result<u64> {
         let Some(backend) = self.inner.meta_backend.get() else {
             return Ok(0);
@@ -8227,41 +8243,49 @@ impl DataRouter {
             if corpses.is_empty() {
                 continue;
             }
+            let chunks = backend.plan_destroy_chunks(&corpses).await?;
             log::warn!(
                 "mount-time corpse sweep: {} unlinked inode(s) a prior era never \
                  reclaimed on {} (lost final FORGET — abort-unmount, kill -9, or \
-                 kernel cache retention); releasing their references and blocks",
+                 kernel cache retention); releasing their references and blocks in \
+                 {} destroy chunk(s)",
                 corpses.len(),
-                be.device_path().display()
+                be.device_path().display(),
+                chunks.len()
             );
-            for &ino in &corpses {
-                let file_path = crate::keys::inode_path(ino);
-                if let Err(e) = self.delete_file(&file_path).await {
-                    // Log-and-proceed, the reclaim batch's own posture:
-                    // whatever this corpse's teardown could not release is
-                    // exactly what fsck C2/C8 name, and the destroy below
-                    // still erases the record.
-                    log::warn!(
-                        "corpse sweep: delete_file(ino {ino}) failed (proceeding to \
-                         destroy): {e:?}"
-                    );
+            let fail_destroy =
+                crate::env_knobs::bool_knob("SQUEEZEFS_TEST_CORPSE_SWEEP_FAIL_DESTROY", false);
+            for chunk in chunks {
+                for &ino in &chunk {
+                    let file_path = crate::keys::inode_path(ino);
+                    if let Err(e) = self.delete_file(&file_path).await {
+                        // Log-and-proceed, the reclaim batch's own posture:
+                        // whatever this corpse's teardown could not release
+                        // is exactly what fsck C2/C8 name, and the destroy
+                        // below still erases the record.
+                        log::warn!(
+                            "corpse sweep: delete_file(ino {ino}) failed (proceeding to \
+                             destroy): {e:?}"
+                        );
+                    }
                 }
-            }
-            // PR 6b: a corpse whose delete_file took the A2 sweep handoff
-            // keeps its record + cursor head — the sweep job's terminal
-            // chunk owns the destroy; destroying here would orphan every
-            // remaining record and strand its references.
-            let destroyable: Vec<u64> = corpses
-                .iter()
-                .copied()
-                .filter(|&i| !self.kvmap_sweep_corpse_pending(i))
-                .collect();
-            if !destroyable.is_empty() {
+                // PR 6b: a corpse whose delete_file took the A2 sweep
+                // handoff keeps its record + cursor head — the sweep job's
+                // terminal chunk owns the destroy; destroying here would
+                // orphan every remaining record and strand its references.
+                let destroyable: Vec<u64> = chunk
+                    .iter()
+                    .copied()
+                    .filter(|&i| !self.kvmap_sweep_corpse_pending(i))
+                    .collect();
+                if destroyable.is_empty() {
+                    continue;
+                }
                 // Test seam (`SQUEEZEFS_TEST_CORPSE_SWEEP_FAIL_DESTROY`):
-                // the destroy fails after the corpses' `delete_file`s ran —
+                // the destroy fails after the chunk's `delete_file`s ran —
                 // the released-references-with-live-records state the
                 // next mount's sweep must find harmless.
-                if crate::env_knobs::bool_knob("SQUEEZEFS_TEST_CORPSE_SWEEP_FAIL_DESTROY", false) {
+                if fail_destroy {
                     return Err(SqueezefsError::InvalidOperation(
                         "corpse sweep destroy refused by SQUEEZEFS_TEST_CORPSE_SWEEP_FAIL_DESTROY \
                          (test seam)"

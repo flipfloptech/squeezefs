@@ -1582,6 +1582,41 @@ impl RoutedMetaBackend {
         Ok(())
     }
 
+    /// Partition `inos` (global; caller order kept) into
+    /// [`Self::destroy_inodes`] chunks that each fit ONE journal entry per
+    /// volume: every ino is priced by its home volume
+    /// ([`kv::backend::KvMetaBackend::destroy_entry_bytes`] — the inode
+    /// `Delete` plus one per xattr, in the admission's own framing) and a
+    /// chunk closes when the next ino would push any volume's share past
+    /// [`kv::journal::entry_payload_cap`]. The mount-time corpse sweep's
+    /// planner: 68,099 corpses were ONE 6 MB entry against the 128 KiB cap
+    /// on the 1.2.3 release chain, refused at every mount forever. An ino
+    /// whose own records exceed the cap sits alone in its chunk, and that
+    /// chunk's destroy fails loud exactly as today.
+    pub async fn plan_destroy_chunks(&self, inos: &[Ino]) -> Result<Vec<Vec<Ino>>> {
+        let cap = kv::journal::entry_payload_cap();
+        let mut chunks: Vec<Vec<Ino>> = Vec::new();
+        let mut current: Vec<Ino> = Vec::new();
+        let mut per_volume: std::collections::HashMap<usize, u64> =
+            std::collections::HashMap::new();
+        for &ino in inos {
+            let (v_idx, local_ino) = self.route_ino(ino);
+            self.check_volume_enabled(v_idx)?;
+            let bytes = self.volumes[v_idx].destroy_entry_bytes(local_ino).await?;
+            let used = per_volume.get(&v_idx).copied().unwrap_or(0);
+            if !current.is_empty() && used + bytes > cap {
+                chunks.push(std::mem::take(&mut current));
+                per_volume.clear();
+            }
+            *per_volume.entry(v_idx).or_insert(0) += bytes;
+            current.push(ino);
+        }
+        if !current.is_empty() {
+            chunks.push(current);
+        }
+        Ok(chunks)
+    }
+
     /// [`Self::destroy_inodes`] for records that no dentry names — fsck
     /// class C9's repair verb (see
     /// [`kv::backend::KvMetaBackend::destroy_unreferenced_inodes`] for why

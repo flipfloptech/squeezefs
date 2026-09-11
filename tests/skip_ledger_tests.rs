@@ -328,6 +328,7 @@ fn the_mount_gated_suites_all_use_the_shared_gate() {
         "cache_path_policy_tests.rs",
         "cli_clients_df_tests.rs",
         "commit_wake_loss_tests.rs",
+        "corpse_sweep_tests.rs",
         "dismount_staged_residue_tests.rs",
         "format_guard_tests.rs",
         "fsync_promote_staged_tests.rs",

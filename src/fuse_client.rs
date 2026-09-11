@@ -6016,6 +6016,19 @@ pub struct Metrics {
     /// evidence of a double-release lineage upstream (leak-safe: the block
     /// leaks until fsck C6, it is never handed to two owners).
     pub block_untracked_free_refusals: Align64<AtomicU64>,
+    /// A corpse's reference RELEASE whose durable record was ALREADY
+    /// absent at release time, skipped BEFORE the free funnel (fstests
+    /// generic/749 on the 1.2.3 release chain, 2026-09-11): on a
+    /// ledger-bearing volume the ledger is the truth for "does this ino
+    /// hold a reference to this block", so a release with no record
+    /// behind it is not a reference and must never decrement the RAM
+    /// count — the decrement landed on whichever LIVE owner had re-minted
+    /// the offset (the pack block every promotion shares) and terminally
+    /// freed it under that owner's layout. Growth names corpses a prior
+    /// era released but never destroyed (a failed `destroy_inodes` after
+    /// their `delete_file`); the sweep destroys them on the same pass.
+    /// Leak-safe, never data.
+    pub block_release_skipped_no_record: Align64<AtomicU64>,
     /// Finding 23's SHIELD (the tracked twin of the untracked refusal
     /// above): a SHIPPED free named an offset whose every RAM reference
     /// the durable ledger still JUSTIFIES (`population ≥ refcount`) —
@@ -11409,6 +11422,7 @@ impl SqueezefsFilesystem {
                 "staged_spill_escalations": METRICS.staged_spill_escalations.load(Ordering::Relaxed),
                 "block_double_frees": METRICS.block_double_frees.load(Ordering::Relaxed),
                 "block_untracked_free_refusals": METRICS.block_untracked_free_refusals.load(Ordering::Relaxed),
+                "block_release_skipped_no_record": METRICS.block_release_skipped_no_record.load(Ordering::Relaxed),
                 "block_live_free_refusals": METRICS.block_live_free_refusals.load(Ordering::Relaxed),
                 "block_claim_anomalies": METRICS.block_claim_anomalies.load(Ordering::Relaxed),
                 "read_settle_stale_head_refetches": METRICS.read_settle_stale_head_refetches.load(Ordering::Relaxed),

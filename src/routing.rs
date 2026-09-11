@@ -8257,6 +8257,17 @@ impl DataRouter {
                 .filter(|&i| !self.kvmap_sweep_corpse_pending(i))
                 .collect();
             if !destroyable.is_empty() {
+                // Test seam (`SQUEEZEFS_TEST_CORPSE_SWEEP_FAIL_DESTROY`):
+                // the destroy fails after the corpses' `delete_file`s ran —
+                // the released-references-with-live-records state the
+                // next mount's sweep must find harmless.
+                if crate::env_knobs::bool_knob("SQUEEZEFS_TEST_CORPSE_SWEEP_FAIL_DESTROY", false) {
+                    return Err(SqueezefsError::InvalidOperation(
+                        "corpse sweep destroy refused by SQUEEZEFS_TEST_CORPSE_SWEEP_FAIL_DESTROY \
+                         (test seam)"
+                            .to_string(),
+                    ));
+                }
                 crate::meta_ship::publish::destroy_inodes(backend, &destroyable).await?;
             }
             swept += destroyable.len() as u64;

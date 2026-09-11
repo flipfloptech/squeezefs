@@ -1988,6 +1988,316 @@ async fn a_prior_eras_unforgotten_corpse_is_reclaimed_at_mount() {
 }
 
 // ---------------------------------------------------------------------------
+// 10b. The corpse sweep's DOUBLE RELEASE (fstests generic/749 on the 1.2.3
+//      release chain, 2026-09-11): a release whose durable record is
+//      already gone must never decrement a LIVE owner's RAM refcount.
+// ---------------------------------------------------------------------------
+
+/// The failed-destroy state and its retry — the field mechanism, in
+/// process. `delete_file` releases a corpse's durable references (its own
+/// commit) and `begin_free`s every block its layout maps; `destroy_inodes`
+/// runs AFTER, as a separate transaction. When the destroy fails (the
+/// tape: ONE entry for 68,099 corpses, 6 MB against the 128 KiB whole-entry
+/// cap), the corpse RECORDS survive with their layouts, but their
+/// references are gone and their blocks are free-listed — and a live file
+/// re-mints the offset. The next mount seeds RAM refcounts from the ledger
+/// alone (the live owner's ONE reference), re-runs the sweep, and the
+/// corpse's stale release lands on the live owner's count: at 0 the block
+/// is TERMINALLY freed — its bytes punched — under a layout that still maps
+/// it (the packed `file2` reading 12,291 zeros after the first cycle mount).
+///
+/// The law this pins: on a ledger-bearing volume a reference release may
+/// decrement the RAM refcount ONLY if THIS owner's durable record existed
+/// at release time — the ledger is the truth for "does this ino hold a
+/// reference to this block". A release of an absent record is a counted
+/// no-op (`block_release_skipped_no_record`), never a RAM decrement.
+///
+/// RED pre-fix: after the third mount's sweep the live owner's block reads
+/// `refcount == None` (terminally freed under its live layout).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_corpse_whose_reference_was_already_released_cannot_free_a_live_owners_block() {
+    let meta = NamedTempFile::new().unwrap();
+    format_meta_stamped(meta.path()).await;
+    let data = data_file();
+
+    // Mount 1: the corpse takes the FIRST block; an anchor keeps the ledger
+    // non-empty across the remounts (an empty ledger is declined at mount
+    // and the layout walk — which COUNTS corpses — would heal the state
+    // this contract is about).
+    let corpse_block = {
+        let rig = mount(meta.path(), data.path()).await;
+        let corpse = rig.mk_file("corpse").await;
+        let corpse_block = rig.publish_block(corpse, 0).await;
+        let anchor = rig.mk_file("anchor").await;
+        let anchor_block = rig.publish_block(anchor, 0).await;
+        assert_ne!(corpse_block, anchor_block);
+        rig.routed.unlink(1, "corpse").await.expect("unlink");
+        // The first sweep's half-act (production order, `sweep_unlinked_
+        // corpses`): `delete_file` releases the reference and frees the
+        // block; the destroy that should follow NEVER lands (the over-cap
+        // entry, a kill between the two commits).
+        rig.router
+            .delete_file(&squeezefs::keys::inode_path(corpse))
+            .await
+            .expect("delete_file");
+        assert_eq!(
+            rig.durable_refcount(corpse_block).await,
+            0,
+            "premise: the corpse's reference is released"
+        );
+        assert_eq!(
+            rig.alloc.refcount(corpse_block),
+            None,
+            "premise: the corpse's block is freed in RAM"
+        );
+        assert!(
+            rig.routed.getattr(corpse).await.is_ok(),
+            "premise: the corpse's record (and its layout) survive the failed destroy"
+        );
+        rig.shutdown().await;
+        corpse_block
+    };
+
+    // Mount 2: ownership recovered from the ledger alone (the anchor's one
+    // reference); the corpse's offset is free and a LIVE file re-mints it.
+    {
+        let rig = mount(meta.path(), data.path()).await;
+        let seeded = rig
+            .router
+            .backend_router
+            .recover_durable_block_refs(&rig.routed)
+            .await
+            .expect("durable recovery")
+            .expect("the ledger is non-empty — the durable path ran");
+        assert_eq!(seeded, 1, "premise: only the anchor's reference is durable");
+        let live = rig.mk_file("live").await;
+        let live_block = rig.publish_block(live, 0).await;
+        assert_eq!(
+            live_block, corpse_block,
+            "premise: the live file re-minted the corpse's offset (the free list's lowest gap)"
+        );
+        assert_eq!(rig.durable_refcount(live_block).await, 1);
+        rig.shutdown().await;
+    }
+
+    // Mount 3: the ledger seeds the live owner's ONE reference; the sweep
+    // finds the surviving corpse, whose layout still names the offset.
+    let rig = mount(meta.path(), data.path()).await;
+    let seeded = rig
+        .router
+        .backend_router
+        .recover_durable_block_refs(&rig.routed)
+        .await
+        .expect("durable recovery")
+        .expect("durable path");
+    assert_eq!(
+        seeded, 2,
+        "premise: the anchor's and the live file's references"
+    );
+    assert_eq!(
+        rig.alloc.refcount(corpse_block),
+        Some(1),
+        "premise: the live owner's block is tracked at exactly its one reference"
+    );
+    let skipped0 = METRICS
+        .block_release_skipped_no_record
+        .load(std::sync::atomic::Ordering::Relaxed);
+    let untracked0 = METRICS
+        .block_untracked_free_refusals
+        .load(std::sync::atomic::Ordering::Relaxed);
+
+    let swept = rig
+        .router
+        .sweep_unlinked_corpses()
+        .await
+        .expect("the mount-time corpse sweep");
+    assert_eq!(swept, 1, "the corpse is destroyed by the retry");
+
+    // The headline: the live owner's count is untouched — a release with no
+    // durable record behind it is not a reference this ino holds.
+    assert_eq!(
+        rig.alloc.refcount(corpse_block),
+        Some(1),
+        "the corpse's STALE release decremented the live owner's refcount — at 0 the block \
+         is terminally freed (its bytes punched) under a layout that still maps it: the \
+         generic/749 data loss"
+    );
+    assert_eq!(
+        rig.durable_refcount(corpse_block).await,
+        1,
+        "the live owner's durable reference is untouched"
+    );
+    assert_eq!(
+        METRICS
+            .block_release_skipped_no_record
+            .load(std::sync::atomic::Ordering::Relaxed)
+            - skipped0,
+        1,
+        "the stale release is COUNTED as skipped (block_release_skipped_no_record)"
+    );
+    assert_eq!(
+        METRICS
+            .block_untracked_free_refusals
+            .load(std::sync::atomic::Ordering::Relaxed),
+        untracked0,
+        "the skip happens BEFORE the funnel — no untracked-free refusal storm"
+    );
+    assert!(
+        rig.drift().await.is_empty(),
+        "durable == derived after the sweep"
+    );
+    rig.shutdown().await;
+
+    // The retry's destroy is durable: a remount finds no corpse and the
+    // live owner still holds its block.
+    let rig = mount(meta.path(), data.path()).await;
+    rig.router
+        .backend_router
+        .recover_durable_block_refs(&rig.routed)
+        .await
+        .expect("durable recovery")
+        .expect("durable path");
+    assert_eq!(rig.alloc.refcount(corpse_block), Some(1));
+    assert_eq!(
+        rig.router
+            .sweep_unlinked_corpses()
+            .await
+            .expect("post-remount sweep"),
+        0,
+        "no corpse record remains"
+    );
+    assert!(rig.drift().await.is_empty());
+    rig.shutdown().await;
+}
+
+/// The leak half: a corpse population whose destroy records exceed the
+/// journal's 128 KiB whole-entry cap. Pre-fix the sweep runs EVERY
+/// corpse's `delete_file` (references released, blocks freed) and then ONE
+/// `destroy_inodes` for the whole population — refused `EntryTooLarge`, so
+/// every corpse record survives with its references gone (the state the
+/// contract above makes harmless, and the leak the tape grew from 30,645
+/// to 68,099 corpses across an hour of mounts: 323 failed sweeps).
+///
+/// The law: the destroy is CHUNKED to the cap — derived from the cap and
+/// the per-record journal cost the KV already knows — and the work is
+/// ordered PER CHUNK (release + free the chunk's corpses, then destroy that
+/// chunk), so the over-cap failure cannot happen and any other failure
+/// touches one chunk. The whole population is reclaimed in one sweep, the
+/// next mount finds no corpse, and the oracle is clean.
+///
+/// RED pre-fix: `sweep_unlinked_corpses` errs with "journal entry length …
+/// exceeds the 131072-byte whole-entry cap".
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_overcap_corpse_population_is_reclaimed_across_chunked_destroys() {
+    use squeezefs::meta_backend::kv::journal::{ENTRY_HDR_LEN, MAX_ENTRY_LEN};
+    use squeezefs::meta_backend::kv::record::{INODE_KEY_LEN, RECORD_HEADER_LEN, XATTR_KEY_LEN};
+
+    let meta = NamedTempFile::new().unwrap();
+    format_meta_stamped(meta.path()).await;
+    let data = data_file();
+
+    // A corpse's destroy stages one inode Delete plus one Delete per xattr
+    // (`layout` for a block-owning corpse): `1 (tree id) + header + key`
+    // bytes apiece, empty values. Two classes — block-owning corpses (the
+    // release + free face; bounded by the rig's 2,048-block volume) and
+    // bare ones — sized so ONE entry for the whole population overshoots
+    // the cap by a clear margin: the tape's shape at a twentieth of its
+    // scale.
+    let per_record = |key_len: usize| 1 + RECORD_HEADER_LEN + key_len;
+    let per_owning = per_record(INODE_KEY_LEN) + per_record(XATTR_KEY_LEN);
+    let per_bare = per_record(INODE_KEY_LEN);
+    let cap = (MAX_ENTRY_LEN - ENTRY_HDR_LEN) as usize;
+    let owning = 1_500usize;
+    let bare = (cap + cap / 8 - owning * per_owning).div_ceil(per_bare);
+    let population = owning + bare;
+    assert!(
+        owning * per_owning + bare * per_bare > cap,
+        "premise: the population's destroy records exceed one entry"
+    );
+
+    let (corpse_blocks, live_block) = {
+        let rig = mount(meta.path(), data.path()).await;
+        let mut corpse_blocks = Vec::with_capacity(owning);
+        for i in 0..population {
+            let name = format!("corpse_{i}");
+            let ino = rig.mk_file(&name).await;
+            if i < owning {
+                corpse_blocks.push(rig.publish_block(ino, 0).await);
+            }
+            rig.routed.unlink(1, &name).await.expect("unlink");
+        }
+        let live = rig.mk_file("survivor").await;
+        let live_block = rig.publish_block(live, 0).await;
+        assert_eq!(
+            rig.durable().await.len(),
+            owning + 1,
+            "premise: every block-owning corpse's reference is still durable (no FORGET ever came)"
+        );
+        rig.shutdown().await;
+        (corpse_blocks, live_block)
+    };
+
+    let rig = mount(meta.path(), data.path()).await;
+    rig.router
+        .backend_router
+        .recover_durable_block_refs(&rig.routed)
+        .await
+        .expect("durable recovery")
+        .expect("durable path");
+    let swept = rig.router.sweep_unlinked_corpses().await.expect(
+        "an over-cap corpse population must be reclaimed across chunked destroys — \
+             never one EntryTooLarge transaction for the whole population",
+    );
+    assert_eq!(
+        swept, population as u64,
+        "the whole population is reclaimed in ONE sweep"
+    );
+    for off in &corpse_blocks {
+        assert_eq!(
+            rig.durable_refcount(*off).await,
+            0,
+            "every corpse's reference is released"
+        );
+        assert_eq!(
+            rig.alloc.refcount(*off),
+            None,
+            "every corpse's block is freed"
+        );
+    }
+    assert_eq!(
+        rig.alloc.refcount(live_block),
+        Some(1),
+        "the survivor is untouched"
+    );
+    assert_eq!(rig.durable_refcount(live_block).await, 1);
+    assert!(
+        rig.drift().await.is_empty(),
+        "durable == derived after the chunked sweep"
+    );
+    rig.shutdown().await;
+
+    // Durable: the next mount finds nothing to sweep.
+    let rig = mount(meta.path(), data.path()).await;
+    rig.router
+        .backend_router
+        .recover_durable_block_refs(&rig.routed)
+        .await
+        .expect("durable recovery")
+        .expect("durable path");
+    assert_eq!(
+        rig.router
+            .sweep_unlinked_corpses()
+            .await
+            .expect("post-remount sweep"),
+        0,
+        "no corpse record remains"
+    );
+    assert_eq!(rig.alloc.refcount(live_block), Some(1));
+    assert!(rig.drift().await.is_empty());
+    rig.shutdown().await;
+}
+
+// ---------------------------------------------------------------------------
 // 11. Finding 38: a ref load beyond one journal entry's admission still
 //     publishes (chunked), and the accumulator can never poison
 // ---------------------------------------------------------------------------

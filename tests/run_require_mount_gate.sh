@@ -31,6 +31,7 @@ DEFAULT_TESTS=(
   cache_path_policy_tests
   cli_clients_df_tests
   commit_wake_loss_tests
+  corpse_sweep_tests
   dismount_staged_residue_tests
   format_guard_tests
   fsync_promote_staged_tests

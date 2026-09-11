@@ -10291,8 +10291,38 @@ impl KvMetaBackend {
         ino: Ino,
         ops: &[super::block_refs::BlockRefOp],
     ) -> Result<()> {
-        if self.block_refs.is_none() || ops.is_empty() {
-            return Ok(());
+        self.commit_block_refs_inner(ino, ops, false)
+            .await
+            .map(|_held| ())
+    }
+
+    /// [`Self::commit_block_refs`] that WITNESSES the releases — `None` on
+    /// a volume without the ledger (the derived posture), `Some(held)`
+    /// otherwise, where `held` is every released reference whose record
+    /// EXISTED at commit time (the reclaim path's RAM-decrement gate —
+    /// [`super::block_refs::ReleaseWitness`]). The existence probes are
+    /// point lookups on the RAM-authoritative tree under the same 4a
+    /// I-guard the commit holds, so no concurrent commit of this ino's
+    /// ownership set can slip between the probe and the `Delete`.
+    pub async fn commit_block_refs_witnessed(
+        &self,
+        ino: Ino,
+        ops: &[super::block_refs::BlockRefOp],
+    ) -> Result<Option<Vec<super::block_refs::BlockRef>>> {
+        self.commit_block_refs_inner(ino, ops, true).await
+    }
+
+    async fn commit_block_refs_inner(
+        &self,
+        ino: Ino,
+        ops: &[super::block_refs::BlockRefOp],
+        witness: bool,
+    ) -> Result<Option<Vec<super::block_refs::BlockRef>>> {
+        let Some(tree) = self.block_refs.as_ref() else {
+            return Ok(None);
+        };
+        if ops.is_empty() {
+            return Ok(Some(Vec::new()));
         }
         self.write_gate()?;
         // The ino's I-guard: the records belong to this ino's ownership
@@ -10300,11 +10330,19 @@ impl KvMetaBackend {
         // serializes their release (lock order unchanged — 4a before 4b,
         // which `commit_tx` takes).
         let guards: Arc<[DlmGuard]> = Arc::from(vec![self.dlm.lock_inode_exclusive(ino).await]);
+        let mut held = Vec::new();
+        if witness {
+            for op in ops.iter().filter(|op| !op.take) {
+                if tree.lookup(&op.reference.key()).await?.is_some() {
+                    held.push(op.reference);
+                }
+            }
+        }
         let mut tx = KvTx::new();
         tx.stage_block_refs(ops);
         tx.hold_guards(guards);
         self.commit_tx(tx).await?;
-        Ok(())
+        Ok(Some(held))
     }
 
     /// Write-commit-economy campaign (2026-07-30): the block-publish

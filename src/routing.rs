@@ -8269,26 +8269,29 @@ impl DataRouter {
                     ));
                 }
                 crate::meta_ship::publish::destroy_inodes(backend, &destroyable).await?;
+                swept += destroyable.len() as u64;
             }
-            swept += destroyable.len() as u64;
         }
         Ok(swept)
     }
 
     /// Commit a standalone durable block-reference release for `ino` (spec
-    /// §6.2 item 1) — the reclaim path's ledger teardown. See the ordering
-    /// note at the call site in [`Self::delete_file`].
+    /// §6.2 item 1) — the reclaim path's ledger teardown — and WITNESS it:
+    /// which released records existed at commit time, the gate every RAM
+    /// free that follows must pass
+    /// ([`crate::meta_backend::kv::block_refs::ReleaseWitness`]). See the
+    /// ordering note at the call site in [`Self::delete_file`].
     pub(crate) async fn release_block_refs(
         &self,
         ino: u64,
         ops: &[crate::meta_backend::kv::block_refs::BlockRefOp],
-    ) -> Result<()> {
+    ) -> Result<crate::meta_backend::kv::block_refs::ReleaseWitness> {
         let Some(backend) = self.inner.meta_backend.get() else {
-            return Ok(());
+            return Ok(crate::meta_backend::kv::block_refs::ReleaseWitness::Derived);
         };
         // S9: routed — a foreign-home ino's ledger teardown belongs to the
         // volume's owner (the record lives in ITS `TREE_BLOCK_REFS`).
-        crate::meta_ship::publish::commit_block_refs(backend, ino, ops).await
+        crate::meta_ship::publish::release_block_refs_witnessed(backend, ino, ops).await
     }
 
     /// The exact durable-reference delta between an ino's PREVIOUS block
@@ -22955,6 +22958,18 @@ impl DataRouter {
         // un-persisted rebinds (never file size — the sparse-corpse law).
         let mut refs = self.block_ref_ops(ino, &ref_changes);
         let pending = self.take_block_ref_ops(ino);
+        // The RAM-ONLY references among the pending notes: a pending TAKE
+        // is a block this process minted (or pinned) and bound in RAM
+        // without persisting — its RAM refcount entry exists (allocation
+        // seeded it) while its durable record does not YET. The witness
+        // below cannot see those, so they are budgeted here, before the
+        // dedup folds the take into the map-derived release of the same
+        // reference.
+        let ram_only_takes: Vec<crate::meta_backend::kv::block_refs::BlockRef> = pending
+            .iter()
+            .filter(|op| op.take)
+            .map(|op| op.reference)
+            .collect();
         if !pending.is_empty() {
             let mut seen: std::collections::BTreeSet<
                 crate::meta_backend::kv::block_refs::BlockRef,
@@ -22967,13 +22982,79 @@ impl DataRouter {
                 }
             }
         }
-        if !refs.is_empty() {
-            if let Err(e) = self.release_block_refs(ino, &refs).await {
-                // Never block the reclaim on the ledger: a failed release
-                // is the conservative window above (blocks stay accounted
-                // and fsck reclaims them), so log loud and continue.
+        // The double-release gate (fstests generic/749 on the 1.2.3 release
+        // chain, 2026-09-11): the release commit WITNESSES which of this
+        // ino's records existed, and only those references — plus the
+        // RAM-only takes above — may decrement a RAM refcount below. The
+        // RAM count was seeded from the records that exist, so a release
+        // with no record behind it is not a reference this ino holds: its
+        // decrement would land on whichever LIVE owner holds the offset
+        // now (a corpse a prior sweep released but never destroyed — the
+        // over-cap destroy — naming the pack block every promotion lands
+        // in), terminally freeing that owner's block under its layout. A
+        // volume without the ledger keeps the derived posture (the layout
+        // walk seeded every surviving layout's references, corpses
+        // included); a peer-owned ino's frees ship, and the authority's
+        // executor validates them against its own ledger.
+        let free_budget: Option<std::collections::HashMap<(u64, u64), usize>> = if refs.is_empty() {
+            None
+        } else {
+            use crate::meta_backend::kv::block_refs::ReleaseWitness;
+            match self.release_block_refs(ino, &refs).await {
+                Ok(ReleaseWitness::Derived) | Ok(ReleaseWitness::Shipped) => None,
+                Ok(ReleaseWitness::Ledger(held)) => {
+                    let mut budget: std::collections::HashMap<(u64, u64), usize> =
+                        std::collections::HashMap::new();
+                    for r in held.iter().chain(ram_only_takes.iter()) {
+                        *budget.entry((r.vol_tag, r.block_idx)).or_insert(0) += 1;
+                    }
+                    Some(budget)
+                }
+                Err(e) => {
+                    // Never block the reclaim on the ledger — but never
+                    // free on an unwitnessed release either: the records
+                    // survive, so the next mount seeds these references
+                    // again and its sweep frees them under a witness (the
+                    // conservative window above; fsck C2/C8 name the
+                    // residue meanwhile).
+                    log::warn!(
+                        "durable block-reference release failed for reclaimed ino {ino}: {e} \
+                         (the corpse's references survive — its blocks stay accounted and \
+                         the next mount's sweep frees them; fsck C2/C8 name them meanwhile)"
+                    );
+                    Some(std::collections::HashMap::new())
+                }
+            }
+        };
+        if let Some(mut budget) = free_budget {
+            let mut skipped = 0u64;
+            blocks_to_free.retain(|bk| {
+                // An unresolvable key is not the ledger's to gate (the same
+                // class the mount-time walk skips); the free funnel refuses
+                // it on its own.
+                let Some(r) = self.backend_router.block_ref_for(bk, ino, 0) else {
+                    return true;
+                };
+                match budget.get_mut(&(r.vol_tag, r.block_idx)) {
+                    Some(n) if *n > 0 => {
+                        *n -= 1;
+                        true
+                    }
+                    _ => {
+                        skipped += 1;
+                        false
+                    }
+                }
+            });
+            if skipped > 0 {
+                crate::fuse_client::METRICS
+                    .block_release_skipped_no_record
+                    .fetch_add(skipped, Ordering::Relaxed);
                 log::warn!(
-                    "durable block-reference release failed for reclaimed ino {ino}: {e}                      (the corpse's references survive — fsck C2/C8 reclaim them; the                      blocks themselves are freed below)"
+                    "reclaim of ino {ino}: {skipped} block release(s) skipped — the layout names \
+                     blocks this ino holds no durable reference to (a prior era released them \
+                     without destroying the record); their RAM refcounts belong to the offsets' \
+                     live owners and are untouched (block_release_skipped_no_record)"
                 );
             }
         }

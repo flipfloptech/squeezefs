@@ -3128,23 +3128,55 @@ pub async fn commit_block_refs(
             note_local();
             be.commit_block_refs(ino, refs).await
         }
+        Some(peer) => ship_commit_block_refs(&peer, ino, refs).await,
+    }
+}
+
+/// [`commit_block_refs`] with the release WITNESS the reclaim path gates
+/// its RAM frees on ([`crate::meta_backend::kv::block_refs::ReleaseWitness`]):
+/// the local arm reports which released records existed; the shipped arm
+/// reports `Shipped` — the frees ship too, and the authority's executor
+/// validates them against its own ledger.
+pub async fn release_block_refs_witnessed(
+    be: &Arc<RoutedMetaBackend>,
+    ino: Ino,
+    refs: &[BlockRefOp],
+) -> Result<crate::meta_backend::kv::block_refs::ReleaseWitness> {
+    use crate::meta_backend::kv::block_refs::ReleaseWitness;
+    match owner_of(be, ino)? {
+        None => {
+            note_local();
+            Ok(match be.commit_block_refs_witnessed(ino, refs).await? {
+                None => ReleaseWitness::Derived,
+                Some(held) => ReleaseWitness::Ledger(held),
+            })
+        }
         Some(peer) => {
-            intent_barrier_inos(&[ino]).await?;
-            expect_unit(
-                ship_witnessed(
-                    &peer,
-                    PublishCall::CommitBlockRefs {
-                        ino,
-                        refs: wire_refs(refs),
-                        lease_epoch: current_lease_epoch(),
-                        request_id: crate::cowriter::next_ship_request_id(),
-                    },
-                )
-                .await?,
-                "commit_block_refs",
-            )
+            ship_commit_block_refs(&peer, ino, refs).await?;
+            Ok(ReleaseWitness::Shipped)
         }
     }
+}
+
+async fn ship_commit_block_refs(
+    peer: &Arc<super::PeerOwner>,
+    ino: Ino,
+    refs: &[BlockRefOp],
+) -> Result<()> {
+    intent_barrier_inos(&[ino]).await?;
+    expect_unit(
+        ship_witnessed(
+            peer,
+            PublishCall::CommitBlockRefs {
+                ino,
+                refs: wire_refs(refs),
+                lease_epoch: current_lease_epoch(),
+                request_id: crate::cowriter::next_ship_request_id(),
+            },
+        )
+        .await?,
+        "commit_block_refs",
+    )
 }
 
 /// Routed [`RoutedMetaBackend::migrate_block_map_train`] — the kvmap

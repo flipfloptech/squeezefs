@@ -3715,6 +3715,27 @@ impl RoutedMetaBackend {
         out
     }
 
+    /// [`Self::commit_block_refs`] with the release WITNESS
+    /// ([`kv::backend::KvMetaBackend::commit_block_refs_witnessed`]): `None`
+    /// when `ino`'s home volume carries no ledger, `Some(held)` otherwise —
+    /// the reclaim path's RAM-decrement gate.
+    pub async fn commit_block_refs_witnessed(
+        &self,
+        ino: Ino,
+        ops: &[crate::meta_backend::kv::block_refs::BlockRefOp],
+    ) -> Result<Option<Vec<crate::meta_backend::kv::block_refs::BlockRef>>> {
+        let _gate = self.slot_gate_enter(&[ino]).await;
+        let (v_idx, local_ino) = self.route_ino(ino);
+        self.check_volume_enabled(v_idx)?;
+        let out = self.volumes[v_idx]
+            .commit_block_refs_witnessed(local_ino, ops)
+            .await;
+        if out.is_err() {
+            self.mirror_volume_failure(v_idx);
+        }
+        out
+    }
+
     /// PR 2 (kvmap): is the block-map tree engaged on `ino`'s HOME volume
     /// (incompat bit 16 stamped, tree mounted)? The crossing decision's
     /// probe — `false` keeps the legacy indirect-blob arm.

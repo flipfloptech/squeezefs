@@ -250,6 +250,36 @@ impl BlockRefOp {
     }
 }
 
+/// What a standalone reference RELEASE commit (the reclaim path's
+/// `delete_file`, the mount-time corpse sweep) can say about the
+/// references it dropped — the input to the RAM-refcount gate that closed
+/// the generic/749 double release (2026-09-11).
+///
+/// The law: on a ledger-bearing volume a release may decrement the RAM
+/// refcount ONLY if THIS owner's durable record existed at release time.
+/// The ledger is the truth for "does this ino hold a reference to this
+/// block"; a `Delete` of an absent key is a no-op in the tree (§4.10's
+/// idempotent-replay posture) and must be a no-op in RAM too — the RAM
+/// count was seeded from the records that exist, so a decrement with no
+/// record behind it lands on whichever LIVE owner holds the offset now.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReleaseWitness {
+    /// No ledger on the ino's home volume (incompat bit 9 absent): the
+    /// derived posture — the layout walk seeded every reference every
+    /// surviving layout names (corpses included), so every release the
+    /// layout justifies stands.
+    Derived,
+    /// The ino's home volume is a peer's: the release shipped as a verb,
+    /// and the FREE ships too — the authority's executor validates it
+    /// against ITS ledger (`cowriter::execute_shipped_frees`' population
+    /// shield); nothing is gated here.
+    Shipped,
+    /// The ledger is engaged: the releases whose record EXISTED at commit
+    /// time (deduped by reference). Every other release named an absent
+    /// record and justifies no RAM decrement.
+    Ledger(Vec<BlockRef>),
+}
+
 /// **The caller frame's RAM-only lifetimes** (finding 15's supply leak,
 /// `.benchmarks/2026-09-06-cowriter-free-refcount-leak.md`): the DATA
 /// blocks a publish frame both TAKES and RELEASES — a binding minted,

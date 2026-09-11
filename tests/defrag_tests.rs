@@ -1167,6 +1167,132 @@ async fn test_defrag_meta_job_merges_underfull_leaves() {
             .expect("survivor xattr");
         assert_eq!(v, payload(k), "survivor {k} reads back byte-exact");
     }
+    // The job's census IS the bounded sweep walk (design §4.6a (e),
+    // finalized): the merge pass drives whole laps of it.
+    assert!(
+        fx.meta.volumes[0].merge_laps() >= 1,
+        "the defrag-meta merge pass completes ≥ 1 sweep lap"
+    );
+    assert_eq!(
+        METRICS.frag_d4_mergeable_leaves.load(Ordering::Relaxed),
+        {
+            squeezefs::defrag::measure(&fx.meta, &fx.fs.router)
+                .await
+                .expect("measure");
+            fx.meta.volumes[0].merge_candidates()
+        },
+        "frag_d4_mergeable_leaves ≡ meta_kv_merge_candidates on a quiescent volume"
+    );
+    fx.close().await;
+}
+
+/// §4.6a (e) finalized, the third trigger's THROTTLE: the D4 merge pass
+/// runs on the job fabric under the KD-3 duty-cycle law like every other
+/// nudge — a 2 % `defrag --meta` makes progress (a chunk lands), yields
+/// between chunks (a pause parks it), and completes once rethrottled to
+/// 100 with its merges counted. Same fixture as the job-drive contract.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_defrag_meta_merge_pass_honours_the_throttle() {
+    use squeezefs::meta_backend::Metadata as _;
+    let _serial = serial().await;
+    struct Cleanup;
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            std::env::remove_var("SQUEEZEFS_META_FLUSH_INTERVAL_MS");
+        }
+    }
+    std::env::set_var("SQUEEZEFS_META_FLUSH_INTERVAL_MS", "60000");
+    let _cleanup = Cleanup;
+    let dir = tempfile::tempdir().unwrap();
+    let meta = make_file(dir.path(), "meta", 256 * 1024 * 1024);
+    let oss1 = make_file(dir.path(), "oss1", 1 << 30);
+    format_meta(&meta, &[&oss1]).await;
+    let recs = base_format_config(&[&oss1]).resolved_data_volumes();
+    let fx = open_fixture(&meta, &recs).await;
+
+    const N: usize = 48;
+    let payload = |k: usize| vec![(k as u8).wrapping_mul(11); 48 * 1024];
+    for k in 0..N {
+        fx.meta
+            .setxattr(1, &format!("user.thr{k:02}"), &payload(k))
+            .await
+            .expect("setxattr");
+    }
+    fx.meta.volumes[0]
+        .checkpoint_now()
+        .await
+        .expect("checkpoint");
+    for k in 0..N {
+        if k % 12 != 0 {
+            fx.meta
+                .removexattr(1, &format!("user.thr{k:02}"))
+                .await
+                .expect("removexattr");
+        }
+    }
+    let census = fx.meta.volumes[0].dead_bset_census();
+    assert!(census.merge_candidates.len() >= 2, "a merge-heavy fixture");
+
+    // 2 %: every chunk of work parks 49× its own duration (KD-3).
+    let merges_before = METRICS.defrag_meta_merges.load(Ordering::Relaxed);
+    let job_id = fx
+        .fabric
+        .submit(JobSpec {
+            job_type: JobType::DefragMeta,
+            throttle_pct: 2,
+        })
+        .await
+        .expect("submit throttled defrag-meta");
+    // Progress under the throttle: the first chunk lands (the status
+    // record's `done` moves) while the job stays live.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    let st = loop {
+        if let Some(st) = fx.fabric.status(&job_id).await.unwrap() {
+            if st.tasks_done >= 1 || !matches!(st.state, JobState::Running | JobState::Queued) {
+                break st;
+            }
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the throttled defrag-meta never made progress"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+    };
+    assert_eq!(st.throttle_pct, 2, "the submitted throttle is recorded");
+    // It yields between chunks: a pause parks it (or it already finished —
+    // both mean the duty park returned control).
+    fx.fabric.pause(&job_id).await.expect("pause");
+    let st = fx.fabric.status(&job_id).await.unwrap().unwrap();
+    assert!(
+        matches!(st.state, JobState::Paused | JobState::Completed),
+        "pause must park a live throttled merge pass (got {:?})",
+        st.state
+    );
+    fx.fabric.resume(&job_id).await.expect("resume");
+    fx.fabric.throttle(&job_id, 100).await.expect("rethrottle");
+    let end = fx
+        .fabric
+        .wait_terminal(&job_id, std::time::Duration::from_secs(180))
+        .await
+        .expect("terminal");
+    assert_eq!(
+        end,
+        JobState::Completed,
+        "the rethrottled merge pass completes"
+    );
+    assert!(
+        METRICS.defrag_meta_merges.load(Ordering::Relaxed) > merges_before,
+        "the throttled job's merges are counted"
+    );
+    for k in (0..N).step_by(12) {
+        let v = fx
+            .meta
+            .getxattr(1, &format!("user.thr{k:02}"))
+            .await
+            .unwrap()
+            .expect("survivor xattr");
+        assert_eq!(v, payload(k));
+    }
     fx.close().await;
 }
 

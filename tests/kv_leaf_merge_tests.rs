@@ -39,8 +39,9 @@
 //!    volume's free extents grow by one per merge (plus one per collapse)
 //!    once the covering advance runs.
 //! 8. **the D4 face** — the census reports `mergeable_leaves`, the
-//!    `measure_d4` report carries it, `defrag_merge_leaves` merges them
-//!    (the in-process job drive is `tests/defrag_tests.rs`).
+//!    `measure_d4` report carries it, `defrag_merge_sweep` (the D4 arm's
+//!    bounded, cursor-resumed sweep) merges them (the in-process job
+//!    drive is `tests/defrag_tests.rs`).
 //! 9. **the derivation tie test** — the candidate bound is the split's ¾
 //!    fill read backwards (drift is red).
 //!
@@ -280,25 +281,120 @@ async fn drain(tree: &KvTree, ctx: &mut SmoContext) {
 
 /// Flush + sweep to a fixpoint: no merge and no collapse left to run.
 async fn merge_to_fixpoint(tree: &KvTree, vol: &mut Vol) -> MaintenanceOutcome {
+    merge_to_fixpoint_counted(tree, vol).await.0
+}
+
+/// [`merge_to_fixpoint`] that also reports how many flush + cover + sweep
+/// PASSES the fixpoint took (the convergence-bound contracts' instrument;
+/// the terminal no-op pass is counted). Every sweep is an unbounded lap
+/// (`deadline = None`), so a pass is one whole census of the tree.
+async fn merge_to_fixpoint_counted(tree: &KvTree, vol: &mut Vol) -> (MaintenanceOutcome, u32) {
     let mut total = MaintenanceOutcome::default();
-    for _ in 0..64 {
+    for pass in 1..=64u32 {
         tree.flush_dirty(&mut vol.ctx).await.expect("flush");
         vol.cover_everything();
         let sweep = tree
-            .merge_underfull(&mut vol.ctx, false)
+            .merge_underfull(&mut vol.ctx, false, None)
             .await
             .expect("merge sweep");
+        assert!(sweep.lap_complete, "an unbounded sweep completes its lap");
         total.merges += sweep.outcome.merges;
         total.root_collapses += sweep.outcome.root_collapses;
+        total.interior_merges += sweep.outcome.interior_merges;
         assert!(
             !sweep.space_refused,
             "a roomy heap never refuses a merge for space"
         );
         if sweep.outcome.merges + sweep.outcome.root_collapses == 0 {
-            return total;
+            return (total, pass);
         }
     }
     panic!("the merge sweep never reached a fixpoint");
+}
+
+/// §4.6a (d) as a checkable law — the tree is at its MERGE FIXED POINT:
+/// at every level, no two adjacent nodes under ONE parent are jointly
+/// mergeable by the candidate law, and no two adjacent nodes under
+/// DIFFERENT parents are jointly mergeable unless their parents are
+/// themselves NOT jointly mergeable (the one shape the sibling-only SMO
+/// cannot reach: a boundary between two interiors whose separator folds
+/// exceed the pair capacity together). Returns `(stranded_pairs,
+/// heavy_boundaries)` — the former is always ≤ the latter by construction
+/// (the walk panics on any pair the SMO should have merged).
+async fn merge_fixed_point(tree: &KvTree, cache: &Arc<NodeCache>) -> (u64, u64) {
+    let layout = cache.config().layout;
+    let tail = cache.durable_tail();
+    let f = |n: &Arc<CachedNode>| {
+        n.snapshot()
+            .fold_bytes_upper_with(&mut [], layout.merge_pair_capacity(), tail)
+            .0
+    };
+    let pair = |a: usize, b: usize| {
+        a + b <= layout.merge_pair_capacity() && a.min(b) <= layout.merge_candidate_capacity()
+    };
+    // Per level: (node, parent addr, fold) in key order.
+    let root = cache.get(tree.root().addr).await.expect("root");
+    let mut level: Vec<(Arc<CachedNode>, u64, usize)> = vec![(root.clone(), u64::MAX, f(&root))];
+    let (mut stranded, mut heavy) = (0u64, 0u64);
+    while level[0].0.level() > 0 {
+        let mut next: Vec<(Arc<CachedNode>, u64, usize)> = Vec::new();
+        for (node, _, _) in &level {
+            let snap = node.snapshot();
+            let mut cursor = node.min_key().to_vec();
+            while let Some((_, ptr)) = snap.next_live(&cursor, None).expect("next_live") {
+                let (addr, _) = decode_interior_value(&ptr).expect("interior value");
+                let child = cache.get(addr).await.expect("child");
+                cursor = key_successor(child.max_key());
+                let fc = f(&child);
+                next.push((child, node.addr(), fc));
+            }
+        }
+        let parents = &level;
+        for w in next.windows(2) {
+            let ((a, pa, fa), (b, pb, fb)) = (&w[0], &w[1]);
+            if !pair(*fa, *fb) {
+                continue;
+            }
+            assert_ne!(
+                pa,
+                pb,
+                "adjacent SIBLINGS {:#x} ({fa} B) and {:#x} ({fb} B) at level {} are jointly \
+                 mergeable — the sweep is not at its fixed point",
+                a.addr(),
+                b.addr(),
+                a.level()
+            );
+            let fpa = parents
+                .iter()
+                .find(|(p, _, _)| p.addr() == *pa)
+                .map(|(_, _, f)| *f);
+            let fpb = parents
+                .iter()
+                .find(|(p, _, _)| p.addr() == *pb)
+                .map(|(_, _, f)| *f);
+            let (fpa, fpb) = (fpa.expect("parent a"), fpb.expect("parent b"));
+            assert!(
+                !pair(fpa, fpb),
+                "adjacent nodes {:#x} and {:#x} at level {} straddle parents {pa:#x} ({fpa} B) \
+                 and {pb:#x} ({fpb} B) that are themselves jointly mergeable — the interior \
+                 merge the sibling law owes did not run",
+                a.addr(),
+                b.addr(),
+                a.level()
+            );
+            stranded += 1;
+        }
+        // A stranded child pair sits under exactly one adjacent-parent
+        // boundary whose parents cannot merge — count those boundaries.
+        for w in level.windows(2) {
+            if !pair(w[0].2, w[1].2) {
+                heavy += 1;
+            }
+        }
+        level = next;
+    }
+    assert!(stranded <= heavy, "stranded pairs exceed heavy boundaries");
+    (stranded, heavy)
 }
 
 /// A deterministic pseudo-random permutation of `0..n` (LCG-driven
@@ -850,7 +946,7 @@ async fn merge_vs_commit_storm_loses_nothing() {
             smo_cache.set_durable_tail(seq);
             smo_alloc.advance_durable(seq);
             let sweep = smo_tree
-                .merge_underfull(&mut smo_ctx, false)
+                .merge_underfull(&mut smo_ctx, false, None)
                 .await
                 .expect("merge sweep under storm");
             merges += sweep.outcome.merges;
@@ -979,7 +1075,7 @@ async fn a_merge_is_admitted_at_the_compaction_floor_and_returns_extents() {
         let held = drain_to(&vol.alloc, floor);
         let root_before = tree.root();
         let sweep = tree
-            .merge_underfull(&mut vol.ctx, false)
+            .merge_underfull(&mut vol.ctx, false, None)
             .await
             .expect("sweep at the floor");
         assert!(
@@ -997,7 +1093,7 @@ async fn a_merge_is_admitted_at_the_compaction_floor_and_returns_extents() {
         // One extent returned: admitted.
         vol.alloc.release_unpublished(held[0]);
         let sweep = tree
-            .merge_underfull(&mut vol.ctx, false)
+            .merge_underfull(&mut vol.ctx, false, None)
             .await
             .expect("sweep one above the floor");
         assert!(!sweep.space_refused);
@@ -1012,7 +1108,7 @@ async fn a_merge_is_admitted_at_the_compaction_floor_and_returns_extents() {
         let _held = drain_to(&vol.alloc, floor + 1);
         let free_before = vol.alloc.free_extents();
         let sweep = tree
-            .merge_underfull(&mut vol.ctx, false)
+            .merge_underfull(&mut vol.ctx, false, None)
             .await
             .expect("sweep");
         assert_eq!(sweep.outcome.merges, 1);
@@ -1115,8 +1211,7 @@ async fn replay_converges_across_crash_windows_of_a_merge_and_a_root_collapse() 
     let merges0 = META_KV_NODE_MERGES.load(Ordering::Relaxed);
     let driver = {
         let be = be.clone();
-        let candidates = census.merge_candidates.clone();
-        tokio::spawn(async move { be.defrag_merge_leaves(&candidates).await })
+        tokio::spawn(async move { be.defrag_merge_sweep(None).await })
     };
     let mut parked = None;
     for _ in 0..2_000 {
@@ -1136,12 +1231,12 @@ async fn replay_converges_across_crash_windows_of_a_merge_and_a_root_collapse() 
     std::fs::copy(file.path(), crash_a.path()).expect("copy the parked image");
     test_smo_build_pause_release();
     *TEST_SMO_BUILD_PAUSED.lock().expect("seam mutex") = None;
-    let merged = driver
+    let report = driver
         .await
         .expect("driver task")
-        .expect("defrag_merge_leaves");
+        .expect("defrag_merge_sweep");
     assert!(
-        merged >= 1,
+        report.merges >= 1,
         "the released merge (and its siblings) run to completion"
     );
     assert!(META_KV_NODE_MERGES.load(Ordering::Relaxed) > merges0);
@@ -1155,13 +1250,13 @@ async fn replay_converges_across_crash_windows_of_a_merge_and_a_root_collapse() 
     // merging to the fixpoint — the inode and dentry trees are each ~10 %
     // of a leaf and collapse to root leaves.
     for _ in 0..8 {
-        let census = be.dead_bset_census();
-        if census.merge_candidates.is_empty() {
-            break;
-        }
-        be.defrag_merge_leaves(&census.merge_candidates)
+        let r = be
+            .defrag_merge_sweep(None)
             .await
             .expect("merge to fixpoint");
+        if r.merges + r.root_collapses == 0 {
+            break;
+        }
     }
     assert!(
         META_KV_ROOT_COLLAPSES.load(Ordering::Relaxed) > collapses0,
@@ -1268,11 +1363,12 @@ async fn d4_census_reports_mergeable_leaves_and_the_defrag_arm_merges_them() {
     assert_eq!(be.merge_candidates(), rows[0].mergeable_leaves);
 
     let merges0 = META_KV_NODE_MERGES.load(Ordering::Relaxed);
-    let merged = be
-        .defrag_merge_leaves(&census.merge_candidates)
-        .await
-        .expect("defrag merge arm");
-    assert!(merged >= 1, "the defrag arm merges the candidates");
+    let report = be.defrag_merge_sweep(None).await.expect("defrag merge arm");
+    assert!(
+        report.lap_complete,
+        "an unbounded arm call completes its lap"
+    );
+    assert!(report.merges >= 1, "the defrag arm merges the candidates");
     assert!(META_KV_NODE_MERGES.load(Ordering::Relaxed) > merges0);
     let after = be.dead_bset_census();
     assert!(
@@ -1296,8 +1392,20 @@ async fn d4_census_reports_mergeable_leaves_and_the_defrag_arm_merges_them() {
             .expect("payload");
         assert!(v.iter().all(|b| *b == (i & 0xFF) as u8));
     }
-    // Idempotence: a clean re-run over an empty candidate list is a no-op.
-    assert_eq!(be.defrag_merge_leaves(&[]).await.expect("re-run"), 0);
+    // Idempotence: the arm at its fixed point merges nothing, and its
+    // published count is the census's (one source of truth).
+    let again = be.defrag_merge_sweep(None).await.expect("re-run");
+    assert_eq!(
+        again.merges + again.root_collapses,
+        0,
+        "nothing mergeable ⇒ nothing merged"
+    );
+    assert_eq!(again.candidates, be.merge_candidates());
+    assert_eq!(
+        again.candidates,
+        be.dead_bset_census().merge_candidates.len() as u64,
+        "the arm's lap count is the census's count"
+    );
     be.checkpoint_now().await.expect("checkpoint");
     be.shutdown().await.expect("shutdown");
 }
@@ -1342,4 +1450,334 @@ fn merge_bounds_derive_from_the_split_fill_target() {
         let reserve = compaction_reserve_extents(total);
         assert_eq!(compaction_floor_extents(reserve), reserve / 2);
     }
+}
+
+// ---------------------------------------------------------------------------
+// Finalization (the three "stated, not done" items, owner ruling
+// 2026-09-11): (10) cross-parent shrinkage proven + the convergence
+// bound; (11) the exact candidates gauge; (12)/(13) the bounded,
+// cursor-resumed sweep and its budget derivation.
+// ---------------------------------------------------------------------------
+
+/// Live children of an interior node, in key order.
+async fn children_of(cache: &Arc<NodeCache>, node: &Arc<CachedNode>) -> Vec<Arc<CachedNode>> {
+    let snap = node.snapshot();
+    let mut out = Vec::new();
+    let mut cursor = node.min_key().to_vec();
+    while let Some((_, ptr)) = snap.next_live(&cursor, None).expect("next_live") {
+        let (addr, _) = decode_interior_value(&ptr).expect("interior value");
+        let child = cache.get(addr).await.expect("child");
+        cursor = key_successor(child.max_key());
+        out.push(child);
+    }
+    out
+}
+
+/// (10) §4.6a (d) PROVEN: underfull leaves on BOTH sides of every parent
+/// boundary — each level-1 interior keeps one record in its leftmost and
+/// one in its rightmost leaf, everything else deleted — can only merge
+/// after their parents merge. The sweep must (a) run the interior merges
+/// (`interior_merges ≥ parents − 1`), (b) reach the merge fixed point
+/// with NO stranded pair (every parent here is tiny, so no boundary is
+/// heavy), (c) collapse the height, and (d) converge within the derived
+/// bound: `passes ≤ 3·h₀ + 1` — per level, one pass merges it, one pass
+/// (after coverage elides the tombstones the merges minted above) merges
+/// the parent level, one pass regroups the level under its merged
+/// parents; plus the terminal no-op pass.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cross_parent_underfull_leaves_shrink_through_interior_merges_to_a_fixed_point() {
+    // 64 KiB nodes + 6 KiB values ⇒ ~9 records per full leaf, ~4–5 per
+    // split half; two survivors (12.3 KB) sit under the ¼C = 15.3 KB
+    // candidate bound, three do not pair with three (37 KB + 37 KB > ¾C).
+    const VAL: usize = 6 * 1024;
+    let mut vol = Vol::new(64 * 1024, 4096, 0);
+    let tree = vol.tree(TREE_INODES).await;
+    let interior_merges0 =
+        squeezefs::meta_backend::kv::META_KV_INTERIOR_MERGES.load(Ordering::Relaxed);
+
+    // Grow until the root is level 2 with at least four level-1 interiors.
+    let mut n = 0u64;
+    loop {
+        tree.insert(&ikey(n), val(n, VAL)).await.expect("insert");
+        n += 1;
+        if n.is_multiple_of(8) {
+            drain(&tree, &mut vol.ctx).await;
+        }
+        if tree.root_level().await.expect("level") == 2 {
+            let root = vol.cache.get(tree.root().addr).await.expect("root");
+            if children_of(&vol.cache, &root).await.len() >= 4 {
+                break;
+            }
+        }
+        assert!(
+            n < 80_000,
+            "the height-3 / four-parent fixture never formed"
+        );
+    }
+    tree.flush_dirty(&mut vol.ctx).await.expect("flush");
+    let (leaves0, height0) = k2_walk(&tree, &vol.cache).await;
+    assert_eq!(height0, 2);
+
+    // The delete plan: per level-1 interior, keep the FIRST record of its
+    // leftmost leaf and of its rightmost leaf; delete everything else.
+    let root = vol.cache.get(tree.root().addr).await.expect("root");
+    let parents = children_of(&vol.cache, &root).await;
+    let parents0 = parents.len() as u64;
+    let mut keep: Vec<Vec<u8>> = Vec::new();
+    for p in &parents {
+        let leaves = children_of(&vol.cache, p).await;
+        for leaf in [&leaves[0], &leaves[leaves.len() - 1]] {
+            let first = tree
+                .range(leaf.min_key(), leaf.max_key(), 1)
+                .await
+                .expect("range")
+                .into_iter()
+                .next()
+                .expect("a leaf holds a record");
+            keep.push(first.0.to_vec());
+        }
+    }
+    keep.dedup();
+    for i in 0..n {
+        if !keep.contains(&ikey(i)) {
+            tree.delete(&ikey(i)).await.expect("delete");
+        }
+    }
+
+    let (out, passes) = merge_to_fixpoint_counted(&tree, &mut vol).await;
+    assert!(
+        out.interior_merges >= parents0 - 1,
+        "collapsing {parents0} level-1 interiors to one takes ≥ {} interior merges (ran {})",
+        parents0 - 1,
+        out.interior_merges
+    );
+    assert!(
+        squeezefs::meta_backend::kv::META_KV_INTERIOR_MERGES.load(Ordering::Relaxed)
+            - interior_merges0
+            >= parents0 - 1,
+        "meta_kv_interior_merges is the level-≥1 face of meta_kv_node_merges"
+    );
+    let bound = 3 * u32::from(height0) + 1;
+    assert!(
+        passes <= bound,
+        "the fixed point took {passes} passes, above the derived bound 3·h₀+1 = {bound} \
+         (h₀ = {height0})"
+    );
+    let (stranded, heavy) = merge_fixed_point(&tree, &vol.cache).await;
+    assert_eq!(
+        (stranded, heavy),
+        (0, 0),
+        "every parent here is tiny: no boundary is heavy, so nothing may stay stranded"
+    );
+    let (leaves1, height1) = k2_walk(&tree, &vol.cache).await;
+    assert!(
+        leaves1 < leaves0 / 8,
+        "the leaf population collapses ({leaves0} → {leaves1})"
+    );
+    assert_eq!(
+        height1,
+        if leaves1 > 1 { 1 } else { 0 },
+        "with {leaves1} leaves left the tree is one interior level (or a root leaf)"
+    );
+    assert!(
+        height1 < height0,
+        "the height collapsed ({height0} → {height1})"
+    );
+    for k in &keep {
+        assert!(
+            tree.lookup(k).await.expect("lookup").is_some(),
+            "a kept record survives the cross-parent shrinkage"
+        );
+    }
+    assert_eq!(
+        tree.range(&ikey(0), &ikey(n), usize::MAX)
+            .await
+            .expect("range")
+            .len(),
+        keep.len(),
+        "exactly the kept records remain"
+    );
+}
+
+/// (12) The sweep is BOUNDED per call and RESUMES from its cursor: a
+/// call whose deadline has already passed processes at least one node
+/// (the progress law) and returns `lap_complete == false`; repeated
+/// bounded calls complete the lap the unbounded call would have, at the
+/// same fixed point, publishing the same exact candidate count; a
+/// completed lap resets the cursor so the next call starts afresh.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn merge_sweep_is_bounded_per_call_and_resumes_from_its_cursor() {
+    let mut vol = Vol::new(64 * 1024, 4096, 0);
+    let tree = vol.tree(TREE_INODES).await;
+    for (k, &i) in permutation(6_000, 3).iter().enumerate() {
+        tree.insert(&ikey(i), val(i, 80)).await.expect("insert");
+        if k % 256 == 255 {
+            drain(&tree, &mut vol.ctx).await;
+        }
+    }
+    for i in 0..6_000u64 {
+        if i % 10 != 0 {
+            tree.delete(&ikey(i)).await.expect("delete");
+        }
+    }
+    tree.flush_dirty(&mut vol.ctx).await.expect("flush");
+    vol.cover_everything();
+    let (leaves0, _) = k2_walk(&tree, &vol.cache).await;
+    assert!(leaves0 >= 4, "a multi-leaf fixture ({leaves0} leaves)");
+
+    // An already-expired deadline: exactly the progress law's one node.
+    let mut calls = 0u32;
+    let mut merges = 0u64;
+    loop {
+        let sweep = tree
+            .merge_underfull(&mut vol.ctx, false, Some(std::time::Instant::now()))
+            .await
+            .expect("bounded sweep");
+        calls += 1;
+        merges += sweep.outcome.merges + sweep.outcome.root_collapses;
+        assert!(
+            sweep.projections >= 1,
+            "a bounded call always makes progress (≥ 1 node projected)"
+        );
+        if sweep.lap_complete {
+            break;
+        }
+        assert!(
+            sweep.projections <= 2,
+            "an expired deadline bounds the call to the progress minimum (projected {})",
+            sweep.projections
+        );
+        assert!(calls < 10_000, "the bounded lap never completed");
+    }
+    assert!(
+        calls > 2,
+        "a {leaves0}-leaf lap under an expired deadline must span several calls ({calls})"
+    );
+    assert!(merges > 0, "the bounded lap merged the underfull leaves");
+    // Cover the tombstones the merges minted, then finish to the fixpoint
+    // with unbounded laps — the bounded laps must have left the SAME fixed
+    // point an unbounded sweep reaches.
+    let (rest, _) = merge_to_fixpoint_counted(&tree, &mut vol).await;
+    merge_fixed_point(&tree, &vol.cache).await;
+    // The published count is exact: the last lap's `candidates` equals a
+    // census over the same tree with the same predicate.
+    let last = tree
+        .merge_underfull(&mut vol.ctx, false, None)
+        .await
+        .expect("a fresh lap");
+    assert!(last.lap_complete);
+    assert_eq!(
+        last.outcome.merges + last.outcome.root_collapses,
+        0,
+        "at the fixpoint"
+    );
+    assert_eq!(
+        last.candidates,
+        tree.merge_candidate_census(),
+        "the sweep's published candidate count is the census's"
+    );
+    let _ = rest;
+}
+
+/// (13) The sweep budget derives from the checkpoint tick period — the
+/// SAME law finding 49 gave the threshold drain ("bounded by one cadence
+/// period; at least one item per pass") — never a constant of its own.
+#[test]
+fn merge_sweep_budget_derives_from_the_checkpoint_tick_period() {
+    use squeezefs::meta_backend::kv::checkpoint::{
+        checkpoint_tick_period_ms, merge_sweep_budget_ms,
+    };
+    // The shipped 50 ms flush, strict mode's 100 ms tick, a slow venue.
+    assert_eq!(merge_sweep_budget_ms(50), 50);
+    assert_eq!(merge_sweep_budget_ms(0), 100);
+    assert_eq!(merge_sweep_budget_ms(2_000), 2_000);
+    for ms in [0u64, 1, 50, 100, 250, 1_000, 5_000, 60_000] {
+        assert_eq!(
+            merge_sweep_budget_ms(ms),
+            checkpoint_tick_period_ms(ms),
+            "the budget IS the tick period ({ms} ms)"
+        );
+    }
+}
+
+/// (11) `meta_kv_merge_candidates` is EXACT: after a sweep that the
+/// compaction floor cut mid-wave, the gauge equals a census taken at
+/// that instant (RED before: the sweep counted only the leaves it saw
+/// before the refusal); at quiescence it equals the D4 report's
+/// `mergeable_leaves`. Also pins the wave bound: the sweeps a heap-full
+/// recovery takes are bounded by the height term plus a geometric wave
+/// term — each wave's merges fund the next.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn merge_candidates_gauge_is_exact_mid_wave_and_at_quiescence() {
+    struct Cleanup;
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            std::env::remove_var("SQUEEZEFS_META_FLUSH_INTERVAL_MS");
+        }
+    }
+    // Park the cadence: every sweep below is one this test drives, so
+    // "the census at the same instant" is exactly the census after the
+    // cycle returns.
+    std::env::set_var("SQUEEZEFS_META_FLUSH_INTERVAL_MS", "60000");
+    let _cleanup = Cleanup;
+
+    let (be, _file) = fresh_volume().await;
+    let (landed, refusal) = tokio::time::timeout(FILL_BOUND, fill_until_refused(&be, 0))
+        .await
+        .expect("the fill reaches ENOSPC");
+    assert_eq!(refusal.to_errno(), libc::ENOSPC);
+    for i in 0..landed {
+        if i % 10 != 0 {
+            delete_file(&be, i).await;
+        }
+    }
+    // Two cycles: the deletes' tombstones fall under the durable tail, the
+    // heap-full sweep runs and is cut at the compaction floor mid-wave.
+    be.checkpoint_now().await.expect("cycle 1");
+    be.checkpoint_now().await.expect("cycle 2");
+    let laps0 = be.merge_laps();
+    assert!(laps0 >= 1, "the heap-full posture ran a sweep lap");
+    let gauge_mid_wave = be.merge_candidates();
+    let census = be.dead_bset_census();
+    assert_eq!(
+        gauge_mid_wave,
+        census.merge_candidates.len() as u64,
+        "mid-wave the gauge must be the complete count (gauge {gauge_mid_wave}, census {}) \
+         — a sweep cut at the floor still counts every underfull leaf",
+        census.merge_candidates.len()
+    );
+    assert!(
+        gauge_mid_wave > 8,
+        "a 90 %-deleted volume mid-wave has many underfull leaves ({gauge_mid_wave})"
+    );
+    let height0 = be.trees()[2].root_level().await.expect("xattr root level");
+    let room0 = be
+        .free_extents()
+        .saturating_sub(compaction_floor_extents(be.allocator().reserve_extents()))
+        .max(1);
+
+    // To quiescence; the gauge from the LAST sweep must equal the report.
+    let sweeps0 = be.merge_sweeps();
+    cycle_until_quiescent(&be, 6, 400).await;
+    let gauge_quiescent = be.merge_candidates();
+    let routed = Arc::new(RoutedMetaBackend::new(vec![be.clone()]));
+    let rows = squeezefs::defrag::measure_d4(&routed)
+        .await
+        .expect("measure_d4");
+    assert_eq!(
+        gauge_quiescent, rows[0].mergeable_leaves,
+        "at quiescence meta_kv_merge_candidates ≡ the D4 report's mergeable_leaves"
+    );
+    // The wave bound: the recovery's sweeps ≤ the level term (3·h₀ + 1, the
+    // K5 contract's) + two cycles per wave, waves ≤ ⌈log₂(candidates/room₀
+    // + 1)⌉ + 1 (each wave returns its merges' extents to fund the next).
+    let waves = ((gauge_mid_wave as f64 / room0 as f64 + 1.0).log2().ceil() as u64) + 1;
+    let bound = 3 * u64::from(height0) + 1 + 2 * waves + 2;
+    let sweeps = be.merge_sweeps() - sweeps0;
+    assert!(
+        sweeps <= bound,
+        "the recovery took {sweeps} sweeps, above the derived bound {bound} (h₀ {height0}, \
+         candidates {gauge_mid_wave}, room₀ {room0}, waves {waves})"
+    );
+    be.shutdown().await.expect("shutdown");
 }

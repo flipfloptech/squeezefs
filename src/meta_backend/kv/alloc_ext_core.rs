@@ -499,6 +499,15 @@ impl ExtCore {
         self.pending_has_room_in(0)
     }
 
+    /// Free FIFO slots in `writer`'s partition — [`Self::pending_has_room_in`]
+    /// counted, for an SMO that parks MORE than one retirement (the §4.6a
+    /// merge parks two). Same soundness: the serialized producer observes
+    /// room that only ever grows until its pushes.
+    pub fn pending_room_in(&self, writer: u64) -> u64 {
+        let p = self.part(writer);
+        (p.pending.len() as u64).saturating_sub(self.fifo_count(p))
+    }
+
     /// Newest durable-coverage watermark for `writer` (its own ring's
     /// durable journal tail since the Option-A coverage fix).
     pub fn durable_seq_in(&self, writer: u64) -> u64 {

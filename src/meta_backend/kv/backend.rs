@@ -9261,9 +9261,13 @@ impl KvMetaBackend {
                     }
                 }
                 let mut extra = pending_records(gi, qi, &refused);
-                let (fold, parts) = lock_set[gi]
-                    .snapshot()
-                    .fold_bytes_upper_with(&mut extra, layout.split_part_capacity());
+                // Tail 0: the admission never credits tombstone elision
+                // (the conservative posture 862b8077 landed with).
+                let (fold, parts) = lock_set[gi].snapshot().fold_bytes_upper_with(
+                    &mut extra,
+                    layout.split_part_capacity(),
+                    0,
+                );
                 let need = with_root(layout.smo_extents_for_parts(fold, parts));
                 let is_split = need > 1;
                 let delta = need.saturating_sub(promised);

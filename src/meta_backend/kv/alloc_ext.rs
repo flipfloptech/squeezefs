@@ -892,6 +892,14 @@ impl ExtentAllocator {
             .pending_has_room_in(u64::from(self.partition.writer_id()))
     }
 
+    /// [`Self::pending_has_room`] for an SMO that parks `n` retirements
+    /// (the §4.6a merge parks two: both old siblings ride one entry).
+    pub fn pending_has_room_for(&self, n: u64) -> bool {
+        self.core
+            .pending_room_in(u64::from(self.partition.writer_id()))
+            >= n
+    }
+
     /// The §4.7 coverage gate: a root-ledger record whose
     /// `journal_tail_seq` is `tail` is now *known durable* (post-barrier)
     /// — release every pending extent whose gate seq that tail covers

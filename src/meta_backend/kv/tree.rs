@@ -112,6 +112,9 @@ pub struct TestSmoPauseInfo {
     /// journals no pointer records — design §2 C′ carve-out; the
     /// stranding contract test requires `false`).
     pub is_root: bool,
+    /// Whether the parked SMO is a §4.6a sibling merge (the range below
+    /// is then the UNION of both siblings) rather than a compaction/split.
+    pub is_merge: bool,
     pub min_key: Vec<u8>,
     pub max_key: Vec<u8>,
 }
@@ -241,6 +244,44 @@ pub struct MaintenanceOutcome {
     pub compactions: u64,
     /// Node splits (2-way and wider) — `meta_kv_node_splits`.
     pub splits: u64,
+    /// §4.6a sibling merges (two nodes → one) — `meta_kv_node_merges`.
+    pub merges: u64,
+    /// §4.6a root collapses (height − 1) — `meta_kv_root_collapses`.
+    pub root_collapses: u64,
+}
+
+/// What one [`KvTree::merge_underfull`] sweep did (§4.6a (e)).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct MergeSweep {
+    /// The merges and collapses executed.
+    pub outcome: MaintenanceOutcome,
+    /// Underfull leaves the sweep found (fold ≤ ¼ capacity, root leaves
+    /// excluded) — the `meta_kv_merge_candidates` input.
+    pub candidates: u64,
+    /// A merge was refused at the compaction floor (`NoSpace`): the
+    /// sweep stopped early and the backlog stands — the next barriered
+    /// cycle returns extents and the sweep resumes.
+    pub space_refused: bool,
+}
+
+/// Owns a node's `FREEZING` bit for an SMO that froze a node with an
+/// EMPTY open delta through `begin_forced_freeze` (the W-B drop guard —
+/// the 2026-08-19 AlreadyFreezing wedge's sibling window): `end_freeze`
+/// on drop unless the SMO consumed the freeze (`armed = false`), so a
+/// dropped future or an unwind mid-SMO never leaves `FREEZING` latched on
+/// a live node. A SUPERSEDED node is skipped — the SMO's own bookkeeping
+/// ran, and a second `end_freeze` is the state core's debug_assert.
+struct ForcedFreezeGuard {
+    node: Arc<CachedNode>,
+    armed: bool,
+}
+
+impl Drop for ForcedFreezeGuard {
+    fn drop(&mut self) {
+        if self.armed && !self.node.state().is_superseded() {
+            self.node.state().end_freeze();
+        }
+    }
 }
 
 /// One logical btree (per `tree_id`) over a shared per-volume [`NodeCache`].
@@ -464,8 +505,9 @@ impl KvTree {
                     return Ok(cur);
                 }
                 if cur.level() < target_level {
-                    // v1 trees never shrink (no merges); a mid-walk root
-                    // swap can still surface this — restart.
+                    // A §4.6a root collapse lowered the height under this
+                    // walk (the ONLY way a tree shrinks): a walk that began
+                    // at the old height restarts at the new root.
                     continue 'restart;
                 }
                 let snap = cur.snapshot();
@@ -876,6 +918,8 @@ impl KvTree {
             out.appends += pass.appends;
             out.compactions += pass.compactions;
             out.splits += pass.splits;
+            out.merges += pass.merges;
+            out.root_collapses += pass.root_collapses;
         }
         Err(KvError::Corrupt(
             "flush_dirty never converged (writeback keeps re-dirtying — SMO bug)".to_string(),
@@ -933,7 +977,53 @@ impl KvTree {
         if out.is_err() {
             node.restore_dirty_floor(floor);
         }
-        out
+        out?;
+        if node.level() == 0 {
+            self.merge_after_flush(ctx, node.min_key()).await?;
+        }
+        Ok(())
+    }
+
+    /// The §4.6a flush-pass trigger: after a leaf's visit, an O(1)
+    /// sound-but-incomplete prefilter on the leaf now covering `min_key`
+    /// (the node itself after an append, its successor after an SMO) —
+    /// its SERIALIZED log bytes plus its open delta at-or-under the
+    /// underfull bound prove `fold ≤ ¼ capacity` (folding only shrinks,
+    /// frames only add), so only a certain candidate pays the O(node)
+    /// exact fold + sibling probe inside [`Self::try_merge_node`]. A
+    /// tombstone-heavy full log is missed here by design and caught when
+    /// it compacts (its successor's log IS its fold) or by the sweeps.
+    /// Opportunistic: a compaction-floor or ring-reserve refusal is a
+    /// deferral (the heap-full sweep owns the retry), never this visit's
+    /// error — the flush itself already succeeded and its floor stands
+    /// cleared.
+    async fn merge_after_flush(&self, ctx: &mut SmoContext, min_key: &[u8]) -> Result<(), KvError> {
+        let layout = self.cache.config().layout;
+        let cur = self.descend(min_key, 0).await?;
+        if self.is_root(&cur) || cur.state().is_superseded() {
+            return Ok(());
+        }
+        let bound = {
+            let g = cur.lock().read().await;
+            g.tail_offset().saturating_sub(super::node::NODE_PAGE)
+                + g.frozen_bytes()
+                + g.overlay_bytes()
+        };
+        if bound > layout.merge_candidate_capacity() {
+            return Ok(());
+        }
+        let mut o = MaintenanceOutcome::default();
+        match self.try_merge_node(ctx, cur, &mut o, true).await {
+            Ok(()) => Ok(()),
+            Err(e @ (KvError::NoSpace { .. } | KvError::JournalReserveExhausted { .. })) => {
+                log::debug!(
+                    "flush-pass merge deferred on tree {} (the heap-full sweep retries): {e}",
+                    self.tree_id
+                );
+                Ok(())
+            }
+            Err(e) => Err(e),
+        }
     }
 
     /// PR VL7 (design-volume-lifecycle §5.7 D4): the **compaction nudge**
@@ -944,10 +1034,9 @@ impl KvTree {
     /// serialization domain as the checkpoint task — lattice 4b respected
     /// by delegation). Returns `false` when the node vanished / was
     /// superseded since the census (idempotent no-op, exactly like a
-    /// spurious maintenance enqueue). Freeze + floor discipline mirrors
-    /// [`Self::checkpoint_flush_node`]'s compaction arm: the floor is
-    /// restored BEFORE the SMO so the retire's dying-floor fold keeps the
-    /// tail clamped (FIND-VS-A).
+    /// spurious maintenance enqueue). The dirty floor is left in place
+    /// (never taken), so the retire's dying-floor fold keeps the tail
+    /// clamped to the node's un-covered records (FIND-VS-A).
     pub(crate) async fn compact_node_forced(
         &self,
         ctx: &mut SmoContext,
@@ -961,52 +1050,14 @@ impl KvTree {
             return Ok(false);
         }
         // W-B drop guard (the 2026-08-19 AlreadyFreezing wedge's sibling
-        // window): the forced-freeze bit is OWNED — `end_freeze` on drop
-        // unless the success path disarms, so a dropped future (job
-        // cancel) or an unwind mid-`smo_replace` can no longer leave
-        // `FREEZING` latched on a live node (every later freeze then
-        // refused `AlreadyFreezing` until remount). A SUPERSEDED node is
-        // skipped: the SMO consumed the freeze in its lock window and
-        // `smo_replace`'s own `end_freeze` bookkeeping ran (or the bit
-        // is terminal-moot) — ending it again is the double-`end_freeze`
-        // the state core's debug_assert refuses.
-        struct ForcedFreezeGuard {
-            node: Arc<CachedNode>,
-            armed: bool,
-        }
-        impl Drop for ForcedFreezeGuard {
-            fn drop(&mut self) {
-                if self.armed && !self.node.state().is_superseded() {
-                    self.node.state().end_freeze();
-                }
-            }
-        }
-        let (floor, mut forced_guard) = {
-            let mut guard = node.lock().write().await;
-            let frozen = node.freeze_locked(&mut guard, &self.cache.config().layout)?;
-            // No delta to swap (the common nudge target — a clean node
-            // with a dead-heavy log): enter FREEZING through the forced
-            // transition so the SMO's supersede/end_freeze bookkeeping
-            // sees a freeze-borne source (empty frozen delta).
-            // (`freeze_locked` returns the EXISTING frozen delta when one
-            // is in flight, so `None` ⇔ truly nothing frozen.)
-            let forced = if frozen.is_none() {
-                if node.state().begin_forced_freeze().is_err() {
-                    return Ok(false); // superseded/racing — the census was stale
-                }
-                true
-            } else {
-                false
-            };
-            (
-                node.take_dirty_floor(),
-                ForcedFreezeGuard {
-                    node: Arc::clone(&node),
-                    armed: forced,
-                },
-            )
+        // window): the forced-freeze bit is OWNED by `ForcedFreezeGuard`
+        // — `end_freeze` on drop unless the success path disarms, so a
+        // dropped future (job cancel) or an unwind mid-`smo_replace` can
+        // no longer leave `FREEZING` latched on a live node (every later
+        // freeze then refused `AlreadyFreezing` until remount).
+        let Some(mut forced_guard) = self.freeze_for_smo(&node).await? else {
+            return Ok(false); // superseded/racing — the census was stale
         };
-        node.restore_dirty_floor(floor);
         // Admission posture (not the flush pass): the defrag nudge keeps
         // the FIFO valve + its bounded cycle-and-retry protocol.
         let out = self.smo_replace(ctx, &node, out, false).await;
@@ -1140,39 +1191,7 @@ impl KvTree {
 
         // ---- Step 1: build successors from the frozen snapshot, no locks.
         let src = load_node(&cfg.path, layout, node.addr(), durable_tail).await?;
-        // FIND-VS-A fold-source guard: the successors are folded from THIS
-        // extent's on-disk log + THIS object's frozen delta. If the disk
-        // image belongs to a different incarnation (extent reuse racing a
-        // stale maintenance address) or its log view disagrees with the
-        // object's own append cursor, folding it would build successors
-        // missing acked records — the silent-loss shape the 2026-07-16
-        // storm forensics caught (split successors missing predecessor
-        // keys). Fail the SMO loud instead; the caller restores the floor
-        // and the next cycle retries against a coherent view.
-        let extra: Vec<Record> = {
-            let guard = node.lock().read().await;
-            if src.header().node_seq != node.node_seq() {
-                return Err(KvError::Corrupt(format!(
-                    "SMO fold-source incarnation mismatch at {:#x}: disk image has \
-                     node_seq {}, the live object is {} — refusing to fold a stale \
-                     source (acked records would be dropped)",
-                    node.addr(),
-                    src.header().node_seq,
-                    node.node_seq()
-                )));
-            }
-            if src.tail_offset() != guard.tail_offset() {
-                return Err(KvError::Corrupt(format!(
-                    "SMO fold-source log-view mismatch at {:#x}: disk walk ends at \
-                     {}, the live object's append cursor is at {} — refusing to fold \
-                     a diverged source (acked records would be dropped)",
-                    node.addr(),
-                    src.tail_offset(),
-                    guard.tail_offset()
-                )));
-            }
-            guard.frozen_records()
-        };
+        let extra = self.fold_source_extra(node, &src).await?;
         // Fold the whole log + frozen delta with THE K1 algebra (§4.2).
         let extra_image = if extra.is_empty() {
             Vec::new()
@@ -1314,25 +1333,14 @@ impl KvTree {
             // commits injected while parked reserve BELOW the flip's seq and
             // reach the successors only as `take_overlay()` leftovers: the
             // sub-mechanism (i) stranding window, held open deterministically.
-            // Unarmed cost: one relaxed load per SMO.
-            if TEST_SMO_BUILD_PAUSE_TREE.load(Ordering::Relaxed) == u64::from(self.tree_id) {
-                *TEST_SMO_BUILD_PAUSED.lock().expect("seam mutex") = Some(TestSmoPauseInfo {
-                    tree_id: self.tree_id,
-                    level: node.level(),
-                    is_root: self.is_root(node),
-                    min_key: node.min_key().to_vec(),
-                    max_key: node.max_key().to_vec(),
-                });
-                while TEST_SMO_BUILD_PAUSE_TREE.load(Ordering::Relaxed) == u64::from(self.tree_id) {
-                    let notified = TEST_SMO_BUILD_NOTIFY.notified();
-                    if TEST_SMO_BUILD_PAUSE_TREE.load(Ordering::Relaxed) != u64::from(self.tree_id)
-                    {
-                        break;
-                    }
-                    notified.await;
-                }
-                *TEST_SMO_BUILD_PAUSED.lock().expect("seam mutex") = None;
-            }
+            self.test_smo_build_pause(
+                node.level(),
+                self.is_root(node),
+                false,
+                node.min_key(),
+                node.max_key(),
+            )
+            .await;
 
             // A multi-way replacement of the root needs a new root above the
             // successors — written before any lock is taken.
@@ -1567,9 +1575,11 @@ impl KvTree {
                     // in the build window, the successor holds a two-node
                     // fold with nothing promised).
                     if sg.projected_log_end(layout, 0) > layout.node_size() {
-                        let (fold, parts) = succ
-                            .snapshot()
-                            .fold_bytes_upper_with(&mut [], layout.split_part_capacity());
+                        let (fold, parts) = succ.snapshot().fold_bytes_upper_with(
+                            &mut [],
+                            layout.split_part_capacity(),
+                            0,
+                        );
                         sg.promise(layout.smo_extents_for_parts(fold, parts), fold);
                     }
                 }
@@ -1768,6 +1778,816 @@ impl KvTree {
     async fn resolve_parent(&self, node: &Arc<CachedNode>) -> Result<Arc<CachedNode>, KvError> {
         let parent = self.descend(node.min_key(), node.level() + 1).await?;
         Ok(parent)
+    }
+
+    // -----------------------------------------------------------------
+    // Shared SMO plumbing (compaction/split and the §4.6a merge alike).
+    // -----------------------------------------------------------------
+
+    /// FIND-VS-A fold-source guard: an SMO's successors are folded from
+    /// THIS extent's on-disk log + THIS object's frozen delta. If the disk
+    /// image belongs to a different incarnation (extent reuse racing a
+    /// stale maintenance address) or its log view disagrees with the
+    /// object's own append cursor, folding it would build successors
+    /// missing acked records — the silent-loss shape the 2026-07-16 storm
+    /// forensics caught (split successors missing predecessor keys). Fail
+    /// the SMO loud instead; the caller's floor stands and the next cycle
+    /// retries against a coherent view. Returns the frozen delta records
+    /// (the newest fold source).
+    async fn fold_source_extra(
+        &self,
+        node: &Arc<CachedNode>,
+        src: &super::node::LoadedNode,
+    ) -> Result<Vec<Record>, KvError> {
+        let guard = node.lock().read().await;
+        if src.header().node_seq != node.node_seq() {
+            return Err(KvError::Corrupt(format!(
+                "SMO fold-source incarnation mismatch at {:#x}: disk image has \
+                 node_seq {}, the live object is {} — refusing to fold a stale \
+                 source (acked records would be dropped)",
+                node.addr(),
+                src.header().node_seq,
+                node.node_seq()
+            )));
+        }
+        if src.tail_offset() != guard.tail_offset() {
+            return Err(KvError::Corrupt(format!(
+                "SMO fold-source log-view mismatch at {:#x}: disk walk ends at \
+                 {}, the live object's append cursor is at {} — refusing to fold \
+                 a diverged source (acked records would be dropped)",
+                node.addr(),
+                src.tail_offset(),
+                guard.tail_offset()
+            )));
+        }
+        Ok(guard.frozen_records())
+    }
+
+    /// Freeze `node` for an SMO under its write lock: the §4.6 pt 1
+    /// freeze-swap when it holds an open delta, else the forced
+    /// transition into `FREEZING` (an empty frozen delta) so the swap's
+    /// supersede/`end_freeze` bookkeeping sees a freeze-borne source
+    /// either way. `None` = the node was superseded / a freeze is racing
+    /// — the caller's census was stale, an idempotent no-op. The returned
+    /// guard owns the forced bit (see [`ForcedFreezeGuard`]).
+    async fn freeze_for_smo(
+        &self,
+        node: &Arc<CachedNode>,
+    ) -> Result<Option<ForcedFreezeGuard>, KvError> {
+        let mut guard = node.lock().write().await;
+        let frozen = node.freeze_locked(&mut guard, &self.cache.config().layout)?;
+        // (`freeze_locked` returns the EXISTING frozen delta when one is
+        // in flight, so `None` ⇔ truly nothing frozen.)
+        let forced = if frozen.is_none() {
+            if node.state().begin_forced_freeze().is_err() {
+                return Ok(None);
+            }
+            true
+        } else {
+            false
+        };
+        Ok(Some(ForcedFreezeGuard {
+            node: Arc::clone(node),
+            armed: forced,
+        }))
+    }
+
+    /// The `TEST_SMO_BUILD_PAUSE_TREE` park (docs/design-smo-replay-
+    /// currency.md §6 PR 1): an armed build parks HERE — successor images
+    /// fixed on disk, no locks held, no reservation taken. Unarmed cost:
+    /// one relaxed load per SMO.
+    async fn test_smo_build_pause(
+        &self,
+        level: u8,
+        is_root: bool,
+        is_merge: bool,
+        min_key: &[u8],
+        max_key: &[u8],
+    ) {
+        if TEST_SMO_BUILD_PAUSE_TREE.load(Ordering::Relaxed) != u64::from(self.tree_id) {
+            return;
+        }
+        *TEST_SMO_BUILD_PAUSED.lock().expect("seam mutex") = Some(TestSmoPauseInfo {
+            tree_id: self.tree_id,
+            level,
+            is_root,
+            is_merge,
+            min_key: min_key.to_vec(),
+            max_key: max_key.to_vec(),
+        });
+        while TEST_SMO_BUILD_PAUSE_TREE.load(Ordering::Relaxed) == u64::from(self.tree_id) {
+            let notified = TEST_SMO_BUILD_NOTIFY.notified();
+            if TEST_SMO_BUILD_PAUSE_TREE.load(Ordering::Relaxed) != u64::from(self.tree_id) {
+                break;
+            }
+            notified.await;
+        }
+        *TEST_SMO_BUILD_PAUSED.lock().expect("seam mutex") = None;
+    }
+
+    // -----------------------------------------------------------------
+    // §4.6a Leaf merge — the underfull-sibling SMO.
+    // -----------------------------------------------------------------
+
+    /// `f(N)` of the §4.6a candidate law: the K1 fold's byte upper bound
+    /// over the node's serialized log + frozen delta + open delta, with
+    /// tombstones below the durable tail credited as elided (the
+    /// compaction fold drops them — `compact_fold`'s rule).
+    fn fold_upper(&self, node: &Arc<CachedNode>) -> usize {
+        let layout = self.cache.config().layout;
+        node.snapshot()
+            .fold_bytes_upper_with(
+                &mut [],
+                layout.merge_pair_capacity(),
+                self.cache.durable_tail(),
+            )
+            .0
+    }
+
+    /// The §4.6a pair law on two fold estimates: the pair fits a fresh
+    /// split part AND one of the two is underfull.
+    fn pair_mergeable(&self, a: usize, b: usize) -> bool {
+        let layout = self.cache.config().layout;
+        a + b <= layout.merge_pair_capacity() && a.min(b) <= layout.merge_candidate_capacity()
+    }
+
+    /// One sweep over this tree's RESIDENT nodes, level by level from the
+    /// leaves up, each level in key order (§4.6a (e), the heap-full sweep
+    /// and the D4 arm's primitive): the exact fold per node, every
+    /// underfull one (`fold ≤ ¼ capacity`; the root excluded) handed to
+    /// `try_merge_node` — which applies the pair law against the
+    /// sibling, packs greedily rightwards, and climbs. The interior levels
+    /// are walked in their own right, not only through the climb: the
+    /// separator tombstones a leaf merge mints sit ABOVE the durable tail
+    /// until the next barriered cycle covers them, so a parent that lost
+    /// most of its children projects underfull only on a LATER sweep —
+    /// one that runs no leaf merge and therefore never climbs. Ends with
+    /// the root-collapse chain. No device reads for the census; a
+    /// candidate's sibling is demand-paged. Stops at the first
+    /// compaction-floor refusal (`space_refused` — the backlog stands,
+    /// the next barriered cycle returns extents and the caller resumes).
+    /// `forced_retirement` selects the §4.7 pending-free posture exactly
+    /// as `smo_replace` does. `candidates` counts underfull
+    /// LEAVES (the census's definition).
+    pub async fn merge_underfull(
+        &self,
+        ctx: &mut SmoContext,
+        forced_retirement: bool,
+    ) -> Result<MergeSweep, KvError> {
+        let layout = self.cache.config().layout;
+        let mut sweep = MergeSweep::default();
+        let mut level = 0u8;
+        'levels: while level < self.root_level().await? {
+            let mut nodes: Vec<(Vec<u8>, u64)> = Vec::new();
+            self.cache.for_each_node(|n| {
+                if n.tree_id() == self.tree_id && n.level() == level && !n.state().is_superseded() {
+                    nodes.push((n.min_key().to_vec(), n.addr()));
+                }
+            });
+            nodes.sort();
+            for (_, addr) in nodes {
+                let Some(node) = self.cache.try_get(addr) else {
+                    continue; // evicted/merged since the census
+                };
+                if node.state().is_superseded() || self.is_root(&node) {
+                    continue;
+                }
+                if self.fold_upper(&node) > layout.merge_candidate_capacity() {
+                    continue;
+                }
+                if level == 0 {
+                    sweep.candidates += 1;
+                }
+                match self
+                    .try_merge_node(ctx, node, &mut sweep.outcome, forced_retirement)
+                    .await
+                {
+                    Ok(()) => {}
+                    Err(KvError::NoSpace { .. }) => {
+                        sweep.space_refused = true;
+                        break 'levels;
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
+            level += 1;
+        }
+        if !sweep.space_refused {
+            self.collapse_root_chain(ctx, &mut sweep.outcome, forced_retirement)
+                .await?;
+        }
+        Ok(sweep)
+    }
+
+    /// The D4 arm's per-candidate entry (§4.6a (e)): merge the leaf at
+    /// `addr` with a sibling if the pair law admits, recursing into the
+    /// interior. `false` = the node vanished / was superseded since the
+    /// census (idempotent no-op — the census is advisory, the SMO
+    /// revalidates), or nothing was mergeable. The FIFO valve posture.
+    pub(crate) async fn merge_node_at(
+        &self,
+        ctx: &mut SmoContext,
+        addr: u64,
+        out: &mut MaintenanceOutcome,
+    ) -> Result<bool, KvError> {
+        let Some(node) = self.cache.try_get(addr) else {
+            return Ok(false);
+        };
+        if node.state().is_superseded() || node.tree_id() != self.tree_id || self.is_root(&node) {
+            return Ok(false);
+        }
+        let before = out.merges + out.root_collapses;
+        self.try_merge_node(ctx, node, out, false).await?;
+        Ok(out.merges + out.root_collapses > before)
+    }
+
+    /// Merge `node` with a sibling while the pair law admits — packing
+    /// greedily rightwards (a successor keeps merging with ITS right
+    /// sibling), then leftwards for a rightmost child — and climb: the
+    /// parent lost a child per merge, so a one-child root collapses and
+    /// an underfull non-root parent is itself a candidate at its level
+    /// (§4.6a (c) — bounded by the tree height). A merge refusal
+    /// (`NoSpace` at the compaction floor, ring-reserve exhaustion,
+    /// FIFO cap) propagates untouched for the caller's posture.
+    pub(crate) async fn try_merge_node(
+        &self,
+        ctx: &mut SmoContext,
+        node: Arc<CachedNode>,
+        out: &mut MaintenanceOutcome,
+        forced_retirement: bool,
+    ) -> Result<(), KvError> {
+        let layout = self.cache.config().layout;
+        let mut cur = node;
+        loop {
+            if self.is_root(&cur) || cur.state().is_superseded() || cur.tree_id() != self.tree_id {
+                return Ok(());
+            }
+            let mut merged_here = false;
+            while let Some(succ) = self
+                .merge_with_sibling(ctx, &cur, out, forced_retirement)
+                .await?
+            {
+                cur = succ;
+                merged_here = true;
+            }
+            if !merged_here || self.is_root(&cur) {
+                return Ok(());
+            }
+            let parent = self.resolve_parent(&cur).await?;
+            if self.is_root(&parent) {
+                return self.collapse_root_chain(ctx, out, forced_retirement).await;
+            }
+            if self.fold_upper(&parent) > layout.merge_candidate_capacity() {
+                return Ok(());
+            }
+            cur = parent;
+        }
+    }
+
+    /// Find `node`'s merge partner under its parent — the right sibling
+    /// first (`next_live(successor(node.max))`), the left one for a
+    /// rightmost child (`prev_live(node.min)`) — and run the merge when
+    /// the pair law admits. `None` = nothing mergeable here.
+    async fn merge_with_sibling(
+        &self,
+        ctx: &mut SmoContext,
+        node: &Arc<CachedNode>,
+        out: &mut MaintenanceOutcome,
+        forced_retirement: bool,
+    ) -> Result<Option<Arc<CachedNode>>, KvError> {
+        let f_node = self.fold_upper(node);
+        let parent = self.resolve_parent(node).await?;
+        let psnap = parent.snapshot();
+        let level = node.level();
+        // A sibling the parent routes to, verified against the pointer
+        // (a stale route on the serialized SMO task is a protocol bug,
+        // surfaced loud by `get`'s retired-extent refusal / the seq check).
+        let sibling = |sep: Bytes, ptr: Bytes| async move {
+            let (addr, seq) = decode_interior_value(&ptr)?;
+            let s = self.cache.get(addr).await?;
+            if s.node_seq() != seq || s.level() != level || s.state().is_superseded() {
+                return Err(KvError::Corrupt(format!(
+                    "merge sibling probe: separator {:x?} names {addr:#x}@{seq} but the \
+                     object is seq {} level {} superseded={}",
+                    &sep[..],
+                    s.node_seq(),
+                    s.level(),
+                    s.state().is_superseded()
+                )));
+            }
+            if s.max_key() != &sep[..] {
+                return Err(KvError::Corrupt(format!(
+                    "merge sibling probe: separator {:x?} ≠ child {addr:#x} max_key {:x?}",
+                    &sep[..],
+                    s.max_key()
+                )));
+            }
+            Ok::<Arc<CachedNode>, KvError>(s)
+        };
+        if node.max_key() < parent.max_key() {
+            let right_min = key_successor(node.max_key());
+            if let Some((sep, ptr)) = psnap.next_live(&right_min, None)? {
+                let right = sibling(sep, ptr).await?;
+                if right.min_key() == &right_min[..]
+                    && self.pair_mergeable(f_node, self.fold_upper(&right))
+                {
+                    return self
+                        .smo_merge(ctx, &parent, node, &right, out, forced_retirement)
+                        .await;
+                }
+            }
+        }
+        if node.min_key() != parent.min_key() {
+            if let Some((sep, ptr)) = psnap.prev_live(node.min_key())? {
+                let left = sibling(sep, ptr).await?;
+                if key_successor(left.max_key()) == node.min_key()
+                    && self.pair_mergeable(self.fold_upper(&left), f_node)
+                {
+                    return self
+                        .smo_merge(ctx, &parent, &left, node, out, forced_retirement)
+                        .await;
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    /// Collapse the root while it is an interior node with exactly one
+    /// live child (§4.6a (c)); chains across levels.
+    async fn collapse_root_chain(
+        &self,
+        ctx: &mut SmoContext,
+        out: &mut MaintenanceOutcome,
+        forced_retirement: bool,
+    ) -> Result<(), KvError> {
+        loop {
+            let root = self.cache.get(self.root().addr).await?;
+            if !self
+                .smo_root_collapse(ctx, &root, out, forced_retirement)
+                .await?
+            {
+                return Ok(());
+            }
+        }
+    }
+
+    /// The §4.6a merge: fold two ADJACENT siblings under `parent` into ONE
+    /// successor spanning `[left.min, right.max]` — the §4.6 three-step
+    /// replacement over two frozen sources. Returns the successor, or
+    /// `None` when the candidate went stale (the exact fold no longer
+    /// fits the pair capacity; a superseded/racing node) — a clean
+    /// decline. Admission refusals are typed errors: `NoSpace` at the
+    /// compaction floor (the merge's claim is the §4.7 compaction class —
+    /// net −1 allocated, admitted down to `reserve/2`, never the flush
+    /// pass's own half), `PendingFreeFull` under the FIFO valve (two
+    /// retirements ride one entry), `JournalReserveExhausted`.
+    ///
+    /// The lock window takes the parent FIRST, then both children in
+    /// **ascending NodeId order** — the commit path's leaf order, never
+    /// key order (a coincidence of allocation) — so a multi-leaf
+    /// transaction holding one sibling and waiting on the other can never
+    /// form a cycle with this SMO. The interior record shape is
+    /// `Put(right.max → succ)` + `Delete(left.max)`: the Put REPLACES the
+    /// right's separator by per-key LWW, the tombstone retires the left's,
+    /// and `next_live` routes every key of the union to the successor.
+    /// The entry is `[Put, Delete, alloc(succ), free(left), free(right)]`
+    /// — flips first (the parent's floor pins at `res.start`), the last
+    /// free the entry's highest seq (the coverage gate for BOTH
+    /// retirements).
+    async fn smo_merge(
+        &self,
+        ctx: &mut SmoContext,
+        parent: &Arc<CachedNode>,
+        left: &Arc<CachedNode>,
+        right: &Arc<CachedNode>,
+        out: &mut MaintenanceOutcome,
+        forced_retirement: bool,
+    ) -> Result<Option<Arc<CachedNode>>, KvError> {
+        let cfg = self.cache.config();
+        let layout = &cfg.layout;
+        let durable_tail = self.cache.durable_tail();
+
+        // ---- Step 0: admission, side-effect free.
+        if left.level() != right.level()
+            || left.tree_id() != self.tree_id
+            || right.tree_id() != self.tree_id
+            || left.state().is_superseded()
+            || right.state().is_superseded()
+            || key_successor(left.max_key()) != right.min_key()
+            || self.is_root(left)
+            || self.is_root(right)
+            || parent.level() != left.level() + 1
+        {
+            return Ok(None);
+        }
+        let claimable = ctx
+            .alloc
+            .free_extents()
+            .saturating_sub(self.cache.heap_promised());
+        let floor = super::alloc_ext::compaction_floor_extents(ctx.alloc.reserve_extents());
+        if claimable.saturating_sub(1) < floor {
+            return Err(KvError::NoSpace {
+                free: claimable,
+                reserve: floor,
+            });
+        }
+        if ctx.journal.is_some() && !forced_retirement && !ctx.alloc.pending_has_room_for(2) {
+            return Err(KvError::PendingFreeFull {
+                pending: ctx.alloc.pending_count(),
+            });
+        }
+
+        // ---- Step 1: build the successor from both frozen sources, no
+        // locks held.
+        let Some(mut freeze_l) = self.freeze_for_smo(left).await? else {
+            return Ok(None);
+        };
+        let Some(mut freeze_r) = self.freeze_for_smo(right).await? else {
+            return Ok(None);
+        };
+        let src_l = load_node(&cfg.path, layout, left.addr(), durable_tail).await?;
+        let src_r = load_node(&cfg.path, layout, right.addr(), durable_tail).await?;
+        let extra_l = self.fold_source_extra(left, &src_l).await?;
+        let extra_r = self.fold_source_extra(right, &src_r).await?;
+        let image_of = |extra: &[Record]| -> Result<Vec<u8>, KvError> {
+            if extra.is_empty() {
+                Ok(Vec::new())
+            } else {
+                super::bset::build_bset(extra, extra.iter().map(|r| r.seq).max().unwrap_or(0))
+            }
+        };
+        let img_l = image_of(&extra_l)?;
+        let img_r = image_of(&extra_r)?;
+        // The two key spaces are disjoint, so the cross-node view order is
+        // immaterial to the per-key fold; within a node the frozen delta
+        // is the newest source, then the log newest-first.
+        let mut views: Vec<BsetView<'_>> = Vec::new();
+        if !img_l.is_empty() {
+            views.push(BsetView::parse(&img_l)?);
+        }
+        views.extend(src_l.bset_views_newest_first()?);
+        if !img_r.is_empty() {
+            views.push(BsetView::parse(&img_r)?);
+        }
+        views.extend(src_r.bset_views_newest_first()?);
+        let horizon = views
+            .iter()
+            .map(|v| v.journal_seq_horizon())
+            .max()
+            .unwrap_or(0);
+        let folded = compact(&views, durable_tail)?;
+        let total: usize = folded.iter().map(|r| r.record_ref().encoded_len()).sum();
+        if total > layout.merge_pair_capacity() {
+            // Stale candidate (records landed since the estimate): a clean
+            // decline — the frozen deltas append at the next flush.
+            return Ok(None);
+        }
+
+        let extent = ctx.alloc.claim_internal()?;
+        let dst = self.cache.extent_addr(extent);
+        let dst_seq = self.next_seq();
+        let build: Result<Arc<CachedNode>, KvError> = async {
+            write_node(
+                &cfg.path,
+                layout,
+                &NodeWriteParams {
+                    node_addr: dst,
+                    node_seq: dst_seq,
+                    tree_id: self.tree_id,
+                    level: left.level(),
+                    min_key: left.min_key(),
+                    max_key: right.max_key(),
+                },
+                &folded,
+                horizon,
+            )
+            .await?;
+            let loaded = load_node(&cfg.path, layout, dst, durable_tail).await?;
+            CachedNode::from_loaded(
+                loaded,
+                left.level() > 0,
+                self.cache.charge_gauge(),
+                self.cache.heap_promise_gauge(),
+                self.cache.node_env(),
+            )
+        }
+        .await;
+        let successor = match build {
+            Ok(s) => s,
+            Err(e) => {
+                ctx.alloc.release_unpublished(extent);
+                return Err(e);
+            }
+        };
+        self.test_smo_build_pause(left.level(), false, true, left.min_key(), right.max_key())
+            .await;
+
+        // ---- Production journaling (before any lock): successor durable,
+        // then the entry admitted from the checkpoint-task reserve.
+        let old_l = self.cache.addr_extent(left.addr());
+        let old_r = self.cache.addr_extent(right.addr());
+        let smo_prep = if let Some(j) = &ctx.journal {
+            if let Err(e) = j.barrier().await {
+                ctx.alloc.release_unpublished(extent);
+                return Err(e);
+            }
+            let retire_tag = j.retire_seq.load(Ordering::Acquire);
+            let tag = tag_for(self.tree_id, left.level() + 1);
+            let recs: Vec<(u8, Record)> = vec![
+                (
+                    tag,
+                    Record::put(
+                        right.max_key().to_vec(),
+                        0, // stamped from the reservation inside the window
+                        encode_interior_value(dst, dst_seq),
+                    ),
+                ),
+                (tag, Record::delete(left.max_key().to_vec(), 0)),
+                alloc_record(extent, 0),
+                free_record(old_l, retire_tag, 0),
+                free_record(old_r, retire_tag, 0),
+            ];
+            let len = entry_len_for(&recs)?;
+            match j
+                .ring
+                .try_admit(len, super::journal_core::AdmissionClass::Checkpoint)
+            {
+                Some(adm) => Some((adm, recs)),
+                None => {
+                    ctx.alloc.release_unpublished(extent);
+                    return Err(KvError::JournalReserveExhausted { needed: len });
+                }
+            }
+        } else {
+            None
+        };
+
+        // ---- Step 2: parent, then both children in ascending NodeId
+        // order; reserve inside; move both deltas; swap; release.
+        let smo_entry = {
+            let mut parent_guard = parent.lock().write().await;
+            let (mut gl, mut gr) = if left.addr() < right.addr() {
+                let l = left.lock().write().await;
+                let r = right.lock().write().await;
+                (l, r)
+            } else {
+                let r = right.lock().write().await;
+                let l = left.lock().write().await;
+                (l, r)
+            };
+            let smo_entry = smo_prep.map(|(adm, mut recs)| {
+                let j = ctx.journal.as_ref().expect("prep implies hooks");
+                let res = j.ring.reserve_registered(adm);
+                for (i, (_tag, r)) in recs.iter_mut().enumerate() {
+                    r.seq = res.start + i as u64;
+                }
+                (res, recs)
+            });
+
+            // The bounded second merge over BOTH deltas, exact per-record
+            // floors (§1b).
+            let mut leftovers = gl.take_overlay();
+            leftovers.extend(gr.take_overlay());
+            for n in [left, right] {
+                let outcome = n.state().supersede().map_err(|_| {
+                    KvError::Corrupt(format!(
+                        "double supersede of node {:#x} (SMO serialization violated)",
+                        n.addr()
+                    ))
+                })?;
+                debug_assert!(
+                    outcome.was_freezing,
+                    "merge sources must hold their frozen deltas until the swap"
+                );
+            }
+            if !leftovers.is_empty() {
+                let mut sg = successor.lock().write().await;
+                let floor = leftovers
+                    .iter()
+                    .map(|r| r.entry_floor.min(r.seq))
+                    .min()
+                    .unwrap_or(u64::MAX);
+                successor.apply_locked(&mut sg, leftovers, floor)?;
+                if sg.projected_log_end(layout, 0) > layout.node_size() {
+                    let (fold, parts) = successor.snapshot().fold_bytes_upper_with(
+                        &mut [],
+                        layout.split_part_capacity(),
+                        0,
+                    );
+                    sg.promise(layout.smo_extents_for_parts(fold, parts), fold);
+                }
+            }
+
+            // Route flip before retire (the K7 ordering): successor
+            // published, the parent's two records in ONE snapshot swap,
+            // both old objects retired last.
+            self.cache.publish(successor.clone());
+            let (put_seq, del_seq) = match &smo_entry {
+                Some((_, recs)) => (recs[0].1.seq, recs[1].1.seq),
+                None => (self.next_seq(), self.next_seq()),
+            };
+            let flips = vec![
+                OwnedRec::new(
+                    Bytes::copy_from_slice(right.max_key()),
+                    put_seq,
+                    RecordKind::Put,
+                    Bytes::from(encode_interior_value(dst, dst_seq)),
+                ),
+                OwnedRec::new(
+                    Bytes::copy_from_slice(left.max_key()),
+                    del_seq,
+                    RecordKind::Delete,
+                    Bytes::new(),
+                ),
+            ];
+            parent.apply_locked(&mut parent_guard, flips, put_seq)?;
+            self.cache.retire(left);
+            self.cache.retire(right);
+            drop(gl);
+            drop(gr);
+            smo_entry
+        };
+        left.state().end_freeze();
+        right.state().end_freeze();
+        freeze_l.armed = false;
+        freeze_r.armed = false;
+
+        // ---- Step 3: after release — entry bytes, both retirements gated
+        // on the entry's last seq, parent maintenance, counters.
+        let free_gate_seq = match smo_entry {
+            Some((res, recs)) => {
+                let gate = recs
+                    .last()
+                    .map(|(_, r)| r.seq)
+                    .expect("a merge entry always carries its free records");
+                let j = ctx.journal.as_ref().expect("entry implies hooks");
+                if let Err(e) = j.ring.commit_entry(&res, &recs).await {
+                    log::warn!(
+                        "merge SMO journal entry write failed on {:?} (crash-equivalent hole; \
+                         state stays RAM-consistent): {e}",
+                        j.path
+                    );
+                }
+                gate
+            }
+            None => self.next_seq(),
+        };
+        for ext in [old_l, old_r] {
+            if forced_retirement {
+                ctx.alloc.free_pending_forced(ext, free_gate_seq);
+            } else {
+                ctx.alloc.free_pending(ext, free_gate_seq)?;
+            }
+        }
+        {
+            let pg = parent.lock().read().await;
+            let re = pg.overlay_bytes() >= cfg.writeback_delta_bytes;
+            drop(pg);
+            if re {
+                self.maintenance.push(parent.addr());
+            }
+        }
+        super::META_KV_NODE_MERGES.fetch_add(1, Ordering::Relaxed);
+        out.merges += 1;
+        Ok(Some(successor))
+    }
+
+    /// The §4.6a root collapse: a root interior with exactly ONE live
+    /// child makes that child the root — a ROOT-SWAP SMO (no pointer
+    /// record; its durable form is the next ledger record's roots; the
+    /// dying floor at `res.start` keeps every later record in the replay
+    /// window until then; the entry is `[free(old_root)]`, so a mount
+    /// from the old ledger replays through the old root — still routing
+    /// to the child — under the §4.7 coverage gate). `false` = not a
+    /// collapse shape (a leaf root, ≥ 2 children).
+    async fn smo_root_collapse(
+        &self,
+        ctx: &mut SmoContext,
+        root: &Arc<CachedNode>,
+        out: &mut MaintenanceOutcome,
+        forced_retirement: bool,
+    ) -> Result<bool, KvError> {
+        if !self.is_root(root) || root.level() == 0 || root.state().is_superseded() {
+            return Ok(false);
+        }
+        let snap = root.snapshot();
+        let Some((sep, ptr)) = snap.next_live(root.min_key(), None)? else {
+            return Err(KvError::Corrupt(format!(
+                "root {:#x} (level {}) routes to no child",
+                root.addr(),
+                root.level()
+            )));
+        };
+        if snap.next_live(&key_successor(&sep), None)?.is_some() {
+            return Ok(false); // two or more children
+        }
+        let (addr, seq) = decode_interior_value(&ptr)?;
+        let child = self.cache.get(addr).await?;
+        if child.node_seq() != seq
+            || child.state().is_superseded()
+            || child.level() + 1 != root.level()
+        {
+            return Err(KvError::Corrupt(format!(
+                "root collapse: the sole separator names {addr:#x}@{seq} level {} but the \
+                 object is seq {} level {} superseded={}",
+                root.level() - 1,
+                child.node_seq(),
+                child.level(),
+                child.state().is_superseded()
+            )));
+        }
+        if !(child.min_key().is_empty()
+            && child.max_key() == &KEY_SPACE_MAX[..]
+            && &sep[..] == &KEY_SPACE_MAX[..])
+        {
+            return Err(KvError::Corrupt(format!(
+                "root collapse: the sole child {addr:#x} spans {:x?}..={:x?} under separator \
+                 {:x?} — a one-child partition must span the whole key space (K2)",
+                child.min_key(),
+                child.max_key(),
+                &sep[..]
+            )));
+        }
+        if ctx.journal.is_some() && !forced_retirement && !ctx.alloc.pending_has_room() {
+            return Err(KvError::PendingFreeFull {
+                pending: ctx.alloc.pending_count(),
+            });
+        }
+        let old_extent = self.cache.addr_extent(root.addr());
+        let smo_prep = if let Some(j) = &ctx.journal {
+            let retire_tag = j.retire_seq.load(Ordering::Acquire);
+            let recs: Vec<(u8, Record)> = vec![free_record(old_extent, retire_tag, 0)];
+            let len = entry_len_for(&recs)?;
+            match j
+                .ring
+                .try_admit(len, super::journal_core::AdmissionClass::Checkpoint)
+            {
+                Some(adm) => Some((adm, recs)),
+                None => return Err(KvError::JournalReserveExhausted { needed: len }),
+            }
+        } else {
+            None
+        };
+
+        let smo_entry = {
+            let mut rg = root.lock().write().await;
+            let smo_entry = smo_prep.map(|(adm, mut recs)| {
+                let j = ctx.journal.as_ref().expect("prep implies hooks");
+                let res = j.ring.reserve_registered(adm);
+                for (i, (_tag, r)) in recs.iter_mut().enumerate() {
+                    r.seq = res.start + i as u64;
+                }
+                (res, recs)
+            });
+            // FIND-VS-A: a root swap has no journaled pointer record and no
+            // parent floor — clamp the next tail to this swap's position.
+            let swap_floor = smo_entry.as_ref().map(|(res, _)| res.start).unwrap_or(0);
+            self.cache.note_dying_floor(swap_floor);
+            // The old root's open delta (separator flips whose only live
+            // target IS the child) dies with the object: its records are
+            // journaled, and replay routes them into the old image or drops
+            // them as unroutable under a shorter mounted structure — both
+            // sound. The charge/promise it held returns here.
+            let _ = rg.take_overlay();
+            root.state().supersede().map_err(|_| {
+                KvError::Corrupt(format!(
+                    "double supersede of root {:#x} (SMO serialization violated)",
+                    root.addr()
+                ))
+            })?;
+            child.pin();
+            self.root.store(Arc::new(RootPtr {
+                addr: child.addr(),
+                seq: child.node_seq(),
+            }));
+            self.cache.retire(root);
+            drop(rg);
+            smo_entry
+        };
+
+        let free_gate_seq = match smo_entry {
+            Some((res, recs)) => {
+                let gate = recs.last().map(|(_, r)| r.seq).expect("the free record");
+                let j = ctx.journal.as_ref().expect("entry implies hooks");
+                if let Err(e) = j.ring.commit_entry(&res, &recs).await {
+                    log::warn!(
+                        "root-collapse SMO journal entry write failed on {:?} (crash-equivalent \
+                         hole; state stays RAM-consistent): {e}",
+                        j.path
+                    );
+                }
+                gate
+            }
+            None => self.next_seq(),
+        };
+        if forced_retirement {
+            ctx.alloc.free_pending_forced(old_extent, free_gate_seq);
+        } else {
+            ctx.alloc.free_pending(old_extent, free_gate_seq)?;
+        }
+        super::META_KV_ROOT_COLLAPSES.fetch_add(1, Ordering::Relaxed);
+        out.root_collapses += 1;
+        Ok(true)
     }
 }
 

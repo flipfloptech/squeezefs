@@ -226,6 +226,26 @@ impl NodeLayout {
         self.fold_capacity() * 3 / 4
     }
 
+    /// §4.6a (a): the encoded bytes two adjacent siblings' folds may sum
+    /// to and still merge — exactly [`Self::split_part_capacity`], the
+    /// split's ¾ fill target read backwards, so a merge successor is as
+    /// full as a fresh split part and carries a part's append headroom.
+    pub fn merge_pair_capacity(&self) -> usize {
+        self.split_part_capacity()
+    }
+
+    /// §4.6a (a): the UNDERFULL bound — a node whose fold is at-or-under
+    /// it is a merge candidate: the pair fill target less the split's
+    /// balance point (`split_node` cuts a fold `> C` at its byte
+    /// midpoint, so every fresh half holds more than `C/2`), i.e. `¾C −
+    /// ½C = ¼C`. An underfull node merges with ANY sibling up to half
+    /// full, and a fresh half never completes a pair with one — the
+    /// structural hysteresis that keeps a split from being undone by the
+    /// next merge.
+    pub fn merge_candidate_capacity(&self) -> usize {
+        self.split_part_capacity() - self.fold_capacity() / 2
+    }
+
     /// Extents the SMO of a leaf whose fold measures `fold_bytes` in
     /// `parts` greedy ¾-fill parts claims (§4.7 heap admission's
     /// promise): one for a compaction (the fold fits one node), else the

@@ -703,11 +703,17 @@ impl NodeSnapshot {
     /// output (a `Delta` chain can only grow its base by at most its own
     /// encoding). A pending `Delete`/`Put` therefore SHADOWS the key's
     /// resident records — what makes a delete into a full leaf project as
-    /// the compaction it is. Tombstones count their own encoding: elision
-    /// needs the durable tail, which this estimate does not consult. One
-    /// linear merge over key-ascending sources (`extra` is sorted here);
-    /// runs once per node fill (only when the log is projected to
-    /// overflow), so its cost is amortized over the bytes that filled it.
+    /// the compaction it is. A resident tombstone counts its own encoding
+    /// unless its seq is strictly below `durable_tail` — the §4.2
+    /// elision rule `compact_fold` applies, so a group the compaction
+    /// fold drops whole (a covered `Delete` and everything it shadows)
+    /// projects as 0; the heap admission passes `0` (never elide — its
+    /// conservative posture is unchanged), the §4.6a merge candidate law
+    /// passes the cache's durable tail (a mostly-deleted leaf IS small
+    /// once its tombstones are covered). One linear merge over
+    /// key-ascending sources (`extra` is sorted here); runs once per node
+    /// fill (only when the log is projected to overflow), so its cost is
+    /// amortized over the bytes that filled it.
     ///
     /// Returns `(fold bytes, greedy parts)`: the parts a split of this
     /// fold packs at `part_budget` bytes each under `KvTree::smo_replace`'s
@@ -718,6 +724,7 @@ impl NodeSnapshot {
         &self,
         extra: &mut [(&[u8], RecordKind, usize)],
         part_budget: usize,
+        durable_tail: u64,
     ) -> (usize, usize) {
         // Stable: same-key extra records keep apply order (newest last).
         extra.sort_by(|a, b| a.0.cmp(b.0));
@@ -755,30 +762,40 @@ impl NodeSnapshot {
             let group: usize = match pending_base {
                 Some(p) => extra[x + p..x + xe].iter().map(|r| r.2).sum(),
                 None => {
-                    let base_seq = base.entries[b..b + be]
+                    // The newest resident base-establisher: `(seq, kind)`
+                    // with the highest seq (0/Put when none — a delta-only
+                    // group keeps everything, as before).
+                    let (base_seq, base_kind) = base.entries[b..b + be]
                         .iter()
                         .filter(|e| establishes(e.kind))
-                        .map(|e| e.seq)
+                        .map(|e| (e.seq, e.kind))
                         .chain(
                             self.stable[s..s + se]
                                 .iter()
                                 .chain(&self.tail[t..t + te])
                                 .filter(|r| establishes(r.kind))
-                                .map(|r| r.seq),
+                                .map(|r| (r.seq, r.kind)),
                         )
-                        .max()
-                        .unwrap_or(0);
-                    (b..b + be)
-                        .filter(|i| base.entries[*i].seq >= base_seq)
-                        .map(|i| base.record_ref(i).encoded_len())
-                        .sum::<usize>()
-                        + self.stable[s..s + se]
-                            .iter()
-                            .chain(&self.tail[t..t + te])
-                            .filter(|r| r.seq >= base_seq)
-                            .map(|r| r.record_ref().encoded_len())
+                        .max_by_key(|(seq, _)| *seq)
+                        .unwrap_or((0, RecordKind::Put));
+                    if base_kind == RecordKind::Delete && base_seq < durable_tail && xe == 0 {
+                        // The §4.2 elision rule: a covered tombstone and
+                        // everything it shadows leave the compaction fold
+                        // whole (orphan deltas above it fold to absent).
+                        0
+                    } else {
+                        (b..b + be)
+                            .filter(|i| base.entries[*i].seq >= base_seq)
+                            .map(|i| base.record_ref(i).encoded_len())
                             .sum::<usize>()
-                        + extra[x..x + xe].iter().map(|r| r.2).sum::<usize>()
+                            + self.stable[s..s + se]
+                                .iter()
+                                .chain(&self.tail[t..t + te])
+                                .filter(|r| r.seq >= base_seq)
+                                .map(|r| r.record_ref().encoded_len())
+                                .sum::<usize>()
+                            + extra[x..x + xe].iter().map(|r| r.2).sum::<usize>()
+                    }
                 }
             };
             total += group;
@@ -1069,6 +1086,52 @@ impl NodeSnapshot {
                     cursor.clear();
                     cursor.extend_from_slice(&key_bytes);
                     cursor.push(0);
+                }
+            }
+        }
+    }
+
+    /// The previous **live** `(key, value)` with key strictly below
+    /// `before` — [`Self::next_live`]'s mirror, the §4.6a left-sibling
+    /// probe (a rightmost child has no right sibling under its parent; its
+    /// merge partner is the separator just below its `min_key`). Same
+    /// fold walk over the three sorted sources, descending; tombstoned
+    /// keys are stepped over.
+    pub fn prev_live(&self, before: &[u8]) -> Result<Option<(Bytes, Bytes)>, KvError> {
+        let mut cursor: Vec<u8> = before.to_vec();
+        loop {
+            // Per source, the last entry with key < cursor.
+            let bi = self.base.first_at_or_after(&cursor);
+            let bk = (bi > 0).then(|| self.base.key_at(&self.base.entries[bi - 1]));
+            let si = self.stable.partition_point(|r| &r.key[..] < &cursor[..]);
+            let sk = (si > 0).then(|| &self.stable[si - 1].key[..]);
+            let ti = self.tail.partition_point(|r| &r.key[..] < &cursor[..]);
+            let tk = (ti > 0).then(|| &self.tail[ti - 1].key[..]);
+            // Maximum candidate key across the three sorted sources.
+            let mut key: Option<&[u8]> = bk;
+            for cand in [sk, tk] {
+                key = match (key, cand) {
+                    (None, c) => c,
+                    (k, None) => k,
+                    (Some(k), Some(c)) => Some(if c > k { c } else { k }),
+                };
+            }
+            let Some(key) = key else {
+                return Ok(None);
+            };
+            let key_bytes = if bk == Some(key) {
+                self.base.key_bytes(bi - 1)
+            } else if sk == Some(key) {
+                self.stable[si - 1].key.clone()
+            } else {
+                self.tail[ti - 1].key.clone()
+            };
+            match self.lookup(key_bytes.as_ref())? {
+                LiveLookup::Live(v) => return Ok(Some((key_bytes, v))),
+                LiveLookup::Tombstone | LiveLookup::Absent => {
+                    // Step below this key: the next probe is strictly less.
+                    cursor.clear();
+                    cursor.extend_from_slice(&key_bytes);
                 }
             }
         }

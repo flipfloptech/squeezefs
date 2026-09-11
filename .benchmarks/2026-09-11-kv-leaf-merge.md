@@ -1,4 +1,4 @@
-# 2026-09-11 — KV leaf merge: the underfull-sibling SMO (§4.6a; landed `fac25656`)
+# 2026-09-11 — KV leaf merge: the underfull-sibling SMO (§4.6a; landed `fac25656`; finalized on `feat/kv-leaf-merge-finalize`)
 
 **What changed: the v3 CoW KV tree can now SHRINK.** Since format v3
 landed (`docs/design-cow-kv-metadata.md` §4.6), "sibling merge of underfull
@@ -138,16 +138,94 @@ Gauges: `meta_kv_node_merges`, `meta_kv_root_collapses`,
 volume), `frag_d4_mergeable_leaves`, `defrag_meta_merges`. No knob, no
 incompat bit (the on-disk vocabulary is the existing separator records).
 
-## 5. Stated, not done
+## 5. Finalized (2026-09-11, `feat/kv-leaf-merge-finalize` — owner ruling: the
+three items below ARE the feature, closed before the release gates)
 
-- Merges never cross a parent boundary (adjacent leaves under different
-  parents shrink through interior merges instead) — by design, §4.6a (d).
-- `sweep.candidates` counts underfull leaves seen before the first floor
-  refusal, so it under-reads during a wave; the D4 census is the complete
-  count.
-- The D4 sweep's cost is O(resident nodes) fold walks per pass, unmeasured
-  on a field-sized node cache; the heap-full sweep pays it only while the
-  posture stands.
-- No field row: the change is a space-recovery mechanism; its engagement on
-  a real volume is the `meta_kv_node_merges` / `meta_kv_merge_sweeps` pair
-  under a delete-heavy workload.
+The landing's three "stated, not done" items, each red-first
+(`tests/kv_leaf_merge_tests.rs` (10)–(13), `tests/defrag_tests.rs`):
+
+**1. Cross-parent shrinkage — PROVEN and pinned (§4.6a (d′)).** A merge
+never crosses a parent boundary; underfull leaves on both sides of one
+shrink through INTERIOR merges (a separator record is ≈ 40 B, so a parent
+whose leaves merged down to a handful is itself underfull — below ≈ 380 live
+separators at 64 KiB, ≈ 1,600 at 256 KiB), after which the former
+neighbours are siblings and merge on the next lap. Contract (10): a
+height-3 tree — **21,856 records, 3,188 leaves under 4 level-1 interiors**,
+one record kept in every parent's leftmost AND rightmost leaf (an underfull
+leaf on both sides of every boundary) — converges in **4 passes** against
+the derived bound `3·h₀+1 = 7`: **2,053 merges, 3 interior merges (=
+parents − 1), 1 root collapse, 3,188 → 2 leaves, height 2 → 1**, and the
+merge fixed-point walk (`merge_fixed_point`: at every level, no adjacent
+sibling pair jointly mergeable; no adjacent cross-parent pair jointly
+mergeable unless its parents are not) finds **0 stranded pairs, 0 heavy
+boundaries**. The one shape the sibling-only SMO cannot reach is stated with
+numbers: a boundary between two interiors whose separator folds exceed the
+pair capacity together (> ≈ 3,900 live children across the pair at 256 KiB,
+≈ 960 at 64 KiB) strands at most ONE leaf pair — `stranded ≤
+heavy_boundaries ≤ interiors − 1`, `1/fanout` of the leaf population,
+cleared as soon as either parent shrinks. The per-level face is
+`meta_kv_interior_merges` / `MaintenanceOutcome::interior_merges`.
+**Convergence bound, derived and pinned:** `passes ≤ 3·h₀ + 1` (per level:
+merge it; after coverage elides the minted separator tombstones, merge the
+parent level; regroup the level under its merged parents; plus the terminal
+no-op pass); on a full heap `sweeps ≤ 3·h₀ + 1 + 2·waves + 2`, `waves ≤
+⌈log₂(candidates/room₀ + 1)⌉ + 1` (contract (11)).
+
+**2. `meta_kv_merge_candidates` is EXACT (§4.6a (h′)).** Every lap ends
+with a COUNT phase over the resident leaves that publishes the post-merge
+underfull population; a compaction-floor refusal stops merging, never
+counting; the census (`dead_bset_census`) and the sweep share ONE predicate
+(`KvTree::is_merge_candidate[_at]`). The sweep moved to the END of the
+checkpoint cycle so its count reads the tail a post-cycle census reads (a
+tail advance only elides more tombstones — it can only ADD candidates).
+`merge_candidates_audit` (under the SMO mutex) pins `gauge ≡
+census_at(gauge_tail)` and `census_now ≥ census_at(gauge_tail)`; on a
+quiescent volume `frag_d4_mergeable_leaves ≡ meta_kv_merge_candidates`.
+Red → green on the SAME trace line: the landed sweep read `merge sweep … 1
+underfull leaves, 0 merges/collapses, backlog=true` mid-wave against a
+335-leaf tree; the finalized sweep reads `1 merges … candidates=335`, then
+`19 → 38 → 76 → 152 → 16` merges per wave to quiescence.
+
+**3. The sweep's cost — measured and bounded (§4.6a (e)).**
+
+| `kv_merge_sweep` row (dev box, release, scoping) | 0 % candidates | 10 % | 90 % |
+|---|---|---|---|
+| `shipped_256k` — 256 KiB nodes, 4 KiB values (~50 records/leaf, the xattr/layout shape) | **2.17 µs/leaf** | 2.23 µs | 2.52 µs |
+| `shipped_256k_dense` — 256 KiB nodes, 80 B values (~1,900 records/leaf, the inode/dentry shape) | **50.0 µs/leaf** | 52.9 µs | 57.9 µs |
+| `small_64k` — 64 KiB nodes, 1 KiB values (~45 records/leaf, the contracts' shape) | **2.17 µs/leaf** | 2.23 µs | 2.53 µs |
+
+The per-leaf cost scales with the record GROUPS a leaf holds (≈ 27 ns per
+group), not with the node size — the sparse 256 KiB and 64 KiB rows are
+equal to the ns. A deleted leaf carries its Puts AND its Deletes in the base
+until it compacts, which is why the dense-candidate rows cost ~16 % more.
+Field lap estimate: the derived node-cache default `max(budget/16, 512
+MiB)` ÷ 256 KiB ≈ **2,048 resident nodes × 50–58 µs ≈ 102–119 ms** on an
+inode/dentry-shaped tree — 2–3 cycles at the shipped budget.
+
+The **per-cycle work bound** derives, never a constant:
+`checkpoint::merge_sweep_budget_ms(flush_interval) ≡
+checkpoint_tick_period_ms(flush_interval)` — one cadence period, finding
+49's drain law ("every threshold drain is bounded by one period; at least
+one item per pass; leftovers re-arm"), tie-tested across eight interval
+shapes (contract (13)). Past the deadline the walk saves its **cursor**
+(phase + next `min_key`, per tree; the volume keeps a per-tree lap ledger
+so a tree the budget keeps cutting is never starved by its predecessors
+re-walking) and the next cycle RESUMES it — a lap completes across cycles
+instead of restarting (contract (12): an already-expired deadline processes
+the progress minimum and `lap_complete == false`; repeated bounded calls
+reach the same fixed point and publish the same count as a census). The
+always-on instrument is the pair `meta_kv_merge_sweep_ns` /
+`meta_kv_merge_sweep_projections` (`ns ÷ projections` = the live ns per
+leaf), plus `meta_kv_merge_laps`. The **D4 arm** drives the SAME bounded,
+cursor-resumed walk in chunks of the budget under the KD-3 duty cycle
+(`defrag_merge_sweep`; `defrag_merge_leaves` deleted) — its census IS the
+walk, no separate O(leaves) pass — and honours `--throttle` (pinned: a 2 %
+`defrag --meta` makes progress, parks on pause, completes rethrottled with
+its merges counted).
+
+**Nothing is left stated-not-done.** The only residual is the stated
+`1/fanout` heavy-boundary shape above, which is a bound, not a gap; and the
+absence of a field row, which the landing already adjudicated (a
+space-recovery mechanism, not a lever — its engagement on a real volume is
+the `meta_kv_node_merges` / `meta_kv_merge_laps` pair under a delete-heavy
+workload).

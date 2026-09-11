@@ -68,8 +68,9 @@ Two things the first reading got wrong: the derived oracle has COUNTED
 `nlink == 0` layouts since 2026-08-23 (so the released-but-undestroyed
 state was already visible as C8 drift, `N derived vs 0 durable` — the
 design's "the oracle skips corpses, no drift" sentence was stale), and the
-FUSE reclaim batch already bisects its destroy (`destroy_batch_bisect`),
-so the over-cap failure was sweep-only.
+FUSE reclaim batch already bisected its destroy (`destroy_batch_bisect`;
+since `18df3379` the router's `reclaim_destroy`), so the over-cap failure
+was sweep-only.
 
 ## 3. The fix (`c4060774` + `ba335913`; red `3a26933a`)
 
@@ -91,6 +92,8 @@ load-bearing for every recovered block's first post-mount read/free, and
 the witness refuses the stale corpse before the funnel.
 
 **Chunked destroys (the leak half).** `RoutedMetaBackend::plan_destroy_chunks`
+(since `18df3379` the packing inside `DataRouter::reclaim_destroy`, which
+also prices the releases now riding each entry)
 prices each corpse's destroy (`KvMetaBackend::destroy_entry_bytes`: the
 inode `Delete` + one per xattr, in `journal::record_frame_len` — the same
 framing the entry admission uses; bound = `entry_payload_cap()` =
@@ -152,13 +155,34 @@ the next two mounts find no corpses.
   seal's pin, the movers' source/dest pins and raise undos, the allocator
   wrappers, fsck C2's free of a zero-referencer leaked block.
 
-## 7. Residuals (pre-existing, stated, not fixed here)
+## 7. Residuals (pre-existing, stated here; CLOSED by `18df3379`, red
+##    `2695aca0` — the RECLAIM-ATOMIC pair, same day)
 
 - A FAILED release commit followed by a SUCCESSFUL destroy (the reclaim
-  batch's log-and-proceed) still orphans durable records forever — a
-  permanent C8-visible leak, not this bug.
-- A single corpse whose own destroy records exceed the cap fails loud at
-  every mount (a one-corpse leak).
+  batch's log-and-proceed) orphaned durable records forever — a permanent
+  C8-visible leak, not this bug. **Closed by `18df3379`:** a reclaimed
+  ino's releases ride its destroy entry (`KvMetaBackend::destroy_inodes_
+  releasing`, witnessed under the destroy's own 4a guards; the router's
+  `prepare_reclaim` → `reclaim_destroy` → `finish_reclaim`), so a failed
+  entry retains record, layout and references together
+  (`reclaim_destroy_refused_release_failed`, one WARN) and a reclaim batch
+  of N block-owning corpses is ONE entry instead of N + 1
+  (`reclaim_release_destroy_joint_commits`). The class was deterministic,
+  not just an I/O-error shape: the standalone release was never chunked,
+  so every file with ≥ ~3,000 references (11.6 GiB at the shipped block,
+  below the kvmap sweep-handoff threshold) orphaned its whole ledger on
+  unlink. `destroy_batch_bisect` and `plan_destroy_chunks` are gone (the
+  router packs to the cap and bisects).
+- A single corpse whose own destroy records exceed the cap failed loud at
+  every mount (a one-corpse leak). **Closed by `18df3379`:**
+  `KvMetaBackend::destroy_inode_chunked` destroys it across entries under
+  one held 4a guard — releases first, every other xattr, the `layout`
+  xattr and the record LAST — so any committed prefix is a corpse the next
+  sweep converges on under the §3 release witness
+  (`reclaim_single_ino_chunked_destroys`; seam
+  `SQUEEZEFS_TEST_DESTROY_CHUNK_STOP_AFTER`). Contracts: `tests/durable_
+  block_refs_tests.rs` §12 (five) and `tests/corpse_sweep_tests.rs`
+  contract (d), mount-class with kill -9 between the entries.
 
 ## 8. Release status
 

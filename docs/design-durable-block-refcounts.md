@@ -159,7 +159,7 @@ vector push per changed entry, computed where the truth already is:
 | `publish_pass` (the coalesced hot path) | the same, per **applied** op — a fencing-stale op contributes nothing, because its entries never enter the map either |
 | `clone_file` | `+key` per dest map entry (the durable half of `pin_block_validated`'s RAM pin) |
 | `save_metadata_to_backend_ext` | `+`/`−` the indirect-map **blob** under `BLOCK_INDEX_MAP_BLOB`; the DUR-6 CoW blob's custody flips in the same entry that re-points the layout at it |
-| `delete_file` (unlink → reclaim) | `−` every map entry and the blob — its own commit; see §6 |
+| `prepare_reclaim` → `reclaim_destroy` (unlink → reclaim) | `−` every map entry and the blob — riding the record's destroy entry (RECLAIM-ATOMIC; `delete_file`, fsck C9's standalone form, in its own commit); see §6 |
 
 Everything is funnelled through
 `DataRouter::block_ref_ops(ino, &[(block_index, key, take)])`, which resolves
@@ -227,46 +227,90 @@ hygiene, not correctness — which is why `trim --full` walks the whole free
 list rather than the debt tracker: the free list is the durable truth, the
 debt tracker only the incremental record of it.
 
-**Unlink/reclaim ordering.** `delete_file` releases the corpse's references
-*before* freeing its blocks, in its own transaction. Both crash windows are
-safe:
+**Unlink/reclaim ordering (RECLAIM-ATOMIC, `18df3379`).** A reclaimed
+ino's reference releases ride the SAME journal entry as its inode and
+xattr `Delete`s — `KvMetaBackend::destroy_inodes_releasing`, the C9
+repair's own "record + xattrs in ONE tx" precedent extended to the ledger
+— and its RAM frees run AFTER that entry lands, under the release WITNESS
+it produced. `DataRouter::prepare_reclaim` reads the layout and enumerates
+the release set (the map, the indirect blob, the torn-down rewrite epoch's
+displaced keys, the drained accounting notes) without touching the
+ledger; `DataRouter::reclaim_destroy` packs the prepared corpses per home
+volume to the journal's whole-entry cap in the admission's own framing
+(`destroy_entry_bytes` + `block_refs::release_records_bytes`), commits one
+entry per group, bisects a failed group down to the failing ino and
+REFUSES that one; `finish_reclaim` frees what the witness admits. One tx =
+one checksummed journal entry (§4.10), so the two half-states the old
+two-commit shape could mint are UNREPRESENTABLE:
 
-* *release → crash → no destroy*: the corpse record and its layout survive
-  with their references GONE. Since the corpse-census correction
-  (2026-08-23) the derived oracle **counts** a corpse's layout, so this
-  state reads as C8 drift (`N derived vs 0 durable`) until the next
-  mount's sweep destroys the record — and that retry is where the
-  original reasoning here ("the oracle skips `nlink == 0`, so no drift")
-  was falsified in the field (fstests `generic/749`, 2026-09-11): the
-  retry's `delete_file` re-read the surviving layout and `begin_free`d its
-  blocks a SECOND time, with no record behind the release, and the
-  decrement landed on whichever LIVE owner had re-minted the offset since
-  (the pack block every promotion lands in) — a terminal free under a live
-  layout. **The rule that closes it: a release may decrement the RAM
-  refcount only if THIS owner's durable record existed at release time.**
-  `commit_block_refs_witnessed` probes each release under the ino's 4a
-  guard and reports the records that existed; `delete_file` frees only the
-  blocks that witness (plus its RAM-only pending takes) and counts the
-  rest as `block_release_skipped_no_record`. The window is therefore a
-  LEAK-FREE no-op on retry: the records are destroyed, the blocks — already
-  free or already someone else's — are untouched.
-* *crash → no release*: the corpse's references survive and its blocks
-  recover ALLOCATED — a leak, never a double-owner mint. fsck C2 ("allocated
-  with zero referencers", whose referencer walk also skips corpses) and the
-  C8 ledger name it, and the next mount's sweep reclaims it (the corpse's
-  references exist, so its releases witness and its blocks free).
+* *release landed, destroy did not* (the over-cap sweep entry, a kill
+  between the commits): the corpse record and its layout survived with
+  their references GONE. Since the corpse-census correction (2026-08-23)
+  the derived oracle **counts** a corpse's layout, so this state reads as
+  C8 drift (`N derived vs 0 durable`) until the next mount's sweep
+  destroys the record — and that retry is where the original reasoning
+  here ("the oracle skips `nlink == 0`, so no drift") was falsified in the
+  field (fstests `generic/749`, 2026-09-11): the retry's `delete_file`
+  re-read the surviving layout and `begin_free`d its blocks a SECOND time,
+  with no record behind the release, and the decrement landed on whichever
+  LIVE owner had re-minted the offset since (the pack block every promotion
+  lands in) — a terminal free under a live layout. **The rule that closes
+  it: a release may decrement the RAM refcount only if THIS owner's durable
+  record existed at release time.** The witness is probed under the ino's
+  exclusive 4a guard inside the destroy entry's commit; the reclaim frees
+  only the blocks that witness (plus its RAM-only pending takes) and counts
+  the rest as `block_release_skipped_no_record`. The state itself is now
+  reachable only from a pre-fix (1.2.3) volume or a crash between the
+  entries of a chunked single-ino destroy (below) — and the gate stands
+  for both: a LEAK-FREE no-op on retry, the records destroyed, the blocks —
+  already free or already someone else's — untouched.
+* *destroy landed, release did not* (ring admission, a fail-stopped
+  volume's barrier, an I/O error — and, deterministically, every file whose
+  release set alone exceeded the cap, since the standalone release was never
+  chunked: ≥ ~3,000 references, an 11.6 GiB file at the shipped block):
+  the inode was gone with its references on the ledger FOREVER — the block
+  could never free, fsck C8 drifted at every mount, the RAM count
+  over-held. This was the corpse-sweep record's residual A. Now a refused
+  entry leaves record, layout and references together (counted
+  `reclaim_destroy_refused_release_failed`, one WARN per ino) and the next
+  reclaim/sweep retries the pair; the same refusal answers a layout that
+  cannot be read (v3 never reuses an ino, so a retained record leaks bytes,
+  never a slot).
+* *crash → nothing landed*: the corpse's references survive and its blocks
+  recover ALLOCATED — a leak, never a double-owner mint. fsck C2
+  ("allocated with zero referencers", whose referencer walk also skips
+  corpses) and the C8 ledger name it, and the next mount's sweep reclaims
+  it (the corpse's references exist, so its releases witness and its blocks
+  free).
 
-A separate transaction is correct here: unlink/reclaim is not the publish
-path (the no-second-commit rule is about the block publish), and
-`destroy_inodes` is a batched multi-ino commit that does not — and should
-not — decode layouts to learn block keys. What the batching MUST respect is
-the journal's whole-entry cap: the mount-time corpse sweep partitions its
-population with `RoutedMetaBackend::plan_destroy_chunks` (every corpse
-priced by its home volume's `destroy_entry_bytes` in the admission's own
-record framing) and runs release + free, then destroy, PER CHUNK — the
-1.2.3 release chain's sweep issued ONE destroy for 68,099 corpses, a 6 MB
-entry refused at every mount, which is how the released-but-undestroyed
-population above was minted by the thousand.
+The journal cost follows: a reclaim batch of N block-owning corpses is
+ONE entry where the two-commit shape paid N release entries plus the
+destroy (`reclaim_release_destroy_joint_commits` is the engagement gauge;
+pinned at N = 8 → 1). A peer-owned ino (S9) cannot ride one entry across
+the wire: its release ships FIRST and its destroy only if the release
+landed — the refuse-and-retain shape — and its frees ship too, validated by
+the authority's ledger.
+
+**One corpse past the cap (residual B).** A single ino whose releases +
+xattrs + record exceed `entry_payload_cap()` — thousands of xattrs, a
+large map — is destroyed ACROSS entries by `KvMetaBackend::destroy_inode_
+chunked` under one held exclusive 4a guard, packed greedily to the cap, in
+the order **releases → every other xattr → the `layout` xattr and the
+inode record LAST**. Any committed prefix leaves the record WITH its
+layout, so the next sweep recomputes the whole release set from it: the
+releases already committed witness NO record (counted skipped — never a
+second decrement, never a decrement on whoever re-minted the offset), the
+rest witness and free, the remaining xattrs and the record destroy. The
+RAM frees follow the witnessed releases whose entry COMMITTED (the ledger
+says free, so RAM must — a destroy stopped between entries frees exactly
+that prefix and is refused for the rest; on a volume without the ledger it
+frees nothing, since the next mount's walk re-seeds the surviving
+layout). `reclaim_single_ino_chunked_destroys` counts it; before it that
+corpse failed "exceeds the … whole-entry cap" at every mount forever (the
+1.2.3 release chain's sweep issued ONE destroy for 68,099 corpses — a 6 MB
+entry — which is how the released-but-undestroyed population above was
+minted by the thousand; the population is now packed, and the single
+corpse chunked).
 
 ### 6.1 Stamping a non-empty volume: never trust an empty ledger
 
@@ -481,7 +525,7 @@ drift of two shapes:
 | `clone_file` | the dest's whole reference set | staged into the dest's layout commit |
 | `save_metadata_to_backend_ext` | the indirect-map blob and its DUR-6 CoW predecessor | `BLOCK_INDEX_MAP_BLOB` take/release in the same tx |
 | staged→striped promotion; StorageFull spill; staged whole-image promotion; staged truncate prune | whole-map swaps | `block_ref_ops_for_map_swap` (per-index diff; those sites are already O(map)) |
-| `delete_file` (unlink → reclaim) | releases | its own tx, ordering per §6 |
+| `prepare_reclaim` → `reclaim_destroy` (unlink → reclaim) | releases | the destroy entry itself (RECLAIM-ATOMIC), ordering per §6 |
 | **`rewrite_shadow_record`** (the last one, and a CLASS) | **everything** — it mutates the RAM map, marks the layout dirty, and does not persist | the deferred-op accumulator, below |
 
 ### The last gap was a class, not a site

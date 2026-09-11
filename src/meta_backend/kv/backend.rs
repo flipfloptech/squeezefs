@@ -1116,10 +1116,31 @@ pub struct KvMetaBackend {
     /// §4.6a (h): `meta_kv_merge_candidates` — underfull leaves the last
     /// sweep or census found (LIVE).
     pub(super) merge_candidates: AtomicU64,
-    /// §4.6a (d): a sweep was refused a merge at the compaction floor —
-    /// the recovery wave is not done; the next cycle sweeps again even
-    /// once the heap-full posture clears.
+    /// §4.6a (d): a sweep was refused a merge at the compaction floor (or
+    /// the budget cut its lap) — the recovery wave is not done; the next
+    /// cycle sweeps again even once the heap-full posture clears.
     pub(super) merge_backlog: AtomicBool,
+    /// §4.6a (e) finalized: the sweep's per-cycle work budget, ms —
+    /// `checkpoint::merge_sweep_budget_ms` of the flush interval in force
+    /// at open (one tick period, finding 49's drain law).
+    pub(super) merge_sweep_budget_ms: u64,
+    /// The volume's merge LAP across its trees (`run_merge_sweep`): which
+    /// trees completed their lap since the last publish, and the exact
+    /// candidate count they reported. Guarded by the SMO mutex's callers;
+    /// the std mutex is the `Sync` face.
+    pub(super) merge_lap: std::sync::Mutex<VolumeLap>,
+    /// `meta_kv_merge_laps`: whole-volume sweep laps completed (every tree
+    /// walked, collapsed, counted) — the exact-candidates publish instant.
+    pub(super) merge_laps: AtomicU64,
+    /// The durable tail `merge_candidates` was counted under (the
+    /// `merge_candidates_audit` law's equal-tails premise).
+    pub(super) merge_candidates_tail: AtomicU64,
+    /// `meta_kv_merge_sweep_ns`: wall ns the sweep calls spent (sum).
+    pub(super) merge_sweep_ns: AtomicU64,
+    /// `meta_kv_merge_sweep_projections`: nodes projected by the sweep
+    /// calls (count) — `merge_sweep_ns ÷ merge_sweep_projections` is the
+    /// live ns/leaf the `kv_merge_sweep` bench prices offline.
+    pub(super) merge_sweep_projections: AtomicU64,
     /// Guard-event trace of this backend's `open` (test/ops surface): the
     /// pinned order `flock_acquired` → `claim_committed` →
     /// `claim_barriered` → `checkpoint_task_spawned`.
@@ -2336,6 +2357,14 @@ impl KvMetaBackend {
             merge_sweeps: AtomicU64::new(0),
             merge_candidates: AtomicU64::new(0),
             merge_backlog: AtomicBool::new(false),
+            merge_sweep_budget_ms: super::checkpoint::merge_sweep_budget_ms(
+                crate::meta_backend::resolve_flush_interval_ms(),
+            ),
+            merge_lap: std::sync::Mutex::new(VolumeLap::default()),
+            merge_laps: AtomicU64::new(0),
+            merge_candidates_tail: AtomicU64::new(0),
+            merge_sweep_ns: AtomicU64::new(0),
+            merge_sweep_projections: AtomicU64::new(0),
             guard_trace: std::sync::Mutex::new(Vec::new()),
         };
 
@@ -2885,10 +2914,33 @@ impl KvMetaBackend {
         self.merge_sweeps.load(Ordering::Relaxed)
     }
 
-    /// `meta_kv_merge_candidates` (§4.6a (h), LIVE): underfull leaves the
-    /// last sweep or census found on this volume.
+    /// `meta_kv_merge_candidates` (§4.6a (h), EXACT as of the last
+    /// completed sweep lap or census): underfull leaves standing on this
+    /// volume.
     pub fn merge_candidates(&self) -> u64 {
         self.merge_candidates.load(Ordering::Relaxed)
+    }
+
+    /// `meta_kv_merge_laps`: whole-volume sweep laps completed (the
+    /// exact-candidates publish instants).
+    pub fn merge_laps(&self) -> u64 {
+        self.merge_laps.load(Ordering::Relaxed)
+    }
+
+    /// `meta_kv_merge_sweep_ns`: wall ns spent in sweep calls (sum).
+    pub fn merge_sweep_ns(&self) -> u64 {
+        self.merge_sweep_ns.load(Ordering::Relaxed)
+    }
+
+    /// `meta_kv_merge_sweep_projections`: nodes the sweep projected (count).
+    pub fn merge_sweep_projections(&self) -> u64 {
+        self.merge_sweep_projections.load(Ordering::Relaxed)
+    }
+
+    /// The sweep's per-cycle budget in force (ms) — `merge_sweep_budget_ms`
+    /// of the flush interval this volume opened with.
+    pub fn merge_sweep_budget_ms(&self) -> u64 {
+        self.merge_sweep_budget_ms
     }
 
     /// The volume path.
@@ -5541,9 +5593,8 @@ impl KvMetaBackend {
     /// `--report-only` engine, the offline harness — page the trees in
     /// with a full range walk first (`squeezefs::defrag::measure` does).
     pub fn dead_bset_census(&self) -> DeadBsetCensus {
-        let layout = self.cache.config().layout;
-        let durable_tail = self.cache.durable_tail();
         let mut out = DeadBsetCensus::default();
+        let trees = self.all_trees();
         self.node_cache().for_each_node(|n| {
             if n.level() != 0 || n.state().is_superseded() {
                 return;
@@ -5556,74 +5607,171 @@ impl KvMetaBackend {
             if total > distinct {
                 out.candidates.push((n.tree_id(), n.addr()));
             }
-            // §4.6a (e): the underfull face — a root leaf has no sibling.
-            if !self
-                .tree_by_id_opt(n.tree_id())
-                .is_some_and(|t| t.is_root_addr(n.addr()))
-                && snap
-                    .fold_bytes_upper_with(&mut [], layout.merge_pair_capacity(), durable_tail)
-                    .0
-                    <= layout.merge_candidate_capacity()
+            // §4.6a (e): the underfull face — the sweep's own predicate
+            // (`KvTree::is_merge_candidate`, one source of truth).
+            if trees
+                .iter()
+                .find(|t| t.tree_id() == n.tree_id())
+                .is_some_and(|t| t.is_merge_candidate(n))
             {
                 out.merge_candidates.push((n.tree_id(), n.addr()));
             }
         });
+        self.merge_candidates_tail
+            .store(self.cache.durable_tail(), Ordering::Relaxed);
         self.merge_candidates
             .store(out.merge_candidates.len() as u64, Ordering::Relaxed);
         out
     }
 
-    /// The tree a census entry belongs to, if this volume mounts it.
-    fn tree_by_id_opt(&self, id: u8) -> Option<&KvTree> {
-        self.all_trees().into_iter().find(|t| t.tree_id() == id)
-    }
-
-    /// §4.6a (e), the D4 arm's MERGE half: merge each candidate leaf with
-    /// a sibling through the EXISTING merge SMO (`KvTree::merge_node_at` →
-    /// `smo_merge`), serialized with the checkpoint task through the
-    /// per-volume SMO mutex — the `defrag_compact_nodes` discipline
-    /// verbatim: journal-reserve / pending-free refusals run a checkpoint
-    /// cycle and retry (bounded), a compaction-floor refusal (`NoSpace`)
-    /// ends the pass for this volume (the cycles return the merged
-    /// extents; a later run continues). Returns the merges + root
-    /// collapses executed (vanished/superseded/no-longer-mergeable
-    /// candidates no-op — the census is advisory, the SMO revalidates).
-    pub async fn defrag_merge_leaves(
+    /// ONE bounded, cursor-resumed sweep call over the volume's trees
+    /// (§4.6a (e) finalized) — the heap-full sweep's and the D4 arm's
+    /// shared body, under the caller's SMO mutex. Trees are walked in
+    /// order under one `deadline`; a tree whose lap completed is marked
+    /// done for the VOLUME lap and skipped until every tree is done, so a
+    /// tree the budget keeps cutting is never starved by the ones before
+    /// it re-walking. When the last tree completes: the exact candidate
+    /// count over the volume publishes (`meta_kv_merge_candidates`),
+    /// `merge_laps` increments, the lap resets. `merge_sweeps` counts
+    /// calls; the `meta_kv_merge_sweep_{ns,projections}` pair accumulates
+    /// every call.
+    pub(super) async fn run_merge_sweep(
         &self,
-        targets: &[(u8, u64)],
-    ) -> std::result::Result<u64, KvError> {
-        let mut smo = self.smo.lock().await;
+        smo: &mut SmoContext,
+        forced_retirement: bool,
+        deadline: Option<std::time::Instant>,
+    ) -> std::result::Result<VolumeMergeSweep, KvError> {
         let trees = self.all_trees();
-        let mut out = crate::meta_backend::kv::tree::MaintenanceOutcome::default();
-        'targets: for &(tree_id, addr) in targets {
-            let Some(tree) = trees.iter().find(|t| t.tree_id() == tree_id) else {
-                continue; // unknown tree id: stale/foreign census entry
-            };
-            let mut attempts = 0;
-            loop {
-                match tree.merge_node_at(&mut smo, addr, &mut out).await {
-                    Ok(_) => break,
-                    Err(KvError::JournalReserveExhausted { .. })
-                    | Err(KvError::PendingFreeFull { .. })
-                        if attempts < 4 =>
-                    {
-                        attempts += 1;
-                        self.checkpoint_cycle(&mut smo, true).await?;
-                    }
-                    Err(e @ KvError::NoSpace { .. }) => {
-                        log::info!(
-                            "defrag-meta merge pass on {:?} stopped at the compaction floor \
-                             ({e}); the checkpoint cycles return the merged extents",
-                            self.path
-                        );
-                        self.merge_backlog.store(true, Ordering::Release);
-                        break 'targets;
-                    }
-                    Err(e) => return Err(e),
+        let mut report = VolumeMergeSweep::default();
+        let mut lap = self.merge_lap.lock().expect("merge lap").clone();
+        lap.done.resize(trees.len(), false);
+        let mut all_done = true;
+        for (i, tree) in trees.iter().enumerate() {
+            if lap.done[i] {
+                continue;
+            }
+            let sweep = match tree.merge_underfull(smo, forced_retirement, deadline).await {
+                Ok(s) => s,
+                Err(e) => {
+                    // A loud class (corruption / I/O): keep the lap state
+                    // as it stands and surface it.
+                    *self.merge_lap.lock().expect("merge lap") = lap;
+                    return Err(e);
                 }
+            };
+            self.merge_sweep_ns
+                .fetch_add(sweep.elapsed.as_nanos() as u64, Ordering::Relaxed);
+            self.merge_sweep_projections
+                .fetch_add(sweep.projections, Ordering::Relaxed);
+            report.merges += sweep.outcome.merges;
+            report.interior_merges += sweep.outcome.interior_merges;
+            report.root_collapses += sweep.outcome.root_collapses;
+            report.space_refused |= sweep.space_refused;
+            if sweep.lap_complete {
+                lap.done[i] = true;
+                lap.candidates += sweep.candidates;
+            } else {
+                // The budget is spent or a merge was refused: the next
+                // call resumes this tree from its parked cursor.
+                report.refusal = sweep.refusal;
+                all_done = false;
+                break;
             }
         }
-        Ok(out.merges + out.root_collapses)
+        if all_done && lap.done.iter().all(|d| *d) {
+            report.lap_complete = true;
+            report.candidates = lap.candidates;
+            // The tail the count was taken under: a later tail advance
+            // elides more tombstones and can only ADD candidates, so the
+            // gauge is exact for THIS tail and a lower bound until the
+            // next lap (`merge_candidates_audit` pins the law).
+            self.merge_candidates_tail
+                .store(self.cache.durable_tail(), Ordering::Relaxed);
+            self.merge_candidates
+                .store(lap.candidates, Ordering::Relaxed);
+            self.merge_laps.fetch_add(1, Ordering::Relaxed);
+            lap = VolumeLap::default();
+        }
+        *self.merge_lap.lock().expect("merge lap") = lap;
+        self.merge_sweeps.fetch_add(1, Ordering::Relaxed);
+        Ok(report)
+    }
+
+    /// The exact-candidates law, auditable: under the SMO mutex (so no
+    /// sweep, compaction or collapse interleaves), the published gauge
+    /// with the durable tail its lap (or census) counted under, a fresh
+    /// census UNDER THAT SAME TAIL (`KvTree::merge_candidate_census_at` —
+    /// the sweep's own predicate), and a census under the tail in force
+    /// now. The law: `gauge == census_at_gauge_tail` whenever no user
+    /// commit changed the tree since the publish; and `census_now ≥
+    /// census_at_gauge_tail` always — a tail advance can only elide more
+    /// tombstones and ADD candidates, which the next lap publishes.
+    pub async fn merge_candidates_audit(&self) -> MergeCandidatesAudit {
+        let _smo = self.smo.lock().await;
+        let gauge_tail = self.merge_candidates_tail.load(Ordering::Relaxed);
+        let census_tail = self.cache.durable_tail();
+        let trees = self.all_trees();
+        MergeCandidatesAudit {
+            gauge: self.merge_candidates.load(Ordering::Relaxed),
+            gauge_tail,
+            census_at_gauge_tail: trees
+                .iter()
+                .map(|t| t.merge_candidate_census_at(gauge_tail))
+                .sum(),
+            census_now: trees.iter().map(|t| t.merge_candidate_census()).sum(),
+            census_tail,
+        }
+    }
+
+    /// §4.6a (e), the D4 arm's MERGE half: one bounded sweep call under
+    /// the FIFO-valve posture, serialized with the checkpoint task through
+    /// the per-volume SMO mutex — the `defrag_compact_nodes` discipline
+    /// verbatim for its refusals: journal-reserve / pending-free refusals
+    /// run a checkpoint cycle and retry from the parked cursor (bounded);
+    /// a compaction-floor refusal ends the merging of this lap and stands
+    /// the backlog (the cycles return the merged extents; the count phase
+    /// still runs, so the published candidates stay exact). `deadline`
+    /// bounds the call (`None` = one whole volume lap) — the job fabric
+    /// passes its throttle chunk and `duty_park`s between calls.
+    pub async fn defrag_merge_sweep(
+        &self,
+        deadline: Option<std::time::Instant>,
+    ) -> std::result::Result<VolumeMergeSweep, KvError> {
+        let mut smo = self.smo.lock().await;
+        let mut total = VolumeMergeSweep::default();
+        for attempt in 0..=4 {
+            let report = self.run_merge_sweep(&mut smo, false, deadline).await?;
+            total.merges += report.merges;
+            total.interior_merges += report.interior_merges;
+            total.root_collapses += report.root_collapses;
+            total.space_refused |= report.space_refused;
+            total.candidates = report.candidates;
+            total.lap_complete = report.lap_complete;
+            total.refusal = report.refusal;
+            if report.space_refused {
+                log::info!(
+                    "defrag-meta merge pass on {:?} stopped merging at the compaction \
+                     floor; the checkpoint cycles return the merged extents",
+                    self.path
+                );
+                self.merge_backlog.store(true, Ordering::Release);
+            }
+            match report.refusal {
+                Some(r) if attempt < 4 => {
+                    // The nudge's ladder: one forced cycle refills the ring
+                    // reserve / drains the FIFO, then resume from the
+                    // parked cursor.
+                    log::debug!(
+                        "defrag-meta merge pass on {:?}: {r:?} — one checkpoint cycle, then \
+                         the lap resumes",
+                        self.path
+                    );
+                    self.checkpoint_cycle(&mut smo, true).await?;
+                }
+                _ => break,
+            }
+        }
+        Ok(total)
     }
 
     /// PR VL7 (§5.7 D4): the **compaction nudge** — fold each candidate
@@ -5688,8 +5836,56 @@ pub struct DeadBsetCensus {
     pub candidates: Vec<(u8, u64)>,
     /// §4.6a (e): `(tree_id, node_addr)` of every UNDERFULL non-root leaf
     /// (fold ≤ ¼ capacity, covered tombstones credited as elided) — the
-    /// merge arm's input and the `mergeable_leaves` face.
+    /// `mergeable_leaves` face, computed with the sweep's own predicate.
     pub merge_candidates: Vec<(u8, u64)>,
+}
+
+/// A volume's merge lap across its trees (`KvMetaBackend::run_merge_sweep`):
+/// per tree (in `all_trees` order) whether its lap completed since the last
+/// publish, and the exact candidates the completed trees reported.
+#[derive(Debug, Default, Clone)]
+pub(super) struct VolumeLap {
+    pub(super) done: Vec<bool>,
+    pub(super) candidates: u64,
+}
+
+/// [`KvMetaBackend::merge_candidates_audit`]'s answer: the gauge and a
+/// fresh census, each with the durable tail it was counted under.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MergeCandidatesAudit {
+    /// `meta_kv_merge_candidates` as published by the last lap or census.
+    pub gauge: u64,
+    /// The durable tail that publish counted under.
+    pub gauge_tail: u64,
+    /// The sweep predicate over every resident leaf under `gauge_tail`.
+    pub census_at_gauge_tail: u64,
+    /// The sweep predicate over every resident leaf under `census_tail`.
+    pub census_now: u64,
+    /// The durable tail in force now.
+    pub census_tail: u64,
+}
+
+/// What one bounded volume sweep call did (§4.6a (e), finalized).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct VolumeMergeSweep {
+    /// Sibling merges this call ran (`meta_kv_node_merges`).
+    pub merges: u64,
+    /// The level-≥ 1 subset (`meta_kv_interior_merges`).
+    pub interior_merges: u64,
+    /// Root collapses (`meta_kv_root_collapses`).
+    pub root_collapses: u64,
+    /// The EXACT underfull-leaf count over the volume — valid when
+    /// `lap_complete` (the `meta_kv_merge_candidates` publish).
+    pub candidates: u64,
+    /// Every tree's lap completed in this call (the publish instant).
+    pub lap_complete: bool,
+    /// A compaction-floor refusal stopped merging in some tree's lap.
+    pub space_refused: bool,
+    /// A merge refused ring reserve / FIFO room stopped the call with its
+    /// merges so far reported and the cursor parked (`KvTree::merge_
+    /// underfull`): the caller's checkpoint cycle remedies it and the
+    /// next call resumes.
+    pub refusal: Option<crate::meta_backend::kv::tree::SweepRefusal>,
 }
 
 // ---------------------------------------------------------------------------

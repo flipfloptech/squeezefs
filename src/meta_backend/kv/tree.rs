@@ -246,22 +246,86 @@ pub struct MaintenanceOutcome {
     pub splits: u64,
     /// §4.6a sibling merges (two nodes → one) — `meta_kv_node_merges`.
     pub merges: u64,
+    /// The subset of `merges` at level ≥ 1 (interior recursion, §4.6a
+    /// (c)) — `meta_kv_interior_merges`, the cross-parent shrinkage face.
+    pub interior_merges: u64,
     /// §4.6a root collapses (height − 1) — `meta_kv_root_collapses`.
     pub root_collapses: u64,
 }
 
-/// What one [`KvTree::merge_underfull`] sweep did (§4.6a (e)).
+/// What one [`KvTree::merge_underfull`] call did (§4.6a (e), finalized —
+/// bounded and cursor-resumed).
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct MergeSweep {
-    /// The merges and collapses executed.
+    /// The merges and collapses executed by this call.
     pub outcome: MaintenanceOutcome,
-    /// Underfull leaves the sweep found (fold ≤ ¼ capacity, root leaves
-    /// excluded) — the `meta_kv_merge_candidates` input.
+    /// The EXACT count of underfull leaves (fold ≤ ¼ capacity, root leaf
+    /// excluded) standing after the lap's merges — the
+    /// `meta_kv_merge_candidates` law — complete when `lap_complete`;
+    /// the running count of the lap's count phase otherwise.
     pub candidates: u64,
-    /// A merge was refused at the compaction floor (`NoSpace`): the
-    /// sweep stopped early and the backlog stands — the next barriered
-    /// cycle returns extents and the sweep resumes.
+    /// A merge was refused at the compaction floor (`NoSpace`) during this
+    /// lap: merging stopped, counting continued — the backlog stands and
+    /// the next barriered cycle returns extents.
     pub space_refused: bool,
+    /// The lap ended in this call (every level walked, the collapse chain
+    /// run, the count phase finished, the cursor reset). `false` = the
+    /// deadline cut the call, or a merge was refused ring reserve / FIFO
+    /// room (`refusal`); the next call resumes from the cursor.
+    pub lap_complete: bool,
+    /// A merge refused for a reason a checkpoint cycle remedies (the
+    /// §4.4 pt 5 reserve, the §4.7 FIFO valve): the lap stopped at that
+    /// node with its merges so far REPORTED, the cursor parked there, and
+    /// the caller's cycle-and-retry resumes it.
+    pub refusal: Option<SweepRefusal>,
+    /// Nodes projected (`is_merge_candidate` evaluations) by this call —
+    /// the `meta_kv_merge_sweep_projections` half of the instrument.
+    pub projections: u64,
+    /// This call's wall time — the `meta_kv_merge_sweep_ns` half.
+    pub elapsed: std::time::Duration,
+}
+
+/// Why a [`KvTree::merge_underfull`] call stopped short of its deadline:
+/// a merge admission the caller's checkpoint cycle remedies.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SweepRefusal {
+    /// The checkpoint-task ring reserve could not admit the SMO's entry.
+    JournalReserve { needed: u64 },
+    /// The pending-free FIFO has no room for the merge's two retirements.
+    PendingFreeFull { pending: u64 },
+}
+
+/// Where a [`KvTree::merge_underfull`] lap stands between bounded calls.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SweepPhase {
+    /// Walking the nodes at this level (leaves up).
+    Merge(u8),
+    /// Every level walked and the collapse chain run: counting the leaves
+    /// that remain underfull (the exact-candidates phase).
+    Count,
+}
+
+/// The per-tree sweep cursor — the lap's resumable state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SweepCursor {
+    phase: SweepPhase,
+    /// The `min_key` the walk resumes at within the current phase.
+    next_min: Vec<u8>,
+    /// Underfull leaves counted so far in this lap's count phase.
+    lap_candidates: u64,
+    /// The compaction floor refused a merge earlier in this lap.
+    space_refused: bool,
+}
+
+impl Default for SweepCursor {
+    fn default() -> Self {
+        Self {
+            phase: SweepPhase::Merge(0),
+            next_min: Vec::new(),
+            lap_candidates: 0,
+            space_refused: false,
+        }
+    }
 }
 
 /// Owns a node's `FREEZING` bit for an SMO that froze a node with an
@@ -297,6 +361,10 @@ pub struct KvTree {
     /// Addresses whose open delta crossed the writeback threshold —
     /// drained by [`Self::run_maintenance`] (duplicates are benign).
     maintenance: scc::Queue<u64>,
+    /// The §4.6a merge sweep's resumable lap state ([`SweepCursor`]) —
+    /// touched only by the serialized SMO context's owner (the callers
+    /// hold `&mut SmoContext`), the mutex is the `Sync` face.
+    merge_cursor: std::sync::Mutex<SweepCursor>,
 }
 
 impl std::fmt::Debug for KvTree {
@@ -369,6 +437,7 @@ impl KvTree {
             }),
             seq,
             maintenance: scc::Queue::default(),
+            merge_cursor: std::sync::Mutex::new(SweepCursor::default()),
         })
     }
 
@@ -404,6 +473,7 @@ impl KvTree {
             root: ArcSwap::from_pointee(root),
             seq,
             maintenance: scc::Queue::default(),
+            merge_cursor: std::sync::Mutex::new(SweepCursor::default()),
         })
     }
 
@@ -919,6 +989,7 @@ impl KvTree {
             out.compactions += pass.compactions;
             out.splits += pass.splits;
             out.merges += pass.merges;
+            out.interior_merges += pass.interior_merges;
             out.root_collapses += pass.root_collapses;
         }
         Err(KvError::Corrupt(
@@ -1894,13 +1965,15 @@ impl KvTree {
     /// tombstones below the durable tail credited as elided (the
     /// compaction fold drops them — `compact_fold`'s rule).
     fn fold_upper(&self, node: &Arc<CachedNode>) -> usize {
+        self.fold_upper_at(node, self.cache.durable_tail())
+    }
+
+    /// [`Self::fold_upper`] under an explicit durable tail — the audit's
+    /// "census under the tail the gauge was counted with".
+    fn fold_upper_at(&self, node: &Arc<CachedNode>, durable_tail: u64) -> usize {
         let layout = self.cache.config().layout;
         node.snapshot()
-            .fold_bytes_upper_with(
-                &mut [],
-                layout.merge_pair_capacity(),
-                self.cache.durable_tail(),
-            )
+            .fold_bytes_upper_with(&mut [], layout.merge_pair_capacity(), durable_tail)
             .0
     }
 
@@ -1911,94 +1984,234 @@ impl KvTree {
         a + b <= layout.merge_pair_capacity() && a.min(b) <= layout.merge_candidate_capacity()
     }
 
-    /// One sweep over this tree's RESIDENT nodes, level by level from the
-    /// leaves up, each level in key order (§4.6a (e), the heap-full sweep
-    /// and the D4 arm's primitive): the exact fold per node, every
-    /// underfull one (`fold ≤ ¼ capacity`; the root excluded) handed to
-    /// `try_merge_node` — which applies the pair law against the
-    /// sibling, packs greedily rightwards, and climbs. The interior levels
-    /// are walked in their own right, not only through the climb: the
-    /// separator tombstones a leaf merge mints sit ABOVE the durable tail
-    /// until the next barriered cycle covers them, so a parent that lost
-    /// most of its children projects underfull only on a LATER sweep —
-    /// one that runs no leaf merge and therefore never climbs. Ends with
-    /// the root-collapse chain. No device reads for the census; a
-    /// candidate's sibling is demand-paged. Stops at the first
-    /// compaction-floor refusal (`space_refused` — the backlog stands,
-    /// the next barriered cycle returns extents and the caller resumes).
-    /// `forced_retirement` selects the §4.7 pending-free posture exactly
-    /// as `smo_replace` does. `candidates` counts underfull
-    /// LEAVES (the census's definition).
+    /// The §4.6a candidate predicate — ONE source of truth for the sweep's
+    /// walk, its count phase, the D4 census (`dead_bset_census`) and the
+    /// bench: a live non-root node of this tree whose fold projects at or
+    /// under the underfull bound. One `fold_bytes_upper_with` per call —
+    /// the projection the `kv_merge_sweep` bench prices per leaf.
+    pub fn is_merge_candidate(&self, node: &Arc<CachedNode>) -> bool {
+        self.is_merge_candidate_at(node, self.cache.durable_tail())
+    }
+
+    /// [`Self::is_merge_candidate`] under an explicit durable tail: the
+    /// tail decides which tombstones project as elided, so a count is only
+    /// comparable to another under the SAME tail (a later tail can only
+    /// elide more and ADD candidates).
+    pub fn is_merge_candidate_at(&self, node: &Arc<CachedNode>, durable_tail: u64) -> bool {
+        !node.state().is_superseded()
+            && node.tree_id() == self.tree_id
+            && !self.is_root(node)
+            && self.fold_upper_at(node, durable_tail)
+                <= self.cache.config().layout.merge_candidate_capacity()
+    }
+
+    /// The projection-only census of this tree's RESIDENT leaves — the
+    /// sweep's count phase without the cursor: how many are merge
+    /// candidates right now. What the `kv_merge_sweep` bench measures
+    /// (ns per leaf) and what the exact-candidates contract compares the
+    /// sweep's published count against.
+    pub fn merge_candidate_census(&self) -> u64 {
+        self.merge_candidate_census_at(self.cache.durable_tail())
+    }
+
+    /// [`Self::merge_candidate_census`] under an explicit durable tail.
+    pub fn merge_candidate_census_at(&self, durable_tail: u64) -> u64 {
+        let mut leaves: Vec<Arc<CachedNode>> = Vec::new();
+        self.cache.for_each_node(|n| {
+            if n.tree_id() == self.tree_id && n.level() == 0 {
+                leaves.push(n.clone());
+            }
+        });
+        leaves
+            .iter()
+            .filter(|n| self.is_merge_candidate_at(n, durable_tail))
+            .count() as u64
+    }
+
+    /// This tree's RESIDENT nodes at `level` in key order, from `from`
+    /// (inclusive on `min_key`): the sweep's per-level census surface — no
+    /// device reads.
+    fn resident_nodes_at(&self, level: u8, from: &[u8]) -> Vec<(Vec<u8>, u64)> {
+        let mut nodes: Vec<(Vec<u8>, u64)> = Vec::new();
+        self.cache.for_each_node(|n| {
+            if n.tree_id() == self.tree_id
+                && n.level() == level
+                && !n.state().is_superseded()
+                && n.min_key() >= from
+            {
+                nodes.push((n.min_key().to_vec(), n.addr()));
+            }
+        });
+        nodes.sort();
+        nodes
+    }
+
+    /// One BOUNDED, CURSOR-RESUMED sweep call over this tree (§4.6a (e),
+    /// finalized): the heap-full sweep's and the D4 arm's primitive. A
+    /// LAP walks the RESIDENT nodes level by level from the leaves up,
+    /// each level in key order — every node projected once
+    /// (`is_merge_candidate`), every underfull one handed to
+    /// `try_merge_node` (the pair law against the sibling, greedy
+    /// rightward packing, the climb) — then runs the root-collapse chain,
+    /// then a COUNT phase over the leaves that publishes the EXACT
+    /// candidate population of the post-merge tree (`candidates`, the
+    /// `meta_kv_merge_candidates` law: what a census taken at that instant
+    /// reads). The interior levels are walked in their own right, not
+    /// only through the climb: the separator tombstones a leaf merge mints
+    /// sit ABOVE the durable tail until the next barriered cycle covers
+    /// them, so a parent that lost most of its children projects underfull
+    /// only on a LATER lap — one that runs no leaf merge and never climbs.
+    ///
+    /// `deadline` bounds ONE call: past it the walk saves its cursor
+    /// (phase + next `min_key`) and returns `lap_complete == false`; the
+    /// next call resumes there, so a lap COMPLETES across calls instead
+    /// of restarting (finding 49's drain shape — at least one node per
+    /// call, so every call makes progress; `None` = one whole lap). A
+    /// compaction-floor refusal (`NoSpace`) stops the MERGING for this lap
+    /// (`space_refused` — the backlog stands, the next barriered cycle
+    /// returns extents) and skips straight to the collapse chain and the
+    /// count phase, so the published count is exact mid-wave too. Any
+    /// other refusal propagates with the cursor parked AT the refused
+    /// node (the caller's cycle-and-retry resumes it). `forced_retirement`
+    /// selects the §4.7 pending-free posture exactly as `smo_replace`
+    /// does. `projections`/`elapsed` are the `meta_kv_merge_sweep_ns`
+    /// instrument's inputs (nodes projected, wall time) for this call.
     pub async fn merge_underfull(
         &self,
         ctx: &mut SmoContext,
         forced_retirement: bool,
+        deadline: Option<std::time::Instant>,
     ) -> Result<MergeSweep, KvError> {
-        let layout = self.cache.config().layout;
+        let started = std::time::Instant::now();
         let mut sweep = MergeSweep::default();
-        let mut level = 0u8;
-        'levels: while level < self.root_level().await? {
-            let mut nodes: Vec<(Vec<u8>, u64)> = Vec::new();
-            self.cache.for_each_node(|n| {
-                if n.tree_id() == self.tree_id && n.level() == level && !n.state().is_superseded() {
-                    nodes.push((n.min_key().to_vec(), n.addr()));
-                }
-            });
-            nodes.sort();
-            for (_, addr) in nodes {
-                let Some(node) = self.cache.try_get(addr) else {
-                    continue; // evicted/merged since the census
-                };
-                if node.state().is_superseded() || self.is_root(&node) {
-                    continue;
-                }
-                if self.fold_upper(&node) > layout.merge_candidate_capacity() {
-                    continue;
-                }
-                if level == 0 {
-                    sweep.candidates += 1;
-                }
-                match self
-                    .try_merge_node(ctx, node, &mut sweep.outcome, forced_retirement)
-                    .await
-                {
-                    Ok(()) => {}
-                    Err(KvError::NoSpace { .. }) => {
-                        sweep.space_refused = true;
-                        break 'levels;
+        let mut cursor = self.merge_cursor.lock().expect("sweep cursor").clone();
+        // The progress law: the deadline is consulted only after this
+        // call projected at least one node.
+        let expired = |projected: u64| {
+            projected >= 1 && deadline.is_some_and(|d| std::time::Instant::now() >= d)
+        };
+        loop {
+            match cursor.phase {
+                SweepPhase::Merge(level) => {
+                    if level >= self.root_level().await? {
+                        // Every level below the root walked (or the root
+                        // collapsed under us): the collapse chain, then
+                        // the count. A collapse refused ring reserve /
+                        // FIFO room parks the lap HERE (the chain re-runs
+                        // on resume — a collapse is idempotent to retry).
+                        match self
+                            .collapse_root_chain(ctx, &mut sweep.outcome, forced_retirement)
+                            .await
+                        {
+                            Ok(()) => {}
+                            Err(KvError::JournalReserveExhausted { needed }) => {
+                                sweep.refusal = Some(SweepRefusal::JournalReserve { needed });
+                                break;
+                            }
+                            Err(KvError::PendingFreeFull { pending }) => {
+                                sweep.refusal = Some(SweepRefusal::PendingFreeFull { pending });
+                                break;
+                            }
+                            Err(e) => return Err(e),
+                        }
+                        cursor.phase = SweepPhase::Count;
+                        cursor.next_min.clear();
+                        continue;
                     }
-                    Err(e) => return Err(e),
+                    let nodes = self.resident_nodes_at(level, &cursor.next_min);
+                    let mut level_done = true;
+                    for (min, addr) in nodes {
+                        if expired(sweep.projections) {
+                            cursor.next_min = min;
+                            level_done = false;
+                            break;
+                        }
+                        // Park the cursor AT this node before touching it:
+                        // a refusal propagating out of the merge leaves the
+                        // walk resumable exactly here.
+                        cursor.next_min = min;
+                        *self.merge_cursor.lock().expect("sweep cursor") = cursor.clone();
+                        let Some(node) = self.cache.try_get(addr) else {
+                            continue; // evicted/merged since the census
+                        };
+                        sweep.projections += 1;
+                        if !self.is_merge_candidate(&node) {
+                            continue;
+                        }
+                        if cursor.space_refused {
+                            continue; // counting only: the floor refused this lap
+                        }
+                        match self
+                            .try_merge_node(ctx, node, &mut sweep.outcome, forced_retirement)
+                            .await
+                        {
+                            Ok(()) => {}
+                            Err(KvError::NoSpace { .. }) => {
+                                cursor.space_refused = true;
+                                sweep.space_refused = true;
+                            }
+                            Err(KvError::JournalReserveExhausted { needed }) => {
+                                sweep.refusal = Some(SweepRefusal::JournalReserve { needed });
+                                level_done = false;
+                                break;
+                            }
+                            Err(KvError::PendingFreeFull { pending }) => {
+                                sweep.refusal = Some(SweepRefusal::PendingFreeFull { pending });
+                                level_done = false;
+                                break;
+                            }
+                            Err(e) => return Err(e),
+                        }
+                    }
+                    if level_done {
+                        cursor.phase = if cursor.space_refused {
+                            // Nothing more can merge this lap: straight to
+                            // the collapse chain (no claim) and the count.
+                            SweepPhase::Merge(u8::MAX)
+                        } else {
+                            SweepPhase::Merge(level + 1)
+                        };
+                        cursor.next_min.clear();
+                    }
+                    if !level_done {
+                        break;
+                    }
+                }
+                SweepPhase::Count => {
+                    let nodes = self.resident_nodes_at(0, &cursor.next_min);
+                    let mut done = true;
+                    for (min, addr) in nodes {
+                        if expired(sweep.projections) {
+                            cursor.next_min = min;
+                            done = false;
+                            break;
+                        }
+                        let Some(node) = self.cache.try_get(addr) else {
+                            continue;
+                        };
+                        sweep.projections += 1;
+                        if self.is_merge_candidate(&node) {
+                            cursor.lap_candidates += 1;
+                        }
+                    }
+                    if done {
+                        // A lap ends here: publish, reset the cursor.
+                        sweep.candidates = cursor.lap_candidates;
+                        sweep.lap_complete = true;
+                        sweep.space_refused |= cursor.space_refused;
+                        cursor = SweepCursor::default();
+                    }
+                    break;
                 }
             }
-            level += 1;
         }
-        if !sweep.space_refused {
-            self.collapse_root_chain(ctx, &mut sweep.outcome, forced_retirement)
-                .await?;
+        if !sweep.lap_complete {
+            sweep.candidates = cursor.lap_candidates;
+            sweep.space_refused |= cursor.space_refused;
         }
+        *self.merge_cursor.lock().expect("sweep cursor") = cursor;
+        sweep.elapsed = started.elapsed();
         Ok(sweep)
-    }
-
-    /// The D4 arm's per-candidate entry (§4.6a (e)): merge the leaf at
-    /// `addr` with a sibling if the pair law admits, recursing into the
-    /// interior. `false` = the node vanished / was superseded since the
-    /// census (idempotent no-op — the census is advisory, the SMO
-    /// revalidates), or nothing was mergeable. The FIFO valve posture.
-    pub(crate) async fn merge_node_at(
-        &self,
-        ctx: &mut SmoContext,
-        addr: u64,
-        out: &mut MaintenanceOutcome,
-    ) -> Result<bool, KvError> {
-        let Some(node) = self.cache.try_get(addr) else {
-            return Ok(false);
-        };
-        if node.state().is_superseded() || node.tree_id() != self.tree_id || self.is_root(&node) {
-            return Ok(false);
-        }
-        let before = out.merges + out.root_collapses;
-        self.try_merge_node(ctx, node, out, false).await?;
-        Ok(out.merges + out.root_collapses > before)
     }
 
     /// Merge `node` with a sibling while the pair law admits — packing
@@ -2449,6 +2662,10 @@ impl KvTree {
         }
         super::META_KV_NODE_MERGES.fetch_add(1, Ordering::Relaxed);
         out.merges += 1;
+        if left.level() > 0 {
+            super::META_KV_INTERIOR_MERGES.fetch_add(1, Ordering::Relaxed);
+            out.interior_merges += 1;
+        }
         Ok(Some(successor))
     }
 

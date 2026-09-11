@@ -13451,6 +13451,29 @@ impl SqueezefsFilesystem {
                     "meta_kv_merge_sweeps".into(),
                     per_volume(&|be| be.merge_sweeps()),
                 );
+                // LEAF-MERGE finalized (§4.6a (c)/(e)): `interior_merges`
+                // = the level-≥1 subset of `node_merges` (cross-parent
+                // shrinkage's face); `merge_laps` = whole-volume sweep
+                // laps completed — the instants `merge_candidates` is
+                // exact at; `merge_sweep_ns` / `merge_sweep_projections` =
+                // the sweep's always-on cost pair (ns ÷ projections = the
+                // live ns per leaf the `kv_merge_sweep` bench prices).
+                metrics.insert(
+                    "meta_kv_interior_merges".into(),
+                    load(&meta_kv::META_KV_INTERIOR_MERGES),
+                );
+                metrics.insert(
+                    "meta_kv_merge_laps".into(),
+                    per_volume(&|be| be.merge_laps()),
+                );
+                metrics.insert(
+                    "meta_kv_merge_sweep_ns".into(),
+                    per_volume(&|be| be.merge_sweep_ns()),
+                );
+                metrics.insert(
+                    "meta_kv_merge_sweep_projections".into(),
+                    per_volume(&|be| be.merge_sweep_projections()),
+                );
                 // PR M1 — the single-writer mount guard (design
                 // §9 Observability): per-volume guarantee class + the
                 // fence / PTPL-reacquire counters.

@@ -2343,29 +2343,49 @@ impl JobFabric {
                 Self::duty_park(ctl, start.elapsed()).await;
             }
             // The §4.6a merge arm (design-cow-kv-metadata §4.6a (e), the
-            // third trigger): the census's UNDERFULL leaves, merged through
-            // the EXISTING merge SMO on the same serialization; a
-            // compaction-floor refusal ends the volume's pass (the
-            // checkpoint cycles return the extents; a re-run continues).
-            // Re-censused after the nudges: a compaction can leave a leaf
-            // underfull.
-            let census = kv.dead_bset_census();
-            ctl.tasks_total
-                .fetch_add(census.merge_candidates.len() as u64, Ordering::Relaxed);
-            for chunk in census.merge_candidates.chunks(8) {
+            // third trigger, finalized): the volume's merge sweep driven to
+            // ONE whole lap in bounded chunks — each chunk is one sweep call
+            // under the checkpoint's own budget (`merge_sweep_budget_ms`,
+            // finding 49's drain law) and the duty cycle parks between
+            // chunks, so the census IS the bounded, cursor-resumed walk the
+            // heap-full sweep runs (no separate O(leaves) pass) and a 1 %
+            // throttle stretches the merge pass like every other nudge. A
+            // compaction-floor refusal ends the lap's merging (the
+            // checkpoint cycles return the extents; a re-run continues);
+            // the lap's count phase still publishes the exact candidates.
+            let mut chunks = 0u64;
+            loop {
                 if ctl.cancelled.load(Ordering::SeqCst) || ctl.paused.load(Ordering::SeqCst) {
                     break;
                 }
                 let start = std::time::Instant::now();
-                match kv.defrag_merge_leaves(chunk).await {
-                    Ok(merged) => {
+                let deadline = start + Duration::from_millis(kv.merge_sweep_budget_ms());
+                match kv.defrag_merge_sweep(Some(deadline)).await {
+                    Ok(report) => {
+                        let merged = report.merges + report.root_collapses;
                         METRICS
                             .defrag_meta_merges
                             .fetch_add(merged, Ordering::Relaxed);
-                        ctl.done.fetch_add(chunk.len() as u64, Ordering::Relaxed);
-                        METRICS
-                            .job_tasks_done
-                            .fetch_add(chunk.len() as u64, Ordering::Relaxed);
+                        // Advisory progress: one task per chunk, plus the
+                        // lap's exact candidate count as the total once
+                        // known.
+                        chunks += 1;
+                        ctl.tasks_total.fetch_add(1, Ordering::Relaxed);
+                        ctl.done.fetch_add(1, Ordering::Relaxed);
+                        METRICS.job_tasks_done.fetch_add(1, Ordering::Relaxed);
+                        if report.lap_complete {
+                            log::info!(
+                                "job {job_id}: defrag-meta merge lap on {:?} — {} merges ({} \
+                                 interior), {} collapses, {} underfull leaves remain, {chunks} \
+                                 chunk(s)",
+                                kv.device_path(),
+                                report.merges,
+                                report.interior_merges,
+                                report.root_collapses,
+                                report.candidates
+                            );
+                            break;
+                        }
                     }
                     Err(e) => {
                         self.fail_job(job_id, ctl, &format!("defrag-meta merge failed: {e}"))

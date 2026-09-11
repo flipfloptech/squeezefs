@@ -999,6 +999,22 @@ pub fn checkpoint_tick_period_ms(flush_interval_ms: u64) -> u64 {
     }
 }
 
+/// The §4.6a merge sweep's per-cycle WORK BUDGET, ms (design §4.6a (e),
+/// finalized): one checkpoint tick period — the SAME law finding 49 gave
+/// the threshold drain ("every threshold drain is BOUNDED by one cadence
+/// period; at least one item per pass, leftovers re-arm"). The sweep's
+/// projection walk is O(resident nodes) per lap (≈ 2,048 × the bench's
+/// ns/leaf on the shipped 512 MiB / 256 KiB geometry), and it runs on the
+/// checkpoint task INSIDE the cycle a full-cache volume's ring reclamation
+/// depends on — so a cycle may spend at most one tick on it, the lap
+/// resumes from its cursor next cycle, and the cadence runs every ≤
+/// period + one item's service time exactly as the drain's law states.
+/// Never a constant of its own: tie-tested against
+/// [`checkpoint_tick_period_ms`] (`tests/kv_leaf_merge_tests.rs`).
+pub fn merge_sweep_budget_ms(flush_interval_ms: u64) -> u64 {
+    checkpoint_tick_period_ms(flush_interval_ms)
+}
+
 /// **The writer's checkpoint LANDING ceiling for a commit, ms** — the
 /// reader ack ladder's qualify term (spec §6.8 item 3; ladder
 /// re-derivation item 1, `.benchmarks/2026-09-06-free-grace-ladder-rederivation.md`).
@@ -1560,48 +1576,6 @@ impl KvMetaBackend {
             self.leave_heap_full("a flush pass deferred nothing and the growth floor is clear");
         }
 
-        // ---- §4.6a (e) the heap-full sweep: while the volume is full (or
-        // a previous sweep left candidates it could not admit for space),
-        // merge underfull adjacent leaves — net −1 extent per merge,
-        // admitted at the compaction floor, both retirements parked
-        // forced like the flush pass's own compactions. Runs HERE, before
-        // the bitmap write and barrier, so this cycle's barrier covers the
-        // merges' successor images and entries and the freed extents can
-        // release as soon as a later tail passes them (the recovery WAVE:
-        // sweep → cycle → cycle → extents return → sweep). Zero cost in
-        // steady state: the posture gates it.
-        if self.heap_full() || self.merge_backlog.load(Ordering::Acquire) {
-            let mut candidates = 0u64;
-            let mut backlog = false;
-            let mut merged = 0u64;
-            for tree in self.all_trees() {
-                match tree.merge_underfull(smo, true).await {
-                    Ok(sweep) => {
-                        candidates += sweep.candidates;
-                        merged += sweep.outcome.merges + sweep.outcome.root_collapses;
-                        backlog |= sweep.space_refused;
-                    }
-                    // The ring reserve is this cycle's to refill: retry
-                    // next cycle, exactly like a deferred flush.
-                    Err(KvError::JournalReserveExhausted { .. }) => backlog = true,
-                    Err(e) => return Err(e),
-                }
-            }
-            self.merge_sweeps.fetch_add(1, Ordering::Relaxed);
-            self.merge_candidates.store(candidates, Ordering::Relaxed);
-            self.merge_backlog.store(backlog, Ordering::Release);
-            if merged > 0 || backlog {
-                log::debug!(
-                    "checkpoint: merge sweep on {:?} — {candidates} underfull leaves, {merged} \
-                     merges/collapses, backlog={backlog} (free={} promised={} pending-free={})",
-                    self.device_path(),
-                    self.allocator().free_extents(),
-                    self.heap_promised(),
-                    self.allocator().pending_count()
-                );
-            }
-        }
-
         // ---- Dirty bitmap pages, stamped with this checkpoint's seq
         // (§4.7: the generation the ledger record names).
         let ckpt_seq = self.checkpoint_seq.load(Ordering::Acquire) + 1;
@@ -1779,6 +1753,63 @@ impl KvMetaBackend {
                     self.fail_stop_loud(&msg);
                     return Err(KvError::Corrupt(msg));
                 }
+            }
+        }
+
+        // ---- §4.6a (e) the heap-full sweep: while the volume is full (or
+        // a previous sweep left a backlog — candidates it could not admit
+        // for space, or a lap the budget cut), merge underfull adjacent
+        // nodes — net −1 extent per merge, admitted at the compaction
+        // floor, both retirements parked forced like the flush pass's own
+        // compactions. Runs at the END of the cycle, after the durable
+        // tail advanced: the lap's count phase then reads the SAME tail a
+        // census taken after the cycle reads, which is what makes
+        // `meta_kv_merge_candidates` exact (a tail advance only elides
+        // more tombstones — it can only ADD candidates, so a count taken
+        // before the advance under-reads). The wave cadence is unchanged
+        // by the placement: a merge's flips sit above this cycle's `H`
+        // either way, so its extents return at the NEXT cycle's barrier.
+        // BOUNDED to one tick period per cycle (`merge_sweep_budget_ms` —
+        // finding 49's drain law) and cursor-resumed, so a full-cache
+        // volume's lap completes across cycles without stalling the
+        // cadence its ring reclamation rides. Zero cost in steady state:
+        // the posture gates it.
+        if self.heap_full() || self.merge_backlog.load(Ordering::Acquire) {
+            let deadline = std::time::Instant::now()
+                + std::time::Duration::from_millis(self.merge_sweep_budget_ms);
+            match self.run_merge_sweep(smo, true, Some(deadline)).await {
+                Ok(report) => {
+                    // The backlog stands while the recovery is not at its
+                    // fixed point: a lap the floor cut, a lap the budget or
+                    // the ring reserve cut (`refusal` ⇒ `!lap_complete`, the
+                    // cursor parked at the refused node), or a lap that
+                    // MERGED — its successors and the parents it shrank can
+                    // pair again, and the posture alone would let the
+                    // recovery stall the moment its first returned extents
+                    // clear the growth floor. A completed lap with no merge
+                    // and no refusal is the fixed point: the sweep stops.
+                    let backlog = report.space_refused
+                        || !report.lap_complete
+                        || report.merges + report.root_collapses > 0;
+                    self.merge_backlog.store(backlog, Ordering::Release);
+                    if report.merges + report.root_collapses > 0 || backlog {
+                        log::debug!(
+                            "checkpoint: merge sweep on {:?} — {} merges ({} interior), {} \
+                             collapses, lap_complete={}, candidates={}, backlog={backlog} \
+                             (free={} promised={} pending-free={})",
+                            self.device_path(),
+                            report.merges,
+                            report.interior_merges,
+                            report.root_collapses,
+                            report.lap_complete,
+                            report.candidates,
+                            self.allocator().free_extents(),
+                            self.heap_promised(),
+                            self.allocator().pending_count()
+                        );
+                    }
+                }
+                Err(e) => return Err(e),
             }
         }
         Ok(())

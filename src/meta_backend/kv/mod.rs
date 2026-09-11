@@ -183,6 +183,13 @@ pub static META_KV_NODE_COMPACTIONS: AtomicU64 = AtomicU64::new(0);
 /// fill-only one. Surfaced as `meta_kv_node_merges`.
 pub static META_KV_NODE_MERGES: AtomicU64 = AtomicU64::new(0);
 
+/// The level-≥ 1 subset of [`META_KV_NODE_MERGES`] (design §4.6a (c),
+/// interior recursion): two adjacent underfull INTERIOR nodes folded into
+/// one — the face that proves cross-parent shrinkage (underfull leaves
+/// under different parents merge only after their parents did). Surfaced
+/// as `meta_kv_interior_merges`.
+pub static META_KV_INTERIOR_MERGES: AtomicU64 = AtomicU64::new(0);
+
 /// Root collapses (design §4.6a (c)): a root left with exactly one live
 /// child made that child the root — the ONLY way the tree's height
 /// decreases. A root-swap SMO (no pointer record; dying floor at the

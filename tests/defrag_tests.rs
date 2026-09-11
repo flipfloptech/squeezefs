@@ -1173,14 +1173,16 @@ async fn test_defrag_meta_job_merges_underfull_leaves() {
         fx.meta.volumes[0].merge_laps() >= 1,
         "the defrag-meta merge pass completes ≥ 1 sweep lap"
     );
+    // The gauge the job's last lap published, read BEFORE the report's
+    // census (which would restamp it): on this quiescent volume (cadence
+    // parked, job done) the two are one number.
+    let gauge_after_job = fx.meta.volumes[0].merge_candidates();
+    squeezefs::defrag::measure(&fx.meta, &fx.fs.router)
+        .await
+        .expect("measure");
     assert_eq!(
         METRICS.frag_d4_mergeable_leaves.load(Ordering::Relaxed),
-        {
-            squeezefs::defrag::measure(&fx.meta, &fx.fs.router)
-                .await
-                .expect("measure");
-            fx.meta.volumes[0].merge_candidates()
-        },
+        gauge_after_job,
         "frag_d4_mergeable_leaves ≡ meta_kv_merge_candidates on a quiescent volume"
     );
     fx.close().await;

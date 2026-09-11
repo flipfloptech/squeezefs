@@ -293,19 +293,33 @@ async fn merge_to_fixpoint_counted(tree: &KvTree, vol: &mut Vol) -> (Maintenance
     for pass in 1..=64u32 {
         tree.flush_dirty(&mut vol.ctx).await.expect("flush");
         vol.cover_everything();
-        let sweep = tree
-            .merge_underfull(&mut vol.ctx, false, None)
-            .await
-            .expect("merge sweep");
-        assert!(sweep.lap_complete, "an unbounded sweep completes its lap");
-        total.merges += sweep.outcome.merges;
-        total.root_collapses += sweep.outcome.root_collapses;
-        total.interior_merges += sweep.outcome.interior_merges;
+        // One whole lap; the FIFO valve (thousands of retirements in one
+        // lap) is answered the way the D4 arm answers it — cover (the K5
+        // stand-in for a checkpoint cycle) and resume from the parked
+        // cursor — so a refusal never splits the pass count.
+        let mut pass_out = MaintenanceOutcome::default();
+        let sweep = loop {
+            match tree.merge_underfull(&mut vol.ctx, false, None).await {
+                Ok(s) => {
+                    pass_out.merges += s.outcome.merges;
+                    pass_out.root_collapses += s.outcome.root_collapses;
+                    pass_out.interior_merges += s.outcome.interior_merges;
+                    if s.lap_complete {
+                        break s;
+                    }
+                }
+                Err(KvError::PendingFreeFull { .. }) => vol.cover_everything(),
+                Err(e) => panic!("merge sweep: {e:?}"),
+            }
+        };
+        total.merges += pass_out.merges;
+        total.root_collapses += pass_out.root_collapses;
+        total.interior_merges += pass_out.interior_merges;
         assert!(
             !sweep.space_refused,
             "a roomy heap never refuses a merge for space"
         );
-        if sweep.outcome.merges + sweep.outcome.root_collapses == 0 {
+        if pass_out.merges + pass_out.root_collapses == 0 {
             return (total, pass);
         }
     }
@@ -1490,18 +1504,22 @@ async fn cross_parent_underfull_leaves_shrink_through_interior_merges_to_a_fixed
     // split half; two survivors (12.3 KB) sit under the ¼C = 15.3 KB
     // candidate bound, three do not pair with three (37 KB + 37 KB > ¾C).
     const VAL: usize = 6 * 1024;
-    let mut vol = Vol::new(64 * 1024, 4096, 0);
+    let mut vol = Vol::new(64 * 1024, 8192, 0);
     let tree = vol.tree(TREE_INODES).await;
     let interior_merges0 =
         squeezefs::meta_backend::kv::META_KV_INTERIOR_MERGES.load(Ordering::Relaxed);
 
-    // Grow until the root is level 2 with at least four level-1 interiors.
+    // Grow until the root is level 2 with at least four level-1 interiors
+    // (~3,000 leaves): the K5 stand-in for the checkpoint releases the
+    // splits' retirements as it goes, or the heap would fill with parked
+    // predecessors long before the shape forms.
     let mut n = 0u64;
     loop {
         tree.insert(&ikey(n), val(n, VAL)).await.expect("insert");
         n += 1;
         if n.is_multiple_of(8) {
             drain(&tree, &mut vol.ctx).await;
+            vol.cover_everything();
         }
         if tree.root_level().await.expect("level") == 2 {
             let root = vol.cache.get(tree.root().addr).await.expect("root");
@@ -1701,83 +1719,150 @@ fn merge_sweep_budget_derives_from_the_checkpoint_tick_period() {
 }
 
 /// (11) `meta_kv_merge_candidates` is EXACT: after a sweep that the
-/// compaction floor cut mid-wave, the gauge equals a census taken at
-/// that instant (RED before: the sweep counted only the leaves it saw
-/// before the refusal); at quiescence it equals the D4 report's
-/// `mergeable_leaves`. Also pins the wave bound: the sweeps a heap-full
-/// recovery takes are bounded by the height term plus a geometric wave
-/// term — each wave's merges fund the next.
+/// compaction floor cut mid-wave, the gauge equals a census taken under
+/// the tail it was counted with (RED on the landed sweep: it counted only
+/// the leaves it saw before the refusal — its own trace read 'merge sweep
+/// … 1 underfull leaves … backlog=true' against a ~300-leaf tree); at
+/// quiescence it equals the D4 report's `mergeable_leaves`. The audit
+/// reads the gauge, a census under the gauge's tail and a census under the
+/// current tail atomically under the SMO mutex: `gauge ==
+/// census_at_gauge_tail` is the law (no user commit touched the tree since
+/// the lap), `census_now ≥ census_at_gauge_tail` its monotone corollary (a
+/// later tail only elides more tombstones). Also pins the wave bound: the
+/// sweeps a heap-full recovery takes are bounded by the height term plus a
+/// geometric wave term — each wave's merges fund the next.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn merge_candidates_gauge_is_exact_mid_wave_and_at_quiescence() {
+    // Park the cadence and drive every cycle by hand: the fill and the
+    // deletes cycle for ring room themselves, so the only sweeps are the
+    // ones this test's cycles run.
     struct Cleanup;
     impl Drop for Cleanup {
         fn drop(&mut self) {
             std::env::remove_var("SQUEEZEFS_META_FLUSH_INTERVAL_MS");
         }
     }
-    // Park the cadence: every sweep below is one this test drives, so
-    // "the census at the same instant" is exactly the census after the
-    // cycle returns.
     std::env::set_var("SQUEEZEFS_META_FLUSH_INTERVAL_MS", "60000");
     let _cleanup = Cleanup;
 
     let (be, _file) = fresh_volume().await;
-    let (landed, refusal) = tokio::time::timeout(FILL_BOUND, fill_until_refused(&be, 0))
-        .await
-        .expect("the fill reaches ENOSPC");
-    assert_eq!(refusal.to_errno(), libc::ENOSPC);
+    let mut landed = 0u32;
+    let refusal = loop {
+        match put_file(&be, landed).await {
+            Ok(()) => landed += 1,
+            Err(e) => break e,
+        }
+        if landed % 16 == 0 {
+            be.checkpoint_now().await.expect("fill cycle");
+        }
+        assert!(landed < 100_000, "harness bug: the fill never refused");
+    };
+    assert_eq!(refusal.to_errno(), libc::ENOSPC, "got {refusal:?}");
+    be.checkpoint_now().await.expect("post-fill cycle");
+
+    // Throttle the wave: a foreign claimant holds every claimable extent
+    // but ONE above the compaction floor, so a sweep admits at most one
+    // merge (plus what its own returns fund) before the floor refuses it
+    // — the deletes' compactions still land, one promise at a time.
+    let alloc = Arc::clone(be.allocator());
+    let floor = compaction_floor_extents(alloc.reserve_extents());
+    let mut held: Vec<u64> = Vec::new();
+    while alloc.free_extents() > floor + 1 {
+        held.push(alloc.claim_internal().expect("drain claim"));
+    }
     for i in 0..landed {
         if i % 10 != 0 {
             delete_file(&be, i).await;
         }
+        if i % 32 == 31 {
+            be.checkpoint_now().await.expect("delete cycle");
+        }
     }
-    // Two cycles: the deletes' tombstones fall under the durable tail, the
-    // heap-full sweep runs and is cut at the compaction floor mid-wave.
-    be.checkpoint_now().await.expect("cycle 1");
-    be.checkpoint_now().await.expect("cycle 2");
+    // The volume is full again by construction (the claimant re-takes the
+    // room the deletes' few merges returned): creates land in whatever
+    // in-place room remains, then a split is refused, the heap-full
+    // posture latches, and the next cycle runs the sweep — cut at the
+    // floor with hundreds of underfull leaves standing: mid-wave.
+    while alloc.free_extents() > floor + 1 {
+        held.push(alloc.claim_internal().expect("re-drain claim"));
+    }
+    let (probes, refusal) = fill_until_refused(&be, 700_000).await;
+    assert_eq!(refusal.to_errno(), libc::ENOSPC, "got {refusal:?}");
+    assert!(
+        probes < 16,
+        "a drained heap refuses within the in-place room ({probes})"
+    );
+    assert!(be.heap_full(), "the refused create latches the posture");
     let laps0 = be.merge_laps();
-    assert!(laps0 >= 1, "the heap-full posture ran a sweep lap");
-    let gauge_mid_wave = be.merge_candidates();
-    let census = be.dead_bset_census();
+    be.checkpoint_now().await.expect("the mid-wave cycle");
+    assert!(
+        be.merge_laps() > laps0,
+        "the heap-full posture ran a sweep lap"
+    );
+    let a = be.merge_candidates_audit().await;
     assert_eq!(
-        gauge_mid_wave,
-        census.merge_candidates.len() as u64,
-        "mid-wave the gauge must be the complete count (gauge {gauge_mid_wave}, census {}) \
-         — a sweep cut at the floor still counts every underfull leaf",
-        census.merge_candidates.len()
+        a.gauge, a.census_at_gauge_tail,
+        "mid-wave the gauge must be the complete count under its tail (gauge {}, census \
+         {}) — a sweep cut at the floor still counts every underfull leaf",
+        a.gauge, a.census_at_gauge_tail
     );
     assert!(
-        gauge_mid_wave > 8,
-        "a 90 %-deleted volume mid-wave has many underfull leaves ({gauge_mid_wave})"
+        a.census_now >= a.census_at_gauge_tail,
+        "a later tail can only add candidates ({} → {})",
+        a.census_at_gauge_tail,
+        a.census_now
     );
+    assert!(
+        a.gauge > 8,
+        "a 90 %-deleted volume mid-wave has many underfull leaves ({})",
+        a.gauge
+    );
+    let candidates0 = a.gauge;
     let height0 = be.trees()[2].root_level().await.expect("xattr root level");
+
+    // Release the claimant: the recovery wave runs to quiescence; the gauge
+    // from the LAST lap must equal the census under its tail, and the D4
+    // report's census — the same predicate — must equal ITS own publish.
+    for ext in held {
+        alloc.release_unpublished(ext);
+    }
     let room0 = be
         .free_extents()
-        .saturating_sub(compaction_floor_extents(be.allocator().reserve_extents()))
+        .saturating_sub(compaction_floor_extents(alloc.reserve_extents()))
         .max(1);
-
-    // To quiescence; the gauge from the LAST sweep must equal the report.
     let sweeps0 = be.merge_sweeps();
     cycle_until_quiescent(&be, 6, 400).await;
-    let gauge_quiescent = be.merge_candidates();
+    let a = be.merge_candidates_audit().await;
+    assert_eq!(
+        a.gauge, a.census_at_gauge_tail,
+        "at quiescence the last lap's gauge is the census under its tail"
+    );
     let routed = Arc::new(RoutedMetaBackend::new(vec![be.clone()]));
     let rows = squeezefs::defrag::measure_d4(&routed)
         .await
         .expect("measure_d4");
     assert_eq!(
-        gauge_quiescent, rows[0].mergeable_leaves,
-        "at quiescence meta_kv_merge_candidates ≡ the D4 report's mergeable_leaves"
+        rows[0].mergeable_leaves,
+        be.merge_candidates(),
+        "the D4 report's mergeable_leaves IS meta_kv_merge_candidates (one predicate, one publish)"
+    );
+    let a = be.merge_candidates_audit().await;
+    assert_eq!(
+        (a.gauge, a.census_at_gauge_tail),
+        (rows[0].mergeable_leaves, rows[0].mergeable_leaves),
+        "the report's census re-counts exactly under the tail it was taken with"
     );
     // The wave bound: the recovery's sweeps ≤ the level term (3·h₀ + 1, the
     // K5 contract's) + two cycles per wave, waves ≤ ⌈log₂(candidates/room₀
-    // + 1)⌉ + 1 (each wave returns its merges' extents to fund the next).
-    let waves = ((gauge_mid_wave as f64 / room0 as f64 + 1.0).log2().ceil() as u64) + 1;
+    // + 1)⌉ + 1 (each wave returns its merges' extents to fund the next),
+    // + the terminal fixed-point lap and the quiescence probe's slack.
+    let waves = ((candidates0 as f64 / room0 as f64 + 1.0).log2().ceil() as u64) + 1;
     let bound = 3 * u64::from(height0) + 1 + 2 * waves + 2;
     let sweeps = be.merge_sweeps() - sweeps0;
     assert!(
         sweeps <= bound,
         "the recovery took {sweeps} sweeps, above the derived bound {bound} (h₀ {height0}, \
-         candidates {gauge_mid_wave}, room₀ {room0}, waves {waves})"
+         candidates {candidates0}, room₀ {room0}, waves {waves})"
     );
     be.shutdown().await.expect("shutdown");
 }

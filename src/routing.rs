@@ -22949,12 +22949,14 @@ impl DataRouter {
         //
         // Ordering rationale (the two crash windows, both safe):
         //
-        // * **release → crash → no destroy.** The inode is already
-        //   `nlink == 0` here (this runs from reclaim, after unlink
-        //   committed), and the derived oracle SKIPS `nlink == 0` inodes
-        //   by construction — so "no durable references for a corpse" is
-        //   exactly what the oracle says too. The blocks read free on both
-        //   sides; no drift, no corruption.
+        // * **release → crash → no destroy.** The corpse record and its
+        //   layout survive with their references gone (the derived oracle
+        //   COUNTS a corpse's layout since the 2026-08-23 census
+        //   correction, so this reads as C8 drift until the next mount's
+        //   sweep destroys the record). That retry re-reads the surviving
+        //   layout — and its frees MUST be gated on the release witness
+        //   below: the blocks are already free or already another owner's
+        //   (the generic/749 double release, 2026-09-11).
         // * **crash → no release.** The corpse's references survive, so
         //   recovery keeps its blocks ALLOCATED — conservative in the safe
         //   direction (a leak, never a double-owner mint). Existing

@@ -219,7 +219,7 @@ states:
 
 | Crash point | Durable state | Recovery |
 |---|---|---|
-| after the publish that dropped the reference | no record | block is FREE; on the free list if below the cursor, in the virgin tail otherwise. Reallocatable. `begin_free` of it is REFUSED (the double-release tripwire), so no double free |
+| after the publish that dropped the reference | no record | block is FREE; on the free list if below the cursor, in the virgin tail otherwise. Reallocatable. `begin_free` of it is REFUSED (the double-release tripwire) **while it stays untracked** — once a new owner re-mints the offset the tripwire cannot tell a stale release from the owner's own, which is why the reclaim path gates its frees on the release WITNESS (below) rather than on the refusal |
 | before it (the reclaimer's `finish_free` lost) | record present | block stays ALLOCATED — conservative, so the offset can never be minted to a second owner |
 
 What a crash *does* lose is the queued `BLKDISCARD`/`PUNCH_HOLE`. That is
@@ -231,19 +231,42 @@ debt tracker only the incremental record of it.
 *before* freeing its blocks, in its own transaction. Both crash windows are
 safe:
 
-* *release → crash → no destroy*: the inode is already `nlink == 0`
-  (reclaim runs after unlink committed), and the derived oracle **skips
-  `nlink == 0`** — so "no references for a corpse" is what the oracle says
-  too. No drift.
+* *release → crash → no destroy*: the corpse record and its layout survive
+  with their references GONE. Since the corpse-census correction
+  (2026-08-23) the derived oracle **counts** a corpse's layout, so this
+  state reads as C8 drift (`N derived vs 0 durable`) until the next
+  mount's sweep destroys the record — and that retry is where the
+  original reasoning here ("the oracle skips `nlink == 0`, so no drift")
+  was falsified in the field (fstests `generic/749`, 2026-09-11): the
+  retry's `delete_file` re-read the surviving layout and `begin_free`d its
+  blocks a SECOND time, with no record behind the release, and the
+  decrement landed on whichever LIVE owner had re-minted the offset since
+  (the pack block every promotion lands in) — a terminal free under a live
+  layout. **The rule that closes it: a release may decrement the RAM
+  refcount only if THIS owner's durable record existed at release time.**
+  `commit_block_refs_witnessed` probes each release under the ino's 4a
+  guard and reports the records that existed; `delete_file` frees only the
+  blocks that witness (plus its RAM-only pending takes) and counts the
+  rest as `block_release_skipped_no_record`. The window is therefore a
+  LEAK-FREE no-op on retry: the records are destroyed, the blocks — already
+  free or already someone else's — are untouched.
 * *crash → no release*: the corpse's references survive and its blocks
   recover ALLOCATED — a leak, never a double-owner mint. fsck C2 ("allocated
   with zero referencers", whose referencer walk also skips corpses) and the
-  C8 ledger name it.
+  C8 ledger name it, and the next mount's sweep reclaims it (the corpse's
+  references exist, so its releases witness and its blocks free).
 
 A separate transaction is correct here: unlink/reclaim is not the publish
 path (the no-second-commit rule is about the block publish), and
 `destroy_inodes` is a batched multi-ino commit that does not — and should
-not — decode layouts to learn block keys.
+not — decode layouts to learn block keys. What the batching MUST respect is
+the journal's whole-entry cap: the mount-time corpse sweep partitions its
+population with `RoutedMetaBackend::plan_destroy_chunks` (every corpse
+priced by its home volume's `destroy_entry_bytes` in the admission's own
+record framing) and runs release + free, then destroy, PER CHUNK — the
+1.2.3 release chain's sweep issued ONE destroy for 68,099 corpses, a 6 MB
+entry refused at every mount, which is how the released-but-undestroyed
+population above was minted by the thousand.
 
 ### 6.1 Stamping a non-empty volume: never trust an empty ledger
 

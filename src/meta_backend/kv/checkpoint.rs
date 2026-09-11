@@ -1560,6 +1560,48 @@ impl KvMetaBackend {
             self.leave_heap_full("a flush pass deferred nothing and the growth floor is clear");
         }
 
+        // ---- §4.6a (e) the heap-full sweep: while the volume is full (or
+        // a previous sweep left candidates it could not admit for space),
+        // merge underfull adjacent leaves — net −1 extent per merge,
+        // admitted at the compaction floor, both retirements parked
+        // forced like the flush pass's own compactions. Runs HERE, before
+        // the bitmap write and barrier, so this cycle's barrier covers the
+        // merges' successor images and entries and the freed extents can
+        // release as soon as a later tail passes them (the recovery WAVE:
+        // sweep → cycle → cycle → extents return → sweep). Zero cost in
+        // steady state: the posture gates it.
+        if self.heap_full() || self.merge_backlog.load(Ordering::Acquire) {
+            let mut candidates = 0u64;
+            let mut backlog = false;
+            let mut merged = 0u64;
+            for tree in self.all_trees() {
+                match tree.merge_underfull(smo, true).await {
+                    Ok(sweep) => {
+                        candidates += sweep.candidates;
+                        merged += sweep.outcome.merges + sweep.outcome.root_collapses;
+                        backlog |= sweep.space_refused;
+                    }
+                    // The ring reserve is this cycle's to refill: retry
+                    // next cycle, exactly like a deferred flush.
+                    Err(KvError::JournalReserveExhausted { .. }) => backlog = true,
+                    Err(e) => return Err(e),
+                }
+            }
+            self.merge_sweeps.fetch_add(1, Ordering::Relaxed);
+            self.merge_candidates.store(candidates, Ordering::Relaxed);
+            self.merge_backlog.store(backlog, Ordering::Release);
+            if merged > 0 || backlog {
+                log::debug!(
+                    "checkpoint: merge sweep on {:?} — {candidates} underfull leaves, {merged} \
+                     merges/collapses, backlog={backlog} (free={} promised={} pending-free={})",
+                    self.device_path(),
+                    self.allocator().free_extents(),
+                    self.heap_promised(),
+                    self.allocator().pending_count()
+                );
+            }
+        }
+
         // ---- Dirty bitmap pages, stamped with this checkpoint's seq
         // (§4.7: the generation the ledger record names).
         let ckpt_seq = self.checkpoint_seq.load(Ordering::Acquire) + 1;

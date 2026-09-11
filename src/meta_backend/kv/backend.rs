@@ -1110,6 +1110,16 @@ pub struct KvMetaBackend {
     /// `meta_kv_heap_full_cycles`: checkpoint cycles whose flush pass
     /// deferred ≥ 1 node because the allocator answered `NoSpace`.
     pub(super) heap_full_cycles: AtomicU64,
+    /// §4.6a (e): `meta_kv_merge_sweeps` — heap-full / backlog merge
+    /// sweeps the checkpoint cycle ran.
+    pub(super) merge_sweeps: AtomicU64,
+    /// §4.6a (h): `meta_kv_merge_candidates` — underfull leaves the last
+    /// sweep or census found (LIVE).
+    pub(super) merge_candidates: AtomicU64,
+    /// §4.6a (d): a sweep was refused a merge at the compaction floor —
+    /// the recovery wave is not done; the next cycle sweeps again even
+    /// once the heap-full posture clears.
+    pub(super) merge_backlog: AtomicBool,
     /// Guard-event trace of this backend's `open` (test/ops surface): the
     /// pinned order `flock_acquired` → `claim_committed` →
     /// `claim_barriered` → `checkpoint_task_spawned`.
@@ -2323,6 +2333,9 @@ impl KvMetaBackend {
             heap_full: AtomicBool::new(false),
             enospc_refusals: AtomicU64::new(0),
             heap_full_cycles: AtomicU64::new(0),
+            merge_sweeps: AtomicU64::new(0),
+            merge_candidates: AtomicU64::new(0),
+            merge_backlog: AtomicBool::new(false),
             guard_trace: std::sync::Mutex::new(Vec::new()),
         };
 
@@ -2864,6 +2877,18 @@ impl KvMetaBackend {
     /// pending SMOs ([`NodeCache::heap_promised`]) — 0 at quiesce.
     pub fn heap_promised(&self) -> u64 {
         self.cache.heap_promised()
+    }
+
+    /// `meta_kv_merge_sweeps` (§4.6a (e)): heap-full / backlog merge
+    /// sweeps the checkpoint cycle ran on this volume.
+    pub fn merge_sweeps(&self) -> u64 {
+        self.merge_sweeps.load(Ordering::Relaxed)
+    }
+
+    /// `meta_kv_merge_candidates` (§4.6a (h), LIVE): underfull leaves the
+    /// last sweep or census found on this volume.
+    pub fn merge_candidates(&self) -> u64 {
+        self.merge_candidates.load(Ordering::Relaxed)
     }
 
     /// The volume path.

@@ -1,3 +1,174 @@
+# SqueezeFS 1.2.3
+
+_Release date: 2026-09-11 (tag `stable-2026.09.3`)_
+
+1.2.3 is a point release on the 1.2 train with one headline and three
+data-loss fixes. The headline is **small-file packing**: files between one
+page and half a block no longer cost a whole 4 MiB block each when they
+leave the local staging ring — they share one block, so a 20,000-file tree
+that used to occupy 80 GiB on the shared store occupies 592 MiB, and every
+client reads those files byte-exact through the ordinary striped path. The
+three fixes are to paths that shipped in 1.2.2 and could lose acked bytes:
+a promoted small file whose block a remount could hand to another file, a
+kernel-split write segment discarded by an unguarded read-modify-write, and
+a mount-time sweep that freed live blocks. Nothing on disk changes; the
+cluster wire does (publish schema 17, cluster wire 4).
+
+## 1.2.3 — what changed
+
+**Upgrading from 1.2.2.** No on-disk format change — the superblock and its
+incompat bits are untouched; packed files ride the size-carrying `bk:off:len`
+mapping every 1.2 binary already decodes, so a volume packed by 1.2.3 reads
+byte-exact under 1.2.2 (and under `SQUEEZEFS_SMALL_FILE_PACKING=0`). The
+**cluster wire changed**: the publish plane's schema went 16 → 17 (the
+`pack_group` frame flag and its two owner refusals) and `CLUSTER_WIRE_SCHEMA`
+3 → 4 (the membership grant advertises `pack_group_available`); the shim's
+`IPC_ABI` stays 6. The same-commit fleet rule (KD-7) governs: **the daemon,
+the shim, and every authority, co-writer and reader of one volume set
+upgrade together.** A plain single-writer mount arms none of these planes.
+The wire change is why this release's gate includes the fuzz campaign.
+
+**Small-file packing (the headline).** Design
+[docs/design-small-file-packing.md](docs/design-small-file-packing.md)
+(five review rounds); acceptance
+[.benchmarks/2026-09-10-packing-rows-squeeze-test.md](.benchmarks/2026-09-10-packing-rows-squeeze-test.md).
+A file between the inline ceiling (4 KiB) and 4 MiB lives in the local
+staging ring until pressure, a clean unmount, or (opt-in) `fsync` promotes it
+to the shared store. 1.2.2 promoted each such file into its own whole 4 MiB
+block — 64× the data for a 64 KiB file, and a 480 GiB set filled by 140,000
+small files in eight seconds. 1.2.3 promotes them into the volume's shared
+**open pack block**: one LBA-aligned slot per file, one DMA, one layout
+commit that publishes the `bk:off:len` mapping and the file's durable block
+reference in the same transaction. N tenants of a block are N references
+in the durable ledger; the block frees only when the last one goes — the
+arithmetic 1.2 already had, so **no new incompat bit**.
+
+- **On the acceptance box (A-B-B-A, same binary, lever as the arm):** 96,000
+  × 16 KiB create + fsync-on-close with promotion at fsync — files/s +0.5 %,
+  fsync −3.7 %, daemon CPU/file −2.2 %, device/user bytes 1.00× on both arms,
+  and **375 blocks instead of 96,000**; 20,000 small files promoted at unmount
+  — **148 blocks instead of 20,000** at the same 2 s unmount wall, all 20,000
+  byte-exact from a second mount point; oracle drift 0, fsck 0 findings,
+  tripwires 0 on every position. fstests' standing regression set passes
+  under both postures.
+- **Existing volumes recover their space with one command.** A volume the
+  1.2.2 dismount pass filled at one block per file is the compaction mover's
+  first customer: `squeezefs defrag --pack` re-packs the live tenants
+  (`--report-only` measures first — `frag_d1_pack_*`, `pack_reclaimable_bytes`)
+  — **20,000 → 147 blocks in 5.5 s** on the box, every file intact. Deletes
+  leave half-empty packs; the same mover compacts them (15 → 5 locally).
+- **Every tenant operation is defined and pinned:** passthrough truncate-shrink
+  is a pure mapping re-description (zero device writes); a transformed shrink
+  lands a new tenant; a clone of a promoted file shares the window; overwrite
+  goes back through the staging ring; `move_one` defers an open pack and seals
+  it when a drain targets its volume; co-writers pack per (owner, home meta
+  volume) as one atomically-enqueued conveyor group, falling back to
+  one-block-per-file where the authority cannot serve the group frame; fsck
+  gained class **C12** (tenant-range consistency, report-only) and the census
+  a pack-open ledger.
+- **`SQUEEZEFS_SMALL_FILE_PACKING`** defaults **on**; `0` is the A/B control
+  and the rollback — the one-block-per-file arm, byte-identical to 1.2.2.
+  `SQUEEZEFS_PACK_MAX_SLOT_BYTES` (derived: half the block) is the one law
+  with two faces: a stored image above it takes its own block, and a pack
+  whose live bytes fall at or below it is a compaction victim. Operator
+  rows: [docs/operations.md → Environment knobs](docs/operations.md#environment-knobs--the-complete-registry).
+- **The interposer is unaffected by construction:** the shim carries no
+  layout logic, and the direct-drive read prelude hands decorated mappings to
+  the handler path (the branch clones always took). A cold shim read of a
+  packed small file therefore skips the direct-drive fast path — the same
+  class 1.2.2's promoted files had.
+
+**Data-loss fixes on the 1.2.2 path.** Each landed red-first with its own
+contract; each is independent of packing (packing exposed two of them by
+making one shared block live at every mount).
+
+- **A promoted small file's block was not in the durable ledger** —
+  FIND-PK-2 (`bfcf1e57`): the staged-file promotion published its mapping
+  without its block reference (the 2026-08-02 ledger wiring named the site
+  and never wired it), so on a volume with any striped file the next mount
+  recovered every promoted block **free** and the next striped write
+  overwrote promoted files (200/200 drift, 8 of 200 files clobbered by four
+  writes in the repro). Since 1.2.2's dismount pass, that fired at every clean
+  unmount of a mount holding staged files. The reference now rides the
+  promotion's own commit. `.benchmarks/2026-09-09-promotion-durable-ref-hole.md`
+- **A kernel-split write segment was discarded by an unguarded
+  read-modify-write** (`d914b673`): a buffered file just over one block is
+  written back as five concurrent 1 MiB WRITEs; when one segment's
+  classification went stale across a sibling's staged→striped promotion, the
+  router's `write_striped` — the one striped publisher that ran without the
+  block guard — seeded from the device, never composed the open device-overlay
+  record another segment had left, and published a merge that made the
+  one-authority screen supersede that record's acked bytes: **1 MiB of zeros
+  after a successful fsync**, ≈ 1 % of such files. `write_striped` is deleted;
+  every caller re-dispatches through the single guarded striped path.
+  `.benchmarks/2026-09-10-overlay-vs-growth-merge-data-loss.md`
+- **The mount-time corpse sweep freed live blocks** (`86eff517`): the sweep
+  released each never-forgotten unlinked inode's references and blocks, then
+  destroyed all their records in ONE transaction; past the journal's entry cap
+  that destroy failed, the records survived with their references gone, and
+  the next mount's sweep decremented whichever **live** file now held each
+  stale offset — at zero the live block was punched under its layout (fstests
+  `generic/749` read a packed file as zeros; the 1.2.2 code has the same
+  double release wherever a re-minted block sat at a stale corpse's offset).
+  A release now decrements RAM only for a durable record it **witnessed**
+  existing, a failed release frees nothing, and the sweep's destroys are
+  chunked to the cap with release → free → destroy per chunk (68,099 corpses
+  drained in ~1 s on the failing volume). `.benchmarks/2026-09-11-corpse-sweep-double-release.md`
+- **Two smaller ledger holes beside packing:** a failed promotion save
+  re-noted its own reference (a durable record to an abandoned block —
+  `retract_block_ref_ops`, FIND-PK-4), and the staged read-modify-write and
+  inline write arms released a superseded copy's RAM reference without its
+  durable `−ref` (FIND-PK-5). Also fixed: promoted files placed on a
+  non-default data volume read as **zeros from every other client** (the
+  read arm used the default device — FIND-PK-0; one routed funnel now serves
+  every decorated mapping), and `defrag --report-only` on a large legacy
+  volume answered "reply too large" (FIND-PK-6; the report is bounded on the
+  admin lane like fsck's).
+
+**Dismount behaviour.** A clean unmount now promotes every resident
+staged-layout file to the shared store (`dismount_promoted_*`), so files a
+client wrote but never fsynced become visible to other clients at unmount
+instead of living only in that client's staging ring; the "unflushed staged
+files" NOTE 1.2.2 recorded is gone. `SQUEEZEFS_FSYNC_PROMOTE_STAGED` (default
+off) promotes at `fsync` instead — priced at −3.7 % per fsync under packing;
+an operator with a hard "fsync'd means visible everywhere" requirement turns
+it on. The inline ceiling is a derived one page (`SQUEEZEFS_INLINE_MAX_BYTES`
+raises it up to the format bound; the sweep that priced a raise out is
+`.benchmarks/2026-09-09-inline-raise-sweep-local.md`).
+
+**Known limitations — what this release does not claim.**
+
+- **Scale.** Unchanged from 1.2.2: one write mount per volume set, any
+  number of read-only and opt-in co-writer mounts; every scale claim carries
+  its evidence tier in [docs/rc-manifest.md](docs/rc-manifest.md#2-guarantee-table-by-evidence-tier-ruling-d1).
+- **A full metadata volume fail-stops** (`Metadata volume N is disabled`,
+  EIO) instead of answering ENOSPC — seen when the inline-raise sweep
+  exhausted a 1 GiB meta volume. Pre-existing, named, not fixed.
+- **Compaction is operator-driven.** `defrag --pack` runs on the job fabric
+  when invoked (throttled, pause/resume/cancel); no automatic trigger ships.
+- **A cold shim read of a packed small file** takes the handler path, not the
+  direct-drive fast path (a performance class, not a correctness one).
+- **The 1.2.2 limitations** on the co-writer venue's capacity, partial-block
+  fsync escalation, and the unnamed lost-wake loser stand.
+
+**Verification.** Every leg of the release gate ran on the tested tree
+`86eff517` — `task check` (377 suites, 4,926 tests), fstests `-g auto` (787
+ran, 783 clean, 4 expected-shape, 0 unexpected; `generic/650` excluded on
+the gate laptop as in 1.2.2), pjdfstests (8,798), LTP (174 syscall tests
+pass, 0 fail), require-mount, the zc-capability leg on the sqz kernel (187
+tests, empty skip ledger), **and the fuzz campaign** (12 targets, 401 M
+execs, 0 crashes). The chain ran three times: the first stopped in `task
+check` on a test whose premise was the pre-packing default, the second in
+fstests on `generic/749` — the corpse-sweep fix above — and the third is
+the release (its LTP leg was resumed once after the LTP source tree aged out
+of `/tmp`; the product under test was unchanged). Record:
+[.benchmarks/2026-09-11-1.2.3-release-gate.md](.benchmarks/2026-09-11-1.2.3-release-gate.md).
+
+The rest of this document is the 1.2.2, 1.2.1 and 1.2.0 record, which 1.2.3
+inherits.
+
+---
+
 # SqueezeFS 1.2.2
 
 _Release date: 2026-09-08 (tag `stable-2026.09.2`)_

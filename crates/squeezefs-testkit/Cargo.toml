@@ -1,7 +1,7 @@
 [package]
 name = "squeezefs-testkit"
 # Tracks the release train (docs/operations.md §Versioning & releases).
-version = "1.2.2"
+version = "1.2.3"
 edition = "2021"
 license-file = "../../LICENSE"
 publish = false

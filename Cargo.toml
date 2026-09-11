@@ -5,7 +5,7 @@ name = "squeezefs"
 # the fine-grained identity; stable-*/lts-* tags remain the release names.
 # The first-party crates (crates/fuse3, crates/squeezefs-{ipc,preload})
 # track the same train.
-version = "1.2.2"
+version = "1.2.3"
 edition = "2021"
 license-file = "LICENSE"
 # ENG-16: `cargo publish` is unrepresentable here — the crate depends on

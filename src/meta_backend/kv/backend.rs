@@ -1097,6 +1097,18 @@ pub struct KvMetaBackend {
     /// in-flight reservation) must present there, never as an unbounded
     /// retry loop. Persists across maintenance passes on purpose.
     pub(super) pending_free_stalled_cycles: AtomicU64,
+    /// §4.7 heap-full posture (`meta_kv_heap_full`): set when a growth
+    /// commit was refused for space or a flush pass deferred a node for
+    /// `NoSpace`; cleared by a cycle that deferred nothing with the growth
+    /// floor clear again. The SPACE standstill class — loud once per
+    /// transition, never terminal.
+    pub(super) heap_full: AtomicBool,
+    /// `meta_kv_enospc_refusals`: user commits refused `NoSpace` at heap
+    /// admission (each is one `ENOSPC` to userspace).
+    pub(super) enospc_refusals: AtomicU64,
+    /// `meta_kv_heap_full_cycles`: checkpoint cycles whose flush pass
+    /// deferred ≥ 1 node because the allocator answered `NoSpace`.
+    pub(super) heap_full_cycles: AtomicU64,
     /// Guard-event trace of this backend's `open` (test/ops surface): the
     /// pinned order `flock_acquired` → `claim_committed` →
     /// `claim_barriered` → `checkpoint_task_spawned`.
@@ -2307,6 +2319,9 @@ impl KvMetaBackend {
             pr_reacquires: AtomicU64::new(0),
             barrier_failures: AtomicU64::new(0),
             pending_free_stalled_cycles: AtomicU64::new(0),
+            heap_full: AtomicBool::new(false),
+            enospc_refusals: AtomicU64::new(0),
+            heap_full_cycles: AtomicU64::new(0),
             guard_trace: std::sync::Mutex::new(Vec::new()),
         };
 
@@ -2822,6 +2837,26 @@ impl KvMetaBackend {
     /// `meta_kv_pending_free` on the stats surface, design §10).
     pub fn pending_free_extents(&self) -> u64 {
         self.alloc.pending_count()
+    }
+
+    /// §4.7 heap-full posture word (`meta_kv_heap_full`, 0/1 per volume):
+    /// growth needing a new leaf is refused `ENOSPC` while set. Reads,
+    /// deletes and in-place appends keep committing; the volume is never
+    /// FAILED for it — the SPACE standstill class, not the wedge class.
+    pub fn heap_full(&self) -> bool {
+        self.heap_full.load(Ordering::Acquire)
+    }
+
+    /// `meta_kv_enospc_refusals`: user commits refused `NoSpace` at heap
+    /// admission on this volume.
+    pub fn enospc_refusals(&self) -> u64 {
+        self.enospc_refusals.load(Ordering::Relaxed)
+    }
+
+    /// `meta_kv_heap_full_cycles`: checkpoint cycles whose flush pass
+    /// deferred ≥ 1 node because the allocator answered `NoSpace`.
+    pub fn heap_full_cycles(&self) -> u64 {
+        self.heap_full_cycles.load(Ordering::Relaxed)
     }
 
     /// The volume path.
@@ -5457,7 +5492,10 @@ impl KvMetaBackend {
         &self.cache
     }
 
-    pub(super) fn allocator(&self) -> &Arc<ExtentAllocator> {
+    /// This volume's §4.7 extent allocator (the `journal_ring()` precedent:
+    /// the space-standstill contracts drain and refill the heap through it
+    /// as a foreign claimant).
+    pub fn allocator(&self) -> &Arc<ExtentAllocator> {
         &self.alloc
     }
 

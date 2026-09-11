@@ -539,8 +539,8 @@ mount (the A-arm rig reset the cluster; remount is part of every arm).
    and the SMO-vs-commit storm; gauges `meta_kv_node_merges`,
    `meta_kv_root_collapses`, `meta_kv_merge_candidates`,
    `meta_kv_merge_sweeps`, `frag_d4_mergeable_leaves`, `defrag_meta_merges`.
-   No knob, no incompat bit. Gate on `fac25656` = the landing gate. 1.2.4-
-   bound with items 2–4.
+   No knob, no incompat bit. **Gate on `fac25656` GREEN** (12:30–13:37, 380
+   suites / 4,956 tests, 18 stages, both audits). 1.2.4-bound with items 2–4.
 2. **Kernel A/B, B arm** — after `squeeze-test` boots the 6.19.14 series
    WITH 0031 (or whichever box carries the patched kernel): on the box,
    `cd /scratch/tmp/sqz-agent/k26 && sudo env ARM=B KERNEL_TAG=<uname -r

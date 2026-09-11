@@ -1050,6 +1050,113 @@ async fn test_defrag_meta_job_counts_kicks() {
     fx.close().await;
 }
 
+/// The D4 arm's MERGE face (design-cow-kv-metadata §4.6a (e), the third
+/// trigger): a volume whose xattr leaves are mostly deleted reports them
+/// as `mergeable_leaves` in the D4 report and on the
+/// `frag_d4_mergeable_leaves` gauge, and `JobType::DefragMeta` merges
+/// them (`defrag_meta_merges` counts) — the leaf population shrinks and
+/// the survivors read back.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_defrag_meta_job_merges_underfull_leaves() {
+    use squeezefs::meta_backend::Metadata as _;
+    let _serial = serial().await;
+    let dir = tempfile::tempdir().unwrap();
+    let meta = make_file(dir.path(), "meta", 256 * 1024 * 1024);
+    let oss1 = make_file(dir.path(), "oss1", 1 << 30);
+    format_meta(&meta, &[&oss1]).await;
+    let recs = base_format_config(&[&oss1]).resolved_data_volumes();
+    let fx = open_fixture(&meta, &recs).await;
+
+    // 48 × 48 KiB xattrs on ino 1 ⇒ ~4 per 256 KiB leaf ⇒ ~12 xattr
+    // leaves; keep every 12th (the survivors fit ONE ¾-fill leaf).
+    const N: usize = 48;
+    let payload = |k: usize| vec![(k as u8).wrapping_mul(7); 48 * 1024];
+    for k in 0..N {
+        fx.meta
+            .setxattr(1, &format!("user.big{k:02}"), &payload(k))
+            .await
+            .expect("setxattr");
+    }
+    fx.meta.volumes[0]
+        .checkpoint_now()
+        .await
+        .expect("checkpoint");
+    for k in 0..N {
+        if k % 12 != 0 {
+            fx.meta
+                .removexattr(1, &format!("user.big{k:02}"))
+                .await
+                .expect("removexattr");
+        }
+    }
+    // Two covering cycles: the tombstones fall below the durable tail so
+    // the merge folds elide them.
+    for _ in 0..2 {
+        fx.meta.volumes[0]
+            .checkpoint_now()
+            .await
+            .expect("covering cycle");
+    }
+
+    let before = fx.meta.volumes[0].dead_bset_census();
+    let report = squeezefs::defrag::measure(&fx.meta, &fx.fs.router)
+        .await
+        .expect("measure");
+    let row = report
+        .d4
+        .iter()
+        .find(|r| r.volume == meta.display().to_string())
+        .expect("the meta volume's D4 row");
+    assert!(
+        row.mergeable_leaves >= 2,
+        "a mostly-deleted xattr tree must report mergeable leaves ({} of {} leaves)",
+        row.mergeable_leaves,
+        row.leaves
+    );
+    assert_eq!(
+        METRICS.frag_d4_mergeable_leaves.load(Ordering::Relaxed),
+        row.mergeable_leaves,
+        "frag_d4_mergeable_leaves is published by measure()"
+    );
+
+    let merges_before = METRICS.defrag_meta_merges.load(Ordering::Relaxed);
+    let job_id = fx
+        .fabric
+        .submit(JobSpec {
+            job_type: JobType::DefragMeta,
+            throttle_pct: 100,
+        })
+        .await
+        .expect("submit defrag-meta");
+    let end = fx
+        .fabric
+        .wait_terminal(&job_id, std::time::Duration::from_secs(60))
+        .await
+        .expect("terminal");
+    assert_eq!(end, JobState::Completed);
+    assert!(
+        METRICS.defrag_meta_merges.load(Ordering::Relaxed) > merges_before,
+        "defrag_meta_merges must count the job's merges"
+    );
+    let after = fx.meta.volumes[0].dead_bset_census();
+    assert!(
+        after.leaves < before.leaves,
+        "the merges shrink the leaf population ({} → {})",
+        before.leaves,
+        after.leaves
+    );
+    for k in (0..N).step_by(12) {
+        let v = fx
+            .meta
+            .getxattr(1, &format!("user.big{k:02}"))
+            .await
+            .unwrap()
+            .expect("survivor xattr");
+        assert_eq!(v, payload(k), "survivor {k} reads back byte-exact");
+    }
+    fx.close().await;
+}
+
 // ---------------------------------------------------------------------------
 // Fabric discipline: throttle live-retunes; pause/cancel honored
 // ---------------------------------------------------------------------------

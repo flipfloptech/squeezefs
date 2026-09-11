@@ -1060,6 +1060,21 @@ async fn test_defrag_meta_job_counts_kicks() {
 async fn test_defrag_meta_job_merges_underfull_leaves() {
     use squeezefs::meta_backend::Metadata as _;
     let _serial = serial().await;
+    // Park the cadence: the flush-pass merge trigger (§4.6a (e), the
+    // first trigger) is live on every checkpoint cycle, so a background
+    // tick landing between the deletes and the census could merge the
+    // candidates this contract is about to count — the job arm is the
+    // trigger under test here; the cycles below are the ones this test
+    // drives, and they never merge these leaves (tombstone-heavy logs are
+    // the prefilter's designed miss).
+    struct Cleanup;
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            std::env::remove_var("SQUEEZEFS_META_FLUSH_INTERVAL_MS");
+        }
+    }
+    std::env::set_var("SQUEEZEFS_META_FLUSH_INTERVAL_MS", "60000");
+    let _cleanup = Cleanup;
     let dir = tempfile::tempdir().unwrap();
     let meta = make_file(dir.path(), "meta", 256 * 1024 * 1024);
     let oss1 = make_file(dir.path(), "oss1", 1 << 30);
@@ -1089,14 +1104,12 @@ async fn test_defrag_meta_job_merges_underfull_leaves() {
                 .expect("removexattr");
         }
     }
-    // Two covering cycles: the tombstones fall below the durable tail so
-    // the merge folds elide them.
-    for _ in 0..2 {
-        fx.meta.volumes[0]
-            .checkpoint_now()
-            .await
-            .expect("covering cycle");
-    }
+    // Deliberately NO checkpoint between the deletes and the census: a
+    // flush pass would compact the emptied leaves and its own merge
+    // trigger would take some of the candidates this contract counts.
+    // The tombstones are still in the window (seq ≥ tail) — the census
+    // counts their encoding, which is exactly why a leaf holding one
+    // 48 KiB value plus a handful of ~30 B tombstones is underfull.
 
     let before = fx.meta.volumes[0].dead_bset_census();
     let report = squeezefs::defrag::measure(&fx.meta, &fx.fs.router)

@@ -25,8 +25,11 @@
 //!   file resolves and its payload reads back; unlinks + destroys commit on
 //!   the full volume; after deletes and a checkpoint, new creates succeed
 //!   again (the record space the deletes freed inside the leaves is
-//!   reusable — the v1 tree never shrinks, so extents do not return, see
-//!   §4.7);
+//!   reusable at once; since §4.6a leaf merge (2026-09-11) the deletes'
+//!   EXTENTS return too, through the heap-full merge sweep — the
+//!   proportional-recovery contract is `tests/kv_leaf_merge_tests.rs`;
+//!   this suite pins only that creates resume and the refusal class stays
+//!   ENOSPC);
 //! - **(d) the ledger closes**: `pending_free` drains to 0 and the
 //!   checkpoint keeps advancing after the deletes;
 //! - **(e) a remount of the full volume mounts, reads and can delete.**
@@ -197,10 +200,27 @@ async fn full_metadata_volume_is_enospc_not_a_failstop() {
     }
     // The compaction that turns the deletes into leaf room rides the
     // checkpoint's flush pass; the next barrier releases the retirements.
-    for _ in 0..3 {
+    // Since §4.6a the heap-full posture also runs the merge sweep inside
+    // these cycles, and each merge WAVE parks two retirements per merge
+    // that release one to two barriered cycles later — so the ledger
+    // closes a few cycles further out than the pre-merge three. The
+    // contract keeps its teeth: a wedged tail never drains, a recovery
+    // wave drains within a bounded number of cycles.
+    let mut cycles = 0u32;
+    loop {
         be.checkpoint_now()
             .await
             .expect("checkpoint cycles run on a full volume");
+        cycles += 1;
+        if cycles >= 3 && be.pending_free_extents() == 0 {
+            break;
+        }
+        assert!(
+            cycles < 64,
+            "pending-free retirements must drain once the deletes' compactions and merges \
+             barriered ({} still parked after {cycles} cycles)",
+            be.pending_free_extents()
+        );
     }
 
     // ---- (d) the ledger closes: retirements drained, promises consumed.
@@ -221,8 +241,10 @@ async fn full_metadata_volume_is_enospc_not_a_failstop() {
     assert!(!be.is_failed());
 
     // ---- (c) new creates succeed again: the room the deletes freed in the
-    // rightmost leaves is reusable (extents do not return — the tree never
-    // shrinks — so the SECOND refusal is again ENOSPC, never a fail-stop).
+    // rightmost leaves is reusable, and the §4.6a merge sweep may have
+    // returned whole extents on top (a third of the files deleted from
+    // the rightmost leaves merges a few) — either way the refill reaches
+    // the SECOND refusal, again ENOSPC, never a fail-stop.
     let (relanded, second_refusal) =
         tokio::time::timeout(FILL_BOUND, fill_until_refused(&be, 500_000))
             .await

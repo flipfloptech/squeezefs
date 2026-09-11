@@ -8969,8 +8969,9 @@ pub enum IpcDirectIneligible {
     /// prelude can bound.
     Layout,
     /// Live RAM overlay / staged sibling / staged extent record on the
-    /// block, or an unstable fill incarnation — correctness owns
-    /// ambiguity.
+    /// block, an unstable fill incarnation, or a key naming a DEAD
+    /// lifetime (freed and reissued under the RAM layout — the handler's
+    /// funnel refuses it, §5.10) — correctness owns ambiguity.
     Overlay,
     /// PK8 (small-file packing, the packed-tenant arm): a size-carrying
     /// tenant mapping whose request window is NOT strictly inside the
@@ -14360,13 +14361,19 @@ impl SqueezefsFilesystem {
         } else {
             None
         };
-        // The §5.10 stale-incarnation disposition (packed arm): the funnel
-        // the handler runs (`read_block_range`) refuses a key naming a
-        // DEAD lifetime before its DMA; the direct DMA has no such gate,
-        // so refuse here — the handler then surfaces the finding-51
-        // contradiction as `EIO` + `invariant_tripwires`, never as the
-        // reissued offset's bytes.
-        if packed_file_id.is_some() && self.router.backend_router.block_key_lifetime_dead(&key) {
+        // The §5.10 stale-incarnation disposition, BOTH arms: the funnel
+        // the handler runs (`read_block_range` → `incarnation_ok`) refuses
+        // a key naming a DEAD lifetime before its DMA; the direct DMA has
+        // no such gate. The fill-word snapshot above cannot stand in for
+        // it: a key whose lifetime was retired and REISSUED before the
+        // plan (the offset freed and re-minted while the RAM layout still
+        // names the old `@inc` key — the stale-binding class the handler's
+        // rebind ladder exists for) reads a STABLE word that stays
+        // unchanged through the CQE, so the striped arm would revalidate
+        // and serve the reissued offset's bytes. One RAM lookup; the
+        // handler then owns the outcome (its refusal + rebind ladder —
+        // `EIO`, never the new owner's bytes).
+        if self.router.backend_router.block_key_lifetime_dead(&key) {
             return Err(I::Overlay);
         }
         // Parse-carry (r5): resolve the backend identity + device

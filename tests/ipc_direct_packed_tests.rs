@@ -35,12 +35,12 @@
 //!  7. The CQE revalidation refuses a tenant whose block's incarnation word
 //!     transitioned between plan and CQE (the re-mint model: retire →
 //!     publish under a new generation); the prelude refuses while unstable.
-//!  7b. The §5.10 stale-incarnation disposition on BOTH arms: a WHOLE-BLOCK
+//!  8. The §5.10 stale-incarnation disposition on BOTH arms: a WHOLE-BLOCK
 //!     key whose lifetime is already dead at plan time (offset freed and
 //!     reissued while the RAM layout still names the old `@inc` key) is
 //!     refused (`Overlay`) — its fill word is stable, so the seqlock alone
 //!     would pass and the DMA would return the reissued offset's bytes.
-//!  8. `ipc_direct_phase_ns` accounts every packed direct op (the `total`
+//!  9. `ipc_direct_phase_ns` accounts every packed direct op (the `total`
 //!     count delta ≡ ops) — on a DEFAULT mount through the governed-miss
 //!     ladder, where a re-read keeps direct-driving (the handler's staged
 //!     arm has no admission arm a GRANT could hand it to).
@@ -1361,7 +1361,7 @@ async fn the_cqe_revalidation_refuses_an_incarnation_transition_between_plan_and
 }
 
 // ---------------------------------------------------------------------------
-// 7b. the §5.10 stale-incarnation disposition on the WHOLE-BLOCK arm: a key
+// 8. the §5.10 stale-incarnation disposition on the WHOLE-BLOCK arm: a key
 //     whose lifetime is ALREADY dead at plan time (freed + reissued while
 //     the RAM layout still names the old `@inc` key — the stale-binding
 //     class the handler's rebind ladder exists for) has a STABLE fill word
@@ -1497,7 +1497,7 @@ async fn a_whole_block_key_naming_a_dead_lifetime_is_refused_never_served_reissu
 }
 
 // ---------------------------------------------------------------------------
-// 8. the default mount: the governed-miss ladder engages the arm, re-reads
+// 9. the default mount: the governed-miss ladder engages the arm, re-reads
 //    keep direct-driving, and `ipc_direct_phase_ns` accounts every op
 // ---------------------------------------------------------------------------
 

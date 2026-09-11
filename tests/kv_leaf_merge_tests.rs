@@ -1752,7 +1752,7 @@ async fn merge_candidates_gauge_is_exact_mid_wave_and_at_quiescence() {
             Ok(()) => landed += 1,
             Err(e) => break e,
         }
-        if landed % 16 == 0 {
+        if landed.is_multiple_of(16) {
             be.checkpoint_now().await.expect("fill cycle");
         }
         assert!(landed < 100_000, "harness bug: the fill never refused");

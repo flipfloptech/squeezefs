@@ -628,21 +628,23 @@ async fn height_three_tree_collapses_to_a_root_leaf_gap_free_with_readers_mid_wa
     let (leaves0, height0) = k2_walk(&tree, &vol.cache).await;
     assert_eq!(height0, 2);
 
-    // Concurrent latch-free readers over the survivors for the whole
-    // collapse: they may restart (a root swap lowers the height mid-walk)
-    // but never error and never see a wrong value.
+    // Concurrent latch-free readers over the five keys that survive BOTH
+    // phases, for the whole collapse: they may restart (a root swap
+    // lowers the height mid-walk) but never error and never see a wrong
+    // value.
     let survivors: Vec<u64> = (0..n).filter(|i| i % 50 == 0).collect();
+    let keep: Vec<u64> = survivors.iter().copied().take(5).collect();
     let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
     let mut readers = tokio::task::JoinSet::new();
     for r in 0..4u64 {
         let tree = tree.clone();
-        let survivors = survivors.clone();
+        let keep = keep.clone();
         let mut stop_rx = stop_rx.clone();
         readers.spawn(async move {
             let mut served = 0u64;
             let mut i = r as usize;
             while !*stop_rx.borrow_and_update() {
-                let k = survivors[i % survivors.len()];
+                let k = keep[i % keep.len()];
                 let got = tree
                     .lookup(&ikey(k))
                     .await
@@ -688,14 +690,14 @@ async fn height_three_tree_collapses_to_a_root_leaf_gap_free_with_readers_mid_wa
         );
     }
 
-    // Phase B: delete down to 5 survivors — the tree collapses to a root
-    // leaf (height 0).
-    let keep: Vec<u64> = survivors.iter().copied().take(5).collect();
+    // Phase B: delete down to the 5 kept keys — the tree collapses to a
+    // root leaf (height 0), the readers still running.
     for &k in &survivors {
         if !keep.contains(&k) {
             tree.delete(&ikey(k)).await.expect("delete");
         }
     }
+    let out_b = merge_to_fixpoint(&tree, &mut vol).await;
     stop_tx.send(true).expect("stop readers");
     let mut served = 0u64;
     while let Some(r) = readers.join_next().await {
@@ -705,7 +707,6 @@ async fn height_three_tree_collapses_to_a_root_leaf_gap_free_with_readers_mid_wa
         served > 0,
         "the readers must have served during the collapse"
     );
-    let out_b = merge_to_fixpoint(&tree, &mut vol).await;
     let (leaves_b, height_b) = k2_walk(&tree, &vol.cache).await;
     assert_eq!(
         (leaves_b, height_b),
@@ -874,14 +875,17 @@ async fn merge_vs_commit_storm_loses_nothing() {
                     .await
                     .expect("storm insert");
             }
-            // The create/unlink storm: delete 90 %, keep every 10th.
+            // The create/unlink storm: delete 90 %, keep every 10th, with
+            // latch-free reads interleaved (a kept key serves, a deleted
+            // one is gone — through every merge racing this writer).
             for i in 0..PER_WRITER {
                 if i % 10 != 0 {
                     tree.delete(&ikey(base + i)).await.expect("storm delete");
                 }
                 if i % 13 == 0 {
                     let got = tree.lookup(&ikey(base + i)).await.expect("storm lookup");
-                    assert_eq!(got.as_deref(), Some(&val(base + i, 48)[..]));
+                    let want = (i % 10 == 0).then(|| val(base + i, 48));
+                    assert_eq!(got.as_deref(), want.as_deref());
                 }
             }
         });
@@ -900,7 +904,9 @@ async fn merge_vs_commit_storm_loses_nothing() {
         .range(&ikey(0), &ikey(total), usize::MAX)
         .await
         .expect("full scan");
-    let kept: Vec<u64> = (0..total).filter(|i| i % PER_WRITER % 10 == 0).collect();
+    let kept: Vec<u64> = (0..total)
+        .filter(|i| (i % PER_WRITER).is_multiple_of(10))
+        .collect();
     assert_eq!(
         all.len(),
         kept.len(),

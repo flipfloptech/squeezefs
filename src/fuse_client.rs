@@ -13424,6 +13424,33 @@ impl SqueezefsFilesystem {
                     "meta_kv_heap_promised".into(),
                     per_volume(&|be| be.heap_promised()),
                 );
+                // LEAF-MERGE (design-cow-kv-metadata §4.6a (h)): the
+                // underfull-sibling SMO. `node_merges` = merges executed
+                // (the engagement gauge — moves on any delete-heavy
+                // workload, 0 on a fill-only one); `root_collapses` =
+                // height decrements (the ONLY way a tree shrinks);
+                // per volume: `merge_candidates` = underfull leaves the
+                // last sweep/census found (LIVE), `merge_sweeps` =
+                // heap-full/backlog sweeps run. `merge_candidates` high
+                // with `node_merges` flat and `heap_full` set ⇒ the
+                // compaction floor is refusing the sweep — read
+                // `free_extents`/`heap_promised` beside it.
+                metrics.insert(
+                    "meta_kv_node_merges".into(),
+                    load(&meta_kv::META_KV_NODE_MERGES),
+                );
+                metrics.insert(
+                    "meta_kv_root_collapses".into(),
+                    load(&meta_kv::META_KV_ROOT_COLLAPSES),
+                );
+                metrics.insert(
+                    "meta_kv_merge_candidates".into(),
+                    per_volume(&|be| be.merge_candidates()),
+                );
+                metrics.insert(
+                    "meta_kv_merge_sweeps".into(),
+                    per_volume(&|be| be.merge_sweeps()),
+                );
                 // PR M1 — the single-writer mount guard (design
                 // §9 Observability): per-volume guarantee class + the
                 // fence / PTPL-reacquire counters.

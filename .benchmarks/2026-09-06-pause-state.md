@@ -519,6 +519,28 @@ mount (the A-arm rig reset the cluster; remount is part of every arm).
    cleaner; (5) bench baseline compare + save; (6) scoreboard on 1.2.3; (7)
    the owner's box cleanup list (`/scratch/tmp/squeezefs-pk7`, `rigs/`,
    `campaign/`, `logs/`); leaf merge (the v1 tree) as a new item.
+1t. **KV LEAF MERGE LANDED (2026-09-11, `fac25656`; owner: "tackle 3, that
+   seems important").** Record `.benchmarks/2026-09-11-kv-leaf-merge.md`;
+   design §4.6a FIRST (design-cow-kv-metadata; the §4.6/§4.7 "never
+   shrinks" sentences struck). The tree can SHRINK: adjacent underfull
+   siblings merge into one successor at the split's ¾ fill read backwards
+   (`merge_pair_capacity`; candidate ≤ ¼ — hysteresis structural), the
+   three-step SMO over two frozen sources (successor written + barriered
+   before any lock; parent first then children ascending; reserve inside
+   the window; entry `[Put(R.max→succ), Delete(L.max), alloc, free(L),
+   free(R)]` — the last free the coverage gate for both), root collapse as
+   a root-swap SMO under the §4.7 coverage gate, interior recursion
+   level-agnostic; net −1 extent per merge at the compaction floor; three
+   derived triggers (flush-pass sibling check, the heap-full recovery
+   sweep — level by level, leaves up, then the collapse chain — and the D4
+   defrag arm). Motivating contract: fill → ENOSPC → delete 940/1,045 →
+   creates resume for **938** (was 4), merges 313, free extents 11 → 325.
+   Nine red-first contracts incl. replay-twice with merges in the window
+   and the SMO-vs-commit storm; gauges `meta_kv_node_merges`,
+   `meta_kv_root_collapses`, `meta_kv_merge_candidates`,
+   `meta_kv_merge_sweeps`, `frag_d4_mergeable_leaves`, `defrag_meta_merges`.
+   No knob, no incompat bit. Gate on `fac25656` = the landing gate. 1.2.4-
+   bound with items 2–4.
 2. **Kernel A/B, B arm** — after `squeeze-test` boots the 6.19.14 series
    WITH 0031 (or whichever box carries the patched kernel): on the box,
    `cd /scratch/tmp/sqz-agent/k26 && sudo env ARM=B KERNEL_TAG=<uname -r

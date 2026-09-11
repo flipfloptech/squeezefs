@@ -8495,6 +8495,24 @@ pub struct Metrics {
     /// deliberate-routing sibling of the `ineligible_*` refusal classes
     /// (docs/design-read-path.md §Observability).
     pub ipc_direct_ineligible_policy: Align64<AtomicU64>,
+    // PK8 — the packed-tenant arm (design-small-file-packing §5.10; lever
+    // `SQUEEZEFS_IPC_DD_PACKED`).
+    /// Direct-drive serves whose binding was a size-carrying `bk:off:len`
+    /// tenant mapping (a promoted staged layout's slot of a shared pack
+    /// block) — ⊆ `ipc_direct_drive_serves`. The engagement instrument
+    /// for the shim's cold read of a packed small file: 0 under
+    /// `SQUEEZEFS_IPC_DD_PACKED=0` by construction.
+    pub ipc_direct_packed_serves: Align64<AtomicU64>,
+    /// Request bytes those serves completed (the device window they rode
+    /// is the funnel's `packed_read_bytes`).
+    pub ipc_direct_packed_bytes: Align64<AtomicU64>,
+    /// `packed_shape` = a tenant mapping whose request window is not
+    /// strictly inside the tenant image (crosses `packed_len`, or the
+    /// logical size's implicit-zero tail) — the handler's short-read /
+    /// zero-fill semantics; the decorated population's own refusal class
+    /// (holes / bare legacy / funnel-refused decorations stay `layout`,
+    /// transformed volumes `meta`).
+    pub ipc_direct_ineligible_packed_shape: Align64<AtomicU64>,
     /// IL direct-drive WRITE lane (docs/design-il-direct-write.md §3/§5,
     /// PR-2+PR-3): W1-patch-shaped ring writes DMA'd IN PLACE on the svc
     /// thread's dd lane shard — no handler handoff, the arena (or its
@@ -8945,12 +8963,22 @@ pub enum IpcDirectIneligible {
     /// No RAM-resident metadata, non-striped layout, or block map not
     /// RAM-resident (the honest map-resident-majority split).
     Meta,
-    /// Hole block (no binding) or decorated (`bk:off:len`) mapping.
+    /// Hole block (no binding), a decorated (`bk:off:len`) mapping on a
+    /// STRIPED map, a bare (legacy, size-less) durable mapping on a staged
+    /// layout, or a decoration the funnel refuses — not a window read the
+    /// prelude can bound.
     Layout,
     /// Live RAM overlay / staged sibling / staged extent record on the
     /// block, or an unstable fill incarnation — correctness owns
     /// ambiguity.
     Overlay,
+    /// PK8 (small-file packing, the packed-tenant arm): a size-carrying
+    /// tenant mapping whose request window is NOT strictly inside the
+    /// tenant image — it crosses the tenant's end (`end > packed_len`) or
+    /// the logical size (`end > size`, the implicit-zero tail); the
+    /// handler owns the short-read / zero-fill semantics. Kept apart from
+    /// `Shape` so the decorated population's refusals stay attributable.
+    PackedShape,
     /// Unhealthy/unknown backend volume, or one not registered with the
     /// direct-drive uring.
     Backend,
@@ -8975,11 +9003,27 @@ pub struct IpcDirectSnapshot {
     pub serve: crate::ro_coherence::ServeStamp,
     pub ino: u64,
     pub block: u32,
-    /// The RAM-authoritative durable binding (whole-block, undecorated).
-    /// CompactString: the shipped key shapes inline (≤ 24 B — no heap
-    /// clone per op; the r5 internal-time ledger priced the probe's
-    /// string builds at ~8 % of svc-thread cycles).
+    /// The RAM-authoritative durable binding: the whole-block undecorated
+    /// key on the striped arm, the size-carrying `bk:off:len` tenant
+    /// mapping on the packed arm (PK8). CompactString: the shipped key
+    /// shapes inline (≤ 24 B — no heap clone per op; the r5 internal-time
+    /// ledger priced the probe's string builds at ~8 % of svc-thread
+    /// cycles).
     pub key: compact_str::CompactString,
+    /// PK8: `Some(file_id)` on the packed-tenant arm — a promoted STAGED
+    /// layout whose `block_map[0]` is `key`; the CQE revalidation checks
+    /// `staged` + this identity + the binding (the handler's own
+    /// `still_bound`) and probes the ring under it (a NEWER image of the
+    /// tenant lives there, never under an `active_block:` key). `None` =
+    /// the whole-block striped arm. `Arc<str>` clone = one refcount bump,
+    /// never a heap copy (the `CachedMetadata` field's own shape).
+    pub packed_file_id: Option<std::sync::Arc<str>>,
+    /// The device window's cap RELATIVE to `dev_off`: `block_size` on the
+    /// striped arm, the tenant's `LBA_GRAIN`-rounded slot
+    /// (`pack_slot_len(packed_len)`) on the packed arm — the bound that
+    /// keeps a tenant's grain-rounded read inside its own slot, so a
+    /// neighbouring tenant's bytes are never DMA'd, let alone served.
+    pub window_cap: u64,
     /// `BLOCK_CUSTODY_EPOCHS` word at probe time (bumped by every
     /// overlay/sibling/record retire — the 795 seqlock).
     pub epoch: u64,
@@ -8996,7 +9040,10 @@ pub struct IpcDirectSnapshot {
     pub ext_key: crate::keys::StackKey,
     /// The key's backend identity + device offset, PARSED ONCE at the
     /// probe (r5 parse-carry: the submit's per-op `parse_block_key`
-    /// re-search deleted — the StrSearcher/TwoWay ~4.4 % svc term).
+    /// re-search deleted — the StrSearcher/TwoWay ~4.4 % svc term). On
+    /// the packed arm `dev_off` is the TENANT's device base
+    /// (`block base + rel_off`), so the submit's window arithmetic is one
+    /// expression for both arms.
     pub be_id: compact_str::CompactString,
     pub dev_off: u64,
     /// Probe-entry instant (CLOCK_MONOTONIC ns — the drain's ONE clock
@@ -12570,6 +12617,10 @@ impl SqueezefsFilesystem {
                 "ipc_direct_ineligible_overlay": METRICS.ipc_direct_ineligible_overlay.load(Ordering::Relaxed),
                 "ipc_direct_ineligible_backend": METRICS.ipc_direct_ineligible_backend.load(Ordering::Relaxed),
                 "ipc_direct_ineligible_policy": METRICS.ipc_direct_ineligible_policy.load(Ordering::Relaxed),
+                // PK8: the packed-tenant arm's engagement pair + its refusal class.
+                "ipc_direct_packed_serves": METRICS.ipc_direct_packed_serves.load(Ordering::Relaxed),
+                "ipc_direct_packed_bytes": METRICS.ipc_direct_packed_bytes.load(Ordering::Relaxed),
+                "ipc_direct_ineligible_packed_shape": METRICS.ipc_direct_ineligible_packed_shape.load(Ordering::Relaxed),
                 // IL direct-drive WRITE lane (design-il-direct-write §5):
                 // serves/bytes + the RES-6 must-stay-0 fence tripwire +
                 // the decision ledger. Engagement law: dd_write_serves +
@@ -14093,7 +14144,12 @@ impl SqueezefsFilesystem {
     /// locks — whether a governed ranged read may be submitted directly
     /// on the ipc-host uring, and capture the 795 custody snapshot that
     /// must revalidate at the CQE. Any miss ⇒ the caller falls back to
-    /// the existing handler path (fallback-is-correctness).
+    /// the existing handler path (fallback-is-correctness). Two eligible
+    /// shapes: the whole-block STRIPED binding, and (PK8, lever
+    /// `SQUEEZEFS_IPC_DD_PACKED`) the packed TENANT — a promoted staged
+    /// layout's size-carrying `bk:off:len` slot, read as ONE grain-rounded
+    /// window inside its own slot on the MAPPING's backend
+    /// (design-small-file-packing §5.10, the FIND-PK-0 law).
     pub fn ipc_direct_read_probe(
         &self,
         ino: u64,
@@ -14149,35 +14205,98 @@ impl SqueezefsFilesystem {
         // clone (the former get cloned five Arcs per call); the block
         // key is copied out ONCE, exactly the CompactString the 795
         // snapshot carries anyway.
-        let key = match self.router.metadata_cache.peek_with(&ino, |meta| {
-            if meta.file_type != "striped" {
-                return Err(I::Meta);
-            }
+        //
+        // Two arms (PK8): the STRIPED whole-block binding, and the packed
+        // TENANT — a promoted STAGED layout (`file_type == "staged"`, its
+        // ring image released) whose `block_map[0]` is the size-carrying
+        // `bk:off:len` mapping the packer published (design-small-file-
+        // packing §5.1/§5.10). The handler's staged arm serves that shape
+        // with ONE ranged, routed window read and no tier admission, so
+        // the direct arm issues the same DMA on the same device and trades
+        // nothing. Lever off ⇒ the pre-PK8 refusal verbatim (`Meta`: a
+        // non-striped layout).
+        let (key, packed_file_id) = match self.router.metadata_cache.peek_with(&ino, |meta| {
             // Item 2: a pre-step entry is not a binding authority on a
             // revalidating mount — the handler re-resolves.
             if crate::ro_coherence::layout_entry_pre_step(meta.reader_step_gen) {
                 return Err(I::Meta);
             }
-            if end > meta.size {
-                return Err(I::Shape);
+            if meta.file_type == "striped" {
+                if end > meta.size {
+                    return Err(I::Shape);
+                }
+                let Some(map) = meta.block_map.as_ref() else {
+                    // Indirect / not-RAM-resident maps: sibling shapes stay on
+                    // the handler (recorded split — never force a partial
+                    // design to claim the whole shape).
+                    return Err(I::Meta);
+                };
+                let Some(key) = map.get(&b32) else {
+                    return Err(I::Layout); // hole block — handler serves zeros
+                };
+                if !crate::routing::is_whole_block_mapping(key) {
+                    return Err(I::Layout); // decorated `bk:off:len` mapping
+                }
+                return Ok((compact_str::CompactString::from(key.as_str()), None));
             }
-            let Some(map) = meta.block_map.as_ref() else {
-                // Indirect / not-RAM-resident maps: sibling shapes stay on
-                // the handler (recorded split — never force a partial
-                // design to claim the whole shape).
+            if meta.file_type != "staged" || !crate::ipc_service::ipc_dd_packed_enabled() {
+                return Err(I::Meta);
+            }
+            // The tenant's identity + its durable slot. A ring-resident
+            // staged file carries no durable mapping (`block_map: None`)
+            // and stays the sync fast path's / handler's — `Meta`, the
+            // pre-PK8 class for every staged layout.
+            let Some(file_id) = meta.file_id.as_ref() else {
                 return Err(I::Meta);
             };
-            let Some(key) = map.get(&b32) else {
-                return Err(I::Layout); // hole block — handler serves zeros
+            let Some(key) = meta.block_map.as_ref().and_then(|map| map.get(&0)) else {
+                return Err(I::Meta);
             };
-            if !crate::routing::is_whole_block_mapping(key) {
-                return Err(I::Layout); // decorated `bk:off:len` mapping
+            if b32 != 0 {
+                return Err(I::Shape); // a staged layout is block 0 only
             }
-            Ok(compact_str::CompactString::from(key.as_str()))
+            if end > meta.size {
+                return Err(I::PackedShape); // the implicit-zero tail is the handler's
+            }
+            Ok((
+                compact_str::CompactString::from(key.as_str()),
+                Some(std::sync::Arc::clone(file_id)),
+            ))
         }) {
-            Some(Ok(key)) => key,
+            Some(Ok(pair)) => pair,
             Some(Err(class)) => return Err(class),
             None => return Err(I::Meta),
+        };
+        // The packed arm's window: `[off, off + pack_slot_len(len))` of the
+        // base block, decoded through the funnel's own grammar split
+        // (`split_mapping_decoration`) and bounded by its window law —
+        // never a re-implementation. Anything the funnel would refuse
+        // (`EIO` + `packed_mapping_refusals`) or a bare legacy staged
+        // mapping (no packed length: its whole-block window's tail is
+        // device garbage only `meta.size` bounds) stays the handler's.
+        let (base_key, dev_base, window_cap) = if packed_file_id.is_some() {
+            if crate::routing::is_damaged_mapping(&key) {
+                return Err(I::Layout);
+            }
+            let Some((base, off_text, len_text)) = crate::routing::split_mapping_decoration(&key)
+            else {
+                return Err(I::Layout);
+            };
+            let (Ok(off), Ok(sz)) = (off_text.parse::<u64>(), len_text.parse::<u64>()) else {
+                return Err(I::Layout);
+            };
+            let slot = crate::routing::pack_slot_len(sz);
+            if off % crate::routing::LBA_GRAIN != 0
+                || off.saturating_add(slot) > crate::block_allocator::CHUNK_SIZE
+            {
+                return Err(I::Layout);
+            }
+            if end > sz {
+                return Err(I::PackedShape); // crosses the tenant's end
+            }
+            (base, off, slot)
+        } else {
+            (key.as_str(), 0, block_size)
         };
         // Overlay screen — ANY overlay presence ⇒ handler (correctness
         // owns ambiguity). The O(1) gate first (the capture_parked_runs
@@ -14193,18 +14312,25 @@ impl SqueezefsFilesystem {
         {
             return Err(I::Overlay);
         }
-        // Staged sibling (the striped block's staging-ring image) — the
-        // handler probes it before any device read; so must we.
+        // Staged sibling — the ring image NEWER than the device bytes: the
+        // striped block's `active_block:` sibling, or the tenant's own
+        // re-staged image under its `file_id` (the RMW's stage → publish
+        // window, where `block_map[0]` still names the durable slot). The
+        // handler probes the ring before any device read; so must we.
+        let ring_key: &str = packed_file_id
+            .as_deref()
+            .unwrap_or_else(|| cache_key.as_str());
         if self
             .router
             .cache
             .nvme
-            .read_staged_zero_copy(cache_key.as_str())
+            .read_staged_zero_copy(ring_key)
             .is_some()
         {
             return Err(I::Overlay);
         }
-        // W2 staged extent record (newer than every base tier).
+        // W2 staged extent record (newer than every base tier; the staged
+        // layout's rider rides block 0's key).
         let ext_key = crate::keys::active_block_ext_stack(ino, u64::from(b32));
         if self
             .router
@@ -14234,17 +14360,31 @@ impl SqueezefsFilesystem {
         } else {
             None
         };
+        // The §5.10 stale-incarnation disposition (packed arm): the funnel
+        // the handler runs (`read_block_range`) refuses a key naming a
+        // DEAD lifetime before its DMA; the direct DMA has no such gate,
+        // so refuse here — the handler then surfaces the finding-51
+        // contradiction as `EIO` + `invariant_tripwires`, never as the
+        // reissued offset's bytes.
+        if packed_file_id.is_some() && self.router.backend_router.block_key_lifetime_dead(&key) {
+            return Err(I::Overlay);
+        }
         // Parse-carry (r5): resolve the backend identity + device
         // offset ONCE here — the submit path's per-op re-parse is gone.
-        let Ok((be_id, dev_off)) = self.router.backend_router.split_block_key(&key) else {
+        // The packed arm resolves the BASE key and lands on the tenant's
+        // device base (`block base + rel_off`).
+        let Ok((be_id, block_base)) = self.router.backend_router.split_block_key(base_key) else {
             return Err(I::Layout);
         };
         let be_id = compact_str::CompactString::from(be_id);
+        let dev_off = block_base + dev_base;
         Ok(IpcDirectSnapshot {
             serve,
             ino,
             block: b32,
             key,
+            packed_file_id,
+            window_cap,
             epoch,
             tracked,
             incarnation,
@@ -14268,13 +14408,21 @@ impl SqueezefsFilesystem {
     /// epoch — the handler's post-read `capture_parked_runs` face); the
     /// binding + incarnation checks prove the device bytes belong to
     /// the block's live incarnation (the validated-ranged serve rule).
+    /// On the packed arm the binding is the handler's own `still_bound`
+    /// (`staged` + the tenant's `file_id` + `block_map[0]`), and the ring
+    /// probe runs under the `file_id` — where a re-staged newer image of
+    /// the tenant lands.
     pub fn ipc_direct_revalidate(&self, snap: &IpcDirectSnapshot) -> bool {
         // Zero-clone peek (L3 coherence campaign): the CQE-side binding
         // re-check is pure loads — the former get paid the full moka
         // read ceremony + a five-Arc value clone per completion, on the
         // dd reaper (25.4 % of its cycles on the 2-socket field box).
         let binding_holds = self.router.metadata_cache.peek_with(&snap.ino, |meta| {
-            meta.file_type == "striped"
+            let layout_holds = match snap.packed_file_id.as_deref() {
+                None => meta.file_type == "striped",
+                Some(fid) => meta.file_type == "staged" && meta.file_id.as_deref() == Some(fid),
+            };
+            layout_holds
                 && snap.offset + u64::from(snap.len) <= meta.size
                 && meta
                     .block_map
@@ -14298,11 +14446,15 @@ impl SqueezefsFilesystem {
         {
             return false;
         }
+        let ring_key: &str = snap
+            .packed_file_id
+            .as_deref()
+            .unwrap_or_else(|| snap.cache_key.as_str());
         if self
             .router
             .cache
             .nvme
-            .read_staged_zero_copy(snap.cache_key.as_str())
+            .read_staged_zero_copy(ring_key)
             .is_some()
         {
             return false;

@@ -322,7 +322,7 @@ async fn open_fresh(dir: &Path, n: usize, tag: &str, compression: &str) -> Fx {
         owner_uid: unsafe { libc::getuid() },
     };
     let host = IpcHost::spawn(host_cfg.clone(), sink.clone()).expect("host must spawn");
-    Fx {
+    let fx = Fx {
         fs,
         meta: routed,
         records,
@@ -331,8 +331,19 @@ async fn open_fresh(dir: &Path, n: usize, tag: &str, compression: &str) -> Fx {
         cfg: host_cfg,
         sink,
         _staging: staging,
+    };
+    // Shift this fixture's ino allocation: fresh v3 volumes hand out the
+    // same monotonic inos and the local DLM lock map is process-global —
+    // a fixture torn down mid-test (a failed assertion) leaves its leases
+    // behind, and the next fixture's ino 2 would contend on them.
+    let salt = INO_SALT.fetch_add(8, Ordering::Relaxed);
+    for i in 0..salt {
+        fx.create(&format!("salt{i}")).await;
     }
+    fx
 }
+
+static INO_SALT: AtomicU64 = AtomicU64::new(0);
 
 impl Fx {
     /// Mount-faithful close: the dismount seal, the reclaim drain, the
@@ -696,8 +707,8 @@ fn snap() -> Deltas {
         ops_read: metric(&METRICS.ipc_ops_read),
         packed_serves: metric(&METRICS.ipc_direct_packed_serves),
         packed_bytes: metric(&METRICS.ipc_direct_packed_bytes),
-        packed_reads: metric(&METRICS.packed_reads),
-        packed_read_bytes: metric(&METRICS.packed_read_bytes),
+        packed_reads: METRICS.packed_reads.load(Ordering::Relaxed),
+        packed_read_bytes: METRICS.packed_read_bytes.load(Ordering::Relaxed),
         inel_meta: metric(&METRICS.ipc_direct_ineligible_meta),
         inel_overlay: metric(&METRICS.ipc_direct_ineligible_overlay),
         inel_packed_shape: metric(&METRICS.ipc_direct_ineligible_packed_shape),
@@ -761,7 +772,11 @@ async fn a_packed_tenant_at_a_nonzero_off_direct_drives_byte_exact_on_every_wind
     let (base0, off0, _) = fx.decode(&m0);
     let (base1, off1, sz1) = fx.decode(&m1);
     let (base2, off2, sz2) = fx.decode(&m2);
-    assert_eq!((base0, base1, base2), (base0, base0, base0), "one pack block");
+    assert_eq!(
+        (base0, base1, base2),
+        (base0, base0, base0),
+        "one pack block"
+    );
     assert_eq!(off0, 0);
     assert_eq!(off1, 16 * KIB as u64, "t1 sits after t0's slot");
     assert_eq!(
@@ -819,20 +834,28 @@ async fn a_packed_tenant_at_a_nonzero_off_direct_drives_byte_exact_on_every_wind
         (0, 4096, 0),
         ((sz2 - 4096) as u64, 4096, 0),
         (8192 + 512, 4096, 0),
-        (16 * 4096, 8192, 512),
+        (12 * 4096, 8192, 512),
     ];
     let before = snap();
-    for (i, (off, len, arena)) in shapes.iter().enumerate() {
-        let got = tokio::task::block_in_place(|| {
+    let mut got_all = Vec::new();
+    for (off, len, arena) in shapes {
+        got_all.push(tokio::task::block_in_place(|| {
             s2.ring_pread(b2, *off, *len, *arena, "packed direct read")
-        });
+        }));
+    }
+    let d = delta(&before);
+    for (i, (off, len, _)) in shapes.iter().enumerate() {
         assert_eq!(
-            got,
+            got_all[i],
             want2[*off as usize..*off as usize + len].to_vec(),
             "byte parity on packed direct-drive shape {i} (off {off} len {len})"
         );
+        assert_eq!(
+            got_all[i],
+            fx.fuse_read(t2, *off, *len).await,
+            "the direct arm and the handler agree on shape {i}"
+        );
     }
-    let d = delta(&before);
     let n = shapes.len() as u64;
     let bytes: u64 = shapes.iter().map(|(_, l, _)| *l as u64).sum();
     assert_eq!(
@@ -840,11 +863,20 @@ async fn a_packed_tenant_at_a_nonzero_off_direct_drives_byte_exact_on_every_wind
         "every packed read must be SERVED direct-drive (no task, no handler) — got {} of {n}",
         d.dd_serves
     );
-    assert_eq!(d.packed_serves, n, "ipc_direct_packed_serves counts the arm");
-    assert_eq!(d.packed_bytes, bytes, "ipc_direct_packed_bytes = the request bytes");
+    assert_eq!(
+        d.packed_serves, n,
+        "ipc_direct_packed_serves counts the arm"
+    );
+    assert_eq!(
+        d.packed_bytes, bytes,
+        "ipc_direct_packed_bytes = the request bytes"
+    );
     assert_eq!(d.ops_read, n, "ipc_ops_read accounts direct packed serves");
     assert_eq!(d.handoffs, 0, "no async handoff on the packed arm");
-    assert_eq!(d.dd_fallbacks_post, 0, "a quiet tenant never fails revalidation");
+    assert_eq!(
+        d.dd_fallbacks_post, 0,
+        "a quiet tenant never fails revalidation"
+    );
     assert_eq!(
         d.packed_reads, n,
         "the funnel's engagement gauge stays live on the direct arm"
@@ -853,7 +885,10 @@ async fn a_packed_tenant_at_a_nonzero_off_direct_drives_byte_exact_on_every_wind
         d.packed_read_bytes >= bytes && d.packed_read_bytes <= n * pack_slot_len(sz2 as u64),
         "packed_read_bytes is the GRAIN window, bounded by the slot"
     );
-    assert_eq!(d.dd_bounces, 2, "the two unaligned shapes ride the bounce leg");
+    assert_eq!(
+        d.dd_bounces, 2,
+        "the two unaligned shapes ride the bounce leg"
+    );
     drop(s2);
 
     // t1's tail: the served bytes stop at the tenant's end even though the
@@ -954,7 +989,11 @@ async fn a_request_crossing_the_tenant_end_is_refused_and_served_short_by_the_ha
     // the slot would hand back.
     let (_t1, _, m1) = fx.packed_tenant("e1.bin", 16 * KIB, 31).await;
     let (_, off1, _) = fx.decode(&m1);
-    assert_eq!(off1, pack_slot_len(50_000), "the neighbour starts at t0's slot end");
+    assert_eq!(
+        off1,
+        pack_slot_len(50_000),
+        "the neighbour starts at t0's slot end"
+    );
 
     // (a) EOF inside the request window (size == image): PackedShape.
     assert!(
@@ -978,7 +1017,10 @@ async fn a_request_crossing_the_tenant_end_is_refused_and_served_short_by_the_ha
     let d = delta(&before);
     assert_eq!(d.packed_serves, 0, "EOF-crossing shapes never direct-drive");
     assert_eq!(d.dd_serves, 0);
-    assert!(d.inel_packed_shape >= 1, "the ledger names the refusal class");
+    assert!(
+        d.inel_packed_shape >= 1,
+        "the ledger names the refusal class"
+    );
     assert!(d.handoffs >= 1, "the op rode the handler");
 
     // (b) truncate-UP: size > image — the tail past the image is an
@@ -1006,7 +1048,10 @@ async fn a_request_crossing_the_tenant_end_is_refused_and_served_short_by_the_ha
     let got = tokio::task::block_in_place(|| s.ring_pread(b, 45_056, 8192, 0, "image cross"));
     let mut want = pattern(30, 50_000)[45_056..].to_vec();
     want.resize(8192, 0);
-    assert_eq!(got, want, "zeros past the image, never the neighbour's bytes");
+    assert_eq!(
+        got, want,
+        "zeros past the image, never the neighbour's bytes"
+    );
     let d = delta(&before);
     assert_eq!(d.packed_serves, 0);
     assert!(d.inel_packed_shape >= 1);
@@ -1110,7 +1155,11 @@ async fn a_newer_ring_resident_image_refuses_the_arm_and_the_handler_serves_it()
         )
         .await
         .expect("stage the newer image");
-    assert_eq!(fx.mapping0(t1), m1, "premise: the durable slot is still bound");
+    assert_eq!(
+        fx.mapping0(t1),
+        m1,
+        "premise: the durable slot is still bound"
+    );
 
     assert!(
         !fx.fs.ipc_direct_revalidate(&snap0),
@@ -1138,7 +1187,10 @@ async fn a_newer_ring_resident_image_refuses_the_arm_and_the_handler_serves_it()
     let d = delta(&before);
     fx.fs.router.set_direct_device_true(false);
     assert_eq!(d.packed_serves, 0, "the stale slot must NOT be served");
-    assert!(d.inel_overlay >= 1, "the overlay ledger records the refusal");
+    assert!(
+        d.inel_overlay >= 1,
+        "the overlay ledger records the refusal"
+    );
     drop(s);
     fx.close().await;
 }
@@ -1290,9 +1342,13 @@ async fn every_packed_direct_op_records_its_residence_on_a_default_mount() {
     // admission arm to be handed to and keeps direct-driving.
     let n = 6u64;
     for i in 0..n {
-        let off = (i % 3) * 16 * 4096;
+        let off = (i % 3) * 4 * 4096;
         let got = tokio::task::block_in_place(|| s.ring_pread(b, off, 4096, 0, "default packed"));
-        assert_eq!(got, want[off as usize..off as usize + 4096].to_vec(), "op {i}");
+        assert_eq!(
+            got,
+            want[off as usize..off as usize + 4096].to_vec(),
+            "op {i}"
+        );
     }
     let d = delta(&before);
     assert_eq!(

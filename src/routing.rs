@@ -2010,6 +2010,32 @@ pub fn clean_block_key_ref(bk: &str) -> &str {
     }
 }
 
+/// The size-carrying decoration of a stored block mapping, BORROWED:
+/// `Some((base, rel_off_text, packed_len_text))` for the 3-part
+/// `[be://]offset[@inc]:rel_off:packed_len` form (`base` is the slice
+/// [`clean_block_key_ref`] returns for it), `None` for every other shape —
+/// the bare whole-block key, and the 2-/4-part strings the base parser
+/// refuses. Grammar only, zero allocation: [`DataRouter::parse_block_mapping`]
+/// is the refusing funnel built on it (numbers, the window law, `EIO` +
+/// `packed_mapping_refusals`), and the direct-drive prelude's packed arm
+/// (PK8) decodes through the SAME split, so the two cannot disagree on
+/// where a decoration starts.
+pub(crate) fn split_mapping_decoration(mapping: &str) -> Option<(&str, &str, &str)> {
+    let prefix_len = mapping.find("://").map_or(0, |p| p + 3);
+    let mut parts = mapping[prefix_len..].split(':');
+    let base_offset = parts.next()?;
+    let off_text = parts.next()?;
+    let len_text = parts.next()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    Some((
+        &mapping[..prefix_len + base_offset.len()],
+        off_text,
+        len_text,
+    ))
+}
+
 // ---------------------------------------------------------------------------
 // `offset ‖ incarnation` block keys — pre-RC engineering spec §6.2 item 6
 // (rationale §6.3 "block-key binding"), incompat bit 13, ruling D9.
@@ -7638,15 +7664,8 @@ impl DataRouter {
             )));
         }
         let default_size = self.block_size.load(Ordering::Acquire) as usize;
-        let (prefix, rest) = match mapping_str.find("://") {
-            Some(pos) => mapping_str.split_at(pos + 3),
-            None => ("", mapping_str),
-        };
-        let parts: Vec<&str> = rest.split(':').collect();
-        if parts.len() == 3 {
-            let bk = self
-                .backend_router
-                .parse_block_offset(&format!("{prefix}{}", parts[0]))?;
+        if let Some((base, off_text, len_text)) = split_mapping_decoration(mapping_str) {
+            let bk = self.backend_router.parse_block_offset(base)?;
             let refuse = |what: &str| {
                 METRICS
                     .packed_mapping_refusals
@@ -7658,10 +7677,10 @@ impl DataRouter {
                 );
                 SqueezefsError::Io(std::io::Error::from_raw_os_error(libc::EIO))
             };
-            let off = parts[1]
+            let off = off_text
                 .parse::<u64>()
                 .map_err(|_| refuse("undecodable rel_off"))?;
-            let sz = parts[2]
+            let sz = len_text
                 .parse::<usize>()
                 .map_err(|_| refuse("undecodable packed_len"))?;
             if off % LBA_GRAIN != 0 {

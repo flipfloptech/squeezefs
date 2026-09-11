@@ -151,6 +151,32 @@ pub fn set_il_direct_write_enabled(v: bool) {
     il_direct_write_cell().store(v, Ordering::Relaxed);
 }
 
+/// `SQUEEZEFS_IPC_DD_PACKED` — the direct-drive READ prelude's PACKED-
+/// tenant arm (PK8, design-small-file-packing §5.10; default ON). `0` =
+/// the pre-PK8 posture verbatim: a promoted staged tenant's ring read
+/// takes the handler path (`ipc_direct_ineligible_meta`) and the
+/// `ipc_direct_packed_*` gauges stay silent. The same runtime-cell shape
+/// as the write lane's lever, for the same reason.
+fn ipc_dd_packed_cell() -> &'static std::sync::atomic::AtomicBool {
+    static ON: std::sync::OnceLock<std::sync::atomic::AtomicBool> = std::sync::OnceLock::new();
+    ON.get_or_init(|| {
+        std::sync::atomic::AtomicBool::new(crate::env_knobs::bool_knob(
+            "SQUEEZEFS_IPC_DD_PACKED",
+            true,
+        ))
+    })
+}
+
+pub(crate) fn ipc_dd_packed_enabled() -> bool {
+    ipc_dd_packed_cell().load(Ordering::Relaxed)
+}
+
+/// Flip the packed-tenant read arm at runtime (A/B bracket + test seam —
+/// env init still wins at process start via the registered knob).
+pub fn set_ipc_dd_packed_enabled(v: bool) {
+    ipc_dd_packed_cell().store(v, Ordering::Relaxed);
+}
+
 thread_local! {
     /// PLACED-write handoffs deferred to the end of the drain pass
     /// (shim-parity 2026-07-28): a placed sever's whole win is that every
@@ -881,6 +907,7 @@ impl DataPlaneSink {
             IpcDirectIneligible::Overlay => &METRICS.ipc_direct_ineligible_overlay,
             IpcDirectIneligible::Backend => &METRICS.ipc_direct_ineligible_backend,
             IpcDirectIneligible::Policy => &METRICS.ipc_direct_ineligible_policy,
+            IpcDirectIneligible::PackedShape => &METRICS.ipc_direct_ineligible_packed_shape,
         };
         counter.fetch_add(1, Ordering::Relaxed);
     }
@@ -1123,7 +1150,14 @@ impl DataPlaneSink {
                 return Err((op, completion));
             }
         };
-        if router.ranged_escalation_candidate(&snap.key)
+        // The admission peek is the STRIPED arm's: the handler's staged
+        // arm serves a packed tenant with one ranged window read and no
+        // tier admission (design-small-file-packing §5.10), so a GRANT
+        // would hand the op to a handler that admits nothing — and a
+        // ghost touch on the tenant's slot would be evidence nobody
+        // consumes. The packed arm direct-drives on every touch.
+        if snap.packed_file_id.is_none()
+            && router.ranged_escalation_candidate(&snap.key)
             && router
                 .cache
                 .admission_governor

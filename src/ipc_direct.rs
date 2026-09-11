@@ -1046,15 +1046,20 @@ impl DirectDriveEngine {
             return Err((op, completion));
         }
 
-        // Window geometry (the handler's ranged arithmetic verbatim).
+        // Window geometry (the handler's ranged arithmetic verbatim):
+        // `[floor(rel), ceil(rel_end))` capped at the arm's window —
+        // the block on the striped arm, the tenant's slot on the packed
+        // arm (PK8: `dev_off` is then the tenant's device base, so the
+        // grain-rounded tail can never reach a neighbouring tenant).
         let block_size = router.block_size.load(Ordering::Relaxed);
         let rel = snap.offset - u64::from(snap.block) * block_size;
         let rel_end = rel + u64::from(snap.len);
         let aligned_start = rel & !(LBA - 1);
-        let aligned_end = std::cmp::min(rel_end.div_ceil(LBA) * LBA, block_size);
+        let aligned_end = std::cmp::min(rel_end.div_ceil(LBA) * LBA, snap.window_cap);
         let window = (aligned_end - aligned_start) as usize;
         let win_skew = (rel - aligned_start) as usize;
         let req_len = snap.len as usize;
+        let packed = snap.packed_file_id.is_some();
 
         // Arena-direct DMA only when the window IS the request and the
         // arena destination can take O_DIRECT-class DMA (4 KiB-aligned).
@@ -1076,14 +1081,25 @@ impl DirectDriveEngine {
         METRICS
             .ipc_direct_drive_submits
             .fetch_add(1, Ordering::Relaxed);
-        METRICS.ranged_reads.fetch_add(1, Ordering::Relaxed);
-        METRICS
-            .ranged_read_bytes
-            .fetch_add(window as u64, Ordering::Relaxed);
-        if window != req_len {
+        if packed {
+            // The funnel's own engagement pair (design-small-file-packing
+            // §5.10 — `packed_read_bytes ≤ Σ ceil(image)` is the packed
+            // amplification bound) for the read the handler would have
+            // issued through `read_mapping_window`.
+            METRICS.packed_reads.fetch_add(1, Ordering::Relaxed);
             METRICS
-                .ranged_read_unaligned_bounces
-                .fetch_add(1, Ordering::Relaxed);
+                .packed_read_bytes
+                .fetch_add(window as u64, Ordering::Relaxed);
+        } else {
+            METRICS.ranged_reads.fetch_add(1, Ordering::Relaxed);
+            METRICS
+                .ranged_read_bytes
+                .fetch_add(window as u64, Ordering::Relaxed);
+            if window != req_len {
+                METRICS
+                    .ranged_read_unaligned_bounces
+                    .fetch_add(1, Ordering::Relaxed);
+            }
         }
         // Posture parity (DIALED P1.5): `read_device_true_reads` is the
         // ddt escape's family — the handler counts it only under
@@ -2053,6 +2069,14 @@ impl DirectDriveEngine {
             METRICS
                 .ipc_direct_drive_serves
                 .fetch_add(1, Ordering::Relaxed);
+            if snap.packed_file_id.is_some() {
+                METRICS
+                    .ipc_direct_packed_serves
+                    .fetch_add(1, Ordering::Relaxed);
+                METRICS
+                    .ipc_direct_packed_bytes
+                    .fetch_add(req_len as u64, Ordering::Relaxed);
+            }
             completion.complete(req_len as i64);
             // ipc_direct_phase_ns: served ops close `finish` (CQE pop →
             // completion posted) and `total` (probe entry → here — the

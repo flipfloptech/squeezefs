@@ -41,6 +41,16 @@
 //!     the EOF page tail + cycle mount + a 3-byte `mwrite` past EOF +
 //!     `syncfs` → the content is unchanged. Pre-fix the file is zeros
 //!     after the FIRST cycle.
+//! (d) **The single over-cap corpse, crashed between entries** (the
+//!     record's residual B, RECLAIM-ATOMIC): a corpse whose own destroy —
+//!     its releases + thousands of xattrs + the `layout` xattr + the
+//!     record — exceeds the whole-entry cap is destroyed ACROSS entries
+//!     (releases first, the layout and the record last); stopped after its
+//!     first entry (`SQUEEZEFS_TEST_DESTROY_CHUNK_STOP_AFTER=1`) and
+//!     SIGKILLed, the next mount's sweep finishes it — the surviving
+//!     layout's releases witness no record (counted skipped, never a
+//!     second free), no leak, no double free, drift 0, fsck clean. Pre-fix
+//!     that corpse fails "exceeds the … whole-entry cap" at every mount.
 //!
 //! Self-skips through the testkit where a mount is not possible and rides
 //! the require-mount gate (`tests/run_require_mount_gate.sh`).
@@ -59,6 +69,9 @@ const BLOCK: usize = 4 * 1024 * KIB;
 const DEFAULT_DISMOUNT_WAIT: Duration = Duration::from_secs(10);
 /// The seam that fails the sweep's destroy after its `delete_file`s.
 const FAIL_DESTROY_SEAM: &str = "SQUEEZEFS_TEST_CORPSE_SWEEP_FAIL_DESTROY";
+/// The seam that stops a single-ino chunked destroy after N committed
+/// entries (contract (d)).
+const STOP_AFTER_SEAM: &str = "SQUEEZEFS_TEST_DESTROY_CHUNK_STOP_AFTER";
 /// The sweep's log faces.
 const SWEEP_FOUND: &str = "mount-time corpse sweep:";
 const SWEEP_FAILED: &str = "mount-time corpse sweep failed";
@@ -833,6 +846,180 @@ fn the_generic_749_shape_survives_a_released_corpse_at_the_pack_offset() {
         log4.display()
     );
     assert_eq!(stat_u64(&mnt, "invariant_tripwires"), 0);
+    m4.umount_timed();
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// How many `user.*` xattrs push the striped corpse's destroy footprint —
+/// `CORPSE_BLOCKS` release `Delete`s + one `Delete` per xattr + the
+/// `layout` xattr's + the inode record's, each `1 (tree id) + header + key`
+/// bytes — past ONE journal entry by an eighth. Derived from the cap and
+/// the record framing (the in-process twin's arithmetic).
+fn overcap_xattr_count() -> usize {
+    use squeezefs::meta_backend::kv::block_refs::BLOCK_REF_KEY_LEN;
+    use squeezefs::meta_backend::kv::journal::{ENTRY_HDR_LEN, MAX_ENTRY_LEN};
+    use squeezefs::meta_backend::kv::record::{INODE_KEY_LEN, RECORD_HEADER_LEN, XATTR_KEY_LEN};
+    let per_record = |key_len: usize| 1 + RECORD_HEADER_LEN + key_len;
+    let cap = (MAX_ENTRY_LEN - ENTRY_HDR_LEN) as usize;
+    let fixed = CORPSE_BLOCKS * per_record(BLOCK_REF_KEY_LEN)
+        + per_record(XATTR_KEY_LEN)
+        + per_record(INODE_KEY_LEN);
+    (cap + cap / 8 - fixed).div_ceil(per_record(XATTR_KEY_LEN))
+}
+
+/// `fsetxattr(fd, name, value)` on a live fd; the return is checked.
+fn fsetxattr(f: &File, name: &str, value: &[u8]) {
+    let cname = std::ffi::CString::new(name).expect("xattr name");
+    // SAFETY: a live fd, a NUL-terminated name and a valid value slice.
+    let rc = unsafe {
+        libc::fsetxattr(
+            f.as_raw_fd(),
+            cname.as_ptr(),
+            value.as_ptr().cast(),
+            value.len(),
+            0,
+        )
+    };
+    assert_eq!(
+        rc,
+        0,
+        "fsetxattr({name}) failed: {}",
+        std::io::Error::last_os_error()
+    );
+}
+
+/// Contract (d): one corpse whose destroy footprint exceeds the whole-entry
+/// cap, its chunked destroy stopped after the first entry and the daemon
+/// SIGKILLed — the next mount finishes it without a leak or a double free.
+#[test]
+fn a_single_overcap_corpse_stopped_between_entries_is_finished_by_the_next_mount() {
+    if !mount_supported(site!()) {
+        return;
+    }
+    let xattrs = overcap_xattr_count();
+    let base = scratch("chunked");
+    let staging = base.join("staging");
+    let meta = format_volume(&base, &staging);
+    let mnt = base.join("mnt");
+
+    // Mount 1: the striped corpse (blocks 0 and 1, fsync'd) carrying
+    // enough xattrs that its destroy cannot fit one entry; held open across
+    // the unlink, then SIGKILL (no FORGET ever arrives). An ANCHOR file
+    // keeps the ledger non-empty once the corpse's references are gone
+    // (an empty ledger is declined at mount — §6.1 — and the layout walk,
+    // which counts a corpse's layout, would backfill the very references
+    // whose absence this contract observes).
+    let anchor = mnt.join("anchor.bin");
+    let anchor_want = pattern(3, CORPSE_BLOCKS * BLOCK);
+    {
+        let mut m1 = spawn_mount(&meta, &mnt, &base.join("m1.log"), &[]);
+        drop(write_fsync(&anchor, &anchor_want));
+        let corpse = mnt.join("corpse.bin");
+        let held = write_fsync(&corpse, &pattern(1, CORPSE_BLOCKS * BLOCK));
+        for i in 0..xattrs {
+            fsetxattr(&held, &format!("user.k{i}"), b"v");
+        }
+        syncfs(&mnt);
+        std::fs::remove_file(&corpse).expect("unlink the held-open corpse");
+        m1.kill9();
+        drop(held);
+    }
+
+    // Mount 2: the sweep finds the corpse; its chunked destroy commits the
+    // FIRST entry (the releases lead) and stops — the record and its layout
+    // survive. Then SIGKILL: the durable state is exactly a crash between
+    // two entries of the destroy.
+    let log2 = base.join("m2.log");
+    let mut m2 = spawn_mount(&meta, &mnt, &log2, &[(STOP_AFTER_SEAM, "1")]);
+    assert!(
+        log_contains(&log2, &format!("{SWEEP_FOUND} 1 unlinked inode(s)")),
+        "premise: the sweep found the corpse; log: {}",
+        log2.display()
+    );
+    assert_eq!(
+        stat_u64(&mnt, "reclaim_single_ino_chunked_destroys"),
+        1,
+        "the over-cap corpse's destroy must run CHUNKED across entries — pre-fix its one \
+         entry was refused at the whole-entry cap ({}); log: {}",
+        if log_contains(&log2, SWEEP_FAILED) {
+            "the sweep FAILED at the cap, as at every mount before this fix"
+        } else {
+            "no failure logged"
+        },
+        log2.display()
+    );
+    assert!(
+        !log_contains(&log2, &format!("{SWEEP_RECLAIMED} 1 unlinked")),
+        "premise: the stopped destroy completed nothing; log: {}",
+        log2.display()
+    );
+    // The first entry's releases were witnessed and committed: their
+    // blocks free on THIS mount (the ledger says free; RAM follows).
+    wait_reclaim_drained(&mnt, CORPSE_BLOCKS as u64);
+    assert_eq!(stat_u64(&mnt, "invariant_tripwires"), 0);
+    m2.kill9();
+
+    // Mount 3: the sweep re-reads the surviving layout; its releases
+    // witness NO record (skipped, never a second free) and the destroy
+    // completes.
+    let log3 = base.join("m3.log");
+    let mut m3 = spawn_mount(&meta, &mnt, &log3, &[("SQUEEZEFS_BLOCK_REFS_VERIFY", "1")]);
+    assert!(
+        log_contains(&log3, &format!("{SWEEP_FOUND} 1 unlinked inode(s)")),
+        "premise: the half-destroyed corpse survived to this mount; log: {}",
+        log3.display()
+    );
+    assert!(
+        log_contains(&log3, &format!("{SWEEP_RECLAIMED} 1 unlinked")),
+        "the next mount FINISHES the destroy; log: {}",
+        log3.display()
+    );
+    wait_reclaim_drained(&mnt, 0);
+    assert_eq!(
+        stat_u64(&mnt, "meta_kv_block_refs_drift"),
+        0,
+        "the C8 oracle reads clean"
+    );
+    assert_eq!(
+        stat_u64(&mnt, "block_release_skipped_no_record"),
+        CORPSE_BLOCKS as u64,
+        "the layout's releases had no record behind them (the first entry committed them) \
+         and are counted skipped"
+    );
+    assert_eq!(stat_u64(&mnt, "block_untracked_free_refusals"), 0);
+    assert_eq!(stat_u64(&mnt, "block_double_frees"), 0);
+    assert_eq!(stat_u64(&mnt, "invariant_tripwires"), 0);
+    assert!(
+        !log_contains(&log3, UNTRACKED_REFUSED),
+        "no refused-untracked line; log: {}",
+        log3.display()
+    );
+    // The freed offsets are re-mintable by a live file, byte-exact; the
+    // anchor is untouched.
+    let live = mnt.join("live.bin");
+    let want = pattern(2, CORPSE_BLOCKS * BLOCK);
+    drop(write_fsync(&live, &want));
+    assert_eq!(std::fs::read(&live).expect("read live"), want);
+    assert_eq!(std::fs::read(&anchor).expect("read anchor"), anchor_want);
+    let report = online_fsck(&mnt);
+    assert_eq!(
+        report["findings"].as_array().map(|a| a.len()).unwrap_or(0),
+        0,
+        "fsck is clean after the finished destroy: {}",
+        report["findings"]
+    );
+    m3.umount_timed();
+
+    // Mount 4: nothing left to sweep; the live file and the anchor intact.
+    let log4 = base.join("m4.log");
+    let mut m4 = spawn_mount(&meta, &mnt, &log4, &[]);
+    assert!(
+        !log_contains(&log4, SWEEP_FOUND),
+        "a swept volume carries no corpses; log: {}",
+        log4.display()
+    );
+    assert_eq!(std::fs::read(&live).expect("read live"), want);
+    assert_eq!(std::fs::read(&anchor).expect("read anchor"), anchor_want);
     m4.umount_timed();
     let _ = std::fs::remove_dir_all(&base);
 }

@@ -6029,6 +6029,30 @@ pub struct Metrics {
     /// their `delete_file`); the sweep destroys them on the same pass.
     /// Leak-safe, never data.
     pub block_release_skipped_no_record: Align64<AtomicU64>,
+    // RECLAIM-ATOMIC (the corpse-sweep record's residuals A + B,
+    // 2026-09-11): a reclaimed ino's reference releases ride the SAME
+    // journal entry as its record + xattr destroy, so a failed release
+    // can never leave the inode gone with its references on the ledger.
+    /// A reclaim destroy WITHHELD because the entry carrying the ino's
+    /// releases did not commit (or its layout could not be read): the
+    /// record survives with its layout, the next reclaim/sweep retries
+    /// the pair. One WARN per refused ino. Growth = a failing meta
+    /// volume, never a leak (the pre-fix shape destroyed the record and
+    /// orphaned every reference forever — permanent C8 drift).
+    pub reclaim_destroy_refused_release_failed: Align64<AtomicU64>,
+    /// Joint release+destroy entries committed (each carried ≥ 1
+    /// reference release beside its inode/xattr `Delete`s) — the
+    /// engagement instrument: a reclaim batch of N block-owning corpses
+    /// is ONE entry, where the pre-fix shape paid N release entries plus
+    /// the destroy.
+    pub reclaim_release_destroy_joint_commits: Align64<AtomicU64>,
+    /// Single-ino destroys that needed MORE than one journal entry (a
+    /// corpse whose releases + xattrs + record exceed the whole-entry
+    /// cap): releases first, then the other xattrs, the `layout` xattr
+    /// and the inode record LAST — every crash prefix leaves a corpse the
+    /// next sweep converges on. Pre-fix such a corpse failed loud at
+    /// every mount forever.
+    pub reclaim_single_ino_chunked_destroys: Align64<AtomicU64>,
     /// Finding 23's SHIELD (the tracked twin of the untracked refusal
     /// above): a SHIPPED free named an offset whose every RAM reference
     /// the durable ledger still JUSTIFIES (`population ≥ refcount`) —
@@ -11423,6 +11447,10 @@ impl SqueezefsFilesystem {
                 "block_double_frees": METRICS.block_double_frees.load(Ordering::Relaxed),
                 "block_untracked_free_refusals": METRICS.block_untracked_free_refusals.load(Ordering::Relaxed),
                 "block_release_skipped_no_record": METRICS.block_release_skipped_no_record.load(Ordering::Relaxed),
+                // RECLAIM-ATOMIC
+                "reclaim_destroy_refused_release_failed": METRICS.reclaim_destroy_refused_release_failed.load(Ordering::Relaxed),
+                "reclaim_release_destroy_joint_commits": METRICS.reclaim_release_destroy_joint_commits.load(Ordering::Relaxed),
+                "reclaim_single_ino_chunked_destroys": METRICS.reclaim_single_ino_chunked_destroys.load(Ordering::Relaxed),
                 "block_live_free_refusals": METRICS.block_live_free_refusals.load(Ordering::Relaxed),
                 "block_claim_anomalies": METRICS.block_claim_anomalies.load(Ordering::Relaxed),
                 "read_settle_stale_head_refetches": METRICS.read_settle_stale_head_refetches.load(Ordering::Relaxed),

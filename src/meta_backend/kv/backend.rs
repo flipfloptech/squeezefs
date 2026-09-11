@@ -286,6 +286,33 @@ pub static TEST_LAYOUT_MERGE_HOLD_MS: AtomicU64 = AtomicU64::new(0);
 pub static TEST_BRING_UP_COVER_DISABLED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
+/// Test seam (RECLAIM-ATOMIC, the corpse-sweep record's residual A): the
+/// commit that carries a reclaimed ino's durable reference RELEASES is
+/// refused before it is staged — the failed-release shape the reclaim
+/// batch and the sweep must answer by RETAINING the record (never
+/// destroying it with its references still on the ledger). One relaxed
+/// load per release commit; `false` = off.
+pub static TEST_FAIL_RECLAIM_RELEASE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// [`TEST_FAIL_RECLAIM_RELEASE`]'s setter (the `test_set_*` idiom).
+pub fn test_set_fail_reclaim_release(on: bool) {
+    TEST_FAIL_RECLAIM_RELEASE.store(on, Ordering::Relaxed);
+}
+
+/// Test seam (RECLAIM-ATOMIC, residual B): a single-ino chunked destroy
+/// STOPS after this many committed entries — the durable state of a crash
+/// between two of its chunks, produced deterministically. `0` = off (one
+/// relaxed load per chunk). The daemon reads the registered knob
+/// `SQUEEZEFS_TEST_DESTROY_CHUNK_STOP_AFTER` into the same word at open.
+pub static TEST_DESTROY_CHUNK_STOP_AFTER: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(0);
+
+/// [`TEST_DESTROY_CHUNK_STOP_AFTER`]'s setter (`None` = off).
+pub fn test_set_destroy_chunk_stop_after(after: Option<u32>) {
+    TEST_DESTROY_CHUNK_STOP_AFTER.store(after.unwrap_or(0), Ordering::Relaxed);
+}
+
 /// `SQUEEZEFS_TIMEOUT` as the D1.b watchdog/escalation threshold
 /// (design-metadata-throughput §6): read per `open` (control-plane —
 /// never on an op path), default 30 s. Deliberately NOT process-memoized:
@@ -10334,6 +10361,18 @@ impl KvMetaBackend {
         self.commit_block_refs_inner(ino, ops, true).await
     }
 
+    /// [`TEST_FAIL_RECLAIM_RELEASE`]: refuse the commit that would carry a
+    /// reclaimed ino's reference releases.
+    fn reclaim_release_seam_gate() -> Result<()> {
+        if TEST_FAIL_RECLAIM_RELEASE.load(Ordering::Relaxed) {
+            return Err(crate::error::SqueezefsError::InvalidOperation(
+                "reclaim release commit refused by TEST_FAIL_RECLAIM_RELEASE (test seam)"
+                    .to_string(),
+            ));
+        }
+        Ok(())
+    }
+
     async fn commit_block_refs_inner(
         &self,
         ino: Ino,
@@ -10347,6 +10386,9 @@ impl KvMetaBackend {
             return Ok(Some(Vec::new()));
         }
         self.write_gate()?;
+        if witness && ops.iter().any(|op| !op.take) {
+            Self::reclaim_release_seam_gate()?;
+        }
         // The ino's I-guard: the records belong to this ino's ownership
         // set, so the same 4a lock that serializes its layout commits
         // serializes their release (lock order unchanged — 4a before 4b,

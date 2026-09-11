@@ -35,6 +35,11 @@
 //!  7. The CQE revalidation refuses a tenant whose block's incarnation word
 //!     transitioned between plan and CQE (the re-mint model: retire →
 //!     publish under a new generation); the prelude refuses while unstable.
+//!  7b. The §5.10 stale-incarnation disposition on BOTH arms: a WHOLE-BLOCK
+//!     key whose lifetime is already dead at plan time (offset freed and
+//!     reissued while the RAM layout still names the old `@inc` key) is
+//!     refused (`Overlay`) — its fill word is stable, so the seqlock alone
+//!     would pass and the DMA would return the reissued offset's bytes.
 //!  8. `ipc_direct_phase_ns` accounts every packed direct op (the `total`
 //!     count delta ≡ ops) — on a DEFAULT mount through the governed-miss
 //!     ladder, where a re-read keeps direct-driving (the handler's staged
@@ -135,6 +140,14 @@ fn pattern(tag: usize, len: usize) -> Vec<u8> {
                 % 251) as u8
         })
         .collect()
+}
+
+/// One whole striped block of deterministic content: a 4 KiB `pattern`
+/// tile salted by `(tag, block)`, repeated (a 4 MiB per-byte closure is
+/// too slow for a fixture).
+fn block_pattern(tag: usize, block: usize) -> Vec<u8> {
+    let tile = pattern(tag * 7 + block, 4096);
+    tile.iter().copied().cycle().take(BLOCK).collect()
 }
 
 fn metric(a: &squeezefs::fuse_client::Align64<AtomicU64>) -> u64 {
@@ -443,6 +456,24 @@ impl Fx {
         (ino, fid, mapping)
     }
 
+    /// A two-block STRIPED file (the `ipc_direct_drive_tests` shape: the
+    /// high block first, so the very first write exceeds the staged
+    /// threshold) with `block_pattern(tag, b)` content. Returns the ino.
+    async fn striped_file(&self, name: &str, tag: usize) -> u64 {
+        let ino = self.create(name).await;
+        for b in [1u64, 0] {
+            self.write_at(ino, b * BLOCK as u64, &block_pattern(tag, b as usize))
+                .await;
+        }
+        self.fs
+            .fsync(req(), ino, 0, false)
+            .await
+            .unwrap_or_else(|e| panic!("fsync ino {ino} failed: {e:?}"));
+        let m = self.fs.router.metadata_cache.get(&ino).expect("RAM layout");
+        assert_eq!(m.file_type, "striped", "fixture premise: striped layout");
+        ino
+    }
+
     /// The RAM layout's `block_map[0]` (the prelude's binding authority).
     fn mapping0(&self, ino: u64) -> String {
         self.fs
@@ -647,22 +678,38 @@ impl ClientSession {
         arena_off: u64,
         what: &str,
     ) -> Vec<u8> {
-        let r = {
-            let gen = self.submit_on(
-                0,
-                &SlotDescriptor {
-                    op: OP_READ,
-                    flags: 0,
-                    binding,
-                    offset,
-                    len: len as u32,
-                    arena_off,
-                },
-            );
-            self.wait_done(0, gen, what)
-        };
-        assert!(r >= 0, "{what}: ring read failed with {r}");
-        self.arena_read(arena_off, r as usize)
+        match self.ring_pread_raw(binding, offset, len, arena_off, what) {
+            Ok(bytes) => bytes,
+            Err(r) => panic!("{what}: ring read failed with {r}"),
+        }
+    }
+
+    /// [`Self::ring_pread`] with the slot's verdict surfaced: `Err(-errno)`
+    /// when the daemon refused the op (the handler's own error surface).
+    fn ring_pread_raw(
+        &self,
+        binding: u64,
+        offset: u64,
+        len: usize,
+        arena_off: u64,
+        what: &str,
+    ) -> Result<Vec<u8>, i64> {
+        let gen = self.submit_on(
+            0,
+            &SlotDescriptor {
+                op: OP_READ,
+                flags: 0,
+                binding,
+                offset,
+                len: len as u32,
+                arena_off,
+            },
+        );
+        let r = self.wait_done(0, gen, what);
+        if r < 0 {
+            return Err(r);
+        }
+        Ok(self.arena_read(arena_off, r as usize))
     }
 }
 
@@ -1310,6 +1357,142 @@ async fn the_cqe_revalidation_refuses_an_incarnation_transition_between_plan_and
         .await
         .expect("truncate");
     assert!(!fx.fs.ipc_direct_revalidate(&snap1));
+    fx.close().await;
+}
+
+// ---------------------------------------------------------------------------
+// 7b. the §5.10 stale-incarnation disposition on the WHOLE-BLOCK arm: a key
+//     whose lifetime is ALREADY dead at plan time (freed + reissued while
+//     the RAM layout still names the old `@inc` key — the stale-binding
+//     class the handler's rebind ladder exists for) has a STABLE fill word
+//     across plan → CQE, so the striped arm's revalidation passes and the
+//     DMA returns the REISSUED offset's bytes; the handler's funnel
+//     (`read_block_range` → `incarnation_ok`) refuses that key.
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_whole_block_key_naming_a_dead_lifetime_is_refused_never_served_reissued_bytes() {
+    let _g = serial().await;
+    let _l = arm_levers();
+    let dir = tempfile::tempdir().unwrap();
+    let fx = open_fresh(dir.path(), 1, "dead-lifetime", "none").await;
+
+    let ino = fx.striped_file("wb.bin", 90).await;
+    let k0 = fx.mapping0(ino);
+    let parts = fx
+        .fs
+        .router
+        .backend_router
+        .parse_block_key_parts(&clean_block_key(&k0))
+        .expect("striped key parses");
+    let a = parts.offset;
+    let alloc = fx.alloc(0);
+    assert_ne!(
+        parts.incarnation, 0,
+        "premise: the default format stamps lifetimes ({k0})"
+    );
+    assert_eq!(alloc.live_incarnation(a), parts.incarnation);
+    assert_eq!(
+        alloc.refcount(a),
+        Some(1),
+        "premise: block 0 is solely owned"
+    );
+    let want = block_pattern(90, 0);
+    let (off, len) = (16u64 * 4096, 4096usize);
+
+    // A quiet striped block plans and revalidates.
+    let snap0 = fx
+        .fs
+        .ipc_direct_read_probe(ino, off, len as u32, now_ns())
+        .expect("a quiet striped block plans");
+    assert!(snap0.packed_file_id.is_none(), "the striped arm");
+    assert!(fx.fs.ipc_direct_revalidate(&snap0));
+
+    // Retire the offset's lifetime and REISSUE it under a new one, with
+    // the RAM layout untouched — it still names `a@inc0`. Then a new
+    // owner's bytes land and the word re-stabilizes under the new
+    // generation (the state the handler's rebind ladder is built for).
+    alloc.free_block(a).await.expect("terminal free");
+    let reissued = alloc.allocate_block().await.expect("allocate");
+    assert_eq!(
+        reissued, a,
+        "premise: the freed offset is reissued (free-list first)"
+    );
+    let other = block_pattern(91, 0);
+    fx.fs
+        .router
+        .backend_router
+        .default_device
+        .write_block(a, bytes::Bytes::copy_from_slice(&other[..128 * KIB]))
+        .await
+        .expect("the new owner's bytes");
+    alloc.publish_block(a);
+    assert_ne!(
+        alloc.live_incarnation(a),
+        parts.incarnation,
+        "premise: the live lifetime moved"
+    );
+    assert_eq!(
+        fx.mapping0(ino),
+        k0,
+        "premise: the RAM layout still names the dead key"
+    );
+    assert!(
+        alloc.fill_incarnation(a).is_some(),
+        "premise: the fill word is STABLE — the seqlock alone cannot see a dead lifetime"
+    );
+    assert!(
+        !fx.fs.ipc_direct_revalidate(&snap0),
+        "a plan taken under the old generation fails at the CQE (the word moved)"
+    );
+
+    // THE CONTRACT (RED today: the striped arm PLANS the read, and a plan
+    // taken NOW revalidates — the stable word is the new lifetime's):
+    // a key naming a dead lifetime is refused to the handler.
+    let probe = fx.fs.ipc_direct_read_probe(ino, off, len as u32, now_ns());
+    assert!(
+        matches!(probe, Err(IpcDirectIneligible::Overlay)),
+        "a whole-block key whose lifetime is dead must be refused (Overlay), got {probe:?}"
+    );
+
+    // Through the ring: never the reissued offset's bytes — the handler
+    // owns the outcome (its funnel refuses the dead key; the rebind ladder
+    // re-resolves the SAME layout, so its own law is EIO or the exact
+    // bytes, never `other`).
+    let sdir = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).expect("repo-dir tempdir");
+    let fd = odirect_standin(&fx, &sdir, "wb.bin", ino);
+    let (s, b) = ClientSession::establish(&fx, &fd);
+    fx.fs.router.set_direct_device_true(true);
+    let before = snap();
+    let got = tokio::task::block_in_place(|| s.ring_pread_raw(b, off, len, 0, "dead lifetime"));
+    let d = delta(&before);
+    fx.fs.router.set_direct_device_true(false);
+    match &got {
+        Ok(bytes) => {
+            assert_ne!(
+                bytes,
+                &other[off as usize..off as usize + len].to_vec(),
+                "the REISSUED offset's bytes were served — the wrong-bytes exposure"
+            );
+            assert_eq!(bytes, &want[off as usize..off as usize + len].to_vec());
+        }
+        Err(errno) => assert_eq!(
+            *errno,
+            -i64::from(libc::EIO),
+            "the handler's refusal is EIO"
+        ),
+    }
+    assert_eq!(
+        d.dd_serves, 0,
+        "a dead-lifetime key never direct-drives (got {} serves; outcome {got:?})",
+        d.dd_serves
+    );
+    assert!(
+        d.inel_overlay >= 1,
+        "the overlay ledger records the refusal"
+    );
+    assert!(d.handoffs >= 1, "the op rode the handler");
+    drop(s);
     fx.close().await;
 }
 

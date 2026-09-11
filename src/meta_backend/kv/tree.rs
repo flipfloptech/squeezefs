@@ -1398,6 +1398,21 @@ impl KvTree {
                 return Err(e);
             }
         };
+        if log::log_enabled!(log::Level::Debug) {
+            // §4.7 heap admission's audit line: claims vs the promise this
+            // node carried (an unpromised leaf claim is a draw on the
+            // reserve the admission did not see).
+            let promised = node.lock().read().await.promised();
+            log::debug!(
+                "SMO tree {} level {} node {:#x}: fold {total} B → {} part(s), claimed {} \
+                 extent(s), {promised} promised",
+                self.tree_id,
+                node.level(),
+                node.addr(),
+                parts.len(),
+                claimed_extents.len(),
+            );
+        }
 
         // ---- K6b production journaling (before any lock): make the
         // successor images durable, then admit the SMO's records from the
@@ -1541,6 +1556,22 @@ impl KvTree {
                         .min()
                         .unwrap_or(u64::MAX);
                     succ.apply_locked(&mut sg, mine, floor)?;
+                    // §4.7 heap admission: the leftovers were admitted
+                    // against the PREDECESSOR's promise (just released by
+                    // `take_overlay`), but this SMO folded only the frozen
+                    // delta — the leftovers still owe their flush. A
+                    // successor whose inherited delta overflows its log
+                    // carries the promise for the SMO it will need, so
+                    // that claim is ledger budget and not a silent draw on
+                    // the reserve (the storm shape: several commits land
+                    // in the build window, the successor holds a two-node
+                    // fold with nothing promised).
+                    if sg.projected_log_end(layout, 0) > layout.node_size() {
+                        let (fold, parts) = succ
+                            .snapshot()
+                            .fold_bytes_upper_with(&mut [], layout.split_part_capacity());
+                        sg.promise(layout.smo_extents_for_parts(fold, parts), fold);
+                    }
                 }
             }
 

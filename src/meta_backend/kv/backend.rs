@@ -8549,24 +8549,34 @@ impl KvMetaBackend {
                 drop(guards);
                 let adm = s.admission.take().expect("admission held until reserve");
                 self.ring.core().release(adm);
-                // Budget a checkpoint cycle can RETURN — promises held by
-                // nodes the flush pass has not reached yet (released at
-                // their SMO/append) and retirements parked on the tail
-                // (released at the barrier) — earns the refused members
-                // ONE retry after one cycle: on a full volume a burst of
-                // deletes would otherwise trip over its own outstanding
-                // compaction promises between two cadence ticks. A refusal
-                // that survives the cycle (or finds nothing to return) is
-                // final: ENOSPC. No node lock is held across the cycle.
+                // Budget the checkpoint can RETURN — promises held by nodes
+                // the flush pass has not reached yet (turned into claims at
+                // their SMO, or released at their append) and retirements
+                // parked on the tail — earns the refused members ONE retry
+                // behind the cycles that return it: on a full volume a
+                // burst of deletes would otherwise trip over its own
+                // outstanding compaction promises between two cadence
+                // ticks. Two barriered cycles, because reclamation lags one
+                // cycle by design (§4.6 pt 2): the first cycle's SMOs park
+                // their old extents at gates past the tail that cycle
+                // covers, the second cycle's tail passes them. A refusal
+                // that survives (or finds nothing to return) is final:
+                // ENOSPC. No node lock is held across the cycles.
                 let returnable = self.cache.heap_promised() > 0 || self.alloc.pending_count() > 0;
                 if !cycled_for_space && returnable {
                     cycled_for_space = true;
-                    if let Err(e) = self.checkpoint_now().await {
-                        log::warn!(
-                            "meta volume {}: checkpoint cycle for heap headroom failed: {e} \
-                             (the refused members will be answered on the retry)",
-                            self.path.display()
-                        );
+                    for _ in 0..2 {
+                        if let Err(e) = self.checkpoint_now().await {
+                            log::warn!(
+                                "meta volume {}: checkpoint cycle for heap headroom failed: {e} \
+                                 (the refused members will be answered on the retry)",
+                                self.path.display()
+                            );
+                            break;
+                        }
+                        if self.alloc.pending_count() == 0 {
+                            break;
+                        }
                     }
                 } else {
                     // Fan the refusals out (pre-reserve terminal outcomes).
@@ -9148,22 +9158,70 @@ impl KvMetaBackend {
     ) -> Vec<(usize, KvError)> {
         let layout = self.cache.config().layout;
         let node_size = layout.node_size();
+        // `lock_set` is addr-sorted and deduped (the union lock order) —
+        // slot lookup is a binary search.
+        let slot = |leaf: &Arc<CachedNode>| -> usize {
+            lock_set
+                .binary_search_by_key(&leaf.addr(), |n| n.addr())
+                .expect("leaf is locked")
+        };
+        // FAST PATH (the shape every pass on a volume with room takes):
+        // per leaf, the WHOLE batch's bytes projected at once — a leaf
+        // that absorbs them all in place needs no per-member accounting.
+        // Stack-buffered for the usual union widths: the pass's hot path
+        // must not gain an allocation per batch.
+        let mut totals_buf = [0usize; 32];
+        let mut totals_heap: Vec<usize> = Vec::new();
+        let totals: &mut [usize] = if lock_set.len() <= totals_buf.len() {
+            &mut totals_buf[..lock_set.len()]
+        } else {
+            totals_heap.resize(lock_set.len(), 0);
+            &mut totals_heap[..]
+        };
+        for (q, entry_leaves) in entries.iter().zip(leaves) {
+            for ((_, r), leaf) in q.recs.iter().zip(entry_leaves) {
+                totals[slot(leaf)] += r.record_ref().encoded_len();
+            }
+        }
+        let any_overflow = totals
+            .iter()
+            .enumerate()
+            .any(|(gi, t)| *t > 0 && guards[gi].projected_log_end(&layout, *t) > node_size);
+        if !any_overflow {
+            return Vec::new();
+        }
+
         let reserve = self.alloc.reserve_extents();
         let compaction_floor = super::alloc_ext::compaction_floor_extents(reserve);
-        // Per locked leaf: this batch's ADMITTED members' records landing
-        // on it, in apply order — the fold projection's pending input.
-        let mut pending: Vec<Vec<(&[u8], RecordKind, usize)>> =
-            (0..lock_set.len()).map(|_| Vec::new()).collect();
+        // Per locked leaf: bytes this batch's ADMITTED members land on it
+        // (the in-place projection's input; the records themselves are
+        // re-derived from `entries` only when a walk needs them).
+        let mut pending: Vec<usize> = vec![0; lock_set.len()];
         // Per member: (leaf slot, bytes) — small, deduped by slot.
         let mut member: Vec<(usize, usize)> = Vec::new();
         let mut refused: Vec<(usize, KvError)> = Vec::new();
+        // The batch's records landing on leaf `gi`, members `..=upto`, in
+        // apply order — the walk's pending input (refused members were
+        // never applied and are skipped).
+        let pending_records = |gi: usize, upto: usize, refused: &[(usize, KvError)]| {
+            entries[..=upto]
+                .iter()
+                .zip(leaves)
+                .enumerate()
+                .filter(|(qi, _)| !refused.iter().any(|(r, _)| r == qi))
+                .flat_map(|(_, (q, entry_leaves))| {
+                    q.recs
+                        .iter()
+                        .zip(entry_leaves)
+                        .filter(move |(_, leaf)| leaf.addr() == lock_set[gi].addr())
+                        .map(|((_, r), _)| (&r.key[..], r.kind, r.record_ref().encoded_len()))
+                })
+                .collect::<Vec<(&[u8], RecordKind, usize)>>()
+        };
         for (qi, (q, entry_leaves)) in entries.iter().zip(leaves).enumerate() {
             member.clear();
             for ((_, r), leaf) in q.recs.iter().zip(entry_leaves) {
-                let gi = lock_set
-                    .iter()
-                    .position(|n| n.addr() == leaf.addr())
-                    .expect("leaf is locked");
+                let gi = slot(leaf);
                 let bytes = r.record_ref().encoded_len();
                 match member.iter_mut().find(|(g, _)| *g == gi) {
                     Some((_, b)) => *b += bytes,
@@ -9172,31 +9230,47 @@ impl KvMetaBackend {
             }
             let mut verdict: Option<KvError> = None;
             for &(gi, bytes) in &member {
-                let pending_bytes: usize = pending[gi].iter().map(|r| r.2).sum();
-                if guards[gi].projected_log_end(&layout, pending_bytes + bytes) <= node_size {
+                if guards[gi].projected_log_end(&layout, pending[gi] + bytes) <= node_size {
                     continue; // in-place append at the flush
                 }
-                let mut extra: Vec<(&[u8], RecordKind, usize)> = pending[gi].clone();
-                extra.extend(
-                    q.recs
-                        .iter()
-                        .zip(entry_leaves)
-                        .filter(|(_, leaf)| leaf.addr() == lock_set[gi].addr())
-                        .map(|((_, r), _)| (&r.key[..], r.kind, r.record_ref().encoded_len())),
-                );
-                let fold = lock_set[gi].snapshot().fold_bytes_upper_with(&mut extra);
-                let mut need = layout.smo_extents_for_fold(fold);
-                let is_split = need > 1;
-                if is_split
-                    && self
-                        .tree_by_id(lock_set[gi].tree_id())
-                        .is_root_addr(lock_set[gi].addr())
-                {
-                    need += 1; // a root leaf's split also mints a new root
+                let is_root = self
+                    .tree_by_id(lock_set[gi].tree_id())
+                    .is_root_addr(lock_set[gi].addr());
+                // A root leaf's split also mints a new root.
+                let with_root = |need: u64| if need > 1 && is_root { need + 1 } else { need };
+                // Cheap re-check on an already-promised node — never the
+                // O(node) walk per commit on a hot leaf between two
+                // flushes: a SPLIT promise carries a cascade extent, so
+                // growth below the layout's window since the last exact
+                // walk cannot need more; a COMPACTION promise (1) covers
+                // growth while the walk's fold plus every byte since stays
+                // within one node (no shadowing credited — an upper bound).
+                let promised = guards[gi].promised();
+                if promised > 0 {
+                    let added = guards[gi].promise_added() + bytes;
+                    let bound = guards[gi].promise_basis() + added;
+                    let covered = if promised == 1 {
+                        bound <= layout.fold_capacity()
+                    } else {
+                        added < layout.split_growth_window()
+                    };
+                    if covered {
+                        guards[gi].note_promise_growth(bytes);
+                        continue;
+                    }
                 }
-                let delta = need.saturating_sub(guards[gi].promised());
+                let mut extra = pending_records(gi, qi, &refused);
+                let (fold, parts) = lock_set[gi]
+                    .snapshot()
+                    .fold_bytes_upper_with(&mut extra, layout.split_part_capacity());
+                let need = with_root(layout.smo_extents_for_parts(fold, parts));
+                let is_split = need > 1;
+                let delta = need.saturating_sub(promised);
                 if delta == 0 {
-                    continue; // already promised by an earlier member/attempt
+                    // Covered by an earlier member/attempt: the exact
+                    // estimate becomes the new basis.
+                    guards[gi].set_promise_basis(fold);
+                    continue;
                 }
                 let floor = if is_split { reserve } else { compaction_floor };
                 let claimable = self
@@ -9204,7 +9278,7 @@ impl KvMetaBackend {
                     .free_extents()
                     .saturating_sub(self.cache.heap_promised());
                 if claimable.saturating_sub(delta) >= floor {
-                    guards[gi].promise(delta);
+                    guards[gi].promise(delta, fold);
                     if is_split {
                         // A leaf was just minted-in-budget: the growth
                         // floor is clear.
@@ -9214,11 +9288,14 @@ impl KvMetaBackend {
                     log::debug!(
                         "heap admission refused: tree {} leaf {:#x} projects a fold of {fold} B \
                          (capacity {}) needing {need} extent(s), {} promised; claimable {claimable} \
-                         − {delta} < floor {floor}",
+                         − {delta} < floor {floor} (free {}, ledger {}, pending-free {})",
                         lock_set[gi].tree_id(),
                         lock_set[gi].addr(),
                         layout.fold_capacity(),
                         guards[gi].promised(),
+                        self.alloc.free_extents(),
+                        self.cache.heap_promised(),
+                        self.alloc.pending_count(),
                     );
                     verdict = Some(KvError::NoSpace {
                         free: claimable,
@@ -9229,12 +9306,8 @@ impl KvMetaBackend {
             }
             match verdict {
                 None => {
-                    for ((_, r), leaf) in q.recs.iter().zip(entry_leaves) {
-                        let gi = lock_set
-                            .iter()
-                            .position(|n| n.addr() == leaf.addr())
-                            .expect("leaf is locked");
-                        pending[gi].push((&r.key[..], r.kind, r.record_ref().encoded_len()));
+                    for &(gi, bytes) in &member {
+                        pending[gi] += bytes;
                     }
                 }
                 Some(e) => refused.push((qi, e)),
@@ -9281,7 +9354,7 @@ impl KvMetaBackend {
     /// (the checkpoint cycle's re-check).
     pub(super) fn heap_growth_floor_clear(&self) -> bool {
         let layout = self.cache.config().layout;
-        let min_split = layout.smo_extents_for_fold(layout.fold_capacity() + 1);
+        let min_split = layout.smo_extents_for_parts(layout.fold_capacity() + 1, 2);
         self.alloc
             .free_extents()
             .saturating_sub(self.cache.heap_promised())

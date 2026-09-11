@@ -708,12 +708,23 @@ impl NodeSnapshot {
     /// linear merge over key-ascending sources (`extra` is sorted here);
     /// runs once per node fill (only when the log is projected to
     /// overflow), so its cost is amortized over the bytes that filled it.
-    pub fn fold_bytes_upper_with(&self, extra: &mut [(&[u8], RecordKind, usize)]) -> usize {
+    ///
+    /// Returns `(fold bytes, greedy parts)`: the parts a split of this
+    /// fold packs at `part_budget` bytes each under `KvTree::smo_replace`'s
+    /// own closing rule (a part closes when the next key group does not
+    /// fit; key groups stay whole) — the same key-ascending order the SMO
+    /// partitions in, over per-key sizes at-or-above the fold's.
+    pub fn fold_bytes_upper_with(
+        &self,
+        extra: &mut [(&[u8], RecordKind, usize)],
+        part_budget: usize,
+    ) -> (usize, usize) {
         // Stable: same-key extra records keep apply order (newest last).
         extra.sort_by(|a, b| a.0.cmp(b.0));
         let base = &self.base;
         let (mut b, mut s, mut t, mut x) = (0usize, 0usize, 0usize, 0usize);
         let mut total = 0usize;
+        let (mut parts, mut acc) = (1usize, 0usize);
         let establishes = |k: RecordKind| matches!(k, RecordKind::Put | RecordKind::Delete);
         loop {
             let kb = (b < base.entries.len()).then(|| base.key_at(&base.entries[b]));
@@ -741,10 +752,8 @@ impl NodeSnapshot {
             // group; otherwise the resident group folds under its own
             // newest establisher and every pending Delta rides on top.
             let pending_base = extra[x..x + xe].iter().rposition(|r| establishes(r.1));
-            match pending_base {
-                Some(p) => {
-                    total += extra[x + p..x + xe].iter().map(|r| r.2).sum::<usize>();
-                }
+            let group: usize = match pending_base {
+                Some(p) => extra[x + p..x + xe].iter().map(|r| r.2).sum(),
                 None => {
                     let base_seq = base.entries[b..b + be]
                         .iter()
@@ -759,25 +768,33 @@ impl NodeSnapshot {
                         )
                         .max()
                         .unwrap_or(0);
-                    total += (b..b + be)
+                    (b..b + be)
                         .filter(|i| base.entries[*i].seq >= base_seq)
                         .map(|i| base.record_ref(i).encoded_len())
-                        .sum::<usize>();
-                    total += self.stable[s..s + se]
-                        .iter()
-                        .chain(&self.tail[t..t + te])
-                        .filter(|r| r.seq >= base_seq)
-                        .map(|r| r.record_ref().encoded_len())
-                        .sum::<usize>();
-                    total += extra[x..x + xe].iter().map(|r| r.2).sum::<usize>();
+                        .sum::<usize>()
+                        + self.stable[s..s + se]
+                            .iter()
+                            .chain(&self.tail[t..t + te])
+                            .filter(|r| r.seq >= base_seq)
+                            .map(|r| r.record_ref().encoded_len())
+                            .sum::<usize>()
+                        + extra[x..x + xe].iter().map(|r| r.2).sum::<usize>()
                 }
+            };
+            total += group;
+            // The SMO's greedy packer, over the same key order: a part
+            // closes when this key's group does not fit a non-empty part.
+            if acc + group > part_budget && acc > 0 {
+                parts += 1;
+                acc = 0;
             }
+            acc += group;
             b += be;
             s += se;
             t += te;
             x += xe;
         }
-        total
+        (total, parts)
     }
 
     /// The newest seq this node holds for `key` across every source —
@@ -1110,6 +1127,12 @@ pub struct NodeDirty {
     /// in-place append leaves the remainder fitting; Drop-owned like the
     /// charge, so a dying object never strands ledger budget.
     promised: u64,
+    /// The fold estimate `promised` was computed for at the last exact
+    /// walk, and the bytes admitted to the node since — the admission's
+    /// cheap re-check: below the layout's growth window the promise's
+    /// cascade extent covers the growth and the O(node) walk is skipped.
+    promise_basis: usize,
+    promise_added: usize,
     /// The owning cache's promise ledger (`NodeCache::heap_promised`).
     heap_promised: Arc<AtomicU64>,
 }
@@ -1201,10 +1224,36 @@ impl NodeDirty {
         self.promised
     }
 
-    /// Promise `extents` more to this node's next SMO — the caller checked
-    /// the budget against the ledger under this node's write lock.
-    pub fn promise(&mut self, extents: u64) {
+    /// The fold estimate the current promise was computed for at the last
+    /// exact walk (0 when nothing is promised).
+    pub fn promise_basis(&self) -> usize {
+        self.promise_basis
+    }
+
+    /// Bytes admitted to this node since the promise's last exact walk.
+    pub fn promise_added(&self) -> usize {
+        self.promise_added
+    }
+
+    /// A member admitted under the existing promise (inside the growth
+    /// window): count its bytes toward the next re-walk.
+    pub fn note_promise_growth(&mut self, bytes: usize) {
+        self.promise_added += bytes;
+    }
+
+    /// Re-base the promise on a fresh exact walk without changing it.
+    pub fn set_promise_basis(&mut self, basis: usize) {
+        self.promise_basis = basis;
+        self.promise_added = 0;
+    }
+
+    /// Promise `extents` more to this node's next SMO, computed for a fold
+    /// of `basis` bytes — the caller checked the budget against the ledger
+    /// under this node's write lock.
+    pub fn promise(&mut self, extents: u64, basis: usize) {
         self.promised += extents;
+        self.promise_basis = basis;
+        self.promise_added = 0;
         self.heap_promised.fetch_add(extents, Ordering::AcqRel);
     }
 
@@ -1216,6 +1265,8 @@ impl NodeDirty {
                 .fetch_sub(self.promised, Ordering::AcqRel);
             self.promised = 0;
         }
+        self.promise_basis = 0;
+        self.promise_added = 0;
     }
 
     /// PR M9 (§5.7): bring the cache budget gauge in line with this open
@@ -1349,6 +1400,8 @@ impl CachedNode {
                 charged: 0,
                 charge: charge.clone(),
                 promised: 0,
+                promise_basis: 0,
+                promise_added: 0,
                 heap_promised,
             }),
             ref_bit: AtomicBool::new(true),

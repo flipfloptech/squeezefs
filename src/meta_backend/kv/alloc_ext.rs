@@ -82,7 +82,13 @@
 //! tree can always fold appends and free space at user-visible ENOSPC —
 //! no write-to-free-space deadlock. K6a/K6b map `NoSpace` onto the crate
 //! error path exactly like today's "Inode table full" analog
-//! (`alloc.rs` → `ENOSPC`).
+//! (`alloc.rs` → `ENOSPC`). **The production user side is the commit
+//! pass's heap admission, not a claim** (design §4.7 amended 2026-09-11):
+//! a user commit's records land in leaf overlays and the flush pass
+//! claims (internal class) for the SMOs they force, so the admission
+//! PROMISES those extents against `free − promised` — splits above the
+//! whole reserve, compactions down to [`compaction_floor_extents`] — and
+//! refuses `NoSpace` where a claim would have.
 //!
 //! ## Append partitioning (pre-RC engineering spec §6.2 item 3)
 //!

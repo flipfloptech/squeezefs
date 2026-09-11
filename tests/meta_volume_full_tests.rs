@@ -440,16 +440,21 @@ fn heap_admission_floors_derive_from_the_reserve_and_the_split_geometry() {
     let cap = layout.fold_capacity();
     assert_eq!(cap, DEFAULT_NODE_SIZE - 4096 - 32 - 32);
     assert_eq!(layout.split_part_capacity(), cap * 3 / 4);
-    // A fold that fits is one compaction extent; one byte over is the
-    // smallest split: two ¾ parts plus the slack extent.
-    assert_eq!(layout.smo_extents_for_fold(0), 1);
-    assert_eq!(layout.smo_extents_for_fold(cap), 1);
-    assert_eq!(layout.smo_extents_for_fold(cap + 1), 3);
-    // A fold worth 3.5 parts packs into 4 parts (+1 slack).
+    // A fold that fits is one compaction extent whatever the packer
+    // says; one byte over is the smallest split: its two parts plus the
+    // rounding and cascade extents.
+    assert_eq!(layout.smo_extents_for_parts(0, 1), 1);
+    assert_eq!(layout.smo_extents_for_parts(cap, 1), 1);
+    assert_eq!(layout.smo_extents_for_parts(cap + 1, 2), 4);
+    assert_eq!(layout.smo_extents_for_parts(cap * 3, 14), 16);
+    // The growth window a split promise absorbs without a re-walk is what
+    // a NEW greedy part needs at minimum: the part budget less the largest
+    // record the layout admits.
     assert_eq!(
-        layout.smo_extents_for_fold(layout.split_part_capacity() * 7 / 2),
-        5
+        layout.split_growth_window(),
+        layout.split_part_capacity() - layout.record_value_cap()
     );
+    assert!(layout.split_growth_window() > layout.record_value_cap());
     // The append frame is the bset frame's geometry: headers + bytes,
     // page-aligned; nothing pending costs nothing.
     assert_eq!(layout.append_frame_len(0), 0);

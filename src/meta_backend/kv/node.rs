@@ -226,20 +226,35 @@ impl NodeLayout {
         self.fold_capacity() * 3 / 4
     }
 
-    /// Extents the SMO of a leaf whose fold measures `fold_bytes` claims
-    /// (§4.7 heap admission's promise): one for a compaction (the fold
-    /// fits one node), else the greedy ¾-fill part count plus one — the
-    /// greedy packer may open one more part than the byte quotient when a
-    /// record straddles a part boundary, and over-promising by an extent
-    /// only refuses growth an extent early (the surplus releases at the
-    /// SMO); under-promising is what lets a flush pass run the heap to
-    /// zero. A ROOT leaf's split also mints a new root (+1, the caller's).
-    pub fn smo_extents_for_fold(&self, fold_bytes: usize) -> u64 {
+    /// Extents the SMO of a leaf whose fold measures `fold_bytes` in
+    /// `parts` greedy ¾-fill parts claims (§4.7 heap admission's
+    /// promise): one for a compaction (the fold fits one node), else the
+    /// part count plus two — one for the packer's own rounding against a
+    /// key-ordered estimate that over-sizes records, one for the CASCADE
+    /// growth below [`Self::split_growth_window`] bytes of later
+    /// admissions can add (bytes landing mid-order push each part's last
+    /// group into the next, which is at most one extra part at the end).
+    /// Over-promising by an extent only refuses growth an extent early
+    /// (the surplus releases at the SMO); under-promising is what lets a
+    /// flush pass run the heap to zero. A ROOT leaf's split also mints a
+    /// new root (+1, the caller's).
+    pub fn smo_extents_for_parts(&self, fold_bytes: usize, parts: usize) -> u64 {
         if fold_bytes <= self.fold_capacity() {
             1
         } else {
-            fold_bytes.div_ceil(self.split_part_capacity()) as u64 + 1
+            parts as u64 + 2
         }
+    }
+
+    /// Bytes a promised leaf may absorb after its exact packing without a
+    /// re-walk: every greedy part but the last closes because the next
+    /// record did not fit, so a NEW part needs more than `budget − max
+    /// record` bytes — below that only the cascade extent the promise
+    /// already carries can be needed.
+    pub fn split_growth_window(&self) -> usize {
+        self.split_part_capacity()
+            .saturating_sub(self.record_value_cap())
+            .max(1)
     }
 
     /// On-disk length of the append frame `bytes` of encoded records

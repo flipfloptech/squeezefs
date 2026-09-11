@@ -127,7 +127,16 @@
 //! cycles fail the volume loud (the genuinely-wedged-tail terminal — a
 //! tail pinned by something no flush can discharge, e.g. a stuck
 //! in-flight reservation — never an unbounded retry loop, and never the
-//! resolvable pinned-floor shape).
+//! resolvable pinned-floor shape). The audit judges TWO classes
+//! (2026-09-11, design §4.7 amended): a cycle whose flush pass deferred
+//! a node because the allocator answered `NoSpace` is a SPACE standstill
+//! — counted on `heap_full_cycles`, latched loud once on the volume's
+//! `heap_full` posture, neither advancing nor resetting the wedge rung,
+//! never terminal — because the tail is legitimately pinned by a node
+//! the pass could not flush for want of an extent; the commit pass's
+//! heap admission (`KvMetaBackend::admit_heap_locked`) promises every
+//! projected SMO's extents, so this class is the residual. The FAILED
+//! terminal is the WEDGE class alone.
 //!
 //! ---
 //!

@@ -2342,6 +2342,43 @@ impl JobFabric {
                 }
                 Self::duty_park(ctl, start.elapsed()).await;
             }
+            // The §4.6a merge arm (design-cow-kv-metadata §4.6a (e), the
+            // third trigger): the census's UNDERFULL leaves, merged through
+            // the EXISTING merge SMO on the same serialization; a
+            // compaction-floor refusal ends the volume's pass (the
+            // checkpoint cycles return the extents; a re-run continues).
+            // Re-censused after the nudges: a compaction can leave a leaf
+            // underfull.
+            let census = kv.dead_bset_census();
+            ctl.tasks_total
+                .fetch_add(census.merge_candidates.len() as u64, Ordering::Relaxed);
+            for chunk in census.merge_candidates.chunks(8) {
+                if ctl.cancelled.load(Ordering::SeqCst) || ctl.paused.load(Ordering::SeqCst) {
+                    break;
+                }
+                let start = std::time::Instant::now();
+                match kv.defrag_merge_leaves(chunk).await {
+                    Ok(merged) => {
+                        METRICS
+                            .defrag_meta_merges
+                            .fetch_add(merged, Ordering::Relaxed);
+                        ctl.done.fetch_add(chunk.len() as u64, Ordering::Relaxed);
+                        METRICS
+                            .job_tasks_done
+                            .fetch_add(chunk.len() as u64, Ordering::Relaxed);
+                    }
+                    Err(e) => {
+                        self.fail_job(job_id, ctl, &format!("defrag-meta merge failed: {e}"))
+                            .await;
+                        return;
+                    }
+                }
+                if last_checkpoint.elapsed() >= Duration::from_secs(CHECKPOINT_SECS) {
+                    let _ = self.checkpoint(job_id, ctl).await;
+                    last_checkpoint = std::time::Instant::now();
+                }
+                Self::duty_park(ctl, start.elapsed()).await;
+            }
         }
         if ctl.cancelled.load(Ordering::SeqCst) {
             let _ = self.checkpoint_as(job_id, ctl, JobState::Cancelled).await;

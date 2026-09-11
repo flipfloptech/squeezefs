@@ -5541,20 +5541,89 @@ impl KvMetaBackend {
     /// `--report-only` engine, the offline harness — page the trees in
     /// with a full range walk first (`squeezefs::defrag::measure` does).
     pub fn dead_bset_census(&self) -> DeadBsetCensus {
+        let layout = self.cache.config().layout;
+        let durable_tail = self.cache.durable_tail();
         let mut out = DeadBsetCensus::default();
         self.node_cache().for_each_node(|n| {
             if n.level() != 0 || n.state().is_superseded() {
                 return;
             }
-            let (total, distinct) = n.snapshot().indexed_record_census();
+            let snap = n.snapshot();
+            let (total, distinct) = snap.indexed_record_census();
             out.leaves += 1;
             out.records_indexed += total;
             out.records_live += distinct;
             if total > distinct {
                 out.candidates.push((n.tree_id(), n.addr()));
             }
+            // §4.6a (e): the underfull face — a root leaf has no sibling.
+            if !self
+                .tree_by_id_opt(n.tree_id())
+                .is_some_and(|t| t.is_root_addr(n.addr()))
+                && snap
+                    .fold_bytes_upper_with(&mut [], layout.merge_pair_capacity(), durable_tail)
+                    .0
+                    <= layout.merge_candidate_capacity()
+            {
+                out.merge_candidates.push((n.tree_id(), n.addr()));
+            }
         });
+        self.merge_candidates
+            .store(out.merge_candidates.len() as u64, Ordering::Relaxed);
         out
+    }
+
+    /// The tree a census entry belongs to, if this volume mounts it.
+    fn tree_by_id_opt(&self, id: u8) -> Option<&KvTree> {
+        self.all_trees().into_iter().find(|t| t.tree_id() == id)
+    }
+
+    /// §4.6a (e), the D4 arm's MERGE half: merge each candidate leaf with
+    /// a sibling through the EXISTING merge SMO (`KvTree::merge_node_at` →
+    /// `smo_merge`), serialized with the checkpoint task through the
+    /// per-volume SMO mutex — the `defrag_compact_nodes` discipline
+    /// verbatim: journal-reserve / pending-free refusals run a checkpoint
+    /// cycle and retry (bounded), a compaction-floor refusal (`NoSpace`)
+    /// ends the pass for this volume (the cycles return the merged
+    /// extents; a later run continues). Returns the merges + root
+    /// collapses executed (vanished/superseded/no-longer-mergeable
+    /// candidates no-op — the census is advisory, the SMO revalidates).
+    pub async fn defrag_merge_leaves(
+        &self,
+        targets: &[(u8, u64)],
+    ) -> std::result::Result<u64, KvError> {
+        let mut smo = self.smo.lock().await;
+        let trees = self.all_trees();
+        let mut out = crate::meta_backend::kv::tree::MaintenanceOutcome::default();
+        'targets: for &(tree_id, addr) in targets {
+            let Some(tree) = trees.iter().find(|t| t.tree_id() == tree_id) else {
+                continue; // unknown tree id: stale/foreign census entry
+            };
+            let mut attempts = 0;
+            loop {
+                match tree.merge_node_at(&mut smo, addr, &mut out).await {
+                    Ok(_) => break,
+                    Err(KvError::JournalReserveExhausted { .. })
+                    | Err(KvError::PendingFreeFull { .. })
+                        if attempts < 4 =>
+                    {
+                        attempts += 1;
+                        self.checkpoint_cycle(&mut smo, true).await?;
+                    }
+                    Err(e @ KvError::NoSpace { .. }) => {
+                        log::info!(
+                            "defrag-meta merge pass on {:?} stopped at the compaction floor \
+                             ({e}); the checkpoint cycles return the merged extents",
+                            self.path
+                        );
+                        self.merge_backlog.store(true, Ordering::Release);
+                        break 'targets;
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
+        }
+        Ok(out.merges + out.root_collapses)
     }
 
     /// PR VL7 (§5.7 D4): the **compaction nudge** — fold each candidate
@@ -5617,6 +5686,10 @@ pub struct DeadBsetCensus {
     pub records_live: u64,
     /// `(tree_id, node_addr)` of every leaf carrying dead records.
     pub candidates: Vec<(u8, u64)>,
+    /// §4.6a (e): `(tree_id, node_addr)` of every UNDERFULL non-root leaf
+    /// (fold ≤ ¼ capacity, covered tombstones credited as elided) — the
+    /// merge arm's input and the `mergeable_leaves` face.
+    pub merge_candidates: Vec<(u8, u64)>,
 }
 
 // ---------------------------------------------------------------------------

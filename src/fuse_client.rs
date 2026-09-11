@@ -6503,6 +6503,13 @@ pub struct Metrics {
     /// record bytes) — not ratio-encoded.
     pub frag_d3_pressure_bytes: Align64<AtomicU64>,
     pub frag_d4_dead_bset_ratio: Align64<AtomicU64>,
+    // LEAF-MERGE (design-cow-kv-metadata §4.6a (e)/(h)): the D4 merge face.
+    /// Underfull non-root meta leaves across the set's meta volumes at the
+    /// last defrag measure (a plain count — the merge arm's candidates).
+    pub frag_d4_mergeable_leaves: Align64<AtomicU64>,
+    /// D4 sibling merges + root collapses the defrag-meta job ran
+    /// (`meta_kv_node_merges` / `meta_kv_root_collapses` move in lockstep).
+    pub defrag_meta_merges: Align64<AtomicU64>,
     /// §5.1.6 remote-wire family (design-volume-lifecycle §10, PR VL2b).
     /// Currently-enrolled remote workers (gauge).
     pub job_remote_workers: Align64<AtomicU64>,
@@ -11715,6 +11722,9 @@ impl SqueezefsFilesystem {
                 "frag_d2_locality": crate::defrag::decode_ratio(METRICS.frag_d2_locality.load(Ordering::Relaxed)),
                 "frag_d3_pressure_bytes": METRICS.frag_d3_pressure_bytes.load(Ordering::Relaxed),
                 "frag_d4_dead_bset_ratio": crate::defrag::decode_ratio(METRICS.frag_d4_dead_bset_ratio.load(Ordering::Relaxed)),
+                // LEAF-MERGE (§4.6a): the D4 merge face — a count, not a ratio.
+                "frag_d4_mergeable_leaves": METRICS.frag_d4_mergeable_leaves.load(Ordering::Relaxed),
+                "defrag_meta_merges": METRICS.defrag_meta_merges.load(Ordering::Relaxed),
                 "job_remote_workers": METRICS.job_remote_workers.load(Ordering::Relaxed),
                 "job_remote_enrollments": METRICS.job_remote_enrollments.load(Ordering::Relaxed),
                 "job_remote_enroll_refused": METRICS.job_remote_enroll_refused.load(Ordering::Relaxed),

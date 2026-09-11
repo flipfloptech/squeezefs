@@ -11,7 +11,7 @@
 //! | **D1 pack** (PK6) | per PACK block — a block whose every referencer is a staged-layout tenant's size-carrying mapping: `occupancy = Σ_{distinct off} pack_slot_len(max len) / CHUNK`, same-`off` windows (the clone share, the nested prefix share) counted ONCE; a VICTIM iff `live ≤ pack_max_slot_bytes()` (§5.5's one law) | `JobType::DefragPack` — re-pack the victims' live windows into the open pack (`squeezefs defrag --pack`) |
 //! | **D2** file locality | fraction of logically-adjacent striped block pairs whose physical mappings are same-backend ascending | `JobType::DefragData` — refcount-1 quiescent rewrites onto one backend (`DestPick::BackendAscending`) |
 //! | **D3** staged-extent pressure | parked overlay bytes (`parked_extent_bytes`) + spilled `active_block_ext:` record bytes | `JobType::DefragFold` — the W2 fold machinery kicked to completion |
-//! | **D4** meta node occupancy | per meta volume: dead (superseded) records vs distinct keys in the serialized bset logs (`KvMetaBackend::dead_bset_census`) | `JobType::DefragMeta` — leaf compaction through the SMO serialization |
+//! | **D4** meta node occupancy | per meta volume: dead (superseded) records vs distinct keys in the serialized bset logs (`KvMetaBackend::dead_bset_census`), plus the UNDERFULL leaf count `mergeable_leaves` (fold ≤ ¼ capacity — design-cow-kv-metadata §4.6a) | `JobType::DefragMeta` — leaf compaction through the SMO serialization, then the §4.6a sibling merge over the underfull leaves (`defrag_merge_leaves`) |
 //!
 //! The virgin tail past `highest_block` deliberately does NOT count as
 //! free space for D1: it is already contiguous and already reclaimable —
@@ -102,6 +102,9 @@ pub struct D4Volume {
     pub records_live: u64,
     /// `1 − live/indexed` (0.0 when empty).
     pub dead_bset_ratio: f64,
+    /// Underfull non-root leaves (fold ≤ ¼ capacity — design-cow-kv-
+    /// metadata §4.6a (e)): the merge arm's candidates.
+    pub mergeable_leaves: u64,
 }
 
 /// One PACK block's occupancy row (PK6, design-small-file-packing §5.8).
@@ -685,6 +688,7 @@ pub async fn measure_d4(meta: &Arc<RoutedMetaBackend>) -> Result<Vec<D4Volume>> 
             } else {
                 1.0 - census.records_live as f64 / census.records_indexed as f64
             },
+            mergeable_leaves: census.merge_candidates.len() as u64,
         });
     }
     Ok(rows)
@@ -719,6 +723,12 @@ pub async fn measure(meta: &Arc<RoutedMetaBackend>, router: &DataRouter) -> Resu
     METRICS
         .frag_d4_dead_bset_ratio
         .store(encode_ratio(worst_d4), Ordering::Relaxed);
+    // A count, not a ratio: the SET's mergeable-leaf population (summed
+    // over the meta volumes) is the operator-facing face.
+    METRICS.frag_d4_mergeable_leaves.store(
+        d4.iter().map(|r| r.mergeable_leaves).sum(),
+        Ordering::Relaxed,
+    );
 
     Ok(DefragReport {
         d1,

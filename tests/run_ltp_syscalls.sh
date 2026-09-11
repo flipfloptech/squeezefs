@@ -33,19 +33,31 @@ fi
 SQUEEZEFS_BIN="$REPO_DIR/target/release/squeezefs"
 
 # 2. Clone and build LTP kernel/syscalls if not already done
-LTP_DIR="/tmp/ltp_build"
-LTP_INSTALL_DIR="/tmp/ltp_install"
-
-if [ ! -d "$LTP_DIR" ]; then
-    echo "Cloning LTP..."
-    git clone --depth 1 https://github.com/linux-test-project/ltp.git "$LTP_DIR"
+# The LTP tree lives in the durable suite cache (tests/suite_tree.sh), never
+# under /tmp's age cleaner; a hollow tree is detected by its marker and
+# re-cloned; the legacy /tmp/ltp_build is adopted once if it is live.
+# shellcheck source=suite_tree.sh
+. "$REPO_DIR/tests/suite_tree.sh"
+LTP_DIR="$(suite_tree_ensure ltp https://github.com/linux-test-project/ltp.git Makefile /tmp/ltp_build)"
+LTP_INSTALL_DIR="$(suite_tree_home)/ltp_install"
+# Adopt an already-built legacy install once (its binaries are what the
+# 1.2.x chains ran; rebuilding them is minutes for nothing).
+if [ ! -d "$LTP_INSTALL_DIR/testcases/bin" ] && [ -d /tmp/ltp_install/testcases/bin ]; then
+    echo "Adopting legacy LTP install /tmp/ltp_install -> $LTP_INSTALL_DIR"
+    mkdir -p "$(dirname "$LTP_INSTALL_DIR")" && mv /tmp/ltp_install "$LTP_INSTALL_DIR"
 fi
 
 cd "$LTP_DIR"
-if [ ! -f "config.status" ]; then
-    echo "Configuring LTP..."
-    make autotools
-    ./configure --prefix="$LTP_INSTALL_DIR" --with-open-posix-testsuite
+# (Re)configure when there is no config.status OR its baked --prefix is not
+# THIS install dir (an adopted tree carries the legacy /tmp prefix, and
+# `make install` would silently land back under the age cleaner).
+if [ ! -f "config.status" ] || ! grep -q -- "--prefix=$LTP_INSTALL_DIR" config.status; then
+    echo "Configuring LTP (prefix $LTP_INSTALL_DIR)..."
+    # autotools are not on a sanitized sudo PATH on nix hosts — the store
+    # copies (and pkg.m4 via ACLOCAL_PATH) fill in.
+    suite_tree_autotools_env
+    [ -x ./configure ] || PATH="${SUITE_AT_PATH:+$SUITE_AT_PATH:}$PATH" make autotools
+    PATH="${SUITE_AT_PATH:+$SUITE_AT_PATH:}$PATH" ./configure --prefix="$LTP_INSTALL_DIR" --with-open-posix-testsuite
 fi
 
 echo "Compiling and installing LTP syscall test binaries..."
@@ -94,7 +106,7 @@ else
 fi
 
 # Define test scenarios
-export PATH="/tmp/ltp_install/testcases/bin:$PATH"
+export PATH="$LTP_INSTALL_DIR/testcases/bin:$PATH"
 
 if [ $# -gt 0 ]; then
     declare -a TESTS=("$@")
@@ -128,9 +140,9 @@ else
 
     # Custom test runners requiring specific parameters
     declare -A CUSTOM_TESTS=(
-        ["mmap21_01"]="/tmp/ltp_install/testcases/bin/mmap21 -m 1"
-        ["mmap21_02"]="/tmp/ltp_install/testcases/bin/mmap21"
-        ["renameat202"]="/tmp/ltp_install/testcases/bin/renameat202 -i 10"
+        ["mmap21_01"]="$LTP_INSTALL_DIR/testcases/bin/mmap21 -m 1"
+        ["mmap21_02"]="$LTP_INSTALL_DIR/testcases/bin/mmap21"
+        ["renameat202"]="$LTP_INSTALL_DIR/testcases/bin/renameat202 -i 10"
     )
 fi
 
@@ -153,7 +165,7 @@ fail_fast() {
 
 echo "Running LTP filesystem tests on squeezefs mount (fail-fast)..."
 for test in "${TESTS[@]}"; do
-    binary="/tmp/ltp_install/testcases/bin/$test"
+    binary="$LTP_INSTALL_DIR/testcases/bin/$test"
     if [ -x "$binary" ]; then
         echo "--------------------------------------------------"
         echo "Running: $test"

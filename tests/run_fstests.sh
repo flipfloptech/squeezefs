@@ -94,18 +94,20 @@ fi
 SQUEEZEFS_BIN="$REPO_DIR/target/release/squeezefs"
 
 # 3. Clone and compile xfstests-dev if not already done
-XFSTESTS_DIR="/tmp/xfstests-dev"
+# The xfstests tree lives in the durable suite cache (tests/suite_tree.sh),
+# never under /tmp's age cleaner; a hollow tree is detected by its marker
+# (Makefile) and re-cloned; the legacy /tmp/xfstests-dev is adopted once.
+# shellcheck source=suite_tree.sh
+. "$REPO_DIR/tests/suite_tree.sh"
+XFSTESTS_DIR="$(suite_tree_ensure xfstests-dev https://git.kernel.org/pub/scm/fs/xfs/xfstests-dev.git Makefile /tmp/xfstests-dev)"
 # A cached checkout that never produced include/builddefs is a FAILED
 # configure's residue — its config.cache pins the stale host environment
 # and every retry dies with a misleading "make does not seem to be
 # installed". Refresh it; a fully built checkout is still reused.
-if [ -d "$XFSTESTS_DIR" ] && [ ! -f "$XFSTESTS_DIR/include/builddefs" ]; then
+if [ -f "$XFSTESTS_DIR/configure" ] && [ ! -f "$XFSTESTS_DIR/include/builddefs" ] && [ -f "$XFSTESTS_DIR/config.cache" ]; then
     echo "Refreshing stale xfstests checkout (configure residue, no builddefs)..."
     rm -rf "$XFSTESTS_DIR"
-fi
-if [ ! -d "$XFSTESTS_DIR" ]; then
-    echo "Cloning xfstests-dev..."
-    git clone --depth 1 https://git.kernel.org/pub/scm/fs/xfs/xfstests-dev.git "$XFSTESTS_DIR"
+    XFSTESTS_DIR="$(suite_tree_ensure xfstests-dev https://git.kernel.org/pub/scm/fs/xfs/xfstests-dev.git Makefile)"
 fi
 
 # Non-FHS hosts (NixOS): the suite hardcodes FHS binary paths that do

@@ -36,7 +36,12 @@ DATA_SIZE="${SQUEEZEFS_PJDFSTEST_DATA_SIZE:-4G}"
 LOG_FILE="/tmp/squeezefs_pjdfstest.log"
 PROVE_OUT="/tmp/squeezefs_pjdfstest_prove.log"
 
-PJDFSTEST_DIR="${PJDFSTEST_DIR:-/tmp/pjdfstest}"
+# The pjdfstest tree lives in the durable suite cache (tests/suite_tree.sh),
+# never under /tmp's age cleaner; a hollow tree is detected by its marker
+# and re-cloned; the legacy /tmp/pjdfstest is adopted once if it is live.
+# PJDFSTEST_DIR overrides the home (an explicit path is honoured as-is).
+# shellcheck source=suite_tree.sh
+. "$REPO_DIR/tests/suite_tree.sh"
 PJDFSTEST_REPO="https://github.com/pjd/pjdfstest.git"
 
 # ---------------------------------------------------------------------------
@@ -112,14 +117,17 @@ else
 fi
 SQUEEZEFS_BIN="$REPO_DIR/target/release/squeezefs"
 
-# 3. Clone and build pjdfstest if not already cached
-if [ ! -d "$PJDFSTEST_DIR" ]; then
-    echo "Cloning pjdfstest..."
-    git clone --depth 1 "$PJDFSTEST_REPO" "$PJDFSTEST_DIR"
+# 3. Clone and build pjdfstest if not already cached (durable home; a
+#    hollow tree is refreshed; the legacy /tmp checkout adopted once).
+if [ -n "${PJDFSTEST_DIR:-}" ]; then
+    [ -f "$PJDFSTEST_DIR/configure.ac" ] || { echo "ERROR: PJDFSTEST_DIR=$PJDFSTEST_DIR is not a pjdfstest checkout" >&2; exit 1; }
+else
+    PJDFSTEST_DIR="$(suite_tree_ensure pjdfstest "$PJDFSTEST_REPO" configure.ac /tmp/pjdfstest)"
 fi
 if [ ! -x "$PJDFSTEST_DIR/pjdfstest" ]; then
     echo "Building pjdfstest..."
-    (cd "$PJDFSTEST_DIR" && autoreconf -ifs && ./configure && make pjdfstest) \
+    suite_tree_autotools_env
+    (cd "$PJDFSTEST_DIR" && PATH="${SUITE_AT_PATH:+$SUITE_AT_PATH:}$PATH" autoreconf -ifs && ./configure && make pjdfstest) \
         >/tmp/squeezefs_pjdfstest_build.log 2>&1 || {
         echo "ERROR: pjdfstest build failed; see /tmp/squeezefs_pjdfstest_build.log" >&2
         exit 1

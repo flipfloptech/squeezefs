@@ -541,6 +541,29 @@ mount (the A-arm rig reset the cluster; remount is part of every arm).
    `meta_kv_merge_sweeps`, `frag_d4_mergeable_leaves`, `defrag_meta_merges`.
    No knob, no incompat bit. **Gate on `fac25656` GREEN** (12:30–13:37, 380
    suites / 4,956 tests, 18 stages, both audits). 1.2.4-bound with items 2–4.
+   **FINALIZED 2026-09-11 (`53e4feeb`; owner: "stated-not-done should all
+   be done, it's part of the leaf merge")** — the three items closed
+   red-first, record §5: (1) cross-parent shrinkage PROVEN + pinned (§4.6a
+   (d′)): a height-3 tree with underfull leaves on both sides of every
+   parent boundary converges in 4 passes (bound `3·h₀+1 = 7`) — 2,053
+   merges, 3 interior merges = parents − 1, 1 root collapse, 3,188 → 2
+   leaves, 0 stranded; the only unreachable shape (two interiors whose
+   separator folds exceed ¾C together) bounded `stranded ≤ heavy_boundaries
+   ≤ interiors − 1`; (2) `meta_kv_merge_candidates` EXACT — a COUNT phase
+   after every lap, one predicate shared with the D4 census
+   (`is_merge_candidate`), `≡ frag_d4_mergeable_leaves` quiescent, the sweep
+   moved to the END of the cycle (counting before the tail advance
+   under-read); (3) the sweep BOUNDED + cursor-resumed — budget ≡ one
+   checkpoint tick period (derived, tie-tested), per-tree `SweepCursor`, a
+   lap ledger so a cut tree is never starved; bench `kv_merge_sweep`: 2.2
+   µs/leaf (4 KiB values) / 50–58 µs (dense inode/dentry) → a 2,048-node
+   field lap ≈ 102–119 ms = 2–3 cycles; the D4 arm runs the same walk under
+   the job throttle (pinned). Two defects the contracts caught and fixed:
+   the recovery STALLED once the first returned extents cleared `heap_full`
+   (the backlog now stands while a lap merged), and the count ran before the
+   tail advance. Gauges `meta_kv_interior_merges`, `meta_kv_merge_laps`,
+   `meta_kv_merge_sweep_{ns,projections}`; operator row added. Nothing left
+   stated-not-done.
 2. **Kernel A/B, B arm** — after `squeeze-test` boots the 6.19.14 series
    WITH 0031 (or whichever box carries the patched kernel): on the box,
    `cd /scratch/tmp/sqz-agent/k26 && sudo env ARM=B KERNEL_TAG=<uname -r

@@ -176,6 +176,19 @@ pub static META_KV_NODE_SPLITS: AtomicU64 = AtomicU64::new(0);
 /// `meta_kv_node_compactions` in K6a/K7.
 pub static META_KV_NODE_COMPACTIONS: AtomicU64 = AtomicU64::new(0);
 
+/// Sibling merges executed by the serialized SMO task (design §4.6a —
+/// two adjacent underfull nodes under one parent folded into ONE
+/// successor; leaf and interior alike). The engagement gauge of the
+/// leaf-merge SMO: it moves on any delete-heavy workload and stays 0 on a
+/// fill-only one. Surfaced as `meta_kv_node_merges`.
+pub static META_KV_NODE_MERGES: AtomicU64 = AtomicU64::new(0);
+
+/// Root collapses (design §4.6a (c)): a root left with exactly one live
+/// child made that child the root — the ONLY way the tree's height
+/// decreases. A root-swap SMO (no pointer record; dying floor at the
+/// entry start). Surfaced as `meta_kv_root_collapses`.
+pub static META_KV_ROOT_COLLAPSES: AtomicU64 = AtomicU64::new(0);
+
 /// Commit-path revalidation retries (design §4.6: a writer locked a leaf
 /// an SMO had superseded between resolution and lock — unlock, re-resolve,
 /// retry; SMOs are rare and serialized, so the loop is short). Surfaced as

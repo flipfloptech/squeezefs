@@ -1315,6 +1315,112 @@ async fn a_refused_publish_releases_exactly_one_destination_reference() {
 }
 
 // ---------------------------------------------------------------------------
+// Contract 7b: a corpse whose release outlived its record is never a mover
+// referencer (the generic/749 double-release law's mover face)
+// ---------------------------------------------------------------------------
+
+/// Sealed packs P1 {a, b} and P2 {c}. b is unlinked and its reclaim's
+/// `delete_file` runs — b's durable reference released, its tenant slot's
+/// RAM reference freed (P1 reads `a` = 1) — but the destroy that should
+/// follow never lands: the failed-destroy corpse the mount-time sweep's
+/// ledger gate exists for, reproduced in-session. b's record and layout
+/// survive and still name P1's slot. The mover census skips `nlink == 0`
+/// (`jobs::census_for`), so b is never a referencer: compaction moves a
+/// and c into one fresh pack and frees P1 and P2 through a's move and
+/// the pins alone — P1 is never decremented on b's behalf (that decrement
+/// would land on the mover's own pin and trip the untracked-free
+/// tripwire at the unpin), no corpse layout is ever published, and the
+/// destination reads `a + c + pin`. The sweep's later destroy of b leaves
+/// the set clean. Pins the census law the release-site classification of
+/// the movers rests on.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_corpse_whose_release_outlived_its_record_is_never_a_mover_referencer() {
+    let _g = serial().await;
+    let _l = arm_levers(true);
+    let dir = tempfile::tempdir().unwrap();
+    let (_meta, fx) = open_fresh(dir.path(), 1, 4 << 30, "corpsegate").await;
+    let alloc = fx.alloc(0);
+
+    let a = fx.promoted_file("a.bin", 16 * KIB, 171).await;
+    let b = fx.promoted_file("b.bin", 16 * KIB, 172).await;
+    fx.seal().await;
+    let c = fx.promoted_file("c.bin", 16 * KIB, 173).await;
+    fx.seal().await;
+    let (p1, _, _) = fx.mapping(a).await;
+    let (p2, _, _) = fx.mapping(c).await;
+    assert_eq!(fx.mapping(b).await.0, p1, "premise: P1 holds a and b");
+    assert_ne!(p1, p2);
+    assert_eq!(alloc.refcount(fx.offset_of(&p1)), Some(2));
+
+    // b's reclaim, minus its destroy: unlink (nlink 0), then `delete_file`
+    // (the reference release + the slot's RAM free), and NO
+    // `destroy_inodes`.
+    let _ = fx.fs.release(req(), b, 0, 0, 0, true).await;
+    fx.fs
+        .unlink(req(), 1, OsStr::new("b.bin"))
+        .await
+        .expect("unlink b");
+    fx.fs
+        .router
+        .delete_file(&squeezefs::keys::inode_path(b))
+        .await
+        .expect("delete_file b");
+    assert_eq!(
+        alloc.refcount(fx.offset_of(&p1)),
+        Some(1),
+        "premise: b's slot reference is released — P1 reads a alone"
+    );
+    assert!(
+        fx.mapping_str(b).await.starts_with(&p1),
+        "premise: b's record and layout survive the failed destroy"
+    );
+
+    let c0 = counters();
+    let skipped0 = metric(&METRICS.block_release_skipped_no_record);
+    let end = fx.compact().await;
+    assert_eq!(end, JobState::Completed);
+    let c1 = counters();
+
+    assert_eq!(
+        c1.tenants_moved - c0.tenants_moved,
+        2,
+        "a and c moved; b — a corpse — is not a referencer"
+    );
+    assert_eq!(
+        metric(&METRICS.block_release_skipped_no_record),
+        skipped0,
+        "the movers never reach the corpse's layout (the census skips nlink == 0)"
+    );
+    assert_no_forensics(c0);
+    assert_eq!(
+        c1.blocks_freed - c0.blocks_freed,
+        2,
+        "P1 and P2 free through the moves and the pins alone"
+    );
+    assert_eq!(alloc.refcount(fx.offset_of(&p1)), None, "P1 is free");
+    assert_eq!(alloc.refcount(fx.offset_of(&p2)), None, "P2 is free");
+    let (dst, _, _) = fx.mapping(a).await;
+    assert_eq!(fx.mapping(c).await.0, dst);
+    assert_eq!(
+        alloc.refcount(fx.offset_of(&dst)),
+        Some(2 + 1),
+        "the destination reads a + c + the open pack's pin — never b"
+    );
+    assert_eq!(fx.read(a, 16 * KIB).await, pattern(171, 16 * KIB));
+    assert_eq!(fx.read(c, 16 * KIB).await, pattern(173, 16 * KIB));
+    assert!(
+        fx.mapping_str(b).await.starts_with(&p1),
+        "the corpse's layout is untouched (the next mount's sweep destroys it)"
+    );
+
+    // The sweep's act on the corpse: destroy the record; the set is then
+    // clean (no record, no layout, P1 free).
+    fx.meta.destroy_inodes(&[b]).await.expect("destroy b");
+    fx.assert_clean("after the corpse's destroy").await;
+    fx.close().await;
+}
+
+// ---------------------------------------------------------------------------
 // Contract 8 💥: kill-9 mid-pass — no leak, no double free, re-run converges
 // ---------------------------------------------------------------------------
 

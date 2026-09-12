@@ -101,8 +101,11 @@ LTP leg had stalled on a checkout hollowed by the `/tmp` age cleaner.
 
 **Known limitations — what this release does not claim.**
 
-- **Scale.** Unchanged: one write mount per volume set, any number of
-  read-only and opt-in co-writer mounts; evidence tiers in
+- **Scale.** Unchanged: metadata authority is per volume — one owner mount
+  commits each metadata volume's changes (one for the whole set by default,
+  up to 16 with the offline `volume set-owners` split); co-writer mounts
+  write data directly and ship each metadata change to the owner; read-only
+  mounts see a bounded delay. Evidence tiers in
   [docs/rc-manifest.md](docs/rc-manifest.md#2-guarantee-table-by-evidence-tier-ruling-d1).
 - **Leaf merge never crosses a parent boundary directly**; underfull leaves
   under different parents become siblings through interior merges. The one

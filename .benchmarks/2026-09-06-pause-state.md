@@ -680,6 +680,33 @@ mount (the A-arm rig reset the cluster; remount is part of every arm).
    BUILD PROFILE is unrecorded in its note (both profiles existed at
    `c985fa8c`, so it is unrecorded, not implied — state it as unknown,
    never infer).
+1y. **NEW DIRECTION (owner, 2026-09-12, verbatim): "everyone should be able
+   to write to the metadata and filesystem all the time like lustre, gpfs,
+   juicefs, BeeGFS, OrangeFS" — confirmed as "every node an equal metadata
+   authority".** The shipped funnel (one owner mount per metadata volume,
+   D0 → per-volume owners K ≤ 16, co-writers ship every metadata verb) is
+   the thing being ruled against. README + 1.2.4 notes re-worded to state
+   the shipped shape plainly (this commit). What the tree already holds
+   toward the ruling: partitioned append (bit 8 — `MAX_APPENDERS` = 16
+   content appenders per volume, own journal rings / bitmap pages / ledger
+   slots; structure — SMOs, roots, `next_ino` — has ONE authority per
+   volume, `ROOT_AUTHORITY_WRITER`), the S4 law that a slot's lock master
+   IS its metadata authority (`route_ino_width`, W = 2^16 slots, online
+   `migrate-meta-slot`), S6 leases with owner failover, S8 verb shipping,
+   the node cache's "partitioning, not coherence" verdict (§4.9a; the
+   missing third gate state "reader for structure, appender for my own
+   leaves"). Blockers for slot-granular symmetric ownership: (a) inos route
+   `(ino−2) % W` so one owner's records interleave with everyone's in the
+   same leaves — leaf partitioning needs an owner-major key layout or
+   owner-clustered ino minting; (b) ownership is static/offline (D19) — the
+   ruling needs LEASED, dynamic ownership (GPFS metanode-style: first
+   writer to touch a slot owns it, released idle, failover via S6);
+   (c) 16 appenders per volume is a root-ledger format bound; (d) the D20
+   singular planes (lane assignment, custody endpoint, root, membership,
+   free-grace, maintenance coordinator) need election, not a fixed node;
+   (e) cross-owner rename/link (D18 scoped out) becomes routine. NEXT: a
+   design (the design loop) once the owner rules on the model — see the
+   2026-09-12 conversation's three options.
 2. **Kernel A/B, B arm** — after `squeeze-test` boots the 6.19.14 series
    WITH 0031 (or whichever box carries the patched kernel): on the box,
    `cd /scratch/tmp/sqz-agent/k26 && sudo env ARM=B KERNEL_TAG=<uname -r

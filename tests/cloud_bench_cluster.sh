@@ -203,7 +203,11 @@ TAG_KEY="squeezefs-bench"                        # every AWS resource carries th
 STATE_ROOT="${STATE_ROOT:-.cloud-bench}"         # local per-cluster state (gitignored)
 RESULTS_ROOT="${RESULTS_ROOT:-.benchmarks/cloud}"
 REMOTE_DIR="/opt/squeezefs-bench"                # artifact landing dir on nodes
-SSH_OPTS=(-o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new)
+# IdentitiesOnly: the operator's ssh agent may hold more keys than sshd's
+# MaxAuthTries (6) — without it the bench key is never offered and every node
+# reads "Too many authentication failures" (2026-09-12: ten agent keys; the
+# launch stalled at 6/7 and the first cluster was torn down unused).
+SSH_OPTS=(-o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new -o IdentitiesOnly=yes)
 # ============================================================================
 
 SCRIPT_PATH="$(readlink -f "$0")"

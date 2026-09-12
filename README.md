@@ -62,7 +62,7 @@ Packaged builds use [go-task](https://taskfile.dev) (`Taskfile.yml`); install it
 | `task build` | Host build → `dist/host/` (daemon + interception shim) |
 | `task build:<distro>` — `rocky8`, `rocky9`, `ubuntu2404`, `ubuntu2604` | Container build for that distro → `dist/<distro>/` (needs docker or podman) |
 | `task build:all` | All four distro builds |
-| `task dist:<distro>` / `task dist:all` | Release builds (full LTO) for tagged releases → `dist/<distro>-dist/` |
+| `task dist:<distro>` / `task dist:all` | Release builds (full LTO) for tagged releases → `dist/<distro>-dist/` — stripped daemon + shim with their `.debug` sidecars and `SHA256SUMS` |
 | `task check` | The full verification gate |
 
 Each build folder holds `squeezefs` and `libsqueezefs_il.so` side by side. Deploy the daemon and the interception shim from the same build folder together — they refuse to pair across builds. `squeezefs --version` prints the release train, the git commit and the build profile on one line, e.g. `squeezefs 1.2.0 (<commit> / <full commit>) built <timestamp> profile release`.

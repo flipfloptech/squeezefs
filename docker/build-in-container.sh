@@ -36,6 +36,26 @@ cargo build -p squeezefs-preload --profile "$shim_profile" --features interposer
 install -m 0755 "$CARGO_TARGET_DIR/$daemon_profile/squeezefs" "$out/squeezefs"
 install -m 0755 "$CARGO_TARGET_DIR/$shim_profile/libsqueezefs_il.so" "$out/libsqueezefs_il.so"
 
+# Split debug info on TAGGED releases (2026-09-12; the 1.2.4 dist daemon
+# was 329 MiB, 305 of them DWARF): the shipped artifact is stripped of
+# .debug_* and its DWARF lands beside it as `<name>.debug`, joined by a
+# .gnu_debuglink (name + CRC32) — perf/gdb resolve it from the same
+# directory or from /usr/lib/debug, so every profiling row stays
+# symbolicated. `release` (dev / A-B / gate) keeps its symbols in-binary.
+# The three objcopy steps are the documented sequence: the debug copy is
+# taken from the UNSTRIPPED file, then the file is stripped, then linked.
+if [ "$daemon_profile" = "dist" ]; then
+  for name in squeezefs libsqueezefs_il.so; do
+    objcopy --only-keep-debug "$out/$name" "$out/$name.debug"
+    objcopy --strip-debug "$out/$name"
+    objcopy --add-gnu-debuglink="$out/$name.debug" "$out/$name"
+    chmod 0644 "$out/$name.debug"
+  done
+  # The release act's checksum file, written where the artifacts are
+  # (the 1.2.x acts wrote it by hand on the host).
+  (cd "$out" && sha256sum squeezefs libsqueezefs_il.so squeezefs.debug libsqueezefs_il.so.debug > SHA256SUMS)
+fi
+
 # Foreign-glibc artifacts: identity + ceiling assertions run HERE, inside
 # the container that can execute them.
 "$src/docker/check-artifacts.sh" "$out" \
@@ -49,5 +69,5 @@ install -m 0755 "$CARGO_TARGET_DIR/$shim_profile/libsqueezefs_il.so" "$out/libsq
 # podman (leave alone), HOST_UID = real docker (chown back).
 if [ -n "${HOST_UID:-}" ] && [ -n "${HOST_GID:-}" ] \
   && [ "$(stat -c %u "$src")" = "$HOST_UID" ]; then
-  chown "$HOST_UID:$HOST_GID" "$out/squeezefs" "$out/libsqueezefs_il.so" 2>/dev/null || true
+  chown "$HOST_UID:$HOST_GID" "$out"/squeezefs "$out"/libsqueezefs_il.so "$out"/*.debug "$out"/SHA256SUMS 2>/dev/null || true
 fi

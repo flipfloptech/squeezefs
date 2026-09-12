@@ -84,4 +84,10 @@ if [ "$ceiling" != "none" ]; then
   done
 fi
 
+# Tagged releases ship split debug info (docker/check-split-debug.sh has
+# the law and runs on any host — it executes nothing).
+if [ "$expected_profile" = "dist" ]; then
+  "$(dirname "$0")/check-split-debug.sh" "$dir"
+fi
+
 echo "artifact checks passed: $dir"

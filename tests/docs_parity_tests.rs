@@ -240,9 +240,10 @@ fn retired_spellings_are_not_rows_and_are_listed_with_their_successor() {
                 k.key, p.rows[idx[0]].line
             ));
         }
-        // The retiree table under law 6 of the parsing convention.
+        // The retiree table under law 6 of the parsing convention (a
+        // list-item table, so its rows are indented).
         let listed = convention.lines().any(|l| {
-            l.starts_with('|') && l.contains(&format!("`{}`", k.key)) && {
+            l.trim_start().starts_with('|') && l.contains(&format!("`{}`", k.key)) && {
                 // A real successor knob must be named on the same row; a
                 // deletion's successor text is free-form prose.
                 if successor.starts_with("SQUEEZEFS_") {

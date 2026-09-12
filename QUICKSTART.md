@@ -87,7 +87,9 @@ df -h ~/squeezefs-sandbox/mnt
 #   Inodes: quota 1000000   used 2   free 999998
 ```
 
-> **Large files.** Files above roughly 8 GiB (at the default 4 MiB block size) are handled automatically — their block map moves into the metadata tree and nothing needs configuring. If you are curious, `grep kvmap ~/squeezefs-sandbox/mount.log` shows it happening.
+> **Large files.** Files above roughly 6–8 GiB (at the default 4 MiB block size) are handled automatically — their block map moves into the metadata tree and nothing needs configuring. If you are curious, `grep kvmap ~/squeezefs-sandbox/mount.log` shows it happening (`kvmap crossing: ino N entered the block-map tree …`).
+>
+> **Small files.** A file up to one page lives inside its metadata record. On a filesystem formatted with staging paths (this sandbox), a file up to one block (4 MiB) stages on this host's local NVMe and is promoted to the shared devices — many files packed into one block — under staging pressure and at the mount's clean unmount; until then other clients of the volume set read it as zeros. `SQUEEZEFS_FSYNC_PROMOTE_STAGED=1` (default off) makes `fsync(2)` promote it too. Details: [docs/operations.md → Breaking changes & migration notes](docs/operations.md#breaking-changes--migration-notes).
 
 ### Step 6: Run the Benchmark
 A bare `squeezefs bench <mountpoint>` runs the full suite over one auto-sized dataset (threads = `min(CPUs, 16)`; total = `max(16 GiB, 2 GiB × threads)`, capped at 25 % of free space): sequential write → sequential read → random 4k read (30 s) → random 4k write (30 s) → stat → delete, all O_DIRECT, mount left clean. The bare suite refuses loudly when even its minimum dataset does not fit, so it wants ≥ 16 GiB free — run it against the [section 2 substrate](#2-dev-box-virtual-nvme-substrate-ram-backed-nvme-of-loop) or real hardware. On this small sandbox, pass an explicit shape:
@@ -103,9 +105,9 @@ Explicit phases reuse the persistent dataset at `<mountpoint>/squeezefs-bench/`;
 
 ### Step 7: Unmount Safely
 ```bash
-./target/release/squeezefs umount ~/squeezefs-sandbox/mnt    # drains staging first
+./target/release/squeezefs umount ~/squeezefs-sandbox/mnt
 ```
-*(Or `fusermount3 -u ~/squeezefs-sandbox/mnt`; root `/bin/umount` works on `--allow-other` mounts.)*
+A clean unmount is a durability boundary: the daemon's teardown promotes every staged-layout file still resident in this host's local staging to the shared devices (packed into shared blocks — the log line is `dismount promoted N staged-layout file(s)`), so other clients read them afterwards. On a TTY the verb warns about unflushed **active write blocks** and offers to wait for their writeback (`-f` skips the prompt). *(Or `fusermount3 -u ~/squeezefs-sandbox/mnt`; root `/bin/umount` works on `--allow-other` mounts — both run the same daemon teardown.)*
 
 ---
 
@@ -334,7 +336,7 @@ Fall-throughs to kernel FUSE are silent by design, so never publish a number wit
 grep -o '"ipc_ops_read": *[0-9]*'  /mnt/squeezefs/.stats
 grep -o '"ipc_ops_write": *[0-9]*' /mnt/squeezefs/.stats
 ```
-The delta must account for your run's operation count (ops chunk at 64 KiB, so large-block runs show more ring ops than application ops). If the deltas are ~0: check the binary is dynamic, both builds match, and the mount has `--interception`. Client and daemon tuning knobs are listed in [docs/operations.md → LD_PRELOAD interception](docs/operations.md#ld_preload-interception--o-interception--security-posture--unsupported-mixes).
+The delta must account for your run's operation count (ring ops are capped at 1 MiB of payload each, so runs with larger application blocks show more ring ops than application ops). If the deltas are ~0: check the binary is dynamic, both builds match, and the mount has `--interception`. Client and daemon tuning knobs are listed in [docs/operations.md → LD_PRELOAD interception](docs/operations.md#ld_preload-interception--o-interception--security-posture--unsupported-mixes).
 
 ---
 
@@ -412,9 +414,15 @@ truncate -s 8G ~/squeezefs-sandbox/data2.bin
 # add --scrub for the full data scrub, --repair [--apply] for quarantine-first repair
 ./target/release/squeezefs fsck ~/squeezefs-sandbox/mnt
 
-# Measure fragmentation (moves nothing), then defragment what needs it
+# Measure fragmentation on its four axes (moves nothing), then defragment what needs
+# it — one axis per invocation: --data (free-space contiguity + file locality),
+# --pack (re-pack half-empty small-file pack blocks, including the one-block-per-file
+# population older releases wrote), --meta (merge underfull metadata nodes so a
+# filled metadata volume returns space), --fold, --rebalance
 ./target/release/squeezefs defrag ~/squeezefs-sandbox/mnt --report-only
 ./target/release/squeezefs defrag ~/squeezefs-sandbox/mnt --data --throttle 25
+./target/release/squeezefs defrag ~/squeezefs-sandbox/mnt --pack
+./target/release/squeezefs defrag ~/squeezefs-sandbox/mnt --meta
 ```
 
-Metadata volumes grow and shrink too (`volume add-meta` / `remove-meta` are offline verbs; `volume migrate-meta-slot` moves a routing slot on the live mount), and a multi-node fleet can split metadata ownership per volume with the offline `volume set-owners`. The full runbook — capacity preflight, distributed workers, per-volume owners, the job guarantee table — is [docs/operations.md → Volume lifecycle & online maintenance](docs/operations.md#volume-lifecycle--online-maintenance).
+A full metadata volume answers `ENOSPC` to growth (reads, deletes and overwrites keep working) and gives extents back as deletes empty its nodes. Metadata volumes grow and shrink too (`volume add-meta` / `remove-meta` are offline verbs; `volume migrate-meta-slot` moves a routing slot on the live mount), and a multi-node fleet can split metadata ownership per volume with the offline `volume set-owners`. The full runbook — capacity preflight, distributed workers, per-volume owners, the job guarantee table — is [docs/operations.md → Volume lifecycle & online maintenance](docs/operations.md#volume-lifecycle--online-maintenance).

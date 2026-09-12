@@ -631,6 +631,55 @@ mount (the A-arm rig reset the cluster; remount is part of every arm).
    needs its own EXPRESSED approval. Honest expectation for a first run:
    30–36 GB/s reads with 40 the stretch; the 800k IOPS row is the likelier
    first win.
+1x. **USER-FACING DOCS ACCURACY AUDIT (owner directive 2026-09-12: "make
+   sure the README QUICKSTART and all DOCUMENTATION is ACCURATE. FOCUS ON
+   USER FACING DOCUMENTATION").** Three parallel audits off `2fd8c37c`, each
+   claim checked against `src/main.rs` (clap), `src/env_knobs.rs`, the
+   Taskfile, the rigs and a LIVE `.stats` dump, merged linearly onto
+   `docs/accuracy-audit` (8 commits): README + QUICKSTART +
+   `docs/cloud-benchmarking.md` (23 corrections — zero-copy claim, online
+   add/remove = DATA volumes only, leases are process-local, one-page inline
+   ceiling + packed promotion, hero row's instrument/row class, scoreboard
+   rank 13/18 first, `--version` example 1.2.4, umount = promotion not
+   drain, `staging` verb, 6–8 GiB kvmap crossing, 1 MiB ring op cap,
+   `defrag --pack/--meta`, cloud: on-demand default / `mw` preset /
+   `assemble-mw`+`bench-mw` / label `aws-<market>` / `IdentitiesOnly`);
+   `docs/operations.md` Versioning / Breaking / Removed / Configuration
+   reference (train 1.2.4 + real version-line shapes, split debug AFTER the
+   1.2.4 tag, `task check:fuzz` row, every `removed_verb()` named, the
+   knob table made COMPLETE — 4 missing seams, 50 harness variables as a
+   table, 4 retired spellings out of the live table, 2 default cells fixed,
+   the ghost `SQUEEZEFS_IL_PARANOID_FSTAT` deleted, `-o` option set complete,
+   `READ_PREFETCH_WINDOW` derived, zc-serve default on) and pinned by the
+   NEW `tests/docs_parity_tests.rs` (5 contracts: product knob ⇒ row;
+   harness ⇒ `harness` row; each row names one registry entry; retired
+   spellings listed not rows; Default cell == `Knob.default` verbatim);
+   `docs/operations.md` Durability / POSIX / Lifecycle / Observability /
+   NVMe-oF / Performance records (a live dump diffed both ways: 315
+   exported-but-undocumented keys named, 1 ghost `defrag_passes` + 3 shape
+   classes fixed, conditional families labelled; read-only mounts SHIP;
+   fsck C1–C12 + full flag surface + per-class repair table; `defrag --pack`
+   + the D4 leaf-merge face; per-volume owners ACCEPTED; nvmeof flag surface;
+   ENOSPC-never-fail-stop / reclaim atomicity / promotion posture; four
+   record rows since 2026-09-03 incl. the cloud row as a third substrate
+   class). Code-side strings the audits surfaced, fixed in `e4770fa9`:
+   `SQUEEZEFS_NVMEOF_TARGET_STACK` registry default `probed` → `spdk`
+   (`resolve_stack`), the `SQUEEZEFS_FSYNC_PROMOTE_STAGED` doc string,
+   `fsck --help` "seven classes" → C1–C12, `version.rs` "1.1 train"; plus
+   the moved-mount-point staging-residue note (`-o client_slot=`,
+   `squeezefs staging adopt|discard`) — the one operator surface no manual
+   section covered. Link check 228/0; parity 5/5; env-knob convention
+   21/21; batch gate on `e4770fa9` (result recorded at the merge). **Board
+   (non-user-facing, not edited):** `AGENTS.md` stats surface omits
+   `fsck_repair_classC12` and calls `overlay_foreign_merge` a `.stats` key
+   (it is an `invariant_tripwires` label); `docs/design-preload-interception.md`
+   names the never-built `SQUEEZEFS_IL_PARANOID_FSTAT`;
+   `.benchmarks/2026-08-22-pv-claim-admission.md` header still says
+   SKELETON above its MET closure; `.benchmarks/2026-09-05-r4-read-zc-serve.md`
+   header says default off above its own flip; the README hero row's
+   BUILD PROFILE is unrecorded in its note (both profiles existed at
+   `c985fa8c`, so it is unrecorded, not implied — state it as unknown,
+   never infer).
 2. **Kernel A/B, B arm** — after `squeeze-test` boots the 6.19.14 series
    WITH 0031 (or whichever box carries the patched kernel): on the box,
    `cd /scratch/tmp/sqz-agent/k26 && sudo env ARM=B KERNEL_TAG=<uname -r

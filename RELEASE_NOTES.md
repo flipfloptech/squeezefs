@@ -1,3 +1,138 @@
+# SqueezeFS 1.2.4
+
+_Release date: 2026-09-11 (tag `stable-2026.09.4`)_
+
+1.2.4 is a point release on the 1.2 train: the metadata tree can now
+**shrink**, a **full metadata volume answers ENOSPC** instead of failing, and
+three defects the 1.2.3 binary ships are fixed — a large-file delete that
+leaked its whole block ledger, a stale read through the interposer's
+direct path that could return another file's bytes, and the fail-stop
+itself. Nothing on disk changes; the cluster wire is unchanged from 1.2.3
+(publish schema 17, cluster wire 4).
+
+## 1.2.4 — what changed
+
+**Upgrading from 1.2.3.** No on-disk format change and no wire change. The
+same-commit fleet rule (KD-7) still governs a volume set's daemon, shim,
+authority, co-writers and readers. A 1.2.3 volume mounts as-is; the first
+1.2.4 mount of a full or delete-heavy volume may run the new merge sweep
+(see below) and return extents over its first checkpoint cycles.
+
+**The metadata tree shrinks — leaf merge (the headline).** Design
+[docs/design-cow-kv-metadata.md §4.6a](docs/design-cow-kv-metadata.md);
+record [.benchmarks/2026-09-11-kv-leaf-merge.md](.benchmarks/2026-09-11-kv-leaf-merge.md).
+Since format v3 landed, deletes returned record space inside a leaf but
+never the leaf's 256 KiB extent — a metadata volume filled once could never
+give its extents back, however much was deleted. Now two adjacent underfull
+leaves merge into one successor (the split's own ¾-fill target read
+backwards, so a split is never undone by the next merge), interior nodes
+merge the same way, and a root with one child collapses — the tree's height
+decreases. Each merge is a structural operation under the existing §4.6
+protocol (successor written and barriered before any lock; interior-pointer
+and free records reserved inside the lock window; the freed extents return
+through the pending-free protocol one or two checkpoint cycles later), so
+no new record kind and no incompat bit.
+
+- **What it does on a full volume:** fill a small volume to ENOSPC, delete
+  90 % of its files spread across leaves, and creates resume for **938 of
+  940** (1.2.3: 4) — 313 merges, free extents 11 → 325. Convergence is
+  proven, not asserted: a height-3 tree with underfull leaves on both sides
+  of every parent boundary reaches its fixed point in 4 passes against a
+  derived bound of 7, with 0 stranded pairs.
+- **Three triggers, all derived:** the flush pass checks an underfull leaf's
+  sibling; a full heap runs a bounded recovery sweep (level by level, then
+  the collapse chain); `squeezefs defrag --meta` runs the same walk under
+  the job throttle. The sweep is bounded to one checkpoint tick per cycle
+  and resumes from a cursor, so it never stalls the checkpoint cadence;
+  measured at 2.2 µs per leaf on 4 KiB-value leaves and 50–58 µs on dense
+  inode/dentry leaves (a 2,048-node cache = 2–3 cycles per lap).
+- **Gauges:** `meta_kv_node_merges`, `meta_kv_interior_merges`,
+  `meta_kv_root_collapses`, `meta_kv_merge_candidates` (exact),
+  `meta_kv_merge_sweeps`/`_laps`, `meta_kv_merge_sweep_ns`,
+  `frag_d4_mergeable_leaves`, `defrag_meta_merges`. No knob.
+
+**A full metadata volume answers ENOSPC, never a fail-stop.** 1.2.3 (and
+every 1.2 before it) marked a metadata volume FAILED when its heap filled —
+EIO on every operation, `writeback error latched`, recovery = remount.
+Root cause: the reserve meant for the checkpoint's compaction had no
+user-side claimant, so acked user growth spent it through the checkpoint's
+own node splits, and the wedged-tail audit read a full heap as a wedge.
+Now the commit pass promises each leaf's eventual structural extents against
+the claimable budget before anything is reserved; a commit that cannot be
+promised refuses **`ENOSPC`** alone; reads, deletes, overwrites and every
+in-place commit keep landing; and the wedged-tail bound distinguishes a
+*space standstill* (counted, clears when budget returns — with leaf merge,
+when deletes return extents) from a genuine wedge (FAILED). Gauges
+`meta_kv_heap_full` (0/1), `meta_kv_enospc_refusals`, `meta_kv_heap_full_cycles`,
+`meta_kv_heap_promised`. Record
+[.benchmarks/2026-09-11-post-123-board-items-2-4.md](.benchmarks/2026-09-11-post-123-board-items-2-4.md).
+
+**Fixes to paths 1.2.3 ships.**
+
+- **Every unlink of a file with ≳ 3,000 block references (≈ 11.6 GiB at 4 MiB
+  blocks) orphaned its whole block ledger** (`d7573e5b`): the release of the
+  references was a standalone commit that was never chunked to the journal's
+  entry cap, so it failed past ~3,000 records, the destroy then succeeded, and
+  the references outlived their owner — the blocks could never free (a
+  permanent leak fsck C8 reported forever). The release now rides the
+  destroy's own transaction (one journal entry per reclaimed inode instead of
+  N + 1), a failed release destroys nothing, and a single inode whose destroy
+  exceeds the cap is destroyed across entries with its layout and record
+  last.
+- **The interposer's direct-drive read could return another file's bytes**
+  (`445525e1`): the whole-block direct path had no dead-lifetime screen, so a
+  stale block key (its offset freed and reissued while the layout cache still
+  named it) passed the completion revalidation and the read returned the
+  reissued offset's contents. Rare — the handler path's rebind counters
+  (`stale_binding_rebinds`) are its rate — but a correctness class. The
+  screen now covers both direct-drive arms; a stale key falls back to the
+  handler, which answers the handler's own law.
+- **The interposer reads packed small files on its direct path** (PK8,
+  `445525e1`): 1.2.3 sent every packed tenant to the handler; now a
+  passthrough tenant plans one ranged read on the mapping's own backend,
+  bounded to the tenant (never a neighbour's bytes). `SQUEEZEFS_IPC_DD_PACKED`
+  defaults on (`0` = the 1.2.3 handler fallback); 99.9 % of a 20,000-file
+  shim randread went direct locally at par IOPS.
+
+**Harness.** The external suites' source trees (xfstests, LTP, pjdfstest)
+live in a durable cache instead of `/tmp`, with a marker-based liveness check
+and the autotools resolved from the store on nix hosts — the 1.2.3 chain's
+LTP leg had stalled on a checkout hollowed by the `/tmp` age cleaner.
+
+**Known limitations — what this release does not claim.**
+
+- **Scale.** Unchanged: one write mount per volume set, any number of
+  read-only and opt-in co-writer mounts; evidence tiers in
+  [docs/rc-manifest.md](docs/rc-manifest.md#2-guarantee-table-by-evidence-tier-ruling-d1).
+- **Leaf merge never crosses a parent boundary directly**; underfull leaves
+  under different parents become siblings through interior merges. The one
+  shape that cannot: two adjacent interiors whose separator folds together
+  exceed a node's fill target — bounded to at most one stranded leaf pair per
+  such boundary (`1/fanout` of the population), cleared as soon as either
+  parent shrinks.
+- **A full metadata volume with nothing mergeable stays full** — the data is
+  simply there; grow the set (`volume add-meta`).
+- **Compaction and `defrag --meta` are operator-driven**; the heap-full sweep
+  is the only automatic merge trigger beyond the flush pass.
+- **The 1.2.3 limitations** on the co-writer venue's capacity and the
+  partial-block fsync escalation stand.
+
+**Verification.** Every leg ran on the tested tree `fe4c9390` — `task check`
+(380 suites, 4,961 tests), fstests `-g auto` (787 ran, 783 clean, 4
+expected-shape, 0 unexpected; `generic/650` excluded on the gate laptop),
+pjdfstests (8,798), LTP (1,884 pass, 0 fail — unattended through the durable
+suite tree), require-mount, zc-capability (187 tests, empty skip ledger), and
+the fuzz campaign (12 targets, 399 M execs, 0 crashes). The chain ran once;
+its zc leg was resumed after a venue condition (the gate disk at 98 % — one
+bench pin needs 68 GiB free; build directories cleared), the product under
+test unchanged. Record:
+[.benchmarks/2026-09-11-1.2.4-release-gate.md](.benchmarks/2026-09-11-1.2.4-release-gate.md).
+
+The rest of this document is the 1.2.3, 1.2.2, 1.2.1 and 1.2.0 record,
+which 1.2.4 inherits.
+
+---
+
 # SqueezeFS 1.2.3
 
 _Release date: 2026-09-11 (tag `stable-2026.09.3`)_

@@ -3,7 +3,7 @@
 //!
 //! A SqueezeFS build carries **two identities, both surfaced**: the
 //! **release-train version** ([`RELEASE_TRAIN`] = `CARGO_PKG_VERSION`,
-//! bumped in `Cargo.toml` as a release act — currently the 1.1 train; the
+//! bumped in `Cargo.toml` as a release act — the 1.2 train; the
 //! first-party `fuse3` fork and the preload/ipc crates track the same
 //! train) and the **git commit the build was produced from** (the
 //! fine-grained identity). Periodic releases remain annotated

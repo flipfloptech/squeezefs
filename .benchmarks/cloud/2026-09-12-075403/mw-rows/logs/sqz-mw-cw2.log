@@ -1,0 +1,122 @@
+SqueezeFS version 1.2.4 (1193c6b7afdd / 1193c6b7afdd47fd3a86603151ab2e6a2590024e, tag stable-2026.09.4) built 2026-09-12T02:40:37Z profile dist
+======================================================================
+  Mount Configuration Summary
+----------------------------------------------------------------------
+  Volume Name:         squeezefs
+  Capacity:            3.41 TiB
+  Block Size:          4.00 MiB
+  Compression:         none
+  Encryption:          none
+----------------------------------------------------------------------
+Metadata Volumes:
+  - [enabled] /dev/nvme2n1 (health: 1000)
+Data Volumes:
+  - [enabled] /dev/nvme3n1 (health: 1000)
+  - [enabled] /dev/nvme4n1 (health: 1000)
+----------------------------------------------------------------------
+Cache/Staging:
+  Memory Cache Size:   1GB
+  Disk Cache Size:     10GB
+  Staging Paths:       /scratch/cache
+----------------------------------------------------------------------
+Mount Options:
+  Mountpoint:          "/scratch/mnt-cw2"
+  Writeback Cache:     enabled
+  Allow Other:         enabled
+======================================================================
+Mounting as a CO-WRITER (DLM stage S9): this mount holds NO metadata authority — every metadata mutation ships to the authority that holds the D0 claim — and writes data only under custody that authority grants. Admission runs a five-rung ladder and refuses loudly naming the rung; see docs/operations.md §Multi-writer co-writer mounts.
+[2026-09-12T11:54:02Z INFO  squeezefs::nvme_dev] data volume /dev/nvme3n1: write_cache=write-through (durability barrier: io_uring Fsync/DATASYNC per device, coalesced)
+[2026-09-12T11:54:02Z INFO  squeezefs] writer-scoped staging ENGAGED: client scope w_e56e47de7cb413eb.mad13c96f (staging generation "v3:067cfa5e15b8431bab1f0fdfc914067d@node:e56e47de7cb413eb.mad13c96f") — staging keys carry the scope and this client's staging roots are bound to it
+[2026-09-12T11:54:02Z INFO  squeezefs::cache::gds] GPU Direct Storage: No discrete GPU environment found. GDS bypassed.
+[2026-09-12T11:54:02Z INFO  squeezefs::cache::nvme] staging init: discarded 16 read-cache segment file(s) (5368709120 B) from a previous session — read cache starts cold (block-key offsets are not incarnation-stable across mounts)
+[2026-09-12T11:54:02Z INFO  squeezefs] Registering data volume 'nvme3n1' at path /dev/nvme3n1 (state active)
+[2026-09-12T11:54:02Z INFO  squeezefs] Registering data volume 'nvme4n1' at path /dev/nvme4n1 (state active)
+[2026-09-12T11:54:02Z INFO  squeezefs::nvme_dev] data volume /dev/nvme4n1: write_cache=write-through (durability barrier: io_uring Fsync/DATASYNC per device, coalesced)
+[2026-09-12T11:54:02Z INFO  squeezefs::nvme_dev] NvmeBlockDev /dev/nvme3n1: read submission fan-out armed (2 lanes)
+[2026-09-12T11:54:02Z INFO  squeezefs::nvme_dev] NvmeBlockDev /dev/nvme3n1: write submission fan-out armed (2 lanes, 4194304 B affinity grain)
+[2026-09-12T11:54:02Z INFO  squeezefs::nvme_dev] NvmeBlockDev /dev/nvme4n1: read submission fan-out armed (2 lanes)
+[2026-09-12T11:54:02Z INFO  squeezefs::nvme_dev] NvmeBlockDev /dev/nvme4n1: write submission fan-out armed (2 lanes, 4194304 B affinity grain)
+[2026-09-12T11:54:02Z WARN  squeezefs::data_custody] data-plane WERO ADOPTED (co-located co-writer, 2 namespace(s), authority key 0x35a153a076ed11ed): this mount shares its authority's PR arbitration domain, so the standing hold is its fenceability evidence and NOTHING was registered — the stated honest residual (docs/operations.md §Multi-writer co-writer mounts): on this shape the metadata read-only half is enforced by this mount's own code, not by the device, and its death is proven by the same-host dead-pid ladder, never by a PR preempt
+[2026-09-12T11:54:02Z INFO  squeezefs::membership] membership member 'node_e56e47de7cb413eb.mad13c96f' (writer) holds lease epoch 2 in term 2: owner deadline 45000 ms, MY deadline 42956 ms (T_owner − 2·skew_max − D_purge, anchored on my send instant), renewing every 10000 ms
+[2026-09-12T11:54:02Z INFO  squeezefs::membership] membership MEMBER armed: writer 'node_e56e47de7cb413eb.mad13c96f' holds a lease from owner '9633a954-5c9a-41c2-b27d-02705c8aba13' at 172.31.21.58:39015 — visible in `squeezefs clients` with ZERO metadata writes, and the same channel §6.8 item 3's freed-offset acknowledgements ride (DLM S6)
+[2026-09-12T11:54:02Z WARN  squeezefs::cowriter] CO-WRITER ADMITTED (DLM S9) over 1 volume(s): node 'node_e56e47de7cb413eb.mad13c96f', authority claim '7eed0e38-bf92-4f56-aa3e-0d0a523e368c' in era 2, membership owner '9633a954-5c9a-41c2-b27d-02705c8aba13' at 172.31.21.58:39015 (member epoch 2), custody at 172.31.21.58:45999, device registrant key 0x35a153a076ed11ed on 2 namespace(s). This mount holds NO metadata authority — every metadata mutation ships — and writes data only under custody the authority grants
+[2026-09-12T11:54:02Z INFO  squeezefs::meta_backend::kv::backend] meta volume /dev/nvme2n1: co-writer mount — a LOCAL exclusive holder (the authority's write mount, or a guarded offline verb) holds this volume on this host; the co-writer takes no lock and refuses nothing
+[2026-09-12T11:54:02Z WARN  squeezefs::meta_backend::kv::backend] meta volume /dev/nvme2n1: mounted CO-WRITER (DLM S9) under authority claim '7eed0e38-bf92-4f56-aa3e-0d0a523e368c' (era 2). No writer_claim, no metadata-namespace reservation, no checkpoint task — this mount appends to none of this volume's single-appender structures and ships every metadata mutation. Guarantee class: co-writer
+[2026-09-12T11:54:02Z INFO  squeezefs] meta volume /dev/nvme2n1: format=3 ledger_seq=8 replay_entries=1 replay_dropped_torn=0 replay_ms=24 free_extents=7152417 next_ino=2 meta_volume_atomicity=cow-checksummed meta_volume_atomicity_physical=unknown writer_guard_mode=co-writer
+[2026-09-12T11:54:02Z INFO  squeezefs::fuse_client] Dynamic reclaim concurrency limit configured: 4
+[2026-09-12T11:54:02Z INFO  squeezefs] co-writer mount: block-ownership recovery skipped entirely (this mount allocates nothing outside a granted lane and frees nothing locally; the walk's free-completing arm must never run on a snapshot view)
+[2026-09-12T11:54:02Z INFO  squeezefs] co-writer mount: job fabric, job wire and the frag-gauge worker are NOT armed (maintenance coordination is the slot-0 volume owner's; this mount cannot write their durable records)
+[2026-09-12T11:54:02Z INFO  squeezefs::multi_writer] multi-writer: this mount is a CO-WRITER (SQUEEZEFS_MW_ROLE=co-writer), so the AUTHORITY arm is not run — the co-writer arm installs the client halves of the same three planes (ownership + publish + custody) after its admission ladder passes
+[2026-09-12T11:54:02Z WARN  squeezefs::meta_ship::owners] metadata function shipping ARMED (DLM S8): 0 of 1 volumes owned locally, 1 shipped to 1 peer(s) ["7eed0e38-bf92-4f56-aa3e-0d0a523e368c"]; 0 slots home locally. Metadata verbs on a foreign volume now travel to its owner; the DATA plane still refuses foreign-home custody loud (S9 ships that half)
+[2026-09-12T11:54:02Z INFO  squeezefs::membership] membership member 'node_e56e47de7cb413eb.mad13c96f' (writer) holds lease epoch 2 in term 2: owner deadline 45000 ms, MY deadline 42956 ms (T_owner − 2·skew_max − D_purge, anchored on my send instant), renewing every 10000 ms
+[2026-09-12T11:54:02Z INFO  squeezefs::dlm] fencing: durable writer term 2 adopted (was 0); every token this process mints now dominates every earlier era's (spec §6.7 decision 4)
+[2026-09-12T11:54:02Z INFO  squeezefs::block_allocator] data-plane allocation partition engaged on volume 'nvme3n1': lane 1 of 4, reservation grain 72 blocks, 335275 block(s) of this device belong to other lanes (alloc_lane_stranded_bytes)
+[2026-09-12T11:54:02Z WARN  squeezefs::alloc_lane_grant] data-plane allocation lane ENGAGED on volume 'nvme3n1': lane 1 of 4, resuming at block 1 (floor OPENED by the authority (this mount never walks)). Fresh allocation is this mount's residue class; frees stay lane-blind
+[2026-09-12T11:54:02Z INFO  squeezefs::block_allocator] data-plane allocation partition engaged on volume 'nvme4n1': lane 1 of 4, reservation grain 72 blocks, 335275 block(s) of this device belong to other lanes (alloc_lane_stranded_bytes)
+[2026-09-12T11:54:02Z WARN  squeezefs::alloc_lane_grant] data-plane allocation lane ENGAGED on volume 'nvme4n1': lane 1 of 4, resuming at block 1 (floor OPENED by the authority (this mount never walks)). Fresh allocation is this mount's residue class; frees stay lane-blind
+[2026-09-12T11:54:02Z WARN  squeezefs::cowriter] CO-WRITER ARMED (DLM S9): metadata verbs ship to '7eed0e38-bf92-4f56-aa3e-0d0a523e368c' at 172.31.21.58:45999, write custody is acquired there, fresh blocks are placed in allocation lane 1 of 4 (durable reservations committed by the authority ahead of every hand-out), and this mount's own free/reclaim accounting stays closed. Data DMA is authorized locally under the custody epoch — only custody travels, never data
+[2026-09-12T11:54:02Z INFO  squeezefs] fleet jobs: member worker armed (KD-MW-16 — fleet read shards; SQUEEZEFS_FLEET_JOBS=0 opts out)
+Mounting Squeezefs at "/scratch/mnt-cw2"...
+[2026-09-12T11:54:02Z INFO  squeezefs::fuse_client] Transport payload-buffer cap: 1844 MiB (memory budget 14759 MiB)
+[2026-09-12T11:54:02Z WARN  squeezefs::ipc_host] SQUEEZEFS_IPC_ALLOW_DEV is set — the KD-7 build-commit skew gate is RELAXED for this mount (degenerate `unknown`/`-dirty` identities will be admitted, counted in ipc_binds_dev_override). Dev boxes only: a mismatched daemon/shim pair is undefined behavior.
+[2026-09-12T11:54:02Z INFO  squeezefs::ipc_host] ipc host: path ctl socket at /run/squeezefs/sqz-il0-2871-42ab6f0a.sock
+[2026-09-12T11:54:02Z INFO  squeezefs::fuse_client] IPC session host armed (socket sqz-il0-2871-42ab6f0a, session shm cap 1844 MiB)
+[2026-09-12T11:54:02Z INFO  squeezefs::fuse_client] SqueezeFS version 1.2.4 (1193c6b7afdd / 1193c6b7afdd47fd3a86603151ab2e6a2590024e, tag stable-2026.09.4) built 2026-09-12T02:40:37Z profile dist initializing mount
+[2026-09-12T11:54:02Z INFO  squeezefs::fuse_client] FUSE Daemon: Mounting squeezefs at "/scratch/mnt-cw2"...
+[2026-09-12T11:54:02Z INFO  squeezefs::fuse_client] FUSE Daemon: Metadata connection active.
+[2026-09-12T11:54:02Z INFO  squeezefs::fuse_client] device-overlay armed: transport streaming holds enabled (SQUEEZEFS_DEVICE_OVERLAY)
+[92mOK[0m Squeezefs is ready at "/scratch/mnt-cw2"
+[2026-09-12T11:54:02Z INFO  squeezefs::fuse_client] FUSE Daemon: Initialized Squeezefs Filesystem mount (version 1.2.4 (1193c6b7afdd / 1193c6b7afdd47fd3a86603151ab2e6a2590024e, tag stable-2026.09.4) built 2026-09-12T02:40:37Z profile dist).
+squeezefs: mount ready (version 1.2.4 (1193c6b7afdd / 1193c6b7afdd47fd3a86603151ab2e6a2590024e, tag stable-2026.09.4) built 2026-09-12T02:40:37Z profile dist, exe hint: rebuild target/release and reinstall)
+[2026-09-12T11:54:02Z INFO  squeezefs::fuse_client] FUSE kernel protocol 7.45 (init flags 0x7ff73fffffb): FOPEN_NOFLUSH advertised + honored on non-writeback opens (kernel ≥ 7.35) (D2.a; under writeback cache the elision switch is the clean-FLUSH ENOSYS latch — uapi: NOFLUSH applies 'unless FUSE_WRITEBACK_CACHE'); UNKNOWN init capability bits 0x40000000000 advertised — investigate whether an atomic-open-class capability is among them (D2.d adoption follow-up)
+squeezefs: FUSE kernel 7.45 — FOPEN_NOFLUSH advertised (wb-cache elision = clean-FLUSH ENOSYS latch); UNKNOWN init capability bits 0x40000000000 advertised — investigate whether an atomic-open-class capability is among them (D2.d adoption follow-up)
+[2026-09-12T11:54:02Z INFO  squeezefs::fuse_client] FUSE_HANDLE_KILLPRIV_V2 negotiated (kernel killpriv probe deleted; daemon owns suid/sgid/caps clearing) for this mount
+[2026-09-12T11:54:02Z INFO  squeezefs::fuse_client] IPC session host: mount st_dev resolved (60)
+[2026-09-12T11:54:02Z INFO  squeezefs::fuse_client] co-writer mount: writeback flusher, extent-record recovery, fold worker and reclaim pool are NOT armed (nothing here can be dirty, staged or freed by this mount)
+[2026-09-12T11:54:02Z WARN  squeezefs::ro_coherence] reader data plane armed (DLM S5): block allocation, terminal frees, device reclaim, the W1 in-place patch and in-place overwrites are all refused on this mount; the reclaim queue is latched halted
+[2026-09-12T11:54:02Z INFO  squeezefs::meta_backend::kv::node_cache] node cache armed for coherent reads at checkpoint epoch 8 (tail 3297): cached nodes are dropped on every epoch step, and this mount may not write
+[2026-09-12T11:54:02Z INFO  squeezefs::ro_coherence] reader coherence armed on 1/1 volume(s): staleness bound 2s (poll 1s + the writer's ≤1 s checkpoint ceiling), R-6 purge sink installed
+[2026-09-12T11:54:02Z INFO  squeezefs::ro_coherence] reader revalidation armed: 1 volume(s), every 1s (the derived cadence — one ledger read per volume per pass; staleness bound 2s; serve ledger armed (observed drain))
+[2026-09-12T11:54:02Z WARN  fuse3::raw::connection::kmbuf] SQUEEZEFS_FUSE_ZC=1 declined: the kmbuf/zc io_uring surface is Absent on this kernel — continuing on the userspace-ent path (fuse3_zc_replies stays 0; the sqz kernel series carries the surface)
+[2026-09-12T11:54:02Z INFO  fuse3::raw::connection::fuse_over_uring] fuse-over-uring queue-ring setup probe: SINGLE_ISSUER+DEFER_TASKRUN available
+FUSE-over-io_uring registered: queues=8 depth=32 payload_sz=1048576 max_write=1048576 max_pages=256 buffers=user-ents kmbuf_ops=absent fd=69 sqpoll=off drain_groups=4(width<=2)
+[2026-09-12T11:54:02Z INFO  fuse3::raw::connection::fuse_over_uring] FUSE-over-io_uring registered: queues=8 depth=32 payload_sz=1048576 max_write=1048576 max_pages=256 buffers=user-ents kmbuf_ops=absent fd=69 sqpoll=off drain_groups=4(width<=2)
+FUSE-over-io_uring session path armed (ready=true, queues=8)
+FUSE-over-io_uring transport armed for this session
+[2026-09-12T11:54:02Z INFO  fuse3::raw::session] FUSE-over-io_uring transport armed for this session
+FUSE-over-io_uring: classical sideband servicer armed (primary session; FORGET/INTERRUPT/resend + switchover stragglers)
+[2026-09-12T11:54:02Z INFO  squeezefs::fleet_worker] fleet worker: member 'node_e56e47de7cb413eb.mad13c96f' enrolled at coordinator 172.31.21.58:40267 (KD-MW-16 fleet read shards)
+[2026-09-12T11:54:33Z ERROR squeezefs::meta_ship::publish] S9: the authority refused 1 shipped free(s) (vol_tag 0xad7b1d37b0829b08, request 1285): already free/graced/quarantined — the double-release lineage, surfaced on the authority's own tripwire
+[2026-09-12T11:54:42Z ERROR squeezefs::meta_ship::publish] S9: the authority refused 1 shipped free(s) (vol_tag 0xc5e11286df218556, request 1474): already free/graced/quarantined — the double-release lineage, surfaced on the authority's own tripwire
+[2026-09-12T11:54:42Z ERROR squeezefs::meta_ship::publish] S9: the authority refused 1 shipped free(s) (vol_tag 0xc5e11286df218556, request 1483): already free/graced/quarantined — the double-release lineage, surfaced on the authority's own tripwire
+[2026-09-12T11:54:42Z ERROR squeezefs::meta_ship::publish] S9: the authority refused 1 shipped free(s) (vol_tag 0xc5e11286df218556, request 1493): already free/graced/quarantined — the double-release lineage, surfaced on the authority's own tripwire
+[2026-09-12T11:54:43Z ERROR squeezefs::meta_ship::publish] S9: the authority refused 1 shipped free(s) (vol_tag 0xc5e11286df218556, request 1500): already free/graced/quarantined — the double-release lineage, surfaced on the authority's own tripwire
+[2026-09-12T11:54:52Z ERROR squeezefs::meta_ship::publish] S9: the authority refused 1 shipped free(s) (vol_tag 0xc5e11286df218556, request 1678): already free/graced/quarantined — the double-release lineage, surfaced on the authority's own tripwire
+[2026-09-12T11:54:52Z ERROR squeezefs::meta_ship::publish] S9: the authority refused 1 shipped free(s) (vol_tag 0xad7b1d37b0829b08, request 1696): already free/graced/quarantined — the double-release lineage, surfaced on the authority's own tripwire
+[2026-09-12T11:55:02Z ERROR squeezefs::meta_ship::publish] S9: the authority refused 1 shipped free(s) (vol_tag 0xad7b1d37b0829b08, request 1855): already free/graced/quarantined — the double-release lineage, surfaced on the authority's own tripwire
+[2026-09-12T11:55:02Z ERROR squeezefs::meta_ship::publish] S9: the authority refused 1 shipped free(s) (vol_tag 0xc5e11286df218556, request 1864): already free/graced/quarantined — the double-release lineage, surfaced on the authority's own tripwire
+[2026-09-12T11:55:02Z ERROR squeezefs::meta_ship::publish] S9: the authority refused 1 shipped free(s) (vol_tag 0xc5e11286df218556, request 1875): already free/graced/quarantined — the double-release lineage, surfaced on the authority's own tripwire
+[2026-09-12T11:55:11Z ERROR squeezefs::meta_ship::publish] S9: the authority refused 1 shipped free(s) (vol_tag 0xc5e11286df218556, request 2035): already free/graced/quarantined — the double-release lineage, surfaced on the authority's own tripwire
+[2026-09-12T11:55:21Z ERROR squeezefs::meta_ship::publish] S9: the authority refused 1 shipped free(s) (vol_tag 0xc5e11286df218556, request 2215): already free/graced/quarantined — the double-release lineage, surfaced on the authority's own tripwire
+[2026-09-12T11:55:21Z ERROR squeezefs::meta_ship::publish] S9: the authority refused 1 shipped free(s) (vol_tag 0xc5e11286df218556, request 2234): already free/graced/quarantined — the double-release lineage, surfaced on the authority's own tripwire
+[2026-09-12T11:55:31Z ERROR squeezefs::meta_ship::publish] S9: the authority refused 1 shipped free(s) (vol_tag 0xad7b1d37b0829b08, request 2420): already free/graced/quarantined — the double-release lineage, surfaced on the authority's own tripwire
+[2026-09-12T11:55:40Z ERROR squeezefs::meta_ship::publish] S9: the authority refused 1 shipped free(s) (vol_tag 0xad7b1d37b0829b08, request 2607): already free/graced/quarantined — the double-release lineage, surfaced on the authority's own tripwire
+[2026-09-12T11:56:39Z WARN  fuse3::raw::connection::fuse_over_uring] fuse-over-uring qids=[2, 3]: the bounded park's tick RESCUED 1 queued WorkerMsg(s) no wake delivered — a LOST commit wake (transport_park_tick_commit_rescues); at pass top: wake_armed=true wake_cqe_seen=false owed=1 wake_fd=80: eventfd-count=1; ring_fd=84: SqHead=38906 SqTail=38907 CachedSqHead=38906 CqHead=38842 CqTail=38842 PollList=1
+[2026-09-12T11:58:49Z ERROR squeezefs::meta_ship::publish] S9: the authority refused 1 shipped free(s) (vol_tag 0xc5e11286df218556, request 15404): already free/graced/quarantined — the double-release lineage, surfaced on the authority's own tripwire
+[2026-09-12T11:59:01Z ERROR squeezefs::meta_ship::publish] S9: the authority refused 1 shipped free(s) (vol_tag 0xc5e11286df218556, request 15726): already free/graced/quarantined — the double-release lineage, surfaced on the authority's own tripwire
+[2026-09-12T11:59:01Z ERROR squeezefs::meta_ship::publish] S9: the authority refused 1 shipped free(s) (vol_tag 0xc5e11286df218556, request 15740): already free/graced/quarantined — the double-release lineage, surfaced on the authority's own tripwire
+[2026-09-12T11:59:10Z ERROR squeezefs::meta_ship::publish] S9: the authority refused 1 shipped free(s) (vol_tag 0xad7b1d37b0829b08, request 15910): already free/graced/quarantined — the double-release lineage, surfaced on the authority's own tripwire
+[2026-09-12T11:59:10Z ERROR squeezefs::meta_ship::publish] S9: the authority refused 1 shipped free(s) (vol_tag 0xc5e11286df218556, request 15921): already free/graced/quarantined — the double-release lineage, surfaced on the authority's own tripwire
+[2026-09-12T11:59:20Z ERROR squeezefs::meta_ship::publish] S9: the authority refused 1 shipped free(s) (vol_tag 0xad7b1d37b0829b08, request 16099): already free/graced/quarantined — the double-release lineage, surfaced on the authority's own tripwire
+[2026-09-12T11:59:20Z ERROR squeezefs::meta_ship::publish] S9: the authority refused 1 shipped free(s) (vol_tag 0xc5e11286df218556, request 16113): already free/graced/quarantined — the double-release lineage, surfaced on the authority's own tripwire
+[2026-09-12T11:59:20Z ERROR squeezefs::meta_ship::publish] S9: the authority refused 1 shipped free(s) (vol_tag 0xc5e11286df218556, request 16125): already free/graced/quarantined — the double-release lineage, surfaced on the authority's own tripwire
+[2026-09-12T11:59:29Z ERROR squeezefs::meta_ship::publish] S9: the authority refused 1 shipped free(s) (vol_tag 0xad7b1d37b0829b08, request 16281): already free/graced/quarantined — the double-release lineage, surfaced on the authority's own tripwire
+[2026-09-12T11:59:30Z ERROR squeezefs::meta_ship::publish] S9: the authority refused 1 shipped free(s) (vol_tag 0xc5e11286df218556, request 16293): already free/graced/quarantined — the double-release lineage, surfaced on the authority's own tripwire
+[2026-09-12T11:59:30Z ERROR squeezefs::meta_ship::publish] S9: the authority refused 1 shipped free(s) (vol_tag 0xc5e11286df218556, request 16303): already free/graced/quarantined — the double-release lineage, surfaced on the authority's own tripwire
+[2026-09-12T11:59:39Z ERROR squeezefs::meta_ship::publish] S9: the authority refused 1 shipped free(s) (vol_tag 0xc5e11286df218556, request 16464): already free/graced/quarantined — the double-release lineage, surfaced on the authority's own tripwire
+[2026-09-12T11:59:40Z ERROR squeezefs::meta_ship::publish] S9: the authority refused 1 shipped free(s) (vol_tag 0xad7b1d37b0829b08, request 16483): already free/graced/quarantined — the double-release lineage, surfaced on the authority's own tripwire
+[2026-09-12T11:59:49Z ERROR squeezefs::meta_ship::publish] S9: the authority refused 1 shipped free(s) (vol_tag 0xc5e11286df218556, request 16670): already free/graced/quarantined — the double-release lineage, surfaced on the authority's own tripwire
+[2026-09-12T11:59:50Z ERROR squeezefs::meta_ship::publish] S9: the authority refused 1 shipped free(s) (vol_tag 0xc5e11286df218556, request 16683): already free/graced/quarantined — the double-release lineage, surfaced on the authority's own tripwire
+[2026-09-12T11:59:50Z ERROR squeezefs::meta_ship::publish] S9: the authority refused 1 shipped free(s) (vol_tag 0xad7b1d37b0829b08, request 16690): already free/graced/quarantined — the double-release lineage, surfaced on the authority's own tripwire
+[2026-09-12T11:59:59Z ERROR squeezefs::meta_ship::publish] S9: the authority refused 1 shipped free(s) (vol_tag 0xad7b1d37b0829b08, request 16844): already free/graced/quarantined — the double-release lineage, surfaced on the authority's own tripwire
+[2026-09-12T12:00:09Z ERROR squeezefs::meta_ship::publish] S9: the authority refused 1 shipped free(s) (vol_tag 0xad7b1d37b0829b08, request 17029): already free/graced/quarantined — the double-release lineage, surfaced on the authority's own tripwire

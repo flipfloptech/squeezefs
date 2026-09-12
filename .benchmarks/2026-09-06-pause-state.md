@@ -599,6 +599,38 @@ mount (the A-arm rig reset the cluster; remount is part of every arm).
    `ROWS` selector (repo copy updated). Box left idle: no daemon, test
    unmounted, set formatted. **Next (owner's plan step c): the AWS hero run
    — cheap-first (a local fleet probe), then EXPRESSED approval at launch.**
+1w. **THE PRE-HERO AWS RUN — the `mw` preset on real fabric, owner-approved
+   ("run the multi-writer preset in AWS no longer than 1h max runtime",
+   2026-09-12).** Cheap-first satisfied first: the LOCAL fleet probe (the
+   s11-mpiio fleet row on the tcp devsub, the 1.2.4 release build) ran the
+   full four-phase matrix — S11 gate MET (min 1.056), read-back exact, zero
+   residue. Cloud: `MAX_CLUSTER_HOURS=1 PRESET=mw … full --yes` on the
+   ubuntu2604 `dist` 1.2.4 artifacts (sha `9b1d7cdd…`), 4 × i4i.2xlarge
+   ON-DEMAND, us-east-1a. Attempt 1 (`sqzbench-20260912-074308`) stalled at
+   launch 6/7 — a VENUE defect: the operator's ssh agent held 10 keys and
+   the rig lacked `IdentitiesOnly=yes`, so sshd refused before the bench
+   key was offered; driver stopped, cluster torn down (sweep clean, ≈ 6 min
+   billed), rig fixed `97e8dac4`. Attempt 2 (`sqzbench-20260912-075025`,
+   07:50 → 08:03, ≈ 12 min billed; ≈ $1 total for both): deploy
+   sha-verified on all four nodes, assemble-mw green (nvmet PR asserted,
+   authority + 2 co-writers, FLEET_SHARE=3), **s11-mpiio row GREEN — S11
+   gate MET min 1.207** (A1 shared 1,061 / B1 fpp 880 / B2 fpp 870 / A2
+   shared 1,053 MiB/s steady; read-back exact 16.8 GiB/s; fsck oracle),
+   teardown sweep clean, independently verified nothing billing. Row:
+   `.benchmarks/cloud/2026-09-12-075403/`. The ~1 GB/s ceiling is the
+   preset's single 12.5 Gbit NIC — the correctness venue, never throughput.
+   **The HERO shape (owner: 40 GB/s+ and 800k+ IOPS) is NIC arithmetic:**
+   40 GB/s over nvme-tcp = ≥ 350 Gbit/s on BOTH the storage and client
+   sides. Shape A (recommended first): 2 × i7ie.48xlarge storage (200 Gbit
+   each, 16 × 7.5 TB NVMe) + 2 × c6in.32xlarge clients (200 Gbit, 128 vCPU)
+   + 1 × i4i.2xlarge meta ≈ **$65/hr on-demand, ≈ $130 for a 2 h run,
+   $195 at a 3 h guard**; shape B: 4 × i3en.24xlarge + 4 × c6in.32xlarge
+   ≈ $73/hr. Both need a rig extension (per-role instance types; a
+   multi-client elbencho battery — today's drives one client) + a dry run
+   + a cheap functional pass of the new battery before the launch, which
+   needs its own EXPRESSED approval. Honest expectation for a first run:
+   30–36 GB/s reads with 40 the stretch; the 800k IOPS row is the likelier
+   first win.
 2. **Kernel A/B, B arm** — after `squeeze-test` boots the 6.19.14 series
    WITH 0031 (or whichever box carries the patched kernel): on the box,
    `cd /scratch/tmp/sqz-agent/k26 && sudo env ARM=B KERNEL_TAG=<uname -r

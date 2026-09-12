@@ -1,0 +1,41 @@
+IOR-4.0.0: MPI Coordinated Test of Parallel I/O
+Began               : Sat Sep 12 12:00:09 2026
+Command line        : /opt/squeezefs-bench/repo/target/mw-ior/ior-4.0.0/src/ior -a POSIX -b 4m -t 4m -s 320 -r -R -C -k -E -G 75427325 -i 1 -o /scratch/mnt-cw1/s11-mpiio.dat
+Machine             : Linux ip-172-31-21-58
+TestID              : 0
+StartTime           : Sat Sep 12 12:00:09 2026
+Path                : /scratch/mnt-cw1/s11-mpiio.dat
+FS                  : 3.4 TiB   Used FS: 22.5%   Inodes: 1.0 Mi   Used Inodes: 0.0%
+
+Options: 
+api                 : POSIX
+apiVersion          : 
+test filename       : /scratch/mnt-cw1/s11-mpiio.dat
+access              : single-shared-file
+type                : independent
+segments            : 320
+ordering in a file  : sequential
+ordering inter file : constant task offset
+task offset         : 1
+nodes               : 1
+tasks               : 8
+clients per node    : 8
+repetitions         : 1
+xfersize            : 4 MiB
+blocksize           : 4 MiB
+aggregate filesize  : 10 GiB
+
+Results: 
+
+access    bw(MiB/s)  IOPS       Latency(s)  block(KiB) xfer(KiB)  open(s)    wr/rd(s)   close(s)   total(s)   iter
+------    ---------  ----       ----------  ---------- ---------  --------   --------   --------   --------   ----
+WARNING: inconsistent file size by different tasks
+WARNING: Expected aggregate file size       = 10737418240
+WARNING: Stat() of aggregate file size      = 10720641024
+WARNING: Using actual aggregate bytes moved = 10737418240
+read      16842      4213       0.604460    4096       4096       0.003299   0.607606   0.000250   0.608008   0   
+
+Summary of all tests:
+Operation   Max(MiB)   Min(MiB)  Mean(MiB)     StdDev   Max(OPs)   Min(OPs)  Mean(OPs)     StdDev    Mean(s) Stonewall(s) Stonewall(MiB) Test# #Tasks tPN reps fPP reord reordoff reordrand seed segcnt   blksiz    xsize aggs(MiB)   API RefNum
+read        16841.88   16841.88   16841.88       0.00    4210.47    4210.47    4210.47       0.00    0.60801         NA            NA     0      8   8    1   0     1        1         0    0    320  4194304  4194304   10240.0 POSIX      0
+Finished            : Sat Sep 12 12:00:10 2026

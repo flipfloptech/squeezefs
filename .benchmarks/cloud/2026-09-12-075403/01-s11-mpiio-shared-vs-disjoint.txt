@@ -1,0 +1,29 @@
+# row=s11-mpiio-shared-vs-disjoint
+# order=1
+# instrument=pinned ior 4.0.0 + mpirun (exact versions in the leg output below)
+# substrate=aws-on-demand/i4i.2xlarge/us-east-1a/pg-cluster (instance-store NVMe over nvmet-tcp, single NIC) — cloud substrate (third class — never spliced into devsub medians)
+# venue=cloud-bench-cluster/mw cluster=sqzbench-20260912-075025 cowriters=2 procs=4
+# ts=2026-09-12T11:54:05Z
+# cmd=SQZ_BIN=/opt/squeezefs-bench/squeezefs SQZ_MWMATRIX_MOUNTS=/scratch/mnt,/scratch/mnt-cw1,/scratch/mnt-cw2 SQZ_MWMATRIX_ROWDIR=/opt/squeezefs-bench/mw-rows bash /opt/squeezefs-bench/repo/tests/run_mw_matrix.sh s11-mpiio --procs=4
+[mwmatrix] external mounts verified: authority=/scratch/mnt (posture=writer, fence_mode=1, membership=owner) + 2 co-writers (posture=co-writer, membership=member)
+[mwmatrix] fetching pinned ior 4.0.0
+[mwmatrix] pinned ior 4.0.0 ready (/opt/squeezefs-bench/repo/target/mw-ior/ior-4.0.0/src/ior, sha256 510b7d4ad0f287375848121aa5a1f9842db077c1d81ad0dde738e96255298158)
+[mwmatrix] s11-mpiio: 2 co-writer mounts x 4 procs = 8 ranks, ONE shared file, 4 MiB-aligned block-cyclic segments (ior 4.0.0 POSIX MPMD, -G 75427325); baseline = -F file-per-proc, SAME fleet/geometry; A-B-B-A
+[mwmatrix] instrument: ior 4.0.0 (sha256 510b7d4ad0f287375848121aa5a1f9842db077c1d81ad0dde738e96255298158) + --------------------------------------------------------------------------; substrate: EXTERNAL mounts (/scratch/mnt,/scratch/mnt-cw1,/scratch/mnt-cw2) — the row's substrate/tier is the HARNESS's to state (a real-fabric field row is a different evidence tier from the local fleet's measured-simulated rows; docs/rc-manifest.md)
+[mwmatrix] probe cold-start iteration 959.49 MiB/s discarded (sizing from the warm 1009.59 MiB/s)
+[mwmatrix] range-custody conviction: every co-writer's ranged ledger moved across the probe pass
+[mwmatrix] self-sizer wanted 22208 MiB — CAPPED to 10240 MiB (s=320): the 10 GiB zram-budget clamp (the indirect domain COMPOSES now — the rung-20 blob-aware owner-side merge; this cap is substrate budget, not a correctness boundary). Iteration ceiling raised to 128 to preserve the sustained window.
+[mwmatrix] probe: 1009.59 MiB/s aggregate -> file 10240 MiB (s=320), 8 iterations/phase (sustained window sized >=60 s + >=3 steady iterations)
+[mwmatrix] phase A1 (shared): steady 1061.3 MiB/s over 79s wall (iters: 960.64 1068.83 1056.61 1060.88 1059.81 1077.03 1053.03 1053.12 )
+[mwmatrix] phase B1 (fpp): steady 879.5 MiB/s over 93s wall (iters: 873.22 917.63 862.60 899.04 876.21 848.15 892.01 861.12 )
+[mwmatrix] phase B2 (fpp): steady 870.3 MiB/s over 95s wall (iters: 890.58 849.91 874.74 867.27 878.01 859.96 916.70 845.22 )
+[mwmatrix] phase A2 (shared): steady 1052.7 MiB/s over 80s wall (iters: 859.45 1061.09 1049.97 1044.63 1065.98 1024.39 1064.29 1058.66 )
+A-B-B-A: shared 1061 / disjoint 880 = 1.207; shared 1053 / disjoint 870 = 1.210
+S11 MPI-IO GATE: shared >= 0.8x disjoint in BOTH brackets (min 1.207)
+m50: ranged acquires+extensions d=28743 publish shipped d=201541
+m51: ranged acquires+extensions d=28970 publish shipped d=202281
+authority: grants d=16984 cap_refusals d=0 demotions d=0 conflicts d=0 desired_trims d=17 prs d=0 ors d=0
+S11 MPI-IO engagement GREEN (ranged engaged on every mount, Issue-19 column 0, zero fabricated sharing)
+[mwmatrix] read-back exact: 16842 MiB/s aggregate reorder-read, zero data-check errors
+[mwmatrix] external mounts: WARM-authority fsck oracle (no remount owner; the local fleet leg's oracle is cold-remounted)
+[mwmatrix] s11-mpiio GREEN — the MPI-IO acceptance row over EXTERNAL mounts (outputs + snapshots + fsck in /opt/squeezefs-bench/mw-rows/s11mpiio-1789214051). Evidence tier: the HARNESS's venue states it (real-fabric field rows are a different tier from the local fleet's measured-simulated ones — docs/rc-manifest.md); oracle: warm-authority

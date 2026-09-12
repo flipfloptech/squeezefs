@@ -1,0 +1,52 @@
+IOR-4.0.0: MPI Coordinated Test of Parallel I/O
+Began               : Sat Sep 12 11:57:15 2026
+Command line        : /opt/squeezefs-bench/repo/target/mw-ior/ior-4.0.0/src/ior -a POSIX -b 4m -t 4m -s 320 -w -e -k -E -G 75427325 -i 8 -F -o /scratch/mnt-cw1/s11-mpiio-fpp.dat
+Machine             : Linux ip-172-31-21-58
+TestID              : 0
+StartTime           : Sat Sep 12 11:57:15 2026
+Path                : /scratch/mnt-cw1/s11-mpiio-fpp.dat.00000000
+FS                  : 3.4 TiB   Used FS: 11.2%   Inodes: 1.0 Mi   Used Inodes: 0.0%
+
+Options: 
+api                 : POSIX
+apiVersion          : 
+test filename       : /scratch/mnt-cw1/s11-mpiio-fpp.dat
+access              : file-per-process
+type                : independent
+segments            : 320
+ordering in a file  : sequential
+ordering inter file : no tasks offsets
+nodes               : 1
+tasks               : 8
+clients per node    : 8
+repetitions         : 8
+xfersize            : 4 MiB
+blocksize           : 4 MiB
+aggregate filesize  : 10 GiB
+
+Results: 
+WARNING: The file "/scratch/mnt-cw2/s11-mpiio-fpp.dat.00000004" exists already and will be overwritten
+WARNING: The file "/scratch/mnt-cw1/s11-mpiio-fpp.dat.00000001" exists already and will be overwritten
+WARNING: The file "/scratch/mnt-cw2/s11-mpiio-fpp.dat.00000005" exists already and will be overwritten
+WARNING: The file "/scratch/mnt-cw1/s11-mpiio-fpp.dat.00000003" exists already and will be overwritten
+WARNING: The file "/scratch/mnt-cw1/s11-mpiio-fpp.dat.00000000" exists already and will be overwritten
+
+access    bw(MiB/s)  IOPS       Latency(s)  block(KiB) xfer(KiB)  open(s)    wr/rd(s)   close(s)   total(s)   iter
+------    ---------  ----       ----------  ---------- ---------  --------   --------   --------   --------   ----
+WARNING: The file "/scratch/mnt-cw2/s11-mpiio-fpp.dat.00000006" exists already and will be overwritten
+WARNING: The file "/scratch/mnt-cw1/s11-mpiio-fpp.dat.00000002" exists already and will be overwritten
+WARNING: The file "/scratch/mnt-cw2/s11-mpiio-fpp.dat.00000007" exists already and will be overwritten
+write     890.58     222.65     11.20       4096       4096       0.000321   11.50      1.12       11.50      0   
+write     849.91     212.48     11.65       4096       4096       0.000803   12.05      2.55       12.05      1   
+write     874.74     218.69     10.91       4096       4096       0.000341   11.71      2.12       11.71      2   
+WARNING: fsync(15) failed
+write     867.27     216.82     7.15        4096       4096       0.000240   11.81      4.66       11.81      3   
+write     878.01     219.51     11.11       4096       4096       0.000254   11.66      2.22       11.66      4   
+write     859.96     214.99     11.30       4096       4096       0.000897   11.91      1.92       11.91      5   
+write     916.70     229.18     11.13       4096       4096       0.002037   11.17      1.24       11.17      6   
+write     845.22     211.31     11.95       4096       4096       0.000242   12.11      1.23       12.12      7   
+
+Summary of all tests:
+Operation   Max(MiB)   Min(MiB)  Mean(MiB)     StdDev   Max(OPs)   Min(OPs)  Mean(OPs)     StdDev    Mean(s) Stonewall(s) Stonewall(MiB) Test# #Tasks tPN reps fPP reord reordoff reordrand seed segcnt   blksiz    xsize aggs(MiB)   API RefNum
+write         916.70     845.22     872.80      21.66     229.18     211.30     218.20       5.42   11.73949         NA            NA     0      8   8    8   1     0        1         0    0    320  4194304  4194304   10240.0 POSIX      0
+Finished            : Sat Sep 12 11:58:49 2026

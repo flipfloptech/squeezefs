@@ -1,0 +1,7 @@
+Warning: SQZ_BIN is not a SqueezeFS knob (typo? `src/env_knobs.rs` is the registry) — ignored
+Warning: SQZ_MWMATRIX_MOUNTS is not a SqueezeFS knob (typo? `src/env_knobs.rs` is the registry) — ignored
+Warning: SQZ_MWMATRIX_ROWDIR is not a SqueezeFS knob (typo? `src/env_knobs.rs` is the registry) — ignored
+fsck job 640918b7-d8b8-44dd-bf55-54f1685847da running (report-only; watch `squeezefs job list`)…
+fsck (online mode): 8 inode(s), 6 tree page(s), 7362 block(s), 1 refcount(s) checked in 3 s
+suspects: 0 raised, 0 cleared (0 epoch-exempt, 0 in-flight-exempt, 0 mover-ledger-exempt, 0 pack-ledger-exempt)
+findings: 0 (clean)

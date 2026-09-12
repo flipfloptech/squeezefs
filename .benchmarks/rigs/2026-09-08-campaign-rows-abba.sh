@@ -23,11 +23,11 @@
 # read jobs only, so its .row files are empty for them).
 set -u
 TS=$(date -u +%Y%m%d-%H%M%S)
-OUT=${OUT:-/scratch/tmp/sqz-agent/campaign/rows-$TS}
+OUT=${OUT:-/scratch/tmp/campaign/rows-$TS}
 MNT=/scratch/tmp/test
 JOBS=/scratch/tmp/fio_jobs
 META="sqmeta:///dev/nvme0n1,/dev/nvme2n1,/dev/nvme4n1,/dev/nvme6n1,/dev/nvme8n1"
-DELTA=/scratch/tmp/sqz-agent/k26/2026-09-03-r4-row-delta.py
+DELTA=${DELTA:-/scratch/tmp/rigs/2026-09-03-r4-row-delta.py}
 SEQ=${SEQ:-"E F F E"}
 RT=${RT:-30}
 mkdir -p "$OUT"
@@ -103,6 +103,13 @@ mount_arm() {  # $1 = arm letter
   pkill -x squeezefs 2>/dev/null; sleep 2; pkill -9 -x squeezefs 2>/dev/null
   umount -l "$MNT" 2>/dev/null
   echo YES | /scratch/tmp/cluster_reset_v4.sh > "$OUT/reset-$1.log" 2>&1 || { echo "RESET FAILED ($1)"; exit 1; }
+  # The meta URI from THIS reset's printed mount line — namespace numbering
+  # can move across resets (the 2026-09-09 n1→n2 lesson); the reset also
+  # leaves the set mounted by its own SQZ, which the arm replaces.
+  META="$(grep -oE 'sqmeta://[^ ]+' "$OUT/reset-$1.log" | tail -n 1)"; [ -n "$META" ] || { echo "RESET printed no sqmeta URI ($1)"; exit 1; }
+  for d in $(echo "$META" | sed 's#sqmeta://##; s#,# #g'); do [ -b "$d" ] || { echo "META device $d is not a block device ($1)"; exit 1; }; done
+  pkill -x squeezefs 2>/dev/null; sleep 2; umount -l "$MNT" 2>/dev/null; rm -rf "$MNT"/client_validation 2>/dev/null
+  [ -z "$(ls -A "$MNT" 2>/dev/null)" ] || { echo "MOUNTPOINT NOT EMPTY ($1)"; exit 1; }
   "$bin" mount "$META" "$MNT" --daemon --interception --allow-other --log-file "$OUT/mount-$1-$(date +%s).log" 2>&1 | tail -1
   sleep 3
   mkdir -p "$MNT/client_validation"
@@ -115,11 +122,17 @@ for arm in $SEQ; do
   i=$((i+1)); ilv="IL_$arm"; il="${!ilv:-}"
   echo "##### arm $arm (position $i) $(date -u +%FT%TZ)"
   mount_arm "$arm"
-  row "${arm}${i}-rr4k-kern" "$JOBS/randread_iops.job"  kern "$il" --runtime="$RT"
-  row "${arm}${i}-rw4k-kern" "$JOBS/randwrite_iops.job" kern "$il" --runtime="$RT"
-  row "${arm}${i}-wdur-kern" "$JOBS/write_BW.job"        kern "$il" --runtime="$RT" --end_fsync=1
-  row "${arm}${i}-fsync-storm" "$STORM"                  kern "$il"
-  [ -n "$il" ] && row "${arm}${i}-rr4k-il" "$JOBS/randread_iops.job" il "$il" --runtime="$RT"
+  # ROWS selects the rows (default all); a re-run of one contested row
+  # names just it, e.g. ROWS="rw4k-kern rr4k-il".
+  for r in ${ROWS:-rr4k-kern rw4k-kern wdur-kern fsync-storm rr4k-il}; do
+    case "$r" in
+      rr4k-kern)   row "${arm}${i}-rr4k-kern" "$JOBS/randread_iops.job"  kern "$il" --runtime="$RT" ;;
+      rw4k-kern)   row "${arm}${i}-rw4k-kern" "$JOBS/randwrite_iops.job" kern "$il" --runtime="$RT" ;;
+      wdur-kern)   row "${arm}${i}-wdur-kern" "$JOBS/write_BW.job"        kern "$il" --runtime="$RT" --end_fsync=1 ;;
+      fsync-storm) row "${arm}${i}-fsync-storm" "$STORM"                  kern "$il" ;;
+      rr4k-il)     [ -n "$il" ] && row "${arm}${i}-rr4k-il" "$JOBS/randread_iops.job" il "$il" --runtime="$RT" ;;
+    esac
+  done
   rm -rf "$MNT/client_validation/storm."* 2>/dev/null
 done
 pkill -x squeezefs 2>/dev/null; sleep 2; umount -l "$MNT" 2>/dev/null

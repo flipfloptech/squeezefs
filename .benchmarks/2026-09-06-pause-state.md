@@ -585,6 +585,20 @@ mount (the A-arm rig reset the cluster; remount is part of every arm).
    the squeeze-test benchmarks (campaign rows + scoreboard on 1.2.4) →
    the AWS hero run (local fleet probe first; EXPRESSED approval at
    launch).
+1v. **1.2.4 shipped to squeeze-test + the regression bracket PAR
+   (2026-09-12, `.benchmarks/2026-09-12-dist-123-vs-124-squeeze-test.md`).**
+   `task dist:all` at the tag → `~/sqz-dist-1.2.4/` + SHA256SUMS; the
+   rocky8 pair shipped as `/scratch/tmp/squeezefs` + `.so` (1.2.3 kept as
+   `.1.2.3` for the A arm). The campaign-rows A-B-B-A 1.2.3 vs 1.2.4
+   (E F F E, 30 s): rr4k-kern −0.4 %, wdur −0.0 %, fsync-storm −0.4 %,
+   rr4k-il −1.3 %, rw4k-kern −3.8 % CONTESTED (F2 non-flat +16 %) → re-run
+   F E E F at 60 s: rw4k-kern **−0.2 %** (arms interleaved; CPU/op +0.4 %),
+   rr4k-il −1.1 % (observation: PK8's dead-lifetime screen is the only
+   shim-path change; inside the position spread; named, not adjudicated).
+   30 min of box time. Rig gained the meta-URI-from-reset-log read and a
+   `ROWS` selector (repo copy updated). Box left idle: no daemon, test
+   unmounted, set formatted. **Next (owner's plan step c): the AWS hero run
+   — cheap-first (a local fleet probe), then EXPRESSED approval at launch.**
 2. **Kernel A/B, B arm** — after `squeeze-test` boots the 6.19.14 series
    WITH 0031 (or whichever box carries the patched kernel): on the box,
    `cd /scratch/tmp/sqz-agent/k26 && sudo env ARM=B KERNEL_TAG=<uname -r

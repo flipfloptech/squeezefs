@@ -564,6 +564,27 @@ mount (the A-arm rig reset the cluster; remount is part of every arm).
    tail advance. Gauges `meta_kv_interior_merges`, `meta_kv_merge_laps`,
    `meta_kv_merge_sweep_{ns,projections}`; operator row added. Nothing left
    stated-not-done.
+1u. **1.2.4 RELEASED — `stable-2026.09.4` = `1193c6b7` over the tested
+   `fe4c9390` (2026-09-11; the owner's plan: finalize → full gates →
+   squeeze-test benchmarks → the AWS hero run).** Also landed before the
+   chain: the suite-tree harness (`6117b0c7`: `tests/suite_tree.sh` — the
+   external suites' trees in a durable cache, marker liveness, legacy
+   adoption, autotools from the store; its exec bit `fe4c9390` after a
+   gate red on `script_exec_bit_tests`). The chain ran ONCE from zero
+   (record `.benchmarks/2026-09-11-1.2.4-release-gate.md`): `task check`
+   380 / 4,961, fstests 787/783/4/**0**, pjdfstests 8,798, LTP 1,884/0
+   UNATTENDED (the durable tree), require-mount, zc 187 (resumed once
+   after a VENUE condition: `/home` at 98 % — the bench auto-size pin
+   needs 68 GiB free; 810 GB of regenerable `target/` cleared → 53 %),
+   fuzz 399 M / 0. Release act `1193c6b7`: train 1.2.3 → 1.2.4, RELEASE_
+   NOTES 1.2.4 (leaf merge headline; ENOSPC not fail-stop; the three
+   1.2.3-shipped fixes; PK8; the harness), the gate record. **Board:** the
+   release driver wants a free-space floor refusal (the bench baseline's
+   thermal-refusal precedent) and `target/` hygiene. **Then:** `task
+   dist:all` at the tag → ship the rocky8 pair to squeeze-test →
+   the squeeze-test benchmarks (campaign rows + scoreboard on 1.2.4) →
+   the AWS hero run (local fleet probe first; EXPRESSED approval at
+   launch).
 2. **Kernel A/B, B arm** — after `squeeze-test` boots the 6.19.14 series
    WITH 0031 (or whichever box carries the patched kernel): on the box,
    `cd /scratch/tmp/sqz-agent/k26 && sudo env ARM=B KERNEL_TAG=<uname -r

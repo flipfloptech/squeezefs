@@ -351,8 +351,10 @@ impl SlotTrees {
     /// Split a slot-tree key into `(kind, legacy key)`, or `None` for a
     /// key the §5.2.1 codec refuses — counted on
     /// `meta_kv_forest_key_violations` (must stay 0) and logged. The
-    /// kind-routed walks skip such a record rather than fail the page
-    /// (see [`Self::range`]); fsck's raw forest walk is what reports it.
+    /// kind-routed RECORD walks skip such a record rather than fail the
+    /// page (see [`Self::range`]); fsck's raw forest walk is what reports
+    /// it. The by-block refs family does NOT ride this — it refuses
+    /// ([`Self::refs_window`]).
     fn decode_or_skip(key: &[u8]) -> Option<(u8, Vec<u8>)> {
         match split_forest_key(key) {
             Ok(split) => Some(split),
@@ -489,6 +491,15 @@ impl SlotTrees {
     /// legacy-key cursor cannot express a forest resume point (refs sort
     /// block-major inside a tree, the forest is slot-major). Keys come
     /// back in legacy form.
+    ///
+    /// A key in the window the codec refuses is REFUSED, never skipped —
+    /// the flat decode's behaviour (`decode_block_ref_key` → `Err` at the
+    /// caller): the population of a block decides a terminal free, a W1
+    /// sole-owner patch and an S9 free's validation, and an answer one
+    /// short is the exact failure the ledger exists to prevent. The
+    /// skip-not-fail law is the kind-routed RECORD walks' ([`Self::range`]),
+    /// where a truncated census is the worse outcome and fsck's raw C1 walk
+    /// is the detector. Counted on the tripwire before the refusal.
     pub async fn refs_window(
         &self,
         start: &[u8],
@@ -515,8 +526,18 @@ impl SlotTrees {
                 };
                 cursor = super::node::key_successor(last);
                 for (k, v) in &page {
-                    let Some((k_kind, legacy)) = Self::decode_or_skip(k) else {
-                        continue;
+                    let (k_kind, legacy) = match split_forest_key(k) {
+                        Ok(split) => split,
+                        Err(e) => {
+                            super::META_KV_FOREST_KEY_VIOLATIONS.fetch_add(1, Ordering::Relaxed);
+                            return Err(KvError::Corrupt(format!(
+                                "block-reference record under a key the forest codec refuses \
+                                 ({} bytes, {:02x?}…): {e} — the population is refused, never \
+                                 answered short; fsck class C1 names the record",
+                                k.len(),
+                                &k[..k.len().min(12)]
+                            )));
+                        }
                     };
                     if k_kind != TREE_BLOCK_REFS {
                         continue;

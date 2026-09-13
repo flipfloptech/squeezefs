@@ -184,6 +184,39 @@ async fn delete_file(be: &KvMetaBackend, i: u32) {
     panic!("delete {} refused ENOSPC past the retry bound", name(i));
 }
 
+/// The mid-wave test's claimant (§4.7): holds every claimable extent but
+/// ONE above the compaction floor, re-taking what the cycles return the
+/// moment `hold` is called, so a sweep lap admits at most one merge.
+struct Throttle {
+    alloc: Arc<ExtentAllocator>,
+    floor: u64,
+    held: Vec<u64>,
+}
+
+impl Throttle {
+    fn new(alloc: Arc<ExtentAllocator>) -> Self {
+        let floor = compaction_floor_extents(alloc.reserve_extents());
+        Self {
+            alloc,
+            floor,
+            held: Vec::new(),
+        }
+    }
+
+    fn hold(&mut self) {
+        while self.alloc.free_extents() > self.floor + 1 {
+            self.held
+                .push(self.alloc.claim_internal().expect("throttle claim"));
+        }
+    }
+
+    fn release(&mut self) {
+        for ext in self.held.drain(..) {
+            self.alloc.release_unpublished(ext);
+        }
+    }
+}
+
 /// Run checkpoint cycles until the claimable extent count stops growing
 /// for `quiet` consecutive cycles (the merge waves return extents one to
 /// two barriered cycles after each sweep — §4.6a (d)). Returns the peak
@@ -1264,9 +1297,22 @@ async fn replay_converges_across_crash_windows_of_a_merge_and_a_root_collapse() 
             delete_file(&be, i).await;
         }
     }
-    // Cover the tombstones so the merge folds elide them (§4.2).
-    be.checkpoint_now().await.expect("checkpoint after deletes");
-    be.checkpoint_now().await.expect("second covering cycle");
+    // Cover the tombstones so the merge folds elide them (§4.2): cycle
+    // until the durable tail has passed the last delete. A cycle's own
+    // SMOs (the compactions a full mixed leaf's tombstone appends force —
+    // many more on a forest's one tree than on three per-kind ones) park
+    // dying floors at their predecessors' records, so the tail can lag a
+    // cycle behind the flush that landed them; a fixed two cycles left
+    // hundreds of tombstones uncovered on 1 in ~12 stamped runs, the big
+    // sweep carried them into its successors, and the last three leaves
+    // stood above the underfull bound with nothing to merge.
+    let deletes_head = be.journal_ring().core().head();
+    let mut covering = 0;
+    while be.ledger_tail() < deletes_head {
+        be.checkpoint_now().await.expect("covering cycle");
+        covering += 1;
+        assert!(covering <= 8, "the tail never passed the deletes");
+    }
 
     let census = be.dead_bset_census();
     assert!(
@@ -1347,10 +1393,23 @@ async fn replay_converges_across_crash_windows_of_a_merge_and_a_root_collapse() 
             break;
         }
     }
-    assert!(
-        META_KV_ROOT_COLLAPSES.load(Ordering::Relaxed) > collapses0,
-        "3,000 creates minus all but every {stride}-th must collapse a tree to its root leaf"
-    );
+    if META_KV_ROOT_COLLAPSES.load(Ordering::Relaxed) <= collapses0 {
+        let c = be.dead_bset_census();
+        let a = be.merge_candidates_audit().await;
+        panic!(
+            "3,000 creates minus all but every {stride}-th must collapse a tree to its root leaf \
+             (census: {} leaves, {} live of {} indexed, {} merge candidates; audit gauge {} \
+             census_now {}; free {} promised {})",
+            c.leaves,
+            c.records_live,
+            c.records_indexed,
+            c.merge_candidates.len(),
+            a.gauge,
+            a.census_now,
+            be.free_extents(),
+            be.heap_promised()
+        );
+    }
     let crash_c = NamedTempFile::new().expect("crash image c");
     std::fs::copy(file.path(), crash_c.path()).expect("copy post-collapse image");
 
@@ -1835,42 +1894,53 @@ async fn merge_candidates_gauge_is_exact_mid_wave_and_at_quiescence() {
     assert_eq!(refusal.to_errno(), libc::ENOSPC, "got {refusal:?}");
     be.checkpoint_now().await.expect("post-fill cycle");
 
+    // Build the underfull population WITHOUT letting the wave run: delete
+    // in PASSES spread across every leaf (pass p removes the files at
+    // index ≡ p mod 10) with the heap unthrottled, so every delete's
+    // compaction is admitted and no leaf drops under the ¼ bound until
+    // the last passes; the LAST pass runs with no cycle at all, so its
+    // tombstones are uncovered — a leaf whose tombstones the durable tail
+    // has not passed is not a merge candidate (the fold credits only
+    // covered tombstones as elided) and the flush pass leaves it alone.
+    // Index order (the shape this test shipped with) empties one leaf
+    // after another and the flush pass's sibling check merges each as it
+    // goes: no backlog ever stands and the "mid-wave" read finds nothing
+    // left to merge — the state the admission's leaked promises had been
+    // hiding (review round 3, Issue 17: with the leak fixed, both layouts
+    // showed it).
+    let mut deleted = 0u32;
+    for pass in 1..10u32 {
+        for i in (pass..landed).step_by(10) {
+            delete_file(&be, i).await;
+            deleted += 1;
+            if pass < 9 && deleted % 32 == 0 {
+                be.checkpoint_now().await.expect("delete cycle");
+            }
+        }
+    }
     // Throttle the wave: a foreign claimant holds every claimable extent
     // but ONE above the compaction floor, so a sweep admits at most one
-    // merge (plus what its own returns fund) before the floor refuses it
-    // — the deletes' compactions still land, one promise at a time.
-    let alloc = Arc::clone(be.allocator());
-    let floor = compaction_floor_extents(alloc.reserve_extents());
-    let mut held: Vec<u64> = Vec::new();
-    while alloc.free_extents() > floor + 1 {
-        held.push(alloc.claim_internal().expect("drain claim"));
-    }
-    for i in 0..landed {
-        if i % 10 != 0 {
-            delete_file(&be, i).await;
+    // merge before the floor refuses it, re-taking what every cycle
+    // returns the moment it lands (a merge's returned extents would
+    // otherwise fund the next lap's second). Creates then land in
+    // whatever in-place room the tail leaf has, a split is refused, the
+    // heap-full posture latches, and the next cycle covers the last
+    // pass's tombstones — hundreds of candidates at once — and runs the
+    // sweep, cut at the floor: mid-wave.
+    let mut throttle = Throttle::new(Arc::clone(be.allocator()));
+    throttle.hold();
+    let mut probes = 0u32;
+    let refusal = loop {
+        match put_file(&be, 700_000 + probes).await {
+            Ok(()) => probes += 1,
+            Err(e) => break e,
         }
-        if i % 32 == 31 {
-            be.checkpoint_now().await.expect("delete cycle");
-        }
-        // Re-take what the cycles returned as they land: the throttle is
-        // ONE admitted merge per lap, and a merge's returned extents (one
-        // to two barriered cycles later) would otherwise fund the next
-        // lap's second — enough laps (the deletes' own ring-full cycles
-        // land at layout-dependent points) and the wave completes before
-        // the mid-wave read below.
-        while alloc.free_extents() > floor + 1 {
-            held.push(alloc.claim_internal().expect("re-drain claim"));
-        }
-    }
-    // The volume is full again by construction (the claimant re-takes the
-    // room the deletes' few merges returned): creates land in whatever
-    // in-place room remains, then a split is refused, the heap-full
-    // posture latches, and the next cycle runs the sweep — cut at the
-    // floor with hundreds of underfull leaves standing: mid-wave.
-    while alloc.free_extents() > floor + 1 {
-        held.push(alloc.claim_internal().expect("re-drain claim"));
-    }
-    let (probes, refusal) = fill_until_refused(&be, 700_000).await;
+        throttle.hold();
+        assert!(
+            probes < 100_000,
+            "harness bug: the throttled fill never refused"
+        );
+    };
     assert_eq!(refusal.to_errno(), libc::ENOSPC, "got {refusal:?}");
     assert!(
         probes < 16,
@@ -1898,7 +1968,8 @@ async fn merge_candidates_gauge_is_exact_mid_wave_and_at_quiescence() {
     );
     assert!(
         a.gauge > 8,
-        "a 90 %-deleted volume mid-wave has many underfull leaves ({})",
+        "a 90 %-deleted volume mid-wave has many underfull leaves ({}) — the last pass's \
+         leaves crossed the underfull bound together and one throttled lap merged one pair",
         a.gauge
     );
     let candidates0 = a.gauge;
@@ -1916,9 +1987,8 @@ async fn merge_candidates_gauge_is_exact_mid_wave_and_at_quiescence() {
     // Release the claimant: the recovery wave runs to quiescence; the gauge
     // from the LAST lap must equal the census under its tail, and the D4
     // report's census — the same predicate — must equal ITS own publish.
-    for ext in held {
-        alloc.release_unpublished(ext);
-    }
+    let alloc = Arc::clone(be.allocator());
+    throttle.release();
     let room0 = be
         .free_extents()
         .saturating_sub(compaction_floor_extents(alloc.reserve_extents()))
@@ -2068,16 +2138,7 @@ async fn a_refused_multi_leaf_member_strands_no_heap_promise() {
     // whatever room the padding leaves.
     let new_name = "zz-strand-the-member-whose-second-leaf-is-refused";
     let dkey = dentry_key(ROOT_INO, dentry_name_hash54(new_name.as_bytes(), seed), 0).to_vec();
-    let d_addr = projected(TREE_DENTRIES, dkey.clone(), 0).await.0;
-    // Does the parent's own inode record share D's leaf (a forest's
-    // first-leaf shape)? Then every dentry mutation's parent Put lands
-    // on D too — in the padding AND in the final create alike.
-    let parent_on_d = projected(TREE_INODES, inode_key(ROOT_INO).to_vec(), 0)
-        .await
-        .0
-        == d_addr;
-    let parent_put = if parent_on_d { inode_put } else { 0 };
-    let create_d_bytes = dentry_put(new_name) + parent_put;
+    let mut d_addr = projected(TREE_DENTRIES, dkey.clone(), 0).await.0;
     // Two 9-char names hashing into D for the rename padding.
     let mut pad_names: Vec<String> = Vec::new();
     let mut k = 0u32;
@@ -2090,9 +2151,10 @@ async fn a_refused_multi_leaf_member_strands_no_heap_promise() {
             pad_names.push(candidate);
         }
     }
-    let rename_d_bytes = dentry_delete + dentry_put(&pad_names[0]) + parent_put;
+    // A same-parent rename stages the dentry Delete + Put and nothing else.
+    let rename_d_bytes = dentry_delete + dentry_put(&pad_names[0]);
     assert!(
-        create_d_bytes > rename_d_bytes,
+        dentry_put(new_name) > rename_d_bytes,
         "the final dentry record must outweigh a pad rename's footprint"
     );
 
@@ -2103,8 +2165,10 @@ async fn a_refused_multi_leaf_member_strands_no_heap_promise() {
     // the threshold writeback into a second frame before the next op is
     // admitted (the op the probe said fits then overflows — and is
     // promised); landing every op first makes the probe the admission's
-    // exact input. Every pad op is a fits-in-place commit while the heap
-    // has room.
+    // exact input. The probe FOLLOWS the leaf: the 800 creates left D's
+    // log a timing-dependent number of page frames deep, so the pad
+    // file's own create (or an early rename) may compact it once — the
+    // padding then continues on the successor, whose log is its fold.
     be.create(ROOT_INO, &pad_names[0], libc::S_IFREG | 0o644, 0, 0)
         .await
         .expect("pad file");
@@ -2112,10 +2176,7 @@ async fn a_refused_multi_leaf_member_strands_no_heap_promise() {
     let mut cur = 0usize;
     loop {
         let (addr, end) = projected(TREE_DENTRIES, dkey.clone(), rename_d_bytes).await;
-        assert_eq!(
-            addr, d_addr,
-            "D compacted under the padding — the fold grew"
-        );
+        d_addr = addr;
         if end > node_size {
             break;
         }
@@ -2125,8 +2186,16 @@ async fn a_refused_multi_leaf_member_strands_no_heap_promise() {
         cur = 1 - cur;
         be.checkpoint_now().await.expect("land the pad rename");
     }
+    // Does the parent's own inode record share D's leaf (a forest's
+    // first-leaf shape)? Then the final create's parent Put lands on D
+    // too. Either way the create's dentry record alone overflows D.
+    let parent_on_d = projected(TREE_INODES, inode_key(ROOT_INO).to_vec(), 0)
+        .await
+        .0
+        == d_addr;
+    let create_d_bytes = dentry_put(new_name) + if parent_on_d { inode_put } else { 0 };
     assert!(
-        projected(TREE_DENTRIES, dkey.clone(), create_d_bytes)
+        projected(TREE_DENTRIES, dkey.clone(), dentry_put(new_name))
             .await
             .1
             > node_size,
@@ -2141,19 +2210,17 @@ async fn a_refused_multi_leaf_member_strands_no_heap_promise() {
         .expect("pad file")
         .ino;
     let ikey = inode_key(last).to_vec();
-    let i_addr = projected(TREE_INODES, ikey.clone(), 0).await.0;
-    assert_ne!(i_addr, d_addr, "I and D are distinct leaves");
-    loop {
+    let i_addr = loop {
         let (addr, end) = projected(TREE_INODES, ikey.clone(), inode_put).await;
-        assert_eq!(addr, i_addr, "I compacted under the padding");
         if end > node_size {
-            break;
+            break addr;
         }
         be.setattr(last, Some(0o600), None, None, None, None, None, None)
             .await
             .expect("pad setattr");
         be.checkpoint_now().await.expect("land the pad setattr");
-    }
+    };
+    assert_ne!(i_addr, d_addr, "I and D are distinct leaves");
 
     // Everything is landed; a covering cycle lets every setup return
     // finish, so nothing is pending or promised when the heap is drained.

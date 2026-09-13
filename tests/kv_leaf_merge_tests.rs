@@ -1176,6 +1176,49 @@ async fn open_copy(path: &std::path::Path) -> Arc<KvMetaBackend> {
     panic!("crash image never opened");
 }
 
+/// The delete stride that lets a create-only population of `n` files
+/// collapse to a root leaf on THIS volume's layout (see the crash-window
+/// test): the heaviest tree's surviving bytes ≤ ½ × `merge_pair_capacity`
+/// — half the merge threshold, the other half being room for the
+/// tombstones the folds have not yet elided. Per-file bytes are the
+/// admission's own (`RECORD_HEADER_LEN` + staged key + value): a flat
+/// volume's heaviest tree holds the inode record alone; a forest's mixed
+/// tree holds the inode AND the dentry (each key one kind byte longer).
+fn survivor_stride(be: &KvMetaBackend, n: u32) -> u32 {
+    use squeezefs::meta_backend::kv::record::{DentryValue, InodeValue, RECORD_HEADER_LEN};
+    let layout = NodeLayout::new(be.superblock().node_size as usize).expect("layout");
+    let key_extra = usize::from(be.symmetric_forest());
+    let inode_rec = RECORD_HEADER_LEN
+        + 8
+        + key_extra
+        + InodeValue {
+            mode: libc::S_IFREG | 0o644,
+            nlink: 1,
+            ..Default::default()
+        }
+        .encode()
+        .len();
+    let dentry_rec = RECORD_HEADER_LEN
+        + 16
+        + key_extra
+        + DentryValue {
+            child_ino: 1,
+            file_type: (libc::S_IFREG >> 12) as u8,
+            name: name(0).into_bytes(),
+        }
+        .encode()
+        .expect("dentry value")
+        .len();
+    let per_file = if be.symmetric_forest() {
+        inode_rec + dentry_rec
+    } else {
+        inode_rec.max(dentry_rec)
+    };
+    let budget = layout.merge_pair_capacity() / 2;
+    let survivors_max = (budget / per_file).max(1) as u32;
+    n.div_ceil(survivors_max).max(2)
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn replay_converges_across_crash_windows_of_a_merge_and_a_root_collapse() {
     // Park the cadence: every checkpoint below is one this test drives.
@@ -1193,9 +1236,21 @@ async fn replay_converges_across_crash_windows_of_a_merge_and_a_root_collapse() 
     let (be, file) = fresh_volume().await;
     let collapses0 = META_KV_ROOT_COLLAPSES.load(Ordering::Relaxed);
 
-    // 3,000 creates (inode + dentry records; no payload — so the two trees
-    // that carry them collapse to root leaves once 90 % is gone).
+    // 3,000 creates (inode + dentry records; no payload), then all but
+    // every `stride`-th deleted — so the tree(s) carrying them collapse
+    // to root leaves. The stride DERIVES from the merge law (§4.6a): a
+    // tree collapses only if its SURVIVING records fit the merge
+    // threshold (`merge_pair_capacity`, the split's ¾ fill read
+    // backwards) with room for the tombstones a covering cycle has not
+    // yet let the folds elide — the heaviest tree's survivors are held
+    // to HALF that threshold. A flat volume's heaviest tree carries one
+    // record per file (the inode record); a forest's mixed tree carries
+    // a file's inode AND its dentry, so the same law keeps fewer
+    // survivors there (at the flat stride the forest's survivors sat at
+    // 85 % of the threshold and the last merge was a coin flip on the
+    // un-elided tombstones — review round 3, Issue 17).
     const N: u32 = 3_000;
+    let stride = survivor_stride(&be, N);
     for i in 0..N {
         be.create(ROOT_INO, &name(i), libc::S_IFREG | 0o644, 0, 0)
             .await
@@ -1205,7 +1260,7 @@ async fn replay_converges_across_crash_windows_of_a_merge_and_a_root_collapse() 
         }
     }
     for i in 0..N {
-        if i % 10 != 0 {
+        if i % stride != 0 {
             delete_file(&be, i).await;
         }
     }
@@ -1216,7 +1271,8 @@ async fn replay_converges_across_crash_windows_of_a_merge_and_a_root_collapse() 
     let census = be.dead_bset_census();
     assert!(
         census.merge_candidates.len() >= 2,
-        "a 90 % delete leaves underfull leaves ({} candidates over {} leaves)",
+        "deleting all but every {stride}-th file leaves underfull leaves ({} candidates over {} \
+         leaves)",
         census.merge_candidates.len(),
         census.leaves
     );
@@ -1293,7 +1349,7 @@ async fn replay_converges_across_crash_windows_of_a_merge_and_a_root_collapse() 
     }
     assert!(
         META_KV_ROOT_COLLAPSES.load(Ordering::Relaxed) > collapses0,
-        "3,000 creates minus 90 % must collapse a tree to its root leaf"
+        "3,000 creates minus all but every {stride}-th must collapse a tree to its root leaf"
     );
     let crash_c = NamedTempFile::new().expect("crash image c");
     std::fs::copy(file.path(), crash_c.path()).expect("copy post-collapse image");
@@ -1316,13 +1372,13 @@ async fn replay_converges_across_crash_windows_of_a_merge_and_a_root_collapse() 
             "window {label}: a replayed merge window is not a failure"
         );
         let d1 = digest_backend(&x).await.expect("digest 1");
-        for i in (0..N).step_by(10) {
+        for i in (0..N).step_by(stride as usize) {
             x.lookup(ROOT_INO, &name(i))
                 .await
                 .unwrap_or_else(|e| panic!("window {label}: survivor {} lost: {e:?}", name(i)));
         }
         for i in (1..N).step_by(7) {
-            if i % 10 != 0 {
+            if i % stride != 0 {
                 assert!(
                     x.lookup(ROOT_INO, &name(i)).await.is_err(),
                     "window {label}: deleted {} resurfaced",

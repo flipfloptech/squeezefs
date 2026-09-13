@@ -6090,8 +6090,12 @@ impl KvMetaBackend {
         // whenever that is.
         self.ckpt_wake.notify_one();
         // PR M6: the drain task observes the flag on its wake and exits;
-        // joining it keeps the no-leaked-tasks teardown contract.
-        self.times_drain_wake.notify_waiters();
+        // joining it keeps the no-leaked-tasks teardown contract. The same
+        // permit law as the checkpoint task's signal above: the drain task
+        // may be inside `drain_pending_times_now` when this runs, and an
+        // epoch signal it did not witness would leave it asleep to its own
+        // tick with this join waiting on it.
+        self.times_drain_wake.notify_one();
         let drain_done = self.times_drain_join.lock().unwrap().take();
         if let Some(done) = drain_done {
             match done.await {

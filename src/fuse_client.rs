@@ -13472,6 +13472,13 @@ impl SqueezefsFilesystem {
                     "meta_kv_forest_key_violations".into(),
                     load(&meta_kv::META_KV_FOREST_KEY_VIOLATIONS),
                 );
+                // A non-writer open's replay skips of records under slot
+                // roots tree 0 does not name yet (served at the poll after
+                // the writer publishes); 0 on every write mount.
+                metrics.insert(
+                    "meta_kv_forest_reader_window_skips".into(),
+                    load(&meta_kv::META_KV_FOREST_READER_WINDOW_SKIPS),
+                );
                 // LEAF-MERGE finalized (§4.6a (c)/(e)): `interior_merges`
                 // = the level-≥1 subset of `node_merges` (cross-parent
                 // shrinkage's face); `merge_laps` = whole-volume sweep

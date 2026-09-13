@@ -68,14 +68,35 @@ pub struct Routed {
     pub key: Vec<u8>,
 }
 
+/// How — and whether — a slot tree may be minted for the caller.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MintPolicy {
+    /// The writer's commit path: USER growth — one `claim_user` extent,
+    /// refused at the growth floor exactly like a new leaf (§4.7).
+    User,
+    /// The writer's mount replay: a RECOVERY act — `claim_internal`, which
+    /// may draw the compaction reserve (the flat bit-9/16 mount-time
+    /// mints' class). A volume that crashed in the `heap_full` posture
+    /// with an unpublished mint in its window must still MOUNT: the user
+    /// class would refuse the mount itself, every mount, for ever.
+    Recovery,
+    /// A mount that may not write (a `-o ro` reader, a co-writer, a
+    /// probe, a peer-owned open): NEVER mints — a mint is an extent claim
+    /// plus a device write, onto the very extents the live writer's
+    /// unpublished roots occupy. Reaching a mint under this policy is an
+    /// invariant violation (loud, counted), never a silent write.
+    Refuse,
+}
+
 /// What a lazy mint needs from the backend: the volume's node cache, its
-/// seq source, its allocator, and the journal head at the mint (the new
-/// tree's `root_floor`).
+/// seq source, its allocator, the journal head at the mint (the new
+/// tree's `root_floor`), and the policy the mount's posture sets.
 pub struct MintContext<'a> {
     pub cache: &'a Arc<NodeCache>,
     pub seq: &'a Arc<AtomicU64>,
     pub alloc: &'a Arc<super::alloc_ext::ExtentAllocator>,
     pub floor: u64,
+    pub policy: MintPolicy,
 }
 
 impl SlotTrees {
@@ -245,16 +266,37 @@ impl SlotTrees {
         Ok(self.tree(slot).map(|tree| Routed { slot, tree, key }))
     }
 
-    /// Mint the slot tree of `slot`: ONE `claim_user` extent (§4.7 — user
-    /// growth, refused at the compaction floor) and ONE device write +
-    /// load-back of its empty root, on the caller's task — the one place
-    /// the commit pipeline's resolve step touches the device (once per
-    /// slot per volume, before any node lock; design-symmetric-metadata
-    /// §5.3.3 moves the extent to the appender's grant in PR 3). The tree
-    /// is born with `root_floor = mint.floor` (the ring head): nothing
-    /// applied to it can sit below that position, and the checkpoint tail
-    /// must not pass it until tree 0 names the root.
+    /// Mint the slot tree of `slot`: ONE extent — `claim_user` on the
+    /// commit path (§4.7 user growth, refused at the growth floor),
+    /// `claim_internal` at the writer's replay (a recovery act may draw
+    /// the reserve) — and ONE device write + load-back of its empty root,
+    /// on the caller's task — the one place the commit pipeline's resolve
+    /// step touches the device (once per slot per volume, before any node
+    /// lock; design-symmetric-metadata §5.3.3 moves the extent to the
+    /// appender's grant in PR 3). A non-writer's policy refuses HERE,
+    /// before any claim or write. The tree is born with `root_floor =
+    /// mint.floor` (the ring head): nothing applied to it can sit below
+    /// that position, and the checkpoint tail must not pass it until tree
+    /// 0 names the root.
     async fn mint(&self, slot: ForestSlot, mint: &MintContext<'_>) -> Result<Arc<KvTree>, KvError> {
+        let class = match mint.policy {
+            MintPolicy::User => super::alloc_ext_core::AllocClass::User,
+            MintPolicy::Recovery => super::alloc_ext_core::AllocClass::Internal,
+            MintPolicy::Refuse => {
+                crate::note_invariant_tripwire(
+                    "forest_mint_on_non_writer",
+                    &format!(
+                        "slot {slot}: a mount that may not write reached a slot-tree mint (an \
+                         extent claim + a device write) — refused"
+                    ),
+                );
+                return Err(KvError::Corrupt(format!(
+                    "slot {slot} has no published root and this mount may not write: a reader / \
+                     co-writer never mints a slot tree (the records are served after the \
+                     writer publishes — S5 bounded staleness)"
+                )));
+            }
+        };
         let _g = self.mint.lock().await;
         if let Some(t) = self.tree(slot) {
             return Ok(t); // the racing minter won
@@ -267,6 +309,7 @@ impl SlotTrees {
                 slot,
                 Arc::clone(mint.seq),
                 mint.floor,
+                class,
             )
             .await?,
         );

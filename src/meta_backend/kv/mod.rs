@@ -218,6 +218,16 @@ pub static META_KV_FOREST_ROOT_PUBLISHES: AtomicU64 = AtomicU64::new(0);
 /// `meta_kv_forest_key_violations`.
 pub static META_KV_FOREST_KEY_VIOLATIONS: AtomicU64 = AtomicU64::new(0);
 
+/// Window records a NON-WRITER open (reader, co-writer, probe) of a forest
+/// volume SKIPPED at replay because their slot tree had no published root
+/// yet (tree 0 did not name it — the writer minted the slot after its
+/// last checkpoint). A mount that may not write mints nothing: those
+/// records are served after the writer's next publication, at the
+/// reader's next poll — the S5 bounded-stale contract. 0 for the life of
+/// every write mount by construction. Surfaced as
+/// `meta_kv_forest_reader_window_skips`.
+pub static META_KV_FOREST_READER_WINDOW_SKIPS: AtomicU64 = AtomicU64::new(0);
+
 /// Commit-path revalidation retries (design §4.6: a writer locked a leaf
 /// an SMO had superseded between resolution and lock — unlock, re-resolve,
 /// retry; SMOs are rare and serialized, so the loop is short). Surfaced as

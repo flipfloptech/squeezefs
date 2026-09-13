@@ -1390,7 +1390,7 @@ impl KvMetaBackend {
         }
 
         // (2) Bootstrap replay (sets `boot_id` — shared with probes).
-        let mut inner = Self::open_inner(path).await?;
+        let mut inner = Self::open_inner(path, OpenPosture::Writer).await?;
         *inner.guard_fd.get_mut().unwrap() = Some(guard_fd);
         inner.writer_id = uuid::Uuid::new_v4().to_string();
         // Layer B1 resolution: test override first, then the real RESCAP
@@ -1459,7 +1459,7 @@ impl KvMetaBackend {
     /// process has live-mounted therefore cannot corrupt it. Dropping the
     /// returned backend releases everything (there is no task to join).
     pub async fn open_probe(path: &Path) -> std::result::Result<Arc<Self>, KvError> {
-        let be = Arc::new(Self::open_inner(path).await?);
+        let be = Arc::new(Self::open_inner(path, OpenPosture::NonWriter).await?);
         // PR M7: probes never mutate, but the conveyor identity is part
         // of construction (a commit without it fails loud, never UB).
         let _ = be.conveyor_self.set(Arc::downgrade(&be));
@@ -1521,7 +1521,7 @@ impl KvMetaBackend {
             ),
             SharedProbe::Unknown => {}
         }
-        let mut inner = Self::open_inner(path).await?;
+        let mut inner = Self::open_inner(path, OpenPosture::NonWriter).await?;
         // The mount-option cause OVERRIDES the §4.11 one only in its
         // reporting: `read_only` is already true when unknown-ro bits are
         // present, and a reader is read-only either way.
@@ -1603,7 +1603,7 @@ impl KvMetaBackend {
             ),
             SharedProbe::Unknown => {}
         }
-        let mut inner = Self::open_inner(path).await?;
+        let mut inner = Self::open_inner(path, OpenPosture::NonWriter).await?;
         inner.read_only = true;
         inner.ro_cause = ReadOnlyCause::CoWriterMount;
         let be = Arc::new(inner);
@@ -1699,7 +1699,7 @@ impl KvMetaBackend {
             ),
             SharedProbe::Unknown => {}
         }
-        let mut inner = Self::open_inner(path).await?;
+        let mut inner = Self::open_inner(path, OpenPosture::NonWriter).await?;
         inner.read_only = true;
         inner.ro_cause = ReadOnlyCause::PeerOwnedVolume;
         let be = Arc::new(inner);
@@ -1857,7 +1857,7 @@ impl KvMetaBackend {
         self.read_only
     }
 
-    async fn open_inner(path: &Path) -> std::result::Result<Self, KvError> {
+    async fn open_inner(path: &Path, posture: OpenPosture) -> std::result::Result<Self, KvError> {
         let t0 = std::time::Instant::now();
 
         // 1. Superblock (the version gate is the loud unit).
@@ -1952,8 +1952,25 @@ impl KvMetaBackend {
         let seq = Arc::new(AtomicU64::new(ledger.seq.max(ledger.node_seq_watermark)));
 
         let (trees, max_replayed_ino, max_replayed_guest) = if sb.symmetric_forest_stamped() {
-            Self::open_forest_and_replay(path, &sb, &ledger, &cache, &seq, &alloc, &recovery)
-                .await?
+            // §4.11's unknown-ro bits degrade a writer's open to a
+            // non-writer for the replay too: a mount that may not write
+            // mints nothing.
+            let replay_posture = if sb.unknown_ro() != 0 {
+                OpenPosture::NonWriter
+            } else {
+                posture
+            };
+            Self::open_forest_and_replay(
+                path,
+                &sb,
+                &ledger,
+                &cache,
+                &seq,
+                &alloc,
+                &recovery,
+                replay_posture,
+            )
+            .await?
         } else {
             let mut opened: Vec<KvTree> = Vec::with_capacity(3);
             for tree_id in [TREE_INODES, TREE_DENTRIES, TREE_XATTRS] {
@@ -3346,6 +3363,14 @@ impl KvMetaBackend {
             seq: self.seq_ref(),
             alloc: &self.alloc,
             floor: self.ring.core().head(),
+            // The runtime mint is USER growth; a mount that may not write
+            // never reaches one (the write gate refuses upstream) — the
+            // policy is the belt to that brace.
+            policy: if self.read_only {
+                super::forest::MintPolicy::Refuse
+            } else {
+                super::forest::MintPolicy::User
+            },
         }
     }
 
@@ -7617,7 +7642,7 @@ impl KvMetaBackend {
                 return Err(KvError::Io(crate::error::SqueezefsError::Io(e)));
             }
         };
-        let mut inner = Self::open_inner(path).await?;
+        let mut inner = Self::open_inner(path, OpenPosture::Writer).await?;
         *inner.guard_fd.get_mut().unwrap() = Some(guard_fd);
         let be = Arc::new(inner);
         // PR M7: conveyor identity before the clear's removexattr commit
@@ -8437,6 +8462,23 @@ impl Drop for LaneSentinel<'_> {
     }
 }
 
+/// The posture an `open_inner` runs its bootstrap replay under — set by
+/// the DOOR, not read from a latch that is only set after the replay
+/// (review round 3, Issue 18: `open_read_only` / `open_co_writer` /
+/// `open_probe` / the peer-owned open flip `read_only` on the returned
+/// value, so the replay itself did not know it was a non-writer's).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OpenPosture {
+    /// The write mount (and the guarded offline verbs that hold its
+    /// flock): replay may mint the slot trees the window names —
+    /// recovery-class extents.
+    Writer,
+    /// A mount that may not write: replay mints nothing; records of a
+    /// slot tree 0 does not name yet are skipped (S5 bounded staleness —
+    /// served at the poll after the writer publishes).
+    NonWriter,
+}
+
 /// How a routed dentry mutation updates its parent directory (the v2
 /// routed arms' three shapes: 16-byte patch under a SHARED parent →
 /// Δtime merge record here; full RMW; full RMW + nlink bump/dec).
@@ -8465,6 +8507,7 @@ impl KvMetaBackend {
     /// tree was minted after the last checkpoint has no root yet — its
     /// records fold into a fresh root by key, the bit-9/16 discipline).
     /// Returns the forest plus the §4.8 replayed-ino maxima.
+    #[allow(clippy::too_many_arguments)]
     async fn open_forest_and_replay(
         path: &Path,
         sb: &SuperblockV3,
@@ -8473,10 +8516,10 @@ impl KvMetaBackend {
         seq: &Arc<AtomicU64>,
         alloc: &Arc<ExtentAllocator>,
         recovery: &super::journal::JournalRecovery,
+        posture: OpenPosture,
     ) -> std::result::Result<(TreeSet, u64, std::collections::HashMap<u16, u64>), KvError> {
         use super::record::{
-            forest_slot_of_ino, split_forest_key, ForestSlot, KIND_INTERIOR, NATIVE_FOREST_SLOT,
-            TREE_CONTROL,
+            split_forest_key, ForestSlot, KIND_INTERIOR, NATIVE_FOREST_SLOT, TREE_CONTROL,
         };
         use super::slot_state::{decode_slot_state_key, slot_state_key_range, SlotState};
 
@@ -8608,12 +8651,37 @@ impl KvMetaBackend {
         let forest = super::forest::SlotTrees::new(control, native, guests);
         // A tree minted AT REPLAY holds records from the window's start:
         // its root floor is the window's tail (replay begins there), so the
-        // first checkpoint cannot pass it before tree 0 names the root.
+        // first checkpoint cannot pass it before tree 0 names the root. The
+        // writer mints in the RECOVERY class (the reserve is fair game —
+        // a heap-full volume must mount); a non-writer never mints: the
+        // records of a slot tree 0 does not name are SKIPPED here and
+        // served after the writer publishes (S5 bounded staleness), never
+        // routed into a RAM-only tree the epoch drop pass would tear from
+        // under the reader.
         let replay_mint = super::forest::MintContext {
             cache,
             seq,
             alloc,
             floor: ledger.journal_tail_seq,
+            policy: match posture {
+                OpenPosture::Writer => super::forest::MintPolicy::Recovery,
+                OpenPosture::NonWriter => super::forest::MintPolicy::Refuse,
+            },
+        };
+        let mut skipped_slots: std::collections::BTreeMap<ForestSlot, u64> =
+            std::collections::BTreeMap::new();
+        // The routing of a window record on this posture: its slot tree,
+        // minted if the writer's; `None` = a non-writer's record of an
+        // unpublished slot, skipped and counted.
+        let route = |slot: ForestSlot,
+                     skipped: &mut std::collections::BTreeMap<ForestSlot, u64>|
+         -> Option<ForestSlot> {
+            if posture == OpenPosture::NonWriter && forest.tree(slot).is_none() {
+                *skipped.entry(slot).or_insert(0) += 1;
+                super::META_KV_FOREST_READER_WINDOW_SKIPS.fetch_add(1, Ordering::Relaxed);
+                return None;
+            }
+            Some(slot)
         };
 
         // ---- The slot trees' window: phase 1 interior records by
@@ -8638,6 +8706,9 @@ impl KvMetaBackend {
             // key (the separator alone cannot — the top one is
             // `KEY_SPACE_MAX` in every tree); strip it for the apply.
             let (slot, separator) = super::forest::split_interior_journal_key(&rec.key)?;
+            let Some(slot) = route(slot, &mut skipped_slots) else {
+                continue;
+            };
             let tree = forest.slot_or_mint(slot, &replay_mint).await?;
             tree.apply_replayed_interior(
                 separator,
@@ -8691,18 +8762,13 @@ impl KvMetaBackend {
                         None => max_replayed_ino = max_replayed_ino.max(ino),
                     }
                 }
-                debug_assert_eq!(
-                    super::record::forest_key_slot(&rec.key)?,
-                    forest_slot_of_ino(u64::from_be_bytes(
-                        rec.key[if kind == super::record::TREE_BLOCK_REFS {
-                            17
-                        } else {
-                            0
-                        }..][..8]
-                            .try_into()
-                            .expect("forest key carries its ino")
-                    ))
-                );
+                let slot = super::record::forest_key_slot(&rec.key).map_err(|e| {
+                    super::META_KV_FOREST_KEY_VIOLATIONS.fetch_add(1, Ordering::Relaxed);
+                    e
+                })?;
+                if route(slot, &mut skipped_slots).is_none() {
+                    continue;
+                }
                 let (_slot, tree) = forest
                     .route_forest_key_or_mint(&rec.key, &replay_mint)
                     .await?;
@@ -8715,6 +8781,18 @@ impl KvMetaBackend {
                 )
                 .await?;
             }
+        }
+
+        if !skipped_slots.is_empty() {
+            let records: u64 = skipped_slots.values().sum();
+            log::info!(
+                "meta volume {}: non-writer open skipped {records} window record(s) of {} slot \
+                 tree(s) tree 0 does not name yet (slots {:?}) — served after the writer's next \
+                 publication, at this mount's next poll (S5 bounded staleness)",
+                path.display(),
+                skipped_slots.len(),
+                skipped_slots.keys().take(8).collect::<Vec<_>>()
+            );
         }
 
         let block_refs =

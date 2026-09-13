@@ -450,13 +450,14 @@ impl KvTree {
         slot: super::record::ForestSlot,
         seq: Arc<AtomicU64>,
         mint_floor: u64,
+        class: super::alloc_ext_core::AllocClass,
     ) -> Result<Self, KvError> {
         Self::create_inner(
             cache,
             ctx,
             super::record::KIND_INTERIOR,
             seq,
-            Some((slot, mint_floor)),
+            Some((slot, mint_floor, class)),
         )
         .await
     }
@@ -466,17 +467,25 @@ impl KvTree {
         ctx: &mut SmoContext,
         tree_id: u8,
         seq: Arc<AtomicU64>,
-        slot_tree: Option<(super::record::ForestSlot, u64)>,
+        slot_tree: Option<(
+            super::record::ForestSlot,
+            u64,
+            super::alloc_ext_core::AllocClass,
+        )>,
     ) -> Result<Self, KvError> {
-        let forest_slot = slot_tree.map(|(slot, _)| slot);
-        // A slot tree's extent is USER growth (§4.7 ENOSPC semantics): a
-        // full volume refuses the mint the way it refuses a new leaf, and
-        // the compaction reserve stays intact for the SMOs that return
-        // space. Per-kind trees and tree 0 are format/checkpoint internals.
-        let extent = if forest_slot.is_some() {
-            ctx.alloc.claim_user()?
-        } else {
-            ctx.alloc.claim_internal()?
+        let forest_slot = slot_tree.map(|(slot, _, _)| slot);
+        // A slot tree's extent is claimed in the class the MINTER's posture
+        // sets (`forest::MintPolicy`): USER growth on the commit path (§4.7
+        // ENOSPC semantics — a full volume refuses the mint the way it
+        // refuses a new leaf, the compaction reserve stays intact for the
+        // SMOs that return space), INTERNAL at the writer's replay (a
+        // recovery act may draw the reserve — a heap-full volume must still
+        // mount). Per-kind trees and tree 0 are format/checkpoint internals.
+        let extent = match slot_tree {
+            Some((_, _, super::alloc_ext_core::AllocClass::User)) => ctx.alloc.claim_user()?,
+            Some((_, _, super::alloc_ext_core::AllocClass::Internal)) | None => {
+                ctx.alloc.claim_internal()?
+            }
         };
         let addr = cache.extent_addr(extent);
         let node_seq = seq.fetch_add(1, Ordering::AcqRel) + 1;
@@ -524,7 +533,7 @@ impl KvTree {
             maintenance: scc::Queue::default(),
             merge_cursor: std::sync::Mutex::new(SweepCursor::default()),
             forest_slot,
-            root_floor: AtomicU64::new(slot_tree.map_or(0, |(_, floor)| floor)),
+            root_floor: AtomicU64::new(slot_tree.map_or(0, |(_, floor, _)| floor)),
         })
     }
 

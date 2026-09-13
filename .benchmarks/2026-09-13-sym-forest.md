@@ -39,7 +39,11 @@ recovery-class mint pins + fix (`7c6fd572`, `afae1666`), the forest C1
 repair contract + the skip-not-fail walk (`ee925586`, `f314ec3d`), the
 owner-offset nit (`608509a4`), the docs (`7771dbfc`), the probe door on
 the non-writer pin (`77d04f92`) and the collapse test's D4-order fold
-(`f0afecff`) — see §4c. Dev-box, debug-build,
+(`f0afecff`) — see §4c; then the round-4 train — the refs scan's refusal
+(`42166de9`, `1841f114`), the raw C1 repair's deletion gate + the
+refused-key classifier (`6a2459f4`, `9e4e53c5`, `1b1cea36`), the
+non-writer's consistent snapshot (`687a82ac`, `c632ab6e`) and the
+replay's counted refusal (`cde2eedd`, `443a03dc`) — see §4d. Dev-box, debug-build,
 in-process evidence ONLY — scoping, per the venue rule; the squeeze-test
 solo re-gate A-B-B-A (gate 1) is owed (§7).
 
@@ -287,6 +291,69 @@ journals them.
   ("a C1 WALK finding, not repairable") is retired. The contract pins
   that one malformed record produces no C2 finding.
 
+## 4d. Found by review round 4 — the skip law's reach, the raw repair's bet, the partial view's edge
+
+- **The skip-not-fail law had reached the by-block refs family** (Issue
+  22): `SlotTrees::refs_window` dropped a reference record whose key the
+  codec refuses, so `block_ref_count` answered a block's population one
+  short (`Ok(1)` over a malformed record beside a live one) where the flat
+  layout's `decode_block_ref_key` refuses at the caller — an under-count
+  is the exact failure the ledger exists to prevent (a terminal free, a
+  W1 sole-owner patch, an S9 free's validation read it), and the gauge
+  increment never reached the caller about to free. Fix `1841f114`: the
+  refs scan REFUSES (counted on the tripwire first); the skip law stays
+  with the kind-routed RECORD walks, where a truncated census is the
+  worse outcome and fsck's raw C1 walk is the detector. Pinned on both
+  layouts (`a_malformed_reference_record_refuses_the_population_on_either_layout`
+  — the flat arm is the pre-forest behaviour, unchanged; the forest's raw
+  C1 walk names the record; the C8 oracle's refusal records no verdict).
+  Named, not fixed here: a flat volume's C1 walks the user kinds only, so
+  its refs tree's detector is the consumers' refusal — the shipped scope.
+- **The raw C1 repair bet the volume on a closed kind set** (Issue 25):
+  `C1RawKey` deleted any key the codec refuses, so an older binary's
+  `fsck --repair` on a forest a newer binary wrote (PR 7's shared index,
+  kind `0x09`, inside slot trees under the same bit) would have deleted
+  every record of the new kind as damage. Fix `9e4e53c5`: the repair
+  deletes on `record::classify_refused_key` ==
+  `MalformedKnownKind` alone — a kind byte THIS binary knows as a
+  slot-tree kind, in a shape it never takes — and reports everything else
+  (`report-only`, refused at apply, honestly persistent). Design §7.1 now
+  makes the slot-tree kind set part of bit 17's meaning: a kind added
+  after the flip ships under a new incompat bit. Writing the classifier's
+  proptest law found two more things: the codec accepted an ino-major key
+  carrying the refs kind byte at offset 8 as a length-valid reference
+  living in the ino-major key space (invisible to the refs scan, accepted
+  by the raw walk) — refused now; and the classifier called a KNOWN
+  ino-major kind in the by-block position "unknown" (report-only) where
+  the codec's own law makes it garbage — a later kind is always a NEW id.
+- **The non-writer's partial view had one inconsistent edge** (Issue
+  23): a dentry lives in its PARENT's slot and names a child in the
+  CHILD's, and the parent's leaf log carries a child's dentry the moment
+  a §4.6 pt 1 threshold append lands it — checkpoint or not — so a `-o
+  ro` reader opened while the writer's window held fresh-slot creates
+  listed names (`readdir`) whose `lookup` refused. Skipping the dentry
+  Put at replay changed nothing (the name was already on disk); skipping
+  the WHOLE window was rejected (the `writer_claim` heartbeat is never
+  checkpointed per beat — the probes and the reader's guard rows read
+  it from the window, `readonly_mount_tests`). Fix `c632ab6e`: the ONE
+  routed directory pager both listing faces ride
+  (`RoutedMetaBackend::readdir_page_held`) lists a child iff its volume
+  HOLDS the child's slot tree — the condition `lookup` already answers —
+  withheld names on `meta_kv_forest_reader_unpublished_children`, the
+  page re-paged so it never ends short; the backend carries the open's
+  posture (`non_writer`) so the filter is the replay's twin; a write
+  mount and a flat volume pay one bool per call. Design §5.3.4 states
+  what a non-writer answers for a slot it does not hold.
+- **N unpublished mints need N reserve extents at replay** (Issue 24):
+  the Issue-19 remount holds for ONE deferred mint; a deferred window
+  holding more mints than the compaction reserve (`max(8, 2 %)` of the
+  heap) still refuses the mount, and it did so with the bare allocator
+  text. Fix `443a03dc`: the writer's replay counts the slot trees the
+  window needs before it mints any, and the refusal is ENOSPC-class
+  (never `Corrupt`) naming the count, the slots, the heap against the
+  reserve and the orphans (pinned at `reserve + 1` mints). The adoption
+  of the orphaned root extents is OWED (§7) with its bound.
+
 ## 5. Stats
 
 `meta_kv_forest_slot_trees_minted` (guest slot trees minted this mount —
@@ -298,8 +365,11 @@ partition-violation class of "a kind byte is never another tree's id";
 the kind-routed walks skip it, fsck's raw C1 walk reports it),
 `meta_kv_forest_reader_window_skips` (window records a non-writer open
 skipped at replay because their slot tree had no published root — 0 on
-every write mount). Exported on the stats inode; rows in
-`docs/operations.md`.
+every write mount), `meta_kv_forest_reader_unpublished_children` (directory
+entries a non-writer withheld from a `readdir` page because the child's
+slot tree is not yet published — what keeps `readdir` and `lookup`
+agreeing on the partial view; 0 on every write mount). Exported on the
+stats inode; rows in `docs/operations.md`.
 
 ## 6. Deviations from the PR row (for adjudication)
 
@@ -342,7 +412,20 @@ every write mount). Exported on the stats inode; rows in
    §4c); a non-writer never mints.
 9. **fsck's C1 walk on a forest is the ONE raw walk per slot tree** (round
    3) — the other classes' kind-routed walkers still read a forest's slot
-   trees once per kind (item 4).
+   trees once per kind (item 4). Its repair deletes ONLY a key whose kind
+   byte this binary knows in a shape it never takes (round 4,
+   `record::classify_refused_key`); an unknown kind is report-only —
+   design §7.1's corollary (a slot-tree kind added after the flip ships
+   under a new incompat bit).
+10. **A non-writer's view of a forest is partial BY SLOT** (rounds 3–4):
+    it serves the slot trees tree 0 named at its last poll (their window
+    records included), nothing of the others, and lists a child in
+    `readdir` iff it holds the child's slot tree — the condition its
+    `lookup` answers — so the partial view is a consistent snapshot; the
+    pre-forest reader replayed the whole window. Stated in §5.3.4; PR 5's
+    tokens replace the projection.
+11. **The by-block refs scan REFUSES a key the codec rejects** (round 4)
+    — the flat decode's law; only the kind-routed record walks skip.
 
 ## 7. Owed
 
@@ -356,9 +439,25 @@ every write mount). Exported on the stats inode; rows in
 - **The ONE-walk fsck census** over the mixed leaves for C2–C10 (C1
   walks a forest's slot trees once, raw, since round 3 — §4c; the other
   classes still read them once per kind).
-- **The orphaned-extent hygiene sweep** for a crashed-with-deferred-
-  publication mint (§4c — one extent per such crash, bitmap-durable, named
-  by no tree).
+- **The orphaned root extents behind a deferred publication** (§4c/§4d,
+  Issue 24): a writer that crashes with N slot trees minted since its
+  last publication leaves N root extents bitmap-durable and named by no
+  tree, and its replay re-mints all N from the compaction reserve
+  (recovery class). **Bound:** N ≤ the guest slots first-touched in one
+  deferred window — `MINT_SPREAD` (64) rotor slots plus the explicitly
+  targeted ones (block references by a foreign owner ino, migrated-in
+  slots) — against a reserve of `max(8, 2 %)` of the heap: a production
+  geometry (≥ 3,200 extents, i.e. ≥ 800 MiB at 256 KiB nodes) covers a
+  full rotor burst, a small volume does not, and a volume that cannot
+  refuses the mount ENOSPC-class NAMING the count (`443a03dc`). Owed in
+  two halves: (a) the hygiene sweep that reclaims the orphans (fsck C6's
+  reachability census is the proof an extent is nobody's — the same
+  recognition an orphaned empty root needs: header id 0, no records or a
+  first key routing to the slot, `node_seq` under the ledger watermark);
+  (b) the replay ADOPTING an orphan instead of claiming a fresh extent,
+  which needs (a)'s proof — an empty root carries no slot identity and an
+  extent an in-window SMO pointer names is not free — so it is never a
+  mount-time guess.
 - **The lazy mint off the pass task** (§6 item 8 — PR 3's appender grant).
 - **Issue 16's attribution** (`v3_ring_full_liveness_storm_drains`,
   `a_mostly_deleted_full_volume_keeps_creating` aborting "parked for ring

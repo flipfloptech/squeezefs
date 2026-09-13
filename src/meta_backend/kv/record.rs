@@ -125,7 +125,8 @@ fn checked_forest_slot(key_ino: u64) -> Result<ForestSlot, KvError> {
     let slot = forest_slot_of_ino(key_ino);
     if slot > FOREST_SLOT_MAX {
         return Err(KvError::Corrupt(format!(
-            "key ino {key_ino:#x} names forest slot {slot} — above the slot namespace              ({FOREST_SLOT_MAX})"
+            "key ino {key_ino:#x} names forest slot {slot} — above the slot namespace \
+             ({FOREST_SLOT_MAX})"
         )));
     }
     Ok(slot)
@@ -145,7 +146,7 @@ pub const FOREST_BLOCK_REF_KEY_LEN: usize = super::block_refs::BLOCK_REF_KEY_LEN
 
 /// Offset of the OWNER ino inside a forest block-reference key (`0x06 ‖
 /// vol_tag(8) ‖ block_idx(8)` precede it).
-pub const FOREST_BLOCK_REF_OWNER_OFF: usize = 1 + 8 + 8;
+pub const FOREST_BLOCK_REF_OWNER_OFF: usize = 1 + super::block_refs::BLOCK_REF_OWNER_OFF;
 
 /// Whether `kind` names a content family that lives INSIDE a slot tree.
 /// Exactly the five kinds of §5.2.1: never the interior marker, never a
@@ -190,7 +191,11 @@ pub fn forest_key(kind: u8, legacy: &[u8]) -> Result<Vec<u8>, KvError> {
     }
     // The ino that routes the key must name a slot: the refs family's
     // owner ino at offset 16 of the legacy key, the leading ino otherwise.
-    let route_off = if kind == TREE_BLOCK_REFS { 16 } else { 0 };
+    let route_off = if kind == TREE_BLOCK_REFS {
+        super::block_refs::BLOCK_REF_OWNER_OFF
+    } else {
+        0
+    };
     checked_forest_slot(u64::from_be_bytes(read8(legacy, route_off)))?;
     let mut out = Vec::with_capacity(legacy.len() + 1);
     if kind == TREE_BLOCK_REFS {

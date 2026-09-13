@@ -139,6 +139,10 @@ pub fn block_ref_resolver() -> Option<BlockRefResolverFn> {
 /// Length of the `(vol_tag, block_idx)` refcount prefix — the range a
 /// refcount read scans ([`block_range`]).
 pub const BLOCK_REF_PREFIX_LEN: usize = 16;
+/// Offset of the OWNER ino inside a reference key — right after the
+/// refcount prefix; the forest routes a reference by it
+/// (`record::FOREST_BLOCK_REF_OWNER_OFF` = one kind byte later).
+pub const BLOCK_REF_OWNER_OFF: usize = BLOCK_REF_PREFIX_LEN;
 
 /// Value length: `version | flags | reserved`.
 pub const BLOCK_REF_VALUE_LEN: usize = 4;
@@ -386,7 +390,7 @@ pub fn block_ref_key(
     let mut key = [0u8; BLOCK_REF_KEY_LEN];
     key[0..8].copy_from_slice(&vol_tag.to_be_bytes());
     key[8..16].copy_from_slice(&block_idx.to_be_bytes());
-    key[16..24].copy_from_slice(&owner_ino.to_be_bytes());
+    key[BLOCK_REF_OWNER_OFF..BLOCK_REF_OWNER_OFF + 8].copy_from_slice(&owner_ino.to_be_bytes());
     key[24..28].copy_from_slice(&block_index.to_be_bytes());
     key
 }
@@ -402,7 +406,11 @@ pub fn decode_block_ref_key(key: &[u8]) -> Result<BlockRef, KvError> {
     Ok(BlockRef {
         vol_tag: u64::from_be_bytes(key[0..8].try_into().unwrap()),
         block_idx: u64::from_be_bytes(key[8..16].try_into().unwrap()),
-        owner_ino: u64::from_be_bytes(key[16..24].try_into().unwrap()),
+        owner_ino: u64::from_be_bytes(
+            key[BLOCK_REF_OWNER_OFF..BLOCK_REF_OWNER_OFF + 8]
+                .try_into()
+                .unwrap(),
+        ),
         block_index: u32::from_be_bytes(key[24..28].try_into().unwrap()),
     })
 }

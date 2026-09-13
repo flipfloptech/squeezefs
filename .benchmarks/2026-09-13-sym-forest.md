@@ -43,7 +43,11 @@ the non-writer pin (`77d04f92`) and the collapse test's D4-order fold
 (`42166de9`, `1841f114`), the raw C1 repair's deletion gate + the
 refused-key classifier (`6a2459f4`, `9e4e53c5`, `1b1cea36`), the
 non-writer's consistent snapshot (`687a82ac`, `c632ab6e`) and the
-replay's counted refusal (`cde2eedd`, `443a03dc`) — see §4d. Dev-box, debug-build,
+replay's counted refusal (`cde2eedd`, `443a03dc`) and the decoder's
+namespace bound the classifier's proptest law found (`b32d1fb3`) — see
+§4d; then the round-5 train — the shutdown lost-wake pin + fixes
+(`20cdbdb6`, `299e7847`, `0e3e2f2a`) and the timed gate (`726bc75e`) —
+see §4e. Dev-box, debug-build,
 in-process evidence ONLY — scoping, per the venue rule; the squeeze-test
 solo re-gate A-B-B-A (gate 1) is owed (§7).
 
@@ -361,6 +365,72 @@ journals them.
   reserve and the orphans (pinned at `reserve + 1` mints). The adoption
   of the orphaned root extents is OWED (§7) with its bound.
 
+## 4e. Found by review round 4 — a shutdown that slept to the cadence (Issue 26)
+
+- **The find.** `kv_scale_tests::rightmost_separator_pointer_record_
+  replays_clean` (cadence parked at 60 s, 8 MiB ring, 64 KiB nodes, an
+  8 KB-xattr storm to 3 splits, drop-without-shutdown, reopen, shutdown)
+  idled for EXACTLY the parked cadence on the stamped layout — 79–80 s in
+  its reproducing pair against 19–20 s flat, 7 of 8 in sequence, 1 of 5
+  isolated — with every assertion green.
+- **Attribution** (`/tmp/sym-run/pr1-issue26/`): a gdb sample 45 s into
+  the stall named the awaiter — the test thread in `re.shutdown().await`
+  at the `ckpt_join` (the REOPENED backend's shutdown), both `sqz-meta`
+  lanes idle in their park, `sqz-jrnl2` parked in its ring, zero CPU;
+  `journal_full_stalls` 0 (no ring-admission park anywhere in the stalled
+  run). The instrumented sequence (scratch debug lines, reverted): the
+  reopened backend's checkpoint task wakes on a threshold PERMIT and
+  enters `maintenance_pass` (the replayed window's ONE mixed root leaf —
+  `fold 1046070 B → 26 part(s)`); `shutdown()` stores `shutting_down` and
+  calls `notify_waiters` WHILE the task is inside that pass — no waiter
+  registered, no permit stored; the pass ends with `maintenance_pending
+  = false`; the task parks on a fresh `notified()` for 59.99 s; the
+  cadence fires; only then does it read the flag and run the final tick.
+  **Verdict: (c)** — not ring-full, not a floor: a LOST WAKE on the
+  shutdown → checkpoint-task path. `Notify::notify_waiters` wakes the
+  waiters registered at that instant and stores nothing, and the task
+  reads the flag only after its `timeout_at(next_tick, notified())` park
+  wakes. Layout-blind (pinned RED on flat AND stamped); the forest reaches
+  it because its post-replay fold is one big mixed-leaf split still
+  running when the test shuts down, where a flat volume's three per-kind
+  folds are done. The intermittency has the same shape: a commit that
+  crosses the 4 KiB overlay threshold after the flag store hands the task
+  a PERMIT and rescues the race by accident (the reproducer's 1-of-8 green
+  runs; the first pin shape, with a second storm commit in flight, was
+  green for exactly this reason).
+- **Shipped cost.** With the shipped ≤ 1 s cadence this was up to one
+  flush interval added to every unmount that raced a maintenance pass —
+  not a write-path term (`journal_full_stalls` 0; ring-full parks wake on
+  `reusable_upto`, and the cadence tick has always been their checkpoint
+  — finding 49, unchanged by the forest).
+- **Fix** (`299e7847`, `0e3e2f2a`): the shutdown signal is a PERMIT
+  (`notify_one` — the checkpoint task is the Notify's only waiter, so the
+  semantics are exact and the permit is consumed by the task's NEXT
+  `notified()`, whenever that is), and the task re-arms itself when it
+  finds the flag set at the end of a pass (the belt for any signaller
+  that stores the flag without a permit). The pending-times drain task —
+  the same loop shape, the same `notify_waiters` signal in the same
+  function — got the same permit. The other `notify_waiters` sites in the
+  tree are register-recheck condition broadcasts (`journal.rs`,
+  `nvme.rs`, `tokens.rs`, `service.rs`, `intents.rs`, `write_pipeline.rs`,
+  `dlm.rs`), not "tell a cadence-parked task a flag was set". Pin
+  `20cdbdb6` (`shutdown_signalled_mid_maintenance_pass_completes_within_
+  the_tick`): the SMO build-pause seam holds the task inside its pass, the
+  storm runs ONE commit at a time so the permit that starts the pass is
+  the only one ever outstanding, `shutdown` is signalled from another
+  task, the seam released, the join bounded at 10 s ≪ 60 s — RED both
+  layouts (10.3 s timeout, the task parked 59 s), GREEN both (≈ 15 ms
+  after the release). The reproducing pair stamped: 19.5–21 s ×5 where it
+  read 79–80 s. The > 500 s run the review saw once is NOT reproduced
+  here (0 of 21 pre-fix pair runs across rounds 4–5, 0 post-fix); its
+  candidate is a SECOND lost signal in the same window — the drain task's
+  — which the fix also closes.
+- **The gate** (`726bc75e`): `tests/run_sym_forest_suites.sh` times every
+  suite per leg and prints the stamped/flat ratio (≥ 2× is a NOTE, never
+  a failure — no bound is derived; suites under 1 s flat are not rated);
+  `kv_scale_tests` is the twenty-first suite. A suite that passes both
+  ways while idling on one layout is what the row catches.
+
 ## 5. Stats
 
 `meta_kv_forest_slot_trees_minted` (guest slot trees minted this mount —
@@ -433,6 +503,11 @@ stats inode; rows in `docs/operations.md`.
     tokens replace the projection.
 11. **The by-block refs scan REFUSES a key the codec rejects** (round 4)
     — the flat decode's law; only the kind-routed record walks skip.
+12. **A signal to a cadence-parked task is a PERMIT** (round 5, §4e):
+    `shutdown()` signals the checkpoint task and the pending-times drain
+    task with `notify_one`, never `notify_waiters` — a rule the fix
+    states on the site; the forest exposed the lost wake, the flat layout
+    carried it too.
 
 ## 7. Owed
 
@@ -466,6 +541,13 @@ stats inode; rows in `docs/operations.md`.
   extent an in-window SMO pointer names is not free — so it is never a
   mount-time guess.
 - **The lazy mint off the pass task** (§6 item 8 — PR 3's appender grant).
+- **The one > 500 s run** the round-4 review saw on the stamped
+  `kv_scale_tests` pair (killed): not reproduced here in 21 pre-fix and
+  the post-fix acceptance runs; both lost signals the fix closes lived in
+  that window (the checkpoint task's and the drain task's — sequential,
+  ≤ 2 cadences), so a stall past them is a third path if it recurs —
+  read `journal_full_stalls`, the wedged-tail audit and a gdb sample of
+  the awaiter (the §4e recipe) before anything else.
 - **Issue 16's attribution** (`v3_ring_full_liveness_storm_drains`,
   `a_mostly_deleted_full_volume_keeps_creating` aborting "parked for ring
   space" under a PARALLEL stamped run): both pass stamped in isolation and

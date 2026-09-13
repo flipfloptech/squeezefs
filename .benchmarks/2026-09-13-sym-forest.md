@@ -36,8 +36,10 @@ and the slot-namespace bound (`5060ccd5`) — see §4b; then the round-3
 train — the stranded-promise pin + fix (`82923d5d`, `2ccb8f72`), the
 leaf-merge harness derivations (`e5842312`, `a6f39694`), the non-writer /
 recovery-class mint pins + fix (`7c6fd572`, `afae1666`), the forest C1
-repair contract + the skip-not-fail walk (`ee925586`, `f314ec3d`) and the
-owner-offset nit (`608509a4`) — see §4c. Dev-box, debug-build,
+repair contract + the skip-not-fail walk (`ee925586`, `f314ec3d`), the
+owner-offset nit (`608509a4`), the docs (`7771dbfc`), the probe door on
+the non-writer pin (`77d04f92`) and the collapse test's D4-order fold
+(`f0afecff`) — see §4c. Dev-box, debug-build,
 in-process evidence ONLY — scoping, per the venue rule; the squeeze-test
 solo re-gate A-B-B-A (gate 1) is owed (§7).
 
@@ -225,10 +227,36 @@ journals them.
   now run in spread passes, the last uncovered, the throttle only for
   the fill); the crash-window collapse test's survivor stride derives from
   the merge law (½ × `merge_pair_capacity` over the heaviest tree's
-  per-file bytes — flat 11, forest 18) and its covering cycles run until
+  per-file bytes — flat 11, forest 17) and its covering cycles run until
   the durable tail has passed the last delete (a forest's mixed leaves
   compact far more often, so the dying floors lag the tail a cycle; two
   fixed cycles left ~780 tombstones uncovered on 1 in ~12 stamped runs).
+- **The collapse test's second face — the parent's un-folded Δtime
+  residue** (`f0afecff`; the widened-matrix stamped leg was red once
+  more at the root-collapse expectation: `3 leaves, 1128 live of 1539
+  indexed, 0 merge candidates`, and the isolated test was 40/40 green).
+  Measured before the sweep (the failure arm now prints it): every
+  survivors' leaf projects at ~1.8 KiB; the leaf holding ino 1 at
+  1.6 / 5.1 / 10.7 / 15.0 KiB across four stamped runs (flat: 19.3 KiB)
+  against the 15,344 B candidate bound. Every shared-parent unlink stages
+  a Δtime MERGE record on the parent (§4.4 pt 6) — 2,700 of them, live
+  data until a fold applies them, which coverage never does — and the
+  §4.6a candidate law prices a leaf by `fold_bytes_upper`, an UPPER bound
+  that sums un-folded records at full length (the fold algebra is what
+  the projection avoids). What the residue reads at the sweep is whatever
+  the LAST threshold compaction left, and that compaction is the
+  background maintenance task's; above the bound, the greedy packing
+  merges every other leaf into one and stops with two non-candidates. A
+  flat volume's dentry tree collapses regardless (the residue sits in the
+  inode tree); on a forest it shares the survivors' ONE tree. Verdict:
+  harness (a) — the premise ignored a live term. The harness now runs
+  the D4 arm in the product's own order (`JobType::DefragMeta`: the
+  compaction nudge over the dead-carrying leaves, THEN the merge sweep)
+  and asserts the parent's leaf is a candidate once folded. The product
+  posture — a conservative candidate projection that delays a merge
+  behind a delta-heavy key until its next compaction — is unchanged and
+  stated here for the record; it costs one un-merged extent on a
+  quiescent directory until its next write, never space it does not own.
 - **Non-writer opens minted at replay** (Issue 18): `open_inner` was
   shared by every door and the `read_only` latch was set only after it
   returned, so a `-o ro` reader / co-writer / probe of a forest minted (an
@@ -337,7 +365,10 @@ every write mount). Exported on the stats inode; rows in
   space" under a PARALLEL stamped run): both pass stamped in isolation and
   inside the serialized gate; the parallel-run shape is box load until a
   quiet-box repro says otherwise. (Issue 17's stamped leaf-merge
-  nondeterminism was a different thing — a product fixpoint, §4c.)
+  nondeterminism was two different things — a product fixpoint and a
+  harness premise that ignored a live term, §4c; acceptance = the final
+  binary stamped ×10 from zero + flat ×3, recorded in the review file's
+  round-3 log.)
 - **PR 2's owed input**: `slot_state.tails` is written empty and
   `cursor` 0 — the handover / per-slot cursor semantics are PR 2/4's.
 - **The `apply_locked` lease gate** (`leased_slots`) — PR 4, "lands HERE,

@@ -44,11 +44,12 @@ use squeezefs::meta_backend::kv::forest::{
 use squeezefs::meta_backend::kv::journal::{decode_entry_payload, encode_entry_payload};
 use squeezefs::meta_backend::kv::node::{verify_node_extent, NodeLayout};
 use squeezefs::meta_backend::kv::record::{
-    decode_dentry_key, decode_inode_key, decode_readdir_cookie, decode_xattr_key, dentry_key,
-    forest_key, forest_key_kind, forest_key_slot, forest_slot_of_ino, inode_key, is_slot_tree_kind,
-    split_forest_key, xattr_key, DentryValue, InodeDelta, InodeValue, Record, RecordRef,
-    XattrValue, FOREST_SLOT_MAX, TREE_BLOCK_MAP, TREE_BLOCK_REFS, TREE_DENTRIES, TREE_INODES,
-    TREE_XATTRS,
+    classify_refused_key, decode_dentry_key, decode_inode_key, decode_readdir_cookie,
+    decode_xattr_key, dentry_key, forest_key, forest_key_kind, forest_key_slot, forest_slot_of_ino,
+    inode_key, is_slot_tree_kind, split_forest_key, xattr_key, DentryValue, InodeDelta, InodeValue,
+    RawKeyDefect, Record, RecordRef, XattrValue, DENTRY_KEY_LEN, FOREST_BLOCK_REF_KEY_LEN,
+    FOREST_SLOT_MAX, INODE_KEY_LEN, TREE_BLOCK_MAP, TREE_BLOCK_REFS, TREE_DENTRIES, TREE_INODES,
+    TREE_XATTRS, XATTR_KEY_LEN,
 };
 use squeezefs::meta_backend::kv::slot_state::{
     decode_slot_state_key, slot_state_key, SlotState, SLOT_STATE_KEY_LEN, SLOT_STATE_VERSION,
@@ -498,6 +499,53 @@ proptest! {
         let mut long = legacy.clone();
         long.push(0);
         prop_assert!(forest_key(kind, &long).is_err());
+    }
+
+    /// The refused-key classifier (fsck's raw C1 deletion gate, review
+    /// round 3 Issue 25) is total and agrees with the codec: it names a
+    /// defect for exactly the keys the codec refuses, and it names
+    /// `MalformedKnownKind` ONLY for a kind byte the codec knows as a
+    /// slot-tree kind — an unknown kind (a later binary's record?) and a
+    /// key too short to carry a kind are never the deletable class. The
+    /// refs kind byte in the ino-major position is refused by the codec
+    /// (references are by-block-prefixed) and classified as the known
+    /// kind in a shape it never takes.
+    #[test]
+    fn refused_key_classifier_agrees_with_the_codec(
+        data in prop::collection::vec(any::<u8>(), 0..64),
+    ) {
+        let defect = classify_refused_key(&data);
+        prop_assert_eq!(defect.is_none(), split_forest_key(&data).is_ok());
+        match defect {
+            Some(RawKeyDefect::MalformedKnownKind { kind, want, got }) => {
+                prop_assert!(is_slot_tree_kind(kind));
+                prop_assert_eq!(got, data.len());
+                // `want` is the codec's forest key length for that kind
+                // (a position error can carry the right length).
+                let codec_len = match kind {
+                    TREE_INODES => INODE_KEY_LEN + 1,
+                    TREE_DENTRIES => DENTRY_KEY_LEN + 1,
+                    TREE_XATTRS => XATTR_KEY_LEN + 1,
+                    TREE_BLOCK_MAP => squeezefs::meta_backend::kv::block_map::BLOCK_MAP_KEY_LEN + 1,
+                    _ => FOREST_BLOCK_REF_KEY_LEN,
+                };
+                prop_assert_eq!(want, codec_len);
+            }
+            Some(RawKeyDefect::UnknownKind { kind }) => prop_assert!(!is_slot_tree_kind(kind)),
+            Some(RawKeyDefect::Truncated { got }) => {
+                prop_assert_eq!(got, data.len());
+                prop_assert!(got < 9);
+            }
+            None => {}
+        }
+        if data.len() >= 9 && data[0] <= 0x01 && data[8] == TREE_BLOCK_REFS {
+            prop_assert!(forest_key_kind(&data).is_err());
+            let refs_in_ino_major = matches!(
+                defect,
+                Some(RawKeyDefect::MalformedKnownKind { kind: TREE_BLOCK_REFS, .. })
+            );
+            prop_assert!(refs_in_ino_major, "{:?}", defect);
+        }
     }
 
     /// A kind byte is never another tree's id (round-3 Issue 6): nothing

@@ -301,7 +301,20 @@ pub fn classify_refused_key(key: &[u8]) -> Option<RawKeyDefect> {
     let kind = match key.first() {
         None => return Some(RawKeyDefect::Truncated { got: 0 }),
         Some(&TREE_BLOCK_REFS) => TREE_BLOCK_REFS,
-        Some(&first) if first > 0x01 => return Some(RawKeyDefect::UnknownKind { kind: first }),
+        // A by-block prefix other than the refs kind: a KNOWN ino-major
+        // kind there is a shape it never takes (garbage by the codec's own
+        // law — a later kind is always a NEW id); anything else may be a
+        // later by-block family.
+        Some(&first) if first > 0x01 => {
+            return Some(match legacy_key_len(first) {
+                Some(want) => RawKeyDefect::MalformedKnownKind {
+                    kind: first,
+                    want: want + 1,
+                    got: key.len(),
+                },
+                None => RawKeyDefect::UnknownKind { kind: first },
+            })
+        }
         Some(_) => match key.get(8) {
             // A refs kind byte in the ino-major position is a KNOWN kind
             // in a shape it never takes (`forest_key_kind` refuses it).

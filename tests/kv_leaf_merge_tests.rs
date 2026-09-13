@@ -1903,3 +1903,255 @@ async fn merge_candidates_gauge_is_exact_mid_wave_and_at_quiescence() {
     );
     be.shutdown().await.expect("shutdown");
 }
+
+/// (14) **A refused member strands no heap promise** (§4.7 P1, review
+/// round 3 Issue 17 — the stamped mid-wave test's ENOSPC fixpoint,
+/// attributed from its debug trace: `heap_promised = 1` for 32 cycles
+/// with `pending-free = 0`, so `claimable = free − 1 = compaction floor`
+/// and neither a delete's compaction nor a sweep's merge could ever be
+/// admitted again). The admission promises a member's leaves ONE AT A
+/// TIME in record order; when a later leaf of the SAME member is refused
+/// the member never lands — but the earlier leaf kept its promise, on a
+/// node with nothing pending for the flush pass to consume it with.
+///
+/// The shape, built to the byte on either layout with the admission's
+/// own arithmetic (`projected_log_end` over `RecordRef::encoded_len`):
+/// leaf D (the leaf the new name's dentry lands in) and leaf I (the tail
+/// leaf holding the last file's inode) are each padded with DEAD bytes
+/// — D by renames of one file between two names that hash into it, I by
+/// `setattr` inode-record shadows — until the next pad op would
+/// overflow, so each leaf's fold stays small and its next append is a
+/// COMPACTION (need 1); the final name is long enough that its dentry
+/// record is bigger than a rename's footprint, so it overflows D for
+/// certain. The heap is drained to exactly one claimable extent above
+/// the compaction floor. `create` stages the inode Put first: I is
+/// promised, D is refused, the member is refused. The law: after the
+/// refusal `heap_promised` is 0 and a single-leaf compaction is still
+/// admissible (with the strand, `claimable − 1 < floor` refuses it for
+/// ever — the wedge).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_refused_multi_leaf_member_strands_no_heap_promise() {
+    use squeezefs::meta_backend::kv::record::{
+        dentry_key, dentry_name_hash54, inode_key, DentryValue, InodeValue, RECORD_HEADER_LEN,
+    };
+    struct Cleanup;
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            std::env::remove_var("SQUEEZEFS_META_FLUSH_INTERVAL_MS");
+        }
+    }
+    std::env::set_var("SQUEEZEFS_META_FLUSH_INTERVAL_MS", "60000");
+    let _cleanup = Cleanup;
+
+    let (be, _file) = fresh_volume().await;
+    let layout = NodeLayout::new(be.superblock().node_size as usize).expect("layout");
+    let node_size = layout.node_size();
+    let seed = be.superblock().hash_seed;
+    // The staged key is one kind byte longer on a forest.
+    let key_extra = usize::from(be.symmetric_forest());
+
+    // Enough files that the inode records span ≥ 2 leaves on both
+    // layouts (the root inode's leaf, the last inode's leaf and the new
+    // name's dentry leaf must be distinct where the shape needs them),
+    // few enough that the dentry leaf keeps room for the padding.
+    const N: u32 = 800;
+    for i in 0..N {
+        be.create(ROOT_INO, &name(i), libc::S_IFREG | 0o644, 0, 0)
+            .await
+            .expect("create");
+    }
+    be.checkpoint_now().await.expect("checkpoint");
+
+    // The LIVE leaf a key resolves to (the admission's own resolve),
+    // through the one router — re-read at every probe, never cached: a
+    // compaction under the padding would leave a stale object behind.
+    let leaf_of = |kind: u8, legacy: Vec<u8>| {
+        let be = be.clone();
+        async move {
+            let (tree, key) = be
+                .record_locator(kind, &legacy)
+                .expect("locator")
+                .expect("tree exists");
+            tree.resolve_leaf(&key).await.expect("leaf resolves")
+        }
+    };
+    let projected = |kind: u8, legacy: Vec<u8>, extra: usize| {
+        let leaf_of = &leaf_of;
+        async move {
+            let leaf = leaf_of(kind, legacy).await;
+            let g = leaf.lock().read().await;
+            (leaf.addr(), g.projected_log_end(&layout, extra))
+        }
+    };
+    let rec_len = |key_len: usize, value_len: usize| RECORD_HEADER_LEN + key_len + value_len;
+    let inode_value_len = InodeValue {
+        mode: libc::S_IFREG | 0o644,
+        nlink: 1,
+        ..Default::default()
+    }
+    .encode()
+    .len();
+    let inode_put = rec_len(8 + key_extra, inode_value_len);
+    let dentry_put = |nm: &str| {
+        rec_len(
+            16 + key_extra,
+            DentryValue {
+                child_ino: 1,
+                file_type: (libc::S_IFREG >> 12) as u8,
+                name: nm.as_bytes().to_vec(),
+            }
+            .encode()
+            .expect("dentry value")
+            .len(),
+        )
+    };
+    let dentry_delete = rec_len(16 + key_extra, 0);
+
+    // The final name: long enough that its dentry record outweighs a
+    // 9-char rename's whole D footprint (Delete + Put), so it overflows
+    // whatever room the padding leaves.
+    let new_name = "zz-strand-the-member-whose-second-leaf-is-refused";
+    let dkey = dentry_key(ROOT_INO, dentry_name_hash54(new_name.as_bytes(), seed), 0).to_vec();
+    let d_addr = projected(TREE_DENTRIES, dkey.clone(), 0).await.0;
+    // Does the parent's own inode record share D's leaf (a forest's
+    // first-leaf shape)? Then every dentry mutation's parent Put lands
+    // on D too — in the padding AND in the final create alike.
+    let parent_on_d = projected(TREE_INODES, inode_key(ROOT_INO).to_vec(), 0)
+        .await
+        .0
+        == d_addr;
+    let parent_put = if parent_on_d { inode_put } else { 0 };
+    let create_d_bytes = dentry_put(new_name) + parent_put;
+    // Two 9-char names hashing into D for the rename padding.
+    let mut pad_names: Vec<String> = Vec::new();
+    let mut k = 0u32;
+    while pad_names.len() < 2 {
+        let candidate = format!("zz-{k:06}");
+        k += 1;
+        assert!(k < 20_000, "no pad name hashed into leaf D");
+        let key = dentry_key(ROOT_INO, dentry_name_hash54(candidate.as_bytes(), seed), 0);
+        if projected(TREE_DENTRIES, key.to_vec(), 0).await.0 == d_addr {
+            pad_names.push(candidate);
+        }
+    }
+    let rename_d_bytes = dentry_delete + dentry_put(&pad_names[0]) + parent_put;
+    assert!(
+        create_d_bytes > rename_d_bytes,
+        "the final dentry record must outweigh a pad rename's footprint"
+    );
+
+    // Pad D: the pad file renamed back and forth between the two names —
+    // dead bytes only, the fold stays put — until the next rename would
+    // overflow D. One CYCLE per pad op: frames are page-aligned, so a
+    // probe taken with records still in the open delta can be split by
+    // the threshold writeback into a second frame before the next op is
+    // admitted (the op the probe said fits then overflows — and is
+    // promised); landing every op first makes the probe the admission's
+    // exact input. Every pad op is a fits-in-place commit while the heap
+    // has room.
+    be.create(ROOT_INO, &pad_names[0], libc::S_IFREG | 0o644, 0, 0)
+        .await
+        .expect("pad file");
+    be.checkpoint_now().await.expect("land the pad file");
+    let mut cur = 0usize;
+    loop {
+        let (addr, end) = projected(TREE_DENTRIES, dkey.clone(), rename_d_bytes).await;
+        assert_eq!(
+            addr, d_addr,
+            "D compacted under the padding — the fold grew"
+        );
+        if end > node_size {
+            break;
+        }
+        be.rename(ROOT_INO, &pad_names[cur], ROOT_INO, &pad_names[1 - cur], 0)
+            .await
+            .expect("pad rename");
+        cur = 1 - cur;
+        be.checkpoint_now().await.expect("land the pad rename");
+    }
+    assert!(
+        projected(TREE_DENTRIES, dkey.clone(), create_d_bytes)
+            .await
+            .1
+            > node_size,
+        "the final create's dentry overflows D"
+    );
+
+    // Pad I (the tail leaf — the last created file's): inode-record
+    // shadows, one cycle each, until the next one would overflow.
+    let last = be
+        .lookup(ROOT_INO, &pad_names[cur])
+        .await
+        .expect("pad file")
+        .ino;
+    let ikey = inode_key(last).to_vec();
+    let i_addr = projected(TREE_INODES, ikey.clone(), 0).await.0;
+    assert_ne!(i_addr, d_addr, "I and D are distinct leaves");
+    loop {
+        let (addr, end) = projected(TREE_INODES, ikey.clone(), inode_put).await;
+        assert_eq!(addr, i_addr, "I compacted under the padding");
+        if end > node_size {
+            break;
+        }
+        be.setattr(last, Some(0o600), None, None, None, None, None, None)
+            .await
+            .expect("pad setattr");
+        be.checkpoint_now().await.expect("land the pad setattr");
+    }
+
+    // Everything is landed; a covering cycle lets every setup return
+    // finish, so nothing is pending or promised when the heap is drained.
+    be.checkpoint_now().await.expect("covering cycle");
+    assert_eq!(be.heap_promised(), 0, "the setup's SMOs all ran");
+    let (addr, end) = projected(TREE_DENTRIES, dkey.clone(), create_d_bytes).await;
+    assert!(
+        addr == d_addr && end > node_size,
+        "D flushed in place, one record from overflow"
+    );
+    let (addr, end) = projected(TREE_INODES, ikey.clone(), inode_put).await;
+    assert!(
+        addr == i_addr && end > node_size,
+        "I flushed in place, one record from overflow (addr {addr:#x} vs {i_addr:#x}, end {end} \
+         vs node {node_size}, inode_put {inode_put})"
+    );
+
+    // One claimable extent above the compaction floor, nothing pending.
+    let alloc = Arc::clone(be.allocator());
+    let floor = compaction_floor_extents(alloc.reserve_extents());
+    let mut held: Vec<u64> = Vec::new();
+    while alloc.free_extents() > floor + 1 {
+        held.push(alloc.claim_internal().expect("drain claim"));
+    }
+    assert_eq!(alloc.pending_count(), 0, "no returns in flight");
+
+    // The two-leaf member: inode Put on I (compaction, need 1 — the one
+    // extent is promised), dentry Put on D (compaction, need 1 — refused
+    // at the floor). Refused as a whole.
+    let refused = be
+        .create(ROOT_INO, new_name, libc::S_IFREG | 0o644, 0, 0)
+        .await
+        .expect_err("the two-leaf create is refused at the compaction floor");
+    assert_eq!(refused.to_errno(), libc::ENOSPC, "got {refused:?}");
+    assert!(
+        be.lookup(ROOT_INO, new_name).await.is_err(),
+        "a refused member landed nothing"
+    );
+    assert_eq!(
+        be.heap_promised(),
+        0,
+        "a refused member's promises are returned to the ledger — a promise on a node with \
+         nothing pending is a permanent claimable deficit (the mid-wave ENOSPC fixpoint)"
+    );
+    // The consequence the law protects: with the one extent still
+    // claimable, a single-leaf compaction is admissible (I's next inode
+    // shadow), exactly as it would have been before the refusal.
+    be.setattr(last, Some(0o640), None, None, None, None, None, None)
+        .await
+        .expect("a single-leaf compaction is admitted at floor + 1");
+    for ext in held {
+        alloc.release_unpublished(ext);
+    }
+    be.checkpoint_now().await.expect("checkpoint");
+    assert!(!be.is_failed());
+    be.shutdown().await.expect("shutdown");
+}

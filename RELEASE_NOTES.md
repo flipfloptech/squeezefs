@@ -33,9 +33,10 @@ stands as history.
 - **An SPDK share still in your share ledger is never re-presented.** The
   ledger schema is unchanged and the record stays decodable: `nvmeof list`
   shows it as `spdk — RETIRED target stack` with the re-share sequence,
-  `nvmeof restore` reports it `skipped`, `nvmeof unshare` removes ONLY its
-  ledger record, and the duplicate-backing guard holds its backing until
-  that record is gone. **The operator's re-share sequence:**
+  `nvmeof restore` reports it `skipped` **and exits nonzero until the record
+  is removed** (`target start` and the nvmet oneshot unit stay red), `nvmeof
+  unshare` removes ONLY its ledger record, and the duplicate-backing guard
+  holds its backing until that record is gone. **The operator's re-share sequence:**
   1. `sudo squeezefs nvmeof unshare <subnqn>` — the SPDK ledger record is
      removed (no `spdk_tgt` is driven); the backing is released.
   2. If an `spdk_tgt` still serves the old subsystem, tear it down

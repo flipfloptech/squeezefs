@@ -599,21 +599,27 @@ pub fn restore_outcome(
     failures: usize,
     retired: usize,
 ) -> Result<(), NvmeofError> {
+    // ONE verdict names every debt: an operator who fixes the nvmet failure
+    // must not meet the retired record as a second surprise on the re-run.
+    let mut debts = Vec::new();
     if failures > 0 {
-        return Err(NvmeofError::Refused(format!(
+        debts.push(format!(
             "{failures} of {replayed} replayed ledger share(s) failed to restore — see the \
              per-share report above"
-        )));
+        ));
     }
     if retired > 0 {
-        return Err(NvmeofError::Refused(format!(
+        debts.push(format!(
             "{retired} ledger share(s) recorded on the RETIRED SPDK target stack (R-SYM-8) were \
              NOT re-presented — this binary drives no spdk_tgt, so the share is unserved until \
              it is re-shared on nvmet; the restore stays FAILED (and the oneshot unit red) until \
              step 1 removes the record.\n  {SPDK_RESHARE_SEQUENCE}"
-        )));
+        ));
     }
-    Ok(())
+    if debts.is_empty() {
+        return Ok(());
+    }
+    Err(NvmeofError::Refused(debts.join(";\nand ")))
 }
 
 /// The `nvmeof restore` verb (§6.2): replays EVERY nvmet ledger record

@@ -208,6 +208,22 @@ fn restore_exits_nonzero_while_a_retired_spdk_record_remains() {
         .expect_err("nvmet failures still fail")
         .to_string();
     assert!(err.contains("2 of 3"), "{err}");
+    assert!(
+        !err.to_ascii_lowercase().contains("retired"),
+        "no retired clause when nothing is retired: {err}"
+    );
+
+    // Both at once: ONE verdict names both debts — the operator who fixes
+    // the nvmet failure must not discover the SPDK record on the re-run.
+    let err = restore_outcome(3, 2, 1)
+        .expect_err("a mixed ledger fails")
+        .to_string();
+    assert!(err.contains("2 of 3"), "names the nvmet failures: {err}");
+    assert_names_retirement_and_reshare("mixed verdict", &err);
+    assert!(
+        err.contains("1 ledger share"),
+        "counts the retired records in the same verdict: {err}"
+    );
 }
 
 #[test]

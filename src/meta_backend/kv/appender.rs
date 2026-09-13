@@ -187,11 +187,21 @@ pub struct AppenderIdentity {
 }
 
 impl AppenderIdentity {
-    /// `(node_token, mount_slot)` — what a joining node matches its own
-    /// residue by (§5.3.2 identity binding; the writer id changes per
-    /// mount).
-    pub fn scope(&self) -> (u64, u32) {
-        (self.node_token, self.mount_slot)
+    /// Is a page stamped with this identity OUR residue, judged by a
+    /// writer that holds the D0 flock (§5.3.2 identity binding, the "D0
+    /// `Reclaimable` arm")?
+    ///
+    /// The flock is the kernel's same-HOST death proof, so under D0 a
+    /// `Live` page of this node — whatever mount point (slot) its holder
+    /// derived — can only be a dead predecessor's: the kill-9 successor
+    /// remounting at another mount point is the shipped same-host
+    /// crash-remount shape, and the flat path reclaims it instantly. The
+    /// `(node_token, mount_slot)` narrowing is PR 10's, where the death
+    /// ledger names WHICH of a node's live mounts holds a page; until
+    /// then two live mounts of one node on one volume are unrepresentable
+    /// (the flock). The writer id changes per mount and never binds.
+    pub fn owned_by_node(&self, node_token: u64) -> bool {
+        self.node_token == node_token
     }
 }
 

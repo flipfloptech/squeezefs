@@ -9625,9 +9625,13 @@ impl KvMetaBackend {
     /// declared partition names.
     ///
     /// Region 0 (the manager's, KD-SYM-3) rides the fixed ring the caller
-    /// already replayed from the ledger; a `Live` page of our own means
-    /// the predecessor died un-recovered and that replay WAS its recovery
-    /// (`appender_self_recoveries`). A `Live` page of a FOREIGN identity
+    /// already replayed from the ledger; a `Live` page of our own NODE
+    /// means the predecessor died un-recovered and that replay WAS its
+    /// recovery (`appender_self_recoveries`) — "own" is the node token,
+    /// because the writer holds the D0 flock here and a same-host holder
+    /// at ANY mount point is therefore dead (`AppenderIdentity::
+    /// owned_by_node`; the kill-9 successor remounting at another mount
+    /// point is the shipped shape). A `Live` page of a FOREIGN node
     /// refuses a writer open loud — recovering another node's ring is
     /// PR 10's driver, `squeezefs appender clear` the remedy — and a
     /// non-writer (reader / probe) lists it and mounts what tree 0 names.
@@ -9686,7 +9690,10 @@ impl KvMetaBackend {
         let ring_bytes = resolve_sym_ring_bytes(0, volume_len);
         let capacity = super::appender::appenders_capacity(sb.heap.len, ring_bytes);
 
-        let mine = |p: &AppenderPage| p.identity.scope() == scope;
+        // A writer reaching this point holds the D0 flock (step (1) of
+        // `open`): a same-NODE Live page is a dead predecessor's residue
+        // whatever mount slot it carried — see `owned_by_node`.
+        let mine = |p: &AppenderPage| p.identity.owned_by_node(scope.0);
         let foreign_live = |p: &AppenderPage| p.state == AppenderState::Live && !mine(p);
         if is_writer {
             if let Some(e) = entries
@@ -9744,10 +9751,12 @@ impl KvMetaBackend {
         if self_recovered0 {
             set.self_recoveries.fetch_add(1, Ordering::Relaxed);
             log::info!(
-                "meta volume {}: appender 0's page is LIVE under our own identity (term {}) — \
-                 our predecessor died un-recovered; its ring window ({} entries) was replayed \
-                 as our own residue (appender_self_recoveries)",
+                "meta volume {}: appender 0's page is LIVE under our own node (mount slot \
+                 {:#x}, term {}) — our predecessor died un-recovered (the D0 flock we hold is \
+                 the proof); its ring window ({} entries) was replayed as our own residue \
+                 (appender_self_recoveries)",
                 path.display(),
+                page0.identity.mount_slot,
                 page0.term,
                 recovery0.entries.len()
             );
@@ -9812,9 +9821,11 @@ impl KvMetaBackend {
                 )
                 .await?;
                 log::info!(
-                    "meta volume {}: appender {id}'s page is LIVE under our own identity (term \
-                     {}) — replaying its ring ({} entries past tail {}) as our own residue",
+                    "meta volume {}: appender {id}'s page is LIVE under our own node (mount slot \
+                     {:#x}, term {}) — replaying its ring ({} entries past tail {}) as our own \
+                     residue",
                     path.display(),
+                    page.identity.mount_slot,
                     page.term,
                     rec.entries.len(),
                     page.ledger_tail_seq

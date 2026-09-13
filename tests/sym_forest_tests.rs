@@ -65,11 +65,16 @@ use squeezefs::meta_backend::kv::superblock::{
     FEATURE_INCOMPAT_KV_SYMMETRIC_FOREST,
 };
 use squeezefs::meta_backend::kv::tree::RootPtr;
+use squeezefs::meta_backend::kv::{
+    META_KV_FOREST_SLOT_TREES_MINTED, META_KV_NODE_APPENDS, META_KV_NODE_REWRITE_BYTES,
+};
 use squeezefs::meta_backend::{
     guest_local_ino, open_routed_meta_set, open_routed_meta_set_read_only, open_volume_for_mount,
     plan_meta_slot_set, plan_meta_slot_set_with_width, Metadata, GUEST_NS_SHIFT, MINT_SPREAD,
 };
 use std::collections::HashMap;
+use std::sync::atomic::Ordering;
+use std::sync::Arc;
 use tempfile::NamedTempFile;
 
 // ---------------------------------------------------------------------------
@@ -1526,6 +1531,303 @@ async fn a_live_reader_of_a_forest_resolves_guests_minted_after_its_mount() {
         "the reader knows every slot tree the writer minted"
     );
     for v in &writer.volumes {
+        v.shutdown().await.unwrap();
+    }
+}
+
+/// Review round 3, Issue 18: a NON-WRITER open (`-o ro`) of a forest volume
+/// whose writer's journal window holds records of slot trees tree 0 does
+/// not yet name performs ZERO device writes. Before the fix the open-time
+/// replay MINTED every unknown slot — an extent claim plus a `write_node`
+/// of an empty root — from a mount that may not write, onto the very
+/// extents the live writer's unpublished roots occupy. The chosen posture
+/// is the S5 bounded-stale contract: the reader SKIPS those records (it
+/// sees the slot at the poll after the writer publishes), never routes
+/// them into RAM-only trees the epoch drop pass would tear from under it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_reader_of_a_forest_with_unpublished_slots_in_the_window_writes_nothing() {
+    struct Cleanup;
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            std::env::remove_var("SQUEEZEFS_META_FLUSH_INTERVAL_MS");
+        }
+    }
+    // Park the writer's cadence: every device write below is one this
+    // test drives, so the global write gauges are the reader's alone.
+    std::env::set_var("SQUEEZEFS_META_FLUSH_INTERVAL_MS", "60000");
+    let _cleanup = Cleanup;
+    let dir = tempfile::tempdir().unwrap();
+    let uris = stamped_forest_set(dir.path()).await;
+    let writer = open_routed_meta_set(&uris).await.expect("writer");
+    let d = writer
+        .create(ROOT_INO, "d", libc::S_IFDIR | 0o755, 0, 0)
+        .await
+        .unwrap()
+        .ino;
+    // A few slots minted AND published (the checkpoint names their roots).
+    let mut published = Vec::new();
+    for i in 0..4 {
+        published.push(
+            writer
+                .create(d, &format!("pub{i}"), libc::S_IFREG | 0o644, 0, 0)
+                .await
+                .unwrap()
+                .ino,
+        );
+    }
+    for v in &writer.volumes {
+        v.checkpoint_now().await.unwrap();
+    }
+    let published_trees = writer.volumes[0].forest_census().unwrap().slot_trees;
+    // Then many more mints, UNPUBLISHED: fresh rotor slots whose roots
+    // only the writer's RAM knows — their records sit in the window.
+    let mut unpublished = Vec::new();
+    for i in 0..(2 * MINT_SPREAD as u32) {
+        unpublished.push(
+            writer
+                .create(d, &format!("win{i:03}"), libc::S_IFREG | 0o644, 0, 0)
+                .await
+                .unwrap()
+                .ino,
+        );
+    }
+    assert!(
+        writer.volumes[0].forest_census().unwrap().slot_trees > published_trees + 8,
+        "the window holds records of slots tree 0 does not name"
+    );
+    writer.volumes[0].sync_device().await.unwrap();
+
+    let minted0 = META_KV_FOREST_SLOT_TREES_MINTED.load(Ordering::Relaxed);
+    let rewrite0 = META_KV_NODE_REWRITE_BYTES.load(Ordering::Relaxed);
+    let appends0 = META_KV_NODE_APPENDS.load(Ordering::Relaxed);
+    let reader = open_routed_meta_set_read_only(&uris).await.expect("reader");
+    assert_eq!(
+        META_KV_FOREST_SLOT_TREES_MINTED.load(Ordering::Relaxed),
+        minted0,
+        "a reader mints no slot tree"
+    );
+    assert_eq!(
+        META_KV_NODE_REWRITE_BYTES.load(Ordering::Relaxed),
+        rewrite0,
+        "a reader writes no node image"
+    );
+    assert_eq!(
+        META_KV_NODE_APPENDS.load(Ordering::Relaxed),
+        appends0,
+        "a reader appends no frame"
+    );
+    let rv = &reader.volumes[0];
+    assert_eq!(rv.forest_census().unwrap().minted, 0);
+    assert_eq!(
+        rv.forest_census().unwrap().slot_trees,
+        published_trees,
+        "the reader opened exactly the slot trees tree 0 names"
+    );
+    // The published population serves; so does every window record of a
+    // slot the reader KNOWS (the rotor re-visits the four published
+    // slots); a record of an UNPUBLISHED slot is not yet visible (bounded
+    // staleness — never a mint, never an error).
+    for (i, ino) in published.iter().enumerate() {
+        assert_eq!(
+            reader.lookup(d, &format!("pub{i}")).await.unwrap().ino,
+            *ino
+        );
+    }
+    let known: std::collections::HashSet<_> = rv
+        .forest_roots()
+        .into_iter()
+        .map(|(slot, _)| slot)
+        .collect();
+    let mut skipped = 0;
+    for (i, ino) in unpublished.iter().enumerate() {
+        let name = format!("win{i:03}");
+        let slot =
+            squeezefs::meta_backend::kv::record::forest_slot_of_ino(writer.route_ino(*ino).1);
+        let r = reader.lookup(d, &name).await;
+        if known.contains(&slot) {
+            assert_eq!(
+                r.unwrap().ino,
+                *ino,
+                "{name}: a known slot's window record serves"
+            );
+        } else {
+            assert!(
+                r.is_err(),
+                "{name}: a record of an unpublished slot is not served before the writer publishes"
+            );
+            skipped += 1;
+        }
+    }
+    assert!(
+        skipped > 8,
+        "the window held records of many unpublished slots ({skipped})"
+    );
+    // The writer publishes; the reader's next poll adopts the roots and
+    // serves every window record — still without a mint.
+    for v in &reader.volumes {
+        v.arm_reader_revalidation(None).unwrap();
+    }
+    for v in &writer.volumes {
+        v.checkpoint_now().await.unwrap();
+    }
+    let poller = RevalidationPoller::new(1);
+    for (_, res) in poller
+        .poll_set_at(&reader.volumes, std::time::Instant::now())
+        .await
+    {
+        assert!(res.expect("poll").advanced);
+    }
+    for (i, ino) in unpublished.iter().enumerate() {
+        assert_eq!(
+            reader.lookup(d, &format!("win{i:03}")).await.unwrap().ino,
+            *ino
+        );
+    }
+    assert_eq!(
+        rv.forest_census().unwrap().minted,
+        0,
+        "still no mint on the reader"
+    );
+    for v in &writer.volumes {
+        v.shutdown().await.unwrap();
+    }
+}
+
+/// Review round 3, Issue 19: a forest volume in the `heap_full` posture
+/// that crashes with an UNPUBLISHED slot in its window (the publication
+/// deferred, the mint's extent durable in the bitmap) REMOUNTS. The replay
+/// re-mints the slot tree — a RECOVERY act — from the compaction reserve
+/// (`claim_internal`, the flat bit-9/16 mount-time mints' class), never
+/// the user class the runtime mint uses (refused at the growth floor —
+/// which on this volume refused the MOUNT itself, every mount, for ever).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_heap_full_forest_with_an_unpublished_mint_in_the_window_remounts() {
+    use squeezefs::meta_backend::kv::alloc_ext::compaction_reserve_extents;
+    struct Cleanup;
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            std::env::remove_var("SQUEEZEFS_META_FLUSH_INTERVAL_MS");
+            squeezefs::meta_backend::kv::backend::TEST_FOREST_PUBLISH_DEFER
+                .store(0, Ordering::SeqCst);
+        }
+    }
+    std::env::set_var("SQUEEZEFS_META_FLUSH_INTERVAL_MS", "60000");
+    let _cleanup = Cleanup;
+    let dir = tempfile::tempdir().unwrap();
+    let uris = stamped_forest_set(dir.path()).await;
+    let routed = open_routed_meta_set(&uris).await.expect("open");
+    let vol = &routed.volumes[0];
+    let d = routed
+        .create(ROOT_INO, "d", libc::S_IFDIR | 0o755, 0, 0)
+        .await
+        .unwrap()
+        .ino;
+    // Every rotor slot minted and published while the heap has room.
+    for i in 0..(2 * MINT_SPREAD as u32) {
+        routed
+            .create(d, &format!("f{i:03}"), libc::S_IFREG | 0o644, 0, 0)
+            .await
+            .unwrap();
+    }
+    vol.checkpoint_now().await.unwrap();
+
+    // Drive the heap to the floor FIRST, with `HELD` extents parked out
+    // of the free list so ENOSPC arrives with exactly that much room in
+    // hand: creates with payloads until the growth floor refuses one
+    // (the fill's own ring-full cycles publish every rotor slot).
+    let alloc = Arc::clone(vol.allocator());
+    let reserve = compaction_reserve_extents(vol.superblock().total_extents());
+    const HELD: usize = 4;
+    let held: Vec<u64> = (0..HELD)
+        .map(|_| alloc.claim_internal().expect("park an extent"))
+        .collect();
+    let mut i = 0u32;
+    loop {
+        let r = async {
+            let f = routed
+                .create(d, &format!("fill{i:05}"), libc::S_IFREG | 0o644, 0, 0)
+                .await?;
+            routed
+                .setxattr(f.ino, "user.payload", &vec![0x5a; 12 * 1024])
+                .await
+        }
+        .await;
+        i += 1;
+        match r {
+            Ok(()) => {
+                // The cadence is parked: cycle for ring room by hand.
+                if i % 8 == 0 {
+                    vol.checkpoint_now().await.unwrap();
+                }
+            }
+            Err(e) if e.to_errno() == libc::ENOSPC => break,
+            Err(e) => panic!("fill: {e:?}"),
+        }
+        assert!(i < 100_000, "a 24 MiB heap absorbed 100k payloads");
+    }
+    assert!(vol.heap_full(), "the refused create latched the posture");
+    vol.checkpoint_now().await.unwrap();
+    let published = vol.forest_census().unwrap().control_records;
+
+    // From here every publication is deferred (the seam). The parked
+    // extents come back, ONE more slot tree is minted by a journaled
+    // commit — a block reference owned by an ino of a slot no rotor
+    // reaches — from that room (the runtime mint is USER growth), then
+    // the room is taken back down to the reserve and landed: the mint's
+    // bitmap bit is durable, its root unpublished, its records in the
+    // window by the unpublished-root floor, and the next mount finds the
+    // heap at the reserve exactly.
+    squeezefs::meta_backend::kv::backend::TEST_FOREST_PUBLISH_DEFER
+        .store(u32::MAX, Ordering::SeqCst);
+    for ext in held {
+        alloc.release_unpublished(ext);
+    }
+    let owner = guest_local_ino(9_000, 1);
+    let tag = squeezefs::meta_backend::kv::block_refs::volume_tag("vol-0011223344556677");
+    let reference = BlockRef {
+        vol_tag: tag,
+        block_idx: 7,
+        owner_ino: owner,
+        block_index: 0,
+    };
+    let trees_before = vol.forest_census().unwrap().slot_trees;
+    vol.commit_block_refs(owner, &[BlockRefOp::taken(reference)])
+        .await
+        .expect("the mint has room");
+    assert_eq!(vol.forest_census().unwrap().slot_trees, trees_before + 1);
+    assert_eq!(vol.block_ref_count(tag, 7).await.unwrap(), 1);
+    while alloc.free_extents() > reserve {
+        alloc.claim_internal().expect("drain to the reserve");
+    }
+    vol.checkpoint_now().await.unwrap();
+    assert_eq!(
+        vol.forest_census().unwrap().control_records,
+        published,
+        "the late mint is still unpublished"
+    );
+    assert_eq!(
+        alloc.free_extents(),
+        reserve,
+        "the heap sits at the reserve"
+    );
+    vol.sync_device().await.unwrap();
+    // Crash: the image as it stands, reopened elsewhere (the writer keeps
+    // its flock on the original).
+    let crash = NamedTempFile::new().unwrap();
+    std::fs::copy(&uris[0], crash.path()).unwrap();
+    squeezefs::meta_backend::kv::backend::TEST_FOREST_PUBLISH_DEFER.store(0, Ordering::SeqCst);
+
+    let again = KvMetaBackend::open(crash.path())
+        .await
+        .expect("a heap-full forest with an unpublished mint in its window REMOUNTS");
+    assert_eq!(
+        again.block_ref_count(tag, 7).await.unwrap(),
+        1,
+        "the window's record folded into the re-minted slot tree"
+    );
+    assert_eq!(again.forest_census().unwrap().slot_trees, trees_before + 1);
+    again.shutdown().await.unwrap();
+    for v in &routed.volumes {
         v.shutdown().await.unwrap();
     }
 }

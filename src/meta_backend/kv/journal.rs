@@ -481,7 +481,14 @@ fn parse_page_header(page: &[u8]) -> Option<(u32, u16, u16)> {
 /// not inside it; the commit hot path's reads stay latch-free.
 pub struct JournalRing {
     path: PathBuf,
-    base: u64,
+    /// The ring's physical pages, in logical page order: ONE segment over
+    /// the extent on the shipped ring (`base`, `pages` — byte-identical
+    /// to the pre-segment ring), several heap extents on an appender's
+    /// grown ring (design-symmetric-metadata §5.3.1; ≤
+    /// [`super::appender::RING_SEGMENTS_MAX`]). Logical page `i` lives in
+    /// the segment whose cumulative page range holds it
+    /// ([`Self::page_offset`]).
+    segments: Vec<RingSegment>,
     /// Which appender's sub-ring this is ([`AppendPartition::SOLO`] = the
     /// whole journal extent, the shipped posture). Stamped into every
     /// page header this ring writes.
@@ -505,6 +512,32 @@ pub struct JournalRing {
     /// committed entry, headers included). Surfaced as
     /// `meta_kv_journal_bytes_per_volume`.
     written_bytes: std::sync::atomic::AtomicU64,
+}
+
+/// One physical run of ring pages: `pages` × 4 KiB at byte `base`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RingSegment {
+    pub base: u64,
+    pub pages: u64,
+}
+
+impl RingSegment {
+    /// The segment as a device extent.
+    pub fn extent(&self) -> super::superblock::ExtentRef {
+        super::superblock::ExtentRef {
+            start: self.base,
+            len: self.pages * JOURNAL_PAGE_LEN,
+        }
+    }
+
+    /// A whole-page device extent as a segment (its trailing partial
+    /// page, if any, is unusable — the whole-extent ring's own rule).
+    pub fn from_extent(ext: &super::superblock::ExtentRef) -> Self {
+        Self {
+            base: ext.start,
+            pages: ext.len / JOURNAL_PAGE_LEN,
+        }
+    }
 }
 
 #[derive(Default)]
@@ -573,14 +606,40 @@ impl JournalRing {
         reserve_bytes: u64,
         part: AppendPartition,
     ) -> Self {
+        Self::new_segments_in_partition(
+            path,
+            vec![RingSegment {
+                base: partition_ring_base(journal_base, total_pages, part),
+                pages: partition_ring_pages(total_pages, part.writers()),
+            }],
+            reserve_bytes,
+            part,
+        )
+    }
+
+    /// A fresh ring over a SEGMENT TABLE (design-symmetric-metadata
+    /// §5.3.1 — an appender's ring is a list of heap extents; the shipped
+    /// ring is the one-segment case). Logical positions run through the
+    /// segments in order.
+    pub fn new_segments(path: &Path, segments: Vec<RingSegment>, reserve_bytes: u64) -> Self {
+        Self::new_segments_in_partition(path, segments, reserve_bytes, AppendPartition::SOLO)
+    }
+
+    fn new_segments_in_partition(
+        path: &Path,
+        segments: Vec<RingSegment>,
+        reserve_bytes: u64,
+        part: AppendPartition,
+    ) -> Self {
+        let pages = segments.iter().map(|s| s.pages).sum();
         Self {
             path: path.to_path_buf(),
-            base: partition_ring_base(journal_base, total_pages, part),
+            segments,
             partition: part,
             core: JournalCore::new(
                 CoreGeometry {
                     page_data_len: JOURNAL_PAGE_DATA_LEN,
-                    pages: partition_ring_pages(total_pages, part.writers()),
+                    pages,
                     reserve_bytes,
                 },
                 0,
@@ -597,6 +656,96 @@ impl JournalRing {
     /// Which appender's sub-ring this is.
     pub fn partition(&self) -> AppendPartition {
         self.partition
+    }
+
+    /// The ring's segments as device extents, in logical order.
+    pub fn segments(&self) -> Vec<super::superblock::ExtentRef> {
+        self.segments.iter().map(RingSegment::extent).collect()
+    }
+
+    /// The ring's physical bytes over every segment.
+    pub fn ring_bytes(&self) -> u64 {
+        self.segments.iter().map(|s| s.pages).sum::<u64>() * JOURNAL_PAGE_LEN
+    }
+
+    /// Device offset of logical page `page`: walked through the segment
+    /// table (≤ 8 entries — a scan, no index).
+    pub fn page_offset(&self, page: u64) -> u64 {
+        let mut rem = page;
+        for seg in &self.segments {
+            if rem < seg.pages {
+                return seg.base + rem * JOURNAL_PAGE_LEN;
+            }
+            rem -= seg.pages;
+        }
+        // Unreachable by the core's geometry (`page < pages`); the
+        // defensive answer is the last segment's end so a bug reads or
+        // writes past every ring byte — loud at the device, never silent
+        // aliasing inside the ring.
+        self.segments
+            .last()
+            .map_or(0, |s| s.base + s.pages * JOURNAL_PAGE_LEN)
+    }
+
+    /// **Ring growth** (design-symmetric-metadata §5.3.2 — a ring that
+    /// stalled on `journal_full_stalls` appends a segment): a NEW ring
+    /// over `segments ‖ extra` continuing at this ring's logical head.
+    /// Legal only when this ring is DRAINED — `head == reusable_upto` and
+    /// no reservation open — because the logical→physical page map
+    /// changes for every position on lap ≥ 1 and an in-window record
+    /// would then be read from the wrong page (the module docs'
+    /// re-partitioning law: never in place). Refuses loud otherwise, and
+    /// past [`super::appender::RING_SEGMENTS_MAX`]. The written-entry
+    /// counters carry over (the ring is the same volume's).
+    pub fn grown_with(&self, extra: RingSegment) -> Result<Self, KvError> {
+        if self.segments.len() >= super::appender::RING_SEGMENTS_MAX {
+            return Err(KvError::Corrupt(format!(
+                "journal ring already has {} segments (the page names at most {})",
+                self.segments.len(),
+                super::appender::RING_SEGMENTS_MAX
+            )));
+        }
+        if extra.pages == 0 {
+            return Err(KvError::Corrupt(
+                "journal ring growth by a zero-page segment".to_string(),
+            ));
+        }
+        let head = self.core.head();
+        let reusable = self.core.reusable_upto();
+        let open = self.inflight.lock().unwrap().open.len();
+        if head != reusable || open != 0 {
+            return Err(KvError::Corrupt(format!(
+                "journal ring growth needs a drained ring (head {head}, reusable_upto \
+                 {reusable}, {open} reservation(s) open) — the page map changes under every \
+                 in-window position"
+            )));
+        }
+        let mut segments = self.segments.clone();
+        segments.push(extra);
+        let pages = segments.iter().map(|s| s.pages).sum();
+        let old = self.core.geometry();
+        Ok(Self {
+            path: self.path.clone(),
+            segments,
+            partition: self.partition,
+            core: JournalCore::new(
+                CoreGeometry {
+                    page_data_len: old.page_data_len,
+                    pages,
+                    reserve_bytes: old.reserve_bytes,
+                },
+                head,
+                head,
+            ),
+            inflight: Mutex::new(Inflight {
+                open: BTreeMap::new(),
+                completed_upto: head,
+            }),
+            space_notify: squeezefs_ipc::sqz_notify::Notify::new(),
+            completion_notify: squeezefs_ipc::sqz_notify::Notify::new(),
+            written_entries: std::sync::atomic::AtomicU64::new(self.written_entries()),
+            written_bytes: std::sync::atomic::AtomicU64::new(self.written_bytes()),
+        })
     }
 
     /// Remount: replay-scan the ring (§4.1 semantics, never loud for ring
@@ -639,29 +788,67 @@ impl JournalRing {
         tail_seq: u64,
         part: AppendPartition,
     ) -> Result<(Self, JournalRecovery), KvError> {
-        let base = partition_ring_base(journal_base, total_pages, part);
-        let pages = partition_ring_pages(total_pages, part.writers());
+        Self::recover_segments_in_partition(
+            path,
+            vec![RingSegment {
+                base: partition_ring_base(journal_base, total_pages, part),
+                pages: partition_ring_pages(total_pages, part.writers()),
+            }],
+            reserve_bytes,
+            tail_seq,
+            part,
+        )
+        .await
+    }
+
+    /// [`Self::recover`] over a SEGMENT TABLE (an appender's ring): one
+    /// sequential read per segment, concatenated in logical order into
+    /// the image the §4.1 scan walks.
+    pub async fn recover_segments(
+        path: &Path,
+        segments: Vec<RingSegment>,
+        reserve_bytes: u64,
+        tail_seq: u64,
+    ) -> Result<(Self, JournalRecovery), KvError> {
+        Self::recover_segments_in_partition(
+            path,
+            segments,
+            reserve_bytes,
+            tail_seq,
+            AppendPartition::SOLO,
+        )
+        .await
+    }
+
+    async fn recover_segments_in_partition(
+        path: &Path,
+        segments: Vec<RingSegment>,
+        reserve_bytes: u64,
+        tail_seq: u64,
+        part: AppendPartition,
+    ) -> Result<(Self, JournalRecovery), KvError> {
+        let pages: u64 = segments.iter().map(|s| s.pages).sum();
         let geo = CoreGeometry {
             page_data_len: JOURNAL_PAGE_DATA_LEN,
             pages,
             reserve_bytes,
         };
-        // One sequential ring read (§3's mount budget). A short read (file
-        // smaller than the extent) zero-extends: zeros verify nothing and
-        // replay to nothing.
+        // One sequential read per segment (§3's mount budget; ONE for the
+        // shipped ring). A short read (file smaller than the extent)
+        // zero-extends: zeros verify nothing and replay to nothing.
         let ring_len = (pages * JOURNAL_PAGE_LEN) as usize;
-        let got = crate::uring_fs::read_at(path, base, ring_len).await?;
-        let image: std::borrow::Cow<'_, [u8]> = if got.len() == ring_len {
-            std::borrow::Cow::Borrowed(&got)
-        } else {
-            let mut full = vec![0u8; ring_len];
-            full[..got.len()].copy_from_slice(&got);
-            std::borrow::Cow::Owned(full)
-        };
+        let mut image: Vec<u8> = Vec::with_capacity(ring_len);
+        for seg in &segments {
+            let seg_len = (seg.pages * JOURNAL_PAGE_LEN) as usize;
+            let got = crate::uring_fs::read_at(path, seg.base, seg_len).await?;
+            let n = got.len().min(seg_len);
+            image.extend_from_slice(&got[..n]);
+            image.resize(image.len() + (seg_len - n), 0);
+        }
         let recovery = replay_scan_image(&image, &geo, tail_seq, part.writer_id());
         let ring = Self {
             path: path.to_path_buf(),
-            base,
+            segments,
             partition: part,
             core: JournalCore::new(geo, recovery.head_pos, tail_seq),
             inflight: Mutex::new(Inflight {
@@ -805,10 +992,7 @@ impl JournalRing {
     /// harness arms write faults at exact entry offsets).
     pub fn physical_offset_of(&self, pos: u64) -> u64 {
         let geo = self.core.geometry();
-        self.base
-            + geo.page_index(pos) * JOURNAL_PAGE_LEN
-            + JOURNAL_PAGE_HDR_LEN
-            + geo.in_page_off(pos)
+        self.page_offset(geo.page_index(pos)) + JOURNAL_PAGE_HDR_LEN + geo.in_page_off(pos)
     }
 
     /// Build one entry's write ops into `ops`: payload segments + the 24 B
@@ -851,8 +1035,7 @@ impl JournalRing {
         // torn-batch shim exercise payload-landed/header-lost shapes.
         let mut consumed = 0usize;
         for seg in geo.segments(res.start, res.len) {
-            let file_off =
-                self.base + seg.page * JOURNAL_PAGE_LEN + JOURNAL_PAGE_HDR_LEN + seg.data_off;
+            let file_off = self.page_offset(seg.page) + JOURNAL_PAGE_HDR_LEN + seg.data_off;
             ops.push((file_off, entry.slice(consumed..consumed + seg.len as usize)));
             consumed += seg.len as usize;
         }
@@ -872,7 +1055,7 @@ impl JournalRing {
             let lap = geo.lap(page_start) as u32;
             let hdr = page_header_image(lap, feo, self.partition.writer_id());
             ops.push((
-                self.base + geo.page_index(page_start) * JOURNAL_PAGE_LEN,
+                self.page_offset(geo.page_index(page_start)),
                 bytes::Bytes::copy_from_slice(&hdr),
             ));
         }
@@ -1514,4 +1697,185 @@ pub fn replay_merge(
         )));
     }
     Ok(merged)
+}
+
+// ---------------------------------------------------------------------------
+// The appender rings' violation classes (design-symmetric-metadata §5.3.4;
+// incompat bit 17 — what the bit-8 partition classes become PER RING).
+// ---------------------------------------------------------------------------
+
+/// A broken appender partition: evidence in one mount's replay windows
+/// that two appender rings did not stay key-disjoint, that a ring carried
+/// a record for a slot its appender did not lease, or that a ring claimed
+/// an extent outside its appender's grant. Each is loud (counted on its
+/// must-stay-0 gauge, then refused), never dropped.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AppenderViolation {
+    /// The same `(kind, key)` in two rings' windows — the case no merge
+    /// order can decide (KD-SYM-4's one-ring-per-key invariant broken).
+    Key {
+        kind: u8,
+        key: Vec<u8>,
+        /// The two appenders, ascending.
+        appenders: (u32, u32),
+        /// Their entry seqs, in `appenders` order.
+        seqs: (u64, u64),
+    },
+    /// A record for a slot tree the ring's appender did not lease: a
+    /// content record outside its lease set (or, for the manager's ring,
+    /// inside another appender's), or the manager's STRUCTURE — a tree-0
+    /// record or an interior record — in a content appender's ring.
+    Lease {
+        appender_id: u32,
+        slot: Option<u32>,
+        seq: u64,
+    },
+    /// An allocator delta in a ring whose appender holds no grant
+    /// covering the extent (§5.3.3 — until PR 3 grants, every extent is
+    /// the manager's).
+    Extent {
+        appender_id: u32,
+        extent: u64,
+        seq: u64,
+    },
+}
+
+impl std::fmt::Display for AppenderViolation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Key {
+                kind,
+                key,
+                appenders,
+                seqs,
+            } => write!(
+                f,
+                "key {} of kind {kind} was written by appender {} (seq {}) AND appender {} \
+                 (seq {}) — two rings hold one key in-window",
+                hex_key(key),
+                appenders.0,
+                seqs.0,
+                appenders.1,
+                seqs.1
+            ),
+            Self::Lease {
+                appender_id,
+                slot,
+                seq,
+            } => match slot {
+                Some(slot) => write!(
+                    f,
+                    "appender {appender_id}'s ring carries a record for slot tree {slot} it \
+                     does not lease (seq {seq})"
+                ),
+                None => write!(
+                    f,
+                    "appender {appender_id}'s ring carries the manager's structure (a tree-0 \
+                     or interior record) at seq {seq}"
+                ),
+            },
+            Self::Extent {
+                appender_id,
+                extent,
+                seq,
+            } => write!(
+                f,
+                "appender {appender_id}'s ring journaled an allocator delta for extent \
+                 {extent} at seq {seq} outside any grant of its own"
+            ),
+        }
+    }
+}
+
+/// Detect the three §5.3.4 classes over every appender ring's recovered
+/// window. `leases` maps each content appender (id ≥ 1) to the FOREST
+/// slots it leases; appender 0 — the manager — leases the complement and
+/// alone may carry structure (tree 0, interior records) and allocator
+/// deltas. Window-scoped like [`detect_partition_violations`]: a key two
+/// appenders touched in different windows leaves no evidence here.
+pub fn detect_appender_violations(
+    rings: &[(u32, JournalRecovery)],
+    leases: &std::collections::BTreeMap<u32, std::collections::BTreeSet<u32>>,
+) -> Vec<AppenderViolation> {
+    let mut out = Vec::new();
+    let mut owners: std::collections::HashMap<(u8, Vec<u8>), (u32, u64)> =
+        std::collections::HashMap::new();
+    let leased_by_other = |appender: u32, slot: u32| -> bool {
+        leases
+            .iter()
+            .any(|(id, set)| *id != appender && set.contains(&slot))
+    };
+    for (appender_id, rec) in rings {
+        let appender_id = *appender_id;
+        for entry in &rec.entries {
+            for (tag, r) in &entry.records {
+                let (tree_id, level) = untag(*tag);
+                if tree_id == TREE_ALLOC_RESERVED {
+                    if appender_id != 0 {
+                        if let Ok(extent) = super::alloc_ext::decode_extent_key(&r.key) {
+                            out.push(AppenderViolation::Extent {
+                                appender_id,
+                                extent,
+                                seq: entry.seq,
+                            });
+                        }
+                    }
+                    continue;
+                }
+                if level > 0 || tree_id == super::record::TREE_CONTROL {
+                    if appender_id != 0 {
+                        out.push(AppenderViolation::Lease {
+                            appender_id,
+                            slot: None,
+                            seq: entry.seq,
+                        });
+                    }
+                    continue;
+                }
+                if !super::record::is_slot_tree_kind(tree_id) {
+                    continue;
+                }
+                let slot = match super::record::forest_key_slot(&r.key) {
+                    Ok(s) => s,
+                    Err(_) => continue, // the codec tripwire's class, not this one's
+                };
+                let leased = if appender_id == 0 {
+                    !leased_by_other(0, slot)
+                } else {
+                    leases
+                        .get(&appender_id)
+                        .is_some_and(|set| set.contains(&slot))
+                };
+                if !leased {
+                    out.push(AppenderViolation::Lease {
+                        appender_id,
+                        slot: Some(slot),
+                        seq: entry.seq,
+                    });
+                }
+                match owners.entry((tree_id, r.key.clone())) {
+                    std::collections::hash_map::Entry::Vacant(v) => {
+                        v.insert((appender_id, entry.seq));
+                    }
+                    std::collections::hash_map::Entry::Occupied(o) => {
+                        let (first, first_seq) = *o.get();
+                        if first != appender_id {
+                            let (appenders, seqs) = if first < appender_id {
+                                ((first, appender_id), (first_seq, entry.seq))
+                            } else {
+                                ((appender_id, first), (entry.seq, first_seq))
+                            };
+                            out.push(AppenderViolation::Key {
+                                kind: tree_id,
+                                key: r.key.clone(),
+                                appenders,
+                                seqs,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+    }
+    out
 }

@@ -42,13 +42,13 @@ use squeezefs::meta_backend::kv::builder::{BuilderConfig, ImageBuilder, ROOT_INO
 use squeezefs::meta_backend::kv::checkpoint::CHECKPOINT_MAX_AGE_MS;
 use squeezefs::meta_backend::kv::journal::{
     checkpoint_reserve_bytes, detect_appender_violations, entry_len_for, tag_for,
-    AppenderViolation, JournalRecovery, JournalRing, ReplayedEntry, RingSegment,
-    JOURNAL_PAGE_LEN, MAX_ENTRY_LEN,
+    AppenderViolation, JournalRecovery, JournalRing, ReplayedEntry, RingSegment, JOURNAL_PAGE_LEN,
+    MAX_ENTRY_LEN,
 };
 use squeezefs::meta_backend::kv::journal_core::AdmissionClass;
 use squeezefs::meta_backend::kv::record::{
     forest_key, guest_forest_slot, inode_key, Record, KIND_INTERIOR, NATIVE_FOREST_SLOT,
-    TREE_ALLOC_RESERVED, TREE_CONTROL, TREE_INODES,
+    TREE_CONTROL, TREE_INODES,
 };
 use squeezefs::meta_backend::kv::superblock::{
     classify_volume, journal_ring_len, ExtentRef, SuperblockV3, VolumeFormat,
@@ -594,7 +594,10 @@ async fn a_segmented_ring_maps_pages_through_its_segment_table_and_replays_acros
     );
     assert_eq!(ring.ring_bytes(), 8 * JOURNAL_PAGE_LEN);
     // Logical page 5 is the second segment's page 1.
-    assert_eq!(ring.page_offset(5), 24 * JOURNAL_PAGE_LEN + JOURNAL_PAGE_LEN);
+    assert_eq!(
+        ring.page_offset(5),
+        24 * JOURNAL_PAGE_LEN + JOURNAL_PAGE_LEN
+    );
     // Six 3000-byte entries: the chain crosses the segment boundary
     // (page 4 starts at logical 4 × 4072 = 16,288; entry 6 ends past it).
     let mut end = 0;
@@ -609,7 +612,10 @@ async fn a_segmented_ring_maps_pages_through_its_segment_table_and_replays_acros
     assert_eq!(recovery.dropped_torn, 0);
     assert_eq!(rec_ring.core().head(), end);
     for (i, e) in recovery.entries.iter().enumerate() {
-        assert_eq!(e.records, sized_records(i as u64 + 1, 3000, i as u8 + 1, e.seq));
+        assert_eq!(
+            e.records,
+            sized_records(i as u64 + 1, 3000, i as u8 + 1, e.seq)
+        );
     }
     // The gap between the segments was never written.
     let gap = squeezefs::uring_fs::read_at(f.path(), 8 * JOURNAL_PAGE_LEN, 16 * 4096)
@@ -647,13 +653,19 @@ async fn a_solo_ring_is_one_segment_and_growth_needs_a_drained_ring() {
     // Not drained: in-window records exist ⇒ refused.
     let ring2 = JournalRing::new(f.path(), 4096, 4, 0);
     append_sized(&ring2, 1, 500, 0xA2).await;
-    assert!(ring2.grown_with(extra).is_err(), "an undrained ring refuses to grow");
+    assert!(
+        ring2.grown_with(extra).is_err(),
+        "an undrained ring refuses to grow"
+    );
     // An open reservation ⇒ refused.
     let ring3 = JournalRing::new(f.path(), 4096, 4, 0);
     let adm = ring3.core().try_admit(500, AdmissionClass::User).unwrap();
     let res = ring3.reserve_registered(adm);
     ring3.advance_reusable_upto(res.end());
-    assert!(ring3.grown_with(extra).is_err(), "an open reservation refuses growth");
+    assert!(
+        ring3.grown_with(extra).is_err(),
+        "an open reservation refuses growth"
+    );
     ring3.complete(&res);
     // Past the segment bound ⇒ refused.
     let mut many = JournalRing::new(f.path(), 4096, 1, 0);
@@ -682,7 +694,11 @@ fn sym_ring_kb_is_a_registered_int_knob_with_the_derived_range() {
         .expect("ENG-10: every knob a site reads is registered");
     match knob.kind {
         squeezefs::env_knobs::Kind::Int { lo, hi } => {
-            assert_eq!(lo, (SYM_RING_FLOOR_BYTES / 1024) as i128, "the floor in KiB");
+            assert_eq!(
+                lo,
+                (SYM_RING_FLOOR_BYTES / 1024) as i128,
+                "the floor in KiB"
+            );
             // The ceiling is per volume (the solo ring's derivation); the
             // registry's bound is the derivation's own ceiling — 32 MiB.
             assert_eq!(hi, (journal_ring_len(u64::MAX) / 1024) as i128);
@@ -729,7 +745,13 @@ fn appender_violations_key_lease_extent_are_each_detected() {
 
     // A clean partition: ring 0 writes native + slot 6, ring 1 writes slot 5.
     let clean = vec![
-        (0u32, recovery(vec![(0, vec![content(NATIVE_FOREST_SLOT, 9)]), (100, vec![content(s6, 1)])])),
+        (
+            0u32,
+            recovery(vec![
+                (0, vec![content(NATIVE_FOREST_SLOT, 9)]),
+                (100, vec![content(s6, 1)]),
+            ]),
+        ),
         (1u32, recovery(vec![(0, vec![content(s5, 1)])])),
     ];
     assert!(detect_appender_violations(&clean, &leases).is_empty());
@@ -741,7 +763,13 @@ fn appender_violations_key_lease_extent_are_each_detected() {
     ];
     let v = detect_appender_violations(&key_dup, &leases);
     assert!(
-        v.iter().any(|x| matches!(x, AppenderViolation::Key { appenders: (0, 1), .. })),
+        v.iter().any(|x| matches!(
+            x,
+            AppenderViolation::Key {
+                appenders: (0, 1),
+                ..
+            }
+        )),
         "{v:?}"
     );
     // Lease: ring 1 writes a slot it does not lease; ring 0 writes a slot
@@ -776,8 +804,12 @@ fn appender_violations_key_lease_extent_are_each_detected() {
         .filter(|x| matches!(x, AppenderViolation::Lease { .. }))
         .count();
     assert_eq!(lease_hits, 4, "{v:?}");
-    assert!(v.iter().any(|x| matches!(x, AppenderViolation::Lease { appender_id: 0, .. })));
-    assert!(v.iter().any(|x| matches!(x, AppenderViolation::Lease { appender_id: 1, .. })));
+    assert!(v
+        .iter()
+        .any(|x| matches!(x, AppenderViolation::Lease { appender_id: 0, .. })));
+    assert!(v
+        .iter()
+        .any(|x| matches!(x, AppenderViolation::Lease { appender_id: 1, .. })));
     // Extent: an allocator delta in a ring whose appender holds no grant.
     let alloc = squeezefs::meta_backend::kv::alloc_ext::alloc_record(77, 0);
     let extent_bad = vec![
@@ -785,7 +817,11 @@ fn appender_violations_key_lease_extent_are_each_detected() {
         (1u32, recovery(vec![(0, vec![alloc])])),
     ];
     let v = detect_appender_violations(&extent_bad, &leases);
-    assert_eq!(v.len(), 1, "the manager's delta is legal, appender 1's is not: {v:?}");
+    assert_eq!(
+        v.len(),
+        1,
+        "the manager's delta is legal, appender 1's is not: {v:?}"
+    );
     assert!(matches!(
         v[0],
         AppenderViolation::Extent {

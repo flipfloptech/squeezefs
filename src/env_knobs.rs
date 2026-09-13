@@ -98,6 +98,14 @@ const fn int(lo: i128, hi: i128) -> Kind {
 /// Milliseconds ceiling used by the timing knobs: 10 minutes. Past that a
 /// "timeout" is a hang with extra steps.
 const MS_MAX: i128 = 600_000;
+
+/// `SQUEEZEFS_SYM_RING_KB`'s range in KiB: the per-appender ring floor
+/// (`appender::SYM_RING_FLOOR_BYTES`) to the solo ring derivation's
+/// ceiling (`superblock::JOURNAL_RING_MAX`) — tie-tested against both.
+const SYM_RING_KB_MIN: i128 =
+    (crate::meta_backend::kv::appender::SYM_RING_FLOOR_BYTES / 1024) as i128;
+const SYM_RING_KB_MAX: i128 =
+    (crate::meta_backend::kv::superblock::JOURNAL_RING_MAX / 1024) as i128;
 /// A byte-count ceiling: 1 TiB. Nothing here is legitimately larger, and
 /// past it the value is a units mistake (bytes given where MiB was meant).
 const BYTES_MAX: i128 = 1 << 40;
@@ -380,6 +388,8 @@ pub static KNOBS: &[Knob] = &[
     k("SQUEEZEFS_TEST_STAMP_BLOCK_REFS", Kind::Bool, "0", "Test seam: stamp incompat bit 9 (durable block refcounts) at format, so a suite can point the write-path fixtures at the durable ledger IN ISOLATION on a single-writer-class format and let the §6.2-item-1 oracle grade them. Never set in production — the default format carries the bit anyway since the rung-10b Phase-B flip; only `--single-writer` formats omit it."),
     k("SQUEEZEFS_TEST_STAMP_WRITER_SCOPE", Kind::Bool, "0", "Test seam: stamp incompat bit 10 (writer-scoped staging — §6.2 items 8/10) at format, so a suite can drive the scoped-key + node-scoped-stamp path IN ISOLATION on a single-writer-class format. Never set in production — the default format carries the bit anyway since the rung-10b Phase-B flip; only `--single-writer` formats omit it."),
     k("SQUEEZEFS_TEST_STAMP_SYMMETRIC", Kind::Bool, "0", "Test seam: stamp incompat bit 17 (the slot-tree FOREST — docs/design-symmetric-metadata.md §7.1) at format, so the forest suites can build and mount forest volumes before `format --symmetric` / `volume enable-symmetric` exist (PR 11). The ONLY way a volume carries bit 17 until then; never set in production."),
+    k("SQUEEZEFS_SYM_RING_KB", int(SYM_RING_KB_MIN, SYM_RING_KB_MAX), "derived", "The per-appender journal ring size, KiB, on a symmetric-forest (bit 17) volume — the ring an appender ≥ 1 joins with (design-symmetric-metadata §1.6 'Per-appender ring', §6.1). DERIVED default `clamp(2 × ewma_commit_bytes/s × CHECKPOINT_MAX_AGE, 512 KiB, volume/64)`: two checkpoint ages of the appender's measured commit stream, never below the admissibility floor (the §4.4 pt 5 checkpoint reserve + one 128 KiB max entry, rounded to a power of two — `appender::SYM_RING_FLOOR_BYTES`), never above the solo ring's own derivation; a fresh join has no EWMA and takes the floor, growth on `journal_full_stalls` (≤ 8 segments) carries a busy appender toward the ceiling. Explicit wins verbatim (clamped to the VOLUME's ceiling, logged). Range = the floor in KiB to the solo derivation's 32 MiB ceiling. Appender 0's ring is the format-time fixed extent and is not sized by this knob."),
+    k("SQUEEZEFS_TEST_SYM_APPENDER_SLOTS", Kind::Harness, "-", "Test seam (PR 2): the DECLARED static appender partition of a forest volume — `<id>:<forest slot>[,<slot>…][;<id>:…]`, ids ≥ 1; every slot not named belongs to appender 0 (the manager). Stands in for the PR-4 slot-lease gate so two appender regions can commit into two rings in one process; never set in production."),
     k("SQUEEZEFS_NODE_ID_FILE", Kind::Str, "none", "Node-identity source file, ahead of /etc/machine-id, /var/lib/dbus/machine-id and /etc/squeezefs/node-id (writer-scoped staging, §6.2 item 10). Also the suites' two-node seam; the file's bytes must be host-stable and reboot-stable."),
     // -- Harness-only variables (suites, rigs, re-exec children) ---------
     k("SQUEEZEFS_TEST_REQUIRE_MOUNT", Kind::Harness, "-", "Turn mount-class skips into failures (TEST-2)."),

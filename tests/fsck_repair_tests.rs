@@ -481,19 +481,66 @@ async fn test_c1_semantic_repair_rebuild_in_place_x3() {
         let ino = create_file(&r.fx, "keep.bin").await;
         let expected = striped_burst(&r.fx, ino, 4).await;
 
-        // VL6a's seed: a dentry-shaped key in the inodes tree.
+        // VL6a's seed: a dentry-shaped key in the inodes tree. On a
+        // forest (review round 3, Issue 20) the ONE codec refuses that
+        // key at the kind-routed insert, so the seed is a raw record in
+        // the native slot tree whose kind byte claims inode but whose
+        // length is a dentry's; fsck's forest C1 walk reads the slot
+        // trees raw and reports it as the same class, repaired the same
+        // way (`rebuild-in-place`), and the gone-check reads it raw.
         let bad_key = squeezefs::meta_backend::kv::record::dentry_key(42, 7, 0);
-        r.fx.meta.volumes[0]
-            .insert_kind(
+        let kv = &r.fx.meta.volumes[0];
+        let mut raw_seed: Option<Vec<u8>> = None;
+        if kv.symmetric_forest() {
+            assert!(
+                kv.insert_kind(
+                    squeezefs::meta_backend::kv::record::TREE_INODES,
+                    &bad_key[..],
+                    bytes::Bytes::from_static(b"bogus"),
+                )
+                .await
+                .is_err(),
+                "round {round}: the forest codec refuses a dentry-length key of kind inode"
+            );
+            let native = kv
+                .all_trees()
+                .into_iter()
+                .find(|t| {
+                    t.forest_slot() == Some(squeezefs::meta_backend::kv::record::NATIVE_FOREST_SLOT)
+                })
+                .expect("the native slot tree exists");
+            let mut raw = Vec::with_capacity(17);
+            raw.extend_from_slice(&42u64.to_be_bytes());
+            raw.push(squeezefs::meta_backend::kv::record::TREE_INODES);
+            raw.extend_from_slice(&7u64.to_be_bytes());
+            native
+                .insert(&raw[..], bytes::Bytes::from_static(b"bogus"))
+                .await
+                .expect("raw slot-tree insert");
+            raw_seed = Some(raw);
+        } else {
+            kv.insert_kind(
                 squeezefs::meta_backend::kv::record::TREE_INODES,
                 &bad_key[..],
                 bytes::Bytes::from_static(b"bogus"),
             )
             .await
             .expect("raw insert");
+        }
 
         let report = run_fsck(&r.fx.ctx(), &online_opts()).await.expect("fsck");
         assert_finding(&report, "C1", "round {round} seed");
+        // The census walked PAST the damaged record: one malformed key
+        // must never truncate the inode walk into a false C2 "leaked"
+        // finding — whose repair would free the live blocks the truncated
+        // census stopped short of (the shape the forest's first raw-key
+        // seed produced when the kind-routed walk failed its whole page).
+        assert!(
+            !report.findings.iter().any(|f| f.class == "C2"),
+            "round {round}: one malformed record produced C2 findings — the census truncated: \
+             {:?}",
+            report.findings
+        );
 
         // Dry run: plan matches the table, nothing mutates.
         let plan = run_repair(&r.fx.ctx(), &report, &dry_run())
@@ -523,13 +570,19 @@ async fn test_c1_semantic_repair_rebuild_in_place_x3() {
             rep.applied
         );
         assert!(rep.counters.quarantined_records >= 1);
-        let gone = r.fx.meta.volumes[0]
-            .lookup_kind(
-                squeezefs::meta_backend::kv::record::TREE_INODES,
-                &bad_key[..],
-            )
-            .await
-            .expect("lookup");
+        let gone = match &raw_seed {
+            Some(raw) => kv
+                .slot_tree_lookup_raw(squeezefs::meta_backend::kv::record::NATIVE_FOREST_SLOT, raw)
+                .await
+                .expect("raw lookup"),
+            None => kv
+                .lookup_kind(
+                    squeezefs::meta_backend::kv::record::TREE_INODES,
+                    &bad_key[..],
+                )
+                .await
+                .expect("lookup"),
+        };
         assert!(gone.is_none(), "round {round}: wrong-tree record removed");
 
         let clean = run_fsck(&r.fx.ctx(), &online_opts()).await.expect("fsck");

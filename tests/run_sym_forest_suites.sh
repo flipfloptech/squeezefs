@@ -12,10 +12,13 @@
 # exactly what review round 1 of PR 1 found by hand (Issues 1-3).
 #
 # The suites listed drive the KV backend directly (format → mount →
-# commit → checkpoint → replay), the durable block-reference ledger, the
-# block-map tree, the leaf merge, fsck's inode plane, the crash matrix and
-# the coherent reader. `sym_forest_tests` itself sets the seam per test
-# and runs once.
+# commit → checkpoint → replay), the tree and node layers, the durable
+# block-reference ledger, the block-map tree, the leaf merge, fsck's
+# detection AND repair classes, the crash matrix, the coherent reader and
+# the per-volume coordinator — every KV-contract suite the harness sweep
+# touched (review round 3, Issue 20: "every existing KV contract" means
+# the list). `sym_forest_tests` itself sets the seam per test and runs
+# once.
 #
 # Usage:
 #   tests/run_sym_forest_suites.sh                 # both legs, the default list
@@ -25,6 +28,8 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 DEFAULT_SUITES=(
+  kv_tree_tests
+  kv_node_tests
   kv_backend_tests
   kv_journal_tests
   kv_partitioned_append_tests
@@ -35,11 +40,14 @@ DEFAULT_SUITES=(
   fsck_tests
   fsck_c9_tests
   fsck_c10_tests
+  fsck_c12_tests
+  fsck_repair_tests
   crash_contract_tests
   crash_kill_tests
   writer_scoped_staging_tests
   readonly_mount_tests
   meta_slot_migration_tests
+  pv_coordinator_tests
 )
 read -r -a SUITES <<<"${SQZ_SYM_SUITES:-${DEFAULT_SUITES[*]}}"
 

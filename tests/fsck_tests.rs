@@ -638,7 +638,9 @@ async fn test_c1_semantic_wrong_tree_record_detected() {
         // door — nothing gets in through the kind-routed insert. The
         // forest face of the seed is a raw record whose kind byte claims
         // inode but whose length is a dentry's: planted straight into the
-        // native slot tree (17 B: ino ‖ kind 1 ‖ 8 stray bytes).
+        // native slot tree (17 B: ino ‖ kind 1 ‖ 8 stray bytes). fsck's
+        // forest C1 walk reads the slot trees RAW and reports it as a
+        // record-level C1 (`C1RawKey`), repairable in place.
         let refused = kv
             .insert_kind(
                 squeezefs::meta_backend::kv::record::TREE_INODES,

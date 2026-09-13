@@ -18,7 +18,10 @@
 # the per-volume coordinator and the scale/liveness rows — every
 # KV-contract suite the harness sweep touched (review round 3, Issue 20:
 # "every existing KV contract" means the list). `sym_forest_tests` itself
-# sets the seam per test and runs once.
+# sets the seam per test and runs once; `sym_appender_tests` (PR 2 — the
+# appender region) formats its region fixtures under the seam itself and
+# rides the list so its flat-layout contracts (no appender set, the
+# untouched sector 0 and ring) run on both legs too.
 #
 # WALL TIME IS A ROW (review round 4, Issue 26): each suite runs under
 # its own timer per leg, and the summary prints `flat`, `stamped` and the
@@ -65,6 +68,7 @@ DEFAULT_SUITES=(
   readonly_mount_tests
   meta_slot_migration_tests
   pv_coordinator_tests
+  sym_appender_tests
 )
 read -r -a SUITES <<<"${SQZ_SYM_SUITES:-${DEFAULT_SUITES[*]}}"
 RATIO_NOTE="${SQZ_SYM_RATIO_NOTE:-2.0}"

@@ -1,48 +1,46 @@
 #!/usr/bin/env bash
-# tests/run_nvmeof_fidelity.sh — the dual-stack NVMe-oF fidelity tier
-# ===================================================================
+# tests/run_nvmeof_fidelity.sh — the kernel-nvmet NVMe-oF fidelity tier
+# ======================================================================
 #
 # The standing real-kernel, ZERO-MOCK acceptance suite for the NVMe-oF
 # target-management program (docs/design-nvmeof-target-management.md §6.8):
-# every leg drives the PRODUCT's own verbs against BOTH real target stacks
-# (SPDK spdk_tgt + kernel nvmet) on the fidelity substrate
-# (tests/nvmeof_target_substrate.sh). Supersedes the ad-hoc root gates that
-# lived under `.agents/spdk-scoping/` (removed from the tree — git history
-# at c615e3a).
+# every leg drives the PRODUCT's own verbs against the real kernel nvmet
+# target — THE target since SPDK was retired (owner ruling R-SYM-8,
+# docs/design-symmetric-metadata.md §5.8.1; the SPDK legs, the stalling
+# JSON-RPC crash-window proxy and the PTPL power-cycle leg left with it) —
+# on the fidelity substrate (tests/nvmeof_target_substrate.sh). Supersedes
+# the ad-hoc root gates that lived under `.agents/spdk-scoping/` (removed
+# from the tree — git history at c615e3a).
 #
 # Usage
 #   sudo tests/run_nvmeof_fidelity.sh quick     # per-PR tier (~10 min)
 #   sudo tests/run_nvmeof_fidelity.sh full      # nightly tier (~45-70 min)
 #
 # quick (per-PR for changes touching src/nvmeof/, reservation.rs, or the
-# guard gate): both-stack product verb round-trips (share -> connect -> IO
-# -> unshare -> residue-free) + ONE guard kill-9 cycle per stack.
+# guard gate): product verb round-trip (share -> connect -> IO -> unshare ->
+# residue-free) + ONE guard kill-9 cycle.
 #
 # full (nightly / program & release gates) adds:
-#   * loud-fail matrix (G3): missing backing, unledgered unshare, --nsid!=1
-#     on nvmet, nvmet --force refusal, broken SQUEEZEFS_SPDK_TGT_BIN
-#     override, dead-RPC runbook message, double target start
-#   * crash-window injection (§6.4 law 6) — SPDK stack: the CLI is SIGKILLED
-#     mid-verb inside three deterministic windows held open by a stalling
-#     JSON-RPC proxy standing in for spdk_tgt's socket (the §6.8-sanctioned
-#     RUN_DIR relocation seam; the product carries NO test seam): pending
-#     intent GC'd, pending intent finalized, removing teardown resumed —
-#     plus the mid-window duplicate-guard refusals. nvmet stack: two REAL
-#     law-6 states produced by kernel-refused mid-verb mutations
-#     (EADDRNOTAVAIL listener bind) — pending finalized (live objects
-#     match), pending garbage-collected after manual partial-residue wipe
+#   * loud-fail matrix (G3): missing backing, unledgered unshare, --nsid!=1,
+#     the deleted SPDK-only flags, the R-SYM-8 retirement refusals
+#     (--target-stack spdk, SQUEEZEFS_NVMEOF_TARGET_STACK=spdk,
+#     SQUEEZEFS_SPDK_TGT_BIN, `target install`) naming nvmet + the re-share
+#     sequence, idempotent target start, target stop refusal
+#   * crash-window injection (§6.4 law 6): two REAL law-6 states produced by
+#     kernel-refused mid-verb mutations (EADDRNOTAVAIL listener bind) —
+#     pending finalized (live objects match), pending garbage-collected
+#     after manual partial-residue wipe
 #   * adopt legs (§6.10 pt 5): pre-rebuild-style configfs adopt (small-int
 #     port id, zero target mutation, zero serving interruption),
-#     adopt-after-simulated-ledger-loss on BOTH stacks, harness-owned
-#     refusal against the fidelity NQN marker itself
-#   * PR/PTPL matrix (pr-matrix.sh productized): RESCAP, register/acquire,
-#     cross-host fence (EBADE class), preempt, PTPL across a product-verb
-#     target power cycle (spdk); register/fence/preempt on nvmet
-#   * target-restart persistence (G2), both stacks: SPDK share -> mount ->
-#     SIGKILL spdk_tgt -> `target start` (load_config) -> IO resumes with
-#     the reservation intact (PTPL; fenced=0, pr_reacquires=0); nvmet
-#     configfs wipe -> `restore` -> same identity re-presented -> the
-#     connected initiator reattaches without operator action
+#     adopt-after-simulated-ledger-loss, harness-owned refusal against the
+#     fidelity NQN marker itself
+#   * PR matrix (pr-matrix.sh productized): RESCAP, register/acquire,
+#     cross-host fence (EBADE class), preempt, registration persistence
+#     across an initiator disconnect (no PTPL claims — nvmet ptpls=0 by
+#     design; the §6.7 errno contract is what this asserts)
+#   * target-restart persistence (G2): configfs wipe -> `restore` -> the
+#     same identity re-presented -> the connected initiator reattaches
+#     without operator action
 #   * soft-RoCE plumbing leg (rdma_rxe; user decision, Resolved Questions
 #     #5): kernel-initiator NVMe/RDMA connect + IO round-trip against an
 #     rxe listener on the PRODUCT-shared nvmet subsystem — plumbing
@@ -50,18 +48,17 @@
 #     no guard or perf claims ride it. The rdma listener is HARNESS-built:
 #     the product's listener plumbing cannot express trtype=rdma yet (a
 #     named residual for PR 7 — see the leg's RESIDUAL lines)
-#   * A/B smoke rows (recorded, NOT ordered): fio rand4k QD32 write+read on
-#     each stack's raw guard-data namespace — instrument: fio io_uring
-#     O_DIRECT (per-release ordered A/B belongs to PR 7's bench rerun)
-#   * guard matrix kill-9 x10 per stack (S1 ladder; the multi-run
-#     discipline applies — any fix restarts the count from zero) + the
-#     SPDK PTPL power-cycle leg (tests/guard_smoke.sh)
+#   * A/B smoke row (recorded, NOT ordered): fio rand4k QD32 write+read on
+#     the raw guard-data namespace — instrument: fio io_uring O_DIRECT
+#     (per-release ordered rows belong to the bench rerun)
+#   * guard matrix kill-9 x10 (S1 ladder; the multi-run discipline applies
+#     — any fix restarts the count from zero) (tests/guard_smoke.sh)
 #   * teardown-to-zero-residue proof (substrate before/after snapshot diff
 #     empty — counted as a leg)
 #
 # Cadence mapping: AGENTS.md "Test tiering" table (quick = per-PR row,
 # full = nightly row). Requires: root (re-execs via sudo), nvme-cli, jq,
-# python3 (crash-window proxy), fio (A/B smoke; loud SKIP if absent).
+# fio (A/B smoke; loud SKIP if absent).
 # Artifacts: $FIDELI_STATE/legs/*.txt + fidelity-<mode>.log (kept until the
 # next substrate create).
 
@@ -314,87 +311,16 @@ leg_roundtrip_nvmet() {
     fi
 }
 
-leg_roundtrip_spdk() {
-    local out="$STATE/legs/rt-spdk.txt" nqn zb uuid rec dev port=4611
-    nqn="nqn.2026-07.io.squeezefs:fideli-rt-spdk"
-    zb=$("$SUBSTRATE" mkzram $((2 * 1024 * 1024 * 1024)) rt-spdk)
-
-    if ! "$FIDELI_BIN" nvmeof share "$zb" --ip 127.0.0.1 --port "$port" --subnqn "$nqn" > "$out" 2>&1; then
-        bad "share (default stack): $(tail -3 "$out")"
-        return
-    fi
-    record "share=$nqn"
-    if grep -q "spdk stack" "$out"; then
-        ok "share rode the DEFAULT spdk stack"
-    else
-        bad "default stack"
-    fi
-    uuid=$(jq -r ".shares[] | select(.subnqn==\"$nqn\") | .ns_uuid" "$SQUEEZEFS_NVMEOF_STATE_DIR/shares.json")
-    rec=$(jq -c ".shares[] | select(.subnqn==\"$nqn\")" "$SQUEEZEFS_NVMEOF_STATE_DIR/shares.json")
-    if echo "$rec" | jq -e ".state==\"active\" and .stack==\"spdk\" and .nsid==1 and .ns_uuid!=null \
-        and .bdev_name!=null and .ptpl_file==\"spdk/ptpl/$uuid.json\" and .loop_device==null" >/dev/null; then
-        ok "ledger record pins the §6.4 SPDK shape (nsid=1, uuid, ptpl, bdev)"
-    else
-        bad "ledger record shape: $rec"
-    fi
-    if grep -q "$nqn" "$SQUEEZEFS_NVMEOF_STATE_DIR/spdk/tgt-config.json" &&
-        grep -q "$uuid" "$SQUEEZEFS_NVMEOF_STATE_DIR/spdk/tgt-config.json"; then
-        ok "tgt-config.json (save_config) captured subsystem + pinned uuid"
-    else
-        bad "tgt-config after share"
-    fi
-    # Read-only live-identity assert (rpc.py is an assertion instrument;
-    # every mutation stays product-verb).
-    if [ -n "$FIDELI_RPCPY" ]; then
-        "$FIDELI_RPCPY" -s "$SQUEEZEFS_NVMEOF_RUN_DIR/spdk.sock" nvmf_get_subsystems \
-            > "$STATE/legs/rt-spdk-live.json" 2>/dev/null
-        if jq -e ".[] | select(.nqn==\"$nqn\") | .namespaces[0] |
-                (.nsid==1 and ((.uuid|ascii_downcase)==(\"$uuid\"|ascii_downcase)))" \
-            "$STATE/legs/rt-spdk-live.json" >/dev/null; then
-            ok "live target serves nsid 1 under the pinned ns UUID"
-        else
-            bad "live namespace identity"
-        fi
-    fi
-
-    "$FIDELI_BIN" nvmeof connect --ip 127.0.0.1 --port "$port" --subnqn "$nqn" >> "$out" 2>&1
-    record "connected=$nqn"
-    dev=$(finddev "$nqn") || { bad "no initiator device"; return; }
-    if io_roundtrip "$dev" 64; then
-        ok "64 MiB O_DIRECT round-trip (spdk)"
-    else
-        bad "spdk IO md5"
-    fi
-
-    "$FIDELI_BIN" nvmeof disconnect "$nqn" >> "$out" 2>&1
-    sleep 1
-    if "$FIDELI_BIN" nvmeof unshare "$nqn" >> "$out" 2>&1; then
-        ok "unshare"
-    else
-        bad "unshare"
-    fi
-    if grep -q "$nqn" "$SQUEEZEFS_NVMEOF_STATE_DIR/spdk/tgt-config.json"; then
-        bad "tgt-config still carries the unshared subsystem (resurrection hazard)"
-    else
-        ok "tgt-config no longer describes the share (resurrection law)"
-    fi
-    if [ -z "$(ledger_state_of "$nqn")" ]; then
-        ok "ledger clean"
-    else
-        bad "ledger residue"
-    fi
-}
-
 # ===========================================================================
 # Loud-fail matrix (G3 — full)
 # ===========================================================================
 leg_loudfail() {
-    local out rc fake_run
+    local out rc flag
     out=$("$FIDELI_BIN" nvmeof share "$STATE/definitely-missing.img" --ip 127.0.0.1 \
         --port 4650 --target-stack nvmet 2>&1)
     rc=$?
     if [ "$rc" -ne 0 ] && echo "$out" | grep -q "does not exist" && echo "$out" | grep -q -- "--create-size"; then
-        ok "missing backing refuses loud, names --create-size (nvmet)"
+        ok "missing backing refuses loud, names --create-size (explicit nvmet)"
     else
         bad "missing-backing refusal (nvmet): $out"
     fi
@@ -407,9 +333,9 @@ leg_loudfail() {
     out=$("$FIDELI_BIN" nvmeof share "$STATE/definitely-missing.img" --ip 127.0.0.1 --port 4650 2>&1)
     rc=$?
     if [ "$rc" -ne 0 ] && echo "$out" | grep -q "does not exist"; then
-        ok "missing backing refuses loud (spdk default)"
+        ok "missing backing refuses loud (default stack = nvmet)"
     else
-        bad "missing-backing refusal (spdk): $out"
+        bad "missing-backing refusal (default): $out"
     fi
 
     out=$("$FIDELI_BIN" nvmeof unshare nqn.2026-07.io.squeezefs:fideli-ghost 2>&1)
@@ -423,7 +349,7 @@ leg_loudfail() {
     out=$("$FIDELI_BIN" nvmeof share /dev/null --ip 127.0.0.1 --target-stack nvmet --nsid 2 2>&1)
     rc=$?
     if [ "$rc" -ne 0 ] && echo "$out" | grep -q "structurally fixed at 1"; then
-        ok "--nsid 2 with nvmet refuses loud"
+        ok "--nsid 2 refuses loud (nvmet index structurally 1)"
     else
         bad "--nsid refusal: $out"
     fi
@@ -432,10 +358,10 @@ leg_loudfail() {
     . "$STATE/devices.env"
     out=$("$FIDELI_BIN" nvmeof unshare "$NQN_GMETA_NVMET" --force 2>&1)
     rc=$?
-    if [ "$rc" -ne 0 ] && echo "$out" | grep -q "never silently ignores"; then
-        ok "--force on an nvmet record refuses (no silent flag-ignore)"
+    if [ "$rc" -ne 0 ] && echo "$out" | grep -q "unexpected argument"; then
+        ok "--force (the deleted SPDK-only flag) dies on clap, never a silent accept"
     else
-        bad "nvmet --force: $out"
+        bad "unshare --force: $out"
     fi
     if [ "$(ledger_state_of "$NQN_GMETA_NVMET")" = "active" ]; then
         ok "refused unshare mutated nothing (guard record still active)"
@@ -443,313 +369,72 @@ leg_loudfail() {
         bad "guard record disturbed"
     fi
 
+    # --- R-SYM-8 retirement refusals: every SPDK-shaped surface refuses
+    # loud naming nvmet + the re-share sequence; nothing falls back.
+    out=$("$FIDELI_BIN" nvmeof share /dev/null --ip 127.0.0.1 --port 4650 --target-stack spdk 2>&1)
+    rc=$?
+    if [ "$rc" -ne 0 ] && echo "$out" | grep -q "RETIRED" && echo "$out" | grep -q "nvmeof unshare" &&
+        echo "$out" | grep -q -- "--target-stack nvmet"; then
+        ok "--target-stack spdk refuses loud naming nvmet + the re-share sequence"
+    else
+        bad "--target-stack spdk refusal: $out"
+    fi
+    out=$(SQUEEZEFS_NVMEOF_TARGET_STACK=spdk "$FIDELI_BIN" nvmeof share /dev/null --ip 127.0.0.1 --port 4650 2>&1)
+    rc=$?
+    if [ "$rc" -ne 0 ] && echo "$out" | grep -q "SQUEEZEFS_NVMEOF_TARGET_STACK" && echo "$out" | grep -q "nvmet"; then
+        ok "SQUEEZEFS_NVMEOF_TARGET_STACK=spdk refuses at startup naming nvmet"
+    else
+        bad "env spdk refusal: $out"
+    fi
     out=$(SQUEEZEFS_SPDK_TGT_BIN=/nonexistent/spdk_tgt "$FIDELI_BIN" nvmeof share /dev/null \
         --ip 127.0.0.1 --port 4650 2>&1)
     rc=$?
-    if [ "$rc" -ne 0 ] && echo "$out" | grep -q "does not exist" &&
-        echo "$out" | grep -q "never falls through" &&
-        echo "$out" | grep -q "never falls back between target stacks"; then
-        ok "broken SQUEEZEFS_SPDK_TGT_BIN override refuses loud + no-fallback law"
+    if [ "$rc" -ne 0 ] && echo "$out" | grep -q "SQUEEZEFS_SPDK_TGT_BIN" && echo "$out" | grep -q "RETIRED"; then
+        ok "SQUEEZEFS_SPDK_TGT_BIN is a retired knob (refuses at startup)"
     else
-        bad "broken-override refusal: $out"
+        bad "retired-knob refusal: $out"
     fi
-
-    # Dead-RPC runbook: a fake RUN_DIR (relocation seam) with the REAL
-    # alive pidfile but no socket — rung 3 fires with the §6.2 message.
-    fake_run="$STATE/fake-run-deadrpc"
-    mkdir -p "$fake_run"
-    cp "$SQUEEZEFS_NVMEOF_RUN_DIR/spdk_tgt.pid" "$fake_run/" 2>/dev/null
-    out=$(SQUEEZEFS_NVMEOF_RUN_DIR="$fake_run" "$FIDELI_BIN" nvmeof share /dev/null \
-        --ip 127.0.0.1 --port 4650 2>&1)
+    out=$("$FIDELI_BIN" nvmeof target install 2>&1)
     rc=$?
-    if [ "$rc" -ne 0 ] && echo "$out" | grep -q "target status" &&
-        echo "$out" | grep -q "target start" &&
-        echo "$out" | grep -q "never falls back between target stacks"; then
-        ok "dead-RPC refusal carries the check/start runbook + no-fallback law"
+    if [ "$rc" -ne 0 ] && echo "$out" | grep -q "was removed" && echo "$out" | grep -q "target setup"; then
+        ok "target install is a retired verb naming its successor"
     else
-        bad "dead-RPC refusal: $out"
+        bad "target install refusal: $out"
     fi
-    rm -rf "$fake_run"
+    for flag in "--core-mask 0x1" "--cores 2" "--dpdk-mem-mb 512" "--accept-version-drift"; do
+        # shellcheck disable=SC2086 # the flag string is intentionally word-split
+        out=$("$FIDELI_BIN" nvmeof target start $flag 2>&1)
+        rc=$?
+        if [ "$rc" -ne 0 ] && echo "$out" | grep -q "unexpected argument"; then
+            ok "deleted SPDK-only flag '$flag' dies on clap"
+        else
+            bad "deleted flag $flag: $out"
+        fi
+    done
 
+    # The kernel target is not a process: a second `target start` is the
+    # idempotent readiness check + ledger replay (guard shares verified
+    # no-op), never an "already running" refusal.
     out=$("$FIDELI_BIN" nvmeof target start 2>&1)
     rc=$?
-    if [ "$rc" -ne 0 ] && echo "$out" | grep -q "already running"; then
-        ok "second target start refuses (already running)"
+    if [ "$rc" -eq 0 ] && echo "$out" | grep -q "verified no-op"; then
+        ok "second target start is idempotent (ledger replay: verified no-ops)"
     else
-        bad "already-running: $out"
+        bad "idempotent target start: $out"
+    fi
+    out=$("$FIDELI_BIN" nvmeof target stop 2>&1)
+    rc=$?
+    if [ "$rc" -ne 0 ] && echo "$out" | grep -q "not a process"; then
+        ok "target stop refuses (the kernel target is not a process)"
+    else
+        bad "target stop: $out"
     fi
 
     if "$FIDELI_BIN" nvmeof target status --json 2>/dev/null |
-        jq -e '.rpc.live == true and .rpc.drift == false' >/dev/null; then
-        ok "target status reports rpc.live + drift=false (report-only rung)"
+        jq -e '.modules_present == true and .configfs_mounted == true and .subsystems >= 2' >/dev/null; then
+        ok "target status reports modules + configfs + the guard subsystems"
     else
-        bad "status drift shape"
-    fi
-}
-
-# ===========================================================================
-# Crash-window injection — SPDK stack (§6.4 law 6; full)
-#
-# Mechanism (stated per the design's env-seam line, §6.8): the product has
-# NO test seam. SQUEEZEFS_NVMEOF_RUN_DIR — a sanctioned relocation seam —
-# points ONE injected CLI invocation at a stalling JSON-RPC proxy that
-# forwards every call verbatim to the real spdk_tgt socket but withholds
-# ONE configured method, holding the verb parked mid-window until the
-# harness SIGKILLs it (a real crash, deterministic by construction: the
-# marker file appears only after the withheld request was received). The
-# RPC client v2 opens ONE connection per call (src/nvmeof/spdk/rpc.rs),
-# so per-connection first-read inspection sees every method.
-# ===========================================================================
-write_stall_proxy() {
-    cat > "$STATE/fideli-rpc-stall.py" <<'EOF'
-#!/usr/bin/env python3
-# fideli-rpc-stall — stalling JSON-RPC unix-socket proxy (crash-window rig).
-# argv: LISTEN_SOCK REAL_SOCK STALL_METHOD MARKER_FILE
-import socket
-import sys
-import threading
-
-listen, real, stall, marker = sys.argv[1:5]
-needle = ('"method":"%s"' % stall).encode()
-srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-srv.bind(listen)
-srv.listen(8)
-
-
-def relay(a, b):
-    try:
-        while True:
-            d = a.recv(65536)
-            if not d:
-                break
-            b.sendall(d)
-    except OSError:
-        pass
-    finally:
-        try:
-            b.shutdown(socket.SHUT_WR)
-        except OSError:
-            pass
-
-
-while True:
-    c, _ = srv.accept()
-    c.settimeout(60)
-    try:
-        first = c.recv(65536)
-    except OSError:
-        c.close()
-        continue
-    if not first:
-        c.close()
-        continue
-    if needle in first:
-        # The window is open: the verb sits parked in its response read.
-        open(marker, "w").close()
-        threading.Event().wait()  # hold forever; the harness kills us
-    r = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    r.settimeout(60)
-    r.connect(real)
-    r.sendall(first)
-    threading.Thread(target=relay, args=(c, r), daemon=True).start()
-    relay(r, c)
-    for s in (c, r):
-        try:
-            s.close()
-        except OSError:
-            pass
-EOF
-}
-
-# run_windowed_verb STALL_METHOD OUT_FILE VERB-ARGS...
-# Runs `squeezefs nvmeof VERB-ARGS` against the stalling proxy, SIGKILLs it
-# once the window opens. Returns 0 when the kill landed inside the window.
-run_windowed_verb() {
-    local stall=$1 out=$2 fake_run marker proxy_pid cli_pid
-    shift 2
-    fake_run="$STATE/fake-run-window"
-    marker="$fake_run/window-entered"
-    rm -rf "$fake_run"
-    mkdir -p "$fake_run"
-    cp "$SQUEEZEFS_NVMEOF_RUN_DIR/spdk_tgt.pid" "$fake_run/" || return 1
-    python3 "$STATE/fideli-rpc-stall.py" "$fake_run/spdk.sock" \
-        "$SQUEEZEFS_NVMEOF_RUN_DIR/spdk.sock" "$stall" "$marker" &
-    proxy_pid=$!
-    for _ in $(seq 1 50); do
-        [ -S "$fake_run/spdk.sock" ] && break
-        sleep 0.1
-    done
-    SQUEEZEFS_NVMEOF_RUN_DIR="$fake_run" "$FIDELI_BIN" nvmeof "$@" > "$out" 2>&1 &
-    cli_pid=$!
-    for _ in $(seq 1 150); do
-        [ -f "$marker" ] && break
-        kill -0 "$cli_pid" 2>/dev/null || break
-        sleep 0.1
-    done
-    if [ ! -f "$marker" ]; then
-        kill -9 "$cli_pid" 2>/dev/null
-        kill -9 "$proxy_pid" 2>/dev/null
-        wait "$cli_pid" 2>/dev/null
-        rm -rf "$fake_run"
-        return 1
-    fi
-    kill -9 "$cli_pid" 2>/dev/null # the crash, inside the held window
-    wait "$cli_pid" 2>/dev/null
-    kill -9 "$proxy_pid" 2>/dev/null
-    wait "$proxy_pid" 2>/dev/null
-    rm -rf "$fake_run"
-    return 0
-}
-
-leg_crash_spdk() {
-    local nqn zb out state rc
-    write_stall_proxy
-
-    # --- W-S1: killed between intent-record and the first target mutation
-    # (stall bdev_aio_create) -> pending intent, ZERO live objects -> GC'd.
-    nqn="nqn.2026-07.io.squeezefs:fideli-ws1"
-    zb=$("$SUBSTRATE" mkzram $((512 * 1024 * 1024)) crash-ws1)
-    if run_windowed_verb bdev_aio_create "$STATE/legs/ws1-share.txt" \
-        share "$zb" --ip 127.0.0.1 --port 4631 --subnqn "$nqn"; then
-        ok "W-S1: share SIGKILLed inside the pre-mutation window (bdev_aio_create withheld)"
-    else
-        bad "W-S1: window never opened: $(tail -3 "$STATE/legs/ws1-share.txt")"
-        return
-    fi
-    state=$(ledger_state_of "$nqn")
-    if [ "$state" = "pending" ]; then
-        ok "W-S1: pending intent record survives the crash"
-    else
-        bad "W-S1: ledger state '$state' (want pending)"
-    fi
-    "$FIDELI_BIN" nvmeof list --json 2>/dev/null > "$STATE/legs/ws1-list.json"
-    if jq -e ".shares[] | select(.subnqn==\"$nqn\") | .classification | test(\"pending\")" \
-        "$STATE/legs/ws1-list.json" >/dev/null; then
-        ok "W-S1: list shows the pending intent with the reconciliation action named"
-    else
-        bad "W-S1: list classification"
-    fi
-    out=$("$FIDELI_BIN" nvmeof share "$zb" --ip 127.0.0.1 --port 4650 \
-        --subnqn "${nqn}-dup" 2>&1)
-    rc=$?
-    if [ "$rc" -ne 0 ] && echo "$out" | grep -q "$nqn"; then
-        ok "W-S1: duplicate guard still refuses MID-WINDOW naming the pending holder"
-    else
-        bad "W-S1: mid-window duplicate guard: $out"
-    fi
-    out=$("$FIDELI_BIN" nvmeof restore --target-stack spdk 2>&1)
-    if echo "$out" | grep -q "$nqn: pending intent garbage-collected"; then
-        ok "W-S1: restore GC'd the pending intent LOUDLY (no live objects)"
-    else
-        bad "W-S1: restore: $out"
-    fi
-    if [ -z "$(ledger_state_of "$nqn")" ]; then
-        ok "W-S1: record gone after GC"
-    else
-        bad "W-S1: record residue"
-    fi
-
-    # --- W-S2: killed between the last mutation and finalize. The stall
-    # method is framework_get_subsystems — the FIRST wire call of the
-    # product's save_config aggregation (src/nvmeof/spdk/lifecycle.rs:
-    # save_config = framework_get_subsystems + framework_get_config +
-    # local atomic write; "save_config" itself is never on the wire) —
-    # so the kill lands after apply_share's last mutation, before the
-    # ledger finalize. Pending intent + live objects MATCH -> finalized.
-    nqn="nqn.2026-07.io.squeezefs:fideli-ws2"
-    zb=$("$SUBSTRATE" mkzram $((512 * 1024 * 1024)) crash-ws2)
-    if run_windowed_verb framework_get_subsystems "$STATE/legs/ws2-share.txt" \
-        share "$zb" --ip 127.0.0.1 --port 4632 --subnqn "$nqn"; then
-        ok "W-S2: share SIGKILLed inside the pre-finalize window (framework_get_subsystems withheld)"
-    else
-        bad "W-S2: window never opened"
-        return
-    fi
-    if [ "$(ledger_state_of "$nqn")" = "pending" ]; then
-        ok "W-S2: pending intent survives"
-    else
-        bad "W-S2: ledger state"
-    fi
-    if [ -n "$FIDELI_RPCPY" ]; then
-        if "$FIDELI_RPCPY" -s "$SQUEEZEFS_NVMEOF_RUN_DIR/spdk.sock" nvmf_get_subsystems 2>/dev/null |
-            jq -e ".[] | select(.nqn==\"$nqn\")" >/dev/null; then
-            ok "W-S2: live objects exist (mutations landed before the crash)"
-        else
-            bad "W-S2: live objects missing"
-        fi
-    fi
-    out=$("$FIDELI_BIN" nvmeof share "$zb" --ip 127.0.0.1 --port 4650 --subnqn "${nqn}-dup" 2>&1)
-    rc=$?
-    if [ "$rc" -ne 0 ]; then
-        ok "W-S2: duplicate guard refuses mid-window (live+ledger sources)"
-    else
-        bad "W-S2: mid-window dup guard accepted: $out"
-    fi
-    out=$("$FIDELI_BIN" nvmeof restore --target-stack spdk 2>&1)
-    if echo "$out" | grep -q "$nqn: pending intent finalized" &&
-        echo "$out" | grep -q "config saved"; then
-        ok "W-S2: restore finalized the pending intent AND re-saved the config (§6.4 persistence law)"
-    else
-        bad "W-S2: restore: $out"
-    fi
-    if [ "$(ledger_state_of "$nqn")" = "active" ]; then
-        ok "W-S2: record active after finalize"
-    else
-        bad "W-S2: record state after finalize"
-    fi
-    if grep -q "$nqn" "$SQUEEZEFS_NVMEOF_STATE_DIR/spdk/tgt-config.json"; then
-        ok "W-S2: tgt-config now carries the finalized share"
-    else
-        bad "W-S2: tgt-config"
-    fi
-    if "$FIDELI_BIN" nvmeof unshare "$nqn" > /dev/null 2>&1; then
-        ok "W-S2: unshare clean"
-    else
-        bad "W-S2: unshare"
-    fi
-
-    # --- W-S3: unshare killed between the removing-intent and teardown
-    # (stall the first teardown RPC) -> removing record, objects live ->
-    # restore RESUMES the teardown.
-    nqn="nqn.2026-07.io.squeezefs:fideli-ws3"
-    zb=$("$SUBSTRATE" mkzram $((512 * 1024 * 1024)) crash-ws3)
-    "$FIDELI_BIN" nvmeof share "$zb" --ip 127.0.0.1 --port 4633 --subnqn "$nqn" \
-        > "$STATE/legs/ws3-share.txt" 2>&1 || { bad "W-S3: setup share failed"; return; }
-    if run_windowed_verb nvmf_subsystem_remove_listener "$STATE/legs/ws3-unshare.txt" \
-        unshare "$nqn"; then
-        ok "W-S3: unshare SIGKILLed inside the teardown window (remove_listener withheld)"
-    else
-        bad "W-S3: window never opened"
-        return
-    fi
-    if [ "$(ledger_state_of "$nqn")" = "removing" ]; then
-        ok "W-S3: removing intent survives the crash"
-    else
-        bad "W-S3: ledger state"
-    fi
-    "$FIDELI_BIN" nvmeof list --json 2>/dev/null > "$STATE/legs/ws3-list.json"
-    if jq -e ".shares[] | select(.subnqn==\"$nqn\") | .classification | test(\"removing\")" \
-        "$STATE/legs/ws3-list.json" >/dev/null; then
-        ok "W-S3: list shows the removing intent with the action named"
-    else
-        bad "W-S3: list"
-    fi
-    out=$("$FIDELI_BIN" nvmeof restore --target-stack spdk 2>&1)
-    if echo "$out" | grep -q "$nqn: interrupted teardown resumed" &&
-        echo "$out" | grep -q "config saved"; then
-        ok "W-S3: restore RESUMED the interrupted teardown + re-saved the config"
-    else
-        bad "W-S3: restore: $out"
-    fi
-    if [ -z "$(ledger_state_of "$nqn")" ]; then
-        ok "W-S3: record gone"
-    else
-        bad "W-S3: record residue"
-    fi
-    if grep -q "$nqn" "$SQUEEZEFS_NVMEOF_STATE_DIR/spdk/tgt-config.json"; then
-        bad "W-S3: tgt-config resurrection hazard (still carries the NQN)"
-    else
-        ok "W-S3: tgt-config no longer describes the share (resurrection law)"
+        bad "status shape"
     fi
 }
 
@@ -761,8 +446,7 @@ leg_crash_spdk() {
 # produced for real instead, by a kernel-refused mid-verb mutation: an
 # unassigned TEST-NET-1 listener address makes the port symlink fail
 # EADDRNOTAVAIL mid-apply, abandoning the verb exactly as a crash would —
-# pending intent + whatever objects the crash left. (The literal
-# kill-mid-verb coverage lives in leg_crash_spdk.)
+# pending intent + whatever objects the crash left.
 # ===========================================================================
 leg_crash_nvmet() {
     local nqn zb out rc
@@ -1000,146 +684,63 @@ leg_adopt() {
     fi
     wipe_marked_subsystem "$nqn"
 
-    # --- A2: adopt-after-simulated-ledger-loss, SPDK stack. The ledger is
-    # snapshotted aside so the substrate's guard records survive the leg.
+    # --- A2: adopt-after-simulated-ledger-loss (§6.10 pt 5). The ledger
+    # is snapshotted aside so the substrate's guard records survive the leg.
     cp "$SQUEEZEFS_NVMEOF_STATE_DIR/shares.json" "$STATE/legs/ledger-backup-a2.json" ||
         { bad "A2: ledger backup failed"; return; }
-    nqn="nqn.2026-07.io.squeezefs:share-fidadopt-loss-spdk"
-    zb=$("$SUBSTRATE" mkzram $((1024 * 1024 * 1024)) adopt-loss-spdk)
-    "$FIDELI_BIN" nvmeof share "$zb" --ip 127.0.0.1 --port 4605 --subnqn "$nqn" \
-        > "$STATE/legs/a2-share.txt" 2>&1 || { bad "A2: product share failed"; return; }
-    uuid=$(jq -r ".shares[] | select(.subnqn==\"$nqn\") | .ns_uuid" "$SQUEEZEFS_NVMEOF_STATE_DIR/shares.json")
-    bdev=$(jq -r ".shares[] | select(.subnqn==\"$nqn\") | .bdev_name" "$SQUEEZEFS_NVMEOF_STATE_DIR/shares.json")
-    rm -f "$SQUEEZEFS_NVMEOF_STATE_DIR/shares.json"
-    ok "A2: ledger loss simulated (shares.json deleted; target keeps serving)"
-    if "$FIDELI_BIN" nvmeof list --json 2>/dev/null | jq -e \
-        ".foreign_live[] | select(.subnqn==\"$nqn\" and .stack==\"spdk\")" >/dev/null; then
-        ok "A2: orphaned share shows foreign (stack=spdk)"
-    else
-        bad "A2: foreign list"
-    fi
-    if [ -n "$FIDELI_RPCPY" ]; then
-        "$FIDELI_RPCPY" -s "$SQUEEZEFS_NVMEOF_RUN_DIR/spdk.sock" nvmf_get_subsystems \
-            > "$STATE/legs/a2-live-before.json" 2>/dev/null
-    fi
-    out=$("$FIDELI_BIN" nvmeof adopt "$nqn" 2>&1)
-    rc=$?
-    echo "$out" > "$STATE/legs/a2-adopt.txt"
-    if [ "$rc" -eq 0 ] && echo "$out" | grep -q "ledger-loss" && echo "$out" | grep -q "spdk stack"; then
-        ok "A2: adopt absorbed the orphan (class ledger-loss)"
-    else
-        bad "A2: adopt: $out"
-    fi
-    if [ -n "$FIDELI_RPCPY" ]; then
-        "$FIDELI_RPCPY" -s "$SQUEEZEFS_NVMEOF_RUN_DIR/spdk.sock" nvmf_get_subsystems \
-            > "$STATE/legs/a2-live-after.json" 2>/dev/null
-        if diff -q "$STATE/legs/a2-live-before.json" "$STATE/legs/a2-live-after.json" >/dev/null; then
-            ok "A2: ZERO target mutation (live inventory identical across adopt)"
-        else
-            bad "A2: live inventory changed"
-        fi
-    fi
-    rec=$(jq -c ".shares[] | select(.subnqn==\"$nqn\")" "$SQUEEZEFS_NVMEOF_STATE_DIR/shares.json")
-    if echo "$rec" | jq -e ".state==\"active\" and .stack==\"spdk\" and .nsid==1 \
-        and (.ns_uuid|ascii_downcase)==(\"$uuid\"|ascii_downcase) and .bdev_name==\"$bdev\" \
-        and .adopted_from.class==\"ledger-loss\"" >/dev/null; then
-        ok "A2: record re-binds the live identity (nsid/uuid/bdev + provenance)"
-    else
-        bad "A2: adopted record: $rec"
-    fi
-    if [ -f "$SQUEEZEFS_NVMEOF_STATE_DIR/spdk/ptpl/$uuid.json" ]; then
-        if echo "$rec" | jq -e ".ptpl_file==\"spdk/ptpl/$uuid.json\"" >/dev/null; then
-            ok "A2: surviving state-dir ptpl file re-bound"
-        else
-            bad "A2: ptpl not re-bound"
-        fi
-    else
-        if echo "$rec" | jq -e ".ptpl_file==\"spdk/ptpl/$uuid.json\" or .ptpl_file==null" >/dev/null; then
-            ok "A2: ptpl shape consistent (no PR activity yet)"
-        else
-            bad "A2: ptpl shape: $rec"
-        fi
-    fi
-    if grep -q "$nqn" "$SQUEEZEFS_NVMEOF_STATE_DIR/spdk/tgt-config.json"; then
-        ok "A2: save_config truth capture (tgt-config describes the adopted share)"
-    else
-        bad "A2: tgt-config misses the adopted share"
-    fi
-    cfgmd5a=$(md5sum "$SQUEEZEFS_NVMEOF_STATE_DIR/spdk/tgt-config.json" | awk '{print $1}')
-    out=$("$FIDELI_BIN" nvmeof restore --target-stack spdk 2>&1)
-    cfgmd5b=$(md5sum "$SQUEEZEFS_NVMEOF_STATE_DIR/spdk/tgt-config.json" | awk '{print $1}')
-    if echo "$out" | grep -q "$nqn: already live — verified no-op" && [ "$cfgmd5a" = "$cfgmd5b" ]; then
-        ok "A2: restore verified no-op, tgt-config untouched (no-op skips save)"
-    else
-        bad "A2: restore after adopt: $out"
-    fi
-    if "$FIDELI_BIN" nvmeof unshare "$nqn" >/dev/null 2>&1; then
-        ok "A2: unshare adopted share"
-    else
-        bad "A2: unshare"
-    fi
-    mv "$STATE/legs/ledger-backup-a2.json" "$SQUEEZEFS_NVMEOF_STATE_DIR/shares.json"
-    if "$FIDELI_BIN" nvmeof list --json 2>/dev/null | jq -e \
-        "[.shares[] | select(.classification==\"managed\" and .live==true)] | length >= 4" >/dev/null; then
-        ok "A2: guard records restored from the ledger backup (still live)"
-    else
-        bad "A2: ledger restore"
-    fi
-
-    # --- A3: adopt-after-simulated-ledger-loss, nvmet stack (§6.10 pt 5
-    # names BOTH stacks for this scenario).
-    cp "$SQUEEZEFS_NVMEOF_STATE_DIR/shares.json" "$STATE/legs/ledger-backup-a3.json" ||
-        { bad "A3: ledger backup failed"; return; }
     nqn="nqn.2026-07.io.squeezefs:share-fidadopt-loss-nvmet"
     zb=$("$SUBSTRATE" mkzram $((1024 * 1024 * 1024)) adopt-loss-nvmet)
     # 4539 -> id 54060.
     "$FIDELI_BIN" nvmeof share "$zb" --ip 127.0.0.1 --port 4539 --subnqn "$nqn" \
-        --target-stack nvmet > "$STATE/legs/a3-share.txt" 2>&1 || { bad "A3: product share failed"; return; }
+        --target-stack nvmet > "$STATE/legs/a2-share.txt" 2>&1 || { bad "A2: product share failed"; return; }
     uuid=$(jq -r ".shares[] | select(.subnqn==\"$nqn\") | .ns_uuid" "$SQUEEZEFS_NVMEOF_STATE_DIR/shares.json")
     rm -f "$SQUEEZEFS_NVMEOF_STATE_DIR/shares.json"
     if "$FIDELI_BIN" nvmeof list --json 2>/dev/null | jq -e \
         ".foreign_live[] | select(.subnqn==\"$nqn\" and .stack==\"nvmet\")" >/dev/null; then
-        ok "A3: orphaned nvmet share shows foreign"
+        ok "A2: orphaned nvmet share shows foreign"
     else
-        bad "A3: foreign list"
+        bad "A2: foreign list"
     fi
     out=$("$FIDELI_BIN" nvmeof adopt "$nqn" 2>&1)
     rc=$?
     if [ "$rc" -eq 0 ] && echo "$out" | grep -q "ledger-loss" && echo "$out" | grep -q "nvmet stack"; then
-        ok "A3: adopt absorbed the orphan (class ledger-loss, nvmet)"
+        ok "A2: adopt absorbed the orphan (class ledger-loss, nvmet)"
     else
-        bad "A3: adopt: $out"
+        bad "A2: adopt: $out"
     fi
     rec=$(jq -c ".shares[] | select(.subnqn==\"$nqn\")" "$SQUEEZEFS_NVMEOF_STATE_DIR/shares.json")
     if echo "$rec" | jq -e ".state==\"active\" and .stack==\"nvmet\" \
         and (.ns_uuid|ascii_downcase)==(\"$uuid\"|ascii_downcase) \
         and .listeners[0].nvmet_port_id==54060 \
         and .adopted_from.class==\"ledger-loss\"" >/dev/null; then
-        ok "A3: record re-binds identity + the actual serving port id (54060)"
+        ok "A2: record re-binds identity + the actual serving port id (54060)"
     else
-        bad "A3: adopted record: $rec"
+        bad "A2: adopted record: $rec"
     fi
     out=$("$FIDELI_BIN" nvmeof restore --target-stack nvmet 2>&1)
     if echo "$out" | grep -q "$nqn: already live — verified no-op"; then
-        ok "A3: restore verified no-op"
+        ok "A2: restore verified no-op"
     else
-        bad "A3: restore: $out"
+        bad "A2: restore: $out"
     fi
     if "$FIDELI_BIN" nvmeof unshare "$nqn" >/dev/null 2>&1; then
-        ok "A3: unshare adopted share"
+        ok "A2: unshare adopted share"
     else
-        bad "A3: unshare"
+        bad "A2: unshare"
     fi
     if [ ! -d "$NVMET_CFS/subsystems/$nqn" ] && [ ! -d "$NVMET_CFS/ports/54060" ]; then
-        ok "A3: zero target residue (subsystem + port gone)"
+        ok "A2: zero target residue (subsystem + port gone)"
     else
-        bad "A3: residue"
+        bad "A2: residue"
     fi
-    mv "$STATE/legs/ledger-backup-a3.json" "$SQUEEZEFS_NVMEOF_STATE_DIR/shares.json"
+    mv "$STATE/legs/ledger-backup-a2.json" "$SQUEEZEFS_NVMEOF_STATE_DIR/shares.json"
 }
 
 # ===========================================================================
-# PR/PTPL matrix (pr-matrix.sh productized — full)
+# PR matrix (pr-matrix.sh productized — full). No PTPL claims: kernel nvmet
+# has ptpls=0 by design (reservations do not survive a TARGET restart —
+# the heartbeat re-check law covers it); the §6.7 errno contract is what
+# this asserts, on the ONE target.
 # ===========================================================================
 leg_pr_matrix() {
     local out="$STATE/legs/pr-matrix.txt" nqn zb dev dev2 rescap report key1=0xA11CE key2=0xB0B
@@ -1147,19 +748,18 @@ leg_pr_matrix() {
     local h2nqn="nqn.2014-08.org.nvmexpress:uuid:$h2uuid"
     : > "$out"
 
-    # --- SPDK arm (the PTPL-bearing stack).
-    nqn="nqn.2026-07.io.squeezefs:fideli-prmx-spdk"
-    zb=$("$SUBSTRATE" mkzram $((1024 * 1024 * 1024)) prmx-spdk)
-    "$FIDELI_BIN" nvmeof share "$zb" --ip 127.0.0.1 --port 4580 --subnqn "$nqn" >> "$out" 2>&1 ||
-        { bad "PRMX: spdk share failed"; return; }
+    nqn="nqn.2026-07.io.squeezefs:fideli-prmx-nvmet"
+    zb=$("$SUBSTRATE" mkzram $((1024 * 1024 * 1024)) prmx-nvmet)
+    "$FIDELI_BIN" nvmeof share "$zb" --ip 127.0.0.1 --port 4555 --subnqn "$nqn" \
+        --target-stack nvmet >> "$out" 2>&1 || { bad "PRMX: share failed"; return; }
     record "share=$nqn"
-    "$FIDELI_BIN" nvmeof connect --ip 127.0.0.1 --port 4580 --subnqn "$nqn" >> "$out" 2>&1
+    "$FIDELI_BIN" nvmeof connect --ip 127.0.0.1 --port 4555 --subnqn "$nqn" >> "$out" 2>&1
     record "connected=$nqn"
     dev=$(finddev "$nqn") || { bad "PRMX: no device"; return; }
 
     rescap=$(nvme id-ns "$dev" -o json | jq -r .rescap)
-    if [ $((rescap & 1)) = 1 ] && [ $(((rescap >> 1) & 1)) = 1 ]; then
-        ok "PRMX: RESCAP carries PTPL-capable + Write-Exclusive bits (0x$(printf '%02x' "$rescap"))"
+    if [ $(((rescap >> 1) & 1)) = 1 ]; then
+        ok "PRMX: RESCAP carries the Write-Exclusive bit (0x$(printf '%02x' "$rescap"); PTPL bit $((rescap & 1)) — nvmet has none by design)"
     else
         bad "PRMX: rescap=$rescap"
     fi
@@ -1188,7 +788,7 @@ leg_pr_matrix() {
 
     nvme disconnect -n "$nqn" >> "$out" 2>&1
     sleep 1
-    nvme connect -t tcp -a 127.0.0.1 -s 4580 -n "$nqn" --hostnqn="$h2nqn" --hostid="$h2uuid" >> "$out" 2>&1
+    nvme connect -t tcp -a 127.0.0.1 -s 4555 -n "$nqn" --hostnqn="$h2nqn" --hostid="$h2uuid" >> "$out" 2>&1
     dev2=$(finddev "$nqn") || { bad "PRMX: host2 device"; return; }
     report=$(nvme resv-report "$dev2" --eds -o json 2>/dev/null | jq -r .regctl)
     if [ "$report" = "1" ]; then
@@ -1213,35 +813,6 @@ leg_pr_matrix() {
         bad "PRMX: post-preempt write"
     fi
 
-    # PTPL across a PRODUCT-VERB target power cycle: SIGKILL by OUR
-    # pidfile -> `nvmeof target start` (load_config replays tgt-config).
-    local spid persisted=""
-    spid=$(cat "$SQUEEZEFS_NVMEOF_RUN_DIR/spdk_tgt.pid")
-    kill -9 "$spid"
-    sleep 1
-    if "$FIDELI_BIN" nvmeof target start >> "$out" 2>&1; then
-        ok "PRMX: product 'target start' after target SIGKILL (load_config)"
-    else
-        bad "PRMX: restart"
-    fi
-    record "spdk_pid=$(cat "$SQUEEZEFS_NVMEOF_RUN_DIR/spdk_tgt.pid" 2>/dev/null)"
-    for _ in $(seq 1 60); do
-        report=$(nvme resv-report "$dev2" --eds -o json 2>/dev/null)
-        if [ -n "$report" ]; then
-            if echo "$report" | jq -e ".regctl==1 and .rtype==1 and
-                ([.regctlext[]?.rkey] | index($((key2))))" >/dev/null 2>&1; then
-                persisted=1
-                break
-            fi
-        fi
-        sleep 2
-    done
-    if [ -n "$persisted" ]; then
-        ok "PRMX: reservation SURVIVED the target power cycle (PTPL: holder $key2, rtype 1)"
-    else
-        bad "PRMX: PTPL persistence (report: $(echo "$report" | jq -c '{regctl, rtype}' 2>/dev/null))"
-    fi
-
     {
         nvme resv-release "$dev2" --crkey="$key2" --rtype=1 --rrela=0
         nvme resv-register "$dev2" --crkey="$key2" --rrega=1
@@ -1255,305 +826,15 @@ leg_pr_matrix() {
     nvme disconnect -n "$nqn" >> "$out" 2>&1
     sleep 1
     if "$FIDELI_BIN" nvmeof unshare "$nqn" >> "$out" 2>&1; then
-        ok "PRMX: spdk unshare"
+        ok "PRMX: unshare"
     else
         bad "PRMX: unshare"
-    fi
-
-    # --- nvmet arm: fence + preempt (no PTPL claims — nvmet ptpls=0 by
-    # design; the §6.7 errno contract is what this asserts).
-    nqn="nqn.2026-07.io.squeezefs:fideli-prmx-nvmet"
-    zb=$("$SUBSTRATE" mkzram $((512 * 1024 * 1024)) prmx-nvmet)
-    "$FIDELI_BIN" nvmeof share "$zb" --ip 127.0.0.1 --port 4555 --subnqn "$nqn" \
-        --target-stack nvmet >> "$out" 2>&1 || { bad "PRMX-N: share failed"; return; }
-    record "share=$nqn"
-    "$FIDELI_BIN" nvmeof connect --ip 127.0.0.1 --port 4555 --subnqn "$nqn" >> "$out" 2>&1
-    record "connected=$nqn"
-    dev=$(finddev "$nqn") || { bad "PRMX-N: no device"; return; }
-    nvme resv-register "$dev" --nrkey="$key1" --rrega=0 --iekey --cptpl=3 >> "$out" 2>&1
-    if nvme resv-acquire "$dev" --crkey="$key1" --rtype=1 --racqa=0 >> "$out" 2>&1; then
-        ok "PRMX-N: register + acquire WE on kernel nvmet"
-    else
-        bad "PRMX-N: register/acquire"
-    fi
-    nvme disconnect -n "$nqn" >> "$out" 2>&1
-    sleep 1
-    nvme connect -t tcp -a 127.0.0.1 -s 4555 -n "$nqn" --hostnqn="$h2nqn" --hostid="$h2uuid" >> "$out" 2>&1
-    dev2=$(finddev "$nqn") || { bad "PRMX-N: host2 device"; return; }
-    if dd if=/dev/zero of="$dev2" bs=4096 count=1 oflag=direct conv=notrunc >> "$out" 2>&1; then
-        bad "PRMX-N: non-holder write SUCCEEDED on nvmet"
-    else
-        ok "PRMX-N: non-holder write rejected (fence errno contract holds on nvmet)"
-    fi
-    nvme resv-register "$dev2" --nrkey="$key2" --rrega=0 --iekey --cptpl=3 >> "$out" 2>&1
-    if nvme resv-acquire "$dev2" --crkey="$key2" --rtype=1 --racqa=1 --prkey="$key1" >> "$out" 2>&1; then
-        ok "PRMX-N: preempt on nvmet"
-    else
-        bad "PRMX-N: preempt"
-    fi
-    {
-        nvme resv-release "$dev2" --crkey="$key2" --rtype=1 --rrela=0
-        nvme resv-register "$dev2" --crkey="$key2" --rrega=1
-        nvme disconnect -n "$nqn"
-    } >> "$out" 2>&1
-    sleep 1
-    if "$FIDELI_BIN" nvmeof unshare "$nqn" >> "$out" 2>&1; then
-        ok "PRMX-N: unshare"
-    else
-        bad "PRMX-N: unshare"
     fi
 }
 
 # ===========================================================================
 # Target-restart persistence (G2 — full)
 # ===========================================================================
-leg_g2_spdk() {
-    local out="$STATE/legs/g2-spdk.txt" nqn_m nqn_d zm zd dev_m dev_d mnt dlog md5 md5b uuid
-    local fenced reacq io_ok mode spid dpid ladder mounted reg
-    local fab_base fab_nl fab_reconn_base fab_reconn fab_ctrls fab_ok
-    nqn_m="nqn.2026-07.io.squeezefs:fideli-g2-meta"
-    nqn_d="nqn.2026-07.io.squeezefs:fideli-g2-data"
-    mnt="$STATE/mnt-g2"
-    dlog="$STATE/legs/g2-daemon.log"
-    : > "$out"
-    : > "$dlog"
-    mkdir -p "$mnt"
-    zm=$("$SUBSTRATE" mkzram $((1024 * 1024 * 1024)) g2-meta)
-    zd=$("$SUBSTRATE" mkzram $((2 * 1024 * 1024 * 1024)) g2-data)
-    "$FIDELI_BIN" nvmeof share "$zm" --ip 127.0.0.1 --port 4621 --subnqn "$nqn_m" >> "$out" 2>&1 ||
-        { bad "G2S: share meta"; return; }
-    record "share=$nqn_m"
-    "$FIDELI_BIN" nvmeof share "$zd" --ip 127.0.0.1 --port 4622 --subnqn "$nqn_d" >> "$out" 2>&1 ||
-        { bad "G2S: share data"; return; }
-    record "share=$nqn_d"
-    uuid=$(jq -r ".shares[] | select(.subnqn==\"$nqn_m\") | .ns_uuid" "$SQUEEZEFS_NVMEOF_STATE_DIR/shares.json")
-    "$FIDELI_BIN" nvmeof connect --ip 127.0.0.1 --port 4621 --subnqn "$nqn_m" >> "$out" 2>&1
-    record "connected=$nqn_m"
-    "$FIDELI_BIN" nvmeof connect --ip 127.0.0.1 --port 4622 --subnqn "$nqn_d" >> "$out" 2>&1
-    record "connected=$nqn_d"
-    dev_m=$(finddev "$nqn_m") || { bad "G2S: no meta device"; return; }
-    dev_d=$(finddev "$nqn_d") || { bad "G2S: no data device"; return; }
-
-    "$FIDELI_BIN" format "sqmeta://$dev_m" "sqdata://$dev_d" --force >> "$out" 2>&1 ||
-        { bad "G2S: format"; return; }
-    # Settle udev before mounting: format's write-then-close fires a change
-    # uevent and systemd-udevd holds a BSD flock on the node while probing
-    # (BLOCK_DEVICE_LOCKING). The guard's anonymous-holder arm waits such
-    # claim-less transients out bounded; settling keeps the timing rows
-    # from absorbing that wait (determinism polish, not correctness).
-    udevadm settle --timeout=10 2>/dev/null || true
-    RUST_LOG=info "$FIDELI_BIN" --log-file "$dlog" mount "sqmeta://$dev_m" "$mnt" \
-        --daemon --allow-other >> "$out" 2>&1
-    mounted=""
-    for _ in $(seq 1 60); do
-        awk -v m="$mnt" '$2==m{f=1} END{exit !f}' /proc/mounts && { mounted=1; break; }
-        sleep 0.5
-    done
-    [ -n "$mounted" ] || { bad "G2S: mount did not appear"; return; }
-    sleep 2
-    mode=$(mnt_stat "$mnt" writer_guard_mode)
-    if [ "$mode" = "flock+pr" ]; then
-        ok "G2S: writer_guard_mode=flock+pr on PRODUCT-shared namespaces (G4)"
-    else
-        bad "G2S: guard mode=$mode"
-    fi
-    dd if=/dev/urandom of="$mnt/g2.bin" bs=1M count=16 2>>"$out" && sync
-    md5=$(md5sum "$mnt/g2.bin" | awk '{print $1}')
-    if [ -f "$SQUEEZEFS_NVMEOF_STATE_DIR/spdk/ptpl/$uuid.json" ]; then
-        ok "G2S: ptpl_file materialized (reservation persisted to state dir)"
-    else
-        bad "G2S: ptpl file missing"
-    fi
-
-    # [PR 6] fabric_* baseline (design §6.9): the daemon's sampler beats
-    # every 10 s — poll until it has published a settled view of this
-    # mount's two fabric controllers (meta + data, both live) before we
-    # yank the target. The settled baseline also makes the reconnect
-    # assertion below deterministic: with a live sample banked and a
-    # not-live sample observed in the down window, the post-reattach
-    # not-live->live transition MUST be counted.
-    fab_base=""
-    fab_nl=""
-    for _ in $(seq 1 20); do
-        fab_base=$(mnt_stat "$mnt" fabric_controllers)
-        fab_nl=$(mnt_stat "$mnt" fabric_ctrl_not_live)
-        [ "${fab_base:-0}" -ge 2 ] && [ "${fab_nl:-1}" = "0" ] && break
-        sleep 2
-    done
-    if [ "${fab_base:-0}" -ge 2 ] && [ "${fab_nl:-1}" = "0" ]; then
-        ok "G2S: fabric_* baseline settled (controllers=$fab_base, not_live=0)"
-    else
-        bad "G2S: fabric baseline (controllers=${fab_base:-?} not_live=${fab_nl:-?})"
-    fi
-    fab_reconn_base=$(mnt_stat "$mnt" fabric_ctrl_reconnects)
-    fab_reconn_base=${fab_reconn_base:-0}
-    # [PR 6] squeezefs status renders the per-volume Fabric section off
-    # the same sysfs source (both backing devices of this volume are
-    # fabric-attached -> exactly 2 controller identities, NQN/addr/state
-    # rows present).
-    if "$FIDELI_BIN" status "sqmeta://$dev_m" > "$STATE/legs/g2-status.json" 2>>"$out" &&
-        jq -e '.Fabric.fabric_controllers == 2 and .Fabric.fabric_ctrl_not_live == 0 and
-               ([.Fabric.Controllers[].SubsysNqn] | length >= 2)' \
-            "$STATE/legs/g2-status.json" >/dev/null; then
-        ok "G2S: squeezefs status Fabric section renders (2 live controllers, NQN rows)"
-    else
-        bad "G2S: status Fabric section: $(jq -c '.Fabric // "absent"' "$STATE/legs/g2-status.json" 2>/dev/null)"
-    fi
-
-    # THE TARGET-RESTART PERSISTENCE WINDOW (G2). SIGKILL the target under
-    # a live mount, restart through the product, and prove IO resumes with
-    # the reservation intact. PR 6 gauge assertions ride this window
-    # (design §6.9 / PR-plan PR 6 — the harness edit this PR owns).
-    spid=$(cat "$SQUEEZEFS_NVMEOF_RUN_DIR/spdk_tgt.pid")
-    kill -9 "$spid" || { bad "G2S: SIGKILL spdk_tgt"; return; }
-    sleep 1
-    # [PR 6] fabric_ctrl_not_live must RISE while the target is dead:
-    # spdk_tgt's death resets the TCP connections, the kernel initiator
-    # flips both controllers to `connecting`, and the next sampler beat
-    # publishes it. Holding `target start` until the gauge moves keeps
-    # the down window >= one observed not-live sample — the precondition
-    # the settle assertion below builds on. (Sampled-transition law:
-    # without this hold, a bounce faster than the 10 s cadence may
-    # legitimately count zero.)
-    fab_nl=""
-    for _ in $(seq 1 30); do
-        fab_nl=$(mnt_stat "$mnt" fabric_ctrl_not_live)
-        [ "${fab_nl:-0}" -ge 1 ] && break
-        sleep 2
-    done
-    if [ "${fab_nl:-0}" -ge 1 ]; then
-        ok "G2S: fabric_ctrl_not_live rose while the target is dead (not_live=$fab_nl)"
-    else
-        bad "G2S: fabric_ctrl_not_live never rose in the down window"
-    fi
-    if "$FIDELI_BIN" nvmeof target start >> "$out" 2>&1 &&
-        grep -q "load_config applied" "$out"; then
-        ok "G2S: target start after SIGKILL replayed the SPDK source of truth"
-    else
-        bad "G2S: restart: $(tail -3 "$out")"
-    fi
-    record "spdk_pid=$(cat "$SQUEEZEFS_NVMEOF_RUN_DIR/spdk_tgt.pid" 2>/dev/null)"
-    if [ -n "$FIDELI_RPCPY" ]; then
-        "$FIDELI_RPCPY" -s "$SQUEEZEFS_NVMEOF_RUN_DIR/spdk.sock" nvmf_get_subsystems \
-            > "$STATE/legs/g2-live.json" 2>/dev/null
-        if jq -e ".[] | select(.nqn==\"$nqn_m\") | .namespaces[0] |
-                ((.uuid|ascii_downcase)==(\"$uuid\"|ascii_downcase))" "$STATE/legs/g2-live.json" >/dev/null; then
-            ok "G2S: share reappeared under the SAME NQN/nsid/UUID"
-        else
-            bad "G2S: post-restart identity"
-        fi
-    fi
-    io_ok=""
-    for _ in $(seq 1 60); do
-        dd if="$mnt/g2.bin" of=/dev/null bs=1M count=1 2>/dev/null && { io_ok=1; break; }
-        sleep 2
-    done
-    sleep 12 # one heartbeat re-check past reattach
-    md5b=$(md5sum "$mnt/g2.bin" 2>/dev/null | awk '{print $1}')
-    fenced=$(mnt_stat "$mnt" writer_guard_fenced)
-    reacq=$(mnt_stat "$mnt" writer_guard_pr_reacquires)
-    if [ -n "$io_ok" ] && [ "$md5b" = "$md5" ]; then
-        ok "G2S: IO RESUMED through the bounce without operator action (data intact)"
-    else
-        bad "G2S: IO resume (ok=${io_ok:-no} md5=$md5b)"
-    fi
-    if [ "${fenced:-1}" = "0" ] && [ "${reacq:-1}" = "0" ]; then
-        ok "G2S: reservation intact via PTPL (fenced=0, pr_reacquires=0 — §6.7 signal)"
-    else
-        bad "G2S: PTPL survival (fenced=$fenced reacq=$reacq)"
-    fi
-    if dd if=/dev/urandom of="$mnt/g2-post.bin" bs=1M count=4 2>/dev/null && sync; then
-        ok "G2S: post-bounce writes land"
-    else
-        bad "G2S: post-bounce write"
-    fi
-
-    # [PR 6] fabric_* gauges settle across the bounce (design §6.9):
-    # not_live back to 0 and the sampled-transition reconnect counter
-    # incremented — the down window above banked a not-live sample per
-    # controller, so the first post-reattach beat must observe the
-    # not-live->live transition. fabric_controllers stays at its
-    # baseline (same endpoints, reattached — population stable).
-    fab_ok=""
-    fab_reconn=""
-    fab_ctrls=""
-    for _ in $(seq 1 30); do
-        fab_nl=$(mnt_stat "$mnt" fabric_ctrl_not_live)
-        fab_reconn=$(mnt_stat "$mnt" fabric_ctrl_reconnects)
-        fab_ctrls=$(mnt_stat "$mnt" fabric_controllers)
-        [ "${fab_nl:-1}" = "0" ] && [ "${fab_reconn:-0}" -gt "$fab_reconn_base" ] &&
-            { fab_ok=1; break; }
-        sleep 2
-    done
-    if [ -n "$fab_ok" ]; then
-        ok "G2S: fabric gauges settled (not_live=0, reconnects $fab_reconn_base -> $fab_reconn)"
-    else
-        bad "G2S: fabric settle (not_live=${fab_nl:-?} reconnects=${fab_reconn:-?} base=$fab_reconn_base)"
-    fi
-    if [ "${fab_ctrls:-0}" = "$fab_base" ]; then
-        ok "G2S: fabric_controllers stable across the bounce (n=$fab_ctrls)"
-    else
-        bad "G2S: fabric_controllers moved across the bounce ($fab_base -> ${fab_ctrls:-?})"
-    fi
-
-    dpid=$(pgrep -f "squeezefs.*mount sqmeta://$dev_m" | head -1)
-    [ -n "${dpid:-}" ] || { bad "G2S: no daemon pid to kill"; return; }
-    kill -9 "$dpid"
-    sleep 2
-    umount -l "$mnt" 2>/dev/null
-    sleep 1
-    udevadm settle --timeout=10 2>/dev/null || true # (same udev-flock race as above)
-    RUST_LOG=info "$FIDELI_BIN" --log-file "$dlog" mount "sqmeta://$dev_m" "$mnt" \
-        --daemon --allow-other >> "$out" 2>&1
-    mounted=""
-    for _ in $(seq 1 60); do
-        awk -v m="$mnt" '$2==m{f=1} END{exit !f}' /proc/mounts && { mounted=1; break; }
-        sleep 0.5
-    done
-    if [ -n "$mounted" ]; then
-        sleep 2
-        md5b=$(md5sum "$mnt/g2.bin" 2>/dev/null | awk '{print $1}')
-        if [ "$md5b" = "$md5" ]; then
-            ok "G2S: kill-9 -> remount recovered on product shares (S1 ladder path)"
-        else
-            bad "G2S: remount data integrity"
-        fi
-    else
-        bad "G2S: remount did not appear"
-    fi
-    ladder=$(grep -c "register conflicted with our own stale" "$dlog" 2>/dev/null || true)
-    if [ "${ladder:-0}" -ge 1 ]; then
-        ok "G2S: register ladder fired on the spec-strict target (hits=$ladder)"
-    else
-        bad "G2S: ladder never fired"
-    fi
-    if umount "$mnt" >> "$out" 2>&1; then
-        ok "G2S: clean unmount"
-    else
-        bad "G2S: clean unmount"
-    fi
-    sleep 1
-    reg=$(nvme resv-report "$dev_m" --eds -o json 2>/dev/null | jq -r .regctl)
-    if [ "${reg:-x}" = "0" ]; then
-        ok "G2S: zero PR residue after clean unmount"
-    else
-        bad "G2S: PR residue regctl=$reg"
-    fi
-    "$FIDELI_BIN" nvmeof disconnect "$nqn_m" >> "$out" 2>&1
-    "$FIDELI_BIN" nvmeof disconnect "$nqn_d" >> "$out" 2>&1
-    sleep 1
-    if "$FIDELI_BIN" nvmeof unshare "$nqn_m" >> "$out" 2>&1; then
-        ok "G2S: unshare meta"
-    else
-        bad "G2S: unshare meta"
-    fi
-    if "$FIDELI_BIN" nvmeof unshare "$nqn_d" >> "$out" 2>&1; then
-        ok "G2S: unshare data"
-    else
-        bad "G2S: unshare data"
-    fi
-}
-
 leg_g2_nvmet() {
     local out="$STATE/legs/g2-nvmet.txt" nqn zb dev uuid uuid2 md5 md5b io_ok
     nqn="nqn.2026-07.io.squeezefs:fideli-g2-nvmet"
@@ -1633,8 +914,8 @@ leg_g2_nvmet() {
 #
 # Branch taken (stated per the PR-5 tasking): the product's listener
 # plumbing cannot express trtype=rdma yet — src/nvmeof/nvmet.rs pins
-# addr_trtype="tcp" (write_attr at ensure_port), src/nvmeof/spdk/mod.rs
-# creates TCP transports/listeners only, and `share` exposes no --trtype.
+# addr_trtype="tcp" (write_attr at ensure_port) and `share` exposes no
+# --trtype.
 # The leg therefore validates kernel-initiator RDMA connect + IO against
 # a HARNESS-built rxe listener on the PRODUCT-shared subsystem, and
 # prints the product-verb gap as a named residual for PR 7.
@@ -1763,8 +1044,7 @@ leg_softroce() {
         bad "RXE: unshare"
     fi
 
-    log "RXE RESIDUAL (PR 7): product listener plumbing cannot express trtype=rdma — 'nvmeof share' has no --trtype, src/nvmeof/nvmet.rs pins addr_trtype=tcp, src/nvmeof/spdk/mod.rs pins TCP transport/listeners; this leg's rdma listener is harness-built on the product-shared subsystem."
-    log "RXE RESIDUAL (PR 7): the SPDK arm cannot serve RDMA at all — the pinned v26.05 build is configured without --with-rdma (SPDK_CONFIGURE_ARGS: --disable-tests --disable-unit-tests --disable-examples only)."
+    log "RXE RESIDUAL (PR 7): product listener plumbing cannot express trtype=rdma — 'nvmeof share' has no --trtype, src/nvmeof/nvmet.rs pins addr_trtype=tcp; this leg's rdma listener is harness-built on the product-shared subsystem."
     log "RXE NOTE: not representative of real RNIC behavior (software RoCE over the local stack); no guard/perf claims ride this leg."
 }
 
@@ -1781,52 +1061,35 @@ leg_ab_smoke() {
     fi
     # shellcheck disable=SC1091 # generated by nvmeof_target_substrate.sh create
     . "$STATE/devices.env"
-    # Rides the raw guard-data namespaces BEFORE the guard legs (which
-    # re-wipe + reformat them at their leg 0/1). Recorded rows only —
-    # ordered A/B belongs to PR 7's bench rerun. Instrument: fio io_uring,
+    # Rides the raw guard-data namespace BEFORE the guard leg (which
+    # re-wipes + reformats it at its leg 0/1). Recorded rows only —
+    # ordered rows belong to the bench rerun. Instrument: fio io_uring,
     # O_DIRECT, railed to cores 0-15. Engine policy note (2026-08-07,
     # `.benchmarks/2026-08-07-fio-engine-policy.md` rule 5): io_uring is
     # the sanctioned KERNEL-LANE raw-device instrument — these rows never
     # ride the shim (which cannot interpose io_uring) and are labeled
     # raw-ceiling rows, not FUSE-lane numbers.
-    local arm dev row iops
-    for arm in spdk nvmet; do
-        case "$arm" in
-        spdk) dev="$DEV_GDATA_SPDK" ;;
-        nvmet) dev="$DEV_GDATA_NVMET" ;;
-        esac
-        for row in randwrite randread; do
-            fio --name="ab-$arm-$row" --filename="$dev" --rw="$row" --bs=4k --iodepth=32 \
-                --ioengine=io_uring --direct=1 --runtime=10 --time_based --size=1G \
-                --cpus_allowed=0-15 --output-format=json > "$STATE/legs/ab-$arm-$row.json" 2>>"$out"
-            if [ "$row" = randread ]; then
-                iops=$(jq -r '.jobs[0].read.iops | floor' "$STATE/legs/ab-$arm-$row.json" 2>/dev/null)
-            else
-                iops=$(jq -r '.jobs[0].write.iops | floor' "$STATE/legs/ab-$arm-$row.json" 2>/dev/null)
-            fi
-            if [ -n "${iops:-}" ] && [ "${iops:-0}" -gt 0 ]; then
-                ok "AB: $arm rand4k QD32 $row = $iops IOPS (recorded row, fio io_uring O_DIRECT)"
-            else
-                bad "AB: $arm $row produced no IO"
-            fi
-        done
+    local arm=nvmet dev="$DEV_GDATA_NVMET" row iops
+    for row in randwrite randread; do
+        fio --name="ab-$arm-$row" --filename="$dev" --rw="$row" --bs=4k --iodepth=32 \
+            --ioengine=io_uring --direct=1 --runtime=10 --time_based --size=1G \
+            --cpus_allowed=0-15 --output-format=json > "$STATE/legs/ab-$arm-$row.json" 2>>"$out"
+        if [ "$row" = randread ]; then
+            iops=$(jq -r '.jobs[0].read.iops | floor' "$STATE/legs/ab-$arm-$row.json" 2>/dev/null)
+        else
+            iops=$(jq -r '.jobs[0].write.iops | floor' "$STATE/legs/ab-$arm-$row.json" 2>/dev/null)
+        fi
+        if [ -n "${iops:-}" ] && [ "${iops:-0}" -gt 0 ]; then
+            ok "AB: $arm rand4k QD32 $row = $iops IOPS (recorded row, fio io_uring O_DIRECT)"
+        else
+            bad "AB: $arm $row produced no IO"
+        fi
     done
 }
 
 # ===========================================================================
-# Guard legs (tests/guard_smoke.sh — quick: 1 cycle; full: x10 + PTPL)
+# Guard leg (tests/guard_smoke.sh — quick: 1 cycle; full: x10)
 # ===========================================================================
-leg_guard_spdk() {
-    local loops=$1
-    local ptpl_flag=()
-    [ "$MODE" = full ] && ptpl_flag=(--ptpl)
-    if "$GUARD_SMOKE" --stack spdk --loops "$loops" "${ptpl_flag[@]}" >> "$LOG" 2>&1; then
-        ok "guard smoke spdk (loops=$loops${ptpl_flag[0]:+, ptpl}) GREEN — transcript $STATE/guard-smoke-spdk.txt"
-    else
-        bad "guard smoke spdk FAILED — see $STATE/guard-smoke-spdk.txt"
-    fi
-}
-
 leg_guard_nvmet() {
     local loops=$1
     if "$GUARD_SMOKE" --stack nvmet --loops "$loops" >> "$LOG" 2>&1; then
@@ -1841,7 +1104,7 @@ leg_guard_nvmet() {
 # ===========================================================================
 leg_substrate_up() {
     if "$SUBSTRATE" create >> "$LOG" 2>&1; then
-        ok "substrate up (product-verb-driven, both stacks)"
+        ok "substrate up (product-verb-driven, kernel nvmet)"
     else
         bad "substrate create FAILED"
         exit 1
@@ -1877,29 +1140,24 @@ main() {
     trap emergency_teardown EXIT
     local t_start t_end line
     t_start=$(date +%s)
-    log "=== NVMe-oF dual-stack fidelity tier: $MODE @ $(date -Is) ==="
+    log "=== NVMe-oF fidelity tier (kernel nvmet — THE target, R-SYM-8): $MODE @ $(date -Is) ==="
     log "binary: ${FIDELI_SQZ_BIN:-$REPO/target/release/squeezefs} ($(md5sum "${FIDELI_SQZ_BIN:-$REPO/target/release/squeezefs}" | awk '{print $1}'))"
     log "Tctl: $(tctl || echo n/a)°C"
 
     run_leg substrate-up leg_substrate_up
 
     run_leg roundtrip-nvmet leg_roundtrip_nvmet
-    run_leg roundtrip-spdk leg_roundtrip_spdk
 
     if [ "$MODE" = full ]; then
         run_leg loud-fail-matrix leg_loudfail
-        run_leg crash-window-spdk leg_crash_spdk
         run_leg crash-window-nvmet leg_crash_nvmet
         run_leg adopt leg_adopt
         run_leg pr-matrix leg_pr_matrix
-        run_leg g2-persistence-spdk leg_g2_spdk
         run_leg g2-persistence-nvmet leg_g2_nvmet
         run_leg soft-roce leg_softroce
         run_leg ab-smoke leg_ab_smoke
-        run_leg guard-spdk-x10 leg_guard_spdk 10
         run_leg guard-nvmet-x10 leg_guard_nvmet 10
     else
-        run_leg guard-spdk-x1 leg_guard_spdk 1
         run_leg guard-nvmet-x1 leg_guard_nvmet 1
     fi
 

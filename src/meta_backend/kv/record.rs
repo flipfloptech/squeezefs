@@ -125,7 +125,7 @@ pub const FOREST_BLOCK_REF_KEY_LEN: usize = super::block_refs::BLOCK_REF_KEY_LEN
 
 /// Offset of the OWNER ino inside a forest block-reference key (`0x06 ‖
 /// vol_tag(8) ‖ block_idx(8)` precede it).
-const FOREST_BLOCK_REF_OWNER_OFF: usize = 1 + 8 + 8;
+pub const FOREST_BLOCK_REF_OWNER_OFF: usize = 1 + 8 + 8;
 
 /// Whether `kind` names a content family that lives INSIDE a slot tree.
 /// Exactly the five kinds of §5.2.1: never the interior marker, never a

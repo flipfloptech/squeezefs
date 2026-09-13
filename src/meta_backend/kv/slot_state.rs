@@ -60,10 +60,13 @@ pub fn decode_slot_state_key(key: &[u8]) -> Result<ForestSlot, KvError> {
             key.len()
         )));
     }
-    let raw: [u8; 4] = key[SLOT_STATE_KEY_PREFIX.len()..]
-        .try_into()
-        .expect("length checked");
-    Ok(ForestSlot::from_be_bytes(raw))
+    let p = SLOT_STATE_KEY_PREFIX.len();
+    Ok(ForestSlot::from_be_bytes([
+        key[p],
+        key[p + 1],
+        key[p + 2],
+        key[p + 3],
+    ]))
 }
 
 /// One slot's durable state in tree 0.
@@ -79,7 +82,10 @@ pub enum SlotState {
         tails: Vec<(u64, u32)>,
     },
     /// Leased: the lessee's identity — what makes slot resolution a
-    /// control-plane projection (KD-SYM-17, PR 4).
+    /// control-plane projection (KD-SYM-17). No writer until PR 4: it is
+    /// decoded here so a volume a PR-4 binary leased refuses THIS binary
+    /// with the right message ("slot leases are not part of this binary's
+    /// forest") instead of a generic unknown-variant corruption.
     Leased {
         appender_id: u32,
         g: u32,
@@ -88,8 +94,11 @@ pub enum SlotState {
 }
 
 impl SlotState {
-    /// Little-endian image, versioned (see the module docs).
-    pub fn encode(&self) -> Vec<u8> {
+    /// Little-endian image, versioned (see the module docs). Refuses a
+    /// tails vector the `u16` count cannot express (the design's inline
+    /// bound is ≈ 4,000 entries — the KV value cap — so a longer one is a
+    /// caller bug, never truncated).
+    pub fn encode(&self) -> Result<Vec<u8>, KvError> {
         match self {
             SlotState::Unleased {
                 root,
@@ -97,6 +106,12 @@ impl SlotState {
                 g,
                 tails,
             } => {
+                let n = u16::try_from(tails.len()).map_err(|_| {
+                    KvError::Corrupt(format!(
+                        "slot_state record cannot carry {} tails (the count is a u16)",
+                        tails.len()
+                    ))
+                })?;
                 let mut out = Vec::with_capacity(UNLEASED_FIXED_LEN + tails.len() * TAIL_ENTRY_LEN);
                 out.push(SLOT_STATE_VERSION);
                 out.push(VARIANT_UNLEASED);
@@ -104,13 +119,12 @@ impl SlotState {
                 out.extend_from_slice(&root.seq.to_le_bytes());
                 out.extend_from_slice(&cursor.to_le_bytes());
                 out.extend_from_slice(&g.to_le_bytes());
-                let n = u16::try_from(tails.len()).expect("tails are bounded by the KV value cap");
                 out.extend_from_slice(&n.to_le_bytes());
                 for (leaf, tail) in tails {
                     out.extend_from_slice(&leaf.to_le_bytes());
                     out.extend_from_slice(&tail.to_le_bytes());
                 }
-                out
+                Ok(out)
             }
             SlotState::Leased {
                 appender_id,
@@ -123,7 +137,7 @@ impl SlotState {
                 out.extend_from_slice(&appender_id.to_le_bytes());
                 out.extend_from_slice(&g.to_le_bytes());
                 out.extend_from_slice(&page_addr.to_le_bytes());
-                out
+                Ok(out)
             }
         }
     }
@@ -208,10 +222,14 @@ impl SlotState {
 
 #[inline]
 fn le64(v: &[u8], off: usize) -> u64 {
-    u64::from_le_bytes(v[off..off + 8].try_into().expect("length checked"))
+    let mut b = [0u8; 8];
+    b.copy_from_slice(&v[off..off + 8]);
+    u64::from_le_bytes(b)
 }
 
 #[inline]
 fn le32(v: &[u8], off: usize) -> u32 {
-    u32::from_le_bytes(v[off..off + 4].try_into().expect("length checked"))
+    let mut b = [0u8; 4];
+    b.copy_from_slice(&v[off..off + 4]);
+    u32::from_le_bytes(b)
 }

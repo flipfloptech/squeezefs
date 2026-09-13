@@ -1500,14 +1500,17 @@ impl KvMetaBackend {
         // FIRST, so the flush pass below carries tree 0's leaf and this
         // cycle's ledger record covers the publication (the slot-tree
         // root-swap floor's covering record — `publish_forest_roots`).
-        // Reserve exhaustion defers to the next cycle exactly like an
-        // SMO's: the dying floor keeps the tail clamped meanwhile.
+        // Reserve exhaustion defers to the next cycle; the unpublished
+        // roots' floors then clamp this cycle's tail (below), so every
+        // record applied under a root tree 0 does not yet name stays in
+        // the replay window — the flush pass may clear those nodes' own
+        // floors, the roots' floors it cannot.
         match self.publish_forest_roots().await {
             Ok(()) => {}
             Err(KvError::JournalReserveExhausted { needed }) => {
                 log::debug!(
                     "checkpoint: SMO reserve exhausted ({needed} B) publishing forest roots; \
-                     deferred to the next cycle"
+                     deferred to the next cycle (the unpublished roots clamp the tail)"
                 );
             }
             Err(e) => return Err(e),
@@ -1620,7 +1623,11 @@ impl KvMetaBackend {
         let dying_floors = self.node_cache().take_dying_floors();
         let mut tail = h
             .min(self.journal_ring().min_inflight_start())
-            .min(dying_floors);
+            .min(dying_floors)
+            // The forest's clamp: a guest root tree 0 does not yet name
+            // (a deferred or failed publication above) keeps every record
+            // applied under it in the window — `u64::MAX` when none.
+            .min(self.unpublished_root_floor());
         self.node_cache().for_each_node(|n| {
             tail = tail.min(n.dirty_floor());
         });

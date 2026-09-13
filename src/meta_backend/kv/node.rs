@@ -68,25 +68,16 @@ use std::path::Path;
 #[cfg(debug_assertions)]
 pub(crate) fn debug_audit_records(tree_id: u8, level: u8, records: &[Record]) {
     use super::record::{
-        split_forest_key, DentryValue, InodeDelta, InodeValue, RecordKind, XattrValue,
-        KIND_INTERIOR, TREE_BLOCK_MAP, TREE_BLOCK_REFS, TREE_DENTRIES, TREE_INODES, TREE_XATTRS,
+        DentryValue, InodeDelta, InodeValue, RecordKind, XattrValue, TREE_BLOCK_MAP,
+        TREE_BLOCK_REFS, TREE_DENTRIES, TREE_INODES, TREE_XATTRS,
     };
     for r in records {
-        // A slot tree (node-header tree id 0) holds every kind under the
-        // §5.2.1 forest key: audit by the kind the KEY carries, against
-        // the legacy key the per-kind decoders read.
-        let (kind, legacy): (u8, std::borrow::Cow<'_, [u8]>) =
-            if tree_id == KIND_INTERIOR && level == 0 {
-                match split_forest_key(&r.key) {
-                    Ok((k, legacy)) => (k, std::borrow::Cow::Owned(legacy)),
-                    Err(e) => panic!(
-                        "write-side encode audit: slot-tree record key does not frame as a forest \
-                     key (kind byte / length): {e}"
-                    ),
-                }
-            } else {
-                (tree_id, std::borrow::Cow::Borrowed(&r.key[..]))
-            };
+        // `tree_id` is the record KIND and `r.key` its LEGACY key on both
+        // layouts: the backend audits BEFORE it frames a forest key (and
+        // un-frames a re-staged one first), so the per-kind decoders read
+        // exactly the bytes they were written for.
+        let kind = tree_id;
+        let legacy: &[u8] = &r.key;
         let ok = match (level, r.kind) {
             (_, RecordKind::Delete) => true, // tombstones carry no value
             (l, RecordKind::Put) if l > 0 => r.value.len() == 16,

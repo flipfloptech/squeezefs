@@ -80,8 +80,25 @@ const RETRY_BUDGET: usize = 256;
 /// (design §1): the racing records reach the successors only as
 /// `take_overlay()` leftovers whose RAM copies die with the process,
 /// while single-pass replay routes them to the abandoned predecessor.
-/// `0` = off; unarmed cost is one relaxed load per SMO.
+/// `0` = off; unarmed cost is one relaxed load per SMO. A SLOT TREE of a
+/// forest volume (header id 0 — the OFF value) is armed through
+/// [`TEST_SMO_PAUSE_SLOT_TREE`] here plus its slot in
+/// [`TEST_SMO_BUILD_PAUSE_SLOT`] ([`test_smo_build_pause_arm_slot`]).
 pub static TEST_SMO_BUILD_PAUSE_TREE: AtomicU64 = AtomicU64::new(0);
+
+/// The [`TEST_SMO_BUILD_PAUSE_TREE`] value that arms a SLOT TREE — a value
+/// no tree id takes (ids are a nibble, ≤ 15), so it can never alias a
+/// per-kind tree's arm.
+pub const TEST_SMO_PAUSE_SLOT_TREE: u64 = 1 << 8;
+
+/// The forest slot [`TEST_SMO_PAUSE_SLOT_TREE`] targets.
+pub static TEST_SMO_BUILD_PAUSE_SLOT: AtomicU64 = AtomicU64::new(0);
+
+/// Arm the build pause for one SLOT TREE of a forest volume.
+pub fn test_smo_build_pause_arm_slot(slot: super::record::ForestSlot) {
+    TEST_SMO_BUILD_PAUSE_SLOT.store(u64::from(slot), Ordering::SeqCst);
+    TEST_SMO_BUILD_PAUSE_TREE.store(TEST_SMO_PAUSE_SLOT_TREE, Ordering::SeqCst);
+}
 
 /// While an SMO is parked on [`TEST_SMO_BUILD_PAUSE_TREE`], the paused
 /// node's identity — the test reads the key range to target its racing
@@ -117,6 +134,8 @@ pub struct TestSmoPauseInfo {
     pub is_merge: bool,
     pub min_key: Vec<u8>,
     pub max_key: Vec<u8>,
+    /// The parked tree's forest slot (`Some` on a slot tree).
+    pub forest_slot: Option<super::record::ForestSlot>,
 }
 
 /// An interior record value: `(child_addr, child_seq)` (§4.2), 16 B LE.
@@ -372,6 +391,15 @@ pub struct KvTree {
     /// dirty walk can dispatch a tree-id-0 node to its owner. `None` on
     /// every per-kind tree and on tree 0.
     forest_slot: Option<super::record::ForestSlot>,
+    /// The journal position the LIVE root came into force at: the mint's
+    /// head for a fresh tree, the swap's reservation start for every root
+    /// swap since (`0` = the root the tree was OPENED with — durably
+    /// named already). A guest slot tree's root has no durable home until
+    /// tree 0 names it, so until the publication lands the checkpoint
+    /// tail must not pass this position — every record applied under the
+    /// root stays in the replay window (the dying-floor law's covering
+    /// condition, one tree at a time — `SlotTrees::unpublished_root_floor`).
+    root_floor: AtomicU64,
 }
 
 impl std::fmt::Debug for KvTree {
@@ -392,6 +420,11 @@ impl KvTree {
     /// ledger recovery).
     pub(super) fn seq_handle(&self) -> Arc<AtomicU64> {
         Arc::clone(&self.seq)
+    }
+
+    /// [`Self::seq_handle`] borrowed — no refcount traffic.
+    pub(super) fn seq_ref(&self) -> &Arc<AtomicU64> {
+        &self.seq
     }
 
     /// Format a fresh, empty tree: claim one extent (internal class — tree
@@ -416,8 +449,16 @@ impl KvTree {
         ctx: &mut SmoContext,
         slot: super::record::ForestSlot,
         seq: Arc<AtomicU64>,
+        mint_floor: u64,
     ) -> Result<Self, KvError> {
-        Self::create_inner(cache, ctx, super::record::KIND_INTERIOR, seq, Some(slot)).await
+        Self::create_inner(
+            cache,
+            ctx,
+            super::record::KIND_INTERIOR,
+            seq,
+            Some((slot, mint_floor)),
+        )
+        .await
     }
 
     async fn create_inner(
@@ -425,9 +466,18 @@ impl KvTree {
         ctx: &mut SmoContext,
         tree_id: u8,
         seq: Arc<AtomicU64>,
-        forest_slot: Option<super::record::ForestSlot>,
+        slot_tree: Option<(super::record::ForestSlot, u64)>,
     ) -> Result<Self, KvError> {
-        let extent = ctx.alloc.claim_internal()?;
+        let forest_slot = slot_tree.map(|(slot, _)| slot);
+        // A slot tree's extent is USER growth (§4.7 ENOSPC semantics): a
+        // full volume refuses the mint the way it refuses a new leaf, and
+        // the compaction reserve stays intact for the SMOs that return
+        // space. Per-kind trees and tree 0 are format/checkpoint internals.
+        let extent = if forest_slot.is_some() {
+            ctx.alloc.claim_user()?
+        } else {
+            ctx.alloc.claim_internal()?
+        };
         let addr = cache.extent_addr(extent);
         let node_seq = seq.fetch_add(1, Ordering::AcqRel) + 1;
         write_node(
@@ -474,6 +524,7 @@ impl KvTree {
             maintenance: scc::Queue::default(),
             merge_cursor: std::sync::Mutex::new(SweepCursor::default()),
             forest_slot,
+            root_floor: AtomicU64::new(slot_tree.map_or(0, |(_, floor)| floor)),
         })
     }
 
@@ -536,6 +587,7 @@ impl KvTree {
             maintenance: scc::Queue::default(),
             merge_cursor: std::sync::Mutex::new(SweepCursor::default()),
             forest_slot,
+            root_floor: AtomicU64::new(0),
         })
     }
 
@@ -578,6 +630,13 @@ impl KvTree {
         self.forest_slot
     }
 
+    /// The journal position the live root came into force at (see the
+    /// field) — the floor a not-yet-published guest root clamps the
+    /// checkpoint tail to.
+    pub fn root_floor(&self) -> u64 {
+        self.root_floor.load(Ordering::Acquire)
+    }
+
     /// Stamp `node` with this tree's slot (a no-op on per-kind trees) —
     /// called on every node this tree resolves or publishes, so a dirty
     /// tree-id-0 node always names its owner.
@@ -596,6 +655,20 @@ impl KvTree {
     fn owns(&self, node: &CachedNode) -> bool {
         node.tree_id() == self.tree_id
             && (self.forest_slot.is_none() || node.forest_slot() == self.forest_slot)
+    }
+
+    /// The JOURNAL key of one of this tree's interior pointer records: the
+    /// separator itself on a per-kind tree; on a slot tree the separator
+    /// PREFIXED with the slot (`slot: u32 BE ‖ separator`,
+    /// [`super::forest::interior_journal_key`]) — a slot tree's interior
+    /// records carry kind 0, and a separator alone cannot name the tree
+    /// (the rightmost child's is `KEY_SPACE_MAX`, every tree's), so replay
+    /// reads the slot off the prefix and strips it.
+    fn interior_journal_key(&self, separator: &[u8]) -> Vec<u8> {
+        match self.forest_slot {
+            Some(slot) => super::forest::interior_journal_key(slot, separator),
+            None => separator.to_vec(),
+        }
     }
 
     /// The shared node cache.
@@ -1620,7 +1693,7 @@ impl KvTree {
                     recs.push((
                         tag_for(self.tree_id, node.level() + 1),
                         Record::put(
-                            s.max_key().to_vec(),
+                            self.interior_journal_key(s.max_key()),
                             0, // stamped from the reservation inside the window
                             encode_interior_value(s.addr(), s.node_seq()),
                         ),
@@ -1793,6 +1866,7 @@ impl KvTree {
                         Some(r) => (r.addr(), r.node_seq()),
                         None => written[0],
                     };
+                    self.root_floor.store(swap_floor, Ordering::Release);
                     self.root.store(Arc::new(RootPtr { addr, seq }));
                 }
                 (Some(parent), Some(pg)) => {
@@ -2013,6 +2087,21 @@ impl KvTree {
         }))
     }
 
+    /// Whether the build-pause seam targets THIS tree: a per-kind tree by
+    /// its id, a slot tree by [`TEST_SMO_PAUSE_SLOT_TREE`] + its slot. `0`
+    /// is OFF — and the header id of every slot tree, which is why the
+    /// sentinel is tested first (an unarmed seam once parked every
+    /// slot-tree SMO forever).
+    fn test_smo_pause_armed(&self) -> bool {
+        match TEST_SMO_BUILD_PAUSE_TREE.load(Ordering::Relaxed) {
+            0 => false,
+            TEST_SMO_PAUSE_SLOT_TREE => self
+                .forest_slot
+                .is_some_and(|s| u64::from(s) == TEST_SMO_BUILD_PAUSE_SLOT.load(Ordering::Relaxed)),
+            armed => self.forest_slot.is_none() && armed == u64::from(self.tree_id),
+        }
+    }
+
     /// The `TEST_SMO_BUILD_PAUSE_TREE` park (docs/design-smo-replay-
     /// currency.md §6 PR 1): an armed build parks HERE — successor images
     /// fixed on disk, no locks held, no reservation taken. Unarmed cost:
@@ -2025,11 +2114,7 @@ impl KvTree {
         min_key: &[u8],
         max_key: &[u8],
     ) {
-        // `0` is OFF — and also the node-header tree id of every slot
-        // tree (`KIND_INTERIOR`), so the arm check must test the sentinel
-        // first or an unarmed seam parks every slot-tree SMO forever.
-        let armed = TEST_SMO_BUILD_PAUSE_TREE.load(Ordering::Relaxed);
-        if armed == 0 || armed != u64::from(self.tree_id) {
+        if !self.test_smo_pause_armed() {
             return;
         }
         *TEST_SMO_BUILD_PAUSED.lock().expect("seam mutex") = Some(TestSmoPauseInfo {
@@ -2039,14 +2124,11 @@ impl KvTree {
             is_merge,
             min_key: min_key.to_vec(),
             max_key: max_key.to_vec(),
+            forest_slot: self.forest_slot,
         });
-        let still_armed = || {
-            let a = TEST_SMO_BUILD_PAUSE_TREE.load(Ordering::Relaxed);
-            a != 0 && a == u64::from(self.tree_id)
-        };
-        while still_armed() {
+        while self.test_smo_pause_armed() {
             let notified = TEST_SMO_BUILD_NOTIFY.notified();
-            if !still_armed() {
+            if !self.test_smo_pause_armed() {
                 break;
             }
             notified.await;
@@ -2608,12 +2690,15 @@ impl KvTree {
                 (
                     tag,
                     Record::put(
-                        right.max_key().to_vec(),
+                        self.interior_journal_key(right.max_key()),
                         0, // stamped from the reservation inside the window
                         encode_interior_value(dst, dst_seq),
                     ),
                 ),
-                (tag, Record::delete(left.max_key().to_vec(), 0)),
+                (
+                    tag,
+                    Record::delete(self.interior_journal_key(left.max_key()), 0),
+                ),
                 alloc_record(extent, 0),
                 free_record(old_l, retire_tag, 0),
                 free_record(old_r, retire_tag, 0),
@@ -2859,6 +2944,7 @@ impl KvTree {
             // parent floor — clamp the next tail to this swap's position.
             let swap_floor = smo_entry.as_ref().map(|(res, _)| res.start).unwrap_or(0);
             self.cache.note_dying_floor(swap_floor);
+            self.root_floor.store(swap_floor, Ordering::Release);
             // The old root's open delta (separator flips whose only live
             // target IS the child) dies with the object: its records are
             // journaled, and replay routes them into the old image or drops

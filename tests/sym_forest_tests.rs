@@ -511,10 +511,13 @@ fn bit_17_is_the_symmetric_forest_and_is_known_to_this_binary() {
 }
 
 #[test]
-fn the_test_seam_is_a_registered_harness_knob() {
+fn the_test_seam_is_a_registered_bool_knob() {
+    // Its siblings (`TEST_STAMP_BLOCK_REFS` / `TEST_STAMP_WRITER_SCOPE`)
+    // are `Kind::Bool`, so a malformed value refuses the process at
+    // startup instead of silently keeping the default.
     let knob = squeezefs::env_knobs::lookup("SQUEEZEFS_TEST_STAMP_SYMMETRIC")
         .expect("ENG-10: every knob a site reads is registered");
-    assert_eq!(knob.kind, squeezefs::env_knobs::Kind::Harness);
+    assert_eq!(knob.kind, squeezefs::env_knobs::Kind::Bool);
     assert_eq!(knob.default, "0");
 }
 
@@ -539,7 +542,7 @@ fn slot_state_records_round_trip_and_refuse_malformed_images() {
         page_addr: 0xF00D,
     };
     for st in [&unleased, &leased] {
-        let img = st.encode();
+        let img = st.encode().expect("encode");
         assert_eq!(&SlotState::decode(&img).expect("decode"), st);
         // Truncation is corruption, never a default.
         assert!(SlotState::decode(&img[..img.len() - 1]).is_err());
@@ -549,7 +552,7 @@ fn slot_state_records_round_trip_and_refuse_malformed_images() {
         assert!(SlotState::decode(&future).is_err());
     }
     // An unknown variant byte refuses.
-    let mut img = leased.encode();
+    let mut img = leased.encode().expect("encode");
     img[1] = 0x7F;
     assert!(SlotState::decode(&img).is_err());
     assert!(SlotState::decode(&[]).is_err());
@@ -1182,30 +1185,23 @@ async fn a_rightmost_leaf_smo_in_the_window_replays_into_its_own_tree_not_a_phan
         .unwrap()
         .ino;
     let mut inos = Vec::new();
-    let fill = |b: &std::sync::Arc<KvMetaBackend>, dir: u64, lo: u32, hi: u32| async move {
+    async fn fill(b: &KvMetaBackend, dir: u64, lo: u32, hi: u32) -> Vec<u64> {
         let mut out = Vec::new();
         for i in lo..hi {
-            let f = Metadata::create(
-                b.as_ref(),
-                dir,
-                &format!("t{i:04}"),
-                libc::S_IFREG | 0o644,
-                0,
-                0,
-            )
-            .await
-            .unwrap()
-            .ino;
+            let f = Metadata::create(b, dir, &format!("t{i:04}"), libc::S_IFREG | 0o644, 0, 0)
+                .await
+                .unwrap()
+                .ino;
             b.setxattr(f, "user.pad", &vec![0x33; 4000]).await.unwrap();
             out.push(f);
         }
         out
-    };
+    }
     // Round 1: past one 64 KiB leaf → the flush pass splits the root
     // (height 1). Round 2: the new (highest) inos fill the RIGHTMOST leaf,
     // whose compaction journals a pointer record keyed KEY_SPACE_MAX past
     // the cycle's `H` — an interior record IN the replay window.
-    inos.extend(fill(&b, dir, 0, 48).await);
+    inos.extend(fill(b.as_ref(), dir, 0, 48).await);
     b.checkpoint_now().await.unwrap();
     let root_level = b
         .slot_tree_root_level(NATIVE_FOREST_SLOT)
@@ -1215,7 +1211,7 @@ async fn a_rightmost_leaf_smo_in_the_window_replays_into_its_own_tree_not_a_phan
         root_level >= 1,
         "the churn must have grown an interior (got level {root_level})"
     );
-    inos.extend(fill(&b, dir, 48, 72).await);
+    inos.extend(fill(b.as_ref(), dir, 48, 72).await);
     b.checkpoint_now().await.unwrap();
     let live = digest_backend(&b).await.unwrap();
     assert!(
@@ -1285,18 +1281,21 @@ async fn a_deferred_root_publication_keeps_the_unpublished_roots_in_the_window()
     let live = digest_backend(vol).await.unwrap();
     // The seam: EVERY publication attempt answers JournalReserveExhausted
     // until cleared (the background tick must not publish behind the
-    // test's back before the crash).
+    // test's back before the crash). The guard clears it on every exit
+    // path — the seam is process-global.
+    struct DeferSeam;
+    impl Drop for DeferSeam {
+        fn drop(&mut self) {
+            squeezefs::meta_backend::kv::backend::TEST_FOREST_PUBLISH_DEFER
+                .store(0, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+    let seam = DeferSeam;
     squeezefs::meta_backend::kv::backend::TEST_FOREST_PUBLISH_DEFER
         .store(u32::MAX, std::sync::atomic::Ordering::SeqCst);
     vol.checkpoint_now()
         .await
         .expect("a deferred publication is not an error");
-    assert!(
-        squeezefs::meta_backend::kv::backend::TEST_FOREST_PUBLISH_DEFER
-            .load(std::sync::atomic::Ordering::SeqCst)
-            < u32::MAX,
-        "the seam fired"
-    );
     assert_eq!(
         vol.forest_census().unwrap().control_records,
         0,
@@ -1305,8 +1304,7 @@ async fn a_deferred_root_publication_keeps_the_unpublished_roots_in_the_window()
     // Crash-equivalent: barriered, dropped without another checkpoint.
     vol.sync_device().await.unwrap();
     drop(routed);
-    squeezefs::meta_backend::kv::backend::TEST_FOREST_PUBLISH_DEFER
-        .store(0, std::sync::atomic::Ordering::SeqCst);
+    drop(seam);
     let again = open_routed_meta_set(&uris).await.expect("remount");
     let vol = &again.volumes[0];
     assert_eq!(

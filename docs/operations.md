@@ -1644,6 +1644,7 @@ Every knob the tree reads, grouped as the registry groups them (`src/env_knobs.r
 | `SQUEEZEFS_TEST_OVERLAY_BYTES` | bool | `0` | Test seam: force the overlay `Bytes` vehicle on even when `SQUEEZEFS_DEVICE_OVERLAY` is off (in-process suites). |
 | `SQUEEZEFS_TEST_STAMP_BLOCK_REFS` | bool | `0` | Test seam: stamp incompat bit 9 (durable block refcounts) at format on a `--single-writer` base so the ledger can be graded in isolation. Never set in production. |
 | `SQUEEZEFS_TEST_STAMP_WRITER_SCOPE` | bool | `0` | Test seam: stamp incompat bit 10 (writer-scoped staging) at format on a `--single-writer` base. Never set in production. |
+| `SQUEEZEFS_TEST_STAMP_SYMMETRIC` | bool | `0` | Test seam: stamp incompat bit 17 (the slot-tree FOREST — `docs/design-symmetric-metadata.md` §7.1) at format, so the forest suites can build and mount forest volumes before `format --symmetric` / `volume enable-symmetric` exist (PR 11). The ONLY way a volume carries bit 17 until then; never set in production. |
 | `SQUEEZEFS_NODE_ID_FILE` | string | `none` | Node-identity source file, ahead of `/etc/machine-id`, `/var/lib/dbus/machine-id` and `/etc/squeezefs/node-id` (writer-scoped staging); the bytes must be host- and reboot-stable. |
 
 **Harness-only variables (suites, rigs, re-exec children — known to the registry so the name census is complete, deliberately unvalidated: the harness owns its own contract; `-` = no default, the variable is presence- or value-read by the suite that names it)**
@@ -1660,7 +1661,6 @@ Every knob the tree reads, grouped as the registry groups them (`src/env_knobs.r
 | `SQUEEZEFS_TEST_REQUIRE_ALL` | harness | `-` | Promote every skip class to a failure. |
 | `SQUEEZEFS_TEST_REQUIRE_HARDWARE` | harness | `-` | Promote hardware-class skips. |
 | `SQUEEZEFS_TEST_REQUIRE_NON_ROOT` | harness | `-` | Promote non-root-class skips. |
-| `SQUEEZEFS_TEST_STAMP_SYMMETRIC` | harness | `0` | Test seam (bool): stamp incompat bit 17 (the slot-tree FOREST — `docs/design-symmetric-metadata.md` §7.1) at format, so the forest suites can build and mount forest volumes before `format --symmetric` / `volume enable-symmetric` exist (PR 11). The ONLY way a volume carries bit 17 until then; never set in production. |
 | `SQUEEZEFS_TEST_REQUIRE_OPT_IN` | harness | `-` | Promote opt-in-class skips. |
 | `SQUEEZEFS_TEST_REQUIRE_ROOT` | harness | `-` | Promote root-class skips. |
 | `SQUEEZEFS_TEST_REQUIRE_SUDO` | harness | `-` | Promote sudo-class skips. |

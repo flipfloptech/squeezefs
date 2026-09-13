@@ -205,6 +205,15 @@ const JOURNAL_FAILURE_LATCH: u64 = 3;
 /// stall IS the scenario under test, not a coordination primitive).
 pub static TEST_COMMIT_ADMITTED_STALL_MS: AtomicU64 = AtomicU64::new(0);
 
+/// Test seam (design-symmetric-metadata PR 1, review Issue 4): make the
+/// next N tree-0 root publications answer `JournalReserveExhausted` —
+/// the deferral arm a full checkpoint reserve produces — so a suite can
+/// prove a deferred publication keeps every unpublished root's records
+/// in the replay window. `u32::MAX` = defer until cleared; `0` = off
+/// (one relaxed load per publication attempt).
+pub static TEST_FOREST_PUBLISH_DEFER: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(0);
+
 /// Test seam (PR M7 §5.5 D5): hold the conveyor pass at a protocol stage
 /// so arrivals accumulate deterministically (no sleep-based batching in
 /// tests — the hold IS the scenario). `0` = off (one relaxed load per
@@ -806,6 +815,24 @@ enum TreeSet {
         block_refs: bool,
         block_map: AtomicBool,
     },
+}
+
+/// A resolved tree handle: BORROWED from the backend's own fields on a
+/// flat volume (the shipped hot path — no refcount traffic), OWNED on a
+/// forest volume (a lazily minted slot tree lives in the router's map).
+pub(super) enum TreeRef<'a> {
+    Borrowed(&'a KvTree),
+    Owned(Arc<KvTree>),
+}
+
+impl std::ops::Deref for TreeRef<'_> {
+    type Target = KvTree;
+    fn deref(&self) -> &KvTree {
+        match self {
+            TreeRef::Borrowed(t) => t,
+            TreeRef::Owned(t) => t,
+        }
+    }
 }
 
 /// One mounted v3 metadata volume.
@@ -3066,6 +3093,32 @@ impl KvMetaBackend {
         self.forest()?.tree(slot).map(|t| t.root())
     }
 
+    /// The root LEVEL of slot tree `slot` (0 = one leaf; `None` as
+    /// [`Self::slot_tree_root`]).
+    pub async fn slot_tree_root_level(&self, slot: super::record::ForestSlot) -> Option<u8> {
+        let tree = self.forest()?.tree(slot)?;
+        tree.root_level().await.ok()
+    }
+
+    /// Every slot tree's `(slot, live root)` in slot order — the forest
+    /// suites' root census (empty on a flat volume).
+    pub fn forest_roots(&self) -> Vec<(super::record::ForestSlot, RootPtr)> {
+        self.forest()
+            .map(|f| {
+                f.slot_trees()
+                    .into_iter()
+                    .map(|(s, t)| (s, t.root()))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// The tail the newest WRITTEN ledger record names (replay starts
+    /// there) — what a checkpoint's covering argument is checked against.
+    pub fn ledger_tail(&self) -> u64 {
+        self.last_ledger_tail.load(Ordering::Acquire)
+    }
+
     /// A forest census for the stats inode and the suites: how many slot
     /// trees exist and how many guest roots tree 0 currently names.
     pub fn forest_census(&self) -> Option<ForestCensus> {
@@ -3079,8 +3132,10 @@ impl KvMetaBackend {
     }
 
     /// The flat per-kind tree for `id` — FLAT volumes only (the forest
-    /// routes by KEY, never by kind alone).
-    fn flat_tree(&self, id: u8) -> Arc<KvTree> {
+    /// routes by KEY, never by kind alone). Borrowed: the flat hot path
+    /// pays no refcount traffic (the DARK pin is a COST pin too — W-6's
+    /// shared-line law).
+    fn flat_tree(&self, id: u8) -> &KvTree {
         match &self.trees {
             TreeSet::Flat {
                 inodes,
@@ -3088,30 +3143,26 @@ impl KvMetaBackend {
                 xattrs,
                 block_refs,
                 block_map,
-            } => {
-                match id {
-                    TREE_INODES => Arc::clone(inodes),
-                    TREE_DENTRIES => Arc::clone(dentries),
-                    TREE_XATTRS => Arc::clone(xattrs),
-                    // Spec §6.2 item 1: staged only by the layout-commit paths,
-                    // and only when the tree is engaged (`block_refs_engaged`
-                    // gates every staging site) — an absent tree here means a
-                    // caller staged accounting onto a volume that has none.
-                    super::record::TREE_BLOCK_REFS => Arc::clone(block_refs.as_ref().expect(
-                        "block-reference records staged on a volume without incompat bit 9",
-                    )),
-                    // PB-class files, PR 1: unreachable un-engaged — the staging
-                    // seam refuses non-empty map ops loud BEFORE a tx exists
-                    // (`set_layout_and_size_with_map`), unlike the block_refs
-                    // silent-skip.
-                    super::record::TREE_BLOCK_MAP => Arc::clone(
-                        block_map
-                            .get()
-                            .expect("block-map records staged on a volume without incompat bit 16"),
-                    ),
-                    _ => unreachable!("kv commits stage only the §4.2 trees"),
-                }
-            }
+            } => match id {
+                TREE_INODES => inodes,
+                TREE_DENTRIES => dentries,
+                TREE_XATTRS => xattrs,
+                // Spec §6.2 item 1: staged only by the layout-commit paths,
+                // and only when the tree is engaged (`block_refs_engaged`
+                // gates every staging site) — an absent tree here means a
+                // caller staged accounting onto a volume that has none.
+                super::record::TREE_BLOCK_REFS => block_refs
+                    .as_ref()
+                    .expect("block-reference records staged on a volume without incompat bit 9"),
+                // PB-class files, PR 1: unreachable un-engaged — the staging
+                // seam refuses non-empty map ops loud BEFORE a tx exists
+                // (`set_layout_and_size_with_map`), unlike the block_refs
+                // silent-skip.
+                super::record::TREE_BLOCK_MAP => block_map
+                    .get()
+                    .expect("block-map records staged on a volume without incompat bit 16"),
+                _ => unreachable!("kv commits stage only the §4.2 trees"),
+            },
             TreeSet::Forest { .. } => {
                 unreachable!("a forest volume routes records by key, never by kind alone")
             }
@@ -3119,7 +3170,8 @@ impl KvMetaBackend {
     }
 
     /// The tree a STAGED / journaled / replayed record belongs to: its
-    /// kind's tree on a flat volume; on a forest volume the slot tree its
+    /// kind's tree on a flat volume (BORROWED — no refcount traffic on
+    /// the shipped hot path); on a forest volume the slot tree its
     /// (forest-form) key names — minted on the slot's first record — or
     /// tree 0 for a [`TREE_CONTROL`] tag. The ONE routing point of the
     /// commit pipelines and replay.
@@ -3127,17 +3179,17 @@ impl KvMetaBackend {
         &self,
         tag_tree_id: u8,
         key: &[u8],
-    ) -> std::result::Result<Arc<KvTree>, KvError> {
+    ) -> std::result::Result<TreeRef<'_>, KvError> {
         match &self.trees {
-            TreeSet::Flat { .. } => Ok(self.flat_tree(tag_tree_id)),
+            TreeSet::Flat { .. } => Ok(TreeRef::Borrowed(self.flat_tree(tag_tree_id))),
             TreeSet::Forest { forest, .. } => {
                 if tag_tree_id == super::record::TREE_CONTROL {
-                    return Ok(Arc::clone(forest.control()));
+                    return Ok(TreeRef::Borrowed(forest.control()));
                 }
                 forest
-                    .route_forest_key_or_mint(key, &self.cache, &self.seq_handle(), &self.alloc)
+                    .route_forest_key_or_mint(key, &self.mint_context())
                     .await
-                    .map(|(_, t)| t)
+                    .map(|(_, t)| TreeRef::Owned(t))
             }
         }
     }
@@ -3148,20 +3200,32 @@ impl KvMetaBackend {
     pub(super) fn tree_of_node(
         &self,
         node: &CachedNode,
-    ) -> std::result::Result<Arc<KvTree>, KvError> {
+    ) -> std::result::Result<TreeRef<'_>, KvError> {
         match &self.trees {
-            TreeSet::Flat { .. } => self
-                .all_trees()
-                .into_iter()
-                .find(|t| t.tree_id() == node.tree_id())
-                .ok_or_else(|| {
+            TreeSet::Flat {
+                inodes,
+                dentries,
+                xattrs,
+                block_refs,
+                block_map,
+            } => {
+                let tree: Option<&KvTree> = match node.tree_id() {
+                    TREE_INODES => Some(inodes),
+                    TREE_DENTRIES => Some(dentries),
+                    TREE_XATTRS => Some(xattrs),
+                    super::record::TREE_BLOCK_REFS => block_refs.as_deref(),
+                    super::record::TREE_BLOCK_MAP => block_map.get().map(|t| &**t),
+                    _ => None,
+                };
+                tree.map(TreeRef::Borrowed).ok_or_else(|| {
                     KvError::Corrupt(format!(
                         "node {:#x} carries tree id {} — no mounted tree",
                         node.addr(),
                         node.tree_id()
                     ))
-                }),
-            TreeSet::Forest { forest, .. } => forest.tree_for_node(node),
+                })
+            }
+            TreeSet::Forest { forest, .. } => forest.tree_for_node(node).map(TreeRef::Owned),
         }
     }
 
@@ -3172,6 +3236,10 @@ impl KvMetaBackend {
     fn stage_key(&self, kind: u8, legacy: Vec<u8>) -> std::result::Result<Vec<u8>, KvError> {
         match &self.trees {
             TreeSet::Flat { .. } => Ok(legacy),
+            // Tree 0's records are keyed by their own codec (`slot_state`),
+            // never framed — a control-tree committer (PR 3/4's manager
+            // verbs) stages them verbatim.
+            TreeSet::Forest { .. } if kind == super::record::TREE_CONTROL => Ok(legacy),
             TreeSet::Forest { .. } => super::record::forest_key(kind, &legacy).map_err(|e| {
                 super::META_KV_FOREST_KEY_VIOLATIONS.fetch_add(1, Ordering::Relaxed);
                 e
@@ -3199,6 +3267,28 @@ impl KvMetaBackend {
                 }
                 Ok(Cow::Owned(out))
             }
+        }
+    }
+
+    /// What a lazy slot-tree mint needs — the floor is the ring HEAD at
+    /// the mint: every record the new tree will hold reserves at or past
+    /// it, so the checkpoint tail must not pass it until tree 0 names the
+    /// root ([`super::forest::SlotTrees::unpublished_root_floor`]).
+    fn mint_context(&self) -> super::forest::MintContext<'_> {
+        super::forest::MintContext {
+            cache: &self.cache,
+            seq: self.seq_ref(),
+            alloc: &self.alloc,
+            floor: self.ring.core().head(),
+        }
+    }
+
+    /// The volume-shared record/node seq source, borrowed (see
+    /// [`Self::seq_handle`]).
+    fn seq_ref(&self) -> &Arc<AtomicU64> {
+        match &self.trees {
+            TreeSet::Flat { inodes, .. } => inodes.seq_ref(),
+            TreeSet::Forest { forest, .. } => forest.control().seq_ref(),
         }
     }
 
@@ -3266,7 +3356,7 @@ impl KvMetaBackend {
             TreeSet::Flat { .. } => self.flat_tree(kind).insert(legacy, value).await,
             TreeSet::Forest { forest, .. } => {
                 let r = forest
-                    .route_or_mint(kind, legacy, &self.cache, &self.seq_handle(), &self.alloc)
+                    .route_or_mint(kind, legacy, &self.mint_context())
                     .await?;
                 r.tree.insert(&r.key, value).await
             }
@@ -3316,27 +3406,48 @@ impl KvMetaBackend {
         if !self.block_refs_engaged() {
             return Ok(Vec::new());
         }
-        let (mut cursor, end) = super::block_refs::volume_range(vol_tag);
+        let (start, end) = super::block_refs::volume_range(vol_tag);
         let mut out = Vec::new();
-        loop {
-            let page = self
-                .range_kind(super::record::TREE_BLOCK_REFS, &cursor, &end, 512)
-                .await?;
-            let Some((last_key, _)) = page.last() else {
-                break;
-            };
-            cursor = key_successor(last_key);
-            for (k, v) in &page {
-                // Decode both halves: a malformed accounting record is
-                // loud corruption, never a silently skipped reference
-                // (an under-count is the exact failure this structure
-                // exists to prevent).
-                let r = super::block_refs::decode_block_ref_key(k)?;
-                let _ = super::block_refs::decode_block_ref_value(v)?;
-                out.push(r);
-            }
+        for (k, v) in self.block_refs_window(&start, &end).await? {
+            // Decode both halves: a malformed accounting record is
+            // loud corruption, never a silently skipped reference
+            // (an under-count is the exact failure this structure
+            // exists to prevent).
+            let r = super::block_refs::decode_block_ref_key(&k)?;
+            let _ = super::block_refs::decode_block_ref_value(&v)?;
+            out.push(r);
         }
         Ok(out)
+    }
+
+    /// Every block-reference record in the LEGACY window `[start, end]`
+    /// (`volume_range` / `block_range`), keys in legacy form: paged by
+    /// legacy cursor on the flat tree; on a forest the union over EVERY
+    /// slot tree, each paged with its own cursor
+    /// ([`super::forest::SlotTrees::refs_window`]) — a legacy cursor is
+    /// not a forest resume point for the block-major refs family.
+    async fn block_refs_window(
+        &self,
+        start: &[u8],
+        end: &[u8],
+    ) -> std::result::Result<Vec<(Bytes, Bytes)>, KvError> {
+        match &self.trees {
+            TreeSet::Flat { .. } => {
+                let tree = self.flat_tree(super::record::TREE_BLOCK_REFS);
+                let mut out = Vec::new();
+                let mut cursor = start.to_vec();
+                loop {
+                    let page = tree.range(&cursor, end, 512).await?;
+                    let Some((last_key, _)) = page.last() else {
+                        break;
+                    };
+                    cursor = key_successor(last_key);
+                    out.extend(page);
+                }
+                Ok(out)
+            }
+            TreeSet::Forest { forest, .. } => forest.refs_window(start, end).await,
+        }
     }
 
     /// The durable reference population of **one block** — the ordered
@@ -3358,24 +3469,15 @@ impl KvMetaBackend {
         if !self.block_refs_engaged() {
             return Ok(0);
         }
-        let (mut cursor, end) = super::block_refs::block_range(vol_tag, block_idx);
+        let (start, end) = super::block_refs::block_range(vol_tag, block_idx);
         let mut population = 0usize;
-        loop {
-            let page = self
-                .range_kind(super::record::TREE_BLOCK_REFS, &cursor, &end, 512)
-                .await?;
-            let Some((last_key, _)) = page.last() else {
-                break;
-            };
-            cursor = key_successor(last_key);
-            for (k, v) in &page {
-                // Decode both halves (the block_ref_scan discipline): a
-                // malformed accounting record is loud corruption, never a
-                // silently skipped — or silently COUNTED — reference.
-                let _ = super::block_refs::decode_block_ref_key(k)?;
-                let _ = super::block_refs::decode_block_ref_value(v)?;
-                population += 1;
-            }
+        for (k, v) in self.block_refs_window(&start, &end).await? {
+            // Decode both halves (the block_ref_scan discipline): a
+            // malformed accounting record is loud corruption, never a
+            // silently skipped — or silently COUNTED — reference.
+            let _ = super::block_refs::decode_block_ref_key(&k)?;
+            let _ = super::block_refs::decode_block_ref_value(&v)?;
+            population += 1;
         }
         Ok(population)
     }
@@ -8438,6 +8540,15 @@ impl KvMetaBackend {
             }
         }
         let forest = super::forest::SlotTrees::new(control, native, guests);
+        // A tree minted AT REPLAY holds records from the window's start:
+        // its root floor is the window's tail (replay begins there), so the
+        // first checkpoint cannot pass it before tree 0 names the root.
+        let replay_mint = super::forest::MintContext {
+            cache,
+            seq,
+            alloc,
+            floor: ledger.journal_tail_seq,
+        };
 
         // ---- The slot trees' window: phase 1 interior records by
         // (level DESC, seq), each routed by its separator's slot.
@@ -8457,11 +8568,13 @@ impl KvMetaBackend {
                     seq.fetch_max(child_seq, Ordering::AcqRel);
                 }
             }
-            let (_slot, tree) = forest
-                .route_forest_key_or_mint(&rec.key, cache, seq, alloc)
-                .await?;
+            // A slot tree's interior record names its slot on the journal
+            // key (the separator alone cannot — the top one is
+            // `KEY_SPACE_MAX` in every tree); strip it for the apply.
+            let (slot, separator) = super::forest::split_interior_journal_key(&rec.key)?;
+            let tree = forest.slot_or_mint(slot, &replay_mint).await?;
             tree.apply_replayed_interior(
-                &rec.key,
+                separator,
                 level,
                 rec.seq,
                 rec.kind,
@@ -8525,7 +8638,7 @@ impl KvMetaBackend {
                     ))
                 );
                 let (_slot, tree) = forest
-                    .route_forest_key_or_mint(&rec.key, cache, seq, alloc)
+                    .route_forest_key_or_mint(&rec.key, &replay_mint)
                     .await?;
                 tree.apply_replayed(
                     &rec.key,
@@ -8572,18 +8685,27 @@ impl KvMetaBackend {
     /// checkpoint-class journal entry applied to tree 0 in RAM — BEFORE
     /// the checkpoint's flush pass, so the same cycle flushes tree 0's
     /// leaf and its ledger record's tree-0 root covers the publication.
-    /// That is what discharges a slot tree's root-swap dying floor: the
-    /// swap's records stay in the window until a ledger record names a
-    /// tree-0 root that durably holds the new slot root. Replay of an
-    /// un-flushed publication re-applies the record into tree 0 (it is a
-    /// content record of tree 0); a crash before the entry landed leaves
-    /// the previous root named and every record under the new one in the
-    /// window — the FIND-VS-A argument, one tree at a time.
+    ///
+    /// The covering argument, and its two halves: (1) until the record
+    /// is applied, every guest root that moved is UNPUBLISHED and its
+    /// `root_floor` (the mint's head / the swap's reservation) clamps the
+    /// cycle's tail through [`super::forest::SlotTrees::
+    /// unpublished_root_floor`] — a deferred publication (reserve
+    /// exhausted) therefore leaves the records under those roots in the
+    /// window, exactly like an SMO the flush pass skipped; (2) once
+    /// applied, the record is a content record of tree 0 with the entry's
+    /// own floor: replayed if un-flushed, covered by the ledger's tree-0
+    /// root once flushed. The images the record names are made durable
+    /// BEFORE the entry is written (a fresh mint's root is written by
+    /// `create_slot_tree` with no barrier of its own; an SMO's root
+    /// already is) — §4.10's "a replayed pointer must never route to a
+    /// torn image", one barrier per cycle-with-moved-roots.
     ///
     /// A no-op on a flat volume and on a forest whose guest roots are all
     /// current. Reserve exhaustion is returned as
     /// [`KvError::JournalReserveExhausted`] for the caller's drain-and-
-    /// retry, exactly like an SMO's.
+    /// retry; a failed entry write is the journal-failure class
+    /// (`note_journal_failure`), and the roots stay unpublished.
     pub(super) async fn publish_forest_roots(&self) -> std::result::Result<(), KvError> {
         let Some(forest) = self.forest() else {
             return Ok(());
@@ -8605,16 +8727,31 @@ impl KvMetaBackend {
                     g: 0,
                     tails: Vec::new(),
                 };
-                (
+                let value = state.encode()?;
+                Ok((
                     tag,
-                    Record::put(super::slot_state::slot_state_key(*slot), 0, state.encode()),
-                )
+                    Record::put(super::slot_state::slot_state_key(*slot), 0, value),
+                ))
             })
-            .collect();
+            .collect::<std::result::Result<_, KvError>>()?;
         let len = entry_len_for(&recs)?;
+        // Test seam: a deferred publication (the reserve-exhausted arm)
+        // on demand — `tests/sym_forest_tests.rs` pins that the deferral
+        // keeps every unpublished root's records in the window.
+        if TEST_FOREST_PUBLISH_DEFER
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
+                (n > 0).then(|| if n == u32::MAX { n } else { n - 1 })
+            })
+            .is_ok()
+        {
+            return Err(KvError::JournalReserveExhausted { needed: len });
+        }
         let Some(adm) = self.ring.try_admit(len, AdmissionClass::Checkpoint) else {
             return Err(KvError::JournalReserveExhausted { needed: len });
         };
+        // The named images first (see the doc): one barrier covers every
+        // fresh root of this cycle.
+        self.sync_device().await.map_err(KvError::Io)?;
         let res = self.ring.reserve_registered(adm);
         let mut recs = recs;
         for (i, (_, r)) in recs.iter_mut().enumerate() {
@@ -8633,18 +8770,80 @@ impl KvMetaBackend {
                 .await?;
         }
         if let Err(e) = self.ring.commit_entry(&res, &recs).await {
-            // RAM is authoritative and this cycle's flush pass carries the
-            // leaf; the unwritten range is the §4.4 pt 4 hole replay skips.
-            log::warn!(
-                "forest root publication entry write failed on {} (crash-equivalent hole; \
-                 the flush pass still carries tree 0's leaf): {e}",
+            // The journal-failure class: the RAM apply stands (tree 0's
+            // leaf carries the records into the flush pass), the roots
+            // stay UNPUBLISHED so their floors keep clamping the tail,
+            // and the volume escalates like every other failed journal
+            // write.
+            log::error!(
+                "meta volume {}: forest root publication entry write failed ({e}) — the \
+                 roots stay unpublished (their floors keep clamping the checkpoint tail)",
                 self.path.display()
             );
+            self.note_journal_failure();
+            return Err(e);
         }
         for (slot, root) in pending {
             forest.note_published(slot, root);
         }
         Ok(())
+    }
+
+    /// A coherent READER's forest resync at an epoch step (spec §6.8 item
+    /// 2 on a forest volume): tree 0's root was just adopted from the
+    /// ledger, so its `slot_state` population is the writer's checkpoint
+    /// — adopt every guest root it names onto the guest tree the reader
+    /// holds, and OPEN every guest the reader has never seen (a slot the
+    /// writer minted after the reader mounted). A no-op on a flat volume.
+    /// The reader mints nothing and publishes nothing.
+    pub(super) async fn forest_reader_resync(&self) -> std::result::Result<(), KvError> {
+        let Some(forest) = self.forest() else {
+            return Ok(());
+        };
+        let control = Arc::clone(forest.control());
+        let (mut cursor, end) = super::slot_state::slot_state_key_range();
+        loop {
+            let page = control.range(&cursor, &end, 512).await?;
+            let Some((last, _)) = page.last() else {
+                break;
+            };
+            cursor = key_successor(last);
+            for (k, v) in &page {
+                let slot = super::slot_state::decode_slot_state_key(k)?;
+                let Some(root) = super::slot_state::SlotState::decode(v)?.root() else {
+                    continue; // a leased slot (PR 4) is not this binary's to resolve
+                };
+                match forest.tree(slot) {
+                    Some(t) => {
+                        if t.root() != root {
+                            t.adopt_root(root)?;
+                        }
+                    }
+                    None => {
+                        let tree = KvTree::open_slot_tree(
+                            Arc::clone(&self.cache),
+                            slot,
+                            root,
+                            self.seq_handle(),
+                        )
+                        .await?;
+                        forest.adopt_guest(slot, Arc::new(tree));
+                    }
+                }
+            }
+            if page.len() < 512 {
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    /// The lowest journal position an UNPUBLISHED guest root came into
+    /// force at — the checkpoint tail's forest clamp (`u64::MAX` on a
+    /// flat volume and on a forest whose roots are all named).
+    pub(super) fn unpublished_root_floor(&self) -> u64 {
+        self.forest()
+            .map_or(u64::MAX, |f| f.unpublished_root_floor())
     }
 
     /// The tree a defrag census target `(header tree id, node addr)`
@@ -9013,28 +9212,28 @@ impl KvMetaBackend {
         // The staged key is the shipped per-kind key; on a forest volume
         // it takes its §5.2.1 kind byte HERE, once — every downstream step
         // (leaf resolution, the journal entry, replay, the migration tee)
-        // sees the forest key, and the tag stays the kind.
+        // sees the forest key, and the tag stays the kind. The write-side
+        // audit reads the LEGACY key, so it runs on the staged tuple
+        // before the framing.
         let mut recs: Vec<(u8, Record)> = Vec::with_capacity(tx.staged.len());
         for (tree_id, key, kind, value) in tx.staged {
-            recs.push((
-                tree_id,
-                Record {
-                    key: self.stage_key(tree_id, key)?,
-                    seq: 0, // stamped from the reservation, in-lock
-                    kind,
-                    // D1.c stage_put audit: `Bytes::to_vec` COPIED every
-                    // staged value at commit; `Vec::from(Bytes)` reclaims
-                    // the unique Vec-backed allocation instead (stage
-                    // sites build values as `Bytes::from(vec)`).
-                    value: Vec::from(value),
-                },
-            ));
-        }
-        // Finding-A hardening: staged records must decode under their own
-        // tree's typed decoder before any byte is persisted (debug tiers).
-        #[cfg(debug_assertions)]
-        for (tree_id, r) in &recs {
-            super::node::debug_audit_records(*tree_id, 0, std::slice::from_ref(r));
+            let mut r = Record {
+                key,
+                seq: 0, // stamped from the reservation, in-lock
+                kind,
+                // D1.c stage_put audit: `Bytes::to_vec` COPIED every
+                // staged value at commit; `Vec::from(Bytes)` reclaims
+                // the unique Vec-backed allocation instead (stage
+                // sites build values as `Bytes::from(vec)`).
+                value: Vec::from(value),
+            };
+            // Finding-A hardening: staged records must decode under their
+            // own kind's typed decoder before any byte is persisted (debug
+            // tiers).
+            #[cfg(debug_assertions)]
+            super::node::debug_audit_records(tree_id, 0, std::slice::from_ref(&r));
+            r.key = self.stage_key(tree_id, r.key)?;
+            recs.push((tree_id, r));
         }
         // Admission honesty (the 2026-08-19 AlreadyFreezing wedge's third
         // leg): the per-volume record-value cap (§4.2 — the very check
@@ -10554,8 +10753,11 @@ impl KvMetaBackend {
                 )
             })
             .collect();
+        // Compensation records re-stage the pass's ALREADY-FRAMED undo keys
+        // (forest keys on a forest volume): the audit reads the legacy
+        // form the per-kind decoders were written for.
         #[cfg(debug_assertions)]
-        for (tree_id, r) in &recs {
+        for (tree_id, r) in self.legacy_recs(&recs)?.iter() {
             super::node::debug_audit_records(*tree_id, 0, std::slice::from_ref(r));
         }
         let len = entry_len_for(&recs)?;

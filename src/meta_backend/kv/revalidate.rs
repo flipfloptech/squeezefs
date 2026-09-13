@@ -240,6 +240,19 @@ pub fn revalidate_trees(
 ) -> RevalidateOutcome {
     if epoch.ledger_seq > cache.revalidation_epoch() {
         for tree in trees {
+            // On a forest volume every slot tree carries header id 0 and
+            // the ledger names ONE id-0 root — the NATIVE slot's. A guest
+            // slot tree's root lives in tree 0 and is adopted by the
+            // reader's forest resync AFTER this step
+            // (`KvMetaBackend::forest_reader_resync`); adopting the
+            // ledger's id-0 root here would re-root every guest at the
+            // native tree.
+            if tree
+                .forest_slot()
+                .is_some_and(|s| s != super::record::NATIVE_FOREST_SLOT)
+            {
+                continue;
+            }
             if let Some(root) = epoch.root_of(tree.tree_id()) {
                 if let Err(e) = tree.adopt_root(RootPtr {
                     addr: root.node_addr,
@@ -374,7 +387,11 @@ impl KvMetaBackend {
         }
         let epoch = self.read_root_epoch().await?;
         let trees = self.all_trees();
-        Ok(revalidate_trees(self.node_cache(), &trees, &epoch))
+        let out = revalidate_trees(self.node_cache(), &trees, &epoch);
+        if out.advanced {
+            self.forest_reader_resync().await?;
+        }
+        Ok(out)
     }
 
     /// The reader's live epoch (0 = not a reader) — the seqlock-style handle

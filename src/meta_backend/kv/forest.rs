@@ -27,8 +27,8 @@
 
 use super::node_cache::NodeCache;
 use super::record::{
-    forest_key, forest_key_kind, forest_key_slot, split_forest_key, ForestSlot, KIND_INTERIOR,
-    NATIVE_FOREST_SLOT, TREE_BLOCK_REFS, TREE_CONTROL,
+    forest_key, forest_key_slot, split_forest_key, ForestSlot, KIND_INTERIOR, NATIVE_FOREST_SLOT,
+    TREE_BLOCK_REFS, TREE_CONTROL,
 };
 use super::tree::{KvTree, RootPtr, SmoContext};
 use super::KvError;
@@ -348,6 +348,27 @@ impl SlotTrees {
         floor
     }
 
+    /// Split a slot-tree key into `(kind, legacy key)`, or `None` for a
+    /// key the §5.2.1 codec refuses — counted on
+    /// `meta_kv_forest_key_violations` (must stay 0) and logged. The
+    /// kind-routed walks skip such a record rather than fail the page
+    /// (see [`Self::range`]); fsck's raw forest walk is what reports it.
+    fn decode_or_skip(key: &[u8]) -> Option<(u8, Vec<u8>)> {
+        match split_forest_key(key) {
+            Ok(split) => Some(split),
+            Err(e) => {
+                super::META_KV_FOREST_KEY_VIOLATIONS.fetch_add(1, Ordering::Relaxed);
+                log::error!(
+                    "slot-tree record under a key the forest codec refuses ({} bytes, {:02x?}…): \
+                     {e} — skipped by the kind-routed walk; fsck class C1 reports it",
+                    key.len(),
+                    &key[..key.len().min(12)]
+                );
+                None
+            }
+        }
+    }
+
     /// Point lookup of a `(kind, legacy key)`.
     pub async fn lookup(&self, kind: u8, legacy: &[u8]) -> Result<Option<Bytes>, KvError> {
         match self.route_read(kind, legacy)? {
@@ -433,10 +454,20 @@ impl SlotTrees {
                 };
                 cursor = super::node::key_successor(last);
                 for (k, v) in &page {
-                    if forest_key_kind(k)? != kind {
+                    // A key the codec refuses is corruption (or a writer
+                    // bug) — counted on the must-stay-0 tripwire and
+                    // logged, then SKIPPED: failing the whole page would
+                    // hide every other record of the leaf from the caller
+                    // (fsck's census walks in particular — a truncated
+                    // census reads live blocks as unreferenced, and the
+                    // repair of THAT finding frees them). fsck's forest C1
+                    // walk reads the slot trees raw and reports the key.
+                    let Some((k_kind, legacy)) = Self::decode_or_skip(k) else {
+                        continue;
+                    };
+                    if k_kind != kind {
                         continue;
                     }
-                    let (_, legacy) = split_forest_key(k)?;
                     out.push((Bytes::from(legacy), v.clone()));
                     if out.len() >= max {
                         return Ok(out);
@@ -484,10 +515,13 @@ impl SlotTrees {
                 };
                 cursor = super::node::key_successor(last);
                 for (k, v) in &page {
-                    if forest_key_kind(k)? != TREE_BLOCK_REFS {
+                    let Some((k_kind, legacy)) = Self::decode_or_skip(k) else {
+                        continue;
+                    };
+                    if k_kind != TREE_BLOCK_REFS {
                         continue;
                     }
-                    out.push((Bytes::from(split_forest_key(k)?.1), v.clone()));
+                    out.push((Bytes::from(legacy), v.clone()));
                 }
                 if page.len() < PAGE {
                     break;

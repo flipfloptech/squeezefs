@@ -540,16 +540,26 @@ pub struct FsckFinding {
 /// before acting).
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum FindingId {
-    /// C1: checksum-bad / torn node (walk could not advance).
+    /// C1: checksum-bad / torn node (walk could not advance). `slot`
+    /// names a forest volume's slot tree (its raw walk; `tree` is 0).
     C1Torn {
         vol: usize,
         tree: u8,
+        #[serde(default)]
+        slot: Option<crate::meta_backend::kv::record::ForestSlot>,
         cursor_hex: String,
     },
     /// C1: checksum-valid semantic damage on one record.
     C1Semantic {
         vol: usize,
         tree: u8,
+        key_hex: String,
+    },
+    /// C1: a forest slot-tree record under a key the codec refuses
+    /// (checksum-valid; the raw stored key).
+    C1RawKey {
+        vol: usize,
+        slot: crate::meta_backend::kv::record::ForestSlot,
         key_hex: String,
     },
     /// C2: allocated (tracked) with zero referencers.
@@ -1295,12 +1305,24 @@ enum SuspectKind {
         key: Vec<u8>,
         why: String,
     },
-    /// C1: a tree walk failed (checksum / undecodable node).
+    /// C1: a tree walk failed (checksum / undecodable node). `slot` names
+    /// the slot tree of a forest volume's raw walk (`tree` is then the
+    /// slot trees' header id, 0).
     C1Walk {
         vol: usize,
         tree: u8,
+        slot: Option<crate::meta_backend::kv::record::ForestSlot>,
         cursor: Vec<u8>,
         error: String,
+    },
+    /// C1: a slot-tree record whose KEY the forest codec refuses (a kind
+    /// byte that is another tree's id, a wrong length for its kind) — the
+    /// kind-routed reads skip it; only the raw walk can name it.
+    C1RawKey {
+        vol: usize,
+        slot: crate::meta_backend::kv::record::ForestSlot,
+        key: Vec<u8>,
+        why: String,
     },
     /// C2 leaked: allocated (tracked) with zero referencers.
     C2Leaked { vol: String, offset: u64 },
@@ -1584,13 +1606,13 @@ pub async fn run(ctx: &FsckCtx, opts: &FsckOptions) -> Result<FsckReport> {
         } else if unthrottled {
             let mut walks = Vec::new();
             for (vol_idx, kv) in ctx.meta.volumes.iter().enumerate() {
-                for kind in crate::meta_backend::kv::backend::KvMetaBackend::USER_KINDS {
+                for unit in c1_units(kv) {
                     let kv = kv.clone();
                     let cancel = opts.cancel.clone();
                     let pct = opts.throttle_pct;
                     walks.push(crate::meta_exec::spawn_meta_join(
                         "fsck_c1_walk",
-                        async move { walk_one_tree_c1(kv, vol_idx, kind, pct, cancel).await },
+                        async move { walk_one_tree_c1(kv, vol_idx, unit, pct, cancel).await },
                     ));
                 }
             }
@@ -2859,38 +2881,82 @@ fn record_schema_violation(tree_id: u8, k: &[u8], v: &[u8]) -> Option<String> {
     }
 }
 
-/// One (volume, kind) C1 walk — the parallel unit (VL10, G-VL-5(c)):
-/// checksum ride-along via the range read, cross-page key ordering, and
-/// the schema check per record. Returns `(pages_walked, suspects)`.
-/// Kind-routed, so it reads either layout: a flat volume's per-kind
-/// tree, or a forest volume's slot trees filtered to the kind (the
-/// forest's mixed leaves are walked once per kind here — the design's
-/// ONE-walk census over C1–C10 is owed, design-symmetric-metadata
-/// §5.8.5).
+/// One C1 walk unit: a per-kind tree on a flat volume; ONE slot tree,
+/// read RAW with every kind in its mixed leaves, on a forest (the ONE-walk
+/// census for C1 — design-symmetric-metadata §5.8.5; the raw read is
+/// also the only one that can SEE a key the forest codec refuses: the
+/// kind-routed walks skip such a record so a census never truncates).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum C1Unit {
+    Kind(u8),
+    Slot(crate::meta_backend::kv::record::ForestSlot),
+}
+
+/// The C1 walk units of one volume.
+fn c1_units(kv: &crate::meta_backend::kv::backend::KvMetaBackend) -> Vec<C1Unit> {
+    if kv.symmetric_forest() {
+        kv.forest_roots()
+            .into_iter()
+            .map(|(slot, _)| C1Unit::Slot(slot))
+            .collect()
+    } else {
+        crate::meta_backend::kv::backend::KvMetaBackend::USER_KINDS
+            .into_iter()
+            .map(C1Unit::Kind)
+            .collect()
+    }
+}
+
+/// One page of a C1 unit from `cursor` — the scan's read and its
+/// re-check's (same shape: a `max = 1` probe could be satisfied by a
+/// healthy left sibling and never touch the damaged node).
+async fn c1_page(
+    kv: &crate::meta_backend::kv::backend::KvMetaBackend,
+    unit: C1Unit,
+    cursor: &[u8],
+) -> std::result::Result<Vec<(bytes::Bytes, bytes::Bytes)>, crate::meta_backend::kv::KvError> {
+    let end = crate::meta_backend::kv::tree::KEY_SPACE_MAX;
+    match unit {
+        C1Unit::Kind(kind) => kv.range_kind(kind, cursor, &end, SCAN_PAGE).await,
+        C1Unit::Slot(slot) => kv.slot_tree_range_raw(slot, cursor, &end, SCAN_PAGE).await,
+    }
+}
+
+/// One C1 walk — the parallel unit (VL10, G-VL-5(c)): checksum
+/// ride-along via the range read, cross-page key ordering, and the schema
+/// check per record. On a forest the unit is a slot tree read raw: each
+/// record's key is split by the codec first — a key it refuses is its own
+/// suspect class (`C1RawKey`), a key it accepts is schema-checked under
+/// its kind exactly like a flat volume's record. Returns `(pages_walked,
+/// suspects)`.
 async fn walk_one_tree_c1(
     kv: Arc<crate::meta_backend::kv::backend::KvMetaBackend>,
     vol_idx: usize,
-    tree_id: u8,
+    unit: C1Unit,
     throttle_pct: u32,
     cancel: Arc<AtomicBool>,
 ) -> (u64, Vec<Suspect>) {
-    let end = crate::meta_backend::kv::tree::KEY_SPACE_MAX;
     let mut nodes_walked = 0u64;
     let mut suspects = Vec::new();
     let mut cursor: Vec<u8> = vec![0u8];
     let mut prev_key: Option<Vec<u8>> = None;
+    let (walk_tree, walk_slot) = match unit {
+        C1Unit::Kind(kind) => (kind, None),
+        C1Unit::Slot(slot) => (crate::meta_backend::kv::record::KIND_INTERIOR, Some(slot)),
+    };
     loop {
         if cancel.load(Ordering::Relaxed) {
             break;
         }
         let t0 = std::time::Instant::now();
-        let page = match kv.range_kind(tree_id, &cursor, &end, SCAN_PAGE).await {
+        let page = match c1_page(&kv, unit, &cursor).await {
             Ok(p) => p,
             Err(e) => {
                 suspects.push(Suspect {
                     kind: SuspectKind::C1Walk {
                         vol: vol_idx,
-                        tree: tree_id,
+                        tree: walk_tree,
+                        slot: walk_slot,
                         cursor: cursor.clone(),
                         error: e.to_string(),
                     },
@@ -2904,28 +2970,48 @@ async fn walk_one_tree_c1(
         };
         cursor = crate::meta_backend::kv::node::key_successor(last_key);
         for (k, v) in &page {
+            // The record's kind and legacy key: as read on a flat volume;
+            // split by the forest codec on a slot tree.
+            let (tree_id, legacy): (u8, std::borrow::Cow<'_, [u8]>) = match unit {
+                C1Unit::Kind(kind) => (kind, std::borrow::Cow::Borrowed(k.as_ref())),
+                C1Unit::Slot(slot) => match crate::meta_backend::kv::record::split_forest_key(k) {
+                    Ok((kind, legacy)) => (kind, std::borrow::Cow::Owned(legacy)),
+                    Err(e) => {
+                        suspects.push(Suspect {
+                            kind: SuspectKind::C1RawKey {
+                                vol: vol_idx,
+                                slot,
+                                key: k.to_vec(),
+                                why: format!("slot-tree key refused by the forest codec: {e}"),
+                            },
+                        });
+                        prev_key = Some(k.to_vec());
+                        continue;
+                    }
+                },
+            };
             // In-page + cross-page ordering (checksum-valid
-            // structural damage surfaces here).
+            // structural damage surfaces here) — on the stored key.
             if let Some(prev) = &prev_key {
                 if k.as_ref() <= prev.as_slice() {
                     suspects.push(Suspect {
                         kind: SuspectKind::C1Record {
                             vol: vol_idx,
                             tree: tree_id,
-                            key: k.to_vec(),
+                            key: legacy.to_vec(),
                             why: "key ordering violated".to_string(),
                         },
                     });
                 }
             }
             prev_key = Some(k.to_vec());
-            let why = record_schema_violation(tree_id, k, v);
+            let why = record_schema_violation(tree_id, &legacy, v);
             if let Some(why) = why {
                 suspects.push(Suspect {
                     kind: SuspectKind::C1Record {
                         vol: vol_idx,
                         tree: tree_id,
-                        key: k.to_vec(),
+                        key: legacy.to_vec(),
                         why,
                     },
                 });
@@ -2945,14 +3031,14 @@ async fn walk_trees_c1(
     suspects: &mut Vec<Suspect>,
 ) {
     for (vol_idx, kv) in ctx.meta.volumes.iter().enumerate() {
-        for kind in crate::meta_backend::kv::backend::KvMetaBackend::USER_KINDS {
+        for unit in c1_units(kv) {
             if opts.cancel.load(Ordering::Relaxed) {
                 return;
             }
             let (nodes_walked, walk_suspects) = walk_one_tree_c1(
                 kv.clone(),
                 vol_idx,
-                kind,
+                unit,
                 opts.throttle_pct,
                 opts.cancel.clone(),
             )
@@ -4786,33 +4872,66 @@ async fn recheck_suspects(
                 })
             }
             SuspectKind::C1Walk {
-                vol, tree, cursor, ..
+                vol,
+                tree,
+                slot,
+                cursor,
+                ..
             } => {
-                // Re-attempt the read (a transient I/O error clears).
+                // Re-attempt the read (a transient I/O error clears) —
+                // the scan's own page shape.
                 let kv = &ctx.meta.volumes[*vol];
-                // Same-shaped read as the scan (a max=1 probe can be
-                // satisfied by a healthy left sibling and never touch
-                // the damaged node).
-                match kv
-                    .range_kind(
-                        *tree,
-                        cursor,
-                        &crate::meta_backend::kv::tree::KEY_SPACE_MAX,
-                        SCAN_PAGE,
-                    )
-                    .await
-                {
+                let unit = match slot {
+                    Some(s) => C1Unit::Slot(*s),
+                    None => C1Unit::Kind(*tree),
+                };
+                match c1_page(kv, unit, cursor).await {
                     Err(e) => Some(FsckFinding {
                         class: "C1".to_string(),
-                        object: format!("vol{vol}/tree{tree}/cursor{}", hex(cursor)),
+                        object: match slot {
+                            Some(s) => format!("vol{vol}/slot{s}/cursor{}", hex(cursor)),
+                            None => format!("vol{vol}/tree{tree}/cursor{}", hex(cursor)),
+                        },
                         evidence: format!("tree walk failed (checksum/undecodable node): {e}"),
                         identity: Some(FindingId::C1Torn {
                             vol: *vol,
                             tree: *tree,
+                            slot: *slot,
                             cursor_hex: hex(cursor),
                         }),
                     }),
                     Ok(_) => None,
+                }
+            }
+            SuspectKind::C1RawKey {
+                vol,
+                slot,
+                key,
+                why,
+            } => {
+                let kv = &ctx.meta.volumes[*vol];
+                match kv.slot_tree_lookup_raw(*slot, key).await {
+                    Ok(Some(_)) => Some(FsckFinding {
+                        class: "C1".to_string(),
+                        object: format!("vol{vol}/slot{slot}/rawkey{}", hex(key)),
+                        evidence: format!("checksum-valid semantic damage: {why}"),
+                        identity: Some(FindingId::C1RawKey {
+                            vol: *vol,
+                            slot: *slot,
+                            key_hex: hex(key),
+                        }),
+                    }),
+                    Ok(None) => None, // vanished (a live delete / a repair)
+                    Err(e) => Some(FsckFinding {
+                        class: "C1".to_string(),
+                        object: format!("vol{vol}/slot{slot}/rawkey{}", hex(key)),
+                        evidence: format!("record unreadable at re-check: {e}"),
+                        identity: Some(FindingId::C1RawKey {
+                            vol: *vol,
+                            slot: *slot,
+                            key_hex: hex(key),
+                        }),
+                    }),
                 }
             }
             SuspectKind::C1Record {
@@ -6163,6 +6282,13 @@ fn planned_action(id: &FindingId) -> (&'static str, String) {
              the schema-violating record via an ordinary journaled CoW leaf re-emit"
                 .to_string(),
         ),
+        FindingId::C1RawKey { .. } => (
+            "rebuild-in-place",
+            "checksum-valid slot-tree record under a key the forest codec refuses: \
+             quarantine the raw bytes, then drop the record from its slot tree (the \
+             kind-routed reads already skip it; no live key resolves to it)"
+                .to_string(),
+        ),
         FindingId::C2Leaked { vol, offset } => (
             "free-leaked-block",
             format!(
@@ -7449,6 +7575,7 @@ pub async fn repair(
             FindingId::C1Torn {
                 vol,
                 tree,
+                slot,
                 cursor_hex,
             } => {
                 // Verify: the walk still fails from this cursor.
@@ -7460,22 +7587,22 @@ pub async fn repair(
                     refuse(&mut out, f, "undecodable cursor identity".to_string());
                     continue;
                 };
-                if !crate::meta_backend::kv::backend::KvMetaBackend::USER_KINDS.contains(tree) {
-                    refuse(&mut out, f, "tree no longer exists".to_string());
-                    continue;
-                }
+                let unit = match slot {
+                    Some(s) => C1Unit::Slot(*s),
+                    None => {
+                        if !crate::meta_backend::kv::backend::KvMetaBackend::USER_KINDS
+                            .contains(tree)
+                        {
+                            refuse(&mut out, f, "tree no longer exists".to_string());
+                            continue;
+                        }
+                        C1Unit::Kind(*tree)
+                    }
+                };
                 // Same-shaped read as the scan (a max=1 probe can be
                 // satisfied by a healthy left sibling and never touch the
                 // damaged node — the recheck's own lesson).
-                match kv
-                    .range_kind(
-                        *tree,
-                        &cursor,
-                        &crate::meta_backend::kv::tree::KEY_SPACE_MAX,
-                        SCAN_PAGE,
-                    )
-                    .await
-                {
+                match c1_page(kv, unit, &cursor).await {
                     Ok(_) => {
                         refuse(
                             &mut out,
@@ -7505,6 +7632,62 @@ pub async fn repair(
                         apply_ok(&mut out, f, "quarantine-report-only", note);
                     }
                 }
+            }
+            // ------------------------------------------- C1 raw slot key
+            FindingId::C1RawKey { vol, slot, key_hex } => {
+                let Some(kv) = ctx.meta.volumes.get(*vol) else {
+                    refuse(&mut out, f, "volume index no longer exists".to_string());
+                    continue;
+                };
+                let Some(key) = unhex(key_hex) else {
+                    refuse(&mut out, f, "undecodable key identity".to_string());
+                    continue;
+                };
+                if crate::meta_backend::kv::record::split_forest_key(&key).is_ok() {
+                    refuse(
+                        &mut out,
+                        f,
+                        "the key now decodes under the forest codec (not this class)".to_string(),
+                    );
+                    continue;
+                }
+                let value = match kv.slot_tree_lookup_raw(*slot, &key).await {
+                    Ok(Some(v)) => v,
+                    Ok(None) => {
+                        refuse(&mut out, f, "record no longer exists (healed)".to_string());
+                        continue;
+                    }
+                    Err(e) => {
+                        refuse(&mut out, f, format!("record unreadable at verify: {e}"));
+                        continue;
+                    }
+                };
+                let bytes = quarantine
+                    .put(
+                        &f.class,
+                        &f.object,
+                        "rebuild-in-place",
+                        "raw slot-tree record bytes (key, value) before the drop",
+                        &[("key", &key), ("value", &value)],
+                    )
+                    .await?;
+                out.counters.quarantined_records += 1;
+                out.counters.quarantined_bytes += bytes;
+                fire_repair_abort_hook(&what)?;
+                kv.slot_tree_delete_raw(*slot, &key).await.map_err(|e| {
+                    SqueezefsError::InvalidOperation(format!(
+                        "rebuild-in-place drop of the undecodable slot-tree record failed: {e}"
+                    ))
+                })?;
+                apply_ok(
+                    &mut out,
+                    f,
+                    "rebuild-in-place",
+                    format!(
+                        "undecodable record dropped from vol{vol}/slot{slot} (journaled CoW \
+                         re-emit); bytes quarantined"
+                    ),
+                );
             }
             // ---------------------------------------------- C1 semantic
             FindingId::C1Semantic { vol, tree, key_hex } => {

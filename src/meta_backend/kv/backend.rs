@@ -3155,6 +3155,50 @@ impl KvMetaBackend {
         }
     }
 
+    /// A RAW page of slot tree `slot` — forest keys as stored, every kind,
+    /// nothing decoded or skipped — fsck's forest C1 walk (the one reader
+    /// that must SEE a key the codec refuses, to report it). `Ok(empty)`
+    /// when the slot has no tree.
+    pub async fn slot_tree_range_raw(
+        &self,
+        slot: super::record::ForestSlot,
+        start: &[u8],
+        end: &[u8],
+        max: usize,
+    ) -> std::result::Result<Vec<(Bytes, Bytes)>, KvError> {
+        match self.forest().and_then(|f| f.tree(slot)) {
+            Some(tree) => tree.range(start, end, max).await,
+            None => Ok(Vec::new()),
+        }
+    }
+
+    /// Raw point lookup of a forest key in slot tree `slot` (fsck's C1
+    /// re-check of an undecodable key).
+    pub async fn slot_tree_lookup_raw(
+        &self,
+        slot: super::record::ForestSlot,
+        key: &[u8],
+    ) -> std::result::Result<Option<Bytes>, KvError> {
+        match self.forest().and_then(|f| f.tree(slot)) {
+            Some(tree) => tree.lookup(key).await,
+            None => Ok(None),
+        }
+    }
+
+    /// Raw `Delete` of a forest key in slot tree `slot` — fsck's C1
+    /// rebuild-in-place for a record whose key the codec refuses (the
+    /// kind-routed [`Self::delete_kind`] cannot name it).
+    pub async fn slot_tree_delete_raw(
+        &self,
+        slot: super::record::ForestSlot,
+        key: &[u8],
+    ) -> std::result::Result<(), KvError> {
+        match self.forest().and_then(|f| f.tree(slot)) {
+            Some(tree) => tree.delete(key).await,
+            None => Ok(()),
+        }
+    }
+
     /// Every slot tree's `(slot, live root)` in slot order — the forest
     /// suites' root census (empty on a flat volume).
     pub fn forest_roots(&self) -> Vec<(super::record::ForestSlot, RootPtr)> {

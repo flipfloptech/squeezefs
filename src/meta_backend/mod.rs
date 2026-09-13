@@ -2113,7 +2113,67 @@ impl RoutedMetaBackend {
         let _guard = self.volumes[v_idx].dlm().lock_inode_shared(local_dir).await;
         // `offset` is a readdir cookie; pages resume strictly after its
         // key suffix (design §5.1).
-        self.volumes[v_idx].readdir(local_dir, offset, max).await
+        Ok(self
+            .readdir_page_held(v_idx, local_dir, offset, max)
+            .await?
+            .into_iter()
+            .map(|(_cookie, entry)| entry)
+            .collect())
+    }
+
+    /// The ONE directory pager both listing faces ride, under the caller's
+    /// held per-volume shared inode guard. A non-writer of a FOREST volume
+    /// (S5 reader, co-writer, probe) lists a child iff the child's volume
+    /// HOLDS the child's slot tree — exactly the condition its `lookup`
+    /// (dentry + `getattr(child)`) answers — so `readdir` never lists a
+    /// name `lookup` refuses: the partial view such a mount serves between
+    /// the writer's mint of a slot and its next publication is a consistent
+    /// snapshot, adopted whole at the poll that names the slot
+    /// (design-symmetric-metadata §5.3.4; `meta_kv_forest_reader_unpublished_children`
+    /// counts the withheld names). Withheld entries are re-paged from the
+    /// last cookie the volume returned, so a page never ends short of `max`
+    /// while the directory has more; the shipped path — every write mount,
+    /// every flat volume — pays one bool per call and takes the volume's
+    /// page verbatim.
+    async fn readdir_page_held(
+        &self,
+        v_idx: usize,
+        local_dir: Ino,
+        offset: u64,
+        max: usize,
+    ) -> Result<Vec<(u64, DirEntry)>> {
+        if !self
+            .volumes
+            .iter()
+            .any(|v| v.filters_unpublished_children())
+        {
+            return self.volumes[v_idx]
+                .readdir_page(local_dir, offset, max)
+                .await;
+        }
+        let mut out: Vec<(u64, DirEntry)> = Vec::new();
+        let mut cursor = offset;
+        while out.len() < max {
+            let want = max - out.len();
+            let page = self.volumes[v_idx]
+                .readdir_page(local_dir, cursor, want)
+                .await?;
+            let short = page.len() < want;
+            let Some((last, _)) = page.last() else {
+                break;
+            };
+            cursor = *last;
+            for (cookie, entry) in page {
+                let (child_v, child_local) = self.route_ino(entry.ino);
+                if self.volumes[child_v].holds_slot_of(child_local) {
+                    out.push((cookie, entry));
+                }
+            }
+            if short {
+                break;
+            }
+        }
+        Ok(out)
     }
 
     /// One cookie-paged readdir step against `dir`'s volume (design
@@ -2137,9 +2197,7 @@ impl RoutedMetaBackend {
         let (v_idx, local_dir) = self.route_ino(dir);
         self.check_volume_enabled(v_idx)?;
         let _guard = self.volumes[v_idx].dlm().lock_inode_shared(local_dir).await;
-        self.volumes[v_idx]
-            .readdir_page(local_dir, offset, max)
-            .await
+        self.readdir_page_held(v_idx, local_dir, offset, max).await
     }
 
     /// [`Metadata::create_with_rdev`] with an INITIAL SIZE committed in

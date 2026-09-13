@@ -930,6 +930,14 @@ pub struct KvMetaBackend {
     /// The write gate (K6a hand-off): reads serve, every mutation is
     /// withheld. Two causes reach it — see [`ReadOnlyCause`].
     read_only: bool,
+    /// The open's posture as the forest replay saw it: `true` for every
+    /// door but the write mount's (`open_read_only`, `open_co_writer`,
+    /// `open_peer_owned`, `open_probe`) and for a writer degraded by §4.11
+    /// unknown-ro bits — the mount that skipped the window records of
+    /// unpublished slot trees at replay, and therefore the mount whose
+    /// directory listings filter children of those slots
+    /// ([`Self::readdir_page`]). Never true on a write mount.
+    non_writer: bool,
     /// WHY this volume is read-only. The write gate and the guarantee-class
     /// row both need to tell a §4.11 forward-compatibility degradation
     /// (unknown `features_ro` bits — an accident of the format) apart from
@@ -1951,15 +1959,14 @@ impl KvMetaBackend {
         // stay as the crash-window belt-and-braces.
         let seq = Arc::new(AtomicU64::new(ledger.seq.max(ledger.node_seq_watermark)));
 
+        // §4.11's unknown-ro bits degrade a writer's open to a non-writer
+        // for the replay too: a mount that may not write mints nothing.
+        let replay_posture = if sb.unknown_ro() != 0 {
+            OpenPosture::NonWriter
+        } else {
+            posture
+        };
         let (trees, max_replayed_ino, max_replayed_guest) = if sb.symmetric_forest_stamped() {
-            // §4.11's unknown-ro bits degrade a writer's open to a
-            // non-writer for the replay too: a mount that may not write
-            // mints nothing.
-            let replay_posture = if sb.unknown_ro() != 0 {
-                OpenPosture::NonWriter
-            } else {
-                posture
-            };
             Self::open_forest_and_replay(
                 path,
                 &sb,
@@ -2388,6 +2395,7 @@ impl KvMetaBackend {
             strict,
             needs_flush: AtomicBool::new(false),
             read_only,
+            non_writer: replay_posture == OpenPosture::NonWriter,
             ro_cause,
             failed: AtomicBool::new(false),
             journal_failures: AtomicU64::new(0),
@@ -3102,6 +3110,40 @@ impl KvMetaBackend {
             TreeSet::Forest { forest, .. } => Some(forest),
             TreeSet::Flat { .. } => None,
         }
+    }
+
+    /// Whether this mount's directory listings must be FILTERED to the
+    /// slot trees it holds: a non-writer of a forest (S5 reader, co-writer,
+    /// probe, a §4.11-degraded writer) serves the slot trees tree 0 named
+    /// at its last poll, while a dentry lives in its PARENT's slot and
+    /// names a child in the CHILD's — the one edge that crosses slots —
+    /// and the parent's leaf log carries the child's dentry as soon as a
+    /// threshold append lands it, checkpoint or not. `false` on every
+    /// write mount (it holds every slot it ever wrote) and on a flat
+    /// volume (one tree per kind): one bool, so the shipped listing path
+    /// pays nothing.
+    pub fn filters_unpublished_children(&self) -> bool {
+        self.non_writer && self.forest().is_some()
+    }
+
+    /// Whether this mount HOLDS the slot tree of `local` — the condition
+    /// its `lookup` (dentry + `getattr(child)`) answers for a child, and
+    /// therefore the condition under which its `readdir` lists the child's
+    /// name (`RoutedMetaBackend::readdir_stream`): the partial view a
+    /// non-writer serves is a consistent snapshot, adopted whole at the
+    /// poll that names the slot (design-symmetric-metadata §5.3.4). Always
+    /// `true` where [`Self::filters_unpublished_children`] is `false`.
+    pub fn holds_slot_of(&self, local: Ino) -> bool {
+        if !self.filters_unpublished_children() {
+            return true;
+        }
+        let held = self
+            .forest()
+            .is_some_and(|f| f.tree(super::record::forest_slot_of_ino(local)).is_some());
+        if !held {
+            super::META_KV_FOREST_READER_UNPUBLISHED_CHILDREN.fetch_add(1, Ordering::Relaxed);
+        }
+        held
     }
 
     /// The live root of slot tree `slot` (`None` = the slot has no tree —

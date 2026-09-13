@@ -13479,6 +13479,14 @@ impl SqueezefsFilesystem {
                     "meta_kv_forest_reader_window_skips".into(),
                     load(&meta_kv::META_KV_FOREST_READER_WINDOW_SKIPS),
                 );
+                // Directory entries a non-writer withheld from a `readdir`
+                // page because the CHILD's slot tree is not yet published
+                // (what keeps `readdir` and `lookup` agreeing on a partial
+                // view); 0 on every write mount.
+                metrics.insert(
+                    "meta_kv_forest_reader_unpublished_children".into(),
+                    load(&meta_kv::META_KV_FOREST_READER_UNPUBLISHED_CHILDREN),
+                );
                 // LEAF-MERGE finalized (§4.6a (c)/(e)): `interior_merges`
                 // = the level-≥1 subset of `node_merges` (cross-parent
                 // shrinkage's face); `merge_laps` = whole-volume sweep

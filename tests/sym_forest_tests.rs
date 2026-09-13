@@ -1545,6 +1545,20 @@ async fn a_live_reader_of_a_forest_resolves_guests_minted_after_its_mount() {
 /// is the S5 bounded-stale contract: the reader SKIPS those records (it
 /// sees the slot at the poll after the writer publishes), never routes
 /// them into RAM-only trees the epoch drop pass would tear from under it.
+///
+/// **What the reader answers meanwhile (Issue 23):** its view is partial
+/// BY SLOT — the slot trees tree 0 named at its last poll serve (their
+/// window records included), a slot it does not hold answers as absent
+/// everywhere at once: `lookup` ENOENT, `getattr` ENOENT, and `readdir`
+/// OMITS the name (a dentry lives in the parent's slot and names a child
+/// in the child's — the one cross-slot edge; the routed pager lists a
+/// child iff the mount holds the child's slot tree, which is what its
+/// `lookup` answers). The pin asserts both faces agree name by name, and
+/// that every skipped record appears at the first poll after the writer
+/// publishes — the whole slot at once, inside the published staleness
+/// bound. Skipping the WHOLE window was rejected: the `writer_claim`
+/// heartbeat is never checkpointed per beat, and the probes and the
+/// reader's guard rows read it from the window.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_reader_of_a_forest_with_unpublished_slots_in_the_window_writes_nothing() {
     struct Cleanup;

@@ -228,6 +228,17 @@ pub static META_KV_FOREST_KEY_VIOLATIONS: AtomicU64 = AtomicU64::new(0);
 /// `meta_kv_forest_reader_window_skips`.
 pub static META_KV_FOREST_READER_WINDOW_SKIPS: AtomicU64 = AtomicU64::new(0);
 
+/// Directory entries a NON-WRITER open of a forest volume withheld from a
+/// `readdir` page because the CHILD's slot tree had no published root yet
+/// (the parent's leaf lists the name — a dentry lives in the parent's
+/// slot; the child's records live in the child's, which this mount does
+/// not hold). Withholding the name is what keeps the partial view a
+/// consistent snapshot: `readdir` never lists a name `lookup` refuses, and
+/// both serve the child at the poll that names its slot. 0 for the life
+/// of every write mount by construction. Surfaced as
+/// `meta_kv_forest_reader_unpublished_children`.
+pub static META_KV_FOREST_READER_UNPUBLISHED_CHILDREN: AtomicU64 = AtomicU64::new(0);
+
 /// Commit-path revalidation retries (design §4.6: a writer locked a leaf
 /// an SMO had superseded between resolution and lock — unlock, re-resolve,
 /// retry; SMOs are rare and serialized, so the loop is short). Surfaced as

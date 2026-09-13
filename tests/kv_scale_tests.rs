@@ -1550,6 +1550,7 @@ async fn rightmost_separator_pointer_record_replays_clean() {
     }
     std::env::set_var("SQUEEZEFS_META_FLUSH_INTERVAL_MS", "60000");
     let _cleanup = Cleanup;
+    let _ = env_logger::builder().is_test(true).try_init();
 
     let file = NamedTempFile::new().expect("temp volume");
     file.as_file().set_len(128 * 1024 * 1024).unwrap();
@@ -1612,6 +1613,148 @@ async fn rightmost_separator_pointer_record_replays_clean() {
         );
     }
     re.shutdown().await.unwrap();
+}
+
+/// **A shutdown signalled while the checkpoint task is inside its
+/// maintenance pass completes within the tick, never a cadence later**
+/// (review round 4 of the symmetric-forest PR, Issue 26 — the attribution
+/// of `rightmost_separator_pointer_record_replays_clean`'s 60 s stamped
+/// stall: the test thread sat in `re.shutdown().await` on `ckpt_join`
+/// while both meta lanes idled and the journal lane parked in its ring).
+///
+/// `shutdown()` signalled the task with `notify_waiters`, which wakes the
+/// waiters REGISTERED at that instant and stores no permit; the task
+/// reads `shutting_down` only after its `timeout_at(next_tick,
+/// notified())` wakes. A shutdown that lands while the task is BUSY — a
+/// §4.6 pt 1 threshold pass running an SMO — finds no waiter, and the
+/// task then parks on a fresh `notified()` until the cadence deadline
+/// before it sees the flag: one full `SQUEEZEFS_META_FLUSH_INTERVAL_MS`
+/// (60 s here; the shipped ≤ 1 s at every unmount that races a pass).
+/// The forest exposed it: a replayed window folds into ONE mixed root
+/// leaf (988 KB → 25 parts here) whose split is still running when the
+/// test calls `shutdown`; a flat volume's three per-kind folds are done
+/// by then — same race, not reached. The pin holds the task inside the
+/// pass deterministically with the SMO build-pause seam (no locks held
+/// there — commits proceed), calls `shutdown` from another task, releases
+/// the seam, and bounds the join at 10 s ≪ the parked cadence, on either
+/// layout.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn shutdown_signalled_mid_maintenance_pass_completes_within_the_tick() {
+    use squeezefs::meta_backend::kv::record::{NATIVE_FOREST_SLOT, TREE_XATTRS};
+    use squeezefs::meta_backend::kv::tree::{
+        test_smo_build_pause_arm_slot, test_smo_build_pause_release, TEST_SMO_BUILD_PAUSED,
+        TEST_SMO_BUILD_PAUSE_TREE,
+    };
+    struct Cleanup;
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            std::env::remove_var("SQUEEZEFS_META_FLUSH_INTERVAL_MS");
+            test_smo_build_pause_release();
+            *TEST_SMO_BUILD_PAUSED.lock().expect("seam mutex") = None;
+        }
+    }
+    std::env::set_var("SQUEEZEFS_META_FLUSH_INTERVAL_MS", "60000");
+    let _cleanup = Cleanup;
+    let _ = env_logger::builder().is_test(true).try_init();
+
+    let file = NamedTempFile::new().expect("temp volume");
+    file.as_file().set_len(128 * 1024 * 1024).unwrap();
+    let cfg = BuilderConfig {
+        node_size: 64 * 1024,
+        journal_len_override: Some(8 * 1024 * 1024),
+        hash_seed: TEST_SEED,
+        uuid: TEST_UUID,
+    };
+    ImageBuilder::new(cfg)
+        .unwrap()
+        .build(file.path(), 128 * 1024 * 1024)
+        .await
+        .unwrap();
+    let be = KvMetaBackend::open(file.path()).await.unwrap();
+
+    // Past the FIRST split unarmed, so the leaf the armed SMO later
+    // replaces is a rightmost leaf and never the one carrying ino 1 (the
+    // shutdown's own claim delete commits there).
+    let splits = || squeezefs::meta_backend::kv::META_KV_NODE_SPLITS.load(Ordering::Relaxed);
+    let splits0 = splits();
+    let mut i = 0u32;
+    while splits() < splits0 + 1 {
+        let f = be
+            .create(ROOT_INO, &format!("y{i:05}"), libc::S_IFREG | 0o644, 0, 0)
+            .await
+            .unwrap();
+        be.setxattr(f.ino, "user.fat", &vec![0xAB; 8000])
+            .await
+            .unwrap();
+        i += 1;
+        assert!(i < 5_000, "the storm never split the tree — harness bug");
+        if i.is_multiple_of(8) {
+            tokio::task::yield_now().await;
+        }
+    }
+    // Quiesce: every overlay flushed and the maintenance queue drained, so
+    // the only wake left to the checkpoint task is the one the shutdown
+    // sends (a commit whose leaf crosses the 4 KiB overlay threshold would
+    // hand the task a PERMIT and rescue the race by accident — which is
+    // exactly why the original reproducer stalls on 7 runs of 8, not all).
+    be.checkpoint_now().await.unwrap();
+    // Arm the seam for the tree the storm splits (the xattr tree on a
+    // flat volume, the native slot tree on a forest one) and storm ONLY
+    // until the checkpoint task PARKS inside its maintenance pass; then
+    // join the storm so no commit is in flight when the signal lands.
+    if be.symmetric_forest() {
+        test_smo_build_pause_arm_slot(NATIVE_FOREST_SLOT);
+    } else {
+        TEST_SMO_BUILD_PAUSE_TREE.store(u64::from(TREE_XATTRS), Ordering::SeqCst);
+    }
+    // ONE commit at a time, each given the task's turn: a commit that
+    // crosses the overlay threshold hands the task a permit, the task
+    // consumes it at the wake that starts the pass, and the pass parks
+    // on the seam — so when it parks, NO permit is outstanding (a second
+    // commit in flight would leave one and rescue the race by accident).
+    let parked = || TEST_SMO_BUILD_PAUSED.lock().expect("seam mutex").is_some();
+    let mut j = 100_000u32;
+    while !parked() {
+        let f = be
+            .create(ROOT_INO, &format!("y{j:05}"), libc::S_IFREG | 0o644, 0, 0)
+            .await
+            .expect("storm create");
+        be.setxattr(f.ino, "user.fat", &vec![0xAB; 8000])
+            .await
+            .expect("storm setxattr");
+        j += 1;
+        assert!(
+            j < 105_000,
+            "the storm never parked an SMO under the armed seam"
+        );
+        let turn = Instant::now();
+        while !parked() && turn.elapsed() < Duration::from_millis(100) {
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    }
+
+    // The task is inside its pass, registered on nothing. Signal the
+    // shutdown NOW, from another task, then let the pass finish.
+    let closer = Arc::clone(&be);
+    let t0 = Instant::now();
+    let closing = tokio::spawn(async move { closer.shutdown().await });
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    test_smo_build_pause_release();
+    let joined = tokio::time::timeout(Duration::from_secs(10), closing)
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "shutdown signalled mid-pass did not complete within 10 s (elapsed {:?}) — \
+                 the checkpoint task slept to its cadence deadline before reading the flag",
+                t0.elapsed()
+            )
+        })
+        .expect("shutdown task");
+    joined.expect("clean shutdown");
+    eprintln!(
+        "[shutdown-mid-pass] shutdown completed in {:?} against a 60 s cadence",
+        t0.elapsed()
+    );
 }
 
 // ---------------------------------------------------------------------------

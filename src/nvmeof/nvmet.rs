@@ -233,6 +233,31 @@ pub fn resolve_backing_canonical(device_path: &str) -> String {
     canon
 }
 
+/// The `target systemd-unit` emission (§6.5/§6.6): configfs is empty at
+/// boot by nature — `Type=oneshot` + `RemainAfterExit=yes`, ExecStart =
+/// the product's `restore --target-stack nvmet`. Every value is baked at
+/// emission (no `${VAR}` indirection — systemd expands unset variables to
+/// empty and would silently render a malformed command line).
+pub fn render_nvmet_unit(squeezefs_exe: &Path) -> String {
+    format!(
+        "# squeezefs nvmeof target systemd-unit --target-stack nvmet  (stdout; operator \
+         installs).\n\
+         # The kernel nvmet target is configfs state — empty at boot by nature; this\n\
+         # oneshot unit replays the share ledger through the product's restore verb.\n\
+         [Unit]\n\
+         Description=SqueezeFS-managed kernel nvmet NVMe-oF target (ledger restore)\n\
+         Wants=network-online.target\n\
+         After=network-online.target\n\
+         [Service]\n\
+         Type=oneshot\n\
+         RemainAfterExit=yes\n\
+         ExecStart={exe} nvmeof restore --target-stack nvmet\n\
+         [Install]\n\
+         WantedBy=multi-user.target\n",
+        exe = squeezefs_exe.display(),
+    )
+}
+
 /// The kernel-nvmet target stack (§6.1/§6.6): configfs plumbing, port
 /// allocator, loop handling — riding the shared ledger intent protocol.
 pub struct NvmetStack {
@@ -522,7 +547,6 @@ impl NvmetStack {
                 listeners: listeners_of.remove(&nqn).unwrap_or_default(),
                 enabled,
                 nsids,
-                bdev_name: None, // SPDK-only
                 allow_hosts,
                 subnqn: nqn,
             });

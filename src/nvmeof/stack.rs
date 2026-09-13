@@ -2,7 +2,7 @@
 //!
 //! These types are the **schema v1** of the share ledger
 //! (`docs/design-nvmeof-target-management.md` §6.4): the versioned,
-//! forward-only record store that owns cross-stack dispatch, ownership
+//! forward-only record store that owns stack dispatch, ownership
 //! metadata, nvmet bookkeeping (loop devices, port ids), and the
 //! write-ahead intent states. Field-presence rules (§6.4):
 //!
@@ -10,11 +10,12 @@
 //!   (`pending` | `active` | `removing`), `backing_path`,
 //!   `backing_canonical`, `listeners` (≥ 1 entry; `ip` + `port` required
 //!   per entry), `created_utc`.
-//! * **Optional (`Option` here)**: `ns_uuid` (the both-stack namespace
-//!   identity, populated from N2/nvmet / N4/spdk on — null on N1-era
-//!   records); `nsid` / `ptpl_file` / `bdev_name` (SPDK-only, null on
-//!   nvmet); `loop_device` + per-listener `nvmet_port_id` (nvmet-only,
-//!   null on SPDK); `adopted_from` (written only by `nvmeof adopt`,
+//! * **Optional (`Option` here)**: `ns_uuid` (the namespace identity,
+//!   populated from N2 on — null on N1-era records); `nsid` /
+//!   `ptpl_file` / `bdev_name` (populated ONLY by the retired SPDK stack —
+//!   kept so its ledger records stay decodable, never written by the
+//!   nvmet stack); `loop_device` + per-listener `nvmet_port_id`
+//!   (nvmet-only); `adopted_from` (written only by `nvmeof adopt`,
 //!   PR 4b — absent on shares created by `share`).
 //!
 //! Schema evolution is forward-only: any field addition is a
@@ -28,7 +29,8 @@
 //! trait** (§6.1) and its request/report vocabulary: small, synchronous
 //! one-shot control-plane verbs (the `ReservationClient` precedent) with
 //! injectable seams instead of env-var mocks. `NvmetStack`
-//! (`super::nvmet`) implements it; `SpdkStack` follows at N3/N4.
+//! (`super::nvmet`) is its ONE implementation since SPDK was retired as a
+//! target (R-SYM-8, `docs/design-symmetric-metadata.md` §5.8.1).
 
 use serde::{Deserialize, Serialize};
 use std::io;
@@ -65,8 +67,8 @@ impl ShareState {
 /// own configfs port object with its own recorded id
 /// (`nvmet_port_id`, §6.6) — **null on N1-era records** (the old
 /// allocator's small-int ids are deliberately untracked; N1 `unshare`
-/// keeps the old all-ports symlink walk) and null on SPDK, where
-/// listeners need no id bookkeeping.
+/// keeps the old all-ports symlink walk) and null on the retired SPDK
+/// stack's records, where listeners needed no id bookkeeping.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Listener {
@@ -228,14 +230,9 @@ pub struct ShareRequest {
     pub subnqn: String,
     pub backing_path: String,
     pub backing_canonical: String,
-    /// `--nsid` (§6.2: SPDK-only — the SPDK stack pins
-    /// `unwrap_or(1)` via `add_ns -n` and records it; the nvmet stack's
-    /// namespace index is structurally fixed at 1, so grammar validation
-    /// guarantees `None`/`Some(1)` there and nothing is recorded).
-    pub nsid: Option<u32>,
-    /// The both-stack namespace identity (§6.4): seeded by `--ns-uuid`
-    /// or generated once at share time — recorded, stamped
-    /// (nvmet `device_uuid` / SPDK `add_ns -u`), re-presented by restore.
+    /// The namespace identity (§6.4): seeded by `--ns-uuid` or generated
+    /// once at share time — recorded, stamped as nvmet `device_uuid`,
+    /// re-presented by restore.
     pub ns_uuid: String,
     /// One (ip, port) per listener; `nvmet_port_id` is allocated by the
     /// nvmet stack and recorded (`None` on entry).
@@ -245,16 +242,16 @@ pub struct ShareRequest {
     pub allow_hosts: Vec<String>,
 }
 
-/// One live share as the stack reports it (configfs walk / RPC
-/// `nvmf_get_subsystems`) — reconciled against the ledger by `list` and
-/// classified by `nvmeof adopt` (§6.10: the walkers ARE the adopt
-/// classification probes; adopt reads the live object into a candidate
-/// record from exactly this shape).
+/// One live share as the stack reports it (the configfs walk) —
+/// reconciled against the ledger by `list` and classified by `nvmeof
+/// adopt` (§6.10: the walker IS the adopt classification probe; adopt
+/// reads the live object into a candidate record from exactly this
+/// shape).
 #[derive(Debug, Clone)]
 pub struct LiveShare {
     pub subnqn: String,
-    /// The device the target serves (nvmet `device_path` / the SPDK aio
-    /// bdev filename; may be a loop node for nvmet file backings).
+    /// The device the target serves (nvmet `device_path`; may be a loop
+    /// node for file backings).
     pub device_path: String,
     /// `device_path` resolved toward the operator's backing: loop nodes
     /// resolve to their backing file when the kernel exposes it.
@@ -264,15 +261,11 @@ pub struct LiveShare {
     pub enabled: bool,
     /// Every namespace index the live object carries (§6.10 shape
     /// classification: nvmet supports exactly `[1]` — the structural
-    /// convention — and SPDK exactly one namespace; anything else is
-    /// `adopt_shape_unsupported`).
+    /// convention; anything else is `adopt_shape_unsupported`).
     pub nsids: Vec<u32>,
-    /// SPDK only: the serving bdev's name (recorded by adopt so
-    /// unshare/restore drive the same object); `None` on nvmet.
-    pub bdev_name: Option<String>,
-    /// The live host-NQN allowlist (nvmet `allowed_hosts` links / SPDK
-    /// subsystem hosts); empty = allow-any. Recorded by adopt so a
-    /// restored adopted share never silently widens to allow-any.
+    /// The live host-NQN allowlist (nvmet `allowed_hosts` links); empty =
+    /// allow-any. Recorded by adopt so a restored adopted share never
+    /// silently widens to allow-any.
     pub allow_hosts: Vec<String>,
 }
 
@@ -294,8 +287,9 @@ pub enum RestoreOutcome {
     /// `removing` intent — the interrupted teardown was resumed and the
     /// record deleted.
     TeardownResumed,
-    /// Not replayed, with the loud reason (e.g. an SPDK-stack record at a
-    /// milestone where SPDK restore is not yet live).
+    /// Not replayed, with the loud reason — the retired SPDK stack's
+    /// records: listed with the re-share sequence, never re-presented
+    /// (R-SYM-8).
     Skipped(String),
     /// Loud per-record failure (collected, never short-circuiting the
     /// report) — e.g. existing-but-mismatched live state, never clobbered.
@@ -325,9 +319,8 @@ impl RestoreReport {
     }
 }
 
-/// Stack health/inventory snapshot (§6.9). N2 carries the nvmet variant's
-/// fields (module presence, configfs, object counts, per-ns PR
-/// enablement); the SPDK lifecycle PR (N3) extends the payload.
+/// Stack health/inventory snapshot (§6.9): module presence, configfs,
+/// object counts, per-ns PR enablement.
 #[derive(Debug, Clone)]
 pub struct TargetStatus {
     pub stack: StackKind,
@@ -339,24 +332,22 @@ pub struct TargetStatus {
     pub resv_enabled_namespaces: usize,
 }
 
-/// One NVMe-oF target stack the product can manage (§6.1). Implementations:
-/// `NvmetStack` (kernel configfs, N2) and `SpdkStack` (JSON-RPC to
-/// spdk_tgt, N3/N4). Methods are synchronous one-shot control-plane
+/// One NVMe-oF target stack the product can manage (§6.1). The ONE
+/// implementation is `NvmetStack` (kernel configfs) — SPDK was retired
+/// as a target (R-SYM-8). Methods are synchronous one-shot control-plane
 /// operations (CLI-driven).
 pub trait TargetStack: Send + Sync {
     fn kind(&self) -> StackKind;
 
     /// Loud, actionable, ordered checks. Every error names its remediation
-    /// verb. NEVER returns a suggestion to fall back to the other stack as
-    /// an automatic action — only as an explicit operator choice in text.
+    /// verb.
     fn preflight(&self, op: PreflightOp) -> Result<(), PreflightError>;
 
     fn share(&self, req: &ShareRequest) -> Result<ShareRecord, NvmeofError>;
     fn unshare(&self, rec: &ShareRecord) -> Result<(), NvmeofError>;
 
-    /// Live state as the stack reports it (RPC get_subsystems / configfs
-    /// walk) — reconciled against the ledger by `list`
-    /// (managed / down / foreign).
+    /// Live state as the stack reports it (the configfs walk) —
+    /// reconciled against the ledger by `list` (managed / down / foreign).
     fn live_shares(&self) -> Result<Vec<LiveShare>, NvmeofError>;
 
     /// Re-establish every ledger share (idempotent; per-share errors are

@@ -50,7 +50,6 @@ fn req(subnqn: &str, backing: &str, ns_uuid: &str, listeners: &[(&str, u16)]) ->
         subnqn: subnqn.to_string(),
         backing_path: backing.to_string(),
         backing_canonical: backing.to_string(),
-        nsid: None,
         ns_uuid: ns_uuid.to_string(),
         listeners: listeners
             .iter()
@@ -808,16 +807,15 @@ fn test_nvmet_live_shares_walk_and_target_status_counts() {
 // mod-level pure helpers (per-stack flag semantics + backing preparation)
 // ---------------------------------------------------------------------------
 
-/// §6.2 per-stack flag semantics: `--nsid` is SPDK-only; the nvmet
-/// namespace index is structurally fixed at 1, so `--nsid` ≠ 1 with
-/// nvmet refuses loud (the `--disk-cache-paths` precedent — never a
-/// silent flag-ignore) while `--nsid 1` (the structural index) passes.
+/// §6.2 flag semantics: the nvmet namespace index is structurally fixed
+/// at 1, so `--nsid` ≠ 1 refuses loud (the `--disk-cache-paths`
+/// precedent — never a silent flag-ignore) while `--nsid 1` (the
+/// structural index) passes.
 #[test]
-fn test_validate_share_flags_nsid_per_stack_semantics() {
+fn test_validate_share_flags_nsid_semantics() {
     use squeezefs::nvmeof::validate_share_flags;
 
-    let err = validate_share_flags(StackKind::Nvmet, Some(2), None)
-        .expect_err("--nsid 2 with nvmet must refuse loud");
+    let err = validate_share_flags(Some(2), None).expect_err("--nsid 2 must refuse loud");
     let msg = err.to_string();
     assert!(msg.contains("--nsid"), "must name the flag: {msg}");
     assert!(
@@ -825,18 +823,14 @@ fn test_validate_share_flags_nsid_per_stack_semantics() {
         "must state the structural convention: {msg}"
     );
 
-    validate_share_flags(StackKind::Nvmet, Some(1), None)
-        .expect("--nsid 1 matches the structural index and passes");
-    validate_share_flags(StackKind::Nvmet, None, None).expect("no nsid is the default");
-    validate_share_flags(StackKind::Spdk, Some(7), None)
-        .expect("--nsid is SPDK-only and any value validates for spdk");
+    validate_share_flags(Some(1), None).expect("--nsid 1 matches the structural index and passes");
+    validate_share_flags(None, None).expect("no nsid is the default");
 
-    // --ns-uuid seeds BOTH stacks and must parse as a UUID.
-    let err = validate_share_flags(StackKind::Nvmet, None, Some("not-a-uuid"))
+    // --ns-uuid must parse as a UUID.
+    let err = validate_share_flags(None, Some("not-a-uuid"))
         .expect_err("malformed --ns-uuid must refuse loud");
     assert!(err.to_string().contains("--ns-uuid"), "{err}");
-    validate_share_flags(StackKind::Nvmet, None, Some(UUID_A)).expect("well-formed uuid");
-    validate_share_flags(StackKind::Spdk, None, Some(UUID_A)).expect("both stacks");
+    validate_share_flags(None, Some(UUID_A)).expect("well-formed uuid");
 }
 
 /// Missing backing refuses loud (the silent 1 GiB sparse auto-create is

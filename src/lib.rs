@@ -316,7 +316,7 @@ const DEFAULT_ROOT_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/b
 ///
 /// Dropped: empty entries, relative entries, non-directories, and
 /// directories writable by group or other. Kept in the caller's order
-/// (operators legitimately front-load `/usr/local/bin` for SPDK tooling).
+/// (operators legitimately front-load `/usr/local/bin` for nvme-cli builds).
 /// An input with no survivors yields `DEFAULT_ROOT_PATH` rather than an
 /// empty `PATH` — an empty `PATH` resolves nothing and would break every
 /// verb with a confusing error instead of a hardened one.

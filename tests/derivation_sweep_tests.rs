@@ -1946,10 +1946,10 @@ fn a_shipped_frame_fits_one_conveyor_drain_at_every_width() {
 /// The `std::thread::available_parallelism` reader census: after rung 3c
 /// the direct readers are exactly the NON-daemon-sizing set — the sizing
 /// roots' own syscall fallbacks (src/cpu.rs, sqz_blocking's unfed-embedding
-/// fallback), the bench tool's load generation, the one-shot SPDK build's
-/// make -j, the CLIENT-process shim, and the fuse3 fork's internal
-/// fallbacks/shards (its own excluded workspace; the transport's queue
-/// COUNT is the exempt possible-CPUs census above). A new direct reader
+/// fallback), the bench tool's load generation, the CLIENT-process shim,
+/// and the fuse3 fork's internal fallbacks/shards (its own excluded
+/// workspace; the transport's queue COUNT is the exempt possible-CPUs
+/// census above). A new direct reader
 /// is a red test, never a drift: daemon sizing reads the divided root
 /// (`crate::cpu::process_parallelism`) — or, inside squeezefs-ipc, the
 /// parallelism the daemon feeds — instead.
@@ -2005,9 +2005,6 @@ fn available_parallelism_reader_census_is_pinned_to_the_non_daemon_set() {
         // The bench TOOL's load-generation width — measures the machine
         // under test, not a daemon resource (class c).
         "src/bench.rs",
-        // One-shot external `make -j` for the SPDK source build — a
-        // build-process width, not a daemon resource (class c).
-        "src/nvmeof/spdk/lifecycle.rs",
         // The blocking pool's unfed-embedding fallback: the daemon feeds
         // the divided root via `set_sizing_parallelism` at startup;
         // foreign hosts/unit tests fall back to the raw mask.

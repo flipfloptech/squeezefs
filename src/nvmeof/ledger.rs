@@ -5,11 +5,12 @@
 //! registry (nvmeof.rs:1019–1033 pre-split: the root writability probe
 //! `fs::write(&path, "[]")` ran on **every** path resolution, so
 //! `load_shares()` destroyed the file before reading it — share
-//! persistence never worked in production). The ledger exists for
-//! exactly the jobs the SPDK-native `save_config` cannot do: nvmet
-//! restore, `unshare` stack dispatch, the cross-stack duplicate-backing
-//! guard, `list` ownership metadata, and the crash-window intent
-//! records.
+//! persistence never worked in production). The ledger owns nvmet
+//! restore, `unshare` stack dispatch, the duplicate-backing guard's
+//! ledger half, `list` ownership metadata, and the crash-window intent
+//! records. Records the RETIRED SPDK stack wrote (R-SYM-8) stay
+//! decodable — listed with the re-share sequence, never re-presented,
+//! removed ledger-only by `unshare`.
 //!
 //! Laws (§6.4, each pinned by a test in `tests/nvmeof_ledger_tests.rs`):
 //!
@@ -100,13 +101,6 @@ impl Ledger {
     /// The ledger file path (for assertions/diagnostics).
     pub fn ledger_path(&self) -> PathBuf {
         self.state_dir.join(LEDGER_FILE)
-    }
-
-    /// The state directory this ledger is rooted at (§6.4 state homes —
-    /// shared with the SPDK-native state; the adopt flow probes
-    /// `<state>/spdk/ptpl/<uuid>.json` existence through it).
-    pub fn state_dir(&self) -> &Path {
-        &self.state_dir
     }
 
     fn lock_path(&self) -> PathBuf {

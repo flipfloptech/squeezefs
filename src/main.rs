@@ -808,8 +808,7 @@ enum Commands {
     },
     /// Manage NVMe over Fabrics target shares and client connections
     ///
-    /// Dual-stack: SPDK is the default target stack; select kernel
-    /// nvmet with --target-stack nvmet.
+    /// The kernel nvmet target is the one supported target stack.
     Nvmeof {
         #[command(subcommand)]
         action: NvmeofActions,
@@ -930,10 +929,13 @@ enum StorageVolumeActions {
 }
 
 /// `--target-stack` argument (§6.2 of the NVMe-oF target-management
-/// design): explicit selection, default `spdk`, loud failure — never a
-/// silent cross-stack fallback.
+/// design): explicit selection, default `nvmet`, loud failure. The
+/// retired `spdk` spelling stays declared (hidden) so the refusal is ours
+/// — naming nvmet and the re-share sequence — instead of clap's generic
+/// invalid-value error (the `--meta-slots` precedent).
 #[derive(clap::ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
 enum TargetStackArg {
+    #[value(hide = true)]
     Spdk,
     Nvmet,
 }
@@ -951,8 +953,7 @@ impl From<TargetStackArg> for squeezefs::nvmeof::StackKind {
 enum NvmeofActions {
     /// Share a local block device or file as an NVMe-oF subsystem
     ///
-    /// The default target stack is spdk; select kernel nvmet with
-    /// --target-stack nvmet.
+    /// Served by the kernel nvmet target (the one supported stack).
     Share {
         /// Local backing path (e.g. /dev/nvme1n1 or /srv/backing.img)
         backing_path: String,
@@ -966,19 +967,19 @@ enum NvmeofActions {
         /// IP address(es) to bind listeners to (comma-separated or repeated)
         #[arg(long, required = true, value_delimiter = ',')]
         ip: Vec<String>,
-        /// Target stack (flag > SQUEEZEFS_NVMEOF_TARGET_STACK env > default spdk)
+        /// Target stack (flag > SQUEEZEFS_NVMEOF_TARGET_STACK env > default nvmet)
         #[arg(long, value_enum)]
         target_stack: Option<TargetStackArg>,
-        /// Namespace id (SPDK only)
+        /// Namespace id — the kernel-nvmet index is structurally fixed at 1
         ///
-        /// The kernel-nvmet namespace index is structurally fixed at 1;
-        /// other values with nvmet are an error.
-        #[arg(long)]
+        /// Any other value is an error. Kept declared so the refusal is
+        /// ours, never a silent flag-ignore.
+        #[arg(long, hide = true)]
         nsid: Option<u32>,
         /// Namespace identity UUID
         ///
-        /// Recorded and re-presented by restore on both stacks.
-        /// Generated once at share time when absent.
+        /// Recorded and re-presented by restore. Generated once at share
+        /// time when absent.
         #[arg(long)]
         ns_uuid: Option<String>,
         /// Create a missing file backing as a sparse file of this size
@@ -992,68 +993,43 @@ enum NvmeofActions {
         /// Default: allow any host, the trusted-fabric posture.
         #[arg(long)]
         allow_host: Vec<String>,
-        /// Proceed despite SPDK target version drift from the pin
-        ///
-        /// SPDK only; an error with --target-stack nvmet.
-        #[arg(long)]
-        accept_version_drift: bool,
     },
     /// Stop sharing a target subsystem
     ///
     /// The stack is resolved from the share ledger, never guessed.
-    /// Unledgered NQNs are an error.
+    /// Unledgered NQNs are an error. A record left by the retired SPDK
+    /// stack is removed from the ledger only (step 1 of its re-share).
     Unshare {
         /// Subsystem NQN to unshare
         subnqn: String,
-        /// Tear down even with live initiator connections
-        ///
-        /// The SPDK stack detects live connections and refuses without
-        /// this flag.
-        #[arg(long)]
-        force: bool,
-        /// Proceed despite SPDK target version drift from the pin
-        ///
-        /// SPDK only; an error on nvmet-recorded NQNs.
-        #[arg(long)]
-        accept_version_drift: bool,
     },
     /// List ledgered shares and connected remote fabric disks
     ///
     /// Shares are reconciled against live target state and reported as
-    /// managed, down, pending, removing, or foreign.
+    /// managed, down, pending, removing, foreign, or retired-spdk.
     List {
         /// Emit machine-readable JSON
         #[arg(long)]
         json: bool,
     },
-    /// Re-establish ledgered shares on their recorded stacks
+    /// Re-establish ledgered shares on the kernel nvmet target
     ///
     /// Idempotent. Reconciles interrupted share/unshare intents and
-    /// prints a per-share report.
+    /// prints a per-share report. Records left by the retired SPDK
+    /// stack are reported as skipped and never re-presented.
     Restore {
-        /// Replay only records recorded for this stack
-        ///
-        /// A filter, never a retarget.
+        /// Target stack (nvmet is the only admissible value)
         #[arg(long, value_enum)]
         target_stack: Option<TargetStackArg>,
-        /// Proceed despite SPDK target version drift from the pin
-        ///
-        /// SPDK only; an error with --target-stack nvmet.
-        #[arg(long)]
-        accept_version_drift: bool,
     },
     /// Absorb a live unledgered share into management
     ///
     /// An explicit operator action: writes only the share ledger and
-    /// never touches the live target object. The stack is auto-detected
-    /// from where the subsystem lives.
+    /// never touches the live target object.
     Adopt {
-        /// Subsystem NQN to adopt (must be live on exactly one stack)
+        /// Subsystem NQN to adopt (must be live on the nvmet target)
         subnqn: String,
-        /// Disambiguate an NQN that is live on both stacks
-        ///
-        /// Without this flag such an adopt fails closed, naming both
-        /// holders. Never a retarget.
+        /// Target stack (nvmet is the only admissible value)
         #[arg(long, value_enum)]
         target_stack: Option<TargetStackArg>,
     },
@@ -1112,9 +1088,9 @@ enum NvmeofActions {
     },
     /// Manage the NVMe-oF target runtime
     ///
-    /// SPDK lifecycle: pinned install, hugepage setup,
-    /// start/stop/status, systemd-unit emission. The nvmet stack
-    /// implements the verbs where they are meaningful.
+    /// Kernel nvmet: readiness setup, start (ledger replay), status,
+    /// systemd-unit emission. The kernel target is not a process, so
+    /// stop refuses.
     Target {
         #[command(subcommand)]
         action: TargetActions,
@@ -1123,89 +1099,51 @@ enum NvmeofActions {
 
 #[derive(Subcommand, Debug, Clone)]
 enum TargetActions {
-    /// Build the pinned SPDK release from source
-    ///
-    /// Verifies the tag and commit sha, then builds into
-    /// /opt/squeezefs/spdk/<tag>/. SPDK only by definition.
+    // RETIRED with SPDK (design-symmetric-metadata §5.8.1, R-SYM-8,
+    // forward-only): the verb and its flags stay declared so the refusal
+    // is ours (loud, naming the successor) instead of clap's generic
+    // unknown-verb error.
+    /// RETIRED: built the pinned SPDK release; SPDK is no longer a target
+    #[command(hide = true)]
     Install {
-        /// Release to install; must equal the pinned tag
-        ///
-        /// Pin bumps are deliberate source changes, never a CLI flag.
-        #[arg(long)]
+        #[arg(long, hide = true)]
         version: Option<String>,
-        /// Consent to system package mutation
-        ///
-        /// Runs the pinned tree's scripts/pkgdep.sh. Default: probe the
-        /// toolchain and fail, listing the missing packages.
-        #[arg(long)]
+        #[arg(long, hide = true)]
         with_pkgdep: bool,
     },
-    /// Prepare the host for the selected target stack
+    /// Prepare the host for the kernel nvmet target
     ///
-    /// SPDK: reserves 2 MiB hugepages and records the prior value;
-    /// restore it with --restore-prior. nvmet: modprobe and configfs
-    /// mount checks.
+    /// modprobe and configfs mount checks.
     Setup {
-        /// Hugepage reservation in MiB (default 2048 = 1024 × 2 MiB pages)
-        #[arg(long, conflicts_with = "restore_prior")]
-        hugemem_mb: Option<u64>,
-        /// Restore nr_hugepages to the recorded prior value and clear the
-        /// record
-        #[arg(long)]
-        restore_prior: bool,
-        /// Target stack (flag > SQUEEZEFS_NVMEOF_TARGET_STACK env > default spdk)
+        /// Target stack (flag > SQUEEZEFS_NVMEOF_TARGET_STACK env > default nvmet)
         #[arg(long, value_enum)]
         target_stack: Option<TargetStackArg>,
     },
     /// Start the target
     ///
-    /// SPDK runs in pidfile mode: preflighted spawn, RPC-liveness
-    /// wait, then load_config. nvmet: modprobe and ledger restore.
+    /// modprobe and ledger restore: configfs is the running target.
     Start {
-        /// Target stack (flag > SQUEEZEFS_NVMEOF_TARGET_STACK env > default spdk)
+        /// Target stack (flag > SQUEEZEFS_NVMEOF_TARGET_STACK env > default nvmet)
         #[arg(long, value_enum)]
         target_stack: Option<TargetStackArg>,
-        /// Explicit reactor core mask (hex, e.g. 0x80000000)
-        ///
-        /// Default: one reactor on the highest online CPU.
-        #[arg(long, conflicts_with = "cores")]
-        core_mask: Option<String>,
-        /// Reactor core count, allocated from the highest online CPUs down
-        #[arg(long)]
-        cores: Option<u32>,
-        /// DPDK hugepage memory for spdk_tgt -s, in MiB (default 1024)
-        #[arg(long)]
-        dpdk_mem_mb: Option<u64>,
-        /// Proceed despite a target version that drifts from the pin
-        ///
-        /// A gate on mutating verbs only: status always reports, stop
-        /// warns.
-        #[arg(long)]
-        accept_version_drift: bool,
     },
     /// Stop the target
     ///
-    /// SPDK sequence: save_config, SIGTERM, a grace period, then
-    /// SIGKILL. Fails while ledgered shares have live consumers unless
-    /// --force is given.
+    /// Always an error: the kernel nvmet target is not a process. Tear
+    /// shares down with unshare instead.
     Stop {
-        /// Stop even with live initiator connections on ledgered shares
-        #[arg(long)]
-        force: bool,
-        /// Target stack (flag > SQUEEZEFS_NVMEOF_TARGET_STACK env > default spdk)
+        /// Target stack (flag > SQUEEZEFS_NVMEOF_TARGET_STACK env > default nvmet)
         #[arg(long, value_enum)]
         target_stack: Option<TargetStackArg>,
     },
     /// Report target health
     ///
-    /// Covers RPC liveness, version and drift from the pin, reactor
-    /// busy, hugepages, and ledger reconciliation. Never fails on
-    /// version drift.
+    /// Module presence, configfs, and subsystem/namespace/port counts.
     Status {
         /// Emit machine-readable JSON
         #[arg(long)]
         json: bool,
-        /// Target stack (flag > SQUEEZEFS_NVMEOF_TARGET_STACK env > default spdk)
+        /// Target stack (flag > SQUEEZEFS_NVMEOF_TARGET_STACK env > default nvmet)
         #[arg(long, value_enum)]
         target_stack: Option<TargetStackArg>,
     },
@@ -1214,18 +1152,9 @@ enum TargetActions {
     /// Values are baked at emission time. The unit is never installed;
     /// the operator installs it.
     SystemdUnit {
-        /// Target stack (flag > SQUEEZEFS_NVMEOF_TARGET_STACK env > default spdk)
+        /// Target stack (flag > SQUEEZEFS_NVMEOF_TARGET_STACK env > default nvmet)
         #[arg(long, value_enum)]
         target_stack: Option<TargetStackArg>,
-        /// Explicit reactor core mask (hex) to bake into ExecStart
-        #[arg(long, conflicts_with = "cores")]
-        core_mask: Option<String>,
-        /// Reactor core count from the highest online CPUs down
-        #[arg(long)]
-        cores: Option<u32>,
-        /// DPDK hugepage memory (spdk_tgt -s) to bake, in MiB (default 1024)
-        #[arg(long)]
-        dpdk_mem_mb: Option<u64>,
     },
 }
 
@@ -3890,7 +3819,6 @@ fn dispatch_nvmeof(action: NvmeofActions) -> Result<(), squeezefs::nvmeof::stack
             ns_uuid,
             create_size,
             allow_host,
-            accept_version_drift,
         } => {
             let create_size = match create_size {
                 Some(raw) => {
@@ -3912,7 +3840,6 @@ fn dispatch_nvmeof(action: NvmeofActions) -> Result<(), squeezefs::nvmeof::stack
                 ns_uuid,
                 create_size,
                 allow_hosts: allow_host,
-                accept_version_drift,
             })?;
             println!(
                 "Successfully shared '{}' as an NVMe-oF target ({} stack).",
@@ -3933,22 +3860,15 @@ fn dispatch_nvmeof(action: NvmeofActions) -> Result<(), squeezefs::nvmeof::stack
                 record.subnqn
             );
         }
-        NvmeofActions::Unshare {
-            subnqn,
-            force,
-            accept_version_drift,
-        } => {
-            squeezefs::nvmeof::unshare(&subnqn, force, accept_version_drift)?;
+        NvmeofActions::Unshare { subnqn } => {
+            squeezefs::nvmeof::unshare(&subnqn)?;
             println!("Successfully stopped sharing target NQN '{}'.", subnqn);
         }
         NvmeofActions::List { json } => {
             squeezefs::nvmeof::list(json)?;
         }
-        NvmeofActions::Restore {
-            target_stack,
-            accept_version_drift,
-        } => {
-            squeezefs::nvmeof::restore(target_stack.map(Into::into), accept_version_drift)?;
+        NvmeofActions::Restore { target_stack } => {
+            squeezefs::nvmeof::restore(target_stack.map(Into::into))?;
         }
         NvmeofActions::Adopt {
             subnqn,
@@ -4010,57 +3930,23 @@ fn dispatch_nvmeof(action: NvmeofActions) -> Result<(), squeezefs::nvmeof::stack
                 version,
                 with_pkgdep,
             } => {
-                squeezefs::nvmeof::target_install(version.as_deref(), with_pkgdep)?;
+                let _ = (version, with_pkgdep);
+                squeezefs::nvmeof::target_install()?;
             }
-            TargetActions::Setup {
-                hugemem_mb,
-                restore_prior,
-                target_stack,
-            } => {
-                squeezefs::nvmeof::target_setup(
-                    target_stack.map(Into::into),
-                    hugemem_mb,
-                    restore_prior,
-                )?;
+            TargetActions::Setup { target_stack } => {
+                squeezefs::nvmeof::target_setup(target_stack.map(Into::into))?;
             }
-            TargetActions::Start {
-                target_stack,
-                core_mask,
-                cores,
-                dpdk_mem_mb,
-                accept_version_drift,
-            } => {
-                squeezefs::nvmeof::target_start(
-                    target_stack.map(Into::into),
-                    &squeezefs::nvmeof::TargetStartOptions {
-                        core_mask,
-                        cores,
-                        dpdk_mem_mb,
-                        accept_version_drift,
-                    },
-                )?;
+            TargetActions::Start { target_stack } => {
+                squeezefs::nvmeof::target_start(target_stack.map(Into::into))?;
             }
-            TargetActions::Stop {
-                force,
-                target_stack,
-            } => {
-                squeezefs::nvmeof::target_stop(target_stack.map(Into::into), force)?;
+            TargetActions::Stop { target_stack } => {
+                squeezefs::nvmeof::target_stop(target_stack.map(Into::into))?;
             }
             TargetActions::Status { json, target_stack } => {
                 squeezefs::nvmeof::target_status(target_stack.map(Into::into), json)?;
             }
-            TargetActions::SystemdUnit {
-                target_stack,
-                core_mask,
-                cores,
-                dpdk_mem_mb,
-            } => {
-                squeezefs::nvmeof::target_systemd_unit(
-                    target_stack.map(Into::into),
-                    core_mask,
-                    cores,
-                    dpdk_mem_mb,
-                )?;
+            TargetActions::SystemdUnit { target_stack } => {
+                squeezefs::nvmeof::target_systemd_unit(target_stack.map(Into::into))?;
             }
         },
     }

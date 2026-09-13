@@ -1,25 +1,25 @@
 //! NVMe-oF target + initiator management (`squeezefs nvmeof …`).
 //!
-//! N4 state of the dual-stack target-management program
-//! (`docs/design-nvmeof-target-management.md`, PRs 1–4): the kernel-nvmet
-//! target path is **rebuilt** (`nvmet::NvmetStack` — no fake configfs
+//! The kernel `nvmet` target (the sqz-kernel target) is **THE** target
+//! (owner ruling R-SYM-8, 2026-09-12 — `docs/design-symmetric-metadata.md`
+//! §5.8.1, KD-SYM-23): SPDK was retired as a target, forward-only — its
+//! compiled-in `SPDK_NVMF_MAX_NUM_REGISTRANTS = 16` was the only hard
+//! registrant ceiling in anything SqueezeFS shipped. `nvmet::NvmetStack`
+//! (`docs/design-nvmeof-target-management.md` §6.6 — no fake configfs
 //! files, checked errors, `resv_enable` + `device_uuid` before enable,
-//! reserved-range port allocator, loop handling via the ledger) and the
-//! SPDK stack is **fully live** (`spdk::SpdkStack` — `save_config`-backed
-//! share/unshare/restore with pinned nsid + ns UUID + `ptpl_file`, plus
-//! the N3 lifecycle verbs), both behind the finalized `TargetStack`
-//! trait (`stack.rs`), under the top-level `squeezefs nvmeof` grammar
-//! (§6.2: `--target-stack` default **spdk**, explicit selection, loud
-//! failure — never a silent cross-stack fallback). Stack dispatch and
-//! the **cross-stack live-state duplicate guard** live HERE, never
-//! inside a stack subtree (the G3 module-graph rule). The pre-rebuild
-//! transitional paths (the collision-prone configfs share path, the raw
-//! SPDK RPC paths, the `spdk-*` lifecycle verbs, the silent sparse
-//! auto-create, and every `SQUEEZEFS_MOCK_NVMEOF*` fork) are
-//! **deleted** — the §6.8 zero-mock policy: unit tests ride injection
-//! seams (explicit configfs roots, relocated state dirs, fake RPC
-//! servers on real sockets), never env behavior forks; correctness
-//! claims for target serving come from the real-kernel tiers.
+//! reserved-range port allocator, loop handling via the ledger) is the
+//! one implementation of the `TargetStack` trait (`stack.rs`), under the
+//! top-level `squeezefs nvmeof` grammar (§6.2: `--target-stack` default
+//! **nvmet**, explicit selection, loud failure). The retired `spdk`
+//! spelling survives ONLY as a parse-and-refuse arm ([`StackKind::Spdk`])
+//! so the refusal can name it, nvmet and the operator's re-share
+//! sequence ([`SPDK_RESHARE_SEQUENCE`]); a ledger record the retired
+//! stack wrote stays decodable, is LISTED with that sequence, and is never
+//! re-presented (never started, restored or adopted onto anything). The
+//! §6.8 zero-mock policy stands: unit tests ride injection seams
+//! (explicit configfs roots, relocated state dirs), never env behavior
+//! forks; correctness claims for target serving come from the real-kernel
+//! fidelity tier.
 //!
 //! Kept: the client/initiator half (`initiator.rs` — binding decision 3)
 //! and the NoCOW guard (`nocow.rs`). Ownership is **ledger membership**,
@@ -36,7 +36,6 @@ pub mod initiator;
 pub mod ledger;
 pub mod nocow;
 pub mod nvmet;
-pub mod spdk;
 pub mod stack;
 
 pub use initiator::{connect_target, disconnect_target, ConnectOptions};
@@ -50,8 +49,8 @@ use uuid::Uuid;
 
 use ledger::Ledger;
 use stack::{
-    AdoptClass, AdoptedFrom, Listener, LiveShare, NvmeofError, PreflightOp, RestoreOutcome,
-    ShareRecord, ShareRequest, ShareState, TargetStack,
+    AdoptClass, AdoptedFrom, Listener, LiveShare, NvmeofError, PreflightOp, RestoreEntry,
+    RestoreOutcome, ShareRecord, ShareRequest, ShareState, TargetStack,
 };
 
 /// The N2+ ownership NQN prefix (§6.2): default `share` NQNs are minted
@@ -70,6 +69,10 @@ pub const PRE_REBUILD_NQN_PREFIX: &str = "nqn.2026-06.io.squeezefs:";
 /// (`docs/design-nvmeof-target-management.md` §6.1/§6.4 — the ledger's
 /// `"stack"` field; a share is owned by exactly one stack, dispatch is
 /// resolved from the ledger, never guessed).
+///
+/// `Spdk` is the RETIRED stack (R-SYM-8): it survives only so its ledger
+/// records stay decodable and so the spelling can be refused by name —
+/// no execution path constructs a stack for it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum StackKind {
@@ -90,25 +93,60 @@ impl std::str::FromStr for StackKind {
     type Err = String;
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
-            "spdk" => Ok(StackKind::Spdk),
             "nvmet" => Ok(StackKind::Nvmet),
+            "spdk" => Err(format!(
+                "target stack 'spdk' was RETIRED (R-SYM-8, 2026-09-12) — the kernel nvmet \
+                 target is THE target; {SPDK_RESHARE_SEQUENCE}"
+            )),
             other => Err(format!(
-                "unknown target stack '{other}' (expected 'spdk' or 'nvmet')"
+                "unknown target stack '{other}' (expected 'nvmet' — the one supported target)"
             )),
         }
     }
 }
 
+/// The operator's path off a retired SPDK share, spelled once so every
+/// refusal, the `list` classification and the `restore` skip agree (a
+/// macro so it also composes into `concat!`-built `&'static str`s).
+macro_rules! spdk_reshare_sequence {
+    () => {
+        "re-share on nvmet:\n  \
+         1. sudo squeezefs nvmeof unshare <subnqn>   (removes the SPDK ledger record ONLY — no \
+         spdk_tgt is driven; the backing is released for step 3)\n  \
+         2. if an spdk_tgt still serves the old subsystem, tear it down yourself \
+         (rpc.py nvmf_delete_subsystem <subnqn>; rpc.py bdev_aio_delete <bdev>)\n  \
+         3. sudo squeezefs nvmeof share <backing> --ip <ip> --target-stack nvmet   (nvmet is \
+         the default; the flag is optional)"
+    };
+}
+
+/// The operator's path off a retired SPDK share: unshare (ledger-only)
+/// → manual spdk_tgt teardown if one still serves → share on nvmet.
+pub const SPDK_RESHARE_SEQUENCE: &str = spdk_reshare_sequence!();
+
+/// The forward-only R-SYM-8 refusal: `what` names the surface that asked
+/// for SPDK (a flag, an env value, a verb arm).
+pub fn spdk_retired_refusal(what: &str) -> NvmeofError {
+    NvmeofError::Refused(format!(
+        "{what}: SPDK was RETIRED as an NVMe-oF target (owner ruling R-SYM-8, 2026-09-12 — \
+         docs/design-symmetric-metadata.md §5.8.1, forward-only): its compiled-in 16-registrant \
+         cap was the only hard registrant ceiling SqueezeFS shipped. The kernel nvmet target is \
+         THE target — nothing falls back to it silently.\n  {SPDK_RESHARE_SEQUENCE}"
+    ))
+}
+
 /// Env half of the §6.2 stack-selection resolution order
-/// (`--target-stack` flag > this env > default `spdk`).
+/// (`--target-stack` flag > this env > default `nvmet`).
 pub const TARGET_STACK_ENV: &str = "SQUEEZEFS_NVMEOF_TARGET_STACK";
 
 /// §6.2 stack-selection resolution: flag > `SQUEEZEFS_NVMEOF_TARGET_STACK`
-/// > default `spdk`. An unparseable env value refuses loud — never a
-/// silent default.
+/// > default `nvmet`. The retired `spdk` selection refuses loud on either
+/// rung (never a silent default); an unparseable env value refuses loud.
 pub fn resolve_stack(flag: Option<StackKind>) -> Result<StackKind, NvmeofError> {
-    if let Some(kind) = flag {
-        return Ok(kind);
+    match flag {
+        Some(StackKind::Spdk) => return Err(spdk_retired_refusal("--target-stack spdk")),
+        Some(StackKind::Nvmet) => return Ok(StackKind::Nvmet),
+        None => {}
     }
     match std::env::var(TARGET_STACK_ENV) {
         Ok(v) if !v.is_empty() => v.parse::<StackKind>().map_err(|e| {
@@ -117,29 +155,15 @@ pub fn resolve_stack(flag: Option<StackKind>) -> Result<StackKind, NvmeofError> 
                  default on a malformed selection"
             ))
         }),
-        _ => Ok(StackKind::Spdk),
+        _ => Ok(StackKind::Nvmet),
     }
 }
 
-/// Constructs the selected stack for the share verbs (real on BOTH arms
-/// from N4 on — the N2/N3 interim SPDK milestone refusal is dead; the
-/// §Migration pt 3 unavailability window is closed). The two verb-layer
-/// options ride the SPDK stack only: `accept_version_drift` gates
-/// preflight rung 4 (§6.2 flag placement — the nvmet arm refuses the
-/// flag before this constructor runs), `unshare_force` overrides the R7
-/// live-consumer refusal.
-fn stack_for(
-    kind: StackKind,
-    accept_version_drift: bool,
-    unshare_force: bool,
-) -> Result<Box<dyn TargetStack>, NvmeofError> {
-    match kind {
-        StackKind::Nvmet => Ok(Box::new(nvmet::NvmetStack::open_default()?)),
-        StackKind::Spdk => Ok(Box::new(spdk::SpdkStack::open_default(
-            accept_version_drift,
-            unshare_force,
-        ))),
-    }
+/// The one stack the verbs construct (the retired kind never reaches
+/// here: `resolve_stack` refuses it and the ledger arms route SPDK records
+/// to `retire_spdk_share` / `partition_restorable`).
+fn nvmet_stack() -> Result<nvmet::NvmetStack, NvmeofError> {
+    Ok(nvmet::NvmetStack::open_default()?)
 }
 
 pub(crate) fn check_root() -> io::Result<()> {
@@ -186,42 +210,34 @@ pub(crate) fn canonical_or_raw(path: &str) -> String {
         .unwrap_or_else(|_| path.to_string())
 }
 
-/// §6.2 per-stack flag semantics (rev-3 issue 23): `--ns-uuid` seeds the
-/// recorded namespace identity on BOTH stacks and must parse as a UUID;
-/// `--nsid` is SPDK-only — the nvmet namespace index is structurally
-/// fixed at 1, so `--nsid` ≠ 1 with nvmet refuses loud (the
+/// §6.2 flag semantics: `--ns-uuid` seeds the recorded namespace
+/// identity and must parse as a UUID; the nvmet namespace index is
+/// structurally fixed at 1, so `--nsid` ≠ 1 refuses loud (the
 /// `--disk-cache-paths` precedent: never a silent flag-ignore).
-pub fn validate_share_flags(
-    stack: StackKind,
-    nsid: Option<u32>,
-    ns_uuid: Option<&str>,
-) -> Result<(), NvmeofError> {
-    if stack == StackKind::Nvmet {
-        if let Some(n) = nsid {
-            if n != 1 {
-                return Err(NvmeofError::Refused(format!(
-                    "--nsid is SPDK-only: the kernel-nvmet namespace index is structurally \
-                     fixed at 1 (one namespace per subsystem — \
-                     docs/design-nvmeof-target-management.md §6.6), got --nsid {n} with \
-                     --target-stack nvmet.\n  drop the flag (or pass --nsid 1, the structural \
-                     index); multi-namespace nvmet subsystems would be a schema-visible format \
-                     change, never a silent flag reinterpretation"
-                )));
-            }
+pub fn validate_share_flags(nsid: Option<u32>, ns_uuid: Option<&str>) -> Result<(), NvmeofError> {
+    if let Some(n) = nsid {
+        if n != 1 {
+            return Err(NvmeofError::Refused(format!(
+                "--nsid {n}: the kernel-nvmet namespace index is structurally fixed at 1 (one \
+                 namespace per subsystem — docs/design-nvmeof-target-management.md §6.6).\n  \
+                 drop the flag (or pass --nsid 1, the structural index); multi-namespace nvmet \
+                 subsystems would be a schema-visible format change, never a silent flag \
+                 reinterpretation"
+            )));
         }
     }
     if let Some(raw) = ns_uuid {
         Uuid::parse_str(raw).map_err(|e| {
             NvmeofError::Refused(format!(
                 "--ns-uuid '{raw}' is not a valid UUID ({e}) — it seeds the recorded namespace \
-                 identity on both stacks and must be well-formed"
+                 identity and must be well-formed"
             ))
         })?;
     }
     Ok(())
 }
 
-/// §6.2 backing preparation (both stacks): a missing path refuses loud
+/// §6.2 backing preparation: a missing path refuses loud
 /// (the silent 1 GiB sparse auto-create is dead — `--create-size` is the
 /// explicit opt-in), directories refuse, and regular-file backings get
 /// the NoCOW guard (a btrfs-CoW backing silently downgrades O_DIRECT to
@@ -275,21 +291,18 @@ pub struct ShareOptions {
     pub subnqn: Option<String>,
     pub port: u16,
     pub ips: Vec<String>,
-    /// `--target-stack` (resolution: flag > env > default `spdk`).
+    /// `--target-stack` (resolution: flag > env > default `nvmet`; the
+    /// retired `spdk` refuses loud).
     pub stack: Option<StackKind>,
-    /// SPDK-only (§6.2); `Some(n)` with `n != 1` on nvmet refuses loud.
+    /// `--nsid`: the nvmet index is structurally 1 — `Some(n)` with
+    /// `n != 1` refuses loud.
     pub nsid: Option<u32>,
-    /// Seeds the recorded both-stack namespace identity; generated when
-    /// absent.
+    /// Seeds the recorded namespace identity; generated when absent.
     pub ns_uuid: Option<String>,
     /// Explicit opt-in size (bytes) for creating a missing file backing.
     pub create_size: Option<u64>,
     /// Host-NQN allowlist; empty = allow-any (trusted-fabric default).
     pub allow_hosts: Vec<String>,
-    /// §6.2 flag placement: proceed against a version-drifted SPDK
-    /// target (preflight rung 4). SPDK-only — explicit nvmet selection
-    /// refuses it loud.
-    pub accept_version_drift: bool,
 }
 
 /// VAL-7g (pre-RC spec §3): validate one NQN-shaped **configfs path
@@ -327,36 +340,16 @@ pub fn validate_nqn_component(what: &str, value: &str) -> Result<(), NvmeofError
     Ok(())
 }
 
-/// Refusal for `--accept-version-drift` under an explicit nvmet
-/// selection (§6.2 flag placement: the flag gates SPDK preflight rung 4
-/// "wherever that rung runs" — the kernel target has no version to
-/// drift, and SqueezeFS never silently ignores an explicit flag).
-fn refuse_drift_flag_on_nvmet(
-    kind: StackKind,
-    accept_version_drift: bool,
-) -> Result<(), NvmeofError> {
-    if kind == StackKind::Nvmet && accept_version_drift {
-        return Err(NvmeofError::Refused(
-            "--accept-version-drift is SPDK-only: it gates the SPDK preflight's version-drift \
-             rung, and the kernel nvmet target has no spdk_tgt version to drift — drop the \
-             flag with --target-stack nvmet (SqueezeFS never silently ignores an explicit \
-             flag)"
-                .to_string(),
-        ));
-    }
-    Ok(())
-}
-
 /// The `nvmeof share` verb (§6.2): grammar validation → stack resolution
-/// → root → stack preflight → backing preparation → the cross-stack
-/// live-state duplicate guard → the selected stack's share flow (intent
-/// protocol + same-stack live duplicate guard inside).
+/// → root → stack preflight → backing preparation → the stack's share
+/// flow (intent protocol + the ledger and live duplicate-backing guards
+/// inside — a backing a retired SPDK record still holds refuses there,
+/// naming the `unshare` that is step 1 of the re-share sequence).
 pub fn share(opts: &ShareOptions) -> Result<ShareRecord, NvmeofError> {
     // Grammar rungs first (pure argument semantics — before root, before
     // any side effect).
-    let kind = resolve_stack(opts.stack)?;
-    validate_share_flags(kind, opts.nsid, opts.ns_uuid.as_deref())?;
-    refuse_drift_flag_on_nvmet(kind, opts.accept_version_drift)?;
+    resolve_stack(opts.stack)?;
+    validate_share_flags(opts.nsid, opts.ns_uuid.as_deref())?;
     if opts.ips.is_empty() {
         return Err(NvmeofError::Refused(
             "at least one --ip listener address is required".to_string(),
@@ -364,7 +357,7 @@ pub fn share(opts: &ShareOptions) -> Result<ShareRecord, NvmeofError> {
     }
     let mut listeners = Vec::new();
     for ip in &opts.ips {
-        nvmet::adrfam_of(ip)?; // loud on malformed addresses, both stacks
+        nvmet::adrfam_of(ip)?; // loud on malformed addresses
         let listener = Listener {
             ip: ip.clone(),
             port: opts.port,
@@ -385,7 +378,7 @@ pub fn share(opts: &ShareOptions) -> Result<ShareRecord, NvmeofError> {
         validate_nqn_component("--subnqn", subnqn)?;
     }
 
-    let stack = stack_for(kind, opts.accept_version_drift, false)?;
+    let stack = nvmet_stack()?;
     check_root()?;
     stack.preflight(PreflightOp::Share)?;
     retire_old_registry_once();
@@ -410,22 +403,10 @@ pub fn share(opts: &ShareOptions) -> Result<ShareRecord, NvmeofError> {
         subnqn,
         backing_canonical: canonical_or_raw(&opts.backing_path),
         backing_path: opts.backing_path.clone(),
-        nsid: opts.nsid,
         ns_uuid,
         listeners,
         allow_hosts: opts.allow_hosts.clone(),
     };
-
-    // §6.4 cross-stack live-state duplicate guard (fully live at N4):
-    // walk the OTHER stack before this stack mutates anything. (The
-    // ledger half — which covers both stacks' records — and the
-    // same-stack live walk run inside `stack.share`.)
-    let other_kind = match kind {
-        StackKind::Spdk => StackKind::Nvmet,
-        StackKind::Nvmet => StackKind::Spdk,
-    };
-    let other_live = other_stack_live_state(other_kind)?;
-    cross_stack_duplicate_guard(&request, other_kind, &other_live, &Ledger::open_default())?;
 
     let record = stack.share(&request)?;
     log::info!(
@@ -445,33 +426,51 @@ pub fn share(opts: &ShareOptions) -> Result<ShareRecord, NvmeofError> {
     Ok(record)
 }
 
+/// Step 1 of the re-share sequence for a record the RETIRED SPDK stack
+/// wrote: `removing` → delete on the ledger ONLY (§6.4 law 6 ordering
+/// kept) — no spdk_tgt is driven, no target object is touched. Returns
+/// the operator note naming the manual teardown and the nvmet re-share.
+/// Refuses any other stack's record (those ride their stack's unshare).
+pub fn retire_spdk_share(ledger: &Ledger, record: &ShareRecord) -> Result<String, NvmeofError> {
+    if record.stack != StackKind::Spdk {
+        return Err(NvmeofError::Refused(format!(
+            "retire_spdk_share: '{}' is recorded on the {} stack — only retired-SPDK records \
+             are removed ledger-only",
+            record.subnqn,
+            record.stack.as_str()
+        )));
+    }
+    ledger
+        .mark_removing(&record.subnqn)
+        .map_err(NvmeofError::Io)?;
+    ledger.delete(&record.subnqn).map_err(NvmeofError::Io)?;
+    Ok(format!(
+        "removed the share ledger record for '{}' (recorded on the RETIRED SPDK target stack — \
+         R-SYM-8): the ledger entry ONLY was removed; SqueezeFS drives no spdk_tgt anymore, so \
+         the target object was NOT torn down.\n  {SPDK_RESHARE_SEQUENCE}\n  (this was step 1; \
+         backing '{}' is released for the nvmet share)",
+        record.subnqn, record.backing_path
+    ))
+}
+
 /// The `nvmeof unshare` verb (§6.2): stack resolved from the ledger —
 /// including `pending`/`removing` intent records (§6.4 law 6: a
 /// crash-window share is still ours to remove); an NQN absent from the
 /// ledger refuses loud with `list` guidance (we never tear down objects
-/// we did not record — the dev_substrate ownership law). `force`
-/// overrides the SPDK live-consumer refusal (R7);
-/// `accept_version_drift` gates SPDK preflight rung 4 — both are
-/// SPDK-only and refuse loud on an nvmet-recorded NQN (never a silent
-/// flag-ignore).
-pub fn unshare(subnqn: &str, force: bool, accept_version_drift: bool) -> Result<(), NvmeofError> {
+/// we did not record — the dev_substrate ownership law). A record the
+/// retired SPDK stack wrote is removed ledger-only ([`retire_spdk_share`]).
+pub fn unshare(subnqn: &str) -> Result<(), NvmeofError> {
     check_root()?;
     retire_old_registry_once();
     let ledger = Ledger::open_default();
     match ledger.find(subnqn).map_err(NvmeofError::Io)? {
+        Some(record) if record.stack == StackKind::Spdk => {
+            let note = retire_spdk_share(&ledger, &record)?;
+            println!("{note}");
+            Ok(())
+        }
         Some(record) => {
-            if record.stack == StackKind::Nvmet {
-                refuse_drift_flag_on_nvmet(record.stack, accept_version_drift)?;
-                if force {
-                    return Err(NvmeofError::Refused(format!(
-                        "--force overrides the SPDK live-consumer refusal, and '{subnqn}' is \
-                         recorded on the kernel nvmet stack (which exposes no per-subsystem \
-                         consumer view — its unshare never refuses on consumers) — drop the \
-                         flag (SqueezeFS never silently ignores an explicit flag)"
-                    )));
-                }
-            }
-            let stack = stack_for(record.stack, accept_version_drift, force)?;
+            let stack = nvmet_stack()?;
             stack.preflight(PreflightOp::Unshare)?;
             stack.unshare(&record)?;
             Ok(())
@@ -516,61 +515,55 @@ fn print_restore_report(report: &stack::RestoreReport) -> (usize, usize) {
     (report.entries.len(), failures)
 }
 
-/// The `nvmeof restore` verb (§6.2): bare replays EVERY ledger record
-/// into its recorded stack (both stacks touched when both have
-/// records); `--target-stack X` filters, never retargets. Reconciles
-/// §6.4 law-6 intents; per-share report; idempotent. The SPDK leg
-/// additionally runs the §6.5 systemd-ExecStartPost half (RPC-live wait
-/// + `load_config` onto an empty target) and — the §6.4 persistence law
-/// — ends with `save_config` whenever reconciliation changed anything,
-/// so an explicit `--target-stack spdk` runs even with zero records.
-/// Exits nonzero when any record failed.
-pub fn restore(filter: Option<StackKind>, accept_version_drift: bool) -> Result<(), NvmeofError> {
-    if let Some(kind) = filter {
-        refuse_drift_flag_on_nvmet(kind, accept_version_drift)?;
+/// Split a ledger into the records `restore` replays (nvmet) and the
+/// report lines for the ones it never re-presents: a record the RETIRED
+/// SPDK stack wrote is `Skipped` LOUD with the re-share sequence — never
+/// silently dropped, never replayed onto anything (R-SYM-8).
+pub fn partition_restorable(records: Vec<ShareRecord>) -> (Vec<ShareRecord>, Vec<RestoreEntry>) {
+    let mut replay = Vec::with_capacity(records.len());
+    let mut skipped = Vec::new();
+    for record in records {
+        match record.stack {
+            StackKind::Nvmet => replay.push(record),
+            StackKind::Spdk => skipped.push(RestoreEntry {
+                outcome: RestoreOutcome::Skipped(format!(
+                    "recorded on the RETIRED SPDK target stack (R-SYM-8) — never re-presented; \
+                     {SPDK_RESHARE_SEQUENCE}"
+                )),
+                subnqn: record.subnqn,
+            }),
+        }
     }
+    (replay, skipped)
+}
+
+/// The `nvmeof restore` verb (§6.2): replays EVERY nvmet ledger record
+/// (`--target-stack nvmet` is the only admissible filter — the retired
+/// `spdk` refuses); reconciles §6.4 law-6 intents; per-share report;
+/// idempotent. Records the retired SPDK stack wrote are reported as
+/// skipped with the re-share sequence and never re-presented. Exits
+/// nonzero when any record failed.
+pub fn restore(filter: Option<StackKind>) -> Result<(), NvmeofError> {
+    resolve_stack(filter)?;
     check_root()?;
     retire_old_registry_once();
     let ledger = Ledger::open_default();
     let records = ledger.load().map_err(NvmeofError::Io)?;
-
-    // Bare `restore` replays every record into its RECORDED stack; a
-    // filter selects records recorded for that stack, never retargets.
-    let selected = |kind: StackKind| filter.is_none() || filter == Some(kind);
+    let total = records.len();
+    let (nvmet_records, skipped) = partition_restorable(records);
 
     let mut failures = 0usize;
     let mut replayed = 0usize;
-
-    let nvmet_records: Vec<ShareRecord> = records
-        .iter()
-        .filter(|r| r.stack == StackKind::Nvmet)
-        .cloned()
-        .collect();
-    if selected(StackKind::Nvmet) && !nvmet_records.is_empty() {
-        let stack = stack_for(StackKind::Nvmet, false, false)?;
+    if !nvmet_records.is_empty() {
+        let stack = nvmet_stack()?;
         stack.preflight(PreflightOp::Restore)?;
         let (n, f) = print_restore_report(&stack.restore(&nvmet_records)?);
         replayed += n;
         failures += f;
     }
+    print_restore_report(&stack::RestoreReport { entries: skipped });
 
-    let spdk_records: Vec<ShareRecord> = records
-        .iter()
-        .filter(|r| r.stack == StackKind::Spdk)
-        .cloned()
-        .collect();
-    // The SPDK leg runs when records exist OR the filter selects it
-    // explicitly (the systemd ExecStartPost path must replay
-    // tgt-config.json even before the first ledgered share).
-    if selected(StackKind::Spdk) && (!spdk_records.is_empty() || filter == Some(StackKind::Spdk)) {
-        let stack = stack_for(StackKind::Spdk, accept_version_drift, false)?;
-        stack.preflight(PreflightOp::Restore)?;
-        let (n, f) = print_restore_report(&stack.restore(&spdk_records)?);
-        replayed += n;
-        failures += f;
-    }
-
-    if replayed == 0 && records.is_empty() {
+    if replayed == 0 && total == 0 {
         println!("No NVMe-oF target shares to restore.");
     }
     if failures > 0 {
@@ -583,401 +576,141 @@ pub fn restore(filter: Option<StackKind>, accept_version_drift: bool) -> Result<
 }
 
 // ---------------------------------------------------------------------------
-// `nvmeof target …` verbs (§6.2/§6.5, PR 3/N3) — stack dispatch lives HERE,
-// never inside a stack subtree (the G3 module-graph rule: src/nvmeof/spdk/
-// carries no reference to nvmet items and vice versa).
+// `nvmeof target …` verbs (§6.2/§6.5) — the kernel nvmet target is not a
+// process: setup/start are readiness + ledger replay, stop refuses, status
+// reports. The SPDK lifecycle (install/hugepages/pidfile/RPC) is RETIRED
+// (R-SYM-8); `target install` survives only as a refusing verb.
 // ---------------------------------------------------------------------------
 
-/// `target start` options carried from the CLI (§6.2 grammar). The
-/// `Option` fields distinguish explicitly-passed values from defaults —
-/// SPDK-only flags with `--target-stack nvmet` refuse loud, never a
-/// silent flag-ignore (the `--disk-cache-paths` precedent).
-#[derive(Debug, Clone, Default)]
-pub struct TargetStartOptions {
-    pub core_mask: Option<String>,
-    pub cores: Option<u32>,
-    pub dpdk_mem_mb: Option<u64>,
-    pub accept_version_drift: bool,
-}
-
-/// Refuse SPDK-only flags on the nvmet arm loud (never silently ignore).
-fn refuse_spdk_only_flags(kind: StackKind, set_flags: &[(&str, bool)]) -> Result<(), NvmeofError> {
-    if kind != StackKind::Nvmet {
-        return Ok(());
-    }
-    let offending: Vec<&str> = set_flags
-        .iter()
-        .filter(|(_, set)| *set)
-        .map(|(name, _)| *name)
-        .collect();
-    if offending.is_empty() {
-        return Ok(());
-    }
+/// `nvmeof target install`: RETIRED with SPDK (R-SYM-8) — it existed only
+/// to build the pinned spdk_tgt. Refuses loud naming the successor (the
+/// `removed_verb()` convention: exit nonzero, never stub success).
+pub fn target_install() -> Result<(), NvmeofError> {
     Err(NvmeofError::Refused(format!(
-        "{} {} SPDK-only: the kernel nvmet target has no spdk_tgt process, hugepages, or \
-         reactor cores — drop the flag(s) with --target-stack nvmet (SqueezeFS never \
-         silently ignores an explicit flag)",
-        offending.join(", "),
-        if offending.len() == 1 { "is" } else { "are" },
+        "`squeezefs nvmeof target install` was removed: it built the pinned SPDK release, and \
+         SPDK was RETIRED as an NVMe-oF target (owner ruling R-SYM-8, 2026-09-12 — \
+         docs/design-symmetric-metadata.md §5.8.1, forward-only). The kernel nvmet target \
+         needs no install: its modules ship with the kernel. Superseded by `squeezefs nvmeof \
+         target setup` (modprobe + configfs checks) and `squeezefs nvmeof target start` \
+         (ledger replay).\n  {SPDK_RESHARE_SEQUENCE}"
     )))
 }
 
-/// `nvmeof target install` (§6.5): SPDK-only by definition — pinned tag +
-/// sha verified build into `/opt/squeezefs/spdk/<tag>/`; `--with-pkgdep`
-/// is the explicit consent for system package mutation.
-pub fn target_install(version: Option<&str>, with_pkgdep: bool) -> Result<(), NvmeofError> {
-    // Grammar rung first (fires before root — the validate_share_flags
-    // precedent), then root, then the build.
-    spdk::lifecycle::validate_install_version(version)?;
+/// `nvmeof target setup` (§6.5): modprobe + configfs mount checks.
+pub fn target_setup(stack_flag: Option<StackKind>) -> Result<(), NvmeofError> {
+    resolve_stack(stack_flag)?;
     check_root()?;
-    spdk::lifecycle::install(&spdk::SpdkPaths::resolve(), version, with_pkgdep)
+    let stack = nvmet_stack()?;
+    stack.ensure_ready()?;
+    println!("kernel nvmet target ready: modules loaded, configfs mounted.");
+    Ok(())
 }
 
-/// `nvmeof target setup` (§6.5): SPDK — hugepage reservation with the
-/// recorded-prior file (+ `--restore-prior` restore path); nvmet —
-/// modprobe + configfs mount checks.
-pub fn target_setup(
-    stack_flag: Option<StackKind>,
-    hugemem_mb: Option<u64>,
-    restore_prior: bool,
-) -> Result<(), NvmeofError> {
-    let kind = resolve_stack(stack_flag)?;
-    refuse_spdk_only_flags(
-        kind,
-        &[
-            ("--hugemem-mb", hugemem_mb.is_some()),
-            ("--restore-prior", restore_prior),
-        ],
-    )?;
+/// `nvmeof target start` (§6.5): modprobe + ledger `restore` (configfs
+/// is the "running target").
+pub fn target_start(stack_flag: Option<StackKind>) -> Result<(), NvmeofError> {
+    resolve_stack(stack_flag)?;
     check_root()?;
-    match kind {
-        StackKind::Spdk => {
-            let paths = spdk::SpdkPaths::resolve();
-            let sysfs = Path::new(spdk::hugepages::HUGEPAGES_2M_SYSFS_DIR);
-            if restore_prior {
-                let out = spdk::hugepages::restore_prior(sysfs, &paths.spdk_state_dir())
-                    .map_err(NvmeofError::Io)?;
-                println!(
-                    "hugepages restored to the recorded prior: nr_hugepages = {} (record \
-                     cleared).",
-                    out.achieved
-                );
-                return Ok(());
-            }
-            let mb = hugemem_mb.unwrap_or(spdk::hugepages::DEFAULT_HUGEMEM_MB);
-            let out = spdk::hugepages::setup(
-                sysfs,
-                &paths.spdk_state_dir(),
-                mb,
-                spdk::hugepages::mem_available_kb(),
-            )
-            .map_err(NvmeofError::Io)?;
-            for w in &out.warnings {
-                eprintln!("warning: {w}");
-            }
-            if let Some(prior) = out.prior_recorded {
-                println!(
-                    "recorded prior nr_hugepages = {prior} (restore with 'squeezefs nvmeof \
-                     target setup --restore-prior')"
-                );
-            }
-            if out.verified_noop {
-                println!(
-                    "hugepage pool already holds {} × 2 MiB pages — verified no-op.",
-                    out.achieved_pages
-                );
-            } else {
-                println!(
-                    "reserved {} × 2 MiB hugepages ({} MiB requested{}).",
-                    out.achieved_pages,
-                    mb,
-                    if out.clamped_to_in_use {
-                        ", clamped to in-use pages"
-                    } else {
-                        ""
-                    }
-                );
-            }
-            Ok(())
-        }
-        StackKind::Nvmet => {
-            let stack = nvmet::NvmetStack::open_default()?;
-            stack.ensure_ready()?;
-            println!("kernel nvmet target ready: modules loaded, configfs mounted.");
-            Ok(())
-        }
-    }
+    let stack = nvmet_stack()?;
+    stack.ensure_ready()?;
+    println!(
+        "kernel nvmet target ready (configfs is the running target) — replaying the share \
+         ledger:"
+    );
+    restore(Some(StackKind::Nvmet))
 }
 
-/// `nvmeof target start` (§6.5): SPDK — preflighted spawn with pidfile +
-/// RPC-liveness wait + `load_config`; nvmet — modprobe + ledger `restore`
-/// (configfs is the "running target").
-pub fn target_start(
-    stack_flag: Option<StackKind>,
-    opts: &TargetStartOptions,
-) -> Result<(), NvmeofError> {
-    let kind = resolve_stack(stack_flag)?;
-    refuse_spdk_only_flags(
-        kind,
-        &[
-            ("--core-mask", opts.core_mask.is_some()),
-            ("--cores", opts.cores.is_some()),
-            ("--dpdk-mem-mb", opts.dpdk_mem_mb.is_some()),
-            ("--accept-version-drift", opts.accept_version_drift),
-        ],
-    )?;
-    check_root()?;
-    match kind {
-        StackKind::Spdk => spdk::lifecycle::start(
-            &spdk::SpdkPaths::resolve(),
-            &spdk::lifecycle::StartOptions {
-                core_mask: opts.core_mask.clone(),
-                cores: opts.cores,
-                dpdk_mem_mb: opts
-                    .dpdk_mem_mb
-                    .unwrap_or(spdk::lifecycle::DEFAULT_DPDK_MEM_MB),
-                accept_version_drift: opts.accept_version_drift,
-            },
-        ),
-        StackKind::Nvmet => {
-            let stack = nvmet::NvmetStack::open_default()?;
-            stack.ensure_ready()?;
-            println!(
-                "kernel nvmet target ready (configfs is the running target) — replaying the \
-                 share ledger:"
-            );
-            restore(Some(StackKind::Nvmet), false)
-        }
-    }
+/// `nvmeof target stop` (§6.5): refuses loud — the kernel target is not a
+/// process (grammar-class refusal, before root).
+pub fn target_stop(stack_flag: Option<StackKind>) -> Result<(), NvmeofError> {
+    resolve_stack(stack_flag)?;
+    Err(NvmeofError::Refused(
+        "the kernel nvmet target is not a process — there is nothing to stop.\n  configfs \
+         objects are the 'running target': tear shares down instead:\n    sudo squeezefs \
+         nvmeof unshare <subnqn>\n  (modules stay loaded by policy)"
+            .to_string(),
+    ))
 }
 
-/// `nvmeof target stop` (§6.5): SPDK — `save_config` → SIGTERM by pidfile
-/// → grace → SIGKILL; refuses while ledger shares are live-connected
-/// unless `--force`. nvmet — refuses loud (the kernel target is not a
-/// process; grammar-class refusal, before root).
-pub fn target_stop(stack_flag: Option<StackKind>, force: bool) -> Result<(), NvmeofError> {
-    let kind = resolve_stack(stack_flag)?;
-    if kind == StackKind::Nvmet {
-        return Err(NvmeofError::Refused(
-            "the kernel nvmet target is not a process — there is nothing to stop.\n  configfs \
-             objects are the 'running target': tear shares down instead:\n    sudo squeezefs \
-             nvmeof unshare <subnqn>\n  (modules stay loaded by policy)"
-                .to_string(),
-        ));
-    }
-    check_root()?;
-    spdk::lifecycle::stop(&spdk::SpdkPaths::resolve(), force)
-}
-
-/// `nvmeof target status` (§6.9): the diagnostic verb — never refuses on
-/// drift; reports.
+/// `nvmeof target status` (§6.9): the diagnostic verb — reports.
 pub fn target_status(stack_flag: Option<StackKind>, json: bool) -> Result<(), NvmeofError> {
-    let kind = resolve_stack(stack_flag)?;
+    resolve_stack(stack_flag)?;
     check_root()?;
-    match kind {
-        StackKind::Spdk => spdk::lifecycle::status(&spdk::SpdkPaths::resolve(), json),
-        StackKind::Nvmet => {
-            let stack = nvmet::NvmetStack::open_default()?;
-            let status = stack.target_status()?;
-            if json {
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&serde_json::json!({
-                        "stack": "nvmet",
-                        "modules_present": status.modules_present,
-                        "configfs_mounted": status.configfs_mounted,
-                        "subsystems": status.subsystems,
-                        "namespaces": status.namespaces,
-                        "ports": status.ports,
-                        "resv_enabled_namespaces": status.resv_enabled_namespaces,
-                    }))
-                    .map_err(|e| NvmeofError::Io(io::Error::other(e)))?
-                );
+    let stack = nvmet_stack()?;
+    let status = stack.target_status()?;
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "stack": "nvmet",
+                "modules_present": status.modules_present,
+                "configfs_mounted": status.configfs_mounted,
+                "subsystems": status.subsystems,
+                "namespaces": status.namespaces,
+                "ports": status.ports,
+                "resv_enabled_namespaces": status.resv_enabled_namespaces,
+            }))
+            .map_err(|e| NvmeofError::Io(io::Error::other(e)))?
+        );
+    } else {
+        println!("=== Kernel nvmet NVMe-oF Target Status ===");
+        println!(
+            "  modules:   {}",
+            if status.modules_present {
+                "loaded"
             } else {
-                println!("=== Kernel nvmet NVMe-oF Target Status ===");
-                println!(
-                    "  modules:   {}",
-                    if status.modules_present {
-                        "loaded"
-                    } else {
-                        "absent"
-                    }
-                );
-                println!(
-                    "  configfs:  {}",
-                    if status.configfs_mounted {
-                        "mounted"
-                    } else {
-                        "absent"
-                    }
-                );
-                println!(
-                    "  serving:   {} subsystem(s), {} namespace(s) ({} with PR/resv_enable), \
-                     {} port(s)",
-                    status.subsystems,
-                    status.namespaces,
-                    status.resv_enabled_namespaces,
-                    status.ports
-                );
+                "absent"
             }
-            Ok(())
-        }
-    }
-}
-
-/// `nvmeof target systemd-unit` (§6.5): emits a unit to stdout with
-/// values baked at emission — never installs, mutates nothing, needs no
-/// root (the dev_substrate precedent).
-pub fn target_systemd_unit(
-    stack_flag: Option<StackKind>,
-    core_mask: Option<String>,
-    cores: Option<u32>,
-    dpdk_mem_mb: Option<u64>,
-) -> Result<(), NvmeofError> {
-    let kind = resolve_stack(stack_flag)?;
-    refuse_spdk_only_flags(
-        kind,
-        &[
-            ("--core-mask", core_mask.is_some()),
-            ("--cores", cores.is_some()),
-            ("--dpdk-mem-mb", dpdk_mem_mb.is_some()),
-        ],
-    )?;
-    match kind {
-        StackKind::Spdk => {
-            let unit = spdk::lifecycle::systemd_unit(
-                &spdk::SpdkPaths::resolve(),
-                core_mask,
-                cores,
-                dpdk_mem_mb.unwrap_or(spdk::lifecycle::DEFAULT_DPDK_MEM_MB),
-            )?;
-            print!("{unit}");
-            Ok(())
-        }
-        StackKind::Nvmet => {
-            let exe = std::env::current_exe().map_err(NvmeofError::Io)?;
-            print!("{}", spdk::lifecycle::render_nvmet_unit(&exe));
-            Ok(())
-        }
-    }
-}
-
-/// Tolerantly gather the OTHER stack's live state for the cross-stack
-/// duplicate guard: an absent stack serves nothing. The nvmet walk
-/// tolerates an absent configfs tree by construction (empty); the SPDK
-/// walk degrades to empty when the target is dead (its state is
-/// process-resident — a stopped target serves nothing), with the note
-/// surfaced. Real read errors on a PRESENT stack stay loud — a guard
-/// that silently skips is no guard.
-fn other_stack_live_state(other_kind: StackKind) -> Result<Vec<LiveShare>, NvmeofError> {
-    match other_kind {
-        StackKind::Nvmet => nvmet::NvmetStack::open_default()
-            .map_err(NvmeofError::Io)?
-            .live_shares(),
-        StackKind::Spdk => {
-            let (live, note) = spdk::SpdkStack::open_default(false, false).live_shares_tolerant();
-            if let Some(note) = note {
-                log::info!("cross-stack duplicate guard: {note}");
+        );
+        println!(
+            "  configfs:  {}",
+            if status.configfs_mounted {
+                "mounted"
+            } else {
+                "absent"
             }
-            Ok(live)
-        }
-    }
-}
-
-/// The manual removal steps for a live holder on `holder_kind` (§6.4:
-/// the refusal message IS the runbook).
-fn manual_steps_for(holder_kind: StackKind, nqn: &str) -> String {
-    match holder_kind {
-        StackKind::Nvmet => format!(
-            "    rm  {root}/ports/<id>/subsystems/{nqn}    (for each port linking it)\n    \
-             echo 0 > {root}/subsystems/{nqn}/namespaces/1/enable\n    \
-             rmdir {root}/subsystems/{nqn}/namespaces/1\n    \
-             rmdir {root}/subsystems/{nqn}",
-            root = nvmet::NVMET_CONFIGFS_ROOT
-        ),
-        StackKind::Spdk => {
-            spdk::manual_removal_steps(&spdk::SpdkPaths::resolve().rpc_sock(), nqn, None)
-        }
-    }
-}
-
-/// The cross-stack half of the §6.4 live-state duplicate-backing guard
-/// (fully live at N4): before a share on stack X mutates anything, the
-/// verb layer walks the OTHER stack's live state (`other_kind` +
-/// `other_live`) and refuses when the requested backing (or NQN) is
-/// already served there — a path shared via nvmet must refuse an SPDK
-/// share of the same canonical path and vice versa. The refusal message
-/// IS the runbook: it names the live holder, its ledger classification,
-/// and the exit (`unshare` for anything ledgered; the exact manual
-/// configfs / rpc.py removal steps for foreign objects). Lives HERE —
-/// never inside a stack subtree — per the G3 module-graph rule.
-pub fn cross_stack_duplicate_guard(
-    req: &ShareRequest,
-    other_kind: StackKind,
-    other_live: &[LiveShare],
-    ledger: &Ledger,
-) -> Result<(), NvmeofError> {
-    for live in other_live {
-        let materialized = !live.device_path.is_empty() || live.enabled;
-        if !materialized {
-            continue;
-        }
-        let nqn_clash = live.subnqn == req.subnqn;
-        let backing_clash = (!live.backing_canonical.is_empty()
-            && live.backing_canonical == req.backing_canonical)
-            || (!live.device_path.is_empty()
-                && (live.device_path == req.backing_path
-                    || live.device_path == req.backing_canonical));
-        if !nqn_clash && !backing_clash {
-            continue;
-        }
-        let class = match ledger.find(&live.subnqn) {
-            Ok(Some(rec)) => format!("managed — ledger state {}", rec.state.as_str()),
-            Ok(None) => "foreign — not in the share ledger".to_string(),
-            Err(e) => format!("unknown — share ledger unreadable: {e}"),
-        };
-        let exit = if class.starts_with("managed") {
-            format!(
-                "  unshare the holder first:\n    sudo squeezefs nvmeof unshare {}",
-                live.subnqn
-            )
-        } else {
-            format!(
-                "  while the old object serves, either remove it first \
-                 (docs/design-nvmeof-target-management.md §6.4):\n{}\n  or absorb it into \
-                 management instead — writes only the ledger, the live object keeps serving \
-                 (§6.10):\n    sudo squeezefs nvmeof adopt {}",
-                manual_steps_for(other_kind, &live.subnqn),
-                live.subnqn
-            )
-        };
-        let what = if nqn_clash {
-            format!("subsystem NQN '{}' is already live", req.subnqn)
-        } else {
-            format!("backing path '{}' is already served", req.backing_path)
-        };
-        return Err(NvmeofError::Refused(format!(
-            "{what} on the {} target stack by live subsystem '{}' (classification: {class}) \
-             — the same backing must never be double-served, across stacks included.\n{exit}",
-            other_kind.as_str(),
-            live.subnqn
-        )));
+        );
+        println!(
+            "  serving:   {} subsystem(s), {} namespace(s) ({} with PR/resv_enable), {} port(s)",
+            status.subsystems, status.namespaces, status.resv_enabled_namespaces, status.ports
+        );
     }
     Ok(())
 }
 
+/// `nvmeof target systemd-unit` (§6.5): emits the nvmet oneshot unit to
+/// stdout with values baked at emission — never installs, mutates
+/// nothing, needs no root (the dev_substrate precedent).
+pub fn target_systemd_unit(stack_flag: Option<StackKind>) -> Result<(), NvmeofError> {
+    resolve_stack(stack_flag)?;
+    let exe = std::env::current_exe().map_err(NvmeofError::Io)?;
+    print!("{}", nvmet::render_nvmet_unit(&exe));
+    Ok(())
+}
+
+/// The manual removal steps for a live nvmet holder (§6.4: the refusal
+/// message IS the runbook).
+fn manual_steps_nvmet(nqn: &str) -> String {
+    format!(
+        "    rm  {root}/ports/<id>/subsystems/{nqn}    (for each port linking it)\n    \
+         echo 0 > {root}/subsystems/{nqn}/namespaces/1/enable\n    \
+         rmdir {root}/subsystems/{nqn}/namespaces/1\n    \
+         rmdir {root}/subsystems/{nqn}",
+        root = nvmet::NVMET_CONFIGFS_ROOT
+    )
+}
+
 // ---------------------------------------------------------------------------
 // `nvmeof adopt <subnqn>` — foreign-share absorption (§6.10, PR 4b/N4b).
-// Adopt probes BOTH stacks (stack auto-detected from where the subnqn
-// lives), so the whole flow lives HERE per the G3 module-graph rule —
-// never inside a stack subtree.
+// The flow probes the ONE stack's live state and writes only the ledger.
 // ---------------------------------------------------------------------------
 
 /// Known test-harness NQN markers (§6.10 `adopt_harness_owned`): the
 /// dev-substrate prefix (`tests/dev_substrate.sh`), the PR 5 fidelity
-/// tier's prefix, and the scoping rig's domain
-/// (`nqn.2026-07.io.spdkscope:*`). Harness objects belong to their
-/// harness's teardown — never absorb the test fabric.
+/// tier's prefix, and the retired scoping rig's domain
+/// (`nqn.2026-07.io.spdkscope:*` — objects a pre-retirement rig may have
+/// left behind). Harness objects belong to their harness's teardown —
+/// never absorb the test fabric.
 pub const HARNESS_NQN_MARKERS: [&str; 3] = [":devsub-", ":fideli-", "spdkscope"];
 
 /// Known test-harness nvmet port ids (§6.10 `adopt_harness_owned`):
@@ -985,25 +718,6 @@ pub const HARNESS_NQN_MARKERS: [&str; 3] = [":devsub-", ":fideli-", "spdkscope"]
 /// name; a share serving through the test fabric's port objects is the
 /// test fabric's.
 pub const HARNESS_NVMET_PORT_IDS: [u32; 3] = [52026, 52470, 52471];
-
-/// One stack's live probe for the adopt flow (§6.10 pt 1). Production
-/// (`adopt`) fills it from the real walkers (`NvmetStack::live_shares`,
-/// `SpdkStack::live_shares_tolerant` + `aio_bdevs_tolerant`); the unit
-/// tier injects snapshots — the same classification code runs over both
-/// (§6.8: seams relocate inputs, never fork behavior).
-pub struct AdoptProbe {
-    pub kind: StackKind,
-    pub live: Vec<LiveShare>,
-    /// SPDK bare-bdev inventory (`name -> aio filename`) for the §6.4
-    /// filename-scan half of `adopt_backing_duplicated`; empty on nvmet
-    /// (configfs subsystems ARE the whole walk there).
-    pub aio_bdevs: Vec<(String, String)>,
-    /// The tolerant gather's loud note (e.g. "SPDK target not
-    /// answering — a stopped target serves nothing"), woven into the
-    /// `adopt_not_live` refusal so a dead-target probe is never a
-    /// silent hole.
-    pub note: Option<String>,
-}
 
 /// Provenance-class heuristic for an unledgered live NQN (§6.10 pt 3 /
 /// §6.4 `adopted_from.class`). The product's own N2+ ownership prefix on
@@ -1029,20 +743,13 @@ fn adopt_refusal(class: &str, subnqn: &str, detail: String) -> NvmeofError {
 
 /// Reads one located live holder into the candidate `pending` record
 /// (§6.10 pt 1 identity capture) and pushes the loud notes (recorded
-/// nulls, out-of-range port ids, ptpl re-binds). Pure over the holder +
-/// state dir; mutates nothing.
-fn build_adopt_record(
-    kind: StackKind,
-    holder: &LiveShare,
-    state_dir: &Path,
-    notes: &mut Vec<String>,
-) -> ShareRecord {
-    // nvmet loop mapping: the live `device_path` is the loop node, the
+/// nulls, out-of-range port ids). Pure over the holder; mutates nothing.
+fn build_adopt_record(holder: &LiveShare, notes: &mut Vec<String>) -> ShareRecord {
+    // Loop mapping: the live `device_path` is the loop node, the
     // canonical resolves to the operator's file — the record carries the
     // file as backing and the node as `loop_device` (§6.4 law 5:
     // teardown learns the association from the ledger).
-    let is_loop_served = kind == StackKind::Nvmet
-        && holder.device_path.starts_with("/dev/loop")
+    let is_loop_served = holder.device_path.starts_with("/dev/loop")
         && !holder.backing_canonical.is_empty()
         && holder.backing_canonical != holder.device_path;
     let (backing_path, loop_device) = if is_loop_served {
@@ -1059,84 +766,42 @@ fn build_adopt_record(
         holder.backing_canonical.clone()
     };
     if holder.ns_uuid.is_none() {
-        notes.push(format!(
-            "the live object exposes no namespace identity ({}) — recorded null; \
+        notes.push(
+            "the live object exposes no namespace identity (device_uuid) — recorded null; \
              restart-identity stability requires a re-share under management (a restore \
-             re-establish would mint a fresh uuid once)",
-            match kind {
-                StackKind::Nvmet => "device_uuid",
-                StackKind::Spdk => "ns UUID",
-            }
-        ));
+             re-establish would mint a fresh uuid once)"
+                .to_string(),
+        );
     }
-    let (nsid, bdev_name, ptpl_file) = match kind {
-        StackKind::Nvmet => {
-            // Out-of-range port ids (e.g. a pre-rebuild share's
-            // small-int id) are recorded AS-IS: the §6.6 link-free
-            // teardown law covers their later removal — the reserved
-            // range governs only allocation.
-            let base = nvmet::NVMET_PORT_ID_BASE_DEFAULT;
-            let end = base + nvmet::NVMET_PORT_ID_RANGE - 1;
-            for l in &holder.listeners {
-                if let Some(id) = l.nvmet_port_id {
-                    if !(base..=end).contains(&id) {
-                        notes.push(format!(
-                            "listener {}:{} rides nvmet port id {id}, outside the reserved \
-                             range [{base}, {end}] — recorded as-is; unshare removes the port \
-                             object only when link-free (§6.6 teardown law)",
-                            l.ip, l.port
-                        ));
-                    }
-                }
+    // Out-of-range port ids (e.g. a pre-rebuild share's small-int id) are
+    // recorded AS-IS: the §6.6 link-free teardown law covers their later
+    // removal — the reserved range governs only allocation.
+    let base = nvmet::NVMET_PORT_ID_BASE_DEFAULT;
+    let end = base + nvmet::NVMET_PORT_ID_RANGE - 1;
+    for l in &holder.listeners {
+        if let Some(id) = l.nvmet_port_id {
+            if !(base..=end).contains(&id) {
+                notes.push(format!(
+                    "listener {}:{} rides nvmet port id {id}, outside the reserved range \
+                     [{base}, {end}] — recorded as-is; unshare removes the port object only \
+                     when link-free (§6.6 teardown law)",
+                    l.ip, l.port
+                ));
             }
-            (None, None, None)
         }
-        StackKind::Spdk => {
-            // Live nsid + serving bdev are recorded verbatim (teardown/
-            // restore drive the RECORDED name). The ptpl posture is
-            // probed against OUR state dir: a surviving
-            // `spdk/ptpl/<uuid>.json` (the ledger-loss funnel) is
-            // re-bound; anything else is a loud null (§6.10 pt 1).
-            let ptpl = match holder.ns_uuid.as_deref() {
-                Some(uuid) => {
-                    let rel = format!("spdk/ptpl/{uuid}.json");
-                    if state_dir.join(&rel).exists() {
-                        notes.push(format!(
-                            "existing reservation-persistence file {rel} re-bound to the \
-                             adopted record (the ledger-loss funnel keeps PTPL)"
-                        ));
-                        Some(rel)
-                    } else {
-                        notes.push(
-                            "no ptpl_file is known for this share — recorded null; \
-                             PTPL/guard-persistence upgrade requires a re-share under \
-                             management"
-                                .to_string(),
-                        );
-                        None
-                    }
-                }
-                None => None,
-            };
-            (
-                holder.nsids.first().copied(),
-                holder.bdev_name.clone(),
-                ptpl,
-            )
-        }
-    };
+    }
     let utc = ledger::utc_now_rfc3339();
     ShareRecord {
         subnqn: holder.subnqn.clone(),
-        stack: kind,
+        stack: StackKind::Nvmet,
         state: ShareState::Pending,
         backing_path,
         backing_canonical,
-        nsid,
+        nsid: None,
         ns_uuid: holder.ns_uuid.clone(),
         listeners: holder.listeners.clone(),
-        bdev_name,
-        ptpl_file,
+        bdev_name: None,
+        ptpl_file: None,
         loop_device,
         created_utc: utc.clone(),
         allow_hosts: holder.allow_hosts.clone(),
@@ -1147,92 +812,46 @@ fn build_adopt_record(
     }
 }
 
-/// §6.10 pts 1–2: locate the live foreign object (exactly one stack;
-/// `flag` disambiguates a both-stacks-live NQN), refuse loud on the six
-/// named classes (`adopt_not_live` / `adopt_ambiguous` /
+/// §6.10 pts 1–2: locate the live foreign object in the nvmet walk,
+/// refuse loud on the named classes (`adopt_not_live` /
 /// `adopt_already_ledgered` / `adopt_backing_duplicated` /
 /// `adopt_harness_owned` / `adopt_shape_unsupported`), and read the live
 /// object into a candidate `pending` record with `adopted_from`
 /// provenance. Returns the candidate plus the loud notes (recorded
 /// nulls, out-of-range port ids) for the caller to print — pure over the
-/// injected probes; mutates nothing.
+/// injected live snapshot; mutates nothing.
 pub fn adopt_candidate(
     subnqn: &str,
-    flag: Option<StackKind>,
-    probes: &[AdoptProbe],
+    live: &[LiveShare],
     ledger: &Ledger,
 ) -> Result<(ShareRecord, Vec<String>), NvmeofError> {
-    // ---- locate (§6.10 pt 1): the flag filters WHERE adopt looks; the
-    // guard scans below always see every probe. --------------------------
-    let holders: Vec<(StackKind, &LiveShare)> = probes
-        .iter()
-        .filter(|p| flag.is_none_or(|f| p.kind == f))
-        .flat_map(|p| {
-            p.live
-                .iter()
-                .filter(|l| l.subnqn == subnqn)
-                .map(move |l| (p.kind, l))
-        })
-        .collect();
-    let (kind, holder) = match holders.as_slice() {
-        [] => {
-            let notes: String = probes
-                .iter()
-                .filter_map(|p| p.note.as_ref())
-                .map(|n| format!("\n  note: {n}"))
-                .collect();
-            let filter_hint = if flag.is_some() {
-                "\n  (--target-stack filtered the probe to that stack — drop the flag to \
-                 auto-detect)"
-            } else {
-                ""
-            };
-            return Err(adopt_refusal(
-                "adopt_not_live",
-                subnqn,
-                format!(
-                    "the subsystem is live on neither target stack — adopt absorbs live \
-                     foreign objects only.{filter_hint}\n  inspect live + ledger state:  sudo \
-                     squeezefs nvmeof list\n  a ledgered-but-down share is `nvmeof restore` \
-                     territory, never adopt{notes}"
-                ),
-            ));
-        }
-        [one] => *one,
-        many => {
-            let holders_txt: String = many
-                .iter()
-                .map(|(k, l)| {
-                    format!(
-                        "\n    {} stack: serving '{}' (backing {})",
-                        k.as_str(),
-                        l.device_path,
-                        l.backing_canonical
-                    )
-                })
-                .collect();
-            return Err(adopt_refusal(
-                "adopt_ambiguous",
-                subnqn,
-                format!(
-                    "the NQN is live on BOTH target stacks — failing closed; adopt absorbs \
-                     exactly one holder:{holders_txt}\n  disambiguate explicitly:  sudo \
-                     squeezefs nvmeof adopt {subnqn} --target-stack <spdk|nvmet>"
-                ),
-            ));
-        }
+    // ---- locate (§6.10 pt 1). --------------------------------------------
+    let Some(holder) = live.iter().find(|l| l.subnqn == subnqn) else {
+        return Err(adopt_refusal(
+            "adopt_not_live",
+            subnqn,
+            "the subsystem is not live on the kernel nvmet target — adopt absorbs live foreign \
+             objects only.\n  inspect live + ledger state:  sudo squeezefs nvmeof list\n  a \
+             ledgered-but-down share is `nvmeof restore` territory, never adopt"
+                .to_string(),
+        ));
     };
 
     // ---- adopt_already_ledgered: NQN or backing, ANY intent state
     // (crash-window records belong to `restore`, active ones to
-    // `unshare`; `begin_share` re-checks this atomically under the
-    // ledger flock). ------------------------------------------------------
+    // `unshare` — including a record the RETIRED SPDK stack wrote, whose
+    // exit is the re-share sequence; `begin_share` re-checks this
+    // atomically under the ledger flock). --------------------------------
     if let Some(rec) = ledger.find(subnqn).map_err(NvmeofError::Io)? {
-        let remediation = match rec.state {
-            ShareState::Active => {
+        let remediation = match (rec.stack, rec.state) {
+            (StackKind::Spdk, _) => {
+                "it is a RETIRED-SPDK record — `nvmeof unshare` removes it (ledger-only), then \
+                 `nvmeof share --target-stack nvmet` re-shares the backing; never adopt"
+            }
+            (_, ShareState::Active) => {
                 "it is already managed — `nvmeof unshare`/`nvmeof restore` territory"
             }
-            ShareState::Pending | ShareState::Removing => {
+            (_, ShareState::Pending | ShareState::Removing) => {
                 "it is a crash-window intent record — `nvmeof restore` reconciles it \
                  (finalize / garbage-collect / resume), never adopt"
             }
@@ -1271,61 +890,30 @@ pub fn adopt_candidate(
     }
 
     // ---- adopt_backing_duplicated: the §6.4 duplicate-guard laws apply
-    // to adopt verbatim — live subsystems on BOTH stacks plus the SPDK
-    // bare-bdev filename scan. --------------------------------------------
-    for probe in probes {
-        for other in &probe.live {
-            if probe.kind == kind && other.subnqn == subnqn {
-                continue; // the holder itself
-            }
-            let materialized = !other.device_path.is_empty() || other.enabled;
-            if !materialized {
-                continue;
-            }
-            let clash = (!holder.backing_canonical.is_empty()
-                && other.backing_canonical == holder.backing_canonical)
-                || (!holder.device_path.is_empty() && other.device_path == holder.device_path);
-            if clash {
-                return Err(adopt_refusal(
-                    "adopt_backing_duplicated",
-                    subnqn,
-                    format!(
-                        "another live object serves the same canonical backing '{}': \
-                         subsystem '{}' on the {} stack — the same backing must never be \
-                         double-served, across stacks included (§6.4); absorbing one of two \
-                         same-backing servers would bless the double-serve.\n  remove one \
-                         holder first (`nvmeof list` classifies both), then adopt or \
-                         re-share",
-                        holder.backing_canonical,
-                        other.subnqn,
-                        probe.kind.as_str()
-                    ),
-                ));
-            }
+    // to adopt verbatim over every other live subsystem. -----------------
+    for other in live {
+        if other.subnqn == subnqn {
+            continue; // the holder itself
         }
-        for (name, filename) in &probe.aio_bdevs {
-            if kind == StackKind::Spdk && holder.bdev_name.as_deref() == Some(name.as_str()) {
-                continue; // the candidate's own serving bdev
-            }
-            if filename == &holder.backing_canonical
-                || (!holder.device_path.is_empty() && filename == &holder.device_path)
-            {
-                return Err(adopt_refusal(
-                    "adopt_backing_duplicated",
-                    subnqn,
-                    format!(
-                        "SPDK bdev '{name}' already opens the same backing '{filename}' \
-                         (attached to a subsystem or not) — the same backing must never be \
-                         double-served (§6.4).\n  a foreign/orphaned bdev is removed \
-                         manually:\n{}",
-                        spdk::manual_removal_steps(
-                            &spdk::SpdkPaths::resolve().rpc_sock(),
-                            "<its subsystem, if any>",
-                            Some(name)
-                        )
-                    ),
-                ));
-            }
+        let materialized = !other.device_path.is_empty() || other.enabled;
+        if !materialized {
+            continue;
+        }
+        let clash = (!holder.backing_canonical.is_empty()
+            && other.backing_canonical == holder.backing_canonical)
+            || (!holder.device_path.is_empty() && other.device_path == holder.device_path);
+        if clash {
+            return Err(adopt_refusal(
+                "adopt_backing_duplicated",
+                subnqn,
+                format!(
+                    "another live subsystem serves the same canonical backing '{}': '{}' — \
+                     the same backing must never be double-served (§6.4); absorbing one of \
+                     two same-backing servers would bless the double-serve.\n  remove one \
+                     holder first (`nvmeof list` classifies both), then adopt or re-share",
+                    holder.backing_canonical, other.subnqn
+                ),
+            ));
         }
     }
 
@@ -1338,96 +926,54 @@ pub fn adopt_candidate(
                 format!(
                     "the NQN carries the test-harness marker '{marker}' — harness objects \
                      belong to their harness's teardown (tests/dev_substrate.sh teardown / \
-                     the scoping rig's teardown.sh), never to adoption"
+                     tests/nvmeof_target_substrate.sh teardown), never to adoption"
                 ),
             ));
         }
     }
-    if kind == StackKind::Nvmet {
-        for l in &holder.listeners {
-            if let Some(id) = l.nvmet_port_id {
-                if HARNESS_NVMET_PORT_IDS.contains(&id) {
-                    return Err(adopt_refusal(
-                        "adopt_harness_owned",
-                        subnqn,
-                        format!(
-                            "it serves through nvmet port id {id} — a \
-                             test-harness-reserved port (dev_substrate 52026 / scoping rig \
-                             52470-52471); harness objects belong to their harness's \
-                             teardown, never to adoption"
-                        ),
-                    ));
-                }
+    for l in &holder.listeners {
+        if let Some(id) = l.nvmet_port_id {
+            if HARNESS_NVMET_PORT_IDS.contains(&id) {
+                return Err(adopt_refusal(
+                    "adopt_harness_owned",
+                    subnqn,
+                    format!(
+                        "it serves through nvmet port id {id} — a test-harness-reserved port \
+                         (dev_substrate 52026 / scoping rig 52470-52471); harness objects \
+                         belong to their harness's teardown, never to adoption"
+                    ),
+                ));
             }
         }
     }
 
     // ---- adopt_shape_unsupported (§6.6 structural conventions). ---------
-    match kind {
-        StackKind::Nvmet => {
-            if holder.nsids.is_empty() || holder.device_path.is_empty() {
-                return Err(adopt_refusal(
-                    "adopt_shape_unsupported",
-                    subnqn,
-                    format!(
-                        "the live subsystem serves no materialized namespace (namespace \
-                         index(es) {:?}, device_path '{}') — nothing absorbable; an empty \
-                         shell is removed manually:\n{}",
-                        holder.nsids,
-                        holder.device_path,
-                        manual_steps_for(kind, subnqn)
-                    ),
-                ));
-            }
-            if holder.nsids != [1] {
-                return Err(adopt_refusal(
-                    "adopt_shape_unsupported",
-                    subnqn,
-                    format!(
-                        "the kernel-nvmet namespace index is structurally fixed at 1 (one \
-                         namespace per subsystem — §6.6), but the live subsystem carries \
-                         namespace index(es) {:?} — remediation is removal-first + re-share \
-                         under management:\n{}",
-                        holder.nsids,
-                        manual_steps_for(kind, subnqn)
-                    ),
-                ));
-            }
-        }
-        StackKind::Spdk => {
-            if holder.nsids.len() != 1 {
-                return Err(adopt_refusal(
-                    "adopt_shape_unsupported",
-                    subnqn,
-                    format!(
-                        "adopt supports exactly one namespace per subsystem, but the live \
-                         subsystem carries {} (nsids {:?}) — remediation is removal-first + \
-                         re-share under management:\n{}",
-                        holder.nsids.len(),
-                        holder.nsids,
-                        manual_steps_for(kind, subnqn)
-                    ),
-                ));
-            }
-            if holder.device_path.is_empty() {
-                return Err(adopt_refusal(
-                    "adopt_shape_unsupported",
-                    subnqn,
-                    format!(
-                        "its namespace does not resolve to a bdev_aio backing (bdev {}) — \
-                         v1 serves kernel block nodes and files via bdev_aio only \
-                         (§Non-Goals); remediation is removal-first + re-share under \
-                         management:\n{}",
-                        holder
-                            .bdev_name
-                            .as_deref()
-                            .map(|b| format!("'{b}'"))
-                            .unwrap_or_else(|| "<none>".to_string()),
-                        manual_steps_for(kind, subnqn)
-                    ),
-                ));
-            }
-        }
+    if holder.nsids.is_empty() || holder.device_path.is_empty() {
+        return Err(adopt_refusal(
+            "adopt_shape_unsupported",
+            subnqn,
+            format!(
+                "the live subsystem serves no materialized namespace (namespace index(es) \
+                 {:?}, device_path '{}') — nothing absorbable; an empty shell is removed \
+                 manually:\n{}",
+                holder.nsids,
+                holder.device_path,
+                manual_steps_nvmet(subnqn)
+            ),
+        ));
+    }
+    if holder.nsids != [1] {
+        return Err(adopt_refusal(
+            "adopt_shape_unsupported",
+            subnqn,
+            format!(
+                "the kernel-nvmet namespace index is structurally fixed at 1 (one namespace \
+                 per subsystem — §6.6), but the live subsystem carries namespace index(es) \
+                 {:?} — remediation is removal-first + re-share under management:\n{}",
+                holder.nsids,
+                manual_steps_nvmet(subnqn)
+            ),
+        ));
     }
     if holder.listeners.is_empty() {
         // The §6.4 schema requires >= 1 listener — a subsystem with no
@@ -1440,14 +986,14 @@ pub fn adopt_candidate(
                 "the live subsystem exposes no listener (no fabric presence) — the share \
                  schema requires at least one; remediation is removal-first + re-share under \
                  management:\n{}",
-                manual_steps_for(kind, subnqn)
+                manual_steps_nvmet(subnqn)
             ),
         ));
     }
 
     // ---- candidate build (§6.10 pt 1 identity capture + loud notes). ----
     let mut notes = Vec::new();
-    let record = build_adopt_record(kind, holder, ledger.state_dir(), &mut notes);
+    let record = build_adopt_record(holder, &mut notes);
     record.validate().map_err(NvmeofError::Io)?;
     Ok((record, notes))
 }
@@ -1490,20 +1036,11 @@ pub fn adopt_verify_unchanged(
         (None, None) => {}
         (a, b) => return Err(format!("ns_uuid changed: recorded {a:?}, live {b:?}")),
     }
-    let expect_nsids: Vec<u32> = match candidate.stack {
-        StackKind::Nvmet => vec![1],
-        StackKind::Spdk => vec![candidate.nsid.unwrap_or(1)],
-    };
-    if live.nsids != expect_nsids {
+    // The nvmet shape is structurally [1] (§6.6).
+    if live.nsids != [1] {
         return Err(format!(
-            "namespace shape changed: recorded {expect_nsids:?}, live {:?}",
+            "namespace shape changed: recorded [1], live {:?}",
             live.nsids
-        ));
-    }
-    if candidate.stack == StackKind::Spdk && live.bdev_name != candidate.bdev_name {
-        return Err(format!(
-            "serving bdev changed: recorded {:?}, live {:?}",
-            candidate.bdev_name, live.bdev_name
         ));
     }
     let mut recorded: Vec<(String, u16, Option<u32>)> = candidate
@@ -1535,43 +1072,21 @@ pub fn adopt_verify_unchanged(
     Ok(())
 }
 
-/// The adopt flow over explicit stacks + ledger (the §6.8 injection
-/// seam: the unit tier drives injected stacks/fake targets through
-/// exactly this production path). Probes both stacks → classify
-/// (`adopt_candidate`) → absorb via the intent protocol (§6.4 law 6:
-/// `begin_share(pending)` → TOCTOU re-verify → SPDK truth-capture
-/// `save_config` → `finalize_share(active)`). **Mutates no target
-/// state** on any path — drift aborts delete only the pending ledger
-/// record.
+/// The adopt flow over an explicit stack + ledger (the §6.8 injection
+/// seam: the unit tier drives an injected configfs root through exactly
+/// this production path). Probe → classify (`adopt_candidate`) → absorb
+/// via the intent protocol (§6.4 law 6: `begin_share(pending)` → TOCTOU
+/// re-verify → `finalize_share(active)`). **Mutates no target state** on
+/// any path — drift aborts delete only the pending ledger record.
 pub fn adopt_over(
     subnqn: &str,
-    flag: Option<StackKind>,
     ledger: &Ledger,
     nvmet_stack: &nvmet::NvmetStack,
-    spdk_stack: &spdk::SpdkStack,
 ) -> Result<ShareRecord, NvmeofError> {
-    // §6.10 pt 1: probe BOTH stacks — locate honors the flag inside the
-    // classification, the duplicate-guard scans always see everything.
-    // The nvmet walk is strict (a present-but-unreadable tree stays loud;
-    // an absent tree walks empty); the SPDK gather is tolerant (a dead
-    // target serves nothing — the note is woven into refusals).
-    let nvmet_live = nvmet_stack.live_shares()?;
-    let (spdk_live, spdk_note) = spdk_stack.live_shares_tolerant();
-    let probes = [
-        AdoptProbe {
-            kind: StackKind::Nvmet,
-            live: nvmet_live,
-            aio_bdevs: Vec::new(),
-            note: None,
-        },
-        AdoptProbe {
-            kind: StackKind::Spdk,
-            live: spdk_live,
-            aio_bdevs: spdk_stack.aio_bdevs_tolerant(),
-            note: spdk_note,
-        },
-    ];
-    let (candidate, notes) = adopt_candidate(subnqn, flag, &probes, ledger)?;
+    // The walk is strict: a present-but-unreadable tree stays loud; an
+    // absent tree walks empty.
+    let live = nvmet_stack.live_shares()?;
+    let (candidate, notes) = adopt_candidate(subnqn, &live, ledger)?;
     for note in &notes {
         println!("note: {note}");
     }
@@ -1581,15 +1096,11 @@ pub fn adopt_over(
     // NQN/backing duplicate laws atomically under the ledger flock.
     ledger.begin_share(&candidate).map_err(NvmeofError::Io)?;
 
-    // §6.10 pt 3 TOCTOU re-verify: re-probe the holder's stack fresh and
-    // compare every live-observable field. Any failure here aborts loud
-    // and garbage-collects the pending intent adopt itself just wrote —
+    // §6.10 pt 3 TOCTOU re-verify: re-probe fresh and compare every
+    // live-observable field. Any failure here aborts loud and
+    // garbage-collects the pending intent adopt itself just wrote —
     // target state is untouched on every path.
-    let verified = match candidate.stack {
-        StackKind::Nvmet => nvmet_stack.live_shares(),
-        StackKind::Spdk => spdk_stack.live_shares(),
-    }
-    .and_then(|live_now| {
+    let verified = nvmet_stack.live_shares().and_then(|live_now| {
         adopt_verify_unchanged(&candidate, &live_now).map_err(|why| {
             NvmeofError::Refused(format!(
                 "adopt of '{subnqn}' aborted: live state changed between classification and \
@@ -1610,15 +1121,6 @@ pub fn adopt_over(
         return Err(e);
     }
 
-    // §6.10 pt 4: SPDK truth capture — tgt-config.json must describe
-    // what the target now serves under management (read-only RPCs + a
-    // state-dir write; not a target mutation). It runs BEFORE finalize
-    // (the law-6 pattern: active only after the verb's last step — a
-    // crash window leaves a pending intent that `restore` finalizes AND
-    // saves).
-    if candidate.stack == StackKind::Spdk {
-        spdk_stack.save_config()?;
-    }
     ledger
         .finalize_share(&candidate.subnqn)
         .map_err(NvmeofError::Io)?;
@@ -1648,22 +1150,36 @@ pub fn adopt_over(
 /// action absorbing a live foreign (unledgered) share into management by
 /// writing ONLY the ledger — the live target object is untouched (the
 /// two funneling scenarios, pre-rebuild shares and ledger loss, have
-/// data serving that must not bounce). Stack auto-detected from where
-/// the subnqn lives; `--target-stack` only disambiguates a
-/// both-stacks-live NQN (never a retarget, and the env knob is
+/// data serving that must not bounce). `--target-stack nvmet` names the
+/// one stack adopt probes; the retired `spdk` refuses (the env knob is
 /// deliberately not consulted — detection is live-state truth).
 pub fn adopt(subnqn: &str, flag: Option<StackKind>) -> Result<ShareRecord, NvmeofError> {
+    if let Some(kind) = flag {
+        resolve_stack(Some(kind))?;
+    }
     check_root()?;
     retire_old_registry_once();
     let ledger = Ledger::open_default();
     let nvmet_stack = nvmet::NvmetStack::open_default().map_err(NvmeofError::Io)?;
-    let spdk_stack = spdk::SpdkStack::open_default(false, false);
-    adopt_over(subnqn, flag, &ledger, &nvmet_stack, &spdk_stack)
+    adopt_over(subnqn, &ledger, &nvmet_stack)
 }
 
-/// Reconciliation classification of one ledger record for `list` (§6.2)
-/// — complete for BOTH stacks from N4 on.
-fn classification_of(record: &ShareRecord, live: bool) -> &'static str {
+/// The `list` classification of a record the RETIRED SPDK stack wrote:
+/// listed with the re-share sequence, never managed, never a restore
+/// candidate (R-SYM-8).
+pub const SPDK_RETIRED_CLASSIFICATION: &str = concat!(
+    "spdk — RETIRED target stack (R-SYM-8): never re-presented (not started, restored or ",
+    "adopted); ",
+    spdk_reshare_sequence!()
+);
+
+/// Reconciliation classification of one ledger record for `list` (§6.2).
+/// A record the retired SPDK stack wrote classifies as retired in every
+/// state — the ledger no longer has a stack to reconcile it against.
+pub fn classification_of(record: &ShareRecord, live: bool) -> &'static str {
+    if record.stack == StackKind::Spdk {
+        return SPDK_RETIRED_CLASSIFICATION;
+    }
     match (record.state, live) {
         (ShareState::Pending, _) => {
             "pending — interrupted share; `nvmeof restore` finalizes or garbage-collects it"
@@ -1677,10 +1193,9 @@ fn classification_of(record: &ShareRecord, live: bool) -> &'static str {
 }
 
 /// The `nvmeof list` verb (§6.2): ledger ∪ live-state reconciliation —
-/// managed / down / pending / removing / foreign, complete for BOTH
-/// stacks (N4) — plus the kept connected-fabric-disks section. The SPDK
-/// gather is tolerant (a stopped target serves nothing — noted, never a
-/// hard failure); the nvmet gather tolerates an absent configfs tree.
+/// managed / down / pending / removing / foreign / retired-spdk — plus
+/// the kept connected-fabric-disks section. The nvmet gather tolerates an
+/// absent configfs tree.
 pub fn list(json: bool) -> Result<(), NvmeofError> {
     check_root()?;
     let ledger = Ledger::open_default();
@@ -1689,15 +1204,11 @@ pub fn list(json: bool) -> Result<(), NvmeofError> {
     let nvmet_stack = nvmet::NvmetStack::open_default()?;
     nvmet_stack.preflight(PreflightOp::List)?;
     let nvmet_live = nvmet_stack.live_shares()?;
-    let (spdk_live, spdk_note) = spdk::SpdkStack::open_default(false, false).live_shares_tolerant();
 
-    // (kind, share) for every live object, both stacks.
-    let live: Vec<(StackKind, &LiveShare)> = nvmet_live
-        .iter()
-        .map(|l| (StackKind::Nvmet, l))
-        .chain(spdk_live.iter().map(|l| (StackKind::Spdk, l)))
-        .collect();
-    // A record is "live" when its OWN stack serves its NQN.
+    let live: Vec<(StackKind, &LiveShare)> =
+        nvmet_live.iter().map(|l| (StackKind::Nvmet, l)).collect();
+    // A record is "live" when its OWN stack serves its NQN — a retired
+    // SPDK record therefore never is.
     let live_by_key: HashMap<(StackKind, &str), &LiveShare> = live
         .iter()
         .map(|(kind, l)| ((*kind, l.subnqn.as_str()), *l))
@@ -1759,9 +1270,6 @@ pub fn list(json: bool) -> Result<(), NvmeofError> {
     }
 
     println!("=== Managed NVMe-oF Target Shares (ledger ∪ live state) ===");
-    if let Some(note) = &spdk_note {
-        println!("  ({note})");
-    }
     if records.is_empty() {
         println!("  (no ledgered shares)");
     }

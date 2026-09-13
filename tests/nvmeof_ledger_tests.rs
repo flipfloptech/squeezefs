@@ -342,8 +342,11 @@ fn test_ledger_field_presence_rules() {
     );
 
     // Full-optional record round-trips losslessly (schema example shape,
-    // §6.4 — incl. the nvmet-only and SPDK-only fields and adopt
-    // provenance, which N1 must parse even though N1 never writes it).
+    // §6.4 — incl. the nvmet-only fields, the fields only the RETIRED
+    // SPDK stack ever wrote (a legacy record must stay decodable so
+    // `list` can name it and `unshare` can remove it — R-SYM-8), and
+    // adopt provenance, which N1 must parse even though N1 never writes
+    // it).
     let full = ShareRecord {
         subnqn: "nqn.2026-07.io.squeezefs:share-full".to_string(),
         stack: StackKind::Spdk,

@@ -172,7 +172,11 @@ fn restore_skips_spdk_records_loud_and_replays_only_nvmet() {
 
     let (replay, skipped) = partition_restorable(vec![spdk.clone(), nvmet.clone()]);
     assert_eq!(replay, vec![nvmet], "only nvmet records are replayed");
-    assert_eq!(skipped.len(), 1, "every SPDK record is reported, never dropped");
+    assert_eq!(
+        skipped.len(),
+        1,
+        "every SPDK record is reported, never dropped"
+    );
     assert_eq!(skipped[0].subnqn, NQN_SPDK);
     match &skipped[0].outcome {
         RestoreOutcome::Skipped(why) => {
@@ -187,7 +191,9 @@ fn unshare_of_an_spdk_record_removes_only_the_ledger_entry_and_names_the_manual_
     let dir = tempfile::tempdir().expect("tempdir");
     let ledger = Ledger::new(dir.path());
     let rec = record(NQN_SPDK, StackKind::Spdk, "/dev/zram9");
-    ledger.begin_share(&rec).expect("seed the legacy SPDK record");
+    ledger
+        .begin_share(&rec)
+        .expect("seed the legacy SPDK record");
     ledger.finalize_share(NQN_SPDK).expect("finalize");
     let active = ledger.find(NQN_SPDK).expect("load").expect("present");
     assert_eq!(active.state, ShareState::Active);
@@ -283,8 +289,14 @@ fn the_target_stack_knob_defaults_to_nvmet_and_refuses_spdk_naming_nvmet() {
     let v = env_knobs::validate_vars([("SQUEEZEFS_NVMEOF_TARGET_STACK", "spdk")]);
     assert_eq!(v.errors.len(), 1, "{v:?}");
     let msg = &v.errors[0];
-    assert!(msg.contains("SQUEEZEFS_NVMEOF_TARGET_STACK") && msg.contains("spdk"), "{msg}");
-    assert!(msg.contains("nvmet"), "the refusal names the ONE target: {msg}");
+    assert!(
+        msg.contains("SQUEEZEFS_NVMEOF_TARGET_STACK") && msg.contains("spdk"),
+        "{msg}"
+    );
+    assert!(
+        msg.contains("nvmet"),
+        "the refusal names the ONE target: {msg}"
+    );
     assert!(env_knobs::validate_vars([("SQUEEZEFS_NVMEOF_TARGET_STACK", "nvmet")]).is_clean());
 }
 
@@ -526,7 +538,13 @@ fn the_spdk_module_is_deleted_and_nothing_reaches_for_it() {
             .map(|l| l.split("//").next().unwrap_or(""))
             .collect::<Vec<_>>()
             .join("\n");
-        for needle in ["spdk::", "mod spdk", "SpdkStack", "SpdkPaths", "SpdkRpcClient"] {
+        for needle in [
+            "spdk::",
+            "mod spdk",
+            "SpdkStack",
+            "SpdkPaths",
+            "SpdkRpcClient",
+        ] {
             assert!(
                 !code.contains(needle),
                 "{} still references SPDK machinery ('{needle}')",

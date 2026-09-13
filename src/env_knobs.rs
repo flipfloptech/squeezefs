@@ -350,11 +350,11 @@ pub static KNOBS: &[Knob] = &[
     k("SQUEEZEFS_JOB_WIRE_MAX_CONNS", int(0, 1 << 20), "derived from cores", "Concurrent job-wire connection cap. 0 is refused by the job-wire loader itself (it would refuse every worker) — same reasoning as the freshness knob."),
     k("SQUEEZEFS_JOB_WIRE_VERIFY_PERMILLE", int(0, 1000), "1000 plaintext / sampled TLS", "Pre-publish verify-read sampling, per mille."),
     // -- NVMe-oF target management ---------------------------------------
-    k("SQUEEZEFS_NVMEOF_TARGET_STACK", Kind::Enum(&["spdk", "nvmet"]), "spdk", "Target stack selection (`--target-stack` flag > this env > spdk — `nvmeof::resolve_stack`); a malformed value refuses loud, never falls back to the default."),
+    k("SQUEEZEFS_NVMEOF_TARGET_STACK", Kind::Enum(&["nvmet"]), "nvmet", "Target stack selection (`--target-stack` flag > this env > nvmet — `nvmeof::resolve_stack`). The kernel nvmet target is THE target: `spdk` was RETIRED (R-SYM-8, docs/design-symmetric-metadata.md §5.8.1) and refuses loud naming nvmet and the re-share sequence; any other value refuses loud, never falls back to the default."),
     k("SQUEEZEFS_NVMEOF_STATE_DIR", Kind::Str, "/var/lib/squeezefs/nvmeof", "Durable target-ledger directory."),
-    k("SQUEEZEFS_NVMEOF_RUN_DIR", Kind::Str, "/run/squeezefs/nvmeof", "Runtime directory for target sockets/pids."),
+    k("SQUEEZEFS_NVMEOF_RUN_DIR", Kind::Retired { successor: "(deleted — SPDK was retired as an NVMe-oF target, R-SYM-8; the kernel nvmet target is not a process and has no sockets or pidfile)" }, "-", "Retired with SPDK (R-SYM-8): the runtime directory held spdk_tgt's RPC socket and pidfile."),
     k("SQUEEZEFS_NVMET_PORT_ID_BASE", int(0, u32::MAX as i128), "derived", "kernel-nvmet port-id allocation base."),
-    k("SQUEEZEFS_SPDK_TGT_BIN", Kind::Str, "pinned install", "Override the spdk_tgt binary path."),
+    k("SQUEEZEFS_SPDK_TGT_BIN", Kind::Retired { successor: "(deleted — SPDK was retired as an NVMe-oF target, R-SYM-8; the kernel nvmet target has no spdk_tgt binary to point at)" }, "-", "Retired with SPDK (R-SYM-8): pointed the SPDK stack at an unpinned spdk_tgt build."),
     // -- Local file I/O ---------------------------------------------------
     k("SQUEEZEFS_URING_FS_WORKERS", int(1, 64), "derived", "`uring_fs` process-worker count for ad-hoc local file I/O."),
     // -- Test seams (product code, armed only by suites/rigs) ------------
@@ -462,7 +462,8 @@ fn validate_one(knob: &Knob, raw: &str) -> Option<String> {
         Kind::Str | Kind::BuildTime | Kind::Harness => None,
         Kind::Retired { successor } => core::present(v).map(|val| {
             format!(
-                "{}='{val}' was RETIRED (ENG-10 knob-namespace collision): use {successor} instead",
+                "{}='{val}' was RETIRED (forward-only — never a silent alias): use {successor} \
+                 instead",
                 knob.key
             )
         }),

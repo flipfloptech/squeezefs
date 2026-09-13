@@ -7,21 +7,16 @@
 //!   lifecycle verbs fail with clap's unknown-verb error (the
 //!   docs/operations.md removed-verbs ledger explains them);
 //! * `--target-stack` resolution (flag > `SQUEEZEFS_NVMEOF_TARGET_STACK`
-//!   env > default `spdk`) — **as of N4 the default stack reaches a real
-//!   `SpdkStack`**: the N3 interim milestone refusal is dead, so an
-//!   unprivileged SPDK-selected share/restore dies on the ROOT rung
-//!   (proving stack construction succeeded), never on a milestone
-//!   message; resolution is observed via the `--nsid` per-stack
-//!   discriminator (nvmet refuses ≠ 1 at the grammar rung, spdk allows);
-//! * the `target …` verb surface exists (N3): install/setup/start/stop/
-//!   status demand root; systemd-unit emits unprivileged;
-//!   `install --version` must equal the pin;
-//! * per-stack flag semantics (§6.2): `--nsid` is SPDK-only (nvmet index
-//!   structurally fixed at 1 ⇒ `--nsid` ≠ 1 with nvmet refuses loud);
-//!   `--ns-uuid` seeds both stacks and must parse; N4 adds
-//!   `--accept-version-drift` to the mutating share verbs (share /
-//!   unshare / restore — SPDK rung 4) and `--force` to unshare (the R7
-//!   live-consumer override), both refusing loud where meaningless.
+//!   env > default `nvmet` — the ONE target since SPDK was retired,
+//!   R-SYM-8; the retirement refusals themselves are pinned in
+//!   `tests/nvmeof_retire_spdk_tests.rs`): an unprivileged share dies on
+//!   the ROOT rung (proving stack construction succeeded), and an
+//!   unparseable env value refuses loud;
+//! * the `target …` verb surface exists: setup/start/status demand root;
+//!   stop refuses (the kernel target is not a process); systemd-unit
+//!   emits unprivileged;
+//! * flag semantics (§6.2): the nvmet namespace index is structurally
+//!   fixed at 1 (`--nsid` ≠ 1 refuses loud); `--ns-uuid` must parse.
 //!
 //! Every invocation uses a missing backing path and a tempdir state dir,
 //! so even a root run mutates nothing.
@@ -146,24 +141,22 @@ fn test_adopt_grammar_root_rung_and_stack_disambiguator() {
         "unprivileged adopt dies on the root rung: {text}"
     );
 
-    for stack in ["spdk", "nvmet"] {
-        let out = run(
-            &[
-                "nvmeof",
-                "adopt",
-                "nqn.2026-06.io.foreign:x",
-                "--target-stack",
-                stack,
-            ],
-            &[],
-        );
-        assert!(!out.status.success());
-        let text = combined(&out);
-        assert!(
-            text.contains("root"),
-            "--target-stack {stack} parses and adopt still dies on the root rung: {text}"
-        );
-    }
+    let out = run(
+        &[
+            "nvmeof",
+            "adopt",
+            "nqn.2026-06.io.foreign:x",
+            "--target-stack",
+            "nvmet",
+        ],
+        &[],
+    );
+    assert!(!out.status.success());
+    let text = combined(&out);
+    assert!(
+        text.contains("root"),
+        "--target-stack nvmet parses and adopt still dies on the root rung: {text}"
+    );
 
     let out = run(
         &[
@@ -192,20 +185,18 @@ fn test_adopt_grammar_root_rung_and_stack_disambiguator() {
     );
 }
 
-/// The N3 `target …` verb surface exists (§6.2).
+/// The `target …` verb surface exists (§6.2); the retired `install`
+/// (SPDK-only by definition) is hidden from help.
 #[test]
 fn test_target_grammar_help_lists_lifecycle_verbs() {
     let out = run(&["nvmeof", "target", "--help"], &[]);
     assert!(out.status.success(), "nvmeof target --help must succeed");
     let help = combined(&out);
-    for verb in [
-        "install",
-        "setup",
-        "start",
-        "stop",
-        "status",
-        "systemd-unit",
-    ] {
+    assert!(
+        !help.contains("install"),
+        "the retired install verb is hidden: {help}"
+    );
+    for verb in ["setup", "start", "stop", "status", "systemd-unit"] {
         assert!(
             help.contains(verb),
             "target help must list '{verb}': {help}"
@@ -214,26 +205,26 @@ fn test_target_grammar_help_lists_lifecycle_verbs() {
 }
 
 // ---------------------------------------------------------------------------
-// the SPDK default reaches a REAL SpdkStack from N4 on (the interim
-// milestone refusal is dead — unprivileged runs die on the root rung)
+// the default stack is nvmet — the ONE target (R-SYM-8); unprivileged runs
+// die on the root rung, proving stack construction succeeded
 // ---------------------------------------------------------------------------
 
-fn assert_reaches_real_spdk_path(context: &str, text: &str) {
-    assert!(
-        !text.contains("lands with milestone N4") && !text.contains("SPDK share management lands"),
-        "{context}: the N3 interim milestone refusal must be DEAD at N4: {text}"
-    );
+fn assert_reaches_real_nvmet_path(context: &str, text: &str) {
     assert!(
         text.contains("root"),
-        "{context}: unprivileged SPDK-selected verbs die on the root rung (stack construction \
+        "{context}: unprivileged nvmet-selected verbs die on the root rung (stack construction \
          succeeded): {text}"
+    );
+    assert!(
+        !text.to_ascii_lowercase().contains("retired"),
+        "{context}: the nvmet path never trips the SPDK retirement refusal: {text}"
     );
 }
 
-/// `share` with the default stack (spdk) reaches the real SPDK path:
-/// unprivileged it dies demanding root — never on a milestone message.
+/// `share` with the default stack reaches the real nvmet path:
+/// unprivileged it dies demanding root.
 #[test]
-fn test_share_default_stack_reaches_real_spdk_path() {
+fn test_share_default_stack_reaches_real_nvmet_path() {
     let out = run(
         &[
             "nvmeof",
@@ -245,37 +236,24 @@ fn test_share_default_stack_reaches_real_spdk_path() {
         &[],
     );
     assert!(!out.status.success(), "unprivileged share must fail");
-    assert_reaches_real_spdk_path("default stack", &combined(&out));
+    assert_reaches_real_nvmet_path("default stack", &combined(&out));
 }
 
-/// Explicit `--target-stack spdk` reaches the same real path.
+/// Explicit `--target-stack nvmet` and `SQUEEZEFS_NVMEOF_TARGET_STACK=nvmet`
+/// reach the same real path — observed via the `--nsid` discriminator
+/// (the nvmet index is structurally 1, so `--nsid 2` dies on the
+/// structural refusal BEFORE root on every resolution rung).
 #[test]
-fn test_share_explicit_spdk_reaches_real_path() {
-    let out = run(
-        &[
-            "nvmeof",
-            "share",
-            "/nonexistent/backing.img",
-            "--ip",
-            "127.0.0.1",
-            "--target-stack",
-            "spdk",
-        ],
-        &[],
-    );
-    assert!(!out.status.success());
-    assert_reaches_real_spdk_path("explicit spdk", &combined(&out));
-}
-
-/// Stack resolution order: the flag wins over the env; the env wins over
-/// the default — observed via the `--nsid` per-stack discriminator
-/// (nvmet refuses `--nsid` ≠ 1 at the grammar rung, spdk allows it).
-#[test]
-fn test_stack_resolution_flag_over_env_over_default() {
-    // Default (spdk): --nsid 2 is legal — the run proceeds to the root
-    // rung, never the structural-index refusal.
-    let out = run(
-        &[
+fn test_stack_resolution_flag_env_default_all_select_nvmet() {
+    const ENV_NVMET: &[(&str, &str)] = &[("SQUEEZEFS_NVMEOF_TARGET_STACK", "nvmet")];
+    const FLAG_NVMET: &[&str] = &["--target-stack", "nvmet"];
+    for (extra, envs) in [
+        (&[][..], &[][..]),
+        (FLAG_NVMET, &[][..]),
+        (&[][..], ENV_NVMET),
+        (FLAG_NVMET, ENV_NVMET),
+    ] {
+        let mut args = vec![
             "nvmeof",
             "share",
             "/nonexistent/backing.img",
@@ -283,60 +261,20 @@ fn test_stack_resolution_flag_over_env_over_default() {
             "127.0.0.1",
             "--nsid",
             "2",
-        ],
-        &[],
-    );
-    assert!(!out.status.success());
-    let text = combined(&out);
-    assert!(
-        !text.contains("structurally fixed"),
-        "default spdk allows --nsid 2: {text}"
-    );
-    assert_reaches_real_spdk_path("default stack nsid", &text);
-
-    // env=nvmet: the env is honored — --nsid 2 dies on the structural
-    // refusal BEFORE root.
-    let out = run(
-        &[
-            "nvmeof",
-            "share",
-            "/nonexistent/backing.img",
-            "--ip",
-            "127.0.0.1",
-            "--nsid",
-            "2",
-        ],
-        &[("SQUEEZEFS_NVMEOF_TARGET_STACK", "nvmet")],
-    );
-    assert!(!out.status.success());
-    let text = combined(&out);
-    assert!(
-        text.contains("structurally fixed at 1"),
-        "env nvmet must select the kernel stack: {text}"
-    );
-
-    // flag=spdk beats env=nvmet: --nsid 2 is legal again.
-    let out = run(
-        &[
-            "nvmeof",
-            "share",
-            "/nonexistent/backing.img",
-            "--ip",
-            "127.0.0.1",
-            "--nsid",
-            "2",
-            "--target-stack",
-            "spdk",
-        ],
-        &[("SQUEEZEFS_NVMEOF_TARGET_STACK", "nvmet")],
-    );
-    assert!(!out.status.success());
-    let text = combined(&out);
-    assert!(
-        !text.contains("structurally fixed"),
-        "the flag must beat the env: {text}"
-    );
-    assert_reaches_real_spdk_path("flag over env", &text);
+        ];
+        args.extend(extra.iter());
+        let out = run(&args, envs);
+        assert!(!out.status.success());
+        let text = combined(&out);
+        assert!(
+            text.contains("structurally fixed at 1"),
+            "{args:?} {envs:?}: every rung selects the kernel stack: {text}"
+        );
+        assert!(
+            !text.contains("root privileges"),
+            "{args:?}: the structural refusal fires before root: {text}"
+        );
+    }
 }
 
 /// An unparseable env value refuses loud (never a silent default).
@@ -360,123 +298,13 @@ fn test_invalid_env_stack_value_refuses_loud() {
     );
 }
 
-/// `restore --target-stack spdk` reaches the real SPDK restore path at
-/// N4: unprivileged it dies on the root rung, never on a milestone
-/// message.
-#[test]
-fn test_restore_spdk_filter_reaches_real_path() {
-    let out = run(&["nvmeof", "restore", "--target-stack", "spdk"], &[]);
-    assert!(!out.status.success());
-    assert_reaches_real_spdk_path("restore spdk", &combined(&out));
-}
-
 // ---------------------------------------------------------------------------
-// N4 mutating-verb flags (§6.2 flag placement + R7)
+// flag semantics (§6.2, rev-3 issue 23)
 // ---------------------------------------------------------------------------
 
-/// `--accept-version-drift` exists on the mutating share verbs (share /
-/// unshare / restore — it gates SPDK preflight rung 4 wherever that rung
-/// runs); unshare additionally carries `--force` (the live-consumer
-/// override). Unprivileged runs die on the root rung, never on clap.
-#[test]
-fn test_mutating_share_verbs_carry_drift_and_force_flags() {
-    for args in [
-        vec![
-            "nvmeof",
-            "share",
-            "/nonexistent/backing.img",
-            "--ip",
-            "127.0.0.1",
-            "--accept-version-drift",
-        ],
-        vec![
-            "nvmeof",
-            "unshare",
-            "nqn.2026-07.io.squeezefs:share-x",
-            "--accept-version-drift",
-        ],
-        vec![
-            "nvmeof",
-            "unshare",
-            "nqn.2026-07.io.squeezefs:share-x",
-            "--force",
-        ],
-        vec!["nvmeof", "restore", "--accept-version-drift"],
-        vec![
-            "nvmeof",
-            "restore",
-            "--target-stack",
-            "spdk",
-            "--accept-version-drift",
-        ],
-    ] {
-        let out = run(&args, &[]);
-        assert!(!out.status.success(), "{args:?} unprivileged must fail");
-        let text = combined(&out);
-        assert!(
-            !text.contains("unexpected argument") && !text.contains("unrecognized subcommand"),
-            "{args:?} must exist in the N4 grammar: {text}"
-        );
-        assert!(text.contains("root"), "{args:?} demands root: {text}");
-    }
-}
-
-/// `--accept-version-drift` with an explicit nvmet selection refuses
-/// loud at the grammar rung (SPDK-only — the kernel target has no
-/// version to drift; the `--disk-cache-paths` never-silently-ignore
-/// precedent), before the root check.
-#[test]
-fn test_share_accept_version_drift_with_nvmet_refuses_loud() {
-    let out = run(
-        &[
-            "nvmeof",
-            "share",
-            "/nonexistent/backing.img",
-            "--ip",
-            "127.0.0.1",
-            "--target-stack",
-            "nvmet",
-            "--accept-version-drift",
-        ],
-        &[],
-    );
-    assert!(!out.status.success());
-    let text = combined(&out);
-    assert!(
-        text.contains("--accept-version-drift") && text.contains("SPDK-only"),
-        "must name the flag as SPDK-only: {text}"
-    );
-    assert!(
-        !text.contains("root privileges"),
-        "the flag refusal fires before the root check: {text}"
-    );
-
-    // Same law on the restore filter.
-    let out = run(
-        &[
-            "nvmeof",
-            "restore",
-            "--target-stack",
-            "nvmet",
-            "--accept-version-drift",
-        ],
-        &[],
-    );
-    assert!(!out.status.success());
-    let text = combined(&out);
-    assert!(
-        text.contains("--accept-version-drift") && text.contains("SPDK-only"),
-        "restore --target-stack nvmet --accept-version-drift refuses: {text}"
-    );
-}
-
-// ---------------------------------------------------------------------------
-// per-stack flag semantics (§6.2, rev-3 issue 23)
-// ---------------------------------------------------------------------------
-
-/// `--nsid` ≠ 1 with `--target-stack nvmet` refuses loud: the nvmet
-/// namespace index is structurally fixed at 1 (the `--disk-cache-paths`
-/// precedent — never a silent flag-ignore).
+/// `--nsid` ≠ 1 refuses loud: the nvmet namespace index is structurally
+/// fixed at 1 (the `--disk-cache-paths` precedent — never a silent
+/// flag-ignore).
 #[test]
 fn test_nsid_not_one_with_nvmet_refuses_loud() {
     let out = run(
@@ -537,7 +365,7 @@ fn test_nsid_one_with_nvmet_passes_flag_validation() {
     );
 }
 
-/// A malformed `--ns-uuid` refuses loud on both stacks (it seeds the
+/// A malformed `--ns-uuid` refuses loud (it seeds the
 /// recorded namespace identity — garbage must never reach the ledger).
 #[test]
 fn test_malformed_ns_uuid_refuses_loud() {
@@ -689,14 +517,14 @@ fn test_connect_nr_io_queues_zero_refuses_loud() {
 // ---------------------------------------------------------------------------
 
 /// The mutating target verbs exist and demand root (unprivileged runs
-/// die on the root rung, never on clap).
+/// die on the root rung, never on clap). `stop` refuses before root (the
+/// kernel target is not a process) and `install` is retired — both are
+/// pinned elsewhere in this file / in `nvmeof_retire_spdk_tests`.
 #[test]
 fn test_target_mutating_verbs_exist_and_demand_root() {
     for args in [
-        vec!["nvmeof", "target", "install"],
         vec!["nvmeof", "target", "setup"],
         vec!["nvmeof", "target", "start"],
-        vec!["nvmeof", "target", "stop"],
         vec!["nvmeof", "target", "status"],
     ] {
         let out = run(&args, &[]);
@@ -708,70 +536,6 @@ fn test_target_mutating_verbs_exist_and_demand_root() {
         );
         assert!(text.contains("root"), "{args:?} demands root: {text}");
     }
-}
-
-/// `target install --version` must equal the pin — pin bumps are
-/// deliberate PRs, never a CLI flag (§6.5/R1). Grammar-rung refusal:
-/// fires before the root check.
-#[test]
-fn test_target_install_version_pin_refusal() {
-    let out = run(&["nvmeof", "target", "install", "--version", "v27.01"], &[]);
-    assert!(!out.status.success(), "--version v27.01 must refuse");
-    let text = combined(&out);
-    assert!(
-        text.contains("v26.05") && text.contains("v27.01"),
-        "names the pin and the request: {text}"
-    );
-    assert!(
-        !text.contains("root privileges"),
-        "the pin refusal fires before the root check: {text}"
-    );
-}
-
-/// `target setup --hugemem-mb … --restore-prior` is a contradiction —
-/// clap refuses the combination.
-#[test]
-fn test_target_setup_restore_prior_conflicts_with_hugemem() {
-    let out = run(
-        &[
-            "nvmeof",
-            "target",
-            "setup",
-            "--hugemem-mb",
-            "512",
-            "--restore-prior",
-        ],
-        &[],
-    );
-    assert!(!out.status.success());
-    let text = combined(&out);
-    assert!(
-        text.contains("cannot be used with"),
-        "clap conflict expected: {text}"
-    );
-}
-
-/// `target start --core-mask … --cores …` is a contradiction.
-#[test]
-fn test_target_start_core_mask_conflicts_with_cores() {
-    let out = run(
-        &[
-            "nvmeof",
-            "target",
-            "start",
-            "--core-mask",
-            "0x1",
-            "--cores",
-            "2",
-        ],
-        &[],
-    );
-    assert!(!out.status.success());
-    assert!(
-        combined(&out).contains("cannot be used with"),
-        "clap conflict expected: {}",
-        combined(&out)
-    );
 }
 
 /// `target stop --target-stack nvmet` refuses loud: the kernel target is
@@ -787,23 +551,5 @@ fn test_target_stop_nvmet_refuses_loud() {
     assert!(
         text.contains("not a process"),
         "must explain the nvmet stop refusal: {text}"
-    );
-}
-
-/// `target install` with the nvmet stack selected via env still installs
-/// SPDK — the verb is SPDK-only by definition (§6.2 table); no silent
-/// reinterpretation, the help says so. Here: the env must NOT change the
-/// version-pin refusal path (proving install ignores stack selection).
-#[test]
-fn test_target_install_is_spdk_only_regardless_of_env() {
-    let out = run(
-        &["nvmeof", "target", "install", "--version", "v27.01"],
-        &[("SQUEEZEFS_NVMEOF_TARGET_STACK", "nvmet")],
-    );
-    assert!(!out.status.success());
-    assert!(
-        combined(&out).contains("v26.05"),
-        "install stays the SPDK pin path under env=nvmet: {}",
-        combined(&out)
     );
 }

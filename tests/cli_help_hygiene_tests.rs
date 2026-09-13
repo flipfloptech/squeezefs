@@ -332,7 +332,6 @@ const CAPS_ALLOWLIST: &[&str] = &[
     "AEAD",
     "CLI",
     "CPU",
-    "DPDK",
     // The errno a cross-subtree rename/link/unlink returns under
     // per-volume metadata owners — the same class as `O_DIRECT`: a
     // kernel-interface name the operator will see in strace, not prose
@@ -352,10 +351,7 @@ const CAPS_ALLOWLIST: &[&str] = &[
     "PID",
     "POSIX",
     "RAM",
-    "RPC",
     "RSA",
-    "SIGKILL",
-    "SIGTERM",
     "SPDK",
     "SQPOLL",
     "TARGET",

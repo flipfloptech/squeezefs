@@ -1787,7 +1787,7 @@ async fn a_heap_full_forest_with_an_unpublished_mint_in_the_window_remounts() {
         match r {
             Ok(()) => {
                 // The cadence is parked: cycle for ring room by hand.
-                if i % 8 == 0 {
+                if i.is_multiple_of(8) {
                     vol.checkpoint_now().await.unwrap();
                 }
             }

@@ -1975,7 +1975,7 @@ async fn merge_candidates_gauge_is_exact_mid_wave_and_at_quiescence() {
         for i in (pass..landed).step_by(10) {
             delete_file(&be, i).await;
             deleted += 1;
-            if pass < 9 && deleted % 32 == 0 {
+            if pass < 9 && deleted.is_multiple_of(32) {
                 be.checkpoint_now().await.expect("delete cycle");
             }
         }

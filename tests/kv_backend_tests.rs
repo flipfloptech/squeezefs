@@ -881,6 +881,16 @@ async fn v3_mount_replays_journal_window_into_the_cache() {
     );
     let new_ino = next_ino_before; // §4.8: the watermark names the next free ino
     let hash54 = dentry_name_hash54(b"replayed.txt", sb.hash_seed);
+    // The key as the volume JOURNALS it: the legacy key on a flat volume,
+    // the §5.2.1 forest key (kind byte inserted) on a forest one — a raw
+    // ring writer frames exactly as the staging choke point does.
+    let journal_key = |kind: u8, legacy: &[u8]| -> Vec<u8> {
+        if sb.symmetric_forest_stamped() {
+            squeezefs::meta_backend::kv::record::forest_key(kind, legacy).expect("forest key")
+        } else {
+            legacy.to_vec()
+        }
+    };
 
     // Tx 1: create "replayed.txt" (inode Put + dentry Put) — record seqs
     // strictly above the built image's checkpoint-covered records.
@@ -888,7 +898,7 @@ async fn v3_mount_replays_journal_window_into_the_cache() {
         (
             TREE_INODES,
             Record::put(
-                inode_key(new_ino).to_vec(),
+                journal_key(TREE_INODES, &inode_key(new_ino)),
                 ledger.seq + 1,
                 InodeValue {
                     mode: libc::S_IFREG | 0o640,
@@ -904,7 +914,7 @@ async fn v3_mount_replays_journal_window_into_the_cache() {
         (
             TREE_DENTRIES,
             Record::put(
-                dentry_key(ROOT_INO, hash54, 0).to_vec(),
+                journal_key(TREE_DENTRIES, &dentry_key(ROOT_INO, hash54, 0)),
                 ledger.seq + 1,
                 DentryValue {
                     child_ino: new_ino,
@@ -921,7 +931,7 @@ async fn v3_mount_replays_journal_window_into_the_cache() {
     let tx2: Vec<(u8, Record)> = vec![(
         TREE_INODES,
         Record::delta(
-            inode_key(ROOT_INO).to_vec(),
+            journal_key(TREE_INODES, &inode_key(ROOT_INO)),
             ledger.seq + 2,
             &InodeDelta::times(777_000, 888_000),
         ),
@@ -1358,7 +1368,16 @@ async fn v3_mount_surfaces_ledger_and_allocator_state() {
         total - img.extents_allocated,
         "free extents = total − built nodes"
     );
-    assert_eq!(be.flat_trees().len(), 3);
+    // The mounted tree set: the three §4.2 user trees on a flat volume;
+    // on a forest the per-kind surface is EMPTY by construction (a forest
+    // routes by key) and the builder's records land in the native slot
+    // tree beside tree 0.
+    if be.symmetric_forest() {
+        assert!(be.flat_trees().is_empty());
+        assert_eq!(be.all_trees().len(), 2, "tree 0 + the native slot tree");
+    } else {
+        assert_eq!(be.flat_trees().len(), 3);
+    }
 
     // Builder-set timestamps round-trip; unset ones stay at the
     // deterministic 0 default.

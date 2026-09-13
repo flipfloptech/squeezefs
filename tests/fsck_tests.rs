@@ -366,15 +366,19 @@ async fn test_census_walk_baseline_measured() {
 
     // Census-walk baseline: the same inode-tree + layout walk `df` runs
     // (one paged range scan + one layout xattr read per ino).
-    use squeezefs::meta_backend::kv::record::{decode_inode_key, inode_key, InodeValue};
+    use squeezefs::meta_backend::kv::record::{
+        decode_inode_key, inode_key, InodeValue, TREE_INODES,
+    };
     let t0 = std::time::Instant::now();
     let mut walked = 0u64;
     for kv in &fx.meta.volumes {
-        let inodes = kv.flat_trees()[0].clone();
         let mut cursor: Vec<u8> = inode_key(1).to_vec();
         let end = inode_key(u64::MAX - 1);
         loop {
-            let page = inodes.range(&cursor, &end, 512).await.expect("walk");
+            let page = kv
+                .range_kind(TREE_INODES, &cursor, &end, 512)
+                .await
+                .expect("walk");
             let Some((last_key, _)) = page.last() else {
                 break;
             };
@@ -508,17 +512,22 @@ async fn test_c1_bitflip_node_detected() {
         fx.close().await;
     }
 
-    // Locate a durable LEAF of the inode tree, then flip bytes in it.
+    // Locate a durable LEAF of the tree holding the inode records (the
+    // inode tree on a flat volume, the native slot tree on a forest one),
+    // then flip bytes in it.
     let leaf_addr = {
         let kv = squeezefs::meta_backend::kv::backend::KvMetaBackend::open_probe(&meta)
             .await
             .expect("probe open");
-        let tree = kv.flat_trees()[0].clone();
+        let (tree, key) = kv
+            .record_locator(
+                squeezefs::meta_backend::kv::record::TREE_INODES,
+                &squeezefs::meta_backend::kv::record::inode_key(500),
+            )
+            .expect("locator")
+            .expect("the inode records' tree exists");
         let root_addr = tree.root().addr;
-        let leaf = tree
-            .resolve_leaf(&squeezefs::meta_backend::kv::record::inode_key(500))
-            .await
-            .expect("leaf resolves");
+        let leaf = tree.resolve_leaf(&key).await.expect("leaf resolves");
         let addr = leaf.addr();
         assert_ne!(
             addr, root_addr,
@@ -623,10 +632,48 @@ async fn test_c1_semantic_wrong_tree_record_detected() {
     // The seed: a 16-byte dentry-shaped key in the 8-byte-keyed inodes
     // tree (checksum-valid; only the schema is violated).
     let bad_key = squeezefs::meta_backend::kv::record::dentry_key(42, 7, 0);
-    fx.meta.volumes[0].flat_trees()[0]
-        .insert(&bad_key[..], bytes::Bytes::from_static(b"bogus"))
+    let kv = &fx.meta.volumes[0];
+    if kv.symmetric_forest() {
+        // A forest volume's ONE codec refuses the wrong-shape key at the
+        // door — nothing gets in through the kind-routed insert. The
+        // forest face of the seed is a raw record whose kind byte claims
+        // inode but whose length is a dentry's: planted straight into the
+        // native slot tree (17 B: ino ‖ kind 1 ‖ 8 stray bytes).
+        let refused = kv
+            .insert_kind(
+                squeezefs::meta_backend::kv::record::TREE_INODES,
+                &bad_key[..],
+                bytes::Bytes::from_static(b"bogus"),
+            )
+            .await;
+        assert!(
+            refused.is_err(),
+            "the forest codec refuses a dentry-length key of kind inode"
+        );
+        let native = kv
+            .all_trees()
+            .into_iter()
+            .find(|t| {
+                t.forest_slot() == Some(squeezefs::meta_backend::kv::record::NATIVE_FOREST_SLOT)
+            })
+            .expect("the native slot tree exists (16 creates landed in it)");
+        let mut raw = Vec::with_capacity(17);
+        raw.extend_from_slice(&42u64.to_be_bytes());
+        raw.push(squeezefs::meta_backend::kv::record::TREE_INODES);
+        raw.extend_from_slice(&7u64.to_be_bytes());
+        native
+            .insert(&raw[..], bytes::Bytes::from_static(b"bogus"))
+            .await
+            .expect("raw slot-tree insert");
+    } else {
+        kv.insert_kind(
+            squeezefs::meta_backend::kv::record::TREE_INODES,
+            &bad_key[..],
+            bytes::Bytes::from_static(b"bogus"),
+        )
         .await
         .expect("raw insert");
+    }
 
     let report = run_fsck(&fx.ctx(), &online_opts()).await.expect("fsck");
     assert!(

@@ -62,10 +62,14 @@ use squeezefs::meta_backend::kv::node::{key_successor, NodeLayout, DEFAULT_NODE_
 use squeezefs::meta_backend::kv::node_cache::{
     CachedNode, NodeCache, NodeCacheConfig, DEFAULT_WRITEBACK_DELTA_BYTES,
 };
-use squeezefs::meta_backend::kv::record::{RecordKind, TREE_DENTRIES, TREE_INODES};
+use squeezefs::meta_backend::kv::record::{
+    xattr_key, RecordKind, KIND_INTERIOR, NATIVE_FOREST_SLOT, TREE_DENTRIES, TREE_INODES,
+    TREE_XATTRS,
+};
 use squeezefs::meta_backend::kv::tree::{
-    decode_interior_value, test_smo_build_pause_release, ApplyOutcome, KvTree, MaintenanceOutcome,
-    SmoContext, KEY_SPACE_MAX, TEST_SMO_BUILD_PAUSED, TEST_SMO_BUILD_PAUSE_TREE,
+    decode_interior_value, test_smo_build_pause_arm_slot, test_smo_build_pause_release,
+    ApplyOutcome, KvTree, MaintenanceOutcome, SmoContext, KEY_SPACE_MAX, TEST_SMO_BUILD_PAUSED,
+    TEST_SMO_BUILD_PAUSE_TREE,
 };
 use squeezefs::meta_backend::kv::{
     KvError, META_KV_COMMIT_SMO_RETRIES, META_KV_NODE_MERGES, META_KV_ROOT_COLLAPSES,
@@ -1218,10 +1222,17 @@ async fn replay_converges_across_crash_windows_of_a_merge_and_a_root_collapse() 
     );
 
     // ---- Window (a): kill between the successor write and the flip. Arm
-    // the build-pause seam on the dentry tree, drive the merges on a task,
-    // copy the volume while the first merge is parked (its successor image
-    // is on the device, no pointer record exists), release.
-    TEST_SMO_BUILD_PAUSE_TREE.store(u64::from(TREE_DENTRIES), Ordering::SeqCst);
+    // the build-pause seam on the tree holding the dentry records (the
+    // dentry tree; on a forest the native slot tree, whose nodes carry
+    // header tree id 0 — the seam arms it by SLOT), drive the merges on a
+    // task, copy the volume while the first merge is parked (its successor
+    // image is on the device, no pointer record exists), release.
+    let forest = be.symmetric_forest();
+    if forest {
+        test_smo_build_pause_arm_slot(NATIVE_FOREST_SLOT);
+    } else {
+        TEST_SMO_BUILD_PAUSE_TREE.store(u64::from(TREE_DENTRIES), Ordering::SeqCst);
+    }
     let merges0 = META_KV_NODE_MERGES.load(Ordering::Relaxed);
     let driver = {
         let be = be.clone();
@@ -1240,7 +1251,15 @@ async fn replay_converges_across_crash_windows_of_a_merge_and_a_root_collapse() 
         info.is_merge,
         "the parked SMO is the merge (not a compaction)"
     );
-    assert_eq!(info.tree_id, TREE_DENTRIES);
+    if forest {
+        assert_eq!(
+            info.tree_id, KIND_INTERIOR,
+            "a slot tree's nodes carry header id 0"
+        );
+        assert_eq!(info.forest_slot, Some(NATIVE_FOREST_SLOT));
+    } else {
+        assert_eq!(info.tree_id, TREE_DENTRIES);
+    }
     let crash_a = NamedTempFile::new().expect("crash image a");
     std::fs::copy(file.path(), crash_a.path()).expect("copy the parked image");
     test_smo_build_pause_release();
@@ -1777,6 +1796,15 @@ async fn merge_candidates_gauge_is_exact_mid_wave_and_at_quiescence() {
         if i % 32 == 31 {
             be.checkpoint_now().await.expect("delete cycle");
         }
+        // Re-take what the cycles returned as they land: the throttle is
+        // ONE admitted merge per lap, and a merge's returned extents (one
+        // to two barriered cycles later) would otherwise fund the next
+        // lap's second — enough laps (the deletes' own ring-full cycles
+        // land at layout-dependent points) and the wave completes before
+        // the mid-wave read below.
+        while alloc.free_extents() > floor + 1 {
+            held.push(alloc.claim_internal().expect("re-drain claim"));
+        }
     }
     // The volume is full again by construction (the claimant re-takes the
     // room the deletes' few merges returned): creates land in whatever
@@ -1818,7 +1846,13 @@ async fn merge_candidates_gauge_is_exact_mid_wave_and_at_quiescence() {
         a.gauge
     );
     let candidates0 = a.gauge;
-    let height0 = be.flat_trees()[2]
+    // The height term: the tree holding the xattr records (the xattr
+    // tree on a flat volume, the native slot tree on a forest one).
+    let height0 = be
+        .record_locator(TREE_XATTRS, &xattr_key(1, 0, 0))
+        .expect("locator")
+        .expect("the xattr records' tree exists")
+        .0
         .root_level()
         .await
         .expect("xattr root level");

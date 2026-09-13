@@ -1201,14 +1201,13 @@ impl ShardDeviceSeam for TimeShiftedSeam {
 /// name, so the key is the identity).
 async fn dentry_key_of(fx: &Fx, name: &str) -> (usize, Vec<u8>, u64) {
     use squeezefs::meta_backend::kv::node::key_successor;
-    use squeezefs::meta_backend::kv::record::DentryValue;
+    use squeezefs::meta_backend::kv::record::{DentryValue, TREE_DENTRIES};
     use squeezefs::meta_backend::kv::tree::KEY_SPACE_MAX;
     for (vol_idx, kv) in fx.meta.volumes.iter().enumerate() {
-        let dentries = kv.flat_trees()[1].clone();
         let mut cursor: Vec<u8> = vec![0u8];
         loop {
-            let page = dentries
-                .range(&cursor, &KEY_SPACE_MAX, 512)
+            let page = kv
+                .range_kind(TREE_DENTRIES, &cursor, &KEY_SPACE_MAX, 512)
                 .await
                 .expect("dentry walk");
             let Some((last, _)) = page.last() else { break };
@@ -1356,10 +1355,12 @@ async fn the_inode_plane_loss_direction_teeth_survive_the_fleet_plane() {
         let (v_idx, local) = fx.meta.route_ino(ghost);
         let kv = &fx.meta.volumes[v_idx];
         kv.drain_pending_times_now().await.ok();
-        kv.flat_trees()[0]
-            .delete(&inode_key(local))
-            .await
-            .expect("destroy the record, keep the name");
+        kv.delete_kind(
+            squeezefs::meta_backend::kv::record::TREE_INODES,
+            &inode_key(local),
+        )
+        .await
+        .expect("destroy the record, keep the name");
     }
 
     let fab = fabric(&fx.meta).await;

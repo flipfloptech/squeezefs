@@ -3100,6 +3100,44 @@ impl KvMetaBackend {
         tree.root_level().await.ok()
     }
 
+    /// Where a `(kind, legacy key)` record LIVES on this volume: the tree
+    /// that holds it and the key it is stored under — the kind's tree +
+    /// the legacy key on a flat volume, the slot tree the forest key
+    /// routes to + the forest key on a forest one. A READ-side locator
+    /// (never mints — `None` when the key's slot has no tree), so the
+    /// layout-blind harnesses (the fsck corruption seeds' leaf finder, the
+    /// leaf-merge suite's height term) resolve leaves and read heights
+    /// through the ONE router instead of indexing a per-kind tree that a
+    /// forest does not have.
+    pub fn record_locator(
+        &self,
+        kind: u8,
+        legacy: &[u8],
+    ) -> std::result::Result<Option<(Arc<KvTree>, Vec<u8>)>, KvError> {
+        match &self.trees {
+            TreeSet::Flat {
+                inodes,
+                dentries,
+                xattrs,
+                block_refs,
+                block_map,
+            } => {
+                let tree = match kind {
+                    TREE_INODES => Some(inodes),
+                    TREE_DENTRIES => Some(dentries),
+                    TREE_XATTRS => Some(xattrs),
+                    super::record::TREE_BLOCK_REFS => block_refs.as_ref(),
+                    super::record::TREE_BLOCK_MAP => block_map.get(),
+                    _ => None,
+                };
+                Ok(tree.map(|t| (Arc::clone(t), legacy.to_vec())))
+            }
+            TreeSet::Forest { forest, .. } => {
+                Ok(forest.route_read(kind, legacy)?.map(|r| (r.tree, r.key)))
+            }
+        }
+    }
+
     /// Every slot tree's `(slot, live root)` in slot order — the forest
     /// suites' root census (empty on a flat volume).
     pub fn forest_roots(&self) -> Vec<(super::record::ForestSlot, RootPtr)> {

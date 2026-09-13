@@ -348,7 +348,10 @@ async fn read_record(fx: &Fx, ino: u64) -> Option<InodeValue> {
     let (v_idx, local) = fx.meta.route_ino(ino);
     let kv = &fx.meta.volumes[v_idx];
     kv.drain_pending_times_now().await.ok();
-    let bytes = kv.flat_trees()[0].lookup(&inode_key(local)).await.ok()??;
+    let bytes = kv
+        .lookup_kind(TREE_INODES, &inode_key(local))
+        .await
+        .ok()??;
     InodeValue::decode(&bytes).ok()
 }
 
@@ -375,13 +378,13 @@ async fn force_nlink(fx: &Fx, ino: u64, nlink: u32) {
 /// lost-name-step shape.
 async fn drop_one_name(fx: &Fx, ino: u64) {
     use squeezefs::meta_backend::kv::node::key_successor;
+    use squeezefs::meta_backend::kv::record::TREE_DENTRIES;
     use squeezefs::meta_backend::kv::tree::KEY_SPACE_MAX;
     for kv in &fx.meta.volumes {
-        let dentries = kv.flat_trees()[1].clone();
         let mut cursor: Vec<u8> = vec![0u8];
         loop {
-            let page = dentries
-                .range(&cursor, &KEY_SPACE_MAX, 512)
+            let page = kv
+                .range_kind(TREE_DENTRIES, &cursor, &KEY_SPACE_MAX, 512)
                 .await
                 .expect("dentry walk");
             let Some((last, _)) = page.last() else { break };
@@ -389,7 +392,9 @@ async fn drop_one_name(fx: &Fx, ino: u64) {
             for (k, v) in &page {
                 if let Ok(d) = DentryValue::decode(v) {
                     if d.child_ino == ino {
-                        dentries.delete(k).await.expect("drop one naming dentry");
+                        kv.delete_kind(TREE_DENTRIES, k)
+                            .await
+                            .expect("drop one naming dentry");
                         return;
                     }
                 }
@@ -406,8 +411,7 @@ async fn destroy_record_keep_name(fx: &Fx, ino: u64) {
     let (v_idx, local) = fx.meta.route_ino(ino);
     let kv = &fx.meta.volumes[v_idx];
     kv.drain_pending_times_now().await.ok();
-    kv.flat_trees()[0]
-        .delete(&inode_key(local))
+    kv.delete_kind(TREE_INODES, &inode_key(local))
         .await
         .expect("destroy the inode record");
 }
@@ -465,14 +469,14 @@ async fn plant_open_intent(fx: &Fx, ino: u64, tx_id: u64) {
 /// "is the name still there" has to be asked of the dentry tree itself.
 async fn name_records(fx: &Fx, name: &str) -> usize {
     use squeezefs::meta_backend::kv::node::key_successor;
+    use squeezefs::meta_backend::kv::record::TREE_DENTRIES;
     use squeezefs::meta_backend::kv::tree::KEY_SPACE_MAX;
     let mut found = 0;
     for kv in &fx.meta.volumes {
-        let dentries = kv.flat_trees()[1].clone();
         let mut cursor: Vec<u8> = vec![0u8];
         loop {
-            let page = dentries
-                .range(&cursor, &KEY_SPACE_MAX, 512)
+            let page = kv
+                .range_kind(TREE_DENTRIES, &cursor, &KEY_SPACE_MAX, 512)
                 .await
                 .expect("dentry walk");
             let Some((last, _)) = page.last() else { break };

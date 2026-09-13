@@ -340,14 +340,13 @@ async fn mkfile_on(meta: &RoutedMetaBackend, parent: u64, want_vol: usize, tag: 
 /// the pre-S3.5 crash residue verbatim (the C9 damage fixture).
 async fn orphan_inode(meta: &RoutedMetaBackend, ino: u64) {
     use squeezefs::meta_backend::kv::node::key_successor;
-    use squeezefs::meta_backend::kv::record::DentryValue;
+    use squeezefs::meta_backend::kv::record::{DentryValue, TREE_DENTRIES};
     use squeezefs::meta_backend::kv::tree::KEY_SPACE_MAX;
     for kv in &meta.volumes {
-        let dentries = kv.flat_trees()[1].clone();
         let mut cursor: Vec<u8> = vec![0u8];
         loop {
-            let page = dentries
-                .range(&cursor, &KEY_SPACE_MAX, 512)
+            let page = kv
+                .range_kind(TREE_DENTRIES, &cursor, &KEY_SPACE_MAX, 512)
                 .await
                 .expect("dentry walk");
             let Some((last, _)) = page.last() else { break };
@@ -355,7 +354,9 @@ async fn orphan_inode(meta: &RoutedMetaBackend, ino: u64) {
             for (k, v) in &page {
                 if let Ok(d) = DentryValue::decode(v) {
                     if d.child_ino == ino {
-                        dentries.delete(k).await.expect("drop the naming dentry");
+                        kv.delete_kind(TREE_DENTRIES, k)
+                            .await
+                            .expect("drop the naming dentry");
                         return;
                     }
                 }

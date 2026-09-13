@@ -357,13 +357,13 @@ async fn block_mappings_of(fx: &Fx, ino: u64) -> Vec<(u32, String)> {
 /// which is precisely the point.
 async fn orphan_inode(fx: &Fx, ino: u64) {
     use squeezefs::meta_backend::kv::node::key_successor;
+    use squeezefs::meta_backend::kv::record::TREE_DENTRIES;
     use squeezefs::meta_backend::kv::tree::KEY_SPACE_MAX;
     for kv in &fx.meta.volumes {
-        let dentries = kv.flat_trees()[1].clone();
         let mut cursor: Vec<u8> = vec![0u8];
         loop {
-            let page = dentries
-                .range(&cursor, &KEY_SPACE_MAX, 512)
+            let page = kv
+                .range_kind(TREE_DENTRIES, &cursor, &KEY_SPACE_MAX, 512)
                 .await
                 .expect("dentry walk");
             let Some((last, _)) = page.last() else { break };
@@ -371,7 +371,9 @@ async fn orphan_inode(fx: &Fx, ino: u64) {
             for (k, v) in &page {
                 if let Ok(d) = DentryValue::decode(v) {
                     if d.child_ino == ino {
-                        dentries.delete(k).await.expect("drop the naming dentry");
+                        kv.delete_kind(TREE_DENTRIES, k)
+                            .await
+                            .expect("drop the naming dentry");
                         return;
                     }
                 }

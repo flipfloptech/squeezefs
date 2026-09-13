@@ -1,3 +1,63 @@
+# SqueezeFS 1.3.0 (unreleased)
+
+_Release train 1.3 — not yet tagged. Everything below is on `dev`._
+
+## 1.3.0 — what changed
+
+**SPDK retired as an NVMe-oF target (forward-only).** Owner ruling
+R-SYM-8 (2026-09-12, [docs/design-symmetric-metadata.md](docs/design-symmetric-metadata.md)
+§5.8.1, KD-SYM-23; record
+[.benchmarks/2026-09-13-sym-retire-spdk.md](.benchmarks/2026-09-13-sym-retire-spdk.md)).
+The kernel `nvmet` target (the sqz-kernel target) is **THE** NVMe-oF target.
+SPDK's compiled-in `SPDK_NVMF_MAX_NUM_REGISTRANTS = 16` was the only hard
+registrant ceiling anything SqueezeFS shipped — the wall the symmetric
+metadata program's fencing-group machinery existed to fit 12,500 hosts
+under — and nvmet's registrant list is unbounded. The retirement is a
+registrant-ceiling ruling, not a re-measurement; the 2026-07 dual-stack A/B
+stands as history.
+
+- **Deleted:** `src/nvmeof/spdk/` (the JSON-RPC client, the pinned v26.05
+  build/install, hugepage management, the pidfile start/stop/status
+  lifecycle, `save_config`/`load_config` persistence, `ptpl_file` pinning),
+  the cross-stack live-state duplicate guard, `adopt_ambiguous`, and every
+  SPDK-only flag (`--accept-version-drift`, `unshare --force`,
+  `--hugemem-mb`, `--restore-prior`, `--core-mask`, `--cores`,
+  `--dpdk-mem-mb` — a deleted flag dies on clap, never a silent accept).
+- **Refuses loud, naming nvmet and the re-share sequence:**
+  `--target-stack spdk`, `SQUEEZEFS_NVMEOF_TARGET_STACK=spdk` (the knob's
+  only admissible value is now `nvmet`, its default), `nvmeof target
+  install` (SPDK-only by definition — a retired verb naming `target setup`
+  / `target start`), and the retired knobs `SQUEEZEFS_SPDK_TGT_BIN` and
+  `SQUEEZEFS_NVMEOF_RUN_DIR`. Nothing falls back silently.
+- **An SPDK share still in your share ledger is never re-presented.** The
+  ledger schema is unchanged and the record stays decodable: `nvmeof list`
+  shows it as `spdk — RETIRED target stack` with the re-share sequence,
+  `nvmeof restore` reports it `skipped`, `nvmeof unshare` removes ONLY its
+  ledger record, and the duplicate-backing guard holds its backing until
+  that record is gone. **The operator's re-share sequence:**
+  1. `sudo squeezefs nvmeof unshare <subnqn>` — the SPDK ledger record is
+     removed (no `spdk_tgt` is driven); the backing is released.
+  2. If an `spdk_tgt` still serves the old subsystem, tear it down
+     yourself (`rpc.py nvmf_delete_subsystem <subnqn>`,
+     `rpc.py bdev_aio_delete <bdev>`) — SqueezeFS no longer speaks SPDK
+     RPC.
+  3. `sudo squeezefs nvmeof share <backing> --ip <ip> [--ns-uuid <uuid>]`
+     — nvmet is the default; re-use the old `--ns-uuid` for initiators
+     that must reattach under the same namespace identity.
+- **Fidelity tier:** `tests/run_nvmeof_fidelity.sh`,
+  `tests/nvmeof_target_substrate.sh` and `tests/guard_smoke.sh` run on
+  nvmet alone (the SPDK legs and the PTPL power-cycle leg are gone; the
+  loud-fail matrix grew the retirement refusals; reservation persistence
+  across a TARGET restart stays nvmet's G2 leg — nvmet has no PTPL by
+  design, so `writer_guard_pr_reacquires` growth across a target power
+  cycle is expected there). Contracts: `tests/nvmeof_retire_spdk_tests.rs`.
+- **Unchanged:** the writer guard's register ladder and its spec-strict
+  Register contracts (measured on kernel nvmet — and on SPDK v26.05 before
+  its retirement), the `nvmeof connect`/`disconnect` initiator half, the
+  ledger's §6.4 laws, and every nvmet share verb.
+
+---
+
 # SqueezeFS 1.2.4
 
 _Release date: 2026-09-11 (tag `stable-2026.09.4`)_

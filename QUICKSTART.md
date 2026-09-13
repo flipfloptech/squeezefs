@@ -186,41 +186,28 @@ For unattended hosts add `--supervise`: the parent stays alive as an external wa
 
 ## 4. NVMe-oF Fabric Setup (Remote Block Storage)
 
-Target sharing and client connections live under **`squeezefs nvmeof`**. Two target stacks are supported — SPDK (the default) and the kernel's nvmet — selected explicitly with `--target-stack` (or `SQUEEZEFS_NVMEOF_TARGET_STACK`); there is never a silent fallback between them. Which stack to choose per deployment class: [docs/operations.md → NVMe-oF operations](docs/operations.md#nvme-of-operations).
+Target sharing and client connections live under **`squeezefs nvmeof`**. The kernel `nvmet` target is the one supported target stack (`--target-stack nvmet` / `SQUEEZEFS_NVMEOF_TARGET_STACK=nvmet` is the default and the only admissible value). **SPDK was retired as a target on 2026-09-12** (owner ruling R-SYM-8 — its 16-registrant cap was the only hard registrant ceiling SqueezeFS shipped): `--target-stack spdk` and `nvmeof target install` refuse loud naming nvmet and the re-share sequence, and an SPDK share still in your ledger is listed by `nvmeof list` for you to re-share — the notice and the sequence: [docs/operations.md → NVMe-oF operations](docs/operations.md#nvme-of-operations).
 
-### Manage the SPDK Target Runtime
+### Prepare the Kernel nvmet Target
 ```bash
-# One-time: build the pinned SPDK release into /opt/squeezefs/spdk/. A missing
-# toolchain refuses with the package list; --with-pkgdep opts into SPDK's pkgdep.sh.
-sudo ./target/release/squeezefs nvmeof target install
+# Load nvmet/nvmet-tcp and check the configfs mount (idempotent):
+sudo ./target/release/squeezefs nvmeof target setup
 
-# Reserve hugepages (default 2048 MiB); the prior value is recorded and
-# restored by --restore-prior:
-sudo ./target/release/squeezefs nvmeof target setup --hugemem-mb 2048
-
-# Start the target. One reactor on the highest online CPU by default
-# (--core-mask / --cores override); the reactor busy-polls its core by design.
+# "Start" = the same readiness check plus a replay of the share ledger;
+# configfs IS the running target — nothing is a process, so `target stop` refuses.
 sudo ./target/release/squeezefs nvmeof target start
 
-# Health: RPC liveness, version drift vs the pin, reactor busy %, hugepages,
-# reservation-persistence files, ledger reconciliation:
+# Health: module presence, configfs, subsystem/namespace/port counts (+ resv_enable):
 sudo ./target/release/squeezefs nvmeof target status --json
 
-# Stop (refuses while shared subsystems have live initiator connections; --force overrides):
-sudo ./target/release/squeezefs nvmeof target stop
-
-# Production: emit a systemd unit (squeezefs never installs units — you do):
-sudo ./target/release/squeezefs nvmeof target systemd-unit > squeezefs-spdk-tgt.service
-
-# Undo the hugepage reservation:
-sudo ./target/release/squeezefs nvmeof target setup --restore-prior
+# Production: emit the oneshot restore unit (squeezefs never installs units — you do):
+sudo ./target/release/squeezefs nvmeof target systemd-unit > squeezefs-nvmet-restore.service
 ```
-Mutating verbs refuse a target whose version drifts from the pin unless `--accept-version-drift`; `target status` always reports drift.
 
-### Share a Target (SPDK, the default stack)
+### Share a Target
 ```bash
-# Share a backing disk as an NVMe-oF subsystem. NVMe Persistent Reservations
-# survive target restarts on this stack.
+# Share a backing disk as an NVMe-oF subsystem. resv_enable is stamped before
+# enable, so the writer guard runs enforcement-grade (Write-Exclusive PR).
 sudo ./target/release/squeezefs nvmeof share /dev/nvme1n1 --ip 10.10.10.50
 
 # A regular file as backing (missing paths refuse; --create-size opts into creating one):
@@ -230,24 +217,16 @@ sudo ./target/release/squeezefs nvmeof share /srv/backing.img --create-size 100G
 sudo ./target/release/squeezefs nvmeof share /dev/nvme1n1 --ip 10.10.10.50 \
     --allow-host nqn.2014-08.org.nvmexpress:uuid:<client-host-id>
 ```
-Every share is recorded in the share ledger (`/var/lib/squeezefs/nvmeof/shares.json`) so it reappears under the same identity after a target restart. A backing already served by either stack refuses, naming the live holder and the remedy.
-
-### Share a Target (kernel nvmet)
-```bash
-sudo ./target/release/squeezefs nvmeof share /dev/nvme1n1 --ip 10.10.10.50 --target-stack nvmet
-sudo ./target/release/squeezefs nvmeof share /srv/backing.img --create-size 100G \
-    --ip 10.10.10.50 --target-stack nvmet
-```
-Listener port ids come from the reserved range 53000–53999 (`SQUEEZEFS_NVMET_PORT_ID_BASE` relocates it); foreign configfs ports are never touched.
+Every share is recorded in the share ledger (`/var/lib/squeezefs/nvmeof/shares.json`) so `restore` re-presents it under the same identity (`device_uuid` = the recorded `ns_uuid`) after a target restart. Listener port ids come from the reserved range 53000–53999 (`SQUEEZEFS_NVMET_PORT_ID_BASE` relocates it); foreign configfs ports are never touched. A backing already served — live or by any ledger record, including one the retired SPDK stack left — refuses, naming the live holder and the remedy.
 
 ### Inspect, Restore, Unshare, Adopt
 ```bash
-sudo ./target/release/squeezefs nvmeof list              # managed / down / pending / foreign, both stacks
+sudo ./target/release/squeezefs nvmeof list              # managed / down / pending / foreign / retired-spdk
 sudo ./target/release/squeezefs nvmeof restore           # replay the ledger (idempotent) — the boot-time step
-sudo ./target/release/squeezefs nvmeof unshare <subnqn>  # refuses while initiators are connected (--force)
+sudo ./target/release/squeezefs nvmeof unshare <subnqn>  # unmount → disconnect → unshare is the sequence
 sudo ./target/release/squeezefs nvmeof adopt <subnqn>    # take a live foreign/unledgered share under management
 ```
-`adopt` writes only the ledger — the live target object keeps serving with zero interruption. It is an explicit operator action and refuses ambiguous or unsupported shapes loudly; every refusal message names the remedy. Full semantics: [docs/operations.md → NVMe-oF operations](docs/operations.md#nvme-of-operations).
+`adopt` writes only the ledger — the live target object keeps serving with zero interruption. It is an explicit operator action and refuses unsupported shapes loudly; every refusal message names the remedy. Full semantics: [docs/operations.md → NVMe-oF operations](docs/operations.md#nvme-of-operations).
 
 ### Connect to Remote NVMe-oF Storage
 ```bash

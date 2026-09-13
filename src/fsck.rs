@@ -1584,13 +1584,13 @@ pub async fn run(ctx: &FsckCtx, opts: &FsckOptions) -> Result<FsckReport> {
         } else if unthrottled {
             let mut walks = Vec::new();
             for (vol_idx, kv) in ctx.meta.volumes.iter().enumerate() {
-                for tree_idx in 0..kv.trees().len() {
+                for kind in crate::meta_backend::kv::backend::KvMetaBackend::USER_KINDS {
                     let kv = kv.clone();
                     let cancel = opts.cancel.clone();
                     let pct = opts.throttle_pct;
                     walks.push(crate::meta_exec::spawn_meta_join(
                         "fsck_c1_walk",
-                        async move { walk_one_tree_c1(kv, vol_idx, tree_idx, pct, cancel).await },
+                        async move { walk_one_tree_c1(kv, vol_idx, kind, pct, cancel).await },
                     ));
                 }
             }
@@ -2859,19 +2859,22 @@ fn record_schema_violation(tree_id: u8, k: &[u8], v: &[u8]) -> Option<String> {
     }
 }
 
-/// One (volume, tree) C1 walk — the parallel unit (VL10, G-VL-5(c)):
+/// One (volume, kind) C1 walk — the parallel unit (VL10, G-VL-5(c)):
 /// checksum ride-along via the range read, cross-page key ordering, and
 /// the schema check per record. Returns `(pages_walked, suspects)`.
+/// Kind-routed, so it reads either layout: a flat volume's per-kind
+/// tree, or a forest volume's slot trees filtered to the kind (the
+/// forest's mixed leaves are walked once per kind here — the design's
+/// ONE-walk census over C1–C10 is owed, design-symmetric-metadata
+/// §5.8.5).
 async fn walk_one_tree_c1(
     kv: Arc<crate::meta_backend::kv::backend::KvMetaBackend>,
     vol_idx: usize,
-    tree_idx: usize,
+    tree_id: u8,
     throttle_pct: u32,
     cancel: Arc<AtomicBool>,
 ) -> (u64, Vec<Suspect>) {
     let end = crate::meta_backend::kv::tree::KEY_SPACE_MAX;
-    let tree = kv.trees()[tree_idx];
-    let tree_id = tree.tree_id();
     let mut nodes_walked = 0u64;
     let mut suspects = Vec::new();
     let mut cursor: Vec<u8> = vec![0u8];
@@ -2881,7 +2884,7 @@ async fn walk_one_tree_c1(
             break;
         }
         let t0 = std::time::Instant::now();
-        let page = match tree.range(&cursor, &end, SCAN_PAGE).await {
+        let page = match kv.range_kind(tree_id, &cursor, &end, SCAN_PAGE).await {
             Ok(p) => p,
             Err(e) => {
                 suspects.push(Suspect {
@@ -2942,14 +2945,14 @@ async fn walk_trees_c1(
     suspects: &mut Vec<Suspect>,
 ) {
     for (vol_idx, kv) in ctx.meta.volumes.iter().enumerate() {
-        for tree_idx in 0..kv.trees().len() {
+        for kind in crate::meta_backend::kv::backend::KvMetaBackend::USER_KINDS {
             if opts.cancel.load(Ordering::Relaxed) {
                 return;
             }
             let (nodes_walked, walk_suspects) = walk_one_tree_c1(
                 kv.clone(),
                 vol_idx,
-                tree_idx,
+                kind,
                 opts.throttle_pct,
                 opts.cancel.clone(),
             )
@@ -2980,7 +2983,6 @@ async fn walk_census(
     };
     let odd_budget = c10_count_entry_budget();
     for (vol_idx, kv) in ctx.meta.volumes.iter().enumerate() {
-        let inodes = kv.trees()[0];
         let mut cursor: Vec<u8> = inode_key(1).to_vec();
         let end = inode_key(u64::MAX - 1);
         loop {
@@ -2989,7 +2991,15 @@ async fn walk_census(
                 break;
             }
             let t0 = std::time::Instant::now();
-            let page = match inodes.range(&cursor, &end, SCAN_PAGE).await {
+            let page = match kv
+                .range_kind(
+                    crate::meta_backend::kv::record::TREE_INODES,
+                    &cursor,
+                    &end,
+                    SCAN_PAGE,
+                )
+                .await
+            {
                 Ok(p) => p,
                 // The C1 walk owns reporting unreadable nodes; the census
                 // takes what it can reach — and says so, because C10's
@@ -3332,15 +3342,15 @@ async fn build_referenced_inos(
     let budget = c10_count_entry_budget();
     let mut indexed = 0u64;
     for (vol_idx, kv) in meta.volumes.iter().enumerate() {
-        let dentries = kv.trees()[1];
         let mut cursor: Vec<u8> = vec![0u8];
         loop {
             if cancel.load(Ordering::Relaxed) {
                 return (None, indexed);
             }
             let t0 = std::time::Instant::now();
-            let page = match dentries
-                .range(
+            let page = match kv
+                .range_kind(
+                    crate::meta_backend::kv::record::TREE_DENTRIES,
                     &cursor,
                     &crate::meta_backend::kv::tree::KEY_SPACE_MAX,
                     SCAN_PAGE,
@@ -4780,16 +4790,12 @@ async fn recheck_suspects(
             } => {
                 // Re-attempt the read (a transient I/O error clears).
                 let kv = &ctx.meta.volumes[*vol];
-                let tree_ref = kv
-                    .trees()
-                    .into_iter()
-                    .find(|t| t.tree_id() == *tree)
-                    .expect("tree exists");
                 // Same-shaped read as the scan (a max=1 probe can be
                 // satisfied by a healthy left sibling and never touch
                 // the damaged node).
-                match tree_ref
-                    .range(
+                match kv
+                    .range_kind(
+                        *tree,
                         cursor,
                         &crate::meta_backend::kv::tree::KEY_SPACE_MAX,
                         SCAN_PAGE,
@@ -4823,12 +4829,7 @@ async fn recheck_suspects(
                     (true, Some(local)) => Some(kv.dlm().lock_inode_exclusive(local).await),
                     _ => None,
                 };
-                let tree_ref = kv
-                    .trees()
-                    .into_iter()
-                    .find(|t| t.tree_id() == *tree)
-                    .expect("tree exists");
-                match tree_ref.lookup(key).await {
+                match kv.lookup_kind(*tree, key).await {
                     Ok(Some(_)) => Some(FsckFinding {
                         class: "C1".to_string(),
                         object: format!("vol{vol}/tree{tree}/key{}", hex(key)),
@@ -5085,7 +5086,10 @@ async fn recheck_suspects(
                     (true, Ok(p)) => Some(kv.dlm().lock_inode_exclusive(p).await),
                     _ => None,
                 };
-                let still_named = match kv.trees()[1].lookup(key).await {
+                let still_named = match kv
+                    .lookup_kind(crate::meta_backend::kv::record::TREE_DENTRIES, key)
+                    .await
+                {
                     Ok(Some(v)) => crate::meta_backend::kv::record::DentryValue::decode(&v)
                         .map(|d| d.child_ino == *child_ino)
                         .unwrap_or(false),
@@ -6990,7 +6994,10 @@ pub async fn repair(
                 // blocks this repair reclaims).
                 use crate::meta_backend::kv::record::{inode_key, xattr_key, HASH56_MAX};
                 let ikey = inode_key(local);
-                let Ok(Some(record)) = kv.trees()[0].lookup(&ikey).await else {
+                let Ok(Some(record)) = kv
+                    .lookup_kind(crate::meta_backend::kv::record::TREE_INODES, &ikey)
+                    .await
+                else {
                     refuse(
                         &mut out,
                         f,
@@ -7002,10 +7009,17 @@ pub async fn repair(
                     vec![("inode_record".to_string(), record.to_vec())];
                 let mut xattr_records = 0u64;
                 {
-                    let xattrs = kv.trees()[2];
                     let end = xattr_key(local, HASH56_MAX, u8::MAX);
                     let mut cursor: Vec<u8> = xattr_key(local, 0, 0).to_vec();
-                    while let Ok(page) = xattrs.range(&cursor, &end, SCAN_PAGE).await {
+                    while let Ok(page) = kv
+                        .range_kind(
+                            crate::meta_backend::kv::record::TREE_XATTRS,
+                            &cursor,
+                            &end,
+                            SCAN_PAGE,
+                        )
+                        .await
+                    {
                         let Some((last, _)) = page.last() else { break };
                         cursor = crate::meta_backend::kv::node::key_successor(last);
                         for (k, v) in &page {
@@ -7205,7 +7219,10 @@ pub async fn repair(
                     continue;
                 }
                 let ikey = crate::meta_backend::kv::record::inode_key(local);
-                let Ok(Some(record)) = kv.trees()[0].lookup(&ikey).await else {
+                let Ok(Some(record)) = kv
+                    .lookup_kind(crate::meta_backend::kv::record::TREE_INODES, &ikey)
+                    .await
+                else {
                     refuse(
                         &mut out,
                         f,
@@ -7315,7 +7332,10 @@ pub async fn repair(
                 } else {
                     None
                 };
-                let record = match kv.trees()[1].lookup(&key).await {
+                let record = match kv
+                    .lookup_kind(crate::meta_backend::kv::record::TREE_DENTRIES, &key)
+                    .await
+                {
                     Ok(Some(v)) => v,
                     Ok(None) => {
                         refuse(
@@ -7401,7 +7421,10 @@ pub async fn repair(
                 out.counters.quarantined_records += 1;
                 out.counters.quarantined_bytes += bytes;
                 fire_repair_abort_hook(&what)?;
-                match kv.trees()[1].delete(&key).await {
+                match kv
+                    .delete_kind(crate::meta_backend::kv::record::TREE_DENTRIES, &key)
+                    .await
+                {
                     Ok(()) => apply_ok(
                         &mut out,
                         f,
@@ -7437,15 +7460,16 @@ pub async fn repair(
                     refuse(&mut out, f, "undecodable cursor identity".to_string());
                     continue;
                 };
-                let Some(tree_ref) = kv.trees().into_iter().find(|t| t.tree_id() == *tree) else {
+                if !crate::meta_backend::kv::backend::KvMetaBackend::USER_KINDS.contains(tree) {
                     refuse(&mut out, f, "tree no longer exists".to_string());
                     continue;
-                };
+                }
                 // Same-shaped read as the scan (a max=1 probe can be
                 // satisfied by a healthy left sibling and never touch the
                 // damaged node — the recheck's own lesson).
-                match tree_ref
-                    .range(
+                match kv
+                    .range_kind(
+                        *tree,
                         &cursor,
                         &crate::meta_backend::kv::tree::KEY_SPACE_MAX,
                         SCAN_PAGE,
@@ -7492,16 +7516,16 @@ pub async fn repair(
                     refuse(&mut out, f, "undecodable key identity".to_string());
                     continue;
                 };
-                let Some(tree_ref) = kv.trees().into_iter().find(|t| t.tree_id() == *tree) else {
+                if !crate::meta_backend::kv::backend::KvMetaBackend::USER_KINDS.contains(tree) {
                     refuse(&mut out, f, "tree no longer exists".to_string());
                     continue;
-                };
+                }
                 // Verify under the owning ino's lease where one exists.
                 let _lease = match (online, owning_ino(*tree, &key)) {
                     (true, Some(local)) => Some(kv.dlm().lock_inode_exclusive(local).await),
                     _ => None,
                 };
-                let value = match tree_ref.lookup(&key).await {
+                let value = match kv.lookup_kind(*tree, &key).await {
                     Ok(Some(v)) => v,
                     Ok(None) => {
                         refuse(&mut out, f, "record no longer exists (healed)".to_string());
@@ -7536,7 +7560,7 @@ pub async fn repair(
                 out.counters.quarantined_records += 1;
                 out.counters.quarantined_bytes += bytes;
                 fire_repair_abort_hook(&what)?;
-                tree_ref.delete(&key).await.map_err(|e| {
+                kv.delete_kind(*tree, &key).await.map_err(|e| {
                     SqueezefsError::InvalidOperation(format!(
                         "rebuild-in-place drop of the schema-violating record failed: {e}"
                     ))

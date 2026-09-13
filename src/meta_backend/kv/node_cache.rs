@@ -108,7 +108,7 @@ use super::KvError;
 use arc_swap::ArcSwap;
 use bytes::Bytes;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 
 /// The shipped node-cache budget (§3 / §4.5): 512 MiB — since the
@@ -1401,6 +1401,13 @@ pub struct CachedNode {
     /// snapshot's [`FoldMemo`] and the open delta's charge accounting so
     /// a node's charged size is `extent + overlay + memo` bytes.
     charge: Arc<AtomicU64>,
+    /// The slot tree this node belongs to on a forest volume
+    /// (design-symmetric-metadata §5.2; RAM-only, `u32::MAX` =
+    /// unstamped). A slot tree's nodes all carry header `tree_id` 0, so
+    /// the checkpoint's dirty walk cannot tell 65 slot trees apart from
+    /// the on-disk header; the owning [`super::tree::KvTree`] stamps every
+    /// node it resolves or publishes, and the flush pass dispatches on it.
+    forest_slot: AtomicU32,
 }
 
 impl std::fmt::Debug for CachedNode {
@@ -1471,12 +1478,29 @@ impl CachedNode {
             pinned: AtomicBool::new(pinned),
             dirty_floor: AtomicU64::new(u64::MAX),
             charge,
+            forest_slot: AtomicU32::new(u32::MAX),
         }))
     }
 
     /// Extent byte address (the cache key).
     pub fn addr(&self) -> u64 {
         self.addr
+    }
+
+    /// Record which slot tree owns this node (see the field). Idempotent;
+    /// one relaxed store on the traversal path of a forest volume.
+    #[inline]
+    pub fn stamp_forest_slot(&self, slot: super::record::ForestSlot) {
+        self.forest_slot.store(slot, Ordering::Relaxed);
+    }
+
+    /// The owning slot tree, if this node was ever resolved through one.
+    #[inline]
+    pub fn forest_slot(&self) -> Option<super::record::ForestSlot> {
+        match self.forest_slot.load(Ordering::Relaxed) {
+            u32::MAX => None,
+            s => Some(s),
+        }
     }
 
     /// The revalidation epoch this object was loaded under (spec §6.8

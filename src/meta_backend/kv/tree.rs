@@ -365,12 +365,20 @@ pub struct KvTree {
     /// touched only by the serialized SMO context's owner (the callers
     /// hold `&mut SmoContext`), the mutex is the `Sync` face.
     merge_cursor: std::sync::Mutex<SweepCursor>,
+    /// `Some(slot)` ⇔ this is a SLOT TREE of a forest volume
+    /// (design-symmetric-metadata §5.2; node-header `tree_id` 0 on every
+    /// node): the tree stamps every node it resolves or publishes with
+    /// the slot ([`CachedNode::stamp_forest_slot`]) so the checkpoint's
+    /// dirty walk can dispatch a tree-id-0 node to its owner. `None` on
+    /// every per-kind tree and on tree 0.
+    forest_slot: Option<super::record::ForestSlot>,
 }
 
 impl std::fmt::Debug for KvTree {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("KvTree")
             .field("tree_id", &self.tree_id)
+            .field("forest_slot", &self.forest_slot)
             .field("root", &self.root.load())
             .finish()
     }
@@ -394,6 +402,30 @@ impl KvTree {
         ctx: &mut SmoContext,
         tree_id: u8,
         seq: Arc<AtomicU64>,
+    ) -> Result<Self, KvError> {
+        Self::create_inner(cache, ctx, tree_id, seq, None).await
+    }
+
+    /// [`Self::create`] for a SLOT TREE of a forest volume: node-header
+    /// tree id [`super::record::KIND_INTERIOR`], every node stamped with
+    /// `slot`. Minted lazily by the forest router on a slot's first
+    /// record (design-symmetric-metadata §5.2.2 — "an empty slot owns no
+    /// extent").
+    pub async fn create_slot_tree(
+        cache: Arc<NodeCache>,
+        ctx: &mut SmoContext,
+        slot: super::record::ForestSlot,
+        seq: Arc<AtomicU64>,
+    ) -> Result<Self, KvError> {
+        Self::create_inner(cache, ctx, super::record::KIND_INTERIOR, seq, Some(slot)).await
+    }
+
+    async fn create_inner(
+        cache: Arc<NodeCache>,
+        ctx: &mut SmoContext,
+        tree_id: u8,
+        seq: Arc<AtomicU64>,
+        forest_slot: Option<super::record::ForestSlot>,
     ) -> Result<Self, KvError> {
         let extent = ctx.alloc.claim_internal()?;
         let addr = cache.extent_addr(extent);
@@ -427,6 +459,9 @@ impl KvTree {
             cache.heap_promise_gauge(),
             cache.node_env(),
         )?;
+        if let Some(slot) = forest_slot {
+            node.stamp_forest_slot(slot);
+        }
         cache.publish(node);
         Ok(Self {
             tree_id,
@@ -438,6 +473,7 @@ impl KvTree {
             seq,
             maintenance: scc::Queue::default(),
             merge_cursor: std::sync::Mutex::new(SweepCursor::default()),
+            forest_slot,
         })
     }
 
@@ -449,6 +485,28 @@ impl KvTree {
         tree_id: u8,
         root: RootPtr,
         seq: Arc<AtomicU64>,
+    ) -> Result<Self, KvError> {
+        Self::open_inner(cache, tree_id, root, seq, None).await
+    }
+
+    /// [`Self::open`] for a SLOT TREE (see [`Self::create_slot_tree`]):
+    /// the root is what the ledger (native slot) or tree 0's
+    /// `slot_state` record names.
+    pub async fn open_slot_tree(
+        cache: Arc<NodeCache>,
+        slot: super::record::ForestSlot,
+        root: RootPtr,
+        seq: Arc<AtomicU64>,
+    ) -> Result<Self, KvError> {
+        Self::open_inner(cache, super::record::KIND_INTERIOR, root, seq, Some(slot)).await
+    }
+
+    async fn open_inner(
+        cache: Arc<NodeCache>,
+        tree_id: u8,
+        root: RootPtr,
+        seq: Arc<AtomicU64>,
+        forest_slot: Option<super::record::ForestSlot>,
     ) -> Result<Self, KvError> {
         let node = cache.get(root.addr).await?;
         if node.node_seq() != root.seq {
@@ -467,6 +525,9 @@ impl KvTree {
             )));
         }
         node.pin();
+        if let Some(slot) = forest_slot {
+            node.stamp_forest_slot(slot);
+        }
         Ok(Self {
             tree_id,
             cache,
@@ -474,6 +535,7 @@ impl KvTree {
             seq,
             maintenance: scc::Queue::default(),
             merge_cursor: std::sync::Mutex::new(SweepCursor::default()),
+            forest_slot,
         })
     }
 
@@ -509,6 +571,31 @@ impl KvTree {
     /// The tree id (§4.2).
     pub fn tree_id(&self) -> u8 {
         self.tree_id
+    }
+
+    /// The forest slot this tree holds (`Some` on a slot tree only).
+    pub fn forest_slot(&self) -> Option<super::record::ForestSlot> {
+        self.forest_slot
+    }
+
+    /// Stamp `node` with this tree's slot (a no-op on per-kind trees) —
+    /// called on every node this tree resolves or publishes, so a dirty
+    /// tree-id-0 node always names its owner.
+    #[inline]
+    fn stamp(&self, node: &CachedNode) {
+        if let Some(slot) = self.forest_slot {
+            node.stamp_forest_slot(slot);
+        }
+    }
+
+    /// Whether `node` belongs to THIS tree: by header id — and, on a slot
+    /// tree (every slot tree's nodes carry header id 0), by the owner
+    /// stamp too, so one slot tree's maintenance never adopts another's
+    /// dirty nodes.
+    #[inline]
+    fn owns(&self, node: &CachedNode) -> bool {
+        node.tree_id() == self.tree_id
+            && (self.forest_slot.is_none() || node.forest_slot() == self.forest_slot)
     }
 
     /// The shared node cache.
@@ -572,6 +659,7 @@ impl KvTree {
             }
             loop {
                 if cur.level() == target_level {
+                    self.stamp(&cur);
                     return Ok(cur);
                 }
                 if cur.level() < target_level {
@@ -1011,7 +1099,7 @@ impl KvTree {
         let Some(node) = self.cache.try_get(addr) else {
             return Ok(()); // evicted/retired since the dirty walk
         };
-        if node.state().is_superseded() || node.tree_id() != self.tree_id {
+        if node.state().is_superseded() || !self.owns(&node) {
             return Ok(());
         }
         let (frozen, floor) = {
@@ -1117,7 +1205,7 @@ impl KvTree {
         let Some(node) = self.cache.try_get(addr) else {
             return Ok(false); // evicted/retired since the census
         };
-        if node.state().is_superseded() || node.tree_id() != self.tree_id {
+        if node.state().is_superseded() || !self.owns(&node) {
             return Ok(false);
         }
         // W-B drop guard (the 2026-08-19 AlreadyFreezing wedge's sibling
@@ -1143,7 +1231,7 @@ impl KvTree {
 
     fn cache_map_dirty_addrs(&self, out: &mut Vec<u64>) {
         self.cache.for_each_node(|node| {
-            if node.tree_id() == self.tree_id
+            if self.owns(node)
                 && (node.state().is_dirty() || node.state().is_freezing())
                 && !node.state().is_superseded()
             {
@@ -1163,7 +1251,7 @@ impl KvTree {
         let Some(node) = self.cache.try_get(addr) else {
             return Ok(()); // evicted/retired since enqueue
         };
-        if node.state().is_superseded() || node.tree_id() != self.tree_id {
+        if node.state().is_superseded() || !self.owns(&node) {
             return Ok(());
         }
         // Phase 1 (§4.6 pt 1): freeze under the lock — RAM only.
@@ -1677,9 +1765,11 @@ impl KvTree {
             // superseded-but-not-yet-retired object can never be dropped
             // from the map in between.
             for succ in &successors {
+                self.stamp(succ);
                 self.cache.publish(succ.clone());
             }
             if let Some(root) = &new_root {
+                self.stamp(root);
                 self.cache.publish(root.clone());
             }
 
@@ -1935,7 +2025,11 @@ impl KvTree {
         min_key: &[u8],
         max_key: &[u8],
     ) {
-        if TEST_SMO_BUILD_PAUSE_TREE.load(Ordering::Relaxed) != u64::from(self.tree_id) {
+        // `0` is OFF — and also the node-header tree id of every slot
+        // tree (`KIND_INTERIOR`), so the arm check must test the sentinel
+        // first or an unarmed seam parks every slot-tree SMO forever.
+        let armed = TEST_SMO_BUILD_PAUSE_TREE.load(Ordering::Relaxed);
+        if armed == 0 || armed != u64::from(self.tree_id) {
             return;
         }
         *TEST_SMO_BUILD_PAUSED.lock().expect("seam mutex") = Some(TestSmoPauseInfo {
@@ -1946,9 +2040,13 @@ impl KvTree {
             min_key: min_key.to_vec(),
             max_key: max_key.to_vec(),
         });
-        while TEST_SMO_BUILD_PAUSE_TREE.load(Ordering::Relaxed) == u64::from(self.tree_id) {
+        let still_armed = || {
+            let a = TEST_SMO_BUILD_PAUSE_TREE.load(Ordering::Relaxed);
+            a != 0 && a == u64::from(self.tree_id)
+        };
+        while still_armed() {
             let notified = TEST_SMO_BUILD_NOTIFY.notified();
-            if TEST_SMO_BUILD_PAUSE_TREE.load(Ordering::Relaxed) != u64::from(self.tree_id) {
+            if !still_armed() {
                 break;
             }
             notified.await;
@@ -1999,7 +2097,7 @@ impl KvTree {
     /// elide more and ADD candidates).
     pub fn is_merge_candidate_at(&self, node: &Arc<CachedNode>, durable_tail: u64) -> bool {
         !node.state().is_superseded()
-            && node.tree_id() == self.tree_id
+            && self.owns(node)
             && !self.is_root(node)
             && self.fold_upper_at(node, durable_tail)
                 <= self.cache.config().layout.merge_candidate_capacity()
@@ -2018,7 +2116,7 @@ impl KvTree {
     pub fn merge_candidate_census_at(&self, durable_tail: u64) -> u64 {
         let mut leaves: Vec<Arc<CachedNode>> = Vec::new();
         self.cache.for_each_node(|n| {
-            if n.tree_id() == self.tree_id && n.level() == 0 {
+            if self.owns(n) && n.level() == 0 {
                 leaves.push(n.clone());
             }
         });
@@ -2034,7 +2132,7 @@ impl KvTree {
     fn resident_nodes_at(&self, level: u8, from: &[u8]) -> Vec<(Vec<u8>, u64)> {
         let mut nodes: Vec<(Vec<u8>, u64)> = Vec::new();
         self.cache.for_each_node(|n| {
-            if n.tree_id() == self.tree_id
+            if self.owns(n)
                 && n.level() == level
                 && !n.state().is_superseded()
                 && n.min_key() >= from
@@ -2232,7 +2330,7 @@ impl KvTree {
         let layout = self.cache.config().layout;
         let mut cur = node;
         loop {
-            if self.is_root(&cur) || cur.state().is_superseded() || cur.tree_id() != self.tree_id {
+            if self.is_root(&cur) || cur.state().is_superseded() || !self.owns(&cur) {
                 return Ok(());
             }
             let mut merged_here = false;
@@ -2382,8 +2480,8 @@ impl KvTree {
 
         // ---- Step 0: admission, side-effect free.
         if left.level() != right.level()
-            || left.tree_id() != self.tree_id
-            || right.tree_id() != self.tree_id
+            || !self.owns(left)
+            || !self.owns(right)
             || left.state().is_superseded()
             || right.state().is_superseded()
             || key_successor(left.max_key()) != right.min_key()
@@ -2594,6 +2692,7 @@ impl KvTree {
             // Route flip before retire (the K7 ordering): successor
             // published, the parent's two records in ONE snapshot swap,
             // both old objects retired last.
+            self.stamp(&successor);
             self.cache.publish(successor.clone());
             let (put_seq, del_seq) = match &smo_entry {
                 Some((_, recs)) => (recs[0].1.seq, recs[1].1.seq),

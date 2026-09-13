@@ -39,11 +39,12 @@ use super::backend::KvMetaBackend;
 use super::checkpoint::{write_ledger_slot, LedgerRecord, TreeRoot};
 use super::node::{key_successor, write_node, NodeLayout, NodeWriteParams, NODE_PAGE};
 use super::record::{
-    dentry_key, dentry_name_hash54, inode_key, xattr_key, xattr_name_hash56, DentryValue,
-    InodeValue, Record, XattrValue, TREE_BLOCK_REFS, TREE_DENTRIES, TREE_INODES, TREE_XATTRS,
+    dentry_key, dentry_name_hash54, forest_key, inode_key, xattr_key, xattr_name_hash56,
+    DentryValue, InodeValue, Record, XattrValue, KIND_INTERIOR, TREE_BLOCK_REFS, TREE_CONTROL,
+    TREE_DENTRIES, TREE_INODES, TREE_XATTRS,
 };
 use super::superblock::{write_superblock_v3, SuperblockV3};
-use super::tree::{encode_interior_value, KvTree, KEY_SPACE_MAX};
+use super::tree::{encode_interior_value, KEY_SPACE_MAX};
 use super::KvError;
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -524,6 +525,17 @@ impl ImageBuilder {
             sb.features_incompat |= super::superblock::FEATURE_INCOMPAT_KV_WRITER_SCOPED_STAGING;
         }
 
+        // **Test seam** (`SQUEEZEFS_TEST_STAMP_SYMMETRIC=1`): stamp incompat
+        // bit 17 (the slot-tree FOREST, docs/design-symmetric-metadata.md
+        // §7.1) at format. The ONLY stamping path until PR 11 lands
+        // `format --symmetric` and the offline conversion verb — a
+        // stamped image is built as the forest below (tree 0 + the native
+        // slot tree), never as the three per-kind trees plus a bit.
+        let symmetric = crate::env_knobs::bool_knob("SQUEEZEFS_TEST_STAMP_SYMMETRIC", false);
+        if symmetric {
+            sb.features_incompat |= super::superblock::FEATURE_INCOMPAT_KV_SYMMETRIC_FOREST;
+        }
+
         // §9 quick-format hygiene: zero SB + ledger + ring + bitmap.
         zero_range(path, 0, sb.heap.start).await?;
 
@@ -559,14 +571,38 @@ impl ImageBuilder {
         // no root would be a mount refusal, not a degradation.
         let block_refs =
             sb.features_incompat & super::superblock::FEATURE_INCOMPAT_KV_BLOCK_REFCOUNTS != 0;
-        let mut planned: Vec<(u8, Vec<Record>)> = vec![
-            (TREE_INODES, self.inode_records()),
-            (TREE_DENTRIES, self.dentry_records()?),
-            (TREE_XATTRS, self.xattr_records()?),
-        ];
-        if block_refs {
-            planned.push((TREE_BLOCK_REFS, Vec::new()));
-        }
+        let planned: Vec<(u8, Vec<Record>)> = if symmetric {
+            // The forest (design-symmetric-metadata §5.2.2): an EMPTY
+            // control tree and ONE mixed-kind native slot tree holding
+            // every format-time record under its forest key (§5.2.1 —
+            // the builder mints native inos only, so no guest slot tree
+            // exists at format; the mount mints them on first write).
+            // Block references and block maps live INSIDE slot trees
+            // under bit 17, so bits 9/16 plant no separate root here.
+            let mut native: Vec<Record> = Vec::new();
+            for (kind, records) in [
+                (TREE_INODES, self.inode_records()),
+                (TREE_DENTRIES, self.dentry_records()?),
+                (TREE_XATTRS, self.xattr_records()?),
+            ] {
+                for mut r in records {
+                    r.key = forest_key(kind, &r.key)?;
+                    native.push(r);
+                }
+            }
+            native.sort_by(|a, b| a.key.cmp(&b.key));
+            vec![(TREE_CONTROL, Vec::new()), (KIND_INTERIOR, native)]
+        } else {
+            let mut planned = vec![
+                (TREE_INODES, self.inode_records()),
+                (TREE_DENTRIES, self.dentry_records()?),
+                (TREE_XATTRS, self.xattr_records()?),
+            ];
+            if block_refs {
+                planned.push((TREE_BLOCK_REFS, Vec::new()));
+            }
+            planned
+        };
         let mut tree_roots = Vec::with_capacity(planned.len());
         for (tree_id, records) in planned {
             let (addr, seq) = writer.write_tree(tree_id, records).await?;
@@ -793,11 +829,15 @@ pub struct BuiltImage {
     pub extents_allocated: u64,
 }
 
-/// The §4.10 post-fold digest walk: xxh3 over every **live** record of
-/// the given trees — `(tree_id, key, folded value)` in tree-id-then-key
-/// order; tombstones and unfolded deltas excluded — so two states compare
-/// by user-visible content, not physical encoding. Used by the builder
-/// determinism tests and the torn-ledger fallback crash case.
+/// The §4.10 post-fold digest walk: xxh3 over every **live** USER record
+/// of a mounted backend — `(kind, legacy key, folded value)` in
+/// kind-then-key order; tombstones and unfolded deltas excluded — so two
+/// states compare by user-visible content, not physical encoding. Runs
+/// through the backend's kind-routed scan, so it serves EITHER layout and
+/// a forest volume digests EQUAL to a flat volume holding the same
+/// records (the forest is a relayout, never a rewrite —
+/// `tests/sym_forest_tests.rs`). Used by the builder determinism tests
+/// and the torn-ledger fallback crash case.
 ///
 /// The `writer_claim` record (PR M1, design-metadata-throughput §5.0) is
 /// **excluded**: it is per-mount guard state, unique to every mount *by
@@ -813,35 +853,22 @@ pub struct BuiltImage {
 /// (post-fold digest mismatch) and two `kv_backend` tests. **Any future
 /// per-mount control record belongs on this exclusion list**; the general
 /// rule is `is_pinned_control_record`-shaped state, never user content.
-pub async fn digest_walk(trees: &[&KvTree]) -> Result<u64, KvError> {
+pub async fn digest_backend(backend: &KvMetaBackend) -> Result<u64, KvError> {
     const WALK_PAGE: usize = 1024;
     let mut h = xxhash_rust::xxh3::Xxh3::new();
-    for tree in trees {
-        h.update(&[tree.tree_id()]);
+    for kind in KvMetaBackend::USER_KINDS {
+        h.update(&[kind]);
         let mut cursor: Vec<u8> = Vec::new();
         loop {
-            let page = tree.range(&cursor, &KEY_SPACE_MAX, WALK_PAGE).await?;
+            let page = backend
+                .range_kind(kind, &cursor, &KEY_SPACE_MAX, WALK_PAGE)
+                .await?;
             let Some((last_key, _)) = page.last() else {
                 break;
             };
             cursor = key_successor(last_key);
             for (k, v) in &page {
-                if tree.tree_id() == TREE_XATTRS
-                    && XattrValue::decode(v)
-                        .map(|x| {
-                            x.name == super::backend::WRITER_CLAIM_XATTR.as_bytes()
-                                // DLM S2 (incompat bit 7): the durable
-                                // writer TERM is the same class as the
-                                // claim — mount-guard state, not
-                                // filesystem content — and it is
-                                // MONOTONE PER MOUNT by design, so
-                                // including it made every
-                                // digest-across-remount comparison
-                                // structurally false (era N vs era N+1).
-                                || x.name == super::backend::WRITER_TERM_XATTR.as_bytes()
-                        })
-                        .unwrap_or(false)
-                {
+                if kind == TREE_XATTRS && is_mount_guard_xattr(v) {
                     continue; // mount-guard state, not filesystem content
                 }
                 h.update(&(k.len() as u64).to_le_bytes());
@@ -854,9 +881,15 @@ pub async fn digest_walk(trees: &[&KvTree]) -> Result<u64, KvError> {
     Ok(h.digest())
 }
 
-/// Convenience: [`digest_walk`] over a mounted backend's three trees.
-pub async fn digest_backend(backend: &KvMetaBackend) -> Result<u64, KvError> {
-    digest_walk(&backend.trees()).await
+/// The digest walk's exclusion predicate (see [`digest_backend`]): the
+/// per-mount `writer_claim` / `writer_term` guard records.
+fn is_mount_guard_xattr(value: &[u8]) -> bool {
+    XattrValue::decode(value)
+        .map(|x| {
+            x.name == super::backend::WRITER_CLAIM_XATTR.as_bytes()
+                || x.name == super::backend::WRITER_TERM_XATTR.as_bytes()
+        })
+        .unwrap_or(false)
 }
 
 /// `squeezefs format` options for one metadata volume (the CLI arm's

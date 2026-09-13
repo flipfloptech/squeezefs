@@ -348,7 +348,7 @@ async fn read_record(fx: &Fx, ino: u64) -> Option<InodeValue> {
     let (v_idx, local) = fx.meta.route_ino(ino);
     let kv = &fx.meta.volumes[v_idx];
     kv.drain_pending_times_now().await.ok();
-    let bytes = kv.trees()[0].lookup(&inode_key(local)).await.ok()??;
+    let bytes = kv.flat_trees()[0].lookup(&inode_key(local)).await.ok()??;
     InodeValue::decode(&bytes).ok()
 }
 
@@ -377,7 +377,7 @@ async fn drop_one_name(fx: &Fx, ino: u64) {
     use squeezefs::meta_backend::kv::node::key_successor;
     use squeezefs::meta_backend::kv::tree::KEY_SPACE_MAX;
     for kv in &fx.meta.volumes {
-        let dentries = kv.trees()[1];
+        let dentries = kv.flat_trees()[1].clone();
         let mut cursor: Vec<u8> = vec![0u8];
         loop {
             let page = dentries
@@ -406,7 +406,7 @@ async fn destroy_record_keep_name(fx: &Fx, ino: u64) {
     let (v_idx, local) = fx.meta.route_ino(ino);
     let kv = &fx.meta.volumes[v_idx];
     kv.drain_pending_times_now().await.ok();
-    kv.trees()[0]
+    kv.flat_trees()[0]
         .delete(&inode_key(local))
         .await
         .expect("destroy the inode record");
@@ -468,7 +468,7 @@ async fn name_records(fx: &Fx, name: &str) -> usize {
     use squeezefs::meta_backend::kv::tree::KEY_SPACE_MAX;
     let mut found = 0;
     for kv in &fx.meta.volumes {
-        let dentries = kv.trees()[1];
+        let dentries = kv.flat_trees()[1].clone();
         let mut cursor: Vec<u8> = vec![0u8];
         loop {
             let page = dentries

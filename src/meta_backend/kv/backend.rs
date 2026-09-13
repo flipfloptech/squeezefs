@@ -154,6 +154,7 @@ use super::KvError;
 use super::{block_map, block_refs};
 use crate::error::Result;
 use crate::meta_backend::atomicity::META_VOLUME_ATOMICITY_COW;
+use std::borrow::Cow;
 // DLM S3.5 (design-cow-kv-metadata §4.10a): the cross-volume plan
 // vocabulary this file's applier consumes.
 use crate::meta_backend::crossvol_tx::{self, XvLocalStep, XvRider, XvStepOutcome, XvStepStatus};
@@ -746,6 +747,67 @@ impl MigrationTee {
     }
 }
 
+/// A forest volume's live census ([`KvMetaBackend::forest_census`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ForestCensus {
+    /// Slot trees that exist (the native one included).
+    pub slot_trees: u64,
+    /// Guest slot roots tree 0 currently names.
+    pub control_records: u64,
+    /// Guest slot trees minted this mount.
+    pub minted: u64,
+    /// `slot_state` publications this mount.
+    pub root_publishes: u64,
+}
+
+/// The trees of one mounted volume — the two on-disk layouts this binary
+/// serves. Exactly the sites that match on it are the layout-dependent
+/// ones; everything else routes through [`KvMetaBackend`]'s kind-keyed
+/// helpers.
+enum TreeSet {
+    /// The shipped layout: one tree per record kind (§4.2), plus the
+    /// bit-9 block-reference tree and the bit-16 block-map tree when
+    /// engaged.
+    Flat {
+        /// Shared node cache behind the three trees (§4.5). Held for tree
+        /// lifetime; the trees clone the `Arc`.
+        inodes: Arc<KvTree>,
+        dentries: Arc<KvTree>,
+        xattrs: Arc<KvTree>,
+        /// Pre-RC spec §6.2 item 1 (incompat bit 9): the **durable
+        /// block-reference tree** — `Some` exactly when this volume carries
+        /// [`super::superblock::FEATURE_INCOMPAT_KV_BLOCK_REFCOUNTS`] and
+        /// the mount may write (a read-only mount never mints a root).
+        /// `None` means derived accounting, i.e. pre-item-1 behavior
+        /// verbatim. Not one of the three §4.2 user trees: the §4.10
+        /// digest walk / slot-migration keyspace / fsck tree walk are
+        /// defined over those; structural consumers (checkpoint flush,
+        /// ledger roots, maintenance) use [`KvMetaBackend::all_trees`].
+        block_refs: Option<Arc<KvTree>>,
+        /// PB-class files, PR 1 (docs/design-kvmap-block-map-tree.md): the
+        /// **block-map tree** — `Some` exactly when this volume carries
+        /// [`super::superblock::FEATURE_INCOMPAT_KV_BLOCK_MAP_TREE`] (bit
+        /// 16) and the mount may write. `None` means inline/`indirect:`
+        /// layout heads only — and, unlike `block_refs`, staging into an
+        /// absent tree REFUSES loud (map records ARE the mapping; a silent
+        /// skip is data loss). A `OnceLock` (PR 2), not an `Option`: the
+        /// bit-16 ratchet ([`KvMetaBackend::block_map_tree_ready`]) can
+        /// stamp+mint AT RUNTIME on the owner-served crossing path.
+        block_map: std::sync::OnceLock<Arc<KvTree>>,
+    },
+    /// The slot-tree forest (docs/design-symmetric-metadata.md §5.2,
+    /// incompat bit 17): one mixed-kind tree per routing slot + the
+    /// control tree. Block references and block maps are RECORD KINDS
+    /// inside the slot trees here, so their engagement is a flag, not a
+    /// tree: refs ⇔ bit 9 present and the mount may write; the block map
+    /// ⇔ bit 16 stamped (ratchetable at runtime like the flat OnceLock).
+    Forest {
+        forest: super::forest::SlotTrees,
+        block_refs: bool,
+        block_map: AtomicBool,
+    },
+}
+
 /// One mounted v3 metadata volume.
 pub struct KvMetaBackend {
     path: PathBuf,
@@ -772,41 +834,12 @@ pub struct KvMetaBackend {
     /// ino falls in the migrating keyspace; values are re-read at delta
     /// apply.
     migration_tee: arc_swap::ArcSwapOption<MigrationTee>,
-    /// Shared node cache behind the three trees (§4.5). Held for tree
-    /// lifetime; the trees clone the `Arc`.
-    inodes: KvTree,
-    dentries: KvTree,
-    xattrs: KvTree,
-    /// Pre-RC spec §6.2 item 1 (incompat bit 8): the **durable
-    /// block-reference tree** — `Some` exactly when this volume carries
-    /// [`super::superblock::FEATURE_INCOMPAT_KV_BLOCK_REFCOUNTS`] and the
-    /// mount may write (a read-only mount never mints a root). `None`
-    /// means derived accounting, i.e. pre-item-1 behavior verbatim.
-    ///
-    /// Deliberately NOT part of [`Self::trees`]: that array is the three
-    /// §4.2 user trees, and the §4.10 digest walk / slot-migration
-    /// keyspace / fsck tree walk are all defined over it. Structural
-    /// consumers (checkpoint flush, ledger roots, maintenance) use
-    /// [`Self::all_trees`], which includes this one.
-    block_refs: Option<KvTree>,
-    /// PB-class files, PR 1 (docs/design-kvmap-block-map-tree.md): the
-    /// **block-map tree** — `Some` exactly when this volume carries
-    /// [`super::superblock::FEATURE_INCOMPAT_KV_BLOCK_MAP_TREE`] (bit 16)
-    /// and the mount may write. `None` means inline/`indirect:` layout
-    /// heads only, i.e. pre-kvmap behavior verbatim — and, unlike
-    /// `block_refs`, staging into an absent tree REFUSES loud (map
-    /// records ARE the mapping; a silent skip is data loss).
-    ///
-    /// The `block_refs` posture otherwise transfers: not part of
-    /// [`Self::trees`] (digest walk / migration keyspace / fsck stay
-    /// defined over the three user trees until PR 4's walkers), included
-    /// in [`Self::all_trees`] for checkpoint/roots/maintenance.
-    ///
-    /// A `OnceLock` (PR 2), not an `Option`: the bit-16 ratchet
-    /// ([`Self::block_map_tree_ready`]) can stamp+mint AT RUNTIME on the
-    /// owner-served crossing path, and engagement is monotone for the
-    /// mount's life either way.
-    block_map: std::sync::OnceLock<KvTree>,
+    /// The volume's trees: the shipped per-kind layout, or — under
+    /// incompat bit 17 — the slot-tree forest. Every record access goes
+    /// through the routing helpers below ([`Self::lookup_kind`],
+    /// [`Self::range_kind`], [`Self::tree_for_record`], …), which are the
+    /// ONE place the two layouts diverge.
+    trees: TreeSet,
     alloc: Arc<ExtentAllocator>,
     /// §4.8 monotonic watermark, recovered at mount; the create path
     /// `fetch_add`s it.
@@ -1890,315 +1923,336 @@ impl KvMetaBackend {
         // residue admissible). The root/replay fetch_max floors below
         // stay as the crash-window belt-and-braces.
         let seq = Arc::new(AtomicU64::new(ledger.seq.max(ledger.node_seq_watermark)));
-        let mut opened: Vec<KvTree> = Vec::with_capacity(3);
-        for tree_id in [TREE_INODES, TREE_DENTRIES, TREE_XATTRS] {
-            let root = ledger
-                .tree_roots
-                .iter()
-                .find(|r| r.tree_id == tree_id)
-                .ok_or_else(|| {
-                    KvError::Corrupt(format!(
-                        "{}: ledger record seq {} names no root for tree {tree_id}",
-                        path.display(),
-                        ledger.seq
-                    ))
-                })?;
-            let tree = KvTree::open(
-                cache.clone(),
-                tree_id,
-                RootPtr {
-                    addr: root.node_addr,
-                    seq: root.node_seq,
-                },
-                seq.clone(),
-            )
-            .await?;
-            // Post-replay seq assignment stays above every node seq the
-            // roots carry.
-            seq.fetch_max(root.node_seq, Ordering::AcqRel);
-            opened.push(tree);
-        }
-        let mut opened = opened.into_iter();
-        let (inodes, dentries, xattrs) = (
-            opened.next().expect("three trees"),
-            opened.next().expect("three trees"),
-            opened.next().expect("three trees"),
-        );
 
-        // 5a′. Spec §6.2 item 1 (incompat bit 8): the durable
-        // block-reference tree. Fresh formats carry its (empty) root from
-        // the builder; a volume STAMPED later (the Phase-8 reformat
-        // window) has the bit and no root, so the first writable mount
-        // mints one. Minting is idempotent across a crash: the claimed
-        // extent's bitmap bit only becomes durable at a checkpoint, so a
-        // mount that dies before its first checkpoint leaves nothing
-        // behind and the next one mints again. The mint happens BEFORE
-        // replay, so any accounting record still in the journal window
-        // folds into the fresh root by key, exactly like every other
-        // content record.
-        //
-        // A read-only mount (unknown-ro feature bits) never mints and
-        // never accounts — it degrades to the derived walk, which is the
-        // honest behavior for a mount that may not write.
-        let block_refs = if sb.features_incompat
-            & super::superblock::FEATURE_INCOMPAT_KV_BLOCK_REFCOUNTS
-            != 0
-            // The `read_only` latch (unknown-ro feature bits) is resolved
-            // further down; its input is the superblock, so read it here.
-            && sb.unknown_ro() == 0
-        {
-            match ledger
-                .tree_roots
-                .iter()
-                .find(|r| r.tree_id == super::record::TREE_BLOCK_REFS)
+        let (trees, max_replayed_ino, max_replayed_guest) = if sb.symmetric_forest_stamped() {
+            Self::open_forest_and_replay(path, &sb, &ledger, &cache, &seq, &alloc, &recovery)
+                .await?
+        } else {
+            let mut opened: Vec<KvTree> = Vec::with_capacity(3);
+            for tree_id in [TREE_INODES, TREE_DENTRIES, TREE_XATTRS] {
+                let root = ledger
+                    .tree_roots
+                    .iter()
+                    .find(|r| r.tree_id == tree_id)
+                    .ok_or_else(|| {
+                        KvError::Corrupt(format!(
+                            "{}: ledger record seq {} names no root for tree {tree_id}",
+                            path.display(),
+                            ledger.seq
+                        ))
+                    })?;
+                let tree = KvTree::open(
+                    cache.clone(),
+                    tree_id,
+                    RootPtr {
+                        addr: root.node_addr,
+                        seq: root.node_seq,
+                    },
+                    seq.clone(),
+                )
+                .await?;
+                // Post-replay seq assignment stays above every node seq the
+                // roots carry.
+                seq.fetch_max(root.node_seq, Ordering::AcqRel);
+                opened.push(tree);
+            }
+            let mut opened = opened.into_iter();
+            let (inodes, dentries, xattrs) = (
+                Arc::new(opened.next().expect("three trees")),
+                Arc::new(opened.next().expect("three trees")),
+                Arc::new(opened.next().expect("three trees")),
+            );
+
+            // 5a′. Spec §6.2 item 1 (incompat bit 8): the durable
+            // block-reference tree. Fresh formats carry its (empty) root from
+            // the builder; a volume STAMPED later (the Phase-8 reformat
+            // window) has the bit and no root, so the first writable mount
+            // mints one. Minting is idempotent across a crash: the claimed
+            // extent's bitmap bit only becomes durable at a checkpoint, so a
+            // mount that dies before its first checkpoint leaves nothing
+            // behind and the next one mints again. The mint happens BEFORE
+            // replay, so any accounting record still in the journal window
+            // folds into the fresh root by key, exactly like every other
+            // content record.
+            //
+            // A read-only mount (unknown-ro feature bits) never mints and
+            // never accounts — it degrades to the derived walk, which is the
+            // honest behavior for a mount that may not write.
+            let block_refs = if sb.features_incompat
+                & super::superblock::FEATURE_INCOMPAT_KV_BLOCK_REFCOUNTS
+                != 0
+                // The `read_only` latch (unknown-ro feature bits) is resolved
+                // further down; its input is the superblock, so read it here.
+                && sb.unknown_ro() == 0
             {
-                Some(root) => {
-                    let tree = KvTree::open(
-                        cache.clone(),
-                        super::record::TREE_BLOCK_REFS,
-                        RootPtr {
-                            addr: root.node_addr,
-                            seq: root.node_seq,
-                        },
-                        seq.clone(),
-                    )
-                    .await?;
-                    seq.fetch_max(root.node_seq, Ordering::AcqRel);
-                    Some(tree)
-                }
-                None => {
-                    log::info!(
-                        "meta volume {}: incompat bit 8 (durable block refcounts) is \
-                         stamped but the ledger names no block-reference root — minting \
-                         an empty one (the post-stamp first mount)",
-                        path.display()
-                    );
-                    let mut mint_ctx = SmoContext::new(alloc.clone());
-                    Some(
-                        KvTree::create(
+                match ledger
+                    .tree_roots
+                    .iter()
+                    .find(|r| r.tree_id == super::record::TREE_BLOCK_REFS)
+                {
+                    Some(root) => {
+                        let tree = KvTree::open(
                             cache.clone(),
-                            &mut mint_ctx,
                             super::record::TREE_BLOCK_REFS,
+                            RootPtr {
+                                addr: root.node_addr,
+                                seq: root.node_seq,
+                            },
                             seq.clone(),
                         )
-                        .await?,
-                    )
+                        .await?;
+                        seq.fetch_max(root.node_seq, Ordering::AcqRel);
+                        Some(Arc::new(tree))
+                    }
+                    None => {
+                        log::info!(
+                            "meta volume {}: incompat bit 8 (durable block refcounts) is \
+                             stamped but the ledger names no block-reference root — minting \
+                             an empty one (the post-stamp first mount)",
+                            path.display()
+                        );
+                        let mut mint_ctx = SmoContext::new(alloc.clone());
+                        Some(Arc::new(
+                            KvTree::create(
+                                cache.clone(),
+                                &mut mint_ctx,
+                                super::record::TREE_BLOCK_REFS,
+                                seq.clone(),
+                            )
+                            .await?,
+                        ))
+                    }
                 }
-            }
-        } else {
-            None
-        };
-
-        // 5a″. PB-class files, PR 1 (docs/design-kvmap-block-map-tree.md):
-        // the block-map tree, under incompat bit 16 — the bit-9 arm's
-        // discipline verbatim: a stamped volume whose ledger names no
-        // tree-7 root mints one (idempotent across a crash — the claimed
-        // extent's bitmap bit only becomes durable at a checkpoint), the
-        // mint happens BEFORE replay so any map record still in the
-        // journal window folds into the fresh root by key, and a
-        // read-only-degraded mount (unknown-ro bits) never mints.
-        let block_map = if sb.block_map_tree_stamped() && sb.unknown_ro() == 0 {
-            match ledger
-                .tree_roots
-                .iter()
-                .find(|r| r.tree_id == super::record::TREE_BLOCK_MAP)
-            {
-                Some(root) => {
-                    let tree = KvTree::open(
-                        cache.clone(),
-                        super::record::TREE_BLOCK_MAP,
-                        RootPtr {
-                            addr: root.node_addr,
-                            seq: root.node_seq,
-                        },
-                        seq.clone(),
-                    )
-                    .await?;
-                    seq.fetch_max(root.node_seq, Ordering::AcqRel);
-                    Some(tree)
-                }
-                None => {
-                    log::info!(
-                        "meta volume {}: incompat bit 16 (block-map tree) is stamped \
-                         but the ledger names no block-map root — minting an empty \
-                         one (the post-stamp first mount)",
-                        path.display()
-                    );
-                    let mut mint_ctx = SmoContext::new(alloc.clone());
-                    Some(
-                        KvTree::create(
-                            cache.clone(),
-                            &mut mint_ctx,
-                            super::record::TREE_BLOCK_MAP,
-                            seq.clone(),
-                        )
-                        .await?,
-                    )
-                }
-            }
-        } else {
-            None
-        };
-
-        // 5b. Read-only replay into the cache, TWO-PHASE (Option C′,
-        // docs/design-smo-replay-currency.md §2/§4): routing must not
-        // evolve UNDER the content walk. Single-pass seq-order replay
-        // routed each content record through the structure *as it stood
-        // at that entry* — a record whose seq races an SMO's build window
-        // (reserved before the in-lock flip reservation) descended the
-        // pre-flip route into the predecessor, and the higher-seq flip
-        // then abandoned that lineage: acked, in-window, replayed
-        // "cleanly", and lost (sub-mechanism (i) stranding — the
-        // FIND-VS-A 0.4–0.9 % acked-create residual).
-        //
-        // Phase 1 — every interior/routing record first, ordered by
-        // (level DESC, then seq): upper flips route lower ones (a leaf-
-        // SMO flip is itself "content" to the interior it applies to —
-        // pure-seq phase 1 would strand it exactly as (i) strands leaf
-        // content). Per-key LWW by seq is unchanged, so a flip already
-        // folded into a successor interior's image re-applies idempotent;
-        // an unroutable pointer (the mounted ledger predates a root
-        // growth) still drops sound-and-silent. Root swaps journal no
-        // pointer records — those windows replay through the old
-        // structure by design (the C′ carve-out; Option A owns them).
-        //
-        // Phase 2 — content records (original seqs, unchanged per-key
-        // LWW gate) through the now-FINAL routing: every record folds
-        // into the node covering its key in the final structure, whose
-        // durable image the SMO barriered before its flip could exist.
-        //
-        // §4.4 pt 4 holes stay dropped in both phases by construction:
-        // each phase walks the SAME `recovery.entries` the checksummed
-        // chain scan materialized — a rolled-back tx's reserved-but-
-        // unwritten range never parses into it, so neither phase can see
-        // half a tx (one tx = one checksummed entry, §4.10). Replay-twice
-        // digest equality holds over the phased order: replay is
-        // read-only into the cache and (level DESC, seq) over the same
-        // materialized entries is a deterministic total order. Allocator
-        // records were already consumed by the K4 load, untouched here.
-        //
-        // Stranded predecessor *objects* can remain mapped-but-unrouted
-        // in the cache until clock eviction — bytes only, bounded by the
-        // window's SMO count (design §2 C′ residuals).
-        // Each replayed record's floor contribution is its ENTRY start
-        // (`ReplayedEntry::seq` — FIND-SMO-TAIL §1b rounding): replay
-        // reproduces record seqs, so it must reproduce the floor
-        // discipline too, or a post-replay checkpoint could re-mint a
-        // mid-entry tail from the replayed window's own records.
-        let mut interior: Vec<(u8, u8, u64, &Record)> = Vec::new();
-        for entry in &recovery.entries {
-            for (tag, rec) in &entry.records {
-                let (tree_id, level) = untag(*tag);
-                let mounted = matches!(tree_id, TREE_INODES | TREE_DENTRIES | TREE_XATTRS)
-                    || (tree_id == super::record::TREE_BLOCK_REFS && block_refs.is_some())
-                    || (tree_id == super::record::TREE_BLOCK_MAP && block_map.is_some());
-                if level > 0 && mounted {
-                    interior.push((tree_id, level, entry.seq, rec));
-                }
-            }
-        }
-        interior.sort_by(|a, b| b.1.cmp(&a.1).then(a.3.seq.cmp(&b.3.seq)));
-        for (tree_id, level, entry_start, rec) in interior {
-            let tree = match tree_id {
-                TREE_INODES => &inodes,
-                TREE_DENTRIES => &dentries,
-                TREE_XATTRS => &xattrs,
-                super::record::TREE_BLOCK_REFS => block_refs
-                    .as_ref()
-                    .expect("phase 1 collects the block-ref tree only when it is mounted"),
-                super::record::TREE_BLOCK_MAP => block_map
-                    .as_ref()
-                    .expect("phase 1 collects the block-map tree only when it is mounted"),
-                _ => unreachable!("phase 1 collects only the mounted trees"),
+            } else {
+                None
             };
-            // Keep post-mount node-seq mints above every child
-            // incarnation a replayed pointer names.
-            if rec.kind == RecordKind::Put {
-                if let Ok((_addr, child_seq)) = decode_interior_value(&rec.value) {
-                    seq.fetch_max(child_seq, Ordering::AcqRel);
+
+            // 5a″. PB-class files, PR 1 (docs/design-kvmap-block-map-tree.md):
+            // the block-map tree, under incompat bit 16 — the bit-9 arm's
+            // discipline verbatim: a stamped volume whose ledger names no
+            // tree-7 root mints one (idempotent across a crash — the claimed
+            // extent's bitmap bit only becomes durable at a checkpoint), the
+            // mint happens BEFORE replay so any map record still in the
+            // journal window folds into the fresh root by key, and a
+            // read-only-degraded mount (unknown-ro bits) never mints.
+            let block_map = if sb.block_map_tree_stamped() && sb.unknown_ro() == 0 {
+                match ledger
+                    .tree_roots
+                    .iter()
+                    .find(|r| r.tree_id == super::record::TREE_BLOCK_MAP)
+                {
+                    Some(root) => {
+                        let tree = KvTree::open(
+                            cache.clone(),
+                            super::record::TREE_BLOCK_MAP,
+                            RootPtr {
+                                addr: root.node_addr,
+                                seq: root.node_seq,
+                            },
+                            seq.clone(),
+                        )
+                        .await?;
+                        seq.fetch_max(root.node_seq, Ordering::AcqRel);
+                        Some(Arc::new(tree))
+                    }
+                    None => {
+                        log::info!(
+                            "meta volume {}: incompat bit 16 (block-map tree) is stamped \
+                             but the ledger names no block-map root — minting an empty \
+                             one (the post-stamp first mount)",
+                            path.display()
+                        );
+                        let mut mint_ctx = SmoContext::new(alloc.clone());
+                        Some(Arc::new(
+                            KvTree::create(
+                                cache.clone(),
+                                &mut mint_ctx,
+                                super::record::TREE_BLOCK_MAP,
+                                seq.clone(),
+                            )
+                            .await?,
+                        ))
+                    }
+                }
+            } else {
+                None
+            };
+
+            // 5b. Read-only replay into the cache, TWO-PHASE (Option C′,
+            // docs/design-smo-replay-currency.md §2/§4): routing must not
+            // evolve UNDER the content walk. Single-pass seq-order replay
+            // routed each content record through the structure *as it stood
+            // at that entry* — a record whose seq races an SMO's build window
+            // (reserved before the in-lock flip reservation) descended the
+            // pre-flip route into the predecessor, and the higher-seq flip
+            // then abandoned that lineage: acked, in-window, replayed
+            // "cleanly", and lost (sub-mechanism (i) stranding — the
+            // FIND-VS-A 0.4–0.9 % acked-create residual).
+            //
+            // Phase 1 — every interior/routing record first, ordered by
+            // (level DESC, then seq): upper flips route lower ones (a leaf-
+            // SMO flip is itself "content" to the interior it applies to —
+            // pure-seq phase 1 would strand it exactly as (i) strands leaf
+            // content). Per-key LWW by seq is unchanged, so a flip already
+            // folded into a successor interior's image re-applies idempotent;
+            // an unroutable pointer (the mounted ledger predates a root
+            // growth) still drops sound-and-silent. Root swaps journal no
+            // pointer records — those windows replay through the old
+            // structure by design (the C′ carve-out; Option A owns them).
+            //
+            // Phase 2 — content records (original seqs, unchanged per-key
+            // LWW gate) through the now-FINAL routing: every record folds
+            // into the node covering its key in the final structure, whose
+            // durable image the SMO barriered before its flip could exist.
+            //
+            // §4.4 pt 4 holes stay dropped in both phases by construction:
+            // each phase walks the SAME `recovery.entries` the checksummed
+            // chain scan materialized — a rolled-back tx's reserved-but-
+            // unwritten range never parses into it, so neither phase can see
+            // half a tx (one tx = one checksummed entry, §4.10). Replay-twice
+            // digest equality holds over the phased order: replay is
+            // read-only into the cache and (level DESC, seq) over the same
+            // materialized entries is a deterministic total order. Allocator
+            // records were already consumed by the K4 load, untouched here.
+            //
+            // Stranded predecessor *objects* can remain mapped-but-unrouted
+            // in the cache until clock eviction — bytes only, bounded by the
+            // window's SMO count (design §2 C′ residuals).
+            // Each replayed record's floor contribution is its ENTRY start
+            // (`ReplayedEntry::seq` — FIND-SMO-TAIL §1b rounding): replay
+            // reproduces record seqs, so it must reproduce the floor
+            // discipline too, or a post-replay checkpoint could re-mint a
+            // mid-entry tail from the replayed window's own records.
+            let mut interior: Vec<(u8, u8, u64, &Record)> = Vec::new();
+            for entry in &recovery.entries {
+                for (tag, rec) in &entry.records {
+                    let (tree_id, level) = untag(*tag);
+                    let mounted = matches!(tree_id, TREE_INODES | TREE_DENTRIES | TREE_XATTRS)
+                        || (tree_id == super::record::TREE_BLOCK_REFS && block_refs.is_some())
+                        || (tree_id == super::record::TREE_BLOCK_MAP && block_map.is_some());
+                    if level > 0 && mounted {
+                        interior.push((tree_id, level, entry.seq, rec));
+                    }
                 }
             }
-            tree.apply_replayed_interior(
-                &rec.key,
-                level,
-                rec.seq,
-                rec.kind,
-                Bytes::copy_from_slice(&rec.value),
-                entry_start,
-            )
-            .await?;
-        }
-        let mut max_replayed_ino: u64 = 0;
-        // PR VL5b: per-guest-slot replayed ino maxima — the same §4.8
-        // recovery fold, one cursor per guest namespace.
-        let mut max_replayed_guest: std::collections::HashMap<u16, u64> =
-            std::collections::HashMap::new();
-        for entry in &recovery.entries {
-            for (tag, rec) in &entry.records {
-                let (tree_id, level) = untag(*tag);
-                if level > 0 {
-                    continue; // phase 1 applied it
-                }
+            interior.sort_by(|a, b| b.1.cmp(&a.1).then(a.3.seq.cmp(&b.3.seq)));
+            for (tree_id, level, entry_start, rec) in interior {
                 let tree = match tree_id {
                     TREE_INODES => &inodes,
                     TREE_DENTRIES => &dentries,
                     TREE_XATTRS => &xattrs,
-                    // Spec §6.2 item 1: accounting records replay like
-                    // any other content record — routed by key into the
-                    // (possibly freshly minted) block-ref root. An
-                    // un-engaged volume cannot have them; a stamped
-                    // volume whose mint raced a crash folds them into the
-                    // new root by key.
-                    super::record::TREE_BLOCK_REFS => match block_refs.as_ref() {
-                        Some(t) => t,
-                        None => continue,
-                    },
-                    // PB-class files, PR 1: map records replay like any
-                    // other content record — routed by key into the
-                    // (possibly freshly minted) block-map root. An
-                    // un-engaged volume cannot have them.
-                    super::record::TREE_BLOCK_MAP => match block_map.as_ref() {
-                        Some(t) => t,
-                        None => continue,
-                    },
-                    TREE_ALLOC_RESERVED => continue,
-                    _ => continue,
+                    super::record::TREE_BLOCK_REFS => block_refs
+                        .as_ref()
+                        .expect("phase 1 collects the block-ref tree only when it is mounted"),
+                    super::record::TREE_BLOCK_MAP => block_map
+                        .as_ref()
+                        .expect("phase 1 collects the block-map tree only when it is mounted"),
+                    _ => unreachable!("phase 1 collects only the mounted trees"),
                 };
-                // §4.8 recovery fold — **DUR-8c**: every ino the replay
-                // window MENTIONS raises the watermark, not just the ones
-                // with a surviving inode record. A torn-dropped create
-                // whose dentry (child ino in the VALUE) or xattr (ino in
-                // the KEY) survived would otherwise let `next_ino` fall
-                // back and RE-MINT that ino over the survivor.
-                let mentioned: Option<u64> = match tree_id {
-                    TREE_INODES => decode_inode_key(&rec.key).ok(),
-                    TREE_DENTRIES => super::record::DentryValue::decode(&rec.value)
-                        .ok()
-                        .map(|d| d.child_ino),
-                    TREE_XATTRS => super::record::decode_xattr_key(&rec.key)
-                        .ok()
-                        .map(|(ino, _, _)| ino),
-                    _ => None,
-                };
-                if let Some(ino) = mentioned {
-                    match crate::meta_backend::split_guest_local(ino) {
-                        Some((slot, raw)) => {
-                            let e = max_replayed_guest.entry(slot).or_insert(0);
-                            *e = (*e).max(raw);
-                        }
-                        None => max_replayed_ino = max_replayed_ino.max(ino),
+                // Keep post-mount node-seq mints above every child
+                // incarnation a replayed pointer names.
+                if rec.kind == RecordKind::Put {
+                    if let Ok((_addr, child_seq)) = decode_interior_value(&rec.value) {
+                        seq.fetch_max(child_seq, Ordering::AcqRel);
                     }
                 }
-                tree.apply_replayed(
+                tree.apply_replayed_interior(
                     &rec.key,
+                    level,
                     rec.seq,
                     rec.kind,
                     Bytes::copy_from_slice(&rec.value),
-                    entry.seq,
+                    entry_start,
                 )
                 .await?;
             }
-        }
+            let mut max_replayed_ino: u64 = 0;
+            // PR VL5b: per-guest-slot replayed ino maxima — the same §4.8
+            // recovery fold, one cursor per guest namespace.
+            let mut max_replayed_guest: std::collections::HashMap<u16, u64> =
+                std::collections::HashMap::new();
+            for entry in &recovery.entries {
+                for (tag, rec) in &entry.records {
+                    let (tree_id, level) = untag(*tag);
+                    if level > 0 {
+                        continue; // phase 1 applied it
+                    }
+                    let tree = match tree_id {
+                        TREE_INODES => &inodes,
+                        TREE_DENTRIES => &dentries,
+                        TREE_XATTRS => &xattrs,
+                        // Spec §6.2 item 1: accounting records replay like
+                        // any other content record — routed by key into the
+                        // (possibly freshly minted) block-ref root. An
+                        // un-engaged volume cannot have them; a stamped
+                        // volume whose mint raced a crash folds them into the
+                        // new root by key.
+                        super::record::TREE_BLOCK_REFS => match block_refs.as_ref() {
+                            Some(t) => t,
+                            None => continue,
+                        },
+                        // PB-class files, PR 1: map records replay like any
+                        // other content record — routed by key into the
+                        // (possibly freshly minted) block-map root. An
+                        // un-engaged volume cannot have them.
+                        super::record::TREE_BLOCK_MAP => match block_map.as_ref() {
+                            Some(t) => t,
+                            None => continue,
+                        },
+                        TREE_ALLOC_RESERVED => continue,
+                        _ => continue,
+                    };
+                    // §4.8 recovery fold — **DUR-8c**: every ino the replay
+                    // window MENTIONS raises the watermark, not just the ones
+                    // with a surviving inode record. A torn-dropped create
+                    // whose dentry (child ino in the VALUE) or xattr (ino in
+                    // the KEY) survived would otherwise let `next_ino` fall
+                    // back and RE-MINT that ino over the survivor.
+                    let mentioned: Option<u64> = match tree_id {
+                        TREE_INODES => decode_inode_key(&rec.key).ok(),
+                        TREE_DENTRIES => super::record::DentryValue::decode(&rec.value)
+                            .ok()
+                            .map(|d| d.child_ino),
+                        TREE_XATTRS => super::record::decode_xattr_key(&rec.key)
+                            .ok()
+                            .map(|(ino, _, _)| ino),
+                        _ => None,
+                    };
+                    if let Some(ino) = mentioned {
+                        match crate::meta_backend::split_guest_local(ino) {
+                            Some((slot, raw)) => {
+                                let e = max_replayed_guest.entry(slot).or_insert(0);
+                                *e = (*e).max(raw);
+                            }
+                            None => max_replayed_ino = max_replayed_ino.max(ino),
+                        }
+                    }
+                    tree.apply_replayed(
+                        &rec.key,
+                        rec.seq,
+                        rec.kind,
+                        Bytes::copy_from_slice(&rec.value),
+                        entry.seq,
+                    )
+                    .await?;
+                }
+            }
+
+            let trees = TreeSet::Flat {
+                inodes,
+                dentries,
+                xattrs,
+                block_refs,
+                block_map: {
+                    let cell = std::sync::OnceLock::new();
+                    if let Some(t) = block_map {
+                        let _ = cell.set(t);
+                    }
+                    cell
+                },
+            };
+            (trees, max_replayed_ino, max_replayed_guest)
+        };
 
         // 5c. §4.8: next_ino = max(ledger watermark, replayed inos + 1).
         let next_ino = ledger.next_ino.max(max_replayed_ino + 1);
@@ -2274,17 +2328,7 @@ impl KvMetaBackend {
             guest_cursors: scc::HashMap::new(),
             migration_tee: arc_swap::ArcSwapOption::empty(),
             ledger,
-            inodes,
-            dentries,
-            xattrs,
-            block_refs,
-            block_map: {
-                let cell = std::sync::OnceLock::new();
-                if let Some(t) = block_map {
-                    let _ = cell.set(t);
-                }
-                cell
-            },
+            trees,
             alloc,
             next_ino: AtomicU64::new(next_ino),
             era_ino_floor_native: next_ino,
@@ -2592,11 +2636,7 @@ impl KvMetaBackend {
     /// PR VL5b: latch-free point read of one raw record (`tree_id`,
     /// `key`) — the delta-apply value re-read. `None` = deleted/absent.
     pub async fn migration_read_record(&self, tree_id: u8, key: &[u8]) -> Result<Option<Vec<u8>>> {
-        Ok(self
-            .tree_by_id(tree_id)
-            .lookup(key)
-            .await?
-            .map(|b| b.to_vec()))
+        Ok(self.lookup_kind(tree_id, key).await?.map(|b| b.to_vec()))
     }
 
     /// PR VL5b: the EFFECTIVE local ino of the filesystem root (global
@@ -2958,38 +2998,300 @@ impl KvMetaBackend {
         self.cache.config().layout.xattr_value_cap()
     }
 
-    /// The three logical trees, tree-id order (inodes, dentries, xattrs)
-    /// — the digest walk's input ([`super::builder::digest_walk`]).
-    ///
-    /// Deliberately excludes the §6.2 item-1 block-reference tree: the
-    /// §4.10 digest walk, the VL5 slot-migration keyspace, and fsck's
-    /// C1 tree walk are all defined over the three USER trees, and
-    /// widening this array would silently redefine all three. Structural
-    /// consumers use [`Self::all_trees`].
-    pub fn trees(&self) -> [&KvTree; 3] {
-        [&self.inodes, &self.dentries, &self.xattrs]
+    /// The per-kind trees of a FLAT volume, tree-id order (inodes,
+    /// dentries, xattrs) — the shape the pre-forest suites drive
+    /// directly. **Empty on a forest volume**: there is no tree per kind
+    /// there, and production code never indexes this — it routes through
+    /// [`Self::lookup_kind`] / [`Self::range_kind`] / the structural
+    /// [`Self::all_trees`], which serve both layouts.
+    pub fn flat_trees(&self) -> Vec<Arc<KvTree>> {
+        match &self.trees {
+            TreeSet::Flat {
+                inodes,
+                dentries,
+                xattrs,
+                ..
+            } => vec![Arc::clone(inodes), Arc::clone(dentries), Arc::clone(xattrs)],
+            TreeSet::Forest { .. } => Vec::new(),
+        }
     }
 
+    /// The §4.2 record kinds every volume serves as USER content — the
+    /// digest walk's, the slot-migration keyspace's and fsck's tree-walk
+    /// domain, in tree-id order.
+    pub const USER_KINDS: [u8; 3] = [TREE_INODES, TREE_DENTRIES, TREE_XATTRS];
+
     /// Every tree this volume must checkpoint, flush, and name a root
-    /// for: the three §4.2 user trees plus the durable block-reference
-    /// tree when incompat bit 8 engaged it (spec §6.2 item 1).
-    pub fn all_trees(&self) -> Vec<&KvTree> {
-        let mut v: Vec<&KvTree> = self.trees().to_vec();
-        if let Some(t) = self.block_refs.as_ref() {
-            v.push(t);
+    /// for: flat — the three §4.2 user trees plus the durable block-
+    /// reference tree and the block-map tree when engaged; forest — tree
+    /// 0 plus every slot tree that exists.
+    pub fn all_trees(&self) -> Vec<Arc<KvTree>> {
+        match &self.trees {
+            TreeSet::Flat {
+                inodes,
+                dentries,
+                xattrs,
+                block_refs,
+                block_map,
+            } => {
+                let mut v = vec![Arc::clone(inodes), Arc::clone(dentries), Arc::clone(xattrs)];
+                if let Some(t) = block_refs {
+                    v.push(Arc::clone(t));
+                }
+                if let Some(t) = block_map.get() {
+                    v.push(Arc::clone(t));
+                }
+                v
+            }
+            TreeSet::Forest { forest, .. } => forest.all(),
         }
-        if let Some(t) = self.block_map.get() {
-            v.push(t);
+    }
+
+    /// Whether this volume is a slot-tree forest (incompat bit 17).
+    pub fn symmetric_forest(&self) -> bool {
+        matches!(self.trees, TreeSet::Forest { .. })
+    }
+
+    /// The forest router, on a forest volume.
+    fn forest(&self) -> Option<&super::forest::SlotTrees> {
+        match &self.trees {
+            TreeSet::Forest { forest, .. } => Some(forest),
+            TreeSet::Flat { .. } => None,
         }
-        v
+    }
+
+    /// The live root of slot tree `slot` (`None` = the slot has no tree —
+    /// "an empty slot owns no extent"; also `None` on a flat volume).
+    pub fn slot_tree_root(&self, slot: super::record::ForestSlot) -> Option<RootPtr> {
+        self.forest()?.tree(slot).map(|t| t.root())
+    }
+
+    /// A forest census for the stats inode and the suites: how many slot
+    /// trees exist and how many guest roots tree 0 currently names.
+    pub fn forest_census(&self) -> Option<ForestCensus> {
+        let f = self.forest()?;
+        Some(ForestCensus {
+            slot_trees: f.slot_tree_count() as u64,
+            control_records: f.published_count() as u64,
+            minted: f.minted(),
+            root_publishes: f.publishes(),
+        })
+    }
+
+    /// The flat per-kind tree for `id` — FLAT volumes only (the forest
+    /// routes by KEY, never by kind alone).
+    fn flat_tree(&self, id: u8) -> Arc<KvTree> {
+        match &self.trees {
+            TreeSet::Flat {
+                inodes,
+                dentries,
+                xattrs,
+                block_refs,
+                block_map,
+            } => {
+                match id {
+                    TREE_INODES => Arc::clone(inodes),
+                    TREE_DENTRIES => Arc::clone(dentries),
+                    TREE_XATTRS => Arc::clone(xattrs),
+                    // Spec §6.2 item 1: staged only by the layout-commit paths,
+                    // and only when the tree is engaged (`block_refs_engaged`
+                    // gates every staging site) — an absent tree here means a
+                    // caller staged accounting onto a volume that has none.
+                    super::record::TREE_BLOCK_REFS => Arc::clone(block_refs.as_ref().expect(
+                        "block-reference records staged on a volume without incompat bit 9",
+                    )),
+                    // PB-class files, PR 1: unreachable un-engaged — the staging
+                    // seam refuses non-empty map ops loud BEFORE a tx exists
+                    // (`set_layout_and_size_with_map`), unlike the block_refs
+                    // silent-skip.
+                    super::record::TREE_BLOCK_MAP => Arc::clone(
+                        block_map
+                            .get()
+                            .expect("block-map records staged on a volume without incompat bit 16"),
+                    ),
+                    _ => unreachable!("kv commits stage only the §4.2 trees"),
+                }
+            }
+            TreeSet::Forest { .. } => {
+                unreachable!("a forest volume routes records by key, never by kind alone")
+            }
+        }
+    }
+
+    /// The tree a STAGED / journaled / replayed record belongs to: its
+    /// kind's tree on a flat volume; on a forest volume the slot tree its
+    /// (forest-form) key names — minted on the slot's first record — or
+    /// tree 0 for a [`TREE_CONTROL`] tag. The ONE routing point of the
+    /// commit pipelines and replay.
+    async fn tree_for_record(
+        &self,
+        tag_tree_id: u8,
+        key: &[u8],
+    ) -> std::result::Result<Arc<KvTree>, KvError> {
+        match &self.trees {
+            TreeSet::Flat { .. } => Ok(self.flat_tree(tag_tree_id)),
+            TreeSet::Forest { forest, .. } => {
+                if tag_tree_id == super::record::TREE_CONTROL {
+                    return Ok(Arc::clone(forest.control()));
+                }
+                forest
+                    .route_forest_key_or_mint(key, &self.cache, &self.seq_handle(), &self.alloc)
+                    .await
+                    .map(|(_, t)| t)
+            }
+        }
+    }
+
+    /// The tree a cache node belongs to (the checkpoint flush pass and the
+    /// heap-admission root check): by header id on a flat volume; on a
+    /// forest volume tree 0 by id, a slot tree by its owner stamp.
+    pub(super) fn tree_of_node(
+        &self,
+        node: &CachedNode,
+    ) -> std::result::Result<Arc<KvTree>, KvError> {
+        match &self.trees {
+            TreeSet::Flat { .. } => self
+                .all_trees()
+                .into_iter()
+                .find(|t| t.tree_id() == node.tree_id())
+                .ok_or_else(|| {
+                    KvError::Corrupt(format!(
+                        "node {:#x} carries tree id {} — no mounted tree",
+                        node.addr(),
+                        node.tree_id()
+                    ))
+                }),
+            TreeSet::Forest { forest, .. } => forest.tree_for_node(node),
+        }
+    }
+
+    /// The key a `(kind, legacy key)` pair is STAGED and JOURNALED under:
+    /// the legacy key verbatim on a flat volume, the §5.2.1 forest key on
+    /// a forest volume (the kind byte inserted once here; the tag stays
+    /// the kind, so the journal wire is the shipped one).
+    fn stage_key(&self, kind: u8, legacy: Vec<u8>) -> std::result::Result<Vec<u8>, KvError> {
+        match &self.trees {
+            TreeSet::Flat { .. } => Ok(legacy),
+            TreeSet::Forest { .. } => super::record::forest_key(kind, &legacy).map_err(|e| {
+                super::META_KV_FOREST_KEY_VIOLATIONS.fetch_add(1, Ordering::Relaxed);
+                e
+            }),
+        }
+    }
+
+    /// A committed batch's records with their keys back in LEGACY form —
+    /// what the migration tee's consumer re-reads by. Borrows on a flat
+    /// volume (identity); re-frames on a forest one.
+    fn legacy_recs<'r>(
+        &self,
+        recs: &'r [(u8, Record)],
+    ) -> std::result::Result<Cow<'r, [(u8, Record)]>, KvError> {
+        match &self.trees {
+            TreeSet::Flat { .. } => Ok(Cow::Borrowed(recs)),
+            TreeSet::Forest { .. } => {
+                let mut out = Vec::with_capacity(recs.len());
+                for (tree_id, r) in recs {
+                    let mut r = r.clone();
+                    if *tree_id != super::record::TREE_CONTROL {
+                        r.key = super::record::split_forest_key(&r.key)?.1;
+                    }
+                    out.push((*tree_id, r));
+                }
+                Ok(Cow::Owned(out))
+            }
+        }
+    }
+
+    /// The volume-shared record/node seq source (the trees clone it).
+    fn seq_handle(&self) -> Arc<AtomicU64> {
+        self.all_trees()
+            .first()
+            .expect("a mounted volume has at least one tree")
+            .seq_handle()
+    }
+
+    /// Latch-free point lookup of a `(kind, legacy key)` — the ONE read
+    /// primitive both layouts serve.
+    pub async fn lookup_kind(
+        &self,
+        kind: u8,
+        legacy: &[u8],
+    ) -> std::result::Result<Option<Bytes>, KvError> {
+        match &self.trees {
+            TreeSet::Flat { .. } => self.flat_tree(kind).lookup(legacy).await,
+            TreeSet::Forest { forest, .. } => forest.lookup(kind, legacy).await,
+        }
+    }
+
+    /// The durable delta-chain probe of a `(kind, legacy key)`
+    /// ([`KvTree::delta_chain_probe`]) on either layout.
+    pub async fn delta_chain_probe_kind(
+        &self,
+        kind: u8,
+        legacy: &[u8],
+    ) -> std::result::Result<(u32, Option<(u64, u64)>), KvError> {
+        match &self.trees {
+            TreeSet::Flat { .. } => self.flat_tree(kind).delta_chain_probe(legacy).await,
+            TreeSet::Forest { forest, .. } => forest.delta_chain_probe(kind, legacy).await,
+        }
+    }
+
+    /// Range scan of `kind` over the inclusive LEGACY window `[start,
+    /// end]`, at most `max` records, keys in legacy form ([`KvTree::range`]
+    /// on a flat volume; the slot-ordered kind-filtered walk on a forest).
+    pub async fn range_kind(
+        &self,
+        kind: u8,
+        start: &[u8],
+        end: &[u8],
+        max: usize,
+    ) -> std::result::Result<Vec<(Bytes, Bytes)>, KvError> {
+        match &self.trees {
+            TreeSet::Flat { .. } => self.flat_tree(kind).range(start, end, max).await,
+            TreeSet::Forest { forest, .. } => forest.range(kind, start, end, max).await,
+        }
+    }
+
+    /// Direct (un-journaled) `Put` of a `(kind, legacy key)` — the
+    /// offline repair verbs' primitive ([`KvTree::insert`]).
+    pub async fn insert_kind(
+        &self,
+        kind: u8,
+        legacy: &[u8],
+        value: impl Into<Bytes>,
+    ) -> std::result::Result<(), KvError> {
+        match &self.trees {
+            TreeSet::Flat { .. } => self.flat_tree(kind).insert(legacy, value).await,
+            TreeSet::Forest { forest, .. } => {
+                let r = forest
+                    .route_or_mint(kind, legacy, &self.cache, &self.seq_handle(), &self.alloc)
+                    .await?;
+                r.tree.insert(&r.key, value).await
+            }
+        }
+    }
+
+    /// Direct (un-journaled) `Delete` of a `(kind, legacy key)` — the
+    /// offline repair verbs' primitive ([`KvTree::delete`]).
+    pub async fn delete_kind(&self, kind: u8, legacy: &[u8]) -> std::result::Result<(), KvError> {
+        match &self.trees {
+            TreeSet::Flat { .. } => self.flat_tree(kind).delete(legacy).await,
+            TreeSet::Forest { forest, .. } => match forest.route_read(kind, legacy)? {
+                Some(r) => r.tree.delete(&r.key).await,
+                None => Ok(()), // nothing was ever written to that slot
+            },
+        }
     }
 
     /// `true` ⇔ durable block-reference accounting is engaged on this
-    /// volume (incompat bit 8 present and the mount may write). `false`
+    /// volume (incompat bit 9 present and the mount may write). `false`
     /// means every block-ownership answer is derived state, exactly as it
     /// was before the bit existed.
     pub fn block_refs_engaged(&self) -> bool {
-        self.block_refs.is_some()
+        match &self.trees {
+            TreeSet::Flat { block_refs, .. } => block_refs.is_some(),
+            TreeSet::Forest { block_refs, .. } => *block_refs,
+        }
     }
 
     /// Every durable block reference recorded on this volume for the data
@@ -3001,18 +3303,23 @@ impl KvMetaBackend {
     /// the peak footprint is one page, not one volume. Returns `Ok(vec![])`
     /// on a volume with no engaged tree — a caller that must distinguish
     /// "no accounting" from "no references" asks
-    /// [`Self::block_refs_engaged`].
+    /// [`Self::block_refs_engaged`]. On a forest volume the by-block
+    /// prefix is probed in EVERY slot tree (a reference lives in the
+    /// referencing ino's slot — §5.4.2), which the kind-routed range walk
+    /// does by construction.
     pub async fn block_ref_scan(
         &self,
         vol_tag: u64,
     ) -> std::result::Result<Vec<super::block_refs::BlockRef>, KvError> {
-        let Some(tree) = self.block_refs.as_ref() else {
+        if !self.block_refs_engaged() {
             return Ok(Vec::new());
-        };
+        }
         let (mut cursor, end) = super::block_refs::volume_range(vol_tag);
         let mut out = Vec::new();
         loop {
-            let page = tree.range(&cursor, &end, 512).await?;
+            let page = self
+                .range_kind(super::record::TREE_BLOCK_REFS, &cursor, &end, 512)
+                .await?;
             let Some((last_key, _)) = page.last() else {
                 break;
             };
@@ -3046,13 +3353,15 @@ impl KvMetaBackend {
         vol_tag: u64,
         block_idx: u64,
     ) -> std::result::Result<usize, KvError> {
-        let Some(tree) = self.block_refs.as_ref() else {
+        if !self.block_refs_engaged() {
             return Ok(0);
-        };
+        }
         let (mut cursor, end) = super::block_refs::block_range(vol_tag, block_idx);
         let mut population = 0usize;
         loop {
-            let page = tree.range(&cursor, &end, 512).await?;
+            let page = self
+                .range_kind(super::record::TREE_BLOCK_REFS, &cursor, &end, 512)
+                .await?;
             let Some((last_key, _)) = page.last() else {
                 break;
             };
@@ -3075,7 +3384,10 @@ impl KvMetaBackend {
     /// existed — and staging a map record refuses loud
     /// ([`Self::set_layout_and_size_with_map`]).
     pub fn block_map_tree_engaged(&self) -> bool {
-        self.block_map.get().is_some()
+        match &self.trees {
+            TreeSet::Flat { block_map, .. } => block_map.get().is_some(),
+            TreeSet::Forest { block_map, .. } => block_map.load(Ordering::Acquire),
+        }
     }
 
     /// PB-class files, PR 1 (design §3 read law, the exact-key half):
@@ -3115,12 +3427,15 @@ impl KvMetaBackend {
         ino: Ino,
         block_index: u32,
     ) -> std::result::Result<Option<(u32, super::block_map::MapEntry)>, KvError> {
-        let Some(tree) = self.block_map.get() else {
+        if !self.block_map_tree_engaged() {
             return Ok(None);
-        };
+        }
         super::META_KV_BLOCK_MAP_LOOKUP_EXACT.fetch_add(1, Ordering::Relaxed);
         let key = super::block_map::block_map_key(ino, block_index)?;
-        match tree.lookup(&key).await? {
+        match self
+            .lookup_kind(super::record::TREE_BLOCK_MAP, &key)
+            .await?
+        {
             // A malformed mapping is loud corruption, never a silently
             // skipped block (a wrong resolve is the failure the tree
             // exists to prevent).
@@ -3145,9 +3460,9 @@ impl KvMetaBackend {
         ino: Ino,
         block_index: u32,
     ) -> std::result::Result<Option<(u32, super::block_map::MapEntry)>, KvError> {
-        let Some(tree) = self.block_map.get() else {
+        if !self.block_map_tree_engaged() {
             return Ok(None);
-        };
+        }
         if block_index == 0 {
             // No index precedes 0 — a covering run would BE the exact hit.
             return Ok(None);
@@ -3168,7 +3483,9 @@ impl KvMetaBackend {
         let mut covering: Option<(u32, super::block_map::MapEntry)> = None;
         let mut cursor: Vec<u8> = lo.to_vec();
         loop {
-            let page = tree.range(&cursor, &hi, 512).await?;
+            let page = self
+                .range_kind(super::record::TREE_BLOCK_MAP, &cursor, &hi, 512)
+                .await?;
             let Some((last_key, _)) = page.last() else {
                 break;
             };
@@ -3211,12 +3528,14 @@ impl KvMetaBackend {
         from_index: u32,
         max: usize,
     ) -> std::result::Result<Vec<(u32, super::block_map::MapEntry)>, KvError> {
-        let Some(tree) = self.block_map.get() else {
+        if !self.block_map_tree_engaged() {
             return Ok(Vec::new());
-        };
+        }
         super::META_KV_BLOCK_MAP_LOOKUP_RANGE.fetch_add(1, Ordering::Relaxed);
         let (lo, hi) = super::block_map::index_range_from(ino, from_index);
-        let page = tree.range(&lo, &hi, max).await?;
+        let page = self
+            .range_kind(super::record::TREE_BLOCK_MAP, &lo, &hi, max)
+            .await?;
         super::META_KV_BLOCK_MAP_RANGE_RECORDS.fetch_add(page.len() as u64, Ordering::Relaxed);
         let mut out = Vec::with_capacity(page.len());
         for (k, v) in &page {
@@ -3261,14 +3580,16 @@ impl KvMetaBackend {
     /// file contributes one probe. `Ok(vec![])` on a volume with no
     /// engaged tree, like [`Self::block_map_range`].
     pub async fn block_map_owner_scan(&self) -> std::result::Result<Vec<Ino>, KvError> {
-        let Some(tree) = self.block_map.get() else {
+        if !self.block_map_tree_engaged() {
             return Ok(Vec::new());
-        };
+        }
         let mut out = Vec::new();
         let mut cursor = [0u8; super::block_map::BLOCK_MAP_KEY_LEN];
         let end = [0xFFu8; super::block_map::BLOCK_MAP_KEY_LEN];
         loop {
-            let page = tree.range(&cursor, &end, 1).await?;
+            let page = self
+                .range_kind(super::record::TREE_BLOCK_MAP, &cursor, &end, 1)
+                .await?;
             let Some((k, _)) = page.first() else {
                 break;
             };
@@ -3300,14 +3621,14 @@ impl KvMetaBackend {
     /// read the owner's superblock, so the owner self-arms at its first
     /// served crossing.
     pub async fn block_map_tree_ready(&self) -> bool {
-        if self.block_map.get().is_some() {
+        if self.block_map_tree_engaged() {
             return true;
         }
         if self.read_only {
             return false;
         }
         let _g = self.block_map_ratchet.lock().await;
-        if self.block_map.get().is_some() {
+        if self.block_map_tree_engaged() {
             return true;
         }
         match super::superblock::set_block_map_tree_bit(&self.path).await {
@@ -3322,7 +3643,22 @@ impl KvMetaBackend {
                     );
                     return false;
                 }
-                let seq = self.inodes.seq_handle();
+                // Under the forest a block map is a record KIND inside
+                // the slot trees (design-symmetric-metadata §5.4.2): no
+                // root to mint — the durable bit alone engages it.
+                let block_map = match &self.trees {
+                    TreeSet::Flat { block_map, .. } => block_map,
+                    TreeSet::Forest { block_map, .. } => {
+                        block_map.store(true, Ordering::Release);
+                        log::info!(
+                            "meta volume {}: incompat bit 16 (block-map tree) stamped on a \
+                             forest volume — map records route into the slot trees",
+                            self.path.display()
+                        );
+                        return true;
+                    }
+                };
+                let seq = self.seq_handle();
                 let mut smo = self.smo.lock().await;
                 match KvTree::create(
                     self.cache.clone(),
@@ -3333,7 +3669,7 @@ impl KvMetaBackend {
                 .await
                 {
                     Ok(tree) => {
-                        let _ = self.block_map.set(tree);
+                        let _ = block_map.set(Arc::new(tree));
                         log::info!(
                             "meta volume {}: incompat bit 16 (block-map tree) stamped and \
                              the tree-7 root minted (the first crossing's ratchet)",
@@ -3580,7 +3916,7 @@ impl KvMetaBackend {
                     if !pg.ops.is_empty() {
                         let mut tx = KvTx::new();
                         tx.stage_block_map(&pg.ops)?;
-                        if self.block_refs.is_some() {
+                        if self.block_refs_engaged() {
                             tx.stage_block_refs(&pg.rel);
                         }
                         tx.hold_guards(Arc::clone(&guards));
@@ -4199,7 +4535,7 @@ impl KvMetaBackend {
         // fsck C8 residue (space-safe, data-safe).
         const TRAIN_REF_TX_CHUNK: usize = 512;
         let mut refs_tail = staged_refs;
-        if claims.is_some() && self.block_refs.is_some() {
+        if claims.is_some() && self.block_refs_engaged() {
             while refs_tail.len() > TRAIN_REF_TX_CHUNK {
                 let rest = refs_tail.split_off(TRAIN_REF_TX_CHUNK);
                 let chunk_ops = std::mem::replace(&mut refs_tail, rest);
@@ -4257,7 +4593,7 @@ impl KvMetaBackend {
     /// unlink teardown is bounded by the PRESENT record population.
     /// A no-op — not an error — on a volume with no engaged tree.
     pub async fn sweep_block_map(&self, ino: Ino, chunk: usize) -> Result<u64> {
-        if self.block_map.get().is_none() {
+        if !self.block_map_tree_engaged() {
             return Ok(0);
         }
         self.write_gate()?;
@@ -4389,7 +4725,7 @@ impl KvMetaBackend {
         entry_key: &(dyn Fn(&super::block_map::MapEntry, u32) -> Option<String> + Send + Sync),
         ref_for: &(dyn Fn(&str, u32) -> Option<super::block_refs::BlockRef> + Send + Sync),
     ) -> Result<SweepChunkOutcome> {
-        if self.block_map.get().is_none() {
+        if !self.block_map_tree_engaged() {
             return Ok(SweepChunkOutcome::NoCursor);
         }
         self.write_gate()?;
@@ -4471,7 +4807,7 @@ impl KvMetaBackend {
         entry_key: &(dyn Fn(&super::block_map::MapEntry, u32) -> Option<String> + Send + Sync),
         ref_for: &(dyn Fn(&str, u32) -> Option<super::block_refs::BlockRef> + Send + Sync),
     ) -> Result<SweepPageOps> {
-        let refs_engaged = self.block_refs.is_some();
+        let refs_engaged = self.block_refs_engaged();
         let mut out = SweepPageOps::default();
         let mut budget = chunk;
         // Release the deltas `[from, to)` of one record — every release
@@ -4647,12 +4983,12 @@ impl KvMetaBackend {
     /// post-fold live records (§4.2).
     async fn chain_scan(
         &self,
-        tree: &KvTree,
+        kind: u8,
         start_key: &[u8],
         end_key: &[u8],
     ) -> std::result::Result<Vec<(Bytes, Bytes)>, KvError> {
         // A chain is ≤ 256 records by construction.
-        tree.range(start_key, end_key, 256).await
+        self.range_kind(kind, start_key, end_key, 256).await
     }
 
     /// Resolve `name` under `parent` to its dentry value, if live.
@@ -4667,7 +5003,7 @@ impl KvMetaBackend {
         let hash = dentry_name_hash54(name.as_bytes(), self.sb.hash_seed);
         let start = dentry_key(parent, hash, 0);
         let end = dentry_key(parent, hash, u8::MAX);
-        for (_k, v) in self.chain_scan(&self.dentries, &start, &end).await? {
+        for (_k, v) in self.chain_scan(TREE_DENTRIES, &start, &end).await? {
             let d = DentryValue::decode(&v)?;
             if d.name == name.as_bytes() {
                 return Ok(Some(d));
@@ -4677,7 +5013,7 @@ impl KvMetaBackend {
     }
 
     async fn read_inode_value(&self, ino: Ino) -> std::result::Result<Option<InodeValue>, KvError> {
-        match self.inodes.lookup(&inode_key(ino)).await? {
+        match self.lookup_kind(TREE_INODES, &inode_key(ino)).await? {
             Some(v) => Ok(Some(InodeValue::decode(&v)?)),
             None => Ok(None),
         }
@@ -4722,7 +5058,9 @@ impl KvMetaBackend {
         let end = super::tree::KEY_SPACE_MAX;
         let mut cursor: Vec<u8> = vec![0u8];
         loop {
-            let page = self.dentries.range(&cursor, &end, SCAN_PAGE).await?;
+            let page = self
+                .range_kind(TREE_DENTRIES, &cursor, &end, SCAN_PAGE)
+                .await?;
             let Some((last_key, _)) = page.last() else {
                 return Ok(None);
             };
@@ -4805,7 +5143,7 @@ impl KvMetaBackend {
         let end = dentry_key(dir, HASH54_MAX, u8::MAX);
         while out.len() < max {
             let want = (max - out.len()).min(SCAN_PAGE);
-            let page = self.dentries.range(&cursor, &end, want).await?;
+            let page = self.range_kind(TREE_DENTRIES, &cursor, &end, want).await?;
             let Some((last_key, _)) = page.last() else {
                 break;
             };
@@ -4835,7 +5173,7 @@ impl KvMetaBackend {
         let hash = xattr_name_hash56(name.as_bytes(), self.sb.hash_seed);
         let start = xattr_key(ino, hash, 0);
         let end = xattr_key(ino, hash, u8::MAX);
-        for (_k, v) in self.chain_scan(&self.xattrs, &start, &end).await? {
+        for (_k, v) in self.chain_scan(TREE_XATTRS, &start, &end).await? {
             let x = XattrValue::decode(&v)?;
             if x.name == name.as_bytes() {
                 return Ok(Some(x.value));
@@ -4851,7 +5189,9 @@ impl KvMetaBackend {
         let mut cursor: Vec<u8> = xattr_key(ino, 0, 0).to_vec();
         let end = xattr_key(ino, HASH56_MAX, u8::MAX);
         loop {
-            let page = self.xattrs.range(&cursor, &end, SCAN_PAGE).await?;
+            let page = self
+                .range_kind(TREE_XATTRS, &cursor, &end, SCAN_PAGE)
+                .await?;
             let Some((last_key, _)) = page.last() else {
                 break;
             };
@@ -5789,11 +6129,13 @@ impl KvMetaBackend {
         targets: &[(u8, u64)],
     ) -> std::result::Result<u64, KvError> {
         let mut smo = self.smo.lock().await;
-        let trees = self.trees();
         let mut compacted = 0u64;
         for &(tree_id, addr) in targets {
-            let Some(tree) = trees.iter().find(|t| t.tree_id() == tree_id) else {
-                continue; // unknown tree id: stale/foreign census entry
+            // The census names nodes by header id + address; on a forest
+            // volume the header id is 0 for every slot tree, so the
+            // owning tree is the one the cached node's stamp names.
+            let Some(tree) = self.tree_for_census_target(tree_id, addr) else {
+                continue; // unknown tree id / unmapped node: stale census entry
             };
             let mut out = crate::meta_backend::kv::tree::MaintenanceOutcome::default();
             let mut attempts = 0;
@@ -7942,28 +8284,384 @@ pub enum RoutedParentUpdate {
 }
 
 impl KvMetaBackend {
-    fn tree_by_id(&self, id: u8) -> &KvTree {
-        match id {
-            TREE_INODES => &self.inodes,
-            TREE_DENTRIES => &self.dentries,
-            TREE_XATTRS => &self.xattrs,
-            // Spec §6.2 item 1: staged only by the layout-commit paths,
-            // and only when the tree is engaged (`block_refs_engaged`
-            // gates every staging site) — an absent tree here means a
-            // caller staged accounting onto a volume that has none.
-            super::record::TREE_BLOCK_REFS => self
-                .block_refs
-                .as_ref()
-                .expect("block-reference records staged on a volume without incompat bit 8"),
-            // PB-class files, PR 1: unreachable un-engaged — the staging
-            // seam refuses non-empty map ops loud BEFORE a tx exists
-            // (`set_layout_and_size_with_map`), unlike the block_refs
-            // silent-skip.
-            super::record::TREE_BLOCK_MAP => self
-                .block_map
-                .get()
-                .expect("block-map records staged on a volume without incompat bit 16"),
-            _ => unreachable!("kv commits stage only the §4.2 trees"),
+    /// The forest arm of the mount path (design-symmetric-metadata §5.2,
+    /// §5.3.4 — one ring, N slot trees): open tree 0 and the native slot
+    /// tree from the ledger, replay tree 0's own records FIRST (its
+    /// `slot_state` records are the routing every guest slot tree is
+    /// opened by), open every guest slot tree tree 0 names, then run the
+    /// two-phase replay of the window's slot-tree records — interior
+    /// records routed by their separator key's slot, content records by
+    /// their forest key, a slot tree minted on first touch (a slot whose
+    /// tree was minted after the last checkpoint has no root yet — its
+    /// records fold into a fresh root by key, the bit-9/16 discipline).
+    /// Returns the forest plus the §4.8 replayed-ino maxima.
+    async fn open_forest_and_replay(
+        path: &Path,
+        sb: &SuperblockV3,
+        ledger: &LedgerRecord,
+        cache: &Arc<NodeCache>,
+        seq: &Arc<AtomicU64>,
+        alloc: &Arc<ExtentAllocator>,
+        recovery: &super::journal::JournalRecovery,
+    ) -> std::result::Result<(TreeSet, u64, std::collections::HashMap<u16, u64>), KvError> {
+        use super::record::{
+            forest_slot_of_ino, split_forest_key, ForestSlot, KIND_INTERIOR, NATIVE_FOREST_SLOT,
+            TREE_CONTROL,
+        };
+        use super::slot_state::{decode_slot_state_key, slot_state_key_range, SlotState};
+
+        let root_of = |tree_id: u8| -> std::result::Result<RootPtr, KvError> {
+            ledger
+                .tree_roots
+                .iter()
+                .find(|r| r.tree_id == tree_id)
+                .map(|r| RootPtr {
+                    addr: r.node_addr,
+                    seq: r.node_seq,
+                })
+                .ok_or_else(|| {
+                    KvError::Corrupt(format!(
+                        "{}: forest volume's ledger record seq {} names no root for tree {tree_id} \
+                         (tree 0 = {TREE_CONTROL}, the native slot tree = {KIND_INTERIOR})",
+                        path.display(),
+                        ledger.seq
+                    ))
+                })
+        };
+        let control_root = root_of(TREE_CONTROL)?;
+        let native_root = root_of(KIND_INTERIOR)?;
+        let control = Arc::new(
+            KvTree::open(
+                Arc::clone(cache),
+                TREE_CONTROL,
+                control_root,
+                Arc::clone(seq),
+            )
+            .await?,
+        );
+        seq.fetch_max(control_root.seq, Ordering::AcqRel);
+        let native = Arc::new(
+            KvTree::open_slot_tree(
+                Arc::clone(cache),
+                NATIVE_FOREST_SLOT,
+                native_root,
+                Arc::clone(seq),
+            )
+            .await?,
+        );
+        seq.fetch_max(native_root.seq, Ordering::AcqRel);
+
+        // ---- Tree 0 first: its window records (level DESC, seq) — the
+        // guest roots the rest of the replay is routed through.
+        let mut control_interior: Vec<(u8, u64, &Record)> = Vec::new();
+        for entry in &recovery.entries {
+            for (tag, rec) in &entry.records {
+                let (tree_id, level) = untag(*tag);
+                if tree_id == TREE_CONTROL && level > 0 {
+                    control_interior.push((level, entry.seq, rec));
+                }
+            }
+        }
+        control_interior.sort_by(|a, b| b.0.cmp(&a.0).then(a.2.seq.cmp(&b.2.seq)));
+        for (level, entry_start, rec) in control_interior {
+            if rec.kind == RecordKind::Put {
+                if let Ok((_addr, child_seq)) = decode_interior_value(&rec.value) {
+                    seq.fetch_max(child_seq, Ordering::AcqRel);
+                }
+            }
+            control
+                .apply_replayed_interior(
+                    &rec.key,
+                    level,
+                    rec.seq,
+                    rec.kind,
+                    Bytes::copy_from_slice(&rec.value),
+                    entry_start,
+                )
+                .await?;
+        }
+        for entry in &recovery.entries {
+            for (tag, rec) in &entry.records {
+                let (tree_id, level) = untag(*tag);
+                if tree_id != TREE_CONTROL || level > 0 {
+                    continue;
+                }
+                control
+                    .apply_replayed(
+                        &rec.key,
+                        rec.seq,
+                        rec.kind,
+                        Bytes::copy_from_slice(&rec.value),
+                        entry.seq,
+                    )
+                    .await?;
+            }
+        }
+
+        // ---- Every guest slot tree tree 0 names.
+        let mut guests: Vec<(ForestSlot, Arc<KvTree>)> = Vec::new();
+        let (mut cursor, end) = slot_state_key_range();
+        loop {
+            let page = control.range(&cursor, &end, 512).await?;
+            let Some((last, _)) = page.last() else {
+                break;
+            };
+            cursor = key_successor(last);
+            for (k, v) in &page {
+                let slot = decode_slot_state_key(k)?;
+                let root = match SlotState::decode(v)? {
+                    SlotState::Unleased { root, .. } => root,
+                    SlotState::Leased { appender_id, .. } => {
+                        return Err(KvError::Corrupt(format!(
+                            "{}: tree 0 names slot {slot} as LEASED by appender {appender_id} — \
+                             slot leases are not part of this binary's forest (PR 4)",
+                            path.display()
+                        )))
+                    }
+                };
+                if slot == NATIVE_FOREST_SLOT {
+                    return Err(KvError::Corrupt(format!(
+                        "{}: tree 0 carries a slot_state record for the NATIVE slot, whose root \
+                         is the ledger's",
+                        path.display()
+                    )));
+                }
+                let tree =
+                    KvTree::open_slot_tree(Arc::clone(cache), slot, root, Arc::clone(seq)).await?;
+                seq.fetch_max(root.seq, Ordering::AcqRel);
+                guests.push((slot, Arc::new(tree)));
+            }
+            if page.len() < 512 {
+                break;
+            }
+        }
+        let forest = super::forest::SlotTrees::new(control, native, guests);
+
+        // ---- The slot trees' window: phase 1 interior records by
+        // (level DESC, seq), each routed by its separator's slot.
+        let mut interior: Vec<(u8, u64, &Record)> = Vec::new();
+        for entry in &recovery.entries {
+            for (tag, rec) in &entry.records {
+                let (tree_id, level) = untag(*tag);
+                if tree_id == KIND_INTERIOR && level > 0 {
+                    interior.push((level, entry.seq, rec));
+                }
+            }
+        }
+        interior.sort_by(|a, b| b.0.cmp(&a.0).then(a.2.seq.cmp(&b.2.seq)));
+        for (level, entry_start, rec) in interior {
+            if rec.kind == RecordKind::Put {
+                if let Ok((_addr, child_seq)) = decode_interior_value(&rec.value) {
+                    seq.fetch_max(child_seq, Ordering::AcqRel);
+                }
+            }
+            let (_slot, tree) = forest
+                .route_forest_key_or_mint(&rec.key, cache, seq, alloc)
+                .await?;
+            tree.apply_replayed_interior(
+                &rec.key,
+                level,
+                rec.seq,
+                rec.kind,
+                Bytes::copy_from_slice(&rec.value),
+                entry_start,
+            )
+            .await?;
+        }
+
+        // ---- Phase 2: content records by forest key, plus the §4.8
+        // recovery fold (DUR-8c — every ino the window MENTIONS).
+        let mut max_replayed_ino: u64 = 0;
+        let mut max_replayed_guest: std::collections::HashMap<u16, u64> =
+            std::collections::HashMap::new();
+        for entry in &recovery.entries {
+            for (tag, rec) in &entry.records {
+                let (tree_id, level) = untag(*tag);
+                if level > 0 || !super::record::is_slot_tree_kind(tree_id) {
+                    continue; // phase 1 applied it / tree 0 / allocator records
+                }
+                let (kind, legacy) = split_forest_key(&rec.key).map_err(|e| {
+                    super::META_KV_FOREST_KEY_VIOLATIONS.fetch_add(1, Ordering::Relaxed);
+                    e
+                })?;
+                if kind != tree_id {
+                    super::META_KV_FOREST_KEY_VIOLATIONS.fetch_add(1, Ordering::Relaxed);
+                    return Err(KvError::Corrupt(format!(
+                        "{}: journaled record tagged kind {tree_id} carries a key of kind {kind}",
+                        path.display()
+                    )));
+                }
+                let mentioned: Option<u64> = match kind {
+                    TREE_INODES => decode_inode_key(&legacy).ok(),
+                    TREE_DENTRIES => super::record::DentryValue::decode(&rec.value)
+                        .ok()
+                        .map(|d| d.child_ino),
+                    TREE_XATTRS => super::record::decode_xattr_key(&legacy)
+                        .ok()
+                        .map(|(ino, _, _)| ino),
+                    _ => None,
+                };
+                if let Some(ino) = mentioned {
+                    match crate::meta_backend::split_guest_local(ino) {
+                        Some((slot, raw)) => {
+                            let e = max_replayed_guest.entry(slot).or_insert(0);
+                            *e = (*e).max(raw);
+                        }
+                        None => max_replayed_ino = max_replayed_ino.max(ino),
+                    }
+                }
+                debug_assert_eq!(
+                    super::record::forest_key_slot(&rec.key)?,
+                    forest_slot_of_ino(u64::from_be_bytes(
+                        rec.key[if kind == super::record::TREE_BLOCK_REFS {
+                            17
+                        } else {
+                            0
+                        }..][..8]
+                            .try_into()
+                            .expect("forest key carries its ino")
+                    ))
+                );
+                let (_slot, tree) = forest
+                    .route_forest_key_or_mint(&rec.key, cache, seq, alloc)
+                    .await?;
+                tree.apply_replayed(
+                    &rec.key,
+                    rec.seq,
+                    rec.kind,
+                    Bytes::copy_from_slice(&rec.value),
+                    entry.seq,
+                )
+                .await?;
+            }
+        }
+
+        let block_refs =
+            sb.features_incompat & super::superblock::FEATURE_INCOMPAT_KV_BLOCK_REFCOUNTS != 0
+                && sb.unknown_ro() == 0;
+        let block_map = AtomicBool::new(sb.block_map_tree_stamped() && sb.unknown_ro() == 0);
+        Ok((
+            TreeSet::Forest {
+                forest,
+                block_refs,
+                block_map,
+            },
+            max_replayed_ino,
+            max_replayed_guest,
+        ))
+    }
+
+    /// The trees whose roots the FIXED LEDGER names: every tree on a flat
+    /// volume; on a forest volume tree 0 and the native slot tree only —
+    /// guest slot roots ride tree 0 (`slot_state` records,
+    /// [`Self::publish_forest_roots`]), never the 4 KiB ledger slot.
+    pub(super) fn ledger_root_trees(&self) -> Vec<Arc<KvTree>> {
+        match &self.trees {
+            TreeSet::Flat { .. } => self.all_trees(),
+            TreeSet::Forest { forest, .. } => {
+                vec![Arc::clone(forest.control()), Arc::clone(forest.native())]
+            }
+        }
+    }
+
+    /// **Tree-0 root publication** (design-symmetric-metadata §5.2.2 /
+    /// §5.2.4): write a `slot_state` record for every guest slot tree
+    /// whose live root moved since its last publication, as ONE
+    /// checkpoint-class journal entry applied to tree 0 in RAM — BEFORE
+    /// the checkpoint's flush pass, so the same cycle flushes tree 0's
+    /// leaf and its ledger record's tree-0 root covers the publication.
+    /// That is what discharges a slot tree's root-swap dying floor: the
+    /// swap's records stay in the window until a ledger record names a
+    /// tree-0 root that durably holds the new slot root. Replay of an
+    /// un-flushed publication re-applies the record into tree 0 (it is a
+    /// content record of tree 0); a crash before the entry landed leaves
+    /// the previous root named and every record under the new one in the
+    /// window — the FIND-VS-A argument, one tree at a time.
+    ///
+    /// A no-op on a flat volume and on a forest whose guest roots are all
+    /// current. Reserve exhaustion is returned as
+    /// [`KvError::JournalReserveExhausted`] for the caller's drain-and-
+    /// retry, exactly like an SMO's.
+    pub(super) async fn publish_forest_roots(&self) -> std::result::Result<(), KvError> {
+        let Some(forest) = self.forest() else {
+            return Ok(());
+        };
+        let pending = forest.roots_to_publish();
+        if pending.is_empty() {
+            return Ok(());
+        }
+        let tag = super::journal::tag_for(super::record::TREE_CONTROL, 0);
+        let recs: Vec<(u8, Record)> = pending
+            .iter()
+            .map(|(slot, root)| {
+                let state = super::slot_state::SlotState::Unleased {
+                    root: *root,
+                    // PR 1: one appender, one cursor — the native
+                    // watermark rides the ledger's `next_ino`; per-slot
+                    // cursors travel with the lease from PR 4.
+                    cursor: 0,
+                    g: 0,
+                    tails: Vec::new(),
+                };
+                (
+                    tag,
+                    Record::put(super::slot_state::slot_state_key(*slot), 0, state.encode()),
+                )
+            })
+            .collect();
+        let len = entry_len_for(&recs)?;
+        let Some(adm) = self.ring.try_admit(len, AdmissionClass::Checkpoint) else {
+            return Err(KvError::JournalReserveExhausted { needed: len });
+        };
+        let res = self.ring.reserve_registered(adm);
+        let mut recs = recs;
+        for (i, (_, r)) in recs.iter_mut().enumerate() {
+            r.seq = res.start + i as u64;
+        }
+        let control = Arc::clone(forest.control());
+        for (_, r) in &recs {
+            control
+                .apply_replayed(
+                    &r.key,
+                    r.seq,
+                    r.kind,
+                    Bytes::copy_from_slice(&r.value),
+                    res.start,
+                )
+                .await?;
+        }
+        if let Err(e) = self.ring.commit_entry(&res, &recs).await {
+            // RAM is authoritative and this cycle's flush pass carries the
+            // leaf; the unwritten range is the §4.4 pt 4 hole replay skips.
+            log::warn!(
+                "forest root publication entry write failed on {} (crash-equivalent hole; \
+                 the flush pass still carries tree 0's leaf): {e}",
+                self.path.display()
+            );
+        }
+        for (slot, root) in pending {
+            forest.note_published(slot, root);
+        }
+        Ok(())
+    }
+
+    /// The tree a defrag census target `(header tree id, node addr)`
+    /// belongs to: the per-kind tree on a flat volume; on a forest volume
+    /// the cached node's owner stamp (a target whose node is no longer
+    /// mapped is a stale census entry — `None`).
+    fn tree_for_census_target(&self, tree_id: u8, addr: u64) -> Option<Arc<KvTree>> {
+        match &self.trees {
+            TreeSet::Flat { .. } => self
+                .all_trees()
+                .into_iter()
+                .find(|t| t.tree_id() == tree_id),
+            TreeSet::Forest { forest, .. } => {
+                let node = self.cache.try_get(addr)?;
+                if node.tree_id() != tree_id {
+                    return None;
+                }
+                forest.tree_for_node(&node).ok()
+            }
         }
     }
 
@@ -8310,25 +9008,26 @@ impl KvMetaBackend {
         // D4.a attribution: the construction site this (about-to-be-
         // committed) tx counts against on success.
         let site = tx.site;
-        let recs: Vec<(u8, Record)> = tx
-            .staged
-            .into_iter()
-            .map(|(tree_id, key, kind, value)| {
-                (
-                    tree_id,
-                    Record {
-                        key,
-                        seq: 0, // stamped from the reservation, in-lock
-                        kind,
-                        // D1.c stage_put audit: `Bytes::to_vec` COPIED every
-                        // staged value at commit; `Vec::from(Bytes)` reclaims
-                        // the unique Vec-backed allocation instead (stage
-                        // sites build values as `Bytes::from(vec)`).
-                        value: Vec::from(value),
-                    },
-                )
-            })
-            .collect();
+        // The staged key is the shipped per-kind key; on a forest volume
+        // it takes its §5.2.1 kind byte HERE, once — every downstream step
+        // (leaf resolution, the journal entry, replay, the migration tee)
+        // sees the forest key, and the tag stays the kind.
+        let mut recs: Vec<(u8, Record)> = Vec::with_capacity(tx.staged.len());
+        for (tree_id, key, kind, value) in tx.staged {
+            recs.push((
+                tree_id,
+                Record {
+                    key: self.stage_key(tree_id, key)?,
+                    seq: 0, // stamped from the reservation, in-lock
+                    kind,
+                    // D1.c stage_put audit: `Bytes::to_vec` COPIED every
+                    // staged value at commit; `Vec::from(Bytes)` reclaims
+                    // the unique Vec-backed allocation instead (stage
+                    // sites build values as `Bytes::from(vec)`).
+                    value: Vec::from(value),
+                },
+            ));
+        }
         // Finding-A hardening: staged records must decode under their own
         // tree's typed decoder before any byte is persisted (debug tiers).
         #[cfg(debug_assertions)]
@@ -8768,7 +9467,14 @@ impl KvMetaBackend {
             'resolve: for q in &s.entries {
                 let mut entry_leaves = Vec::with_capacity(q.recs.len());
                 for (tree_id, r) in &q.recs {
-                    match self.tree_by_id(*tree_id).resolve_leaf(&r.key).await {
+                    let tree = match self.tree_for_record(*tree_id, &r.key).await {
+                        Ok(t) => t,
+                        Err(e) => {
+                            resolve_err = Some(e);
+                            break 'resolve;
+                        }
+                    };
+                    match tree.resolve_leaf(&r.key).await {
                         Ok(l) => entry_leaves.push(l),
                         Err(e) => {
                             resolve_err = Some(e);
@@ -9037,15 +9743,11 @@ impl KvMetaBackend {
             let mut threshold_crossed = false;
             for (gi, node) in lock_set.iter().enumerate() {
                 if guards[gi].overlay_bytes() >= self.cache.config().writeback_delta_bytes {
-                    let tree_id = s
-                        .entries
-                        .iter()
-                        .zip(&leaves)
-                        .flat_map(|(q, entry_leaves)| q.recs.iter().zip(entry_leaves))
-                        .find(|(_, leaf)| leaf.addr() == node.addr())
-                        .map(|((t, _), _)| *t);
-                    if let Some(tree_id) = tree_id {
-                        self.tree_by_id(tree_id).enqueue_maintenance(node.addr());
+                    // The leaf's own tree (by header id on a flat volume,
+                    // by its owner stamp on a forest one) — every leaf in
+                    // the lock set was resolved through its tree above.
+                    if let Ok(tree) = self.tree_of_node(node) {
+                        tree.enqueue_maintenance(node.addr());
                         threshold_crossed = true;
                     }
                 }
@@ -9314,7 +10016,15 @@ impl KvMetaBackend {
                         // entry against the tx's construction site.
                         super::note_commit_site(q.site);
                         if let Some(tee) = tee.as_deref() {
-                            tee.note_committed(&q.recs);
+                            // The tee's consumer re-reads by `(kind,
+                            // legacy key)`; strip the forest kind byte.
+                            match self.legacy_recs(&q.recs) {
+                                Ok(legacy) => tee.note_committed(&legacy),
+                                Err(e) => log::error!(
+                                    "migration tee: a committed record's key does not frame \
+                                     as a forest key ({e}) — the slot copy will re-snapshot"
+                                ),
+                            }
                         }
                         Ok(())
                     }
@@ -9529,8 +10239,9 @@ impl KvMetaBackend {
                     continue; // in-place append at the flush
                 }
                 let is_root = self
-                    .tree_by_id(lock_set[gi].tree_id())
-                    .is_root_addr(lock_set[gi].addr());
+                    .tree_of_node(&lock_set[gi])
+                    .map(|t| t.is_root_addr(lock_set[gi].addr()))
+                    .unwrap_or(false);
                 // A root leaf's split also mints a new root.
                 let with_root = |need: u64| if need > 1 && is_root { need + 1 } else { need };
                 // Cheap re-check on an already-promised node — never the
@@ -9736,7 +10447,15 @@ impl KvMetaBackend {
             let mut leaves: Vec<Arc<CachedNode>> = Vec::with_capacity(undo.len());
             let mut resolve_failed = false;
             for u in undo {
-                match self.tree_by_id(u.tree_id).resolve_leaf(&u.key).await {
+                let tree = match self.tree_for_record(u.tree_id, &u.key).await {
+                    Ok(t) => t,
+                    Err(e) => {
+                        log::error!("rollback: tree resolution failed for a dirty key: {e}");
+                        resolve_failed = true;
+                        break;
+                    }
+                };
+                match tree.resolve_leaf(&u.key).await {
                     Ok(l) => leaves.push(l),
                     Err(e) => {
                         log::error!("rollback: leaf resolution failed for a dirty key: {e}");
@@ -9844,7 +10563,12 @@ impl KvMetaBackend {
         for attempt in 0..COMMIT_RETRY_BUDGET {
             let mut leaves: Vec<Arc<CachedNode>> = Vec::with_capacity(recs.len());
             for (tree_id, r) in &recs {
-                leaves.push(self.tree_by_id(*tree_id).resolve_leaf(&r.key).await?);
+                leaves.push(
+                    self.tree_for_record(*tree_id, &r.key)
+                        .await?
+                        .resolve_leaf(&r.key)
+                        .await?,
+                );
             }
             let mut lock_set: Vec<Arc<CachedNode>> = leaves.clone();
             lock_set.sort_by_key(|n| n.addr());
@@ -9943,7 +10667,7 @@ impl KvMetaBackend {
         let hash = dentry_name_hash54(name.as_bytes(), self.sb.hash_seed);
         let start = dentry_key(parent, hash, 0);
         let end = dentry_key(parent, hash, u8::MAX);
-        for (k, v) in self.chain_scan(&self.dentries, &start, &end).await? {
+        for (k, v) in self.chain_scan(TREE_DENTRIES, &start, &end).await? {
             let d = DentryValue::decode(&v)?;
             if d.name == name.as_bytes() {
                 let mut key = [0u8; 16];
@@ -9962,18 +10686,18 @@ impl KvMetaBackend {
     async fn chain_occupancy(
         &self,
         tx: &KvTx,
-        tree: &KvTree,
+        chain_kind: u8,
         start: &[u8],
         end: &[u8],
     ) -> std::result::Result<Vec<u8>, KvError> {
         let mut occ: std::collections::BTreeSet<u8> = self
-            .chain_scan(tree, start, end)
+            .chain_scan(chain_kind, start, end)
             .await?
             .iter()
             .map(|(k, _)| k[k.len() - 1])
             .collect();
         for (t, k, kind, _) in &tx.staged {
-            if *t == tree.tree_id() && k[..] >= *start && k[..] <= *end {
+            if *t == chain_kind && k[..] >= *start && k[..] <= *end {
                 match kind {
                     RecordKind::Delete => {
                         occ.remove(&k[k.len() - 1]);
@@ -10005,7 +10729,7 @@ impl KvMetaBackend {
         let start = dentry_key(parent, hash, 0);
         let end = dentry_key(parent, hash, u8::MAX);
         let occupied = self
-            .chain_occupancy(tx, &self.dentries, &start, &end)
+            .chain_occupancy(tx, TREE_DENTRIES, &start, &end)
             .await?;
         match first_free_coll_seq(occupied) {
             Some(coll) => Ok(dentry_key(parent, hash, coll)),
@@ -10031,14 +10755,14 @@ impl KvMetaBackend {
         let hash = xattr_name_hash56(name.as_bytes(), self.sb.hash_seed);
         let start = xattr_key(ino, hash, 0);
         let end = xattr_key(ino, hash, u8::MAX);
-        for (k, v) in self.chain_scan(&self.xattrs, &start, &end).await? {
+        for (k, v) in self.chain_scan(TREE_XATTRS, &start, &end).await? {
             if XattrValue::decode(&v)?.name == name.as_bytes() {
                 let mut key = [0u8; 16];
                 key.copy_from_slice(&k);
                 return Ok((true, key));
             }
         }
-        let occupied = self.chain_occupancy(tx, &self.xattrs, &start, &end).await?;
+        let occupied = self.chain_occupancy(tx, TREE_XATTRS, &start, &end).await?;
         match first_free_coll_seq(occupied) {
             Some(coll) => Ok((false, xattr_key(ino, hash, coll))),
             None => {
@@ -10182,7 +10906,9 @@ impl KvMetaBackend {
         let end = xattr_key(ino, HASH56_MAX, u8::MAX);
         let mut cursor: Vec<u8> = start.to_vec();
         loop {
-            let page = self.xattrs.range(&cursor, &end, SCAN_PAGE).await?;
+            let page = self
+                .range_kind(TREE_XATTRS, &cursor, &end, SCAN_PAGE)
+                .await?;
             let Some((last, _)) = page.last() else { break };
             cursor = key_successor(last);
             bytes += page.len() as u64 * super::journal::record_frame_len(XATTR_KEY_LEN, 0);
@@ -10197,7 +10923,9 @@ impl KvMetaBackend {
         let mut cursor: Vec<u8> = start.to_vec();
         let mut keys = Vec::new();
         loop {
-            let page = self.xattrs.range(&cursor, &end, SCAN_PAGE).await?;
+            let page = self
+                .range_kind(TREE_XATTRS, &cursor, &end, SCAN_PAGE)
+                .await?;
             let Some((last, _)) = page.last() else { break };
             cursor = key_successor(last);
             keys.extend(page.into_iter().map(|(k, _)| k.to_vec()));
@@ -10213,12 +10941,16 @@ impl KvMetaBackend {
         &self,
         ops: &[super::block_refs::BlockRefOp],
     ) -> Result<Option<Vec<super::block_refs::BlockRef>>> {
-        let Some(tree) = self.block_refs.as_ref() else {
+        if !self.block_refs_engaged() {
             return Ok(None);
-        };
+        }
         let mut held = Vec::new();
         for op in ops.iter().filter(|op| !op.take) {
-            if tree.lookup(&op.reference.key()).await?.is_some() {
+            if self
+                .lookup_kind(super::record::TREE_BLOCK_REFS, &op.reference.key())
+                .await?
+                .is_some()
+            {
                 held.push(op.reference);
             }
         }
@@ -10261,7 +10993,7 @@ impl KvMetaBackend {
                     // commit holds). Silently skipped on a volume without
                     // the ledger — its ownership answers stay derived.
                     let held = self.witness_releases(ops).await?;
-                    if self.block_refs.is_some() && !ops.is_empty() {
+                    if self.block_refs_engaged() && !ops.is_empty() {
                         tx.stage_block_refs(ops);
                         releases += ops.iter().filter(|op| !op.take).count();
                     }
@@ -10353,21 +11085,20 @@ impl KvMetaBackend {
         // The witness, once, under the guard: per release op, whether its
         // record existed before THIS destroy touched anything.
         let witnessed: Option<Vec<Option<super::block_refs::BlockRef>>> =
-            match self.block_refs.as_ref() {
-                None => None,
-                Some(tree) => {
-                    let mut w = Vec::with_capacity(refs.len());
-                    for op in refs {
-                        w.push(if op.take {
-                            None
-                        } else {
-                            tree.lookup(&op.reference.key())
-                                .await?
-                                .map(|_| op.reference)
-                        });
-                    }
-                    Some(w)
+            if !self.block_refs_engaged() {
+                None
+            } else {
+                let mut w = Vec::with_capacity(refs.len());
+                for op in refs {
+                    w.push(if op.take {
+                        None
+                    } else {
+                        self.lookup_kind(super::record::TREE_BLOCK_REFS, &op.reference.key())
+                            .await?
+                            .map(|_| op.reference)
+                    });
                 }
+                Some(w)
             };
         let layout_key = {
             let probe = KvTx::empty();
@@ -10387,7 +11118,7 @@ impl KvMetaBackend {
             Inode,
         }
         let cap = super::journal::entry_payload_cap();
-        let ledger = self.block_refs.is_some();
+        let ledger = self.block_refs_engaged();
         let mut records: Vec<(Rec<'_>, u64)> = Vec::new();
         if ledger {
             records.extend(
@@ -10523,7 +11254,10 @@ impl KvMetaBackend {
     pub async fn dir_has_entries(&self, local_ino: Ino) -> Result<bool> {
         let start = dentry_key(local_ino, 0, 0);
         let end = dentry_key(local_ino, HASH54_MAX, u8::MAX);
-        Ok(!self.dentries.range(&start, &end, 1).await?.is_empty())
+        Ok(!self
+            .range_kind(TREE_DENTRIES, &start, &end, 1)
+            .await?
+            .is_empty())
     }
 
     /// Routed same-volume create — ONE whole-tx entry: EEXIST check,
@@ -11169,7 +11903,7 @@ impl KvMetaBackend {
         block_refs: &[super::block_refs::BlockRefOp],
         block_map: &[super::block_map::BlockMapOp],
     ) -> Result<()> {
-        if !block_map.is_empty() && self.block_map.get().is_none() {
+        if !block_map.is_empty() && !self.block_map_tree_engaged() {
             return Err(crate::error::SqueezefsError::InvalidOperation(format!(
                 "block-map records staged on meta volume {} which does not carry \
                  incompat bit 16 (KV_BLOCK_MAP_TREE): map records ARE the mapping, so \
@@ -11251,7 +11985,7 @@ impl KvMetaBackend {
         // Spec §6.2 item 1: the accounting rides THIS tx (no second
         // commit). Silently skipped on a volume without incompat bit 8 —
         // that volume's ownership answers stay derived state.
-        if self.block_refs.is_some() {
+        if self.block_refs_engaged() {
             tx.stage_block_refs(block_refs);
         }
         // Design §3: the map records ride THIS tx too (no second
@@ -11314,9 +12048,9 @@ impl KvMetaBackend {
         ops: &[super::block_refs::BlockRefOp],
         witness: bool,
     ) -> Result<Option<Vec<super::block_refs::BlockRef>>> {
-        let Some(tree) = self.block_refs.as_ref() else {
+        if !self.block_refs_engaged() {
             return Ok(None);
-        };
+        }
         if ops.is_empty() {
             return Ok(Some(Vec::new()));
         }
@@ -11332,7 +12066,11 @@ impl KvMetaBackend {
         let mut held = Vec::new();
         if witness {
             for op in ops.iter().filter(|op| !op.take) {
-                if tree.lookup(&op.reference.key()).await?.is_some() {
+                if self
+                    .lookup_kind(super::record::TREE_BLOCK_REFS, &op.reference.key())
+                    .await?
+                    .is_some()
+                {
                     held.push(op.reference);
                 }
             }
@@ -11787,7 +12525,7 @@ impl KvMetaBackend {
             // nowhere; freed with the released set).
             let mut ram_only_releases: Vec<super::block_refs::BlockRef> = Vec::new();
             if existing {
-                match self.xattrs.lookup(&key).await {
+                match self.lookup_kind(TREE_XATTRS, &key).await {
                     Ok(Some(cur)) => {
                         let base_ok = XattrValue::decode(&cur)
                             .map(|x| !x.value.starts_with(b"{"))
@@ -11813,7 +12551,7 @@ impl KvMetaBackend {
                         let max_chain = crate::routing::layout_delta_max_chain();
                         let (depth, head_versions) = match batch_heads.get(&op.ino) {
                             Some(&h) => h,
-                            None => match self.xattrs.delta_chain_probe(&key).await {
+                            None => match self.delta_chain_probe_kind(TREE_XATTRS, &key).await {
                                 Ok(p) => p,
                                 Err(e) => {
                                     failed.push((op.done, e.into()));
@@ -11966,8 +12704,7 @@ impl KvMetaBackend {
                             // against the ACCUMULATED view (the memo's
                             // map, pre-apply).
                             let (mut composed_refs, composed_ram_only) = match self
-                                .block_refs
-                                .is_some()
+                                .block_refs_engaged()
                                 .then(|| {
                                     state.layout.block_map.as_ref().and_then(|memo_map| {
                                         Self::recompute_refs_against_map(
@@ -12239,7 +12976,7 @@ impl KvMetaBackend {
                         // re-running here would clobber it back to the
                         // caller's frame (`recompute_chained_refs`
                         // returns `None` on an indirect head).
-                        if op.chain && self.block_refs.is_some() && !head_indirect {
+                        if op.chain && self.block_refs_engaged() && !head_indirect {
                             if let Ok(d) = crate::layout_wire::LayoutDelta::decode(&op.delta_wire) {
                                 if let Some(frame) = Self::recompute_chained_refs(
                                     &cur,
@@ -12316,7 +13053,7 @@ impl KvMetaBackend {
             // its inode read / slot probe above `continue`d before this
             // point, so no orphan accounting can be staged for a save
             // that never happens.
-            if self.block_refs.is_some() {
+            if self.block_refs_engaged() {
                 tx.stage_block_refs(&op.block_refs);
             }
             // Finding 36: the recompute verdict travels with the member's
@@ -12662,7 +13399,7 @@ impl KvMetaBackend {
         // the displaced head was INLINE, so nothing is freed.
         let mut crossing_fresh: Option<String> = None;
         if existing {
-            if let Some(cur) = self.xattrs.lookup(&key).await? {
+            if let Some(cur) = self.lookup_kind(TREE_XATTRS, &key).await? {
                 let base_ok = XattrValue::decode(&cur)
                     .map(|x| !x.value.starts_with(b"{"))
                     .unwrap_or(false);
@@ -12683,7 +13420,7 @@ impl KvMetaBackend {
                 // not by `SQUEEZEFS_LAYOUT_DELTA_MAX_CHAIN`. One extra
                 // leaf resolve on the publish path, no record decodes.
                 let max_chain = crate::routing::layout_delta_max_chain();
-                let (depth, head_versions) = self.xattrs.delta_chain_probe(&key).await?;
+                let (depth, head_versions) = self.delta_chain_probe_kind(TREE_XATTRS, &key).await?;
                 if base_ok && max_chain > 0 && depth < max_chain {
                     use_delta = self.layout_deltas_ready().await;
                 }
@@ -12740,8 +13477,7 @@ impl KvMetaBackend {
                     // FULL head (the map-entry half; the blob custody
                     // transfer joins once the fresh key exists).
                     let (mut composed_refs, composed_ram_only) = match self
-                        .block_refs
-                        .is_some()
+                        .block_refs_engaged()
                         .then(|| {
                             Self::recompute_refs_against_map(
                                 &full_map,
@@ -12840,7 +13576,7 @@ impl KvMetaBackend {
                 // accounting (recomputed against the FULL rehydrated
                 // head), and this call would clobber it back to `None`
                 // (`decode_base_layout` refuses indirect heads).
-                if chain && self.block_refs.is_some() && !head_indirect {
+                if chain && self.block_refs_engaged() && !head_indirect {
                     if let Some(frame) =
                         Self::recompute_chained_refs(&cur, &delta.entries, refs_owner, block_refs)
                     {
@@ -12895,7 +13631,7 @@ impl KvMetaBackend {
         }
         tx.stage_put(TREE_INODES, inode_key(ino), v.encode());
         // Spec §6.2 item 1: accounting rides THIS tx (no second commit).
-        if self.block_refs.is_some() {
+        if self.block_refs_engaged() {
             tx.stage_block_refs(refs_override.as_deref().unwrap_or(block_refs));
         }
         tx.hold_guards(guards);
@@ -12938,7 +13674,7 @@ impl KvMetaBackend {
         if !existing {
             return Ok(0);
         }
-        let (_depth, head) = self.xattrs.delta_chain_probe(&key).await?;
+        let (_depth, head) = self.delta_chain_probe_kind(TREE_XATTRS, &key).await?;
         Ok(head.map(|(_, v)| v).unwrap_or(0))
     }
 
@@ -13307,7 +14043,9 @@ impl KvMetaBackend {
         let mut cursor: Vec<u8> = xattr_key(crossvol_tx::XV_INTENT_INO, 0, 0).to_vec();
         let mut out = Vec::new();
         loop {
-            let page = self.xattrs.range(&cursor, &end, SCAN_PAGE).await?;
+            let page = self
+                .range_kind(TREE_XATTRS, &cursor, &end, SCAN_PAGE)
+                .await?;
             let Some((last_key, _)) = page.last() else {
                 break;
             };

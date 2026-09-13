@@ -235,7 +235,7 @@ impl RevalidationPoller {
 /// partitioned volume's non-authority records carry no roots at all).
 pub fn revalidate_trees(
     cache: &Arc<NodeCache>,
-    trees: &[&KvTree],
+    trees: &[Arc<KvTree>],
     epoch: &RootEpoch,
 ) -> RevalidateOutcome {
     if epoch.ledger_seq > cache.revalidation_epoch() {

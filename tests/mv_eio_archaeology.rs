@@ -22,7 +22,7 @@ async fn walk_user_meta_key_forms() {
             .await
             .unwrap_or_else(|e| panic!("open {p}: {e:?}"));
         use squeezefs::meta_backend::kv::record::{decode_inode_key, inode_key, InodeValue};
-        let inodes = kv.trees()[0];
+        let inodes = kv.flat_trees()[0].clone();
         let mut cursor: Vec<u8> = inode_key(1).to_vec();
         let end = inode_key(u64::MAX - 1);
         loop {

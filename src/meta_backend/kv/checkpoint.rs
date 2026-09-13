@@ -233,6 +233,7 @@
 
 use super::backend::KvMetaBackend;
 use super::journal::AppendPartition;
+use super::node_cache::CachedNode;
 use super::tree::SmoContext;
 use super::KvError;
 use std::path::Path;
@@ -1304,7 +1305,8 @@ async fn maintenance_pass(
     let mut smo = be.smo.lock().await;
     for tree in be.all_trees() {
         loop {
-            match tree.run_maintenance_until(&mut smo, deadline).await {
+            let r = tree.run_maintenance_until(&mut smo, deadline).await;
+            match r {
                 Ok(_) => break,
                 Err(KvError::JournalReserveExhausted { .. } | KvError::PendingFreeFull { .. }) => {
                     be.checkpoint_cycle(&mut smo, true).await?;
@@ -1494,25 +1496,39 @@ impl KvMetaBackend {
         let pending_before = self.allocator().pending_count();
         let tail_before = self.last_ledger_tail.load(Ordering::Acquire);
 
+        // ---- Forest: publish every moved guest slot root into tree 0
+        // FIRST, so the flush pass below carries tree 0's leaf and this
+        // cycle's ledger record covers the publication (the slot-tree
+        // root-swap floor's covering record — `publish_forest_roots`).
+        // Reserve exhaustion defers to the next cycle exactly like an
+        // SMO's: the dying floor keeps the tail clamped meanwhile.
+        match self.publish_forest_roots().await {
+            Ok(()) => {}
+            Err(KvError::JournalReserveExhausted { needed }) => {
+                log::debug!(
+                    "checkpoint: SMO reserve exhausted ({needed} B) publishing forest roots; \
+                     deferred to the next cycle"
+                );
+            }
+            Err(e) => return Err(e),
+        }
+
         // ---- Flush pass: every dirty node once, snapshot-then-write.
         // SMO-reserve exhaustion skips the node (floor restored — the
         // tail keeps respecting it) and retries next cycle with the
         // budget this cycle frees.
-        let mut dirty: Vec<(u8, u64)> = Vec::new();
+        let mut dirty: Vec<Arc<CachedNode>> = Vec::new();
         self.node_cache().for_each_node(|n| {
             if n.dirty_floor() != u64::MAX && !n.state().is_superseded() {
-                dirty.push((n.tree_id(), n.addr()));
+                dirty.push(Arc::clone(n));
             }
         });
         // Nodes this pass could not flush because the allocator answered
         // `NoSpace` — the wedged-tail audit's class discriminator below.
         let mut deferred_for_space = 0u64;
-        for (tree_id, addr) in dirty {
-            let tree = self
-                .all_trees()
-                .into_iter()
-                .find(|t| t.tree_id() == tree_id)
-                .expect("dirty node belongs to a mounted tree");
+        for node in dirty {
+            let addr = node.addr();
+            let tree = self.tree_of_node(&node)?;
             match tree.checkpoint_flush_node(smo, addr).await {
                 Ok(()) => {}
                 Err(KvError::JournalReserveExhausted { needed }) => {
@@ -1615,9 +1631,11 @@ impl KvMetaBackend {
         // (the ledger payload's `n_roots` has been variable-length since
         // PR K3, with ~19 roots of headroom inside the 4 KiB slot, so
         // this is a payload the pre-item-1 DECODER still parses — old
-        // binaries refuse the volume at the superblock gate instead).
+        // binaries refuse the volume at the superblock gate instead). On
+        // a forest volume: tree 0 and the native slot tree only — guest
+        // slot roots were published into tree 0 above.
         let tree_roots: Vec<TreeRoot> = self
-            .all_trees()
+            .ledger_root_trees()
             .into_iter()
             .map(|t| TreeRoot {
                 tree_id: t.tree_id(),
@@ -1640,7 +1658,7 @@ impl KvMetaBackend {
             // (Every tree shares ONE mint counter — `KvTree::open`/`create`
             // clone the same `Arc<AtomicU64>` — so any tree's snapshot is
             // the volume's watermark.)
-            node_seq_watermark: self.trees()[0].node_seq_snapshot(),
+            node_seq_watermark: self.all_trees()[0].node_seq_snapshot(),
             // PR VL5a (§5.5.1a): the membership stamp rides EVERY ledger
             // record of a slot-mapped volume (seeded from the mounted
             // record at open; installed by format/repair-set). Legacy

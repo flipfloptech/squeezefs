@@ -959,7 +959,7 @@ async fn test_rollback_race_seq_conditional() {
         // `be` is still live-mounted, and the single-writer guard now
         // refuses a second write mount of one volume — which is also why
         // the old comment called this remount "read-only-in-spirit".)
-        let d_live = squeezefs::meta_backend::kv::builder::digest_walk(&be.trees())
+        let d_live = squeezefs::meta_backend::kv::builder::digest_backend(&be)
             .await
             .unwrap();
         let replayed = KvMetaBackend::open_probe(&vol).await.unwrap();

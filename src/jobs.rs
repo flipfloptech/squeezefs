@@ -894,15 +894,22 @@ pub(crate) async fn census_for(
     let mut blob_blocks = 0u64;
 
     for (vol_idx, kv) in meta.volumes.iter().enumerate() {
-        let inodes = kv.trees()[0];
         let mut cursor: Vec<u8> = inode_key(1).to_vec();
         let end = inode_key(u64::MAX - 1);
         loop {
-            let page = inodes.range(&cursor, &end, 512).await.map_err(|e| {
-                crate::error::SqueezefsError::InvalidOperation(format!(
-                    "evacuation census inode walk failed: {e}"
-                ))
-            })?;
+            let page = kv
+                .range_kind(
+                    crate::meta_backend::kv::record::TREE_INODES,
+                    &cursor,
+                    &end,
+                    512,
+                )
+                .await
+                .map_err(|e| {
+                    crate::error::SqueezefsError::InvalidOperation(format!(
+                        "evacuation census inode walk failed: {e}"
+                    ))
+                })?;
             let Some((last_key, _)) = page.last() else {
                 break;
             };

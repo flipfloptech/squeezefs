@@ -1818,7 +1818,10 @@ async fn merge_candidates_gauge_is_exact_mid_wave_and_at_quiescence() {
         a.gauge
     );
     let candidates0 = a.gauge;
-    let height0 = be.trees()[2].root_level().await.expect("xattr root level");
+    let height0 = be.flat_trees()[2]
+        .root_level()
+        .await
+        .expect("xattr root level");
 
     // Release the claimant: the recovery wave runs to quiescence; the gauge
     // from the LAST lap must equal the census under its tail, and the D4

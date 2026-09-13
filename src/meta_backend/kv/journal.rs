@@ -135,7 +135,9 @@
 //! corruption alert (§10) instead of a tear census.
 
 use super::journal_core::{AdmissionClass, CoreGeometry, JournalCore, Reservation};
-use super::record::{Record, RecordRef, TREE_ALLOC_RESERVED, TREE_ID_MAX, TREE_INODES};
+use super::record::{
+    Record, RecordRef, KIND_INTERIOR, TREE_ALLOC_RESERVED, TREE_ID_MAX, TREE_INODES,
+};
 use super::KvError;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -350,13 +352,28 @@ pub fn encode_entry_payload(records: &[(u8, Record)]) -> Vec<u8> {
 /// unchanged), > 0 for the SMO task's journaled interior-pointer records
 /// (§4.6: "interior mutations are journaled records"). Replay routes a
 /// level-`L` record to the level-`L` node covering its key.
+///
+/// Two conventions belong to the slot-tree forest (incompat bit 17,
+/// design-symmetric-metadata §5.2.1): an INTERIOR record of a slot tree
+/// carries [`KIND_INTERIOR`] (0) — legal **iff** `level ≥ 1`, since the
+/// separator key's slot routes it and no kind applies to a mixed tree's
+/// interior — and the control tree is tagged by its own id
+/// ([`super::record::TREE_CONTROL`]). Content records of a slot tree keep
+/// their kind as the tag, byte-identical to the shipped per-kind tags.
 pub fn tag_for(tree_id: u8, level: u8) -> u8 {
-    debug_assert!((TREE_INODES..=TREE_ID_MAX).contains(&tree_id));
+    debug_assert!(tag_tree_id_admissible(tree_id, level));
     debug_assert!(
         level <= 0x0F,
         "interior level {level} exceeds the tag nibble"
     );
     tree_id | (level << 4)
+}
+
+/// Whether `(tree_id, level)` is a tag any writer produces: a tree id in
+/// `TREE_INODES..=TREE_ID_MAX` at any level, or [`KIND_INTERIOR`] at an
+/// interior level only.
+pub fn tag_tree_id_admissible(tree_id: u8, level: u8) -> bool {
+    (TREE_INODES..=TREE_ID_MAX).contains(&tree_id) || (tree_id == KIND_INTERIOR && level >= 1)
 }
 
 /// Split a record tag byte into `(tree_id, level)` (see [`tag_for`]).
@@ -375,10 +392,11 @@ pub fn decode_entry_payload(buf: &[u8]) -> Result<Vec<(u8, Record)>, KvError> {
     while pos < buf.len() {
         let tag = buf[pos];
         pos += 1;
-        let (tree_id, _level) = untag(tag);
-        if !(TREE_INODES..=TREE_ID_MAX).contains(&tree_id) {
+        let (tree_id, level) = untag(tag);
+        if !tag_tree_id_admissible(tree_id, level) {
             return Err(KvError::Corrupt(format!(
-                "journal record carries tree id {tree_id} outside the §4.2 table"
+                "journal record carries tree id {tree_id} at level {level} — outside the \
+                 §4.2 table (kind 0 is legal only at interior levels)"
             )));
         }
         let (r, used) = RecordRef::decode(&buf[pos..])?;

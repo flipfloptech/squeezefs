@@ -73,7 +73,7 @@ async fn writer() -> (NamedTempFile, Arc<KvMetaBackend>) {
 /// A hand-built reader over the same device: its own node cache and its
 /// own `KvTree` handles, opened from the newest ledger record. This is the
 /// surface the RO-mount wiring consumes.
-async fn reader(path: &std::path::Path) -> (Arc<NodeCache>, Vec<KvTree>, RootEpoch) {
+async fn reader(path: &std::path::Path) -> (Arc<NodeCache>, Vec<Arc<KvTree>>, RootEpoch) {
     let sb = match classify_volume(path).await.expect("classify") {
         VolumeFormat::V3(sb) => sb,
         other => panic!("expected a v3 volume, got {other:?}"),
@@ -101,7 +101,7 @@ async fn reader(path: &std::path::Path) -> (Arc<NodeCache>, Vec<KvTree>, RootEpo
         squeezefs::meta_backend::kv::record::TREE_XATTRS,
     ] {
         let root = epoch.root_of(tree_id).expect("every tree names a root");
-        trees.push(
+        trees.push(Arc::new(
             KvTree::open(
                 cache.clone(),
                 tree_id,
@@ -113,7 +113,7 @@ async fn reader(path: &std::path::Path) -> (Arc<NodeCache>, Vec<KvTree>, RootEpo
             )
             .await
             .expect("open reader tree"),
-        );
+        ));
     }
     (cache, trees, epoch)
 }
@@ -132,7 +132,7 @@ async fn poll_epoch(path: &std::path::Path) -> RootEpoch {
     RootEpoch::from_ledger(&rec)
 }
 
-fn tree_of(trees: &[KvTree], tree_id: u8) -> &KvTree {
+fn tree_of(trees: &[Arc<KvTree>], tree_id: u8) -> &KvTree {
     trees
         .iter()
         .find(|t| t.tree_id() == tree_id)
@@ -262,7 +262,7 @@ async fn an_unchanged_ledger_poll_is_inert() {
 
     for _ in 0..2 {
         let fresh = poll_epoch(&path).await;
-        let out = revalidate_trees(&cache, &trees.iter().collect::<Vec<_>>(), &fresh);
+        let out = revalidate_trees(&cache, &trees, &fresh);
         assert!(!out.advanced, "the same record must not advance the epoch");
         assert_eq!(out.dropped, 0);
         assert_eq!(out.bytes_credited, 0);
@@ -287,7 +287,6 @@ async fn an_advanced_epoch_drops_every_stale_node_including_pinned_roots() {
     be.create(1, "a", 0o644, 0, 0).await.expect("create");
     be.checkpoint_now().await.expect("checkpoint");
     let (cache, trees, _) = reader(&path).await;
-    let refs: Vec<&KvTree> = trees.iter().collect();
     // Touch every tree so all three roots are mapped and pinned.
     for t in &trees {
         t.lookup(&inode_key(1)).await.expect("lookup");
@@ -301,7 +300,7 @@ async fn an_advanced_epoch_drops_every_stale_node_including_pinned_roots() {
     be.checkpoint_now().await.expect("checkpoint");
 
     let fresh = poll_epoch(&path).await;
-    let out = revalidate_trees(&cache, &refs, &fresh);
+    let out = revalidate_trees(&cache, &trees, &fresh);
     assert!(out.advanced, "a newer ledger record advances the epoch");
     assert!(out.dropped >= mapped.len() as u64, "every node dropped");
     assert_eq!(
@@ -336,7 +335,6 @@ async fn a_root_named_identically_by_the_new_record_is_still_dropped() {
     be.create(1, "a", 0o644, 0, 0).await.expect("create");
     be.checkpoint_now().await.expect("checkpoint");
     let (cache, trees, epoch0) = reader(&path).await;
-    let refs: Vec<&KvTree> = trees.iter().collect();
     let inodes = tree_of(&trees, TREE_INODES);
     inodes.lookup(&inode_key(1)).await.expect("lookup");
     let root0 = inodes.root();
@@ -353,7 +351,7 @@ async fn a_root_named_identically_by_the_new_record_is_still_dropped() {
     );
     assert!(fresh.ledger_seq > epoch0.ledger_seq, "the record advanced");
 
-    let out = revalidate_trees(&cache, &refs, &fresh);
+    let out = revalidate_trees(&cache, &trees, &fresh);
     assert!(out.advanced);
     assert!(
         !cache.contains(root0.addr),
@@ -377,7 +375,6 @@ async fn the_reader_lags_by_exactly_one_polled_checkpoint() {
         .ino;
     be.checkpoint_now().await.expect("checkpoint");
     let (cache, trees, _) = reader(&path).await;
-    let refs: Vec<&KvTree> = trees.iter().collect();
     let inodes = tree_of(&trees, TREE_INODES);
     assert!(
         inodes
@@ -405,7 +402,7 @@ async fn the_reader_lags_by_exactly_one_polled_checkpoint() {
     );
 
     let fresh = poll_epoch(&path).await;
-    assert!(revalidate_trees(&cache, &refs, &fresh).advanced);
+    assert!(revalidate_trees(&cache, &trees, &fresh).advanced);
     assert!(
         inodes
             .lookup(&inode_key(after))

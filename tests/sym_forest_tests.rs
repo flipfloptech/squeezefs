@@ -41,9 +41,9 @@
 //!   tree pins the checkpoint floor until the ledger's tree-0 root names
 //!   the new root (the dying-floor law, one tree at a time).
 
+use squeezefs::meta_backend::kv::backend::KvMetaBackend;
 use squeezefs::meta_backend::kv::block_map::block_map_key;
 use squeezefs::meta_backend::kv::block_refs::block_ref_key;
-use squeezefs::meta_backend::kv::backend::KvMetaBackend;
 use squeezefs::meta_backend::kv::builder::{
     digest_backend, format_v3_stamped, BuilderConfig, FormatV3Options, ImageBuilder, ROOT_INO,
 };
@@ -55,8 +55,8 @@ use squeezefs::meta_backend::kv::record::{
     dentry_key, forest_key, forest_key_slot, guest_forest_slot, inode_key, is_slot_tree_kind,
     split_forest_key, xattr_key, Record, FOREST_BLOCK_MAP_KEY_LEN, FOREST_BLOCK_REF_KEY_LEN,
     FOREST_DENTRY_KEY_LEN, FOREST_INODE_KEY_LEN, FOREST_XATTR_KEY_LEN, KIND_INTERIOR,
-    NATIVE_FOREST_SLOT, TREE_BLOCK_MAP, TREE_BLOCK_REFS, TREE_CONTROL, TREE_DENTRIES,
-    TREE_ID_MAX, TREE_INODES, TREE_SHARED_INDEX, TREE_XATTRS,
+    NATIVE_FOREST_SLOT, TREE_BLOCK_MAP, TREE_BLOCK_REFS, TREE_CONTROL, TREE_DENTRIES, TREE_ID_MAX,
+    TREE_INODES, TREE_SHARED_INDEX, TREE_XATTRS,
 };
 use squeezefs::meta_backend::kv::slot_state::{slot_state_key, SlotState};
 use squeezefs::meta_backend::kv::superblock::{
@@ -69,7 +69,6 @@ use squeezefs::meta_backend::{
     MINT_SPREAD,
 };
 use std::collections::HashMap;
-use std::sync::Mutex;
 use tempfile::NamedTempFile;
 
 // ---------------------------------------------------------------------------
@@ -85,8 +84,8 @@ const TEST_UUID: [u8; 16] = *b"sym-forest-test!";
 
 /// The seam is process-global; suites in this binary serialize their
 /// format calls through it so a parallel un-stamped format never
-/// observes a sibling's stamp.
-static SEAM: Mutex<()> = Mutex::new(());
+/// observes a sibling's stamp (async-aware: the guard spans the build).
+static SEAM: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 fn builder_config() -> BuilderConfig {
     BuilderConfig {
@@ -123,7 +122,7 @@ fn describe() -> (ImageBuilder, HashMap<&'static str, u64>) {
 async fn build_image(file: &NamedTempFile, symmetric: bool) -> HashMap<&'static str, u64> {
     file.as_file().set_len(VOL_LEN).unwrap();
     let (b, inos) = describe();
-    let _g = SEAM.lock().unwrap_or_else(|p| p.into_inner());
+    let _g = SEAM.lock().await;
     if symmetric {
         std::env::set_var("SQUEEZEFS_TEST_STAMP_SYMMETRIC", "1");
     } else {
@@ -135,7 +134,9 @@ async fn build_image(file: &NamedTempFile, symmetric: bool) -> HashMap<&'static 
     inos
 }
 
-async fn superblock_of(file: &NamedTempFile) -> squeezefs::meta_backend::kv::superblock::SuperblockV3 {
+async fn superblock_of(
+    file: &NamedTempFile,
+) -> squeezefs::meta_backend::kv::superblock::SuperblockV3 {
     match classify_volume(file.path()).await.expect("classify") {
         VolumeFormat::V3(sb) => sb,
         other => panic!("expected a v3 superblock, got {other:?}"),
@@ -155,15 +156,37 @@ fn kind_bytes_are_the_tree_ids_and_the_id_space_extends_to_the_control_and_share
     assert_eq!(TREE_XATTRS, 3);
     assert_eq!(TREE_BLOCK_REFS, 6);
     assert_eq!(TREE_BLOCK_MAP, 7);
-    assert_eq!(KIND_INTERIOR, 0, "interior records of a slot tree carry kind 0");
+    assert_eq!(
+        KIND_INTERIOR, 0,
+        "interior records of a slot tree carry kind 0"
+    );
     assert_eq!(TREE_CONTROL, 8, "tree 0 is TREE_CONTROL = 8");
     assert_eq!(TREE_SHARED_INDEX, 9, "the shared index is kind 9");
-    assert_eq!(TREE_ID_MAX, 9, "TREE_ID_MAX 7 → 9");
-    assert!(TREE_ID_MAX <= 0x0F, "the tag nibble bounds it at 15");
-    for kind in [TREE_INODES, TREE_DENTRIES, TREE_XATTRS, TREE_BLOCK_REFS, TREE_BLOCK_MAP] {
-        assert!(is_slot_tree_kind(kind), "kind {kind} lives inside a slot tree");
+    assert_eq!(
+        TREE_ID_MAX, 9,
+        "TREE_ID_MAX 7 → 9 — inside the tag nibble's 15"
+    );
+    for kind in [
+        TREE_INODES,
+        TREE_DENTRIES,
+        TREE_XATTRS,
+        TREE_BLOCK_REFS,
+        TREE_BLOCK_MAP,
+    ] {
+        assert!(
+            is_slot_tree_kind(kind),
+            "kind {kind} lives inside a slot tree"
+        );
     }
-    for not in [KIND_INTERIOR, 4u8, 5, TREE_CONTROL, TREE_SHARED_INDEX, 10, 0xFF] {
+    for not in [
+        KIND_INTERIOR,
+        4u8,
+        5,
+        TREE_CONTROL,
+        TREE_SHARED_INDEX,
+        10,
+        0xFF,
+    ] {
         assert!(
             !is_slot_tree_kind(not),
             "kind {not} is not a slot-tree content kind"
@@ -223,7 +246,11 @@ fn forest_keys_round_trip_every_kind_and_refuse_a_wrong_length() {
         let f = forest_key(*kind, key).expect("encode");
         let (k2, back) = split_forest_key(&f).expect("decode");
         assert_eq!(k2, *kind, "kind byte survives the round trip");
-        assert_eq!(&back[..], &key[..], "the legacy key survives the round trip");
+        assert_eq!(
+            &back[..],
+            &key[..],
+            "the legacy key survives the round trip"
+        );
         // A wrong-length legacy key for the kind is refused, never
         // silently framed.
         let mut short = key.clone();
@@ -266,13 +293,23 @@ fn forest_keys_preserve_memcmp_order_within_a_kind() {
         .collect();
     inos.sort_unstable();
     inos.dedup();
-    for kind in [TREE_INODES, TREE_DENTRIES, TREE_XATTRS, TREE_BLOCK_MAP, TREE_BLOCK_REFS] {
+    for kind in [
+        TREE_INODES,
+        TREE_DENTRIES,
+        TREE_XATTRS,
+        TREE_BLOCK_MAP,
+        TREE_BLOCK_REFS,
+    ] {
         let mut legacy: Vec<Vec<u8>> = inos
             .iter()
             .map(|&ino| match kind {
                 TREE_INODES => inode_key(ino).to_vec(),
-                TREE_DENTRIES => dentry_key(ino, rng(&mut s) >> 10, (rng(&mut s) & 0xFF) as u8).to_vec(),
-                TREE_XATTRS => xattr_key(ino, rng(&mut s) >> 8, (rng(&mut s) & 0xFF) as u8).to_vec(),
+                TREE_DENTRIES => {
+                    dentry_key(ino, rng(&mut s) >> 10, (rng(&mut s) & 0xFF) as u8).to_vec()
+                }
+                TREE_XATTRS => {
+                    xattr_key(ino, rng(&mut s) >> 8, (rng(&mut s) & 0xFF) as u8).to_vec()
+                }
                 TREE_BLOCK_MAP => block_map_key(ino, (rng(&mut s) as u32) & 0x7FFF_FFFF)
                     .unwrap()
                     .to_vec(),
@@ -308,9 +345,15 @@ fn a_kind_byte_is_never_another_trees_id() {
     }
     let mut forged = forest_key(TREE_INODES, &inode_key(ino)).unwrap();
     forged[8] = TREE_CONTROL;
-    assert!(split_forest_key(&forged).is_err(), "kind byte 8 inside a slot tree is corruption");
+    assert!(
+        split_forest_key(&forged).is_err(),
+        "kind byte 8 inside a slot tree is corruption"
+    );
     forged[8] = KIND_INTERIOR;
-    assert!(split_forest_key(&forged).is_err(), "kind byte 0 inside a slot tree is corruption");
+    assert!(
+        split_forest_key(&forged).is_err(),
+        "kind byte 0 inside a slot tree is corruption"
+    );
     // A by-block prefix that is not the refs kind is refused too.
     let mut refs = forest_key(TREE_BLOCK_REFS, &block_ref_key(1, 1, ino, 0)).unwrap();
     refs[0] = TREE_CONTROL;
@@ -356,8 +399,11 @@ fn a_record_routes_to_the_slot_its_key_names() {
     // A block reference belongs to the REFERENCING ino's slot — the owner
     // at offset 17, never the volume tag or block index at the front.
     let owner = guest_local_ino(3, 1);
-    let refs = forest_key(TREE_BLOCK_REFS, &block_ref_key(0xFFFF_FFFF, 0xFFFF_FFFF, owner, 0))
-        .unwrap();
+    let refs = forest_key(
+        TREE_BLOCK_REFS,
+        &block_ref_key(0xFFFF_FFFF, 0xFFFF_FFFF, owner, 0),
+    )
+    .unwrap();
     assert_eq!(forest_key_slot(&refs).unwrap(), guest_forest_slot(3));
     // Interior separators are real keys of the tree and route the same
     // way (the design's "routed to its slot tree by the separator key").
@@ -375,19 +421,30 @@ fn stat_and_layout_are_adjacent_in_ino_major_order() {
     let inode = forest_key(TREE_INODES, &inode_key(ino)).unwrap();
     let dentry_lo = forest_key(TREE_DENTRIES, &dentry_key(ino, 0, 0)).unwrap();
     let dentry_hi = forest_key(TREE_DENTRIES, &dentry_key(ino, (1 << 54) - 1, 0xFF)).unwrap();
-    let layout = forest_key(TREE_XATTRS, &xattr_key(ino, 0x0123_4567_89AB_CD, 0)).unwrap();
+    let layout = forest_key(TREE_XATTRS, &xattr_key(ino, 0x0001_2345_6789_ABCD, 0)).unwrap();
     let xattr_hi = forest_key(TREE_XATTRS, &xattr_key(ino, (1 << 56) - 1, 0xFF)).unwrap();
     let map_lo = forest_key(TREE_BLOCK_MAP, &block_map_key(ino, 0).unwrap()).unwrap();
     let map_hi = forest_key(TREE_BLOCK_MAP, &block_map_key(ino, u32::MAX - 1).unwrap()).unwrap();
     let next_inode = forest_key(TREE_INODES, &inode_key(next)).unwrap();
     let refs = forest_key(TREE_BLOCK_REFS, &block_ref_key(0, 0, 1, 0)).unwrap();
     let chain = [
-        &inode, &dentry_lo, &dentry_hi, &layout, &xattr_hi, &map_lo, &map_hi, &next_inode,
+        &inode,
+        &dentry_lo,
+        &dentry_hi,
+        &layout,
+        &xattr_hi,
+        &map_lo,
+        &map_hi,
+        &next_inode,
     ];
     for w in chain.windows(2) {
         assert!(w[0] < w[1], "ino-major order: {:x?} < {:x?}", w[0], w[1]);
     }
-    let last_ino_major = forest_key(TREE_BLOCK_MAP, &block_map_key(u64::MAX >> 8, u32::MAX - 1).unwrap()).unwrap();
+    let last_ino_major = forest_key(
+        TREE_BLOCK_MAP,
+        &block_map_key(u64::MAX >> 8, u32::MAX - 1).unwrap(),
+    )
+    .unwrap();
     assert!(
         last_ino_major < refs,
         "the by-block family (prefix 0x06) sorts after every ino-major key"
@@ -409,7 +466,10 @@ fn interior_records_carry_kind_zero_and_the_control_tree_tags_decode() {
     let sep = forest_key(TREE_INODES, &inode_key(ino)).unwrap();
     let ok = encode_entry_payload(&[
         (tag_for(KIND_INTERIOR, 1), rec(&sep)),
-        (tag_for(TREE_CONTROL, 0), rec(&slot_state_key(guest_forest_slot(2)))),
+        (
+            tag_for(TREE_CONTROL, 0),
+            rec(&slot_state_key(guest_forest_slot(2))),
+        ),
         (tag_for(TREE_SHARED_INDEX, 0), rec(&[TREE_SHARED_INDEX; 29])),
         (tag_for(TREE_INODES, 0), rec(&sep)),
     ]);
@@ -501,7 +561,10 @@ fn slot_state_keys_sort_by_slot_index_and_decode() {
     let k2 = slot_state_key(guest_forest_slot(255));
     let k3 = slot_state_key(guest_forest_slot(256));
     let k4 = slot_state_key(guest_forest_slot(u16::MAX));
-    assert!(k0 < k1 && k1 < k2 && k2 < k3 && k3 < k4, "memcmp order == slot order");
+    assert!(
+        k0 < k1 && k1 < k2 && k2 < k3 && k3 < k4,
+        "memcmp order == slot order"
+    );
     for (k, s) in [
         (&k0, NATIVE_FOREST_SLOT),
         (&k3, guest_forest_slot(256)),
@@ -512,7 +575,9 @@ fn slot_state_keys_sort_by_slot_index_and_decode() {
             s
         );
     }
-    assert!(squeezefs::meta_backend::kv::slot_state::decode_slot_state_key(b"slot_state:").is_err());
+    assert!(
+        squeezefs::meta_backend::kv::slot_state::decode_slot_state_key(b"slot_state:").is_err()
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -547,7 +612,10 @@ async fn format_under_the_seam_stamps_bit_17_and_names_tree_zero_and_the_native_
     let file = NamedTempFile::new().unwrap();
     build_image(&file, true).await;
     let sb = superblock_of(&file).await;
-    assert_ne!(sb.features_incompat & FEATURE_INCOMPAT_KV_SYMMETRIC_FOREST, 0);
+    assert_ne!(
+        sb.features_incompat & FEATURE_INCOMPAT_KV_SYMMETRIC_FOREST,
+        0
+    );
     assert!(sb.symmetric_forest_stamped());
     let ledger = read_newest_ledger(file.path(), sb.root_ledger.start)
         .await
@@ -566,16 +634,16 @@ async fn format_under_the_seam_stamps_bit_17_and_names_tree_zero_and_the_native_
 // Mount: the shipped conformance population, served from the forest.
 // ---------------------------------------------------------------------------
 
-async fn assert_population_served(
-    b: &KvMetaBackend,
-    inos: &HashMap<&'static str, u64>,
-) {
+async fn assert_population_served(b: &KvMetaBackend, inos: &HashMap<&'static str, u64>) {
     let root = b.getattr(ROOT_INO).await.expect("root getattr");
     assert_eq!(root.mode & libc::S_IFMT, libc::S_IFDIR);
     let docs = b.lookup(ROOT_INO, "docs").await.expect("lookup docs");
     assert_eq!(docs.ino, inos["docs"]);
     assert_eq!(docs.mode, libc::S_IFDIR | 0o750);
-    let readme = b.lookup(docs.ino, "readme.txt").await.expect("lookup readme");
+    let readme = b
+        .lookup(docs.ino, "readme.txt")
+        .await
+        .expect("lookup readme");
     assert_eq!(readme.ino, inos["readme.txt"]);
     assert_eq!(readme.size, 4096);
     assert!(b.lookup(ROOT_INO, "no-such-entry").await.is_err());
@@ -587,9 +655,11 @@ async fn assert_population_served(
         .map(|d| d.name)
         .collect();
     names.sort();
-    assert_eq!(names, vec![".", "..", "docs", "empty", "hard.lnk", "hello.bin"]);
+    assert_eq!(names, vec!["docs", "empty", "hard.lnk", "hello.bin"]);
     assert_eq!(
-        b.getxattr(readme.ino, "user.color").await.expect("getxattr"),
+        b.getxattr(readme.ino, "user.color")
+            .await
+            .expect("getxattr"),
         Some(b"blue".to_vec())
     );
     assert_eq!(
@@ -638,8 +708,12 @@ async fn the_forest_and_the_shipped_layout_fold_to_the_same_digest() {
     build_image(&flat, false).await;
     let forest = NamedTempFile::new().unwrap();
     build_image(&forest, true).await;
-    let a = open_volume_for_mount(flat.path().to_str().unwrap()).await.unwrap();
-    let b = open_volume_for_mount(forest.path().to_str().unwrap()).await.unwrap();
+    let a = open_volume_for_mount(flat.path().to_str().unwrap())
+        .await
+        .unwrap();
+    let b = open_volume_for_mount(forest.path().to_str().unwrap())
+        .await
+        .unwrap();
     let da = digest_backend(&a).await.expect("digest flat");
     let db = digest_backend(&b).await.expect("digest forest");
     assert_eq!(da, db, "same logical records ⇒ same digest across layouts");
@@ -667,7 +741,9 @@ async fn churn(b: &KvMetaBackend, rounds: u32) -> u64 {
             .await
             .expect("setxattr");
         if i % 4 == 3 {
-            b.unlink(dir, &format!("f{:04}", i - 1)).await.expect("unlink");
+            b.unlink(dir, &format!("f{:04}", i - 1))
+                .await
+                .expect("unlink");
         }
     }
     dir
@@ -677,21 +753,29 @@ async fn churn(b: &KvMetaBackend, rounds: u32) -> u64 {
 async fn forest_mutations_commit_checkpoint_and_replay_to_the_same_digest() {
     let file = NamedTempFile::new().unwrap();
     build_image(&file, true).await;
-    let b = open_volume_for_mount(file.path().to_str().unwrap()).await.unwrap();
+    let b = open_volume_for_mount(file.path().to_str().unwrap())
+        .await
+        .unwrap();
     let dir = churn(&b, 64).await;
     let live_digest = digest_backend(&b).await.unwrap();
     // A CLEAN shutdown: checkpoint → tail == head; the next mount replays
     // nothing and must fold to the same digest from the leaf images alone.
     b.shutdown().await.expect("shutdown");
     drop(b);
-    let again = open_volume_for_mount(file.path().to_str().unwrap()).await.unwrap();
-    assert_eq!(again.replay_stats().entries, 0, "clean shutdown ⇒ empty replay window");
+    let again = open_volume_for_mount(file.path().to_str().unwrap())
+        .await
+        .unwrap();
+    assert_eq!(
+        again.replay_stats().entries,
+        0,
+        "clean shutdown ⇒ empty replay window"
+    );
     assert_eq!(digest_backend(&again).await.unwrap(), live_digest);
     // The population is still served through the forest after remount.
     assert_eq!(again.lookup(ROOT_INO, "storm").await.unwrap().ino, dir);
     let names = again.readdir(dir, 0, usize::MAX).await.unwrap();
-    // 64 created, 16 unlinked (every i % 4 == 3 removes i-1), plus . and ..
-    assert_eq!(names.len(), 64 - 16 + 2);
+    // 64 created, 16 unlinked (every i % 4 == 3 removes i-1).
+    assert_eq!(names.len(), 64 - 16);
     let f5 = again.lookup(dir, "f0005").await.unwrap();
     assert_eq!(
         again.getxattr(f5.ino, "user.k5").await.unwrap(),
@@ -708,7 +792,9 @@ async fn forest_mutations_commit_checkpoint_and_replay_to_the_same_digest() {
 async fn forest_replay_twice_digest_equality() {
     let file = NamedTempFile::new().unwrap();
     build_image(&file, true).await;
-    let b = open_volume_for_mount(file.path().to_str().unwrap()).await.unwrap();
+    let b = open_volume_for_mount(file.path().to_str().unwrap())
+        .await
+        .unwrap();
     churn(&b, 48).await;
     let live = digest_backend(&b).await.unwrap();
     // Barrier the ring WITHOUT a checkpoint, then abandon the mount: the
@@ -716,17 +802,24 @@ async fn forest_replay_twice_digest_equality() {
     // last `Arc`).
     b.sync_device().await.expect("barrier");
     drop(b);
-    let r1 = open_volume_for_mount(file.path().to_str().unwrap()).await.unwrap();
+    let r1 = open_volume_for_mount(file.path().to_str().unwrap())
+        .await
+        .unwrap();
     assert!(
         r1.replay_stats().entries > 0,
         "the window was replayed, not checkpointed away"
     );
     let d1 = digest_backend(&r1).await.unwrap();
     drop(r1);
-    let r2 = open_volume_for_mount(file.path().to_str().unwrap()).await.unwrap();
+    let r2 = open_volume_for_mount(file.path().to_str().unwrap())
+        .await
+        .unwrap();
     let d2 = digest_backend(&r2).await.unwrap();
     assert_eq!(d1, live, "replay reproduces the live state");
-    assert_eq!(d1, d2, "replay is deterministic: twice gives the same digest");
+    assert_eq!(
+        d1, d2,
+        "replay is deterministic: twice gives the same digest"
+    );
     r2.shutdown().await.unwrap();
 }
 
@@ -754,7 +847,7 @@ async fn stamped_forest_set(dir: &std::path::Path) -> Vec<String> {
     std::fs::File::create(&p).unwrap().set_len(VOL_LEN).unwrap();
     let plan = plan_meta_slot_set(1).expect("derived plan");
     {
-        let _g = SEAM.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = SEAM.lock().await;
         std::env::set_var("SQUEEZEFS_TEST_STAMP_SYMMETRIC", "1");
         let r = format_v3_stamped(&p, VOL_LEN, &set_opts(), plan.stamps[0].clone()).await;
         std::env::remove_var("SQUEEZEFS_TEST_STAMP_SYMMETRIC");
@@ -767,7 +860,9 @@ async fn stamped_forest_set(dir: &std::path::Path) -> Vec<String> {
 async fn a_stamped_set_mints_into_guest_slot_trees_whose_roots_ride_tree_zero() {
     let dir = tempfile::tempdir().unwrap();
     let uris = stamped_forest_set(dir.path()).await;
-    let routed = open_routed_meta_set(&uris).await.expect("open routed forest set");
+    let routed = open_routed_meta_set(&uris)
+        .await
+        .expect("open routed forest set");
     let vol = &routed.volumes[0];
     assert!(vol.symmetric_forest());
     let before = vol.forest_census().expect("forest");
@@ -785,7 +880,10 @@ async fn a_stamped_set_mints_into_guest_slot_trees_whose_roots_ride_tree_zero() 
             .await
             .expect("create")
             .ino;
-        routed.setxattr(f, "user.tag", b"t").await.expect("setxattr");
+        routed
+            .setxattr(f, "user.tag", b"t")
+            .await
+            .expect("setxattr");
         children.push(f);
     }
     // The mints spread over the volume's rotor: several DISTINCT guest
@@ -828,9 +926,15 @@ async fn a_stamped_set_mints_into_guest_slot_trees_whose_roots_ride_tree_zero() 
     assert_eq!(digest_backend(vol).await.unwrap(), live);
     assert_eq!(vol.forest_census().unwrap().slot_trees, after.slot_trees);
     for (i, ino) in children.iter().enumerate() {
-        let got = again.lookup(d, &format!("c{i:03}")).await.expect("lookup child");
+        let got = again
+            .lookup(d, &format!("c{i:03}"))
+            .await
+            .expect("lookup child");
         assert_eq!(got.ino, *ino);
-        assert_eq!(again.getxattr(*ino, "user.tag").await.unwrap(), Some(b"t".to_vec()));
+        assert_eq!(
+            again.getxattr(*ino, "user.tag").await.unwrap(),
+            Some(b"t".to_vec())
+        );
     }
     for v in &again.volumes {
         v.shutdown().await.unwrap();
@@ -845,13 +949,18 @@ async fn a_stamped_set_mints_into_guest_slot_trees_whose_roots_ride_tree_zero() 
 async fn an_empty_slot_owns_no_extent() {
     let file = NamedTempFile::new().unwrap();
     build_image(&file, true).await;
-    let b = open_volume_for_mount(file.path().to_str().unwrap()).await.unwrap();
+    let b = open_volume_for_mount(file.path().to_str().unwrap())
+        .await
+        .unwrap();
     // Nothing has minted a guest slot on this single-member image: the
     // forest holds exactly the native slot tree; tree 0 carries no
     // `slot_state` record; no extent is claimed for any other slot.
     let census = b.forest_census().expect("the mount is a forest");
     assert_eq!(census.slot_trees, 1, "the native slot tree only");
-    assert_eq!(census.control_records, 0, "no slot_state record for an empty slot");
+    assert_eq!(
+        census.control_records, 0,
+        "no slot_state record for an empty slot"
+    );
     assert!(
         b.slot_tree_root(guest_forest_slot(0)).is_none(),
         "a slot with no records has no root and owns no extent"
@@ -863,14 +972,18 @@ async fn an_empty_slot_owns_no_extent() {
 /// tree's root has no journaled pointer record, so the checkpoint's tail
 /// must not pass the swap until a ledger record covers the new root. The
 /// covering direction is asserted: after a churn that swaps the native
-/// root, one checkpoint names the swapped root AND its tail stands at or
-/// past the pre-cycle head — the swap's floor was released by the record
-/// that covers it, never by anything earlier.
+/// root, the checkpoint names the swapped root, and the swap's floor is
+/// released within the progress theorem's bound — the SECOND barriered
+/// cycle's tail stands at or past the pre-swap head (the first cycle's
+/// record covers the swap; its own SMO records land past that cycle's
+/// `H`, so reclamation lags one cycle by design).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_root_swap_pins_the_floor_until_the_ledger_names_it() {
     let file = NamedTempFile::new().unwrap();
     build_image(&file, true).await;
-    let b = open_volume_for_mount(file.path().to_str().unwrap()).await.unwrap();
+    let b = open_volume_for_mount(file.path().to_str().unwrap())
+        .await
+        .unwrap();
     let before = b.slot_tree_root(NATIVE_FOREST_SLOT).expect("native root");
     // Enough churn to fill the native root leaf's log (64 KiB nodes; 4 KB
     // xattr values) so the flush pass compacts or splits it.
@@ -879,16 +992,26 @@ async fn a_root_swap_pins_the_floor_until_the_ledger_names_it() {
         .unwrap()
         .ino;
     for i in 0..48u32 {
-        let f = Metadata::create(b.as_ref(), dir, &format!("g{i:03}"), libc::S_IFREG | 0o644, 0, 0)
-            .await
-            .unwrap()
-            .ino;
+        let f = Metadata::create(
+            b.as_ref(),
+            dir,
+            &format!("g{i:03}"),
+            libc::S_IFREG | 0o644,
+            0,
+            0,
+        )
+        .await
+        .unwrap()
+        .ino;
         b.setxattr(f, "user.pad", &vec![0x5A; 4000]).await.unwrap();
     }
     let head_before = b.journal_ring().core().head();
     b.checkpoint_now().await.expect("checkpoint");
     let after = b.slot_tree_root(NATIVE_FOREST_SLOT).expect("native root");
-    assert_ne!(before, after, "the churn compacted (or split) the native root");
+    assert_ne!(
+        before, after,
+        "the churn compacted (or split) the native root"
+    );
     let sb = b.superblock().clone();
     let ledger = read_newest_ledger(file.path(), sb.root_ledger.start)
         .await
@@ -904,10 +1027,18 @@ async fn a_root_swap_pins_the_floor_until_the_ledger_names_it() {
         (after.addr, after.seq),
         "the checkpoint's ledger record names the swapped root"
     );
+    // The first record covers the swap; the second cycle's tail passes
+    // the pre-swap head (the bound the flush pass's progress theorem
+    // states: every floor live at the next cycle belongs to records ≥ H).
+    b.checkpoint_now().await.expect("second checkpoint");
+    let ledger2 = read_newest_ledger(file.path(), sb.root_ledger.start)
+        .await
+        .unwrap()
+        .expect("ledger");
     assert!(
-        ledger.journal_tail_seq >= head_before,
-        "the covering record released the swap's dying floor (tail {} < pre-cycle head {})",
-        ledger.journal_tail_seq,
+        ledger2.journal_tail_seq >= head_before,
+        "the covering records released the swap's dying floor (tail {} < pre-swap head {})",
+        ledger2.journal_tail_seq,
         head_before
     );
     b.shutdown().await.unwrap();

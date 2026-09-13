@@ -1204,7 +1204,7 @@ async fn dentry_key_of(fx: &Fx, name: &str) -> (usize, Vec<u8>, u64) {
     use squeezefs::meta_backend::kv::record::DentryValue;
     use squeezefs::meta_backend::kv::tree::KEY_SPACE_MAX;
     for (vol_idx, kv) in fx.meta.volumes.iter().enumerate() {
-        let dentries = kv.trees()[1];
+        let dentries = kv.flat_trees()[1].clone();
         let mut cursor: Vec<u8> = vec![0u8];
         loop {
             let page = dentries
@@ -1356,7 +1356,7 @@ async fn the_inode_plane_loss_direction_teeth_survive_the_fleet_plane() {
         let (v_idx, local) = fx.meta.route_ino(ghost);
         let kv = &fx.meta.volumes[v_idx];
         kv.drain_pending_times_now().await.ok();
-        kv.trees()[0]
+        kv.flat_trees()[0]
             .delete(&inode_key(local))
             .await
             .expect("destroy the record, keep the name");

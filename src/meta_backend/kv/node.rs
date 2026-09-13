@@ -68,15 +68,30 @@ use std::path::Path;
 #[cfg(debug_assertions)]
 pub(crate) fn debug_audit_records(tree_id: u8, level: u8, records: &[Record]) {
     use super::record::{
-        DentryValue, InodeDelta, InodeValue, RecordKind, XattrValue, TREE_BLOCK_MAP,
-        TREE_BLOCK_REFS, TREE_DENTRIES, TREE_INODES, TREE_XATTRS,
+        split_forest_key, DentryValue, InodeDelta, InodeValue, RecordKind, XattrValue,
+        KIND_INTERIOR, TREE_BLOCK_MAP, TREE_BLOCK_REFS, TREE_DENTRIES, TREE_INODES, TREE_XATTRS,
     };
     for r in records {
+        // A slot tree (node-header tree id 0) holds every kind under the
+        // §5.2.1 forest key: audit by the kind the KEY carries, against
+        // the legacy key the per-kind decoders read.
+        let (kind, legacy): (u8, std::borrow::Cow<'_, [u8]>) =
+            if tree_id == KIND_INTERIOR && level == 0 {
+                match split_forest_key(&r.key) {
+                    Ok((k, legacy)) => (k, std::borrow::Cow::Owned(legacy)),
+                    Err(e) => panic!(
+                        "write-side encode audit: slot-tree record key does not frame as a forest \
+                     key (kind byte / length): {e}"
+                    ),
+                }
+            } else {
+                (tree_id, std::borrow::Cow::Borrowed(&r.key[..]))
+            };
         let ok = match (level, r.kind) {
             (_, RecordKind::Delete) => true, // tombstones carry no value
             (l, RecordKind::Put) if l > 0 => r.value.len() == 16,
             (l, _) if l > 0 => false, // interior nodes hold Put/Delete pointers only
-            (_, RecordKind::Put) => match tree_id {
+            (_, RecordKind::Put) => match kind {
                 TREE_INODES => InodeValue::decode(&r.value).is_ok(),
                 TREE_DENTRIES => DentryValue::decode(&r.value).is_ok(),
                 TREE_XATTRS => XattrValue::decode(&r.value).is_ok(),
@@ -85,7 +100,7 @@ pub(crate) fn debug_audit_records(tree_id: u8, level: u8, records: &[Record]) {
                 // mis-count shared ownership at recovery — audited here,
                 // write-side, before a byte is persisted.
                 TREE_BLOCK_REFS => {
-                    super::block_refs::decode_block_ref_key(&r.key).is_ok()
+                    super::block_refs::decode_block_ref_key(&legacy).is_ok()
                         && super::block_refs::decode_block_ref_value(&r.value).is_ok()
                 }
                 // PB-class files, PR 1: a map record whose key or value
@@ -93,14 +108,12 @@ pub(crate) fn debug_audit_records(tree_id: u8, level: u8, records: &[Record]) {
                 // block at read time — audited write-side, before a byte
                 // is persisted.
                 TREE_BLOCK_MAP => {
-                    super::block_map::decode_block_map_key(&r.key).is_ok()
+                    super::block_map::decode_block_map_key(&legacy).is_ok()
                         && super::block_map::decode_block_map_value(&r.value).is_ok()
                 }
                 _ => true, // foreign trees (test harnesses) are not audited
             },
-            (_, RecordKind::Delta) => {
-                tree_id != TREE_INODES || InodeDelta::decode(&r.value).is_ok()
-            }
+            (_, RecordKind::Delta) => kind != TREE_INODES || InodeDelta::decode(&r.value).is_ok(),
         };
         assert!(
             ok,

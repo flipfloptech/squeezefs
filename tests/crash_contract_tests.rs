@@ -1917,7 +1917,7 @@ async fn test_kv_batch_mid_rollback_race_ram_equals_replay() {
         test_conveyor_hold_release, KvMetaBackend, TEST_CONVEYOR_HOLD_PRE_DRAIN,
         TEST_CONVEYOR_HOLD_STAGE,
     };
-    use squeezefs::meta_backend::kv::builder::{digest_walk, format_v3, FormatV3Options};
+    use squeezefs::meta_backend::kv::builder::{digest_backend, format_v3, FormatV3Options};
     use squeezefs::meta_backend::{Metadata, RoutedMetaBackend};
 
     struct Cleanup;
@@ -2017,7 +2017,7 @@ async fn test_kv_batch_mid_rollback_race_ram_equals_replay() {
     // RAM == replay (§4.4 pt 4, batch edition): the failed batch's hole
     // was checkpointed past; a probe of the same bytes folds to the live
     // state exactly.
-    let d_live = digest_walk(&be.trees()).await.unwrap();
+    let d_live = digest_backend(&be).await.unwrap();
     let probe = KvMetaBackend::open_probe(&vol).await.unwrap();
     let d_replay = digest_backend(&probe).await.unwrap();
     assert_eq!(
@@ -2041,7 +2041,7 @@ async fn test_kv_batch_mid_rollback_race_ram_equals_replay() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_kv_batched_commits_replay_twice_digest_equal() {
     use squeezefs::meta_backend::kv::backend::KvMetaBackend;
-    use squeezefs::meta_backend::kv::builder::{digest_walk, format_v3, FormatV3Options};
+    use squeezefs::meta_backend::kv::builder::{digest_backend, format_v3, FormatV3Options};
     use squeezefs::meta_backend::{Metadata, RoutedMetaBackend};
 
     struct Cleanup;
@@ -2108,7 +2108,7 @@ async fn test_kv_batched_commits_replay_twice_digest_equal() {
         "the storm must have produced at least one multi-tx batch"
     );
 
-    let d_live = digest_walk(&be.trees()).await.unwrap();
+    let d_live = digest_backend(&be).await.unwrap();
     let p1 = KvMetaBackend::open_probe(&vol).await.unwrap();
     let d1 = digest_backend(&p1).await.unwrap();
     drop(p1);

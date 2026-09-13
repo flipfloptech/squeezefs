@@ -488,13 +488,20 @@ pub(crate) async fn walk_striped_files(
     let block_size = router.block_size.load(Ordering::Relaxed) as usize;
     let mut out = Vec::new();
     for (vol_idx, kv) in meta.volumes.iter().enumerate() {
-        let inodes = kv.trees()[0];
         let mut cursor: Vec<u8> = inode_key(1).to_vec();
         let end = inode_key(u64::MAX - 1);
         loop {
-            let page = inodes.range(&cursor, &end, 512).await.map_err(|e| {
-                SqueezefsError::InvalidOperation(format!("defrag D2 inode walk failed: {e}"))
-            })?;
+            let page = kv
+                .range_kind(
+                    crate::meta_backend::kv::record::TREE_INODES,
+                    &cursor,
+                    &end,
+                    512,
+                )
+                .await
+                .map_err(|e| {
+                    SqueezefsError::InvalidOperation(format!("defrag D2 inode walk failed: {e}"))
+                })?;
             let Some((last_key, _)) = page.last() else {
                 break;
             };
@@ -654,7 +661,9 @@ pub fn measure_d3(router: &DataRouter) -> D3Report {
 pub(crate) async fn page_in_leaves(
     kv: &crate::meta_backend::kv::backend::KvMetaBackend,
 ) -> Result<()> {
-    for tree in kv.trees() {
+    // Every tree of either layout (flat: the per-kind trees; forest: tree 0
+    // + every slot tree) — a raw node-key walk, no kind routing needed.
+    for tree in kv.all_trees() {
         let mut cursor: Vec<u8> = Vec::new();
         loop {
             let page = tree

@@ -483,7 +483,7 @@ async fn test_c1_semantic_repair_rebuild_in_place_x3() {
 
         // VL6a's seed: a dentry-shaped key in the inodes tree.
         let bad_key = squeezefs::meta_backend::kv::record::dentry_key(42, 7, 0);
-        r.fx.meta.volumes[0].trees()[0]
+        r.fx.meta.volumes[0].flat_trees()[0]
             .insert(&bad_key[..], bytes::Bytes::from_static(b"bogus"))
             .await
             .expect("raw insert");
@@ -519,7 +519,7 @@ async fn test_c1_semantic_repair_rebuild_in_place_x3() {
             rep.applied
         );
         assert!(rep.counters.quarantined_records >= 1);
-        let gone = r.fx.meta.volumes[0].trees()[0]
+        let gone = r.fx.meta.volumes[0].flat_trees()[0]
             .lookup(&bad_key[..])
             .await
             .expect("lookup");
@@ -563,7 +563,7 @@ async fn test_c1_torn_node_quarantine_report_only() {
         let kv = squeezefs::meta_backend::kv::backend::KvMetaBackend::open_probe(&meta)
             .await
             .expect("probe open");
-        let tree = kv.trees()[0];
+        let tree = kv.flat_trees()[0].clone();
         let root_addr = tree.root().addr;
         let leaf = tree
             .resolve_leaf(&squeezefs::meta_backend::kv::record::inode_key(500))

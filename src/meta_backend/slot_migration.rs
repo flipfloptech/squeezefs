@@ -300,11 +300,14 @@ pub async fn scan_slot_keyspace(
     ks: &SlotKeyspace,
     mut sink: impl FnMut(usize, &[u8], &[u8]) -> Result<()>,
 ) -> Result<()> {
-    for (tree_idx, tree) in be.trees().into_iter().enumerate() {
+    for (tree_idx, kind) in KvMetaBackend::USER_KINDS.into_iter().enumerate() {
         let (start, end) = tree_bounds(ks, tree_idx);
         let mut cursor = start;
         loop {
-            let page = tree.range(&cursor, &end, 512).await.map_err(|e| {
+            // Kind-routed: legacy keys in, legacy keys out, on both layouts
+            // (on a forest volume the slot keyspace IS one slot tree's
+            // ino-major range, filtered by kind).
+            let page = be.range_kind(kind, &cursor, &end, 512).await.map_err(|e| {
                 SqueezefsError::InvalidOperation(format!("slot keyspace scan failed: {e}"))
             })?;
             let Some((last_key, _)) = page.last() else {
@@ -330,10 +333,7 @@ pub async fn bulk_copy_slot(
     dst: &Arc<KvMetaBackend>,
     dst_ks: &SlotKeyspace,
 ) -> Result<u64> {
-    let tree_ids: [u8; 3] = {
-        let trees = src.trees();
-        [trees[0].tree_id(), trees[1].tree_id(), trees[2].tree_id()]
-    };
+    let tree_ids: [u8; 3] = KvMetaBackend::USER_KINDS;
     let mut batch: Vec<(u8, Vec<u8>, Vec<u8>)> = Vec::with_capacity(COPY_BATCH_RECORDS);
     let mut copied = 0u64;
     // Collect pages first (scan sink is sync), flush batches after.
@@ -368,10 +368,7 @@ pub async fn bulk_copy_slot(
 /// teardown and the pre-copy target wipe ("torn-down by re-run",
 /// §5.5.2b write-0 note). Returns records deleted.
 pub async fn teardown_slot_keyspace(be: &Arc<KvMetaBackend>, ks: &SlotKeyspace) -> Result<u64> {
-    let tree_ids: [u8; 3] = {
-        let trees = be.trees();
-        [trees[0].tree_id(), trees[1].tree_id(), trees[2].tree_id()]
-    };
+    let tree_ids: [u8; 3] = KvMetaBackend::USER_KINDS;
     let mut keys: Vec<(u8, Vec<u8>)> = Vec::new();
     scan_slot_keyspace(be, ks, |tree_idx, k, _v| {
         keys.push((tree_ids[tree_idx], k.to_vec()));

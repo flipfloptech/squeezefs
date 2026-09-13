@@ -45,12 +45,208 @@ pub const TREE_BLOCK_REFS: u8 = 6;
 /// other volume has no such root and behaves exactly as before the bit
 /// existed (nothing stamps it in PR 1 — the crossing is PR 2's).
 pub const TREE_BLOCK_MAP: u8 = 7;
+/// **The control tree ("tree 0")** of a symmetric-forest volume
+/// (docs/design-symmetric-metadata.md §5.2.1; incompat bit 17): per
+/// volume the [`super::slot_state`] records naming every non-native slot
+/// tree's root. Its own tree, never a slot tree — which is why a kind
+/// byte of 8 inside a slot tree is corruption ([`is_slot_tree_kind`]).
+pub const TREE_CONTROL: u8 = 8;
+/// **The shared-block index** (design-symmetric-metadata §5.4.3/§5.4.4,
+/// PR 7): by-block records under the allocation holder's control ino.
+/// Reserved here so the id space is complete; nothing writes it in PR 1.
+pub const TREE_SHARED_INDEX: u8 = 9;
+/// The kind byte an INTERIOR record of a slot tree carries in its journal
+/// tag (`tag_for(KIND_INTERIOR, level ≥ 1)`): an interior node of a
+/// mixed-kind tree separates keys of every kind, so the record is routed
+/// to its slot tree by the separator key's slot, never by a kind. Also
+/// the node-header `tree_id` of every slot-tree node.
+pub const KIND_INTERIOR: u8 = 0;
 
 /// Highest tree id this binary writes or accepts on the wire. The
 /// journal's tag nibble ([`super::journal::tag_for`]) bounds it at 15;
-/// anything outside `TREE_INODES..=TREE_ID_MAX` is structural
-/// corruption.
-pub const TREE_ID_MAX: u8 = TREE_BLOCK_MAP;
+/// anything outside `KIND_INTERIOR..=TREE_ID_MAX` is structural
+/// corruption (and kind 0 is legal only at interior levels).
+pub const TREE_ID_MAX: u8 = TREE_SHARED_INDEX;
+
+// ---------------------------------------------------------------------------
+// The slot-tree forest's key layout (design-symmetric-metadata §5.2.1).
+//
+// Under bit 17 every content record of a volume lives in ONE mixed-kind
+// tree per routing slot. The kind byte IS the record's tree id, placed so
+// that raw byte order stays logical order (memcmp, never decode):
+//
+//   ino-major family (first byte ≤ 0x01 — `(s+1) << 40 ≤ 2^56`):
+//     local_key_ino: u64 BE ‖ kind ‖ rest        inode 9 B · dentry 17 B ·
+//                                                 xattr 17 B · block-map 13 B
+//   by-block family (first byte = the kind ≥ 0x02, sorts after every
+//   ino-major key):
+//     0x06 ‖ vol_tag ‖ block_idx ‖ owner_ino ‖ block_index   (refs, 29 B)
+//
+// The forest key of a record is a pure function of `(kind, legacy key)`:
+// the kind byte is inserted at offset 8 (ino-major) or prepended
+// (by-block). Both transforms preserve memcmp order among keys of one
+// kind, so every legacy range translates verbatim. The record's SLOT is
+// `key_ino >> 40` (0 = the native keyspace, `s + 1` = guest slot `s`),
+// read at offset 0 for the ino-major family and at offset 17 (the OWNER
+// ino) for refs.
+// ---------------------------------------------------------------------------
+
+/// A slot index inside the forest: `key_ino >> 40`. `0` is the volume's
+/// NATIVE keyspace; guest slot `s` is `s + 1` (u32 because 65 536 does
+/// not fit the u16 slot id).
+pub type ForestSlot = u32;
+/// The native keyspace's slot tree (local inos `< 2^40`).
+pub const NATIVE_FOREST_SLOT: ForestSlot = 0;
+
+/// The forest slot of guest slot `slot` (`(slot + 1) << 40` is its key
+/// ino base — [`crate::meta_backend::guest_local_ino`]).
+#[inline]
+pub fn guest_forest_slot(slot: u16) -> ForestSlot {
+    ForestSlot::from(slot) + 1
+}
+
+/// The forest slot of a local key ino: its top 24 bits.
+#[inline]
+pub fn forest_slot_of_ino(key_ino: u64) -> ForestSlot {
+    (key_ino >> crate::meta_backend::GUEST_NS_SHIFT) as ForestSlot
+}
+
+/// Forest inode key: `ino ‖ 0x01`.
+pub const FOREST_INODE_KEY_LEN: usize = INODE_KEY_LEN + 1;
+/// Forest dentry key: `parent ‖ 0x02 ‖ (hash54, coll_seq)`.
+pub const FOREST_DENTRY_KEY_LEN: usize = DENTRY_KEY_LEN + 1;
+/// Forest xattr key: `ino ‖ 0x03 ‖ (hash56, coll_seq)`.
+pub const FOREST_XATTR_KEY_LEN: usize = XATTR_KEY_LEN + 1;
+/// Forest block-map key: `owner ‖ 0x07 ‖ block_index`.
+pub const FOREST_BLOCK_MAP_KEY_LEN: usize = super::block_map::BLOCK_MAP_KEY_LEN + 1;
+/// Forest block-reference key: `0x06 ‖ vol_tag ‖ block_idx ‖ owner ‖
+/// block_index`.
+pub const FOREST_BLOCK_REF_KEY_LEN: usize = super::block_refs::BLOCK_REF_KEY_LEN + 1;
+
+/// Offset of the OWNER ino inside a forest block-reference key (`0x06 ‖
+/// vol_tag(8) ‖ block_idx(8)` precede it).
+const FOREST_BLOCK_REF_OWNER_OFF: usize = 1 + 8 + 8;
+
+/// Whether `kind` names a content family that lives INSIDE a slot tree.
+/// Exactly the five kinds of §5.2.1: never the interior marker, never a
+/// reserved id, never tree 0 or the shared index (round-3 Issue 6 — a
+/// kind byte is never another tree's id).
+#[inline]
+pub fn is_slot_tree_kind(kind: u8) -> bool {
+    matches!(
+        kind,
+        TREE_INODES | TREE_DENTRIES | TREE_XATTRS | TREE_BLOCK_REFS | TREE_BLOCK_MAP
+    )
+}
+
+/// The legacy key length of a slot-tree kind (the shipped per-kind
+/// codec's), `None` for a kind that is not one.
+fn legacy_key_len(kind: u8) -> Option<usize> {
+    match kind {
+        TREE_INODES => Some(INODE_KEY_LEN),
+        TREE_DENTRIES => Some(DENTRY_KEY_LEN),
+        TREE_XATTRS => Some(XATTR_KEY_LEN),
+        TREE_BLOCK_MAP => Some(super::block_map::BLOCK_MAP_KEY_LEN),
+        TREE_BLOCK_REFS => Some(super::block_refs::BLOCK_REF_KEY_LEN),
+        _ => None,
+    }
+}
+
+/// Frame a shipped per-kind key as its forest key (§5.2.1). Refuses a kind
+/// outside the slot-tree families and a legacy key of the wrong length
+/// for its kind — a mis-framed key would route to a foreign slot or fail
+/// to decode at every later read, so it is refused at the one encoder.
+pub fn forest_key(kind: u8, legacy: &[u8]) -> Result<Vec<u8>, KvError> {
+    let want = legacy_key_len(kind).ok_or_else(|| {
+        KvError::Corrupt(format!(
+            "kind {kind} is not a slot-tree content kind (§5.2.1: 1/2/3/6/7)"
+        ))
+    })?;
+    if legacy.len() != want {
+        return Err(KvError::Corrupt(format!(
+            "kind {kind} key must be {want} bytes, got {}",
+            legacy.len()
+        )));
+    }
+    let mut out = Vec::with_capacity(legacy.len() + 1);
+    if kind == TREE_BLOCK_REFS {
+        out.push(kind);
+        out.extend_from_slice(legacy);
+    } else {
+        out.extend_from_slice(&legacy[..8]);
+        out.push(kind);
+        out.extend_from_slice(&legacy[8..]);
+    }
+    Ok(out)
+}
+
+/// The kind byte of a forest key without materializing its legacy form:
+/// the first byte for the by-block family (≥ 0x02), offset 8 otherwise.
+/// Refuses a kind that is not a slot-tree content kind and a key too
+/// short to carry one.
+pub fn forest_key_kind(key: &[u8]) -> Result<u8, KvError> {
+    let kind = match key.first() {
+        None => return Err(KvError::Corrupt("empty key inside a slot tree".to_string())),
+        // By-block family: the ONLY prefix a slot tree holds is the refs
+        // kind (the shared index is its own tree, §5.4.2).
+        Some(&TREE_BLOCK_REFS) => TREE_BLOCK_REFS,
+        Some(&first) if first > 0x01 => {
+            return Err(KvError::Corrupt(format!(
+                "slot-tree key starts with byte {first:#04x}: neither an ino-major key (top \
+                 byte ≤ 0x01) nor the refs prefix"
+            )))
+        }
+        Some(_) => *key.get(8).ok_or_else(|| {
+            KvError::Corrupt(format!(
+                "ino-major slot-tree key of {} bytes carries no kind byte",
+                key.len()
+            ))
+        })?,
+    };
+    if !is_slot_tree_kind(kind) {
+        return Err(KvError::Corrupt(format!(
+            "slot-tree key carries kind byte {kind} — not a content kind (a kind byte is \
+             never another tree's id)"
+        )));
+    }
+    if key.len() != legacy_key_len(kind).map_or(0, |n| n + 1) {
+        return Err(KvError::Corrupt(format!(
+            "slot-tree key of kind {kind} must be {} bytes, got {}",
+            legacy_key_len(kind).map_or(0, |n| n + 1),
+            key.len()
+        )));
+    }
+    Ok(kind)
+}
+
+/// Split a forest key into `(kind, legacy key)` — the inverse of
+/// [`forest_key`]; every shipped per-kind decoder then applies verbatim.
+pub fn split_forest_key(key: &[u8]) -> Result<(u8, Vec<u8>), KvError> {
+    let kind = forest_key_kind(key)?;
+    let legacy = if kind == TREE_BLOCK_REFS {
+        key[1..].to_vec()
+    } else {
+        let mut v = Vec::with_capacity(key.len() - 1);
+        v.extend_from_slice(&key[..8]);
+        v.extend_from_slice(&key[9..]);
+        v
+    };
+    Ok((kind, legacy))
+}
+
+/// The slot a forest key routes to (§5.2.1: "the record's SLOT is
+/// `key_ino >> 40` for the ino-major family and the owner ino at offset
+/// 17 for refs"). Interior separator keys are real keys of the tree and
+/// route the same way.
+pub fn forest_key_slot(key: &[u8]) -> Result<ForestSlot, KvError> {
+    let kind = forest_key_kind(key)?;
+    let off = if kind == TREE_BLOCK_REFS {
+        FOREST_BLOCK_REF_OWNER_OFF
+    } else {
+        0
+    };
+    Ok(forest_slot_of_ino(u64::from_be_bytes(read8(key, off))))
+}
 
 // ---------------------------------------------------------------------------
 // Key builders — memcmp-ordered big-endian composites (design §4.2).
@@ -1383,7 +1579,10 @@ mod tests {
         assert_eq!(TREE_BACKPTR_RESERVED, 5);
         assert_eq!(TREE_BLOCK_REFS, 6);
         assert_eq!(TREE_BLOCK_MAP, 7);
-        assert_eq!(TREE_ID_MAX, TREE_BLOCK_MAP);
+        assert_eq!(TREE_CONTROL, 8);
+        assert_eq!(TREE_SHARED_INDEX, 9);
+        assert_eq!(KIND_INTERIOR, 0);
+        assert_eq!(TREE_ID_MAX, TREE_SHARED_INDEX);
         // The journal tag byte keeps tree ids in its low nibble.
         assert!(TREE_ID_MAX <= 0x0F);
     }

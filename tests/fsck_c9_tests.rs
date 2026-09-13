@@ -359,7 +359,7 @@ async fn orphan_inode(fx: &Fx, ino: u64) {
     use squeezefs::meta_backend::kv::node::key_successor;
     use squeezefs::meta_backend::kv::tree::KEY_SPACE_MAX;
     for kv in &fx.meta.volumes {
-        let dentries = kv.trees()[1];
+        let dentries = kv.flat_trees()[1].clone();
         let mut cursor: Vec<u8> = vec![0u8];
         loop {
             let page = dentries

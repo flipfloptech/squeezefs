@@ -1358,7 +1358,7 @@ async fn v3_mount_surfaces_ledger_and_allocator_state() {
         total - img.extents_allocated,
         "free extents = total − built nodes"
     );
-    assert_eq!(be.trees().len(), 3);
+    assert_eq!(be.flat_trees().len(), 3);
 
     // Builder-set timestamps round-trip; unset ones stay at the
     // deterministic 0 default.

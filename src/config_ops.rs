@@ -3391,11 +3391,16 @@ async fn cross_owner_census(
         ..CrossOwnerCensus::default()
     };
     for (v, kv) in routed.volumes.iter().enumerate() {
-        let dentries = kv.trees()[1];
-        let mut cursor: Vec<u8> = vec![0u8];
+        let mut cursor: Vec<u8> = vec![0u8; crate::meta_backend::kv::record::DENTRY_KEY_LEN];
+        let end = [0xFFu8; crate::meta_backend::kv::record::DENTRY_KEY_LEN];
         loop {
-            let page = dentries
-                .range(&cursor, &crate::meta_backend::kv::tree::KEY_SPACE_MAX, PAGE)
+            let page = kv
+                .range_kind(
+                    crate::meta_backend::kv::record::TREE_DENTRIES,
+                    &cursor,
+                    &end,
+                    PAGE,
+                )
                 .await?;
             let Some((last, _)) = page.last() else { break };
             cursor = crate::meta_backend::kv::node::key_successor(last);

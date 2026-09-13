@@ -55,6 +55,7 @@ pub mod builder;
 pub mod checkpoint;
 pub mod conveyor_core;
 pub mod epoch_core;
+pub mod forest;
 pub mod indirect_map;
 pub mod ino_lane;
 pub mod journal;
@@ -67,6 +68,7 @@ pub mod record;
 pub mod revalidate;
 pub mod slot_cursor_core;
 pub mod slot_set;
+pub mod slot_state;
 pub mod superblock;
 pub mod tree;
 
@@ -195,6 +197,26 @@ pub static META_KV_INTERIOR_MERGES: AtomicU64 = AtomicU64::new(0);
 /// decreases. A root-swap SMO (no pointer record; dying floor at the
 /// entry start). Surfaced as `meta_kv_root_collapses`.
 pub static META_KV_ROOT_COLLAPSES: AtomicU64 = AtomicU64::new(0);
+
+/// **Slot-tree forest** (design-symmetric-metadata §5.2, bit 17): guest
+/// slot trees minted on a slot's first record (one extent each — the
+/// engagement gauge of lazy minting; 0 for the life of every un-stamped
+/// mount). Surfaced as `meta_kv_forest_slot_trees_minted`.
+pub static META_KV_FOREST_SLOT_TREES_MINTED: AtomicU64 = AtomicU64::new(0);
+
+/// Slot-tree roots the checkpoint published into tree 0 as `slot_state`
+/// records (one per guest slot whose root moved since its last
+/// publication). `publishes ≤ checkpoints × slot trees`; 0 on un-stamped
+/// mounts. Surfaced as `meta_kv_forest_root_publishes`.
+pub static META_KV_FOREST_ROOT_PUBLISHES: AtomicU64 = AtomicU64::new(0);
+
+/// **Must-stay-0 tripwire**: a record that reached a forest volume's
+/// commit or replay path carrying a key the §5.2.1 codec refuses (a kind
+/// byte that is another tree's id, a wrong length, a by-block prefix
+/// other than refs) — the partition-violation class of KD-SYM-2's "a
+/// kind byte is never another tree's id". Surfaced as
+/// `meta_kv_forest_key_violations`.
+pub static META_KV_FOREST_KEY_VIOLATIONS: AtomicU64 = AtomicU64::new(0);
 
 /// Commit-path revalidation retries (design §4.6: a writer locked a leaf
 /// an SMO had superseded between resolution and lock — unlock, re-resolve,

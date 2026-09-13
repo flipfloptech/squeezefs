@@ -546,6 +546,36 @@ pub const FEATURE_INCOMPAT_KV_LAYOUT_VERSIONS: u64 = 1 << 15;
 /// what makes a parallel claim a red gate instead of on-disk aliasing.
 pub const FEATURE_INCOMPAT_KV_BLOCK_MAP_TREE: u64 = 1 << 16;
 
+/// `features_incompat` bit 17: **the slot-tree FOREST** — the symmetric
+/// shared-disk metadata format (docs/design-symmetric-metadata.md §5.2
+/// B(i) / §7.1, KD-SYM-2). One mixed-kind KV tree per routing slot with
+/// the §5.2.1 key layout (kind byte at offset 8 for the ino-major family,
+/// prefix `0x06` for block references), a control tree
+/// ([`crate::meta_backend::kv::record::TREE_CONTROL`], "tree 0") whose
+/// `slot_state` records name every non-native slot tree's root, and a
+/// fixed ledger naming tree 0 plus the native slot tree.
+///
+/// **Presence is OPTIONAL until the PR-14 flip** (the bit-9/16 pattern):
+/// a volume WITHOUT this bit mounts exactly as it did before the bit
+/// existed — three per-kind trees, the shipped codecs, the shipped code
+/// path, byte-for-byte (`tests/sym_forest_tests.rs` pins it). Pre-bit
+/// binaries refuse a stamped volume via the [`FEATURES_INCOMPAT_KNOWN`]
+/// gate — exactly right: they would read a slot tree's 9-byte inode keys
+/// as corruption.
+///
+/// **Never stamped by [`SuperblockV3::plan`]** and stamped by NOTHING in
+/// PR 1 but the test seam `SQUEEZEFS_TEST_STAMP_SYMMETRIC=1` (the
+/// `SQUEEZEFS_TEST_STAMP_BLOCK_REFS` precedent, read by the image
+/// builder): `format --symmetric` and the offline `volume
+/// enable-symmetric` conversion are PR 11's, the default flip PR 14's
+/// (§7.1: the bit is never partially stamped — it means the COMPLETE
+/// forest format).
+///
+/// **Bit 17** — 0..=16 are claimed; the
+/// `incompat_bits_are_single_bit_and_pairwise_disjoint` union clause is
+/// what makes a parallel claim a red gate instead of on-disk aliasing.
+pub const FEATURE_INCOMPAT_KV_SYMMETRIC_FOREST: u64 = 1 << 17;
+
 /// The **one-act multi-writer stamp set** (KD-MW-1,
 /// docs/design-full-multi-writer.md §6.1/§6.2): the nine incompat bits a
 /// multi-writer-capable format carries — 7 (durable term), 8 (partitioned
@@ -591,7 +621,8 @@ pub const FEATURES_INCOMPAT_KNOWN: u64 = FEATURE_INCOMPAT_KV_V3
     | FEATURE_INCOMPAT_KV_BLOCK_KEY_INCARNATION
     | FEATURE_INCOMPAT_KV_CLAIM_SET
     | FEATURE_INCOMPAT_KV_LAYOUT_VERSIONS
-    | FEATURE_INCOMPAT_KV_BLOCK_MAP_TREE;
+    | FEATURE_INCOMPAT_KV_BLOCK_MAP_TREE
+    | FEATURE_INCOMPAT_KV_SYMMETRIC_FOREST;
 
 /// Read-only feature bits this binary understands (none yet — §4.11
 /// reserves the mechanism for snapshots). Unknown bits mount read-only.
@@ -794,6 +825,13 @@ impl SuperblockV3 {
     /// predicate.
     pub fn block_map_tree_stamped(&self) -> bool {
         self.features_incompat & FEATURE_INCOMPAT_KV_BLOCK_MAP_TREE != 0
+    }
+
+    /// Whether this volume is a slot-tree FOREST
+    /// ([`FEATURE_INCOMPAT_KV_SYMMETRIC_FOREST`], bit 17) — the mount gate
+    /// every forest-vs-per-kind decision reads.
+    pub fn symmetric_forest_stamped(&self) -> bool {
+        self.features_incompat & FEATURE_INCOMPAT_KV_SYMMETRIC_FOREST != 0
     }
 
     /// Encode into a checksummed whole-sector image (generation 0 — the

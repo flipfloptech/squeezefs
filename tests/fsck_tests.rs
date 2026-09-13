@@ -370,7 +370,7 @@ async fn test_census_walk_baseline_measured() {
     let t0 = std::time::Instant::now();
     let mut walked = 0u64;
     for kv in &fx.meta.volumes {
-        let inodes = kv.trees()[0];
+        let inodes = kv.flat_trees()[0].clone();
         let mut cursor: Vec<u8> = inode_key(1).to_vec();
         let end = inode_key(u64::MAX - 1);
         loop {
@@ -513,7 +513,7 @@ async fn test_c1_bitflip_node_detected() {
         let kv = squeezefs::meta_backend::kv::backend::KvMetaBackend::open_probe(&meta)
             .await
             .expect("probe open");
-        let tree = kv.trees()[0];
+        let tree = kv.flat_trees()[0].clone();
         let root_addr = tree.root().addr;
         let leaf = tree
             .resolve_leaf(&squeezefs::meta_backend::kv::record::inode_key(500))
@@ -623,7 +623,7 @@ async fn test_c1_semantic_wrong_tree_record_detected() {
     // The seed: a 16-byte dentry-shaped key in the 8-byte-keyed inodes
     // tree (checksum-valid; only the schema is violated).
     let bad_key = squeezefs::meta_backend::kv::record::dentry_key(42, 7, 0);
-    fx.meta.volumes[0].trees()[0]
+    fx.meta.volumes[0].flat_trees()[0]
         .insert(&bad_key[..], bytes::Bytes::from_static(b"bogus"))
         .await
         .expect("raw insert");

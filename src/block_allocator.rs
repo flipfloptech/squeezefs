@@ -4524,16 +4524,23 @@ pub(crate) async fn collect_corpse_inos(
     kv: &crate::meta_backend::kv::backend::KvMetaBackend,
 ) -> Result<Vec<u64>> {
     use crate::meta_backend::kv::record::{decode_inode_key, inode_key, InodeValue};
-    let inodes = kv.trees()[0];
     let mut out = Vec::new();
     let mut cursor: Vec<u8> = inode_key(2).to_vec();
     let end = inode_key(u64::MAX - 1);
     loop {
-        let page = inodes.range(&cursor, &end, 512).await.map_err(|e| {
-            crate::error::SqueezefsError::InvalidOperation(format!(
-                "v3 corpse-sweep inode walk failed: {e}"
-            ))
-        })?;
+        let page = kv
+            .range_kind(
+                crate::meta_backend::kv::record::TREE_INODES,
+                &cursor,
+                &end,
+                512,
+            )
+            .await
+            .map_err(|e| {
+                crate::error::SqueezefsError::InvalidOperation(format!(
+                    "v3 corpse-sweep inode walk failed: {e}"
+                ))
+            })?;
         let Some((last_key, _)) = page.last() else {
             break;
         };
@@ -4592,16 +4599,23 @@ where
     F: FnMut(u64, &crate::routing::LayoutMetadata),
 {
     use crate::meta_backend::kv::record::{decode_inode_key, inode_key, InodeValue};
-    let inodes = kv.trees()[0];
     let mut summary = LayoutWalkSummary::default();
     let mut cursor: Vec<u8> = inode_key(1).to_vec();
     let end = inode_key(u64::MAX - 1);
     loop {
-        let page = inodes.range(&cursor, &end, 512).await.map_err(|e| {
-            crate::error::SqueezefsError::InvalidOperation(format!(
-                "v3 recovery inode walk failed: {e}"
-            ))
-        })?;
+        let page = kv
+            .range_kind(
+                crate::meta_backend::kv::record::TREE_INODES,
+                &cursor,
+                &end,
+                512,
+            )
+            .await
+            .map_err(|e| {
+                crate::error::SqueezefsError::InvalidOperation(format!(
+                    "v3 recovery inode walk failed: {e}"
+                ))
+            })?;
         let Some((last_key, _)) = page.last() else {
             break;
         };

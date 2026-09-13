@@ -128,11 +128,11 @@ fn test_new_grammar_help_lists_verbs() {
 
 /// The `adopt` verb grammar (§6.10, PR 4b): root demanded before any
 /// probing (an unprivileged run dies on the root rung — adopt writes
-/// the ledger and probes both stacks); `--target-stack` is the
-/// both-stacks-live disambiguator and parses the stack values; a bogus
-/// value dies on clap's invalid-value error before anything runs.
+/// the ledger and probes the nvmet target); `--target-stack nvmet` is
+/// the only admissible value and parses; a bogus value dies on clap's
+/// invalid-value error before anything runs.
 #[test]
-fn test_adopt_grammar_root_rung_and_stack_disambiguator() {
+fn test_adopt_grammar_root_rung_and_stack_flag() {
     let out = run(&["nvmeof", "adopt", "nqn.2026-06.io.foreign:x"], &[]);
     assert!(!out.status.success(), "unprivileged adopt must fail");
     let text = combined(&out);

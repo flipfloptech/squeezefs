@@ -25,7 +25,9 @@
 //!   allow-any;
 //! * **absorption via the intent protocol** (§6.4 law 6): `pending`
 //!   before anything else, TOCTOU re-verify against a fresh live probe
-//!   (drift = loud abort + the pending intent garbage-collected),
+//!   (drift = loud abort + the pending intent garbage-collected — pinned
+//!   end-to-end through `adopt_over`'s `TargetStack` seam with a
+//!   two-snapshot fake whose second `live_shares()` drifts or errors),
 //!   finalize `active`;
 //! * **zero target mutation**: the injected configfs tree snapshots
 //!   byte-identical (shape + content + symlink targets);
@@ -35,15 +37,19 @@
 //! * the §6.4 duplicate-guard refusal names `adopt` beside the manual
 //!   removal steps.
 
+use std::collections::VecDeque;
 use std::fs;
+use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
 use serde_json::Value;
 
 use squeezefs::nvmeof::ledger::Ledger;
 use squeezefs::nvmeof::nvmet::{NvmetStack, NVMET_PORT_ID_BASE_DEFAULT};
 use squeezefs::nvmeof::stack::{
-    AdoptClass, Listener, LiveShare, ShareRecord, ShareRequest, ShareState, TargetStack,
+    AdoptClass, Listener, LiveShare, NvmeofError, PreflightError, PreflightOp, RestoreReport,
+    ShareRecord, ShareRequest, ShareState, TargetStack, TargetStatus,
 };
 use squeezefs::nvmeof::{
     adopt_candidate, adopt_class_of, adopt_over, adopt_verify_unchanged, StackKind,
@@ -792,6 +798,146 @@ fn test_adopt_over_nvmet_adopted_share_restore_noop_then_unshare_clean() {
         "the adopted out-of-range port object is removed once link-free"
     );
     assert!(r.ledger.find(NQN_FOREIGN).unwrap().is_none(), "record gone");
+}
+
+// ---------------------------------------------------------------------------
+// TOCTOU abort-and-GC, end to end (§6.10 pt 3) — through adopt_over's
+// TargetStack seam: a stack whose successive live_shares() answers are
+// scripted (first the classification probe, then the re-verify probe). An
+// injection seam in the §6.8 sense — the production path runs unchanged.
+// ---------------------------------------------------------------------------
+
+/// The scripted stack: `live_shares()` pops the next answer; every other
+/// verb is a mutation adopt must never reach for (the zero-mutation law) —
+/// reaching one fails the test.
+struct ScriptedStack {
+    probes: Mutex<VecDeque<Result<Vec<LiveShare>, String>>>,
+}
+
+impl ScriptedStack {
+    fn new(probes: Vec<Result<Vec<LiveShare>, String>>) -> Self {
+        ScriptedStack {
+            probes: Mutex::new(probes.into()),
+        }
+    }
+
+    fn remaining(&self) -> usize {
+        self.probes.lock().unwrap().len()
+    }
+}
+
+impl TargetStack for ScriptedStack {
+    fn kind(&self) -> StackKind {
+        StackKind::Nvmet
+    }
+    fn preflight(&self, _op: PreflightOp) -> Result<(), PreflightError> {
+        panic!("adopt never preflights through the stack")
+    }
+    fn share(&self, _req: &ShareRequest) -> Result<ShareRecord, NvmeofError> {
+        panic!("adopt never mutates target state (share)")
+    }
+    fn unshare(&self, _rec: &ShareRecord) -> Result<(), NvmeofError> {
+        panic!("adopt never mutates target state (unshare)")
+    }
+    fn live_shares(&self) -> Result<Vec<LiveShare>, NvmeofError> {
+        self.probes
+            .lock()
+            .unwrap()
+            .pop_front()
+            .expect("adopt probed live state more often than scripted")
+            .map_err(|why| NvmeofError::Io(io::Error::other(why)))
+    }
+    fn restore(&self, _recs: &[ShareRecord]) -> Result<RestoreReport, NvmeofError> {
+        panic!("adopt never mutates target state (restore)")
+    }
+    fn target_status(&self) -> Result<TargetStatus, NvmeofError> {
+        panic!("adopt never reads target status")
+    }
+}
+
+/// The identity flips between the classification probe and the re-verify
+/// probe (the TOCTOU window made real): the abort is loud and names the
+/// drift, the pending intent adopt itself wrote is garbage-collected, and
+/// exactly two probes were spent — no third look, no mutation.
+#[test]
+fn test_adopt_over_toctou_drift_aborts_loud_and_gcs_pending() {
+    let (_dir, ledger) = tmp_ledger();
+    let holder = live(
+        NQN_FOREIGN,
+        "/dev/zram40",
+        Some(UUID_A),
+        &[("127.0.0.1", 4420, Some(53040))],
+    );
+    let mut drifted = holder.clone();
+    drifted.ns_uuid = Some(UUID_B.to_string());
+    let stack = ScriptedStack::new(vec![Ok(vec![holder]), Ok(vec![drifted])]);
+
+    let err = adopt_over(NQN_FOREIGN, &ledger, &stack).expect_err("drift must abort the adopt");
+    let text = err.to_string();
+    assert!(
+        text.contains(NQN_FOREIGN) && text.contains("drift") && text.contains("ns_uuid"),
+        "the abort is loud and names the drift: {text}"
+    );
+    assert!(
+        text.contains("garbage-collected"),
+        "the abort says what happened to the intent: {text}"
+    );
+    assert!(
+        ledger.find(NQN_FOREIGN).unwrap().is_none(),
+        "the pending intent is garbage-collected on abort — nothing strands"
+    );
+    assert_eq!(
+        stack.remaining(),
+        0,
+        "exactly two probes: classify, re-verify"
+    );
+}
+
+/// The re-verify probe itself fails (the tree went unreadable between the
+/// two looks): the error propagates loud and the pending intent is still
+/// garbage-collected — a failed re-probe never leaves a `pending` record
+/// for a foreign object behind.
+#[test]
+fn test_adopt_over_reprobe_error_propagates_and_gcs_pending() {
+    let (_dir, ledger) = tmp_ledger();
+    let holder = live(
+        NQN_FOREIGN,
+        "/dev/zram41",
+        Some(UUID_A),
+        &[("127.0.0.1", 4420, Some(53041))],
+    );
+    let stack = ScriptedStack::new(vec![
+        Ok(vec![holder]),
+        Err("configfs walk: permission denied mid-verb".to_string()),
+    ]);
+
+    let err = adopt_over(NQN_FOREIGN, &ledger, &stack).expect_err("a failed re-probe aborts");
+    assert!(
+        err.to_string().contains("permission denied mid-verb"),
+        "the probe error propagates verbatim: {err}"
+    );
+    assert!(
+        ledger.find(NQN_FOREIGN).unwrap().is_none(),
+        "the pending intent is garbage-collected on a failed re-probe too"
+    );
+    assert_eq!(stack.remaining(), 0);
+}
+
+/// The vanished shape (the object was removed between the two probes) is
+/// drift too.
+#[test]
+fn test_adopt_over_vanished_between_probes_aborts_and_gcs_pending() {
+    let (_dir, ledger) = tmp_ledger();
+    let holder = live(
+        NQN_FOREIGN,
+        "/dev/zram42",
+        Some(UUID_A),
+        &[("127.0.0.1", 4420, Some(53042))],
+    );
+    let stack = ScriptedStack::new(vec![Ok(vec![holder]), Ok(vec![])]);
+    let err = adopt_over(NQN_FOREIGN, &ledger, &stack).expect_err("vanished = drift");
+    assert!(err.to_string().contains("vanished"), "{err}");
+    assert!(ledger.find(NQN_FOREIGN).unwrap().is_none());
 }
 
 // ---------------------------------------------------------------------------

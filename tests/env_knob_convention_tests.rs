@@ -231,6 +231,49 @@ fn retired_spellings_refuse_naming_the_successor() {
     }
 }
 
+/// A retired VALUE of a live enum knob refuses the same way a retired
+/// spelling does — naming the knob, the value and the successor text — and
+/// never collides with the admissible set (an admissible spelling cannot
+/// also be retired). Case-insensitive like the admissible match. The
+/// `SQUEEZEFS_NVMEOF_TARGET_STACK=spdk` precedent (R-SYM-8): before this arm
+/// existed the startup gate refused it with the generic "expected one of"
+/// message while every other retired surface named the retirement.
+#[test]
+fn retired_enum_values_refuse_naming_the_successor() {
+    let mut seen = 0usize;
+    for k in env_knobs::KNOBS.iter() {
+        let Kind::Enum { allowed, retired } = k.kind else {
+            continue;
+        };
+        for (value, why) in retired {
+            seen += 1;
+            assert!(
+                !allowed.iter().any(|a| a.eq_ignore_ascii_case(value)),
+                "{}: retired value {value} is also admissible",
+                k.key
+            );
+            assert!(!why.is_empty(), "{}: a retired value needs its why", k.key);
+            for spelling in [value.to_string(), value.to_ascii_uppercase()] {
+                let v = env_knobs::validate_vars([(k.key, spelling.as_str())]);
+                assert_eq!(v.errors.len(), 1, "{}={spelling} must refuse: {v:?}", k.key);
+                let msg = &v.errors[0];
+                assert!(msg.contains(k.key) && msg.contains(&spelling), "{msg}");
+                assert!(msg.contains("RETIRED"), "says it is retired: {msg}");
+                assert!(msg.contains(why), "carries the successor text: {msg}");
+                assert!(
+                    !msg.contains("expected one of"),
+                    "a retired value is not an unknown word: {msg}"
+                );
+                assert!(v.unknown.is_empty(), "a retired value's knob is known");
+            }
+        }
+    }
+    assert!(
+        seen >= 1,
+        "the arm exists to be used: the target-stack knob retires spdk"
+    );
+}
+
 /// A malformed value is refused, naming the knob and the value — for every
 /// kind. This is the ENG-10 requirement in one test.
 #[test]

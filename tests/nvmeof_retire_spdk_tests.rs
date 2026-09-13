@@ -17,7 +17,12 @@
 //!   `adopt` can only ever mint an nvmet candidate, and the ledger's
 //!   duplicate-backing guard holds the backing until the record is gone;
 //! * the retired knobs (`SQUEEZEFS_SPDK_TGT_BIN`,
-//!   `SQUEEZEFS_NVMEOF_RUN_DIR`) refuse under the ENG-10 convention;
+//!   `SQUEEZEFS_NVMEOF_RUN_DIR`) refuse under the ENG-10 convention, and
+//!   the retired VALUE `SQUEEZEFS_NVMEOF_TARGET_STACK=spdk` refuses at the
+//!   same startup gate with the retirement + the re-share sequence (not the
+//!   generic enum message);
+//! * `restore` exits nonzero while a retired SPDK record remains (the
+//!   nvmet oneshot unit fails loud until step 1 of the sequence has run);
 //! * `src/nvmeof/spdk/` is gone and nothing under `src/nvmeof/` reaches
 //!   for it (the no-dead-code law, structurally).
 //!
@@ -32,8 +37,8 @@ use squeezefs::env_knobs::{self, Kind};
 use squeezefs::nvmeof::ledger::Ledger;
 use squeezefs::nvmeof::stack::{Listener, LiveShare, RestoreOutcome, ShareRecord, ShareState};
 use squeezefs::nvmeof::{
-    adopt_candidate, classification_of, partition_restorable, resolve_stack, retire_spdk_share,
-    StackKind,
+    adopt_candidate, classification_of, partition_restorable, resolve_stack, restore_outcome,
+    retire_spdk_share, StackKind,
 };
 
 const UUID_A: &str = "e2b1c9a4-52d1-4a08-9f31-7c2b8d1e0aa1";
@@ -186,6 +191,25 @@ fn restore_skips_spdk_records_loud_and_replays_only_nvmet() {
     }
 }
 
+/// A share the ledger records and this binary cannot serve is a FAILED
+/// restore for that share: `restore` (and so `target start` and the nvmet
+/// oneshot unit) exits nonzero while any retired SPDK record remains, naming
+/// the sequence — never a green unit over an unserved share.
+#[test]
+fn restore_exits_nonzero_while_a_retired_spdk_record_remains() {
+    restore_outcome(2, 0, 0).expect("all replayed, nothing retired: success");
+    restore_outcome(0, 0, 0).expect("an empty ledger is a success");
+    let err = restore_outcome(2, 0, 1)
+        .expect_err("a retired record left in the ledger fails the restore")
+        .to_string();
+    assert_names_retirement_and_reshare("restore verdict", &err);
+    assert!(err.contains('1'), "counts the retired records: {err}");
+    let err = restore_outcome(3, 2, 0)
+        .expect_err("nvmet failures still fail")
+        .to_string();
+    assert!(err.contains("2 of 3"), "{err}");
+}
+
 #[test]
 fn unshare_of_an_spdk_record_removes_only_the_ledger_entry_and_names_the_manual_teardown() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -207,6 +231,13 @@ fn unshare_of_an_spdk_record_removes_only_the_ledger_entry_and_names_the_manual_
     assert!(
         note.contains("rpc.py"),
         "the note names the manual spdk_tgt teardown the product no longer drives: {note}"
+    );
+    let residue = dir.path().join("spdk");
+    assert!(
+        note.contains(&residue.display().to_string())
+            && note.contains(&format!("spdk/ptpl/{UUID_A}.json")),
+        "the note names the state-dir residue the retired stack left (the SPDK state dir + the \
+         recorded ptpl file) for the operator to remove once every SPDK record is gone: {note}"
     );
 
     // Retiring a record that is not SPDK is a programming error, refused.
@@ -274,28 +305,74 @@ fn adopt_never_mints_an_spdk_candidate() {
         .expect_err("already ledgered")
         .to_string();
     assert!(err.contains("adopt_already_ledgered"), "{err}");
+    assert_names_retirement_and_reshare("adopt of an SPDK-ledgered NQN", &err);
+
+    // The same law for the BACKING arm: a live nvmet object on a backing an
+    // SPDK record still holds is `unshare` territory — `restore` never
+    // reconciles that record, so the remediation must not say it does.
+    let other = LiveShare {
+        subnqn: "nqn.2026-06.io.foreign:handbuilt-2".to_string(),
+        backing_canonical: "/dev/zram9".to_string(),
+        device_path: "/dev/zram9".to_string(),
+        ..live.clone()
+    };
+    let err = adopt_candidate(&other.subnqn, std::slice::from_ref(&other), &ledger)
+        .expect_err("backing held by the SPDK record")
+        .to_string();
+    assert!(err.contains("adopt_already_ledgered"), "{err}");
+    assert_names_retirement_and_reshare("adopt of an SPDK-held backing", &err);
+    assert!(
+        !err.contains("restore` reconciles"),
+        "restore never reconciles a retired record: {err}"
+    );
 }
 
 // ---------------------------------------------------------------------------
 // knobs (ENG-10)
 // ---------------------------------------------------------------------------
 
+/// The knob keeps `nvmet` as its ONE admissible value and carries `spdk` as
+/// a RETIRED value: the ENG-10 startup gate refuses it with the retirement
+/// and the re-share sequence — the same text every other SPDK-shaped
+/// surface carries — not the generic "expected one of" enum message.
 #[test]
-fn the_target_stack_knob_defaults_to_nvmet_and_refuses_spdk_naming_nvmet() {
+fn the_target_stack_knob_defaults_to_nvmet_and_refuses_spdk_as_a_retired_value() {
     let knob = env_knobs::lookup("SQUEEZEFS_NVMEOF_TARGET_STACK").expect("registered");
     assert_eq!(knob.default, "nvmet");
-    assert_eq!(knob.kind, Kind::Enum(&["nvmet"]));
+    match knob.kind {
+        Kind::Enum { allowed, retired } => {
+            assert_eq!(allowed, &["nvmet"]);
+            assert_eq!(
+                retired.len(),
+                1,
+                "exactly the one retired spelling: {retired:?}"
+            );
+            assert_eq!(retired[0].0, "spdk");
+        }
+        other => panic!("the target-stack knob stays an enum, got {other:?}"),
+    }
 
-    let v = env_knobs::validate_vars([("SQUEEZEFS_NVMEOF_TARGET_STACK", "spdk")]);
+    for spelling in ["spdk", "SPDK"] {
+        let v = env_knobs::validate_vars([("SQUEEZEFS_NVMEOF_TARGET_STACK", spelling)]);
+        assert_eq!(v.errors.len(), 1, "{v:?}");
+        let msg = &v.errors[0];
+        assert!(
+            msg.contains("SQUEEZEFS_NVMEOF_TARGET_STACK") && msg.contains(spelling),
+            "{msg}"
+        );
+        assert_names_retirement_and_reshare("startup gate", msg);
+        assert!(
+            !msg.contains("expected one of"),
+            "the retired value gets the retirement text, not the generic enum refusal: {msg}"
+        );
+    }
+    // A genuinely unknown word keeps the generic enum refusal.
+    let v = env_knobs::validate_vars([("SQUEEZEFS_NVMEOF_TARGET_STACK", "banana")]);
     assert_eq!(v.errors.len(), 1, "{v:?}");
-    let msg = &v.errors[0];
     assert!(
-        msg.contains("SQUEEZEFS_NVMEOF_TARGET_STACK") && msg.contains("spdk"),
-        "{msg}"
-    );
-    assert!(
-        msg.contains("nvmet"),
-        "the refusal names the ONE target: {msg}"
+        v.errors[0].contains("expected one of nvmet"),
+        "{}",
+        v.errors[0]
     );
     assert!(env_knobs::validate_vars([("SQUEEZEFS_NVMEOF_TARGET_STACK", "nvmet")]).is_clean());
 }
@@ -401,7 +478,7 @@ fn the_binary_refuses_the_spdk_env_value_naming_nvmet() {
         text.contains("SQUEEZEFS_NVMEOF_TARGET_STACK") && text.contains("spdk"),
         "names the knob and the value: {text}"
     );
-    assert!(text.contains("nvmet"), "names the ONE target: {text}");
+    assert_names_retirement_and_reshare("binary startup gate", &text);
 }
 
 /// `target install` existed only to build SPDK: a retired verb under the

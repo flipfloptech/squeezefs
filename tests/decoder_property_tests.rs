@@ -31,6 +31,11 @@ use squeezefs::cluster_wire::{
     FrameClass, Role, RpcFrame,
 };
 use squeezefs::layout_wire::{decode_base_layout, encode_layout, LayoutDelta, LayoutMetadata};
+use squeezefs::meta_backend::kv::appender::{
+    classify_page, newest_valid, AppenderIdentity, AppenderPage, AppenderState, DirHeader,
+    GrantRun, PageRead, SlotEntry, SlotEntryState, APPENDER_PAGE_LEN, GRANT_RUNS_MAX,
+    RING_SEGMENTS_MAX, SLOT_PAGE_BUDGET,
+};
 use squeezefs::meta_backend::kv::block_map::{
     block_map_key, decode_block_map_key, decode_block_map_value, parse_kvmap_head,
 };
@@ -54,7 +59,7 @@ use squeezefs::meta_backend::kv::record::{
 use squeezefs::meta_backend::kv::slot_state::{
     decode_slot_state_key, slot_state_key, SlotState, SLOT_STATE_KEY_LEN, SLOT_STATE_VERSION,
 };
-use squeezefs::meta_backend::kv::superblock::SuperblockV3;
+use squeezefs::meta_backend::kv::superblock::{ExtentRef, SuperblockV3};
 use squeezefs::meta_backend::kv::tree::RootPtr;
 use squeezefs::meta_backend::GUEST_NS_SHIFT;
 use squeezefs::meta_ship::publish::{
@@ -624,6 +629,108 @@ proptest! {
             variant[1] = 0x7F;
             prop_assert!(SlotState::decode(&variant).is_err());
             prop_assert!(SlotState::decode(&bytes[..bytes.len() - 1]).is_err());
+        }
+    }
+
+    /// The appender page + directory-header codecs (design-symmetric-
+    /// metadata §5.3.2, PR 2; the `appender_page` fuzz target's mirror)
+    /// are total over arbitrary page-sized bytes — a blank page is
+    /// `Blank`, anything unverifiable `Corrupt`, never a panic — and
+    /// whatever decodes re-encodes byte-identically (canonical: every
+    /// count is bounded, every reserved byte zero).
+    #[test]
+    fn appender_page_decoders_never_panic(
+        data in prop::collection::vec(any::<u8>(), 0..(APPENDER_PAGE_LEN + 8)),
+    ) {
+        match classify_page(&data) {
+            PageRead::Blank => prop_assert!(data.iter().all(|b| *b == 0)),
+            PageRead::Valid(p) => {
+                prop_assert_eq!(data.len(), APPENDER_PAGE_LEN);
+                prop_assert_eq!(p.encode().expect("re-encodes"), data.clone());
+                prop_assert!(p.segments.len() <= RING_SEGMENTS_MAX);
+                prop_assert!(p.grant.len() <= GRANT_RUNS_MAX);
+                prop_assert!(p.slots.len() <= SLOT_PAGE_BUDGET);
+            }
+            PageRead::Corrupt(_) => {}
+        }
+        if let Ok(h) = DirHeader::decode(&data) {
+            prop_assert_eq!(h.encode(), data.clone());
+        }
+        // Newest-valid-wins is total over any image set.
+        let _ = newest_valid(&[data.as_slice(), &[0u8; APPENDER_PAGE_LEN]]);
+    }
+
+    /// Every emittable appender page — any state, any counts within the
+    /// bounds, slot entries in slot order — round-trips; one more entry
+    /// than the budget refuses at the encoder; the newest generation wins
+    /// over its predecessors and a torn newest falls back.
+    #[test]
+    fn appender_page_round_trips_over_the_encoders_domain(
+        id in any::<u32>(),
+        generation in any::<u64>(),
+        node_token in any::<u64>(),
+        mount_slot in any::<u32>(),
+        writer_id in any::<u128>(),
+        term in any::<u64>(),
+        state in 0u8..4,
+        n_segments in 0usize..=RING_SEGMENTS_MAX,
+        n_runs in 0usize..=GRANT_RUNS_MAX,
+        n_slots in 0usize..=SLOT_PAGE_BUDGET,
+        tail in any::<u64>(),
+    ) {
+        let state = match state {
+            0 => AppenderState::Free,
+            1 => AppenderState::Live,
+            2 => AppenderState::Recovering,
+            _ => AppenderState::Recovered,
+        };
+        let mut page = AppenderPage::free(id, generation);
+        page.identity = AppenderIdentity { node_token, mount_slot, writer_id };
+        page.term = term;
+        page.state = state;
+        page.is_manager = term % 2 == 0;
+        page.home_volume = (term % 251) as u8;
+        page.ledger_tail_seq = tail;
+        page.ckpt_seq = tail.wrapping_add(1);
+        page.segments = (0..n_segments as u64)
+            .map(|i| ExtentRef { start: i * 0x4_0000, len: 0x4_0000 })
+            .collect();
+        page.grant = (0..n_runs as u64).map(|i| GrantRun { start: i * 8, len: 8 }).collect();
+        page.slots = (0..n_slots as u16)
+            .map(|i| SlotEntry {
+                slot: i,
+                state: if i % 2 == 0 { SlotEntryState::Live } else { SlotEntryState::Releasing },
+                g: u32::from(i),
+                slot_tree_extents: u32::from(i) * 3,
+                root: RootPtr { addr: u64::from(i) * 0x1_0000, seq: tail.wrapping_add(u64::from(i)) },
+                cursor: u64::from(i),
+            })
+            .collect();
+        let img = page.encode().expect("encodes");
+        prop_assert_eq!(AppenderPage::decode(&img).expect("decodes"), page.clone());
+        let mut over = page.clone();
+        over.slots = (0..=SLOT_PAGE_BUDGET as u16)
+            .map(|i| SlotEntry {
+                slot: i,
+                state: SlotEntryState::Live,
+                g: 0,
+                slot_tree_extents: 0,
+                root: RootPtr { addr: 0, seq: 0 },
+                cursor: 0,
+            })
+            .collect();
+        prop_assert!(over.encode().is_err());
+        // A/B: the higher generation wins; tearing it falls back.
+        let mut older = page.clone();
+        older.generation = generation.wrapping_sub(1);
+        let older_img = older.encode().expect("encodes");
+        if generation > 0 {
+            let (i, _) = newest_valid(&[older_img.clone(), img.clone()]).expect("valid");
+            prop_assert_eq!(i, 1);
+            let mut torn = img.clone();
+            torn[40] ^= 0xFF;
+            let (i, _) = newest_valid(&[older_img, torn]).expect("the predecessor");
+            prop_assert_eq!(i, 0);
         }
     }
 

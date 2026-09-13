@@ -118,6 +118,13 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "appender_page"
+path = "fuzz_targets/appender_page.rs"
+test = false
+doc = false
+bench = false
+
 # --- remote job wire + the cluster wire's RPC vocabulary --------------------
 
 [[bin]]

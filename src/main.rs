@@ -198,6 +198,19 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
+    // Anchor: design-symmetric-metadata §5.3 / §6.2 (PR 2).
+    /// List the appender pages of a symmetric-forest metadata volume
+    ///
+    /// One row per appender directory entry: id, identity, state, term,
+    /// ring segments, leased slots. Read-only probe, safe beside a live
+    /// mount. Refuses on a volume without incompat bit 17.
+    Appenders {
+        /// Metadata URI (sqmeta://...) or a metadata volume path
+        meta_uri: String,
+        /// Emit machine-readable JSON
+        #[arg(long)]
+        json: bool,
+    },
     // Anchors: design-volume-lifecycle §5.3–§5.5/§6 (PR VL3–VL5b).
     /// Manage the volume set: add, list, drain, remove, repair
     ///
@@ -4513,6 +4526,15 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             };
             run_clients_report(&meta_lvs, json).await?;
         }
+        Commands::Appenders { meta_uri, json } => {
+            squeezefs::set_fs_prefix("squeezefs");
+            let meta_lvs = if meta_uri.starts_with("sqmeta://") {
+                parse_block_uri(&meta_uri, "sqmeta://")?
+            } else {
+                vec![meta_uri]
+            };
+            run_appenders_report(&meta_lvs, json).await?;
+        }
         // Anchor: design-full-multi-writer §5.1(b) (KD-MW-2, MW-1b).
         Commands::Staging { action } => {
             squeezefs::set_fs_prefix("squeezefs");
@@ -8003,6 +8025,113 @@ fn find_squeezefs_mounts() -> Vec<PathBuf> {
 /// classified under the existing staleness law (live / stale / dead-pid).
 /// Read-only probes (the `status` access pattern): never blocked by, and
 /// never perturbing, a live mount.
+/// `squeezefs appenders` (design-symmetric-metadata §6.2, PR 2): the
+/// appender directory of each volume — id, identity, state, term, ring
+/// segments, leased slots — off a read-only probe (the mount's own
+/// bootstrap, nothing written). A volume without incompat bit 17 holds no
+/// directory and is refused naming the way one gets the bit.
+async fn run_appenders_report(
+    meta_lvs: &[String],
+    json: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use squeezefs::meta_backend::kv::appender::{read_directory, AppenderState};
+    let mut rows: Vec<serde_json::Value> = Vec::new();
+    for path in meta_lvs {
+        let be = squeezefs::meta_backend::kv::backend::KvMetaBackend::open_probe(
+            std::path::Path::new(path),
+        )
+        .await
+        .map_err(|e| format!("cannot probe metadata volume '{path}': {e}"))?;
+        let sb = be.superblock().clone();
+        if !sb.symmetric_forest_stamped() {
+            return Err(format!(
+                "{path}: not a symmetric-forest volume (incompat bit 17 absent) — it has no \
+                 appender directory. Until `squeezefs volume enable-symmetric` / `format \
+                 --symmetric` land (design-symmetric-metadata PR 11), only the test seam \
+                 SQUEEZEFS_TEST_STAMP_SYMMETRIC=1 stamps the bit at format"
+            )
+            .into());
+        }
+        let capacity = be.appender_stats().map_or(0, |s| s.capacity);
+        for e in read_directory(std::path::Path::new(path), &sb).await? {
+            let Some(p) = e.page else {
+                rows.push(serde_json::json!({
+                    "volume": path,
+                    "appender_id": e.appender_id,
+                    "state": "unallocated",
+                }));
+                continue;
+            };
+            rows.push(serde_json::json!({
+                "volume": path,
+                "appender_id": p.appender_id,
+                "state": p.state.as_str(),
+                "term": p.term,
+                "generation": p.generation,
+                "is_manager": p.is_manager,
+                "identity": {
+                    "node_token": format!("{:#018x}", p.identity.node_token),
+                    "mount_slot": p.identity.mount_slot,
+                    "writer_id": format!("{:#034x}", p.identity.writer_id),
+                },
+                "ring": {
+                    "segments": p.segments.iter().map(|s| serde_json::json!({
+                        "start": s.start, "len": s.len
+                    })).collect::<Vec<_>>(),
+                    "bytes": p.ring_bytes(),
+                    "head_hint": p.head_hint,
+                    "ledger_tail_seq": p.ledger_tail_seq,
+                    "ckpt_seq": p.ckpt_seq,
+                },
+                "grant_runs": p.grant.len(),
+                "leased_slots": p.slots.iter().map(|s| s.slot).collect::<Vec<u16>>(),
+                "appenders_capacity": capacity,
+                "recovering_or_recovered_by_term":
+                    if p.state == AppenderState::Free { serde_json::Value::Null } else { serde_json::json!(p.recovered_by_term) },
+            }));
+        }
+    }
+    if json {
+        println!("{}", serde_json::to_string_pretty(&rows)?);
+        return Ok(());
+    }
+    println!(
+        "{:<4} {:<11} {:<5} {:<20} {:<10} {:<9} {:<12} {}",
+        "id", "state", "term", "node_token", "mount_slot", "segments", "ring_bytes", "leased_slots"
+    );
+    for r in &rows {
+        if r["state"] == "unallocated" {
+            println!("{:<4} {:<11}", r["appender_id"], "unallocated");
+            continue;
+        }
+        let slots: Vec<String> = r["leased_slots"]
+            .as_array()
+            .map(|a| a.iter().map(|v| v.to_string()).collect())
+            .unwrap_or_default();
+        let shown = if slots.len() > 8 {
+            format!("{} (+{} more)", slots[..8].join(","), slots.len() - 8)
+        } else {
+            slots.join(",")
+        };
+        println!(
+            "{:<4} {:<11} {:<5} {:<20} {:<10} {:<9} {:<12} {}",
+            r["appender_id"],
+            r["state"].as_str().unwrap_or("?"),
+            r["term"],
+            r["identity"]["node_token"].as_str().unwrap_or("?"),
+            r["identity"]["mount_slot"],
+            r["ring"]["segments"].as_array().map_or(0, |a| a.len()),
+            r["ring"]["bytes"],
+            if shown.is_empty() {
+                "-".to_string()
+            } else {
+                shown
+            },
+        );
+    }
+    Ok(())
+}
+
 async fn run_clients_report(
     meta_lvs: &[String],
     json: bool,

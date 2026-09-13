@@ -13487,6 +13487,55 @@ impl SqueezefsFilesystem {
                     "meta_kv_forest_reader_unpublished_children".into(),
                     load(&meta_kv::META_KV_FOREST_READER_UNPUBLISHED_CHILDREN),
                 );
+                // THE APPENDER FAMILY (design-symmetric-metadata §11 —
+                // PR 2, dark): per volume, 0 on every bit-17-absent mount
+                // (no region exists there). `appenders_capacity` is derived
+                // (`heap/16 ÷ ring`); the closure law is
+                // `appender_joins − appender_leaves − appender_recoveries ≡
+                // appenders_live` (recoveries = PR 10's, 0 here);
+                // `appender_flush_ceiling_overruns` MUST STAY 0 (a flush
+                // pass that began with a region's dirty leaves and
+                // reached its covering barrier past CHECKPOINT_MAX_AGE_MS
+                // — KD-SYM-10).
+                let appender = |f: &dyn Fn(&meta_kv::appender::AppenderStats) -> u64| {
+                    per_volume(&|be| be.appender_stats().map_or(0, |s| f(&s)))
+                };
+                metrics.insert(
+                    "appender_id".into(),
+                    appender(&|s| u64::from(s.appender_id)),
+                );
+                metrics.insert("appenders_live".into(), appender(&|s| s.live));
+                metrics.insert("appenders_capacity".into(), appender(&|s| s.capacity));
+                metrics.insert("appender_joins".into(), appender(&|s| s.joins));
+                metrics.insert("appender_leaves".into(), appender(&|s| s.leaves));
+                metrics.insert(
+                    "appender_self_recoveries".into(),
+                    appender(&|s| s.self_recoveries),
+                );
+                metrics.insert("appender_ring_bytes".into(), appender(&|s| s.ring_bytes));
+                metrics.insert(
+                    "appender_ring_segments".into(),
+                    appender(&|s| s.ring_segments),
+                );
+                metrics.insert("appender_ring_grows".into(), appender(&|s| s.ring_grows));
+                metrics.insert(
+                    "appender_flush_ceiling_overruns".into(),
+                    appender(&|s| s.flush_ceiling_overruns),
+                );
+                // The three per-ring partition classes (§5.3.4 / §5.8.6),
+                // MUST STAY 0: a mount that counted one refused.
+                metrics.insert(
+                    "meta_kv_replay_key_violations".into(),
+                    load(&meta_kv::META_KV_REPLAY_KEY_VIOLATIONS),
+                );
+                metrics.insert(
+                    "meta_kv_replay_lease_violations".into(),
+                    load(&meta_kv::META_KV_REPLAY_LEASE_VIOLATIONS),
+                );
+                metrics.insert(
+                    "meta_kv_replay_extent_violations".into(),
+                    load(&meta_kv::META_KV_REPLAY_EXTENT_VIOLATIONS),
+                );
                 // LEAF-MERGE finalized (§4.6a (c)/(e)): `interior_merges`
                 // = the level-≥1 subset of `node_merges` (cross-parent
                 // shrinkage's face); `merge_laps` = whole-volume sweep

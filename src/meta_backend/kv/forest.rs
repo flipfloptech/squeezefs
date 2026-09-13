@@ -5,7 +5,7 @@
 //! mixed-kind [`KvTree`] per routing slot, plus the control tree
 //! ([`TREE_CONTROL`], "tree 0"). This module owns that population and the
 //! ONE routing function every backend site goes through:
-//! [`SlotTrees::route`] takes a `(kind, legacy key)` pair — exactly what
+//! [`SlotTrees::route_or_mint`] takes a `(kind, legacy key)` pair — exactly what
 //! the shipped per-kind codecs produce — and answers the slot tree that
 //! holds it together with the record's forest key (§5.2.1). Reads route
 //! the same way and strip the kind byte on the way out, so every per-kind
@@ -289,10 +289,21 @@ impl SlotTrees {
         }
         let (fstart, first_slot) = forest_bound(kind, start, false);
         let (fend, last_slot) = forest_bound(kind, end, true);
-        for (slot, tree) in self.slot_trees() {
-            if slot < first_slot || slot > last_slot {
-                continue;
+        // The common case — a chain scan, an ino's xattrs, a directory's
+        // entries — spans ONE slot: probe that tree alone. Only a census
+        // window walks the forest (slot order = legacy key order).
+        let trees: Vec<(ForestSlot, Arc<KvTree>)> = if first_slot == last_slot {
+            match self.tree(first_slot) {
+                Some(t) => vec![(first_slot, t)],
+                None => return Ok(out), // no tree ⇒ nothing was ever written there
             }
+        } else {
+            self.slot_trees()
+                .into_iter()
+                .filter(|(slot, _)| *slot >= first_slot && *slot <= last_slot)
+                .collect()
+        };
+        for (_slot, tree) in trees {
             let mut cursor = fstart.clone();
             'tree: loop {
                 // A page of the mixed leaf; over-fetch by the kind mix so

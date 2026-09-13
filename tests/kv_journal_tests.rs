@@ -350,15 +350,19 @@ fn test_entry_payload_roundtrip_and_bounds() {
     // Truncated container: never a panic, always a typed error.
     assert!(decode_entry_payload(&payload[..payload.len() - 1]).is_err());
     assert!(decode_entry_payload(&payload[..1]).is_err());
-    // tree_id 0 (zeroed garbage) and ids beyond the §4.2 table are corrupt.
+    // tree_id 0 at LEVEL 0 (zeroed garbage) and ids beyond the §4.2 table
+    // are corrupt. Kind 0 is legal only at an interior level — a slot
+    // tree's separator record (design-symmetric-metadata §5.2.1).
     let mut zero_id = payload.clone();
     zero_id[0] = 0;
     assert!(decode_entry_payload(&zero_id).is_err());
     let mut big_id = payload;
-    // Tree id 8 — one past `TREE_ID_MAX` (7 = the block-map tree,
-    // docs/design-kvmap-block-map-tree.md / incompat bit 16; the §4.2
-    // table grew again — 6 is the durable block-ref tree).
-    big_id[0] = 8;
+    // Tree id 10 — one past `TREE_ID_MAX` (9 = the shared index; 8 the
+    // control tree; 7 the block-map tree,
+    // docs/design-kvmap-block-map-tree.md / incompat bit 16; 6 the
+    // durable block-ref tree — the §4.2 table grew again with the
+    // symmetric program's forest).
+    big_id[0] = 10;
     assert!(decode_entry_payload(&big_id).is_err());
 }
 

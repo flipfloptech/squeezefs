@@ -3202,12 +3202,14 @@ impl KvMetaBackend {
         }
     }
 
-    /// The volume-shared record/node seq source (the trees clone it).
+    /// The volume-shared record/node seq source (every tree clones the
+    /// same `Arc`; one clone here, never a tree-set walk — this sits on
+    /// the per-record commit path of a forest volume).
     fn seq_handle(&self) -> Arc<AtomicU64> {
-        self.all_trees()
-            .first()
-            .expect("a mounted volume has at least one tree")
-            .seq_handle()
+        match &self.trees {
+            TreeSet::Flat { inodes, .. } => inodes.seq_handle(),
+            TreeSet::Forest { forest, .. } => forest.control().seq_handle(),
+        }
     }
 
     /// Latch-free point lookup of a `(kind, legacy key)` — the ONE read

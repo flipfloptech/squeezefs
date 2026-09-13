@@ -789,7 +789,15 @@ async fn map_records_survive_a_crash_remount_through_the_journal() {
 async fn a_fresh_format_does_not_carry_bit16_and_sector0_stays_byte_identical() {
     // The on-disk pins.
     assert_eq!(TREE_BLOCK_MAP, 7, "the §4.2 tree table pins the id");
-    assert_eq!(TREE_ID_MAX, TREE_BLOCK_MAP);
+    // The symmetric program's forest (design-symmetric-metadata §5.2.1)
+    // extended the id space past the block-map tree: TREE_CONTROL = 8
+    // and TREE_SHARED_INDEX = 9, so the ceiling is 9, still inside the
+    // tag nibble.
+    assert_eq!(
+        TREE_ID_MAX,
+        squeezefs::meta_backend::kv::record::TREE_SHARED_INDEX,
+        "the ceiling is the shared index, two past the block-map tree"
+    );
     assert_eq!(TREE_BLOCK_REFS, 6, "tree 7 sits beside the refs tree");
     assert_eq!(
         TREE_BLOCK_MAP & 0xF0,

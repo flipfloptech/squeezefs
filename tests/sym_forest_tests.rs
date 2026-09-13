@@ -901,6 +901,14 @@ async fn a_stamped_set_mints_into_guest_slot_trees_whose_roots_ride_tree_zero() 
     // tree 0 + the native root only.
     vol.checkpoint_now().await.expect("checkpoint");
     let published = vol.forest_census().expect("forest");
+    // MINT_SPREAD rotor slots + the native slot: 2 × MINT_SPREAD files
+    // spread over every rotor slot (the mint-spread law), one tree each,
+    // one extent each — the per-slot extent floor §1.6 names.
+    assert_eq!(
+        published.slot_trees as usize, MINT_SPREAD,
+        "every rotor slot minted its tree"
+    );
+    assert_eq!(published.minted as usize, MINT_SPREAD - 1);
     assert_eq!(
         published.control_records,
         published.slot_trees - 1,

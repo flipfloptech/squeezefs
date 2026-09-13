@@ -1314,6 +1314,38 @@ async fn replay_converges_across_crash_windows_of_a_merge_and_a_root_collapse() 
         assert!(covering <= 8, "the tail never passed the deletes");
     }
 
+    // Fold the parent's Δtime residue FIRST — the D4 arm's own order
+    // (`JobType::DefragMeta`: the compaction nudge, then the merge sweep).
+    // Every unlink above updated the parent under a SHARED lock, i.e. a
+    // Δtime MERGE record on ino 1 (§4.4 pt 6) — 2,700 of them, live data
+    // until a fold applies them, which coverage never does. The §4.6a
+    // candidate law prices a leaf by `fold_bytes_upper` — an UPPER bound
+    // that sums un-folded records at full length (the algebra is what it
+    // avoids) — so the leaf holding ino 1 projects at the residue the
+    // last threshold compaction left behind (measured 1.6–19 KiB across
+    // runs, against the 15 KiB bound: the background maintenance task
+    // decides when that compaction ran), and while it sits above the
+    // bound the greedy packing merges every OTHER leaf into one and
+    // stops with two non-candidates (review round 3, Issue 17's second
+    // face — 1 in ~12 stamped runs). On a flat volume the residue sits
+    // in the inode tree and the dentry tree collapses regardless; on a
+    // forest it shares the survivors' ONE tree.
+    let dead = be.dead_bset_census();
+    be.defrag_compact_nodes(&dead.candidates)
+        .await
+        .expect("fold the dead-carrying leaves");
+    {
+        let (tree, key) = be
+            .record_locator(TREE_INODES, &ikey(ROOT_INO))
+            .expect("locator")
+            .expect("inode tree");
+        let leaf = tree.resolve_leaf(&key).await.expect("the parent's leaf");
+        assert!(
+            tree.is_merge_candidate(&leaf),
+            "the parent's leaf projects under the candidate bound once its Δtime residue is \
+             folded"
+        );
+    }
     let census = be.dead_bset_census();
     assert!(
         census.merge_candidates.len() >= 2,
@@ -1396,18 +1428,48 @@ async fn replay_converges_across_crash_windows_of_a_merge_and_a_root_collapse() 
     if META_KV_ROOT_COLLAPSES.load(Ordering::Relaxed) <= collapses0 {
         let c = be.dead_bset_census();
         let a = be.merge_candidates_audit().await;
+        // Per-leaf attribution: the leaves the survivors (and the parent
+        // inode) resolve to, each with its fold projection under the
+        // census tail — what the candidate law read.
+        let layout = NodeLayout::new(be.superblock().node_size as usize).expect("layout");
+        let mut leaves: BTreeMap<u64, (usize, u64, u64, bool)> = BTreeMap::new();
+        for ino in std::iter::once(ROOT_INO).chain((0..N).step_by(stride as usize).map(|i| {
+            // Survivor inos are minted in create order after the root.
+            ROOT_INO + 1 + u64::from(i)
+        })) {
+            let (tree, key) = be
+                .record_locator(TREE_INODES, &ikey(ino))
+                .expect("locator")
+                .expect("inode tree");
+            let leaf = tree.resolve_leaf(&key).await.expect("leaf");
+            let snap = leaf.snapshot();
+            let (indexed, distinct) = snap.indexed_record_census();
+            let (fold, _) =
+                snap.fold_bytes_upper_with(&mut [], layout.merge_pair_capacity(), a.census_tail);
+            let e = leaves
+                .entry(leaf.addr())
+                .or_insert((fold, indexed, distinct, false));
+            e.3 |= ino == ROOT_INO;
+        }
         panic!(
             "3,000 creates minus all but every {stride}-th must collapse a tree to its root leaf \
              (census: {} leaves, {} live of {} indexed, {} merge candidates; audit gauge {} \
-             census_now {}; free {} promised {})",
+             census_now {} census_tail {} ledger_tail {} deletes_head {}; free {} promised {}; \
+             candidate bound {} pair {}; leaves by addr (fold, indexed, distinct, holds root): \
+             {leaves:x?})",
             c.leaves,
             c.records_live,
             c.records_indexed,
             c.merge_candidates.len(),
             a.gauge,
             a.census_now,
+            a.census_tail,
+            be.ledger_tail(),
+            deletes_head,
             be.free_extents(),
-            be.heap_promised()
+            be.heap_promised(),
+            layout.merge_candidate_capacity(),
+            layout.merge_pair_capacity(),
         );
     }
     let crash_c = NamedTempFile::new().expect("crash image c");

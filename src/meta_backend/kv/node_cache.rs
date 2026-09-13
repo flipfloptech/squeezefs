@@ -1320,6 +1320,31 @@ impl NodeDirty {
         self.heap_promised.fetch_add(extents, Ordering::AcqRel);
     }
 
+    /// Return `extents` of a promise the admission made for a member that
+    /// was then REFUSED (a later leaf of the same member did not clear the
+    /// floor — §4.7 P1, review round 3 Issue 17): the member's records
+    /// never land, so the SMO they projected is not owed. A promise left
+    /// on a node with nothing pending is never consumed — no flush has an
+    /// SMO to run there — and stands as a permanent claimable deficit
+    /// (`heap_promised = 1` for 32 cycles was the mid-wave ENOSPC
+    /// fixpoint). The basis stays where the walk put it (an over-estimate
+    /// only triggers an earlier re-walk); a promise back at 0 clears it.
+    pub fn retract_promise(&mut self, extents: u64) {
+        let take = extents.min(self.promised);
+        self.promised -= take;
+        self.heap_promised.fetch_sub(take, Ordering::AcqRel);
+        if self.promised == 0 {
+            self.promise_basis = 0;
+            self.promise_added = 0;
+        }
+    }
+
+    /// Undo [`Self::note_promise_growth`] for a refused member's bytes
+    /// (they were never applied).
+    pub fn retract_promise_growth(&mut self, bytes: usize) {
+        self.promise_added = self.promise_added.saturating_sub(bytes);
+    }
+
     /// Return this node's promise to the ledger (the SMO consumed it, or
     /// the pending bytes fit in place after an append).
     pub fn release_promise(&mut self) {

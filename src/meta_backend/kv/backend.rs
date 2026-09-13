@@ -10471,6 +10471,12 @@ impl KvMetaBackend {
         let mut pending: Vec<usize> = vec![0; lock_set.len()];
         // Per member: (leaf slot, bytes) — small, deduped by slot.
         let mut member: Vec<(usize, usize)> = Vec::new();
+        // Per member: the promise mutations made for its leaves so far —
+        // `(leaf slot, extents promised, growth noted)` — undone when a
+        // LATER leaf of the same member is refused (§4.7 P1: a promise
+        // left on a leaf whose member never landed has no SMO to consume
+        // it and understates claimable for ever).
+        let mut taken: Vec<(usize, u64, usize)> = Vec::new();
         let mut refused: Vec<(usize, KvError)> = Vec::new();
         // The batch's records landing on leaf `gi`, members `..=upto`, in
         // apply order — the walk's pending input (refused members were
@@ -10492,6 +10498,7 @@ impl KvMetaBackend {
         };
         for (qi, (q, entry_leaves)) in entries.iter().zip(leaves).enumerate() {
             member.clear();
+            taken.clear();
             for ((_, r), leaf) in q.recs.iter().zip(entry_leaves) {
                 let gi = slot(leaf);
                 let bytes = r.record_ref().encoded_len();
@@ -10501,6 +10508,7 @@ impl KvMetaBackend {
                 }
             }
             let mut verdict: Option<KvError> = None;
+            let mut admitted_split = false;
             for &(gi, bytes) in &member {
                 if guards[gi].projected_log_end(&layout, pending[gi] + bytes) <= node_size {
                     continue; // in-place append at the flush
@@ -10529,6 +10537,7 @@ impl KvMetaBackend {
                     };
                     if covered {
                         guards[gi].note_promise_growth(bytes);
+                        taken.push((gi, 0, bytes));
                         continue;
                     }
                 }
@@ -10556,11 +10565,8 @@ impl KvMetaBackend {
                     .saturating_sub(self.cache.heap_promised());
                 if claimable.saturating_sub(delta) >= floor {
                     guards[gi].promise(delta, fold);
-                    if is_split {
-                        // A leaf was just minted-in-budget: the growth
-                        // floor is clear.
-                        self.leave_heap_full("a growth commit was admitted a new leaf");
-                    }
+                    taken.push((gi, delta, 0));
+                    admitted_split |= is_split;
                 } else {
                     log::debug!(
                         "heap admission refused: tree {} leaf {:#x} projects a fold of {fold} B \
@@ -10586,8 +10592,25 @@ impl KvMetaBackend {
                     for &(gi, bytes) in &member {
                         pending[gi] += bytes;
                     }
+                    if admitted_split {
+                        // A leaf was minted-in-budget for a member that
+                        // LANDS: the growth floor is clear.
+                        self.leave_heap_full("a growth commit was admitted a new leaf");
+                    }
                 }
-                Some(e) => refused.push((qi, e)),
+                Some(e) => {
+                    // The member never lands: give back every promise its
+                    // earlier leaves drew and every growth they noted.
+                    for &(gi, extents, grew) in &taken {
+                        if extents > 0 {
+                            guards[gi].retract_promise(extents);
+                        }
+                        if grew > 0 {
+                            guards[gi].retract_promise_growth(grew);
+                        }
+                    }
+                    refused.push((qi, e));
+                }
             }
         }
         refused

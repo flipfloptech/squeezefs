@@ -2412,3 +2412,73 @@ fn free_grace_elastic_checkpoint_ceiling_derives_from_the_poll_and_the_cycle() {
     assert_eq!(elastic_checkpoint_ceiling_ms(300, 0, 1_000), 150);
     assert_eq!(elastic_checkpoint_ceiling_ms(1, 0, 1_000), 1);
 }
+
+/// The symmetric appender REGION's derivations (design-symmetric-metadata
+/// §1.6 "Per-appender ring" / "Ring budget per volume", §5.7.3 KD-SYM-10;
+/// PR 2): the ring floor is the §4.4 pt 5 checkpoint carve-out plus one
+/// max entry rounded to a power of two, the ceiling the solo ring's own
+/// derivation, the default two checkpoint ages of the measured commit
+/// stream inside them; `appenders_capacity = heap/16 ÷ ring`; the
+/// `SQUEEZEFS_SYM_RING_KB` registry range is the floor in KiB to the solo
+/// derivation's ceiling; the flush ceiling IS `CHECKPOINT_MAX_AGE_MS`.
+/// Drift on any of them is red here.
+#[test]
+fn sym_appender_ring_derives_from_the_reserve_and_the_solo_ring() {
+    use squeezefs::meta_backend::kv::appender::{
+        appender_flush_ceiling_ms, appender_ring_bytes_derived, appenders_capacity,
+        ring_budget_bytes, sym_ring_ceiling_bytes, SYM_RING_FLOOR_BYTES,
+    };
+    use squeezefs::meta_backend::kv::checkpoint::CHECKPOINT_MAX_AGE_MS;
+    use squeezefs::meta_backend::kv::journal::{checkpoint_reserve_bytes, MAX_ENTRY_LEN};
+    use squeezefs::meta_backend::kv::superblock::{
+        journal_ring_len, JOURNAL_RING_MAX, JOURNAL_RING_MIN,
+    };
+
+    // Floor: reserve(256 KiB at this size) + 128 KiB = 384 KiB → 512 KiB.
+    assert_eq!(
+        SYM_RING_FLOOR_BYTES,
+        (checkpoint_reserve_bytes(SYM_RING_FLOOR_BYTES) + MAX_ENTRY_LEN).next_power_of_two()
+    );
+    assert_eq!(SYM_RING_FLOOR_BYTES, 512 * 1024);
+    // Ceiling = the solo ring's clamp, on both canonical shapes.
+    let field_vol = 2 * 1024 * GIB; // a 2 TiB metadata volume ⇒ the 32 MiB solo cap
+    let floor_vol = 256 * MIB; // a small volume ⇒ the 8 MiB solo floor
+    assert_eq!(sym_ring_ceiling_bytes(field_vol), JOURNAL_RING_MAX);
+    assert_eq!(sym_ring_ceiling_bytes(floor_vol), JOURNAL_RING_MIN);
+    assert_eq!(
+        sym_ring_ceiling_bytes(field_vol),
+        journal_ring_len(field_vol)
+    );
+    // Default: 2 × rate × CHECKPOINT_MAX_AGE, clamped — a fresh join (no
+    // EWMA) takes the floor; the field peak (8 k creates/s × ≈ 230 B ≈
+    // 1.8 MiB/s) lands at ≈ 3.7 MiB; a runaway rate the ceiling.
+    assert_eq!(
+        appender_ring_bytes_derived(0, field_vol),
+        SYM_RING_FLOOR_BYTES
+    );
+    let peak = 8_000 * 230;
+    let expect = 2 * peak * CHECKPOINT_MAX_AGE_MS as u64 / 1000 / 4096 * 4096;
+    assert_eq!(appender_ring_bytes_derived(peak, field_vol), expect);
+    assert_eq!(
+        appender_ring_bytes_derived(u64::MAX / 4, field_vol),
+        JOURNAL_RING_MAX
+    );
+    // Capacity: heap/16 over the ring an appender joins with.
+    let heap = 2 * 1024 * GIB;
+    assert_eq!(ring_budget_bytes(heap), heap / 16);
+    assert_eq!(
+        appenders_capacity(heap, SYM_RING_FLOOR_BYTES),
+        heap / 16 / SYM_RING_FLOOR_BYTES
+    );
+    // The knob's registry range ties to the floor and the solo ceiling.
+    let knob = squeezefs::env_knobs::lookup("SQUEEZEFS_SYM_RING_KB").expect("registered");
+    match knob.kind {
+        squeezefs::env_knobs::Kind::Int { lo, hi } => {
+            assert_eq!(lo, (SYM_RING_FLOOR_BYTES / 1024) as i128);
+            assert_eq!(hi, (JOURNAL_RING_MAX / 1024) as i128);
+        }
+        other => panic!("SQUEEZEFS_SYM_RING_KB must be Int, got {other:?}"),
+    }
+    // KD-SYM-10: the flush ceiling is the checkpoint cadence ceiling.
+    assert_eq!(appender_flush_ceiling_ms(), CHECKPOINT_MAX_AGE_MS as u64);
+}

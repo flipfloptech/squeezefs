@@ -40,8 +40,16 @@ use squeezefs::meta_backend::kv::appender::{
 };
 use squeezefs::meta_backend::kv::builder::{BuilderConfig, ImageBuilder, ROOT_INO};
 use squeezefs::meta_backend::kv::checkpoint::CHECKPOINT_MAX_AGE_MS;
-use squeezefs::meta_backend::kv::journal::{checkpoint_reserve_bytes, MAX_ENTRY_LEN};
-use squeezefs::meta_backend::kv::record::{guest_forest_slot, NATIVE_FOREST_SLOT};
+use squeezefs::meta_backend::kv::journal::{
+    checkpoint_reserve_bytes, detect_appender_violations, entry_len_for, tag_for,
+    AppenderViolation, JournalRecovery, JournalRing, ReplayedEntry, RingSegment,
+    JOURNAL_PAGE_LEN, MAX_ENTRY_LEN,
+};
+use squeezefs::meta_backend::kv::journal_core::AdmissionClass;
+use squeezefs::meta_backend::kv::record::{
+    forest_key, guest_forest_slot, inode_key, Record, KIND_INTERIOR, NATIVE_FOREST_SLOT,
+    TREE_ALLOC_RESERVED, TREE_CONTROL, TREE_INODES,
+};
 use squeezefs::meta_backend::kv::superblock::{
     classify_volume, journal_ring_len, ExtentRef, SuperblockV3, VolumeFormat,
     FEATURE_INCOMPAT_KV_SYMMETRIC_FOREST, SUPERBLOCK_V3_LEN,
@@ -526,4 +534,264 @@ async fn format_under_the_seam_writes_appender_zeros_page_pair_and_the_first_dir
     for e in &entries[1..] {
         assert!(e.page.is_none(), "an unallocated id has no page");
     }
+}
+
+// ---------------------------------------------------------------------------
+// §5.3.1 / §6.4 — segmented rings (kv/journal.rs).
+// ---------------------------------------------------------------------------
+
+/// One inode Put padding its entry to exactly `entry_len` bytes.
+fn sized_records(i: u64, entry_len: u64, marker: u8, seq: u64) -> Vec<(u8, Record)> {
+    let overhead = squeezefs::meta_backend::kv::journal::ENTRY_HDR_LEN
+        + 1
+        + squeezefs::meta_backend::kv::record::RECORD_HEADER_LEN as u64
+        + squeezefs::meta_backend::kv::record::INODE_KEY_LEN as u64;
+    let value = vec![marker; (entry_len - overhead) as usize];
+    vec![(TREE_INODES, Record::put(inode_key(i).to_vec(), seq, value))]
+}
+
+async fn append_sized(ring: &JournalRing, i: u64, entry_len: u64, marker: u8) -> u64 {
+    let probe = sized_records(i, entry_len, marker, 0);
+    let need = entry_len_for(&probe).expect("under cap");
+    let adm = ring
+        .core()
+        .try_admit(need, AdmissionClass::User)
+        .expect("room");
+    let res = ring.reserve_registered(adm);
+    let records = sized_records(i, entry_len, marker, res.seq());
+    ring.commit_entry(&res, &records).await.expect("write");
+    res.end()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_segmented_ring_maps_pages_through_its_segment_table_and_replays_across_segments() {
+    // Two NON-contiguous segments of 4 pages each, with a 16-page gap.
+    let f = NamedTempFile::new().unwrap();
+    f.as_file().set_len(64 * JOURNAL_PAGE_LEN).unwrap();
+    let segs = vec![
+        RingSegment {
+            base: 4 * JOURNAL_PAGE_LEN,
+            pages: 4,
+        },
+        RingSegment {
+            base: 24 * JOURNAL_PAGE_LEN,
+            pages: 4,
+        },
+    ];
+    let ring = JournalRing::new_segments(f.path(), segs.clone(), 0);
+    assert_eq!(
+        ring.segments(),
+        vec![
+            ExtentRef {
+                start: 4 * JOURNAL_PAGE_LEN,
+                len: 4 * JOURNAL_PAGE_LEN
+            },
+            ExtentRef {
+                start: 24 * JOURNAL_PAGE_LEN,
+                len: 4 * JOURNAL_PAGE_LEN
+            }
+        ]
+    );
+    assert_eq!(ring.ring_bytes(), 8 * JOURNAL_PAGE_LEN);
+    // Logical page 5 is the second segment's page 1.
+    assert_eq!(ring.page_offset(5), 24 * JOURNAL_PAGE_LEN + JOURNAL_PAGE_LEN);
+    // Six 3000-byte entries: the chain crosses the segment boundary
+    // (page 4 starts at logical 4 × 4072 = 16,288; entry 6 ends past it).
+    let mut end = 0;
+    for i in 1..=6u64 {
+        end = append_sized(&ring, i, 3000, i as u8).await;
+    }
+    assert!(end > 4 * 4072, "the chain crossed into the second segment");
+    let (rec_ring, recovery) = JournalRing::recover_segments(f.path(), segs, 0, 0)
+        .await
+        .expect("replay");
+    assert_eq!(recovery.entries.len(), 6);
+    assert_eq!(recovery.dropped_torn, 0);
+    assert_eq!(rec_ring.core().head(), end);
+    for (i, e) in recovery.entries.iter().enumerate() {
+        assert_eq!(e.records, sized_records(i as u64 + 1, 3000, i as u8 + 1, e.seq));
+    }
+    // The gap between the segments was never written.
+    let gap = squeezefs::uring_fs::read_at(f.path(), 8 * JOURNAL_PAGE_LEN, 16 * 4096)
+        .await
+        .unwrap();
+    assert!(gap.iter().all(|b| *b == 0));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_solo_ring_is_one_segment_and_growth_needs_a_drained_ring() {
+    let f = NamedTempFile::new().unwrap();
+    f.as_file().set_len(32 * JOURNAL_PAGE_LEN).unwrap();
+    let ring = JournalRing::new(f.path(), 4096, 4, 0);
+    assert_eq!(
+        ring.segments(),
+        vec![ExtentRef {
+            start: 4096,
+            len: 4 * JOURNAL_PAGE_LEN
+        }],
+        "the shipped ring is one segment over its extent"
+    );
+    let extra = RingSegment {
+        base: 16 * JOURNAL_PAGE_LEN,
+        pages: 4,
+    };
+    // Drained (head == reusable_upto, nothing in flight): grows, head kept.
+    let end = append_sized(&ring, 1, 500, 0xA1).await;
+    ring.advance_reusable_upto(end);
+    let grown = ring.grown_with(extra).expect("a drained ring grows");
+    assert_eq!(grown.segments().len(), 2);
+    assert_eq!(grown.core().head(), end, "the logical head is kept");
+    assert_eq!(grown.core().reusable_upto(), end);
+    assert_eq!(grown.core().geometry().pages, 8);
+    assert_eq!(grown.written_entries(), 1, "the counters carry over");
+    // Not drained: in-window records exist ⇒ refused.
+    let ring2 = JournalRing::new(f.path(), 4096, 4, 0);
+    append_sized(&ring2, 1, 500, 0xA2).await;
+    assert!(ring2.grown_with(extra).is_err(), "an undrained ring refuses to grow");
+    // An open reservation ⇒ refused.
+    let ring3 = JournalRing::new(f.path(), 4096, 4, 0);
+    let adm = ring3.core().try_admit(500, AdmissionClass::User).unwrap();
+    let res = ring3.reserve_registered(adm);
+    ring3.advance_reusable_upto(res.end());
+    assert!(ring3.grown_with(extra).is_err(), "an open reservation refuses growth");
+    ring3.complete(&res);
+    // Past the segment bound ⇒ refused.
+    let mut many = JournalRing::new(f.path(), 4096, 1, 0);
+    for k in 0..RING_SEGMENTS_MAX as u64 - 1 {
+        many = many
+            .grown_with(RingSegment {
+                base: (8 + k) * JOURNAL_PAGE_LEN,
+                pages: 1,
+            })
+            .expect("under the bound");
+    }
+    assert_eq!(many.segments().len(), RING_SEGMENTS_MAX);
+    assert!(
+        many.grown_with(RingSegment {
+            base: 20 * JOURNAL_PAGE_LEN,
+            pages: 1
+        })
+        .is_err(),
+        "a ninth segment refuses"
+    );
+}
+
+#[test]
+fn sym_ring_kb_is_a_registered_int_knob_with_the_derived_range() {
+    let knob = squeezefs::env_knobs::lookup("SQUEEZEFS_SYM_RING_KB")
+        .expect("ENG-10: every knob a site reads is registered");
+    match knob.kind {
+        squeezefs::env_knobs::Kind::Int { lo, hi } => {
+            assert_eq!(lo, (SYM_RING_FLOOR_BYTES / 1024) as i128, "the floor in KiB");
+            // The ceiling is per volume (the solo ring's derivation); the
+            // registry's bound is the derivation's own ceiling — 32 MiB.
+            assert_eq!(hi, (journal_ring_len(u64::MAX) / 1024) as i128);
+        }
+        other => panic!("SQUEEZEFS_SYM_RING_KB must be an Int knob, got {other:?}"),
+    }
+    assert_eq!(knob.default, "derived");
+}
+
+// ---------------------------------------------------------------------------
+// §5.3.4 — the three per-ring violation classes.
+// ---------------------------------------------------------------------------
+
+fn recovery(entries: Vec<(u64, Vec<(u8, Record)>)>) -> JournalRecovery {
+    let head_pos = entries.iter().map(|(s, _)| *s + 1).max().unwrap_or(0);
+    JournalRecovery {
+        entries: entries
+            .into_iter()
+            .map(|(seq, records)| ReplayedEntry { seq, records })
+            .collect(),
+        head_pos,
+        dropped_torn: 0,
+        foreign_pages: 0,
+    }
+}
+
+fn content(slot: u32, ino_local: u64) -> (u8, Record) {
+    let ino = if slot == NATIVE_FOREST_SLOT {
+        ino_local
+    } else {
+        squeezefs::meta_backend::guest_local_ino((slot - 1) as u16, ino_local)
+    };
+    let key = forest_key(TREE_INODES, &inode_key(ino)).unwrap();
+    (tag_for(TREE_INODES, 0), Record::put(key, 0, vec![1]))
+}
+
+#[test]
+fn appender_violations_key_lease_extent_are_each_detected() {
+    let s5 = guest_forest_slot(5);
+    let s6 = guest_forest_slot(6);
+    let mut leases: std::collections::BTreeMap<u32, std::collections::BTreeSet<u32>> =
+        std::collections::BTreeMap::new();
+    leases.insert(1, [s5].into_iter().collect());
+
+    // A clean partition: ring 0 writes native + slot 6, ring 1 writes slot 5.
+    let clean = vec![
+        (0u32, recovery(vec![(0, vec![content(NATIVE_FOREST_SLOT, 9)]), (100, vec![content(s6, 1)])])),
+        (1u32, recovery(vec![(0, vec![content(s5, 1)])])),
+    ];
+    assert!(detect_appender_violations(&clean, &leases).is_empty());
+
+    // Key: the same key in two rings.
+    let key_dup = vec![
+        (0u32, recovery(vec![(0, vec![content(s6, 1)])])),
+        (1u32, recovery(vec![(0, vec![content(s6, 1)])])),
+    ];
+    let v = detect_appender_violations(&key_dup, &leases);
+    assert!(
+        v.iter().any(|x| matches!(x, AppenderViolation::Key { appenders: (0, 1), .. })),
+        "{v:?}"
+    );
+    // Lease: ring 1 writes a slot it does not lease; ring 0 writes a slot
+    // appender 1 leases; ring 1 carries a tree-0 record and an interior
+    // record (the manager's structure).
+    let lease_bad = vec![
+        (0u32, recovery(vec![(0, vec![content(s5, 2)])])),
+        (
+            1u32,
+            recovery(vec![
+                (0, vec![content(s6, 2)]),
+                (
+                    50,
+                    vec![(
+                        tag_for(TREE_CONTROL, 0),
+                        Record::put(b"slot_state:xxxx".to_vec(), 0, vec![]),
+                    )],
+                ),
+                (
+                    60,
+                    vec![(
+                        tag_for(KIND_INTERIOR, 1),
+                        Record::put(vec![0, 0, 0, 6, 0xFF], 0, vec![]),
+                    )],
+                ),
+            ]),
+        ),
+    ];
+    let v = detect_appender_violations(&lease_bad, &leases);
+    let lease_hits = v
+        .iter()
+        .filter(|x| matches!(x, AppenderViolation::Lease { .. }))
+        .count();
+    assert_eq!(lease_hits, 4, "{v:?}");
+    assert!(v.iter().any(|x| matches!(x, AppenderViolation::Lease { appender_id: 0, .. })));
+    assert!(v.iter().any(|x| matches!(x, AppenderViolation::Lease { appender_id: 1, .. })));
+    // Extent: an allocator delta in a ring whose appender holds no grant.
+    let alloc = squeezefs::meta_backend::kv::alloc_ext::alloc_record(77, 0);
+    let extent_bad = vec![
+        (0u32, recovery(vec![(0, vec![alloc.clone()])])),
+        (1u32, recovery(vec![(0, vec![alloc])])),
+    ];
+    let v = detect_appender_violations(&extent_bad, &leases);
+    assert_eq!(v.len(), 1, "the manager's delta is legal, appender 1's is not: {v:?}");
+    assert!(matches!(
+        v[0],
+        AppenderViolation::Extent {
+            appender_id: 1,
+            extent: 77,
+            ..
+        }
+    ));
 }

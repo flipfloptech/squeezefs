@@ -707,6 +707,39 @@ mount (the A-arm rig reset the cluster; remount is part of every arm).
    (e) cross-owner rename/link (D18 scoped out) becomes routine. NEXT: a
    design (the design loop) once the owner rules on the model — see the
    2026-09-12 conversation's three options.
+1z. **SYMMETRIC METADATA DESIGN APPROVED (`docs/design-symmetric-metadata.md`,
+   Rev 7, 1,056 lines).** Owner rulings 2026-09-12: R-SYM-1 every node an
+   equal metadata authority; R-SYM-2 mechanism (a) symmetric shared-disk —
+   direct appends under leased slot ownership; R-SYM-3 the `MAX_APPENDERS`
+   = 16 ledger bound must go; the operating point is **10–15 k
+   simultaneously writing clients on AVERAGE** (owner reminder). The design
+   loop ran 7 rounds: 71 issues (1 critical / 32 major / 32 minor / 6 nit),
+   all addressed, 0 wontfix, 0 escalations, approved with 0 open. The shape
+   CHANGED in round 1 on the reviewer's alternative: a **per-slot tree
+   FOREST** (one KV tree per routing slot, roots travel with the slot
+   lease, every SMO the owner's own in its own ring, a zero-per-op
+   per-volume MANAGER lease) — no structural authority survives; appender
+   identity lives in an appender directory of A/B pages bounded by heap
+   alone; partitioning-not-coherence kept; WERO + `(appender_id, g)`
+   frame stamps on metadata namespaces; per-data-volume allocation lease
+   with a durable bitmap; death ledger in tree 0 of volume 0; park-and-
+   reclaim as a symmetric appender's `T_self` action. Five open questions
+   DECIDED by the owner (R-SYM-4..8, KD-SYM-19..23): GPFS-strict per-object
+   tokens are the ONLY foreign-read method (bounded projection deleted —
+   "2 seconds is too long"); sub-slot dentry STRIPING funded (PR 7b);
+   `format` never sizes for client count; co-located mounts = own
+   guarantee row; **SPDK RETIRED as a target** (PR 16 — nvmet is THE
+   target; removes the 16-registrant cap and with it the whole
+   fencing-group machinery from the program). 24 KDs, 27 pinned risks, 11
+   knobs, 18 PRs + fix campaign ≈ 95 eng-weeks, everything dark behind
+   `SQUEEZEFS_SYMMETRIC_META` until PR 14's flip. **Product findings from
+   the review (1.2.4 board):** `reservation.rs` reads the PR Reservation
+   Report into a fixed 4 KiB buffer and silently `break`s past the 63rd
+   extended registrant — S7's rung-5 admission would mis-report a 64th
+   co-writer TODAY (fixed by PR 3's REGCTL-sized read; repro-port owed);
+   `SPDK_NVMF_MAX_NUM_REGISTRANTS = 16` caps any SPDK-shared set at 16
+   writers today (moot once PR 16 lands). Loop artifacts: writer/reviewer
+   snapshots under `/tmp/grok-justin/grok-design-review-07bad785*.md`.
 2. **Kernel A/B, B arm** — after `squeeze-test` boots the 6.19.14 series
    WITH 0031 (or whichever box carries the patched kernel): on the box,
    `cd /scratch/tmp/sqz-agent/k26 && sudo env ARM=B KERNEL_TAG=<uname -r

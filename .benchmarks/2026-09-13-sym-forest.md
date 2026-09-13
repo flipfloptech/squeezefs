@@ -32,13 +32,18 @@ economy pass (`e90ceec8`), the docs + this note (`ef05b8a7`); then the
 review round 2 train — the red pins (`a01e806e`), the six forest-arm fixes
 (`d616cd6a`), the staged-key entry pricing (`49b6f592`), the parametrized
 harnesses (`98177d57`), the fuzz targets + proptest mirror (`f485905d`)
-and the slot-namespace bound (`5060ccd5`) — see §4b. Dev-box,
-debug-build, in-process evidence ONLY — scoping, per the venue rule; the
-squeeze-test solo re-gate A-B-B-A (gate 1) is owed (§7).
+and the slot-namespace bound (`5060ccd5`) — see §4b; then the round-3
+train — the stranded-promise pin + fix (`82923d5d`, `2ccb8f72`), the
+leaf-merge harness derivations (`e5842312`, `a6f39694`), the non-writer /
+recovery-class mint pins + fix (`7c6fd572`, `afae1666`), the forest C1
+repair contract + the skip-not-fail walk (`ee925586`, `f314ec3d`) and the
+owner-offset nit (`608509a4`) — see §4c. Dev-box, debug-build,
+in-process evidence ONLY — scoping, per the venue rule; the squeeze-test
+solo re-gate A-B-B-A (gate 1) is owed (§7).
 
 ---
 
-## 1. The contracts (`tests/sym_forest_tests.rs`, 27, all green)
+## 1. The contracts (`tests/sym_forest_tests.rs`, 29, all green)
 
 | Contract | Pins |
 |---|---|
@@ -68,6 +73,8 @@ squeeze-test solo re-gate A-B-B-A (gate 1) is owed (§7).
 | `a_guest_root_swap_is_covered_through_tree_zero` (round 2) | a GUEST root swap is named by tree 0 before the ledger's tail passes its floor |
 | `a_live_reader_of_a_forest_resolves_guests_minted_after_its_mount` (round 2) | a `-o ro` reader of a stamped set resolves a guest ino created after its mount at the next epoch step; guest roots are never re-rooted at the native root |
 | `stat_and_layout_are_adjacent_in_ino_major_order` (extended, round 2) | `FOREST_SLOT_MAX` is the ONE slot-namespace bound: an ino above it refuses at the encoder (every kind, refs by OWNER) and at the decoder |
+| **`a_reader_of_a_forest_with_unpublished_slots_in_the_window_writes_nothing`** (round 3) | a `-o ro` reader opened against a writer with ~60 slots minted since its last checkpoint mints NO slot tree and writes no node image or frame (the global write gauges unchanged across the open; the reader's own mint count 0), opens exactly the slot trees tree 0 names, serves the published population and the window records of slots it knows, answers ENOENT for the records of unpublished slots, and serves them all at the poll after the writer publishes — still without a mint |
+| **`a_heap_full_forest_with_an_unpublished_mint_in_the_window_remounts`** (round 3) | a forest driven to the growth floor, one more slot tree minted from parked room with every publication deferred, the room taken back to the reserve and landed, crash-copied: the WRITE mount remounts (the replay's re-mint claims in the recovery class) and the window's record folds into the re-minted tree (RED before: `NoSpace { free: 20, reserve: 20 }` refused the mount) |
 
 Regression instrument — **the parametrized gate** `tests/run_sym_forest_suites.sh` (= `task check:sym-forest`): fifteen pre-forest KV suites run flat THEN under the seam, failing on the first red leg — `kv_backend_tests` 36, `kv_journal_tests` 21, `kv_partitioned_append_tests` 27, `kv_leaf_merge_tests` 13, `kv_node_cache_coherence_tests` 21, `kvmap_tree_tests` 14, `durable_block_refs_tests` 24, `fsck_tests` 22, `fsck_c9_tests` 12, `fsck_c10_tests` 18, `crash_contract_tests` 25, `crash_kill_tests` 9, `writer_scoped_staging_tests` 32, `readonly_mount_tests` 28, `meta_slot_migration_tests` 16 — **all green BOTH ways** (round 2; round 1 had run them flat only, which is how the §4b defects stayed invisible). The three live-FUSE suites (`posix_mount_semantics_tests` 3, `corpse_sweep_tests` 4, `inline_raise_tests` 7) run under `SQUEEZEFS_TEST_REQUIRE_MOUNT=1` both ways too. Plus `derivation_sweep_tests` 51, `env_knob_convention_tests` 21, `docs_parity_tests` 5, `decoder_property_tests` 36 (two pins moved with the format law: `TREE_ID_MAX` is 9, and 10 — not 8 — is the first id past the table).
 
@@ -186,6 +193,72 @@ complete before the mid-wave read — bimodal at 2/4 runs; a no-op on the
 flat leg), and the raw-ring replay test frames its keys as the volume
 journals them.
 
+## 4c. Found by review round 3 — the stamped leaf-merge binary ×10, the non-writer doors
+
+- **The heap admission stranded a promise on a refused multi-leaf member
+  (§4.7 P1 — a PRODUCT term, layout-independent).** Attribution: the
+  stamped `kv_leaf_merge_tests` binary ×10 from zero with
+  `RUST_LOG=squeezefs::meta_backend::kv=debug` (`/tmp/sym-run/pr1-leafmerge/
+  attrib_run{1..10}.log`) was red 3/10 at `delete_file`'s 32-cycle retry
+  bound, every time with the same trace: `merge sweep … 0 merges …
+  (free=5 promised=1 pending-free=0)` on all 32 cycles while the delete's
+  compaction reads `claimable 4 − 1 < floor 4`. One extent was PROMISED to
+  a node no flush ever SMOs: the admission promises a member's leaves one
+  at a time in record order, and when a later leaf of the same member was
+  refused the member never landed but the earlier leaf kept its promise —
+  on a node with nothing pending. `claimable = free − heap_promised` sat
+  at the compaction floor for ever: no delete's compaction, no merge, no
+  return — a true fixpoint. The forest exposes it on every full mixed
+  tail leaf (a file's inode AND its 12 KiB xattr in one leaf; the unlink's
+  dentry tombstone on another); the flat layout has the same shape on
+  any two-leaf member. Fix `2ccb8f72`: a refused member retracts every
+  promise its earlier leaves drew (`NodeDirty::retract_promise` /
+  `retract_promise_growth`); `leave_heap_full` announces only for a member
+  that lands. Pinned to the byte on BOTH layouts by
+  `a_refused_multi_leaf_member_strands_no_heap_promise` (12/12 red on the
+  shipped flat layout before the fix).
+- **Three leaf-merge harness premises were propped up by that bug** or
+  calibrated on the flat SMO cadence (`e5842312`, `a6f39694`): the
+  mid-wave gauge test's "hundreds of underfull leaves standing" existed
+  only because the leaked promises froze the merges (with the leak fixed,
+  index-order deletes are merged as they go on BOTH layouts — the deletes
+  now run in spread passes, the last uncovered, the throttle only for
+  the fill); the crash-window collapse test's survivor stride derives from
+  the merge law (½ × `merge_pair_capacity` over the heaviest tree's
+  per-file bytes — flat 11, forest 18) and its covering cycles run until
+  the durable tail has passed the last delete (a forest's mixed leaves
+  compact far more often, so the dying floors lag the tail a cycle; two
+  fixed cycles left ~780 tombstones uncovered on 1 in ~12 stamped runs).
+- **Non-writer opens minted at replay** (Issue 18): `open_inner` was
+  shared by every door and the `read_only` latch was set only after it
+  returned, so a `-o ro` reader / co-writer / probe of a forest minted (an
+  extent claim + a `write_node`) every window slot tree 0 did not name.
+  Fix `afae1666`: `OpenPosture` set by the door → `forest::MintPolicy`;
+  a non-writer's replay skips those records (`meta_kv_forest_reader_
+  window_skips`, INFO per open) — the S5 bounded-stale posture, chosen
+  over a RAM-only tree because the epoch drop pass would tear it from the
+  reader's cache at the next advance — and a mint reached under its
+  policy is an invariant tripwire.
+- **The replay mint's user-class claim made a `heap_full` volume
+  unmountable** after a crash with an unpublished mint (Issue 19; RED:
+  `NoSpace { free: 20, reserve: 20 }`). The writer's replay now mints in
+  the RECOVERY class (`claim_internal`, the flat bit-9/16 mount-time
+  mints' class); the commit path keeps USER growth. Residual, stated: the
+  original mint's extent (bitmap bit durable, no tree names it) leaks one
+  extent per crash-with-deferred-publication — an extent-reachability
+  hygiene item, not a correctness one.
+- **A malformed slot-tree key truncated fsck's census into destructive
+  repair** (found by Issue 20's forest branch of the C1 repair contract):
+  `SlotTrees::range` failed the WHOLE page at a key the codec refuses, so
+  the inode census stopped short of the seed, the live file's blocks past
+  it read as C2 "leaked", and applying the report FREED them (read-back
+  EIO). Fix `f314ec3d`: the kind-routed walks skip such a record (counted
+  on `meta_kv_forest_key_violations`, logged); fsck's C1 on a forest is
+  ONE raw walk per slot tree (`C1Unit::Slot`) where the key is the
+  record-level `C1RawKey` finding, repaired in place — the round-2 interim
+  ("a C1 WALK finding, not repairable") is retired. The contract pins
+  that one malformed record produces no C2 finding.
+
 ## 5. Stats
 
 `meta_kv_forest_slot_trees_minted` (guest slot trees minted this mount —
@@ -193,8 +266,12 @@ the lazy-mint engagement gauge, 0 for the life of every un-stamped mount),
 `meta_kv_forest_root_publishes` (`slot_state` records published; ≤
 checkpoints × slot trees), `meta_kv_forest_key_violations` (**must stay
 0**: a record under a key the §5.2.1 codec refuses — the
-partition-violation class of "a kind byte is never another tree's id").
-Exported on the stats inode; rows in `docs/operations.md`.
+partition-violation class of "a kind byte is never another tree's id";
+the kind-routed walks skip it, fsck's raw C1 walk reports it),
+`meta_kv_forest_reader_window_skips` (window records a non-writer open
+skipped at replay because their slot tree had no published root — 0 on
+every write mount). Exported on the stats inode; rows in
+`docs/operations.md`.
 
 ## 6. Deviations from the PR row (for adjudication)
 
@@ -232,7 +309,12 @@ Exported on the stats inode; rows in `docs/operations.md`.
    from the compaction reserve) and ONE device write + load-back of the
    empty root, once per slot per volume, before any node lock. It deviates
    from the §4.9 4b "RAM-only pass" law for that one write; design §5.3.3
-   moves the extent to the appender's grant in PR 3 (§7).
+   moves the extent to the appender's grant in PR 3 (§7). The REPLAY's
+   mint is the writer's only and claims in the recovery class (round 3,
+   §4c); a non-writer never mints.
+9. **fsck's C1 walk on a forest is the ONE raw walk per slot tree** (round
+   3) — the other classes' kind-routed walkers still read a forest's slot
+   trees once per kind (item 4).
 
 ## 7. Owed
 
@@ -243,18 +325,19 @@ Exported on the stats inode; rows in `docs/operations.md`.
   `slot_state_record` (nightly tier — no nightly toolchain on the dev box;
   `task check:fuzz` type-checks them on stable and the proptest mirror runs
   every law per commit).
-- **The ONE-walk fsck census** over the mixed leaves (C1–C10 in one pass
-  per slot tree). Until then a malformed slot-tree key surfaces as a C1
-  WALK finding for the kind being walked (loud; the remainder of that
-  kind's walk is lost and the finding is not in-place repairable) — the
-  record-level C1 the flat layout reports for the same seed needs the
-  raw walk.
+- **The ONE-walk fsck census** over the mixed leaves for C2–C10 (C1
+  walks a forest's slot trees once, raw, since round 3 — §4c; the other
+  classes still read them once per kind).
+- **The orphaned-extent hygiene sweep** for a crashed-with-deferred-
+  publication mint (§4c — one extent per such crash, bitmap-durable, named
+  by no tree).
 - **The lazy mint off the pass task** (§6 item 8 — PR 3's appender grant).
 - **Issue 16's attribution** (`v3_ring_full_liveness_storm_drains`,
   `a_mostly_deleted_full_volume_keeps_creating` aborting "parked for ring
   space" under a PARALLEL stamped run): both pass stamped in isolation and
   inside the serialized gate; the parallel-run shape is box load until a
-  quiet-box repro says otherwise.
+  quiet-box repro says otherwise. (Issue 17's stamped leaf-merge
+  nondeterminism was a different thing — a product fixpoint, §4c.)
 - **PR 2's owed input**: `slot_state.tails` is written empty and
   `cursor` 0 — the handover / per-slot cursor semantics are PR 2/4's.
 - **The `apply_locked` lease gate** (`leased_slots`) — PR 4, "lands HERE,

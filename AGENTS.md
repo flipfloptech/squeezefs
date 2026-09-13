@@ -690,7 +690,7 @@ verdict, and each launch is individually approved by the user before
 `tests/cloud_bench_cluster.sh launch` is invoked. A gate/fix train never
 implies cloud approval.
 
-### Benchmark VENUE: A/B and A-B-B-A rows run on squeeze-test, never the dev box (user directive 2026-09-07)
+### Benchmark VENUE: A/B and A-B-B-A rows run on squeeze-test, never the dev box (user directive 2026-09-07; scope narrowed 2026-09-14)
 
 **Every A/B, A-B-B-A bracket, per-lever leg and acceptance row runs on
 `squeeze-test`** (the 32-core Xeon field box). The dev laptop has **heat
@@ -702,11 +702,30 @@ of a shape) and every note carrying one must say so; the acceptance
 pair is re-run on the box before any verdict is written. This is the
 same fact the criterion baselines already record ("the thermally-capped
 dev box gives relative truth only") applied to every measurement class.
-The multi-writer fleet rig runs on the box too (`tests/mw_fleet.sh` +
-`tests/run_mw_matrix.sh` over the dev substrate; Open MPI is the vendor
-build at `/usr/mpi/gcc/openmpi-*/bin`, put it on `PATH`; a user-level
-toolchain + bundle-fed checkout live under `/scratch/tmp/sqz-agent/`).
-Cloud runs still need expressed approval (below).
+
+**The box is for the acceptance rows ONLY, at the minimum count (user
+directive 2026-09-14: "run the minimal amount of ABBA rows on
+squeeze-test … don't use it for verification of something working").**
+Everything that proves a mechanism WORKS — cargo suites, the flat/stamped
+matrix, live-FUSE legs, the fidelity tier, smoke mounts, "does it
+engage", crash/kill matrices, from-zero ×N determinism runs — is LOCAL
+and is finished BEFORE a row is scheduled on the box. A box row is one
+A-B-B-A bracket per row set, with the reversed re-run bracket only for a
+row that read DELTA; the scoping pass on the laptop (mechanism engaged,
+tripwires 0, the shape read once) is the filter that keeps the box quiet.
+Program gates name WHICH PRs get a box bracket (this program: the PR-1
+solo re-gate — met — and the PR 13/14 acceptance; every other rung takes
+the cheaper local re-gate), and a box row that exists to confirm
+correctness is a rule violation, not evidence. The box has NO Rust
+toolchain and no internet: arms are built on the laptop
+(`task build:rocky8`, the `release` profile for dev A/Bs — the two-profile
+law — both arms the same profile) and copied over with checksums; every
+file placed on the box is listed in the row's note (§Box footprint).
+The multi-writer fleet rig's ACCEPTANCE rows run on the box too
+(`tests/mw_fleet.sh` + `tests/run_mw_matrix.sh` over the dev substrate;
+Open MPI is the vendor build at `/usr/mpi/gcc/openmpi-*/bin`, put it on
+`PATH`); its functional legs run locally first. Cloud runs still need
+expressed approval (below).
 
 ### Benchmark substrates: the two-substrate rule (2026-07-27)
 

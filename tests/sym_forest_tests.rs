@@ -1984,8 +1984,7 @@ async fn a_heap_full_forest_with_more_unpublished_mints_than_the_reserve_refuses
 
     let err = KvMetaBackend::open(fx.crash.path())
         .await
-        .err()
-        .expect("the reserve cannot re-mint reserve + 1 slot trees");
+        .expect_err("the reserve cannot re-mint reserve + 1 slot trees");
     let text = err.to_string();
     assert!(
         text.contains(&format!("EACH of the {mints} slot tree(s)")),

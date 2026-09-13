@@ -1663,6 +1663,39 @@ async fn a_reader_of_a_forest_with_unpublished_slots_in_the_window_writes_nothin
         skipped > 8,
         "the window held records of many unpublished slots ({skipped})"
     );
+    // The reader's PARTIAL window is a consistent snapshot of its own (review
+    // round 3, Issue 23): a dentry lives in its PARENT's slot and names a
+    // child in the child's — the one edge that crosses slots — so a
+    // non-writer skips a dentry whose child's slot is unpublished together
+    // with the child (the create has not happened for this mount yet, as
+    // ONE unit) and `readdir` never lists a name `lookup` refuses.
+    let mut listed = std::collections::HashSet::new();
+    let mut cookie = 0u64;
+    loop {
+        let page = reader.readdir_stream(d, cookie, 64).await.unwrap();
+        let Some((last, _)) = page.last() else {
+            break;
+        };
+        cookie = *last;
+        for (_, e) in &page {
+            listed.insert(e.name.clone());
+        }
+    }
+    for i in 0..published.len() {
+        assert!(listed.contains(&format!("pub{i}")));
+    }
+    for (i, ino) in unpublished.iter().enumerate() {
+        let name = format!("win{i:03}");
+        let slot =
+            squeezefs::meta_backend::kv::record::forest_slot_of_ino(writer.route_ino(*ino).1);
+        assert_eq!(
+            listed.contains(&name),
+            known.contains(&slot),
+            "{name}: readdir lists a name iff lookup resolves it (child slot {slot} published: \
+             {})",
+            known.contains(&slot)
+        );
+    }
     // The other non-writer entry (`open_probe` — `squeezefs status`
     // against a live writer; `open_co_writer` and `open_peer_owned` take
     // the SAME `OpenPosture::NonWriter` arm, chosen at the call site):

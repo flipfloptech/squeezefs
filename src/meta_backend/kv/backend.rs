@@ -6049,7 +6049,7 @@ impl KvMetaBackend {
         ) {
             self.shutting_down.store(true, Ordering::Release);
             self.ring.wake_parked();
-            self.ckpt_wake.notify_waiters();
+            self.ckpt_wake.notify_one();
             return Ok(());
         }
         // PR M6: make parked pending-times refinements durable while the
@@ -6075,7 +6075,20 @@ impl KvMetaBackend {
         }
         self.shutting_down.store(true, Ordering::Release);
         self.ring.wake_parked();
-        self.ckpt_wake.notify_waiters();
+        // The shutdown signal is a PERMIT (`notify_one`), never an epoch
+        // (`notify_waiters`): the checkpoint task reads `shutting_down`
+        // only after its park wakes, and it is often NOT parked when this
+        // runs — it is inside a §4.6 pt 1 maintenance pass (the reopen's
+        // post-replay fold on a forest volume is one big mixed-leaf split
+        // still running at the test's `shutdown`). `notify_waiters` wakes
+        // the waiters registered at that instant and stores nothing, so a
+        // busy task came back to a fresh `notified()` and slept to its
+        // cadence deadline before it saw the flag — one full flush
+        // interval per unmount that raced a pass (review round 4, Issue
+        // 26; `SQUEEZEFS_META_FLUSH_INTERVAL_MS=60000` made it a 60 s
+        // stall). A permit is consumed by the task's NEXT `notified()`,
+        // whenever that is.
+        self.ckpt_wake.notify_one();
         // PR M6: the drain task observes the flag on its wake and exits;
         // joining it keeps the no-leaked-tasks teardown contract.
         self.times_drain_wake.notify_waiters();

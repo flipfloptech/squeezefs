@@ -1282,7 +1282,14 @@ async fn checkpoint_task(
         // still gets its turn — never spin the cadence out. The re-arm
         // can no longer starve the cadence: the deadline is read off the
         // clock above.
-        if be.all_trees().into_iter().any(|t| t.maintenance_pending()) {
+        //
+        // A shutdown that landed WHILE this pass ran is re-armed the same
+        // way: the flag is read only after a wake, so a task that parked
+        // on it now would sleep to the cadence deadline with the final
+        // checkpoint owed (review round 4, Issue 26 — `shutdown()` itself
+        // now signals with a permit; this is the belt for any signaller
+        // that stores the flag without one).
+        if be.is_shutting_down() || be.all_trees().into_iter().any(|t| t.maintenance_pending()) {
             wake.notify_one();
         }
     }

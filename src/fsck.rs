@@ -6268,6 +6268,39 @@ fn destroys_under_multi_owner(id: &FindingId) -> bool {
     )
 }
 
+/// The raw C1 repair's deletion gate (design-symmetric-metadata §7.1's
+/// corollary, review round 3 Issue 25): `Ok(description)` when the key is
+/// a KNOWN slot-tree kind in a shape it never takes — garbage by the
+/// codec's own law, repairable in place — and `Err(reason)` for every
+/// other refused key: a kind byte this binary does not know may be a
+/// LATER binary's record (a new slot-tree kind ships under a new incompat
+/// bit, but the repair never bets the volume on the bit having been
+/// honoured), and a key too short to carry a kind cannot be NAMED. Those
+/// are reported, never deleted — the C1 torn posture.
+fn raw_key_repair_gate(key_hex: &str) -> std::result::Result<String, String> {
+    use crate::meta_backend::kv::record::{classify_refused_key, RawKeyDefect};
+    let Some(key) = unhex(key_hex) else {
+        return Err("undecodable key identity".to_string());
+    };
+    match classify_refused_key(&key) {
+        None => Err("the key now decodes under the forest codec (not this class)".to_string()),
+        Some(RawKeyDefect::MalformedKnownKind { kind, want, got }) => Ok(format!(
+            "kind {kind} is a slot-tree kind of this binary and its key is {got} bytes where the \
+             codec wants {want}"
+        )),
+        Some(RawKeyDefect::UnknownKind { kind }) => Err(format!(
+            "kind byte {kind:#04x} is not a slot-tree kind this binary knows — a later \
+             binary's record or garbage; REPORT-ONLY (design-symmetric-metadata §7.1: a new \
+             slot-tree kind ships under a new incompat bit, and the raw repair never deletes \
+             what it cannot name)"
+        )),
+        Some(RawKeyDefect::Truncated { got }) => Err(format!(
+            "a {got}-byte key carries no kind byte — no kind of this binary can name it; \
+             REPORT-ONLY (the raw repair deletes only what it can name)"
+        )),
+    }
+}
+
 fn planned_action(id: &FindingId) -> (&'static str, String) {
     match id {
         FindingId::C1Torn { .. } => (
@@ -6282,13 +6315,17 @@ fn planned_action(id: &FindingId) -> (&'static str, String) {
              the schema-violating record via an ordinary journaled CoW leaf re-emit"
                 .to_string(),
         ),
-        FindingId::C1RawKey { .. } => (
-            "rebuild-in-place",
-            "checksum-valid slot-tree record under a key the forest codec refuses: \
-             quarantine the raw bytes, then drop the record from its slot tree (the \
-             kind-routed reads already skip it; no live key resolves to it)"
-                .to_string(),
-        ),
+        FindingId::C1RawKey { key_hex, .. } => match raw_key_repair_gate(key_hex) {
+            Ok(defect) => (
+                "rebuild-in-place",
+                format!(
+                    "checksum-valid slot-tree record under a key the forest codec refuses \
+                     ({defect}): quarantine the raw bytes, then drop the record from its slot \
+                     tree (the kind-routed reads already skip it; no live key resolves to it)"
+                ),
+            ),
+            Err(why) => ("report-only", why),
+        },
         FindingId::C2Leaked { vol, offset } => (
             "free-leaked-block",
             format!(
@@ -7643,14 +7680,17 @@ pub async fn repair(
                     refuse(&mut out, f, "undecodable key identity".to_string());
                     continue;
                 };
-                if crate::meta_backend::kv::record::split_forest_key(&key).is_ok() {
-                    refuse(
-                        &mut out,
-                        f,
-                        "the key now decodes under the forest codec (not this class)".to_string(),
-                    );
-                    continue;
-                }
+                // The deletion gate: a known kind in a shape it never
+                // takes is dropped; an unknown kind (a later binary's
+                // record?) and a key too short to name are REPORTED and
+                // left exactly where they are.
+                let defect = match raw_key_repair_gate(key_hex) {
+                    Ok(defect) => defect,
+                    Err(why) => {
+                        refuse(&mut out, f, why);
+                        continue;
+                    }
+                };
                 let value = match kv.slot_tree_lookup_raw(*slot, &key).await {
                     Ok(Some(v)) => v,
                     Ok(None) => {
@@ -7684,8 +7724,8 @@ pub async fn repair(
                     f,
                     "rebuild-in-place",
                     format!(
-                        "undecodable record dropped from vol{vol}/slot{slot} (journaled CoW \
-                         re-emit); bytes quarantined"
+                        "undecodable record ({defect}) dropped from vol{vol}/slot{slot} \
+                         (journaled CoW re-emit); bytes quarantined"
                     ),
                 );
             }

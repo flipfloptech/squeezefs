@@ -615,6 +615,50 @@ impl ImageBuilder {
         let nodes_written = writer.nodes_written;
         let node_seq_watermark = writer.next_node_seq;
 
+        // The appender region (design-symmetric-metadata §5.3, PR 2): a
+        // stamped image carries appender 0's page pair — `Free`, naming
+        // the fixed ring past its four reserved pages as the one segment;
+        // the first writable mount joins it — and the directory's first
+        // extent (one heap extent, header page last), so ids ≥ 1 have a
+        // home before any join. Claimed from the same allocator whose
+        // bitmap lands below, so the extent is durable-claimed by the
+        // image the ledger names.
+        if symmetric {
+            use super::appender::{
+                appender0_page_offsets, appender0_ring_extent, dir_header_offset,
+                dir_pairs_per_extent, page_slot_for, AppenderPage, DirHeader,
+            };
+            let dir_extent = alloc.claim_internal()?;
+            let node_size = self.layout.node_size() as u64;
+            sb.appender_dir = super::superblock::ExtentRef {
+                start: sb.heap.start + dir_extent * node_size,
+                len: node_size,
+            };
+            let hdr = DirHeader {
+                chain_index: 0,
+                next: super::superblock::ExtentRef { start: 0, len: 0 },
+                pairs: dir_pairs_per_extent(node_size) as u16,
+            };
+            // Zero the extent (quick format zeroes only the fixed region),
+            // then the header page.
+            zero_range(path, sb.appender_dir.start, sb.appender_dir.len).await?;
+            crate::uring_fs::write_at(
+                path,
+                dir_header_offset(&sb.appender_dir),
+                bytes::Bytes::from(hdr.encode()),
+            )
+            .await?;
+            let mut page0 = AppenderPage::free(0, 1);
+            page0.segments = vec![appender0_ring_extent(&sb.journal)];
+            let offs = appender0_page_offsets(&sb.journal);
+            crate::uring_fs::write_at(
+                path,
+                offs[page_slot_for(page0.generation)],
+                bytes::Bytes::from(page0.encode()?),
+            )
+            .await?;
+        }
+
         // Persist the allocator's claimed-extent bitmap (A slots,
         // generation 1 — the ledger names it).
         alloc

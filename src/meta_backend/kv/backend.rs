@@ -1912,12 +1912,15 @@ impl KvMetaBackend {
         // 3+4a. Journal recovery: one sequential ring read, §4.1 tear
         // semantics (never loud for ring contents). K6b stores the ring:
         // it is the §4.4 admission/reservation core for every commit and
-        // the checkpoint task's reclamation watermark.
+        // the checkpoint task's reclamation watermark. On a forest volume
+        // the fixed extent's first four pages are appender 0's page slots
+        // (design-symmetric-metadata §5.3.2) and its ring is the rest.
+        let ring_extent = Self::fixed_ring_extent(&sb);
         let (ring, recovery) = JournalRing::recover(
             path,
-            sb.journal.start,
-            sb.journal_pages(),
-            checkpoint_reserve_bytes(sb.journal.len),
+            ring_extent.start,
+            ring_extent.len / super::journal::JOURNAL_PAGE_LEN,
+            checkpoint_reserve_bytes(ring_extent.len),
             ledger.journal_tail_seq,
         )
         .await?;
@@ -2324,8 +2327,9 @@ impl KvMetaBackend {
         // user-admissible capacity (every individual entry ≤ the 128 KiB
         // whole-entry cap already fits by the ring-size floor).
         let batch_max_bytes = {
-            let user_capacity = (sb.journal_pages() * super::journal::JOURNAL_PAGE_DATA_LEN)
-                .saturating_sub(checkpoint_reserve_bytes(sb.journal.len));
+            let user_capacity = (ring_extent.len / super::journal::JOURNAL_PAGE_LEN
+                * super::journal::JOURNAL_PAGE_DATA_LEN)
+                .saturating_sub(checkpoint_reserve_bytes(ring_extent.len));
             resolve_commit_batch_bytes(
                 std::env::var(COMMIT_BATCH_BYTES_ENV).ok().as_deref(),
                 user_capacity,
@@ -2506,6 +2510,17 @@ impl KvMetaBackend {
     /// The mounted superblock.
     pub fn superblock(&self) -> &SuperblockV3 {
         &self.sb
+    }
+
+    /// The fixed journal extent's RING part: the whole extent on a flat
+    /// volume; on a forest volume (bit 17) the extent past appender 0's
+    /// four page slots (design-symmetric-metadata §5.3.2).
+    pub fn fixed_ring_extent(sb: &SuperblockV3) -> super::superblock::ExtentRef {
+        if sb.symmetric_forest_stamped() {
+            super::appender::appender0_ring_extent(&sb.journal)
+        } else {
+            sb.journal
+        }
     }
 
     /// The dirty-node checkpoint cap resolved at open (see the field

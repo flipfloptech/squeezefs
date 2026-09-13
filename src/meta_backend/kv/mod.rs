@@ -47,6 +47,7 @@
 
 pub mod alloc_ext;
 pub mod alloc_ext_core;
+pub mod appender;
 pub mod backend;
 pub mod block_map;
 pub mod block_refs;

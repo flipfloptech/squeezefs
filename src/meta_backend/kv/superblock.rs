@@ -78,6 +78,13 @@ const OFF_CHECKSUM: usize = 120;
 /// simply ignores the field. Every writer bumps it; the reader resolves
 /// primary vs [`backup_offset`] copy by newest-valid-wins.
 const OFF_SB_GENERATION: usize = 128;
+/// The appender directory's first extent (design-symmetric-metadata
+/// §5.3.1, incompat bit 17): `start ‖ len`, carved out of the zero
+/// padding after the generation and covered by the whole-sector checksum.
+/// ZERO on every bit-17-absent volume — the encoder refuses a named
+/// directory without the bit and the decoder refuses a non-zero field
+/// without it, so sector 0 stays byte-identical to the shipped image.
+const OFF_APPENDER_DIR: usize = 136;
 
 /// Format version this module writes and mounts.
 pub const SUPERBLOCK_V3_VERSION: u32 = 3;
@@ -673,6 +680,10 @@ pub struct SuperblockV3 {
     pub uuid: [u8; 16],
     /// Per-volume secret seed keying the §4.2 dentry/xattr name hashes.
     pub hash_seed: u64,
+    /// The appender directory's first extent (bit 17 —
+    /// [`super::appender`]); `len == 0` = none (every bit-17-absent
+    /// volume, and a stamped volume before its directory is allocated).
+    pub appender_dir: ExtentRef,
 }
 
 impl SuperblockV3 {
@@ -792,6 +803,7 @@ impl SuperblockV3 {
             heap,
             uuid,
             hash_seed,
+            appender_dir: ExtentRef { start: 0, len: 0 },
         })
     }
 
@@ -872,6 +884,19 @@ impl SuperblockV3 {
         }
         img[OFF_UUID..OFF_UUID + 16].copy_from_slice(&self.uuid);
         img[OFF_HASH_SEED..OFF_HASH_SEED + 8].copy_from_slice(&self.hash_seed.to_le_bytes());
+        if self.appender_dir.len != 0 || self.appender_dir.start != 0 {
+            if !self.symmetric_forest_stamped() {
+                return Err(KvError::Corrupt(
+                    "superblock names an appender directory without incompat bit 17 — a \
+                     bit-17-absent volume's sector 0 is the shipped image byte for byte"
+                        .to_string(),
+                ));
+            }
+            img[OFF_APPENDER_DIR..OFF_APPENDER_DIR + 8]
+                .copy_from_slice(&self.appender_dir.start.to_le_bytes());
+            img[OFF_APPENDER_DIR + 8..OFF_APPENDER_DIR + 16]
+                .copy_from_slice(&self.appender_dir.len.to_le_bytes());
+        }
         Ok(img)
     }
 
@@ -939,7 +964,17 @@ impl SuperblockV3 {
             hash_seed: u64::from_le_bytes(
                 buf[OFF_HASH_SEED..OFF_HASH_SEED + 8].try_into().unwrap(),
             ),
+            appender_dir: ext_at(OFF_APPENDER_DIR),
         };
+        if (sb.appender_dir.len != 0 || sb.appender_dir.start != 0)
+            && !sb.symmetric_forest_stamped()
+        {
+            return Err(KvError::Corrupt(
+                "v3 superblock names an appender directory but carries no incompat bit 17 — \
+                 the directory is part of bit 17's meaning (design-symmetric-metadata §7.1)"
+                    .to_string(),
+            ));
+        }
         // Feature gate (§6.1): the KV_V3 bit must be present; unknown
         // incompat bits refuse the mount naming the bits. Unknown ro bits
         // pass — their read-only semantics belong to callers with a write
@@ -1088,6 +1123,21 @@ impl SuperblockV3 {
             return corrupt(format!(
                 "heap of {total} extents cannot hold the compaction reserve \
                  (≥ {min_extents} required)"
+            ));
+        }
+        // The appender directory (bit 17) is ONE whole heap extent: it is
+        // claimed from the bitmap like any node, so a ref outside the
+        // heap or off the extent grid is corruption.
+        if self.appender_dir.len != 0
+            && (self.appender_dir.len != node_size
+                || self.appender_dir.start < self.heap.start
+                || self.appender_dir.end() > self.heap.end()
+                || (self.appender_dir.start - self.heap.start) % node_size != 0)
+        {
+            return corrupt(format!(
+                "appender directory [{}, {}) is not one heap extent of {node_size} bytes",
+                self.appender_dir.start,
+                self.appender_dir.end()
             ));
         }
         Ok(())

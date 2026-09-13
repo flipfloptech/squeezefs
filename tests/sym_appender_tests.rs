@@ -30,13 +30,13 @@
 //!   pair + the directory's first extent.
 
 use squeezefs::meta_backend::kv::appender::{
-    appender0_page_offsets, appender0_ring_extent, appender_ring_bytes_derived,
-    appenders_capacity, classify_page, dir_pairs_per_extent, forest_slot_of_page_slot,
-    newest_valid, page_slot_for, page_slot_of_forest_slot, read_directory, ring_budget_bytes,
-    sym_ring_ceiling_bytes, AppenderIdentity, AppenderPage, AppenderState, DirHeader, GrantRun,
-    PageRead, SlotEntry, SlotEntryState, APPENDER0_RESERVED_PAGES, APPENDER_PAGE_FIXED_LEN,
-    APPENDER_PAGE_LEN, APPENDER_PAGE_SLOTS, GRANT_RUNS_MAX, RING_SEGMENTS_MAX, SLOT_ENTRY_LEN,
-    SLOT_PAGE_BUDGET, SYM_RING_FLOOR_BYTES,
+    appender0_page_offsets, appender0_ring_extent, appender_ring_bytes_derived, appenders_capacity,
+    classify_page, dir_pairs_per_extent, forest_slot_of_page_slot, newest_valid, page_slot_for,
+    page_slot_of_forest_slot, read_directory, ring_budget_bytes, sym_ring_ceiling_bytes,
+    AppenderIdentity, AppenderPage, AppenderState, DirHeader, GrantRun, PageRead, SlotEntry,
+    SlotEntryState, APPENDER0_RESERVED_PAGES, APPENDER_PAGE_FIXED_LEN, APPENDER_PAGE_LEN,
+    APPENDER_PAGE_SLOTS, GRANT_RUNS_MAX, RING_SEGMENTS_MAX, SLOT_ENTRY_LEN, SLOT_PAGE_BUDGET,
+    SYM_RING_FLOOR_BYTES,
 };
 use squeezefs::meta_backend::kv::builder::{BuilderConfig, ImageBuilder, ROOT_INO};
 use squeezefs::meta_backend::kv::checkpoint::CHECKPOINT_MAX_AGE_MS;
@@ -170,14 +170,24 @@ fn slot_page_budget_derives_from_the_pages_fixed_part() {
         SLOT_PAGE_BUDGET,
         (APPENDER_PAGE_LEN - APPENDER_PAGE_FIXED_LEN) / SLOT_ENTRY_LEN
     );
-    assert!(APPENDER_PAGE_FIXED_LEN + SLOT_PAGE_BUDGET * SLOT_ENTRY_LEN <= APPENDER_PAGE_LEN);
-    assert!(APPENDER_PAGE_FIXED_LEN + (SLOT_PAGE_BUDGET + 1) * SLOT_ENTRY_LEN > APPENDER_PAGE_LEN);
+    let budget = std::hint::black_box(SLOT_PAGE_BUDGET);
+    assert!(APPENDER_PAGE_FIXED_LEN + budget * SLOT_ENTRY_LEN <= APPENDER_PAGE_LEN);
+    assert!(APPENDER_PAGE_FIXED_LEN + (budget + 1) * SLOT_ENTRY_LEN > APPENDER_PAGE_LEN);
     // The §5.3.2 field list at natural widths: slot u16 + state u8 + g u32
     // + slot_tree_extents u32 + root (u64, u64) + cursor u64.
     assert_eq!(SLOT_ENTRY_LEN, 2 + 1 + 4 + 4 + 8 + 8 + 8);
-    assert_eq!(RING_SEGMENTS_MAX, 8, "2 MiB per growth step at 256 KiB segments");
-    assert_eq!(GRANT_RUNS_MAX, 4, "current + successor + two returns in flight");
-    assert_eq!(APPENDER_PAGE_SLOTS, 4, "the A/B pair + the two ring-side pages");
+    assert_eq!(
+        RING_SEGMENTS_MAX, 8,
+        "2 MiB per growth step at 256 KiB segments"
+    );
+    assert_eq!(
+        GRANT_RUNS_MAX, 4,
+        "current + successor + two returns in flight"
+    );
+    assert_eq!(
+        APPENDER_PAGE_SLOTS, 4,
+        "the A/B pair + the two ring-side pages"
+    );
     assert_eq!(APPENDER0_RESERVED_PAGES, 4);
 }
 
@@ -190,7 +200,9 @@ fn appender_page_round_trips_at_every_bound_and_refuses_past_them() {
     assert_eq!(page.ring_bytes(), RING_SEGMENTS_MAX as u64 * 0x4_0000);
 
     let mut too_many_segments = page.clone();
-    too_many_segments.segments.push(ExtentRef { start: 1, len: 1 });
+    too_many_segments
+        .segments
+        .push(ExtentRef { start: 1, len: 1 });
     assert!(too_many_segments.encode().is_err(), "9 segments refuse");
     let mut too_many_runs = page.clone();
     too_many_runs.grant.push(GrantRun { start: 1, len: 1 });
@@ -247,7 +259,10 @@ fn appender_page_decode_is_total_and_canonical() {
     s_img[52] = 9;
     let sum = recompute_checksum(&s_img);
     s_img[16..24].copy_from_slice(&sum.to_le_bytes());
-    assert!(AppenderPage::decode(&s_img).is_err(), "unknown state refuses");
+    assert!(
+        AppenderPage::decode(&s_img).is_err(),
+        "unknown state refuses"
+    );
     let mut unsorted = page.clone();
     unsorted.slots.truncate(2);
     unsorted.slots.swap(0, 1);
@@ -362,7 +377,10 @@ fn ring_size_derivation_floor_ceiling_and_capacity_tie() {
     let tib = 1u64 << 40;
     assert_eq!(sym_ring_ceiling_bytes(tib), journal_ring_len(tib));
     // A fresh join (no EWMA) takes the floor; a runaway rate the ceiling.
-    assert_eq!(appender_ring_bytes_derived(0, VOL_LEN), SYM_RING_FLOOR_BYTES);
+    assert_eq!(
+        appender_ring_bytes_derived(0, VOL_LEN),
+        SYM_RING_FLOOR_BYTES
+    );
     assert_eq!(
         appender_ring_bytes_derived(u64::MAX / 4, VOL_LEN),
         journal_ring_len(VOL_LEN)
@@ -388,7 +406,10 @@ fn routing_slot_and_forest_slot_convert_both_ways_around_the_native_slot() {
     let native = 5u16;
     assert_eq!(forest_slot_of_page_slot(native, native), NATIVE_FOREST_SLOT);
     assert_eq!(forest_slot_of_page_slot(7, native), guest_forest_slot(7));
-    assert_eq!(page_slot_of_forest_slot(NATIVE_FOREST_SLOT, native).unwrap(), native);
+    assert_eq!(
+        page_slot_of_forest_slot(NATIVE_FOREST_SLOT, native).unwrap(),
+        native
+    );
     assert_eq!(
         page_slot_of_forest_slot(guest_forest_slot(7), native).unwrap(),
         7
@@ -415,8 +436,8 @@ fn routing_slot_and_forest_slot_convert_both_ways_around_the_native_slot() {
 
 #[test]
 fn appender_dir_rides_sector_zero_only_under_bit_17() {
-    let mut sb = SuperblockV3::plan(VOL_LEN, NODE_SIZE, Some(RING_LEN), TEST_UUID, TEST_SEED)
-        .expect("plan");
+    let mut sb =
+        SuperblockV3::plan(VOL_LEN, NODE_SIZE, Some(RING_LEN), TEST_UUID, TEST_SEED).expect("plan");
     assert_eq!(
         sb.appender_dir,
         ExtentRef { start: 0, len: 0 },
@@ -482,13 +503,26 @@ async fn format_under_the_seam_writes_appender_zeros_page_pair_and_the_first_dir
     assert!(sb.appender_dir.start >= sb.heap.start && sb.appender_dir.end() <= sb.heap.end());
     let entries = read_directory(file.path(), &sb).await.expect("directory");
     // Appender 0 + every pair of the first extent (7 at 64 KiB nodes).
-    assert_eq!(entries.len() as u64, 1 + dir_pairs_per_extent(NODE_SIZE as u64));
+    assert_eq!(
+        entries.len() as u64,
+        1 + dir_pairs_per_extent(NODE_SIZE as u64)
+    );
     let zero = entries[0].page.as_ref().expect("appender 0's page");
     assert_eq!(zero.appender_id, 0);
-    assert_eq!(zero.state, AppenderState::Free, "nobody has joined at format");
+    assert_eq!(
+        zero.state,
+        AppenderState::Free,
+        "nobody has joined at format"
+    );
     assert_eq!(zero.segments, vec![appender0_ring_extent(&sb.journal)]);
-    assert_eq!(entries[0].dir_offsets, [sb.journal.start, sb.journal.start + 4096]);
-    assert_eq!(appender0_page_offsets(&sb.journal)[3], sb.journal.start + 3 * 4096);
+    assert_eq!(
+        entries[0].dir_offsets,
+        [sb.journal.start, sb.journal.start + 4096]
+    );
+    assert_eq!(
+        appender0_page_offsets(&sb.journal)[3],
+        sb.journal.start + 3 * 4096
+    );
     for e in &entries[1..] {
         assert!(e.page.is_none(), "an unallocated id has no page");
     }

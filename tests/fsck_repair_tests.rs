@@ -597,6 +597,175 @@ async fn test_c1_semantic_repair_rebuild_in_place_x3() {
 }
 
 // ---------------------------------------------------------------------------
+// C1 raw slot-tree key of an UNKNOWN kind — report ONLY, never deleted
+// (review round 3 of the symmetric-forest PR, Issue 25)
+// ---------------------------------------------------------------------------
+
+/// **The raw C1 repair deletes only what it can NAME.** A slot-tree key
+/// the forest codec refuses is provably garbage only when its kind byte is
+/// one THIS binary knows and its shape is wrong for that kind; a kind byte
+/// this binary does not know may be a LATER binary's record (design §7.1's
+/// corollary — a new slot-tree kind ships under a new incompat bit, and
+/// the raw repair never bets the volume on the bit having been honoured).
+/// Two seeds in the native slot tree: an ino-major key whose kind byte is
+/// `0x0A` (no tree of this binary) and a by-block key under the prefix
+/// `0x09` (§5.4.2's shared index, PR 7's) — both REPORTED as C1, both
+/// planned `report-only`, both REFUSED at apply and still present after;
+/// the known-kind malformed seed beside them is repaired in place as
+/// before. On a flat volume no raw slot tree exists: the arm asserts the
+/// classifier itself (`RawKeyDefect`) draws the same line on the same
+/// bytes, which is the law the forest arm enforces end to end.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_c1_raw_key_of_an_unknown_kind_is_report_only() {
+    use squeezefs::meta_backend::kv::record::{
+        classify_refused_key, RawKeyDefect, NATIVE_FOREST_SLOT, TREE_INODES,
+    };
+    let _serial = serial().await;
+    let r = fresh_round().await;
+    let ino = create_file(&r.fx, "keep.bin").await;
+    let expected = striped_burst(&r.fx, ino, 4).await;
+    let kv = &r.fx.meta.volumes[0];
+
+    // The three seeds, as raw slot-tree keys.
+    let mut unknown_ino_major = Vec::with_capacity(17);
+    unknown_ino_major.extend_from_slice(&42u64.to_be_bytes());
+    unknown_ino_major.push(0x0A);
+    unknown_ino_major.extend_from_slice(&7u64.to_be_bytes());
+    let mut unknown_by_block = vec![0x09u8];
+    unknown_by_block.extend_from_slice(&[0x11u8; 28]);
+    let mut malformed_known = Vec::with_capacity(17);
+    malformed_known.extend_from_slice(&42u64.to_be_bytes());
+    malformed_known.push(TREE_INODES);
+    malformed_known.extend_from_slice(&7u64.to_be_bytes());
+
+    // The classifier's line, on either layout.
+    assert!(matches!(
+        classify_refused_key(&unknown_ino_major),
+        Some(RawKeyDefect::UnknownKind { kind: 0x0A })
+    ));
+    assert!(matches!(
+        classify_refused_key(&unknown_by_block),
+        Some(RawKeyDefect::UnknownKind { kind: 0x09 })
+    ));
+    assert!(matches!(
+        classify_refused_key(&malformed_known),
+        Some(RawKeyDefect::MalformedKnownKind {
+            kind: TREE_INODES,
+            want: 9,
+            got: 17
+        })
+    ));
+    assert!(
+        classify_refused_key(
+            &squeezefs::meta_backend::kv::record::forest_key(TREE_INODES, &42u64.to_be_bytes())
+                .expect("a well-formed forest key")
+        )
+        .is_none(),
+        "a key the codec accepts has no defect"
+    );
+
+    if !kv.symmetric_forest() {
+        r.fx.close().await;
+        return;
+    }
+    let native = kv
+        .all_trees()
+        .into_iter()
+        .find(|t| t.forest_slot() == Some(NATIVE_FOREST_SLOT))
+        .expect("the native slot tree exists");
+    for raw in [&unknown_ino_major, &unknown_by_block, &malformed_known] {
+        native
+            .insert(&raw[..], bytes::Bytes::from_static(b"later"))
+            .await
+            .expect("raw slot-tree insert");
+    }
+
+    let report = run_fsck(&r.fx.ctx(), &online_opts()).await.expect("fsck");
+    let c1: Vec<_> = report.findings.iter().filter(|f| f.class == "C1").collect();
+    assert_eq!(c1.len(), 3, "every raw seed is reported: {c1:?}");
+    assert!(
+        !report.findings.iter().any(|f| f.class == "C2"),
+        "no census truncation: {:?}",
+        report.findings
+    );
+
+    // The plan draws the line: the known-kind malformation rebuilds in
+    // place, the two unknown kinds are report-only.
+    let plan = run_repair(&r.fx.ctx(), &report, &dry_run())
+        .await
+        .expect("plan");
+    let planned_for = |needle: &str| -> Vec<String> {
+        plan.planned
+            .iter()
+            .filter(|a| a.class == "C1" && a.object.contains(needle))
+            .map(|a| a.action.clone())
+            .collect()
+    };
+    let hex = |k: &[u8]| k.iter().map(|b| format!("{b:02x}")).collect::<String>();
+    assert_eq!(
+        planned_for(&hex(&malformed_known)),
+        vec!["rebuild-in-place".to_string()]
+    );
+    assert_eq!(
+        planned_for(&hex(&unknown_ino_major)),
+        vec!["report-only".to_string()],
+        "an unknown ino-major kind is never planned for deletion: {:?}",
+        plan.planned
+    );
+    assert_eq!(
+        planned_for(&hex(&unknown_by_block)),
+        vec!["report-only".to_string()],
+        "an unknown by-block prefix is never planned for deletion: {:?}",
+        plan.planned
+    );
+
+    // Apply: the malformed known-kind record is dropped; the unknown
+    // kinds are REFUSED and stay exactly where they were.
+    let rep = run_repair(&r.fx.ctx(), &report, &apply())
+        .await
+        .expect("apply");
+    assert_eq!(
+        rep.applied
+            .iter()
+            .filter(|a| a.class == "C1" && a.action == "rebuild-in-place")
+            .count(),
+        1,
+        "exactly the known-kind malformation was repaired: {:?}",
+        rep.applied
+    );
+    assert!(
+        rep.refused.iter().filter(|a| a.class == "C1").count() >= 2,
+        "both unknown kinds refused: {:?}",
+        rep.refused
+    );
+    assert!(kv
+        .slot_tree_lookup_raw(NATIVE_FOREST_SLOT, &malformed_known)
+        .await
+        .expect("raw lookup")
+        .is_none());
+    for raw in [&unknown_ino_major, &unknown_by_block] {
+        assert!(
+            kv.slot_tree_lookup_raw(NATIVE_FOREST_SLOT, raw)
+                .await
+                .expect("raw lookup")
+                .is_some(),
+            "an unknown-kind record survives the repair"
+        );
+    }
+    // The unknown kinds keep being REPORTED (honest persistence, the C1
+    // torn posture) and the data manifest is intact.
+    let again = run_fsck(&r.fx.ctx(), &online_opts()).await.expect("fsck");
+    assert_eq!(
+        again.findings.iter().filter(|f| f.class == "C1").count(),
+        2,
+        "the two unknown-kind records persist as findings: {:?}",
+        again.findings
+    );
+    assert_eq!(read_back(&r.fx, ino, expected.len()).await, expected);
+    r.fx.close().await;
+}
+
+// ---------------------------------------------------------------------------
 // C1 torn — quarantine + report ONLY (no fabrication): the finding
 // honestly persists on re-fsck
 // ---------------------------------------------------------------------------

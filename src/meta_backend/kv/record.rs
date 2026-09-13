@@ -152,6 +152,14 @@ pub const FOREST_BLOCK_REF_OWNER_OFF: usize = 1 + super::block_refs::BLOCK_REF_O
 /// Exactly the five kinds of §5.2.1: never the interior marker, never a
 /// reserved id, never tree 0 or the shared index (round-3 Issue 6 — a
 /// kind byte is never another tree's id).
+///
+/// **This set is bit 17's meaning** (design §7.1): a slot-tree kind added
+/// after bit 17 ships needs a NEW incompat bit, so an older binary refuses
+/// the volume instead of skipping the new kind's records in its walks and
+/// deleting them in its fsck. Until the flip, bit 17 is stamped by the
+/// test seam alone and the set may still grow with it (PR 7's shared
+/// index, §5.4.2); the raw C1 repair never relies on that —
+/// [`classify_refused_key`] is the line it deletes on.
 #[inline]
 pub fn is_slot_tree_kind(kind: u8) -> bool {
     matches!(
@@ -225,12 +233,26 @@ pub fn forest_key_kind(key: &[u8]) -> Result<u8, KvError> {
                  byte ≤ 0x01) nor the refs prefix"
             )))
         }
-        Some(_) => *key.get(8).ok_or_else(|| {
-            KvError::Corrupt(format!(
-                "ino-major slot-tree key of {} bytes carries no kind byte",
-                key.len()
-            ))
-        })?,
+        Some(_) => {
+            let kind = *key.get(8).ok_or_else(|| {
+                KvError::Corrupt(format!(
+                    "ino-major slot-tree key of {} bytes carries no kind byte",
+                    key.len()
+                ))
+            })?;
+            // The refs kind is by-block-prefixed, never ino-major: a `0x06`
+            // at offset 8 would otherwise decode as a length-valid
+            // reference living in the ino-major key space — invisible to
+            // the refs scan, accepted by the raw walk.
+            if kind == TREE_BLOCK_REFS {
+                return Err(KvError::Corrupt(
+                    "ino-major slot-tree key carries the refs kind byte at offset 8 — block \
+                     references are by-block-prefixed"
+                        .to_string(),
+                ));
+            }
+            kind
+        }
     };
     if !is_slot_tree_kind(kind) {
         return Err(KvError::Corrupt(format!(
@@ -246,6 +268,62 @@ pub fn forest_key_kind(key: &[u8]) -> Result<u8, KvError> {
         )));
     }
     Ok(kind)
+}
+
+/// How a key a slot tree holds fails the §5.2.1 codec — fsck's raw C1
+/// repair gate (design §7.1's corollary, review round 3 Issue 25). Only a
+/// key whose kind THIS binary knows and whose shape is wrong for it is
+/// provably garbage; a kind byte this binary does not know may be a LATER
+/// binary's record, and deleting it would make an old `fsck --repair`
+/// destroy a newer format's data — so the raw repair deletes on
+/// [`RawKeyDefect::MalformedKnownKind`] alone and reports the rest.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RawKeyDefect {
+    /// A kind byte this binary knows as a slot-tree content kind, with a
+    /// key length that is not that kind's — garbage by the codec's own
+    /// law, repairable in place.
+    MalformedKnownKind { kind: u8, want: usize, got: usize },
+    /// A kind byte (ino-major at offset 8, or a by-block prefix) that is
+    /// not a slot-tree content kind of this binary — a later kind or
+    /// garbage; report-only.
+    UnknownKind { kind: u8 },
+    /// Too short to carry a kind byte at all (an ino-major key under 9
+    /// bytes, an empty key) — no kind can claim it; report-only, since
+    /// the repair deletes only what it can NAME.
+    Truncated { got: usize },
+}
+
+/// Classify a key the forest codec refuses; `None` when it decodes.
+pub fn classify_refused_key(key: &[u8]) -> Option<RawKeyDefect> {
+    if forest_key_kind(key).is_ok() {
+        return None;
+    }
+    let kind = match key.first() {
+        None => return Some(RawKeyDefect::Truncated { got: 0 }),
+        Some(&TREE_BLOCK_REFS) => TREE_BLOCK_REFS,
+        Some(&first) if first > 0x01 => return Some(RawKeyDefect::UnknownKind { kind: first }),
+        Some(_) => match key.get(8) {
+            // A refs kind byte in the ino-major position is a KNOWN kind
+            // in a shape it never takes (`forest_key_kind` refuses it).
+            Some(&TREE_BLOCK_REFS) => {
+                return Some(RawKeyDefect::MalformedKnownKind {
+                    kind: TREE_BLOCK_REFS,
+                    want: FOREST_BLOCK_REF_KEY_LEN,
+                    got: key.len(),
+                })
+            }
+            Some(&k) => k,
+            None => return Some(RawKeyDefect::Truncated { got: key.len() }),
+        },
+    };
+    match legacy_key_len(kind) {
+        Some(want) => Some(RawKeyDefect::MalformedKnownKind {
+            kind,
+            want: want + 1,
+            got: key.len(),
+        }),
+        None => Some(RawKeyDefect::UnknownKind { kind }),
+    }
 }
 
 /// Split a forest key into `(kind, legacy key)` — the inverse of

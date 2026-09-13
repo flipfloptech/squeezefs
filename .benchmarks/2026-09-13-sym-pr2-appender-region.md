@@ -59,7 +59,35 @@ A scratch harness (not committed) over `format_v3_stamped` members (256 MiB volu
 
 ## 4. The widened gate — `tests/run_sym_forest_suites.sh`, 22 suites × flat / stamped
 
-Final tree (`9f9c4e95`), one run from zero, both legs **PASS**, no ratio NOTE (the rated maximum is `meta_slot_migration_tests` at 1.22×; `kvmap_tree_tests`' 1.77× is under the 1 s flat floor and unrated):
+Final tree (`040a4f26` — after the two live-FUSE-driven fixes, items 11–12), one run from zero, both legs **PASS**, `matrix rc=0`, no ratio NOTE (the maximum is `kv_tree_tests` at 1.08×):
+
+```text
+suite                                 flat   stamped   ratio
+kv_tree_tests                         47.7      51.4    1.08
+kv_node_tests                          0.1       0.1    1.06
+kv_backend_tests                     137.7     144.2    1.05
+kv_journal_tests                       0.1       0.1    0.88
+kv_partitioned_append_tests            0.2       0.1    0.83
+kv_leaf_merge_tests                   49.6      39.5    0.80
+kv_node_cache_coherence_tests          0.5       0.4    0.82
+kvmap_tree_tests                       0.5       0.3    0.70
+kv_scale_tests                        37.9      30.3    0.80
+durable_block_refs_tests              10.2       9.8    0.96
+fsck_tests                            15.5      14.3    0.92
+fsck_c9_tests                          3.7       2.9    0.77
+fsck_c10_tests                         5.8       4.0    0.69
+fsck_c12_tests                         5.3       3.7    0.70
+fsck_repair_tests                     18.0      12.0    0.67
+crash_contract_tests                   0.5       0.5    1.01
+crash_kill_tests                       4.8       4.4    0.91
+writer_scoped_staging_tests            3.0       2.9    0.97
+readonly_mount_tests                   4.7       4.4    0.93
+meta_slot_migration_tests              5.7       4.4    0.77
+pv_coordinator_tests                   5.5       4.2    0.77
+sym_appender_tests                     6.5       6.0    0.92
+```
+
+The sub-1.0 ratios are the FLAT leg's, not the code's: every stamped wall matches the previous run's to within noise (`fsck_repair_tests` 12.1 → 12.0 s, `kv_scale_tests` 32.4 → 30.3, `kv_backend_tests` 148.4 → 144.2, `kv_leaf_merge_tests` 41.6 → 39.5) while this run's flat leg — which followed the ×10 loops' rebuild on a box at load ≈ 1.8 — reads 30–55 % slower than its own previous run (`fsck_repair_tests` 11.6 → 18.0, `kv_scale_tests` 27.5 → 37.9, `fsck_c10_tests` 3.9 → 5.8). The stamped path is a superset of the flat one, so "stamped faster" is only ever venue; the dev-box heat/load caveat every dev-box row carries. The previous run (tree `1ceedb79`, before items 11–12) for the paired reading:
 
 ```text
 suite                                 flat   stamped   ratio
@@ -87,7 +115,9 @@ pv_coordinator_tests                   3.9       4.3    1.11
 sym_appender_tests                     5.5       5.5    1.01
 ```
 
-Two earlier runs were red and attributed before this one: (run 1) the flat leg's `sym_appender_tests::a_stalled_appender_ring_grows…` — the growth decision's instant (§6 item 9, product fix `4ce4c7de`); (run 2) the stamped leg's `crash_contract_tests::test_kv_v3_torn_newest_ledger_mount_serves_predecessor` — a harness premise: it tore whatever sat in slot `mounted + 1`, which on the flat leg was the bring-up cover's one record (the contract held by that coincidence) and on the forest leg the join's, with the cover's newer sibling intact beside it; it now shuts the first mount down and reads the predecessor seq off the device (`9f9c4e95`). Beside the matrix: `sym_appender_tests` ×10 from zero on each leg (5.2–5.4 s each); `crash_contract_tests`, `sym_forest_tests`, `decoder_property_tests`, `derivation_sweep_tests`, `env_knob_convention_tests`, `docs_parity_tests`, `kernel_op_economy_tests`, `readonly_mount_tests`, `kv_leaf_merge_tests`, `kv_backend_tests` flat ×3 + stamped ×3 with `--test-threads=1`, all green (`kv_backend_tests` 135–138 s flat vs 146–150 s stamped = 1.08×; `kv_leaf_merge_tests` 42–48 s vs 41–43 s).
+Live-FUSE suites (`posix_mount_semantics_tests`, `corpse_sweep_tests`, `inline_raise_tests`) both ways under `SQUEEZEFS_TEST_REQUIRE_MOUNT=1`, `--test-threads=1`, on the final tree: **all six legs green** — 3/3 in 32 s / 32 s, 4/4 in 138 s / 129 s, 7/7 in 83 s / 87 s (flat / stamped). The first live-FUSE run (tree `1ceedb79`) read `inline_raise_tests` STAMPED RED 5/7 — item 11's finding; its other five legs were green.
+
+Two earlier matrix runs were red and attributed before these: (run 1) the flat leg's `sym_appender_tests::a_stalled_appender_ring_grows…` — the growth decision's instant (§6 item 9, product fix `4ce4c7de`); (run 2) the stamped leg's `crash_contract_tests::test_kv_v3_torn_newest_ledger_mount_serves_predecessor` — a harness premise: it tore whatever sat in slot `mounted + 1`, which on the flat leg was the bring-up cover's one record (the contract held by that coincidence) and on the forest leg the join's, with the cover's newer sibling intact beside it; it now shuts the first mount down and reads the predecessor seq off the device (`9f9c4e95`). Beside the matrix: `sym_appender_tests` ×10 stamped + ×10 flat from zero on the FINAL tree, 20/20 green at 25/25 (5.81–5.90 s each; the ×10 on the previous tree read one stamped red in twenty — item 12's finding); `crash_contract_tests`, `sym_forest_tests`, `decoder_property_tests`, `derivation_sweep_tests`, `env_knob_convention_tests`, `docs_parity_tests`, `kernel_op_economy_tests`, `readonly_mount_tests`, `kv_leaf_merge_tests`, `kv_backend_tests` flat ×3 + stamped ×3 with `--test-threads=1`, all green (`kv_backend_tests` 135–138 s flat vs 146–150 s stamped = 1.08×; `kv_leaf_merge_tests` 42–48 s vs 41–43 s).
 
 ## 5. Contracts (`tests/sym_appender_tests.rs`, 25)
 

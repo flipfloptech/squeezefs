@@ -198,7 +198,8 @@ pub fn forest_key(kind: u8, legacy: &[u8]) -> Result<Vec<u8>, KvError> {
         )));
     }
     // The ino that routes the key must name a slot: the refs family's
-    // owner ino at offset 16 of the legacy key, the leading ino otherwise.
+    // owner ino at offset 16 of the legacy key, the leading ino otherwise
+    // (the forest form's `forest_route_off`, one byte earlier).
     let route_off = if kind == TREE_BLOCK_REFS {
         super::block_refs::BLOCK_REF_OWNER_OFF
     } else {
@@ -267,7 +268,23 @@ pub fn forest_key_kind(key: &[u8]) -> Result<u8, KvError> {
             key.len()
         )));
     }
+    // The ONE bound, both directions: a key whose routing ino names no
+    // slot is refused here as it is at the encoder — so whatever this
+    // decoder accepts re-encodes, and `split_forest_key` never hands a
+    // kind-routed walk a record no slot tree can own.
+    checked_forest_slot(u64::from_be_bytes(read8(key, forest_route_off(kind))))?;
     Ok(kind)
+}
+
+/// Offset of the ROUTING ino inside a forest key of `kind`: the owner for
+/// the refs family, the leading ino otherwise.
+#[inline]
+fn forest_route_off(kind: u8) -> usize {
+    if kind == TREE_BLOCK_REFS {
+        FOREST_BLOCK_REF_OWNER_OFF
+    } else {
+        0
+    }
 }
 
 /// How a key a slot tree holds fails the §5.2.1 codec — fsck's raw C1
@@ -276,7 +293,9 @@ pub fn forest_key_kind(key: &[u8]) -> Result<u8, KvError> {
 /// provably garbage; a kind byte this binary does not know may be a LATER
 /// binary's record, and deleting it would make an old `fsck --repair`
 /// destroy a newer format's data — so the raw repair deletes on
-/// [`RawKeyDefect::MalformedKnownKind`] alone and reports the rest.
+/// [`RawKeyDefect::MalformedKnownKind`] and
+/// [`RawKeyDefect::SlotOutOfNamespace`] alone (both a KNOWN kind in a
+/// shape the encoder never produces) and reports the rest.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RawKeyDefect {
     /// A kind byte this binary knows as a slot-tree content kind, with a
@@ -291,6 +310,11 @@ pub enum RawKeyDefect {
     /// bytes, an empty key) — no kind can claim it; report-only, since
     /// the repair deletes only what it can NAME.
     Truncated { got: usize },
+    /// A well-shaped key of a known kind whose ROUTING ino names a slot
+    /// above the namespace — the encoder never frames one (the u16 slot
+    /// space is frozen with the key layout), so no slot tree can own it:
+    /// repairable in place.
+    SlotOutOfNamespace { kind: u8, slot: ForestSlot },
 }
 
 /// Classify a key the forest codec refuses; `None` when it decodes.
@@ -329,14 +353,21 @@ pub fn classify_refused_key(key: &[u8]) -> Option<RawKeyDefect> {
             None => return Some(RawKeyDefect::Truncated { got: key.len() }),
         },
     };
-    match legacy_key_len(kind) {
-        Some(want) => Some(RawKeyDefect::MalformedKnownKind {
+    let Some(want) = legacy_key_len(kind) else {
+        return Some(RawKeyDefect::UnknownKind { kind });
+    };
+    if key.len() != want + 1 {
+        return Some(RawKeyDefect::MalformedKnownKind {
             kind,
             want: want + 1,
             got: key.len(),
-        }),
-        None => Some(RawKeyDefect::UnknownKind { kind }),
+        });
     }
+    // Right kind, right length: the codec refused the routing ino.
+    Some(RawKeyDefect::SlotOutOfNamespace {
+        kind,
+        slot: forest_slot_of_ino(u64::from_be_bytes(read8(key, forest_route_off(kind)))),
+    })
 }
 
 /// Split a forest key into `(kind, legacy key)` — the inverse of
@@ -360,12 +391,11 @@ pub fn split_forest_key(key: &[u8]) -> Result<(u8, Vec<u8>), KvError> {
 /// route the same way.
 pub fn forest_key_slot(key: &[u8]) -> Result<ForestSlot, KvError> {
     let kind = forest_key_kind(key)?;
-    let off = if kind == TREE_BLOCK_REFS {
-        FOREST_BLOCK_REF_OWNER_OFF
-    } else {
-        0
-    };
-    checked_forest_slot(u64::from_be_bytes(read8(key, off)))
+    // `forest_key_kind` already refused an ino above the namespace.
+    Ok(forest_slot_of_ino(u64::from_be_bytes(read8(
+        key,
+        forest_route_off(kind),
+    ))))
 }
 
 // ---------------------------------------------------------------------------

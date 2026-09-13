@@ -7,3 +7,4 @@
 cc 837f28d5becfbc50876d22c52b1b5235095372ad98a147dcfe63de784099616d # shrinks to recs = [Record { key: [0], seq: 0, kind: Put, value: [] }], tree = 0
 cc 4bf733ba54564edad538d395889ea9ae85003eba7abb2db5a5646a81343b2a47 # shrinks to s = "A𖭽a   aaጘ00a "
 cc ba4178e33d162067f7866bc11a56ce9d479c686d0868ea465bc3e8f1a30af886 # shrinks to data = [2]
+cc 392593f140ac6250459e97ff89650bd6255d97b258a7fbb615e0df3f9f73adc4 # shrinks to data = [6, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0]

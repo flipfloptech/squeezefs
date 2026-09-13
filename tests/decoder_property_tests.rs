@@ -536,6 +536,13 @@ proptest! {
                 prop_assert_eq!(got, data.len());
                 prop_assert!(got < 9);
             }
+            // Right kind, right length, a routing ino no slot names: the
+            // ONE bound, enforced at the decoder as at the encoder — the
+            // key would never have re-encoded.
+            Some(RawKeyDefect::SlotOutOfNamespace { kind, slot }) => {
+                prop_assert!(is_slot_tree_kind(kind));
+                prop_assert!(slot > FOREST_SLOT_MAX);
+            }
             None => {}
         }
         if data.len() >= 9 && data[0] <= 0x01 && data[8] == TREE_BLOCK_REFS {

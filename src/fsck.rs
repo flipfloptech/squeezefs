@@ -6288,6 +6288,10 @@ fn raw_key_repair_gate(key_hex: &str) -> std::result::Result<String, String> {
             "kind {kind} is a slot-tree kind of this binary and its key is {got} bytes where the \
              codec wants {want}"
         )),
+        Some(RawKeyDefect::SlotOutOfNamespace { kind, slot }) => Ok(format!(
+            "kind {kind} is a slot-tree kind of this binary and its routing ino names slot \
+             {slot}, above the u16 slot namespace no encoder ever frames into"
+        )),
         Some(RawKeyDefect::UnknownKind { kind }) => Err(format!(
             "kind byte {kind:#04x} is not a slot-tree kind this binary knows — a later \
              binary's record or garbage; REPORT-ONLY (design-symmetric-metadata §7.1: a new \

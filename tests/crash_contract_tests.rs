@@ -1483,16 +1483,24 @@ async fn test_kv_v3_torn_newest_ledger_mount_serves_predecessor() {
     let f = k6a_built_volume().await;
     let _g = FaultGuard;
 
-    // Mount once clean: this is the predecessor state a fallback must
-    // reproduce exactly.
-    let (want_digest, want_seq, sb) = {
+    // Mount once clean and shut down: this is the predecessor state a
+    // fallback must reproduce exactly. The predecessor SEQ is read off
+    // the DEVICE after the shutdown — a mount writes ledger records of its
+    // own (the bring-up cover, the final checkpoint; on a forest volume
+    // the appender join too), so "the record the torn one follows" is the
+    // newest durable one, never the one the mount happened to read.
+    let (want_digest, sb) = {
         let be = KvMetaBackend::open(f.path()).await.unwrap();
-        (
-            digest_backend(&be).await.unwrap(),
-            be.mounted_ledger().seq,
-            be.superblock().clone(),
-        )
+        let d = digest_backend(&be).await.unwrap();
+        let sb = be.superblock().clone();
+        be.shutdown().await.unwrap();
+        (d, sb)
     };
+    let want_seq = read_newest_ledger(f.path(), sb.root_ledger.start)
+        .await
+        .unwrap()
+        .expect("a shut-down volume's ledger")
+        .seq;
 
     // A later checkpoint (seq + 1) races power loss: its slot write tears
     // mid-record. Roots point at garbage on purpose — if the fallback ever

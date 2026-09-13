@@ -1167,6 +1167,14 @@ async fn times_drain_task(
                 be.device_path()
             );
         }
+        // The checkpoint task's belt, verbatim: a shutdown that landed
+        // WHILE the drain ran is re-armed as a permit, so the park above
+        // never sleeps to the cadence deadline with the join waiting on it
+        // (`shutdown()` signals with a permit; this covers a signaller that
+        // stores the flag without one).
+        if be.is_shutting_down() {
+            wake.notify_one();
+        }
     }
 }
 

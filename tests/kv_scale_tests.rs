@@ -1734,11 +1734,26 @@ async fn shutdown_signalled_mid_maintenance_pass_completes_within_the_tick() {
     }
 
     // The task is inside its pass, registered on nothing. Signal the
-    // shutdown NOW, from another task, then let the pass finish.
+    // shutdown from another task and OBSERVE it landing — the
+    // `shutdown_signalled` trace edge is written after the flag store and
+    // the permit — before the seam is released, so "the signal lands while
+    // the task is inside its pass" is an ordering the test witnesses, not
+    // a sleep it hopes covers it (review round 5, Issue 27). The 10 s is
+    // the bound on the whole join, never the ordering.
     let closer = Arc::clone(&be);
     let t0 = Instant::now();
     let closing = tokio::spawn(async move { closer.shutdown().await });
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    while !be.open_trace().contains(&"shutdown_signalled") {
+        assert!(
+            t0.elapsed() < Duration::from_secs(10),
+            "shutdown never reached its signal while the task was parked on the seam"
+        );
+        assert!(
+            TEST_SMO_BUILD_PAUSED.lock().expect("seam mutex").is_some(),
+            "the task left its pass before the signal landed — the seam did not hold"
+        );
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
     test_smo_build_pause_release();
     let joined = tokio::time::timeout(Duration::from_secs(10), closing)
         .await

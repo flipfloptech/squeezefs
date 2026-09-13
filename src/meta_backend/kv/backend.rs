@@ -6089,6 +6089,11 @@ impl KvMetaBackend {
         // stall). A permit is consumed by the task's NEXT `notified()`,
         // whenever that is.
         self.ckpt_wake.notify_one();
+        // The trace edge a harness orders on: past this line the flag is
+        // stored and the permit sent — whatever the checkpoint task is
+        // doing now, its next park is not where it learns about the
+        // shutdown.
+        self.trace_guard_event("shutdown_signalled");
         // PR M6: the drain task observes the flag on its wake and exits;
         // joining it keeps the no-leaked-tasks teardown contract. The same
         // permit law as the checkpoint task's signal above: the drain task
@@ -7467,7 +7472,10 @@ impl KvMetaBackend {
     /// guard events of this backend's `open` — pinned order
     /// `flock_acquired` → `claim_committed` → `claim_barriered` →
     /// `checkpoint_task_spawned` (the claim is the volume's first
-    /// post-replay mutation *by construction*, design §5.0 B2).
+    /// post-replay mutation *by construction*, design §5.0 B2) — and, at
+    /// the other end, `shutdown_signalled` once `shutdown()` has stored
+    /// the flag and sent the checkpoint task its permit (the edge a
+    /// liveness harness orders a seam release on).
     pub fn open_trace(&self) -> Vec<&'static str> {
         self.guard_trace.lock().unwrap().clone()
     }

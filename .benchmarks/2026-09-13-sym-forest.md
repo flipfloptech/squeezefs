@@ -13,25 +13,32 @@ block-map 13 B) and `0x06 ‖ …` for block references (29 B). One router
 (`kv/forest.rs` `SlotTrees`) turns every `(kind, legacy key)` the shipped
 codecs produce into `(slot tree, forest key)`; slot trees are minted lazily
 on a slot's first record; the checkpoint task publishes every moved guest
-root into tree 0 before its flush pass, so the cycle's ledger record covers
-a slot tree's root swap.
+root into tree 0 before its flush pass (images barriered first), and an
+unpublished moved root is a FLOOR on the cycle's replay tail until tree 0
+names it — so the ledger record that follows the publication covers the
+root swap, and a deferred publication leaves every acked record under that
+root in the window.
 
 **It lands DARK.** Nothing stamps bit 17 but the test seam
-`SQUEEZEFS_TEST_STAMP_SYMMETRIC=1` (`Kind::Harness`, registered); `format
+`SQUEEZEFS_TEST_STAMP_SYMMETRIC=1` (`Kind::Bool`, registered); `format
 --symmetric` / `volume enable-symmetric` are PR 11's, the default flip PR
 14's. **A bit-17-absent volume takes the shipped code path verbatim** — the
 PR's most important pin, and the reason every pre-forest suite is the
 regression instrument here.
 
-Two commits on `feat/sym-forest` off `dev` `89f34ed7`: the red-first
-contracts (`bb059206`), the implementation (`df4682ff`), then the docs +
-this note. Dev-box, debug-build, in-process evidence ONLY — scoping, per
-the venue rule; the squeeze-test solo re-gate A-B-B-A (gate 1) is owed
-(§7).
+Commits on `feat/sym-forest` off `dev` `89f34ed7`: the red-first
+contracts (`bb059206`), the implementation (`df4682ff`), the per-op
+economy pass (`e90ceec8`), the docs + this note (`ef05b8a7`); then the
+review round 2 train — the red pins (`a01e806e`), the six forest-arm fixes
+(`d616cd6a`), the staged-key entry pricing (`49b6f592`), the parametrized
+harnesses (`98177d57`), the fuzz targets + proptest mirror (`f485905d`)
+and the slot-namespace bound (`5060ccd5`) — see §4b. Dev-box,
+debug-build, in-process evidence ONLY — scoping, per the venue rule; the
+squeeze-test solo re-gate A-B-B-A (gate 1) is owed (§7).
 
 ---
 
-## 1. The contracts (`tests/sym_forest_tests.rs`, 22, all green)
+## 1. The contracts (`tests/sym_forest_tests.rs`, 27, all green)
 
 | Contract | Pins |
 |---|---|
@@ -44,7 +51,7 @@ the venue rule; the squeeze-test solo re-gate A-B-B-A (gate 1) is owed
 | `stat_and_layout_are_adjacent_in_ino_major_order` | inode < dentries < xattrs < block map < next ino; every by-block key after every ino-major key |
 | `interior_records_carry_kind_zero_and_the_control_tree_tags_decode` | `tag_for(0, 1) = 0x10`; `decode_entry_payload` admits (0, level ≥ 1), 8, 9 and refuses (0, 0) and 10 |
 | `bit_17_is_the_symmetric_forest_and_is_known_to_this_binary` | `1 << 17`, ≠ bit 16, in `FEATURES_INCOMPAT_KNOWN` |
-| `the_test_seam_is_a_registered_harness_knob` | ENG-10 |
+| `the_test_seam_is_a_registered_bool_knob` | ENG-10 — `Kind::Bool`, so a bad value refuses at startup like its `TEST_STAMP_*` siblings |
 | `slot_state_records_round_trip_and_refuse_malformed_images` / `slot_state_keys_sort_by_slot_index_and_decode` | tree 0's codec: versioned, truncation / future version / unknown variant refused; keys memcmp-sort by slot |
 | **`format_without_the_seam_stamps_nothing_and_names_the_shipped_roots`** | **the DARK pin**: the un-stamped builder image has no bit 17 and names exactly the three §4.2 roots |
 | `format_under_the_seam_stamps_bit_17_and_names_tree_zero_and_the_native_slot_root` | the stamped image's ledger names ids {0, 8} and no per-kind root |
@@ -55,8 +62,14 @@ the venue rule; the squeeze-test solo re-gate A-B-B-A (gate 1) is owed
 | **`a_stamped_set_mints_into_guest_slot_trees_whose_roots_ride_tree_zero`** | a one-member derived-width set under the seam: 128 creates spread over the 64 rotor slots → 64 slot trees (63 minted lazily); `checkpoint_now` publishes exactly 63 `slot_state` records into tree 0 and the ledger still names only {0, 8}; remount reopens all 64 from tree 0, digest-equal, every child + xattr resolves |
 | `an_empty_slot_owns_no_extent` | a fresh single-member forest: one slot tree, zero `slot_state` records, no root for an untouched guest slot |
 | `a_root_swap_pins_the_floor_until_the_ledger_names_it` | 48 files × 4 KB xattrs swap the native root; the checkpoint's ledger names the swapped root; the SECOND barriered cycle's tail stands past the pre-swap head (reclamation lags one cycle by design — the same on a flat volume) |
+| **`block_references_of_guest_owned_files_commit_and_are_counted_across_slot_trees`** (round 2) | a stamped width-8 set with guest-owned striped files: every reference commits (the write-side audit sees the LEGACY key), `block_ref_count` = the population across EVERY slot tree, the C8 oracle reads drift 0 |
+| **`a_rightmost_leaf_smo_in_the_window_replays_into_its_own_tree_not_a_phantom_slot`** (round 2) | a slot tree of height ≥ 2 with a rightmost-leaf SMO (separator `KEY_SPACE_MAX`) in the replay window: replay-twice digest equality, no phantom `slot_state`, the slot-tree population unchanged |
+| **`a_deferred_root_publication_keeps_the_unpublished_roots_in_the_window`** (round 2) | `TEST_FOREST_PUBLISH_DEFER` defers the tree-0 publication: the cycle's tail stays clamped at the unpublished roots' floor, a crash + replay serves every acked record (RED with the clamp removed) |
+| `a_guest_root_swap_is_covered_through_tree_zero` (round 2) | a GUEST root swap is named by tree 0 before the ledger's tail passes its floor |
+| `a_live_reader_of_a_forest_resolves_guests_minted_after_its_mount` (round 2) | a `-o ro` reader of a stamped set resolves a guest ino created after its mount at the next epoch step; guest roots are never re-rooted at the native root |
+| `stat_and_layout_are_adjacent_in_ino_major_order` (extended, round 2) | `FOREST_SLOT_MAX` is the ONE slot-namespace bound: an ino above it refuses at the encoder (every kind, refs by OWNER) and at the decoder |
 
-Regression instrument (un-stamped volumes, the shipped path): `kv_backend_tests` 36, `kv_leaf_merge_tests` 13, `kv_node_cache_coherence_tests` 21, `kv_partitioned_append_tests` 27, `kvmap_tree_tests` 14, `kv_journal_tests`, `durable_block_refs_tests` 24, `crash_contract_tests` 25, `derivation_sweep_tests` 51, `env_knob_convention_tests` 21, `docs_parity_tests` 5, `writer_scoped_staging_tests` 32, `decoder_property_tests` 29, `fsck_tests` / `fsck_c9_tests` / `fsck_c10_tests` — all green after the sweep (two pins moved with the format law: `TREE_ID_MAX` is 9, and 10 — not 8 — is the first id past the table).
+Regression instrument — **the parametrized gate** `tests/run_sym_forest_suites.sh` (= `task check:sym-forest`): fifteen pre-forest KV suites run flat THEN under the seam, failing on the first red leg — `kv_backend_tests` 36, `kv_journal_tests` 21, `kv_partitioned_append_tests` 27, `kv_leaf_merge_tests` 13, `kv_node_cache_coherence_tests` 21, `kvmap_tree_tests` 14, `durable_block_refs_tests` 24, `fsck_tests` 22, `fsck_c9_tests` 12, `fsck_c10_tests` 18, `crash_contract_tests` 25, `crash_kill_tests` 9, `writer_scoped_staging_tests` 32, `readonly_mount_tests` 28, `meta_slot_migration_tests` 16 — **all green BOTH ways** (round 2; round 1 had run them flat only, which is how the §4b defects stayed invisible). The three live-FUSE suites (`posix_mount_semantics_tests` 3, `corpse_sweep_tests` 4, `inline_raise_tests` 7) run under `SQUEEZEFS_TEST_REQUIRE_MOUNT=1` both ways too. Plus `derivation_sweep_tests` 51, `env_knob_convention_tests` 21, `docs_parity_tests` 5, `decoder_property_tests` 36 (two pins moved with the format law: `TREE_ID_MAX` is 9, and 10 — not 8 — is the first id past the table).
 
 ## 2. The design as built — and the four places it was decided
 
@@ -64,8 +77,8 @@ Regression instrument (un-stamped volumes, the shipped path): `kv_backend_tests`
 |---|---|---|
 | **Where the kind byte enters** | ONCE, at the staging choke point (`build_queued_tx` → `stage_key`); every downstream step — leaf resolution, the journal entry, replay, the migration tee — sees the forest key, and the tag stays the kind (the journal wire is the shipped one byte-for-byte, only the key bytes gained the kind) | the design's "content records journaled `tag_for(kind, 0)`", with the ~300 per-kind key builders across the tree left untouched: they produce LEGACY keys and the router frames them |
 | **Node → tree dispatch** | every slot tree's nodes carry header `tree_id` 0, so `CachedNode` gained a RAM-only `forest_slot` stamp (set by the owning `KvTree` at `descend` return and at every publish) and the checkpoint's flush pass, the heap-admission root check and the maintenance enqueue dispatch by it; `KvTree::owns` = header id ∧ stamp at every maintenance / merge / census filter | the 40-byte node header has no free field; a separator-derived slot is not defined for a one-leaf root spanning `[b"", MAX]`; the stamp is one relaxed store on the traversal path |
-| **Where guest roots live** | tree 0, written by the checkpoint task as ONE checkpoint-class journal entry (`try_admit(Checkpoint)` → `reserve_registered` → `apply_replayed` with the reserved seqs → `commit_entry`) BEFORE the flush pass; the native root and tree 0's own root ride the ledger | the SMO journal's own protocol; a journaled record replays into tree 0 if un-flushed, and the flush pass carries tree 0's leaf in the same cycle, so the cycle's ledger record covers the publication — the FIND-VS-A dying-floor argument holds per slot tree with no new mechanism |
-| **Range scans** | `range_kind(kind, start, end, max)` translates sentinel bounds (`[0]`, `KEY_SPACE_MAX`) as prefix cuts, probes ONE slot tree when the window spans one slot (chain scans, an ino's xattrs, a directory's entries) and walks the forest in slot order otherwise (= legacy key order), filtering the mixed leaf by kind and returning legacy keys | every walker in the tree (fsck, defrag, jobs, migration, the census) works unchanged on both layouts |
+| **Where guest roots live** | tree 0, written by the checkpoint task as ONE checkpoint-class journal entry (`try_admit(Checkpoint)` → barrier (the named images — a fresh mint's root has none of its own) → `reserve_registered` → `apply_replayed` with the reserved seqs → `commit_entry`) BEFORE the flush pass; the native root and tree 0's own root ride the ledger. **An unpublished moved root is a floor**: `KvTree::root_floor` (the mint's ring head / the swap's reservation) clamps the cycle's tail through `SlotTrees::unpublished_root_floor` until the publication lands; a `commit_entry` failure is the journal-failure class | the SMO journal's own protocol; a journaled record replays into tree 0 if un-flushed, and the flush pass carries tree 0's leaf in the same cycle — but ONLY once the publication has landed, which the reserve can defer, so the floor is what makes the FIND-VS-A dying-floor argument hold per slot tree (round 2, Issues 4/5) |
+| **Range scans** | `range_kind(kind, start, end, max)` translates sentinel bounds (`[0]`, `KEY_SPACE_MAX`) as prefix cuts, probes ONE slot tree when the window spans one slot (chain scans, an ino's xattrs, a directory's entries) and walks the forest in slot order otherwise (= legacy key order for the ino-major kinds), filtering the mixed leaf by kind and returning legacy keys. **The refs family is the exception**: block-major inside a tree, slot-major across the forest, so a legacy cursor cannot name a forest resume point — `SlotTrees::refs_window` scans the whole window in EVERY slot tree with its own cursor (`block_ref_count` / `block_ref_scan`), and `range_kind(TREE_BLOCK_REFS, …)` refuses | every walker in the tree (fsck, defrag, jobs, migration, the census) works unchanged on both layouts; the refs probes are exact on a forest (round 2, Issue 1) |
 
 Two more decisions worth stating: `flat_trees()` (the pre-forest `trees()`
 surface) is a FLAT volume's per-kind trees and EMPTY on a forest —
@@ -116,6 +129,63 @@ adjudicates "within noise".
   have adopted every other slot tree's nodes. `KvTree::owns` (id ∧ stamp)
   is at every site.
 
+## 4b. Found by review round 2 — the stamped run of the pre-forest suites
+
+Round 1 ran every pre-forest suite flat only; the reviewer ran them under
+the seam and the forest arm was red in four independent ways. Each got a
+red-first pin (`a01e806e`) and a fix (`d616cd6a` + `49b6f592`):
+
+- **The write-side encode audit received the FOREST key under the kind
+  tag** (`node.rs` `debug_audit_records`) and ran the 28/12-byte legacy
+  decoders on the 29/13-byte refs / block-map keys — every block reference
+  or block-map record staged on a forest volume panicked the handler task
+  in a debug build (22/24 `durable_block_refs_tests`, 18/22 `fsck_tests`,
+  3/14 `kvmap_tree_tests`; a stamped live mount's `fsync` answered EIO).
+  The audit now runs on the LEGACY key BEFORE `stage_key` frames it, and on
+  the un-framed compensation records; the dead `KIND_INTERIOR && level ==
+  0` branch is gone.
+- **The refs probes saw the native slot tree only**: `forest_bound` read the
+  slot from the owner bytes of `block_range` / `volume_range`'s full-length
+  bounds (0 both ends), so `block_ref_count` / `block_ref_scan` collapsed to
+  slot 0 — the mount-time ledger seed recovered every guest-owned block as
+  FREE and the C8 oracle reported drift. `SlotTrees::refs_window` visits
+  every slot tree with its own cursor (§2, Range scans).
+- **Rightmost-leaf SMO pointer records routed to a phantom slot**: the
+  separator `KEY_SPACE_MAX` decoded to slot `0xFFFFFF`, minting a bogus
+  tree at replay and leaving the real tree's parent on the retired child.
+  A slot tree's interior journal key is now `slot: u32 BE ‖ separator`
+  (`forest::interior_journal_key`), stripped at replay.
+- **A deferred tree-0 publication left no floor** (and a fresh mint's root
+  was named in the ring un-barriered): `KvTree::root_floor` +
+  `SlotTrees::unpublished_root_floor` clamp the tail; the barrier precedes
+  the entry; a `commit_entry` failure fail-stops.
+- **The FLAT hot path had gained an `Arc<KvTree>` clone/drop per record
+  access** (`flat_tree`) — the shared-line RMW class W-6 removed. The flat
+  arm borrows (`TreeRef::Borrowed(&KvTree)`); the forest arm keeps its
+  `Arc` (the minted tree lives in the `scc` map).
+- **A `-o ro` reader re-rooted every guest at the native root** (every
+  slot tree carries header id 0, so `root_of(0)` answered the native root)
+  and never learned post-mount guests: `revalidate_trees` skips guest slot
+  trees and `forest_reader_resync` re-reads tree 0 at each epoch step.
+- **Entry planners priced records with LEGACY key lengths**: an over-cap
+  chunked destroy planned to the byte overran the cap on a forest (one
+  kind byte per record) and was refused — the three chunked-destroy
+  contracts swept 0 of 1 corpse. `staged_frame_len` is the ONE pricing
+  function.
+- **`forest_key` framed an ino no slot names** while the decoder refused
+  the same bytes (found writing the fuzz round-trip law): `FOREST_SLOT_MAX`
+  is the one bound, both directions.
+
+Harness shapes that only the flat layout could satisfy were made
+layout-blind (`98177d57`): every census walk / damage seed reaches the
+trees through the kind-routed helpers (`record_locator` replaces the two
+leaf finders and the height term), the SMO build-pause seam arms a slot
+tree by SLOT, the mid-wave merge test's throttle re-takes returned extents
+every iteration (on a forest the deletes' ring-full cycles let the wave
+complete before the mid-wave read — bimodal at 2/4 runs; a no-op on the
+flat leg), and the raw-ring replay test frames its keys as the volume
+journals them.
+
 ## 5. Stats
 
 `meta_kv_forest_slot_trees_minted` (guest slot trees minted this mount —
@@ -148,21 +218,43 @@ Exported on the stats inode; rows in `docs/operations.md`.
 6. **The pack law (§5.4.3) is untouched**: block references route by
    their OWNER ino, so a pack block's tenants of different slots put its
    references in different slot trees today; `block_ref_count` /
-   `block_ref_scan` therefore probe EVERY slot tree (the `0x06 ‖ vol ‖ blk`
-   prefix is one range per tree) — exact, O(slot trees) per probe, until
-   PR 7 packs per `(writer, slot, data volume)`.
+   `block_ref_scan` therefore probe EVERY slot tree (`SlotTrees::
+   refs_window` — one whole-window scan per tree, each with its own
+   cursor; round 1's claim of this was FALSE — `forest_bound` collapsed
+   the window to the native slot — and round 2 pinned + fixed it) — exact,
+   O(slot trees) per probe, until PR 7 packs per `(writer, slot, data
+   volume)`.
 7. **The `slot_tree_record` / `slot_state_record` fuzz targets and the
-   `decoder_property_tests` mirror are not written** (§7).
+   `decoder_property_tests` mirror** landed in round 2 (`f485905d`;
+   `kvmap_record` absorbed); the instrumented campaign is the nightly tier.
+8. **The lazy mint runs on the conveyor pass task**: ONE `claim_user`
+   extent (§4.7 user growth — refused at the compaction floor, never drawn
+   from the compaction reserve) and ONE device write + load-back of the
+   empty root, once per slot per volume, before any node lock. It deviates
+   from the §4.9 4b "RAM-only pass" law for that one write; design §5.3.3
+   moves the extent to the appender's grant in PR 3 (§7).
 
 ## 7. Owed
 
 - **Gate 1 on squeeze-test**: the A-B-B-A solo re-gate (mdstorm, rand-4k,
   `w_fresh`, scoreboard smoke, mount time) at this format-changing PR —
   `dlm_rpcs == 0`, within noise; leaf count vs population; the packing row.
-- **Fuzz**: `slot_tree_record` (absorbing `kvmap_record`) and
-  `slot_state_record` targets + the stable proptest mirror.
+- **The instrumented fuzz campaign** over `slot_tree_record` /
+  `slot_state_record` (nightly tier — no nightly toolchain on the dev box;
+  `task check:fuzz` type-checks them on stable and the proptest mirror runs
+  every law per commit).
 - **The ONE-walk fsck census** over the mixed leaves (C1–C10 in one pass
-  per slot tree).
+  per slot tree). Until then a malformed slot-tree key surfaces as a C1
+  WALK finding for the kind being walked (loud; the remainder of that
+  kind's walk is lost and the finding is not in-place repairable) — the
+  record-level C1 the flat layout reports for the same seed needs the
+  raw walk.
+- **The lazy mint off the pass task** (§6 item 8 — PR 3's appender grant).
+- **Issue 16's attribution** (`v3_ring_full_liveness_storm_drains`,
+  `a_mostly_deleted_full_volume_keeps_creating` aborting "parked for ring
+  space" under a PARALLEL stamped run): both pass stamped in isolation and
+  inside the serialized gate; the parallel-run shape is box load until a
+  quiet-box repro says otherwise.
 - **PR 2's owed input**: `slot_state.tails` is written empty and
   `cursor` 0 — the handover / per-slot cursor semantics are PR 2/4's.
 - **The `apply_locked` lease gate** (`leased_slots`) — PR 4, "lands HERE,

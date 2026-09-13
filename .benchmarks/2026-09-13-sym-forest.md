@@ -325,7 +325,14 @@ journals them.
   living in the ino-major key space (invisible to the refs scan, accepted
   by the raw walk) — refused now; and the classifier called a KNOWN
   ino-major kind in the by-block position "unknown" (report-only) where
-  the codec's own law makes it garbage — a later kind is always a NEW id.
+  the codec's own law makes it garbage — a later kind is always a NEW id;
+  and, OLDER than this round, `split_forest_key` accepted a key whose
+  routing ino names a slot above the namespace while the encoder refused
+  it (the saved seed: a refs key whose owner ino names slot 2,227,914) —
+  the decoder now enforces the shared bound (`b32d1fb3`), so whatever it
+  accepts re-encodes, and the classifier names the class
+  (`SlotOutOfNamespace`, repairable in place: a known kind in a shape the
+  encoder never produces).
 - **The non-writer's partial view had one inconsistent edge** (Issue
   23): a dentry lives in its PARENT's slot and names a child in the
   CHILD's, and the parent's leaf log carries a child's dentry the moment

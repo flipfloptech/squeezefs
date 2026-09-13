@@ -1267,6 +1267,154 @@ async fn fsck_reports_no_durable_reference_drift_on_a_healthy_volume() {
 }
 
 // ---------------------------------------------------------------------------
+// 9b. The by-block family REFUSES a malformed record on either layout
+//     (review round 3 of the symmetric-forest PR, Issue 22).
+// ---------------------------------------------------------------------------
+
+/// **A malformed block-reference record is loud corruption, never a
+/// silently skipped reference** — `block_ref_scan`'s own words — on BOTH
+/// layouts. The flat tree's decode refuses at the caller (`?` on
+/// `decode_block_ref_key`); the forest's whole-window scan (`SlotTrees::
+/// refs_window`) must refuse the same way, not drop the record from the
+/// page: an under-count is the exact failure this structure exists to
+/// prevent (a terminal free, a W1 sole-owner patch and an S9 population
+/// decision all read it). The skip-not-fail law belongs to the kind-routed
+/// RECORD walks alone, where fsck's raw C1 walk is the detector — and that
+/// walk reports this record too. The seed is a 20-byte key inside the
+/// block's `(vol_tag, block_idx)` prefix window (the legacy key is 28): the
+/// flat kind-routed insert stores it verbatim; the forest codec refuses the
+/// kind-routed insert (wrong length for its kind), so the seed goes RAW into
+/// the native slot tree under the refs prefix.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_malformed_reference_record_refuses_the_population_on_either_layout() {
+    use squeezefs::fsck::{FsckCtx, FsckOptions};
+    use squeezefs::meta_backend::kv::META_KV_FOREST_KEY_VIOLATIONS;
+
+    let meta = NamedTempFile::new().unwrap();
+    format_meta_stamped(meta.path()).await;
+    let data = data_file();
+    let rig = mount(meta.path(), data.path()).await;
+    let kv = &rig.routed.volumes[0];
+    assert!(kv.block_refs_engaged());
+
+    let a = rig.mk_file("refs_a").await;
+    let offset = rig.publish_block(a, 0).await;
+    let tag = block_refs::volume_tag(DATA_VOL_ID);
+    let idx = offset / rig.alloc.chunk_size();
+    assert_eq!(kv.block_ref_count(tag, idx).await.expect("count"), 1);
+    assert!(rig.drift().await.is_empty());
+
+    // The seed: the block's own 16-byte prefix plus 4 bytes — sorts inside
+    // `block_range(tag, idx)`, decodes as nothing.
+    let mut bad = Vec::with_capacity(20);
+    bad.extend_from_slice(&tag.to_be_bytes());
+    bad.extend_from_slice(&idx.to_be_bytes());
+    bad.extend_from_slice(&0x0badu32.to_be_bytes());
+    let violations0 = META_KV_FOREST_KEY_VIOLATIONS.load(std::sync::atomic::Ordering::Relaxed);
+    let forest = kv.symmetric_forest();
+    if forest {
+        assert!(
+            kv.insert_kind(
+                TREE_BLOCK_REFS,
+                &bad,
+                bytes::Bytes::from_static(b"\x01\0\0\0")
+            )
+            .await
+            .is_err(),
+            "the forest codec refuses a 20-byte key of the refs kind at the kind-routed insert"
+        );
+        let native = kv
+            .all_trees()
+            .into_iter()
+            .find(|t| {
+                t.forest_slot() == Some(squeezefs::meta_backend::kv::record::NATIVE_FOREST_SLOT)
+            })
+            .expect("the native slot tree exists");
+        let mut raw = Vec::with_capacity(21);
+        raw.push(TREE_BLOCK_REFS);
+        raw.extend_from_slice(&bad);
+        native
+            .insert(&raw[..], bytes::Bytes::from_static(b"\x01\0\0\0"))
+            .await
+            .expect("raw slot-tree insert");
+    } else {
+        kv.insert_kind(
+            TREE_BLOCK_REFS,
+            &bad,
+            bytes::Bytes::from_static(b"\x01\0\0\0"),
+        )
+        .await
+        .expect("the flat tree stores the key verbatim");
+    }
+
+    // Every by-block consumer refuses — the population is never answered
+    // short. (The flat arm is the pre-forest behaviour, unchanged.)
+    let count = kv.block_ref_count(tag, idx).await;
+    assert!(
+        count.is_err(),
+        "block_ref_count answered {count:?} over a malformed record (forest = {forest}) — an \
+         under-count, never a refusal"
+    );
+    assert!(
+        kv.block_ref_scan(tag).await.is_err(),
+        "block_ref_scan must refuse a malformed record (forest = {forest})"
+    );
+    assert!(
+        rig.router
+            .backend_router
+            .verify_durable_block_refs(&rig.routed)
+            .await
+            .is_err(),
+        "the C8 oracle must refuse, not compare a short population (forest = {forest})"
+    );
+    let violations = META_KV_FOREST_KEY_VIOLATIONS.load(std::sync::atomic::Ordering::Relaxed);
+    if forest {
+        assert!(
+            violations > violations0,
+            "the refused key is counted on the must-stay-0 tripwire before the refusal"
+        );
+    } else {
+        assert_eq!(
+            violations, violations0,
+            "no forest tripwire on a flat volume"
+        );
+    }
+
+    // fsck never guesses over a short population: the C8 oracle's refusal
+    // records no verdict on either layout. On a forest the raw C1 walk
+    // reads the mixed leaves and NAMES the record (a flat volume's C1
+    // walks the user kinds only — the refs tree's detector there is the
+    // consumers' refusal above, the shipped posture).
+    let report = squeezefs::fsck::run(
+        &FsckCtx {
+            meta: rig.routed.clone(),
+            router: rig.router.clone(),
+            staging_dirs: Vec::new(),
+            expected_generation: None,
+        },
+        &FsckOptions {
+            settle: std::time::Duration::from_millis(0),
+            ..FsckOptions::online()
+        },
+    )
+    .await
+    .expect("fsck runs to a report over the malformed record");
+    assert!(
+        !report.findings.iter().any(|f| f.class == "C8"),
+        "a refused oracle records no C8 verdict: {:?}",
+        report.findings
+    );
+    if forest {
+        assert!(
+            report.findings.iter().any(|f| f.class == "C1"),
+            "the forest's raw C1 walk names the malformed reference record: {:?}",
+            report.findings
+        );
+    }
+    rig.shutdown().await;
+}
+
+// ---------------------------------------------------------------------------
 // 10. Vector B of the 2026-08-04 shadow-supersession finding
 //     (rc-manifest §3d item 4): pending block-ref notes must never drain
 //     into a commit that does not persist the bindings they describe.

@@ -101,14 +101,34 @@ pub const NATIVE_FOREST_SLOT: ForestSlot = 0;
 /// The forest slot of guest slot `slot` (`(slot + 1) << 40` is its key
 /// ino base — [`crate::meta_backend::guest_local_ino`]).
 #[inline]
-pub fn guest_forest_slot(slot: u16) -> ForestSlot {
-    ForestSlot::from(slot) + 1
+pub const fn guest_forest_slot(slot: u16) -> ForestSlot {
+    slot as ForestSlot + 1
 }
 
-/// The forest slot of a local key ino: its top 24 bits.
+/// The largest forest slot any key can name: the native slot plus the
+/// u16 guest-slot namespace. A key ino at or above `(FOREST_SLOT_MAX + 1)
+/// << 40` belongs to no slot and is refused at the one codec in both
+/// directions ([`forest_key`] never frames it, [`forest_key_slot`] never
+/// routes it).
+pub const FOREST_SLOT_MAX: ForestSlot = guest_forest_slot(u16::MAX);
+
+/// The forest slot of a local key ino: its top 24 bits (unchecked — the
+/// range-bound builders pad with `0xFF` on purpose; [`forest_key_slot`]
+/// is the checked form).
 #[inline]
 pub fn forest_slot_of_ino(key_ino: u64) -> ForestSlot {
     (key_ino >> crate::meta_backend::GUEST_NS_SHIFT) as ForestSlot
+}
+
+/// [`forest_slot_of_ino`], refusing an ino no slot names.
+fn checked_forest_slot(key_ino: u64) -> Result<ForestSlot, KvError> {
+    let slot = forest_slot_of_ino(key_ino);
+    if slot > FOREST_SLOT_MAX {
+        return Err(KvError::Corrupt(format!(
+            "key ino {key_ino:#x} names forest slot {slot} — above the slot namespace              ({FOREST_SLOT_MAX})"
+        )));
+    }
+    Ok(slot)
 }
 
 /// Forest inode key: `ino ‖ 0x01`.
@@ -168,6 +188,10 @@ pub fn forest_key(kind: u8, legacy: &[u8]) -> Result<Vec<u8>, KvError> {
             legacy.len()
         )));
     }
+    // The ino that routes the key must name a slot: the refs family's
+    // owner ino at offset 16 of the legacy key, the leading ino otherwise.
+    let route_off = if kind == TREE_BLOCK_REFS { 16 } else { 0 };
+    checked_forest_slot(u64::from_be_bytes(read8(legacy, route_off)))?;
     let mut out = Vec::with_capacity(legacy.len() + 1);
     if kind == TREE_BLOCK_REFS {
         out.push(kind);
@@ -245,7 +269,7 @@ pub fn forest_key_slot(key: &[u8]) -> Result<ForestSlot, KvError> {
     } else {
         0
     };
-    Ok(forest_slot_of_ino(u64::from_be_bytes(read8(key, off))))
+    checked_forest_slot(u64::from_be_bytes(read8(key, off)))
 }
 
 // ---------------------------------------------------------------------------

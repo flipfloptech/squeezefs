@@ -32,18 +32,30 @@ use squeezefs::cluster_wire::{
 };
 use squeezefs::layout_wire::{decode_base_layout, encode_layout, LayoutDelta, LayoutMetadata};
 use squeezefs::meta_backend::kv::block_map::{
-    decode_block_map_key, decode_block_map_value, parse_kvmap_head,
+    block_map_key, decode_block_map_key, decode_block_map_value, parse_kvmap_head,
 };
+use squeezefs::meta_backend::kv::block_refs::block_ref_key;
 use squeezefs::meta_backend::kv::bset::{
     build_bset, checksum_image, BsetView, BSET_HEADER_LEN, BSET_MAGIC, BSET_VERSION,
+};
+use squeezefs::meta_backend::kv::forest::{
+    interior_journal_key, split_interior_journal_key, INTERIOR_JOURNAL_SLOT_LEN,
 };
 use squeezefs::meta_backend::kv::journal::{decode_entry_payload, encode_entry_payload};
 use squeezefs::meta_backend::kv::node::{verify_node_extent, NodeLayout};
 use squeezefs::meta_backend::kv::record::{
-    decode_dentry_key, decode_inode_key, decode_readdir_cookie, decode_xattr_key, DentryValue,
-    InodeDelta, InodeValue, Record, RecordRef, XattrValue,
+    decode_dentry_key, decode_inode_key, decode_readdir_cookie, decode_xattr_key, dentry_key,
+    forest_key, forest_key_kind, forest_key_slot, forest_slot_of_ino, inode_key, is_slot_tree_kind,
+    split_forest_key, xattr_key, DentryValue, InodeDelta, InodeValue, Record, RecordRef,
+    XattrValue, FOREST_SLOT_MAX, TREE_BLOCK_MAP, TREE_BLOCK_REFS, TREE_DENTRIES, TREE_INODES,
+    TREE_XATTRS,
+};
+use squeezefs::meta_backend::kv::slot_state::{
+    decode_slot_state_key, slot_state_key, SlotState, SLOT_STATE_KEY_LEN, SLOT_STATE_VERSION,
 };
 use squeezefs::meta_backend::kv::superblock::SuperblockV3;
+use squeezefs::meta_backend::kv::tree::RootPtr;
+use squeezefs::meta_backend::GUEST_NS_SHIFT;
 use squeezefs::meta_ship::publish::{
     decode_reply_frame, decode_request_frame, encode_reply_frame, encode_request_frame,
     PublishCall, PublishCallOutcome, PublishReply, PublishReplyFrame, PublishRequestFrame,
@@ -233,6 +245,29 @@ fn cluster_wire_hex_decode_is_total_and_exact() {
     );
 }
 
+/// A `slot_state` tails vector the u16 count cannot express is refused at
+/// the ENCODER — never truncated into a record whose count lies (the
+/// decoder checks the count against the length, so a truncated image would
+/// be corruption on the next mount).
+#[test]
+fn slot_state_tails_past_u16_refuse_at_the_encoder() {
+    let too_many = SlotState::Unleased {
+        root: RootPtr { addr: 1, seq: 1 },
+        cursor: 0,
+        g: 0,
+        tails: vec![(0, 0); usize::from(u16::MAX) + 1],
+    };
+    assert!(too_many.encode().is_err());
+    let at_cap = SlotState::Unleased {
+        root: RootPtr { addr: 1, seq: 1 },
+        cursor: 0,
+        g: 0,
+        tails: vec![(0, 0); usize::from(u16::MAX)],
+    };
+    let bytes = at_cap.encode().expect("u16::MAX tails encode");
+    assert_eq!(SlotState::decode(&bytes).expect("decodes"), at_cap);
+}
+
 // ---------------------------------------------------------------------------
 // never-panic over arbitrary bytes
 // ---------------------------------------------------------------------------
@@ -389,6 +424,151 @@ proptest! {
         let prefixed = format!("kvmap:{s}");
         if let Ok(head) = parse_kvmap_head(&prefixed) {
             prop_assert_eq!(head.encode(), prefixed);
+        }
+    }
+
+    /// The slot-tree forest's ONE key codec
+    /// (docs/design-symmetric-metadata.md §5.2.1, incompat bit 17; the
+    /// `slot_tree_record` fuzz target's mirror) is total, and whatever it
+    /// accepts re-encodes byte-identically and routes to a slot inside the
+    /// namespace.
+    #[test]
+    fn forest_key_decoders_never_panic(data in prop::collection::vec(any::<u8>(), 0..64)) {
+        let kind = forest_key_kind(&data);
+        let split = split_forest_key(&data);
+        let slot = forest_key_slot(&data);
+        prop_assert_eq!(kind.is_ok(), split.is_ok());
+        match split {
+            Ok((k, legacy)) => {
+                prop_assert!(is_slot_tree_kind(k));
+                prop_assert_eq!(kind.ok(), Some(k));
+                prop_assert_eq!(forest_key(k, &legacy).expect("re-encodes"), data);
+                let s = slot.expect("a decoded key routes");
+                prop_assert!(s <= FOREST_SLOT_MAX);
+            }
+            Err(_) => prop_assert!(slot.is_err()),
+        }
+    }
+
+    /// The encoder's whole domain round-trips, and the slot namespace is
+    /// ONE bound enforced in both directions: an ino at or above
+    /// `(FOREST_SLOT_MAX + 1) << 40` — the routing ino, i.e. the OWNER for
+    /// the refs family — frames iff a slot names it.
+    #[test]
+    fn forest_key_round_trips_over_the_encoders_domain(
+        kind in prop::sample::select(vec![
+            TREE_INODES, TREE_DENTRIES, TREE_XATTRS, TREE_BLOCK_MAP, TREE_BLOCK_REFS,
+        ]),
+        // Half the draws inside the namespace, half at/above its edge.
+        ino in prop_oneof![
+            0u64..=((u64::from(FOREST_SLOT_MAX) + 1) << GUEST_NS_SHIFT) - 1,
+            ((u64::from(FOREST_SLOT_MAX) + 1) << GUEST_NS_SHIFT)..=u64::MAX,
+        ],
+        hash in any::<u64>(),
+        coll in any::<u8>(),
+        idx in 0u32..u32::MAX,
+        vol_tag in any::<u64>(),
+        block_idx in any::<u64>(),
+    ) {
+        let legacy: Vec<u8> = match kind {
+            TREE_INODES => inode_key(ino).to_vec(),
+            TREE_DENTRIES => dentry_key(ino, hash & ((1 << 54) - 1), coll).to_vec(),
+            TREE_XATTRS => xattr_key(ino, hash & ((1 << 56) - 1), coll).to_vec(),
+            TREE_BLOCK_MAP => block_map_key(ino, idx).expect("non-reserved index").to_vec(),
+            _ => block_ref_key(vol_tag, block_idx, ino, idx).to_vec(),
+        };
+        let framed = forest_key(kind, &legacy);
+        let in_namespace = forest_slot_of_ino(ino) <= FOREST_SLOT_MAX;
+        prop_assert_eq!(framed.is_ok(), in_namespace, "kind {} ino {:#x}", kind, ino);
+        if let Ok(f) = framed {
+            prop_assert_eq!(f.len(), legacy.len() + 1);
+            let (k2, l2) = split_forest_key(&f).expect("splits");
+            prop_assert_eq!((k2, l2), (kind, legacy.clone()));
+            prop_assert_eq!(forest_key_slot(&f).expect("routes"), forest_slot_of_ino(ino));
+            // A forged kind byte (any non-content kind) refuses at the decoder.
+            let kind_off = if kind == TREE_BLOCK_REFS { 0 } else { 8 };
+            for forged_kind in [0u8, 4, 5, 8, 9, 10, 0xFF] {
+                let mut forged = f.clone();
+                forged[kind_off] = forged_kind;
+                prop_assert!(split_forest_key(&forged).is_err(), "kind byte {}", forged_kind);
+            }
+        }
+        // Wrong lengths refuse at the encoder.
+        prop_assert!(forest_key(kind, &legacy[..legacy.len() - 1]).is_err());
+        let mut long = legacy.clone();
+        long.push(0);
+        prop_assert!(forest_key(kind, &long).is_err());
+    }
+
+    /// A kind byte is never another tree's id (round-3 Issue 6): nothing
+    /// frames under the interior marker, the reserved ids, tree 0, the
+    /// shared index or any byte above — at any length.
+    #[test]
+    fn non_content_kinds_never_frame(
+        kind in prop::sample::select(vec![0u8, 4, 5, 8, 9, 10, 0x7F, 0xFF]),
+        legacy in prop::collection::vec(any::<u8>(), 0..40),
+    ) {
+        prop_assert!(!is_slot_tree_kind(kind));
+        prop_assert!(forest_key(kind, &legacy).is_err());
+    }
+
+    /// A slot tree's interior journal key (`slot ‖ separator`) splits
+    /// exactly; only a key with no separator refuses.
+    #[test]
+    fn interior_journal_key_split_is_total_and_exact(
+        data in prop::collection::vec(any::<u8>(), 0..48),
+    ) {
+        match split_interior_journal_key(&data) {
+            Ok((slot, sep)) => {
+                prop_assert!(!sep.is_empty());
+                prop_assert_eq!(interior_journal_key(slot, sep), data);
+            }
+            Err(_) => prop_assert!(data.len() <= INTERIOR_JOURNAL_SLOT_LEN),
+        }
+    }
+
+    /// Tree 0's `slot_state` codecs (design §5.2.2; the
+    /// `slot_state_record` fuzz target's mirror) are total, and whatever
+    /// decodes re-encodes byte-identically.
+    #[test]
+    fn slot_state_decoders_never_panic(data in prop::collection::vec(any::<u8>(), 0..256)) {
+        match decode_slot_state_key(&data) {
+            Ok(slot) => prop_assert_eq!(slot_state_key(slot), data.clone()),
+            Err(_) => prop_assert!(
+                data.len() != SLOT_STATE_KEY_LEN || !data.starts_with(b"slot_state:")
+            ),
+        }
+        if let Ok(state) = SlotState::decode(&data) {
+            prop_assert_eq!(data[0], SLOT_STATE_VERSION);
+            prop_assert_eq!(state.encode().expect("re-encodes"), data);
+        }
+    }
+
+    /// Every emittable `slot_state` record (both variants, any tails
+    /// length a u16 expresses) round-trips; a future version and an
+    /// unknown variant refuse; truncation refuses.
+    #[test]
+    fn slot_state_round_trips_over_the_encoders_domain(
+        addr in any::<u64>(),
+        seq in any::<u64>(),
+        cursor in any::<u64>(),
+        g in any::<u32>(),
+        tails in prop::collection::vec((any::<u64>(), any::<u32>()), 0..48),
+        slot in any::<u32>(),
+    ) {
+        prop_assert_eq!(decode_slot_state_key(&slot_state_key(slot)).ok(), Some(slot));
+        let unleased = SlotState::Unleased { root: RootPtr { addr, seq }, cursor, g, tails };
+        let leased = SlotState::Leased { appender_id: g, g: g.wrapping_add(1), page_addr: addr };
+        for state in [unleased, leased] {
+            let bytes = state.encode().expect("encodes");
+            prop_assert_eq!(SlotState::decode(&bytes).expect("decodes"), state.clone());
+            let mut future = bytes.clone();
+            future[0] = SLOT_STATE_VERSION.wrapping_add(1);
+            prop_assert!(SlotState::decode(&future).is_err());
+            let mut variant = bytes.clone();
+            variant[1] = 0x7F;
+            prop_assert!(SlotState::decode(&variant).is_err());
+            prop_assert!(SlotState::decode(&bytes[..bytes.len() - 1]).is_err());
         }
     }
 

@@ -10,10 +10,14 @@
 #      a header written by a process it must not trust unconditionally.
 #
 # 1.2 added to surfaces 1 and 2: the kvmap block-map tree's codecs
-# (incompat bit 16 — `kvmap_record`), and the cluster wire's RPC
-# vocabulary + authenticated framing with the S8/S9 verb bodies that ride
-# it (`cluster_wire_frame`, `publish_wire`) — the bytes one MEMBER of a
-# multi-writer set hands the volume authority.
+# (incompat bit 16), and the cluster wire's RPC vocabulary +
+# authenticated framing with the S8/S9 verb bodies that ride it
+# (`cluster_wire_frame`, `publish_wire`) — the bytes one MEMBER of a
+# multi-writer set hands the volume authority. The symmetric-metadata
+# forest (incompat bit 17, PR 1) folded the kvmap target into
+# `slot_tree_record` — the ONE forest key codec every record of a forest
+# volume passes through, plus the block-map codecs verbatim — and added
+# `slot_state_record` for tree 0's slot-root records.
 #
 # `tests/ipc_host_tests.rs` and `tests/job_wire_bounds_tests.rs` cover
 # every NAMED refusal class well. What these targets add is the classes
@@ -101,8 +105,15 @@ doc = false
 bench = false
 
 [[bin]]
-name = "kvmap_record"
-path = "fuzz_targets/kvmap_record.rs"
+name = "slot_tree_record"
+path = "fuzz_targets/slot_tree_record.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "slot_state_record"
+path = "fuzz_targets/slot_state_record.rs"
 test = false
 doc = false
 bench = false

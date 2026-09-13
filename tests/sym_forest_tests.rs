@@ -54,9 +54,9 @@ use squeezefs::meta_backend::kv::journal::{
 use squeezefs::meta_backend::kv::record::{
     dentry_key, forest_key, forest_key_slot, guest_forest_slot, inode_key, is_slot_tree_kind,
     split_forest_key, xattr_key, Record, FOREST_BLOCK_MAP_KEY_LEN, FOREST_BLOCK_REF_KEY_LEN,
-    FOREST_DENTRY_KEY_LEN, FOREST_INODE_KEY_LEN, FOREST_XATTR_KEY_LEN, KIND_INTERIOR,
-    NATIVE_FOREST_SLOT, TREE_BLOCK_MAP, TREE_BLOCK_REFS, TREE_CONTROL, TREE_DENTRIES, TREE_ID_MAX,
-    TREE_INODES, TREE_SHARED_INDEX, TREE_XATTRS,
+    FOREST_DENTRY_KEY_LEN, FOREST_INODE_KEY_LEN, FOREST_SLOT_MAX, FOREST_XATTR_KEY_LEN,
+    KIND_INTERIOR, NATIVE_FOREST_SLOT, TREE_BLOCK_MAP, TREE_BLOCK_REFS, TREE_CONTROL,
+    TREE_DENTRIES, TREE_ID_MAX, TREE_INODES, TREE_SHARED_INDEX, TREE_XATTRS,
 };
 use squeezefs::meta_backend::kv::revalidate::RevalidationPoller;
 use squeezefs::meta_backend::kv::slot_state::{slot_state_key, SlotState};
@@ -67,7 +67,7 @@ use squeezefs::meta_backend::kv::superblock::{
 use squeezefs::meta_backend::kv::tree::RootPtr;
 use squeezefs::meta_backend::{
     guest_local_ino, open_routed_meta_set, open_routed_meta_set_read_only, open_volume_for_mount,
-    plan_meta_slot_set, plan_meta_slot_set_with_width, Metadata, MINT_SPREAD,
+    plan_meta_slot_set, plan_meta_slot_set_with_width, Metadata, GUEST_NS_SHIFT, MINT_SPREAD,
 };
 use std::collections::HashMap;
 use tempfile::NamedTempFile;
@@ -441,14 +441,43 @@ fn stat_and_layout_are_adjacent_in_ino_major_order() {
     for w in chain.windows(2) {
         assert!(w[0] < w[1], "ino-major order: {:x?} < {:x?}", w[0], w[1]);
     }
+    // The largest ino any slot names: the last local ino of the last
+    // guest slot (the codec refuses anything above — no slot owns it).
+    let last_ino = (u64::from(FOREST_SLOT_MAX) << GUEST_NS_SHIFT) | ((1u64 << GUEST_NS_SHIFT) - 1);
     let last_ino_major = forest_key(
         TREE_BLOCK_MAP,
-        &block_map_key(u64::MAX >> 8, u32::MAX - 1).unwrap(),
+        &block_map_key(last_ino, u32::MAX - 1).unwrap(),
     )
     .unwrap();
     assert!(
         last_ino_major < refs,
         "the by-block family (prefix 0x06) sorts after every ino-major key"
+    );
+    let above_ino = last_ino + 1;
+    let above: [(u8, Vec<u8>); 4] = [
+        (TREE_INODES, inode_key(above_ino).to_vec()),
+        (TREE_DENTRIES, dentry_key(above_ino, 0, 0).to_vec()),
+        (TREE_XATTRS, xattr_key(above_ino, 0, 0).to_vec()),
+        (
+            TREE_BLOCK_MAP,
+            block_map_key(above_ino, 0).unwrap().to_vec(),
+        ),
+    ];
+    for (kind, legacy) in &above {
+        assert!(
+            forest_key(*kind, legacy).is_err(),
+            "kind {kind}: an ino above the slot namespace is refused at the encoder"
+        );
+    }
+    assert!(
+        forest_key(TREE_BLOCK_REFS, &block_ref_key(1, 1, above_ino, 0)).is_err(),
+        "a reference OWNED by an ino above the namespace is refused"
+    );
+    let mut forged = forest_key(TREE_INODES, &inode_key(last_ino)).unwrap();
+    forged[..8].copy_from_slice(&above_ino.to_be_bytes());
+    assert!(
+        forest_key_slot(&forged).is_err(),
+        "the decoder refuses the same ino — one bound, both directions"
     );
 }
 

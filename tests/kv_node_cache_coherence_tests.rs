@@ -31,7 +31,10 @@ use squeezefs::meta_backend::kv::node::{
 use squeezefs::meta_backend::kv::node_cache::{
     EpochPurgeSink, NodeCache, NodeCacheConfig, RootEpoch, DEFAULT_WRITEBACK_DELTA_BYTES,
 };
-use squeezefs::meta_backend::kv::record::{inode_key, InodeValue, Record, TREE_INODES};
+use squeezefs::meta_backend::kv::record::{
+    forest_key, inode_key, InodeValue, Record, NATIVE_FOREST_SLOT, TREE_CONTROL, TREE_DENTRIES,
+    TREE_INODES, TREE_XATTRS,
+};
 use squeezefs::meta_backend::kv::revalidate::{
     resolve_revalidate_interval_ms, revalidate_trees, revalidation_stats, RevalidationPoller,
     REVALIDATE_INTERVAL_ENV,
@@ -95,27 +98,70 @@ async fn reader(path: &std::path::Path) -> (Arc<NodeCache>, Vec<Arc<KvTree>>, Ro
         .expect("a fresh cache arms");
     let seq = Arc::new(AtomicU64::new(rec.seq.max(rec.node_seq_watermark)));
     let mut trees = Vec::new();
-    for tree_id in [
-        squeezefs::meta_backend::kv::record::TREE_INODES,
-        squeezefs::meta_backend::kv::record::TREE_DENTRIES,
-        squeezefs::meta_backend::kv::record::TREE_XATTRS,
-    ] {
-        let root = epoch.root_of(tree_id).expect("every tree names a root");
+    if sb.symmetric_forest_stamped() {
+        // A forest's ledger names tree 0 and the NATIVE slot tree (header
+        // id 0) — the three user kinds live inside the latter.
+        let control = epoch
+            .root_of(TREE_CONTROL)
+            .expect("the ledger names tree 0");
         trees.push(Arc::new(
             KvTree::open(
                 cache.clone(),
-                tree_id,
+                TREE_CONTROL,
                 RootPtr {
-                    addr: root.node_addr,
-                    seq: root.node_seq,
+                    addr: control.node_addr,
+                    seq: control.node_seq,
                 },
                 seq.clone(),
             )
             .await
-            .expect("open reader tree"),
+            .expect("open reader tree 0"),
         ));
+        let native = epoch
+            .root_of(squeezefs::meta_backend::kv::record::KIND_INTERIOR)
+            .expect("the ledger names the native slot tree");
+        trees.push(Arc::new(
+            KvTree::open_slot_tree(
+                cache.clone(),
+                NATIVE_FOREST_SLOT,
+                RootPtr {
+                    addr: native.node_addr,
+                    seq: native.node_seq,
+                },
+                seq.clone(),
+            )
+            .await
+            .expect("open reader native slot tree"),
+        ));
+    } else {
+        for tree_id in [TREE_INODES, TREE_DENTRIES, TREE_XATTRS] {
+            let root = epoch.root_of(tree_id).expect("every tree names a root");
+            trees.push(Arc::new(
+                KvTree::open(
+                    cache.clone(),
+                    tree_id,
+                    RootPtr {
+                        addr: root.node_addr,
+                        seq: root.node_seq,
+                    },
+                    seq.clone(),
+                )
+                .await
+                .expect("open reader tree"),
+            ));
+        }
     }
     (cache, trees, epoch)
+}
+
+/// The key a reader tree stores the inode record of `ino` under: the
+/// legacy key in a per-kind tree, the forest key in a slot tree.
+fn ikey(tree: &KvTree, ino: u64) -> Vec<u8> {
+    if tree.forest_slot().is_some() {
+        forest_key(TREE_INODES, &inode_key(ino)).expect("forest inode key")
+    } else {
+        inode_key(ino).to_vec()
+    }
 }
 
 /// Re-read the newest ledger record as a fresh epoch (one 128 KiB read —
@@ -132,10 +178,17 @@ async fn poll_epoch(path: &std::path::Path) -> RootEpoch {
     RootEpoch::from_ledger(&rec)
 }
 
+/// The reader tree holding records of kind `tree_id`: the per-kind tree
+/// on a flat volume, the native slot tree on a forest one.
 fn tree_of(trees: &[Arc<KvTree>], tree_id: u8) -> &KvTree {
     trees
         .iter()
         .find(|t| t.tree_id() == tree_id)
+        .or_else(|| {
+            trees
+                .iter()
+                .find(|t| t.forest_slot() == Some(NATIVE_FOREST_SLOT))
+        })
         .expect("tree opened")
 }
 
@@ -236,11 +289,11 @@ async fn arming_seeds_the_epoch_and_the_tail_and_drops_nothing() {
     assert_eq!(cache.durable_tail(), epoch.journal_tail_seq);
     assert!(
         cache.cached_bytes() > 0,
-        "opening three trees mapped their roots"
+        "opening the reader trees mapped their roots"
     );
     // The reader can read what the writer checkpointed.
     let inodes = tree_of(&trees, TREE_INODES);
-    let root_ino = inodes.lookup(&inode_key(1)).await.expect("lookup ino 1");
+    let root_ino = inodes.lookup(&ikey(inodes, 1)).await.expect("lookup ino 1");
     assert!(root_ino.is_some(), "the reader serves the root inode");
     be.shutdown().await.expect("shutdown");
 }
@@ -287,9 +340,9 @@ async fn an_advanced_epoch_drops_every_stale_node_including_pinned_roots() {
     be.create(1, "a", 0o644, 0, 0).await.expect("create");
     be.checkpoint_now().await.expect("checkpoint");
     let (cache, trees, _) = reader(&path).await;
-    // Touch every tree so all three roots are mapped and pinned.
+    // Touch every tree so every root is mapped and pinned.
     for t in &trees {
-        t.lookup(&inode_key(1)).await.expect("lookup");
+        t.lookup(&ikey(t, 1)).await.expect("lookup");
     }
     let mapped: Vec<u64> = trees.iter().map(|t| t.root().addr).collect();
     let charged = cache.cached_bytes();
@@ -336,14 +389,14 @@ async fn a_root_named_identically_by_the_new_record_is_still_dropped() {
     be.checkpoint_now().await.expect("checkpoint");
     let (cache, trees, epoch0) = reader(&path).await;
     let inodes = tree_of(&trees, TREE_INODES);
-    inodes.lookup(&inode_key(1)).await.expect("lookup");
+    inodes.lookup(&ikey(inodes, 1)).await.expect("lookup");
     let root0 = inodes.root();
 
     // A plain record append: no SMO, so the root pointer cannot move.
     be.create(1, "b", 0o644, 0, 0).await.expect("create");
     be.checkpoint_now().await.expect("checkpoint");
     let fresh = poll_epoch(&path).await;
-    let root1 = fresh.root_of(TREE_INODES).expect("root named");
+    let root1 = fresh.root_of(inodes.tree_id()).expect("root named");
     assert_eq!(
         (root1.node_addr, root1.node_seq),
         (root0.addr, root0.seq),
@@ -378,7 +431,7 @@ async fn the_reader_lags_by_exactly_one_polled_checkpoint() {
     let inodes = tree_of(&trees, TREE_INODES);
     assert!(
         inodes
-            .lookup(&inode_key(before))
+            .lookup(&ikey(inodes, before))
             .await
             .expect("lookup")
             .is_some(),
@@ -393,7 +446,7 @@ async fn the_reader_lags_by_exactly_one_polled_checkpoint() {
     be.checkpoint_now().await.expect("checkpoint");
     assert!(
         inodes
-            .lookup(&inode_key(after))
+            .lookup(&ikey(inodes, after))
             .await
             .expect("lookup")
             .is_none(),
@@ -405,7 +458,7 @@ async fn the_reader_lags_by_exactly_one_polled_checkpoint() {
     assert!(revalidate_trees(&cache, &trees, &fresh).advanced);
     assert!(
         inodes
-            .lookup(&inode_key(after))
+            .lookup(&ikey(inodes, after))
             .await
             .expect("lookup")
             .is_some(),
@@ -413,7 +466,7 @@ async fn the_reader_lags_by_exactly_one_polled_checkpoint() {
     );
     assert!(
         inodes
-            .lookup(&inode_key(before))
+            .lookup(&ikey(inodes, before))
             .await
             .expect("lookup")
             .is_some(),

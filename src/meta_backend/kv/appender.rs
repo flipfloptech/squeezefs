@@ -937,6 +937,298 @@ pub fn page_slot_offsets(
     }
 }
 
+// ---- The mounted regions ----------------------------------------------------
+
+/// The per-appender FLUSH CEILING, ms (KD-SYM-10, §5.7.3): every dirty
+/// leaf of every slot tree an appender leases is flushed — bset appended
+/// and barriered — within this many ms. It IS the checkpoint cadence
+/// ceiling (`CHECKPOINT_MAX_AGE_MS`), stated once; the reader's landing
+/// ceiling adds its tick terms on top of it, never the other way round.
+pub fn appender_flush_ceiling_ms() -> u64 {
+    super::checkpoint::CHECKPOINT_MAX_AGE_MS as u64
+}
+
+/// `SQUEEZEFS_TEST_SYM_APPENDER_SLOTS` — the PR-2 declared static
+/// partition (a harness seam standing in for PR 4's lease gate).
+pub const TEST_APPENDER_SLOTS_ENV: &str = "SQUEEZEFS_TEST_SYM_APPENDER_SLOTS";
+
+/// Parse the declared partition: `<id>:<forest slot>[,<slot>…][;<id>:…]`,
+/// ids ≥ 1, slots inside the forest namespace and named once. Empty /
+/// unset = no content appender besides the manager.
+pub fn declared_partition() -> Result<
+    std::collections::BTreeMap<u32, std::collections::BTreeSet<super::record::ForestSlot>>,
+    KvError,
+> {
+    let mut out = std::collections::BTreeMap::new();
+    let Ok(raw) = std::env::var(TEST_APPENDER_SLOTS_ENV) else {
+        return Ok(out);
+    };
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return Ok(out);
+    }
+    let mut seen: std::collections::BTreeSet<super::record::ForestSlot> =
+        std::collections::BTreeSet::new();
+    for part in raw.split(';') {
+        let (id, slots) = part.split_once(':').ok_or_else(|| {
+            KvError::Corrupt(format!(
+                "{TEST_APPENDER_SLOTS_ENV}: expected `<id>:<slot>[,<slot>…]`, got {part:?}"
+            ))
+        })?;
+        let id: u32 = id.trim().parse().map_err(|e| {
+            KvError::Corrupt(format!(
+                "{TEST_APPENDER_SLOTS_ENV}: bad appender id {id:?}: {e}"
+            ))
+        })?;
+        if id == 0 {
+            return Err(KvError::Corrupt(format!(
+                "{TEST_APPENDER_SLOTS_ENV}: appender 0 is the manager and leases the complement"
+            )));
+        }
+        let set: &mut std::collections::BTreeSet<super::record::ForestSlot> =
+            out.entry(id).or_default();
+        for s in slots.split(',') {
+            let slot: super::record::ForestSlot = s.trim().parse().map_err(|e| {
+                KvError::Corrupt(format!("{TEST_APPENDER_SLOTS_ENV}: bad slot {s:?}: {e}"))
+            })?;
+            if slot == super::record::NATIVE_FOREST_SLOT || slot > super::record::FOREST_SLOT_MAX {
+                return Err(KvError::Corrupt(format!(
+                    "{TEST_APPENDER_SLOTS_ENV}: slot {slot} is the native slot or outside the \
+                     forest namespace"
+                )));
+            }
+            if !seen.insert(slot) {
+                return Err(KvError::Corrupt(format!(
+                    "{TEST_APPENDER_SLOTS_ENV}: slot {slot} is named twice"
+                )));
+            }
+            set.insert(slot);
+        }
+    }
+    Ok(out)
+}
+
+/// One appender region this mount holds: its page slots, the RAM copy of
+/// its page, its ring (swapped on growth — never in place) and the
+/// per-region ledger the checkpoint cycle maintains.
+pub struct AppenderRegion {
+    pub id: u32,
+    /// `[A, B, R0, R1]` device offsets.
+    pub page_offsets: [u64; APPENDER_PAGE_SLOTS],
+    /// The page as last written (generation, term, roots, tail).
+    pub page: std::sync::Mutex<AppenderPage>,
+    /// The ring. Region 0's IS the backend's fixed ring; a region ≥ 1's
+    /// is replaced by [`super::journal::JournalRing::grown_with`] on a
+    /// drained stall.
+    pub ring: arc_swap::ArcSwap<super::journal::JournalRing>,
+    /// Forest slots this region leases (the declared partition); empty
+    /// for the manager, which leases the complement.
+    pub leases: std::collections::BTreeSet<super::record::ForestSlot>,
+    /// The tail the last written page named.
+    pub last_tail: std::sync::atomic::AtomicU64,
+    /// The tail the last COMPLETED barrier made durable — what this
+    /// ring's `reusable_upto` follows.
+    pub durable_tail: std::sync::atomic::AtomicU64,
+    /// Ring-admission parks on this region's ring (`journal_full_stalls`
+    /// attributed per appender).
+    pub stalls: std::sync::atomic::AtomicU64,
+    /// `stalls` as of the last growth decision — growth fires when it moved.
+    pub stalls_at_last_grow: std::sync::atomic::AtomicU64,
+    /// Growth events (`appender_ring_grows`).
+    pub ring_grows: std::sync::atomic::AtomicU64,
+    /// `(tail, barrier push epoch)` pushed per page write, drained by the
+    /// completed barrier that covers them (the DUR-3 discipline per ring).
+    pub pending_reclaim: std::sync::Mutex<Vec<(u64, u64)>>,
+    /// Conveyor passes inside this region's admit→handoff window (the
+    /// Dekker pair with `growing` — growth never swaps a ring a pass is
+    /// reserving on).
+    pub passes_inside: std::sync::atomic::AtomicUsize,
+    pub growing: std::sync::atomic::AtomicBool,
+    /// Recovered from its own `Live` residue at this mount.
+    pub self_recovered: bool,
+}
+
+impl AppenderRegion {
+    /// The region's ring right now.
+    pub fn ring(&self) -> std::sync::Arc<super::journal::JournalRing> {
+        self.ring.load_full()
+    }
+
+    /// Whether `slot`'s records journal into THIS region's ring.
+    pub fn leases_slot(&self, slot: super::record::ForestSlot) -> bool {
+        self.leases.contains(&slot)
+    }
+}
+
+/// The appender regions of one mounted forest volume plus the Appender
+/// family's gauges (§11).
+pub struct AppenderSet {
+    /// Regions in id order; `regions[0]` is this mount's appender 0.
+    pub regions: Vec<std::sync::Arc<AppenderRegion>>,
+    /// This mount's identity (the writer id is stamped at the join).
+    pub identity: AppenderIdentity,
+    /// The volume's native routing slot (page entries name routing slots).
+    pub native_slot: u16,
+    /// `appenders_capacity` (derived: the ring budget over the ring size
+    /// an appender joins with).
+    pub capacity: u64,
+    /// `Live` pages the directory held at mount (foreign ones included —
+    /// what a non-writer open reports; a writer refuses on a foreign one).
+    pub live_pages_at_mount: u64,
+    pub joins: std::sync::atomic::AtomicU64,
+    pub leaves: std::sync::atomic::AtomicU64,
+    pub self_recoveries: std::sync::atomic::AtomicU64,
+    /// **Must-stay-0**: a flush pass that began with dirty leaves of a
+    /// region and did not reach its covering barrier within the flush
+    /// ceiling (KD-SYM-10).
+    pub flush_ceiling_overruns: std::sync::atomic::AtomicU64,
+    /// Set by the writer's JOIN: only a joined mount writes pages (a
+    /// guarded offline verb that opens writer-posture never joins).
+    pub joined: std::sync::atomic::AtomicBool,
+}
+
+impl AppenderSet {
+    /// The region that journals `slot`'s records: the one leasing it, else
+    /// the manager (region 0).
+    pub fn region_of_slot(&self, slot: super::record::ForestSlot) -> u32 {
+        self.regions
+            .iter()
+            .skip(1)
+            .find(|r| r.leases_slot(slot))
+            .map_or(0, |r| r.id)
+    }
+
+    /// The region with id `id` (`regions` is id-dense in PR 2: 0 and the
+    /// declared ids in order; looked up by id, never by index).
+    pub fn region(&self, id: u32) -> Option<&std::sync::Arc<AppenderRegion>> {
+        self.regions.iter().find(|r| r.id == id)
+    }
+
+    /// Whether more than the manager's region exists.
+    pub fn is_partitioned(&self) -> bool {
+        self.regions.len() > 1
+    }
+
+    /// The declared lease map (ids ≥ 1) the violation detector reads.
+    pub fn lease_map(
+        &self,
+    ) -> std::collections::BTreeMap<u32, std::collections::BTreeSet<super::record::ForestSlot>>
+    {
+        self.regions
+            .iter()
+            .skip(1)
+            .map(|r| (r.id, r.leases.clone()))
+            .collect()
+    }
+
+    /// `appenders_live`: regions this mount holds (its pages are `Live`).
+    pub fn live(&self) -> u64 {
+        self.regions.len() as u64
+    }
+
+    /// Bytes of ring EXTENTS over every region (the pages' segment
+    /// tables — what the knob sizes; the ring-side ledger pages included).
+    pub fn ring_bytes(&self) -> u64 {
+        self.regions
+            .iter()
+            .map(|r| {
+                r.page
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .ring_bytes()
+            })
+            .sum()
+    }
+
+    pub fn ring_segments(&self) -> u64 {
+        self.regions
+            .iter()
+            .map(|r| r.ring().segments().len() as u64)
+            .sum()
+    }
+
+    pub fn ring_grows(&self) -> u64 {
+        self.regions
+            .iter()
+            .map(|r| r.ring_grows.load(std::sync::atomic::Ordering::Relaxed))
+            .sum()
+    }
+
+    /// The Appender family's snapshot (§11).
+    pub fn stats(&self) -> AppenderStats {
+        use std::sync::atomic::Ordering::Relaxed;
+        AppenderStats {
+            appender_id: self.regions.first().map_or(0, |r| r.id),
+            native_slot: self.native_slot,
+            live: self.live(),
+            live_pages_at_mount: self.live_pages_at_mount,
+            capacity: self.capacity,
+            joins: self.joins.load(Relaxed),
+            leaves: self.leaves.load(Relaxed),
+            self_recoveries: self.self_recoveries.load(Relaxed),
+            ring_bytes: self.ring_bytes(),
+            ring_segments: self.ring_segments(),
+            ring_grows: self.ring_grows(),
+            flush_ceiling_overruns: self.flush_ceiling_overruns.load(Relaxed),
+            regions: self
+                .regions
+                .iter()
+                .map(|r| {
+                    let ring = r.ring();
+                    let page = r.page.lock().unwrap_or_else(|e| e.into_inner());
+                    AppenderRegionStats {
+                        id: r.id,
+                        term: page.term,
+                        ring_bytes: page.ring_bytes(),
+                        segments: ring.segments().len() as u64,
+                        ring_entries: ring.written_entries(),
+                        stalls: r.stalls.load(Relaxed),
+                        leases: r.leases.len() as u64,
+                        self_recovered: r.self_recovered,
+                    }
+                })
+                .collect(),
+        }
+    }
+}
+
+/// One region's face in [`AppenderStats`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AppenderRegionStats {
+    pub id: u32,
+    pub term: u64,
+    pub ring_bytes: u64,
+    pub segments: u64,
+    /// Journal entries written into this region's ring since open.
+    pub ring_entries: u64,
+    /// Ring-admission parks on this region's ring.
+    pub stalls: u64,
+    /// Declared leases (0 for the manager, which leases the complement).
+    pub leases: u64,
+    pub self_recovered: bool,
+}
+
+/// The Appender family (design-symmetric-metadata §11) as one snapshot —
+/// `None` on every bit-17-absent mount (`KvMetaBackend::appender_stats`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AppenderStats {
+    pub appender_id: u32,
+    pub native_slot: u16,
+    /// Regions this mount holds (`appenders_live`).
+    pub live: u64,
+    /// `Live` pages the directory held at mount, foreign ones included.
+    pub live_pages_at_mount: u64,
+    pub capacity: u64,
+    pub joins: u64,
+    pub leaves: u64,
+    pub self_recoveries: u64,
+    pub ring_bytes: u64,
+    pub ring_segments: u64,
+    pub ring_grows: u64,
+    pub flush_ceiling_overruns: u64,
+    pub regions: Vec<AppenderRegionStats>,
+}
+
 #[inline]
 fn le64(v: &[u8], off: usize) -> u64 {
     let mut b = [0u8; 8];

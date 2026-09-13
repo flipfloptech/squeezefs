@@ -823,8 +823,9 @@ async fn test_kill9_after_arm_same_host_instant_reclaim() {
 /// logical ring position `pos` would write (the §4.4 fault-arming helper:
 /// entry headers start at the reservation's first logical byte).
 fn journal_physical_offset(be: &KvMetaBackend, pos: u64) -> u64 {
-    let geo = *be.journal_ring().core().geometry();
-    be.superblock().journal.start + geo.page_index(pos) * 4096 + 24 + geo.in_page_off(pos)
+    // The ring's own map (a forest volume's ring starts past appender 0's
+    // page slots — design-symmetric-metadata §5.3.2).
+    be.journal_ring().physical_offset_of(pos)
 }
 
 /// **The §4.4 pt 4 rollback-race case**: two shared-parent-lock creates

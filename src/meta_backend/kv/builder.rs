@@ -696,7 +696,9 @@ impl ImageBuilder {
             ledger_seq: ledger.seq,
             next_ino: self.next_ino,
             nodes_written,
-            extents_allocated: nodes_written,
+            // The heap extents this image claimed: its nodes plus, under
+            // the seam, the appender directory's first extent.
+            extents_allocated: nodes_written + u64::from(symmetric),
         })
     }
 }

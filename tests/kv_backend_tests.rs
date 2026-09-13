@@ -692,9 +692,16 @@ async fn builder_output_is_deterministic_and_digest_stable() {
     let (f2, img2) = build_once().await;
 
     assert_eq!(img1.nodes_written, img2.nodes_written);
+    // One extent per node — plus, on a forest image, the appender
+    // directory's first extent (design-symmetric-metadata §5.3.1).
+    let forest_extents = u64::from(squeezefs::env_knobs::bool_knob(
+        "SQUEEZEFS_TEST_STAMP_SYMMETRIC",
+        false,
+    ));
     assert_eq!(
-        img1.extents_allocated, img1.nodes_written,
-        "one extent per node"
+        img1.extents_allocated,
+        img1.nodes_written + forest_extents,
+        "one extent per node (+ the appender directory on a forest image)"
     );
     assert_eq!(img1.next_ino, img2.next_ino);
     assert_eq!(img1.ledger_seq, img2.ledger_seq);
@@ -873,11 +880,15 @@ async fn v3_mount_replays_journal_window_into_the_cache() {
 
     // Write two committed transactions into the ring the way K6b will:
     // admit → reserve → write the committer's own bytes.
+    // The ring's extent as the volume mounts it: the whole journal extent
+    // on a flat volume, the extent past appender 0's page slots on a
+    // forest one (design-symmetric-metadata §5.3.2).
+    let ring_extent = KvMetaBackend::fixed_ring_extent(&sb);
     let ring = JournalRing::new(
         file.path(),
-        sb.journal.start,
-        sb.journal_pages(),
-        checkpoint_reserve_bytes(sb.journal.len),
+        ring_extent.start,
+        ring_extent.len / squeezefs::meta_backend::kv::journal::JOURNAL_PAGE_LEN,
+        checkpoint_reserve_bytes(ring_extent.len),
     );
     let new_ino = next_ino_before; // §4.8: the watermark names the next free ino
     let hash54 = dentry_name_hash54(b"replayed.txt", sb.hash_seed);
@@ -1203,8 +1214,11 @@ async fn v3_dd_zeroed_head_virgin_format_buries_all_residue_classes() {
     );
 
     // Journal burial: the WHOLE fresh ring is zero — nothing to replay.
+    // (On a forest volume the extent's first four pages are appender 0's
+    // page slots, written fresh by this format — the RING is the rest.)
     let image = std::fs::read(file.path()).unwrap();
-    let ring_bytes = &image[ring.start as usize..ring.end() as usize];
+    let ring_part = KvMetaBackend::fixed_ring_extent(&gen3_sb);
+    let ring_bytes = &image[ring_part.start as usize..ring_part.end() as usize];
     assert!(
         ring_bytes.iter().all(|b| *b == 0),
         "the virgin format must zero the whole journal ring exactly like \

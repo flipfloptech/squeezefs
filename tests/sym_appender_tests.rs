@@ -466,10 +466,13 @@ fn appender_dir_rides_sector_zero_only_under_bit_17() {
     assert_eq!(img.len(), SUPERBLOCK_V3_LEN);
     let back = SuperblockV3::decode_sector(&img).unwrap();
     assert_eq!(back.appender_dir, sb.appender_dir);
-    // Without the bit a named directory is unrepresentable — refused at
-    // the encoder AND the decoder (the byte-identity law's two teeth).
+    // Without the bit a named directory is not the shipped image: the
+    // DECODER refuses it (the mount gate — the byte-identity law's tooth;
+    // the encoder writes what it is handed so the harnesses that strip
+    // bits off a stamped superblock reach the gate they aim at).
     sb.features_incompat &= !FEATURE_INCOMPAT_KV_SYMMETRIC_FOREST;
-    assert!(sb.encode_sector().is_err());
+    let stripped = sb.encode_sector().unwrap();
+    assert!(SuperblockV3::decode_sector(&stripped).is_err());
     let mut forged = flat.clone();
     forged[136..144].copy_from_slice(&sb.heap.start.to_le_bytes());
     forged[144..152].copy_from_slice(&(NODE_SIZE as u64).to_le_bytes());
@@ -890,7 +893,8 @@ async fn open_with_partition(uris: &[String], partition: Option<&str>) -> Arc<Ro
 }
 
 fn stats(vol: &squeezefs::meta_backend::kv::backend::KvMetaBackend) -> AppenderStats {
-    vol.appender_stats().expect("a forest volume has an appender set")
+    vol.appender_stats()
+        .expect("a forest volume has an appender set")
 }
 
 /// `n` block references of `owner` on volume tag `tag`, blocks
@@ -940,14 +944,20 @@ async fn a_writer_joins_appender_zero_and_writes_its_page_per_checkpoint() {
             squeezefs::meta_backend::kv::appender::resolve_sym_ring_bytes(0, VOL_LEN)
         )
     );
-    assert_eq!(s.ring_segments, 1, "appender 0's ring is the fixed extent, one segment");
+    assert_eq!(
+        s.ring_segments, 1,
+        "appender 0's ring is the fixed extent, one segment"
+    );
     assert_eq!(s.ring_bytes, appender0_ring_extent(&sb.journal).len);
     let path = std::path::Path::new(&uris[0]);
     let entries = read_directory(path, &sb).await.unwrap();
     let page = entries[0].page.clone().expect("page 0");
     assert_eq!(page.state, AppenderState::Live);
     assert_eq!(page.term, 1, "the first join of a Free page is term 1");
-    assert!(page.is_manager, "the solo writer plays the manager (KD-SYM-3)");
+    assert!(
+        page.is_manager,
+        "the solo writer plays the manager (KD-SYM-3)"
+    );
     let gen_before = page.generation;
 
     // A checkpoint writes the page: tail + ckpt_seq mirror the fixed
@@ -965,7 +975,10 @@ async fn a_writer_joins_appender_zero_and_writes_its_page_per_checkpoint() {
         .page
         .clone()
         .unwrap();
-    assert!(page.generation > gen_before, "one page write per checkpoint");
+    assert!(
+        page.generation > gen_before,
+        "one page write per checkpoint"
+    );
     assert_eq!(page.ledger_tail_seq, ledger.journal_tail_seq);
     assert_eq!(page.ckpt_seq, ledger.seq);
     let native_root = ledger
@@ -983,7 +996,9 @@ async fn a_writer_joins_appender_zero_and_writes_its_page_per_checkpoint() {
         (native_root.node_addr, native_root.node_seq)
     );
     assert!(
-        page.slots.iter().all(|e| e.slot != u16::MAX || s.native_slot == u16::MAX),
+        page.slots
+            .iter()
+            .all(|e| e.slot != u16::MAX || s.native_slot == u16::MAX),
         "no entry stands in for tree 0"
     );
 
@@ -1026,7 +1041,10 @@ async fn own_residue_is_recovered_at_rejoin_with_a_bumped_term() {
     let again = open_with_partition(&uris, None).await;
     let vol = &again.volumes[0];
     let s = stats(vol);
-    assert_eq!(s.self_recoveries, 1, "a Live page of our own ⇒ recover our own ring first");
+    assert_eq!(
+        s.self_recoveries, 1,
+        "a Live page of our own ⇒ recover our own ring first"
+    );
     assert_eq!(s.joins, 1);
     assert_eq!(vol.appender_term(), 2, "re-adopted with a bumped term");
     assert!(vol.replay_stats().entries > 0);
@@ -1064,9 +1082,13 @@ async fn a_foreign_live_page_refuses_the_writer_open_and_a_probe_lists_it() {
         mount_slot: 0x1234_5678,
         writer_id: 42,
     };
-    write_page(path, offs[page_slot_for(page.generation)], page.encode().unwrap())
-        .await
-        .unwrap();
+    write_page(
+        path,
+        offs[page_slot_for(page.generation)],
+        page.encode().unwrap(),
+    )
+    .await
+    .unwrap();
     let err = match open_routed_meta_set(&uris).await {
         Ok(_) => panic!("a writer must not mount over a foreign Live appender page"),
         Err(e) => e.to_string(),
@@ -1135,7 +1157,10 @@ async fn two_appenders_commit_into_two_rings_and_replay_to_the_union_digest() {
     t2.await.unwrap();
     let s = stats(&va);
     assert!(s.regions[0].ring_entries >= 16, "{:?}", s.regions);
-    assert_eq!(s.regions[1].ring_entries, 16, "appender 1's commits rode ITS ring");
+    assert_eq!(
+        s.regions[1].ring_entries, 16,
+        "appender 1's commits rode ITS ring"
+    );
     let live_a = digest_backend(&va).await.unwrap();
     va.sync_device().await.unwrap();
     drop(va);
@@ -1153,7 +1178,10 @@ async fn two_appenders_commit_into_two_rings_and_replay_to_the_union_digest() {
             .unwrap();
     }
     let live_b = digest_backend(&vb).await.unwrap();
-    assert_eq!(live_a, live_b, "the same records fold to the same digest, one ring or two");
+    assert_eq!(
+        live_a, live_b,
+        "the same records fold to the same digest, one ring or two"
+    );
     vb.sync_device().await.unwrap();
     drop(vb);
     drop(rb);
@@ -1162,7 +1190,11 @@ async fn two_appenders_commit_into_two_rings_and_replay_to_the_union_digest() {
     // replays twice to the same digest.
     let ra = open_with_partition(&a, Some(PARTITION)).await;
     let va = &ra.volumes[0];
-    assert_eq!(stats(va).self_recoveries, 2, "both of our Live pages were recovered");
+    assert_eq!(
+        stats(va).self_recoveries,
+        2,
+        "both of our Live pages were recovered"
+    );
     assert_eq!(digest_backend(va).await.unwrap(), live_a);
     assert_eq!(va.block_ref_count(tag, 1005).await.unwrap(), 0);
     assert_eq!(va.block_ref_count(tag, 1010).await.unwrap(), 1);
@@ -1184,12 +1216,21 @@ async fn a_changed_lease_set_refuses_the_mount_as_a_lease_violation() {
     let uris = vec![format_stamped_member(dir.path(), "meta0").await];
     let tag = volume_tag("vol-0011223344556677");
     let guest_owner = guest_local_ino(3, 5);
+    // The cadence parked (the two-suite "park the timer" idiom): the
+    // records must still sit in ring 1's WINDOW at the crash, not in a
+    // flushed leaf the page's tail already passed.
+    std::env::set_var("SQUEEZEFS_META_FLUSH_INTERVAL_MS", "60000");
     let ra = open_with_partition(&uris, Some(PARTITION)).await;
+    std::env::remove_var("SQUEEZEFS_META_FLUSH_INTERVAL_MS");
     let va = Arc::clone(&ra.volumes[0]);
     va.commit_block_refs(guest_owner, &refs(tag, guest_owner, 0, 2))
         .await
         .unwrap();
     va.sync_device().await.unwrap();
+    assert!(
+        stats(&va).regions[1].ring_entries >= 1,
+        "the commit rode appender 1's ring"
+    );
     drop(va);
     drop(ra);
     let before = META_KV_REPLAY_LEASE_VIOLATIONS.load(Ordering::Relaxed);
@@ -1218,7 +1259,11 @@ async fn a_stalled_appender_ring_grows_a_segment_and_its_content_survives() {
     std::env::remove_var("SQUEEZEFS_SYM_RING_KB");
     let va = Arc::clone(&ra.volumes[0]);
     let s = stats(&va);
-    assert_eq!(s.regions[1].ring_bytes, 512 * 1024, "the knob sized appender 1's ring");
+    assert_eq!(
+        s.regions[1].ring_bytes,
+        512 * 1024,
+        "the knob sized appender 1's ring"
+    );
     assert_eq!(s.regions[1].segments, 1);
     // 40 × ~27 KB entries ≈ 1 MiB into a 512 KiB ring whose user
     // capacity is ~250 KB: the committer stalls; the checkpoint poller
@@ -1239,7 +1284,11 @@ async fn a_stalled_appender_ring_grows_a_segment_and_its_content_survives() {
     }
     committer.await.unwrap();
     let s = stats(&va);
-    assert!(s.regions[1].stalls > 0, "the small ring stalled: {:?}", s.regions[1]);
+    assert!(
+        s.regions[1].stalls > 0,
+        "the small ring stalled: {:?}",
+        s.regions[1]
+    );
     // Two drained cycles: the first covers the last entry, the second
     // finds the ring drained with stalls behind it and grows it.
     va.checkpoint_now().await.unwrap();
@@ -1295,7 +1344,11 @@ async fn the_flush_ceiling_is_the_checkpoint_age_and_a_parked_device_moves_the_o
             .unwrap();
         va.checkpoint_now().await.unwrap();
     }
-    assert_eq!(stats(&va).flush_ceiling_overruns, 0, "a normal run never overruns");
+    assert_eq!(
+        stats(&va).flush_ceiling_overruns,
+        0,
+        "a normal run never overruns"
+    );
     // A parked device: the flush pass's covering barrier lands past the
     // ceiling while a dirty leaf waited on it.
     let park = std::time::Duration::from_millis(appender_flush_ceiling_ms() + 400);

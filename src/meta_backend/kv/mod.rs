@@ -240,6 +240,20 @@ pub static META_KV_FOREST_READER_WINDOW_SKIPS: AtomicU64 = AtomicU64::new(0);
 /// `meta_kv_forest_reader_unpublished_children`.
 pub static META_KV_FOREST_READER_UNPUBLISHED_CHILDREN: AtomicU64 = AtomicU64::new(0);
 
+/// **Must-stay-0 tripwire** (design-symmetric-metadata §5.3.4, PR 2):
+/// one `(kind, key)` found in TWO appender rings' replay windows —
+/// KD-SYM-4's one-ring-per-key invariant broken; the mount refuses.
+pub static META_KV_REPLAY_KEY_VIOLATIONS: AtomicU64 = AtomicU64::new(0);
+
+/// **Must-stay-0 tripwire**: a ring carried a record for a slot tree its
+/// appender did not lease (or the manager's structure in a content
+/// appender's ring); the mount refuses.
+pub static META_KV_REPLAY_LEASE_VIOLATIONS: AtomicU64 = AtomicU64::new(0);
+
+/// **Must-stay-0 tripwire**: an allocator delta in a ring whose appender
+/// holds no grant covering the extent; the mount refuses.
+pub static META_KV_REPLAY_EXTENT_VIOLATIONS: AtomicU64 = AtomicU64::new(0);
+
 /// Commit-path revalidation retries (design §4.6: a writer locked a leaf
 /// an SMO had superseded between resolution and lock — unlock, re-resolve,
 /// retry; SMOs are rare and serialized, so the loop is short). Surfaced as

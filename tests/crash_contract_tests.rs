@@ -1992,11 +1992,10 @@ async fn test_kv_batch_mid_rollback_race_ram_equals_replay() {
         tokio::time::sleep(std::time::Duration::from_millis(5)).await;
     }
     let head = be.journal_ring().core().head();
-    let geo = *be.journal_ring().core().geometry();
-    let phys = be.superblock().journal.start
-        + geo.page_index(head) * JOURNAL_PAGE_LEN
-        + JOURNAL_PAGE_HDR_LEN
-        + geo.in_page_off(head);
+    // The ring's own logical→physical map: on a forest volume the ring
+    // starts past appender 0's page slots (design-symmetric-metadata
+    // §5.3.2), so the raw `journal.start` arithmetic names the wrong page.
+    let phys = be.journal_ring().physical_offset_of(head);
     uring_fs::arm_sector_write_error(phys);
     TEST_CONVEYOR_HOLD_STAGE.store(0, std::sync::atomic::Ordering::SeqCst);
     test_conveyor_hold_release();

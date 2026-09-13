@@ -1511,6 +1511,13 @@ impl KvMetaBackend {
         let pending_before = self.allocator().pending_count();
         let tail_before = self.last_ledger_tail.load(Ordering::Acquire);
 
+        // ---- Appender rings (design-symmetric-metadata §5.3.2, PR 2): a
+        // declared region whose ring stalled and is drained grows by one
+        // segment FIRST — its bitmap bits and the page naming the grown
+        // table land before anything else this cycle writes. A no-op on
+        // every unpartitioned volume.
+        self.grow_stalled_regions().await?;
+
         // ---- Forest: publish every moved guest slot root into tree 0
         // FIRST, so the flush pass below carries tree 0's leaf and this
         // cycle's ledger record covers the publication (the slot-tree
@@ -1536,8 +1543,18 @@ impl KvMetaBackend {
         // tail keeps respecting it) and retries next cycle with the
         // budget this cycle frees.
         let mut dirty: Vec<Arc<CachedNode>> = Vec::new();
+        // The regions whose LEAVES are dirty as the pass begins — the
+        // flush-ceiling audit's subjects (KD-SYM-10; forest volumes only).
+        let mut had_dirty: Vec<u32> = Vec::new();
+        let region_aware = self.appenders().is_some();
         self.node_cache().for_each_node(|n| {
             if n.dirty_floor() != u64::MAX && !n.state().is_superseded() {
+                if region_aware && n.level() == 0 {
+                    let r = self.region_of_node(n);
+                    if !had_dirty.contains(&r) {
+                        had_dirty.push(r);
+                    }
+                }
                 dirty.push(Arc::clone(n));
             }
         });
@@ -1625,6 +1642,7 @@ impl KvMetaBackend {
         // journal write + any previously-written ledger record become
         // durable (the §4.6 pt 3 pending-reclaim drains inside).
         self.sync_device().await.map_err(KvError::Io)?;
+        self.note_flush_ceiling(&had_dirty, cycle_started.elapsed());
 
         // ---- The tail rule (module docs; §4.6 pt 2), plus the FIND-VS-A
         // dying-floor clamp: floors of nodes whose mappings LEFT the cache
@@ -1636,6 +1654,12 @@ impl KvMetaBackend {
         // back on any failure past this point (the ledger slot never
         // landed, so the next cycle must still respect the floor).
         let dying_floors = self.node_cache().take_dying_floors();
+        // The slot-stamped LEAF floors, per slot: on a partitioned forest
+        // a leaf's floor is a position in ITS lessee's ring and clamps
+        // THAT region's tail (`appender_region_tails`); on every other
+        // volume every slot is region 0's and they fold into `tail`.
+        let dying_leaf_floors = self.node_cache().take_dying_leaf_floors();
+        let partitioned = self.appenders().is_some_and(|a| a.is_partitioned());
         let mut tail = h
             .min(self.journal_ring().min_inflight_start())
             .min(dying_floors)
@@ -1643,9 +1667,30 @@ impl KvMetaBackend {
             // (a deferred or failed publication above) keeps every record
             // applied under it in the window — `u64::MAX` when none.
             .min(self.unpublished_root_floor());
+        let mut live_leaf_floors: std::collections::BTreeMap<super::record::ForestSlot, u64> =
+            std::collections::BTreeMap::new();
+        for (slot, f) in &dying_leaf_floors {
+            if !partitioned || self.region_of_slot(*slot) == 0 {
+                tail = tail.min(*f);
+            }
+        }
         self.node_cache().for_each_node(|n| {
-            tail = tail.min(n.dirty_floor());
+            let floor = n.dirty_floor();
+            if floor == u64::MAX {
+                return;
+            }
+            if partitioned && n.level() == 0 {
+                if let Some(slot) = n.forest_slot() {
+                    if self.region_of_slot(slot) != 0 {
+                        let e = live_leaf_floors.entry(slot).or_insert(u64::MAX);
+                        *e = (*e).min(floor);
+                        return;
+                    }
+                }
+            }
+            tail = tail.min(floor);
         });
+        let region_tails = self.appender_region_tails(&dying_leaf_floors, &live_leaf_floors);
 
         // ---- The ledger record naming the synced roots + that tail.
         // Every mounted tree names a root — the three §4.2 user trees
@@ -1708,6 +1753,8 @@ impl KvMetaBackend {
             // floors are still uncovered — fold them back so the next
             // cycle's tail keeps clamping to them (FIND-VS-A).
             self.node_cache().restore_dying_floors(dying_floors);
+            self.node_cache()
+                .restore_dying_leaf_floors(dying_leaf_floors);
             return Err(e);
         }
         self.checkpoint_seq.store(ckpt_seq, Ordering::Release);
@@ -1727,6 +1774,20 @@ impl KvMetaBackend {
             .unwrap()
             .push((tail, self.barrier_push_epoch()));
         super::META_KV_CHECKPOINTS.fetch_add(1, Ordering::Relaxed);
+        // ---- The appender pages (§5.3.2): region 0's mirrors the record
+        // just written; a declared region's names ITS tail — one page
+        // write per region per checkpoint. A no-op on a flat volume. The
+        // leaf floors a failed page write leaves uncovered are the
+        // region's own: its page keeps its previous (lower) tail, so
+        // nothing under them is reclaimed.
+        if let Err(e) = self
+            .write_appender_pages(tail, ckpt_seq, h, &region_tails)
+            .await
+        {
+            self.node_cache()
+                .restore_dying_leaf_floors(dying_leaf_floors);
+            return Err(e);
+        }
         // §6.8 item 3's hold ledger: the record naming the new roots is on
         // the device — a reader's next poll adopts it — so this is the
         // instant every dereference committed before the cycle became

@@ -2402,6 +2402,14 @@ pub struct NodeCache {
     /// tail computation keeps every such record inside the replay window
     /// until a ledger record written AFTER its floor died covers it.
     dying_floors: AtomicU64,
+    /// The dying floors of LEAF nodes that carry a forest-slot stamp,
+    /// per slot (design-symmetric-metadata §5.3, PR 2): a slot tree's
+    /// content journals into the ring of the appender that leases the
+    /// slot, so a leaf's floor is a position in THAT ring's logical space
+    /// and must clamp that ring's tail — never another's. Interior nodes
+    /// (the manager's structure) and unstamped nodes fold into
+    /// `dying_floors`. Empty for the life of a flat volume.
+    dying_leaf_floors: std::sync::Mutex<std::collections::BTreeMap<super::record::ForestSlot, u64>>,
 }
 
 impl std::fmt::Debug for NodeCache {
@@ -2427,7 +2435,59 @@ impl NodeCache {
             purge_sink: OnceLock::new(),
             retired: scc::HashSet::default(),
             dying_floors: AtomicU64::new(u64::MAX),
+            dying_leaf_floors: std::sync::Mutex::new(std::collections::BTreeMap::new()),
         })
+    }
+
+    /// Fold a departing NODE's `dirty_floor` (see [`Self::note_dying_floor`])
+    /// into the accumulator its ring owns: a slot-stamped LEAF's into the
+    /// per-slot map, everything else into the flat word.
+    fn note_node_dying_floor(&self, node: &CachedNode) {
+        let floor = node.dirty_floor();
+        if floor == u64::MAX {
+            return;
+        }
+        match (node.level(), node.forest_slot()) {
+            (0, Some(slot)) => {
+                let mut g = self
+                    .dying_leaf_floors
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                let e = g.entry(slot).or_insert(u64::MAX);
+                *e = (*e).min(floor);
+            }
+            _ => self.note_dying_floor(floor),
+        }
+    }
+
+    /// Drain the per-slot LEAF dying floors (the sibling of
+    /// [`Self::take_dying_floors`]; the checkpoint cycle folds each slot's
+    /// floor into the tail of the ring its appender journals into).
+    pub fn take_dying_leaf_floors(
+        &self,
+    ) -> std::collections::BTreeMap<super::record::ForestSlot, u64> {
+        std::mem::take(
+            &mut *self
+                .dying_leaf_floors
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()),
+        )
+    }
+
+    /// Fold drained leaf floors back after a failed covering write
+    /// ([`Self::restore_dying_floors`]'s sibling).
+    pub fn restore_dying_leaf_floors(
+        &self,
+        floors: std::collections::BTreeMap<super::record::ForestSlot, u64>,
+    ) {
+        let mut g = self
+            .dying_leaf_floors
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        for (slot, floor) in floors {
+            let e = g.entry(slot).or_insert(u64::MAX);
+            *e = (*e).min(floor);
+        }
     }
 
     /// Fold a departing node's `dirty_floor` into the dying-floor
@@ -2937,7 +2997,7 @@ impl NodeCache {
                 // un-covered acked records).
                 let old = e.get().clone();
                 let outcome = old.state().supersede();
-                self.note_dying_floor(old.dirty_floor());
+                self.note_node_dying_floor(&old);
                 if let Ok(o) = outcome {
                     if o.was_dirty || o.was_freezing {
                         // Displaced RAM records cannot be carried here
@@ -2984,7 +3044,7 @@ impl NodeCache {
         // durably tied down until a ledger record written after this
         // point. Clamping the next tail to the dead floor keeps every
         // such record inside the replay window until then.
-        self.note_dying_floor(node.dirty_floor());
+        self.note_node_dying_floor(node);
         self.retired.insert_sync(node.addr()).ok();
         if self
             .map
@@ -3043,7 +3103,7 @@ impl NodeCache {
                 // The floor must survive the eviction (FIND-VS-A dying-
                 // floor clamp) or the tail could pass records whose
                 // appends a power-cut would still tear away.
-                self.note_dying_floor(node.dirty_floor());
+                self.note_node_dying_floor(&node);
                 if self
                     .map
                     .remove_if_sync(&addr, |v| Arc::ptr_eq(v, &node))

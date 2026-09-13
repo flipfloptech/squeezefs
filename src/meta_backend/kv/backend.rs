@@ -914,6 +914,10 @@ pub struct KvMetaBackend {
     // ---- PR K6b: the commit pipeline + checkpoint state ----
     /// The journal ring (K6a dropped it after replay; K6b stores it).
     ring: Arc<JournalRing>,
+    /// The appender regions of a forest volume (design-symmetric-metadata
+    /// §5.3, PR 2): region 0 rides `ring`; declared regions carry their
+    /// own rings and pages. `None` on every bit-17-absent volume.
+    appenders: Option<Arc<super::appender::AppenderSet>>,
     /// Level 4a of P1-9: the per-volume I/D lock manager.
     dlm: DlmLockManager,
     /// Group-commit fdatasync coalescer (§4.6 pt 4).
@@ -1455,6 +1459,16 @@ impl KvMetaBackend {
             return Err(e);
         }
 
+        // (7) The appender JOIN (design-symmetric-metadata §5.3.2, PR 2):
+        // every region of ours goes Live under this mount's identity in
+        // one barriered cycle — a no-op on a flat volume. A refusal tears
+        // down like the gate's.
+        if let Err(e) = be.join_appender_regions().await {
+            be.release_reservation().await;
+            drop(be.guard_fd.lock().unwrap().take());
+            return Err(e);
+        }
+
         super::checkpoint::spawn_checkpoint_task(&be);
         super::checkpoint::spawn_times_drain_task(&be);
         Ok(be)
@@ -1954,7 +1968,13 @@ impl KvMetaBackend {
             budget_bytes: node_cache_budget_bytes(),
             writeback_delta_bytes: DEFAULT_WRITEBACK_DELTA_BYTES,
         });
-        cache.set_durable_tail(ledger.journal_tail_seq);
+        // The elision tail: the ledger's on a flat volume; on a forest
+        // volume the MIN over every appender region's tail, set once the
+        // regions are read (`open_appender_regions`) — a tombstone is
+        // elidable only below its OWN ring's tail.
+        if !sb.symmetric_forest_stamped() {
+            cache.set_durable_tail(ledger.journal_tail_seq);
+        }
         // Node-seq mint floor: the persisted watermark keeps mints
         // strictly above every seq ever stamped into a frame this
         // generation (Finding A — re-minted seqs made recycled-extent
@@ -2308,6 +2328,31 @@ impl KvMetaBackend {
             (trees, max_replayed_ino, max_replayed_guest)
         };
 
+        // 5b. The appender regions of a forest volume (design-symmetric-
+        // metadata §5.3, PR 2): identity binding, own-residue recovery,
+        // the declared regions' rings, the per-ring violation classes.
+        // `None` on a flat volume — nothing of it exists there.
+        let boot_id = read_boot_id();
+        let appenders = match &trees {
+            TreeSet::Forest { forest, .. } => Some(Arc::new(
+                Self::open_appender_regions(
+                    path,
+                    &sb,
+                    &ledger,
+                    &ring,
+                    forest,
+                    &cache,
+                    &seq,
+                    &alloc,
+                    &recovery,
+                    replay_posture,
+                    &boot_id,
+                )
+                .await?,
+            )),
+            TreeSet::Flat { .. } => None,
+        };
+
         // 5c. §4.8: next_ino = max(ledger watermark, replayed inos + 1).
         let next_ino = ledger.next_ino.max(max_replayed_ino + 1);
 
@@ -2393,6 +2438,7 @@ impl KvMetaBackend {
             destroyed_inodes: AtomicU64::new(0),
             replay,
             ring,
+            appenders,
             dlm: DlmLockManager::new(),
             sync,
             cache,
@@ -2439,7 +2485,7 @@ impl KvMetaBackend {
             // This boot's id — needed by write mounts (the claim gate's
             // same-host dead-pid proof) AND probes (`mount_registrations`
             // classifies claim records with the same proof).
-            boot_id: read_boot_id(),
+            boot_id,
             claimed: AtomicBool::new(false),
             writer_term: AtomicU64::new(0),
             durable_term_enabled,
@@ -2510,6 +2556,484 @@ impl KvMetaBackend {
     /// The mounted superblock.
     pub fn superblock(&self) -> &SuperblockV3 {
         &self.sb
+    }
+
+    /// The Appender family's snapshot (design-symmetric-metadata §11) —
+    /// `None` on a bit-17-absent volume, where no region exists.
+    pub fn appender_stats(&self) -> Option<super::appender::AppenderStats> {
+        self.appenders.as_ref().map(|a| a.stats())
+    }
+
+    /// This mount's appender term (region 0's page); 0 on a flat volume.
+    pub fn appender_term(&self) -> u64 {
+        self.appenders
+            .as_ref()
+            .and_then(|a| a.regions.first())
+            .map_or(0, |r| r.page.lock().unwrap_or_else(|e| e.into_inner()).term)
+    }
+
+    /// The appender set of a forest volume.
+    pub(super) fn appenders(&self) -> Option<&Arc<super::appender::AppenderSet>> {
+        self.appenders.as_ref()
+    }
+
+    /// The region that journals a slot tree's content: the declared
+    /// lessee, else the manager (0). 0 on a flat volume.
+    pub(super) fn region_of_slot(&self, slot: super::record::ForestSlot) -> u32 {
+        self.appenders
+            .as_ref()
+            .filter(|a| a.is_partitioned())
+            .map_or(0, |a| a.region_of_slot(slot))
+    }
+
+    /// The region a cached node's floor clamps: a slot-stamped LEAF's is
+    /// its slot's lessee's ring (its content journals there); interior
+    /// nodes, tree 0 and every flat node are the manager's (ring 0 —
+    /// structure is the manager's in PR 2, design §5.2.3 owed to PR 3's
+    /// grant).
+    pub(super) fn region_of_node(&self, node: &CachedNode) -> u32 {
+        match (node.level(), node.forest_slot()) {
+            (0, Some(slot)) => self.region_of_slot(slot),
+            _ => 0,
+        }
+    }
+
+    /// The ring region `id` journals into (region 0's is the fixed ring).
+    pub(super) fn ring_of_region(&self, id: u32) -> Arc<JournalRing> {
+        self.appenders
+            .as_ref()
+            .and_then(|a| a.region(id))
+            .map_or_else(|| Arc::clone(&self.ring), |r| r.ring())
+    }
+
+    /// The region that journals a staged tx: every slot-tree record's
+    /// slot must resolve to ONE region (a tx spanning two appenders is a
+    /// cross-owner operation — PR 6's intents — and refuses here); records
+    /// of no slot (tree 0, allocator) are the manager's.
+    fn region_of_records(&self, recs: &[(u8, Record)]) -> std::result::Result<u32, KvError> {
+        let Some(set) = self.appenders.as_ref().filter(|a| a.is_partitioned()) else {
+            return Ok(0);
+        };
+        let mut region: Option<u32> = None;
+        for (tag, r) in recs {
+            let (kind, level) = untag(*tag);
+            if level > 0 || !super::record::is_slot_tree_kind(kind) {
+                continue;
+            }
+            let slot = super::record::forest_key_slot(&r.key)?;
+            let this = set.region_of_slot(slot);
+            match region {
+                None => region = Some(this),
+                Some(prev) if prev != this => {
+                    return Err(KvError::Corrupt(format!(
+                        "transaction spans appenders {prev} and {this} (slot {slot}) — a \
+                         cross-appender mutation is a cross-owner operation \
+                         (design-symmetric-metadata §5.6, PR 6), never one entry in two rings"
+                    )));
+                }
+                Some(_) => {}
+            }
+        }
+        Ok(region.unwrap_or(0))
+    }
+
+    /// **The appender JOIN** (design-symmetric-metadata §5.3.2 identity
+    /// binding; PR 2 — the writer open's last step before its tasks
+    /// spawn): every region this mount holds goes `Live` under this
+    /// mount's identity with a bumped term (a `Free` page's first join is
+    /// term 1; an own `Live` / `Recovered` page re-adopts at term + 1),
+    /// its segments named, and the join is made durable by ONE barriered
+    /// checkpoint cycle — which also lands the bitmap bits of any ring
+    /// extents claimed at open BEFORE a page names them. Refuses on a
+    /// non-writer (a probe / reader never writes a page).
+    pub(super) async fn join_appender_regions(&self) -> std::result::Result<(), KvError> {
+        let Some(set) = self.appenders.as_ref() else {
+            return Ok(());
+        };
+        // A writer open degraded to read-only (§4.11 unknown-ro bits)
+        // joins nothing: it writes no page, as it writes nothing else.
+        if self.read_only || self.non_writer {
+            return Ok(());
+        }
+        let writer_id = uuid::Uuid::parse_str(&self.writer_id)
+            .map(|u| u.as_u128())
+            .unwrap_or_else(|_| u128::from(xxhash_rust::xxh3::xxh3_64(self.writer_id.as_bytes())));
+        for region in &set.regions {
+            let mut page = region.page.lock().unwrap_or_else(|e| e.into_inner());
+            page.term += 1;
+            page.state = super::appender::AppenderState::Live;
+            page.recovered_by_term = 0;
+            page.identity = super::appender::AppenderIdentity {
+                node_token: set.identity.node_token,
+                mount_slot: set.identity.mount_slot,
+                writer_id,
+            };
+            page.is_manager = region.id == 0;
+            page.home_volume = 0;
+            page.appender_id = region.id;
+            set.joins.fetch_add(1, Ordering::Relaxed);
+        }
+        set.joined.store(true, Ordering::Release);
+        // One barriered cycle: bitmap pages (the rings' extents), the
+        // ledger, then every region's page in its Live form.
+        self.checkpoint_now().await
+    }
+
+    /// **The appender LEAVE** (§5.1.3 region release, the clean-unmount
+    /// arm): after the final checkpoint every region's page goes `Free`
+    /// — its id and term kept (ids are stable for the volume's life) — and
+    /// a declared region's ring extents return to the heap (the manager's
+    /// bitmap; the final cycle already persisted every root into tree 0).
+    /// Region 0 keeps naming the fixed ring. The pages are written and
+    /// barriered here; the bitmap's cleared bits ride the next mount's
+    /// first checkpoint (a crash between leaves them claimed — the C13
+    /// orphan-extent class fsck reclaims, never a loss).
+    pub(super) async fn leave_appender_regions(&self) -> std::result::Result<(), KvError> {
+        let Some(set) = self.appenders.as_ref() else {
+            return Ok(());
+        };
+        if self.read_only
+            || self.non_writer
+            || self.is_failed()
+            || !set.joined.load(Ordering::Acquire)
+        {
+            return Ok(());
+        }
+        let node_size = u64::from(self.sb.node_size);
+        for region in &set.regions {
+            let img = {
+                let mut page = region.page.lock().unwrap_or_else(|e| e.into_inner());
+                page.generation += 1;
+                page.state = super::appender::AppenderState::Free;
+                page.slots.clear();
+                page.grant.clear();
+                if region.id != 0 {
+                    for ext in page.segments.drain(..) {
+                        let mut off = ext.start;
+                        while off < ext.end() {
+                            self.alloc
+                                .release_unpublished((off - self.sb.heap.start) / node_size);
+                            off += node_size;
+                        }
+                    }
+                    page.head_hint = 0;
+                    page.ledger_tail_seq = 0;
+                }
+                // The DIRECTORY pair only: a released region's ring-side
+                // pages sit in extents just returned to the heap.
+                (
+                    region.page_offsets[(page.generation % 2) as usize],
+                    page.encode()?,
+                )
+            };
+            super::appender::write_page(&self.path, img.0, img.1).await?;
+            set.leaves.fetch_add(1, Ordering::Relaxed);
+        }
+        crate::uring_fs::fdatasync(self.path.clone()).await?;
+        Ok(())
+    }
+
+    /// **Ring growth on `journal_full_stalls`** (design-symmetric-metadata
+    /// §5.3.2; PR 2) — the checkpoint cycle's first step on a partitioned
+    /// forest volume. A declared region whose ring stalled since its last
+    /// growth decision, is DRAINED (head == reusable_upto, no reservation
+    /// open) and has no pass inside its admit→handoff window (the Dekker
+    /// pair with `run_batch_group`) gets ONE more segment — extents
+    /// claimed internal-class up to the ring's current size, adjacent
+    /// ones coalesced — in this order: bitmap pages + barrier (the extents
+    /// are durably claimed), the page naming the grown table + barrier
+    /// (replay's geometry), THEN the ring swap (nothing lands in the new
+    /// geometry before a page describes it). Region 0's fixed ring never
+    /// grows: it is the format's `--meta-journal-mb` decision.
+    pub(super) async fn grow_stalled_regions(&self) -> std::result::Result<(), KvError> {
+        let Some(set) = self.appenders.as_ref().filter(|a| a.is_partitioned()) else {
+            return Ok(());
+        };
+        if !set.joined.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        let node_size = u64::from(self.sb.node_size);
+        for r in set.regions.iter().skip(1) {
+            let stalls = r.stalls.load(Ordering::Relaxed);
+            if stalls == r.stalls_at_last_grow.load(Ordering::Relaxed) {
+                continue;
+            }
+            let ring = r.ring();
+            if ring.segments().len() >= super::appender::RING_SEGMENTS_MAX {
+                r.stalls_at_last_grow.store(stalls, Ordering::Relaxed);
+                continue;
+            }
+            r.growing.store(true, Ordering::SeqCst);
+            if r.passes_inside.load(Ordering::SeqCst) != 0 {
+                r.growing.store(false, Ordering::SeqCst);
+                continue;
+            }
+            let core = ring.core();
+            let drained =
+                core.head() == core.reusable_upto() && ring.min_inflight_start() == u64::MAX;
+            if !drained {
+                r.growing.store(false, Ordering::SeqCst);
+                continue;
+            }
+            // One growth step = up to the ring's current size in extents,
+            // as ONE contiguous segment (the run breaks at the first
+            // non-adjacent claim; the remainder is released).
+            let want = (ring.ring_bytes() / node_size).max(1);
+            let mut claimed: Vec<u64> = Vec::new();
+            for _ in 0..want {
+                match self.alloc.claim_internal() {
+                    Ok(e) => {
+                        if let Some(&last) = claimed.last() {
+                            if e != last + 1 {
+                                self.alloc.release_unpublished(e);
+                                break;
+                            }
+                        }
+                        claimed.push(e);
+                    }
+                    Err(_) => break,
+                }
+            }
+            if claimed.is_empty() {
+                r.growing.store(false, Ordering::SeqCst);
+                r.stalls_at_last_grow.store(stalls, Ordering::Relaxed);
+                continue;
+            }
+            let extent = super::superblock::ExtentRef {
+                start: self.sb.heap.start + claimed[0] * node_size,
+                len: claimed.len() as u64 * node_size,
+            };
+            let grown = match ring.grown_with(super::journal::RingSegment::from_extent(&extent)) {
+                Ok(g) => g,
+                Err(e) => {
+                    // The drained/bound preconditions were checked above;
+                    // a refusal here is a race with a straggling
+                    // completion — skip this cycle, keep the stall on
+                    // record so the next cycle retries.
+                    for c in claimed {
+                        self.alloc.release_unpublished(c);
+                    }
+                    r.growing.store(false, Ordering::SeqCst);
+                    log::debug!(
+                        "checkpoint: appender {}'s ring growth deferred ({e}); retrying next cycle",
+                        r.id
+                    );
+                    continue;
+                }
+            };
+            // The extents' bits, durable before any page names them.
+            let ckpt_seq = self.checkpoint_seq.load(Ordering::Acquire) + 1;
+            self.alloc
+                .write_dirty_pages(&self.path, self.sb.alloc_bitmap.start, ckpt_seq)
+                .await?;
+            self.sync_device().await.map_err(KvError::Io)?;
+            // The page naming the grown table at the drained head.
+            let (off, img) = {
+                let mut page = r.page.lock().unwrap_or_else(|e| e.into_inner());
+                page.segments.push(extent);
+                page.generation += 1;
+                page.head_hint = core.head();
+                page.ledger_tail_seq = core.head();
+                (
+                    r.page_offsets[super::appender::page_slot_for(page.generation)],
+                    page.encode()?,
+                )
+            };
+            super::appender::write_page(&self.path, off, img).await?;
+            self.sync_device().await.map_err(KvError::Io)?;
+            r.last_tail.store(core.head(), Ordering::Release);
+            r.durable_tail.fetch_max(core.head(), Ordering::AcqRel);
+            r.ring.store(Arc::new(grown));
+            r.ring_grows.fetch_add(1, Ordering::Relaxed);
+            r.stalls_at_last_grow.store(stalls, Ordering::Relaxed);
+            r.growing.store(false, Ordering::SeqCst);
+            log::info!(
+                "meta volume {}: appender {}'s ring stalled ({stalls} parks) and was drained — \
+                 grew by one segment of {} bytes at {:#x} ({} segments, {} bytes; \
+                 appender_ring_grows)",
+                self.path.display(),
+                r.id,
+                extent.len,
+                extent.start,
+                r.ring().segments().len(),
+                r.ring().ring_bytes()
+            );
+        }
+        Ok(())
+    }
+
+    /// The per-region TAILS of one checkpoint cycle (design-symmetric-
+    /// metadata §5.3.4 — one ring, one tail, per appender): region 0's is
+    /// the caller's ledger tail; a declared region's is `min(its head, its
+    /// oldest open reservation, the dying floors of its slots' leaves,
+    /// the live floors of its slots' dirty leaves)` — every position in
+    /// ITS ring's logical space. `leaf_floors` are the per-slot dying
+    /// floors the cycle drained; `live_floors` the dirty leaves' by slot.
+    pub(super) fn appender_region_tails(
+        &self,
+        leaf_floors: &std::collections::BTreeMap<super::record::ForestSlot, u64>,
+        live_floors: &std::collections::BTreeMap<super::record::ForestSlot, u64>,
+    ) -> Vec<(u32, u64)> {
+        let Some(set) = self.appenders.as_ref().filter(|a| a.is_partitioned()) else {
+            return Vec::new();
+        };
+        set.regions
+            .iter()
+            .skip(1)
+            .map(|r| {
+                let ring = r.ring();
+                let mut tail = ring.core().head().min(ring.min_inflight_start());
+                for (slot, f) in leaf_floors.iter().chain(live_floors.iter()) {
+                    if r.leases_slot(*slot) {
+                        tail = tail.min(*f);
+                    }
+                }
+                (r.id, tail)
+            })
+            .collect()
+    }
+
+    /// **The appender PAGE writes of one checkpoint cycle** (§5.3.2 — the
+    /// page IS the appender's ledger record; one write per checkpoint):
+    /// region 0's mirrors the fixed ledger (its tail, this `ckpt_seq`) and
+    /// names the roots of the slot trees it holds — the native slot and
+    /// every guest slot no declared region leases, up to the page budget
+    /// — never tree 0's root or the stamp (KD-SYM-3); a declared region's
+    /// names its own tail and the roots of its leased slots' trees (an
+    /// unminted slot has root `(0, 0)`). Each write's tail is pushed on the
+    /// region's pending-reclaim ledger with the barrier epoch, exactly
+    /// like the fixed ledger's. A no-op on a flat volume and before the
+    /// join.
+    pub(super) async fn write_appender_pages(
+        &self,
+        ledger_tail: u64,
+        ckpt_seq: u64,
+        head: u64,
+        region_tails: &[(u32, u64)],
+    ) -> std::result::Result<(), KvError> {
+        let Some(set) = self.appenders.as_ref() else {
+            return Ok(());
+        };
+        if !set.joined.load(Ordering::Acquire) || self.read_only || self.non_writer {
+            return Ok(());
+        }
+        let Some(forest) = self.forest() else {
+            return Ok(());
+        };
+        let trees = forest.slot_trees();
+        for r in &set.regions {
+            let tail = if r.id == 0 {
+                ledger_tail
+            } else {
+                region_tails
+                    .iter()
+                    .find(|(id, _)| *id == r.id)
+                    .map_or(0, |(_, t)| *t)
+            };
+            let mut entries: Vec<super::appender::SlotEntry> = Vec::new();
+            if r.id == 0 {
+                for (slot, tree) in &trees {
+                    if set.region_of_slot(*slot) != 0 {
+                        continue;
+                    }
+                    if entries.len() >= super::appender::SLOT_PAGE_BUDGET {
+                        break; // the rest ride tree 0 until PR 4's LRU release
+                    }
+                    let Ok(page_slot) =
+                        super::appender::page_slot_of_forest_slot(*slot, set.native_slot)
+                    else {
+                        continue;
+                    };
+                    let root = tree.root();
+                    entries.push(super::appender::SlotEntry {
+                        slot: page_slot,
+                        state: super::appender::SlotEntryState::Live,
+                        g: 0,
+                        slot_tree_extents: 0,
+                        root,
+                        cursor: 0,
+                    });
+                }
+            } else {
+                for slot in &r.leases {
+                    let Ok(page_slot) =
+                        super::appender::page_slot_of_forest_slot(*slot, set.native_slot)
+                    else {
+                        continue;
+                    };
+                    let root = forest
+                        .tree(*slot)
+                        .map_or(RootPtr { addr: 0, seq: 0 }, |t| t.root());
+                    entries.push(super::appender::SlotEntry {
+                        slot: page_slot,
+                        state: super::appender::SlotEntryState::Live,
+                        g: 0,
+                        slot_tree_extents: 0,
+                        root,
+                        cursor: 0,
+                    });
+                }
+            }
+            entries.sort_by_key(|e| e.slot);
+            entries.dedup_by_key(|e| e.slot);
+            let (off, img) = {
+                let mut page = r.page.lock().unwrap_or_else(|e| e.into_inner());
+                page.generation += 1;
+                page.ledger_tail_seq = tail;
+                page.ckpt_seq = ckpt_seq;
+                page.head_hint = if r.id == 0 {
+                    head
+                } else {
+                    r.ring().core().head()
+                };
+                // The segment table names EXTENTS (a declared region's
+                // first extent holds its two ring-side pages ahead of the
+                // ring proper; growth appends whole extents), so it is
+                // maintained at open and growth, never derived from the
+                // ring's page ranges. Appender 0's is the fixed extent past
+                // its page slots, as format wrote it.
+                if r.id == 0 {
+                    page.segments = vec![super::appender::appender0_ring_extent(&self.sb.journal)];
+                }
+                page.slots = entries;
+                (
+                    r.page_offsets[super::appender::page_slot_for(page.generation)],
+                    page.encode()?,
+                )
+            };
+            super::appender::write_page(&self.path, off, img).await?;
+            r.last_tail.store(tail, Ordering::Release);
+            if r.id != 0 {
+                r.pending_reclaim
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push((tail, self.barrier_push_epoch()));
+            }
+        }
+        Ok(())
+    }
+
+    /// The flush-ceiling audit of one cycle (KD-SYM-10): `had_dirty` names
+    /// the regions whose leaves were dirty when the flush pass began;
+    /// `elapsed` is the pass's start → covering barrier. Past the ceiling
+    /// each such region is one overrun (must-stay-0), logged.
+    pub(super) fn note_flush_ceiling(&self, had_dirty: &[u32], elapsed: std::time::Duration) {
+        let Some(set) = self.appenders.as_ref() else {
+            return;
+        };
+        let ceiling = super::appender::appender_flush_ceiling_ms();
+        if had_dirty.is_empty() || elapsed.as_millis() <= u128::from(ceiling) {
+            return;
+        }
+        set.flush_ceiling_overruns
+            .fetch_add(had_dirty.len() as u64, Ordering::Relaxed);
+        log::warn!(
+            "meta volume {}: flush ceiling OVERRUN — appender region(s) {had_dirty:?} had dirty \
+             leaves when the flush pass began and its covering barrier landed {} ms later \
+             (ceiling {ceiling} ms; appender_flush_ceiling_overruns, must stay 0)",
+            self.path.display(),
+            elapsed.as_millis()
+        );
     }
 
     /// The fixed journal extent's RING part: the whole extent on a flat
@@ -5715,10 +6239,48 @@ impl KvMetaBackend {
             let split = g.partition_point(|&(_, epoch)| epoch < covered);
             g.drain(..split).collect()
         };
+        let mut region0_tail: Option<u64> = None;
         for (tail, _) in drained {
             self.alloc.advance_durable(tail);
-            self.cache.set_durable_tail(tail);
             self.ring.advance_reusable_upto(tail);
+            region0_tail = Some(tail);
+        }
+        match self.appenders.as_ref() {
+            None => {
+                if let Some(tail) = region0_tail {
+                    self.cache.set_durable_tail(tail);
+                }
+            }
+            Some(set) => {
+                // Per region: the same epoch split on ITS pending list,
+                // advancing ITS ring; the cache's elision tail is the MIN
+                // over the regions (a tombstone is elidable only below its
+                // own ring's tail, and the min is safe for every ring).
+                if let Some(tail) = region0_tail {
+                    if let Some(r0) = set.regions.first() {
+                        r0.durable_tail.fetch_max(tail, Ordering::AcqRel);
+                    }
+                }
+                for r in set.regions.iter().skip(1) {
+                    let drained: Vec<(u64, u64)> = {
+                        let mut g = r.pending_reclaim.lock().unwrap_or_else(|e| e.into_inner());
+                        let split = g.partition_point(|&(_, epoch)| epoch < covered);
+                        g.drain(..split).collect()
+                    };
+                    for (tail, _) in drained {
+                        r.ring().advance_reusable_upto(tail);
+                        r.durable_tail.fetch_max(tail, Ordering::AcqRel);
+                    }
+                }
+                if let Some(min) = set
+                    .regions
+                    .iter()
+                    .map(|r| r.durable_tail.load(Ordering::Acquire))
+                    .min()
+                {
+                    self.cache.set_durable_tail(min);
+                }
+            }
         }
     }
 
@@ -5781,6 +6343,37 @@ impl KvMetaBackend {
         } else {
             self.ring.core().head()
         }
+    }
+
+    /// [`Self::checkpoint_past`] for an appender region's ring: cycle until
+    /// THAT region's page tail reaches `pos` (positions are per ring).
+    /// Region 0's is the fixed ledger's tail — [`Self::checkpoint_past`].
+    pub async fn checkpoint_past_region(
+        &self,
+        region: u32,
+        pos: u64,
+    ) -> std::result::Result<(), KvError> {
+        let Some(r) = self
+            .appenders
+            .as_ref()
+            .and_then(|a| a.region(region))
+            .filter(|r| r.id != 0)
+            .cloned()
+        else {
+            return self.checkpoint_past(pos).await;
+        };
+        let mut smo = self.smo.lock().await;
+        for _ in 0..8 {
+            self.checkpoint_cycle(&mut smo, true).await?;
+            if r.last_tail.load(Ordering::Acquire) >= pos {
+                return Ok(());
+            }
+        }
+        Err(KvError::Corrupt(format!(
+            "appender {region}'s checkpoint tail failed to clear the journal hole ending at \
+             {pos} after 8 cycles (tail stuck at {}) — replay would walk into the hole",
+            r.last_tail.load(Ordering::Acquire)
+        )))
     }
 
     pub async fn checkpoint_past(&self, pos: u64) -> std::result::Result<(), KvError> {
@@ -6147,6 +6740,16 @@ impl KvMetaBackend {
             // volume rather than panic (the §4.4 pt 4 posture).
             self.ring.wait_completed_upto(self.ring.core().head()).await;
             self.checkpoint_now().await?;
+        }
+        // The appender region release (design-symmetric-metadata §5.1.3,
+        // PR 2): every page of ours goes Free after the final checkpoint
+        // named every root in tree 0 (a no-op on a flat volume).
+        if let Err(e) = self.leave_appender_regions().await {
+            log::warn!(
+                "meta volume {}: clean unmount could not release its appender pages: {e} (the \
+                 pages stay Live — the next mount of this identity recovers its own residue)",
+                self.path.display()
+            );
         }
         // D0: release the Write Exclusive reservation after the final
         // barrier (nothing of ours writes past this point), then the
@@ -8331,6 +8934,9 @@ struct SpilledChainedFull {
 struct QueuedTx {
     /// The tx's records, seqs stamped by the pass inside the lock window.
     recs: Vec<(u8, Record)>,
+    /// The appender region whose ring this tx journals into (0 on a flat
+    /// volume and for every manager-owned record — `region_of_records`).
+    region: u32,
     /// Exact journal entry length ([`entry_len_for`]) — the Σ-admission
     /// and the drain byte cap read it.
     len: u64,
@@ -8360,6 +8966,10 @@ struct QueuedTx {
 /// barrier, then fans the members' terminal outcomes out — in handoff
 /// order, which is drain order, which is journal-seq order.
 struct ConveyorWindow {
+    /// The ring this window's reservation lives in (the region's ring at
+    /// the pass; region 0's is the fixed ring) and the region's id.
+    ring: Arc<JournalRing>,
+    region: u32,
     /// The batch members (queue order), each still co-owning its DLM
     /// guards — released only at the terminal outcome the lane computes.
     entries: Vec<QueuedTx>,
@@ -8394,7 +9004,9 @@ struct ConveyorWindow {
 /// never both non-empty.
 struct BatchProduct {
     outcomes: Vec<(QueuedTx, std::result::Result<(), KvError>)>,
-    window: Option<ConveyorWindow>,
+    /// One window per appender region the batch touched (exactly one on
+    /// a flat volume / the manager alone).
+    windows: Vec<ConveyorWindow>,
 }
 
 impl ConveyorWindow {
@@ -8421,6 +9033,9 @@ impl ConveyorWindow {
 /// fail; `completed_upto` can never wedge.
 struct PassSentinel<'a> {
     be: &'a Arc<KvMetaBackend>,
+    /// The ring this batch reserves in and the region it belongs to.
+    ring: Arc<JournalRing>,
+    region: u32,
     /// The pass start (`pass_total`, and the window's `window_total`).
     t_pass: std::time::Instant,
     /// Batch members not yet at their terminal outcome.
@@ -8469,10 +9084,10 @@ impl Drop for PassSentinel<'_> {
         if let Some(res) = self.reservation.take() {
             // Abandoned, never wedged: the range stays unwritten; replay
             // drops it at the checksum walk (§4.4 pt 4).
-            self.be.ring.complete(&res);
+            self.ring.complete(&res);
         }
         if let Some(adm) = self.admission.take() {
-            self.be.ring.core().release(adm);
+            self.ring.core().release(adm);
         }
         let mut batch_n = self.entries.len();
         for q in self.entries.drain(..) {
@@ -8984,6 +9599,448 @@ impl KvMetaBackend {
             max_replayed_ino,
             max_replayed_guest,
         ))
+    }
+
+    /// This process's appender identity scope `(node_token, mount_slot)`
+    /// (KD-MW-2): the engaged writer scope when a mount armed one, else
+    /// the node token + this process's mount slot; a box without any
+    /// node-identity material falls back to a boot-scoped token so two
+    /// mounts of one boot still match their own residue.
+    fn appender_identity_scope(boot_id: &str) -> (u64, u32) {
+        if let Some(scope) = crate::writer_scope::engaged_scope() {
+            return (scope.node, scope.slot);
+        }
+        let node = crate::writer_scope::resolve_node_identity()
+            .map(|n| n.token)
+            .unwrap_or_else(|_| {
+                xxhash_rust::xxh3::xxh3_64(format!("sqz-appender\u{0}{boot_id}").as_bytes())
+            });
+        (node, crate::writer_scope::mount_slot())
+    }
+
+    /// **The appender regions of a forest volume at open** (design-
+    /// symmetric-metadata §5.3.2 identity binding, §5.3.4, §5.9 — PR 2):
+    /// read the directory, bind this node's identity, and — on a WRITER
+    /// open — recover its own residue and stand up every region the
+    /// declared partition names.
+    ///
+    /// Region 0 (the manager's, KD-SYM-3) rides the fixed ring the caller
+    /// already replayed from the ledger; a `Live` page of our own means
+    /// the predecessor died un-recovered and that replay WAS its recovery
+    /// (`appender_self_recoveries`). A `Live` page of a FOREIGN identity
+    /// refuses a writer open loud — recovering another node's ring is
+    /// PR 10's driver, `squeezefs appender clear` the remedy — and a
+    /// non-writer (reader / probe) lists it and mounts what tree 0 names.
+    /// A declared region ≥ 1 with an own `Live` page has its ring
+    /// replayed from the page's segments and tail (content only — the
+    /// manager owns every ring's structure in PR 2); `Free` / `Recovered`
+    /// pages get a fresh ring from the heap (`SQUEEZEFS_SYM_RING_KB` or
+    /// the derivation), never replayed. The three per-ring violation
+    /// classes are evaluated over EVERY ring's window and refuse loud.
+    #[allow(clippy::too_many_arguments)]
+    async fn open_appender_regions(
+        path: &Path,
+        sb: &SuperblockV3,
+        ledger: &LedgerRecord,
+        ring0: &Arc<JournalRing>,
+        forest: &super::forest::SlotTrees,
+        cache: &Arc<NodeCache>,
+        seq: &Arc<AtomicU64>,
+        alloc: &Arc<ExtentAllocator>,
+        recovery0: &super::journal::JournalRecovery,
+        posture: OpenPosture,
+        boot_id: &str,
+    ) -> std::result::Result<super::appender::AppenderSet, KvError> {
+        use super::appender::{
+            appender0_page_offsets, declared_partition, dir_pairs_per_extent,
+            first_segment_ring_part, page_slot_offsets, read_directory, resolve_sym_ring_bytes,
+            AppenderIdentity, AppenderPage, AppenderRegion, AppenderSet, AppenderState,
+        };
+        use super::journal::RingSegment;
+
+        let entries = read_directory(path, sb).await?;
+        let scope = Self::appender_identity_scope(boot_id);
+        let native_slot = ledger
+            .membership_stamp
+            .as_ref()
+            .and_then(|s| s.native_slot)
+            .unwrap_or(0);
+        let live_pages_at_mount = entries
+            .iter()
+            .filter(|e| {
+                e.page
+                    .as_ref()
+                    .is_some_and(|p| p.state == AppenderState::Live)
+            })
+            .count() as u64;
+        let is_writer = posture == OpenPosture::Writer;
+        let partition = if is_writer {
+            declared_partition()?
+        } else {
+            Default::default()
+        };
+        // The volume length the ring derivation clamps against: the heap's
+        // end (the superblock stores no volume length; the redundant
+        // superblock copy sits in the one sector past it).
+        let volume_len = sb.heap.end();
+        let ring_bytes = resolve_sym_ring_bytes(0, volume_len);
+        let capacity = super::appender::appenders_capacity(sb.heap.len, ring_bytes);
+
+        let mine = |p: &AppenderPage| p.identity.scope() == scope;
+        let foreign_live = |p: &AppenderPage| p.state == AppenderState::Live && !mine(p);
+        if is_writer {
+            if let Some(e) = entries
+                .iter()
+                .find(|e| e.page.as_ref().is_some_and(foreign_live))
+            {
+                let p = e.page.as_ref().expect("filtered");
+                return Err(KvError::Busy(format!(
+                    "{}: appender page {} is LIVE under a foreign identity (node {:#018x}, mount \
+                     slot {:#x}, term {}) — recovering another node's ring is the dead-appender \
+                     recovery driver (design-symmetric-metadata PR 10); until it lands, \
+                     `squeezefs appender clear <sqmeta-uri> {}` is the attested remedy. Refusing \
+                     to mount over it",
+                    path.display(),
+                    p.appender_id,
+                    p.identity.node_token,
+                    p.identity.mount_slot,
+                    p.term,
+                    p.appender_id
+                )));
+            }
+        }
+
+        let set = AppenderSet {
+            regions: Vec::new(),
+            identity: AppenderIdentity {
+                node_token: scope.0,
+                mount_slot: scope.1,
+                writer_id: 0,
+            },
+            native_slot,
+            capacity,
+            live_pages_at_mount,
+            joins: AtomicU64::new(0),
+            leaves: AtomicU64::new(0),
+            self_recoveries: AtomicU64::new(0),
+            flush_ceiling_overruns: AtomicU64::new(0),
+            joined: AtomicBool::new(false),
+        };
+        let mut regions: Vec<Arc<AppenderRegion>> = Vec::new();
+
+        // ---- Region 0: the fixed ring, already replayed by the caller.
+        let page0 = entries
+            .first()
+            .and_then(|e| e.page.clone())
+            .unwrap_or_else(|| {
+                // A stamped volume whose page 0 never verified (every copy
+                // torn): rebuild the Free page the format wrote — the ring
+                // is the fixed extent by construction.
+                let mut p = AppenderPage::free(0, 0);
+                p.segments = vec![super::appender::appender0_ring_extent(&sb.journal)];
+                p
+            });
+        let self_recovered0 = is_writer && page0.state == AppenderState::Live && mine(&page0);
+        if self_recovered0 {
+            set.self_recoveries.fetch_add(1, Ordering::Relaxed);
+            log::info!(
+                "meta volume {}: appender 0's page is LIVE under our own identity (term {}) — \
+                 our predecessor died un-recovered; its ring window ({} entries) was replayed \
+                 as our own residue (appender_self_recoveries)",
+                path.display(),
+                page0.term,
+                recovery0.entries.len()
+            );
+        }
+        regions.push(Arc::new(AppenderRegion {
+            id: 0,
+            page_offsets: appender0_page_offsets(&sb.journal),
+            page: std::sync::Mutex::new(page0),
+            ring: arc_swap::ArcSwap::from(Arc::clone(ring0)),
+            leases: Default::default(),
+            last_tail: AtomicU64::new(ledger.journal_tail_seq),
+            durable_tail: AtomicU64::new(ledger.journal_tail_seq),
+            stalls: AtomicU64::new(0),
+            stalls_at_last_grow: AtomicU64::new(0),
+            ring_grows: AtomicU64::new(0),
+            pending_reclaim: std::sync::Mutex::new(Vec::new()),
+            passes_inside: std::sync::atomic::AtomicUsize::new(0),
+            growing: AtomicBool::new(false),
+            self_recovered: self_recovered0,
+        }));
+
+        // ---- Declared regions (the PR-2 seam standing in for PR 4's
+        // lease gate): each needs a page in the directory and a ring.
+        let mut rings: Vec<(u32, &super::journal::JournalRecovery)> = vec![(0, recovery0)];
+        let mut recovered: Vec<(u32, super::journal::JournalRecovery)> = Vec::new();
+        let node_size = u64::from(sb.node_size);
+        for (&id, slots) in &partition {
+            let entry = entries
+                .iter()
+                .find(|e| e.appender_id == id)
+                .ok_or_else(|| {
+                    KvError::Corrupt(format!(
+                        "{}: declared appender {id} has no page in the directory (the chain holds \
+                     {} ids per extent at this node size; growing the chain is the manager's \
+                     JoinAppender — PR 3)",
+                        path.display(),
+                        dir_pairs_per_extent(node_size)
+                    ))
+                })?;
+            let mut page = entry
+                .page
+                .clone()
+                .unwrap_or_else(|| AppenderPage::free(id, 0));
+            let own_live = page.state == AppenderState::Live && mine(&page);
+            let reserve = checkpoint_reserve_bytes(ring_bytes);
+            let (ring, self_recovered) = if own_live && !page.segments.is_empty() {
+                // Own residue: replay THIS ring from ITS page's tail.
+                let mut segs: Vec<RingSegment> = Vec::with_capacity(page.segments.len());
+                for (i, ext) in page.segments.iter().enumerate() {
+                    let ext = if i == 0 {
+                        first_segment_ring_part(ext)
+                    } else {
+                        *ext
+                    };
+                    segs.push(RingSegment::from_extent(&ext));
+                }
+                let (ring, rec) = JournalRing::recover_segments(
+                    path,
+                    segs,
+                    checkpoint_reserve_bytes(page.ring_bytes()),
+                    page.ledger_tail_seq,
+                )
+                .await?;
+                log::info!(
+                    "meta volume {}: appender {id}'s page is LIVE under our own identity (term \
+                     {}) — replaying its ring ({} entries past tail {}) as our own residue",
+                    path.display(),
+                    page.term,
+                    rec.entries.len(),
+                    page.ledger_tail_seq
+                );
+                set.self_recoveries.fetch_add(1, Ordering::Relaxed);
+                recovered.push((id, rec));
+                (ring, true)
+            } else {
+                // A fresh ring from the heap (`Free`, or `Recovered` — never
+                // replayed, §5.8.3): whole extents claimed internal-class,
+                // adjacent ones coalesced into segments; the bits land in
+                // the join's checkpoint before the page names them.
+                let want_extents = ring_bytes.div_ceil(node_size).max(1);
+                let mut claimed: Vec<u64> = Vec::with_capacity(want_extents as usize);
+                for _ in 0..want_extents {
+                    match alloc.claim_internal() {
+                        Ok(e) => claimed.push(e),
+                        Err(err) => {
+                            for e in claimed {
+                                alloc.release_unpublished(e);
+                            }
+                            return Err(err);
+                        }
+                    }
+                }
+                claimed.sort_unstable();
+                let mut extents: Vec<super::superblock::ExtentRef> = Vec::new();
+                for e in claimed.iter() {
+                    let start = sb.heap.start + e * node_size;
+                    match extents.last_mut() {
+                        Some(last) if last.end() == start => last.len += node_size,
+                        _ => extents.push(super::superblock::ExtentRef {
+                            start,
+                            len: node_size,
+                        }),
+                    }
+                }
+                if extents.len() > super::appender::RING_SEGMENTS_MAX {
+                    for e in claimed {
+                        alloc.release_unpublished(e);
+                    }
+                    return Err(KvError::Corrupt(format!(
+                        "{}: appender {id}'s {ring_bytes}-byte ring would take {} segments of \
+                         this heap's free extents (the page names at most {}) — lower \
+                         {} or raise --meta-node-kib",
+                        path.display(),
+                        extents.len(),
+                        super::appender::RING_SEGMENTS_MAX,
+                        super::appender::SYM_RING_KB_ENV
+                    )));
+                }
+                page.segments = extents;
+                page.head_hint = 0;
+                page.ledger_tail_seq = 0;
+                let segs: Vec<RingSegment> = page
+                    .segments
+                    .iter()
+                    .enumerate()
+                    .map(|(i, ext)| {
+                        RingSegment::from_extent(&if i == 0 {
+                            first_segment_ring_part(ext)
+                        } else {
+                            *ext
+                        })
+                    })
+                    .collect();
+                (JournalRing::new_segments(path, segs, reserve), false)
+            };
+            let first = page.segments.first().copied().unwrap_or(sb.journal);
+            let page_offsets = page_slot_offsets(sb, id, entry.dir_offsets, &first);
+            regions.push(Arc::new(AppenderRegion {
+                id,
+                page_offsets,
+                last_tail: AtomicU64::new(page.ledger_tail_seq),
+                durable_tail: AtomicU64::new(page.ledger_tail_seq),
+                page: std::sync::Mutex::new(page),
+                ring: arc_swap::ArcSwap::from(Arc::new(ring)),
+                leases: slots.clone(),
+                stalls: AtomicU64::new(0),
+                stalls_at_last_grow: AtomicU64::new(0),
+                ring_grows: AtomicU64::new(0),
+                pending_reclaim: std::sync::Mutex::new(Vec::new()),
+                passes_inside: std::sync::atomic::AtomicUsize::new(0),
+                growing: AtomicBool::new(false),
+                self_recovered,
+            }));
+        }
+        let set = AppenderSet { regions, ..set };
+
+        // ---- The per-ring violation classes over EVERY window (§5.3.4),
+        // BEFORE any recovered content is applied: loud, counted, refused.
+        for (id, rec) in &recovered {
+            rings.push((*id, rec));
+        }
+        let leases = set.lease_map();
+        let owned: Vec<(u32, super::journal::JournalRecovery)> = rings
+            .iter()
+            .map(|(id, r)| {
+                (
+                    *id,
+                    super::journal::JournalRecovery {
+                        entries: r.entries.clone(),
+                        head_pos: r.head_pos,
+                        dropped_torn: r.dropped_torn,
+                        foreign_pages: r.foreign_pages,
+                    },
+                )
+            })
+            .collect();
+        let violations = super::journal::detect_appender_violations(&owned, &leases);
+        if !violations.is_empty() {
+            let (mut key, mut lease, mut extent) = (0u64, 0u64, 0u64);
+            for v in &violations {
+                match v {
+                    super::journal::AppenderViolation::Key { .. } => key += 1,
+                    super::journal::AppenderViolation::Lease { .. } => lease += 1,
+                    super::journal::AppenderViolation::Extent { .. } => extent += 1,
+                }
+            }
+            super::META_KV_REPLAY_KEY_VIOLATIONS.fetch_add(key, Ordering::Relaxed);
+            super::META_KV_REPLAY_LEASE_VIOLATIONS.fetch_add(lease, Ordering::Relaxed);
+            super::META_KV_REPLAY_EXTENT_VIOLATIONS.fetch_add(extent, Ordering::Relaxed);
+            let shown: Vec<String> = violations.iter().take(4).map(|v| v.to_string()).collect();
+            return Err(KvError::Corrupt(format!(
+                "{}: appender partition violated by {} record(s) in the replay windows \
+                 ({key} key, {lease} lease, {extent} extent) — no merge order is correct: {}{}",
+                path.display(),
+                violations.len(),
+                shown.join("; "),
+                if violations.len() > shown.len() {
+                    format!(" (+{} more)", violations.len() - shown.len())
+                } else {
+                    String::new()
+                }
+            )));
+        }
+
+        // ---- The pages' root vectors (§5.2.2 — a leased slot's root
+        // lives on its lessee's page, written every cycle AFTER tree 0's
+        // publication; §5.2.4): for every own page, a slot entry whose
+        // root is NEWER than the tree's (node seqs mint monotonically, so
+        // a later root image carries a higher seq) is adopted, and a slot
+        // tree 0 does not name yet is OPENED from the page. A declared
+        // region's content rides ITS ring, whose tail the page advanced
+        // past the flushed records — the page's root is that content's
+        // only durable home.
+        if is_writer {
+            for r in &set.regions {
+                let entries: Vec<super::appender::SlotEntry> = {
+                    let page = r.page.lock().unwrap_or_else(|e| e.into_inner());
+                    if page.state != AppenderState::Live || !mine(&page) {
+                        continue;
+                    }
+                    page.slots.clone()
+                };
+                for e in entries {
+                    if e.root.addr == 0 {
+                        continue;
+                    }
+                    let slot = super::appender::forest_slot_of_page_slot(e.slot, native_slot);
+                    if slot == super::record::NATIVE_FOREST_SLOT {
+                        continue; // the ledger's, mirrored
+                    }
+                    match forest.tree(slot) {
+                        Some(t) => {
+                            if e.root.seq > t.root().seq {
+                                t.adopt_root(e.root)?;
+                            }
+                        }
+                        None => {
+                            let tree = KvTree::open_slot_tree(
+                                Arc::clone(cache),
+                                slot,
+                                e.root,
+                                Arc::clone(seq),
+                            )
+                            .await?;
+                            seq.fetch_max(e.root.seq, Ordering::AcqRel);
+                            forest.adopt_guest(slot, Arc::new(tree));
+                        }
+                    }
+                }
+            }
+        }
+
+        // ---- Apply the recovered content rings into the forest (phase 2
+        // of §5.3.4 per ring — content by forest key; order-independent
+        // across rings because they are key-disjoint in-window, which the
+        // check above just proved).
+        let mint = super::forest::MintContext {
+            cache,
+            seq,
+            alloc,
+            floor: ledger.journal_tail_seq,
+            policy: super::forest::MintPolicy::Recovery,
+        };
+        for (_id, rec) in &recovered {
+            for entry in &rec.entries {
+                for (tag, rec) in &entry.records {
+                    let (tree_id, level) = untag(*tag);
+                    if level > 0 || !super::record::is_slot_tree_kind(tree_id) {
+                        continue; // refused above as a Lease/Extent violation
+                    }
+                    let (_slot, tree) = forest.route_forest_key_or_mint(&rec.key, &mint).await?;
+                    tree.apply_replayed(
+                        &rec.key,
+                        rec.seq,
+                        rec.kind,
+                        Bytes::copy_from_slice(&rec.value),
+                        entry.seq,
+                    )
+                    .await?;
+                }
+            }
+        }
+        // The elision tail every compaction reads is the MIN over the
+        // rings' durable tails (a tombstone is elidable only below its own
+        // ring's tail; the min is safe for every ring).
+        let min_tail = set
+            .regions
+            .iter()
+            .map(|r| r.durable_tail.load(Ordering::Relaxed))
+            .min()
+            .unwrap_or(ledger.journal_tail_seq);
+        cache.set_durable_tail(min_tail);
+        Ok(set)
     }
 
     /// The trees whose roots the FIXED LEDGER names: every tree on a flat
@@ -9574,6 +10631,7 @@ impl KvMetaBackend {
             });
         }
         let len = entry_len_for(&recs)?;
+        let region = self.region_of_records(&recs)?;
 
         let (done, rx) = squeezefs_ipc::sqz_channel::oneshot::channel();
         // op-trace (audit A2): the tx carries the ORIGINATING op's id
@@ -9586,6 +10644,7 @@ impl KvMetaBackend {
         Ok((
             QueuedTx {
                 recs,
+                region,
                 len,
                 enqueued_at,
                 trace_id,
@@ -9669,12 +10728,12 @@ impl KvMetaBackend {
                 }
                 continue;
             }
-            let BatchProduct { outcomes, window } = be.run_batch(batch).await;
-            // Stage A → stage B handoff (D-2): the window joins the
+            let BatchProduct { outcomes, windows } = be.run_batch(batch).await;
+            // Stage A → stage B handoff (D-2): each window joins the
             // durability lane's in-order queue; the enqueue and the
             // leader-elect are two uninterruptible steps (no await between
             // them), so a window can never sit in the lane leaderless.
-            if let Some(window) = window {
+            for window in windows {
                 super::note_window_inflight();
                 let lane = Arc::clone(&be.durability_lane);
                 let len = window.entries.len() as u64;
@@ -9727,7 +10786,7 @@ impl KvMetaBackend {
     /// the in-flight gauge. All-sync.
     fn abandon_window(&self, w: ConveyorWindow, why: &str) {
         if w.res_open {
-            self.ring.complete(&w.res);
+            w.ring.complete(&w.res);
         }
         for q in w.entries {
             let _ = q.done.send(Err(KvError::Io(self.eio(why))));
@@ -9819,6 +10878,37 @@ impl KvMetaBackend {
     /// (every member failed as a unit, nothing reserved or applied) or the
     /// applied-and-submitted window for the durability lane.
     async fn run_batch(self: &Arc<Self>, batch: Vec<QueuedTx>) -> BatchProduct {
+        // One group per appender region the batch touched, in queue order
+        // of first appearance: a group is one reservation in ONE ring
+        // (design-symmetric-metadata §5.3 — a tx journals into its
+        // appender's ring; an unpartitioned volume is the one-group case,
+        // byte-identical to the pre-region pass).
+        let partitioned = self.appenders.as_ref().is_some_and(|a| a.is_partitioned());
+        if !partitioned {
+            return self.run_batch_group(batch, 0).await;
+        }
+        let mut groups: Vec<(u32, Vec<QueuedTx>)> = Vec::new();
+        for q in batch {
+            match groups.iter_mut().find(|(r, _)| *r == q.region) {
+                Some((_, g)) => g.push(q),
+                None => groups.push((q.region, vec![q])),
+            }
+        }
+        let mut product = BatchProduct {
+            outcomes: Vec::new(),
+            windows: Vec::new(),
+        };
+        for (region, group) in groups {
+            let BatchProduct { outcomes, windows } = self.run_batch_group(group, region).await;
+            product.outcomes.extend(outcomes);
+            product.windows.extend(windows);
+        }
+        product
+    }
+
+    /// [`Self::run_batch`] for the members of ONE region: the pipeline
+    /// once over the group, reserving in that region's ring.
+    async fn run_batch_group(self: &Arc<Self>, batch: Vec<QueuedTx>, region: u32) -> BatchProduct {
         use crate::fuse_client::{
             meta_txpass_phase_record, meta_txpass_phase_record_dur, MetaTxPassPhase,
         };
@@ -9883,8 +10973,32 @@ impl KvMetaBackend {
         // registered reservation as abandoned, fails the remaining
         // oneshots with EIO and escalates. All-sync cleanup; a batch can
         // fail loud but can never wedge `completed_upto`.
+        // The Dekker pair with a region's ring GROWTH (`grow_stalled_
+        // regions`): a pass announces itself inside the region's window
+        // before it loads the ring, growth announces itself before it
+        // reads the count — one of the two always sees the other, so a
+        // pass never reserves on a ring the checkpoint task is replacing.
+        let growth_gate = self
+            .appenders
+            .as_ref()
+            .and_then(|a| a.region(region))
+            .filter(|r| r.id != 0)
+            .cloned();
+        if let Some(r) = &growth_gate {
+            loop {
+                r.passes_inside.fetch_add(1, Ordering::SeqCst);
+                if !r.growing.load(Ordering::SeqCst) {
+                    break;
+                }
+                r.passes_inside.fetch_sub(1, Ordering::SeqCst);
+                squeezefs_ipc::sqz_time::sleep(std::time::Duration::from_micros(200)).await;
+            }
+        }
+        let ring = self.ring_of_region(region);
         let mut sentinel = PassSentinel {
             be: self,
+            ring,
+            region,
             t_pass,
             entries: batch,
             outcomes: Vec::new(),
@@ -9895,6 +11009,9 @@ impl KvMetaBackend {
             traced,
         };
         self.run_batch_pipeline(&mut sentinel).await;
+        if let Some(r) = &growth_gate {
+            r.passes_inside.fetch_sub(1, Ordering::SeqCst);
+        }
         debug_assert!(
             sentinel.entries.is_empty()
                 && sentinel.admission.is_none()
@@ -9907,7 +11024,7 @@ impl KvMetaBackend {
         meta_txpass_phase_record(MetaTxPassPhase::PassTotal, t_pass, &sentinel.traced);
         BatchProduct {
             outcomes: std::mem::take(&mut sentinel.outcomes),
-            window: sentinel.window.take(),
+            windows: sentinel.window.take().into_iter().collect(),
         }
     }
 
@@ -9936,7 +11053,7 @@ impl KvMetaBackend {
         // drain takes no DLM locks, ever), with the D1.b park-escalation
         // rung moved verbatim from the per-tx pipeline.
         let t_adm = std::time::Instant::now();
-        match self.admit_user_budget(total_len).await {
+        match self.admit_user_budget(&s.ring, s.region, total_len).await {
             Ok(adm) => s.admission = Some(adm),
             Err(e) => {
                 self.fail_batch(s, &e);
@@ -9973,7 +11090,7 @@ impl KvMetaBackend {
             attempt += 1;
             if attempt > COMMIT_RETRY_BUDGET {
                 let adm = s.admission.take().expect("admission held until reserve");
-                self.ring.core().release(adm);
+                s.ring.core().release(adm);
                 let e = KvError::Corrupt(
                     "commit retry budget exhausted (revalidation never passed — SMO \
                      protocol bug)"
@@ -10009,7 +11126,7 @@ impl KvMetaBackend {
                 // Device-read class: the batch fails as a unit; nothing
                 // was reserved or applied.
                 let adm = s.admission.take().expect("admission held until reserve");
-                self.ring.core().release(adm);
+                s.ring.core().release(adm);
                 self.fail_batch(s, &e);
                 return;
             }
@@ -10069,7 +11186,7 @@ impl KvMetaBackend {
                 record_hold();
                 drop(guards);
                 let adm = s.admission.take().expect("admission held until reserve");
-                self.ring.core().release(adm);
+                s.ring.core().release(adm);
                 // Budget the checkpoint can RETURN — promises held by nodes
                 // the flush pass has not reached yet (turned into claims at
                 // their SMO, or released at their append) and retirements
@@ -10114,7 +11231,10 @@ impl KvMetaBackend {
                 // Re-admit the ring budget — no node lock held across the
                 // park (§4.4 pt 5) — and re-resolve everything.
                 let survivors_len: u64 = s.entries.iter().map(|q| q.len).sum();
-                match self.admit_user_budget(survivors_len).await {
+                match self
+                    .admit_user_budget(&s.ring, s.region, survivors_len)
+                    .await
+                {
                     Ok(adm) => s.admission = Some(adm),
                     Err(e) => {
                         self.fail_batch(s, &e);
@@ -10156,7 +11276,7 @@ impl KvMetaBackend {
                     record_hold();
                     drop(guards);
                     let adm = s.admission.take().expect("admission held until reserve");
-                    self.ring.core().release(adm);
+                    s.ring.core().release(adm);
                     self.fail_batch(s, &e);
                     return;
                 }
@@ -10168,7 +11288,7 @@ impl KvMetaBackend {
             // window reservation+apply keeps per-key journal-seq order
             // equal to RAM apply order (§4.4 pt 2) across the batch.
             let adm = s.admission.take().expect("admission held until reserve");
-            let res = self.ring.reserve_registered(adm);
+            let res = s.ring.reserve_registered(adm);
             s.reservation = Some(res);
             {
                 let mut seq_cursor = res.start;
@@ -10311,7 +11431,7 @@ impl KvMetaBackend {
             if parts.is_empty() {
                 Ok(None)
             } else {
-                self.ring
+                s.ring
                     .submit_entries_batch(&parts, self.journal_lane().map(Arc::as_ref))
                     .map(Some)
             }
@@ -10325,6 +11445,8 @@ impl KvMetaBackend {
         let entries = std::mem::take(&mut s.entries);
         s.applied_unrolled = false;
         s.window = Some(ConveyorWindow {
+            ring: Arc::clone(&s.ring),
+            region: s.region,
             entries,
             failed,
             res,
@@ -10390,15 +11512,16 @@ impl KvMetaBackend {
         // (an unwritten / failed range still completes — an abandoned
         // hole), in journal order so `completed_upto` walks forward.
         for w in s.windows.iter_mut() {
-            self.ring.complete(&w.res);
+            w.ring.complete(&w.res);
             w.res_open = false;
         }
 
         // (9) Per window, in order: the success arm or the rollback arm.
         // `hole_end` accumulates the furthest position replay's chain walk
         // must start past before any survivor in the group is acked.
-        let group_end = s.windows.last().expect("head").res.end();
-        let mut hole_end: Option<u64> = None;
+        // Apply-holes per REGION: a hole's end is a position in its own
+        // ring, so the covering checkpoint is that region's.
+        let mut hole_end: Vec<(u32, u64)> = Vec::new();
         let mut any_ok = false;
         // Per-window verdict feeding the outcomes: `Ok(())` = ack pending
         // the group barrier; `Err(msg)` = every survivor fails with `msg`.
@@ -10408,8 +11531,19 @@ impl KvMetaBackend {
         if write_outs.iter().any(|o| o.is_ok()) {
             // One completed-prefix wait covers every member of the group
             // (their entries all end at-or-before the group end; chain-
-            // reachability per the K3 barrier observation).
-            self.ring.wait_completed_upto(group_end).await;
+            // reachability per the K3 barrier observation) — per RING when
+            // the group spans appender regions (each ring has its own
+            // completed prefix; positions are not comparable across rings).
+            let mut waited: Vec<(Arc<JournalRing>, u64)> = Vec::new();
+            for w in &s.windows {
+                match waited.iter_mut().find(|(r, _)| Arc::ptr_eq(r, &w.ring)) {
+                    Some((_, end)) => *end = (*end).max(w.res.end()),
+                    None => waited.push((Arc::clone(&w.ring), w.res.end())),
+                }
+            }
+            for (ring, end) in waited {
+                ring.wait_completed_upto(end).await;
+            }
         }
         meta_txpass_phase_record(
             MetaTxPassPhase::JournalPrefixWait,
@@ -10421,7 +11555,10 @@ impl KvMetaBackend {
                 Ok(()) => {
                     self.journal_failures.store(0, Ordering::Release);
                     if !w.failed.is_empty() {
-                        hole_end = Some(hole_end.map_or(w.res.end(), |h| h.max(w.res.end())));
+                        match hole_end.iter_mut().find(|(r, _)| *r == w.region) {
+                            Some((_, h)) => *h = (*h).max(w.res.end()),
+                            None => hole_end.push((w.region, w.res.end())),
+                        }
                     }
                     any_ok = true;
                     verdicts.push(Ok(()));
@@ -10450,7 +11587,7 @@ impl KvMetaBackend {
                     // ring (§4.1 discovery loses same-page successors of a
                     // dead chain): checkpoint past it — zero ring bytes by
                     // the §4.4 pt 5 progress theorem.
-                    if let Err(ck) = self.checkpoint_past(w.res.end()).await {
+                    if let Err(ck) = self.checkpoint_past_region(w.region, w.res.end()).await {
                         log::error!(
                             "meta volume {}: post-failure checkpoint could not drain the \
                              journal hole: {ck} (volume escalating)",
@@ -10467,8 +11604,8 @@ impl KvMetaBackend {
         // reachability of what is about to be acked (§4.4 pt 4's hole
         // discipline, applied window-mid). One cycle covers the furthest.
         let mut hole_err: Option<String> = None;
-        if let Some(end) = hole_end {
-            if let Err(ck) = self.checkpoint_past(end).await {
+        for (region, end) in hole_end {
+            if let Err(ck) = self.checkpoint_past_region(region, end).await {
                 log::error!(
                     "meta volume {}: post-isolation checkpoint could not cover the batch \
                      hole: {ck} (volume escalating; failing the survivors loud rather than \
@@ -10580,7 +11717,7 @@ impl KvMetaBackend {
             Ok(Some(inflight)) => {
                 let t_sub = inflight.submitted_at;
                 w.submitted_at = Some(t_sub);
-                let out = inflight.finish(&self.ring, &w.traced).await;
+                let out = inflight.finish(&w.ring, &w.traced).await;
                 if out.is_ok() {
                     meta_txpass_phase_record_span(
                         MetaTxPassPhase::JournalRingWrite,
@@ -10603,17 +11740,22 @@ impl KvMetaBackend {
     /// unchanged and pinned by the M4 watchdog suite).
     async fn admit_user_budget(
         &self,
+        ring: &JournalRing,
+        region: u32,
         len: u64,
     ) -> std::result::Result<super::journal_core::Admission, KvError> {
         let threshold = self.timeout_threshold;
         let mut parked_since: Option<std::time::Instant> = None;
         loop {
-            if let Some(adm) = self.ring.try_admit(len, AdmissionClass::User) {
+            if let Some(adm) = ring.try_admit(len, AdmissionClass::User) {
                 return Ok(adm);
             }
             self.stalls.fetch_add(1, Ordering::Relaxed);
-            let notified = self.ring_space_notified();
-            if let Some(adm) = self.ring.try_admit(len, AdmissionClass::User) {
+            if let Some(r) = self.appenders.as_ref().and_then(|a| a.region(region)) {
+                r.stalls.fetch_add(1, Ordering::Relaxed);
+            }
+            let notified = ring.space_notified();
+            if let Some(adm) = ring.try_admit(len, AdmissionClass::User) {
                 return Ok(adm);
             }
             // Re-check liveness flags after each park so shutdown/failure
@@ -10953,13 +12095,6 @@ impl KvMetaBackend {
     /// `eio` over an owned message (the batch paths format contexts).
     fn eio_str(&self, what: &str) -> KvError {
         KvError::Io(self.eio(what))
-    }
-
-    /// A notified-future handle on the ring's space notify (private
-    /// helper so the admission loop can use the register-recheck-await
-    /// pattern without exposing the Notify).
-    fn ring_space_notified(&self) -> impl std::future::Future<Output = ()> + '_ {
-        self.ring.space_notified()
     }
 
     /// **The §4.4 pt 4 seq-conditional rollback.** The locks were

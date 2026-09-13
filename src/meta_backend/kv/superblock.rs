@@ -885,13 +885,6 @@ impl SuperblockV3 {
         img[OFF_UUID..OFF_UUID + 16].copy_from_slice(&self.uuid);
         img[OFF_HASH_SEED..OFF_HASH_SEED + 8].copy_from_slice(&self.hash_seed.to_le_bytes());
         if self.appender_dir.len != 0 || self.appender_dir.start != 0 {
-            if !self.symmetric_forest_stamped() {
-                return Err(KvError::Corrupt(
-                    "superblock names an appender directory without incompat bit 17 — a \
-                     bit-17-absent volume's sector 0 is the shipped image byte for byte"
-                        .to_string(),
-                ));
-            }
             img[OFF_APPENDER_DIR..OFF_APPENDER_DIR + 8]
                 .copy_from_slice(&self.appender_dir.start.to_le_bytes());
             img[OFF_APPENDER_DIR + 8..OFF_APPENDER_DIR + 16]
@@ -966,15 +959,6 @@ impl SuperblockV3 {
             ),
             appender_dir: ext_at(OFF_APPENDER_DIR),
         };
-        if (sb.appender_dir.len != 0 || sb.appender_dir.start != 0)
-            && !sb.symmetric_forest_stamped()
-        {
-            return Err(KvError::Corrupt(
-                "v3 superblock names an appender directory but carries no incompat bit 17 — \
-                 the directory is part of bit 17's meaning (design-symmetric-metadata §7.1)"
-                    .to_string(),
-            ));
-        }
         // Feature gate (§6.1): the KV_V3 bit must be present; unknown
         // incompat bits refuse the mount naming the bits. Unknown ro bits
         // pass — their read-only semantics belong to callers with a write
@@ -1017,6 +1001,19 @@ impl SuperblockV3 {
                  ({unknown:#x}) — upgrade squeezefs to mount this volume",
                 bits.join(", ")
             )));
+        }
+        // The appender directory is PART of bit 17's meaning (design-
+        // symmetric-metadata §7.1): a named directory on a bit-17-absent
+        // sector is not the shipped image and refuses — after the feature
+        // gates, whose refusals are the more specific answer.
+        if (sb.appender_dir.len != 0 || sb.appender_dir.start != 0)
+            && !sb.symmetric_forest_stamped()
+        {
+            return Err(KvError::Corrupt(
+                "v3 superblock names an appender directory but carries no incompat bit 17 — \
+                 the directory is part of bit 17's meaning (design-symmetric-metadata §7.1)"
+                    .to_string(),
+            ));
         }
         sb.validate_geometry()?;
         Ok(sb)

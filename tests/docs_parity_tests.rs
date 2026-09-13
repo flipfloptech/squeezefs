@@ -105,7 +105,7 @@ fn accepts_word(kind: Kind) -> &'static str {
     match kind {
         Kind::Bool => "bool",
         Kind::Int { .. } => "int",
-        Kind::Enum(_) => "enum",
+        Kind::Enum { .. } => "enum",
         Kind::Str => "string",
         Kind::Retired { .. } => "retired",
         Kind::BuildTime => "build-time",
@@ -116,9 +116,11 @@ fn accepts_word(kind: Kind) -> &'static str {
 fn accepts_matches(kind: Kind, cell: &str) -> bool {
     match kind {
         Kind::Int { .. } => cell.starts_with("int "),
-        Kind::Enum(words) => {
+        // The Accepts cell lists the ADMISSIBLE words; a retired value is
+        // named in the purpose text, never offered as a choice.
+        Kind::Enum { allowed, .. } => {
             let listed: Vec<&str> = cell.split('/').map(str::trim).collect();
-            listed == words
+            listed == allowed
         }
         other => cell == accepts_word(other),
     }
@@ -147,7 +149,7 @@ fn parse() -> (String, Parsed) {
 fn is_product(kind: Kind) -> bool {
     matches!(
         kind,
-        Kind::Bool | Kind::Int { .. } | Kind::Enum(_) | Kind::Str
+        Kind::Bool | Kind::Int { .. } | Kind::Enum { .. } | Kind::Str
     )
 }
 

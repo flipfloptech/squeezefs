@@ -124,6 +124,18 @@ macro_rules! spdk_reshare_sequence {
 /// → manual spdk_tgt teardown if one still serves → share on nvmet.
 pub const SPDK_RESHARE_SEQUENCE: &str = spdk_reshare_sequence!();
 
+/// The ENG-10 startup gate's text for `SQUEEZEFS_NVMEOF_TARGET_STACK=spdk`
+/// (the knob's RETIRED value — `env_knobs`): the same retirement + sequence
+/// every other SPDK-shaped surface carries, so the env spelling is not the
+/// one refusal that says only "expected one of nvmet".
+pub const SPDK_RETIRED_KNOB_VALUE_NOTE: &str = concat!(
+    "SPDK was RETIRED as an NVMe-oF target (owner ruling R-SYM-8, 2026-09-12 — ",
+    "docs/design-symmetric-metadata.md §5.8.1); the kernel nvmet target is THE target — set ",
+    "nvmet or unset the knob (nvmet is the default). An SPDK share still in the ledger is ",
+    "listed by `nvmeof list` for the ",
+    spdk_reshare_sequence!()
+);
+
 /// The forward-only R-SYM-8 refusal: `what` names the surface that asked
 /// for SPDK (a flag, an env value, a verb arm).
 pub fn spdk_retired_refusal(what: &str) -> NvmeofError {
@@ -426,11 +438,39 @@ pub fn share(opts: &ShareOptions) -> Result<ShareRecord, NvmeofError> {
     Ok(record)
 }
 
+/// The state-dir subtree the retired SPDK stack kept beside the ledger
+/// (`ptpl/<uuid>.json`, `tgt-config.json`, `hugepages-prior`) — named to the
+/// operator by `unshare` and `list`, never touched by the binary (its
+/// hugepage record is the operator's undo value for the reservation the
+/// retired `target setup` made).
+pub const SPDK_STATE_SUBDIR: &str = "spdk";
+
+/// Where a retired SPDK record's residue lives: the SPDK state subtree
+/// plus the record's own `ptpl_file` when it recorded one.
+pub fn spdk_residue_note(ledger: &Ledger, record: &ShareRecord) -> String {
+    let dir = ledger.state_dir().join(SPDK_STATE_SUBDIR);
+    match &record.ptpl_file {
+        Some(ptpl) => format!(
+            "state-dir residue the retired stack left: {} (this record's reservation file: \
+             {}; also tgt-config.json and the hugepages-prior record) — remove the whole \
+             directory once every SPDK record is gone",
+            dir.display(),
+            ledger.state_dir().join(ptpl).display()
+        ),
+        None => format!(
+            "state-dir residue the retired stack left: {} (tgt-config.json, the hugepages-prior \
+             record) — remove the whole directory once every SPDK record is gone",
+            dir.display()
+        ),
+    }
+}
+
 /// Step 1 of the re-share sequence for a record the RETIRED SPDK stack
 /// wrote: `removing` → delete on the ledger ONLY (§6.4 law 6 ordering
 /// kept) — no spdk_tgt is driven, no target object is touched. Returns
-/// the operator note naming the manual teardown and the nvmet re-share.
-/// Refuses any other stack's record (those ride their stack's unshare).
+/// the operator note naming the manual teardown, the state-dir residue and
+/// the nvmet re-share. Refuses any other stack's record (those ride their
+/// stack's unshare).
 pub fn retire_spdk_share(ledger: &Ledger, record: &ShareRecord) -> Result<String, NvmeofError> {
     if record.stack != StackKind::Spdk {
         return Err(NvmeofError::Refused(format!(
@@ -448,9 +488,21 @@ pub fn retire_spdk_share(ledger: &Ledger, record: &ShareRecord) -> Result<String
         "removed the share ledger record for '{}' (recorded on the RETIRED SPDK target stack — \
          R-SYM-8): the ledger entry ONLY was removed; SqueezeFS drives no spdk_tgt anymore, so \
          the target object was NOT torn down.\n  {SPDK_RESHARE_SEQUENCE}\n  (this was step 1; \
-         backing '{}' is released for the nvmet share)",
-        record.subnqn, record.backing_path
+         backing '{}' is released for the nvmet share)\n  {}",
+        record.subnqn,
+        record.backing_path,
+        spdk_residue_note(ledger, record)
     ))
+}
+
+/// What `unshare` did — the caller's success line depends on it: only a
+/// torn-down share "stopped sharing"; a retired-SPDK record was removed
+/// from the ledger while whatever served it is untouched (step 1 of the
+/// re-share sequence, the note says so).
+#[derive(Debug)]
+pub enum UnshareOutcome {
+    TornDown,
+    LedgerOnlyRetired(String),
 }
 
 /// The `nvmeof unshare` verb (§6.2): stack resolved from the ledger —
@@ -459,21 +511,20 @@ pub fn retire_spdk_share(ledger: &Ledger, record: &ShareRecord) -> Result<String
 /// ledger refuses loud with `list` guidance (we never tear down objects
 /// we did not record — the dev_substrate ownership law). A record the
 /// retired SPDK stack wrote is removed ledger-only ([`retire_spdk_share`]).
-pub fn unshare(subnqn: &str) -> Result<(), NvmeofError> {
+pub fn unshare(subnqn: &str) -> Result<UnshareOutcome, NvmeofError> {
     check_root()?;
     retire_old_registry_once();
     let ledger = Ledger::open_default();
     match ledger.find(subnqn).map_err(NvmeofError::Io)? {
         Some(record) if record.stack == StackKind::Spdk => {
             let note = retire_spdk_share(&ledger, &record)?;
-            println!("{note}");
-            Ok(())
+            Ok(UnshareOutcome::LedgerOnlyRetired(note))
         }
         Some(record) => {
             let stack = nvmet_stack()?;
             stack.preflight(PreflightOp::Unshare)?;
             stack.unshare(&record)?;
-            Ok(())
+            Ok(UnshareOutcome::TornDown)
         }
         None => Err(NvmeofError::Refused(format!(
             "subsystem '{subnqn}' is not in the share ledger — SqueezeFS never tears down \
@@ -537,12 +588,40 @@ pub fn partition_restorable(records: Vec<ShareRecord>) -> (Vec<ShareRecord>, Vec
     (replay, skipped)
 }
 
+/// `restore`'s exit verdict over the per-share report: a nvmet failure
+/// fails it, and so does a retired SPDK record still in the ledger — a
+/// share the ledger records and this binary cannot serve is a FAILED
+/// restore for that share, so the nvmet oneshot unit (and `target start`)
+/// fail LOUD until step 1 of the re-share sequence has run, never green
+/// over an unserved share.
+pub fn restore_outcome(
+    replayed: usize,
+    failures: usize,
+    retired: usize,
+) -> Result<(), NvmeofError> {
+    if failures > 0 {
+        return Err(NvmeofError::Refused(format!(
+            "{failures} of {replayed} replayed ledger share(s) failed to restore — see the \
+             per-share report above"
+        )));
+    }
+    if retired > 0 {
+        return Err(NvmeofError::Refused(format!(
+            "{retired} ledger share(s) recorded on the RETIRED SPDK target stack (R-SYM-8) were \
+             NOT re-presented — this binary drives no spdk_tgt, so the share is unserved until \
+             it is re-shared on nvmet; the restore stays FAILED (and the oneshot unit red) until \
+             step 1 removes the record.\n  {SPDK_RESHARE_SEQUENCE}"
+        )));
+    }
+    Ok(())
+}
+
 /// The `nvmeof restore` verb (§6.2): replays EVERY nvmet ledger record
 /// (`--target-stack nvmet` is the only admissible filter — the retired
 /// `spdk` refuses); reconciles §6.4 law-6 intents; per-share report;
 /// idempotent. Records the retired SPDK stack wrote are reported as
-/// skipped with the re-share sequence and never re-presented. Exits
-/// nonzero when any record failed.
+/// skipped with the re-share sequence and never re-presented — and fail
+/// the verdict ([`restore_outcome`]) until the operator removes them.
 pub fn restore(filter: Option<StackKind>) -> Result<(), NvmeofError> {
     resolve_stack(filter)?;
     check_root()?;
@@ -561,18 +640,13 @@ pub fn restore(filter: Option<StackKind>) -> Result<(), NvmeofError> {
         replayed += n;
         failures += f;
     }
+    let retired = skipped.len();
     print_restore_report(&stack::RestoreReport { entries: skipped });
 
     if replayed == 0 && total == 0 {
         println!("No NVMe-oF target shares to restore.");
     }
-    if failures > 0 {
-        return Err(NvmeofError::Refused(format!(
-            "{failures} of {replayed} replayed ledger share(s) failed to restore — see the \
-             per-share report above"
-        )));
-    }
-    Ok(())
+    restore_outcome(replayed, failures, retired)
 }
 
 // ---------------------------------------------------------------------------
@@ -872,18 +946,29 @@ pub fn adopt_candidate(
             .iter()
             .find(|r| r.backing_canonical == holder.backing_canonical)
         {
+            let remediation = match rec.stack {
+                StackKind::Spdk => format!(
+                    "that record was written by the RETIRED SPDK stack (R-SYM-8) — `nvmeof \
+                     restore` never reconciles it; `nvmeof unshare {}` removes it (ledger-only) \
+                     and releases the backing, then `nvmeof share --target-stack nvmet` \
+                     re-shares it; never adopt",
+                    rec.subnqn
+                ),
+                StackKind::Nvmet => format!(
+                    "`nvmeof restore` reconciles that record, `nvmeof unshare {}` removes it",
+                    rec.subnqn
+                ),
+            };
             return Err(adopt_refusal(
                 "adopt_already_ledgered",
                 subnqn,
                 format!(
                     "its backing '{}' is already recorded under subsystem '{}' (stack {}, \
-                     state {}) — the same backing must never be double-served; `nvmeof \
-                     restore` reconciles that record, `nvmeof unshare {}` removes it",
+                     state {}) — the same backing must never be double-served; {remediation}",
                     holder.backing_canonical,
                     rec.subnqn,
                     rec.stack.as_str(),
                     rec.state.as_str(),
-                    rec.subnqn
                 ),
             ));
         }
@@ -1073,19 +1158,22 @@ pub fn adopt_verify_unchanged(
 }
 
 /// The adopt flow over an explicit stack + ledger (the §6.8 injection
-/// seam: the unit tier drives an injected configfs root through exactly
-/// this production path). Probe → classify (`adopt_candidate`) → absorb
-/// via the intent protocol (§6.4 law 6: `begin_share(pending)` → TOCTOU
-/// re-verify → `finalize_share(active)`). **Mutates no target state** on
-/// any path — drift aborts delete only the pending ledger record.
+/// seam: the unit tier drives an injected configfs root — or a scripted
+/// `TargetStack` whose second probe drifts — through exactly this
+/// production path; `live_shares` is the only stack verb it calls).
+/// Probe → classify (`adopt_candidate`) → absorb via the intent protocol
+/// (§6.4 law 6: `begin_share(pending)` → TOCTOU re-verify →
+/// `finalize_share(active)`). **Mutates no target state** on any path —
+/// drift (or a failed re-probe) aborts and deletes only the pending ledger
+/// record.
 pub fn adopt_over(
     subnqn: &str,
     ledger: &Ledger,
-    nvmet_stack: &nvmet::NvmetStack,
+    stack: &dyn TargetStack,
 ) -> Result<ShareRecord, NvmeofError> {
     // The walk is strict: a present-but-unreadable tree stays loud; an
     // absent tree walks empty.
-    let live = nvmet_stack.live_shares()?;
+    let live = stack.live_shares()?;
     let (candidate, notes) = adopt_candidate(subnqn, &live, ledger)?;
     for note in &notes {
         println!("note: {note}");
@@ -1100,7 +1188,7 @@ pub fn adopt_over(
     // live-observable field. Any failure here aborts loud and
     // garbage-collects the pending intent adopt itself just wrote —
     // target state is untouched on every path.
-    let verified = nvmet_stack.live_shares().and_then(|live_now| {
+    let verified = stack.live_shares().and_then(|live_now| {
         adopt_verify_unchanged(&candidate, &live_now).map_err(|why| {
             NvmeofError::Refused(format!(
                 "adopt of '{subnqn}' aborted: live state changed between classification and \
@@ -1160,8 +1248,7 @@ pub fn adopt(subnqn: &str, flag: Option<StackKind>) -> Result<ShareRecord, Nvmeo
     check_root()?;
     retire_old_registry_once();
     let ledger = Ledger::open_default();
-    let nvmet_stack = nvmet::NvmetStack::open_default().map_err(NvmeofError::Io)?;
-    adopt_over(subnqn, &ledger, &nvmet_stack)
+    adopt_over(subnqn, &ledger, &nvmet_stack()?)
 }
 
 /// The `list` classification of a record the RETIRED SPDK stack wrote:
@@ -1201,7 +1288,7 @@ pub fn list(json: bool) -> Result<(), NvmeofError> {
     let ledger = Ledger::open_default();
     let records = ledger.load().map_err(NvmeofError::Io)?;
 
-    let nvmet_stack = nvmet::NvmetStack::open_default()?;
+    let nvmet_stack = nvmet_stack()?;
     nvmet_stack.preflight(PreflightOp::List)?;
     let nvmet_live = nvmet_stack.live_shares()?;
 
@@ -1228,6 +1315,12 @@ pub fn list(json: bool) -> Result<(), NvmeofError> {
                         serde_json::Value::String(classification_of(r, is_live).to_string()),
                     );
                     obj.insert("live".to_string(), serde_json::Value::Bool(is_live));
+                    if r.stack == StackKind::Spdk {
+                        obj.insert(
+                            "retired_residue".to_string(),
+                            serde_json::Value::String(spdk_residue_note(&ledger, r)),
+                        );
+                    }
                 }
                 v
             })
@@ -1315,6 +1408,9 @@ pub fn list(json: bool) -> Result<(), NvmeofError> {
             "  State:          {}",
             classification_of(record, live_entry.is_some())
         );
+        if record.stack == StackKind::Spdk {
+            println!("  Residue:        {}", spdk_residue_note(&ledger, record));
+        }
         println!();
     }
 

@@ -69,18 +69,18 @@ sweep's `available_parallelism` reader census dropped
 (the design row's `docker/` item was already vacuous — the pin lived in
 `lifecycle.rs`).
 
-## 3. The refusal surface (forward-only; every one pinned in `tests/nvmeof_retire_spdk_tests.rs`, 18 tests)
+## 3. The refusal surface (forward-only; every one pinned in `tests/nvmeof_retire_spdk_tests.rs`, 19 tests)
 
 | Surface | Behaviour |
 |---|---|
 | `"spdk".parse::<StackKind>()` | `Err` naming the retirement + nvmet + the re-share sequence. `StackKind::Spdk` survives ONLY as this parse-and-refuse arm and as the ledger's serde decoder — no execution path constructs a stack for it (`nvmet_stack()` is the one constructor). |
 | `--target-stack spdk` (share / restore / adopt / target setup / start / stop / status / systemd-unit) | `resolve_stack` refuses at the grammar rung, BEFORE root, with `spdk_retired_refusal(...)`: names R-SYM-8, nvmet, `SPDK_RESHARE_SEQUENCE`. The clap variant is declared hidden (`#[value(hide = true)]`, the `--meta-slots` precedent) so the refusal is ours, not clap's `invalid value`. |
-| `SQUEEZEFS_NVMEOF_TARGET_STACK=spdk` | The registry knob is `Kind::Enum(&["nvmet"])`, default `nvmet`: the ENG-10 startup gate refuses naming the knob, the value and `nvmet`; the in-process `resolve_stack` parse gives the full retirement text. |
+| `SQUEEZEFS_NVMEOF_TARGET_STACK=spdk` | The registry knob is `Kind::Enum { allowed: ["nvmet"], retired: [("spdk", SPDK_RETIRED_KNOB_VALUE_NOTE)] }`, default `nvmet`: `Kind::Enum` gained a **retired-values arm** (review issue 1 — the `Kind::Retired` law applied to one value of a live knob; `env_knob_convention_tests::retired_enum_values_refuse_naming_the_successor` pins it generically), so the ENG-10 startup gate refuses `spdk`/`SPDK` with `was RETIRED … the kernel nvmet target is THE target … re-share on nvmet: 1./2./3.` — the same text every other SPDK-shaped surface carries — while an unknown word (`banana`) keeps the generic `expected one of nvmet`. The in-process `resolve_stack` parse gives the same retirement text. |
 | `SQUEEZEFS_SPDK_TGT_BIN`, `SQUEEZEFS_NVMEOF_RUN_DIR` | `Kind::Retired { successor: "(deleted — SPDK was retired …)" }` — refuse at startup naming the retirement and nvmet; listed in the operations.md law-6 retiree table (docs-parity pinned). The generic retired-knob message lost its "(ENG-10 knob-namespace collision)" parenthetical, which was already false for `SQUEEZEFS_FUSE_PLACED_MERGE`. |
 | `nvmeof target install [--version] [--with-pkgdep]` | Retired verb under the `removed_verb()` convention: hidden from help, its flags kept declared (hidden) so `install --version v26.05 --with-pkgdep` still reaches OUR refusal ("was removed … Superseded by `target setup` / `target start`"), before root. |
 | the deleted SPDK-only flags | die on clap's `unexpected argument` — loud, never a silent accept (pinned for all eleven spellings). |
 | `nvmeof target stop` | refuses on the ONE target ("not a process" — tear shares down with `unshare`); `--target-stack spdk` there refuses with the retirement first. |
-| an SPDK share in the ledger | `classification_of` → `SPDK_RETIRED_CLASSIFICATION` (never `managed`, never a restore candidate) — `nvmeof list` shows it with the sequence; `partition_restorable` routes it to `RestoreOutcome::Skipped(<sequence>)` and only nvmet records replay; `unshare` → `retire_spdk_share` = `mark_removing` → `delete` on the ledger ONLY (law-6 order kept; nothing SPDK is driven; the note names the manual `rpc.py` teardown); `adopt_candidate` on its NQN → `adopt_already_ledgered` naming the sequence; `begin_share` of the same backing on nvmet → `AlreadyExists` naming `unshare <spdk-nqn>` until the record is gone (the ledger's duplicate-backing guard IS the sequence's step-1 enforcement). `adopt` can only ever mint `StackKind::Nvmet` candidates. |
+| an SPDK share in the ledger | `classification_of` → `SPDK_RETIRED_CLASSIFICATION` (never `managed`, never a restore candidate) — `nvmeof list` shows it with the sequence AND a `Residue:` line (`spdk_residue_note`: `<state>/spdk/` + the record's `ptpl_file`; JSON `retired_residue`); `partition_restorable` routes it to `RestoreOutcome::Skipped(<sequence>)` and only nvmet records replay — and **`restore_outcome` fails the restore while any retired record remains** (the exit-code decision, §3a); `unshare` → `retire_spdk_share` = `mark_removing` → `delete` on the ledger ONLY (law-6 order kept; nothing SPDK is driven; the note names the manual `rpc.py` teardown and the residue path) and returns `UnshareOutcome::LedgerOnlyRetired(note)` so the CLI prints "Removed the share ledger record … nothing stopped sharing" instead of the torn-down arm's "Successfully stopped sharing" (review issue 4); `adopt_candidate` on its NQN OR its backing → `adopt_already_ledgered` naming the sequence (the backing arm no longer claims `restore` reconciles it — review issue 8); `begin_share` of the same backing on nvmet → `AlreadyExists` naming `unshare <spdk-nqn>` until the record is gone (the ledger's duplicate-backing guard IS the sequence's step-1 enforcement). `adopt` can only ever mint `StackKind::Nvmet` candidates. |
 
 **The re-share sequence** (`nvmeof::SPDK_RESHARE_SEQUENCE`, spelled once
 via a `macro_rules!` so the `list` classification `&'static str` composes
@@ -90,6 +90,21 @@ subsystem, tear it down yourself (`rpc.py nvmf_delete_subsystem`,
 `rpc.py bdev_aio_delete`) — SqueezeFS speaks no SPDK RPC anymore; (3)
 `sudo squeezefs nvmeof share <backing> --ip <ip> --target-stack nvmet`
 (nvmet is the default; re-use `--ns-uuid` to keep the namespace identity).
+
+### 3a. The `restore` exit-code decision (review issue 9b)
+
+`RestoreOutcome::Skipped` pre-dated this PR as a non-failure (the N2/N3
+interim "SPDK restore not yet live" milestone). Keeping that semantics
+would let the nvmet oneshot unit report success while a ledgered share is
+unserved. Decision: **a retired SPDK record left in the ledger FAILS the
+restore** — `restore_outcome(replayed, failures, retired)` (pure, pinned by
+`restore_exits_nonzero_while_a_retired_spdk_record_remains`) returns
+`Refused` naming the count and the sequence, so `nvmeof restore`, `target
+start` and the oneshot unit exit nonzero until step 1 has run for every
+SPDK share. The forward-only reading: the operator owes a re-share; a red
+unit is the honest state, and the record's removal (step 1) is exactly what
+turns it green. nvmet records still replay first in the same invocation, so
+the nvmet shares are served even while the unit reports the SPDK debt.
 
 Interpretation note: the design row says "`nvmeof status` lists the ledger's
 SPDK shares". There is no `nvmeof status` verb; the ledger listing verb is
@@ -139,16 +154,20 @@ override).
 ## 6. Owed
 
 - **The root-run of the fidelity tier on nvmet alone** — `sudo tests/run_nvmeof_fidelity.sh quick` (and `full` for the nightly row) on a box with root + the zram/nvmet-tcp substrate. This session had neither; the three scripts are `bash -n` clean and the exec-bit test is green, but the design row's closing evidence ("the fidelity tier's quick + full run green on nvmet alone") is the orchestrator's to record here, with the nvmet-only durations replacing the dual-stack 2m20s / 5m46s in the AGENTS.md tier table.
-- The in-process TOCTOU-drift end-to-end test for `adopt_over` was dropped with its only seam (the fake `spdk_tgt`'s `flip_uuid_after_gets` hook). The drift detector itself stays pinned by `test_adopt_verify_unchanged_detects_drift`; the abort-and-GC branch of `adopt_over` is a five-line path with no in-process seam on configfs. If one is wanted, a `NvmetStack` injection seam that re-reads a mutable snapshot would be the shape — not built here (scope).
+- ~~The in-process TOCTOU-drift end-to-end test for `adopt_over`~~ — **landed on review** (issue 2): `adopt_over` takes `&dyn TargetStack` (its one stack verb is `live_shares`), and `tests/nvmeof_adopt_tests.rs` drives it with a two-snapshot `ScriptedStack` (every mutating verb panics — the zero-mutation witness): identity drift, a vanished object and a failing re-probe each abort loud and garbage-collect the pending intent; exactly two probes spent.
+
+## 6a. Review fixes folded in (2026-09-13, the PR 16 review's 11 issues)
+
+1. retired-values arm on `Kind::Enum` — the env spelling refuses with the retirement text at the gate (§3); 2. `adopt_over` over the `TargetStack` trait + the three scripted TOCTOU pins (§6); 3. the NoCOW guard's doc + operator string attribute the CoW hazard to direct I/O on the file (the loop device a file-backed nvmet share rides), with SPDK as the historical first sighting only; 4. `UnshareOutcome` — no "Successfully stopped sharing" after a ledger-only removal; 5. the operator upgrade path (old SPDK unit, hugepage undo by hand, `<state>/spdk/` residue, the process-wide retired-knob refusal) in operations.md + RELEASE_NOTES, with `unshare`/`list` printing the residue path; 6. `guard_smoke.sh --stack` validated at the parser (before sudo, before the substrate is read); 7. the adopt grammar test's doc/name; 8. the adopt backing-arm remediation; 9a. the nightly AGENTS row's owed note; 9b. the `restore` exit-code decision (§3a); 10. `nvmet_stack()` is the one constructor site (`adopt`/`list` too); 11. "per-stack" dropped.
 
 ## 7. Gate state at the commit boundary
 
 `cargo fmt --check` clean; `cargo clippy --all-targets --all-features -- -D warnings`
 and `cargo clippy --all-targets -- -D warnings` clean (no new `#[allow]`);
 `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps` clean. Suites run green:
-`nvmeof_retire_spdk_tests` (18), `nvmeof_grammar_tests` (17),
-`nvmeof_adopt_tests` (13), `nvmeof_target_lifecycle_tests` (2),
-`nvmeof_nvmet_stack_tests` (17), `nvmeof_ledger_tests` (19),
+`nvmeof_retire_spdk_tests` (19), `nvmeof_grammar_tests` (17),
+`nvmeof_adopt_tests` (16), `nvmeof_target_lifecycle_tests` (2),
+`nvmeof_nvmet_stack_tests` (15), `nvmeof_ledger_tests` (11),
 `nvmeof_port_alloc_tests`, `nvmeof_initiator_tests`,
 `nvmeof_fabric_stats_tests`, `env_knob_convention_tests`,
 `cli_help_hygiene_tests`, `derivation_sweep_tests`, `cli_version_tests`,

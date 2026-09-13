@@ -25,7 +25,8 @@ stands as history.
   `--dpdk-mem-mb` — a deleted flag dies on clap, never a silent accept).
 - **Refuses loud, naming nvmet and the re-share sequence:**
   `--target-stack spdk`, `SQUEEZEFS_NVMEOF_TARGET_STACK=spdk` (the knob's
-  only admissible value is now `nvmet`, its default), `nvmeof target
+  only admissible value is now `nvmet`, its default; `spdk` is a RETIRED
+  value the startup gate refuses with the same text), `nvmeof target
   install` (SPDK-only by definition — a retired verb naming `target setup`
   / `target start`), and the retired knobs `SQUEEZEFS_SPDK_TGT_BIN` and
   `SQUEEZEFS_NVMEOF_RUN_DIR`. Nothing falls back silently.
@@ -44,6 +45,22 @@ stands as history.
   3. `sudo squeezefs nvmeof share <backing> --ip <ip> [--ns-uuid <uuid>]`
      — nvmet is the default; re-use the old `--ns-uuid` for initiators
      that must reattach under the same namespace identity.
+
+  And the three things a pre-retirement SPDK host has that the sequence
+  does not touch (`docs/operations.md` §NVMe-oF operations has the exact
+  commands): the **old SPDK systemd unit** — its `ExecStartPost … --target-stack
+  spdk` now refuses, so systemd stops `spdk_tgt` at the next boot and the SPDK
+  shares go dark loudly; `systemctl disable --now` it and remove the file
+  (**`nvmeof restore` / `target start` / the nvmet oneshot unit exit nonzero
+  while any SPDK record remains in the ledger** — red until step 1 has run
+  for every SPDK share); the **hugepage reservation** the retired
+  `target setup --hugemem-mb` made — `--restore-prior` is gone, restore
+  `nr_hugepages` by hand from `<state>/spdk/hugepages-prior`; and the
+  **state-dir residue** under `<state>/spdk/` (`unshare` and `list` print its
+  path) — `rm -r` it once every SPDK record is gone. A retired knob
+  (`SQUEEZEFS_SPDK_TGT_BIN`, `SQUEEZEFS_NVMEOF_RUN_DIR`) still exported in a
+  unit's `Environment=` or a shell profile refuses **every** `squeezefs`
+  verb at startup, `mount` included — unset it.
 - **Fidelity tier:** `tests/run_nvmeof_fidelity.sh`,
   `tests/nvmeof_target_substrate.sh` and `tests/guard_smoke.sh` run on
   nvmet alone (the SPDK legs and the PTPL power-cycle leg are gone; the

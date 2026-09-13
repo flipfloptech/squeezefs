@@ -103,6 +103,12 @@ impl Ledger {
         self.state_dir.join(LEDGER_FILE)
     }
 
+    /// The state directory this ledger is rooted at (§6.4 state homes) —
+    /// where the retired SPDK stack's residue is named from.
+    pub fn state_dir(&self) -> &Path {
+        &self.state_dir
+    }
+
     fn lock_path(&self) -> PathBuf {
         self.state_dir.join(LEDGER_LOCK_FILE)
     }

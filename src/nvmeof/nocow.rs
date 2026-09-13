@@ -31,12 +31,16 @@ const FS_IOC_SETFLAGS: libc::c_ulong = 0x4008_6602;
 
 /// Ensure a regular-file backing path is safe to serve as an NVMe-oF target.
 ///
-/// On btrfs, `O_DIRECT` (SPDK's AIO bdev) **silently degrades to buffered
-/// I/O on copy-on-write files**. The single-threaded `nvmf_tgt` reactor then
-/// parks in the kernel dirty-page throttle (`balance_dirty_pages`) under
-/// write load, stops polling the fabric sockets, keepalives blow past their
-/// budget, controllers flap between `live`/`connecting`, and every consumer
-/// of the target wedges in D-state — observed live as "format hangs".
+/// On btrfs, `O_DIRECT` **silently degrades to buffered I/O on
+/// copy-on-write files** — for the kernel nvmet path that is the loop
+/// device the file-backed share rides (`losetup` over the file, direct I/O
+/// requested): every fabric write then lands in the page cache of a CoW
+/// file, the writer parks in the kernel dirty-page throttle
+/// (`balance_dirty_pages`) under load, keepalives blow past their budget,
+/// controllers flap between `live`/`connecting`, and every consumer of the
+/// target wedges in D-state — observed live as "format hangs" (first on the
+/// since-retired SPDK stack's single-threaded reactor, commit `eafab6c`;
+/// the CoW hazard is the file's, not the stack's).
 ///
 /// Policy:
 /// - non-btrfs filesystem: nothing to do.
@@ -76,8 +80,9 @@ pub fn ensure_nocow_backing(path: &Path) -> std::io::Result<()> {
             std::io::ErrorKind::InvalidInput,
             format!(
                 "Backing file '{}' lives on btrfs WITHOUT the NoCOW attribute and already \
-                 carries data. SPDK's O_DIRECT silently degrades to buffered I/O on CoW \
-                 files, which wedges the whole fabric under write load. Recreate it: \
+                 carries data. Direct I/O silently degrades to buffered I/O on CoW files \
+                 (the loop device a file-backed nvmet share rides included), which wedges \
+                 the whole fabric under write load. Recreate it: \
                  `rm {p} && touch {p} && chattr +C {p} && truncate -s <size> {p}` \
                  (or place it on a non-CoW filesystem).",
                 path.display(),

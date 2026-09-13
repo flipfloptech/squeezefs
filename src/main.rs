@@ -3860,10 +3860,19 @@ fn dispatch_nvmeof(action: NvmeofActions) -> Result<(), squeezefs::nvmeof::stack
                 record.subnqn
             );
         }
-        NvmeofActions::Unshare { subnqn } => {
-            squeezefs::nvmeof::unshare(&subnqn)?;
-            println!("Successfully stopped sharing target NQN '{}'.", subnqn);
-        }
+        NvmeofActions::Unshare { subnqn } => match squeezefs::nvmeof::unshare(&subnqn)? {
+            squeezefs::nvmeof::UnshareOutcome::TornDown => {
+                println!("Successfully stopped sharing target NQN '{}'.", subnqn);
+            }
+            squeezefs::nvmeof::UnshareOutcome::LedgerOnlyRetired(note) => {
+                println!("{note}");
+                println!(
+                    "Removed the share ledger record for '{}' (retired SPDK stack — see the \
+                     re-share sequence above); nothing stopped sharing.",
+                    subnqn
+                );
+            }
+        },
         NvmeofActions::List { json } => {
             squeezefs::nvmeof::list(json)?;
         }

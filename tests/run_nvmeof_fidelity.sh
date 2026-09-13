@@ -381,8 +381,9 @@ leg_loudfail() {
     fi
     out=$(SQUEEZEFS_NVMEOF_TARGET_STACK=spdk "$FIDELI_BIN" nvmeof share /dev/null --ip 127.0.0.1 --port 4650 2>&1)
     rc=$?
-    if [ "$rc" -ne 0 ] && echo "$out" | grep -q "SQUEEZEFS_NVMEOF_TARGET_STACK" && echo "$out" | grep -q "nvmet"; then
-        ok "SQUEEZEFS_NVMEOF_TARGET_STACK=spdk refuses at startup naming nvmet"
+    if [ "$rc" -ne 0 ] && echo "$out" | grep -q "SQUEEZEFS_NVMEOF_TARGET_STACK" && echo "$out" | grep -q "RETIRED" &&
+        echo "$out" | grep -q "nvmeof unshare" && echo "$out" | grep -q -- "--target-stack nvmet"; then
+        ok "SQUEEZEFS_NVMEOF_TARGET_STACK=spdk refuses at startup as a RETIRED value naming nvmet + the re-share sequence"
     else
         bad "env spdk refusal: $out"
     fi

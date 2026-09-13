@@ -55,6 +55,19 @@ while [ $# -gt 0 ]; do
     case "$1" in
     --stack)
         ARM="${2:?--stack needs nvmet}"
+        # The grammar rung, before sudo and before any substrate is read
+        # (the binary's own rule for the same refusal).
+        case "$ARM" in
+        nvmet) ;;
+        spdk)
+            echo "--stack spdk: SPDK was RETIRED as an NVMe-oF target (R-SYM-8) — the kernel nvmet target is THE target; run with --stack nvmet (the default)" >&2
+            exit 2
+            ;;
+        *)
+            echo "--stack must be nvmet (the one supported target), got '$ARM'" >&2
+            exit 2
+            ;;
+        esac
         shift 2
         ;;
     --loops)
@@ -89,20 +102,9 @@ fi
 . "$STATE/devices.env"
 SQZ="$FIDELI_BIN"
 
-case "$ARM" in
-nvmet)
-    NQN_META="$NQN_GMETA_NVMET"
-    NQN_DATA="$NQN_GDATA_NVMET"
-    ;;
-spdk)
-    echo "--stack spdk: SPDK was RETIRED as an NVMe-oF target (R-SYM-8) — the kernel nvmet target is THE target; run with --stack nvmet (the default)" >&2
-    exit 2
-    ;;
-*)
-    echo "--stack must be nvmet (the one supported target)" >&2
-    exit 2
-    ;;
-esac
+# ARM was validated at the parser; only the NQN wiring remains.
+NQN_META="$NQN_GMETA_NVMET"
+NQN_DATA="$NQN_GDATA_NVMET"
 
 OUT="$STATE/guard-smoke-$ARM.txt"
 DLOG="$STATE/guard-daemon-$ARM.log"

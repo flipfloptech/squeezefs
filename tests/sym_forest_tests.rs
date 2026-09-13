@@ -43,7 +43,7 @@
 
 use squeezefs::meta_backend::kv::backend::KvMetaBackend;
 use squeezefs::meta_backend::kv::block_map::block_map_key;
-use squeezefs::meta_backend::kv::block_refs::block_ref_key;
+use squeezefs::meta_backend::kv::block_refs::{block_ref_key, BlockRef, BlockRefOp};
 use squeezefs::meta_backend::kv::builder::{
     digest_backend, format_v3_stamped, BuilderConfig, FormatV3Options, ImageBuilder, ROOT_INO,
 };
@@ -58,6 +58,7 @@ use squeezefs::meta_backend::kv::record::{
     NATIVE_FOREST_SLOT, TREE_BLOCK_MAP, TREE_BLOCK_REFS, TREE_CONTROL, TREE_DENTRIES, TREE_ID_MAX,
     TREE_INODES, TREE_SHARED_INDEX, TREE_XATTRS,
 };
+use squeezefs::meta_backend::kv::revalidate::RevalidationPoller;
 use squeezefs::meta_backend::kv::slot_state::{slot_state_key, SlotState};
 use squeezefs::meta_backend::kv::superblock::{
     classify_volume, VolumeFormat, FEATURES_INCOMPAT_KNOWN, FEATURE_INCOMPAT_KV_BLOCK_MAP_TREE,
@@ -65,8 +66,8 @@ use squeezefs::meta_backend::kv::superblock::{
 };
 use squeezefs::meta_backend::kv::tree::RootPtr;
 use squeezefs::meta_backend::{
-    guest_local_ino, open_routed_meta_set, open_volume_for_mount, plan_meta_slot_set, Metadata,
-    MINT_SPREAD,
+    guest_local_ino, open_routed_meta_set, open_routed_meta_set_read_only, open_volume_for_mount,
+    plan_meta_slot_set, plan_meta_slot_set_with_width, Metadata, MINT_SPREAD,
 };
 use std::collections::HashMap;
 use tempfile::NamedTempFile;
@@ -1050,4 +1051,454 @@ async fn a_root_swap_pins_the_floor_until_the_ledger_names_it() {
         head_before
     );
     b.shutdown().await.unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// Review round 1 — the forest ARM's own contracts (every one red against
+// `df4682ff`): block references and block maps on a forest, the refs probe
+// over every slot tree, the top separator at replay, the deferred
+// publication's floor, a guest root swap covered through tree 0, the
+// coherent reader.
+// ---------------------------------------------------------------------------
+
+/// A narrow stamped set — `width` hosted slots per volume, so every rotor
+/// slot fills in a few dozen creates (the heavy-tree pins below).
+async fn stamped_forest_set_width(dir: &std::path::Path, width: u32) -> Vec<String> {
+    let p = dir.join("meta0");
+    std::fs::File::create(&p).unwrap().set_len(VOL_LEN).unwrap();
+    let plan = plan_meta_slot_set_with_width(1, width).expect("derived plan");
+    {
+        let _g = SEAM.lock().await;
+        std::env::set_var("SQUEEZEFS_TEST_STAMP_SYMMETRIC", "1");
+        let r = format_v3_stamped(&p, VOL_LEN, &set_opts(), plan.stamps[0].clone()).await;
+        std::env::remove_var("SQUEEZEFS_TEST_STAMP_SYMMETRIC");
+        r.expect("format stamped forest member");
+    }
+    vec![p.display().to_string()]
+}
+
+/// Issues 1 + 2: a forest volume COMMITS block-reference records for
+/// guest-owned files (the write-side audit reads the legacy key), and the
+/// by-block probes see EVERY slot tree — a block referenced by two files
+/// in two different guest slots counts 2, and the volume scan returns
+/// every reference, whatever slot owns it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn block_references_of_guest_owned_files_commit_and_are_counted_across_slot_trees() {
+    let dir = tempfile::tempdir().unwrap();
+    let uris = stamped_forest_set(dir.path()).await;
+    let routed = open_routed_meta_set(&uris).await.expect("open");
+    let vol = &routed.volumes[0];
+    assert!(vol.block_refs_engaged(), "the default format stamps bit 9");
+    let d = routed
+        .create(ROOT_INO, "data", libc::S_IFDIR | 0o755, 0, 0)
+        .await
+        .unwrap()
+        .ino;
+    // Consecutive mints land in DIFFERENT rotor slots (the mint-spread
+    // law), so these two owners live in two guest slot trees.
+    let mut owners = Vec::new();
+    for i in 0..2 {
+        let g = routed
+            .create(d, &format!("o{i}"), libc::S_IFREG | 0o644, 0, 0)
+            .await
+            .unwrap()
+            .ino;
+        owners.push(routed.route_ino(g).1);
+    }
+    let slot_of = |ino: u64| squeezefs::meta_backend::kv::record::forest_slot_of_ino(ino);
+    assert_ne!(slot_of(owners[0]), slot_of(owners[1]), "two guest slots");
+    assert_ne!(slot_of(owners[0]), NATIVE_FOREST_SLOT);
+    let tag = squeezefs::meta_backend::kv::block_refs::volume_tag("vol-0011223344556677");
+    // Both owners reference block 7; owner 1 also holds block 8.
+    for (i, &owner) in owners.iter().enumerate() {
+        let mut ops = vec![BlockRefOp::taken(BlockRef {
+            vol_tag: tag,
+            block_idx: 7,
+            owner_ino: owner,
+            block_index: 0,
+        })];
+        if i == 1 {
+            ops.push(BlockRefOp::taken(BlockRef {
+                vol_tag: tag,
+                block_idx: 8,
+                owner_ino: owner,
+                block_index: 1,
+            }));
+        }
+        vol.set_layout_and_size(owner, b"layout", 4096 * (i as u64 + 1), &ops)
+            .await
+            .expect("a forest volume commits block-reference records");
+    }
+    assert_eq!(
+        vol.block_ref_count(tag, 7).await.unwrap(),
+        2,
+        "refcount(block) is the population over EVERY slot tree"
+    );
+    assert_eq!(vol.block_ref_count(tag, 8).await.unwrap(), 1);
+    assert_eq!(vol.block_ref_count(tag, 9).await.unwrap(), 0);
+    let mut scanned = vol.block_ref_scan(tag).await.unwrap();
+    scanned.sort_by_key(|r| (r.block_idx, r.owner_ino));
+    assert_eq!(
+        scanned.len(),
+        3,
+        "the volume scan returns every reference of every slot"
+    );
+    assert_eq!(
+        scanned.iter().map(|r| r.block_idx).collect::<Vec<_>>(),
+        vec![7, 7, 8]
+    );
+    // Survives a checkpoint + remount (the refs live in their owners'
+    // slot trees, whose roots ride tree 0).
+    vol.checkpoint_now().await.unwrap();
+    let live = digest_backend(vol).await.unwrap();
+    for v in &routed.volumes {
+        v.shutdown().await.unwrap();
+    }
+    drop(routed);
+    let again = open_routed_meta_set(&uris).await.unwrap();
+    let vol = &again.volumes[0];
+    assert_eq!(vol.block_ref_count(tag, 7).await.unwrap(), 2);
+    assert_eq!(vol.block_ref_scan(tag).await.unwrap().len(), 3);
+    assert_eq!(digest_backend(vol).await.unwrap(), live);
+    for v in &again.volumes {
+        v.shutdown().await.unwrap();
+    }
+}
+
+/// Issue 3: the rightmost leaf of a slot tree of height ≥ 1 journals its
+/// SMO pointer record under `KEY_SPACE_MAX`; replay must route it to the
+/// tree that produced it — never mint a phantom slot from the sentinel's
+/// bytes. The native slot tree is a slot tree for this purpose (its
+/// interior records carry kind 0 like every other's).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_rightmost_leaf_smo_in_the_window_replays_into_its_own_tree_not_a_phantom_slot() {
+    let file = NamedTempFile::new().unwrap();
+    build_image(&file, true).await;
+    let b = open_volume_for_mount(file.path().to_str().unwrap())
+        .await
+        .unwrap();
+    let dir = Metadata::create(b.as_ref(), ROOT_INO, "tall", libc::S_IFDIR | 0o755, 0, 0)
+        .await
+        .unwrap()
+        .ino;
+    let mut inos = Vec::new();
+    let fill = |b: &std::sync::Arc<KvMetaBackend>, dir: u64, lo: u32, hi: u32| async move {
+        let mut out = Vec::new();
+        for i in lo..hi {
+            let f = Metadata::create(
+                b.as_ref(),
+                dir,
+                &format!("t{i:04}"),
+                libc::S_IFREG | 0o644,
+                0,
+                0,
+            )
+            .await
+            .unwrap()
+            .ino;
+            b.setxattr(f, "user.pad", &vec![0x33; 4000]).await.unwrap();
+            out.push(f);
+        }
+        out
+    };
+    // Round 1: past one 64 KiB leaf → the flush pass splits the root
+    // (height 1). Round 2: the new (highest) inos fill the RIGHTMOST leaf,
+    // whose compaction journals a pointer record keyed KEY_SPACE_MAX past
+    // the cycle's `H` — an interior record IN the replay window.
+    inos.extend(fill(&b, dir, 0, 48).await);
+    b.checkpoint_now().await.unwrap();
+    let root_level = b
+        .slot_tree_root_level(NATIVE_FOREST_SLOT)
+        .await
+        .expect("native root");
+    assert!(
+        root_level >= 1,
+        "the churn must have grown an interior (got level {root_level})"
+    );
+    inos.extend(fill(&b, dir, 48, 72).await);
+    b.checkpoint_now().await.unwrap();
+    let live = digest_backend(&b).await.unwrap();
+    assert!(
+        b.journal_ring().core().head() > b.ledger_tail(),
+        "SMO records of the second cycle sit past its tail — the window is not empty"
+    );
+    b.sync_device().await.unwrap();
+    drop(b);
+    let again = open_volume_for_mount(file.path().to_str().unwrap())
+        .await
+        .unwrap();
+    let census = again.forest_census().unwrap();
+    assert_eq!(
+        census.slot_trees, 1,
+        "replay minted a PHANTOM slot tree from the KEY_SPACE_MAX separator"
+    );
+    assert_eq!(digest_backend(&again).await.unwrap(), live);
+    for ino in &inos {
+        assert_eq!(
+            again
+                .getxattr(*ino, "user.pad")
+                .await
+                .unwrap()
+                .map(|v| v.len()),
+            Some(4000)
+        );
+    }
+    again.checkpoint_now().await.unwrap();
+    assert_eq!(
+        again.forest_census().unwrap().control_records,
+        0,
+        "no phantom slot_state was published"
+    );
+    again.shutdown().await.unwrap();
+}
+
+/// Issue 4: when the tree-0 publication is DEFERRED (checkpoint reserve
+/// exhausted), the cycle's ledger record must not let the tail pass the
+/// unpublished roots — a fresh guest tree's records stay in the replay
+/// window until tree 0 names the root. Pinned through the publication
+/// deferral seam: one deferred cycle, crash, every acked record served.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_deferred_root_publication_keeps_the_unpublished_roots_in_the_window() {
+    let dir = tempfile::tempdir().unwrap();
+    let uris = stamped_forest_set_width(dir.path(), 8).await;
+    let routed = open_routed_meta_set(&uris).await.expect("open");
+    let vol = &routed.volumes[0];
+    let d = routed
+        .create(ROOT_INO, "d", libc::S_IFDIR | 0o755, 0, 0)
+        .await
+        .unwrap()
+        .ino;
+    let mut children = Vec::new();
+    for i in 0..16 {
+        let f = routed
+            .create(d, &format!("c{i:02}"), libc::S_IFREG | 0o644, 0, 0)
+            .await
+            .unwrap()
+            .ino;
+        routed.setxattr(f, "user.k", b"v").await.unwrap();
+        children.push(f);
+    }
+    assert!(
+        vol.forest_census().unwrap().slot_trees > 1,
+        "guest trees were minted"
+    );
+    let live = digest_backend(vol).await.unwrap();
+    // The seam: EVERY publication attempt answers JournalReserveExhausted
+    // until cleared (the background tick must not publish behind the
+    // test's back before the crash).
+    squeezefs::meta_backend::kv::backend::TEST_FOREST_PUBLISH_DEFER
+        .store(u32::MAX, std::sync::atomic::Ordering::SeqCst);
+    vol.checkpoint_now()
+        .await
+        .expect("a deferred publication is not an error");
+    assert!(
+        squeezefs::meta_backend::kv::backend::TEST_FOREST_PUBLISH_DEFER
+            .load(std::sync::atomic::Ordering::SeqCst)
+            < u32::MAX,
+        "the seam fired"
+    );
+    assert_eq!(
+        vol.forest_census().unwrap().control_records,
+        0,
+        "nothing was published this cycle"
+    );
+    // Crash-equivalent: barriered, dropped without another checkpoint.
+    vol.sync_device().await.unwrap();
+    drop(routed);
+    squeezefs::meta_backend::kv::backend::TEST_FOREST_PUBLISH_DEFER
+        .store(0, std::sync::atomic::Ordering::SeqCst);
+    let again = open_routed_meta_set(&uris).await.expect("remount");
+    let vol = &again.volumes[0];
+    assert_eq!(
+        digest_backend(vol).await.unwrap(),
+        live,
+        "acked records under unpublished roots were lost across the deferred cycle"
+    );
+    for (i, ino) in children.iter().enumerate() {
+        assert_eq!(
+            again
+                .lookup(d, &format!("c{i:02}"))
+                .await
+                .expect("child resolves")
+                .ino,
+            *ino
+        );
+        assert_eq!(
+            again.getxattr(*ino, "user.k").await.unwrap(),
+            Some(b"v".to_vec())
+        );
+    }
+    for v in &again.volumes {
+        v.shutdown().await.unwrap();
+    }
+}
+
+/// A GUEST root swap is covered through tree 0 (the new mechanism the
+/// native pin cannot reach): every rotor slot's root leaf fills and
+/// compacts/splits; the checkpoint publishes the swapped roots; a remount
+/// reopens each guest at the root tree 0 names and serves everything.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_guest_root_swap_is_covered_through_tree_zero() {
+    let dir = tempfile::tempdir().unwrap();
+    let uris = stamped_forest_set_width(dir.path(), 8).await;
+    let routed = open_routed_meta_set(&uris).await.expect("open");
+    let vol = &routed.volumes[0];
+    let d = routed
+        .create(ROOT_INO, "swap", libc::S_IFDIR | 0o755, 0, 0)
+        .await
+        .unwrap()
+        .ino;
+    // 8 rotor slots × 15 files × 4 KB xattrs: every guest root leaf's
+    // log fills past one 64 KiB node.
+    let mut inos = Vec::new();
+    for i in 0..120u32 {
+        let f = routed
+            .create(d, &format!("g{i:03}"), libc::S_IFREG | 0o644, 0, 0)
+            .await
+            .unwrap()
+            .ino;
+        routed
+            .setxattr(f, "user.pad", &vec![0x44; 4000])
+            .await
+            .unwrap();
+        inos.push(f);
+    }
+    let before: Vec<(u32, RootPtr)> = vol.forest_roots();
+    vol.checkpoint_now().await.unwrap();
+    let after: Vec<(u32, RootPtr)> = vol.forest_roots();
+    let swapped = before
+        .iter()
+        .zip(&after)
+        .filter(|((s0, r0), (s1, r1))| s0 == s1 && s0 != &NATIVE_FOREST_SLOT && r0 != r1)
+        .count();
+    assert!(
+        swapped >= 1,
+        "at least one guest root swapped under the churn"
+    );
+    let census = vol.forest_census().unwrap();
+    assert_eq!(census.control_records, census.slot_trees - 1);
+    let live = digest_backend(vol).await.unwrap();
+    for v in &routed.volumes {
+        v.shutdown().await.unwrap();
+    }
+    drop(routed);
+    let again = open_routed_meta_set(&uris).await.unwrap();
+    let vol = &again.volumes[0];
+    assert_eq!(
+        vol.forest_roots(),
+        after,
+        "every guest reopened at the root tree 0 names"
+    );
+    assert_eq!(digest_backend(vol).await.unwrap(), live);
+    for ino in &inos {
+        assert_eq!(
+            again
+                .getxattr(*ino, "user.pad")
+                .await
+                .unwrap()
+                .map(|v| v.len()),
+            Some(4000)
+        );
+    }
+    for v in &again.volumes {
+        v.shutdown().await.unwrap();
+    }
+}
+
+/// Issue 6: a coherent reader (`-o ro`) of a forest set resolves a guest
+/// ino created AFTER its mount — its poll adopts tree 0's root, re-reads
+/// the slot roots tree 0 names and opens the guests it did not know; it
+/// never re-roots a guest at the native root.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_live_reader_of_a_forest_resolves_guests_minted_after_its_mount() {
+    let dir = tempfile::tempdir().unwrap();
+    let uris = stamped_forest_set(dir.path()).await;
+    let writer = open_routed_meta_set(&uris).await.expect("writer");
+    // A first guest exists BEFORE the reader mounts (its root moves later).
+    let d = writer
+        .create(ROOT_INO, "shared", libc::S_IFDIR | 0o755, 0, 0)
+        .await
+        .unwrap()
+        .ino;
+    let early = writer
+        .create(d, "early", libc::S_IFREG | 0o644, 0, 0)
+        .await
+        .unwrap()
+        .ino;
+    for v in &writer.volumes {
+        v.checkpoint_now().await.unwrap();
+    }
+    let reader = open_routed_meta_set_read_only(&uris).await.expect("reader");
+    for v in &reader.volumes {
+        v.arm_reader_revalidation(None).unwrap();
+    }
+    assert_eq!(reader.lookup(d, "early").await.unwrap().ino, early);
+
+    // Post-mount: new guests (fresh slot trees the reader never saw) and
+    // churn on the early one (its root swaps).
+    let mut late = Vec::new();
+    for i in 0..(2 * MINT_SPREAD as u32) {
+        let f = writer
+            .create(d, &format!("late{i:03}"), libc::S_IFREG | 0o644, 0, 0)
+            .await
+            .unwrap()
+            .ino;
+        writer
+            .setxattr(f, "user.pad", &vec![0x55; 2048])
+            .await
+            .unwrap();
+        late.push(f);
+    }
+    writer
+        .setxattr(early, "user.pad", &vec![0x66; 4000])
+        .await
+        .unwrap();
+    for v in &writer.volumes {
+        v.checkpoint_now().await.unwrap();
+    }
+    let poller = RevalidationPoller::new(1);
+    let outcomes = poller
+        .poll_set_at(&reader.volumes, std::time::Instant::now())
+        .await;
+    for (_, res) in &outcomes {
+        assert!(
+            res.as_ref().expect("poll").advanced,
+            "the reader adopted the new checkpoint"
+        );
+    }
+    // Every post-mount guest resolves; the early one still does, with its
+    // new content; nothing was re-rooted at the native root.
+    for (i, ino) in late.iter().enumerate() {
+        let got = reader
+            .lookup(d, &format!("late{i:03}"))
+            .await
+            .unwrap_or_else(|e| {
+                panic!("late{i:03} (a post-mount guest) must resolve on the reader: {e}")
+            });
+        assert_eq!(got.ino, *ino);
+        assert_eq!(
+            reader
+                .getxattr(*ino, "user.pad")
+                .await
+                .unwrap()
+                .map(|v| v.len()),
+            Some(2048)
+        );
+    }
+    assert_eq!(
+        reader
+            .getxattr(early, "user.pad")
+            .await
+            .unwrap()
+            .map(|v| v.len()),
+        Some(4000)
+    );
+    assert_eq!(
+        reader.volumes[0].forest_census().unwrap().slot_trees,
+        writer.volumes[0].forest_census().unwrap().slot_trees,
+        "the reader knows every slot tree the writer minted"
+    );
+    for v in &writer.volumes {
+        v.shutdown().await.unwrap();
+    }
 }

@@ -1586,11 +1586,19 @@ impl RoutedMetaBackend {
     /// the inode `Delete` plus one per xattr, in the admission's own
     /// framing ([`kv::backend::KvMetaBackend::destroy_entry_bytes`]). The
     /// reclaim planner's record term; the release term is
-    /// [`kv::block_refs::release_records_bytes`].
+    /// [`Self::release_records_bytes`].
     pub async fn destroy_entry_bytes(&self, ino: Ino) -> Result<u64> {
         let (v_idx, local_ino) = self.route_ino(ino);
         self.check_volume_enabled(v_idx)?;
         self.volumes[v_idx].destroy_entry_bytes(local_ino).await
+    }
+
+    /// The journal payload `n` reference releases stage on `ino`'s home
+    /// volume, framed as that volume STAGES them (a forest volume's keys
+    /// carry a kind byte — [`kv::backend::KvMetaBackend::release_records_bytes`]).
+    pub fn release_records_bytes(&self, ino: Ino, n: usize) -> u64 {
+        let (v_idx, _) = self.route_ino(ino);
+        self.volumes[v_idx].release_records_bytes(n)
     }
 
     /// RECLAIM-ATOMIC: [`Self::destroy_inodes`] with every ino's durable

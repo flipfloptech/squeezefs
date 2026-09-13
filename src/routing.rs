@@ -23305,7 +23305,7 @@ impl DataRouter {
     ///   whole-entry cap in the admission's own framing (the record term
     ///   [`crate::meta_backend::RoutedMetaBackend::destroy_entry_bytes`] +
     ///   the release term
-    ///   [`crate::meta_backend::kv::block_refs::release_records_bytes`]) —
+    ///   [`crate::meta_backend::RoutedMetaBackend::release_records_bytes`]) —
     ///   one entry per group; a failed group BISECTS (one persistently
     ///   failing ino must wedge only itself, never its batch-mates) and a
     ///   singleton failure is a REFUSED destroy: record, layout and
@@ -23439,7 +23439,7 @@ impl DataRouter {
         plans: Vec<ReclaimPlan>,
         out: &mut Vec<(u64, ReclaimVerdict)>,
     ) {
-        use crate::meta_backend::kv::block_refs::{release_records_bytes, DestroyVerdict};
+        use crate::meta_backend::kv::block_refs::DestroyVerdict;
         let cap = crate::meta_backend::kv::journal::entry_payload_cap();
         let mut groups: Vec<Vec<ReclaimPlan>> = Vec::new();
         let mut overcap: Vec<ReclaimPlan> = Vec::new();
@@ -23447,7 +23447,7 @@ impl DataRouter {
         let mut current_bytes = 0u64;
         for plan in plans {
             let bytes = match backend.destroy_entry_bytes(plan.ino).await {
-                Ok(b) => b + release_records_bytes(plan.refs.len()),
+                Ok(b) => b + backend.release_records_bytes(plan.ino, plan.refs.len()),
                 Err(e) => {
                     self.refuse_reclaim(plan, &format!("pricing the destroy failed: {e}"), out)
                         .await;

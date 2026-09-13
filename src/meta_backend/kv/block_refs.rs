@@ -280,14 +280,6 @@ pub enum ReleaseWitness {
     Ledger(Vec<BlockRef>),
 }
 
-/// The journal payload `n` reference-release `Delete`s stage — the
-/// admission's own framing, the destroy planner's release term
-/// (RECLAIM-ATOMIC: a reclaimed ino's releases ride its destroy entry, so
-/// the entry is priced with them).
-pub fn release_records_bytes(n: usize) -> u64 {
-    n as u64 * super::journal::record_frame_len(BLOCK_REF_KEY_LEN, 0)
-}
-
 /// Per-ino verdict of a joint release + destroy entry
 /// (`KvMetaBackend::destroy_inodes_releasing`, RECLAIM-ATOMIC).
 #[derive(Debug, Clone, PartialEq, Eq)]

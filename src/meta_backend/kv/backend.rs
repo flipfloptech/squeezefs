@@ -3229,6 +3229,34 @@ impl KvMetaBackend {
         }
     }
 
+    /// The journal payload ONE staged record of `kind` with a `value_len`
+    /// value costs on THIS volume — the admission's framing over the key
+    /// as STAGED: the legacy key on a flat volume, one kind byte longer on
+    /// a forest. Every entry planner (the corpse sweep's destroy chunks,
+    /// the reclaim grouping) prices with this, so a planned entry fits by
+    /// the arithmetic the commit enforces on either layout.
+    pub fn staged_frame_len(&self, kind: u8, value_len: usize) -> u64 {
+        let legacy = match kind {
+            TREE_INODES => INODE_KEY_LEN,
+            TREE_DENTRIES => super::record::DENTRY_KEY_LEN,
+            TREE_XATTRS => XATTR_KEY_LEN,
+            super::record::TREE_BLOCK_REFS => super::block_refs::BLOCK_REF_KEY_LEN,
+            super::record::TREE_BLOCK_MAP => super::block_map::BLOCK_MAP_KEY_LEN,
+            _ => 0,
+        };
+        let framed = match &self.trees {
+            TreeSet::Flat { .. } => legacy,
+            TreeSet::Forest { .. } => legacy + 1,
+        };
+        super::journal::record_frame_len(framed, value_len)
+    }
+
+    /// The journal payload `n` reference-release `Delete`s stage on THIS
+    /// volume (RECLAIM-ATOMIC's release term, framed as staged here).
+    pub fn release_records_bytes(&self, n: usize) -> u64 {
+        n as u64 * self.staged_frame_len(super::record::TREE_BLOCK_REFS, 0)
+    }
+
     /// The key a `(kind, legacy key)` pair is STAGED and JOURNALED under:
     /// the legacy key verbatim on a flat volume, the §5.2.1 forest key on
     /// a forest volume (the kind byte inserted once here; the tag stays
@@ -11064,8 +11092,8 @@ impl KvMetaBackend {
     ///
     /// One entry: the caller packs `items` to [`super::journal::
     /// entry_payload_cap`] with [`Self::destroy_entry_bytes`] +
-    /// [`super::block_refs::release_records_bytes`]; a single ino past the
-    /// cap takes [`Self::destroy_inode_chunked`].
+    /// [`Self::release_records_bytes`]; a single ino past the cap takes
+    /// [`Self::destroy_inode_chunked`].
     pub async fn destroy_inodes_releasing(
         &self,
         items: &[(Ino, &[super::block_refs::BlockRefOp])],
@@ -11105,7 +11133,7 @@ impl KvMetaBackend {
     /// missing ino prices as if destroyed (the destroy stages nothing for
     /// it — an over-estimate in the safe direction).
     pub async fn destroy_entry_bytes(&self, ino: Ino) -> Result<u64> {
-        let mut bytes = super::journal::record_frame_len(INODE_KEY_LEN, 0);
+        let mut bytes = self.staged_frame_len(TREE_INODES, 0);
         let start = xattr_key(ino, 0, 0);
         let end = xattr_key(ino, HASH56_MAX, u8::MAX);
         let mut cursor: Vec<u8> = start.to_vec();
@@ -11115,7 +11143,7 @@ impl KvMetaBackend {
                 .await?;
             let Some((last, _)) = page.last() else { break };
             cursor = key_successor(last);
-            bytes += page.len() as u64 * super::journal::record_frame_len(XATTR_KEY_LEN, 0);
+            bytes += page.len() as u64 * self.staged_frame_len(TREE_XATTRS, 0);
         }
         Ok(bytes)
     }
@@ -11261,8 +11289,7 @@ impl KvMetaBackend {
         ino: Ino,
         refs: &[super::block_refs::BlockRefOp],
     ) -> Result<super::block_refs::ChunkedDestroy> {
-        use super::block_refs::{ChunkedDestroy, BLOCK_REF_KEY_LEN};
-        use super::journal::record_frame_len;
+        use super::block_refs::ChunkedDestroy;
         self.write_gate()?;
         if refs.iter().any(|op| !op.take) {
             Self::reclaim_release_seam_gate()?;
@@ -11325,18 +11352,17 @@ impl KvMetaBackend {
         let ledger = self.block_refs_engaged();
         let mut records: Vec<(Rec<'_>, u64)> = Vec::new();
         if ledger {
-            records.extend(
-                refs.iter()
-                    .map(|op| (Rec::Release(op), record_frame_len(BLOCK_REF_KEY_LEN, 0))),
-            );
+            let release = self.staged_frame_len(super::record::TREE_BLOCK_REFS, 0);
+            records.extend(refs.iter().map(|op| (Rec::Release(op), release)));
         }
+        let xattr = self.staged_frame_len(TREE_XATTRS, 0);
         records.extend(
             other_xattrs
                 .into_iter()
                 .chain(layout_key)
-                .map(|k| (Rec::Xattr(k), record_frame_len(XATTR_KEY_LEN, 0))),
+                .map(|k| (Rec::Xattr(k), xattr)),
         );
-        records.push((Rec::Inode, record_frame_len(INODE_KEY_LEN, 0)));
+        records.push((Rec::Inode, self.staged_frame_len(TREE_INODES, 0)));
 
         let stop_after = {
             let seam = TEST_DESTROY_CHUNK_STOP_AFTER.load(Ordering::Relaxed);

@@ -13451,6 +13451,27 @@ impl SqueezefsFilesystem {
                     "meta_kv_merge_sweeps".into(),
                     per_volume(&|be| be.merge_sweeps()),
                 );
+                // THE SLOT-TREE FOREST (design-symmetric-metadata §5.2,
+                // incompat bit 17 — PR 1, dark): `slot_trees_minted` =
+                // guest slot trees minted on a slot's first record (the
+                // lazy-mint engagement gauge; 0 for the life of every
+                // un-stamped mount), `root_publishes` = `slot_state`
+                // records the checkpoint published into tree 0 (≤
+                // checkpoints × slot trees), `key_violations` MUST STAY 0
+                // (a record under a key the §5.2.1 codec refuses — the
+                // partition-violation class).
+                metrics.insert(
+                    "meta_kv_forest_slot_trees_minted".into(),
+                    load(&meta_kv::META_KV_FOREST_SLOT_TREES_MINTED),
+                );
+                metrics.insert(
+                    "meta_kv_forest_root_publishes".into(),
+                    load(&meta_kv::META_KV_FOREST_ROOT_PUBLISHES),
+                );
+                metrics.insert(
+                    "meta_kv_forest_key_violations".into(),
+                    load(&meta_kv::META_KV_FOREST_KEY_VIOLATIONS),
+                );
                 // LEAF-MERGE finalized (§4.6a (c)/(e)): `interior_merges`
                 // = the level-≥1 subset of `node_merges` (cross-parent
                 // shrinkage's face); `merge_laps` = whole-volume sweep

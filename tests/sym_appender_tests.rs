@@ -1064,6 +1064,78 @@ async fn own_residue_is_recovered_at_rejoin_with_a_bumped_term() {
     }
 }
 
+/// The kill-9 successor at ANOTHER mount point of the same node (the
+/// shape `inline_raise_tests` runs live: `kill9()` the promoter, remount
+/// the volume at `mnt2`) — its mount slot is `xxh3(canonical mount
+/// point)`, so it differs, but the writer flock it holds at this point of
+/// the open IS the D0 same-host death proof: a same-NODE Live page can
+/// only be a dead predecessor's residue, and refusing it would make the
+/// forest volume the one layout a same-host crash cannot remount over.
+/// Found stamped-only by the live-FUSE leg of the PR-2 verification.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_same_node_live_page_under_another_mount_slot_is_own_residue_under_d0() {
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    let uris = vec![format_stamped_member(dir.path(), "meta0").await];
+    let path = std::path::Path::new(&uris[0]);
+    let sb = superblock_of_path(path).await;
+    let routed = open_with_partition(&uris, None).await;
+    let vol = Arc::clone(&routed.volumes[0]);
+    let d = routed
+        .create(ROOT_INO, "promoter", libc::S_IFDIR | 0o755, 0, 0)
+        .await
+        .unwrap()
+        .ino;
+    for i in 0..8u32 {
+        routed
+            .create(d, &format!("f{i}"), libc::S_IFREG | 0o644, 0, 0)
+            .await
+            .unwrap();
+    }
+    let live = digest_backend(&vol).await.unwrap();
+    vol.sync_device().await.unwrap();
+    // Die without a checkpoint (page 0 Live, a window behind it) ...
+    drop(vol);
+    drop(routed);
+    // ... and re-stamp the Live page with the slot another mount point of
+    // THIS node derives: the same node token, a different mount slot.
+    let offs = appender0_page_offsets(&sb.journal);
+    let mut page = read_directory(path, &sb).await.unwrap()[0]
+        .page
+        .clone()
+        .expect("the dead mount left a valid page");
+    assert_eq!(page.state, AppenderState::Live);
+    let our_slot = page.identity.mount_slot;
+    page.identity.mount_slot = our_slot ^ 0x5A5A_0001;
+    page.generation += 1;
+    write_page(
+        path,
+        offs[page_slot_for(page.generation)],
+        page.encode().unwrap(),
+    )
+    .await
+    .unwrap();
+    let again = open_with_partition(&uris, None).await;
+    let vol = &again.volumes[0];
+    let s = stats(vol);
+    assert_eq!(
+        s.self_recoveries, 1,
+        "a same-node Live page is OUR residue under the D0 flock, whatever mount point \
+         the dead predecessor used"
+    );
+    assert_eq!(vol.appender_term(), 2, "re-adopted with a bumped term");
+    assert_eq!(digest_backend(vol).await.unwrap(), live);
+    assert_eq!(again.readdir(d, 0, usize::MAX).await.unwrap().len(), 8);
+    // The rejoined page is bound to THIS mount's slot again.
+    let listed = read_directory(path, &sb).await.unwrap();
+    let bound = listed[0].page.as_ref().unwrap();
+    assert_eq!(bound.state, AppenderState::Live);
+    assert_eq!(bound.identity.mount_slot, our_slot);
+    for v in &again.volumes {
+        v.shutdown().await.unwrap();
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_foreign_live_page_refuses_the_writer_open_and_a_probe_lists_it() {
     let dir = tempfile::tempdir().unwrap();

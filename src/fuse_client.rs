@@ -13505,6 +13505,18 @@ impl SqueezefsFilesystem {
                     appender(&|s| u64::from(s.appender_id)),
                 );
                 metrics.insert("appenders_live".into(), appender(&|s| s.live));
+                // `Live` pages the directory held at mount, foreign ones
+                // included — the probe's face of a page a writer would
+                // refuse to join over; and the routing slot page entries
+                // are converted against.
+                metrics.insert(
+                    "appender_live_pages_at_mount".into(),
+                    appender(&|s| s.live_pages_at_mount),
+                );
+                metrics.insert(
+                    "appender_native_slot".into(),
+                    appender(&|s| u64::from(s.native_slot)),
+                );
                 metrics.insert("appenders_capacity".into(), appender(&|s| s.capacity));
                 metrics.insert("appender_joins".into(), appender(&|s| s.joins));
                 metrics.insert("appender_leaves".into(), appender(&|s| s.leaves));

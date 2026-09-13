@@ -81,9 +81,10 @@ const OFF_SB_GENERATION: usize = 128;
 /// The appender directory's first extent (design-symmetric-metadata
 /// §5.3.1, incompat bit 17): `start ‖ len`, carved out of the zero
 /// padding after the generation and covered by the whole-sector checksum.
-/// ZERO on every bit-17-absent volume — the encoder refuses a named
-/// directory without the bit and the decoder refuses a non-zero field
-/// without it, so sector 0 stays byte-identical to the shipped image.
+/// ZERO on every bit-17-absent volume — the builder names a directory
+/// only under the bit (the encoder writes the field it is handed) and the
+/// DECODER refuses a non-zero field without the bit, after the feature
+/// gates; so sector 0 stays byte-identical to the shipped image.
 const OFF_APPENDER_DIR: usize = 136;
 
 /// Format version this module writes and mounts.

@@ -8020,11 +8020,6 @@ fn find_squeezefs_mounts() -> Vec<PathBuf> {
     mounts
 }
 
-/// `squeezefs clients` — list the mount registrations (client heartbeats +
-/// the single-writer claim) recorded on the volume set's root inos,
-/// classified under the existing staleness law (live / stale / dead-pid).
-/// Read-only probes (the `status` access pattern): never blocked by, and
-/// never perturbing, a live mount.
 /// `squeezefs appenders` (design-symmetric-metadata §6.2, PR 2): the
 /// appender directory of each volume — id, identity, state, term, ring
 /// segments, leased slots — off a read-only probe (the mount's own
@@ -8132,6 +8127,11 @@ async fn run_appenders_report(
     Ok(())
 }
 
+/// `squeezefs clients` — list the mount registrations (client heartbeats +
+/// the single-writer claim) recorded on the volume set's root inos,
+/// classified under the existing staleness law (live / stale / dead-pid).
+/// Read-only probes (the `status` access pattern): never blocked by, and
+/// never perturbing, a live mount.
 async fn run_clients_report(
     meta_lvs: &[String],
     json: bool,

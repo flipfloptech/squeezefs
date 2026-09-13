@@ -856,6 +856,56 @@ pub struct AppenderEntry {
     /// The newest valid page over `[A, B, R0, R1]` (R0/R1 read only when
     /// a valid directory page names a first ring segment).
     pub page: Option<AppenderPage>,
+    /// The valid images of the DIRECTORY pair `[A, B]` themselves — what
+    /// [`dir_named_mask`] reads: which of the two names the ring the
+    /// mount is about to use.
+    pub dir_pages: [Option<AppenderPage>; 2],
+}
+
+fn valid_page(img: &[u8]) -> Option<AppenderPage> {
+    match classify_page(img) {
+        PageRead::Valid(p) => Some(p),
+        PageRead::Blank | PageRead::Corrupt(_) => None,
+    }
+}
+
+/// Directory-pair confirmation mask: bit 0 = slot A's valid image names
+/// the region's CURRENT ring table, bit 1 = slot B's. Both set =
+/// [`DIR_NAMED_ALL`].
+pub const DIR_NAMED_ALL: u8 = 0b11;
+
+/// The mask over the directory pair's valid images for a region whose
+/// ring table is `table`.
+pub fn dir_named_mask(dir_pages: &[Option<AppenderPage>; 2], table: &[ExtentRef]) -> u8 {
+    let mut mask = 0u8;
+    for (i, p) in dir_pages.iter().enumerate() {
+        if p.as_ref().is_some_and(|p| p.segments == table) {
+            mask |= 1 << i;
+        }
+    }
+    mask
+}
+
+/// **The DIRECTORY-FIRST page-slot law** (review round 1, Issue 1 — the
+/// invariant `read_directory` rests on: "a directory image always names
+/// the region's current first segment"). The slots ONE logical page write
+/// lands in, given the pair's confirmation `mask` and the generation the
+/// first image will carry: while a directory slot does not name the
+/// current table — after a join onto a fresh ring, a growth, a leave —
+/// every such slot is written (A then B, one generation apart), so the
+/// pair alone finds the ring and a torn one falls back to the other
+/// naming the SAME table (a table-changing page whose only copy tore
+/// would fall back to a predecessor naming a ring that cannot decode the
+/// positions written since); once both name it, the four-slot rotation
+/// `page_slot_for(generation)` — the ring-side slots are reachable
+/// through either directory image, so the design's two predecessors of
+/// slack hold for appenders ≥ 1 as for appender 0.
+pub fn page_write_slots(mask: u8, generation: u64) -> Vec<usize> {
+    if mask & DIR_NAMED_ALL == DIR_NAMED_ALL {
+        vec![page_slot_for(generation)]
+    } else {
+        (0..2).filter(|i| mask & (1 << i) == 0).collect()
+    }
 }
 
 /// Walk the appender directory of a bit-17 volume: appender 0 from the
@@ -870,11 +920,15 @@ pub async fn read_directory(
     let mut out = Vec::new();
     // Appender 0: all four slots sit in the fixed extent.
     let offs0 = appender0_page_offsets(&sb.journal);
-    let page0 = read_newest_page(path, &offs0).await?.map(|(_, p)| p);
+    let mut images0 = Vec::with_capacity(offs0.len());
+    for off in &offs0 {
+        images0.push(read_page(path, *off).await?);
+    }
     out.push(AppenderEntry {
         appender_id: 0,
         dir_offsets: [offs0[0], offs0[1]],
-        page: page0,
+        page: newest_valid(&images0).map(|(_, p)| p),
+        dir_pages: [valid_page(&images0[0]), valid_page(&images0[1])],
     });
     if sb.appender_dir.len == 0 {
         return Ok(out);
@@ -921,6 +975,7 @@ pub async fn read_directory(
                 appender_id: next_id,
                 dir_offsets: offs,
                 page: newest_valid(&images).map(|(_, p)| p),
+                dir_pages: [valid_page(&images[0]), valid_page(&images[1])],
             });
             next_id += 1;
         }
@@ -1054,6 +1109,14 @@ pub struct AppenderRegion {
     /// reserving on).
     pub passes_inside: std::sync::atomic::AtomicUsize,
     pub growing: std::sync::atomic::AtomicBool,
+    /// Woken (`notify_waiters`) when `growing` clears — the pass side
+    /// parks on it instead of polling (no poll period to derive).
+    pub growth_done: squeezefs_ipc::sqz_notify::Notify,
+    /// [`dir_named_mask`] over the directory pair for the CURRENT ring
+    /// table — reset to 0 by every table change (a fresh ring at open, a
+    /// growth, the leave), raised to [`DIR_NAMED_ALL`] by the page write
+    /// that follows ([`page_write_slots`]).
+    pub dir_named: std::sync::atomic::AtomicU8,
     /// Recovered from its own `Live` residue at this mount.
     pub self_recovered: bool,
 }
@@ -1067,6 +1130,14 @@ impl AppenderRegion {
     /// Whether `slot`'s records journal into THIS region's ring.
     pub fn leases_slot(&self, slot: super::record::ForestSlot) -> bool {
         self.leases.contains(&slot)
+    }
+
+    /// Growth's release of the Dekker gate: clear `growing`, wake every
+    /// pass parked on it.
+    pub fn end_growth(&self) {
+        self.growing
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        self.growth_done.notify_waiters();
     }
 }
 
@@ -1100,6 +1171,11 @@ pub struct AppenderSet {
     /// Set by the writer's JOIN: only a joined mount writes pages (a
     /// guarded offline verb that opens writer-posture never joins).
     pub joined: std::sync::atomic::AtomicBool,
+    /// Why the JOIN must refuse, decided at open: a foreign node's `Live`
+    /// page or a `Recovering` page (PR 10's recovery driver owns both).
+    /// Deferred to the join so the D0 claim gate classifies the volume's
+    /// holder first and non-joining Writer opens are never blocked.
+    pub join_refusal: Option<String>,
 }
 
 impl AppenderSet {
@@ -1168,9 +1244,16 @@ impl AppenderSet {
         })
     }
 
-    /// `appenders_live`: regions this mount holds (its pages are `Live`).
+    /// `appenders_live`: regions this mount holds — its pages are `Live`,
+    /// which is true only after the JOIN (a probe / reader holds region
+    /// 0's structure without joining and exports 0, so the closure law
+    /// `joins − leaves − recoveries ≡ live` holds on every posture).
     pub fn live(&self) -> u64 {
-        self.regions.len() as u64
+        if self.joined.load(std::sync::atomic::Ordering::Acquire) {
+            self.regions.len() as u64
+        } else {
+            0
+        }
     }
 
     /// Bytes of ring EXTENTS over every region (the pages' segment

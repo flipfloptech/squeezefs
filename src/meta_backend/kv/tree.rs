@@ -639,6 +639,14 @@ impl KvTree {
         self.forest_slot
     }
 
+    /// This tree's elision tail: its slot's ring's durable tail on a
+    /// partitioned forest volume (a record's seq is a position in ITS
+    /// ring), the cache-wide word everywhere else — the ONE tail every
+    /// fold / merge decision of this tree reads.
+    pub fn durable_tail(&self) -> u64 {
+        self.cache.durable_tail_for_slot(self.forest_slot)
+    }
+
     /// The journal position the live root came into force at (see the
     /// field) — the floor a not-yet-published guest root clamps the
     /// checkpoint tail to.
@@ -1428,7 +1436,7 @@ impl KvTree {
     ) -> Result<(), KvError> {
         let cfg = self.cache.config();
         let layout = &cfg.layout;
-        let durable_tail = self.cache.durable_tail();
+        let durable_tail = self.durable_tail();
 
         // ---- Step 1: build successors from the frozen snapshot, no locks.
         let src = load_node(&cfg.path, layout, node.addr(), durable_tail).await?;
@@ -2154,7 +2162,7 @@ impl KvTree {
     /// tombstones below the durable tail credited as elided (the
     /// compaction fold drops them — `compact_fold`'s rule).
     fn fold_upper(&self, node: &Arc<CachedNode>) -> usize {
-        self.fold_upper_at(node, self.cache.durable_tail())
+        self.fold_upper_at(node, self.durable_tail())
     }
 
     /// [`Self::fold_upper`] under an explicit durable tail — the audit's
@@ -2179,7 +2187,7 @@ impl KvTree {
     /// under the underfull bound. One `fold_bytes_upper_with` per call —
     /// the projection the `kv_merge_sweep` bench prices per leaf.
     pub fn is_merge_candidate(&self, node: &Arc<CachedNode>) -> bool {
-        self.is_merge_candidate_at(node, self.cache.durable_tail())
+        self.is_merge_candidate_at(node, self.durable_tail())
     }
 
     /// [`Self::is_merge_candidate`] under an explicit durable tail: the
@@ -2200,7 +2208,7 @@ impl KvTree {
     /// (ns per leaf) and what the exact-candidates contract compares the
     /// sweep's published count against.
     pub fn merge_candidate_census(&self) -> u64 {
-        self.merge_candidate_census_at(self.cache.durable_tail())
+        self.merge_candidate_census_at(self.durable_tail())
     }
 
     /// [`Self::merge_candidate_census`] under an explicit durable tail.
@@ -2567,7 +2575,7 @@ impl KvTree {
     ) -> Result<Option<Arc<CachedNode>>, KvError> {
         let cfg = self.cache.config();
         let layout = &cfg.layout;
-        let durable_tail = self.cache.durable_tail();
+        let durable_tail = self.durable_tail();
 
         // ---- Step 0: admission, side-effect free.
         if left.level() != right.level()

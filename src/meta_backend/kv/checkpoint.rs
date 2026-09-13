@@ -1553,16 +1553,20 @@ impl KvMetaBackend {
         // tail keeps respecting it) and retries next cycle with the
         // budget this cycle frees.
         let mut dirty: Vec<Arc<CachedNode>> = Vec::new();
-        // The regions whose LEAVES are dirty as the pass begins — the
-        // flush-ceiling audit's subjects (KD-SYM-10; forest volumes only).
-        let mut had_dirty: Vec<u32> = Vec::new();
+        // The regions whose LEAVES are dirty as the pass begins, each with
+        // its OLDEST leaf's dirty-since instant — the flush-ceiling
+        // audit's subjects (KD-SYM-10 bounds the AGE of a dirty leaf, from
+        // the record that dirtied it; forest volumes only).
+        let mut had_dirty: Vec<(u32, u64)> = Vec::new();
         let region_aware = self.appenders().is_some();
         self.node_cache().for_each_node(|n| {
             if n.dirty_floor() != u64::MAX && !n.state().is_superseded() {
                 if region_aware && n.level() == 0 {
                     let r = self.region_of_node(n);
-                    if !had_dirty.contains(&r) {
-                        had_dirty.push(r);
+                    let since = n.dirty_since_ns();
+                    match had_dirty.iter_mut().find(|(id, _)| *id == r) {
+                        Some((_, oldest)) => *oldest = (*oldest).min(since),
+                        None => had_dirty.push((r, since)),
                     }
                 }
                 dirty.push(Arc::clone(n));
@@ -1652,7 +1656,7 @@ impl KvMetaBackend {
         // journal write + any previously-written ledger record become
         // durable (the §4.6 pt 3 pending-reclaim drains inside).
         self.sync_device().await.map_err(KvError::Io)?;
-        self.note_flush_ceiling(&had_dirty, cycle_started.elapsed());
+        self.note_flush_ceiling(&had_dirty, crate::mono_core::monotonic_ns_u64());
 
         // ---- The tail rule (module docs; §4.6 pt 2), plus the FIND-VS-A
         // dying-floor clamp: floors of nodes whose mappings LEFT the cache

@@ -1422,6 +1422,11 @@ pub struct CachedNode {
     /// checkpoint task swaps it out per flush pass and restores it if the
     /// pass fails — the tail rule takes the min over these floors.
     dirty_floor: AtomicU64,
+    /// CLOCK_MONOTONIC ns at this node's last clean → dirty transition
+    /// (KD-SYM-10's subject: the AGE of a dirty leaf, measured from the
+    /// record that dirtied it, not from the flush pass that finds it).
+    /// Stale once the floor is taken — read only beside a live floor.
+    dirty_since_ns: AtomicU64,
     /// PR M9 (§5.7): the owning cache's budget gauge — handed to every
     /// snapshot's [`FoldMemo`] and the open delta's charge accounting so
     /// a node's charged size is `extent + overlay + memo` bytes.
@@ -1502,6 +1507,7 @@ impl CachedNode {
             ref_bit: AtomicBool::new(true),
             pinned: AtomicBool::new(pinned),
             dirty_floor: AtomicU64::new(u64::MAX),
+            dirty_since_ns: AtomicU64::new(0),
             charge,
             forest_slot: AtomicU32::new(u32::MAX),
         }))
@@ -1704,7 +1710,11 @@ impl CachedNode {
         // seqs below their entry position (K6a-era committers) — the
         // entry start is the coverage target either way.
         if !records.is_empty() {
-            self.dirty_floor.fetch_min(floor, Ordering::AcqRel);
+            let prev = self.dirty_floor.fetch_min(floor, Ordering::AcqRel);
+            if prev == u64::MAX {
+                self.dirty_since_ns
+                    .store(crate::mono_core::monotonic_ns_u64(), Ordering::Release);
+            }
         }
         for mut rec in records {
             // Stamp (or tighten) the record's own floor contribution so
@@ -1887,6 +1897,13 @@ impl CachedNode {
     /// records).
     pub fn dirty_floor(&self) -> u64 {
         self.dirty_floor.load(Ordering::Acquire)
+    }
+
+    /// CLOCK_MONOTONIC ns at the last clean → dirty transition —
+    /// meaningful only while [`Self::dirty_floor`] is live (a restored
+    /// floor after a failed flush keeps its original age).
+    pub fn dirty_since_ns(&self) -> u64 {
+        self.dirty_since_ns.load(Ordering::Acquire)
     }
 
     /// Checkpoint flush pass: take the floor (leaving `u64::MAX`) —
@@ -2410,6 +2427,16 @@ pub struct NodeCache {
     /// (the manager's structure) and unstamped nodes fold into
     /// `dying_floors`. Empty for the life of a flat volume.
     dying_leaf_floors: std::sync::Mutex<std::collections::BTreeMap<super::record::ForestSlot, u64>>,
+    /// The per-SLOT durable tails of a partitioned forest volume
+    /// (design-symmetric-metadata §5.3, PR 2 — review round 1, Issue 5):
+    /// a record's seq is a position in ITS ring, so a leaf leased to a
+    /// declared appender elides tombstones below THAT ring's tail, never
+    /// below ring 0's (the cache-wide `durable_tail`, which stays the
+    /// ledger's as on a flat volume). Written once per completed barrier
+    /// (monotone per slot), read per maintenance decision through
+    /// [`Self::durable_tail_for_slot`]; empty for the life of every
+    /// volume without a declared region.
+    slot_tails: ArcSwap<std::collections::BTreeMap<super::record::ForestSlot, u64>>,
 }
 
 impl std::fmt::Debug for NodeCache {
@@ -2436,6 +2463,7 @@ impl NodeCache {
             retired: scc::HashSet::default(),
             dying_floors: AtomicU64::new(u64::MAX),
             dying_leaf_floors: std::sync::Mutex::new(std::collections::BTreeMap::new()),
+            slot_tails: ArcSwap::from_pointee(std::collections::BTreeMap::new()),
         })
     }
 
@@ -2562,6 +2590,34 @@ impl NodeCache {
     /// Advance the durable tail (monotonic).
     pub fn set_durable_tail(&self, tail: u64) {
         self.env.epoch.advance_tail(tail);
+    }
+
+    /// The elision tail for a node of forest slot `slot`: the slot's own
+    /// ring's durable tail when a declared appender leases it, else the
+    /// cache-wide tail (ring 0's). `None` — every flat node, interior
+    /// nodes, tree 0 — reads the cache-wide word without touching the map.
+    pub fn durable_tail_for_slot(&self, slot: Option<super::record::ForestSlot>) -> u64 {
+        match slot {
+            Some(s) => self
+                .slot_tails
+                .load()
+                .get(&s)
+                .copied()
+                .unwrap_or_else(|| self.durable_tail()),
+            None => self.durable_tail(),
+        }
+    }
+
+    /// Advance slot `slot`'s elision tail (monotone per slot; a lower
+    /// value is a no-op). Once per completed barrier per leased slot.
+    pub fn set_slot_durable_tail(&self, slot: super::record::ForestSlot, tail: u64) {
+        let cur = self.slot_tails.load();
+        if cur.get(&slot).is_some_and(|t| *t >= tail) {
+            return;
+        }
+        let mut next = (**cur).clone();
+        next.insert(slot, tail);
+        self.slot_tails.store(Arc::new(next));
     }
 
     /// The shared node environment — what [`CachedNode::from_loaded`] takes

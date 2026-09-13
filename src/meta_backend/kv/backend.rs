@@ -2564,14 +2564,6 @@ impl KvMetaBackend {
         self.appenders.as_ref().map(|a| a.stats())
     }
 
-    /// This mount's appender term (region 0's page); 0 on a flat volume.
-    pub fn appender_term(&self) -> u64 {
-        self.appenders
-            .as_ref()
-            .and_then(|a| a.regions.first())
-            .map_or(0, |r| r.page.lock().unwrap_or_else(|e| e.into_inner()).term)
-    }
-
     /// The appender set of a forest volume.
     pub(super) fn appenders(&self) -> Option<&Arc<super::appender::AppenderSet>> {
         self.appenders.as_ref()
@@ -2657,6 +2649,13 @@ impl KvMetaBackend {
         if self.read_only || self.non_writer {
             return Ok(());
         }
+        // The refusal the open deferred (a foreign Live / a Recovering
+        // page): the claim gate has run, so a live foreign holder was
+        // already refused by D0's own message — what is left is a dead
+        // appender's page, PR 10's.
+        if let Some(why) = &set.join_refusal {
+            return Err(KvError::Busy(why.clone()));
+        }
         let writer_id = uuid::Uuid::parse_str(&self.writer_id)
             .map(|u| u.as_u128())
             .unwrap_or_else(|_| u128::from(xxhash_rust::xxh3::xxh3_64(self.writer_id.as_bytes())));
@@ -2684,12 +2683,19 @@ impl KvMetaBackend {
     /// **The appender LEAVE** (§5.1.3 region release, the clean-unmount
     /// arm): after the final checkpoint every region's page goes `Free`
     /// — its id and term kept (ids are stable for the volume's life) — and
-    /// a declared region's ring extents return to the heap (the manager's
-    /// bitmap; the final cycle already persisted every root into tree 0).
-    /// Region 0 keeps naming the fixed ring. The pages are written and
-    /// barriered here; the bitmap's cleared bits ride the next mount's
-    /// first checkpoint (a crash between leaves them claimed — the C13
-    /// orphan-extent class fsck reclaims, never a loss).
+    /// a declared region's ring extents return to the heap. Region 0
+    /// keeps naming the fixed ring. The order is PAGES, barrier, RELEASE,
+    /// BITMAP, barrier: the `Free` page is a table change, so it lands in
+    /// BOTH directory slots (a torn one falls back to the other `Free`,
+    /// never to a `Live` page naming extents about to be freed), and only
+    /// once no durable page names the extents are their bits cleared and
+    /// written — the release must reach the durable bitmap before the
+    /// process exits, or every clean unmount leaks the ring (review round
+    /// 1, Issue 2). The reverse order (release before the final
+    /// checkpoint so its bitmap write carries it) would leave a `Live`
+    /// page naming FREED extents across that checkpoint's barrier. A
+    /// crash between the two barriers here leaves the extents claimed —
+    /// the C13 orphan-extent class fsck reclaims, never a loss.
     pub(super) async fn leave_appender_regions(&self) -> std::result::Result<(), KvError> {
         let Some(set) = self.appenders.as_ref() else {
             return Ok(());
@@ -2702,35 +2708,47 @@ impl KvMetaBackend {
             return Ok(());
         }
         let node_size = u64::from(self.sb.node_size);
+        let mut released: Vec<super::superblock::ExtentRef> = Vec::new();
         for region in &set.regions {
-            let img = {
+            {
                 let mut page = region.page.lock().unwrap_or_else(|e| e.into_inner());
-                page.generation += 1;
                 page.state = super::appender::AppenderState::Free;
                 page.slots.clear();
                 page.grant.clear();
                 if region.id != 0 {
-                    for ext in page.segments.drain(..) {
-                        let mut off = ext.start;
-                        while off < ext.end() {
-                            self.alloc
-                                .release_unpublished((off - self.sb.heap.start) / node_size);
-                            off += node_size;
-                        }
-                    }
+                    released.append(&mut page.segments);
                     page.head_hint = 0;
                     page.ledger_tail_seq = 0;
                 }
-                // The DIRECTORY pair only: a released region's ring-side
-                // pages sit in extents just returned to the heap.
-                (
-                    region.page_offsets[(page.generation % 2) as usize],
-                    page.encode()?,
-                )
-            };
-            super::appender::write_page(&self.path, img.0, img.1).await?;
+            }
+            // A table change: the directory pair only — a released
+            // region's ring-side pages sit in extents about to return to
+            // the heap.
+            region.dir_named.store(0, Ordering::Release);
+            self.write_region_page(region).await?;
             set.leaves.fetch_add(1, Ordering::Relaxed);
         }
+        crate::uring_fs::fdatasync(self.path.clone()).await?;
+        if released.is_empty() {
+            return Ok(());
+        }
+        // No durable page names the ring extents any more; no journal
+        // record ever did (a ring is referenced by its page alone), so the
+        // §4.7 pending-free gate has nothing to cover and the immediate
+        // release is the right op. The bits ride their own bitmap write
+        // and barrier before the process exits.
+        for ext in &released {
+            let mut off = ext.start;
+            while off < ext.end() {
+                self.alloc
+                    .release_unpublished((off - self.sb.heap.start) / node_size);
+                off += node_size;
+            }
+        }
+        let ckpt_seq = self.checkpoint_seq.fetch_add(1, Ordering::AcqRel) + 1;
+        self.alloc
+            .write_dirty_pages(&self.path, self.sb.alloc_bitmap.start, ckpt_seq)
+            .await?;
         crate::uring_fs::fdatasync(self.path.clone()).await?;
         Ok(())
     }
@@ -2767,14 +2785,14 @@ impl KvMetaBackend {
             }
             r.growing.store(true, Ordering::SeqCst);
             if r.passes_inside.load(Ordering::SeqCst) != 0 {
-                r.growing.store(false, Ordering::SeqCst);
+                r.end_growth();
                 continue;
             }
             let core = ring.core();
             let drained =
                 core.head() == core.reusable_upto() && ring.min_inflight_start() == u64::MAX;
             if !drained {
-                r.growing.store(false, Ordering::SeqCst);
+                r.end_growth();
                 continue;
             }
             // One growth step = up to the ring's current size in extents,
@@ -2797,7 +2815,7 @@ impl KvMetaBackend {
                 }
             }
             if claimed.is_empty() {
-                r.growing.store(false, Ordering::SeqCst);
+                r.end_growth();
                 r.stalls_at_last_grow.store(stalls, Ordering::Relaxed);
                 continue;
             }
@@ -2815,7 +2833,7 @@ impl KvMetaBackend {
                     for c in claimed {
                         self.alloc.release_unpublished(c);
                     }
-                    r.growing.store(false, Ordering::SeqCst);
+                    r.end_growth();
                     log::debug!(
                         "checkpoint: appender {}'s ring growth deferred ({e}); retrying next cycle",
                         r.id
@@ -2823,32 +2841,35 @@ impl KvMetaBackend {
                     continue;
                 }
             };
-            // The extents' bits, durable before any page names them.
-            let ckpt_seq = self.checkpoint_seq.load(Ordering::Acquire) + 1;
+            // The extents' bits, durable before any page names them. A
+            // checkpoint-class durable step CONSUMES a checkpoint seq
+            // (ledger slots are `seq % 32`, so the gap is harmless): the
+            // next cycle's bitmap write then carries a strictly higher
+            // generation instead of tying this one and taking DUR-4's
+            // loud raise.
+            let ckpt_seq = self.checkpoint_seq.fetch_add(1, Ordering::AcqRel) + 1;
             self.alloc
                 .write_dirty_pages(&self.path, self.sb.alloc_bitmap.start, ckpt_seq)
                 .await?;
             self.sync_device().await.map_err(KvError::Io)?;
-            // The page naming the grown table at the drained head.
-            let (off, img) = {
+            // The page naming the grown table at the drained head — a
+            // TABLE CHANGE, so it lands in the directory pair (both
+            // slots) before any position is written under the new map.
+            {
                 let mut page = r.page.lock().unwrap_or_else(|e| e.into_inner());
                 page.segments.push(extent);
-                page.generation += 1;
                 page.head_hint = core.head();
                 page.ledger_tail_seq = core.head();
-                (
-                    r.page_offsets[super::appender::page_slot_for(page.generation)],
-                    page.encode()?,
-                )
-            };
-            super::appender::write_page(&self.path, off, img).await?;
+            }
+            r.dir_named.store(0, Ordering::Release);
+            self.write_region_page(r).await?;
             self.sync_device().await.map_err(KvError::Io)?;
             r.last_tail.store(core.head(), Ordering::Release);
             r.durable_tail.fetch_max(core.head(), Ordering::AcqRel);
             r.ring.store(Arc::new(grown));
             r.ring_grows.fetch_add(1, Ordering::Relaxed);
             r.stalls_at_last_grow.store(stalls, Ordering::Relaxed);
-            r.growing.store(false, Ordering::SeqCst);
+            r.end_growth();
             log::info!(
                 "meta volume {}: appender {}'s ring stalled ({stalls} parks) and was drained — \
                  grew by one segment of {} bytes at {:#x} ({} segments, {} bytes; \
@@ -2893,6 +2914,38 @@ impl KvMetaBackend {
                 (r.id, tail)
             })
             .collect()
+    }
+
+    /// Write region `r`'s RAM page under the DIRECTORY-FIRST law
+    /// ([`super::appender::page_write_slots`]): one image per slot the law
+    /// names, the generation advanced once per image, the pair's
+    /// confirmation mask raised to ALL afterwards. The caller mutates the
+    /// page's content first and barriers afterwards; a site that CHANGED
+    /// the segment table resets `dir_named` before calling (the fresh ring
+    /// at open, growth, the leave), which is what routes that page into
+    /// the directory pair instead of a ring-side slot no directory image
+    /// can reach yet.
+    async fn write_region_page(
+        &self,
+        r: &super::appender::AppenderRegion,
+    ) -> std::result::Result<(), KvError> {
+        let images: Vec<(u64, Vec<u8>)> = {
+            let mut page = r.page.lock().unwrap_or_else(|e| e.into_inner());
+            let mask = r.dir_named.load(Ordering::Acquire);
+            let slots = super::appender::page_write_slots(mask, page.generation + 1);
+            let mut out = Vec::with_capacity(slots.len());
+            for slot in slots {
+                page.generation += 1;
+                out.push((r.page_offsets[slot], page.encode()?));
+            }
+            out
+        };
+        for (off, img) in images {
+            super::appender::write_page(&self.path, off, img).await?;
+        }
+        r.dir_named
+            .store(super::appender::DIR_NAMED_ALL, Ordering::Release);
+        Ok(())
     }
 
     /// **The appender PAGE writes of one checkpoint cycle** (§5.3.2 — the
@@ -2978,9 +3031,8 @@ impl KvMetaBackend {
             }
             entries.sort_by_key(|e| e.slot);
             entries.dedup_by_key(|e| e.slot);
-            let (off, img) = {
+            {
                 let mut page = r.page.lock().unwrap_or_else(|e| e.into_inner());
-                page.generation += 1;
                 page.ledger_tail_seq = tail;
                 page.ckpt_seq = ckpt_seq;
                 page.head_hint = if r.id == 0 {
@@ -2998,12 +3050,8 @@ impl KvMetaBackend {
                     page.segments = vec![super::appender::appender0_ring_extent(&self.sb.journal)];
                 }
                 page.slots = entries;
-                (
-                    r.page_offsets[super::appender::page_slot_for(page.generation)],
-                    page.encode()?,
-                )
-            };
-            super::appender::write_page(&self.path, off, img).await?;
+            }
+            self.write_region_page(r).await?;
             r.last_tail.store(tail, Ordering::Release);
             if r.id != 0 {
                 r.pending_reclaim
@@ -3015,26 +3063,37 @@ impl KvMetaBackend {
         Ok(())
     }
 
-    /// The flush-ceiling audit of one cycle (KD-SYM-10): `had_dirty` names
-    /// the regions whose leaves were dirty when the flush pass began;
-    /// `elapsed` is the pass's start → covering barrier. Past the ceiling
-    /// each such region is one overrun (must-stay-0), logged.
-    pub(super) fn note_flush_ceiling(&self, had_dirty: &[u32], elapsed: std::time::Duration) {
+    /// The flush-ceiling audit of one cycle (KD-SYM-10, §5.7.3: "every
+    /// dirty leaf … is flushed and barriered within `CHECKPOINT_MAX_AGE_MS`"):
+    /// `had_dirty` names the regions whose leaves were dirty when the
+    /// flush pass began, each with its OLDEST leaf's dirty-since instant
+    /// (CLOCK_MONOTONIC ns); `now_ns` is the covering barrier's
+    /// completion. The audited quantity is the leaf's AGE at the barrier
+    /// — record → durable — which under the default cadence is up to one
+    /// tick of waiting plus the pass; the pass wall alone (the first PR-2
+    /// build) read 0 for every violation up to ≈ 2× the bound. Past the
+    /// ceiling each such region is one overrun (must-stay-0), logged.
+    pub(super) fn note_flush_ceiling(&self, had_dirty: &[(u32, u64)], now_ns: u64) {
         let Some(set) = self.appenders.as_ref() else {
             return;
         };
-        let ceiling = super::appender::appender_flush_ceiling_ms();
-        if had_dirty.is_empty() || elapsed.as_millis() <= u128::from(ceiling) {
+        let ceiling_ns = super::appender::appender_flush_ceiling_ms() * 1_000_000;
+        let over: Vec<(u32, u64)> = had_dirty
+            .iter()
+            .filter(|(_, since)| *since != 0 && now_ns.saturating_sub(*since) > ceiling_ns)
+            .map(|(r, since)| (*r, now_ns.saturating_sub(*since) / 1_000_000))
+            .collect();
+        if over.is_empty() {
             return;
         }
         set.flush_ceiling_overruns
-            .fetch_add(had_dirty.len() as u64, Ordering::Relaxed);
+            .fetch_add(over.len() as u64, Ordering::Relaxed);
         log::warn!(
-            "meta volume {}: flush ceiling OVERRUN — appender region(s) {had_dirty:?} had dirty \
-             leaves when the flush pass began and its covering barrier landed {} ms later \
-             (ceiling {ceiling} ms; appender_flush_ceiling_overruns, must stay 0)",
+            "meta volume {}: flush ceiling OVERRUN — appender region(s) {over:?} (id, oldest \
+             dirty leaf's age in ms at the covering barrier) exceeded the {} ms ceiling \
+             (appender_flush_ceiling_overruns, must stay 0)",
             self.path.display(),
-            elapsed.as_millis()
+            super::appender::appender_flush_ceiling_ms()
         );
     }
 
@@ -6274,14 +6333,25 @@ impl KvMetaBackend {
                         r.durable_tail.fetch_max(tail, Ordering::AcqRel);
                     }
                 }
-                if let Some(min) = set
-                    .regions
-                    .iter()
-                    .map(|r| r.durable_tail.load(Ordering::Acquire))
-                    .min()
-                {
-                    self.cache.set_durable_tail(min);
+                // Elision tails are PER RING (positions are not comparable
+                // across rings): the cache-wide word is ring 0's, as on a
+                // flat volume; each leased slot's is its lessee's.
+                if let Some(tail) = region0_tail {
+                    self.cache.set_durable_tail(tail);
                 }
+                Self::publish_slot_durable_tails(set, &self.cache);
+            }
+        }
+    }
+
+    /// Publish every declared region's durable tail as the elision tail of
+    /// the slots it leases (`NodeCache::set_slot_durable_tail` — monotone
+    /// per slot). A no-op on an unpartitioned set.
+    fn publish_slot_durable_tails(set: &super::appender::AppenderSet, cache: &NodeCache) {
+        for r in set.regions.iter().skip(1) {
+            let tail = r.durable_tail.load(Ordering::Acquire);
+            for slot in &r.leases {
+                cache.set_slot_durable_tail(*slot, tail);
             }
         }
     }
@@ -9696,28 +9766,51 @@ impl KvMetaBackend {
         // `open`): a same-NODE Live page is a dead predecessor's residue
         // whatever mount slot it carried — see `owned_by_node`.
         let mine = |p: &AppenderPage| p.identity.owned_by_node(scope.0);
-        let foreign_live = |p: &AppenderPage| p.state == AppenderState::Live && !mine(p);
-        if is_writer {
-            if let Some(e) = entries
+        // A page no PR-2 writer may join over: a FOREIGN node's `Live`
+        // page (recovering another node's ring is PR 10's driver), or a
+        // `Recovering` page of any identity (a recoverer mid-replay,
+        // §5.9 — the design's joiner PARKS; nothing writes the state in
+        // PR 2, so this is the tripwire a PR-10 recoverer would trip).
+        // The refusal is DEFERRED to the JOIN (step 7 of `open`, after
+        // the D0 claim gate has classified the volume's holder): a LIVE
+        // foreign writer on a shared non-PR LUN then gets the gate's own
+        // "another process holds the writer claim" refusal, and the
+        // non-joining Writer opens — `claim clear`, the guarded offline
+        // verbs — are not blocked by a page they never write.
+        let join_refusal = if is_writer {
+            entries
                 .iter()
-                .find(|e| e.page.as_ref().is_some_and(foreign_live))
-            {
-                let p = e.page.as_ref().expect("filtered");
-                return Err(KvError::Busy(format!(
-                    "{}: appender page {} is LIVE under a foreign identity (node {:#018x}, mount \
-                     slot {:#x}, term {}) — recovering another node's ring is the dead-appender \
-                     recovery driver (design-symmetric-metadata PR 10); until it lands, \
-                     `squeezefs appender clear <sqmeta-uri> {}` is the attested remedy. Refusing \
-                     to mount over it",
-                    path.display(),
-                    p.appender_id,
-                    p.identity.node_token,
-                    p.identity.mount_slot,
-                    p.term,
-                    p.appender_id
-                )));
-            }
-        }
+                .find_map(|e| {
+                    e.page.as_ref().filter(|p| {
+                        (p.state == AppenderState::Live && !mine(p))
+                            || p.state == AppenderState::Recovering
+                    })
+                })
+                .map(|p| {
+                    format!(
+                        "{}: appender page {} is {} under {} identity (node {:#018x}, mount slot \
+                         {:#x}, term {}) — recovering another node's ring is the dead-appender \
+                         recovery driver (design-symmetric-metadata PR 10, not yet available; \
+                         it owns the operator remedy). Refusing to join over it",
+                        path.display(),
+                        p.appender_id,
+                        p.state.as_str(),
+                        if mine(p) { "our own" } else { "a foreign" },
+                        p.identity.node_token,
+                        p.identity.mount_slot,
+                        p.term,
+                    )
+                })
+        } else {
+            None
+        };
+        // A blocked writer stands up region 0 only: it claims no ring and
+        // writes no page before the join refuses.
+        let partition = if join_refusal.is_some() {
+            Default::default()
+        } else {
+            partition
+        };
 
         let set = AppenderSet {
             regions: Vec::new(),
@@ -9735,6 +9828,7 @@ impl KvMetaBackend {
             flush_ceiling_overruns: AtomicU64::new(0),
             pressure_cycles: AtomicU64::new(0),
             joined: AtomicBool::new(false),
+            join_refusal,
         };
         let mut regions: Vec<Arc<AppenderRegion>> = Vec::new();
 
@@ -9764,6 +9858,9 @@ impl KvMetaBackend {
                 recovery0.entries.len()
             );
         }
+        let dir_named0 = entries.first().map_or(0, |e| {
+            super::appender::dir_named_mask(&e.dir_pages, &page0.segments)
+        });
         regions.push(Arc::new(AppenderRegion {
             id: 0,
             page_offsets: appender0_page_offsets(&sb.journal),
@@ -9778,6 +9875,8 @@ impl KvMetaBackend {
             pending_reclaim: std::sync::Mutex::new(Vec::new()),
             passes_inside: std::sync::atomic::AtomicUsize::new(0),
             growing: AtomicBool::new(false),
+            growth_done: squeezefs_ipc::sqz_notify::Notify::new(),
+            dir_named: std::sync::atomic::AtomicU8::new(dir_named0),
             self_recovered: self_recovered0,
         }));
 
@@ -9899,6 +9998,10 @@ impl KvMetaBackend {
             };
             let first = page.segments.first().copied().unwrap_or(sb.journal);
             let page_offsets = page_slot_offsets(sb, id, entry.dir_offsets, &first);
+            // Which directory images name the ring this mount USES: for
+            // a recovered ring the pair's images naming its table; for a
+            // fresh ring none — the join's page write fills both slots.
+            let dir_named = super::appender::dir_named_mask(&entry.dir_pages, &page.segments);
             regions.push(Arc::new(AppenderRegion {
                 id,
                 page_offsets,
@@ -9913,6 +10016,8 @@ impl KvMetaBackend {
                 pending_reclaim: std::sync::Mutex::new(Vec::new()),
                 passes_inside: std::sync::atomic::AtomicUsize::new(0),
                 growing: AtomicBool::new(false),
+                growth_done: squeezefs_ipc::sqz_notify::Notify::new(),
+                dir_named: std::sync::atomic::AtomicU8::new(dir_named),
                 self_recovered,
             }));
         }
@@ -10044,16 +10149,13 @@ impl KvMetaBackend {
                 }
             }
         }
-        // The elision tail every compaction reads is the MIN over the
-        // rings' durable tails (a tombstone is elidable only below its own
-        // ring's tail; the min is safe for every ring).
-        let min_tail = set
-            .regions
-            .iter()
-            .map(|r| r.durable_tail.load(Ordering::Relaxed))
-            .min()
-            .unwrap_or(ledger.journal_tail_seq);
-        cache.set_durable_tail(min_tail);
+        // The elision tails are PER RING: a record's seq is a position in
+        // ITS ring, so a leaf's tombstones are elidable only below its own
+        // region's durable tail — the cache-wide word stays ring 0's (the
+        // ledger's tail, as on a flat volume) and every leased slot's tail
+        // is the lessee's (`durable_tail_for_slot`).
+        cache.set_durable_tail(ledger.journal_tail_seq);
+        Self::publish_slot_durable_tails(&set, cache);
         Ok(set)
     }
 
@@ -11000,12 +11102,16 @@ impl KvMetaBackend {
             .cloned();
         if let Some(r) = &growth_gate {
             loop {
+                // Register-recheck-await: the wake is armed BEFORE the
+                // flag is read, so growth's `end_growth` between the two
+                // is never lost (the `sqz_notify` create-recheck idiom).
+                let released = r.growth_done.notified();
                 r.passes_inside.fetch_add(1, Ordering::SeqCst);
                 if !r.growing.load(Ordering::SeqCst) {
                     break;
                 }
                 r.passes_inside.fetch_sub(1, Ordering::SeqCst);
-                squeezefs_ipc::sqz_time::sleep(std::time::Duration::from_micros(200)).await;
+                released.await;
             }
         }
         let ring = self.ring_of_region(region);
@@ -11594,7 +11700,7 @@ impl KvMetaBackend {
                     // other same-key writer is still excluded by the DLM
                     // guards this window's entries hold), skip-if-newer
                     // being precisely LWW-correct for those.
-                    self.rollback_failed_tx(w.res.start, w.res.end(), &w.undo)
+                    self.rollback_failed_tx(w.res.start, w.res.end(), &w.undo, &w.ring)
                         .await;
                     self.note_journal_failure();
                     // The reserved range is now a PERMANENT hole in the
@@ -12132,7 +12238,14 @@ impl KvMetaBackend {
     /// The failing tx still holds its DLM I/D guards (the op returns only
     /// after rollback), so dependent readers and same-key `Put` writers
     /// stay excluded throughout — §4.4 pt 4's exactness argument.
-    async fn rollback_failed_tx(&self, lo: u64, hi: u64, undo: &[UndoKey]) {
+    ///
+    /// `ring` is the ring the failed window reserved in: `lo`/`hi` are
+    /// positions in it, and the compensation is journaled into IT —
+    /// compensation is CONTENT of the window's appender region, and one
+    /// key lives in one ring (KD-SYM-4); in the manager's ring it would
+    /// be the `Lease` violation the next mount refuses on (review round
+    /// 1, Issue 3). On a flat volume this is the one ring there is.
+    async fn rollback_failed_tx(&self, lo: u64, hi: u64, undo: &[UndoKey], ring: &JournalRing) {
         // Phase 1: removal under re-acquired ascending locks.
         let mut comp: Vec<(u8, Vec<u8>, RecordKind, Bytes)> = Vec::new();
         for attempt in 0..COMMIT_RETRY_BUDGET {
@@ -12216,7 +12329,7 @@ impl KvMetaBackend {
         for (tree_id, key, kind, value) in comp {
             tx.staged.push((tree_id, key, kind, value));
         }
-        if let Err(e) = self.commit_compensation(tx).await {
+        if let Err(e) = self.commit_compensation(tx, ring).await {
             log::error!(
                 "meta volume {}: rollback compensation failed ({e}) — volume escalating",
                 self.path.display()
@@ -12225,10 +12338,14 @@ impl KvMetaBackend {
         }
     }
 
-    /// Commit a compensation tx through the checkpoint-class reserve
-    /// (never parks behind user admissions; skip-if-newer re-checked
-    /// under the locks).
-    async fn commit_compensation(&self, tx: KvTx) -> std::result::Result<(), KvError> {
+    /// Commit a compensation tx through the checkpoint-class reserve of
+    /// `ring` — the failed window's own (never parks behind user
+    /// admissions; skip-if-newer re-checked under the locks).
+    async fn commit_compensation(
+        &self,
+        tx: KvTx,
+        ring: &JournalRing,
+    ) -> std::result::Result<(), KvError> {
         let mut recs: Vec<(u8, Record)> = tx
             .staged
             .into_iter()
@@ -12253,7 +12370,7 @@ impl KvMetaBackend {
             super::node::debug_audit_records(*tree_id, 0, std::slice::from_ref(r));
         }
         let len = entry_len_for(&recs)?;
-        let Some(adm) = self.ring.try_admit(len, AdmissionClass::Checkpoint) else {
+        let Some(adm) = ring.try_admit(len, AdmissionClass::Checkpoint) else {
             return Err(KvError::JournalReserveExhausted { needed: len });
         };
         for attempt in 0..COMMIT_RETRY_BUDGET {
@@ -12281,14 +12398,14 @@ impl KvMetaBackend {
             if stale {
                 drop(guards);
                 if attempt + 1 == COMMIT_RETRY_BUDGET {
-                    self.ring.core().release(adm);
+                    ring.core().release(adm);
                     return Err(KvError::Corrupt(
                         "compensation retry budget exhausted".to_string(),
                     ));
                 }
                 continue;
             }
-            let res = self.ring.reserve_registered(adm);
+            let res = ring.reserve_registered(adm);
             for (i, (_t, r)) in recs.iter_mut().enumerate() {
                 r.seq = res.start + i as u64;
             }
@@ -12311,7 +12428,7 @@ impl KvMetaBackend {
                 )?;
             }
             drop(guards);
-            return self.ring.commit_entry(&res, &recs).await;
+            return ring.commit_entry(&res, &recs).await;
         }
         unreachable!("loop returns or errors within the budget")
     }

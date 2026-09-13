@@ -181,6 +181,19 @@ fn slot_page_budget_derives_from_the_pages_fixed_part() {
     let budget = std::hint::black_box(SLOT_PAGE_BUDGET);
     assert!(APPENDER_PAGE_FIXED_LEN + budget * SLOT_ENTRY_LEN <= APPENDER_PAGE_LEN);
     assert!(APPENDER_PAGE_FIXED_LEN + (budget + 1) * SLOT_ENTRY_LEN > APPENDER_PAGE_LEN);
+    // The two VALUES are on-disk format (the `TREE_ALLOC_RESERVED == 4`
+    // precedent): a wider fixed part or a wider entry recomputes both
+    // and would silently re-lay every page under the same bit — a change
+    // here ships under a NEW incompat bit (design §7.1), so the numbers
+    // are pinned, not only the formula.
+    assert_eq!(
+        APPENDER_PAGE_FIXED_LEN, 306,
+        "the §5.3.2 fixed part at natural widths (offset of n_slots + 2)"
+    );
+    assert_eq!(
+        SLOT_PAGE_BUDGET, 108,
+        "(4096 − 306) / 35 — the design's 122 predates `slot_tree_extents`"
+    );
     // The §5.3.2 field list at natural widths: slot u16 + state u8 + g u32
     // + slot_tree_extents u32 + root (u64, u64) + cursor u64.
     assert_eq!(SLOT_ENTRY_LEN, 2 + 1 + 4 + 4 + 8 + 8 + 8);
@@ -995,11 +1008,21 @@ async fn a_writer_joins_appender_zero_and_writes_its_page_per_checkpoint() {
         (native_entry.root.addr, native_entry.root.seq),
         (native_root.node_addr, native_root.node_seq)
     );
+    // KD-SYM-3: no page names tree 0's root — checked against the ROOT
+    // ADDRESS the ledger publishes for tree 0, not a slot value no code
+    // path produces.
+    let tree0_root = ledger
+        .tree_roots
+        .iter()
+        .find(|r| r.tree_id == TREE_CONTROL)
+        .expect("the ledger names tree 0");
+    assert_ne!(tree0_root.node_addr, 0);
     assert!(
         page.slots
             .iter()
-            .all(|e| e.slot != u16::MAX || s.native_slot == u16::MAX),
-        "no entry stands in for tree 0"
+            .all(|e| e.root.addr != tree0_root.node_addr),
+        "no entry of the manager's page names tree 0's root {:#x}",
+        tree0_root.node_addr
     );
 
     // A clean shutdown releases the region: the page goes Free.
@@ -1046,7 +1069,7 @@ async fn own_residue_is_recovered_at_rejoin_with_a_bumped_term() {
         "a Live page of our own ⇒ recover our own ring first"
     );
     assert_eq!(s.joins, 1);
-    assert_eq!(vol.appender_term(), 2, "re-adopted with a bumped term");
+    assert_eq!(s.regions[0].term, 2, "re-adopted with a bumped term");
     assert!(vol.replay_stats().entries > 0);
     assert_eq!(digest_backend(vol).await.unwrap(), live);
     assert_eq!(again.readdir(d, 0, usize::MAX).await.unwrap().len(), 24);
@@ -1058,7 +1081,7 @@ async fn own_residue_is_recovered_at_rejoin_with_a_bumped_term() {
     let third = open_with_partition(&uris, None).await;
     let s = stats(&third.volumes[0]);
     assert_eq!(s.self_recoveries, 0);
-    assert_eq!(third.volumes[0].appender_term(), 3);
+    assert_eq!(s.regions[0].term, 3);
     for v in &third.volumes {
         v.shutdown().await.unwrap();
     }
@@ -1123,7 +1146,7 @@ async fn a_same_node_live_page_under_another_mount_slot_is_own_residue_under_d0(
         "a same-node Live page is OUR residue under the D0 flock, whatever mount point \
          the dead predecessor used"
     );
-    assert_eq!(vol.appender_term(), 2, "re-adopted with a bumped term");
+    assert_eq!(s.regions[0].term, 2, "re-adopted with a bumped term");
     assert_eq!(digest_backend(vol).await.unwrap(), live);
     assert_eq!(again.readdir(d, 0, usize::MAX).await.unwrap().len(), 8);
     // The rejoined page is bound to THIS mount's slot again.
@@ -1161,13 +1184,33 @@ async fn a_foreign_live_page_refuses_the_writer_open_and_a_probe_lists_it() {
     )
     .await
     .unwrap();
+    // The non-joining Writer opens are NOT blocked by the page: `claim
+    // clear` — the attested D0 remedy for a dead foreign-host writer on a
+    // non-PR substrate — opens Writer posture, joins nothing, and answers
+    // (before the refused mount below leaves its own fresh claim, which
+    // `claim clear` rightly refuses to touch — a possibly-live holder).
+    let cleared = squeezefs::meta_backend::kv::backend::KvMetaBackend::claim_clear(path)
+        .await
+        .expect("`claim clear` is never blocked by an appender page it does not write");
+    assert!(
+        matches!(
+            cleared,
+            squeezefs::meta_backend::kv::backend::ClaimClearOutcome::NoClaim
+        ),
+        "a fresh volume carries no writer claim: {cleared:?}"
+    );
     let err = match open_routed_meta_set(&uris).await {
         Ok(_) => panic!("a writer must not mount over a foreign Live appender page"),
         Err(e) => e.to_string(),
     };
+    // The refusal names the driver that OWNS the remedy (PR 10) and no
+    // verb this binary lacks; it fires at the JOIN, after the D0 claim
+    // gate — a live foreign holder gets D0's own message first.
     assert!(
-        err.contains("PR 10") && err.contains("appender clear"),
-        "the refusal names the recovery driver and the remedy: {err}"
+        err.contains("PR 10")
+            && err.contains("Refusing to join")
+            && !err.contains("appender clear"),
+        "the refusal names PR 10 as the recovery driver and nothing that does not exist: {err}"
     );
     // A probe never writes and lists the page as it stands.
     let probe = squeezefs::meta_backend::kv::backend::KvMetaBackend::open_probe(path)
@@ -1176,8 +1219,61 @@ async fn a_foreign_live_page_refuses_the_writer_open_and_a_probe_lists_it() {
     let s = stats(&probe);
     assert_eq!(s.live_pages_at_mount, 1);
     assert_eq!(s.joins, 0, "a probe joins nothing");
+    assert_eq!(
+        s.live, 0,
+        "a probe holds no Live region: the closure law holds on every posture"
+    );
     let listed = read_directory(path, &sb).await.unwrap();
     assert_eq!(listed[0].page.as_ref().unwrap().term, 9);
+    // The page is untouched by any of it.
+    let listed = read_directory(path, &sb).await.unwrap();
+    let p = listed[0].page.as_ref().unwrap();
+    assert_eq!(
+        (p.state, p.term, p.generation),
+        (AppenderState::Live, 9, 1000)
+    );
+}
+
+/// A `Recovering` page — a recoverer mid-replay (§5.9; nothing writes the
+/// state before PR 10) — is a join refusal too, of any identity: the
+/// design's joiner PARKS, and adopting it `Free` with a fresh ring would
+/// race the recoverer for the ring.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_recovering_page_refuses_the_join_of_any_identity() {
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    let uris = vec![format_stamped_member(dir.path(), "meta0").await];
+    let path = std::path::Path::new(&uris[0]);
+    let sb = superblock_of_path(path).await;
+    // Our OWN identity, mid-recovery: mount once (page Live under us),
+    // then re-stamp the newest page Recovering.
+    let routed = open_with_partition(&uris, None).await;
+    for v in &routed.volumes {
+        v.shutdown().await.unwrap();
+    }
+    drop(routed);
+    let offs = appender0_page_offsets(&sb.journal);
+    let mut page = read_directory(path, &sb).await.unwrap()[0]
+        .page
+        .clone()
+        .unwrap();
+    page.state = AppenderState::Recovering;
+    page.generation += 1;
+    write_page(
+        path,
+        offs[page_slot_for(page.generation)],
+        page.encode().unwrap(),
+    )
+    .await
+    .unwrap();
+    let err = match open_routed_meta_set(&uris).await {
+        Ok(_) => panic!("a writer must not join over a Recovering page"),
+        Err(e) => e.to_string(),
+    };
+    assert!(
+        err.contains("recovering") && err.contains("PR 10"),
+        "the refusal names the state and PR 10: {err}"
+    );
 }
 
 async fn superblock_of_path(path: &std::path::Path) -> SuperblockV3 {

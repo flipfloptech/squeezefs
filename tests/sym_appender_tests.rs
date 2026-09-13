@@ -1289,8 +1289,10 @@ async fn a_stalled_appender_ring_grows_a_segment_and_its_content_survives() {
         "the small ring stalled: {:?}",
         s.regions[1]
     );
-    // Two drained cycles: the first covers the last entry, the second
-    // finds the ring drained with stalls behind it and grows it.
+    // Two barriered cycles: the first covers the last entries (its tail
+    // may still sit under a dying leaf floor — reclamation lags a cycle by
+    // design); the second's barrier leaves the ring drained with stalls
+    // behind it, and the growth decision at that cycle's end grows it.
     va.checkpoint_now().await.unwrap();
     va.checkpoint_now().await.unwrap();
     let s = stats(&va);

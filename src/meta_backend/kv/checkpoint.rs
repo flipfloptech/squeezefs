@@ -1511,13 +1511,6 @@ impl KvMetaBackend {
         let pending_before = self.allocator().pending_count();
         let tail_before = self.last_ledger_tail.load(Ordering::Acquire);
 
-        // ---- Appender rings (design-symmetric-metadata §5.3.2, PR 2): a
-        // declared region whose ring stalled and is drained grows by one
-        // segment FIRST — its bitmap bits and the page naming the grown
-        // table land before anything else this cycle writes. A no-op on
-        // every unpartitioned volume.
-        self.grow_stalled_regions().await?;
-
         // ---- Forest: publish every moved guest slot root into tree 0
         // FIRST, so the flush pass below carries tree 0's leaf and this
         // cycle's ledger record covers the publication (the slot-tree
@@ -1856,6 +1849,17 @@ impl KvMetaBackend {
                 }
             }
         }
+
+        // ---- Appender rings (design-symmetric-metadata §5.3.2, PR 2): a
+        // declared region whose ring stalled since its last growth decision
+        // and is DRAINED grows by one segment. Evaluated HERE, after this
+        // cycle's barrier advanced every ring's `reusable_upto` — the first
+        // instant a ring whose last records this cycle covered reads as
+        // drained (a cycle earlier it still held them; FIND-VS-A's one-
+        // cycle lag applies to the region's tail exactly as to the
+        // ledger's). Its own bitmap + page writes and barriers are inside.
+        // A no-op on every unpartitioned volume.
+        self.grow_stalled_regions().await?;
 
         // ---- §4.6a (e) the heap-full sweep: while the volume is full (or
         // a previous sweep left a backlog — candidates it could not admit

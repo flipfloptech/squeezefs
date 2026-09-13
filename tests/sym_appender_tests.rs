@@ -1319,27 +1319,29 @@ async fn a_changed_lease_set_refuses_the_mount_as_a_lease_violation() {
     assert_eq!(META_KV_REPLAY_EXTENT_VIOLATIONS.load(Ordering::Relaxed), 0);
 }
 
+/// §4.6 pt 2's ring-pressure trigger, per REGION: a committer parked at a
+/// full declared ring is drained by the NEXT cadence tick, never by the
+/// 1 s ceiling. The tick read ring 0 alone (`be.journal_ring()`), so a
+/// full region ring never made a cycle due — its committer sat parked for
+/// `CHECKPOINT_MAX_AGE_MS` per drain — and the shipped law's `distance >
+/// logical_len / 2` is unreachable on a floor-sized ring anyway (its
+/// reserve IS half the ring): the region's law is half its ADMISSIBLE
+/// window. Found attributing the growth contract's 1-in-20 stall race.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_stalled_appender_ring_grows_a_segment_and_its_content_survives() {
+async fn a_full_declared_ring_kicks_the_next_cadence_tick_not_the_ceiling() {
     let dir = tempfile::tempdir().unwrap();
     let _g = SEAM.lock().await;
     let uris = vec![format_stamped_member(dir.path(), "meta0").await];
     let tag = volume_tag("vol-0011223344556677");
-    let guest_owner = guest_local_ino(3, 9);
+    let guest_owner = guest_local_ino(3, 11);
     std::env::set_var("SQUEEZEFS_SYM_RING_KB", "512");
+    // The DEFAULT cadence (50 ms): the tick is the only drain here.
+    std::env::remove_var("SQUEEZEFS_META_FLUSH_INTERVAL_MS");
     let ra = open_with_partition(&uris, Some(PARTITION)).await;
     std::env::remove_var("SQUEEZEFS_SYM_RING_KB");
     let va = Arc::clone(&ra.volumes[0]);
-    let s = stats(&va);
-    assert_eq!(
-        s.regions[1].ring_bytes,
-        512 * 1024,
-        "the knob sized appender 1's ring"
-    );
-    assert_eq!(s.regions[1].segments, 1);
-    // 40 × ~27 KB entries ≈ 1 MiB into a 512 KiB ring whose user
-    // capacity is ~250 KB: the committer stalls; the checkpoint poller
-    // advances the tail and wakes it.
+    assert_eq!(stats(&va).regions[1].ring_bytes, 512 * 1024);
+    let t0 = std::time::Instant::now();
     let committer = {
         let v = Arc::clone(&va);
         tokio::spawn(async move {
@@ -1350,6 +1352,97 @@ async fn a_stalled_appender_ring_grows_a_segment_and_its_content_survives() {
             }
         })
     };
+    // ≈ 1.08 MB into a 256 KiB user window: ≥ 4 drains, each a park.
+    tokio::time::timeout(std::time::Duration::from_secs(60), committer)
+        .await
+        .expect("the storm drains — a parked committer is never stranded")
+        .unwrap();
+    let wall = t0.elapsed();
+    let s = stats(&va);
+    assert!(
+        s.regions[1].stalls > 0,
+        "the small ring parked: {:?}",
+        s.regions[1]
+    );
+    assert!(
+        s.pressure_cycles > 0,
+        "a full region ring made a cycle due (appender_pressure_cycles): {s:?}"
+    );
+    // Each drain rides the next 50 ms tick (+ one cycle); the ceiling-
+    // driven shape costs ≥ CHECKPOINT_MAX_AGE_MS PER drain, so the whole
+    // storm under two ceilings separates the two by ≥ 2×.
+    let bound = std::time::Duration::from_millis(2 * CHECKPOINT_MAX_AGE_MS as u64);
+    assert!(
+        wall < bound,
+        "the storm's {} drains took {wall:?} — parked committers waited for the ceiling, \
+         not the tick: {:?}",
+        s.pressure_cycles,
+        s.regions[1]
+    );
+    for i in [0u64, 17, 39] {
+        assert_eq!(va.block_ref_count(tag, i * 1000 + 7).await.unwrap(), 1);
+    }
+    drop(va);
+    for v in &ra.volumes {
+        v.shutdown().await.unwrap();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_stalled_appender_ring_grows_a_segment_and_its_content_survives() {
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    let uris = vec![format_stamped_member(dir.path(), "meta0").await];
+    let tag = volume_tag("vol-0011223344556677");
+    let guest_owner = guest_local_ino(3, 9);
+    std::env::set_var("SQUEEZEFS_SYM_RING_KB", "512");
+    // The cadence parked: the test is the ONLY drain of ring 1 (see the
+    // stall wait below).
+    std::env::set_var("SQUEEZEFS_META_FLUSH_INTERVAL_MS", "60000");
+    let ra = open_with_partition(&uris, Some(PARTITION)).await;
+    std::env::remove_var("SQUEEZEFS_META_FLUSH_INTERVAL_MS");
+    std::env::remove_var("SQUEEZEFS_SYM_RING_KB");
+    let va = Arc::clone(&ra.volumes[0]);
+    let s = stats(&va);
+    assert_eq!(
+        s.regions[1].ring_bytes,
+        512 * 1024,
+        "the knob sized appender 1's ring"
+    );
+    assert_eq!(s.regions[1].segments, 1);
+    // 40 × ~27 KB entries ≈ 1 MiB into a 512 KiB ring whose user window
+    // is 256 KiB (the reserve is the other half): with the cadence PARKED
+    // (`SQUEEZEFS_META_FLUSH_INTERVAL_MS` above) nothing but this test
+    // advances ring 1's tail, so the committer MUST park at the ring by
+    // capacity arithmetic — the stall gauge moving is the certainty the
+    // poller waits for BEFORE it starts draining. (The first shape raced
+    // the poller's `checkpoint_now` loop against the committer's fill and
+    // read `stalls == 0` on one stamped run in twenty — a legal schedule,
+    // not a defect: the poller drained faster than 40 commits filled.)
+    let committer = {
+        let v = Arc::clone(&va);
+        tokio::spawn(async move {
+            for i in 0..40u64 {
+                v.commit_block_refs(guest_owner, &refs(tag, guest_owner, i * 1000, 500))
+                    .await
+                    .unwrap();
+            }
+        })
+    };
+    let stall_deadline = std::time::Instant::now() + std::time::Duration::from_secs(20); // ≪ the 30 s D1.b park
+    while stats(&va).regions[1].stalls == 0 {
+        assert!(
+            !committer.is_finished(),
+            "40 × 27 KB cannot fit a 256 KiB user window without a drain: {:?}",
+            stats(&va).regions[1]
+        );
+        assert!(
+            std::time::Instant::now() < stall_deadline,
+            "the committer never parked at the small ring: {:?}",
+            stats(&va).regions[1]
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+    }
     while !committer.is_finished() {
         va.checkpoint_now().await.unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(5)).await;

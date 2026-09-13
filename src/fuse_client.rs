@@ -13522,6 +13522,13 @@ impl SqueezefsFilesystem {
                     "appender_flush_ceiling_overruns".into(),
                     appender(&|s| s.flush_ceiling_overruns),
                 );
+                // §4.6 pt 2 per region: cycles a declared region's full
+                // ring made due (its parked committer drains at the next
+                // tick, never the ceiling); 0 unpartitioned.
+                metrics.insert(
+                    "appender_pressure_cycles".into(),
+                    appender(&|s| s.pressure_cycles),
+                );
                 // The three per-ring partition classes (§5.3.4 / §5.8.6),
                 // MUST STAY 0: a mount that counted one refused.
                 metrics.insert(

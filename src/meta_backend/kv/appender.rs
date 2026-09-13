@@ -1092,6 +1092,11 @@ pub struct AppenderSet {
     /// region and did not reach its covering barrier within the flush
     /// ceiling (KD-SYM-10).
     pub flush_ceiling_overruns: std::sync::atomic::AtomicU64,
+    /// Checkpoint cycles a declared region's ring pressure made due (§4.6
+    /// pt 2 per region — [`AppenderSet::ring_pressure`]): a parked
+    /// committer is drained by the next cadence tick, never by the
+    /// ceiling. 0 on an unpartitioned mount by construction.
+    pub pressure_cycles: std::sync::atomic::AtomicU64,
     /// Set by the writer's JOIN: only a joined mount writes pages (a
     /// guarded offline verb that opens writer-posture never joins).
     pub joined: std::sync::atomic::AtomicBool,
@@ -1129,6 +1134,38 @@ impl AppenderSet {
             .skip(1)
             .map(|r| (r.id, r.leases.clone()))
             .collect()
+    }
+
+    /// §4.6 pt 2's ring-pressure trigger over the DECLARED regions (ring
+    /// 0 keeps the shipped law in the tick, byte-identical on a flat
+    /// mount): a region's ring is under pressure when its un-reclaimed
+    /// distance exceeds half its ADMISSIBLE window. The shipped `distance
+    /// > logical_len / 2` is unreachable on a floor-sized ring — the §4.4
+    /// pt 5 reserve is half of it — so a full region would never have made
+    /// a cycle due and its parked committer waited for the ceiling.
+    pub fn ring_pressure(&self) -> bool {
+        self.regions.iter().skip(1).any(|r| {
+            let ring = r.ring();
+            let core = ring.core();
+            let geo = core.geometry();
+            let admissible = geo.logical_len().saturating_sub(geo.reserve_bytes);
+            core.head().saturating_sub(core.reusable_upto()) > admissible / 2
+        })
+    }
+
+    /// Any declared region's ring holding un-reclaimed entries (`head >
+    /// reusable_upto`) — the region face of the tick's "anything to
+    /// cover" arm (`distance > 0` on ring 0): a cadence cycle's barrier is
+    /// deferred to the NEXT cycle ("reclamation lags a cycle"), so a
+    /// region tail sitting in `pending_reclaim` needs one more cycle to
+    /// land, and a tick that saw ring 0 idle and nothing dirty would never
+    /// run it.
+    pub fn rings_uncovered(&self) -> bool {
+        self.regions.iter().skip(1).any(|r| {
+            let ring = r.ring();
+            let core = ring.core();
+            core.head() > core.reusable_upto()
+        })
     }
 
     /// `appenders_live`: regions this mount holds (its pages are `Live`).
@@ -1180,6 +1217,7 @@ impl AppenderSet {
             ring_segments: self.ring_segments(),
             ring_grows: self.ring_grows(),
             flush_ceiling_overruns: self.flush_ceiling_overruns.load(Relaxed),
+            pressure_cycles: self.pressure_cycles.load(Relaxed),
             regions: self
                 .regions
                 .iter()
@@ -1236,6 +1274,8 @@ pub struct AppenderStats {
     pub ring_segments: u64,
     pub ring_grows: u64,
     pub flush_ceiling_overruns: u64,
+    /// Cycles a declared region's ring pressure made due.
+    pub pressure_cycles: u64,
     pub regions: Vec<AppenderRegionStats>,
 }
 

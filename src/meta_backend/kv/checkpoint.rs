@@ -1423,7 +1423,15 @@ async fn tick(
     //    dirty-node cap, shutdown.
     let core = be.journal_ring().core();
     let distance = core.head().saturating_sub(core.reusable_upto());
-    let ring_pressure = distance > core.geometry().logical_len() / 2;
+    // Ring 0 keeps the shipped law verbatim (a flat mount is byte-
+    // identical); a DECLARED region's ring has its own (PR 2, `AppenderSet::
+    // ring_pressure`): a committer parked at a full region ring holds no
+    // node lock (§4.4 pt 5), so nothing is dirty and ring 0 is idle — read
+    // alone, this tick would never make a cycle due and nobody would
+    // advance that ring's `reusable_upto` (the wedge the pressure contract
+    // pins).
+    let region_pressure = be.appenders().is_some_and(|a| a.ring_pressure());
+    let ring_pressure = distance > core.geometry().logical_len() / 2 || region_pressure;
     let mut dirty_nodes = 0u64;
     be.node_cache().for_each_node(|n| {
         if n.dirty_floor() != u64::MAX {
@@ -1446,9 +1454,18 @@ async fn tick(
         // that broke the op-economy allocation-free contract (2026-08-02).
         || dirty_nodes > be.dirty_node_cap()
         || last_checkpoint.elapsed().as_millis() >= ceiling_ms;
-    if due && (final_cycle || dirty_nodes > 0 || distance > 0) {
+    // A declared region's uncovered ring counts as "something to cover"
+    // exactly as ring 0's `distance > 0` does (its tail lands a cycle
+    // after its flush, like the ledger's).
+    let regions_uncovered = be.appenders().is_some_and(|a| a.rings_uncovered());
+    if due && (final_cycle || dirty_nodes > 0 || distance > 0 || regions_uncovered) {
         // Immediate post-ledger barrier under pressure or at shutdown:
         // reclamation must not lag a cycle when parkers wait on it.
+        if region_pressure {
+            if let Some(a) = be.appenders() {
+                a.pressure_cycles.fetch_add(1, Ordering::Relaxed);
+            }
+        }
         be.checkpoint_cycle(&mut smo, ring_pressure || final_cycle)
             .await?;
         *last_checkpoint = std::time::Instant::now();

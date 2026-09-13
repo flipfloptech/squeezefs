@@ -9731,6 +9731,7 @@ impl KvMetaBackend {
             leaves: AtomicU64::new(0),
             self_recoveries: AtomicU64::new(0),
             flush_ceiling_overruns: AtomicU64::new(0),
+            pressure_cycles: AtomicU64::new(0),
             joined: AtomicBool::new(false),
         };
         let mut regions: Vec<Arc<AppenderRegion>> = Vec::new();

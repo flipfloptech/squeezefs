@@ -1533,3 +1533,251 @@ async fn the_flush_ceiling_is_the_checkpoint_age_and_a_parked_device_moves_the_o
         v.shutdown().await.unwrap();
     }
 }
+
+// ---------------------------------------------------------------------------
+// Review round 1 — the three landed-behaviour bugs, pinned red first.
+// ---------------------------------------------------------------------------
+
+/// Set an env var for a scope; restore its prior value on drop (a panic
+/// mid-contract must not leave the cadence parked for the next one).
+struct EnvVarGuard {
+    key: &'static str,
+    prior: Option<String>,
+}
+
+impl EnvVarGuard {
+    fn set(key: &'static str, val: &str) -> Self {
+        let prior = std::env::var(key).ok();
+        std::env::set_var(key, val);
+        Self { key, prior }
+    }
+}
+
+impl Drop for EnvVarGuard {
+    fn drop(&mut self) {
+        match &self.prior {
+            Some(v) => std::env::set_var(self.key, v),
+            None => std::env::remove_var(self.key),
+        }
+    }
+}
+
+/// Disarm every `uring_fs` fault on drop (a panicked contract must not
+/// leave a sector error armed for the next one).
+struct FaultGuard;
+impl Drop for FaultGuard {
+    fn drop(&mut self) {
+        squeezefs::uring_fs::clear_faults();
+    }
+}
+
+/// Review round 1, Issue 1 (bug — the headline mechanism): a clean
+/// unmount writes the region's `Free` page into the DIRECTORY pair; the
+/// join that follows attaches a FRESH ring, and its `Live` page must be
+/// discoverable from the directory pair ALONE — `read_directory` reaches
+/// a ring-side slot only through a directory image that names that ring.
+/// The four-slot rotation put the join's page into R0/R1 of the new ring
+/// for two of the four generation residues, so a crash before the
+/// next-but-one checkpoint read the region as `Free`: the ring abandoned,
+/// its acked in-window records lost. Every residue is walked (k extra
+/// checkpoints before the leave shift the join's generation by k).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_region_rejoined_after_a_clean_unmount_is_found_live_after_a_crash() {
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    // The cadence parked: the join's checkpoint is the ONLY page write
+    // between the rejoin and the crash — the exposure window as it is.
+    let _cadence = EnvVarGuard::set("SQUEEZEFS_META_FLUSH_INTERVAL_MS", "60000");
+    let tag = volume_tag("vol-0011223344556677");
+    let guest_owner = guest_local_ino(3, 21);
+    for k in 0..4u32 {
+        let uris = vec![format_stamped_member(dir.path(), &format!("k{k}")).await];
+        let path = std::path::Path::new(&uris[0]);
+        let sb = superblock_of_path(path).await;
+        // Mount 1: join, k extra cycles, a clean unmount (the leave).
+        let ra = open_with_partition(&uris, Some(PARTITION)).await;
+        for _ in 0..k {
+            ra.volumes[0].checkpoint_now().await.unwrap();
+        }
+        for v in &ra.volumes {
+            v.shutdown().await.unwrap();
+        }
+        drop(ra);
+        let left = read_directory(path, &sb).await.unwrap()[1]
+            .page
+            .clone()
+            .expect("the leave wrote appender 1's Free page");
+        assert_eq!(left.state, AppenderState::Free, "k={k}");
+        // Mount 2: the rejoin (a fresh ring), one acked commit into the
+        // region, then death before any further checkpoint.
+        let rb = open_with_partition(&uris, Some(PARTITION)).await;
+        let vb = Arc::clone(&rb.volumes[0]);
+        vb.commit_block_refs(guest_owner, &refs(tag, guest_owner, 500, 2))
+            .await
+            .unwrap();
+        vb.sync_device().await.unwrap();
+        let live = digest_backend(&vb).await.unwrap();
+        let joined = read_directory(path, &sb).await.unwrap()[1]
+            .page
+            .clone()
+            .expect("appender 1 has a page");
+        assert_eq!(
+            joined.state,
+            AppenderState::Live,
+            "k={k}: the rejoined region's Live page is reachable from the directory (the leave \
+             left generation {}, the join wrote generation {})",
+            left.generation,
+            joined.generation
+        );
+        drop(vb);
+        drop(rb);
+        // Mount 3: both regions are our own residue; the acked refs are
+        // there.
+        let rc = open_with_partition(&uris, Some(PARTITION)).await;
+        let vc = &rc.volumes[0];
+        let s = stats(vc);
+        assert_eq!(
+            s.self_recoveries, 2,
+            "k={k}: both Live pages recovered (the leave left generation {}): {s:?}",
+            left.generation
+        );
+        assert_eq!(vc.block_ref_count(tag, 500).await.unwrap(), 1, "k={k}");
+        assert_eq!(vc.block_ref_count(tag, 501).await.unwrap(), 1, "k={k}");
+        assert_eq!(digest_backend(vc).await.unwrap(), live, "k={k}");
+        for v in &rc.volumes {
+            v.shutdown().await.unwrap();
+        }
+    }
+}
+
+/// Review round 1, Issue 2 (bug): the leave released a declared region's
+/// ring extents with a RAM-only allocator op AFTER the final checkpoint
+/// had written the bitmap, and the process then exited — so every clean
+/// unmount of a partitioned volume leaked the ring (the next mount reads
+/// the bitmap, not a reachability census). The heap's free count must
+/// come back to the unpartitioned baseline after every clean cycle.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_clean_unmount_returns_a_declared_regions_ring_extents_to_the_heap() {
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    let uris = vec![format_stamped_member(dir.path(), "meta0").await];
+    let path = std::path::Path::new(&uris[0]);
+    // The baseline: the heap as an unpartitioned mount leaves it.
+    let r0 = open_with_partition(&uris, None).await;
+    for v in &r0.volumes {
+        v.shutdown().await.unwrap();
+    }
+    drop(r0);
+    let baseline = squeezefs::meta_backend::kv::backend::KvMetaBackend::open_probe(path)
+        .await
+        .unwrap()
+        .free_extents();
+    for cycle in 0..3u32 {
+        let ra = open_with_partition(&uris, Some(PARTITION)).await;
+        let held = ra.volumes[0].free_extents();
+        assert!(
+            held < baseline,
+            "cycle {cycle}: the region's ring is claimed while mounted ({held} < {baseline})"
+        );
+        for v in &ra.volumes {
+            v.shutdown().await.unwrap();
+        }
+        drop(ra);
+        // The durable bitmap, as the next mount reads it.
+        let probe = squeezefs::meta_backend::kv::backend::KvMetaBackend::open_probe(path)
+            .await
+            .unwrap();
+        assert_eq!(
+            probe.free_extents(),
+            baseline,
+            "cycle {cycle}: the ring's extents returned to the heap durably (held {held} while \
+             mounted)"
+        );
+    }
+}
+
+/// Review round 1, Issue 3 (bug): the §4.4 pt 4 rollback of a FAILED
+/// window write journals its compensating records through the
+/// checkpoint-class reserve — of the ring the failed window used, never
+/// ring 0. Compensation is CONTENT of the window's region (KD-SYM-4: one
+/// ring per key); in the manager's ring it is the `Lease` violation the
+/// next mount refuses on. The phase-2 arm is forced exactly: the doomed
+/// write is HELD, a checkpoint flushes its applied records into a durable
+/// bset (the "freeze raced the failed write" shape), then the held write
+/// fails on release.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_failed_window_in_a_declared_region_compensates_into_its_own_ring() {
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    let _faults = FaultGuard;
+    let _cadence = EnvVarGuard::set("SQUEEZEFS_META_FLUSH_INTERVAL_MS", "60000");
+    let uris = vec![format_stamped_member(dir.path(), "meta0").await];
+    let path = std::path::PathBuf::from(&uris[0]);
+    let tag = volume_tag("vol-0011223344556677");
+    let guest_owner = guest_local_ino(3, 31);
+    let ra = open_with_partition(&uris, Some(PARTITION)).await;
+    let va = Arc::clone(&ra.volumes[0]);
+    // The leaf exists and is flushed before the doomed write.
+    va.commit_block_refs(guest_owner, &refs(tag, guest_owner, 0, 2))
+        .await
+        .unwrap();
+    va.checkpoint_now().await.unwrap();
+    let ring0 = va.journal_ring();
+    let ring1 = va.ring_of_region(1);
+    let (e0, e1) = (ring0.written_entries(), ring1.written_entries());
+    let phys = ring1.physical_offset_of(ring1.core().head());
+    let mut arrived = squeezefs::uring_fs::arm_write_stall(&path, phys, 8);
+    let doomed = {
+        let v = Arc::clone(&va);
+        tokio::spawn(async move {
+            v.commit_block_refs(guest_owner, &refs(tag, guest_owner, 100, 2))
+                .await
+        })
+    };
+    arrived
+        .recv()
+        .await
+        .expect("the doomed write reached the device shim");
+    // Applied at stage A; its records now leave the open overlay for a
+    // durable bset while the write is still in flight.
+    va.checkpoint_now().await.unwrap();
+    squeezefs::uring_fs::arm_sector_write_error(phys);
+    squeezefs::uring_fs::release_write_stall(&path);
+    let out = doomed.await.unwrap();
+    assert!(out.is_err(), "the failed window fails its member: {out:?}");
+    squeezefs::uring_fs::clear_faults();
+    assert_eq!(
+        va.block_ref_count(tag, 100).await.unwrap(),
+        0,
+        "rolled back in RAM"
+    );
+    assert_eq!(
+        ring0.written_entries(),
+        e0,
+        "no compensating entry rode the MANAGER's ring for appender 1's content"
+    );
+    assert_eq!(
+        ring1.written_entries(),
+        e1 + 1,
+        "the compensating entry rode appender 1's OWN ring"
+    );
+    // The remount is clean: no partition violation, the rolled-back refs
+    // absent, the earlier ones present.
+    let before = META_KV_REPLAY_LEASE_VIOLATIONS.load(Ordering::Relaxed);
+    let live = digest_backend(&va).await.unwrap();
+    drop(va);
+    drop(ra);
+    let rb = open_with_partition(&uris, Some(PARTITION)).await;
+    let vb = &rb.volumes[0];
+    assert_eq!(
+        META_KV_REPLAY_LEASE_VIOLATIONS.load(Ordering::Relaxed),
+        before
+    );
+    assert_eq!(META_KV_REPLAY_KEY_VIOLATIONS.load(Ordering::Relaxed), 0);
+    assert_eq!(vb.block_ref_count(tag, 100).await.unwrap(), 0);
+    assert_eq!(vb.block_ref_count(tag, 0).await.unwrap(), 1);
+    assert_eq!(digest_backend(vb).await.unwrap(), live);
+    for v in &rb.volumes {
+        v.shutdown().await.unwrap();
+    }
+}

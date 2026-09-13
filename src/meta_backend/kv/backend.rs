@@ -2599,7 +2599,9 @@ impl KvMetaBackend {
     }
 
     /// The ring region `id` journals into (region 0's is the fixed ring).
-    pub(super) fn ring_of_region(&self, id: u32) -> Arc<JournalRing> {
+    /// Public for the crash harness, like [`Self::journal_ring`]: a fault
+    /// armed by ring position needs THAT ring's logical→physical map.
+    pub fn ring_of_region(&self, id: u32) -> Arc<JournalRing> {
         self.appenders
             .as_ref()
             .and_then(|a| a.region(id))

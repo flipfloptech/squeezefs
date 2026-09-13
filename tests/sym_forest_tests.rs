@@ -66,7 +66,8 @@ use squeezefs::meta_backend::kv::superblock::{
 };
 use squeezefs::meta_backend::kv::tree::RootPtr;
 use squeezefs::meta_backend::kv::{
-    META_KV_FOREST_SLOT_TREES_MINTED, META_KV_NODE_APPENDS, META_KV_NODE_REWRITE_BYTES,
+    META_KV_FOREST_READER_WINDOW_SKIPS, META_KV_FOREST_SLOT_TREES_MINTED, META_KV_NODE_APPENDS,
+    META_KV_NODE_REWRITE_BYTES,
 };
 use squeezefs::meta_backend::{
     guest_local_ino, open_routed_meta_set, open_routed_meta_set_read_only, open_volume_for_mount,
@@ -1662,6 +1663,36 @@ async fn a_reader_of_a_forest_with_unpublished_slots_in_the_window_writes_nothin
         skipped > 8,
         "the window held records of many unpublished slots ({skipped})"
     );
+    // The other non-writer entry (`open_probe` — `squeezefs status`
+    // against a live writer; `open_co_writer` and `open_peer_owned` take
+    // the SAME `OpenPosture::NonWriter` arm, chosen at the call site):
+    // the same replay, the same zero writes, the same skips.
+    let skips0 = META_KV_FOREST_READER_WINDOW_SKIPS.load(Ordering::Relaxed);
+    let probe = KvMetaBackend::open_probe(std::path::Path::new(&uris[0]))
+        .await
+        .expect("probe");
+    assert_eq!(
+        META_KV_FOREST_SLOT_TREES_MINTED.load(Ordering::Relaxed),
+        minted0,
+        "a probe mints no slot tree"
+    );
+    assert_eq!(
+        META_KV_NODE_REWRITE_BYTES.load(Ordering::Relaxed),
+        rewrite0,
+        "a probe writes no node image"
+    );
+    assert_eq!(
+        META_KV_NODE_APPENDS.load(Ordering::Relaxed),
+        appends0,
+        "a probe appends no frame"
+    );
+    assert_eq!(probe.forest_census().unwrap().minted, 0);
+    assert_eq!(probe.forest_census().unwrap().slot_trees, published_trees);
+    assert!(
+        META_KV_FOREST_READER_WINDOW_SKIPS.load(Ordering::Relaxed) > skips0,
+        "the probe's replay counted the window records it skipped"
+    );
+    drop(probe);
     // The writer publishes; the reader's next poll adopts the roots and
     // serves every window record — still without a mint.
     for v in &reader.volumes {

@@ -46,11 +46,47 @@ Pinned in `sym_appender_tests`: `plan` never names a directory and sector 0's by
 
 ### 3a. Numbers
 
-FILLED_IN_BY_MEASUREMENT
+A scratch harness (not committed) over `format_v3_stamped` members (256 MiB volume, 64 KiB nodes, a 4 MiB fixed ring) opened with the partition `1:4` and the cadence parked, on the dev box, debug build, tmpfs — **scoping only**:
+
+| Shape | Journal bytes per appender | Idle `checkpoint_now` (ledger + pages + barrier) | Window at the crash | Re-open (own-residue recovery of BOTH regions) |
+|---|---|---|---|---|
+| appender-1 ring **512 KiB** (`SQUEEZEFS_SYM_RING_KB=512`) | 64 × `commit_block_refs`(8 refs) = 26,368 B per appender — **412 B/entry**, identical for appender 0 (ring 0) and appender 1 (ring 1): the entry is the same bytes whichever ring carries it | **0.89 ms/cycle** with 2 regions | region 1: 72 entries (8 × 500-ref commits ≈ 220 KB in-window), 0 stalls | **200 ms** wall (`replay_ms` 142; `self_recoveries` 2) |
+| appender-1 ring **4 MiB** (`=4096`) | same 412 B/entry | **0.73 ms/cycle** with 2 regions | region 1: 128 entries (64 × 500 refs ≈ 1.7 MB in-window) | **6.9 s** wall (`replay_ms` 6,697) — ≈ 32,000 block-reference records applied one by one through the forest's routed `apply_replayed` in a DEBUG build (≈ 200 µs/record incl. the slot tree's splits); the same per-record path PR 1's ring-0 replay takes — the row says the recovery bound of §5.9 (0.2–0.5 s per dead region at 4 MiB) is a RELEASE-build claim to measure on the box, not a debug-build one |
+| solo (one region) | — | **0.65 ms/cycle** with 1 region ⇒ the second region's page write costs ≈ **+0.1–0.25 ms per checkpoint** here (one 4 KiB `write_at` + its share of the barrier) | — | — |
+
+`replay_stats().entries` counts the fixed ring's window (3 / 23 above); a declared region's recovered entries are visible on its `AppenderRegionStats::ring_entries` and in the mount log line — folding them into `replay_stats` is a one-line owing (§7).
 
 ## 4. The widened gate — `tests/run_sym_forest_suites.sh`, 22 suites × flat / stamped
 
-FILLED_IN_BY_MATRIX
+Final tree (`9f9c4e95`), one run from zero, both legs **PASS**, no ratio NOTE (the rated maximum is `meta_slot_migration_tests` at 1.22×; `kvmap_tree_tests`' 1.77× is under the 1 s flat floor and unrated):
+
+```text
+suite                                 flat   stamped   ratio
+kv_tree_tests                         46.5      50.0    1.07
+kv_node_tests                          0.1       0.2    1.13
+kv_backend_tests                     136.3     148.4    1.09
+kv_journal_tests                       0.1       0.1    1.04
+kv_partitioned_append_tests            0.1       0.1    1.04
+kv_leaf_merge_tests                   41.8      41.6    0.99
+kv_node_cache_coherence_tests          0.4       0.4    1.19
+kvmap_tree_tests                       0.4       0.6    1.77
+kv_scale_tests                        27.5      32.4    1.18
+durable_block_refs_tests               8.5       9.9    1.16
+fsck_tests                            12.0      14.0    1.16
+fsck_c9_tests                          2.7       2.8    1.04
+fsck_c10_tests                         3.9       4.0    1.02
+fsck_c12_tests                         3.5       3.7    1.05
+fsck_repair_tests                     11.6      12.1    1.05
+crash_contract_tests                   0.4       0.4    1.11
+crash_kill_tests                       3.8       4.5    1.18
+writer_scoped_staging_tests            2.8       2.9    1.03
+readonly_mount_tests                   4.3       4.4    1.02
+meta_slot_migration_tests              3.7       4.5    1.22
+pv_coordinator_tests                   3.9       4.3    1.11
+sym_appender_tests                     5.5       5.5    1.01
+```
+
+Two earlier runs were red and attributed before this one: (run 1) the flat leg's `sym_appender_tests::a_stalled_appender_ring_grows…` — the growth decision's instant (§6 item 9, product fix `4ce4c7de`); (run 2) the stamped leg's `crash_contract_tests::test_kv_v3_torn_newest_ledger_mount_serves_predecessor` — a harness premise: it tore whatever sat in slot `mounted + 1`, which on the flat leg was the bring-up cover's one record (the contract held by that coincidence) and on the forest leg the join's, with the cover's newer sibling intact beside it; it now shuts the first mount down and reads the predecessor seq off the device (`9f9c4e95`). Beside the matrix: `sym_appender_tests` ×10 from zero on each leg (5.2–5.4 s each); `crash_contract_tests`, `sym_forest_tests`, `decoder_property_tests`, `derivation_sweep_tests`, `env_knob_convention_tests`, `docs_parity_tests`, `kernel_op_economy_tests`, `readonly_mount_tests`, `kv_leaf_merge_tests`, `kv_backend_tests` flat ×3 + stamped ×3 with `--test-threads=1`, all green (`kv_backend_tests` 135–138 s flat vs 146–150 s stamped = 1.08×; `kv_leaf_merge_tests` 42–48 s vs 41–43 s).
 
 ## 5. Contracts (`tests/sym_appender_tests.rs`, 23)
 
@@ -82,4 +118,5 @@ Every contract was committed red first (the `test(...)` commits quote the compil
 - **PR 4**: slot leases — the page's `g` and `slot_tree_extents` are written 0 — and the LRU release at the budget.
 - **PR 10**: foreign-ring recovery, `Recovering` / `Recovered`, `squeezefs appender clear`.
 - **The instrumented fuzz run** of `appender_page` (nightly tier; `task check:fuzz` type-checks it on stable and the proptest mirror runs every law per commit).
+- **`replay_stats().entries` folding in the declared regions' recovered entries** (visible today on `AppenderRegionStats::ring_entries` and the mount log line).
 - **The one-walk fsck census** and the orphaned-extent hygiene sweep (PR 1's §7, unchanged): a declared region's ring extents released at unmount ride the next checkpoint's bitmap write, so a crash between leaves them claimed — the C13 class.

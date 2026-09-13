@@ -8769,6 +8769,52 @@ impl KvMetaBackend {
             }
             Some(slot)
         };
+        // The writer's replay re-mints every slot tree the window holds
+        // records for and tree 0 does not name — one recovery-class extent
+        // EACH, while the originals sit orphaned in the durable bitmap
+        // until the hygiene sweep (design-symmetric-metadata §5.3.4; note
+        // §7). A reserve that cannot cover them refuses the MOUNT, so the
+        // refusal names the count: what the window needs, what it got,
+        // what the heap holds.
+        let unpublished: std::collections::BTreeSet<ForestSlot> = recovery
+            .entries
+            .iter()
+            .flat_map(|e| e.records.iter())
+            .filter_map(|(tag, rec)| {
+                let (tree_id, level) = untag(*tag);
+                let slot = if tree_id == KIND_INTERIOR && level > 0 {
+                    super::forest::split_interior_journal_key(&rec.key)
+                        .ok()
+                        .map(|(slot, _)| slot)
+                } else if level == 0 && super::record::is_slot_tree_kind(tree_id) {
+                    super::record::forest_key_slot(&rec.key).ok()
+                } else {
+                    None
+                };
+                slot.filter(|s| forest.tree(*s).is_none())
+            })
+            .collect();
+        // The space class stays the space class (ENOSPC through the crate
+        // error, never `Corrupt` — whose "corrupt KV encoding" text once
+        // sent a field hunt after phantom device corruption).
+        let mint_refused = |e: KvError| -> KvError {
+            match e {
+                KvError::NoSpace { free, reserve } if posture == OpenPosture::Writer => {
+                    KvError::Io(crate::error::SqueezefsError::no_space(format!(
+                        "{}: replaying the journal window needs one root extent for EACH of \
+                         the {} slot tree(s) tree 0 does not name yet (slots {:?}; their \
+                         originals are orphaned in the bitmap until the hygiene sweep), and \
+                         the heap cannot cover them — {free} free extent(s) against the \
+                         {reserve}-extent compaction reserve. `squeezefs fsck` reclaims the \
+                         orphans; design-symmetric-metadata §5.3.4",
+                        path.display(),
+                        unpublished.len(),
+                        unpublished.iter().take(8).collect::<Vec<_>>()
+                    )))
+                }
+                other => other,
+            }
+        };
 
         // ---- The slot trees' window: phase 1 interior records by
         // (level DESC, seq), each routed by its separator's slot.
@@ -8795,7 +8841,10 @@ impl KvMetaBackend {
             let Some(slot) = route(slot, &mut skipped_slots) else {
                 continue;
             };
-            let tree = forest.slot_or_mint(slot, &replay_mint).await?;
+            let tree = forest
+                .slot_or_mint(slot, &replay_mint)
+                .await
+                .map_err(mint_refused)?;
             tree.apply_replayed_interior(
                 separator,
                 level,
@@ -8857,7 +8906,8 @@ impl KvMetaBackend {
                 }
                 let (_slot, tree) = forest
                     .route_forest_key_or_mint(&rec.key, &replay_mint)
-                    .await?;
+                    .await
+                    .map_err(mint_refused)?;
                 tree.apply_replayed(
                     &rec.key,
                     rec.seq,

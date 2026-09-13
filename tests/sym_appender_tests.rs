@@ -831,3 +831,485 @@ fn appender_violations_key_lease_extent_are_each_detected() {
         }
     ));
 }
+
+// ---------------------------------------------------------------------------
+// The mounted region: join, the page per checkpoint, own-residue recovery,
+// the foreign refusal, two appenders, growth, the flush ceiling.
+// ---------------------------------------------------------------------------
+
+use squeezefs::meta_backend::kv::appender::{
+    appender_flush_ceiling_ms, read_page, write_page, AppenderStats, TEST_APPENDER_SLOTS_ENV,
+};
+use squeezefs::meta_backend::kv::block_refs::{volume_tag, BlockRef, BlockRefOp};
+use squeezefs::meta_backend::kv::builder::{digest_backend, format_v3_stamped, FormatV3Options};
+use squeezefs::meta_backend::kv::checkpoint::read_newest_ledger;
+use squeezefs::meta_backend::kv::{
+    META_KV_REPLAY_EXTENT_VIOLATIONS, META_KV_REPLAY_KEY_VIOLATIONS,
+    META_KV_REPLAY_LEASE_VIOLATIONS,
+};
+use squeezefs::meta_backend::{
+    guest_local_ino, open_routed_meta_set, open_volume_for_mount, plan_meta_slot_set, Metadata,
+    RoutedMetaBackend,
+};
+use std::sync::atomic::Ordering;
+use std::sync::Arc;
+
+fn set_opts() -> FormatV3Options {
+    FormatV3Options {
+        node_size: NODE_SIZE,
+        journal_len_override: Some(RING_LEN),
+        force: true,
+        full_wipe: false,
+        format_config_xattr: None,
+    }
+}
+
+/// Format a one-member stamped set (the default format's bits + bit 17)
+/// at `dir/name`; the seam guard is the caller's.
+async fn format_stamped_member(dir: &std::path::Path, name: &str) -> String {
+    let p = dir.join(name);
+    std::fs::File::create(&p).unwrap().set_len(VOL_LEN).unwrap();
+    let plan = plan_meta_slot_set(1).expect("derived plan");
+    std::env::set_var("SQUEEZEFS_TEST_STAMP_SYMMETRIC", "1");
+    let r = format_v3_stamped(&p, VOL_LEN, &set_opts(), plan.stamps[0].clone()).await;
+    std::env::remove_var("SQUEEZEFS_TEST_STAMP_SYMMETRIC");
+    r.expect("format stamped member");
+    p.display().to_string()
+}
+
+/// Open the set with the declared partition `partition` in force for the
+/// open (the env is read at the writer's open; cleared after).
+async fn open_with_partition(uris: &[String], partition: Option<&str>) -> Arc<RoutedMetaBackend> {
+    match partition {
+        Some(p) => std::env::set_var(TEST_APPENDER_SLOTS_ENV, p),
+        None => std::env::remove_var(TEST_APPENDER_SLOTS_ENV),
+    }
+    let r = open_routed_meta_set(uris).await;
+    std::env::remove_var(TEST_APPENDER_SLOTS_ENV);
+    r.expect("open routed set")
+}
+
+fn stats(vol: &squeezefs::meta_backend::kv::backend::KvMetaBackend) -> AppenderStats {
+    vol.appender_stats().expect("a forest volume has an appender set")
+}
+
+/// `n` block references of `owner` on volume tag `tag`, blocks
+/// `base..base+n`.
+fn refs(tag: u64, owner: u64, base: u64, n: u64) -> Vec<BlockRefOp> {
+    (0..n)
+        .map(|i| {
+            BlockRefOp::taken(BlockRef {
+                vol_tag: tag,
+                block_idx: base + i,
+                owner_ino: owner,
+                block_index: i as u32,
+            })
+        })
+        .collect()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_flat_mount_has_no_appender_set() {
+    let file = NamedTempFile::new().unwrap();
+    build_image(&file, false).await;
+    let b = open_volume_for_mount(file.path().to_str().unwrap())
+        .await
+        .unwrap();
+    assert!(
+        b.appender_stats().is_none(),
+        "a bit-17-absent mount has no appender region — every Appender gauge is absent"
+    );
+    b.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_writer_joins_appender_zero_and_writes_its_page_per_checkpoint() {
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    let uris = vec![format_stamped_member(dir.path(), "meta0").await];
+    let routed = open_with_partition(&uris, None).await;
+    let vol = &routed.volumes[0];
+    let s = stats(vol);
+    assert_eq!(s.appender_id, 0);
+    assert_eq!((s.joins, s.leaves, s.self_recoveries, s.live), (1, 0, 0, 1));
+    let sb = vol.superblock().clone();
+    assert_eq!(
+        s.capacity,
+        appenders_capacity(
+            sb.heap.len,
+            squeezefs::meta_backend::kv::appender::resolve_sym_ring_bytes(0, VOL_LEN)
+        )
+    );
+    assert_eq!(s.ring_segments, 1, "appender 0's ring is the fixed extent, one segment");
+    assert_eq!(s.ring_bytes, appender0_ring_extent(&sb.journal).len);
+    let path = std::path::Path::new(&uris[0]);
+    let entries = read_directory(path, &sb).await.unwrap();
+    let page = entries[0].page.clone().expect("page 0");
+    assert_eq!(page.state, AppenderState::Live);
+    assert_eq!(page.term, 1, "the first join of a Free page is term 1");
+    assert!(page.is_manager, "the solo writer plays the manager (KD-SYM-3)");
+    let gen_before = page.generation;
+
+    // A checkpoint writes the page: tail + ckpt_seq mirror the fixed
+    // ledger; the slot vector names the native slot tree's root; tree 0's
+    // root and the stamp are NOT on the page.
+    Metadata::create(vol.as_ref(), ROOT_INO, "d", libc::S_IFDIR | 0o755, 0, 0)
+        .await
+        .unwrap();
+    vol.checkpoint_now().await.unwrap();
+    let ledger = read_newest_ledger(path, sb.root_ledger.start)
+        .await
+        .unwrap()
+        .expect("ledger");
+    let page = read_directory(path, &sb).await.unwrap()[0]
+        .page
+        .clone()
+        .unwrap();
+    assert!(page.generation > gen_before, "one page write per checkpoint");
+    assert_eq!(page.ledger_tail_seq, ledger.journal_tail_seq);
+    assert_eq!(page.ckpt_seq, ledger.seq);
+    let native_root = ledger
+        .tree_roots
+        .iter()
+        .find(|r| r.tree_id == KIND_INTERIOR)
+        .unwrap();
+    let native_entry = page
+        .slots
+        .iter()
+        .find(|e| e.slot == s.native_slot)
+        .expect("the page names the native slot it leases");
+    assert_eq!(
+        (native_entry.root.addr, native_entry.root.seq),
+        (native_root.node_addr, native_root.node_seq)
+    );
+    assert!(
+        page.slots.iter().all(|e| e.slot != u16::MAX || s.native_slot == u16::MAX),
+        "no entry stands in for tree 0"
+    );
+
+    // A clean shutdown releases the region: the page goes Free.
+    for v in &routed.volumes {
+        v.shutdown().await.unwrap();
+    }
+    let page = read_directory(path, &sb).await.unwrap()[0]
+        .page
+        .clone()
+        .unwrap();
+    assert_eq!(page.state, AppenderState::Free);
+    assert_eq!(page.term, 1, "the id and its term survive the release");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn own_residue_is_recovered_at_rejoin_with_a_bumped_term() {
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    let uris = vec![format_stamped_member(dir.path(), "meta0").await];
+    let routed = open_with_partition(&uris, None).await;
+    let vol = Arc::clone(&routed.volumes[0]);
+    let d = routed
+        .create(ROOT_INO, "storm", libc::S_IFDIR | 0o755, 0, 0)
+        .await
+        .unwrap()
+        .ino;
+    for i in 0..24u32 {
+        routed
+            .create(d, &format!("f{i:03}"), libc::S_IFREG | 0o644, 0, 0)
+            .await
+            .unwrap();
+    }
+    let live = digest_backend(&vol).await.unwrap();
+    // Barrier, then die without a checkpoint: page 0 stays Live with a
+    // non-empty window behind it.
+    vol.sync_device().await.unwrap();
+    drop(vol);
+    drop(routed);
+    let again = open_with_partition(&uris, None).await;
+    let vol = &again.volumes[0];
+    let s = stats(vol);
+    assert_eq!(s.self_recoveries, 1, "a Live page of our own ⇒ recover our own ring first");
+    assert_eq!(s.joins, 1);
+    assert_eq!(vol.appender_term(), 2, "re-adopted with a bumped term");
+    assert!(vol.replay_stats().entries > 0);
+    assert_eq!(digest_backend(vol).await.unwrap(), live);
+    assert_eq!(again.readdir(d, 0, usize::MAX).await.unwrap().len(), 24);
+    // A clean shutdown then a rejoin: nothing to recover, term bumps again.
+    for v in &again.volumes {
+        v.shutdown().await.unwrap();
+    }
+    drop(again);
+    let third = open_with_partition(&uris, None).await;
+    let s = stats(&third.volumes[0]);
+    assert_eq!(s.self_recoveries, 0);
+    assert_eq!(third.volumes[0].appender_term(), 3);
+    for v in &third.volumes {
+        v.shutdown().await.unwrap();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_foreign_live_page_refuses_the_writer_open_and_a_probe_lists_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    let uris = vec![format_stamped_member(dir.path(), "meta0").await];
+    let path = std::path::Path::new(&uris[0]);
+    let sb = superblock_of_path(path).await;
+    // Forge: appender 0's page Live under an identity that is not ours.
+    let offs = appender0_page_offsets(&sb.journal);
+    let mut page = AppenderPage::decode(&read_page(path, offs[1]).await.unwrap()).unwrap();
+    page.generation = 1000;
+    page.state = AppenderState::Live;
+    page.term = 9;
+    page.identity = AppenderIdentity {
+        node_token: 0xF0E1_D2C3_B4A5_9687,
+        mount_slot: 0x1234_5678,
+        writer_id: 42,
+    };
+    write_page(path, offs[page_slot_for(page.generation)], page.encode().unwrap())
+        .await
+        .unwrap();
+    let err = match open_routed_meta_set(&uris).await {
+        Ok(_) => panic!("a writer must not mount over a foreign Live appender page"),
+        Err(e) => e.to_string(),
+    };
+    assert!(
+        err.contains("PR 10") && err.contains("appender clear"),
+        "the refusal names the recovery driver and the remedy: {err}"
+    );
+    // A probe never writes and lists the page as it stands.
+    let probe = squeezefs::meta_backend::kv::backend::KvMetaBackend::open_probe(path)
+        .await
+        .expect("a probe opens beside a foreign Live page");
+    let s = stats(&probe);
+    assert_eq!(s.live_pages_at_mount, 1);
+    assert_eq!(s.joins, 0, "a probe joins nothing");
+    let listed = read_directory(path, &sb).await.unwrap();
+    assert_eq!(listed[0].page.as_ref().unwrap().term, 9);
+}
+
+async fn superblock_of_path(path: &std::path::Path) -> SuperblockV3 {
+    match classify_volume(path).await.expect("classify") {
+        VolumeFormat::V3(sb) => sb,
+        other => panic!("expected a v3 superblock, got {other:?}"),
+    }
+}
+
+/// The two-appender shape: appender 1 leases forest slot `guest 3`; the
+/// native slot stays the manager's. Every tx of `commit_block_refs` lives
+/// in its owner's slot, so the partition is respected by construction.
+const PARTITION: &str = "1:4";
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn two_appenders_commit_into_two_rings_and_replay_to_the_union_digest() {
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    let a = vec![format_stamped_member(dir.path(), "a").await];
+    let b = vec![format_stamped_member(dir.path(), "b").await];
+    let tag = volume_tag("vol-0011223344556677");
+    let manager_owner = 1000u64; // native slot
+    let guest_owner = guest_local_ino(3, 77); // forest slot 4 — appender 1's
+
+    // Volume A: partitioned — two rings written concurrently.
+    let ra = open_with_partition(&a, Some(PARTITION)).await;
+    let va = Arc::clone(&ra.volumes[0]);
+    let s = stats(&va);
+    assert_eq!(s.live, 2, "two regions joined");
+    assert_eq!(s.joins, 2);
+    assert_eq!(s.regions.len(), 2);
+    assert_eq!(s.regions[1].id, 1);
+    let (v1, v2) = (Arc::clone(&va), Arc::clone(&va));
+    let t1 = tokio::spawn(async move {
+        for i in 0..16u64 {
+            v1.commit_block_refs(manager_owner, &refs(tag, manager_owner, i * 10, 3))
+                .await
+                .unwrap();
+        }
+    });
+    let t2 = tokio::spawn(async move {
+        for i in 0..16u64 {
+            v2.commit_block_refs(guest_owner, &refs(tag, guest_owner, 1000 + i * 10, 3))
+                .await
+                .unwrap();
+        }
+    });
+    t1.await.unwrap();
+    t2.await.unwrap();
+    let s = stats(&va);
+    assert!(s.regions[0].ring_entries >= 16, "{:?}", s.regions);
+    assert_eq!(s.regions[1].ring_entries, 16, "appender 1's commits rode ITS ring");
+    let live_a = digest_backend(&va).await.unwrap();
+    va.sync_device().await.unwrap();
+    drop(va);
+    drop(ra);
+
+    // Volume B: one appender commits the union.
+    let rb = open_with_partition(&b, None).await;
+    let vb = Arc::clone(&rb.volumes[0]);
+    for i in 0..16u64 {
+        vb.commit_block_refs(manager_owner, &refs(tag, manager_owner, i * 10, 3))
+            .await
+            .unwrap();
+        vb.commit_block_refs(guest_owner, &refs(tag, guest_owner, 1000 + i * 10, 3))
+            .await
+            .unwrap();
+    }
+    let live_b = digest_backend(&vb).await.unwrap();
+    assert_eq!(live_a, live_b, "the same records fold to the same digest, one ring or two");
+    vb.sync_device().await.unwrap();
+    drop(vb);
+    drop(rb);
+
+    // Both replay (own-residue for A's two rings) to the live digest; A
+    // replays twice to the same digest.
+    let ra = open_with_partition(&a, Some(PARTITION)).await;
+    let va = &ra.volumes[0];
+    assert_eq!(stats(va).self_recoveries, 2, "both of our Live pages were recovered");
+    assert_eq!(digest_backend(va).await.unwrap(), live_a);
+    assert_eq!(va.block_ref_count(tag, 1005).await.unwrap(), 0);
+    assert_eq!(va.block_ref_count(tag, 1010).await.unwrap(), 1);
+    assert_eq!(va.block_ref_count(tag, 10).await.unwrap(), 1);
+    drop(ra);
+    let ra2 = open_with_partition(&a, Some(PARTITION)).await;
+    assert_eq!(digest_backend(&ra2.volumes[0]).await.unwrap(), live_a);
+    let rb = open_with_partition(&b, None).await;
+    assert_eq!(digest_backend(&rb.volumes[0]).await.unwrap(), live_b);
+    for v in ra2.volumes.iter().chain(rb.volumes.iter()) {
+        v.shutdown().await.unwrap();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_changed_lease_set_refuses_the_mount_as_a_lease_violation() {
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    let uris = vec![format_stamped_member(dir.path(), "meta0").await];
+    let tag = volume_tag("vol-0011223344556677");
+    let guest_owner = guest_local_ino(3, 5);
+    let ra = open_with_partition(&uris, Some(PARTITION)).await;
+    let va = Arc::clone(&ra.volumes[0]);
+    va.commit_block_refs(guest_owner, &refs(tag, guest_owner, 0, 2))
+        .await
+        .unwrap();
+    va.sync_device().await.unwrap();
+    drop(va);
+    drop(ra);
+    let before = META_KV_REPLAY_LEASE_VIOLATIONS.load(Ordering::Relaxed);
+    std::env::set_var(TEST_APPENDER_SLOTS_ENV, "1:9");
+    let r = open_routed_meta_set(&uris).await;
+    std::env::remove_var(TEST_APPENDER_SLOTS_ENV);
+    let err = match r {
+        Ok(_) => panic!("ring 1 holds records for slot 4, which appender 1 no longer leases"),
+        Err(e) => e.to_string(),
+    };
+    assert!(err.contains("does not lease"), "{err}");
+    assert!(META_KV_REPLAY_LEASE_VIOLATIONS.load(Ordering::Relaxed) > before);
+    assert_eq!(META_KV_REPLAY_KEY_VIOLATIONS.load(Ordering::Relaxed), 0);
+    assert_eq!(META_KV_REPLAY_EXTENT_VIOLATIONS.load(Ordering::Relaxed), 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_stalled_appender_ring_grows_a_segment_and_its_content_survives() {
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    let uris = vec![format_stamped_member(dir.path(), "meta0").await];
+    let tag = volume_tag("vol-0011223344556677");
+    let guest_owner = guest_local_ino(3, 9);
+    std::env::set_var("SQUEEZEFS_SYM_RING_KB", "512");
+    let ra = open_with_partition(&uris, Some(PARTITION)).await;
+    std::env::remove_var("SQUEEZEFS_SYM_RING_KB");
+    let va = Arc::clone(&ra.volumes[0]);
+    let s = stats(&va);
+    assert_eq!(s.regions[1].ring_bytes, 512 * 1024, "the knob sized appender 1's ring");
+    assert_eq!(s.regions[1].segments, 1);
+    // 40 × ~27 KB entries ≈ 1 MiB into a 512 KiB ring whose user
+    // capacity is ~250 KB: the committer stalls; the checkpoint poller
+    // advances the tail and wakes it.
+    let committer = {
+        let v = Arc::clone(&va);
+        tokio::spawn(async move {
+            for i in 0..40u64 {
+                v.commit_block_refs(guest_owner, &refs(tag, guest_owner, i * 1000, 500))
+                    .await
+                    .unwrap();
+            }
+        })
+    };
+    while !committer.is_finished() {
+        va.checkpoint_now().await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    committer.await.unwrap();
+    let s = stats(&va);
+    assert!(s.regions[1].stalls > 0, "the small ring stalled: {:?}", s.regions[1]);
+    // Two drained cycles: the first covers the last entry, the second
+    // finds the ring drained with stalls behind it and grows it.
+    va.checkpoint_now().await.unwrap();
+    va.checkpoint_now().await.unwrap();
+    let s = stats(&va);
+    assert!(s.ring_grows >= 1, "{:?}", s.regions[1]);
+    assert!(s.regions[1].segments >= 2 && s.regions[1].segments <= RING_SEGMENTS_MAX as u64);
+    assert!(s.regions[1].ring_bytes > 512 * 1024);
+    // The page names the grown segment table.
+    let path = std::path::Path::new(&uris[0]);
+    let sb = va.superblock().clone();
+    let page1 = read_directory(path, &sb).await.unwrap()[1]
+        .page
+        .clone()
+        .expect("appender 1's page");
+    assert_eq!(page1.segments.len() as u64, s.regions[1].segments);
+    // Content intact, live and after a crash-replay through the grown ring.
+    for i in [0u64, 17, 39] {
+        assert_eq!(va.block_ref_count(tag, i * 1000 + 7).await.unwrap(), 1);
+    }
+    va.commit_block_refs(guest_owner, &refs(tag, guest_owner, 90_000, 4))
+        .await
+        .unwrap();
+    va.sync_device().await.unwrap();
+    let live = digest_backend(&va).await.unwrap();
+    drop(va);
+    drop(ra);
+    let again = open_with_partition(&uris, Some(PARTITION)).await;
+    let v = &again.volumes[0];
+    assert_eq!(digest_backend(v).await.unwrap(), live);
+    assert_eq!(v.block_ref_count(tag, 90_002).await.unwrap(), 1);
+    for v in &again.volumes {
+        v.shutdown().await.unwrap();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_flush_ceiling_is_the_checkpoint_age_and_a_parked_device_moves_the_overrun_counter() {
+    assert_eq!(
+        appender_flush_ceiling_ms(),
+        CHECKPOINT_MAX_AGE_MS as u64,
+        "KD-SYM-10: the ceiling IS the checkpoint cadence ceiling"
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    let uris = vec![format_stamped_member(dir.path(), "meta0").await];
+    let path = std::path::PathBuf::from(&uris[0]);
+    let ra = open_with_partition(&uris, None).await;
+    let va = Arc::clone(&ra.volumes[0]);
+    for i in 0..8u32 {
+        ra.create(ROOT_INO, &format!("n{i}"), libc::S_IFREG | 0o644, 0, 0)
+            .await
+            .unwrap();
+        va.checkpoint_now().await.unwrap();
+    }
+    assert_eq!(stats(&va).flush_ceiling_overruns, 0, "a normal run never overruns");
+    // A parked device: the flush pass's covering barrier lands past the
+    // ceiling while a dirty leaf waited on it.
+    let park = std::time::Duration::from_millis(appender_flush_ceiling_ms() + 400);
+    squeezefs::uring_fs::arm_device_latency(&path, std::time::Duration::ZERO, park);
+    ra.create(ROOT_INO, "late", libc::S_IFREG | 0o644, 0, 0)
+        .await
+        .unwrap();
+    va.checkpoint_now().await.unwrap();
+    squeezefs::uring_fs::disarm_device_latency(&path);
+    assert!(
+        stats(&va).flush_ceiling_overruns >= 1,
+        "the parked barrier is an overrun the counter must see"
+    );
+    for v in &ra.volumes {
+        v.shutdown().await.unwrap();
+    }
+}

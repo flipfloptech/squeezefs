@@ -1251,6 +1251,34 @@ pub async fn read_directory(
     Ok(out)
 }
 
+/// The appender directory's extent CHAIN with each extent's header, in
+/// chain order (empty on a volume with no directory) — what the
+/// manager's `JoinAppender` grows.
+pub async fn read_directory_chain(
+    path: &Path,
+    sb: &super::superblock::SuperblockV3,
+) -> Result<Vec<(ExtentRef, DirHeader)>, KvError> {
+    let mut out = Vec::new();
+    if sb.appender_dir.len == 0 {
+        return Ok(out);
+    }
+    let mut extent = sb.appender_dir;
+    let max_chain = sb.total_extents().max(1);
+    while extent.len != 0 {
+        if out.len() as u64 >= max_chain {
+            return Err(KvError::Corrupt(format!(
+                "{}: appender directory chain exceeds the heap's {max_chain} extents (a cycle)",
+                path.display()
+            )));
+        }
+        let hdr = DirHeader::decode(&read_page(path, dir_header_offset(&extent)).await?)?;
+        let next = hdr.next;
+        out.push((extent, hdr));
+        extent = next;
+    }
+    Ok(out)
+}
+
 /// The four page-slot offsets of `entry`'s appender given its ring's
 /// first segment: `[A, B, R0, R1]` (appender 0's R0/R1 are its fixed
 /// extent's pages 2 and 3; an appender ≥ 1's are its first segment's).

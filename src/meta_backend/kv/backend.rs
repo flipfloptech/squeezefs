@@ -3238,6 +3238,268 @@ impl KvMetaBackend {
         Ok((granted.len() as u64, already.len() as u64))
     }
 
+    /// **`JoinAppender { identity, ring_want_bytes }`** (§5.3.1 / §5.3.5,
+    /// KD-SYM-7): a page already `Live` under `identity` answers
+    /// `already` with what it names; otherwise the lowest `Free` page of
+    /// the directory — the chain grown by one extent when its last
+    /// extent's pairs are all taken — a ring of whole heap extents (≤
+    /// `RING_SEGMENTS_MAX` segments; `ring_want_bytes` clamped to the
+    /// volume's floor/ceiling, 0 = the derivation), their allocator
+    /// deltas as ONE control entry + barrier, the page written `Live`
+    /// into BOTH directory slots (a table change) + barrier, then the
+    /// initial extent grant. Refuses past `appenders_capacity` — the
+    /// ONE hard resource (§5.11) — naming the volume count as the lever.
+    pub async fn manager_join_appender(
+        &self,
+        identity: super::appender::AppenderIdentity,
+        ring_want_bytes: u64,
+    ) -> std::result::Result<JoinOutcome, KvError> {
+        use super::appender::{
+            dir_pair_offsets, dir_pairs_per_extent, read_directory, read_directory_chain,
+            AppenderPage, AppenderState, DirHeader,
+        };
+        let set = self.manager_gate(false)?;
+        let node_size = u64::from(self.sb.node_size);
+        let chosen = {
+            let _g = self.manager_verbs.lock().await;
+            let entries = read_directory(&self.path, &self.sb).await?;
+            // KD-SYM-7: the durable witness — a Live page under this
+            // identity IS the join, whatever RAM remembers.
+            if let Some(e) = entries.iter().find(|e| {
+                e.page
+                    .as_ref()
+                    .is_some_and(|p| p.state == AppenderState::Live && p.identity == identity)
+            }) {
+                let page = e.page.clone().expect("matched a page");
+                let record = self.extent_grant_record(page.appender_id).await?;
+                set.verbs.replays.fetch_add(1, Ordering::Relaxed);
+                return Ok(JoinOutcome {
+                    appender_id: page.appender_id,
+                    page_addr: e.dir_offsets[0],
+                    ring_segments: page.segments.clone(),
+                    grant: record.runs,
+                    already: true,
+                });
+            }
+            let live = entries
+                .iter()
+                .filter(|e| {
+                    e.page
+                        .as_ref()
+                        .is_some_and(|p| p.state == AppenderState::Live)
+                })
+                .count() as u64;
+            if live >= set.capacity {
+                set.verbs.refusals.fetch_add(1, Ordering::Relaxed);
+                return Err(KvError::Busy(format!(
+                    "{}: {live} appenders are live and the ring budget admits {} \
+                     (appenders_capacity = heap/16 ÷ ring) — the lever is the metadata volume \
+                     COUNT, never a format-time client count (design-symmetric-metadata §5.11, \
+                     R-SYM-6)",
+                    self.path.display(),
+                    set.capacity
+                )));
+            }
+            // The lowest Free (or blank) page of the chain; none ⇒ grow it.
+            let free = entries.iter().skip(1).find(|e| {
+                e.page
+                    .as_ref()
+                    .is_none_or(|p| p.state == AppenderState::Free)
+            });
+            let mut claimed: Vec<u64> = Vec::new();
+            let (id, dir_offsets, prior) = match free {
+                Some(e) => (
+                    e.appender_id,
+                    e.dir_offsets,
+                    e.page
+                        .clone()
+                        .unwrap_or_else(|| AppenderPage::free(e.appender_id, 0)),
+                ),
+                None => {
+                    let chain = read_directory_chain(&self.path, &self.sb).await?;
+                    let (last_ext, last_hdr) = chain.last().copied().ok_or_else(|| {
+                        KvError::Corrupt(format!(
+                            "{}: a forest volume with no appender directory",
+                            self.path.display()
+                        ))
+                    })?;
+                    let ext_idx = self.alloc.claim_internal()?;
+                    claimed.push(ext_idx);
+                    let extent = super::superblock::ExtentRef {
+                        start: self.sb.heap.start + ext_idx * node_size,
+                        len: node_size,
+                    };
+                    // The new extent: zeroed pairs, its header LAST, then
+                    // linked from the previous last header — each step
+                    // barriered, so a torn growth leaves a chain that ends
+                    // where it did.
+                    crate::uring_fs::write_at(
+                        self.path.clone(),
+                        extent.start,
+                        bytes::Bytes::from(vec![0u8; node_size as usize]),
+                    )
+                    .await?;
+                    let pairs = dir_pairs_per_extent(node_size);
+                    super::appender::write_page(
+                        &self.path,
+                        super::appender::dir_header_offset(&extent),
+                        DirHeader {
+                            chain_index: last_hdr.chain_index + 1,
+                            next: super::superblock::ExtentRef { start: 0, len: 0 },
+                            pairs: pairs as u16,
+                        }
+                        .encode(),
+                    )
+                    .await?;
+                    self.sync_device().await.map_err(KvError::Io)?;
+                    super::appender::write_page(
+                        &self.path,
+                        super::appender::dir_header_offset(&last_ext),
+                        DirHeader {
+                            next: extent,
+                            ..last_hdr
+                        }
+                        .encode(),
+                    )
+                    .await?;
+                    self.sync_device().await.map_err(KvError::Io)?;
+                    let id = entries.len() as u32;
+                    log::info!(
+                        "meta volume {}: appender directory grew by one extent at {:#x} (chain \
+                         index {}, {pairs} pairs) — appender ids {id}..{}",
+                        self.path.display(),
+                        extent.start,
+                        last_hdr.chain_index + 1,
+                        id + pairs as u32 - 1
+                    );
+                    (id, dir_pair_offsets(&extent, 0), AppenderPage::free(id, 0))
+                }
+            };
+            // The ring: whole extents, coalesced into ≤ RING_SEGMENTS_MAX
+            // segments (the open-time carve's law).
+            let volume_len = self.sb.heap.end();
+            let ring_bytes = if ring_want_bytes == 0 {
+                super::appender::resolve_sym_ring_bytes(0, volume_len)
+            } else {
+                ring_want_bytes.clamp(
+                    super::appender::SYM_RING_FLOOR_BYTES,
+                    super::appender::sym_ring_ceiling_bytes(volume_len),
+                )
+            };
+            let want_extents = ring_bytes.div_ceil(node_size).max(1);
+            let mut ring_claimed: Vec<u64> = Vec::with_capacity(want_extents as usize);
+            for _ in 0..want_extents {
+                match self.alloc.claim_internal() {
+                    Ok(e) => ring_claimed.push(e),
+                    Err(err) => {
+                        for e in claimed.iter().chain(ring_claimed.iter()) {
+                            self.alloc.release_unpublished(*e);
+                        }
+                        return Err(err);
+                    }
+                }
+            }
+            ring_claimed.sort_unstable();
+            let mut segments: Vec<super::superblock::ExtentRef> = Vec::new();
+            for e in &ring_claimed {
+                let start = self.sb.heap.start + e * node_size;
+                match segments.last_mut() {
+                    Some(last) if last.end() == start => last.len += node_size,
+                    _ => segments.push(super::superblock::ExtentRef {
+                        start,
+                        len: node_size,
+                    }),
+                }
+            }
+            if segments.len() > super::appender::RING_SEGMENTS_MAX {
+                for e in claimed.iter().chain(ring_claimed.iter()) {
+                    self.alloc.release_unpublished(*e);
+                }
+                return Err(KvError::Corrupt(format!(
+                    "{}: a {ring_bytes}-byte ring would take {} segments of this heap's free \
+                     extents (the page names at most {}) — lower {} or raise --meta-node-kib",
+                    self.path.display(),
+                    segments.len(),
+                    super::appender::RING_SEGMENTS_MAX,
+                    super::appender::SYM_RING_KB_ENV
+                )));
+            }
+            claimed.extend(ring_claimed);
+            // The claims' deltas, durable before any page names the ring.
+            let recs: Vec<(u8, Record)> = claimed
+                .iter()
+                .map(|e| super::alloc_ext::alloc_record(*e, 0))
+                .collect();
+            if let Err(e) = self.write_control_entry(recs).await {
+                for c in claimed {
+                    self.alloc.release_unpublished(c);
+                }
+                return Err(e);
+            }
+            // The page, Live under the joiner, into BOTH directory slots.
+            let mut page = prior;
+            page.appender_id = id;
+            page.term += 1;
+            page.state = AppenderState::Live;
+            page.recovered_by_term = 0;
+            page.identity = identity;
+            page.is_manager = false;
+            page.home_volume = 0;
+            page.segments = segments.clone();
+            page.head_hint = 0;
+            page.ledger_tail_seq = 0;
+            page.ckpt_seq = 0;
+            page.grant.clear();
+            page.slots.clear();
+            for off in dir_offsets {
+                page.generation += 1;
+                super::appender::write_page(&self.path, off, page.encode()?).await?;
+            }
+            self.sync_device().await.map_err(KvError::Io)?;
+            set.joins.fetch_add(1, Ordering::Relaxed);
+            log::info!(
+                "meta volume {}: JoinAppender — appender {id} (node {:#018x}, mount slot {:#x}) \
+                 joined with a {ring_bytes}-byte ring in {} segment(s), term {}",
+                self.path.display(),
+                identity.node_token,
+                identity.mount_slot,
+                segments.len(),
+                page.term
+            );
+            (id, dir_offsets[0], segments)
+        };
+        // The initial grant — its own control entry, outside the join's
+        // critical section (the verb mutex is not reentrant).
+        let (id, page_addr, ring_segments) = chosen;
+        let grant = self.manager_extent_grant(id, 0).await?;
+        // The joiner's page names its grant (an in-process region did so
+        // inside the grant; a wire joiner's page is the manager's to write).
+        if set.region(id).is_none() {
+            let entries = read_directory(&self.path, &self.sb).await?;
+            if let Some(e) = entries.iter().find(|e| e.appender_id == id) {
+                if let Some(mut page) = e.page.clone() {
+                    page.grant = grant.clone();
+                    for off in e.dir_offsets {
+                        page.generation += 1;
+                        super::appender::write_page(&self.path, off, page.encode()?).await?;
+                    }
+                }
+            }
+        }
+        Ok(JoinOutcome {
+            appender_id: id,
+            page_addr,
+            ring_segments,
+            grant,
+            already: false,
+        })
+    }
+
+    /// The appender set (the manager service's gauge handle).
+    pub fn appenders_public(&self) -> Option<&Arc<super::appender::AppenderSet>> {
+        self.appenders.as_ref()
+    }
+
     /// **The grant cadence of one checkpoint cycle** (§5.3.3): fold every
     /// region's SMO rate, ship the extents its tail released as
     /// `ReturnExtents`, and refill a region at 50 % consumption — the
@@ -7934,6 +8196,19 @@ pub fn durable_volume_id_of(sb_uuid: &[u8; 16]) -> String {
     format!("vol-{:016x}", xxhash_rust::xxh3::xxh3_64(sb_uuid))
 }
 
+/// What `JoinAppender` answered (design-symmetric-metadata §6.3
+/// `Joined`): the appender's id, its page's directory slot A, its ring's
+/// segment table, its grant, and whether the page was ALREADY `Live`
+/// under the caller's identity (KD-SYM-7).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JoinOutcome {
+    pub appender_id: u32,
+    pub page_addr: u64,
+    pub ring_segments: Vec<super::superblock::ExtentRef>,
+    pub grant: Vec<super::appender::GrantRun>,
+    pub already: bool,
+}
+
 /// The Layer B2 mount-gate classification of the replayed claim evidence.
 #[derive(Debug)]
 enum ClaimEvidence {
@@ -10461,17 +10736,25 @@ impl KvMetaBackend {
         // "another process holds the writer claim" refusal, and the
         // non-joining Writer opens — `claim clear`, the guarded offline
         // verbs — are not blocked by a page they never write.
-        // Page 0 is the exception (§5.9, PR 3): a foreign `Live` page 0
-        // at the JOIN belongs to a manager the D0 ladder took the claim
-        // from — dead by D0's proof — and its ring IS the fixed ring
-        // this open replayed; the successor adopts the page with the
-        // role. Every other foreign `Live` page still refuses.
+        // PR 3 narrows the refusal to what a manager may not mount OVER:
+        // a `Recovering` page of any identity, and a foreign `Live` page
+        // whose id the DECLARED partition claims (the seam would steal a
+        // joined appender's page). A foreign `Live` page 0 is a manager
+        // the D0 ladder took the claim from — dead by D0's proof, its ring
+        // the fixed ring this open replayed — and the successor adopts it
+        // with the role (§5.9); every OTHER foreign `Live` page is a
+        // JOINED appender (`JoinAppender`, §5.3.5) — the directory's
+        // normal state on a multi-appender volume, listed on
+        // `appender_live_pages_at_mount`, recovered by PR 10's driver when
+        // its death is proven, never a reason the manager cannot remount.
         let join_refusal = if is_writer {
             entries
                 .iter()
                 .find_map(|e| {
                     e.page.as_ref().filter(|p| {
-                        (p.state == AppenderState::Live && !mine(p) && p.appender_id != 0)
+                        (p.state == AppenderState::Live
+                            && !mine(p)
+                            && partition.contains_key(&p.appender_id))
                             || p.state == AppenderState::Recovering
                     })
                 })

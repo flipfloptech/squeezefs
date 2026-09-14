@@ -573,7 +573,11 @@ fn joiner_identity(n: u64) -> AppenderIdentity {
 
 #[test]
 fn the_manager_call_frames_round_trip_and_the_wire_schema_is_five() {
-    assert_eq!(cw::CLUSTER_WIRE_SCHEMA, 5, "bumped ONCE for the program's wire");
+    assert_eq!(
+        cw::CLUSTER_WIRE_SCHEMA,
+        5,
+        "bumped ONCE for the program's wire"
+    );
     assert_eq!(VERB_MANAGER_CALL, 0x0500, "its own verb block");
     let req = ManagerRequestFrame {
         schema: MANAGER_SCHEMA,
@@ -670,15 +674,24 @@ async fn join_appender_over_the_wire_allocates_a_page_ring_and_grant_and_replays
         }
         other => panic!("{other:?}"),
     };
-    assert_eq!(id, 2, "appender 1 is the declared region; the join takes the next Free page");
+    assert_eq!(
+        id, 2,
+        "appender 1 is the declared region; the join takes the next Free page"
+    );
     let segments = joined_segments(&reply);
     assert!(!segments.is_empty() && segments.len() <= 8);
     let ring_bytes: u64 = segments.iter().map(|s| s.len).sum();
     assert!(ring_bytes >= squeezefs::meta_backend::kv::appender::SYM_RING_FLOOR_BYTES);
-    assert_eq!(grant.iter().map(|(_, l)| u64::from(*l)).sum::<u64>(), GRANT_EXTENTS_FLOOR);
+    assert_eq!(
+        grant.iter().map(|(_, l)| u64::from(*l)).sum::<u64>(),
+        GRANT_EXTENTS_FLOOR
+    );
     // The heap paid for the ring and the grant.
     let ring_extents = ring_bytes / NODE_SIZE as u64;
-    assert_eq!(vol.free_extents(), free_before - ring_extents - GRANT_EXTENTS_FLOOR);
+    assert_eq!(
+        vol.free_extents(),
+        free_before - ring_extents - GRANT_EXTENTS_FLOOR
+    );
     // The directory: page 2 Live under the joiner, its ring and grant named.
     let sb = vol.superblock().clone();
     let entries = read_directory(path, &sb).await.unwrap();
@@ -690,10 +703,16 @@ async fn join_appender_over_the_wire_allocates_a_page_ring_and_grant_and_replays
     assert_eq!(page.term, 1);
     assert_eq!(page.segments, segments);
     assert_eq!(
-        page.grant.iter().map(|r| (r.start, r.len)).collect::<Vec<_>>(),
+        page.grant
+            .iter()
+            .map(|r| (r.start, r.len))
+            .collect::<Vec<_>>(),
         grant
     );
-    assert_eq!(vol.extent_grant_record(2).await.unwrap().runs.len(), grant.len());
+    assert_eq!(
+        vol.extent_grant_record(2).await.unwrap().runs.len(),
+        grant.len()
+    );
     // The replay: the same identity ⇒ `already`, the same page and ring.
     let again = client.join(me, 0).await.unwrap();
     match &again {
@@ -761,10 +780,17 @@ async fn a_join_replayed_against_a_successor_manager_answers_already() {
     let routed = open_with_partition(&uris, Some(PARTITION)).await;
     let vol = Arc::clone(&routed.volumes[0]);
     let s = stats(&vol);
-    assert_eq!(s.manager_lease, ManagerLease::Held, "the successor holds the role");
+    assert_eq!(
+        s.manager_lease,
+        ManagerLease::Held,
+        "the successor holds the role"
+    );
     assert_eq!(s.self_recoveries, 2, "its own two regions' residue");
     let again = vol.manager_join_appender(me, 0).await.unwrap();
-    assert!(again.already, "the successor answers from the page, with no RAM window");
+    assert!(
+        again.already,
+        "the successor answers from the page, with no RAM window"
+    );
     assert_eq!(again.appender_id, id);
     assert_eq!(again.ring_segments, segments);
     assert_eq!(again.grant, grant, "the grant record survived the failover");
@@ -897,7 +923,10 @@ async fn a_join_storm_of_32_completes_inside_the_bound_and_grows_the_directory_c
     drop(routed);
     let routed = open_with_partition(&uris, Some(PARTITION)).await;
     let vol = &routed.volumes[0];
-    let again = vol.manager_join_appender(joiner_identity(131), 0).await.unwrap();
+    let again = vol
+        .manager_join_appender(joiner_identity(131), 0)
+        .await
+        .unwrap();
     assert!(again.already);
     let entries = read_directory(path, &sb).await.unwrap();
     assert_eq!(

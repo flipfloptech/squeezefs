@@ -189,8 +189,15 @@ use std::time::Duration;
 /// PR PK4): a 3-speaker's co-writer would read the flag as absent and run
 /// one-block-per-file for ever — the shipped PK2 shape, silently — and a
 /// 4-speaker against a 3-speaker authority would decode the trailing bool
-/// from EOF; the mismatch refuses loud at the handshake.
-pub const CLUSTER_WIRE_SCHEMA: u32 = 4;
+/// from EOF; the mismatch refuses loud at the handshake. **5 since the
+/// manager verb block** (`crate::meta_ship::manager`, the symmetric
+/// metadata program's `ManagerCall` — design-symmetric-metadata §6.3,
+/// PR 3): a 4-speaker has no `0x0500` block and would answer a
+/// `JoinAppender` with `RPC_UNKNOWN_VERB` after admitting the session;
+/// the mismatch refuses loud at the handshake instead (KD-7 same-commit
+/// fleets). Bumped ONCE for the program's wire — the later rungs extend
+/// the enum under it while the wire is unreleased.
+pub const CLUSTER_WIRE_SCHEMA: u32 = 5;
 
 /// The **pre-authentication** frame class cap: a challenge/proof pair is a
 /// few hundred bytes, so this is all an unauthenticated peer gets to

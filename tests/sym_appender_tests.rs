@@ -1243,8 +1243,17 @@ async fn a_foreign_live_page_refuses_the_writer_open_and_a_probe_lists_it() {
         ),
         "a fresh volume carries no writer claim: {cleared:?}"
     );
-    let err = match open_routed_meta_set(&uris).await {
-        Ok(_) => panic!("a writer must not mount over a foreign Live appender page"),
+    // A DECLARED region whose id a foreign Live page holds: the seam
+    // would steal a joined appender's page — refused. (An undeclared
+    // foreign Live page ≥ 1 is a JOINED appender, the directory's normal
+    // state since PR 3's `JoinAppender`, and refuses nothing.)
+    std::env::set_var(TEST_APPENDER_SLOTS_ENV, PARTITION);
+    std::env::set_var("SQUEEZEFS_SYM_ALLOW_NON_PR", "1");
+    let r = open_routed_meta_set(&uris).await;
+    std::env::remove_var(TEST_APPENDER_SLOTS_ENV);
+    std::env::remove_var("SQUEEZEFS_SYM_ALLOW_NON_PR");
+    let err = match r {
+        Ok(_) => panic!("a writer must not mount a declared region over a foreign Live page"),
         Err(e) => e.to_string(),
     };
     // The refusal names the driver that OWNS the remedy (PR 10) and no

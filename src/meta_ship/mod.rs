@@ -105,6 +105,7 @@
 /// DLM S10 rung 13: the client half of the per-directory EXCLUSIVE UPDATE
 /// grants + asynchronous create-intent batches (KD-MW-13).
 pub mod intents;
+pub mod manager;
 pub mod owners;
 /// DLM S10 rung 14: client-owned-slot placement (KD-MW-6) — the per-client
 /// mint-targeting hint + the valve-bounded migration policy over the

@@ -1974,6 +1974,319 @@ async fn an_smo_retirement_on_an_offset_ring_releases_on_its_entrys_coverage() {
     shutdown(&routed).await;
 }
 
+/// A stamped member of `len` bytes with an `ring` byte fixed ring — the
+/// large-tree fixtures (a slot tree past the inline tails cap is ≈ 90 MiB
+/// of 64 KiB leaves).
+async fn format_stamped_member_sized(
+    dir: &std::path::Path,
+    name: &str,
+    len: u64,
+    ring: u64,
+) -> String {
+    let p = dir.join(name);
+    std::fs::File::create(&p).unwrap().set_len(len).unwrap();
+    let plan = plan_meta_slot_set(1).expect("derived plan");
+    let opts = FormatV3Options {
+        journal_len_override: Some(ring),
+        ..set_opts()
+    };
+    std::env::set_var("SQUEEZEFS_TEST_STAMP_SYMMETRIC", "1");
+    let r = format_v3_stamped(&p, len, &opts, plan.stamps[0].clone()).await;
+    std::env::remove_var("SQUEEZEFS_TEST_STAMP_SYMMETRIC");
+    r.expect("format stamped member");
+    p.display().to_string()
+}
+
+/// Grow slot `slot`'s tree past `nodes` extents (the slot's extent ledger
+/// — leaves plus the few interior nodes) with 15 KiB xattr values (≈ 3
+/// per 64 KiB leaf).
+async fn grow_slot_tree(vol: &KvMetaBackend, slot: ForestSlot, nodes: usize) {
+    let value = vec![0x3Cu8; 15 * 1024];
+    let ledger = Arc::clone(&vol.slot_leases().unwrap().extents);
+    let mut k = 0u64;
+    while (ledger.get(slot) as usize) <= nodes {
+        for _ in 0..64 {
+            vol.setxattr_internal(ino_in_slot(slot, 1 + k / 8), &format!("user.t{k}"), &value)
+                .await
+                .unwrap();
+            k += 1;
+        }
+        assert!(k < 200_000, "the tree never reached {nodes} extents");
+    }
+}
+
+/// The reachable LEAF count of slot `slot`'s tree (a QUIET tree — the
+/// walk is not serialized against SMOs).
+async fn leaf_count(vol: &KvMetaBackend, slot: ForestSlot) -> usize {
+    let tree = vol.slot_tree(slot).expect("the slot tree exists");
+    let mut n = 0usize;
+    for addr in tree.reachable_node_addrs().await.unwrap() {
+        if vol
+            .node_cache()
+            .peek_tail_offset(addr)
+            .await
+            .unwrap()
+            .is_some()
+        {
+            n += 1;
+        }
+    }
+    n
+}
+
+/// **Issue 21 (round 3): a release records the tails of a tree PAST the
+/// inline cap — spilled, complete, and the mount survives.** At 64 KiB
+/// nodes the KV value cap carries ≈ 1,386 tail entries inline; a slot
+/// tree of more leaves than that released to the manager must land (its
+/// `slot_tails` record a SPILL locator, the images barriered before the
+/// record named them), the next checkpoints must run (before the fix the
+/// over-cap value passed `write_control_entry` and the flush pass wedged
+/// on `ValueTooLarge` at tree 0's freeze — the clause-b FAIL-STOP class),
+/// and a remount must read every leaf's tail back through the record.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_release_of_a_tree_past_the_inline_cap_spills_its_tails_and_the_mount_survives() {
+    use squeezefs::meta_backend::kv::slot_state::{inline_tails_cap, SlotTails};
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    let uris = vec![
+        format_stamped_member_sized(dir.path(), "meta0", 320 * 1024 * 1024, 8 * 1024 * 1024).await,
+    ];
+    let routed = open_under(&uris, &Knobs::armed().partition(PARTITION)).await;
+    let vol = Arc::clone(&routed.volumes[0]);
+    let cap = inline_tails_cap(NODE_SIZE / 4 + 256);
+    grow_slot_tree(&vol, SLOT4, cap + 64).await;
+    vol.release_slot_handover(1, SLOT4)
+        .await
+        .expect("the release lands whatever the tree's size");
+    let leaves = leaf_count(&vol, SLOT4).await;
+    assert!(
+        leaves > cap,
+        "the fixture: {leaves} leaves > the inline cap {cap}"
+    );
+    // The mount keeps cycling: the flush pass freezes tree 0's leaf
+    // (before the fix: `ValueTooLarge` at the freeze, deferred node,
+    // pinned tail, the clause-b FAIL-STOP).
+    for _ in 0..3 {
+        vol.checkpoint_now()
+            .await
+            .expect("the flush pass never wedges on tree 0");
+    }
+    assert!(!vol.is_failed(), "never the clause-b fail-stop");
+    // The record is a SPILL locator, COMPLETE over the tree.
+    let (g, tails) = vol
+        .slot_tails(SLOT4)
+        .await
+        .unwrap()
+        .expect("tails recorded");
+    assert_eq!(g, 1);
+    assert_eq!(tails.len(), leaves, "COMPLETE over the tree");
+    let rec = vol.slot_tails_record(SLOT4).await.unwrap().unwrap();
+    let SlotTails::Spilled(sp) = &rec.tails else {
+        panic!("a set past the inline cap spills, got {:?}", rec.tails);
+    };
+    assert_eq!(sp.runs.len(), leaves.div_ceil(NODE_SIZE / 12));
+    let heap = vol.superblock().heap.start;
+    for (addr, _) in &sp.runs {
+        assert!(
+            vol.allocator()
+                .is_allocated((addr - heap) / NODE_SIZE as u64),
+            "the spill's extent at {addr:#x} is claimed in the bitmap"
+        );
+    }
+    // A remount reads the same complete set through the record; the
+    // slot is unleased and acquirable at g + 1.
+    drop(vol);
+    drop(routed);
+    let routed = open_under(&uris, &Knobs::armed().partition(PARTITION_ALT)).await;
+    let vol = Arc::clone(&routed.volumes[0]);
+    assert!(!vol.slot_leases().unwrap().gate.is_leased(SLOT4));
+    let (g2, tails2) = vol.slot_tails(SLOT4).await.unwrap().expect("tails survive");
+    assert_eq!((g2, tails2.len()), (1, leaves));
+    assert_eq!(tails2, tails);
+    let AcquireSlotReply::Granted(gr) = vol.manager_acquire_slot(0, SLOT4).await.unwrap() else {
+        panic!()
+    };
+    assert_eq!(gr.g, 2);
+    // The grant leaves the tails record alone (PR 5 reads generation 1's
+    // tails while the slot is leased at 2).
+    let (g3, tails3) = vol.slot_tails(SLOT4).await.unwrap().expect("kept");
+    assert_eq!((g3, tails3.len()), (1, leaves));
+    // The next release supersedes the record: generation 2's set spills
+    // again and generation 1's spill extents are FREED by the superseding
+    // entry (released to the pool, or already reused by the new spill —
+    // lowest-free-first).
+    vol.release_slot_handover(0, SLOT4).await.unwrap();
+    let (g4, tails4) = vol.slot_tails(SLOT4).await.unwrap().expect("re-recorded");
+    assert_eq!((g4, tails4.len()), (2, leaves));
+    let rec2 = vol.slot_tails_record(SLOT4).await.unwrap().unwrap();
+    let new_addrs = rec2.tails.spill_addrs();
+    assert!(!new_addrs.is_empty(), "still past the inline cap");
+    let heap = vol.superblock().heap.start;
+    for (addr, _) in &sp.runs {
+        assert!(
+            new_addrs.contains(addr)
+                || !vol
+                    .allocator()
+                    .is_allocated((addr - heap) / NODE_SIZE as u64),
+            "generation 1's spill extent at {addr:#x} left the bitmap with its record"
+        );
+    }
+    shutdown(&routed).await;
+}
+
+/// **Issue 21 (round 3): the leave's tree-0 batch is CHUNKED by the entry
+/// cap.** The reviewer's arithmetic: a region holding 108 trees of 100
+/// leaves releases 108 × (an `Unleased` put + a tails record of 100 inline
+/// entries) ≈ 140 KiB of records — past `MAX_ENTRY_LEN` (128 KiB) as ONE
+/// entry, the `EntryTooLarge` the first build hit AFTER its page said
+/// `Releasing`. The packer splits it into entries that each fit, keeps
+/// every member, keeps order, and charges each chunk's grant rewrite;
+/// one member always goes.
+#[test]
+fn the_leaves_batch_of_108_hundred_leaf_trees_packs_into_entries_under_the_cap() {
+    use squeezefs::meta_backend::kv::journal::{
+        pack_entries, record_frame_len, ENTRY_HDR_LEN, MAX_ENTRY_LEN,
+    };
+    use squeezefs::meta_backend::kv::slot_state::{
+        slot_state_key, slot_tails_key, SlotTails, SlotTailsRecord, UNLEASED_LEN,
+    };
+    let tails_len = |leaves: usize| {
+        SlotTailsRecord {
+            g: 1,
+            tails: SlotTails::Inline(vec![(0x1000, 4096); leaves]),
+        }
+        .encode()
+        .unwrap()
+        .len()
+    };
+    let member = |leaves: usize| {
+        record_frame_len(slot_state_key(1).len(), UNLEASED_LEN)
+            + record_frame_len(slot_tails_key(1).len(), tails_len(leaves))
+    };
+    let payloads: Vec<u64> = (0..108).map(|_| member(100)).collect();
+    let total: u64 = payloads.iter().sum();
+    assert!(
+        ENTRY_HDR_LEN + total > MAX_ENTRY_LEN,
+        "the fixture: {total} B of records exceed one entry"
+    );
+    // A grant rewrite of ≤ 8 runs rides beside every chunk.
+    let overhead = |_: std::ops::Range<usize>| record_frame_len(17, 3 + 8 * 12);
+    let chunks = pack_entries(&payloads, overhead);
+    assert!(chunks.len() >= 2, "{chunks:?}");
+    assert_eq!(chunks.first().unwrap().start, 0);
+    assert_eq!(chunks.last().unwrap().end, payloads.len());
+    for w in chunks.windows(2) {
+        assert_eq!(w[0].end, w[1].start, "contiguous, in order");
+    }
+    for c in &chunks {
+        let len: u64 =
+            ENTRY_HDR_LEN + payloads[c.clone()].iter().sum::<u64>() + overhead(c.clone());
+        assert!(len <= MAX_ENTRY_LEN, "chunk {c:?} = {len} B fits one entry");
+    }
+    // A single member past the cap still goes alone (the write's refusal
+    // is the loud outcome, never a silent split of one slot's records).
+    let huge = vec![MAX_ENTRY_LEN, 10, 10];
+    assert_eq!(pack_entries(&huge, |_| 0), vec![0..1, 1..3]);
+    assert!(pack_entries(&[], |_| 0).is_empty());
+}
+
+/// **Issue 21 (round 3): the clean leave of a region holding several
+/// trees records every tree's tails and the next open serves them.** A
+/// declared region leasing three slots grows each to ≈ 120 leaves, leaves
+/// cleanly, and the remount finds every slot `Unleased` at `g = 1` with a
+/// COMPLETE inline tails record, the region's grant record free of the
+/// released trees' images, the two-sided closure holding and C13 empty;
+/// a first touch re-acquires each at `g = 2` and leaves the tails record
+/// alone. (The multi-chunk shape at the real cap is ≈ 600 MiB of leaves
+/// — the packer's own contract above pins that arithmetic exactly.)
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_leave_of_a_region_holding_several_trees_records_every_trees_tails() {
+    use squeezefs::meta_backend::kv::slot_state::SlotTails;
+    const THREE: &str = "1:4,5,6";
+    let slots: [ForestSlot; 3] = [4, 5, 6];
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    let uris = vec![
+        format_stamped_member_sized(dir.path(), "meta0", 128 * 1024 * 1024, 4 * 1024 * 1024).await,
+    ];
+    let closure = |s: &squeezefs::meta_backend::kv::appender::AppenderStats| {
+        assert_eq!(
+            s.grant_granted,
+            s.grant_claimed + s.grant_returned + s.grant_unclaimed,
+            "extent_grant_extents ≡ claimed + returned + unclaimed: {s:?}"
+        );
+    };
+    let mut leaves = [0usize; 3];
+    let images = {
+        let routed = open_under(&uris, &Knobs::armed().partition(THREE)).await;
+        let vol = Arc::clone(&routed.volumes[0]);
+        for s in slots {
+            grow_slot_tree(&vol, s, 120).await;
+        }
+        vol.checkpoint_now().await.unwrap();
+        vol.checkpoint_now().await.unwrap();
+        let heap = vol.superblock().heap.start;
+        let node = u64::from(vol.superblock().node_size);
+        let mut images: Vec<u64> = Vec::new();
+        for (i, s) in slots.iter().enumerate() {
+            leaves[i] = leaf_count(&vol, *s).await;
+            assert!(leaves[i] >= 100, "slot {s}: {} leaves", leaves[i]);
+            for a in vol
+                .slot_tree(*s)
+                .unwrap()
+                .reachable_node_addrs()
+                .await
+                .unwrap()
+            {
+                images.push((a - heap) / node);
+            }
+        }
+        closure(&vol.appender_stats().unwrap());
+        // The clean leave: three `Unleased` puts + three tails records
+        // (+ the grant rewrite) — one entry here, chunked past the cap.
+        shutdown(&routed).await;
+        images
+    };
+    let routed = open_under(&uris, &Knobs::armed().partition(PARTITION_ALT)).await;
+    let vol = Arc::clone(&routed.volumes[0]);
+    let states = tree0_states(&vol).await;
+    for (i, s) in slots.iter().enumerate() {
+        let (_, st) = states.iter().find(|(k, _)| k == s).expect("slot recorded");
+        let SlotState::Unleased { g, .. } = st else {
+            panic!("slot {s} is Unleased after the leave, got {st:?}");
+        };
+        assert_eq!(*g, 1);
+        let (tg, tails) = vol.slot_tails(*s).await.unwrap().expect("tails recorded");
+        assert_eq!(
+            (tg, tails.len()),
+            (1, leaves[i]),
+            "slot {s}: COMPLETE tails"
+        );
+        let rec = vol.slot_tails_record(*s).await.unwrap().unwrap();
+        assert!(
+            matches!(rec.tails, SlotTails::Inline(_)),
+            "≈ 120 leaves ride inline"
+        );
+    }
+    let record = vol.extent_grant_record(1).await.unwrap();
+    assert!(
+        images.iter().all(|e| !record.contains(*e)),
+        "the leave moved every released tree's images out of region 1's record"
+    );
+    closure(&vol.appender_stats().unwrap());
+    assert!(vol.c13_orphan_image_extents().await.unwrap().is_empty());
+    // First touches re-acquire at g = 2; the tails records are untouched.
+    for (i, s) in slots.iter().enumerate() {
+        let AcquireSlotReply::Granted(gr) = vol.manager_acquire_slot(0, *s).await.unwrap() else {
+            panic!()
+        };
+        assert_eq!(gr.g, 2);
+        let (tg, tails) = vol.slot_tails(*s).await.unwrap().unwrap();
+        assert_eq!((tg, tails.len()), (1, leaves[i]));
+    }
+    shutdown(&routed).await;
+}
+
 /// **Issue 24 (round 3): a first-touch acquire never parks for ring space
 /// under `manager_verbs`.** With the cadence parked and ring 0's user
 /// window exhausted, a first-touch commit's door acquire PARKS at ring

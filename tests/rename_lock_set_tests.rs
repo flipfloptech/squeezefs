@@ -113,7 +113,7 @@ async fn a_layout_publish_never_co_queues_with_a_rename_of_the_same_inode() {
     };
     // The publish is queued (its I{ino} guard alive inside the queue).
     poll_until("the layout publish queued", || {
-        META_CONVEYOR_QUEUED.load(Ordering::SeqCst) >= queued0 + 1
+        META_CONVEYOR_QUEUED.load(Ordering::SeqCst) > queued0
     })
     .await;
     let rename = {
@@ -183,7 +183,7 @@ async fn a_layout_publish_of_the_overwrite_victim_never_co_queues_with_the_renam
         })
     };
     poll_until("the victim's publish queued", || {
-        META_CONVEYOR_QUEUED.load(Ordering::SeqCst) >= queued0 + 1
+        META_CONVEYOR_QUEUED.load(Ordering::SeqCst) > queued0
     })
     .await;
     let rename = {

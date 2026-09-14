@@ -129,6 +129,12 @@ pub struct ImageBuilder {
     /// (`format_v3`/`format_v3_stamped`) set it, and the single-writer
     /// opt-out variants are what withhold it.
     multi_writer: bool,
+    /// `format --symmetric` (design-symmetric-metadata §6.2, PR 11): build
+    /// the slot-tree FOREST and stamp incompat bit 17 — the product arm of
+    /// the image the `SQUEEZEFS_TEST_STAMP_SYMMETRIC` seam builds; the
+    /// two are one code path, so their images are byte-identical for one
+    /// description.
+    symmetric: bool,
 }
 
 impl ImageBuilder {
@@ -168,6 +174,7 @@ impl ImageBuilder {
             next_ino: ROOT_INO + 1,
             membership_stamp: None,
             multi_writer: false,
+            symmetric: false,
         })
     }
 
@@ -190,6 +197,16 @@ impl ImageBuilder {
     /// beyond the existing minting acts.
     pub fn set_multi_writer(&mut self) {
         self.multi_writer = true;
+    }
+
+    /// Make the built image a slot-tree FOREST under incompat bit 17
+    /// (`format --symmetric`, design-symmetric-metadata §6.2 / §7.1): tree
+    /// 0, the native slot tree, appender 0's page and the appender
+    /// directory — everything a bit-17 mount expects, in the one planned
+    /// superblock write. The same image the
+    /// `SQUEEZEFS_TEST_STAMP_SYMMETRIC` seam builds.
+    pub fn set_symmetric(&mut self) {
+        self.symmetric = true;
     }
 
     fn check_name(name: &str) -> Result<(), KvError> {
@@ -525,13 +542,15 @@ impl ImageBuilder {
             sb.features_incompat |= super::superblock::FEATURE_INCOMPAT_KV_WRITER_SCOPED_STAGING;
         }
 
-        // **Test seam** (`SQUEEZEFS_TEST_STAMP_SYMMETRIC=1`): stamp incompat
-        // bit 17 (the slot-tree FOREST, docs/design-symmetric-metadata.md
-        // §7.1) at format. The ONLY stamping path until PR 11 lands
-        // `format --symmetric` and the offline conversion verb — a
-        // stamped image is built as the forest below (tree 0 + the native
-        // slot tree), never as the three per-kind trees plus a bit.
-        let symmetric = crate::env_knobs::bool_knob("SQUEEZEFS_TEST_STAMP_SYMMETRIC", false);
+        // Incompat bit 17 (the slot-tree FOREST, docs/design-symmetric-
+        // metadata.md §7.1): `format --symmetric` ([`Self::set_symmetric`])
+        // or the **test seam** `SQUEEZEFS_TEST_STAMP_SYMMETRIC=1` (the
+        // suites' way, so a flat-shaped harness formats a forest without
+        // knowing it). Either way the image is built as the forest below
+        // (tree 0 + the native slot tree + the appender region), never as
+        // the three per-kind trees plus a bit.
+        let symmetric =
+            self.symmetric || crate::env_knobs::bool_knob("SQUEEZEFS_TEST_STAMP_SYMMETRIC", false);
         if symmetric {
             sb.features_incompat |= super::superblock::FEATURE_INCOMPAT_KV_SYMMETRIC_FOREST;
         }
@@ -546,17 +565,16 @@ impl ImageBuilder {
             BUILDER_PENDING_CAP,
         );
 
-        let mut writer = TreeWriter {
+        // Generation-namespaced (uuid-derived) so heap extents reused
+        // across a quick reformat never chain the dead generation's
+        // tail bsets — see [`node_seq_base`].
+        let mut writer = TreeWriter::new(
             path,
-            layout: &self.layout,
-            heap_base: sb.heap.start,
-            alloc: &alloc,
-            // Generation-namespaced (uuid-derived) so heap extents reused
-            // across a quick reformat never chain the dead generation's
-            // tail bsets — see [`node_seq_base`].
-            next_node_seq: node_seq_base(self.cfg.uuid),
-            nodes_written: 0,
-        };
+            &self.layout,
+            sb.heap.start,
+            &alloc,
+            node_seq_base(self.cfg.uuid),
+        );
         // Spec §6.2 item 1 (incompat bit 8): the FORMAT-TIME half of the
         // durable block-reference tree — an EMPTY root, one node, so a
         // bit-8 image needs no structural mutation at first mount.
@@ -612,8 +630,8 @@ impl ImageBuilder {
                 node_seq: seq,
             });
         }
-        let nodes_written = writer.nodes_written;
-        let node_seq_watermark = writer.next_node_seq;
+        let nodes_written = writer.nodes_written();
+        let node_seq_watermark = writer.node_seq_watermark();
 
         // The appender region (design-symmetric-metadata §5.3, PR 2): a
         // stamped image carries appender 0's page pair — `Free`, naming
@@ -725,7 +743,7 @@ fn node_seq_base(uuid: [u8; 16]) -> u64 {
 }
 
 /// Zero `[start, start + len)` in bounded chunks via `uring_fs`.
-async fn zero_range(path: &Path, start: u64, len: u64) -> Result<(), KvError> {
+pub(crate) async fn zero_range(path: &Path, start: u64, len: u64) -> Result<(), KvError> {
     let zeros = bytes::Bytes::from(vec![0u8; ZERO_CHUNK]);
     let mut off = start;
     let end = start + len;
@@ -741,8 +759,11 @@ async fn zero_range(path: &Path, start: u64, len: u64) -> Result<(), KvError> {
 /// usable bytes (append headroom — the K5 split-fill convention), then
 /// interior levels of `(child max_key → (addr, seq))` separators until a
 /// single root remains. Extents claim lowest-first; node seqs count up in
-/// write order — both deterministic.
-struct TreeWriter<'a> {
+/// write order — both deterministic. Shared with the offline
+/// `enable-symmetric` conversion (`config_ops`), which writes a forest
+/// from a flat volume's records exactly the way format writes one from a
+/// description.
+pub(crate) struct TreeWriter<'a> {
     path: &'a Path,
     layout: &'a NodeLayout,
     heap_base: u64,
@@ -751,7 +772,36 @@ struct TreeWriter<'a> {
     nodes_written: u64,
 }
 
-impl TreeWriter<'_> {
+impl<'a> TreeWriter<'a> {
+    /// A writer over `alloc`'s heap at `heap_base`, minting node seqs
+    /// strictly above `node_seq_floor`.
+    pub(crate) fn new(
+        path: &'a Path,
+        layout: &'a NodeLayout,
+        heap_base: u64,
+        alloc: &'a ExtentAllocator,
+        node_seq_floor: u64,
+    ) -> Self {
+        Self {
+            path,
+            layout,
+            heap_base,
+            alloc,
+            next_node_seq: node_seq_floor,
+            nodes_written: 0,
+        }
+    }
+
+    /// The highest node seq minted so far (the ledger's next watermark).
+    pub(crate) fn node_seq_watermark(&self) -> u64 {
+        self.next_node_seq
+    }
+
+    /// Nodes written so far (one heap extent each).
+    pub(crate) fn nodes_written(&self) -> u64 {
+        self.nodes_written
+    }
+
     fn usable_budget(&self) -> usize {
         let usable = self.layout.node_size()
             - NODE_PAGE
@@ -760,7 +810,9 @@ impl TreeWriter<'_> {
         usable * 3 / 4
     }
 
-    async fn write_tree(
+    /// Write one whole tree of `tree_id` from key-ascending `records`;
+    /// returns its root `(addr, node_seq)`.
+    pub(crate) async fn write_tree(
         &mut self,
         tree_id: u8,
         records: Vec<Record>,
@@ -1087,7 +1139,7 @@ pub async fn format_v3(
     volume_len: u64,
     opts: &FormatV3Options,
 ) -> Result<BuiltImage, crate::error::SqueezefsError> {
-    format_v3_inner(path, volume_len, opts, None, true).await
+    format_v3_inner(path, volume_len, opts, None, FormatClass::MultiWriter).await
 }
 
 /// [`format_v3`] through the `--single-writer` opt-out (rung 10b): the
@@ -1102,7 +1154,7 @@ pub async fn format_v3_single_writer(
     volume_len: u64,
     opts: &FormatV3Options,
 ) -> Result<BuiltImage, crate::error::SqueezefsError> {
-    format_v3_inner(path, volume_len, opts, None, false).await
+    format_v3_inner(path, volume_len, opts, None, FormatClass::SingleWriter).await
 }
 
 /// [`format_v3`] for one member of a multi-volume set (PR VL5a,
@@ -1120,7 +1172,14 @@ pub async fn format_v3_stamped(
     opts: &FormatV3Options,
     stamp: super::checkpoint::MembershipStamp,
 ) -> Result<BuiltImage, crate::error::SqueezefsError> {
-    format_v3_inner(path, volume_len, opts, Some(stamp), true).await
+    format_v3_inner(
+        path,
+        volume_len,
+        opts,
+        Some(stamp),
+        FormatClass::MultiWriter,
+    )
+    .await
 }
 
 /// [`format_v3_stamped`] through the `--single-writer` opt-out (see
@@ -1135,7 +1194,42 @@ pub async fn format_v3_stamped_single_writer(
     opts: &FormatV3Options,
     stamp: super::checkpoint::MembershipStamp,
 ) -> Result<BuiltImage, crate::error::SqueezefsError> {
-    format_v3_inner(path, volume_len, opts, Some(stamp), false).await
+    format_v3_inner(
+        path,
+        volume_len,
+        opts,
+        Some(stamp),
+        FormatClass::SingleWriter,
+    )
+    .await
+}
+
+/// [`format_v3_stamped`] under `format --symmetric`
+/// (design-symmetric-metadata §6.2, PR 11): the multi-writer-capable
+/// class PLUS incompat bit 17 — one set member built as a slot-tree
+/// forest (tree 0, the native slot tree, appender 0's page, the appender
+/// directory) in the one planned superblock write. The same image the
+/// `SQUEEZEFS_TEST_STAMP_SYMMETRIC` seam builds; dark until the PR-14
+/// default flip. The single-writer opt-out has no symmetric form: the
+/// forest presumes the nine multi-writer bits.
+pub async fn format_v3_stamped_symmetric(
+    path: &Path,
+    volume_len: u64,
+    opts: &FormatV3Options,
+    stamp: super::checkpoint::MembershipStamp,
+) -> Result<BuiltImage, crate::error::SqueezefsError> {
+    format_v3_inner(path, volume_len, opts, Some(stamp), FormatClass::Symmetric).await
+}
+
+/// The format CLASS a public formatter builds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FormatClass {
+    /// The nine multi-writer bits (the default since the rung-10b flip).
+    MultiWriter,
+    /// None of them (`--single-writer`).
+    SingleWriter,
+    /// The multi-writer class plus the bit-17 forest (`--symmetric`).
+    Symmetric,
 }
 
 async fn format_v3_inner(
@@ -1143,7 +1237,7 @@ async fn format_v3_inner(
     volume_len: u64,
     opts: &FormatV3Options,
     stamp: Option<super::checkpoint::MembershipStamp>,
-    multi_writer: bool,
+    class: FormatClass,
 ) -> Result<BuiltImage, crate::error::SqueezefsError> {
     format_preflight(path, opts.force).await?;
 
@@ -1200,8 +1294,13 @@ async fn format_v3_inner(
         builder.set_xattr(ROOT_INO, FORMAT_CONFIG_XATTR, cfg)?;
     }
     builder.set_membership_stamp(stamp);
-    if multi_writer {
-        builder.set_multi_writer();
+    match class {
+        FormatClass::MultiWriter => builder.set_multi_writer(),
+        FormatClass::SingleWriter => {}
+        FormatClass::Symmetric => {
+            builder.set_multi_writer();
+            builder.set_symmetric();
+        }
     }
     Ok(builder.build(path, volume_len).await?)
 }

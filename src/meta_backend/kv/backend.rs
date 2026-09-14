@@ -1474,6 +1474,56 @@ impl KvMetaBackend {
     /// [`Self::shutdown`] or when the backend is dropped (the v2 flusher's
     /// sentinel discipline — no leaked tasks).
     pub async fn open(path: &Path) -> std::result::Result<Arc<Self>, KvError> {
+        Self::open_writer(path, false).await
+    }
+
+    /// [`Self::open`] for the offline `squeezefs volume enable-symmetric`
+    /// conversion (design-symmetric-metadata §6.2, PR 11) — the ONE
+    /// writable open that tolerates the `sym_upgrade:` marker, so the
+    /// verb can resume its own crashed run. Every other step of the D0
+    /// ladder is [`Self::open`]'s verbatim.
+    pub async fn open_for_sym_upgrade(path: &Path) -> std::result::Result<Arc<Self>, KvError> {
+        Self::open_writer(path, true).await
+    }
+
+    /// The `sym_upgrade:` marker gate (design-symmetric-metadata §6.2,
+    /// PR 11): a volume mid-conversion refuses every writable open that is
+    /// not the verb's own, BEFORE the claim gate — so a refused open writes
+    /// nothing (no claim tx, no checkpoint task), which is what keeps every
+    /// intermediate durable state of the conversion exactly what the verb
+    /// left and therefore resumable. One `getxattr` on ino 1, whose leaf
+    /// the claim gate reads next anyway; a volume nobody is converting
+    /// answers `None` and pays nothing else.
+    async fn refuse_sym_upgrade_marker(&self, path: &Path) -> std::result::Result<(), KvError> {
+        match self.getxattr(1, crate::SYM_UPGRADE_MARKER_XATTR).await {
+            Ok(Some(raw)) => {
+                let named = match crate::config_ops::SymUpgradeMarker::decode(&raw) {
+                    Ok(m) => format!("covering volumes {:?}", m.volumes),
+                    Err(e) => format!("(marker undecodable: {e})"),
+                };
+                Err(KvError::Busy(format!(
+                    "{}: refusing a writable mount — a symmetric-forest conversion marker \
+                     (`{}`) is present on this volume {named}: a `squeezefs volume \
+                     enable-symmetric` run crashed mid-conversion. Re-run `squeezefs volume \
+                     enable-symmetric <sqmeta-uri> --resume` (idempotent, continues from \
+                     the crash point); read-only mounts keep serving",
+                    path.display(),
+                    crate::SYM_UPGRADE_MARKER_XATTR
+                )))
+            }
+            Ok(None) => Ok(()),
+            Err(e) => Err(KvError::Busy(format!(
+                "{}: refusing a writable mount — the symmetric-forest conversion marker \
+                 probe failed ({e}); never guess about a bracket",
+                path.display()
+            ))),
+        }
+    }
+
+    async fn open_writer(
+        path: &Path,
+        tolerate_sym_upgrade: bool,
+    ) -> std::result::Result<Arc<Self>, KvError> {
         let open_started = std::time::Instant::now();
         // (1) Layer A first: kernel-arbitrated, cheapest, and the refusal
         // the measured incident (two same-host daemons) needs.
@@ -1549,6 +1599,11 @@ impl KvMetaBackend {
         // (2) Bootstrap replay (sets `boot_id` — shared with probes).
         let mut inner = Self::open_inner(path, OpenPosture::Writer).await?;
         *inner.guard_fd.get_mut().unwrap() = Some(guard_fd);
+        // (2b) The `sym_upgrade:` marker gate — before the claim, so a
+        // refusal drops `inner` (and its flock) with nothing written.
+        if !tolerate_sym_upgrade {
+            inner.refuse_sym_upgrade_marker(path).await?;
+        }
         inner.writer_id = uuid::Uuid::new_v4().to_string();
         // Layer B1 resolution: test override first, then the real RESCAP
         // probe (control-plane ioctl — off the async runtime).

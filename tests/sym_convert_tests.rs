@@ -38,8 +38,8 @@ use squeezefs::config_ops::{
 use squeezefs::meta_backend::kv::backend::KvMetaBackend;
 use squeezefs::meta_backend::kv::block_refs::{volume_tag, BlockRef, BlockRefOp};
 use squeezefs::meta_backend::kv::builder::{
-    digest_backend, format_v3_stamped, format_v3_stamped_symmetric, BuilderConfig,
-    FormatV3Options, ImageBuilder, ROOT_INO,
+    digest_backend, format_v3_stamped, format_v3_stamped_symmetric, BuilderConfig, FormatV3Options,
+    ImageBuilder, ROOT_INO,
 };
 use squeezefs::meta_backend::kv::checkpoint::{read_newest_ledger, write_ledger_slot};
 use squeezefs::meta_backend::kv::journal::AppendPartition;
@@ -82,18 +82,72 @@ fn set_opts() -> FormatV3Options {
     }
 }
 
+/// The volume-set format config the first member records (what the
+/// offline fsck harness reads back to build its router), naming one
+/// file-backed data volume under `dir`.
+fn format_config_for(dir: &Path) -> Vec<u8> {
+    let oss = dir.join("oss0");
+    std::fs::File::create(&oss)
+        .unwrap()
+        .set_len(64 * 1024 * 1024)
+        .unwrap();
+    let cfg = squeezefs::FormatConfig {
+        name: "squeezefs".to_string(),
+        block_size: 4096,
+        capacity: 1 << 30,
+        inodes: 1_000_000,
+        compression: "none".to_string(),
+        encrypt_algo: "none".to_string(),
+        encrypt_key: None,
+        encrypt_key_ref: None,
+        mem_cache_size: None,
+        disk_cache_size: None,
+        disk_cache_paths: None,
+        data_lv: Some(vec![oss.display().to_string()]),
+        data_volumes: None,
+        read_cache_size: None,
+        write_cache_size: None,
+        read_mem_cache_size: None,
+        write_mem_cache_size: None,
+        dismount_wait: None,
+        upload_delay: None,
+        fuse_io_uring_sqpoll_idle_ms: None,
+        meta_routing_width: None,
+        meta_slot_runs: None,
+        meta_volumes: None,
+    };
+    serde_json::to_vec(&cfg).unwrap()
+}
+
 /// Format an `n`-member derived-width set of the DEFAULT (multi-writer-
-/// capable, bit-17-absent) class — the shape every field volume has.
+/// capable, bit-17-absent) class — the shape every field volume has. The
+/// seam is cleared for the build (and restored): this suite's source
+/// volumes are FLAT whatever leg of the matrix runs it — the verb is what
+/// stamps.
 async fn format_flat_set(dir: &Path, n: usize) -> Vec<String> {
     let plan = plan_meta_slot_set(n).expect("derived plan");
     let mut uris = Vec::with_capacity(n);
+    let _g = SEAM.lock().await;
+    let prior = std::env::var_os("SQUEEZEFS_TEST_STAMP_SYMMETRIC");
+    std::env::remove_var("SQUEEZEFS_TEST_STAMP_SYMMETRIC");
     for i in 0..n {
         let p = dir.join(format!("meta{i}"));
         std::fs::File::create(&p).unwrap().set_len(VOL_LEN).unwrap();
-        format_v3_stamped(&p, VOL_LEN, &set_opts(), plan.stamps[i].clone())
-            .await
-            .expect("format flat member");
+        let opts = FormatV3Options {
+            format_config_xattr: (i == 0).then(|| format_config_for(dir)),
+            ..set_opts()
+        };
+        let r = format_v3_stamped(&p, VOL_LEN, &opts, plan.stamps[i].clone()).await;
+        if r.is_err() {
+            if let Some(v) = &prior {
+                std::env::set_var("SQUEEZEFS_TEST_STAMP_SYMMETRIC", v);
+            }
+        }
+        r.expect("format flat member");
         uris.push(p.display().to_string());
+    }
+    if let Some(v) = prior {
+        std::env::set_var("SQUEEZEFS_TEST_STAMP_SYMMETRIC", v);
     }
     uris
 }
@@ -115,6 +169,30 @@ async fn digest_of(path: &str) -> u64 {
         .await
         .expect("probe open");
     digest_backend(&be).await.expect("digest")
+}
+
+/// The bitmap-vs-reachability census of one quiesced volume through a
+/// probe: `(claimed extents, extents some tree root reaches)`.
+async fn extent_census(path: &str) -> (u64, u64) {
+    let be = KvMetaBackend::open_probe(Path::new(path))
+        .await
+        .expect("probe open");
+    assert_eq!(
+        be.replay_stats().entries,
+        0,
+        "the census is exact only over an empty replay window"
+    );
+    let sb = be.superblock().clone();
+    let mut reachable = std::collections::BTreeSet::new();
+    for tree in be.all_trees() {
+        for addr in tree.reachable_node_addrs().await.expect("walk") {
+            reachable.insert((addr - sb.heap.start) / u64::from(sb.node_size));
+        }
+    }
+    let claimed = (0..sb.total_extents())
+        .filter(|e| be.allocator().is_allocated(*e))
+        .count() as u64;
+    (claimed, reachable.len() as u64)
 }
 
 /// Whether the volume carries the `sym_upgrade:` marker (probe-read).
@@ -199,10 +277,7 @@ async fn churn(routed: &RoutedMetaBackend, files: u32) -> Population {
         .find(|(k, _)| k.starts_with("/work/f"))
         .map(|(_, v)| v)
         .expect("a surviving file");
-    routed
-        .link(first, docs, "hard.lnk")
-        .await
-        .expect("link");
+    routed.link(first, docs, "hard.lnk").await.expect("link");
     pop.inos.insert("/docs/hard.lnk".into(), first);
     let moved = routed
         .create(docs, "moving.txt", libc::S_IFREG | 0o600, 0, 0)
@@ -269,7 +344,11 @@ async fn assert_population(routed: &RoutedMetaBackend, pop: &Population) {
     }
     for ((ino, name), value) in &pop.xattrs {
         assert_eq!(
-            routed.getxattr(*ino, name).await.expect("getxattr").as_deref(),
+            routed
+                .getxattr(*ino, name)
+                .await
+                .expect("getxattr")
+                .as_deref(),
             Some(value.as_slice()),
             "xattr {name} of ino {ino}"
         );
@@ -289,7 +368,7 @@ async fn assert_population(routed: &RoutedMetaBackend, pop: &Population) {
     for (tag, blk, want) in &pop.refs {
         let mut count = 0u64;
         for vol in &routed.volumes {
-            count += vol.block_ref_count(*tag, *blk).await.expect("refcount");
+            count += vol.block_ref_count(*tag, *blk).await.expect("refcount") as u64;
         }
         assert_eq!(count, *want, "refcount(block {blk}) over the set");
     }
@@ -297,7 +376,11 @@ async fn assert_population(routed: &RoutedMetaBackend, pop: &Population) {
 
 /// A flat set of `n` volumes populated with `files` files, cleanly shut
 /// down: the per-volume digests, the population, the URIs.
-async fn populated_flat_set(dir: &Path, n: usize, files: u32) -> (Vec<String>, Vec<u64>, Population) {
+async fn populated_flat_set(
+    dir: &Path,
+    n: usize,
+    files: u32,
+) -> (Vec<String>, Vec<u64>, Population) {
     let uris = format_flat_set(dir, n).await;
     let routed = open_routed_meta_set(&uris).await.expect("open flat set");
     let pop = churn(&routed, files).await;
@@ -351,10 +434,13 @@ async fn storm(routed: &RoutedMetaBackend, rounds: u32) {
                 .expect("rename");
         }
         if i % 4 == 3 {
-            routed
-                .unlink(d, &format!("s{:04}", i - 1))
-                .await
-                .expect("unlink");
+            let prev = i - 1;
+            let name = if prev % 3 == 2 {
+                format!("r{prev:04}")
+            } else {
+                format!("s{prev:04}")
+            };
+            routed.unlink(d, &name).await.expect("unlink");
         }
     }
 }
@@ -386,12 +472,27 @@ async fn a_converted_volumes_post_fold_digest_equals_the_sources() {
         .await
         .expect("enable-symmetric converts a flat set");
     assert_eq!(report.rows.len(), 1);
+    println!("conversion row: {:?}", report.rows[0]);
     assert_eq!(report.rows[0].outcome, ConversionOutcome::Converted);
     assert!(report.rows[0].records > 0, "records were moved");
     assert!(
         report.rows[0].slot_trees > 1,
         "a derived-width set's mints spread over guest slots: {} slot trees",
         report.rows[0].slot_trees
+    );
+    assert!(
+        report.rows[0].extents_freed > 0,
+        "the emptied shared trees returned their extents"
+    );
+    // The forest the conversion leaves is exactly accounted: every
+    // claimed extent is a node some root reaches or the directory extent
+    // (the census that reclaimed the source's leaked images holds on the
+    // result — see `a_clean_flat_unmount_leaves_claimed_extents_no_root_reaches`).
+    let (claimed, reachable) = extent_census(&uris[0]).await;
+    assert_eq!(
+        claimed,
+        reachable + 1,
+        "claimed extents = reachable nodes + the appender directory extent"
     );
 
     let sb = superblock_of(&uris[0]).await;
@@ -407,7 +508,10 @@ async fn a_converted_volumes_post_fold_digest_equals_the_sources() {
     let rpcs_before = squeezefs::dlm_slot::dlm_rpcs();
     let routed = open_routed_meta_set(&uris).await.expect("forest mount");
     let vol = &routed.volumes[0];
-    assert!(vol.symmetric_forest(), "the converted volume mounts as a forest");
+    assert!(
+        vol.symmetric_forest(),
+        "the converted volume mounts as a forest"
+    );
     assert_eq!(digest_backend(vol).await.unwrap(), digests[0]);
     assert_population(&routed, &pop).await;
     assert_eq!(
@@ -443,6 +547,60 @@ async fn a_converted_volumes_post_fold_digest_equals_the_sources() {
     fsck_clean(&uris).await;
 }
 
+/// **Finding (PR 11, shipped, every flat volume): a clean unmount leaves
+/// claimed extents no ledger root reaches.** The checkpoint cycle's
+/// coverage barrier releases the pending frees its tail covers
+/// (`after_durable_barrier` → `advance_durable`) AFTER that cycle wrote
+/// its bitmap pages, so the release only dirties the pages for the NEXT
+/// cycle — and the shutdown fixpoint converges on ring coverage (`head ==
+/// reusable_upto`), never on "no dirty bitmap page", so the FINAL cycle's
+/// releases are never written: the freed images read CLAIMED at the next
+/// mount, and nothing in the (covered) window frees them again. Every
+/// clean unmount whose last cycle retired an image leaks it — the idle
+/// mount/unmount pair below leaks one. The conversion's pre-build census
+/// reclaims the class as a side effect (`orphans_reclaimed`); this pin
+/// records the shipped shape so the fix, when it lands in the checkpoint
+/// task, is asked to flip it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_clean_flat_unmount_leaves_claimed_extents_no_root_reaches() {
+    let dir = tempfile::tempdir().unwrap();
+    let (uris, _d, _p) = populated_flat_set(dir.path(), 1, 60).await;
+    let (claimed0, reachable0) = extent_census(&uris[0]).await;
+    assert!(
+        claimed0 > reachable0,
+        "the populated volume's clean unmount already leaked: claimed {claimed0} vs reachable \
+         {reachable0}"
+    );
+    // Idle mount cycles: no records change, yet the claimed count grows.
+    for _ in 0..3 {
+        let routed = open_routed_meta_set(&uris).await.expect("mount");
+        for v in &routed.volumes {
+            v.shutdown().await.unwrap();
+        }
+    }
+    let (claimed3, reachable3) = extent_census(&uris[0]).await;
+    assert_eq!(reachable3, reachable0, "the trees hold the same population");
+    assert!(
+        claimed3 > claimed0,
+        "idle mount cycles leak claimed extents: {claimed0} → {claimed3}"
+    );
+    // The conversion reclaims that class (its own quiesce is one more
+    // mount cycle, which may leak once more before the census), then
+    // leaves a volume whose claimed set is its reachable set plus the
+    // directory extent.
+    let report = enable_symmetric(&uris, &EnableSymOptions::default())
+        .await
+        .expect("convert");
+    assert!(
+        report.rows[0].orphans_reclaimed >= claimed3 - reachable3,
+        "reclaimed {} ≥ the {} leaked before the verb ran",
+        report.rows[0].orphans_reclaimed,
+        claimed3 - reachable3
+    );
+    let (claimed, reachable) = extent_census(&uris[0]).await;
+    assert_eq!(claimed, reachable + 1);
+}
+
 // ---------------------------------------------------------------------------
 // The crash-window matrix.
 // ---------------------------------------------------------------------------
@@ -459,8 +617,7 @@ async fn crash_then_resume(window: EnableSymCrash) -> u64 {
     };
     let err = enable_symmetric_with(&uris, &EnableSymOptions::default(), &hooks)
         .await
-        .err()
-        .expect("the injected crash aborts the verb");
+        .expect_err("the injected crash aborts the verb");
     assert!(
         err.to_string().contains("crash injection"),
         "the abort is the seam's: {err}"
@@ -474,23 +631,19 @@ async fn crash_then_resume(window: EnableSymCrash) -> u64 {
         refusal.contains(&uris[0]),
         "the refusal names the volume: {refusal}"
     );
-    // Readers keep serving on whichever layout is current.
+    // Readers keep serving on whichever layout is current. (The digest
+    // is not compared here: the marker is itself an ino-1 xattr the walk
+    // hashes — equality is asserted once the resume removes it.)
     let reader = open_routed_meta_set_read_only(&uris)
         .await
         .expect("a read-only mount proceeds under the marker");
-    assert_eq!(
-        digest_backend(&reader.volumes[0]).await.unwrap(),
-        digests[0],
-        "the reader serves the population across the crash window"
-    );
     assert_population(&reader, &pop).await;
     drop(reader);
 
     // A plain re-run refuses: a crashed run must be acknowledged.
     let plain = enable_symmetric(&uris, &EnableSymOptions::default())
         .await
-        .err()
-        .expect("a marker refuses a plain re-run");
+        .expect_err("a marker refuses a plain re-run");
     assert!(plain.to_string().contains("--resume"), "{plain}");
 
     let report = enable_symmetric(
@@ -502,7 +655,17 @@ async fn crash_then_resume(window: EnableSymCrash) -> u64 {
     )
     .await
     .expect("the resume completes the conversion");
+    println!("resume row after {window:?}: {:?}", report.rows[0]);
     assert_eq!(report.rows[0].outcome, ConversionOutcome::Resumed);
+    if matches!(
+        window,
+        EnableSymCrash::AfterBuild { .. } | EnableSymCrash::AfterLedger { .. }
+    ) {
+        assert!(
+            report.rows[0].orphans_reclaimed > 0,
+            "the resume reclaims the crashed build's extents before rebuilding"
+        );
+    }
     assert!(is_symmetric(&superblock_of(&uris[0]).await));
     assert!(!marker_present(&uris[0]).await);
     assert_eq!(digest_of(&uris[0]).await, digests[0]);
@@ -586,8 +749,7 @@ async fn an_already_symmetric_set_is_refused() {
     let uris = vec![p.display().to_string()];
     let err = enable_symmetric(&uris, &EnableSymOptions::default())
         .await
-        .err()
-        .expect("refused");
+        .expect_err("refused");
     assert!(err.to_string().contains("already symmetric"), "{err}");
 }
 
@@ -612,8 +774,7 @@ async fn a_bit_8_non_solo_partition_record_is_refused_naming_the_solo_mount() {
         .unwrap();
     let err = enable_symmetric(&uris, &EnableSymOptions::default())
         .await
-        .err()
-        .expect("refused");
+        .expect_err("refused");
     let msg = err.to_string();
     assert!(
         msg.contains("partition") && msg.contains("solo"),
@@ -628,7 +789,9 @@ async fn an_open_cross_volume_intent_is_refused() {
     let (uris, _d, _p) = populated_flat_set(dir.path(), 1, 20).await;
     // Plant an intent record on the reserved intent ino (what a crashed
     // cross-volume transaction leaves behind), through the guarded open.
-    let be = KvMetaBackend::open(Path::new(&uris[0])).await.expect("open");
+    let be = KvMetaBackend::open(Path::new(&uris[0]))
+        .await
+        .expect("open");
     let key = xattr_key(
         squeezefs::meta_backend::crossvol_tx::XV_INTENT_INO,
         0x1234 & HASH56_MAX,
@@ -640,25 +803,25 @@ async fn an_open_cross_volume_intent_is_refused() {
     }
     .encode()
     .unwrap();
-    be.insert_kind(TREE_XATTRS, &key, value).await.expect("plant");
+    be.insert_kind(TREE_XATTRS, &key, value)
+        .await
+        .expect("plant");
     be.checkpoint_now().await.unwrap();
     be.shutdown().await.unwrap();
     drop(be);
     let err = enable_symmetric(&uris, &EnableSymOptions::default())
         .await
-        .err()
-        .expect("refused");
-    assert!(
-        err.to_string().contains("cross-volume intent"),
-        "{err}"
-    );
+        .expect_err("refused");
+    assert!(err.to_string().contains("cross-volume intent"), "{err}");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_in_flight_job_record_is_refused() {
     let dir = tempfile::tempdir().unwrap();
     let (uris, _d, _p) = populated_flat_set(dir.path(), 1, 20).await;
-    let be = KvMetaBackend::open(Path::new(&uris[0])).await.expect("open");
+    let be = KvMetaBackend::open(Path::new(&uris[0]))
+        .await
+        .expect("open");
     let (name, bytes) = squeezefs::jobs::durable_queued_job_xattr(
         &squeezefs::jobs::JobType::Noop {
             tasks: 4,
@@ -674,8 +837,7 @@ async fn an_in_flight_job_record_is_refused() {
     drop(be);
     let err = enable_symmetric(&uris, &EnableSymOptions::default())
         .await
-        .err()
-        .expect("refused");
+        .expect_err("refused");
     assert!(err.to_string().contains("job"), "{err}");
 }
 
@@ -686,8 +848,7 @@ async fn a_live_client_is_refused() {
     let live = open_routed_meta_set(&uris).await.expect("live writer");
     let err = enable_symmetric(&uris, &EnableSymOptions::default())
         .await
-        .err()
-        .expect("refused under a live client");
+        .expect_err("refused under a live client");
     assert!(err.to_string().contains("mounted"), "{err}");
     for v in &live.volumes {
         v.shutdown().await.unwrap();
@@ -706,8 +867,7 @@ async fn resume_with_nothing_to_resume_is_refused() {
         },
     )
     .await
-    .err()
-    .expect("refused");
+    .expect_err("refused");
     assert!(err.to_string().contains("nothing to resume"), "{err}");
     assert!(!is_symmetric(&superblock_of(&uris[0]).await));
 }
@@ -784,7 +944,9 @@ async fn format_symmetric_builds_the_image_the_seam_builds_byte_for_byte() {
         std::env::remove_var("SQUEEZEFS_TEST_STAMP_SYMMETRIC");
         let mut b = describe();
         b.set_symmetric();
-        b.build(flag.path(), VOL_LEN).await.expect("build --symmetric");
+        b.build(flag.path(), VOL_LEN)
+            .await
+            .expect("build --symmetric");
         std::env::set_var("SQUEEZEFS_TEST_STAMP_SYMMETRIC", "1");
         let r = describe().build(seam.path(), VOL_LEN).await;
         std::env::remove_var("SQUEEZEFS_TEST_STAMP_SYMMETRIC");
@@ -811,8 +973,7 @@ async fn the_public_symmetric_formatter_mounts_as_a_forest() {
     let sb = superblock_of(&uris[0]).await;
     assert!(is_symmetric(&sb));
     assert!(
-        sb.features_incompat
-            & squeezefs::meta_backend::kv::superblock::MULTI_WRITER_FORMAT_BITS
+        sb.features_incompat & squeezefs::meta_backend::kv::superblock::MULTI_WRITER_FORMAT_BITS
             == squeezefs::meta_backend::kv::superblock::MULTI_WRITER_FORMAT_BITS,
         "--symmetric is the multi-writer-capable class plus bit 17"
     );
@@ -894,7 +1055,10 @@ async fn a_four_volume_set_converts_every_volume_in_one_invocation() {
         .expect("convert the set");
     assert_eq!(report.rows.len(), 4);
     for (i, uri) in uris.iter().enumerate() {
-        assert!(is_symmetric(&superblock_of(uri).await), "volume {i} stamped");
+        assert!(
+            is_symmetric(&superblock_of(uri).await),
+            "volume {i} stamped"
+        );
         assert!(!marker_present(uri).await, "volume {i} marker gone");
         assert_eq!(
             report.rows[i].outcome,
@@ -929,8 +1093,7 @@ async fn a_half_converted_set_refuses_writable_mounts_naming_the_volume() {
     };
     enable_symmetric_with(&uris, &EnableSymOptions::default(), &hooks)
         .await
-        .err()
-        .expect("the injected crash aborts the verb");
+        .expect_err("the injected crash aborts the verb");
     // Volumes 0 and 1 are stamped (1 still under its marker); 2 and 3 are
     // flat under theirs.
     assert!(is_symmetric(&superblock_of(&uris[0]).await));
@@ -947,9 +1110,14 @@ async fn a_half_converted_set_refuses_writable_mounts_naming_the_volume() {
     let reader = open_routed_meta_set_read_only(&uris)
         .await
         .expect("readers proceed");
-    for (i, vol) in reader.volumes.iter().enumerate() {
-        assert_eq!(digest_backend(vol).await.unwrap(), digests[i]);
-    }
+    // Volume 0 finished (marker gone): its digest is the source's; the
+    // others still carry the marker xattr the walk hashes — the population
+    // check is the layout-blind assertion for them.
+    assert_eq!(
+        digest_backend(&reader.volumes[0]).await.unwrap(),
+        digests[0]
+    );
+    assert_population(&reader, &pop).await;
     drop(reader);
 
     let report = enable_symmetric(
@@ -990,8 +1158,7 @@ async fn a_refused_writable_open_writes_nothing() {
     };
     enable_symmetric_with(&uris, &EnableSymOptions::default(), &hooks)
         .await
-        .err()
-        .expect("crash");
+        .expect_err("crash");
     let sb = superblock_of(&uris[0]).await;
     let fixed_len = sb.heap.start as usize;
     let before = squeezefs::uring_fs::read_at(Path::new(&uris[0]), 0, fixed_len)
@@ -1006,7 +1173,9 @@ async fn a_refused_writable_open_writes_nothing() {
         "a refused writable open leaves the fixed structures byte-identical"
     );
     // The marker's value names the act.
-    let be = KvMetaBackend::open_probe(Path::new(&uris[0])).await.unwrap();
+    let be = KvMetaBackend::open_probe(Path::new(&uris[0]))
+        .await
+        .unwrap();
     let raw = be
         .getxattr(ROOT_INO, SYM_UPGRADE_MARKER_XATTR)
         .await

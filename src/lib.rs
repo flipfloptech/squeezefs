@@ -1087,6 +1087,18 @@ pub const MW_UPGRADE_MARKER_VERSION: u8 = 1;
 /// unmountable.
 pub const OWNER_ASSIGN_MARKER_XATTR: &str = "owner_assign:intent";
 
+/// The durable **symmetric-forest conversion marker** record name
+/// (docs/design-symmetric-metadata.md §6.2, PR 11): the
+/// [`MW_UPGRADE_MARKER_XATTR`] mechanism one namespace over, written by
+/// `squeezefs volume enable-symmetric` on **ino 1 of EVERY volume it
+/// converts** (each volume's own record — the gate reads it inside
+/// `KvMetaBackend::open`, per volume, before the claim) as its first act
+/// and deleted per volume as that volume's last. A writable open refuses
+/// while it exists; readers, probes and the verb's own marker-tolerant
+/// open proceed. The record is copied into the forest with every other
+/// ino-1 xattr, which is what lets it outlive the bit-17 stamp.
+pub const SYM_UPGRADE_MARKER_XATTR: &str = "sym_upgrade:intent";
+
 /// The `mw_upgrade:` intent marker's content (§6.2 mechanism i): the
 /// TARGET bit set and the canonical volume list the crashed-or-running
 /// upgrade covers, so a resume can verify it is completing the SAME act

@@ -115,6 +115,19 @@ enum Commands {
         /// class the operator did not ask for.
         #[arg(long, conflicts_with = "multi_writer")]
         single_writer: bool,
+        /// Format the symmetric slot-tree FOREST (incompat bit 17)
+        ///
+        /// Every metadata volume is built as one mixed-kind tree per
+        /// routing slot with a control tree and an appender directory —
+        /// the on-disk shape of the symmetric shared-disk metadata
+        /// program, in which every mount is an equal metadata authority.
+        /// Dark until that program's default flip: a plain `format` never
+        /// stamps the bit, and pre-symmetric binaries refuse this set
+        /// loud. Existing sets convert offline with `squeezefs volume
+        /// enable-symmetric`. Conflicts with `--single-writer`: the
+        /// forest presumes the multi-writer format class.
+        #[arg(long, conflicts_with = "single_writer")]
+        symmetric: bool,
         /// Force formatting even if a squeezefs volume is already detected
         #[arg(long, short = 'f')]
         force: bool,
@@ -1354,6 +1367,43 @@ enum VolumeActions {
     EnableMultiWriter {
         /// sqmeta:// URI of the metadata volume set
         target: String,
+    },
+    // Anchors: design-symmetric-metadata §6.2 / §7.1–§7.3 (PR 11).
+    // Offline D0-guarded conversion, bracketed per volume by the
+    // `sym_upgrade:` marker.
+    /// Convert an existing volume set to the symmetric slot-tree forest
+    ///
+    /// Rewrites every metadata volume of the set from the three shared
+    /// per-kind trees into one tree per routing slot (incompat bit 17,
+    /// the on-disk shape of the symmetric shared-disk metadata program)
+    /// in one invocation, volume by volume: a durable marker on each
+    /// volume refuses every writable mount until that volume's
+    /// conversion is complete (read-only mounts keep serving), the
+    /// records are re-laid into fresh extents, the layout flips in one
+    /// sector write, the emptied trees return their space, and the
+    /// marker is removed last. A crashed run leaves the set unmountable
+    /// for writers; `--resume` continues it from the crash point.
+    ///
+    /// Refuses loud: a set that is already symmetric, a volume whose
+    /// ledger was last written by a multi-appender era (mount solo once
+    /// first), an open cross-volume intent, an in-flight maintenance job,
+    /// a live client. Per-volume owner assignments (`volume set-owners`)
+    /// are reported as dropped — ownership is a lease under the forest.
+    /// There is no downgrade verb (forward-only).
+    ///
+    /// Offline verb: unmount every mount of the set first and pass the
+    /// sqmeta:// URI. The conversion holds every volume's records in RAM
+    /// while it re-lays them (one volume at a time).
+    EnableSymmetric {
+        /// sqmeta:// URI of the metadata volume set
+        target: String,
+        /// Continue a crashed run (required when a conversion marker is
+        /// present on any volume)
+        #[arg(long)]
+        resume: bool,
+        /// Print the plan and every refusal; write nothing
+        #[arg(long)]
+        dry_run: bool,
     },
     // Anchors: design-volume-lifecycle §5.5.2 (PR VL5b) — bulk copy +
     // conveyor delta tee + the §5.5.2a cutover gate + the §5.5.2b flip.
@@ -4076,6 +4126,7 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             subnqn: _,
             multi_writer,
             single_writer,
+            symmetric,
             force,
             full,
             inodes,
@@ -4270,6 +4321,14 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                      one act (KD-MW-1). Pre-multi-writer binaries refuse this set loud; \
                      solo mounts behave identically (opt out with --single-writer)."
                 );
+                if symmetric {
+                    println!(
+                        "Symmetric forest (--symmetric): every metadata volume is built as \
+                         one tree per routing slot with a control tree and an appender \
+                         directory, and stamps incompat bit 17. Pre-symmetric binaries \
+                         refuse this set loud; there is no downgrade verb."
+                    );
+                }
             }
 
             let requested_block_size = parse_human_readable_size(&block_size)?;
@@ -4444,6 +4503,15 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                         // formats the unstamped class.
                         if single_writer {
                             squeezefs::meta_backend::kv::builder::format_v3_stamped_single_writer(
+                                Path::new(&path),
+                                volume_len,
+                                &opts,
+                                stamp,
+                            )
+                            .await
+                            .map(|_| ())
+                        } else if symmetric {
+                            squeezefs::meta_backend::kv::builder::format_v3_stamped_symmetric(
                                 Path::new(&path),
                                 volume_len,
                                 &opts,
@@ -4847,6 +4915,69 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                              no downgrade verb — `format --force` reformats.",
                             report.volumes.len(),
                             report.bits_stamped
+                        );
+                    }
+                }
+                VolumeActions::EnableSymmetric {
+                    target,
+                    resume,
+                    dry_run,
+                } => {
+                    if live(&target) {
+                        return Err("volume enable-symmetric is an OFFLINE verb \
+                             (design-symmetric-metadata §6.2: the conversion runs under a \
+                             D0-guarded coordinator, the enable-multi-writer posture): \
+                             unmount first and pass the sqmeta:// URI"
+                            .into());
+                    }
+                    let meta_lvs = parse_block_uri(&target, "sqmeta://")?;
+                    let opts = squeezefs::config_ops::EnableSymOptions { dry_run, resume };
+                    let report = squeezefs::config_ops::enable_symmetric(&meta_lvs, &opts).await?;
+                    for line in &report.dropped {
+                        println!("DROPPED: {line}");
+                    }
+                    for row in &report.rows {
+                        use squeezefs::config_ops::ConversionOutcome as O;
+                        match row.outcome {
+                            O::AlreadySymmetric => {
+                                println!("{}: already symmetric (bit 17) — skipped", row.path)
+                            }
+                            O::Planned => println!(
+                                "{}: PLAN — {} record(s), {} B would move into the forest \
+                                 (dry run; nothing written)",
+                                row.path, row.records, row.bytes
+                            ),
+                            O::Converted | O::Resumed => {
+                                let secs = row.secs.max(f64::EPSILON);
+                                println!(
+                                    "{}: {} — {} record(s), {} B into {} slot tree(s) in {:.2} s \
+                                     ({:.0} records/s, {:.1} MB/s); {} extent(s) written, {} \
+                                     freed, {} orphan(s) reclaimed",
+                                    row.path,
+                                    if row.outcome == O::Resumed {
+                                        "resumed and converted"
+                                    } else {
+                                        "converted"
+                                    },
+                                    row.records,
+                                    row.bytes,
+                                    row.slot_trees,
+                                    row.secs,
+                                    row.records as f64 / secs,
+                                    row.bytes as f64 / secs / 1e6,
+                                    row.extents_written,
+                                    row.extents_freed,
+                                    row.orphans_reclaimed
+                                );
+                            }
+                        }
+                    }
+                    if !dry_run {
+                        println!(
+                            "Converted the {}-volume set to the symmetric forest (incompat bit \
+                             17; every marker removed). Pre-symmetric binaries refuse this set \
+                             loud; there is no downgrade verb — `format --force` reformats.",
+                            report.volumes.len()
                         );
                     }
                 }

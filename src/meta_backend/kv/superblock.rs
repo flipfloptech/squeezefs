@@ -1655,6 +1655,57 @@ pub async fn set_partitioned_append_bit(path: &Path) -> Result<bool, KvError> {
     .await
 }
 
+/// Stamp [`FEATURE_INCOMPAT_KV_SYMMETRIC_FOREST`] together with the
+/// appender directory's first extent in ONE sector write — the offline
+/// `squeezefs volume enable-symmetric` conversion's flip
+/// (docs/design-symmetric-metadata.md §6.2 / §7.1). The two are one act
+/// because the directory is part of bit 17's meaning: the decoder refuses
+/// a named directory without the bit, and a forest open without the
+/// directory has no appender region to join. Returns whether the bit was
+/// NEWLY set (`false` = already stamped; a differing directory is then
+/// refused, never silently rewritten).
+///
+/// The caller has already made everything the bit implies durable (tree
+/// 0, the native slot tree, the directory extent, appender 0's page, the
+/// ledger naming the forest roots) behind a barrier: this write is the
+/// commit point that flips the volume's layout, exactly the format-time
+/// "superblock last" discipline applied to a conversion.
+pub async fn set_symmetric_forest(path: &Path, appender_dir: ExtentRef) -> Result<bool, KvError> {
+    let lock = sb_write_lock(path);
+    let _held = lock.lock().await;
+    match classify_volume(path).await? {
+        VolumeFormat::V3(mut sb) => {
+            if sb.symmetric_forest_stamped() {
+                if sb.appender_dir != appender_dir {
+                    return Err(KvError::Corrupt(format!(
+                        "{}: bit 17 is already stamped with appender directory {:#x}+{} — \
+                         refusing to re-point it at {:#x}+{}",
+                        path.display(),
+                        sb.appender_dir.start,
+                        sb.appender_dir.len,
+                        appender_dir.start,
+                        appender_dir.len
+                    )));
+                }
+                return Ok(false);
+            }
+            sb.features_incompat |= FEATURE_INCOMPAT_KV_SYMMETRIC_FOREST;
+            sb.appender_dir = appender_dir;
+            write_superblock_v3(path, &sb).await?;
+            Ok(true)
+        }
+        VolumeFormat::Blank => Err(KvError::Corrupt(format!(
+            "{}: cannot stamp the symmetric-forest bit on an unformatted volume — run \
+             `squeezefs format` first",
+            path.display()
+        ))),
+        VolumeFormat::V2Legacy => Err(KvError::Corrupt(format!(
+            "{}: format v2 is no longer supported; reformat required",
+            path.display()
+        ))),
+    }
+}
+
 /// Stamp [`FEATURE_INCOMPAT_KV_WRITER_SCOPED_STAGING`] on `path`'s
 /// superblock — the §6.2 items-8/10 upgrade path (the batched Phase-8
 /// reformat window; **mount NEVER calls this**). Returns whether the bit

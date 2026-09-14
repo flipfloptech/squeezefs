@@ -18,7 +18,12 @@
 #
 # quick (per-PR for changes touching src/nvmeof/, reservation.rs, or the
 # guard gate): product verb round-trip (share -> connect -> IO -> unshare ->
-# residue-free) + ONE guard kill-9 cycle.
+# residue-free) + the symmetric PR 3 legs (`pr-registrants`: ≥ 64 real
+# registrants on one namespace REPORTED through the product's REGCTL-sized
+# read — the shipped 4 KiB-buffer truncation repro-ported;
+# `sym-manager-failover`: a bit-17 volume's manager holds WERO rtype 3,
+# dies by kill -9, the successor wins inside `manager_failover_bound_ms`,
+# acked data intact, zero residue) + ONE guard kill-9 cycle.
 #
 # full (nightly / program & release gates) adds:
 #   * loud-fail matrix (G3): missing backing, unledgered unshare, --nsid!=1,
@@ -1101,6 +1106,279 @@ leg_guard_nvmet() {
 }
 
 # ===========================================================================
+# Symmetric PR 3 — the registrant ceiling (KD-SYM-18/23; quick + full)
+# ===========================================================================
+# The shipped `reservation.rs` read the Reservation Report into a FIXED
+# 4 KiB buffer: 64 B header + 63 × 64 B extended registrants fit, the 64th
+# was silently dropped — S7's rung-5 check would mis-report the 64th
+# co-writer. PR 3 sizes the read by REGCTL (header first, then
+# `64 + 64 × REGCTL`). This leg puts FIDELI_PR_REGISTRANTS (default 128)
+# real registrants on one nvmet namespace — one host identity each,
+# through the PRODUCT connect path (`nvmeof connect --hostnqn/--hostid`),
+# registered per controller through its char device (the association
+# pin on native-multipath kernels) — and reads the report back through
+# the product's own read (`squeezefs nvmeof resv-report`): every one must
+# be REPORTED and the transfer must be exactly `64 + 64 × N` bytes. nvmet
+# has no registrant cap, so `registrant_cap` reads unbounded (0) and the
+# join refusal is unreachable here by construction.
+leg_pr_registrants() {
+    local out="$STATE/legs/pr-registrants.txt" nqn zb head n want i ctrl uuid hostnqn
+    local report regctl bytes cap json_regctl cli_regctl
+    want="${FIDELI_PR_REGISTRANTS:-128}"
+    : > "$out"
+    nqn="nqn.2026-07.io.squeezefs:fideli-prreg-nvmet"
+    zb=$("$SUBSTRATE" mkzram $((256 * 1024 * 1024)) prreg-nvmet)
+    "$FIDELI_BIN" nvmeof share "$zb" --ip 127.0.0.1 --port 4556 --subnqn "$nqn" \
+        --target-stack nvmet >> "$out" 2>&1 || { bad "PRREG: share failed"; return; }
+    record "share=$nqn"
+    if [ "$(cat "$NVMET_CFS/subsystems/$nqn/namespaces/1/resv_enable" 2>/dev/null)" = "1" ]; then
+        ok "PRREG: share live with resv_enable=1"
+    else
+        bad "PRREG: resv_enable is not 1"
+    fi
+
+    # N identities, N controllers (one I/O queue each — the leg measures
+    # the reservation table, not the fabric), N registrations.
+    local t0 t1
+    t0=$(date +%s%3N)
+    n=0
+    for i in $(seq 1 "$want"); do
+        uuid=$(printf '7c7c7c7c-%04x-4%03x-8%03x-c3c3c3c3%04x' "$i" "$((i % 4096))" "$((i % 4096))" "$i")
+        hostnqn="nqn.2014-08.org.nvmexpress:uuid:$uuid"
+        if ! "$FIDELI_BIN" nvmeof connect --ip 127.0.0.1 --port 4556 --subnqn "$nqn" \
+            --hostnqn "$hostnqn" --hostid "$uuid" --nr-io-queues 1 >> "$out" 2>&1; then
+            bad "PRREG: connect $i failed"
+            break
+        fi
+        ctrl=""
+        for _ in $(seq 1 40); do
+            for c in /sys/class/nvme/nvme*; do
+                [ -e "$c/subsysnqn" ] || continue
+                [ "$(cat "$c/subsysnqn" 2>/dev/null)" = "$nqn" ] || continue
+                [ "$(cat "$c/hostnqn" 2>/dev/null)" = "$hostnqn" ] || continue
+                ctrl=$(basename "$c")
+                break
+            done
+            [ -n "$ctrl" ] && [ -c "/dev/$ctrl" ] && break
+            sleep 0.1
+        done
+        [ -n "$ctrl" ] || { bad "PRREG: no controller for identity $i"; break; }
+        if nvme resv-register "/dev/$ctrl" -n 1 --nrkey="$((0xC0DE0000 + i))" --rrega=0 --cptpl=0 >> "$out" 2>&1; then
+            n=$((n + 1))
+        else
+            bad "PRREG: register $i failed"
+            break
+        fi
+    done
+    record "connected=$nqn"
+    t1=$(date +%s%3N)
+    log "PRREG: $n registrant(s) established in $((t1 - t0)) ms ($(( (t1 - t0) / (n > 0 ? n : 1) )) ms each)"
+    if [ "$n" -ge 64 ]; then
+        ok "PRREG: $n registrants on one namespace (≥ 64 — past the shipped 4 KiB buffer's 63)"
+    else
+        bad "PRREG: only $n registrants established (need ≥ 64 to exercise the truncation)"
+    fi
+
+    head=$(finddev "$nqn") || { bad "PRREG: no head node"; return; }
+    cli_regctl=$(nvme resv-report "$head" --eds -o json 2>/dev/null | jq -r .regctl)
+    report=$("$FIDELI_BIN" nvmeof resv-report "$head" --json 2>> "$out") || { bad "PRREG: product resv-report failed"; return; }
+    echo "$report" >> "$out"
+    regctl=$(echo "$report" | jq -r .regctl)
+    bytes=$(echo "$report" | jq -r .report_bytes)
+    cap=$(echo "$report" | jq -r .registrant_cap)
+    json_regctl=$(echo "$report" | jq -r '.registrants | length')
+    if [ "$regctl" = "$n" ] && [ "$json_regctl" = "$n" ]; then
+        ok "PRREG: the product's REGCTL-sized read REPORTS all $n registrants (nvme-cli regctl=$cli_regctl)"
+    else
+        bad "PRREG: product read regctl=$regctl (decoded $json_regctl) vs $n established (nvme-cli $cli_regctl) — the truncation"
+    fi
+    if [ "$bytes" = "$((64 + 64 * n))" ]; then
+        ok "PRREG: report transfer = 64 + 64 × $n = $bytes B (pr_report_bytes)"
+    else
+        bad "PRREG: report transfer $bytes B ≠ $((64 + 64 * n))"
+    fi
+    if [ "$cap" = "0" ]; then
+        ok "PRREG: registrant cap in force = unbounded (nvmet has none — refusals unreachable by construction)"
+    else
+        bad "PRREG: registrant cap $cap on nvmet"
+    fi
+
+    # Drain: every registrant's own controller unregisters its own key (a
+    # controller may only drop what its association registered — the
+    # unregister names the key, the device matches it to the host id), then
+    # disconnect and unshare.
+    i=0
+    for c in /sys/class/nvme/nvme*; do
+        [ -e "$c/subsysnqn" ] || continue
+        [ "$(cat "$c/subsysnqn" 2>/dev/null)" = "$nqn" ] || continue
+        ctrl=$(basename "$c")
+        hostnqn=$(cat "$c/hostnqn" 2>/dev/null)
+        i=$(printf '%s' "$hostnqn" | sed -n 's/.*uuid:7c7c7c7c-\([0-9a-f]*\)-.*/\1/p')
+        [ -n "$i" ] || continue
+        nvme resv-register "/dev/$ctrl" -n 1 --crkey="$((0xC0DE0000 + 0x$i))" --rrega=1 >> "$out" 2>&1 || true
+    done
+    cli_regctl=$(nvme resv-report "$head" --eds -o json 2>/dev/null | jq -r .regctl)
+    if [ "$cli_regctl" = "0" ]; then
+        ok "PRREG: drained to regctl=0"
+    else
+        bad "PRREG: residue regctl=$cli_regctl after the drain"
+    fi
+    "$FIDELI_BIN" nvmeof disconnect "$nqn" >> "$out" 2>&1
+    for _ in $(seq 1 60); do
+        ls /sys/class/nvme/nvme*/subsysnqn 2>/dev/null | xargs -r grep -l "^$nqn$" >/dev/null 2>&1 || break
+        sleep 0.5
+    done
+    if "$FIDELI_BIN" nvmeof unshare "$nqn" >> "$out" 2>&1; then
+        ok "PRREG: unshare"
+    else
+        bad "PRREG: unshare"
+    fi
+}
+
+# ===========================================================================
+# Symmetric PR 3 — the manager lease on a REAL PR target (quick + full)
+# ===========================================================================
+# design-symmetric-metadata §5.8.1 / §5.9: a bit-17 volume (stamped through
+# the seam) mounted with the symmetric plane ARMED (a declared partition —
+# PR 4's lease gate stands in) on the fidelity guard namespaces: the writer
+# that wins the D0 ladder is the manager (`manager_lease` = held), holds the
+# metadata namespace under WERO rtype 3 (`meta_pr_wero` = 1; the DEVICE
+# reports the type), the must-stay-0 set is 0; kill -9 the manager, the
+# same-host successor wins the ladder inside `manager_failover_bound_ms`
+# (the register ladder reclaims the dead incarnation's key on the strict
+# nvmet target), reads `held` again, and acked data is byte-intact; a clean
+# unmount leaves regctl=0 and page 0 Free.
+leg_sym_manager_failover() {
+    local out="$STATE/legs/sym-manager-failover.txt" dlog="$STATE/sym-manager-daemon.log"
+    local mnt="$STATE/mnt-sym-manager" meta data rt lease wero mode md5 md5b t0 t1 bound pid
+    local refusals stalls kv lv ev rtype2 reg
+    : > "$out"
+    : > "$dlog"
+    # shellcheck disable=SC1091 # generated by nvmeof_target_substrate.sh create
+    . "$STATE/devices.env"
+    meta=$(finddev "$NQN_GMETA_NVMET") || { bad "SYMMGR: no meta device"; return; }
+    data=$(finddev "$NQN_GDATA_NVMET") || { bad "SYMMGR: no data device"; return; }
+    mkdir -p "$mnt"
+    pkill -f "squeezefs.*mount sqmeta://$meta" && sleep 2
+    umount -l "$mnt" 2>/dev/null
+    for k in $(nvme resv-report "$meta" --eds -o json 2>/dev/null | jq -r '.regctlext[]?.rkey'); do
+        nvme resv-register "$meta" --crkey="$k" --rrega=1 >> "$out" 2>&1
+    done
+    dd if=/dev/zero of="$meta" bs=1M count=16 oflag=direct status=none
+    dd if=/dev/zero of="$data" bs=1M count=16 oflag=direct status=none
+
+    # A bit-17 volume: the seam at format (PR 11's `format --symmetric` is
+    # not built), the partition seam at mount (PR 4's lease gate).
+    if SQUEEZEFS_TEST_STAMP_SYMMETRIC=1 "$FIDELI_BIN" format "sqmeta://$meta" "sqdata://$data" --force >> "$out" 2>&1; then
+        ok "SYMMGR: stamped format (bit 17 through the seam)"
+    else
+        bad "SYMMGR: format failed"
+        return
+    fi
+    mount_sym() {
+        udevadm settle --timeout=10 2>/dev/null || true
+        SQUEEZEFS_TEST_SYM_APPENDER_SLOTS="1:4" RUST_LOG=info \
+            "$FIDELI_BIN" --log-file "$dlog" mount "sqmeta://$meta" "$mnt" --daemon --allow-other >> "$out" 2>&1
+    }
+    wait_sym_mounted() {
+        local i
+        for i in $(seq 1 60); do
+            awk -v m="$mnt" '$2==m{f=1} END{exit !f}' /proc/mounts && return 0
+            sleep 0.5
+        done
+        return 1
+    }
+    t0=$(date +%s%3N)
+    mount_sym
+    wait_sym_mounted || { bad "SYMMGR: initial mount did not appear — $(tail -5 "$out")"; return; }
+    t1=$(date +%s%3N)
+    sleep 2
+    mode=$(mnt_stat "$mnt" writer_guard_mode)
+    lease=$(mnt_stat "$mnt" manager_lease)
+    wero=$(mnt_stat "$mnt" meta_pr_wero)
+    bound=$(mnt_stat "$mnt" manager_failover_bound_ms)
+    log "SYMMGR: mount wall $((t1 - t0)) ms; writer_guard_mode=$mode manager_lease=$lease meta_pr_wero=$wero manager_failover_bound_ms=$bound"
+    [ "$mode" = "flock+pr" ] && ok "SYMMGR: writer_guard_mode=flock+pr" || bad "SYMMGR: writer_guard_mode=$mode"
+    [ "$lease" = "held" ] && ok "SYMMGR: manager_lease=held (the D0 winner is the manager)" || bad "SYMMGR: manager_lease=$lease"
+    [ "$wero" = "1" ] && ok "SYMMGR: meta_pr_wero=1 (rtype 3 on the metadata namespace)" || bad "SYMMGR: meta_pr_wero=$wero"
+    rtype2=$(nvme resv-report "$meta" --eds -o json 2>/dev/null | jq -r .rtype)
+    if [ "$rtype2" = "3" ]; then
+        ok "SYMMGR: the DEVICE reports rtype 3 (Write Exclusive – Registrants Only) held"
+    else
+        bad "SYMMGR: device rtype=$rtype2 (want 3)"
+    fi
+    rt=$("$FIDELI_BIN" nvmeof resv-report "$meta" --json 2>> "$out") && echo "$rt" >> "$out"
+    if [ "$(echo "$rt" | jq -r .wero)" = "true" ]; then
+        ok "SYMMGR: the product's report reads WERO held ($(echo "$rt" | jq -r .regctl) registrant(s))"
+    else
+        bad "SYMMGR: product report wero=$(echo "$rt" | jq -r .wero)"
+    fi
+    [ "${bound:-0}" -gt 45000 ] && ok "SYMMGR: manager_failover_bound_ms=$bound (> the 45 s stale TTL — DERIVED)" || bad "SYMMGR: bound=$bound"
+
+    dd if=/dev/urandom of="$mnt/manager.bin" bs=1M count=8 status=none
+    sync
+    md5=$(md5sum "$mnt/manager.bin" | cut -d' ' -f1)
+    for i in $(seq 1 200); do echo "sym $i" > "$mnt/f$i"; done
+    sync
+    refusals=$(mnt_stat "$mnt" manager_verb_refusals)
+    stalls=$(mnt_stat "$mnt" manager_dependency_stalls)
+    kv=$(mnt_stat "$mnt" meta_kv_replay_key_violations)
+    lv=$(mnt_stat "$mnt" meta_kv_replay_lease_violations)
+    ev=$(mnt_stat "$mnt" meta_kv_replay_extent_violations)
+    if [ "$refusals" = "0" ] && [ "$stalls" = "0" ] && [ "$kv" = "0" ] && [ "$lv" = "0" ] && [ "$ev" = "0" ]; then
+        ok "SYMMGR: must-stay-0 set clean under load (refusals/stalls/key/lease/extent = 0)"
+    else
+        bad "SYMMGR: refusals=$refusals stalls=$stalls key=$kv lease=$lv extent=$ev"
+    fi
+
+    # The manager dies. The successor is this host (the D0 same-host arm:
+    # flock reclaims instantly, the strict target's stale key rides the
+    # register ladder), so its wall is far inside the cross-host bound —
+    # both numbers are the row.
+    pid=$(pgrep -f "squeezefs.*mount sqmeta://$meta" | head -1)
+    [ -n "$pid" ] || { bad "SYMMGR: no daemon pid"; return; }
+    t0=$(date +%s%3N)
+    kill -9 "$pid"
+    sleep 1
+    umount -l "$mnt" 2>/dev/null
+    mount_sym
+    if wait_sym_mounted; then
+        t1=$(date +%s%3N)
+        sleep 2
+        lease=$(mnt_stat "$mnt" manager_lease)
+        md5b=$(md5sum "$mnt/manager.bin" 2>/dev/null | cut -d' ' -f1)
+        log "SYMMGR: successor wall (kill → mounted) $((t1 - t0)) ms against bound $bound ms"
+        if [ "$lease" = "held" ]; then
+            ok "SYMMGR: the successor holds the manager lease"
+        else
+            bad "SYMMGR: successor manager_lease=$lease"
+        fi
+        if [ "$((t1 - t0))" -lt "${bound:-1}" ]; then
+            ok "SYMMGR: successor inside manager_failover_bound_ms ($((t1 - t0)) < $bound)"
+        else
+            bad "SYMMGR: successor took $((t1 - t0)) ms ≥ bound $bound"
+        fi
+        [ "$md5b" = "$md5" ] && ok "SYMMGR: acked data byte-intact across the manager's death" || bad "SYMMGR: md5 $md5b != $md5"
+        [ "$(ls "$mnt" | grep -c '^f')" = "200" ] && ok "SYMMGR: 200 acked names served by the successor" || bad "SYMMGR: names lost"
+        [ "$(mnt_stat "$mnt" appender_self_recoveries)" -ge 1 ] && ok "SYMMGR: own-residue recovery counted (appender_self_recoveries ≥ 1)" || bad "SYMMGR: no self recovery counted"
+        [ "$(mnt_stat "$mnt" meta_pr_wero)" = "1" ] && ok "SYMMGR: WERO re-held by the successor" || bad "SYMMGR: successor meta_pr_wero != 1"
+    else
+        bad "SYMMGR: successor mount did not appear — $(tail -20 "$dlog")"
+        return
+    fi
+
+    umount "$mnt" >> "$out" 2>&1
+    sleep 1
+    reg=$(nvme resv-report "$meta" --eds -o json 2>/dev/null | jq -r .regctl)
+    [ "${reg:-x}" = "0" ] && ok "SYMMGR: zero PR residue after the clean unmount (regctl=0)" || bad "SYMMGR: residue regctl=$reg"
+    if "$FIDELI_BIN" appenders "sqmeta://$meta" --json >> "$out" 2>&1; then
+        ok "SYMMGR: appenders probe lists the directory after the clean unmount"
+    else
+        bad "SYMMGR: appenders probe failed"
+    fi
+}
+
+# ===========================================================================
 # Substrate legs
 # ===========================================================================
 leg_substrate_up() {
@@ -1148,6 +1426,10 @@ main() {
     run_leg substrate-up leg_substrate_up
 
     run_leg roundtrip-nvmet leg_roundtrip_nvmet
+    # Symmetric PR 3 (both tiers): the registrant ceiling and the manager
+    # lease on the real PR target.
+    run_leg pr-registrants leg_pr_registrants
+    run_leg sym-manager-failover leg_sym_manager_failover
 
     if [ "$MODE" = full ]; then
         run_leg loud-fail-matrix leg_loudfail

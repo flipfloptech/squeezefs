@@ -1099,6 +1099,21 @@ enum NvmeofActions {
         /// Subsystem NQN to disconnect
         subnqn: String,
     },
+    /// Read a namespace's Persistent Reservation report the way the guard does
+    ///
+    /// The product's own REGCTL-sized two-step read (design-symmetric-
+    /// metadata §5.8.1, KD-SYM-18): every registrant the header names is
+    /// decoded — the fixed 4 KiB buffer that truncated the report at the
+    /// 63rd extended registrant is gone. Prints the holder, the type, the
+    /// registrant count and the bytes transferred, plus the registrant
+    /// cap in force (declared or learned; 0 = unbounded).
+    ResvReport {
+        /// The NVMe namespace node (e.g. /dev/nvme2n1)
+        dev: String,
+        /// Emit machine-readable JSON
+        #[arg(long)]
+        json: bool,
+    },
     /// Manage the NVMe-oF target runtime
     ///
     /// Kernel nvmet: readiness setup, start (ledger replay), status,
@@ -3946,6 +3961,76 @@ fn dispatch_nvmeof(action: NvmeofActions) -> Result<(), squeezefs::nvmeof::stack
         NvmeofActions::Disconnect { subnqn } => {
             squeezefs::nvmeof::disconnect_target(&subnqn)?;
             println!("Successfully disconnected from target NQN '{}'.", subnqn);
+        }
+        NvmeofActions::ResvReport { dev, json } => {
+            use squeezefs::meta_backend::reservation::{
+                pr_registrant_cap, NvmeReservationClient, ReservationClient,
+            };
+            let path = std::path::Path::new(&dev);
+            let client = NvmeReservationClient::open(path).ok_or_else(|| {
+                squeezefs::nvmeof::stack::NvmeofError::Refused(format!(
+                    "{dev} is not an NVMe namespace (a block device answering NVME_IOCTL_ID) — \
+                     a file-backed or loop volume has no Persistent Reservations to report"
+                ))
+            })?;
+            let report = client.report().map_err(|e| {
+                squeezefs::nvmeof::stack::NvmeofError::Refused(format!(
+                    "Reservation Report on {dev}: {e}"
+                ))
+            })?;
+            let bytes = client.report_bytes();
+            let cap = pr_registrant_cap();
+            if json {
+                let registrants: Vec<serde_json::Value> = report
+                    .registrants
+                    .iter()
+                    .map(|r| {
+                        serde_json::json!({
+                            "rkey": format!("{:#x}", r.rkey),
+                            "host_id": r
+                                .host_id
+                                .iter()
+                                .map(|b| format!("{b:02x}"))
+                                .collect::<String>(),
+                            "holds_reservation": r.holds_reservation,
+                        })
+                    })
+                    .collect();
+                let doc = serde_json::json!({
+                    "dev": dev,
+                    "regctl": report.regctl(),
+                    "report_bytes": bytes,
+                    "rtype": report.rtype,
+                    "holder_key": report.holder_key.map(|k| format!("{k:#x}")),
+                    "wero": report.is_wero(),
+                    "registrant_cap": cap,
+                    "registrants": registrants,
+                });
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&doc).map_err(|e| {
+                        squeezefs::nvmeof::stack::NvmeofError::Refused(format!(
+                            "resv-report JSON: {e}"
+                        ))
+                    })?
+                );
+            } else {
+                println!(
+                    "{dev}: {} registrant(s) reported ({bytes} B transferred, REGCTL-sized read); \
+                     rtype {} holder {}; registrant cap in force: {}",
+                    report.regctl(),
+                    report.rtype,
+                    report
+                        .holder_key
+                        .map(|k| format!("{k:#x}"))
+                        .unwrap_or_else(|| "none".to_string()),
+                    if cap == 0 {
+                        "unbounded".to_string()
+                    } else {
+                        cap.to_string()
+                    }
+                );
+            }
         }
         NvmeofActions::Target { action } => match action {
             TargetActions::Install {

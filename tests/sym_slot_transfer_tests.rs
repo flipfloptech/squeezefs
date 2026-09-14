@@ -1986,14 +1986,34 @@ async fn a_first_touch_acquire_parked_for_ring_space_never_holds_the_verb_mutex(
     // The test plays the tick: the held budget returns, one covering cycle
     // frees the ring; every parked commit — the first touch included —
     // lands.
+    // The test plays the tick: the held budget returns, and covering
+    // cycles free the ring (the FIND-VS-A law — a split's dying floor
+    // clamps the cycle that retires it, the next cycle passes it — so
+    // the tick's continuous cadence is played as a bounded loop); every
+    // parked commit — the first touch included — lands.
     for adm in held {
         ring0.core().release(adm);
     }
-    vol.checkpoint_now().await.unwrap();
-    for f in fillers {
-        f.await.unwrap().unwrap();
+    for _ in 0..8 {
+        vol.checkpoint_now().await.unwrap();
+        for _ in 0..50 {
+            tokio::task::yield_now().await;
+        }
+        if fillers.iter().all(|f| f.is_finished()) && first_touch.is_finished() {
+            break;
+        }
     }
-    first_touch.await.unwrap().unwrap();
+    let settled = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        for f in fillers {
+            f.await.unwrap().unwrap();
+        }
+        first_touch.await.unwrap().unwrap();
+    })
+    .await;
+    assert!(
+        settled.is_ok(),
+        "every parked commit lands once the ring is freed — the D1.b threshold never binds"
+    );
     assert!(vol.slot_leases().unwrap().gate.is_leased(fresh));
     assert_eq!(vol.block_ref_count(tag, 1).await.unwrap(), 1);
     assert!(!vol.is_failed(), "never the D1.b fail-stop");

@@ -3810,6 +3810,26 @@ impl KvMetaBackend {
         Ok(())
     }
 
+    /// The worst-case journal entry length of `slots` `Leased` puts — what
+    /// a PARKING acquire admits before it takes the verb mutex (the
+    /// manager's own grants write nothing else into the entry).
+    fn leased_puts_worst_len(&self, slots: usize) -> std::result::Result<u64, KvError> {
+        let tag = super::journal::tag_for(super::record::TREE_CONTROL, 0);
+        let puts: Vec<(u8, Record)> = (0..slots.max(1))
+            .map(|i| {
+                (
+                    tag,
+                    Record::put(
+                        super::slot_state::slot_state_key(i as super::record::ForestSlot),
+                        0,
+                        vec![0u8; super::slot_state::LEASED_LEN],
+                    ),
+                )
+            })
+            .collect();
+        entry_len_for(&puts)
+    }
+
     /// The manager's `AcquireSlots` / `AcquireSlot` executor for
     /// `appender_id` (§5.1.2 / §5.3.5): `explicit` names the slots (first-
     /// writer-takes-it, the native slot, a declared region's seam slots),
@@ -3835,11 +3855,42 @@ impl KvMetaBackend {
                 self.path.display()
             ))
         })?);
+        // The PARKING admission is taken HERE, holding nothing (Issue 24):
+        // the worst case is one `Leased` put per slot the call can grant
+        // (the manager's own grants carry no grant-record rewrite — the
+        // one Park caller class; a declared appender's Park ask degrades
+        // to Try below, loud). The exact length is reserved under the
+        // mutex and the remainder released.
+        let rotor_ask = explicit.is_empty();
+        let mut pre_admission = match admit {
+            ControlAdmit::Try => None,
+            ControlAdmit::Park => {
+                if appender_id != 0 {
+                    log::warn!(
+                        "meta volume {}: a parking slot acquire for appender {appender_id} — \
+                         only the manager's own acquires pre-admit; degraded to a try",
+                        self.path.display()
+                    );
+                    None
+                } else {
+                    let slots = if rotor_ask {
+                        (if want == 0 {
+                            plane.mint_slots()
+                        } else {
+                            u64::from(want)
+                        }) as usize
+                    } else {
+                        explicit.len()
+                    };
+                    let worst = self.leased_puts_worst_len(slots)?;
+                    Some(self.admit_user_budget(&self.ring, 0, worst).await?)
+                }
+            }
+        };
         let _g = self.manager_verbs.lock().await;
         plane.acquires.fetch_add(1, Ordering::Relaxed);
         let now = crate::mono_core::monotonic_ns_u64();
         let m = plane.mint_slots();
-        let rotor_ask = explicit.is_empty();
         let candidates: Vec<super::record::ForestSlot> = if rotor_ask {
             // The rotor cap counts the appender's ROTOR grants (review
             // round 2, Issue 14 — never every non-native lease: the page
@@ -3848,6 +3899,9 @@ impl KvMetaBackend {
             let want = if want == 0 { m } else { u64::from(want) };
             if held.saturating_add(want) > 2 * m {
                 plane.rotor_cap_refusals.fetch_add(1, Ordering::Relaxed);
+                if let Some(adm) = pre_admission {
+                    self.ring.core().release(adm);
+                }
                 return Err(KvError::RotorAtCap {
                     appender: appender_id,
                     held,
@@ -3930,6 +3984,9 @@ impl KvMetaBackend {
                         // normal reply, never a witness contradiction
                         // (Issue 14: its own gauge).
                         plane.acquire_refusals.fetch_add(1, Ordering::Relaxed);
+                        if let Some(adm) = pre_admission {
+                            self.ring.core().release(adm);
+                        }
                         return Err(KvError::SlotBusy { slot, holder, g });
                     }
                 }
@@ -3964,7 +4021,11 @@ impl KvMetaBackend {
                     ));
                 }
             }
-            if let Err(e) = self.write_control_entry(puts, admit).await {
+            let admission = match pre_admission.take() {
+                Some(adm) => EntryAdmission::Held(adm),
+                None => EntryAdmission::Try,
+            };
+            if let Err(e) = self.write_control_entry(puts, admission).await {
                 for s in &fresh {
                     let l = plane.table.get(*s);
                     let _ = plane.table.release(
@@ -3983,6 +4044,10 @@ impl KvMetaBackend {
             plane
                 .grants
                 .fetch_add(fresh.len() as u64, Ordering::Relaxed);
+        }
+        // Nothing granted (every slot `Already`): the pre-admission returns.
+        if let Some(adm) = pre_admission.take() {
+            self.ring.core().release(adm);
         }
         for g in &grants {
             if !g.already || set.region(appender_id).is_some() {
@@ -4335,7 +4400,7 @@ impl KvMetaBackend {
         // rewritten without them in the SAME entry, bits untouched.
         let (rewrite, leaving) = self.grant_record_minus_images(appender_id, &[slot]).await?;
         recs.extend(rewrite);
-        self.write_control_entry(recs, ControlAdmit::Try).await?;
+        self.write_control_entry(recs, EntryAdmission::Try).await?;
         if let Some(r) = set.region(appender_id).filter(|_| !leaving.is_empty()) {
             r.grant().transfer_out(&leaving);
         }
@@ -5314,7 +5379,7 @@ impl KvMetaBackend {
             .grant_record_minus_images(region.id, &released_slots)
             .await?;
         puts.extend(rewrite);
-        self.write_control_entry(puts, ControlAdmit::Try).await?;
+        self.write_control_entry(puts, EntryAdmission::Try).await?;
         if !leaving.is_empty() {
             region.grant().transfer_out(&leaving);
         }
@@ -5472,7 +5537,7 @@ impl KvMetaBackend {
     async fn write_control_entry(
         &self,
         mut recs: Vec<(u8, Record)>,
-        admit: ControlAdmit,
+        admit: EntryAdmission,
     ) -> std::result::Result<(), KvError> {
         let forest = self.forest().ok_or_else(|| {
             KvError::Corrupt(format!(
@@ -5482,16 +5547,28 @@ impl KvMetaBackend {
         })?;
         let len = entry_len_for(&recs)?;
         let adm = match admit {
-            ControlAdmit::Try => self
+            EntryAdmission::Try => self
                 .ring
                 .try_admit(len, AdmissionClass::User)
                 .ok_or(KvError::JournalReserveExhausted { needed: len })?,
-            // The door's first-touch acquire runs INSIDE a user commit:
-            // it parks for ring space exactly as the pass would for that
-            // commit (review round 2, Issue 15 — `try_admit` refused on a
-            // full ring where every other user commit parks, and the
-            // user's first touch of a slot with history failed EINVAL).
-            ControlAdmit::Park => self.admit_user_budget(&self.ring, 0, len).await?,
+            // A pre-admission (the door's, taken PARKING before the verb
+            // mutex — Issue 24) for at least this entry: split to the
+            // exact length, the remainder released. A shorter one is a
+            // caller bug — loud, and its budget returned.
+            EntryAdmission::Held(pre) => {
+                let core = self.ring.core();
+                if pre.len() < len {
+                    let had = pre.len();
+                    core.release(pre);
+                    return Err(KvError::Corrupt(format!(
+                        "{}: a control entry of {len} B exceeds its {had} B pre-admission",
+                        self.path.display()
+                    )));
+                }
+                let (exact, rest) = core.split_admission(pre, len);
+                core.release(rest);
+                exact
+            }
         };
         let (res, seq_base) = self.ring.reserve_registered(adm);
         for (i, (_, r)) in recs.iter_mut().enumerate() {
@@ -5799,7 +5876,7 @@ impl KvMetaBackend {
                 merged.encode()?,
             ),
         ));
-        if let Err(e) = self.write_control_entry(recs, ControlAdmit::Try).await {
+        if let Err(e) = self.write_control_entry(recs, EntryAdmission::Try).await {
             for c in claimed {
                 self.alloc.release_unpublished(c);
             }
@@ -5989,7 +6066,7 @@ impl KvMetaBackend {
                 Record::put(key, 0, remaining.encode()?)
             },
         ));
-        if let Err(e) = self.write_control_entry(recs, ControlAdmit::Try).await {
+        if let Err(e) = self.write_control_entry(recs, EntryAdmission::Try).await {
             if let Some(r) = set.region(appender_id) {
                 r.grant().restore_returnable(dropped_from_ram);
             }
@@ -6437,7 +6514,7 @@ impl KvMetaBackend {
                 .iter()
                 .map(|e| super::alloc_ext::alloc_record(*e, 0))
                 .collect();
-            if let Err(e) = self.write_control_entry(recs, ControlAdmit::Try).await {
+            if let Err(e) = self.write_control_entry(recs, EntryAdmission::Try).await {
                 for c in claimed {
                     self.alloc.release_unpublished(c);
                 }
@@ -11279,11 +11356,26 @@ pub fn durable_volume_id_of(sb_uuid: &[u8; 16]) -> String {
 /// (`write_control_entry`): a WIRE verb / the cadence tries once and its
 /// refusal is the caller's retry (the peer's resend, the next cycle); the
 /// commit DOOR's first-touch acquire parks like the user commit it runs
-/// inside (review round 2, Issue 15).
+/// inside (review round 2, Issue 15) — and it parks BEFORE the manager's
+/// verb mutex (review round 3, Issue 24): `manager_acquire_slots` admits
+/// the entry's worst-case length holding nothing, then takes the mutex,
+/// builds the exact puts and reserves exactly that much (the rest of the
+/// admission released). A park under `manager_verbs` deadlocked with the
+/// checkpoint task's grant verbs on a partitioned mount — the cycle that
+/// frees the ring waited on the mutex the parked acquire held.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ControlAdmit {
     Try,
     Park,
+}
+
+/// A control entry's admission as [`KvMetaBackend::write_control_entry`]
+/// receives it: taken now (`try_admit`, the wire verbs' and the
+/// cadence's class) or handed in, already admitted for AT LEAST the
+/// entry's length (the door's pre-admission).
+enum EntryAdmission {
+    Try,
+    Held(super::journal_core::Admission),
 }
 
 /// One slot the manager granted (design-symmetric-metadata §5.1.2 / §6.3,

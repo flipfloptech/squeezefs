@@ -203,6 +203,18 @@ pub struct Admission {
     len: u64,
 }
 
+impl Admission {
+    /// The admitted length in bytes.
+    pub fn len(&self) -> u64 {
+        self.len
+    }
+
+    /// Whether nothing was admitted (a zero-length split remainder).
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+}
+
 /// A claimed journal range: `[start, start + len)` in logical byte space.
 /// `seq() == start` — see the module docs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -360,6 +372,25 @@ impl JournalCore {
     pub fn release(&self, adm: Admission) {
         let prev = self.admitted.fetch_sub(adm.len, Ordering::AcqRel);
         debug_assert!(prev >= adm.len, "released more budget than admitted");
+    }
+
+    /// Split an admission into `first` bytes and the remainder — pure
+    /// bookkeeping over the same admitted budget (the counter moves at
+    /// `reserve` / `release`, never here). What lets a caller admit a
+    /// WORST-CASE length before it knows the exact one (PR 4 review round
+    /// 3, Issue 24: the door's first-touch acquire admits its control
+    /// entry before taking the manager's verb mutex, then reserves the
+    /// exact length and releases the rest). `first` must not exceed the
+    /// admission.
+    pub fn split_admission(&self, adm: Admission, first: u64) -> (Admission, Admission) {
+        debug_assert!(first <= adm.len, "split past the admission");
+        let first = first.min(adm.len);
+        (
+            Admission { len: first },
+            Admission {
+                len: adm.len - first,
+            },
+        )
     }
 
     /// Transfer admitted budget to the head: the single `fetch_add` of

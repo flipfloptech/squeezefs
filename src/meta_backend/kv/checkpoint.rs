@@ -1669,12 +1669,25 @@ impl KvMetaBackend {
             // steady-state grant. A heap that cannot serve even that
             // answers `NoSpace`, which is the SPACE class below — never
             // the manager dependency.
-            if let (Err(KvError::GrantExhausted { appender, .. }), Some(id)) = (&out, region_id) {
+            if let (
+                Err(KvError::GrantExhausted {
+                    appender, needed, ..
+                }),
+                Some(id),
+            ) = (&out, region_id)
+            {
                 if *appender == id && !super::appender::test_manager_unreachable() {
+                    // The ask is the SMO's OWN need (never less than the
+                    // one-SMO constant): a constant ask was re-answered
+                    // verbatim once the remainder held it while a fat
+                    // overlay's split needed more (review round 3).
+                    let want = u32::try_from(*needed)
+                        .unwrap_or(u32::MAX)
+                        .max(super::appender::SMO_IMAGES_MAX);
                     match self
                         .manager_extent_grant_class(
                             id,
-                            super::appender::SMO_IMAGES_MAX,
+                            want,
                             super::alloc_ext_core::AllocClass::Internal,
                         )
                         .await
@@ -1711,6 +1724,7 @@ impl KvMetaBackend {
                 Err(KvError::GrantExhausted {
                     appender,
                     unclaimed,
+                    needed,
                 }) => {
                     deferred_for_grant += 1;
                     if let Some(r) = self.appenders().and_then(|a| a.region(appender)) {
@@ -1718,9 +1732,9 @@ impl KvMetaBackend {
                     }
                     log::warn!(
                         "checkpoint: appender {appender}'s extent grant is exhausted ({unclaimed} \
-                         unclaimed) at node {addr:#x}; compaction deferred to the next cycle \
-                         until the manager refills it (manager_dependency_stalls, bound \
-                         manager_dependency_stall_bound_ms)"
+                         unclaimed, {needed} needed) at node {addr:#x}; compaction deferred to \
+                         the next cycle until the manager refills it (manager_dependency_stalls, \
+                         bound manager_dependency_stall_bound_ms)"
                     );
                 }
                 Err(KvError::NoSpace { free, reserve }) => {

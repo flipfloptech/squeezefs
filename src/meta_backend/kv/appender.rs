@@ -84,7 +84,7 @@ const OFF_MOUNT_SLOT: usize = 48; // u32 — the KD-MW-2 slot at its shipped wid
 const OFF_STATE: usize = 52; // u8
 const OFF_IS_MANAGER: usize = 53; // u8
 const OFF_HOME_VOLUME: usize = 54; // u8
-const OFF_RESERVED_55: usize = 55; // u8, zero
+const OFF_LAYOUT_VERSION: usize = 55; // u8 — APPENDER_PAGE_LAYOUT_VERSION (PR 4)
 const OFF_TERM: usize = 56; // u64
 const OFF_RECOVERED_BY_TERM: usize = 64; // u64
 const OFF_N_SEGMENTS: usize = 72; // u16
@@ -101,6 +101,16 @@ const RUN_ENC_LEN: usize = 16;
 const OFF_N_SLOTS: usize = OFF_RUNS + GRANT_RUNS_MAX * RUN_ENC_LEN; // 304, u16
 const OFF_SEQ_OFFSET: usize = OFF_N_SLOTS + 2; // 306, u64 — the ring's record-seq offset (PR 4)
 const OFF_SLOTS: usize = OFF_SEQ_OFFSET + 8; // 314
+
+/// The page LAYOUT version (byte 55, a reserved-zero byte through PR 3):
+/// `1` = PR 4's layout — `seq_offset` at 306 and the slot entries at 314.
+/// The PR 2/3 layout (slots at 306, no offset word) wrote 0 here and
+/// decodes REFUSED, never misread: a page under the same magic with the
+/// slot table 8 bytes earlier would otherwise verify its checksum and
+/// hand back a `seq_offset` made of slot bytes (review round 3, Issue
+/// 23). Bit 17 is stamped by no field volume, so no such page exists
+/// outside a test tempdir; the byte is what makes the next move loud.
+pub const APPENDER_PAGE_LAYOUT_VERSION: u8 = 1;
 
 /// Bytes of the page before its slot entries — the field list of §5.3.2
 /// at natural widths (the KD-MW-2 mount slot at its shipped u32).
@@ -322,6 +332,7 @@ impl AppenderPage {
         img[OFF_STATE] = self.state as u8;
         img[OFF_IS_MANAGER] = u8::from(self.is_manager);
         img[OFF_HOME_VOLUME] = self.home_volume;
+        img[OFF_LAYOUT_VERSION] = APPENDER_PAGE_LAYOUT_VERSION;
         img[OFF_TERM..OFF_TERM + 8].copy_from_slice(&self.term.to_le_bytes());
         img[OFF_RECOVERED_BY_TERM..OFF_RECOVERED_BY_TERM + 8]
             .copy_from_slice(&self.recovered_by_term.to_le_bytes());
@@ -377,10 +388,18 @@ impl AppenderPage {
         if stored != computed {
             return Err(KvError::ChecksumMismatch { stored, computed });
         }
-        if buf[OFF_RESERVED_55] != 0
-            || buf[OFF_RESERVED_74..OFF_RESERVED_74 + 6]
-                .iter()
-                .any(|b| *b != 0)
+        if buf[OFF_LAYOUT_VERSION] != APPENDER_PAGE_LAYOUT_VERSION {
+            return Err(KvError::Corrupt(format!(
+                "appender page layout version {} — this binary writes \
+                 {APPENDER_PAGE_LAYOUT_VERSION} (PR 4: seq_offset at {OFF_SEQ_OFFSET}, slot \
+                 entries at {OFF_SLOTS}); a page of the PR 2/3 layout is refused, never \
+                 misread (the format is forward-only: reformat the volume)",
+                buf[OFF_LAYOUT_VERSION]
+            )));
+        }
+        if buf[OFF_RESERVED_74..OFF_RESERVED_74 + 6]
+            .iter()
+            .any(|b| *b != 0)
             || buf[OFF_RESERVED_234..OFF_RESERVED_234 + 6]
                 .iter()
                 .any(|b| *b != 0)
@@ -519,7 +538,9 @@ impl AppenderPage {
 }
 
 /// xxh3_64 over the page with the checksum field zeroed.
-fn page_checksum(img: &[u8]) -> u64 {
+/// xxh3 over a page image with its checksum field zeroed (the codec's
+/// own; the contracts re-stamp a mutated image with it).
+pub fn page_checksum(img: &[u8]) -> u64 {
     let mut h = xxhash_rust::xxh3::Xxh3::new();
     h.update(&img[..OFF_CHECKSUM]);
     h.update(&[0u8; 8]);

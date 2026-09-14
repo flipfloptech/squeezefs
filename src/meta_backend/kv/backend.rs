@@ -2816,6 +2816,23 @@ impl KvMetaBackend {
         self.appenders.as_ref()
     }
 
+    /// The UNCLAIMED extents of in-process region `appender_id`'s RAM
+    /// grant (the contracts' way to drain a grant through
+    /// `ReturnExtents`); empty for the manager or an unknown region.
+    pub fn region_grant_unclaimed(&self, appender_id: u32) -> Vec<u64> {
+        self.appenders
+            .as_ref()
+            .and_then(|a| a.region(appender_id))
+            .map(|r| {
+                r.grant()
+                    .unclaimed_runs()
+                    .iter()
+                    .flat_map(|run| run.start..run.start + u64::from(run.len))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     /// The region that journals a slot tree's content: the declared
     /// lessee, else the manager (0). 0 on a flat volume.
     pub(super) fn region_of_slot(&self, slot: super::record::ForestSlot) -> u32 {
@@ -3132,6 +3149,9 @@ impl KvMetaBackend {
                 page.state = super::appender::AppenderState::Free;
                 page.slots.clear();
                 page.grant.clear();
+                // The offset in force, not the last checkpoint's (review
+                // round 3, Issue 23): a grant since that cycle raised it.
+                page.seq_offset = self.ring_of_region(region.id).seq_offset();
                 if region.id != 0 {
                     released.append(&mut page.segments);
                     // The `Free` page KEEPS the ring's final head: the
@@ -3453,6 +3473,12 @@ impl KvMetaBackend {
             if r.id == 0 && !readopted.is_empty() {
                 readopted.sort_unstable();
                 readopted.truncate(m as usize);
+                // The rebuilt rotor's slots count against the `2 × M`
+                // cap again (Issue 23: tree 0 does not carry the rotor
+                // bit, and a re-adopted rotor read as 0 held).
+                for slot in &readopted {
+                    plane.table.mark_rotor(*slot, 0);
+                }
                 plane.rotor_update(|rotor| *rotor = readopted);
             }
         }
@@ -5822,6 +5848,9 @@ impl KvMetaBackend {
             let head = region.ring().core().head();
             page.head_hint = head;
             page.ledger_tail_seq = head;
+            // The offset in force (Issue 23), beside the head it pairs
+            // with as the region's seq-space watermark.
+            page.seq_offset = region.ring().seq_offset();
             std::mem::take(&mut page.segments)
         };
         region.dir_named.store(0, Ordering::Release);
@@ -6174,7 +6203,19 @@ impl KvMetaBackend {
         }
         let _g = self.manager_verbs.lock().await;
         let cap = self.grant_extents_for(set, appender_id);
-        let want = super::appender::clamp_grant_want(want, cap);
+        // The steady-state cap clamps the USER-class asks — the cadence's
+        // and the wire's, where an integer is never an allocation
+        // authority. The INTERNAL class is the flush pass's own reactive
+        // ask for ONE SMO's images, sized by that SMO's need: clamped to
+        // the cap it was answered its remainder VERBATIM for ever once
+        // the remainder reached the cap while the split needed more
+        // (PR 4 review round 3 — a quiet appender's derived cap is the
+        // floor, 8, and a fat overlay splits wider). Bounded by the free
+        // heap below, as every carve is.
+        let want = match class {
+            super::alloc_ext_core::AllocClass::User => super::appender::clamp_grant_want(want, cap),
+            super::alloc_ext_core::AllocClass::Internal => u64::from(want.max(1)),
+        };
         // §5.3.5: an unconsumed grant is answered verbatim.
         let remainder = self.unclaimed_remainder_of(set, appender_id).await?;
         let remainder_extents: u64 = remainder.iter().map(|r| u64::from(r.len)).sum();
@@ -17211,6 +17252,7 @@ impl KvMetaBackend {
                         verdict = Some(KvError::GrantExhausted {
                             appender: region.id,
                             unclaimed: headroom,
+                            needed: delta,
                         });
                         break;
                     }

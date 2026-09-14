@@ -181,10 +181,23 @@ impl LeaseGate {
 
     /// Return the door token of `slot` (the commit's terminal outcome).
     /// Answers the tokens still out — `0` wakes a release parked on the
-    /// drain.
+    /// drain. A leave with no token out (a `DoorPass` dropped twice would
+    /// be the bug) answers 0 and leaves the count at 0 rather than
+    /// wrapping it — a wrapped count is a permanently un-drainable slot
+    /// (review round 3, Issue 23).
     #[inline]
     pub fn leave(&self, slot: Slot) -> u32 {
-        self.inflight[slot as usize].fetch_sub(1, Ordering::AcqRel) - 1
+        let word = &self.inflight[slot as usize];
+        let mut cur = word.load(Ordering::Acquire);
+        loop {
+            if cur == 0 {
+                return 0;
+            }
+            match word.compare_exchange_weak(cur, cur - 1, Ordering::AcqRel, Ordering::Acquire) {
+                Ok(_) => return cur - 1,
+                Err(seen) => cur = seen,
+            }
+        }
     }
 
     /// The door tokens out on `slot` — the release's half of the Dekker
@@ -350,8 +363,9 @@ pub struct SlotLease {
     /// want }`), so it counts against the holder's `2 × M` rotor cap
     /// (§5.1.2; review round 2, Issue 14 — the cap counts rotor slots,
     /// never every non-native lease; the page budget governs holdings).
-    /// Cleared at the release; a re-adoption at open reads `false` and
-    /// the manager's own rotor is rebuilt from its RAM vector.
+    /// Cleared at the release; a re-adoption at open reads `false` from
+    /// tree 0 and the arm re-marks the manager's rebuilt rotor
+    /// ([`SlotLeaseTable::mark_rotor`]) so the cap counts it.
     pub rotor: bool,
 }
 
@@ -801,6 +815,23 @@ impl SlotLeaseTable {
             .get(&holder)
             .map(|s| s.iter().copied().collect())
             .unwrap_or_default()
+    }
+
+    /// Mark `slot` — held by `holder` — as a ROTOR grant: the arm's re-
+    /// adoption rebuilds the manager's rotor from tree 0's leases, whose
+    /// records do not distinguish a rotor grant from a handover's, so the
+    /// `2 × M` cap would otherwise count 0 re-adopted rotor slots and
+    /// admit up to `M` more than the law (review round 3, Issue 23).
+    /// A slot another holder leases is left alone.
+    pub fn mark_rotor(&self, slot: Slot, holder: AppenderId) {
+        let mut m = self.lock();
+        if let Some(e) = m
+            .slots
+            .get_mut(&slot)
+            .filter(|e| e.state != LeaseState::Unleased && e.holder == holder)
+        {
+            e.rotor = true;
+        }
     }
 
     /// The slots `holder` leases by a ROTOR grant (the `2 × M` cap's

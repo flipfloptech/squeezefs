@@ -350,12 +350,39 @@ impl SmoContext {
                 g.claim().ok_or(KvError::GrantExhausted {
                     appender: r.appender_id,
                     unclaimed: 0,
+                    needed: 1,
                 })?
             }
             None => self.alloc.claim_internal()?,
         };
         self.note_claim();
         Ok(extent)
+    }
+
+    /// Refuse BEFORE the first claim when the region's grant cannot cover
+    /// an SMO that needs `needed` images — the refusal names the whole
+    /// need, so the reactive refill (`checkpoint.rs`) asks for exactly
+    /// that. A grant answered to a constant (`SMO_IMAGES_MAX`) was
+    /// re-answered VERBATIM by §5.3.5's idempotency once it held that
+    /// many, while a fat overlay's split needed more — the compaction
+    /// deferred for ever, the region's tail never advanced, and every
+    /// commit parked at its full ring escalated through D1.b (PR 4
+    /// review round 3, found by the three-tree leave fixture). Unscoped
+    /// (the manager's bitmap) it checks nothing: the heap's admission
+    /// promised the images.
+    fn check_grant_covers(&self, needed: usize) -> Result<(), KvError> {
+        if let Some(r) = &self.region {
+            let g = r.grant.lock().unwrap_or_else(|e| e.into_inner());
+            let unclaimed = g.unclaimed();
+            if unclaimed < needed as u64 {
+                return Err(KvError::GrantExhausted {
+                    appender: r.appender_id,
+                    unclaimed,
+                    needed: needed as u64,
+                });
+            }
+        }
+        Ok(())
     }
 
     /// Return a claimed-but-unpublished extent.
@@ -1709,6 +1736,11 @@ impl KvTree {
             ),
             KvError,
         > = async {
+            // The whole need up front (the parts + a new root when a
+            // multi-way replacement is the root's): a leased slot's grant
+            // that cannot cover it refuses NAMING it, before any claim.
+            let need = parts.len() + usize::from(self.is_root(node) && parts.len() > 1);
+            ctx.check_grant_covers(need)?;
             let mut written: Vec<(u64, u64)> = Vec::new(); // (addr, node_seq)
             let mut claim = |ctx: &SmoContext, cache: &NodeCache| -> Result<u64, KvError> {
                 let extent = ctx.claim_internal()?;

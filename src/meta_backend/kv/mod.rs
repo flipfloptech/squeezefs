@@ -891,11 +891,19 @@ pub enum KvError {
     /// defers the node (counted `manager_dependency_stalls`); a user op
     /// that needs the extent refuses `EAGAIN`-class, never `ENOSPC` (the
     /// heap is not full — the appender is out of grant).
+    /// `needed` = the images the refused act needs IN TOTAL (a split's
+    /// parts + its root), so the reactive refill asks for exactly that —
+    /// a refill sized to a constant re-answered the remainder verbatim
+    /// for ever when one SMO needed more (PR 4 review round 3).
     #[error(
-        "appender {appender}'s extent grant is exhausted ({unclaimed} unclaimed) and the \
-         manager has not refilled it — retry (EAGAIN)"
+        "appender {appender}'s extent grant is exhausted ({unclaimed} unclaimed, {needed} \
+         needed) and the manager has not refilled it — retry (EAGAIN)"
     )]
-    GrantExhausted { appender: u32, unclaimed: u64 },
+    GrantExhausted {
+        appender: u32,
+        unclaimed: u64,
+        needed: u64,
+    },
 
     /// A mutation of a forest slot another appender LEASES (design-
     /// symmetric-metadata §5.1.4, PR 4; review round 2 Issue 6): the

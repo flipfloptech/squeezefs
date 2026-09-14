@@ -6,9 +6,8 @@
 //! mount replays tree 0 first and opens every slot tree the records name,
 //! so a record that decodes wrong is a whole slot tree unreachable (or a
 //! stale root mounted as live). The value is versioned and forward-only;
-//! the `Leased` variant has no writer until PR 4 and is decoded so a
-//! PR-4 volume refuses THIS binary with the right message. The laws (spec
-//! §11 TEST-4):
+//! the `Leased` variant is the PR-4 lessee record (the root then rides
+//! the lessee's appender page). The laws (spec §11 TEST-4):
 //!
 //! 1. **Total.** Key and value decoders answer `Ok` or a typed error on
 //!    arbitrary bytes — never a panic, never an allocation driven by the
@@ -26,7 +25,7 @@
 use libfuzzer_sys::fuzz_target;
 use squeezefs::meta_backend::kv::slot_state::{
     decode_slot_state_key, slot_state_key, slot_state_key_range, SlotState, SLOT_STATE_KEY_LEN,
-    SLOT_STATE_VERSION,
+    SLOT_STATE_VERSION, UNLEASED_FIXED_LEN,
 };
 use squeezefs::meta_backend::kv::tree::RootPtr;
 
@@ -75,9 +74,16 @@ fuzz_target!(|data: &[u8]| {
                 if v == SLOT_STATE_VERSION && data.len() >= 2 && data[1] == 1 {
                     // An Unleased image refuses only when its length is
                     // not the fixed part plus exactly the tails it names.
-                    if data.len() >= 32 {
-                        let n = usize::from(u16::from_le_bytes([data[30], data[31]]));
-                        assert_ne!(data.len(), 32 + n * 12, "a well-formed image decodes");
+                    if data.len() >= UNLEASED_FIXED_LEN {
+                        let n = usize::from(u16::from_le_bytes([
+                            data[UNLEASED_FIXED_LEN - 2],
+                            data[UNLEASED_FIXED_LEN - 1],
+                        ]));
+                        assert_ne!(
+                            data.len(),
+                            UNLEASED_FIXED_LEN + n * 12,
+                            "a well-formed image decodes"
+                        );
                     }
                 }
             }
@@ -85,12 +91,14 @@ fuzz_target!(|data: &[u8]| {
     }
 
     // --- the value: encode side, over the encoder's whole domain -------------
-    if data.len() >= 1 + 8 + 8 + 8 + 4 + 2 {
+    if data.len() >= 1 + 8 + 8 + 8 + 4 + 4 + 8 + 2 {
         let addr = u64::from_le_bytes(data[1..9].try_into().unwrap());
         let seq = u64::from_le_bytes(data[9..17].try_into().unwrap());
         let cursor = u64::from_le_bytes(data[17..25].try_into().unwrap());
         let g = u32::from_le_bytes(data[25..29].try_into().unwrap());
-        let n = usize::from(u16::from_le_bytes([data[29], data[30]])) % 64; // bounded work
+        let slot_tree_extents = u32::from_le_bytes(data[29..33].try_into().unwrap());
+        let last_written = u64::from_le_bytes(data[33..41].try_into().unwrap());
+        let n = usize::from(u16::from_le_bytes([data[41], data[42]])) % 64; // bounded work
         let tails: Vec<(u64, u32)> = (0..n)
             .map(|i| (addr.wrapping_add(i as u64), g.wrapping_add(i as u32)))
             .collect();
@@ -98,6 +106,8 @@ fuzz_target!(|data: &[u8]| {
             root: RootPtr { addr, seq },
             cursor,
             g,
+            slot_tree_extents,
+            last_written,
             tails,
         };
         let leased = SlotState::Leased {

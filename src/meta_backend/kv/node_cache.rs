@@ -1418,6 +1418,12 @@ pub struct CachedNode {
     /// ([`Self::apply_locked`]) — one relaxed load, and on the leaf commit
     /// path the level test short-circuits before even that.
     env: Arc<NodeEnv>,
+    /// The owning cache's slot-lease gate (design-symmetric-metadata
+    /// §5.4.1, PR 4) — the THIRD gate state, "appender for my own
+    /// leaves": read at the choke point only for a forest-slot-stamped
+    /// node on an ARMED mount (two relaxed loads); a flat volume's nodes
+    /// never reach the load.
+    lease: Arc<crate::slot_lease_core::LeaseGate>,
     /// The revalidation epoch this object was **loaded under** (spec §6.8
     /// item 2). Stamped by [`NodeCache::publish_stamped`] from the
     /// pre-device-read snapshot, so a node can never claim currency for a
@@ -1490,12 +1496,14 @@ impl CachedNode {
         charge: Arc<AtomicU64>,
         heap_promised: Arc<AtomicU64>,
         env: Arc<NodeEnv>,
+        lease: Arc<crate::slot_lease_core::LeaseGate>,
     ) -> Result<Arc<Self>, KvError> {
         let (header, buf, bset_ranges, tail_offset) = loaded.into_parts();
         let sources: Vec<Bytes> = bset_ranges.iter().map(|r| buf.slice(r.clone())).collect();
         let base = Arc::new(RecordIndex::build(sources)?);
         Ok(Arc::new(Self {
             env,
+            lease,
             epoch_stamp: AtomicU64::new(UNARMED_EPOCH),
             addr: header.node_addr,
             node_seq: header.node_seq,
@@ -1715,6 +1723,35 @@ impl CachedNode {
                  (spec §6.2 closing: partitioning, not cache coherence; lock order 4b)",
                 self.addr, self.level, gate.writer_id, gate.writers
             )));
+        }
+        // The THIRD gate state (design-symmetric-metadata §5.4.1, PR 4):
+        // "appender for my own leaves". A slot tree has exactly one
+        // writer-cacher — its lessee — so on an ARMED mount a leaf of a
+        // slot this mount does not lease, or one mid-handover (the
+        // departing holder raised `Releasing` before its flush took this
+        // very lock), is refused here, under the node's write lock — the
+        // order the `slot_lease_core` loom model pins. Flat volumes and
+        // unarmed forests never reach the load: the stamp is `u32::MAX` /
+        // the gate answers `Unarmed`.
+        let slot = self.forest_slot.load(Ordering::Relaxed);
+        if slot != u32::MAX {
+            use crate::slot_lease_core::CommitVerdict;
+            match self.lease.verdict(slot) {
+                CommitVerdict::Unarmed | CommitVerdict::Allowed => {}
+                verdict @ (CommitVerdict::NotLeased | CommitVerdict::Releasing) => {
+                    super::META_KV_LEAF_LEASE_REFUSALS.fetch_add(1, Ordering::Relaxed);
+                    return Err(KvError::Corrupt(format!(
+                        "mutation of node {:#x} (forest slot {slot}) refused: {} — a slot tree \
+                         has exactly one writer-cacher, its lessee (design-symmetric-metadata \
+                         §5.4.1; meta_kv_leaf_lease_refusals)",
+                        self.addr,
+                        match verdict {
+                            CommitVerdict::NotLeased => "this mount does not lease the slot",
+                            _ => "the slot is mid-handover (flush-then-transfer)",
+                        }
+                    )));
+                }
+            }
         }
         if self.state.mark_dirty().is_err() {
             return Err(KvError::Corrupt(format!(
@@ -2420,6 +2457,9 @@ pub struct NodeCache {
     /// **revalidation epoch**, plus the §6.2-closing append gates. Every
     /// node holds a clone.
     env: Arc<NodeEnv>,
+    /// The slot-lease gate every node clones (PR 4; unarmed on every
+    /// bit-17-absent volume and every unarmed forest mount).
+    lease: Arc<crate::slot_lease_core::LeaseGate>,
     /// The R-6 purge trigger a reader installs at arm time (spec §6.8
     /// item 5). `None` on every write mount — set once, never replaced.
     purge_sink: OnceLock<Arc<dyn EpochPurgeSink>>,
@@ -2486,6 +2526,7 @@ impl NodeCache {
             cached_bytes: Arc::new(AtomicU64::new(0)),
             heap_promised: Arc::new(AtomicU64::new(0)),
             env: Arc::new(NodeEnv::new(0)),
+            lease: Arc::new(crate::slot_lease_core::LeaseGate::new()),
             purge_sink: OnceLock::new(),
             retired: scc::HashSet::default(),
             dying_floors: AtomicU64::new(u64::MAX),
@@ -2662,6 +2703,13 @@ impl NodeCache {
     /// builds SMO successors and fresh roots itself).
     pub(crate) fn node_env(&self) -> Arc<NodeEnv> {
         self.env.clone()
+    }
+
+    /// The slot-lease gate (PR 4) — what [`CachedNode::from_loaded`] takes
+    /// beside the environment, and what the writer's join arms and
+    /// publishes leases into.
+    pub fn lease_gate(&self) -> Arc<crate::slot_lease_core::LeaseGate> {
+        self.lease.clone()
     }
 
     // -----------------------------------------------------------------
@@ -3025,6 +3073,7 @@ impl NodeCache {
                 self.cached_bytes.clone(),
                 self.heap_promised.clone(),
                 self.env.clone(),
+                self.lease.clone(),
             )?;
             if node.level() > 0 {
                 node.pin(); // §4.5: interior nodes always pinned.

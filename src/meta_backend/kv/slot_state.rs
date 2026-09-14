@@ -4,12 +4,17 @@
 //! Under the slot-tree forest every non-native slot tree's root has a
 //! durable home outside the fixed ledger: a `slot_state:{s}` record in
 //! the volume's control tree ([`super::record::TREE_CONTROL`]), whose own
-//! root the ledger names. PR 1 writes the `Unleased` form only — one
-//! appender, roots published by its checkpoint task (`tails` stays empty
-//! until PR 2's handover path records flushed-leaf log tails); the
-//! `Leased` form is the PR-4 lessee record readers resolve slots by
-//! (KD-SYM-17). Both are versioned and refuse a future version loud
-//! (forward-only format).
+//! root the ledger names. An `Unleased` record names the tree's root,
+//! its ino cursor, its lease generation `g`, its extent count (the
+//! affinity cap's durable input, §5.1.2), the manager's seq at the last
+//! release (`prefer: unleased-then-idle`'s ordering key, §5.1.2) and the
+//! flushed-leaf log tails the last release recorded (§5.8.2 — consumed by
+//! PR 5's frame screen); a `Leased` record names the LESSEE (KD-SYM-17,
+//! PR 4) — the root then rides the lessee's appender page. Both are
+//! versioned and refuse a future version loud (forward-only format;
+//! version 2 since PR 4 added `slot_tree_extents` and `last_written` to
+//! the `Unleased` image — bit 17 is stamped by no field volume, so no
+//! version-1 record exists outside a test tempdir).
 //!
 //! Keys are memcmp-ordered: `b"slot_state:" ‖ slot: u32 BE`, so a range
 //! walk over the prefix yields slots in index order — the census's
@@ -25,12 +30,13 @@ pub const SLOT_STATE_KEY_PREFIX: &[u8] = b"slot_state:";
 pub const SLOT_STATE_KEY_LEN: usize = SLOT_STATE_KEY_PREFIX.len() + 4;
 
 /// Record value version (byte 0 of every image).
-pub const SLOT_STATE_VERSION: u8 = 1;
+pub const SLOT_STATE_VERSION: u8 = 2;
 const VARIANT_UNLEASED: u8 = 1;
 const VARIANT_LEASED: u8 = 2;
-/// `version ‖ variant ‖ root.addr ‖ root.seq ‖ cursor ‖ g ‖ n_tails: u16`
-/// before the tail entries (`leaf addr: u64 ‖ tail: u32` each).
-const UNLEASED_FIXED_LEN: usize = 1 + 1 + 8 + 8 + 8 + 4 + 2;
+/// `version ‖ variant ‖ root.addr ‖ root.seq ‖ cursor ‖ g ‖
+/// slot_tree_extents: u32 ‖ last_written: u64 ‖ n_tails: u16` before the
+/// tail entries (`leaf addr: u64 ‖ tail: u32` each).
+pub const UNLEASED_FIXED_LEN: usize = 1 + 1 + 8 + 8 + 8 + 4 + 4 + 8 + 2;
 const TAIL_ENTRY_LEN: usize = 8 + 4;
 /// `version ‖ variant ‖ appender_id: u32 ‖ g: u32 ‖ page_addr: u64`.
 const LEASED_LEN: usize = 1 + 1 + 4 + 4 + 8;
@@ -73,19 +79,20 @@ pub fn decode_slot_state_key(key: &[u8]) -> Result<ForestSlot, KvError> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SlotState {
     /// No lessee: the slot tree's root, its ino cursor, its lease
-    /// generation and the flushed-leaf log tails recorded at the last
-    /// release (§5.8.2 — empty until PR 2 records them).
+    /// generation, its extent count, the manager's seq at the last
+    /// release and the flushed-leaf log tails that release recorded
+    /// (§5.8.2 — the handover writes them; PR 5's frame screen reads them).
     Unleased {
         root: RootPtr,
         cursor: u64,
         g: u32,
+        slot_tree_extents: u32,
+        last_written: u64,
         tails: Vec<(u64, u32)>,
     },
     /// Leased: the lessee's identity — what makes slot resolution a
-    /// control-plane projection (KD-SYM-17). No writer until PR 4: it is
-    /// decoded here so a volume a PR-4 binary leased refuses THIS binary
-    /// with the right message ("slot leases are not part of this binary's
-    /// forest") instead of a generic unknown-variant corruption.
+    /// control-plane projection (KD-SYM-17). Written by the manager at
+    /// every grant (PR 4); the root rides the lessee's page.
     Leased {
         appender_id: u32,
         g: u32,
@@ -104,6 +111,8 @@ impl SlotState {
                 root,
                 cursor,
                 g,
+                slot_tree_extents,
+                last_written,
                 tails,
             } => {
                 let n = u16::try_from(tails.len()).map_err(|_| {
@@ -119,6 +128,8 @@ impl SlotState {
                 out.extend_from_slice(&root.seq.to_le_bytes());
                 out.extend_from_slice(&cursor.to_le_bytes());
                 out.extend_from_slice(&g.to_le_bytes());
+                out.extend_from_slice(&slot_tree_extents.to_le_bytes());
+                out.extend_from_slice(&last_written.to_le_bytes());
                 out.extend_from_slice(&n.to_le_bytes());
                 for (leaf, tail) in tails {
                     out.extend_from_slice(&leaf.to_le_bytes());
@@ -170,7 +181,9 @@ impl SlotState {
                 let seq = le64(value, 10);
                 let cursor = le64(value, 18);
                 let g = le32(value, 26);
-                let n = usize::from(u16::from_le_bytes([value[30], value[31]]));
+                let slot_tree_extents = le32(value, 30);
+                let last_written = le64(value, 34);
+                let n = usize::from(u16::from_le_bytes([value[42], value[43]]));
                 let want = UNLEASED_FIXED_LEN + n * TAIL_ENTRY_LEN;
                 if value.len() != want {
                     return Err(KvError::Corrupt(format!(
@@ -189,6 +202,8 @@ impl SlotState {
                     root: RootPtr { addr, seq },
                     cursor,
                     g,
+                    slot_tree_extents,
+                    last_written,
                     tails,
                 })
             }

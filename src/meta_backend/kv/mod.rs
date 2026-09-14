@@ -68,6 +68,7 @@ pub mod node_state_core;
 pub mod record;
 pub mod revalidate;
 pub mod slot_cursor_core;
+pub mod slot_lease;
 pub mod slot_set;
 pub mod slot_state;
 pub mod superblock;
@@ -253,6 +254,13 @@ pub static META_KV_REPLAY_LEASE_VIOLATIONS: AtomicU64 = AtomicU64::new(0);
 /// **Must-stay-0 tripwire**: an allocator delta in a ring whose appender
 /// holds no grant covering the extent; the mount refuses.
 pub static META_KV_REPLAY_EXTENT_VIOLATIONS: AtomicU64 = AtomicU64::new(0);
+
+/// **Must-stay-0 tripwire** (design-symmetric-metadata §5.4.1, PR 4): a
+/// leaf mutation of a slot tree this mount does NOT lease — or one
+/// mid-handover — refused at `CachedNode::apply_locked` on an ARMED
+/// symmetric mount; the writer twin of `meta_kv_node_partition_refusals`.
+/// Surfaced as `meta_kv_leaf_lease_refusals`.
+pub static META_KV_LEAF_LEASE_REFUSALS: AtomicU64 = AtomicU64::new(0);
 
 /// DUR-4 law 2 engagements: bitmap page images whose requested generation
 /// tied or trailed the page's newest on-disk copy and were RAISED above it

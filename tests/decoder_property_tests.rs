@@ -266,6 +266,8 @@ fn slot_state_tails_past_u16_refuse_at_the_encoder() {
         root: RootPtr { addr: 1, seq: 1 },
         cursor: 0,
         g: 0,
+        slot_tree_extents: 0,
+        last_written: 0,
         tails: vec![(0, 0); usize::from(u16::MAX) + 1],
     };
     assert!(too_many.encode().is_err());
@@ -273,6 +275,8 @@ fn slot_state_tails_past_u16_refuse_at_the_encoder() {
         root: RootPtr { addr: 1, seq: 1 },
         cursor: 0,
         g: 0,
+        slot_tree_extents: 0,
+        last_written: 0,
         tails: vec![(0, 0); usize::from(u16::MAX)],
     };
     let bytes = at_cap.encode().expect("u16::MAX tails encode");
@@ -618,11 +622,15 @@ proptest! {
         seq in any::<u64>(),
         cursor in any::<u64>(),
         g in any::<u32>(),
+        slot_tree_extents in any::<u32>(),
+        last_written in any::<u64>(),
         tails in prop::collection::vec((any::<u64>(), any::<u32>()), 0..48),
         slot in any::<u32>(),
     ) {
         prop_assert_eq!(decode_slot_state_key(&slot_state_key(slot)).ok(), Some(slot));
-        let unleased = SlotState::Unleased { root: RootPtr { addr, seq }, cursor, g, tails };
+        let unleased = SlotState::Unleased {
+            root: RootPtr { addr, seq }, cursor, g, slot_tree_extents, last_written, tails,
+        };
         let leased = SlotState::Leased { appender_id: g, g: g.wrapping_add(1), page_addr: addr };
         for state in [unleased, leased] {
             let bytes = state.encode().expect("encodes");

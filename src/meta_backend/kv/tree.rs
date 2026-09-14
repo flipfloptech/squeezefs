@@ -229,6 +229,13 @@ pub struct SmoContext {
     /// `None` = a flat volume or an unpartitioned forest: every SMO is the
     /// manager's.
     resolver: Option<Arc<dyn Fn(super::record::ForestSlot) -> Option<SmoRegion> + Send + Sync>>,
+    /// The forest slot the SMOs that follow run for (`scope_to`'s input) —
+    /// the key the extent ledger counts under.
+    slot: Option<super::record::ForestSlot>,
+    /// The per-slot extent ledger (design-symmetric-metadata §5.1.2's
+    /// `slot_tree_extents`, PR 4): every image claim and retirement of a
+    /// slot tree moves its count. `None` on a flat volume.
+    extent_ledger: Option<Arc<super::slot_lease::SlotExtentLedger>>,
 }
 
 /// The region scope an SMO runs in: the lessee's ring and grant.
@@ -246,6 +253,8 @@ impl SmoContext {
             journal: None,
             region: None,
             resolver: None,
+            slot: None,
+            extent_ledger: None,
         }
     }
 
@@ -258,6 +267,33 @@ impl SmoContext {
             journal: Some(journal),
             region: None,
             resolver: None,
+            slot: None,
+            extent_ledger: None,
+        }
+    }
+
+    /// Install the per-slot extent ledger (a forest volume's).
+    pub fn set_extent_ledger(&mut self, ledger: Arc<super::slot_lease::SlotExtentLedger>) {
+        self.extent_ledger = Some(ledger);
+    }
+
+    /// Scope the claims that follow to `slot`'s extent count without a
+    /// region resolution (the lazy mint, which sets its region itself).
+    pub fn set_slot(&mut self, slot: Option<super::record::ForestSlot>) {
+        self.slot = slot;
+    }
+
+    /// One image claimed for the slot in scope.
+    fn note_claim(&self) {
+        if let (Some(l), Some(s)) = (&self.extent_ledger, self.slot) {
+            l.claim(s);
+        }
+    }
+
+    /// One image of the slot in scope retired or released.
+    fn note_free(&self) {
+        if let (Some(l), Some(s)) = (&self.extent_ledger, self.slot) {
+            l.free(s);
         }
     }
 
@@ -282,6 +318,7 @@ impl SmoContext {
     /// Scope to the region leasing `slot` (`None` slot = tree 0 / a flat
     /// tree = the manager's) — what every SMO entry point does first.
     fn scope_to(&mut self, slot: Option<super::record::ForestSlot>) {
+        self.slot = slot;
         self.region = match (&self.resolver, slot) {
             (Some(resolve), Some(s)) => resolve(s),
             _ => None,
@@ -307,16 +344,18 @@ impl SmoContext {
     /// when scoped — [`KvError::GrantExhausted`] when the grant has none —
     /// else from the bitmap.
     fn claim_internal(&self) -> Result<u64, KvError> {
-        match &self.region {
+        let extent = match &self.region {
             Some(r) => {
                 let mut g = r.grant.lock().unwrap_or_else(|e| e.into_inner());
                 g.claim().ok_or(KvError::GrantExhausted {
                     appender: r.appender_id,
                     unclaimed: 0,
-                })
+                })?
             }
-            None => self.alloc.claim_internal(),
-        }
+            None => self.alloc.claim_internal()?,
+        };
+        self.note_claim();
+        Ok(extent)
     }
 
     /// Return a claimed-but-unpublished extent.
@@ -329,6 +368,7 @@ impl SmoContext {
                 .release_unpublished(extent),
             None => self.alloc.release_unpublished(extent),
         }
+        self.note_free();
     }
 
     /// Park a retired image's extent gated on `gate_seq` — a position in
@@ -341,14 +381,14 @@ impl SmoContext {
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
                     .free_pending(extent, gate_seq);
-                Ok(())
             }
             None if forced => {
                 self.alloc.free_pending_forced(extent, gate_seq);
-                Ok(())
             }
-            None => self.alloc.free_pending(extent, gate_seq),
+            None => self.alloc.free_pending(extent, gate_seq)?,
         }
+        self.note_free();
+        Ok(())
     }
 
     /// The §4.7 at-cap admission valve: a region's grant parks without a
@@ -613,10 +653,17 @@ impl KvTree {
         // budget, so the class distinction is the manager's alone.
         let extent = match (ctx.region.is_some(), slot_tree) {
             (true, Some(_)) => ctx.claim_internal()?,
-            (_, Some((_, _, super::alloc_ext_core::AllocClass::User))) => ctx.alloc.claim_user()?,
-            (_, Some((_, _, super::alloc_ext_core::AllocClass::Internal))) | (_, None) => {
-                ctx.alloc.claim_internal()?
+            (_, Some((_, _, super::alloc_ext_core::AllocClass::User))) => {
+                let e = ctx.alloc.claim_user()?;
+                ctx.note_claim();
+                e
             }
+            (_, Some((_, _, super::alloc_ext_core::AllocClass::Internal))) => {
+                let e = ctx.alloc.claim_internal()?;
+                ctx.note_claim();
+                e
+            }
+            (_, None) => ctx.alloc.claim_internal()?,
         };
         let addr = cache.extent_addr(extent);
         let node_seq = seq.fetch_add(1, Ordering::AcqRel) + 1;
@@ -648,6 +695,7 @@ impl KvTree {
             cache.charge_gauge(),
             cache.heap_promise_gauge(),
             cache.node_env(),
+            cache.lease_gate(),
         )?;
         if let Some(slot) = forest_slot {
             node.stamp_forest_slot(slot);
@@ -1745,6 +1793,7 @@ impl KvTree {
                     self.cache.charge_gauge(),
                     self.cache.heap_promise_gauge(),
                     self.cache.node_env(),
+                    self.cache.lease_gate(),
                 )?);
             }
 
@@ -1811,6 +1860,7 @@ impl KvTree {
                     self.cache.charge_gauge(),
                     self.cache.heap_promise_gauge(),
                     self.cache.node_env(),
+                    self.cache.lease_gate(),
                 )?)
             } else {
                 None
@@ -2862,6 +2912,7 @@ impl KvTree {
                 self.cache.charge_gauge(),
                 self.cache.heap_promise_gauge(),
                 self.cache.node_env(),
+                self.cache.lease_gate(),
             )
         }
         .await;

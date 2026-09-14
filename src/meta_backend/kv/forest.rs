@@ -59,6 +59,9 @@ pub struct SlotTrees {
     minted: AtomicU64,
     /// `slot_state` records the checkpoint published (`meta_kv_forest_root_publishes`).
     publishes: AtomicU64,
+    /// Per-slot extent counts (`slot_tree_extents`, PR 4) — the affinity
+    /// cap's input, moved by every SMO context scoped to a slot.
+    extents: Arc<super::slot_lease::SlotExtentLedger>,
 }
 
 /// A routed record: the slot tree holding it and its forest key.
@@ -125,7 +128,13 @@ impl SlotTrees {
             published,
             minted: AtomicU64::new(0),
             publishes: AtomicU64::new(0),
+            extents: Arc::new(super::slot_lease::SlotExtentLedger::new()),
         }
+    }
+
+    /// The per-slot extent ledger (shared with the volume's SMO context).
+    pub fn extent_ledger(&self) -> &Arc<super::slot_lease::SlotExtentLedger> {
+        &self.extents
     }
 
     /// Tree 0.
@@ -334,6 +343,8 @@ impl SlotTrees {
         }
         let mut ctx = SmoContext::new(Arc::clone(mint.alloc));
         ctx.set_region(mint.region.clone());
+        ctx.set_extent_ledger(Arc::clone(&self.extents));
+        ctx.set_slot(Some(slot));
         let tree = Arc::new(
             KvTree::create_slot_tree(
                 Arc::clone(mint.cache),

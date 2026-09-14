@@ -2541,6 +2541,12 @@ impl KvMetaBackend {
                 path: path.to_path_buf(),
             },
         );
+        // A forest's SMO context counts every slot tree's image claims and
+        // retirements on the per-slot extent ledger (`slot_tree_extents`,
+        // the affinity cap's input — PR 4).
+        if let TreeSet::Forest { forest, .. } = &trees {
+            smo_ctx.set_extent_ledger(Arc::clone(forest.extent_ledger()));
+        }
         // A partitioned forest's SMOs scope themselves by slot (§5.2.3):
         // a leased slot tree's ring and grant are its lessee's. The
         // resolver holds the set weakly — the set outlives every SMO by
@@ -11903,11 +11909,15 @@ impl KvMetaBackend {
             .map(|(slot, root)| {
                 let state = super::slot_state::SlotState::Unleased {
                     root: *root,
-                    // PR 1: one appender, one cursor — the native
-                    // watermark rides the ledger's `next_ino`; per-slot
-                    // cursors travel with the lease from PR 4.
+                    // The UNARMED forest (PR 1–3): one appender, one
+                    // cursor — the native watermark rides the ledger's
+                    // `next_ino`; per-slot cursors travel with the lease
+                    // on an armed mount, whose leased slots never come
+                    // through here (their roots ride the lessee's page).
                     cursor: 0,
                     g: 0,
+                    slot_tree_extents: 0,
+                    last_written: 0,
                     tails: Vec::new(),
                 };
                 let value = state.encode()?;

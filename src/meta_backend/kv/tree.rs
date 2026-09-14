@@ -2040,7 +2040,7 @@ impl KvTree {
                         .map(|r| r.entry_floor.min(r.seq))
                         .min()
                         .unwrap_or(u64::MAX);
-                    succ.apply_locked(&mut sg, mine, floor)?;
+                    succ.apply_locked_structural(&mut sg, mine, floor)?;
                     // §4.7 heap admission: the leftovers were admitted
                     // against the PREDECESSOR's promise (just released by
                     // `take_overlay`), but this SMO folded only the frozen
@@ -2145,7 +2145,7 @@ impl KvTree {
                     // under the K6b hooks) — SMO floors already pin at
                     // the §1b boundary.
                     let flip_floor = recs.first().map(|r| r.seq).unwrap_or(u64::MAX);
-                    parent.apply_locked(pg, recs, flip_floor)?;
+                    parent.apply_locked_structural(pg, recs, flip_floor)?;
                 }
                 (Some(_), None) => unreachable!("parent guard taken with parent"),
             }
@@ -3030,7 +3030,7 @@ impl KvTree {
                     .map(|r| r.entry_floor.min(r.seq))
                     .min()
                     .unwrap_or(u64::MAX);
-                successor.apply_locked(&mut sg, leftovers, floor)?;
+                successor.apply_locked_structural(&mut sg, leftovers, floor)?;
                 if sg.projected_log_end(layout, 0) > layout.node_size() {
                     let (fold, parts) = successor.snapshot().fold_bytes_upper_with(
                         &mut [],
@@ -3064,7 +3064,7 @@ impl KvTree {
                     Bytes::new(),
                 ),
             ];
-            parent.apply_locked(&mut parent_guard, flips, put_seq)?;
+            parent.apply_locked_structural(&mut parent_guard, flips, put_seq)?;
             self.cache.retire(left);
             self.cache.retire(right);
             drop(gl);

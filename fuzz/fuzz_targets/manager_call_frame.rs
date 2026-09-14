@@ -44,7 +44,9 @@ use squeezefs::meta_backend::kv::appender::{
     clamp_grant_want, coalesce_runs, intersect_coalesced_with_record, runs_extent_count,
     validate_return_runs, GrantRun,
 };
-use squeezefs::meta_backend::kv::slot_state::{ExtentGrantRecord, SlotState};
+use squeezefs::meta_backend::kv::slot_state::{
+    ExtentGrantRecord, SlotState, SlotTails, SlotTailsRecord, TAILS_SPILLED,
+};
 use squeezefs::meta_backend::kv::tree::RootPtr;
 use squeezefs::meta_ship::manager::{
     decode_reply, decode_request, encode_reply, encode_request, ManagerCall, ManagerReply,
@@ -115,29 +117,34 @@ fn check_service_edge(call: &ManagerCall, total_extents: u64, record_seed: &[u8]
         // The slot-lease verbs (PR 4): their wire integers are a slot
         // (u16 — the routing namespace, total), an appender id, `g`, the
         // words and the tails; the ONE proportional input is the tails
-        // list, whose count is bounded by the record's u16 at the
-        // service edge (`manager_release_slot_wire` rejects past it).
+        // list, bounded by the frame's class cap at the codec. The
+        // release site records it inline below the KV value cap and
+        // SPILLED above it (review round 3, Issue 21), so the fixed-size
+        // `Unleased` record round-trips with the frame's words whatever
+        // the count, and the tails record's inline arm encodes for every
+        // count below the spill sentinel.
         ManagerCall::ReleaseSlot { words, tails, .. } => {
-            // The service edge REJECTS a tails count past the record's u16
-            // before anything proportional to it is built; within it the
-            // record encodes and round-trips with the frame's words.
-            if tails.len() <= usize::from(u16::MAX) {
-                let record = SlotState::Unleased {
-                    root: RootPtr {
-                        addr: words.root.0,
-                        seq: words.root.1,
-                    },
-                    cursor: words.cursor,
+            let record = SlotState::Unleased {
+                root: RootPtr {
+                    addr: words.root.0,
+                    seq: words.root.1,
+                },
+                cursor: words.cursor,
+                g: 1,
+                slot_tree_extents: words.slot_tree_extents,
+                last_written: 0,
+                seq_floor: words.seq_floor,
+            };
+            assert_eq!(SlotState::decode(&record.encode()).expect("decodes"), record);
+            if tails.len() < usize::from(TAILS_SPILLED) {
+                let rec = SlotTailsRecord {
                     g: 1,
-                    slot_tree_extents: words.slot_tree_extents,
-                    last_written: 0,
-                    seq_floor: words.seq_floor,
-                    tails: tails.clone(),
+                    tails: SlotTails::Inline(tails.clone()),
                 };
-                let img = record
+                let img = rec
                     .encode()
-                    .expect("a tails count within the u16 encodes");
-                assert_eq!(SlotState::decode(&img).expect("decodes"), record);
+                    .expect("a tails count below the spill sentinel encodes inline");
+                assert_eq!(SlotTailsRecord::decode(&img).expect("decodes"), rec);
             }
         }
         ManagerCall::JoinAppender { .. }

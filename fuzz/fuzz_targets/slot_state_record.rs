@@ -1,36 +1,46 @@
-//! Fuzz the **tree-0 `slot_state` record codecs** of the symmetric-metadata
-//! forest (`src/meta_backend/kv/slot_state.rs` —
-//! `docs/design-symmetric-metadata.md` §5.2.2 / §5.4.2, incompat bit 17).
+//! Fuzz the **tree-0 `slot_state` and `slot_tails` record codecs** of the
+//! symmetric-metadata forest (`src/meta_backend/kv/slot_state.rs` —
+//! `docs/design-symmetric-metadata.md` §5.2.2 / §5.4.2 / §5.8.2, incompat
+//! bit 17).
 //!
 //! A `slot_state:{slot}` record is where a guest slot tree's ROOT lives:
 //! mount replays tree 0 first and opens every slot tree the records name,
 //! so a record that decodes wrong is a whole slot tree unreachable (or a
 //! stale root mounted as live). The value is versioned and forward-only;
 //! the `Leased` variant is the PR-4 lessee record (the root then rides
-//! the lessee's appender page). The laws (spec §11 TEST-4):
+//! the lessee's appender page); both variants are FIXED-SIZE since PR 4
+//! review round 3. A `slot_tails:{slot}` record is the flushed-leaf log
+//! tails a release recorded — INLINE under the KV value cap, SPILLED to
+//! heap extents the record names above it (PR 5's frame screen reads
+//! it). The laws (spec §11 TEST-4):
 //!
 //! 1. **Total.** Key and value decoders answer `Ok` or a typed error on
 //!    arbitrary bytes — never a panic, never an allocation driven by the
-//!    `n_tails` count beyond what the bytes actually hold (the count is a
-//!    claim checked against the length BEFORE any tail is read).
+//!    `n_tails` / `n_runs` count beyond what the bytes actually hold (the
+//!    count is a claim checked against the length BEFORE any entry is
+//!    read).
 //! 2. **Exact.** `decode ∘ encode = id` over the encoder's whole domain
-//!    (both variants, every tails length a `u16` expresses), and whatever
+//!    (both `slot_state` variants; inline tails at every length below the
+//!    spill sentinel and spilled sets at every run count), and whatever
 //!    `decode` accepts re-encodes to the SAME bytes.
 //! 3. **Forward-only.** A version byte other than the one this binary
 //!    writes refuses; an unknown variant refuses.
-//! 4. **The key** is `b"slot_state:" ‖ slot: u32 BE`, exact in both
-//!    directions, and every slot's key sits inside the census window.
+//! 4. **The keys** are `b"slot_state:" ‖ slot: u32 BE` and `b"slot_tails:"
+//!    ‖ slot: u32 BE`, exact in both directions, every slot's key inside
+//!    its census window.
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
 use squeezefs::meta_backend::kv::slot_state::{
-    decode_slot_state_key, slot_state_key, slot_state_key_range, SlotState, SLOT_STATE_KEY_LEN,
-    SLOT_STATE_VERSION, UNLEASED_FIXED_LEN,
+    decode_slot_state_key, decode_slot_tails_key, slot_state_key, slot_state_key_range,
+    slot_tails_key, slot_tails_key_range, SlotState, SlotTails, SlotTailsRecord, TailsSpill,
+    LEASED_LEN, SLOT_STATE_KEY_LEN, SLOT_STATE_VERSION, SLOT_TAILS_FIXED_LEN, SLOT_TAILS_KEY_LEN,
+    SLOT_TAILS_VERSION, TAILS_SPILLED, TAIL_ENTRY_LEN, UNLEASED_LEN,
 };
 use squeezefs::meta_backend::kv::tree::RootPtr;
 
 fuzz_target!(|data: &[u8]| {
-    // --- the key ------------------------------------------------------------
+    // --- the keys -----------------------------------------------------------
     match decode_slot_state_key(data) {
         Ok(slot) => {
             assert_eq!(data.len(), SLOT_STATE_KEY_LEN);
@@ -46,52 +56,104 @@ fuzz_target!(|data: &[u8]| {
             "only a wrong prefix or length refuses"
         ),
     }
+    match decode_slot_tails_key(data) {
+        Ok(slot) => {
+            assert_eq!(data.len(), SLOT_TAILS_KEY_LEN);
+            assert_eq!(slot_tails_key(slot), data, "the tails key is byte-exact");
+            let (lo, hi) = slot_tails_key_range();
+            assert!(lo <= data.to_vec() && data.to_vec() <= hi);
+        }
+        Err(_) => assert!(
+            data.len() != SLOT_TAILS_KEY_LEN || !data.starts_with(b"slot_tails:"),
+            "only a wrong prefix or length refuses"
+        ),
+    }
     if data.len() >= 4 {
         let slot = u32::from_be_bytes(data[0..4].try_into().unwrap());
-        assert_eq!(
-            decode_slot_state_key(&slot_state_key(slot)).ok(),
-            Some(slot),
-            "every slot's key decodes back"
-        );
+        assert_eq!(decode_slot_state_key(&slot_state_key(slot)).ok(), Some(slot));
+        assert_eq!(decode_slot_tails_key(&slot_tails_key(slot)).ok(), Some(slot));
     }
 
-    // --- the value: decode side ----------------------------------------------
+    // --- slot_state: decode side --------------------------------------------
     match SlotState::decode(data) {
         Ok(state) => {
             assert_eq!(
                 data[0], SLOT_STATE_VERSION,
                 "only this binary's version decodes"
             );
-            let re = state.encode().expect("a decoded record re-encodes");
-            assert_eq!(re, data, "the record is byte-exact");
-            // The variant byte is the discriminant the decoder honoured.
+            assert_eq!(state.encode(), data, "the record is byte-exact");
             match &state {
-                SlotState::Unleased { .. } => assert_eq!(data[1], 1),
-                SlotState::Leased { .. } => assert_eq!(data[1], 2),
+                SlotState::Unleased { .. } => {
+                    assert_eq!(data[1], 1);
+                    assert_eq!(data.len(), UNLEASED_LEN);
+                }
+                SlotState::Leased { .. } => {
+                    assert_eq!(data[1], 2);
+                    assert_eq!(data.len(), LEASED_LEN);
+                }
             }
         }
         Err(_) => {
-            if let Some(&v) = data.first() {
-                if v == SLOT_STATE_VERSION && data.len() >= 2 && data[1] == 1 {
-                    // An Unleased image refuses only when its length is
-                    // not the fixed part plus exactly the tails it names.
-                    if data.len() >= UNLEASED_FIXED_LEN {
-                        let n = usize::from(u16::from_le_bytes([
-                            data[UNLEASED_FIXED_LEN - 2],
-                            data[UNLEASED_FIXED_LEN - 1],
-                        ]));
-                        assert_ne!(
-                            data.len(),
-                            UNLEASED_FIXED_LEN + n * 12,
-                            "a well-formed image decodes"
-                        );
-                    }
+            if data.len() >= 2 && data[0] == SLOT_STATE_VERSION {
+                // A fixed-size image refuses only at the wrong length.
+                if data[1] == 1 {
+                    assert_ne!(data.len(), UNLEASED_LEN, "a well-formed Unleased decodes");
+                }
+                if data[1] == 2 {
+                    assert_ne!(data.len(), LEASED_LEN, "a well-formed Leased decodes");
                 }
             }
         }
     }
 
-    // --- the value: encode side, over the encoder's whole domain -------------
+    // --- slot_tails: decode side --------------------------------------------
+    match SlotTailsRecord::decode(data) {
+        Ok(rec) => {
+            assert_eq!(data[0], SLOT_TAILS_VERSION);
+            let re = rec.encode().expect("a decoded tails record re-encodes");
+            assert_eq!(re, data, "the tails record is byte-exact");
+            match &rec.tails {
+                SlotTails::Inline(v) => {
+                    assert_eq!(data.len(), SLOT_TAILS_FIXED_LEN + v.len() * TAIL_ENTRY_LEN);
+                    assert!(v.len() < usize::from(TAILS_SPILLED));
+                }
+                SlotTails::Spilled(sp) => {
+                    assert_eq!(
+                        u16::from_le_bytes([data[5], data[6]]),
+                        TAILS_SPILLED,
+                        "the sentinel names a spill"
+                    );
+                    assert_eq!(rec.tails.spill_addrs().len(), sp.runs.len());
+                }
+            }
+        }
+        Err(_) => {
+            if data.len() >= SLOT_TAILS_FIXED_LEN && data[0] == SLOT_TAILS_VERSION {
+                let n = u16::from_le_bytes([data[5], data[6]]);
+                if n != TAILS_SPILLED {
+                    // An inline image refuses only when its length is not
+                    // the fixed part plus exactly the entries it names.
+                    assert_ne!(
+                        data.len(),
+                        SLOT_TAILS_FIXED_LEN + usize::from(n) * TAIL_ENTRY_LEN,
+                        "a well-formed inline image decodes"
+                    );
+                } else if data.len() >= SLOT_TAILS_FIXED_LEN + 2 {
+                    let runs = usize::from(u16::from_le_bytes([
+                        data[SLOT_TAILS_FIXED_LEN],
+                        data[SLOT_TAILS_FIXED_LEN + 1],
+                    ]));
+                    assert_ne!(
+                        data.len(),
+                        SLOT_TAILS_FIXED_LEN + 2 + runs * 12 + 8,
+                        "a well-formed spill image decodes"
+                    );
+                }
+            }
+        }
+    }
+
+    // --- encode side, over the encoders' whole domain -------------------------
     if data.len() >= 1 + 8 + 8 + 8 + 4 + 4 + 8 + 2 {
         let addr = u64::from_le_bytes(data[1..9].try_into().unwrap());
         let seq = u64::from_le_bytes(data[9..17].try_into().unwrap());
@@ -100,9 +162,6 @@ fuzz_target!(|data: &[u8]| {
         let slot_tree_extents = u32::from_le_bytes(data[29..33].try_into().unwrap());
         let last_written = u64::from_le_bytes(data[33..41].try_into().unwrap());
         let n = usize::from(u16::from_le_bytes([data[41], data[42]])) % 64; // bounded work
-        let tails: Vec<(u64, u32)> = (0..n)
-            .map(|i| (addr.wrapping_add(i as u64), g.wrapping_add(i as u32)))
-            .collect();
         let unleased = SlotState::Unleased {
             root: RootPtr { addr, seq },
             cursor,
@@ -110,7 +169,6 @@ fuzz_target!(|data: &[u8]| {
             slot_tree_extents,
             last_written,
             seq_floor: last_written ^ cursor,
-            tails,
         };
         let leased = SlotState::Leased {
             appender_id: g,
@@ -125,7 +183,7 @@ fuzz_target!(|data: &[u8]| {
             seq_floor: addr ^ seq,
         };
         for state in [unleased, leased] {
-            let bytes = state.encode().expect("every emittable record encodes");
+            let bytes = state.encode();
             assert_eq!(
                 SlotState::decode(&bytes).expect("an encoded record decodes"),
                 state,
@@ -145,9 +203,38 @@ fuzz_target!(|data: &[u8]| {
                 SlotState::decode(&variant).is_err(),
                 "an unknown variant refuses"
             );
-            // Truncation refuses (the tails count is a claim, not an
-            // allocation authority).
             assert!(SlotState::decode(&bytes[..bytes.len() - 1]).is_err());
+        }
+        let entries: Vec<(u64, u32)> = (0..n)
+            .map(|i| (addr.wrapping_add(i as u64), g.wrapping_add(i as u32)))
+            .collect();
+        let inline = SlotTailsRecord {
+            g,
+            tails: SlotTails::Inline(entries.clone()),
+        };
+        let spilled = SlotTailsRecord {
+            g,
+            tails: SlotTails::Spilled(TailsSpill {
+                runs: entries
+                    .iter()
+                    .map(|(a, c)| (a & !0xFFF, c % 1024 + 1))
+                    .collect(),
+                checksum: seq,
+            }),
+        };
+        for rec in [inline, spilled] {
+            let bytes = rec.encode().expect("every emittable tails record encodes");
+            assert_eq!(
+                SlotTailsRecord::decode(&bytes).expect("an encoded tails record decodes"),
+                rec,
+                "round trip"
+            );
+            let mut future = bytes.clone();
+            future[0] = SLOT_TAILS_VERSION.wrapping_add(1);
+            assert!(SlotTailsRecord::decode(&future).is_err());
+            // Truncation refuses (the counts are claims, not allocation
+            // authorities).
+            assert!(SlotTailsRecord::decode(&bytes[..bytes.len() - 1]).is_err());
         }
     }
 });

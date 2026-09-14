@@ -134,7 +134,9 @@
 use super::alloc_ext::{compaction_reserve_extents, ExtentAllocator};
 use super::checkpoint::{read_newest_ledger, LedgerRecord};
 use super::conveyor_core::ConveyorCore;
-use super::journal::{checkpoint_reserve_bytes, entry_len_for, untag, JournalRing, SeqSpan};
+use super::journal::{
+    checkpoint_reserve_bytes, entry_len_for, record_frame_len, untag, JournalRing, SeqSpan,
+};
 use super::journal_core::{AdmissionClass, Reservation};
 use super::node::{key_successor, NodeLayout};
 use super::node_cache::{
@@ -3207,6 +3209,12 @@ impl KvMetaBackend {
         self.forest().map(|f| Arc::clone(f.control()))
     }
 
+    /// Forest slot `slot`'s tree when this mount holds it (`None` flat, or
+    /// a slot nobody minted) — the contracts' leaf census.
+    pub fn slot_tree(&self, slot: super::record::ForestSlot) -> Option<Arc<KvTree>> {
+        self.forest().and_then(|f| f.tree(slot))
+    }
+
     /// The Slot-lease family (§11), `None` unarmed.
     pub fn slot_lease_stats(&self) -> Option<super::slot_lease::SlotLeaseStats> {
         let plane = self.slot_leases()?;
@@ -3935,7 +3943,7 @@ impl KvMetaBackend {
                         slot_tree_extents: words.extents,
                         seq_floor: words.seq_floor,
                     }
-                    .encode()?;
+                    .encode();
                     puts.push((
                         tag,
                         Record::put(super::slot_state::slot_state_key(slot), 0, value),
@@ -4385,22 +4393,43 @@ impl KvMetaBackend {
             slot_tree_extents: words.extents,
             last_written,
             seq_floor: words.seq_floor,
-            tails,
         }
-        .encode()?;
+        .encode();
         let tag = super::journal::tag_for(super::record::TREE_CONTROL, 0);
         let mut recs = vec![(
             tag,
             Record::put(super::slot_state::slot_state_key(slot), 0, value),
         )];
+        // The tails record (§5.8.2) rides the same entry: inline under
+        // the value cap, spilled above it — the spill's images written
+        // and barriered before this entry names them, the previous
+        // release's spill freed by it (review round 3, Issue 21).
+        let spilled = self.stage_slot_tails(slot, g, tails, &mut recs).await?;
+        let prior_spill = match self.retire_slot_tails_spill(slot, &mut recs).await {
+            Ok(v) => v,
+            Err(e) => {
+                self.release_spill_claims(&spilled);
+                return Err(e);
+            }
+        };
         // The custody of the tree's live images leaves the departing
         // grant with the slot (C13's candidate set is the grant-claimed
         // unreachable extents — an image the requester later retires
         // through ITS context must not stay claimed here): the record is
         // rewritten without them in the SAME entry, bits untouched.
-        let (rewrite, leaving) = self.grant_record_minus_images(appender_id, &[slot]).await?;
+        let (rewrite, leaving) = match self.grant_record_minus_images(appender_id, &[slot]).await {
+            Ok(v) => v,
+            Err(e) => {
+                self.release_spill_claims(&spilled);
+                return Err(e);
+            }
+        };
         recs.extend(rewrite);
-        self.write_control_entry(recs, EntryAdmission::Try).await?;
+        if let Err(e) = self.write_control_entry(recs, EntryAdmission::Try).await {
+            self.release_spill_claims(&spilled);
+            return Err(e);
+        }
+        self.release_spill_claims(&prior_spill);
         if let Some(r) = set.region(appender_id).filter(|_| !leaving.is_empty()) {
             r.grant().transfer_out(&leaving);
         }
@@ -4455,12 +4484,8 @@ impl KvMetaBackend {
         words: crate::meta_ship::manager::WireSlotWords,
         tails: &[(u64, u32)],
     ) -> std::result::Result<bool, KvError> {
-        if tails.len() > usize::from(u16::MAX) {
-            return Err(KvError::Rejected(format!(
-                "ReleaseSlot names {} tails — the record's count is a u16",
-                tails.len()
-            )));
-        }
+        // Any count: the release site records the set inline or spilled
+        // (the wire frame's own class cap bounds what arrives).
         let fslot = self.forest_slot_of_routing(slot);
         self.manager_release_slot(appender_id, fslot, words.into(), g, tails.to_vec())
             .await
@@ -4505,20 +4530,220 @@ impl KvMetaBackend {
     /// The `(leaf addr, log tail)` of every leaf `tree` reaches — what a
     /// release records for PR 5's frame screen (§5.8.2).
     /// COMPLETE over the tree (review round 2, Issue 12): a leaf the node
-    /// cache evicted since its flush — or never loaded, a re-adopted
-    /// tree's — is paged in for its tail; the record's consumer reads
-    /// every leaf, never a cached subset.
+    /// cache holds answers off its RAM state (no I/O — the flush pass
+    /// that just wrote it left it resident); a leaf it evicted since —
+    /// or never loaded, a re-adopted tree's — costs ONE extent read that
+    /// is scanned and dropped, never materialized into the cache
+    /// (`NodeCache::peek_tail_offset` — a release does not evict the
+    /// working set to record itself; review round 3, Issue 21). The tail
+    /// is the §4.5 append walk's result, not a header field, so the read
+    /// is the floor: an evicted leaf's tail exists nowhere else.
     async fn leaf_tails(&self, tree: &KvTree) -> std::result::Result<Vec<(u64, u32)>, KvError> {
         let mut out = Vec::new();
         for addr in tree.reachable_node_addrs().await? {
-            let node = self.cache.get(addr).await?;
-            if node.level() != 0 {
+            let Some(tail) = self.cache.peek_tail_offset(addr).await? else {
                 continue;
-            }
-            let tail = node.lock().read().await.tail_offset();
+            };
             out.push((addr, u32::try_from(tail).unwrap_or(u32::MAX)));
         }
         Ok(out)
+    }
+
+    /// Tree 0's CURRENT tails record of `slot` (`None` when no release
+    /// recorded one) — the locator as written (inline or spilled);
+    /// [`Self::slot_tails`] reads the set through it.
+    pub async fn slot_tails_record(
+        &self,
+        slot: super::record::ForestSlot,
+    ) -> std::result::Result<Option<super::slot_state::SlotTailsRecord>, KvError> {
+        let Some(control) = self.forest_control_tree() else {
+            return Ok(None);
+        };
+        match control
+            .lookup(&super::slot_state::slot_tails_key(slot))
+            .await?
+        {
+            Some(v) => Ok(Some(super::slot_state::SlotTailsRecord::decode(&v)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Slot `slot`'s recorded tails, COMPLETE: `(g, tails)` — inline off
+    /// the record, spilled by one extent read per run with the record's
+    /// checksum verified over the concatenation (PR 5's frame screen; the
+    /// contracts). `None` when no release recorded any.
+    pub async fn slot_tails(
+        &self,
+        slot: super::record::ForestSlot,
+    ) -> std::result::Result<Option<(u32, Vec<(u64, u32)>)>, KvError> {
+        let Some(rec) = self.slot_tails_record(slot).await? else {
+            return Ok(None);
+        };
+        let tails = match rec.tails {
+            super::slot_state::SlotTails::Inline(v) => v,
+            super::slot_state::SlotTails::Spilled(sp) => {
+                let node_size = self.cache.config().layout.node_size();
+                let per_extent = super::slot_state::tails_per_spill_extent(node_size);
+                let mut all: Vec<(u64, u32)> = Vec::with_capacity(
+                    sp.runs
+                        .iter()
+                        .map(|(_, n)| *n as usize)
+                        .sum::<usize>()
+                        .min(per_extent * sp.runs.len()),
+                );
+                for (addr, count) in &sp.runs {
+                    let count = *count as usize;
+                    if count > per_extent {
+                        return Err(KvError::Corrupt(format!(
+                            "{}: slot {slot} tails spill run at {addr:#x} names {count} entries \
+                             — one {node_size}-byte extent holds {per_extent}",
+                            self.path.display()
+                        )));
+                    }
+                    let image = crate::uring_fs::read_at(
+                        &self.path,
+                        *addr,
+                        count * super::slot_state::TAIL_ENTRY_LEN,
+                    )
+                    .await
+                    .map_err(KvError::Io)?;
+                    all.extend(super::slot_state::decode_tail_entries(&image, count)?);
+                }
+                let sum = super::slot_state::checksum_tails(&all);
+                if sum != sp.checksum {
+                    return Err(KvError::Corrupt(format!(
+                        "{}: slot {slot} tails spill checksum mismatch ({sum:#x} read, {:#x} \
+                         recorded) — a spill extent was overwritten under a record that still \
+                         names it",
+                        self.path.display(),
+                        sp.checksum
+                    )));
+                }
+                all
+            }
+        };
+        Ok(Some((rec.g, tails)))
+    }
+
+    /// Stage slot `slot`'s tails record at generation `g` into `recs`:
+    /// INLINE while the set fits the volume's KV value cap, else SPILLED
+    /// — heap extents claimed from the manager's bitmap in the INTERNAL
+    /// class (a release is structure, admitted to the compaction floor
+    /// like an SMO's images), each written with its raw image and
+    /// BARRIERED before the record names it, their alloc deltas in the
+    /// same entry. Returns the claimed extents — the caller releases them
+    /// if the entry fails (never referenced, `release_spill_claims`).
+    async fn stage_slot_tails(
+        &self,
+        slot: super::record::ForestSlot,
+        g: u32,
+        tails: Vec<(u64, u32)>,
+        recs: &mut Vec<(u8, Record)>,
+    ) -> std::result::Result<Vec<u64>, KvError> {
+        use super::slot_state::{SlotTails, SlotTailsRecord, TailsSpill};
+        let layout = &self.cache.config().layout;
+        let value_cap = layout.record_value_cap();
+        let tag = super::journal::tag_for(super::record::TREE_CONTROL, 0);
+        let mut claimed: Vec<u64> = Vec::new();
+        let set = if SlotTails::fits_inline(tails.len(), value_cap) {
+            SlotTails::Inline(tails)
+        } else {
+            let per_extent = super::slot_state::tails_per_spill_extent(layout.node_size());
+            let checksum = super::slot_state::checksum_tails(&tails);
+            let mut runs: Vec<(u64, u32)> = Vec::with_capacity(tails.len().div_ceil(per_extent));
+            for chunk in tails.chunks(per_extent) {
+                let extent = match self.alloc.claim_internal() {
+                    Ok(e) => e,
+                    Err(e) => {
+                        self.release_spill_claims(&claimed);
+                        return Err(e);
+                    }
+                };
+                claimed.push(extent);
+                let addr = self.cache.extent_addr(extent);
+                if let Err(e) = crate::uring_fs::write_at(
+                    &self.path,
+                    addr,
+                    Bytes::from(super::slot_state::encode_tail_entries(chunk)),
+                )
+                .await
+                {
+                    self.release_spill_claims(&claimed);
+                    return Err(KvError::Io(e));
+                }
+                runs.push((addr, chunk.len() as u32));
+            }
+            if let Err(e) = self.sync_device().await {
+                self.release_spill_claims(&claimed);
+                return Err(KvError::Io(e));
+            }
+            log::info!(
+                "meta volume {}: slot {slot} tails at g {g} spilled — {} entries in {} extent(s) \
+                 (the inline cap is {} entries)",
+                self.path.display(),
+                runs.iter().map(|(_, n)| u64::from(*n)).sum::<u64>(),
+                runs.len(),
+                super::slot_state::inline_tails_cap(value_cap)
+            );
+            SlotTails::Spilled(TailsSpill { runs, checksum })
+        };
+        let value = match (SlotTailsRecord { g, tails: set }).encode() {
+            Ok(v) => v,
+            Err(e) => {
+                self.release_spill_claims(&claimed);
+                return Err(e);
+            }
+        };
+        recs.extend(
+            claimed
+                .iter()
+                .map(|e| super::alloc_ext::alloc_record(*e, 0)),
+        );
+        recs.push((
+            tag,
+            Record::put(super::slot_state::slot_tails_key(slot), 0, value),
+        ));
+        Ok(claimed)
+    }
+
+    /// The spill extents slot `slot`'s CURRENT tails record names — their
+    /// frees (retire 0) appended to `recs`, the extents returned for
+    /// `release_spill_claims` once the superseding entry has LANDED and
+    /// BARRIERED: from then on no replay selects the record that named
+    /// them (the entry is in every window whose ledger tail precedes it,
+    /// and a ledger tail past it means the tree-0 leaf holding the new
+    /// record was flushed — its dirty floor clamped the tail until then),
+    /// which is the `retire 0` class's law; a stale reader's read of a
+    /// reused extent fails the run checksum loud.
+    async fn retire_slot_tails_spill(
+        &self,
+        slot: super::record::ForestSlot,
+        recs: &mut Vec<(u8, Record)>,
+    ) -> std::result::Result<Vec<u64>, KvError> {
+        let Some(prior) = self.slot_tails_record(slot).await? else {
+            return Ok(Vec::new());
+        };
+        let extents: Vec<u64> = prior
+            .tails
+            .spill_addrs()
+            .into_iter()
+            .map(|addr| self.cache.addr_extent(addr))
+            .collect();
+        recs.extend(
+            extents
+                .iter()
+                .map(|e| super::alloc_ext::free_record(*e, 0, 0)),
+        );
+        Ok(extents)
+    }
+
+    /// Return `extents` to the claimable pool — a spill nothing durable
+    /// names (a failed entry's fresh claims; a superseded record's runs
+    /// after the superseding entry landed).
+    fn release_spill_claims(&self, extents: &[u64]) {
+        for e in extents {
+            self.alloc.release_unpublished(*e);
+        }
     }
 
     /// The page entries of in-process region `region` under the armed
@@ -5303,15 +5528,62 @@ impl KvMetaBackend {
         Ok(())
     }
 
+    /// The grant rewrite one leave chunk implies, from a RAM copy of the
+    /// record: `(the rewritten record, its tree-0 put — a delete when
+    /// nothing remains, `None` when nothing leaves — and the image extents
+    /// that leave)`. Pure: the packer measures candidate chunks with it.
+    fn leave_chunk_rewrite(
+        record: &super::slot_state::ExtentGrantRecord,
+        appender_id: u32,
+        chunk: &[LeaveSlot],
+    ) -> std::result::Result<LeaveChunkRewrite, KvError> {
+        let unchanged = || LeaveChunkRewrite {
+            record: record.clone(),
+            put: None,
+            leaving: Vec::new(),
+        };
+        if appender_id == 0 || record.is_empty() {
+            return Ok(unchanged());
+        }
+        let mut leaving: Vec<u64> = chunk
+            .iter()
+            .flat_map(|s| s.images.iter().copied())
+            .filter(|e| record.contains(*e))
+            .collect();
+        leaving.sort_unstable();
+        leaving.dedup();
+        if leaving.is_empty() {
+            return Ok(unchanged());
+        }
+        let remaining = super::slot_state::ExtentGrantRecord::from_extents(
+            record.extents().filter(|e| !leaving.contains(e)),
+        );
+        let key = super::slot_state::extent_grant_key(appender_id);
+        let tag = super::journal::tag_for(super::record::TREE_CONTROL, 0);
+        let put = if remaining.is_empty() {
+            Record::delete(key, 0)
+        } else {
+            Record::put(key, 0, remaining.encode()?)
+        };
+        Ok(LeaveChunkRewrite {
+            record: remaining,
+            put: Some((tag, put)),
+            leaving,
+        })
+    }
+
     /// The clean unmount's lease release for one region (§5.1.3 — the
     /// design's release ORDER, review round 2 Issue 8a): the region's page
     /// with every held slot `Releasing` + barrier FIRST (a crash past this
     /// point leaves attestations the next open drops by the row-6 rule,
     /// never `Live` entries a later lessee's page would contradict), then
-    /// every slot `Unleased` in tree 0 with its final words and tails — ONE
-    /// control entry that also moves the trees' live images out of the
-    /// region's grant record (Issue 4 — the handover's custody step, on
-    /// the leave path too) — then the RAM plane.
+    /// every slot `Unleased` in tree 0 with its final words and its tails
+    /// record — control entries CHUNKED by the entry cap (review round 3,
+    /// Issue 21: 108 complete tails sets do not fit one 128 KiB entry;
+    /// each chunk also moves ITS trees' live images out of the region's
+    /// grant record — Issue 4's custody step, composed chunk by chunk
+    /// against the record the previous chunk rewrote) — then the RAM
+    /// plane.
     async fn release_leases_at_leave(
         &self,
         set: &super::appender::AppenderSet,
@@ -5331,12 +5603,11 @@ impl KvMetaBackend {
         self.sync_device().await.map_err(KvError::Io)?;
         let last_written = self.lease_seq();
         let tag = super::journal::tag_for(super::record::TREE_CONTROL, 0);
-        let mut puts: Vec<(u8, Record)> = Vec::with_capacity(held.len());
-        let mut releases: Vec<(
-            super::record::ForestSlot,
-            u32,
-            crate::slot_lease_core::SlotWords,
-        )> = Vec::with_capacity(held.len());
+        // Phase 1: every slot's records staged (its `Unleased` put, its
+        // tails record with any spill's claims, the prior spill's frees)
+        // and the image extents its tree reaches. A failure here releases
+        // every spill claimed so far — nothing durable names one yet.
+        let mut staged: Vec<LeaveSlot> = Vec::with_capacity(held.len());
         for slot in &held {
             let Some(lease) = plane.table.get(*slot) else {
                 continue;
@@ -5347,41 +5618,145 @@ impl KvMetaBackend {
                 continue;
             }
             let words = self.slot_words_now(plane, *slot);
-            let tails = match self.forest().and_then(|f| f.tree(*slot)) {
-                Some(t) => self.leaf_tails(&t).await?,
-                None => Vec::new(),
-            };
-            let value = super::slot_state::SlotState::Unleased {
-                root: RootPtr {
-                    addr: words.root.0,
-                    seq: words.root.1,
-                },
-                cursor: words.cursor,
-                g: lease.g,
-                slot_tree_extents: words.extents,
-                last_written,
-                seq_floor: words.seq_floor,
-                tails,
-            }
-            .encode()?;
-            puts.push((
+            let mut recs: Vec<(u8, Record)> = vec![(
                 tag,
-                Record::put(super::slot_state::slot_state_key(*slot), 0, value),
-            ));
-            releases.push((*slot, lease.g, words));
+                Record::put(
+                    super::slot_state::slot_state_key(*slot),
+                    0,
+                    super::slot_state::SlotState::Unleased {
+                        root: RootPtr {
+                            addr: words.root.0,
+                            seq: words.root.1,
+                        },
+                        cursor: words.cursor,
+                        g: lease.g,
+                        slot_tree_extents: words.extents,
+                        last_written,
+                        seq_floor: words.seq_floor,
+                    }
+                    .encode(),
+                ),
+            )];
+            let step = async {
+                let tails = match self.forest().and_then(|f| f.tree(*slot)) {
+                    Some(t) => self.leaf_tails(&t).await?,
+                    None => Vec::new(),
+                };
+                let spilled = self
+                    .stage_slot_tails(*slot, lease.g, tails, &mut recs)
+                    .await?;
+                let prior = match self.retire_slot_tails_spill(*slot, &mut recs).await {
+                    Ok(v) => v,
+                    Err(e) => {
+                        self.release_spill_claims(&spilled);
+                        return Err(e);
+                    }
+                };
+                let images = match self.slot_tree_image_extents(*slot).await {
+                    Ok(v) => v,
+                    Err(e) => {
+                        self.release_spill_claims(&spilled);
+                        return Err(e);
+                    }
+                };
+                Ok::<_, KvError>((spilled, prior, images))
+            }
+            .await;
+            let (spilled, prior, images) = match step {
+                Ok(v) => v,
+                Err(e) => {
+                    for s in &staged {
+                        self.release_spill_claims(&s.spilled);
+                    }
+                    return Err(e);
+                }
+            };
+            let payload_len = recs
+                .iter()
+                .map(|(_, r)| record_frame_len(r.key.len(), r.value.len()))
+                .sum();
+            staged.push(LeaveSlot {
+                slot: *slot,
+                g: lease.g,
+                words,
+                recs,
+                payload_len,
+                spilled,
+                prior,
+                images,
+            });
         }
-        if puts.is_empty() {
+        if staged.is_empty() {
             return Ok(());
         }
-        let released_slots: Vec<super::record::ForestSlot> =
-            releases.iter().map(|(s, _, _)| *s).collect();
-        let (rewrite, leaving) = self
-            .grant_record_minus_images(region.id, &released_slots)
-            .await?;
-        puts.extend(rewrite);
-        self.write_control_entry(puts, EntryAdmission::Try).await?;
-        if !leaving.is_empty() {
-            region.grant().transfer_out(&leaving);
+        // Phase 2: pack the slots into entries greedily against the entry
+        // cap (`journal::pack_entries` — the corpse sweep's chunk law),
+        // each chunk beside ITS grant rewrite computed from a RAM copy of
+        // the record (the record the previous chunk's entry left
+        // behind); write chunk by chunk. The records are measured by
+        // length, never cloned to be measured.
+        let release_from = |from: usize| {
+            for s in &staged[from..] {
+                self.release_spill_claims(&s.spilled);
+            }
+        };
+        let mut record = match self.extent_grant_record(region.id).await {
+            Ok(r) => r,
+            Err(e) => {
+                release_from(0);
+                return Err(e);
+            }
+        };
+        let mut releases: Vec<(
+            super::record::ForestSlot,
+            u32,
+            crate::slot_lease_core::SlotWords,
+        )> = Vec::with_capacity(staged.len());
+        // Every chunk's overhead is measured against the record AS IT IS
+        // NOW — an upper bound for the later chunks, since the record
+        // only shrinks as earlier chunks' images leave it.
+        let payloads: Vec<u64> = staged.iter().map(|s| s.payload_len).collect();
+        let mut overhead_err: Option<KvError> = None;
+        let chunks =
+            super::journal::pack_entries(&payloads, |range| {
+                match Self::leave_chunk_rewrite(&record, region.id, &staged[range]) {
+                    Ok(p) => p
+                        .put
+                        .as_ref()
+                        .map_or(0, |(_, r)| record_frame_len(r.key.len(), r.value.len())),
+                    Err(e) => {
+                        overhead_err = Some(e);
+                        u64::MAX
+                    }
+                }
+            });
+        if let Some(e) = overhead_err {
+            release_from(0);
+            return Err(e);
+        }
+        for range in chunks {
+            let chunk = &staged[range.clone()];
+            let rewrite = match Self::leave_chunk_rewrite(&record, region.id, chunk) {
+                Ok(r) => r,
+                Err(e) => {
+                    release_from(range.start);
+                    return Err(e);
+                }
+            };
+            let mut recs: Vec<(u8, Record)> = chunk.iter().flat_map(|s| s.recs.clone()).collect();
+            recs.extend(rewrite.put);
+            if let Err(e) = self.write_control_entry(recs, EntryAdmission::Try).await {
+                release_from(range.start);
+                return Err(e);
+            }
+            for s in chunk {
+                self.release_spill_claims(&s.prior);
+                releases.push((s.slot, s.g, s.words));
+            }
+            if !rewrite.leaving.is_empty() {
+                region.grant().transfer_out(&rewrite.leaving);
+            }
+            record = rewrite.record;
         }
         for (slot, g, words) in releases {
             let _ = plane.table.release(slot, region.id, g, words, last_written);
@@ -5545,6 +5920,17 @@ impl KvMetaBackend {
                 self.path.display()
             ))
         })?;
+        // The value cap is enforced HERE, at the release site's door —
+        // never discovered at the flush pass, whose `ValueTooLarge` on
+        // tree 0's leaf freeze is the deferred-node → pinned-tail →
+        // clause-b FAIL-STOP class (review round 3, Issue 21).
+        let value_cap = self.cache.config().layout.record_value_cap();
+        if let Some((_, r)) = recs.iter().find(|(_, r)| r.value.len() > value_cap) {
+            return Err(KvError::ValueTooLarge {
+                len: r.value.len(),
+                cap: value_cap,
+            });
+        }
         let len = entry_len_for(&recs)?;
         let adm = match admit {
             EntryAdmission::Try => self
@@ -10894,7 +11280,9 @@ impl KvMetaBackend {
         self.needs_flush.swap(false, Ordering::AcqRel)
     }
 
-    pub(super) fn node_cache(&self) -> &Arc<NodeCache> {
+    /// The volume's node cache (the checkpoint task's; the contracts'
+    /// tail probes).
+    pub fn node_cache(&self) -> &Arc<NodeCache> {
         &self.cache
     }
 
@@ -11376,6 +11764,34 @@ pub enum ControlAdmit {
 enum EntryAdmission {
     Try,
     Held(super::journal_core::Admission),
+}
+
+/// One slot the clean leave releases (`release_leases_at_leave`): its
+/// staged tree-0 records (the `Unleased` put, the tails record with a
+/// spill's claims, the prior spill's frees), their payload length, the
+/// spill extents claimed for it (released on a failed entry), the prior
+/// spill's extents (released once its entry landed) and the image
+/// extents its tree reaches (the custody transfer's set).
+struct LeaveSlot {
+    slot: super::record::ForestSlot,
+    g: u32,
+    words: crate::slot_lease_core::SlotWords,
+    recs: Vec<(u8, Record)>,
+    payload_len: u64,
+    spilled: Vec<u64>,
+    prior: Vec<u64>,
+    images: Vec<u64>,
+}
+
+/// The grant rewrite one leave chunk implies (`leave_chunk_rewrite`).
+struct LeaveChunkRewrite {
+    /// The record after the chunk's images left it.
+    record: super::slot_state::ExtentGrantRecord,
+    /// Its tree-0 put (a delete when nothing remains); `None` when nothing
+    /// leaves.
+    put: Option<(u8, Record)>,
+    /// The image extents that leave the grant.
+    leaving: Vec<u64>,
 }
 
 /// One slot the manager granted (design-symmetric-metadata §5.1.2 / §6.3,
@@ -14751,7 +15167,7 @@ impl KvMetaBackend {
                     slot_tree_extents: words.extents,
                     seq_floor: l.words.seq_floor,
                 }
-                .encode()?;
+                .encode();
                 recs.push((
                     tag,
                     Record::put(super::slot_state::slot_state_key(*slot), 0, value),
@@ -14762,26 +15178,24 @@ impl KvMetaBackend {
             // native watermark rides the ledger's `next_ino`. An armed
             // plane's UNLEASED slot keeps its release record's `g`,
             // cursor (§5.1.8 — the floor never regresses), extent count
-            // and `last_written`; only the root and the tails move.
+            // and `last_written`; only the root moves. The tails record
+            // (`slot_tails:{s}`) is the RELEASE's attestation for `g` and
+            // is untouched here — a root moved by the manager's
+            // structural maintenance rewrites leaves whose frames carry
+            // their own `(appender_id, g)`; no tree is paged in at a
+            // checkpoint to re-record it (review round 3, Issue 21).
             let lease = plane
                 .and_then(|p| p.table.get(*slot))
                 .filter(|l| l.state == crate::slot_lease_core::LeaseState::Unleased);
             let state = match lease {
-                Some(l) => {
-                    let tails = match forest.tree(*slot) {
-                        Some(t) => self.leaf_tails(&t).await?,
-                        None => Vec::new(),
-                    };
-                    super::slot_state::SlotState::Unleased {
-                        root: *root,
-                        cursor: l.words.cursor,
-                        g: l.g,
-                        slot_tree_extents: l.words.extents,
-                        last_written: l.last_written,
-                        seq_floor: l.words.seq_floor,
-                        tails,
-                    }
-                }
+                Some(l) => super::slot_state::SlotState::Unleased {
+                    root: *root,
+                    cursor: l.words.cursor,
+                    g: l.g,
+                    slot_tree_extents: l.words.extents,
+                    last_written: l.last_written,
+                    seq_floor: l.words.seq_floor,
+                },
                 None => super::slot_state::SlotState::Unleased {
                     root: *root,
                     cursor: 0,
@@ -14789,10 +15203,9 @@ impl KvMetaBackend {
                     slot_tree_extents: 0,
                     last_written: 0,
                     seq_floor: 0,
-                    tails: Vec::new(),
                 },
             };
-            let value = state.encode()?;
+            let value = state.encode();
             recs.push((
                 tag,
                 Record::put(super::slot_state::slot_state_key(*slot), 0, value),

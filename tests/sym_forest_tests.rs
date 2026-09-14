@@ -572,7 +572,6 @@ fn slot_state_records_round_trip_and_refuse_malformed_images() {
         slot_tree_extents: 5,
         last_written: 9_001,
         seq_floor: 123_456,
-        tails: vec![(0x1000, 12), (0x2000, 0)],
     };
     let leased = SlotState::Leased {
         appender_id: 9,
@@ -587,7 +586,7 @@ fn slot_state_records_round_trip_and_refuse_malformed_images() {
         seq_floor: 123_457,
     };
     for st in [&unleased, &leased] {
-        let img = st.encode().expect("encode");
+        let img = st.encode();
         assert_eq!(&SlotState::decode(&img).expect("decode"), st);
         // Truncation is corruption, never a default.
         assert!(SlotState::decode(&img[..img.len() - 1]).is_err());
@@ -597,10 +596,58 @@ fn slot_state_records_round_trip_and_refuse_malformed_images() {
         assert!(SlotState::decode(&future).is_err());
     }
     // An unknown variant byte refuses.
-    let mut img = leased.encode().expect("encode");
+    let mut img = leased.encode();
     img[1] = 0x7F;
     assert!(SlotState::decode(&img).is_err());
     assert!(SlotState::decode(&[]).is_err());
+}
+
+/// The tails record (`slot_tails:{s}`, review round 3 Issue 21): inline
+/// and spilled images round-trip, the inline cap derives from the value
+/// cap, a count at the spill sentinel refuses the inline encoder, and
+/// truncation / a future version refuse.
+#[test]
+fn slot_tails_records_round_trip_inline_and_spilled() {
+    use squeezefs::meta_backend::kv::slot_state::{
+        inline_tails_cap, tails_per_spill_extent, SlotTails, SlotTailsRecord, TailsSpill,
+        SLOT_TAILS_FIXED_LEN, TAILS_SPILLED, TAIL_ENTRY_LEN,
+    };
+    let inline = SlotTailsRecord {
+        g: 7,
+        tails: SlotTails::Inline(vec![(0x1000, 12), (0x2000, 0)]),
+    };
+    let spilled = SlotTailsRecord {
+        g: 8,
+        tails: SlotTails::Spilled(TailsSpill {
+            runs: vec![(0x40000, 21_845), (0x80000, 155)],
+            checksum: 0xC0FFEE,
+        }),
+    };
+    assert_eq!(inline.tails.count(), 2);
+    assert_eq!(spilled.tails.count(), 22_000);
+    assert_eq!(spilled.tails.spill_addrs(), vec![0x40000, 0x80000]);
+    for rec in [&inline, &spilled] {
+        let img = rec.encode().expect("encode");
+        assert_eq!(&SlotTailsRecord::decode(&img).expect("decode"), rec);
+        assert!(SlotTailsRecord::decode(&img[..img.len() - 1]).is_err());
+        let mut future = img.clone();
+        future[0] = 0xFF;
+        assert!(SlotTailsRecord::decode(&future).is_err());
+    }
+    // The inline cap: a 64 KiB value cap carries ≈ 5,400 entries; the
+    // 256 KiB spill extent 21,845.
+    let cap = inline_tails_cap(65_536 + 512);
+    assert_eq!(cap, (65_536 + 512 - SLOT_TAILS_FIXED_LEN) / TAIL_ENTRY_LEN);
+    assert!(SlotTails::fits_inline(cap, 65_536 + 512));
+    assert!(!SlotTails::fits_inline(cap + 1, 65_536 + 512));
+    assert_eq!(tails_per_spill_extent(256 * 1024), 21_845);
+    // A count at the sentinel is the spill's, never an inline image.
+    let at_sentinel = SlotTailsRecord {
+        g: 1,
+        tails: SlotTails::Inline(vec![(0, 0); usize::from(TAILS_SPILLED)]),
+    };
+    assert!(at_sentinel.encode().is_err());
+    assert!(SlotTailsRecord::decode(&[]).is_err());
 }
 
 #[test]

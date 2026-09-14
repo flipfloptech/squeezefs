@@ -1687,6 +1687,35 @@ impl CachedNode {
         records: Vec<OwnedRec>,
         floor: u64,
     ) -> Result<(), KvError> {
+        self.apply_locked_class(guard, records, floor, false)
+    }
+
+    /// [`Self::apply_locked`] for the serialized SMO task's OWN moves —
+    /// an SMO's leftover overlay into its successor, a parent's pointer
+    /// flips: the flush pass of the slot's lessee. Admits a slot
+    /// mid-handover (`Releasing`): flush-then-transfer IS the departing
+    /// holder flushing — its compactions and splits are the release's
+    /// own work, and the door has already drained every user commit the
+    /// third gate state exists to refuse (PR 4 review round 3: a tree
+    /// with a pending SMO at the handover's flush failed the release on
+    /// this gate). Every other refusal — a reader, a foreign interior, a
+    /// slot this mount does not lease — is unchanged.
+    pub fn apply_locked_structural(
+        &self,
+        guard: &mut NodeDirty,
+        records: Vec<OwnedRec>,
+        floor: u64,
+    ) -> Result<(), KvError> {
+        self.apply_locked_class(guard, records, floor, true)
+    }
+
+    fn apply_locked_class(
+        &self,
+        guard: &mut NodeDirty,
+        records: Vec<OwnedRec>,
+        floor: u64,
+        structural: bool,
+    ) -> Result<(), KvError> {
         // ---- The partitioning gate (pre-RC engineering spec §6.2 closing,
         // §6.3; ruling D8's S8 prerequisite). This is the ONE place every
         // RAM mutation of every node passes, so it is where "which nodes may
@@ -1741,6 +1770,9 @@ impl CachedNode {
             use crate::slot_lease_core::CommitVerdict;
             match self.lease.verdict(slot) {
                 CommitVerdict::Unarmed | CommitVerdict::Allowed => {}
+                // The departing holder's own flush (an SMO's moves) is
+                // the release's work — see `apply_locked_structural`.
+                CommitVerdict::Releasing if structural => {}
                 verdict @ (CommitVerdict::NotLeased | CommitVerdict::Releasing) => {
                     super::META_KV_LEAF_LEASE_REFUSALS.fetch_add(1, Ordering::Relaxed);
                     return Err(KvError::Corrupt(format!(
@@ -3166,6 +3198,37 @@ impl NodeCache {
             drop(guard);
             return Ok(Some(node));
         }
+    }
+
+    /// The log tail of LEAF `addr` without materializing it: a resident
+    /// node answers off its RAM state (no I/O), a non-resident one costs
+    /// ONE extent read ([`load_node`] — the §4.5 append walk is what
+    /// finds a tail; the header carries none) that is scanned and
+    /// dropped, never inserted into the map or charged to the budget.
+    /// `None` for an interior node or a retired extent. What a slot
+    /// release records for every reachable leaf (design-symmetric-
+    /// metadata §5.8.2) — a 65 k-leaf tree's release must not evict the
+    /// working set to record itself (PR 4 review round 3, Issue 21).
+    pub async fn peek_tail_offset(&self, addr: u64) -> Result<Option<usize>, KvError> {
+        if let Some(node) = self.try_get(addr) {
+            if node.level() != 0 {
+                return Ok(None);
+            }
+            return Ok(Some(node.lock().read().await.tail_offset()));
+        }
+        if self.retired.contains_sync(&addr) {
+            return Ok(None);
+        }
+        let snap = self.env.epoch.load_snapshot();
+        let reader_mode = snap.epoch != UNARMED_EPOCH;
+        let loaded = retry_racing_reader_load(reader_mode, addr, || {
+            load_node(&self.cfg.path, &self.cfg.layout, addr, snap.tail)
+        })
+        .await?;
+        if loaded.header().level != 0 {
+            return Ok(None);
+        }
+        Ok(Some(loaded.tail_offset()))
     }
 
     /// [`Self::try_get`] or [`Self::load`], erroring on a retired address

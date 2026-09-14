@@ -6,19 +6,31 @@
 //! the volume's control tree ([`super::record::TREE_CONTROL`]), whose own
 //! root the ledger names. An `Unleased` record names the tree's root,
 //! its ino cursor, its lease generation `g`, its extent count (the
-//! affinity cap's durable input, §5.1.2), the manager's seq at the last
-//! release (`prefer: unleased-then-idle`'s ordering key, §5.1.2) and the
-//! flushed-leaf log tails the last release recorded (§5.8.2 — consumed by
-//! PR 5's frame screen); a `Leased` record names the LESSEE (KD-SYM-17,
-//! PR 4) — the root then rides the lessee's appender page. Both are
-//! versioned and refuse a future version loud (forward-only format;
-//! version 2 since PR 4 added `slot_tree_extents` and `last_written` to
-//! the `Unleased` image — bit 17 is stamped by no field volume, so no
-//! version-1 record exists outside a test tempdir).
+//! affinity cap's durable input, §5.1.2) and the manager's seq at the
+//! last release (`prefer: unleased-then-idle`'s ordering key, §5.1.2); a
+//! `Leased` record names the LESSEE (KD-SYM-17, PR 4) — the root then
+//! rides the lessee's appender page. Both are FIXED-SIZE and versioned,
+//! and refuse a future version loud (forward-only format; version 3
+//! since PR 4 review round 3 moved the flushed-leaf log tails OUT of the
+//! `Unleased` image — bit 17 is stamped by no field volume, so no older
+//! record exists outside a test tempdir).
 //!
-//! Keys are memcmp-ordered: `b"slot_state:" ‖ slot: u32 BE`, so a range
-//! walk over the prefix yields slots in index order — the census's
-//! shape.
+//! **The tails ride their own record, `slot_tails:{s}`** (§5.8.2 — the
+//! flushed-leaf log tails the last release recorded, stamped with the
+//! generation `g` they attest; consumed by PR 5's frame screen): written
+//! by the RELEASE in the same control entry as the `Unleased` record and
+//! left alone by the grant, so a `Leased` slot keeps the tails of its
+//! previous generation readable (rule 2 of the screen reads them WHILE
+//! the slot is leased at `g + 1`), the `Unleased`/`Leased` images stay
+//! fixed-size (the door's parking pre-admission — review round 3, Issue
+//! 24 — is exact), and a grant never rewrites a tails set. The set is
+//! INLINE while it fits the volume's KV value cap and SPILLS to heap
+//! extents the record names above it (design §5.2.2's `tails:
+//! ExtentRef?`; [`SlotTails`]).
+//!
+//! Keys are memcmp-ordered: `b"slot_state:" ‖ slot: u32 BE` (and
+//! `b"slot_tails:" ‖ slot: u32 BE`), so a range walk over a prefix yields
+//! slots in index order — the census's shape.
 
 use super::record::ForestSlot;
 use super::tree::RootPtr;
@@ -30,18 +42,16 @@ pub const SLOT_STATE_KEY_PREFIX: &[u8] = b"slot_state:";
 pub const SLOT_STATE_KEY_LEN: usize = SLOT_STATE_KEY_PREFIX.len() + 4;
 
 /// Record value version (byte 0 of every image).
-pub const SLOT_STATE_VERSION: u8 = 2;
+pub const SLOT_STATE_VERSION: u8 = 3;
 const VARIANT_UNLEASED: u8 = 1;
 const VARIANT_LEASED: u8 = 2;
 /// `version ‖ variant ‖ root.addr ‖ root.seq ‖ cursor ‖ g ‖
-/// slot_tree_extents: u32 ‖ last_written: u64 ‖ seq_floor: u64 ‖
-/// n_tails: u16` before the tail entries (`leaf addr: u64 ‖ tail: u32`
-/// each). `seq_floor` is the seq-space law's word (design §5.1.4 /
-/// §5.8.2, PR 4 review round 2): the departing ring's stamp frontier at
-/// the release — every record of the slot carries a seq strictly below
-/// it, and the next lessee's ring is raised above it at the grant.
-pub const UNLEASED_FIXED_LEN: usize = 1 + 1 + 8 + 8 + 8 + 4 + 4 + 8 + 8 + 2;
-const TAIL_ENTRY_LEN: usize = 8 + 4;
+/// slot_tree_extents: u32 ‖ last_written: u64 ‖ seq_floor: u64`.
+/// `seq_floor` is the seq-space law's word (design §5.1.4 / §5.8.2, PR 4
+/// review round 2): the departing ring's stamp frontier at the release —
+/// every record of the slot carries a seq strictly below it, and the
+/// next lessee's ring is raised above it at the grant.
+pub const UNLEASED_LEN: usize = 1 + 1 + 8 + 8 + 8 + 4 + 4 + 8 + 8;
 /// `version ‖ variant ‖ appender_id: u32 ‖ g: u32 ‖ page_addr: u64 ‖
 /// root.addr ‖ root.seq ‖ cursor ‖ slot_tree_extents: u32 ‖ seq_floor:
 /// u64` — the words AS OF THE GRANT ride the lessee record too: between
@@ -90,18 +100,16 @@ pub fn decode_slot_state_key(key: &[u8]) -> Result<ForestSlot, KvError> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SlotState {
     /// No lessee: the slot tree's root, its ino cursor, its lease
-    /// generation, its extent count, the manager's seq at the last
-    /// release and the flushed-leaf log tails that release recorded
-    /// (§5.8.2 — the handover writes them; PR 5's frame screen reads them).
+    /// generation, its extent count and the manager's seq at the last
+    /// release (the tails that release recorded ride `slot_tails:{s}`).
     Unleased {
         root: RootPtr,
         cursor: u64,
         g: u32,
         slot_tree_extents: u32,
         last_written: u64,
-        /// The seq-space floor (see [`UNLEASED_FIXED_LEN`]).
+        /// The seq-space floor (see [`UNLEASED_LEN`]).
         seq_floor: u64,
-        tails: Vec<(u64, u32)>,
     },
     /// Leased: the lessee's identity — what makes slot resolution a
     /// control-plane projection (KD-SYM-17) — plus the tree's words as of
@@ -120,11 +128,8 @@ pub enum SlotState {
 }
 
 impl SlotState {
-    /// Little-endian image, versioned (see the module docs). Refuses a
-    /// tails vector the `u16` count cannot express (the design's inline
-    /// bound is ≈ 4,000 entries — the KV value cap — so a longer one is a
-    /// caller bug, never truncated).
-    pub fn encode(&self) -> Result<Vec<u8>, KvError> {
+    /// Little-endian image, versioned (see the module docs).
+    pub fn encode(&self) -> Vec<u8> {
         match self {
             SlotState::Unleased {
                 root,
@@ -133,15 +138,8 @@ impl SlotState {
                 slot_tree_extents,
                 last_written,
                 seq_floor,
-                tails,
             } => {
-                let n = u16::try_from(tails.len()).map_err(|_| {
-                    KvError::Corrupt(format!(
-                        "slot_state record cannot carry {} tails (the count is a u16)",
-                        tails.len()
-                    ))
-                })?;
-                let mut out = Vec::with_capacity(UNLEASED_FIXED_LEN + tails.len() * TAIL_ENTRY_LEN);
+                let mut out = Vec::with_capacity(UNLEASED_LEN);
                 out.push(SLOT_STATE_VERSION);
                 out.push(VARIANT_UNLEASED);
                 out.extend_from_slice(&root.addr.to_le_bytes());
@@ -151,12 +149,7 @@ impl SlotState {
                 out.extend_from_slice(&slot_tree_extents.to_le_bytes());
                 out.extend_from_slice(&last_written.to_le_bytes());
                 out.extend_from_slice(&seq_floor.to_le_bytes());
-                out.extend_from_slice(&n.to_le_bytes());
-                for (leaf, tail) in tails {
-                    out.extend_from_slice(&leaf.to_le_bytes());
-                    out.extend_from_slice(&tail.to_le_bytes());
-                }
-                Ok(out)
+                out
             }
             SlotState::Leased {
                 appender_id,
@@ -178,65 +171,45 @@ impl SlotState {
                 out.extend_from_slice(&cursor.to_le_bytes());
                 out.extend_from_slice(&slot_tree_extents.to_le_bytes());
                 out.extend_from_slice(&seq_floor.to_le_bytes());
-                Ok(out)
+                out
             }
         }
     }
 
-    /// Decode + validate; every failure is loud corruption (a slot root
-    /// this record mis-states is a whole slot tree unreachable).
+    /// Decode + validate (total: every failure is loud corruption; §9
+    /// bounds rule — every length checked against its container).
     pub fn decode(value: &[u8]) -> Result<Self, KvError> {
-        let version = *value
-            .first()
-            .ok_or_else(|| KvError::Corrupt("slot_state record is empty".to_string()))?;
-        if version != SLOT_STATE_VERSION {
+        if value.len() < 2 {
             return Err(KvError::Corrupt(format!(
-                "slot_state record version {version} — this binary writes {SLOT_STATE_VERSION} \
-                 and the format is forward-only (upgrade squeezefs)"
+                "slot_state record too short ({} bytes)",
+                value.len()
             )));
         }
-        let variant = *value.get(1).ok_or_else(|| {
-            KvError::Corrupt("slot_state record truncated before its variant byte".to_string())
-        })?;
-        match variant {
+        if value[0] != SLOT_STATE_VERSION {
+            return Err(KvError::Corrupt(format!(
+                "slot_state record version {} — this binary writes {SLOT_STATE_VERSION} and \
+                 the format is forward-only (upgrade squeezefs)",
+                value[0]
+            )));
+        }
+        match value[1] {
             VARIANT_UNLEASED => {
-                if value.len() < UNLEASED_FIXED_LEN {
+                if value.len() != UNLEASED_LEN {
                     return Err(KvError::Corrupt(format!(
-                        "slot_state Unleased record of {} bytes is shorter than its \
-                         {UNLEASED_FIXED_LEN}-byte fixed part",
+                        "slot_state Unleased record must be {UNLEASED_LEN} bytes, got {}",
                         value.len()
                     )));
                 }
-                let addr = le64(value, 2);
-                let seq = le64(value, 10);
-                let cursor = le64(value, 18);
-                let g = le32(value, 26);
-                let slot_tree_extents = le32(value, 30);
-                let last_written = le64(value, 34);
-                let seq_floor = le64(value, 42);
-                let n = usize::from(u16::from_le_bytes([value[50], value[51]]));
-                let want = UNLEASED_FIXED_LEN + n * TAIL_ENTRY_LEN;
-                if value.len() != want {
-                    return Err(KvError::Corrupt(format!(
-                        "slot_state Unleased record names {n} tails ({want} bytes) but holds {} \
-                         bytes",
-                        value.len()
-                    )));
-                }
-                let tails = (0..n)
-                    .map(|i| {
-                        let off = UNLEASED_FIXED_LEN + i * TAIL_ENTRY_LEN;
-                        (le64(value, off), le32(value, off + 8))
-                    })
-                    .collect();
                 Ok(SlotState::Unleased {
-                    root: RootPtr { addr, seq },
-                    cursor,
-                    g,
-                    slot_tree_extents,
-                    last_written,
-                    seq_floor,
-                    tails,
+                    root: RootPtr {
+                        addr: le64(value, 2),
+                        seq: le64(value, 10),
+                    },
+                    cursor: le64(value, 18),
+                    g: le32(value, 26),
+                    slot_tree_extents: le32(value, 30),
+                    last_written: le64(value, 34),
+                    seq_floor: le64(value, 42),
                 })
             }
             VARIANT_LEASED => {
@@ -263,6 +236,277 @@ impl SlotState {
                 "slot_state record carries unknown variant {other}"
             ))),
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// `slot_tails:{slot}` — the flushed-leaf log tails the last release of a
+// slot recorded (design-symmetric-metadata §5.8.2; PR 4 review round 3,
+// Issue 21).
+// ---------------------------------------------------------------------------
+
+/// Key prefix of every slot-tails record in tree 0.
+pub const SLOT_TAILS_KEY_PREFIX: &[u8] = b"slot_tails:";
+/// `prefix ‖ slot: u32 BE`.
+pub const SLOT_TAILS_KEY_LEN: usize = SLOT_TAILS_KEY_PREFIX.len() + 4;
+/// Record value version (byte 0).
+pub const SLOT_TAILS_VERSION: u8 = 1;
+/// `version ‖ g: u32 ‖ n_tails: u16` before the payload.
+pub const SLOT_TAILS_FIXED_LEN: usize = 1 + 4 + 2;
+/// One tail entry: `leaf addr: u64 ‖ tail: u32` — inline in the record or
+/// in a spill extent's image.
+pub const TAIL_ENTRY_LEN: usize = 8 + 4;
+/// `n_tails` sentinel: the set is SPILLED — `n_runs: u16 ‖ (extent addr:
+/// u64 ‖ count: u32) × n_runs ‖ xxh3: u64` follow instead of inline
+/// entries.
+pub const TAILS_SPILLED: u16 = u16::MAX;
+const SPILL_FIXED_LEN: usize = 2;
+const SPILL_RUN_LEN: usize = 8 + 4;
+const SPILL_CHECKSUM_LEN: usize = 8;
+
+/// The tree-0 key of slot `slot`'s tails record.
+pub fn slot_tails_key(slot: ForestSlot) -> Vec<u8> {
+    let mut k = Vec::with_capacity(SLOT_TAILS_KEY_LEN);
+    k.extend_from_slice(SLOT_TAILS_KEY_PREFIX);
+    k.extend_from_slice(&slot.to_be_bytes());
+    k
+}
+
+/// Inclusive `[start, end]` bounds covering every slot-tails record.
+pub fn slot_tails_key_range() -> (Vec<u8>, Vec<u8>) {
+    (slot_tails_key(0), slot_tails_key(ForestSlot::MAX))
+}
+
+/// Decode a slot-tails key back to its slot.
+pub fn decode_slot_tails_key(key: &[u8]) -> Result<ForestSlot, KvError> {
+    if key.len() != SLOT_TAILS_KEY_LEN || !key.starts_with(SLOT_TAILS_KEY_PREFIX) {
+        return Err(KvError::Corrupt(format!(
+            "slot_tails key must be {SLOT_TAILS_KEY_LEN} bytes under the {:?} prefix, got {} \
+             bytes",
+            String::from_utf8_lossy(SLOT_TAILS_KEY_PREFIX),
+            key.len()
+        )));
+    }
+    let p = SLOT_TAILS_KEY_PREFIX.len();
+    Ok(ForestSlot::from_be_bytes([
+        key[p],
+        key[p + 1],
+        key[p + 2],
+        key[p + 3],
+    ]))
+}
+
+/// The inline tails a record of `value_cap` bytes can carry (the KV
+/// value cap less the fixed part, and below the spill sentinel).
+pub fn inline_tails_cap(value_cap: usize) -> usize {
+    (value_cap.saturating_sub(SLOT_TAILS_FIXED_LEN) / TAIL_ENTRY_LEN)
+        .min(usize::from(TAILS_SPILLED) - 1)
+}
+
+/// The entries one spill extent of `node_size` bytes holds.
+pub fn tails_per_spill_extent(node_size: usize) -> usize {
+    (node_size / TAIL_ENTRY_LEN).max(1)
+}
+
+/// A slot's tails set as the record carries it: INLINE while it fits the
+/// value cap, else SPILLED to heap extents — each holding
+/// [`tails_per_spill_extent`] entries as a raw image, the record's
+/// checksum over the concatenated payload; the extents are written and
+/// barriered BEFORE the record names them and released when the record
+/// is superseded (the release site's law, `KvMetaBackend::stage_slot_tails`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SlotTails {
+    Inline(Vec<(u64, u32)>),
+    Spilled(TailsSpill),
+}
+
+/// The spill locator of a tails set past the inline cap.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TailsSpill {
+    /// `(extent byte address, entries in it)`, in payload order.
+    pub runs: Vec<(u64, u32)>,
+    /// xxh3 over the concatenated entry images.
+    pub checksum: u64,
+}
+
+impl Default for SlotTails {
+    fn default() -> Self {
+        SlotTails::Inline(Vec::new())
+    }
+}
+
+impl SlotTails {
+    /// Entries the set names (inline or spilled).
+    pub fn count(&self) -> usize {
+        match self {
+            SlotTails::Inline(v) => v.len(),
+            SlotTails::Spilled(sp) => sp.runs.iter().map(|(_, n)| *n as usize).sum(),
+        }
+    }
+
+    /// Whether a set of `n` entries fits inline under `value_cap`.
+    pub fn fits_inline(n: usize, value_cap: usize) -> bool {
+        n <= inline_tails_cap(value_cap)
+    }
+
+    /// The spill extents' byte addresses (empty when inline).
+    pub fn spill_addrs(&self) -> Vec<u64> {
+        match self {
+            SlotTails::Inline(_) => Vec::new(),
+            SlotTails::Spilled(sp) => sp.runs.iter().map(|(a, _)| *a).collect(),
+        }
+    }
+}
+
+/// The raw image of tail entries (a spill extent's payload;
+/// [`checksum_tails`] covers the concatenation).
+pub fn encode_tail_entries(tails: &[(u64, u32)]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(tails.len() * TAIL_ENTRY_LEN);
+    for (leaf, tail) in tails {
+        out.extend_from_slice(&leaf.to_le_bytes());
+        out.extend_from_slice(&tail.to_le_bytes());
+    }
+    out
+}
+
+/// Decode `count` tail entries off a raw image.
+pub fn decode_tail_entries(image: &[u8], count: usize) -> Result<Vec<(u64, u32)>, KvError> {
+    if image.len() < count.saturating_mul(TAIL_ENTRY_LEN) {
+        return Err(KvError::Corrupt(format!(
+            "tails image of {} bytes holds fewer than {count} entries",
+            image.len()
+        )));
+    }
+    Ok((0..count)
+        .map(|i| {
+            let off = i * TAIL_ENTRY_LEN;
+            (le64(image, off), le32(image, off + 8))
+        })
+        .collect())
+}
+
+/// xxh3 over a tails set's entry images (the spill checksum).
+pub fn checksum_tails(tails: &[(u64, u32)]) -> u64 {
+    xxhash_rust::xxh3::xxh3_64(&encode_tail_entries(tails))
+}
+
+/// Slot `s`'s recorded tails: `g` = the lease generation the release
+/// attests (the frame screen's rule 2 reads them for `g` while the slot
+/// is leased at `g + 1`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SlotTailsRecord {
+    pub g: u32,
+    pub tails: SlotTails,
+}
+
+impl SlotTailsRecord {
+    /// LE image, versioned. Refuses an inline count at or past the spill
+    /// sentinel and a spill of more runs than a `u16` names — caller bugs
+    /// (the release site decides inline vs spill against the value cap),
+    /// never truncated.
+    pub fn encode(&self) -> Result<Vec<u8>, KvError> {
+        let payload = match &self.tails {
+            SlotTails::Inline(v) => v.len() * TAIL_ENTRY_LEN,
+            SlotTails::Spilled(sp) => {
+                SPILL_FIXED_LEN + sp.runs.len() * SPILL_RUN_LEN + SPILL_CHECKSUM_LEN
+            }
+        };
+        let mut out = Vec::with_capacity(SLOT_TAILS_FIXED_LEN + payload);
+        out.push(SLOT_TAILS_VERSION);
+        out.extend_from_slice(&self.g.to_le_bytes());
+        match &self.tails {
+            SlotTails::Inline(v) => {
+                let n = u16::try_from(v.len())
+                    .ok()
+                    .filter(|n| *n != TAILS_SPILLED)
+                    .ok_or_else(|| {
+                        KvError::Corrupt(format!(
+                            "slot_tails record cannot carry {} inline tails (the count is a u16 \
+                             below the spill sentinel — spill them)",
+                            v.len()
+                        ))
+                    })?;
+                out.extend_from_slice(&n.to_le_bytes());
+                out.extend_from_slice(&encode_tail_entries(v));
+            }
+            SlotTails::Spilled(sp) => {
+                let n_runs = u16::try_from(sp.runs.len()).map_err(|_| {
+                    KvError::Corrupt(format!(
+                        "slot_tails spill cannot name {} runs (the count is a u16)",
+                        sp.runs.len()
+                    ))
+                })?;
+                out.extend_from_slice(&TAILS_SPILLED.to_le_bytes());
+                out.extend_from_slice(&n_runs.to_le_bytes());
+                for (addr, count) in &sp.runs {
+                    out.extend_from_slice(&addr.to_le_bytes());
+                    out.extend_from_slice(&count.to_le_bytes());
+                }
+                out.extend_from_slice(&sp.checksum.to_le_bytes());
+            }
+        }
+        Ok(out)
+    }
+
+    /// Decode + validate (total; §9 bounds rule).
+    pub fn decode(value: &[u8]) -> Result<Self, KvError> {
+        if value.len() < SLOT_TAILS_FIXED_LEN {
+            return Err(KvError::Corrupt(format!(
+                "slot_tails record too short ({} bytes)",
+                value.len()
+            )));
+        }
+        if value[0] != SLOT_TAILS_VERSION {
+            return Err(KvError::Corrupt(format!(
+                "slot_tails record version {} — this binary writes {SLOT_TAILS_VERSION} and the \
+                 format is forward-only (upgrade squeezefs)",
+                value[0]
+            )));
+        }
+        let g = le32(value, 1);
+        let n_raw = u16::from_le_bytes([value[5], value[6]]);
+        let tails = if n_raw == TAILS_SPILLED {
+            if value.len() < SLOT_TAILS_FIXED_LEN + SPILL_FIXED_LEN {
+                return Err(KvError::Corrupt(
+                    "slot_tails record names a spill but is truncated before the run count"
+                        .to_string(),
+                ));
+            }
+            let n_runs = usize::from(u16::from_le_bytes([
+                value[SLOT_TAILS_FIXED_LEN],
+                value[SLOT_TAILS_FIXED_LEN + 1],
+            ]));
+            let want = SLOT_TAILS_FIXED_LEN
+                + SPILL_FIXED_LEN
+                + n_runs * SPILL_RUN_LEN
+                + SPILL_CHECKSUM_LEN;
+            if value.len() != want {
+                return Err(KvError::Corrupt(format!(
+                    "slot_tails record names {n_runs} spill runs ({want} bytes) but holds {} \
+                     bytes",
+                    value.len()
+                )));
+            }
+            let runs = (0..n_runs)
+                .map(|i| {
+                    let off = SLOT_TAILS_FIXED_LEN + SPILL_FIXED_LEN + i * SPILL_RUN_LEN;
+                    (le64(value, off), le32(value, off + 8))
+                })
+                .collect();
+            let checksum = le64(value, want - SPILL_CHECKSUM_LEN);
+            SlotTails::Spilled(TailsSpill { runs, checksum })
+        } else {
+            let n = usize::from(n_raw);
+            let want = SLOT_TAILS_FIXED_LEN + n * TAIL_ENTRY_LEN;
+            if value.len() != want {
+                return Err(KvError::Corrupt(format!(
+                    "slot_tails record names {n} tails ({want} bytes) but holds {} bytes",
+                    value.len()
+                )));
+            }
+            SlotTails::Inline(decode_tail_entries(&value[SLOT_TAILS_FIXED_LEN..], n)?)
+        };
+        Ok(Self { g, tails })
     }
 }
 

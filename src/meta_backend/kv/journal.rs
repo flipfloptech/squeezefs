@@ -331,6 +331,43 @@ pub fn entry_len_for(records: &[(u8, Record)]) -> Result<u64, KvError> {
     Ok(len)
 }
 
+/// Greedy packing of staged members into entries under [`MAX_ENTRY_LEN`]:
+/// `payloads[i]` is member `i`'s framed bytes ([`record_frame_len`] summed
+/// over its records), `overhead(range)` the framed bytes of what rides
+/// BESIDE a chunk (the slot leave's grant rewrite for exactly those
+/// members — recomputed per candidate, since it shrinks as images leave).
+/// Members stay in order; a chunk grows while the next member and the
+/// overhead it implies still fit; ONE member always goes — a member past
+/// the cap alone is the entry write's own loud refusal, never a silent
+/// split. The corpse sweep's destroy-chunk law for the slot leave (PR 4
+/// review round 3, Issue 21: 108 complete tails sets do not fit one
+/// entry).
+pub fn pack_entries(
+    payloads: &[u64],
+    mut overhead: impl FnMut(std::ops::Range<usize>) -> u64,
+) -> Vec<std::ops::Range<usize>> {
+    let mut chunks = Vec::new();
+    let mut start = 0usize;
+    while start < payloads.len() {
+        let mut end = start + 1;
+        let mut sum = payloads[start];
+        while end < payloads.len() {
+            let next = sum.saturating_add(payloads[end]);
+            let total = ENTRY_HDR_LEN
+                .saturating_add(next)
+                .saturating_add(overhead(start..end + 1));
+            if total > MAX_ENTRY_LEN {
+                break;
+            }
+            sum = next;
+            end += 1;
+        }
+        chunks.push(start..end);
+        start = end;
+    }
+    chunks
+}
+
 /// Encode the entry payload: each staged record as `tree_id: u8` followed
 /// by the K1 record framing.
 pub fn encode_entry_payload(records: &[(u8, Record)]) -> Vec<u8> {

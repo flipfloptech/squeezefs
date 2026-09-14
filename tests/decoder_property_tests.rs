@@ -57,7 +57,9 @@ use squeezefs::meta_backend::kv::record::{
     TREE_XATTRS, XATTR_KEY_LEN,
 };
 use squeezefs::meta_backend::kv::slot_state::{
-    decode_slot_state_key, slot_state_key, SlotState, SLOT_STATE_KEY_LEN, SLOT_STATE_VERSION,
+    decode_slot_state_key, decode_slot_tails_key, slot_state_key, slot_tails_key, SlotState,
+    SlotTails, SlotTailsRecord, TailsSpill, SLOT_STATE_KEY_LEN, SLOT_STATE_VERSION,
+    SLOT_TAILS_KEY_LEN, SLOT_TAILS_VERSION, TAILS_SPILLED,
 };
 use squeezefs::meta_backend::kv::superblock::{ExtentRef, SuperblockV3};
 use squeezefs::meta_backend::kv::tree::RootPtr;
@@ -257,33 +259,34 @@ fn cluster_wire_hex_decode_is_total_and_exact() {
     );
 }
 
-/// A `slot_state` tails vector the u16 count cannot express is refused at
-/// the ENCODER — never truncated into a record whose count lies (the
-/// decoder checks the count against the length, so a truncated image would
-/// be corruption on the next mount).
+/// A `slot_tails` INLINE vector at or past the spill sentinel is refused
+/// at the ENCODER — never truncated into a record whose count lies (the
+/// decoder checks the count against the length, so a truncated image
+/// would be corruption on the next mount); the count one below the
+/// sentinel encodes and round-trips, and the same set SPILLED encodes
+/// as a locator whatever its size (PR 4 review round 3, Issue 21).
 #[test]
-fn slot_state_tails_past_u16_refuse_at_the_encoder() {
-    let too_many = SlotState::Unleased {
-        root: RootPtr { addr: 1, seq: 1 },
-        cursor: 0,
-        g: 0,
-        slot_tree_extents: 0,
-        last_written: 0,
-        seq_floor: 0,
-        tails: vec![(0, 0); usize::from(u16::MAX) + 1],
+fn slot_tails_at_the_spill_sentinel_refuse_the_inline_encoder() {
+    let too_many = SlotTailsRecord {
+        g: 1,
+        tails: SlotTails::Inline(vec![(0, 0); usize::from(TAILS_SPILLED)]),
     };
     assert!(too_many.encode().is_err());
-    let at_cap = SlotState::Unleased {
-        root: RootPtr { addr: 1, seq: 1 },
-        cursor: 0,
-        g: 0,
-        slot_tree_extents: 0,
-        last_written: 0,
-        seq_floor: 0,
-        tails: vec![(0, 0); usize::from(u16::MAX)],
+    let at_cap = SlotTailsRecord {
+        g: 1,
+        tails: SlotTails::Inline(vec![(0, 0); usize::from(TAILS_SPILLED) - 1]),
     };
-    let bytes = at_cap.encode().expect("u16::MAX tails encode");
-    assert_eq!(SlotState::decode(&bytes).expect("decodes"), at_cap);
+    let bytes = at_cap.encode().expect("one below the sentinel encodes");
+    assert_eq!(SlotTailsRecord::decode(&bytes).expect("decodes"), at_cap);
+    let spilled = SlotTailsRecord {
+        g: 1,
+        tails: SlotTails::Spilled(TailsSpill {
+            runs: vec![(0x1000, u32::MAX)],
+            checksum: 5,
+        }),
+    };
+    let bytes = spilled.encode().expect("a spill locator encodes");
+    assert_eq!(SlotTailsRecord::decode(&bytes).expect("decodes"), spilled);
 }
 
 // ---------------------------------------------------------------------------
@@ -612,13 +615,24 @@ proptest! {
         }
         if let Ok(state) = SlotState::decode(&data) {
             prop_assert_eq!(data[0], SLOT_STATE_VERSION);
-            prop_assert_eq!(state.encode().expect("re-encodes"), data);
+            prop_assert_eq!(state.encode(), data.clone());
+        }
+        match decode_slot_tails_key(&data) {
+            Ok(slot) => prop_assert_eq!(slot_tails_key(slot), data.clone()),
+            Err(_) => prop_assert!(
+                data.len() != SLOT_TAILS_KEY_LEN || !data.starts_with(b"slot_tails:")
+            ),
+        }
+        if let Ok(rec) = SlotTailsRecord::decode(&data) {
+            prop_assert_eq!(rec.encode().expect("re-encodes"), data);
         }
     }
 
-    /// Every emittable `slot_state` record (both variants, any tails
-    /// length a u16 expresses) round-trips; a future version and an
-    /// unknown variant refuse; truncation refuses.
+    /// Every emittable `slot_state` record (both variants — fixed-size
+    /// since PR 4 review round 3) and every emittable `slot_tails` record
+    /// (inline at any count below the spill sentinel, spilled at any run
+    /// count) round-trips; a future version and an unknown variant
+    /// refuse; truncation refuses.
     #[test]
     fn slot_state_round_trips_over_the_encoders_domain(
         addr in any::<u64>(),
@@ -631,9 +645,10 @@ proptest! {
         slot in any::<u32>(),
     ) {
         prop_assert_eq!(decode_slot_state_key(&slot_state_key(slot)).ok(), Some(slot));
+        prop_assert_eq!(decode_slot_tails_key(&slot_tails_key(slot)).ok(), Some(slot));
         let unleased = SlotState::Unleased {
             root: RootPtr { addr, seq }, cursor, g, slot_tree_extents, last_written,
-            seq_floor: last_written.rotate_left(7), tails,
+            seq_floor: last_written.rotate_left(7),
         };
         let leased = SlotState::Leased {
             appender_id: g, g: g.wrapping_add(1), page_addr: addr,
@@ -641,7 +656,7 @@ proptest! {
             seq_floor: cursor.rotate_left(9),
         };
         for state in [unleased, leased] {
-            let bytes = state.encode().expect("encodes");
+            let bytes = state.encode();
             prop_assert_eq!(SlotState::decode(&bytes).expect("decodes"), state.clone());
             let mut future = bytes.clone();
             future[0] = SLOT_STATE_VERSION.wrapping_add(1);
@@ -650,6 +665,22 @@ proptest! {
             variant[1] = 0x7F;
             prop_assert!(SlotState::decode(&variant).is_err());
             prop_assert!(SlotState::decode(&bytes[..bytes.len() - 1]).is_err());
+        }
+        let inline = SlotTailsRecord { g, tails: SlotTails::Inline(tails.clone()) };
+        let spilled = SlotTailsRecord {
+            g,
+            tails: SlotTails::Spilled(TailsSpill {
+                runs: tails.iter().map(|(a, c)| (a & !0xFFF, c % 4096 + 1)).collect(),
+                checksum: seq,
+            }),
+        };
+        for rec in [inline, spilled] {
+            let bytes = rec.encode().expect("encodes");
+            prop_assert_eq!(SlotTailsRecord::decode(&bytes).expect("decodes"), rec.clone());
+            let mut future = bytes.clone();
+            future[0] = SLOT_TAILS_VERSION.wrapping_add(1);
+            prop_assert!(SlotTailsRecord::decode(&future).is_err());
+            prop_assert!(SlotTailsRecord::decode(&bytes[..bytes.len() - 1]).is_err());
         }
     }
 

@@ -66,11 +66,15 @@ fn set_opts() -> FormatV3Options {
 }
 
 async fn format_stamped_member(dir: &std::path::Path, name: &str) -> String {
+    format_stamped_member_sized(dir, name, VOL_LEN).await
+}
+
+async fn format_stamped_member_sized(dir: &std::path::Path, name: &str, len: u64) -> String {
     let p = dir.join(name);
-    std::fs::File::create(&p).unwrap().set_len(VOL_LEN).unwrap();
+    std::fs::File::create(&p).unwrap().set_len(len).unwrap();
     let plan = plan_meta_slot_set(1).expect("derived plan");
     std::env::set_var("SQUEEZEFS_TEST_STAMP_SYMMETRIC", "1");
-    let r = format_v3_stamped(&p, VOL_LEN, &set_opts(), plan.stamps[0].clone()).await;
+    let r = format_v3_stamped(&p, len, &set_opts(), plan.stamps[0].clone()).await;
     std::env::remove_var("SQUEEZEFS_TEST_STAMP_SYMMETRIC");
     r.expect("format stamped member");
     p.display().to_string()
@@ -527,6 +531,384 @@ async fn a_return_replayed_against_durable_state_answers_already() {
         vol.extent_grant_record(1).await.unwrap().len(),
         GRANT_EXTENTS_FLOOR - 2,
         "the record dropped the returned extents"
+    );
+    for v in &routed.volumes {
+        v.shutdown().await.unwrap();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// §6.3 / §5.3.5 — the ManagerCall wire: JoinAppender over the S8 wire,
+// idempotency against DURABLE state, the directory chain's growth, the
+// join storm, the service phases.
+// ---------------------------------------------------------------------------
+
+use squeezefs::cluster_wire as cw;
+use squeezefs::meta_backend::kv::appender::{
+    dir_pairs_per_extent, read_directory_chain, AppenderIdentity, AppenderState,
+};
+use squeezefs::meta_ship::manager::{
+    decode_reply, decode_request, encode_reply, encode_request, joined_segments, ManagerCall,
+    ManagerClient, ManagerReply, ManagerReplyFrame, ManagerRequestFrame, ManagerService,
+    WireIdentity, MANAGER_SCHEMA, VERB_MANAGER_CALL,
+};
+
+const SECRET: &[u8] = b"sym-manager-tests-enroll-secret";
+
+fn listener_cfg() -> cw::RpcListenerConfig {
+    cw::RpcListenerConfig {
+        bind_addr: "127.0.0.1:0".parse().expect("literal addr"),
+        service_threads: 2,
+        ..cw::RpcListenerConfig::default()
+    }
+}
+
+fn joiner_identity(n: u64) -> AppenderIdentity {
+    AppenderIdentity {
+        node_token: 0x5EED_0000_0000_0000 | n,
+        mount_slot: 0x1000 + n as u32,
+        writer_id: 0xABCD_0000 + u128::from(n),
+    }
+}
+
+#[test]
+fn the_manager_call_frames_round_trip_and_the_wire_schema_is_five() {
+    assert_eq!(cw::CLUSTER_WIRE_SCHEMA, 5, "bumped ONCE for the program's wire");
+    assert_eq!(VERB_MANAGER_CALL, 0x0500, "its own verb block");
+    let req = ManagerRequestFrame {
+        schema: MANAGER_SCHEMA,
+        request_id: 7,
+        call: ManagerCall::JoinAppender {
+            identity: WireIdentity {
+                node_token: 1,
+                mount_slot: 2,
+                writer_id: 3,
+            },
+            ring_want_bytes: 512 * 1024,
+        },
+    };
+    let bytes = encode_request(&req).unwrap();
+    assert_eq!(decode_request(&bytes).unwrap(), req);
+    for call in [
+        ManagerCall::ExtentGrant {
+            appender_id: 3,
+            want: 8,
+        },
+        ManagerCall::ReturnExtents {
+            appender_id: 3,
+            runs: vec![(100, 4), (200, 1)],
+        },
+    ] {
+        let f = ManagerRequestFrame {
+            schema: MANAGER_SCHEMA,
+            request_id: 1,
+            call,
+        };
+        assert_eq!(decode_request(&encode_request(&f).unwrap()).unwrap(), f);
+    }
+    let rep = ManagerReplyFrame {
+        schema: MANAGER_SCHEMA,
+        request_id: 7,
+        reply: ManagerReply::Joined {
+            appender_id: 1,
+            page_addr: 0x1000,
+            ring_segments: vec![(0x2000, 0x10000)],
+            grant: vec![(50, 8)],
+            already: false,
+        },
+    };
+    let bytes = encode_reply(&rep).unwrap();
+    assert_eq!(decode_reply(&bytes).unwrap(), rep);
+    assert_eq!(
+        joined_segments(&rep.reply),
+        vec![squeezefs::meta_backend::kv::superblock::ExtentRef {
+            start: 0x2000,
+            len: 0x10000
+        }]
+    );
+    // Total decode: garbage never panics.
+    assert!(decode_request(&[0xFF; 40]).is_err());
+    assert!(decode_reply(&[]).is_err());
+}
+
+/// `JoinAppender` over the S8 wire: the manager allocates the lowest Free
+/// page, a ring from the heap, an initial grant; the joiner's page reads
+/// Live under its identity in the directory; a repeated join answers
+/// `already` from the PAGE (KD-SYM-7 — the durable witness), not a RAM
+/// window; the service phases are recorded exact-sum.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn join_appender_over_the_wire_allocates_a_page_ring_and_grant_and_replays_already() {
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    let uris = vec![format_stamped_member(dir.path(), "meta0").await];
+    let path = std::path::Path::new(&uris[0]);
+    let routed = open_with_partition(&uris, Some(PARTITION)).await;
+    let vol = Arc::clone(&routed.volumes[0]);
+    let host = cw::RpcListener::start_async(
+        listener_cfg(),
+        SECRET.to_vec(),
+        ManagerService::new(Arc::clone(&vol)),
+    )
+    .expect("manager listener");
+    let endpoint = host.endpoint().to_string();
+    let mut client = ManagerClient::connect(&endpoint, SECRET, "joiner-a")
+        .await
+        .expect("storage-trust enrollment");
+    let me = joiner_identity(1);
+    let free_before = vol.free_extents();
+    let reply = client.join(me, 0).await.unwrap();
+    let (id, page_addr, grant) = match &reply {
+        ManagerReply::Joined {
+            appender_id,
+            page_addr,
+            grant,
+            already,
+            ..
+        } => {
+            assert!(!already, "a first join");
+            (*appender_id, *page_addr, grant.clone())
+        }
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(id, 2, "appender 1 is the declared region; the join takes the next Free page");
+    let segments = joined_segments(&reply);
+    assert!(!segments.is_empty() && segments.len() <= 8);
+    let ring_bytes: u64 = segments.iter().map(|s| s.len).sum();
+    assert!(ring_bytes >= squeezefs::meta_backend::kv::appender::SYM_RING_FLOOR_BYTES);
+    assert_eq!(grant.iter().map(|(_, l)| u64::from(*l)).sum::<u64>(), GRANT_EXTENTS_FLOOR);
+    // The heap paid for the ring and the grant.
+    let ring_extents = ring_bytes / NODE_SIZE as u64;
+    assert_eq!(vol.free_extents(), free_before - ring_extents - GRANT_EXTENTS_FLOOR);
+    // The directory: page 2 Live under the joiner, its ring and grant named.
+    let sb = vol.superblock().clone();
+    let entries = read_directory(path, &sb).await.unwrap();
+    assert_eq!(entries[2].dir_offsets[0], page_addr);
+    let page = entries[2].page.clone().expect("the joiner's page");
+    assert_eq!(page.state, AppenderState::Live);
+    assert_eq!(page.identity, me);
+    assert!(!page.is_manager);
+    assert_eq!(page.term, 1);
+    assert_eq!(page.segments, segments);
+    assert_eq!(
+        page.grant.iter().map(|r| (r.start, r.len)).collect::<Vec<_>>(),
+        grant
+    );
+    assert_eq!(vol.extent_grant_record(2).await.unwrap().runs.len(), grant.len());
+    // The replay: the same identity ⇒ `already`, the same page and ring.
+    let again = client.join(me, 0).await.unwrap();
+    match &again {
+        ManagerReply::Joined {
+            appender_id,
+            already,
+            page_addr: p2,
+            ..
+        } => {
+            assert!(already, "KD-SYM-7: the Live page IS the witness");
+            assert_eq!((*appender_id, *p2), (id, page_addr));
+        }
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(joined_segments(&again), segments);
+    let s = stats(&vol);
+    assert_eq!(s.manager_verbs, 2, "two verbs served over the wire");
+    assert_eq!(s.manager_verb_replays, 1);
+    assert_eq!(s.manager_verb_refusals, 0);
+    assert_eq!(
+        s.manager_service_ns[3],
+        s.manager_service_ns[0] + s.manager_service_ns[1] + s.manager_service_ns[2],
+        "admit + execute + reply ≡ total"
+    );
+    assert!(s.manager_service_ns[1] > 0);
+    // ExtentGrant / ReturnExtents for the wire joiner: granted, returned,
+    // returned again ⇒ already.
+    let more = client.extent_grant(2, 4).await.unwrap();
+    assert_eq!(more.iter().map(|r| u64::from(r.len)).sum::<u64>(), 4);
+    let (cleared, already) = client.return_extents(2, &more).await.unwrap();
+    assert_eq!((cleared, already), (4, 0));
+    let (cleared, already) = client.return_extents(2, &more).await.unwrap();
+    assert_eq!((cleared, already), (0, 4));
+    // The manager takes no grant over the wire either.
+    assert!(client.extent_grant(0, 1).await.is_err());
+    assert_eq!(stats(&vol).manager_verb_refusals, 1);
+    host.shutdown();
+    for v in &routed.volumes {
+        v.shutdown().await.unwrap();
+    }
+}
+
+/// Idempotency is against DURABLE state, never the S8 RAM window: the
+/// manager dies between the join's durable step and its reply, a
+/// successor is elected (the D0 ladder over the same volume), and the
+/// replayed verb answers `already` off the page the dead manager wrote.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_join_replayed_against_a_successor_manager_answers_already() {
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    let uris = vec![format_stamped_member(dir.path(), "meta0").await];
+    let me = joiner_identity(2);
+    let (id, segments, grant) = {
+        let routed = open_with_partition(&uris, Some(PARTITION)).await;
+        let vol = Arc::clone(&routed.volumes[0]);
+        let out = vol.manager_join_appender(me, 0).await.unwrap();
+        assert!(!out.already);
+        vol.sync_device().await.unwrap();
+        // The manager dies before any reply reaches the joiner: no
+        // shutdown, no leave — the page stays Live in the directory.
+        drop(vol);
+        drop(routed);
+        (out.appender_id, out.ring_segments, out.grant)
+    };
+    let routed = open_with_partition(&uris, Some(PARTITION)).await;
+    let vol = Arc::clone(&routed.volumes[0]);
+    let s = stats(&vol);
+    assert_eq!(s.manager_lease, ManagerLease::Held, "the successor holds the role");
+    assert_eq!(s.self_recoveries, 2, "its own two regions' residue");
+    let again = vol.manager_join_appender(me, 0).await.unwrap();
+    assert!(again.already, "the successor answers from the page, with no RAM window");
+    assert_eq!(again.appender_id, id);
+    assert_eq!(again.ring_segments, segments);
+    assert_eq!(again.grant, grant, "the grant record survived the failover");
+    assert_eq!(stats(&vol).manager_verb_replays, 1);
+    assert_eq!(stats(&vol).manager_verb_refusals, 0);
+    for v in &routed.volumes {
+        v.shutdown().await.unwrap();
+    }
+}
+
+/// The ONE hard refusal (§5.11, R-SYM-6): a join past `appenders_capacity`
+/// (`heap/16 ÷ ring` — 7 on this 64 MiB volume at the 512 KiB floor ring)
+/// refuses naming the volume count as the lever, never a format-time
+/// client count; `manager_verb_refusals` counts it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_join_past_appenders_capacity_refuses_naming_the_volume_count_lever() {
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    let uris = vec![format_stamped_member(dir.path(), "meta0").await];
+    let routed = open_with_partition(&uris, Some(PARTITION)).await;
+    let vol = Arc::clone(&routed.volumes[0]);
+    let capacity = stats(&vol).capacity;
+    assert_eq!(capacity, 7, "heap/16 ÷ 512 KiB on a 64 MiB volume");
+    // Two live already (the manager + the declared region).
+    let mut n = 0u64;
+    let refusal = loop {
+        match vol.manager_join_appender(joiner_identity(200 + n), 0).await {
+            Ok(out) => {
+                assert!(!out.already);
+                n += 1;
+                assert!(n < 64, "no capacity refusal");
+            }
+            Err(e) => break e.to_string(),
+        }
+    };
+    assert_eq!(n, capacity - 2, "every page up to the capacity joined");
+    assert!(
+        refusal.contains("appenders_capacity") && refusal.contains("volume COUNT"),
+        "{refusal}"
+    );
+    assert_eq!(stats(&vol).manager_verb_refusals, 1);
+    for v in &routed.volumes {
+        v.shutdown().await.unwrap();
+    }
+}
+
+/// A join storm of 32 completes inside the bound and grows the directory
+/// chain past its first extent (7 pairs at 64 KiB nodes): every joiner
+/// gets a distinct page, ring and grant; the chain's headers link. A
+/// 512 MiB volume: `appenders_capacity` = 32 MiB ÷ 512 KiB = 64.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_join_storm_of_32_completes_inside_the_bound_and_grows_the_directory_chain() {
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    let uris = vec![format_stamped_member_sized(dir.path(), "meta0", 512 * 1024 * 1024).await];
+    let path = std::path::Path::new(&uris[0]);
+    let routed = open_with_partition(&uris, Some(PARTITION)).await;
+    let vol = Arc::clone(&routed.volumes[0]);
+    let host = cw::RpcListener::start_async(
+        listener_cfg(),
+        SECRET.to_vec(),
+        ManagerService::new(Arc::clone(&vol)),
+    )
+    .expect("manager listener");
+    let endpoint = host.endpoint().to_string();
+    let pairs = dir_pairs_per_extent(NODE_SIZE as u64);
+    assert_eq!(pairs, 7, "64 KiB nodes: 16 pages − the header = 7 pairs");
+    let t0 = std::time::Instant::now();
+    let mut ids = std::collections::BTreeSet::new();
+    let mut client = ManagerClient::connect(&endpoint, SECRET, "storm")
+        .await
+        .unwrap();
+    for n in 0..32u64 {
+        match client.join(joiner_identity(100 + n), 0).await.unwrap() {
+            ManagerReply::Joined {
+                appender_id,
+                already,
+                ..
+            } => {
+                assert!(!already);
+                assert!(ids.insert(appender_id), "distinct pages");
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+    let wall = t0.elapsed();
+    let per_join = wall / 32;
+    // §1.6: ≈ 2–5 ms per join incl. the barrier on the design's venue;
+    // the dev box (tmpfs, debug) is scoping — the bound here is loose.
+    assert!(
+        per_join < std::time::Duration::from_millis(200),
+        "32 joins took {wall:?} ({per_join:?} each)"
+    );
+    log::info!("join storm: 32 joins in {wall:?} ({per_join:?} per join, dev box — scoping)");
+    let sb = vol.superblock().clone();
+    let chain = read_directory_chain(path, &sb).await.unwrap();
+    assert!(
+        chain.len() >= (33u64).div_ceil(pairs) as usize,
+        "33 appenders (the declared + 32) need {} extents of {pairs} pairs: {} in the chain",
+        (33u64).div_ceil(pairs),
+        chain.len()
+    );
+    for (i, (_, hdr)) in chain.iter().enumerate() {
+        assert_eq!(hdr.chain_index, i as u32);
+        assert_eq!(u64::from(hdr.pairs), pairs);
+    }
+    let entries = read_directory(path, &sb).await.unwrap();
+    let live = entries
+        .iter()
+        .filter(|e| {
+            e.page
+                .as_ref()
+                .is_some_and(|p| p.state == AppenderState::Live)
+        })
+        .count();
+    assert_eq!(live, 34, "the manager, the declared region and 32 joiners");
+    let s = stats(&vol);
+    assert_eq!(s.manager_verb_refusals, 0);
+    assert_eq!(s.extent_grants, 1 + 32);
+    assert!(s.manager_verbs_per_s > 0);
+    assert!(s.manager_load_pct <= 100);
+    // The whole thing survives a remount: the same 34 Live pages, the same
+    // chain — and the successor still answers each joiner `already`. The
+    // listener's service holds the backend: it goes first, or the flock
+    // it pins refuses the remount.
+    host.shutdown();
+    drop(host);
+    vol.sync_device().await.unwrap();
+    drop(vol);
+    drop(routed);
+    let routed = open_with_partition(&uris, Some(PARTITION)).await;
+    let vol = &routed.volumes[0];
+    let again = vol.manager_join_appender(joiner_identity(131), 0).await.unwrap();
+    assert!(again.already);
+    let entries = read_directory(path, &sb).await.unwrap();
+    assert_eq!(
+        entries
+            .iter()
+            .filter(|e| e
+                .page
+                .as_ref()
+                .is_some_and(|p| p.state == AppenderState::Live))
+            .count(),
+        34
     );
     for v in &routed.volumes {
         v.shutdown().await.unwrap();

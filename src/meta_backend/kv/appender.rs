@@ -1762,6 +1762,10 @@ pub struct AppenderRegion {
     /// set — swapped whole at every acquire / release, read latch-free
     /// by the conveyor's region routing.
     pub leases: arc_swap::ArcSwap<std::collections::BTreeSet<super::record::ForestSlot>>,
+    /// The one-writer mutex of `leases` (review round 2, Issue 5): every
+    /// RMW of the set — `add_lease` / `drop_lease` — runs under it, held
+    /// for the RMW only, never across an await.
+    pub leases_writer: std::sync::Mutex<()>,
     /// The tail the last written page named.
     pub last_tail: std::sync::atomic::AtomicU64,
     /// The tail the last COMPLETED barrier made durable — what this
@@ -1852,15 +1856,21 @@ impl AppenderRegion {
         self.leases.load_full()
     }
 
-    /// Lease `slot` (an acquire / a handover in).
+    /// Lease `slot` (an acquire / a handover in). The clone-and-store runs
+    /// under the set's one-writer mutex (review round 2, Issue 5): a grant
+    /// under `manager_verbs` and a release under `handover` on the same
+    /// region can never lose each other's update; readers stay lock-free.
     pub fn add_lease(&self, slot: super::record::ForestSlot) {
+        let _w = self.leases_writer.lock().unwrap_or_else(|e| e.into_inner());
         let mut next = (**self.leases.load()).clone();
         next.insert(slot);
         self.leases.store(std::sync::Arc::new(next));
     }
 
-    /// Drop `slot`'s lease (a release / a handover out).
+    /// Drop `slot`'s lease (a release / a handover out) — under the same
+    /// one-writer mutex as [`Self::add_lease`].
     pub fn drop_lease(&self, slot: super::record::ForestSlot) {
+        let _w = self.leases_writer.lock().unwrap_or_else(|e| e.into_inner());
         let mut next = (**self.leases.load()).clone();
         next.remove(&slot);
         self.leases.store(std::sync::Arc::new(next));

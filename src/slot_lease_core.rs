@@ -42,17 +42,17 @@
 
 #[cfg(loom)]
 pub(crate) mod sync {
-    pub use loom::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    pub use loom::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
     pub use loom::sync::{Mutex, MutexGuard};
 }
 #[cfg(not(loom))]
 pub(crate) mod sync {
-    pub use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    pub use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
     pub use std::sync::{Mutex, MutexGuard};
 }
 
-use std::collections::BTreeMap;
-use sync::{AtomicBool, AtomicU64, Mutex, MutexGuard, Ordering};
+use std::collections::{BTreeMap, BTreeSet};
+use sync::{AtomicBool, AtomicU32, AtomicU64, Mutex, MutexGuard, Ordering};
 
 /// A forest slot (`kv::record::ForestSlot`): 0 = the native slot, guest
 /// slot `s` = `s + 1`.
@@ -110,11 +110,24 @@ pub enum CommitVerdict {
 /// the ONE RAM-mutation choke point with two relaxed loads on an armed
 /// forest mount and none on a flat one (the node's forest-slot stamp
 /// short-circuits first).
+///
+/// **The door tokens** (review round 2, Issue 6 — the §5.4.1 door law):
+/// `inflight[slot]` counts the commits that passed the door for the slot
+/// and have not reached their terminal outcome. The door takes its
+/// token BEFORE it reads `releasing` and a release raises `releasing`
+/// BEFORE it reads the count — both `SeqCst`, the Dekker pair — so one of
+/// the two always sees the other: a commit that passed the door is
+/// drained by the release before its flush, and a commit that reads the
+/// bit parks at the door. The belt in `apply_locked` is then reached by
+/// NO legal schedule (`meta_kv_leaf_lease_refusals` keeps its must-stay-0
+/// meaning); before the tokens, every commit admitted between the door
+/// and the flush failed EINVAL on a legal schedule.
 #[derive(Debug)]
 pub struct LeaseGate {
     armed: AtomicBool,
     leased: Box<[AtomicU64]>,
     releasing: Box<[AtomicU64]>,
+    inflight: Box<[AtomicU32]>,
 }
 
 impl Default for LeaseGate {
@@ -124,18 +137,55 @@ impl Default for LeaseGate {
 }
 
 impl LeaseGate {
-    /// Unarmed, nothing leased.
+    /// Unarmed, nothing leased, over the whole slot namespace.
     pub fn new() -> Self {
+        Self::with_namespace(SLOT_NAMESPACE)
+    }
+
+    /// The gate over the first `slots` slots (the loom models size it to
+    /// their handful; the product uses [`Self::new`]).
+    pub fn with_namespace(slots: usize) -> Self {
         Self {
             armed: AtomicBool::new(false),
             leased: (0..GATE_WORDS).map(|_| AtomicU64::new(0)).collect(),
             releasing: (0..GATE_WORDS).map(|_| AtomicU64::new(0)).collect(),
+            inflight: (0..slots).map(|_| AtomicU32::new(0)).collect(),
         }
     }
 
     #[inline]
     fn index(slot: Slot) -> (usize, u64) {
         ((slot as usize) / 64, 1u64 << (slot % 64))
+    }
+
+    /// The door of `slot` (§5.4.1): take a token, then read `releasing`
+    /// — `true` = the commit may proceed and holds the token until
+    /// [`Self::leave`]; `false` = the slot is mid-handover, the token is
+    /// returned and the caller parks until the handover completes.
+    #[inline]
+    pub fn enter(&self, slot: Slot) -> bool {
+        let (w, bit) = Self::index(slot);
+        self.inflight[slot as usize].fetch_add(1, Ordering::SeqCst);
+        if self.releasing[w].load(Ordering::SeqCst) & bit != 0 {
+            self.inflight[slot as usize].fetch_sub(1, Ordering::SeqCst);
+            return false;
+        }
+        true
+    }
+
+    /// Return the door token of `slot` (the commit's terminal outcome).
+    /// Answers the tokens still out — `0` wakes a release parked on the
+    /// drain.
+    #[inline]
+    pub fn leave(&self, slot: Slot) -> u32 {
+        self.inflight[slot as usize].fetch_sub(1, Ordering::SeqCst) - 1
+    }
+
+    /// The door tokens out on `slot` (read `SeqCst` — the release's half
+    /// of the Dekker pair, after [`Self::begin_release`]).
+    #[inline]
+    pub fn inflight(&self, slot: Slot) -> u32 {
+        self.inflight[slot as usize].load(Ordering::SeqCst)
     }
 
     /// Arm the gate: from here on a leaf mutation of a slot this mount
@@ -164,11 +214,11 @@ impl LeaseGate {
     }
 
     /// The departing holder's FIRST act of a handover: from this store
-    /// on no new commit lands on the slot. `SeqCst` — the store must be
-    /// ordered before the node locks the flush takes, and a committer
-    /// inside its own node lock must observe it (the two are ordered by
-    /// the lock; the fence keeps a check that ran outside any lock from
-    /// being reordered past the store on the releaser's side).
+    /// on no new commit passes the door of the slot. `SeqCst` — the
+    /// store is the release's half of the door's Dekker pair (it must be
+    /// ordered before the release reads [`Self::inflight`]), and it must
+    /// be ordered before the node locks the flush takes, so a committer
+    /// inside its own node lock observes it (the belt).
     pub fn begin_release(&self, slot: Slot) {
         let (w, bit) = Self::index(slot);
         self.releasing[w].fetch_or(bit, Ordering::SeqCst);
@@ -286,6 +336,13 @@ pub struct SlotLease {
     pub last_written: u64,
     /// The words the last release recorded (what a grant hands over).
     pub words: SlotWords,
+    /// RAM-only: the lease was granted by a ROTOR ask (`AcquireSlots {
+    /// want }`), so it counts against the holder's `2 × M` rotor cap
+    /// (§5.1.2; review round 2, Issue 14 — the cap counts rotor slots,
+    /// never every non-native lease; the page budget governs holdings).
+    /// Cleared at the release; a re-adoption at open reads `false` and
+    /// the manager's own rotor is rebuilt from its RAM vector.
+    pub rotor: bool,
 }
 
 impl SlotLease {
@@ -299,6 +356,7 @@ impl SlotLease {
             offer_expires_ns: 0,
             last_written,
             words,
+            rotor: false,
         }
     }
 
@@ -318,6 +376,7 @@ impl SlotLease {
             offer_expires_ns: 0,
             last_written: 0,
             words,
+            rotor: false,
         }
     }
 }
@@ -369,11 +428,67 @@ pub enum LeaseRefusal {
     },
 }
 
+/// The table's interior: the per-slot entries plus the two indexes the
+/// renewal carriage and the manager read per HOLDER — `held[holder]` =
+/// every slot in a leased state under it, `offered[to]` = every slot
+/// offered to it (review round 2, Issue 16: `held_by` / `carriage_for`
+/// are O(held) off these, never a scan of the table — KD-FG-4's
+/// no-scan-in-renew law; `snapshot()` stays the stats face's).
+#[derive(Debug, Default)]
+struct TableInner {
+    slots: BTreeMap<Slot, SlotLease>,
+    held: BTreeMap<AppenderId, BTreeSet<Slot>>,
+    offered: BTreeMap<AppenderId, BTreeSet<Slot>>,
+}
+
+impl TableInner {
+    fn index_hold(&mut self, slot: Slot, holder: AppenderId) {
+        self.held.entry(holder).or_default().insert(slot);
+    }
+
+    fn unindex_hold(&mut self, slot: Slot, holder: AppenderId) {
+        if let Some(set) = self.held.get_mut(&holder) {
+            set.remove(&slot);
+            if set.is_empty() {
+                self.held.remove(&holder);
+            }
+        }
+    }
+
+    fn index_offer(&mut self, slot: Slot, to: AppenderId) {
+        self.offered.entry(to).or_default().insert(slot);
+    }
+
+    fn unindex_offer(&mut self, slot: Slot, to: AppenderId) {
+        if let Some(set) = self.offered.get_mut(&to) {
+            set.remove(&slot);
+            if set.is_empty() {
+                self.offered.remove(&to);
+            }
+        }
+    }
+
+    /// Withdraw a standing offer of `slot` (the entry's `offered_to`
+    /// cleared with the index).
+    fn clear_offer(&mut self, slot: Slot) {
+        if let Some(e) = self.slots.get(&slot) {
+            let to = e.offered_to;
+            if to != 0 {
+                self.unindex_offer(slot, to);
+            }
+        }
+        if let Some(e) = self.slots.get_mut(&slot) {
+            e.offered_to = 0;
+            e.offer_expires_ns = 0;
+        }
+    }
+}
+
 /// The manager's RAM lease map — mirrors tree 0 (loaded at open, written
 /// through by every grant/release).
 #[derive(Debug, Default)]
 pub struct SlotLeaseTable {
-    slots: Mutex<BTreeMap<Slot, SlotLease>>,
+    inner: Mutex<TableInner>,
     /// Offers made (`slot_offers`) / expired (`slot_offers_expired`).
     offers: AtomicU64,
     offers_expired: AtomicU64,
@@ -384,23 +499,39 @@ impl SlotLeaseTable {
         Self::default()
     }
 
-    fn lock(&self) -> MutexGuard<'_, BTreeMap<Slot, SlotLease>> {
-        self.slots.lock().unwrap_or_else(|e| e.into_inner())
+    fn lock(&self) -> MutexGuard<'_, TableInner> {
+        self.inner.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     /// Install a slot's state as tree 0 records it (open / epoch reload).
     pub fn load(&self, slot: Slot, lease: SlotLease) {
-        self.lock().insert(slot, lease);
+        let mut m = self.lock();
+        if let Some(prev) = m.slots.get(&slot).copied() {
+            if prev.state != LeaseState::Unleased {
+                m.unindex_hold(slot, prev.holder);
+            }
+            if prev.offered_to != 0 {
+                m.unindex_offer(slot, prev.offered_to);
+            }
+        }
+        if lease.state != LeaseState::Unleased {
+            m.index_hold(slot, lease.holder);
+        }
+        if lease.state == LeaseState::Offered && lease.offered_to != 0 {
+            m.index_offer(slot, lease.offered_to);
+        }
+        m.slots.insert(slot, lease);
     }
 
     /// The entry of `slot` (`None` = never leased, no history).
     pub fn get(&self, slot: Slot) -> Option<SlotLease> {
-        self.lock().get(&slot).copied()
+        self.lock().slots.get(&slot).copied()
     }
 
-    /// Every entry, slot-ascending.
+    /// Every entry, slot-ascending — the stats face and the open's
+    /// reconciliation; never the renewal path (Issue 16).
     pub fn snapshot(&self) -> Vec<(Slot, SlotLease)> {
-        self.lock().iter().map(|(s, l)| (*s, *l)).collect()
+        self.lock().slots.iter().map(|(s, l)| (*s, *l)).collect()
     }
 
     /// `AcquireSlot` (§5.1.2 / §5.3.5): grant an unleased slot (`g += 1`),
@@ -408,9 +539,17 @@ impl SlotLeaseTable {
     /// its identity, and turn an offer to this requester into a recall.
     /// A slot mid-release is refused with its holder (retry after the
     /// release lands). The first grant of a never-leased slot mints `g = 1`.
-    pub fn acquire(&self, slot: Slot, requester: AppenderId, now_ns: u64) -> AcquireOutcome {
+    /// `rotor` marks a grant made by a rotor ask (the `2 × M` cap's unit).
+    pub fn acquire(
+        &self,
+        slot: Slot,
+        requester: AppenderId,
+        now_ns: u64,
+        rotor: bool,
+    ) -> AcquireOutcome {
         let mut m = self.lock();
         let entry = m
+            .slots
             .entry(slot)
             .or_insert_with(|| SlotLease::unleased(0, 0, SlotWords::default()));
         match entry.state {
@@ -420,10 +559,13 @@ impl SlotLeaseTable {
                 entry.holder = requester;
                 entry.offered_to = 0;
                 entry.offer_expires_ns = 0;
-                AcquireOutcome::Granted {
+                entry.rotor = rotor;
+                let out = AcquireOutcome::Granted {
                     g: entry.g,
                     words: entry.words,
-                }
+                };
+                m.index_hold(slot, requester);
+                out
             }
             LeaseState::Leased | LeaseState::Offered | LeaseState::Releasing
                 if entry.holder == requester =>
@@ -441,12 +583,13 @@ impl SlotLeaseTable {
             LeaseState::Offered if now_ns >= entry.offer_expires_ns => {
                 // Lapsed under the acquire: the holder is unchanged.
                 entry.state = LeaseState::Leased;
-                entry.offered_to = 0;
-                self.offers_expired.fetch_add(1, Ordering::Relaxed);
-                AcquireOutcome::Refused {
+                let out = AcquireOutcome::Refused {
                     holder: entry.holder,
                     g: entry.g,
-                }
+                };
+                m.clear_offer(slot);
+                self.offers_expired.fetch_add(1, Ordering::Relaxed);
+                out
             }
             LeaseState::Leased | LeaseState::Offered | LeaseState::Releasing => {
                 AcquireOutcome::Refused {
@@ -468,7 +611,7 @@ impl SlotLeaseTable {
         expires_ns: u64,
     ) -> Result<(), LeaseRefusal> {
         let mut m = self.lock();
-        let Some(entry) = m.get_mut(&slot) else {
+        let Some(entry) = m.slots.get_mut(&slot) else {
             return Err(LeaseRefusal::Unleased);
         };
         match entry.state {
@@ -480,6 +623,7 @@ impl SlotLeaseTable {
                 entry.state = LeaseState::Offered;
                 entry.offered_to = to;
                 entry.offer_expires_ns = expires_ns;
+                m.index_offer(slot, to);
                 self.offers.fetch_add(1, Ordering::Relaxed);
                 Ok(())
             }
@@ -488,18 +632,25 @@ impl SlotLeaseTable {
     }
 
     /// Lapse every offer past `now_ns`: the holder is unchanged. Returns
-    /// the slots whose offers expired.
+    /// the slots whose offers expired. O(offers) off the offer index.
     pub fn expire_offers(&self, now_ns: u64) -> Vec<Slot> {
         let mut m = self.lock();
+        let offered: Vec<Slot> = m.offered.values().flatten().copied().collect();
         let mut out = Vec::new();
-        for (slot, entry) in m.iter_mut() {
-            if entry.state == LeaseState::Offered && now_ns >= entry.offer_expires_ns {
-                entry.state = LeaseState::Leased;
-                entry.offered_to = 0;
-                entry.offer_expires_ns = 0;
-                out.push(*slot);
+        for slot in offered {
+            let lapsed = m.slots.get(&slot).is_some_and(|entry| {
+                entry.state == LeaseState::Offered && now_ns >= entry.offer_expires_ns
+            });
+            if !lapsed {
+                continue;
             }
+            if let Some(entry) = m.slots.get_mut(&slot) {
+                entry.state = LeaseState::Leased;
+            }
+            m.clear_offer(slot);
+            out.push(slot);
         }
+        out.sort_unstable();
         self.offers_expired
             .fetch_add(out.len() as u64, Ordering::Relaxed);
         out
@@ -511,7 +662,7 @@ impl SlotLeaseTable {
     /// under this holder.
     pub fn begin_release(&self, slot: Slot, holder: AppenderId) -> Result<u32, LeaseRefusal> {
         let mut m = self.lock();
-        let Some(entry) = m.get_mut(&slot) else {
+        let Some(entry) = m.slots.get_mut(&slot) else {
             return Err(LeaseRefusal::Unleased);
         };
         match entry.state {
@@ -527,15 +678,21 @@ impl SlotLeaseTable {
     }
 
     /// A release that will not complete (the manager refused it, the
-    /// flush failed): back to `Leased`, holder unchanged.
+    /// flush failed): back to `Leased`, holder unchanged, the offer (if
+    /// the release was an accepted offer's recall) withdrawn.
     pub fn abort_release(&self, slot: Slot, holder: AppenderId) {
         let mut m = self.lock();
-        if let Some(entry) = m.get_mut(&slot) {
-            if entry.holder == holder && entry.state == LeaseState::Releasing {
-                entry.state = LeaseState::Leased;
-                entry.offered_to = 0;
-            }
+        let aborting = m
+            .slots
+            .get(&slot)
+            .is_some_and(|entry| entry.holder == holder && entry.state == LeaseState::Releasing);
+        if !aborting {
+            return;
         }
+        if let Some(entry) = m.slots.get_mut(&slot) {
+            entry.state = LeaseState::Leased;
+        }
+        m.clear_offer(slot);
     }
 
     /// `ReleaseSlot` (§5.1.4 / §5.3.5): the holder presents its `g` and
@@ -553,19 +710,22 @@ impl SlotLeaseTable {
         now_seq: u64,
     ) -> ReleaseOutcome {
         let mut m = self.lock();
-        let Some(entry) = m.get_mut(&slot) else {
+        let Some(entry) = m.slots.get(&slot).copied() else {
             return ReleaseOutcome::Refused { holder: 0, g: 0 };
         };
-        match Self::release_verdict(entry, holder, g, words) {
+        match Self::release_verdict(&entry, holder, g, words) {
             ReleaseOutcome::Released => {}
             other => return other,
         }
-        entry.state = LeaseState::Unleased;
-        entry.holder = 0;
-        entry.offered_to = 0;
-        entry.offer_expires_ns = 0;
-        entry.last_written = now_seq;
-        entry.words = words;
+        m.unindex_hold(slot, entry.holder);
+        m.clear_offer(slot);
+        if let Some(entry) = m.slots.get_mut(&slot) {
+            entry.state = LeaseState::Unleased;
+            entry.holder = 0;
+            entry.last_written = now_seq;
+            entry.words = words;
+            entry.rotor = false;
+        }
         ReleaseOutcome::Released
     }
 
@@ -581,7 +741,7 @@ impl SlotLeaseTable {
         words: SlotWords,
     ) -> ReleaseOutcome {
         let m = self.lock();
-        match m.get(&slot) {
+        match m.slots.get(&slot) {
             None => ReleaseOutcome::Refused { holder: 0, g: 0 },
             Some(entry) => Self::release_verdict(entry, holder, g, words),
         }
@@ -613,7 +773,7 @@ impl SlotLeaseTable {
 
     /// `ResolveSlot` (§5.1.6): who holds `slot`.
     pub fn resolve(&self, slot: Slot) -> Resolved {
-        match self.lock().get(&slot) {
+        match self.lock().slots.get(&slot) {
             None => Resolved::Unleased { g: 0 },
             Some(e) if e.state == LeaseState::Unleased => Resolved::Unleased { g: e.g },
             Some(e) => Resolved::Holder {
@@ -623,13 +783,71 @@ impl SlotLeaseTable {
         }
     }
 
-    /// Every slot `holder` leases (any leased state), ascending.
+    /// Every slot `holder` leases (any leased state), ascending — O(held)
+    /// off the holder index.
     pub fn held_by(&self, holder: AppenderId) -> Vec<Slot> {
         self.lock()
+            .held
+            .get(&holder)
+            .map(|s| s.iter().copied().collect())
+            .unwrap_or_default()
+    }
+
+    /// The slots `holder` leases by a ROTOR grant (the `2 × M` cap's
+    /// count, §5.1.2) — O(held).
+    pub fn rotor_held_by(&self, holder: AppenderId) -> u64 {
+        let m = self.lock();
+        m.held.get(&holder).map_or(0, |set| {
+            set.iter()
+                .filter(|s| m.slots.get(s).is_some_and(|e| e.rotor))
+                .count() as u64
+        })
+    }
+
+    /// Every leased slot with its holder and `g`, ascending — the holder
+    /// cache's refresh input, O(leased) off the holder index.
+    pub fn leased_entries(&self) -> Vec<(Slot, AppenderId, u32)> {
+        let m = self.lock();
+        let mut out: Vec<(Slot, AppenderId, u32)> = m
+            .held
             .iter()
-            .filter(|(_, e)| e.state != LeaseState::Unleased && e.holder == holder)
-            .map(|(s, _)| *s)
-            .collect()
+            .flat_map(|(holder, set)| {
+                set.iter()
+                    .filter_map(|s| m.slots.get(s).map(|e| (*s, *holder, e.g)))
+            })
+            .collect();
+        out.sort_unstable();
+        out
+    }
+
+    /// Every leased slot whose holder is NOT one of `holders` (the S4
+    /// plane's foreign set), ascending — O(leased).
+    pub fn held_outside(&self, holders: &BTreeSet<AppenderId>) -> Vec<Slot> {
+        let m = self.lock();
+        let mut out: Vec<Slot> = m
+            .held
+            .iter()
+            .filter(|(h, _)| !holders.contains(h))
+            .flat_map(|(_, set)| set.iter().copied())
+            .collect();
+        out.sort_unstable();
+        out
+    }
+
+    /// Every slot offered to `to` with its `g`, ascending — O(offered)
+    /// off the offer index.
+    pub fn offered_to(&self, to: AppenderId) -> Vec<(Slot, u32)> {
+        let m = self.lock();
+        m.offered.get(&to).map_or_else(Vec::new, |set| {
+            set.iter()
+                .filter_map(|s| {
+                    m.slots
+                        .get(s)
+                        .filter(|e| e.state == LeaseState::Offered)
+                        .map(|e| (*s, e.g))
+                })
+                .collect()
+        })
     }
 
     /// `prefer: unleased-then-idle` (§5.1.2): up to `want` unleased
@@ -638,7 +856,7 @@ impl SlotLeaseTable {
     pub fn pick_unleased(&self, want: usize, candidates: impl Iterator<Item = Slot>) -> Vec<Slot> {
         let m = self.lock();
         let mut ranked: Vec<(u64, Slot)> = candidates
-            .filter_map(|s| match m.get(&s) {
+            .filter_map(|s| match m.slots.get(&s) {
                 None => Some((0, s)),
                 Some(e) if e.state == LeaseState::Unleased => Some((e.last_written, s)),
                 Some(_) => None,
@@ -654,14 +872,6 @@ impl SlotLeaseTable {
             self.offers.load(Ordering::Relaxed),
             self.offers_expired.load(Ordering::Relaxed),
         )
-    }
-
-    /// Slots in a leased state.
-    pub fn leased_count(&self) -> usize {
-        self.lock()
-            .values()
-            .filter(|e| e.state != LeaseState::Unleased)
-            .count()
     }
 }
 
@@ -857,25 +1067,6 @@ impl DominanceWindow {
         }
     }
 
-    /// `ops_q` of `requester` on `slot` over the common window.
-    pub fn requester_ops(
-        &self,
-        slot: Slot,
-        requester: RequesterId,
-        now_ns: u64,
-        t_idle_ns: u64,
-    ) -> u64 {
-        let mut m = self.lock();
-        let Some(e) = m.get_mut(&slot) else {
-            return 0;
-        };
-        e.align(Self::epoch(now_ns, t_idle_ns));
-        e.requesters
-            .iter()
-            .find(|r| r.id == requester)
-            .map_or(0, |r| r.ops.total())
-    }
-
     /// Forget `slot` (released / handed over).
     pub fn forget(&self, slot: Slot) {
         self.lock().remove(&slot);
@@ -1018,16 +1209,36 @@ mod tests {
         assert_eq!(g.leased_count(), 1);
     }
 
+    /// The door's Dekker pair: a token taken before `Releasing` is seen
+    /// by the release; a door that reads `Releasing` takes no token.
+    #[test]
+    fn door_tokens_pair_with_the_release() {
+        let g = LeaseGate::with_namespace(8);
+        g.arm();
+        g.grant(3);
+        assert!(g.enter(3));
+        assert!(g.enter(3));
+        assert_eq!(g.inflight(3), 2);
+        g.begin_release(3);
+        assert!(!g.enter(3), "a releasing slot refuses at the door");
+        assert_eq!(g.inflight(3), 2, "a refused door leaves no token");
+        assert_eq!(g.leave(3), 1);
+        assert_eq!(g.leave(3), 0);
+        g.end_release(3);
+        assert!(g.enter(3));
+        assert_eq!(g.leave(3), 0);
+    }
+
     #[test]
     fn table_state_machine() {
         let t = SlotLeaseTable::new();
         assert!(matches!(
-            t.acquire(7, 1, 0),
+            t.acquire(7, 1, 0, false),
             AcquireOutcome::Granted { g: 1, .. }
         ));
-        assert_eq!(t.acquire(7, 1, 0), AcquireOutcome::Already { g: 1 });
+        assert_eq!(t.acquire(7, 1, 0, false), AcquireOutcome::Already { g: 1 });
         assert_eq!(
-            t.acquire(7, 2, 0),
+            t.acquire(7, 2, 0, false),
             AcquireOutcome::Refused { holder: 1, g: 1 }
         );
         assert_eq!(
@@ -1036,16 +1247,16 @@ mod tests {
         );
         t.offer(7, 1, 2, 100).unwrap();
         assert_eq!(
-            t.acquire(7, 3, 50),
+            t.acquire(7, 3, 50, false),
             AcquireOutcome::Refused { holder: 1, g: 1 }
         );
         assert_eq!(
-            t.acquire(7, 2, 50),
+            t.acquire(7, 2, 50, false),
             AcquireOutcome::Recall { holder: 1, g: 1 }
         );
         assert_eq!(t.begin_release(7, 1), Ok(1));
         assert_eq!(
-            t.acquire(7, 2, 50),
+            t.acquire(7, 2, 50, false),
             AcquireOutcome::Refused { holder: 1, g: 1 }
         );
         let words = SlotWords {
@@ -1060,16 +1271,34 @@ mod tests {
         );
         assert_eq!(t.release(7, 1, 1, words, 9), ReleaseOutcome::Released);
         assert_eq!(t.release(7, 1, 1, words, 9), ReleaseOutcome::Already);
-        assert_eq!(t.acquire(7, 2, 60), AcquireOutcome::Granted { g: 2, words });
+        assert_eq!(
+            t.acquire(7, 2, 60, true),
+            AcquireOutcome::Granted { g: 2, words }
+        );
         assert_eq!(t.resolve(7), Resolved::Holder { holder: 2, g: 2 });
         assert_eq!(t.held_by(2), vec![7]);
+        assert_eq!(t.held_by(1), Vec::<Slot>::new());
+        assert_eq!(t.rotor_held_by(2), 1);
+        assert_eq!(t.leased_entries(), vec![(7, 2, 2)]);
         // An offer that lapses under the requester's acquire.
         t.offer(7, 2, 5, 70).unwrap();
         assert_eq!(
-            t.acquire(7, 5, 70),
+            t.acquire(7, 5, 70, false),
             AcquireOutcome::Refused { holder: 2, g: 2 }
         );
         assert_eq!(t.offer_counts(), (2, 1));
+        assert!(
+            t.offered_to(5).is_empty(),
+            "a lapsed offer leaves the index"
+        );
+        // The offer index answers the carriage; a release clears both.
+        t.offer(7, 2, 6, 200).unwrap();
+        assert_eq!(t.offered_to(6), vec![(7, 2)]);
+        assert_eq!(t.begin_release(7, 2), Ok(2));
+        assert_eq!(t.release(7, 2, 2, words, 11), ReleaseOutcome::Released);
+        assert!(t.offered_to(6).is_empty());
+        assert!(t.leased_entries().is_empty());
+        assert_eq!(t.rotor_held_by(2), 0);
     }
 
     #[test]
@@ -1108,9 +1337,10 @@ mod tests {
             w.note_ship(2, 7, h.total(40, t), 40, t, 2),
             ShipVerdict::OfferDominated { to: 7 }
         );
-        // The window rotates: two half-windows later the counts are gone.
-        assert_eq!(w.requester_ops(2, 7, 40 + 2 * t, t), 0);
+        // The window rotates: two half-windows later the counts are gone
+        // — the requester starts over (one ship is far below the floor).
         assert_eq!(h.total(40 + 2 * t, t), 0);
+        assert_eq!(w.note_ship(2, 7, 0, 40 + 2 * t, t, 2), ShipVerdict::Serve);
         // One half-window later the previous bucket still counts.
         let h2 = HolderOps::new();
         h2.note(0, t);

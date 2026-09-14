@@ -13717,8 +13717,21 @@ impl SqueezefsFilesystem {
                 // divisibility law read live; `affinity_mints + rotor_mints
                 // (+ dir_gather_mints, PR 7) ≡ mints`; `slot_offer_n_floor`
                 // is the handover's own cost in ships (derived).
+                // The snapshot is built ONCE per volume per stats read
+                // (its percentile sorts included) and every gauge indexes
+                // it (review round 2, Issue 17).
+                let lease_snapshots: Vec<Option<meta_kv::slot_lease::SlotLeaseStats>> = self
+                    .meta_backend
+                    .as_ref()
+                    .map(|mb| mb.volumes.iter().map(|be| be.slot_lease_stats()).collect())
+                    .unwrap_or_default();
                 let lease = |f: &dyn Fn(&meta_kv::slot_lease::SlotLeaseStats) -> u64| {
-                    per_volume(&|be| be.slot_lease_stats().map_or(0, |s| f(&s)))
+                    serde_json::Value::Array(
+                        lease_snapshots
+                            .iter()
+                            .map(|s| s.as_ref().map_or(0, f).into())
+                            .collect(),
+                    )
                 };
                 metrics.insert(
                     "symmetric_meta".into(),
@@ -13738,38 +13751,28 @@ impl SqueezefsFilesystem {
                 metrics.insert("slot_handovers".into(), lease(&|s| s.handovers));
                 metrics.insert(
                     "slot_handover_phase_ns".into(),
-                    self.meta_backend
-                        .as_ref()
-                        .map(|mb| {
-                            serde_json::Value::Array(
-                                mb.volumes
-                                    .iter()
-                                    .map(|v| {
-                                        let [flush, page, tree0, grant, total] = v
-                                            .slot_lease_stats()
-                                            .map_or([0; 5], |s| s.handover_phase_ns);
-                                        serde_json::json!({
-                                            "flush": flush,
-                                            "page": page,
-                                            "tree0": tree0,
-                                            "grant": grant,
-                                            "total": total,
-                                        })
-                                    })
-                                    .collect(),
-                            )
-                        })
-                        .unwrap_or_default(),
+                    serde_json::Value::Array(
+                        lease_snapshots
+                            .iter()
+                            .map(|s| {
+                                let [flush, page, tree0, grant, total] =
+                                    s.as_ref().map_or([0; 5], |s| s.handover_phase_ns);
+                                serde_json::json!({
+                                    "flush": flush,
+                                    "page": page,
+                                    "tree0": tree0,
+                                    "grant": grant,
+                                    "total": total,
+                                })
+                            })
+                            .collect(),
+                    ),
                 );
                 metrics.insert("slot_ships".into(), lease(&|s| s.ships));
                 metrics.insert("slot_lru_releases".into(), lease(&|s| s.lru_releases));
                 metrics.insert("slot_forced_shrinks".into(), lease(&|s| s.forced_shrinks));
                 metrics.insert("slot_lease_conflicts".into(), lease(&|s| s.conflicts));
                 metrics.insert("slot_resolve_rpcs".into(), lease(&|s| s.resolve_rpcs));
-                metrics.insert(
-                    "slot_resolve_redirects".into(),
-                    lease(&|s| s.resolve_redirects),
-                );
                 metrics.insert("slot_tree_inos_p50".into(), lease(&|s| s.tree_inos_p50));
                 metrics.insert("slot_tree_inos_p99".into(), lease(&|s| s.tree_inos_p99));
                 metrics.insert("slot_tree_inos_max".into(), lease(&|s| s.tree_inos_max));
@@ -13793,6 +13796,23 @@ impl SqueezefsFilesystem {
                     "slot_lease_stale_entries".into(),
                     lease(&|s| s.stale_entries),
                 );
+                // The door's ledger (review round 2, Issue 6): parks are a
+                // legal wait for a bounded handover, refusals the "ship to
+                // the holder" class (0 on a solo mount — no foreign holder
+                // exists); with the legal manager outcomes on their own
+                // gauges (Issue 14), `manager_verb_refusals` counts witness
+                // contradictions ALONE.
+                metrics.insert("slot_door_parks".into(), lease(&|s| s.door_parks));
+                metrics.insert("slot_door_refusals".into(), lease(&|s| s.door_refusals));
+                metrics.insert(
+                    "slot_acquire_refusals".into(),
+                    lease(&|s| s.acquire_refusals),
+                );
+                metrics.insert(
+                    "slot_rotor_cap_refusals".into(),
+                    lease(&|s| s.rotor_cap_refusals),
+                );
+                metrics.insert("slot_offers_busy".into(), lease(&|s| s.offers_busy));
                 metrics.insert(
                     "meta_kv_leaf_lease_refusals".into(),
                     load(&meta_kv::META_KV_LEAF_LEASE_REFUSALS),

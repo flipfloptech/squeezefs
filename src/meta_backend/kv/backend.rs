@@ -366,6 +366,31 @@ pub static TEST_JOIN_HOLD_AFTER_PAGE: std::sync::atomic::AtomicBool =
 pub static TEST_HANDOVER_HOLD_AFTER_PAGE: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
+/// Test seam (review round 2, Issue 6's contract): PARK a handover after
+/// its page named the slot `Releasing` and before tree 0 is written —
+/// the window a commit on the departing holder is issued into. Released
+/// by [`test_handover_park_release`]; one relaxed load per handover.
+pub static TEST_HANDOVER_PARK_AFTER_PAGE: AtomicBool = AtomicBool::new(false);
+
+/// Handovers that PARKED on [`TEST_HANDOVER_PARK_AFTER_PAGE`] so far (the
+/// test-side barrier that the schedule formed).
+static TEST_HANDOVER_PARKED: AtomicU64 = AtomicU64::new(0);
+
+/// Handovers parked on [`TEST_HANDOVER_PARK_AFTER_PAGE`] so far.
+pub fn test_handover_parked() -> u64 {
+    TEST_HANDOVER_PARKED.load(Ordering::Acquire)
+}
+
+static TEST_HANDOVER_PARK_NOTIFY: once_cell::sync::Lazy<squeezefs_ipc::sqz_notify::Notify> =
+    once_cell::sync::Lazy::new(squeezefs_ipc::sqz_notify::Notify::new);
+
+/// Release every handover parked on [`TEST_HANDOVER_PARK_AFTER_PAGE`]
+/// (the flag is stored `false` first; the notify wakes the loop).
+pub fn test_handover_park_release() {
+    TEST_HANDOVER_PARK_AFTER_PAGE.store(false, Ordering::Relaxed);
+    TEST_HANDOVER_PARK_NOTIFY.notify_waiters();
+}
+
 /// Test seam (§5.3.4 row 6, PR 4): the holder DIES after the manager's
 /// tree-0 `Unleased` landed and before it dropped the slot from its page
 /// — page `Releasing` ∧ tree 0 `Unleased`: tree 0 wins, the entry is
@@ -1143,6 +1168,14 @@ pub struct KvMetaBackend {
     /// slot, so two in flight over one slot would both attest the release
     /// and the later one would be refused by tree 0's witness.
     handover: crate::sqz_sync::SqzMutex<()>,
+    /// The slot-lease cadence's single-flight latch (PR 4, review round
+    /// 2 Issue 6): the checkpoint task SPAWNS the cadence on its own task
+    /// instead of running it inline — a handover drains the commit door
+    /// (waits for admitted commits' terminal outcomes), and an admitted
+    /// commit parked at ring admission needs the TICK to free ring space,
+    /// so the tick must never wait behind a handover. One cadence run at
+    /// a time; a tick that finds one running skips.
+    slot_cadence_running: std::sync::atomic::AtomicBool,
     /// Last ledger seq written by a checkpoint (starts at the mounted
     /// record's seq).
     pub(super) checkpoint_seq: AtomicU64,
@@ -2677,6 +2710,7 @@ impl KvMetaBackend {
             smo,
             manager_verbs: crate::sqz_sync::SqzMutex::new(()),
             handover: crate::sqz_sync::SqzMutex::new(()),
+            slot_cadence_running: std::sync::atomic::AtomicBool::new(false),
             retire_seq,
             pending_reclaim: std::sync::Mutex::new(Vec::new()),
             barrier_starts: AtomicU64::new(0),
@@ -3041,6 +3075,11 @@ impl KvMetaBackend {
         // successor manager takes the native slot at `g + 1` (KD-SYM-2).
         // An uncovered region keeps its leases with its Live page.
         if let Some(plane) = set.slot_leases().cloned() {
+            // The leave IS a release: under the handover mutex, so a
+            // cadence handover in flight on its own task completes (or
+            // the leave takes the mutex first and the cadence finds the
+            // slot released) — never both on one slot.
+            let _handover = self.handover.lock().await;
             for region in set.regions.iter().filter(|r| !uncovered(r)) {
                 if region.released.load(Ordering::Acquire) {
                     continue;
@@ -3202,19 +3241,28 @@ impl KvMetaBackend {
     /// Every NON-NATIVE forest slot this volume hosts, ascending — the
     /// rotor's candidate set (a volume with no membership stamp hosts the
     /// whole width).
-    fn hosted_rotor_candidates(&self) -> Vec<super::record::ForestSlot> {
+    fn hosted_rotor_candidates(&self) -> Box<dyn Iterator<Item = super::record::ForestSlot> + '_> {
         let native = self.appenders.as_ref().map_or(0, |a| a.native_slot);
-        match self.membership_stamp.lock().unwrap().as_ref() {
-            Some(stamp) => stamp
-                .slots_hosted
-                .iter()
-                .filter(|r| *r != native)
-                .map(super::record::guest_forest_slot)
-                .collect(),
-            None => (0..=u16::MAX)
-                .filter(|r| *r != native)
-                .map(super::record::guest_forest_slot)
-                .collect(),
+        // A stamped volume's hosted set (cloned — small on a fleet volume);
+        // an unstamped one hosts the whole width, walked LAZILY (Issue 15:
+        // never a 65,536-entry vector per grant).
+        let hosted: Option<Vec<u16>> = self
+            .membership_stamp
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .map(|stamp| stamp.slots_hosted.iter().collect());
+        match hosted {
+            Some(v) => Box::new(
+                v.into_iter()
+                    .filter(move |r| *r != native)
+                    .map(super::record::guest_forest_slot),
+            ),
+            None => Box::new(
+                (0..=u16::MAX)
+                    .filter(move |r| *r != native)
+                    .map(super::record::guest_forest_slot),
+            ),
         }
     }
 
@@ -3298,10 +3346,9 @@ impl KvMetaBackend {
         &self,
         plane: &super::slot_lease::SlotLeasePlane,
     ) -> std::result::Result<(), KvError> {
-        let Some(forest) = self.forest() else {
+        let Some(control) = self.forest_control_tree() else {
             return Ok(());
         };
-        let control = Arc::clone(forest.control());
         let (mut cursor, end) = super::slot_state::slot_state_key_range();
         loop {
             let page = control.range(&cursor, &end, 512).await?;
@@ -3398,12 +3445,17 @@ impl KvMetaBackend {
             if r.id == 0 && !readopted.is_empty() {
                 readopted.sort_unstable();
                 readopted.truncate(m as usize);
-                plane.rotor.store(Arc::new(readopted));
+                plane.rotor_update(|rotor| *rotor = readopted);
             }
         }
         // KD-SYM-2: the manager's native slot.
-        self.manager_acquire_slots(0, 0, &[super::record::NATIVE_FOREST_SLOT])
-            .await?;
+        self.manager_acquire_slots(
+            0,
+            0,
+            &[super::record::NATIVE_FOREST_SLOT],
+            ControlAdmit::Try,
+        )
+        .await?;
         // The seam's declared slots for every declared region — a wish-list
         // reconciled against tree 0 (unleased or already the region's;
         // another appender's holding is left to it) — BEFORE the manager's
@@ -3431,25 +3483,30 @@ impl KvMetaBackend {
                 );
             }
             if !wanted.is_empty() {
-                self.manager_acquire_slots(r.id, 0, &wanted).await?;
+                self.manager_acquire_slots(r.id, 0, &wanted, ControlAdmit::Try)
+                    .await?;
             }
         }
         // The rotor: `M` slots for region 0.
         let rotor_now = plane.rotor.load().len() as u64;
         if rotor_now < m {
             let grants = self
-                .manager_acquire_slots(0, (m - rotor_now) as u16, &[])
+                .manager_acquire_slots(0, (m - rotor_now) as u16, &[], ControlAdmit::Try)
                 .await?;
-            let mut rotor = (**plane.rotor.load()).clone();
-            for g in grants {
-                if !rotor.contains(&g.slot) {
-                    rotor.push(g.slot);
+            plane.rotor_update(|rotor| {
+                for g in grants {
+                    if !rotor.contains(&g.slot) {
+                        rotor.push(g.slot);
+                    }
                 }
-            }
-            plane.rotor.store(Arc::new(rotor));
+            });
         }
         self.publish_slot_owners(set, plane);
         plane.refresh_holders();
+        // `N_floor`'s inputs from the mount's always-on EWMAs (§5.1.4's
+        // cold start — Issue 7): a handover is priced before the first
+        // one runs, a ship before the first one is served.
+        plane.seed_n_floor_inputs();
         plane.gate.arm();
         // The membership carriage (§5.9): every member's renewal grant
         // now names the slots it leases here.
@@ -3565,6 +3622,17 @@ impl KvMetaBackend {
                             l.g
                         )));
                     }
+                    // OUR surviving attestation names the tree's durable
+                    // extent count: the ledger is seeded from it, so the
+                    // re-adoption walks only a slot no entry names (review
+                    // round 2, Issue 17).
+                    if in_process.contains(appender_id)
+                        && l.holder == *appender_id
+                        && se.slot_tree_extents != 0
+                        && plane.extents.get(slot) == 0
+                    {
+                        plane.extents.set(slot, u64::from(se.slot_tree_extents));
+                    }
                 }
             }
         }
@@ -3643,18 +3711,23 @@ impl KvMetaBackend {
     ) {
         let in_process: std::collections::BTreeSet<u32> =
             set.regions.iter().map(|r| r.id).collect();
-        let foreign: std::collections::BTreeSet<u16> = plane
+        // The FOREIGN set off the holder index (O(leased)); this volume's
+        // contribution to the process table is MERGED with the other
+        // armed volumes' and S8's (review round 2, Issue 13 — the
+        // wholesale store clobbered them).
+        let foreign: Vec<u16> = plane
             .table
-            .snapshot()
+            .held_outside(&in_process)
             .into_iter()
-            .filter(|(_, l)| {
-                l.state != crate::slot_lease_core::LeaseState::Unleased
-                    && !in_process.contains(&l.holder)
-            })
-            .filter_map(|(s, _)| self.routing_slot_of_forest(s).ok())
+            .filter_map(|s| self.routing_slot_of_forest(s).ok())
             .collect();
-        let local: Vec<u16> = (0..=u16::MAX).filter(|s| !foreign.contains(s)).collect();
-        crate::dlm_slot::install_local_slots(Some(&local));
+        crate::dlm_slot::install_lease_foreign_slots(self.volume_uuid(), Some(&foreign));
+    }
+
+    /// This volume's superblock uuid as one word — the process-global
+    /// owner table's per-volume key.
+    fn volume_uuid(&self) -> u128 {
+        u128::from_le_bytes(self.sb.uuid)
     }
 
     /// Adopt a lease of `slot` for in-process region `region_id`: the
@@ -3724,6 +3797,11 @@ impl KvMetaBackend {
                 }
             }
         }
+        // Every record the slot may already carry in the region's ring
+        // (a re-adoption's replayed window, the grant's own control
+        // entry) sits below the head: the frontier a release must cover.
+        self.cache
+            .note_slot_record_frontier(slot, region.ring().core().head());
         region.add_lease(slot);
         plane.gate.grant(slot);
         Ok(())
@@ -3744,6 +3822,7 @@ impl KvMetaBackend {
         appender_id: u32,
         want: u16,
         explicit: &[super::record::ForestSlot],
+        admit: ControlAdmit,
     ) -> std::result::Result<Vec<SlotGrant>, KvError> {
         let set = self.manager_gate(false)?;
         let plane = Arc::clone(set.slot_leases().ok_or_else(|| {
@@ -3757,29 +3836,25 @@ impl KvMetaBackend {
         plane.acquires.fetch_add(1, Ordering::Relaxed);
         let now = crate::mono_core::monotonic_ns_u64();
         let m = plane.mint_slots();
-        let candidates: Vec<super::record::ForestSlot> = if explicit.is_empty() {
-            // The rotor bound counts the appender's NON-native leases (the
-            // native slot is KD-SYM-2's, never a rotor slot).
-            let held = plane
-                .table
-                .held_by(appender_id)
-                .into_iter()
-                .filter(|s| *s != super::record::NATIVE_FOREST_SLOT)
-                .count() as u64;
+        let rotor_ask = explicit.is_empty();
+        let candidates: Vec<super::record::ForestSlot> = if rotor_ask {
+            // The rotor cap counts the appender's ROTOR grants (review
+            // round 2, Issue 14 — never every non-native lease: the page
+            // budget governs holdings; the native slot is KD-SYM-2's).
+            let held = plane.table.rotor_held_by(appender_id);
             let want = if want == 0 { m } else { u64::from(want) };
             if held.saturating_add(want) > 2 * m {
-                set.verbs.refusals.fetch_add(1, Ordering::Relaxed);
-                return Err(KvError::Busy(format!(
-                    "{}: appender {appender_id} holds {held} slot(s) and asks {want} more — the \
-                     manager grants rotor slots up to 2 × M = {} (SQUEEZEFS_SYM_MINT_SLOTS; \
-                     design-symmetric-metadata §5.1.2)",
-                    self.path.display(),
-                    2 * m
-                )));
+                plane.rotor_cap_refusals.fetch_add(1, Ordering::Relaxed);
+                return Err(KvError::RotorAtCap {
+                    appender: appender_id,
+                    held,
+                    want,
+                    cap: 2 * m,
+                });
             }
             plane
                 .table
-                .pick_unleased(want as usize, self.hosted_rotor_candidates().into_iter())
+                .pick_unleased(want as usize, self.hosted_rotor_candidates())
         } else {
             explicit.to_vec()
         };
@@ -3789,7 +3864,7 @@ impl KvMetaBackend {
         let mut puts: Vec<(u8, Record)> = Vec::new();
         let tag = super::journal::tag_for(super::record::TREE_CONTROL, 0);
         for slot in candidates {
-            match plane.table.acquire(slot, appender_id, now) {
+            match plane.table.acquire(slot, appender_id, now, rotor_ask) {
                 crate::slot_lease_core::AcquireOutcome::Granted { g, words } => {
                     let value = super::slot_state::SlotState::Leased {
                         appender_id,
@@ -3827,28 +3902,32 @@ impl KvMetaBackend {
                 }
                 crate::slot_lease_core::AcquireOutcome::Refused { holder, g }
                 | crate::slot_lease_core::AcquireOutcome::Recall { holder, g } => {
-                    if !explicit.is_empty() {
-                        // Roll back the grants of this call that were
-                        // not yet written: the RAM table must not run
-                        // ahead of tree 0.
+                    if !rotor_ask {
+                        // Roll back the grants of this call that were not
+                        // yet written: the RAM table must not run ahead
+                        // of tree 0. The rolled-back entry keeps the `g`
+                        // the grant minted (one ahead of tree 0's) and
+                        // `last_written = 0` — harmless by construction:
+                        // `g` only ever needs to be strictly monotone per
+                        // slot (the next grant mints above it), and a
+                        // never-written rank puts the slot first for
+                        // `prefer: unleased-then-idle`, which is where a
+                        // slot nobody wrote belongs (Issue 18).
                         for s in &fresh {
+                            let l = plane.table.get(*s);
                             let _ = plane.table.release(
                                 *s,
                                 appender_id,
-                                plane.table.get(*s).map_or(0, |l| l.g),
-                                plane
-                                    .table
-                                    .get(*s)
-                                    .map_or_else(Default::default, |l| l.words),
+                                l.map_or(0, |l| l.g),
+                                l.map_or_else(Default::default, |l| l.words),
                                 0,
                             );
                         }
-                        set.verbs.refusals.fetch_add(1, Ordering::Relaxed);
-                        return Err(KvError::Busy(format!(
-                            "{}: slot {slot} is leased by appender {holder} (g {g}) — ship to the \
-                             holder (design-symmetric-metadata §5.1.4)",
-                            self.path.display()
-                        )));
+                        // The "ship to the holder" answer — §5.1.4's
+                        // normal reply, never a witness contradiction
+                        // (Issue 14: its own gauge).
+                        plane.acquire_refusals.fetch_add(1, Ordering::Relaxed);
+                        return Err(KvError::SlotBusy { slot, holder, g });
                     }
                 }
             }
@@ -3882,7 +3961,7 @@ impl KvMetaBackend {
                     ));
                 }
             }
-            if let Err(e) = self.write_control_entry(puts).await {
+            if let Err(e) = self.write_control_entry(puts, admit).await {
                 for s in &fresh {
                     let l = plane.table.get(*s);
                     let _ = plane.table.release(
@@ -3907,14 +3986,24 @@ impl KvMetaBackend {
                 self.install_lease(set, &plane, appender_id, g.slot, g.words, !g.already)
                     .await?;
             }
+            if !g.already {
+                // The holder cache learns the grant (one entry, never a
+                // wholesale rebuild per grant — Issue 9/17).
+                plane.holders.learn(
+                    g.slot,
+                    crate::slot_holder_cache::SlotHolder {
+                        appender_id,
+                        g: g.g,
+                    },
+                );
+            }
         }
         if set.region(appender_id).is_none() && !fresh.is_empty() {
             self.write_wire_joiner_page_slots(appender_id, &plane)
                 .await?;
-        }
-        if !fresh.is_empty() {
+            // A wire appender's grant makes the slots foreign to the S4
+            // plane (an in-process region's leaves the table untouched).
             self.publish_slot_owners(set, &plane);
-            plane.refresh_holders();
         }
         Ok(grants)
     }
@@ -3970,7 +4059,9 @@ impl KvMetaBackend {
         appender_id: u32,
         want: u16,
     ) -> std::result::Result<(Vec<crate::meta_ship::manager::WireSlotGrant>, bool), KvError> {
-        let grants = self.manager_acquire_slots(appender_id, want, &[]).await?;
+        let grants = self
+            .manager_acquire_slots(appender_id, want, &[], ControlAdmit::Try)
+            .await?;
         let already = !grants.is_empty() && grants.iter().all(|g| g.already);
         let mut out = Vec::with_capacity(grants.len());
         for g in grants {
@@ -4036,13 +4127,28 @@ impl KvMetaBackend {
                         g: lease.g,
                     });
                 }
+                // The release AND the grant under the one handover mutex:
+                // a door parked on the slot wakes only once the requester
+                // holds it, so it reads the requester as the holder
+                // (`SlotBusy`) — never a first-touch re-acquire by the
+                // departing holder in the window between the two.
                 let t0 = std::time::Instant::now();
-                self.release_slot_handover(lease.holder, slot).await?;
-                let t_grant = std::time::Instant::now();
-                let g = self.grant_one_slot(appender_id, slot).await?;
-                let grant_ns = t_grant.elapsed().as_nanos() as u64;
-                plane.phases.grant_ns.fetch_add(grant_ns, Ordering::Relaxed);
-                plane.phases.total_ns.fetch_add(grant_ns, Ordering::Relaxed);
+                let out = {
+                    let _handover = self.handover.lock().await;
+                    match self.release_slot_handover_locked(lease.holder, slot).await {
+                        Ok(()) => {
+                            let t_grant = std::time::Instant::now();
+                            let g = self.grant_one_slot(appender_id, slot).await;
+                            let grant_ns = t_grant.elapsed().as_nanos() as u64;
+                            plane.phases.grant_ns.fetch_add(grant_ns, Ordering::Relaxed);
+                            plane.phases.total_ns.fetch_add(grant_ns, Ordering::Relaxed);
+                            g
+                        }
+                        Err(e) => Err(e),
+                    }
+                };
+                plane.handover_done.notify_waiters();
+                let g = out?;
                 plane.handovers.fetch_add(1, Ordering::Relaxed);
                 plane.fold_handover_ns(t0.elapsed().as_nanos() as u64);
                 plane.note_handover(slot, crate::mono_core::monotonic_ns_u64());
@@ -4068,7 +4174,9 @@ impl KvMetaBackend {
         appender_id: u32,
         slot: super::record::ForestSlot,
     ) -> std::result::Result<SlotGrant, KvError> {
-        let mut grants = self.manager_acquire_slots(appender_id, 0, &[slot]).await?;
+        let mut grants = self
+            .manager_acquire_slots(appender_id, 0, &[slot], ControlAdmit::Try)
+            .await?;
         grants.pop().ok_or_else(|| {
             KvError::Corrupt(format!(
                 "{}: AcquireSlot {slot} answered no grant",
@@ -4122,7 +4230,18 @@ impl KvMetaBackend {
             .table
             .offer(slot, appender_id, to, expires)
             .map_err(|e| {
-                set.verbs.refusals.fetch_add(1, Ordering::Relaxed);
+                // A transition already in flight (a second dominating
+                // ship before the accept, a recall) is the LEGAL busy
+                // class (`slot_offers_busy`); only a caller that is not
+                // the holder contradicts the witness (Issue 14).
+                match e {
+                    crate::slot_lease_core::LeaseRefusal::Busy { .. } => {
+                        plane.offers_busy.fetch_add(1, Ordering::Relaxed);
+                    }
+                    _ => {
+                        set.verbs.refusals.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
                 KvError::Busy(format!(
                     "{}: OfferSlot {slot} by appender {appender_id} refused: {e:?}",
                     self.path.display()
@@ -4213,11 +4332,12 @@ impl KvMetaBackend {
         // rewritten without them in the SAME entry, bits untouched.
         let (rewrite, leaving) = self.grant_record_minus_images(appender_id, &[slot]).await?;
         recs.extend(rewrite);
-        self.write_control_entry(recs).await?;
+        self.write_control_entry(recs, ControlAdmit::Try).await?;
         if let Some(r) = set.region(appender_id).filter(|_| !leaving.is_empty()) {
             r.grant().transfer_out(&leaving);
         }
         plane.clear_recall(appender_id, slot);
+        plane.holders.forget(slot);
         match plane
             .table
             .release(slot, appender_id, g, words, last_written)
@@ -4251,9 +4371,10 @@ impl KvMetaBackend {
         if set.region(appender_id).is_none() {
             self.write_wire_joiner_page_slots(appender_id, &plane)
                 .await?;
+            // A wire appender's release returns the slot to the S4
+            // plane's local set (an in-process region's changes nothing).
+            self.publish_slot_owners(set, &plane);
         }
-        self.publish_slot_owners(set, &plane);
-        plane.refresh_holders();
         Ok(false)
     }
 
@@ -4290,6 +4411,10 @@ impl KvMetaBackend {
                 self.path.display()
             ))
         })?;
+        // The served verb IS the stale-view fallback's round trip
+        // (`slot_resolve_rpcs` — never `dlm_rpcs`, which keeps its S4
+        // meaning); a mount whose holder cache is warm never issues one.
+        plane.resolve_rpcs.fetch_add(1, Ordering::Relaxed);
         Ok(plane.table.resolve(slot))
     }
 
@@ -4311,12 +4436,14 @@ impl KvMetaBackend {
 
     /// The `(leaf addr, log tail)` of every leaf `tree` reaches — what a
     /// release records for PR 5's frame screen (§5.8.2).
+    /// COMPLETE over the tree (review round 2, Issue 12): a leaf the node
+    /// cache evicted since its flush — or never loaded, a re-adopted
+    /// tree's — is paged in for its tail; the record's consumer reads
+    /// every leaf, never a cached subset.
     async fn leaf_tails(&self, tree: &KvTree) -> std::result::Result<Vec<(u64, u32)>, KvError> {
         let mut out = Vec::new();
         for addr in tree.reachable_node_addrs().await? {
-            let Some(node) = self.cache.try_get(addr) else {
-                continue;
-            };
+            let node = self.cache.get(addr).await?;
             if node.level() != 0 {
                 continue;
             }
@@ -4365,15 +4492,117 @@ impl KvMetaBackend {
         entries
     }
 
+    /// The slots of `region` its page CANNOT name — the leases past
+    /// `SLOT_PAGE_BUDGET` in the page's own order (`lease_page_entries`
+    /// sorts by page slot and truncates); their roots ride tree 0 (the
+    /// page-budget overflow law, `publish_forest_roots`).
+    fn region_page_overflow(
+        set: &super::appender::AppenderSet,
+        region: &super::appender::AppenderRegion,
+    ) -> Vec<super::record::ForestSlot> {
+        let leases = region.leases();
+        if leases.len() <= super::appender::SLOT_PAGE_BUDGET {
+            return Vec::new();
+        }
+        let mut by_page: Vec<(u16, super::record::ForestSlot)> = leases
+            .iter()
+            .filter_map(|s| {
+                super::appender::page_slot_of_forest_slot(*s, set.native_slot)
+                    .ok()
+                    .map(|p| (p, *s))
+            })
+            .collect();
+        by_page.sort_unstable();
+        by_page
+            .into_iter()
+            .skip(super::appender::SLOT_PAGE_BUDGET)
+            .map(|(_, s)| s)
+            .collect()
+    }
+
     /// **Flush-then-transfer** (KD-SYM-4, §5.1.4) of `slot` held by
-    /// in-process region `region_id`, in the exact order: `Releasing`
-    /// raised on the gate (no new commit lands) → flush every dirty leaf
-    /// + barrier (`checkpoint_now`) → the page with the slot in
+    /// in-process region `region_id` — the public face: one handover at a
+    /// time per volume (the `handover` mutex), the door's parkers woken
+    /// when it completes or aborts. The accept path runs the same body
+    /// under its own hold of the mutex so the requester's grant lands
+    /// before any parker re-reads the slot.
+    pub async fn release_slot_handover(
+        &self,
+        region_id: u32,
+        slot: super::record::ForestSlot,
+    ) -> std::result::Result<(), KvError> {
+        let out = {
+            // One handover at a time per volume: a concurrent release of
+            // the same slot (the cadence against an accepted offer) finds
+            // it already released and is refused here, never at tree 0's
+            // witness.
+            let _handover = self.handover.lock().await;
+            self.release_slot_handover_locked(region_id, slot).await
+        };
+        if let Some(plane) = self.slot_leases() {
+            plane.handover_done.notify_waiters();
+        }
+        out
+    }
+
+    /// Cycle the volume's checkpoint until region `region`'s durable tail
+    /// covers every record of `slot` (its record frontier — the door is
+    /// closed and drained, so only the flush pass's own SMOs on the tree
+    /// can add to it, and each of those raises the frontier the next
+    /// cycle must pass) AND the tree's root is published (its floor
+    /// lifted). The `checkpoint_past_region` discipline (review round 2,
+    /// Issue 11): a post-condition, not a fixed cycle count — bounded,
+    /// loud on a stuck tail. `slot_handover_phase_ns.flush` then measures
+    /// what the clearing costs.
+    async fn flush_slot_clear_of_region(
+        &self,
+        region: &super::appender::AppenderRegion,
+        slot: super::record::ForestSlot,
+    ) -> std::result::Result<(), KvError> {
+        const HANDOVER_FLUSH_CYCLES_MAX: u32 = 64;
+        for cycle in 1..=HANDOVER_FLUSH_CYCLES_MAX {
+            self.checkpoint_now().await?;
+            if let Some(forest) = self.forest() {
+                if let Some(tree) = forest.tree(slot) {
+                    forest.note_page_published(slot, tree.root());
+                }
+            }
+            let tail = region.ring().core().reusable_upto();
+            let frontier = self.cache.slot_record_frontier(slot);
+            let root_unpublished = self.unpublished_root_floors().contains_key(&slot);
+            if tail >= frontier && !root_unpublished {
+                if cycle > 2 {
+                    log::info!(
+                        "meta volume {}: slot {slot}'s records cleared from appender {}'s window \
+                         after {cycle} checkpoint cycles (frontier {frontier}, tail {tail})",
+                        self.path.display(),
+                        region.id
+                    );
+                }
+                return Ok(());
+            }
+        }
+        Err(KvError::Corrupt(format!(
+            "{}: slot {slot}'s records did not clear appender {}'s window in \
+             {HANDOVER_FLUSH_CYCLES_MAX} checkpoint cycles (frontier {}, tail {}) — a stuck \
+             tail is a defect, never a longer wait",
+            self.path.display(),
+            region.id,
+            self.cache.slot_record_frontier(slot),
+            region.ring().core().reusable_upto()
+        )))
+    }
+
+    /// The handover body, under the caller's hold of `handover`, in the
+    /// exact order: `Releasing` raised on the gate (no new commit passes
+    /// the door) → the door DRAINED (every admitted commit of the slot at
+    /// its terminal outcome — Issue 6) → flush cycles until the region's
+    /// window is clear of the slot (Issue 11) → the page with the slot in
     /// `Releasing { root, cursor, g }` + barrier → `ReleaseSlot` (tree 0
     /// `Unleased`, one tx, barriered) → the page without the slot. Two
     /// durable homes at every instant; `slot_handover_phase_ns` records
     /// `flush / page / tree0`.
-    pub async fn release_slot_handover(
+    async fn release_slot_handover_locked(
         &self,
         region_id: u32,
         slot: super::record::ForestSlot,
@@ -4398,12 +4627,10 @@ impl KvMetaBackend {
                 self.path.display()
             )));
         }
-        // One handover at a time per volume: a concurrent release of the
-        // same slot (the cadence against an accepted offer) finds it
-        // already released and is refused here, never at tree 0's witness.
-        let _handover = self.handover.lock().await;
-        // 1. Releasing FIRST: the gate stops new commits before the flush
-        // takes any node lock (the loom-pinned order).
+        // 1. Releasing FIRST: the gate stops new commits at the door
+        // before the flush takes any node lock (the loom-pinned order),
+        // then the door is drained — the release's half of the Dekker
+        // pair with `LeaseGate::enter`.
         let g = match plane.table.get(slot) {
             Some(l)
                 if l.holder == region_id
@@ -4434,35 +4661,27 @@ impl KvMetaBackend {
                 )));
             }
         };
+        let abort = |e: KvError| {
+            plane.table.abort_release(slot, region_id);
+            plane.gate.end_release(slot);
+            e
+        };
         let t_flush = std::time::Instant::now();
-        // 2. Flush + barrier: one checkpoint cycle covers every dirty leaf
-        // of the tree (and the rest of the mount's — bounded by the same
-        // ceiling's dirty set). Its root moved in that cycle, so its
-        // floor clamped the region's tail; the root is published (the
-        // page of the cycle named it) and a SECOND cycle carries the tail
-        // past the slot's records — the departing ring's window is
-        // flushed CLEAR of the slot before any other home says it moved
-        // (KD-SYM-4's one ring per key; the `Lease` detector at the next
-        // open judges the window by tree 0's lessee).
-        if let Err(e) = self.checkpoint_now().await {
-            plane.table.abort_release(slot, region_id);
-            plane.gate.end_release(slot);
-            return Err(e);
-        }
-        if let Some(forest) = self.forest() {
-            if let Some(tree) = forest.tree(slot) {
-                forest.note_page_published(slot, tree.root());
-            }
-        }
-        if let Err(e) = self.checkpoint_now().await {
-            plane.table.abort_release(slot, region_id);
-            plane.gate.end_release(slot);
-            return Err(e);
+        self.drain_door(&plane, slot).await;
+        // 2. Flush until the departing ring's window is CLEAR of the slot
+        // before any other home says it moved (KD-SYM-4's one ring per
+        // key; the `Lease` detector at the next open judges the window by
+        // tree 0's lessee).
+        if let Err(e) = self.flush_slot_clear_of_region(region, slot).await {
+            return Err(abort(e));
         }
         let flush_ns = t_flush.elapsed().as_nanos() as u64;
         let words = self.slot_words_now(&plane, slot);
         let tails = match self.forest().and_then(|f| f.tree(slot)) {
-            Some(t) => self.leaf_tails(&t).await?,
+            Some(t) => match self.leaf_tails(&t).await {
+                Ok(t) => t,
+                Err(e) => return Err(abort(e)),
+            },
             None => Vec::new(),
         };
         // 3. The page: the slot in `Releasing` with its final words.
@@ -4482,15 +4701,26 @@ impl KvMetaBackend {
                 self.path.display()
             )));
         }
+        // Test seam: PARK here (the page names the slot Releasing, tree 0
+        // does not yet) until released — the window the door contract
+        // issues its commits into.
+        if TEST_HANDOVER_PARK_AFTER_PAGE.load(Ordering::Relaxed) {
+            TEST_HANDOVER_PARKED.fetch_add(1, Ordering::AcqRel);
+            while TEST_HANDOVER_PARK_AFTER_PAGE.load(Ordering::Relaxed) {
+                let notified = TEST_HANDOVER_PARK_NOTIFY.notified();
+                if !TEST_HANDOVER_PARK_AFTER_PAGE.load(Ordering::Relaxed) {
+                    break;
+                }
+                notified.await;
+            }
+        }
         // 4. Tree 0: Unleased { root, cursor, g, extents, tails } — one tx.
         let t_tree0 = std::time::Instant::now();
         if let Err(e) = self
             .manager_release_slot(region_id, slot, words, g, tails)
             .await
         {
-            plane.table.abort_release(slot, region_id);
-            plane.gate.end_release(slot);
-            return Err(e);
+            return Err(abort(e));
         }
         let tree0_ns = t_tree0.elapsed().as_nanos() as u64;
         if TEST_HANDOVER_HOLD_AFTER_TREE0.load(Ordering::Relaxed) {
@@ -4501,16 +4731,13 @@ impl KvMetaBackend {
             )));
         }
         // 5. Drop the slot: RAM first (the region no longer journals it),
-        // then the page without it.
+        // then the page without it. The lease set's and the rotor's RMWs
+        // run under their one-writer mutexes (Issue 5).
         region.drop_lease(slot);
         plane.gate.revoke(slot);
         plane.dominance.forget(slot);
         plane.extents.forget(slot);
-        {
-            let mut rotor = (**plane.rotor.load()).clone();
-            rotor.retain(|s| *s != slot);
-            plane.rotor.store(Arc::new(rotor));
-        }
+        plane.rotor_update(|rotor| rotor.retain(|s| *s != slot));
         if let Ok(r) = self.routing_slot_of_forest(slot) {
             if slot != super::record::NATIVE_FOREST_SLOT {
                 self.remove_guest_cursor(r);
@@ -4544,10 +4771,18 @@ impl KvMetaBackend {
     /// on every other ship, on an unarmed mount, and on a slot this
     /// mount does not hold. `requester` is the appender id of the
     /// shipping mount (the offer's `to`).
+    ///
+    /// `ship_ns` is the served ship's MEASURED wall (the S8 owner-side
+    /// `meta_ship_owner_phase_ns.total` of the frame that carried it —
+    /// the caller's clock; `0` = unmeasured, nothing folded): it feeds
+    /// `N_floor`'s ship-cost EWMA (review round 2, Issue 7 — before the
+    /// feed, `ewma_ship_ns` stayed 0 for the mount's life and one
+    /// handover made `N_floor` its wall in nanoseconds).
     pub async fn note_slot_ship(
         &self,
         slot: super::record::ForestSlot,
         requester: u32,
+        ship_ns: u64,
     ) -> crate::slot_lease_core::ShipVerdict {
         use crate::slot_lease_core::ShipVerdict;
         let Some(set) = self.appenders.as_ref() else {
@@ -4558,6 +4793,9 @@ impl KvMetaBackend {
         };
         if !plane.gate.is_leased(slot) {
             return ShipVerdict::Serve;
+        }
+        if ship_ns != 0 {
+            plane.fold_ship_ns(ship_ns);
         }
         let holder = set.region_of_slot(slot);
         plane.ships.fetch_add(1, Ordering::Relaxed);
@@ -4624,52 +4862,105 @@ impl KvMetaBackend {
         }
     }
 
-    /// **First-writer-takes-it at the commit** (§5.1.2): every slot a tx's
-    /// records name must be this mount's before the tx is queued. A slot
-    /// nobody leases is acquired here (one tree-0 write, the FIRST touch
-    /// of a slot with history after a remount); a slot another appender
-    /// leases refuses `EAGAIN`-class naming the holder — the ship to the
-    /// holder is the S8 verb path (the metanode arm, PR 6/12's). A
-    /// no-op on an unarmed mount (one `Option` test).
-    async fn ensure_leases_for_tx(&self, tx: &KvTx) -> std::result::Result<(), KvError> {
-        let Some(plane) = self.slot_leases() else {
-            return Ok(());
+    /// **The commit door** (§5.1.2 first-writer-takes-it + §5.4.1's
+    /// door law; review round 2, Issue 6): every slot a tx's records name
+    /// must be this mount's before the tx is queued, and the tx holds a
+    /// door TOKEN per slot ([`LeaseGate::enter`]) until its terminal
+    /// outcome — a release drains them before its flush, so the belt in
+    /// `apply_locked` is reached by no legal schedule. A slot mid-
+    /// handover PARKS here until the handover completes (bounded,
+    /// serialized per volume; `slot_door_parks`) and is re-read; a slot
+    /// another appender leases refuses [`KvError::SlotBusy`] (EAGAIN —
+    /// the ship to the holder is the S8 verb path, PR 6/12's;
+    /// `slot_door_refusals`); a slot nobody leases is acquired here (one
+    /// tree-0 write with a PARKING ring admission, like the user commit it
+    /// is — Issue 15). A no-op on an unarmed mount (one `Option` test).
+    async fn ensure_leases_for_tx(
+        &self,
+        tx: &KvTx,
+    ) -> std::result::Result<Option<super::slot_lease::DoorPass>, KvError> {
+        let Some(plane) = self.slot_leases().cloned() else {
+            return Ok(None);
         };
         let Some(set) = self.appenders.as_ref() else {
-            return Ok(());
+            return Ok(None);
         };
-        let mut missing: Vec<super::record::ForestSlot> = Vec::new();
+        let mut slots: Vec<super::record::ForestSlot> = Vec::new();
         for (kind, key, _, _) in &tx.staged {
             if !super::record::is_slot_tree_kind(*kind) {
                 continue;
             }
             let slot = super::record::legacy_key_slot(*kind, key)?;
-            if plane.gate.is_leased(slot) || missing.contains(&slot) {
-                continue;
-            }
-            missing.push(slot);
-        }
-        for slot in missing {
-            match plane.table.resolve(slot) {
-                crate::slot_lease_core::Resolved::Holder { holder, g }
-                    if set.region(holder).is_none() =>
-                {
-                    return Err(KvError::Busy(format!(
-                        "{}: slot {slot} is leased by appender {holder} (g {g}) — a mutation of \
-                         a foreign slot ships to its holder (design-symmetric-metadata §5.1.4, \
-                         the metanode arm; PR 6/12)",
-                        self.path.display()
-                    )));
-                }
-                _ => {
-                    // Unleased, or ours in tree 0 without the gate bit (a
-                    // window between the arm and the install): acquire
-                    // for region 0 — first-writer-takes-it.
-                    self.manager_acquire_slots(0, 0, &[slot]).await?;
-                }
+            if !slots.contains(&slot) {
+                slots.push(slot);
             }
         }
-        Ok(())
+        if slots.is_empty() {
+            return Ok(None);
+        }
+        let mut entered: Vec<super::record::ForestSlot> = Vec::with_capacity(slots.len());
+        for slot in slots {
+            loop {
+                if plane.gate.is_leased(slot) {
+                    // Ours (possibly mid-handover): the token BEFORE the
+                    // releasing read — the door's half of the Dekker pair.
+                    if plane.gate.enter(slot) {
+                        entered.push(slot);
+                        break;
+                    }
+                    // Mid-handover: park until it completes or aborts,
+                    // then re-read (register-recheck-await).
+                    let done = plane.handover_done.notified();
+                    if !plane.gate.is_releasing(slot) {
+                        continue;
+                    }
+                    plane.door_parks.fetch_add(1, Ordering::Relaxed);
+                    done.await;
+                    continue;
+                }
+                match plane.table.resolve(slot) {
+                    crate::slot_lease_core::Resolved::Holder { holder, g }
+                        if set.region(holder).is_none() =>
+                    {
+                        // The tokens taken so far return with the pass.
+                        drop(super::slot_lease::DoorPass::new(
+                            Arc::clone(&plane),
+                            std::mem::take(&mut entered),
+                        ));
+                        plane.door_refusals.fetch_add(1, Ordering::Relaxed);
+                        return Err(KvError::SlotBusy { slot, holder, g });
+                    }
+                    _ => {
+                        // Unleased, or ours in tree 0 without the gate bit
+                        // (a window between the arm and the install):
+                        // acquire for region 0 — first-writer-takes-it —
+                        // then loop to take the token.
+                        self.manager_acquire_slots(0, 0, &[slot], ControlAdmit::Park)
+                            .await?;
+                    }
+                }
+            }
+        }
+        Ok(Some(super::slot_lease::DoorPass::new(plane, entered)))
+    }
+
+    /// Wait until every door token of `slot` is back (the release's half
+    /// of the door law, after `Releasing` was raised): the admitted
+    /// commits of the slot reach their terminal outcome — apply included
+    /// — before the flush snapshots the tree. Bounded by the conveyor's
+    /// own latency; the last token out wakes it.
+    async fn drain_door(
+        &self,
+        plane: &super::slot_lease::SlotLeasePlane,
+        slot: super::record::ForestSlot,
+    ) {
+        loop {
+            let drained = plane.door_drained.notified();
+            if plane.gate.inflight(slot) == 0 {
+                return;
+            }
+            drained.await;
+        }
     }
 
     /// **The mint policy** (KD-SYM-11 / KD-SYM-16, §5.1.2) on an armed
@@ -4685,7 +4976,13 @@ impl KvMetaBackend {
     ) -> Option<crate::slot_lease_core::MintChoice> {
         let plane = self.slot_leases()?;
         let node_size = u64::from(self.sb.node_size);
-        let used = (self.alloc.total_extents() - self.alloc.free_extents()) * node_size;
+        // `used_leaf_bytes` (§5.1.2) off the slot-tree extent ledger — the
+        // images of every slot tree this mount holds a count for (leaves
+        // and interior; the interior share is under 1 % at the shipped
+        // fan-out), never the used HEAP (rings, the directory, pages,
+        // tree 0 — review round 2, Issue 10). A wire lessee's input is
+        // PR 12's ledger field.
+        let used = plane.extents.total() * node_size;
         let a_max = super::slot_lease::affinity_ceiling_in_force(
             plane.affinity_static_mb,
             used,
@@ -4740,21 +5037,25 @@ impl KvMetaBackend {
         let Some(plane) = self.slot_leases() else {
             return Ok(None);
         };
-        match self.manager_acquire_slots(0, 1, &[]).await {
+        match self
+            .manager_acquire_slots(0, 1, &[], ControlAdmit::Park)
+            .await
+        {
             Ok(grants) => {
                 let Some(g) = grants.first() else {
                     return Ok(None);
                 };
-                let mut rotor = (**plane.rotor.load()).clone();
-                if !rotor.contains(&g.slot) {
-                    rotor.push(g.slot);
-                }
-                plane.rotor.store(Arc::new(rotor));
+                let slot = g.slot;
+                plane.rotor_update(|rotor| {
+                    if !rotor.contains(&slot) {
+                        rotor.push(slot);
+                    }
+                });
                 plane.ceiling_overflows.fetch_add(1, Ordering::Relaxed);
                 plane.rotor_mints.fetch_add(1, Ordering::Relaxed);
-                Ok(Some(g.slot))
+                Ok(Some(slot))
             }
-            Err(KvError::Busy(_)) => {
+            Err(KvError::RotorAtCap { .. }) => {
                 // Past 2 × M: the smallest rotor tree.
                 let rotor = plane.rotor.load();
                 let smallest = rotor
@@ -4778,6 +5079,10 @@ impl KvMetaBackend {
         region_id: u32,
         slot: super::record::ForestSlot,
     ) -> std::result::Result<bool, KvError> {
+        // A shutdown in progress owns the remaining releases (the leave).
+        if self.is_shutting_down() {
+            return Ok(false);
+        }
         match self.release_slot_handover(region_id, slot).await {
             Ok(()) => Ok(true),
             Err(KvError::Busy(why)) => {
@@ -4786,6 +5091,44 @@ impl KvMetaBackend {
             }
             Err(e) => Err(e),
         }
+    }
+
+    /// Run [`Self::slot_lease_cadence`] on its own detached task, single-
+    /// flight (the checkpoint task's caller — see `slot_cadence_running`).
+    /// A no-op on an unarmed mount (one `Option` test) and while a run is
+    /// in flight or the volume shuts down. The task holds the backend
+    /// `Arc` for its run; the shutdown's leave serializes with a run in
+    /// flight through the `handover` mutex.
+    pub(super) fn spawn_slot_lease_cadence(self: &Arc<Self>) {
+        if self.slot_leases().is_none() || self.is_shutting_down() {
+            return;
+        }
+        if self
+            .slot_cadence_running
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
+        // The latch clears on EVERY exit, a contained panic included
+        // (`spawn_meta` counts it on `detached_task_panics`; the next tick
+        // must still be able to run a cadence).
+        struct Running(Arc<KvMetaBackend>);
+        impl Drop for Running {
+            fn drop(&mut self) {
+                self.0.slot_cadence_running.store(false, Ordering::Release);
+            }
+        }
+        let running = Running(Arc::clone(self));
+        crate::meta_exec::spawn_meta("kv_slot_lease_cadence", async move {
+            let be = &running.0;
+            if let Err(e) = be.slot_lease_cadence().await {
+                log::warn!(
+                    "slot-lease cadence failed on {:?}: {e} (the next tick retries)",
+                    be.device_path()
+                );
+            }
+        });
     }
 
     /// The slot-lease CADENCE of one checkpoint cycle (§5.1.3 / §5.1.4):
@@ -4968,7 +5311,7 @@ impl KvMetaBackend {
             .grant_record_minus_images(region.id, &released_slots)
             .await?;
         puts.extend(rewrite);
-        self.write_control_entry(puts).await?;
+        self.write_control_entry(puts, ControlAdmit::Try).await?;
         if !leaving.is_empty() {
             region.grant().transfer_out(&leaving);
         }
@@ -4988,10 +5331,11 @@ impl KvMetaBackend {
             region.drop_lease(slot);
             plane.gate.revoke(slot);
         }
-        plane.rotor.store(Arc::new(Vec::new()));
-        // The lease map is gone with the leave: the S4 plane returns to
-        // solo (the table is process-global — one mount, one truth).
-        crate::dlm_slot::install_local_slots(None);
+        plane.rotor_update(Vec::clear);
+        // The lease map is gone with the leave: this volume's contribution
+        // to the S4 plane is withdrawn (solo again once the last armed
+        // volume leaves).
+        crate::dlm_slot::install_lease_foreign_slots(self.volume_uuid(), None);
         plane.refresh_holders();
         Ok(())
     }
@@ -5125,6 +5469,7 @@ impl KvMetaBackend {
     async fn write_control_entry(
         &self,
         mut recs: Vec<(u8, Record)>,
+        admit: ControlAdmit,
     ) -> std::result::Result<(), KvError> {
         let forest = self.forest().ok_or_else(|| {
             KvError::Corrupt(format!(
@@ -5133,8 +5478,17 @@ impl KvMetaBackend {
             ))
         })?;
         let len = entry_len_for(&recs)?;
-        let Some(adm) = self.ring.try_admit(len, AdmissionClass::User) else {
-            return Err(KvError::JournalReserveExhausted { needed: len });
+        let adm = match admit {
+            ControlAdmit::Try => self
+                .ring
+                .try_admit(len, AdmissionClass::User)
+                .ok_or(KvError::JournalReserveExhausted { needed: len })?,
+            // The door's first-touch acquire runs INSIDE a user commit:
+            // it parks for ring space exactly as the pass would for that
+            // commit (review round 2, Issue 15 — `try_admit` refused on a
+            // full ring where every other user commit parks, and the
+            // user's first touch of a slot with history failed EINVAL).
+            ControlAdmit::Park => self.admit_user_budget(&self.ring, 0, len).await?,
         };
         let (res, seq_base) = self.ring.reserve_registered(adm);
         for (i, (_, r)) in recs.iter_mut().enumerate() {
@@ -5442,7 +5796,7 @@ impl KvMetaBackend {
                 merged.encode()?,
             ),
         ));
-        if let Err(e) = self.write_control_entry(recs).await {
+        if let Err(e) = self.write_control_entry(recs, ControlAdmit::Try).await {
             for c in claimed {
                 self.alloc.release_unpublished(c);
             }
@@ -5632,7 +5986,7 @@ impl KvMetaBackend {
                 Record::put(key, 0, remaining.encode()?)
             },
         ));
-        if let Err(e) = self.write_control_entry(recs).await {
+        if let Err(e) = self.write_control_entry(recs, ControlAdmit::Try).await {
             if let Some(r) = set.region(appender_id) {
                 r.grant().restore_returnable(dropped_from_ram);
             }
@@ -6080,7 +6434,7 @@ impl KvMetaBackend {
                 .iter()
                 .map(|e| super::alloc_ext::alloc_record(*e, 0))
                 .collect();
-            if let Err(e) = self.write_control_entry(recs).await {
+            if let Err(e) = self.write_control_entry(recs, ControlAdmit::Try).await {
                 for c in claimed {
                     self.alloc.release_unpublished(c);
                 }
@@ -10918,6 +11272,17 @@ pub fn durable_volume_id_of(sb_uuid: &[u8; 16]) -> String {
     format!("vol-{:016x}", xxhash_rust::xxh3::xxh3_64(sb_uuid))
 }
 
+/// How a manager control entry takes its ring-0 admission
+/// (`write_control_entry`): a WIRE verb / the cadence tries once and its
+/// refusal is the caller's retry (the peer's resend, the next cycle); the
+/// commit DOOR's first-touch acquire parks like the user commit it runs
+/// inside (review round 2, Issue 15).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ControlAdmit {
+    Try,
+    Park,
+}
+
 /// One slot the manager granted (design-symmetric-metadata §5.1.2 / §6.3,
 /// PR 4): its lease generation and the words its tree carries.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -12737,6 +13102,12 @@ struct QueuedTx {
     /// on failure). Never read, only owned: the RAII hold IS the same-key
     /// exclusion.
     _guards: Arc<[DlmGuard]>,
+    /// PR 4 (review round 2, Issue 6): the tx's door tokens — one per
+    /// slot its records name — owned by THIS entry until the terminal
+    /// outcome, like the guards: a slot's release drains them before its
+    /// flush, so no admitted tx can land after the flush's snapshot.
+    /// `None` on an unarmed mount.
+    _door: Option<super::slot_lease::DoorPass>,
     /// Fan-out channel. A dead receiver (dropped committer future) is
     /// harmless — semantically identical to timeout-fires-after-commit.
     done: squeezefs_ipc::sqz_channel::oneshot::Sender<std::result::Result<(), KvError>>,
@@ -13654,6 +14025,7 @@ impl KvMetaBackend {
             page: std::sync::Mutex::new(page0),
             ring: arc_swap::ArcSwap::from(Arc::clone(ring0)),
             leases: arc_swap::ArcSwap::from_pointee(Default::default()),
+            leases_writer: std::sync::Mutex::new(()),
             last_tail: AtomicU64::new(ledger.journal_tail_seq),
             durable_tail: AtomicU64::new(ledger.journal_tail_seq),
             stalls: AtomicU64::new(0),
@@ -13862,6 +14234,7 @@ impl KvMetaBackend {
                 } else {
                     slots.clone()
                 }),
+                leases_writer: std::sync::Mutex::new(()),
                 stalls: AtomicU64::new(0),
                 stalls_at_last_grow: AtomicU64::new(0),
                 ring_grows: AtomicU64::new(0),
@@ -13894,6 +14267,7 @@ impl KvMetaBackend {
                 m,
                 partition.clone(),
                 set.native_slot,
+                u128::from_le_bytes(sb.uuid),
             );
             // The pages' slot entries as loaded — the arm's settle reads
             // them after the join's checkpoint has rewritten the pages.
@@ -14214,12 +14588,40 @@ impl KvMetaBackend {
         // the `Leased` record keeps the grant-time words, and a
         // publication here would overwrite the lease itself. A slot
         // mid-handover (`releasing`) is the release record's.
+        //
+        // **The page-budget overflow law** (review round 2 — found by the
+        // Issue 5 storm pin): a region holding MORE slots than its page
+        // names (`SLOT_PAGE_BUDGET`; the LRU release brings it back only
+        // when a slot goes idle) has roots the page CANNOT publish, and an
+        // unpublished root is a floor — before this arm a burst of first-
+        // touch acquires past the budget pinned the ledger tail for good
+        // and the clause-b audit FAIL-STOPPED the volume after 8 barriered
+        // cycles. Such a root rides tree 0 after all: its `Leased` record
+        // is REWRITTEN with the current root (lessee, `g`, cursor, extent
+        // count, seq floor kept — the lease itself is untouched), which
+        // is exactly the record the next open's `leased_root_from_
+        // directory` falls back to when the page names no entry. In-
+        // process regions only (a wire appender's page is its own
+        // mount's; its holdings are bounded at its join — PR 12).
         let plane = self.slot_leases();
+        let overflow: std::collections::BTreeSet<super::record::ForestSlot> =
+            match (plane, self.appenders.as_ref()) {
+                (Some(_), Some(set)) => set
+                    .regions
+                    .iter()
+                    .filter(|r| !r.released.load(Ordering::Acquire))
+                    .flat_map(|r| Self::region_page_overflow(set, r))
+                    .collect(),
+                _ => Default::default(),
+            };
         let pending: Vec<(super::record::ForestSlot, RootPtr)> = forest
             .roots_to_publish()
             .into_iter()
             .filter(|(slot, _)| {
-                plane.is_none_or(|p| !p.gate.is_leased(*slot) && !p.gate.is_releasing(*slot))
+                plane.is_none_or(|p| {
+                    (!p.gate.is_leased(*slot) && !p.gate.is_releasing(*slot))
+                        || (overflow.contains(slot) && !p.gate.is_releasing(*slot))
+                })
             })
             .collect();
         if pending.is_empty() {
@@ -14228,6 +14630,31 @@ impl KvMetaBackend {
         let tag = super::journal::tag_for(super::record::TREE_CONTROL, 0);
         let mut recs: Vec<(u8, Record)> = Vec::with_capacity(pending.len());
         for (slot, root) in &pending {
+            if overflow.contains(slot) {
+                let Some(l) = plane
+                    .and_then(|p| p.table.get(*slot))
+                    .filter(|l| l.state != crate::slot_lease_core::LeaseState::Unleased)
+                else {
+                    continue;
+                };
+                let page_addr = self.page_addr_of(l.holder).await?;
+                let words = plane.map_or(l.words, |p| self.slot_words_now(p, *slot));
+                let value = super::slot_state::SlotState::Leased {
+                    appender_id: l.holder,
+                    g: l.g,
+                    page_addr,
+                    root: *root,
+                    cursor: words.cursor,
+                    slot_tree_extents: words.extents,
+                    seq_floor: l.words.seq_floor,
+                }
+                .encode()?;
+                recs.push((
+                    tag,
+                    Record::put(super::slot_state::slot_state_key(*slot), 0, value),
+                ));
+                continue;
+            }
             // The UNARMED forest (PR 1–3): one appender, one cursor — the
             // native watermark rides the ledger's `next_ino`. An armed
             // plane's UNLEASED slot keeps its release record's `g`,
@@ -14344,6 +14771,11 @@ impl KvMetaBackend {
             return Ok(());
         };
         let control = Arc::clone(forest.control());
+        // The directory is read ONCE per pass, at the first leased record
+        // (review round 2, Issue 17 — it was read once per `Leased`
+        // record per epoch step).
+        let mut directory: Option<Vec<super::appender::AppenderEntry>> = None;
+        let native = self.appenders.as_ref().map_or(0, |a| a.native_slot);
         let (mut cursor, end) = super::slot_state::slot_state_key_range();
         loop {
             let page = control.range(&cursor, &end, 512).await?;
@@ -14358,16 +14790,12 @@ impl KvMetaBackend {
                     super::slot_state::SlotState::Leased {
                         appender_id, root, ..
                     } => {
-                        let directory =
-                            super::appender::read_directory(&self.path, &self.sb).await?;
-                        let native = self.appenders.as_ref().map_or(0, |a| a.native_slot);
-                        Self::leased_root_from_directory(
-                            &directory,
-                            native,
-                            appender_id,
-                            slot,
-                            root,
-                        )
+                        if directory.is_none() {
+                            directory =
+                                Some(super::appender::read_directory(&self.path, &self.sb).await?);
+                        }
+                        let directory = directory.as_deref().unwrap_or(&[]);
+                        Self::leased_root_from_directory(directory, native, appender_id, slot, root)
                     }
                 };
                 if root.addr == 0 || slot == super::record::NATIVE_FOREST_SLOT {
@@ -14607,13 +15035,15 @@ impl KvMetaBackend {
         if tx.is_empty() {
             return Ok(());
         }
-        // (0) First-writer-takes-it (PR 4): every slot the tx names is
-        // this mount's before the tx is queued; a no-op unarmed.
-        self.ensure_leases_for_tx(&tx).await?;
+        // (0) The door (PR 4): every slot the tx names is this mount's
+        // before the tx is queued — a slot mid-handover parks here, a
+        // foreign one refuses `SlotBusy`; the tokens ride the queue entry
+        // to the terminal outcome. A no-op unarmed.
+        let door = self.ensure_leases_for_tx(&tx).await?;
         // (1) Exact size before anything is queued (§4.4 pt 5) — an
         // oversized / undecodable tx fails ALONE, never inside a batch.
         let weak = self.conveyor_identity()?;
-        let (entry, rx) = self.build_queued_tx(tx)?;
+        let (entry, rx) = self.build_queued_tx(tx, door)?;
         let len = entry.len;
 
         // (2) Enqueue + leader-elect — no await between the two.
@@ -14723,11 +15153,14 @@ impl KvMetaBackend {
                 results[i] = Some(Ok(()));
                 continue;
             }
-            if let Err(e) = self.ensure_leases_for_tx(&tx).await {
-                results[i] = Some(Err(e));
-                continue;
-            }
-            match self.build_queued_tx(tx) {
+            let door = match self.ensure_leases_for_tx(&tx).await {
+                Ok(d) => d,
+                Err(e) => {
+                    results[i] = Some(Err(e));
+                    continue;
+                }
+            };
+            match self.build_queued_tx(tx, door) {
                 Ok((entry, rx)) => {
                     let len = entry.len;
                     entries.push((entry, len));
@@ -14768,6 +15201,7 @@ impl KvMetaBackend {
     fn build_queued_tx(
         &self,
         tx: KvTx,
+        door: Option<super::slot_lease::DoorPass>,
     ) -> std::result::Result<
         (
             QueuedTx,
@@ -14843,6 +15277,7 @@ impl KvMetaBackend {
                 trace_id,
                 site,
                 _guards: tx.guards,
+                _door: door,
                 done,
             },
             rx,
@@ -15602,6 +16037,13 @@ impl KvMetaBackend {
                         );
                     }
                     failed.push((qi, e));
+                }
+            }
+            // The slot record frontier (Issue 11): every slot-stamped
+            // node of the union carries records below this batch's end.
+            for node in &lock_set {
+                if let Some(slot) = node.forest_slot() {
+                    self.cache.note_slot_record_frontier(slot, seq_cursor);
                 }
             }
             // Surviving members' records are now applied to RAM and not

@@ -6964,11 +6964,11 @@ mod slot_lease_models {
             let table = Arc::new(SlotLeaseTable::new());
             let a = {
                 let t = Arc::clone(&table);
-                thread::spawn(move || t.acquire(SLOT, 1, 0))
+                thread::spawn(move || t.acquire(SLOT, 1, 0, false))
             };
             let b = {
                 let t = Arc::clone(&table);
-                thread::spawn(move || t.acquire(SLOT, 2, 0))
+                thread::spawn(move || t.acquire(SLOT, 2, 0, false))
             };
             let (ra, rb) = (a.join().unwrap(), b.join().unwrap());
             let granted = [ra, rb]
@@ -7003,7 +7003,7 @@ mod slot_lease_models {
         loom::model(|| {
             let table = Arc::new(SlotLeaseTable::new());
             assert!(matches!(
-                table.acquire(SLOT, 1, 0),
+                table.acquire(SLOT, 1, 0, false),
                 AcquireOutcome::Granted { g: 1, .. }
             ));
             table.offer(SLOT, 1, 2, 100).unwrap();
@@ -7013,7 +7013,7 @@ mod slot_lease_models {
             };
             let acceptor = {
                 let t = Arc::clone(&table);
-                thread::spawn(move || t.acquire(SLOT, 2, 99))
+                thread::spawn(move || t.acquire(SLOT, 2, 99, false))
             };
             let expired = expirer.join().unwrap();
             let accepted = acceptor.join().unwrap();
@@ -7045,7 +7045,7 @@ mod slot_lease_models {
         loom::model(|| {
             let table = Arc::new(SlotLeaseTable::new());
             assert!(matches!(
-                table.acquire(SLOT, 1, 0),
+                table.acquire(SLOT, 1, 0, false),
                 AcquireOutcome::Granted { g: 1, .. }
             ));
             let words = SlotWords {
@@ -7074,7 +7074,7 @@ mod slot_lease_models {
             let e = table.get(SLOT).unwrap();
             assert_eq!((e.words, e.last_written), (words, 10));
             assert!(matches!(
-                table.acquire(SLOT, 2, 0),
+                table.acquire(SLOT, 2, 0, false),
                 AcquireOutcome::Granted { g: 2, words: w } if w == words
             ));
         });

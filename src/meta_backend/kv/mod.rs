@@ -897,6 +897,37 @@ pub enum KvError {
     )]
     GrantExhausted { appender: u32, unclaimed: u64 },
 
+    /// A mutation of a forest slot another appender LEASES (design-
+    /// symmetric-metadata §5.1.4, PR 4; review round 2 Issue 6): the
+    /// commit door's "ship to the holder" answer — the ship is the
+    /// metanode arm (PR 6/12), so until it lands the caller retries
+    /// `EAGAIN`-class once the slot is this mount's or the ship exists.
+    /// Never the corruption class: a foreign lease is a scheduling
+    /// outcome, and a slot mid-handover PARKS at the door instead
+    /// (`slot_door_parks`). `slot` is the forest slot.
+    #[error(
+        "forest slot {slot} is leased by appender {holder} (g {g}) — a mutation of a foreign \
+         slot ships to its holder (design-symmetric-metadata §5.1.4, the metanode arm; \
+         PR 6/12) — retry (EAGAIN)"
+    )]
+    SlotBusy { slot: u32, holder: u32, g: u32 },
+
+    /// A rotor ask (`AcquireSlots { want }`) that would take `appender`
+    /// past the `2 × M` rotor cap (§5.1.2) — the overflow arm's designed
+    /// past-cap answer (the smallest rotor tree takes the mint), counted
+    /// `slot_rotor_cap_refusals`, never `manager_verb_refusals`.
+    #[error(
+        "appender {appender} holds {held} rotor slot(s) and asks {want} more — the manager \
+         grants rotor slots up to 2 × M = {cap} (SQUEEZEFS_SYM_MINT_SLOTS; \
+         design-symmetric-metadata §5.1.2)"
+    )]
+    RotorAtCap {
+        appender: u32,
+        held: u64,
+        want: u64,
+        cap: u64,
+    },
+
     /// A manager verb REJECTED at the service edge (design-symmetric-
     /// metadata §5.3.5; review round 1 Issue 2): a wire-carried integer
     /// names what the durable state cannot — a return run outside the
@@ -969,6 +1000,12 @@ impl From<KvError> for crate::error::SqueezefsError {
             e @ KvError::GrantExhausted { .. } => {
                 E::refused(libc::EAGAIN, format!("kv metadata: {e}"))
             }
+            // A foreign slot lease at the commit door: EAGAIN — the ship
+            // to the holder is PR 6/12's; the caller retries.
+            e @ KvError::SlotBusy { .. } => E::refused(libc::EAGAIN, format!("kv metadata: {e}")),
+            // The rotor cap names a holder-side limit — EBUSY, like the
+            // other manager refusals that name a holder.
+            e @ KvError::RotorAtCap { .. } => E::busy(format!("kv metadata: {e}")),
             // A wire-invalid manager frame: the caller's argument is the
             // defect — EINVAL.
             e @ KvError::Rejected(_) => E::refused(libc::EINVAL, format!("kv metadata: {e}")),

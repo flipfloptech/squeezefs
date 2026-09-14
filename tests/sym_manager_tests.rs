@@ -664,7 +664,7 @@ async fn join_appender_over_the_wire_allocates_a_page_ring_and_grant_and_replays
     )
     .expect("manager listener");
     let endpoint = host.endpoint().to_string();
-    let mut client = ManagerClient::connect(&endpoint, SECRET, "joiner-a")
+    let mut client = ManagerClient::connect(&endpoint, SECRET, "joiner-a", 0)
         .await
         .expect("storage-trust enrollment");
     let me = joiner_identity(1);
@@ -898,7 +898,7 @@ async fn a_join_storm_of_32_completes_inside_the_bound_and_grows_the_directory_c
     assert_eq!(pairs, 7, "64 KiB nodes: 16 pages − the header = 7 pairs");
     let t0 = std::time::Instant::now();
     let mut ids = std::collections::BTreeSet::new();
-    let mut client = ManagerClient::connect(&endpoint, SECRET, "storm")
+    let mut client = ManagerClient::connect(&endpoint, SECRET, "storm", 0)
         .await
         .unwrap();
     for n in 0..32u64 {
@@ -1629,7 +1629,7 @@ async fn wire_integers_are_never_allocation_authority() {
         ManagerService::new(Arc::clone(&vol)),
     )
     .unwrap();
-    let mut client = ManagerClient::connect(&host.endpoint().to_string(), SECRET, "peer-w")
+    let mut client = ManagerClient::connect(&host.endpoint().to_string(), SECRET, "peer-w", 0)
         .await
         .unwrap();
     let err = client
@@ -1752,7 +1752,7 @@ async fn an_unconsumed_grant_is_answered_verbatim() {
         ManagerService::new(Arc::clone(&vol)),
     )
     .unwrap();
-    let mut client = ManagerClient::connect(&host.endpoint().to_string(), SECRET, "peer-i")
+    let mut client = ManagerClient::connect(&host.endpoint().to_string(), SECRET, "peer-i", 0)
         .await
         .unwrap();
     let joined = client.join(joiner_identity(11), 0).await.unwrap();
@@ -2027,7 +2027,7 @@ async fn the_grant_cap_counts_every_live_appender_wire_joiners_included() {
         ManagerService::new(Arc::clone(&vol)),
     )
     .unwrap();
-    let mut client = ManagerClient::connect(&host.endpoint().to_string(), SECRET, "peer-k")
+    let mut client = ManagerClient::connect(&host.endpoint().to_string(), SECRET, "peer-k", 0)
         .await
         .unwrap();
     client.join(joiner_identity(12), 0).await.unwrap();

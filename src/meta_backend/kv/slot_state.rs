@@ -264,25 +264,6 @@ impl SlotState {
             ))),
         }
     }
-
-    /// The slot tree's root as an UNLEASED record names it (`None` for a
-    /// leased slot, whose live root is the lessee's — see
-    /// [`Self::recorded_root`]).
-    pub fn root(&self) -> Option<RootPtr> {
-        match self {
-            SlotState::Unleased { root, .. } => Some(*root),
-            SlotState::Leased { .. } => None,
-        }
-    }
-
-    /// The root the record carries, whichever variant: the release's for
-    /// an unleased slot, the grant-time one for a leased slot (superseded
-    /// by the lessee's page once written).
-    pub fn recorded_root(&self) -> RootPtr {
-        match self {
-            SlotState::Unleased { root, .. } | SlotState::Leased { root, .. } => *root,
-        }
-    }
 }
 
 // ---------------------------------------------------------------------------

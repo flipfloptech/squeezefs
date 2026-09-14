@@ -717,7 +717,8 @@ pub struct ManagerClient {
     rpc: RpcClient,
     next_request: u64,
     /// The volume ordinal every frame of this client names
-    /// ([`ManagerRequestFrame::volume`]); 0 unless [`Self::for_volume`].
+    /// ([`ManagerRequestFrame::volume`] — the slot map's volume index,
+    /// which [`ManagerSetService`] dispatches on).
     volume: u16,
 }
 
@@ -731,21 +732,19 @@ impl std::fmt::Debug for ManagerClient {
 
 impl ManagerClient {
     /// Dial `endpoint` and prove membership with the set's `job:enroll`
-    /// secret.
-    pub async fn connect(endpoint: &str, secret: &[u8], peer_id: &str) -> Result<Self> {
+    /// secret; every frame addresses the set's volume ordinal `volume`.
+    pub async fn connect(
+        endpoint: &str,
+        secret: &[u8],
+        peer_id: &str,
+        volume: u16,
+    ) -> Result<Self> {
         let rpc = RpcClient::connect(endpoint, secret, peer_id, None).await?;
         Ok(Self {
             rpc,
             next_request: 1,
-            volume: 0,
+            volume,
         })
-    }
-
-    /// Address every frame to the set's volume ordinal `volume` (the slot
-    /// map's volume index — [`ManagerSetService`] dispatches on it).
-    pub fn for_volume(mut self, volume: u16) -> Self {
-        self.volume = volume;
-        self
     }
 
     /// Issue one verb; a `Refused` reply is an error naming its reason.

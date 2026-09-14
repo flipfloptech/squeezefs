@@ -21,11 +21,12 @@
 //! `dlm_mode` = `solo` — and a bit-17-absent volume is untouched.
 
 use squeezefs::meta_backend::kv::appender::{
-    read_directory, write_page, AppenderIdentity, AppenderState, SlotEntryState,
+    read_directory, write_page, AppenderIdentity, AppenderState, SlotEntryState, SLOT_PAGE_BUDGET,
     TEST_APPENDER_SLOTS_ENV,
 };
 use squeezefs::meta_backend::kv::backend::{
-    AcquireSlotReply, KvMetaBackend, TEST_HANDOVER_HOLD_AFTER_PAGE, TEST_HANDOVER_HOLD_AFTER_TREE0,
+    AcquireSlotReply, ControlAdmit, KvMetaBackend, TEST_HANDOVER_HOLD_AFTER_PAGE,
+    TEST_HANDOVER_HOLD_AFTER_TREE0,
 };
 use squeezefs::meta_backend::kv::block_refs::{volume_tag, BlockRef, BlockRefOp};
 use squeezefs::meta_backend::kv::builder::{
@@ -50,6 +51,12 @@ use squeezefs::meta_backend::{
 use squeezefs::slot_lease_core::{ShipVerdict, MINT_SPREAD as CORE_SPREAD};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
+
+/// The measured wall of one served ship the contracts feed `note_slot_
+/// ship` (the S8 owner-side `total` of the frame; the fleet's fabric RTT
+/// order). `N_floor` = ceil(handover / ship) then reads ≈ the design's
+/// tens, never the raw handover nanoseconds (review round 2, Issue 7).
+const SHIP_NS: u64 = 200_000;
 
 // ---------------------------------------------------------------------------
 // Harness (the sym_manager_tests shape: 64 KiB nodes, a 1 MiB fixed ring).
@@ -765,7 +772,7 @@ async fn wire_joiner(
     )
     .expect("manager listener");
     let endpoint = host.endpoint().to_string();
-    let mut client = ManagerClient::connect(&endpoint, SECRET, &format!("joiner-{n}"))
+    let mut client = ManagerClient::connect(&endpoint, SECRET, &format!("joiner-{n}"), 0)
         .await
         .expect("storage-trust enrollment");
     let reply = client.join(joiner_identity(n), 0).await.unwrap();
@@ -851,8 +858,9 @@ async fn first_writer_takes_it_and_the_second_is_refused_naming_the_holder() {
     );
     assert_eq!(
         lease_stats(&vol).resolve_rpcs,
-        0,
-        "warm path: no resolve RPC"
+        2,
+        "the two wire ResolveSlot verbs served — the manager's own resolution rode the \
+         holder cache, never a verb"
     );
     // The S4 table: that slot is FOREIGN, everything else local.
     assert_eq!(squeezefs::dlm_slot::dlm_mode(), "slot-homed");
@@ -941,6 +949,330 @@ async fn leaf_lease_refusals_fire_on_a_foreign_mutation() {
     // The history is intact and readable.
     assert_eq!(vol.block_ref_count(tag, 0).await.unwrap(), 1);
     host.shutdown();
+    shutdown(&routed).await;
+}
+
+/// **Issue 6 (review round 2) — the door law on a legal schedule.** A
+/// commit issued on the departing holder WHILE a handover is in flight
+/// (the holder parked after its page named the slot `Releasing`, before
+/// tree 0 moved) PARKS at the door — never an error — and completes when
+/// the handover does: for an accept by a WIRE requester the slot is then
+/// foreign and the commit refuses `SlotBusy` = EAGAIN (the "ship to the
+/// holder" class), never `Corrupt`/EINVAL; for the cadence's own release
+/// the slot is unleased and the commit re-acquires it first-touch and
+/// SUCCEEDS. The belt (`meta_kv_leaf_lease_refusals`, must-stay-0) never
+/// counts: the release drained the door's tokens before its flush.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_commit_during_a_handover_parks_at_the_door_and_never_fails_einval() {
+    use squeezefs::meta_backend::kv::backend::{
+        test_handover_park_release, test_handover_parked, TEST_HANDOVER_PARK_AFTER_PAGE,
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    let uris = vec![format_stamped_member(dir.path(), "meta0").await];
+    let routed = open_under(&uris, &Knobs::armed()).await;
+    let vol = Arc::clone(&routed.volumes[0]);
+    let plane = vol.slot_leases().expect("armed");
+    let (host, _client, joiner) = wire_joiner(&vol, 6).await;
+    let tag = 0xD006;
+    let belt_before = META_KV_LEAF_LEASE_REFUSALS.load(Ordering::Relaxed);
+    let parked_before = test_handover_parked();
+
+    // ---- Face 1: the accept by a wire requester — the slot leaves. ----
+    let slot: ForestSlot = 2; // rotor slot 2 (routing 1)
+    let owner = ino_in_slot(slot, 21);
+    for i in 0..4u64 {
+        vol.commit_block_refs(owner, &refs(tag, owner, i, 1))
+            .await
+            .unwrap();
+    }
+    vol.manager_offer_slot(0, slot, joiner).await.unwrap();
+    TEST_HANDOVER_PARK_AFTER_PAGE.store(true, Ordering::Relaxed);
+    let accept = {
+        let vol = Arc::clone(&vol);
+        tokio::spawn(async move { vol.manager_acquire_slot(joiner, slot).await })
+    };
+    // The handover parked: page Releasing, tree 0 not yet moved.
+    while test_handover_parked() == parked_before {
+        tokio::task::yield_now().await;
+    }
+    assert!(plane.gate.is_releasing(slot));
+    // The commit issued INTO the window: it parks at the door.
+    let commit = {
+        let vol = Arc::clone(&vol);
+        tokio::spawn(async move {
+            vol.commit_block_refs(owner, &refs(tag, owner, 100, 1))
+                .await
+        })
+    };
+    while lease_stats(&vol).door_parks == 0 {
+        assert!(!commit.is_finished(), "the commit must PARK, not fail");
+        tokio::task::yield_now().await;
+    }
+    for _ in 0..50 {
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        !commit.is_finished(),
+        "parked at the door while the handover is in flight"
+    );
+    // Release the handover: the requester is granted, the door re-reads.
+    test_handover_park_release();
+    let AcquireSlotReply::Granted(g) = accept.await.unwrap().unwrap() else {
+        panic!("the accept lands")
+    };
+    assert_eq!(g.g, 2);
+    let e = commit
+        .await
+        .unwrap()
+        .expect_err("the slot is the wire joiner's now — ship to the holder");
+    let msg = e.to_string();
+    assert!(
+        msg.contains(&format!("slot {slot} is leased by appender {joiner} (g 2)"))
+            && msg.contains("ships to its holder"),
+        "{msg}"
+    );
+    assert_eq!(
+        e.to_errno(),
+        libc::EAGAIN,
+        "the retryable class, never EINVAL: {msg}"
+    );
+    let st = lease_stats(&vol);
+    assert_eq!((st.door_parks, st.door_refusals), (1, 1));
+    assert_eq!(vol.block_ref_count(tag, 100).await.unwrap(), 0);
+    for i in 0..4u64 {
+        assert_eq!(vol.block_ref_count(tag, i).await.unwrap(), 1);
+    }
+
+    // ---- Face 2: the cadence's own release — the slot stays home. ----
+    let slot2: ForestSlot = 3;
+    let owner2 = ino_in_slot(slot2, 22);
+    vol.commit_block_refs(owner2, &refs(tag, owner2, 200, 1))
+        .await
+        .unwrap();
+    let parked_before = test_handover_parked();
+    TEST_HANDOVER_PARK_AFTER_PAGE.store(true, Ordering::Relaxed);
+    let release = {
+        let vol = Arc::clone(&vol);
+        tokio::spawn(async move { vol.release_slot_handover(0, slot2).await })
+    };
+    while test_handover_parked() == parked_before {
+        tokio::task::yield_now().await;
+    }
+    let commit = {
+        let vol = Arc::clone(&vol);
+        tokio::spawn(async move {
+            vol.commit_block_refs(owner2, &refs(tag, owner2, 201, 1))
+                .await
+        })
+    };
+    while lease_stats(&vol).door_parks < 2 {
+        assert!(!commit.is_finished(), "the commit must PARK, not fail");
+        tokio::task::yield_now().await;
+    }
+    test_handover_park_release();
+    release.await.unwrap().unwrap();
+    commit
+        .await
+        .unwrap()
+        .expect("an unleased slot is re-acquired first-touch — the commit lands");
+    assert!(plane.gate.is_leased(slot2), "first-writer-takes-it again");
+    assert_eq!(vol.block_ref_count(tag, 201).await.unwrap(), 1);
+    let st = lease_stats(&vol);
+    assert_eq!((st.door_parks, st.door_refusals), (2, 1));
+    assert_eq!(
+        META_KV_LEAF_LEASE_REFUSALS.load(Ordering::Relaxed),
+        belt_before,
+        "the belt never fires on a legal schedule"
+    );
+    assert_eq!(
+        vol.appender_stats().unwrap().manager_verb_refusals,
+        0,
+        "no witness contradiction happened"
+    );
+    // The handover's flush post-condition held: no record of the moved
+    // slot is left in ring 0's window at the next open.
+    host.shutdown();
+    shutdown(&routed).await;
+    let routed = open_under(&uris, &Knobs::armed()).await;
+    let vol = Arc::clone(&routed.volumes[0]);
+    assert_eq!(META_KV_REPLAY_LEASE_VIOLATIONS.load(Ordering::Relaxed), 0);
+    assert_eq!(vol.block_ref_count(tag, 201).await.unwrap(), 1);
+    shutdown(&routed).await;
+}
+
+/// **Issue 5 (review round 2) — one writer discipline per RAM set.** The
+/// region's lease set and the plane's rotor are `ArcSwap`s mutated by
+/// clone-and-store from different critical sections (a grant under
+/// `manager_verbs`, a release under `handover`, the overflow arm under
+/// none); every RMW now runs under the set's own writer mutex. The
+/// storm: the cadence releases 40 leased slots (drops under `handover`)
+/// while three committers take 60 fresh slots first-touch (adds under
+/// `manager_verbs`) on the same region — afterwards the region's lease
+/// set is EXACTLY the gate's (whose bits are `fetch_or`/`fetch_and`,
+/// never lost), and the rotor is untouched by the storm. A lost update
+/// would leave a released slot routed into ring 0 after tree 0 released
+/// it (the `Lease` class at the next open) or a fresh slot's commits
+/// routed away from the region that leases them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn lease_set_and_rotor_rmws_never_lose_an_update() {
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    let uris = vec![format_stamped_member(dir.path(), "meta0").await];
+    let routed = open_under(&uris, &Knobs::armed()).await;
+    let vol = Arc::clone(&routed.volumes[0]);
+    let plane = vol.slot_leases().expect("armed");
+    let tag = 0xD005;
+    // 40 inherited slots (first-touch now, released by the storm).
+    let inherited: Vec<ForestSlot> = (300..340).collect();
+    for s in &inherited {
+        let owner = ino_in_slot(*s, 3);
+        vol.commit_block_refs(owner, &refs(tag, owner, u64::from(*s), 1))
+            .await
+            .unwrap();
+    }
+    let rotor_before = (**plane.rotor.load()).clone();
+    let releaser = {
+        let vol = Arc::clone(&vol);
+        let inherited = inherited.clone();
+        tokio::spawn(async move {
+            for s in inherited {
+                vol.release_slot_handover(0, s).await.unwrap();
+            }
+        })
+    };
+    let mut committers = Vec::new();
+    for t in 0..3u32 {
+        let vol = Arc::clone(&vol);
+        committers.push(tokio::spawn(async move {
+            for i in 0..20u32 {
+                let slot: ForestSlot = 400 + t * 100 + i;
+                let owner = ino_in_slot(slot, 5);
+                vol.commit_block_refs(owner, &refs(tag, owner, 1_000 + u64::from(slot), 1))
+                    .await
+                    .unwrap();
+            }
+        }));
+    }
+    releaser.await.unwrap();
+    for c in committers {
+        c.await.unwrap();
+    }
+    let leased = plane.gate.leased_slots();
+    assert_eq!(
+        vol.appender_stats().unwrap().regions[0].leases,
+        leased.len() as u64,
+        "the region's lease set is exactly the gate's — no lost update"
+    );
+    for s in &inherited {
+        assert!(!leased.contains(s), "slot {s} was released");
+    }
+    for t in 0..3u32 {
+        for i in 0..20u32 {
+            assert!(leased.contains(&(400 + t * 100 + i)));
+        }
+    }
+    assert_eq!(
+        &**plane.rotor.load(),
+        &rotor_before,
+        "the rotor is untouched"
+    );
+    // Every fresh slot's commit routes into ring 0 and lands.
+    for t in 0..3u32 {
+        let slot: ForestSlot = 400 + t * 100;
+        let owner = ino_in_slot(slot, 5);
+        vol.commit_block_refs(owner, &refs(tag, owner, 2_000 + u64::from(slot), 1))
+            .await
+            .unwrap();
+        assert_eq!(
+            vol.block_ref_count(tag, 2_000 + u64::from(slot))
+                .await
+                .unwrap(),
+            1
+        );
+    }
+    assert_eq!(META_KV_REPLAY_LEASE_VIOLATIONS.load(Ordering::Relaxed), 0);
+    shutdown(&routed).await;
+}
+
+/// **The page-budget overflow law** (review round 2 — found by the Issue 5
+/// storm): a region holding MORE slots than its page names (a burst of
+/// first-touch acquires past `SLOT_PAGE_BUDGET`, none idle yet for the
+/// LRU release) has roots its page cannot publish; an unpublished root is
+/// a floor, so before the law the ledger tail pinned for good and the
+/// clause-b audit FAIL-STOPPED the volume after 8 barriered cycles. The
+/// overflow roots ride tree 0's `Leased` records instead: ten barriered
+/// cycles pass, the tail advances past the burst, and a crash remount
+/// resolves every overflow root off the record (the page names none).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_region_past_its_page_budget_publishes_the_overflow_roots_into_tree0() {
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    let uris = vec![format_stamped_member(dir.path(), "meta0").await];
+    let routed = open_under(&uris, &Knobs::armed()).await;
+    let vol = Arc::clone(&routed.volumes[0]);
+    let tag = 0xB0D6;
+    let head_before = vol.journal_ring().core().head();
+    // 120 inherited slots first-touched in one burst: 1 + 64 + 120 leases
+    // on region 0, 77 past the page's 108.
+    let touched: Vec<ForestSlot> = (1_000..1_120).collect();
+    for s in &touched {
+        let owner = ino_in_slot(*s, 9);
+        vol.commit_block_refs(owner, &refs(tag, owner, u64::from(*s), 1))
+            .await
+            .unwrap();
+    }
+    assert!(
+        vol.appender_stats().unwrap().regions[0].leases as usize > SLOT_PAGE_BUDGET,
+        "the burst is past the budget"
+    );
+    for _ in 0..10 {
+        vol.checkpoint_now()
+            .await
+            .expect("no wedge: the overflow roots are published into tree 0");
+    }
+    assert!(!vol.is_failed(), "never the clause-b fail-stop");
+    assert!(
+        vol.journal_ring().core().reusable_upto() > head_before,
+        "the tail passed the burst"
+    );
+    // Every overflow slot's record names a live root; the page names it
+    // not (the budget).
+    let entries = read_directory(std::path::Path::new(&uris[0]), vol.superblock())
+        .await
+        .unwrap();
+    let page0 = entries[0].page.clone().unwrap();
+    assert_eq!(page0.slots.len(), SLOT_PAGE_BUDGET);
+    let named: std::collections::BTreeSet<ForestSlot> = page0
+        .slots
+        .iter()
+        .map(|e| guest_forest_slot(e.slot))
+        .collect();
+    let states = tree0_states(&vol).await;
+    let mut overflow = 0;
+    for s in &touched {
+        if named.contains(s) {
+            continue;
+        }
+        overflow += 1;
+        assert!(
+            matches!(
+                states.iter().find(|(x, _)| x == s).map(|(_, st)| st),
+                Some(SlotState::Leased { appender_id: 0, root, .. }) if root.addr != 0
+            ),
+            "slot {s}: the overflow root rides tree 0"
+        );
+    }
+    assert!(overflow >= 77, "{overflow} overflow slots");
+    // Crash remount: every record is served off the recovered roots.
+    drop(vol);
+    drop(routed);
+    let routed = open_under(&uris, &Knobs::armed()).await;
+    let vol = Arc::clone(&routed.volumes[0]);
+    for s in &touched {
+        assert_eq!(vol.block_ref_count(tag, u64::from(*s)).await.unwrap(), 1);
+    }
+    assert_eq!(lease_stats(&vol).conflicts, 0);
     shutdown(&routed).await;
 }
 
@@ -1137,11 +1469,17 @@ async fn dominance_over_a_common_window_decides_every_offer() {
             .unwrap();
     }
     // A touch by requester 7: served, never an offer.
-    assert_eq!(vol.note_slot_ship(live_slot, 7).await, ShipVerdict::Serve);
+    assert_eq!(
+        vol.note_slot_ship(live_slot, 7, SHIP_NS).await,
+        ShipVerdict::Serve
+    );
     assert_eq!(lease_stats(&vol).offers, 0);
     // 39 more ships (< 2 × 20 ops): still served.
     for _ in 0..38 {
-        assert_eq!(vol.note_slot_ship(live_slot, 7).await, ShipVerdict::Serve);
+        assert_eq!(
+            vol.note_slot_ship(live_slot, 7, SHIP_NS).await,
+            ShipVerdict::Serve
+        );
     }
     assert_eq!(
         lease_stats(&vol).offers,
@@ -1150,7 +1488,10 @@ async fn dominance_over_a_common_window_decides_every_offer() {
     );
     // A paused live job: no new ops, the window still counts its 20.
     for _ in 0..10 {
-        assert_eq!(vol.note_slot_ship(live_slot, 8).await, ShipVerdict::Serve);
+        assert_eq!(
+            vol.note_slot_ship(live_slot, 8, SHIP_NS).await,
+            ShipVerdict::Serve
+        );
     }
     assert_eq!(
         lease_stats(&vol).offers,
@@ -1159,7 +1500,10 @@ async fn dominance_over_a_common_window_decides_every_offer() {
     );
     // An IDLE tree (rotor slot 3): one touch never moves it.
     let idle_slot: ForestSlot = 3;
-    assert_eq!(vol.note_slot_ship(idle_slot, 11).await, ShipVerdict::Serve);
+    assert_eq!(
+        vol.note_slot_ship(idle_slot, 11, SHIP_NS).await,
+        ShipVerdict::Serve
+    );
     assert_eq!(
         lease_stats(&vol).offers,
         0,
@@ -1168,7 +1512,10 @@ async fn dominance_over_a_common_window_decides_every_offer() {
     // Twelve thousand single-shot creators on the idle tree: aggregate
     // shipping never triggers.
     for q in 1_000..13_000u32 {
-        assert_eq!(vol.note_slot_ship(idle_slot, q).await, ShipVerdict::Serve);
+        assert_eq!(
+            vol.note_slot_ship(idle_slot, q, SHIP_NS).await,
+            ShipVerdict::Serve
+        );
     }
     let s = lease_stats(&vol);
     assert_eq!(
@@ -1177,20 +1524,36 @@ async fn dominance_over_a_common_window_decides_every_offer() {
     );
     assert_eq!(s.ships, 39 + 10 + 1 + 12_000);
     // ONE dominating requester (appender 1) reaches N_floor on the idle
-    // tree: the IDLE arm offers to it and nobody else.
-    for i in 0..n_floor {
-        let v = vol.note_slot_ship(idle_slot, 1).await;
-        if i + 1 < n_floor {
-            assert_eq!(v, ShipVerdict::Serve);
-        } else {
-            assert_eq!(v, ShipVerdict::OfferIdle { to: 1 });
+    // tree: the IDLE arm offers to it and nobody else. `N_floor` is LIVE
+    // — every served ship feeds the ship-cost EWMA (Issue 7) — so the
+    // verdict is checked against the floor in force AT the ship: the
+    // offer fires at exactly the first ship where `ops_q ≥ N_floor`.
+    let mut ops_q = 0u64;
+    loop {
+        ops_q += 1;
+        let v = vol.note_slot_ship(idle_slot, 1, SHIP_NS).await;
+        let nf = plane.n_floor();
+        assert!((2..1_000).contains(&nf), "N_floor in force: {nf}");
+        if ops_q >= nf {
+            assert_eq!(
+                v,
+                ShipVerdict::OfferIdle { to: 1 },
+                "ship {ops_q} ≥ N_floor {nf}"
+            );
+            break;
         }
+        assert_eq!(v, ShipVerdict::Serve, "ship {ops_q} < N_floor {nf}");
+        assert!(
+            ops_q < 10_000,
+            "no offer after {ops_q} ships (N_floor {nf})"
+        );
     }
+    let n_floor = plane.n_floor();
     let s = lease_stats(&vol);
     assert_eq!((s.offers, s.offers_idle, s.offers_dominated), (1, 1, 0));
     // The crowd keeps being served while the offer stands.
     assert_eq!(
-        vol.note_slot_ship(idle_slot, 12_345).await,
+        vol.note_slot_ship(idle_slot, 12_345, SHIP_NS).await,
         ShipVerdict::Serve
     );
     assert_eq!(lease_stats(&vol).offers, 1);
@@ -1204,9 +1567,12 @@ async fn dominance_over_a_common_window_decides_every_offer() {
             .await
             .unwrap();
     }
+    // The EWMA has converged on SHIP_NS by now (`N_floor` is stable);
+    // the floor read here is the one every ship below evaluates against.
     let need = (2 * 5).max(n_floor);
     for i in 0..need {
-        let v = vol.note_slot_ship(trickle_slot, 1).await;
+        let v = vol.note_slot_ship(trickle_slot, 1, SHIP_NS).await;
+        assert_eq!(plane.n_floor(), n_floor, "N_floor converged");
         if i + 1 < need {
             assert_eq!(v, ShipVerdict::Serve, "ship {}", i + 1);
         } else {
@@ -1242,6 +1608,10 @@ async fn dominance_over_a_common_window_decides_every_offer() {
 /// Two nodes alternating on one directory converge on ONE holder: the
 /// requester-side cooldown (the S10 valve over `T_idle`) serves the
 /// alternating touches after the first handover instead of re-offering.
+/// The pin runs ≥ 2 handovers against the REAL `N_floor` (review round 2,
+/// Issue 7): after the first handover the floor is re-read and must
+/// still be a count of ships (< 1,000), never the handover's wall in
+/// nanoseconds — a second idle tree moves at exactly that floor.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn two_nodes_alternating_on_one_directory_converge_on_one_holder() {
     let dir = tempfile::tempdir().unwrap();
@@ -1256,11 +1626,23 @@ async fn two_nodes_alternating_on_one_directory_converge_on_one_holder() {
     let vol = Arc::clone(&routed.volumes[0]);
     let plane = vol.slot_leases().expect("armed");
     assert_eq!(plane.t_idle_ms, 1000);
-    let n_floor = plane.n_floor();
+    // The cold-start seed: a handover is priced before the first one
+    // runs, a ship before the first one is served — the floor is a
+    // count of ships from the arm.
+    let seeded = plane.n_floor();
+    assert!(
+        (2..1_000).contains(&seeded),
+        "the seeded N_floor is a ship count: {seeded}"
+    );
     let slot: ForestSlot = 6; // an idle rotor slot of region 0
                               // Node 1 bursts: the idle arm offers, node 1 accepts — handover 1.
-    for _ in 0..n_floor {
-        vol.note_slot_ship(slot, 1).await;
+    let mut ships = 0;
+    loop {
+        ships += 1;
+        if vol.note_slot_ship(slot, 1, SHIP_NS).await != ShipVerdict::Serve {
+            break;
+        }
+        assert!(ships < 10_000);
     }
     assert_eq!(lease_stats(&vol).offers, 1);
     let AcquireSlotReply::Granted(g) = vol.manager_acquire_slot(1, slot).await.unwrap() else {
@@ -1268,18 +1650,59 @@ async fn two_nodes_alternating_on_one_directory_converge_on_one_holder() {
     };
     assert_eq!(g.g, 2);
     assert!(plane.in_cooldown(slot, squeezefs::mono_core::monotonic_ns_u64()));
+    // The REAL floor after a handover fed the handover EWMA: a ship count.
+    let n_floor = plane.n_floor();
+    assert!(
+        (2..1_000).contains(&n_floor),
+        "N_floor after the first handover is a ship count, not its wall in ns: {n_floor}"
+    );
     // Now node 0 (the manager's own ops would be commits; as a REQUESTER
     // it ships) and node 1 alternate: inside the cooldown every ship is
     // served — no second offer, no second handover.
     for _ in 0..(4 * n_floor) {
-        assert_eq!(vol.note_slot_ship(slot, 0).await, ShipVerdict::Serve);
-        assert_eq!(vol.note_slot_ship(slot, 1).await, ShipVerdict::Serve);
+        assert_eq!(
+            vol.note_slot_ship(slot, 0, SHIP_NS).await,
+            ShipVerdict::Serve
+        );
+        assert_eq!(
+            vol.note_slot_ship(slot, 1, SHIP_NS).await,
+            ShipVerdict::Serve
+        );
     }
     let s = lease_stats(&vol);
     assert_eq!(
         (s.handovers, s.offers),
         (1, 1),
         "the pair converged on one holder"
+    );
+    // Handover 2 — another idle tree moves at the real floor (before the
+    // feed, no offer could fire again on this mount: the floor read
+    // ≈ 10⁷ ships).
+    let slot2: ForestSlot = 7;
+    for i in 0..n_floor {
+        let v = vol.note_slot_ship(slot2, 1, SHIP_NS).await;
+        let nf = plane.n_floor();
+        if i + 1 >= nf {
+            assert_eq!(
+                v,
+                ShipVerdict::OfferIdle { to: 1 },
+                "ship {} ≥ N_floor {nf}",
+                i + 1
+            );
+            break;
+        }
+        assert_eq!(v, ShipVerdict::Serve, "ship {} < N_floor {nf}", i + 1);
+    }
+    let AcquireSlotReply::Granted(g2) = vol.manager_acquire_slot(1, slot2).await.unwrap() else {
+        panic!()
+    };
+    assert_eq!(g2.g, 2);
+    let s = lease_stats(&vol);
+    assert_eq!((s.handovers, s.offers), (2, 2), "two handovers");
+    assert!(
+        (2..1_000).contains(&plane.n_floor()),
+        "N_floor after two handovers: {}",
+        plane.n_floor()
     );
     shutdown(&routed).await;
 }
@@ -1384,7 +1807,7 @@ async fn a_holder_dying_after_its_page_named_releasing_has_tree0_written_from_th
     assert_eq!(digest_backend(&vol).await.unwrap(), digest_before);
     // A fresh acquire takes the tree at g + 1 with the page's root.
     let g = vol
-        .manager_acquire_slots(0, 0, &[SLOT4])
+        .manager_acquire_slots(0, 0, &[SLOT4], ControlAdmit::Try)
         .await
         .unwrap()
         .pop()
@@ -1474,7 +1897,7 @@ async fn tree0_wins_over_a_stale_releasing_page_entry() {
     // manager (region 0) acquires it — tree 0 Leased { 0, g = 3 } — and
     // the process dies before page 0 names it.
     let g = vol
-        .manager_acquire_slots(1, 0, &[SLOT4])
+        .manager_acquire_slots(1, 0, &[SLOT4], ControlAdmit::Try)
         .await
         .unwrap()
         .pop()
@@ -1491,7 +1914,7 @@ async fn tree0_wins_over_a_stale_releasing_page_entry() {
         .expect_err("the seam kills the holder");
     TEST_HANDOVER_HOLD_AFTER_TREE0.store(false, Ordering::Relaxed);
     let g = vol
-        .manager_acquire_slots(0, 0, &[SLOT4])
+        .manager_acquire_slots(0, 0, &[SLOT4], ControlAdmit::Try)
         .await
         .unwrap()
         .pop()
@@ -1588,7 +2011,7 @@ async fn a_requester_retries_against_the_successor_and_a_dead_requesters_lease_s
         let n_floor = vol.slot_leases().unwrap().n_floor();
         let need = (2 * 4).max(n_floor);
         for _ in 0..need {
-            vol.note_slot_ship(slot, joiner).await;
+            vol.note_slot_ship(slot, joiner, SHIP_NS).await;
         }
         assert_eq!(lease_stats(&vol).offers, 1);
         // The accept dies with the manager after tree 0 wrote the release.
@@ -1620,7 +2043,7 @@ async fn a_requester_retries_against_the_successor_and_a_dead_requesters_lease_s
         ManagerService::new(Arc::clone(&vol)),
     )
     .unwrap();
-    let mut client = ManagerClient::connect(&host.endpoint().to_string(), SECRET, "joiner-3")
+    let mut client = ManagerClient::connect(&host.endpoint().to_string(), SECRET, "joiner-3", 0)
         .await
         .unwrap();
     // The joiner's page is Live in the directory: its re-join is `already`.
@@ -1666,9 +2089,10 @@ async fn a_requester_retries_against_the_successor_and_a_dead_requesters_lease_s
         plane.holders.holder(slot).map(|h| (h.appender_id, h.g)),
         Some((joiner, g))
     );
-    let mut client = ManagerClient::connect(&host.endpoint().to_string(), SECRET, "joiner-3-again")
-        .await
-        .unwrap();
+    let mut client =
+        ManagerClient::connect(&host.endpoint().to_string(), SECRET, "joiner-3-again", 0)
+            .await
+            .unwrap();
     match client.join(joiner_identity(3), 0).await.unwrap() {
         ManagerReply::Joined { already, .. } => assert!(already),
         other => panic!("{other:?}"),
@@ -1751,7 +2175,7 @@ async fn a_slot_released_reacquired_with_its_top_inos_deleted_never_remints_an_i
         }
         // Re-acquire in-process: the next mint is above the top.
         let g = vol
-            .manager_acquire_slots(0, 0, &[slot])
+            .manager_acquire_slots(0, 0, &[slot], ControlAdmit::Try)
             .await
             .unwrap()
             .pop()
@@ -1769,7 +2193,7 @@ async fn a_slot_released_reacquired_with_its_top_inos_deleted_never_remints_an_i
     let vol = Arc::clone(&routed.volumes[0]);
     assert_eq!(digest_backend(&vol).await.unwrap(), digest);
     let g = vol
-        .manager_acquire_slots(0, 0, &[slot])
+        .manager_acquire_slots(0, 0, &[slot], ControlAdmit::Try)
         .await
         .unwrap()
         .pop()
@@ -2059,7 +2483,7 @@ async fn the_renewal_grant_carries_the_members_slot_leases_recalls_and_offers() 
     let plane = vol.slot_leases().expect("armed");
     let offered_slot: ForestSlot = 7;
     for _ in 0..plane.n_floor() {
-        vol.note_slot_ship(offered_slot, joiner).await;
+        vol.note_slot_ship(offered_slot, joiner, SHIP_NS).await;
     }
     let RenewOutcome::Renewed(grant) = owner.renew(&member_id, epoch, 0) else {
         panic!("renew refused");
@@ -2139,7 +2563,7 @@ async fn the_manager_verbs_ride_the_owner_listener_dispatched_by_volume_ordinal(
     )
     .unwrap();
     let endpoint = host.endpoint().to_string();
-    let mut client = ManagerClient::connect(&endpoint, SECRET, "joiner-9")
+    let mut client = ManagerClient::connect(&endpoint, SECRET, "joiner-9", 0)
         .await
         .unwrap();
     let reply = client.join(joiner_identity(9), 0).await.unwrap();
@@ -2150,10 +2574,9 @@ async fn the_manager_verbs_ride_the_owner_listener_dispatched_by_volume_ordinal(
         ManagerReply::SlotsGranted { slots, .. } => assert_eq!(slots[0].slot, 500),
         other => panic!("{other:?}"),
     }
-    let mut wrong = ManagerClient::connect(&endpoint, SECRET, "joiner-9b")
+    let mut wrong = ManagerClient::connect(&endpoint, SECRET, "joiner-9b", 5)
         .await
-        .unwrap()
-        .for_volume(5);
+        .unwrap();
     let e = wrong
         .resolve_slot(500)
         .await
@@ -2319,7 +2742,7 @@ async fn a_stale_release_is_refused_before_tree0_is_written() {
     };
     let root1 = *root1;
     let g2 = vol
-        .manager_acquire_slots(0, 0, &[slot])
+        .manager_acquire_slots(0, 0, &[slot], ControlAdmit::Try)
         .await
         .unwrap()
         .pop()

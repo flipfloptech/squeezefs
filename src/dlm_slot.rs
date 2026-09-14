@@ -100,8 +100,35 @@ static DLM_RPCS: AtomicU64 = AtomicU64::new(0);
 /// The installed per-slot lock-ownership table, or `None` = **solo**:
 /// this node owns every slot. An `ArcSwapOption` because the answer must
 /// be readable lock-free on the acquire path and replaceable wholesale by
-/// a future remastering event (the `PlacementTable` precedent).
+/// a future remastering event (the `PlacementTable` precedent). Composed
+/// from [`OWNER_SOURCES`] by [`rebuild_owner_table`] — never stored by a
+/// contributor directly.
 static SLOT_OWNERS: Lazy<ArcSwapOption<SlotOwners>> = Lazy::new(ArcSwapOption::empty);
+
+/// The two contributors of the owner table (PR 4 review round 2, Issue
+/// 13 — the table was one process-global word each armed volume stored
+/// WHOLESALE, so the second volume's install marked the first volume's
+/// foreign slots local again and both clobbered S8's `arm_ownership`):
+///
+/// * `ownership_local` — the S8 metadata-ownership plane's local set
+///   (`arm_ownership`; `None` = not armed, every slot local as far as it
+///   is concerned);
+/// * `lease_foreign` — per armed symmetric VOLUME (keyed by its
+///   superblock uuid), the routing slots a FOREIGN appender leases on
+///   it (design-symmetric-metadata §5.1.5).
+///
+/// The table in force is `local = (ownership_local ∨ all) ∖ ⋃ lease_
+/// foreign`; solo (`None`) iff no contributor is present.
+#[derive(Default)]
+struct OwnerSources {
+    ownership_local: Option<Vec<u16>>,
+    lease_foreign: std::collections::BTreeMap<u128, Vec<u16>>,
+}
+
+static OWNER_SOURCES: std::sync::Mutex<OwnerSources> = std::sync::Mutex::new(OwnerSources {
+    ownership_local: None,
+    lease_foreign: std::collections::BTreeMap::new(),
+});
 
 /// `dlm_mode` when no owner table is installed: this node is the lock
 /// authority for every slot. The shipped mount's answer.
@@ -133,6 +160,21 @@ impl SlotOwners {
         }
         Self {
             local: local.into_boxed_slice(),
+        }
+    }
+
+    /// Every slot of the u16 namespace local (1024 full words) — the
+    /// starting point a foreign set is subtracted from (Issue 15: never a
+    /// 65,536-entry vector per install).
+    fn all() -> Self {
+        Self {
+            local: vec![u64::MAX; (usize::from(u16::MAX) + 1) / 64].into_boxed_slice(),
+        }
+    }
+
+    fn clear(&mut self, slot: u16) {
+        if let Some(word) = self.local.get_mut(usize::from(slot) / 64) {
+            *word &= !(1u64 << (slot % 64));
         }
     }
 
@@ -218,10 +260,44 @@ pub fn dlm_rpcs() -> u64 {
 /// the same instant they leave the metadata plane's — no window exists in
 /// which one plane would grant what the other ships away.
 pub(crate) fn install_local_slots(slots: Option<&[u16]>) {
-    match slots {
-        None => SLOT_OWNERS.store(None),
-        Some(slots) => SLOT_OWNERS.store(Some(Arc::new(SlotOwners::from_slots(slots)))),
+    let mut src = OWNER_SOURCES.lock().unwrap_or_else(|e| e.into_inner());
+    src.ownership_local = slots.map(<[u16]>::to_vec);
+    rebuild_owner_table(&src);
+}
+
+/// The symmetric plane's contribution of ONE armed volume (PR 4, §5.1.5):
+/// the routing slots a foreign appender leases on `volume` (its
+/// superblock uuid), or `None` at its leave. A per-volume MERGE — every
+/// other volume's foreign set and S8's local set stay in force (Issue 13).
+pub(crate) fn install_lease_foreign_slots(volume: u128, foreign: Option<&[u16]>) {
+    let mut src = OWNER_SOURCES.lock().unwrap_or_else(|e| e.into_inner());
+    match foreign {
+        None => {
+            src.lease_foreign.remove(&volume);
+        }
+        Some(f) => {
+            src.lease_foreign.insert(volume, f.to_vec());
+        }
     }
+    rebuild_owner_table(&src);
+}
+
+/// Compose the table in force from its contributors and publish it.
+fn rebuild_owner_table(src: &OwnerSources) {
+    if src.ownership_local.is_none() && src.lease_foreign.is_empty() {
+        SLOT_OWNERS.store(None);
+        return;
+    }
+    let mut table = match &src.ownership_local {
+        Some(local) => SlotOwners::from_slots(local),
+        None => SlotOwners::all(),
+    };
+    for foreign in src.lease_foreign.values() {
+        for slot in foreign {
+            table.clear(*slot);
+        }
+    }
+    SLOT_OWNERS.store(Some(Arc::new(table)));
 }
 
 /// **Test seam** (the [`crate::dlm::test_arm_cw_mode`] precedent):

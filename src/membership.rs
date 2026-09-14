@@ -1300,20 +1300,20 @@ pub struct Grant {
     /// a reclaim after a manager failover re-asserts exactly this set
     /// (PR 10's grace arm). Empty on an owner with no armed symmetric
     /// plane and for a member that holds no slot. Rides the
-    /// `CLUSTER_WIRE_SCHEMA` 5 grant (the program's wire, unreleased).
-    #[serde(default)]
+    /// `CLUSTER_WIRE_SCHEMA` 5 grant (the program's wire, unreleased —
+    /// KD-7 same-commit fleets govern: the frame is positional bincode,
+    /// so a shorter frame fails to decode whole; no field here is
+    /// defaulted).
     pub slot_leases_ack: SlotLeasesAck,
     /// **Slots the manager asks this member to RELEASE** (routing slots):
     /// a requester's accepted offer of a slot this member holds — the
     /// holder-side `RecallForOffer` carried on the renewal, since a
     /// member serves no push channel. The member runs flush-then-transfer
     /// and `ReleaseSlot`; the requester's `AcquireSlot` retries after.
-    #[serde(default)]
     pub slot_release_notices: Vec<u16>,
     /// **Offers standing FOR this member** — `(routing slot, g)` the
     /// holder offered it (§5.1.4): the member accepts with `AcquireSlot`
     /// before the offer's one-renewal expiry, or lets it lapse.
-    #[serde(default)]
     pub offered_slots: Vec<(u16, u32)>,
 }
 

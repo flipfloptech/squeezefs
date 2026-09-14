@@ -608,6 +608,14 @@ pub fn phase_record(phase: ShipPhase, t0: std::time::Instant) {
     SHIP_PROF[phase as usize].record(t0.elapsed());
 }
 
+/// Exact `(sum_ns, count)` of one client-side phase — the slot-lease
+/// plane's `N_floor` ship-cost seed reads `Rtt` (design-symmetric-metadata
+/// §5.1.4; the stats inode carries the same words as JSON).
+pub fn ship_phase_totals(phase: ShipPhase) -> (u64, u64) {
+    let h = &SHIP_PROF[phase as usize];
+    (h.sum_ns(), h.count())
+}
+
 /// `meta_ship_phase_ns` — the client-side decomposition.
 pub fn phase_json() -> serde_json::Value {
     let mut phases = serde_json::Map::new();

@@ -1987,6 +1987,11 @@ impl KvTree {
                 for (i, (_tag, r)) in recs.iter_mut().enumerate() {
                     r.seq = seq_base + i as u64;
                 }
+                // The slot's record frontier: a release cycles until the
+                // region's tail passes this entry (Issue 11).
+                if let Some(slot) = self.forest_slot {
+                    self.cache.note_slot_record_frontier(slot, res.end());
+                }
                 (res, recs)
             });
 
@@ -2989,6 +2994,11 @@ impl KvTree {
                 for (i, (_tag, r)) in recs.iter_mut().enumerate() {
                     r.seq = seq_base + i as u64;
                 }
+                // The slot's record frontier: a release cycles until the
+                // region's tail passes this entry (Issue 11).
+                if let Some(slot) = self.forest_slot {
+                    self.cache.note_slot_record_frontier(slot, res.end());
+                }
                 (res, recs)
             });
 
@@ -3191,6 +3201,11 @@ impl KvTree {
                 let (res, seq_base) = ring.reserve_registered(adm);
                 for (i, (_tag, r)) in recs.iter_mut().enumerate() {
                     r.seq = seq_base + i as u64;
+                }
+                // The slot's record frontier: a release cycles until the
+                // region's tail passes this entry (Issue 11).
+                if let Some(slot) = self.forest_slot {
+                    self.cache.note_slot_record_frontier(slot, res.end());
                 }
                 (res, recs)
             });

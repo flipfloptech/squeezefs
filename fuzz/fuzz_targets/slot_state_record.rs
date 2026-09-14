@@ -64,9 +64,10 @@ fuzz_target!(|data: &[u8]| {
             );
             let re = state.encode().expect("a decoded record re-encodes");
             assert_eq!(re, data, "the record is byte-exact");
+            // The variant byte is the discriminant the decoder honoured.
             match &state {
-                SlotState::Unleased { root, .. } => assert_eq!(state.root(), Some(*root)),
-                SlotState::Leased { .. } => assert_eq!(state.root(), None),
+                SlotState::Unleased { .. } => assert_eq!(data[1], 1),
+                SlotState::Leased { .. } => assert_eq!(data[1], 2),
             }
         }
         Err(_) => {

@@ -1273,14 +1273,11 @@ async fn checkpoint_task(
                 return; // final checkpoint ran inside the tick
             }
             // The slot-lease cadence (design-symmetric-metadata §5.1.3 /
-            // §5.1.4, PR 4) — OUTSIDE the tick's SMO guard: a release runs
-            // its own covering checkpoint. A no-op unarmed.
-            if let Err(e) = be.slot_lease_cadence().await {
-                log::warn!(
-                    "slot-lease cadence failed on {:?}: {e} (the next tick retries)",
-                    be.device_path()
-                );
-            }
+            // §5.1.4, PR 4) — on its OWN task, never inline: a release
+            // drains the commit door, and a parked committer needs THIS
+            // task's next tick to free ring space (review round 2, Issue
+            // 6). Single-flight; a no-op unarmed.
+            be.spawn_slot_lease_cadence();
         } else {
             // §4.6 pt 1's threshold trigger (a commit crossed a bset
             // worth of open delta): appends only — no barrier, no ledger,

@@ -12,8 +12,8 @@
 
 use super::record::ForestSlot;
 use crate::slot_lease_core::{
-    affinity_ceiling_bytes, mint_slots_derived, DominanceWindow, LeaseGate, LeaseState,
-    SlotLeaseTable, MINT_SPREAD,
+    affinity_ceiling_bytes, mint_slots_derived, DominanceWindow, LeaseGate, SlotLeaseTable,
+    MINT_SPREAD,
 };
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -148,6 +148,21 @@ impl SlotExtentLedger {
     pub fn forget(&self, slot: ForestSlot) {
         let _ = self.map.remove_sync(&slot);
     }
+
+    /// Σ over every slot tree this mount holds a count for — the
+    /// affinity cap's `used_leaf_bytes` input in extents (review round 2,
+    /// Issue 10: the ledger counts every slot tree's IMAGES, leaves and
+    /// interior; at the shipped fan-out the interior share is under 1 %,
+    /// and none of the non-leaf heap — rings, the directory, pages, tree 0
+    /// — is in it).
+    pub fn total(&self) -> u64 {
+        let mut sum = 0u64;
+        self.map.iter_sync(|_, c| {
+            sum = sum.saturating_add(c.load(Ordering::Relaxed));
+            true
+        });
+        sum
+    }
 }
 
 /// `slot_handover_phase_ns` — `flush / page / tree0 / grant / total`,
@@ -248,6 +263,11 @@ pub struct SlotLeasePlane {
     /// The volume's native routing slot (page entries name ROUTING slots;
     /// the carriage does too).
     pub native_slot: u16,
+    /// The volume's superblock uuid — the process-global S4 owner
+    /// table's per-volume key (`dlm_slot::install_lease_foreign_slots`);
+    /// the plane's drop withdraws the contribution, so a backend dropped
+    /// without its leave never leaves a stale foreign set behind.
+    pub volume_uuid: u128,
     /// Appender id → `(node_token, mount_slot)` of every `Live` page in
     /// the directory (the arm reads it; a wire join adds one) — the
     /// membership carriage's member-id → appender resolution.
@@ -257,18 +277,34 @@ pub struct SlotLeasePlane {
     /// `slot_release_notices`; cleared by its `ReleaseSlot`.
     pub recalls:
         std::sync::Mutex<std::collections::BTreeMap<u32, std::collections::BTreeSet<ForestSlot>>>,
+    /// Fired when a handover COMPLETES or aborts (the gate's `Releasing`
+    /// bit cleared, the requester granted): the door's park wakes here
+    /// and re-reads the slot (review round 2, Issue 6).
+    pub handover_done: squeezefs_ipc::sqz_notify::Notify,
+    /// Fired when a door token returns and the slot's count reaches 0:
+    /// a release parked on the door's drain wakes here.
+    pub door_drained: squeezefs_ipc::sqz_notify::Notify,
+    /// **The one-writer mutex of the rotor** (review round 2, Issue 5):
+    /// every clone-and-store of `rotor` runs under it — the arm, the
+    /// overflow arm's push, the handover's and the leave's removal — so
+    /// two RMWs from two critical sections can never lose an update.
+    /// Held for the RMW only, never across an await; readers stay
+    /// lock-free on the `ArcSwap`.
+    rotor_writer: std::sync::Mutex<()>,
     // ---- gauges (§11) ----
     pub acquires: AtomicU64,
     pub grants: AtomicU64,
     pub offers_idle: AtomicU64,
     pub offers_dominated: AtomicU64,
+    /// `OfferSlot` answered `Busy` — a second dominating ship before the
+    /// accept (legal; never `manager_verb_refusals`).
+    pub offers_busy: AtomicU64,
     pub handovers: AtomicU64,
     pub ships: AtomicU64,
     pub lru_releases: AtomicU64,
     pub forced_shrinks: AtomicU64,
     pub conflicts: AtomicU64,
     pub resolve_rpcs: AtomicU64,
-    pub resolve_redirects: AtomicU64,
     pub affinity_mints: AtomicU64,
     pub rotor_mints: AtomicU64,
     pub ceiling_spills: AtomicU64,
@@ -276,7 +312,24 @@ pub struct SlotLeasePlane {
     pub region_releases: AtomicU64,
     pub recall_notices: AtomicU64,
     pub stale_entries: AtomicU64,
+    /// Commits parked at the door on a slot mid-handover (Issue 6).
+    pub door_parks: AtomicU64,
+    /// Commits refused at the door because another appender leases the
+    /// slot — `SlotBusy`, the "ship to the holder" class (legal).
+    pub door_refusals: AtomicU64,
+    /// Explicit `AcquireSlot(s)` asks for a slot another appender holds
+    /// (legal; the singular verb's `Refused` reply and the plural's error).
+    pub acquire_refusals: AtomicU64,
+    /// Rotor asks refused past `2 × M` (legal — the overflow arm's
+    /// designed past-cap answer).
+    pub rotor_cap_refusals: AtomicU64,
     pub phases: HandoverPhases,
+}
+
+impl Drop for SlotLeasePlane {
+    fn drop(&mut self) {
+        crate::dlm_slot::install_lease_foreign_slots(self.volume_uuid, None);
+    }
 }
 
 impl SlotLeasePlane {
@@ -286,14 +339,24 @@ impl SlotLeasePlane {
         mint_slots: u64,
         declared: std::collections::BTreeMap<u32, std::collections::BTreeSet<ForestSlot>>,
         native_slot: u16,
+        volume_uuid: u128,
     ) -> Self {
         Self {
             declared,
             native_slot,
+            volume_uuid,
             identities: std::sync::Mutex::new(std::collections::BTreeMap::new()),
             recalls: std::sync::Mutex::new(std::collections::BTreeMap::new()),
+            handover_done: squeezefs_ipc::sqz_notify::Notify::new(),
+            door_drained: squeezefs_ipc::sqz_notify::Notify::new(),
+            rotor_writer: std::sync::Mutex::new(()),
             recall_notices: AtomicU64::new(0),
             stale_entries: AtomicU64::new(0),
+            door_parks: AtomicU64::new(0),
+            door_refusals: AtomicU64::new(0),
+            acquire_refusals: AtomicU64::new(0),
+            rotor_cap_refusals: AtomicU64::new(0),
+            offers_busy: AtomicU64::new(0),
             table: SlotLeaseTable::new(),
             gate,
             dominance: DominanceWindow::new(),
@@ -323,7 +386,6 @@ impl SlotLeasePlane {
             forced_shrinks: AtomicU64::new(0),
             conflicts: AtomicU64::new(0),
             resolve_rpcs: AtomicU64::new(0),
-            resolve_redirects: AtomicU64::new(0),
             affinity_mints: AtomicU64::new(0),
             rotor_mints: AtomicU64::new(0),
             ceiling_spills: AtomicU64::new(0),
@@ -400,13 +462,53 @@ impl SlotLeasePlane {
     /// Mirror the lease table into the holder cache (the manager's own
     /// tree-0 view — every grant and release it writes lands here).
     pub fn refresh_holders(&self) {
-        self.holders.refresh(
-            self.table
-                .snapshot()
-                .into_iter()
-                .filter(|(_, l)| l.state != crate::slot_lease_core::LeaseState::Unleased)
-                .map(|(s, l)| (s, l.holder, l.g)),
-        );
+        self.holders.refresh(self.table.leased_entries());
+    }
+
+    /// Mutate the rotor under its one-writer mutex (Issue 5): `f` sees
+    /// the current vector and returns the next; readers keep their
+    /// lock-free `ArcSwap` load.
+    pub fn rotor_update(&self, f: impl FnOnce(&mut Vec<ForestSlot>)) {
+        let _w = self.rotor_writer.lock().unwrap_or_else(|e| e.into_inner());
+        let mut next = (**self.rotor.load()).clone();
+        f(&mut next);
+        self.rotor.store(Arc::new(next));
+    }
+
+    /// Seed the `N_floor` inputs at the arm from the mount's always-on
+    /// EWMAs (§5.1.4's cold start, review round 2 Issue 7): one ship =
+    /// the S8 `meta_ship_phase_ns.rtt` mean when a verb has shipped, else
+    /// one journal write's round trip (`uring_fs_write_phase_ns.total` —
+    /// the in-process proxy for a fabric RTT, the same order on the
+    /// fleet's fabric; the first measured ship replaces it); one handover
+    /// = [`crate::slot_lease_core::handover_cold_start_ns`] over the
+    /// barrier and RTT means. Idempotent: a seeded EWMA is left alone.
+    pub fn seed_n_floor_inputs(&self) {
+        let mean = |(sum, n): (u64, u64)| if n == 0 { 0 } else { sum / n };
+        let write_ns = mean(crate::uring_fs::uring_fs_write_phase_totals(
+            crate::uring_fs::UringFsWritePhase::Total,
+        ));
+        let rtt_ns = mean(crate::meta_ship::ship_phase_totals(
+            crate::meta_ship::ShipPhase::Rtt,
+        ));
+        let ship_ns = if rtt_ns != 0 { rtt_ns } else { write_ns };
+        if ship_ns != 0 {
+            let _ = self.ewma_ship_ns.compare_exchange(
+                0,
+                ship_ns,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            );
+        }
+        let handover_ns = crate::slot_lease_core::handover_cold_start_ns(write_ns, ship_ns);
+        if handover_ns != 0 {
+            let _ = self.ewma_handover_ns.compare_exchange(
+                0,
+                handover_ns,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            );
+        }
     }
 
     /// `N_floor` in force (`slot_offer_n_floor`): the measured handover
@@ -471,8 +573,7 @@ impl SlotLeasePlane {
             lru_releases: self.lru_releases.load(Relaxed),
             forced_shrinks: self.forced_shrinks.load(Relaxed),
             conflicts: self.conflicts.load(Relaxed),
-            resolve_rpcs: self.resolve_rpcs.load(Relaxed) + self.holders.resolve_rpcs(),
-            resolve_redirects: self.resolve_redirects.load(Relaxed) + self.holders.redirects(),
+            resolve_rpcs: self.resolve_rpcs.load(Relaxed),
             tree_inos_p50: percentile(&inos, 50),
             tree_inos_p99: percentile(&inos, 99),
             tree_inos_max: inos.iter().copied().max().unwrap_or(0),
@@ -487,6 +588,11 @@ impl SlotLeasePlane {
             region_releases: self.region_releases.load(Relaxed),
             recall_notices: self.recall_notices.load(Relaxed),
             stale_entries: self.stale_entries.load(Relaxed),
+            door_parks: self.door_parks.load(Relaxed),
+            door_refusals: self.door_refusals.load(Relaxed),
+            acquire_refusals: self.acquire_refusals.load(Relaxed),
+            rotor_cap_refusals: self.rotor_cap_refusals.load(Relaxed),
+            offers_busy: self.offers_busy.load(Relaxed),
         }
     }
 
@@ -560,20 +666,21 @@ impl SlotLeasePlane {
         let routing = |slot: ForestSlot| -> Option<u16> {
             super::appender::page_slot_of_forest_slot(slot, self.native_slot).ok()
         };
-        for (slot, lease) in self.table.snapshot() {
-            let Some(r) = routing(slot) else {
-                continue;
-            };
-            match lease.state {
-                LeaseState::Unleased => {}
-                LeaseState::Offered if ids.contains(&lease.offered_to) => {
-                    out.offered.push((r, lease.g));
-                    if ids.contains(&lease.holder) {
-                        out.leases.push((r, lease.g));
-                    }
+        // O(held + offered) off the table's holder and offer indexes
+        // (Issue 16) — bounded by the page budget per appender.
+        for id in &ids {
+            for slot in self.table.held_by(*id) {
+                let Some(r) = routing(slot) else {
+                    continue;
+                };
+                if let Some(l) = self.table.get(slot) {
+                    out.leases.push((r, l.g));
                 }
-                _ if ids.contains(&lease.holder) => out.leases.push((r, lease.g)),
-                _ => {}
+            }
+            for (slot, g) in self.table.offered_to(*id) {
+                if let Some(r) = routing(slot) {
+                    out.offered.push((r, g));
+                }
             }
         }
         for id in &ids {
@@ -588,6 +695,47 @@ impl SlotLeasePlane {
         out.release_notices.sort_unstable();
         out.release_notices.dedup();
         out
+    }
+}
+
+/// **A commit's door tokens** (review round 2, Issue 6 — the §5.4.1 door
+/// law): one token per distinct slot the tx's records name, taken at the
+/// door ([`LeaseGate::enter`]) and returned at the tx's TERMINAL outcome
+/// — the queue entry owns it, the way it owns the tx's DLM guards, so a
+/// dropped committer future cannot return a token early. A release
+/// raises `Releasing` and drains the slot's tokens before its flush;
+/// the last token out wakes it (`door_drained`).
+pub struct DoorPass {
+    plane: Arc<SlotLeasePlane>,
+    slots: Vec<ForestSlot>,
+}
+
+impl std::fmt::Debug for DoorPass {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DoorPass")
+            .field("slots", &self.slots)
+            .finish()
+    }
+}
+
+impl DoorPass {
+    /// The tokens of `slots`, already taken on `plane`'s gate.
+    pub fn new(plane: Arc<SlotLeasePlane>, slots: Vec<ForestSlot>) -> Self {
+        Self { plane, slots }
+    }
+}
+
+impl Drop for DoorPass {
+    fn drop(&mut self) {
+        let mut drained = false;
+        for slot in &self.slots {
+            if self.plane.gate.leave(*slot) == 0 {
+                drained = true;
+            }
+        }
+        if drained {
+            self.plane.door_drained.notify_waiters();
+        }
     }
 }
 
@@ -677,8 +825,9 @@ pub struct SlotLeaseStats {
     pub forced_shrinks: u64,
     /// **Must-stay-0**: two live attestations of one slot (C14's live face).
     pub conflicts: u64,
+    /// `ResolveSlot` verbs served (the wire's stale-view fallback; 0 on a
+    /// solo mount — the warm path is the holder cache).
     pub resolve_rpcs: u64,
-    pub resolve_redirects: u64,
     /// Cursor-derived per held slot: minted inos p50 / p99 / max.
     pub tree_inos_p50: u64,
     pub tree_inos_p99: u64,
@@ -702,4 +851,18 @@ pub struct SlotLeaseStats {
     /// at the arm as stale residue (a leave or handover the page never
     /// recorded — review round 2 Issue 8).
     pub stale_entries: u64,
+    /// Commits parked at the door on a slot mid-handover (Issue 6 — a
+    /// park, never an error; the handover is bounded).
+    pub door_parks: u64,
+    /// Commits refused `SlotBusy` at the door: another appender leases
+    /// the slot (the "ship to the holder" class — PR 6/12's ship).
+    pub door_refusals: u64,
+    /// Explicit acquires of a slot another appender holds (legal).
+    pub acquire_refusals: u64,
+    /// Rotor asks refused past `2 × M` (legal — the overflow arm's
+    /// designed answer).
+    pub rotor_cap_refusals: u64,
+    /// `OfferSlot` answered `Busy` — a second dominating ship before the
+    /// accept (legal).
+    pub offers_busy: u64,
 }

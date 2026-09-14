@@ -2504,6 +2504,17 @@ pub struct NodeCache {
     /// [`Self::durable_tail_for_slot`]; empty for the life of every
     /// volume without a declared region.
     slot_tails: ArcSwap<std::collections::BTreeMap<super::record::ForestSlot, u64>>,
+    /// **The per-slot record frontier** of an ARMED symmetric mount
+    /// (design-symmetric-metadata §5.1.4; PR 4 review round 2, Issue
+    /// 11): for each leased slot, one past the highest ring position any
+    /// record of its tree was journaled at by this mount — the conveyor
+    /// pass notes its batch's end for every slot-stamped node of the
+    /// union, an SMO its entry's end, the arm the ring's head. A release
+    /// cycles until the region's `reusable_upto` reaches it (and the root
+    /// is published): the departing ring's window is then CLEAR of the
+    /// slot by a post-condition, not by a fixed cycle count. Latch-free
+    /// (one `fetch_max`); empty on every unarmed mount.
+    slot_frontiers: scc::HashMap<super::record::ForestSlot, Arc<AtomicU64>>,
 }
 
 impl std::fmt::Debug for NodeCache {
@@ -2532,7 +2543,38 @@ impl NodeCache {
             dying_floors: AtomicU64::new(u64::MAX),
             dying_leaf_floors: std::sync::Mutex::new(std::collections::BTreeMap::new()),
             slot_tails: ArcSwap::from_pointee(std::collections::BTreeMap::new()),
+            slot_frontiers: scc::HashMap::new(),
         })
+    }
+
+    /// Note that a record of slot `slot`'s tree was journaled below ring
+    /// position `end` (see `slot_frontiers`). A no-op for an unstamped
+    /// node (`u32::MAX`) and on an unarmed gate — one relaxed load on the
+    /// dark forest, nothing on a flat volume.
+    pub fn note_slot_record_frontier(&self, slot: u32, end: u64) {
+        if slot == u32::MAX || !self.lease.is_armed() {
+            return;
+        }
+        if let Some(()) = self
+            .slot_frontiers
+            .read_sync(&slot, |_, c| c.fetch_max(end, Ordering::AcqRel))
+            .map(drop)
+        {
+            return;
+        }
+        let fresh = Arc::new(AtomicU64::new(end));
+        if let Err((_, fresh)) = self.slot_frontiers.insert_sync(slot, fresh) {
+            let _ = self.slot_frontiers.read_sync(&slot, |_, c| {
+                c.fetch_max(fresh.load(Ordering::Acquire), Ordering::AcqRel)
+            });
+        }
+    }
+
+    /// The frontier of `slot` (0 = no record noted since the arm).
+    pub fn slot_record_frontier(&self, slot: u32) -> u64 {
+        self.slot_frontiers
+            .read_sync(&slot, |_, c| c.load(Ordering::Acquire))
+            .unwrap_or(0)
     }
 
     /// Fold a departing NODE's `dirty_floor` (see [`Self::note_dying_floor`])

@@ -237,6 +237,14 @@ pub struct SlotLeasePlane {
     /// requester-side cooldown): no new offer of a slot before the
     /// instant recorded at its last handover.
     cooldowns: std::sync::Mutex<std::collections::BTreeMap<ForestSlot, u64>>,
+    /// The slot entries of every in-process region's page AS LOADED at
+    /// open (`region id → entries`): the join's checkpoint rewrites the
+    /// pages from the RAM lease set before the arm settles them against
+    /// tree 0, so the §5.3.4 row 5/6 `Releasing` entries and C14's live
+    /// attestations are read from this snapshot, taken once, drained by
+    /// the arm.
+    pub loaded_page_entries:
+        std::sync::Mutex<std::collections::BTreeMap<u32, Vec<super::appender::SlotEntry>>>,
     // ---- gauges (§11) ----
     pub acquires: AtomicU64,
     pub grants: AtomicU64,
@@ -284,6 +292,7 @@ impl SlotLeasePlane {
             release_seq: AtomicU64::new(0),
             holders: crate::slot_holder_cache::SlotHolderCache::new(),
             cooldowns: std::sync::Mutex::new(std::collections::BTreeMap::new()),
+            loaded_page_entries: std::sync::Mutex::new(std::collections::BTreeMap::new()),
             acquires: AtomicU64::new(0),
             grants: AtomicU64::new(0),
             offers_idle: AtomicU64::new(0),

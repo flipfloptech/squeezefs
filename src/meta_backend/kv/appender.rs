@@ -1173,6 +1173,34 @@ impl RegionGrant {
         n
     }
 
+    /// A slot HANDOVER's custody transfer OUT (design-symmetric-metadata
+    /// §5.1.4 / §5.8.5 C13): the departing lessee's grant stops claiming
+    /// the slot tree's live images — they are the manager's (untracked,
+    /// like its own images) until the requester's grant claims them. The
+    /// bitmap bits stay set (the images are live); the closure law reads
+    /// them as RETURNED. Answers the extents that were claimed here.
+    pub fn transfer_out(&mut self, extents: &[u64]) -> Vec<u64> {
+        let mut out = Vec::new();
+        for e in extents {
+            if self.claimed.remove(e) {
+                self.returned += 1;
+                out.push(*e);
+            }
+        }
+        out
+    }
+
+    /// The transfer IN: the requester's grant claims the slot tree's live
+    /// images (granted by transfer — `granted` counts them).
+    pub fn transfer_in(&mut self, extents: &[u64]) {
+        for e in extents {
+            self.unclaimed.remove(e);
+            if self.claimed.insert(*e) {
+                self.granted += 1;
+            }
+        }
+    }
+
     /// The claimed set (fsck C13's candidate population).
     pub fn claimed_extents(&self) -> Vec<u64> {
         self.claimed.iter().copied().collect()
@@ -2118,7 +2146,12 @@ impl AppenderSet {
     /// `joins − leaves − recoveries ≡ live` holds on every posture).
     pub fn live(&self) -> u64 {
         if self.joined.load(std::sync::atomic::Ordering::Acquire) {
-            self.regions.len() as u64
+            // A region RELEASED at the cadence (§5.1.3 — its last slot
+            // went) is `Free` again: one leave, no longer live.
+            self.regions
+                .iter()
+                .filter(|r| !r.released.load(std::sync::atomic::Ordering::Acquire))
+                .count() as u64
         } else {
             0
         }

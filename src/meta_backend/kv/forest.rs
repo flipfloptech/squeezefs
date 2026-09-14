@@ -624,6 +624,20 @@ impl SlotTrees {
         self.publishes.fetch_add(1, Ordering::Relaxed);
         super::META_KV_FOREST_ROOT_PUBLISHES.fetch_add(1, Ordering::Relaxed);
     }
+
+    /// [`Self::note_published`] for a root a LEASED slot's appender page
+    /// named (the armed plane's durable home for it): counted only when
+    /// the root MOVED since its last publication — a page names every
+    /// leased root at every checkpoint.
+    pub fn note_page_published(&self, slot: ForestSlot, root: RootPtr) {
+        let moved = self
+            .published
+            .read_sync(&slot, |_, p| *p != root)
+            .unwrap_or(true);
+        if moved {
+            self.note_published(slot, root);
+        }
+    }
 }
 
 /// Translate a LEGACY range bound of an INO-MAJOR kind — exact-length key

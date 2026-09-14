@@ -46,7 +46,7 @@ use squeezefs::meta_backend::kv::{
 use squeezefs::meta_backend::{
     open_routed_meta_set, plan_meta_slot_set, Metadata, RoutedMetaBackend, MINT_SPREAD,
 };
-use squeezefs::slot_lease_core::{LeaseState, ShipVerdict, SlotWords, MINT_SPREAD as CORE_SPREAD};
+use squeezefs::slot_lease_core::{ShipVerdict, MINT_SPREAD as CORE_SPREAD};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
@@ -60,6 +60,11 @@ const RING_LEN: u64 = 1024 * 1024;
 /// The declared seam: appender 1 leases forest slot 4 (routing slot 3).
 const PARTITION: &str = "1:4";
 const SLOT4: ForestSlot = 4;
+/// The seam's ALTERNATE: appender 1 declares forest slot 200 (routing
+/// 199) — outside the manager's rotor (forest slots 2..=65), so a remount
+/// under it leaves slot 4 to whatever tree 0 says.
+const PARTITION_ALT: &str = "1:200";
+const SLOT_ALT: ForestSlot = 200;
 
 /// The seams and knobs are process-global; every test serializes on it.
 static SEAM: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
@@ -175,9 +180,8 @@ impl Knobs {
     }
 }
 
-/// Open the set under `knobs`; the knobs are cleared after the open (the
-/// cadence re-reads `SQUEEZEFS_SYM_MINT_SLOTS`, which the forced-shrink
-/// contract sets on purpose after this).
+/// Open the set under `knobs`; the knobs are cleared after the open (a
+/// mount reads them once, at open — the plane keeps them).
 async fn open_under(uris: &[String], knobs: &Knobs) -> Arc<RoutedMetaBackend> {
     knobs.apply();
     let r = open_routed_meta_set(uris).await;
@@ -1154,4 +1158,648 @@ async fn two_nodes_alternating_on_one_directory_converge_on_one_holder() {
     let s = lease_stats(&vol);
     assert_eq!((s.handovers, s.offers), (1, 1), "the pair converged on one holder");
     shutdown(&routed).await;
+}
+
+// ---------------------------------------------------------------------------
+// §5.3.4 rows 5–8 — the handover's crash windows through the seams.
+// ---------------------------------------------------------------------------
+
+/// Row 5: the holder dies after its page named the slot `Releasing {
+/// root, cursor, g }` and BEFORE tree 0 was written. The next open of
+/// that identity completes the release FROM THE PAGE — tree 0 `Unleased`
+/// at the page's `g` with the page's root and cursor (§5.1.8) — serves
+/// every acked record, counts no conflict, and a fresh acquire takes the
+/// tree at `g + 1` with that root.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_holder_dying_after_its_page_named_releasing_has_tree0_written_from_the_page() {
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    let uris = vec![format_stamped_member(dir.path(), "meta0").await];
+    let path = std::path::Path::new(&uris[0]);
+    let tag = volume_tag("vol-0000000000000005");
+    let owner = ino_in_slot(SLOT4, 5);
+    let (page_entry, digest_before) = {
+        let routed = open_under(&uris, &Knobs::armed().partition(PARTITION)).await;
+        let vol = Arc::clone(&routed.volumes[0]);
+        for i in 0..6 {
+            vol.commit_block_refs(owner, &refs(tag, owner, i * 10, 4))
+                .await
+                .unwrap();
+        }
+        TEST_HANDOVER_HOLD_AFTER_PAGE.store(true, Ordering::Relaxed);
+        let e = vol
+            .release_slot_handover(1, SLOT4)
+            .await
+            .err()
+            .expect("the seam kills the holder");
+        TEST_HANDOVER_HOLD_AFTER_PAGE.store(false, Ordering::Relaxed);
+        assert!(e.to_string().contains("TEST_HANDOVER_HOLD_AFTER_PAGE"), "{e}");
+        // Durable state: page 1 names slot 4 Releasing at g = 1 with the
+        // flushed root; tree 0 still Leased { 1, g: 1 }.
+        let entries = read_directory(path, vol.superblock()).await.unwrap();
+        let p1 = entries[1].page.clone().unwrap();
+        let se = p1
+            .slots
+            .iter()
+            .find(|e| guest_forest_slot(e.slot) == SLOT4)
+            .copied()
+            .expect("the Releasing entry");
+        assert_eq!((se.state, se.g), (SlotEntryState::Releasing, 1));
+        assert_ne!(se.root.addr, 0, "the flushed tree's root travels on the page");
+        let states = tree0_states(&vol).await;
+        assert!(matches!(
+            states.iter().find(|(s, _)| *s == SLOT4).map(|(_, st)| st),
+            Some(SlotState::Leased { appender_id: 1, g: 1, .. })
+        ));
+        let d = digest_backend(&vol).await.unwrap();
+        vol.sync_device().await.unwrap();
+        drop(vol);
+        drop(routed);
+        (se, d)
+    };
+    // The next open of this identity — region 1 declares another slot,
+    // so nothing re-acquires slot 4 behind the settle.
+    let routed = open_under(&uris, &Knobs::armed().partition(PARTITION_ALT)).await;
+    let vol = Arc::clone(&routed.volumes[0]);
+    assert_eq!(lease_stats(&vol).conflicts, 0);
+    let states = tree0_states(&vol).await;
+    match states.iter().find(|(s, _)| *s == SLOT4).map(|(_, st)| st) {
+        Some(SlotState::Unleased {
+            root, cursor, g, ..
+        }) => {
+            assert_eq!(*g, 1, "the page's g");
+            assert_eq!(
+                (root.addr, root.seq),
+                (page_entry.root.addr, page_entry.root.seq),
+                "the page's root"
+            );
+            assert_eq!(*cursor, page_entry.cursor, "the page's cursor (§5.1.8)");
+        }
+        other => panic!("{other:?}"),
+    }
+    let plane = vol.slot_leases().expect("armed");
+    assert!(!plane.gate.is_leased(SLOT4));
+    assert!(plane.gate.is_leased(SLOT_ALT), "region 1's declared slot");
+    assert_eq!(vol.appender_stats().unwrap().regions[1].leases, 1);
+    for i in 0..6 {
+        assert_eq!(vol.block_ref_count(tag, i * 10).await.unwrap(), 1, "block {i}");
+    }
+    assert_eq!(digest_backend(&vol).await.unwrap(), digest_before);
+    // A fresh acquire takes the tree at g + 1 with the page's root.
+    let g = vol
+        .manager_acquire_slots(0, 0, &[SLOT4])
+        .await
+        .unwrap()
+        .pop()
+        .unwrap();
+    assert_eq!(g.g, 2);
+    assert_eq!(g.words.root, (page_entry.root.addr, page_entry.root.seq));
+    vol.commit_block_refs(owner, &refs(tag, owner, 100, 1))
+        .await
+        .unwrap();
+    assert_eq!(vol.block_ref_count(tag, 100).await.unwrap(), 1);
+    shutdown(&routed).await;
+}
+
+/// Row 6: the holder dies AFTER the manager's tree-0 ack and BEFORE its
+/// page dropped the slot — page `Releasing` ∧ tree 0 `Unleased` (first
+/// half), then page `Releasing` ∧ tree 0 `Leased { other }` (second
+/// half). Tree 0 wins both times: the stale entry is dropped, never
+/// completed, never a conflict, and the acked records are served.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn tree0_wins_over_a_stale_releasing_page_entry() {
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    let uris = vec![format_stamped_member(dir.path(), "meta0").await];
+    let path = std::path::Path::new(&uris[0]);
+    let tag = volume_tag("vol-0000000000000006");
+    let owner = ino_in_slot(SLOT4, 5);
+    // ---- first half: tree 0 Unleased.
+    {
+        let routed = open_under(&uris, &Knobs::armed().partition(PARTITION)).await;
+        let vol = Arc::clone(&routed.volumes[0]);
+        for i in 0..4 {
+            vol.commit_block_refs(owner, &refs(tag, owner, i * 10, 2))
+                .await
+                .unwrap();
+        }
+        TEST_HANDOVER_HOLD_AFTER_TREE0.store(true, Ordering::Relaxed);
+        let e = vol
+            .release_slot_handover(1, SLOT4)
+            .await
+            .err()
+            .expect("the seam kills the holder");
+        TEST_HANDOVER_HOLD_AFTER_TREE0.store(false, Ordering::Relaxed);
+        assert!(e.to_string().contains("TEST_HANDOVER_HOLD_AFTER_TREE0"), "{e}");
+        let entries = read_directory(path, vol.superblock()).await.unwrap();
+        let p1 = entries[1].page.clone().unwrap();
+        assert!(p1
+            .slots
+            .iter()
+            .any(|e| guest_forest_slot(e.slot) == SLOT4 && e.state == SlotEntryState::Releasing));
+        let states = tree0_states(&vol).await;
+        assert!(matches!(
+            states.iter().find(|(s, _)| *s == SLOT4).map(|(_, st)| st),
+            Some(SlotState::Unleased { g: 1, .. })
+        ));
+        vol.sync_device().await.unwrap();
+        drop(vol);
+        drop(routed);
+    }
+    let routed = open_under(&uris, &Knobs::armed().partition(PARTITION_ALT)).await;
+    let vol = Arc::clone(&routed.volumes[0]);
+    assert_eq!(lease_stats(&vol).conflicts, 0);
+    let states = tree0_states(&vol).await;
+    assert!(
+        matches!(
+            states.iter().find(|(s, _)| *s == SLOT4).map(|(_, st)| st),
+            Some(SlotState::Unleased { g: 1, .. })
+        ),
+        "tree 0 wins: the release stands at g = 1, never re-completed"
+    );
+    let plane = vol.slot_leases().expect("armed");
+    assert!(!plane.gate.is_leased(SLOT4));
+    for i in 0..4 {
+        assert_eq!(vol.block_ref_count(tag, i * 10).await.unwrap(), 1);
+    }
+    vol.checkpoint_now().await.unwrap();
+    let entries = read_directory(path, vol.superblock()).await.unwrap();
+    let p1 = entries[1].page.clone().unwrap();
+    assert!(
+        p1.slots.iter().all(|e| guest_forest_slot(e.slot) != SLOT4),
+        "the stale entry is gone from the page"
+    );
+    // ---- second half: tree 0 Leased { other }. Region 1 takes slot 4
+    // again explicitly (g = 2), the seam kills its handover after tree
+    // 0's release (Unleased at g = 2 — a release never moves g), the
+    // manager (region 0) acquires it — tree 0 Leased { 0, g = 3 } — and
+    // the process dies before page 0 names it.
+    let g = vol
+        .manager_acquire_slots(1, 0, &[SLOT4])
+        .await
+        .unwrap()
+        .pop()
+        .unwrap();
+    assert_eq!(g.g, 2);
+    vol.checkpoint_now().await.unwrap();
+    vol.commit_block_refs(owner, &refs(tag, owner, 200, 2))
+        .await
+        .unwrap();
+    TEST_HANDOVER_HOLD_AFTER_TREE0.store(true, Ordering::Relaxed);
+    let _ = vol
+        .release_slot_handover(1, SLOT4)
+        .await
+        .err()
+        .expect("the seam kills the holder");
+    TEST_HANDOVER_HOLD_AFTER_TREE0.store(false, Ordering::Relaxed);
+    let g = vol
+        .manager_acquire_slots(0, 0, &[SLOT4])
+        .await
+        .unwrap()
+        .pop()
+        .unwrap();
+    assert_eq!(g.g, 3, "Unleased at 2 → Leased {{ 0 }} at 3");
+    let entries = read_directory(path, vol.superblock()).await.unwrap();
+    assert!(entries[1]
+        .page
+        .clone()
+        .unwrap()
+        .slots
+        .iter()
+        .any(|e| guest_forest_slot(e.slot) == SLOT4 && e.state == SlotEntryState::Releasing));
+    assert!(entries[0]
+        .page
+        .clone()
+        .unwrap()
+        .slots
+        .iter()
+        .all(|e| guest_forest_slot(e.slot) != SLOT4));
+    vol.sync_device().await.unwrap();
+    drop(vol);
+    drop(routed);
+    let routed = open_under(&uris, &Knobs::armed().partition(PARTITION_ALT)).await;
+    let vol = Arc::clone(&routed.volumes[0]);
+    assert_eq!(lease_stats(&vol).conflicts, 0);
+    let states = tree0_states(&vol).await;
+    assert!(matches!(
+        states.iter().find(|(s, _)| *s == SLOT4).map(|(_, st)| st),
+        Some(SlotState::Leased { appender_id: 0, g: 3, .. })
+    ));
+    let plane = vol.slot_leases().expect("armed");
+    assert!(plane.gate.is_leased(SLOT4) && !plane.gate.is_releasing(SLOT4));
+    assert_eq!(vol.appender_stats().unwrap().regions[1].leases, 1, "the alternate slot only");
+    for i in 0..4 {
+        assert_eq!(vol.block_ref_count(tag, i * 10).await.unwrap(), 1);
+    }
+    assert_eq!(vol.block_ref_count(tag, 200).await.unwrap(), 1);
+    vol.commit_block_refs(owner, &refs(tag, owner, 300, 1))
+        .await
+        .unwrap();
+    vol.checkpoint_now().await.unwrap();
+    let entries = read_directory(path, vol.superblock()).await.unwrap();
+    let p0 = entries[0].page.clone().unwrap();
+    assert!(p0
+        .slots
+        .iter()
+        .any(|e| guest_forest_slot(e.slot) == SLOT4 && e.g == 3 && e.state == SlotEntryState::Live));
+    assert!(entries[1]
+        .page
+        .clone()
+        .unwrap()
+        .slots
+        .iter()
+        .all(|e| guest_forest_slot(e.slot) != SLOT4));
+    shutdown(&routed).await;
+}
+
+/// Rows 7 and 8 (§5.3.5): a WIRE requester's accepted offer dies with the
+/// manager after tree 0 wrote the holder's release and before the
+/// requester's page named the slot — the requester retries `AcquireSlot`
+/// against the successor manager and is granted, idempotently, with no
+/// refusal (row 7); a requester that dies after its page named a slot
+/// keeps it — tree 0 `Leased { requester }`, the manager's own commit
+/// into it refuses naming the holder, and the requester's own re-join
+/// re-adopts it as `already` at the same `g` (row 8).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_requester_retries_against_the_successor_and_a_dead_requesters_lease_survives() {
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    let uris = vec![format_stamped_member(dir.path(), "meta0").await];
+    let tag = volume_tag("vol-0000000000000007");
+    // Rotor slot 6 (routing 5) holds the manager's records.
+    let slot: ForestSlot = 6;
+    let routing: u16 = 5;
+    let owner = ino_in_slot(slot, 3);
+    let joiner = {
+        let routed = open_under(&uris, &Knobs::armed()).await;
+        let vol = Arc::clone(&routed.volumes[0]);
+        let (host, mut client, joiner) = wire_joiner(&vol, 3).await;
+        for i in 0..4 {
+            vol.commit_block_refs(owner, &refs(tag, owner, i * 10, 2))
+                .await
+                .unwrap();
+        }
+        // The joiner's ships dominate the idle holder: the offer.
+        let n_floor = vol.slot_leases().unwrap().n_floor();
+        let need = (2 * 4).max(n_floor);
+        for _ in 0..need {
+            vol.note_slot_ship(slot, joiner).await;
+        }
+        assert_eq!(lease_stats(&vol).offers, 1);
+        // The accept dies with the manager after tree 0 wrote the release.
+        TEST_HANDOVER_HOLD_AFTER_TREE0.store(true, Ordering::Relaxed);
+        let r = client.acquire_slot(joiner, routing).await;
+        TEST_HANDOVER_HOLD_AFTER_TREE0.store(false, Ordering::Relaxed);
+        assert!(r.is_err() || !matches!(r, Ok(ManagerReply::SlotsGranted { .. })), "{r:?}");
+        let states = tree0_states(&vol).await;
+        assert!(matches!(
+            states.iter().find(|(s, _)| *s == slot).map(|(_, st)| st),
+            Some(SlotState::Unleased { g: 1, .. })
+        ));
+        vol.sync_device().await.unwrap();
+        host.shutdown();
+        drop(vol);
+        drop(routed);
+        joiner
+    };
+    // Row 7: the successor manager; the requester retries.
+    let routed = open_under(&uris, &Knobs::armed()).await;
+    let vol = Arc::clone(&routed.volumes[0]);
+    assert_eq!(lease_stats(&vol).conflicts, 0);
+    let host = cw::RpcListener::start_async(
+        listener_cfg(),
+        SECRET.to_vec(),
+        ManagerService::new(Arc::clone(&vol)),
+    )
+    .unwrap();
+    let mut client = ManagerClient::connect(&host.endpoint().to_string(), SECRET, "joiner-3")
+        .await
+        .unwrap();
+    // The joiner's page is Live in the directory: its re-join is `already`.
+    match client.join(joiner_identity(3), 0).await.unwrap() {
+        ManagerReply::Joined {
+            appender_id,
+            already,
+            ..
+        } => assert_eq!((appender_id, already), (joiner, true)),
+        other => panic!("{other:?}"),
+    }
+    let g = match client.acquire_slot(joiner, routing).await.unwrap() {
+        ManagerReply::SlotsGranted { slots, already } => {
+            assert!(!already, "the release landed, the grant had not: a fresh grant");
+            assert_eq!(slots.len(), 1);
+            assert_eq!(slots[0].g, 2);
+            assert_ne!(slots[0].root, (0, 0), "the flushed tree travels");
+            slots[0].g
+        }
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(vol.appender_stats().unwrap().manager_verb_refusals, 0);
+    let states = tree0_states(&vol).await;
+    assert!(matches!(
+        states.iter().find(|(s, _)| *s == slot).map(|(_, st)| st),
+        Some(SlotState::Leased { appender_id, g: 2, .. }) if *appender_id == joiner
+    ));
+    // Row 8: the requester dies (its client goes away; its page stays
+    // Live naming the slot). The lease survives: the manager's commit
+    // refuses naming the holder, the holder cache names it, and the
+    // requester's next join + acquire answer `already` at the same g.
+    drop(client);
+    let e = vol
+        .commit_block_refs(owner, &refs(tag, owner, 100, 1))
+        .await
+        .err()
+        .expect("a foreign slot's mutation refuses");
+    assert!(e.to_string().contains(&format!("appender {joiner}")), "{e}");
+    let plane = vol.slot_leases().unwrap();
+    assert_eq!(
+        plane.holders.holder(slot).map(|h| (h.appender_id, h.g)),
+        Some((joiner, g))
+    );
+    let mut client = ManagerClient::connect(&host.endpoint().to_string(), SECRET, "joiner-3-again")
+        .await
+        .unwrap();
+    match client.join(joiner_identity(3), 0).await.unwrap() {
+        ManagerReply::Joined { already, .. } => assert!(already),
+        other => panic!("{other:?}"),
+    }
+    match client.acquire_slot(joiner, routing).await.unwrap() {
+        ManagerReply::SlotsGranted { slots, already } => {
+            assert!(already);
+            assert_eq!(slots[0].g, g);
+        }
+        other => panic!("{other:?}"),
+    }
+    for i in 0..4 {
+        assert_eq!(vol.block_ref_count(tag, i * 10).await.unwrap(), 1);
+    }
+    assert_eq!(vol.appender_stats().unwrap().manager_verb_refusals, 0);
+    host.shutdown();
+    shutdown(&routed).await;
+}
+
+// ---------------------------------------------------------------------------
+// §5.1.8 the cursor, §5.1.3 forced shrink / LRU / region release, C14.
+// ---------------------------------------------------------------------------
+
+/// §5.1.8: the slot's mint cursor travels with the lease as a FLOOR — a
+/// slot released with its top inos deleted and re-acquired (in-process
+/// and across a remount) never re-mints one of them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_slot_released_reacquired_with_its_top_inos_deleted_never_remints_an_ino() {
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    let uris = vec![format_stamped_member(dir.path(), "meta0").await];
+    let tag = volume_tag("vol-0000000000000008");
+    let slot: ForestSlot = 6;
+    let routing: u16 = 5;
+    let (minted, digest) = {
+        let routed = open_under(&uris, &Knobs::armed()).await;
+        let vol = Arc::clone(&routed.volumes[0]);
+        let mut minted = Vec::new();
+        for _ in 0..3 {
+            let local = vol.allocate_guest_ino(routing).unwrap();
+            let ino = squeezefs::meta_backend::guest_local_ino(routing, local);
+            vol.commit_block_refs(ino, &refs(tag, ino, local * 10, 1))
+                .await
+                .unwrap();
+            minted.push((local, ino));
+        }
+        let top = minted.iter().map(|(l, _)| *l).max().unwrap();
+        assert_eq!(vol.guest_cursor_snapshot(routing), Some(top + 1));
+        // Delete the top two inos' records (their block refs).
+        for (local, ino) in minted.iter().rev().take(2) {
+            let op = BlockRefOp::released(BlockRef {
+                vol_tag: tag,
+                block_idx: local * 10,
+                owner_ino: *ino,
+                block_index: 0,
+            });
+            vol.commit_block_refs(*ino, &[op]).await.unwrap();
+        }
+        // Release: the cursor travels into tree 0.
+        vol.release_slot_handover(0, slot).await.unwrap();
+        assert_eq!(vol.guest_cursor_snapshot(routing), None, "the cursor left with the lease");
+        let states = tree0_states(&vol).await;
+        match states.iter().find(|(s, _)| *s == slot).map(|(_, st)| st) {
+            Some(SlotState::Unleased { cursor, .. }) => assert_eq!(*cursor, top + 1),
+            other => panic!("{other:?}"),
+        }
+        // Re-acquire in-process: the next mint is above the top.
+        let g = vol
+            .manager_acquire_slots(0, 0, &[slot])
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert_eq!(g.words.cursor, top + 1);
+        let next = vol.allocate_guest_ino(routing).unwrap();
+        assert!(next > top, "{next} re-mints a deleted ino ≤ {top}");
+        // Release again and leave cleanly; the remount re-adopts.
+        vol.release_slot_handover(0, slot).await.unwrap();
+        let d = digest_backend(&vol).await.unwrap();
+        shutdown(&routed).await;
+        (next, d)
+    };
+    let routed = open_under(&uris, &Knobs::armed()).await;
+    let vol = Arc::clone(&routed.volumes[0]);
+    assert_eq!(digest_backend(&vol).await.unwrap(), digest);
+    let g = vol
+        .manager_acquire_slots(0, 0, &[slot])
+        .await
+        .unwrap()
+        .pop()
+        .unwrap();
+    assert_eq!(g.words.cursor, minted + 1, "the cursor after the last mint travelled");
+    let next = vol.allocate_guest_ino(routing).unwrap();
+    assert!(next > minted, "{next} re-mints across the remount");
+    shutdown(&routed).await;
+}
+
+/// §5.1.3 forced shrink: the membership census grows past 512 writers so
+/// the derived `M` falls (64 → 32); the cadence releases the idle rotor
+/// slots beyond it (least extents first, the handover's own sequence —
+/// tree 0 `Unleased` with cursor and root), keeps every slot with live
+/// ops, and `slot_rotor` reads the new `M`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn forced_shrink_releases_idle_rotor_slots_down_to_the_derived_m() {
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    let uris = vec![format_stamped_member(dir.path(), "meta0").await];
+    let routed = open_under(&uris, &Knobs::armed()).await;
+    let vol = Arc::clone(&routed.volumes[0]);
+    let plane = vol.slot_leases().expect("armed");
+    assert_eq!(lease_stats(&vol).rotor, 64);
+    // Two rotor slots with live ops: they must survive the shrink even
+    // when idle slots run out.
+    let tag = volume_tag("vol-0000000000000009");
+    let live: Vec<ForestSlot> = vec![2, 3];
+    for s in &live {
+        let owner = ino_in_slot(*s, 2);
+        vol.commit_block_refs(owner, &refs(tag, owner, u64::from(*s) * 100, 2))
+            .await
+            .unwrap();
+    }
+    // 1,024 writers ⇒ M = clamp(65536 / 2048, 1, 64) = 32.
+    plane.test_writers_known.store(1024, Ordering::Relaxed);
+    vol.slot_lease_cadence().await.unwrap();
+    let s = lease_stats(&vol);
+    assert_eq!(s.rotor, 32);
+    assert_eq!(s.forced_shrinks, 32);
+    assert_eq!(s.leases_held, 1 + 32, "native + the shrunk rotor");
+    for l in &live {
+        assert!(plane.gate.is_leased(*l), "slot {l} has live ops");
+    }
+    let states = tree0_states(&vol).await;
+    let unleased = states
+        .iter()
+        .filter(|(_, st)| matches!(st, SlotState::Unleased { g: 1, .. }))
+        .count();
+    assert_eq!(unleased, 32, "every released slot is Unleased at its g");
+    // A second cadence is a no-op: nothing beyond M.
+    vol.slot_lease_cadence().await.unwrap();
+    assert_eq!(lease_stats(&vol).forced_shrinks, 32);
+    // The census falls back: nothing grows back on its own (the rotor
+    // refills through the mint policy's overflow arm, never the shrink).
+    plane.test_writers_known.store(1, Ordering::Relaxed);
+    vol.slot_lease_cadence().await.unwrap();
+    let s = lease_stats(&vol);
+    assert_eq!((s.rotor, s.forced_shrinks), (64, 32), "M in force is 64; the rotor holds 32");
+    for i in 0..4 {
+        for s in &live {
+            let _ = i;
+            assert_eq!(
+                vol.block_ref_count(tag, u64::from(*s) * 100).await.unwrap(),
+                1
+            );
+        }
+    }
+    shutdown(&routed).await;
+}
+
+/// §5.1.3 region release: a declared region whose last slot went (the
+/// handover) and whose ring is drained goes `Free` at the cadence — the
+/// page `Free` in both directory slots, `slot_region_releases` 1 — and a
+/// remount over it is clean (the region rejoins on a fresh ring; the slot
+/// stays the manager's).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_declared_region_is_released_when_its_last_slot_goes() {
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    let uris = vec![format_stamped_member(dir.path(), "meta0").await];
+    let path = std::path::Path::new(&uris[0]);
+    let tag = volume_tag("vol-000000000000000a");
+    let owner = ino_in_slot(SLOT4, 5);
+    let digest = {
+        let routed = open_under(&uris, &Knobs::armed().partition(PARTITION)).await;
+        let vol = Arc::clone(&routed.volumes[0]);
+        for i in 0..3 {
+            vol.commit_block_refs(owner, &refs(tag, owner, i * 10, 2))
+                .await
+                .unwrap();
+        }
+        // The handover to the manager; the ring drains at the next covering cycle.
+        vol.manager_offer_slot(1, SLOT4, 0).await.unwrap();
+        let AcquireSlotReply::Granted(_) = vol.manager_acquire_slot(0, SLOT4).await.unwrap()
+        else {
+            panic!()
+        };
+        assert_eq!(vol.appender_stats().unwrap().regions[1].leases, 0);
+        vol.checkpoint_now().await.unwrap();
+        vol.slot_lease_cadence().await.unwrap();
+        let s = lease_stats(&vol);
+        assert_eq!(s.region_releases, 1, "{:?}", vol.appender_stats().unwrap());
+        let entries = read_directory(path, vol.superblock()).await.unwrap();
+        let p1 = entries[1].page.clone().unwrap();
+        assert_eq!(p1.state, AppenderState::Free);
+        assert!(p1.slots.is_empty() && p1.segments.is_empty());
+        assert_eq!(vol.appender_stats().unwrap().live, 1, "region 0 alone is joined");
+        // The manager keeps serving the slot.
+        vol.commit_block_refs(owner, &refs(tag, owner, 100, 1))
+            .await
+            .unwrap();
+        for i in 0..3 {
+            assert_eq!(vol.block_ref_count(tag, i * 10).await.unwrap(), 1);
+        }
+        let d = digest_backend(&vol).await.unwrap();
+        shutdown(&routed).await;
+        d
+    };
+    let routed = open_under(&uris, &Knobs::armed().partition(PARTITION)).await;
+    let vol = Arc::clone(&routed.volumes[0]);
+    assert_eq!(digest_backend(&vol).await.unwrap(), digest);
+    assert_eq!(lease_stats(&vol).conflicts, 0);
+    let set = vol.appender_stats().unwrap();
+    assert_eq!(set.regions.len(), 2);
+    assert_eq!(
+        set.regions[1].leases, 1,
+        "the clean leave unleased every slot; the wish-list takes slot 4 back on the region's \
+         fresh ring"
+    );
+    assert_eq!(set.live, 2);
+    let plane = vol.slot_leases().expect("armed");
+    assert!(plane.gate.is_leased(SLOT4));
+    assert_eq!(vol.block_ref_count(tag, 100).await.unwrap(), 1);
+    let ring1_before = set.regions[1].ring_entries;
+    vol.commit_block_refs(owner, &refs(tag, owner, 200, 1))
+        .await
+        .unwrap();
+    assert!(vol.appender_stats().unwrap().regions[1].ring_entries > ring1_before);
+    shutdown(&routed).await;
+}
+
+/// C14's live face (§5.8.5): two Live pages attesting ONE slot refuse the
+/// mount loud, naming both appenders and the class; the volume is left
+/// as it was (`slot_lease_conflicts` counted on the refusing open).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn two_live_pages_attesting_one_slot_refuse_the_mount() {
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    let uris = vec![format_stamped_member(dir.path(), "meta0").await];
+    let path = std::path::Path::new(&uris[0]);
+    let sb = {
+        let routed = open_under(&uris, &Knobs::armed()).await;
+        let vol = Arc::clone(&routed.volumes[0]);
+        let (host, mut client, joiner) = wire_joiner(&vol, 4).await;
+        // The joiner leases routing slot 300 — its page names it Live.
+        match client.acquire_slot(joiner, 300).await.unwrap() {
+            ManagerReply::SlotsGranted { .. } => {}
+            other => panic!("{other:?}"),
+        }
+        let sb = vol.superblock().clone();
+        host.shutdown();
+        shutdown(&routed).await;
+        sb
+    };
+    // Forge the conflict: a second Live page (a second joiner) also
+    // attesting routing slot 300 — the shape a torn custody hand-off
+    // between two dead appenders leaves.
+    let entries = read_directory(path, &sb).await.unwrap();
+    let victim = entries
+        .iter()
+        .find(|e| e.appender_id != 0 && e.page.as_ref().is_some_and(|p| p.slots.iter().any(|s| s.slot == 300)))
+        .expect("the joiner's page");
+    let mut forged = victim.page.clone().unwrap();
+    forged.appender_id = victim.appender_id + 1;
+    forged.identity = joiner_identity(5);
+    let free = entries
+        .iter()
+        .find(|e| e.appender_id == forged.appender_id)
+        .expect("the directory's next pair");
+    for off in &free.dir_offsets {
+        forged.generation += 1;
+        squeezefs::meta_backend::kv::appender::write_page(path, *off, forged.encode().unwrap())
+            .await
+            .unwrap();
+    }
+    Knobs::armed().apply();
+    std::env::remove_var(TEST_APPENDER_SLOTS_ENV);
+    let r = open_routed_meta_set(&uris).await;
+    Knobs::clear();
+    let e = r.err().expect("two live attestations refuse the mount");
+    let msg = e.to_string();
+    assert!(msg.contains("two appender pages"), "{msg}");
+    assert!(msg.contains("C14"), "{msg}");
+    assert!(msg.contains(&format!("{}", victim.appender_id)), "{msg}");
+    assert!(msg.contains(&format!("{}", forged.appender_id)), "{msg}");
 }

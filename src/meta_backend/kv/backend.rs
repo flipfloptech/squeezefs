@@ -1128,6 +1128,12 @@ pub struct KvMetaBackend {
     /// reads tree 0's durable witness, decides, and writes ONE control
     /// entry; two in flight would decide on the same witness.
     manager_verbs: crate::sqz_sync::SqzMutex<()>,
+    /// Serializes slot HANDOVERS (`release_slot_handover` — the cadence's
+    /// LRU / forced-shrink releases and a requester's accepted offer
+    /// recall the same slots): flush-then-transfer is one sequence per
+    /// slot, so two in flight over one slot would both attest the release
+    /// and the later one would be refused by tree 0's witness.
+    handover: crate::sqz_sync::SqzMutex<()>,
     /// Last ledger seq written by a checkpoint (starts at the mounted
     /// record's seq).
     pub(super) checkpoint_seq: AtomicU64,
@@ -2656,6 +2662,7 @@ impl KvMetaBackend {
             timeout_threshold: squeezefs_timeout_env(),
             smo,
             manager_verbs: crate::sqz_sync::SqzMutex::new(()),
+            handover: crate::sqz_sync::SqzMutex::new(()),
             retire_seq,
             pending_reclaim: std::sync::Mutex::new(Vec::new()),
             barrier_starts: AtomicU64::new(0),
@@ -3423,46 +3430,62 @@ impl KvMetaBackend {
         plane: &super::slot_lease::SlotLeasePlane,
     ) -> std::result::Result<(), KvError> {
         use super::appender::{AppenderState, SlotEntryState};
-        let entries = super::appender::read_directory(&self.path, &self.sb).await?;
-        let mut live_by_slot: std::collections::BTreeMap<super::record::ForestSlot, u32> =
-            std::collections::BTreeMap::new();
-        for e in entries.iter() {
+        // The attestations: OUR pages as LOADED (the join's checkpoint has
+        // rewritten them since), every other Live page as the directory
+        // holds it now.
+        let loaded: std::collections::BTreeMap<u32, Vec<super::appender::SlotEntry>> =
+            std::mem::take(
+                &mut *plane
+                    .loaded_page_entries
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner()),
+            );
+        let in_process: std::collections::BTreeSet<u32> =
+            set.regions.iter().map(|r| r.id).collect();
+        let mut attestations: Vec<(u32, Vec<super::appender::SlotEntry>)> = loaded
+            .iter()
+            .map(|(id, slots)| (*id, slots.clone()))
+            .collect();
+        for e in super::appender::read_directory(&self.path, &self.sb).await? {
             let Some(page) = e.page.as_ref() else {
                 continue;
             };
-            if page.state != AppenderState::Live {
+            if page.state != AppenderState::Live || in_process.contains(&page.appender_id) {
                 continue;
             }
-            for se in &page.slots {
+            attestations.push((page.appender_id, page.slots.clone()));
+        }
+        let mut live_by_slot: std::collections::BTreeMap<super::record::ForestSlot, u32> =
+            std::collections::BTreeMap::new();
+        for (appender_id, slots) in &attestations {
+            for se in slots {
                 if se.state != SlotEntryState::Live {
                     continue;
                 }
                 let slot = super::appender::forest_slot_of_page_slot(se.slot, set.native_slot);
-                if let Some(other) = live_by_slot.insert(slot, page.appender_id) {
-                    if other != page.appender_id {
+                if let Some(other) = live_by_slot.insert(slot, *appender_id) {
+                    if other != *appender_id {
                         plane.conflicts.fetch_add(1, Ordering::Relaxed);
                         return Err(KvError::Corrupt(format!(
                             "{}: slot {slot} is attested LIVE on two appender pages ({other} and \
-                             {}) — a slot custody conflict (design-symmetric-metadata §5.8.5 \
-                             C14; slot_lease_conflicts). Refusing the mount; the remedy is \
-                             `squeezefs appender clear` (PR 10)",
-                            self.path.display(),
-                            page.appender_id
+                             {appender_id}) — a slot custody conflict (design-symmetric-metadata \
+                             §5.8.5 C14; slot_lease_conflicts). Refusing the mount; the remedy \
+                             is `squeezefs appender clear` (PR 10)",
+                            self.path.display()
                         )));
                     }
                 }
                 if let Some(l) = plane.table.get(slot) {
                     if l.state != crate::slot_lease_core::LeaseState::Unleased
-                        && l.holder != page.appender_id
+                        && l.holder != *appender_id
                         && l.g > se.g
                     {
                         plane.conflicts.fetch_add(1, Ordering::Relaxed);
                         return Err(KvError::Corrupt(format!(
-                            "{}: slot {slot} is LIVE on appender {}'s page at g {} while tree 0 \
-                             leases it to appender {} at g {} — a slot custody conflict (C14). \
-                             Refusing the mount",
+                            "{}: slot {slot} is LIVE on appender {appender_id}'s page at g {} \
+                             while tree 0 leases it to appender {} at g {} — a slot custody \
+                             conflict (C14). Refusing the mount",
                             self.path.display(),
-                            page.appender_id,
                             se.g,
                             l.holder,
                             l.g
@@ -3471,17 +3494,12 @@ impl KvMetaBackend {
                 }
             }
         }
-        // OUR pages' `Releasing` entries: complete or drop.
+        // OUR pages' `Releasing` entries as loaded: complete or drop.
         for r in &set.regions {
-            let releasing: Vec<super::appender::SlotEntry> = {
-                let page = r.page.lock().unwrap_or_else(|e| e.into_inner());
-                page.slots
-                    .iter()
-                    .filter(|se| se.state == SlotEntryState::Releasing)
-                    .copied()
-                    .collect()
+            let Some(slots) = loaded.get(&r.id) else {
+                continue;
             };
-            for se in releasing {
+            for se in slots.iter().filter(|se| se.state == SlotEntryState::Releasing) {
                 let slot = super::appender::forest_slot_of_page_slot(se.slot, set.native_slot);
                 match plane.table.get(slot) {
                     Some(l)
@@ -3496,7 +3514,11 @@ impl KvMetaBackend {
                             cursor: se.cursor,
                             extents: se.slot_tree_extents,
                         };
-                        self.manager_release_slot(r.id, slot, words, se.g, Vec::new())
+                        let tails = match self.forest().and_then(|f| f.tree(slot)) {
+                            Some(t) => self.leaf_tails(&t).await?,
+                            None => Vec::new(),
+                        };
+                        self.manager_release_slot(r.id, slot, words, se.g, tails)
                             .await?;
                         log::warn!(
                             "meta volume {}: appender {}'s page named slot {slot} RELEASING at g \
@@ -3520,8 +3542,6 @@ impl KvMetaBackend {
                         );
                     }
                 }
-                let mut page = r.page.lock().unwrap_or_else(|e| e.into_inner());
-                page.slots.retain(|x| x.slot != se.slot);
             }
         }
         Ok(())
@@ -3745,6 +3765,34 @@ impl KvMetaBackend {
             }
         }
         if !puts.is_empty() {
+            // A fresh grant to a declared appender (never the manager,
+            // whose images are untracked) claims the granted trees' live
+            // images: its grant record gains them in the SAME entry (the
+            // custody transfer's second half — `manager_release_slot` took
+            // them off the departing grant), so an image it later retires
+            // through its own context is one its grant claims.
+            let mut arriving: Vec<u64> = Vec::new();
+            if appender_id != 0 {
+                for s in &fresh {
+                    arriving.extend(self.slot_tree_image_extents(*s).await?);
+                }
+                arriving.sort_unstable();
+                arriving.dedup();
+                if !arriving.is_empty() {
+                    let record = self.extent_grant_record(appender_id).await?;
+                    let merged = super::slot_state::ExtentGrantRecord::from_extents(
+                        record.extents().chain(arriving.iter().copied()),
+                    );
+                    puts.push((
+                        tag,
+                        Record::put(
+                            super::slot_state::extent_grant_key(appender_id),
+                            0,
+                            merged.encode()?,
+                        ),
+                    ));
+                }
+            }
             if let Err(e) = self.write_control_entry(puts).await {
                 for s in &fresh {
                     let l = plane.table.get(*s);
@@ -3757,6 +3805,9 @@ impl KvMetaBackend {
                     );
                 }
                 return Err(e);
+            }
+            if let Some(r) = set.region(appender_id).filter(|_| !arriving.is_empty()) {
+                r.grant().transfer_in(&arriving);
             }
             plane
                 .grants
@@ -4069,11 +4120,45 @@ impl KvMetaBackend {
         }
         .encode()?;
         let tag = super::journal::tag_for(super::record::TREE_CONTROL, 0);
-        self.write_control_entry(vec![(
+        let mut recs = vec![(
             tag,
             Record::put(super::slot_state::slot_state_key(slot), 0, value),
-        )])
-        .await?;
+        )];
+        // The custody of the tree's live images leaves the departing
+        // grant with the slot (C13's candidate set is the grant-claimed
+        // unreachable extents — an image the requester later retires
+        // through ITS context must not stay claimed here): the record is
+        // rewritten without them in the SAME entry, bits untouched.
+        let mut leaving: Vec<u64> = Vec::new();
+        if appender_id != 0 {
+            let record = self.extent_grant_record(appender_id).await?;
+            if !record.is_empty() {
+                leaving = self
+                    .slot_tree_image_extents(slot)
+                    .await?
+                    .into_iter()
+                    .filter(|e| record.contains(*e))
+                    .collect();
+            }
+            if !leaving.is_empty() {
+                let remaining = super::slot_state::ExtentGrantRecord::from_extents(
+                    record.extents().filter(|e| !leaving.contains(e)),
+                );
+                let key = super::slot_state::extent_grant_key(appender_id);
+                recs.push((
+                    tag,
+                    if remaining.is_empty() {
+                        Record::delete(key, 0)
+                    } else {
+                        Record::put(key, 0, remaining.encode()?)
+                    },
+                ));
+            }
+        }
+        self.write_control_entry(recs).await?;
+        if let Some(r) = set.region(appender_id).filter(|_| !leaving.is_empty()) {
+            r.grant().transfer_out(&leaving);
+        }
         match plane
             .table
             .release(slot, appender_id, g, words, last_written)
@@ -4267,23 +4352,62 @@ impl KvMetaBackend {
                 self.path.display()
             )));
         }
+        // One handover at a time per volume: a concurrent release of the
+        // same slot (the cadence against an accepted offer) finds it
+        // already released and is refused here, never at tree 0's witness.
+        let _handover = self.handover.lock().await;
         // 1. Releasing FIRST: the gate stops new commits before the flush
         // takes any node lock (the loom-pinned order).
-        plane.gate.begin_release(slot);
-        let g = match plane.table.begin_release(slot, region_id) {
-            Ok(g) => g,
-            Err(e) => {
-                plane.gate.end_release(slot);
+        let g = match plane.table.get(slot) {
+            Some(l)
+                if l.holder == region_id
+                    && l.state != crate::slot_lease_core::LeaseState::Unleased
+                    && l.state != crate::slot_lease_core::LeaseState::Releasing =>
+            {
+                plane.gate.begin_release(slot);
+                match plane.table.begin_release(slot, region_id) {
+                    Ok(g) => g,
+                    Err(e) => {
+                        plane.gate.end_release(slot);
+                        return Err(KvError::Busy(format!(
+                            "{}: release of slot {slot} by appender {region_id} refused: {e:?}",
+                            self.path.display()
+                        )));
+                    }
+                }
+            }
+            other => {
                 return Err(KvError::Busy(format!(
-                    "{}: release of slot {slot} by appender {region_id} refused: {e:?}",
-                    self.path.display()
+                    "{}: release of slot {slot} by appender {region_id} refused — the slot is \
+                     {} (a concurrent release or transfer took it)",
+                    self.path.display(),
+                    other.map_or_else(
+                        || "unknown to tree 0".to_string(),
+                        |l| format!("{:?} under appender {} at g {}", l.state, l.holder, l.g)
+                    )
                 )));
             }
         };
         let t_flush = std::time::Instant::now();
         // 2. Flush + barrier: one checkpoint cycle covers every dirty leaf
         // of the tree (and the rest of the mount's — bounded by the same
-        // ceiling's dirty set).
+        // ceiling's dirty set). Its root moved in that cycle, so its
+        // floor clamped the region's tail; the root is published (the
+        // page of the cycle named it) and a SECOND cycle carries the tail
+        // past the slot's records — the departing ring's window is
+        // flushed CLEAR of the slot before any other home says it moved
+        // (KD-SYM-4's one ring per key; the `Lease` detector at the next
+        // open judges the window by tree 0's lessee).
+        if let Err(e) = self.checkpoint_now().await {
+            plane.table.abort_release(slot, region_id);
+            plane.gate.end_release(slot);
+            return Err(e);
+        }
+        if let Some(forest) = self.forest() {
+            if let Some(tree) = forest.tree(slot) {
+                forest.note_page_published(slot, tree.root());
+            }
+        }
         if let Err(e) = self.checkpoint_now().await {
             plane.table.abort_release(slot, region_id);
             plane.gate.end_release(slot);
@@ -4600,12 +4724,31 @@ impl KvMetaBackend {
         }
     }
 
+    /// One cadence release: `Ok(true)` released the slot; `Ok(false)` = a
+    /// concurrent release or transfer already took it (the `Busy` class —
+    /// skipped, the pass goes on); any other failure propagates.
+    async fn release_for_cadence(
+        &self,
+        region_id: u32,
+        slot: super::record::ForestSlot,
+    ) -> std::result::Result<bool, KvError> {
+        match self.release_slot_handover(region_id, slot).await {
+            Ok(()) => Ok(true),
+            Err(KvError::Busy(why)) => {
+                log::debug!("slot-lease cadence: slot {slot} not released — {why}");
+                Ok(false)
+            }
+            Err(e) => Err(e),
+        }
+    }
+
     /// The slot-lease CADENCE of one checkpoint cycle (§5.1.3 / §5.1.4):
     /// lapse expired offers; LRU-release inherited slots past the page
     /// budget; forced-shrink the rotor to the derived `M` when the
     /// membership census grew; release a declared region whose last
-    /// slot went and whose ring is drained.
-    pub(super) async fn slot_lease_cadence(&self) -> std::result::Result<(), KvError> {
+    /// slot went and whose ring is drained. The checkpoint task runs it
+    /// after every cadence tick; the contracts run it directly.
+    pub async fn slot_lease_cadence(&self) -> std::result::Result<(), KvError> {
         let Some(set) = self.appenders.as_ref() else {
             return Ok(());
         };
@@ -4643,10 +4786,16 @@ impl KvMetaBackend {
                 .map(|s| (plane.extents.get(*s), *s))
                 .collect();
             idle.sort_unstable();
-            let excess = rotor.len() as u64 - m;
-            for (_, slot) in idle.into_iter().take(excess as usize) {
-                self.release_slot_handover(0, slot).await?;
-                plane.forced_shrinks.fetch_add(1, Ordering::Relaxed);
+            for (_, slot) in idle {
+                // Re-read per release: a concurrent pass (an accepted
+                // offer's recall, the cadence tick beside a harness call)
+                // may have brought the rotor to `M` already.
+                if plane.rotor.load().len() as u64 <= m {
+                    break;
+                }
+                if self.release_for_cadence(0, slot).await? {
+                    plane.forced_shrinks.fetch_add(1, Ordering::Relaxed);
+                }
             }
         }
         // LRU release at the page budget (§5.1.3): a region holding more
@@ -4667,10 +4816,13 @@ impl KvMetaBackend {
                 })
                 .collect();
             idle.sort_unstable();
-            let excess = held.len() - super::appender::SLOT_PAGE_BUDGET;
-            for slot in idle.into_iter().take(excess) {
-                self.release_slot_handover(r.id, slot).await?;
-                plane.lru_releases.fetch_add(1, Ordering::Relaxed);
+            for slot in idle {
+                if r.leases().len() <= super::appender::SLOT_PAGE_BUDGET {
+                    break;
+                }
+                if self.release_for_cadence(r.id, slot).await? {
+                    plane.lru_releases.fetch_add(1, Ordering::Relaxed);
+                }
             }
         }
         // Region release (§5.1.3): a declared region with no lease left
@@ -4687,8 +4839,9 @@ impl KvMetaBackend {
             {
                 continue;
             }
-            self.release_region(r).await?;
-            plane.region_releases.fetch_add(1, Ordering::Relaxed);
+            if self.release_region(r).await? {
+                plane.region_releases.fetch_add(1, Ordering::Relaxed);
+            }
         }
         Ok(())
     }
@@ -4782,10 +4935,16 @@ impl KvMetaBackend {
     async fn release_region(
         &self,
         region: &super::appender::AppenderRegion,
-    ) -> std::result::Result<(), KvError> {
+    ) -> std::result::Result<bool, KvError> {
         let Some(set) = self.appenders.as_ref() else {
-            return Ok(());
+            return Ok(false);
         };
+        // One release per region: the cadence tick and a harness-driven
+        // cadence may both find the region empty and drained.
+        let _handover = self.handover.lock().await;
+        if region.released.load(Ordering::Acquire) || !region.leases().is_empty() {
+            return Ok(false);
+        }
         let node_size = u64::from(self.sb.node_size);
         let mut back: Vec<u64> = {
             let mut g = region.grant();
@@ -4832,7 +4991,7 @@ impl KvMetaBackend {
             self.path.display(),
             region.id
         );
-        Ok(())
+        Ok(true)
     }
 
     // -----------------------------------------------------------------------
@@ -5432,6 +5591,30 @@ impl KvMetaBackend {
             set.verbs.replays.fetch_add(1, Ordering::Relaxed);
         }
         Ok((granted.len() as u64, already.len() as u64))
+    }
+
+    /// The image extents `slot`'s tree reaches (empty when no tree exists)
+    /// — a slot handover's custody-transfer set (§5.1.4): one paged walk
+    /// of the tree's interior population, C13's reachability per tree.
+    /// The tree is flushed and gated (a release) or unleased (a grant) at
+    /// every call, so no image of it is between its claim and its
+    /// publication.
+    async fn slot_tree_image_extents(
+        &self,
+        slot: super::record::ForestSlot,
+    ) -> std::result::Result<Vec<u64>, KvError> {
+        let Some(tree) = self.forest().and_then(|f| f.tree(slot)) else {
+            return Ok(Vec::new());
+        };
+        let mut out: Vec<u64> = tree
+            .reachable_node_addrs()
+            .await?
+            .into_iter()
+            .map(|addr| self.cache.addr_extent(addr))
+            .collect();
+        out.sort_unstable();
+        out.dedup();
+        Ok(out)
     }
 
     /// Whether appender `id`'s RAM grant holds `extent` in ANY set
@@ -6262,7 +6445,7 @@ impl KvMetaBackend {
                     }
                     page.grant = g.unclaimed_runs();
                 }
-                page.slots = entries;
+                page.slots = entries.clone();
             }
             self.write_region_page(r).await?;
             r.last_tail.store(tail, Ordering::Release);
@@ -6271,6 +6454,26 @@ impl KvMetaBackend {
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
                     .push((tail, self.barrier_push_epoch()));
+            }
+            // Under the armed plane the page IS a leased root's durable
+            // home (`publish_forest_roots` skips leased slots): a `Live`
+            // entry naming a root is that root's publication — its floor
+            // stops clamping the next cycle's tail. The next cycle's
+            // record advances the tail past the floor only after a barrier
+            // that started after this write (the DUR-3 push above), so
+            // the page is durable before any record under the root can
+            // leave the window. An entry the budget truncated off the
+            // page publishes nothing and keeps its floor.
+            if self.slot_leases().is_some() {
+                for e in entries
+                    .iter()
+                    .filter(|e| e.state == super::appender::SlotEntryState::Live && e.root.addr != 0)
+                {
+                    let slot = super::appender::forest_slot_of_page_slot(e.slot, set.native_slot);
+                    if slot != super::record::NATIVE_FOREST_SLOT {
+                        forest.note_page_published(slot, e.root);
+                    }
+                }
             }
         }
         Ok(())
@@ -13548,12 +13751,27 @@ impl KvMetaBackend {
                 u64::from(crate::meta_backend::DERIVED_ROUTING_WIDTH),
                 writers_known,
             );
-            Arc::new(super::slot_lease::SlotLeasePlane::new(
+            let plane = super::slot_lease::SlotLeasePlane::new(
                 cache.lease_gate(),
                 Arc::clone(forest.extent_ledger()),
                 m,
                 partition.clone(),
-            ))
+            );
+            // The pages' slot entries as loaded — the arm's settle reads
+            // them after the join's checkpoint has rewritten the pages.
+            {
+                let mut loaded = plane
+                    .loaded_page_entries
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                for r in &regions {
+                    let page = r.page.lock().unwrap_or_else(|e| e.into_inner());
+                    if page.state == super::appender::AppenderState::Live {
+                        loaded.insert(r.id, page.slots.clone());
+                    }
+                }
+            }
+            Arc::new(plane)
         });
         let set = AppenderSet {
             regions,
@@ -13835,34 +14053,64 @@ impl KvMetaBackend {
         let Some(forest) = self.forest() else {
             return Ok(());
         };
-        let pending = forest.roots_to_publish();
+        // Under the ARMED plane a LEASED slot's root rides its lessee's
+        // page (KD-SYM-3 — the page is written every checkpoint and
+        // `write_appender_pages` records the publication), never tree 0:
+        // the `Leased` record keeps the grant-time words, and a
+        // publication here would overwrite the lease itself. A slot
+        // mid-handover (`releasing`) is the release record's.
+        let plane = self.slot_leases();
+        let pending: Vec<(super::record::ForestSlot, RootPtr)> = forest
+            .roots_to_publish()
+            .into_iter()
+            .filter(|(slot, _)| {
+                plane.is_none_or(|p| !p.gate.is_leased(*slot) && !p.gate.is_releasing(*slot))
+            })
+            .collect();
         if pending.is_empty() {
             return Ok(());
         }
         let tag = super::journal::tag_for(super::record::TREE_CONTROL, 0);
-        let recs: Vec<(u8, Record)> = pending
-            .iter()
-            .map(|(slot, root)| {
-                let state = super::slot_state::SlotState::Unleased {
+        let mut recs: Vec<(u8, Record)> = Vec::with_capacity(pending.len());
+        for (slot, root) in &pending {
+            // The UNARMED forest (PR 1–3): one appender, one cursor — the
+            // native watermark rides the ledger's `next_ino`. An armed
+            // plane's UNLEASED slot keeps its release record's `g`,
+            // cursor (§5.1.8 — the floor never regresses), extent count
+            // and `last_written`; only the root and the tails move.
+            let lease = plane.and_then(|p| p.table.get(*slot)).filter(|l| {
+                l.state == crate::slot_lease_core::LeaseState::Unleased
+            });
+            let state = match lease {
+                Some(l) => {
+                    let tails = match forest.tree(*slot) {
+                        Some(t) => self.leaf_tails(&t).await?,
+                        None => Vec::new(),
+                    };
+                    super::slot_state::SlotState::Unleased {
+                        root: *root,
+                        cursor: l.words.cursor,
+                        g: l.g,
+                        slot_tree_extents: l.words.extents,
+                        last_written: l.last_written,
+                        tails,
+                    }
+                }
+                None => super::slot_state::SlotState::Unleased {
                     root: *root,
-                    // The UNARMED forest (PR 1–3): one appender, one
-                    // cursor — the native watermark rides the ledger's
-                    // `next_ino`; per-slot cursors travel with the lease
-                    // on an armed mount, whose leased slots never come
-                    // through here (their roots ride the lessee's page).
                     cursor: 0,
                     g: 0,
                     slot_tree_extents: 0,
                     last_written: 0,
                     tails: Vec::new(),
-                };
-                let value = state.encode()?;
-                Ok((
-                    tag,
-                    Record::put(super::slot_state::slot_state_key(*slot), 0, value),
-                ))
-            })
-            .collect::<std::result::Result<_, KvError>>()?;
+                },
+            };
+            let value = state.encode()?;
+            recs.push((
+                tag,
+                Record::put(super::slot_state::slot_state_key(*slot), 0, value),
+            ));
+        }
         let len = entry_len_for(&recs)?;
         // Test seam: a deferred publication (the reserve-exhausted arm)
         // on demand — `tests/sym_forest_tests.rs` pins that the deferral
@@ -13914,6 +14162,16 @@ impl KvMetaBackend {
         }
         for (slot, root) in pending {
             forest.note_published(slot, root);
+            // The RAM table's unleased words follow the record (a later
+            // grant hands the requester the root the record names).
+            if let Some(p) = plane {
+                if let Some(mut l) = p.table.get(slot) {
+                    if l.state == crate::slot_lease_core::LeaseState::Unleased {
+                        l.words.root = (root.addr, root.seq);
+                        p.table.load(slot, l);
+                    }
+                }
+            }
         }
         Ok(())
     }

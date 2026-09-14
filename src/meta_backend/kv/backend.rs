@@ -373,6 +373,15 @@ pub static TEST_HANDOVER_HOLD_AFTER_PAGE: std::sync::atomic::AtomicBool =
 pub static TEST_HANDOVER_HOLD_AFTER_TREE0: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
+/// Test seam (review round 2, Issue 8): the mount DIES during its clean
+/// leave AFTER every region's leases went `Unleased` in tree 0 and BEFORE
+/// its pages went `Free` — the pages still attest the released slots. A
+/// remount over that history (another appender having leased one of the
+/// slots since) must read the attestations as STALE, never as a C14
+/// conflict. `false` = off.
+pub static TEST_LEAVE_HOLD_AFTER_RELEASES: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 /// `SQUEEZEFS_TIMEOUT` as the D1.b watchdog/escalation threshold
 /// (design-metadata-throughput §6): read per `open` (control-plane —
 /// never on an op path), default 30 s. Deliberately NOT process-memoized:
@@ -3040,6 +3049,13 @@ impl KvMetaBackend {
             }
             // The membership carriage no longer answers for this plane.
             super::slot_lease::unregister_carriage_plane(&plane);
+            if TEST_LEAVE_HOLD_AFTER_RELEASES.load(Ordering::Relaxed) {
+                return Err(KvError::Busy(format!(
+                    "{}: TEST_LEAVE_HOLD_AFTER_RELEASES — the mount died after its leases went \
+                     Unleased and before its pages went Free",
+                    self.path.display()
+                )));
+            }
         }
         // §5.1.3: a released region's UNCLAIMED grant (and every free its
         // tail already covered) returns to the heap — one control entry

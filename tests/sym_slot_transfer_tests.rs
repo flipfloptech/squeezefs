@@ -2501,3 +2501,104 @@ async fn a_leave_moves_the_released_trees_images_out_of_the_regions_grant() {
     assert!(vol.c13_orphan_image_extents().await.unwrap().is_empty());
     shutdown(&routed).await;
 }
+
+/// **Issue 8 (round 1): a leave-crash history is not a custody conflict.**
+/// The mount dies during its clean leave after its leases went `Unleased`
+/// in tree 0 and before its pages went `Free`; another appender then
+/// leases one of those slots (g + 1). The crashed identity's remount must
+/// SUCCEED — the page's attestation at the lower `g` is stale residue
+/// (`g` is strictly monotone per slot and tree 0 is the witness), dropped
+/// and counted, never `slot_lease_conflicts` — and the leave now writes
+/// the design's `Releasing` page step before the tree-0 batch, so the
+/// residue is a `Releasing` entry the row-6 rule already drops.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_leave_crash_history_remounts_without_a_custody_conflict() {
+    use squeezefs::meta_backend::kv::backend::TEST_LEAVE_HOLD_AFTER_RELEASES;
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    let uris = vec![format_stamped_member(dir.path(), "meta0").await];
+    let path = std::path::Path::new(&uris[0]);
+    let tag = volume_tag("vol-000000000000000e");
+    let owner = ino_in_slot(SLOT4, 5);
+    // 1. The declared region leases slot 4 and writes it; the leave dies
+    //    between the tree-0 batch and the pages going Free.
+    {
+        let routed = open_under(&uris, &Knobs::armed().partition(PARTITION)).await;
+        let vol = Arc::clone(&routed.volumes[0]);
+        for i in 0..4u64 {
+            vol.commit_block_refs(owner, &refs(tag, owner, i * 8, 2))
+                .await
+                .unwrap();
+        }
+        TEST_LEAVE_HOLD_AFTER_RELEASES.store(true, Ordering::Relaxed);
+        shutdown(&routed).await;
+        TEST_LEAVE_HOLD_AFTER_RELEASES.store(false, Ordering::Relaxed);
+        drop(vol);
+        let entries = read_directory(path, routed.volumes[0].superblock())
+            .await
+            .unwrap();
+        let p1 = entries[1].page.clone().unwrap();
+        assert_eq!(
+            p1.state,
+            AppenderState::Live,
+            "the crash left the page Live"
+        );
+        assert!(
+            p1.slots.iter().any(|e| guest_forest_slot(e.slot) == SLOT4),
+            "… still attesting slot 4"
+        );
+    }
+    // 2. Another appender leases slot 4 and still HOLDS it: a manager-only
+    //    mount (the seam's region undeclared — its Live page is listed,
+    //    not recovered) takes it by first touch (g = 2) and crashes with
+    //    its page attesting the slot.
+    {
+        let routed = open_under(&uris, &Knobs::armed()).await;
+        let vol = Arc::clone(&routed.volumes[0]);
+        vol.commit_block_refs(owner, &refs(tag, owner, 100, 1))
+            .await
+            .unwrap();
+        let states = tree0_states(&vol).await;
+        assert!(matches!(
+            states.iter().find(|(s, _)| *s == SLOT4).map(|(_, st)| st),
+            Some(SlotState::Leased {
+                appender_id: 0,
+                g: 2,
+                ..
+            })
+        ));
+        vol.checkpoint_now().await.unwrap();
+        vol.sync_device().await.unwrap();
+        drop(vol);
+        drop(routed);
+    }
+    // 3. The crashed identity remounts with its partition: page 0 (own
+    //    residue) attests slot 4 at g = 2, page 1 at g = 1 — the lower g
+    //    is stale, dropped and counted; the mount succeeds, no conflict.
+    let routed = open_under(&uris, &Knobs::armed().partition(PARTITION)).await;
+    let vol = Arc::clone(&routed.volumes[0]);
+    let s = lease_stats(&vol);
+    assert_eq!(
+        s.conflicts, 0,
+        "a leave-crash history is not a C14 conflict"
+    );
+    assert_eq!(
+        vol.appender_stats().unwrap().regions[1].leases,
+        0,
+        "slot 4 is region 0's"
+    );
+    let states = tree0_states(&vol).await;
+    assert!(matches!(
+        states.iter().find(|(s, _)| *s == SLOT4).map(|(_, st)| st),
+        Some(SlotState::Leased {
+            appender_id: 0,
+            g: 2,
+            ..
+        })
+    ));
+    for i in 0..4u64 {
+        assert_eq!(vol.block_ref_count(tag, i * 8).await.unwrap(), 1);
+    }
+    assert_eq!(vol.block_ref_count(tag, 100).await.unwrap(), 1);
+    shutdown(&routed).await;
+}

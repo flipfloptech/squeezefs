@@ -528,3 +528,162 @@ async fn below_the_declared_cap_the_join_lands_and_the_gauges_read_the_namespace
     assert_eq!(bytes, report_len_for(2, true) as u64);
     drop(join);
 }
+
+/// What the adversary's REGISTER answers.
+#[derive(Debug, Clone, Copy)]
+enum RegisterAnswer {
+    Ok,
+    Errno(i32),
+    Status(u16),
+}
+
+/// A `ReservationClient` whose REGISTER answers a configured error while
+/// every other verb is the fake namespace's — the learn arm's adversary.
+#[derive(Debug)]
+struct RegisterAnswers {
+    inner: Arc<FakeReservationClient>,
+    answer: std::sync::Mutex<RegisterAnswer>,
+}
+
+impl RegisterAnswers {
+    fn set(&self, a: RegisterAnswer) {
+        *self.answer.lock().unwrap() = a;
+    }
+}
+
+impl ReservationClient for RegisterAnswers {
+    fn rescap(&self) -> std::io::Result<u8> {
+        self.inner.rescap()
+    }
+    fn host_identity(&self) -> std::io::Result<squeezefs::meta_backend::reservation::HostIdentity> {
+        self.inner.host_identity()
+    }
+    fn wire_host_id(&self) -> std::io::Result<Vec<u8>> {
+        self.inner.wire_host_id()
+    }
+    fn register(&self, key: u64) -> std::io::Result<()> {
+        match *self.answer.lock().unwrap() {
+            RegisterAnswer::Ok => self.inner.register(key),
+            RegisterAnswer::Errno(code) => Err(std::io::Error::from_raw_os_error(code)),
+            RegisterAnswer::Status(status) => Err(
+                squeezefs::meta_backend::reservation::nvme_status_error(0x0d, status),
+            ),
+        }
+    }
+    fn unregister(&self, key: u64) -> std::io::Result<()> {
+        self.inner.unregister(key)
+    }
+    fn acquire_write_exclusive(&self, key: u64) -> std::io::Result<()> {
+        self.inner.acquire_write_exclusive(key)
+    }
+    fn acquire_write_exclusive_registrants_only(&self, key: u64) -> std::io::Result<()> {
+        self.inner.acquire_write_exclusive_registrants_only(key)
+    }
+    fn preempt(&self, key: u64, victim: u64) -> std::io::Result<()> {
+        self.inner.preempt(key, victim)
+    }
+    fn preempt_registrants_only(&self, key: u64, victim: u64) -> std::io::Result<()> {
+        self.inner.preempt_registrants_only(key, victim)
+    }
+    fn release(&self, key: u64) -> std::io::Result<()> {
+        self.inner.release(key)
+    }
+    fn release_registrants_only(&self, key: u64) -> std::io::Result<()> {
+        self.inner.release_registrants_only(key)
+    }
+    fn report(&self) -> std::io::Result<squeezefs::meta_backend::reservation::ReservationReport> {
+        self.inner.report()
+    }
+    fn report_bytes(&self) -> u64 {
+        self.inner.report_bytes()
+    }
+}
+
+/// Review round 1, Issue 5: the registrant cap is learned ONLY from a
+/// device-answered NVMe STATUS refusal of REGISTER that is neither the
+/// reservation conflict nor a transient class (`Namespace Not Ready`,
+/// `Command Interrupted`, `Transient Transport`, the abort classes, the
+/// path classes), and only once the SAME refusal REPEATS at the same
+/// registrant count; a transport errno — `EIO`, `ENXIO`, `ENOTTY`,
+/// `EAGAIN`, `ETIMEDOUT`, `EBUSY`, `ENODEV`, `ECONNRESET` … — never
+/// learns; a later REGISTER that SUCCEEDS at or past the learned count
+/// unlearns it (`pr_registrant_cap` falls back to unbounded).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_cap_is_learned_only_from_a_repeated_status_refusal_and_unlearned_on_success() {
+    use squeezefs::meta_backend::reservation::{
+        clear_learned_registrant_cap, pr_registrant_cap, register_ladder,
+        NVME_SC_NAMESPACE_NOT_READY, NVME_SC_TRANSIENT_TRANSPORT,
+    };
+    let _g = ENV.lock().await;
+    std::env::remove_var(PR_REGISTRANT_CAP_ENV);
+    clear_learned_registrant_cap();
+    let ns = FakeNvmeNamespace::lenient_register();
+    // Three registrants stand on the namespace.
+    for i in 0..3u64 {
+        FakeReservationClient::new(Arc::clone(&ns), "nqn.peer", &format!("peer-{i}"))
+            .register(0xC0 + i)
+            .unwrap();
+    }
+    let client = RegisterAnswers {
+        inner: FakeReservationClient::new(Arc::clone(&ns), "nqn.learn", "learn-host"),
+        answer: std::sync::Mutex::new(RegisterAnswer::Ok),
+    };
+    // Every transport errno class: refused, nothing learned.
+    for errno in [
+        libc::EIO,
+        libc::ENXIO,
+        libc::ENOTTY,
+        libc::EAGAIN,
+        libc::ETIMEDOUT,
+        libc::EBUSY,
+        libc::ENODEV,
+        libc::ECONNRESET,
+        libc::EINTR,
+        libc::ENOENT,
+    ] {
+        client.set(RegisterAnswer::Errno(errno));
+        register_ladder(&client, 0xD0).expect_err("register fails");
+        register_ladder(&client, 0xD0).expect_err("register fails again");
+        assert_eq!(
+            pr_registrant_cap(),
+            0,
+            "errno {errno} must never learn a cap"
+        );
+    }
+    // The transient NVMe status classes: never learn either.
+    for status in [NVME_SC_NAMESPACE_NOT_READY, NVME_SC_TRANSIENT_TRANSPORT] {
+        client.set(RegisterAnswer::Status(status));
+        register_ladder(&client, 0xD0).expect_err("register fails");
+        register_ladder(&client, 0xD0).expect_err("register fails again");
+        assert_eq!(
+            pr_registrant_cap(),
+            0,
+            "status {status:#x} is transient — never a cap"
+        );
+    }
+    // A device-answered command-specific refusal ONCE: a candidate, not a
+    // cap; the SAME refusal again at the same count: learned (3).
+    client.set(RegisterAnswer::Status(0x0102));
+    register_ladder(&client, 0xD0).expect_err("refused");
+    assert_eq!(
+        pr_registrant_cap(),
+        0,
+        "one refusal is a candidate, not a cap"
+    );
+    register_ladder(&client, 0xD0).expect_err("refused again");
+    assert_eq!(
+        pr_registrant_cap(),
+        3,
+        "the repeated refusal at 3 registrants learns 3"
+    );
+    // A REGISTER that SUCCEEDS at or past the learned count unlearns it.
+    client.set(RegisterAnswer::Ok);
+    register_ladder(&client, 0xD0).expect("the device admits the 4th registrant");
+    assert_eq!(client.report().unwrap().regctl(), 4);
+    assert_eq!(
+        pr_registrant_cap(),
+        0,
+        "a success at regctl ≥ learned proves the cap wrong — unlearned"
+    );
+    clear_learned_registrant_cap();
+}

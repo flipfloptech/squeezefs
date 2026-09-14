@@ -1122,7 +1122,12 @@ async fn c13_finds_exactly_the_unpublished_root_swaps_successor_and_repair_retur
     assert_eq!(digest_backend(va).await.unwrap(), live);
     // The returned extent is back in the pool: free, or legitimately
     // re-claimed by a later image / re-granted (lowest-free-first) — but
-    // never an orphan again.
+    // never an orphan again — and the sweep is a REAL one: the clean
+    // remount recovered the grant from tree 0, so every extent the
+    // record names is in a RAM set (review round 1, Issue 1: the first
+    // build forgot the record on a clean remount and this `is_empty()`
+    // passed vacuously).
+    assert_durable_ram_grant_law(va, 1).await;
     assert!(va.c13_orphan_image_extents().await.unwrap().is_empty());
     assert_grant_closure(&stats(va));
     let _ = guest_owner;
@@ -1313,6 +1318,651 @@ async fn fsck_ctx(dir: &std::path::Path, meta: Arc<RoutedMetaBackend>) -> squeez
         router,
         staging_dirs: vec![staging],
         expected_generation: None,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Review round 1 — the grant across a CLEAN remount (Issue 1), the wire's
+// integers (Issue 2), the join's already-arm (3), ExtentGrant's
+// idempotency (4), the space class on a leased slot (6), the page's
+// remainder (9), the leased leaf's promise (10), a return's RAM face (11),
+// the cap's appender count (12).
+// ---------------------------------------------------------------------------
+
+/// The durable-vs-RAM grant law after ANY open: every extent tree 0's
+/// `extent_grant:{id}` record names is in one of the region's RAM sets —
+/// `claimed ∪ unclaimed ∪ pending ∪ returnable` — so a retirement of a
+/// pre-remount image parks and returns like any other, and the C13 census
+/// (over `claimed`) is never vacuous.
+async fn assert_durable_ram_grant_law(vol: &KvMetaBackend, id: u32) {
+    let record = vol.extent_grant_record(id).await.unwrap();
+    let s = stats(vol);
+    let r = &s.regions[id as usize];
+    assert_eq!(
+        record.len(),
+        r.grant_claimed + r.grant_unclaimed + r.grant_pending + r.grant_returnable,
+        "tree 0's record ({} extents) must be exactly the RAM sets of appender {id}: {r:?}",
+        record.len()
+    );
+    for e in record.extents() {
+        assert!(
+            vol.grant_holds(id, e),
+            "extent {e} is in tree 0's record but in no RAM set of appender {id}"
+        );
+    }
+}
+
+/// Issue 1: three CLEAN unmount/remount cycles, a retirement in each —
+/// the grant is recovered from tree 0 at every open (a `Free` page names
+/// no remainder, so everything the record names is CLAIMED, the truth
+/// after a clean leave returned the rest), the retired pre-remount image
+/// parks on the region's tail, the cadence returns it (bit cleared,
+/// record rewritten), and the closure law holds across the remounts. Then
+/// an orphan PLANTED after the third remount is found by C13 — the census
+/// is a real one on a remounted region.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_clean_remount_recovers_the_grant_from_tree_zero_and_pre_remount_images_return() {
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    let uris = vec![format_stamped_member(dir.path(), "meta0").await];
+    let tag = volume_tag("vol-0011223344556677");
+    let guest_owner = guest_local_ino(3, 80); // forest slot 4 — appender 1's
+    for cycle in 0..3u64 {
+        std::env::set_var("SQUEEZEFS_META_FLUSH_INTERVAL_MS", "60000");
+        let ra = open_with_partition(&uris, Some(PARTITION)).await;
+        std::env::remove_var("SQUEEZEFS_META_FLUSH_INTERVAL_MS");
+        let va = Arc::clone(&ra.volumes[0]);
+        for i in 0..4u64 {
+            va.commit_block_refs(
+                guest_owner,
+                &refs(tag, guest_owner, cycle * 10_000 + i * 100, 40),
+            )
+            .await
+            .unwrap();
+        }
+        va.checkpoint_now().await.unwrap();
+        va.checkpoint_now().await.unwrap();
+        assert_durable_ram_grant_law(&va, 1).await;
+        if cycle > 0 {
+            let s = stats(&va);
+            assert!(
+                s.regions[1].grant_claimed >= 1,
+                "cycle {cycle}: the slot tree's live images are CLAIMED after the clean remount \
+                 (tree 0's record named them): {:?}",
+                s.regions[1]
+            );
+        }
+        // The retirement: a forced compaction of the slot tree's root —
+        // the old root (a pre-remount image from cycle 1 on) must park on
+        // appender 1's tail and return within a few cycles.
+        let tree = slot_tree(&va, 4);
+        let old_root = tree.root();
+        let old_ext = extent_of(&va, old_root.addr);
+        let returns_before = stats(&va).extent_returns;
+        assert_eq!(
+            va.defrag_compact_nodes(&[(0, old_root.addr)])
+                .await
+                .unwrap(),
+            1
+        );
+        assert_ne!(tree.root().addr, old_root.addr);
+        let s = stats(&va);
+        assert_eq!(
+            s.regions[1].grant_pending, 1,
+            "cycle {cycle}: the retired root is PARKED on appender 1's tail (a remount-forgotten \
+             grant drops the free): {:?}",
+            s.regions[1]
+        );
+        let mut cycles = 0;
+        while va.allocator().is_allocated(old_ext) && cycles < 6 {
+            va.checkpoint_now().await.unwrap();
+            cycles += 1;
+        }
+        assert!(
+            !va.allocator().is_allocated(old_ext),
+            "cycle {cycle}: the retired pre-remount image {old_ext} returned to the bitmap \
+             within {cycles} cycles"
+        );
+        assert!(
+            !va.extent_grant_record(1).await.unwrap().contains(old_ext),
+            "cycle {cycle}: the record dropped the returned extent"
+        );
+        assert!(stats(&va).extent_returns > returns_before);
+        assert_grant_closure(&stats(&va));
+        assert_durable_ram_grant_law(&va, 1).await;
+        assert!(va.c13_orphan_image_extents().await.unwrap().is_empty());
+        for v in &ra.volumes {
+            v.shutdown().await.unwrap();
+        }
+    }
+    // The planted orphan AFTER the remounts: a root swap the crash leaves
+    // unpublished — C13 on the remounted region finds exactly it.
+    std::env::set_var("SQUEEZEFS_META_FLUSH_INTERVAL_MS", "60000");
+    let ra = open_with_partition(&uris, Some(PARTITION)).await;
+    std::env::remove_var("SQUEEZEFS_META_FLUSH_INTERVAL_MS");
+    let va = Arc::clone(&ra.volumes[0]);
+    assert_durable_ram_grant_law(&va, 1).await;
+    let tree = slot_tree(&va, 4);
+    let old_root = tree.root();
+    assert_eq!(
+        va.defrag_compact_nodes(&[(0, old_root.addr)])
+            .await
+            .unwrap(),
+        1
+    );
+    let planted = extent_of(&va, tree.root().addr);
+    drop(va);
+    drop(ra);
+    let ra = open_with_partition(&uris, Some(PARTITION)).await;
+    let va = &ra.volumes[0];
+    assert_durable_ram_grant_law(va, 1).await;
+    let orphans = va.c13_orphan_image_extents().await.unwrap();
+    assert_eq!(
+        orphans
+            .iter()
+            .map(|o| (o.appender, o.extent))
+            .collect::<Vec<_>>(),
+        vec![(1u32, planted)],
+        "C13 finds the orphan planted after the remounts — a real census over a recovered grant"
+    );
+    assert!(va.c13_return_orphan(1, planted).await.unwrap());
+    for v in &ra.volumes {
+        v.shutdown().await.unwrap();
+    }
+}
+
+/// Issue 2: a wire integer is never an allocation authority. A
+/// `ReturnExtents` run past the volume's extents, one that overflows, or
+/// one naming more extents than the caller's whole record is REJECTED
+/// before any expansion (`manager_verb_rejected` — the wire-invalid
+/// class, kept apart from the durable-witness `manager_verb_refusals`
+/// must-stay-0); a run inside the record returns only its intersection;
+/// an explicit `ExtentGrant { want }` is clamped to the derivation's cap
+/// and never carves the free heap.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn wire_integers_are_never_allocation_authority() {
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    let uris = vec![format_stamped_member(dir.path(), "meta0").await];
+    let routed = open_with_partition(&uris, Some(PARTITION)).await;
+    let vol = Arc::clone(&routed.volumes[0]);
+    let total = vol.allocator().total_extents();
+    let free_before = vol.free_extents();
+    // Past the volume, overflowing, and wider than the record: rejected.
+    for runs in [
+        vec![GrantRun {
+            start: 0,
+            len: u32::MAX,
+        }],
+        vec![GrantRun {
+            start: u64::MAX - 1,
+            len: 4,
+        }],
+        vec![GrantRun {
+            start: total,
+            len: 1,
+        }],
+        vec![
+            GrantRun {
+                start: 0,
+                len: (total / 2) as u32,
+            },
+            GrantRun {
+                start: total / 2,
+                len: (total - total / 2) as u32,
+            },
+        ],
+    ] {
+        let err = vol
+            .manager_return_runs(1, &runs)
+            .await
+            .expect_err("a wire-invalid run is rejected before any allocation");
+        assert!(
+            err.to_string().contains("rejected"),
+            "the rejection names its class: {err}"
+        );
+    }
+    let s = stats(&vol);
+    assert_eq!(
+        s.manager_verb_rejected, 4,
+        "four wire-invalid frames rejected"
+    );
+    assert_eq!(
+        s.manager_verb_refusals, 0,
+        "a wire-invalid frame is not the durable-witness class"
+    );
+    assert_eq!(vol.free_extents(), free_before, "nothing was cleared");
+    // A run partly outside the record: only the intersection returns.
+    let record = vol.extent_grant_record(1).await.unwrap();
+    let first = record.extents().next().unwrap();
+    let (cleared, already) = vol
+        .manager_return_runs(
+            1,
+            &[GrantRun {
+                start: first,
+                len: 1,
+            }],
+        )
+        .await
+        .unwrap();
+    assert_eq!((cleared, already), (1, 0));
+    // An explicit `want` past the cap is clamped: the grant never carves
+    // more than the derivation's cap, never the free heap.
+    let free_before = vol.free_extents();
+    let granted = vol.manager_extent_grant(1, u32::MAX).await.unwrap();
+    let n: u64 = granted.iter().map(|r| u64::from(r.len)).sum();
+    let cap = resolve_grant_extents(
+        0,
+        stats(&vol).failover_bound_ms,
+        free_before,
+        stats(&vol).appenders_known,
+    );
+    assert!(
+        n <= cap.max(GRANT_EXTENTS_FLOOR),
+        "want = u32::MAX carved {n} extents — past the derivation's cap {cap}"
+    );
+    assert!(
+        vol.free_extents() >= free_before - cap.max(GRANT_EXTENTS_FLOOR),
+        "the free heap survives a hostile want"
+    );
+    // The same laws over the wire.
+    let host = cw::RpcListener::start_async(
+        listener_cfg(),
+        SECRET.to_vec(),
+        ManagerService::new(Arc::clone(&vol)),
+    )
+    .unwrap();
+    let mut client = ManagerClient::connect(&host.endpoint().to_string(), SECRET, "peer-w")
+        .await
+        .unwrap();
+    let err = client
+        .return_extents(
+            1,
+            &[GrantRun {
+                start: 0,
+                len: u32::MAX,
+            }],
+        )
+        .await
+        .expect_err("rejected over the wire");
+    assert!(err.to_string().contains("rejected"), "{err}");
+    let granted = client.extent_grant(1, u32::MAX).await.unwrap();
+    let n: u64 = granted.iter().map(|r| u64::from(r.len)).sum();
+    assert!(n <= cap.max(GRANT_EXTENTS_FLOOR));
+    assert_eq!(stats(&vol).manager_verb_rejected, 5);
+    host.shutdown();
+    for v in &routed.volumes {
+        v.shutdown().await.unwrap();
+    }
+}
+
+/// Issue 3: `Joined { already }` answers the joiner's UNCLAIMED remainder
+/// (its page's grant), never the whole record — and a join interrupted
+/// between its page going Live and its initial grant (the seam
+/// `TEST_JOIN_HOLD_AFTER_PAGE`) is completed by the replay: the successor
+/// mints the grant the interrupted join owed and answers it, so
+/// `Joined.grant` means the same thing on every reply.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_join_interrupted_after_its_page_replays_already_with_the_grant_it_was_owed() {
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    let uris = vec![format_stamped_member(dir.path(), "meta0").await];
+    let routed = open_with_partition(&uris, Some(PARTITION)).await;
+    let vol = Arc::clone(&routed.volumes[0]);
+    let identity = joiner_identity(9);
+    // The interrupted join: the page is Live, the grant never minted.
+    squeezefs::meta_backend::kv::backend::TEST_JOIN_HOLD_AFTER_PAGE.store(true, Ordering::SeqCst);
+    let err = vol
+        .manager_join_appender(identity, 0)
+        .await
+        .expect_err("the seam fails the join after its page");
+    squeezefs::meta_backend::kv::backend::TEST_JOIN_HOLD_AFTER_PAGE.store(false, Ordering::SeqCst);
+    assert!(
+        err.to_string().contains("TEST_JOIN_HOLD_AFTER_PAGE"),
+        "{err}"
+    );
+    let entries = read_directory(std::path::Path::new(&uris[0]), vol.superblock())
+        .await
+        .unwrap();
+    let page = entries
+        .iter()
+        .find_map(|e| {
+            e.page
+                .as_ref()
+                .filter(|p| p.identity == identity && p.state == AppenderState::Live)
+        })
+        .expect("the page is Live");
+    assert!(page.grant.is_empty(), "no grant was minted");
+    assert!(vol
+        .extent_grant_record(page.appender_id)
+        .await
+        .unwrap()
+        .is_empty());
+    // The replay completes the join: already, AND a grant.
+    let out = vol.manager_join_appender(identity, 0).await.unwrap();
+    assert!(out.already, "KD-SYM-7: the Live page is the witness");
+    let granted: u64 = out.grant.iter().map(|r| u64::from(r.len)).sum();
+    assert!(
+        granted >= GRANT_EXTENTS_FLOOR,
+        "the interrupted join's grant is minted by the replay: {:?}",
+        out.grant
+    );
+    let record = vol.extent_grant_record(out.appender_id).await.unwrap();
+    assert_eq!(record.len(), granted, "the record names it");
+    // A second replay answers the UNCLAIMED remainder (the page's grant),
+    // not the record — after the joiner claims one, they differ.
+    let again = vol.manager_join_appender(identity, 0).await.unwrap();
+    assert!(again.already);
+    assert_eq!(
+        again.grant, out.grant,
+        "unconsumed: the remainder IS the grant"
+    );
+    for v in &routed.volumes {
+        v.shutdown().await.unwrap();
+    }
+}
+
+/// Issue 4 / §5.3.5: `ExtentGrant` is idempotent against DURABLE state —
+/// a caller whose unclaimed remainder (its page's grant) already covers
+/// the size it asks for is answered that remainder VERBATIM (a replay
+/// after a lost reply carves nothing; `manager_verb_replays`); a caller
+/// that has consumed past half gets a fresh carve (the 50 % law).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unconsumed_grant_is_answered_verbatim() {
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    let uris = vec![format_stamped_member(dir.path(), "meta0").await];
+    let routed = open_with_partition(&uris, Some(PARTITION)).await;
+    let vol = Arc::clone(&routed.volumes[0]);
+    let s0 = stats(&vol);
+    assert_eq!(s0.extent_grants, 1, "the join's initial grant");
+    let first = vol.manager_extent_grant(1, 0).await.unwrap();
+    let s1 = stats(&vol);
+    assert_eq!(
+        s1.extent_grants, 1,
+        "an unconsumed grant is answered verbatim — nothing carved"
+    );
+    assert_eq!(s1.manager_verb_replays, s0.manager_verb_replays + 1);
+    let n: u64 = first.iter().map(|r| u64::from(r.len)).sum();
+    assert_eq!(n, s1.regions[1].grant_unclaimed, "the remainder, verbatim");
+    let again = vol.manager_extent_grant(1, 0).await.unwrap();
+    assert_eq!(again, first);
+    // A wire joiner's remainder is read off ITS page.
+    let host = cw::RpcListener::start_async(
+        listener_cfg(),
+        SECRET.to_vec(),
+        ManagerService::new(Arc::clone(&vol)),
+    )
+    .unwrap();
+    let mut client = ManagerClient::connect(&host.endpoint().to_string(), SECRET, "peer-i")
+        .await
+        .unwrap();
+    let joined = client.join(joiner_identity(11), 0).await.unwrap();
+    let ManagerReply::Joined {
+        appender_id, grant, ..
+    } = joined
+    else {
+        panic!("{joined:?}");
+    };
+    let grants_before = stats(&vol).extent_grants;
+    let g1 = client.extent_grant(appender_id, 0).await.unwrap();
+    assert_eq!(
+        g1.iter().map(|r| (r.start, r.len)).collect::<Vec<_>>(),
+        grant,
+        "the wire joiner's unconsumed grant, verbatim"
+    );
+    assert_eq!(stats(&vol).extent_grants, grants_before, "nothing carved");
+    host.shutdown();
+    for v in &routed.volumes {
+        v.shutdown().await.unwrap();
+    }
+}
+
+/// Issue 6: a FULL heap on a leased slot is the SPACE class, never the
+/// manager dependency — a grant the bitmap cannot serve answers
+/// `NoSpace`, the flush pass counts it on the space class and
+/// `manager_dependency_stalls` stays 0; and a COMPACTION-class grant
+/// draws down to the compaction floor like the manager's own SMOs, so the
+/// heap-full recovery can return extents through a leased slot tree too.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_full_heap_on_a_leased_slot_is_the_space_class_not_a_manager_stall() {
+    use squeezefs::meta_backend::kv::alloc_ext_core::AllocClass;
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    let uris = vec![format_stamped_member(dir.path(), "meta0").await];
+    let routed = open_with_partition(&uris, Some(PARTITION)).await;
+    let vol = Arc::clone(&routed.volumes[0]);
+    // Drain the USER-claimable heap through the manager's own claimer.
+    let mut drained = Vec::new();
+    loop {
+        match vol.allocator().claim_user() {
+            Ok(e) => drained.push(e),
+            Err(squeezefs::meta_backend::kv::KvError::NoSpace { .. }) => break,
+            Err(e) => panic!("{e:?}"),
+        }
+    }
+    // A USER-class grant on the full heap is the space class.
+    let err = vol
+        .manager_extent_grant(1, 8)
+        .await
+        .expect_err("no user-claimable extent: NoSpace, never Ok(empty)");
+    assert!(
+        matches!(err, squeezefs::meta_backend::kv::KvError::NoSpace { .. }),
+        "{err:?}"
+    );
+    // A COMPACTION-class grant draws the reserve down to the floor.
+    let granted = vol
+        .manager_extent_grant_class(1, 2, AllocClass::Internal)
+        .await
+        .unwrap();
+    assert!(
+        granted.iter().map(|r| u64::from(r.len)).sum::<u64>() >= 1,
+        "the compaction class carves from the reserve: {granted:?}"
+    );
+    let s = stats(&vol);
+    assert_eq!(s.dependency_stalls, 0, "a space condition is not a stall");
+    for e in drained {
+        vol.allocator().release_unpublished(e);
+    }
+    for v in &routed.volumes {
+        v.shutdown().await.unwrap();
+    }
+}
+
+/// Issue 9: the page names the WHOLE unclaimed remainder. A RAM remainder
+/// in more runs than the page carries (`GRANT_RUNS_MAX`) trims its
+/// smallest runs into the returnable batch before the page is written,
+/// so a crash-class open never recovers legitimately unclaimed extents as
+/// claimed (a two-cycle C13 round trip).
+#[test]
+fn the_page_remainder_is_never_truncated_the_excess_returns() {
+    let mut g = RegionGrant::default();
+    // Six single-extent runs (every other extent).
+    g.add_runs(
+        &(0..6u64)
+            .map(|i| GrantRun {
+                start: 100 + 2 * i,
+                len: 1,
+            })
+            .collect::<Vec<_>>(),
+    );
+    assert_eq!(g.unclaimed(), 6);
+    let trimmed = g.trim_to_page_runs();
+    assert_eq!(trimmed, 6 - GRANT_RUNS_MAX as u64);
+    assert_eq!(g.unclaimed_runs().len(), GRANT_RUNS_MAX);
+    assert_eq!(
+        g.unclaimed(),
+        GRANT_RUNS_MAX as u64,
+        "the page's runs ARE the remainder"
+    );
+    assert_eq!(g.returnable(), trimmed, "the excess is returnable");
+    assert_eq!(g.held() + g.unclaimed(), 6, "closure: nothing lost");
+    // The trim keeps the LARGEST runs.
+    let mut g = RegionGrant::default();
+    g.add_runs(&[
+        GrantRun { start: 0, len: 4 },
+        GrantRun { start: 10, len: 1 },
+        GrantRun { start: 20, len: 3 },
+        GrantRun { start: 30, len: 1 },
+        GrantRun { start: 40, len: 2 },
+    ]);
+    assert_eq!(g.trim_to_page_runs(), 1);
+    assert_eq!(g.returnable(), 1, "one single-extent run trimmed");
+    assert_eq!(g.unclaimed(), 10);
+    assert_eq!(g.unclaimed_runs().len(), GRANT_RUNS_MAX);
+}
+
+/// Issue 10: a leased slot's leaf promises its SMO's extents against the
+/// REGION's grant (`grant_promised`), not the heap ledger — its SMO
+/// draws the grant, and a heap promise was a transient over-count on the
+/// manager's claimable; the promise is released when the SMO claims.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_leased_leafs_promise_rides_the_grant_not_the_heap() {
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    let uris = vec![format_stamped_member(dir.path(), "meta0").await];
+    let tag = volume_tag("vol-0011223344556677");
+    let guest_owner = guest_local_ino(3, 81);
+    std::env::set_var("SQUEEZEFS_META_FLUSH_INTERVAL_MS", "60000");
+    let ra = open_with_partition(&uris, Some(PARTITION)).await;
+    std::env::remove_var("SQUEEZEFS_META_FLUSH_INTERVAL_MS");
+    let va = Arc::clone(&ra.volumes[0]);
+    let heap_promised_before = va.heap_promised();
+    // Enough refs into appender 1's slot that the leaf's fold overflows
+    // its log: the admission promises the SMO's extents.
+    for i in 0..6u64 {
+        va.commit_block_refs(guest_owner, &refs(tag, guest_owner, i * 1000, 400))
+            .await
+            .unwrap();
+    }
+    assert_eq!(
+        va.heap_promised(),
+        heap_promised_before,
+        "a leased leaf never promises on the heap ledger"
+    );
+    va.checkpoint_now().await.unwrap();
+    let s = stats(&va);
+    assert!(
+        s.regions[1].grant_claimed >= 2,
+        "the folds ran as SMOs of appender 1's tree: {:?}",
+        s.regions[1]
+    );
+    assert_eq!(
+        s.regions[1].grant_promised, 0,
+        "every promise the admission recorded on the grant was released by its SMO: {:?}",
+        s.regions[1]
+    );
+    assert_eq!(va.heap_promised(), heap_promised_before);
+    assert_grant_closure(&s);
+    // The arithmetic, on the RAM grant itself: a promise reserves
+    // headroom, a claim consumes it, a retraction returns it.
+    let mut g = RegionGrant::default();
+    g.add_runs(&[GrantRun { start: 0, len: 4 }]);
+    assert_eq!(g.headroom(), 4);
+    g.promise(3);
+    assert_eq!((g.promised(), g.headroom()), (3, 1));
+    assert_eq!(g.claim_promised(), Some(0));
+    assert_eq!((g.promised(), g.headroom()), (2, 1));
+    g.retract_promise(2);
+    assert_eq!((g.promised(), g.headroom()), (0, 3));
+    for v in &ra.volumes {
+        v.shutdown().await.unwrap();
+    }
+}
+
+/// Issue 11: a `ReturnExtents` of extents an IN-PROCESS region's RAM
+/// grant still holds drops them from RAM too (unclaimed / returnable /
+/// pending — never a live image: a CLAIMED extent is refused), so the
+/// bitmap and the RAM grant cannot disagree and a later `claim()` can
+/// never hand out an extent the manager re-granted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_return_drops_the_extents_from_the_ram_grant_and_refuses_a_live_image() {
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    let uris = vec![format_stamped_member(dir.path(), "meta0").await];
+    let tag = volume_tag("vol-0011223344556677");
+    let guest_owner = guest_local_ino(3, 82);
+    let routed = open_with_partition(&uris, Some(PARTITION)).await;
+    let vol = Arc::clone(&routed.volumes[0]);
+    vol.commit_block_refs(guest_owner, &refs(tag, guest_owner, 0, 8))
+        .await
+        .unwrap();
+    vol.checkpoint_now().await.unwrap();
+    let s = stats(&vol);
+    let unclaimed_before = s.regions[1].grant_unclaimed;
+    assert!(s.regions[1].grant_claimed >= 1);
+    let record = vol.extent_grant_record(1).await.unwrap();
+    // The live image (the slot tree's root) is CLAIMED: refused.
+    let root_ext = extent_of(&vol, slot_tree(&vol, 4).root().addr);
+    assert!(record.contains(root_ext));
+    let err = vol
+        .manager_return_runs(
+            1,
+            &[GrantRun {
+                start: root_ext,
+                len: 1,
+            }],
+        )
+        .await
+        .expect_err("a claimed extent holds a live image — refused");
+    assert!(err.to_string().contains("claimed"), "{err}");
+    assert!(vol.allocator().is_allocated(root_ext));
+    // Two UNCLAIMED extents: returned AND dropped from RAM.
+    let two: Vec<u64> = record
+        .extents()
+        .filter(|e| *e != root_ext && vol.grant_holds(1, *e))
+        .take(2)
+        .collect();
+    assert_eq!(two.len(), 2);
+    let (cleared, already) = vol
+        .manager_return_runs(
+            1,
+            &two.iter()
+                .map(|e| GrantRun { start: *e, len: 1 })
+                .collect::<Vec<_>>(),
+        )
+        .await
+        .unwrap();
+    assert_eq!((cleared, already), (2, 0));
+    let s = stats(&vol);
+    assert_eq!(s.regions[1].grant_unclaimed, unclaimed_before - 2);
+    for e in &two {
+        assert!(!vol.grant_holds(1, *e), "extent {e} left every RAM set");
+        assert!(!vol.allocator().is_allocated(*e));
+    }
+    assert_grant_closure(&s);
+    for v in &routed.volumes {
+        v.shutdown().await.unwrap();
+    }
+}
+
+/// Issue 12: the grant cap's appender count is the directory's LIVE
+/// count (in-process regions AND wire joiners), published as
+/// `appenders_known`; a wire join grows it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_grant_cap_counts_every_live_appender_wire_joiners_included() {
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    let uris = vec![format_stamped_member(dir.path(), "meta0").await];
+    let routed = open_with_partition(&uris, Some(PARTITION)).await;
+    let vol = Arc::clone(&routed.volumes[0]);
+    assert_eq!(stats(&vol).appenders_known, 2, "the manager and appender 1");
+    let host = cw::RpcListener::start_async(
+        listener_cfg(),
+        SECRET.to_vec(),
+        ManagerService::new(Arc::clone(&vol)),
+    )
+    .unwrap();
+    let mut client = ManagerClient::connect(&host.endpoint().to_string(), SECRET, "peer-k")
+        .await
+        .unwrap();
+    client.join(joiner_identity(12), 0).await.unwrap();
+    assert_eq!(stats(&vol).appenders_known, 3, "the wire joiner counts");
+    client.join(joiner_identity(12), 0).await.unwrap();
+    assert_eq!(stats(&vol).appenders_known, 3, "a replay does not");
+    host.shutdown();
+    for v in &routed.volumes {
+        v.shutdown().await.unwrap();
     }
 }
 

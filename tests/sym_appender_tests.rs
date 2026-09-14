@@ -932,14 +932,20 @@ async fn format_stamped_member(dir: &std::path::Path, name: &str) -> String {
 }
 
 /// Open the set with the declared partition `partition` in force for the
-/// open (the env is read at the writer's open; cleared after).
+/// open (the env is read at the writer's open; cleared after). A declared
+/// partition ARMS the symmetric plane, and a file-backed volume is a
+/// non-PR substrate — KD-SYM-13 (PR 3) needs the loud opt-in here.
 async fn open_with_partition(uris: &[String], partition: Option<&str>) -> Arc<RoutedMetaBackend> {
     match partition {
-        Some(p) => std::env::set_var(TEST_APPENDER_SLOTS_ENV, p),
+        Some(p) => {
+            std::env::set_var(TEST_APPENDER_SLOTS_ENV, p);
+            std::env::set_var("SQUEEZEFS_SYM_ALLOW_NON_PR", "1");
+        }
         None => std::env::remove_var(TEST_APPENDER_SLOTS_ENV),
     }
     let r = open_routed_meta_set(uris).await;
     std::env::remove_var(TEST_APPENDER_SLOTS_ENV);
+    std::env::remove_var("SQUEEZEFS_SYM_ALLOW_NON_PR");
     r.expect("open routed set")
 }
 
@@ -1441,8 +1447,10 @@ async fn a_changed_lease_set_refuses_the_mount_as_a_lease_violation() {
     drop(ra);
     let before = META_KV_REPLAY_LEASE_VIOLATIONS.load(Ordering::Relaxed);
     std::env::set_var(TEST_APPENDER_SLOTS_ENV, "1:9");
+    std::env::set_var("SQUEEZEFS_SYM_ALLOW_NON_PR", "1");
     let r = open_routed_meta_set(&uris).await;
     std::env::remove_var(TEST_APPENDER_SLOTS_ENV);
+    std::env::remove_var("SQUEEZEFS_SYM_ALLOW_NON_PR");
     let err = match r {
         Ok(_) => panic!("ring 1 holds records for slot 4, which appender 1 no longer leases"),
         Err(e) => e.to_string(),

@@ -1159,6 +1159,13 @@ pub struct KvMetaBackend {
     reservations: Option<Arc<dyn crate::meta_backend::reservation::ReservationClient>>,
     /// Our 64-bit reservation key: `xxh3_64(writer_id ‖ boot_id)`.
     pr_key: u64,
+    /// The metadata namespace's reservation TYPE this mount holds
+    /// (design-symmetric-metadata §5.8.1): `true` = Write Exclusive –
+    /// Registrants Only (rtype 3 — the manager of an ARMED forest volume,
+    /// every other appender a registrant), `false` = the shipped Write
+    /// Exclusive (rtype 1). Decided at open; a bit-17-absent mount and an
+    /// unarmed forest mount read `false`.
+    meta_wero: bool,
     /// The host identity recorded at mount (§5.0 B1 pt 6 stability
     /// requirement); set once by the mount gate, compared by the
     /// heartbeat re-check.
@@ -1438,6 +1445,12 @@ impl KvMetaBackend {
         inner.pr_key = xxhash_rust::xxh3::xxh3_64(
             format!("{}\u{0}{}", inner.writer_id, inner.boot_id).as_bytes(),
         );
+        // KD-SYM-13 (design-symmetric-metadata §5.8.1 / §5.8.2): the
+        // symmetric arm refuses a substrate that cannot fence — and a
+        // detection-grade posture on one that can — without the loud
+        // opt-in. Decided BEFORE the gate: nothing is registered yet.
+        // A refusal drops `inner` — and with it the flock it carries.
+        inner.meta_wero = inner.decide_meta_fence_posture()?;
         let be = Arc::new(inner);
         // PR M7: pass-task spawn identity — set before the FIRST commit
         // (the writer-claim tx below already rides the conveyor).
@@ -2549,6 +2562,7 @@ impl KvMetaBackend {
             durable_term_enabled,
             reservations: None,
             pr_key: 0,
+            meta_wero: false,
             pr_identity: std::sync::OnceLock::new(),
             pr_active: AtomicBool::new(false),
             guard_fenced: AtomicU64::new(0),
@@ -2772,6 +2786,10 @@ impl KvMetaBackend {
         );
         *set.manager_lease.lock().unwrap_or_else(|e| e.into_inner()) =
             super::appender::ManagerLease::Held;
+        set.wero_meta.store(
+            self.meta_wero && self.pr_active.load(Ordering::Acquire),
+            Ordering::Release,
+        );
         set.joined.store(true, Ordering::Release);
         // One barriered cycle: bitmap pages (the rings' extents), the
         // ledger, then every region's page in its Live form.
@@ -8343,7 +8361,7 @@ impl KvMetaBackend {
                     self.path.display()
                 );
             }
-            let acquire = rsv_call(&rsv, move |c| c.acquire_write_exclusive(key)).await;
+            let acquire = self.rsv_acquire(&rsv, key).await;
             match acquire {
                 Ok(()) => {}
                 Err(e) if crate::meta_backend::reservation::is_reservation_conflict(&e) => {
@@ -8360,9 +8378,16 @@ impl KvMetaBackend {
                             self.path.display()
                         )));
                     };
-                    rsv_call(&rsv, move |c| c.preempt(key, victim))
-                        .await
-                        .map_err(|e| self.pr_error("reservation preempt", e))?;
+                    let wero = self.meta_wero;
+                    rsv_call(&rsv, move |c| {
+                        if wero {
+                            c.preempt_registrants_only(key, victim)
+                        } else {
+                            c.preempt(key, victim)
+                        }
+                    })
+                    .await
+                    .map_err(|e| self.pr_error("reservation preempt", e))?;
                     log::warn!(
                         "meta volume {}: preempted stale reservation holder key {victim:#018x} \
                          (device-fenced takeover; writer_claim evidence was stale/absent)",
@@ -8625,6 +8650,99 @@ impl KvMetaBackend {
         )))
     }
 
+    /// The metadata namespace's acquire in the rtype this mount holds
+    /// (`meta_wero`): WERO for an armed forest's manager, the shipped
+    /// Write Exclusive otherwise.
+    async fn rsv_acquire(
+        &self,
+        rsv: &Arc<dyn crate::meta_backend::reservation::ReservationClient>,
+        key: u64,
+    ) -> std::io::Result<()> {
+        let wero = self.meta_wero;
+        rsv_call(rsv, move |c| {
+            if wero {
+                c.acquire_write_exclusive_registrants_only(key)
+            } else {
+                c.acquire_write_exclusive(key)
+            }
+        })
+        .await
+    }
+
+    /// This mount's reservation key on the metadata namespace (0 on a
+    /// non-PR substrate) — the holder key a registrant's report names.
+    pub fn writer_guard_pr_key(&self) -> u64 {
+        self.pr_key
+    }
+
+    /// Whether the symmetric PLANE is armed on this volume (KD-SYM-13's
+    /// subject): a declared appender partition — or, from PR 4, a join or
+    /// a lease. A solo forest mount is NOT the arm.
+    pub fn symmetric_arm_engaged(&self) -> bool {
+        self.appenders.as_ref().is_some_and(|a| a.is_partitioned())
+    }
+
+    /// KD-SYM-13: decide the metadata namespace's fence posture for this
+    /// open. Returns whether the manager holds WERO. Refuses loud (a) an
+    /// armed plane on a non-PR substrate and (b) `SQUEEZEFS_META_PR_WERO=0`
+    /// on a PR-capable one, unless `SQUEEZEFS_SYM_ALLOW_NON_PR=1` — which
+    /// is announced at every mount that uses it, never a default. An
+    /// unarmed mount (flat, or a solo forest) keeps the shipped posture
+    /// verbatim and reads none of the knobs.
+    fn decide_meta_fence_posture(&self) -> std::result::Result<bool, KvError> {
+        if !self.symmetric_arm_engaged() {
+            return Ok(false);
+        }
+        let allow_non_pr = crate::env_knobs::bool_knob("SQUEEZEFS_SYM_ALLOW_NON_PR", false);
+        let wero_wanted = crate::env_knobs::bool_knob("SQUEEZEFS_META_PR_WERO", true);
+        let pr_capable = self.reservations.is_some();
+        if !pr_capable {
+            if !allow_non_pr {
+                return Err(KvError::Busy(format!(
+                    "{}: the symmetric metadata plane is armed (a declared appender partition) \
+                     but this namespace advertises no NVMe Persistent Reservations (RESCAP=0 or \
+                     not an NVMe namespace) — fencing between appenders would be \
+                     detection-grade only, and detection-grade is not loss-free (a zombie's \
+                     frame past the recorded tail is an ACKED-loss class, \
+                     design-symmetric-metadata §5.8.2). KD-SYM-13 refuses to arm here; set \
+                     SQUEEZEFS_SYM_ALLOW_NON_PR=1 to opt in LOUDLY (lab use), or use a \
+                     PR-capable namespace (the kernel nvmet target)",
+                    self.path.display()
+                )));
+            }
+            log::warn!(
+                "meta volume {}: SYMMETRIC PLANE ARMED ON A NON-PR SUBSTRATE under \
+                 SQUEEZEFS_SYM_ALLOW_NON_PR=1 (KD-SYM-13) — fencing between appenders is \
+                 DETECTION-GRADE ONLY, which is not loss-free (design-symmetric-metadata \
+                 §5.8.2): a zombie appender's frame past the recorded tail is an acked-loss \
+                 class the device would have refused. Lab posture, never a default",
+                self.path.display()
+            );
+            return Ok(false);
+        }
+        if !wero_wanted {
+            if !allow_non_pr {
+                return Err(KvError::Busy(format!(
+                    "{}: SQUEEZEFS_META_PR_WERO=0 asks for the detection-grade Write Exclusive \
+                     posture on a PR-CAPABLE namespace with the symmetric plane armed — the \
+                     device could fence every appender (WERO + registrants, \
+                     design-symmetric-metadata §5.8.1) and detection-grade is not loss-free \
+                     (§5.8.2). Refused unless SQUEEZEFS_SYM_ALLOW_NON_PR=1 (KD-SYM-13)",
+                    self.path.display()
+                )));
+            }
+            log::warn!(
+                "meta volume {}: SQUEEZEFS_META_PR_WERO=0 on a PR-capable namespace under \
+                 SQUEEZEFS_SYM_ALLOW_NON_PR=1 — the manager holds the shipped Write Exclusive \
+                 and the other appenders are fenced DETECTION-GRADE ONLY (KD-SYM-13, lab \
+                 posture)",
+                self.path.display()
+            );
+            return Ok(false);
+        }
+        Ok(true)
+    }
+
     fn pr_error(&self, what: &str, e: std::io::Error) -> KvError {
         KvError::Busy(format!(
             "{}: {what} failed on the PR-capable namespace: {e} (single-writer guard)",
@@ -8640,7 +8758,16 @@ impl KvMetaBackend {
         }
         if let Some(rsv) = self.reservations.clone() {
             let key = self.pr_key;
-            match rsv_call(&rsv, move |c| c.release(key)).await {
+            let wero = self.meta_wero;
+            match rsv_call(&rsv, move |c| {
+                if wero {
+                    c.release_registrants_only(key)
+                } else {
+                    c.release(key)
+                }
+            })
+            .await
+            {
                 Ok(()) => log::debug!("meta volume {}: reservation released", self.path.display()),
                 Err(e) => log::warn!(
                     "meta volume {}: reservation release failed: {e} (a successor \
@@ -8912,7 +9039,7 @@ impl KvMetaBackend {
                                     self.path.display()
                                 );
                             }
-                            rsv_call(&rsv, move |c| c.acquire_write_exclusive(key)).await
+                            self.rsv_acquire(&rsv, key).await
                         }
                         .await;
                         match re {

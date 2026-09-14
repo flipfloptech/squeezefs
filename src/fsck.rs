@@ -2,7 +2,7 @@
 //! KD-9/KD-17; repair is VL6b and consumes the findings this module
 //! verifies).
 //!
-//! Check classes (C1–C12; C8–C12 postdate the VL6a seven):
+//! Check classes (C1–C13; C8–C13 postdate the VL6a seven):
 //!
 //! | Class | What | Source of truth |
 //! |---|---|---|
@@ -57,6 +57,15 @@
 //! LBA grain, or does not decode (`C12Overrun`). **REPORT-ONLY** (the C8
 //! posture). | the census mapping list itself — one interval sort per
 //! `(vol, offset, incarnation)`, no new walk |
+//! | C13 | **orphan image extent** (design-symmetric-metadata §5.8.5,
+//! symmetric PR 3): a heap extent an appender's grant holds CLAIMED that
+//! no slot-tree root reaches and no pending-free names — the successor
+//! image of a root swap the crash left unpublished, or a grant remainder
+//! the page could not name. Repair = return to the bitmap through the
+//! appender's own ring. Absent on every flat volume (no grant exists). |
+//! the backend's census under its SMO + mint serialization
+//! (`KvMetaBackend::c13_orphan_image_extents`) — one paged walk of the
+//! interior population per volume, skipped when no grant holds a claim |
 //!
 //! ## C12 — tenant-range consistency (the packing class)
 //!

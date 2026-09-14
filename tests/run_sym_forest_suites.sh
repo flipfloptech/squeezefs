@@ -21,7 +21,11 @@
 # sets the seam per test and runs once; `sym_appender_tests` (PR 2 — the
 # appender region) formats its region fixtures under the seam itself and
 # rides the list so its flat-layout contracts (no appender set, the
-# untouched sector 0 and ring) run on both legs too.
+# untouched sector 0 and ring) run on both legs too; `sym_manager_tests`
+# and `sym_fence_tests` (PR 3 — the manager lease) ride it the same way:
+# their stamped fixtures set the seam themselves, and their flat pins (no
+# manager, no grant, the shipped rtype-1 reservation, the REGCTL-sized
+# report read on every layout) run on both legs.
 #
 # WALL TIME IS A ROW (review round 4, Issue 26): each suite runs under
 # its own timer per leg, and the summary prints `flat`, `stamped` and the
@@ -69,6 +73,8 @@ DEFAULT_SUITES=(
   meta_slot_migration_tests
   pv_coordinator_tests
   sym_appender_tests
+  sym_manager_tests
+  sym_fence_tests
 )
 read -r -a SUITES <<<"${SQZ_SYM_SUITES:-${DEFAULT_SUITES[*]}}"
 RATIO_NOTE="${SQZ_SYM_RATIO_NOTE:-2.0}"

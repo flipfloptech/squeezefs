@@ -250,7 +250,7 @@ enum Commands {
     // `--repair` takes the guarded D0 open.
     /// Check the filesystem, with optional per-class repair
     ///
-    /// Runs twelve check classes (C1-C12, as labeled in the report).
+    /// Runs thirteen check classes (C1-C13, as labeled in the report).
     /// Every finding is verified before it is reported, and detection
     /// never mutates the filesystem.
     ///

@@ -2497,3 +2497,66 @@ fn sym_appender_ring_derives_from_the_reserve_and_the_solo_ring() {
         "the shipped 50 ms flush"
     );
 }
+
+/// The symmetric MANAGER's derivations (design-symmetric-metadata §5.3.3
+/// grant sizing, §5.9 the failover bound, §1.6 "Manager death"; PR 3):
+/// `grant_extents = clamp(2 × ewma_smo_rate × failover_bound_s, 8,
+/// free_heap / (4 × appenders))` — the floor is the SMO budget (≤ 2
+/// extents per compaction/split × 4 pending root swaps per cycle), the
+/// cap a quarter of the free heap over the appenders, never below the
+/// floor; `manager_failover_bound_ms = CLIENT_STALE_TTL_SECS × 1000 +
+/// ladder + replay` — the two measured terms added to the constant the
+/// D0 ladder waits out; the `SQUEEZEFS_SYM_GRANT_EXTENTS` registry range
+/// is the floor to the u16 slot namespace's width and the knob wins
+/// verbatim. Drift on any of them is red here.
+#[test]
+fn sym_manager_grant_and_failover_bound_derive_from_the_ladder_and_the_smo_rate() {
+    use squeezefs::fuse_client::CLIENT_STALE_TTL_SECS;
+    use squeezefs::meta_backend::kv::appender::{
+        grant_extents_derived, manager_failover_bound_ms, resolve_grant_extents,
+        GRANT_EXTENTS_FLOOR, GRANT_EXTENTS_MAX, SYM_GRANT_EXTENTS_ENV,
+    };
+
+    assert_eq!(GRANT_EXTENTS_FLOOR, 2 * 4);
+    assert_eq!(GRANT_EXTENTS_MAX, u64::from(u16::MAX) + 1);
+    // The bound: the constant TTL plus the two measured walls.
+    let bound = manager_failover_bound_ms(CLIENT_STALE_TTL_SECS, 1_000, 500);
+    assert_eq!(bound, CLIENT_STALE_TTL_SECS * 1_000 + 1_500);
+    // No measured SMO rate ⇒ the floor, at any heap.
+    assert_eq!(
+        grant_extents_derived(0, bound, 1 << 30, 12),
+        GRANT_EXTENTS_FLOOR
+    );
+    // 5 SMO/s (milli-units) over the bound, doubled.
+    let rate_milli = 5_000;
+    assert_eq!(
+        grant_extents_derived(rate_milli, bound, 1 << 30, 1),
+        2 * rate_milli * bound / 1_000_000
+    );
+    // The cap: a quarter of the free heap over the appenders …
+    assert_eq!(
+        grant_extents_derived(rate_milli, bound, 4_000, 10),
+        4_000 / 40
+    );
+    // … never below the floor.
+    assert_eq!(
+        grant_extents_derived(rate_milli, bound, 4, 10),
+        GRANT_EXTENTS_FLOOR
+    );
+    // The knob wins verbatim; the registry range is the floor to the width.
+    let knob = squeezefs::env_knobs::lookup(SYM_GRANT_EXTENTS_ENV).expect("registered");
+    match knob.kind {
+        squeezefs::env_knobs::Kind::Int { lo, hi } => {
+            assert_eq!(lo, GRANT_EXTENTS_FLOOR as i128);
+            assert_eq!(hi, GRANT_EXTENTS_MAX as i128);
+        }
+        other => panic!("SQUEEZEFS_SYM_GRANT_EXTENTS must be Int, got {other:?}"),
+    }
+    std::env::set_var(SYM_GRANT_EXTENTS_ENV, "64");
+    assert_eq!(resolve_grant_extents(0, bound, 1 << 30, 1), 64);
+    std::env::remove_var(SYM_GRANT_EXTENTS_ENV);
+    assert_eq!(
+        resolve_grant_extents(0, bound, 1 << 30, 1),
+        GRANT_EXTENTS_FLOOR
+    );
+}

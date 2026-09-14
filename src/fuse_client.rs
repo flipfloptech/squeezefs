@@ -13566,6 +13566,149 @@ impl SqueezefsFilesystem {
                     "appender_pressure_cycles".into(),
                     appender(&|s| s.pressure_cycles),
                 );
+                // THE MANAGER FAMILY (design-symmetric-metadata §11 — PR 3,
+                // dark): per volume; `vacant` / 0 on every bit-17-absent
+                // mount. `manager_lease` is the posture word — `held` (this
+                // mount won the D0 ladder and holds the WERO on the
+                // metadata namespace), `peer:<node token>` (another node's
+                // Live page 0), `vacant`; `meta_pr_wero` says the hold is
+                // rtype 3 (registrants join) rather than the shipped rtype 1.
+                // `manager_failover_bound_ms` is DERIVED (stale TTL + the
+                // ladder's wall + the replay's wall) and is ALSO
+                // `manager_dependency_stall_bound_ms` — the grant headroom
+                // is sized against it, so `manager_dependency_stalls` MUST
+                // STAY 0 at the sized grant (a stall = an appender that
+                // consumed its whole grant while the manager could not
+                // refill). The closure law `extent_grant_extents ≡ claimed
+                // + returned + granted_unclaimed` is published as its four
+                // terms. `manager_load_pct` is MEASURED (Σ service ÷ wall);
+                // `manager_service_ns` is exact-sum `admit / execute /
+                // reply / total`; `manager_verb_refusals` MUST STAY 0.
+                let manager_word = |be: &crate::meta_backend::kv::backend::KvMetaBackend| {
+                    be.appender_stats()
+                        .map_or_else(|| "vacant".to_string(), |s| s.manager_lease.word())
+                };
+                metrics.insert(
+                    "manager_lease".into(),
+                    self.meta_backend
+                        .as_ref()
+                        .map(|mb| {
+                            serde_json::Value::Array(
+                                mb.volumes.iter().map(|v| manager_word(v).into()).collect(),
+                            )
+                        })
+                        .unwrap_or_default(),
+                );
+                metrics.insert(
+                    "meta_pr_wero".into(),
+                    appender(&|s| u64::from(s.meta_pr_wero)),
+                );
+                metrics.insert(
+                    "manager_failover_bound_ms".into(),
+                    appender(&|s| s.failover_bound_ms),
+                );
+                metrics.insert(
+                    "manager_dependency_stall_bound_ms".into(),
+                    appender(&|s| s.failover_bound_ms),
+                );
+                metrics.insert(
+                    "manager_dependency_stalls".into(),
+                    appender(&|s| s.dependency_stalls),
+                );
+                metrics.insert("extent_grants".into(), appender(&|s| s.extent_grants));
+                metrics.insert(
+                    "extent_grant_extents".into(),
+                    appender(&|s| s.extent_grant_extents),
+                );
+                metrics.insert("extent_returns".into(), appender(&|s| s.extent_returns));
+                metrics.insert(
+                    "extent_grant_claimed".into(),
+                    appender(&|s| s.grant_claimed),
+                );
+                metrics.insert(
+                    "extent_grant_returned".into(),
+                    appender(&|s| s.grant_returned),
+                );
+                metrics.insert(
+                    "extent_grant_unclaimed".into(),
+                    appender(&|s| s.grant_unclaimed),
+                );
+                metrics.insert(
+                    "manager_vol0_unreachable".into(),
+                    appender(&|s| s.vol0_unreachable),
+                );
+                metrics.insert("manager_verbs".into(), appender(&|s| s.manager_verbs));
+                metrics.insert(
+                    "manager_verbs_per_s".into(),
+                    appender(&|s| s.manager_verbs_per_s),
+                );
+                metrics.insert("manager_load_pct".into(), appender(&|s| s.manager_load_pct));
+                metrics.insert(
+                    "manager_verb_replays".into(),
+                    appender(&|s| s.manager_verb_replays),
+                );
+                metrics.insert(
+                    "manager_verb_refusals".into(),
+                    appender(&|s| s.manager_verb_refusals),
+                );
+                metrics.insert(
+                    "manager_service_ns".into(),
+                    self.meta_backend
+                        .as_ref()
+                        .map(|mb| {
+                            serde_json::Value::Array(
+                                mb.volumes
+                                    .iter()
+                                    .map(|v| {
+                                        let [admit, execute, reply, total] = v
+                                            .appender_stats()
+                                            .map_or([0; 4], |s| s.manager_service_ns);
+                                        serde_json::json!({
+                                            "admit": admit,
+                                            "execute": execute,
+                                            "reply": reply,
+                                            "total": total,
+                                        })
+                                    })
+                                    .collect(),
+                            )
+                        })
+                        .unwrap_or_default(),
+                );
+                // THE FENCING FAMILY (§5.8.1 / KD-SYM-18): the Reservation
+                // Report read SIZED BY REGCTL — per metadata AND data
+                // namespace this mount registered on: registrants the last
+                // report counted, its byte length, the registrant cap in
+                // force (declared `SQUEEZEFS_PR_REGISTRANT_CAP`, else the
+                // vendor cap learned from the first REGISTER failure; 0 =
+                // unbounded, nvmet's posture) and the joins refused at it
+                // (MUST STAY 0 on nvmet by construction).
+                {
+                    let report = crate::meta_backend::reservation::pr_report_gauges();
+                    let regs: serde_json::Map<String, serde_json::Value> = report
+                        .iter()
+                        .map(|(ns, (regctl, _))| (ns.clone(), serde_json::json!(regctl)))
+                        .collect();
+                    let bytes: serde_json::Map<String, serde_json::Value> = report
+                        .iter()
+                        .map(|(ns, (_, bytes))| (ns.clone(), serde_json::json!(bytes)))
+                        .collect();
+                    metrics.insert(
+                        "pr_registrants_per_namespace".into(),
+                        serde_json::Value::Object(regs),
+                    );
+                    metrics.insert("pr_report_bytes".into(), serde_json::Value::Object(bytes));
+                    metrics.insert(
+                        "pr_registrant_cap".into(),
+                        serde_json::json!(crate::meta_backend::reservation::pr_registrant_cap()),
+                    );
+                    metrics.insert(
+                        "pr_registrant_cap_refusals".into(),
+                        serde_json::json!(
+                            crate::meta_backend::reservation::pr_registrant_cap_refusals()
+                        ),
+                    );
+                }
                 // The three per-ring partition classes (§5.3.4 / §5.8.6),
                 // MUST STAY 0: a mount that counted one refused.
                 metrics.insert(

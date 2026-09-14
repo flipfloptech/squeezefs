@@ -631,7 +631,10 @@ proptest! {
         let unleased = SlotState::Unleased {
             root: RootPtr { addr, seq }, cursor, g, slot_tree_extents, last_written, tails,
         };
-        let leased = SlotState::Leased { appender_id: g, g: g.wrapping_add(1), page_addr: addr };
+        let leased = SlotState::Leased {
+            appender_id: g, g: g.wrapping_add(1), page_addr: addr,
+            root: RootPtr { addr: seq, seq: addr }, cursor, slot_tree_extents,
+        };
         for state in [unleased, leased] {
             let bytes = state.encode().expect("encodes");
             prop_assert_eq!(SlotState::decode(&bytes).expect("decodes"), state.clone());

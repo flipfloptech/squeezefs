@@ -1717,9 +1717,12 @@ pub struct AppenderRegion {
     /// is replaced by [`super::journal::JournalRing::grown_with`] on a
     /// drained stall.
     pub ring: arc_swap::ArcSwap<super::journal::JournalRing>,
-    /// Forest slots this region leases (the declared partition); empty
-    /// for the manager, which leases the complement.
-    pub leases: std::collections::BTreeSet<super::record::ForestSlot>,
+    /// Forest slots this region leases: the declared partition on an
+    /// unarmed forest (empty for the manager, which leases the
+    /// complement); under an ARMED symmetric plane (PR 4) the live lease
+    /// set — swapped whole at every acquire / release, read latch-free
+    /// by the conveyor's region routing.
+    pub leases: arc_swap::ArcSwap<std::collections::BTreeSet<super::record::ForestSlot>>,
     /// The tail the last written page named.
     pub last_tail: std::sync::atomic::AtomicU64,
     /// The tail the last COMPLETED barrier made durable — what this
@@ -1769,6 +1772,10 @@ pub struct AppenderRegion {
     /// not refill (`manager_dependency_stalls`, must-stay-0 at the sized
     /// grant).
     pub dependency_stalls: std::sync::atomic::AtomicU64,
+    /// Released at the slot-lease cadence (§5.1.3 — its last slot went,
+    /// its window was empty): its page is `Free`, its ring returned;
+    /// every later cycle skips it.
+    pub released: std::sync::atomic::AtomicBool,
 }
 
 impl AppenderRegion {
@@ -1798,7 +1805,26 @@ impl AppenderRegion {
 
     /// Whether `slot`'s records journal into THIS region's ring.
     pub fn leases_slot(&self, slot: super::record::ForestSlot) -> bool {
-        self.leases.contains(&slot)
+        self.leases.load().contains(&slot)
+    }
+
+    /// The lease set as of now.
+    pub fn leases(&self) -> std::sync::Arc<std::collections::BTreeSet<super::record::ForestSlot>> {
+        self.leases.load_full()
+    }
+
+    /// Lease `slot` (an acquire / a handover in).
+    pub fn add_lease(&self, slot: super::record::ForestSlot) {
+        let mut next = (**self.leases.load()).clone();
+        next.insert(slot);
+        self.leases.store(std::sync::Arc::new(next));
+    }
+
+    /// Drop `slot`'s lease (a release / a handover out).
+    pub fn drop_lease(&self, slot: super::record::ForestSlot) {
+        let mut next = (**self.leases.load()).clone();
+        next.remove(&slot);
+        self.leases.store(std::sync::Arc::new(next));
     }
 
     /// Growth's release of the Dekker gate: clear `growing`, wake every
@@ -1899,6 +1925,10 @@ pub struct AppenderSet {
     /// count the grant cap divides the free heap by (review round 1,
     /// Issue 12). Set at open, raised by a join.
     pub appenders_known: std::sync::atomic::AtomicU64,
+    /// The slot-lease plane (design-symmetric-metadata §5.1, PR 4):
+    /// `Some` on a writer's open with `SQUEEZEFS_SYMMETRIC_META=1`; `None`
+    /// = the PR 1–3 dark forest verbatim.
+    pub leases: Option<std::sync::Arc<super::slot_lease::SlotLeasePlane>>,
 }
 
 /// Test seam: the manager is UNREACHABLE — the grant cadence issues no
@@ -2033,7 +2063,7 @@ impl AppenderSet {
         self.regions.len() > 1
     }
 
-    /// The declared lease map (ids ≥ 1) the violation detector reads.
+    /// The lease map (ids ≥ 1) the violation detector reads.
     pub fn lease_map(
         &self,
     ) -> std::collections::BTreeMap<u32, std::collections::BTreeSet<super::record::ForestSlot>>
@@ -2041,8 +2071,13 @@ impl AppenderSet {
         self.regions
             .iter()
             .skip(1)
-            .map(|r| (r.id, r.leases.clone()))
+            .map(|r| (r.id, (*r.leases()).clone()))
             .collect()
+    }
+
+    /// The slot-lease plane, if armed.
+    pub fn slot_leases(&self) -> Option<&std::sync::Arc<super::slot_lease::SlotLeasePlane>> {
+        self.leases.as_ref()
     }
 
     /// §4.6 pt 2's ring-pressure trigger over the DECLARED regions (ring
@@ -2180,7 +2215,7 @@ impl AppenderSet {
                         segments: ring.segments().len() as u64,
                         ring_entries: ring.written_entries(),
                         stalls: r.stalls.load(Relaxed),
-                        leases: r.leases.len() as u64,
+                        leases: r.leases().len() as u64,
                         self_recovered: r.self_recovered,
                         grant_unclaimed: grant.unclaimed(),
                         grant_claimed: grant.claimed(),

@@ -20,12 +20,13 @@
 //! allocation authority), fuzzed by `fuzz/fuzz_targets/manager_call_frame.rs`
 //! and mirrored on stable in `tests/decoder_property_tests.rs`.
 //!
-//! What is NOT here (later rungs, §6.3): `AcquireSlot` / `AcquireSlots` /
-//! `OfferSlot` / `ReleaseSlot` / `ResolveSlot` (PR 4 — slot leases),
-//! `RecordDeath` / `RecordRecovered` (PR 8/10 — the death ledger),
-//! `DirRenameLock` (PR 6). They extend this enum under the same schema
-//! while the wire is unreleased; a release in between bumps
-//! `MANAGER_SCHEMA` again.
+//! PR 4 added the slot-lease verbs under the same schema (the wire is
+//! unreleased): `AcquireSlots` / `AcquireSlot` / `OfferSlot` /
+//! `ReleaseSlot` / `ResolveSlot` (design §5.1.2–§5.1.6, §5.3.5). What is
+//! NOT here (later rungs, §6.3): `RecordDeath` / `RecordRecovered` (PR
+//! 8/10 — the death ledger), `DirRenameLock` (PR 6). They extend this
+//! enum under the same schema while the wire is unreleased; a release in
+//! between bumps `MANAGER_SCHEMA` again.
 
 use crate::cluster_wire::{RpcAsyncService, RpcClient, RpcRequest, RpcResponse};
 use crate::error::{Result, SqueezefsError};
@@ -130,6 +131,46 @@ pub enum ManagerCall {
         appender_id: u32,
         runs: Vec<WireRun>,
     },
+    /// Up to `want` rotor slots for `appender_id`, `prefer:
+    /// unleased-then-idle` (§5.1.2; 0 = the manager's derived `M`).
+    AcquireSlots { appender_id: u32, want: u16 },
+    /// One named routing slot — first-writer-takes-it, or the accept of
+    /// an offer (§5.1.4).
+    AcquireSlot { appender_id: u32, slot: u16 },
+    /// The HOLDER offers `slot` to appender `to` (RAM at the manager,
+    /// expires after one renewal beat).
+    OfferSlot {
+        appender_id: u32,
+        slot: u16,
+        to: u32,
+    },
+    /// Flush-then-transfer's durable step: the holder's `g` and the
+    /// slot's final words; the manager writes tree 0 `Unleased`.
+    ReleaseSlot {
+        appender_id: u32,
+        slot: u16,
+        root: (u64, u64),
+        cursor: u64,
+        g: u32,
+        slot_tree_extents: u32,
+        /// `(leaf addr, log tail)` of every leaf flushed under the lease
+        /// (§5.8.2 — PR 5's frame screen reads them).
+        tails: Vec<(u64, u32)>,
+    },
+    /// The holder of `slot` (the `SlotHolderCache`'s stale-view fallback,
+    /// §5.1.6).
+    ResolveSlot { slot: u16 },
+}
+
+/// One granted slot on the wire: the routing slot, its lease generation
+/// and the words the tree carries (§5.1.4 "four words move").
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WireSlotGrant {
+    pub slot: u16,
+    pub g: u32,
+    pub root: (u64, u64),
+    pub cursor: u64,
+    pub slot_tree_extents: u32,
 }
 
 impl ManagerCall {
@@ -139,6 +180,11 @@ impl ManagerCall {
             Self::JoinAppender { .. } => "join_appender",
             Self::ExtentGrant { .. } => "extent_grant",
             Self::ReturnExtents { .. } => "return_extents",
+            Self::AcquireSlots { .. } => "acquire_slots",
+            Self::AcquireSlot { .. } => "acquire_slot",
+            Self::OfferSlot { .. } => "offer_slot",
+            Self::ReleaseSlot { .. } => "release_slot",
+            Self::ResolveSlot { .. } => "resolve_slot",
         }
     }
 }
@@ -174,6 +220,33 @@ pub enum ManagerReply {
         cleared: u64,
         /// Extents the record no longer granted — a replay's no-op.
         already: u64,
+    },
+    /// Slots granted (or re-answered — `already` = every slot named was
+    /// already the caller's, KD-SYM-7).
+    SlotsGranted {
+        slots: Vec<WireSlotGrant>,
+        already: bool,
+    },
+    /// Another appender holds the slot: ship to it (the metanode arm).
+    SlotRefused {
+        slot: u16,
+        holder: u32,
+        g: u32,
+    },
+    /// The offer is recorded at the manager.
+    Offered,
+    /// The release landed in tree 0 (`already` = it had — a replay).
+    Released {
+        already: bool,
+    },
+    /// `ResolveSlot`: the lessee.
+    Holder {
+        appender_id: u32,
+        g: u32,
+    },
+    /// `ResolveSlot`: nobody leases it.
+    Unleased {
+        g: u32,
     },
     /// The durable witness contradicts the caller, or the manager could
     /// not perform the verb; `reason` is operator-facing.
@@ -376,6 +449,92 @@ impl ManagerService {
                     }
                 }
             }
+            ManagerCall::AcquireSlots { appender_id, want } => {
+                match self
+                    .volume
+                    .manager_acquire_slots_wire(*appender_id, *want)
+                    .await
+                {
+                    Ok((slots, already)) => (ManagerReply::SlotsGranted { slots, already }, false),
+                    Err(e) => (
+                        ManagerReply::Refused {
+                            reason: e.to_string(),
+                        },
+                        true,
+                    ),
+                }
+            }
+            ManagerCall::AcquireSlot { appender_id, slot } => {
+                match self
+                    .volume
+                    .manager_acquire_slot_wire(*appender_id, *slot)
+                    .await
+                {
+                    Ok(reply) => (reply, false),
+                    Err(e) => (
+                        ManagerReply::Refused {
+                            reason: e.to_string(),
+                        },
+                        true,
+                    ),
+                }
+            }
+            ManagerCall::OfferSlot {
+                appender_id,
+                slot,
+                to,
+            } => match self
+                .volume
+                .manager_offer_slot_wire(*appender_id, *slot, *to)
+                .await
+            {
+                Ok(()) => (ManagerReply::Offered, false),
+                Err(e) => (
+                    ManagerReply::Refused {
+                        reason: e.to_string(),
+                    },
+                    true,
+                ),
+            },
+            ManagerCall::ReleaseSlot {
+                appender_id,
+                slot,
+                root,
+                cursor,
+                g,
+                slot_tree_extents,
+                tails,
+            } => match self
+                .volume
+                .manager_release_slot_wire(
+                    *appender_id,
+                    *slot,
+                    *root,
+                    *cursor,
+                    *g,
+                    *slot_tree_extents,
+                    tails,
+                )
+                .await
+            {
+                Ok(already) => (ManagerReply::Released { already }, false),
+                Err(e) => (
+                    ManagerReply::Refused {
+                        reason: e.to_string(),
+                    },
+                    true,
+                ),
+            },
+            ManagerCall::ResolveSlot { slot } => match self.volume.manager_resolve_slot_wire(*slot)
+            {
+                Ok(reply) => (reply, false),
+                Err(e) => (
+                    ManagerReply::Refused {
+                        reason: e.to_string(),
+                    },
+                    true,
+                ),
+            },
         };
         let execute_ns = t_execute.elapsed().as_nanos() as u64;
         let t_reply = Instant::now();
@@ -539,6 +698,96 @@ impl ManagerClient {
             other => Err(SqueezefsError::InvalidOperation(format!(
                 "ReturnExtents answered {other:?}"
             ))),
+        }
+    }
+}
+
+impl ManagerClient {
+    /// `AcquireSlots` for `appender_id` (`want` 0 = the manager's `M`).
+    pub async fn acquire_slots(
+        &mut self,
+        appender_id: u32,
+        want: u16,
+    ) -> Result<(Vec<WireSlotGrant>, bool)> {
+        match self
+            .call(ManagerCall::AcquireSlots { appender_id, want })
+            .await?
+        {
+            ManagerReply::SlotsGranted { slots, already } => Ok((slots, already)),
+            ManagerReply::Refused { reason } => Err(SqueezefsError::InvalidOperation(reason)),
+            other => Err(SqueezefsError::InvalidOperation(format!(
+                "AcquireSlots answered {other:?}"
+            ))),
+        }
+    }
+
+    /// `AcquireSlot` for `appender_id` — `Ok(reply)` is one of
+    /// `SlotsGranted` / `SlotRefused`.
+    pub async fn acquire_slot(&mut self, appender_id: u32, slot: u16) -> Result<ManagerReply> {
+        match self
+            .call(ManagerCall::AcquireSlot { appender_id, slot })
+            .await?
+        {
+            ManagerReply::Refused { reason } => Err(SqueezefsError::InvalidOperation(reason)),
+            other => Ok(other),
+        }
+    }
+
+    /// `OfferSlot`: the holder `appender_id` offers `slot` to `to`.
+    pub async fn offer_slot(&mut self, appender_id: u32, slot: u16, to: u32) -> Result<()> {
+        match self
+            .call(ManagerCall::OfferSlot {
+                appender_id,
+                slot,
+                to,
+            })
+            .await?
+        {
+            ManagerReply::Offered => Ok(()),
+            ManagerReply::Refused { reason } => Err(SqueezefsError::InvalidOperation(reason)),
+            other => Err(SqueezefsError::InvalidOperation(format!(
+                "OfferSlot answered {other:?}"
+            ))),
+        }
+    }
+
+    /// `ReleaseSlot` — `Ok(already)`.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn release_slot(
+        &mut self,
+        appender_id: u32,
+        slot: u16,
+        root: (u64, u64),
+        cursor: u64,
+        g: u32,
+        slot_tree_extents: u32,
+        tails: Vec<(u64, u32)>,
+    ) -> Result<bool> {
+        match self
+            .call(ManagerCall::ReleaseSlot {
+                appender_id,
+                slot,
+                root,
+                cursor,
+                g,
+                slot_tree_extents,
+                tails,
+            })
+            .await?
+        {
+            ManagerReply::Released { already } => Ok(already),
+            ManagerReply::Refused { reason } => Err(SqueezefsError::InvalidOperation(reason)),
+            other => Err(SqueezefsError::InvalidOperation(format!(
+                "ReleaseSlot answered {other:?}"
+            ))),
+        }
+    }
+
+    /// `ResolveSlot` — `Ok(reply)` is `Holder` or `Unleased`.
+    pub async fn resolve_slot(&mut self, slot: u16) -> Result<ManagerReply> {
+        match self.call(ManagerCall::ResolveSlot { slot }).await? {
+            ManagerReply::Refused { reason } => Err(SqueezefsError::InvalidOperation(reason)),
+            other => Ok(other),
         }
     }
 }

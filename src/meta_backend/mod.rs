@@ -1784,6 +1784,12 @@ impl RoutedMetaBackend {
         if self.routing_width <= 1 {
             return 0;
         }
+        // The armed symmetric plane (PR 4, KD-SYM-11): the mint lands in a
+        // LEASED rotor slot — no parent here, so the rotor slot with the
+        // most headroom (the overflow arm needs the async face).
+        if let Some(slot) = self.lease_mint_slot(volume_idx, None) {
+            return slot;
+        }
         let t = self.route.load();
         // Rung 14 (client-owned-slot placement, KD-MW-6): a mint executing
         // FOR a shipping client (the owner-side SHIP_CLIENT scope, armed
@@ -1805,6 +1811,74 @@ impl RoutedMetaBackend {
         let k = self.mint_rr[volume_idx].fetch_add(1, std::sync::atomic::Ordering::Relaxed)
             % mints.len();
         u64::from(mints[k])
+    }
+
+    /// The armed plane's mint slot on `volume_idx` for a child of
+    /// `parent` (design-symmetric-metadata §5.1.2): the parent's slot iff
+    /// this mount leases it, it is not native and its tree is below
+    /// `A_max(t)`; else the rotor slot with the most headroom. `None` on
+    /// an unarmed volume. The synchronous face answers the SMALLEST rotor
+    /// tree for the overflow arm; [`Self::pick_mint_slot_for`] asks the
+    /// manager for one more slot instead.
+    fn lease_mint_slot(&self, volume_idx: usize, parent: Option<Ino>) -> Option<u64> {
+        use kv::record::forest_slot_of_ino;
+        let vol = self.volumes.get(volume_idx)?;
+        if !vol.slot_lease_armed() {
+            return None;
+        }
+        let parent_slot = parent.and_then(|p| {
+            let (pv, local) = self.route_ino(p);
+            (pv == volume_idx).then(|| forest_slot_of_ino(local))
+        });
+        let forest = match vol.lease_mint_choice(parent_slot)? {
+            crate::slot_lease_core::MintChoice::Affinity(s)
+            | crate::slot_lease_core::MintChoice::Rotor(s)
+            | crate::slot_lease_core::MintChoice::Smallest(s) => s,
+            crate::slot_lease_core::MintChoice::Overflow => {
+                // The synchronous face cannot acquire: the smallest rotor
+                // tree (the past-`2 × M` law) stands in.
+                let plane = vol.slot_leases()?;
+                let rotor = plane.rotor.load();
+                *rotor.iter().min_by_key(|s| (plane.extents.get(**s), **s))?
+            }
+        };
+        vol.routing_slot_of_forest(forest).ok().map(u64::from)
+    }
+
+    /// [`Self::pick_mint_slot`] for a child of `parent` — the create
+    /// path's face: on an armed volume the bounded parent-slot affinity
+    /// policy with its overflow arm (one more rotor slot from the
+    /// manager, up to `2 × M`); everywhere else the shared rotor verbatim.
+    pub async fn pick_mint_slot_for(&self, volume_idx: usize, parent: Ino) -> u64 {
+        if self.routing_width > 1 {
+            if let Some(vol) = self.volumes.get(volume_idx) {
+                if vol.slot_lease_armed() {
+                    let (pv, local) = self.route_ino(parent);
+                    let parent_slot =
+                        (pv == volume_idx).then(|| kv::record::forest_slot_of_ino(local));
+                    if let Some(crate::slot_lease_core::MintChoice::Overflow) =
+                        vol.lease_mint_choice(parent_slot)
+                    {
+                        match vol.lease_mint_overflow().await {
+                            Ok(Some(slot)) => {
+                                if let Ok(r) = vol.routing_slot_of_forest(slot) {
+                                    return u64::from(r);
+                                }
+                            }
+                            Ok(None) => {}
+                            Err(e) => log::warn!(
+                                "volume {volume_idx}: the affinity-ceiling overflow ask failed \
+                                 ({e}) — minting into the smallest rotor tree"
+                            ),
+                        }
+                    }
+                    if let Some(slot) = self.lease_mint_slot(volume_idx, Some(parent)) {
+                        return slot;
+                    }
+                }
+            }
+        }
+        self.pick_mint_slot(volume_idx)
     }
 
     /// PR VL5b: mint one fresh ino on `volume_idx` in `mint` (a slot the
@@ -2284,7 +2358,7 @@ impl RoutedMetaBackend {
         // a flip: re-derive the parent's route after.
         let mint_slot = match &preset {
             Some(p) => self.slot_of_ino(p.global_ino),
-            None => self.pick_mint_slot(target_v_idx),
+            None => self.pick_mint_slot_for(target_v_idx, parent).await,
         };
         {
             if self.slot_gate_extend_slots(&mut _gate, &[mint_slot]).await

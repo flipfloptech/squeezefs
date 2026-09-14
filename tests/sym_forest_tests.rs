@@ -577,6 +577,12 @@ fn slot_state_records_round_trip_and_refuse_malformed_images() {
         appender_id: 9,
         g: 4,
         page_addr: 0xF00D,
+        root: RootPtr {
+            addr: 0xBEEF_0000,
+            seq: 78,
+        },
+        cursor: 4243,
+        slot_tree_extents: 1,
     };
     for st in [&unleased, &leased] {
         let img = st.encode().expect("encode");

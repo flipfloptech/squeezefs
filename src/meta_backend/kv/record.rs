@@ -218,6 +218,29 @@ pub fn forest_key(kind: u8, legacy: &[u8]) -> Result<Vec<u8>, KvError> {
     Ok(out)
 }
 
+/// The forest slot a `(kind, LEGACY key)` pair routes to, without
+/// framing the key — the lease step's per-record probe on the commit
+/// path (PR 4). The same offsets [`forest_key`] frames with.
+pub fn legacy_key_slot(kind: u8, legacy: &[u8]) -> Result<ForestSlot, KvError> {
+    let want = legacy_key_len(kind).ok_or_else(|| {
+        KvError::Corrupt(format!(
+            "kind {kind} is not a slot-tree content kind (§5.2.1: 1/2/3/6/7)"
+        ))
+    })?;
+    if legacy.len() != want {
+        return Err(KvError::Corrupt(format!(
+            "kind {kind} key must be {want} bytes, got {}",
+            legacy.len()
+        )));
+    }
+    let route_off = if kind == TREE_BLOCK_REFS {
+        super::block_refs::BLOCK_REF_OWNER_OFF
+    } else {
+        0
+    };
+    checked_forest_slot(u64::from_be_bytes(read8(legacy, route_off)))
+}
+
 /// The kind byte of a forest key without materializing its legacy form:
 /// the first byte for the by-block family (≥ 0x02), offset 8 otherwise.
 /// Refuses a kind that is not a slot-tree content kind and a key too

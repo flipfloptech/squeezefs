@@ -179,6 +179,9 @@ pub struct SlotLeasePlane {
     /// Round-robin cursor for equal-headroom ties.
     pub rr: AtomicUsize,
     pub extents: Arc<SlotExtentLedger>,
+    /// The holder's own ops per leased slot over the common window
+    /// (lock-free — one bump per commit on the hot path).
+    holder_ops: scc::HashMap<ForestSlot, Arc<crate::slot_lease_core::HolderOps>>,
     /// The affinity ceiling last computed (`affinity_a_max_bytes`).
     pub a_max_bytes: AtomicU64,
     /// EWMA inputs of `N_floor` (ns): the handover's own measured cost
@@ -218,6 +221,7 @@ impl SlotLeasePlane {
             rotor: arc_swap::ArcSwap::from_pointee(Vec::new()),
             rr: AtomicUsize::new(0),
             extents,
+            holder_ops: scc::HashMap::new(),
             a_max_bytes: AtomicU64::new(0),
             ewma_handover_ns: AtomicU64::new(0),
             ewma_ship_ns: AtomicU64::new(0),
@@ -245,6 +249,32 @@ impl SlotLeasePlane {
     /// `T_idle` in ns.
     pub fn t_idle_ns(&self) -> u64 {
         self.t_idle_ms.saturating_mul(1_000_000)
+    }
+
+    fn holder_cell(&self, slot: ForestSlot) -> Arc<crate::slot_lease_core::HolderOps> {
+        if let Some(c) = self.holder_ops.read_sync(&slot, |_, c| Arc::clone(c)) {
+            return c;
+        }
+        let fresh = Arc::new(crate::slot_lease_core::HolderOps::new());
+        match self.holder_ops.insert_sync(slot, Arc::clone(&fresh)) {
+            Ok(()) => fresh,
+            Err(_) => self
+                .holder_ops
+                .read_sync(&slot, |_, c| Arc::clone(c))
+                .unwrap_or(fresh),
+        }
+    }
+
+    /// One own commit on `slot` at `now_ns`.
+    pub fn note_holder_op(&self, slot: ForestSlot, now_ns: u64, t_idle_ns: u64) {
+        self.holder_cell(slot).note(now_ns, t_idle_ns);
+    }
+
+    /// The holder's ops on `slot` over the common window at `now_ns`.
+    pub fn holder_ops(&self, slot: ForestSlot, now_ns: u64) -> u64 {
+        self.holder_ops
+            .read_sync(&slot, |_, c| c.total(now_ns, self.t_idle_ns()))
+            .unwrap_or(0)
     }
 
     /// The rotor size in force.

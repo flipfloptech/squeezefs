@@ -661,7 +661,6 @@ struct RequesterOps {
 struct SlotOps {
     /// The half-window epoch the buckets are aligned to.
     epoch: u64,
-    holder: Buckets,
     requesters: Vec<RequesterOps>,
 }
 
@@ -669,12 +668,59 @@ impl SlotOps {
     fn align(&mut self, epoch: u64) {
         if epoch > self.epoch {
             let steps = epoch - self.epoch;
-            self.holder.rotate(steps);
             for r in &mut self.requesters {
                 r.ops.rotate(steps);
             }
             self.epoch = epoch;
         }
+    }
+}
+
+/// The HOLDER's own ops on one slot over the common window — lock-free,
+/// because it is bumped once per commit on the lessee's hot path (a
+/// mutex there is the solo re-gate's regression). Two half-window
+/// buckets rotated by a CAS on the epoch word; a lost rotation race
+/// under-counts by one commit, never over-counts (the comparison the
+/// count feeds — `ops_q ≥ 2 × ops_h` — errs toward serving, never
+/// toward a handover).
+#[derive(Debug, Default)]
+pub struct HolderOps {
+    epoch: AtomicU64,
+    cur: AtomicU64,
+    prev: AtomicU64,
+}
+
+impl HolderOps {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// One commit on the slot at `now_ns`.
+    pub fn note(&self, now_ns: u64, t_idle_ns: u64) {
+        self.align(DominanceWindow::epoch(now_ns, t_idle_ns));
+        self.cur.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn align(&self, epoch: u64) {
+        let seen = self.epoch.load(Ordering::Acquire);
+        if epoch <= seen {
+            return;
+        }
+        if self
+            .epoch
+            .compare_exchange(seen, epoch, Ordering::AcqRel, Ordering::Relaxed)
+            .is_ok()
+        {
+            let cur = self.cur.swap(0, Ordering::AcqRel);
+            self.prev
+                .store(if epoch == seen + 1 { cur } else { 0 }, Ordering::Release);
+        }
+    }
+
+    /// The ops over the common window at `now_ns`.
+    pub fn total(&self, now_ns: u64, t_idle_ns: u64) -> u64 {
+        self.align(DominanceWindow::epoch(now_ns, t_idle_ns));
+        self.cur.load(Ordering::Acquire) + self.prev.load(Ordering::Acquire)
     }
 }
 
@@ -706,26 +752,20 @@ impl DominanceWindow {
 
     /// The half-window epoch of `now_ns` under a `t_idle_ns` window.
     #[inline]
-    fn epoch(now_ns: u64, t_idle_ns: u64) -> u64 {
+    pub fn epoch(now_ns: u64, t_idle_ns: u64) -> u64 {
         now_ns / (t_idle_ns / 2).max(1)
-    }
-
-    /// The holder committed one op on `slot`.
-    pub fn note_holder_op(&self, slot: Slot, now_ns: u64, t_idle_ns: u64) {
-        let mut m = self.lock();
-        let e = m.entry(slot).or_default();
-        e.align(Self::epoch(now_ns, t_idle_ns));
-        e.holder.cur += 1;
     }
 
     /// The holder served one ship of `requester` on `slot`: count it and
     /// evaluate §5.1.4 — `ops_q ≥ 2 × ops_h ∧ ops_q ≥ n_floor` over the
-    /// common window. The per-requester table is bounded by
+    /// common window (`ops_h` = the holder's [`HolderOps::total`] at the
+    /// same instant). The per-requester table is bounded by
     /// [`REQUESTERS_PER_SLOT_MAX`], LRU-evicted.
     pub fn note_ship(
         &self,
         slot: Slot,
         requester: RequesterId,
+        ops_h: u64,
         now_ns: u64,
         t_idle_ns: u64,
         n_floor: u64,
@@ -760,7 +800,6 @@ impl DominanceWindow {
         r.ops.cur += 1;
         r.touched = epoch;
         let ops_q = r.ops.total();
-        let ops_h = e.holder.total();
         if ops_q >= n_floor && ops_q >= 2 * ops_h {
             if ops_h == 0 {
                 ShipVerdict::OfferIdle { to: requester }
@@ -772,25 +811,23 @@ impl DominanceWindow {
         }
     }
 
-    /// `(ops_h, ops_q)` of `requester` on `slot` over the common window.
-    pub fn counts(
+    /// `ops_q` of `requester` on `slot` over the common window.
+    pub fn requester_ops(
         &self,
         slot: Slot,
         requester: RequesterId,
         now_ns: u64,
         t_idle_ns: u64,
-    ) -> (u64, u64) {
+    ) -> u64 {
         let mut m = self.lock();
         let Some(e) = m.get_mut(&slot) else {
-            return (0, 0);
+            return 0;
         };
         e.align(Self::epoch(now_ns, t_idle_ns));
-        let q = e
-            .requesters
+        e.requesters
             .iter()
             .find(|r| r.id == requester)
-            .map_or(0, |r| r.ops.total());
-        (e.holder.total(), q)
+            .map_or(0, |r| r.ops.total())
     }
 
     /// Forget `slot` (released / handed over).
@@ -1000,27 +1037,35 @@ mod tests {
         let t = 1_000;
         // A crowd of 12 single-shot creators never dominates.
         for q in 0..12u64 {
-            assert_eq!(w.note_ship(1, q, 10, t, 2), ShipVerdict::Serve);
+            assert_eq!(w.note_ship(1, q, 0, 10, t, 2), ShipVerdict::Serve);
         }
         // One requester at N_floor with an idle holder: the idle arm.
-        assert_eq!(w.note_ship(1, 100, 11, t, 2), ShipVerdict::Serve);
+        assert_eq!(w.note_ship(1, 100, 0, 11, t, 2), ShipVerdict::Serve);
         assert_eq!(
-            w.note_ship(1, 100, 12, t, 2),
+            w.note_ship(1, 100, 0, 12, t, 2),
             ShipVerdict::OfferIdle { to: 100 }
         );
         // A live holder: 10 ops; the requester needs 20.
+        let h = HolderOps::new();
         for _ in 0..10 {
-            w.note_holder_op(2, 20, t);
+            h.note(20, t);
         }
         for i in 0..19 {
-            assert_eq!(w.note_ship(2, 7, 20 + i, t, 2), ShipVerdict::Serve);
+            let ops_h = h.total(20 + i, t);
+            assert_eq!(w.note_ship(2, 7, ops_h, 20 + i, t, 2), ShipVerdict::Serve);
         }
         assert_eq!(
-            w.note_ship(2, 7, 40, t, 2),
+            w.note_ship(2, 7, h.total(40, t), 40, t, 2),
             ShipVerdict::OfferDominated { to: 7 }
         );
         // The window rotates: two half-windows later the counts are gone.
-        assert_eq!(w.counts(2, 7, 40 + 2 * t, t), (0, 0));
+        assert_eq!(w.requester_ops(2, 7, 40 + 2 * t, t), 0);
+        assert_eq!(h.total(40 + 2 * t, t), 0);
+        // One half-window later the previous bucket still counts.
+        let h2 = HolderOps::new();
+        h2.note(0, t);
+        assert_eq!(h2.total(t / 2, t), 1);
+        assert_eq!(h2.total(t, t), 0);
     }
 
     #[test]

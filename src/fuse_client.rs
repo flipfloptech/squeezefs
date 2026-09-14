@@ -13696,6 +13696,102 @@ impl SqueezefsFilesystem {
                         })
                         .unwrap_or_default(),
                 );
+                // THE SLOT-LEASE FAMILY (design-symmetric-metadata §11 —
+                // PR 4, dark): per volume; every gauge 0 on a bit-17-absent
+                // or UNARMED mount (`SQUEEZEFS_SYMMETRIC_META=0`). The
+                // posture word `symmetric_meta` (0/1) says whether the
+                // plane is armed; `dlm_mode` reads `slot-homed` exactly
+                // then (the S4 table installed from the live lease map —
+                // `dlm_rpcs` stays 0 on a solo mount by construction).
+                // `slot_leases_held` = native + rotor + inherited on this
+                // mount (1 + 64 on a solo mount — gate 1's engagement law);
+                // `slot_rotor` = the derived `M` in force; `slot_offers ≡
+                // slot_handovers + slot_offers_expired + open offers` is the
+                // closure law; `slot_lease_conflicts` MUST STAY 0 (two
+                // live attestations of one slot — C14's live face);
+                // `meta_kv_leaf_lease_refusals` MUST STAY 0 (a leaf mutation
+                // of a slot this mount does not lease reached the node
+                // cache — the writer twin of `node_partition_refusals`);
+                // `affinity_a_max_bytes` is the load-relative ceiling in
+                // force, `slot_tree_bytes_max ≤ A_max + node_size` the
+                // divisibility law read live; `affinity_mints + rotor_mints
+                // (+ dir_gather_mints, PR 7) ≡ mints`; `slot_offer_n_floor`
+                // is the handover's own cost in ships (derived).
+                let lease = |f: &dyn Fn(&meta_kv::slot_lease::SlotLeaseStats) -> u64| {
+                    per_volume(&|be| be.slot_lease_stats().map_or(0, |s| f(&s)))
+                };
+                metrics.insert(
+                    "symmetric_meta".into(),
+                    per_volume(&|be| u64::from(be.slot_lease_armed())),
+                );
+                metrics.insert("slot_leases_held".into(), lease(&|s| s.leases_held));
+                metrics.insert("slot_rotor".into(), lease(&|s| s.rotor));
+                metrics.insert("slot_acquires".into(), lease(&|s| s.acquires));
+                metrics.insert("slot_grants".into(), lease(&|s| s.grants));
+                metrics.insert("slot_offers".into(), lease(&|s| s.offers));
+                metrics.insert("slot_offers_idle".into(), lease(&|s| s.offers_idle));
+                metrics.insert(
+                    "slot_offers_dominated".into(),
+                    lease(&|s| s.offers_dominated),
+                );
+                metrics.insert("slot_offers_expired".into(), lease(&|s| s.offers_expired));
+                metrics.insert("slot_handovers".into(), lease(&|s| s.handovers));
+                metrics.insert(
+                    "slot_handover_phase_ns".into(),
+                    self.meta_backend
+                        .as_ref()
+                        .map(|mb| {
+                            serde_json::Value::Array(
+                                mb.volumes
+                                    .iter()
+                                    .map(|v| {
+                                        let [flush, page, tree0, grant, total] = v
+                                            .slot_lease_stats()
+                                            .map_or([0; 5], |s| s.handover_phase_ns);
+                                        serde_json::json!({
+                                            "flush": flush,
+                                            "page": page,
+                                            "tree0": tree0,
+                                            "grant": grant,
+                                            "total": total,
+                                        })
+                                    })
+                                    .collect(),
+                            )
+                        })
+                        .unwrap_or_default(),
+                );
+                metrics.insert("slot_ships".into(), lease(&|s| s.ships));
+                metrics.insert("slot_lru_releases".into(), lease(&|s| s.lru_releases));
+                metrics.insert("slot_forced_shrinks".into(), lease(&|s| s.forced_shrinks));
+                metrics.insert("slot_lease_conflicts".into(), lease(&|s| s.conflicts));
+                metrics.insert("slot_resolve_rpcs".into(), lease(&|s| s.resolve_rpcs));
+                metrics.insert(
+                    "slot_resolve_redirects".into(),
+                    lease(&|s| s.resolve_redirects),
+                );
+                metrics.insert("slot_tree_inos_p50".into(), lease(&|s| s.tree_inos_p50));
+                metrics.insert("slot_tree_inos_p99".into(), lease(&|s| s.tree_inos_p99));
+                metrics.insert("slot_tree_inos_max".into(), lease(&|s| s.tree_inos_max));
+                metrics.insert("slot_tree_bytes_p99".into(), lease(&|s| s.tree_bytes_p99));
+                metrics.insert("slot_tree_bytes_max".into(), lease(&|s| s.tree_bytes_max));
+                metrics.insert("affinity_a_max_bytes".into(), lease(&|s| s.a_max_bytes));
+                metrics.insert("affinity_mints".into(), lease(&|s| s.affinity_mints));
+                metrics.insert("rotor_mints".into(), lease(&|s| s.rotor_mints));
+                metrics.insert(
+                    "affinity_ceiling_spills".into(),
+                    lease(&|s| s.ceiling_spills),
+                );
+                metrics.insert(
+                    "affinity_ceiling_overflows".into(),
+                    lease(&|s| s.ceiling_overflows),
+                );
+                metrics.insert("slot_offer_n_floor".into(), lease(&|s| s.offer_n_floor));
+                metrics.insert("slot_region_releases".into(), lease(&|s| s.region_releases));
+                metrics.insert(
+                    "meta_kv_leaf_lease_refusals".into(),
+                    load(&meta_kv::META_KV_LEAF_LEASE_REFUSALS),
+                );
                 // THE FENCING FAMILY (§5.8.1 / KD-SYM-18): the Reservation
                 // Report read SIZED BY REGCTL — per metadata AND data
                 // namespace this mount registered on: registrants the last

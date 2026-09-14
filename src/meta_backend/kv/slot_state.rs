@@ -38,8 +38,13 @@ const VARIANT_LEASED: u8 = 2;
 /// tail entries (`leaf addr: u64 ‖ tail: u32` each).
 pub const UNLEASED_FIXED_LEN: usize = 1 + 1 + 8 + 8 + 8 + 4 + 4 + 8 + 2;
 const TAIL_ENTRY_LEN: usize = 8 + 4;
-/// `version ‖ variant ‖ appender_id: u32 ‖ g: u32 ‖ page_addr: u64`.
-const LEASED_LEN: usize = 1 + 1 + 4 + 4 + 8;
+/// `version ‖ variant ‖ appender_id: u32 ‖ g: u32 ‖ page_addr: u64 ‖
+/// root.addr ‖ root.seq ‖ cursor ‖ slot_tree_extents: u32` — the words
+/// AS OF THE GRANT ride the lessee record too: between the grant and the
+/// lessee's first page write the tree's root has no other durable home
+/// (the grant replaced the `Unleased` record that carried it); the
+/// page's entry supersedes them once written (a newer root seq).
+pub const LEASED_LEN: usize = 1 + 1 + 4 + 4 + 8 + 8 + 8 + 8 + 4;
 
 /// The tree-0 key of slot `slot`'s state record.
 pub fn slot_state_key(slot: ForestSlot) -> Vec<u8> {
@@ -91,12 +96,16 @@ pub enum SlotState {
         tails: Vec<(u64, u32)>,
     },
     /// Leased: the lessee's identity — what makes slot resolution a
-    /// control-plane projection (KD-SYM-17). Written by the manager at
-    /// every grant (PR 4); the root rides the lessee's page.
+    /// control-plane projection (KD-SYM-17) — plus the tree's words as of
+    /// the grant (the root's durable home until the lessee's first page
+    /// write names a newer one). Written by the manager at every grant.
     Leased {
         appender_id: u32,
         g: u32,
         page_addr: u64,
+        root: RootPtr,
+        cursor: u64,
+        slot_tree_extents: u32,
     },
 }
 
@@ -141,6 +150,9 @@ impl SlotState {
                 appender_id,
                 g,
                 page_addr,
+                root,
+                cursor,
+                slot_tree_extents,
             } => {
                 let mut out = Vec::with_capacity(LEASED_LEN);
                 out.push(SLOT_STATE_VERSION);
@@ -148,6 +160,10 @@ impl SlotState {
                 out.extend_from_slice(&appender_id.to_le_bytes());
                 out.extend_from_slice(&g.to_le_bytes());
                 out.extend_from_slice(&page_addr.to_le_bytes());
+                out.extend_from_slice(&root.addr.to_le_bytes());
+                out.extend_from_slice(&root.seq.to_le_bytes());
+                out.extend_from_slice(&cursor.to_le_bytes());
+                out.extend_from_slice(&slot_tree_extents.to_le_bytes());
                 Ok(out)
             }
         }
@@ -218,6 +234,12 @@ impl SlotState {
                     appender_id: le32(value, 2),
                     g: le32(value, 6),
                     page_addr: le64(value, 10),
+                    root: RootPtr {
+                        addr: le64(value, 18),
+                        seq: le64(value, 26),
+                    },
+                    cursor: le64(value, 34),
+                    slot_tree_extents: le32(value, 42),
                 })
             }
             other => Err(KvError::Corrupt(format!(
@@ -226,11 +248,22 @@ impl SlotState {
         }
     }
 
-    /// The slot tree's root when this record names one (`Unleased`).
+    /// The slot tree's root as an UNLEASED record names it (`None` for a
+    /// leased slot, whose live root is the lessee's — see
+    /// [`Self::recorded_root`]).
     pub fn root(&self) -> Option<RootPtr> {
         match self {
             SlotState::Unleased { root, .. } => Some(*root),
             SlotState::Leased { .. } => None,
+        }
+    }
+
+    /// The root the record carries, whichever variant: the release's for
+    /// an unleased slot, the grant-time one for a leased slot (superseded
+    /// by the lessee's page once written).
+    pub fn recorded_root(&self) -> RootPtr {
+        match self {
+            SlotState::Unleased { root, .. } | SlotState::Leased { root, .. } => *root,
         }
     }
 }

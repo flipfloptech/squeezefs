@@ -114,6 +114,9 @@ fuzz_target!(|data: &[u8]| {
             appender_id: g,
             g: g.wrapping_add(1),
             page_addr: addr,
+            root: RootPtr { addr: seq, seq: addr },
+            cursor,
+            slot_tree_extents,
         };
         for state in [unleased, leased] {
             let bytes = state.encode().expect("every emittable record encodes");

@@ -1256,8 +1256,9 @@ async fn test_kv_alloc_torn_newest_root_after_churn_predecessor_extents_intact()
     // still safe, §4.7) + journal replay rebuild the full allocator
     // state: predecessor extents allocated (nothing lost), round-4
     // claims allocated (their records replay — the per-key LWW finals),
-    // round-3 frees pending again (in-window ⇒ parked, design-smo-
-    // replay-currency §2-A), and NOTHING double-allocatable.
+    // round-3 frees in-window (bits set at load; the parks are deferred
+    // to the mount body's second step — design-smo-replay-currency §2-A
+    // + the root-swap carve-out), and NOTHING double-allocatable.
     let (_ring2, recovery) =
         JournalRing::recover(f.path(), 0, RING_PAGES, 0, mounted.journal_tail_seq)
             .await
@@ -1285,23 +1286,48 @@ async fn test_kv_alloc_torn_newest_root_after_churn_predecessor_extents_intact()
     for &e in &r4_claims {
         assert!(loaded.is_allocated(e), "replayed round-4 claim {e} lost");
     }
-    assert_eq!(
-        loaded.pending_count(),
-        live.len() as u64,
-        "round-3 frees rebuild as pending (§4.7: pending-free is journaled)"
-    );
     assert_eq!(loaded.free_extents(), 0, "occupancy reconstructs exactly");
     assert!(
         matches!(loaded.claim_internal(), Err(KvError::NoSpace { .. })),
         "nothing is double-allocatable after the fallback"
     );
 
+    // The mount body's second step, with the roots the fallback mounted:
+    // round 4's frees named EXACTLY the predecessor's roots (the torn
+    // checkpoint's root swaps never became durable, so the mount replays
+    // THROUGH those roots — they are live again), and a replayed free of
+    // a live root is DROPPED, never parked. Parking it was the shipped
+    // defect: the first post-mount checkpoint's tail passed its gate and
+    // released the live root to the next claim.
+    let roots: std::collections::BTreeSet<u64> = mounted
+        .tree_roots
+        .iter()
+        .map(|r| (r.node_addr - heap_base) / EXT_LEN)
+        .collect();
+    let mut expected_roots: Vec<u64> = live.clone();
+    expected_roots.sort_unstable();
+    assert_eq!(
+        roots.iter().copied().collect::<Vec<_>>(),
+        expected_roots,
+        "the fallback mounts round 3's images as its roots"
+    );
+    assert_eq!(
+        loaded.park_replayed_frees(&roots),
+        (0, live.len() as u64),
+        "every round-3 free names a mounted root: all dropped, none parked"
+    );
+    assert_eq!(loaded.pending_count(), 0);
+    for &e in &live {
+        assert!(loaded.is_allocated(e), "live root {e} keeps its bit");
+    }
+
     // The reconstruct closes: the first post-mount checkpoint (seq 4
     // again, bitmap generation above everything on disk — including the
-    // crashed round's landed pages) becomes durable with a tail past the
-    // replayed window — coverage of the freeing records, not mere record
-    // durability (§2-A) — and only then do the predecessor's retired
-    // extents re-enter the pool.
+    // crashed round's landed pages) names the roots the mount actually
+    // serves — the predecessor's — and becomes durable with a tail past
+    // the replayed window. Nothing re-enters the pool: the live roots
+    // stay allocated, and round 4's images — unrouted successors — are
+    // the bounded leak class (fsck C13 on a forest grant).
     let generation = loaded
         .resume_generation()
         .max(mounted.alloc_bitmap_generation)
@@ -1315,34 +1341,26 @@ async fn test_kv_alloc_torn_newest_root_after_churn_predecessor_extents_intact()
         .write_dirty_pages(f.path(), BITMAP_BASE, generation)
         .await
         .unwrap();
-    write_ledger_slot(
-        f.path(),
-        LEDGER_BASE,
-        &ledger_rec(4, &r4_claims, generation),
-    )
-    .await
-    .unwrap();
+    write_ledger_slot(f.path(), LEDGER_BASE, &ledger_rec(4, &live, generation))
+        .await
+        .unwrap();
     uring_fs::fdatasync(f.path().to_path_buf()).await.unwrap();
-    // The post-mount record's tail: past every replayed entry (the
-    // window fully re-covered by the fresh checkpoint's flush).
     let covering_tail = recovery
         .entries
         .last()
         .map(|e| e.seq + JOURNAL_PAGE_LEN)
         .expect("the churn window is non-empty");
-    assert_eq!(loaded.advance_durable(covering_tail), 2);
-    let mut reopened = Vec::new();
-    while let Ok(e) = loaded.claim_internal() {
-        reopened.push(e);
-    }
-    reopened.sort_unstable();
-    let mut expected = live.clone();
-    expected.sort_unstable();
-    assert_eq!(
-        reopened, expected,
-        "exactly the predecessor's retired extents re-enter the pool once \
-         their retiring checkpoint is durable"
+    assert_eq!(loaded.advance_durable(covering_tail), 0);
+    assert!(
+        matches!(loaded.claim_internal(), Err(KvError::NoSpace { .. })),
+        "the live roots never re-enter the pool"
     );
+    for &e in &live {
+        let bytes = uring_fs::read_at(f.path(), heap_base + e * EXT_LEN, EXT_LEN as usize)
+            .await
+            .unwrap();
+        assert_eq!(&bytes[..], &pattern(3, e)[..], "live root {e} byte-intact");
+    }
 }
 
 // ===========================================================================

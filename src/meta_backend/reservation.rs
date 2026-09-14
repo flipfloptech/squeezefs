@@ -89,6 +89,11 @@ impl ReservationReport {
         self.registrants.iter().any(|r| r.rkey == key)
     }
 
+    /// The registrant count (`REGCTL`).
+    pub fn regctl(&self) -> usize {
+        self.registrants.len()
+    }
+
     /// `true` ⇔ a **Write Exclusive – Registrants Only** reservation
     /// (rtype 3 — the shared-data-namespace fence) is held: every
     /// registrant writes, unregistered hosts are rejected by the device.
@@ -121,6 +126,184 @@ pub fn registrant_identity_shared(
         .registrants
         .iter()
         .any(|r| r.rkey != our_key && r.host_id == our_wire_id)
+}
+
+// ---------------------------------------------------------------------------
+// The Reservation Report codec — sized by REGCTL (design-symmetric-metadata
+// §5.8.1 / KD-SYM-18): the data structure is a header plus one
+// registered-controller structure per registrant, so the transfer is read
+// in two steps — the header first, then `header + stride × REGCTL` — and
+// every registrant the header names is decoded. The shipped read filled a
+// fixed 4 KiB buffer and its parse loop broke at the 63rd extended
+// registrant (`(4096 − 64) / 64`), so the 64th co-writer read as
+// unregistered.
+// ---------------------------------------------------------------------------
+
+/// Header length of the Reservation Report data structure: 64 B in the
+/// extended form (EDS = 1, 128-bit host ids — every fabrics association),
+/// 24 B in the short form (64-bit host ids — PCIe controllers). Both
+/// forms pad the registered-controller structures to the same stride
+/// (verified byte-wise against kernel nvmet — the first extended
+/// structure sits at 0x40).
+pub fn report_header_len(extended: bool) -> usize {
+    if extended {
+        64
+    } else {
+        24
+    }
+}
+
+/// Bytes of one Reservation Report holding `regctl` registrants:
+/// `header + stride × REGCTL` (stride = the header length in both forms).
+pub fn report_len_for(regctl: u16, extended: bool) -> usize {
+    let unit = report_header_len(extended);
+    unit + unit * usize::from(regctl)
+}
+
+/// Decode one Reservation Report image (either form). Total: a short
+/// image refuses, a header naming more registrants than the image holds
+/// decodes the ones that fit (the two-step read's first transfer is the
+/// header alone, and a REGCTL that grew between the two reads is caught
+/// at the next read). Both forms open with `gen u32 ‖ rtype u8 ‖ regctl
+/// u16`; each structure opens with `cntlid u16 ‖ rcsts u8`, the short form
+/// carries `hostid u64 @8 ‖ rkey u64 @16`, the extended `rkey u64 @8 ‖
+/// hostid[16] @16`.
+pub fn parse_reservation_report(data: &[u8], extended: bool) -> io::Result<ReservationReport> {
+    let hdr = report_header_len(extended);
+    if data.len() < hdr {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "reservation report image of {} bytes is shorter than its {hdr}-byte header",
+                data.len()
+            ),
+        ));
+    }
+    let rtype = data[4];
+    let regctl = usize::from(u16::from_le_bytes([data[5], data[6]]));
+    let stride = hdr;
+    let (rkey_off, hostid_off, hostid_len) = if extended { (8, 16, 16) } else { (16, 8, 8) };
+    let fits = data.len().saturating_sub(hdr) / stride;
+    let n = regctl.min(fits);
+    let mut registrants = Vec::with_capacity(n);
+    let mut holder_key = None;
+    for i in 0..n {
+        let base = hdr + i * stride;
+        let rcsts = data[base + 2];
+        let mut rkey = [0u8; 8];
+        rkey.copy_from_slice(&data[base + rkey_off..base + rkey_off + 8]);
+        let rkey = u64::from_le_bytes(rkey);
+        let holds = rcsts & 0x1 != 0 && rtype != 0;
+        registrants.push(ReservationRegistrant {
+            rkey,
+            host_id: data[base + hostid_off..base + hostid_off + hostid_len].to_vec(),
+            holds_reservation: holds,
+        });
+        if holds {
+            holder_key = Some(rkey);
+        }
+    }
+    Ok(ReservationReport {
+        holder_key,
+        registrants,
+        rtype,
+    })
+}
+
+/// The per-namespace report gauges (`pr_registrants_per_namespace`,
+/// `pr_report_bytes` — design §11 "Fencing family"): the last report's
+/// `REGCTL` and the bytes its REGCTL-sized read transferred, keyed by the
+/// namespace's device path.
+type ReportGauges = Mutex<std::collections::BTreeMap<String, (u64, u64)>>;
+
+fn report_gauges() -> &'static ReportGauges {
+    static G: OnceLock<ReportGauges> = OnceLock::new();
+    G.get_or_init(|| Mutex::new(std::collections::BTreeMap::new()))
+}
+
+/// Record one namespace's report (`regctl`, transferred `bytes`).
+pub fn note_report_gauge(namespace: &str, regctl: usize, bytes: u64) {
+    report_gauges()
+        .lock()
+        .unwrap()
+        .insert(namespace.to_string(), (regctl as u64, bytes));
+}
+
+/// Snapshot of the per-namespace report gauges.
+pub fn pr_report_gauges() -> std::collections::BTreeMap<String, (u64, u64)> {
+    report_gauges().lock().unwrap().clone()
+}
+
+/// `SQUEEZEFS_PR_REGISTRANT_CAP` — a DECLARED registrant cap for a
+/// third-party PR array whose behaviour is known (int 1..=65535; unset =
+/// learn from the device, and the kernel `nvmet` target — THE target,
+/// R-SYM-8 — has none).
+pub const PR_REGISTRANT_CAP_ENV: &str = "SQUEEZEFS_PR_REGISTRANT_CAP";
+
+/// The cap LEARNED from the device: the `REGCTL` a Reservation Report
+/// read at the first REGISTER that failed with a non-conflict status (a
+/// vendor array's "registration table full"). 0 = nothing learned.
+static PR_REGISTRANT_CAP_LEARNED: AtomicU64 = AtomicU64::new(0);
+/// Joins refused at the cap (`pr_registrant_cap_refusals` — must stay 0
+/// on nvmet by construction).
+static PR_REGISTRANT_CAP_REFUSALS: AtomicU64 = AtomicU64::new(0);
+
+/// The registrant cap in force: declared wins, else learned, else 0 =
+/// unbounded (`pr_registrant_cap` on the stats inode).
+pub fn pr_registrant_cap() -> u64 {
+    match crate::env_knobs::opt_int_knob::<u64>(PR_REGISTRANT_CAP_ENV) {
+        Some(declared) => declared,
+        None => PR_REGISTRANT_CAP_LEARNED.load(Ordering::Relaxed),
+    }
+}
+
+/// `pr_registrant_cap_refusals`.
+pub fn pr_registrant_cap_refusals() -> u64 {
+    PR_REGISTRANT_CAP_REFUSALS.load(Ordering::Relaxed)
+}
+
+/// Learn a cap from the device (monotone — the smallest observed).
+fn learn_registrant_cap(regctl: usize) {
+    if regctl == 0 {
+        return;
+    }
+    let n = regctl as u64;
+    let _ = PR_REGISTRANT_CAP_LEARNED.fetch_update(Ordering::AcqRel, Ordering::Acquire, |cur| {
+        (cur == 0 || n < cur).then_some(n)
+    });
+}
+
+/// **The registrant-cap gate** (KD-SYM-18 / KD-SYM-23): before a join
+/// registers on `namespace`, its report's `REGCTL` is read against the
+/// cap in force; at or past it the join refuses LOUD, naming the count,
+/// the namespace and the remedy — nvmet in front of the array, or fewer
+/// hosts per namespace. Unbounded (0) never refuses. Records the
+/// namespace's report gauges as a side effect (every join reads the
+/// report sized by REGCTL).
+pub fn registrant_cap_gate(
+    namespace: &Path,
+    report: &ReservationReport,
+    report_bytes: u64,
+) -> io::Result<()> {
+    let regctl = report.regctl();
+    note_report_gauge(&namespace.display().to_string(), regctl, report_bytes);
+    let cap = pr_registrant_cap();
+    if cap != 0 && regctl as u64 >= cap {
+        PR_REGISTRANT_CAP_REFUSALS.fetch_add(1, Ordering::Relaxed);
+        return Err(io::Error::other(format!(
+            "namespace {} already carries {regctl} registrant(s) and its registrant cap is \
+             {cap} ({}) — refusing to register a further host: put the kernel nvmet target in \
+             front of the array (its registrant list is unbounded — the ONE supported target, \
+             R-SYM-8) or use fewer hosts per namespace (pr_registrant_cap_refusals)",
+            namespace.display(),
+            if crate::env_knobs::opt_int_knob::<u64>(PR_REGISTRANT_CAP_ENV).is_some() {
+                format!("declared by {PR_REGISTRANT_CAP_ENV}")
+            } else {
+                "learned from the device's first refused REGISTER".to_string()
+            },
+        )));
+    }
+    Ok(())
 }
 
 /// The reservation-conflict errno class (design §5.0 B1 pt 3: "the
@@ -214,8 +397,13 @@ pub trait ReservationClient: Send + Sync + std::fmt::Debug {
     fn release_registrants_only(&self, key: u64) -> io::Result<()>;
 
     /// Reservation Report: current holder + registrants (the heartbeat
-    /// PTPL-lapse re-check, §5.0 B1 pt 6).
+    /// PTPL-lapse re-check, §5.0 B1 pt 6). Read sized by `REGCTL` — every
+    /// registrant the header names is decoded ([`parse_reservation_report`]).
     fn report(&self) -> io::Result<ReservationReport>;
+
+    /// Bytes the last [`Self::report`] transferred (`pr_report_bytes`):
+    /// the REGCTL-sized second read's length on the real client.
+    fn report_bytes(&self) -> u64;
 }
 
 /// Outcome of [`register_ladder`].
@@ -258,6 +446,22 @@ pub fn register_ladder(client: &dyn ReservationClient, key: u64) -> io::Result<R
         return Ok(RegisterOutcome::Registered);
     };
     if !is_reservation_conflict(&conflict) {
+        // A REGISTER refused with a NON-conflict status on a namespace
+        // that reports registrants is a vendor array's registration
+        // table binding (KD-SYM-18): the count it holds is the cap this
+        // process learns, so the next join refuses BEFORE registering
+        // instead of failing here again.
+        if let Ok(report) = client.report() {
+            if report.regctl() > 0 {
+                learn_registrant_cap(report.regctl());
+                log::warn!(
+                    "reservation REGISTER refused ({conflict}) with {} registrant(s) on the \
+                     namespace — learned as this array's registrant cap \
+                     (pr_registrant_cap); the next join refuses at it",
+                    report.regctl()
+                );
+            }
+        }
         return Err(conflict);
     }
     // Spec-strict Register (SPDK v26.05 measured, scoping §4 pt 2): the
@@ -465,6 +669,10 @@ const NVME_SC_RESERVATION_CONFLICT: i32 = 0x83;
 pub struct NvmeReservationClient {
     file: std::fs::File,
     nsid: u32,
+    /// The namespace's device path — the report gauges' key.
+    path: PathBuf,
+    /// Bytes the last Reservation Report transferred (`pr_report_bytes`).
+    last_report_bytes: AtomicU64,
 }
 
 impl NvmeReservationClient {
@@ -491,6 +699,8 @@ impl NvmeReservationClient {
         Some(Arc::new(Self {
             file,
             nsid: rc as u32,
+            path: path.to_path_buf(),
+            last_report_bytes: AtomicU64::new(0),
         }))
     }
 
@@ -545,63 +755,46 @@ impl NvmeReservationClient {
         self.passthru(NVME_IOCTL_IO_CMD, &mut cmd)
     }
 
-    /// One Reservation Report transfer: header (gen u32, rtype u8,
-    /// regctl u16, …, PTPLS) + regctl registered-controller structures —
-    /// 24 B each in the short form (64-bit hostid), 64 B each in the
-    /// extended form (128-bit hostid; rkey sits before the hostid there).
-    fn report_with(&self, extended: bool) -> io::Result<ReservationReport> {
-        let mut data = vec![0u8; 4096];
-        let numd = (data.len() / 4 - 1) as u32; // 0-based dword count
+    /// One Reservation Report transfer of `len` bytes (a multiple of 4;
+    /// CDW10 carries the 0-based dword count).
+    fn report_transfer(&self, extended: bool, len: usize) -> io::Result<Vec<u8>> {
+        let mut data = vec![0u8; len];
+        let numd = (len / 4 - 1) as u32;
         let mut cmd = NvmePassthruCmd {
             opcode: NVME_CMD_RESV_REPORT,
             nsid: self.nsid,
             addr: data.as_mut_ptr() as u64,
-            data_len: data.len() as u32,
+            data_len: len as u32,
             cdw10: numd,
             cdw11: u32::from(extended), // EDS
             ..Default::default()
         };
         self.passthru(NVME_IOCTL_IO_CMD, &mut cmd)?;
-        let rtype = data[4];
-        let regctl = u16::from_le_bytes([data[5], data[6]]) as usize;
-        // The short form packs 24 B controller structures after a 24 B
-        // header; the extended form pads BOTH to 64 B (verified byte-wise
-        // against kernel nvmet in the M1 root session — first regctlext
-        // at 0x40).
-        let (hdr, stride) = if extended { (64, 64) } else { (24, 24) };
-        let mut registrants = Vec::with_capacity(regctl);
-        let mut holder_key = None;
-        for i in 0..regctl {
-            let base = hdr + i * stride;
-            if base + stride > data.len() {
-                break;
-            }
-            // Both forms open with: cntlid u16, rcsts u8, rsvd…; the
-            // short form carries hostid u64 @8 then rkey u64 @16; the
-            // extended form carries rkey u64 @8 then hostid[16] @16.
-            let rcsts = data[base + 2];
-            let (rkey_off, hostid_off, hostid_len) =
-                if extended { (8, 16, 16) } else { (16, 8, 8) };
-            let rkey = u64::from_le_bytes(
-                data[base + rkey_off..base + rkey_off + 8]
-                    .try_into()
-                    .unwrap(),
-            );
-            let holds = rcsts & 0x1 != 0 && rtype != 0;
-            registrants.push(ReservationRegistrant {
-                rkey,
-                host_id: data[base + hostid_off..base + hostid_off + hostid_len].to_vec(),
-                holds_reservation: holds,
-            });
-            if holds {
-                holder_key = Some(rkey);
-            }
+        Ok(data)
+    }
+
+    /// The Reservation Report, read SIZED BY `REGCTL` in two steps: the
+    /// header first (it carries the registrant count), then `header +
+    /// stride × REGCTL` — so every registrant is decoded whatever their
+    /// number ([`parse_reservation_report`]). A count that grew between
+    /// the two reads is re-read once at the new size; the parse decodes
+    /// what the final transfer holds. The transfer length is recorded for
+    /// `pr_report_bytes`.
+    fn report_with(&self, extended: bool) -> io::Result<ReservationReport> {
+        let hdr = report_header_len(extended);
+        let head = self.report_transfer(extended, hdr)?;
+        let mut regctl = u16::from_le_bytes([head[5], head[6]]);
+        let mut data = self.report_transfer(extended, report_len_for(regctl, extended))?;
+        let seen = u16::from_le_bytes([data[5], data[6]]);
+        if seen > regctl {
+            regctl = seen;
+            data = self.report_transfer(extended, report_len_for(regctl, extended))?;
         }
-        Ok(ReservationReport {
-            holder_key,
-            registrants,
-            rtype,
-        })
+        let bytes = data.len() as u64;
+        self.last_report_bytes.store(bytes, Ordering::Relaxed);
+        let report = parse_reservation_report(&data, extended)?;
+        note_report_gauge(&self.path.display().to_string(), report.regctl(), bytes);
+        Ok(report)
     }
 
     /// Reservation Acquire / Preempt: 16 B payload `[crkey, prkey]`,
@@ -777,6 +970,10 @@ impl ReservationClient for NvmeReservationClient {
             Err(e) if is_reservation_conflict(&e) => Err(e),
             Err(_) => self.report_with(false),
         }
+    }
+
+    fn report_bytes(&self) -> u64 {
+        self.last_report_bytes.load(Ordering::Relaxed)
     }
 }
 
@@ -1174,5 +1371,12 @@ impl ReservationClient for FakeReservationClient {
                 0
             },
         })
+    }
+
+    /// The fake models a fabrics association (128-bit host ids), so its
+    /// report is the extended form's length for its registrant count.
+    fn report_bytes(&self) -> u64 {
+        let n = self.ns.state.lock().unwrap().registered.len();
+        report_len_for(n.min(usize::from(u16::MAX)) as u16, true) as u64
     }
 }

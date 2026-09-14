@@ -69,7 +69,10 @@ fn a_reservation_report_with_more_than_sixty_three_registrants_decodes_completel
         Some(0x1000 + 69),
         "the 70th registrant — beyond the 63rd — is reported as the holder"
     );
-    assert!(report.registered(0x1000 + 63), "the 64th registrant is REPORTED");
+    assert!(
+        report.registered(0x1000 + 63),
+        "the 64th registrant is REPORTED"
+    );
     // The shipped truncation, stated: a fixed 4 KiB buffer holds the
     // header plus 63 extended structures, so the 64th and every later
     // registrant fell off the parse.
@@ -113,14 +116,17 @@ fn the_report_parse_is_total_over_short_and_malformed_images() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_declared_registrant_cap_refuses_the_next_join_loud() {
-    use squeezefs::data_custody::{join_wero_as_registrant, pr_registrant_cap_refusals};
+    use squeezefs::data_custody::join_wero_as_registrant;
+    use squeezefs::meta_backend::reservation::pr_registrant_cap_refusals;
     let _g = ENV.lock().await;
     let ns = FakeNvmeNamespace::lenient_register();
     // An authority holds WERO; seven more hosts are registered under it —
     // eight registrants on the namespace.
     let authority = FakeReservationClient::new(Arc::clone(&ns), "nqn.auth", "auth-host");
     authority.register(0xA0).unwrap();
-    authority.acquire_write_exclusive_registrants_only(0xA0).unwrap();
+    authority
+        .acquire_write_exclusive_registrants_only(0xA0)
+        .unwrap();
     for i in 1..8u64 {
         let c = FakeReservationClient::new(Arc::clone(&ns), "nqn.peer", &format!("peer-{i}"));
         c.register(0xA0 + i).unwrap();
@@ -164,7 +170,9 @@ async fn below_the_declared_cap_the_join_lands_and_the_gauges_read_the_namespace
     let ns = FakeNvmeNamespace::lenient_register();
     let authority = FakeReservationClient::new(Arc::clone(&ns), "nqn.auth", "auth-host");
     authority.register(0xA0).unwrap();
-    authority.acquire_write_exclusive_registrants_only(0xA0).unwrap();
+    authority
+        .acquire_write_exclusive_registrants_only(0xA0)
+        .unwrap();
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("data1");
     std::fs::File::create(&path).unwrap();

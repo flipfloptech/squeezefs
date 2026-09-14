@@ -1035,6 +1035,9 @@ impl ReservationClient for RegisterFailingClient {
     fn report(&self) -> std::io::Result<ReservationReport> {
         self.inner.report()
     }
+    fn report_bytes(&self) -> u64 {
+        self.inner.report_bytes()
+    }
 }
 
 /// Fast path pin: no stale state ⇒ plain register, no report/unregister

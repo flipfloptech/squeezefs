@@ -106,9 +106,12 @@
 
 use crate::error::{Result, SqueezefsError};
 use crate::fuse_client::METRICS;
-use crate::meta_backend::reservation::{register_ladder, resolve_for_mount, ReservationClient};
+use crate::meta_backend::reservation::{
+    register_ladder, registrant_cap_gate, resolve_for_mount, ReservationClient,
+};
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::io;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 
@@ -844,6 +847,20 @@ fn release_partial(clients: &[Arc<dyn ReservationClient>], key: u64) {
     }
 }
 
+/// One join's registrant-cap probe on `path`: the Reservation Report
+/// (REGCTL-sized) through [`registrant_cap_gate`] — the ONE gate every
+/// registrant join runs, metadata and data namespaces alike.
+pub fn registrant_cap_probe(client: &dyn ReservationClient, path: &Path) -> io::Result<()> {
+    let report = client.report().map_err(|e| {
+        io::Error::other(format!(
+            "Reservation Report on {} failed before registering: {e} — the registrant cap \
+             cannot be probed blind",
+            path.display()
+        ))
+    })?;
+    registrant_cap_gate(path, &report, client.report_bytes())
+}
+
 fn unregister_partial(clients: &[Arc<dyn ReservationClient>], key: u64) {
     for client in clients {
         if let Err(e) = client.unregister(key) {
@@ -1105,6 +1122,15 @@ pub fn join_wero_as_registrant(data_paths: &[PathBuf]) -> Result<WeroRegistrantJ
                 path.display()
             )));
         };
+        // The registrant-cap probe (KD-SYM-18): the report sized by
+        // REGCTL, read BEFORE this host registers — at or past the cap
+        // in force the join refuses with nothing registered.
+        if let Err(e) = registrant_cap_probe(client.as_ref(), path) {
+            unregister_partial(&clients, key);
+            return Err(SqueezefsError::InvalidOperation(format!(
+                "co-writer WERO join refuses: {e}"
+            )));
+        }
         if let Err(e) = register_ladder(client.as_ref(), key) {
             unregister_partial(&clients, key);
             return Err(SqueezefsError::InvalidOperation(format!(
@@ -1128,6 +1154,11 @@ pub fn join_wero_as_registrant(data_paths: &[PathBuf]) -> Result<WeroRegistrantJ
                 )));
             }
         };
+        crate::meta_backend::reservation::note_report_gauge(
+            &path.display().to_string(),
+            report.regctl(),
+            client.report_bytes(),
+        );
         if !report.is_wero() {
             let held = report.holder_key;
             unregister_partial(&clients, key);

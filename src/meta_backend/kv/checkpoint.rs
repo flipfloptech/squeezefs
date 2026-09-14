@@ -1548,10 +1548,18 @@ async fn tick(
             0 => 16,
             n => n - 1,
         };
+        // Coverage alone is not convergence: the cycle's own barrier
+        // releases the pending frees its tail covers AFTER the cycle wrote
+        // its bitmap pages, so the release is a dirty page for the NEXT
+        // cycle — and without one the retired images read CLAIMED at every
+        // later mount (the clean-unmount leak PR 11's census found). One
+        // more cycle persists them; with nothing dirty it journals no SMO,
+        // so the term converges in that cycle.
         let uncovered = |be: &KvMetaBackend| {
             let core = be.journal_ring().core();
             core.head() != core.reusable_upto()
                 || be.appenders().is_some_and(|a| a.rings_uncovered())
+                || be.allocator().has_dirty_pages()
         };
         for _ in 0..bound {
             if !uncovered(be) {

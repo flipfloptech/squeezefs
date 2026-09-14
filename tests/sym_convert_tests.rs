@@ -486,8 +486,8 @@ async fn a_converted_volumes_post_fold_digest_equals_the_sources() {
     );
     // The forest the conversion leaves is exactly accounted: every
     // claimed extent is a node some root reaches or the directory extent
-    // (the census that reclaimed the source's leaked images holds on the
-    // result — see `a_clean_flat_unmount_leaves_claimed_extents_no_root_reaches`).
+    // (the same census the verb runs before it builds — see
+    // `a_clean_flat_unmount_leaves_no_claimed_extent_its_roots_do_not_reach`).
     let (claimed, reachable) = extent_census(&uris[0]).await;
     assert_eq!(
         claimed,
@@ -547,31 +547,31 @@ async fn a_converted_volumes_post_fold_digest_equals_the_sources() {
     fsck_clean(&uris).await;
 }
 
-/// **Finding (PR 11, shipped, every flat volume): a clean unmount leaves
-/// claimed extents no ledger root reaches.** The checkpoint cycle's
-/// coverage barrier releases the pending frees its tail covers
-/// (`after_durable_barrier` → `advance_durable`) AFTER that cycle wrote
-/// its bitmap pages, so the release only dirties the pages for the NEXT
-/// cycle — and the shutdown fixpoint converges on ring coverage (`head ==
-/// reusable_upto`), never on "no dirty bitmap page", so the FINAL cycle's
-/// releases are never written: the freed images read CLAIMED at the next
-/// mount, and nothing in the (covered) window frees them again. Every
-/// clean unmount whose last cycle retired an image leaks it — the idle
-/// mount/unmount pair below leaks one. The conversion's pre-build census
-/// reclaims the class as a side effect (`orphans_reclaimed`); this pin
-/// records the shipped shape so the fix, when it lands in the checkpoint
-/// task, is asked to flip it.
+/// **The clean-unmount law, and the shipped defect PR 11 found under it
+/// (every flat volume): a clean unmount leaves NO claimed extent its
+/// ledger roots do not reach.** Before the fix, the checkpoint cycle's
+/// coverage barrier released the pending frees its tail covers
+/// (`after_durable_barrier` → `advance_durable`) AFTER that cycle had
+/// written its bitmap pages — dirtying them for the NEXT cycle — while
+/// the shutdown fixpoint converged on ring coverage alone (`head ==
+/// reusable_upto`), so the FINAL cycle's releases were never written:
+/// the retired images read CLAIMED at the next mount, nothing in the
+/// covered window freed them again, and every clean unmount whose last
+/// pass retired images leaked them (the populated volume below leaked 6,
+/// an idle mount/unmount pair 1 — proportional to the final pass's
+/// SMOs). The fixpoint now also converges on "no dirty bitmap page"; the
+/// conversion's pre-build census (`orphans_reclaimed`) is the instrument
+/// that found the class and reads 0 on a volume this binary unmounted.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_clean_flat_unmount_leaves_claimed_extents_no_root_reaches() {
+async fn a_clean_flat_unmount_leaves_no_claimed_extent_its_roots_do_not_reach() {
     let dir = tempfile::tempdir().unwrap();
     let (uris, _d, _p) = populated_flat_set(dir.path(), 1, 60).await;
     let (claimed0, reachable0) = extent_census(&uris[0]).await;
-    assert!(
-        claimed0 > reachable0,
-        "the populated volume's clean unmount already leaked: claimed {claimed0} vs reachable \
-         {reachable0}"
+    assert_eq!(
+        claimed0, reachable0,
+        "the populated volume's clean unmount left every claimed extent reachable"
     );
-    // Idle mount cycles: no records change, yet the claimed count grows.
+    // Idle mount cycles: no records change, and the claimed count holds.
     for _ in 0..3 {
         let routed = open_routed_meta_set(&uris).await.expect("mount");
         for v in &routed.volumes {
@@ -580,22 +580,19 @@ async fn a_clean_flat_unmount_leaves_claimed_extents_no_root_reaches() {
     }
     let (claimed3, reachable3) = extent_census(&uris[0]).await;
     assert_eq!(reachable3, reachable0, "the trees hold the same population");
-    assert!(
-        claimed3 > claimed0,
-        "idle mount cycles leak claimed extents: {claimed0} → {claimed3}"
+    assert_eq!(
+        claimed3, claimed0,
+        "idle mount cycles leak no claimed extent: {claimed0} → {claimed3}"
     );
-    // The conversion reclaims that class (its own quiesce is one more
-    // mount cycle, which may leak once more before the census), then
-    // leaves a volume whose claimed set is its reachable set plus the
+    // The conversion's census finds nothing to reclaim on such a volume,
+    // and leaves one whose claimed set is its reachable set plus the
     // directory extent.
     let report = enable_symmetric(&uris, &EnableSymOptions::default())
         .await
         .expect("convert");
-    assert!(
-        report.rows[0].orphans_reclaimed >= claimed3 - reachable3,
-        "reclaimed {} ≥ the {} leaked before the verb ran",
-        report.rows[0].orphans_reclaimed,
-        claimed3 - reachable3
+    assert_eq!(
+        report.rows[0].orphans_reclaimed, 0,
+        "nothing leaked before the verb ran"
     );
     let (claimed, reachable) = extent_census(&uris[0]).await;
     assert_eq!(claimed, reachable + 1);

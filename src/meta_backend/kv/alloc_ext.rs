@@ -826,6 +826,17 @@ impl ExtentAllocator {
         self.core.is_allocated(extent)
     }
 
+    /// Whether any bitmap page holds a delta the next
+    /// [`Self::write_dirty_pages`] must persist — a claim, or a release the
+    /// last checkpoint's coverage barrier made AFTER that cycle wrote its
+    /// pages. The shutdown fixpoint's second convergence term: a final
+    /// cycle whose barrier releases pending frees dirties their pages for a
+    /// cycle that would otherwise never run, and the released images then
+    /// read CLAIMED at every later mount (PR 11's finding).
+    pub fn has_dirty_pages(&self) -> bool {
+        self.dirty.iter().any(|w| w.load(Ordering::Acquire) != 0)
+    }
+
     /// Newest bitmap generation on disk across pages — mount resumes
     /// generation numbering above `max(this, ledger.alloc_bitmap_generation)`
     /// so a new write can never tie an existing valid slot.

@@ -134,6 +134,7 @@
 //! which is exactly what makes "nonzero after a clean unmount" the
 //! corruption alert (§10) instead of a tear census.
 
+pub use super::journal_core::SeqSpan;
 use super::journal_core::{AdmissionClass, CoreGeometry, JournalCore, Reservation};
 use super::record::{
     Record, RecordRef, KIND_INTERIOR, TREE_ALLOC_RESERVED, TREE_ID_MAX, TREE_INODES,

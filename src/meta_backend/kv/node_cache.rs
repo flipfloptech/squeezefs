@@ -782,6 +782,9 @@ impl NodeSnapshot {
                         // The §4.2 elision rule: a covered tombstone and
                         // everything it shadows leave the compaction fold
                         // whole (orphan deltas above it fold to absent).
+                        // Seq vs position, conservatively: a stamp is ≥
+                        // its position, so `seq < tail` implies covered
+                        // (`compact_fold`'s law; round 3 Issue 20).
                         0
                     } else {
                         (b..b + be)
@@ -1987,21 +1990,23 @@ impl CachedNode {
 
     /// §4.4 pt 4 seq-conditional rollback, removal half: under the held
     /// write lock, remove every open-overlay record of `key` whose seq is
-    /// inside the failing tx's reserved range `[lo, hi)` and swap a fresh
-    /// snapshot. Records that already left the overlay (a freeze raced
-    /// the failed write) are the caller's compensation problem — detected
-    /// via [`NodeSnapshot::newest_record_seq`]. Returns how many records
-    /// were removed.
+    /// inside the failing tx's STAMPED span (a
+    /// [`super::journal::SeqSpan`] — record seqs, never ring positions;
+    /// review round 3, Issue 20) and swap a fresh snapshot. Records that
+    /// already left the overlay (a freeze raced the failed write) are the
+    /// caller's compensation problem — detected via
+    /// [`NodeSnapshot::newest_record_seq`]. Returns how many records were
+    /// removed.
     pub fn remove_overlay_records_locked(
         &self,
         guard: &mut NodeDirty,
         key: &[u8],
-        lo: u64,
-        hi: u64,
+        span: super::journal::SeqSpan,
     ) -> usize {
+        let lo = span.lo;
         let before = guard.overlay.len();
         guard.overlay.retain(|r| {
-            let mine = r.key[..] == *key && r.seq >= lo && r.seq < hi;
+            let mine = r.key[..] == *key && span.contains(r.seq);
             !mine
         });
         let removed = before - guard.overlay.len();
@@ -2506,14 +2511,16 @@ pub struct NodeCache {
     slot_tails: ArcSwap<std::collections::BTreeMap<super::record::ForestSlot, u64>>,
     /// **The per-slot record frontier** of an ARMED symmetric mount
     /// (design-symmetric-metadata §5.1.4; PR 4 review round 2, Issue
-    /// 11): for each leased slot, one past the highest ring position any
-    /// record of its tree was journaled at by this mount — the conveyor
-    /// pass notes its batch's end for every slot-stamped node of the
-    /// union, an SMO its entry's end, the arm the ring's head. A release
-    /// cycles until the region's `reusable_upto` reaches it (and the root
-    /// is published): the departing ring's window is then CLEAR of the
-    /// slot by a post-condition, not by a fixed cycle count. Latch-free
-    /// (one `fetch_max`); empty on every unarmed mount.
+    /// 11): for each leased slot, one past the highest position in ITS
+    /// LESSEE'S RING any record of its tree was journaled at by this
+    /// mount — the conveyor pass notes its batch's end for every slot-
+    /// stamped node of the union, an SMO its entry's end, and the install
+    /// RESETS it to the receiving ring's head (a position is a ring's;
+    /// the slot's frontier follows the lease — review round 3, Issue 22).
+    /// A release cycles until the region's `reusable_upto` reaches it
+    /// (and the root is published): the departing ring's window is then
+    /// CLEAR of the slot by a post-condition, not by a fixed cycle count.
+    /// Latch-free (one `fetch_max`); empty on every unarmed mount.
     slot_frontiers: scc::HashMap<super::record::ForestSlot, Arc<AtomicU64>>,
 }
 
@@ -2566,6 +2573,32 @@ impl NodeCache {
         if let Err((_, fresh)) = self.slot_frontiers.insert_sync(slot, fresh) {
             let _ = self.slot_frontiers.read_sync(&slot, |_, c| {
                 c.fetch_max(fresh.load(Ordering::Acquire), Ordering::AcqRel)
+            });
+        }
+    }
+
+    /// RESET `slot`'s frontier to `head` — the RECEIVING ring's head at
+    /// a grant / re-adoption (review round 3, Issue 22): the frontier is
+    /// a position in the LESSEE's ring, so a slot arriving from another
+    /// ring must not inherit the departing ring's maximum (unreachable by
+    /// this ring's `reusable_upto` until its own positions pass it — 64
+    /// cycles and an aborted release, every tick). The departing window is
+    /// clear of the slot by construction at a grant; at a re-adoption the
+    /// head covers every replayed record.
+    pub fn reset_slot_record_frontier(&self, slot: u32, head: u64) {
+        if slot == u32::MAX {
+            return;
+        }
+        if let Some(()) = self
+            .slot_frontiers
+            .read_sync(&slot, |_, c| c.store(head, Ordering::Release))
+        {
+            return;
+        }
+        let fresh = Arc::new(AtomicU64::new(head));
+        if let Err((_, fresh)) = self.slot_frontiers.insert_sync(slot, fresh) {
+            let _ = self.slot_frontiers.read_sync(&slot, |_, c| {
+                c.store(fresh.load(Ordering::Acquire), Ordering::Release)
             });
         }
     }

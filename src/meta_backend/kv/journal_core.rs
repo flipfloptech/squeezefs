@@ -225,6 +225,42 @@ impl Reservation {
     }
 }
 
+/// **The RECORD-SEQ span of one journal entry or one contiguous batch —
+/// the ONE domain every overlay address uses** (PR 4 review round 3,
+/// Issue 20). Records are stamped `seq_base + i` from the base the
+/// ring's `reserve_registered` answers (`position + seq_offset`, §5.8.2's
+/// seq-space law), so a `len`-byte entry's stamps lie in `[seq_base,
+/// seq_base + len)` (a record is at least one byte) and adjacent members
+/// of a batch occupy disjoint spans. A [`Reservation`] is the POSITION
+/// domain — holes, coverage, floors, the ring's own arithmetic — and the
+/// two differ by the ring's offset on any ring that ever received a
+/// handed-over slot; the §4.4 pt 4 rollback arms that addressed the
+/// overlay by the position range removed nothing there.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SeqSpan {
+    /// The first record seq the span holds.
+    pub lo: u64,
+    /// One past the last.
+    pub hi: u64,
+}
+
+impl SeqSpan {
+    /// The span of an entry (or batch) of `len` bytes stamped from
+    /// `seq_base`.
+    pub fn stamped(seq_base: u64, len: u64) -> Self {
+        Self {
+            lo: seq_base,
+            hi: seq_base.saturating_add(len),
+        }
+    }
+
+    /// Whether a record seq lies inside the span.
+    #[inline]
+    pub fn contains(&self, seq: u64) -> bool {
+        seq >= self.lo && seq < self.hi
+    }
+}
+
 /// The lock-free reservation/admission core. See the module docs for the
 /// protocol; the loom models in `loom-models/` pin its invariants:
 /// no reservation overlap, seq monotonic, lap/wrap correctness, multi-page

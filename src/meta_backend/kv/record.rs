@@ -1456,7 +1456,13 @@ pub fn compact_fold(
     match fold_newest_first(group_newest_first.iter().copied())? {
         Folded::Put { value, seq } => Ok(vec![Record::put(key.to_vec(), seq, value.into_owned())]),
         // Still inside the replay window (seq ≥ tail): the tombstone must
-        // survive in the node (§4.2 elision rule).
+        // survive in the node (§4.2 elision rule). The comparison crosses
+        // domains on purpose — a record seq against a ring POSITION — and
+        // is CONSERVATIVE under the seq-space law (design-symmetric-
+        // metadata §5.1.4): a stamp is `position + offset ≥ position`, so
+        // `seq < tail ⇒ position < tail ⇒ covered`; a nonzero offset only
+        // delays an elision, never takes one early (review round 3,
+        // Issue 20's sweep of every seq-vs-position site).
         Folded::Tombstone { seq } if seq >= durable_tail => {
             Ok(vec![Record::delete(key.to_vec(), seq)])
         }

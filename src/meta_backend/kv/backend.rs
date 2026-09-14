@@ -134,7 +134,7 @@
 use super::alloc_ext::{compaction_reserve_extents, ExtentAllocator};
 use super::checkpoint::{read_newest_ledger, LedgerRecord};
 use super::conveyor_core::ConveyorCore;
-use super::journal::{checkpoint_reserve_bytes, entry_len_for, untag, JournalRing};
+use super::journal::{checkpoint_reserve_bytes, entry_len_for, untag, JournalRing, SeqSpan};
 use super::journal_core::{AdmissionClass, Reservation};
 use super::node::{key_successor, NodeLayout};
 use super::node_cache::{
@@ -3797,11 +3797,14 @@ impl KvMetaBackend {
                 }
             }
         }
-        // Every record the slot may already carry in the region's ring
-        // (a re-adoption's replayed window, the grant's own control
-        // entry) sits below the head: the frontier a release must cover.
+        // The slot's record frontier is a position in ITS LESSEE'S ring:
+        // RESET to the receiving ring's head (never `max`ed with the
+        // departing ring's positions — review round 3, Issue 22). Every
+        // record the slot may already carry here (a re-adoption's
+        // replayed window, the grant's own control entry) sits below it;
+        // the departing window is clear of the slot by construction.
         self.cache
-            .note_slot_record_frontier(slot, region.ring().core().head());
+            .reset_slot_record_frontier(slot, region.ring().core().head());
         region.add_lease(slot);
         plane.gate.grant(slot);
         Ok(())
@@ -13134,6 +13137,11 @@ struct ConveyorWindow {
     /// it once the write's outcome is known (`res_open` tracks that).
     res: Reservation,
     res_open: bool,
+    /// The first RECORD seq the reservation stamped (`position +
+    /// seq_offset`): with `res.len` it is the window's [`SeqSpan`] — the
+    /// domain the failed-write rollback addresses the overlay in (review
+    /// round 3, Issue 20). `res` stays the position domain for the hole.
+    seq_base: u64,
     /// First-touch pre-images for the §4.4 pt 4 seq-conditional rollback
     /// the lane runs if the write fails.
     undo: Vec<UndoKey>,
@@ -15744,7 +15752,7 @@ impl KvMetaBackend {
         // §4.7 heap admission: whether this pass already spent its ONE
         // checkpoint cycle trying to return budget for a refused member.
         let mut cycled_for_space = false;
-        let (res, undo, failed) = loop {
+        let (res, seq_base, undo, failed) = loop {
             attempt += 1;
             if attempt > COMMIT_RETRY_BUDGET {
                 let adm = s.admission.take().expect("admission held until reserve");
@@ -15971,10 +15979,16 @@ impl KvMetaBackend {
             // fails alone; the batch survives (§5.5 isolation).
             let mut failed: Vec<(usize, KvError)> = Vec::new();
             let poison = TEST_CONVEYOR_POISON_APPLY_INO.load(Ordering::Relaxed);
+            // Two cursors, two domains: the member's POSITION (its entry
+            // floor, the hole arithmetic) and its STAMPED span (the
+            // overlay's address — Issue 20).
             let mut seq_cursor = res.start;
+            let mut stamp_cursor = seq_base;
             for (qi, (q, entry_leaves)) in s.entries.iter().zip(&leaves).enumerate() {
                 let entry_start = seq_cursor;
                 seq_cursor += q.len;
+                let member_span = SeqSpan::stamped(stamp_cursor, q.len);
+                stamp_cursor += q.len;
                 let mut apply_err: Option<KvError> = None;
                 for node in &lock_set {
                     let group: Vec<OwnedRec> = q
@@ -16038,12 +16052,7 @@ impl KvMetaBackend {
                             .iter()
                             .position(|n| n.addr() == leaf.addr())
                             .expect("leaf is locked");
-                        leaf.remove_overlay_records_locked(
-                            &mut guards[gi],
-                            &r.key,
-                            entry_start,
-                            entry_start + q.len,
-                        );
+                        leaf.remove_overlay_records_locked(&mut guards[gi], &r.key, member_span);
                     }
                     failed.push((qi, e));
                 }
@@ -16082,7 +16091,7 @@ impl KvMetaBackend {
                 // RAM apply pay O(delta) — the K7 create-row cliff.
                 self.ckpt_wake.notify_one();
             }
-            break (res, undo, failed);
+            break (res, seq_base, undo, failed);
         };
         meta_txpass_phase_record(MetaTxPassPhase::PassLeafLocks, t_locks, &s.traced);
         crate::fuse_client::lock_phase_record(
@@ -16140,6 +16149,7 @@ impl KvMetaBackend {
             failed,
             res,
             res_open: true,
+            seq_base,
             undo,
             write: Some(write),
             t_pass: s.t_pass,
@@ -16285,8 +16295,12 @@ impl KvMetaBackend {
                     // other same-key writer is still excluded by the DLM
                     // guards this window's entries hold), skip-if-newer
                     // being precisely LWW-correct for those.
-                    self.rollback_failed_tx(w.res.start, w.res.end(), &w.undo, &w.ring)
-                        .await;
+                    self.rollback_failed_tx(
+                        SeqSpan::stamped(w.seq_base, w.res.len),
+                        &w.undo,
+                        &w.ring,
+                    )
+                    .await;
                     self.note_journal_failure();
                     // The reserved range is now a PERMANENT hole in the
                     // ring (§4.1 discovery loses same-page successors of a
@@ -16863,13 +16877,16 @@ impl KvMetaBackend {
     /// after rollback), so dependent readers and same-key `Put` writers
     /// stay excluded throughout — §4.4 pt 4's exactness argument.
     ///
-    /// `ring` is the ring the failed window reserved in: `lo`/`hi` are
-    /// positions in it, and the compensation is journaled into IT —
-    /// compensation is CONTENT of the window's appender region, and one
-    /// key lives in one ring (KD-SYM-4); in the manager's ring it would
-    /// be the `Lease` violation the next mount refuses on (review round
-    /// 1, Issue 3). On a flat volume this is the one ring there is.
-    async fn rollback_failed_tx(&self, lo: u64, hi: u64, undo: &[UndoKey], ring: &JournalRing) {
+    /// `ring` is the ring the failed window reserved in and `span` the
+    /// window's STAMPED record-seq span (`SeqSpan::stamped(seq_base,
+    /// len)` — never the position range: on a ring whose `seq_offset > 0`
+    /// the two differ and a position-addressed removal removed nothing,
+    /// review round 3 Issue 20); the compensation is journaled into that
+    /// ring — compensation is CONTENT of the window's appender region,
+    /// and one key lives in one ring (KD-SYM-4); in the manager's ring it
+    /// would be the `Lease` violation the next mount refuses on (review
+    /// round 1, Issue 3). On a flat volume this is the one ring there is.
+    async fn rollback_failed_tx(&self, span: SeqSpan, undo: &[UndoKey], ring: &JournalRing) {
         // Phase 1: removal under re-acquired ascending locks.
         let mut comp: Vec<(u8, Vec<u8>, RecordKind, Bytes)> = Vec::new();
         for attempt in 0..COMMIT_RETRY_BUDGET {
@@ -16923,11 +16940,11 @@ impl KvMetaBackend {
                     .iter()
                     .position(|n| n.addr() == leaf.addr())
                     .expect("leaf is locked");
-                leaf.remove_overlay_records_locked(&mut guards[gi], &u.key, lo, hi);
+                leaf.remove_overlay_records_locked(&mut guards[gi], &u.key, span);
                 // Seq-conditional probe: did any of this tx's records
                 // escape the open overlay?
                 if let Some(newest) = leaf.snapshot().newest_record_seq(&u.key) {
-                    if newest >= lo && newest < hi {
+                    if span.contains(newest) {
                         let (kind, value) = match &u.pre {
                             LiveLookup::Live(v) => (RecordKind::Put, Bytes::copy_from_slice(v)),
                             LiveLookup::Tombstone | LiveLookup::Absent => {

@@ -1893,6 +1893,113 @@ async fn a_release_from_the_quieter_ring_clears_its_window_in_one_cycle() {
     shutdown(&routed).await;
 }
 
+/// **Issue 24 (round 3): a first-touch acquire never parks for ring space
+/// under `manager_verbs`.** With the cadence parked and ring 0's user
+/// window exhausted, a first-touch commit's door acquire PARKS at ring
+/// admission; the checkpoint task's grant verb (the cadence refill, the
+/// flush pass's reactive refill) must still get the verb mutex — before
+/// the fix the acquire parked HOLDING it, the cycle that would have freed
+/// the ring blocked behind it, and the D1.b escalation was the only exit.
+/// After the fix the grant verb answers within the bound, a checkpoint
+/// frees the ring and every parked commit — the first touch included —
+/// lands.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_first_touch_acquire_parked_for_ring_space_never_holds_the_verb_mutex() {
+    struct Cleanup;
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            std::env::remove_var("SQUEEZEFS_META_FLUSH_INTERVAL_MS");
+        }
+    }
+    let _cleanup = Cleanup;
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    let uris = vec![format_stamped_member(dir.path(), "meta0").await];
+    // The cadence parked: nothing but the test advances the ring's tail.
+    std::env::set_var("SQUEEZEFS_META_FLUSH_INTERVAL_MS", "60000");
+    let routed = open_under(&uris, &Knobs::armed().partition(PARTITION)).await;
+    let vol = Arc::clone(&routed.volumes[0]);
+    // Fill ring 0's USER window: 16 KiB xattr values on the root (native
+    // slot → ring 0) until a committer PARKS at admission.
+    let value = vec![0xA5u8; 16 * 1024];
+    let stalls0 = vol.journal_full_stalls();
+    let mut fillers = Vec::new();
+    let mut n = 0;
+    while vol.journal_full_stalls() == stalls0 {
+        n += 1;
+        assert!(n < 400, "the ring never filled");
+        let routed = Arc::clone(&routed);
+        let value = value.clone();
+        let name = format!("user.fill{n}");
+        fillers.push(tokio::spawn(async move {
+            routed.setxattr(ROOT_INO, &name, &value).await
+        }));
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+        if n > 2 && vol.journal_full_stalls() == stalls0 {
+            // Give the conveyor a moment to admit or stall the batch.
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    }
+    // The parked batch leaves the user window ALMOST full — the acquire's
+    // control entry is a few hundred bytes: take the remainder as held
+    // (never reserved) admissions so even that entry cannot be admitted.
+    let ring0 = vol.journal_ring();
+    let mut held = Vec::new();
+    while let Some(adm) = ring0.try_admit(
+        64,
+        squeezefs::meta_backend::kv::journal_core::AdmissionClass::User,
+    ) {
+        held.push(adm);
+        assert!(held.len() < 1 << 16, "the user window never exhausted");
+    }
+    let stalls1 = vol.journal_full_stalls();
+    // A first touch of a slot with no lease: its acquire needs a ring-0
+    // control entry — it must PARK for space (a user commit's law)…
+    let tag = volume_tag("vol-0000000000000024");
+    let fresh: ForestSlot = 300;
+    let owner = ino_in_slot(fresh, 7);
+    let first_touch = {
+        let vol = Arc::clone(&vol);
+        tokio::spawn(async move { vol.commit_block_refs(owner, &refs(tag, owner, 1, 1)).await })
+    };
+    while vol.journal_full_stalls() == stalls1 {
+        assert!(
+            !first_touch.is_finished(),
+            "the first touch cannot land on a full ring"
+        );
+        tokio::task::yield_now().await;
+    }
+    // … and while it parks, the checkpoint task's GRANT VERB (driven here
+    // as the task would) must still be served: the verb mutex is free.
+    let grant = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        vol.manager_extent_grant(1, 8),
+    )
+    .await;
+    assert!(
+        grant.is_ok(),
+        "the grant verb blocked behind a parked first-touch acquire — the verb mutex was held \
+         across a ring-space park (the lock-order inversion the D1.b fail-stop resolves)"
+    );
+    // The test plays the tick: the held budget returns, one covering cycle
+    // frees the ring; every parked commit — the first touch included —
+    // lands.
+    for adm in held {
+        ring0.core().release(adm);
+    }
+    vol.checkpoint_now().await.unwrap();
+    for f in fillers {
+        f.await.unwrap().unwrap();
+    }
+    first_touch.await.unwrap().unwrap();
+    assert!(vol.slot_leases().unwrap().gate.is_leased(fresh));
+    assert_eq!(vol.block_ref_count(tag, 1).await.unwrap(), 1);
+    assert!(!vol.is_failed(), "never the D1.b fail-stop");
+    shutdown(&routed).await;
+}
+
 // ---------------------------------------------------------------------------
 // §5.3.4 rows 5–8 — the handover's crash windows through the seams.
 // ---------------------------------------------------------------------------

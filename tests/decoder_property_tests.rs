@@ -62,6 +62,11 @@ use squeezefs::meta_backend::kv::slot_state::{
 use squeezefs::meta_backend::kv::superblock::{ExtentRef, SuperblockV3};
 use squeezefs::meta_backend::kv::tree::RootPtr;
 use squeezefs::meta_backend::GUEST_NS_SHIFT;
+use squeezefs::meta_ship::manager::{
+    decode_reply as decode_manager_reply, decode_request as decode_manager_request,
+    encode_reply as encode_manager_reply, encode_request as encode_manager_request, ManagerCall,
+    ManagerReply, ManagerReplyFrame, ManagerRequestFrame, WireIdentity, MANAGER_SCHEMA,
+};
 use squeezefs::meta_ship::publish::{
     decode_reply_frame, decode_request_frame, encode_reply_frame, encode_request_frame,
     PublishCall, PublishCallOutcome, PublishReply, PublishReplyFrame, PublishRequestFrame,
@@ -750,6 +755,25 @@ proptest! {
         }
     }
 
+    /// The symmetric manager's frames (design-symmetric-metadata §6.3,
+    /// `MANAGER_SCHEMA` 1 under `CLUSTER_WIRE_SCHEMA` 5 — a joiner's bytes
+    /// at the node holding the manager lease, and the manager's bytes at
+    /// every appender) are total over arbitrary bytes, and whatever
+    /// decodes re-encodes canonically to an equal frame.
+    #[test]
+    fn manager_call_decoders_never_panic(data in prop::collection::vec(any::<u8>(), 0..512)) {
+        if let Ok(f) = decode_manager_request(&data) {
+            let re = encode_manager_request(&f).expect("an accepted request frame re-encodes");
+            prop_assert_eq!(decode_manager_request(&re).expect("re-decodes"), f);
+            prop_assert_eq!(encode_manager_request(&decode_manager_request(&re).unwrap()).unwrap(), re);
+        }
+        if let Ok(f) = decode_manager_reply(&data) {
+            let re = encode_manager_reply(&f).expect("an accepted reply frame re-encodes");
+            prop_assert_eq!(decode_manager_reply(&re).expect("re-decodes"), f);
+            prop_assert_eq!(encode_manager_reply(&decode_manager_reply(&re).unwrap()).unwrap(), re);
+        }
+    }
+
     /// The cluster wire's `RpcFrame` reader (every distributed plane's
     /// transport) and the S8 verb-body decoders are total over an
     /// arbitrary byte STREAM under every class cap; an arbitrary tag never
@@ -982,6 +1006,31 @@ proptest! {
         prop_assert_eq!(decode_request_frame(&enc).expect("decodes"), frame);
     }
 
+    /// Every `ManagerCall` — `JoinAppender` with its KD-MW-2 identity,
+    /// `ExtentGrant`, `ReturnExtents` with its runs — round-trips through
+    /// the bounded codec inside a request frame.
+    #[test]
+    fn manager_request_frame_round_trips(
+        request_id in any::<u64>(),
+        call in arb_manager_call(),
+    ) {
+        let frame = ManagerRequestFrame { schema: MANAGER_SCHEMA, request_id, call };
+        let enc = encode_manager_request(&frame).expect("encodes");
+        prop_assert_eq!(decode_manager_request(&enc).expect("decodes"), frame);
+    }
+
+    /// Every `ManagerReply` — `Joined` (page, ring table, grant, `already`),
+    /// `Granted`, `Returned { cleared, already }`, `Refused` — round-trips.
+    #[test]
+    fn manager_reply_frame_round_trips(
+        request_id in any::<u64>(),
+        reply in arb_manager_reply(),
+    ) {
+        let frame = ManagerReplyFrame { schema: MANAGER_SCHEMA, request_id, reply };
+        let enc = encode_manager_reply(&frame).expect("encodes");
+        prop_assert_eq!(decode_manager_reply(&enc).expect("decodes"), frame);
+    }
+
     /// A publish reply frame round-trips one outcome per call, `MapMigrated
     /// { recomputed, gen, … }` included, plus its lane-free notices.
     #[test]
@@ -1047,6 +1096,58 @@ proptest! {
         let enc = encode_reclaim(&f).expect("encodes");
         prop_assert_eq!(decode_reclaim(&enc).expect("decodes"), f);
     }
+}
+
+// ---------------------------------------------------------------------------
+// manager-wire generators (design-symmetric-metadata §6.3)
+// ---------------------------------------------------------------------------
+
+fn arb_runs() -> impl Strategy<Value = Vec<(u64, u32)>> {
+    prop::collection::vec((any::<u64>(), any::<u32>()), 0..6)
+}
+
+fn arb_manager_call() -> impl Strategy<Value = ManagerCall> {
+    prop_oneof![
+        (any::<u64>(), any::<u32>(), any::<u128>(), any::<u64>()).prop_map(
+            |(node_token, mount_slot, writer_id, ring_want_bytes)| ManagerCall::JoinAppender {
+                identity: WireIdentity {
+                    node_token,
+                    mount_slot,
+                    writer_id,
+                },
+                ring_want_bytes,
+            }
+        ),
+        (any::<u32>(), any::<u32>())
+            .prop_map(|(appender_id, want)| ManagerCall::ExtentGrant { appender_id, want }),
+        (any::<u32>(), arb_runs())
+            .prop_map(|(appender_id, runs)| ManagerCall::ReturnExtents { appender_id, runs }),
+    ]
+}
+
+fn arb_manager_reply() -> impl Strategy<Value = ManagerReply> {
+    prop_oneof![
+        (
+            any::<u32>(),
+            any::<u64>(),
+            prop::collection::vec((any::<u64>(), any::<u64>()), 0..9),
+            arb_runs(),
+            any::<bool>(),
+        )
+            .prop_map(|(appender_id, page_addr, ring_segments, grant, already)| {
+                ManagerReply::Joined {
+                    appender_id,
+                    page_addr,
+                    ring_segments,
+                    grant,
+                    already,
+                }
+            }),
+        arb_runs().prop_map(|runs| ManagerReply::Granted { runs }),
+        (any::<u64>(), any::<u64>())
+            .prop_map(|(cleared, already)| ManagerReply::Returned { cleared, already }),
+        "[ -~]{0,64}".prop_map(|reason| ManagerReply::Refused { reason }),
+    ]
 }
 
 // ---------------------------------------------------------------------------

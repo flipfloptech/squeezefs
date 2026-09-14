@@ -148,6 +148,13 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "manager_call_frame"
+path = "fuzz_targets/manager_call_frame.rs"
+test = false
+doc = false
+bench = false
+
 # --- IPC shared memfd ------------------------------------------------------
 
 [[bin]]

@@ -2437,7 +2437,17 @@ impl KvMetaBackend {
         let be = Self {
             path: path.to_path_buf(),
             sb,
-            checkpoint_seq: AtomicU64::new(ledger.seq),
+            // DUR-4's resume law, made true here: the bitmap's newest page
+            // generation can exceed the ledger's seq — a failed cycle's
+            // raise, a cycle that wrote its pages and died before its
+            // ledger record, or (PR 2) the leave's consumed seq, which no
+            // ledger record carries — and resuming from the ledger alone
+            // made the first bitmap write of the next mount TIE that copy
+            // and take the loud raise on every clean partitioned remount
+            // (review round 2, Issue 18). Ledger slots are `seq % 32`, so
+            // the gap the max opens is harmless; on a flat volume the two
+            // agree except after a genuine failed-cycle raise.
+            checkpoint_seq: AtomicU64::new(ledger.seq.max(alloc.resume_generation())),
             last_ledger_tail: AtomicU64::new(ledger.journal_tail_seq),
             // PR VL5a (§5.5.1a): seed the live stamp from the mounted
             // record — every checkpoint re-writes it, so a slot-mapped
@@ -2802,7 +2812,13 @@ impl KvMetaBackend {
                 continue;
             }
             r.growing.store(true, Ordering::SeqCst);
-            if r.passes_inside.load(Ordering::SeqCst) != 0 {
+            // A pass inside the region's window, or a stage-B window not
+            // yet at its terminal outcome (its reservation may be closed
+            // while its §4.4 pt 4 compensation is still to reserve on the
+            // ring it holds): the ring is not this cycle's to replace.
+            if r.passes_inside.load(Ordering::SeqCst) != 0
+                || r.windows_inflight.load(Ordering::SeqCst) != 0
+            {
                 r.end_growth();
                 continue;
             }
@@ -3083,22 +3099,24 @@ impl KvMetaBackend {
 
     /// The flush-ceiling audit of one cycle (KD-SYM-10, §5.7.3: "every
     /// dirty leaf … is flushed and barriered within `CHECKPOINT_MAX_AGE_MS`"):
-    /// `had_dirty` names the regions whose leaves were dirty when the
-    /// flush pass began, each with its OLDEST leaf's dirty-since instant
-    /// (CLOCK_MONOTONIC ns); `now_ns` is the covering barrier's
-    /// completion. The audited quantity is the leaf's AGE at the barrier
-    /// — record → durable — which under the default cadence is up to one
-    /// tick of waiting plus the pass; the pass wall alone (the first PR-2
-    /// build) read 0 for every violation up to ≈ 2× the bound. Past the
-    /// ceiling each such region is one overrun (must-stay-0), logged.
+    /// `had_dirty` names the regions whose STAMPED leaves (a slot tree's)
+    /// were dirty when the flush pass began, each with its OLDEST leaf's
+    /// dirty-since instant (CLOCK_MONOTONIC ns); `now_ns` is the covering
+    /// barrier's completion. The audited quantity is the leaf's AGE at the
+    /// barrier — record → durable — against the LANDING ceiling of the
+    /// cadence in force (`AppenderSet::flush_ceiling_ms`; the trigger
+    /// alone, the round-2 build, read a healthy mount as overrunning by
+    /// the pass; the pass wall alone, the round-1 build, read 0 for every
+    /// violation up to ≈ 2× the bound). Past the ceiling each such region
+    /// is one overrun (must-stay-0), logged.
     pub(super) fn note_flush_ceiling(&self, had_dirty: &[(u32, u64)], now_ns: u64) {
         let Some(set) = self.appenders.as_ref() else {
             return;
         };
-        let ceiling_ns = super::appender::appender_flush_ceiling_ms() * 1_000_000;
+        let ceiling_ns = set.flush_ceiling_ms * 1_000_000;
         let over: Vec<(u32, u64)> = had_dirty
             .iter()
-            .filter(|(_, since)| *since != 0 && now_ns.saturating_sub(*since) > ceiling_ns)
+            .filter(|(_, since)| now_ns.saturating_sub(*since) > ceiling_ns)
             .map(|(r, since)| (*r, now_ns.saturating_sub(*since) / 1_000_000))
             .collect();
         if over.is_empty() {
@@ -3108,10 +3126,10 @@ impl KvMetaBackend {
             .fetch_add(over.len() as u64, Ordering::Relaxed);
         log::warn!(
             "meta volume {}: flush ceiling OVERRUN — appender region(s) {over:?} (id, oldest \
-             dirty leaf's age in ms at the covering barrier) exceeded the {} ms ceiling \
-             (appender_flush_ceiling_overruns, must stay 0)",
+             dirty leaf's age in ms at the covering barrier) exceeded the {} ms landing \
+             ceiling (appender_flush_ceiling_overruns, must stay 0)",
             self.path.display(),
-            super::appender::appender_flush_ceiling_ms()
+            set.flush_ceiling_ms
         );
     }
 
@@ -9847,6 +9865,9 @@ impl KvMetaBackend {
             pressure_cycles: AtomicU64::new(0),
             joined: AtomicBool::new(false),
             join_refusal,
+            flush_ceiling_ms: super::appender::appender_flush_ceiling_ms(
+                crate::meta_backend::resolve_flush_interval_ms(),
+            ),
         };
         let mut regions: Vec<Arc<AppenderRegion>> = Vec::new();
 
@@ -9892,6 +9913,7 @@ impl KvMetaBackend {
             ring_grows: AtomicU64::new(0),
             pending_reclaim: std::sync::Mutex::new(Vec::new()),
             passes_inside: std::sync::atomic::AtomicUsize::new(0),
+            windows_inflight: std::sync::atomic::AtomicUsize::new(0),
             growing: AtomicBool::new(false),
             growth_done: squeezefs_ipc::sqz_notify::Notify::new(),
             dir_named: std::sync::atomic::AtomicU8::new(dir_named0),
@@ -10033,6 +10055,7 @@ impl KvMetaBackend {
                 ring_grows: AtomicU64::new(0),
                 pending_reclaim: std::sync::Mutex::new(Vec::new()),
                 passes_inside: std::sync::atomic::AtomicUsize::new(0),
+                windows_inflight: std::sync::atomic::AtomicUsize::new(0),
                 growing: AtomicBool::new(false),
                 growth_done: squeezefs_ipc::sqz_notify::Notify::new(),
                 dir_named: std::sync::atomic::AtomicU8::new(dir_named),
@@ -10922,10 +10945,36 @@ impl KvMetaBackend {
         if w.res_open {
             w.ring.complete(&w.res);
         }
+        self.region_window_settled(w.region);
         for q in w.entries {
             let _ = q.done.send(Err(KvError::Io(self.eio(why))));
         }
         super::note_window_done();
+    }
+
+    /// A stage-B window of `region` came into being (the pass's handoff).
+    fn region_window_opened(&self, region: u32) {
+        if let Some(r) = self.declared_region(region) {
+            r.windows_inflight.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    /// A stage-B window of `region` reached its terminal outcome (acked,
+    /// rolled back and compensated, or abandoned) — its ring may be
+    /// replaced from here.
+    fn region_window_settled(&self, region: u32) {
+        if let Some(r) = self.declared_region(region) {
+            r.windows_inflight.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+
+    /// Region `region` if it is a DECLARED one (≥ 1 — region 0's fixed
+    /// ring never grows, so it keeps no window count).
+    fn declared_region(&self, region: u32) -> Option<&Arc<super::appender::AppenderRegion>> {
+        self.appenders
+            .as_ref()
+            .and_then(|a| a.region(region))
+            .filter(|r| r.id != 0)
     }
 
     /// **Stage B — the per-volume durability lane** (D-2; module docs "The
@@ -11582,6 +11631,15 @@ impl KvMetaBackend {
         let res = s.reservation.take().expect("reservation registered");
         let entries = std::mem::take(&mut s.entries);
         s.applied_unrolled = false;
+        // The window counts against its region's ring GROWTH from here to
+        // its terminal outcome (`region_window_settled`) — announced while
+        // the pass is still inside the region's Dekker window, so growth
+        // that saw `passes_inside == 0` sees this instead. Its reservation
+        // covers the ring until the lane completes it (step 8); the count
+        // covers the stage-B tail past that point — the §4.4 pt 4
+        // compensation reserves on the ring the window holds (review
+        // round 2, Issue 23).
+        self.region_window_opened(s.region);
         s.window = Some(ConveyorWindow {
             ring: Arc::clone(&s.ring),
             region: s.region,
@@ -11843,6 +11901,7 @@ impl KvMetaBackend {
                 };
                 s.outcomes.push((q, outcome));
             }
+            self.region_window_settled(w.region);
             super::note_window_done();
         }
         std::mem::take(&mut s.outcomes)

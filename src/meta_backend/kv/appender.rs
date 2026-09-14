@@ -1006,11 +1006,21 @@ pub fn page_slot_offsets(
 
 /// The per-appender FLUSH CEILING, ms (KD-SYM-10, §5.7.3): every dirty
 /// leaf of every slot tree an appender leases is flushed — bset appended
-/// and barriered — within this many ms. It IS the checkpoint cadence
-/// ceiling (`CHECKPOINT_MAX_AGE_MS`), stated once; the reader's landing
-/// ceiling adds its tick terms on top of it, never the other way round.
-pub fn appender_flush_ceiling_ms() -> u64 {
-    super::checkpoint::CHECKPOINT_MAX_AGE_MS as u64
+/// and barriered — within this many ms of the record that dirtied it. It
+/// is the checkpoint LANDING ceiling of the cadence in force
+/// (`checkpoint_landing_ceiling_ms`: `CHECKPOINT_MAX_AGE_MS` + two tick
+/// periods — 1,100 ms at the shipped 50 ms flush), the ONE derivation the
+/// reader's qualify term already rests on: KD-SYM-10's "within
+/// `CHECKPOINT_MAX_AGE_MS`" names the cadence TRIGGER, which the tick
+/// fires AT (`elapsed ≥ ceiling`), so a leaf dirtied ε after a checkpoint
+/// is `trigger + pass − ε` old at its covering barrier and the trigger
+/// alone reads a healthy mount as overrunning (review round 2, Issue 22:
+/// 3 overruns in 3.5 s of a steady stream, ages 1,013–1,060 ms). The
+/// two tick terms are the tick wait and the bounded maintenance drain
+/// that precedes the decision in the same tick; the pass's own device
+/// time is what the audit MEASURES against them.
+pub fn appender_flush_ceiling_ms(flush_interval_ms: u64) -> u64 {
+    super::checkpoint::checkpoint_landing_ceiling_ms(flush_interval_ms)
 }
 
 /// `SQUEEZEFS_TEST_SYM_APPENDER_SLOTS` — the PR-2 declared static
@@ -1108,6 +1118,13 @@ pub struct AppenderRegion {
     /// Dekker pair with `growing` — growth never swaps a ring a pass is
     /// reserving on).
     pub passes_inside: std::sync::atomic::AtomicUsize,
+    /// Stage-B windows of this region between their handoff and their
+    /// terminal outcome — counted against growth beside `passes_inside`:
+    /// a window's reservation is completed BEFORE its §4.4 pt 4 rollback
+    /// runs, and the rollback's compensation reserves on the ring the
+    /// window holds, so `drained` alone would let growth swap that ring
+    /// out from under it (review round 2, Issue 23).
+    pub windows_inflight: std::sync::atomic::AtomicUsize,
     pub growing: std::sync::atomic::AtomicBool,
     /// Woken (`notify_waiters`) when `growing` clears — the pass side
     /// parks on it instead of polling (no poll period to derive).
@@ -1176,6 +1193,9 @@ pub struct AppenderSet {
     /// Deferred to the join so the D0 claim gate classifies the volume's
     /// holder first and non-joining Writer opens are never blocked.
     pub join_refusal: Option<String>,
+    /// [`appender_flush_ceiling_ms`] of the flush interval in force at
+    /// open (the backend-knob convention: resolved once, never per cycle).
+    pub flush_ceiling_ms: u64,
 }
 
 impl AppenderSet {
@@ -1300,7 +1320,7 @@ impl AppenderSet {
             ring_segments: self.ring_segments(),
             ring_grows: self.ring_grows(),
             flush_ceiling_overruns: self.flush_ceiling_overruns.load(Relaxed),
-            flush_ceiling_ms: appender_flush_ceiling_ms(),
+            flush_ceiling_ms: self.flush_ceiling_ms,
             pressure_cycles: self.pressure_cycles.load(Relaxed),
             regions: self
                 .regions

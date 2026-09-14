@@ -1562,11 +1562,15 @@ impl KvMetaBackend {
         self.node_cache().for_each_node(|n| {
             if n.dirty_floor() != u64::MAX && !n.state().is_superseded() {
                 if region_aware && n.level() == 0 {
-                    let r = self.region_of_node(n);
+                    // Only STAMPED leaves are the audit's subjects (a slot
+                    // tree's; tree 0's leaf carries no stamp and no age).
                     let since = n.dirty_since_ns();
-                    match had_dirty.iter_mut().find(|(id, _)| *id == r) {
-                        Some((_, oldest)) => *oldest = (*oldest).min(since),
-                        None => had_dirty.push((r, since)),
+                    if since != 0 {
+                        let r = self.region_of_node(n);
+                        match had_dirty.iter_mut().find(|(id, _)| *id == r) {
+                            Some((_, oldest)) => *oldest = (*oldest).min(since),
+                            None => had_dirty.push((r, since)),
+                        }
                     }
                 }
                 dirty.push(Arc::clone(n));

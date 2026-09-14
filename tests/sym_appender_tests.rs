@@ -861,7 +861,9 @@ use squeezefs::meta_backend::kv::backend::{
 };
 use squeezefs::meta_backend::kv::block_refs::{volume_tag, BlockRef, BlockRefOp};
 use squeezefs::meta_backend::kv::builder::{digest_backend, format_v3_stamped, FormatV3Options};
-use squeezefs::meta_backend::kv::checkpoint::read_newest_ledger;
+use squeezefs::meta_backend::kv::checkpoint::{
+    checkpoint_landing_ceiling_ms, checkpoint_tick_period_ms, read_newest_ledger,
+};
 use squeezefs::meta_backend::kv::node::{write_node, NodeLayout, NodeWriteParams, MIN_NODE_SIZE};
 use squeezefs::meta_backend::kv::node_cache::{
     NodeCache, NodeCacheConfig, OwnedRec, DEFAULT_WRITEBACK_DELTA_BYTES,
@@ -1598,11 +1600,23 @@ async fn a_stalled_appender_ring_grows_a_segment_and_its_content_survives() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_flush_ceiling_is_the_checkpoint_age_and_a_parked_device_moves_the_overrun_counter() {
-    assert_eq!(
-        appender_flush_ceiling_ms(),
-        CHECKPOINT_MAX_AGE_MS as u64,
-        "KD-SYM-10: the ceiling IS the checkpoint cadence ceiling"
-    );
+    // KD-SYM-10's "within CHECKPOINT_MAX_AGE_MS" names the cadence
+    // TRIGGER; a leaf is durable one LANDING later (the trigger plus the
+    // two tick-granularity terms the reader's qualify term already
+    // derives), so the audit's ceiling IS that derivation — at the shipped
+    // 50 ms flush, 1,100 ms; on a parked cadence, the parked tick's.
+    for interval in [0u64, 50, 200, 60_000] {
+        assert_eq!(
+            appender_flush_ceiling_ms(interval),
+            checkpoint_landing_ceiling_ms(interval),
+            "the flush ceiling is the checkpoint LANDING ceiling of the cadence in force"
+        );
+        assert_eq!(
+            appender_flush_ceiling_ms(interval),
+            CHECKPOINT_MAX_AGE_MS as u64 + 2 * checkpoint_tick_period_ms(interval)
+        );
+    }
+    assert_eq!(appender_flush_ceiling_ms(50), 1_100);
     let dir = tempfile::tempdir().unwrap();
     let _g = SEAM.lock().await;
     let uris = vec![format_stamped_member(dir.path(), "meta0").await];
@@ -1624,7 +1638,11 @@ async fn the_flush_ceiling_is_the_checkpoint_age_and_a_parked_device_moves_the_o
     // ceiling while a dirty leaf waited on it (the ceiling in force is the
     // default cadence's; the gauge publishes it).
     let ceiling = stats(&va).flush_ceiling_ms;
-    assert_eq!(ceiling, appender_flush_ceiling_ms());
+    assert_eq!(
+        ceiling,
+        appender_flush_ceiling_ms(50),
+        "the default cadence's landing ceiling"
+    );
     let park = std::time::Duration::from_millis(ceiling + 400);
     squeezefs::uring_fs::arm_device_latency(&path, std::time::Duration::ZERO, park);
     ra.create(ROOT_INO, "late", libc::S_IFREG | 0o644, 0, 0)

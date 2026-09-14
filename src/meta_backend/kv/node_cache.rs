@@ -1425,7 +1425,8 @@ pub struct CachedNode {
     /// CLOCK_MONOTONIC ns at this node's last clean → dirty transition
     /// (KD-SYM-10's subject: the AGE of a dirty leaf, measured from the
     /// record that dirtied it, not from the flush pass that finds it).
-    /// Stale once the floor is taken — read only beside a live floor.
+    /// Stamped on forest-slot nodes only (0 for ever on a flat volume);
+    /// stale once the floor is taken — read only beside a live floor.
     dirty_since_ns: AtomicU64,
     /// PR M9 (§5.7): the owning cache's budget gauge — handed to every
     /// snapshot's [`FoldMemo`] and the open delta's charge accounting so
@@ -1711,7 +1712,12 @@ impl CachedNode {
         // entry start is the coverage target either way.
         if !records.is_empty() {
             let prev = self.dirty_floor.fetch_min(floor, Ordering::AcqRel);
-            if prev == u64::MAX {
+            // The leaf-age stamp is the forest-only flush-ceiling audit's
+            // input; a node of no forest slot — every node of a bit-17-
+            // absent volume, tree 0's, the interior — reads no clock here
+            // (nothing before PR 14 changes a flat mount; review round 2,
+            // Issue 24).
+            if prev == u64::MAX && self.forest_slot.load(Ordering::Relaxed) != u32::MAX {
                 self.dirty_since_ns
                     .store(crate::mono_core::monotonic_ns_u64(), Ordering::Release);
             }

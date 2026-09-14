@@ -2479,6 +2479,21 @@ fn sym_appender_ring_derives_from_the_reserve_and_the_solo_ring() {
         }
         other => panic!("SQUEEZEFS_SYM_RING_KB must be Int, got {other:?}"),
     }
-    // KD-SYM-10: the flush ceiling is the checkpoint cadence ceiling.
-    assert_eq!(appender_flush_ceiling_ms(), CHECKPOINT_MAX_AGE_MS as u64);
+    // KD-SYM-10: the flush ceiling is the checkpoint LANDING ceiling of the
+    // cadence in force — the trigger plus the two tick-granularity terms
+    // the reader's qualify term derives (review round 2, Issue 22: the
+    // trigger alone is what the tick fires AT, so a healthy mount's leaves
+    // land past it by the pass).
+    for interval in [0u64, 50, 5_000] {
+        assert_eq!(
+            appender_flush_ceiling_ms(interval),
+            squeezefs::meta_backend::kv::checkpoint::checkpoint_landing_ceiling_ms(interval)
+        );
+        assert!(appender_flush_ceiling_ms(interval) > CHECKPOINT_MAX_AGE_MS as u64);
+    }
+    assert_eq!(
+        appender_flush_ceiling_ms(50),
+        1_100,
+        "the shipped 50 ms flush"
+    );
 }

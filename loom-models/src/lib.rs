@@ -6882,14 +6882,27 @@ mod slot_lease_models {
     //! node cache's lease gate, the manager's lease table, the holder's
     //! flush-then-transfer.
     //!
+    //! **What each model is** (review round 2, Issue 19 — stated
+    //! honestly): models 1 and 5 model REAL memory orderings the product
+    //! relies on and are weakening-verified (the weakening named on each,
+    //! run red, then restored). Models 2–4 exercise the lease table's
+    //! state machine through its ONE interior mutex, so loom explores the
+    //! two serial orders of each pair of calls — they are serializability
+    //! PINS of the table's law (model 4 found the `Already`-for-any-`g ≥`
+    //! defect that way), not memory-ordering evidence, and are not
+    //! described as weakening-verified.
+    //!
     //! Model precondition (stated): a leaf's dirty set is guarded by the
     //! node's write lock in `node_cache.rs` (`SqzRwLock<NodeDirty>`); the
-    //! `loom::sync::Mutex` below stands in for it. What is under test is
+    //! `loom::sync::Mutex` below stands in for it. What model 1 tests is
     //! the ORDER the shipped code fixes around that lock: the committer
     //! reads the gate verdict inside `apply_locked` (under the lock), the
     //! departing holder raises `Releasing` before its flush takes the
     //! lock, so every record the committer lands is in the flush's
-    //! snapshot or was refused.
+    //! snapshot or was refused. Model 5 tests the DOOR's Dekker pair
+    //! (`LeaseGate::enter` vs `begin_release` + `inflight`): the two
+    //! `SeqCst` sides guarantee a commit that passed the door is drained
+    //! by the release before its flush, or parked at the door.
     use crate::slot_lease_core::{
         AcquireOutcome, CommitVerdict, LeaseGate, ReleaseOutcome, SlotLeaseTable, SlotWords,
     };
@@ -6898,6 +6911,58 @@ mod slot_lease_models {
     use loom::thread;
 
     const SLOT: u32 = 7;
+
+    /// §5.4.1's DOOR law (review round 2, Issue 6): a commit takes its
+    /// door token BEFORE it reads `releasing`; the release raises
+    /// `releasing` BEFORE it reads the token count. With both `SeqCst`
+    /// one side always sees the other: either the commit is parked at the
+    /// door (took no token) or the release observes its token and waits
+    /// — a commit that passed the door is never flushed around.
+    ///
+    /// Weakening evidence (verified RED 2026-09-14, then restored):
+    /// WITHOUT the two `SeqCst` fences (the sides' accesses `SeqCst` on
+    /// their own words — loom models them as acquire/release, the
+    /// `slot_gate_core` lesson) loom finds the schedule where the commit
+    /// passes (reads no bit) AND the release reads 0 tokens — the flush
+    /// snapshots without the commit and the commit lands afterwards.
+    /// The transient the model ALLOWS: a token counted while the door is
+    /// still deciding and then backed out — the release then waits for
+    /// the count to fall, which it does (`inflight` is 0 after the join).
+    #[test]
+    fn a_commit_that_passed_the_door_is_drained_by_the_release() {
+        loom::model(|| {
+            let gate = Arc::new(LeaseGate::with_namespace(8));
+            gate.arm();
+            gate.grant(SLOT);
+            let passed = Arc::new(AtomicBool::new(false));
+            let committer = {
+                let gate = Arc::clone(&gate);
+                let passed = Arc::clone(&passed);
+                thread::spawn(move || {
+                    if gate.enter(SLOT) {
+                        passed.store(true, Ordering::Release);
+                    }
+                })
+            };
+            // The release: Releasing, then read the door's count.
+            gate.begin_release(SLOT);
+            let tokens = gate.inflight(SLOT);
+            committer.join().unwrap();
+            if passed.load(Ordering::Acquire) {
+                assert_eq!(
+                    tokens, 1,
+                    "the commit passed the door but the release saw no token — the flush \
+                     would run around an admitted commit"
+                );
+                assert_eq!(gate.leave(SLOT), 0);
+            } else {
+                // A refused door leaves no token behind (the release may
+                // have read a transient 1 before the back-out — it waits).
+                assert!(tokens <= 1);
+                assert_eq!(gate.inflight(SLOT), 0, "a refused door leaves no token");
+            }
+        });
+    }
 
     /// §5.1.4's flush-then-transfer against a racing commit: the record
     /// either lands BEFORE the flush's snapshot (and is in it) or is

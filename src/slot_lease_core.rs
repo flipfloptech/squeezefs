@@ -42,17 +42,17 @@
 
 #[cfg(loom)]
 pub(crate) mod sync {
-    pub use loom::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+    pub use loom::sync::atomic::{fence, AtomicBool, AtomicU32, AtomicU64, Ordering};
     pub use loom::sync::{Mutex, MutexGuard};
 }
 #[cfg(not(loom))]
 pub(crate) mod sync {
-    pub use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+    pub use std::sync::atomic::{fence, AtomicBool, AtomicU32, AtomicU64, Ordering};
     pub use std::sync::{Mutex, MutexGuard};
 }
 
 use std::collections::{BTreeMap, BTreeSet};
-use sync::{AtomicBool, AtomicU32, AtomicU64, Mutex, MutexGuard, Ordering};
+use sync::{fence, AtomicBool, AtomicU32, AtomicU64, Mutex, MutexGuard, Ordering};
 
 /// A forest slot (`kv::record::ForestSlot`): 0 = the native slot, guest
 /// slot `s` = `s + 1`.
@@ -115,13 +115,16 @@ pub enum CommitVerdict {
 /// `inflight[slot]` counts the commits that passed the door for the slot
 /// and have not reached their terminal outcome. The door takes its
 /// token BEFORE it reads `releasing` and a release raises `releasing`
-/// BEFORE it reads the count — both `SeqCst`, the Dekker pair — so one of
-/// the two always sees the other: a commit that passed the door is
-/// drained by the release before its flush, and a commit that reads the
-/// bit parks at the door. The belt in `apply_locked` is then reached by
-/// NO legal schedule (`meta_kv_leaf_lease_refusals` keeps its must-stay-0
-/// meaning); before the tokens, every commit admitted between the door
-/// and the flush failed EINVAL on a legal schedule.
+/// BEFORE it reads the count — the Dekker pair, each side's two accesses
+/// separated by a `SeqCst` fence (the `slot_gate_core` idiom; loom models
+/// fences, and the pair is what `a_commit_that_passed_the_door_is_
+/// drained_by_the_release` weakens) — so one of the two always sees the
+/// other: a commit that passed the door is drained by the release before
+/// its flush, and a commit that reads the bit parks at the door. The
+/// belt in `apply_locked` is then reached by NO legal schedule
+/// (`meta_kv_leaf_lease_refusals` keeps its must-stay-0 meaning); before
+/// the tokens, every commit admitted between the door and the flush
+/// failed EINVAL on a legal schedule.
 #[derive(Debug)]
 pub struct LeaseGate {
     armed: AtomicBool,
@@ -165,9 +168,12 @@ impl LeaseGate {
     #[inline]
     pub fn enter(&self, slot: Slot) -> bool {
         let (w, bit) = Self::index(slot);
-        self.inflight[slot as usize].fetch_add(1, Ordering::SeqCst);
-        if self.releasing[w].load(Ordering::SeqCst) & bit != 0 {
-            self.inflight[slot as usize].fetch_sub(1, Ordering::SeqCst);
+        self.inflight[slot as usize].fetch_add(1, Ordering::AcqRel);
+        // Dekker fence #1: publish the token before probing the bit
+        // (pairs with `begin_release`'s).
+        fence(Ordering::SeqCst);
+        if self.releasing[w].load(Ordering::Acquire) & bit != 0 {
+            self.inflight[slot as usize].fetch_sub(1, Ordering::AcqRel);
             return false;
         }
         true
@@ -178,14 +184,15 @@ impl LeaseGate {
     /// drain.
     #[inline]
     pub fn leave(&self, slot: Slot) -> u32 {
-        self.inflight[slot as usize].fetch_sub(1, Ordering::SeqCst) - 1
+        self.inflight[slot as usize].fetch_sub(1, Ordering::AcqRel) - 1
     }
 
-    /// The door tokens out on `slot` (read `SeqCst` — the release's half
-    /// of the Dekker pair, after [`Self::begin_release`]).
+    /// The door tokens out on `slot` — the release's half of the Dekker
+    /// pair, read after [`Self::begin_release`] behind the pairing fence.
     #[inline]
     pub fn inflight(&self, slot: Slot) -> u32 {
-        self.inflight[slot as usize].load(Ordering::SeqCst)
+        fence(Ordering::SeqCst);
+        self.inflight[slot as usize].load(Ordering::Acquire)
     }
 
     /// Arm the gate: from here on a leaf mutation of a slot this mount
@@ -222,6 +229,9 @@ impl LeaseGate {
     pub fn begin_release(&self, slot: Slot) {
         let (w, bit) = Self::index(slot);
         self.releasing[w].fetch_or(bit, Ordering::SeqCst);
+        // Dekker fence #2: the bit is published before any read of the
+        // door's count (pairs with `enter`'s).
+        fence(Ordering::SeqCst);
     }
 
     /// A handover that did not complete (the manager refused the release,

@@ -2106,27 +2106,6 @@ impl RoutedMetaBackend {
         parked
     }
 
-    /// Join a pass to inos DISCOVERED MID-FLIGHT (rename/unlink legs
-    /// found under held guards): never parks — the cutover's drain waits
-    /// for the join instead (§5.5.2a's "ops already past the gate are
-    /// drained to terminal outcome").
-    pub(crate) fn slot_gate_join(&self, pass: &mut SlotGatePass, inos: &[Ino]) {
-        if self.gates.armed.load(std::sync::atomic::Ordering::Relaxed) == 0 {
-            return;
-        }
-        for &ino in inos {
-            let slot = self.slot_of_ino(ino);
-            if pass.entered.iter().any(|(s, _)| *s == slot) {
-                continue;
-            }
-            let Some(gate) = self.gates.map.read_sync(&slot, |_, v| v.clone()) else {
-                continue;
-            };
-            gate.join();
-            pass.entered.push((slot, gate));
-        }
-    }
-
     /// The per-ino xattr value cap — the largest inline xattr value
     /// `ino`'s volume can hold (design-cow-kv-metadata §5.3): the
     /// record-value cap `min(65_536, node_size/4)` (§4.2). A *non-trait*
@@ -3116,9 +3095,8 @@ impl Metadata for RoutedMetaBackend {
         // rename case: BOTH parents' slots checked before any 4a
         // acquisition (and before route derivation — a park can span a
         // flip), so a rename spanning the migrating slot parks WHOLE,
-        // holding zero guards. Children are discovered under the guards
-        // below and JOIN (never park) — the cutover drain waits for
-        // them.
+        // holding zero guards. The children's slots join after phase-1
+        // discovery (holding nothing — a park there is legal).
         let mut _gate = self.slot_gate_enter(&[old_parent, new_parent]).await;
         let (old_parent_v_idx, local_old_parent) = self.route_ino(old_parent);
         let (new_parent_v_idx, local_new_parent) = self.route_ino(new_parent);
@@ -3146,69 +3124,110 @@ impl Metadata for RoutedMetaBackend {
             None
         };
 
-        // Per-volume lock sets in ascending volume order, each internally
-        // canonical (I before D, stripe-deduped by lock_many). Interleaving
-        // classes across volumes descends the (volume, class) order and can
-        // ABBA against cross-volume unlink/link.
-        let mut _guards = Vec::new();
-        if old_parent_v_idx == new_parent_v_idx {
-            _guards.extend(
-                self.volumes[old_parent_v_idx]
-                    .dlm()
-                    .lock_many(
-                        &[
-                            (local_old_parent, dlm::LockMode::Exclusive),
-                            (local_new_parent, dlm::LockMode::Exclusive),
-                        ],
-                        &[
-                            (local_old_parent, old_name, dlm::LockMode::Exclusive),
-                            (local_new_parent, new_name, dlm::LockMode::Exclusive),
-                        ],
-                    )
-                    .await,
-            );
-        } else {
-            let mut sets = [
-                (old_parent_v_idx, local_old_parent, old_name),
-                (new_parent_v_idx, local_new_parent, new_name),
-            ];
-            sets.sort_unstable_by_key(|&(v, _, _)| v);
-            for (v_idx, local_p, name) in sets {
-                _guards.extend(
-                    self.volumes[v_idx]
-                        .dlm()
-                        .lock_many(
-                            &[(local_p, dlm::LockMode::Exclusive)],
-                            &[(local_p, name, dlm::LockMode::Exclusive)],
-                        )
-                        .await,
-                );
+        // **The rename lock set** (the lock law of `src/stripe_locks.rs`;
+        // PR 4 review round 2, Issue 1 — a SHIPPED, layout-independent
+        // defect: the set named the two parents' I/D keys only, and the
+        // moved child's `Delta` / the overwrite victim's `Put` were staged
+        // under guards that never named `I{moved}` / `I{dest}`, so a
+        // concurrent `set_layout_and_size` — which holds `I{ino}` and
+        // stages a `Put` of the same key — CO-QUEUED with the rename in
+        // one conveyor batch: the pass's same-key sentinel in debug, a
+        // lost ctime in release). The unlink path's two-phase shape:
+        // phase 1 discovers both children holding NOTHING; phase 2 takes
+        // ONE canonical `lock_many` per volume over the parents, the
+        // children and the two D keys — per-volume sets in ascending
+        // volume order, each internally canonical (I before D, stripe-
+        // deduped by `lock_many`) — and re-reads both dentries under the
+        // guards, retrying the plan when either child moved.
+        let (old_dentry_opt, new_dentry_opt, guards) = loop {
+            let old_dentry_opt = self
+                .find_dentry_routed(old_parent_v_idx, local_old_parent, old_name)
+                .await?;
+            let new_dentry_opt = self
+                .find_dentry_routed(new_parent_v_idx, local_new_parent, new_name)
+                .await?;
+            // The discovered children's slots join the gate BEFORE any 4a
+            // acquisition (holding nothing — a park is legal). A park can
+            // span a flip: the parents' routes are re-verified.
+            {
+                let mut join = Vec::new();
+                if let Some((c, _)) = old_dentry_opt {
+                    join.push(c);
+                }
+                if let Some((c, _)) = new_dentry_opt {
+                    join.push(c);
+                }
+                if self.slot_gate_extend(&mut _gate, &join).await
+                    && (self.route_ino(old_parent) != (old_parent_v_idx, local_old_parent)
+                        || self.route_ino(new_parent) != (new_parent_v_idx, local_new_parent))
+                {
+                    return Err(crate::error::SqueezefsError::Io(
+                        std::io::Error::from_raw_os_error(libc::EAGAIN),
+                    ));
+                }
             }
-        }
-
-        // PR M7 (Issue 13): Arc the op's guard set — the same-volume
-        // one-tx shape takes it once; the cross-volume fragments clone it
-        // per sequential commit.
-        let guards: std::sync::Arc<[dlm::DlmGuard]> = std::sync::Arc::from(_guards);
-
-        let old_dentry_opt = self
-            .find_dentry_routed(old_parent_v_idx, local_old_parent, old_name)
-            .await?;
-        let new_dentry_opt = self
-            .find_dentry_routed(new_parent_v_idx, local_new_parent, new_name)
-            .await?;
-        // Late-discovered child inos JOIN the gate census (under held
-        // guards — never park; §5.5.2a's drain rule covers them).
-        {
-            let mut join = Vec::new();
-            if let Some((c, _)) = old_dentry_opt {
-                join.push(c);
+            // Per-volume lock sets: `(volume, I keys, D keys)`.
+            let mut per_volume: std::collections::BTreeMap<
+                usize,
+                (Vec<(Ino, dlm::LockMode)>, Vec<(Ino, &str, dlm::LockMode)>),
+            > = std::collections::BTreeMap::new();
+            per_volume
+                .entry(old_parent_v_idx)
+                .or_default()
+                .0
+                .push((local_old_parent, dlm::LockMode::Exclusive));
+            per_volume.entry(old_parent_v_idx).or_default().1.push((
+                local_old_parent,
+                old_name,
+                dlm::LockMode::Exclusive,
+            ));
+            per_volume
+                .entry(new_parent_v_idx)
+                .or_default()
+                .0
+                .push((local_new_parent, dlm::LockMode::Exclusive));
+            per_volume.entry(new_parent_v_idx).or_default().1.push((
+                local_new_parent,
+                new_name,
+                dlm::LockMode::Exclusive,
+            ));
+            for child in old_dentry_opt
+                .iter()
+                .chain(new_dentry_opt.iter())
+                .map(|(c, _)| *c)
+            {
+                let (v, l) = self.route_ino(child);
+                self.check_volume_enabled(v)?;
+                per_volume
+                    .entry(v)
+                    .or_default()
+                    .0
+                    .push((l, dlm::LockMode::Exclusive));
             }
-            if let Some((c, _)) = new_dentry_opt {
-                join.push(c);
+            let mut guards = Vec::new();
+            for (v_idx, (mut inos, dents)) in per_volume {
+                inos.sort_unstable_by_key(|(l, _)| *l);
+                inos.dedup_by_key(|(l, _)| *l);
+                guards.extend(self.volumes[v_idx].dlm().lock_many(&inos, &dents).await);
             }
-            self.slot_gate_join(&mut _gate, &join);
-        }
+            // Revalidate under the guards: both dentries as discovered.
+            let old_now = self
+                .find_dentry_routed(old_parent_v_idx, local_old_parent, old_name)
+                .await?;
+            let new_now = self
+                .find_dentry_routed(new_parent_v_idx, local_new_parent, new_name)
+                .await?;
+            if old_now.map(|(c, _)| c) == old_dentry_opt.map(|(c, _)| c)
+                && new_now.map(|(c, _)| c) == new_dentry_opt.map(|(c, _)| c)
+            {
+                // PR M7 (Issue 13): Arc the op's guard set — the same-
+                // volume one-tx shape takes it once; the cross-volume
+                // fragments clone it per sequential commit.
+                let guards: std::sync::Arc<[dlm::DlmGuard]> = std::sync::Arc::from(guards);
+                break (old_now, new_now, guards);
+            }
+            // A child moved under us — rediscover (guards dropped here).
+        };
 
         // **§5.4a M1**, with the PLURAL participant set the owner side
         // already uses (`service.rs`'s loop over both `(parent, name)`

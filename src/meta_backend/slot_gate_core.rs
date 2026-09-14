@@ -73,16 +73,6 @@ impl SlotGate {
         true
     }
 
-    /// Late join for an op that discovered a new ino MID-FLIGHT (a
-    /// rename leg found under its locks): it must never park (it holds
-    /// guards), but the drain must wait for it — unconditional entry.
-    pub fn join(&self) {
-        self.inflight.fetch_add(1, Ordering::AcqRel);
-        // Same publication fence as `try_enter` — the drain must see
-        // the join even though joiners never probe the gate.
-        fence(Ordering::SeqCst);
-    }
-
     /// Terminal outcome reached: leave the census.
     pub fn exit(&self) {
         let prev = self.inflight.fetch_sub(1, Ordering::AcqRel);

@@ -26,6 +26,17 @@
 # their stamped fixtures set the seam themselves, and their flat pins (no
 # manager, no grant, the shipped rtype-1 reservation, the REGCTL-sized
 # report read on every layout) run on both legs.
+# `kv_smo_crash_completeness_tests` (the SMO replay-currency crash matrix)
+# joined the list in PR 3's round 2: three of its pins assumed the flat
+# layout — a per-kind INODES tree armed by id, racing inos filtered by the
+# legacy key, an exact parked count from a depth-1 INODES pair — and read
+# red under the seam on the base with nobody running them stamped. They
+# now resolve their tree through the ONE locator, arm a slot tree by
+# SLOT, and state the §2-A law layout-blind (the live root's replayed
+# free dropped, every other in-window free parked, every mounted root
+# keeping its bit; a forest writer's `open` joins its appender regions,
+# and that join's barriered cycle IS the first post-mount durable
+# checkpoint, so the parked window is read off the counters there).
 #
 # WALL TIME IS A ROW (review round 4, Issue 26): each suite runs under
 # its own timer per leg, and the summary prints `flat`, `stamped` and the
@@ -72,6 +83,7 @@ DEFAULT_SUITES=(
   readonly_mount_tests
   meta_slot_migration_tests
   pv_coordinator_tests
+  kv_smo_crash_completeness_tests
   sym_appender_tests
   sym_manager_tests
   sym_fence_tests

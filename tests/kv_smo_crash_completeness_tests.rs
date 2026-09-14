@@ -23,9 +23,10 @@ use squeezefs::meta_backend::kv::backend::{
     KvMetaBackend, TEST_BRING_UP_COVER_DISABLED, TEST_PENDING_FREE_CAP,
 };
 use squeezefs::meta_backend::kv::builder::{digest_backend, format_v3, FormatV3Options};
-use squeezefs::meta_backend::kv::record::TREE_INODES;
+use squeezefs::meta_backend::kv::record::{inode_key, TREE_INODES};
 use squeezefs::meta_backend::kv::tree::{
-    test_smo_build_pause_release, TEST_SMO_BUILD_PAUSED, TEST_SMO_BUILD_PAUSE_TREE,
+    test_smo_build_pause_arm_slot, test_smo_build_pause_release, TEST_SMO_BUILD_PAUSED,
+    TEST_SMO_BUILD_PAUSE_TREE,
 };
 use squeezefs::meta_backend::Metadata;
 use squeezefs::meta_backend::RoutedMetaBackend;
@@ -193,7 +194,18 @@ async fn stranded_build_window_commits_survive_crash() {
     // covers the successors" — a full cycle here would materialize the
     // successor overlays and mask the stranding (the cadence does
     // exactly that eventually in production; the kill races it).
-    TEST_SMO_BUILD_PAUSE_TREE.store(u64::from(TREE_INODES), Ordering::SeqCst);
+    // Layout-blind arming: the tree the inode records live in through the
+    // ONE locator — the INODES tree (armed by id) on a flat volume, the
+    // native slot tree (armed by SLOT — every slot tree carries header id
+    // 0) on a forest.
+    let (inodes, _) = kv
+        .record_locator(TREE_INODES, &inode_key(inos[1200]))
+        .expect("locator")
+        .expect("the inode records' tree exists");
+    match inodes.forest_slot() {
+        Some(slot) => test_smo_build_pause_arm_slot(slot),
+        None => TEST_SMO_BUILD_PAUSE_TREE.store(u64::from(TREE_INODES), Ordering::SeqCst),
+    }
     let band = &inos[1200..1400];
     let mut parked = false;
     'drive: for round in 0..60u32 {
@@ -222,7 +234,8 @@ async fn stranded_build_window_commits_survive_crash() {
         .expect("seam mutex")
         .clone()
         .expect("pause info published while parked");
-    assert_eq!(info.tree_id, TREE_INODES, "the armed tree pauses");
+    assert_eq!(info.tree_id, inodes.tree_id(), "the armed tree pauses");
+    assert_eq!(info.forest_slot, inodes.forest_slot());
     assert!(
         !info.is_root,
         "depth-2 setup: the paused SMO must journal pointer flips (a root \
@@ -230,16 +243,20 @@ async fn stranded_build_window_commits_survive_crash() {
     );
 
     // The racing commits (design §1: `C (T ≤ c < p_flip)`): ACKED setattr
-    // Puts on inos inside the PAUSED leaf's key range — memcmp against
-    // the leaf bounds, exactly the revalidation the conveyor apply runs.
-    // Kept small (32 × ~70 B ≪ the 4 KiB writeback threshold) so nothing
-    // re-enqueues the frozen predecessor mid-SMO.
+    // Puts on inos inside the PAUSED leaf's key range — memcmp of the
+    // STORED key (the locator's — the legacy key flat, the forest key on
+    // a forest) against the leaf bounds, exactly the revalidation the
+    // conveyor apply runs. Kept small (32 × ~70 B ≪ the 4 KiB writeback
+    // threshold) so nothing re-enqueues the frozen predecessor mid-SMO.
     const MARKER: u32 = libc::S_IFREG | 0o751;
     let racing: Vec<u64> = inos
         .iter()
         .copied()
         .filter(|ino| {
-            let k = ino.to_be_bytes();
+            let (_, k) = kv
+                .record_locator(TREE_INODES, &inode_key(*ino))
+                .expect("locator")
+                .expect("the inode records' tree exists");
             k[..] >= info.min_key[..] && k[..] <= info.max_key[..]
         })
         .take(32)
@@ -812,17 +829,49 @@ async fn mount_side_replayed_free_parks_until_post_mount_checkpoint() {
     // Crash-equivalent kill: no further cycle, RAM dropped.
     drop(routed);
     drop(kv);
+    let parked_before =
+        squeezefs::meta_backend::kv::META_KV_PENDING_FREE_PARKED.load(Ordering::Relaxed);
+    let released_before =
+        squeezefs::meta_backend::kv::META_KV_PENDING_FREE_RELEASED.load(Ordering::Relaxed);
     let kv2 = reopen(file.path()).await;
+    let parked_delta = squeezefs::meta_backend::kv::META_KV_PENDING_FREE_PARKED
+        .load(Ordering::Relaxed)
+        - parked_before;
+    let released_delta = squeezefs::meta_backend::kv::META_KV_PENDING_FREE_RELEASED
+        .load(Ordering::Relaxed)
+        - released_before;
 
+    // The mount PARKED the replayed free (never released it at load) —
+    // on both layouts.
     assert_eq!(
-        kv2.pending_free_extents(),
-        1,
-        "design-smo-replay-currency §2-A mount gate: a replayed free is \
-         in-window by construction — it must PARK until the first post-mount \
-         durable checkpoint, never release on the mounted record's generation \
-         (the mounted record itself may be page-cache-only after a kill; \
-         releasing here is the reuse-vs-fallback §4.7 law violation)"
+        parked_delta, 1,
+        "design-smo-replay-currency §2-A mount gate: the replayed in-window free is \
+         PARKED at mount, never released on the mounted record's generation"
     );
+    if kv2.symmetric_forest() {
+        // A forest writer's `open` JOINS its appender regions, and the
+        // join's one barriered cycle (bitmap, ledger, Live pages) IS the
+        // first post-mount durable checkpoint: the fresh tail covers the
+        // window and its barrier drains the parked free INSIDE `open`.
+        // The park-then-drain progression is read off the counters here;
+        // the flat leg below observes the parked window itself (its
+        // bring-up cover is the only post-mount cycle, held off).
+        assert_eq!(
+            (kv2.pending_free_extents(), released_delta),
+            (0, 1),
+            "forest: the join's barriered cycle inside `open` drained the parked free"
+        );
+    } else {
+        assert_eq!(
+            (kv2.pending_free_extents(), released_delta),
+            (1, 0),
+            "design-smo-replay-currency §2-A mount gate: a replayed free is \
+             in-window by construction — it must PARK until the first post-mount \
+             durable checkpoint, never release on the mounted record's generation \
+             (the mounted record itself may be page-cache-only after a kill; \
+             releasing here is the reuse-vs-fallback §4.7 law violation)"
+        );
+    }
 
     // First post-mount durable checkpoint: replayed dirt flushes, the
     // fresh tail covers the window, the barrier drains the free.
@@ -908,10 +957,16 @@ async fn an_unnamed_root_swaps_replayed_free_never_releases_the_live_root() {
 
     // The D4 nudge: a FORCED compaction of the root leaf = a root swap
     // with no ledger record after it (the shipped defrag arm's shape).
-    let inodes = kv.all_trees()[0].clone();
+    // Layout-blind: the tree holding the fill inode's record through the
+    // ONE locator (the INODES tree flat; the native slot tree — header id
+    // 0 — on a forest, where the census names a node by its header id).
+    let (inodes, _) = kv
+        .record_locator(TREE_INODES, &inode_key(fill_ino))
+        .expect("locator")
+        .expect("the inode records' tree exists");
     let old_root = inodes.root();
     let compacted = kv
-        .defrag_compact_nodes(&[(TREE_INODES, old_root.addr)])
+        .defrag_compact_nodes(&[(inodes.tree_id(), old_root.addr)])
         .await
         .expect("forced compaction");
     assert_eq!(compacted, 1, "the nudge compacts the root leaf");
@@ -931,7 +986,10 @@ async fn an_unnamed_root_swaps_replayed_free_never_releases_the_live_root() {
     drop(routed);
     drop(kv);
     let kv2 = reopen(file.path()).await;
-    let inodes2 = kv2.all_trees()[0].clone();
+    let (inodes2, _) = kv2
+        .record_locator(TREE_INODES, &inode_key(fill_ino))
+        .expect("locator")
+        .expect("the inode records' tree exists");
     let live = inodes2.root();
     assert_eq!(
         extent_of(&kv2, live.addr),
@@ -1436,8 +1494,20 @@ async fn pending_free_wedged_shape_reopen_recovers_and_drains() {
         squeezefs::meta_backend::kv::META_KV_REPLAY_ROOT_FREES_DROPPED.load(Ordering::Relaxed);
     drop(routed);
     drop(kv);
+    let parked_before =
+        squeezefs::meta_backend::kv::META_KV_PENDING_FREE_PARKED.load(Ordering::Relaxed);
+    let released_before =
+        squeezefs::meta_backend::kv::META_KV_PENDING_FREE_RELEASED.load(Ordering::Relaxed);
     let kv2 = reopen(file.path()).await;
-
+    let parked_delta = squeezefs::meta_backend::kv::META_KV_PENDING_FREE_PARKED
+        .load(Ordering::Relaxed)
+        - parked_before;
+    let released_delta = squeezefs::meta_backend::kv::META_KV_PENDING_FREE_RELEASED
+        .load(Ordering::Relaxed)
+        - released_before;
+    let dropped_delta = squeezefs::meta_backend::kv::META_KV_REPLAY_ROOT_FREES_DROPPED
+        .load(Ordering::Relaxed)
+        - dropped_before;
     // The two saturating retirements were threshold-driven ROOT swaps of
     // the depth-1 INODES tree (R0 → R1 → R2) that no ledger record ever
     // named, so the mount replays through R0 — LIVE again. Its free is
@@ -1445,20 +1515,43 @@ async fn pending_free_wedged_shape_reopen_recovers_and_drains() {
     // `an_unnamed_root_swaps_replayed_free_never_releases_the_live_root`);
     // R1's — an unreached successor — re-parks under the §2-A mount gate.
     // Before the carve-out both parked and the drain below CLEARED the
-    // live root's bit.
+    // live root's bit. The law on both layouts: the live root's free is
+    // dropped, every OTHER in-window free re-parks (none is released at
+    // load), every mounted root keeps its bit. The exact parked COUNT is
+    // the flat shape's: a forest's native slot tree is MIXED (its inode
+    // and xattr records share one tree), so the at-cap window holds a
+    // different retirement population (two unreached predecessors), and
+    // the pinned floor keeps the join's cycle inside `open` from covering
+    // them — the counters read what parked.
     assert_eq!(
-        kv2.pending_free_extents(),
-        1,
-        "the in-window free of the unreached successor re-parks at mount (§2-A mount \
-         gate); the live root's is dropped"
-    );
-    assert_eq!(
-        squeezefs::meta_backend::kv::META_KV_REPLAY_ROOT_FREES_DROPPED.load(Ordering::Relaxed),
-        dropped_before + 1,
+        dropped_delta, 1,
         "exactly the live root's replayed free was dropped"
     );
-    let live_root_ext = extent_of(&kv2, kv2.all_trees()[0].root().addr);
-    assert!(kv2.allocator().is_allocated(live_root_ext));
+    assert!(
+        parked_delta >= 1,
+        "the unreached successors' in-window frees re-park at mount (§2-A mount gate)"
+    );
+    assert_eq!(
+        kv2.pending_free_extents(),
+        parked_delta - released_delta,
+        "every replayed free that was not the live root's is PARKED — none released at load"
+    );
+    if !kv2.symmetric_forest() {
+        assert_eq!(
+            (kv2.pending_free_extents(), released_delta),
+            (1, 0),
+            "flat: R1's free re-parks; the bring-up cover is held off, nothing drained yet"
+        );
+    }
+    for t in kv2.all_trees() {
+        let root_ext = extent_of(&kv2, t.root().addr);
+        assert!(
+            kv2.allocator().is_allocated(root_ext),
+            "mounted root of tree {} (slot {:?}) at extent {root_ext} keeps its bit",
+            t.tree_id(),
+            t.forest_slot()
+        );
+    }
     for i in 0..8u32 {
         kv2.checkpoint_now()
             .await

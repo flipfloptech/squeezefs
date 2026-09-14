@@ -1858,9 +1858,7 @@ impl RoutedMetaBackend {
             crate::slot_lease_core::MintChoice::Overflow => {
                 let plane = vol.slot_leases()?;
                 let rotor = plane.rotor.load();
-                *rotor
-                    .iter()
-                    .min_by_key(|s| (plane.extents.get(**s), **s))?
+                *rotor.iter().min_by_key(|s| (plane.extents.get(**s), **s))?
             }
         };
         vol.routing_slot_of_forest(forest).ok().map(u64::from)

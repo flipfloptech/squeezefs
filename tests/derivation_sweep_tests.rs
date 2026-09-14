@@ -2560,3 +2560,124 @@ fn sym_manager_grant_and_failover_bound_derive_from_the_ladder_and_the_smo_rate(
         GRANT_EXTENTS_FLOOR
     );
 }
+
+/// PR 4's slot-lease derivations (design-symmetric-metadata §5.1.2 /
+/// §5.1.4, §6.1): `M = clamp(W / (2 × writers_known), 1, MINT_SPREAD)` —
+/// 64 on a solo mount at the derived width, 2 at the 12,500-writer
+/// operating point, never 0; `A_max = max(used_leaf_bytes / MINT_SPREAD,
+/// node_size)` with the static knob clamped to `[node_size, heap]`;
+/// `N_floor = max(2, ceil(handover / ship))`; the cold-start handover cost
+/// is four barriers + three ship round trips; `T_idle` = `T_owner`
+/// (`SQUEEZEFS_MEMBERSHIP_LEASE_TTL_MS`, the 45 s TTL) unless explicit;
+/// the four registry ranges tie to the constants and every knob wins
+/// verbatim. Drift on any of them is red here.
+#[test]
+fn sym_slot_lease_rotor_ceiling_floor_and_window_derive_from_the_width_and_the_lease() {
+    use squeezefs::fuse_client::CLIENT_STALE_TTL_SECS;
+    use squeezefs::meta_backend::kv::slot_lease::{
+        affinity_ceiling_in_force, mint_slots_in_force, resolve_affinity_ceiling,
+        resolve_mint_slots, resolve_t_idle_ms, SYMMETRIC_META_ENV, SYM_AFFINITY_MAX_MB_ENV,
+        SYM_MINT_SLOTS_ENV, SYM_T_IDLE_MS_ENV,
+    };
+    use squeezefs::meta_backend::DERIVED_ROUTING_WIDTH;
+    use squeezefs::slot_lease_core::{
+        affinity_ceiling_bytes, handover_cold_start_ns, mint_slots_derived, n_floor, MINT_SPREAD,
+    };
+    let w = u64::from(DERIVED_ROUTING_WIDTH);
+    assert_eq!(MINT_SPREAD, squeezefs::meta_backend::MINT_SPREAD as u64);
+    assert_eq!(mint_slots_derived(w, 1), MINT_SPREAD, "a solo mount: 64");
+    assert_eq!(
+        mint_slots_derived(w, 0),
+        MINT_SPREAD,
+        "a census of 0 reads as 1"
+    );
+    assert_eq!(
+        mint_slots_derived(w, 512),
+        MINT_SPREAD,
+        "the ceiling binds to 512 writers"
+    );
+    assert_eq!(mint_slots_derived(w, 1_024), 32);
+    assert_eq!(mint_slots_derived(w, 12_500), 2, "the operating point");
+    assert_eq!(mint_slots_derived(w, 1 << 20), 1, "never 0");
+    // A_max: load-relative, never below one extent; the static knob is
+    // clamped to [node_size, heap].
+    let node = 256 * 1024u64;
+    assert_eq!(affinity_ceiling_bytes(0, node), node);
+    assert_eq!(affinity_ceiling_bytes(64 * node, node), node);
+    assert_eq!(affinity_ceiling_bytes(6_400 * node, node), 100 * node);
+    let heap = 1 << 30;
+    assert_eq!(
+        affinity_ceiling_in_force(None, 6_400 * node, node, heap),
+        100 * node
+    );
+    assert_eq!(affinity_ceiling_in_force(Some(1), 0, node, heap), 1 << 20);
+    assert_eq!(
+        affinity_ceiling_in_force(Some(1), 0, 4 << 20, heap),
+        4 << 20,
+        "≥ node_size"
+    );
+    assert_eq!(
+        affinity_ceiling_in_force(Some(4096), 0, node, heap),
+        heap,
+        "≤ heap"
+    );
+    // N_floor and the cold start.
+    assert_eq!(n_floor(0, 0), 2);
+    assert_eq!(n_floor(10, 3), 4);
+    assert_eq!(n_floor(1_000, 0), 1_000, "a ship of 0 ns reads as 1");
+    assert_eq!(handover_cold_start_ns(100, 10), 430);
+    // The registry ranges tie to the constants.
+    let lookup = |k: &str| squeezefs::env_knobs::lookup(k).expect("registered");
+    assert!(matches!(
+        lookup(SYMMETRIC_META_ENV).kind,
+        squeezefs::env_knobs::Kind::Bool
+    ));
+    match lookup(SYM_MINT_SLOTS_ENV).kind {
+        squeezefs::env_knobs::Kind::Int { lo, hi } => {
+            assert_eq!((lo, hi), (1, MINT_SPREAD as i128));
+        }
+        other => panic!("SQUEEZEFS_SYM_MINT_SLOTS must be Int, got {other:?}"),
+    }
+    match lookup(SYM_AFFINITY_MAX_MB_ENV).kind {
+        squeezefs::env_knobs::Kind::Int { lo, hi } => {
+            assert_eq!(lo, 1);
+            assert_eq!(hi, 1 << 20, "BYTES_MAX (1 TiB) in MiB");
+        }
+        other => panic!("SQUEEZEFS_SYM_AFFINITY_MAX_MB must be Int, got {other:?}"),
+    }
+    match lookup(SYM_T_IDLE_MS_ENV).kind {
+        squeezefs::env_knobs::Kind::Int { lo, hi } => {
+            assert_eq!((lo, hi), (1_000, 600_000));
+        }
+        other => panic!("SQUEEZEFS_SYM_T_IDLE_MS must be Int, got {other:?}"),
+    }
+    // Every knob wins verbatim.
+    for k in [
+        SYM_MINT_SLOTS_ENV,
+        SYM_AFFINITY_MAX_MB_ENV,
+        SYM_T_IDLE_MS_ENV,
+    ] {
+        std::env::remove_var(k);
+    }
+    std::env::remove_var("SQUEEZEFS_MEMBERSHIP_LEASE_TTL_MS");
+    assert_eq!(resolve_mint_slots(w, 1), MINT_SPREAD);
+    assert_eq!(mint_slots_in_force(Some(7), w, 1), 7);
+    std::env::set_var(SYM_MINT_SLOTS_ENV, "7");
+    assert_eq!(resolve_mint_slots(w, 1), 7);
+    std::env::remove_var(SYM_MINT_SLOTS_ENV);
+    assert_eq!(
+        resolve_affinity_ceiling(6_400 * node, node, heap),
+        100 * node
+    );
+    std::env::set_var(SYM_AFFINITY_MAX_MB_ENV, "2");
+    assert_eq!(resolve_affinity_ceiling(6_400 * node, node, heap), 2 << 20);
+    std::env::remove_var(SYM_AFFINITY_MAX_MB_ENV);
+    assert_eq!(
+        resolve_t_idle_ms(),
+        CLIENT_STALE_TTL_SECS * 1_000,
+        "T_owner"
+    );
+    std::env::set_var(SYM_T_IDLE_MS_ENV, "1500");
+    assert_eq!(resolve_t_idle_ms(), 1_500);
+    std::env::remove_var(SYM_T_IDLE_MS_ENV);
+}

@@ -3504,7 +3504,10 @@ impl KvMetaBackend {
             let Some(slots) = loaded.get(&r.id) else {
                 continue;
             };
-            for se in slots.iter().filter(|se| se.state == SlotEntryState::Releasing) {
+            for se in slots
+                .iter()
+                .filter(|se| se.state == SlotEntryState::Releasing)
+            {
                 let slot = super::appender::forest_slot_of_page_slot(se.slot, set.native_slot);
                 match plane.table.get(slot) {
                     Some(l)
@@ -6479,10 +6482,9 @@ impl KvMetaBackend {
             // leave the window. An entry the budget truncated off the
             // page publishes nothing and keeps its floor.
             if self.slot_leases().is_some() {
-                for e in entries
-                    .iter()
-                    .filter(|e| e.state == super::appender::SlotEntryState::Live && e.root.addr != 0)
-                {
+                for e in entries.iter().filter(|e| {
+                    e.state == super::appender::SlotEntryState::Live && e.root.addr != 0
+                }) {
                     let slot = super::appender::forest_slot_of_page_slot(e.slot, set.native_slot);
                     if slot != super::record::NATIVE_FOREST_SLOT {
                         forest.note_page_published(slot, e.root);
@@ -14110,9 +14112,9 @@ impl KvMetaBackend {
             // plane's UNLEASED slot keeps its release record's `g`,
             // cursor (§5.1.8 — the floor never regresses), extent count
             // and `last_written`; only the root and the tails move.
-            let lease = plane.and_then(|p| p.table.get(*slot)).filter(|l| {
-                l.state == crate::slot_lease_core::LeaseState::Unleased
-            });
+            let lease = plane
+                .and_then(|p| p.table.get(*slot))
+                .filter(|l| l.state == crate::slot_lease_core::LeaseState::Unleased);
             let state = match lease {
                 Some(l) => {
                     let tails = match forest.tree(*slot) {
@@ -14162,7 +14164,6 @@ impl KvMetaBackend {
         // fresh root of this cycle.
         self.sync_device().await.map_err(KvError::Io)?;
         let res = self.ring.reserve_registered(adm);
-        let mut recs = recs;
         for (i, (_, r)) in recs.iter_mut().enumerate() {
             r.seq = res.start + i as u64;
         }

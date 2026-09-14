@@ -255,7 +255,8 @@ pub struct SlotLeasePlane {
     /// Slots the manager RECALLS from a wire holder (an accepted offer of
     /// a slot it holds) — carried on its renewal grant as
     /// `slot_release_notices`; cleared by its `ReleaseSlot`.
-    pub recalls: std::sync::Mutex<std::collections::BTreeMap<u32, std::collections::BTreeSet<ForestSlot>>>,
+    pub recalls:
+        std::sync::Mutex<std::collections::BTreeMap<u32, std::collections::BTreeSet<ForestSlot>>>,
     // ---- gauges (§11) ----
     pub acquires: AtomicU64,
     pub grants: AtomicU64,

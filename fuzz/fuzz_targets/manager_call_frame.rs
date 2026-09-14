@@ -47,7 +47,7 @@ use squeezefs::meta_backend::kv::appender::{
 use squeezefs::meta_backend::kv::slot_state::ExtentGrantRecord;
 use squeezefs::meta_ship::manager::{
     decode_reply, decode_request, encode_reply, encode_request, ManagerCall, ManagerReply,
-    ManagerReplyFrame, ManagerRequestFrame, WireIdentity, MANAGER_SCHEMA,
+    ManagerReplyFrame, ManagerRequestFrame, WireIdentity, WireSlotGrant, MANAGER_SCHEMA,
 };
 
 /// Arm 3: the service-edge law over a decoded call's integers. `record`
@@ -110,7 +110,22 @@ fn check_service_edge(call: &ManagerCall, total_extents: u64, record_seed: &[u8]
                 assert!(w <= cap && (w > 0 || cap == 0));
             }
         }
-        ManagerCall::JoinAppender { .. } => {}
+        // The slot-lease verbs (PR 4): their wire integers are a slot
+        // (u16 — the routing namespace, total), an appender id, `g`, the
+        // words and the tails; the ONE proportional input is the tails
+        // list, whose count is bounded by the record's u16 at the
+        // service edge (`manager_release_slot_wire` rejects past it).
+        ManagerCall::ReleaseSlot { tails, .. } => {
+            assert!(
+                tails.len() > usize::from(u16::MAX) || u16::try_from(tails.len()).is_ok(),
+                "a tails count either fits the record's u16 or is the rejected class"
+            );
+        }
+        ManagerCall::JoinAppender { .. }
+        | ManagerCall::AcquireSlots { .. }
+        | ManagerCall::AcquireSlot { .. }
+        | ManagerCall::OfferSlot { .. }
+        | ManagerCall::ResolveSlot { .. } => {}
     }
 }
 
@@ -167,11 +182,69 @@ enum ArbCall {
         appender_id: u32,
         runs: Vec<(u64, u32)>,
     },
+    AcquireSlots {
+        appender_id: u32,
+        want: u16,
+    },
+    AcquireSlot {
+        appender_id: u32,
+        slot: u16,
+    },
+    OfferSlot {
+        appender_id: u32,
+        slot: u16,
+        to: u32,
+    },
+    ReleaseSlot {
+        appender_id: u32,
+        slot: u16,
+        root: (u64, u64),
+        cursor: u64,
+        g: u32,
+        slot_tree_extents: u32,
+        tails: Vec<(u64, u32)>,
+    },
+    ResolveSlot {
+        slot: u16,
+    },
 }
 
 impl From<ArbCall> for ManagerCall {
     fn from(c: ArbCall) -> Self {
         match c {
+            ArbCall::AcquireSlots { appender_id, want } => {
+                ManagerCall::AcquireSlots { appender_id, want }
+            }
+            ArbCall::AcquireSlot { appender_id, slot } => {
+                ManagerCall::AcquireSlot { appender_id, slot }
+            }
+            ArbCall::OfferSlot {
+                appender_id,
+                slot,
+                to,
+            } => ManagerCall::OfferSlot {
+                appender_id,
+                slot,
+                to,
+            },
+            ArbCall::ReleaseSlot {
+                appender_id,
+                slot,
+                root,
+                cursor,
+                g,
+                slot_tree_extents,
+                tails,
+            } => ManagerCall::ReleaseSlot {
+                appender_id,
+                slot,
+                root,
+                cursor,
+                g,
+                slot_tree_extents,
+                tails,
+            },
+            ArbCall::ResolveSlot { slot } => ManagerCall::ResolveSlot { slot },
             ArbCall::JoinAppender {
                 identity,
                 ring_want_bytes,
@@ -208,11 +281,51 @@ enum ArbReply {
     Refused {
         reason: String,
     },
+    SlotsGranted {
+        slots: Vec<(u16, u32, (u64, u64), u64, u32)>,
+        already: bool,
+    },
+    SlotRefused {
+        slot: u16,
+        holder: u32,
+        g: u32,
+    },
+    Offered,
+    Released {
+        already: bool,
+    },
+    Holder {
+        appender_id: u32,
+        g: u32,
+    },
+    Unleased {
+        g: u32,
+    },
 }
 
 impl From<ArbReply> for ManagerReply {
     fn from(r: ArbReply) -> Self {
         match r {
+            ArbReply::SlotsGranted { slots, already } => ManagerReply::SlotsGranted {
+                slots: slots
+                    .into_iter()
+                    .map(|(slot, g, root, cursor, slot_tree_extents)| WireSlotGrant {
+                        slot,
+                        g,
+                        root,
+                        cursor,
+                        slot_tree_extents,
+                    })
+                    .collect(),
+                already,
+            },
+            ArbReply::SlotRefused { slot, holder, g } => {
+                ManagerReply::SlotRefused { slot, holder, g }
+            }
+            ArbReply::Offered => ManagerReply::Offered,
+            ArbReply::Released { already } => ManagerReply::Released { already },
+            ArbReply::Holder { appender_id, g } => ManagerReply::Holder { appender_id, g },
+            ArbReply::Unleased { g } => ManagerReply::Unleased { g },
             ArbReply::Joined {
                 appender_id,
                 page_addr,

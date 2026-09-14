@@ -65,7 +65,8 @@ use squeezefs::meta_backend::GUEST_NS_SHIFT;
 use squeezefs::meta_ship::manager::{
     decode_reply as decode_manager_reply, decode_request as decode_manager_request,
     encode_reply as encode_manager_reply, encode_request as encode_manager_request, ManagerCall,
-    ManagerReply, ManagerReplyFrame, ManagerRequestFrame, WireIdentity, MANAGER_SCHEMA,
+    ManagerReply, ManagerReplyFrame, ManagerRequestFrame, WireIdentity, WireSlotGrant,
+    MANAGER_SCHEMA,
 };
 use squeezefs::meta_ship::publish::{
     decode_reply_frame, decode_request_frame, encode_reply_frame, encode_request_frame,
@@ -1204,6 +1205,41 @@ fn arb_manager_call() -> impl Strategy<Value = ManagerCall> {
             .prop_map(|(appender_id, want)| ManagerCall::ExtentGrant { appender_id, want }),
         (any::<u32>(), arb_runs())
             .prop_map(|(appender_id, runs)| ManagerCall::ReturnExtents { appender_id, runs }),
+        // PR 4's slot-lease verbs.
+        (any::<u32>(), any::<u16>())
+            .prop_map(|(appender_id, want)| ManagerCall::AcquireSlots { appender_id, want }),
+        (any::<u32>(), any::<u16>())
+            .prop_map(|(appender_id, slot)| ManagerCall::AcquireSlot { appender_id, slot }),
+        (any::<u32>(), any::<u16>(), any::<u32>()).prop_map(|(appender_id, slot, to)| {
+            ManagerCall::OfferSlot {
+                appender_id,
+                slot,
+                to,
+            }
+        }),
+        (
+            any::<u32>(),
+            any::<u16>(),
+            (any::<u64>(), any::<u64>()),
+            any::<u64>(),
+            any::<u32>(),
+            any::<u32>(),
+            prop::collection::vec((any::<u64>(), any::<u32>()), 0..9),
+        )
+            .prop_map(
+                |(appender_id, slot, root, cursor, g, slot_tree_extents, tails)| {
+                    ManagerCall::ReleaseSlot {
+                        appender_id,
+                        slot,
+                        root,
+                        cursor,
+                        g,
+                        slot_tree_extents,
+                        tails,
+                    }
+                }
+            ),
+        any::<u16>().prop_map(|slot| ManagerCall::ResolveSlot { slot }),
     ]
 }
 
@@ -1229,6 +1265,40 @@ fn arb_manager_reply() -> impl Strategy<Value = ManagerReply> {
         (any::<u64>(), any::<u64>())
             .prop_map(|(cleared, already)| ManagerReply::Returned { cleared, already }),
         "[ -~]{0,64}".prop_map(|reason| ManagerReply::Refused { reason }),
+        // PR 4's slot-lease replies.
+        (
+            prop::collection::vec(
+                (
+                    any::<u16>(),
+                    any::<u32>(),
+                    (any::<u64>(), any::<u64>()),
+                    any::<u64>(),
+                    any::<u32>(),
+                ),
+                0..5,
+            ),
+            any::<bool>(),
+        )
+            .prop_map(|(slots, already)| ManagerReply::SlotsGranted {
+                slots: slots
+                    .into_iter()
+                    .map(|(slot, g, root, cursor, slot_tree_extents)| WireSlotGrant {
+                        slot,
+                        g,
+                        root,
+                        cursor,
+                        slot_tree_extents,
+                    })
+                    .collect(),
+                already,
+            }),
+        (any::<u16>(), any::<u32>(), any::<u32>())
+            .prop_map(|(slot, holder, g)| ManagerReply::SlotRefused { slot, holder, g }),
+        Just(ManagerReply::Offered),
+        any::<bool>().prop_map(|already| ManagerReply::Released { already }),
+        (any::<u32>(), any::<u32>())
+            .prop_map(|(appender_id, g)| ManagerReply::Holder { appender_id, g }),
+        any::<u32>().prop_map(|g| ManagerReply::Unleased { g }),
     ]
 }
 

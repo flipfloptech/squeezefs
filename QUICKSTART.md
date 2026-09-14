@@ -51,7 +51,7 @@ Cache/staging paths are declared **at format** and recorded in the volume; omit 
   sqdata://$HOME/squeezefs-sandbox/data.bin \
   --disk-cache-paths ~/squeezefs-sandbox/staging
 ```
-> Fresh formats are multi-writer-capable by default. Pass `--single-writer` only when an older SqueezeFS binary must be able to read the volume (upgrade later with `squeezefs volume enable-multi-writer`). Optional format knobs (`--meta-node-kib`, `--meta-journal-mb`, compression, encryption) are listed in [docs/operations.md → Format](docs/operations.md#format-squeezefs-format).
+> Fresh formats are multi-writer-capable by default. Pass `--single-writer` only when an older SqueezeFS binary must be able to read the volume (upgrade later with `squeezefs volume enable-multi-writer`). `--symmetric` formats the symmetric slot-tree forest (incompat bit 17) — the DARK symmetric metadata program's on-disk shape; leave it off unless you are running that program (an existing set converts offline with `squeezefs volume enable-symmetric`). Optional format knobs (`--meta-node-kib`, `--meta-journal-mb`, compression, encryption) are listed in [docs/operations.md → Format](docs/operations.md#format-squeezefs-format).
 
 ### Step 4: Mount
 The mount reads its cache/staging paths from the volume (passing `--disk-cache-paths` at mount is refused; change them with `squeezefs config set-cache-paths`):

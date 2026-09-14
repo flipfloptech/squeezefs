@@ -174,7 +174,7 @@ async fn the_manager_holds_wero_on_the_metadata_namespace_and_a_flat_mount_keeps
     // The armed forest mount: WERO (rtype 3) held by the manager.
     {
         let _e = ArmEnv::set(Some(PARTITION), None, None);
-        let routed = open_routed_meta_set(&[stamped.clone()])
+        let routed = open_routed_meta_set(std::slice::from_ref(&stamped))
             .await
             .expect("a PR-capable substrate arms without the opt-in");
         let vol = &routed.volumes[0];
@@ -228,7 +228,7 @@ async fn the_manager_holds_wero_on_the_metadata_namespace_and_a_flat_mount_keeps
     // the shipped Write Exclusive.
     {
         let _e = ArmEnv::set(Some(PARTITION), None, Some("0"));
-        let err = match open_routed_meta_set(&[stamped.clone()]).await {
+        let err = match open_routed_meta_set(std::slice::from_ref(&stamped)).await {
             Ok(_) => panic!("WERO=0 on a PR-capable substrate must refuse without the opt-in"),
             Err(e) => e.to_string(),
         };
@@ -238,11 +238,11 @@ async fn the_manager_holds_wero_on_the_metadata_namespace_and_a_flat_mount_keeps
     }
     {
         let _e = ArmEnv::set(Some(PARTITION), Some("1"), Some("0"));
-        let routed = open_routed_meta_set(&[stamped.clone()])
+        let routed = open_routed_meta_set(std::slice::from_ref(&stamped))
             .await
             .expect("opt-in");
         assert!(!routed.volumes[0].appender_stats().unwrap().meta_pr_wero);
-        assert_eq!(ns_stamped.holder().is_some(), true);
+        assert!(ns_stamped.holder().is_some());
         let report = FakeReservationClient::new(Arc::clone(&ns_stamped), "nqn.probe", "probe")
             .report()
             .unwrap();
@@ -255,7 +255,7 @@ async fn the_manager_holds_wero_on_the_metadata_namespace_and_a_flat_mount_keeps
     // Write Exclusive (rtype 1), whatever the knobs say.
     {
         let _e = ArmEnv::set(Some(PARTITION), None, None);
-        let routed = open_routed_meta_set(&[flat.clone()])
+        let routed = open_routed_meta_set(std::slice::from_ref(&flat))
             .await
             .expect("flat mounts");
         assert!(routed.volumes[0].appender_stats().is_none());
@@ -275,7 +275,7 @@ async fn the_manager_holds_wero_on_the_metadata_namespace_and_a_flat_mount_keeps
     // The solo stamped mount — unarmed — keeps rtype 1 too.
     {
         let _e = ArmEnv::set(None, None, None);
-        let routed = open_routed_meta_set(&[stamped.clone()])
+        let routed = open_routed_meta_set(std::slice::from_ref(&stamped))
             .await
             .expect("solo");
         assert!(!routed.volumes[0].appender_stats().unwrap().meta_pr_wero);
@@ -339,7 +339,7 @@ async fn manager_lease_reads_held_vacant_and_peer() {
     // The successor: no claim exists, so the D0 ladder is won outright —
     // the foreign Live page 0 is adopted with the role (§5.9).
     let _e = ArmEnv::set(None, None, None);
-    let routed = open_routed_meta_set(&[uri.clone()])
+    let routed = open_routed_meta_set(std::slice::from_ref(&uri))
         .await
         .expect("successor");
     let s = routed.volumes[0].appender_stats().unwrap();

@@ -1821,25 +1821,46 @@ impl RoutedMetaBackend {
     /// tree for the overflow arm; [`Self::pick_mint_slot_for`] asks the
     /// manager for one more slot instead.
     fn lease_mint_slot(&self, volume_idx: usize, parent: Option<Ino>) -> Option<u64> {
-        use kv::record::forest_slot_of_ino;
         let vol = self.volumes.get(volume_idx)?;
         if !vol.slot_lease_armed() {
             return None;
         }
-        let parent_slot = parent.and_then(|p| {
+        let choice = vol.lease_mint_choice(self.lease_parent_slot(volume_idx, parent))?;
+        self.lease_choice_slot(volume_idx, choice)
+    }
+
+    /// The parent's forest slot for the mint policy — `None` when the
+    /// parent is on another volume (no affinity across volumes).
+    fn lease_parent_slot(
+        &self,
+        volume_idx: usize,
+        parent: Option<Ino>,
+    ) -> Option<kv::record::ForestSlot> {
+        parent.and_then(|p| {
             let (pv, local) = self.route_ino(p);
-            (pv == volume_idx).then(|| forest_slot_of_ino(local))
-        });
-        let forest = match vol.lease_mint_choice(parent_slot)? {
+            (pv == volume_idx).then(|| kv::record::forest_slot_of_ino(local))
+        })
+    }
+
+    /// A decided mint choice's ROUTING slot; the overflow arm's
+    /// synchronous stand-in is the smallest rotor tree (the past-`2 × M`
+    /// law).
+    fn lease_choice_slot(
+        &self,
+        volume_idx: usize,
+        choice: crate::slot_lease_core::MintChoice,
+    ) -> Option<u64> {
+        let vol = self.volumes.get(volume_idx)?;
+        let forest = match choice {
             crate::slot_lease_core::MintChoice::Affinity(s)
             | crate::slot_lease_core::MintChoice::Rotor(s)
             | crate::slot_lease_core::MintChoice::Smallest(s) => s,
             crate::slot_lease_core::MintChoice::Overflow => {
-                // The synchronous face cannot acquire: the smallest rotor
-                // tree (the past-`2 × M` law) stands in.
                 let plane = vol.slot_leases()?;
                 let rotor = plane.rotor.load();
-                *rotor.iter().min_by_key(|s| (plane.extents.get(**s), **s))?
+                *rotor
+                    .iter()
+                    .min_by_key(|s| (plane.extents.get(**s), **s))?
             }
         };
         vol.routing_slot_of_forest(forest).ok().map(u64::from)
@@ -1853,27 +1874,25 @@ impl RoutedMetaBackend {
         if self.routing_width > 1 {
             if let Some(vol) = self.volumes.get(volume_idx) {
                 if vol.slot_lease_armed() {
-                    let (pv, local) = self.route_ino(parent);
-                    let parent_slot =
-                        (pv == volume_idx).then(|| kv::record::forest_slot_of_ino(local));
-                    if let Some(crate::slot_lease_core::MintChoice::Overflow) =
-                        vol.lease_mint_choice(parent_slot)
-                    {
-                        match vol.lease_mint_overflow().await {
-                            Ok(Some(slot)) => {
-                                if let Ok(r) = vol.routing_slot_of_forest(slot) {
-                                    return u64::from(r);
+                    let parent_slot = self.lease_parent_slot(volume_idx, Some(parent));
+                    if let Some(choice) = vol.lease_mint_choice(parent_slot) {
+                        if choice == crate::slot_lease_core::MintChoice::Overflow {
+                            match vol.lease_mint_overflow().await {
+                                Ok(Some(slot)) => {
+                                    if let Ok(r) = vol.routing_slot_of_forest(slot) {
+                                        return u64::from(r);
+                                    }
                                 }
+                                Ok(None) => {}
+                                Err(e) => log::warn!(
+                                    "volume {volume_idx}: the affinity-ceiling overflow ask \
+                                     failed ({e}) — minting into the smallest rotor tree"
+                                ),
                             }
-                            Ok(None) => {}
-                            Err(e) => log::warn!(
-                                "volume {volume_idx}: the affinity-ceiling overflow ask failed \
-                                 ({e}) — minting into the smallest rotor tree"
-                            ),
                         }
-                    }
-                    if let Some(slot) = self.lease_mint_slot(volume_idx, Some(parent)) {
-                        return slot;
+                        if let Some(slot) = self.lease_choice_slot(volume_idx, choice) {
+                            return slot;
+                        }
                     }
                 }
             }

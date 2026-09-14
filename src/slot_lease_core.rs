@@ -932,14 +932,17 @@ pub fn mint_choice(
             .map(|(_, (s, _))| *s)?;
         return Some(MintChoice::Smallest(smallest));
     }
-    // Most headroom; ties broken by the round-robin cursor so equal trees
-    // spread (the mint-spread law scoped to the node).
+    // Most headroom — SIGNED, so once every rotor tree is at or over the
+    // cap the least-over (smallest) tree takes the mint and the trees
+    // equalize instead of one running away; ties broken by the
+    // round-robin cursor so equal trees spread (the mint-spread law
+    // scoped to the node).
     let n = rotors.len();
     let best = rotors
         .iter()
         .enumerate()
         .max_by_key(|(i, (_, b))| {
-            let headroom = a_max.saturating_sub(*b);
+            let headroom = i128::from(a_max) - i128::from(*b);
             (headroom, std::cmp::Reverse((*i + n - rr % n) % n))
         })
         .map(|(_, (s, _))| *s)?;

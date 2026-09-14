@@ -46,11 +46,36 @@ pub fn resolve_mint_slots(width: u64, writers_known: u64) -> u64 {
 /// clamped to `[node_size, heap_bytes]` — the design's "one-extent
 /// floor" is `node_size`, the heap is the degenerate hard ceiling), else
 /// the DYNAMIC [`affinity_ceiling_bytes`] over the volume's current used
-/// bytes.
-pub fn resolve_affinity_ceiling(used_bytes: u64, node_size: u64, heap_bytes: u64) -> u64 {
-    match crate::env_knobs::opt_int_knob::<u64>(SYM_AFFINITY_MAX_MB_ENV) {
+/// bytes. `static_mb` is the knob as read ONCE at open
+/// ([`SlotLeasePlane::affinity_static_mb`]).
+pub fn affinity_ceiling_in_force(
+    static_mb: Option<u64>,
+    used_bytes: u64,
+    node_size: u64,
+    heap_bytes: u64,
+) -> u64 {
+    match static_mb {
         Some(mb) => (mb << 20).clamp(node_size, heap_bytes.max(node_size)),
         None => affinity_ceiling_bytes(used_bytes, node_size).min(heap_bytes.max(node_size)),
+    }
+}
+
+/// [`affinity_ceiling_in_force`] with the knob read now (the open's read).
+pub fn resolve_affinity_ceiling(used_bytes: u64, node_size: u64, heap_bytes: u64) -> u64 {
+    affinity_ceiling_in_force(
+        crate::env_knobs::opt_int_knob::<u64>(SYM_AFFINITY_MAX_MB_ENV),
+        used_bytes,
+        node_size,
+        heap_bytes,
+    )
+}
+
+/// The rotor size in force from an explicit knob value read at open
+/// (`Some` wins verbatim) or the derivation over the census.
+pub fn mint_slots_in_force(knob: Option<u64>, width: u64, writers_known: u64) -> u64 {
+    match knob {
+        Some(n) => n.clamp(1, MINT_SPREAD),
+        None => mint_slots_derived(width, writers_known),
     }
 }
 
@@ -171,6 +196,21 @@ pub struct SlotLeasePlane {
     pub dominance: DominanceWindow,
     /// The rotor size in force (`slot_rotor`).
     pub mint_slots: AtomicU64,
+    /// `SQUEEZEFS_SYM_MINT_SLOTS` as read at open (`None` = derived from
+    /// the census at every cadence).
+    pub mint_slots_knob: Option<u64>,
+    /// `SQUEEZEFS_SYM_AFFINITY_MAX_MB` as read at open (`None` = the
+    /// dynamic derivation).
+    pub affinity_static_mb: Option<u64>,
+    /// The PR-2 seam's declared partition (`SQUEEZEFS_TEST_SYM_APPENDER_
+    /// SLOTS`) as the arm's WISH-LIST for each declared region: acquired
+    /// where unleased or already the region's, skipped where another
+    /// appender holds the slot (the real acquire path decides).
+    pub declared: std::collections::BTreeMap<u32, std::collections::BTreeSet<ForestSlot>>,
+    /// Test seam: the census the forced shrink derives `M` from, when set
+    /// (the in-process contracts cannot stand up 512 joiners; `0` = read
+    /// `appenders_known`).
+    pub test_writers_known: AtomicU64,
     /// `T_idle` in force, ms.
     pub t_idle_ms: u64,
     /// Region 0's rotor slots in acquisition order (the mint policy's
@@ -190,6 +230,13 @@ pub struct SlotLeasePlane {
     pub ewma_ship_ns: AtomicU64,
     /// The manager's seq the table stamps releases with (`last_written`).
     pub release_seq: AtomicU64,
+    /// Slot → holder as tree 0 records it (§5.1.6) — the ship target's
+    /// and token server's resolution, wire-free.
+    pub holders: crate::slot_holder_cache::SlotHolderCache,
+    /// Per-slot handover cooldown (the S10 valve reused as §5.1.4's
+    /// requester-side cooldown): no new offer of a slot before the
+    /// instant recorded at its last handover.
+    cooldowns: std::sync::Mutex<std::collections::BTreeMap<ForestSlot, u64>>,
     // ---- gauges (§11) ----
     pub acquires: AtomicU64,
     pub grants: AtomicU64,
@@ -211,12 +258,21 @@ pub struct SlotLeasePlane {
 }
 
 impl SlotLeasePlane {
-    pub fn new(gate: Arc<LeaseGate>, extents: Arc<SlotExtentLedger>, mint_slots: u64) -> Self {
+    pub fn new(
+        gate: Arc<LeaseGate>,
+        extents: Arc<SlotExtentLedger>,
+        mint_slots: u64,
+        declared: std::collections::BTreeMap<u32, std::collections::BTreeSet<ForestSlot>>,
+    ) -> Self {
         Self {
+            declared,
             table: SlotLeaseTable::new(),
             gate,
             dominance: DominanceWindow::new(),
             mint_slots: AtomicU64::new(mint_slots),
+            mint_slots_knob: crate::env_knobs::opt_int_knob::<u64>(SYM_MINT_SLOTS_ENV),
+            affinity_static_mb: crate::env_knobs::opt_int_knob::<u64>(SYM_AFFINITY_MAX_MB_ENV),
+            test_writers_known: AtomicU64::new(0),
             t_idle_ms: resolve_t_idle_ms(),
             rotor: arc_swap::ArcSwap::from_pointee(Vec::new()),
             rr: AtomicUsize::new(0),
@@ -226,6 +282,8 @@ impl SlotLeasePlane {
             ewma_handover_ns: AtomicU64::new(0),
             ewma_ship_ns: AtomicU64::new(0),
             release_seq: AtomicU64::new(0),
+            holders: crate::slot_holder_cache::SlotHolderCache::new(),
+            cooldowns: std::sync::Mutex::new(std::collections::BTreeMap::new()),
             acquires: AtomicU64::new(0),
             grants: AtomicU64::new(0),
             offers_idle: AtomicU64::new(0),
@@ -280,6 +338,46 @@ impl SlotLeasePlane {
     /// The rotor size in force.
     pub fn mint_slots(&self) -> u64 {
         self.mint_slots.load(Ordering::Relaxed)
+    }
+
+    /// The handover cooldown of one slot (§5.1.4 — the S10 never-thrash
+    /// valve, `recall_cooldown_from`, over the `T_idle` window): a slot
+    /// handed over at `now_ns` is offered again no sooner than this.
+    pub fn cooldown_ns(&self) -> u64 {
+        crate::meta_ship::tokens::recall_cooldown_from(
+            crate::env_knobs::opt_int_knob::<u64>(crate::meta_ship::tokens::RECALL_COOLDOWN_ENV),
+            std::time::Duration::from_millis(self.t_idle_ms),
+        )
+        .as_nanos() as u64
+    }
+
+    /// Record a handover of `slot` at `now_ns`: its cooldown starts.
+    pub fn note_handover(&self, slot: ForestSlot, now_ns: u64) {
+        self.cooldowns
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(slot, now_ns.saturating_add(self.cooldown_ns()));
+    }
+
+    /// Whether `slot` is inside its handover cooldown at `now_ns`.
+    pub fn in_cooldown(&self, slot: ForestSlot, now_ns: u64) -> bool {
+        self.cooldowns
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&slot)
+            .is_some_and(|until| now_ns < *until)
+    }
+
+    /// Mirror the lease table into the holder cache (the manager's own
+    /// tree-0 view — every grant and release it writes lands here).
+    pub fn refresh_holders(&self) {
+        self.holders.refresh(
+            self.table
+                .snapshot()
+                .into_iter()
+                .filter(|(_, l)| l.state != crate::slot_lease_core::LeaseState::Unleased)
+                .map(|(s, l)| (s, l.holder, l.g)),
+        );
     }
 
     /// `N_floor` in force (`slot_offer_n_floor`): the measured handover
@@ -344,8 +442,8 @@ impl SlotLeasePlane {
             lru_releases: self.lru_releases.load(Relaxed),
             forced_shrinks: self.forced_shrinks.load(Relaxed),
             conflicts: self.conflicts.load(Relaxed),
-            resolve_rpcs: self.resolve_rpcs.load(Relaxed),
-            resolve_redirects: self.resolve_redirects.load(Relaxed),
+            resolve_rpcs: self.resolve_rpcs.load(Relaxed) + self.holders.resolve_rpcs(),
+            resolve_redirects: self.resolve_redirects.load(Relaxed) + self.holders.redirects(),
             tree_inos_p50: percentile(&inos, 50),
             tree_inos_p99: percentile(&inos, 99),
             tree_inos_max: inos.iter().copied().max().unwrap_or(0),

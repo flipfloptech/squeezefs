@@ -2384,3 +2384,120 @@ async fn a_stale_release_is_refused_before_tree0_is_written() {
     assert_eq!(vol.journal_ring().written_entries(), entries_before);
     shutdown(&routed).await;
 }
+
+/// The two-sided grant closure on every path a slot tree changes hands
+/// (review round 2, Issue 4): `extent_grant_extents ≡ claimed + returned
+/// + unclaimed` holds after a HANDOVER and after a clean LEAVE, the
+/// departing region's grant RECORD stops naming the released trees' live
+/// images on both paths, and a compaction by the new lessee after the
+/// leave leaves fsck C13 empty — the first build moved the images with
+/// the handover only, so a leave left them claimed in the old record for
+/// C13 to "return" (a double free once the new lessee retired them).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_leave_moves_the_released_trees_images_out_of_the_regions_grant() {
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    let uris = vec![format_stamped_member(dir.path(), "meta0").await];
+    let tag = volume_tag("vol-000000000000000d");
+    let owner = ino_in_slot(SLOT4, 5);
+    let closure = |s: &squeezefs::meta_backend::kv::appender::AppenderStats| {
+        assert_eq!(
+            s.grant_granted,
+            s.grant_claimed + s.grant_returned + s.grant_unclaimed,
+            "extent_grant_extents ≡ claimed + returned + unclaimed: {s:?}"
+        );
+    };
+    let images = {
+        let routed = open_under(&uris, &Knobs::armed().partition(PARTITION)).await;
+        let vol = Arc::clone(&routed.volumes[0]);
+        for i in 0..40u64 {
+            vol.commit_block_refs(owner, &refs(tag, owner, i * 8, 4))
+                .await
+                .unwrap();
+        }
+        vol.checkpoint_now().await.unwrap();
+        // Region 1's grant claims the slot-4 tree's images; the record
+        // names them.
+        let tree = vol
+            .all_trees()
+            .into_iter()
+            .find(|t| t.forest_slot() == Some(SLOT4))
+            .expect("slot 4's tree");
+        let heap = vol.superblock().heap.start;
+        let node = u64::from(vol.superblock().node_size);
+        let images: Vec<u64> = tree
+            .reachable_node_addrs()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|a| (a - heap) / node)
+            .collect();
+        assert!(!images.is_empty());
+        let record = vol.extent_grant_record(1).await.unwrap();
+        assert!(
+            images.iter().all(|e| record.contains(*e)),
+            "region 1's record claims its tree's images"
+        );
+        closure(&vol.appender_stats().unwrap());
+        // The clean leave.
+        shutdown(&routed).await;
+        images
+    };
+    // The remount WITHOUT the declared region: the manager takes slot 4
+    // by first touch and compacts the tree it inherited.
+    let routed = open_under(&uris, &Knobs::armed()).await;
+    let vol = Arc::clone(&routed.volumes[0]);
+    let record = vol.extent_grant_record(1).await.unwrap();
+    assert!(
+        images.iter().all(|e| !record.contains(*e)),
+        "the leave moved the released tree's images out of region 1's record: {:?} ∩ {:?}",
+        images,
+        record.runs
+    );
+    closure(&vol.appender_stats().unwrap());
+    for i in 40..400u64 {
+        vol.commit_block_refs(owner, &refs(tag, owner, i * 8, 4))
+            .await
+            .unwrap();
+    }
+    vol.checkpoint_now().await.unwrap();
+    assert!(
+        vol.c13_orphan_image_extents().await.unwrap().is_empty(),
+        "no grant claims an image the new lessee retired"
+    );
+    // And after a HANDOVER back to a declared region the closure holds on
+    // both sides too.
+    shutdown(&routed).await;
+    let routed = open_under(&uris, &Knobs::armed().partition(PARTITION)).await;
+    let vol = Arc::clone(&routed.volumes[0]);
+    let set = vol.appender_stats().unwrap();
+    assert_eq!(
+        set.regions[1].leases, 1,
+        "the wish-list took the unleased slot 4 back"
+    );
+    closure(&set);
+    vol.commit_block_refs(owner, &refs(tag, owner, 4_000, 4))
+        .await
+        .unwrap();
+    vol.manager_offer_slot(1, SLOT4, 0).await.unwrap();
+    let AcquireSlotReply::Granted(_) = vol.manager_acquire_slot(0, SLOT4).await.unwrap() else {
+        panic!()
+    };
+    closure(&vol.appender_stats().unwrap());
+    let record = vol.extent_grant_record(1).await.unwrap();
+    let tree = vol
+        .all_trees()
+        .into_iter()
+        .find(|t| t.forest_slot() == Some(SLOT4))
+        .unwrap();
+    let heap = vol.superblock().heap.start;
+    let node = u64::from(vol.superblock().node_size);
+    for a in tree.reachable_node_addrs().await.unwrap() {
+        assert!(
+            !record.contains((a - heap) / node),
+            "the handover moved the images too"
+        );
+    }
+    assert!(vol.c13_orphan_image_extents().await.unwrap().is_empty());
+    shutdown(&routed).await;
+}

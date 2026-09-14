@@ -1956,7 +1956,10 @@ async fn an_smo_retirement_on_an_offset_ring_releases_on_its_entrys_coverage() {
     drop(routed);
     let routed = open_under(&uris, &Knobs::armed().partition(PARTITION)).await;
     let vol = Arc::clone(&routed.volumes[0]);
-    assert!(vol.journal_ring().seq_offset() > 0, "the offset is recovered");
+    assert!(
+        vol.journal_ring().seq_offset() > 0,
+        "the offset is recovered"
+    );
     for _ in 0..4 {
         if vol.allocator().pending_count() == 0 {
             break;

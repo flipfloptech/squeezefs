@@ -46,6 +46,12 @@
 # `rename` lock hole, layout-independent) rides both legs too: the pin
 # forces a rename and a layout publish of one inode into ONE conveyor
 # batch, which the fixed lock set must make impossible on either layout.
+# `sym_convert_tests` (PR 11 — `enable-symmetric` + `format --symmetric`)
+# is layout-blind by construction: its source volumes are formatted FLAT
+# with the seam cleared (the verb is what stamps), so both legs run the
+# same conversion; it rides the list so the marker gate, the hybrid
+# ledger and the forest it leaves are exercised whichever leg the
+# environment selects.
 #
 # WALL TIME IS A ROW (review round 4, Issue 26): each suite runs under
 # its own timer per leg, and the summary prints `flat`, `stamped` and the
@@ -98,6 +104,7 @@ DEFAULT_SUITES=(
   sym_fence_tests
   sym_slot_transfer_tests
   rename_lock_set_tests
+  sym_convert_tests
 )
 read -r -a SUITES <<<"${SQZ_SYM_SUITES:-${DEFAULT_SUITES[*]}}"
 RATIO_NOTE="${SQZ_SYM_RATIO_NOTE:-2.0}"

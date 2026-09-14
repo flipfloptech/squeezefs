@@ -343,6 +343,7 @@ fn the_mount_gated_suites_all_use_the_shared_gate() {
         "posix_mount_semantics_tests.rs",
         "small_file_packing_tests.rs",
         "statfs_tests.rs",
+        "sym_convert_fuse_tests.rs",
         "transport_concurrency_tests.rs",
         "transport_geometry_tests.rs",
         "transport_ingress_tests.rs",

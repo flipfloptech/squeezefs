@@ -46,6 +46,7 @@ DEFAULT_TESTS=(
   posix_mount_semantics_tests
   small_file_packing_tests
   statfs_tests
+  sym_convert_fuse_tests
   transport_concurrency_tests
   transport_geometry_tests
   transport_ingress_tests

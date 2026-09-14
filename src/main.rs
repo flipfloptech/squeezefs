@@ -115,15 +115,15 @@ enum Commands {
         /// class the operator did not ask for.
         #[arg(long, conflicts_with = "multi_writer")]
         single_writer: bool,
-        /// Format the symmetric slot-tree FOREST (incompat bit 17)
+        /// Format the symmetric slot-tree forest (incompat bit 17)
         ///
         /// Every metadata volume is built as one mixed-kind tree per
         /// routing slot with a control tree and an appender directory —
         /// the on-disk shape of the symmetric shared-disk metadata
         /// program, in which every mount is an equal metadata authority.
         /// Dark until that program's default flip: a plain `format` never
-        /// stamps the bit, and pre-symmetric binaries refuse this set
-        /// loud. Existing sets convert offline with `squeezefs volume
+        /// stamps the bit, and pre-symmetric binaries refuse this set.
+        /// Existing sets convert offline with `squeezefs volume
         /// enable-symmetric`. Conflicts with `--single-writer`: the
         /// forest presumes the multi-writer format class.
         #[arg(long, conflicts_with = "single_writer")]
@@ -1114,12 +1114,12 @@ enum NvmeofActions {
     },
     /// Read a namespace's Persistent Reservation report the way the guard does
     ///
-    /// The product's own REGCTL-sized two-step read (design-symmetric-
-    /// metadata §5.8.1, KD-SYM-18): every registrant the header names is
-    /// decoded — the fixed 4 KiB buffer that truncated the report at the
-    /// 63rd extended registrant is gone. Prints the holder, the type, the
-    /// registrant count and the bytes transferred, plus the registrant
-    /// cap in force (declared or learned; 0 = unbounded).
+    /// The product's own two-step read, sized by the report's registrant
+    /// count: every registrant the header names is decoded (the fixed
+    /// 4 KiB buffer that truncated the report at the 63rd extended
+    /// registrant is gone). Prints the holder, the type, the registrant
+    /// count and the bytes transferred, plus the registrant cap in force
+    /// (declared or learned; 0 = unbounded).
     ResvReport {
         /// The NVMe namespace node (e.g. /dev/nvme2n1)
         dev: String,
@@ -1384,7 +1384,7 @@ enum VolumeActions {
     /// marker is removed last. A crashed run leaves the set unmountable
     /// for writers; `--resume` continues it from the crash point.
     ///
-    /// Refuses loud: a set that is already symmetric, a volume whose
+    /// Refuses: a set that is already symmetric, a volume whose
     /// ledger was last written by a multi-appender era (mount solo once
     /// first), an open cross-volume intent, an in-flight maintenance job,
     /// a live client. Per-volume owner assignments (`volume set-owners`)

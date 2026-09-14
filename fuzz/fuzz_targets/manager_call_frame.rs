@@ -44,8 +44,8 @@ use squeezefs::meta_backend::kv::appender::{
     clamp_grant_want, coalesce_runs, intersect_coalesced_with_record, runs_extent_count,
     validate_return_runs, GrantRun,
 };
-use squeezefs::meta_backend::kv::tree::RootPtr;
 use squeezefs::meta_backend::kv::slot_state::{ExtentGrantRecord, SlotState};
+use squeezefs::meta_backend::kv::tree::RootPtr;
 use squeezefs::meta_ship::manager::{
     decode_reply, decode_request, encode_reply, encode_request, ManagerCall, ManagerReply,
     ManagerReplyFrame, ManagerRequestFrame, WireIdentity, WireSlotGrant, WireSlotWords,

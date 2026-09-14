@@ -7018,7 +7018,11 @@ mod slot_lease_models {
             let expired = expirer.join().unwrap();
             let accepted = acceptor.join().unwrap();
             let e = table.get(SLOT).unwrap();
-            assert_eq!((e.holder, e.g), (1, 1), "the holder never changed under the race");
+            assert_eq!(
+                (e.holder, e.g),
+                (1, 1),
+                "the holder never changed under the race"
+            );
             match accepted {
                 AcquireOutcome::Recall { holder: 1, g: 1 } => {
                     // The accept saw the live offer; the expiry then ran
@@ -7062,7 +7066,10 @@ mod slot_lease_models {
                 ReleaseOutcome::Refused { .. }
             ));
             assert_eq!(live.join().unwrap(), ReleaseOutcome::Released);
-            assert_eq!(table.release(SLOT, 1, 1, words, 11), ReleaseOutcome::Already);
+            assert_eq!(
+                table.release(SLOT, 1, 1, words, 11),
+                ReleaseOutcome::Already
+            );
             let e = table.get(SLOT).unwrap();
             assert_eq!((e.words, e.last_written), (words, 10));
             assert!(matches!(

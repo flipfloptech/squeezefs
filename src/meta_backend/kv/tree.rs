@@ -2171,10 +2171,15 @@ impl KvTree {
         // parent maintenance if its delta crossed the threshold.
         let free_gate_seq = match smo_entry {
             Some((res, recs)) => {
-                let gate = recs
-                    .last()
-                    .map(|(_, r)| r.seq)
-                    .expect("an SMO entry always carries its free record");
+                // The free record's POSITION-domain seq (`record_gate`):
+                // the durable tail that covers it is a position, and on
+                // a ring stamping above its positions the stamp would
+                // park the extent `seq_offset` bytes past the entry.
+                debug_assert!(
+                    !recs.is_empty(),
+                    "an SMO entry always carries its free record"
+                );
+                let gate = res.record_gate(recs.len().saturating_sub(1));
                 let j = ctx.journal.as_ref().expect("entry implies hooks");
                 let ring = ctx.smo_ring().expect("entry implies hooks");
                 if let Err(e) = ring.commit_entry(&res, &recs).await {
@@ -3072,13 +3077,16 @@ impl KvTree {
         freeze_r.armed = false;
 
         // ---- Step 3: after release — entry bytes, both retirements gated
-        // on the entry's last seq, parent maintenance, counters.
+        // on the entry's last record's POSITION (`Reservation::record_gate`
+        // — the tail's domain, never the stamp), parent maintenance,
+        // counters.
         let free_gate_seq = match smo_entry {
             Some((res, recs)) => {
-                let gate = recs
-                    .last()
-                    .map(|(_, r)| r.seq)
-                    .expect("a merge entry always carries its free records");
+                debug_assert!(
+                    !recs.is_empty(),
+                    "a merge entry always carries its free records"
+                );
+                let gate = res.record_gate(recs.len().saturating_sub(1));
                 let j = ctx.journal.as_ref().expect("entry implies hooks");
                 let ring = ctx.smo_ring().expect("entry implies hooks");
                 if let Err(e) = ring.commit_entry(&res, &recs).await {
@@ -3238,7 +3246,8 @@ impl KvTree {
 
         let free_gate_seq = match smo_entry {
             Some((res, recs)) => {
-                let gate = recs.last().map(|(_, r)| r.seq).expect("the free record");
+                debug_assert!(!recs.is_empty(), "the free record");
+                let gate = res.record_gate(recs.len().saturating_sub(1));
                 let j = ctx.journal.as_ref().expect("entry implies hooks");
                 let ring = ctx.smo_ring().expect("entry implies hooks");
                 if let Err(e) = ring.commit_entry(&res, &recs).await {

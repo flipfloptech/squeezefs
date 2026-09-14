@@ -6284,7 +6284,7 @@ impl KvMetaBackend {
         let mut recs = recs;
         recs[0].1.seq = seq_base;
         ring.commit_entry(&res, &recs).await?;
-        region.grant().free_pending(extent, res.start);
+        region.grant().free_pending(extent, res.record_gate(0));
         log::info!(
             "meta volume {}: fsck C13 returned orphan image extent {extent} of appender \
              {appender} (freed in its ring at seq {}; the cadence returns it to the bitmap)",
@@ -14540,7 +14540,7 @@ impl KvMetaBackend {
             // predates, a `free` a retirement parked on this ring's tail.
             let mut interior: Vec<(u8, u64, &Record)> = Vec::new();
             for entry in &rec.entries {
-                for (tag, r) in &entry.records {
+                for (i, (tag, r)) in entry.records.iter().enumerate() {
                     let (tree_id, level) = untag(*tag);
                     if tree_id == super::record::TREE_ALLOC_RESERVED {
                         if let Some(region) = set.region(*id) {
@@ -14549,7 +14549,10 @@ impl KvMetaBackend {
                                     region.grant().claim_exact(extent);
                                 }
                                 super::alloc_ext::AllocDelta::Freed { extent, .. } => {
-                                    region.grant().free_exact(extent, r.seq);
+                                    // Parked on the record's POSITION
+                                    // (`Reservation::record_gate`'s law):
+                                    // the region's tail is a position.
+                                    region.grant().free_exact(extent, entry.seq + i as u64);
                                 }
                             }
                         }

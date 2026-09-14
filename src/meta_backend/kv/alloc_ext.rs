@@ -628,7 +628,7 @@ impl ExtentAllocator {
         let mut folded: std::collections::BTreeMap<u64, (u16, u64, AllocDelta)> =
             std::collections::BTreeMap::new();
         for (writer, entry_seq, records) in &replay {
-            for (tree_id, rec) in *records {
+            for (i, (tree_id, rec)) in records.iter().enumerate() {
                 if *tree_id != TREE_ALLOC_RESERVED {
                     continue;
                 }
@@ -650,8 +650,13 @@ impl ExtentAllocator {
                 }
                 // Entries arrive in canonical merge order; per-key
                 // newest-wins is a plain overwrite (an extent's records
-                // all come from its owner, whose seqs are monotonic).
-                folded.insert(extent, (*writer, rec.seq, delta));
+                // all come from its owner, whose seqs are monotonic). The
+                // park gate is the record's POSITION (`entry_seq + i`,
+                // `Reservation::record_gate`'s law) — the tail that
+                // covers it is a position, and the record's STAMP sits
+                // `seq_offset` above it on a ring that received a
+                // handed-over slot (PR 4 review round 3, Issue 20).
+                folded.insert(extent, (*writer, entry_seq + i as u64, delta));
             }
         }
         // Apply survivors; parked finals push per partition in seq order

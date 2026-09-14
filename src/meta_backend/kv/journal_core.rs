@@ -235,6 +235,17 @@ impl Reservation {
     pub fn end(&self) -> u64 {
         self.start + self.len
     }
+
+    /// The POSITION-domain seq of this entry's `i`-th record — what a
+    /// §4.7 pending free parks on and the durable tail (a position)
+    /// covers: `start + i`, inside `[start, end())` since a record is at
+    /// least one byte. The record's STAMP is `seq_base + i` (the overlay's
+    /// domain, [`SeqSpan`]); on a ring stamping above its positions a
+    /// free gated on the stamp waited `seq_offset` bytes past its entry
+    /// (PR 4 review round 3, Issue 20's third site).
+    pub fn record_gate(&self, i: usize) -> u64 {
+        self.start + i as u64
+    }
 }
 
 /// **The RECORD-SEQ span of one journal entry or one contiguous batch —

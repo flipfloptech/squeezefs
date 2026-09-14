@@ -926,6 +926,12 @@ pub fn verify_node_extent(
     // same-incarnation bsets that DO verify. horizon ≤ durable_tail ⇒
     // checkpoint-covered data after a tear ⇒ fail the node loud; otherwise
     // they are unreachable replay-window appends — dropped and counted.
+    // The horizon is a record STAMP and the tail a ring-0 position: on a
+    // forest slot tree (another ring, or a ring stamping above its
+    // positions — the seq-space law) a larger horizon satisfies `≤` less
+    // often, so the domain gap can only make this tripwire QUIETER — its
+    // sensitivity, never a load's safety (the walk above branched on no
+    // seq).
     let mut dropped = u64::from(torn_stop);
     let mut probe = pos.saturating_add(NODE_PAGE);
     while probe + BSET_FRAME_LEN <= node_size {

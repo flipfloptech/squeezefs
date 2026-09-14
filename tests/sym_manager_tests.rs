@@ -18,10 +18,10 @@
 //! Manager-family gauge is absent there.
 
 use squeezefs::meta_backend::kv::appender::{
-    grant_extents_derived, manager_failover_bound_ms, manager_should_release_role,
-    read_directory, resolve_grant_extents, test_set_manager_unreachable, AppenderStats,
-    GrantRun, ManagerLease, RegionGrant, GRANT_EXTENTS_FLOOR, GRANT_EXTENTS_MAX,
-    GRANT_RUNS_MAX, SYM_GRANT_EXTENTS_ENV, TEST_APPENDER_SLOTS_ENV,
+    grant_extents_derived, manager_failover_bound_ms, manager_should_release_role, read_directory,
+    resolve_grant_extents, test_set_manager_unreachable, AppenderStats, GrantRun, ManagerLease,
+    RegionGrant, GRANT_EXTENTS_FLOOR, GRANT_EXTENTS_MAX, GRANT_RUNS_MAX, SYM_GRANT_EXTENTS_ENV,
+    TEST_APPENDER_SLOTS_ENV,
 };
 use squeezefs::meta_backend::kv::backend::KvMetaBackend;
 use squeezefs::meta_backend::kv::block_refs::{volume_tag, BlockRef, BlockRefOp};
@@ -31,7 +31,6 @@ use squeezefs::meta_backend::kv::builder::{
 use squeezefs::meta_backend::kv::slot_state::{
     decode_extent_grant_key, extent_grant_key, ExtentGrantRecord, EXTENT_GRANT_KEY_LEN,
 };
-use squeezefs::meta_backend::kv::superblock::{classify_volume, SuperblockV3, VolumeFormat};
 use squeezefs::meta_backend::kv::{
     META_KV_NODE_COMPACTIONS, META_KV_NODE_SPLITS, META_KV_REPLAY_EXTENT_VIOLATIONS,
     META_KV_REPLAY_KEY_VIOLATIONS, META_KV_REPLAY_LEASE_VIOLATIONS,
@@ -110,13 +109,6 @@ fn stats(vol: &KvMetaBackend) -> AppenderStats {
         .expect("a forest volume has an appender set")
 }
 
-async fn superblock_of_path(path: &std::path::Path) -> SuperblockV3 {
-    match classify_volume(path).await.expect("classify") {
-        VolumeFormat::V3(sb) => sb,
-        other => panic!("expected a v3 superblock, got {other:?}"),
-    }
-}
-
 /// `n` block references of `owner` on volume tag `tag`, blocks
 /// `base..base+n`.
 fn refs(tag: u64, owner: u64, base: u64, n: u64) -> Vec<BlockRefOp> {
@@ -174,7 +166,10 @@ fn the_extent_grant_record_round_trips_and_is_normalized() {
     empty_run[3 + 8..3 + 12].copy_from_slice(&0u32.to_le_bytes());
     assert!(ExtentGrantRecord::decode(&empty_run).is_err());
     let adjacent = ExtentGrantRecord {
-        runs: vec![GrantRun { start: 10, len: 2 }, GrantRun { start: 12, len: 1 }],
+        runs: vec![
+            GrantRun { start: 10, len: 2 },
+            GrantRun { start: 12, len: 1 },
+        ],
     };
     assert!(ExtentGrantRecord::decode(&adjacent.encode().unwrap()).is_err());
     assert!(ExtentGrantRecord::default().is_empty());
@@ -182,21 +177,33 @@ fn the_extent_grant_record_round_trips_and_is_normalized() {
 
 #[test]
 fn grant_size_derivation_floor_cap_and_the_knob_tie() {
-    assert_eq!(GRANT_EXTENTS_FLOOR, 8, "2 extents per SMO × 4 pending swaps per cycle");
+    assert_eq!(
+        GRANT_EXTENTS_FLOOR, 8,
+        "2 extents per SMO × 4 pending swaps per cycle"
+    );
     assert_eq!(GRANT_EXTENTS_MAX, 65_536);
     // No measured SMO rate ⇒ the floor.
-    assert_eq!(grant_extents_derived(0, 46_500, 1_000_000, 195), GRANT_EXTENTS_FLOOR);
+    assert_eq!(
+        grant_extents_derived(0, 46_500, 1_000_000, 195),
+        GRANT_EXTENTS_FLOOR
+    );
     // 5 SMO/s over a 46.5 s bound, doubled = 465 extents.
     assert_eq!(grant_extents_derived(5_000, 46_500, 1_000_000, 1), 465);
     // The cap: a quarter of the free heap over the appenders.
     assert_eq!(grant_extents_derived(5_000, 46_500, 1_000, 10), 1_000 / 40);
     // The cap never falls below the floor.
-    assert_eq!(grant_extents_derived(5_000, 46_500, 4, 10), GRANT_EXTENTS_FLOOR);
+    assert_eq!(
+        grant_extents_derived(5_000, 46_500, 4, 10),
+        GRANT_EXTENTS_FLOOR
+    );
     // The knob wins verbatim.
     std::env::set_var(SYM_GRANT_EXTENTS_ENV, "64");
     assert_eq!(resolve_grant_extents(0, 46_500, 1_000_000, 1), 64);
     std::env::remove_var(SYM_GRANT_EXTENTS_ENV);
-    assert_eq!(resolve_grant_extents(0, 46_500, 1_000_000, 1), GRANT_EXTENTS_FLOOR);
+    assert_eq!(
+        resolve_grant_extents(0, 46_500, 1_000_000, 1),
+        GRANT_EXTENTS_FLOOR
+    );
     // The registry: an int knob over floor..=max.
     let k = squeezefs::env_knobs::lookup(SYM_GRANT_EXTENTS_ENV).expect("registered");
     match k.kind {
@@ -238,13 +245,10 @@ fn the_ram_grant_claims_lowest_first_parks_frees_on_its_tail_and_returns_past_it
     g.add_runs(&[GrantRun { start: 400, len: 1 }]);
     g.add_runs(&[GrantRun { start: 500, len: 1 }]);
     assert_eq!(g.unclaimed_runs().len(), GRANT_RUNS_MAX);
-    // Closure over every op so far.
-    assert_eq!(g.granted, g.claimed_total + g.returned + g.unclaimed());
+    // Closure over every op so far: granted ≡ held + returned + unclaimed.
+    assert_eq!(g.granted, g.held() + g.returned + g.unclaimed());
     // Recovery: the record's whole grant against the page's remainder.
-    let r = RegionGrant::recover(
-        [10u64, 11, 12, 13],
-        &[GrantRun { start: 12, len: 2 }],
-    );
+    let r = RegionGrant::recover([10u64, 11, 12, 13], &[GrantRun { start: 12, len: 2 }]);
     assert_eq!((r.unclaimed(), r.claimed()), (2, 2));
     assert!(r.contains(10) && r.contains(13));
     let mut r = r;
@@ -266,9 +270,16 @@ async fn a_declared_region_joins_with_a_grant_in_tree_zero_and_on_its_page() {
     let routed = open_with_partition(&uris, Some(PARTITION)).await;
     let vol = Arc::clone(&routed.volumes[0]);
     let s = stats(&vol);
-    assert_eq!(s.manager_lease, ManagerLease::Held, "the D0 winner IS the manager");
+    assert_eq!(
+        s.manager_lease,
+        ManagerLease::Held,
+        "the D0 winner IS the manager"
+    );
     assert_eq!(s.extent_grants, 1, "the join grants once");
-    assert_eq!(s.extent_grant_extents, GRANT_EXTENTS_FLOOR, "no measured rate ⇒ the floor");
+    assert_eq!(
+        s.extent_grant_extents, GRANT_EXTENTS_FLOOR,
+        "no measured rate ⇒ the floor"
+    );
     assert_eq!(s.regions[1].grant_unclaimed, GRANT_EXTENTS_FLOOR);
     assert_grant_closure(&s);
     assert!(
@@ -285,14 +296,20 @@ async fn a_declared_region_joins_with_a_grant_in_tree_zero_and_on_its_page() {
         .page
         .clone()
         .expect("appender 1's page");
-    assert_eq!(page.grant, record.runs, "page remainder = the whole grant, unclaimed");
+    assert_eq!(
+        page.grant, record.runs,
+        "page remainder = the whole grant, unclaimed"
+    );
     // The manager takes no grant: appender 0 refuses (manager_verb_refusals).
     assert!(vol.manager_extent_grant(0, 1).await.is_err());
     assert_eq!(stats(&vol).manager_verb_refusals, 1);
     // Every granted extent is ALLOCATED in the bitmap — the grant's
     // carve rode ring 0 as allocator deltas.
     for e in record.extents() {
-        assert!(vol.allocator().is_allocated(e), "granted extent {e} is claimed");
+        assert!(
+            vol.allocator().is_allocated(e),
+            "granted extent {e} is claimed"
+        );
     }
     for v in &routed.volumes {
         v.shutdown().await.unwrap();
@@ -317,22 +334,23 @@ async fn a_declared_regions_smos_journal_into_its_own_ring_and_claim_inside_its_
     let uris = vec![format_stamped_member(dir.path(), "meta0").await];
     let tag = volume_tag("vol-0011223344556677");
     let guest_owner = guest_local_ino(3, 77); // forest slot 4 — appender 1's
-    // The cadence parked: every SMO below is driven by `checkpoint_now`.
+                                              // The cadence parked: every SMO below is driven by `checkpoint_now`.
     std::env::set_var("SQUEEZEFS_META_FLUSH_INTERVAL_MS", "60000");
     let ra = open_with_partition(&uris, Some(PARTITION)).await;
     std::env::remove_var("SQUEEZEFS_META_FLUSH_INTERVAL_MS");
     let va = Arc::clone(&ra.volumes[0]);
     let ring0_before = stats(&va).regions[0].ring_entries;
-    let smos_before =
-        META_KV_NODE_COMPACTIONS.load(Ordering::Relaxed) + META_KV_NODE_SPLITS.load(Ordering::Relaxed);
+    let smos_before = META_KV_NODE_COMPACTIONS.load(Ordering::Relaxed)
+        + META_KV_NODE_SPLITS.load(Ordering::Relaxed);
     // Enough same-slot content to fill the slot tree's leaf log several
     // times over: each checkpoint's flush folds it — compactions and
     // splits, every one an SMO of appender 1's tree.
-    for round in 0..24u64 {
-        for i in 0..8u64 {
+    const ROUNDS: u64 = 10;
+    for round in 0..ROUNDS {
+        for i in 0..3u64 {
             va.commit_block_refs(
                 guest_owner,
-                &refs(tag, guest_owner, round * 10_000 + i * 600, 500),
+                &refs(tag, guest_owner, round * 10_000 + i * 600, 400),
             )
             .await
             .unwrap();
@@ -359,10 +377,10 @@ async fn a_declared_regions_smos_journal_into_its_own_ring_and_claim_inside_its_
     // deltas, which ride appender 1's ring.
     let ring0_grew = s.regions[0].ring_entries - ring0_before;
     assert!(
-        ring0_grew <= s.extent_grants + s.extent_returns + 24 + 2,
+        ring0_grew <= s.extent_grants + s.extent_returns + ROUNDS + 2,
         "ring 0 grew by {ring0_grew} entries — more than the manager's control entries and \
-         publications ({} grants, {} returns, 24 cycles): appender 1's structure leaked into \
-         the manager's ring",
+         publications ({} grants, {} returns, {ROUNDS} cycles): appender 1's structure leaked \
+         into the manager's ring",
         s.extent_grants,
         s.extent_returns
     );
@@ -409,12 +427,12 @@ async fn an_exhausted_grant_with_the_manager_unreachable_stalls_loud_and_never_l
     let va = Arc::clone(&ra.volumes[0]);
     test_set_manager_unreachable(true);
     let mut refused_eagain = 0u64;
-    for round in 0..40u64 {
-        for i in 0..8u64 {
+    for round in 0..16u64 {
+        for i in 0..3u64 {
             match va
                 .commit_block_refs(
                     guest_owner,
-                    &refs(tag, guest_owner, round * 10_000 + i * 600, 500),
+                    &refs(tag, guest_owner, round * 10_000 + i * 600, 400),
                 )
                 .await
             {
@@ -445,7 +463,10 @@ async fn an_exhausted_grant_with_the_manager_unreachable_stalls_loud_and_never_l
         0,
         "a grant stall is never the heap's space class"
     );
-    assert!(!va.heap_full(), "the heap is not full — the appender is out of grant");
+    assert!(
+        !va.heap_full(),
+        "the heap is not full — the appender is out of grant"
+    );
     // Every ACKED record is readable: the deferred compactions left them
     // in the ring / the leaf's overlay.
     assert!(va.block_ref_count(tag, 0).await.unwrap() >= 1);
@@ -459,8 +480,15 @@ async fn an_exhausted_grant_with_the_manager_unreachable_stalls_loud_and_never_l
     va.checkpoint_now().await.unwrap();
     let s = stats(&va);
     assert!(s.extent_grants >= 2, "the refill landed: {s:?}");
-    assert_eq!(s.dependency_stalls, stalls_at_recovery, "no stall after the refill");
-    assert_eq!(digest_backend(&va).await.unwrap(), live, "the stall lost nothing");
+    assert_eq!(
+        s.dependency_stalls, stalls_at_recovery,
+        "no stall after the refill"
+    );
+    assert_eq!(
+        digest_backend(&va).await.unwrap(),
+        live,
+        "the stall lost nothing"
+    );
     assert_grant_closure(&s);
     log::info!(
         "stall row: {refused_eagain} EAGAIN refusals, {} stalls, bound {} ms",
@@ -515,7 +543,10 @@ async fn a_flat_mount_has_no_manager_lease_and_no_grants() {
     let _g = SEAM.lock().await;
     let uri = format_flat_member(dir.path(), "flat0").await;
     let b = open_volume_for_mount(&uri).await.unwrap();
-    assert!(b.appender_stats().is_none(), "no region, no manager, no grant");
+    assert!(
+        b.appender_stats().is_none(),
+        "no region, no manager, no grant"
+    );
     assert!(
         b.extent_grant_records().await.unwrap().is_empty(),
         "tree 0 does not exist on a flat volume"

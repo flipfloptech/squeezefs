@@ -220,6 +220,187 @@ impl SlotState {
     }
 }
 
+// ---------------------------------------------------------------------------
+// `extent_grant:{appender}` — the manager's attestation of an appender's
+// extent grant (design-symmetric-metadata §5.3.3, PR 3).
+// ---------------------------------------------------------------------------
+
+/// Key prefix of every extent-grant record in tree 0.
+pub const EXTENT_GRANT_KEY_PREFIX: &[u8] = b"extent_grant:";
+/// `prefix ‖ appender_id: u32 BE`.
+pub const EXTENT_GRANT_KEY_LEN: usize = EXTENT_GRANT_KEY_PREFIX.len() + 4;
+/// Record value version (byte 0).
+pub const EXTENT_GRANT_VERSION: u8 = 1;
+/// `version ‖ n_runs: u16` before the runs (`start: u64 ‖ len: u32` each).
+const EXTENT_GRANT_FIXED_LEN: usize = 1 + 2;
+const GRANT_RUN_LEN: usize = 8 + 4;
+
+/// The tree-0 key of appender `appender_id`'s grant record.
+pub fn extent_grant_key(appender_id: u32) -> Vec<u8> {
+    let mut k = Vec::with_capacity(EXTENT_GRANT_KEY_LEN);
+    k.extend_from_slice(EXTENT_GRANT_KEY_PREFIX);
+    k.extend_from_slice(&appender_id.to_be_bytes());
+    k
+}
+
+/// Inclusive `[start, end]` bounds covering every extent-grant record.
+pub fn extent_grant_key_range() -> (Vec<u8>, Vec<u8>) {
+    (extent_grant_key(0), extent_grant_key(u32::MAX))
+}
+
+/// Decode an extent-grant key back to its appender id.
+pub fn decode_extent_grant_key(key: &[u8]) -> Result<u32, KvError> {
+    if key.len() != EXTENT_GRANT_KEY_LEN || !key.starts_with(EXTENT_GRANT_KEY_PREFIX) {
+        return Err(KvError::Corrupt(format!(
+            "extent_grant key must be {EXTENT_GRANT_KEY_LEN} bytes under the {:?} prefix, got \
+             {} bytes",
+            String::from_utf8_lossy(EXTENT_GRANT_KEY_PREFIX),
+            key.len()
+        )));
+    }
+    let p = EXTENT_GRANT_KEY_PREFIX.len();
+    Ok(u32::from_be_bytes([
+        key[p],
+        key[p + 1],
+        key[p + 2],
+        key[p + 3],
+    ]))
+}
+
+/// One appender's CURRENT extent grant as the manager attests it: every
+/// run the manager carved for it and has not yet had returned — claimed
+/// and unclaimed alike (the appender's page names the UNCLAIMED remainder;
+/// the difference is what its images occupy). Runs are normalized:
+/// ascending, non-empty, non-adjacent. A `ReturnExtents` rewrites the
+/// record without the returned extents, so a returned extent the manager
+/// reuses for its own images is never "granted" to anyone (fsck C13's
+/// candidate set is the granted, claimed, unreachable extents).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ExtentGrantRecord {
+    pub runs: Vec<super::appender::GrantRun>,
+}
+
+impl ExtentGrantRecord {
+    /// A record over the sorted extent set `extents`, coalesced into runs.
+    pub fn from_extents(extents: impl IntoIterator<Item = u64>) -> Self {
+        let mut sorted: Vec<u64> = extents.into_iter().collect();
+        sorted.sort_unstable();
+        sorted.dedup();
+        let mut runs: Vec<super::appender::GrantRun> = Vec::new();
+        for e in sorted {
+            match runs.last_mut() {
+                Some(r) if r.start + u64::from(r.len) == e && r.len < u32::MAX => r.len += 1,
+                _ => runs.push(super::appender::GrantRun { start: e, len: 1 }),
+            }
+        }
+        Self { runs }
+    }
+
+    /// Every extent the record grants, ascending.
+    pub fn extents(&self) -> impl Iterator<Item = u64> + '_ {
+        self.runs
+            .iter()
+            .flat_map(|r| r.start..r.start + u64::from(r.len))
+    }
+
+    /// Extents granted.
+    pub fn len(&self) -> u64 {
+        self.runs.iter().map(|r| u64::from(r.len)).sum()
+    }
+
+    /// Whether the record grants nothing.
+    pub fn is_empty(&self) -> bool {
+        self.runs.is_empty()
+    }
+
+    /// Whether `extent` lies inside the grant.
+    pub fn contains(&self, extent: u64) -> bool {
+        self.runs
+            .iter()
+            .any(|r| extent >= r.start && extent < r.start + u64::from(r.len))
+    }
+
+    /// LE image, versioned. Refuses a run count the `u16` cannot express.
+    pub fn encode(&self) -> Result<Vec<u8>, KvError> {
+        let n = u16::try_from(self.runs.len()).map_err(|_| {
+            KvError::Corrupt(format!(
+                "extent_grant record cannot carry {} runs (the count is a u16)",
+                self.runs.len()
+            ))
+        })?;
+        let mut out = Vec::with_capacity(EXTENT_GRANT_FIXED_LEN + self.runs.len() * GRANT_RUN_LEN);
+        out.push(EXTENT_GRANT_VERSION);
+        out.extend_from_slice(&n.to_le_bytes());
+        for r in &self.runs {
+            out.extend_from_slice(&r.start.to_le_bytes());
+            out.extend_from_slice(&r.len.to_le_bytes());
+        }
+        Ok(out)
+    }
+
+    /// Decode + validate (total; every failure is loud corruption). Runs
+    /// must be normalized — ascending, non-empty, non-adjacent — so the
+    /// image is canonical.
+    pub fn decode(value: &[u8]) -> Result<Self, KvError> {
+        let version = *value
+            .first()
+            .ok_or_else(|| KvError::Corrupt("extent_grant record is empty".to_string()))?;
+        if version != EXTENT_GRANT_VERSION {
+            return Err(KvError::Corrupt(format!(
+                "extent_grant record version {version} — this binary writes \
+                 {EXTENT_GRANT_VERSION} and the format is forward-only (upgrade squeezefs)"
+            )));
+        }
+        if value.len() < EXTENT_GRANT_FIXED_LEN {
+            return Err(KvError::Corrupt(
+                "extent_grant record truncated before its run count".to_string(),
+            ));
+        }
+        let n = usize::from(u16::from_le_bytes([value[1], value[2]]));
+        let want = EXTENT_GRANT_FIXED_LEN + n * GRANT_RUN_LEN;
+        if value.len() != want {
+            return Err(KvError::Corrupt(format!(
+                "extent_grant record names {n} runs ({want} bytes) but holds {} bytes",
+                value.len()
+            )));
+        }
+        let mut runs = Vec::with_capacity(n);
+        for i in 0..n {
+            let off = EXTENT_GRANT_FIXED_LEN + i * GRANT_RUN_LEN;
+            let run = super::appender::GrantRun {
+                start: le64(value, off),
+                len: le32(value, off + 8),
+            };
+            if run.len == 0 {
+                return Err(KvError::Corrupt(
+                    "extent_grant record carries an empty run".to_string(),
+                ));
+            }
+            if let Some(prev) = runs.last() {
+                let prev: &super::appender::GrantRun = prev;
+                let Some(prev_end) = prev.start.checked_add(u64::from(prev.len)) else {
+                    return Err(KvError::Corrupt(
+                        "extent_grant record run overflows the extent space".to_string(),
+                    ));
+                };
+                if run.start <= prev_end {
+                    return Err(KvError::Corrupt(format!(
+                        "extent_grant record runs are not normalized ({} + {} then {})",
+                        prev.start, prev.len, run.start
+                    )));
+                }
+            }
+            if run.start.checked_add(u64::from(run.len)).is_none() {
+                return Err(KvError::Corrupt(
+                    "extent_grant record run overflows the extent space".to_string(),
+                ));
+            }
+            runs.push(run);
+        }
+        Ok(Self { runs })
+    }
+}
+
 #[inline]
 fn le64(v: &[u8], off: usize) -> u64 {
     let mut b = [0u8; 8];

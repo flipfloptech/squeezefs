@@ -31,12 +31,12 @@
 
 use squeezefs::meta_backend::kv::appender::{
     appender0_page_offsets, appender0_ring_extent, appender_ring_bytes_derived, appenders_capacity,
-    classify_page, dir_pairs_per_extent, forest_slot_of_page_slot, newest_valid, page_slot_for,
-    page_slot_of_forest_slot, read_directory, ring_budget_bytes, sym_ring_ceiling_bytes,
-    AppenderIdentity, AppenderPage, AppenderState, DirHeader, GrantRun, PageRead, SlotEntry,
-    SlotEntryState, APPENDER0_RESERVED_PAGES, APPENDER_PAGE_FIXED_LEN, APPENDER_PAGE_LEN,
-    APPENDER_PAGE_SLOTS, GRANT_RUNS_MAX, RING_SEGMENTS_MAX, SLOT_ENTRY_LEN, SLOT_PAGE_BUDGET,
-    SYM_RING_FLOOR_BYTES,
+    classify_page, dir_pair_offsets, dir_pairs_per_extent, forest_slot_of_page_slot, newest_valid,
+    page_slot_for, page_slot_of_forest_slot, read_directory, ring_budget_bytes,
+    sym_ring_ceiling_bytes, AppenderIdentity, AppenderPage, AppenderState, DirHeader, GrantRun,
+    PageRead, SlotEntry, SlotEntryState, APPENDER0_RESERVED_PAGES, APPENDER_PAGE_FIXED_LEN,
+    APPENDER_PAGE_LEN, APPENDER_PAGE_SLOTS, GRANT_RUNS_MAX, RING_SEGMENTS_MAX, SLOT_ENTRY_LEN,
+    SLOT_PAGE_BUDGET, SYM_RING_FLOOR_BYTES,
 };
 use squeezefs::meta_backend::kv::builder::{BuilderConfig, ImageBuilder, ROOT_INO};
 use squeezefs::meta_backend::kv::checkpoint::CHECKPOINT_MAX_AGE_MS;
@@ -770,14 +770,15 @@ fn appender_violations_key_lease_extent_are_each_detected() {
         ),
         (1u32, recovery(vec![(0, vec![content(s5, 1)])])),
     ];
-    assert!(detect_appender_violations(&clean, &leases).is_empty());
+    let no_grant = |_: u32, _: u64| false;
+    assert!(detect_appender_violations(&clean, &leases, &no_grant).is_empty());
 
     // Key: the same key in two rings.
     let key_dup = vec![
         (0u32, recovery(vec![(0, vec![content(s6, 1)])])),
         (1u32, recovery(vec![(0, vec![content(s6, 1)])])),
     ];
-    let v = detect_appender_violations(&key_dup, &leases);
+    let v = detect_appender_violations(&key_dup, &leases, &no_grant);
     assert!(
         v.iter().any(|x| matches!(
             x,
@@ -789,8 +790,10 @@ fn appender_violations_key_lease_extent_are_each_detected() {
         "{v:?}"
     );
     // Lease: ring 1 writes a slot it does not lease; ring 0 writes a slot
-    // appender 1 leases; ring 1 carries a tree-0 record and an interior
-    // record (the manager's structure).
+    // appender 1 leases; ring 1 carries a tree-0 record (the manager's
+    // structure) and an interior record for slot 7, which it does NOT
+    // lease. Its interior record for slot 6 — ITS slot's own SMO (PR 3,
+    // §5.2.3) — is legal and counts nothing.
     let lease_bad = vec![
         (0u32, recovery(vec![(0, vec![content(s5, 2)])])),
         (
@@ -808,31 +811,51 @@ fn appender_violations_key_lease_extent_are_each_detected() {
                     60,
                     vec![(
                         tag_for(KIND_INTERIOR, 1),
+                        Record::put(vec![0, 0, 0, 7, 0xFF], 0, vec![]),
+                    )],
+                ),
+                (
+                    70,
+                    vec![(
+                        tag_for(KIND_INTERIOR, 1),
                         Record::put(vec![0, 0, 0, 6, 0xFF], 0, vec![]),
                     )],
                 ),
             ]),
         ),
     ];
-    let v = detect_appender_violations(&lease_bad, &leases);
+    let v = detect_appender_violations(&lease_bad, &leases, &no_grant);
     let lease_hits = v
         .iter()
         .filter(|x| matches!(x, AppenderViolation::Lease { .. }))
         .count();
     assert_eq!(lease_hits, 4, "{v:?}");
+    assert!(
+        v.iter().any(|x| matches!(
+            x,
+            AppenderViolation::Lease {
+                appender_id: 1,
+                slot: Some(7),
+                ..
+            }
+        )),
+        "the foreign-slot interior record is the violation, not the own-slot one: {v:?}"
+    );
     assert!(v
         .iter()
         .any(|x| matches!(x, AppenderViolation::Lease { appender_id: 0, .. })));
     assert!(v
         .iter()
         .any(|x| matches!(x, AppenderViolation::Lease { appender_id: 1, .. })));
-    // Extent: an allocator delta in a ring whose appender holds no grant.
+    // Extent: an allocator delta in a ring whose appender holds no grant
+    // covering it — and, granted, the same delta is the appender's own
+    // (§5.3.3: an alloc record is its own only INSIDE a grant).
     let alloc = squeezefs::meta_backend::kv::alloc_ext::alloc_record(77, 0);
     let extent_bad = vec![
         (0u32, recovery(vec![(0, vec![alloc.clone()])])),
         (1u32, recovery(vec![(0, vec![alloc])])),
     ];
-    let v = detect_appender_violations(&extent_bad, &leases);
+    let v = detect_appender_violations(&extent_bad, &leases, &no_grant);
     assert_eq!(
         v.len(),
         1,
@@ -846,6 +869,11 @@ fn appender_violations_key_lease_extent_are_each_detected() {
             ..
         }
     ));
+    let granted = |appender: u32, extent: u64| appender == 1 && (72..80).contains(&extent);
+    assert!(
+        detect_appender_violations(&extent_bad, &leases, &granted).is_empty(),
+        "inside its grant the delta is appender 1's own"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -854,7 +882,7 @@ fn appender_violations_key_lease_extent_are_each_detected() {
 // ---------------------------------------------------------------------------
 
 use squeezefs::meta_backend::kv::appender::{
-    appender_flush_ceiling_ms, read_page, write_page, AppenderStats, TEST_APPENDER_SLOTS_ENV,
+    appender_flush_ceiling_ms, write_page, AppenderStats, TEST_APPENDER_SLOTS_ENV,
 };
 use squeezefs::meta_backend::kv::backend::{
     test_conveyor_hold_release, TEST_CONVEYOR_HOLD_PRE_ROLLBACK, TEST_CONVEYOR_HOLD_STAGE,
@@ -1176,9 +1204,13 @@ async fn a_foreign_live_page_refuses_the_writer_open_and_a_probe_lists_it() {
     let uris = vec![format_stamped_member(dir.path(), "meta0").await];
     let path = std::path::Path::new(&uris[0]);
     let sb = superblock_of_path(path).await;
-    // Forge: appender 0's page Live under an identity that is not ours.
-    let offs = appender0_page_offsets(&sb.journal);
-    let mut page = AppenderPage::decode(&read_page(path, offs[1]).await.unwrap()).unwrap();
+    // Forge: appender 1's page (the directory's first pair) Live under an
+    // identity that is not ours. Page 0 is the MANAGER's and is the one
+    // page a writer that won the D0 ladder ADOPTS (PR 3's successor arm,
+    // §5.9 — pinned in `sym_manager_tests`); every other foreign Live
+    // page refuses the join until PR 10's recovery driver.
+    let offs = dir_pair_offsets(&sb.appender_dir, 0);
+    let mut page = AppenderPage::free(1, 0);
     page.generation = 1000;
     page.state = AppenderState::Live;
     page.term = 9;
@@ -1187,13 +1219,9 @@ async fn a_foreign_live_page_refuses_the_writer_open_and_a_probe_lists_it() {
         mount_slot: 0x1234_5678,
         writer_id: 42,
     };
-    write_page(
-        path,
-        offs[page_slot_for(page.generation)],
-        page.encode().unwrap(),
-    )
-    .await
-    .unwrap();
+    write_page(path, offs[0], page.encode().unwrap())
+        .await
+        .unwrap();
     // The non-joining Writer opens are NOT blocked by the page: `claim
     // clear` — the attested D0 remedy for a dead foreign-host writer on a
     // non-PR substrate — opens Writer posture, joins nothing, and answers
@@ -1234,10 +1262,10 @@ async fn a_foreign_live_page_refuses_the_writer_open_and_a_probe_lists_it() {
         "a probe holds no Live region: the closure law holds on every posture"
     );
     let listed = read_directory(path, &sb).await.unwrap();
-    assert_eq!(listed[0].page.as_ref().unwrap().term, 9);
+    assert_eq!(listed[1].page.as_ref().unwrap().term, 9);
     // The page is untouched by any of it.
     let listed = read_directory(path, &sb).await.unwrap();
-    let p = listed[0].page.as_ref().unwrap();
+    let p = listed[1].page.as_ref().unwrap();
     assert_eq!(
         (p.state, p.term, p.generation),
         (AppenderState::Live, 9, 1000)

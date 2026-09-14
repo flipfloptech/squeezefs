@@ -814,6 +814,272 @@ pub fn appenders_capacity(heap_len: u64, ring_bytes: u64) -> u64 {
     ring_budget_bytes(heap_len) / ring_bytes
 }
 
+// ---- Extent grants (§5.3.3) -------------------------------------------------
+
+/// The extent-grant FLOOR, extents: one image per pending root swap per
+/// checkpoint cycle (a compaction or split of a slot tree claims ≤ 2
+/// extents) × up to 4 pending swaps per cycle — the mixed tree's SMO
+/// budget (physical, §5.3.3).
+pub const GRANT_EXTENTS_FLOOR: u64 = 2 * 4;
+/// The registry ceiling of `SQUEEZEFS_SYM_GRANT_EXTENTS`: the u16 slot
+/// namespace's width — more extents than a volume has slot trees to
+/// compact is a units mistake.
+pub const GRANT_EXTENTS_MAX: u64 = 65_536;
+
+/// `SQUEEZEFS_SYM_GRANT_EXTENTS` — the explicit extent-grant size
+/// (int floor..=65536; explicit wins verbatim over the derivation).
+pub const SYM_GRANT_EXTENTS_ENV: &str = "SQUEEZEFS_SYM_GRANT_EXTENTS";
+
+/// The DERIVED grant size (§5.3.3): `clamp(2 × ewma_smo_rate ×
+/// manager_failover_bound_s, floor, free_heap / (4 × appenders))` — the
+/// headroom an appender needs to keep compacting through a manager
+/// failover at its measured SMO rate (`2 ×` = one EWMA window of
+/// under-estimate), never below the SMO budget floor, never more than a
+/// quarter of the free heap spread over the appenders. `ewma_smo_milli`
+/// is the appender's SMO rate in milli-SMOs per second.
+pub fn grant_extents_derived(
+    ewma_smo_milli_per_s: u64,
+    failover_bound_ms: u64,
+    free_heap: u64,
+    appenders: u64,
+) -> u64 {
+    // milli-SMO/s × ms = micro-SMOs; 2 × … / 1_000_000 = SMOs over the
+    // bound, doubled.
+    let want = ewma_smo_milli_per_s
+        .saturating_mul(2)
+        .saturating_mul(failover_bound_ms)
+        / 1_000_000;
+    let cap = (free_heap / (4 * appenders.max(1))).max(GRANT_EXTENTS_FLOOR);
+    want.clamp(GRANT_EXTENTS_FLOOR, cap)
+}
+
+/// The grant size in force: the knob verbatim, else the derivation.
+pub fn resolve_grant_extents(
+    ewma_smo_milli_per_s: u64,
+    failover_bound_ms: u64,
+    free_heap: u64,
+    appenders: u64,
+) -> u64 {
+    match crate::env_knobs::opt_int_knob::<u64>(SYM_GRANT_EXTENTS_ENV) {
+        Some(n) => n,
+        None => grant_extents_derived(
+            ewma_smo_milli_per_s,
+            failover_bound_ms,
+            free_heap,
+            appenders,
+        ),
+    }
+}
+
+/// `manager_failover_bound_ms` (§1.6 "Manager death — FOREIGN-homed
+/// appenders", §5.9): the writer-claim TTL the D0 ladder waits out
+/// (`CLIENT_STALE_TTL_SECS`) + the ladder's own wall (flock absorption +
+/// the PR round trips, measured at this open) + the ring replay's wall
+/// (measured at this open) — DERIVED from the constants and the two
+/// measured terms, published live, and the term the grant headroom is
+/// sized against.
+pub fn manager_failover_bound_ms(stale_ttl_secs: u64, ladder_ms: u64, replay_ms: u64) -> u64 {
+    stale_ttl_secs
+        .saturating_mul(1000)
+        .saturating_add(ladder_ms)
+        .saturating_add(replay_ms)
+}
+
+/// The §5.5.2 vol-0 rule: a manager that cannot read volume 0's ledger for
+/// longer than `T_owner` RELEASES its manager role rather than act on a
+/// stale death ledger. The decision, as one function (PR 8/10 wire the
+/// roles; the gauge `manager_vol0_unreachable` counts the releases).
+pub fn manager_should_release_role(unreachable_for_ms: u64, t_owner_ms: u64) -> bool {
+    unreachable_for_ms > t_owner_ms
+}
+
+/// One region's extent grant in RAM (§5.3.3): the manager carved it, the
+/// page names its UNCLAIMED remainder, tree 0's `extent_grant` record
+/// names the whole of it. Claims take the lowest unclaimed extent so the
+/// remainder stays as few runs as the grants that produced it; a free is
+/// parked on THIS region's tail and, once released, returned to the
+/// manager in a batch at the checkpoint cadence.
+#[derive(Debug, Default)]
+pub struct RegionGrant {
+    unclaimed: std::collections::BTreeSet<u64>,
+    claimed: std::collections::BTreeSet<u64>,
+    /// `(extent, gate seq)` — frees parked on this region's tail.
+    pending: Vec<(u64, u64)>,
+    /// Released past the tail, awaiting `ReturnExtents`.
+    returnable: Vec<u64>,
+    /// Extents ever granted to this region (`extent_grant_extents`).
+    pub granted: u64,
+    /// Extents returned to the manager (`returned` in the closure law).
+    pub returned: u64,
+    /// The unclaimed count at the last refill decision — the 50 % law's
+    /// reference (`granted_since_refill`).
+    pub refill_reference: u64,
+}
+
+impl RegionGrant {
+    /// Adopt the runs a grant answered.
+    pub fn add_runs(&mut self, runs: &[GrantRun]) {
+        for r in runs {
+            for e in r.start..r.start + u64::from(r.len) {
+                if self.unclaimed.insert(e) {
+                    self.granted += 1;
+                }
+            }
+        }
+        self.refill_reference = self.unclaimed.len() as u64;
+    }
+
+    /// Recovery: the whole grant (tree 0's record) against the page's
+    /// unclaimed remainder — everything else is claimed.
+    pub fn recover(record_extents: impl IntoIterator<Item = u64>, unclaimed: &[GrantRun]) -> Self {
+        let mut g = Self::default();
+        for r in unclaimed {
+            for e in r.start..r.start + u64::from(r.len) {
+                g.unclaimed.insert(e);
+            }
+        }
+        for e in record_extents {
+            g.granted += 1;
+            if !g.unclaimed.contains(&e) {
+                g.claimed.insert(e);
+            }
+        }
+        g.refill_reference = g.unclaimed.len() as u64;
+        g
+    }
+
+    /// Claim the lowest unclaimed extent.
+    pub fn claim(&mut self) -> Option<u64> {
+        let e = self.unclaimed.pop_first()?;
+        self.claimed.insert(e);
+        Some(e)
+    }
+
+    /// Recovery fold of an in-window `alloc(extent)` record: the extent is
+    /// claimed whatever the page said (the page predates the claim).
+    pub fn claim_exact(&mut self, extent: u64) {
+        self.unclaimed.remove(&extent);
+        self.claimed.insert(extent);
+    }
+
+    /// A claim whose build was abandoned before publication.
+    pub fn release_unpublished(&mut self, extent: u64) {
+        if self.claimed.remove(&extent) {
+            self.unclaimed.insert(extent);
+        }
+    }
+
+    /// Park a freed image gated on `gate_seq` (a position in this
+    /// region's ring).
+    pub fn free_pending(&mut self, extent: u64, gate_seq: u64) {
+        if self.claimed.remove(&extent) {
+            self.pending.push((extent, gate_seq));
+        }
+    }
+
+    /// Recovery fold of an in-window `free(extent)` record.
+    pub fn free_exact(&mut self, extent: u64, gate_seq: u64) {
+        self.claimed.remove(&extent);
+        self.unclaimed.remove(&extent);
+        if !self.pending.iter().any(|(e, _)| *e == extent) {
+            self.pending.push((extent, gate_seq));
+        }
+    }
+
+    /// The coverage gate: a durable tail of `tail` releases every parked
+    /// free whose gate it covers into the returnable batch.
+    pub fn advance_durable(&mut self, tail: u64) -> usize {
+        let mut n = 0;
+        let mut i = 0;
+        while i < self.pending.len() {
+            if self.pending[i].1 <= tail {
+                let (e, _) = self.pending.swap_remove(i);
+                self.returnable.push(e);
+                n += 1;
+            } else {
+                i += 1;
+            }
+        }
+        n
+    }
+
+    /// Drain the UNCLAIMED remainder — the region release's return
+    /// (§5.1.3): the extents go back to the manager, never to an image.
+    pub fn take_unclaimed(&mut self) -> Vec<u64> {
+        let v: Vec<u64> = std::mem::take(&mut self.unclaimed).into_iter().collect();
+        self.returned += v.len() as u64;
+        self.refill_reference = 0;
+        v
+    }
+
+    /// Drain the returnable batch (the `ReturnExtents` payload).
+    pub fn take_returnable(&mut self) -> Vec<u64> {
+        let mut v = std::mem::take(&mut self.returnable);
+        v.sort_unstable();
+        self.returned += v.len() as u64;
+        v
+    }
+
+    /// Put a batch back after a failed return.
+    pub fn restore_returnable(&mut self, extents: Vec<u64>) {
+        self.returned = self.returned.saturating_sub(extents.len() as u64);
+        self.returnable.extend(extents);
+    }
+
+    /// The unclaimed remainder as page runs (≤ [`GRANT_RUNS_MAX`],
+    /// ascending; a remainder in more runs than the page names keeps its
+    /// lowest runs — the rest are recovered as fsck C13 candidates).
+    pub fn unclaimed_runs(&self) -> Vec<GrantRun> {
+        let mut runs: Vec<GrantRun> = Vec::new();
+        for &e in &self.unclaimed {
+            match runs.last_mut() {
+                Some(r) if r.start + u64::from(r.len) == e => r.len += 1,
+                _ => runs.push(GrantRun { start: e, len: 1 }),
+            }
+        }
+        runs.truncate(GRANT_RUNS_MAX);
+        runs
+    }
+
+    pub fn unclaimed(&self) -> u64 {
+        self.unclaimed.len() as u64
+    }
+
+    pub fn claimed(&self) -> u64 {
+        self.claimed.len() as u64
+    }
+
+    pub fn pending(&self) -> u64 {
+        self.pending.len() as u64
+    }
+
+    pub fn returnable(&self) -> u64 {
+        self.returnable.len() as u64
+    }
+
+    /// The HELD term of the closure law: every granted extent the region
+    /// still holds — live images, frees parked on its tail, releases not
+    /// yet returned.
+    pub fn held(&self) -> u64 {
+        self.claimed() + self.pending() + self.returnable()
+    }
+
+    /// Whether `extent` is this grant's — claimed, unclaimed or parked.
+    pub fn contains(&self, extent: u64) -> bool {
+        self.claimed.contains(&extent)
+            || self.unclaimed.contains(&extent)
+            || self.pending.iter().any(|(e, _)| *e == extent)
+            || self.returnable.contains(&extent)
+    }
+
+    /// The proactive-refill law (§5.3.3, the `alloc_lane` ahead-refill
+    /// shape): a refill is due once HALF of what the last grant left has
+    /// been consumed.
+    pub fn refill_due(&self) -> bool {
+        self.unclaimed() * 2 <= self.refill_reference
+    }
+}
+
 // ---- Device I/O (every read and write through `crate::uring_fs`) ------------
 
 /// Read one page-sized image at `offset` (zero-extended on a short read —
@@ -1136,12 +1402,43 @@ pub struct AppenderRegion {
     pub dir_named: std::sync::atomic::AtomicU8,
     /// Recovered from its own `Live` residue at this mount.
     pub self_recovered: bool,
+    /// The region's extent grant (§5.3.3) — empty for region 0, whose
+    /// images come from the bitmap it owns.
+    pub grant: std::sync::Arc<std::sync::Mutex<RegionGrant>>,
+    /// The region's SMO rate, milli-SMOs per second, EWMA over checkpoint
+    /// cycles — the grant derivation's measured input.
+    pub smo_ewma_milli: std::sync::atomic::AtomicU64,
+    /// SMOs of this region's slot trees since the last cycle's EWMA fold.
+    pub smos_this_cycle: std::sync::atomic::AtomicU64,
+    /// SMOs refused for want of a granted extent while the manager could
+    /// not refill (`manager_dependency_stalls`, must-stay-0 at the sized
+    /// grant).
+    pub dependency_stalls: std::sync::atomic::AtomicU64,
 }
 
 impl AppenderRegion {
     /// The region's ring right now.
     pub fn ring(&self) -> std::sync::Arc<super::journal::JournalRing> {
         self.ring.load_full()
+    }
+
+    /// The region's grant (RAM).
+    pub fn grant(&self) -> std::sync::MutexGuard<'_, RegionGrant> {
+        self.grant.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Fold this cycle's SMO count into the rate EWMA (`cycle_ms` = the
+    /// wall since the last fold): `ewma = ewma × 7/8 + rate / 8`.
+    pub fn fold_smo_rate(&self, cycle_ms: u64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let n = self.smos_this_cycle.swap(0, Relaxed);
+        if cycle_ms == 0 {
+            return;
+        }
+        let rate_milli = n.saturating_mul(1_000_000) / cycle_ms;
+        let cur = self.smo_ewma_milli.load(Relaxed);
+        self.smo_ewma_milli
+            .store(cur - cur / 8 + rate_milli / 8, Relaxed);
     }
 
     /// Whether `slot`'s records journal into THIS region's ring.
@@ -1155,6 +1452,27 @@ impl AppenderRegion {
         self.growing
             .store(false, std::sync::atomic::Ordering::SeqCst);
         self.growth_done.notify_waiters();
+    }
+}
+
+/// The manager-lease posture word per volume (§11): `held` = this mount
+/// won the D0 ladder and joined as appender 0; `peer:<node>` = another
+/// node's page 0 is `Live`; `vacant` = nobody holds it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ManagerLease {
+    Held,
+    Peer { node_token: u64 },
+    Vacant,
+}
+
+impl ManagerLease {
+    /// The stats-inode word.
+    pub fn word(&self) -> String {
+        match self {
+            Self::Held => "held".to_string(),
+            Self::Peer { node_token } => format!("peer:{node_token:#018x}"),
+            Self::Vacant => "vacant".to_string(),
+        }
     }
 }
 
@@ -1196,9 +1514,138 @@ pub struct AppenderSet {
     /// [`appender_flush_ceiling_ms`] of the flush interval in force at
     /// open (the backend-knob convention: resolved once, never per cycle).
     pub flush_ceiling_ms: u64,
+    /// [`manager_failover_bound_ms`] as derived at this open (the ladder
+    /// and replay terms land at the join).
+    pub failover_bound_ms: std::sync::atomic::AtomicU64,
+    /// The manager-lease posture (decided at open; `Held` once joined).
+    pub manager_lease: std::sync::Mutex<ManagerLease>,
+    /// The manager holds WERO (rtype 3) on this volume's metadata
+    /// namespace (`meta_pr_wero` — 0 = the shipped Write Exclusive, or no
+    /// reservation at all).
+    pub wero_meta: std::sync::atomic::AtomicBool,
+    /// Grants issued by this manager (`extent_grants`) and the extents
+    /// they carried (`extent_grant_extents`).
+    pub extent_grants: std::sync::atomic::AtomicU64,
+    pub extent_grant_extents: std::sync::atomic::AtomicU64,
+    /// `ReturnExtents` batches this manager cleared (`extent_returns`).
+    pub extent_returns: std::sync::atomic::AtomicU64,
+    /// Manager-role releases the §5.5.2 vol-0 rule decided
+    /// (`manager_vol0_unreachable`).
+    pub vol0_unreachable: std::sync::atomic::AtomicU64,
+    /// The manager verb ledger (`manager_verb_replays` /
+    /// `manager_verb_refusals`, the latter must-stay-0) and the service
+    /// phase table (`manager_service_ns`).
+    pub verbs: ManagerVerbLedger,
+    /// CLOCK_MONOTONIC ns of the last grant-cadence pass (the SMO-rate
+    /// EWMA's cycle wall); 0 = none yet.
+    pub cadence_last_ns: std::sync::atomic::AtomicU64,
+}
+
+/// Test seam: the manager is UNREACHABLE — the grant cadence issues no
+/// refill, so an appender consuming its grant runs out and the
+/// `manager_dependency_stalls` arm engages (the in-process face of a
+/// dead manager; the failover contracts drive it).
+static TEST_MANAGER_UNREACHABLE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Arm / disarm the unreachable-manager seam.
+pub fn test_set_manager_unreachable(on: bool) {
+    TEST_MANAGER_UNREACHABLE.store(on, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// Whether the seam is armed.
+pub fn test_manager_unreachable() -> bool {
+    TEST_MANAGER_UNREACHABLE.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// The manager's verb ledger (§5.3.5 / §11 "Manager family"): every verb
+/// answered, the replays answered from DURABLE state (`already`), the
+/// refusals (a verb whose durable witness contradicts the caller —
+/// must-stay-0), and the exact-sum service phases `admit / execute /
+/// reply / total` with the wall the load percentage is measured against.
+#[derive(Debug, Default)]
+pub struct ManagerVerbLedger {
+    pub verbs: std::sync::atomic::AtomicU64,
+    pub replays: std::sync::atomic::AtomicU64,
+    pub refusals: std::sync::atomic::AtomicU64,
+    pub admit_ns: std::sync::atomic::AtomicU64,
+    pub execute_ns: std::sync::atomic::AtomicU64,
+    pub reply_ns: std::sync::atomic::AtomicU64,
+    pub total_ns: std::sync::atomic::AtomicU64,
+    /// CLOCK_MONOTONIC ns of the first verb served (the load wall's
+    /// origin; 0 = none yet).
+    pub first_verb_ns: std::sync::atomic::AtomicU64,
+    /// CLOCK_MONOTONIC ns of the last verb served.
+    pub last_verb_ns: std::sync::atomic::AtomicU64,
+}
+
+impl ManagerVerbLedger {
+    /// Record one served verb's phases (ns).
+    pub fn record(&self, admit_ns: u64, execute_ns: u64, reply_ns: u64, now_ns: u64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.verbs.fetch_add(1, Relaxed);
+        self.admit_ns.fetch_add(admit_ns, Relaxed);
+        self.execute_ns.fetch_add(execute_ns, Relaxed);
+        self.reply_ns.fetch_add(reply_ns, Relaxed);
+        self.total_ns
+            .fetch_add(admit_ns + execute_ns + reply_ns, Relaxed);
+        let _ = self
+            .first_verb_ns
+            .compare_exchange(0, now_ns, Relaxed, Relaxed);
+        self.last_verb_ns.fetch_max(now_ns, Relaxed);
+    }
+
+    /// `manager_verbs_per_s`: verbs over the wall from the first to the
+    /// last served (0 with fewer than two).
+    pub fn verbs_per_s(&self) -> u64 {
+        use std::sync::atomic::Ordering::Relaxed;
+        let first = self.first_verb_ns.load(Relaxed);
+        let last = self.last_verb_ns.load(Relaxed);
+        if first == 0 || last <= first {
+            return 0;
+        }
+        self.verbs.load(Relaxed).saturating_mul(1_000_000_000) / (last - first)
+    }
+
+    /// `manager_load_pct`: Σ service ns ÷ the wall from the first verb to
+    /// `now_ns`, in percent — MEASURED, never declared (§5.11).
+    pub fn load_pct(&self, now_ns: u64) -> u64 {
+        use std::sync::atomic::Ordering::Relaxed;
+        let first = self.first_verb_ns.load(Relaxed);
+        if first == 0 || now_ns <= first {
+            return 0;
+        }
+        self.total_ns.load(Relaxed).saturating_mul(100) / (now_ns - first)
+    }
 }
 
 impl AppenderSet {
+    /// Every region's grant-closure terms summed: `(granted, held,
+    /// returned, unclaimed)` — the law `extent_grant_extents ≡ claimed +
+    /// returned + granted_unclaimed` (§11), `claimed` being what the
+    /// regions still HOLD (images, parked frees, unreturned releases).
+    pub fn grant_closure(&self) -> (u64, u64, u64, u64) {
+        let mut out = (0u64, 0u64, 0u64, 0u64);
+        for r in self.regions.iter().skip(1) {
+            let g = r.grant();
+            out.0 += g.granted;
+            out.1 += g.held();
+            out.2 += g.returned;
+            out.3 += g.unclaimed();
+        }
+        out
+    }
+
+    /// `manager_dependency_stalls` over every region.
+    pub fn dependency_stalls(&self) -> u64 {
+        self.regions
+            .iter()
+            .map(|r| {
+                r.dependency_stalls
+                    .load(std::sync::atomic::Ordering::Relaxed)
+            })
+            .sum()
+    }
     /// The region that journals `slot`'s records: the one leasing it, else
     /// the manager (region 0).
     pub fn region_of_slot(&self, slot: super::record::ForestSlot) -> u32 {
@@ -1307,6 +1754,8 @@ impl AppenderSet {
     /// The Appender family's snapshot (§11).
     pub fn stats(&self) -> AppenderStats {
         use std::sync::atomic::Ordering::Relaxed;
+        let (granted, claimed, returned, unclaimed) = self.grant_closure();
+        let now_ns = crate::mono_core::monotonic_ns_u64();
         AppenderStats {
             appender_id: self.regions.first().map_or(0, |r| r.id),
             native_slot: self.native_slot,
@@ -1322,12 +1771,40 @@ impl AppenderSet {
             flush_ceiling_overruns: self.flush_ceiling_overruns.load(Relaxed),
             flush_ceiling_ms: self.flush_ceiling_ms,
             pressure_cycles: self.pressure_cycles.load(Relaxed),
+            manager_lease: self
+                .manager_lease
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone(),
+            meta_pr_wero: self.wero_meta.load(Relaxed),
+            failover_bound_ms: self.failover_bound_ms.load(Relaxed),
+            dependency_stalls: self.dependency_stalls(),
+            extent_grants: self.extent_grants.load(Relaxed),
+            extent_grant_extents: self.extent_grant_extents.load(Relaxed),
+            extent_returns: self.extent_returns.load(Relaxed),
+            grant_granted: granted,
+            grant_claimed: claimed,
+            grant_returned: returned,
+            grant_unclaimed: unclaimed,
+            vol0_unreachable: self.vol0_unreachable.load(Relaxed),
+            manager_verbs: self.verbs.verbs.load(Relaxed),
+            manager_verb_replays: self.verbs.replays.load(Relaxed),
+            manager_verb_refusals: self.verbs.refusals.load(Relaxed),
+            manager_verbs_per_s: self.verbs.verbs_per_s(),
+            manager_load_pct: self.verbs.load_pct(now_ns),
+            manager_service_ns: [
+                self.verbs.admit_ns.load(Relaxed),
+                self.verbs.execute_ns.load(Relaxed),
+                self.verbs.reply_ns.load(Relaxed),
+                self.verbs.total_ns.load(Relaxed),
+            ],
             regions: self
                 .regions
                 .iter()
                 .map(|r| {
                     let ring = r.ring();
                     let page = r.page.lock().unwrap_or_else(|e| e.into_inner());
+                    let grant = r.grant();
                     AppenderRegionStats {
                         id: r.id,
                         term: page.term,
@@ -1337,6 +1814,11 @@ impl AppenderSet {
                         stalls: r.stalls.load(Relaxed),
                         leases: r.leases.len() as u64,
                         self_recovered: r.self_recovered,
+                        grant_unclaimed: grant.unclaimed(),
+                        grant_claimed: grant.claimed(),
+                        grant_pending: grant.pending(),
+                        smo_ewma_milli: r.smo_ewma_milli.load(Relaxed),
+                        dependency_stalls: r.dependency_stalls.load(Relaxed),
                     }
                 })
                 .collect(),
@@ -1358,6 +1840,14 @@ pub struct AppenderRegionStats {
     /// Declared leases (0 for the manager, which leases the complement).
     pub leases: u64,
     pub self_recovered: bool,
+    /// The region's grant: unclaimed remainder, claimed images, frees
+    /// parked on its tail.
+    pub grant_unclaimed: u64,
+    pub grant_claimed: u64,
+    pub grant_pending: u64,
+    /// The region's SMO rate EWMA (milli-SMOs/s).
+    pub smo_ewma_milli: u64,
+    pub dependency_stalls: u64,
 }
 
 /// The Appender family (design-symmetric-metadata §11) as one snapshot —
@@ -1383,6 +1873,27 @@ pub struct AppenderStats {
     pub flush_ceiling_ms: u64,
     /// Cycles a declared region's ring pressure made due.
     pub pressure_cycles: u64,
+    /// The Manager family (§11, PR 3).
+    pub manager_lease: ManagerLease,
+    pub meta_pr_wero: bool,
+    pub failover_bound_ms: u64,
+    pub dependency_stalls: u64,
+    pub extent_grants: u64,
+    pub extent_grant_extents: u64,
+    pub extent_returns: u64,
+    /// The grant closure's four terms over every region.
+    pub grant_granted: u64,
+    pub grant_claimed: u64,
+    pub grant_returned: u64,
+    pub grant_unclaimed: u64,
+    pub vol0_unreachable: u64,
+    pub manager_verbs: u64,
+    pub manager_verb_replays: u64,
+    pub manager_verb_refusals: u64,
+    pub manager_verbs_per_s: u64,
+    pub manager_load_pct: u64,
+    /// `admit / execute / reply / total` ns, exact-sum.
+    pub manager_service_ns: [u64; 4],
     pub regions: Vec<AppenderRegionStats>,
 }
 

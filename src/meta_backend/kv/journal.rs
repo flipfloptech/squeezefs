@@ -1722,17 +1722,19 @@ pub enum AppenderViolation {
         seqs: (u64, u64),
     },
     /// A record for a slot tree the ring's appender did not lease: a
-    /// content record outside its lease set (or, for the manager's ring,
-    /// inside another appender's), or the manager's STRUCTURE — a tree-0
-    /// record or an interior record — in a content appender's ring.
+    /// content or INTERIOR record outside its lease set (or, for the
+    /// manager's ring, inside another appender's), or the manager's
+    /// STRUCTURE — a tree-0 record — in a content appender's ring. A
+    /// leased slot tree's interior flips are the lessee's own (§5.2.3)
+    /// and journal in its ring legally.
     Lease {
         appender_id: u32,
         slot: Option<u32>,
         seq: u64,
     },
     /// An allocator delta in a ring whose appender holds no grant
-    /// covering the extent (§5.3.3 — until PR 3 grants, every extent is
-    /// the manager's).
+    /// covering the extent (§5.3.3): an appender's `alloc(extent)` /
+    /// `free(extent)` is its own only INSIDE a grant of its own.
     Extent {
         appender_id: u32,
         extent: u64,
@@ -1790,12 +1792,16 @@ impl std::fmt::Display for AppenderViolation {
 /// Detect the three §5.3.4 classes over every appender ring's recovered
 /// window. `leases` maps each content appender (id ≥ 1) to the FOREST
 /// slots it leases; appender 0 — the manager — leases the complement and
-/// alone may carry structure (tree 0, interior records) and allocator
-/// deltas. Window-scoped like [`detect_partition_violations`]: a key two
-/// appenders touched in different windows leaves no evidence here.
+/// alone carries tree 0. An appender's INTERIOR records are legal for the
+/// slots it leases (its own SMOs, §5.2.3), and its allocator deltas are
+/// legal for the extents `granted(appender, extent)` answers — inside a
+/// grant of its own (§5.3.3). Window-scoped like
+/// [`detect_partition_violations`]: a key two appenders touched in
+/// different windows leaves no evidence here.
 pub fn detect_appender_violations(
     rings: &[(u32, JournalRecovery)],
     leases: &std::collections::BTreeMap<u32, std::collections::BTreeSet<u32>>,
+    granted: &dyn Fn(u32, u64) -> bool,
 ) -> Vec<AppenderViolation> {
     let mut out = Vec::new();
     let mut owners: std::collections::HashMap<(u8, Vec<u8>), (u32, u64)> =
@@ -1813,20 +1819,42 @@ pub fn detect_appender_violations(
                 if tree_id == TREE_ALLOC_RESERVED {
                     if appender_id != 0 {
                         if let Ok(extent) = super::alloc_ext::decode_extent_key(&r.key) {
-                            out.push(AppenderViolation::Extent {
-                                appender_id,
-                                extent,
-                                seq: entry.seq,
-                            });
+                            if !granted(appender_id, extent) {
+                                out.push(AppenderViolation::Extent {
+                                    appender_id,
+                                    extent,
+                                    seq: entry.seq,
+                                });
+                            }
                         }
                     }
                     continue;
                 }
-                if level > 0 || tree_id == super::record::TREE_CONTROL {
+                if tree_id == super::record::TREE_CONTROL {
                     if appender_id != 0 {
                         out.push(AppenderViolation::Lease {
                             appender_id,
                             slot: None,
+                            seq: entry.seq,
+                        });
+                    }
+                    continue;
+                }
+                if level > 0 {
+                    // A slot tree's interior record names its slot on the
+                    // journal key; it is the lessee's own.
+                    let slot = super::forest::split_interior_journal_key(&r.key)
+                        .ok()
+                        .map(|(s, _)| s);
+                    let legal = match slot {
+                        Some(s) if appender_id == 0 => !leased_by_other(0, s),
+                        Some(s) => leases.get(&appender_id).is_some_and(|set| set.contains(&s)),
+                        None => appender_id == 0,
+                    };
+                    if !legal {
+                        out.push(AppenderViolation::Lease {
+                            appender_id,
+                            slot,
                             seq: entry.seq,
                         });
                     }

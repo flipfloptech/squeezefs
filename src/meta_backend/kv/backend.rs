@@ -1059,6 +1059,10 @@ pub struct KvMetaBackend {
     /// discipline carried by this mutex; the background task is the
     /// primary holder, `checkpoint_now`/`shutdown` share the exclusion).
     pub(super) smo: crate::sqz_sync::SqzMutex<SmoContext>,
+    /// Serializes the manager's verbs (grant / return / join): each
+    /// reads tree 0's durable witness, decides, and writes ONE control
+    /// entry; two in flight would decide on the same witness.
+    manager_verbs: crate::sqz_sync::SqzMutex<()>,
     /// Last ledger seq written by a checkpoint (starts at the mounted
     /// record's seq).
     pub(super) checkpoint_seq: AtomicU64,
@@ -1348,6 +1352,7 @@ impl KvMetaBackend {
     /// [`Self::shutdown`] or when the backend is dropped (the v2 flusher's
     /// sentinel discipline — no leaked tasks).
     pub async fn open(path: &Path) -> std::result::Result<Arc<Self>, KvError> {
+        let open_started = std::time::Instant::now();
         // (1) Layer A first: kernel-arbitrated, cheapest, and the refusal
         // the measured incident (two same-host daemons) needs.
         let guard_fd = match Self::acquire_writer_flock(path) {
@@ -1481,7 +1486,10 @@ impl KvMetaBackend {
         // every region of ours goes Live under this mount's identity in
         // one barriered cycle — a no-op on a flat volume. A refusal tears
         // down like the gate's.
-        if let Err(e) = be.join_appender_regions().await {
+        if let Err(e) = be
+            .join_appender_regions(open_started.elapsed().as_millis() as u64)
+            .await
+        {
             be.release_reservation().await;
             drop(be.guard_fd.lock().unwrap().take());
             return Err(e);
@@ -2425,7 +2433,7 @@ impl KvMetaBackend {
                 .ok()
                 .as_deref(),
         );
-        let smo = crate::sqz_sync::SqzMutex::new(SmoContext::with_journal(
+        let mut smo_ctx = SmoContext::with_journal(
             alloc.clone(),
             SmoJournal {
                 ring: ring.clone(),
@@ -2433,7 +2441,28 @@ impl KvMetaBackend {
                 sync: sync.clone(),
                 path: path.to_path_buf(),
             },
-        ));
+        );
+        // A partitioned forest's SMOs scope themselves by slot (§5.2.3):
+        // a leased slot tree's ring and grant are its lessee's. The
+        // resolver holds the set weakly — the set outlives every SMO by
+        // construction, and the backend owns both.
+        if let Some(set) = appenders.as_ref().filter(|a| a.is_partitioned()) {
+            let weak = Arc::downgrade(set);
+            smo_ctx.set_region_resolver(Arc::new(move |slot| {
+                let set = weak.upgrade()?;
+                let id = set.region_of_slot(slot);
+                if id == 0 {
+                    return None;
+                }
+                let r = set.region(id)?;
+                Some(super::tree::SmoRegion {
+                    appender_id: id,
+                    ring: r.ring(),
+                    grant: Arc::clone(&r.grant),
+                })
+            }));
+        }
+        let smo = crate::sqz_sync::SqzMutex::new(smo_ctx);
         let be = Self {
             path: path.to_path_buf(),
             sb,
@@ -2495,6 +2524,7 @@ impl KvMetaBackend {
             dirty_node_cap,
             timeout_threshold: squeezefs_timeout_env(),
             smo,
+            manager_verbs: crate::sqz_sync::SqzMutex::new(()),
             retire_seq,
             pending_reclaim: std::sync::Mutex::new(Vec::new()),
             barrier_starts: AtomicU64::new(0),
@@ -2606,16 +2636,14 @@ impl KvMetaBackend {
             .map_or(0, |a| a.region_of_slot(slot))
     }
 
-    /// The region a cached node's floor clamps: a slot-stamped LEAF's is
-    /// its slot's lessee's ring (its content journals there); interior
-    /// nodes, tree 0 and every flat node are the manager's (ring 0 —
-    /// structure is the manager's in PR 2, design §5.2.3 owed to PR 3's
-    /// grant).
+    /// The region a cached node's floor clamps and whose ring its SMOs
+    /// journal into: a slot-stamped node's — leaf or interior — is its
+    /// slot's lessee's (§5.2.3: every SMO of a slot tree is the owner's
+    /// own, in its own ring, with a grant); tree 0 and every flat node
+    /// are the manager's (ring 0).
     pub(super) fn region_of_node(&self, node: &CachedNode) -> u32 {
-        match (node.level(), node.forest_slot()) {
-            (0, Some(slot)) => self.region_of_slot(slot),
-            _ => 0,
-        }
+        node.forest_slot()
+            .map_or(0, |slot| self.region_of_slot(slot))
     }
 
     /// The ring region `id` journals into (region 0's is the fixed ring).
@@ -2668,7 +2696,10 @@ impl KvMetaBackend {
     /// checkpoint cycle — which also lands the bitmap bits of any ring
     /// extents claimed at open BEFORE a page names them. Refuses on a
     /// non-writer (a probe / reader never writes a page).
-    pub(super) async fn join_appender_regions(&self) -> std::result::Result<(), KvError> {
+    pub(super) async fn join_appender_regions(
+        &self,
+        open_wall_ms: u64,
+    ) -> std::result::Result<(), KvError> {
         let Some(set) = self.appenders.as_ref() else {
             return Ok(());
         };
@@ -2683,6 +2714,32 @@ impl KvMetaBackend {
         // appender's page, PR 10's.
         if let Some(why) = &set.join_refusal {
             return Err(KvError::Busy(why.clone()));
+        }
+        // §5.9's successor arm: page 0 `Live` under a FOREIGN node here
+        // means the D0 ladder was WON over its holder (a fresh claim
+        // refused at the gate; a stale one was preempted at the device
+        // or attested clear) — the dead manager's ring, the fixed ring,
+        // was replayed at step (2) of this open, before this first
+        // control write (KD-SYM-3). The role passes with the page.
+        if let Some(r0) = set.regions.first() {
+            let foreign = {
+                let page = r0.page.lock().unwrap_or_else(|e| e.into_inner());
+                page.state == super::appender::AppenderState::Live
+                    && !page.identity.owned_by_node(set.identity.node_token)
+            };
+            if foreign {
+                let page = r0.page.lock().unwrap_or_else(|e| e.into_inner());
+                log::warn!(
+                    "meta volume {}: appender 0's page is LIVE under a foreign node ({:#018x}, \
+                     term {}) whose writer_claim the D0 ladder took over — the manager role \
+                     passes to this mount; the dead manager's ring was replayed before this \
+                     first control write (design-symmetric-metadata §5.9 / KD-SYM-3; \
+                     manager_lease: held)",
+                    self.path.display(),
+                    page.identity.node_token,
+                    page.term
+                );
+            }
         }
         let writer_id = uuid::Uuid::parse_str(&self.writer_id)
             .map(|u| u.as_u128())
@@ -2702,10 +2759,33 @@ impl KvMetaBackend {
             page.appender_id = region.id;
             set.joins.fetch_add(1, Ordering::Relaxed);
         }
+        // The failover bound's two measured terms: the replay this open
+        // paid and the rest of the open's wall (the ladder).
+        let replay_ms = self.replay.replay_ms;
+        set.failover_bound_ms.store(
+            super::appender::manager_failover_bound_ms(
+                crate::fuse_client::CLIENT_STALE_TTL_SECS,
+                open_wall_ms.saturating_sub(replay_ms),
+                replay_ms,
+            ),
+            Ordering::Release,
+        );
+        *set.manager_lease.lock().unwrap_or_else(|e| e.into_inner()) =
+            super::appender::ManagerLease::Held;
         set.joined.store(true, Ordering::Release);
         // One barriered cycle: bitmap pages (the rings' extents), the
         // ledger, then every region's page in its Live form.
-        self.checkpoint_now().await
+        self.checkpoint_now().await?;
+        // The initial grant of every declared region that holds none
+        // (§5.3.3 — the join's grant): a recovered region keeps what its
+        // record and page attest.
+        for r in set.regions.iter().skip(1) {
+            if r.grant().unclaimed() == 0 && r.grant().claimed() == 0 {
+                let want = self.grant_extents_for(set, r.id) as u32;
+                self.manager_extent_grant(r.id, want).await?;
+            }
+        }
+        Ok(())
     }
 
     /// **The appender LEAVE** (§5.1.3 region release, the clean-unmount
@@ -2736,6 +2816,29 @@ impl KvMetaBackend {
             return Ok(());
         }
         let node_size = u64::from(self.sb.node_size);
+        // §5.1.3: a released region's UNCLAIMED grant (and every free its
+        // tail already covered) returns to the heap — one control entry
+        // per region, before its page goes Free.
+        for region in set.regions.iter().skip(1) {
+            let mut back: Vec<u64> = {
+                let mut g = region.grant();
+                let mut v = g.take_returnable();
+                v.extend(g.take_unclaimed());
+                v
+            };
+            back.sort_unstable();
+            back.dedup();
+            if !back.is_empty() {
+                if let Err(e) = self.return_extents_inner(region.id, &back, true).await {
+                    log::warn!(
+                        "meta volume {}: appender {}'s grant return at the leave failed ({e}) — \
+                         the extents stay granted (fsck C13 reclaims)",
+                        self.path.display(),
+                        region.id
+                    );
+                }
+            }
+        }
         let mut released: Vec<super::superblock::ExtentRef> = Vec::new();
         for region in &set.regions {
             {
@@ -2778,6 +2881,384 @@ impl KvMetaBackend {
             .write_dirty_pages(&self.path, self.sb.alloc_bitmap.start, ckpt_seq)
             .await?;
         crate::uring_fs::fdatasync(self.path.clone()).await?;
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // The manager's verbs (design-symmetric-metadata §5.3.3 / §5.3.5, PR 3):
+    // extent grants and returns, the appender join. Every verb mutates
+    // DURABLE state through ONE control entry in ring 0 (tree-0 records +
+    // allocator deltas, one checksummed entry, barriered before the reply)
+    // and is idempotent against that state — never against a RAM window.
+    // -----------------------------------------------------------------------
+
+    /// The manager's durable-state precondition: a joined writer holding
+    /// the manager lease of a forest volume. `at_leave` = the clean
+    /// unmount's own return, which runs under the shutdown latch the
+    /// write gate refuses everything else on (a failed volume still
+    /// refuses).
+    fn manager_gate(
+        &self,
+        at_leave: bool,
+    ) -> std::result::Result<&Arc<super::appender::AppenderSet>, KvError> {
+        let set = self.appenders.as_ref().ok_or_else(|| {
+            KvError::Busy(format!(
+                "{}: not a symmetric-forest volume (bit 17 absent) — no manager lease exists",
+                self.path.display()
+            ))
+        })?;
+        if self.read_only || self.non_writer || !set.joined.load(Ordering::Acquire) {
+            return Err(KvError::Busy(format!(
+                "{}: this mount does not hold the manager lease ({}) — only the manager \
+                 grants, returns and joins (design-symmetric-metadata KD-SYM-3)",
+                self.path.display(),
+                set.manager_lease
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .word()
+            )));
+        }
+        if at_leave {
+            if self.is_failed() {
+                return Err(KvError::Busy(format!(
+                    "{}: volume failed — the leave returns nothing",
+                    self.path.display()
+                )));
+            }
+        } else {
+            self.write_gate()?;
+        }
+        Ok(set)
+    }
+
+    /// ONE checkpoint-class control entry in ring 0 carrying `recs`
+    /// (tree-0 puts, allocator deltas), applied to tree 0 in RAM after the
+    /// reservation, written, then BARRIERED — a manager verb answers
+    /// only from durable state (§5.3.5; the S9 `BlockGrant` law: a grant
+    /// a peer holds is always journaled). A refused admission is the
+    /// caller's retry; a failed write is the journal-failure class.
+    async fn write_control_entry(
+        &self,
+        mut recs: Vec<(u8, Record)>,
+    ) -> std::result::Result<(), KvError> {
+        let forest = self.forest().ok_or_else(|| {
+            KvError::Corrupt(format!(
+                "{}: a control entry on a volume without tree 0",
+                self.path.display()
+            ))
+        })?;
+        let len = entry_len_for(&recs)?;
+        let Some(adm) = self.ring.try_admit(len, AdmissionClass::Checkpoint) else {
+            return Err(KvError::JournalReserveExhausted { needed: len });
+        };
+        let res = self.ring.reserve_registered(adm);
+        for (i, (_, r)) in recs.iter_mut().enumerate() {
+            r.seq = res.start + i as u64;
+        }
+        let control = Arc::clone(forest.control());
+        for (tag, r) in &recs {
+            if untag(*tag).0 != super::record::TREE_CONTROL {
+                continue;
+            }
+            control
+                .apply_replayed(
+                    &r.key,
+                    r.seq,
+                    r.kind,
+                    Bytes::copy_from_slice(&r.value),
+                    res.start,
+                )
+                .await?;
+        }
+        if let Err(e) = self.ring.commit_entry(&res, &recs).await {
+            log::error!(
+                "meta volume {}: manager control entry write failed ({e}) — the verb's durable \
+                 step did not land",
+                self.path.display()
+            );
+            self.note_journal_failure();
+            return Err(e);
+        }
+        self.sync_device().await.map_err(KvError::Io)
+    }
+
+    /// Appender `id`'s CURRENT grant record in tree 0 (empty when none).
+    pub async fn extent_grant_record(
+        &self,
+        appender_id: u32,
+    ) -> std::result::Result<super::slot_state::ExtentGrantRecord, KvError> {
+        let Some(forest) = self.forest() else {
+            return Ok(Default::default());
+        };
+        match forest
+            .control()
+            .lookup(&super::slot_state::extent_grant_key(appender_id))
+            .await?
+        {
+            Some(v) => super::slot_state::ExtentGrantRecord::decode(&v),
+            None => Ok(Default::default()),
+        }
+    }
+
+    /// Every appender's grant record in tree 0 (fsck C13's granted set;
+    /// the violation detector's grant map).
+    pub async fn extent_grant_records(
+        &self,
+    ) -> std::result::Result<Vec<(u32, super::slot_state::ExtentGrantRecord)>, KvError> {
+        let Some(forest) = self.forest() else {
+            return Ok(Vec::new());
+        };
+        Self::read_extent_grant_records(forest.control()).await
+    }
+
+    async fn read_extent_grant_records(
+        control: &KvTree,
+    ) -> std::result::Result<Vec<(u32, super::slot_state::ExtentGrantRecord)>, KvError> {
+        let (mut cursor, end) = super::slot_state::extent_grant_key_range();
+        let mut out = Vec::new();
+        loop {
+            let page = control.range(&cursor, &end, 512).await?;
+            let Some((last, _)) = page.last() else {
+                break;
+            };
+            cursor = key_successor(last);
+            for (k, v) in &page {
+                out.push((
+                    super::slot_state::decode_extent_grant_key(k)?,
+                    super::slot_state::ExtentGrantRecord::decode(v)?,
+                ));
+            }
+            if page.len() < 512 {
+                break;
+            }
+        }
+        Ok(out)
+    }
+
+    /// The grant size the manager answers appender `id` with right now:
+    /// the knob, else the §5.3.3 derivation over the region's measured
+    /// SMO rate, the failover bound and the free heap.
+    pub(super) fn grant_extents_for(
+        &self,
+        set: &super::appender::AppenderSet,
+        appender_id: u32,
+    ) -> u64 {
+        let ewma = set
+            .region(appender_id)
+            .map_or(0, |r| r.smo_ewma_milli.load(Ordering::Relaxed));
+        super::appender::resolve_grant_extents(
+            ewma,
+            set.failover_bound_ms.load(Ordering::Relaxed),
+            self.alloc.free_extents(),
+            set.regions.len().max(1) as u64,
+        )
+    }
+
+    /// **`ExtentGrant { want }`** (§5.3.3): carve up to `want` extents
+    /// from the free heap in the USER class (a grant never eats the
+    /// manager's compaction reserve), coalesced into ≤ `GRANT_RUNS_MAX`
+    /// runs; journal their allocator deltas and the appender's rewritten
+    /// `extent_grant` record as ONE control entry; barrier; answer the
+    /// runs. `want == 0` answers the derived size. An in-process region
+    /// adopts the runs into its RAM grant. Answers the empty grant when
+    /// the heap is at its growth floor — the appender counts the stall.
+    pub async fn manager_extent_grant(
+        &self,
+        appender_id: u32,
+        want: u32,
+    ) -> std::result::Result<Vec<super::appender::GrantRun>, KvError> {
+        let set = self.manager_gate(false)?;
+        if appender_id == 0 {
+            set.verbs.refusals.fetch_add(1, Ordering::Relaxed);
+            return Err(KvError::Busy(format!(
+                "{}: appender 0 is the manager and claims from the bitmap it owns — it takes \
+                 no grant (manager_verb_refusals)",
+                self.path.display()
+            )));
+        }
+        let _g = self.manager_verbs.lock().await;
+        let want = if want == 0 {
+            self.grant_extents_for(set, appender_id)
+        } else {
+            u64::from(want)
+        };
+        let record = self.extent_grant_record(appender_id).await?;
+        let mut claimed: Vec<u64> = Vec::with_capacity(want as usize);
+        for _ in 0..want {
+            match self.alloc.claim_user() {
+                Ok(e) => claimed.push(e),
+                Err(KvError::NoSpace { .. }) => break,
+                Err(e) => {
+                    for c in claimed {
+                        self.alloc.release_unpublished(c);
+                    }
+                    return Err(e);
+                }
+            }
+        }
+        claimed.sort_unstable();
+        let mut runs =
+            super::slot_state::ExtentGrantRecord::from_extents(claimed.iter().copied()).runs;
+        // The page names ≤ GRANT_RUNS_MAX runs: a fragmented heap answers
+        // fewer extents rather than a grant the page cannot record.
+        if runs.len() > super::appender::GRANT_RUNS_MAX {
+            let keep: std::collections::BTreeSet<u64> = runs
+                .iter()
+                .take(super::appender::GRANT_RUNS_MAX)
+                .flat_map(|r| r.start..r.start + u64::from(r.len))
+                .collect();
+            for e in claimed.iter().filter(|e| !keep.contains(e)) {
+                self.alloc.release_unpublished(*e);
+            }
+            claimed.retain(|e| keep.contains(e));
+            runs.truncate(super::appender::GRANT_RUNS_MAX);
+        }
+        if claimed.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut recs: Vec<(u8, Record)> = claimed
+            .iter()
+            .map(|e| super::alloc_ext::alloc_record(*e, 0))
+            .collect();
+        let merged = super::slot_state::ExtentGrantRecord::from_extents(
+            record.extents().chain(claimed.iter().copied()),
+        );
+        recs.push((
+            super::journal::tag_for(super::record::TREE_CONTROL, 0),
+            Record::put(
+                super::slot_state::extent_grant_key(appender_id),
+                0,
+                merged.encode()?,
+            ),
+        ));
+        if let Err(e) = self.write_control_entry(recs).await {
+            for c in claimed {
+                self.alloc.release_unpublished(c);
+            }
+            return Err(e);
+        }
+        set.extent_grants.fetch_add(1, Ordering::Relaxed);
+        set.extent_grant_extents
+            .fetch_add(claimed.len() as u64, Ordering::Relaxed);
+        if let Some(r) = set.region(appender_id) {
+            r.grant().add_runs(&runs);
+            // The page names the grant (§5.3.3) — one write; the next
+            // checkpoint's barrier covers it, and a page lost before that
+            // only over-states the claimed set (fsck C13's class).
+            {
+                let mut page = r.page.lock().unwrap_or_else(|e| e.into_inner());
+                page.grant = r.grant().unclaimed_runs();
+            }
+            self.write_region_page(r).await?;
+        }
+        log::info!(
+            "meta volume {}: extent grant to appender {appender_id}: {} extent(s) in {} run(s) \
+             (extent_grants)",
+            self.path.display(),
+            claimed.len(),
+            runs.len()
+        );
+        Ok(runs)
+    }
+
+    /// **`ReturnExtents { runs }`** (§5.3.3): clear the returned extents'
+    /// bits — a `free(extent, retire 0)` delta each, immediately reusable:
+    /// the appender's own tail covered the free, so nothing durable
+    /// routes to the old image — and rewrite the appender's grant record
+    /// without them, ONE control entry. Idempotent: an extent the record
+    /// no longer grants is already returned (`already`). Answers
+    /// `(cleared, already)`.
+    pub async fn manager_return_extents(
+        &self,
+        appender_id: u32,
+        extents: &[u64],
+    ) -> std::result::Result<(u64, u64), KvError> {
+        self.return_extents_inner(appender_id, extents, false).await
+    }
+
+    async fn return_extents_inner(
+        &self,
+        appender_id: u32,
+        extents: &[u64],
+        at_leave: bool,
+    ) -> std::result::Result<(u64, u64), KvError> {
+        let set = self.manager_gate(at_leave)?;
+        let _g = self.manager_verbs.lock().await;
+        let record = self.extent_grant_record(appender_id).await?;
+        let (granted, already): (Vec<u64>, Vec<u64>) =
+            extents.iter().copied().partition(|e| record.contains(*e));
+        if granted.is_empty() {
+            if !already.is_empty() {
+                set.verbs.replays.fetch_add(1, Ordering::Relaxed);
+            }
+            return Ok((0, already.len() as u64));
+        }
+        let remaining = super::slot_state::ExtentGrantRecord::from_extents(
+            record.extents().filter(|e| !granted.contains(e)),
+        );
+        let mut recs: Vec<(u8, Record)> = granted
+            .iter()
+            .map(|e| super::alloc_ext::free_record(*e, 0, 0))
+            .collect();
+        let key = super::slot_state::extent_grant_key(appender_id);
+        recs.push((
+            super::journal::tag_for(super::record::TREE_CONTROL, 0),
+            if remaining.is_empty() {
+                Record::delete(key, 0)
+            } else {
+                Record::put(key, 0, remaining.encode()?)
+            },
+        ));
+        self.write_control_entry(recs).await?;
+        for e in &granted {
+            self.alloc.release_unpublished(*e);
+        }
+        set.extent_returns.fetch_add(1, Ordering::Relaxed);
+        if !already.is_empty() {
+            set.verbs.replays.fetch_add(1, Ordering::Relaxed);
+        }
+        Ok((granted.len() as u64, already.len() as u64))
+    }
+
+    /// **The grant cadence of one checkpoint cycle** (§5.3.3): fold every
+    /// region's SMO rate, ship the extents its tail released as
+    /// `ReturnExtents`, and refill a region at 50 % consumption — the
+    /// `alloc_lane` ahead-refill law. In PR 3 the manager is this
+    /// process (the region's grant calls are local); the wire form rides
+    /// the same executors.
+    pub(super) async fn grant_cadence(&self, cycle_ms: u64) -> std::result::Result<(), KvError> {
+        let Some(set) = self.appenders.as_ref().filter(|a| a.is_partitioned()) else {
+            return Ok(());
+        };
+        if !set.joined.load(Ordering::Acquire) || self.read_only || self.non_writer {
+            return Ok(());
+        }
+        for r in set.regions.iter().skip(1) {
+            r.fold_smo_rate(cycle_ms);
+            let returnable = r.grant().take_returnable();
+            if !returnable.is_empty() {
+                if let Err(e) = self.manager_return_extents(r.id, &returnable).await {
+                    r.grant().restore_returnable(returnable);
+                    log::warn!(
+                        "meta volume {}: appender {}'s ReturnExtents deferred ({e}); retried next \
+                         cycle",
+                        self.path.display(),
+                        r.id
+                    );
+                }
+            }
+            let due = r.grant().refill_due();
+            if due && !super::appender::test_manager_unreachable() {
+                let want = self.grant_extents_for(set, r.id) as u32;
+                if let Err(e) = self.manager_extent_grant(r.id, want).await {
+                    log::warn!(
+                        "meta volume {}: appender {}'s ExtentGrant refill deferred ({e})",
+                        self.path.display(),
+                        r.id
+                    );
+                }
+            }
+        }
         Ok(())
     }
 
@@ -3082,6 +3563,10 @@ impl KvMetaBackend {
                 // its page slots, as format wrote it.
                 if r.id == 0 {
                     page.segments = vec![super::appender::appender0_ring_extent(&self.sb.journal)];
+                } else {
+                    // The grant's UNCLAIMED remainder (§5.3.3): recovery
+                    // reads it against tree 0's record for the claimed set.
+                    page.grant = r.grant().unclaimed_runs();
                 }
                 page.slots = entries;
             }
@@ -3963,10 +4448,11 @@ impl KvMetaBackend {
                 if tag_tree_id == super::record::TREE_CONTROL {
                     return Ok(TreeRef::Borrowed(forest.control()));
                 }
+                let slot = forest.slot_of_forest_key(key)?;
                 forest
-                    .route_forest_key_or_mint(key, &self.mint_context())
+                    .slot_or_mint(slot, &self.mint_context_for(slot))
                     .await
-                    .map(|(_, t)| TreeRef::Owned(t))
+                    .map(TreeRef::Owned)
             }
         }
     }
@@ -4078,13 +4564,19 @@ impl KvMetaBackend {
     /// What a lazy slot-tree mint needs — the floor is the ring HEAD at
     /// the mint: every record the new tree will hold reserves at or past
     /// it, so the checkpoint tail must not pass it until tree 0 names the
-    /// root ([`super::forest::SlotTrees::unpublished_root_floor`]).
-    fn mint_context(&self) -> super::forest::MintContext<'_> {
+    /// root ([`super::forest::SlotTrees::unpublished_root_floors`]).
+    fn mint_context_for(&self, slot: super::record::ForestSlot) -> super::forest::MintContext<'_> {
+        // A slot a declared appender leases mints INSIDE that appender's
+        // grant, with its ring's head as the floor (§5.3.3).
+        let region = self.smo_region_of_slot(slot);
+        let floor = region
+            .as_ref()
+            .map_or_else(|| self.ring.core().head(), |r| r.ring.core().head());
         super::forest::MintContext {
             cache: &self.cache,
             seq: self.seq_ref(),
             alloc: &self.alloc,
-            floor: self.ring.core().head(),
+            floor,
             // The runtime mint is USER growth; a mount that may not write
             // never reaches one (the write gate refuses upstream) — the
             // policy is the belt to that brace.
@@ -4093,7 +4585,27 @@ impl KvMetaBackend {
             } else {
                 super::forest::MintPolicy::User
             },
+            region,
         }
+    }
+
+    /// The SMO scope of `slot`'s lessee: its ring and grant when a
+    /// declared region leases it, `None` for the manager's own slots.
+    pub(super) fn smo_region_of_slot(
+        &self,
+        slot: super::record::ForestSlot,
+    ) -> Option<super::tree::SmoRegion> {
+        let set = self.appenders.as_ref().filter(|a| a.is_partitioned())?;
+        let id = set.region_of_slot(slot);
+        if id == 0 {
+            return None;
+        }
+        let r = set.region(id)?;
+        Some(super::tree::SmoRegion {
+            appender_id: id,
+            ring: r.ring(),
+            grant: Arc::clone(&r.grant),
+        })
     }
 
     /// The volume-shared record/node seq source, borrowed (see
@@ -4168,10 +4680,11 @@ impl KvMetaBackend {
         match &self.trees {
             TreeSet::Flat { .. } => self.flat_tree(kind).insert(legacy, value).await,
             TreeSet::Forest { forest, .. } => {
-                let r = forest
-                    .route_or_mint(kind, legacy, &self.mint_context())
+                let (slot, key) = forest.route_key(kind, legacy)?;
+                let tree = forest
+                    .slot_or_mint(slot, &self.mint_context_for(slot))
                     .await?;
-                r.tree.insert(&r.key, value).await
+                tree.insert(&key, value).await
             }
         }
     }
@@ -6367,6 +6880,10 @@ impl KvMetaBackend {
                     for (tail, _) in drained {
                         r.ring().advance_reusable_upto(tail);
                         r.durable_tail.fetch_max(tail, Ordering::AcqRel);
+                        // The region's own §4.7 coverage gate: frees its
+                        // ring's tail covers become RETURNABLE — the
+                        // `ReturnExtents` batch the next cycle ships.
+                        r.grant().advance_durable(tail);
                     }
                 }
                 // Elision tails are PER RING (positions are not comparable
@@ -9516,6 +10033,10 @@ impl KvMetaBackend {
                 OpenPosture::Writer => super::forest::MintPolicy::Recovery,
                 OpenPosture::NonWriter => super::forest::MintPolicy::Refuse,
             },
+            // A recovery mint draws the bitmap, never a grant: the region
+            // set is not yet open here, and a recovered root extent the
+            // manager owns is an image like any other.
+            region: None,
         };
         let mut skipped_slots: std::collections::BTreeMap<ForestSlot, u64> =
             std::collections::BTreeMap::new();
@@ -9813,12 +10334,17 @@ impl KvMetaBackend {
         // "another process holds the writer claim" refusal, and the
         // non-joining Writer opens — `claim clear`, the guarded offline
         // verbs — are not blocked by a page they never write.
+        // Page 0 is the exception (§5.9, PR 3): a foreign `Live` page 0
+        // at the JOIN belongs to a manager the D0 ladder took the claim
+        // from — dead by D0's proof — and its ring IS the fixed ring
+        // this open replayed; the successor adopts the page with the
+        // role. Every other foreign `Live` page still refuses.
         let join_refusal = if is_writer {
             entries
                 .iter()
                 .find_map(|e| {
                     e.page.as_ref().filter(|p| {
-                        (p.state == AppenderState::Live && !mine(p))
+                        (p.state == AppenderState::Live && !mine(p) && p.appender_id != 0)
                             || p.state == AppenderState::Recovering
                     })
                 })
@@ -9848,6 +10374,18 @@ impl KvMetaBackend {
             partition
         };
 
+        // The manager-lease posture off page 0 as found: `Held` is the
+        // JOIN's to declare; a foreign `Live` page 0 is a peer's; a Free
+        // (or blank) page 0 is vacant. A same-node Live page 0 is our
+        // dead predecessor's — vacant until we join.
+        let manager_lease = match entries.first().and_then(|e| e.page.as_ref()) {
+            Some(p) if p.state == AppenderState::Live && !mine(p) => {
+                super::appender::ManagerLease::Peer {
+                    node_token: p.identity.node_token,
+                }
+            }
+            _ => super::appender::ManagerLease::Vacant,
+        };
         let set = AppenderSet {
             regions: Vec::new(),
             identity: AppenderIdentity {
@@ -9868,6 +10406,22 @@ impl KvMetaBackend {
             flush_ceiling_ms: super::appender::appender_flush_ceiling_ms(
                 crate::meta_backend::resolve_flush_interval_ms(),
             ),
+            // The ladder's and the replay's measured terms land at the
+            // JOIN (`join_appender_regions`), where the open's wall is
+            // known; until then the bound is the TTL alone.
+            failover_bound_ms: AtomicU64::new(super::appender::manager_failover_bound_ms(
+                crate::fuse_client::CLIENT_STALE_TTL_SECS,
+                0,
+                0,
+            )),
+            manager_lease: std::sync::Mutex::new(manager_lease),
+            wero_meta: AtomicBool::new(false),
+            extent_grants: AtomicU64::new(0),
+            extent_grant_extents: AtomicU64::new(0),
+            extent_returns: AtomicU64::new(0),
+            vol0_unreachable: AtomicU64::new(0),
+            verbs: Default::default(),
+            cadence_last_ns: AtomicU64::new(0),
         };
         let mut regions: Vec<Arc<AppenderRegion>> = Vec::new();
 
@@ -9918,6 +10472,10 @@ impl KvMetaBackend {
             growth_done: squeezefs_ipc::sqz_notify::Notify::new(),
             dir_named: std::sync::atomic::AtomicU8::new(dir_named0),
             self_recovered: self_recovered0,
+            grant: Default::default(),
+            smo_ewma_milli: AtomicU64::new(0),
+            smos_this_cycle: AtomicU64::new(0),
+            dependency_stalls: AtomicU64::new(0),
         }));
 
         // ---- Declared regions (the PR-2 seam standing in for PR 4's
@@ -10042,6 +10600,23 @@ impl KvMetaBackend {
             // a recovered ring the pair's images naming its table; for a
             // fresh ring none — the join's page write fills both slots.
             let dir_named = super::appender::dir_named_mask(&entry.dir_pages, &page.segments);
+            // The region's grant (§5.3.3): tree 0's record is the whole of
+            // it, the page names the unclaimed remainder; the ring
+            // window's alloc/free records refine both below.
+            let grant = if self_recovered {
+                let record = match forest
+                    .control()
+                    .lookup(&super::slot_state::extent_grant_key(id))
+                    .await?
+                {
+                    Some(v) => super::slot_state::ExtentGrantRecord::decode(&v)?,
+                    None => Default::default(),
+                };
+                super::appender::RegionGrant::recover(record.extents(), &page.grant)
+            } else {
+                page.grant.clear();
+                super::appender::RegionGrant::default()
+            };
             regions.push(Arc::new(AppenderRegion {
                 id,
                 page_offsets,
@@ -10060,6 +10635,10 @@ impl KvMetaBackend {
                 growth_done: squeezefs_ipc::sqz_notify::Notify::new(),
                 dir_named: std::sync::atomic::AtomicU8::new(dir_named),
                 self_recovered,
+                grant: Arc::new(std::sync::Mutex::new(grant)),
+                smo_ewma_milli: AtomicU64::new(0),
+                smos_this_cycle: AtomicU64::new(0),
+                dependency_stalls: AtomicU64::new(0),
             }));
         }
         let set = AppenderSet { regions, ..set };
@@ -10070,6 +10649,12 @@ impl KvMetaBackend {
             rings.push((*id, rec));
         }
         let leases = set.lease_map();
+        let grants = Self::read_extent_grant_records(forest.control()).await?;
+        let granted = |appender: u32, extent: u64| -> bool {
+            grants
+                .iter()
+                .any(|(id, rec)| *id == appender && rec.contains(extent))
+        };
         let owned: Vec<(u32, super::journal::JournalRecovery)> = rings
             .iter()
             .map(|(id, r)| {
@@ -10084,7 +10669,7 @@ impl KvMetaBackend {
                 )
             })
             .collect();
-        let violations = super::journal::detect_appender_violations(&owned, &leases);
+        let violations = super::journal::detect_appender_violations(&owned, &leases, &granted);
         if !violations.is_empty() {
             let (mut key, mut lease, mut extent) = (0u64, 0u64, 0u64);
             for v in &violations {
@@ -10170,20 +10755,67 @@ impl KvMetaBackend {
             alloc,
             floor: ledger.journal_tail_seq,
             policy: super::forest::MintPolicy::Recovery,
+            region: None,
         };
-        for (_id, rec) in &recovered {
+        for (id, rec) in &recovered {
+            // Phase 1: the region's own SMO pointer records by (level
+            // DESC, seq) — the lessee's interior flips journal in ITS
+            // ring since PR 3 (§5.2.3) — and its allocator deltas, which
+            // are GRANT-internal (the bitmap bits were set by the grant's
+            // carve in ring 0): an in-window `alloc` is a claim the page
+            // predates, a `free` a retirement parked on this ring's tail.
+            let mut interior: Vec<(u8, u64, &Record)> = Vec::new();
             for entry in &rec.entries {
-                for (tag, rec) in &entry.records {
+                for (tag, r) in &entry.records {
+                    let (tree_id, level) = untag(*tag);
+                    if tree_id == super::record::TREE_ALLOC_RESERVED {
+                        if let Some(region) = set.region(*id) {
+                            match super::alloc_ext::decode_alloc_record(r)? {
+                                super::alloc_ext::AllocDelta::Allocated { extent } => {
+                                    region.grant().claim_exact(extent);
+                                }
+                                super::alloc_ext::AllocDelta::Freed { extent, .. } => {
+                                    region.grant().free_exact(extent, r.seq);
+                                }
+                            }
+                        }
+                    } else if tree_id == super::record::KIND_INTERIOR && level > 0 {
+                        interior.push((level, entry.seq, r));
+                    }
+                }
+            }
+            interior.sort_by(|a, b| b.0.cmp(&a.0).then(a.2.seq.cmp(&b.2.seq)));
+            for (level, entry_start, r) in interior {
+                if r.kind == RecordKind::Put {
+                    if let Ok((_addr, child_seq)) = decode_interior_value(&r.value) {
+                        seq.fetch_max(child_seq, Ordering::AcqRel);
+                    }
+                }
+                let (slot, separator) = super::forest::split_interior_journal_key(&r.key)?;
+                let tree = forest.slot_or_mint(slot, &mint).await?;
+                tree.apply_replayed_interior(
+                    separator,
+                    level,
+                    r.seq,
+                    r.kind,
+                    Bytes::copy_from_slice(&r.value),
+                    entry_start,
+                )
+                .await?;
+            }
+            // Phase 2: content by forest key.
+            for entry in &rec.entries {
+                for (tag, r) in &entry.records {
                     let (tree_id, level) = untag(*tag);
                     if level > 0 || !super::record::is_slot_tree_kind(tree_id) {
-                        continue; // refused above as a Lease/Extent violation
+                        continue;
                     }
-                    let (_slot, tree) = forest.route_forest_key_or_mint(&rec.key, &mint).await?;
+                    let (_slot, tree) = forest.route_forest_key_or_mint(&r.key, &mint).await?;
                     tree.apply_replayed(
-                        &rec.key,
-                        rec.seq,
-                        rec.kind,
-                        Bytes::copy_from_slice(&rec.value),
+                        &r.key,
+                        r.seq,
+                        r.kind,
+                        Bytes::copy_from_slice(&r.value),
                         entry.seq,
                     )
                     .await?;
@@ -10224,7 +10856,7 @@ impl KvMetaBackend {
     /// is applied, every guest root that moved is UNPUBLISHED and its
     /// `root_floor` (the mint's head / the swap's reservation) clamps the
     /// cycle's tail through [`super::forest::SlotTrees::
-    /// unpublished_root_floor`] — a deferred publication (reserve
+    /// unpublished_root_floors`] — a deferred publication (reserve
     /// exhausted) therefore leaves the records under those roots in the
     /// window, exactly like an SMO the flush pass skipped; (2) once
     /// applied, the record is a content record of tree 0 with the entry's
@@ -10372,12 +11004,14 @@ impl KvMetaBackend {
         Ok(())
     }
 
-    /// The lowest journal position an UNPUBLISHED guest root came into
-    /// force at — the checkpoint tail's forest clamp (`u64::MAX` on a
-    /// flat volume and on a forest whose roots are all named).
-    pub(super) fn unpublished_root_floor(&self) -> u64 {
+    /// The unpublished guest roots' floors per slot (empty on a flat
+    /// volume) — folded into each slot's REGION tail by the checkpoint.
+    pub(super) fn unpublished_root_floors(
+        &self,
+    ) -> std::collections::BTreeMap<super::record::ForestSlot, u64> {
         self.forest()
-            .map_or(u64::MAX, |f| f.unpublished_root_floor())
+            .map(|f| f.unpublished_root_floors())
+            .unwrap_or_default()
     }
 
     /// The tree a defrag census target `(header tree id, node addr)`
@@ -11405,9 +12039,15 @@ impl KvMetaBackend {
                     }
                 } else {
                     // Fan the refusals out (pre-reserve terminal outcomes).
+                    // A GRANT refusal is the appender's manager dependency
+                    // (EAGAIN, already counted), never the heap's space
+                    // class: it neither latches `heap_full` nor counts an
+                    // ENOSPC.
                     for (qi, e) in refused.into_iter().rev() {
-                        self.enospc_refusals.fetch_add(1, Ordering::Relaxed);
-                        self.enter_heap_full(&format!("a user commit was refused: {e}"));
+                        if !matches!(e, KvError::GrantExhausted { .. }) {
+                            self.enospc_refusals.fetch_add(1, Ordering::Relaxed);
+                            self.enter_heap_full(&format!("a user commit was refused: {e}"));
+                        }
                         let q = s.entries.remove(qi);
                         s.outcomes.push((q, Err(e)));
                     }
@@ -12165,6 +12805,34 @@ impl KvMetaBackend {
                     // Covered by an earlier member/attempt: the exact
                     // estimate becomes the new basis.
                     guards[gi].set_promise_basis(fold);
+                    continue;
+                }
+                // A leaf of a LEASED slot draws its lessee's GRANT, never
+                // the bitmap (§5.3.3): admitted while the grant covers
+                // the SMO; short of it with the manager unreachable the
+                // member refuses EAGAIN-class (`GrantExhausted` — the
+                // appender's dependency, counted); short of it with the
+                // manager live it is admitted — the cadence refills before
+                // the flush pass needs the extent, or that pass defers
+                // and counts the stall.
+                if let Some(region) = lock_set[gi]
+                    .forest_slot()
+                    .map(|s| self.region_of_slot(s))
+                    .filter(|id| *id != 0)
+                    .and_then(|id| self.appenders().and_then(|a| a.region(id)))
+                {
+                    let unclaimed = region.grant().unclaimed();
+                    if unclaimed < delta && super::appender::test_manager_unreachable() {
+                        region.dependency_stalls.fetch_add(1, Ordering::Relaxed);
+                        verdict = Some(KvError::GrantExhausted {
+                            appender: region.id,
+                            unclaimed,
+                        });
+                        break;
+                    }
+                    guards[gi].promise(delta, fold);
+                    taken.push((gi, delta, 0));
+                    admitted_split |= is_split;
                     continue;
                 }
                 let floor = if is_split { reserve } else { compaction_floor };

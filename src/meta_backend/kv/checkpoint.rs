@@ -1579,15 +1579,77 @@ impl KvMetaBackend {
         // Nodes this pass could not flush because the allocator answered
         // `NoSpace` — the wedged-tail audit's class discriminator below.
         let mut deferred_for_space = 0u64;
+        // Regions whose SMO wanted an extent their exhausted grant could
+        // not give (the manager's refill owed): deferred like the space
+        // arm, counted on `manager_dependency_stalls`.
+        let mut deferred_for_grant = 0u64;
+        let smo_counters = || {
+            super::META_KV_NODE_COMPACTIONS.load(Ordering::Relaxed)
+                + super::META_KV_NODE_SPLITS.load(Ordering::Relaxed)
+                + super::META_KV_NODE_MERGES.load(Ordering::Relaxed)
+                + super::META_KV_ROOT_COLLAPSES.load(Ordering::Relaxed)
+        };
         for node in dirty {
             let addr = node.addr();
             let tree = self.tree_of_node(&node)?;
-            match tree.checkpoint_flush_node(smo, addr).await {
+            // A leased slot tree's SMOs journal into its lessee's ring and
+            // claim inside its grant (§5.2.3 / §5.3.3) — the tree scopes
+            // itself; the region id here is the SMO-rate ledger's.
+            let region_id = node
+                .forest_slot()
+                .map(|slot| self.region_of_slot(slot))
+                .filter(|id| *id != 0);
+            let smos_before = smo_counters();
+            let mut out = tree.checkpoint_flush_node(smo, addr).await;
+            // A REACTIVE refill (§5.3.3): the flush pass that exhausts a
+            // region's grant asks the manager — this process, in PR 3 —
+            // for more and retries the node once; only a manager that
+            // cannot answer leaves the SMO deferred and counts the stall.
+            if let (Err(KvError::GrantExhausted { appender, .. }), Some(id)) = (&out, region_id) {
+                if *appender == id && !super::appender::test_manager_unreachable() {
+                    let want = self
+                        .appenders()
+                        .map_or(0, |a| self.grant_extents_for(a, id) as u32);
+                    match self.manager_extent_grant(id, want).await {
+                        Ok(runs) if !runs.is_empty() => {
+                            out = tree.checkpoint_flush_node(smo, addr).await;
+                        }
+                        Ok(_) => {}
+                        Err(e) => log::warn!(
+                            "checkpoint: appender {id}'s reactive ExtentGrant deferred ({e})"
+                        ),
+                    }
+                }
+            }
+            if let Some(id) = region_id {
+                let n = smo_counters().saturating_sub(smos_before);
+                if n > 0 {
+                    if let Some(r) = self.appenders().and_then(|a| a.region(id)) {
+                        r.smos_this_cycle.fetch_add(n, Ordering::Relaxed);
+                    }
+                }
+            }
+            match out {
                 Ok(()) => {}
                 Err(KvError::JournalReserveExhausted { needed }) => {
                     log::debug!(
                         "checkpoint: SMO reserve exhausted ({needed} B) at node {addr:#x}; \
                          deferred to the next cycle"
+                    );
+                }
+                Err(KvError::GrantExhausted {
+                    appender,
+                    unclaimed,
+                }) => {
+                    deferred_for_grant += 1;
+                    if let Some(r) = self.appenders().and_then(|a| a.region(appender)) {
+                        r.dependency_stalls.fetch_add(1, Ordering::Relaxed);
+                    }
+                    log::warn!(
+                        "checkpoint: appender {appender}'s extent grant is exhausted ({unclaimed} \
+                         unclaimed) at node {addr:#x}; compaction deferred to the next cycle \
+                         until the manager refills it (manager_dependency_stalls, bound \
+                         manager_dependency_stall_bound_ms)"
                     );
                 }
                 Err(KvError::NoSpace { free, reserve }) => {
@@ -1680,13 +1742,22 @@ impl KvMetaBackend {
         let partitioned = self.appenders().is_some_and(|a| a.is_partitioned());
         let mut tail = h
             .min(self.journal_ring().min_inflight_start())
-            .min(dying_floors)
-            // The forest's clamp: a guest root tree 0 does not yet name
-            // (a deferred or failed publication above) keeps every record
-            // applied under it in the window — `u64::MAX` when none.
-            .min(self.unpublished_root_floor());
+            .min(dying_floors);
+        // The forest's clamp: a guest root tree 0 does not yet name (a
+        // deferred or failed publication above) keeps every record
+        // applied under it in the window. A root floor is a position in
+        // the ring the slot's records journal into — the manager's slots
+        // clamp the ledger's tail, a leased slot's clamps ITS region's.
         let mut live_leaf_floors: std::collections::BTreeMap<super::record::ForestSlot, u64> =
             std::collections::BTreeMap::new();
+        for (slot, f) in self.unpublished_root_floors() {
+            if !partitioned || self.region_of_slot(slot) == 0 {
+                tail = tail.min(f);
+            } else {
+                let e = live_leaf_floors.entry(slot).or_insert(u64::MAX);
+                *e = (*e).min(f);
+            }
+        }
         for (slot, f) in &dying_leaf_floors {
             if !partitioned || self.region_of_slot(*slot) == 0 {
                 tail = tail.min(*f);
@@ -1697,7 +1768,10 @@ impl KvMetaBackend {
             if floor == u64::MAX {
                 return;
             }
-            if partitioned && n.level() == 0 {
+            // A slot-stamped node of a LEASED slot — leaf or interior,
+            // since its flips journal in its lessee's ring too — clamps
+            // that region's tail, never the ledger's.
+            if partitioned {
                 if let Some(slot) = n.forest_slot() {
                     if self.region_of_slot(slot) != 0 {
                         let e = live_leaf_floors.entry(slot).or_insert(u64::MAX);
@@ -1849,6 +1923,14 @@ impl KvMetaBackend {
             let pending_after = self.allocator().pending_count();
             if pending_after == 0 || pending_after < pending_before || tail > tail_before {
                 self.pending_free_stalled_cycles.store(0, Ordering::Release);
+            } else if deferred_for_grant > 0 {
+                // A tail pinned by a node whose lessee is out of GRANT is
+                // the manager dependency, not a wedge: bounded by
+                // `manager_dependency_stall_bound_ms`, counted above.
+                log::debug!(
+                    "checkpoint: {deferred_for_grant} node(s) deferred for an exhausted extent \
+                     grant (tail {tail}); the manager's refill owns the retry"
+                );
             } else if deferred_for_space > 0 {
                 log::debug!(
                     "checkpoint: space standstill — {deferred_for_space} node(s) deferred for \
@@ -1885,6 +1967,21 @@ impl KvMetaBackend {
         // ledger's). Its own bitmap + page writes and barriers are inside.
         // A no-op on every unpartitioned volume.
         self.grow_stalled_regions().await?;
+
+        // ---- The grant cadence (design-symmetric-metadata §5.3.3, PR 3):
+        // fold each region's SMO rate, ship the extents this cycle's
+        // barrier released as `ReturnExtents`, refill at 50 % consumption.
+        // A no-op on every unpartitioned volume.
+        if let Some(set) = self.appenders().filter(|a| a.is_partitioned()) {
+            let now = crate::mono_core::monotonic_ns_u64();
+            let last = set.cadence_last_ns.swap(now, Ordering::AcqRel);
+            let cycle_ms = if last == 0 {
+                0
+            } else {
+                now.saturating_sub(last) / 1_000_000
+            };
+            self.grant_cadence(cycle_ms).await?;
+        }
 
         // ---- §4.6a (e) the heap-full sweep: while the volume is full (or
         // a previous sweep left a backlog — candidates it could not admit

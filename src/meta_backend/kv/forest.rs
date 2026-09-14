@@ -90,13 +90,17 @@ pub enum MintPolicy {
 
 /// What a lazy mint needs from the backend: the volume's node cache, its
 /// seq source, its allocator, the journal head at the mint (the new
-/// tree's `root_floor`), and the policy the mount's posture sets.
+/// tree's `root_floor`), the policy the mount's posture sets, and — for
+/// a slot a declared appender leases — that appender's region, whose
+/// grant the root extent is claimed from and whose ring head the floor is
+/// (§5.3.3).
 pub struct MintContext<'a> {
     pub cache: &'a Arc<NodeCache>,
     pub seq: &'a Arc<AtomicU64>,
     pub alloc: &'a Arc<super::alloc_ext::ExtentAllocator>,
     pub floor: u64,
     pub policy: MintPolicy,
+    pub region: Option<super::tree::SmoRegion>,
 }
 
 impl SlotTrees {
@@ -230,6 +234,25 @@ impl SlotTrees {
         Ok(Routed { slot, tree, key })
     }
 
+    /// The forest key and slot of a `(kind, legacy key)` pair — the routing
+    /// decision without the mint, for a caller that builds the mint
+    /// context PER SLOT (a leased slot's mint claims from its lessee's
+    /// grant).
+    pub fn route_key(&self, kind: u8, legacy: &[u8]) -> Result<(ForestSlot, Vec<u8>), KvError> {
+        let key = forest_key(kind, legacy)?;
+        let slot = forest_key_slot(&key)?;
+        Ok((slot, key))
+    }
+
+    /// The slot a CONTENT forest key names, counting a refused key on
+    /// `meta_kv_forest_key_violations`.
+    pub fn slot_of_forest_key(&self, key: &[u8]) -> Result<ForestSlot, KvError> {
+        forest_key_slot(key).map_err(|e| {
+            super::META_KV_FOREST_KEY_VIOLATIONS.fetch_add(1, Ordering::Relaxed);
+            e
+        })
+    }
+
     /// Route a journaled / replayed CONTENT forest key to its slot tree,
     /// minting on first touch. (Interior records name their slot on the
     /// journal key — [`split_interior_journal_key`] + [`Self::slot_or_mint`].)
@@ -302,6 +325,7 @@ impl SlotTrees {
             return Ok(t); // the racing minter won
         }
         let mut ctx = SmoContext::new(Arc::clone(mint.alloc));
+        ctx.set_region(mint.region.clone());
         let tree = Arc::new(
             KvTree::create_slot_tree(
                 Arc::clone(mint.cache),
@@ -327,13 +351,15 @@ impl SlotTrees {
         let _ = self.published.upsert_sync(slot, root);
     }
 
-    /// The lowest journal position any UNPUBLISHED guest root came into
-    /// force at (`u64::MAX` = every guest root is named in tree 0): the
+    /// The journal position every UNPUBLISHED guest root came into force
+    /// at, PER SLOT (empty = every guest root is named in tree 0): the
     /// checkpoint tail's clamp while a publication is pending or
     /// deferred — until tree 0 durably names a root, every record applied
-    /// under it must stay in the replay window.
-    pub fn unpublished_root_floor(&self) -> u64 {
-        let mut floor = u64::MAX;
+    /// under it must stay in the replay window. A floor is a position in
+    /// the ring the slot's records journal into, so a partitioned volume
+    /// folds each into ITS region's tail.
+    pub fn unpublished_root_floors(&self) -> std::collections::BTreeMap<ForestSlot, u64> {
+        let mut out = std::collections::BTreeMap::new();
         self.guests.iter_sync(|slot, tree| {
             let live = tree.root();
             let stale = self
@@ -341,11 +367,11 @@ impl SlotTrees {
                 .read_sync(slot, |_, p| *p != live)
                 .unwrap_or(true);
             if stale {
-                floor = floor.min(tree.root_floor());
+                out.insert(*slot, tree.root_floor());
             }
             true
         });
-        floor
+        out
     }
 
     /// Split a slot-tree key into `(kind, legacy key)`, or `None` for a

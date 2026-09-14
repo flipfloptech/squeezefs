@@ -2474,24 +2474,34 @@ impl NodeCache {
     }
 
     /// Fold a departing NODE's `dirty_floor` (see [`Self::note_dying_floor`])
-    /// into the accumulator its ring owns: a slot-stamped LEAF's into the
-    /// per-slot map, everything else into the flat word.
+    /// into the accumulator its ring owns: a slot-stamped node's — leaf
+    /// or interior, since PR 3 journals a leased slot tree's flips into
+    /// its lessee's ring too — into the per-slot map, everything else
+    /// (tree 0, flat nodes) into the flat word. The checkpoint folds the
+    /// slots the manager holds back into the ledger's tail.
     fn note_node_dying_floor(&self, node: &CachedNode) {
         let floor = node.dirty_floor();
         if floor == u64::MAX {
             return;
         }
-        match (node.level(), node.forest_slot()) {
-            (0, Some(slot)) => {
-                let mut g = self
-                    .dying_leaf_floors
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner());
-                let e = g.entry(slot).or_insert(u64::MAX);
-                *e = (*e).min(floor);
-            }
-            _ => self.note_dying_floor(floor),
+        match node.forest_slot() {
+            Some(slot) => self.note_slot_dying_floor(slot, floor),
+            None => self.note_dying_floor(floor),
         }
+    }
+
+    /// Fold a position in slot `slot`'s lessee's ring into the per-slot
+    /// dying-floor map (a retiring node's floor, a root swap's position).
+    pub(crate) fn note_slot_dying_floor(&self, slot: super::record::ForestSlot, floor: u64) {
+        if floor == u64::MAX {
+            return;
+        }
+        let mut g = self
+            .dying_leaf_floors
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let e = g.entry(slot).or_insert(u64::MAX);
+        *e = (*e).min(floor);
     }
 
     /// Drain the per-slot LEAF dying floors (the sibling of

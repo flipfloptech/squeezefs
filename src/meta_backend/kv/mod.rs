@@ -865,6 +865,19 @@ pub enum KvError {
     )]
     NoSpace { free: u64, reserve: u64 },
 
+    /// An appender's SMO needs an image extent and its extent GRANT is
+    /// exhausted (design-symmetric-metadata §5.3.3): the manager's refill
+    /// has not answered — the appender's dependency on a live manager,
+    /// bounded by `manager_dependency_stall_bound_ms`. The flush pass
+    /// defers the node (counted `manager_dependency_stalls`); a user op
+    /// that needs the extent refuses `EAGAIN`-class, never `ENOSPC` (the
+    /// heap is not full — the appender is out of grant).
+    #[error(
+        "appender {appender}'s extent grant is exhausted ({unclaimed} unclaimed) and the \
+         manager has not refilled it — retry (EAGAIN)"
+    )]
+    GrantExhausted { appender: u32, unclaimed: u64 },
+
     /// The checkpoint-task ring reserve could not admit an SMO's records
     /// right now (§4.4 pt 5): the caller (the per-volume checkpoint task
     /// — the only SMO driver) must run a **minimal drain** (barrier +
@@ -923,6 +936,11 @@ impl From<KvError> for crate::error::SqueezefsError {
             e @ KvError::ValueTooLarge { .. } => E::too_large(format!("kv metadata: {e}")),
             // The D0 single-writer refusal names a holder — EBUSY.
             e @ KvError::Busy(_) => E::busy(format!("kv metadata: {e}")),
+            // Out of grant with the manager unreachable: EAGAIN — the
+            // caller retries inside the published stall bound.
+            e @ KvError::GrantExhausted { .. } => {
+                E::refused(libc::EAGAIN, format!("kv metadata: {e}"))
+            }
             other => E::InvalidOperation(format!("kv metadata: {other}")),
         }
     }

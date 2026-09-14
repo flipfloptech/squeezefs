@@ -746,9 +746,11 @@ impl ExtCore {
             "pending-free of an unclaimed extent {extent}"
         );
         let part = self.part(self.map.owner_of_extent(extent));
+        let prev_retire = part.last_retire_seq.fetch_max(retire_seq, Ordering::AcqRel);
         debug_assert!(
-            part.last_retire_seq.fetch_max(retire_seq, Ordering::AcqRel) <= retire_seq,
-            "retire seqs must be non-decreasing in push order (§4.6 serialized SMO task)"
+            prev_retire <= retire_seq,
+            "retire seqs must be non-decreasing in push order (§4.6 serialized SMO task): \
+             previous {prev_retire}, this {retire_seq} (extent {extent})"
         );
         let cap = part.pending.len() as u64;
         let mut pos = part.pending_head.load(Ordering::Acquire);

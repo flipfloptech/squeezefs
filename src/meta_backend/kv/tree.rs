@@ -216,6 +216,27 @@ pub struct SmoContext {
     /// `None` = the K5 test shape (counter seqs, no journaling, no
     /// barrier); `Some` = the K6b production shape.
     journal: Option<SmoJournal>,
+    /// The appender REGION the next SMOs run for (design-symmetric-
+    /// metadata §5.2.3 / §5.3.3, PR 3): its ring replaces the volume's
+    /// fixed ring for the SMO entry, and its extent GRANT replaces the
+    /// bitmap for every image claim and free. `None` = the manager's own
+    /// structure (region 0) — the shipped path verbatim.
+    region: Option<SmoRegion>,
+    /// The forest slot → region resolver every SMO entry point scopes
+    /// itself through ([`Self::scope_to`]), so no SMO driver — the flush
+    /// pass, the threshold maintenance, the merge sweep, the defrag arm —
+    /// can run a leased slot tree's SMO in the manager's ring by omission.
+    /// `None` = a flat volume or an unpartitioned forest: every SMO is the
+    /// manager's.
+    resolver: Option<Arc<dyn Fn(super::record::ForestSlot) -> Option<SmoRegion> + Send + Sync>>,
+}
+
+/// The region scope an SMO runs in: the lessee's ring and grant.
+#[derive(Clone)]
+pub struct SmoRegion {
+    pub appender_id: u32,
+    pub ring: Arc<JournalRing>,
+    pub grant: Arc<std::sync::Mutex<super::appender::RegionGrant>>,
 }
 
 impl SmoContext {
@@ -223,6 +244,8 @@ impl SmoContext {
         Self {
             alloc,
             journal: None,
+            region: None,
+            resolver: None,
         }
     }
 
@@ -233,12 +256,116 @@ impl SmoContext {
         Self {
             alloc,
             journal: Some(journal),
+            region: None,
+            resolver: None,
         }
+    }
+
+    /// Install the slot → region resolver (a partitioned forest's).
+    pub fn set_region_resolver(
+        &mut self,
+        resolver: Arc<dyn Fn(super::record::ForestSlot) -> Option<SmoRegion> + Send + Sync>,
+    ) {
+        self.resolver = Some(resolver);
     }
 
     /// The extent allocator behind this volume's SMOs (§4.7).
     pub fn allocator(&self) -> &Arc<ExtentAllocator> {
         &self.alloc
+    }
+
+    /// Scope the SMOs that follow to `region` (`None` = the manager's).
+    pub fn set_region(&mut self, region: Option<SmoRegion>) {
+        self.region = region;
+    }
+
+    /// Scope to the region leasing `slot` (`None` slot = tree 0 / a flat
+    /// tree = the manager's) — what every SMO entry point does first.
+    fn scope_to(&mut self, slot: Option<super::record::ForestSlot>) {
+        self.region = match (&self.resolver, slot) {
+            (Some(resolve), Some(s)) => resolve(s),
+            _ => None,
+        };
+    }
+
+    /// The region in scope.
+    pub fn region(&self) -> Option<&SmoRegion> {
+        self.region.as_ref()
+    }
+
+    /// The ring the SMO entry reserves in: the region's, else the
+    /// volume's fixed ring.
+    fn smo_ring(&self) -> Option<Arc<JournalRing>> {
+        match (&self.region, &self.journal) {
+            (Some(r), Some(_)) => Some(Arc::clone(&r.ring)),
+            (None, Some(j)) => Some(Arc::clone(&j.ring)),
+            (_, None) => None,
+        }
+    }
+
+    /// Claim one image extent (internal class): from the region's grant
+    /// when scoped — [`KvError::GrantExhausted`] when the grant has none —
+    /// else from the bitmap.
+    fn claim_internal(&self) -> Result<u64, KvError> {
+        match &self.region {
+            Some(r) => {
+                let mut g = r.grant.lock().unwrap_or_else(|e| e.into_inner());
+                g.claim().ok_or(KvError::GrantExhausted {
+                    appender: r.appender_id,
+                    unclaimed: 0,
+                })
+            }
+            None => self.alloc.claim_internal(),
+        }
+    }
+
+    /// Return a claimed-but-unpublished extent.
+    fn release_unpublished(&self, extent: u64) {
+        match &self.region {
+            Some(r) => r
+                .grant
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .release_unpublished(extent),
+            None => self.alloc.release_unpublished(extent),
+        }
+    }
+
+    /// Park a retired image's extent gated on `gate_seq` — a position in
+    /// the ring the free record rode: the region's grant parks on its
+    /// own tail, the bitmap on the ledger's.
+    fn free_pending(&self, extent: u64, gate_seq: u64, forced: bool) -> Result<(), KvError> {
+        match &self.region {
+            Some(r) => {
+                r.grant
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .free_pending(extent, gate_seq);
+                Ok(())
+            }
+            None if forced => {
+                self.alloc.free_pending_forced(extent, gate_seq);
+                Ok(())
+            }
+            None => self.alloc.free_pending(extent, gate_seq),
+        }
+    }
+
+    /// The §4.7 at-cap admission valve: a region's grant parks without a
+    /// cap (its pending list is bounded by the grant itself).
+    fn pending_has_room_for(&self, n: u64) -> bool {
+        match &self.region {
+            Some(_) => true,
+            None if n <= 1 => self.alloc.pending_has_room(),
+            None => self.alloc.pending_has_room_for(n),
+        }
+    }
+
+    fn pending_count(&self) -> u64 {
+        match &self.region {
+            Some(r) => r.grant.lock().unwrap_or_else(|e| e.into_inner()).pending(),
+            None => self.alloc.pending_count(),
+        }
     }
 }
 
@@ -398,7 +525,7 @@ pub struct KvTree {
     /// tree 0 names it, so until the publication lands the checkpoint
     /// tail must not pass this position — every record applied under the
     /// root stays in the replay window (the dying-floor law's covering
-    /// condition, one tree at a time — `SlotTrees::unpublished_root_floor`).
+    /// condition, one tree at a time — `SlotTrees::unpublished_root_floors`).
     root_floor: AtomicU64,
 }
 
@@ -481,9 +608,13 @@ impl KvTree {
         // SMOs that return space), INTERNAL at the writer's replay (a
         // recovery act may draw the reserve — a heap-full volume must still
         // mount). Per-kind trees and tree 0 are format/checkpoint internals.
-        let extent = match slot_tree {
-            Some((_, _, super::alloc_ext_core::AllocClass::User)) => ctx.alloc.claim_user()?,
-            Some((_, _, super::alloc_ext_core::AllocClass::Internal)) | None => {
+        // A slot tree minted for a leased slot claims its root INSIDE the
+        // lessee's grant (§5.3.3) — the grant is that appender's whole
+        // budget, so the class distinction is the manager's alone.
+        let extent = match (ctx.region.is_some(), slot_tree) {
+            (true, Some(_)) => ctx.claim_internal()?,
+            (_, Some((_, _, super::alloc_ext_core::AllocClass::User))) => ctx.alloc.claim_user()?,
+            (_, Some((_, _, super::alloc_ext_core::AllocClass::Internal))) | (_, None) => {
                 ctx.alloc.claim_internal()?
             }
         };
@@ -1434,6 +1565,8 @@ impl KvTree {
         out: &mut MaintenanceOutcome,
         forced_retirement: bool,
     ) -> Result<(), KvError> {
+        // This tree's SMOs are its lessee's: its ring, its grant (§5.2.3).
+        ctx.scope_to(self.forest_slot);
         let cfg = self.cache.config();
         let layout = &cfg.layout;
         let durable_tail = self.durable_tail();
@@ -1491,7 +1624,7 @@ impl KvTree {
         > = async {
             let mut written: Vec<(u64, u64)> = Vec::new(); // (addr, node_seq)
             let mut claim = |ctx: &SmoContext, cache: &NodeCache| -> Result<u64, KvError> {
-                let extent = ctx.alloc.claim_internal()?;
+                let extent = ctx.claim_internal()?;
                 claimed_extents.push(extent);
                 Ok(cache.extent_addr(extent))
             };
@@ -1650,7 +1783,7 @@ impl KvTree {
             Ok(v) => v,
             Err(e) => {
                 for ext in &claimed_extents {
-                    ctx.alloc.release_unpublished(*ext);
+                    ctx.release_unpublished(*ext);
                 }
                 return Err(e);
             }
@@ -1696,12 +1829,12 @@ impl KvTree {
             // retirement parks unconditionally at step 3): refusing THE
             // SMO that discharges a tail-pinning floor is the §4.7
             // closed dependency cycle (doc above).
-            if !forced_retirement && !ctx.alloc.pending_has_room() {
+            if !forced_retirement && !ctx.pending_has_room_for(1) {
                 for e in &claimed_extents {
-                    ctx.alloc.release_unpublished(*e);
+                    ctx.release_unpublished(*e);
                 }
                 return Err(KvError::PendingFreeFull {
-                    pending: ctx.alloc.pending_count(),
+                    pending: ctx.pending_count(),
                 });
             }
             let mut recs: Vec<(u8, Record)> = Vec::new();
@@ -1723,14 +1856,15 @@ impl KvTree {
             let retire_tag = j.retire_seq.load(Ordering::Acquire);
             recs.push(free_record(old_extent, retire_tag, 0));
             let len = entry_len_for(&recs)?;
-            match j
-                .ring
+            match ctx
+                .smo_ring()
+                .expect("the hooks name a ring")
                 .try_admit(len, super::journal_core::AdmissionClass::Checkpoint)
             {
                 Some(adm) => Some((adm, recs)),
                 None => {
                     for e in &claimed_extents {
-                        ctx.alloc.release_unpublished(*e);
+                        ctx.release_unpublished(*e);
                     }
                     return Err(KvError::JournalReserveExhausted { needed: len });
                 }
@@ -1759,8 +1893,8 @@ impl KvTree {
             // swap reserves after this and carries higher seqs, so
             // replay applies the pointer record first.
             let smo_entry = smo_prep.map(|(adm, mut recs)| {
-                let j = ctx.journal.as_ref().expect("prep implies hooks");
-                let res = j.ring.reserve_registered(adm);
+                let ring = ctx.smo_ring().expect("prep implies hooks");
+                let res = ring.reserve_registered(adm);
                 for (i, (_tag, r)) in recs.iter_mut().enumerate() {
                     r.seq = res.start + i as u64;
                 }
@@ -1878,7 +2012,7 @@ impl KvTree {
                     // stays inside the replay window until a ledger
                     // record naming the new root covers them.
                     let swap_floor = smo_entry.as_ref().map(|(res, _)| res.start).unwrap_or(0);
-                    self.cache.note_dying_floor(swap_floor);
+                    self.note_root_swap_floor(swap_floor);
                     let (addr, seq) = match &new_root {
                         Some(r) => (r.addr(), r.node_seq()),
                         None => written[0],
@@ -1948,7 +2082,8 @@ impl KvTree {
                     .map(|(_, r)| r.seq)
                     .expect("an SMO entry always carries its free record");
                 let j = ctx.journal.as_ref().expect("entry implies hooks");
-                if let Err(e) = j.ring.commit_entry(&res, &recs).await {
+                let ring = ctx.smo_ring().expect("entry implies hooks");
+                if let Err(e) = ring.commit_entry(&res, &recs).await {
                     // The swap already happened and RAM is authoritative;
                     // an unwritten reserved range is exactly the §4.4
                     // pt 4 crash-equivalent hole — replay folds to the
@@ -1964,24 +2099,21 @@ impl KvTree {
             }
             None => self.next_seq(),
         };
-        if forced_retirement {
-            // The flush-pass posture: park unconditionally — at cap the
-            // retirement rides the allocator's unbounded overflow against
-            // the coming cycle's tail (the §4.7 cycle-break; progress
-            // theorem in the fn doc).
-            ctx.alloc
-                .free_pending_forced(self.cache.addr_extent(node.addr()), free_gate_seq);
-        } else {
-            // Defense-in-depth only: the admission headroom check before
-            // `try_admit` (clause a above) makes this cap refusal
-            // unreachable — the serialized SMO task is the FIFO's only
-            // producer, so headroom at admission holds here. It stays as
-            // a `?` because a FIFO refusal at this point would be a
-            // protocol bug (a second producer), and the §4.4-pt-4-style
-            // loud abort is the right failure mode for that.
-            ctx.alloc
-                .free_pending(self.cache.addr_extent(node.addr()), free_gate_seq)?;
-        }
+        // The flush-pass posture (`forced_retirement`) parks
+        // unconditionally — at cap the retirement rides the allocator's
+        // unbounded overflow against the coming cycle's tail (the §4.7
+        // cycle-break; progress theorem in the fn doc). Otherwise the
+        // admission headroom check before `try_admit` (clause a above)
+        // makes the cap refusal unreachable — the serialized SMO task is
+        // the FIFO's only producer — and a refusal here would be a
+        // protocol bug (a second producer), the §4.4-pt-4-style loud
+        // abort being the right failure mode. A region's grant parks the
+        // extent on its own tail either way.
+        ctx.free_pending(
+            self.cache.addr_extent(node.addr()),
+            free_gate_seq,
+            forced_retirement,
+        )?;
         if let Some(parent) = &parent {
             let pg = parent.lock().read().await;
             let re = pg.overlay_bytes() >= cfg.writeback_delta_bytes;
@@ -2003,6 +2135,16 @@ impl KvTree {
 
     fn is_root(&self, node: &Arc<CachedNode>) -> bool {
         self.root().addr == node.addr()
+    }
+
+    /// A ROOT SWAP's dying floor (FIND-VS-A): a slot tree's is a position
+    /// in its lessee's ring and clamps THAT region's tail through the
+    /// per-slot map; every other tree's clamps the ledger's.
+    fn note_root_swap_floor(&self, floor: u64) {
+        match self.forest_slot {
+            Some(slot) => self.cache.note_slot_dying_floor(slot, floor),
+            None => self.cache.note_dying_floor(floor),
+        }
     }
 
     /// Whether `addr` is this tree's current root (the heap admission's
@@ -2426,6 +2568,7 @@ impl KvTree {
         out: &mut MaintenanceOutcome,
         forced_retirement: bool,
     ) -> Result<(), KvError> {
+        ctx.scope_to(self.forest_slot);
         let layout = self.cache.config().layout;
         let mut cur = node;
         loop {
@@ -2530,6 +2673,7 @@ impl KvTree {
         out: &mut MaintenanceOutcome,
         forced_retirement: bool,
     ) -> Result<(), KvError> {
+        ctx.scope_to(self.forest_slot);
         loop {
             let root = self.cache.get(self.root().addr).await?;
             if !self
@@ -2601,9 +2745,9 @@ impl KvTree {
                 reserve: floor,
             });
         }
-        if ctx.journal.is_some() && !forced_retirement && !ctx.alloc.pending_has_room_for(2) {
+        if ctx.journal.is_some() && !forced_retirement && !ctx.pending_has_room_for(2) {
             return Err(KvError::PendingFreeFull {
-                pending: ctx.alloc.pending_count(),
+                pending: ctx.pending_count(),
             });
         }
 
@@ -2653,7 +2797,7 @@ impl KvTree {
             return Ok(None);
         }
 
-        let extent = ctx.alloc.claim_internal()?;
+        let extent = ctx.claim_internal()?;
         let dst = self.cache.extent_addr(extent);
         let dst_seq = self.next_seq();
         let build: Result<Arc<CachedNode>, KvError> = async {
@@ -2685,7 +2829,7 @@ impl KvTree {
         let successor = match build {
             Ok(s) => s,
             Err(e) => {
-                ctx.alloc.release_unpublished(extent);
+                ctx.release_unpublished(extent);
                 return Err(e);
             }
         };
@@ -2698,7 +2842,7 @@ impl KvTree {
         let old_r = self.cache.addr_extent(right.addr());
         let smo_prep = if let Some(j) = &ctx.journal {
             if let Err(e) = j.barrier().await {
-                ctx.alloc.release_unpublished(extent);
+                ctx.release_unpublished(extent);
                 return Err(e);
             }
             let retire_tag = j.retire_seq.load(Ordering::Acquire);
@@ -2721,13 +2865,14 @@ impl KvTree {
                 free_record(old_r, retire_tag, 0),
             ];
             let len = entry_len_for(&recs)?;
-            match j
-                .ring
+            match ctx
+                .smo_ring()
+                .expect("the hooks name a ring")
                 .try_admit(len, super::journal_core::AdmissionClass::Checkpoint)
             {
                 Some(adm) => Some((adm, recs)),
                 None => {
-                    ctx.alloc.release_unpublished(extent);
+                    ctx.release_unpublished(extent);
                     return Err(KvError::JournalReserveExhausted { needed: len });
                 }
             }
@@ -2749,8 +2894,8 @@ impl KvTree {
                 (l, r)
             };
             let smo_entry = smo_prep.map(|(adm, mut recs)| {
-                let j = ctx.journal.as_ref().expect("prep implies hooks");
-                let res = j.ring.reserve_registered(adm);
+                let ring = ctx.smo_ring().expect("prep implies hooks");
+                let res = ring.reserve_registered(adm);
                 for (i, (_tag, r)) in recs.iter_mut().enumerate() {
                     r.seq = res.start + i as u64;
                 }
@@ -2835,7 +2980,8 @@ impl KvTree {
                     .map(|(_, r)| r.seq)
                     .expect("a merge entry always carries its free records");
                 let j = ctx.journal.as_ref().expect("entry implies hooks");
-                if let Err(e) = j.ring.commit_entry(&res, &recs).await {
+                let ring = ctx.smo_ring().expect("entry implies hooks");
+                if let Err(e) = ring.commit_entry(&res, &recs).await {
                     log::warn!(
                         "merge SMO journal entry write failed on {:?} (crash-equivalent hole; \
                          state stays RAM-consistent): {e}",
@@ -2848,9 +2994,9 @@ impl KvTree {
         };
         for ext in [old_l, old_r] {
             if forced_retirement {
-                ctx.alloc.free_pending_forced(ext, free_gate_seq);
+                ctx.free_pending(ext, free_gate_seq, true)?;
             } else {
-                ctx.alloc.free_pending(ext, free_gate_seq)?;
+                ctx.free_pending(ext, free_gate_seq, false)?;
             }
         }
         {
@@ -2926,9 +3072,9 @@ impl KvTree {
                 &sep[..]
             )));
         }
-        if ctx.journal.is_some() && !forced_retirement && !ctx.alloc.pending_has_room() {
+        if ctx.journal.is_some() && !forced_retirement && !ctx.pending_has_room_for(1) {
             return Err(KvError::PendingFreeFull {
-                pending: ctx.alloc.pending_count(),
+                pending: ctx.pending_count(),
             });
         }
         let old_extent = self.cache.addr_extent(root.addr());
@@ -2936,8 +3082,9 @@ impl KvTree {
             let retire_tag = j.retire_seq.load(Ordering::Acquire);
             let recs: Vec<(u8, Record)> = vec![free_record(old_extent, retire_tag, 0)];
             let len = entry_len_for(&recs)?;
-            match j
-                .ring
+            match ctx
+                .smo_ring()
+                .expect("the hooks name a ring")
                 .try_admit(len, super::journal_core::AdmissionClass::Checkpoint)
             {
                 Some(adm) => Some((adm, recs)),
@@ -2950,8 +3097,8 @@ impl KvTree {
         let smo_entry = {
             let mut rg = root.lock().write().await;
             let smo_entry = smo_prep.map(|(adm, mut recs)| {
-                let j = ctx.journal.as_ref().expect("prep implies hooks");
-                let res = j.ring.reserve_registered(adm);
+                let ring = ctx.smo_ring().expect("prep implies hooks");
+                let res = ring.reserve_registered(adm);
                 for (i, (_tag, r)) in recs.iter_mut().enumerate() {
                     r.seq = res.start + i as u64;
                 }
@@ -2960,7 +3107,7 @@ impl KvTree {
             // FIND-VS-A: a root swap has no journaled pointer record and no
             // parent floor — clamp the next tail to this swap's position.
             let swap_floor = smo_entry.as_ref().map(|(res, _)| res.start).unwrap_or(0);
-            self.cache.note_dying_floor(swap_floor);
+            self.note_root_swap_floor(swap_floor);
             self.root_floor.store(swap_floor, Ordering::Release);
             // The old root's open delta (separator flips whose only live
             // target IS the child) dies with the object: its records are
@@ -2988,7 +3135,8 @@ impl KvTree {
             Some((res, recs)) => {
                 let gate = recs.last().map(|(_, r)| r.seq).expect("the free record");
                 let j = ctx.journal.as_ref().expect("entry implies hooks");
-                if let Err(e) = j.ring.commit_entry(&res, &recs).await {
+                let ring = ctx.smo_ring().expect("entry implies hooks");
+                if let Err(e) = ring.commit_entry(&res, &recs).await {
                     log::warn!(
                         "root-collapse SMO journal entry write failed on {:?} (crash-equivalent \
                          hole; state stays RAM-consistent): {e}",
@@ -2999,11 +3147,7 @@ impl KvTree {
             }
             None => self.next_seq(),
         };
-        if forced_retirement {
-            ctx.alloc.free_pending_forced(old_extent, free_gate_seq);
-        } else {
-            ctx.alloc.free_pending(old_extent, free_gate_seq)?;
-        }
+        ctx.free_pending(old_extent, free_gate_seq, forced_retirement)?;
         super::META_KV_ROOT_COLLAPSES.fetch_add(1, Ordering::Relaxed);
         out.root_collapses += 1;
         Ok(true)

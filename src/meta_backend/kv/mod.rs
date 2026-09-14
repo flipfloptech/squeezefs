@@ -334,6 +334,17 @@ pub static META_KV_PENDING_FREE_RELEASED: AtomicU64 = AtomicU64::new(0);
 /// pressure. Surfaced as `meta_kv_pending_free_overflow`.
 pub static META_KV_PENDING_FREE_OVERFLOW: AtomicU64 = AtomicU64::new(0);
 
+/// Replayed in-window `free` records DROPPED at mount because their
+/// extent is a LIVE tree root — the root-swap carve-out's retirement
+/// (design-smo-replay-currency §2 C′: a root swap journals no pointer
+/// record, so a kill before the record naming its successor leaves the
+/// mount replaying through the predecessor, which is live again;
+/// parking its free released the live root at the first post-mount
+/// checkpoint). One per unpublished root swap in the recovered window
+/// (flat rings and appender rings alike); 0 on every clean remount.
+/// Surfaced as `meta_kv_replay_root_frees_dropped`.
+pub static META_KV_REPLAY_ROOT_FREES_DROPPED: AtomicU64 = AtomicU64::new(0);
+
 /// Pre-RC spec §6.2 item 1 (incompat bit 8): durable block-reference
 /// records **staged** into layout transactions — one `Put` per reference
 /// taken. Rides the publish tx, so `staged/publish` is the accounting's

@@ -370,6 +370,11 @@ pub struct ExtentAllocator {
     /// extents); legitimately nonzero exactly once, on the recovery mount
     /// that replays a peer's window while holding the volume alone.
     foreign_page_writes: AtomicU64,
+    /// The replayed in-window frees `load` deferred — `(writer, gate seq,
+    /// extent)`, seq-sorted — until [`Self::park_replayed_frees`] knows
+    /// the mounted roots. Empty on a formatted allocator and after the
+    /// park.
+    replayed_parks: std::sync::Mutex<Vec<(u16, u64, u64)>>,
 }
 
 impl std::fmt::Debug for ExtentAllocator {
@@ -443,6 +448,7 @@ impl ExtentAllocator {
             dirty: dirty.into_boxed_slice(),
             partition: part,
             foreign_page_writes: AtomicU64::new(0),
+            replayed_parks: std::sync::Mutex::new(Vec::new()),
         }
     }
 
@@ -661,49 +667,26 @@ impl ExtentAllocator {
                     // reusable, as always.
                     core.release(*extent);
                 }
-                AllocDelta::Freed { .. } => parked.push((*writer, *seq, *extent)),
+                AllocDelta::Freed { .. } => {
+                    // In-window by construction ⇒ the freeing swap/flips
+                    // are not durably covered (the mounted record itself
+                    // may be page-cache-only after a kill). The bit may
+                    // live only in this same window (its claiming alloc
+                    // folded away under this key's LWW; the pages may
+                    // predate both) — set it now, idempotently, so the
+                    // FIFO's claimed-while-pending contract holds when
+                    // the park lands. The park itself is DEFERRED to
+                    // [`Self::park_replayed_frees`]: whether a replayed
+                    // free may park at all depends on the roots the
+                    // mount ends up with, which the trees decide AFTER
+                    // this load (the root-swap carve-out, doc there).
+                    core.mark_allocated(*extent);
+                    parked.push((*writer, *seq, *extent));
+                }
             }
             replay_dirty.push(*extent);
         }
         parked.sort_unstable();
-        let mut overflowed = 0u64;
-        for (_writer, seq, extent) in parked {
-            // In-window by construction ⇒ the freeing swap/flips are not
-            // durably covered (the mounted record itself may be page-
-            // cache-only after a kill): park gated on the record's own
-            // seq until the first post-mount durable checkpoint's tail
-            // passes it. The historical generation tag in the value
-            // stays byte-for-byte on disk but no longer gates (§2-A: it
-            // certified record durability, not flip coverage). The bit
-            // may live only in this same window (its claiming alloc
-            // folded away under this key's LWW; the pages may predate
-            // both) — set it before parking, idempotently, so the FIFO's
-            // claimed-while-pending contract holds. Parking is FORCED
-            // (never refused): a recovered window can legitimately carry
-            // more frees than the FIFO cap — a tail pinned pre-crash
-            // accumulates parked SMO retirements without bound on the
-            // window's budget, and the pre-fix loud refusal here made
-            // exactly that image UNMOUNTABLE (the §4.7 pinned-floor
-            // wedge's remount face, P2 2026-07-26 §9). Beyond-cap
-            // entries park in the overflow and drain at the first
-            // post-mount durable checkpoint like every other. The park
-            // routes to the extent's OWNER partition, whose clock is the
-            // only one that can cover this gate seq.
-            core.mark_allocated(extent);
-            if core.free_pending_forced(extent, seq) {
-                overflowed += 1;
-                super::META_KV_PENDING_FREE_OVERFLOW
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            }
-            super::META_KV_PENDING_FREE_PARKED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        }
-        if overflowed > 0 {
-            log::warn!(
-                "mount: {overflowed} replayed pending-free record(s) exceeded the FIFO \
-                 cap and parked in the overflow (a pre-crash pinned tail accumulated \
-                 them); they drain at the first post-mount durable checkpoint"
-            );
-        }
 
         let dirty: Vec<AtomicU64> = (0..pages.div_ceil(64)).map(|_| AtomicU64::new(0)).collect();
         let alloc = Self {
@@ -713,11 +696,81 @@ impl ExtentAllocator {
             dirty: dirty.into_boxed_slice(),
             partition: part,
             foreign_page_writes: AtomicU64::new(0),
+            replayed_parks: std::sync::Mutex::new(parked),
         };
         for extent in replay_dirty {
             alloc.mark_dirty(extent);
         }
         Ok(alloc)
+    }
+
+    /// Park the replayed in-window frees [`Self::load`] deferred — every
+    /// one EXCEPT a free of an extent one of `live_roots` names, which is
+    /// DROPPED and counted on `meta_kv_replay_root_frees_dropped`.
+    ///
+    /// The root-swap carve-out (design-smo-replay-currency §2 C′): a root
+    /// swap journals no pointer record, so its durable form is
+    /// exclusively the next ledger / page / tree-0 record naming the new
+    /// root. A kill between the swap and that record leaves the mount
+    /// replaying through the PREDECESSOR — which is therefore LIVE again
+    /// — while the swap's `free(old)` is in the window. Parking that free
+    /// released the live root's extent at the first post-mount
+    /// checkpoint, and the next claim (lowest-free-first) overwrote the
+    /// tree's root with a fresh node image. The predecessor's free is
+    /// the unpublished swap's and must not fold; the swap's successor
+    /// image stays claimed-and-unrouted (fsck C13's class on a forest
+    /// grant; the bounded leak the design states on a flat volume).
+    ///
+    /// Must run once, after every tree is open and adopted (the roots are
+    /// final) and BEFORE any post-mount SMO (the FIFO's non-decreasing
+    /// gate order per partition: every replayed seq precedes every
+    /// post-mount one). Parking is FORCED (never refused): a recovered
+    /// window can legitimately carry more frees than the FIFO cap — a
+    /// tail pinned pre-crash accumulates parked SMO retirements without
+    /// bound on the window's budget, and a loud refusal here made
+    /// exactly that image UNMOUNTABLE (the §4.7 pinned-floor wedge's
+    /// remount face, P2 2026-07-26 §9). Beyond-cap entries park in the
+    /// overflow and drain at the first post-mount durable checkpoint like
+    /// every other; the park routes to the extent's OWNER partition,
+    /// whose clock is the only one that can cover its gate seq.
+    /// Returns `(parked, dropped)`.
+    pub fn park_replayed_frees(&self, live_roots: &std::collections::BTreeSet<u64>) -> (u64, u64) {
+        let parked = std::mem::take(
+            &mut *self
+                .replayed_parks
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()),
+        );
+        let (mut n_parked, mut dropped, mut overflowed) = (0u64, 0u64, 0u64);
+        for (_writer, seq, extent) in parked {
+            if live_roots.contains(&extent) {
+                dropped += 1;
+                super::META_KV_REPLAY_ROOT_FREES_DROPPED
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                log::warn!(
+                    "mount: replayed free of extent {extent} (seq {seq}) names a LIVE tree \
+                     root — an unpublished root swap's retirement; dropped, the root stays \
+                     allocated (meta_kv_replay_root_frees_dropped). Its successor image is \
+                     unrouted: fsck C13 reclaims it on a forest grant"
+                );
+                continue;
+            }
+            if self.core.free_pending_forced(extent, seq) {
+                overflowed += 1;
+                super::META_KV_PENDING_FREE_OVERFLOW
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            n_parked += 1;
+            super::META_KV_PENDING_FREE_PARKED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        if overflowed > 0 {
+            log::warn!(
+                "mount: {overflowed} replayed pending-free record(s) exceeded the FIFO \
+                 cap and parked in the overflow (a pre-crash pinned tail accumulated \
+                 them); they drain at the first post-mount durable checkpoint"
+            );
+        }
+        (n_parked, dropped)
     }
 
     /// Total heap extents.

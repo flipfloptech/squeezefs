@@ -835,6 +835,40 @@ enum TreeSet {
     },
 }
 
+impl TreeSet {
+    /// Every tree of the set ([`KvMetaBackend::all_trees`]'s body).
+    fn all(&self) -> Vec<Arc<KvTree>> {
+        match self {
+            TreeSet::Flat {
+                inodes,
+                dentries,
+                xattrs,
+                block_refs,
+                block_map,
+            } => {
+                let mut v = vec![Arc::clone(inodes), Arc::clone(dentries), Arc::clone(xattrs)];
+                if let Some(t) = block_refs {
+                    v.push(Arc::clone(t));
+                }
+                if let Some(t) = block_map.get() {
+                    v.push(Arc::clone(t));
+                }
+                v
+            }
+            TreeSet::Forest { forest, .. } => forest.all(),
+        }
+    }
+
+    /// The heap extents the set's roots occupy — the mounted-root set
+    /// the replayed-free carve-out keys on.
+    fn root_extents(&self, cache: &NodeCache) -> std::collections::BTreeSet<u64> {
+        self.all()
+            .iter()
+            .map(|t| cache.addr_extent(t.root().addr))
+            .collect()
+    }
+}
+
 /// A resolved tree handle: BORROWED from the backend's own fields on a
 /// flat volume (the shipped hot path — no refcount traffic), OWNED on a
 /// forest volume (a lazily minted slot tree lives in the router's map).
@@ -2392,6 +2426,41 @@ impl KvMetaBackend {
             TreeSet::Flat { .. } => None,
         };
 
+        // 5b′. The roots are final: park the replayed in-window frees the
+        // allocator load deferred — EXCEPT a free of a mounted root, the
+        // unpublished root swap's retirement of the very node the mount
+        // replays through (`ExtentAllocator::park_replayed_frees`; the
+        // same law for every declared region's grant). Before any
+        // post-mount SMO: the bring-up cover below is the first.
+        {
+            let roots = trees.root_extents(&cache);
+            let (parked, dropped) = alloc.park_replayed_frees(&roots);
+            let mut grant_dropped = 0usize;
+            if let Some(set) = appenders.as_ref() {
+                for r in set.regions.iter().skip(1) {
+                    grant_dropped += r.grant().unpark_live_roots(&roots);
+                }
+            }
+            if grant_dropped > 0 {
+                super::META_KV_REPLAY_ROOT_FREES_DROPPED
+                    .fetch_add(grant_dropped as u64, Ordering::Relaxed);
+                log::warn!(
+                    "meta volume {}: {grant_dropped} replayed grant free(s) named a LIVE slot-tree \
+                     root — unpublished root swaps; the roots stay claimed \
+                     (meta_kv_replay_root_frees_dropped)",
+                    path.display()
+                );
+            }
+            if parked > 0 || dropped > 0 || grant_dropped > 0 {
+                log::info!(
+                    "meta volume {}: replay parked {parked} in-window free(s), dropped {} of a \
+                     live root",
+                    path.display(),
+                    dropped + grant_dropped as u64
+                );
+            }
+        }
+
         // 5c. §4.8: next_ino = max(ledger watermark, replayed inos + 1).
         let next_ino = ledger.next_ino.max(max_replayed_ino + 1);
 
@@ -3236,6 +3305,120 @@ impl KvMetaBackend {
             set.verbs.replays.fetch_add(1, Ordering::Relaxed);
         }
         Ok((granted.len() as u64, already.len() as u64))
+    }
+
+    /// The image extents every tree of this volume reaches, under the
+    /// caller's SMO + mint serialization (fsck C13's reachability set).
+    async fn reachable_image_extents(
+        &self,
+    ) -> std::result::Result<std::collections::BTreeSet<u64>, KvError> {
+        let mut reachable = std::collections::BTreeSet::new();
+        for tree in self.all_trees() {
+            for addr in tree.reachable_node_addrs().await? {
+                reachable.insert(self.cache.addr_extent(addr));
+            }
+        }
+        Ok(reachable)
+    }
+
+    /// **fsck C13 — orphan image extents** (design-symmetric-metadata
+    /// §5.8.5): every extent a declared region's grant holds CLAIMED that
+    /// no tree root reaches. The census runs under the SMO mutex and the
+    /// forest's mint guard, so no image is between its claim and its
+    /// publication (an SMO's successor before the route flip, a lazy
+    /// mint's root before the forest names it) — the "live in-window
+    /// image" is never a candidate; a retired image parked on its
+    /// region's tail is a pending-free, not a claim. The class is the
+    /// §5.3.4 unpublished-root-swap window's successor, the page's
+    /// truncated `unclaimed_runs` remainder, and a return lost between
+    /// its `advance_durable` and the cadence. Empty on a flat volume and
+    /// an unpartitioned forest (no grant exists there); the walk pages
+    /// every interior node in once and is skipped when no grant holds a
+    /// claim.
+    pub async fn c13_orphan_image_extents(
+        &self,
+    ) -> std::result::Result<Vec<OrphanImageExtent>, KvError> {
+        let Some(set) = self.appenders.as_ref().filter(|a| a.is_partitioned()) else {
+            return Ok(Vec::new());
+        };
+        let _smo = self.smo.lock().await;
+        let _mint = match self.forest() {
+            Some(f) => Some(f.mint_guard().await),
+            None => None,
+        };
+        let claimed: Vec<(u32, Vec<u64>)> = set
+            .regions
+            .iter()
+            .skip(1)
+            .map(|r| (r.id, r.grant().claimed_extents()))
+            .filter(|(_, c)| !c.is_empty())
+            .collect();
+        if claimed.is_empty() {
+            return Ok(Vec::new());
+        }
+        let reachable = self.reachable_image_extents().await?;
+        Ok(claimed
+            .into_iter()
+            .flat_map(|(appender, extents)| {
+                extents
+                    .into_iter()
+                    .filter(|e| !reachable.contains(e))
+                    .map(move |extent| OrphanImageExtent { appender, extent })
+            })
+            .collect())
+    }
+
+    /// **fsck C13's repair — return the orphan to the bitmap**: the
+    /// appender FREES its orphan image exactly as an SMO retires a
+    /// predecessor — one `free(extent)` record in ITS ring (checkpoint-
+    /// class admission), the extent parked on ITS tail gated on that
+    /// record's seq — so the cadence's `ReturnExtents` clears the bit and
+    /// rewrites the grant record once the tail passes it, and the ring's
+    /// window never shows an `alloc` outside the record (the `Extent`
+    /// violation a direct return would have planted for the next mount).
+    /// Verify-before-repair under the same serialization as the census:
+    /// `Ok(false)` when the extent is no longer a claimed orphan.
+    pub async fn c13_return_orphan(
+        &self,
+        appender: u32,
+        extent: u64,
+    ) -> std::result::Result<bool, KvError> {
+        let Some(set) = self.appenders.as_ref().filter(|a| a.is_partitioned()) else {
+            return Ok(false);
+        };
+        let Some(region) = set.region(appender).filter(|r| r.id != 0) else {
+            return Ok(false);
+        };
+        let _smo = self.smo.lock().await;
+        let _mint = match self.forest() {
+            Some(f) => Some(f.mint_guard().await),
+            None => None,
+        };
+        if !region.grant().is_claimed(extent) {
+            return Ok(false);
+        }
+        if self.reachable_image_extents().await?.contains(&extent) {
+            return Ok(false);
+        }
+        let retire_tag = self.retire_seq.load(Ordering::Acquire);
+        let recs = vec![super::alloc_ext::free_record(extent, retire_tag, 0)];
+        let len = super::journal::entry_len_for(&recs)?;
+        let ring = region.ring();
+        let adm = ring
+            .try_admit(len, super::journal_core::AdmissionClass::Checkpoint)
+            .ok_or(KvError::JournalReserveExhausted { needed: len })?;
+        let res = ring.reserve_registered(adm);
+        let mut recs = recs;
+        recs[0].1.seq = res.start;
+        ring.commit_entry(&res, &recs).await?;
+        region.grant().free_pending(extent, res.start);
+        log::info!(
+            "meta volume {}: fsck C13 returned orphan image extent {extent} of appender \
+             {appender} (freed in its ring at seq {}; the cadence returns it to the bitmap)",
+            self.path.display(),
+            res.start
+        );
+        Ok(true)
     }
 
     /// **`JoinAppender { identity, ring_want_bytes }`** (§5.3.1 / §5.3.5,
@@ -4479,25 +4662,7 @@ impl KvMetaBackend {
     /// reference tree and the block-map tree when engaged; forest — tree
     /// 0 plus every slot tree that exists.
     pub fn all_trees(&self) -> Vec<Arc<KvTree>> {
-        match &self.trees {
-            TreeSet::Flat {
-                inodes,
-                dentries,
-                xattrs,
-                block_refs,
-                block_map,
-            } => {
-                let mut v = vec![Arc::clone(inodes), Arc::clone(dentries), Arc::clone(xattrs)];
-                if let Some(t) = block_refs {
-                    v.push(Arc::clone(t));
-                }
-                if let Some(t) = block_map.get() {
-                    v.push(Arc::clone(t));
-                }
-                v
-            }
-            TreeSet::Forest { forest, .. } => forest.all(),
-        }
+        self.trees.all()
     }
 
     /// Whether this volume is a slot-tree forest (incompat bit 17).
@@ -8207,6 +8372,14 @@ pub struct JoinOutcome {
     pub ring_segments: Vec<super::superblock::ExtentRef>,
     pub grant: Vec<super::appender::GrantRun>,
     pub already: bool,
+}
+
+/// One fsck C13 candidate (design-symmetric-metadata §5.8.5): a heap
+/// extent `appender`'s grant holds claimed that no tree root reaches.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct OrphanImageExtent {
+    pub appender: u32,
+    pub extent: u64,
 }
 
 /// The Layer B2 mount-gate classification of the replayed claim evidence.

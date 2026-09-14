@@ -824,6 +824,45 @@ impl KvTree {
         &self.cache
     }
 
+    /// Every node address the current root REACHES — the tree's image set
+    /// (fsck C13's reachability half, design-symmetric-metadata §5.8.5).
+    /// Interior nodes are paged in (demand loads through the cache) to
+    /// read their live child pointers; leaves are named by their parent's
+    /// pointer and never loaded. The caller holds the SMO serialization,
+    /// so no swap moves a route under the walk.
+    pub async fn reachable_node_addrs(&self) -> Result<std::collections::BTreeSet<u64>, KvError> {
+        let mut out = std::collections::BTreeSet::new();
+        let root = self.root();
+        let mut frontier: Vec<u64> = vec![root.addr];
+        while let Some(addr) = frontier.pop() {
+            if !out.insert(addr) {
+                continue;
+            }
+            let node = match self.cache.try_get(addr) {
+                Some(n) => n,
+                None => self.cache.load(addr).await?.ok_or_else(|| {
+                    KvError::Corrupt(format!(
+                        "tree {} (slot {:?}): routed node {addr:#x} is on a retired extent",
+                        self.tree_id, self.forest_slot
+                    ))
+                })?,
+            };
+            if node.level() == 0 {
+                continue;
+            }
+            let snap = node.snapshot();
+            let mut cursor: Vec<u8> = Vec::new();
+            while let Some((key, ptr)) = snap.next_live(&cursor, None)? {
+                let (child, _seq) = decode_interior_value(&ptr)?;
+                frontier.push(child);
+                cursor.clear();
+                cursor.extend_from_slice(&key);
+                cursor.push(0);
+            }
+        }
+        Ok(out)
+    }
+
     /// Root level: 0 = single-leaf tree, 1 = one interior level, …
     pub async fn root_level(&self) -> Result<u8, KvError> {
         Ok(self.cache.get(self.root().addr).await?.level())

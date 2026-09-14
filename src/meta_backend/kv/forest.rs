@@ -133,6 +133,14 @@ impl SlotTrees {
         &self.control
     }
 
+    /// Hold the mint serialization: while held no slot tree is between
+    /// its root claim and its publication into the forest (fsck C13's
+    /// coverage of the lazy mint — the SMO mutex covers every other
+    /// claim).
+    pub(super) async fn mint_guard(&self) -> crate::sqz_sync::SqzMutexGuard<'_, ()> {
+        self.mint.lock().await
+    }
+
     /// The native slot tree.
     pub fn native(&self) -> &Arc<KvTree> {
         &self.native

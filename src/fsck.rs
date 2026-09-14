@@ -669,6 +669,17 @@ pub enum FindingId {
         block_idx: u32,
         mapping: String,
     },
+    /// C13 (design-symmetric-metadata §5.8.5): an **orphan image extent**
+    /// — a heap extent of meta volume `vol` that `appender`'s grant holds
+    /// claimed, reached by no slot-tree root and parked by no pending-free
+    /// (the unpublished root swap's successor, the page's truncated
+    /// unclaimed remainder). Repair: the appender frees it in its own ring
+    /// and the cadence returns it to the bitmap.
+    C13OrphanImageExtent {
+        vol: usize,
+        appender: u32,
+        extent: u64,
+    },
 }
 
 /// The §10 `fsck_*` / `scrub_*` counter families, per run (the process
@@ -1432,6 +1443,15 @@ enum SuspectKind {
         mapping: String,
         why: String,
     },
+    /// C13 (design-symmetric-metadata §5.8.5): a heap extent an
+    /// appender's grant holds CLAIMED that no tree root of meta volume
+    /// `vol` reaches (the census ran under the volume's SMO + mint
+    /// serialization, so a live in-window image is never nominated).
+    C13OrphanImageExtent {
+        vol: usize,
+        appender: u32,
+        extent: u64,
+    },
 }
 
 /// One referencer's device window on its block, as C12 judges it:
@@ -1757,6 +1777,10 @@ pub async fn run(ctx: &FsckCtx, opts: &FsckOptions) -> Result<FsckReport> {
             // the class rides the unsharded run (and the fleet finalize's
             // merged list), the C8 posture.
             evaluate_c12_tenant_ranges(&census, &mut suspects);
+            // C13 (design-symmetric-metadata §5.8.5): orphan image extents
+            // of the appender grants — a per-volume question over the
+            // whole tree population, so unsharded like C8.
+            evaluate_c13(ctx, &mut suspects).await;
         }
 
         // C9 (the class design-cow-kv-metadata §4.10a owed): live
@@ -3873,6 +3897,39 @@ async fn evaluate_c8(ctx: &FsckCtx, suspects: &mut Vec<Suspect>) {
     }
 }
 
+/// C13 nomination (design-symmetric-metadata §5.8.5): per meta volume,
+/// the grant-claimed image extents no tree root reaches — the backend's
+/// census under its SMO + mint serialization, so the "live in-window
+/// image" (an SMO's successor before its route flip, a lazy mint's root
+/// before the forest names it) is structurally excluded and a retired
+/// image parked on its region's tail is a pending-free, not a claim.
+/// Empty on a flat volume and an unpartitioned forest (no grant exists).
+/// Its own pass, not the census walk: the class needs the tree's NODE
+/// reachability (every interior node's live child pointers), which the
+/// record-level census does not read — one paged walk of the interior
+/// population per volume, skipped when no grant holds a claim.
+async fn evaluate_c13(ctx: &FsckCtx, suspects: &mut Vec<Suspect>) {
+    for (vol, kv) in ctx.meta.volumes.iter().enumerate() {
+        match kv.c13_orphan_image_extents().await {
+            Ok(orphans) => {
+                for o in orphans {
+                    suspects.push(Suspect {
+                        kind: SuspectKind::C13OrphanImageExtent {
+                            vol,
+                            appender: o.appender,
+                            extent: o.extent,
+                        },
+                    });
+                }
+            }
+            Err(e) => log::warn!(
+                "fsck C13: orphan image-extent census failed on vol {vol}: {e} (no verdict \
+                 recorded — the class is skipped for this volume, never guessed)"
+            ),
+        }
+    }
+}
+
 /// One owner's tree-7 record count, paged (`block_map_range`, the same
 /// primitive the shared extraction rides) — C11's evidence unit. A
 /// decode failure ends the count at what was read (conservative; C1's
@@ -4684,6 +4741,12 @@ async fn recheck_suspects(
     // its transients. One pass judges every C8 suspect against one
     // consistent view.
     let mut c8_fresh: Option<Vec<(String, u64, u32, u32)>> = None;
+    // C13's fresh census, ONCE per meta volume (`None` = the census
+    // failed: no verdict for that volume's suspects, never guessed).
+    let mut c13_fresh: HashMap<
+        usize,
+        Option<Vec<crate::meta_backend::kv::backend::OrphanImageExtent>>,
+    > = HashMap::new();
     for s in pending {
         if opts.cancel.load(Ordering::Relaxed) {
             break;
@@ -4933,6 +4996,44 @@ async fn recheck_suspects(
                         }),
                     }),
                 }
+            }
+            SuspectKind::C13OrphanImageExtent {
+                vol,
+                appender,
+                extent,
+            } => {
+                // ONE fresh census per volume for the whole confirm pass
+                // (the C8 shape): the census walks the volume's interior
+                // population, so a per-suspect re-run would pay it per
+                // orphan. Under the backend's SMO + mint serialization
+                // again, so the settle + this re-read together clear a
+                // publication that landed since the nomination.
+                let fresh = match c13_fresh.entry(*vol) {
+                    std::collections::hash_map::Entry::Occupied(o) => o.into_mut(),
+                    std::collections::hash_map::Entry::Vacant(v) => {
+                        let kv = &ctx.meta.volumes[*vol];
+                        v.insert(kv.c13_orphan_image_extents().await.ok())
+                    }
+                };
+                let still = fresh.as_ref().is_some_and(|o| {
+                    o.iter()
+                        .any(|x| x.appender == *appender && x.extent == *extent)
+                });
+                still.then(|| FsckFinding {
+                    class: "C13".to_string(),
+                    object: format!("vol{vol}/appender{appender}/extent{extent}"),
+                    evidence: format!(
+                        "orphan image extent: claimed inside appender {appender}'s grant, reached \
+                         by no slot-tree root and parked by no pending-free at two censuses \
+                         under the volume's SMO serialization (an unpublished root swap's \
+                         successor, or a grant remainder the page could not name)"
+                    ),
+                    identity: Some(FindingId::C13OrphanImageExtent {
+                        vol: *vol,
+                        appender: *appender,
+                        extent: *extent,
+                    }),
+                })
             }
             SuspectKind::C1Record {
                 vol,
@@ -6511,6 +6612,19 @@ fn planned_action(id: &FindingId) -> (&'static str, String) {
                  repair is the owner's, not a guess"
             ),
         ),
+        FindingId::C13OrphanImageExtent {
+            vol,
+            appender,
+            extent,
+        } => (
+            "return-orphan-image-extent",
+            format!(
+                "return heap extent {extent} of vol{vol} to the bitmap: appender {appender} \
+                 frees it in its OWN ring (a `free` gated on its tail, the SMO retirement \
+                 shape) and the cadence's ReturnExtents clears the bit and rewrites the grant \
+                 record — nothing routes to the image, so nothing is quarantined"
+            ),
+        ),
     }
 }
 
@@ -7066,6 +7180,56 @@ pub async fn repair(
                          restating it would fabricate a mapping"
                     ),
                 );
+                continue;
+            }
+            // ------------------------------------ C13 orphan image extent
+            //
+            // Verify-before-repair is the backend's: `c13_return_orphan`
+            // re-runs the census under the volume's SMO + mint
+            // serialization and acts only on an extent still claimed and
+            // still unreached — `false` is the healed / stale-report
+            // refusal. Nothing is quarantined: no route reaches the image,
+            // so there is nothing a reader could lose.
+            FindingId::C13OrphanImageExtent {
+                vol,
+                appender,
+                extent,
+            } => {
+                let Some(kv) = ctx.meta.volumes.get(*vol) else {
+                    refuse(&mut out, f, format!("meta volume {vol} is not mounted"));
+                    continue;
+                };
+                match kv.c13_return_orphan(*appender, *extent).await {
+                    Ok(true) => {
+                        crate::fuse_client::METRICS
+                            .fsck_repair_class_c13
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        apply_ok(
+                            &mut out,
+                            f,
+                            "return-orphan-image-extent",
+                            format!(
+                                "extent {extent} freed in appender {appender}'s ring; the \
+                                 cadence's ReturnExtents clears the bit and rewrites the \
+                                 grant record"
+                            ),
+                        );
+                    }
+                    Ok(false) => refuse(
+                        &mut out,
+                        f,
+                        format!(
+                            "extent {extent} is no longer a claimed orphan of appender \
+                             {appender} (healed, returned, or reached by a root since the \
+                             report) — re-run detection"
+                        ),
+                    ),
+                    Err(e) => refuse(
+                        &mut out,
+                        f,
+                        format!("returning extent {extent} of appender {appender} failed: {e}"),
+                    ),
+                }
                 continue;
             }
             // ------------------------------------ C9 unreferenced inode

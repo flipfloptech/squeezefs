@@ -1058,7 +1058,10 @@ async fn c13_finds_exactly_the_unpublished_root_swaps_successor_and_repair_retur
     );
     let orphans = va.c13_orphan_image_extents().await.unwrap();
     assert_eq!(
-        orphans.iter().map(|o| (o.appender, o.extent)).collect::<Vec<_>>(),
+        orphans
+            .iter()
+            .map(|o| (o.appender, o.extent))
+            .collect::<Vec<_>>(),
         vec![(1u32, new_ext)],
         "C13 finds exactly the unpublished successor image"
     );
@@ -1095,7 +1098,10 @@ async fn c13_finds_exactly_the_unpublished_root_swaps_successor_and_repair_retur
     let s = stats(&va);
     assert!(s.extent_returns >= 1, "{s:?}");
     assert_grant_closure(&s);
-    assert!(va.allocator().is_allocated(old_ext), "the live root is untouched");
+    assert!(
+        va.allocator().is_allocated(old_ext),
+        "the live root is untouched"
+    );
     assert!(va.block_ref_count(tag, 0).await.unwrap() >= 1);
     let live = digest_backend(&va).await.unwrap();
     for v in &ra.volumes {
@@ -1107,8 +1113,10 @@ async fn c13_finds_exactly_the_unpublished_root_swaps_successor_and_repair_retur
     let va = &ra.volumes[0];
     assert_eq!(META_KV_REPLAY_EXTENT_VIOLATIONS.load(Ordering::Relaxed), 0);
     assert_eq!(digest_backend(va).await.unwrap(), live);
+    // The returned extent is back in the pool: free, or legitimately
+    // re-claimed by a later image / re-granted (lowest-free-first) — but
+    // never an orphan again.
     assert!(va.c13_orphan_image_extents().await.unwrap().is_empty());
-    assert!(!va.allocator().is_allocated(new_ext));
     assert_grant_closure(&stats(va));
     let _ = guest_owner;
     for v in &ra.volumes {
@@ -1137,7 +1145,11 @@ async fn fsck_c13_reports_plans_and_repairs_the_orphan_image_extent() {
     let mut opts = FsckOptions::offline();
     opts.settle = std::time::Duration::from_millis(10);
     let report = run(&ctx, &opts).await.expect("fsck runs");
-    let c13: Vec<_> = report.findings.iter().filter(|f| f.class == "C13").collect();
+    let c13: Vec<_> = report
+        .findings
+        .iter()
+        .filter(|f| f.class == "C13")
+        .collect();
     assert_eq!(c13.len(), 1, "one C13 finding: {:?}", report.findings);
     assert!(
         c13[0].object.contains(&format!("extent{new_ext}")) && c13[0].object.contains("appender1"),
@@ -1195,7 +1207,10 @@ async fn fsck_c13_reports_plans_and_repairs_the_orphan_image_extent() {
         va.checkpoint_now().await.unwrap();
         cycles += 1;
     }
-    assert!(!va.allocator().is_allocated(new_ext), "returned to the bitmap");
+    assert!(
+        !va.allocator().is_allocated(new_ext),
+        "returned to the bitmap"
+    );
     let again = run(&ctx, &opts).await.expect("re-fsck");
     assert!(
         again.findings.is_empty(),

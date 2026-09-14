@@ -1133,7 +1133,13 @@ async fn test_load_refuses_foreign_alloc_record() {
     assert!(alloc.is_allocated(3));
     assert!(
         alloc.is_allocated(ALLOC_PAGE_BITS + 1),
-        "a replayed in-window free stays parked (the §2-A mount gate)"
+        "a replayed in-window free keeps its bit set (the §2-A mount gate)"
+    );
+    // The mount body's step once the trees are open (no live root among
+    // them here): the deferred free parks under the OWNER's gate.
+    assert_eq!(
+        alloc.park_replayed_frees(&std::collections::BTreeSet::new()),
+        (1, 0)
     );
     assert_eq!(alloc.pending_count(), 1);
     // Writer 0's tail cannot release writer 1's parked extent.

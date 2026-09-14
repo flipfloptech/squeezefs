@@ -917,11 +917,15 @@ async fn an_unnamed_root_swaps_replayed_free_never_releases_the_live_root() {
     assert_eq!(compacted, 1, "the nudge compacts the root leaf");
     let new_root = inodes.root();
     assert_ne!(old_root.addr, new_root.addr, "a root swap happened");
-    assert_eq!(kv.pending_free_extents(), 1, "the old root's free is parked");
+    assert_eq!(
+        kv.pending_free_extents(),
+        1,
+        "the old root's free is parked"
+    );
     let old_ext = extent_of(&kv, old_root.addr);
     let new_ext = extent_of(&kv, new_root.addr);
-    let dropped_before = squeezefs::meta_backend::kv::META_KV_REPLAY_ROOT_FREES_DROPPED
-        .load(Ordering::Relaxed);
+    let dropped_before =
+        squeezefs::meta_backend::kv::META_KV_REPLAY_ROOT_FREES_DROPPED.load(Ordering::Relaxed);
 
     // Kill before any ledger record names the new root.
     drop(routed);
@@ -1428,15 +1432,33 @@ async fn pending_free_wedged_shape_reopen_recovers_and_drains() {
         .expect("marker acked");
 
     // Crash-equivalent kill inside the wedge shape.
+    let dropped_before =
+        squeezefs::meta_backend::kv::META_KV_REPLAY_ROOT_FREES_DROPPED.load(Ordering::Relaxed);
     drop(routed);
     drop(kv);
     let kv2 = reopen(file.path()).await;
 
+    // The two saturating retirements were threshold-driven ROOT swaps of
+    // the depth-1 INODES tree (R0 → R1 → R2) that no ledger record ever
+    // named, so the mount replays through R0 — LIVE again. Its free is
+    // the unpublished swap's and is DROPPED (the root-swap carve-out,
+    // `an_unnamed_root_swaps_replayed_free_never_releases_the_live_root`);
+    // R1's — an unreached successor — re-parks under the §2-A mount gate.
+    // Before the carve-out both parked and the drain below CLEARED the
+    // live root's bit.
     assert_eq!(
         kv2.pending_free_extents(),
-        2,
-        "the in-window frees re-park at mount (§2-A mount gate)"
+        1,
+        "the in-window free of the unreached successor re-parks at mount (§2-A mount \
+         gate); the live root's is dropped"
     );
+    assert_eq!(
+        squeezefs::meta_backend::kv::META_KV_REPLAY_ROOT_FREES_DROPPED.load(Ordering::Relaxed),
+        dropped_before + 1,
+        "exactly the live root's replayed free was dropped"
+    );
+    let live_root_ext = extent_of(&kv2, kv2.all_trees()[0].root().addr);
+    assert!(kv2.allocator().is_allocated(live_root_ext));
     for i in 0..8u32 {
         kv2.checkpoint_now()
             .await

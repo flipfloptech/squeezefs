@@ -48,7 +48,7 @@ use squeezefs::meta_backend::kv::journal_core::AdmissionClass;
 use squeezefs::meta_backend::kv::record::{Record, TREE_ALLOC_RESERVED, TREE_INODES};
 use squeezefs::meta_backend::kv::KvError;
 use squeezefs::uring_fs;
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 use tempfile::NamedTempFile;
 
 // ---------------------------------------------------------------------------
@@ -719,10 +719,22 @@ async fn test_journal_replay_rebuilds_alloc_free_and_pending() {
 
     assert!(
         loaded.is_allocated(e0) && loaded.is_allocated(e1),
-        "every checkpoint-referenced replayed free parks (in-window by \
-         construction — §2-A mount gate), bits set"
+        "every checkpoint-referenced replayed free keeps its bit set at load (in-window \
+         by construction — §2-A mount gate)"
     );
+    assert_eq!(
+        loaded.pending_count(),
+        0,
+        "the parks are DEFERRED until the mount knows its roots (the root-swap carve-out)"
+    );
+    // The mount body's step once the trees are open: no live root among
+    // them here, so every deferred free parks.
+    assert_eq!(loaded.park_replayed_frees(&BTreeSet::new()), (2, 0));
     assert_eq!(loaded.pending_count(), 2, "exactly e0 + e1 parked");
+    assert!(
+        loaded.is_allocated(e0) && loaded.is_allocated(e1),
+        "parked extents keep their bits"
+    );
     assert!(loaded.is_allocated(e2), "journal-only alloc re-marked");
     assert!(
         loaded.is_allocated(e3),

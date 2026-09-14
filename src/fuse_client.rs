@@ -6479,6 +6479,11 @@ pub struct Metrics {
     /// volume says which, so the class is reported and never
     /// auto-repaired (no arm of the repair engine increments this).
     pub fsck_repair_class_c12: Align64<AtomicU64>,
+    /// `fsck_repair_classC13` (design-symmetric-metadata §5.8.5): orphan
+    /// image extents RETURNED to the bitmap — an appender-grant extent no
+    /// slot-tree root reached (an unpublished root swap's successor), freed
+    /// in the appender's own ring by the repair. 0 on every flat volume.
+    pub fsck_repair_class_c13: Align64<AtomicU64>,
     /// PR VL7 defrag family (design-volume-lifecycle §5.7/§10, KD-11).
     /// Distinct blocks moved by the D1/D2 defrag objective (the same
     /// `move_one` engine as `evacuate_*` — a defrag move counts BOTH
@@ -11710,6 +11715,9 @@ impl SqueezefsFilesystem {
                 // tripwire and the structurally-0 repair gauge (report-only).
                 "fsck_tenant_overlap_findings": METRICS.fsck_tenant_overlap_findings.load(Ordering::Relaxed),
                 "fsck_repair_classC12": METRICS.fsck_repair_class_c12.load(Ordering::Relaxed),
+                // Symmetric PR 3 — C13 (orphan image extent): returned
+                // grant extents; 0 on every flat volume.
+                "fsck_repair_classC13": METRICS.fsck_repair_class_c13.load(Ordering::Relaxed),
                 // PR VL7 defrag family (§5.7 / §10, KD-11). Ratio gauges
                 // decode permille+1 (null = never measured); worst-volume
                 // semantics — per-volume rows ride `defrag --report-only`.
@@ -13168,6 +13176,16 @@ impl SqueezefsFilesystem {
                 metrics.insert(
                     "meta_kv_pending_free_overflow".into(),
                     load(&meta_kv::META_KV_PENDING_FREE_OVERFLOW),
+                );
+                // The root-swap carve-out at replay (design-smo-replay-
+                // currency §2 C′, fixed with symmetric PR 3): in-window
+                // frees of a LIVE tree root dropped at mount — the
+                // unpublished swap's retirement of the very node the
+                // mount replays through. One per such window; 0 on every
+                // clean remount.
+                metrics.insert(
+                    "meta_kv_replay_root_frees_dropped".into(),
+                    load(&meta_kv::META_KV_REPLAY_ROOT_FREES_DROPPED),
                 );
                 // Pre-RC spec §6.2 item 1 (incompat bit 8): durable
                 // block-reference accounting. `staged`/`released` are the

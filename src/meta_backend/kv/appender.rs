@@ -986,6 +986,38 @@ impl RegionGrant {
         }
     }
 
+    /// The root-swap carve-out at the region's replay
+    /// ([`super::alloc_ext::ExtentAllocator::park_replayed_frees`]'s law
+    /// for a grant): a replayed `free` whose extent is one of the mounted
+    /// `live_roots` is the unpublished swap's retirement of a root the
+    /// mount replays THROUGH — it goes back to CLAIMED (the image is
+    /// live), never to the returnable batch. Returns how many.
+    pub fn unpark_live_roots(&mut self, live_roots: &std::collections::BTreeSet<u64>) -> usize {
+        let mut n = 0;
+        let mut i = 0;
+        while i < self.pending.len() {
+            if live_roots.contains(&self.pending[i].0) {
+                let (e, _) = self.pending.swap_remove(i);
+                self.claimed.insert(e);
+                n += 1;
+            } else {
+                i += 1;
+            }
+        }
+        n
+    }
+
+    /// The claimed set (fsck C13's candidate population).
+    pub fn claimed_extents(&self) -> Vec<u64> {
+        self.claimed.iter().copied().collect()
+    }
+
+    /// Whether `extent` is CLAIMED (holds an image, by this grant's
+    /// account).
+    pub fn is_claimed(&self, extent: u64) -> bool {
+        self.claimed.contains(&extent)
+    }
+
     /// The coverage gate: a durable tail of `tail` releases every parked
     /// free whose gate it covers into the returnable batch.
     pub fn advance_durable(&mut self, tail: u64) -> usize {

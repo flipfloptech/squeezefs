@@ -2060,6 +2060,11 @@ impl KvMetaBackend {
             ledger.journal_tail_seq,
         )
         .await?;
+        // The seq-space law (§5.8.2): the window's own stamps attest the
+        // offset in force (0 on every ring nothing was ever handed to —
+        // the shipped ring's seqs stay its positions); appender 0's page
+        // raises it further once read (`open_appender_regions`).
+        ring.recover_seq_offset(super::journal::seq_offset_of_window(&recovery.entries));
         let ring = Arc::new(ring);
 
         // 4b. Allocator: newest-valid A/B pages + replayed deltas (§4.7).
@@ -3251,10 +3256,23 @@ impl KvMetaBackend {
             .ok()
             .and_then(|r| self.guest_cursor_snapshot(r))
             .unwrap_or(0);
+        // The seq-space floor (§5.8.2): the stamp frontier of the ring the
+        // slot's records journal into — every record of the slot carries
+        // a seq strictly below it — `max`ed with the floor the table
+        // already carries (a slot's floor never regresses across leases).
+        let ring = self
+            .appenders
+            .as_ref()
+            .map(|set| set.region_of_slot(slot))
+            .map_or_else(|| Arc::clone(&self.ring), |r| self.ring_of_region(r));
+        let seq_floor = ring
+            .seq_frontier()
+            .max(plane.table.get(slot).map_or(0, |l| l.words.seq_floor));
         crate::slot_lease_core::SlotWords {
             root,
             cursor,
             extents: u32::try_from(plane.extents.get(slot)).unwrap_or(u32::MAX),
+            seq_floor,
         }
     }
 
@@ -3284,6 +3302,7 @@ impl KvMetaBackend {
                         g,
                         slot_tree_extents,
                         last_written,
+                        seq_floor,
                         ..
                     } => crate::slot_lease_core::SlotLease::unleased(
                         g,
@@ -3292,11 +3311,27 @@ impl KvMetaBackend {
                             root: (root.addr, root.seq),
                             cursor,
                             extents: slot_tree_extents,
+                            seq_floor,
                         },
                     ),
-                    super::slot_state::SlotState::Leased { appender_id, g, .. } => {
-                        crate::slot_lease_core::SlotLease::leased(appender_id, g)
-                    }
+                    super::slot_state::SlotState::Leased {
+                        appender_id,
+                        g,
+                        root,
+                        cursor,
+                        slot_tree_extents,
+                        seq_floor,
+                        ..
+                    } => crate::slot_lease_core::SlotLease::leased_with(
+                        appender_id,
+                        g,
+                        crate::slot_lease_core::SlotWords {
+                            root: (root.addr, root.seq),
+                            cursor,
+                            extents: slot_tree_extents,
+                            seq_floor,
+                        },
+                    ),
                 };
                 plane.table.load(slot, lease);
             }
@@ -3331,20 +3366,15 @@ impl KvMetaBackend {
         for r in &set.regions {
             let mut readopted: Vec<super::record::ForestSlot> = Vec::new();
             for slot in plane.table.held_by(r.id) {
-                let lease = plane
-                    .table
-                    .get(slot)
-                    .unwrap_or_else(|| crate::slot_lease_core::SlotLease::leased(r.id, 0));
-                self.install_lease(
-                    set,
-                    plane,
-                    r.id,
-                    slot,
-                    lease.g,
-                    crate::slot_lease_core::SlotWords::default(),
-                    false,
-                )
-                .await?;
+                // A re-adoption reads what the forest holds; the record's
+                // seq floor is the one word the install must still carry
+                // (the lessee's ring is raised above it again).
+                let words = crate::slot_lease_core::SlotWords {
+                    seq_floor: plane.table.get(slot).map_or(0, |l| l.words.seq_floor),
+                    ..Default::default()
+                };
+                self.install_lease(set, plane, r.id, slot, words, false)
+                    .await?;
                 if r.id == 0 && slot != super::record::NATIVE_FOREST_SLOT {
                     readopted.push(slot);
                 }
@@ -3521,6 +3551,13 @@ impl KvMetaBackend {
                             root: (se.root.addr, se.root.seq),
                             cursor: se.cursor,
                             extents: se.slot_tree_extents,
+                            // The departing ring's frontier at this open
+                            // bounds every stamp it ever made for the slot
+                            // (the recovered head + offset never fall).
+                            seq_floor: self
+                                .ring_of_region(r.id)
+                                .seq_frontier()
+                                .max(l.words.seq_floor),
                         };
                         let tails = match self.forest().and_then(|f| f.tree(slot)) {
                             Some(t) => self.leaf_tails(&t).await?,
@@ -3587,20 +3624,24 @@ impl KvMetaBackend {
     /// never drops below), the tree opened from the recorded root when
     /// this mount has never seen it. `fresh` = a grant made now (the
     /// words are the record's); a re-adoption reads what the forest holds.
-    #[allow(clippy::too_many_arguments)]
     async fn install_lease(
         &self,
         set: &super::appender::AppenderSet,
         plane: &super::slot_lease::SlotLeasePlane,
         region_id: u32,
         slot: super::record::ForestSlot,
-        _g: u32,
         words: crate::slot_lease_core::SlotWords,
         fresh: bool,
     ) -> std::result::Result<(), KvError> {
         let Some(region) = set.region(region_id) else {
             return Ok(());
         };
+        // The seq-space law (§5.8.2): the lessee's ring stamps ABOVE every
+        // record the slot already carries — raised at the grant and again
+        // at every re-adoption (idempotent, `max`).
+        if words.seq_floor != 0 {
+            region.ring().raise_seq_floor(words.seq_floor);
+        }
         if fresh && words.root.0 != 0 {
             if let Some(forest) = self.forest() {
                 let root = RootPtr {
@@ -3721,6 +3762,7 @@ impl KvMetaBackend {
                         },
                         cursor: words.cursor,
                         slot_tree_extents: words.extents,
+                        seq_floor: words.seq_floor,
                     }
                     .encode()?;
                     puts.push((
@@ -3823,7 +3865,7 @@ impl KvMetaBackend {
         }
         for g in &grants {
             if !g.already || set.region(appender_id).is_some() {
-                self.install_lease(set, &plane, appender_id, g.slot, g.g, g.words, !g.already)
+                self.install_lease(set, &plane, appender_id, g.slot, g.words, !g.already)
                     .await?;
             }
         }
@@ -3896,9 +3938,7 @@ impl KvMetaBackend {
             out.push(crate::meta_ship::manager::WireSlotGrant {
                 slot: self.routing_slot_of_forest(g.slot)?,
                 g: g.g,
-                root: g.words.root,
-                cursor: g.words.cursor,
-                slot_tree_extents: g.words.extents,
+                words: g.words.into(),
             });
         }
         Ok((out, already))
@@ -4012,9 +4052,7 @@ impl KvMetaBackend {
                     slots: vec![WireSlotGrant {
                         slot,
                         g: g.g,
-                        root: g.words.root,
-                        cursor: g.words.cursor,
-                        slot_tree_extents: g.words.extents,
+                        words: g.words.into(),
                     }],
                     already: g.already,
                 }
@@ -4068,7 +4106,6 @@ impl KvMetaBackend {
     /// transfer — tree 0 `slot_state:{s} → Unleased { root, cursor, g,
     /// extents, last_written, tails }` as ONE control entry (barriered),
     /// then the RAM table. `Ok(true)` = a replay (tree 0 already said so).
-    #[allow(clippy::too_many_arguments)]
     pub async fn manager_release_slot(
         &self,
         appender_id: u32,
@@ -4128,6 +4165,7 @@ impl KvMetaBackend {
             g,
             slot_tree_extents: words.extents,
             last_written,
+            seq_floor: words.seq_floor,
             tails,
         }
         .encode()?;
@@ -4212,15 +4250,12 @@ impl KvMetaBackend {
     }
 
     /// The wire face of [`Self::manager_release_slot`].
-    #[allow(clippy::too_many_arguments)]
     pub async fn manager_release_slot_wire(
         &self,
         appender_id: u32,
         slot: u16,
-        root: (u64, u64),
-        cursor: u64,
         g: u32,
-        slot_tree_extents: u32,
+        words: crate::meta_ship::manager::WireSlotWords,
         tails: &[(u64, u32)],
     ) -> std::result::Result<bool, KvError> {
         if tails.len() > usize::from(u16::MAX) {
@@ -4230,18 +4265,8 @@ impl KvMetaBackend {
             )));
         }
         let fslot = self.forest_slot_of_routing(slot);
-        self.manager_release_slot(
-            appender_id,
-            fslot,
-            crate::slot_lease_core::SlotWords {
-                root,
-                cursor,
-                extents: slot_tree_extents,
-            },
-            g,
-            tails.to_vec(),
-        )
-        .await
+        self.manager_release_slot(appender_id, fslot, words.into(), g, tails.to_vec())
+            .await
     }
 
     /// `ResolveSlot` (§5.1.6): the holder of `slot` as the manager's
@@ -4902,6 +4927,7 @@ impl KvMetaBackend {
                 g: lease.g,
                 slot_tree_extents: words.extents,
                 last_written,
+                seq_floor: words.seq_floor,
                 tails,
             }
             .encode()?;
@@ -5079,9 +5105,9 @@ impl KvMetaBackend {
         let Some(adm) = self.ring.try_admit(len, AdmissionClass::User) else {
             return Err(KvError::JournalReserveExhausted { needed: len });
         };
-        let res = self.ring.reserve_registered(adm);
+        let (res, seq_base) = self.ring.reserve_registered(adm);
         for (i, (_, r)) in recs.iter_mut().enumerate() {
-            r.seq = res.start + i as u64;
+            r.seq = seq_base + i as u64;
         }
         let control = Arc::clone(forest.control());
         for (tag, r) in &recs {
@@ -5743,9 +5769,9 @@ impl KvMetaBackend {
         let adm = ring
             .try_admit(len, super::journal_core::AdmissionClass::Checkpoint)
             .ok_or(KvError::JournalReserveExhausted { needed: len })?;
-        let res = ring.reserve_registered(adm);
+        let (res, seq_base) = ring.reserve_registered(adm);
         let mut recs = recs;
-        recs[0].1.seq = res.start;
+        recs[0].1.seq = seq_base;
         ring.commit_entry(&res, &recs).await?;
         region.grant().free_pending(extent, res.start);
         log::info!(
@@ -6434,6 +6460,10 @@ impl KvMetaBackend {
                 } else {
                     r.ring().core().head()
                 };
+                // The seq-space law's durable word (§5.8.2): the ring's
+                // offset in force — recovery reads it back as the floor
+                // of the window's own stamps.
+                page.seq_offset = r.ring().seq_offset();
                 // The segment table names EXTENTS (a declared region's
                 // first extent holds its two ring-side pages ahead of the
                 // ring proper; growth appends whole extents), so it is
@@ -13466,6 +13496,11 @@ impl KvMetaBackend {
             }
             _ => super::appender::ManagerLease::Vacant,
         };
+        // Ring 0's seq offset (§5.8.2): appender 0's page raises what the
+        // fixed ring's window attested at step 4a (`max`, never lower).
+        if let Some(p) = entries.first().and_then(|e| e.page.as_ref()) {
+            ring0.recover_seq_offset(p.seq_offset);
+        }
         let set = AppenderSet {
             regions: Vec::new(),
             identity: AppenderIdentity {
@@ -13603,6 +13638,12 @@ impl KvMetaBackend {
                     page.ledger_tail_seq,
                 )
                 .await?;
+                // The seq-space law (§5.8.2): the page's offset, raised by
+                // what the window's own stamps attest.
+                ring.recover_seq_offset(
+                    page.seq_offset
+                        .max(super::journal::seq_offset_of_window(&rec.entries)),
+                );
                 log::info!(
                     "meta volume {}: appender {id}'s page is LIVE under our own node (mount slot \
                      {:#x}, term {}) — replaying its ring ({} entries past tail {}) as our own \
@@ -13682,6 +13723,10 @@ impl KvMetaBackend {
                 let start = page.head_hint.max(ring0.core().head());
                 page.head_hint = start;
                 page.ledger_tail_seq = start;
+                // The predecessor incarnation's seq offset carries over
+                // with its position space (§5.8.2): the new ring stamps
+                // above every record the predecessor ever stamped.
+                let seq_offset = page.seq_offset;
                 let segs: Vec<RingSegment> = page
                     .segments
                     .iter()
@@ -13694,10 +13739,9 @@ impl KvMetaBackend {
                         })
                     })
                     .collect();
-                (
-                    JournalRing::new_segments_at(path, segs, reserve, start),
-                    false,
-                )
+                let fresh = JournalRing::new_segments_at(path, segs, reserve, start);
+                fresh.recover_seq_offset(seq_offset);
+                (fresh, false)
             };
             let first = page.segments.first().copied().unwrap_or(sb.journal);
             let page_offsets = page_slot_offsets(sb, id, entry.dir_offsets, &first);
@@ -14127,6 +14171,7 @@ impl KvMetaBackend {
                         g: l.g,
                         slot_tree_extents: l.words.extents,
                         last_written: l.last_written,
+                        seq_floor: l.words.seq_floor,
                         tails,
                     }
                 }
@@ -14136,6 +14181,7 @@ impl KvMetaBackend {
                     g: 0,
                     slot_tree_extents: 0,
                     last_written: 0,
+                    seq_floor: 0,
                     tails: Vec::new(),
                 },
             };
@@ -14163,9 +14209,9 @@ impl KvMetaBackend {
         // The named images first (see the doc): one barrier covers every
         // fresh root of this cycle.
         self.sync_device().await.map_err(KvError::Io)?;
-        let res = self.ring.reserve_registered(adm);
+        let (res, seq_base) = self.ring.reserve_registered(adm);
         for (i, (_, r)) in recs.iter_mut().enumerate() {
-            r.seq = res.start + i as u64;
+            r.seq = seq_base + i as u64;
         }
         let control = Arc::clone(forest.control());
         for (_, r) in &recs {
@@ -15394,10 +15440,10 @@ impl KvMetaBackend {
             // window reservation+apply keeps per-key journal-seq order
             // equal to RAM apply order (§4.4 pt 2) across the batch.
             let adm = s.admission.take().expect("admission held until reserve");
-            let res = s.ring.reserve_registered(adm);
+            let (res, seq_base) = s.ring.reserve_registered(adm);
             s.reservation = Some(res);
             {
-                let mut seq_cursor = res.start;
+                let mut seq_cursor = seq_base;
                 for q in s.entries.iter_mut() {
                     for (i, (_t, r)) in q.recs.iter_mut().enumerate() {
                         r.seq = seq_cursor + i as u64;
@@ -16455,9 +16501,9 @@ impl KvMetaBackend {
                 }
                 continue;
             }
-            let res = ring.reserve_registered(adm);
+            let (res, seq_base) = ring.reserve_registered(adm);
             for (i, (_t, r)) in recs.iter_mut().enumerate() {
-                r.seq = res.start + i as u64;
+                r.seq = seq_base + i as u64;
             }
             for (i, (_t, r)) in recs.iter().enumerate() {
                 let gi = lock_set

@@ -251,7 +251,8 @@ pub enum LeaseState {
 }
 
 /// The slot tree's durable words a lease carries (§5.1.4 "four words
-/// move: root, cursor, `g`, tails" — `tails` ride the durable record only).
+/// move: root, cursor, `g`, tails" — `tails` ride the durable record only)
+/// plus the seq-space floor (§5.8.2, review round 2).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct SlotWords {
     /// The tree root `(addr, seq)`; `(0, 0)` = never minted.
@@ -260,6 +261,12 @@ pub struct SlotWords {
     pub cursor: u64,
     /// The tree's extent count (the affinity cap's durable input).
     pub extents: u32,
+    /// **The record-seq floor**: every record of the slot's keys carries
+    /// a seq strictly below it (the departing ring's stamp frontier at the
+    /// release, `max`ed over every release); the next lessee's ring is
+    /// raised above it at the grant, so the leaf fold's per-key LWW is
+    /// monotone across rings.
+    pub seq_floor: u64,
 }
 
 /// One slot's entry.
@@ -297,6 +304,12 @@ impl SlotLease {
 
     /// A leased slot (tree 0's `Leased{appender_id, g}`).
     pub fn leased(holder: AppenderId, g: u32) -> Self {
+        Self::leased_with(holder, g, SlotWords::default())
+    }
+
+    /// A leased slot carrying the grant-time words the record holds (the
+    /// seq floor among them — the one word a re-adoption must re-apply).
+    pub fn leased_with(holder: AppenderId, g: u32, words: SlotWords) -> Self {
         Self {
             state: LeaseState::Leased,
             holder,
@@ -304,7 +317,7 @@ impl SlotLease {
             offered_to: 0,
             offer_expires_ns: 0,
             last_written: 0,
-            words: SlotWords::default(),
+            words,
         }
     }
 }
@@ -1006,6 +1019,7 @@ mod tests {
             root: (10, 20),
             cursor: 30,
             extents: 2,
+            seq_floor: 40,
         };
         assert_eq!(
             t.release(7, 1, 0, words, 9),

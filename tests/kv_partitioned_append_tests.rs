@@ -79,7 +79,7 @@ async fn append(ring: &JournalRing, records: &[(u8, Record)]) -> u64 {
     let adm = ring
         .try_admit(len, AdmissionClass::User)
         .expect("ring has space");
-    let res = ring.reserve_registered(adm);
+    let (res, _seq_base) = ring.reserve_registered(adm);
     ring.commit_entry(&res, records)
         .await
         .expect("entry write must succeed");

@@ -99,7 +99,8 @@ const OFF_RESERVED_234: usize = 234; // [u8; 6], zero (aligns the run table)
 const OFF_RUNS: usize = 240; // [(start u64, len u32, reserved u32); 4] × 16 B
 const RUN_ENC_LEN: usize = 16;
 const OFF_N_SLOTS: usize = OFF_RUNS + GRANT_RUNS_MAX * RUN_ENC_LEN; // 304, u16
-const OFF_SLOTS: usize = OFF_N_SLOTS + 2; // 306
+const OFF_SEQ_OFFSET: usize = OFF_N_SLOTS + 2; // 306, u64 — the ring's record-seq offset (PR 4)
+const OFF_SLOTS: usize = OFF_SEQ_OFFSET + 8; // 314
 
 /// Bytes of the page before its slot entries — the field list of §5.3.2
 /// at natural widths (the KD-MW-2 mount slot at its shipped u32).
@@ -250,6 +251,13 @@ pub struct AppenderPage {
     /// This ring's replay tail — the appender's ledger record.
     pub ledger_tail_seq: u64,
     pub ckpt_seq: u64,
+    /// The ring's record-seq OFFSET in force at the page write
+    /// (`JournalRing::seq_offset` — the seq-space law, design §5.1.4 /
+    /// §5.8.2, PR 4): a record's seq is its position plus this; a grant
+    /// of a slot whose departing ring stamped past this ring's frontier
+    /// raises it. Recovered as the max of this and the window's stamps.
+    /// 0 for a ring nothing was ever handed to.
+    pub seq_offset: u64,
     /// Extent-grant runs (≤ [`GRANT_RUNS_MAX`]; empty until PR 3 grants).
     pub grant: Vec<GrantRun>,
     /// Leased slots (≤ [`SLOT_PAGE_BUDGET`]), slot-ascending.
@@ -273,6 +281,7 @@ impl AppenderPage {
             head_hint: 0,
             ledger_tail_seq: 0,
             ckpt_seq: 0,
+            seq_offset: 0,
             grant: Vec::new(),
             slots: Vec::new(),
         }
@@ -327,6 +336,7 @@ impl AppenderPage {
         img[OFF_LEDGER_TAIL_SEQ..OFF_LEDGER_TAIL_SEQ + 8]
             .copy_from_slice(&self.ledger_tail_seq.to_le_bytes());
         img[OFF_CKPT_SEQ..OFF_CKPT_SEQ + 8].copy_from_slice(&self.ckpt_seq.to_le_bytes());
+        img[OFF_SEQ_OFFSET..OFF_SEQ_OFFSET + 8].copy_from_slice(&self.seq_offset.to_le_bytes());
         img[OFF_N_RUNS..OFF_N_RUNS + 2].copy_from_slice(&(self.grant.len() as u16).to_le_bytes());
         for (i, run) in self.grant.iter().enumerate() {
             let off = OFF_RUNS + i * RUN_ENC_LEN;
@@ -496,6 +506,7 @@ impl AppenderPage {
             head_hint: le64(buf, OFF_HEAD_HINT),
             ledger_tail_seq: le64(buf, OFF_LEDGER_TAIL_SEQ),
             ckpt_seq: le64(buf, OFF_CKPT_SEQ),
+            seq_offset: le64(buf, OFF_SEQ_OFFSET),
             grant,
             slots,
         })

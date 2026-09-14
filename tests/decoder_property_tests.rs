@@ -66,7 +66,7 @@ use squeezefs::meta_ship::manager::{
     decode_reply as decode_manager_reply, decode_request as decode_manager_request,
     encode_reply as encode_manager_reply, encode_request as encode_manager_request, ManagerCall,
     ManagerReply, ManagerReplyFrame, ManagerRequestFrame, WireIdentity, WireSlotGrant,
-    MANAGER_SCHEMA,
+    WireSlotWords, MANAGER_SCHEMA,
 };
 use squeezefs::meta_ship::publish::{
     decode_reply_frame, decode_request_frame, encode_reply_frame, encode_request_frame,
@@ -269,6 +269,7 @@ fn slot_state_tails_past_u16_refuse_at_the_encoder() {
         g: 0,
         slot_tree_extents: 0,
         last_written: 0,
+        seq_floor: 0,
         tails: vec![(0, 0); usize::from(u16::MAX) + 1],
     };
     assert!(too_many.encode().is_err());
@@ -278,6 +279,7 @@ fn slot_state_tails_past_u16_refuse_at_the_encoder() {
         g: 0,
         slot_tree_extents: 0,
         last_written: 0,
+        seq_floor: 0,
         tails: vec![(0, 0); usize::from(u16::MAX)],
     };
     let bytes = at_cap.encode().expect("u16::MAX tails encode");
@@ -630,11 +632,13 @@ proptest! {
     ) {
         prop_assert_eq!(decode_slot_state_key(&slot_state_key(slot)).ok(), Some(slot));
         let unleased = SlotState::Unleased {
-            root: RootPtr { addr, seq }, cursor, g, slot_tree_extents, last_written, tails,
+            root: RootPtr { addr, seq }, cursor, g, slot_tree_extents, last_written,
+            seq_floor: last_written.rotate_left(7), tails,
         };
         let leased = SlotState::Leased {
             appender_id: g, g: g.wrapping_add(1), page_addr: addr,
             root: RootPtr { addr: seq, seq: addr }, cursor, slot_tree_extents,
+            seq_floor: cursor.rotate_left(9),
         };
         for state in [unleased, leased] {
             let bytes = state.encode().expect("encodes");
@@ -709,6 +713,7 @@ proptest! {
         page.home_volume = (term % 251) as u8;
         page.ledger_tail_seq = tail;
         page.ckpt_seq = tail.wrapping_add(1);
+        page.seq_offset = tail.rotate_left(17);
         page.segments = (0..n_segments as u64)
             .map(|i| ExtentRef { start: i * 0x4_0000, len: 0x4_0000 })
             .collect();
@@ -1220,27 +1225,38 @@ fn arb_manager_call() -> impl Strategy<Value = ManagerCall> {
         (
             any::<u32>(),
             any::<u16>(),
-            (any::<u64>(), any::<u64>()),
-            any::<u64>(),
             any::<u32>(),
-            any::<u32>(),
+            arb_wire_slot_words(),
             prop::collection::vec((any::<u64>(), any::<u32>()), 0..9),
         )
             .prop_map(
-                |(appender_id, slot, root, cursor, g, slot_tree_extents, tails)| {
-                    ManagerCall::ReleaseSlot {
-                        appender_id,
-                        slot,
-                        root,
-                        cursor,
-                        g,
-                        slot_tree_extents,
-                        tails,
-                    }
+                |(appender_id, slot, g, words, tails)| ManagerCall::ReleaseSlot {
+                    appender_id,
+                    slot,
+                    g,
+                    words,
+                    tails,
                 }
             ),
         any::<u16>().prop_map(|slot| ManagerCall::ResolveSlot { slot }),
     ]
+}
+
+fn arb_wire_slot_words() -> impl Strategy<Value = WireSlotWords> {
+    (
+        (any::<u64>(), any::<u64>()),
+        any::<u64>(),
+        any::<u32>(),
+        any::<u64>(),
+    )
+        .prop_map(
+            |(root, cursor, slot_tree_extents, seq_floor)| WireSlotWords {
+                root,
+                cursor,
+                slot_tree_extents,
+                seq_floor,
+            },
+        )
 }
 
 fn arb_manager_reply() -> impl Strategy<Value = ManagerReply> {
@@ -1267,28 +1283,13 @@ fn arb_manager_reply() -> impl Strategy<Value = ManagerReply> {
         "[ -~]{0,64}".prop_map(|reason| ManagerReply::Refused { reason }),
         // PR 4's slot-lease replies.
         (
-            prop::collection::vec(
-                (
-                    any::<u16>(),
-                    any::<u32>(),
-                    (any::<u64>(), any::<u64>()),
-                    any::<u64>(),
-                    any::<u32>(),
-                ),
-                0..5,
-            ),
+            prop::collection::vec((any::<u16>(), any::<u32>(), arb_wire_slot_words()), 0..5),
             any::<bool>(),
         )
             .prop_map(|(slots, already)| ManagerReply::SlotsGranted {
                 slots: slots
                     .into_iter()
-                    .map(|(slot, g, root, cursor, slot_tree_extents)| WireSlotGrant {
-                        slot,
-                        g,
-                        root,
-                        cursor,
-                        slot_tree_extents,
-                    })
+                    .map(|(slot, g, words)| WireSlotGrant { slot, g, words })
                     .collect(),
                 already,
             }),

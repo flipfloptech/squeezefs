@@ -512,6 +512,22 @@ pub struct JournalRing {
     /// committed entry, headers included). Surfaced as
     /// `meta_kv_journal_bytes_per_volume`.
     written_bytes: std::sync::atomic::AtomicU64,
+    /// **The ring's record-seq offset** (design-symmetric-metadata
+    /// §5.1.4 / §5.8.2 — the seq-space law, PR 4 review round 2): a
+    /// record's seq is its reservation's POSITION plus this offset. The
+    /// leaf fold is seq-LWW over every source and a slot's records come
+    /// from EVERY ring that ever leased it, so the seq space must be
+    /// monotone across rings per key: the release records the departing
+    /// ring's stamp frontier as the slot's `seq_floor`, and the grant
+    /// RAISES the receiving ring's offset so its next stamp exceeds it
+    /// ([`Self::raise_seq_floor`]). Only ever grows; 0 for the life of a
+    /// ring nothing was ever handed to — the shipped ring, whose seqs
+    /// stay byte-identical to its positions. Read and raised under the
+    /// in-flight mutex so seq order equals reservation order within one
+    /// ring ([`Self::reserve_registered`] stamps at reservation).
+    /// Durable on the appender's page (`seq_offset`), recovered as the
+    /// max of the page's value and the window's own stamps.
+    seq_offset: std::sync::atomic::AtomicU64,
 }
 
 /// One physical run of ring pages: `pages` × 4 KiB at byte `base`.
@@ -558,6 +574,26 @@ pub struct ReplayedEntry {
     pub seq: u64,
     /// The entry's records, each tagged with its tree id (§4.2).
     pub records: Vec<(u8, Record)>,
+}
+
+/// The record-seq OFFSET a replay window attests (the seq-space law,
+/// design-symmetric-metadata §5.8.2): every record was stamped `entry
+/// position + offset + index`, so `seq − (entry.seq + index)` reads the
+/// offset in force at its stamp exactly — the maximum over the window is
+/// the newest. 0 on every window a ring stamped at its positions (the
+/// shipped ring; a K6a-era fold-domain seq below its position saturates
+/// to 0). Recovery installs `max(page.seq_offset, this)`.
+pub fn seq_offset_of_window(entries: &[ReplayedEntry]) -> u64 {
+    entries
+        .iter()
+        .flat_map(|e| {
+            e.records
+                .iter()
+                .enumerate()
+                .map(move |(i, (_, r))| r.seq.saturating_sub(e.seq.saturating_add(i as u64)))
+        })
+        .max()
+        .unwrap_or(0)
 }
 
 /// Outcome of a replay scan (§4.1).
@@ -673,6 +709,7 @@ impl JournalRing {
             completion_notify: squeezefs_ipc::sqz_notify::Notify::new(),
             written_entries: std::sync::atomic::AtomicU64::new(0),
             written_bytes: std::sync::atomic::AtomicU64::new(0),
+            seq_offset: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -768,6 +805,9 @@ impl JournalRing {
             completion_notify: squeezefs_ipc::sqz_notify::Notify::new(),
             written_entries: std::sync::atomic::AtomicU64::new(self.written_entries()),
             written_bytes: std::sync::atomic::AtomicU64::new(self.written_bytes()),
+            // The seq offset is the RING's: a grown ring keeps stamping above every
+            // record its predecessor image holds.
+            seq_offset: std::sync::atomic::AtomicU64::new(self.seq_offset()),
         })
     }
 
@@ -882,6 +922,7 @@ impl JournalRing {
             completion_notify: squeezefs_ipc::sqz_notify::Notify::new(),
             written_entries: std::sync::atomic::AtomicU64::new(0),
             written_bytes: std::sync::atomic::AtomicU64::new(0),
+            seq_offset: std::sync::atomic::AtomicU64::new(0),
         };
         Ok((ring, recovery))
     }
@@ -926,11 +967,54 @@ impl JournalRing {
     /// watermark can never observe a head past an unregistered
     /// reservation. Called inside the node-lock window (§4.4 pt 2); the
     /// mutex is held for two map operations, never across `.await`.
-    pub fn reserve_registered(&self, adm: super::journal_core::Admission) -> Reservation {
+    pub fn reserve_registered(&self, adm: super::journal_core::Admission) -> (Reservation, u64) {
         let mut g = self.inflight.lock().unwrap();
         let res = self.core.reserve(adm);
         g.open.insert(res.start, res.end());
-        res
+        // The entry's first record seq, stamped AT reservation (under the
+        // same lock a raise takes): position + offset, so seq order is
+        // reservation order within the ring whatever the offset does.
+        let seq_base = res
+            .start
+            .saturating_add(self.seq_offset.load(std::sync::atomic::Ordering::Relaxed));
+        (res, seq_base)
+    }
+
+    /// The ring's record-seq offset in force (the page's `seq_offset`).
+    pub fn seq_offset(&self) -> u64 {
+        self.seq_offset.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// The seq the ring's NEXT reservation would stamp — the slot's
+    /// `seq_floor` a release records: every record this ring stamped so
+    /// far is strictly below it.
+    pub fn seq_frontier(&self) -> u64 {
+        let _g = self.inflight.lock().unwrap();
+        self.core
+            .head()
+            .saturating_add(self.seq_offset.load(std::sync::atomic::Ordering::Relaxed))
+    }
+
+    /// Raise the offset so the ring's next stamp EXCEEDS `floor` (a
+    /// grant of a slot whose departing ring stamped up to `floor`).
+    /// Monotone: never lowers; a no-op when the frontier already exceeds
+    /// the floor. Answers the offset in force afterwards.
+    pub fn raise_seq_floor(&self, floor: u64) -> u64 {
+        let g = self.inflight.lock().unwrap();
+        let head = self.core.head();
+        let need = floor.saturating_add(1).saturating_sub(head);
+        let prev = self
+            .seq_offset
+            .fetch_max(need, std::sync::atomic::Ordering::AcqRel);
+        drop(g);
+        prev.max(need)
+    }
+
+    /// Install the offset recovered at open (the page's value, or the
+    /// window's own stamps when they say more) — `max`, never lower.
+    pub fn recover_seq_offset(&self, offset: u64) {
+        self.seq_offset
+            .fetch_max(offset, std::sync::atomic::Ordering::AcqRel);
     }
 
     /// Mark a reservation's write complete — or abandoned (a failed

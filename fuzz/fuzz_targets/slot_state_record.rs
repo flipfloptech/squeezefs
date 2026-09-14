@@ -108,6 +108,7 @@ fuzz_target!(|data: &[u8]| {
             g,
             slot_tree_extents,
             last_written,
+            seq_floor: last_written ^ cursor,
             tails,
         };
         let leased = SlotState::Leased {
@@ -120,6 +121,7 @@ fuzz_target!(|data: &[u8]| {
             },
             cursor,
             slot_tree_extents,
+            seq_floor: addr ^ seq,
         };
         for state in [unleased, leased] {
             let bytes = state.encode().expect("every emittable record encodes");

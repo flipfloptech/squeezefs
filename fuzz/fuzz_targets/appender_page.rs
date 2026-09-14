@@ -78,6 +78,7 @@ fuzz_target!(|data: &[u8]| {
         page.home_volume = data[42];
         page.ledger_tail_seq = u64_at(12) ^ u64_at(4);
         page.ckpt_seq = page.ledger_tail_seq.wrapping_add(1);
+        page.seq_offset = u64_at(20) ^ u64_at(28);
         let n_segments = usize::from(data[43]) % (RING_SEGMENTS_MAX + 1);
         let n_runs = usize::from(data[44]) % (GRANT_RUNS_MAX + 1);
         let n_slots =

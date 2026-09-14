@@ -34,17 +34,23 @@ pub const SLOT_STATE_VERSION: u8 = 2;
 const VARIANT_UNLEASED: u8 = 1;
 const VARIANT_LEASED: u8 = 2;
 /// `version ‖ variant ‖ root.addr ‖ root.seq ‖ cursor ‖ g ‖
-/// slot_tree_extents: u32 ‖ last_written: u64 ‖ n_tails: u16` before the
-/// tail entries (`leaf addr: u64 ‖ tail: u32` each).
-pub const UNLEASED_FIXED_LEN: usize = 1 + 1 + 8 + 8 + 8 + 4 + 4 + 8 + 2;
+/// slot_tree_extents: u32 ‖ last_written: u64 ‖ seq_floor: u64 ‖
+/// n_tails: u16` before the tail entries (`leaf addr: u64 ‖ tail: u32`
+/// each). `seq_floor` is the seq-space law's word (design §5.1.4 /
+/// §5.8.2, PR 4 review round 2): the departing ring's stamp frontier at
+/// the release — every record of the slot carries a seq strictly below
+/// it, and the next lessee's ring is raised above it at the grant.
+pub const UNLEASED_FIXED_LEN: usize = 1 + 1 + 8 + 8 + 8 + 4 + 4 + 8 + 8 + 2;
 const TAIL_ENTRY_LEN: usize = 8 + 4;
 /// `version ‖ variant ‖ appender_id: u32 ‖ g: u32 ‖ page_addr: u64 ‖
-/// root.addr ‖ root.seq ‖ cursor ‖ slot_tree_extents: u32` — the words
-/// AS OF THE GRANT ride the lessee record too: between the grant and the
-/// lessee's first page write the tree's root has no other durable home
-/// (the grant replaced the `Unleased` record that carried it); the
-/// page's entry supersedes them once written (a newer root seq).
-pub const LEASED_LEN: usize = 1 + 1 + 4 + 4 + 8 + 8 + 8 + 8 + 4;
+/// root.addr ‖ root.seq ‖ cursor ‖ slot_tree_extents: u32 ‖ seq_floor:
+/// u64` — the words AS OF THE GRANT ride the lessee record too: between
+/// the grant and the lessee's first page write the tree's root has no
+/// other durable home (the grant replaced the `Unleased` record that
+/// carried it); the page's entry supersedes them once written (a newer
+/// root seq). `seq_floor` = the floor the grant raised the lessee's ring
+/// above (a re-adoption raises it again, idempotently).
+pub const LEASED_LEN: usize = 1 + 1 + 4 + 4 + 8 + 8 + 8 + 8 + 4 + 8;
 
 /// The tree-0 key of slot `slot`'s state record.
 pub fn slot_state_key(slot: ForestSlot) -> Vec<u8> {
@@ -93,6 +99,8 @@ pub enum SlotState {
         g: u32,
         slot_tree_extents: u32,
         last_written: u64,
+        /// The seq-space floor (see [`UNLEASED_FIXED_LEN`]).
+        seq_floor: u64,
         tails: Vec<(u64, u32)>,
     },
     /// Leased: the lessee's identity — what makes slot resolution a
@@ -106,6 +114,8 @@ pub enum SlotState {
         root: RootPtr,
         cursor: u64,
         slot_tree_extents: u32,
+        /// The seq-space floor (see [`LEASED_LEN`]).
+        seq_floor: u64,
     },
 }
 
@@ -122,6 +132,7 @@ impl SlotState {
                 g,
                 slot_tree_extents,
                 last_written,
+                seq_floor,
                 tails,
             } => {
                 let n = u16::try_from(tails.len()).map_err(|_| {
@@ -139,6 +150,7 @@ impl SlotState {
                 out.extend_from_slice(&g.to_le_bytes());
                 out.extend_from_slice(&slot_tree_extents.to_le_bytes());
                 out.extend_from_slice(&last_written.to_le_bytes());
+                out.extend_from_slice(&seq_floor.to_le_bytes());
                 out.extend_from_slice(&n.to_le_bytes());
                 for (leaf, tail) in tails {
                     out.extend_from_slice(&leaf.to_le_bytes());
@@ -153,6 +165,7 @@ impl SlotState {
                 root,
                 cursor,
                 slot_tree_extents,
+                seq_floor,
             } => {
                 let mut out = Vec::with_capacity(LEASED_LEN);
                 out.push(SLOT_STATE_VERSION);
@@ -164,6 +177,7 @@ impl SlotState {
                 out.extend_from_slice(&root.seq.to_le_bytes());
                 out.extend_from_slice(&cursor.to_le_bytes());
                 out.extend_from_slice(&slot_tree_extents.to_le_bytes());
+                out.extend_from_slice(&seq_floor.to_le_bytes());
                 Ok(out)
             }
         }
@@ -199,7 +213,8 @@ impl SlotState {
                 let g = le32(value, 26);
                 let slot_tree_extents = le32(value, 30);
                 let last_written = le64(value, 34);
-                let n = usize::from(u16::from_le_bytes([value[42], value[43]]));
+                let seq_floor = le64(value, 42);
+                let n = usize::from(u16::from_le_bytes([value[50], value[51]]));
                 let want = UNLEASED_FIXED_LEN + n * TAIL_ENTRY_LEN;
                 if value.len() != want {
                     return Err(KvError::Corrupt(format!(
@@ -220,6 +235,7 @@ impl SlotState {
                     g,
                     slot_tree_extents,
                     last_written,
+                    seq_floor,
                     tails,
                 })
             }
@@ -240,6 +256,7 @@ impl SlotState {
                     },
                     cursor: le64(value, 34),
                     slot_tree_extents: le32(value, 42),
+                    seq_floor: le64(value, 46),
                 })
             }
             other => Err(KvError::Corrupt(format!(

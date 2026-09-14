@@ -1983,9 +1983,9 @@ impl KvTree {
             // replay applies the pointer record first.
             let smo_entry = smo_prep.map(|(adm, mut recs)| {
                 let ring = ctx.smo_ring().expect("prep implies hooks");
-                let res = ring.reserve_registered(adm);
+                let (res, seq_base) = ring.reserve_registered(adm);
                 for (i, (_tag, r)) in recs.iter_mut().enumerate() {
-                    r.seq = res.start + i as u64;
+                    r.seq = seq_base + i as u64;
                 }
                 (res, recs)
             });
@@ -2985,9 +2985,9 @@ impl KvTree {
             };
             let smo_entry = smo_prep.map(|(adm, mut recs)| {
                 let ring = ctx.smo_ring().expect("prep implies hooks");
-                let res = ring.reserve_registered(adm);
+                let (res, seq_base) = ring.reserve_registered(adm);
                 for (i, (_tag, r)) in recs.iter_mut().enumerate() {
-                    r.seq = res.start + i as u64;
+                    r.seq = seq_base + i as u64;
                 }
                 (res, recs)
             });
@@ -3188,9 +3188,9 @@ impl KvTree {
             let mut rg = root.lock().write().await;
             let smo_entry = smo_prep.map(|(adm, mut recs)| {
                 let ring = ctx.smo_ring().expect("prep implies hooks");
-                let res = ring.reserve_registered(adm);
+                let (res, seq_base) = ring.reserve_registered(adm);
                 for (i, (_tag, r)) in recs.iter_mut().enumerate() {
-                    r.seq = res.start + i as u64;
+                    r.seq = seq_base + i as u64;
                 }
                 (res, recs)
             });

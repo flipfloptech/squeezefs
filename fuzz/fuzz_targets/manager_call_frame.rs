@@ -44,10 +44,12 @@ use squeezefs::meta_backend::kv::appender::{
     clamp_grant_want, coalesce_runs, intersect_coalesced_with_record, runs_extent_count,
     validate_return_runs, GrantRun,
 };
-use squeezefs::meta_backend::kv::slot_state::ExtentGrantRecord;
+use squeezefs::meta_backend::kv::tree::RootPtr;
+use squeezefs::meta_backend::kv::slot_state::{ExtentGrantRecord, SlotState};
 use squeezefs::meta_ship::manager::{
     decode_reply, decode_request, encode_reply, encode_request, ManagerCall, ManagerReply,
-    ManagerReplyFrame, ManagerRequestFrame, WireIdentity, WireSlotGrant, MANAGER_SCHEMA,
+    ManagerReplyFrame, ManagerRequestFrame, WireIdentity, WireSlotGrant, WireSlotWords,
+    MANAGER_SCHEMA,
 };
 
 /// Arm 3: the service-edge law over a decoded call's integers. `record`
@@ -115,11 +117,28 @@ fn check_service_edge(call: &ManagerCall, total_extents: u64, record_seed: &[u8]
         // words and the tails; the ONE proportional input is the tails
         // list, whose count is bounded by the record's u16 at the
         // service edge (`manager_release_slot_wire` rejects past it).
-        ManagerCall::ReleaseSlot { tails, .. } => {
-            assert!(
-                tails.len() > usize::from(u16::MAX) || u16::try_from(tails.len()).is_ok(),
-                "a tails count either fits the record's u16 or is the rejected class"
-            );
+        ManagerCall::ReleaseSlot { words, tails, .. } => {
+            // The service edge REJECTS a tails count past the record's u16
+            // before anything proportional to it is built; within it the
+            // record encodes and round-trips with the frame's words.
+            if tails.len() <= usize::from(u16::MAX) {
+                let record = SlotState::Unleased {
+                    root: RootPtr {
+                        addr: words.root.0,
+                        seq: words.root.1,
+                    },
+                    cursor: words.cursor,
+                    g: 1,
+                    slot_tree_extents: words.slot_tree_extents,
+                    last_written: 0,
+                    seq_floor: words.seq_floor,
+                    tails: tails.clone(),
+                };
+                let img = record
+                    .encode()
+                    .expect("a tails count within the u16 encodes");
+                assert_eq!(SlotState::decode(&img).expect("decodes"), record);
+            }
         }
         ManagerCall::JoinAppender { .. }
         | ManagerCall::AcquireSlots { .. }
@@ -198,15 +217,32 @@ enum ArbCall {
     ReleaseSlot {
         appender_id: u32,
         slot: u16,
-        root: (u64, u64),
-        cursor: u64,
         g: u32,
-        slot_tree_extents: u32,
+        words: ArbWords,
         tails: Vec<(u64, u32)>,
     },
     ResolveSlot {
         slot: u16,
     },
+}
+
+#[derive(Arbitrary, Debug, Clone, Copy)]
+struct ArbWords {
+    root: (u64, u64),
+    cursor: u64,
+    slot_tree_extents: u32,
+    seq_floor: u64,
+}
+
+impl From<ArbWords> for WireSlotWords {
+    fn from(w: ArbWords) -> Self {
+        WireSlotWords {
+            root: w.root,
+            cursor: w.cursor,
+            slot_tree_extents: w.slot_tree_extents,
+            seq_floor: w.seq_floor,
+        }
+    }
 }
 
 impl From<ArbCall> for ManagerCall {
@@ -230,18 +266,14 @@ impl From<ArbCall> for ManagerCall {
             ArbCall::ReleaseSlot {
                 appender_id,
                 slot,
-                root,
-                cursor,
                 g,
-                slot_tree_extents,
+                words,
                 tails,
             } => ManagerCall::ReleaseSlot {
                 appender_id,
                 slot,
-                root,
-                cursor,
                 g,
-                slot_tree_extents,
+                words: words.into(),
                 tails,
             },
             ArbCall::ResolveSlot { slot } => ManagerCall::ResolveSlot { slot },
@@ -282,7 +314,7 @@ enum ArbReply {
         reason: String,
     },
     SlotsGranted {
-        slots: Vec<(u16, u32, (u64, u64), u64, u32)>,
+        slots: Vec<(u16, u32, ArbWords)>,
         already: bool,
     },
     SlotRefused {
@@ -309,12 +341,10 @@ impl From<ArbReply> for ManagerReply {
             ArbReply::SlotsGranted { slots, already } => ManagerReply::SlotsGranted {
                 slots: slots
                     .into_iter()
-                    .map(|(slot, g, root, cursor, slot_tree_extents)| WireSlotGrant {
+                    .map(|(slot, g, words)| WireSlotGrant {
                         slot,
                         g,
-                        root,
-                        cursor,
-                        slot_tree_extents,
+                        words: words.into(),
                     })
                     .collect(),
                 already,

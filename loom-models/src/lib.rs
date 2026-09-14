@@ -7052,6 +7052,7 @@ mod slot_lease_models {
                 root: (0x1000, 5),
                 cursor: 42,
                 extents: 3,
+                seq_floor: 0x2000,
             };
             let stale = {
                 let t = Arc::clone(&table);

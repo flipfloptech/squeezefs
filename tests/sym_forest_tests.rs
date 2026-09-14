@@ -571,6 +571,7 @@ fn slot_state_records_round_trip_and_refuse_malformed_images() {
         g: 3,
         slot_tree_extents: 5,
         last_written: 9_001,
+        seq_floor: 123_456,
         tails: vec![(0x1000, 12), (0x2000, 0)],
     };
     let leased = SlotState::Leased {
@@ -583,6 +584,7 @@ fn slot_state_records_round_trip_and_refuse_malformed_images() {
         },
         cursor: 4243,
         slot_tree_extents: 1,
+        seq_floor: 123_457,
     };
     for st in [&unleased, &leased] {
         let img = st.encode().expect("encode");

@@ -138,6 +138,7 @@ fn full_page() -> AppenderPage {
         head_hint: 123_456,
         ledger_tail_seq: 100_000,
         ckpt_seq: 17,
+        seq_offset: 0x0102_0304,
         grant: (0..GRANT_RUNS_MAX as u64)
             .map(|i| GrantRun {
                 start: 1000 + i * 8,
@@ -187,12 +188,13 @@ fn slot_page_budget_derives_from_the_pages_fixed_part() {
     // here ships under a NEW incompat bit (design §7.1), so the numbers
     // are pinned, not only the formula.
     assert_eq!(
-        APPENDER_PAGE_FIXED_LEN, 306,
-        "the §5.3.2 fixed part at natural widths (offset of n_slots + 2)"
+        APPENDER_PAGE_FIXED_LEN, 314,
+        "the §5.3.2 fixed part at natural widths (offset of n_slots + 2 + the ring's u64 \
+         seq_offset — PR 4's seq-space law)"
     );
     assert_eq!(
         SLOT_PAGE_BUDGET, 108,
-        "(4096 − 306) / 35 — the design's 122 predates `slot_tree_extents`"
+        "(4096 − 314) / 35 — the design's 122 predates `slot_tree_extents`"
     );
     // The §5.3.2 field list at natural widths: slot u16 + state u8 + g u32
     // + slot_tree_extents u32 + root (u64, u64) + cursor u64.
@@ -296,6 +298,7 @@ fn appender_page_decode_is_total_and_canonical() {
     count.slots.clear();
     let mut c_img = count.encode().unwrap();
     c_img[304..306].copy_from_slice(&((SLOT_PAGE_BUDGET as u16) + 1).to_le_bytes());
+    // (offset 304 is `n_slots`; the u64 `seq_offset` follows it at 306.)
     let sum = recompute_checksum(&c_img);
     c_img[16..24].copy_from_slice(&sum.to_le_bytes());
     assert!(
@@ -573,8 +576,8 @@ async fn append_sized(ring: &JournalRing, i: u64, entry_len: u64, marker: u8) ->
         .core()
         .try_admit(need, AdmissionClass::User)
         .expect("room");
-    let res = ring.reserve_registered(adm);
-    let records = sized_records(i, entry_len, marker, res.seq());
+    let (res, seq_base) = ring.reserve_registered(adm);
+    let records = sized_records(i, entry_len, marker, seq_base);
     ring.commit_entry(&res, &records).await.expect("write");
     res.end()
 }
@@ -676,7 +679,7 @@ async fn a_solo_ring_is_one_segment_and_growth_needs_a_drained_ring() {
     // An open reservation ⇒ refused.
     let ring3 = JournalRing::new(f.path(), 4096, 4, 0);
     let adm = ring3.core().try_admit(500, AdmissionClass::User).unwrap();
-    let res = ring3.reserve_registered(adm);
+    let (res, _) = ring3.reserve_registered(adm);
     ring3.advance_reusable_upto(res.end());
     assert!(
         ring3.grown_with(extra).is_err(),

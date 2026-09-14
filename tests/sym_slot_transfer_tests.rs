@@ -375,6 +375,8 @@ async fn symmetric_meta_off_is_the_shipped_dark_forest() {
         refusals_before,
         "the gate is inert unarmed"
     );
+    // The seq-space law is inert here: the ring stamps its positions.
+    assert_eq!(vol.journal_ring().seq_offset(), 0);
     shutdown(&routed).await;
 }
 
@@ -796,7 +798,7 @@ async fn first_writer_takes_it_and_the_second_is_refused_naming_the_holder() {
             assert!(!already);
             assert_eq!(slots.len(), 1);
             assert_eq!((slots[0].slot, slots[0].g), (routing, 1));
-            assert_eq!(slots[0].root, (0, 0), "never minted");
+            assert_eq!(slots[0].words.root, (0, 0), "never minted");
         }
         other => panic!("{other:?}"),
     }
@@ -893,7 +895,11 @@ async fn leaf_lease_refusals_fire_on_a_foreign_mutation() {
     match client.acquire_slot(joiner, routing).await.unwrap() {
         ManagerReply::SlotsGranted { slots, .. } => {
             assert_eq!(slots[0].g, 2, "g moved at the grant");
-            assert_ne!(slots[0].root, (0, 0), "the grant carries the tree's root");
+            assert_ne!(
+                slots[0].words.root,
+                (0, 0),
+                "the grant carries the tree's root"
+            );
         }
         other => panic!("{other:?}"),
     }
@@ -1633,7 +1639,7 @@ async fn a_requester_retries_against_the_successor_and_a_dead_requesters_lease_s
             );
             assert_eq!(slots.len(), 1);
             assert_eq!(slots[0].g, 2);
-            assert_ne!(slots[0].root, (0, 0), "the flushed tree travels");
+            assert_ne!(slots[0].words.root, (0, 0), "the flushed tree travels");
             slots[0].g
         }
         other => panic!("{other:?}"),
@@ -2079,7 +2085,13 @@ async fn the_renewal_grant_carries_the_members_slot_leases_recalls_and_offers() 
     // was never minted, so the words are empty), the recall clears, the
     // requester's retry is granted at g + 1.
     let already = client
-        .release_slot(joiner, routing, (0, 0), 0, 1, 0, Vec::new())
+        .release_slot(
+            joiner,
+            routing,
+            1,
+            squeezefs::meta_ship::manager::WireSlotWords::default(),
+            Vec::new(),
+        )
         .await
         .unwrap();
     assert!(!already, "the release landed once");
@@ -2151,5 +2163,121 @@ async fn the_manager_verbs_ride_the_owner_listener_dispatched_by_volume_ordinal(
         "{msg}"
     );
     host.shutdown();
+    shutdown(&routed).await;
+}
+
+// ---------------------------------------------------------------------------
+// Review round 2 — the record-seq space across rings (Issue 2).
+// ---------------------------------------------------------------------------
+
+/// **Issue 2 (round 1): a same-key write after a handover from a BUSIER
+/// ring to a QUIETER one is the newest value in RAM and at replay.** Record
+/// seqs were ring POSITIONS in each ring's own space, and the leaf fold is
+/// seq-LWW over every source, so the requester's first write on a key the
+/// departing holder had written carried a LOWER seq than the stored one —
+/// shadowed in RAM, skipped by the replay gate. The law now: every ring
+/// stamps `position + seq_offset`, the release records the departing
+/// ring's stamp frontier as the slot's `seq_floor`, and a grant raises the
+/// receiving ring's offset above it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_same_key_write_after_a_handover_to_a_quieter_ring_is_the_newest_value() {
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    let uris = vec![format_stamped_member(dir.path(), "meta0").await];
+    let tag = volume_tag("vol-000000000000000b");
+    let owner = ino_in_slot(SLOT4, 5);
+    let digest = {
+        let routed = open_under(&uris, &Knobs::armed().partition(PARTITION)).await;
+        let vol = Arc::clone(&routed.volumes[0]);
+        // Region 1 (the busy holder) writes 400 entries of slot 4 — its
+        // ring's positions run far past ring 0's, which stays idle.
+        for i in 0..400u64 {
+            vol.commit_block_refs(owner, &refs(tag, owner, i, 1))
+                .await
+                .unwrap();
+        }
+        let head1 = vol.ring_of_region(1).core().head();
+        let head0 = vol.journal_ring().core().head();
+        assert!(
+            head1 > head0 + 10_000,
+            "ring 1 {head1} is the busy one; ring 0 {head0} idle"
+        );
+        assert_eq!(vol.block_ref_count(tag, 395).await.unwrap(), 1);
+        // The handover to the manager (region 0).
+        vol.manager_offer_slot(1, SLOT4, 0).await.unwrap();
+        assert_eq!(
+            vol.journal_ring().seq_offset(),
+            0,
+            "ring 0 stamped its positions so far"
+        );
+        let AcquireSlotReply::Granted(g) = vol.manager_acquire_slot(0, SLOT4).await.unwrap() else {
+            panic!()
+        };
+        assert_eq!(g.g, 2);
+        // The law's mechanism: the release recorded ring 1's stamp frontier
+        // as the slot's floor and the grant raised ring 0's offset above it.
+        assert!(
+            g.words.seq_floor >= head1,
+            "the floor is the departing ring's frontier"
+        );
+        assert!(
+            vol.journal_ring().seq_frontier() > g.words.seq_floor,
+            "ring 0 stamps above the floor now (offset {})",
+            vol.journal_ring().seq_offset()
+        );
+        assert!(vol.journal_ring().seq_offset() > 0);
+        // The requester's SAME-KEY write: release block 395's reference (a
+        // Delete of a key region 1 Put LATE in its ring — a seq far past
+        // ring 0's head).
+        let op = BlockRefOp::released(BlockRef {
+            vol_tag: tag,
+            block_idx: 395,
+            owner_ino: owner,
+            block_index: 0,
+        });
+        vol.commit_block_refs(owner, &[op]).await.unwrap();
+        assert_eq!(
+            vol.block_ref_count(tag, 395).await.unwrap(),
+            0,
+            "the acked release is the newest value in RAM (the overlay head)"
+        );
+        // A checkpoint freezes the overlay into the leaf's bset beside the
+        // departing holder's records: the fold is seq-LWW there.
+        vol.checkpoint_now().await.unwrap();
+        assert_eq!(
+            vol.block_ref_count(tag, 395).await.unwrap(),
+            0,
+            "the acked release is the newest value in RAM after the freeze"
+        );
+        // A second release, left in ring 0's window for the replay gate.
+        let op = BlockRefOp::released(BlockRef {
+            vol_tag: tag,
+            block_idx: 397,
+            owner_ino: owner,
+            block_index: 0,
+        });
+        vol.commit_block_refs(owner, &[op]).await.unwrap();
+        assert_eq!(vol.block_ref_count(tag, 397).await.unwrap(), 0);
+        vol.sync_device().await.unwrap();
+        let d = digest_backend(&vol).await.unwrap();
+        // Crash: no leave.
+        drop(vol);
+        drop(routed);
+        d
+    };
+    let routed = open_under(&uris, &Knobs::armed().partition(PARTITION)).await;
+    let vol = Arc::clone(&routed.volumes[0]);
+    assert_eq!(
+        vol.block_ref_count(tag, 395).await.unwrap(),
+        0,
+        "the acked release survives the remount"
+    );
+    assert_eq!(vol.block_ref_count(tag, 396).await.unwrap(), 1);
+    assert_eq!(
+        vol.block_ref_count(tag, 397).await.unwrap(),
+        0,
+        "the acked in-window release is the newest value at replay"
+    );
+    assert_eq!(digest_backend(&vol).await.unwrap(), digest);
     shutdown(&routed).await;
 }

@@ -149,10 +149,8 @@ pub enum ManagerCall {
     ReleaseSlot {
         appender_id: u32,
         slot: u16,
-        root: (u64, u64),
-        cursor: u64,
         g: u32,
-        slot_tree_extents: u32,
+        words: WireSlotWords,
         /// `(leaf addr, log tail)` of every leaf flushed under the lease
         /// (§5.8.2 — PR 5's frame screen reads them).
         tails: Vec<(u64, u32)>,
@@ -162,15 +160,48 @@ pub enum ManagerCall {
     ResolveSlot { slot: u16 },
 }
 
+/// The slot tree's words on the wire (§5.1.4 "four words move" — root,
+/// cursor, extent count — plus §5.8.2's seq-space floor): what a release
+/// presents and a grant answers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct WireSlotWords {
+    pub root: (u64, u64),
+    pub cursor: u64,
+    pub slot_tree_extents: u32,
+    /// Every record of the slot carries a seq strictly below it; the
+    /// lessee's ring stamps above it (`JournalRing::raise_seq_floor`).
+    pub seq_floor: u64,
+}
+
+impl From<crate::slot_lease_core::SlotWords> for WireSlotWords {
+    fn from(w: crate::slot_lease_core::SlotWords) -> Self {
+        Self {
+            root: w.root,
+            cursor: w.cursor,
+            slot_tree_extents: w.extents,
+            seq_floor: w.seq_floor,
+        }
+    }
+}
+
+impl From<WireSlotWords> for crate::slot_lease_core::SlotWords {
+    fn from(w: WireSlotWords) -> Self {
+        Self {
+            root: w.root,
+            cursor: w.cursor,
+            extents: w.slot_tree_extents,
+            seq_floor: w.seq_floor,
+        }
+    }
+}
+
 /// One granted slot on the wire: the routing slot, its lease generation
-/// and the words the tree carries (§5.1.4 "four words move").
+/// and the words the tree carries.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WireSlotGrant {
     pub slot: u16,
     pub g: u32,
-    pub root: (u64, u64),
-    pub cursor: u64,
-    pub slot_tree_extents: u32,
+    pub words: WireSlotWords,
 }
 
 impl ManagerCall {
@@ -522,22 +553,12 @@ impl ManagerService {
             ManagerCall::ReleaseSlot {
                 appender_id,
                 slot,
-                root,
-                cursor,
                 g,
-                slot_tree_extents,
+                words,
                 tails,
             } => match self
                 .volume
-                .manager_release_slot_wire(
-                    *appender_id,
-                    *slot,
-                    *root,
-                    *cursor,
-                    *g,
-                    *slot_tree_extents,
-                    tails,
-                )
+                .manager_release_slot_wire(*appender_id, *slot, *g, *words, tails)
                 .await
             {
                 Ok(already) => (ManagerReply::Released { already }, false),
@@ -862,25 +883,20 @@ impl ManagerClient {
     }
 
     /// `ReleaseSlot` — `Ok(already)`.
-    #[allow(clippy::too_many_arguments)]
     pub async fn release_slot(
         &mut self,
         appender_id: u32,
         slot: u16,
-        root: (u64, u64),
-        cursor: u64,
         g: u32,
-        slot_tree_extents: u32,
+        words: WireSlotWords,
         tails: Vec<(u64, u32)>,
     ) -> Result<bool> {
         match self
             .call(ManagerCall::ReleaseSlot {
                 appender_id,
                 slot,
-                root,
-                cursor,
                 g,
-                slot_tree_extents,
+                words,
                 tails,
             })
             .await?

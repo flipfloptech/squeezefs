@@ -1866,6 +1866,82 @@ async fn a_clean_unmount_returns_a_declared_regions_ring_extents_to_the_heap() {
     }
 }
 
+/// PR 3 review round 2 (found by the clean-remount grant pin's planted
+/// orphan — a product defect on PR 2's ring carve): a region rejoined
+/// after a clean unmount carves a FRESH ring from the heap, and the
+/// heap's lowest-free-first hands it the extents the PREDECESSOR
+/// incarnation's ring occupied — with that ring's entries still on the
+/// device, checksummed, at lap 0 like the new ring's own. The new
+/// incarnation's replay chain walks past its own head into them: a
+/// predecessor's `+ref` at a higher position out-votes this mount's
+/// acked release (per-key LWW by ring position — the record resurrects),
+/// a predecessor's `free(extent)` is folded into the grant and RETURNED
+/// (the extent's live image loses its bit). A carved ring must replay
+/// exactly the entries its own incarnation wrote.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_re_carved_ring_never_replays_its_predecessor_incarnations_entries() {
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    let _cadence = EnvVarGuard::set("SQUEEZEFS_META_FLUSH_INTERVAL_MS", "60000");
+    let tag = volume_tag("vol-0011223344556677");
+    let guest_owner = guest_local_ino(3, 23);
+    let uris = vec![format_stamped_member(dir.path(), "meta0").await];
+    // Mount 1: many entries into appender 1's ring (one commit = one
+    // entry), durable, then a clean leave (the ring's extents return).
+    let ra = open_with_partition(&uris, Some(PARTITION)).await;
+    let va = Arc::clone(&ra.volumes[0]);
+    for i in 0..24u64 {
+        va.commit_block_refs(guest_owner, &refs(tag, guest_owner, 7000 + i * 10, 3))
+            .await
+            .unwrap();
+    }
+    va.checkpoint_now().await.unwrap();
+    for v in &ra.volumes {
+        v.shutdown().await.unwrap();
+    }
+    drop(va);
+    drop(ra);
+    // Mount 2: the rejoin carves a fresh ring (the predecessor's extents,
+    // lowest-free-first); ONE acked entry — the RELEASE of a mount-1
+    // reference — then death.
+    let rb = open_with_partition(&uris, Some(PARTITION)).await;
+    let vb = Arc::clone(&rb.volumes[0]);
+    let victim = BlockRef {
+        vol_tag: tag,
+        block_idx: 7000,
+        owner_ino: guest_owner,
+        block_index: 0,
+    };
+    assert_eq!(vb.block_ref_count(tag, 7000).await.unwrap(), 1);
+    vb.commit_block_refs(guest_owner, &[BlockRefOp::released(victim)])
+        .await
+        .unwrap();
+    vb.sync_device().await.unwrap();
+    assert_eq!(vb.block_ref_count(tag, 7000).await.unwrap(), 0);
+    let live = digest_backend(&vb).await.unwrap();
+    let free_live = vb.free_extents();
+    drop(vb);
+    drop(rb);
+    // Mount 3: the release stands; the predecessor's entries are gone.
+    let rc = open_with_partition(&uris, Some(PARTITION)).await;
+    let vc = &rc.volumes[0];
+    assert_eq!(
+        vc.block_ref_count(tag, 7000).await.unwrap(),
+        0,
+        "the acked release survives the crash — a predecessor incarnation's `+ref` at a higher \
+         ring position must never out-vote it"
+    );
+    assert_eq!(digest_backend(vc).await.unwrap(), live);
+    assert_eq!(
+        vc.free_extents(),
+        free_live,
+        "no predecessor `free` was folded into the grant and returned"
+    );
+    for v in &rc.volumes {
+        v.shutdown().await.unwrap();
+    }
+}
+
 /// Review round 1, Issue 3 (bug): the §4.4 pt 4 rollback of a FAILED
 /// window write journals its compensating records through the
 /// checkpoint-class reserve — of the ring the failed window used, never

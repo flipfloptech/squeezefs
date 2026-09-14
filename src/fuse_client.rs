@@ -13534,6 +13534,13 @@ impl SqueezefsFilesystem {
                     "appender_flush_ceiling_overruns".into(),
                     appender(&|s| s.flush_ceiling_overruns),
                 );
+                // The bound the audit compares against — the checkpoint
+                // LANDING ceiling of the cadence in force (1,100 ms at the
+                // shipped 50 ms flush) — published so the docs cannot drift.
+                metrics.insert(
+                    "appender_flush_ceiling_ms".into(),
+                    appender(&|s| s.flush_ceiling_ms),
+                );
                 // §4.6 pt 2 per region: cycles a declared region's full
                 // ring made due (its parked committer drains at the next
                 // tick, never the ceiling); 0 unpartitioned.
@@ -13550,6 +13557,12 @@ impl SqueezefsFilesystem {
                 metrics.insert(
                     "meta_kv_replay_lease_violations".into(),
                     load(&meta_kv::META_KV_REPLAY_LEASE_VIOLATIONS),
+                );
+                // DUR-4 law 2's raise — the failed-cycle-retry shape; 0 on
+                // a healthy mount across clean unmount/remount cycles.
+                metrics.insert(
+                    "meta_kv_bitmap_generation_raises".into(),
+                    load(&meta_kv::META_KV_BITMAP_GENERATION_RAISES),
                 );
                 metrics.insert(
                     "meta_kv_replay_extent_violations".into(),

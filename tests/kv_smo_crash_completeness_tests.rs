@@ -842,6 +842,151 @@ async fn mount_side_replayed_free_parks_until_post_mount_checkpoint() {
     assert_eq!(fill.mode & libc::S_IFMT, libc::S_IFREG);
 }
 
+/// The heap extent of a node address on `kv`'s volume.
+fn extent_of(kv: &KvMetaBackend, addr: u64) -> u64 {
+    let sb = kv.superblock();
+    (addr - sb.heap.start) / u64::from(sb.node_size)
+}
+
+/// Option A's mount gate has a hole the root-swap carve-out opens
+/// (design-smo-replay-currency §2 C′: "root-swap SMOs journal no pointer
+/// records … a mount whose ledger names the OLD root replays through the
+/// old structure by design … the old extents stay readable only because
+/// A parks the in-window frees"). Parking is not enough: a root swap
+/// that ran OUTSIDE a checkpoint cycle — the D4 compaction nudge here,
+/// the merge sweep's root collapse and a threshold-maintenance root swap
+/// alike — followed by a kill before the next ledger record leaves the
+/// ledger naming the PREDECESSOR. The mount replays through it, so the
+/// predecessor is the LIVE root again — and the replayed `free(old)`
+/// parks, the bring-up cover's tail passes its gate, and the live root's
+/// bit is CLEARED. The next claim prefers the lowest free extent, which
+/// is that root: the next node image overwrites the INODES tree's root.
+///
+/// The contract: a replayed in-window free whose extent a MOUNTED ROOT
+/// names is DROPPED (the freeing swap never published; the successor
+/// image is the leak class — fsck C13 on a forest grant, a bounded leak
+/// on a flat volume), counted on `meta_kv_replay_root_frees_dropped`.
+/// The live root's extent stays allocated through the cover and every
+/// later cycle, and a create storm + remount reads every acked record.
+///
+/// RED on the shipped tree: `is_allocated(live root) == false` right
+/// after the reopen (the probe read `pending 0, old_alloc false` with the
+/// ledger's root at extent 0).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_unnamed_root_swaps_replayed_free_never_releases_the_live_root() {
+    struct Cleanup;
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            std::env::remove_var("SQUEEZEFS_META_FLUSH_INTERVAL_MS");
+        }
+    }
+    std::env::set_var("SQUEEZEFS_META_FLUSH_INTERVAL_MS", "60000");
+    let _cleanup = Cleanup;
+
+    let (routed, kv, file) = sandbox().await;
+    let fill_ino = kv
+        .create(1, "fillfile", libc::S_IFREG | 0o644, 0, 0)
+        .await
+        .expect("fill create acked")
+        .ino;
+    let keep_ino = kv
+        .create(1, "keeper", libc::S_IFREG | 0o640, 0, 0)
+        .await
+        .expect("keeper create acked")
+        .ino;
+    // Dead records on the depth-1 INODES root, checkpointed (durable in
+    // the node log, below the tail, nothing dirty).
+    for j in 0..8u32 {
+        let mode = libc::S_IFREG | if j.is_multiple_of(2) { 0o640 } else { 0o600 };
+        kv.setattr(fill_ino, Some(mode), None, None, None, None, None, None)
+            .await
+            .expect("setattr acked");
+    }
+    kv.checkpoint_now().await.expect("dead-record checkpoint");
+    kv.checkpoint_now().await.expect("quiesce");
+    assert_eq!(kv.pending_free_extents(), 0, "quiesced before the window");
+
+    // The D4 nudge: a FORCED compaction of the root leaf = a root swap
+    // with no ledger record after it (the shipped defrag arm's shape).
+    let inodes = kv.all_trees()[0].clone();
+    let old_root = inodes.root();
+    let compacted = kv
+        .defrag_compact_nodes(&[(TREE_INODES, old_root.addr)])
+        .await
+        .expect("forced compaction");
+    assert_eq!(compacted, 1, "the nudge compacts the root leaf");
+    let new_root = inodes.root();
+    assert_ne!(old_root.addr, new_root.addr, "a root swap happened");
+    assert_eq!(kv.pending_free_extents(), 1, "the old root's free is parked");
+    let old_ext = extent_of(&kv, old_root.addr);
+    let new_ext = extent_of(&kv, new_root.addr);
+    let dropped_before = squeezefs::meta_backend::kv::META_KV_REPLAY_ROOT_FREES_DROPPED
+        .load(Ordering::Relaxed);
+
+    // Kill before any ledger record names the new root.
+    drop(routed);
+    drop(kv);
+    let kv2 = reopen(file.path()).await;
+    let inodes2 = kv2.all_trees()[0].clone();
+    let live = inodes2.root();
+    assert_eq!(
+        extent_of(&kv2, live.addr),
+        old_ext,
+        "the ledger names the predecessor: the mount replays through it"
+    );
+    assert!(
+        kv2.allocator().is_allocated(old_ext),
+        "the LIVE root's extent {old_ext} must stay allocated across the bring-up cover — \
+         the replayed free of a mounted root is the unpublished swap's, and dropping it is \
+         the only sound fold (releasing it hands the INODES root to the next claim)"
+    );
+    assert_eq!(
+        squeezefs::meta_backend::kv::META_KV_REPLAY_ROOT_FREES_DROPPED.load(Ordering::Relaxed),
+        dropped_before + 1,
+        "exactly one replayed root free dropped (meta_kv_replay_root_frees_dropped)"
+    );
+    // The unpublished successor is the bounded leak class on a flat
+    // volume (fsck C13 reclaims it on a forest grant): allocated, unrouted.
+    assert!(kv2.allocator().is_allocated(new_ext));
+
+    // Two more cycles plus a claim storm: the live root is never handed
+    // out, and every acked record survives a further remount.
+    kv2.checkpoint_now().await.expect("cycle 1");
+    kv2.checkpoint_now().await.expect("cycle 2");
+    let mut acked: Vec<String> = Vec::new();
+    for round in 0..6 {
+        for i in 0..400 {
+            let name = format!("s{round:02}_{i:04}");
+            kv2.create(1, &name, libc::S_IFREG | 0o644, 0, 0)
+                .await
+                .expect("create acked");
+            acked.push(name);
+        }
+        kv2.checkpoint_now().await.expect("storm checkpoint");
+    }
+    drop(kv2);
+    let kv3 = reopen(file.path()).await;
+    let keeper = kv3.getattr(keep_ino).await.expect("keeper inode present");
+    assert_eq!(keeper.mode, libc::S_IFREG | 0o640, "keeper mode intact");
+    let routed3 = Arc::new(RoutedMetaBackend::new(vec![kv3.clone()]));
+    let lost: Vec<&String> = {
+        let mut v = Vec::new();
+        for name in &acked {
+            if routed3.lookup(1, name).await.is_err() {
+                v.push(name);
+            }
+        }
+        v
+    };
+    assert!(
+        lost.is_empty(),
+        "{} of {} acked creates vanished after the root-swap crash window: {:?} …",
+        lost.len(),
+        acked.len(),
+        &lost[..lost.len().min(12)]
+    );
+}
+
 /// The §4.7 at-cap law, made mechanism (PR 4 row, review Issue 9 clauses
 /// a+b+c): "pressure forces a checkpoint rather than unsafe reuse".
 /// Today `free_pending` at cap errors POST-swap (`smo_replace` step 3

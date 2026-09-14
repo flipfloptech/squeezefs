@@ -31,9 +31,11 @@ use squeezefs::meta_backend::kv::builder::{
 use squeezefs::meta_backend::kv::slot_state::{
     decode_extent_grant_key, extent_grant_key, ExtentGrantRecord, EXTENT_GRANT_KEY_LEN,
 };
+use squeezefs::meta_backend::kv::tree::KvTree;
 use squeezefs::meta_backend::kv::{
     META_KV_NODE_COMPACTIONS, META_KV_NODE_SPLITS, META_KV_REPLAY_EXTENT_VIOLATIONS,
     META_KV_REPLAY_KEY_VIOLATIONS, META_KV_REPLAY_LEASE_VIOLATIONS,
+    META_KV_REPLAY_ROOT_FREES_DROPPED,
 };
 use squeezefs::meta_backend::{
     guest_local_ino, open_routed_meta_set, open_volume_for_mount, plan_meta_slot_set, Metadata,
@@ -941,6 +943,354 @@ async fn a_join_storm_of_32_completes_inside_the_bound_and_grows_the_directory_c
     );
     for v in &routed.volumes {
         v.shutdown().await.unwrap();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// §5.8.5 — fsck C13, the orphan image extent: an extent claimed inside a
+// grant that no slot-tree root reaches and no pending-free names.
+// ---------------------------------------------------------------------------
+
+/// The heap extent of a node address on `kv`'s volume.
+fn extent_of(kv: &KvMetaBackend, addr: u64) -> u64 {
+    let sb = kv.superblock();
+    (addr - sb.heap.start) / u64::from(sb.node_size)
+}
+
+/// The slot tree of forest `slot` (appender 1's is slot 4 under the
+/// declared partition).
+fn slot_tree(kv: &KvMetaBackend, slot: u32) -> Arc<KvTree> {
+    kv.all_trees()
+        .into_iter()
+        .find(|t| t.forest_slot() == Some(slot))
+        .expect("the slot tree exists once a record landed in it")
+}
+
+/// Drive the crash window C13 exists for (design §5.3.4 "root swap done
+/// in RAM, page not yet naming the new root"): a quiesced slot tree, a
+/// FORCED root-leaf compaction (the D4 nudge — a root swap outside any
+/// checkpoint cycle, its `alloc(new)` + `free(old)` in appender 1's ring,
+/// no page naming the successor), then a crash-equivalent drop. Returns
+/// `(uris, guest owner, old root extent, successor extent)`.
+async fn crash_after_an_unpublished_root_swap(
+    dir: &std::path::Path,
+) -> (Vec<String>, u64, u64, u64) {
+    let uris = vec![format_stamped_member(dir, "meta0").await];
+    let tag = volume_tag("vol-0011223344556677");
+    let guest_owner = guest_local_ino(3, 79); // forest slot 4 — appender 1's
+    std::env::set_var("SQUEEZEFS_META_FLUSH_INTERVAL_MS", "60000");
+    let ra = open_with_partition(&uris, Some(PARTITION)).await;
+    std::env::remove_var("SQUEEZEFS_META_FLUSH_INTERVAL_MS");
+    let va = Arc::clone(&ra.volumes[0]);
+    for i in 0..4u64 {
+        va.commit_block_refs(guest_owner, &refs(tag, guest_owner, i * 100, 40))
+            .await
+            .unwrap();
+    }
+    va.checkpoint_now().await.unwrap();
+    va.checkpoint_now().await.unwrap();
+    let tree = slot_tree(&va, 4);
+    let old_root = tree.root();
+    let compacted = va
+        .defrag_compact_nodes(&[(0, old_root.addr)])
+        .await
+        .expect("forced compaction of appender 1's root leaf");
+    assert_eq!(compacted, 1, "the nudge compacts the slot tree's root");
+    let new_root = tree.root();
+    assert_ne!(old_root.addr, new_root.addr, "a root swap happened");
+    let old_ext = extent_of(&va, old_root.addr);
+    let new_ext = extent_of(&va, new_root.addr);
+    let s = stats(&va);
+    assert!(
+        s.regions[1].grant_claimed >= 1 && s.regions[1].grant_pending == 1,
+        "the successor is claimed and the predecessor parked on appender 1's tail: {:?}",
+        s.regions[1]
+    );
+    // A LIVE in-window image is never a finding: the RAM root reaches the
+    // successor, the predecessor is a pending-free.
+    assert!(
+        va.c13_orphan_image_extents().await.unwrap().is_empty(),
+        "the live swap is in-window and covered by the coverage gate — no finding"
+    );
+    drop(va);
+    drop(ra);
+    (uris, guest_owner, old_ext, new_ext)
+}
+
+/// The pin: crash after `alloc(extent)` landed but before the root swap
+/// publishes ⇒ C13 finds EXACTLY that extent (the successor image); the
+/// predecessor — the page's root, live again after the replay — keeps
+/// its bit (its replayed free is dropped, `meta_kv_replay_root_frees_
+/// dropped`); repair returns the orphan to the bitmap through the
+/// appender's own ring (a `free` gated on its tail, the ordinary SMO
+/// retirement shape — the cadence's `ReturnExtents` clears the bit and
+/// rewrites the grant record), the closure law holds throughout, a second
+/// sweep finds nothing, and the remount reads every acked record.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn c13_finds_exactly_the_unpublished_root_swaps_successor_and_repair_returns_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    let tag = volume_tag("vol-0011223344556677");
+    let dropped_before = META_KV_REPLAY_ROOT_FREES_DROPPED.load(Ordering::Relaxed);
+    let (uris, guest_owner, old_ext, new_ext) =
+        crash_after_an_unpublished_root_swap(dir.path()).await;
+
+    std::env::set_var("SQUEEZEFS_META_FLUSH_INTERVAL_MS", "60000");
+    let ra = open_with_partition(&uris, Some(PARTITION)).await;
+    std::env::remove_var("SQUEEZEFS_META_FLUSH_INTERVAL_MS");
+    let va = Arc::clone(&ra.volumes[0]);
+    assert_eq!(META_KV_REPLAY_LEASE_VIOLATIONS.load(Ordering::Relaxed), 0);
+    assert_eq!(META_KV_REPLAY_EXTENT_VIOLATIONS.load(Ordering::Relaxed), 0);
+    let tree = slot_tree(&va, 4);
+    assert_eq!(
+        extent_of(&va, tree.root().addr),
+        old_ext,
+        "the page names the predecessor: the mount replays through it"
+    );
+    assert!(
+        va.allocator().is_allocated(old_ext),
+        "the LIVE root's extent stays allocated: its replayed free is the unpublished swap's"
+    );
+    assert_eq!(
+        META_KV_REPLAY_ROOT_FREES_DROPPED.load(Ordering::Relaxed),
+        dropped_before + 1,
+        "exactly one replayed root free dropped"
+    );
+    let orphans = va.c13_orphan_image_extents().await.unwrap();
+    assert_eq!(
+        orphans.iter().map(|o| (o.appender, o.extent)).collect::<Vec<_>>(),
+        vec![(1u32, new_ext)],
+        "C13 finds exactly the unpublished successor image"
+    );
+    let s = stats(&va);
+    assert_grant_closure(&s);
+    assert!(
+        va.extent_grant_record(1).await.unwrap().contains(new_ext),
+        "the orphan is still inside appender 1's grant"
+    );
+
+    // Repair: return it to the bitmap.
+    assert!(va.c13_return_orphan(1, new_ext).await.unwrap());
+    assert!(
+        va.c13_orphan_image_extents().await.unwrap().is_empty(),
+        "repaired: the extent is a pending-free now, no longer a finding"
+    );
+    assert!(
+        !va.c13_return_orphan(1, new_ext).await.unwrap(),
+        "a second repair of the same extent is a no-op (verify-before-repair)"
+    );
+    let mut cycles = 0;
+    while va.allocator().is_allocated(new_ext) && cycles < 6 {
+        va.checkpoint_now().await.unwrap();
+        cycles += 1;
+    }
+    assert!(
+        !va.allocator().is_allocated(new_ext),
+        "the cadence returned the orphan to the bitmap within {cycles} cycles"
+    );
+    assert!(
+        !va.extent_grant_record(1).await.unwrap().contains(new_ext),
+        "the grant record no longer names it"
+    );
+    let s = stats(&va);
+    assert!(s.extent_returns >= 1, "{s:?}");
+    assert_grant_closure(&s);
+    assert!(va.allocator().is_allocated(old_ext), "the live root is untouched");
+    assert!(va.block_ref_count(tag, 0).await.unwrap() >= 1);
+    let live = digest_backend(&va).await.unwrap();
+    for v in &ra.volumes {
+        v.shutdown().await.unwrap();
+    }
+    drop(va);
+    drop(ra);
+    let ra = open_with_partition(&uris, Some(PARTITION)).await;
+    let va = &ra.volumes[0];
+    assert_eq!(META_KV_REPLAY_EXTENT_VIOLATIONS.load(Ordering::Relaxed), 0);
+    assert_eq!(digest_backend(va).await.unwrap(), live);
+    assert!(va.c13_orphan_image_extents().await.unwrap().is_empty());
+    assert!(!va.allocator().is_allocated(new_ext));
+    assert_grant_closure(&stats(va));
+    let _ = guest_owner;
+    for v in &ra.volumes {
+        v.shutdown().await.unwrap();
+    }
+}
+
+/// The class through fsck's ladder: the census nominates the suspect,
+/// the re-check under the SMO serialization confirms it, the report
+/// carries `C13` with its identity, the dry run plans
+/// `return-orphan-image-extent` and mutates nothing, `--apply` repairs it
+/// once (`fsck_repair_classC13` +1), and the re-fsck is clean. A flat
+/// volume's fsck never produces the class.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn fsck_c13_reports_plans_and_repairs_the_orphan_image_extent() {
+    use squeezefs::fsck::{repair, run, FsckOptions, RepairOptions};
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    let (uris, _guest_owner, _old_ext, new_ext) =
+        crash_after_an_unpublished_root_swap(dir.path()).await;
+
+    std::env::set_var("SQUEEZEFS_META_FLUSH_INTERVAL_MS", "60000");
+    let ra = open_with_partition(&uris, Some(PARTITION)).await;
+    std::env::remove_var("SQUEEZEFS_META_FLUSH_INTERVAL_MS");
+    let ctx = fsck_ctx(dir.path(), Arc::clone(&ra)).await;
+    let mut opts = FsckOptions::offline();
+    opts.settle = std::time::Duration::from_millis(10);
+    let report = run(&ctx, &opts).await.expect("fsck runs");
+    let c13: Vec<_> = report.findings.iter().filter(|f| f.class == "C13").collect();
+    assert_eq!(c13.len(), 1, "one C13 finding: {:?}", report.findings);
+    assert!(
+        c13[0].object.contains(&format!("extent{new_ext}")) && c13[0].object.contains("appender1"),
+        "the finding names the appender and the extent: {:?}",
+        c13[0]
+    );
+    assert!(
+        report.findings.iter().all(|f| f.class == "C13"),
+        "nothing else is wrong with the volume: {:?}",
+        report.findings
+    );
+    let dry = repair(
+        &ctx,
+        &report,
+        &RepairOptions {
+            apply: false,
+            quarantine_dir: None,
+            multi_owner: false,
+        },
+    )
+    .await
+    .expect("dry run");
+    assert_eq!(dry.planned.len(), 1, "{dry:?}");
+    assert_eq!(dry.planned[0].action, "return-orphan-image-extent");
+    assert_eq!(dry.counters.applied, 0);
+    assert!(
+        ra.volumes[0].allocator().is_allocated(new_ext),
+        "the dry run mutated nothing"
+    );
+    let before = squeezefs::fuse_client::METRICS
+        .fsck_repair_class_c13
+        .load(Ordering::Relaxed);
+    let applied = repair(
+        &ctx,
+        &report,
+        &RepairOptions {
+            apply: true,
+            quarantine_dir: None,
+            multi_owner: false,
+        },
+    )
+    .await
+    .expect("apply");
+    assert_eq!(applied.counters.applied, 1, "{applied:?}");
+    assert_eq!(applied.counters.refused, 0, "{applied:?}");
+    assert_eq!(
+        squeezefs::fuse_client::METRICS
+            .fsck_repair_class_c13
+            .load(Ordering::Relaxed),
+        before + 1
+    );
+    let va = &ra.volumes[0];
+    let mut cycles = 0;
+    while va.allocator().is_allocated(new_ext) && cycles < 6 {
+        va.checkpoint_now().await.unwrap();
+        cycles += 1;
+    }
+    assert!(!va.allocator().is_allocated(new_ext), "returned to the bitmap");
+    let again = run(&ctx, &opts).await.expect("re-fsck");
+    assert!(
+        again.findings.is_empty(),
+        "the repaired volume is clean: {:?}",
+        again.findings
+    );
+    // Re-applying the stale report refuses (verify-before-repair).
+    let stale = repair(
+        &ctx,
+        &report,
+        &RepairOptions {
+            apply: true,
+            quarantine_dir: None,
+            multi_owner: false,
+        },
+    )
+    .await
+    .expect("stale apply");
+    assert_eq!(stale.counters.applied, 0, "{stale:?}");
+    assert_eq!(stale.counters.refused, 1, "{stale:?}");
+    for v in &ra.volumes {
+        v.shutdown().await.unwrap();
+    }
+}
+
+/// A mount-shaped fsck context over an already-open routed set: one
+/// file-backed data volume, the router registered the way a mount does.
+async fn fsck_ctx(dir: &std::path::Path, meta: Arc<RoutedMetaBackend>) -> squeezefs::fsck::FsckCtx {
+    use squeezefs::block_allocator::BlockAllocator;
+    use squeezefs::cache::TieredCache;
+    use squeezefs::dlm::DlmClient;
+    use squeezefs::nvme_dev::NvmeBlockDev;
+    use squeezefs::routing::DataRouter;
+    const BLOCK: u64 = 4096;
+    let oss = dir.join("oss0");
+    std::fs::File::create(&oss)
+        .unwrap()
+        .set_len(64 * 1024 * 1024)
+        .unwrap();
+    let cfg = squeezefs::FormatConfig {
+        name: "squeezefs".to_string(),
+        block_size: BLOCK,
+        capacity: 1 << 30,
+        inodes: 1_000_000,
+        compression: "none".to_string(),
+        encrypt_algo: "none".to_string(),
+        encrypt_key: None,
+        encrypt_key_ref: None,
+        mem_cache_size: None,
+        disk_cache_size: None,
+        disk_cache_paths: None,
+        data_lv: Some(vec![oss.display().to_string()]),
+        data_volumes: None,
+        read_cache_size: None,
+        write_cache_size: None,
+        read_mem_cache_size: None,
+        write_mem_cache_size: None,
+        dismount_wait: None,
+        upload_delay: None,
+        fuse_io_uring_sqpoll_idle_ms: None,
+        meta_routing_width: None,
+        meta_slot_runs: None,
+        meta_volumes: None,
+    };
+    std::env::set_var("SQUEEZEFS_DEFAULT_BLOCK_SIZE", BLOCK.to_string());
+    let records = cfg.resolved_data_volumes();
+    let dlm = DlmClient::new().unwrap();
+    let first = &records[0];
+    let dev = Arc::new(NvmeBlockDev::new(&first.backing_dev));
+    let alloc = Arc::new(BlockAllocator::new(&first.id).await.unwrap());
+    let staging = dir.join("staging");
+    std::fs::create_dir_all(&staging).unwrap();
+    let cache = TieredCache::new(
+        vec![staging.clone()],
+        Some("16MB"),
+        Some("16MB"),
+        Some("32MB"),
+        Some("32MB"),
+        alloc.clone(),
+        dev.clone(),
+        None,
+    )
+    .await
+    .unwrap();
+    let router = DataRouter::new(dlm, cache, alloc, dev);
+    for rec in &records {
+        router.backend_router.register_backend(rec).await.unwrap();
+    }
+    router.backend_router.set_volume_records(records.clone());
+    router.set_meta_backend(meta.clone());
+    squeezefs::fsck::FsckCtx {
+        meta,
+        router,
+        staging_dirs: vec![staging],
+        expected_generation: None,
     }
 }
 

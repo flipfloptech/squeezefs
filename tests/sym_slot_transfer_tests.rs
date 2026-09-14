@@ -2281,3 +2281,106 @@ async fn a_same_key_write_after_a_handover_to_a_quieter_ring_is_the_newest_value
     assert_eq!(digest_backend(&vol).await.unwrap(), digest);
     shutdown(&routed).await;
 }
+
+/// **Issue 3 (round 1): a stale `ReleaseSlot` never rewrites tree 0.**
+/// The durable-witness pre-check let an `Unleased`-at-another-`g` release
+/// PROCEED — tree 0 was rewritten with the caller's stale words and lower
+/// `g` before the table refused — so a wire holder's retried release
+/// after a re-lease rolled the slot's record back (the old root served,
+/// the cursor floor lost). The verdict now precedes the write: the g = 1
+/// release replayed after the g = 2 release is REFUSED, counted on
+/// `manager_verb_refusals`, and tree 0 keeps the g = 2 record verbatim.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_stale_release_is_refused_before_tree0_is_written() {
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    let uris = vec![format_stamped_member(dir.path(), "meta0").await];
+    let routed = open_under(&uris, &Knobs::armed()).await;
+    let vol = Arc::clone(&routed.volumes[0]);
+    let tag = volume_tag("vol-000000000000000c");
+    let slot: ForestSlot = 6; // a rotor slot of region 0
+    let owner = ino_in_slot(slot, 4);
+    vol.commit_block_refs(owner, &refs(tag, owner, 0, 2))
+        .await
+        .unwrap();
+    // Release at g = 1 (the words as of now), re-grant (g = 2), write
+    // more, release at g = 2 (newer root, higher cursor floor).
+    vol.release_slot_handover(0, slot).await.unwrap();
+    let states = tree0_states(&vol).await;
+    let Some((
+        _,
+        SlotState::Unleased {
+            g: 1, root: root1, ..
+        },
+    )) = states.iter().find(|(s, _)| *s == slot)
+    else {
+        panic!("{states:?}");
+    };
+    let root1 = *root1;
+    let g2 = vol
+        .manager_acquire_slots(0, 0, &[slot])
+        .await
+        .unwrap()
+        .pop()
+        .unwrap();
+    assert_eq!(g2.g, 2);
+    vol.commit_block_refs(owner, &refs(tag, owner, 10, 3))
+        .await
+        .unwrap();
+    vol.release_slot_handover(0, slot).await.unwrap();
+    let states = tree0_states(&vol).await;
+    let Some((_, before @ SlotState::Unleased { g: 2, .. })) =
+        states.iter().find(|(s, _)| *s == slot)
+    else {
+        panic!("{states:?}");
+    };
+    let before = before.clone();
+    let refusals_before = vol.appender_stats().unwrap().manager_verb_refusals;
+    // The stale replay: the g = 1 release, with the g = 1 words.
+    let stale = squeezefs::slot_lease_core::SlotWords {
+        root: (root1.addr, root1.seq),
+        cursor: 0,
+        extents: 1,
+        seq_floor: 0,
+    };
+    let e = vol
+        .manager_release_slot(0, slot, stale, 1, Vec::new())
+        .await
+        .expect_err("a release at a stale g is refused");
+    assert!(e.to_string().contains("refused"), "{e}");
+    assert_eq!(
+        vol.appender_stats().unwrap().manager_verb_refusals,
+        refusals_before + 1,
+        "the witness contradicted the caller"
+    );
+    let states = tree0_states(&vol).await;
+    assert_eq!(
+        states.iter().find(|(s, _)| *s == slot).map(|(_, st)| st),
+        Some(&before),
+        "tree 0 is untouched by the stale release"
+    );
+    // And the true replay of the g = 2 release is `already`, no write.
+    let entries_before = vol.journal_ring().written_entries();
+    let SlotState::Unleased {
+        root,
+        cursor,
+        slot_tree_extents,
+        seq_floor,
+        ..
+    } = &before
+    else {
+        unreachable!()
+    };
+    let same = squeezefs::slot_lease_core::SlotWords {
+        root: (root.addr, root.seq),
+        cursor: *cursor,
+        extents: *slot_tree_extents,
+        seq_floor: *seq_floor,
+    };
+    assert!(vol
+        .manager_release_slot(0, slot, same, 2, Vec::new())
+        .await
+        .unwrap());
+    assert_eq!(vol.journal_ring().written_entries(), entries_before);
+    shutdown(&routed).await;
+}

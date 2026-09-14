@@ -4,7 +4,7 @@
 //! measured with a peak-allocation gauge (the `job_wire_bounds_tests`
 //! instrument): a decoded `ReturnExtents` frame's integers must never
 //! buy an allocation proportional to `frame runs × record extents`. Before
-//! the fix `intersect_runs_with_record` emitted one extent per (frame run
+//! the fix the record intersection emitted one extent per (frame run
 //! × record extent) BEFORE its dedup — ~250K copies of one run over a
 //! 4,096-extent record was an 8 GiB list on the node holding the manager
 //! lease. Now the frame's runs are COALESCED first (bounded by the
@@ -13,7 +13,7 @@
 //! coalesce so a duplicated run is one extent, not two.
 
 use squeezefs::meta_backend::kv::appender::{
-    coalesce_runs, intersect_runs_with_record, runs_extent_count, GrantRun,
+    coalesce_runs, intersect_coalesced_with_record, runs_extent_count, GrantRun,
 };
 use squeezefs::meta_backend::kv::slot_state::ExtentGrantRecord;
 use std::alloc::{GlobalAlloc, Layout, System};
@@ -84,7 +84,8 @@ fn a_duplicated_return_frame_allocates_frame_plus_record_never_their_product() {
             len: 1 << 20,
         })
         .collect();
-    let (inside, peak) = peak_alloc(|| intersect_runs_with_record(&runs, &record));
+    let (inside, peak) =
+        peak_alloc(|| intersect_coalesced_with_record(&coalesce_runs(&runs), &record));
     assert_eq!(
         inside.len() as u64,
         RECORD_EXTENTS,
@@ -135,7 +136,7 @@ fn duplicated_and_overlapping_runs_count_once_after_the_coalesce() {
     assert_eq!(runs_extent_count(&runs), 20, "the raw sum double-counts");
     let record = ExtentGrantRecord::from_extents([11u64, 12, 13, 30, 31]);
     assert_eq!(
-        intersect_runs_with_record(&runs, &record),
+        intersect_coalesced_with_record(&coalesce_runs(&runs), &record),
         vec![11, 12, 13, 30]
     );
 }

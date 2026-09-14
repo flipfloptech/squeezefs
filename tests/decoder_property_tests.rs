@@ -791,7 +791,7 @@ proptest! {
         cap in 8u64..(1 << 32),
     ) {
         use squeezefs::meta_backend::kv::appender::{
-            clamp_grant_want, coalesce_runs, intersect_runs_with_record, runs_extent_count,
+            clamp_grant_want, coalesce_runs, intersect_coalesced_with_record, runs_extent_count,
             validate_return_runs, GrantRun,
         };
         use squeezefs::meta_backend::kv::slot_state::ExtentGrantRecord;
@@ -829,7 +829,7 @@ proptest! {
             prop_assert_eq!(runs_extent_count(&coalesced), distinct.len() as u64);
         }
         let record = ExtentGrantRecord::from_extents(record_seed.iter().map(|e| *e % total));
-        let inside = intersect_runs_with_record(&runs, &record);
+        let inside = intersect_coalesced_with_record(&coalesce_runs(&runs), &record);
         prop_assert!(inside.len() as u64 <= record.len());
         prop_assert!(inside.iter().all(|e| record.contains(*e)));
         prop_assert!(inside.windows(2).all(|w| w[0] < w[1]), "strictly ascending — no dedup step");

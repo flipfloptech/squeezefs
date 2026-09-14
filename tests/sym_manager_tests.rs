@@ -2219,6 +2219,137 @@ async fn a_leave_over_an_uncovered_window_keeps_the_page_live_for_the_next_open(
 }
 
 // ---------------------------------------------------------------------------
+// Review round 3 — Issue 21: the final tick waits for EVERY ring's head.
+// ---------------------------------------------------------------------------
+
+/// Issue 21: a declared region's window IN FLIGHT at the final tick (its
+/// committer passed the gate; its ring write is on a slow device) is
+/// WAITED for — the same head-stability wait ring 0 gets — so the
+/// fixpoint covers it and the leave is clean (the guarantee:
+/// `appender_self_recoveries == 0` at the next open), instead of burning
+/// the fixpoint bound against an uncovered region and landing on the belt
+/// (page `Live`, own-residue recovery — sound, but the guarantee missed).
+///
+/// The schedule that reaches the shape: the shutdown's own writer-claim
+/// removal (ring 0) and the region commit ride ONE conveyor batch (the
+/// pass parked before its drain), so the ring-0 group is handed off
+/// FIRST and acks — the shutdown proceeds to its flag and the final tick
+/// — while the region group's ring write is PARKED on the device
+/// (`arm_write_stall`); the write is released a second later, long after
+/// the pre-fix fixpoint (fast cycles on tmpfs) had burnt its 16 cycles.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_region_window_in_flight_at_shutdown_is_waited_for_and_the_leave_is_clean() {
+    use squeezefs::meta_backend::kv::backend::{
+        test_conveyor_hold_release, TEST_CONVEYOR_HOLD_PRE_DRAIN, TEST_CONVEYOR_HOLD_STAGE,
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    let uris = vec![format_stamped_member(dir.path(), "meta0").await];
+    let path = std::path::PathBuf::from(&uris[0]);
+    let tag = volume_tag("vol-0011223344556677");
+    let guest_owner = guest_local_ino(3, 94);
+    std::env::set_var("SQUEEZEFS_META_FLUSH_INTERVAL_MS", "60000");
+    let routed = open_with_partition(&uris, Some(PARTITION)).await;
+    std::env::remove_var("SQUEEZEFS_META_FLUSH_INTERVAL_MS");
+    let vol = Arc::clone(&routed.volumes[0]);
+    vol.commit_block_refs(guest_owner, &refs(tag, guest_owner, 0, 40))
+        .await
+        .unwrap();
+    vol.checkpoint_now().await.unwrap();
+    struct Cleanup(std::path::PathBuf);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            TEST_CONVEYOR_HOLD_STAGE.store(0, Ordering::SeqCst);
+            test_conveyor_hold_release();
+            squeezefs::uring_fs::release_write_stall(&self.0);
+        }
+    }
+    let _cleanup = Cleanup(path.clone());
+    // Park appender 1's NEXT ring write (the window the region commit
+    // below reserves), and the pass before its drain.
+    let ring1 = vol.appenders_public().unwrap().regions[1].ring();
+    let head = ring1.core().head();
+    let mut arrived =
+        squeezefs::uring_fs::arm_write_stall(&path, ring1.physical_offset_of(head), 8);
+    TEST_CONVEYOR_HOLD_STAGE.store(TEST_CONVEYOR_HOLD_PRE_DRAIN, Ordering::SeqCst);
+    // The shutdown enqueues its writer-claim removal first …
+    let shutdown = {
+        let routed = Arc::clone(&routed);
+        tokio::spawn(async move {
+            for v in &routed.volumes {
+                v.shutdown().await.unwrap();
+            }
+        })
+    };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while vol.conveyor_pending_len() < 1 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the claim removal enqueues"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+    }
+    // … then the region commit, behind it in the same batch.
+    let committer = {
+        let vol = Arc::clone(&vol);
+        tokio::spawn(async move {
+            vol.commit_block_refs(guest_owner, &refs(tag, guest_owner, 5000, 40))
+                .await
+        })
+    };
+    while vol.conveyor_pending_len() < 2 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the region commit enqueues"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+    }
+    TEST_CONVEYOR_HOLD_STAGE.store(0, Ordering::SeqCst);
+    test_conveyor_hold_release();
+    tokio::time::timeout(std::time::Duration::from_secs(20), arrived.recv())
+        .await
+        .expect("the region window's ring write reaches the stall")
+        .expect("stall arrival channel");
+    // The ring-0 group acked, the shutdown is at its final tick, the
+    // region window is in flight: a second on the parked device.
+    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    squeezefs::uring_fs::release_write_stall(&path);
+    committer.await.unwrap().expect("the in-flight commit acks");
+    tokio::time::timeout(std::time::Duration::from_secs(60), shutdown)
+        .await
+        .expect("shutdown completes once the window lands")
+        .unwrap();
+    drop(vol);
+    drop(routed);
+    let sb = squeezefs::meta_backend::kv::backend::KvMetaBackend::open_probe(&path)
+        .await
+        .unwrap()
+        .superblock()
+        .clone();
+    let page = read_directory(&path, &sb).await.unwrap()[1]
+        .page
+        .clone()
+        .expect("appender 1 has a page");
+    assert_eq!(
+        page.state,
+        AppenderState::Free,
+        "the final tick waited for the region's window: the leave was CLEAN (not the belt)"
+    );
+    let rb = open_with_partition(&uris, Some(PARTITION)).await;
+    let vb = Arc::clone(&rb.volumes[0]);
+    let s = stats(&vb);
+    assert_eq!(
+        s.self_recoveries, 0,
+        "the guarantee held — no own residue at the next open: {s:?}"
+    );
+    assert_eq!(vb.block_ref_count(tag, 5000).await.unwrap(), 1);
+    assert_eq!(vb.block_ref_count(tag, 0).await.unwrap(), 1);
+    for v in &rb.volumes {
+        v.shutdown().await.unwrap();
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Review round 2 — Issues 17 and 18.
 // ---------------------------------------------------------------------------
 

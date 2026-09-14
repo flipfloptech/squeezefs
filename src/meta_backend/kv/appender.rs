@@ -946,25 +946,37 @@ pub fn coalesce_runs(runs: &[GrantRun]) -> Vec<GrantRun> {
             Some(last) if r.start <= last.start + u64::from(last.len) => {
                 let last_end = last.start + u64::from(last.len);
                 let end = last_end.max(r_end);
-                // A merged run longer than the wire's `u32` splits (the
-                // codec's own bound); `run_len` keeps it exact.
-                match u32::try_from(end - last.start) {
-                    Ok(len) => last.len = len,
-                    Err(_) => {
-                        last.len = u32::MAX;
-                        let next_start = last.start + u64::from(u32::MAX);
-                        if next_start < end {
-                            out.push(GrantRun {
-                                start: next_start,
-                                len: (end - next_start) as u32,
-                            });
-                        }
-                    }
+                // A merged run longer than the wire's `u32` splits into
+                // `u32::MAX`-long pieces — every piece, not one (review
+                // round 3, Issue 20): the pieces are adjacent, so the
+                // output stays a list of ascending runs the merge walk
+                // below reads correctly. Unreachable behind
+                // `validate_return_runs` (every run lies inside the
+                // volume; > 2^32 extents is a 1 EiB metadata volume), so
+                // it is the codec's own bound made exact, not a path.
+                let mut piece_start = last.start;
+                let mut remaining = end - last.start;
+                last.len = u32::try_from(remaining).unwrap_or(u32::MAX);
+                remaining -= u64::from(last.len);
+                piece_start += u64::from(last.len);
+                while remaining > 0 {
+                    let len = u32::try_from(remaining).unwrap_or(u32::MAX);
+                    out.push(GrantRun {
+                        start: piece_start,
+                        len,
+                    });
+                    remaining -= u64::from(len);
+                    piece_start += u64::from(len);
                 }
             }
             _ => out.push(r),
         }
     }
+    debug_assert!(
+        out.windows(2)
+            .all(|w| w[0].start + u64::from(w[0].len) <= w[1].start),
+        "coalesced runs are ascending and non-overlapping"
+    );
     out
 }
 
@@ -974,28 +986,20 @@ pub fn runs_extent_count(runs: &[GrantRun]) -> u64 {
         .fold(0u64, |n, r| n.saturating_add(u64::from(r.len)))
 }
 
-/// The extents `runs` name INSIDE `record`, as a strictly ascending list:
-/// the frame's runs are COALESCED first ([`coalesce_runs`] — disjoint,
-/// ascending), then intersected as intervals with the record's own
-/// disjoint ascending runs, so every emitted extent is distinct by
-/// construction (no dedup, no intermediate list) and the output is
-/// bounded by the RECORD's extent count — the only allocations are the
-/// coalesced runs (≤ the frame's) and the output (≤ the record's).
-pub fn intersect_runs_with_record(
-    runs: &[GrantRun],
-    record: &super::slot_state::ExtentGrantRecord,
-) -> Vec<u64> {
-    intersect_coalesced_with_record(&coalesce_runs(runs), record)
-}
-
-/// [`intersect_runs_with_record`] over runs the caller already coalesced.
+/// The extents `coalesced` — the frame's runs after [`coalesce_runs`]:
+/// disjoint (or adjacent), ascending — name INSIDE `record`, as a
+/// strictly ascending list: a merge walk over the two ascending lists,
+/// so every emitted extent is distinct by construction (no dedup, no
+/// intermediate list) and the output is bounded by the RECORD's extent
+/// count — the return verb's only allocations are the coalesced runs (≤
+/// the frame's) and this output (≤ the record's).
 pub fn intersect_coalesced_with_record(
     coalesced: &[GrantRun],
     record: &super::slot_state::ExtentGrantRecord,
 ) -> Vec<u64> {
     let mut extents: Vec<u64> = Vec::new();
-    // Both lists are disjoint and ascending: a merge walk emits each
-    // intersection once, in order.
+    // Both lists are ascending and non-overlapping: a merge walk emits
+    // each intersection once, in order.
     let (mut i, mut j) = (0usize, 0usize);
     while i < coalesced.len() && j < record.runs.len() {
         let r = coalesced[i];

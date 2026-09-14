@@ -1372,10 +1372,32 @@ async fn tick(
         // on it while earlier windows of its own still hold open
         // reservations would never complete them, and this wait would
         // hold the mutex forever.
+        //
+        // EVERY ring gets this wait (review round 3, Issue 21): a declared
+        // region's in-flight window — its committer passed the gate, its
+        // write is on the device — would otherwise only be OBSERVED by the
+        // all-rings fixpoint below (`min_inflight_start` keeps the region
+        // uncovered, every iteration re-cycles), so a slow region write
+        // could burn the fixpoint bound and land the leave on its belt
+        // (page `Live`, own-residue recovery — sound, but the guarantee
+        // missed) where waiting here lets the guarantee hold.
+        let region_rings: Vec<Arc<super::journal::JournalRing>> = be
+            .appenders()
+            .map(|a| a.regions.iter().skip(1).map(|r| r.ring()).collect())
+            .unwrap_or_default();
         for _ in 0..64 {
-            let head = be.journal_ring().core().head();
-            be.journal_ring().wait_completed_upto(head).await;
-            if be.journal_ring().core().head() == head {
+            let head0 = be.journal_ring().core().head();
+            let heads: Vec<u64> = region_rings.iter().map(|r| r.core().head()).collect();
+            be.journal_ring().wait_completed_upto(head0).await;
+            for (ring, head) in region_rings.iter().zip(&heads) {
+                ring.wait_completed_upto(*head).await;
+            }
+            if be.journal_ring().core().head() == head0
+                && region_rings
+                    .iter()
+                    .zip(&heads)
+                    .all(|(ring, head)| ring.core().head() == *head)
+            {
                 break;
             }
         }

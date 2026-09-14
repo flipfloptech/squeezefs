@@ -25,7 +25,7 @@
 //!   without touching it, the record intersection materializes at most
 //!   the RECORD's extents whatever the runs name, and an explicit
 //!   `ExtentGrant { want }` is clamped to the derivation's cap
-//!   (`appender::{validate_return_runs, intersect_runs_with_record,
+//!   (`appender::{validate_return_runs, coalesce_runs, intersect_coalesced_with_record,
 //!   clamp_grant_want}` — the pure edge `KvMetaBackend::manager_return_runs`
 //!   / `manager_extent_grant_class` run).
 //!
@@ -41,7 +41,7 @@
 use arbitrary::{Arbitrary, Unstructured};
 use libfuzzer_sys::fuzz_target;
 use squeezefs::meta_backend::kv::appender::{
-    clamp_grant_want, coalesce_runs, intersect_runs_with_record, runs_extent_count,
+    clamp_grant_want, coalesce_runs, intersect_coalesced_with_record, runs_extent_count,
     validate_return_runs, GrantRun,
 };
 use squeezefs::meta_backend::kv::slot_state::ExtentGrantRecord;
@@ -94,7 +94,7 @@ fn check_service_edge(call: &ManagerCall, total_extents: u64, record_seed: &[u8]
                 .windows(2)
                 .all(|w| { w[0].start + u64::from(w[0].len) < w[1].start }));
             assert!(runs_extent_count(&coalesced) <= runs_extent_count(&runs));
-            let inside = intersect_runs_with_record(&runs, &record);
+            let inside = intersect_coalesced_with_record(&coalesce_runs(&runs), &record);
             assert!(
                 inside.len() as u64 <= record.len(),
                 "the materialized list is bounded by the record"

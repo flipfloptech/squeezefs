@@ -1572,12 +1572,14 @@ async fn tick(
             let core = be.journal_ring().core();
             log::warn!(
                 "shutdown checkpoint did not converge to an empty replay window \
-                 (ring 0 head={}, reusable_upto={}; a declared region uncovered: {}): the \
-                 next mount will replay the residue (sound — an uncovered region's page \
-                 stays Live at the leave — but the shutdown tail==head guarantee was missed)",
+                 (ring 0 head={}, reusable_upto={}; a declared region uncovered: {}; dirty \
+                 bitmap pages: {}): the next mount will replay the residue (sound — an \
+                 uncovered region's page stays Live at the leave — but the shutdown \
+                 tail==head guarantee was missed)",
                 core.head(),
                 core.reusable_upto(),
-                be.appenders().is_some_and(|a| a.rings_uncovered())
+                be.appenders().is_some_and(|a| a.rings_uncovered()),
+                be.allocator().has_dirty_pages()
             );
         }
     }

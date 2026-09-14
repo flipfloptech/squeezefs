@@ -135,7 +135,10 @@ fn check_service_edge(call: &ManagerCall, total_extents: u64, record_seed: &[u8]
                 last_written: 0,
                 seq_floor: words.seq_floor,
             };
-            assert_eq!(SlotState::decode(&record.encode()).expect("decodes"), record);
+            assert_eq!(
+                SlotState::decode(&record.encode()).expect("decodes"),
+                record
+            );
             if tails.len() < usize::from(TAILS_SPILLED) {
                 let rec = SlotTailsRecord {
                     g: 1,

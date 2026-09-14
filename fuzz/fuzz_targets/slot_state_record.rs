@@ -70,8 +70,14 @@ fuzz_target!(|data: &[u8]| {
     }
     if data.len() >= 4 {
         let slot = u32::from_be_bytes(data[0..4].try_into().unwrap());
-        assert_eq!(decode_slot_state_key(&slot_state_key(slot)).ok(), Some(slot));
-        assert_eq!(decode_slot_tails_key(&slot_tails_key(slot)).ok(), Some(slot));
+        assert_eq!(
+            decode_slot_state_key(&slot_state_key(slot)).ok(),
+            Some(slot)
+        );
+        assert_eq!(
+            decode_slot_tails_key(&slot_tails_key(slot)).ok(),
+            Some(slot)
+        );
     }
 
     // --- slot_state: decode side --------------------------------------------

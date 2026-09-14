@@ -71,7 +71,17 @@ The open snapshots every in-process region's `Live` page's slot entries into the
 
 ## 4. Verification
 
-(The matrix, the ×10, the listed suites, the live-FUSE trio, the fidelity leg: filled in at the end of the run — see the summary file for the logs.)
+Gate lines on the final tree: `cargo fmt --check`, `cargo clippy --all-targets --all-features -- -D warnings`, `cargo clippy --all-targets -- -D warnings`, `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`, `cargo bench --benches -- --test` (rc 0), `task check:loom`'s two lines (`--cfg loom -D warnings` build + fmt), `tests/run_loom.sh` **106/106** (the four `slot_lease_models` included) — all clean. Logs `/tmp/grok-justin/pr4-*.log`.
+
+**The 26-suite matrix both ways** (`tests/run_sym_forest_suites.sh`, quiet box): **flat PASS, stamped PASS, no ratio NOTE** — ratios 0.80–1.46 (`kv_backend_tests` 136.9 / 149.2 s = 1.09, `fsck_tests` 12.1 / 17.6 = 1.46 the widest, `kv_leaf_merge_tests` 41.6 / 39.3, `kv_scale_tests` 28.9 / 29.5, `sym_appender_tests` 12.9 / 13.1, `sym_manager_tests` 5.5 / 5.5, `sym_slot_transfer_tests` 3.1 / 3.1). A first run also passed both legs but carried four NOTEs (2.02–2.53× on 3–5 s suites, a uniform ≈ +4 s per stamped suite, `kv_journal_tests` 0.3 → 16.4 s) — **attributed to the venue before anything moved**: its stamped leg ran beside `tests/run_loom.sh`'s release compile and a `Compiling squeezefs-preload` re-link is visible in the log ahead of the 16 s suite; the quiet re-run shows none of it.
+
+`sym_slot_transfer_tests` (21 contracts) **×10 stamped + ×3 flat from zero: 13/13 green**, 2.95–3.40 s each.
+
+The brief's listed suites, `--test-threads=1`, both legs, all green (32 legs): `sym_manager_tests` 29, `sym_fence_tests` 8, `sym_appender_tests` 34, `sym_forest_tests` 30, `decoder_property_tests` 43, `derivation_sweep_tests` 54, `env_knob_convention_tests` 22, `docs_parity_tests` 5, `kernel_op_economy_tests` 3, `dlm_multi_writer_tests` 16, `dlm_membership_tests` 51, `kv_backend_tests` 36, `crash_contract_tests` 25, `readonly_mount_tests` 28, `dlm_slot_lock_tests` 11, `mw_slot_placement_tests` 9.
+
+**The live-FUSE trio** under `SQUEEZEFS_TEST_REQUIRE_MOUNT=1`, both legs green, zero skip-ledger lines: `posix_mount_semantics_tests` 3/3 (44.2 / 37.1 s), `corpse_sweep_tests` 4/4 (149.0 / 143.2 s), `inline_raise_tests` 7/7 (94.0 / 105.6 s).
+
+**Fidelity `quick` as root** (kernel nvmet-tcp `resv_enable=1`, the release binary `8925c06a`): **PASS=43 FAIL=0 in 1m37s** — `substrate-up` 1, `roundtrip-nvmet` 15, `pr-registrants` 7, `sym-manager-failover` 18 (mount 394 ms, `manager_lease` = `held`, `meta_pr_wero` = 1, `manager_failover_bound_ms` 45,009; 196 of 200 creates acked under the seam with the 4 PR-6 cross-owner refusals; the successor inside the bound; acked data byte-intact; zero PR residue), `guard-nvmet-x1` 1, `teardown-zero-residue` 1. **The leg is unchanged**: it mounts under the declared partition WITHOUT `SQUEEZEFS_SYMMETRIC_META`, so it rides PR 2/3's unarmed path verbatim (the seam is a static partition there; under the armed plane it is the wish-list). (`jq` had to be put on root's PATH by hand on this NixOS box — a venue note, not a product one.)
 
 ## 5. Where the contracts needed PR 5+ machinery — stopped and stated
 

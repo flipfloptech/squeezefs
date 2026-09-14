@@ -43,7 +43,8 @@ use squeezefs::meta_backend::kv::slot_state::{
     decode_slot_state_key, slot_state_key_range, SlotState,
 };
 use squeezefs::meta_backend::kv::{
-    META_KV_LEAF_LEASE_REFUSALS, META_KV_REPLAY_KEY_VIOLATIONS, META_KV_REPLAY_LEASE_VIOLATIONS,
+    META_KV_CHECKPOINTS, META_KV_LEAF_LEASE_REFUSALS, META_KV_REPLAY_KEY_VIOLATIONS,
+    META_KV_REPLAY_LEASE_VIOLATIONS,
 };
 use squeezefs::meta_backend::{
     open_routed_meta_set, plan_meta_slot_set, Metadata, RoutedMetaBackend, MINT_SPREAD,
@@ -1704,6 +1705,191 @@ async fn two_nodes_alternating_on_one_directory_converge_on_one_holder() {
         "N_floor after two handovers: {}",
         plane.n_floor()
     );
+    shutdown(&routed).await;
+}
+
+// ---------------------------------------------------------------------------
+// Review round 3 — the seq-space law's two consumers the round-2 pins
+// missed: the §4.4 pt 4 rollback arms (Issue 20) and the record frontier
+// (Issue 22), both on a ring whose stamps are OFFSET from its positions.
+// ---------------------------------------------------------------------------
+
+/// The Issue-2 shape as a fixture: region 1 (slot 4's busy holder) stamps
+/// 400 entries, the slot is handed to region 0 — ring 0 now stamps
+/// `position + seq_offset` with a NONZERO offset. Returns the routed set
+/// and the (busy) ring 1 head.
+async fn open_with_ring0_offset(uris: &[String], tag: u64, owner: u64) -> Arc<RoutedMetaBackend> {
+    let routed = open_under(uris, &Knobs::armed().partition(PARTITION)).await;
+    let vol = Arc::clone(&routed.volumes[0]);
+    for i in 0..400u64 {
+        vol.commit_block_refs(owner, &refs(tag, owner, i, 1))
+            .await
+            .unwrap();
+    }
+    vol.manager_offer_slot(1, SLOT4, 0).await.unwrap();
+    let AcquireSlotReply::Granted(_) = vol.manager_acquire_slot(0, SLOT4).await.unwrap() else {
+        panic!()
+    };
+    assert!(
+        vol.journal_ring().seq_offset() > 0,
+        "the fixture: ring 0 stamps above its positions"
+    );
+    routed
+}
+
+/// **Issue 20 (round 3): the §4.4 pt 4 rollback arms address the overlay
+/// by STAMPED seqs.** On a ring whose `seq_offset > 0` a member whose
+/// apply fails (the poison seam fires AFTER the apply) must be rolled OUT
+/// of RAM — its already-applied prefix removed by the seq range the
+/// records actually carry — and a FAILED WRITE's whole-window rollback
+/// must remove every member's records; RAM equals a fresh mount's replay
+/// after both. Before the fix both arms addressed `[res.start, res.end())`
+/// — the POSITION range — and removed nothing on such a ring.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rollbacks_address_stamped_seqs_on_a_ring_with_an_offset() {
+    use squeezefs::meta_backend::kv::backend::TEST_CONVEYOR_POISON_APPLY_INO;
+    struct Cleanup;
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            TEST_CONVEYOR_POISON_APPLY_INO.store(0, Ordering::SeqCst);
+            squeezefs::uring_fs::clear_faults();
+        }
+    }
+    let _cleanup = Cleanup;
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    let uris = vec![format_stamped_member(dir.path(), "meta0").await];
+    let tag = volume_tag("vol-0000000000000020");
+    let owner = ino_in_slot(SLOT4, 5);
+    let routed = open_with_ring0_offset(&uris, tag, owner).await;
+    let vol = Arc::clone(&routed.volumes[0]);
+    let offset = vol.journal_ring().seq_offset();
+
+    // ---- Arm 1: a member whose apply fails is rolled out of RAM. ----
+    let victim = routed
+        .create(ROOT_INO, "poison_me", libc::S_IFREG | 0o600, 0, 0)
+        .await
+        .unwrap();
+    let atime_before = routed.getattr(victim.ino).await.unwrap().atime;
+    assert_ne!(atime_before, 1);
+    // The seam names the LOCAL inode key (the routed layer encodes the
+    // slot into the volume-local ino).
+    let (_, local_victim) = routed.route_ino(victim.ino);
+    TEST_CONVEYOR_POISON_APPLY_INO.store(local_victim, Ordering::SeqCst);
+    let poisoned = routed
+        .setattr(
+            victim.ino,
+            None,
+            None,
+            None,
+            None,
+            Some(1),
+            Some(2),
+            Some(3),
+        )
+        .await;
+    TEST_CONVEYOR_POISON_APPLY_INO.store(0, Ordering::SeqCst);
+    assert!(poisoned.is_err(), "the armed apply fault fails the member");
+    assert_eq!(
+        routed.getattr(victim.ino).await.unwrap().atime,
+        atime_before,
+        "the poisoned member's applied prefix is rolled OUT of RAM (ring 0 offset {offset})"
+    );
+    // The volume keeps working after the isolated failure.
+    routed
+        .create(ROOT_INO, "after_poison", libc::S_IFREG | 0o600, 0, 0)
+        .await
+        .unwrap();
+
+    // ---- Arm 2: a failed WRITE's whole-window rollback. ----
+    let ring0 = vol.journal_ring();
+    let head = ring0.core().head();
+    squeezefs::uring_fs::arm_sector_write_error(ring0.physical_offset_of(head));
+    let failed = routed
+        .create(ROOT_INO, "never_landed", libc::S_IFREG | 0o600, 0, 0)
+        .await;
+    squeezefs::uring_fs::clear_faults();
+    assert!(failed.is_err(), "the armed ring-head fault fails the write");
+    assert!(
+        routed
+            .lookup_dentry(ROOT_INO, "never_landed")
+            .await
+            .unwrap()
+            .is_none(),
+        "the failed write's records are rolled out of RAM (ring 0 offset {offset})"
+    );
+    routed
+        .create(ROOT_INO, "after_fault", libc::S_IFREG | 0o600, 0, 0)
+        .await
+        .unwrap();
+    assert_eq!(vol.block_ref_count(tag, 395).await.unwrap(), 1);
+
+    // RAM == replay: a crash remount folds to the same digest, with the
+    // rolled-back names absent and the survivors present.
+    let ram = digest_backend(&vol).await.unwrap();
+    drop(vol);
+    drop(routed);
+    let routed = open_under(&uris, &Knobs::armed().partition(PARTITION)).await;
+    let vol = Arc::clone(&routed.volumes[0]);
+    assert_eq!(digest_backend(&vol).await.unwrap(), ram, "RAM == replay");
+    assert!(routed
+        .lookup_dentry(ROOT_INO, "never_landed")
+        .await
+        .unwrap()
+        .is_none());
+    assert!(routed
+        .lookup_dentry(ROOT_INO, "after_fault")
+        .await
+        .unwrap()
+        .is_some());
+    let v = routed
+        .lookup_dentry(ROOT_INO, "poison_me")
+        .await
+        .unwrap()
+        .unwrap()
+        .0;
+    assert_eq!(routed.getattr(v).await.unwrap().atime, atime_before);
+    shutdown(&routed).await;
+}
+
+/// **Issue 22 (round 3): the record frontier is the RECEIVING ring's.**
+/// After A → B with A's positions far ahead of B's (the fixture), B's
+/// later release of the slot must clear its window within a cycle or two
+/// — before the fix the per-slot frontier kept A's maximum, ring B's
+/// `reusable_upto` could never reach it, and the release stormed 64
+/// checkpoint cycles and aborted `Corrupt` (retried every tick).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_release_from_the_quieter_ring_clears_its_window_in_one_cycle() {
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    let uris = vec![format_stamped_member(dir.path(), "meta0").await];
+    let tag = volume_tag("vol-0000000000000022");
+    let owner = ino_in_slot(SLOT4, 5);
+    let routed = open_with_ring0_offset(&uris, tag, owner).await;
+    let vol = Arc::clone(&routed.volumes[0]);
+    // Region 0 (the quieter ring) writes the slot once, then releases it.
+    vol.commit_block_refs(owner, &refs(tag, owner, 500, 1))
+        .await
+        .unwrap();
+    let ckpts_before = META_KV_CHECKPOINTS.load(Ordering::Relaxed);
+    vol.release_slot_handover(0, SLOT4)
+        .await
+        .expect("the release lands — never a stuck-tail Corrupt");
+    let cycles = META_KV_CHECKPOINTS.load(Ordering::Relaxed) - ckpts_before;
+    assert!(
+        cycles <= 3,
+        "the flush cleared ring 0's window of the slot in {cycles} cycles (a stuck frontier \
+         storms 64)"
+    );
+    assert!(!vol.slot_leases().unwrap().gate.is_leased(SLOT4));
+    assert_eq!(vol.block_ref_count(tag, 500).await.unwrap(), 1);
+    // The next open replays both rings without a Lease violation.
+    drop(vol);
+    drop(routed);
+    let routed = open_under(&uris, &Knobs::armed().partition(PARTITION)).await;
+    let vol = Arc::clone(&routed.volumes[0]);
+    assert_eq!(META_KV_REPLAY_LEASE_VIOLATIONS.load(Ordering::Relaxed), 0);
+    assert_eq!(vol.block_ref_count(tag, 500).await.unwrap(), 1);
     shutdown(&routed).await;
 }
 

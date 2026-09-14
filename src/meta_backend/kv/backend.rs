@@ -16008,12 +16008,21 @@ impl KvMetaBackend {
                     }
                 }
                 // Test seam: poison AFTER the apply so the in-window
-                // removal machinery is exercised for real.
+                // removal machinery is exercised for real. The staged key
+                // is the FOREST key on a forest volume (the kind byte
+                // framed at `build_queued_tx`), so the seam matches the
+                // legacy inode key on either layout.
                 if apply_err.is_none()
                     && poison != 0
-                    && q.recs
-                        .iter()
-                        .any(|(t, r)| *t == TREE_INODES && r.key[..] == inode_key(poison)[..])
+                    && q.recs.iter().any(|(t, r)| {
+                        *t == TREE_INODES
+                            && (r.key[..] == inode_key(poison)[..]
+                                || super::record::split_forest_key(&r.key).is_ok_and(
+                                    |(kind, legacy)| {
+                                        kind == TREE_INODES && legacy[..] == inode_key(poison)[..]
+                                    },
+                                ))
+                    })
                 {
                     apply_err = Some(KvError::Corrupt(
                         "TEST_CONVEYOR_POISON_APPLY_INO armed apply fault".to_string(),

@@ -243,6 +243,10 @@ pub mod build_profile_core;
 // tree, `#[path]`-included here (the ipc service lanes) and by the fuse3
 // fork (the FUSE-over-io_uring queue workers, R-4), so both spin
 // populations fold parks and read box headroom through the ONE law.
+/// Symmetric metadata PR 4: the slot-lease core (design §5.1) — the node
+/// cache's lease gate, the manager's lease table, the holder's dominance
+/// window; `#[path]`-shared into `loom-models/`.
+pub mod slot_lease_core;
 #[path = "../crates/squeezefs-ipc/src/spin_governor_core.rs"]
 pub mod spin_governor;
 pub mod sqz_sync_core;

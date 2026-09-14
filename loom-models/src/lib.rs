@@ -167,6 +167,16 @@
 //!   published snapshot covers every mint whose record-apply
 //!   happened-before it (the latch-free reader vs publisher edge the
 //!   PR-plan loom clause names).
+//! - [`slot_lease_core`]: the symmetric metadata program's SLOT LEASE
+//!   core (design-symmetric-metadata §5.1, PR 4) — invariants: a commit
+//!   never lands on a `Releasing` slot after the departing holder's
+//!   flush snapshot (the gate verdict is read INSIDE the node's write
+//!   lock, the holder raises `Releasing` BEFORE its flush takes that
+//!   lock — weakening-verified: a verdict read outside the lock lands an
+//!   acked record no ring holds); racing acquires of one unleased slot
+//!   yield exactly one holder and one `g` increment; an offer lapsing
+//!   under an accept never yields two holders; a release by a stale
+//!   holder or `g` is refused and the live holder's words stand.
 //! - [`lane_core`]: the pre-RC spec §6.2 items 5/6 per-writer LANE cursor
 //!   (per-writer ino cursors + block-key incarnation stamps) — invariants:
 //!   two appenders' concurrent mints are never equal and never leave their
@@ -327,6 +337,8 @@ pub mod refcount_core;
 pub mod slot_cursor_core;
 #[path = "../../src/meta_backend/slot_gate_core.rs"]
 pub mod slot_gate_core;
+#[path = "../../src/slot_lease_core.rs"]
+pub mod slot_lease_core;
 #[path = "../../src/sqz_sync_core.rs"]
 pub mod sqz_sync_core;
 #[path = "../../src/token_cache_core.rs"]
@@ -6860,6 +6872,203 @@ mod conveyor_two_stage_models {
             );
             assert_eq!(lane.pending(), 0, "no window left queued");
             assert!(lane.try_lead(), "lane leadership released at quiesce");
+        });
+    }
+}
+
+#[cfg(all(test, loom))]
+mod slot_lease_models {
+    //! [`slot_lease_core`] (design-symmetric-metadata §5.1, PR 4): the
+    //! node cache's lease gate, the manager's lease table, the holder's
+    //! flush-then-transfer.
+    //!
+    //! Model precondition (stated): a leaf's dirty set is guarded by the
+    //! node's write lock in `node_cache.rs` (`SqzRwLock<NodeDirty>`); the
+    //! `loom::sync::Mutex` below stands in for it. What is under test is
+    //! the ORDER the shipped code fixes around that lock: the committer
+    //! reads the gate verdict inside `apply_locked` (under the lock), the
+    //! departing holder raises `Releasing` before its flush takes the
+    //! lock, so every record the committer lands is in the flush's
+    //! snapshot or was refused.
+    use crate::slot_lease_core::{
+        AcquireOutcome, CommitVerdict, LeaseGate, ReleaseOutcome, SlotLeaseTable, SlotWords,
+    };
+    use loom::sync::atomic::{AtomicBool, Ordering};
+    use loom::sync::{Arc, Mutex};
+    use loom::thread;
+
+    const SLOT: u32 = 7;
+
+    /// §5.1.4's flush-then-transfer against a racing commit: the record
+    /// either lands BEFORE the flush's snapshot (and is in it) or is
+    /// REFUSED — never applied after the snapshot.
+    ///
+    /// Weakening evidence (verified RED 2026-09-14, then restored): reading
+    /// the verdict BEFORE taking the node lock (check-then-lock) lets the
+    /// committer observe `Allowed`, the holder then raise `Releasing`,
+    /// snapshot an empty dirty set and hand the slot over, and the
+    /// committer land its record afterwards — applied, never flushed,
+    /// in no ring the successor replays.
+    #[test]
+    fn a_commit_never_lands_on_a_releasing_slot() {
+        loom::model(|| {
+            let gate = Arc::new(LeaseGate::new());
+            gate.arm();
+            gate.grant(SLOT);
+            // The leaf's dirty set (the node's write lock stands in for
+            // `NodeDirty`'s).
+            let dirty: Arc<Mutex<Vec<u32>>> = Arc::new(Mutex::new(Vec::new()));
+            let applied = Arc::new(AtomicBool::new(false));
+
+            let committer = {
+                let gate = Arc::clone(&gate);
+                let dirty = Arc::clone(&dirty);
+                let applied = Arc::clone(&applied);
+                thread::spawn(move || {
+                    // `apply_locked`: the verdict is read UNDER the node's
+                    // write lock.
+                    let mut d = dirty.lock().unwrap();
+                    if gate.verdict(SLOT) == CommitVerdict::Allowed {
+                        d.push(1);
+                        applied.store(true, Ordering::Release);
+                    }
+                })
+            };
+            // The departing holder: Releasing FIRST, then the flush takes
+            // the node lock and snapshots the dirty set.
+            gate.begin_release(SLOT);
+            let snapshot: Vec<u32> = dirty.lock().unwrap().clone();
+            committer.join().unwrap();
+            if applied.load(Ordering::Acquire) {
+                assert_eq!(
+                    snapshot,
+                    vec![1],
+                    "a record landed on the slot AFTER the flush's snapshot — an acked record \
+                     no ring holds and no page names"
+                );
+            } else {
+                assert!(snapshot.is_empty());
+                assert_eq!(gate.verdict(SLOT), CommitVerdict::Releasing);
+            }
+            gate.revoke(SLOT);
+            assert_eq!(gate.verdict(SLOT), CommitVerdict::NotLeased);
+        });
+    }
+
+    /// Two appenders race the first acquire of an unleased slot: exactly
+    /// one is granted, the other is refused naming it, and `g` moved
+    /// exactly once.
+    #[test]
+    fn racing_acquires_yield_one_holder_and_one_g_increment() {
+        loom::model(|| {
+            let table = Arc::new(SlotLeaseTable::new());
+            let a = {
+                let t = Arc::clone(&table);
+                thread::spawn(move || t.acquire(SLOT, 1, 0))
+            };
+            let b = {
+                let t = Arc::clone(&table);
+                thread::spawn(move || t.acquire(SLOT, 2, 0))
+            };
+            let (ra, rb) = (a.join().unwrap(), b.join().unwrap());
+            let granted = [ra, rb]
+                .iter()
+                .filter(|r| matches!(r, AcquireOutcome::Granted { g: 1, .. }))
+                .count();
+            let refused = [ra, rb]
+                .iter()
+                .filter(|r| matches!(r, AcquireOutcome::Refused { g: 1, .. }))
+                .count();
+            assert_eq!((granted, refused), (1, 1), "{ra:?} / {rb:?}");
+            let e = table.get(SLOT).unwrap();
+            assert_eq!(e.g, 1, "g moved exactly once");
+            match (ra, rb) {
+                (AcquireOutcome::Granted { .. }, AcquireOutcome::Refused { holder, .. }) => {
+                    assert_eq!((e.holder, holder), (1, 1));
+                }
+                (AcquireOutcome::Refused { holder, .. }, AcquireOutcome::Granted { .. }) => {
+                    assert_eq!((e.holder, holder), (2, 2));
+                }
+                other => panic!("{other:?}"),
+            }
+        });
+    }
+
+    /// An offer lapsing under the requester's accept: whichever wins, the
+    /// slot has ONE holder afterwards and `g` never moved (an expiry and
+    /// a recall both leave the holder in place; only a release + grant
+    /// increments).
+    #[test]
+    fn an_offer_expiring_under_an_accept_never_yields_two_holders() {
+        loom::model(|| {
+            let table = Arc::new(SlotLeaseTable::new());
+            assert!(matches!(
+                table.acquire(SLOT, 1, 0),
+                AcquireOutcome::Granted { g: 1, .. }
+            ));
+            table.offer(SLOT, 1, 2, 100).unwrap();
+            let expirer = {
+                let t = Arc::clone(&table);
+                thread::spawn(move || t.expire_offers(100))
+            };
+            let acceptor = {
+                let t = Arc::clone(&table);
+                thread::spawn(move || t.acquire(SLOT, 2, 99))
+            };
+            let expired = expirer.join().unwrap();
+            let accepted = acceptor.join().unwrap();
+            let e = table.get(SLOT).unwrap();
+            assert_eq!((e.holder, e.g), (1, 1), "the holder never changed under the race");
+            match accepted {
+                AcquireOutcome::Recall { holder: 1, g: 1 } => {
+                    // The accept saw the live offer; the expiry then ran
+                    // (or not) — either way the holder stands until the
+                    // recall's release lands.
+                }
+                AcquireOutcome::Refused { holder: 1, g: 1 } => {
+                    assert_eq!(expired, vec![SLOT], "refused only because the offer lapsed");
+                }
+                other => panic!("{other:?}"),
+            }
+        });
+    }
+
+    /// A release by a stale holder or a stale `g` is refused and the live
+    /// holder's words stand; the live holder's release lands once and a
+    /// replay answers `Already`.
+    #[test]
+    fn a_stale_release_is_refused_and_the_live_one_lands_once() {
+        loom::model(|| {
+            let table = Arc::new(SlotLeaseTable::new());
+            assert!(matches!(
+                table.acquire(SLOT, 1, 0),
+                AcquireOutcome::Granted { g: 1, .. }
+            ));
+            let words = SlotWords {
+                root: (0x1000, 5),
+                cursor: 42,
+                extents: 3,
+            };
+            let stale = {
+                let t = Arc::clone(&table);
+                thread::spawn(move || t.release(SLOT, 2, 1, SlotWords::default(), 9))
+            };
+            let live = {
+                let t = Arc::clone(&table);
+                thread::spawn(move || t.release(SLOT, 1, 1, words, 10))
+            };
+            assert!(matches!(
+                stale.join().unwrap(),
+                ReleaseOutcome::Refused { .. }
+            ));
+            assert_eq!(live.join().unwrap(), ReleaseOutcome::Released);
+            assert_eq!(table.release(SLOT, 1, 1, words, 11), ReleaseOutcome::Already);
+            let e = table.get(SLOT).unwrap();
+            assert_eq!((e.words, e.last_written), (words, 10));
+            assert!(matches!(
+                table.acquire(SLOT, 2, 0),
+                AcquireOutcome::Granted { g: 2, words: w } if w == words
+            ));
         });
     }
 }

@@ -968,6 +968,10 @@ pub struct BuiltImage {
     pub extents_allocated: u64,
 }
 
+/// One leaf's worth of records per page for the digest walks (the
+/// census walks' shape — a bound on the page, never on the volume).
+const WALK_PAGE: usize = 1024;
+
 /// The §4.10 post-fold digest walk: xxh3 over every **live** USER record
 /// of a mounted backend — `(kind, legacy key, folded value)` in
 /// kind-then-key order; tombstones and unfolded deltas excluded — so two
@@ -993,7 +997,6 @@ pub struct BuiltImage {
 /// per-mount control record belongs on this exclusion list**; the general
 /// rule is `is_pinned_control_record`-shaped state, never user content.
 pub async fn digest_backend(backend: &KvMetaBackend) -> Result<u64, KvError> {
-    const WALK_PAGE: usize = 1024;
     let mut h = xxhash_rust::xxh3::Xxh3::new();
     for kind in KvMetaBackend::USER_KINDS {
         h.update(&[kind]);
@@ -1036,7 +1039,6 @@ pub async fn digest_backend_kind_set(
     backend: &KvMetaBackend,
     kind: u8,
 ) -> Result<(u64, u64), KvError> {
-    const WALK_PAGE: usize = 1024;
     let engaged = match kind {
         TREE_BLOCK_REFS => backend.block_refs_engaged(),
         TREE_BLOCK_MAP => backend.block_map_tree_engaged(),

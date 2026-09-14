@@ -5388,17 +5388,46 @@ impl VerbFlocks {
         self.held[vi] = None;
     }
 
-    /// Re-take volume `vi`'s hold after the guarded open closed.
-    fn retake(&mut self, vi: usize) -> Result<()> {
-        self.take(vi).map_err(|e| {
-            SqueezefsError::InvalidOperation(format!(
-                "{e} (the lock was released for the verb's own guarded open and taken by \
-                 another process before it could be re-taken; re-run with `--resume` once the \
-                 holder has finished)"
-            ))
-        })
+    /// Re-take volume `vi`'s hold after the guarded open closed. A holder
+    /// that slipped into the open's window is given the same bounded
+    /// wait a mount grants a transient flock holder before the refusal
+    /// ([`VERB_FLOCK_RETAKE_WAIT`]), so the ms-grade collision — a mount
+    /// that took Layer A inside the window and refuses at the marker gate
+    /// within it — never aborts the verb post-marker.
+    async fn retake(&mut self, vi: usize) -> Result<()> {
+        let deadline = std::time::Instant::now() + VERB_FLOCK_RETAKE_WAIT;
+        loop {
+            match self.take(vi) {
+                Ok(()) => return Ok(()),
+                Err(e) if self.held_elsewhere(&e) && std::time::Instant::now() < deadline => {
+                    squeezefs_ipc::sqz_time::sleep(VERB_FLOCK_RETAKE_POLL).await;
+                }
+                Err(e) => {
+                    return Err(SqueezefsError::InvalidOperation(format!(
+                        "{e} (the lock was released for the verb's own guarded open and taken \
+                         by another process before it could be re-taken within {} s; re-run with \
+                         `--resume` once the holder has finished)",
+                        VERB_FLOCK_RETAKE_WAIT.as_secs()
+                    )))
+                }
+            }
+        }
+    }
+
+    /// Whether a [`Self::take`] error is the busy class (a live holder),
+    /// as opposed to an I/O failure that no wait cures.
+    fn held_elsewhere(&self, e: &SqueezefsError) -> bool {
+        matches!(e, SqueezefsError::InvalidOperation(msg) if msg.contains("holds the writer lock"))
     }
 }
+
+/// The bounded window [`VerbFlocks::retake`] polls a holder for — the
+/// same 2 s `KvMetaBackend::open` grants a transient flock holder before
+/// its own refusal (`backend.rs` `TRANSIENT_FLOCK_WAIT`; that constant is
+/// private to PR 4's file — make it `pub` and tie the two at the rebase).
+const VERB_FLOCK_RETAKE_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+/// The retake's poll period (the mount's own transient-wait poll).
+const VERB_FLOCK_RETAKE_POLL: std::time::Duration = std::time::Duration::from_millis(5);
 
 /// The capacity preflight of one flat volume — computed from the
 /// write-free inspection, BEFORE the first marker.
@@ -5623,8 +5652,13 @@ async fn inspect_for_symmetric(path: &str, ordered: &[String]) -> Result<SymInsp
     // trees' `old_extents` stay claimed until step 5 frees them. The
     // internal class may claim down to the last extent, so the build
     // COMPLETES iff `needed ≤ free + orphans`; the preflight keeps the
-    // §4.7 compaction floor out of the claim as well, so the converted
-    // volume's first flush pass finds it intact:
+    // §4.7 compaction floor out of the claim as well — it doubles as the
+    // SLACK for what happens between this plan and the build: the
+    // marker's and the quiesce's guarded opens commit their claim /
+    // unclaim / `writer_term` records, and a leaf those split or compact
+    // costs the build one or two extents (or moves one chunk boundary)
+    // the pre-quiesce plan could not see; the floor (≥ 4 extents) covers
+    // it, and the converted volume's first flush pass still finds it:
     //   needed    = Σ_slot nodes(slot records) + nodes(tree 0) + 1
     //   available = free + orphans − compaction_floor(reserve)
     // Tie-tested in `sym_convert_tests` (`needed ≡ extents_written`).
@@ -5992,6 +6026,33 @@ async fn abort_conversion(
              conversion with `--resume`"
         )));
     }
+    // The torn-stamp window: `set_symmetric_forest` writes the DUR-5
+    // backup copy FIRST, so a kill between its two sector writes leaves
+    // sector 0 FLAT under a STAMPED copy. Every reader honours the
+    // primary, so the volume IS flat and the abort above would admit it —
+    // but it writes no superblock, and the stale stamped copy would stay
+    // for a later sector-0 failure to fall back onto (a forest superblock
+    // over a flat ledger: a loud refusal only surgery exits). `--resume`
+    // rewrites both copies at a new generation; the abort refuses.
+    for (path, ins) in ordered.iter().zip(inspections) {
+        if ins.symmetric || ins.marker.is_none() {
+            continue;
+        }
+        if let Some(backup) =
+            crate::meta_backend::kv::superblock::read_backup_superblock(Path::new(path)).await?
+        {
+            if backup.symmetric_forest_stamped() {
+                return Err(SqueezefsError::InvalidOperation(format!(
+                    "volume enable-symmetric --abort refused: {path}'s redundant superblock copy \
+                     already carries incompat bit 17 while sector 0 is flat — the run was killed \
+                     inside the stamp's two sector writes. Undoing it would leave a stale \
+                     stamped copy on the device for a later sector-0 failure to fall back onto; \
+                     nothing was undone on any volume. Finish the conversion with `--resume` \
+                     (it rewrites both copies)"
+                )));
+            }
+        }
+    }
     let mut rows = Vec::with_capacity(ordered.len());
     for (vi, (path, ins)) in ordered.iter().zip(inspections).enumerate() {
         let outcome = if ins.symmetric {
@@ -6023,7 +6084,12 @@ async fn abort_conversion(
 async fn abort_volume_conversion(path: &str, vi: usize, flocks: &mut VerbFlocks) -> Result<u64> {
     use crate::meta_backend::kv::alloc_ext::{compaction_reserve_extents, ExtentAllocator};
     use crate::meta_backend::kv::backend::{KvMetaBackend, PENDING_FREE_CAP};
-    use crate::meta_backend::kv::builder::digest_backend;
+    use crate::meta_backend::kv::builder::{digest_backend, digest_backend_kind_set};
+    use crate::meta_backend::kv::checkpoint::{write_ledger_slot, LedgerRecord};
+    use crate::meta_backend::kv::node::residue_seq_ceiling;
+    use crate::meta_backend::kv::record::{
+        KIND_INTERIOR, TREE_BLOCK_MAP, TREE_BLOCK_REFS, TREE_CONTROL,
+    };
 
     let p = Path::new(path);
     let (sb, ledger, reachable, window_entries) = {
@@ -6033,9 +6099,14 @@ async fn abort_volume_conversion(path: &str, vi: usize, flocks: &mut VerbFlocks)
                 "volume enable-symmetric --abort: {path} mounted as a forest — refusing"
             )));
         }
-        // Intact = every live record of every kind reads and folds; a
-        // corrupt node fails the walk loud, never an abort over it.
+        // Intact = every live record of EVERY kind the build would relay
+        // reads and folds — the user kinds through the ordered digest,
+        // the references and the block map through the per-kind set
+        // oracle; a corrupt node fails the walk loud, never an abort
+        // over it.
         digest_backend(&be).await?;
+        digest_backend_kind_set(&be, TREE_BLOCK_REFS).await?;
+        digest_backend_kind_set(&be, TREE_BLOCK_MAP).await?;
         let sb = be.superblock().clone();
         let ledger = be.mounted_ledger().clone();
         let mut reachable = std::collections::BTreeSet::new();
@@ -6062,8 +6133,25 @@ async fn abort_volume_conversion(path: &str, vi: usize, flocks: &mut VerbFlocks)
             &[],
         )
         .await?;
+        // The reclaimed extents go back to the FLAT free list, and their
+        // residue — the crashed build's images — carries node seqs ABOVE
+        // the flat ledger's watermark (Issue 4's law, the abort's twin):
+        // the flat volume's next SMOs would mint `watermark + k` into
+        // exactly these lowest-free extents. The ceiling over their
+        // residue raises the watermark the ledger record below carries,
+        // so the marker-removal mount (and every flat mount after it)
+        // seeds its node-seq counter above every stamp they hold.
+        let node_size = u64::from(sb.node_size);
+        let mut seq_floor = ledger.node_seq_watermark;
         for extent in 0..total {
             if alloc.is_allocated(extent) && !reachable.contains(&extent) {
+                let image = crate::uring_fs::read_at(
+                    p,
+                    sb.heap.start + extent * node_size,
+                    sb.node_size as usize,
+                )
+                .await?;
+                seq_floor = seq_floor.max(residue_seq_ceiling(&image));
                 alloc.release_unpublished(extent);
                 reclaimed += 1;
             }
@@ -6076,6 +6164,28 @@ async fn abort_volume_conversion(path: &str, vi: usize, flocks: &mut VerbFlocks)
             alloc
                 .write_dirty_pages(p, sb.alloc_bitmap.start, generation)
                 .await?;
+            crate::uring_fs::fdatasync(p.to_path_buf()).await?;
+            // ONE ledger record: the flat roots ALONE (a hybrid record's
+            // forest roots now name reclaimed extents), the same tail,
+            // the new bitmap generation, the raised watermark. Until it
+            // lands the previous record still describes a consistent
+            // flat volume (its forest roots are ignored by a flat open).
+            let restated = LedgerRecord {
+                seq: ledger.seq + 1,
+                tree_roots: ledger
+                    .tree_roots
+                    .iter()
+                    .copied()
+                    .filter(|r| r.tree_id != TREE_CONTROL && r.tree_id != KIND_INTERIOR)
+                    .collect(),
+                journal_tail_seq: ledger.journal_tail_seq,
+                next_ino: ledger.next_ino,
+                alloc_bitmap_generation: generation,
+                node_seq_watermark: seq_floor,
+                membership_stamp: ledger.membership_stamp.clone(),
+                append_partition: ledger.append_partition,
+            };
+            write_ledger_slot(p, sb.root_ledger.start, &restated).await?;
             crate::uring_fs::fdatasync(p.to_path_buf()).await?;
         }
     }
@@ -6107,7 +6217,7 @@ async fn write_sym_marker(
     }
     .await;
     be.shutdown().await?;
-    flocks.retake(vi)?;
+    flocks.retake(vi).await?;
     body
 }
 
@@ -6129,7 +6239,7 @@ async fn remove_sym_marker(path: &str, vi: usize, flocks: &mut VerbFlocks) -> Re
     }
     .await;
     be.shutdown().await?;
-    flocks.retake(vi)?;
+    flocks.retake(vi).await?;
     body
 }
 
@@ -6313,7 +6423,7 @@ async fn convert_volume_to_forest(
         let be = KvMetaBackend::open_for_sym_upgrade(p).await?;
         let r = be.checkpoint_now().await;
         be.shutdown().await?;
-        flocks.retake(vi)?;
+        flocks.retake(vi).await?;
         r?;
     }
 

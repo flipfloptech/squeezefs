@@ -1376,6 +1376,27 @@ pub async fn classify_volume_slot(path: &Path) -> Result<(VolumeFormat, Superblo
     }
 }
 
+/// The DUR-5 redundant copy as it lies on the device, whatever sector 0
+/// says: `Some(sb)` when the tail sector holds a verifying v3 image
+/// (any generation), `None` when the geometry has no slot or the slot
+/// holds no superblock. Never consulted for MOUNTING (a readable primary
+/// is authoritative — [`classify_volume_slot`]); the offline verbs read it
+/// to refuse an act that would leave the two copies disagreeing on the
+/// LAYOUT: `write_superblock_v3` lands the copy first, so a kill between
+/// its two writes leaves a flat sector 0 under a stamped copy, and an
+/// `--abort` of that window would keep the stale stamped copy for a
+/// later sector-0 failure to fall back onto.
+pub async fn read_backup_superblock(path: &Path) -> Result<Option<SuperblockV3>, KvError> {
+    let Some(off) = volume_len(path).and_then(backup_offset) else {
+        return Ok(None);
+    };
+    let sector = read_sector(path, off).await?;
+    Ok(match classify_sector0(&sector) {
+        Ok(VolumeFormat::V3(sb)) => Some(sb),
+        _ => None,
+    })
+}
+
 /// Write `sb` to `path`: the DUR-5 redundant copy FIRST (barriered), then
 /// sector 0 (barriered). A tear on sector 0 therefore always recovers
 /// FORWARD to this image, and a tear on the copy leaves the durable

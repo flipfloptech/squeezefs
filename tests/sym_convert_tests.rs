@@ -52,7 +52,8 @@ use squeezefs::meta_backend::kv::slot_state::{
     decode_slot_state_key, slot_state_key_range, SlotState,
 };
 use squeezefs::meta_backend::kv::superblock::{
-    classify_volume, SuperblockV3, VolumeFormat, FEATURE_INCOMPAT_KV_SYMMETRIC_FOREST,
+    backup_offset, classify_volume, read_backup_superblock, sector_generation, ExtentRef,
+    SuperblockV3, VolumeFormat, FEATURE_INCOMPAT_KV_SYMMETRIC_FOREST, SUPERBLOCK_V3_LEN,
 };
 use squeezefs::meta_backend::{
     open_routed_meta_set, open_routed_meta_set_read_only, plan_meta_slot_set, Metadata,
@@ -2104,4 +2105,233 @@ async fn rename_and_a_layout_publish_of_one_ino_never_co_queue_a_delta_and_a_put
     for v in &routed.volumes {
         v.shutdown().await.unwrap();
     }
+}
+
+// ---------------------------------------------------------------------------
+// Round 3 — the torn-stamp window under `--abort`; the abort's seq floor.
+// ---------------------------------------------------------------------------
+
+/// **Issue 14.** The stamp writes the DUR-5 backup copy FIRST, so a kill
+/// between its two sector writes leaves sector 0 FLAT under a STAMPED
+/// copy. Every reader honours the primary — the volume is flat and an
+/// abort would be admitted — but the abort writes no superblock, so the
+/// stale stamped copy would stay for a later sector-0 failure to fall
+/// back onto. `--abort` refuses that window naming `--resume`, touching
+/// nothing; `--resume` finishes and rewrites BOTH copies consistent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_abort_under_a_stamped_backup_copy_refuses_naming_resume() {
+    let dir = tempfile::tempdir().unwrap();
+    let (uris, digests, pop) = populated_flat_set(dir.path(), 1, 60).await;
+    let p = Path::new(&uris[0]);
+    enable_symmetric_with(
+        &uris,
+        &EnableSymOptions::default(),
+        &EnableSymHooks {
+            crash_after: Some(EnableSymCrash::AfterLedger { volume: 0 }),
+        },
+    )
+    .await
+    .expect_err("crash after the hybrid ledger");
+    // The torn stamp: a stamped image at a newer generation in the backup
+    // slot, sector 0 still flat — exactly what a kill between the two
+    // writes of `set_symmetric_forest` leaves.
+    let primary = superblock_of(&uris[0]).await;
+    assert!(!is_symmetric(&primary));
+    let primary_sector = squeezefs::uring_fs::read_at(p, 0, SUPERBLOCK_V3_LEN)
+        .await
+        .unwrap();
+    let mut stamped = primary.clone();
+    stamped.features_incompat |= FEATURE_INCOMPAT_KV_SYMMETRIC_FOREST;
+    stamped.appender_dir = ExtentRef {
+        start: primary.heap.start,
+        len: u64::from(primary.node_size),
+    };
+    let img = stamped
+        .encode_sector_at_generation(sector_generation(&primary_sector) + 1)
+        .expect("a stamped image");
+    let off = backup_offset(VOL_LEN).expect("the volume reserves the backup slot");
+    squeezefs::uring_fs::write_at(p, off, bytes::Bytes::from(img))
+        .await
+        .unwrap();
+    squeezefs::uring_fs::fdatasync(p).await.unwrap();
+    assert!(
+        read_backup_superblock(p)
+            .await
+            .unwrap()
+            .expect("the backup slot holds a superblock")
+            .symmetric_forest_stamped(),
+        "the planted backup copy carries bit 17"
+    );
+    assert!(
+        !is_symmetric(&superblock_of(&uris[0]).await),
+        "sector 0 is authoritative and still flat"
+    );
+
+    let before = fixed_region_of(&uris[0]).await;
+    let err = enable_symmetric(
+        &uris,
+        &EnableSymOptions {
+            abort: true,
+            ..Default::default()
+        },
+    )
+    .await
+    .expect_err("the torn-stamp window refuses the abort");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("redundant superblock copy")
+            && msg.contains("--resume")
+            && msg.contains(&uris[0]),
+        "names the copy, the volume and the only exit: {msg}"
+    );
+    assert!(before == fixed_region_of(&uris[0]).await, "nothing undone");
+    assert!(marker_present(&uris[0]).await, "the marker stays");
+    assert!(
+        read_backup_superblock(p)
+            .await
+            .unwrap()
+            .unwrap()
+            .symmetric_forest_stamped(),
+        "the backup copy is untouched by the refusal"
+    );
+
+    // `--resume` finishes the conversion and leaves the two copies
+    // agreeing on the layout (both stamped, one directory).
+    let report = enable_symmetric(
+        &uris,
+        &EnableSymOptions {
+            resume: true,
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("resume");
+    assert_eq!(report.rows[0].outcome, ConversionOutcome::Resumed);
+    let primary = superblock_of(&uris[0]).await;
+    let backup = read_backup_superblock(p).await.unwrap().expect("backup");
+    assert!(is_symmetric(&primary) && backup.symmetric_forest_stamped());
+    assert_eq!(
+        backup.appender_dir, primary.appender_dir,
+        "the resume's stamp rewrote both copies from one image"
+    );
+    assert_eq!(digest_of(&uris[0]).await, digests[0]);
+    let routed = open_routed_meta_set(&uris).await.expect("forest mount");
+    assert_population(&routed, &pop).await;
+    for v in &routed.volumes {
+        v.shutdown().await.unwrap();
+    }
+}
+
+/// **Issue 15 — Issue 4's abort-path twin.** The abort returns the
+/// crashed build's images (node seqs ABOVE the flat ledger's watermark)
+/// to the FLAT free list; its ledger record raises the watermark above
+/// every stamp their residue carries (`residue_seq_ceiling`), so the
+/// flat volume's later SMOs — minted lowest-free into exactly those
+/// extents — never share a seq with a dead frame there. Pinned: after the
+/// abort the ledger's watermark is at or above the residue's ceiling, and
+/// every node a later flat mount writes is stamped above it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_abort_raises_the_flat_watermark_above_every_reclaimed_extents_residue() {
+    let dir = tempfile::tempdir().unwrap();
+    let (uris, digests, _pop) = populated_flat_set(dir.path(), 1, 120).await;
+    let sb = superblock_of(&uris[0]).await;
+    let p = Path::new(&uris[0]);
+    enable_symmetric_with(
+        &uris,
+        &EnableSymOptions::default(),
+        &EnableSymHooks {
+            crash_after: Some(EnableSymCrash::AfterBuild { volume: 0 }),
+        },
+    )
+    .await
+    .expect_err("crash after the build");
+    let node_size = sb.node_size as usize;
+    let mut residue_max = 0u64;
+    for extent in 0..sb.total_extents() {
+        let img =
+            squeezefs::uring_fs::read_at(p, sb.heap.start + extent * node_size as u64, node_size)
+                .await
+                .unwrap();
+        residue_max = residue_max.max(residue_seq_ceiling(&img));
+    }
+    let ledger_crashed = read_newest_ledger(p, sb.root_ledger.start)
+        .await
+        .unwrap()
+        .expect("ledger");
+    assert!(
+        residue_max > ledger_crashed.node_seq_watermark,
+        "the orphaned build's images sit ABOVE the flat watermark ({residue_max} > {}) — the \
+         abort returns them to the flat free list",
+        ledger_crashed.node_seq_watermark
+    );
+    // The flat trees' nodes before the abort (they keep their old seqs).
+    let reachable_before: std::collections::BTreeSet<u64> = {
+        let be = KvMetaBackend::open_probe(p).await.expect("probe");
+        let mut set = std::collections::BTreeSet::new();
+        for tree in be.all_trees() {
+            set.extend(tree.reachable_node_addrs().await.expect("walk"));
+        }
+        set
+    };
+
+    let report = enable_symmetric(
+        &uris,
+        &EnableSymOptions {
+            abort: true,
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("abort");
+    assert_eq!(report.rows[0].outcome, ConversionOutcome::Aborted);
+    assert!(report.rows[0].orphans_reclaimed > 0);
+    let ledger_after = read_newest_ledger(p, sb.root_ledger.start)
+        .await
+        .unwrap()
+        .expect("ledger");
+    assert!(
+        ledger_after.node_seq_watermark >= residue_max,
+        "the abort's ledger record carries the raised watermark: {} ≥ {residue_max}",
+        ledger_after.node_seq_watermark
+    );
+    assert!(
+        ledger_after
+            .tree_roots
+            .iter()
+            .all(|r| r.tree_id != TREE_CONTROL && r.tree_id != KIND_INTERIOR),
+        "the abort's record names the flat roots alone"
+    );
+    assert_eq!(digest_of(&uris[0]).await, digests[0]);
+
+    // A later flat mount mints its SMOs into the reclaimed extents: every
+    // node it writes is stamped above the residue's ceiling.
+    let routed = open_routed_meta_set(&uris).await.expect("flat mount");
+    fill_with_large_xattrs(&routed, 120, 15_000).await;
+    for v in &routed.volumes {
+        v.shutdown().await.unwrap();
+    }
+    drop(routed);
+    let be = KvMetaBackend::open_probe(p).await.expect("probe");
+    let layout = squeezefs::meta_backend::kv::node::NodeLayout::new(node_size).unwrap();
+    let mut new_nodes = 0u64;
+    for tree in be.all_trees() {
+        for addr in tree.reachable_node_addrs().await.expect("walk") {
+            if reachable_before.contains(&addr) {
+                continue;
+            }
+            let node = squeezefs::meta_backend::kv::node::load_node(p, &layout, addr, u64::MAX)
+                .await
+                .expect("a reachable node loads");
+            assert!(
+                node.header().node_seq > residue_max,
+                "new node {addr:#x} seq {} ≤ the reclaimed residue's {residue_max}",
+                node.header().node_seq
+            );
+            new_nodes += 1;
+        }
+    }
+    assert!(
+        new_nodes > 0,
+        "the fill minted new nodes into the reclaimed extents"
+    );
 }

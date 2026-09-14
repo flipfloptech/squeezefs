@@ -791,7 +791,8 @@ proptest! {
         cap in 8u64..(1 << 32),
     ) {
         use squeezefs::meta_backend::kv::appender::{
-            clamp_grant_want, intersect_runs_with_record, validate_return_runs, GrantRun,
+            clamp_grant_want, coalesce_runs, intersect_runs_with_record, runs_extent_count,
+            validate_return_runs, GrantRun,
         };
         use squeezefs::meta_backend::kv::slot_state::ExtentGrantRecord;
         let runs: Vec<GrantRun> = runs
@@ -799,9 +800,8 @@ proptest! {
             .map(|&(start, len)| GrantRun { start, len })
             .collect();
         match validate_return_runs(&runs, total) {
-            Ok(named) => {
+            Ok(()) => {
                 prop_assert!(runs.iter().all(|r| r.start + u64::from(r.len) <= total));
-                prop_assert!(named <= runs.len() as u64 * u64::from(u32::MAX));
             }
             Err(offender) => {
                 prop_assert!(offender
@@ -811,11 +811,28 @@ proptest! {
                 prop_assert!(runs.contains(&offender));
             }
         }
+        // The coalesce (Issue 2's residual): bounded by the frame's own
+        // run count, disjoint and ascending, naming no more than the input
+        // and exactly the input's distinct extents.
+        let coalesced = coalesce_runs(&runs);
+        prop_assert!(coalesced.len() <= runs.len());
+        prop_assert!(coalesced
+            .windows(2)
+            .all(|w| w[0].start + u64::from(w[0].len) < w[1].start));
+        prop_assert!(runs_extent_count(&coalesced) <= runs_extent_count(&runs));
+        let distinct: std::collections::BTreeSet<u64> = runs
+            .iter()
+            .filter(|r| r.len <= 64 && r.start.checked_add(u64::from(r.len)).is_some())
+            .flat_map(|r| r.start..r.start + u64::from(r.len))
+            .collect();
+        if runs.iter().all(|r| r.len <= 64) {
+            prop_assert_eq!(runs_extent_count(&coalesced), distinct.len() as u64);
+        }
         let record = ExtentGrantRecord::from_extents(record_seed.iter().map(|e| *e % total));
         let inside = intersect_runs_with_record(&runs, &record);
         prop_assert!(inside.len() as u64 <= record.len());
         prop_assert!(inside.iter().all(|e| record.contains(*e)));
-        prop_assert!(inside.windows(2).all(|w| w[0] < w[1]), "ascending, deduplicated");
+        prop_assert!(inside.windows(2).all(|w| w[0] < w[1]), "strictly ascending — no dedup step");
         // Every extent a run names that the record holds IS in the list.
         for r in runs.iter().filter(|r| r.len <= 64) {
             for e in r.start..r.start.saturating_add(u64::from(r.len)) {

@@ -41,7 +41,8 @@
 use arbitrary::{Arbitrary, Unstructured};
 use libfuzzer_sys::fuzz_target;
 use squeezefs::meta_backend::kv::appender::{
-    clamp_grant_want, intersect_runs_with_record, validate_return_runs, GrantRun,
+    clamp_grant_want, coalesce_runs, intersect_runs_with_record, runs_extent_count,
+    validate_return_runs, GrantRun,
 };
 use squeezefs::meta_backend::kv::slot_state::ExtentGrantRecord;
 use squeezefs::meta_ship::manager::{
@@ -66,10 +67,7 @@ fn check_service_edge(call: &ManagerCall, total_extents: u64, record_seed: &[u8]
                 .map(|&(start, len)| GrantRun { start, len })
                 .collect();
             match validate_return_runs(&runs, total_extents) {
-                Ok(named) => {
-                    // Every run lies inside the volume: the sum cannot
-                    // exceed runs × u32::MAX, and never overflowed.
-                    assert!(named <= runs.len() as u64 * u64::from(u32::MAX));
+                Ok(()) => {
                     for r in &runs {
                         assert!(r.start + u64::from(r.len) <= total_extents);
                     }
@@ -84,11 +82,24 @@ fn check_service_edge(call: &ManagerCall, total_extents: u64, record_seed: &[u8]
                     );
                 }
             }
+            // The coalesce is bounded by the FRAME's own run count and
+            // yields disjoint ascending runs naming no more than the
+            // input; the intersection emits each record extent at most
+            // once — strictly ascending by construction, no dedup step
+            // exists to hide an over-allocation behind (Issue 2's
+            // residual: the pre-dedup list was ∝ runs × record).
+            let coalesced = coalesce_runs(&runs);
+            assert!(coalesced.len() <= runs.len());
+            assert!(coalesced
+                .windows(2)
+                .all(|w| { w[0].start + u64::from(w[0].len) < w[1].start }));
+            assert!(runs_extent_count(&coalesced) <= runs_extent_count(&runs));
             let inside = intersect_runs_with_record(&runs, &record);
             assert!(
                 inside.len() as u64 <= record.len(),
                 "the materialized list is bounded by the record"
             );
+            assert!(inside.windows(2).all(|w| w[0] < w[1]), "strictly ascending");
             for e in &inside {
                 assert!(record.contains(*e));
             }

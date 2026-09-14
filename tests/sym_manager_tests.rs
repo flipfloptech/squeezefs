@@ -2148,11 +2148,12 @@ async fn a_leased_trees_smo_inside_the_final_cycle_survives_a_clean_leave() {
 /// Issue 16's belt: a leave over an UNCOVERED region window must never
 /// write that region's page `Free` (that declares the window covered and
 /// frees the ring). The seam `TEST_SHUTDOWN_FIXPOINT_CYCLES = 1` caps the
-/// shutdown fixpoint at one cycle — the defective loop's exact shape — so
-/// a final-cycle SMO leaves the region uncovered at the leave: the page
-/// stays `Live` with its roots and tail, the ring's extents stay claimed,
-/// and the next open recovers the region as OWN RESIDUE
-/// (`appender_self_recoveries == 1`) with every acked base readable.
+/// shutdown at ONE final cycle with no fixpoint iteration — the defective
+/// loop's exact shape when ring 0 is idle — so a final-cycle SMO leaves
+/// the region uncovered at the leave: the page stays `Live` with its
+/// roots and tail, the ring's extents stay claimed, and the next open
+/// recovers the region as OWN RESIDUE (`appender_self_recoveries ≥ 1`,
+/// region 1 among them) with every acked base readable.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_leave_over_an_uncovered_window_keeps_the_page_live_for_the_next_open() {
     use squeezefs::meta_backend::kv::backend::TEST_SHUTDOWN_FIXPOINT_CYCLES;
@@ -2196,10 +2197,11 @@ async fn a_leave_over_an_uncovered_window_keeps_the_page_live_for_the_next_open(
         assert!(!page.segments.is_empty(), "its ring is still named");
         let rb = open_with_partition(&uris, Some(PARTITION)).await;
         let vb = Arc::clone(&rb.volumes[0]);
-        assert_eq!(
-            stats(&vb).self_recoveries,
-            1,
-            "rounds={rounds}: the next open recovers appender 1 as its own residue"
+        let s = stats(&vb);
+        assert!(
+            s.regions[1].self_recovered && s.self_recoveries >= 1,
+            "rounds={rounds}: the next open recovers appender 1 as its own residue (region 0 \
+             too when the cadence left ring 0 uncovered): {s:?}"
         );
         for base in &acked {
             assert_eq!(
@@ -2214,6 +2216,162 @@ async fn a_leave_over_an_uncovered_window_keeps_the_page_live_for_the_next_open(
         break;
     }
     assert!(hit, "no round count produced an SMO inside the final cycle");
+}
+
+// ---------------------------------------------------------------------------
+// Review round 2 — Issues 17 and 18.
+// ---------------------------------------------------------------------------
+
+/// Issue 17: a `ReturnExtents` naming an extent whose free is PENDING on
+/// the region's tail is REFUSED like a claimed one (the witness class):
+/// until the tail passes the free record a crash replays through the
+/// structure that still routes to the retired image (§4.7's coverage
+/// gate), so the extent becomes returnable only through
+/// `advance_durable` — the cadence returns it a few cycles later.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_return_of_a_pending_extent_is_refused_until_the_tail_covers_its_free() {
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    let uris = vec![format_stamped_member(dir.path(), "meta0").await];
+    let tag = volume_tag("vol-0011223344556677");
+    let guest_owner = guest_local_ino(3, 92);
+    std::env::set_var("SQUEEZEFS_META_FLUSH_INTERVAL_MS", "60000");
+    let routed = open_with_partition(&uris, Some(PARTITION)).await;
+    std::env::remove_var("SQUEEZEFS_META_FLUSH_INTERVAL_MS");
+    let vol = Arc::clone(&routed.volumes[0]);
+    for i in 0..4u64 {
+        vol.commit_block_refs(guest_owner, &refs(tag, guest_owner, i * 100, 40))
+            .await
+            .unwrap();
+    }
+    vol.checkpoint_now().await.unwrap();
+    vol.checkpoint_now().await.unwrap();
+    let tree = slot_tree(&vol, 4);
+    let old_root = tree.root();
+    let old_ext = extent_of(&vol, old_root.addr);
+    assert_eq!(
+        vol.defrag_compact_nodes(&[(0, old_root.addr)])
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        stats(&vol).regions[1].grant_pending,
+        1,
+        "the old root parked"
+    );
+    let refusals_before = stats(&vol).manager_verb_refusals;
+    let err = vol
+        .manager_return_runs(
+            1,
+            &[GrantRun {
+                start: old_ext,
+                len: 1,
+            }],
+        )
+        .await
+        .expect_err("a pending extent is not returnable");
+    assert!(err.to_string().contains("pending"), "{err}");
+    assert!(vol.allocator().is_allocated(old_ext), "the bit stays set");
+    assert!(vol.grant_holds(1, old_ext), "it stays in the RAM grant");
+    assert_eq!(stats(&vol).regions[1].grant_pending, 1);
+    assert_eq!(stats(&vol).manager_verb_refusals, refusals_before + 1);
+    // The tail passes the free: the cadence returns it normally.
+    let mut cycles = 0;
+    while vol.allocator().is_allocated(old_ext) && cycles < 6 {
+        vol.checkpoint_now().await.unwrap();
+        cycles += 1;
+    }
+    assert!(
+        !vol.allocator().is_allocated(old_ext),
+        "returned by the cadence within {cycles} cycles once covered"
+    );
+    assert_grant_closure(&stats(&vol));
+    for v in &routed.volumes {
+        v.shutdown().await.unwrap();
+    }
+}
+
+/// Issue 18: the flush pass's REACTIVE refill of an exhausted grant asks
+/// the compaction reserve for ONE SMO's images (`SMO_IMAGES_MAX`), never
+/// the derived user grant (the floor 8): on a heap drained to its reserve
+/// the refill carves at most `SMO_IMAGES_MAX` per grant, the reserve is
+/// not drained by one refill, and the deferred node completes without a
+/// manager stall.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_reactive_refill_asks_the_reserve_for_one_smos_images_not_the_derived_grant() {
+    use squeezefs::meta_backend::kv::appender::SMO_IMAGES_MAX;
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    let uris = vec![format_stamped_member(dir.path(), "meta0").await];
+    let tag = volume_tag("vol-0011223344556677");
+    let guest_owner = guest_local_ino(3, 93);
+    std::env::set_var("SQUEEZEFS_META_FLUSH_INTERVAL_MS", "60000");
+    let routed = open_with_partition(&uris, Some(PARTITION)).await;
+    std::env::remove_var("SQUEEZEFS_META_FLUSH_INTERVAL_MS");
+    let vol = Arc::clone(&routed.volumes[0]);
+    // One leaf in the leased slot, quiesced.
+    vol.commit_block_refs(guest_owner, &refs(tag, guest_owner, 0, 40))
+        .await
+        .unwrap();
+    vol.checkpoint_now().await.unwrap();
+    vol.checkpoint_now().await.unwrap();
+    // Appender 1 hands back its whole unclaimed remainder, then the
+    // USER-claimable heap is drained: only the reserve is left.
+    let remainder = vol.appenders_public().unwrap().regions[1]
+        .grant()
+        .unclaimed_runs();
+    vol.manager_return_runs(1, &remainder).await.unwrap();
+    assert_eq!(stats(&vol).regions[1].grant_unclaimed, 0);
+    let mut drained = Vec::new();
+    loop {
+        match vol.allocator().claim_user() {
+            Ok(e) => drained.push(e),
+            Err(squeezefs::meta_backend::kv::KvError::NoSpace { .. }) => break,
+            Err(e) => panic!("{e:?}"),
+        }
+    }
+    let reserve_left = vol.free_extents();
+    let s0 = stats(&vol);
+    // Enough records that the leaf's flush overflows its log: the flush
+    // pass's SMO meets an EMPTY grant and refills reactively.
+    for i in 0..6u64 {
+        vol.commit_block_refs(guest_owner, &refs(tag, guest_owner, 1000 + i * 1000, 400))
+            .await
+            .unwrap();
+    }
+    vol.checkpoint_now().await.unwrap();
+    vol.checkpoint_now().await.unwrap();
+    let s1 = stats(&vol);
+    let grants = s1.extent_grants - s0.extent_grants;
+    let carved = s1.extent_grant_extents - s0.extent_grant_extents;
+    assert!(grants >= 1, "the reactive refill engaged: {s1:?}");
+    assert!(
+        carved <= u64::from(SMO_IMAGES_MAX) * grants,
+        "{carved} extents over {grants} reactive grant(s) — more than one SMO's images \
+         ({SMO_IMAGES_MAX}) per refill from the reserve"
+    );
+    assert!(
+        carved < GRANT_EXTENTS_FLOOR * grants,
+        "a reactive refill must never take the derived user grant ({GRANT_EXTENTS_FLOOR}) from \
+         the reserve: {carved} over {grants}"
+    );
+    assert!(
+        vol.free_extents() + carved >= reserve_left,
+        "the reserve only paid the refills"
+    );
+    assert_eq!(s1.dependency_stalls, 0, "no manager stall");
+    assert!(
+        s1.regions[1].grant_claimed >= 1,
+        "the deferred SMO completed inside the refill: {:?}",
+        s1.regions[1]
+    );
+    for e in drained {
+        vol.allocator().release_unpublished(e);
+    }
+    for v in &routed.volumes {
+        v.shutdown().await.unwrap();
+    }
 }
 
 // ---------------------------------------------------------------------------

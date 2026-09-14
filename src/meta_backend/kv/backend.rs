@@ -2935,10 +2935,51 @@ impl KvMetaBackend {
             return Ok(());
         }
         let node_size = u64::from(self.sb.node_size);
+        // The belt (review round 2, Issue 16): a declared region whose
+        // ring is UNCOVERED at the leave — its window holds records no
+        // durable tail passed (the final fixpoint did not converge, or a
+        // seam capped it) — is NOT released: a `Free` page over that
+        // window would declare it covered and free the ring, and the next
+        // open would route through the predecessor images (acked records
+        // lost). Its page stays `Live` with its roots and tail, its ring
+        // and grant stay claimed, and the next open of this identity
+        // recovers it as own residue. Loud — this is the shutdown
+        // guarantee missed, never a silent loss.
+        // Region 0's ring is the fixed ring: its page names the roots of
+        // the guest slots the manager holds (a moved root reaches tree 0
+        // only through the next cycle), so the same law governs it. The
+        // verdict is taken ONCE, here, before the leave's own control
+        // entries (the grant returns below ride ring 0 — barriered,
+        // root-free, replayed idempotently; they are not the window this
+        // law guards).
+        let uncovered_ids: std::collections::BTreeSet<u32> = set
+            .regions
+            .iter()
+            .filter(|r| {
+                let ring = r.ring();
+                let core = ring.core();
+                core.head() > core.reusable_upto()
+            })
+            .map(|r| r.id)
+            .collect();
+        let uncovered = |r: &super::appender::AppenderRegion| uncovered_ids.contains(&r.id);
+        for region in set.regions.iter().filter(|r| uncovered(r)) {
+            let ring = region.ring();
+            log::warn!(
+                "meta volume {}: appender {}'s ring is UNCOVERED at the leave (head {}, \
+                 reusable_upto {}) — its page stays Live with its roots and its ring stays \
+                 claimed; the next mount of this identity recovers the window as own residue \
+                 (the shutdown fixpoint did not cover every ring)",
+                self.path.display(),
+                region.id,
+                ring.core().head(),
+                ring.core().reusable_upto()
+            );
+        }
         // §5.1.3: a released region's UNCLAIMED grant (and every free its
         // tail already covered) returns to the heap — one control entry
         // per region, before its page goes Free.
-        for region in set.regions.iter().skip(1) {
+        for region in set.regions.iter().skip(1).filter(|r| !uncovered(r)) {
             let mut back: Vec<u64> = {
                 let mut g = region.grant();
                 let mut v = g.take_returnable();
@@ -2959,7 +3000,7 @@ impl KvMetaBackend {
             }
         }
         let mut released: Vec<super::superblock::ExtentRef> = Vec::new();
-        for region in &set.regions {
+        for region in set.regions.iter().filter(|r| !uncovered(r)) {
             {
                 let mut page = region.page.lock().unwrap_or_else(|e| e.into_inner());
                 page.state = super::appender::AppenderState::Free;
@@ -3429,32 +3470,47 @@ impl KvMetaBackend {
         let set = self.manager_gate(false)?;
         let total = self.alloc.total_extents();
         let record = self.extent_grant_record(appender_id).await?;
-        let named = match super::appender::validate_return_runs(runs, total) {
-            Ok(named) => named,
-            Err(r) => {
-                set.verbs.rejected.fetch_add(1, Ordering::Relaxed);
-                return Err(KvError::Rejected(format!(
-                    "{}: ReturnExtents from appender {appender_id} rejected — run ({}, {}) lies \
-                     outside this volume's {total} extents (manager_verb_rejected)",
-                    self.path.display(),
-                    r.start,
-                    r.len
-                )));
-            }
-        };
-        // Interval intersection with the record's runs: the list is
-        // bounded by the record.
-        let extents = super::appender::intersect_runs_with_record(runs, &record);
+        if let Err(r) = super::appender::validate_return_runs(runs, total) {
+            set.verbs.rejected.fetch_add(1, Ordering::Relaxed);
+            return Err(KvError::Rejected(format!(
+                "{}: ReturnExtents from appender {appender_id} rejected — run ({}, {}) lies \
+                 outside this volume's {total} extents (manager_verb_rejected)",
+                self.path.display(),
+                r.start,
+                r.len
+            )));
+        }
+        // The frame's runs COALESCED first (bounded by the frame's own
+        // length), then intersected with the record (bounded by the
+        // record) — never a list proportional to runs × record. `named`
+        // is counted AFTER the coalesce, so a duplicated run is one
+        // extent, not two (Issue 19).
+        let coalesced = super::appender::coalesce_runs(runs);
+        let named = super::appender::runs_extent_count(&coalesced);
+        let extents = super::appender::intersect_coalesced_with_record(&coalesced, &record);
         if extents.is_empty() {
-            // Everything named is already outside the record.
+            // Everything named is already outside the record: a replay
+            // after a lost reply — or a peer naming what it never held,
+            // which the debug line lets it find.
+            log::debug!(
+                "meta volume {}: ReturnExtents from appender {appender_id} names {named} \
+                 extent(s) in {} run(s), none inside its grant record ({} extent(s)) — \
+                 answered already (manager_verb_replays)",
+                self.path.display(),
+                coalesced.len(),
+                record.len()
+            );
             set.verbs.replays.fetch_add(1, Ordering::Relaxed);
             return Ok((0, named));
         }
-        let already = named.saturating_sub(extents.len() as u64);
-        let (cleared, _) = self
+        let outside = named.saturating_sub(extents.len() as u64);
+        // The inner partition runs against the FRESH record under the
+        // verb mutex: what a concurrent return took is `already` too, so
+        // `cleared + already ≡ named` on every reply.
+        let (cleared, inner_already) = self
             .return_extents_inner(appender_id, &extents, false)
             .await?;
-        Ok((cleared, already))
+        Ok((cleared, outside.saturating_add(inner_already)))
     }
 
     async fn return_extents_inner(
@@ -3476,33 +3532,36 @@ impl KvMetaBackend {
         }
         // An in-process region's RAM grant must not disagree with the
         // bitmap (Issue 11): an extent it still holds CLAIMED holds a live
-        // image — refused; unclaimed / parked / returnable are dropped
-        // from RAM BEFORE the durable return (an SMO claiming one between
-        // the screen and the bit clear would write an image into an
-        // extent the manager re-grants), restored to the returnable batch
-        // if the return fails — so a later `claim()` can never hand out
-        // an extent the manager re-granted.
+        // image, one PENDING has its free parked on the region's tail (the
+        // §4.7 coverage gate — Issue 17) — both refused; unclaimed /
+        // returnable are dropped from RAM BEFORE the durable return (an
+        // SMO claiming one between the screen and the bit clear would
+        // write an image into an extent the manager re-grants), restored
+        // to the returnable batch if the return fails — so a later
+        // `claim()` can never hand out an extent the manager re-granted.
         let mut dropped_from_ram: Vec<u64> = Vec::new();
         if let Some(r) = set.region(appender_id) {
             let mut g = r.grant();
-            let mut live: Vec<u64> = Vec::new();
+            let mut held: Vec<(u64, super::appender::GrantHeld)> = Vec::new();
             for e in &granted {
                 match g.drop_returned(*e) {
                     Ok(true) => dropped_from_ram.push(*e),
                     Ok(false) => {}
-                    Err(()) => live.push(*e),
+                    Err(why) => held.push((*e, why)),
                 }
             }
-            if !live.is_empty() {
+            if !held.is_empty() {
                 g.restore_returnable(std::mem::take(&mut dropped_from_ram));
                 drop(g);
                 set.verbs.refusals.fetch_add(1, Ordering::Relaxed);
+                let (e, why) = held[0];
                 return Err(KvError::Busy(format!(
                     "{}: ReturnExtents from appender {appender_id} refused — {} extent(s) are \
-                     claimed (live images): {:?} (manager_verb_refusals)",
+                     held by its grant, the first {e} {}: {:?} (manager_verb_refusals)",
                     self.path.display(),
-                    live.len(),
-                    &live[..live.len().min(4)]
+                    held.len(),
+                    why.as_str(),
+                    held.iter().map(|(e, _)| *e).take(4).collect::<Vec<_>>()
                 )));
             }
         }

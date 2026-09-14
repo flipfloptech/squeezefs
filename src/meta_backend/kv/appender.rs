@@ -816,6 +816,18 @@ pub fn appenders_capacity(heap_len: u64, ring_bytes: u64) -> u64 {
 
 // ---- Extent grants (§5.3.3) -------------------------------------------------
 
+/// The images ONE SMO of a slot tree claims at most (physical): a
+/// compaction claims 1; a leaf split claims its parts — a one-node log
+/// folds into ≤ 2 parts at the ¾ fill, and the frozen delta riding the
+/// split can add a third (`NodeLayout::smo_extents_for_parts`'s `parts +
+/// 2` over-promise is the ADMISSION's cushion, not a claim count) — plus
+/// the new root a ROOT leaf's split mints. The flush pass's REACTIVE
+/// refill of an exhausted grant asks for exactly this from the
+/// compaction reserve (review round 2, Issue 18): the manager's own SMOs
+/// draw the reserve one image at a time, and a refill that took the full
+/// derived grant (the floor 8, or more) into one region's grant would
+/// starve the manager's recovery-class claims on a near-full heap.
+pub const SMO_IMAGES_MAX: u32 = 3 + 1;
 /// The extent-grant FLOOR, extents: one image per pending root swap per
 /// checkpoint cycle (a compaction or split of a slot tree claims ≤ 2
 /// extents) × up to 4 pending swaps per cycle — the mixed tree's SMO
@@ -897,46 +909,109 @@ pub fn manager_should_release_role(unreachable_for_ms: u64, t_owner_ms: u64) -> 
 /// The service-edge validation of a wire `ReturnExtents` (review round 1,
 /// Issue 2 — "bounded codec = bounded execution"): every run must lie
 /// inside the volume's `total_extents` and `start + len` must not
-/// overflow; the first offending run is the rejection, else the number of
-/// extents the runs NAME (saturating — a count for the reply, never a
-/// capacity). Pure over the integers: nothing here allocates
-/// proportional to them (fuzzed by `manager_call_frame`, mirrored in
-/// `decoder_property_tests`).
-pub fn validate_return_runs(runs: &[GrantRun], total_extents: u64) -> Result<u64, GrantRun> {
-    let mut named: u64 = 0;
+/// overflow; the first offending run is the rejection. Pure over the
+/// integers: nothing here allocates (fuzzed by `manager_call_frame`,
+/// mirrored in `decoder_property_tests`).
+pub fn validate_return_runs(runs: &[GrantRun], total_extents: u64) -> Result<(), GrantRun> {
     for r in runs {
         match r.start.checked_add(u64::from(r.len)) {
             Some(end) if end <= total_extents => {}
             _ => return Err(*r),
         }
-        named = named.saturating_add(u64::from(r.len));
     }
-    Ok(named)
+    Ok(())
 }
 
-/// The extents `runs` name INSIDE `record`, as an ascending deduplicated
-/// list — computed as interval intersections (O(runs × record runs)), so
-/// the list is bounded by the record's extent count, never by the frame's
-/// integers.
+/// The frame's runs COALESCED: sorted by start, overlapping and adjacent
+/// runs merged, an overflowing or empty run dropped — a list of DISJOINT
+/// ascending runs no longer than the input (one pass over the frame's own
+/// runs, O(n log n), the only allocation proportional to the frame — and
+/// bounded by the frame's own byte length, never by the integers it
+/// carries). Review round 2, Issue 2 residual: the intersection below
+/// used to emit one extent per (frame run × record extent) BEFORE a
+/// dedup, so 250K copies of one run over a 4,096-extent record built an
+/// 8 GiB list on the manager; coalescing first makes every later step
+/// bounded by the record.
+pub fn coalesce_runs(runs: &[GrantRun]) -> Vec<GrantRun> {
+    let mut sorted: Vec<GrantRun> = runs
+        .iter()
+        .filter(|r| r.len > 0 && r.start.checked_add(u64::from(r.len)).is_some())
+        .copied()
+        .collect();
+    sorted.sort_unstable_by_key(|r| (r.start, r.len));
+    let mut out: Vec<GrantRun> = Vec::new();
+    for r in sorted {
+        let r_end = r.start + u64::from(r.len);
+        match out.last_mut() {
+            Some(last) if r.start <= last.start + u64::from(last.len) => {
+                let last_end = last.start + u64::from(last.len);
+                let end = last_end.max(r_end);
+                // A merged run longer than the wire's `u32` splits (the
+                // codec's own bound); `run_len` keeps it exact.
+                match u32::try_from(end - last.start) {
+                    Ok(len) => last.len = len,
+                    Err(_) => {
+                        last.len = u32::MAX;
+                        let next_start = last.start + u64::from(u32::MAX);
+                        if next_start < end {
+                            out.push(GrantRun {
+                                start: next_start,
+                                len: (end - next_start) as u32,
+                            });
+                        }
+                    }
+                }
+            }
+            _ => out.push(r),
+        }
+    }
+    out
+}
+
+/// Extents a list of runs names (saturating).
+pub fn runs_extent_count(runs: &[GrantRun]) -> u64 {
+    runs.iter()
+        .fold(0u64, |n, r| n.saturating_add(u64::from(r.len)))
+}
+
+/// The extents `runs` name INSIDE `record`, as a strictly ascending list:
+/// the frame's runs are COALESCED first ([`coalesce_runs`] — disjoint,
+/// ascending), then intersected as intervals with the record's own
+/// disjoint ascending runs, so every emitted extent is distinct by
+/// construction (no dedup, no intermediate list) and the output is
+/// bounded by the RECORD's extent count — the only allocations are the
+/// coalesced runs (≤ the frame's) and the output (≤ the record's).
 pub fn intersect_runs_with_record(
     runs: &[GrantRun],
     record: &super::slot_state::ExtentGrantRecord,
 ) -> Vec<u64> {
+    intersect_coalesced_with_record(&coalesce_runs(runs), record)
+}
+
+/// [`intersect_runs_with_record`] over runs the caller already coalesced.
+pub fn intersect_coalesced_with_record(
+    coalesced: &[GrantRun],
+    record: &super::slot_state::ExtentGrantRecord,
+) -> Vec<u64> {
     let mut extents: Vec<u64> = Vec::new();
-    for r in runs {
-        let Some(re) = r.start.checked_add(u64::from(r.len)) else {
-            continue;
-        };
-        for g in &record.runs {
-            let ge = g.start + u64::from(g.len);
-            let (s, e) = (r.start.max(g.start), re.min(ge));
-            if s < e {
-                extents.extend(s..e);
-            }
+    // Both lists are disjoint and ascending: a merge walk emits each
+    // intersection once, in order.
+    let (mut i, mut j) = (0usize, 0usize);
+    while i < coalesced.len() && j < record.runs.len() {
+        let r = coalesced[i];
+        let g = record.runs[j];
+        let (rs, re) = (r.start, r.start + u64::from(r.len));
+        let (gs, ge) = (g.start, g.start + u64::from(g.len));
+        let (s, e) = (rs.max(gs), re.min(ge));
+        if s < e {
+            extents.extend(s..e);
+        }
+        if re < ge {
+            i += 1;
+        } else {
+            j += 1;
         }
     }
-    extents.sort_unstable();
-    extents.dedup();
     extents
 }
 
@@ -948,6 +1023,25 @@ pub fn clamp_grant_want(want: u32, cap: u64) -> u64 {
         cap
     } else {
         u64::from(want).min(cap)
+    }
+}
+
+/// Why a RAM grant refuses to drop an extent for a return
+/// ([`RegionGrant::drop_returned`]): it holds a live image, or its free is
+/// still parked on the region's tail.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GrantHeld {
+    Claimed,
+    Pending,
+}
+
+impl GrantHeld {
+    /// The refusal's word.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Claimed => "claimed (a live image)",
+            Self::Pending => "pending (its free is parked on the region's tail — not returnable until the tail passes it)",
+        }
     }
 }
 
@@ -1208,21 +1302,25 @@ impl RegionGrant {
         std::sync::Arc::clone(&self.promised)
     }
 
-    /// Drop `extent` from every set that is not a live image: a
-    /// `ReturnExtents` of an extent an in-process region's RAM grant still
-    /// holds (review round 1, Issue 11) — the bitmap and the RAM grant
-    /// must not disagree, or a later `claim()` hands out an extent the
-    /// manager re-granted. `Err(())` when the extent is CLAIMED (it holds
-    /// an image); `Ok(true)` when it was dropped, `Ok(false)` when no set
-    /// held it.
-    pub fn drop_returned(&mut self, extent: u64) -> std::result::Result<bool, ()> {
+    /// Drop `extent` from the sets a return may take it from — UNCLAIMED
+    /// and RETURNABLE: a `ReturnExtents` of an extent an in-process
+    /// region's RAM grant still holds (review round 1, Issue 11) — the
+    /// bitmap and the RAM grant must not disagree, or a later `claim()`
+    /// hands out an extent the manager re-granted. `Err(Held)` when the
+    /// extent is CLAIMED (it holds an image) or PENDING (its free is parked
+    /// on this region's tail — until the tail passes the free record a
+    /// crash replays through the structure that still routes to the
+    /// retired image, the §4.7 coverage gate; review round 2, Issue 17 —
+    /// it becomes returnable only through `advance_durable`); `Ok(true)`
+    /// when it was dropped, `Ok(false)` when no set held it.
+    pub fn drop_returned(&mut self, extent: u64) -> std::result::Result<bool, GrantHeld> {
         if self.claimed.contains(&extent) {
-            return Err(());
+            return Err(GrantHeld::Claimed);
+        }
+        if self.pending.iter().any(|(e, _)| *e == extent) {
+            return Err(GrantHeld::Pending);
         }
         let mut dropped = self.unclaimed.remove(&extent);
-        let before = self.pending.len();
-        self.pending.retain(|(e, _)| *e != extent);
-        dropped |= self.pending.len() != before;
         let before = self.returnable.len();
         self.returnable.retain(|e| *e != extent);
         dropped |= self.returnable.len() != before;

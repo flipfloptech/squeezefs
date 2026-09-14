@@ -1487,22 +1487,47 @@ async fn tick(
         // journaled; a cycle only journals when it rewrites a full node
         // log (strictly consumed), so this converges within the SMO
         // cascade height. The bound is defensive.
-        for _ in 0..16 {
+        //
+        // The fixpoint is over EVERY ring (review round 2, Issue 16):
+        // since PR 3 a leased slot tree's SMO journals into its REGION's
+        // ring and clamps the REGION's tail, and its moved root reaches
+        // tree 0 only through the NEXT cycle's publication — so a cycle
+        // that left ring 0 at `head == reusable_upto` can leave a region
+        // uncovered, and the leave that followed wrote that region's page
+        // `Free` over the uncovered window (acked records lost). A cycle
+        // N+1 publishes what cycle N's flush pass moved and covers the
+        // region's records; N+2 covers the publication itself.
+        // The seam counts TOTAL final cycles (the one above included): `1`
+        // = no fixpoint iteration at all — the ring-0-idle shape of the
+        // defect.
+        let bound = match crate::meta_backend::kv::backend::TEST_SHUTDOWN_FIXPOINT_CYCLES
+            .load(Ordering::Relaxed)
+        {
+            0 => 16,
+            n => n - 1,
+        };
+        let uncovered = |be: &KvMetaBackend| {
             let core = be.journal_ring().core();
-            if core.head() == core.reusable_upto() {
+            core.head() != core.reusable_upto()
+                || be.appenders().is_some_and(|a| a.rings_uncovered())
+        };
+        for _ in 0..bound {
+            if !uncovered(be) {
                 return Ok(());
             }
             be.checkpoint_cycle(&mut smo, true).await?;
             *last_checkpoint = std::time::Instant::now();
         }
-        let core = be.journal_ring().core();
-        if core.head() != core.reusable_upto() {
+        if uncovered(be) {
+            let core = be.journal_ring().core();
             log::warn!(
                 "shutdown checkpoint did not converge to an empty replay window \
-                 (head={}, reusable_upto={}): the next mount will replay the residue \
-                 (sound, but the shutdown tail==head guarantee was missed)",
+                 (ring 0 head={}, reusable_upto={}; a declared region uncovered: {}): the \
+                 next mount will replay the residue (sound — an uncovered region's page \
+                 stays Live at the leave — but the shutdown tail==head guarantee was missed)",
                 core.head(),
-                core.reusable_upto()
+                core.reusable_upto(),
+                be.appenders().is_some_and(|a| a.rings_uncovered())
             );
         }
     }
@@ -1609,7 +1634,11 @@ impl KvMetaBackend {
             // extents — so the grant is carved in the INTERNAL class and
             // draws down to the compaction floor like the manager's own
             // (Issue 6: the heap-full recovery must make progress on a
-            // leased slot tree too); a heap that cannot serve even that
+            // leased slot tree too) — and for exactly ONE SMO's images
+            // (`SMO_IMAGES_MAX`), never the derived user grant: the
+            // reserve is the manager's recovery budget, drawn one image
+            // at a time (Issue 18); the USER-class cadence sizes the
+            // steady-state grant. A heap that cannot serve even that
             // answers `NoSpace`, which is the SPACE class below — never
             // the manager dependency.
             if let (Err(KvError::GrantExhausted { appender, .. }), Some(id)) = (&out, region_id) {
@@ -1617,7 +1646,7 @@ impl KvMetaBackend {
                     match self
                         .manager_extent_grant_class(
                             id,
-                            0,
+                            super::appender::SMO_IMAGES_MAX,
                             super::alloc_ext_core::AllocClass::Internal,
                         )
                         .await

@@ -3448,3 +3448,62 @@ async fn a_leave_crash_history_remounts_without_a_custody_conflict() {
     assert_eq!(vol.block_ref_count(tag, 100).await.unwrap(), 1);
     shutdown(&routed).await;
 }
+
+// ---------------------------------------------------------------------------
+// Review round 3 — the handover's flush over a tree with pending structure
+// (found by Issue 21's large-tree fixture).
+// ---------------------------------------------------------------------------
+
+/// **The departing holder's flush is the release's own work.** A slot
+/// tree with pending SMOs at the handover — leaves past their split
+/// threshold, the shape every tree of operating size has — must still
+/// release: flush-then-transfer runs the holder's compactions and splits
+/// under `Releasing`, and the third gate state exists to refuse USER
+/// commits the door already drained, never the flush pass's own moves.
+/// Before the fix the SMO's leftover move into its successor was refused
+/// at `apply_locked` ("the slot is mid-handover") and the release failed
+/// — every tree larger than the suite's 1–10-leaf fixtures.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_handover_of_a_tree_with_pending_structure_runs_the_holders_own_smos() {
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    let uris = vec![format_stamped_member(dir.path(), "meta0").await];
+    let routed = open_under(&uris, &Knobs::armed().partition(PARTITION)).await;
+    let vol = Arc::clone(&routed.volumes[0]);
+    // ≈ 200 leaves of 15 KiB xattr values, the last of them dirty and
+    // past their split threshold when the release's flush runs.
+    let value = vec![0x3Cu8; 15 * 1024];
+    let ledger = Arc::clone(&vol.slot_leases().unwrap().extents);
+    let mut k = 0u64;
+    while ledger.get(SLOT4) < 200 {
+        for _ in 0..64 {
+            vol.setxattr_internal(ino_in_slot(SLOT4, 1 + k / 8), &format!("user.t{k}"), &value)
+                .await
+                .unwrap();
+            k += 1;
+        }
+        assert!(k < 50_000, "the tree never reached 200 extents");
+    }
+    let refusals0 =
+        squeezefs::meta_backend::kv::META_KV_LEAF_LEASE_REFUSALS.load(Ordering::Relaxed);
+    vol.release_slot_handover(1, SLOT4)
+        .await
+        .expect("the release lands over a tree with pending structure");
+    assert_eq!(
+        squeezefs::meta_backend::kv::META_KV_LEAF_LEASE_REFUSALS.load(Ordering::Relaxed),
+        refusals0,
+        "the holder's own flush is never refused by its own gate"
+    );
+    assert!(!vol.slot_leases().unwrap().gate.is_leased(SLOT4));
+    // Every record survives the release and a remount.
+    let probe = ino_in_slot(SLOT4, 1);
+    let v = vol.getxattr(probe, "user.t0").await.unwrap();
+    assert_eq!(v.as_deref(), Some(value.as_slice()));
+    drop(vol);
+    drop(routed);
+    let routed = open_under(&uris, &Knobs::armed().partition(PARTITION_ALT)).await;
+    let vol = Arc::clone(&routed.volumes[0]);
+    let v = vol.getxattr(probe, "user.t0").await.unwrap();
+    assert_eq!(v.as_deref(), Some(value.as_slice()));
+    shutdown(&routed).await;
+}

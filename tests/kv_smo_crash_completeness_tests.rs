@@ -67,7 +67,16 @@ async fn sandbox() -> (Arc<RoutedMetaBackend>, Arc<KvMetaBackend>, NamedTempFile
 /// only when the detached checkpoint/pass tasks drop their last Arc —
 /// poll-retry (a real crash releases the flock instantly; this is
 /// harness plumbing, not the contract under test).
+///
+/// The flock is waited for BEFORE `open` is called, not inside it: a
+/// held flock sends `open_writer` down its transient-holder arm, whose
+/// `probe_claim_best_effort` runs a posture-blind `open_inner` that
+/// bumps the process-global replay counters this suite reads as deltas
+/// (`META_KV_REPLAY_ROOT_FREES_DROPPED` once from the probe, once from
+/// the real open — `dropped 2 vs 1`, the PR-11 matrix flake). Waiting
+/// here makes every recovery counter delta the ONE open's.
 async fn reopen(path: &std::path::Path) -> Arc<KvMetaBackend> {
+    wait_for_writer_flock_free(path).await;
     for _ in 0..200 {
         match KvMetaBackend::open(path).await {
             Ok(be) => return be,
@@ -78,6 +87,33 @@ async fn reopen(path: &std::path::Path) -> Arc<KvMetaBackend> {
         }
     }
     panic!("writer guard must release once the old backend is dropped");
+}
+
+/// Poll the device node's Layer-A `flock` until the dropped backend's
+/// detached tasks have released it (taken `LOCK_EX | LOCK_NB` and
+/// released immediately — nothing else contends for a test volume).
+async fn wait_for_writer_flock_free(path: &std::path::Path) {
+    use std::os::unix::io::AsRawFd;
+    for _ in 0..400 {
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+            .expect("open the volume for the flock probe");
+        // SAFETY: valid owned fd; LOCK_NB never blocks; the fd (and with
+        // it the lock) drops at the end of the iteration.
+        let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        if rc == 0 {
+            return;
+        }
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::EWOULDBLOCK),
+            "the flock probe fails only with EWOULDBLOCK"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    panic!("the dropped backend's detached tasks must release the writer flock");
 }
 
 /// The storm shape from the forensics, shrunk: bursts of acked creates

@@ -1059,6 +1059,7 @@ impl ExtentAllocator {
             // the page's newest valid copy.
             let page_gen = if has_copy && generation <= cur_gen {
                 let raised = cur_gen + 1;
+                super::META_KV_BITMAP_GENERATION_RAISES.fetch_add(1, Ordering::Relaxed);
                 log::warn!(
                     "bitmap page {page}: requested generation {generation} does not exceed \
                      the newest on-disk copy {cur_gen} (a checkpoint retry after a failed \

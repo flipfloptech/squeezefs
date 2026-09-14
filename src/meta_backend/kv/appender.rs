@@ -1300,6 +1300,7 @@ impl AppenderSet {
             ring_segments: self.ring_segments(),
             ring_grows: self.ring_grows(),
             flush_ceiling_overruns: self.flush_ceiling_overruns.load(Relaxed),
+            flush_ceiling_ms: appender_flush_ceiling_ms(),
             pressure_cycles: self.pressure_cycles.load(Relaxed),
             regions: self
                 .regions
@@ -1357,6 +1358,9 @@ pub struct AppenderStats {
     pub ring_segments: u64,
     pub ring_grows: u64,
     pub flush_ceiling_overruns: u64,
+    /// The flush ceiling in force, ms (`appender_flush_ceiling_ms`) —
+    /// published so the bound the gauge audits cannot drift from the docs.
+    pub flush_ceiling_ms: u64,
     /// Cycles a declared region's ring pressure made due.
     pub pressure_cycles: u64,
     pub regions: Vec<AppenderRegionStats>,

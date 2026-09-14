@@ -254,6 +254,15 @@ pub static META_KV_REPLAY_LEASE_VIOLATIONS: AtomicU64 = AtomicU64::new(0);
 /// holds no grant covering the extent; the mount refuses.
 pub static META_KV_REPLAY_EXTENT_VIOLATIONS: AtomicU64 = AtomicU64::new(0);
 
+/// DUR-4 law 2 engagements: bitmap page images whose requested generation
+/// tied or trailed the page's newest on-disk copy and were RAISED above it
+/// (`alloc_ext::write_dirty_pages`). The shape it was written for is a
+/// checkpoint RETRY after a failed cycle — on a healthy mount, across
+/// clean unmount/remount cycles included, it stays 0 (review round 2,
+/// Issue 18: the mount resumes its checkpoint seq above the bitmap's
+/// newest generation, not the ledger's alone).
+pub static META_KV_BITMAP_GENERATION_RAISES: AtomicU64 = AtomicU64::new(0);
+
 /// Commit-path revalidation retries (design §4.6: a writer locked a leaf
 /// an SMO had superseded between resolution and lock — unlock, re-resolve,
 /// retry; SMOs are rare and serialized, so the loop is short). Surfaced as

@@ -856,12 +856,20 @@ fn appender_violations_key_lease_extent_are_each_detected() {
 use squeezefs::meta_backend::kv::appender::{
     appender_flush_ceiling_ms, read_page, write_page, AppenderStats, TEST_APPENDER_SLOTS_ENV,
 };
+use squeezefs::meta_backend::kv::backend::{
+    test_conveyor_hold_release, TEST_CONVEYOR_HOLD_PRE_ROLLBACK, TEST_CONVEYOR_HOLD_STAGE,
+};
 use squeezefs::meta_backend::kv::block_refs::{volume_tag, BlockRef, BlockRefOp};
 use squeezefs::meta_backend::kv::builder::{digest_backend, format_v3_stamped, FormatV3Options};
 use squeezefs::meta_backend::kv::checkpoint::read_newest_ledger;
+use squeezefs::meta_backend::kv::node::{write_node, NodeLayout, NodeWriteParams, MIN_NODE_SIZE};
+use squeezefs::meta_backend::kv::node_cache::{
+    NodeCache, NodeCacheConfig, OwnedRec, DEFAULT_WRITEBACK_DELTA_BYTES,
+};
+use squeezefs::meta_backend::kv::record::RecordKind;
 use squeezefs::meta_backend::kv::{
-    META_KV_REPLAY_EXTENT_VIOLATIONS, META_KV_REPLAY_KEY_VIOLATIONS,
-    META_KV_REPLAY_LEASE_VIOLATIONS,
+    META_KV_BITMAP_GENERATION_RAISES, META_KV_REPLAY_EXTENT_VIOLATIONS,
+    META_KV_REPLAY_KEY_VIOLATIONS, META_KV_REPLAY_LEASE_VIOLATIONS,
 };
 use squeezefs::meta_backend::{
     guest_local_ino, open_routed_meta_set, open_volume_for_mount, plan_meta_slot_set, Metadata,
@@ -1613,8 +1621,11 @@ async fn the_flush_ceiling_is_the_checkpoint_age_and_a_parked_device_moves_the_o
         "a normal run never overruns"
     );
     // A parked device: the flush pass's covering barrier lands past the
-    // ceiling while a dirty leaf waited on it.
-    let park = std::time::Duration::from_millis(appender_flush_ceiling_ms() + 400);
+    // ceiling while a dirty leaf waited on it (the ceiling in force is the
+    // default cadence's; the gauge publishes it).
+    let ceiling = stats(&va).flush_ceiling_ms;
+    assert_eq!(ceiling, appender_flush_ceiling_ms());
+    let park = std::time::Duration::from_millis(ceiling + 400);
     squeezefs::uring_fs::arm_device_latency(&path, std::time::Duration::ZERO, park);
     ra.create(ROOT_INO, "late", libc::S_IFREG | 0o644, 0, 0)
         .await
@@ -1876,4 +1887,300 @@ async fn a_failed_window_in_a_declared_region_compensates_into_its_own_ring() {
     for v in &rb.volumes {
         v.shutdown().await.unwrap();
     }
+}
+
+// ---------------------------------------------------------------------------
+// Review round 2 — Issues 22, 18, 23, 24, pinned red first.
+// ---------------------------------------------------------------------------
+
+/// Review round 2, Issue 22 (bug): the audit compared the leaf's age
+/// against the cadence TRIGGER (1,000 ms) — but the tick makes a cycle due
+/// AT the trigger, so a leaf dirtied ε after a checkpoint is `1000 + pass −
+/// ε` old at its covering barrier and the must-stay-0 gauge fired on a
+/// healthy stamped mount under any steady stream at the DEFAULT cadence
+/// (the reviewer read 3 overruns in 3.5 s, ages 1,013–1,060 ms). The
+/// ceiling is the LANDING one (`checkpoint_landing_ceiling_ms`); a steady
+/// stream into BOTH regions for ≥ 5 s at the default cadence moves the
+/// gauge by nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_steady_write_stream_at_the_default_cadence_never_overruns_the_flush_ceiling() {
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    // The DEFAULT cadence — the shipped shape the tripwire must be silent on.
+    std::env::remove_var("SQUEEZEFS_META_FLUSH_INTERVAL_MS");
+    let uris = vec![format_stamped_member(dir.path(), "meta0").await];
+    let tag = volume_tag("vol-0011223344556677");
+    // Region 0 through the native slot's owner, region 1 through guest
+    // slot 3's (the two-appender contract's shape). A routed CREATE is not
+    // the vehicle under the declared partition: the mint spread lands ~1
+    // in 64 child inos in the declared slot, and a tx spanning the parent's
+    // slot and the child's is the §5.6 cross-owner refusal as the seam
+    // models it (PR 6's intents) — the seam's known shape, not this
+    // contract's subject.
+    let manager_owner = 1000u64;
+    let guest_owner = guest_local_ino(3, 41);
+    let ra = open_with_partition(&uris, Some(PARTITION)).await;
+    let va = Arc::clone(&ra.volumes[0]);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let mut i = 0u64;
+    while std::time::Instant::now() < deadline {
+        va.commit_block_refs(manager_owner, &refs(tag, manager_owner, i * 4, 2))
+            .await
+            .unwrap();
+        va.commit_block_refs(guest_owner, &refs(tag, guest_owner, i * 4, 2))
+            .await
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        i += 1;
+    }
+    let s = stats(&va);
+    assert!(i >= 500, "the stream ran: {i} rounds");
+    assert!(s.regions[0].ring_entries > 0 && s.regions[1].ring_entries > 0);
+    assert_eq!(
+        s.flush_ceiling_overruns, 0,
+        "a healthy stamped mount at the default cadence never overruns the flush ceiling \
+         ({} ms in force): {s:?}",
+        s.flush_ceiling_ms
+    );
+    for v in &ra.volumes {
+        v.shutdown().await.unwrap();
+    }
+}
+
+/// Review round 2, Issue 18 (nit, reproduced): the leave's bitmap write
+/// consumed a checkpoint seq that no ledger record carried, and the mount
+/// resumed `checkpoint_seq` from the ledger alone — so the next mount's
+/// first bitmap write TIED the leave's copy and took DUR-4's loud raise
+/// ("a checkpoint retry after a failed cycle") on every clean partitioned
+/// unmount → remount. The mount resumes above `max(ledger.seq, the
+/// bitmap's newest page generation)` — what DUR-4's own doc always said —
+/// and the raise stays the failed-cycle signal it was written for (its
+/// tripwire `meta_kv_bitmap_generation_raises` reads 0 across the cycles).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn clean_partitioned_remounts_never_take_the_bitmap_generation_raise() {
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    let uris = vec![format_stamped_member(dir.path(), "meta0").await];
+    let tag = volume_tag("vol-0011223344556677");
+    let guest_owner = guest_local_ino(3, 51);
+    let before = META_KV_BITMAP_GENERATION_RAISES.load(Ordering::Relaxed);
+    for cycle in 0..3u64 {
+        let ra = open_with_partition(&uris, Some(PARTITION)).await;
+        let va = Arc::clone(&ra.volumes[0]);
+        va.commit_block_refs(guest_owner, &refs(tag, guest_owner, cycle * 10, 2))
+            .await
+            .unwrap();
+        va.checkpoint_now().await.unwrap();
+        drop(va);
+        for v in &ra.volumes {
+            v.shutdown().await.unwrap();
+        }
+        drop(ra);
+        assert_eq!(
+            META_KV_BITMAP_GENERATION_RAISES.load(Ordering::Relaxed),
+            before,
+            "cycle {cycle}: a clean partitioned unmount → remount is not a failed-cycle retry \
+             — the bitmap generation is never raised"
+        );
+    }
+}
+
+/// Review round 2, Issue 23 (suggestion): the Dekker pair guards the PASS
+/// (stage A); the durability lane (stage B) holds only the ring `Arc` it
+/// was handed. Between a failed window's `complete` (its reservation
+/// closed — `min_inflight_start` clear) and its §4.4 pt 4 compensation,
+/// growth's `drained` predicate could hold and swap the ring, and the
+/// compensation would then reserve on the OLD ring object — a second core
+/// over the same extents, the compensating record lost at replay. A
+/// stage-B window counts against growth from its creation to its terminal
+/// outcome (`windows_inflight`), so growth never swaps a ring a window
+/// still names. The exact schedule is built: the doomed write held, its
+/// records frozen, the write failed, the lane PARKED before the rollback
+/// (`TEST_CONVEYOR_HOLD_PRE_ROLLBACK`) while two barriered cycles find the
+/// ring drained with a stall on record.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn growth_never_swaps_a_ring_with_a_stage_b_window_in_flight() {
+    struct HoldGuard;
+    impl Drop for HoldGuard {
+        fn drop(&mut self) {
+            TEST_CONVEYOR_HOLD_STAGE.store(0, Ordering::SeqCst);
+            test_conveyor_hold_release();
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    let _faults = FaultGuard;
+    let _hold = HoldGuard;
+    let _cadence = EnvVarGuard::set("SQUEEZEFS_META_FLUSH_INTERVAL_MS", "60000");
+    let _ring = EnvVarGuard::set("SQUEEZEFS_SYM_RING_KB", "512");
+    let uris = vec![format_stamped_member(dir.path(), "meta0").await];
+    let path = std::path::PathBuf::from(&uris[0]);
+    let tag = volume_tag("vol-0011223344556677");
+    let guest_owner = guest_local_ino(3, 61);
+    let ra = open_with_partition(&uris, Some(PARTITION)).await;
+    let va = Arc::clone(&ra.volumes[0]);
+    assert_eq!(stats(&va).regions[1].ring_bytes, 512 * 1024);
+    // A stall on record (the growth contract's storm; the test is the
+    // only drain), the ring NOT yet grown.
+    let committer = {
+        let v = Arc::clone(&va);
+        tokio::spawn(async move {
+            for i in 0..40u64 {
+                v.commit_block_refs(guest_owner, &refs(tag, guest_owner, i * 1000, 500))
+                    .await
+                    .unwrap();
+            }
+        })
+    };
+    let stall_deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while stats(&va).regions[1].stalls == 0 {
+        assert!(!committer.is_finished() && std::time::Instant::now() < stall_deadline);
+        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+    }
+    while !committer.is_finished() {
+        va.checkpoint_now().await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    committer.await.unwrap();
+    let s = stats(&va);
+    assert!(s.regions[1].stalls > 0);
+    assert_eq!(s.ring_grows, 0, "not grown yet: {:?}", s.regions[1]);
+    // The doomed write: held at the device, its stage-A records frozen
+    // into a bset by a checkpoint, then failed on release with the lane
+    // parked BEFORE its rollback — a stage-B window in flight, its
+    // reservation completed, its compensation not yet issued.
+    let ring1 = va.ring_of_region(1);
+    let phys = ring1.physical_offset_of(ring1.core().head());
+    let mut arrived = squeezefs::uring_fs::arm_write_stall(&path, phys, 8);
+    let doomed = {
+        let v = Arc::clone(&va);
+        tokio::spawn(async move {
+            v.commit_block_refs(guest_owner, &refs(tag, guest_owner, 90_000, 2))
+                .await
+        })
+    };
+    arrived
+        .recv()
+        .await
+        .expect("the doomed write reached the device shim");
+    va.checkpoint_now().await.unwrap();
+    TEST_CONVEYOR_HOLD_STAGE.store(TEST_CONVEYOR_HOLD_PRE_ROLLBACK, Ordering::SeqCst);
+    squeezefs::uring_fs::arm_sector_write_error(phys);
+    squeezefs::uring_fs::release_write_stall(&path);
+    // The lane parks pre-rollback once the failed write's outcome is known.
+    let park_deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while squeezefs::meta_backend::kv::backend::test_conveyor_hold_parked() == 0 {
+        assert!(
+            std::time::Instant::now() < park_deadline,
+            "the lane never parked"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+    }
+    // Two barriered cycles: the ring drains (the failed tx's leaves are
+    // flushed, the hole's tail lands) with the stall on record — the
+    // growth decision at each cycle's end must DECLINE while the window
+    // is in flight.
+    va.checkpoint_now().await.unwrap();
+    va.checkpoint_now().await.unwrap();
+    let s = stats(&va);
+    assert_eq!(
+        s.ring_grows, 0,
+        "growth never swaps a ring a stage-B window still names: {:?}",
+        s.regions[1]
+    );
+    // Release: the rollback compensates into the ring it holds — the
+    // CURRENT one — and the member fails.
+    TEST_CONVEYOR_HOLD_STAGE.store(0, Ordering::SeqCst);
+    test_conveyor_hold_release();
+    let out = doomed.await.unwrap();
+    assert!(out.is_err(), "the failed window fails its member: {out:?}");
+    squeezefs::uring_fs::clear_faults();
+    // With the window settled, growth proceeds on the next drained cycle.
+    va.checkpoint_now().await.unwrap();
+    va.checkpoint_now().await.unwrap();
+    let s = stats(&va);
+    assert!(s.ring_grows >= 1, "{:?}", s.regions[1]);
+    assert_eq!(va.block_ref_count(tag, 90_000).await.unwrap(), 0);
+    assert_eq!(va.block_ref_count(tag, 17_007).await.unwrap(), 1);
+    let live = digest_backend(&va).await.unwrap();
+    drop(va);
+    drop(ra);
+    let rb = open_with_partition(&uris, Some(PARTITION)).await;
+    assert_eq!(digest_backend(&rb.volumes[0]).await.unwrap(), live);
+    assert_eq!(rb.volumes[0].block_ref_count(tag, 90_000).await.unwrap(), 0);
+    for v in &rb.volumes {
+        v.shutdown().await.unwrap();
+    }
+}
+
+/// Review round 2, Issue 24 (nit): the leaf-age stamp is a forest-only
+/// instrument, so a node that carries no forest-slot stamp — every node of
+/// a bit-17-absent volume — takes no clock read at its clean → dirty
+/// transition: the flat path pays nothing (nothing before PR 14 changes a
+/// flat mount).
+#[tokio::test]
+async fn the_dirty_since_stamp_is_taken_only_on_forest_slot_nodes() {
+    let file = tempfile::NamedTempFile::new().unwrap();
+    let node_size = MIN_NODE_SIZE;
+    file.as_file().set_len(4 * node_size as u64).unwrap();
+    let cache = NodeCache::new(NodeCacheConfig {
+        path: file.path().to_path_buf(),
+        layout: NodeLayout::new(node_size).unwrap(),
+        heap_base: 0,
+        budget_bytes: 4 * node_size as u64,
+        writeback_delta_bytes: DEFAULT_WRITEBACK_DELTA_BYTES,
+    });
+    let mut nodes = Vec::new();
+    for e in 0..2u64 {
+        let addr = cache.extent_addr(e);
+        write_node(
+            cache.config().path.clone(),
+            &cache.config().layout,
+            &NodeWriteParams {
+                node_addr: addr,
+                node_seq: e + 1,
+                tree_id: TREE_INODES,
+                level: 0,
+                min_key: b"",
+                max_key: &[0xff; 8],
+            },
+            &[],
+            0,
+        )
+        .await
+        .unwrap();
+        nodes.push(cache.load(addr).await.unwrap().unwrap());
+    }
+    let rec = || {
+        vec![OwnedRec::new(
+            bytes::Bytes::from_static(b"k"),
+            1,
+            RecordKind::Put,
+            bytes::Bytes::from_static(b"v"),
+        )]
+    };
+    // A flat node: dirty, unstamped.
+    {
+        let mut g = nodes[0].lock().write().await;
+        nodes[0].apply_locked(&mut g, rec(), 1).unwrap();
+    }
+    assert_ne!(nodes[0].dirty_floor(), u64::MAX);
+    assert_eq!(
+        nodes[0].dirty_since_ns(),
+        0,
+        "a node of no forest slot takes no age stamp — the flat path's clean → dirty \
+         transition reads no clock"
+    );
+    // A slot-tree node: dirty, stamped.
+    nodes[1].stamp_forest_slot(guest_forest_slot(3));
+    {
+        let mut g = nodes[1].lock().write().await;
+        nodes[1].apply_locked(&mut g, rec(), 1).unwrap();
+    }
+    assert_ne!(nodes[1].dirty_floor(), u64::MAX);
+    assert_ne!(
+        nodes[1].dirty_since_ns(),
+        0,
+        "a forest-slot leaf is stamped"
+    );
 }

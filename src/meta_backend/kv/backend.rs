@@ -249,6 +249,24 @@ pub const TEST_CONVEYOR_HOLD_EMPTY_DRAIN_TAIL: u64 = 3;
 /// scenario honest instead of timing-lucky).
 pub static TEST_CONVEYOR_EMPTY_TAIL_PARKED: AtomicU64 = AtomicU64::new(0);
 
+/// [`TEST_CONVEYOR_HOLD_STAGE`] value: park the durability lane AFTER a
+/// group's reservations are completed (step 8 — `min_inflight_start`
+/// clear) and BEFORE its per-window verdicts (step 9 — the §4.4 pt 4
+/// rollback and its compensation): the window is in flight with its
+/// reservation closed, the shape review round 2 (Issue 23) named as the
+/// one a ring growth could race.
+pub const TEST_CONVEYOR_HOLD_PRE_ROLLBACK: u64 = 4;
+
+/// Monotonic count of lane groups that PARKED on
+/// [`TEST_CONVEYOR_HOLD_PRE_ROLLBACK`] — the test-side barrier that the
+/// schedule formed.
+static TEST_CONVEYOR_PRE_ROLLBACK_PARKED: AtomicU64 = AtomicU64::new(0);
+
+/// Lane groups parked on [`TEST_CONVEYOR_HOLD_PRE_ROLLBACK`] so far.
+pub fn test_conveyor_hold_parked() -> u64 {
+    TEST_CONVEYOR_PRE_ROLLBACK_PARKED.load(Ordering::Acquire)
+}
+
 /// The parked-pass wake for [`TEST_CONVEYOR_HOLD_STAGE`] (register-recheck
 /// discipline — a stale release can never strand a pass).
 static TEST_CONVEYOR_HOLD_NOTIFY: once_cell::sync::Lazy<squeezefs_ipc::sqz_notify::Notify> =
@@ -11634,6 +11652,22 @@ impl KvMetaBackend {
         for w in s.windows.iter_mut() {
             w.ring.complete(&w.res);
             w.res_open = false;
+        }
+        // Pre-rollback test seam (the Issue-23 schedule: reservations
+        // closed, verdicts not yet taken). Register-recheck-await.
+        if TEST_CONVEYOR_HOLD_STAGE.load(Ordering::Relaxed) == TEST_CONVEYOR_HOLD_PRE_ROLLBACK {
+            TEST_CONVEYOR_PRE_ROLLBACK_PARKED.fetch_add(1, Ordering::AcqRel);
+            while TEST_CONVEYOR_HOLD_STAGE.load(Ordering::Relaxed)
+                == TEST_CONVEYOR_HOLD_PRE_ROLLBACK
+            {
+                let notified = TEST_CONVEYOR_HOLD_NOTIFY.notified();
+                if TEST_CONVEYOR_HOLD_STAGE.load(Ordering::Relaxed)
+                    != TEST_CONVEYOR_HOLD_PRE_ROLLBACK
+                {
+                    break;
+                }
+                notified.await;
+            }
         }
 
         // (9) Per window, in order: the success arm or the rollback arm.

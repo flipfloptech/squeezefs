@@ -43,7 +43,7 @@ use squeezefs::meta_backend::kv::slot_state::{
     decode_slot_state_key, slot_state_key_range, SlotState,
 };
 use squeezefs::meta_backend::kv::{
-    META_KV_CHECKPOINTS, META_KV_LEAF_LEASE_REFUSALS, META_KV_REPLAY_KEY_VIOLATIONS,
+    KvError, META_KV_CHECKPOINTS, META_KV_LEAF_LEASE_REFUSALS, META_KV_REPLAY_KEY_VIOLATIONS,
     META_KV_REPLAY_LEASE_VIOLATIONS,
 };
 use squeezefs::meta_backend::{
@@ -2202,6 +2202,7 @@ fn the_leaves_batch_of_108_hundred_leaf_trees_packs_into_entries_under_the_cap()
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_leave_of_a_region_holding_several_trees_records_every_trees_tails() {
     use squeezefs::meta_backend::kv::slot_state::SlotTails;
+    let _ = env_logger::builder().is_test(true).try_init();
     const THREE: &str = "1:4,5,6";
     let slots: [ForestSlot; 3] = [4, 5, 6];
     let dir = tempfile::tempdir().unwrap();
@@ -2284,6 +2285,84 @@ async fn a_leave_of_a_region_holding_several_trees_records_every_trees_tails() {
         let (tg, tails) = vol.slot_tails(*s).await.unwrap().unwrap();
         assert_eq!((tg, tails.len()), (1, leaves[i]));
     }
+    shutdown(&routed).await;
+}
+
+/// **The reactive grant refill asks for the SMO's OWN need (round 3 —
+/// found by the three-tree leave fixture).** A leased leaf whose overlay
+/// splits into MORE parts than the one-SMO constant (`SMO_IMAGES_MAX` =
+/// 4) with the region's grant drained must still compact: the refusal
+/// names the need, the refill carves it, the retry lands. Before the fix
+/// the refill asked for the constant, §5.3.5's idempotency answered the
+/// 4-extent remainder VERBATIM at every later cycle while the split
+/// needed 6, the compaction deferred for ever, the region's tail never
+/// advanced and every commit parked at its full ring escalated through
+/// D1.b (`commit aborted while parked for ring space`, 2 runs in 5).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_leased_leafs_split_wider_than_the_one_smo_constant_is_refilled_to_its_need() {
+    use squeezefs::meta_backend::kv::appender::SMO_IMAGES_MAX;
+    use squeezefs::meta_backend::kv::META_KV_NODE_SPLITS;
+    let _ = env_logger::builder().is_test(true).try_init();
+    struct Cleanup;
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            std::env::remove_var("SQUEEZEFS_SYM_GRANT_EXTENTS");
+            std::env::remove_var("SQUEEZEFS_SYM_RING_KB");
+            std::env::remove_var("SQUEEZEFS_META_FLUSH_INTERVAL_MS");
+        }
+    }
+    let _cleanup = Cleanup;
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    let uris = vec![format_stamped_member(dir.path(), "meta0").await];
+    // The cadence's carve at its floor (8): the constant refill (4) plus
+    // one cadence carve (8) stays below the split's need below. The
+    // cadence PARKED and region 1's ring wide enough to hold the whole
+    // overlay, so ONE flush meets the whole split.
+    std::env::set_var("SQUEEZEFS_SYM_GRANT_EXTENTS", "8");
+    std::env::set_var("SQUEEZEFS_SYM_RING_KB", "4096");
+    std::env::set_var("SQUEEZEFS_META_FLUSH_INTERVAL_MS", "60000");
+    let routed = open_under(&uris, &Knobs::armed().partition(PARTITION)).await;
+    let vol = Arc::clone(&routed.volumes[0]);
+    // The tree minted (its root is the grant's first claim), then region
+    // 1's grant DRAINED: every unclaimed extent returned.
+    let value = vec![0x77u8; 15 * 1024];
+    let owner = ino_in_slot(SLOT4, 9);
+    vol.setxattr_internal(owner, "user.mint", &value)
+        .await
+        .unwrap();
+    let unclaimed = vol.region_grant_unclaimed(1);
+    assert!(!unclaimed.is_empty(), "the join minted a grant");
+    vol.manager_return_extents(1, &unclaimed).await.unwrap();
+    assert!(vol.region_grant_unclaimed(1).is_empty());
+    // One leaf's overlay: 48 × 15 KiB values under one ino — a split into
+    // ≥ 14 parts of a 64 KiB node, more than the constant plus one
+    // cadence carve at the floor cover.
+    for k in 0..48 {
+        vol.setxattr_internal(owner, &format!("user.wide{k}"), &value)
+            .await
+            .unwrap();
+    }
+    let splits0 = META_KV_NODE_SPLITS.load(Ordering::Relaxed);
+    let stalls0 = vol.appender_stats().unwrap().regions[1].dependency_stalls;
+    for _ in 0..3 {
+        vol.checkpoint_now().await.unwrap();
+    }
+    assert!(
+        META_KV_NODE_SPLITS.load(Ordering::Relaxed) > splits0,
+        "the wide split ran (the refill covered its need)"
+    );
+    let stalls = vol.appender_stats().unwrap().regions[1].dependency_stalls - stalls0;
+    assert!(
+        stalls <= 1,
+        "at most the one refusal that named the need, never a stall per cycle: {stalls}"
+    );
+    let grant = vol.appender_stats().unwrap().regions[1].grant_claimed;
+    assert!(
+        grant > u64::from(SMO_IMAGES_MAX),
+        "the split's images exceed the one-SMO constant: {grant} claimed"
+    );
+    assert!(!vol.is_failed());
     shutdown(&routed).await;
 }
 
@@ -2412,6 +2491,120 @@ async fn a_first_touch_acquire_parked_for_ring_space_never_holds_the_verb_mutex(
     assert_eq!(vol.block_ref_count(tag, 1).await.unwrap(), 1);
     assert!(!vol.is_failed(), "never the D1.b fail-stop");
     shutdown(&routed).await;
+}
+
+/// **Issue 23 (round 3): the rotor cap survives a crash-remount.** A
+/// solo mount's 64 rotor grants are re-adopted at the next open from
+/// tree 0, which does not carry the rotor bit; the arm rebuilds the rotor
+/// AND re-marks its slots, so `rotor_held_by(0)` reads 64 again and a
+/// rotor ask past `2 × M` refuses `RotorAtCap` exactly as on the first
+/// mount — before the fix the re-adopted rotor read as 0 held and the
+/// cap admitted ≈ 3M.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_rotor_cap_counts_the_re_adopted_rotor_after_a_crash_remount() {
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    let uris = vec![format_stamped_member(dir.path(), "meta0").await];
+    {
+        let routed = open_under(&uris, &Knobs::armed()).await;
+        let vol = Arc::clone(&routed.volumes[0]);
+        let plane = Arc::clone(vol.slot_leases().unwrap());
+        assert_eq!(plane.table.rotor_held_by(0), MINT_SPREAD as u64);
+        vol.checkpoint_now().await.unwrap();
+        // A crash: no leave.
+        drop(vol);
+        drop(routed);
+    }
+    let routed = open_under(&uris, &Knobs::armed()).await;
+    let vol = Arc::clone(&routed.volumes[0]);
+    let plane = Arc::clone(vol.slot_leases().unwrap());
+    let m = plane.mint_slots();
+    assert_eq!(
+        lease_stats(&vol).rotor,
+        MINT_SPREAD as u64,
+        "the rotor is rebuilt"
+    );
+    assert_eq!(
+        plane.table.rotor_held_by(0),
+        MINT_SPREAD as u64,
+        "the re-adopted rotor counts against the cap"
+    );
+    // A rotor ask for M more lands (2M = the cap), the next refuses.
+    let more = vol
+        .manager_acquire_slots(0, m as u16, &[], ControlAdmit::Try)
+        .await
+        .unwrap();
+    assert_eq!(more.len(), m as usize);
+    assert_eq!(plane.table.rotor_held_by(0), 2 * m);
+    let e = vol
+        .manager_acquire_slots(0, 1, &[], ControlAdmit::Try)
+        .await
+        .expect_err("past 2 × M the rotor ask refuses");
+    assert!(
+        matches!(e, KvError::RotorAtCap { held, cap, .. } if held == 2 * m && cap == 2 * m),
+        "{e:?}"
+    );
+    shutdown(&routed).await;
+}
+
+/// **Issue 23 (round 3): the appender page carries a LAYOUT version and
+/// the PR 2/3 layout is refused, never misread.** A page of this
+/// binary's layout decodes; the same image with the layout byte at its
+/// pre-PR-4 value (0 — the slots then sat at 306 with no `seq_offset`
+/// word) refuses with a message naming the layout law, even with a valid
+/// checksum; a `Free` page written at the leave carries the ring's
+/// offset IN FORCE, not the last checkpoint's; and a door token returned
+/// with none out leaves the count at 0.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_page_layout_is_versioned_and_the_free_page_carries_the_offset_in_force() {
+    use squeezefs::meta_backend::kv::appender::{
+        classify_page, AppenderPage, PageRead, APPENDER_PAGE_LAYOUT_VERSION,
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    let uris = vec![format_stamped_member(dir.path(), "meta0").await];
+    let tag = volume_tag("vol-0000000000000023");
+    let owner = ino_in_slot(SLOT4, 5);
+    let routed = open_with_ring0_offset(&uris, tag, owner).await;
+    let vol = Arc::clone(&routed.volumes[0]);
+    let offset = vol.journal_ring().seq_offset();
+    assert!(offset > 0);
+    // The offset was raised by the grant AFTER the last checkpoint's page
+    // write; the clean leave's `Free` page must carry it.
+    let path = std::path::Path::new(&uris[0]);
+    let before = read_directory(path, vol.superblock()).await.unwrap();
+    let p0 = before[0].page.clone().unwrap();
+    assert_eq!(p0.state, AppenderState::Live);
+    shutdown(&routed).await;
+    let after = read_directory(path, vol.superblock()).await.unwrap();
+    let p0 = after[0].page.clone().unwrap();
+    assert_eq!(p0.state, AppenderState::Free);
+    assert_eq!(
+        p0.seq_offset, offset,
+        "the Free page names the offset in force"
+    );
+    // The layout byte: this binary's value decodes, the pre-PR-4 value
+    // refuses loud.
+    let img = p0.encode().unwrap();
+    assert_eq!(img[55], APPENDER_PAGE_LAYOUT_VERSION);
+    assert!(matches!(classify_page(&img), PageRead::Valid(_)));
+    let mut old = img.clone();
+    old[55] = 0;
+    // Re-checksum so the layout byte — not the checksum — is what refuses.
+    let sum = squeezefs::meta_backend::kv::appender::page_checksum(&old);
+    old[16..24].copy_from_slice(&sum.to_le_bytes());
+    let e = AppenderPage::decode(&old).expect_err("the PR 2/3 layout refuses");
+    assert!(
+        e.to_string().contains("layout version 0"),
+        "names the layout law: {e}"
+    );
+    assert!(matches!(classify_page(&old), PageRead::Corrupt(_)));
+    // The door: a leave with no token out stays at 0.
+    let gate = squeezefs::slot_lease_core::LeaseGate::new();
+    assert_eq!(gate.leave(3), 0);
+    assert_eq!(gate.inflight(3), 0);
+    drop(vol);
+    drop(routed);
 }
 
 // ---------------------------------------------------------------------------
@@ -3295,6 +3488,114 @@ async fn the_manager_verbs_ride_the_owner_listener_dispatched_by_volume_ordinal(
     );
     host.shutdown();
     shutdown(&routed).await;
+}
+
+/// **Issue 13's owed pin (round 3, Issue 23): two armed volumes, a wire
+/// joiner on each.** The S4 owner table is composed per VOLUME: joiner A
+/// leases routing slot 300 on volume 0 and joiner B routing slot 400 on
+/// volume 1 through ONE `ManagerSetService` listener addressed by
+/// ordinal; both slots read FOREIGN and every other slot local (the
+/// second install never re-marks the first volume's foreign slot local),
+/// each volume's tree 0 names its own lessee only, a release on one
+/// volume withdraws that slot alone, and the whole set's leave reads
+/// `solo`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn two_armed_volumes_each_with_a_wire_joiner_compose_one_owner_table() {
+    use squeezefs::data_grant::AsyncVerbRouter;
+    use squeezefs::meta_ship::manager::ManagerSetService;
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    // Two stamped members of one set (one plan, two stamps).
+    let plan = plan_meta_slot_set(2).expect("derived plan");
+    let mut uris = Vec::new();
+    for (i, name) in ["meta0", "meta1"].iter().enumerate() {
+        let p = dir.path().join(name);
+        std::fs::File::create(&p).unwrap().set_len(VOL_LEN).unwrap();
+        std::env::set_var("SQUEEZEFS_TEST_STAMP_SYMMETRIC", "1");
+        let r = format_v3_stamped(&p, VOL_LEN, &set_opts(), plan.stamps[i].clone()).await;
+        std::env::remove_var("SQUEEZEFS_TEST_STAMP_SYMMETRIC");
+        r.expect("format stamped member");
+        uris.push(p.display().to_string());
+    }
+    let routed = open_under(&uris, &Knobs::armed()).await;
+    assert_eq!(routed.volumes.len(), 2);
+    assert!(routed.volumes.iter().all(|v| v.slot_lease_armed()));
+    let set_svc = ManagerSetService::new(&routed.volumes);
+    assert_eq!(set_svc.width(), 2);
+    let host = cw::RpcListener::start_async(
+        listener_cfg(),
+        SECRET.to_vec(),
+        Arc::new(AsyncVerbRouter::new().with_manager(set_svc)),
+    )
+    .unwrap();
+    let endpoint = host.endpoint().to_string();
+    let (slot_a, slot_b): (u16, u16) = (300, 400);
+    let mut clients = Vec::new();
+    for (ordinal, slot) in [(0u16, slot_a), (1u16, slot_b)] {
+        let mut client =
+            ManagerClient::connect(&endpoint, SECRET, &format!("joiner-v{ordinal}"), ordinal)
+                .await
+                .unwrap();
+        let reply = client
+            .join(joiner_identity(20 + u64::from(ordinal)), 0)
+            .await
+            .unwrap();
+        let ManagerReply::Joined { appender_id, .. } = reply else {
+            panic!("{reply:?}");
+        };
+        match client.acquire_slot(appender_id, slot).await.unwrap() {
+            ManagerReply::SlotsGranted { slots, already } => {
+                assert!(!already);
+                assert_eq!((slots[0].slot, slots[0].g), (slot, 1));
+            }
+            other => panic!("{other:?}"),
+        }
+        clients.push((client, appender_id));
+    }
+    // The composed table: both foreign, everything else local.
+    assert_eq!(squeezefs::dlm_slot::dlm_mode(), "slot-homed");
+    assert!(!squeezefs::dlm_slot::is_local_slot(u64::from(slot_a)));
+    assert!(!squeezefs::dlm_slot::is_local_slot(u64::from(slot_b)));
+    assert!(squeezefs::dlm_slot::is_local_slot(1));
+    assert!(squeezefs::dlm_slot::is_local_slot(500));
+    // Each volume's tree 0 names ITS lessee only.
+    for (ordinal, (mine, other)) in [(0usize, (slot_a, slot_b)), (1usize, (slot_b, slot_a))] {
+        let states = tree0_states(&routed.volumes[ordinal]).await;
+        let (_, joiner) = clients[ordinal];
+        assert!(
+            matches!(
+                states
+                    .iter()
+                    .find(|(s, _)| *s == guest_forest_slot(mine))
+                    .map(|(_, st)| st),
+                Some(SlotState::Leased { appender_id, g: 1, .. }) if *appender_id == joiner
+            ),
+            "volume {ordinal} leases {mine} to its joiner"
+        );
+        assert!(
+            !states
+                .iter()
+                .any(|(s, st)| *s == guest_forest_slot(other)
+                    && matches!(st, SlotState::Leased { .. })),
+            "volume {ordinal} knows nothing of the other volume's slot {other}"
+        );
+    }
+    // Joiner A releases its slot on volume 0: slot A is local again, slot
+    // B stays foreign (the withdrawal is per volume).
+    let (client_a, joiner_a) = &mut clients[0];
+    let words = squeezefs::meta_ship::manager::WireSlotWords::default();
+    client_a
+        .release_slot(*joiner_a, slot_a, 1, words, Vec::new())
+        .await
+        .unwrap();
+    assert!(squeezefs::dlm_slot::is_local_slot(u64::from(slot_a)));
+    assert!(!squeezefs::dlm_slot::is_local_slot(u64::from(slot_b)));
+    assert_eq!(squeezefs::dlm_slot::dlm_mode(), "slot-homed");
+    host.shutdown();
+    // The set's leave withdraws the last contributor: solo.
+    shutdown(&routed).await;
+    assert_eq!(squeezefs::dlm_slot::dlm_mode(), "solo");
+    assert!(squeezefs::dlm_slot::is_local_slot(u64::from(slot_b)));
 }
 
 // ---------------------------------------------------------------------------

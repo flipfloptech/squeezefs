@@ -1893,6 +1893,84 @@ async fn a_release_from_the_quieter_ring_clears_its_window_in_one_cycle() {
     shutdown(&routed).await;
 }
 
+/// **Issue 20 (round 3, the grep's third site): a §4.7 pending free is
+/// gated on the freeing entry's POSITION, the tail's domain.** On a ring
+/// stamping above its positions an SMO's retired extent must become
+/// claimable once a covering cycle passes its entry — live, and again
+/// when the free is REPLAYED from the window at the next open. Before
+/// the fix the gate was the free record's STAMPED seq (`position +
+/// offset`), so the extent stayed parked until the ring wrote `offset`
+/// more bytes — on a quiet ring, for ever (`pending_free` never drains).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_smo_retirement_on_an_offset_ring_releases_on_its_entrys_coverage() {
+    use squeezefs::meta_backend::kv::META_KV_PENDING_FREE_PARKED;
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    let uris = vec![format_stamped_member(dir.path(), "meta0").await];
+    let tag = volume_tag("vol-0000000000000021");
+    let owner = ino_in_slot(SLOT4, 5);
+    let routed = open_with_ring0_offset(&uris, tag, owner).await;
+    let vol = Arc::clone(&routed.volumes[0]);
+    let offset = vol.journal_ring().seq_offset();
+    // Enough native-slot records (→ ring 0) to split the root's xattr
+    // leaf: the flush pass's SMO retires the predecessor image.
+    let split_leaf = |routed: Arc<RoutedMetaBackend>, round: u32| async move {
+        let value = vec![0x5Au8; 16 * 1024];
+        for i in 0..24 {
+            routed
+                .setxattr(ROOT_INO, &format!("user.smo{round}_{i}"), &value)
+                .await
+                .unwrap();
+        }
+    };
+    let parked0 = META_KV_PENDING_FREE_PARKED.load(Ordering::Relaxed);
+    split_leaf(Arc::clone(&routed), 1).await;
+    vol.checkpoint_now().await.unwrap();
+    assert!(
+        META_KV_PENDING_FREE_PARKED.load(Ordering::Relaxed) > parked0,
+        "the fixture: an SMO retired an image on ring 0 (offset {offset})"
+    );
+    // Live arm: the covering cycles release the retirement (the FIND-VS-A
+    // second cycle carries the tail past the split's dying floor).
+    for _ in 0..4 {
+        if vol.allocator().pending_count() == 0 {
+            break;
+        }
+        vol.checkpoint_now().await.unwrap();
+    }
+    assert_eq!(
+        vol.allocator().pending_count(),
+        0,
+        "a retirement on ring 0 (offset {offset}) drains on the entry's coverage"
+    );
+    // Replay arm: another SMO whose free is still IN THE WINDOW at a
+    // crash; the next open re-parks it on the entry's position and the
+    // first covering cycles drain it.
+    split_leaf(Arc::clone(&routed), 2).await;
+    vol.checkpoint_now().await.unwrap();
+    assert!(
+        vol.allocator().pending_count() > 0,
+        "the fixture: the second SMO's free is parked in the window"
+    );
+    drop(vol);
+    drop(routed);
+    let routed = open_under(&uris, &Knobs::armed().partition(PARTITION)).await;
+    let vol = Arc::clone(&routed.volumes[0]);
+    assert!(vol.journal_ring().seq_offset() > 0, "the offset is recovered");
+    for _ in 0..4 {
+        if vol.allocator().pending_count() == 0 {
+            break;
+        }
+        vol.checkpoint_now().await.unwrap();
+    }
+    assert_eq!(
+        vol.allocator().pending_count(),
+        0,
+        "a replayed free on an offset ring drains on its entry's coverage"
+    );
+    shutdown(&routed).await;
+}
+
 /// **Issue 24 (round 3): a first-touch acquire never parks for ring space
 /// under `manager_verbs`.** With the cadence parked and ring 0's user
 /// window exhausted, a first-touch commit's door acquire PARKS at ring

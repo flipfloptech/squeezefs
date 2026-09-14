@@ -740,6 +740,11 @@ async fn join_appender_over_the_wire_allocates_a_page_ring_and_grant_and_replays
         "admit + execute + reply ≡ total"
     );
     assert!(s.manager_service_ns[1] > 0);
+    eprintln!(
+        "wire join row: manager_service_ns admit/execute/reply/total = {:?} over {} verbs (dev \
+         box — scoping)",
+        s.manager_service_ns, s.manager_verbs
+    );
     // ExtentGrant / ReturnExtents for the wire joiner: granted, returned,
     // returned again ⇒ already.
     let more = client.extent_grant(2, 4).await.unwrap();
@@ -886,7 +891,9 @@ async fn a_join_storm_of_32_completes_inside_the_bound_and_grows_the_directory_c
         per_join < std::time::Duration::from_millis(200),
         "32 joins took {wall:?} ({per_join:?} each)"
     );
-    log::info!("join storm: 32 joins in {wall:?} ({per_join:?} per join, dev box — scoping)");
+    // The row (`--nocapture`): the dev box is scoping, the design venue is
+    // the box.
+    eprintln!("join storm: 32 joins in {wall:?} ({per_join:?} per join, dev box — scoping)");
     let sb = vol.superblock().clone();
     let chain = read_directory_chain(path, &sb).await.unwrap();
     assert!(

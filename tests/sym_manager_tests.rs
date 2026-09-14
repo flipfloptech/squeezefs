@@ -2039,6 +2039,184 @@ async fn the_grant_cap_counts_every_live_appender_wire_joiners_included() {
 }
 
 // ---------------------------------------------------------------------------
+// Review round 2 — Issue 16: the clean leave over an SMO in the FINAL cycle.
+// ---------------------------------------------------------------------------
+
+/// Drive the reviewer's shape: `rounds` of 3 × 400 refs into appender
+/// 1's slot with a checkpoint between rounds and the LAST round left
+/// uncheckpointed, so the final cycle's flush pass may run an SMO on the
+/// leased slot tree (its records ride the REGION's ring since PR 3).
+/// Returns the acked bases and how many SMOs the shutdown ran.
+async fn final_cycle_shape(
+    uris: &[String],
+    rounds: u64,
+    tag: u64,
+    guest_owner: u64,
+) -> (Vec<u64>, u64) {
+    std::env::set_var("SQUEEZEFS_META_FLUSH_INTERVAL_MS", "60000");
+    let ra = open_with_partition(uris, Some(PARTITION)).await;
+    std::env::remove_var("SQUEEZEFS_META_FLUSH_INTERVAL_MS");
+    let va = Arc::clone(&ra.volumes[0]);
+    let mut acked: Vec<u64> = Vec::new();
+    for round in 0..rounds {
+        for i in 0..3u64 {
+            let base = round * 10_000 + i * 600;
+            va.commit_block_refs(guest_owner, &refs(tag, guest_owner, base, 400))
+                .await
+                .unwrap();
+            acked.push(base);
+        }
+        if round + 1 < rounds {
+            va.checkpoint_now().await.unwrap();
+        }
+    }
+    let smos_before = META_KV_NODE_COMPACTIONS.load(Ordering::Relaxed)
+        + META_KV_NODE_SPLITS.load(Ordering::Relaxed);
+    for v in &ra.volumes {
+        v.shutdown().await.unwrap();
+    }
+    let smos_in_final = META_KV_NODE_COMPACTIONS.load(Ordering::Relaxed)
+        + META_KV_NODE_SPLITS.load(Ordering::Relaxed)
+        - smos_before;
+    (acked, smos_in_final)
+}
+
+/// Issue 16 (bug): a CLEAN unmount whose final checkpoint cycle's flush
+/// pass runs an SMO on a LEASED slot tree must lose nothing. The
+/// shutdown fixpoint was ring-0-only, so with the SMO's records in the
+/// REGION's ring (PR 3's own-ring structure) the loop exited after one
+/// cycle, the leave cleared the page's roots and declared the uncovered
+/// window covered, and the next open routed through the PREDECESSOR
+/// image — acked block references read back at count 0. The fixpoint
+/// must cover EVERY ring (`rings_uncovered`), the leave leaves nothing
+/// pending (a region's last-cycle retirements would otherwise recover as
+/// CLAIMED-unreached C13 candidates on a healthy lifecycle), and every
+/// acked base survives. Every round count 1..=8 is driven so the shape
+/// is reached whatever the fold's exact spacing; at least one must run
+/// an SMO inside the final cycle.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_leased_trees_smo_inside_the_final_cycle_survives_a_clean_leave() {
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    let tag = volume_tag("vol-0011223344556677");
+    let guest_owner = guest_local_ino(3, 90);
+    let mut hit = 0u64;
+    for rounds in 1..=8u64 {
+        let uris = vec![format_stamped_member(dir.path(), &format!("r{rounds}")).await];
+        let (acked, smos_in_final) = final_cycle_shape(&uris, rounds, tag, guest_owner).await;
+        let rb = open_with_partition(&uris, Some(PARTITION)).await;
+        let vb = Arc::clone(&rb.volumes[0]);
+        let s = stats(&vb);
+        assert_eq!(
+            s.self_recoveries, 0,
+            "rounds={rounds}: a clean leave leaves no own residue: {s:?}"
+        );
+        let mut missing: Vec<u64> = Vec::new();
+        for base in &acked {
+            if vb.block_ref_count(tag, *base).await.unwrap() != 1 {
+                missing.push(*base);
+            }
+        }
+        assert!(
+            missing.is_empty(),
+            "rounds={rounds}: {} of {} acked block-ref bases unreadable after a CLEAN unmount \
+             whose final cycle ran {smos_in_final} SMO(s) on the leased slot tree: {missing:?}",
+            missing.len(),
+            acked.len()
+        );
+        assert_eq!(
+            s.regions[1].grant_pending, 0,
+            "rounds={rounds}: the leave drained the region's last-cycle retirements"
+        );
+        assert!(
+            vb.c13_orphan_image_extents().await.unwrap().is_empty(),
+            "rounds={rounds}: a healthy clean lifecycle plants no C13 candidate"
+        );
+        if smos_in_final > 0 {
+            hit += 1;
+        }
+        for v in &rb.volumes {
+            v.shutdown().await.unwrap();
+        }
+    }
+    assert!(
+        hit > 0,
+        "no round count produced an SMO inside the final cycle — the shape was not reached"
+    );
+}
+
+/// Issue 16's belt: a leave over an UNCOVERED region window must never
+/// write that region's page `Free` (that declares the window covered and
+/// frees the ring). The seam `TEST_SHUTDOWN_FIXPOINT_CYCLES = 1` caps the
+/// shutdown fixpoint at one cycle — the defective loop's exact shape — so
+/// a final-cycle SMO leaves the region uncovered at the leave: the page
+/// stays `Live` with its roots and tail, the ring's extents stay claimed,
+/// and the next open recovers the region as OWN RESIDUE
+/// (`appender_self_recoveries == 1`) with every acked base readable.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_leave_over_an_uncovered_window_keeps_the_page_live_for_the_next_open() {
+    use squeezefs::meta_backend::kv::backend::TEST_SHUTDOWN_FIXPOINT_CYCLES;
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    let tag = volume_tag("vol-0011223344556677");
+    let guest_owner = guest_local_ino(3, 91);
+    struct Cleanup;
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            TEST_SHUTDOWN_FIXPOINT_CYCLES.store(0, Ordering::SeqCst);
+        }
+    }
+    let _cleanup = Cleanup;
+    let mut hit = false;
+    for rounds in 1..=8u64 {
+        let uris = vec![format_stamped_member(dir.path(), &format!("u{rounds}")).await];
+        let path = std::path::Path::new(&uris[0]);
+        TEST_SHUTDOWN_FIXPOINT_CYCLES.store(1, Ordering::SeqCst);
+        let (acked, smos_in_final) = final_cycle_shape(&uris, rounds, tag, guest_owner).await;
+        TEST_SHUTDOWN_FIXPOINT_CYCLES.store(0, Ordering::SeqCst);
+        if smos_in_final == 0 {
+            continue;
+        }
+        hit = true;
+        let sb = squeezefs::meta_backend::kv::backend::KvMetaBackend::open_probe(path)
+            .await
+            .unwrap()
+            .superblock()
+            .clone();
+        let page = read_directory(path, &sb).await.unwrap()[1]
+            .page
+            .clone()
+            .expect("appender 1 has a page");
+        assert_eq!(
+            page.state,
+            AppenderState::Live,
+            "rounds={rounds}: the leave REFUSED to free a region whose window was uncovered — \
+             the page stays Live for the next open"
+        );
+        assert!(!page.segments.is_empty(), "its ring is still named");
+        let rb = open_with_partition(&uris, Some(PARTITION)).await;
+        let vb = Arc::clone(&rb.volumes[0]);
+        assert_eq!(
+            stats(&vb).self_recoveries,
+            1,
+            "rounds={rounds}: the next open recovers appender 1 as its own residue"
+        );
+        for base in &acked {
+            assert_eq!(
+                vb.block_ref_count(tag, *base).await.unwrap(),
+                1,
+                "rounds={rounds}: acked base {base} served after the own-residue recovery"
+            );
+        }
+        for v in &rb.volumes {
+            v.shutdown().await.unwrap();
+        }
+        break;
+    }
+    assert!(hit, "no round count produced an SMO inside the final cycle");
+}
+
+// ---------------------------------------------------------------------------
 // The negative contract: a bit-17-absent volume carries none of it.
 // ---------------------------------------------------------------------------
 

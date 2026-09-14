@@ -342,6 +342,14 @@ pub fn test_set_destroy_chunk_stop_after(after: Option<u32>) {
     TEST_DESTROY_CHUNK_STOP_AFTER.store(after.unwrap_or(0), Ordering::Relaxed);
 }
 
+/// Test seam (review round 2, Issue 16): cap the shutdown's final-cycle
+/// FIXPOINT at this many cycles (`0` = the product bound). `1` is the
+/// defective ring-0-only loop's exact shape — a leased slot tree's SMO in
+/// the final flush pass leaves its region's ring UNCOVERED at the leave —
+/// so the leave's belt (never a `Free` page over an uncovered window) is
+/// observable. One relaxed load per shutdown.
+pub static TEST_SHUTDOWN_FIXPOINT_CYCLES: AtomicU64 = AtomicU64::new(0);
+
 /// Test seam (design-symmetric-metadata §5.3.5 / KD-SYM-7, review round 1
 /// Issue 3): `JoinAppender` FAILS after its page went `Live` (both
 /// directory slots barriered) and before its initial extent grant — the

@@ -4122,38 +4122,31 @@ impl KvMetaBackend {
             ))
         })?);
         let _guard = self.manager_verbs.lock().await;
-        // The durable witness first: a slot tree 0 already records
-        // Unleased at this `g` with these words is the replay.
-        match plane.table.get(slot) {
-            Some(l)
-                if l.state == crate::slot_lease_core::LeaseState::Unleased
-                    && l.g == g
-                    && l.words == words =>
-            {
+        // The durable witness first — the TABLE's own law, consulted
+        // BEFORE any write (review round 2, Issue 3: an `Unleased` at
+        // another `g` or with other words fell through and REWROTE tree 0
+        // with the caller's stale words before the table refused; the
+        // verdict now precedes the durable act): `Unleased` at this `g`
+        // with these words is the replay, every contradiction refuses.
+        match plane.table.check_release(slot, appender_id, g, words) {
+            crate::slot_lease_core::ReleaseOutcome::Already => {
                 set.verbs.replays.fetch_add(1, Ordering::Relaxed);
                 return Ok(true);
             }
-            Some(l)
-                if l.state != crate::slot_lease_core::LeaseState::Unleased
-                    && (l.holder != appender_id || l.g != g) =>
-            {
+            crate::slot_lease_core::ReleaseOutcome::Refused { holder, g: have } => {
                 set.verbs.refusals.fetch_add(1, Ordering::Relaxed);
                 return Err(KvError::Busy(format!(
                     "{}: ReleaseSlot {slot} by appender {appender_id} at g {g} refused — tree 0 \
-                     names appender {} at g {} (the durable witness contradicts the caller)",
+                     names {} at g {have} (the durable witness contradicts the caller)",
                     self.path.display(),
-                    l.holder,
-                    l.g
+                    if holder == 0 {
+                        "no holder (Unleased)".to_string()
+                    } else {
+                        format!("appender {holder}")
+                    }
                 )));
             }
-            None => {
-                set.verbs.refusals.fetch_add(1, Ordering::Relaxed);
-                return Err(KvError::Busy(format!(
-                    "{}: ReleaseSlot {slot} — tree 0 has no record of the slot",
-                    self.path.display()
-                )));
-            }
-            _ => {}
+            crate::slot_lease_core::ReleaseOutcome::Released => {}
         }
         let last_written = self.lease_seq();
         let value = super::slot_state::SlotState::Unleased {

@@ -556,6 +556,47 @@ impl SlotLeaseTable {
         let Some(entry) = m.get_mut(&slot) else {
             return ReleaseOutcome::Refused { holder: 0, g: 0 };
         };
+        match Self::release_verdict(entry, holder, g, words) {
+            ReleaseOutcome::Released => {}
+            other => return other,
+        }
+        entry.state = LeaseState::Unleased;
+        entry.holder = 0;
+        entry.offered_to = 0;
+        entry.offer_expires_ns = 0;
+        entry.last_written = now_seq;
+        entry.words = words;
+        ReleaseOutcome::Released
+    }
+
+    /// [`Self::release`]'s verdict WITHOUT the transition — what the
+    /// manager consults BEFORE its durable write (review round 2, Issue
+    /// 3: the durable act must never precede the verdict; a stale release
+    /// that proceeded to tree 0 rolled the record back to older words).
+    pub fn check_release(
+        &self,
+        slot: Slot,
+        holder: AppenderId,
+        g: u32,
+        words: SlotWords,
+    ) -> ReleaseOutcome {
+        let m = self.lock();
+        match m.get(&slot) {
+            None => ReleaseOutcome::Refused { holder: 0, g: 0 },
+            Some(entry) => Self::release_verdict(entry, holder, g, words),
+        }
+    }
+
+    /// The release law over one entry: `Unleased` at the same `g` with
+    /// the same words = the replay (`Already`); `Unleased` otherwise, a
+    /// foreign holder or a stale `g` = refused with the truth; else the
+    /// release lands.
+    fn release_verdict(
+        entry: &SlotLease,
+        holder: AppenderId,
+        g: u32,
+        words: SlotWords,
+    ) -> ReleaseOutcome {
         match entry.state {
             LeaseState::Unleased if entry.g == g && entry.words == words => ReleaseOutcome::Already,
             LeaseState::Unleased => ReleaseOutcome::Refused {
@@ -566,15 +607,7 @@ impl SlotLeaseTable {
                 holder: entry.holder,
                 g: entry.g,
             },
-            _ => {
-                entry.state = LeaseState::Unleased;
-                entry.holder = 0;
-                entry.offered_to = 0;
-                entry.offer_expires_ns = 0;
-                entry.last_written = now_seq;
-                entry.words = words;
-                ReleaseOutcome::Released
-            }
+            _ => ReleaseOutcome::Released,
         }
     }
 

@@ -40,8 +40,8 @@ use super::checkpoint::{write_ledger_slot, LedgerRecord, TreeRoot};
 use super::node::{key_successor, write_node, NodeLayout, NodeWriteParams, NODE_PAGE};
 use super::record::{
     dentry_key, dentry_name_hash54, forest_key, inode_key, xattr_key, xattr_name_hash56,
-    DentryValue, InodeValue, Record, XattrValue, KIND_INTERIOR, TREE_BLOCK_REFS, TREE_CONTROL,
-    TREE_DENTRIES, TREE_INODES, TREE_XATTRS,
+    DentryValue, InodeValue, Record, XattrValue, KIND_INTERIOR, TREE_BLOCK_MAP, TREE_BLOCK_REFS,
+    TREE_CONTROL, TREE_DENTRIES, TREE_INODES, TREE_XATTRS,
 };
 use super::superblock::{write_superblock_v3, SuperblockV3};
 use super::tree::{encode_interior_value, KEY_SPACE_MAX};
@@ -802,12 +802,53 @@ impl<'a> TreeWriter<'a> {
         self.nodes_written
     }
 
-    fn usable_budget(&self) -> usize {
-        let usable = self.layout.node_size()
+    /// The nodes [`Self::write_tree`] WOULD write for key-ascending
+    /// `records` under `layout` — the same chunking, level by level, with
+    /// nothing written: the capacity preflight's exact term (one heap
+    /// extent per node). The interior levels are planned over separator
+    /// records of the same shape `write_tree` emits (`child max_key →
+    /// interior value`), so the count is the writer's, not an estimate.
+    pub(crate) fn planned_nodes(layout: &NodeLayout, records: &[Record]) -> u64 {
+        fn plan_level(budget: usize, records: &[Record]) -> u64 {
+            let chunks: Vec<&[Record]> = if records.is_empty() {
+                vec![records]
+            } else {
+                chunk_by_encoded_len(records, budget)
+            };
+            if chunks.len() <= 1 {
+                return 1;
+            }
+            // The interior value is two fixed-width u64s, so the planned
+            // separator's encoded length is the written one's.
+            let separators: Vec<Record> = chunks
+                .iter()
+                .enumerate()
+                .map(|(i, chunk)| {
+                    let max_key = if i + 1 == chunks.len() {
+                        KEY_SPACE_MAX.to_vec()
+                    } else {
+                        chunk
+                            .last()
+                            .map_or_else(|| KEY_SPACE_MAX.to_vec(), |r| r.key.clone())
+                    };
+                    Record::put(max_key, 0, encode_interior_value(0, 0))
+                })
+                .collect();
+            chunks.len() as u64 + plan_level(budget, &separators)
+        }
+        plan_level(Self::usable_budget_of(layout), records)
+    }
+
+    fn usable_budget_of(layout: &NodeLayout) -> usize {
+        let usable = layout.node_size()
             - NODE_PAGE
             - super::node::BSET_FRAME_LEN
             - super::bset::BSET_HEADER_LEN;
         usable * 3 / 4
+    }
+
+    fn usable_budget(&self) -> usize {
+        Self::usable_budget_of(self.layout)
     }
 
     /// Write one whole tree of `tree_id` from key-ascending `records`;
@@ -977,6 +1018,74 @@ pub async fn digest_backend(backend: &KvMetaBackend) -> Result<u64, KvError> {
         }
     }
     Ok(h.digest())
+}
+
+/// The ORDER-INDEPENDENT per-kind oracle for the kinds [`digest_backend`]
+/// does not walk — the durable block references (kind 6) and the
+/// block-map tree (kind 7): `(live record count, wrapping sum over every
+/// record of xxh3(len ‖ key ‖ len ‖ value))`. A sum, not a chained hash,
+/// because the kind-routed walk of a forest volume yields these kinds
+/// per slot tree (a reference lives in its OWNER ino's slot — §5.4.2),
+/// so the two layouts agree on the SET of records and not necessarily on
+/// the order a paged range walk visits them; keys are unique within a
+/// kind, so the sum is exact on the set. `(0, 0)` on a volume where the
+/// kind is not engaged. Together with [`digest_backend`] this is what the
+/// `enable-symmetric` contracts compare across the relayout: the user
+/// kinds ordered, kinds 6 and 7 as sets.
+pub async fn digest_backend_kind_set(
+    backend: &KvMetaBackend,
+    kind: u8,
+) -> Result<(u64, u64), KvError> {
+    const WALK_PAGE: usize = 1024;
+    let engaged = match kind {
+        TREE_BLOCK_REFS => backend.block_refs_engaged(),
+        TREE_BLOCK_MAP => backend.block_map_tree_engaged(),
+        _ => {
+            return Err(KvError::Corrupt(format!(
+                "digest_backend_kind_set: kind {kind} is a user kind — digest_backend walks it"
+            )))
+        }
+    };
+    if !engaged {
+        return Ok((0, 0));
+    }
+    let mut count = 0u64;
+    let mut sum = 0u64;
+    let mut fold = |k: &[u8], v: &[u8]| {
+        let mut h = xxhash_rust::xxh3::Xxh3::new();
+        h.update(&(k.len() as u64).to_le_bytes());
+        h.update(k);
+        h.update(&(v.len() as u64).to_le_bytes());
+        h.update(v);
+        count += 1;
+        sum = sum.wrapping_add(h.digest());
+    };
+    if kind == TREE_BLOCK_REFS {
+        // The block-major refs family is not legacy-cursor-paged on a
+        // forest (a cursor is no resume point across slot trees): the
+        // whole-window scan is its one layout-blind walk.
+        for (k, v) in backend.block_refs_window(&[], &KEY_SPACE_MAX).await? {
+            fold(&k, &v);
+        }
+        return Ok((count, sum));
+    }
+    let mut cursor: Vec<u8> = Vec::new();
+    loop {
+        let page = backend
+            .range_kind(kind, &cursor, &KEY_SPACE_MAX, WALK_PAGE)
+            .await?;
+        let Some((last_key, _)) = page.last() else {
+            break;
+        };
+        cursor = key_successor(last_key);
+        for (k, v) in &page {
+            fold(k, v);
+        }
+        if page.len() < WALK_PAGE {
+            break;
+        }
+    }
+    Ok((count, sum))
 }
 
 /// The digest walk's exclusion predicate (see [`digest_backend`]): the

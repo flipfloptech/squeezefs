@@ -1382,12 +1382,19 @@ enum VolumeActions {
     /// records are re-laid into fresh extents, the layout flips in one
     /// sector write, the emptied trees return their space, and the
     /// marker is removed last. A crashed run leaves the set unmountable
-    /// for writers; `--resume` continues it from the crash point.
+    /// for writers; `--resume` continues it from the crash point, and
+    /// `--abort` undoes it on every volume still flat under its marker
+    /// (a volume already past its flip finishes with `--resume` only).
     ///
-    /// Refuses: a set that is already symmetric, a volume whose
-    /// ledger was last written by a multi-appender era (mount solo once
-    /// first), an open cross-volume intent, an in-flight maintenance job,
-    /// a live client. Per-volume owner assignments (`volume set-owners`)
+    /// Every check runs before the first marker is written: a set that
+    /// is already symmetric, a volume whose ledger was last written by a
+    /// multi-appender era (mount solo once first), a volume not cleanly
+    /// unmounted, an open cross-volume intent, an in-flight maintenance
+    /// job, a live client, a concurrent invocation, and the capacity
+    /// preflight — the forest is built beside the shared trees, which
+    /// return their space only at the end, so a volume that cannot hold
+    /// both refuses naming the extents needed and available (`--dry-run`
+    /// prints them). Per-volume owner assignments (`volume set-owners`)
     /// are reported as dropped — ownership is a lease under the forest.
     /// There is no downgrade verb (forward-only).
     ///
@@ -1399,11 +1406,17 @@ enum VolumeActions {
         target: String,
         /// Continue a crashed run (required when a conversion marker is
         /// present on any volume)
-        #[arg(long)]
+        #[arg(long, conflicts_with = "abort")]
         resume: bool,
-        /// Print the plan and every refusal; write nothing
-        #[arg(long)]
+        /// Print the plan (records, bytes, extents needed and available
+        /// per volume) and every refusal; write nothing
+        #[arg(long, conflicts_with = "abort")]
         dry_run: bool,
+        /// Undo a crashed run on every volume still flat under its
+        /// marker: reclaim the aborted build's extents and remove the
+        /// marker. Refused when any volume is already stamped
+        #[arg(long)]
+        abort: bool,
     },
     // Anchors: design-volume-lifecycle §5.5.2 (PR VL5b) — bulk copy +
     // conveyor delta tee + the §5.5.2a cutover gate + the §5.5.2b flip.
@@ -4922,6 +4935,7 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                     target,
                     resume,
                     dry_run,
+                    abort,
                 } => {
                     if live(&target) {
                         return Err("volume enable-symmetric is an OFFLINE verb \
@@ -4931,7 +4945,11 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                             .into());
                     }
                     let meta_lvs = parse_block_uri(&target, "sqmeta://")?;
-                    let opts = squeezefs::config_ops::EnableSymOptions { dry_run, resume };
+                    let opts = squeezefs::config_ops::EnableSymOptions {
+                        dry_run,
+                        resume,
+                        abort,
+                    };
                     let report = squeezefs::config_ops::enable_symmetric(&meta_lvs, &opts).await?;
                     for line in &report.dropped {
                         println!("DROPPED: {line}");
@@ -4943,16 +4961,39 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                                 println!("{}: already symmetric (bit 17) — skipped", row.path)
                             }
                             O::Planned => println!(
-                                "{}: PLAN — {} record(s), {} B would move into the forest \
-                                 (dry run; nothing written)",
-                                row.path, row.records, row.bytes
+                                "{}: PLAN — {} record(s), {} B would move into {} slot tree(s); \
+                                 the build claims {} extent(s) of the {} claimable ({} orphan(s) \
+                                 reclaimed first){} (dry run; nothing written)",
+                                row.path,
+                                row.records,
+                                row.bytes,
+                                row.slot_trees,
+                                row.extents_needed,
+                                row.extents_available,
+                                row.orphans_reclaimed,
+                                if row.extents_needed > row.extents_available {
+                                    " — SHORT: the real run refuses this volume (free space, \
+                                     migrate slots off it, or rebuild the set on larger \
+                                     metadata volumes)"
+                                } else {
+                                    ""
+                                }
+                            ),
+                            O::Aborted => println!(
+                                "{}: aborted — marker removed, {} extent(s) of the crashed \
+                                 build reclaimed; a flat volume as before the verb",
+                                row.path, row.orphans_reclaimed
+                            ),
+                            O::Untouched => println!(
+                                "{}: untouched — the crashed run never marked it",
+                                row.path
                             ),
                             O::Converted | O::Resumed => {
                                 let secs = row.secs.max(f64::EPSILON);
                                 println!(
                                     "{}: {} — {} record(s), {} B into {} slot tree(s) in {:.2} s \
-                                     ({:.0} records/s, {:.1} MB/s); {} extent(s) written, {} \
-                                     freed, {} orphan(s) reclaimed",
+                                     ({:.0} records/s, {:.1} MB/s); {} extent(s) written (planned \
+                                     {}, {} claimable), {} freed, {} orphan(s) reclaimed",
                                     row.path,
                                     if row.outcome == O::Resumed {
                                         "resumed and converted"
@@ -4966,13 +5007,21 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                                     row.records as f64 / secs,
                                     row.bytes as f64 / secs / 1e6,
                                     row.extents_written,
+                                    row.extents_needed,
+                                    row.extents_available,
                                     row.extents_freed,
                                     row.orphans_reclaimed
                                 );
                             }
                         }
                     }
-                    if !dry_run {
+                    if abort {
+                        println!(
+                            "Aborted the crashed conversion: every volume of the {}-volume set \
+                             is a flat volume as before the verb.",
+                            report.volumes.len()
+                        );
+                    } else if !dry_run {
                         println!(
                             "Converted the {}-volume set to the symmetric forest (incompat bit \
                              17; every marker removed). Pre-symmetric binaries refuse this set \

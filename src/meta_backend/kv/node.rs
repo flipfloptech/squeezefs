@@ -1010,6 +1010,52 @@ fn check_fresh_destination(src: &LoadedNode, dst_addr: u64) -> Result<(), KvErro
     Ok(())
 }
 
+/// The highest node-seq stamp the RESIDUE of one extent carries: its
+/// header's `node_seq` when the header page verifies, and the
+/// `node_seq_at_write` of every checksum-verified frame header at any
+/// 4 KiB slot of its log area — whatever incarnation stamped it. `0` for
+/// an extent carrying no verifiable stamp.
+///
+/// The offline census reclaim (`config_ops::enable-symmetric`) seeds its
+/// tree writer's seq floor ABOVE this over every extent it returns to
+/// the free list. The ledger's `node_seq_watermark` law — every stamp an
+/// extent freed under a ledger record can carry is ≤ that record's
+/// watermark — is what keeps a fresh node's §4.1 tail chain sound on a
+/// recycled extent (a residue frame stamped with the fresh node's seq
+/// would be accepted as its own append); an extent the census reclaims
+/// was never freed under any record (a crashed build's forest, an
+/// unpublished root-swap successor), so its stamps sit ABOVE the mounted
+/// watermark and the law does not cover it. Reading the residue's own
+/// stamps and flooring the writer above them restores the law by
+/// construction, instead of resting on the fact that such images happen
+/// to hold a single frame (which the fresh header page overwrites).
+pub fn residue_seq_ceiling(buf: &[u8]) -> u64 {
+    let mut ceiling = 0u64;
+    if buf.len() >= NODE_PAGE {
+        if let Ok(h) = NodeHeader::decode_page(&buf[..NODE_PAGE]) {
+            ceiling = h.node_seq;
+        }
+    }
+    let mut pos = NODE_PAGE;
+    while pos + BSET_FRAME_LEN <= buf.len() {
+        let hdr = &buf[pos..pos + BSET_FRAME_LEN];
+        let magic = u32::from_le_bytes([hdr[0], hdr[1], hdr[2], hdr[3]]);
+        if magic == BSET_FRAME_MAGIC {
+            let stored = u64::from_le_bytes([
+                hdr[24], hdr[25], hdr[26], hdr[27], hdr[28], hdr[29], hdr[30], hdr[31],
+            ]);
+            if stored == xxhash_rust::xxh3::xxh3_64(&hdr[..24]) {
+                let stamp = u64::from_le_bytes([
+                    hdr[8], hdr[9], hdr[10], hdr[11], hdr[12], hdr[13], hdr[14], hdr[15],
+                ]);
+                ceiling = ceiling.max(stamp);
+            }
+        }
+        pos += NODE_PAGE;
+    }
+    ceiling
+}
+
 /// Compact `src` — its on-disk bset log **plus** `extra_records`, the
 /// caller's frozen dirty delta that no longer fits the log (§4.6 pt 1 /
 /// SMO successor build: "re-freeze any delta that accumulated … into the

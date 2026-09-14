@@ -9099,8 +9099,9 @@ impl KvMetaBackend {
     /// legacy cursor on the flat tree; on a forest the union over EVERY
     /// slot tree, each paged with its own cursor
     /// ([`super::forest::SlotTrees::refs_window`]) — a legacy cursor is
-    /// not a forest resume point for the block-major refs family.
-    async fn block_refs_window(
+    /// not a forest resume point for the block-major refs family. Public
+    /// for the layout-blind per-kind oracle (`builder::digest_backend_kind_set`).
+    pub async fn block_refs_window(
         &self,
         start: &[u8],
         end: &[u8],

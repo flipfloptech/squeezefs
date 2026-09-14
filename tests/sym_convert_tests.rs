@@ -38,13 +38,18 @@ use squeezefs::config_ops::{
 use squeezefs::meta_backend::kv::backend::KvMetaBackend;
 use squeezefs::meta_backend::kv::block_refs::{volume_tag, BlockRef, BlockRefOp};
 use squeezefs::meta_backend::kv::builder::{
-    digest_backend, format_v3_stamped, format_v3_stamped_symmetric, BuilderConfig, FormatV3Options,
-    ImageBuilder, ROOT_INO,
+    digest_backend, digest_backend_kind_set, format_v3_stamped, format_v3_stamped_symmetric,
+    BuilderConfig, FormatV3Options, ImageBuilder, ROOT_INO,
 };
 use squeezefs::meta_backend::kv::checkpoint::{read_newest_ledger, write_ledger_slot};
 use squeezefs::meta_backend::kv::journal::AppendPartition;
+use squeezefs::meta_backend::kv::node::residue_seq_ceiling;
 use squeezefs::meta_backend::kv::record::{
-    xattr_key, XattrValue, HASH56_MAX, KIND_INTERIOR, TREE_CONTROL, TREE_XATTRS,
+    guest_forest_slot, xattr_key, XattrValue, HASH56_MAX, KIND_INTERIOR, TREE_BLOCK_MAP,
+    TREE_BLOCK_REFS, TREE_CONTROL, TREE_XATTRS,
+};
+use squeezefs::meta_backend::kv::slot_state::{
+    decode_slot_state_key, slot_state_key_range, SlotState,
 };
 use squeezefs::meta_backend::kv::superblock::{
     classify_volume, SuperblockV3, VolumeFormat, FEATURE_INCOMPAT_KV_SYMMETRIC_FOREST,
@@ -125,6 +130,12 @@ fn format_config_for(dir: &Path) -> Vec<u8> {
 /// volumes are FLAT whatever leg of the matrix runs it — the verb is what
 /// stamps.
 async fn format_flat_set(dir: &Path, n: usize) -> Vec<String> {
+    format_flat_set_sized(dir, n, VOL_LEN).await
+}
+
+/// [`format_flat_set`] on `vol_len`-byte volumes (the capacity contracts
+/// use a small heap).
+async fn format_flat_set_sized(dir: &Path, n: usize, vol_len: u64) -> Vec<String> {
     let plan = plan_meta_slot_set(n).expect("derived plan");
     let mut uris = Vec::with_capacity(n);
     let _g = SEAM.lock().await;
@@ -132,12 +143,12 @@ async fn format_flat_set(dir: &Path, n: usize) -> Vec<String> {
     std::env::remove_var("SQUEEZEFS_TEST_STAMP_SYMMETRIC");
     for i in 0..n {
         let p = dir.join(format!("meta{i}"));
-        std::fs::File::create(&p).unwrap().set_len(VOL_LEN).unwrap();
+        std::fs::File::create(&p).unwrap().set_len(vol_len).unwrap();
         let opts = FormatV3Options {
             format_config_xattr: (i == 0).then(|| format_config_for(dir)),
             ..set_opts()
         };
-        let r = format_v3_stamped(&p, VOL_LEN, &opts, plan.stamps[i].clone()).await;
+        let r = format_v3_stamped(&p, vol_len, &opts, plan.stamps[i].clone()).await;
         if r.is_err() {
             if let Some(v) = &prior {
                 std::env::set_var("SQUEEZEFS_TEST_STAMP_SYMMETRIC", v);
@@ -169,6 +180,23 @@ async fn digest_of(path: &str) -> u64 {
         .await
         .expect("probe open");
     digest_backend(&be).await.expect("digest")
+}
+
+/// The order-independent oracles for the two kinds the ordered digest
+/// does not walk — `(block references, block map)` as `(count, sum)` —
+/// through a read-only probe.
+async fn kind_sets_of(path: &str) -> ((u64, u64), (u64, u64)) {
+    let be = KvMetaBackend::open_probe(Path::new(path))
+        .await
+        .expect("probe open");
+    (
+        digest_backend_kind_set(&be, TREE_BLOCK_REFS)
+            .await
+            .expect("refs set"),
+        digest_backend_kind_set(&be, TREE_BLOCK_MAP)
+            .await
+            .expect("map set"),
+    )
 }
 
 /// The bitmap-vs-reachability census of one quiesced volume through a
@@ -467,6 +495,41 @@ async fn a_converted_volumes_post_fold_digest_equals_the_sources() {
     let dir = tempfile::tempdir().unwrap();
     let (uris, digests, pop) = populated_flat_set(dir.path(), 1, 200).await;
     assert!(!is_symmetric(&superblock_of(&uris[0]).await));
+    // The kinds the ordered digest does not walk: the references are
+    // non-trivial here (three published), the block map whatever the
+    // format engaged.
+    let (refs_before, map_before) = kind_sets_of(&uris[0]).await;
+    assert_eq!(
+        refs_before.0, 3,
+        "the source publishes three block references"
+    );
+
+    // The plan is the build's own claim: what `--dry-run` reports as
+    // needed is exactly what the conversion writes (the tie contract of
+    // the capacity preflight — the tree writer's chunking, not an
+    // estimate), and the census credit reads 0 on a cleanly unmounted
+    // volume.
+    let plan = enable_symmetric(
+        &uris,
+        &EnableSymOptions {
+            dry_run: true,
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("plan");
+    assert_eq!(plan.rows[0].outcome, ConversionOutcome::Planned);
+    assert!(
+        plan.rows[0].extents_needed > 1,
+        "the plan claims nodes + the directory"
+    );
+    assert!(
+        plan.rows[0].extents_available >= plan.rows[0].extents_needed,
+        "the populated 64 MiB volume holds its forest: needs {} of {}",
+        plan.rows[0].extents_needed,
+        plan.rows[0].extents_available
+    );
+    assert_eq!(plan.rows[0].orphans_reclaimed, 0);
 
     let report = enable_symmetric(&uris, &EnableSymOptions::default())
         .await
@@ -475,6 +538,16 @@ async fn a_converted_volumes_post_fold_digest_equals_the_sources() {
     println!("conversion row: {:?}", report.rows[0]);
     assert_eq!(report.rows[0].outcome, ConversionOutcome::Converted);
     assert!(report.rows[0].records > 0, "records were moved");
+    assert_eq!(
+        report.rows[0].records, plan.rows[0].records,
+        "the plan's record set is the build's (the marker planned in)"
+    );
+    assert_eq!(
+        report.rows[0].extents_written, plan.rows[0].extents_needed,
+        "the capacity preflight's peak claim IS the build's claim (tie)"
+    );
+    assert_eq!(report.rows[0].extents_needed, plan.rows[0].extents_needed);
+    assert_eq!(report.rows[0].slot_trees, plan.rows[0].slot_trees);
     assert!(
         report.rows[0].slot_trees > 1,
         "a derived-width set's mints spread over guest slots: {} slot trees",
@@ -483,6 +556,11 @@ async fn a_converted_volumes_post_fold_digest_equals_the_sources() {
     assert!(
         report.rows[0].extents_freed > 0,
         "the emptied shared trees returned their extents"
+    );
+    assert_eq!(
+        kind_sets_of(&uris[0]).await,
+        (refs_before, map_before),
+        "the block-reference and block-map record SETS survive the relayout"
     );
     // The forest the conversion leaves is exactly accounted: every
     // claimed extent is a node some root reaches or the directory extent
@@ -608,6 +686,7 @@ async fn a_clean_flat_unmount_leaves_no_claimed_extent_its_roots_do_not_reach() 
 async fn crash_then_resume(window: EnableSymCrash) -> u64 {
     let dir = tempfile::tempdir().unwrap();
     let (uris, digests, pop) = populated_flat_set(dir.path(), 1, 150).await;
+    let kind_sets = kind_sets_of(&uris[0]).await;
 
     let hooks = EnableSymHooks {
         crash_after: Some(window),
@@ -666,6 +745,7 @@ async fn crash_then_resume(window: EnableSymCrash) -> u64 {
     assert!(is_symmetric(&superblock_of(&uris[0]).await));
     assert!(!marker_present(&uris[0]).await);
     assert_eq!(digest_of(&uris[0]).await, digests[0]);
+    assert_eq!(kind_sets_of(&uris[0]).await, kind_sets);
 
     let routed = open_routed_meta_set(&uris).await.expect("forest mount");
     assert!(routed.volumes[0].symmetric_forest());
@@ -901,7 +981,7 @@ fn the_marker_round_trips_and_refuses_a_torn_image() {
     let m = SymUpgradeMarker {
         volumes: vec!["/dev/a".into(), "/dev/b".into()],
     };
-    let img = m.encode();
+    let img = m.encode().expect("two short paths fit the u16 fields");
     assert_eq!(SymUpgradeMarker::decode(&img).unwrap(), m);
     let mut torn = img.clone();
     torn[3] ^= 0xFF;
@@ -914,24 +994,27 @@ fn the_marker_round_trips_and_refuses_a_torn_image() {
 // `format --symmetric` and the untouched default.
 // ---------------------------------------------------------------------------
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn format_symmetric_builds_the_image_the_seam_builds_byte_for_byte() {
+/// The fixed image description every byte-identity contract builds
+/// (`TEST_UUID` / `TEST_SEED`: the builder is deterministic over them).
+fn describe() -> ImageBuilder {
     let cfg = BuilderConfig {
         node_size: NODE_SIZE,
         journal_len_override: Some(RING_LEN),
         hash_seed: TEST_SEED,
         uuid: TEST_UUID,
     };
-    let describe = || {
-        let mut b = ImageBuilder::new(cfg.clone()).unwrap();
-        let docs = b.add_dir(ROOT_INO, "docs", 0o750, 1000, 1000).unwrap();
-        let readme = b
-            .add_file(docs, "readme.txt", 0o644, 1000, 1000, 4096)
-            .unwrap();
-        b.set_xattr(readme, "user.color", b"blue").unwrap();
-        b.add_link(readme, ROOT_INO, "hard.lnk").unwrap();
-        b
-    };
+    let mut b = ImageBuilder::new(cfg).unwrap();
+    let docs = b.add_dir(ROOT_INO, "docs", 0o750, 1000, 1000).unwrap();
+    let readme = b
+        .add_file(docs, "readme.txt", 0o644, 1000, 1000, 4096)
+        .unwrap();
+    b.set_xattr(readme, "user.color", b"blue").unwrap();
+    b.add_link(readme, ROOT_INO, "hard.lnk").unwrap();
+    b
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn format_symmetric_builds_the_image_the_seam_builds_byte_for_byte() {
     let flag = tempfile::NamedTempFile::new().unwrap();
     flag.as_file().set_len(VOL_LEN).unwrap();
     let seam = tempfile::NamedTempFile::new().unwrap();
@@ -1180,4 +1263,845 @@ async fn a_refused_writable_open_writes_nothing() {
         .expect("marker");
     let m = SymUpgradeMarker::decode(&raw).expect("decodes");
     assert_eq!(m.volumes, uris);
+}
+
+// ---------------------------------------------------------------------------
+// Round 2 — everything that can refuse runs BEFORE the first marker: the
+// capacity preflight, the verb's D0 hold, `--abort`, the census-reclaim
+// seq floor, the emptied slot's cursor in tree 0, the golden flat image.
+// ---------------------------------------------------------------------------
+
+/// A small heap for the capacity contracts: 16 MiB at 64 KiB nodes with a
+/// 1 MiB ring ≈ 236 heap extents.
+const SMALL_VOL_LEN: u64 = 16 * 1024 * 1024;
+
+/// Grow the shared trees by whole extents fast: `count` files each
+/// carrying one `value_len`-byte xattr (near the 64 KiB-node value cap, so
+/// a leaf holds a handful).
+async fn fill_with_large_xattrs(routed: &RoutedMetaBackend, count: u32, value_len: usize) {
+    let d = routed
+        .create(ROOT_INO, "bulk", libc::S_IFDIR | 0o755, 0, 0)
+        .await
+        .expect("mkdir bulk")
+        .ino;
+    for i in 0..count {
+        let f = routed
+            .create(d, &format!("b{i:05}"), libc::S_IFREG | 0o644, 0, 0)
+            .await
+            .expect("create")
+            .ino;
+        let v = vec![(i % 251) as u8; value_len];
+        routed.setxattr(f, "user.bulk", &v).await.expect("setxattr");
+        if i % 50 == 49 {
+            for vol in &routed.volumes {
+                vol.checkpoint_now().await.expect("checkpoint");
+            }
+        }
+    }
+}
+
+/// The fixed region `[0, heap.start)` — sector 0, the ledger, the ring,
+/// the bitmap — of one volume.
+async fn fixed_region_of(path: &str) -> Vec<u8> {
+    let sb = superblock_of(path).await;
+    squeezefs::uring_fs::read_at(Path::new(path), 0, sb.heap.start as usize)
+        .await
+        .unwrap()
+        .to_vec()
+}
+
+/// **Issue 1 (the bug).** A volume that cannot hold the forest beside its
+/// shared trees refuses BEFORE any marker — the capacity preflight is
+/// computed from the write-free inspection — naming the volume, the
+/// extents needed and available, and the remedy; the fixed region is
+/// byte-identical, the digest unchanged, and a writer mounts it. Before
+/// round 2 the same volume took its marker first and failed `NoSpace`
+/// mid-build, with `--resume` failing identically and no abort: a set
+/// only `format --force` could exit.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_capacity_preflight_refuses_a_volume_that_cannot_hold_the_forest_before_any_marker() {
+    let dir = tempfile::tempdir().unwrap();
+    let uris = format_flat_set_sized(dir.path(), 1, SMALL_VOL_LEN).await;
+    let routed = open_routed_meta_set(&uris).await.expect("open");
+    let pop = churn(&routed, 20).await;
+    fill_with_large_xattrs(&routed, 480, 15_000).await;
+    let digest = digest_backend(&routed.volumes[0]).await.unwrap();
+    for v in &routed.volumes {
+        v.shutdown().await.unwrap();
+    }
+    drop(routed);
+    let before = fixed_region_of(&uris[0]).await;
+
+    // The dry run reports the shortfall instead of refusing — the
+    // operator's instrument for the remedy.
+    let plan = enable_symmetric(
+        &uris,
+        &EnableSymOptions {
+            dry_run: true,
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("a dry run plans what it would refuse");
+    let row = &plan.rows[0];
+    println!("capacity plan: {row:?}");
+    assert!(
+        row.extents_needed > row.extents_available,
+        "the small volume cannot hold the forest beside its trees: needs {} of {}",
+        row.extents_needed,
+        row.extents_available
+    );
+
+    let err = enable_symmetric(&uris, &EnableSymOptions::default())
+        .await
+        .expect_err("refused at the capacity preflight");
+    let msg = err.to_string();
+    assert!(msg.contains("cannot hold the forest"), "{msg}");
+    assert!(msg.contains(&uris[0]), "names the volume: {msg}");
+    assert!(
+        msg.contains(&format!("claims {} fresh extents", row.extents_needed))
+            && msg.contains(&format!("only {} are claimable", row.extents_available)),
+        "names the needed and the available extents: {msg}"
+    );
+    assert!(
+        msg.contains("--meta-node-kib") && msg.contains("defrag --meta"),
+        "names the remedy: {msg}"
+    );
+
+    assert!(
+        before == fixed_region_of(&uris[0]).await,
+        "refused BEFORE any write: sector 0, the ledger, the ring and the bitmap are \
+         byte-identical"
+    );
+    assert!(!marker_present(&uris[0]).await, "no marker was written");
+    assert!(!is_symmetric(&superblock_of(&uris[0]).await));
+    assert_eq!(
+        digest_of(&uris[0]).await,
+        digest,
+        "the records are untouched"
+    );
+    let routed = open_routed_meta_set(&uris)
+        .await
+        .expect("a writer mounts the refused volume");
+    assert_population(&routed, &pop).await;
+    for v in &routed.volumes {
+        v.shutdown().await.unwrap();
+    }
+}
+
+/// **Issue 2.** The verb holds the D0 Layer-A flock on every volume for
+/// its duration: a concurrent holder — another invocation, a mount that
+/// began after the live-client gate — refuses the verb loud before any
+/// write, naming the lock.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_concurrent_holder_of_the_writer_lock_refuses_the_verb_before_any_write() {
+    use std::os::unix::io::AsRawFd;
+    let dir = tempfile::tempdir().unwrap();
+    let (uris, digests, _pop) = populated_flat_set(dir.path(), 1, 20).await;
+    let before = fixed_region_of(&uris[0]).await;
+    let holder = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&uris[0])
+        .unwrap();
+    // SAFETY: valid owned fd; LOCK_NB never blocks.
+    let rc = unsafe { libc::flock(holder.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    assert_eq!(rc, 0, "the test takes the device flock");
+    let err = enable_symmetric(&uris, &EnableSymOptions::default())
+        .await
+        .expect_err("refused on the writer lock");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("writer lock") && msg.contains("concurrent"),
+        "names the lock and the concurrent class: {msg}"
+    );
+    assert!(before == fixed_region_of(&uris[0]).await, "nothing written");
+    assert!(!marker_present(&uris[0]).await);
+    drop(holder);
+    // Released, the same set converts.
+    enable_symmetric(&uris, &EnableSymOptions::default())
+        .await
+        .expect("converts once the lock is free");
+    assert_eq!(digest_of(&uris[0]).await, digests[0]);
+}
+
+/// **Issue 2, the race itself.** Two invocations started together on one
+/// set: exactly one converts, the other refuses loud (on the lock, or —
+/// if it took the lock inside the winner's own guarded-open window — on
+/// the marker the winner had already written), and the set ends
+/// symmetric with the source's digest, never double-built.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn two_concurrent_invocations_never_double_build() {
+    let dir = tempfile::tempdir().unwrap();
+    let (uris, digests, pop) = populated_flat_set(dir.path(), 1, 60).await;
+    let opts = EnableSymOptions::default();
+    let (a, b) = tokio::join!(
+        enable_symmetric(&uris, &opts),
+        enable_symmetric(&uris, &opts)
+    );
+    let (won, lost) = match (a, b) {
+        (Ok(r), Err(e)) | (Err(e), Ok(r)) => (r, e),
+        (Ok(_), Ok(_)) => panic!("both invocations converted — the lock did not exclude"),
+        (Err(a), Err(b)) => panic!("neither invocation converted: {a} / {b}"),
+    };
+    assert_eq!(won.rows[0].outcome, ConversionOutcome::Converted);
+    let msg = lost.to_string();
+    assert!(
+        msg.contains("writer lock") || msg.contains("--resume") || msg.contains("mounted"),
+        "the loser refuses on the lock or the marker: {msg}"
+    );
+    assert!(is_symmetric(&superblock_of(&uris[0]).await));
+    assert!(!marker_present(&uris[0]).await);
+    assert_eq!(digest_of(&uris[0]).await, digests[0]);
+    let routed = open_routed_meta_set(&uris).await.expect("forest mount");
+    assert_population(&routed, &pop).await;
+    let (claimed, reachable) = {
+        let free_before = routed.volumes[0].allocator().free_extents();
+        for v in &routed.volumes {
+            v.shutdown().await.unwrap();
+        }
+        drop(routed);
+        let _ = free_before;
+        extent_census(&uris[0]).await
+    };
+    assert_eq!(claimed, reachable + 1, "one forest, exactly accounted");
+    fsck_clean(&uris).await;
+}
+
+/// `--abort` after a crash at `window` (a FLAT volume under its marker):
+/// the marker is removed, the aborted build's extents reclaimed, and the
+/// volume is the flat volume it was before the verb — the pre-verb
+/// digest, every claimed extent reachable, writer-mountable, and a fresh
+/// conversion of it succeeds.
+async fn abort_after(window: EnableSymCrash) {
+    let dir = tempfile::tempdir().unwrap();
+    let (uris, digests, pop) = populated_flat_set(dir.path(), 1, 120).await;
+    let sector0_before = squeezefs::uring_fs::read_at(Path::new(&uris[0]), 0, 4096)
+        .await
+        .unwrap();
+    enable_symmetric_with(
+        &uris,
+        &EnableSymOptions::default(),
+        &EnableSymHooks {
+            crash_after: Some(window),
+        },
+    )
+    .await
+    .expect_err("the injected crash aborts the verb");
+    assert!(marker_present(&uris[0]).await);
+    assert!(!is_symmetric(&superblock_of(&uris[0]).await));
+
+    let report = enable_symmetric(
+        &uris,
+        &EnableSymOptions {
+            abort: true,
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("--abort undoes the crashed run on a flat volume");
+    println!("abort row after {window:?}: {:?}", report.rows[0]);
+    assert_eq!(report.rows[0].outcome, ConversionOutcome::Aborted);
+    if matches!(
+        window,
+        EnableSymCrash::AfterBuild { .. } | EnableSymCrash::AfterLedger { .. }
+    ) {
+        assert!(
+            report.rows[0].orphans_reclaimed > 0,
+            "the abort reclaims the crashed build's extents"
+        );
+    } else {
+        assert_eq!(report.rows[0].orphans_reclaimed, 0);
+    }
+    assert!(!marker_present(&uris[0]).await, "the marker is gone");
+    assert!(!is_symmetric(&superblock_of(&uris[0]).await), "still flat");
+    let sector0_after = squeezefs::uring_fs::read_at(Path::new(&uris[0]), 0, 4096)
+        .await
+        .unwrap();
+    assert!(sector0_before == sector0_after, "sector 0 never changed");
+    assert_eq!(
+        digest_of(&uris[0]).await,
+        digests[0],
+        "the pre-verb digest — the same records, nothing else"
+    );
+    let (claimed, reachable) = extent_census(&uris[0]).await;
+    assert_eq!(
+        claimed, reachable,
+        "every claimed extent is reachable again — the aborted build left nothing"
+    );
+
+    let routed = open_routed_meta_set(&uris)
+        .await
+        .expect("a writer mounts the aborted volume");
+    assert_population(&routed, &pop).await;
+    for v in &routed.volumes {
+        v.shutdown().await.unwrap();
+    }
+    drop(routed);
+    // A plain conversion of the restored volume succeeds.
+    let report = enable_symmetric(&uris, &EnableSymOptions::default())
+        .await
+        .expect("convert after the abort");
+    assert_eq!(report.rows[0].outcome, ConversionOutcome::Converted);
+    assert_eq!(digest_of(&uris[0]).await, digests[0]);
+    fsck_clean(&uris).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_abort_after_the_markers_restores_the_flat_volume() {
+    abort_after(EnableSymCrash::AfterMarker).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_abort_after_a_crashed_build_restores_the_flat_volume() {
+    abort_after(EnableSymCrash::AfterBuild { volume: 0 }).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_abort_after_the_hybrid_ledger_restores_the_flat_volume() {
+    abort_after(EnableSymCrash::AfterLedger { volume: 0 }).await;
+}
+
+/// `--abort` on a volume past its flip refuses naming `--resume`, touches
+/// nothing (the marker stays, the stamp stays), and the resume then
+/// finishes it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_abort_on_a_stamped_volume_refuses_naming_resume() {
+    let dir = tempfile::tempdir().unwrap();
+    let (uris, digests, pop) = populated_flat_set(dir.path(), 1, 60).await;
+    enable_symmetric_with(
+        &uris,
+        &EnableSymOptions::default(),
+        &EnableSymHooks {
+            crash_after: Some(EnableSymCrash::AfterStamp { volume: 0 }),
+        },
+    )
+    .await
+    .expect_err("crash");
+    assert!(is_symmetric(&superblock_of(&uris[0]).await));
+    assert!(marker_present(&uris[0]).await);
+    let before = fixed_region_of(&uris[0]).await;
+    let err = enable_symmetric(
+        &uris,
+        &EnableSymOptions {
+            abort: true,
+            ..Default::default()
+        },
+    )
+    .await
+    .expect_err("refused past the flip");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("--resume") && msg.contains("past its flip") && msg.contains(&uris[0]),
+        "names the volume and the only exit: {msg}"
+    );
+    assert!(before == fixed_region_of(&uris[0]).await, "nothing undone");
+    assert!(marker_present(&uris[0]).await);
+    let report = enable_symmetric(
+        &uris,
+        &EnableSymOptions {
+            resume: true,
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("resume finishes");
+    assert_eq!(report.rows[0].outcome, ConversionOutcome::Resumed);
+    assert_eq!(digest_of(&uris[0]).await, digests[0]);
+    let routed = open_routed_meta_set(&uris).await.expect("forest mount");
+    assert_population(&routed, &pop).await;
+    for v in &routed.volumes {
+        v.shutdown().await.unwrap();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_abort_with_nothing_to_abort_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let (uris, _d, _p) = populated_flat_set(dir.path(), 1, 10).await;
+    let err = enable_symmetric(
+        &uris,
+        &EnableSymOptions {
+            abort: true,
+            ..Default::default()
+        },
+    )
+    .await
+    .expect_err("refused");
+    assert!(err.to_string().contains("nothing to abort"), "{err}");
+    assert!(!is_symmetric(&superblock_of(&uris[0]).await));
+}
+
+/// **Issue 1 (the half-converted set).** `--abort` on a set with one
+/// volume past its flip refuses the WHOLE set — the flat marked volumes
+/// keep their markers (nothing partial), and `--resume` finishes all.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_abort_on_a_half_converted_set_refuses_whole_and_undoes_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let (uris, digests, _pop) = populated_flat_set(dir.path(), 2, 40).await;
+    enable_symmetric_with(
+        &uris,
+        &EnableSymOptions::default(),
+        &EnableSymHooks {
+            crash_after: Some(EnableSymCrash::AfterStamp { volume: 0 }),
+        },
+    )
+    .await
+    .expect_err("crash");
+    assert!(is_symmetric(&superblock_of(&uris[0]).await));
+    assert!(!is_symmetric(&superblock_of(&uris[1]).await));
+    assert!(marker_present(&uris[0]).await && marker_present(&uris[1]).await);
+    let err = enable_symmetric(
+        &uris,
+        &EnableSymOptions {
+            abort: true,
+            ..Default::default()
+        },
+    )
+    .await
+    .expect_err("refused");
+    assert!(err.to_string().contains(&uris[0]), "{err}");
+    assert!(
+        marker_present(&uris[1]).await,
+        "the flat volume's marker stays — nothing was undone on any volume"
+    );
+    let report = enable_symmetric(
+        &uris,
+        &EnableSymOptions {
+            resume: true,
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("resume");
+    assert!(report
+        .rows
+        .iter()
+        .all(|r| r.outcome == ConversionOutcome::Resumed));
+    for (i, uri) in uris.iter().enumerate() {
+        assert_eq!(digest_of(uri).await, digests[i]);
+    }
+}
+
+/// **Issue 4.** A crashed build's images carry node seqs ABOVE the mounted
+/// ledger's watermark (they were never freed under a record — the
+/// watermark law does not cover them). The resume's census reclaims those
+/// extents and floors its writer above every stamp their residue carries,
+/// so no forest node can ever share a seq with a frame left in a
+/// reclaimed extent (the §4.1 tail-chain hazard): every node the
+/// converted volume reaches is stamped above the crashed build's highest.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_resume_floors_its_node_seqs_above_every_reclaimed_extents_residue() {
+    let dir = tempfile::tempdir().unwrap();
+    let (uris, digests, _pop) = populated_flat_set(dir.path(), 1, 120).await;
+    let sb = superblock_of(&uris[0]).await;
+    let p = Path::new(&uris[0]);
+    let ledger_before = read_newest_ledger(p, sb.root_ledger.start)
+        .await
+        .unwrap()
+        .expect("ledger");
+    enable_symmetric_with(
+        &uris,
+        &EnableSymOptions::default(),
+        &EnableSymHooks {
+            crash_after: Some(EnableSymCrash::AfterBuild { volume: 0 }),
+        },
+    )
+    .await
+    .expect_err("crash after the build");
+    // The heap's highest residue stamp — the crashed build's images — vs
+    // the watermark the flat ledger still carries.
+    let node_size = sb.node_size as usize;
+    let mut residue_max = 0u64;
+    for extent in 0..sb.total_extents() {
+        let img =
+            squeezefs::uring_fs::read_at(p, sb.heap.start + extent * node_size as u64, node_size)
+                .await
+                .unwrap();
+        residue_max = residue_max.max(residue_seq_ceiling(&img));
+    }
+    let ledger_crashed = read_newest_ledger(p, sb.root_ledger.start)
+        .await
+        .unwrap()
+        .expect("ledger");
+    assert!(
+        residue_max > ledger_crashed.node_seq_watermark,
+        "the orphaned build's images sit ABOVE the mounted watermark ({} > {}) — the hazard \
+         the floor exists for is real here",
+        residue_max,
+        ledger_crashed.node_seq_watermark
+    );
+    assert!(ledger_crashed.node_seq_watermark >= ledger_before.node_seq_watermark);
+
+    enable_symmetric(
+        &uris,
+        &EnableSymOptions {
+            resume: true,
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("resume");
+    assert_eq!(digest_of(&uris[0]).await, digests[0]);
+    let be = KvMetaBackend::open_probe(p).await.expect("probe");
+    let ledger_after = be.mounted_ledger().clone();
+    assert!(
+        ledger_after.node_seq_watermark > residue_max,
+        "the ledger's watermark passed every reclaimed stamp: {} > {}",
+        ledger_after.node_seq_watermark,
+        residue_max
+    );
+    let layout = squeezefs::meta_backend::kv::node::NodeLayout::new(node_size).unwrap();
+    let mut nodes = 0u64;
+    for tree in be.all_trees() {
+        for addr in tree.reachable_node_addrs().await.expect("walk") {
+            let node = squeezefs::meta_backend::kv::node::load_node(p, &layout, addr, u64::MAX)
+                .await
+                .expect("a reachable node loads");
+            assert!(
+                node.header().node_seq > residue_max,
+                "node {addr:#x} seq {} ≤ the reclaimed residue's {} — a fresh node could adopt \
+                 a dead frame",
+                node.header().node_seq,
+                residue_max
+            );
+            nodes += 1;
+        }
+    }
+    assert!(nodes > 1);
+}
+
+/// **Issue 5.** A hosted slot whose stamp carries a cursor but whose inos
+/// were all deleted gets an EMPTY slot tree and a tree-0 `Unleased`
+/// record carrying that cursor: tree 0 is the cursor's durable home
+/// without the stamp (§5.1.8), so a lease that reads tree 0 alone can
+/// never re-mint a deleted ino. Pinned twice: tree 0 names every stamped
+/// guest slot at or above the stamp's cursor, and no ino minted after the
+/// conversion is one that was deleted before it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_slot_emptied_before_conversion_never_remints_after_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let uris = format_flat_set(dir.path(), 1).await;
+    let routed = open_routed_meta_set(&uris).await.expect("open");
+    let gone = routed
+        .create(ROOT_INO, "gone", libc::S_IFDIR | 0o755, 0, 0)
+        .await
+        .expect("mkdir")
+        .ino;
+    let mut deleted = std::collections::BTreeSet::new();
+    for i in 0..300 {
+        let f = routed
+            .create(gone, &format!("g{i:04}"), libc::S_IFREG | 0o644, 0, 0)
+            .await
+            .expect("create")
+            .ino;
+        deleted.insert(f);
+    }
+    for i in 0..300 {
+        routed
+            .unlink(gone, &format!("g{i:04}"))
+            .await
+            .expect("unlink");
+    }
+    for v in &routed.volumes {
+        v.shutdown().await.unwrap();
+    }
+    drop(routed);
+    let sb = superblock_of(&uris[0]).await;
+    let p = Path::new(&uris[0]);
+    let stamp = read_newest_ledger(p, sb.root_ledger.start)
+        .await
+        .unwrap()
+        .expect("ledger")
+        .membership_stamp
+        .expect("stamp");
+    let guests: Vec<(u16, u64)> = stamp
+        .slot_cursors
+        .iter()
+        .copied()
+        .filter(|(s, _)| stamp.resolved_native_slot() != Some(*s))
+        .collect();
+    assert!(
+        guests.len() > 1,
+        "the mint spread left cursors on several guest slots: {}",
+        guests.len()
+    );
+
+    let report = enable_symmetric(&uris, &EnableSymOptions::default())
+        .await
+        .expect("convert");
+    assert!(
+        report.rows[0].slot_trees as usize > guests.len(),
+        "one slot tree per stamped guest slot plus the native: {} > {}",
+        report.rows[0].slot_trees,
+        guests.len()
+    );
+
+    // Tree 0 carries every stamped guest slot's cursor.
+    let be = KvMetaBackend::open_probe(p).await.expect("probe");
+    let control = be
+        .all_trees()
+        .into_iter()
+        .find(|t| t.tree_id() == TREE_CONTROL)
+        .expect("tree 0");
+    let (start, end) = slot_state_key_range();
+    let mut named: BTreeMap<u32, u64> = BTreeMap::new();
+    for (k, v) in control.range(&start, &end, 100_000).await.expect("range") {
+        let slot = decode_slot_state_key(&k).expect("slot key");
+        match SlotState::decode(&v).expect("slot state") {
+            SlotState::Unleased { cursor, .. } => {
+                named.insert(slot, cursor);
+            }
+            other => panic!("PR 11 writes Unleased only: {other:?}"),
+        }
+    }
+    for (slot, cursor) in &guests {
+        let fs = guest_forest_slot(*slot);
+        let got = named
+            .get(&fs)
+            .unwrap_or_else(|| panic!("tree 0 names no record for stamped guest slot {slot}"));
+        assert!(
+            *got >= *cursor,
+            "slot {slot}: tree 0's cursor {got} is below the stamp's {cursor}"
+        );
+    }
+    drop(be);
+
+    // Nothing minted after the conversion is an ino deleted before it.
+    let routed = open_routed_meta_set(&uris).await.expect("forest mount");
+    for i in 0..600 {
+        let f = routed
+            .create(gone, &format!("n{i:04}"), libc::S_IFREG | 0o644, 0, 0)
+            .await
+            .expect("create")
+            .ino;
+        assert!(
+            !deleted.contains(&f),
+            "ino {f} was deleted before the conversion and re-minted after it"
+        );
+    }
+    for v in &routed.volumes {
+        v.shutdown().await.unwrap();
+    }
+}
+
+/// **Issue 12.** The non-solo bit-8 refusal's remedy — "mount the set solo
+/// once" — is true: a solo mount of a volume whose newest ledger record
+/// carries a 2-way partition re-checkpoints the ledger in its solo form,
+/// after which the verb converts it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_solo_mount_of_a_non_solo_record_volume_leaves_a_solo_record_and_the_verb_converts() {
+    let dir = tempfile::tempdir().unwrap();
+    let (uris, digests, _p) = populated_flat_set(dir.path(), 1, 20).await;
+    let sb = superblock_of(&uris[0]).await;
+    let p = Path::new(&uris[0]);
+    let mut rec = read_newest_ledger(p, sb.root_ledger.start)
+        .await
+        .unwrap()
+        .expect("ledger");
+    rec.seq += 1;
+    rec.append_partition = Some(AppendPartition::new(2, 0).expect("legal partition"));
+    write_ledger_slot(p, sb.root_ledger.start, &rec)
+        .await
+        .expect("write");
+    squeezefs::uring_fs::fdatasync(p).await.unwrap();
+    enable_symmetric(&uris, &EnableSymOptions::default())
+        .await
+        .expect_err("refused under the non-solo record");
+    // The remedy.
+    let routed = open_routed_meta_set(&uris).await.expect("a solo mount");
+    for v in &routed.volumes {
+        v.checkpoint_now().await.unwrap();
+        v.shutdown().await.unwrap();
+    }
+    drop(routed);
+    let after = read_newest_ledger(p, sb.root_ledger.start)
+        .await
+        .unwrap()
+        .expect("ledger");
+    assert!(
+        after.append_partition.is_none_or(|part| part.is_solo()),
+        "the solo mount's checkpoint wrote a solo-form record: {:?}",
+        after.append_partition
+    );
+    let report = enable_symmetric(&uris, &EnableSymOptions::default())
+        .await
+        .expect("converts after the solo mount");
+    assert_eq!(report.rows[0].outcome, ConversionOutcome::Converted);
+    assert_eq!(digest_of(&uris[0]).await, digests[0]);
+}
+
+/// A flat volume whose ring holds entries past its checkpoint tail (a
+/// crashed writer whose claim has aged out — within the 45 s TTL the
+/// live-client gate refuses it first) refuses BEFORE any marker, naming
+/// the mount that fixes it — the census the conversion runs is exact only
+/// over an empty window, and the remedy must be reachable.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_volume_not_cleanly_unmounted_refuses_before_any_marker() {
+    use squeezefs::meta_backend::kv::journal::{
+        checkpoint_reserve_bytes, entry_len_for, JournalRing, JOURNAL_PAGE_LEN,
+    };
+    use squeezefs::meta_backend::kv::journal_core::AdmissionClass;
+    use squeezefs::meta_backend::kv::record::Record;
+    let dir = tempfile::tempdir().unwrap();
+    let (uris, digests, pop) = populated_flat_set(dir.path(), 1, 30).await;
+    let p = Path::new(&uris[0]);
+    // A committed-but-not-checkpointed record past the tail — the shape
+    // a kill -9 after an ack leaves — written through the ring's own
+    // primitive at the recovered head (the claim record itself is gone:
+    // the clean unmount removed it, as an aged-out crash's is ignored).
+    let sb = superblock_of(&uris[0]).await;
+    let ledger = read_newest_ledger(p, sb.root_ledger.start)
+        .await
+        .unwrap()
+        .expect("ledger");
+    let (ring, recovery) = JournalRing::recover(
+        p,
+        sb.journal.start,
+        sb.journal.len / JOURNAL_PAGE_LEN,
+        checkpoint_reserve_bytes(sb.journal.len),
+        ledger.journal_tail_seq,
+    )
+    .await
+    .expect("recover the ring");
+    assert!(
+        recovery.entries.is_empty(),
+        "cleanly unmounted: empty window"
+    );
+    let key = xattr_key(
+        ROOT_INO,
+        squeezefs::meta_backend::kv::record::xattr_name_hash56(
+            b"user.uncheckpointed",
+            sb.hash_seed,
+        ),
+        0,
+    );
+    let value = XattrValue {
+        name: b"user.uncheckpointed".to_vec(),
+        value: b"x".to_vec(),
+    }
+    .encode()
+    .unwrap();
+    let probe = vec![(TREE_XATTRS, Record::put(key.to_vec(), 0, value.clone()))];
+    let need = entry_len_for(&probe).unwrap();
+    let adm = ring
+        .try_admit(need, AdmissionClass::User)
+        .expect("room in the ring");
+    let res = ring.core().reserve(adm);
+    ring.write_entry(
+        &res,
+        &[(TREE_XATTRS, Record::put(key.to_vec(), res.seq(), value))],
+    )
+    .await
+    .expect("write the entry");
+    squeezefs::uring_fs::fdatasync(p).await.unwrap();
+    drop(ring);
+    let before = fixed_region_of(&uris[0]).await;
+    let err = enable_symmetric(&uris, &EnableSymOptions::default())
+        .await
+        .expect_err("refused");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("not cleanly unmounted") && msg.contains("unmount cleanly"),
+        "names the state and the remedy: {msg}"
+    );
+    assert!(before == fixed_region_of(&uris[0]).await, "nothing written");
+    assert!(!marker_present(&uris[0]).await);
+    // The remedy.
+    let routed = open_routed_meta_set(&uris)
+        .await
+        .expect("mount replays the window");
+    assert_population(&routed, &pop).await;
+    routed
+        .removexattr(ROOT_INO, "user.uncheckpointed")
+        .await
+        .expect("remove");
+    for v in &routed.volumes {
+        v.shutdown().await.unwrap();
+    }
+    drop(routed);
+    enable_symmetric(&uris, &EnableSymOptions::default())
+        .await
+        .expect("converts after the clean unmount");
+    assert_eq!(digest_of(&uris[0]).await, digests[0]);
+}
+
+/// **Issue 13.** The default `format` is untouched, as a TEST: the flat
+/// image of the fixed description digests to the value the pre-PR-11
+/// builder produced (computed on `dev` @ `5eca0e12` for the same
+/// description), for both the `--single-writer` class and the default
+/// multi-writer-capable class.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_flat_image_of_the_fixed_description_digests_to_the_pre_pr_golden() {
+    const GOLDEN_SINGLE_WRITER: u64 = 0xd132_9394_4543_ef28;
+    const GOLDEN_MULTI_WRITER: u64 = 0x4358_b34f_3970_f9c9;
+    let _g = SEAM.lock().await;
+    let prior = std::env::var_os("SQUEEZEFS_TEST_STAMP_SYMMETRIC");
+    std::env::remove_var("SQUEEZEFS_TEST_STAMP_SYMMETRIC");
+    let single = tempfile::NamedTempFile::new().unwrap();
+    single.as_file().set_len(VOL_LEN).unwrap();
+    let multi = tempfile::NamedTempFile::new().unwrap();
+    multi.as_file().set_len(VOL_LEN).unwrap();
+    let r1 = describe().build(single.path(), VOL_LEN).await;
+    let mut mw = describe();
+    mw.set_multi_writer();
+    let r2 = mw.build(multi.path(), VOL_LEN).await;
+    if let Some(v) = prior {
+        std::env::set_var("SQUEEZEFS_TEST_STAMP_SYMMETRIC", v);
+    }
+    r1.expect("build the single-writer flat image");
+    r2.expect("build the multi-writer flat image");
+    let d1 = xxhash_rust::xxh3::xxh3_64(&std::fs::read(single.path()).unwrap());
+    let d2 = xxhash_rust::xxh3::xxh3_64(&std::fs::read(multi.path()).unwrap());
+    assert_eq!(
+        d1, GOLDEN_SINGLE_WRITER,
+        "the single-writer flat image changed: {d1:#018x}"
+    );
+    assert_eq!(
+        d2, GOLDEN_MULTI_WRITER,
+        "the multi-writer flat image changed: {d2:#018x}"
+    );
+}
+
+/// **The §5b finding, as a test** (`.benchmarks/2026-09-14-sym-pr11-convert.md`
+/// §5b — SHIPPED, every layout; NOT fixed by PR 11): `RoutedMetaBackend::rename`
+/// (`src/meta_backend/mod.rs`, the `lock_many` over the two parents and
+/// the two names) → `KvMetaBackend::routed_rename_local` stages the MOVED
+/// inode's ctime `Delta` without holding `I{moved}`, while a concurrent
+/// layout publish of the same ino holds `I{ino}` and stages a `Put` — so
+/// both land in one conveyor batch on one key and the pass's same-key
+/// co-queue exclusion fires (a debug binary fails the batch, a release
+/// binary can lose the rename's ctime). Ignored until the rename takes
+/// `I{moved}` in its `lock_many` (lookup → one `lock_many` incl. the
+/// moved and the overwritten ino → revalidate); un-ignore with the fix.
+#[ignore = "the shipped rename guard hole (note §5b): rename never locks I{moved}; un-ignore with the fix"]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rename_and_a_layout_publish_of_one_ino_never_co_queue_a_delta_and_a_put_unguarded() {
+    let dir = tempfile::tempdir().unwrap();
+    let uris = format_flat_set(dir.path(), 1).await;
+    let routed = open_routed_meta_set(&uris).await.expect("open");
+    let d = routed
+        .create(ROOT_INO, "race", libc::S_IFDIR | 0o755, 0, 0)
+        .await
+        .expect("mkdir")
+        .ino;
+    for round in 0..200u32 {
+        let f = routed
+            .create(d, &format!("f{round}"), libc::S_IFREG | 0o644, 0, 0)
+            .await
+            .expect("create")
+            .ino;
+        let (vi, local) = routed.route_ino(f);
+        let vol = routed.volumes[vi].clone();
+        let (from, to) = (format!("f{round}"), format!("g{round}"));
+        let (renamed, published) = tokio::join!(
+            routed.rename(d, &from, d, &to, 0),
+            vol.set_layout_and_size(local, b"layout", 4096, &[])
+        );
+        renamed.unwrap_or_else(|e| panic!("round {round}: rename failed: {e}"));
+        published.unwrap_or_else(|e| panic!("round {round}: publish failed: {e}"));
+    }
+    for v in &routed.volumes {
+        v.shutdown().await.unwrap();
+    }
 }

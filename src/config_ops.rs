@@ -5021,25 +5021,39 @@ pub struct SymUpgradeMarker {
 impl SymUpgradeMarker {
     /// `version u8 | count u16 LE | (len u16 LE | bytes) × volumes |
     /// xxh3-64 LE of everything before` (the mw marker's shape without
-    /// its bit word).
-    pub fn encode(&self) -> Vec<u8> {
+    /// its bit word). Refuses a volume count or a path the `u16` fields
+    /// cannot carry rather than truncating them.
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        let too_wide = |what: &str, n: usize| {
+            SqueezefsError::InvalidOperation(format!(
+                "sym_upgrade marker: {what} of {n} does not fit the record's u16 field"
+            ))
+        };
+        let count = u16::try_from(self.volumes.len())
+            .map_err(|_| too_wide("a volume count", self.volumes.len()))?;
         let mut out =
             Vec::with_capacity(1 + 2 + self.volumes.iter().map(|v| 2 + v.len()).sum::<usize>() + 8);
         out.push(SYM_UPGRADE_MARKER_VERSION);
-        out.extend_from_slice(&(self.volumes.len() as u16).to_le_bytes());
+        out.extend_from_slice(&count.to_le_bytes());
         for v in &self.volumes {
             let b = v.as_bytes();
-            out.extend_from_slice(&(b.len() as u16).to_le_bytes());
+            let len = u16::try_from(b.len()).map_err(|_| too_wide("a path length", b.len()))?;
+            out.extend_from_slice(&len.to_le_bytes());
             out.extend_from_slice(b);
         }
         let sum = xxhash_rust::xxh3::xxh3_64(&out);
         out.extend_from_slice(&sum.to_le_bytes());
-        out
+        Ok(out)
     }
 
     /// Decode + verify; torn, truncated and future-version images refuse
     /// loud (presence alone is the mount gate's predicate).
     pub fn decode(raw: &[u8]) -> std::result::Result<Self, String> {
+        fn le_u16(b: &[u8], at: usize) -> std::result::Result<usize, String> {
+            b.get(at..at + 2)
+                .map(|s| usize::from(u16::from_le_bytes([s[0], s[1]])))
+                .ok_or_else(|| "sym_upgrade marker truncated inside a length field".to_string())
+        }
         if raw.len() < 1 + 2 + 8 {
             return Err(format!(
                 "sym_upgrade marker too short ({} B) — torn or foreign",
@@ -5047,8 +5061,9 @@ impl SymUpgradeMarker {
             ));
         }
         let (body, sum_bytes) = raw.split_at(raw.len() - 8);
-        let want = u64::from_le_bytes(sum_bytes.try_into().expect("8 B split"));
-        if xxhash_rust::xxh3::xxh3_64(body) != want {
+        let mut sum = [0u8; 8];
+        sum.copy_from_slice(sum_bytes);
+        if xxhash_rust::xxh3::xxh3_64(body) != u64::from_le_bytes(sum) {
             return Err(
                 "sym_upgrade marker checksum mismatch — torn write or corruption".to_string(),
             );
@@ -5060,20 +5075,18 @@ impl SymUpgradeMarker {
                 body[0], SYM_UPGRADE_MARKER_VERSION
             ));
         }
-        let count = u16::from_le_bytes(body[1..3].try_into().expect("2 B")) as usize;
+        let count = le_u16(body, 1)?;
         let mut pos = 3usize;
         let mut volumes = Vec::with_capacity(count);
         for _ in 0..count {
-            if pos + 2 > body.len() {
-                return Err("sym_upgrade marker truncated before a volume entry".to_string());
-            }
-            let len = u16::from_le_bytes(body[pos..pos + 2].try_into().expect("2 B")) as usize;
+            let len = le_u16(body, pos)
+                .map_err(|_| "sym_upgrade marker truncated before a volume entry".to_string())?;
             pos += 2;
-            if pos + len > body.len() {
-                return Err("sym_upgrade marker truncated inside a volume entry".to_string());
-            }
+            let entry = body
+                .get(pos..pos + len)
+                .ok_or_else(|| "sym_upgrade marker truncated inside a volume entry".to_string())?;
             volumes.push(
-                std::str::from_utf8(&body[pos..pos + len])
+                std::str::from_utf8(entry)
                     .map_err(|_| "sym_upgrade marker volume entry is not UTF-8".to_string())?
                     .to_string(),
             );
@@ -5094,6 +5107,12 @@ pub struct EnableSymOptions {
     /// Continue a crashed run (a marker present on any volume refuses a
     /// plain run — a crash must be acknowledged).
     pub resume: bool,
+    /// Undo a crashed run on every volume still FLAT under its marker:
+    /// the marker is removed and any extents its aborted build claimed
+    /// are reclaimed, leaving the volume as it was before the verb. A
+    /// volume already past its flip (stamped, marker present) refuses —
+    /// the forest is that volume's truth and `--resume` its only exit.
+    pub abort: bool,
 }
 
 /// The conversion's crash seams: each injects a hard error AFTER the named
@@ -5136,6 +5155,11 @@ pub enum ConversionOutcome {
     AlreadySymmetric,
     /// `--dry-run`: planned, nothing written.
     Planned,
+    /// `--abort`: a flat volume's marker removed and its aborted build's
+    /// extents reclaimed — the volume as before the verb.
+    Aborted,
+    /// `--abort`: a flat volume the crashed run never marked — untouched.
+    Untouched,
 }
 
 /// One volume's row of an [`EnableSymReport`].
@@ -5149,6 +5173,14 @@ pub struct VolumeConversionRow {
     pub bytes: u64,
     /// Slot trees the forest holds (native included).
     pub slot_trees: u64,
+    /// The capacity preflight's PEAK CLAIM: the heap extents the build
+    /// claims while the shared trees stay claimed (Σ planned nodes + the
+    /// directory extent) — the plan the tie contract compares against
+    /// `extents_written`.
+    pub extents_needed: u64,
+    /// What the preflight found claimable for the build: free extents
+    /// plus the orphans its census reclaims, less the compaction floor.
+    pub extents_available: u64,
     /// Heap extents the forest occupies (nodes + the directory extent).
     pub extents_written: u64,
     /// Heap extents the emptied shared trees returned.
@@ -5158,6 +5190,36 @@ pub struct VolumeConversionRow {
     pub orphans_reclaimed: u64,
     /// Wall seconds of the conversion pass.
     pub secs: f64,
+}
+
+impl VolumeConversionRow {
+    fn new(path: &str, outcome: ConversionOutcome) -> Self {
+        Self {
+            path: path.to_string(),
+            outcome,
+            records: 0,
+            bytes: 0,
+            slot_trees: 0,
+            extents_needed: 0,
+            extents_available: 0,
+            extents_written: 0,
+            extents_freed: 0,
+            orphans_reclaimed: 0,
+            secs: 0.0,
+        }
+    }
+
+    fn with_plan(mut self, plan: Option<&BuildPlan>) -> Self {
+        if let Some(p) = plan {
+            self.records = p.records;
+            self.bytes = p.bytes;
+            self.slot_trees = p.slot_trees;
+            self.extents_needed = p.needed;
+            self.extents_available = p.available;
+            self.orphans_reclaimed = p.orphans;
+        }
+        self
+    }
 }
 
 /// What [`enable_symmetric`] did.
@@ -5179,6 +5241,24 @@ pub struct EnableSymReport {
 /// volume, the D0 ladder asserted per volume, whole-set in one
 /// invocation, crash-resumable).
 ///
+/// **Everything that can refuse runs BEFORE the first marker, and the
+/// marker is the verb's first write.** The live-client gate, the set
+/// discovery, the verb's own D0 flock on every volume (held for the
+/// verb's duration, released only around its guarded opens — a
+/// concurrent invocation refuses at Layer A instead of racing the
+/// inspection into the same extents), then one write-free inspection
+/// per volume through a probe: the layout bit and the marker, the
+/// membership stamp, the bit-8 partition record, the replay window
+/// (a flat volume not cleanly unmounted is refused while a mount can
+/// still fix it), the open cross-volume intents and in-flight jobs,
+/// the record collection (the codec's slot-range refusals fire here),
+/// the bitmap-vs-reachability census and the **capacity preflight**
+/// (the build plan, `extents_needed` / `extents_available` on the row):
+/// the build's peak claim, computed by the tree writer's own chunking,
+/// against what the volume can supply. A set that
+/// passes is a set the build cannot leave stranded under its markers by
+/// a refusal this binary could have made first.
+///
 /// Per volume, in canonical order, the durable steps and the state each
 /// leaves (every one is what a `kill -9` right after it leaves; the
 /// resume decides where it is from these alone):
@@ -5193,21 +5273,28 @@ pub struct EnableSymReport {
 ///    clean shutdown ⇒ an EMPTY replay window, asserted), read through a
 ///    probe (every live record of every kind, folded), and the forest is
 ///    written into FRESH extents: one mixed-kind slot tree per slot the
-///    records name, tree 0 naming every guest root `Unleased { root,
-///    cursor: max(stamp cursor, max live ino + 1), g: 0 }` (§5.1.8), the
-///    appender directory extent, the fixed ring zeroed and appender 0's
-///    `Free` page in its first slot (§5.3.1); every record is written at
-///    seq 0 (checkpoint-covered by construction, the format law) so the
-///    ring may restart at 0. The bitmap claiming the new extents lands at
-///    a new generation. Before the build, every claimed extent no ledger
-///    root reaches is RECLAIMED (a crashed build's orphans — the volume is
-///    quiesced with an empty window, so reachability from the ledger's
-///    roots is exact).
+///    records name — and one EMPTY slot tree per hosted slot whose stamp
+///    carries a cursor but whose records were all deleted, so tree 0 is
+///    the cursor's durable home without the stamp (§5.1.8) — tree 0
+///    naming every guest root `Unleased { root, cursor: max(stamp cursor,
+///    max live ino + 1), g: 0 }`, the appender directory extent, the
+///    fixed ring zeroed and appender 0's `Free` page in its first slot
+///    (§5.3.1); every record is written at seq 0 (checkpoint-covered by
+///    construction, the format law). The ring's seq space is kept: both
+///    layouts resume at the quiesced tail `T` over the zeros, so a flat
+///    write in the window before the stamp still sorts above the flat
+///    trees' records. The bitmap claiming the new extents lands at a
+///    new generation. Before
+///    the build, every claimed extent no ledger root reaches is
+///    RECLAIMED (a crashed build's orphans — the volume is quiesced with
+///    an empty window, so reachability from the ledger's roots is exact)
+///    and the writer's node-seq floor is raised above every stamp those
+///    extents' residue carries ([`crate::meta_backend::kv::node::residue_seq_ceiling`]).
 /// 3. **the hybrid ledger** — ONE 4 KiB checksummed slot write naming the
-///    flat roots AND tree 0 + the native slot tree, tail 0, the new
-///    bitmap generation. A flat open still finds its roots (and reads the
-///    zeroed ring as empty — the appender page in page 0 is not a journal
-///    page); nothing references the forest yet but this record.
+///    flat roots AND tree 0 + the native slot tree, the quiesced tail, the
+///    new bitmap generation. A flat open still finds its roots (and reads
+///    the zeroed ring as empty — the appender page in page 0 is not a
+///    journal page); nothing references the forest yet but this record.
 /// 4. **the stamp** — bit 17 + `appender_dir` in one sector write: the
 ///    volume's layout flips to the forest, which the same ledger already
 ///    describes. The marker rode the build into the native slot tree, so
@@ -5222,12 +5309,15 @@ pub struct EnableSymReport {
 ///    (its join, checkpoint and leave), the volume's last act. The marker
 ///    outlives the stamp by construction: windows 4 and 5 refuse writers.
 ///
-/// Two crash windows are stated and pinned: between 3 and 4 the volume is
-/// a FLAT volume whose ledger also names an unreferenced forest (the
-/// resume rebuilds — the census reclaims the forest as orphans and the
-/// hybrid record is overwritten); between 4 and 6 it is a FOREST whose
-/// ledger may still name the old trees (the resume frees them, or finds
-/// them already folded out, then removes the marker).
+/// Two CLASSES of crash window are stated and pinned at five seams:
+/// before the stamp (after the markers, the build, the hybrid ledger) the
+/// volume is a FLAT volume whose bitmap and ledger may also name an
+/// unreferenced forest (the resume rebuilds — the census reclaims the
+/// forest as orphans and the hybrid record is overwritten; `--abort`
+/// reclaims it and removes the marker instead); after it (after the
+/// stamp, after the free) it is a FOREST whose ledger may still name the
+/// old trees (the resume frees them, or finds them already folded out,
+/// then removes the marker; `--abort` refuses — the forest is the truth).
 pub async fn enable_symmetric(
     meta_lvs: &[String],
     opts: &EnableSymOptions,
@@ -5235,7 +5325,105 @@ pub async fn enable_symmetric(
     enable_symmetric_with(meta_lvs, opts, &EnableSymHooks::default()).await
 }
 
-/// One volume's durable state as the verb finds it.
+/// The verb's D0 Layer-A hold on every volume of the set: the same
+/// `flock(LOCK_EX | LOCK_NB)` on the device node a writer open takes
+/// ([`crate::meta_backend::kv::backend::KvMetaBackend::open`]'s guard), so
+/// a concurrent invocation — or a mount that began after the live-client
+/// gate — refuses at Layer A instead of racing the inspection and building
+/// into the same extents. Held for the verb's duration; released around
+/// the verb's OWN guarded opens (a second open file description in this
+/// process conflicts with its own hold) and re-taken the moment they
+/// close, so the unguarded window is the open's own.
+struct VerbFlocks {
+    paths: Vec<String>,
+    held: Vec<Option<std::fs::File>>,
+}
+
+impl VerbFlocks {
+    fn acquire(paths: &[String]) -> Result<Self> {
+        let mut out = Self {
+            paths: paths.to_vec(),
+            held: Vec::with_capacity(paths.len()),
+        };
+        for vi in 0..paths.len() {
+            out.held.push(None);
+            out.take(vi)?;
+        }
+        Ok(out)
+    }
+
+    fn take(&mut self, vi: usize) -> Result<()> {
+        use std::os::unix::io::AsRawFd;
+        let path = &self.paths[vi];
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+            .map_err(|e| {
+                SqueezefsError::InvalidOperation(format!(
+                    "volume enable-symmetric: cannot open {path} for the writer lock: {e}"
+                ))
+            })?;
+        // SAFETY: valid owned fd; LOCK_NB never blocks.
+        let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        if rc != 0 {
+            let err = std::io::Error::last_os_error();
+            return Err(if err.raw_os_error() == Some(libc::EWOULDBLOCK) {
+                SqueezefsError::InvalidOperation(format!(
+                    "volume enable-symmetric refused: {path}: another process holds the writer \
+                     lock — a concurrent `volume enable-symmetric`, or a mount that began after \
+                     the live-client gate; one invocation converts a set at a time \
+                     (single-writer guard). Retry when it has finished"
+                ))
+            } else {
+                SqueezefsError::Io(err)
+            });
+        }
+        self.held[vi] = Some(file);
+        Ok(())
+    }
+
+    /// Release volume `vi`'s hold for one of the verb's guarded opens.
+    fn release(&mut self, vi: usize) {
+        self.held[vi] = None;
+    }
+
+    /// Re-take volume `vi`'s hold after the guarded open closed.
+    fn retake(&mut self, vi: usize) -> Result<()> {
+        self.take(vi).map_err(|e| {
+            SqueezefsError::InvalidOperation(format!(
+                "{e} (the lock was released for the verb's own guarded open and taken by \
+                 another process before it could be re-taken; re-run with `--resume` once the \
+                 holder has finished)"
+            ))
+        })
+    }
+}
+
+/// The capacity preflight of one flat volume — computed from the
+/// write-free inspection, BEFORE the first marker.
+struct BuildPlan {
+    records: u64,
+    bytes: u64,
+    slot_trees: u64,
+    /// The extents of the shared trees (claimed until step 5).
+    old_extents: u64,
+    /// Claimed extents no ledger root reaches (the census credit).
+    orphans: u64,
+    /// The peak claim: Σ planned nodes over every slot tree and tree 0,
+    /// plus the directory extent.
+    needed: u64,
+    /// `free + orphans − compaction_floor(reserve)`.
+    available: u64,
+    /// The bitmap's free extents (the refusal text's term).
+    free: u64,
+    /// The §4.7 compaction floor in extents (the refusal text's term).
+    floor: u64,
+    /// One extent, in KiB (the refusal text's term).
+    extent_kib: u64,
+}
+
+/// One volume's durable state as the verb finds it (write-free).
 struct SymInspection {
     symmetric: bool,
     marker: Option<SymUpgradeMarker>,
@@ -5243,18 +5431,31 @@ struct SymInspection {
     partition_non_solo: bool,
     /// The newest ledger record carries a solo partition suffix (dropped).
     partition_solo_record: bool,
+    /// The newest ledger record carries no membership stamp.
+    stamp_absent: bool,
+    /// Journal entries past the ledger's checkpoint tail the probe
+    /// replayed — nonzero means the volume was not cleanly unmounted.
+    window_entries: u64,
     open_intents: Vec<u64>,
     /// In-flight (non-terminal) `job:` records, by id.
     jobs_in_flight: Vec<String>,
     /// The `volume set-owners` assignment, if any (dropped).
     owner: Option<String>,
-    records: u64,
-    bytes: u64,
+    /// The build plan (flat volumes only).
+    plan: Option<BuildPlan>,
 }
 
-async fn inspect_for_symmetric(path: &str, count_records: bool) -> Result<SymInspection> {
-    use crate::meta_backend::kv::backend::KvMetaBackend;
+async fn inspect_for_symmetric(path: &str, ordered: &[String]) -> Result<SymInspection> {
+    use crate::meta_backend::kv::alloc_ext::{
+        compaction_floor_extents, compaction_reserve_extents, ExtentAllocator,
+    };
+    use crate::meta_backend::kv::backend::{KvMetaBackend, PENDING_FREE_CAP};
+    use crate::meta_backend::kv::builder::TreeWriter;
     use crate::meta_backend::kv::checkpoint::read_newest_ledger;
+    use crate::meta_backend::kv::node::NodeLayout;
+    use crate::meta_backend::kv::record::{
+        forest_key, xattr_key, xattr_name_hash56, Record, XattrValue, TREE_XATTRS,
+    };
     use crate::meta_backend::kv::superblock::{classify_volume, VolumeFormat};
 
     let p = Path::new(path);
@@ -5286,18 +5487,21 @@ async fn inspect_for_symmetric(path: &str, count_records: bool) -> Result<SymIns
         marker: None,
         partition_non_solo,
         partition_solo_record,
+        stamp_absent: ledger.membership_stamp.is_none(),
+        window_entries: 0,
         open_intents: Vec::new(),
         jobs_in_flight: Vec::new(),
         owner: None,
-        records: 0,
-        bytes: 0,
+        plan: None,
     };
-    if partition_non_solo {
-        // A partitioned era's record is refused below without a probe:
-        // its slot arithmetic is not a solo mount's.
+    if partition_non_solo || out.stamp_absent {
+        // Refused below without a probe: a partitioned era's slot
+        // arithmetic is not a solo mount's, and a stamp-less volume is
+        // not a dynamic-routing set member.
         return Ok(out);
     }
     let be = KvMetaBackend::open_probe(p).await?;
+    out.window_entries = be.replay_stats().entries;
     if let Some(raw) = be.getxattr(1, crate::SYM_UPGRADE_MARKER_XATTR).await? {
         let marker = SymUpgradeMarker::decode(&raw).map_err(|e| {
             SqueezefsError::InvalidOperation(format!(
@@ -5336,14 +5540,157 @@ async fn inspect_for_symmetric(path: &str, count_records: bool) -> Result<SymIns
         .await
         .filter(|s| s.durable)
         .and_then(|s| s.owner);
-    if count_records && !out.symmetric {
-        let (records, bytes, _slots) = collect_flat_records(&be)
-            .await
-            .map(|c| (c.records, c.bytes, c.by_slot.len()))?;
-        out.records = records;
-        out.bytes = bytes;
+    if out.symmetric {
+        return Ok(out);
     }
+
+    // ---- The capacity preflight (a flat volume) ------------------------
+    let stamp = ledger
+        .membership_stamp
+        .as_ref()
+        .ok_or_else(|| SqueezefsError::InvalidOperation("stamp checked above".to_string()))?;
+    let mut flat = collect_flat_records(&be).await?;
+    if out.marker.is_none() {
+        // The marker the verb is about to write rides the build as an
+        // ino-1 xattr record of the native slot: plan it, so the plan is
+        // the build's record set and not one record short.
+        let marker = SymUpgradeMarker {
+            volumes: ordered.to_vec(),
+        };
+        let key = xattr_key(
+            1,
+            xattr_name_hash56(crate::SYM_UPGRADE_MARKER_XATTR.as_bytes(), sb.hash_seed),
+            0,
+        );
+        let value = XattrValue {
+            name: crate::SYM_UPGRADE_MARKER_XATTR.as_bytes().to_vec(),
+            value: marker.encode()?,
+        }
+        .encode()?;
+        let fkey = forest_key(TREE_XATTRS, &key)?;
+        flat.records += 1;
+        flat.bytes += (fkey.len() + value.len()) as u64;
+        flat.by_slot
+            .entry(crate::meta_backend::kv::record::NATIVE_FOREST_SLOT)
+            .or_default()
+            .push(Record::put(fkey, 0, value));
+    }
+    let layout = NodeLayout::new(sb.node_size as usize)?;
+    let slots = forest_slots_of(&flat, stamp);
+    let mut planned_nodes = 0u64;
+    for slot in &slots {
+        let mut records = flat.by_slot.remove(slot).unwrap_or_default();
+        records.sort_by(|a, b| a.key.cmp(&b.key));
+        planned_nodes += TreeWriter::planned_nodes(&layout, &records);
+    }
+    let control = control_records_planned(&slots);
+    planned_nodes += TreeWriter::planned_nodes(&layout, &control);
+
+    // The census: old extents (the shared trees' reachable nodes) and the
+    // orphans (claimed, reachable from no root).
+    let mut reachable = std::collections::BTreeSet::new();
+    for tree in be.all_trees() {
+        for addr in tree.reachable_node_addrs().await? {
+            reachable.insert(extent_of(&sb, addr)?);
+        }
+    }
+    let total = sb.total_extents();
+    let reserve = compaction_reserve_extents(total);
+    let alloc = ExtentAllocator::load(
+        p,
+        sb.alloc_bitmap.start,
+        total,
+        reserve,
+        PENDING_FREE_CAP,
+        ledger.journal_tail_seq,
+        &[],
+    )
+    .await?;
+    // The census credit is exact only over an EMPTY replay window (an
+    // in-window SMO's successor is claimed and reachable from no
+    // checkpointed root); a marked volume's window is emptied by the
+    // build's own quiesce, so its plan takes no credit here.
+    let orphans = if out.window_entries == 0 {
+        (0..total)
+            .filter(|e| alloc.is_allocated(*e) && !reachable.contains(e))
+            .count() as u64
+    } else {
+        0
+    };
+    // The peak claim: the build writes `planned_nodes` fresh nodes (one
+    // heap extent each — the tree writer's own chunking, not an
+    // estimate) plus the appender directory extent, while the shared
+    // trees' `old_extents` stay claimed until step 5 frees them. The
+    // internal class may claim down to the last extent, so the build
+    // COMPLETES iff `needed ≤ free + orphans`; the preflight keeps the
+    // §4.7 compaction floor out of the claim as well, so the converted
+    // volume's first flush pass finds it intact:
+    //   needed    = Σ_slot nodes(slot records) + nodes(tree 0) + 1
+    //   available = free + orphans − compaction_floor(reserve)
+    // Tie-tested in `sym_convert_tests` (`needed ≡ extents_written`).
+    let needed = planned_nodes + 1;
+    let free = alloc.free_extents();
+    let floor = compaction_floor_extents(reserve);
+    let available = (free + orphans).saturating_sub(floor);
+    out.plan = Some(BuildPlan {
+        records: flat.records,
+        bytes: flat.bytes,
+        slot_trees: slots.len() as u64,
+        old_extents: reachable.len() as u64,
+        orphans,
+        needed,
+        available,
+        free,
+        floor,
+        extent_kib: u64::from(sb.node_size) / 1024,
+    });
     Ok(out)
+}
+
+/// The slot trees the forest holds: every slot the records name, the
+/// native slot, and every hosted slot whose stamp carries a cursor
+/// (§5.1.8 — a cursor is never lowered, and tree 0 is its durable home
+/// even where every ino it covers was deleted). Index-ascending.
+fn forest_slots_of(
+    flat: &FlatRecords,
+    stamp: &crate::meta_backend::kv::checkpoint::MembershipStamp,
+) -> Vec<crate::meta_backend::kv::record::ForestSlot> {
+    use crate::meta_backend::kv::record::{guest_forest_slot, NATIVE_FOREST_SLOT};
+    let mut slots: std::collections::BTreeSet<_> = flat.by_slot.keys().copied().collect();
+    slots.insert(NATIVE_FOREST_SLOT);
+    for (slot, _) in &stamp.slot_cursors {
+        if stamp.resolved_native_slot() != Some(*slot) {
+            slots.insert(guest_forest_slot(*slot));
+        }
+    }
+    slots.into_iter().collect()
+}
+
+/// Tree 0's records as the plan sees them: one `Unleased` record per
+/// guest slot — its value is fixed-width (no tails), so the plan's
+/// records encode to the build's exact lengths whatever the roots are.
+fn control_records_planned(
+    slots: &[crate::meta_backend::kv::record::ForestSlot],
+) -> Vec<crate::meta_backend::kv::record::Record> {
+    use crate::meta_backend::kv::record::{Record, NATIVE_FOREST_SLOT};
+    use crate::meta_backend::kv::slot_state::{slot_state_key, SlotState};
+    use crate::meta_backend::kv::tree::RootPtr;
+    slots
+        .iter()
+        .filter(|s| **s != NATIVE_FOREST_SLOT)
+        .filter_map(|slot| {
+            let state = SlotState::Unleased {
+                root: RootPtr { addr: 0, seq: 0 },
+                cursor: 0,
+                g: 0,
+                tails: Vec::new(),
+            };
+            state
+                .encode()
+                .ok()
+                .map(|v| Record::put(slot_state_key(*slot), 0, v))
+        })
+        .collect()
 }
 
 /// [`enable_symmetric`] with the crash seams exposed.
@@ -5352,6 +5699,12 @@ pub async fn enable_symmetric_with(
     opts: &EnableSymOptions,
     hooks: &EnableSymHooks,
 ) -> Result<EnableSymReport> {
+    if opts.abort && (opts.resume || opts.dry_run) {
+        return Err(SqueezefsError::InvalidOperation(
+            "volume enable-symmetric: `--abort` stands alone (it is neither a resume nor a plan)"
+                .to_string(),
+        ));
+    }
     // Live-client gate on EVERY volume before anything is touched (the
     // enable-multi-writer posture; `true` = the already-formatted refusal
     // does not apply).
@@ -5365,9 +5718,14 @@ pub async fn enable_symmetric_with(
     let disc = crate::meta_backend::discover_meta_set(meta_lvs).await?;
     let ordered = disc.ordered_paths.clone();
 
+    // The verb's D0 hold, BEFORE the inspection: from here a concurrent
+    // invocation refuses at Layer A, so no two verbs pass the inspection
+    // against the same extents.
+    let mut flocks = VerbFlocks::acquire(&ordered)?;
+
     let mut inspections = Vec::with_capacity(ordered.len());
     for path in &ordered {
-        inspections.push(inspect_for_symmetric(path, opts.dry_run).await?);
+        inspections.push(inspect_for_symmetric(path, &ordered).await?);
     }
 
     // ---- refusals FIRST, loud, naming the remedy ----------------------
@@ -5395,11 +5753,15 @@ pub async fn enable_symmetric_with(
             }
         }
     }
+    if opts.abort {
+        return abort_conversion(&ordered, &inspections, &markers, &mut flocks).await;
+    }
     if !markers.is_empty() && !opts.resume {
         return Err(SqueezefsError::InvalidOperation(format!(
             "volume enable-symmetric: a conversion marker (`{}`) is present on {:?} — a \
              previous run crashed mid-conversion and every writable mount refuses until it is \
-             finished. Re-run with `--resume` to continue it from the crash point",
+             finished. Re-run with `--resume` to continue it from the crash point, or with \
+             `--abort` to undo it on every volume still flat under its marker",
             crate::SYM_UPGRADE_MARKER_XATTR,
             markers
         )));
@@ -5424,6 +5786,21 @@ pub async fn enable_symmetric_with(
                  (design-symmetric-metadata §7.2)"
             )));
         }
+        if ins.stamp_absent {
+            return Err(SqueezefsError::InvalidOperation(format!(
+                "volume enable-symmetric: {path} carries no membership stamp — not a \
+                 dynamic-routing set member (reformat required)"
+            )));
+        }
+        if ins.window_entries > 0 && ins.marker.is_none() {
+            return Err(SqueezefsError::InvalidOperation(format!(
+                "volume enable-symmetric: {path} was not cleanly unmounted — {} journal \
+                 entr(ies) sit past its checkpoint tail, so its trees are not the whole truth \
+                 and the census the conversion runs is not exact. Mount the set once and \
+                 unmount cleanly, then re-run",
+                ins.window_entries
+            )));
+        }
         if !ins.open_intents.is_empty() {
             return Err(SqueezefsError::InvalidOperation(format!(
                 "volume enable-symmetric: {path} carries {} open cross-volume intent(s) (tx \
@@ -5442,6 +5819,33 @@ pub async fn enable_symmetric_with(
                 ins.jobs_in_flight.len(),
                 ins.jobs_in_flight
             )));
+        }
+        if let Some(plan) = &ins.plan {
+            // A dry run REPORTS the shortfall in its row (the operator's
+            // instrument for the remedy); the real run refuses on it.
+            if plan.needed > plan.available && !opts.dry_run {
+                return Err(SqueezefsError::InvalidOperation(format!(
+                    "volume enable-symmetric refused: {path} cannot hold the forest beside its \
+                     shared trees — the build claims {} fresh extents ({} nodes over {} slot \
+                     trees + tree 0, plus the appender directory) while the trees' {} extents \
+                     stay claimed until the end, and only {} are claimable ({} free + {} \
+                     reclaimable orphan(s), less the {}-extent compaction floor; one extent = \
+                     {} KiB). Free space on the volume (delete files, or `squeezefs defrag \
+                     --meta` to compact its nodes), move slots off it (`volume \
+                     migrate-meta-slot`), or rebuild the set on larger metadata volumes (a \
+                     smaller `--meta-node-kib` lowers the per-slot floor); `--dry-run` prints \
+                     these numbers for every volume",
+                    plan.needed,
+                    plan.needed - 1,
+                    plan.slot_trees,
+                    plan.old_extents,
+                    plan.available,
+                    plan.free,
+                    plan.orphans,
+                    plan.floor,
+                    plan.extent_kib,
+                )));
+            }
         }
     }
 
@@ -5467,20 +5871,13 @@ pub async fn enable_symmetric_with(
         let rows = ordered
             .iter()
             .zip(&inspections)
-            .map(|(path, ins)| VolumeConversionRow {
-                path: path.clone(),
-                outcome: if ins.symmetric && ins.marker.is_none() {
+            .map(|(path, ins)| {
+                let outcome = if ins.symmetric && ins.marker.is_none() {
                     ConversionOutcome::AlreadySymmetric
                 } else {
                     ConversionOutcome::Planned
-                },
-                records: ins.records,
-                bytes: ins.bytes,
-                slot_trees: 0,
-                extents_written: 0,
-                extents_freed: 0,
-                orphans_reclaimed: 0,
-                secs: 0.0,
+                };
+                VolumeConversionRow::new(path, outcome).with_plan(ins.plan.as_ref())
             })
             .collect();
         return Ok(EnableSymReport {
@@ -5494,11 +5891,11 @@ pub async fn enable_symmetric_with(
     let marker = SymUpgradeMarker {
         volumes: ordered.clone(),
     };
-    for (path, ins) in ordered.iter().zip(&inspections) {
+    for (vi, (path, ins)) in ordered.iter().zip(&inspections).enumerate() {
         if ins.symmetric || ins.marker.is_some() {
             continue;
         }
-        write_sym_marker(path, &marker).await?;
+        write_sym_marker(path, vi, &marker, &mut flocks).await?;
     }
     if hooks.crash_after == Some(EnableSymCrash::AfterMarker) {
         return Err(SqueezefsError::InvalidOperation(
@@ -5510,52 +5907,42 @@ pub async fn enable_symmetric_with(
     let mut rows = Vec::with_capacity(ordered.len());
     for (vi, (path, ins)) in ordered.iter().zip(&inspections).enumerate() {
         if ins.symmetric && ins.marker.is_none() {
-            rows.push(VolumeConversionRow {
-                path: path.clone(),
-                outcome: ConversionOutcome::AlreadySymmetric,
-                records: 0,
-                bytes: 0,
-                slot_trees: 0,
-                extents_written: 0,
-                extents_freed: 0,
-                orphans_reclaimed: 0,
-                secs: 0.0,
-            });
+            rows.push(VolumeConversionRow::new(
+                path,
+                ConversionOutcome::AlreadySymmetric,
+            ));
             continue;
         }
         let t0 = std::time::Instant::now();
-        let mut row = VolumeConversionRow {
-            path: path.clone(),
-            outcome: if opts.resume {
+        let mut row = VolumeConversionRow::new(
+            path,
+            if opts.resume {
                 ConversionOutcome::Resumed
             } else {
                 ConversionOutcome::Converted
             },
-            records: 0,
-            bytes: 0,
-            slot_trees: 0,
-            extents_written: 0,
-            extents_freed: 0,
-            orphans_reclaimed: 0,
-            secs: 0.0,
-        };
+        )
+        .with_plan(ins.plan.as_ref());
         if !ins.symmetric {
-            let built = convert_volume_to_forest(path, vi, hooks).await?;
+            let built = convert_volume_to_forest(path, vi, hooks, &mut flocks).await?;
             row.records = built.records;
             row.bytes = built.bytes;
             row.slot_trees = built.slot_trees;
             row.extents_written = built.extents_written;
             row.orphans_reclaimed = built.orphans_reclaimed;
         }
-        row.extents_freed = finish_forest_conversion(path, vi, hooks).await?;
+        row.extents_freed = finish_forest_conversion(path, vi, hooks, &mut flocks).await?;
         row.secs = t0.elapsed().as_secs_f64();
         log::info!(
             "volume enable-symmetric: {path} converted — {} records ({} B) into {} slot \
-             tree(s), {} extents written, {} freed, {} orphans reclaimed, {:.2} s",
+             tree(s), {} extents written (planned {}, {} claimable), {} freed, {} orphans \
+             reclaimed, {:.2} s",
             row.records,
             row.bytes,
             row.slot_trees,
             row.extents_written,
+            row.extents_needed,
+            row.extents_available,
             row.extents_freed,
             row.orphans_reclaimed,
             row.secs
@@ -5569,13 +5956,148 @@ pub async fn enable_symmetric_with(
     })
 }
 
+/// `--abort`: undo a crashed run on every volume still FLAT under its
+/// marker. Refuses the whole set, touching nothing, when any volume is
+/// past its flip (stamped, marker present): the forest is that volume's
+/// truth — its old trees are unreferenced or already freed — and
+/// `--resume` is the only exit. Otherwise, per flat marked volume: the
+/// flat trees are verified intact (the digest walk reads every live
+/// record), the extents the aborted build claimed are reclaimed (claimed
+/// and reachable from no ledger root; the bitmap written at a new
+/// generation), and the marker is removed through the marker-tolerant
+/// guarded open — the volume is a flat volume of the same records, as
+/// before the verb (pinned: pre-verb digest, writer-mountable).
+async fn abort_conversion(
+    ordered: &[String],
+    inspections: &[SymInspection],
+    markers: &[&String],
+    flocks: &mut VerbFlocks,
+) -> Result<EnableSymReport> {
+    if markers.is_empty() {
+        return Err(SqueezefsError::InvalidOperation(
+            "volume enable-symmetric --abort: nothing to abort — no volume of the set carries \
+             a conversion marker"
+                .to_string(),
+        ));
+    }
+    if let Some((path, _)) = ordered
+        .iter()
+        .zip(inspections)
+        .find(|(_, i)| i.symmetric && i.marker.is_some())
+    {
+        return Err(SqueezefsError::InvalidOperation(format!(
+            "volume enable-symmetric --abort refused: {path} is past its flip (incompat bit 17 \
+             stamped, marker present) — the forest is its truth and its shared trees are \
+             unreferenced or already freed; nothing was undone on any volume. Finish the \
+             conversion with `--resume`"
+        )));
+    }
+    let mut rows = Vec::with_capacity(ordered.len());
+    for (vi, (path, ins)) in ordered.iter().zip(inspections).enumerate() {
+        let outcome = if ins.symmetric {
+            ConversionOutcome::AlreadySymmetric
+        } else if ins.marker.is_none() {
+            ConversionOutcome::Untouched
+        } else {
+            let mut row = VolumeConversionRow::new(path, ConversionOutcome::Aborted);
+            row.orphans_reclaimed = abort_volume_conversion(path, vi, flocks).await?;
+            log::info!(
+                "volume enable-symmetric --abort: {path}: marker removed, {} extent(s) of the \
+                 aborted build reclaimed — a flat volume as before the verb",
+                row.orphans_reclaimed
+            );
+            rows.push(row);
+            continue;
+        };
+        rows.push(VolumeConversionRow::new(path, outcome));
+    }
+    Ok(EnableSymReport {
+        volumes: ordered.to_vec(),
+        rows,
+        dropped: Vec::new(),
+    })
+}
+
+/// One flat marked volume's abort (see [`abort_conversion`]). Returns the
+/// extents reclaimed.
+async fn abort_volume_conversion(path: &str, vi: usize, flocks: &mut VerbFlocks) -> Result<u64> {
+    use crate::meta_backend::kv::alloc_ext::{compaction_reserve_extents, ExtentAllocator};
+    use crate::meta_backend::kv::backend::{KvMetaBackend, PENDING_FREE_CAP};
+    use crate::meta_backend::kv::builder::digest_backend;
+
+    let p = Path::new(path);
+    let (sb, ledger, reachable, window_entries) = {
+        let be = KvMetaBackend::open_probe(p).await?;
+        if be.symmetric_forest() {
+            return Err(SqueezefsError::InvalidOperation(format!(
+                "volume enable-symmetric --abort: {path} mounted as a forest — refusing"
+            )));
+        }
+        // Intact = every live record of every kind reads and folds; a
+        // corrupt node fails the walk loud, never an abort over it.
+        digest_backend(&be).await?;
+        let sb = be.superblock().clone();
+        let ledger = be.mounted_ledger().clone();
+        let mut reachable = std::collections::BTreeSet::new();
+        for tree in be.all_trees() {
+            for addr in tree.reachable_node_addrs().await? {
+                reachable.insert(extent_of(&sb, addr)?);
+            }
+        }
+        (sb, ledger, reachable, be.replay_stats().entries)
+    };
+    let mut reclaimed = 0u64;
+    // The census is exact over an empty window only; a marked volume
+    // whose window is not empty (a kill inside the marker's own guarded
+    // open) leaves its orphans — if any — to the next verb's census.
+    if window_entries == 0 {
+        let total = sb.total_extents();
+        let alloc = ExtentAllocator::load(
+            p,
+            sb.alloc_bitmap.start,
+            total,
+            compaction_reserve_extents(total),
+            PENDING_FREE_CAP,
+            ledger.journal_tail_seq,
+            &[],
+        )
+        .await?;
+        for extent in 0..total {
+            if alloc.is_allocated(extent) && !reachable.contains(&extent) {
+                alloc.release_unpublished(extent);
+                reclaimed += 1;
+            }
+        }
+        if reclaimed > 0 {
+            let generation = ledger
+                .alloc_bitmap_generation
+                .max(alloc.resume_generation())
+                + 1;
+            alloc
+                .write_dirty_pages(p, sb.alloc_bitmap.start, generation)
+                .await?;
+            crate::uring_fs::fdatasync(p.to_path_buf()).await?;
+        }
+    }
+    remove_sym_marker(path, vi, flocks).await?;
+    Ok(reclaimed)
+}
+
 /// Write the marker on `path` through its guarded (marker-tolerant) open:
-/// journal-committed, checkpointed, then a clean shutdown.
-async fn write_sym_marker(path: &str, marker: &SymUpgradeMarker) -> Result<()> {
+/// journal-committed, checkpointed, then a clean shutdown. The verb's own
+/// flock is released for the open and re-taken after it.
+async fn write_sym_marker(
+    path: &str,
+    vi: usize,
+    marker: &SymUpgradeMarker,
+    flocks: &mut VerbFlocks,
+) -> Result<()> {
     use crate::meta_backend::kv::backend::KvMetaBackend;
+    let image = marker.encode()?;
+    flocks.release(vi);
     let be = KvMetaBackend::open_for_sym_upgrade(Path::new(path)).await?;
     let body = async {
-        be.setxattr_internal(1, crate::SYM_UPGRADE_MARKER_XATTR, &marker.encode())
+        be.setxattr_internal(1, crate::SYM_UPGRADE_MARKER_XATTR, &image)
             .await?;
         be.checkpoint_now().await.map_err(|e| {
             SqueezefsError::InvalidOperation(format!(
@@ -5585,6 +6107,29 @@ async fn write_sym_marker(path: &str, marker: &SymUpgradeMarker) -> Result<()> {
     }
     .await;
     be.shutdown().await?;
+    flocks.retake(vi)?;
+    body
+}
+
+/// Remove the marker on `path` through its guarded (marker-tolerant)
+/// open — on a forest, its join, checkpoint and leave. The verb's own
+/// flock is released for the open and re-taken after it.
+async fn remove_sym_marker(path: &str, vi: usize, flocks: &mut VerbFlocks) -> Result<()> {
+    use crate::meta_backend::kv::backend::KvMetaBackend;
+    flocks.release(vi);
+    let be = KvMetaBackend::open_for_sym_upgrade(Path::new(path)).await?;
+    let body = async {
+        be.removexattr_internal(1, crate::SYM_UPGRADE_MARKER_XATTR)
+            .await?;
+        be.checkpoint_now().await.map_err(|e| {
+            SqueezefsError::InvalidOperation(format!(
+                "volume enable-symmetric: the marker delete on {path} did not land durably: {e}"
+            ))
+        })
+    }
+    .await;
+    be.shutdown().await?;
+    flocks.retake(vi)?;
     body
 }
 
@@ -5642,7 +6187,14 @@ async fn collect_flat_records(
                 let key = forest_key(kind, k)?;
                 let slot = forest_key_slot(&key)?;
                 if kind == TREE_INODES {
-                    let ino = u64::from_be_bytes(k[..8].try_into().expect("8-byte inode key"));
+                    let ino_bytes: [u8; 8] =
+                        k.get(..8).and_then(|s| s.try_into().ok()).ok_or_else(|| {
+                            SqueezefsError::InvalidOperation(format!(
+                                "volume enable-symmetric: an inode key of {} bytes (8 expected)",
+                                k.len()
+                            ))
+                        })?;
+                    let ino = u64::from_be_bytes(ino_bytes);
                     let local = ino & ((1u64 << GUEST_NS_SHIFT) - 1);
                     let e = out.max_local_ino.entry(slot).or_insert(0);
                     *e = (*e).max(local);
@@ -5671,14 +6223,24 @@ struct ForestBuild {
     orphans_reclaimed: u64,
 }
 
-/// Heap extent index of a node address.
-fn extent_of(sb: &crate::meta_backend::kv::superblock::SuperblockV3, addr: u64) -> u64 {
-    (addr - sb.heap.start) / u64::from(sb.node_size)
+/// Heap extent index of a node address; an address below the heap is
+/// corruption, never a wrap.
+fn extent_of(sb: &crate::meta_backend::kv::superblock::SuperblockV3, addr: u64) -> Result<u64> {
+    addr.checked_sub(sb.heap.start)
+        .map(|off| off / u64::from(sb.node_size))
+        .ok_or_else(|| {
+            SqueezefsError::InvalidOperation(format!(
+                "volume enable-symmetric: node address {addr:#x} lies below the heap ({:#x})",
+                sb.heap.start
+            ))
+        })
 }
 
 /// Refuse unless the ring window over `extent` is EMPTY — the conversion's
 /// offline steps read the trees through the ledger's roots, which is exact
-/// only when nothing in the ring is ahead of them.
+/// only when nothing in the ring is ahead of them. Reached only after the
+/// volume's own quiesce (or on a stamped volume under its marker), so the
+/// remedy is the verb's: a `--resume` re-quiesces.
 async fn assert_quiesced_ring(
     path: &Path,
     extent: crate::meta_backend::kv::superblock::ExtentRef,
@@ -5699,7 +6261,8 @@ async fn assert_quiesced_ring(
         return Err(SqueezefsError::InvalidOperation(format!(
             "volume enable-symmetric: {} still holds {} journal entr(ies) past its checkpoint \
              tail after the quiesce — refusing to convert a volume whose trees are not the \
-             whole truth (mount it once and unmount cleanly, then re-run)",
+             whole truth (the shutdown checkpoint did not converge; re-run with `--resume`, \
+             which quiesces the volume again)",
             path.display(),
             recovery.entries.len()
         )));
@@ -5713,6 +6276,7 @@ async fn convert_volume_to_forest(
     path: &str,
     vi: usize,
     hooks: &EnableSymHooks,
+    flocks: &mut VerbFlocks,
 ) -> Result<ForestBuild> {
     use crate::meta_backend::kv::alloc_ext::{compaction_reserve_extents, ExtentAllocator};
     use crate::meta_backend::kv::appender::{
@@ -5722,9 +6286,9 @@ async fn convert_volume_to_forest(
     use crate::meta_backend::kv::backend::{KvMetaBackend, PENDING_FREE_CAP};
     use crate::meta_backend::kv::builder::{zero_range, TreeWriter};
     use crate::meta_backend::kv::checkpoint::{write_ledger_slot, LedgerRecord, TreeRoot};
-    use crate::meta_backend::kv::node::NodeLayout;
+    use crate::meta_backend::kv::node::{residue_seq_ceiling, NodeLayout};
     use crate::meta_backend::kv::record::{
-        ForestSlot, Record, KIND_INTERIOR, NATIVE_FOREST_SLOT, TREE_CONTROL,
+        Record, KIND_INTERIOR, NATIVE_FOREST_SLOT, TREE_CONTROL,
     };
     use crate::meta_backend::kv::slot_state::{slot_state_key, SlotState};
     use crate::meta_backend::kv::superblock::{set_symmetric_forest, ExtentRef};
@@ -5745,13 +6309,16 @@ async fn convert_volume_to_forest(
     // zeroed under it), the checkpoint + clean shutdown leave an EMPTY
     // window with every record in the trees.
     {
+        flocks.release(vi);
         let be = KvMetaBackend::open_for_sym_upgrade(p).await?;
         let r = be.checkpoint_now().await;
         be.shutdown().await?;
+        flocks.retake(vi)?;
         r?;
     }
 
-    // (2b) Read: the ledger, the reachable image set, every live record.
+    // (2b) Read: the ledger, the empty window (asserted before anything
+    // is collected), the reachable image set, every live record.
     let (sb, ledger, reachable, flat) = {
         let be = KvMetaBackend::open_probe(p).await?;
         if be.symmetric_forest() {
@@ -5761,10 +6328,11 @@ async fn convert_volume_to_forest(
         }
         let sb = be.superblock().clone();
         let ledger = be.mounted_ledger().clone();
+        assert_quiesced_ring(p, sb.journal, ledger.journal_tail_seq).await?;
         let mut reachable = std::collections::BTreeSet::new();
         for tree in be.all_trees() {
             for addr in tree.reachable_node_addrs().await? {
-                reachable.insert(extent_of(&sb, addr));
+                reachable.insert(extent_of(&sb, addr)?);
             }
         }
         let flat = collect_flat_records(&be).await?;
@@ -5776,10 +6344,12 @@ async fn convert_volume_to_forest(
              set member (reformat required)"
         ))
     })?;
-    assert_quiesced_ring(p, sb.journal, ledger.journal_tail_seq).await?;
 
     // (2c) The allocator off the durable bitmap; reclaim what no root
-    // reaches (a crashed build's forest, the shipped root-swap leak).
+    // reaches (a crashed build's forest, the shipped root-swap leak), and
+    // raise the node-seq floor above every stamp their residue carries:
+    // the ledger's watermark law covers extents freed UNDER a record,
+    // never these (`residue_seq_ceiling`).
     let total = sb.total_extents();
     let alloc = ExtentAllocator::load(
         p,
@@ -5791,9 +6361,18 @@ async fn convert_volume_to_forest(
         &[],
     )
     .await?;
+    let node_size = u64::from(sb.node_size);
     let mut orphans_reclaimed = 0u64;
+    let mut seq_floor = ledger.node_seq_watermark;
     for extent in 0..total {
         if alloc.is_allocated(extent) && !reachable.contains(&extent) {
+            let image = crate::uring_fs::read_at(
+                p,
+                sb.heap.start + extent * node_size,
+                sb.node_size as usize,
+            )
+            .await?;
+            seq_floor = seq_floor.max(residue_seq_ceiling(&image));
             alloc.release_unpublished(extent);
             orphans_reclaimed += 1;
         }
@@ -5801,19 +6380,25 @@ async fn convert_volume_to_forest(
     if orphans_reclaimed > 0 {
         log::warn!(
             "volume enable-symmetric: {path}: reclaimed {orphans_reclaimed} claimed extent(s) no \
-             ledger root reaches (a crashed conversion's build, or leaked root-swap images)"
+             ledger root reaches (a crashed conversion's build, or leaked root-swap images); \
+             node seqs resume above {seq_floor} (ledger watermark {})",
+            ledger.node_seq_watermark
         );
     }
 
-    // (2d) The forest: one slot tree per slot, tree 0, the directory,
-    // appender 0's page in the zeroed fixed ring, the bitmap.
+    // (2d) The forest: one slot tree per slot (an EMPTY one for a hosted
+    // slot whose stamp carries a cursor but whose records are gone —
+    // tree 0 is the cursor's durable home, §5.1.8), tree 0, the
+    // directory, appender 0's page in the zeroed fixed ring, the bitmap.
     let layout = NodeLayout::new(sb.node_size as usize)?;
-    let node_size = u64::from(sb.node_size);
-    let mut writer = TreeWriter::new(p, &layout, sb.heap.start, &alloc, ledger.node_seq_watermark);
+    let mut writer = TreeWriter::new(p, &layout, sb.heap.start, &alloc, seq_floor);
     let mut control: Vec<Record> = Vec::new();
     let mut native_root: Option<RootPtr> = None;
-    let slot_trees = flat.by_slot.len().max(1) as u64;
-    for (slot, mut records) in flat.by_slot {
+    let slots = forest_slots_of(&flat, &stamp);
+    let slot_trees = slots.len() as u64;
+    let mut by_slot = flat.by_slot;
+    for slot in slots {
+        let mut records = by_slot.remove(&slot).unwrap_or_default();
         records.sort_by(|a, b| a.key.cmp(&b.key));
         let (addr, seq) = writer.write_tree(KIND_INTERIOR, records).await?;
         let root = RootPtr { addr, seq };
@@ -5837,19 +6422,13 @@ async fn convert_volume_to_forest(
             g: 0,
             tails: Vec::new(),
         };
-        control.push(Record::put(
-            slot_state_key(slot as ForestSlot),
-            0,
-            state.encode()?,
-        ));
+        control.push(Record::put(slot_state_key(slot), 0, state.encode()?));
     }
-    let native_root = match native_root {
-        Some(r) => r,
-        None => {
-            let (addr, seq) = writer.write_tree(KIND_INTERIOR, Vec::new()).await?;
-            RootPtr { addr, seq }
-        }
-    };
+    let native_root = native_root.ok_or_else(|| {
+        SqueezefsError::InvalidOperation(
+            "volume enable-symmetric: the native slot tree was not written".to_string(),
+        )
+    })?;
     control.sort_by(|a, b| a.key.cmp(&b.key));
     let (control_addr, control_seq) = writer.write_tree(TREE_CONTROL, control).await?;
 
@@ -5870,12 +6449,25 @@ async fn convert_volume_to_forest(
         bytes::Bytes::from(hdr.encode()),
     )
     .await?;
-    // The fixed ring restarts at 0 (its window is empty — asserted above,
-    // and every forest record is at seq 0): zero it, then appender 0's
-    // `Free` page in the first of its four slots.
+    // The fixed ring is ZEROED (its window is empty — asserted above — so
+    // everything it holds is dead history no layout may ever replay) and
+    // appender 0's `Free` page lands in the first of its four slots. The
+    // ring's SEQ SPACE is NOT restarted: the hybrid ledger keeps the
+    // quiesced tail `T`, and both layouts resume their ring at `T` over
+    // the zeros (an empty window, the PR-3 re-carve law). The forest's
+    // records are at seq 0 ≤ T (checkpoint-covered by construction); the
+    // FLAT trees' records carry seqs ≤ T — and a flat open of the hybrid
+    // state (the window before the stamp: `--resume`'s quiesce, `--abort`'s
+    // marker removal) mints its record seqs ABOVE the head it resumes at.
+    // A tail of 0 restarted that space below the flat records: every
+    // per-key LWW fold then lost the new write (the marker's Delete, an
+    // interior child-pointer update → a routing hole), which is what the
+    // `--abort` contracts found.
     zero_range(p, sb.journal.start, sb.journal.len).await?;
     let mut page0 = AppenderPage::free(0, 1);
     page0.segments = vec![appender0_ring_extent(&sb.journal)];
+    page0.ledger_tail_seq = ledger.journal_tail_seq;
+    page0.head_hint = ledger.journal_tail_seq;
     let offs = appender0_page_offsets(&sb.journal);
     crate::uring_fs::write_at(
         p,
@@ -5894,7 +6486,8 @@ async fn convert_volume_to_forest(
     crash(EnableSymCrash::AfterBuild { volume: vi })?;
 
     // (3) The hybrid ledger: the flat roots stay (a flat open still finds
-    // them), the forest roots join, tail 0, the new bitmap generation.
+    // them), the forest roots join, the quiesced tail stays (see the ring
+    // note above), the new bitmap generation.
     let mut tree_roots: Vec<TreeRoot> = ledger
         .tree_roots
         .iter()
@@ -5914,7 +6507,7 @@ async fn convert_volume_to_forest(
     let hybrid = LedgerRecord {
         seq: ledger.seq + 1,
         tree_roots,
-        journal_tail_seq: 0,
+        journal_tail_seq: ledger.journal_tail_seq,
         next_ino: ledger.next_ino,
         alloc_bitmap_generation: generation,
         node_seq_watermark: writer.node_seq_watermark(),
@@ -5942,10 +6535,15 @@ async fn convert_volume_to_forest(
 /// marker: free the old trees the hybrid ledger names and fold them out,
 /// then remove the marker through the forest's guarded open. Returns the
 /// extents freed (0 when a previous run already folded them out).
-async fn finish_forest_conversion(path: &str, vi: usize, hooks: &EnableSymHooks) -> Result<u64> {
+async fn finish_forest_conversion(
+    path: &str,
+    vi: usize,
+    hooks: &EnableSymHooks,
+    flocks: &mut VerbFlocks,
+) -> Result<u64> {
     use crate::meta_backend::kv::alloc_ext::{compaction_reserve_extents, ExtentAllocator};
     use crate::meta_backend::kv::appender::appender0_ring_extent;
-    use crate::meta_backend::kv::backend::{KvMetaBackend, PENDING_FREE_CAP};
+    use crate::meta_backend::kv::backend::PENDING_FREE_CAP;
     use crate::meta_backend::kv::checkpoint::{
         read_newest_ledger, write_ledger_slot, LedgerRecord,
     };
@@ -6025,7 +6623,7 @@ async fn finish_forest_conversion(path: &str, vi: usize, hooks: &EnableSymHooks)
             )
             .await?;
             for addr in tree.reachable_node_addrs().await? {
-                let extent = extent_of(&sb, addr);
+                let extent = extent_of(&sb, addr)?;
                 if alloc.is_allocated(extent) {
                     alloc.release_unpublished(extent);
                     freed += 1;
@@ -6066,18 +6664,6 @@ async fn finish_forest_conversion(path: &str, vi: usize, hooks: &EnableSymHooks)
 
     // (6) The marker's removal — the forest's own guarded open: join,
     // the delete committed, checkpointed, a clean leave.
-    let be = KvMetaBackend::open_for_sym_upgrade(p).await?;
-    let body = async {
-        be.removexattr_internal(1, crate::SYM_UPGRADE_MARKER_XATTR)
-            .await?;
-        be.checkpoint_now().await.map_err(|e| {
-            SqueezefsError::InvalidOperation(format!(
-                "volume enable-symmetric: the marker delete on {path} did not land durably: {e}"
-            ))
-        })
-    }
-    .await;
-    be.shutdown().await?;
-    body?;
+    remove_sym_marker(path, vi, flocks).await?;
     Ok(freed)
 }

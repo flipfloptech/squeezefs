@@ -5381,6 +5381,9 @@ fn the_member_adopts_the_advertised_ceiling_with_its_label() {
         checkpoint_ceiling_ms: ceiling,
         lane_supply_volumes: Vec::new(),
         pack_group_available: false,
+        slot_leases_ack: Default::default(),
+        slot_release_notices: Vec::new(),
+        offered_slots: Vec::new(),
     };
     let (clock, ticks) = manual_clock();
     let session = MemberSession::adopt(

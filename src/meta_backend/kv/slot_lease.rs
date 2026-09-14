@@ -12,8 +12,8 @@
 
 use super::record::ForestSlot;
 use crate::slot_lease_core::{
-    affinity_ceiling_bytes, mint_slots_derived, DominanceWindow, LeaseGate, SlotLeaseTable,
-    MINT_SPREAD,
+    affinity_ceiling_bytes, mint_slots_derived, DominanceWindow, LeaseGate, LeaseState,
+    SlotLeaseTable, MINT_SPREAD,
 };
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -245,6 +245,17 @@ pub struct SlotLeasePlane {
     /// the arm.
     pub loaded_page_entries:
         std::sync::Mutex<std::collections::BTreeMap<u32, Vec<super::appender::SlotEntry>>>,
+    /// The volume's native routing slot (page entries name ROUTING slots;
+    /// the carriage does too).
+    pub native_slot: u16,
+    /// Appender id → `(node_token, mount_slot)` of every `Live` page in
+    /// the directory (the arm reads it; a wire join adds one) — the
+    /// membership carriage's member-id → appender resolution.
+    pub identities: std::sync::Mutex<std::collections::BTreeMap<u32, (u64, u32)>>,
+    /// Slots the manager RECALLS from a wire holder (an accepted offer of
+    /// a slot it holds) — carried on its renewal grant as
+    /// `slot_release_notices`; cleared by its `ReleaseSlot`.
+    pub recalls: std::sync::Mutex<std::collections::BTreeMap<u32, std::collections::BTreeSet<ForestSlot>>>,
     // ---- gauges (§11) ----
     pub acquires: AtomicU64,
     pub grants: AtomicU64,
@@ -262,6 +273,7 @@ pub struct SlotLeasePlane {
     pub ceiling_spills: AtomicU64,
     pub ceiling_overflows: AtomicU64,
     pub region_releases: AtomicU64,
+    pub recall_notices: AtomicU64,
     pub phases: HandoverPhases,
 }
 
@@ -271,9 +283,14 @@ impl SlotLeasePlane {
         extents: Arc<SlotExtentLedger>,
         mint_slots: u64,
         declared: std::collections::BTreeMap<u32, std::collections::BTreeSet<ForestSlot>>,
+        native_slot: u16,
     ) -> Self {
         Self {
             declared,
+            native_slot,
+            identities: std::sync::Mutex::new(std::collections::BTreeMap::new()),
+            recalls: std::sync::Mutex::new(std::collections::BTreeMap::new()),
+            recall_notices: AtomicU64::new(0),
             table: SlotLeaseTable::new(),
             gate,
             dominance: DominanceWindow::new(),
@@ -465,8 +482,162 @@ impl SlotLeasePlane {
             ceiling_overflows: self.ceiling_overflows.load(Relaxed),
             offer_n_floor: self.n_floor(),
             region_releases: self.region_releases.load(Relaxed),
+            recall_notices: self.recall_notices.load(Relaxed),
         }
     }
+
+    /// Learn (or refresh) appender `id`'s identity for the carriage.
+    pub fn note_identity(&self, id: u32, node_token: u64, mount_slot: u32) {
+        self.identities
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(id, (node_token, mount_slot));
+    }
+
+    /// Record a recall of `slot` from wire appender `holder` (its next
+    /// renewal grant carries it).
+    pub fn note_recall(&self, holder: u32, slot: ForestSlot) {
+        let fresh = self
+            .recalls
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entry(holder)
+            .or_default()
+            .insert(slot);
+        if fresh {
+            self.recall_notices.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// The holder released `slot` (or lost it): the recall is spent.
+    pub fn clear_recall(&self, holder: u32, slot: ForestSlot) {
+        let mut m = self.recalls.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(set) = m.get_mut(&holder) {
+            set.remove(&slot);
+            if set.is_empty() {
+                m.remove(&holder);
+            }
+        }
+    }
+
+    /// The pending recalls of `holder` (forest slots).
+    pub fn recalls_of(&self, holder: u32) -> Vec<ForestSlot> {
+        self.recalls
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&holder)
+            .map(|s| s.iter().copied().collect())
+            .unwrap_or_default()
+    }
+
+    /// **The membership carriage of one member** (§5.1.4 / §5.9 — the
+    /// `Grant`'s `slot_leases_ack` / `slot_release_notices` /
+    /// `offered_slots`): every appender of this plane whose page identity
+    /// is `(node_token, mount_slot)` — its leases `(routing slot, g)`,
+    /// the manager's recalls from it, the offers standing for it. O(held)
+    /// off the RAM table; empty for an identity no page names.
+    pub fn carriage_for(
+        &self,
+        node_token: u64,
+        mount_slot: u32,
+    ) -> crate::membership::SlotLeaseCarriage {
+        let ids: Vec<u32> = self
+            .identities
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .filter(|(_, ident)| **ident == (node_token, mount_slot))
+            .map(|(id, _)| *id)
+            .collect();
+        let mut out = crate::membership::SlotLeaseCarriage::default();
+        if ids.is_empty() {
+            return out;
+        }
+        let routing = |slot: ForestSlot| -> Option<u16> {
+            super::appender::page_slot_of_forest_slot(slot, self.native_slot).ok()
+        };
+        for (slot, lease) in self.table.snapshot() {
+            let Some(r) = routing(slot) else {
+                continue;
+            };
+            match lease.state {
+                LeaseState::Unleased => {}
+                LeaseState::Offered if ids.contains(&lease.offered_to) => {
+                    out.offered.push((r, lease.g));
+                    if ids.contains(&lease.holder) {
+                        out.leases.push((r, lease.g));
+                    }
+                }
+                _ if ids.contains(&lease.holder) => out.leases.push((r, lease.g)),
+                _ => {}
+            }
+        }
+        for id in &ids {
+            for slot in self.recalls_of(*id) {
+                if let Some(r) = routing(slot) {
+                    out.release_notices.push(r);
+                }
+            }
+        }
+        out.leases.sort_unstable();
+        out.offered.sort_unstable();
+        out.release_notices.sort_unstable();
+        out.release_notices.dedup();
+        out
+    }
+}
+
+/// Every armed plane of this process, for the membership carriage
+/// (one owner serves a SET; a member's leases span its volumes).
+static CARRIAGE_PLANES: std::sync::Mutex<Vec<std::sync::Weak<SlotLeasePlane>>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// Register an armed plane with the membership carriage source (the arm).
+pub fn register_carriage_plane(plane: &Arc<SlotLeasePlane>) {
+    let mut planes = CARRIAGE_PLANES.lock().unwrap_or_else(|e| e.into_inner());
+    planes.retain(|w| w.strong_count() > 0);
+    if !planes.iter().any(|w| w.as_ptr() == Arc::as_ptr(plane)) {
+        planes.push(Arc::downgrade(plane));
+    }
+    if planes.len() == 1 {
+        crate::membership::install_slot_lease_carriage_source(Arc::new(carriage_for_member));
+    }
+}
+
+/// Unregister it (the leave); the source is uninstalled with the last
+/// plane.
+pub fn unregister_carriage_plane(plane: &Arc<SlotLeasePlane>) {
+    let mut planes = CARRIAGE_PLANES.lock().unwrap_or_else(|e| e.into_inner());
+    planes.retain(|w| w.strong_count() > 0 && w.as_ptr() != Arc::as_ptr(plane));
+    if planes.is_empty() {
+        crate::membership::uninstall_slot_lease_carriage_source();
+    }
+}
+
+/// The installed source: the member id → `(node_token, mount_slot)`
+/// (`cowriter::parse_node_member_id`), merged over every armed plane.
+fn carriage_for_member(member_id: &str) -> crate::membership::SlotLeaseCarriage {
+    let Some((node_token, mount_slot)) = crate::cowriter::parse_node_member_id(member_id) else {
+        return Default::default();
+    };
+    let planes: Vec<Arc<SlotLeasePlane>> = CARRIAGE_PLANES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .filter_map(std::sync::Weak::upgrade)
+        .collect();
+    let mut out = crate::membership::SlotLeaseCarriage::default();
+    for p in planes {
+        let c = p.carriage_for(node_token, mount_slot);
+        out.leases.extend(c.leases);
+        out.release_notices.extend(c.release_notices);
+        out.offered.extend(c.offered);
+    }
+    out.leases.sort_unstable();
+    out.offered.sort_unstable();
+    out.release_notices.sort_unstable();
+    out.release_notices.dedup();
+    out
 }
 
 fn percentile(sorted_in: &[u64], pct: usize) -> u64 {
@@ -519,4 +690,8 @@ pub struct SlotLeaseStats {
     pub offer_n_floor: u64,
     /// Regions released because their last slot on the volume was.
     pub region_releases: u64,
+    /// Recalls of a slot from a WIRE holder recorded for its renewal
+    /// grant's `slot_release_notices` (an accepted offer of a slot it
+    /// holds).
+    pub recall_notices: u64,
 }

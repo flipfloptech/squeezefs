@@ -241,6 +241,7 @@ struct ArbInput {
     schema_is_current: bool,
     schema: u32,
     request_id: u64,
+    volume: u16,
     call: ArbCall,
     reply: ArbReply,
     // The service-edge arm: the volume's extent count and a record seed.
@@ -276,6 +277,7 @@ fuzz_target!(|data: &[u8]| {
     let request = ManagerRequestFrame {
         schema,
         request_id: input.request_id,
+        volume: input.volume,
         call: input.call.into(),
     };
     // --- arm 3: the service edge over the call's integers -------------------

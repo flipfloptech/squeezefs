@@ -1093,9 +1093,10 @@ proptest! {
     #[test]
     fn manager_request_frame_round_trips(
         request_id in any::<u64>(),
+        volume in any::<u16>(),
         call in arb_manager_call(),
     ) {
-        let frame = ManagerRequestFrame { schema: MANAGER_SCHEMA, request_id, call };
+        let frame = ManagerRequestFrame { schema: MANAGER_SCHEMA, request_id, volume, call };
         let enc = encode_manager_request(&frame).expect("encodes");
         prop_assert_eq!(decode_manager_request(&enc).expect("decodes"), frame);
     }

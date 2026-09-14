@@ -37,6 +37,11 @@
 # keeping its bit; a forest writer's `open` joins its appender regions,
 # and that join's barriered cycle IS the first post-mount durable
 # checkpoint, so the parked window is read off the counters there).
+# `sym_slot_transfer_tests` (PR 4 — slot leases) rides the list the same
+# way as PR 2/3's suites: its armed fixtures stamp under the seam
+# themselves (`SQUEEZEFS_SYMMETRIC_META=1` on a bit-17 volume), and its
+# flat pins (the `=1` refusal on a flat volume, the `=0` dark forest with
+# no plane and `dlm_mode = solo`) run on both legs.
 #
 # WALL TIME IS A ROW (review round 4, Issue 26): each suite runs under
 # its own timer per leg, and the summary prints `flat`, `stamped` and the
@@ -87,6 +92,7 @@ DEFAULT_SUITES=(
   sym_appender_tests
   sym_manager_tests
   sym_fence_tests
+  sym_slot_transfer_tests
 )
 read -r -a SUITES <<<"${SQZ_SYM_SUITES:-${DEFAULT_SUITES[*]}}"
 RATIO_NOTE="${SQZ_SYM_RATIO_NOTE:-2.0}"

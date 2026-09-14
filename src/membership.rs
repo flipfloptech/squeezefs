@@ -1292,6 +1292,81 @@ pub struct Grant {
     /// (`PUBLISH_PACK_GROUP_UNAVAILABLE`). Rides the `CLUSTER_WIRE_SCHEMA`
     /// 4 grant.
     pub pack_group_available: bool,
+    /// **The slot-lease carriage** (design-symmetric-metadata §5.1.4 /
+    /// §5.9, PR 4 — the `ack_free_epoch` carriage precedent: a slot lease
+    /// lives as long as the membership lease). The manager's attestation
+    /// of every slot THIS member leases on the volumes it manages, as
+    /// `(routing slot, g)`, under the epoch the member last held them —
+    /// a reclaim after a manager failover re-asserts exactly this set
+    /// (PR 10's grace arm). Empty on an owner with no armed symmetric
+    /// plane and for a member that holds no slot. Rides the
+    /// `CLUSTER_WIRE_SCHEMA` 5 grant (the program's wire, unreleased).
+    #[serde(default)]
+    pub slot_leases_ack: SlotLeasesAck,
+    /// **Slots the manager asks this member to RELEASE** (routing slots):
+    /// a requester's accepted offer of a slot this member holds — the
+    /// holder-side `RecallForOffer` carried on the renewal, since a
+    /// member serves no push channel. The member runs flush-then-transfer
+    /// and `ReleaseSlot`; the requester's `AcquireSlot` retries after.
+    #[serde(default)]
+    pub slot_release_notices: Vec<u16>,
+    /// **Offers standing FOR this member** — `(routing slot, g)` the
+    /// holder offered it (§5.1.4): the member accepts with `AcquireSlot`
+    /// before the offer's one-renewal expiry, or lets it lapse.
+    #[serde(default)]
+    pub offered_slots: Vec<(u16, u32)>,
+}
+
+/// [`Grant::slot_leases_ack`]: the slots a member leases, attested by the
+/// manager at the grant, under the member's prior epoch.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct SlotLeasesAck {
+    /// The member's epoch these leases were last held under (0 on a fresh
+    /// join with no history).
+    pub prior_epoch: u64,
+    /// `(routing slot, g)`, slot-ascending.
+    pub slots: Vec<(u16, u32)>,
+}
+
+/// One member's slot-lease carriage as the installed source answers it
+/// ([`install_slot_lease_carriage_source`]).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct SlotLeaseCarriage {
+    /// `(routing slot, g)` the member leases.
+    pub leases: Vec<(u16, u32)>,
+    /// Routing slots the manager recalls from it.
+    pub release_notices: Vec<u16>,
+    /// `(routing slot, g)` offered to it.
+    pub offered: Vec<(u16, u32)>,
+}
+
+/// The owner-side source of a member's slot-lease carriage, keyed by the
+/// member id (`node_{token:016x}[.m{slot:08x}]` for a writer member —
+/// `cowriter::node_member_id`): installed by an armed symmetric plane,
+/// O(held slots) per renewal through the plane's RAM table, never a scan
+/// of the volume (KD-FG-4's no-scan-in-renew law).
+pub type SlotLeaseCarriageSource = Arc<dyn Fn(&str) -> SlotLeaseCarriage + Send + Sync>;
+
+static SLOT_LEASE_CARRIAGE_SOURCE: once_cell::sync::Lazy<
+    arc_swap::ArcSwapOption<SlotLeaseCarriageSource>,
+> = once_cell::sync::Lazy::new(arc_swap::ArcSwapOption::empty);
+
+/// Install the armed plane's carriage source (the symmetric arm).
+pub fn install_slot_lease_carriage_source(src: SlotLeaseCarriageSource) {
+    SLOT_LEASE_CARRIAGE_SOURCE.store(Some(Arc::new(src)));
+}
+
+/// Uninstall it (the leave / disarm / test teardown).
+pub fn uninstall_slot_lease_carriage_source() {
+    SLOT_LEASE_CARRIAGE_SOURCE.store(None);
+}
+
+/// The carriage for `member_id` — empty with no source installed.
+pub fn slot_lease_carriage_for_member(member_id: &str) -> SlotLeaseCarriage {
+    match SLOT_LEASE_CARRIAGE_SOURCE.load_full() {
+        Some(src) => src(member_id),
+        None => SlotLeaseCarriage::default(),
+    }
 }
 
 impl Grant {
@@ -1526,7 +1601,22 @@ impl MembershipOwner {
             // PK4: the set authority's pack-group posture (one relaxed knob
             // read — KD-FG-4's no-scan-in-renew law stands).
             pack_group_available: crate::meta_ship::publish::conveyor_group_enabled(),
+            slot_leases_ack: SlotLeasesAck::default(),
+            slot_release_notices: Vec::new(),
+            offered_slots: Vec::new(),
         }
+    }
+
+    /// The slot-lease carriage of a grant to `member_id` (PR 4): the
+    /// installed source's answer, or nothing (no armed plane).
+    fn carry_slot_leases(grant: &mut Grant, member_id: &str, prior_epoch: u64) {
+        let c = slot_lease_carriage_for_member(member_id);
+        grant.slot_leases_ack = SlotLeasesAck {
+            prior_epoch,
+            slots: c.leases,
+        };
+        grant.slot_release_notices = c.release_notices;
+        grant.offered_slots = c.offered;
     }
 
     /// Admit a member (fresh) or re-admit one (reclaim).
@@ -1682,7 +1772,12 @@ impl MembershipOwner {
                 .fetch_add(1, Ordering::Relaxed);
             self.note_reclaim(&req.id);
         }
-        JoinOutcome::Granted(self.grant_for(epoch, now))
+        let mut grant = self.grant_for(epoch, now);
+        // PR 4: the slots this member leases on the volumes this owner
+        // manages, under the epoch it last held them (its reclaim's, or
+        // none on a fresh join).
+        Self::carry_slot_leases(&mut grant, &req.id, req.prior_epoch.unwrap_or(0));
+        JoinOutcome::Granted(grant)
     }
 
     /// Renew a lease, carrying the member's acknowledged freed-offset epoch
@@ -1761,6 +1856,10 @@ impl MembershipOwner {
             .map(|(_, n)| *n)
             .fold(0u64, u64::saturating_add);
         grant.lane_supply_volumes = volumes;
+        // PR 4: the slot-lease carriage — this member's leases attested,
+        // the manager's recalls, the offers standing for it; O(held) off
+        // the plane's RAM table.
+        Self::carry_slot_leases(&mut grant, id, epoch);
         RenewOutcome::Renewed(grant)
     }
 

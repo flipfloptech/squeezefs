@@ -364,6 +364,9 @@ fn install_member_grant(pack_group_available: bool) {
         checkpoint_ceiling_ms: 0,
         lane_supply_volumes: Vec::new(),
         pack_group_available,
+        slot_leases_ack: Default::default(),
+        slot_release_notices: Vec::new(),
+        offered_slots: Vec::new(),
     };
     let session = MemberSession::adopt(
         NODE_A,

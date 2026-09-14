@@ -589,6 +589,7 @@ fn the_manager_call_frames_round_trip_and_the_wire_schema_is_five() {
     let req = ManagerRequestFrame {
         schema: MANAGER_SCHEMA,
         request_id: 7,
+        volume: 0,
         call: ManagerCall::JoinAppender {
             identity: WireIdentity {
                 node_token: 1,
@@ -613,6 +614,7 @@ fn the_manager_call_frames_round_trip_and_the_wire_schema_is_five() {
         let f = ManagerRequestFrame {
             schema: MANAGER_SCHEMA,
             request_id: 1,
+            volume: 3,
             call,
         };
         assert_eq!(decode_request(&encode_request(&f).unwrap()).unwrap(), f);

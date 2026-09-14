@@ -313,6 +313,11 @@ impl LeaseFrame {
             // Nor the pack-group posture (PK4): the SET authority's
             // membership grant advertises it; this frame is custody only.
             pack_group_available: false,
+            // Nor the slot-lease carriage (PR 4): a slot lease lives on the
+            // MEMBERSHIP lease, never the custody one.
+            slot_leases_ack: Default::default(),
+            slot_release_notices: Vec::new(),
+            offered_slots: Vec::new(),
         }
     }
 }
@@ -2801,6 +2806,19 @@ impl AsyncVerbRouter {
         .with(
             crate::meta_ship::VERB_DELEG_BASE,
             crate::meta_ship::VERB_DELEG_LAST,
+            service,
+        )
+    }
+
+    /// Claim the **symmetric manager's verb block** (`0x0500`, design-
+    /// symmetric-metadata §6.3) for `service` — PR 4's mount-path wiring
+    /// of PR 3's `ManagerService`: the manager verbs ride the SAME
+    /// listener as custody, publish and the S8 metadata verbs, one venue
+    /// for every owner-side verb of the node.
+    pub fn with_manager(self, service: Arc<crate::meta_ship::manager::ManagerSetService>) -> Self {
+        self.with(
+            crate::meta_ship::manager::VERB_MANAGER_BASE,
+            crate::meta_ship::manager::VERB_MANAGER_LAST,
             service,
         )
     }

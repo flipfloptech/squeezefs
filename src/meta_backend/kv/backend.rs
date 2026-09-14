@@ -3033,6 +3033,8 @@ impl KvMetaBackend {
                 }
                 self.release_leases_at_leave(&plane, region).await?;
             }
+            // The membership carriage no longer answers for this plane.
+            super::slot_lease::unregister_carriage_plane(&plane);
         }
         // §5.1.3: a released region's UNCLAIMED grant (and every free its
         // tail already covered) returns to the heap — one control entry
@@ -3403,6 +3405,9 @@ impl KvMetaBackend {
         self.publish_slot_owners(set, plane);
         plane.refresh_holders();
         plane.gate.arm();
+        // The membership carriage (§5.9): every member's renewal grant
+        // now names the slots it leases here.
+        super::slot_lease::register_carriage_plane(plane);
         log::info!(
             "meta volume {}: symmetric plane ARMED — {} slot(s) leased (native + {} rotor), \
              M = {m}, T_idle = {} ms, dlm_mode = {}",
@@ -3934,12 +3939,16 @@ impl KvMetaBackend {
                 if lease.offered_to == appender_id && now < lease.offer_expires_ns =>
             {
                 // The accept. The holder is an in-process region: recalled
-                // here (`RecallForOffer`). A WIRE holder's recall needs the
-                // holder to run a service — PR 12's every-mount-is-a-writer;
-                // until then a wire holder's offer is refused back to the
-                // requester with the holder named.
+                // here (`RecallForOffer`). A WIRE holder serves no push
+                // channel: the recall rides its next membership renewal
+                // grant (`slot_release_notices`, §5.9's carriage), the
+                // holder runs flush-then-transfer + `ReleaseSlot`, and the
+                // requester's retry finds the slot unleased — so the
+                // requester is answered `Refused { holder }` now (retry
+                // after the release), never a refusal counted against the
+                // manager.
                 if set.region(lease.holder).is_none() {
-                    set.verbs.refusals.fetch_add(1, Ordering::Relaxed);
+                    plane.note_recall(lease.holder, slot);
                     return Ok(AcquireSlotReply::Refused {
                         holder: lease.holder,
                         g: lease.g,
@@ -4159,6 +4168,7 @@ impl KvMetaBackend {
         if let Some(r) = set.region(appender_id).filter(|_| !leaving.is_empty()) {
             r.grant().transfer_out(&leaving);
         }
+        plane.clear_recall(appender_id, slot);
         match plane
             .table
             .release(slot, appender_id, g, words, last_written)
@@ -6020,6 +6030,10 @@ impl KvMetaBackend {
         let (id, page_addr, ring_segments) = chosen;
         // The grant writes the joiner's page with it.
         let grant = self.manager_extent_grant(id, 0).await?;
+        // The joiner's identity for the membership carriage (PR 4).
+        if let Some(plane) = set.slot_leases() {
+            plane.note_identity(id, identity.node_token, identity.mount_slot);
+        }
         Ok(JoinOutcome {
             appender_id: id,
             page_addr,
@@ -13756,6 +13770,7 @@ impl KvMetaBackend {
                 Arc::clone(forest.extent_ledger()),
                 m,
                 partition.clone(),
+                set.native_slot,
             );
             // The pages' slot entries as loaded — the arm's settle reads
             // them after the join's checkpoint has rewritten the pages.
@@ -13770,6 +13785,23 @@ impl KvMetaBackend {
                         loaded.insert(r.id, page.slots.clone());
                     }
                 }
+            }
+            // Every Live page's identity (the membership carriage's
+            // member → appender resolution); this mount's regions carry
+            // its own.
+            for e in &entries {
+                if let Some(p) = e.page.as_ref() {
+                    if p.state == super::appender::AppenderState::Live {
+                        plane.note_identity(
+                            e.appender_id,
+                            p.identity.node_token,
+                            p.identity.mount_slot,
+                        );
+                    }
+                }
+            }
+            for r in &regions {
+                plane.note_identity(r.id, set.identity.node_token, set.identity.mount_slot);
             }
             Arc::new(plane)
         });

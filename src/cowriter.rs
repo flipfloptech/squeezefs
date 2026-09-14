@@ -276,10 +276,35 @@ pub fn rostered_members() -> Vec<String> {
 /// identity would enroll one host and admit another.
 pub fn node_member_id() -> Result<String> {
     let node = crate::writer_scope::resolve_node_identity()?.token;
-    Ok(match crate::writer_scope::mount_slot() {
+    Ok(node_member_id_of(node, crate::writer_scope::mount_slot()))
+}
+
+/// [`node_member_id`]'s form for a given `(node_token, mount_slot)`.
+pub fn node_member_id_of(node: u64, slot: u32) -> String {
+    match slot {
         0 => format!("node_{node:016x}"),
         slot => format!("node_{node:016x}.m{slot:08x}"),
-    })
+    }
+}
+
+/// The inverse of [`node_member_id`]: `(node_token, mount_slot)` from a
+/// writer member's id, `None` for any other member id (a reader's uuid).
+pub fn parse_node_member_id(id: &str) -> Option<(u64, u32)> {
+    let rest = id.strip_prefix("node_")?;
+    let (node_hex, slot_hex) = match rest.split_once(".m") {
+        Some((n, s)) => (n, Some(s)),
+        None => (rest, None),
+    };
+    if node_hex.len() != 16 {
+        return None;
+    }
+    let node = u64::from_str_radix(node_hex, 16).ok()?;
+    let slot = match slot_hex {
+        Some(s) if s.len() == 8 => u32::from_str_radix(s, 16).ok()?,
+        Some(_) => return None,
+        None => 0,
+    };
+    Some((node, slot))
 }
 
 /// Is the authority CO-LOCATED with this mount (rung-9 finding #1)?

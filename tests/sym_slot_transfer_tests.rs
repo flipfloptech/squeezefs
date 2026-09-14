@@ -1803,3 +1803,173 @@ async fn two_live_pages_attesting_one_slot_refuse_the_mount() {
     assert!(msg.contains(&format!("{}", victim.appender_id)), "{msg}");
     assert!(msg.contains(&format!("{}", forged.appender_id)), "{msg}");
 }
+
+// ---------------------------------------------------------------------------
+// §5.9 — the membership carriage.
+// ---------------------------------------------------------------------------
+
+/// The renewal `Grant` carries a member's slot leases (`slot_leases_ack`
+/// — the manager's attestation, `(routing slot, g)` under the member's
+/// epoch), the manager's recalls (`slot_release_notices` — a requester's
+/// accepted offer of a slot a WIRE holder holds rides the holder's
+/// renewal, since a member serves no push channel) and the offers
+/// standing for it (`offered_slots`); the recall clears with the
+/// holder's `ReleaseSlot`, after which the requester's retry is granted.
+/// A member no page names, and every mount without an armed plane, gets
+/// an empty carriage.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_renewal_grant_carries_the_members_slot_leases_recalls_and_offers() {
+    use squeezefs::membership::{
+        JoinOutcome, JoinRequest, LeaseClock, LeaseClocks, MemberRole, MembershipOwner,
+        RenewOutcome,
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    let uris = vec![format_stamped_member(dir.path(), "meta0").await];
+    let routed = open_under(&uris, &Knobs::armed()).await;
+    let vol = Arc::clone(&routed.volumes[0]);
+    let (host, mut client, joiner) = wire_joiner(&vol, 6).await;
+    let ident = joiner_identity(6);
+    let member_id = squeezefs::cowriter::node_member_id_of(ident.node_token, ident.mount_slot);
+    assert_eq!(
+        squeezefs::cowriter::parse_node_member_id(&member_id),
+        Some((ident.node_token, ident.mount_slot))
+    );
+    // The joiner leases routing slot 400.
+    let routing: u16 = 400;
+    let fslot = guest_forest_slot(routing);
+    match client.acquire_slot(joiner, routing).await.unwrap() {
+        ManagerReply::SlotsGranted { .. } => {}
+        other => panic!("{other:?}"),
+    }
+    // The membership owner (the S6 plane, in-process): the joiner's join
+    // grant attests its lease.
+    let owner = MembershipOwner::arm(
+        "owner-pr4",
+        1,
+        0,
+        LeaseClocks::derive(std::time::Duration::from_micros(250)).unwrap(),
+        LeaseClock::monotonic(),
+    )
+    .unwrap();
+    let req = |id: &str| JoinRequest {
+        id: id.to_string(),
+        role: MemberRole::Writer,
+        endpoint: None,
+        pid: std::process::id(),
+        boot: "pr4-carriage".to_string(),
+        prior_epoch: None,
+        pr_key: 0,
+        mount: None,
+    };
+    let JoinOutcome::Granted(grant) = owner.join(req(&member_id)) else {
+        panic!("join refused");
+    };
+    assert_eq!(grant.slot_leases_ack.slots, vec![(routing, 1)]);
+    assert_eq!(grant.slot_leases_ack.prior_epoch, 0);
+    assert!(grant.slot_release_notices.is_empty() && grant.offered_slots.is_empty());
+    let epoch = grant.epoch;
+    // A member no page names: an empty carriage.
+    let JoinOutcome::Granted(other) = owner.join(req("node_00000000deadbeef.m00000001")) else {
+        panic!("join refused");
+    };
+    assert!(other.slot_leases_ack.slots.is_empty());
+    // An OFFER for the joiner: the manager's idle rotor slot 7 (routing
+    // 6), touched by the joiner N_floor times.
+    let plane = vol.slot_leases().expect("armed");
+    let offered_slot: ForestSlot = 7;
+    for _ in 0..plane.n_floor() {
+        vol.note_slot_ship(offered_slot, joiner).await;
+    }
+    let RenewOutcome::Renewed(grant) = owner.renew(&member_id, epoch, 0) else {
+        panic!("renew refused");
+    };
+    assert_eq!(grant.offered_slots, vec![(6u16, 1u32)]);
+    assert_eq!(grant.slot_leases_ack.slots, vec![(routing, 1)]);
+    assert_eq!(grant.slot_leases_ack.prior_epoch, epoch);
+    // A RECALL: the joiner (the HOLDER decides — its own dominance
+    // evaluation runs at its mount) offers slot 400 to the manager, which
+    // accepts — the wire holder's recall rides the carriage; the requester
+    // is answered "retry after the release".
+    client.offer_slot(joiner, routing, 0).await.unwrap();
+    match vol.manager_acquire_slot(0, fslot).await.unwrap() {
+        AcquireSlotReply::Refused { holder, g } => assert_eq!((holder, g), (joiner, 1)),
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(lease_stats(&vol).recall_notices, 1);
+    assert_eq!(vol.appender_stats().unwrap().manager_verb_refusals, 0);
+    let RenewOutcome::Renewed(grant) = owner.renew(&member_id, epoch, 0) else {
+        panic!("renew refused");
+    };
+    assert_eq!(grant.slot_release_notices, vec![routing]);
+    // The holder releases (its flush-then-transfer is its own; the tree
+    // was never minted, so the words are empty), the recall clears, the
+    // requester's retry is granted at g + 1.
+    let already = client
+        .release_slot(joiner, routing, (0, 0), 0, 1, 0, Vec::new())
+        .await
+        .unwrap();
+    assert!(!already, "the release landed once");
+    let RenewOutcome::Renewed(grant) = owner.renew(&member_id, epoch, 0) else {
+        panic!("renew refused");
+    };
+    assert!(grant.slot_release_notices.is_empty());
+    assert!(grant.slot_leases_ack.slots.is_empty(), "the lease left with the release");
+    match vol.manager_acquire_slot(0, fslot).await.unwrap() {
+        AcquireSlotReply::Granted(g) => assert_eq!(g.g, 2),
+        other => panic!("{other:?}"),
+    }
+    host.shutdown();
+    shutdown(&routed).await;
+    // The leave uninstalled the carriage source: nothing answers.
+    assert!(squeezefs::membership::slot_lease_carriage_for_member(&member_id)
+        .leases
+        .is_empty());
+}
+
+/// The mount path's venue (deliverable 4 — PR 3's owed wiring): the
+/// manager verbs ride the S8 owner listener's `AsyncVerbRouter` through
+/// `ManagerSetService`, dispatched by the frame's volume ordinal; a frame
+/// naming an ordinal the set does not have is refused naming the width.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_manager_verbs_ride_the_owner_listener_dispatched_by_volume_ordinal() {
+    use squeezefs::data_grant::AsyncVerbRouter;
+    use squeezefs::meta_ship::manager::ManagerSetService;
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    let uris = vec![format_stamped_member(dir.path(), "meta0").await];
+    let routed = open_under(&uris, &Knobs::armed()).await;
+    let set_svc = ManagerSetService::new(&routed.volumes);
+    assert_eq!(set_svc.width(), 1);
+    let host = cw::RpcListener::start_async(
+        listener_cfg(),
+        SECRET.to_vec(),
+        Arc::new(AsyncVerbRouter::new().with_manager(set_svc)),
+    )
+    .unwrap();
+    let endpoint = host.endpoint().to_string();
+    let mut client = ManagerClient::connect(&endpoint, SECRET, "joiner-9")
+        .await
+        .unwrap();
+    let reply = client.join(joiner_identity(9), 0).await.unwrap();
+    let ManagerReply::Joined { appender_id, .. } = reply else {
+        panic!("{reply:?}");
+    };
+    match client.acquire_slot(appender_id, 500).await.unwrap() {
+        ManagerReply::SlotsGranted { slots, .. } => assert_eq!(slots[0].slot, 500),
+        other => panic!("{other:?}"),
+    }
+    let mut wrong = ManagerClient::connect(&endpoint, SECRET, "joiner-9b")
+        .await
+        .unwrap()
+        .for_volume(5);
+    let e = wrong
+        .resolve_slot(500)
+        .await
+        .err()
+        .expect("an ordinal past the set refuses");
+    let msg = e.to_string();
+    assert!(msg.contains("ordinal 5") && msg.contains("1 volume"), "{msg}");
+    host.shutdown();
+    shutdown(&routed).await;
+}

@@ -190,12 +190,19 @@ impl ManagerCall {
 }
 
 /// One request: the schema, a correlation id the caller chooses, the
-/// call. Idempotency is the DURABLE state's, so `request_id` is for the
-/// log line and the reply's echo only.
+/// volume the call is about, the call. Idempotency is the DURABLE
+/// state's, so `request_id` is for the log line and the reply's echo
+/// only.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ManagerRequestFrame {
     pub schema: u32,
     pub request_id: u64,
+    /// The target volume's ordinal in the routed set (the slot map's
+    /// volume index — every client of the set knows it): one listener
+    /// serves every volume a node manages (PR 4's mount-path wiring,
+    /// [`ManagerSetService`]), so the frame names which. `0` on a
+    /// one-volume set.
+    pub volume: u16,
     pub call: ManagerCall,
 }
 
@@ -350,6 +357,22 @@ impl ManagerService {
         let frame = match decode_request(&req.body) {
             Ok(f) => f,
             Err(e) => return self.refuse(req.id, STATUS_MALFORMED, e.to_string()),
+        };
+        self.serve_frame(req.id, frame, t_admit).await
+    }
+
+    /// Serve an already-decoded frame (the set dispatcher decodes once to
+    /// read the volume ordinal, then hands the frame here).
+    async fn serve_frame(
+        &self,
+        req_id: u64,
+        frame: ManagerRequestFrame,
+        t_admit: Instant,
+    ) -> RpcResponse {
+        let req = RpcRequest {
+            id: req_id,
+            verb: VERB_MANAGER_CALL,
+            body: Vec::new(),
         };
         if frame.schema != MANAGER_SCHEMA {
             return self.refuse(
@@ -589,6 +612,81 @@ impl RpcAsyncService for ManagerService {
     }
 }
 
+/// **The mount path's manager service** (PR 4, deliverable 4 — PR 3's
+/// owed wiring): ONE service on the S8 listener for every metadata volume
+/// this node manages, dispatching by the frame's `volume` ordinal to that
+/// volume's [`ManagerService`]. A frame naming an ordinal the set does
+/// not have is refused `STATUS_NOT_MANAGER` naming the width; a volume
+/// whose plane is not armed answers through its own service's refusals
+/// (`appenders_public()` / the manager gate). Built by the multi-writer
+/// arm over the routed set's volumes when any of them armed the
+/// symmetric plane (`AsyncVerbRouter::with_manager`), so the manager
+/// verbs ride the venue every other owner verb rides.
+pub struct ManagerSetService {
+    volumes: Vec<Arc<ManagerService>>,
+}
+
+impl ManagerSetService {
+    pub fn new(volumes: &[Arc<KvMetaBackend>]) -> Arc<Self> {
+        Arc::new(Self {
+            volumes: volumes
+                .iter()
+                .map(|v| ManagerService::new(Arc::clone(v)))
+                .collect(),
+        })
+    }
+
+    /// The set's width (volumes served).
+    pub fn width(&self) -> usize {
+        self.volumes.len()
+    }
+
+    async fn serve(&self, req: RpcRequest) -> RpcResponse {
+        let t_admit = Instant::now();
+        if req.verb != VERB_MANAGER_CALL {
+            return RpcResponse {
+                id: req.id,
+                status: crate::cluster_wire::RPC_UNKNOWN_VERB,
+                body: format!("manager: unknown verb {}", req.verb).into_bytes(),
+            };
+        }
+        let frame = match decode_request(&req.body) {
+            Ok(f) => f,
+            Err(e) => {
+                log::warn!("manager set service refused a frame: {e}");
+                return RpcResponse {
+                    id: req.id,
+                    status: STATUS_MALFORMED,
+                    body: e.to_string().into_bytes(),
+                };
+            }
+        };
+        let Some(svc) = self.volumes.get(usize::from(frame.volume)) else {
+            let reason = format!(
+                "manager frame names volume ordinal {} on a set of {} volume(s)",
+                frame.volume,
+                self.volumes.len()
+            );
+            log::warn!("manager set service refused a frame: {reason}");
+            return RpcResponse {
+                id: req.id,
+                status: STATUS_NOT_MANAGER,
+                body: reason.into_bytes(),
+            };
+        };
+        svc.serve_frame(req.id, frame, t_admit).await
+    }
+}
+
+impl RpcAsyncService for ManagerSetService {
+    fn call<'a>(
+        &'a self,
+        req: RpcRequest,
+    ) -> Pin<Box<dyn Future<Output = RpcResponse> + Send + 'a>> {
+        Box::pin(self.serve(req))
+    }
+}
+
 /// The client half: one authenticated session to a manager's endpoint,
 /// one call per verb. The S8 `RpcClient` underneath — the same dial, the
 /// same proof of storage membership, the same per-frame MAC. First
@@ -597,6 +695,9 @@ impl RpcAsyncService for ManagerService {
 pub struct ManagerClient {
     rpc: RpcClient,
     next_request: u64,
+    /// The volume ordinal every frame of this client names
+    /// ([`ManagerRequestFrame::volume`]); 0 unless [`Self::for_volume`].
+    volume: u16,
 }
 
 impl std::fmt::Debug for ManagerClient {
@@ -615,7 +716,15 @@ impl ManagerClient {
         Ok(Self {
             rpc,
             next_request: 1,
+            volume: 0,
         })
+    }
+
+    /// Address every frame to the set's volume ordinal `volume` (the slot
+    /// map's volume index — [`ManagerSetService`] dispatches on it).
+    pub fn for_volume(mut self, volume: u16) -> Self {
+        self.volume = volume;
+        self
     }
 
     /// Issue one verb; a `Refused` reply is an error naming its reason.
@@ -625,6 +734,7 @@ impl ManagerClient {
         let body = encode_request(&ManagerRequestFrame {
             schema: MANAGER_SCHEMA,
             request_id,
+            volume: self.volume,
             call,
         })?;
         let resp = self.rpc.call(VERB_MANAGER_CALL, body).await?;

@@ -1004,7 +1004,7 @@ pub async fn arm_multi_writer(
     // coherence gate on this backend's mutation surface (grants may only
     // exist where the recall-before-conflicting-publish law is enforced).
     crate::meta_ship::install_delegation_host(Arc::clone(&meta_svc));
-    let router = AsyncVerbRouter::new()
+    let mut router = AsyncVerbRouter::new()
         .with_custody(Arc::clone(&owner))
         // Scoped like the meta service above (§5.7 correction 3, finding
         // 13): a served block-ref population answers from OWNED volumes
@@ -1016,6 +1016,22 @@ pub async fn arm_multi_writer(
             &map.local_volume_set(),
         ))
         .with_meta(meta_svc);
+    // The symmetric manager's verb block (design-symmetric-metadata §6.3,
+    // PR 4 — PR 3's owed mount-path wiring): when any volume of the set
+    // armed the symmetric plane (`SQUEEZEFS_SYMMETRIC_META=1` on a bit-17
+    // volume), this node is those volumes' manager and serves
+    // `JoinAppender` / the grants / the slot leases on this SAME listener,
+    // dispatched by the frame's volume ordinal. Dark on every other mount.
+    if meta.volumes.iter().any(|v| v.slot_lease_armed()) {
+        router = router.with_manager(crate::meta_ship::manager::ManagerSetService::new(
+            &meta.volumes,
+        ));
+        log::info!(
+            "symmetric manager verbs served on the S8 listener for {} volume(s) \
+             (design-symmetric-metadata §6.3)",
+            meta.volumes.len()
+        );
+    }
     let listener = match crate::cluster_wire::RpcListener::start_async(
         crate::cluster_wire::RpcListenerConfig {
             bind_addr: bind,

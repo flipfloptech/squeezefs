@@ -614,6 +614,7 @@ impl JournalRing {
             }],
             reserve_bytes,
             part,
+            0,
         )
     }
 
@@ -622,7 +623,25 @@ impl JournalRing {
     /// ring is the one-segment case). Logical positions run through the
     /// segments in order.
     pub fn new_segments(path: &Path, segments: Vec<RingSegment>, reserve_bytes: u64) -> Self {
-        Self::new_segments_in_partition(path, segments, reserve_bytes, AppendPartition::SOLO)
+        Self::new_segments_at(path, segments, reserve_bytes, 0)
+    }
+
+    /// [`Self::new_segments`] whose logical position space STARTS at
+    /// `start` (head = reusable_upto = `start`, nothing to replay) — a
+    /// rejoined appender region's ring (PR 3 review round 2): record seqs
+    /// are ring positions, and per-key LWW compares them raw, so a fresh
+    /// ring restarting at 0 gives this incarnation's records seqs at or
+    /// below the predecessor's durable ones — an acked release replays as
+    /// resurrected while the live RAM apply read it gone. The region's
+    /// seq space must be monotone across its incarnations: the caller
+    /// passes the predecessor's final head (kept on the `Free` page).
+    pub fn new_segments_at(
+        path: &Path,
+        segments: Vec<RingSegment>,
+        reserve_bytes: u64,
+        start: u64,
+    ) -> Self {
+        Self::new_segments_in_partition(path, segments, reserve_bytes, AppendPartition::SOLO, start)
     }
 
     fn new_segments_in_partition(
@@ -630,6 +649,7 @@ impl JournalRing {
         segments: Vec<RingSegment>,
         reserve_bytes: u64,
         part: AppendPartition,
+        start: u64,
     ) -> Self {
         let pages = segments.iter().map(|s| s.pages).sum();
         Self {
@@ -642,10 +662,13 @@ impl JournalRing {
                     pages,
                     reserve_bytes,
                 },
-                0,
-                0,
+                start,
+                start,
             ),
-            inflight: Mutex::new(Inflight::default()),
+            inflight: Mutex::new(Inflight {
+                open: BTreeMap::new(),
+                completed_upto: start,
+            }),
             space_notify: squeezefs_ipc::sqz_notify::Notify::new(),
             completion_notify: squeezefs_ipc::sqz_notify::Notify::new(),
             written_entries: std::sync::atomic::AtomicU64::new(0),
@@ -1383,7 +1406,12 @@ fn replay_scan_image(
                         Some((_, _, w)) if w != expect_writer => {
                             pending += 1;
                         }
-                        Some((lap, feo, _)) if u64::from(lap) == geo.lap(pos_i) => {
+                        // The header carries the lap's LOW 32 bits (module
+                        // docs); compare what it carries — a ring whose
+                        // logical positions started past 2^32 laps (a
+                        // rejoined region's ring continues its
+                        // predecessor's space) verifies like any other.
+                        Some((lap, feo, _)) if lap == geo.lap(pos_i) as u32 => {
                             if feo == FIRST_ENTRY_NONE {
                                 // Attested continuation-only page: nothing
                                 // starts here, nothing to lose.

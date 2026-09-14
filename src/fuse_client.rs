@@ -13583,7 +13583,19 @@ impl SqueezefsFilesystem {
                 // + returned + granted_unclaimed` is published as its four
                 // terms. `manager_load_pct` is MEASURED (Σ service ÷ wall);
                 // `manager_service_ns` is exact-sum `admit / execute /
-                // reply / total`; `manager_verb_refusals` MUST STAY 0.
+                // reply / total`; `manager_verb_refusals` MUST STAY 0 —
+                // `manager_verb_rejected` is the OTHER class (round 2,
+                // Issue 2): frames whose wire integers named what the
+                // durable state cannot (a return run outside the volume,
+                // an overflowing length), rejected at the service edge
+                // before any allocation proportional to them — a buggy or
+                // hostile peer, never this manager's witness.
+                // `appenders_known` is the directory's Live count the grant
+                // cap divides the free heap by (in-process regions AND wire
+                // joiners); `extent_grant_promised` the §4.7 admission's
+                // promises against the grants (a leased leaf's SMO draws
+                // the GRANT, so its promise rides the region's ledger, not
+                // `heap_promised`) — 0 at quiesce.
                 let manager_word = |be: &crate::meta_backend::kv::backend::KvMetaBackend| {
                     be.appender_stats()
                         .map_or_else(|| "vacant".to_string(), |s| s.manager_lease.word())
@@ -13650,6 +13662,15 @@ impl SqueezefsFilesystem {
                 metrics.insert(
                     "manager_verb_refusals".into(),
                     appender(&|s| s.manager_verb_refusals),
+                );
+                metrics.insert(
+                    "manager_verb_rejected".into(),
+                    appender(&|s| s.manager_verb_rejected),
+                );
+                metrics.insert("appenders_known".into(), appender(&|s| s.appenders_known));
+                metrics.insert(
+                    "extent_grant_promised".into(),
+                    appender(&|s| s.regions.iter().map(|r| r.grant_promised).sum()),
                 );
                 metrics.insert(
                     "manager_service_ns".into(),

@@ -342,6 +342,15 @@ pub fn test_set_destroy_chunk_stop_after(after: Option<u32>) {
     TEST_DESTROY_CHUNK_STOP_AFTER.store(after.unwrap_or(0), Ordering::Relaxed);
 }
 
+/// Test seam (design-symmetric-metadata §5.3.5 / KD-SYM-7, review round 1
+/// Issue 3): `JoinAppender` FAILS after its page went `Live` (both
+/// directory slots barriered) and before its initial extent grant — the
+/// durable state of a manager killed in that window. The replay of the
+/// join must complete it: `already`, AND the grant the interrupted join
+/// owed. One relaxed load per join (a control-plane verb); `false` = off.
+pub static TEST_JOIN_HOLD_AFTER_PAGE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 /// `SQUEEZEFS_TIMEOUT` as the D1.b watchdog/escalation threshold
 /// (design-metadata-throughput §6): read per `open` (control-plane —
 /// never on an op path), default 30 s. Deliberately NOT process-memoized:
@@ -2863,13 +2872,28 @@ impl KvMetaBackend {
         // One barriered cycle: bitmap pages (the rings' extents), the
         // ledger, then every region's page in its Live form.
         self.checkpoint_now().await?;
-        // The initial grant of every declared region that holds none
-        // (§5.3.3 — the join's grant): a recovered region keeps what its
-        // record and page attest.
+        // `appenders_known`: the directory's Live count now that this
+        // mount's pages are Live (foreign joiners included).
+        let live = super::appender::read_directory(&self.path, &self.sb)
+            .await?
+            .iter()
+            .filter(|e| {
+                e.page
+                    .as_ref()
+                    .is_some_and(|p| p.state == super::appender::AppenderState::Live)
+            })
+            .count() as u64;
+        set.appenders_known
+            .store(live.max(set.regions.len() as u64), Ordering::Relaxed);
+        // The initial grant of every declared region whose UNCLAIMED
+        // remainder is empty (§5.3.3 — the join's grant): a recovered
+        // region's claimed images (tree 0's record, review round 1 Issue
+        // 1) are not a remainder to compact into — before the fix the
+        // condition also required `claimed() == 0`, so a region recovered
+        // with images and no remainder never got its grant.
         for r in set.regions.iter().skip(1) {
-            if r.grant().unclaimed() == 0 && r.grant().claimed() == 0 {
-                let want = self.grant_extents_for(set, r.id) as u32;
-                self.manager_extent_grant(r.id, want).await?;
+            if r.grant().unclaimed() == 0 {
+                self.manager_extent_grant(r.id, 0).await?;
             }
         }
         Ok(())
@@ -2935,8 +2959,14 @@ impl KvMetaBackend {
                 page.grant.clear();
                 if region.id != 0 {
                     released.append(&mut page.segments);
-                    page.head_hint = 0;
-                    page.ledger_tail_seq = 0;
+                    // The `Free` page KEEPS the ring's final head: the
+                    // region's seq-space watermark, which the next carve
+                    // continues from (`JournalRing::new_segments_at`) —
+                    // record seqs are ring positions and per-key LWW
+                    // compares them raw across incarnations.
+                    let head = region.ring().core().head();
+                    page.head_hint = head;
+                    page.ledger_tail_seq = head;
                 }
             }
             // A table change: the directory pair only — a released
@@ -3018,12 +3048,17 @@ impl KvMetaBackend {
         Ok(set)
     }
 
-    /// ONE checkpoint-class control entry in ring 0 carrying `recs`
-    /// (tree-0 puts, allocator deltas), applied to tree 0 in RAM after the
-    /// reservation, written, then BARRIERED — a manager verb answers
-    /// only from durable state (§5.3.5; the S9 `BlockGrant` law: a grant
-    /// a peer holds is always journaled). A refused admission is the
-    /// caller's retry; a failed write is the journal-failure class.
+    /// ONE control entry in ring 0 carrying `recs` (tree-0 puts,
+    /// allocator deltas), applied to tree 0 in RAM after the reservation,
+    /// written, then BARRIERED — a manager verb answers only from durable
+    /// state (§5.3.5; the S9 `BlockGrant` law: a grant a peer holds is
+    /// always journaled). Admitted in the USER class (review round 1,
+    /// Issue 15): a verb storm from the wire venue then competes with user
+    /// commits for the ring's admissible window and can never eat the
+    /// §4.4 pt 5 reserve the checkpoint task's own publication relies on
+    /// — the rate bound IS the class. A refused admission is the caller's
+    /// retry (the cadence's next cycle, the peer's resend); a failed write
+    /// is the journal-failure class.
     async fn write_control_entry(
         &self,
         mut recs: Vec<(u8, Record)>,
@@ -3035,7 +3070,7 @@ impl KvMetaBackend {
             ))
         })?;
         let len = entry_len_for(&recs)?;
-        let Some(adm) = self.ring.try_admit(len, AdmissionClass::Checkpoint) else {
+        let Some(adm) = self.ring.try_admit(len, AdmissionClass::User) else {
             return Err(KvError::JournalReserveExhausted { needed: len });
         };
         let res = self.ring.reserve_registered(adm);
@@ -3087,8 +3122,12 @@ impl KvMetaBackend {
         }
     }
 
-    /// Every appender's grant record in tree 0 (fsck C13's granted set;
-    /// the violation detector's grant map).
+    /// Every appender's grant record in tree 0 — the violation detector's
+    /// grant map at open (`read_extent_grant_records`). First product
+    /// caller of this public face: PR 10's dead-appender recovery driver
+    /// (a dead region's whole grant is what it returns); the flat-mount
+    /// contract (`a_flat_mount_has_no_manager_lease_and_no_grants`) is its
+    /// consumer today.
     pub async fn extent_grant_records(
         &self,
     ) -> std::result::Result<Vec<(u32, super::slot_state::ExtentGrantRecord)>, KvError> {
@@ -3124,7 +3163,9 @@ impl KvMetaBackend {
 
     /// The grant size the manager answers appender `id` with right now:
     /// the knob, else the §5.3.3 derivation over the region's measured
-    /// SMO rate, the failover bound and the free heap.
+    /// SMO rate, the failover bound, the free heap and the directory's
+    /// LIVE appender count (`appenders_known` — in-process regions AND
+    /// wire joiners; review round 1, Issue 12).
     pub(super) fn grant_extents_for(
         &self,
         set: &super::appender::AppenderSet,
@@ -3137,22 +3178,70 @@ impl KvMetaBackend {
             ewma,
             set.failover_bound_ms.load(Ordering::Relaxed),
             self.alloc.free_extents(),
-            set.regions.len().max(1) as u64,
+            set.appenders_known
+                .load(Ordering::Relaxed)
+                .max(set.regions.len() as u64)
+                .max(1),
         )
     }
 
-    /// **`ExtentGrant { want }`** (§5.3.3): carve up to `want` extents
-    /// from the free heap in the USER class (a grant never eats the
-    /// manager's compaction reserve), coalesced into ≤ `GRANT_RUNS_MAX`
-    /// runs; journal their allocator deltas and the appender's rewritten
-    /// `extent_grant` record as ONE control entry; barrier; answer the
-    /// runs. `want == 0` answers the derived size. An in-process region
-    /// adopts the runs into its RAM grant. Answers the empty grant when
-    /// the heap is at its growth floor — the appender counts the stall.
+    /// Appender `id`'s UNCLAIMED remainder as the durable state has it:
+    /// an in-process region's RAM grant (the page mirrors it), a wire
+    /// joiner's page `grant` field (the manager writes it at every grant).
+    async fn unclaimed_remainder_of(
+        &self,
+        set: &super::appender::AppenderSet,
+        appender_id: u32,
+    ) -> std::result::Result<Vec<super::appender::GrantRun>, KvError> {
+        if let Some(r) = set.region(appender_id) {
+            return Ok(r.grant().unclaimed_runs());
+        }
+        let entries = super::appender::read_directory(&self.path, &self.sb).await?;
+        Ok(entries
+            .iter()
+            .find(|e| e.appender_id == appender_id)
+            .and_then(|e| e.page.as_ref())
+            .filter(|p| p.state == super::appender::AppenderState::Live)
+            .map(|p| p.grant.clone())
+            .unwrap_or_default())
+    }
+
+    /// **`ExtentGrant { want }`** (§5.3.3) in the USER class — a grant
+    /// never eats the manager's compaction reserve. See
+    /// [`Self::manager_extent_grant_class`].
     pub async fn manager_extent_grant(
         &self,
         appender_id: u32,
         want: u32,
+    ) -> std::result::Result<Vec<super::appender::GrantRun>, KvError> {
+        self.manager_extent_grant_class(appender_id, want, super::alloc_ext_core::AllocClass::User)
+            .await
+    }
+
+    /// **`ExtentGrant { want }`** (§5.3.3 / §5.3.5): carve up to `want`
+    /// extents from the free heap in `class`, coalesced into ≤
+    /// `GRANT_RUNS_MAX` runs; journal their allocator deltas and the
+    /// appender's rewritten `extent_grant` record as ONE control entry;
+    /// barrier; answer the runs. `want == 0` = the derived size; an
+    /// explicit `want` is CLAMPED to the derivation's cap — a wire integer
+    /// is never an allocation authority (review round 1, Issue 2). The
+    /// verb is idempotent against DURABLE state (§5.3.5): a caller whose
+    /// unclaimed remainder already covers `want` is answered that
+    /// remainder VERBATIM (a replayed frame after a lost reply carves
+    /// nothing — `manager_verb_replays`); the 50 % refill law reaches a
+    /// fresh carve because a remainder below half the reference is below
+    /// the derived size. `class`: USER for the cadence and the join (the
+    /// compaction reserve stays the manager's); INTERNAL for the flush
+    /// pass's compactions of a leased slot tree — the SMOs that RETURN
+    /// extents draw down to the compaction floor like the manager's own,
+    /// so the heap-full recovery makes progress on leased trees too
+    /// (Issue 6). A heap that cannot serve one extent answers `NoSpace`
+    /// — the SPACE class, never `Ok(empty)` counted as a manager stall.
+    pub async fn manager_extent_grant_class(
+        &self,
+        appender_id: u32,
+        want: u32,
+        class: super::alloc_ext_core::AllocClass,
     ) -> std::result::Result<Vec<super::appender::GrantRun>, KvError> {
         let set = self.manager_gate(false)?;
         if appender_id == 0 {
@@ -3164,17 +3253,32 @@ impl KvMetaBackend {
             )));
         }
         let _g = self.manager_verbs.lock().await;
-        let want = if want == 0 {
-            self.grant_extents_for(set, appender_id)
-        } else {
-            u64::from(want)
-        };
+        let cap = self.grant_extents_for(set, appender_id);
+        let want = super::appender::clamp_grant_want(want, cap);
+        // §5.3.5: an unconsumed grant is answered verbatim.
+        let remainder = self.unclaimed_remainder_of(set, appender_id).await?;
+        let remainder_extents: u64 = remainder.iter().map(|r| u64::from(r.len)).sum();
+        if remainder_extents >= want && want > 0 {
+            set.verbs.replays.fetch_add(1, Ordering::Relaxed);
+            return Ok(remainder);
+        }
         let record = self.extent_grant_record(appender_id).await?;
-        let mut claimed: Vec<u64> = Vec::with_capacity(want as usize);
+        // Bounded by the FREE heap, never by the wire.
+        let mut claimed: Vec<u64> =
+            Vec::with_capacity(want.min(self.alloc.free_extents()) as usize);
         for _ in 0..want {
-            match self.alloc.claim_user() {
+            let claim = match class {
+                super::alloc_ext_core::AllocClass::User => self.alloc.claim_user(),
+                super::alloc_ext_core::AllocClass::Internal => self.alloc.claim_internal(),
+            };
+            match claim {
                 Ok(e) => claimed.push(e),
-                Err(KvError::NoSpace { .. }) => break,
+                Err(KvError::NoSpace { free, reserve }) => {
+                    if claimed.is_empty() {
+                        return Err(KvError::NoSpace { free, reserve });
+                    }
+                    break;
+                }
                 Err(e) => {
                     for c in claimed {
                         self.alloc.release_unpublished(c);
@@ -3184,25 +3288,45 @@ impl KvMetaBackend {
             }
         }
         claimed.sort_unstable();
-        let mut runs =
-            super::slot_state::ExtentGrantRecord::from_extents(claimed.iter().copied()).runs;
-        // The page names ≤ GRANT_RUNS_MAX runs: a fragmented heap answers
-        // fewer extents rather than a grant the page cannot record.
-        if runs.len() > super::appender::GRANT_RUNS_MAX {
-            let keep: std::collections::BTreeSet<u64> = runs
-                .iter()
-                .take(super::appender::GRANT_RUNS_MAX)
-                .flat_map(|r| r.start..r.start + u64::from(r.len))
-                .collect();
-            for e in claimed.iter().filter(|e| !keep.contains(e)) {
-                self.alloc.release_unpublished(*e);
+        // The page names ≤ GRANT_RUNS_MAX runs of the WHOLE remainder
+        // (Issue 9): the carve is coalesced with the caller's current
+        // remainder before it is decided, and while the union has more
+        // runs than the page carries, the smallest run made only of NEW
+        // claims is released (never granted) — a fragmented heap answers
+        // fewer extents rather than a remainder the page cannot name.
+        let mut new_set: std::collections::BTreeSet<u64> = claimed.iter().copied().collect();
+        let mut union: std::collections::BTreeSet<u64> = remainder
+            .iter()
+            .flat_map(|r| r.start..r.start + u64::from(r.len))
+            .collect();
+        union.extend(new_set.iter().copied());
+        loop {
+            let runs =
+                super::slot_state::ExtentGrantRecord::from_extents(union.iter().copied()).runs;
+            if runs.len() <= super::appender::GRANT_RUNS_MAX {
+                break;
             }
-            claimed.retain(|e| keep.contains(e));
-            runs.truncate(super::appender::GRANT_RUNS_MAX);
+            let Some(victim) = runs
+                .iter()
+                .filter(|r| (r.start..r.start + u64::from(r.len)).all(|e| new_set.contains(&e)))
+                .min_by_key(|r| r.len)
+                .cloned()
+            else {
+                break;
+            };
+            for e in victim.start..victim.start + u64::from(victim.len) {
+                union.remove(&e);
+                new_set.remove(&e);
+                self.alloc.release_unpublished(e);
+            }
         }
+        claimed.retain(|e| new_set.contains(e));
         if claimed.is_empty() {
-            return Ok(Vec::new());
+            // Nothing carvable fits beside the caller's fragmented
+            // remainder: the remainder, verbatim (a return coalesces it).
+            return Ok(remainder);
         }
+        let runs = super::slot_state::ExtentGrantRecord::from_extents(claimed.iter().copied()).runs;
         let mut recs: Vec<(u8, Record)> = claimed
             .iter()
             .map(|e| super::alloc_ext::alloc_record(*e, 0))
@@ -3228,15 +3352,26 @@ impl KvMetaBackend {
         set.extent_grant_extents
             .fetch_add(claimed.len() as u64, Ordering::Relaxed);
         if let Some(r) = set.region(appender_id) {
-            r.grant().add_runs(&runs);
             // The page names the grant (§5.3.3) — one write; the next
             // checkpoint's barrier covers it, and a page lost before that
-            // only over-states the claimed set (fsck C13's class).
+            // only over-states the claimed set (fsck C13's class). The
+            // page names the WHOLE remainder (Issue 9): an excess run
+            // moves to the returnable batch before the write.
             {
+                let mut g = r.grant();
+                g.add_runs(&runs);
+                g.trim_to_page_runs();
                 let mut page = r.page.lock().unwrap_or_else(|e| e.into_inner());
-                page.grant = r.grant().unclaimed_runs();
+                page.grant = g.unclaimed_runs();
             }
             self.write_region_page(r).await?;
+        } else {
+            // A wire joiner's page: its remainder ∪ the carve, the union
+            // the loop above fitted to the page.
+            let page_grant =
+                super::slot_state::ExtentGrantRecord::from_extents(union.iter().copied()).runs;
+            self.write_wire_joiner_page_grant(appender_id, &page_grant)
+                .await?;
         }
         log::info!(
             "meta volume {}: extent grant to appender {appender_id}: {} extent(s) in {} run(s) \
@@ -3254,13 +3389,64 @@ impl KvMetaBackend {
     /// routes to the old image — and rewrite the appender's grant record
     /// without them, ONE control entry. Idempotent: an extent the record
     /// no longer grants is already returned (`already`). Answers
-    /// `(cleared, already)`.
+    /// `(cleared, already)`. The extent list is the CADENCE's — this
+    /// process's own returnable batch, bounded by the grant it came from;
+    /// the wire form is [`Self::manager_return_runs`].
     pub async fn manager_return_extents(
         &self,
         appender_id: u32,
         extents: &[u64],
     ) -> std::result::Result<(u64, u64), KvError> {
         self.return_extents_inner(appender_id, extents, false).await
+    }
+
+    /// **`ReturnExtents { runs }`** as the WIRE carries it (review round
+    /// 1, Issue 2 — "bounded codec = bounded execution"): every run is
+    /// validated against the VOLUME before anything proportional to a
+    /// wire integer happens — `start + len` must not overflow and must
+    /// lie inside the volume's extents; a frame that fails is REJECTED
+    /// (`manager_verb_rejected`, the buggy/hostile-peer class — kept
+    /// apart from `manager_verb_refusals`, whose must-stay-0 meaning is
+    /// "a verb's durable witness contradicts the caller"). The runs are
+    /// then intersected with the caller's record as INTERVALS — the
+    /// materialized extent list is bounded by the record, never by the
+    /// frame — and what lies outside the record is `already` (§5.3.5's
+    /// idempotency: a replay after a lost reply names extents the record
+    /// no longer holds and answers as the first reply did).
+    pub async fn manager_return_runs(
+        &self,
+        appender_id: u32,
+        runs: &[super::appender::GrantRun],
+    ) -> std::result::Result<(u64, u64), KvError> {
+        let set = self.manager_gate(false)?;
+        let total = self.alloc.total_extents();
+        let record = self.extent_grant_record(appender_id).await?;
+        let named = match super::appender::validate_return_runs(runs, total) {
+            Ok(named) => named,
+            Err(r) => {
+                set.verbs.rejected.fetch_add(1, Ordering::Relaxed);
+                return Err(KvError::Rejected(format!(
+                    "{}: ReturnExtents from appender {appender_id} rejected — run ({}, {}) lies \
+                     outside this volume's {total} extents (manager_verb_rejected)",
+                    self.path.display(),
+                    r.start,
+                    r.len
+                )));
+            }
+        };
+        // Interval intersection with the record's runs: the list is
+        // bounded by the record.
+        let extents = super::appender::intersect_runs_with_record(runs, &record);
+        if extents.is_empty() {
+            // Everything named is already outside the record.
+            set.verbs.replays.fetch_add(1, Ordering::Relaxed);
+            return Ok((0, named));
+        }
+        let already = named.saturating_sub(extents.len() as u64);
+        let (cleared, _) = self
+            .return_extents_inner(appender_id, &extents, false)
+            .await?;
+        Ok((cleared, already))
     }
 
     async fn return_extents_inner(
@@ -3280,6 +3466,38 @@ impl KvMetaBackend {
             }
             return Ok((0, already.len() as u64));
         }
+        // An in-process region's RAM grant must not disagree with the
+        // bitmap (Issue 11): an extent it still holds CLAIMED holds a live
+        // image — refused; unclaimed / parked / returnable are dropped
+        // from RAM BEFORE the durable return (an SMO claiming one between
+        // the screen and the bit clear would write an image into an
+        // extent the manager re-grants), restored to the returnable batch
+        // if the return fails — so a later `claim()` can never hand out
+        // an extent the manager re-granted.
+        let mut dropped_from_ram: Vec<u64> = Vec::new();
+        if let Some(r) = set.region(appender_id) {
+            let mut g = r.grant();
+            let mut live: Vec<u64> = Vec::new();
+            for e in &granted {
+                match g.drop_returned(*e) {
+                    Ok(true) => dropped_from_ram.push(*e),
+                    Ok(false) => {}
+                    Err(()) => live.push(*e),
+                }
+            }
+            if !live.is_empty() {
+                g.restore_returnable(std::mem::take(&mut dropped_from_ram));
+                drop(g);
+                set.verbs.refusals.fetch_add(1, Ordering::Relaxed);
+                return Err(KvError::Busy(format!(
+                    "{}: ReturnExtents from appender {appender_id} refused — {} extent(s) are \
+                     claimed (live images): {:?} (manager_verb_refusals)",
+                    self.path.display(),
+                    live.len(),
+                    &live[..live.len().min(4)]
+                )));
+            }
+        }
         let remaining = super::slot_state::ExtentGrantRecord::from_extents(
             record.extents().filter(|e| !granted.contains(e)),
         );
@@ -3296,15 +3514,48 @@ impl KvMetaBackend {
                 Record::put(key, 0, remaining.encode()?)
             },
         ));
-        self.write_control_entry(recs).await?;
+        if let Err(e) = self.write_control_entry(recs).await {
+            if let Some(r) = set.region(appender_id) {
+                r.grant().restore_returnable(dropped_from_ram);
+            }
+            return Err(e);
+        }
         for e in &granted {
             self.alloc.release_unpublished(*e);
+        }
+        if set.region(appender_id).is_none() && !at_leave {
+            // A wire joiner's page remainder drops the returned extents
+            // (its page is the manager's to write in PR 3; §5.3.5's
+            // idempotency reads the remainder off it).
+            let remainder = self.unclaimed_remainder_of(set, appender_id).await?;
+            let kept = super::slot_state::ExtentGrantRecord::from_extents(
+                remainder
+                    .iter()
+                    .flat_map(|r| r.start..r.start + u64::from(r.len))
+                    .filter(|e| !granted.contains(e)),
+            )
+            .runs;
+            self.write_wire_joiner_page_grant(appender_id, &kept)
+                .await?;
         }
         set.extent_returns.fetch_add(1, Ordering::Relaxed);
         if !already.is_empty() {
             set.verbs.replays.fetch_add(1, Ordering::Relaxed);
         }
         Ok((granted.len() as u64, already.len() as u64))
+    }
+
+    /// Whether appender `id`'s RAM grant holds `extent` in ANY set
+    /// (claimed, unclaimed, parked, returnable) — the durable-vs-RAM law's
+    /// probe (`record ⊆ RAM sets` after every open; review round 1, Issue
+    /// 1). Its first product caller is PR 4's lease gate (a slot lease's
+    /// `slot_tree_extents` audit); the contract suite is the consumer
+    /// today.
+    pub fn grant_holds(&self, appender_id: u32, extent: u64) -> bool {
+        self.appenders
+            .as_ref()
+            .and_then(|a| a.region(appender_id))
+            .is_some_and(|r| r.grant().contains(extent))
     }
 
     /// The image extents every tree of this volume reaches, under the
@@ -3447,22 +3698,42 @@ impl KvMetaBackend {
             let _g = self.manager_verbs.lock().await;
             let entries = read_directory(&self.path, &self.sb).await?;
             // KD-SYM-7: the durable witness — a Live page under this
-            // identity IS the join, whatever RAM remembers.
+            // identity IS the join, whatever RAM remembers. The reply's
+            // `grant` is the joiner's UNCLAIMED remainder (its page's
+            // `grant`, never the whole record — the record's claimed
+            // images are not a remainder; Issue 3), and a join the
+            // manager died inside — page Live, no grant minted — is
+            // COMPLETED here: the replay mints the grant the interrupted
+            // join owed, so `Joined.grant` means the same thing on every
+            // reply.
             if let Some(e) = entries.iter().find(|e| {
                 e.page
                     .as_ref()
                     .is_some_and(|p| p.state == AppenderState::Live && p.identity == identity)
             }) {
                 let page = e.page.clone().expect("matched a page");
-                let record = self.extent_grant_record(page.appender_id).await?;
                 set.verbs.replays.fetch_add(1, Ordering::Relaxed);
-                return Ok(JoinOutcome {
-                    appender_id: page.appender_id,
+                let owed = page.grant.is_empty()
+                    && set.region(page.appender_id).is_none()
+                    && self.extent_grant_record(page.appender_id).await?.is_empty();
+                let id = page.appender_id;
+                let mut out = JoinOutcome {
+                    appender_id: id,
                     page_addr: e.dir_offsets[0],
                     ring_segments: page.segments.clone(),
-                    grant: record.runs,
+                    grant: page.grant.clone(),
                     already: true,
-                });
+                };
+                if owed {
+                    drop(_g);
+                    out.grant = self.manager_extent_grant(id, 0).await?;
+                    log::info!(
+                        "meta volume {}: JoinAppender replay completed appender {id}'s \
+                         interrupted join — the grant its first join never minted",
+                        self.path.display()
+                    );
+                }
+                return Ok(out);
             }
             let live = entries
                 .iter()
@@ -3608,6 +3879,14 @@ impl KvMetaBackend {
                 )));
             }
             claimed.extend(ring_claimed);
+            // A predecessor incarnation's ring may have occupied these
+            // extents: zeroed before any page names them (`zero_extents`).
+            if let Err(e) = super::appender::zero_extents(&self.path, &segments).await {
+                for c in claimed {
+                    self.alloc.release_unpublished(c);
+                }
+                return Err(e);
+            }
             // The claims' deltas, durable before any page names the ring.
             let recs: Vec<(u8, Record)> = claimed
                 .iter()
@@ -3629,8 +3908,12 @@ impl KvMetaBackend {
             page.is_manager = false;
             page.home_volume = 0;
             page.segments = segments.clone();
-            page.head_hint = 0;
-            page.ledger_tail_seq = 0;
+            // The joiner's position space continues past this page's
+            // watermark and ring 0's head (the carve law — see
+            // `open_appender_regions`'s fresh-ring arm).
+            let start = page.head_hint.max(self.ring.core().head());
+            page.head_hint = start;
+            page.ledger_tail_seq = start;
             page.ckpt_seq = 0;
             page.grant.clear();
             page.slots.clear();
@@ -3640,6 +3923,8 @@ impl KvMetaBackend {
             }
             self.sync_device().await.map_err(KvError::Io)?;
             set.joins.fetch_add(1, Ordering::Relaxed);
+            set.appenders_known
+                .store((live + 1).max(set.regions.len() as u64), Ordering::Relaxed);
             log::info!(
                 "meta volume {}: JoinAppender — appender {id} (node {:#018x}, mount slot {:#x}) \
                  joined with a {ring_bytes}-byte ring in {} segment(s), term {}",
@@ -3651,24 +3936,18 @@ impl KvMetaBackend {
             );
             (id, dir_offsets[0], segments)
         };
+        if TEST_JOIN_HOLD_AFTER_PAGE.load(Ordering::Relaxed) {
+            return Err(KvError::Busy(format!(
+                "{}: TEST_JOIN_HOLD_AFTER_PAGE — the join failed after its page went Live and \
+                 before its initial grant",
+                self.path.display()
+            )));
+        }
         // The initial grant — its own control entry, outside the join's
         // critical section (the verb mutex is not reentrant).
         let (id, page_addr, ring_segments) = chosen;
+        // The grant writes the joiner's page with it.
         let grant = self.manager_extent_grant(id, 0).await?;
-        // The joiner's page names its grant (an in-process region did so
-        // inside the grant; a wire joiner's page is the manager's to write).
-        if set.region(id).is_none() {
-            let entries = read_directory(&self.path, &self.sb).await?;
-            if let Some(e) = entries.iter().find(|e| e.appender_id == id) {
-                if let Some(mut page) = e.page.clone() {
-                    page.grant = grant.clone();
-                    for off in e.dir_offsets {
-                        page.generation += 1;
-                        super::appender::write_page(&self.path, off, page.encode()?).await?;
-                    }
-                }
-            }
-        }
         Ok(JoinOutcome {
             appender_id: id,
             page_addr,
@@ -3676,6 +3955,32 @@ impl KvMetaBackend {
             grant,
             already: false,
         })
+    }
+
+    /// A WIRE joiner's page names its grant — the manager writes it (an
+    /// in-process region's page is written inside the grant itself).
+    async fn write_wire_joiner_page_grant(
+        &self,
+        appender_id: u32,
+        grant: &[super::appender::GrantRun],
+    ) -> std::result::Result<(), KvError> {
+        let Some(set) = self.appenders.as_ref() else {
+            return Ok(());
+        };
+        if set.region(appender_id).is_some() {
+            return Ok(());
+        }
+        let entries = super::appender::read_directory(&self.path, &self.sb).await?;
+        if let Some(e) = entries.iter().find(|e| e.appender_id == appender_id) {
+            if let Some(mut page) = e.page.clone() {
+                page.grant = grant.to_vec();
+                for off in e.dir_offsets {
+                    page.generation += 1;
+                    super::appender::write_page(&self.path, off, page.encode()?).await?;
+                }
+            }
+        }
+        Ok(())
     }
 
     /// The appender set (the manager service's gauge handle).
@@ -3710,10 +4015,15 @@ impl KvMetaBackend {
                     );
                 }
             }
-            let due = r.grant().refill_due();
+            // Due at 50 % consumption AND below the derived size (a
+            // remainder at or above it is answered verbatim by §5.3.5's
+            // idempotency — asking would only count a replay).
+            let due = {
+                let g = r.grant();
+                g.refill_due() && g.unclaimed() < self.grant_extents_for(set, r.id)
+            };
             if due && !super::appender::test_manager_unreachable() {
-                let want = self.grant_extents_for(set, r.id) as u32;
-                if let Err(e) = self.manager_extent_grant(r.id, want).await {
+                if let Err(e) = self.manager_extent_grant(r.id, 0).await {
                     log::warn!(
                         "meta volume {}: appender {}'s ExtentGrant refill deferred ({e})",
                         self.path.display(),
@@ -3801,6 +4111,15 @@ impl KvMetaBackend {
                 start: self.sb.heap.start + claimed[0] * node_size,
                 len: claimed.len() as u64 * node_size,
             };
+            // A predecessor ring may have occupied the new segment's
+            // extents: zeroed before the table names it (`zero_extents`).
+            if let Err(e) = super::appender::zero_extents(&self.path, &[extent]).await {
+                for c in claimed {
+                    self.alloc.release_unpublished(c);
+                }
+                r.end_growth();
+                return Err(e);
+            }
             let grown = match ring.grown_with(super::journal::RingSegment::from_extent(&extent)) {
                 Ok(g) => g,
                 Err(e) => {
@@ -4028,8 +4347,23 @@ impl KvMetaBackend {
                     page.segments = vec![super::appender::appender0_ring_extent(&self.sb.journal)];
                 } else {
                     // The grant's UNCLAIMED remainder (§5.3.3): recovery
-                    // reads it against tree 0's record for the claimed set.
-                    page.grant = r.grant().unclaimed_runs();
+                    // reads it against tree 0's record for the claimed
+                    // set, so the page names the WHOLE of it — a remainder
+                    // in more runs than the page carries moves its excess
+                    // to the returnable batch first (Issue 9), never a
+                    // truncation that recovery would read as claimed.
+                    let mut g = r.grant();
+                    let moved = g.trim_to_page_runs();
+                    if moved > 0 {
+                        log::debug!(
+                            "meta volume {}: appender {}'s unclaimed remainder exceeded the \
+                             page's {} runs — {moved} extent(s) moved to the returnable batch",
+                            self.path.display(),
+                            r.id,
+                            super::appender::GRANT_RUNS_MAX
+                        );
+                    }
+                    page.grant = g.unclaimed_runs();
                 }
                 page.slots = entries;
             }
@@ -9119,6 +9453,9 @@ impl KvMetaBackend {
 
     /// This mount's reservation key on the metadata namespace (0 on a
     /// non-PR substrate) — the holder key a registrant's report names.
+    /// First product caller: PR 4's joiner (it verifies the standing WERO
+    /// hold is the manager's before registering under it); the fence
+    /// contracts read it today.
     pub fn writer_guard_pr_key(&self) -> u64 {
         self.pr_key
     }
@@ -11005,6 +11342,7 @@ impl KvMetaBackend {
             vol0_unreachable: AtomicU64::new(0),
             verbs: Default::default(),
             cadence_last_ns: AtomicU64::new(0),
+            appenders_known: AtomicU64::new(0),
         };
         let mut regions: Vec<Arc<AppenderRegion>> = Vec::new();
 
@@ -11160,9 +11498,28 @@ impl KvMetaBackend {
                         super::appender::SYM_RING_KB_ENV
                     )));
                 }
+                // A predecessor incarnation's ring may have occupied these
+                // very extents: zeroed before the page names them, or its
+                // entries replay as this ring's (`zero_extents`).
+                if let Err(e) = super::appender::zero_extents(path, &extents).await {
+                    for e in claimed {
+                        alloc.release_unpublished(e);
+                    }
+                    return Err(e);
+                }
                 page.segments = extents;
-                page.head_hint = 0;
-                page.ledger_tail_seq = 0;
+                // The ring's position space CONTINUES: past the region's
+                // own watermark (the `Free` page's head — its predecessor
+                // incarnation's final head) and past ring 0's head, so
+                // every record this incarnation writes carries a seq above
+                // every durable record of the slots it leases (per-key
+                // LWW is by raw seq; a ring restarting at 0 replayed an
+                // acked release as resurrected). The cross-ring case — a
+                // lease moving between rings — is PR 4's globally
+                // monotone seq space.
+                let start = page.head_hint.max(ring0.core().head());
+                page.head_hint = start;
+                page.ledger_tail_seq = start;
                 let segs: Vec<RingSegment> = page
                     .segments
                     .iter()
@@ -11175,7 +11532,10 @@ impl KvMetaBackend {
                         })
                     })
                     .collect();
-                (JournalRing::new_segments(path, segs, reserve), false)
+                (
+                    JournalRing::new_segments_at(path, segs, reserve, start),
+                    false,
+                )
             };
             let first = page.segments.first().copied().unwrap_or(sb.journal);
             let page_offsets = page_slot_offsets(sb, id, entry.dir_offsets, &first);
@@ -11183,23 +11543,30 @@ impl KvMetaBackend {
             // a recovered ring the pair's images naming its table; for a
             // fresh ring none — the join's page write fills both slots.
             let dir_named = super::appender::dir_named_mask(&entry.dir_pages, &page.segments);
-            // The region's grant (§5.3.3): tree 0's record is the whole of
-            // it, the page names the unclaimed remainder; the ring
-            // window's alloc/free records refine both below.
-            let grant = if self_recovered {
-                let record = match forest
-                    .control()
-                    .lookup(&super::slot_state::extent_grant_key(id))
-                    .await?
-                {
-                    Some(v) => super::slot_state::ExtentGrantRecord::decode(&v)?,
-                    None => Default::default(),
-                };
-                super::appender::RegionGrant::recover(record.extents(), &page.grant)
-            } else {
+            // The region's grant (§5.3.3), recovered from tree 0 at EVERY
+            // open: the record is the whole of it, the page names the
+            // unclaimed remainder — a `Free` page (the clean leave
+            // returned the remainder) names none, so everything the record
+            // still names is a live image and lands CLAIMED, which is the
+            // truth. Before review round 1's Issue 1 a non-recovered open
+            // built an EMPTY grant against a record naming the region's
+            // live images, and every later retirement of a pre-remount
+            // image was dropped by `free_pending`'s claimed guard: never
+            // parked, never returned, invisible to C13 and to the closure
+            // gauge — the silent leak on the ordinary clean lifecycle. The
+            // ring window's alloc/free records refine both below.
+            if !self_recovered {
                 page.grant.clear();
-                super::appender::RegionGrant::default()
+            }
+            let record = match forest
+                .control()
+                .lookup(&super::slot_state::extent_grant_key(id))
+                .await?
+            {
+                Some(v) => super::slot_state::ExtentGrantRecord::decode(&v)?,
+                None => Default::default(),
             };
+            let grant = super::appender::RegionGrant::recover(record.extents(), &page.grant);
             regions.push(Arc::new(AppenderRegion {
                 id,
                 page_offsets,
@@ -13391,28 +13758,38 @@ impl KvMetaBackend {
                     continue;
                 }
                 // A leaf of a LEASED slot draws its lessee's GRANT, never
-                // the bitmap (§5.3.3): admitted while the grant covers
-                // the SMO; short of it with the manager unreachable the
-                // member refuses EAGAIN-class (`GrantExhausted` — the
-                // appender's dependency, counted); short of it with the
-                // manager live it is admitted — the cadence refills before
-                // the flush pass needs the extent, or that pass defers
-                // and counts the stall.
+                // the bitmap (§5.3.3): its promise rides the REGION's
+                // ledger (`grant_promised` — the leaf's dirty half is
+                // pointed at it, so the heap's claimable never carries a
+                // leased SMO's extents); admitted while the grant's
+                // headroom covers the SMO; short of it with the manager
+                // unreachable the member refuses EAGAIN-class
+                // (`GrantExhausted` — the appender's dependency, counted);
+                // short of it with the manager live it is admitted — the
+                // cadence refills before the flush pass needs the extent,
+                // or that pass defers and counts the stall. The
+                // reachability read is the test seam until PR 4's manager
+                // lease renewal carries the live signal
+                // (`ManagerLease::Peer` liveness) — its product successor.
                 if let Some(region) = lock_set[gi]
                     .forest_slot()
                     .map(|s| self.region_of_slot(s))
                     .filter(|id| *id != 0)
                     .and_then(|id| self.appenders().and_then(|a| a.region(id)))
                 {
-                    let unclaimed = region.grant().unclaimed();
-                    if unclaimed < delta && super::appender::test_manager_unreachable() {
+                    let (headroom, ledger) = {
+                        let g = region.grant();
+                        (g.headroom(), g.promise_ledger())
+                    };
+                    if headroom < delta && super::appender::test_manager_unreachable() {
                         region.dependency_stalls.fetch_add(1, Ordering::Relaxed);
                         verdict = Some(KvError::GrantExhausted {
                             appender: region.id,
-                            unclaimed,
+                            unclaimed: headroom,
                         });
                         break;
                     }
+                    guards[gi].set_promise_ledger(ledger);
                     guards[gi].promise(delta, fold);
                     taken.push((gi, delta, 0));
                     admitted_split |= is_split;

@@ -244,13 +244,18 @@ fn the_ram_grant_claims_lowest_first_parks_frees_on_its_tail_and_returns_past_it
     assert_eq!(g.advance_durable(500), 1);
     assert_eq!(g.take_returnable(), vec![100]);
     assert_eq!(g.returned, 1);
-    // The page names the unclaimed remainder as runs, ≤ GRANT_RUNS_MAX.
+    // The page names the WHOLE unclaimed remainder as runs; the page
+    // writer fits it to GRANT_RUNS_MAX by moving the excess to the
+    // returnable batch (Issue 9), never by truncating.
     assert_eq!(g.unclaimed_runs(), vec![GrantRun { start: 102, len: 2 }]);
     g.add_runs(&[GrantRun { start: 200, len: 1 }]);
     g.add_runs(&[GrantRun { start: 300, len: 1 }]);
     g.add_runs(&[GrantRun { start: 400, len: 1 }]);
     g.add_runs(&[GrantRun { start: 500, len: 1 }]);
+    assert_eq!(g.unclaimed_runs().len(), GRANT_RUNS_MAX + 1);
+    assert_eq!(g.trim_to_page_runs(), 1);
     assert_eq!(g.unclaimed_runs().len(), GRANT_RUNS_MAX);
+    assert_eq!(g.returnable(), 1);
     // Closure over every op so far: granted ≡ held + returned + unclaimed.
     assert_eq!(g.granted, g.held() + g.returned + g.unclaimed());
     // Recovery: the record's whole grant against the page's remainder.
@@ -745,14 +750,38 @@ async fn join_appender_over_the_wire_allocates_a_page_ring_and_grant_and_replays
          box — scoping)",
         s.manager_service_ns, s.manager_verbs
     );
-    // ExtentGrant / ReturnExtents for the wire joiner: granted, returned,
-    // returned again ⇒ already.
+    // ExtentGrant / ReturnExtents for the wire joiner: an unconsumed
+    // remainder covering the ask is answered VERBATIM (§5.3.5, Issue 4 —
+    // the join's grant, read off the joiner's page), returned, returned
+    // again ⇒ already; with the remainder gone a fresh ask CARVES exactly
+    // the (cap-clamped) want, and the joiner's page names it.
     let more = client.extent_grant(2, 4).await.unwrap();
-    assert_eq!(more.iter().map(|r| u64::from(r.len)).sum::<u64>(), 4);
+    assert_eq!(
+        more.iter().map(|r| (r.start, r.len)).collect::<Vec<_>>(),
+        grant,
+        "the unconsumed join grant, verbatim"
+    );
+    let n = more.iter().map(|r| u64::from(r.len)).sum::<u64>();
     let (cleared, already) = client.return_extents(2, &more).await.unwrap();
-    assert_eq!((cleared, already), (4, 0));
+    assert_eq!((cleared, already), (n, 0));
+    let page = read_directory(path, &sb).await.unwrap()[2]
+        .page
+        .clone()
+        .expect("the joiner's page");
+    assert!(
+        page.grant.is_empty(),
+        "the return rewrote the wire joiner's page remainder: {:?}",
+        page.grant
+    );
     let (cleared, already) = client.return_extents(2, &more).await.unwrap();
-    assert_eq!((cleared, already), (0, 4));
+    assert_eq!((cleared, already), (0, n));
+    let fresh = client.extent_grant(2, 4).await.unwrap();
+    assert_eq!(fresh.iter().map(|r| u64::from(r.len)).sum::<u64>(), 4);
+    let page = read_directory(path, &sb).await.unwrap()[2]
+        .page
+        .clone()
+        .expect("the joiner's page");
+    assert_eq!(page.grant, fresh, "the joiner's page names the fresh grant");
     // The manager takes no grant over the wire either.
     assert!(client.extent_grant(0, 1).await.is_err());
     assert_eq!(stats(&vol).manager_verb_refusals, 1);
@@ -1451,6 +1480,10 @@ async fn a_clean_remount_recovers_the_grant_from_tree_zero_and_pre_remount_image
         1
     );
     let planted = extent_of(&va, tree.root().addr);
+    assert!(
+        va.extent_grant_record(1).await.unwrap().contains(planted),
+        "the successor was claimed INSIDE appender 1's grant"
+    );
     drop(va);
     drop(ra);
     let ra = open_with_partition(&uris, Some(PARTITION)).await;
@@ -1472,13 +1505,15 @@ async fn a_clean_remount_recovers_the_grant_from_tree_zero_and_pre_remount_image
 }
 
 /// Issue 2: a wire integer is never an allocation authority. A
-/// `ReturnExtents` run past the volume's extents, one that overflows, or
-/// one naming more extents than the caller's whole record is REJECTED
-/// before any expansion (`manager_verb_rejected` — the wire-invalid
-/// class, kept apart from the durable-witness `manager_verb_refusals`
-/// must-stay-0); a run inside the record returns only its intersection;
-/// an explicit `ExtentGrant { want }` is clamped to the derivation's cap
-/// and never carves the free heap.
+/// `ReturnExtents` run past the volume's extents or one that overflows
+/// is REJECTED before any expansion (`manager_verb_rejected` — the
+/// wire-invalid class, kept apart from the durable-witness
+/// `manager_verb_refusals` must-stay-0); a geometrically valid run is
+/// intersected with the record as intervals, so the materialized list is
+/// bounded by the record and never by the frame (a run over the WHOLE
+/// volume clears the caller's record and answers the rest `already`); an
+/// explicit `ExtentGrant { want }` is clamped to the derivation's cap and
+/// never carves the free heap.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn wire_integers_are_never_allocation_authority() {
     let dir = tempfile::tempdir().unwrap();
@@ -1488,7 +1523,8 @@ async fn wire_integers_are_never_allocation_authority() {
     let vol = Arc::clone(&routed.volumes[0]);
     let total = vol.allocator().total_extents();
     let free_before = vol.free_extents();
-    // Past the volume, overflowing, and wider than the record: rejected.
+    // Past the volume, overflowing: rejected before anything proportional
+    // to the wire integer happens.
     for runs in [
         vec![GrantRun {
             start: 0,
@@ -1502,16 +1538,6 @@ async fn wire_integers_are_never_allocation_authority() {
             start: total,
             len: 1,
         }],
-        vec![
-            GrantRun {
-                start: 0,
-                len: (total / 2) as u32,
-            },
-            GrantRun {
-                start: total / 2,
-                len: (total - total / 2) as u32,
-            },
-        ],
     ] {
         let err = vol
             .manager_return_runs(1, &runs)
@@ -1524,8 +1550,8 @@ async fn wire_integers_are_never_allocation_authority() {
     }
     let s = stats(&vol);
     assert_eq!(
-        s.manager_verb_rejected, 4,
-        "four wire-invalid frames rejected"
+        s.manager_verb_rejected, 3,
+        "three wire-invalid frames rejected"
     );
     assert_eq!(
         s.manager_verb_refusals, 0,
@@ -1546,20 +1572,49 @@ async fn wire_integers_are_never_allocation_authority() {
         .await
         .unwrap();
     assert_eq!((cleared, already), (1, 0));
-    // An explicit `want` past the cap is clamped: the grant never carves
-    // more than the derivation's cap, never the free heap.
+    // Every extent of the volume, in two geometrically valid runs: the
+    // intersection with the record is materialized (bounded by the
+    // record, never by the frame — here appender 1's unclaimed remainder,
+    // which returns), the rest is `already`; nothing outside the record
+    // is touched.
+    let record = vol.extent_grant_record(1).await.unwrap();
+    let n = record.len();
     let free_before = vol.free_extents();
-    let granted = vol.manager_extent_grant(1, u32::MAX).await.unwrap();
-    let n: u64 = granted.iter().map(|r| u64::from(r.len)).sum();
+    let (cleared, already) = vol
+        .manager_return_runs(
+            1,
+            &[
+                GrantRun {
+                    start: 0,
+                    len: (total / 2) as u32,
+                },
+                GrantRun {
+                    start: total / 2,
+                    len: (total - total / 2) as u32,
+                },
+            ],
+        )
+        .await
+        .unwrap();
+    assert_eq!((cleared, already), (n, total - n));
+    assert_eq!(vol.free_extents(), free_before + n);
+    assert!(vol.extent_grant_record(1).await.unwrap().is_empty());
+    // An explicit `want` past the cap is clamped: the grant never CARVES
+    // more than the derivation's cap, never the free heap (the reply may
+    // be larger — it names the whole remainder, §5.3.5).
+    let free_before = vol.free_extents();
     let cap = resolve_grant_extents(
         0,
         stats(&vol).failover_bound_ms,
         free_before,
         stats(&vol).appenders_known,
     );
+    let granted = vol.manager_extent_grant(1, u32::MAX).await.unwrap();
+    assert!(!granted.is_empty());
+    let carved = free_before - vol.free_extents();
     assert!(
-        n <= cap.max(GRANT_EXTENTS_FLOOR),
-        "want = u32::MAX carved {n} extents — past the derivation's cap {cap}"
+        carved <= cap.max(GRANT_EXTENTS_FLOOR),
+        "want = u32::MAX carved {carved} extents — past the derivation's cap {cap}"
     );
     assert!(
         vol.free_extents() >= free_before - cap.max(GRANT_EXTENTS_FLOOR),
@@ -1586,10 +1641,11 @@ async fn wire_integers_are_never_allocation_authority() {
         .await
         .expect_err("rejected over the wire");
     assert!(err.to_string().contains("rejected"), "{err}");
+    let free_before = vol.free_extents();
     let granted = client.extent_grant(1, u32::MAX).await.unwrap();
-    let n: u64 = granted.iter().map(|r| u64::from(r.len)).sum();
-    assert!(n <= cap.max(GRANT_EXTENTS_FLOOR));
-    assert_eq!(stats(&vol).manager_verb_rejected, 5);
+    assert!(!granted.is_empty());
+    assert!(free_before - vol.free_extents() <= cap.max(GRANT_EXTENTS_FLOOR));
+    assert_eq!(stats(&vol).manager_verb_rejected, 4);
     host.shutdown();
     for v in &routed.volumes {
         v.shutdown().await.unwrap();
@@ -1732,6 +1788,15 @@ async fn a_full_heap_on_a_leased_slot_is_the_space_class_not_a_manager_stall() {
     let uris = vec![format_stamped_member(dir.path(), "meta0").await];
     let routed = open_with_partition(&uris, Some(PARTITION)).await;
     let vol = Arc::clone(&routed.volumes[0]);
+    // Appender 1 returns its unconsumed initial grant first — §5.3.5's
+    // idempotency would otherwise answer that remainder verbatim, and the
+    // contract here is the CARVE's answer on a full heap.
+    let remainder = vol.appenders_public().unwrap().regions[1]
+        .grant()
+        .unclaimed_runs();
+    assert!(!remainder.is_empty());
+    vol.manager_return_runs(1, &remainder).await.unwrap();
+    assert_eq!(stats(&vol).regions[1].grant_unclaimed, 0);
     // Drain the USER-claimable heap through the manager's own claimer.
     let mut drained = Vec::new();
     loop {
@@ -1854,17 +1919,24 @@ async fn a_leased_leafs_promise_rides_the_grant_not_the_heap() {
     );
     assert_eq!(va.heap_promised(), heap_promised_before);
     assert_grant_closure(&s);
-    // The arithmetic, on the RAM grant itself: a promise reserves
-    // headroom, a claim consumes it, a retraction returns it.
+    // The arithmetic, on the RAM grant itself — the heap ledger's
+    // lifecycle verbatim: a promise reserves headroom, the SMO's claim
+    // draws the remainder (the promise stands until the SMO takes the
+    // overlay and its node RELEASES it), a retraction / release returns
+    // it.
     let mut g = RegionGrant::default();
     g.add_runs(&[GrantRun { start: 0, len: 4 }]);
     assert_eq!(g.headroom(), 4);
     g.promise(3);
     assert_eq!((g.promised(), g.headroom()), (3, 1));
-    assert_eq!(g.claim_promised(), Some(0));
-    assert_eq!((g.promised(), g.headroom()), (2, 1));
-    g.retract_promise(2);
+    assert_eq!(g.claim(), Some(0));
+    assert_eq!((g.promised(), g.headroom()), (3, 0));
+    g.retract_promise(3);
     assert_eq!((g.promised(), g.headroom()), (0, 3));
+    // The shared ledger: a node pointed at it promises HERE.
+    let ledger = g.promise_ledger();
+    ledger.fetch_add(2, Ordering::AcqRel);
+    assert_eq!((g.promised(), g.headroom()), (2, 1));
     for v in &ra.volumes {
         v.shutdown().await.unwrap();
     }

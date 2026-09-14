@@ -1155,7 +1155,7 @@ pub fn join_wero_as_registrant(data_paths: &[PathBuf]) -> Result<WeroRegistrantJ
             }
         };
         crate::meta_backend::reservation::note_report_gauge(
-            &path.display().to_string(),
+            path,
             report.regctl(),
             client.report_bytes(),
         );

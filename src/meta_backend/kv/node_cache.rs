@@ -1310,6 +1310,27 @@ impl NodeDirty {
         self.promise_added = 0;
     }
 
+    /// Point this node's promises at `ledger` — a LEASED slot's leaf
+    /// promises against its lessee's extent GRANT
+    /// (`RegionGrant::promise_ledger`), never the heap's `heap_promised`:
+    /// its SMO draws the grant, so a heap promise was a transient
+    /// over-count on the manager's claimable (design-symmetric-metadata
+    /// §5.3.3; review round 1, Issue 10). An outstanding promise moves
+    /// with the pointer, so `promise` / `retract` / `release` stay exact
+    /// on both counters. Under the node's write lock, like every promise
+    /// mutation.
+    pub fn set_promise_ledger(&mut self, ledger: Arc<AtomicU64>) {
+        if Arc::ptr_eq(&self.heap_promised, &ledger) {
+            return;
+        }
+        if self.promised > 0 {
+            self.heap_promised
+                .fetch_sub(self.promised, Ordering::AcqRel);
+            ledger.fetch_add(self.promised, Ordering::AcqRel);
+        }
+        self.heap_promised = ledger;
+    }
+
     /// Promise `extents` more to this node's next SMO, computed for a fold
     /// of `basis` bytes — the caller checked the budget against the ledger
     /// under this node's write lock.

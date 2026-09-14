@@ -63,6 +63,13 @@ pub const STATUS_NOT_MANAGER: u16 = super::wire::STATUS_NOT_OWNER;
 /// Frame status: the verb's durable witness contradicts the caller
 /// (`manager_verb_refusals` — must-stay-0).
 pub const STATUS_REFUSED: u16 = 48;
+/// Frame status: the frame's wire integers name what the durable state
+/// cannot (a run outside the volume, wider than the caller's record, an
+/// overflowing length) — REJECTED at the service edge before any
+/// allocation proportional to them (`manager_verb_rejected`, the
+/// buggy/hostile-peer class; review round 1 Issue 2). The body is still
+/// a [`ManagerReplyFrame`] carrying [`ManagerReply::Refused`].
+pub const STATUS_REJECTED: u16 = 49;
 
 /// The KD-MW-2 appender identity on the wire.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -291,6 +298,14 @@ impl ManagerService {
         };
         let admit_ns = t_admit.elapsed().as_nanos() as u64;
         let t_execute = Instant::now();
+        // Every executor validates the frame's integers against DURABLE
+        // state before anything proportional to them is allocated
+        // (`want` clamped to the derivation's cap; return runs checked
+        // against the volume and the caller's record run by run) —
+        // "bounded codec = bounded execution" (Issue 2). A rejection is
+        // its own status so the peer can tell its own defect from a
+        // witness refusal.
+        let mut rejected = false;
         let (reply, refusal) = match &frame.call {
             ManagerCall::JoinAppender {
                 identity,
@@ -340,22 +355,25 @@ impl ManagerService {
                 }
             }
             ManagerCall::ReturnExtents { appender_id, runs } => {
-                let extents: Vec<u64> = runs_from_wire(runs)
-                    .iter()
-                    .flat_map(|r| r.start..r.start + u64::from(r.len))
-                    .collect();
+                // The runs travel as RUNS: the executor intersects them
+                // with the record run by run; the only allocation
+                // proportional to the frame here is the run list itself,
+                // bounded by the frame cap.
                 match self
                     .volume
-                    .manager_return_extents(*appender_id, &extents)
+                    .manager_return_runs(*appender_id, &runs_from_wire(runs))
                     .await
                 {
                     Ok((cleared, already)) => (ManagerReply::Returned { cleared, already }, false),
-                    Err(e) => (
-                        ManagerReply::Refused {
-                            reason: e.to_string(),
-                        },
-                        true,
-                    ),
+                    Err(e) => {
+                        rejected = matches!(e, crate::meta_backend::kv::KvError::Rejected(_));
+                        (
+                            ManagerReply::Refused {
+                                reason: e.to_string(),
+                            },
+                            true,
+                        )
+                    }
                 }
             }
         };
@@ -381,11 +399,23 @@ impl ManagerService {
             frame.call.name(),
             frame.request_id,
             (admit_ns + execute_ns + reply_ns) / 1000,
-            if refusal { " — REFUSED" } else { "" }
+            if rejected {
+                " — REJECTED"
+            } else if refusal {
+                " — REFUSED"
+            } else {
+                ""
+            }
         );
         RpcResponse {
             id: req.id,
-            status: if refusal { STATUS_REFUSED } else { STATUS_OK },
+            status: if rejected {
+                STATUS_REJECTED
+            } else if refusal {
+                STATUS_REFUSED
+            } else {
+                STATUS_OK
+            },
             body,
         }
     }
@@ -402,7 +432,9 @@ impl RpcAsyncService for ManagerService {
 
 /// The client half: one authenticated session to a manager's endpoint,
 /// one call per verb. The S8 `RpcClient` underneath — the same dial, the
-/// same proof of storage membership, the same per-frame MAC.
+/// same proof of storage membership, the same per-frame MAC. First
+/// product caller: PR 4's mount-path joiner (a co-appender's open dials
+/// the manager and joins); the contract suite drives it today.
 pub struct ManagerClient {
     rpc: RpcClient,
     next_request: u64,
@@ -438,7 +470,7 @@ impl ManagerClient {
         })?;
         let resp = self.rpc.call(VERB_MANAGER_CALL, body).await?;
         match resp.status {
-            STATUS_OK | STATUS_REFUSED => {}
+            STATUS_OK | STATUS_REFUSED | STATUS_REJECTED => {}
             other => {
                 return Err(SqueezefsError::InvalidOperation(format!(
                     "manager refused the frame with status {other}: {}",
@@ -511,7 +543,9 @@ impl ManagerClient {
     }
 }
 
-/// The ring segments a `Joined` reply names, as extents.
+/// The ring segments a `Joined` reply names, as extents — what PR 4's
+/// joiner builds its `JournalRing` from (first product caller); the
+/// contract suite's reader today.
 pub fn joined_segments(reply: &ManagerReply) -> Vec<ExtentRef> {
     match reply {
         ManagerReply::Joined { ring_segments, .. } => ring_segments

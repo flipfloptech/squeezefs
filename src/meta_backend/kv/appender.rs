@@ -887,10 +887,68 @@ pub fn manager_failover_bound_ms(stale_ttl_secs: u64, ladder_ms: u64, replay_ms:
 
 /// The §5.5.2 vol-0 rule: a manager that cannot read volume 0's ledger for
 /// longer than `T_owner` RELEASES its manager role rather than act on a
-/// stale death ledger. The decision, as one function (PR 8/10 wire the
-/// roles; the gauge `manager_vol0_unreachable` counts the releases).
+/// stale death ledger. The decision, as one function — first product
+/// caller: PR 8/10's role driver (the gauge `manager_vol0_unreachable`
+/// counts the releases); the derivation tie test is its consumer today.
 pub fn manager_should_release_role(unreachable_for_ms: u64, t_owner_ms: u64) -> bool {
     unreachable_for_ms > t_owner_ms
+}
+
+/// The service-edge validation of a wire `ReturnExtents` (review round 1,
+/// Issue 2 — "bounded codec = bounded execution"): every run must lie
+/// inside the volume's `total_extents` and `start + len` must not
+/// overflow; the first offending run is the rejection, else the number of
+/// extents the runs NAME (saturating — a count for the reply, never a
+/// capacity). Pure over the integers: nothing here allocates
+/// proportional to them (fuzzed by `manager_call_frame`, mirrored in
+/// `decoder_property_tests`).
+pub fn validate_return_runs(runs: &[GrantRun], total_extents: u64) -> Result<u64, GrantRun> {
+    let mut named: u64 = 0;
+    for r in runs {
+        match r.start.checked_add(u64::from(r.len)) {
+            Some(end) if end <= total_extents => {}
+            _ => return Err(*r),
+        }
+        named = named.saturating_add(u64::from(r.len));
+    }
+    Ok(named)
+}
+
+/// The extents `runs` name INSIDE `record`, as an ascending deduplicated
+/// list — computed as interval intersections (O(runs × record runs)), so
+/// the list is bounded by the record's extent count, never by the frame's
+/// integers.
+pub fn intersect_runs_with_record(
+    runs: &[GrantRun],
+    record: &super::slot_state::ExtentGrantRecord,
+) -> Vec<u64> {
+    let mut extents: Vec<u64> = Vec::new();
+    for r in runs {
+        let Some(re) = r.start.checked_add(u64::from(r.len)) else {
+            continue;
+        };
+        for g in &record.runs {
+            let ge = g.start + u64::from(g.len);
+            let (s, e) = (r.start.max(g.start), re.min(ge));
+            if s < e {
+                extents.extend(s..e);
+            }
+        }
+    }
+    extents.sort_unstable();
+    extents.dedup();
+    extents
+}
+
+/// The extents a wire `ExtentGrant { want }` may CARVE: `want == 0` is the
+/// derived size `cap`; an explicit want is clamped to it — a wire integer
+/// is never an allocation authority.
+pub fn clamp_grant_want(want: u32, cap: u64) -> u64 {
+    if want == 0 {
+        cap
+    } else {
+        u64::from(want).min(cap)
+    }
 }
 
 /// One region's extent grant in RAM (§5.3.3): the manager carved it, the
@@ -914,6 +972,16 @@ pub struct RegionGrant {
     /// The unclaimed count at the last refill decision — the 50 % law's
     /// reference (`granted_since_refill`).
     pub refill_reference: u64,
+    /// Extents the §4.7 heap admission PROMISED against this grant for
+    /// the SMOs a leased slot's leaves will need (review round 1, Issue
+    /// 10): a leased leaf's SMO draws the GRANT, never the bitmap, so its
+    /// promise reserves grant headroom — `headroom() = unclaimed −
+    /// promised`. The ledger is SHARED with the region's leaves' dirty
+    /// halves ([`Self::promise_ledger`] → `NodeDirty::set_promise_ledger`)
+    /// so a leased leaf's promise lifecycle is the heap's verbatim —
+    /// promised at admission, released when its SMO takes the overlay or
+    /// the promise is retracted — on this counter instead of the heap's.
+    promised: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl RegionGrant {
@@ -1058,9 +1126,9 @@ impl RegionGrant {
         self.returnable.extend(extents);
     }
 
-    /// The unclaimed remainder as page runs (≤ [`GRANT_RUNS_MAX`],
-    /// ascending; a remainder in more runs than the page names keeps its
-    /// lowest runs — the rest are recovered as fsck C13 candidates).
+    /// The unclaimed remainder as ascending runs — the WHOLE remainder;
+    /// the page writer calls [`Self::trim_to_page_runs`] first so the
+    /// page names every unclaimed extent (review round 1, Issue 9).
     pub fn unclaimed_runs(&self) -> Vec<GrantRun> {
         let mut runs: Vec<GrantRun> = Vec::new();
         for &e in &self.unclaimed {
@@ -1069,8 +1137,99 @@ impl RegionGrant {
                 _ => runs.push(GrantRun { start: e, len: 1 }),
             }
         }
-        runs.truncate(GRANT_RUNS_MAX);
         runs
+    }
+
+    /// Fit the unclaimed remainder to the page's [`GRANT_RUNS_MAX`] runs
+    /// WITHOUT truncating it: the largest runs stay unclaimed, every
+    /// extent of the rest moves to the returnable batch (the cadence
+    /// returns them; a crash-class open recovers exactly the page's
+    /// remainder as unclaimed and the returned extents are back in the
+    /// heap — never a two-cycle C13 round trip over legitimately
+    /// unclaimed extents). Returns how many extents moved.
+    pub fn trim_to_page_runs(&mut self) -> u64 {
+        let runs = self.unclaimed_runs();
+        if runs.len() <= GRANT_RUNS_MAX {
+            return 0;
+        }
+        // Largest first; ties keep the lowest run (a stable sort on a
+        // sequence that is ascending by start).
+        let mut by_len: Vec<&GrantRun> = runs.iter().collect();
+        by_len.sort_by(|a, b| b.len.cmp(&a.len));
+        let mut moved = 0u64;
+        for r in &by_len[GRANT_RUNS_MAX..] {
+            for e in r.start..r.start + u64::from(r.len) {
+                if self.unclaimed.remove(&e) {
+                    self.returnable.push(e);
+                    moved += 1;
+                }
+            }
+        }
+        // The 50 % law's reference follows the remainder it measures.
+        self.refill_reference = self.refill_reference.saturating_sub(moved);
+        moved
+    }
+
+    /// Grant headroom the §4.7 admission may promise against: the
+    /// unclaimed remainder less what earlier admissions already promised
+    /// (review round 1, Issue 10 — a leased leaf's SMO draws THIS grant,
+    /// never the heap ledger).
+    pub fn headroom(&self) -> u64 {
+        self.unclaimed().saturating_sub(self.promised())
+    }
+
+    /// Promise `n` extents of the headroom to admitted-but-unflushed
+    /// SMOs of this region's leaves (the leaves' dirty halves do this
+    /// through the shared ledger in product code).
+    pub fn promise(&self, n: u64) {
+        self.promised
+            .fetch_add(n, std::sync::atomic::Ordering::AcqRel);
+    }
+
+    /// Extents currently promised (`grant_promised`; 0 at quiesce).
+    pub fn promised(&self) -> u64 {
+        self.promised.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Retract `n` promises (a refused member, a node that flushed
+    /// without the SMO its admission projected).
+    pub fn retract_promise(&self, n: u64) {
+        let _ = self.promised.fetch_update(
+            std::sync::atomic::Ordering::AcqRel,
+            std::sync::atomic::Ordering::Acquire,
+            |cur| Some(cur.saturating_sub(n)),
+        );
+    }
+
+    /// The promise ledger a leased leaf's dirty half is pointed at
+    /// (`NodeDirty::set_promise_ledger`): its `promise` / `retract` /
+    /// `release` land here instead of on the heap's `heap_promised`.
+    pub fn promise_ledger(&self) -> std::sync::Arc<std::sync::atomic::AtomicU64> {
+        std::sync::Arc::clone(&self.promised)
+    }
+
+    /// Drop `extent` from every set that is not a live image: a
+    /// `ReturnExtents` of an extent an in-process region's RAM grant still
+    /// holds (review round 1, Issue 11) — the bitmap and the RAM grant
+    /// must not disagree, or a later `claim()` hands out an extent the
+    /// manager re-granted. `Err(())` when the extent is CLAIMED (it holds
+    /// an image); `Ok(true)` when it was dropped, `Ok(false)` when no set
+    /// held it.
+    pub fn drop_returned(&mut self, extent: u64) -> std::result::Result<bool, ()> {
+        if self.claimed.contains(&extent) {
+            return Err(());
+        }
+        let mut dropped = self.unclaimed.remove(&extent);
+        let before = self.pending.len();
+        self.pending.retain(|(e, _)| *e != extent);
+        dropped |= self.pending.len() != before;
+        let before = self.returnable.len();
+        self.returnable.retain(|e| *e != extent);
+        dropped |= self.returnable.len() != before;
+        if dropped {
+            self.returned += 1;
+        }
+        Ok(dropped)
     }
 
     pub fn unclaimed(&self) -> u64 {
@@ -1096,7 +1255,9 @@ impl RegionGrant {
         self.claimed() + self.pending() + self.returnable()
     }
 
-    /// Whether `extent` is this grant's — claimed, unclaimed or parked.
+    /// Whether `extent` is this grant's — claimed, unclaimed, parked or
+    /// returnable (`KvMetaBackend::grant_holds`, the durable-vs-RAM law's
+    /// probe).
     pub fn contains(&self, extent: u64) -> bool {
         self.claimed.contains(&extent)
             || self.unclaimed.contains(&extent)
@@ -1127,6 +1288,38 @@ pub async fn read_page(path: &Path, offset: u64) -> Result<Vec<u8>, KvError> {
 /// Write one page image at `offset`.
 pub async fn write_page(path: &Path, offset: u64, img: Vec<u8>) -> Result<(), KvError> {
     crate::uring_fs::write_at(path, offset, bytes::Bytes::from(img)).await?;
+    Ok(())
+}
+
+/// ZERO the extents a ring is carved from, BEFORE any page names them
+/// (PR 3 review round 2; the ring carve's law): the heap hands a fresh
+/// ring — a rejoin's, a wire join's, a growth segment — the extents a
+/// predecessor incarnation's ring occupied, lowest-free-first, with that
+/// ring's entries still on the device, checksummed, at lap 0 like the new
+/// ring's own. The §4.1 replay chain of the new incarnation then walks
+/// past its own head into them: a predecessor's `+ref` at a higher
+/// position out-votes this mount's acked release (per-key LWW by ring
+/// position — an acked delete undone), a predecessor's `free(extent)`
+/// folds into the grant and is RETURNED (a live image's bit cleared). A
+/// zeroed page verifies nothing and replays to nothing, so a carved ring
+/// replays exactly what its own incarnation wrote. One sequential write
+/// per extent in `ZERO_CHUNK` pieces (the ring floor is 512 KiB; the
+/// ceiling the solo ring's) — a control-plane act at the carve, never on
+/// a hot path.
+pub async fn zero_extents(
+    path: &Path,
+    extents: &[super::superblock::ExtentRef],
+) -> Result<(), KvError> {
+    const ZERO_CHUNK: u64 = 4 * 1024 * 1024;
+    let zeros = bytes::Bytes::from(vec![0u8; ZERO_CHUNK as usize]);
+    for ext in extents {
+        let mut off = ext.start;
+        while off < ext.end() {
+            let n = (ext.end() - off).min(ZERO_CHUNK);
+            crate::uring_fs::write_at(path, off, zeros.slice(..n as usize)).await?;
+            off += n;
+        }
+    }
     Ok(())
 }
 
@@ -1599,6 +1792,11 @@ pub struct AppenderSet {
     /// CLOCK_MONOTONIC ns of the last grant-cadence pass (the SMO-rate
     /// EWMA's cycle wall); 0 = none yet.
     pub cadence_last_ns: std::sync::atomic::AtomicU64,
+    /// `appenders_known`: the directory's `Live` count as this manager
+    /// last read it — in-process regions AND wire joiners — the appender
+    /// count the grant cap divides the free heap by (review round 1,
+    /// Issue 12). Set at open, raised by a join.
+    pub appenders_known: std::sync::atomic::AtomicU64,
 }
 
 /// Test seam: the manager is UNREACHABLE — the grant cadence issues no
@@ -1621,13 +1819,19 @@ pub fn test_manager_unreachable() -> bool {
 /// The manager's verb ledger (§5.3.5 / §11 "Manager family"): every verb
 /// answered, the replays answered from DURABLE state (`already`), the
 /// refusals (a verb whose durable witness contradicts the caller —
-/// must-stay-0), and the exact-sum service phases `admit / execute /
-/// reply / total` with the wall the load percentage is measured against.
+/// must-stay-0), the REJECTIONS (a frame whose wire integers name what
+/// the durable state cannot — a run past the volume, wider than the
+/// caller's record, an overflowing length: a buggy or hostile peer, kept
+/// apart from the witness class so `manager_verb_refusals` keeps its
+/// must-stay-0 meaning; review round 1, Issue 2), and the exact-sum
+/// service phases `admit / execute / reply / total` with the wall the
+/// load percentage is measured against.
 #[derive(Debug, Default)]
 pub struct ManagerVerbLedger {
     pub verbs: std::sync::atomic::AtomicU64,
     pub replays: std::sync::atomic::AtomicU64,
     pub refusals: std::sync::atomic::AtomicU64,
+    pub rejected: std::sync::atomic::AtomicU64,
     pub admit_ns: std::sync::atomic::AtomicU64,
     pub execute_ns: std::sync::atomic::AtomicU64,
     pub reply_ns: std::sync::atomic::AtomicU64,
@@ -1850,6 +2054,8 @@ impl AppenderSet {
             manager_verbs: self.verbs.verbs.load(Relaxed),
             manager_verb_replays: self.verbs.replays.load(Relaxed),
             manager_verb_refusals: self.verbs.refusals.load(Relaxed),
+            manager_verb_rejected: self.verbs.rejected.load(Relaxed),
+            appenders_known: self.appenders_known.load(Relaxed),
             manager_verbs_per_s: self.verbs.verbs_per_s(),
             manager_load_pct: self.verbs.load_pct(now_ns),
             manager_service_ns: [
@@ -1877,6 +2083,8 @@ impl AppenderSet {
                         grant_unclaimed: grant.unclaimed(),
                         grant_claimed: grant.claimed(),
                         grant_pending: grant.pending(),
+                        grant_returnable: grant.returnable(),
+                        grant_promised: grant.promised(),
                         smo_ewma_milli: r.smo_ewma_milli.load(Relaxed),
                         dependency_stalls: r.dependency_stalls.load(Relaxed),
                     }
@@ -1905,6 +2113,11 @@ pub struct AppenderRegionStats {
     pub grant_unclaimed: u64,
     pub grant_claimed: u64,
     pub grant_pending: u64,
+    /// Releases the tail covered, awaiting the cadence's return.
+    pub grant_returnable: u64,
+    /// Extents the §4.7 admission promised against the grant for
+    /// admitted-but-unflushed SMOs of this region's leaves (0 at quiesce).
+    pub grant_promised: u64,
     /// The region's SMO rate EWMA (milli-SMOs/s).
     pub smo_ewma_milli: u64,
     pub dependency_stalls: u64,
@@ -1950,6 +2163,12 @@ pub struct AppenderStats {
     pub manager_verbs: u64,
     pub manager_verb_replays: u64,
     pub manager_verb_refusals: u64,
+    /// Wire-invalid frames rejected before any allocation
+    /// (`manager_verb_rejected` — the buggy/hostile-peer class).
+    pub manager_verb_rejected: u64,
+    /// The directory's `Live` count as last read (`appenders_known`) —
+    /// the grant cap's appender term.
+    pub appenders_known: u64,
     pub manager_verbs_per_s: u64,
     pub manager_load_pct: u64,
     /// `admit / execute / reply / total` ns, exact-sum.

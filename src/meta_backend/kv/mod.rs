@@ -889,6 +889,15 @@ pub enum KvError {
     )]
     GrantExhausted { appender: u32, unclaimed: u64 },
 
+    /// A manager verb REJECTED at the service edge (design-symmetric-
+    /// metadata §5.3.5; review round 1 Issue 2): a wire-carried integer
+    /// names what the durable state cannot — a return run outside the
+    /// volume, wider than the caller's record, an overflowing length.
+    /// The buggy/hostile-peer class (`manager_verb_rejected`), kept apart
+    /// from the witness refusals (`manager_verb_refusals`, must-stay-0).
+    #[error("{0}")]
+    Rejected(String),
+
     /// The checkpoint-task ring reserve could not admit an SMO's records
     /// right now (§4.4 pt 5): the caller (the per-volume checkpoint task
     /// — the only SMO driver) must run a **minimal drain** (barrier +
@@ -952,6 +961,9 @@ impl From<KvError> for crate::error::SqueezefsError {
             e @ KvError::GrantExhausted { .. } => {
                 E::refused(libc::EAGAIN, format!("kv metadata: {e}"))
             }
+            // A wire-invalid manager frame: the caller's argument is the
+            // defect — EINVAL.
+            e @ KvError::Rejected(_) => E::refused(libc::EINVAL, format!("kv metadata: {e}")),
             other => E::InvalidOperation(format!("kv metadata: {other}")),
         }
     }

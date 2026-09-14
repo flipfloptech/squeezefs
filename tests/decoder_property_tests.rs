@@ -774,6 +774,59 @@ proptest! {
         }
     }
 
+    /// Review round 1, Issue 2 — "bounded codec = bounded EXECUTION": a
+    /// decoded integer is never an allocation authority at the manager's
+    /// service edge either. Over arbitrary `ReturnExtents` runs and an
+    /// arbitrary volume size, the validator rejects exactly the runs that
+    /// overflow or lie outside the volume (touching nothing else), the
+    /// record intersection materializes at most the RECORD's extents
+    /// whatever the runs name (every one inside the record), and an
+    /// explicit `ExtentGrant { want }` is clamped to the derivation's cap.
+    #[test]
+    fn manager_service_edge_is_bounded_by_durable_state(
+        runs in prop::collection::vec((any::<u64>(), any::<u32>()), 0..16),
+        total in 1u64..(1 << 40),
+        record_seed in prop::collection::vec(0u64..(1 << 16), 0..64),
+        want in any::<u32>(),
+        cap in 8u64..(1 << 32),
+    ) {
+        use squeezefs::meta_backend::kv::appender::{
+            clamp_grant_want, intersect_runs_with_record, validate_return_runs, GrantRun,
+        };
+        use squeezefs::meta_backend::kv::slot_state::ExtentGrantRecord;
+        let runs: Vec<GrantRun> = runs
+            .iter()
+            .map(|&(start, len)| GrantRun { start, len })
+            .collect();
+        match validate_return_runs(&runs, total) {
+            Ok(named) => {
+                prop_assert!(runs.iter().all(|r| r.start + u64::from(r.len) <= total));
+                prop_assert!(named <= runs.len() as u64 * u64::from(u32::MAX));
+            }
+            Err(offender) => {
+                prop_assert!(offender
+                    .start
+                    .checked_add(u64::from(offender.len))
+                    .is_none_or(|end| end > total));
+                prop_assert!(runs.contains(&offender));
+            }
+        }
+        let record = ExtentGrantRecord::from_extents(record_seed.iter().map(|e| *e % total));
+        let inside = intersect_runs_with_record(&runs, &record);
+        prop_assert!(inside.len() as u64 <= record.len());
+        prop_assert!(inside.iter().all(|e| record.contains(*e)));
+        prop_assert!(inside.windows(2).all(|w| w[0] < w[1]), "ascending, deduplicated");
+        // Every extent a run names that the record holds IS in the list.
+        for r in runs.iter().filter(|r| r.len <= 64) {
+            for e in r.start..r.start.saturating_add(u64::from(r.len)) {
+                prop_assert_eq!(record.contains(e), inside.binary_search(&e).is_ok());
+            }
+        }
+        let w = clamp_grant_want(want, cap);
+        prop_assert!(w <= cap && w > 0);
+        prop_assert_eq!(clamp_grant_want(0, cap), cap);
+    }
+
     /// The cluster wire's `RpcFrame` reader (every distributed plane's
     /// transport) and the S8 verb-body decoders are total over an
     /// arbitrary byte STREAM under every class cap; an arbitrary tag never

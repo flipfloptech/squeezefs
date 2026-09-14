@@ -1902,35 +1902,53 @@ async fn a_re_carved_ring_never_replays_its_predecessor_incarnations_entries() {
     drop(va);
     drop(ra);
     // Mount 2: the rejoin carves a fresh ring (the predecessor's extents,
-    // lowest-free-first); ONE acked entry — the RELEASE of a mount-1
-    // reference — then death.
+    // lowest-free-first); ONE acked entry — the RELEASE of two mount-1
+    // references: the FIRST record mount 1 ever wrote (its seq is the
+    // predecessor ring's position 0 — a fresh ring restarting at 0 gives
+    // the release the SAME seq, the tie) and the LAST (position ≫ 0 — a
+    // release at a fresh ring's low position sorts BELOW it, and per-key
+    // LWW by seq resurrects the put at replay while the live RAM apply
+    // read 0: the seq space of a region must be monotone across its
+    // incarnations) — then death.
     let rb = open_with_partition(&uris, Some(PARTITION)).await;
     let vb = Arc::clone(&rb.volumes[0]);
-    let victim = BlockRef {
-        vol_tag: tag,
-        block_idx: 7000,
-        owner_ino: guest_owner,
-        block_index: 0,
-    };
+    let victims: Vec<BlockRefOp> = [7000u64, 7230]
+        .iter()
+        .map(|b| {
+            BlockRefOp::released(BlockRef {
+                vol_tag: tag,
+                block_idx: *b,
+                owner_ino: guest_owner,
+                block_index: 0,
+            })
+        })
+        .collect();
     assert_eq!(vb.block_ref_count(tag, 7000).await.unwrap(), 1);
-    vb.commit_block_refs(guest_owner, &[BlockRefOp::released(victim)])
-        .await
-        .unwrap();
+    assert_eq!(vb.block_ref_count(tag, 7230).await.unwrap(), 1);
+    vb.commit_block_refs(guest_owner, &victims).await.unwrap();
     vb.sync_device().await.unwrap();
     assert_eq!(vb.block_ref_count(tag, 7000).await.unwrap(), 0);
+    assert_eq!(vb.block_ref_count(tag, 7230).await.unwrap(), 0);
     let live = digest_backend(&vb).await.unwrap();
     let free_live = vb.free_extents();
     drop(vb);
     drop(rb);
-    // Mount 3: the release stands; the predecessor's entries are gone.
+    // Mount 3: the releases stand; the predecessor's entries are gone.
     let rc = open_with_partition(&uris, Some(PARTITION)).await;
     let vc = &rc.volumes[0];
+    let s = stats(vc);
     assert_eq!(
-        vc.block_ref_count(tag, 7000).await.unwrap(),
-        0,
-        "the acked release survives the crash — a predecessor incarnation's `+ref` at a higher \
-         ring position must never out-vote it"
+        s.self_recoveries, 2,
+        "both regions are our own residue at the crash remount: {s:?}"
     );
+    for b in [7000u64, 7230] {
+        assert_eq!(
+            vc.block_ref_count(tag, b).await.unwrap(),
+            0,
+            "block {b}: the acked release survives the crash — a predecessor incarnation's \
+             `+ref`, at a higher ring position or at the same seq, must never out-vote it"
+        );
+    }
     assert_eq!(digest_backend(vc).await.unwrap(), live);
     assert_eq!(
         vc.free_extents(),

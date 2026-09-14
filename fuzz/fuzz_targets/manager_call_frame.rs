@@ -18,22 +18,90 @@
 //!   and libFuzzer's `-malloc_limit_mb` is the detector;
 //! * **round-trip** — whatever decodes re-encodes to bytes that decode
 //!   to an equal frame, and the re-encode is canonical (the bytes compare
-//!   equal too).
+//!   equal too);
+//! * **bounded EXECUTION** (review round 1, Issue 2) — a decoded integer
+//!   is never an allocation authority at the SERVICE edge either: the
+//!   `ReturnExtents` validators reject an overflowing or out-of-volume run
+//!   without touching it, the record intersection materializes at most
+//!   the RECORD's extents whatever the runs name, and an explicit
+//!   `ExtentGrant { want }` is clamped to the derivation's cap
+//!   (`appender::{validate_return_runs, intersect_runs_with_record,
+//!   clamp_grant_want}` — the pure edge `KvMetaBackend::manager_return_runs`
+//!   / `manager_extent_grant_class` run).
 //!
-//! Two arms: the raw bytes (the reject ladder), and an `Arbitrary`-built
+//! Three arms: the raw bytes (the reject ladder), an `Arbitrary`-built
 //! frame encoded then decoded — the constructive mirror that reaches
-//! every variant. The mirrors are local: the wire vocabulary must not
-//! grow a derive for the fuzzer's sake, and a mirror that falls out of
-//! step fails to compile here (a new verb lands with its fuzz arm or not
-//! at all).
+//! every variant — and the decoded call's integers driven through the
+//! service-edge validators against a small arbitrary record. The mirrors
+//! are local: the wire vocabulary must not grow a derive for the fuzzer's
+//! sake, and a mirror that falls out of step fails to compile here (a new
+//! verb lands with its fuzz arm or not at all).
 #![no_main]
 
 use arbitrary::{Arbitrary, Unstructured};
 use libfuzzer_sys::fuzz_target;
+use squeezefs::meta_backend::kv::appender::{
+    clamp_grant_want, intersect_runs_with_record, validate_return_runs, GrantRun,
+};
+use squeezefs::meta_backend::kv::slot_state::ExtentGrantRecord;
 use squeezefs::meta_ship::manager::{
     decode_reply, decode_request, encode_reply, encode_request, ManagerCall, ManagerReply,
     ManagerReplyFrame, ManagerRequestFrame, WireIdentity, MANAGER_SCHEMA,
 };
+
+/// Arm 3: the service-edge law over a decoded call's integers. `record`
+/// is small by construction (≤ 64 extents), so the intersection's bound
+/// is the record's, never the frame's.
+fn check_service_edge(call: &ManagerCall, total_extents: u64, record_seed: &[u8]) {
+    let record = ExtentGrantRecord::from_extents(
+        record_seed
+            .iter()
+            .take(64)
+            .map(|b| u64::from(*b) % total_extents.max(1)),
+    );
+    match call {
+        ManagerCall::ReturnExtents { runs, .. } => {
+            let runs: Vec<GrantRun> = runs
+                .iter()
+                .map(|&(start, len)| GrantRun { start, len })
+                .collect();
+            match validate_return_runs(&runs, total_extents) {
+                Ok(named) => {
+                    // Every run lies inside the volume: the sum cannot
+                    // exceed runs × u32::MAX, and never overflowed.
+                    assert!(named <= runs.len() as u64 * u64::from(u32::MAX));
+                    for r in &runs {
+                        assert!(r.start + u64::from(r.len) <= total_extents);
+                    }
+                }
+                Err(offender) => {
+                    assert!(
+                        offender
+                            .start
+                            .checked_add(u64::from(offender.len))
+                            .is_none_or(|end| end > total_extents),
+                        "a rejected run is one outside the volume or overflowing"
+                    );
+                }
+            }
+            let inside = intersect_runs_with_record(&runs, &record);
+            assert!(
+                inside.len() as u64 <= record.len(),
+                "the materialized list is bounded by the record"
+            );
+            for e in &inside {
+                assert!(record.contains(*e));
+            }
+        }
+        ManagerCall::ExtentGrant { want, .. } => {
+            for cap in [8u64, 1 << 20, u64::from(u32::MAX) + 1] {
+                let w = clamp_grant_want(*want, cap);
+                assert!(w <= cap && (w > 0 || cap == 0));
+            }
+        }
+        ManagerCall::JoinAppender { .. } => {}
+    }
+}
 
 fn check_request(frame: &ManagerRequestFrame) {
     let re = encode_request(frame).expect("an accepted request frame re-encodes");
@@ -164,12 +232,16 @@ struct ArbInput {
     request_id: u64,
     call: ArbCall,
     reply: ArbReply,
+    // The service-edge arm: the volume's extent count and a record seed.
+    total_extents: u64,
+    record_seed: Vec<u8>,
 }
 
 fuzz_target!(|data: &[u8]| {
     // --- arm 1: raw bytes at both decoders ----------------------------------
     if let Ok(frame) = decode_request(data) {
         check_request(&frame);
+        check_service_edge(&frame.call, 1 << 20, &data[..data.len().min(64)]);
     }
     if let Ok(frame) = decode_reply(data) {
         check_reply(&frame);
@@ -195,6 +267,8 @@ fuzz_target!(|data: &[u8]| {
         request_id: input.request_id,
         call: input.call.into(),
     };
+    // --- arm 3: the service edge over the call's integers -------------------
+    check_service_edge(&request.call, input.total_extents, &input.record_seed);
     // Past the CONTROL cap the encoder REFUSES (a return of that many
     // runs never rides one frame) — that refusal is the contract, not a
     // failure; below it the frame must round-trip.

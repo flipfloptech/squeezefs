@@ -1605,16 +1605,30 @@ impl KvMetaBackend {
             // region's grant asks the manager — this process, in PR 3 —
             // for more and retries the node once; only a manager that
             // cannot answer leaves the SMO deferred and counts the stall.
+            // The flush pass's SMOs are COMPACTIONS — the SMOs that return
+            // extents — so the grant is carved in the INTERNAL class and
+            // draws down to the compaction floor like the manager's own
+            // (Issue 6: the heap-full recovery must make progress on a
+            // leased slot tree too); a heap that cannot serve even that
+            // answers `NoSpace`, which is the SPACE class below — never
+            // the manager dependency.
             if let (Err(KvError::GrantExhausted { appender, .. }), Some(id)) = (&out, region_id) {
                 if *appender == id && !super::appender::test_manager_unreachable() {
-                    let want = self
-                        .appenders()
-                        .map_or(0, |a| self.grant_extents_for(a, id) as u32);
-                    match self.manager_extent_grant(id, want).await {
+                    match self
+                        .manager_extent_grant_class(
+                            id,
+                            0,
+                            super::alloc_ext_core::AllocClass::Internal,
+                        )
+                        .await
+                    {
                         Ok(runs) if !runs.is_empty() => {
                             out = tree.checkpoint_flush_node(smo, addr).await;
                         }
                         Ok(_) => {}
+                        Err(KvError::NoSpace { free, reserve }) => {
+                            out = Err(KvError::NoSpace { free, reserve });
+                        }
                         Err(e) => log::warn!(
                             "checkpoint: appender {id}'s reactive ExtentGrant deferred ({e})"
                         ),

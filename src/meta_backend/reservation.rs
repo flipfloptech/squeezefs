@@ -214,24 +214,36 @@ pub fn parse_reservation_report(data: &[u8], extended: bool) -> io::Result<Reser
 /// `pr_report_bytes` — design §11 "Fencing family"): the last report's
 /// `REGCTL` and the bytes its REGCTL-sized read transferred, keyed by the
 /// namespace's device path.
-type ReportGauges = Mutex<std::collections::BTreeMap<String, (u64, u64)>>;
+type ReportGauges = Mutex<std::collections::BTreeMap<PathBuf, (u64, u64)>>;
 
 fn report_gauges() -> &'static ReportGauges {
     static G: OnceLock<ReportGauges> = OnceLock::new();
     G.get_or_init(|| Mutex::new(std::collections::BTreeMap::new()))
 }
 
-/// Record one namespace's report (`regctl`, transferred `bytes`).
-pub fn note_report_gauge(namespace: &str, regctl: usize, bytes: u64) {
-    report_gauges()
-        .lock()
-        .unwrap()
-        .insert(namespace.to_string(), (regctl as u64, bytes));
+/// Record one namespace's report (`regctl`, transferred `bytes`). The
+/// map is keyed by the client's own path and updated IN PLACE: one
+/// allocation the first time a namespace reports, none on the heartbeat
+/// cadence after (review round 1, Issue 14); the lock is poison-tolerant
+/// like every gauge lock in the tree.
+pub fn note_report_gauge(namespace: &Path, regctl: usize, bytes: u64) {
+    let mut g = report_gauges().lock().unwrap_or_else(|e| e.into_inner());
+    match g.get_mut(namespace) {
+        Some(v) => *v = (regctl as u64, bytes),
+        None => {
+            g.insert(namespace.to_path_buf(), (regctl as u64, bytes));
+        }
+    }
 }
 
-/// Snapshot of the per-namespace report gauges.
+/// Snapshot of the per-namespace report gauges (the stats inode's read).
 pub fn pr_report_gauges() -> std::collections::BTreeMap<String, (u64, u64)> {
-    report_gauges().lock().unwrap().clone()
+    report_gauges()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .map(|(k, v)| (k.display().to_string(), *v))
+        .collect()
 }
 
 /// `SQUEEZEFS_PR_REGISTRANT_CAP` — a DECLARED registrant cap for a
@@ -241,12 +253,123 @@ pub fn pr_report_gauges() -> std::collections::BTreeMap<String, (u64, u64)> {
 pub const PR_REGISTRANT_CAP_ENV: &str = "SQUEEZEFS_PR_REGISTRANT_CAP";
 
 /// The cap LEARNED from the device: the `REGCTL` a Reservation Report
-/// read at the first REGISTER that failed with a non-conflict status (a
-/// vendor array's "registration table full"). 0 = nothing learned.
+/// read when a REGISTER was refused TWICE with the same device-answered
+/// command-specific / vendor-specific NVMe status at the same registrant
+/// count (a vendor array's "registration table full"). 0 = nothing
+/// learned. Unlearned when a REGISTER later succeeds at or past it.
 static PR_REGISTRANT_CAP_LEARNED: AtomicU64 = AtomicU64::new(0);
+/// The learn arm's CANDIDATE: `(status << 32) | regctl` of the last
+/// learnable refusal — the cap is learned only when the same pair
+/// repeats (review round 1, Issue 5: one refusal is a candidate, not a
+/// cap). 0 = none.
+static PR_REGISTRANT_CAP_CANDIDATE: AtomicU64 = AtomicU64::new(0);
 /// Joins refused at the cap (`pr_registrant_cap_refusals` — must stay 0
 /// on nvmet by construction).
 static PR_REGISTRANT_CAP_REFUSALS: AtomicU64 = AtomicU64::new(0);
+
+/// A device-answered NVMe status (SCT ‖ SC, the DNR/More bits masked) on
+/// one command — the `io::Error` payload [`NvmeReservationClient`]'s
+/// passthru surfaces for every nonzero status that is not the
+/// reservation conflict, so callers can CLASSIFY the refusal instead of
+/// reading a message ([`nvme_status_of`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NvmeStatusError {
+    pub opcode: u8,
+    pub status: u16,
+}
+
+impl std::fmt::Display for NvmeStatusError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "nvme command 0x{:02x} failed with status 0x{:x}",
+            self.opcode, self.status
+        )
+    }
+}
+
+impl std::error::Error for NvmeStatusError {}
+
+/// An `io::Error` carrying a device-answered NVMe status.
+pub fn nvme_status_error(opcode: u8, status: u16) -> io::Error {
+    io::Error::other(NvmeStatusError {
+        opcode,
+        status: status & 0x7ff,
+    })
+}
+
+/// The NVMe status `e` carries, if it is a device-answered status (an
+/// errno — a transport failure, a disconnected controller, a
+/// still-connecting one — carries none).
+pub fn nvme_status_of(e: &io::Error) -> Option<u16> {
+    e.get_ref()
+        .and_then(|inner| inner.downcast_ref::<NvmeStatusError>())
+        .map(|s| s.status)
+}
+
+// NVMe generic command statuses (SCT 0) that mean "not now", never "the
+// table is full" — the learn arm never reads a cap from them.
+/// Command Abort Requested.
+pub const NVME_SC_ABORT_REQ: u16 = 0x07;
+/// Command Aborted due to SQ Deletion.
+pub const NVME_SC_ABORT_QUEUE: u16 = 0x08;
+/// Command Aborted due to Failed Fused Command.
+pub const NVME_SC_FUSED_FAIL: u16 = 0x09;
+/// Command Aborted due to Missing Fused Command.
+pub const NVME_SC_FUSED_MISSING: u16 = 0x0a;
+/// Command Interrupted.
+pub const NVME_SC_CMD_INTERRUPTED: u16 = 0x21;
+/// Transient Transport Error.
+pub const NVME_SC_TRANSIENT_TRANSPORT: u16 = 0x22;
+/// Namespace Not Ready.
+pub const NVME_SC_NAMESPACE_NOT_READY: u16 = 0x82;
+/// The path-related status class (SCT 3: internal path error, ANA
+/// states, controller/host path errors, aborted-by-host).
+const NVME_SCT_PATH_RELATED: u16 = 0x300;
+/// The command-specific status class (SCT 1) — where a vendor array's
+/// "registration table full" lives when it is spec-shaped.
+const NVME_SCT_COMMAND_SPECIFIC: u16 = 0x100;
+/// The vendor-specific status class (SCT 7).
+const NVME_SCT_VENDOR_SPECIFIC: u16 = 0x700;
+
+/// Whether a device-answered status is a TRANSIENT class — the aborts,
+/// the interrupted / transient-transport pair, Namespace Not Ready, every
+/// path-related status: a refusal that says nothing about the registrant
+/// table.
+pub fn nvme_status_is_transient(status: u16) -> bool {
+    let s = status & 0x7ff;
+    matches!(
+        s,
+        NVME_SC_ABORT_REQ
+            | NVME_SC_ABORT_QUEUE
+            | NVME_SC_FUSED_FAIL
+            | NVME_SC_FUSED_MISSING
+            | NVME_SC_CMD_INTERRUPTED
+            | NVME_SC_TRANSIENT_TRANSPORT
+            | NVME_SC_NAMESPACE_NOT_READY
+    ) || (NVME_SCT_PATH_RELATED..NVME_SCT_PATH_RELATED + 0x80).contains(&s)
+}
+
+/// Whether a REGISTER refusal is one the registrant cap may be LEARNED
+/// from: a device-answered status in the command-specific or
+/// vendor-specific class — the only classes a "registration table full"
+/// is expressed in — never the reservation conflict, never a generic or
+/// transient status, never an errno.
+fn nvme_status_learnable(status: u16) -> bool {
+    let s = status & 0x7ff;
+    if nvme_status_is_transient(s) || i32::from(s) == NVME_SC_RESERVATION_CONFLICT {
+        return false;
+    }
+    (NVME_SCT_COMMAND_SPECIFIC..NVME_SCT_COMMAND_SPECIFIC + 0x100).contains(&s)
+        || (NVME_SCT_VENDOR_SPECIFIC..=0x7ff).contains(&s)
+}
+
+/// Forget the learned cap and its candidate (the unlearn arm; the
+/// contract suite's reset).
+pub fn clear_learned_registrant_cap() {
+    PR_REGISTRANT_CAP_LEARNED.store(0, Ordering::Release);
+    PR_REGISTRANT_CAP_CANDIDATE.store(0, Ordering::Release);
+}
 
 /// The registrant cap in force: declared wins, else learned, else 0 =
 /// unbounded (`pr_registrant_cap` on the stats inode).
@@ -262,15 +385,38 @@ pub fn pr_registrant_cap_refusals() -> u64 {
     PR_REGISTRANT_CAP_REFUSALS.load(Ordering::Relaxed)
 }
 
-/// Learn a cap from the device (monotone — the smallest observed).
-fn learn_registrant_cap(regctl: usize) {
+/// Learn a cap from the device (monotone — the smallest observed) — ONLY
+/// on the REPEAT of the same learnable `status` at the same `regctl`
+/// (the first is the candidate). Returns whether the cap was learned.
+fn learn_registrant_cap(status: u16, regctl: usize) -> bool {
     if regctl == 0 {
-        return;
+        return false;
+    }
+    let pair = (u64::from(status) << 32) | regctl as u64;
+    let prior = PR_REGISTRANT_CAP_CANDIDATE.swap(pair, Ordering::AcqRel);
+    if prior != pair {
+        return false;
     }
     let n = regctl as u64;
     let _ = PR_REGISTRANT_CAP_LEARNED.fetch_update(Ordering::AcqRel, Ordering::Acquire, |cur| {
         (cur == 0 || n < cur).then_some(n)
     });
+    true
+}
+
+/// A REGISTER SUCCEEDED with `regctl` registrants on the namespace: a
+/// learned cap at or below that count was wrong — unlearned (the
+/// declared knob is the operator's and is never touched).
+fn unlearn_registrant_cap_on_success(regctl: usize) {
+    let learned = PR_REGISTRANT_CAP_LEARNED.load(Ordering::Acquire);
+    if learned != 0 && regctl as u64 >= learned {
+        clear_learned_registrant_cap();
+        log::info!(
+            "reservation REGISTER succeeded with {regctl} registrant(s) on the namespace — the \
+             learned registrant cap {learned} was wrong and is unlearned (pr_registrant_cap \
+             reads unbounded again)"
+        );
+    }
 }
 
 /// **The registrant-cap gate** (KD-SYM-18 / KD-SYM-23): before a join
@@ -286,7 +432,7 @@ pub fn registrant_cap_gate(
     report_bytes: u64,
 ) -> io::Result<()> {
     let regctl = report.regctl();
-    note_report_gauge(&namespace.display().to_string(), regctl, report_bytes);
+    note_report_gauge(namespace, regctl, report_bytes);
     let cap = pr_registrant_cap();
     if cap != 0 && regctl as u64 >= cap {
         PR_REGISTRANT_CAP_REFUSALS.fetch_add(1, Ordering::Relaxed);
@@ -299,7 +445,7 @@ pub fn registrant_cap_gate(
             if crate::env_knobs::opt_int_knob::<u64>(PR_REGISTRANT_CAP_ENV).is_some() {
                 format!("declared by {PR_REGISTRANT_CAP_ENV}")
             } else {
-                "learned from the device's first refused REGISTER".to_string()
+                "learned from the device's repeated refused REGISTER".to_string()
             },
         )));
     }
@@ -443,23 +589,38 @@ pub enum RegisterOutcome {
 /// preempt path, which this ladder must not widen).
 pub fn register_ladder(client: &dyn ReservationClient, key: u64) -> io::Result<RegisterOutcome> {
     let Err(conflict) = client.register(key) else {
+        // A success at or past a LEARNED cap disproves it (Issue 5's
+        // unlearn arm); the report is read only while a cap is learned,
+        // so the shipped fast path pays nothing.
+        if PR_REGISTRANT_CAP_LEARNED.load(Ordering::Acquire) != 0 {
+            if let Ok(report) = client.report() {
+                unlearn_registrant_cap_on_success(report.regctl());
+            }
+        }
         return Ok(RegisterOutcome::Registered);
     };
     if !is_reservation_conflict(&conflict) {
-        // A REGISTER refused with a NON-conflict status on a namespace
-        // that reports registrants is a vendor array's registration
-        // table binding (KD-SYM-18): the count it holds is the cap this
-        // process learns, so the next join refuses BEFORE registering
-        // instead of failing here again.
-        if let Ok(report) = client.report() {
-            if report.regctl() > 0 {
-                learn_registrant_cap(report.regctl());
-                log::warn!(
-                    "reservation REGISTER refused ({conflict}) with {} registrant(s) on the \
-                     namespace — learned as this array's registrant cap \
-                     (pr_registrant_cap); the next join refuses at it",
-                    report.regctl()
-                );
+        // A REGISTER refused by the DEVICE with a command-specific or
+        // vendor-specific status — the classes a vendor array's
+        // "registration table full" is expressed in — on a namespace
+        // that reports registrants is the table binding (KD-SYM-18): the
+        // count it holds is the cap this process learns, so the next
+        // join refuses BEFORE registering instead of failing here again.
+        // Learned only when the SAME status repeats at the same count
+        // (one refusal is a candidate); never from a transport errno
+        // (EIO on a path failover, ENXIO on a disconnect, ENOTTY on a
+        // still-connecting controller), never from a generic, transient
+        // or path-related status (review round 1, Issue 5).
+        if let Some(status) = nvme_status_of(&conflict).filter(|s| nvme_status_learnable(*s)) {
+            if let Ok(report) = client.report() {
+                if report.regctl() > 0 && learn_registrant_cap(status, report.regctl()) {
+                    log::warn!(
+                        "reservation REGISTER refused twice with status {status:#x} at {} \
+                         registrant(s) on the namespace — learned as this array's registrant \
+                         cap (pr_registrant_cap); the next join refuses at it",
+                        report.regctl()
+                    );
+                }
             }
         }
         return Err(conflict);
@@ -730,10 +891,9 @@ impl NvmeReservationClient {
             if rc & 0x7ff == NVME_SC_RESERVATION_CONFLICT {
                 return Err(reservation_conflict_error());
             }
-            return Err(io::Error::other(format!(
-                "nvme command 0x{:02x} failed with status 0x{rc:x}",
-                cmd.opcode
-            )));
+            // Typed, so the register ladder can classify the refusal
+            // (learnable vs transient) without reading a message.
+            return Err(nvme_status_error(cmd.opcode, (rc & 0x7ff) as u16));
         }
         Ok(())
     }
@@ -793,7 +953,7 @@ impl NvmeReservationClient {
         let bytes = data.len() as u64;
         self.last_report_bytes.store(bytes, Ordering::Relaxed);
         let report = parse_reservation_report(&data, extended)?;
-        note_report_gauge(&self.path.display().to_string(), report.regctl(), bytes);
+        note_report_gauge(&self.path, report.regctl(), bytes);
         Ok(report)
     }
 

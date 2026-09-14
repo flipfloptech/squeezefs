@@ -21,7 +21,8 @@
 //! `dlm_mode` = `solo` — and a bit-17-absent volume is untouched.
 
 use squeezefs::meta_backend::kv::appender::{
-    read_directory, AppenderIdentity, AppenderState, SlotEntryState, TEST_APPENDER_SLOTS_ENV,
+    read_directory, write_page, AppenderIdentity, AppenderState, SlotEntryState,
+    TEST_APPENDER_SLOTS_ENV,
 };
 use squeezefs::meta_backend::kv::backend::{
     AcquireSlotReply, KvMetaBackend, TEST_HANDOVER_HOLD_AFTER_PAGE, TEST_HANDOVER_HOLD_AFTER_TREE0,
@@ -2543,16 +2544,22 @@ async fn a_leave_crash_history_remounts_without_a_custody_conflict() {
             AppenderState::Live,
             "the crash left the page Live"
         );
-        assert!(
-            p1.slots.iter().any(|e| guest_forest_slot(e.slot) == SLOT4),
-            "… still attesting slot 4"
+        let e4 = p1
+            .slots
+            .iter()
+            .find(|e| guest_forest_slot(e.slot) == SLOT4)
+            .expect("… still attesting slot 4");
+        assert_eq!(
+            e4.state,
+            SlotEntryState::Releasing,
+            "the leave's first step is the page's Releasing attestation (§5.3.4)"
         );
     }
     // 2. Another appender leases slot 4 and still HOLDS it: a manager-only
     //    mount (the seam's region undeclared — its Live page is listed,
     //    not recovered) takes it by first touch (g = 2) and crashes with
     //    its page attesting the slot.
-    {
+    let sb = {
         let routed = open_under(&uris, &Knobs::armed()).await;
         let vol = Arc::clone(&routed.volumes[0]);
         vol.commit_block_refs(owner, &refs(tag, owner, 100, 1))
@@ -2569,8 +2576,26 @@ async fn a_leave_crash_history_remounts_without_a_custody_conflict() {
         ));
         vol.checkpoint_now().await.unwrap();
         vol.sync_device().await.unwrap();
+        let sb = vol.superblock().clone();
         drop(vol);
         drop(routed);
+        sb
+    };
+    // Forge the pre-fix residue: page 1's entries flipped back to LIVE at
+    // their g = 1 — the shape a leave that skipped the Releasing step (or a
+    // crash between it and the page write) leaves behind. The settle must
+    // read a Live attestation BELOW tree 0's g as stale, never a conflict.
+    {
+        let entries = read_directory(path, &sb).await.unwrap();
+        let mut p1 = entries[1].page.clone().unwrap();
+        for e in &mut p1.slots {
+            e.state = SlotEntryState::Live;
+        }
+        p1.generation += 1;
+        let img = p1.encode().unwrap();
+        for off in entries[1].dir_offsets {
+            write_page(path, off, img.clone()).await.unwrap();
+        }
     }
     // 3. The crashed identity remounts with its partition: page 0 (own
     //    residue) attests slot 4 at g = 2, page 1 at g = 1 — the lower g
@@ -2581,6 +2606,10 @@ async fn a_leave_crash_history_remounts_without_a_custody_conflict() {
     assert_eq!(
         s.conflicts, 0,
         "a leave-crash history is not a C14 conflict"
+    );
+    assert_eq!(
+        s.stale_entries, 1,
+        "the lower-g Live attestation is dropped and COUNTED"
     );
     assert_eq!(
         vol.appender_stats().unwrap().regions[1].leases,

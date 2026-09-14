@@ -3045,7 +3045,7 @@ impl KvMetaBackend {
                 if region.released.load(Ordering::Acquire) {
                     continue;
                 }
-                self.release_leases_at_leave(&plane, region).await?;
+                self.release_leases_at_leave(set, &plane, region).await?;
             }
             // The membership carriage no longer answers for this plane.
             super::slot_lease::unregister_carriage_plane(&plane);
@@ -3468,13 +3468,19 @@ impl KvMetaBackend {
 
     /// The §5.3.4 handover crash rows at the arm, and C14's live face
     /// (§5.8.5): every `Live` page's `Live` slot entries across the
-    /// directory must name each slot ONCE, and a `Live` entry must agree
-    /// with tree 0's lessee — two live attestations of one slot REFUSE the
-    /// mount loud (`slot_lease_conflicts`); a `Releasing` entry never
-    /// counts (tree 0 wins): on OUR page it is a handover this identity
-    /// died inside — row 5 (tree 0 still `Leased` by us at that `g`)
-    /// COMPLETES the release from the page's words; row 6 (tree 0 already
-    /// `Unleased` / another's) just drops it.
+    /// directory must name each slot ONCE at its CURRENT `g`, and a `Live`
+    /// entry must agree with tree 0's lessee — two live attestations of
+    /// one slot at tree 0's `g` REFUSE the mount loud
+    /// (`slot_lease_conflicts`); a `Live` entry whose `g` is BELOW tree
+    /// 0's for the slot is STALE residue (`g` is strictly monotone per
+    /// slot and tree 0 is the durable witness — the leave-crash history of
+    /// review round 2 Issue 8: released in tree 0, the page never went
+    /// `Free`), dropped and counted (`slot_lease_stale_entries`), never a
+    /// conflict; a `Releasing` entry never counts (tree 0 wins): on OUR
+    /// page it is a handover this identity died inside — row 5 (tree 0
+    /// still `Leased` by us at that `g`) COMPLETES the release from the
+    /// page's words; row 6 (tree 0 already `Unleased` / another's) just
+    /// drops it.
     async fn settle_page_entries_against_tree0(
         &self,
         set: &super::appender::AppenderSet,
@@ -3514,6 +3520,21 @@ impl KvMetaBackend {
                     continue;
                 }
                 let slot = super::appender::forest_slot_of_page_slot(se.slot, set.native_slot);
+                // A `Live` attestation BELOW tree 0's `g` for the slot is
+                // stale residue, not custody: it neither contends for the
+                // slot nor contradicts the witness.
+                if plane.table.get(slot).is_some_and(|l| l.g > se.g) {
+                    plane.stale_entries.fetch_add(1, Ordering::Relaxed);
+                    log::info!(
+                        "meta volume {}: appender {appender_id}'s page attests slot {slot} LIVE \
+                         at g {} below tree 0's g {} — stale residue of a leave or handover the \
+                         page never recorded, dropped (slot_lease_stale_entries)",
+                        self.path.display(),
+                        se.g,
+                        plane.table.get(slot).map_or(0, |l| l.g)
+                    );
+                    continue;
+                }
                 if let Some(other) = live_by_slot.insert(slot, *appender_id) {
                     if other != *appender_id {
                         plane.conflicts.fetch_add(1, Ordering::Relaxed);
@@ -3527,9 +3548,11 @@ impl KvMetaBackend {
                     }
                 }
                 if let Some(l) = plane.table.get(slot) {
+                    // At tree 0's `g` (or ahead of it — a page the witness
+                    // never caught up with) under ANOTHER lessee: the
+                    // conflict class.
                     if l.state != crate::slot_lease_core::LeaseState::Unleased
                         && l.holder != *appender_id
-                        && l.g > se.g
                     {
                         plane.conflicts.fetch_add(1, Ordering::Relaxed);
                         return Err(KvError::Corrupt(format!(
@@ -4188,32 +4211,8 @@ impl KvMetaBackend {
         // unreachable extents — an image the requester later retires
         // through ITS context must not stay claimed here): the record is
         // rewritten without them in the SAME entry, bits untouched.
-        let mut leaving: Vec<u64> = Vec::new();
-        if appender_id != 0 {
-            let record = self.extent_grant_record(appender_id).await?;
-            if !record.is_empty() {
-                leaving = self
-                    .slot_tree_image_extents(slot)
-                    .await?
-                    .into_iter()
-                    .filter(|e| record.contains(*e))
-                    .collect();
-            }
-            if !leaving.is_empty() {
-                let remaining = super::slot_state::ExtentGrantRecord::from_extents(
-                    record.extents().filter(|e| !leaving.contains(e)),
-                );
-                let key = super::slot_state::extent_grant_key(appender_id);
-                recs.push((
-                    tag,
-                    if remaining.is_empty() {
-                        Record::delete(key, 0)
-                    } else {
-                        Record::put(key, 0, remaining.encode()?)
-                    },
-                ));
-            }
-        }
+        let (rewrite, leaving) = self.grant_record_minus_images(appender_id, &[slot]).await?;
+        recs.extend(rewrite);
         self.write_control_entry(recs).await?;
         if let Some(r) = set.region(appender_id).filter(|_| !leaving.is_empty()) {
             r.grant().transfer_out(&leaving);
@@ -4335,7 +4334,7 @@ impl KvMetaBackend {
         set: &super::appender::AppenderSet,
         plane: &super::slot_lease::SlotLeasePlane,
         region: &super::appender::AppenderRegion,
-        releasing: Option<super::record::ForestSlot>,
+        releasing: &[super::record::ForestSlot],
     ) -> Vec<super::appender::SlotEntry> {
         let mut entries: Vec<super::appender::SlotEntry> = Vec::new();
         for slot in region.leases().iter().copied() {
@@ -4347,7 +4346,7 @@ impl KvMetaBackend {
             let g = plane.table.get(slot).map_or(0, |l| l.g);
             entries.push(super::appender::SlotEntry {
                 slot: page_slot,
-                state: if releasing == Some(slot) {
+                state: if releasing.contains(&slot) {
                     super::appender::SlotEntryState::Releasing
                 } else {
                     super::appender::SlotEntryState::Live
@@ -4469,7 +4468,7 @@ impl KvMetaBackend {
         // 3. The page: the slot in `Releasing` with its final words.
         let t_page = std::time::Instant::now();
         {
-            let entries = self.lease_page_entries(set, &plane, region, Some(slot));
+            let entries = self.lease_page_entries(set, &plane, region, &[slot]);
             let mut page = region.page.lock().unwrap_or_else(|e| e.into_inner());
             page.slots = entries;
         }
@@ -4518,7 +4517,7 @@ impl KvMetaBackend {
             }
         }
         {
-            let entries = self.lease_page_entries(set, &plane, region, None);
+            let entries = self.lease_page_entries(set, &plane, region, &[]);
             let mut page = region.page.lock().unwrap_or_else(|e| e.into_inner());
             page.slots = entries;
         }
@@ -4893,11 +4892,18 @@ impl KvMetaBackend {
         Ok(())
     }
 
-    /// The clean unmount's lease release for one region (§5.1.3): every
-    /// slot it holds goes `Unleased` in tree 0 with its final words and
-    /// tails — ONE control entry — then leaves the RAM plane.
+    /// The clean unmount's lease release for one region (§5.1.3 — the
+    /// design's release ORDER, review round 2 Issue 8a): the region's page
+    /// with every held slot `Releasing` + barrier FIRST (a crash past this
+    /// point leaves attestations the next open drops by the row-6 rule,
+    /// never `Live` entries a later lessee's page would contradict), then
+    /// every slot `Unleased` in tree 0 with its final words and tails — ONE
+    /// control entry that also moves the trees' live images out of the
+    /// region's grant record (Issue 4 — the handover's custody step, on
+    /// the leave path too) — then the RAM plane.
     async fn release_leases_at_leave(
         &self,
+        set: &super::appender::AppenderSet,
         plane: &super::slot_lease::SlotLeasePlane,
         region: &super::appender::AppenderRegion,
     ) -> std::result::Result<(), KvError> {
@@ -4905,6 +4911,13 @@ impl KvMetaBackend {
         if held.is_empty() {
             return Ok(());
         }
+        {
+            let entries = self.lease_page_entries(set, plane, region, &held);
+            let mut page = region.page.lock().unwrap_or_else(|e| e.into_inner());
+            page.slots = entries;
+        }
+        self.write_region_page(region).await?;
+        self.sync_device().await.map_err(KvError::Io)?;
         let last_written = self.lease_seq();
         let tag = super::journal::tag_for(super::record::TREE_CONTROL, 0);
         let mut puts: Vec<(u8, Record)> = Vec::with_capacity(held.len());
@@ -4949,7 +4962,16 @@ impl KvMetaBackend {
         if puts.is_empty() {
             return Ok(());
         }
+        let released_slots: Vec<super::record::ForestSlot> =
+            releases.iter().map(|(s, _, _)| *s).collect();
+        let (rewrite, leaving) = self
+            .grant_record_minus_images(region.id, &released_slots)
+            .await?;
+        puts.extend(rewrite);
         self.write_control_entry(puts).await?;
+        if !leaving.is_empty() {
+            region.grant().transfer_out(&leaving);
+        }
         for (slot, g, words) in releases {
             let _ = plane.table.release(slot, region.id, g, words, last_written);
             if words.root.0 != 0 {
@@ -5639,6 +5661,52 @@ impl KvMetaBackend {
             set.verbs.replays.fetch_add(1, Ordering::Relaxed);
         }
         Ok((granted.len() as u64, already.len() as u64))
+    }
+
+    /// The custody transfer OUT of appender `appender_id`'s grant record
+    /// (§5.1.4 / §5.8.5 C13, review round 2 Issue 4): the live image
+    /// extents of `slots`' trees the record claims leave it — the
+    /// rewritten record (a delete when nothing remains) as the tree-0 put
+    /// to ride the caller's control entry, and the extents that left (the
+    /// RAM `transfer_out` after the write). Nothing for the manager
+    /// (appender 0 — its images are untracked) or a record claiming none.
+    async fn grant_record_minus_images(
+        &self,
+        appender_id: u32,
+        slots: &[super::record::ForestSlot],
+    ) -> std::result::Result<(Option<(u8, Record)>, Vec<u64>), KvError> {
+        if appender_id == 0 {
+            return Ok((None, Vec::new()));
+        }
+        let record = self.extent_grant_record(appender_id).await?;
+        if record.is_empty() {
+            return Ok((None, Vec::new()));
+        }
+        let mut leaving: Vec<u64> = Vec::new();
+        for slot in slots {
+            leaving.extend(
+                self.slot_tree_image_extents(*slot)
+                    .await?
+                    .into_iter()
+                    .filter(|e| record.contains(*e)),
+            );
+        }
+        leaving.sort_unstable();
+        leaving.dedup();
+        if leaving.is_empty() {
+            return Ok((None, Vec::new()));
+        }
+        let remaining = super::slot_state::ExtentGrantRecord::from_extents(
+            record.extents().filter(|e| !leaving.contains(e)),
+        );
+        let key = super::slot_state::extent_grant_key(appender_id);
+        let tag = super::journal::tag_for(super::record::TREE_CONTROL, 0);
+        let rec = if remaining.is_empty() {
+            Record::delete(key, 0)
+        } else {
+            Record::put(key, 0, remaining.encode()?)
+        };
+        Ok((Some((tag, rec)), leaving))
     }
 
     /// The image extents `slot`'s tree reaches (empty when no tree exists)
@@ -6414,7 +6482,7 @@ impl KvMetaBackend {
                 // The armed plane (PR 4, KD-SYM-3): every page names
                 // exactly the slots its region leases, with their live
                 // `g`, extent count, root and cursor.
-                entries = self.lease_page_entries(set, plane, r, None);
+                entries = self.lease_page_entries(set, plane, r, &[]);
             } else if r.id == 0 {
                 for (slot, tree) in &trees {
                     if set.region_of_slot(*slot) != 0 {

@@ -275,6 +275,7 @@ pub struct SlotLeasePlane {
     pub ceiling_overflows: AtomicU64,
     pub region_releases: AtomicU64,
     pub recall_notices: AtomicU64,
+    pub stale_entries: AtomicU64,
     pub phases: HandoverPhases,
 }
 
@@ -292,6 +293,7 @@ impl SlotLeasePlane {
             identities: std::sync::Mutex::new(std::collections::BTreeMap::new()),
             recalls: std::sync::Mutex::new(std::collections::BTreeMap::new()),
             recall_notices: AtomicU64::new(0),
+            stale_entries: AtomicU64::new(0),
             table: SlotLeaseTable::new(),
             gate,
             dominance: DominanceWindow::new(),
@@ -484,6 +486,7 @@ impl SlotLeasePlane {
             offer_n_floor: self.n_floor(),
             region_releases: self.region_releases.load(Relaxed),
             recall_notices: self.recall_notices.load(Relaxed),
+            stale_entries: self.stale_entries.load(Relaxed),
         }
     }
 
@@ -695,4 +698,8 @@ pub struct SlotLeaseStats {
     /// grant's `slot_release_notices` (an accepted offer of a slot it
     /// holds).
     pub recall_notices: u64,
+    /// `Live` page attestations below tree 0's `g` for the slot, dropped
+    /// at the arm as stale residue (a leave or handover the page never
+    /// recorded — review round 2 Issue 8).
+    pub stale_entries: u64,
 }

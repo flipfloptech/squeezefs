@@ -13790,6 +13790,10 @@ impl SqueezefsFilesystem {
                 metrics.insert("slot_region_releases".into(), lease(&|s| s.region_releases));
                 metrics.insert("slot_recall_notices".into(), lease(&|s| s.recall_notices));
                 metrics.insert(
+                    "slot_lease_stale_entries".into(),
+                    lease(&|s| s.stale_entries),
+                );
+                metrics.insert(
                     "meta_kv_leaf_lease_refusals".into(),
                     load(&meta_kv::META_KV_LEAF_LEASE_REFUSALS),
                 );

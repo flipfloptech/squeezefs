@@ -35,6 +35,7 @@
 
 use bytes::Bytes;
 use proptest::prelude::*;
+use squeezefs::meta_backend::kv::journal::SeqSpan;
 use squeezefs::meta_backend::kv::node::{write_node, NodeLayout, NodeWriteParams};
 use squeezefs::meta_backend::kv::node_cache::{
     CachedNode, LiveLookup, NodeCache, NodeCacheConfig, FOLD_MEMO_CAPACITY,
@@ -573,7 +574,7 @@ async fn mid_range_rollback_removal_folds_exactly() {
     {
         let mut guard = leaf.lock().write().await;
         let removed =
-            leaf.remove_overlay_records_locked(&mut guard, &key, s_failing, s_failing + 1);
+            leaf.remove_overlay_records_locked(&mut guard, &key, SeqSpan::stamped(s_failing, 1));
         assert_eq!(removed, 1, "exactly the failing record is removed");
     }
 
@@ -754,7 +755,7 @@ proptest! {
                         let seq = mirror[pick].rec.seq;
                         let mut guard = leaf.lock().write().await;
                         let removed =
-                            leaf.remove_overlay_records_locked(&mut guard, &k, seq, seq + 1);
+                            leaf.remove_overlay_records_locked(&mut guard, &k, SeqSpan::stamped(seq, 1));
                         drop(guard);
                         prop_assert_eq!(removed, 1, "the mirrored overlay record must exist");
                         mirror[pick].removed = true;

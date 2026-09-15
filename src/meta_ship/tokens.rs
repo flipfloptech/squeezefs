@@ -104,6 +104,29 @@ static MISSES: AtomicU64 = AtomicU64::new(0);
 static EVICTIONS: AtomicU64 = AtomicU64::new(0);
 static GRANTS: AtomicU64 = AtomicU64::new(0);
 
+/// The read-token RECORDS budget, bytes (PR 5, review round 1 Issue 7):
+/// a token entry carries the object's records — attrs, every carried
+/// xattr, a directory's whole dentry set — so the reader's cache is bound
+/// by BYTES on its own R5 component, never by the delegation cache's
+/// 32-byte entry count. Derived as 1/256 of the R5 budget (64 MiB at
+/// 16 GiB ≈ 1.6 M dentries or ≈ 1,000 full-size `layout` values — a
+/// reader's live interest set: the directories it lists and the files it
+/// has open, the same order as the node cache's share of the same budget
+/// divided by the four kinds it holds per object); the R5 component is
+/// floor 0, weight 1 (a re-earnable cache — a shed costs one grant round
+/// trip per object, never a wrong answer). The budget's own floor is ONE
+/// control frame (`CONTROL_MAX_FRAME_BYTES`): the physical minimum under
+/// which a grant page can be resident at all — below it no token could
+/// ever be served. Tie-tested in `derivation_sweep_tests`.
+pub fn records_budget_bytes() -> u64 {
+    (crate::mem_budget::MEM_BUDGET.budget_bytes() / RECORDS_BUDGET_DIVISOR)
+        .max(u64::from(crate::cluster_wire::CONTROL_MAX_FRAME_BYTES))
+}
+
+/// The token records' share of the R5 budget (see
+/// [`records_budget_bytes`]).
+pub const RECORDS_BUDGET_DIVISOR: u64 = 256;
+
 /// The cache's entry cap: derived from the R5 budget, absolute override
 /// wins verbatim (the standing precedence law).
 pub fn cache_cap() -> usize {
@@ -772,7 +795,7 @@ const RECALL_DEADLINE_FLOOR: Duration = Duration::from_millis(1);
 /// (the owner's park derivation clamps at this — `MetaShipService::
 /// deleg_park`). A constant scheduling grain, not a tuning value: below
 /// it the standing poll degenerates into a busy loop.
-pub(crate) const RECALL_POLL_PARK_FLOOR: Duration = Duration::from_millis(100);
+pub const RECALL_POLL_PARK_FLOOR: Duration = Duration::from_millis(100);
 
 /// The **delivery term** the rung-12 wire added to the deadline
 /// derivation (live finding #3): rung 11 priced the deadline as
@@ -1818,8 +1841,9 @@ fn now_ms() -> u64 {
 /// round window): the owner's own floor-to-ceiling park derivation lands
 /// in [100 ms, 5 s]; 1 s keeps the initial freshness window tight while
 /// the first round is in flight, and the first reply replaces it with the
-/// owner's published number.
-const DELEG_PARK_DEFAULT_MS: u64 = 1_000;
+/// owner's published number (the token plane's recall channel reads the
+/// same default and derives its reconnect backoff from it).
+pub(super) const DELEG_PARK_DEFAULT_MS: u64 = 1_000;
 
 /// Freshness slack over two park rounds: scheduling + one RTT of grace
 /// (the token plane's recall channel reads the same law).

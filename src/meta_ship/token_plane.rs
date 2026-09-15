@@ -1159,24 +1159,58 @@ pub trait RecallDataSink: Send + Sync {
 
 /// Entry state: serving.
 const ENTRY_LIVE: u8 = 0;
-/// Entry state: recalled — no new serve begins; in-flight ones drain.
+/// Entry state: recalled or evicted — a serve that finds it re-fetches.
 const ENTRY_REVOKED: u8 = 1;
 
-/// One cached token: the object's records as granted.
+/// One cached token: the object's records as granted. Immutable once
+/// installed — a serve that began before the entry's recall serves the
+/// records it holds (linearizable at its start); the DMA hazard a recall
+/// exists for is the `ServeStamp` drain's, run by the recall sink, which
+/// is why the entry carries no in-flight count of its own (review round
+/// 1, Issue 15).
 pub struct TokenEntry {
     pub attrs: InodeValue,
     pub xattrs: Vec<(Vec<u8>, Vec<u8>)>,
     /// The directory's entries in cookie order (`None` = not fetched;
     /// a non-directory never has them).
     pub dir: Option<Vec<DirRecord>>,
+    /// name → index into `dir` (a `lookup` is one hash probe, never a
+    /// scan of the set — review round 1, Issue 11).
+    names: Option<HashMap<Vec<u8>, usize>>,
+    /// The bytes this entry is charged to the token records budget.
+    bytes: u64,
     state: AtomicU8,
-    inflight: AtomicU64,
-    drain: squeezefs_ipc::sqz_notify::Notify,
     used: AtomicBool,
 }
 
-/// An in-flight serve of one entry (RAII over its inflight count — what
-/// the recall drain waits on).
+impl TokenEntry {
+    /// The dentry named `name`, if the directory holds one.
+    pub fn find(&self, name: &[u8]) -> Option<&DirRecord> {
+        let dir = self.dir.as_ref()?;
+        let at = *self.names.as_ref()?.get(name)?;
+        dir.get(at)
+    }
+
+    /// The dentries with a cookie strictly above `after`, at most `max` —
+    /// a binary search on the cookie-ordered set, so a whole `readdir` of
+    /// N entries costs O(N) rather than O(N²/page).
+    pub fn page_after(&self, after: u64, max: usize) -> &[DirRecord] {
+        let Some(dir) = self.dir.as_ref() else {
+            return &[];
+        };
+        let from = dir.partition_point(|d| d.cookie <= after);
+        &dir[from..dir.len().min(from + max)]
+    }
+
+    /// The bytes this entry is charged (`dlm_token_cached_bytes`).
+    pub fn bytes(&self) -> u64 {
+        self.bytes
+    }
+}
+
+/// A serve of one entry: the `Arc` keeps the records alive for the
+/// serve's duration — a recall dropping the entry from the cache never
+/// invalidates a serve already begun.
 pub struct TokenServe {
     entry: Arc<TokenEntry>,
 }
@@ -1187,17 +1221,63 @@ impl TokenServe {
     }
 }
 
-impl Drop for TokenServe {
-    fn drop(&mut self) {
-        self.entry.inflight.fetch_sub(1, Ordering::AcqRel);
-        self.entry.drain.notify_waiters();
-    }
-}
-
-/// Bytes charged per cached token (the entry, its `Arc`, the bucket) —
-/// the delegation cache's accounting style; the records' own bytes are
-/// added per entry.
+/// Bytes charged per cached token beside its records (the entry, its
+/// `Arc`, the `scc` bucket, the name index's header) — the delegation
+/// cache's accounting style.
 const TOKEN_ENTRY_BYTES: u64 = 128;
+/// Bytes charged per dentry beside its name (cookie, ino, type, the
+/// index slot).
+const DIR_RECORD_BYTES: u64 = 24;
+
+/// The recall channel's reconnect backoff: from a twentieth of the
+/// channel's birth park (one RTT-class retry) doubling to five parks
+/// (the S10 park derivation's own ceiling) — both derived from
+/// `DELEG_PARK_DEFAULT_MS`, never free constants.
+const RECONNECT_BACKOFF_FLOOR: Duration =
+    Duration::from_millis(super::tokens::DELEG_PARK_DEFAULT_MS / 20);
+const RECONNECT_BACKOFF_CEILING: Duration =
+    Duration::from_millis(super::tokens::DELEG_PARK_DEFAULT_MS * 5);
+
+/// Bytes the whole process's token readers hold — the gauge of the
+/// `dlm_token_records_bytes` R5 component (one component for every
+/// volume's plane; each plane mirrors its own `cached_bytes` here).
+static TOKEN_RECORDS_BYTES: AtomicU64 = AtomicU64::new(0);
+
+/// The planes registered for the component's shed.
+static TOKEN_READER_PLANES: once_cell::sync::Lazy<
+    parking_lot::Mutex<Vec<std::sync::Weak<TokenReaderPlane>>>,
+> = once_cell::sync::Lazy::new(|| parking_lot::Mutex::new(Vec::new()));
+
+/// Register `dlm_token_records_bytes` with the R5 authority (once) and
+/// the plane for its shed: floor 0, weight 1 — a re-earnable cache (a shed
+/// DROPS entries without a release: the holder keeps the grant and its
+/// next commit recalls a reader that holds nothing, one needless recall
+/// per shed object, never a wrong answer).
+fn ensure_records_r5(plane: &Arc<TokenReaderPlane>) {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        crate::mem_budget::MEM_BUDGET.register(crate::mem_budget::Component::new(
+            "dlm_token_records_bytes",
+            0,
+            1,
+            Arc::new(|| TOKEN_RECORDS_BYTES.load(Ordering::Relaxed)),
+            Arc::new(|target| {
+                let planes: Vec<Arc<TokenReaderPlane>> = TOKEN_READER_PLANES
+                    .lock()
+                    .iter()
+                    .filter_map(|w| w.upgrade())
+                    .collect();
+                for p in planes {
+                    if TOKEN_RECORDS_BYTES.load(Ordering::Relaxed) <= target {
+                        break;
+                    }
+                    p.shed_all();
+                }
+            }),
+        ));
+    });
+    TOKEN_READER_PLANES.lock().push(Arc::downgrade(plane));
+}
 
 /// The reader's side of the token plane for ONE volume.
 pub struct TokenReaderPlane {
@@ -1218,13 +1298,26 @@ pub struct TokenReaderPlane {
     /// Test seam: `0` = read the installed membership session, `1` =
     /// declared live, `2` = declared past `T_self`.
     lease_override: AtomicU8,
+    /// Bytes the cache holds (`dlm_token_cached_bytes`) — charged at
+    /// install, credited at recall / eviction / shed; mirrored into the
+    /// process-wide R5 gauge.
     cached_bytes: AtomicU64,
+    /// Test seam: a records budget in place of the derived one (0 = the
+    /// derivation).
+    budget_override: AtomicU64,
     // ---- gauges ----
     grants: AtomicU64,
     hits: AtomicU64,
     recalls_received: AtomicU64,
     recalls_acked: AtomicU64,
     releases: AtomicU64,
+    /// Entries the R5 authority shed under pressure (dropped, not
+    /// released — the holder's next recall finds nothing cached).
+    sheds: AtomicU64,
+    /// Grants refused because ONE entry would exceed the whole records
+    /// budget (a directory too large for this reader's budget — R5
+    /// sizing is the remedy; the streaming form is owed).
+    oversize_refusals: AtomicU64,
     serve_refusals: AtomicU64,
     channel_rounds: AtomicU64,
     fetch_retries: AtomicU64,
@@ -1250,7 +1343,7 @@ fn fail_closed(what: &str) -> SqueezefsError {
 
 impl TokenReaderPlane {
     pub fn new(cfg: TokenClientConfig) -> Arc<Self> {
-        Arc::new(Self {
+        let plane = Arc::new(Self {
             cfg,
             session: crate::sqz_sync::SqzMutex::new(None),
             cache: scc::HashMap::new(),
@@ -1258,22 +1351,54 @@ impl TokenReaderPlane {
             revoke_gens: scc::HashMap::new(),
             channel_ok: AtomicBool::new(false),
             channel_last_round_ms: AtomicU64::new(0),
-            channel_park_ms: AtomicU64::new(1_000),
+            // The S10 channel's birth park (the first poll's reply
+            // replaces it with the holder's bound).
+            channel_park_ms: AtomicU64::new(super::tokens::DELEG_PARK_DEFAULT_MS),
             epoch: Instant::now(),
             data_sink: std::sync::OnceLock::new(),
             stop: AtomicBool::new(false),
             lease_override: AtomicU8::new(0),
             cached_bytes: AtomicU64::new(0),
+            budget_override: AtomicU64::new(0),
             grants: AtomicU64::new(0),
             hits: AtomicU64::new(0),
             recalls_received: AtomicU64::new(0),
             recalls_acked: AtomicU64::new(0),
             releases: AtomicU64::new(0),
+            sheds: AtomicU64::new(0),
+            oversize_refusals: AtomicU64::new(0),
             serve_refusals: AtomicU64::new(0),
             channel_rounds: AtomicU64::new(0),
             fetch_retries: AtomicU64::new(0),
             grant_rtt: LatencyHistogram::default(),
-        })
+        });
+        ensure_records_r5(&plane);
+        plane
+    }
+
+    /// Test seam: the records budget in force (`None` = the derivation).
+    pub fn test_set_records_budget(&self, bytes: Option<u64>) {
+        self.budget_override
+            .store(bytes.unwrap_or(0), Ordering::Relaxed);
+    }
+
+    /// The records budget in force, bytes.
+    fn records_budget(&self) -> u64 {
+        match self.budget_override.load(Ordering::Relaxed) {
+            0 => super::tokens::records_budget_bytes(),
+            b => b,
+        }
+    }
+
+    /// Charge / credit the byte gauges (the plane's and the R5 one).
+    fn charge(&self, bytes: u64) {
+        self.cached_bytes.fetch_add(bytes, Ordering::Relaxed);
+        TOKEN_RECORDS_BYTES.fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    fn credit(&self, bytes: u64) {
+        self.cached_bytes.fetch_sub(bytes, Ordering::Relaxed);
+        TOKEN_RECORDS_BYTES.fetch_sub(bytes, Ordering::Relaxed);
     }
 
     /// Install the mount's data drain + purge (once).
@@ -1462,30 +1587,50 @@ impl TokenReaderPlane {
         }
         let attrs = attrs.ok_or_else(|| fail_closed("a grant carried no attrs"))?;
         let is_dir = (attrs.mode & libc::S_IFMT) == libc::S_IFDIR;
+        let dir = (wants.dentries && is_dir).then_some(entries);
         let bytes = TOKEN_ENTRY_BYTES
             + xattrs
                 .iter()
                 .map(|(n, v)| (n.len() + v.len()) as u64)
                 .sum::<u64>()
-            + entries
-                .iter()
-                .map(|d| 24 + d.name.len() as u64)
-                .sum::<u64>();
+            + dir.as_ref().map_or(0, |d| {
+                d.iter()
+                    .map(|r| DIR_RECORD_BYTES + r.name.len() as u64)
+                    .sum::<u64>()
+            });
+        let budget = self.records_budget();
+        if bytes > budget {
+            // ONE entry larger than the whole budget is never resident:
+            // refused loud (fail-closed — R-SYM-4 leaves no second read
+            // method), the remedy the message names.
+            self.oversize_refusals.fetch_add(1, Ordering::Relaxed);
+            return Err(fail_closed(&format!(
+                "object {object}'s records ({bytes} B) exceed this reader's token records \
+                 budget ({budget} B — 1/{} of the R5 memory budget; \
+                 dlm_token_oversize_refusals): a directory too large for this reader's \
+                 memory budget",
+                super::tokens::RECORDS_BUDGET_DIVISOR
+            )));
+        }
+        let names = dir.as_ref().map(|d| {
+            d.iter()
+                .enumerate()
+                .map(|(i, r)| (r.name.clone(), i))
+                .collect::<HashMap<Vec<u8>, usize>>()
+        });
         let entry = Arc::new(TokenEntry {
             attrs: attrs.into(),
             xattrs,
-            dir: (wants.dentries && is_dir).then_some(entries),
+            dir,
+            names,
+            bytes,
             state: AtomicU8::new(ENTRY_LIVE),
-            inflight: AtomicU64::new(0),
-            drain: squeezefs_ipc::sqz_notify::Notify::new(),
             used: AtomicBool::new(true),
         });
-        let retired = self.evict_to_cap();
-        if !retired.is_empty() {
-            // Voluntary releases (best effort — a lost release costs the
-            // holder one needless recall, never a wrong answer).
-            let _ = self.call(TokenCall::Release { objects: retired }).await;
-        }
+        // Room for the entry under the byte budget: evict (voluntary
+        // releases — each one drained and purged before the holder is
+        // told, the recall's own law) until it fits.
+        self.evict_to_budget(bytes).await;
         match self.cache.entry_sync(object) {
             scc::hash_map::Entry::Occupied(mut o) => {
                 let prev = o.get().clone();
@@ -1495,36 +1640,85 @@ impl TokenReaderPlane {
                 if prev.dir.is_some() && entry.dir.is_none() {
                     return Ok(FetchOutcome::Installed(prev));
                 }
+                self.credit(prev.bytes);
+                prev.state.store(ENTRY_REVOKED, Ordering::Release);
                 *o.get_mut() = Arc::clone(&entry);
             }
             scc::hash_map::Entry::Vacant(v) => {
                 v.insert_entry(Arc::clone(&entry));
             }
         }
-        self.cached_bytes.fetch_add(bytes, Ordering::Relaxed);
+        self.charge(bytes);
         Ok(FetchOutcome::Installed(entry))
     }
 
-    /// The token cache's cap: the delegation cache's derivation verbatim
-    /// (one R5 law, not two); past it one second-chance sweep — every
-    /// retired entry is a voluntary release.
-    fn evict_to_cap(&self) -> Vec<u64> {
-        if self.cache.len() < super::tokens::cache_cap() {
-            return Vec::new();
+    /// **Eviction = a voluntary release, drained and purged first**
+    /// (review round 1, Issue 4): while the cache with `incoming` bytes
+    /// added sits over the records budget, retire entries — the second-
+    /// chance sweep first (unused since their last serve), then any — run
+    /// the SAME data-plane drain + R-6 purge a recall runs on the retired
+    /// objects, and only then tell the holder (`Release`). A release the
+    /// holder never receives costs it one needless recall, never a wrong
+    /// answer; a purge skipped would let the reader DMA a block the
+    /// holder's next free — which recalls nobody for a released object —
+    /// reallocated.
+    async fn evict_to_budget(&self, incoming: u64) {
+        let budget = self.records_budget();
+        if self.cached_bytes.load(Ordering::Relaxed) + incoming <= budget {
+            return;
         }
         let mut retired: Vec<u64> = Vec::new();
-        self.cache.retain_sync(|ino, e| {
-            if e.used.swap(false, Ordering::Relaxed) {
-                true
-            } else {
+        for pass in 0..2u8 {
+            self.cache.retain_sync(|ino, e| {
+                if self.cached_bytes.load(Ordering::Relaxed) + incoming <= budget {
+                    return true;
+                }
+                if pass == 0 && e.used.swap(false, Ordering::Relaxed) {
+                    return true;
+                }
                 e.state.store(ENTRY_REVOKED, Ordering::Release);
+                self.credit(e.bytes);
                 retired.push(*ino);
                 false
+            });
+            if self.cached_bytes.load(Ordering::Relaxed) + incoming <= budget {
+                break;
             }
-        });
+        }
+        if retired.is_empty() {
+            return;
+        }
+        self.release_retired(retired).await;
+    }
+
+    /// The release path: the data-plane drain + purge on `objects`, then
+    /// the holder is told. ONE path, two triggers (eviction, the clean
+    /// leave).
+    async fn release_retired(&self, objects: Vec<u64>) {
+        if let Some(sink) = self.data_sink.get() {
+            sink.drain_and_purge(&objects).await;
+        }
         self.releases
-            .fetch_add(retired.len() as u64, Ordering::Relaxed);
-        retired
+            .fetch_add(objects.len() as u64, Ordering::Relaxed);
+        // Best effort: a lost release costs the holder one needless
+        // recall, never a wrong answer.
+        let _ = self.call(TokenCall::Release { objects }).await;
+    }
+
+    /// The R5 authority's shed: DROP every entry (no release — the holder
+    /// keeps the grant and recalls a reader that holds nothing; the drain
+    /// a release needs cannot run inside the authority's synchronous
+    /// trim, so the tokens stay registered and the recall law covers the
+    /// data plane).
+    fn shed_all(&self) {
+        let mut n = 0u64;
+        self.cache.retain_sync(|_, e| {
+            e.state.store(ENTRY_REVOKED, Ordering::Release);
+            self.credit(e.bytes);
+            n += 1;
+            false
+        });
+        self.sheds.fetch_add(n, Ordering::Relaxed);
     }
 
     /// Begin a serve of `object`: the cached entry under the serve gate,
@@ -1537,12 +1731,6 @@ impl TokenReaderPlane {
                     && (!wants.dentries || entry.dir.is_some())
                 {
                     entry.used.store(true, Ordering::Relaxed);
-                    entry.inflight.fetch_add(1, Ordering::AcqRel);
-                    if entry.state.load(Ordering::Acquire) != ENTRY_LIVE {
-                        entry.inflight.fetch_sub(1, Ordering::AcqRel);
-                        entry.drain.notify_waiters();
-                        continue;
-                    }
                     self.hits.fetch_add(1, Ordering::Relaxed);
                     return Ok(Some(TokenServe { entry }));
                 }
@@ -1550,10 +1738,7 @@ impl TokenReaderPlane {
             let Some(entry) = self.fetch(object, wants).await? else {
                 return Ok(None);
             };
-            entry.inflight.fetch_add(1, Ordering::AcqRel);
             if entry.state.load(Ordering::Acquire) != ENTRY_LIVE {
-                entry.inflight.fetch_sub(1, Ordering::AcqRel);
-                entry.drain.notify_waiters();
                 continue;
             }
             return Ok(Some(TokenServe { entry }));
@@ -1561,13 +1746,35 @@ impl TokenReaderPlane {
     }
 
     /// Drop every entry (the lease is gone / the channel died): serves
-    /// stop now; in-flight ones complete under the entry they hold.
+    /// stop now; ones already begun complete under the `Arc` they hold.
+    /// No release — the holder's lease arm retires the grants.
     fn drop_all(&self) {
         self.cache.retain_sync(|_, e| {
             e.state.store(ENTRY_REVOKED, Ordering::Release);
+            self.credit(e.bytes);
             false
         });
-        self.cached_bytes.store(0, Ordering::Relaxed);
+    }
+
+    /// [`Self::drop_all`] followed by the data-plane drain + purge of
+    /// every dropped object — the channel task's arm on a channel loss:
+    /// the holder's lease arm retires the grants and its frees will ship
+    /// without recalling this reader, so no serve under the dropped
+    /// records may stay in flight and no block key of theirs cached.
+    async fn drop_all_and_purge(&self) {
+        let mut dropped: Vec<u64> = Vec::new();
+        self.cache.retain_sync(|ino, e| {
+            e.state.store(ENTRY_REVOKED, Ordering::Release);
+            self.credit(e.bytes);
+            dropped.push(*ino);
+            false
+        });
+        if dropped.is_empty() {
+            return;
+        }
+        if let Some(sink) = self.data_sink.get() {
+            sink.drain_and_purge(&dropped).await;
+        }
     }
 
     /// The standing recall channel — run by the reader's task until
@@ -1575,7 +1782,7 @@ impl TokenReaderPlane {
     /// parked call must never block a grant.
     pub async fn run_recall_channel(self: Arc<Self>) {
         let mut session: Option<RpcClient> = None;
-        let mut backoff = Duration::from_millis(50);
+        let mut backoff = RECONNECT_BACKOFF_FLOOR;
         while !self.stop.load(Ordering::Relaxed) {
             let client = match session.as_mut() {
                 Some(c) => c,
@@ -1588,7 +1795,7 @@ impl TokenReaderPlane {
                 .await
                 {
                     Ok(c) => {
-                        backoff = Duration::from_millis(50);
+                        backoff = RECONNECT_BACKOFF_FLOOR;
                         session.insert(c)
                     }
                     Err(e) => {
@@ -1598,9 +1805,9 @@ impl TokenReaderPlane {
                             backoff
                         );
                         self.channel_ok.store(false, Ordering::Release);
-                        self.drop_all();
+                        self.drop_all_and_purge().await;
                         squeezefs_ipc::sqz_time::sleep(backoff).await;
-                        backoff = (backoff * 2).min(Duration::from_secs(5));
+                        backoff = (backoff * 2).min(RECONNECT_BACKOFF_CEILING);
                         continue;
                     }
                 },
@@ -1622,7 +1829,7 @@ impl TokenReaderPlane {
                             );
                             session = None;
                             self.channel_ok.store(false, Ordering::Release);
-                            self.drop_all();
+                            self.drop_all_and_purge().await;
                         }
                     }
                 }
@@ -1630,7 +1837,7 @@ impl TokenReaderPlane {
                     log::warn!("token recall channel answered {other:?}; reconnecting");
                     session = None;
                     self.channel_ok.store(false, Ordering::Release);
-                    self.drop_all();
+                    self.drop_all_and_purge().await;
                 }
                 Err(e) => {
                     log::warn!(
@@ -1640,9 +1847,9 @@ impl TokenReaderPlane {
                     );
                     session = None;
                     self.channel_ok.store(false, Ordering::Release);
-                    self.drop_all();
+                    self.drop_all_and_purge().await;
                     squeezefs_ipc::sqz_time::sleep(backoff).await;
-                    backoff = (backoff * 2).min(Duration::from_secs(5));
+                    backoff = (backoff * 2).min(RECONNECT_BACKOFF_CEILING);
                 }
             }
         }
@@ -1664,18 +1871,14 @@ impl TokenReaderPlane {
                     v.insert_entry(1);
                 }
             }
-            let Some(entry) = self.cache.remove_sync(&o).map(|(_, e)| e) else {
-                continue;
-            };
-            entry.state.store(ENTRY_REVOKED, Ordering::Release);
-            loop {
-                let notified = entry.drain.notified();
-                if entry.inflight.load(Ordering::Acquire) == 0 {
-                    break;
-                }
-                notified.await;
+            if let Some((_, entry)) = self.cache.remove_sync(&o) {
+                entry.state.store(ENTRY_REVOKED, Ordering::Release);
+                self.credit(entry.bytes);
             }
         }
+        // The data-plane half BEFORE the ack: every serve that began under
+        // the recalled records drains (`ServeStamp`) and the objects' block
+        // keys are purged — the ack is what lets the holder's free ship.
         if let Some(sink) = self.data_sink.get() {
             sink.drain_and_purge(objects).await;
         }
@@ -1698,14 +1901,12 @@ impl TokenReaderPlane {
     /// lease-expiry arm.
     pub async fn stop(&self) {
         let mut held: Vec<u64> = Vec::new();
-        self.cache.retain_sync(|ino, _| {
+        self.cache.iter_sync(|ino, _| {
             held.push(*ino);
             true
         });
         if !held.is_empty() && self.channel_ok.load(Ordering::Acquire) {
-            self.releases
-                .fetch_add(held.len() as u64, Ordering::Relaxed);
-            let _ = self.call(TokenCall::Release { objects: held }).await;
+            self.release_retired(held).await;
         }
         self.stop.store(true, Ordering::Relaxed);
         self.drop_all();
@@ -1728,6 +1929,9 @@ impl TokenReaderPlane {
             recalls_received: self.recalls_received.load(Ordering::Relaxed),
             recalls_acked: self.recalls_acked.load(Ordering::Relaxed),
             releases: self.releases.load(Ordering::Relaxed),
+            cached_bytes: self.cached_bytes.load(Ordering::Relaxed),
+            sheds: self.sheds.load(Ordering::Relaxed),
+            oversize_refusals: self.oversize_refusals.load(Ordering::Relaxed),
             serve_refusals: self.serve_refusals.load(Ordering::Relaxed),
             channel_rounds: self.channel_rounds.load(Ordering::Relaxed),
             fetch_retries: self.fetch_retries.load(Ordering::Relaxed),
@@ -1765,6 +1969,9 @@ pub struct TokenReaderStats {
     pub recalls_received: u64,
     pub recalls_acked: u64,
     pub releases: u64,
+    pub cached_bytes: u64,
+    pub sheds: u64,
+    pub oversize_refusals: u64,
     pub serve_refusals: u64,
     pub channel_rounds: u64,
     pub fetch_retries: u64,
@@ -1840,14 +2047,7 @@ pub async fn token_find_dentry(
             format!("Inode {parent} not found"),
         )));
     };
-    let entry = serve.entry();
-    let Some(dir) = entry.dir.as_ref() else {
-        return Ok(None);
-    };
-    Ok(dir
-        .iter()
-        .find(|d| d.name == name.as_bytes())
-        .map(dentry_of))
+    Ok(serve.entry().find(name.as_bytes()).map(dentry_of))
 }
 
 // ---------------------------------------------------------------------------
@@ -1942,6 +2142,9 @@ pub fn reader_stats_json(volumes: &[Arc<KvMetaBackend>]) -> serde_json::Value {
         "dlm_token_recalls_received": per(&|s| s.recalls_received),
         "dlm_token_recalls_acked": per(&|s| s.recalls_acked),
         "dlm_token_reader_releases": per(&|s| s.releases),
+        "dlm_token_cached_bytes": per(&|s| s.cached_bytes),
+        "dlm_token_sheds": per(&|s| s.sheds),
+        "dlm_token_oversize_refusals": per(&|s| s.oversize_refusals),
         "dlm_token_serve_refusals": per(&|s| s.serve_refusals),
         "dlm_token_channel_rounds": per(&|s| s.channel_rounds),
         "dlm_token_fetch_retries": per(&|s| s.fetch_retries),

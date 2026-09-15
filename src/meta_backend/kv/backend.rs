@@ -11276,17 +11276,15 @@ impl KvMetaBackend {
             else {
                 return Ok(out); // an ino with no dentries lists empty (the v2 contract)
             };
-            if let Some(entries) = serve.entry().dir.as_ref() {
-                for d in entries.iter().filter(|d| d.cookie > after).take(max) {
-                    out.push((
-                        d.cookie,
-                        DirEntry {
-                            ino: d.child_ino,
-                            name: String::from_utf8_lossy(&d.name).into_owned(),
-                            file_type: u32::from(d.file_type) << 12,
-                        },
-                    ));
-                }
+            for d in serve.entry().page_after(after, max) {
+                out.push((
+                    d.cookie,
+                    DirEntry {
+                        ino: d.child_ino,
+                        name: String::from_utf8_lossy(&d.name).into_owned(),
+                        file_type: u32::from(d.file_type) << 12,
+                    },
+                ));
             }
             return Ok(out);
         }

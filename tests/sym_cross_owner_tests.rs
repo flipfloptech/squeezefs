@@ -1252,6 +1252,157 @@ fn the_cross_owner_family_is_exported_under_its_published_names() {
 }
 
 // ---------------------------------------------------------------------------
+// The roll-forward cadence beside LIVE ops (review round 1, Issue 4).
+// ---------------------------------------------------------------------------
+
+/// The cadence never adopts a LIVE initiator's intent — its own op is
+/// its own, however long it runs (a step parked at a busy holder, a wire
+/// timeout, a D1.b stall): adoption is keyed on the register's
+/// in-flight / abandoned state, never on elapsed time or a tick count.
+/// A `link` whose shipped insert is HELD at the holder spans several
+/// cadence passes; none re-applies it, and after the op completes and
+/// the user unlinks the name, a further pass resurrects nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_live_op_spanning_cadence_passes_is_never_replayed_by_the_cadence() {
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    let (uris, dirs) = seeded_volume(dir.path(), &[SLOT_B]).await;
+    let shared = dirs[0];
+    let routed = open_under(&uris, true, Some(TWO_HOLDERS)).await;
+    let holders = Holders::stand_up(&routed, &[1]).await;
+    let f = routed
+        .create(ROOT_INO, "f", libc::S_IFREG | 0o644, 0, 0)
+        .await
+        .unwrap()
+        .ino;
+    let before = cross_owner_stats();
+    crossvol_tx::TEST_XV_SERVE_HOLD_MS.store(600, Ordering::SeqCst);
+    let op = {
+        let routed = Arc::clone(&routed);
+        tokio::spawn(async move { routed.link(f, shared, "l").await })
+    };
+    // Several cadence passes while the op is parked at the holder.
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    let mut passes = 0;
+    while !op.is_finished() && passes < 20 {
+        assert_eq!(
+            crossvol_tx::roll_forward_open_intents(&routed)
+                .await
+                .unwrap(),
+            0,
+            "a live op's intent is its own — never adopted"
+        );
+        assert_eq!(cross_owner_stats().intents_open, 1, "registered in flight");
+        passes += 1;
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert!(passes >= 2, "the op spanned at least two passes ({passes})");
+    crossvol_tx::TEST_XV_SERVE_HOLD_MS.store(0, Ordering::SeqCst);
+    op.await.unwrap().unwrap();
+    assert_eq!(routed.getattr(f).await.unwrap().nlink, 2);
+    // The user removes the link; a later pass must resurrect nothing.
+    routed.unlink(shared, "l").await.unwrap();
+    assert_eq!(
+        crossvol_tx::roll_forward_open_intents(&routed)
+            .await
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        routed.getattr(f).await.unwrap().nlink,
+        1,
+        "no resurrected count"
+    );
+    assert!(
+        names_in(&routed, shared).await.is_empty(),
+        "no resurrected name"
+    );
+    let after = cross_owner_stats();
+    assert_eq!(after.intents_open, 0);
+    assert_eq!(
+        after.intents_minted - before.intents_minted,
+        2,
+        "the link and the unlink"
+    );
+    assert_closed("live op vs cadence");
+    holders.tear_down();
+    shutdown(&routed).await;
+    fsck_clean(&uris).await;
+}
+
+/// A cadence pass that SCANNED an intent another pass then retired
+/// re-reads the record under the guards it acquires and finds it gone —
+/// a no-op, even when the objects have moved since in a way the stale
+/// plan's witnesses would accept (the unlinked name is free again, the
+/// count is back at `pre`): nothing is re-applied, no RAM ghost survives
+/// (`intents_open` 0, `intents_stuck` 0 past the grace window).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_retired_intent_met_by_a_stale_scan_is_a_no_op_and_leaves_no_ghost() {
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    let (uris, dirs) = seeded_volume(dir.path(), &[SLOT_B]).await;
+    let shared = dirs[0];
+    let routed = open_under(&uris, true, Some(TWO_HOLDERS)).await;
+    let holders = Holders::stand_up(&routed, &[1]).await;
+    let f = routed
+        .create(ROOT_INO, "f", libc::S_IFREG | 0o644, 0, 0)
+        .await
+        .unwrap()
+        .ino;
+    // An ABANDONED intent: the holder is down for the op, which errors.
+    TEST_XV_SERVE_REFUSE.store(true, Ordering::SeqCst);
+    assert!(routed.link(f, shared, "l").await.is_err());
+    TEST_XV_SERVE_REFUSE.store(false, Ordering::SeqCst);
+    assert_eq!(cross_owner_stats().intents_open, 1);
+    // Pass A scans, then parks; pass B completes and retires the intent;
+    // the user unlinks the name; pass A resumes on its stale scan.
+    crossvol_tx::TEST_XV_CADENCE_HOLD_AFTER_SCAN_MS.store(400, Ordering::SeqCst);
+    let pass_a = {
+        let routed = Arc::clone(&routed);
+        tokio::spawn(async move { crossvol_tx::roll_forward_open_intents(&routed).await })
+    };
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    crossvol_tx::TEST_XV_CADENCE_HOLD_AFTER_SCAN_MS.store(0, Ordering::SeqCst);
+    assert_eq!(
+        crossvol_tx::roll_forward_open_intents(&routed)
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(routed.getattr(f).await.unwrap().nlink, 2);
+    routed.unlink(shared, "l").await.unwrap();
+    assert_eq!(routed.getattr(f).await.unwrap().nlink, 1);
+    assert_eq!(
+        pass_a.await.unwrap().unwrap(),
+        0,
+        "the stale scan applies nothing"
+    );
+    assert_eq!(
+        routed.getattr(f).await.unwrap().nlink,
+        1,
+        "no resurrected count"
+    );
+    assert!(
+        names_in(&routed, shared).await.is_empty(),
+        "no resurrected name"
+    );
+    let s = cross_owner_stats();
+    assert_eq!(s.intents_open, 0, "no RAM ghost");
+    TEST_XV_STUCK_AFTER_MS.store(1, Ordering::SeqCst);
+    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    assert_eq!(
+        cross_owner_stats().intents_stuck,
+        0,
+        "nothing stuck behind a ghost"
+    );
+    TEST_XV_STUCK_AFTER_MS.store(0, Ordering::SeqCst);
+    assert_closed("stale scan");
+    holders.tear_down();
+    shutdown(&routed).await;
+    fsck_clean(&uris).await;
+}
+
+// ---------------------------------------------------------------------------
 // The 4a guards travel (design §5.6 line 1) — found by the scoping row.
 // ---------------------------------------------------------------------------
 

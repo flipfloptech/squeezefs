@@ -1875,11 +1875,22 @@ async fn rollbacks_address_stamped_seqs_on_a_ring_with_an_offset() {
 /// checkpoint cycles and aborted `Corrupt` (retried every tick).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_release_from_the_quieter_ring_clears_its_window_in_one_cycle() {
+    struct Cleanup;
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            std::env::remove_var("SQUEEZEFS_META_FLUSH_INTERVAL_MS");
+        }
+    }
+    let _cleanup = Cleanup;
     let dir = tempfile::tempdir().unwrap();
     let _g = SEAM.lock().await;
     let uris = vec![format_stamped_member(dir.path(), "meta0").await];
     let tag = volume_tag("vol-0000000000000022");
     let owner = ino_in_slot(SLOT4, 5);
+    // The cadence PARKED: the cycle count below is a process-global delta,
+    // and a tick landing inside the release would count as one of its
+    // cycles (review round 6, Issue 33's class).
+    std::env::set_var("SQUEEZEFS_META_FLUSH_INTERVAL_MS", "60000");
     let routed = open_with_ring0_offset(&uris, tag, owner).await;
     let vol = Arc::clone(&routed.volumes[0]);
     // Region 0 (the quieter ring) writes the slot once, then releases it.
@@ -2392,12 +2403,39 @@ async fn a_leased_leafs_split_wider_than_the_one_smo_constant_is_refilled_to_its
 /// that tree and the tick errored every cadence. Then a WIRE joiner takes
 /// the slot: the manager's sweep skips its tree (`merge_sweep_foreign_
 /// skips`), completes the lap, and refuses nothing.
+///
+/// **The witness is the TREE, under a parked cadence** (review round 6,
+/// Issue 33): the round-4 pin read a process-global `META_KV_NODE_MERGES`
+/// delta taken after the release, and on a legal schedule the cadence's
+/// own pass merged the pair FIRST (the checkpoint task's backlog sweep on
+/// the now-unleased tree — Issue 25's fix on the tick instead of the
+/// test's call), so the test's sweep had nothing left and the pin read
+/// "who merged" (~8 % red on the matrix's stamped leg). Now no background
+/// pass runs, slot 4's own underfull-leaf census and node count are read
+/// before and after the sweep, the sweep's OWN report says it merged, and
+/// the global counter is the secondary check.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_manager_merges_an_unleased_slot_tree_and_skips_a_foreign_leased_one() {
     use squeezefs::meta_backend::kv::META_KV_NODE_MERGES;
+    struct Cleanup;
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            std::env::remove_var("SQUEEZEFS_SYM_RING_KB");
+            std::env::remove_var("SQUEEZEFS_META_FLUSH_INTERVAL_MS");
+        }
+    }
+    let _cleanup = Cleanup;
     let dir = tempfile::tempdir().unwrap();
     let _g = SEAM.lock().await;
-    let uris = vec![format_stamped_member(dir.path(), "meta0").await];
+    // The cadence PARKED (every SMO of this test is one the test runs) and
+    // region 1's ring wide enough for the fixture's writes on a member
+    // whose appender budget admits the wire joiner beside it (the Issue-28
+    // fixture's shape).
+    let uris = vec![
+        format_stamped_member_sized(dir.path(), "meta0", 320 * 1024 * 1024, 8 * 1024 * 1024).await,
+    ];
+    std::env::set_var("SQUEEZEFS_SYM_RING_KB", "4096");
+    std::env::set_var("SQUEEZEFS_META_FLUSH_INTERVAL_MS", "60000");
     let routed = open_under(&uris, &Knobs::armed().partition(PARTITION)).await;
     let vol = Arc::clone(&routed.volumes[0]);
     let refusals0 = META_KV_LEAF_LEASE_REFUSALS.load(Ordering::Relaxed);
@@ -2418,19 +2456,28 @@ async fn the_manager_merges_an_unleased_slot_tree_and_skips_a_foreign_leased_one
     }
     vol.checkpoint_now().await.unwrap();
     vol.checkpoint_now().await.unwrap();
-    // The census is a lock-free RAM walk (a background flush pass may be
-    // mid-swap): the precondition is that it finds SOME underfull leaf —
-    // the sweep below, serialized under the SMO mutex, is the verdict.
-    let census = vol.dead_bset_census();
-    assert!(
-        !census.merge_candidates.is_empty(),
-        "the fixture: underfull leaves in slot 4 ({} of {})",
-        census.merge_candidates.len(),
-        census.leaves
-    );
     // Region 1 releases the slot: unleased, the manager's to maintain.
     vol.release_slot_handover(1, SLOT4).await.unwrap();
     assert!(!vol.slot_leases().unwrap().gate.is_leased(SLOT4));
+    // Slot 4's tree AFTER the release, with nothing else running: its
+    // reachable nodes and the underfull leaves the census finds among
+    // them — the sweep's input.
+    let tree = vol.slot_tree(SLOT4).expect("slot 4's tree");
+    let slot4_candidates = |census: &squeezefs::meta_backend::kv::backend::DeadBsetCensus,
+                            nodes: &std::collections::BTreeSet<u64>| {
+        census
+            .merge_candidates
+            .iter()
+            .filter(|(_, addr)| nodes.contains(addr))
+            .count()
+    };
+    let nodes0 = tree.reachable_node_addrs().await.unwrap();
+    let candidates0 = slot4_candidates(&vol.dead_bset_census(), &nodes0);
+    assert!(
+        candidates0 >= 1,
+        "the fixture: underfull leaves in slot 4's {} nodes (none found)",
+        nodes0.len()
+    );
     let merges0 = META_KV_NODE_MERGES.load(Ordering::Relaxed);
     let report = vol
         .defrag_merge_sweep(None)
@@ -2438,8 +2485,24 @@ async fn the_manager_merges_an_unleased_slot_tree_and_skips_a_foreign_leased_one
         .expect("the manager's sweep runs over an unleased slot tree");
     assert!(report.lap_complete, "the lap completes");
     assert!(
+        report.merges >= 1,
+        "the sweep's own report: it merged the unleased tree's underfull pair ({report:?})"
+    );
+    let nodes1 = tree.reachable_node_addrs().await.unwrap();
+    assert!(
+        nodes1.len() < nodes0.len(),
+        "the tree lost a node to the merge ({} → {})",
+        nodes0.len(),
+        nodes1.len()
+    );
+    let candidates1 = slot4_candidates(&vol.dead_bset_census(), &nodes1);
+    assert!(
+        candidates1 < candidates0,
+        "the underfull population shrank ({candidates0} → {candidates1})"
+    );
+    assert!(
         META_KV_NODE_MERGES.load(Ordering::Relaxed) > merges0,
-        "the unleased tree's underfull pair merged"
+        "the global counter agrees (secondary)"
     );
     assert_eq!(
         META_KV_LEAF_LEASE_REFUSALS.load(Ordering::Relaxed),
@@ -2595,8 +2658,12 @@ async fn a_wire_grant_of_an_unleased_tree_waits_for_the_sweep_and_clears_its_win
         .expect("the sweep completes its pass — the merge landed on a still-unleased tree");
     assert!(report.lap_complete);
     assert!(
+        report.merges >= 1,
+        "the sweep's own report: the parked merge landed ({report:?})"
+    );
+    assert!(
         META_KV_NODE_MERGES.load(Ordering::Relaxed) > merges0,
-        "the parked merge landed"
+        "the global counter agrees (secondary)"
     );
     let (mut client, reply) = grant.await.unwrap();
     match reply.unwrap() {
@@ -2711,6 +2778,15 @@ async fn a_wire_releases_slot_words_are_screened_before_any_effect() {
             .unwrap();
     }
     vol.reserve_guest_ino_range(routing, 16).unwrap();
+    // A SECOND tree, slot 5 (routing 4), for the slot witness below: a
+    // holder of both must not release one with the other's root.
+    const SLOT5: ForestSlot = 5;
+    let routing_b: u16 = 4;
+    for k in 1..=3u64 {
+        vol.setxattr_internal(ino_in_slot(SLOT5, k), "user.seed", &value)
+            .await
+            .unwrap();
+    }
     vol.checkpoint_now().await.unwrap();
     let offset_before_self_release = vol.journal_ring().seq_offset();
     vol.release_slot_handover(0, SLOT4).await.unwrap();
@@ -2719,6 +2795,7 @@ async fn a_wire_releases_slot_words_are_screened_before_any_effect() {
         offset_before_self_release,
         "the manager's own release moves nothing between rings — no seq gap (Issue 30)"
     );
+    vol.release_slot_handover(0, SLOT5).await.unwrap();
     let (host, mut client, joiner) = wire_joiner(&vol, 29).await;
     let granted = match client.acquire_slot(joiner, routing).await.unwrap() {
         ManagerReply::SlotsGranted { slots, already } => {
@@ -2729,6 +2806,11 @@ async fn a_wire_releases_slot_words_are_screened_before_any_effect() {
         other => panic!("{other:?}"),
     };
     assert!(granted.root.0 != 0 && granted.cursor >= 18 && granted.seq_floor > 0);
+    let granted_b = match client.acquire_slot(joiner, routing_b).await.unwrap() {
+        ManagerReply::SlotsGranted { slots, .. } => slots[0].words,
+        other => panic!("{other:?}"),
+    };
+    assert!(granted_b.root.0 != 0 && granted_b.root != granted.root);
     // The snapshot every poisoned frame must leave byte-identical.
     let path = std::path::Path::new(&uris[0]);
     let sector0 = || std::fs::read(path).unwrap()[..4096].to_vec();
@@ -2799,6 +2881,15 @@ async fn a_wire_releases_slot_words_are_screened_before_any_effect() {
             "root at the recorded address with another incarnation stamp",
             WireSlotWords {
                 root: (granted.root.0, granted.root.1 + 1),
+                seq_floor: granted.seq_floor + 1,
+                ..granted
+            },
+        ),
+        (
+            "root = the joiner's OTHER tree's root (inside its grant, the right stamp, slot 5's \
+             records — round 7, Issue 32)",
+            WireSlotWords {
+                root: granted_b.root,
                 seq_floor: granted.seq_floor + 1,
                 ..granted
             },
@@ -2939,6 +3030,86 @@ async fn a_wire_releases_slot_words_are_screened_before_any_effect() {
         rejected,
         "the legitimate release is not a rejection"
     );
+    host.shutdown();
+    shutdown(&routed).await;
+}
+
+/// **Issue 31 (round 7): a wire appender's page that no appender
+/// checkpoint ever wrote bounds a release's `seq_floor` by the sane cap
+/// alone.** The derived bound (`release_seq_floor_bound`) presumes the
+/// appender's OWN checkpoint refreshes its page's `head_hint` — PR 12's
+/// obligation; in PR 4 only the join and the manager's slot-only rewrites
+/// touch a wire appender's page, so `head_hint` is the join-time `start`
+/// for ever and the derived bound would refuse a LEGITIMATE release past
+/// two laps of the joiner's ring (the slot stuck leased). The screen reads
+/// `ckpt_seq == 0` and falls back to the cap: a floor far above the
+/// derived bound is accepted, `u64::MAX` still refused.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_release_from_a_page_no_checkpoint_wrote_is_bounded_by_the_cap_alone() {
+    use squeezefs::meta_backend::kv::appender::{release_seq_floor_bound, SEQ_FRONTIER_SANE_MAX};
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    let uris = vec![format_stamped_member(dir.path(), "meta0").await];
+    let routed = open_under(&uris, &Knobs::armed()).await;
+    let vol = Arc::clone(&routed.volumes[0]);
+    let (host, mut client, joiner) = wire_joiner(&vol, 31).await;
+    let routing: u16 = 100;
+    let granted = match client.acquire_slot(joiner, routing).await.unwrap() {
+        ManagerReply::SlotsGranted { slots, .. } => slots[0].words,
+        other => panic!("{other:?}"),
+    };
+    // The joiner's page as the manager reads it: written by the join and
+    // the grant's slot rewrite only — no checkpoint of its own.
+    let entries = read_directory(std::path::Path::new(&uris[0]), vol.superblock())
+        .await
+        .unwrap();
+    let page = entries
+        .iter()
+        .find_map(|e| e.page.clone().filter(|p| p.appender_id == joiner))
+        .expect("the joiner's Live page");
+    assert_eq!(page.ckpt_seq, 0, "no appender checkpoint wrote this page");
+    let ring_len: u64 = page.segments.iter().map(|s| s.len).sum();
+    let derived = release_seq_floor_bound(
+        page.seq_offset,
+        Some(granted.seq_floor),
+        page.head_hint,
+        ring_len,
+    );
+    // A lessee that journaled many laps: its frontier is far past the
+    // stale hint's bound — and legitimate.
+    let far = granted.seq_floor + 64 * ring_len;
+    assert!(far > derived && far < SEQ_FRONTIER_SANE_MAX);
+    let rejected0 = vol.appender_stats().unwrap().manager_verb_rejected;
+    let already = client
+        .release_slot(
+            joiner,
+            routing,
+            1,
+            squeezefs::meta_ship::manager::WireSlotWords {
+                seq_floor: far,
+                ..granted
+            },
+            Vec::new(),
+        )
+        .await
+        .expect("a legitimate release past the stale hint's bound lands");
+    assert!(!already);
+    assert_eq!(
+        vol.appender_stats().unwrap().manager_verb_rejected,
+        rejected0
+    );
+    let states = tree0_states(&vol).await;
+    match states
+        .iter()
+        .find(|(s, _)| *s == guest_forest_slot(routing))
+        .map(|(_, st)| st)
+    {
+        Some(SlotState::Unleased {
+            seq_floor, g: 1, ..
+        }) => assert_eq!(*seq_floor, far),
+        other => panic!("{other:?}"),
+    }
+    assert!(vol.journal_ring().seq_frontier() > far);
     host.shutdown();
     shutdown(&routed).await;
 }

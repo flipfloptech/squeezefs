@@ -1567,6 +1567,76 @@ impl KvMetaBackend {
         }
     }
 
+    /// **The once-armed gate** (design-symmetric-metadata §5.8.2 / §7.2;
+    /// PR 5 review round 3, Issue 25): a WRITER without the slot-lease
+    /// plane (`SQUEEZEFS_SYMMETRIC_META` unset) refuses a bit-17 volume
+    /// whose tree 0 records any slot generation `g ≥ 1` — a generation
+    /// the plane minted.
+    ///
+    /// The frame-stamp law is "a slot's generations are ONE sequence
+    /// owned by its lease; a frame is legitimate under the lease that
+    /// wrote it". Every append to an EXISTING leaf on an armed volume is
+    /// its slot's lessee's at the slot's current generation (a user
+    /// commit acquires the slot first-touch; the manager's structural
+    /// `(0, g)` lands on fresh SMO images only). A writer holding no lease
+    /// has NO legitimate stamp: `(0, g)` sits past the generation's
+    /// recorded tail (rule 2's zombie shape — the release recorded `g`'s
+    /// tails), `(0, g + 1)` pre-empts a generation tree 0 never granted
+    /// (rule 1's breach on every slot the next arm does not acquire; rule
+    /// 4's when a wire joiner takes it), and moving tree 0's generation
+    /// IS the plane — the first-touch acquire and the release's tails.
+    /// So the honest answer is the refusal: `=0` on a PR 1–3-shaped volume
+    /// (every slot at `g = 0`, §7.1 — the shape the seam, `format
+    /// --symmetric` and `enable-symmetric` all produce) stays the shipped
+    /// posture exactly; a volume the plane has stamped stays under the
+    /// plane until the PR-14 flip. Readers, probes and co-writers append
+    /// nothing and open as before. One tree-0 range scan — the arm's own
+    /// `load_slot_leases` walk, paid once per writer open.
+    async fn refuse_unarmed_writer_of_an_armed_forest(
+        &self,
+        path: &Path,
+    ) -> std::result::Result<(), KvError> {
+        let Some(control) = self.forest_control_tree() else {
+            return Ok(());
+        };
+        let (mut cursor, end) = super::slot_state::slot_state_key_range();
+        let mut armed_slots = 0u64;
+        let mut g_max = 0u32;
+        loop {
+            let page = control.range(&cursor, &end, 512).await?;
+            let Some((last, _)) = page.last() else {
+                break;
+            };
+            cursor = key_successor(last);
+            for (_, v) in &page {
+                let g = match super::slot_state::SlotState::decode(v)? {
+                    super::slot_state::SlotState::Unleased { g, .. }
+                    | super::slot_state::SlotState::Leased { g, .. } => g,
+                };
+                if g >= 1 {
+                    armed_slots += 1;
+                    g_max = g_max.max(g);
+                }
+            }
+            if page.len() < 512 {
+                break;
+            }
+        }
+        if armed_slots == 0 {
+            return Ok(());
+        }
+        Err(KvError::Busy(format!(
+            "{}: refusing a writable mount without SQUEEZEFS_SYMMETRIC_META=1 — this \
+             symmetric-forest volume has been mounted under the slot-lease plane ({armed_slots} \
+             slot(s) at generation ≥ 1, highest {g_max}), and a writer without the plane stamps \
+             frames no lease backs (design-symmetric-metadata §5.8.2: the screen would drop its \
+             acked commits at the next load). Once armed, a set stays armed until the PR-14 \
+             flip: mount with SQUEEZEFS_SYMMETRIC_META=1 (an offline writable verb too); \
+             read-only mounts, probes and co-writers open without it",
+            path.display()
+        )))
+    }
+
     async fn open_writer(
         path: &Path,
         tolerate_sym_upgrade: bool,
@@ -1650,6 +1720,13 @@ impl KvMetaBackend {
         // refusal drops `inner` (and its flock) with nothing written.
         if !tolerate_sym_upgrade {
             inner.refuse_sym_upgrade_marker(path).await?;
+        }
+        // (2c) The once-armed gate (PR 5, §5.8.2's frame-stamp law): a
+        // writer without the slot-lease plane on a volume whose slots
+        // carry a generation the plane minted — same place in the ladder,
+        // same "nothing written" shape.
+        if !super::slot_lease::symmetric_meta_requested() {
+            inner.refuse_unarmed_writer_of_an_armed_forest(path).await?;
         }
         inner.writer_id = uuid::Uuid::new_v4().to_string();
         // Layer B1 resolution: test override first, then the real RESCAP

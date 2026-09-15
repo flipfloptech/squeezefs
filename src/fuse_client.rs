@@ -4015,9 +4015,17 @@ pub enum MetaTxPassPhase {
     /// apply pass start → its members' terminal outcomes staged (per
     /// window). `tx_queue_wait + window_total` ≈ a tx's commit latency.
     WindowTotal = 9,
+    /// Pass (PR 5, design-symmetric-metadata §5.7.1): the read-token
+    /// RECALL of the batch's union — the pass's call → every recall acked
+    /// or expired with its reader's lease — one wire round trip (2.3 ms
+    /// healthy; a dead reader's lease remainder at worst) INSIDE the
+    /// serialized apply stage, recorded on its own so `pass_total`
+    /// decomposes and ρ = Σ ÷ wall names it. Recorded on an ARMED holder
+    /// only: an unarmed pass adds no sample.
+    PassTokenRecall = 10,
 }
 
-const META_TXPASS_PHASES: usize = 10;
+const META_TXPASS_PHASES: usize = 11;
 const META_TXPASS_PHASE_NAMES: [&str; META_TXPASS_PHASES] = [
     "tx_queue_wait",
     "pass_admission",
@@ -4029,6 +4037,7 @@ const META_TXPASS_PHASE_NAMES: [&str; META_TXPASS_PHASES] = [
     "journal_barrier",
     "window_lane_wait",
     "window_total",
+    "pass_token_recall",
 ];
 
 static META_TXPASS_PROF: Lazy<[LatencyHistogram; META_TXPASS_PHASES]> =
@@ -4048,6 +4057,7 @@ const META_TXPASS_STAGE: [Option<crate::op_trace::Stage>; META_TXPASS_PHASES] = 
     Some(crate::op_trace::Stage::JournalWritten),
     Some(crate::op_trace::Stage::JournalPrefixDone),
     Some(crate::op_trace::Stage::Barrier),
+    None,
     None,
     None,
 ];

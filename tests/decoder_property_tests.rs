@@ -2083,3 +2083,146 @@ proptest! {
         prop_assert_eq!(RecoveredRecord::decode(&r.encode()).expect("decodes"), r);
     }
 }
+
+// PR 5 — the read-token wire (`meta_ship::token_plane`, review round 1
+// Issue 9): the stable mirror of `fuzz/fuzz_targets/token_call_frame.rs`.
+// ---------------------------------------------------------------------------
+
+use squeezefs::meta_ship::token_plane::{
+    decode_reply as decode_token_reply, decode_request as decode_token_request,
+    encode_reply as encode_token_reply, encode_request as encode_token_request, DirRecord,
+    TokenCall, TokenMode, TokenRecords, TokenReply, TokenReplyFrame, TokenRequestFrame, TokenWants,
+    WireAttrs, TOKEN_SCHEMA,
+};
+
+fn arb_token_call() -> impl Strategy<Value = TokenCall> {
+    prop_oneof![
+        (any::<u64>(), any::<bool>(), any::<u64>()).prop_map(|(object, dentries, after)| {
+            TokenCall::Grant {
+                object,
+                mode: TokenMode::Read,
+                wants: TokenWants { dentries },
+                after,
+            }
+        }),
+        any::<u32>().prop_map(|wait_ms| TokenCall::Recall { wait_ms }),
+        any::<u64>().prop_map(|frame_id| TokenCall::RecallAck { frame_id }),
+        prop::collection::vec(any::<u64>(), 0..32)
+            .prop_map(|objects| TokenCall::Release { objects }),
+    ]
+}
+
+fn arb_wire_attrs() -> impl Strategy<Value = WireAttrs> {
+    (
+        any::<u32>(),
+        any::<u32>(),
+        any::<u32>(),
+        any::<u32>(),
+        any::<u32>(),
+        any::<u32>(),
+        any::<u64>(),
+        any::<u64>(),
+        any::<u64>(),
+        any::<u64>(),
+    )
+        .prop_map(
+            |(mode, uid, gid, nlink, flags, rdev, size, atime, mtime, ctime)| WireAttrs {
+                mode,
+                uid,
+                gid,
+                nlink,
+                flags,
+                rdev,
+                size,
+                atime,
+                mtime,
+                ctime,
+            },
+        )
+}
+
+fn arb_token_reply() -> impl Strategy<Value = TokenReply> {
+    let dir = prop::option::of((
+        prop::collection::vec(
+            (
+                any::<u64>(),
+                any::<u64>(),
+                any::<u8>(),
+                prop::collection::vec(any::<u8>(), 0..255),
+            )
+                .prop_map(|(cookie, child_ino, file_type, name)| DirRecord {
+                    cookie,
+                    child_ino,
+                    file_type,
+                    name,
+                }),
+            0..32,
+        ),
+        any::<bool>(),
+    ));
+    let xattrs = prop::collection::vec(
+        (
+            prop::collection::vec(any::<u8>(), 0..64),
+            prop::collection::vec(any::<u8>(), 0..256),
+        ),
+        0..8,
+    );
+    prop_oneof![
+        (arb_wire_attrs(), xattrs, dir, any::<bool>()).prop_map(|(attrs, xattrs, dir, already)| {
+            TokenReply::Granted {
+                records: TokenRecords { attrs, xattrs, dir },
+                already,
+            }
+        }),
+        any::<u32>().prop_map(|holder| TokenReply::NotHolder { holder }),
+        Just(TokenReply::Gone),
+        (any::<u64>(), prop::collection::vec(any::<u64>(), 0..32))
+            .prop_map(|(frame_id, objects)| TokenReply::Recall { frame_id, objects }),
+        Just(TokenReply::Acked),
+        any::<u64>().prop_map(|count| TokenReply::Released { count }),
+        "\\PC{0,64}".prop_map(|reason| TokenReply::Refused { reason }),
+    ]
+}
+
+proptest! {
+    /// The token codecs are TOTAL on arbitrary bytes, and whatever decodes
+    /// re-encodes canonically (both directions).
+    #[test]
+    fn token_frame_decoders_never_panic(data in prop::collection::vec(any::<u8>(), 0..512)) {
+        if let Ok(f) = decode_token_request(&data) {
+            let re = encode_token_request(&f).expect("an accepted request frame re-encodes");
+            prop_assert_eq!(decode_token_request(&re).expect("re-decodes"), f);
+            prop_assert_eq!(encode_token_request(&decode_token_request(&re).unwrap()).unwrap(), re);
+        }
+        if let Ok(f) = decode_token_reply(&data) {
+            let re = encode_token_reply(&f).expect("an accepted reply frame re-encodes");
+            prop_assert_eq!(decode_token_reply(&re).expect("re-decodes"), f);
+            prop_assert_eq!(encode_token_reply(&decode_token_reply(&re).unwrap()).unwrap(), re);
+        }
+    }
+
+    /// Every `TokenCall` round-trips inside its request frame.
+    #[test]
+    fn token_request_frame_round_trips(
+        request_id in any::<u64>(),
+        volume in any::<u16>(),
+        client in "\\PC{0,64}",
+        call in arb_token_call(),
+    ) {
+        let frame = TokenRequestFrame { schema: TOKEN_SCHEMA, request_id, volume, client, call };
+        let enc = encode_token_request(&frame).expect("encodes");
+        prop_assert_eq!(decode_token_request(&enc).expect("decodes"), frame);
+    }
+
+    /// Every `TokenReply` — a `Granted` carrying attrs, xattrs and a dentry
+    /// page included — round-trips inside its reply frame.
+    #[test]
+    fn token_reply_frame_round_trips(
+        request_id in any::<u64>(),
+        reply in arb_token_reply(),
+    ) {
+        let frame = TokenReplyFrame { schema: TOKEN_SCHEMA, request_id, reply };
+        let enc = encode_token_reply(&frame).expect("encodes");
+        prop_assert_eq!(decode_token_reply(&enc).expect("decodes"), frame);
+    }
+}

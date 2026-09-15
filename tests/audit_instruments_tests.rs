@@ -451,8 +451,10 @@ const PIPELINE_PHASES: [&str; 12] = [
 
 /// The eight audit-B phases plus D-2's two durability-lane phases
 /// (`window_lane_wait`: handoff → lane pickup; `window_total`: apply pass
-/// start → the window's members answered).
-const TXPASS_PHASES: [&str; 10] = [
+/// start → the window's members answered) plus PR 5's `pass_token_recall`
+/// (the read-token recall's round trip inside the apply stage; no sample
+/// on an unarmed pass).
+const TXPASS_PHASES: [&str; 11] = [
     "tx_queue_wait",
     "pass_admission",
     "pass_leaf_locks",
@@ -463,6 +465,7 @@ const TXPASS_PHASES: [&str; 10] = [
     "journal_barrier",
     "window_lane_wait",
     "window_total",
+    "pass_token_recall",
 ];
 
 #[test]
@@ -486,7 +489,7 @@ fn meta_txpass_family_carries_the_journal_split() {
     assert_eq!(
         obj.len(),
         TXPASS_PHASES.len(),
-        "exactly the ten phases: {obj:?}"
+        "exactly the eleven phases: {obj:?}"
     );
     for p in TXPASS_PHASES {
         let _ = phase_words(&fam, p);

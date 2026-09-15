@@ -17298,6 +17298,37 @@ impl KvMetaBackend {
         // before it loads the ring, growth announces itself before it
         // reads the count — one of the two always sees the other, so a
         // pass never reserves on a ring the checkpoint task is replacing.
+        // PR 5 — the commit-path recall (design-symmetric-metadata
+        // §5.7.1): under the batch's 4a guards, BEFORE the ring admission
+        // and any node lock (§4.4 pt 5 / the lock law) — and before the
+        // region-growth Dekker below, which has nothing to do with a
+        // recall and must not be held for its round trip (review round 1,
+        // Issue 8) — the union of the batch's objects is recalled once and
+        // the pass waits for the acks (or the readers' lease expiry). Its
+        // wall is `pass_token_recall`, so `pass_total` decomposes; an
+        // unarmed pass pays one OnceLock probe and adds no sample.
+        let recalled = if self.token_holder().is_some() {
+            let t_recall = std::time::Instant::now();
+            let recalled = self.recall_tokens_for_batch(&batch).await;
+            meta_txpass_phase_record_dur(MetaTxPassPhase::PassTokenRecall, t_recall.elapsed());
+            recalled
+        } else {
+            Vec::new()
+        };
+        // Test seam: the post-recall / pre-apply window (register-recheck).
+        if TEST_CONVEYOR_HOLD_STAGE.load(Ordering::Relaxed) == TEST_CONVEYOR_HOLD_POST_RECALL {
+            TEST_CONVEYOR_POST_RECALL_PARKED.fetch_add(1, Ordering::AcqRel);
+            while TEST_CONVEYOR_HOLD_STAGE.load(Ordering::Relaxed) == TEST_CONVEYOR_HOLD_POST_RECALL
+            {
+                let notified = TEST_CONVEYOR_HOLD_NOTIFY.notified();
+                if TEST_CONVEYOR_HOLD_STAGE.load(Ordering::Relaxed)
+                    != TEST_CONVEYOR_HOLD_POST_RECALL
+                {
+                    break;
+                }
+                notified.await;
+            }
+        }
         let growth_gate = self
             .appenders
             .as_ref()
@@ -17316,26 +17347,6 @@ impl KvMetaBackend {
                 }
                 r.passes_inside.fetch_sub(1, Ordering::SeqCst);
                 released.await;
-            }
-        }
-        // PR 5 — the commit-path recall (design-symmetric-metadata
-        // §5.7.1): under the batch's 4a guards, BEFORE the ring admission
-        // and any node lock (§4.4 pt 5 / the lock law), the union of the
-        // batch's objects is recalled once and the pass waits for the
-        // acks (or the readers' lease expiry). One relaxed load unarmed.
-        let recalled = self.recall_tokens_for_batch(&batch).await;
-        // Test seam: the post-recall / pre-apply window (register-recheck).
-        if TEST_CONVEYOR_HOLD_STAGE.load(Ordering::Relaxed) == TEST_CONVEYOR_HOLD_POST_RECALL {
-            TEST_CONVEYOR_POST_RECALL_PARKED.fetch_add(1, Ordering::AcqRel);
-            while TEST_CONVEYOR_HOLD_STAGE.load(Ordering::Relaxed) == TEST_CONVEYOR_HOLD_POST_RECALL
-            {
-                let notified = TEST_CONVEYOR_HOLD_NOTIFY.notified();
-                if TEST_CONVEYOR_HOLD_STAGE.load(Ordering::Relaxed)
-                    != TEST_CONVEYOR_HOLD_POST_RECALL
-                {
-                    break;
-                }
-                notified.await;
             }
         }
         let ring = self.ring_of_region(region);

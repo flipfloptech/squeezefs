@@ -188,3 +188,10 @@ path = "fuzz_targets/bset_frame_v2.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "token_call_frame"
+path = "fuzz_targets/token_call_frame.rs"
+test = false
+doc = false
+bench = false

@@ -245,4 +245,16 @@ Tree `6695fa45` (the code tree; the ledger's own docs commit follows). `CARGO_IN
 
 ### 10.1 Run ledger (the rebased tree)
 
-RUN_LEDGER_4
+Attempts 1 and 2 were killed after their finds (the key clash; the pre-arm stamp defect) and are rate/signature evidence only (`attempt{1,2}/`); the count restarted from zero on the final tree.
+
+| Gate / run (final tree `171da6e8` over `c6683b19`, from zero; `CARGO_INCREMENTAL=0`, disk 83 %; logs `/tmp/grok-justin/pr5-logs/round4/`) | Result |
+|---|---|
+| `cargo fmt --check` (root, `fuzz/`, `loom-models/`) | clean / clean / clean |
+| `cargo clippy --all-targets --all-features -- -D warnings` / `cargo clippy --all-targets -- -D warnings` (shipped) | clean / clean |
+| `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps` | green |
+| `cd fuzz && cargo check --bins` + `cargo fmt --check` | clean |
+| `task check:loom` (build `--cfg loom -D warnings` + fmt) / `tests/run_loom.sh` | clean / **113 passed** |
+| `sym_coherence_tests` ×5 stamped / ×2 flat | 7/7 — **33 passed** each (57.1–58.8 s) |
+| `sym_block_grant_tests` (37) / `sym_cross_owner_tests` (27 + 1 ignored) / `sym_shared_refs_tests` (16) / `readonly_mount_tests` (35) / `reader_free_grace_tests` (66) / `dlm_membership_tests` (51) / `docs_parity_tests` (5) / `env_knob_convention_tests` (22) / `derivation_sweep_tests` (57), both layouts | 18/18 legs green |
+| `bash tests/run_sym_forest_suites.sh` (**33 suites**, once, both legs) | **flat PASS / stamped PASS**, 1,158 s; `sym_coherence_tests` 57.1 / 57.0 s = 1.00, `sym_cross_owner_tests` 1.00, `sym_block_grant_tests` 1.00, `sym_slot_transfer_tests` 0.98 — no ratio NOTE |
+| live-FUSE trio under `SQUEEZEFS_TEST_REQUIRE_MOUNT=1`, both layouts — `posix_mount_semantics_tests` (3) / `corpse_sweep_tests` (4) / `inline_raise_tests` (7) | 6/6 legs green (no skip) |

@@ -1611,9 +1611,6 @@ impl RecallLane {
     }
 }
 
-/// A recall reached its terminal outcome (ack or timeout): the grant and
-/// the dedupe entry retire together. Returns whether a grant was actually
-/// removed (the caller maintains the lock-free outstanding gauge).
 /// The token plane's grant ∥ pass gate reads and registers holders
 /// through the lane (`token_grant_core::HolderTable`): `register` is a
 /// `holds`-then-`try_grant` (the valve is off on the token lane, so the
@@ -1632,6 +1629,9 @@ impl crate::token_grant_core::HolderTable for RecallLane {
     }
 }
 
+/// A recall reached its terminal outcome (ack or timeout): the grant and
+/// the dedupe entry retire together. Returns whether a grant was actually
+/// removed (the caller maintains the lock-free outstanding gauge).
 fn retire_recall(st: &mut LaneState, client: &str, ino: u64) -> bool {
     let removed = match st.grants.get_mut(&ino) {
         Some(hs) => {

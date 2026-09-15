@@ -4142,12 +4142,13 @@ pub fn arm_recall_gate() {
 /// `shutdown`; a test's teardown): the gate clears with the LAST one,
 /// and the timeout window with it.
 pub fn disarm_recall_gate() {
-    let before = RECALL_GATE_HOLDERS.load(Ordering::Acquire);
-    let left = if before == 0 {
-        0
-    } else {
-        RECALL_GATE_HOLDERS.fetch_sub(1, Ordering::AcqRel) - 1
-    };
+    // One RMW (review round 2, Issue 24): two concurrent last leaves must
+    // not both read `1` and both decrement past zero.
+    let left = RECALL_GATE_HOLDERS
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+            Some(n.saturating_sub(1))
+        })
+        .map_or(0, |before| before.saturating_sub(1));
     if left == 0 {
         RECALL_GATE.store(false, Ordering::Release);
         RECALL_UNACKED_UNTIL_MS.store(0, Ordering::Relaxed);

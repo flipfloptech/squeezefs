@@ -2709,3 +2709,57 @@ fn sym_slot_lease_rotor_ceiling_floor_and_window_derive_from_the_width_and_the_l
     assert_eq!(resolve_t_idle_ms(), 1_500);
     std::env::remove_var(SYM_T_IDLE_MS_ENV);
 }
+
+/// Symmetric metadata PR 8 (design-symmetric-metadata §5.5 / §5.5.1 /
+/// §5.5.3): the ranged block grant `G = clamp(2 × ewma × T_renewal, 64,
+/// cap / (2 × writers))` — floor 64 = one write-pipeline BDP window of
+/// 4 MiB blocks, cap = half the volume spread over the writers; the data
+/// bitmap's 32 KiB per TiB at the shipped 4 MiB block; `T_park_max =
+/// manager_failover_bound_ms + grace_ms` — every term re-derived here
+/// from the constants it names.
+#[test]
+fn sym_block_grant_bitmap_and_park_bound_derive_from_their_terms() {
+    use squeezefs::block_grant::{block_grant_derived, BLOCK_GRANT_FLOOR};
+    use squeezefs::data_alloc_bitmap::{bitmap_bytes_for, pages_for, DATA_ALLOC_PAGE_BITS};
+    use squeezefs::park_gate::t_park_max_ms;
+    assert_eq!(BLOCK_GRANT_FLOOR, 64, "one BDP window of 4 MiB blocks");
+    let cap_blocks = (1u64 << 40) / (4 << 20);
+    // Below the floor's worth of rate the floor answers.
+    assert_eq!(
+        block_grant_derived(0, 10_000, cap_blocks, 1),
+        BLOCK_GRANT_FLOOR
+    );
+    // 2 × 100 blocks/s × 10 s = 2,000.
+    assert_eq!(block_grant_derived(100_000, 10_000, cap_blocks, 1), 2_000);
+    // The cap: half the volume over the writers.
+    assert_eq!(
+        block_grant_derived(u64::MAX / 4, 10_000, cap_blocks, 8),
+        cap_blocks / 16
+    );
+    // A cap below the floor is the floor (the carve truncates at what is
+    // free).
+    assert_eq!(
+        block_grant_derived(u64::MAX / 4, 10_000, 32, 8),
+        BLOCK_GRANT_FLOOR
+    );
+    assert_eq!(bitmap_bytes_for(1 << 40, 4 << 20), 32 * 1024);
+    assert_eq!(
+        bitmap_bytes_for(1 << 50, 4 << 20),
+        32 << 20,
+        "32 MiB per PiB"
+    );
+    assert_eq!(
+        bitmap_bytes_for(1 << 40, 0),
+        0,
+        "a zero block size divides nothing"
+    );
+    assert_eq!(DATA_ALLOC_PAGE_BITS, (4096 - 32) * 8);
+    assert_eq!(pages_for(DATA_ALLOC_PAGE_BITS), 1);
+    assert_eq!(pages_for(DATA_ALLOC_PAGE_BITS + 1), 2);
+    assert_eq!(t_park_max_ms(46_500, 45_000), 91_500);
+    assert_eq!(t_park_max_ms(u64::MAX, 1), u64::MAX, "saturating");
+    assert!(
+        t_park_max_ms(30_000, 0) >= 30_000,
+        "T_park_max is never below SQUEEZEFS_TIMEOUT's shipped 30 s when the failover bound is"
+    );
+}

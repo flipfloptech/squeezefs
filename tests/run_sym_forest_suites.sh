@@ -121,6 +121,7 @@ DEFAULT_SUITES=(
   sym_pack_tests
   sym_shared_refs_tests
   sym_cross_owner_tests
+  sym_block_grant_tests
 )
 read -r -a SUITES <<<"${SQZ_SYM_SUITES:-${DEFAULT_SUITES[*]}}"
 RATIO_NOTE="${SQZ_SYM_RATIO_NOTE:-2.0}"

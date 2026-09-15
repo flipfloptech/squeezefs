@@ -1667,3 +1667,116 @@ fn arb_publish_outcome() -> impl Strategy<Value = PublishCallOutcome> {
             .prop_map(|(status, detail)| PublishCallOutcome::Refused { status, detail }),
     ]
 }
+
+// ---------------------------------------------------------------------------
+// Symmetric metadata PR 8 — the data allocation bitmap page + the tree-0
+// allocation-lease records (the `data_alloc_bitmap_page` fuzz target's
+// stable mirror; design-symmetric-metadata §5.5.1 / §5.4.2).
+// ---------------------------------------------------------------------------
+
+proptest! {
+    #![proptest_config(ProptestConfig { cases: 256, ..ProptestConfig::default() })]
+
+    /// The page decoder is total over arbitrary bytes; a fresh page
+    /// verifies under its own (tag, index) and under nothing else; a
+    /// flipped payload byte never verifies.
+    #[test]
+    fn data_alloc_bitmap_page_decoders_never_panic_and_round_trip(
+        data in prop::collection::vec(any::<u8>(), 0..4200),
+        tag in any::<u64>(),
+        idx in any::<u32>(),
+        gen in any::<u64>(),
+        bits in prop::collection::vec(any::<u8>(), 0..=squeezefs::data_alloc_bitmap::DATA_ALLOC_PAGE_DATA_LEN),
+        flip in 32usize..4096,
+    ) {
+        use squeezefs::data_alloc_bitmap::{decode_data_alloc_page, encode_data_alloc_page};
+        let _ = decode_data_alloc_page(&data, tag, idx);
+        let img = encode_data_alloc_page(tag, idx, gen, &bits).expect("in-domain payload");
+        let (g, got) = decode_data_alloc_page(&img, tag, idx).expect("a fresh page verifies");
+        prop_assert_eq!(g, gen);
+        prop_assert_eq!(&got[..bits.len()], bits.as_slice());
+        prop_assert!(decode_data_alloc_page(&img, tag.wrapping_add(1), idx).is_err());
+        prop_assert!(decode_data_alloc_page(&img, tag, idx.wrapping_add(1)).is_err());
+        let mut torn = img.clone();
+        torn[flip] ^= 0x80;
+        prop_assert!(decode_data_alloc_page(&torn, tag, idx).is_err());
+    }
+
+    /// The kind-4 data delta records round-trip, the 16-byte key is the
+    /// one discriminator, and the replay is idempotent over any stream.
+    #[test]
+    fn data_alloc_deltas_round_trip_and_replay_is_idempotent(
+        ops in prop::collection::vec((any::<u16>(), any::<bool>()), 0..64),
+    ) {
+        use squeezefs::data_alloc_bitmap::{
+            clear_record, decode_data_alloc_record, is_data_alloc_delta_key, set_record,
+            DataAllocBitmap, DataAllocDelta,
+        };
+        use squeezefs::meta_backend::kv::record::TREE_ALLOC_RESERVED;
+        let recs: Vec<_> = ops
+            .iter()
+            .enumerate()
+            .map(|(i, (b, set))| {
+                let (_, r) = if *set {
+                    set_record(9, u64::from(*b), i as u64)
+                } else {
+                    clear_record(9, u64::from(*b), i as u64)
+                };
+                r
+            })
+            .collect();
+        for (r, (b, set)) in recs.iter().zip(&ops) {
+            prop_assert!(is_data_alloc_delta_key(&r.key));
+            let d = decode_data_alloc_record(r).expect("decodes");
+            prop_assert_eq!(d.block_idx(), u64::from(*b));
+            prop_assert_eq!(matches!(d, DataAllocDelta::Set { .. }), *set);
+        }
+        let bm = DataAllocBitmap::new(9, 1 << 16);
+        bm.replay(recs.iter().map(|r| (TREE_ALLOC_RESERVED, r)));
+        let once = bm.set_blocks();
+        prop_assert_eq!(bm.replay(recs.iter().map(|r| (TREE_ALLOC_RESERVED, r))), 0);
+        prop_assert_eq!(bm.set_blocks(), once);
+    }
+
+    /// The `alloc_lease:` / `dead_member:` / `recovered:` records
+    /// round-trip over the encoders' domain and refuse a future version.
+    #[test]
+    fn alloc_lease_records_round_trip_and_refuse_a_future_version(
+        node_token in any::<u64>(),
+        mount_slot in any::<u32>(),
+        writer_id in any::<u128>(),
+        appender_id in any::<u32>(),
+        home_vol in any::<u16>(),
+        control_ino in any::<u64>(),
+        blocks in any::<u64>(),
+        term in any::<u64>(),
+        refs in prop::collection::vec((any::<u16>(), 0u64..(1 << 40), 1u64..(1 << 30)), 0..8),
+        epoch in any::<u64>(),
+        ts in any::<u64>(),
+    ) {
+        use squeezefs::meta_backend::kv::alloc_lease::{
+            AllocLeaseRecord, DeadMemberRecord, RecoveredRecord,
+        };
+        use squeezefs::meta_backend::kv::appender::AppenderIdentity;
+        use squeezefs::meta_backend::kv::superblock::ExtentRef;
+        let rec = AllocLeaseRecord {
+            holder: AppenderIdentity { node_token, mount_slot, writer_id },
+            holder_appender_id: appender_id,
+            home_vol,
+            control_ino,
+            blocks,
+            term,
+            bitmap: refs.iter().map(|(v, s, l)| (*v, ExtentRef { start: *s, len: *l })).collect(),
+        };
+        let img = rec.encode().expect("in-domain record");
+        prop_assert_eq!(AllocLeaseRecord::decode(&img).expect("decodes"), rec);
+        let mut future = img.clone();
+        future[0] = 2;
+        prop_assert!(AllocLeaseRecord::decode(&future).is_err());
+        prop_assert!(AllocLeaseRecord::decode(&img[..img.len() - 1]).is_err());
+        let d = DeadMemberRecord { epoch, ts_ms: ts };
+        prop_assert_eq!(DeadMemberRecord::decode(&d.encode()).expect("decodes"), d);
+        let r = RecoveredRecord { by_term: term, ts_ms: ts };
+        prop_assert_eq!(RecoveredRecord::decode(&r.encode()).expect("decodes"), r);
+    }
+}

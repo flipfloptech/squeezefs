@@ -1008,7 +1008,10 @@ async fn a_parked_member_reclaims_against_the_successor_the_ledger_names() {
     let dir = tempfile::tempdir().unwrap();
     let _g = SEAM.lock().await;
     reset_process_state();
-    let uris = format_stamped_set(dir.path(), 2).await;
+    // ONE volume: the journal-order witness below is per RING (a 2-volume
+    // set routes the two creates by slot, possibly onto two lanes, whose
+    // fan-outs are unordered by design).
+    let uris = format_stamped_set(dir.path(), 1).await;
     let routed = open_armed(&uris).await;
     let vol = Arc::clone(&routed.volumes[slot0_of(&routed)]);
     assert!(
@@ -1037,12 +1040,18 @@ async fn a_parked_member_reclaims_against_the_successor_the_ledger_names() {
     // A commit lands and is held at the lane's pre-fanout seam; THEN the
     // park is raised, so its ack is HELD by the park (in-flight entries
     // land, acks wait).
+    // The completion ORDINAL is the journal-order witness (inos are
+    // per-slot cursors on a forest, never an order).
+    let order = Arc::new(std::sync::atomic::AtomicU64::new(0));
     TEST_CONVEYOR_HOLD_STAGE.store(TEST_CONVEYOR_HOLD_PRE_FANOUT, Ordering::SeqCst);
     let r1 = Arc::clone(&routed);
+    let o1 = Arc::clone(&order);
     let held = tokio::spawn(async move {
-        r1.create(ROOT_INO, "held", libc::S_IFREG | 0o644, 0, 0)
+        let r = r1
+            .create(ROOT_INO, "held", libc::S_IFREG | 0o644, 0, 0)
             .await
-            .map(|i| i.ino)
+            .map(|i| i.ino);
+        (r, o1.fetch_add(1, Ordering::SeqCst))
     });
     wait_until("the lane at the pre-fanout seam", || {
         park_gate::inflight() >= 1
@@ -1083,10 +1092,13 @@ async fn a_parked_member_reclaims_against_the_successor_the_ledger_names() {
     assert!(!held.is_finished(), "the landed entry's ack is HELD");
     // A new commit waits at the pre-admission door — never escalates.
     let r2 = Arc::clone(&routed);
+    let o2 = Arc::clone(&order);
     let parked = tokio::spawn(async move {
-        r2.create(ROOT_INO, "parked", libc::S_IFREG | 0o644, 0, 0)
+        let r = r2
+            .create(ROOT_INO, "parked", libc::S_IFREG | 0o644, 0, 0)
             .await
-            .map(|i| i.ino)
+            .map(|i| i.ino);
+        (r, o2.fetch_add(1, Ordering::SeqCst))
     });
     tokio::task::yield_now().await;
     assert!(!parked.is_finished());
@@ -1123,18 +1135,25 @@ async fn a_parked_member_reclaims_against_the_successor_the_ledger_names() {
         epoch,
         "the reclaim kept its epoch"
     );
-    let held_ino = tokio::time::timeout(Duration::from_secs(10), held)
+    let (held_ino, held_order) = tokio::time::timeout(Duration::from_secs(10), held)
         .await
         .expect("the held ack releases on the grant")
-        .unwrap()
         .unwrap();
-    let parked_ino = tokio::time::timeout(Duration::from_secs(10), parked)
+    let held_ino = held_ino.unwrap();
+    let (parked_ino, parked_order) = tokio::time::timeout(Duration::from_secs(10), parked)
         .await
         .expect("the parked commit admits on the grant")
-        .unwrap()
         .unwrap();
-    assert!(held_ino < parked_ino, "journal order: the held ack first");
+    let parked_ino = parked_ino.unwrap();
+    assert!(
+        held_order < parked_order,
+        "journal order: the held ack is fanned out before the parked commit lands"
+    );
     assert_eq!(routed.lookup(ROOT_INO, "held").await.unwrap().ino, held_ino);
+    assert_eq!(
+        routed.lookup(ROOT_INO, "parked").await.unwrap().ino,
+        parked_ino
+    );
     assert!(!park_gate::is_parked());
     assert_eq!(park_gate::reclaims(), 1);
     assert_eq!(
@@ -1251,6 +1270,255 @@ async fn a_park_never_granted_expires_at_t_park_max_with_eio_never_silent() {
         .unwrap();
     assert!(outcome.is_err(), "EIO to the parked op, got {outcome:?}");
     shutdown(&routed).await;
+    reset_process_state();
+}
+
+/// Review round 2, Issue 22 — the checkpoint's page step never lets a
+/// USER-class admission decide the cycle's outcome (§4.4 pt 5: the
+/// checkpoint task's own admissions never park and never fail the cycle):
+/// with the ring's user window EXHAUSTED and a holding whose queued deltas
+/// cannot be journaled, the cycle still lands its pages, barrier and
+/// ledger record — no `JournalReserveExhausted`, no D1.b escalation, the
+/// volume never fails; the deltas stay queued (counted) and are journaled
+/// once the window frees.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_checkpoint_under_ring_pressure_lands_the_pages_and_never_fails_on_a_queued_delta() {
+    use squeezefs::meta_backend::kv::journal_core::AdmissionClass;
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    reset_process_state();
+    let uris = format_stamped_set(dir.path(), 2).await;
+    let routed = open_armed(&uris).await;
+    let vol = Arc::clone(&routed.volumes[slot0_of(&routed)]);
+    let me = identity_of(&vol);
+    let (holding, _) = take_fresh_lease(&vol, me).await;
+    let g = grant_of(vol.holder_block_grant(DATA_TAG, "w", 64, 0).await.unwrap());
+    vol.checkpoint_now().await.unwrap();
+    // Exhaust the USER window: every admission the ring will give, held.
+    let core = vol.journal_ring().core();
+    let mut held = Vec::new();
+    for grain in [4096u64, 64, 1] {
+        while let Some(adm) = core.try_admit(grain, AdmissionClass::User) {
+            held.push(adm);
+        }
+    }
+    assert!(!held.is_empty());
+    assert!(
+        core.try_admit(1, AdmissionClass::User).is_none(),
+        "the user window is exhausted"
+    );
+    // A terminal free under that pressure: the bit clears, its CLEAR is
+    // queued, the journaler cannot land it.
+    assert!(alloc_lease::note_finish_free(DATA_TAG, g.start));
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(holding.queued_deltas(), 1, "the CLEAR waits for the window");
+    assert!(holding.bitmap.has_dirty_pages());
+    let ckpts = META_KV_CHECKPOINTS.load(Ordering::Relaxed);
+    // The cycle that exists to relieve the pressure COMPLETES.
+    vol.checkpoint_now()
+        .await
+        .expect("a queued delta never fails the checkpoint cycle");
+    assert!(META_KV_CHECKPOINTS.load(Ordering::Relaxed) > ckpts);
+    assert!(!vol.is_failed(), "the D1.b lattice never fired");
+    assert!(!holding.bitmap.has_dirty_pages(), "the pages landed");
+    let on_disk = vol
+        .read_alloc_bitmap_image(&holding.pages, DATA_BLOCKS)
+        .await
+        .unwrap();
+    let pages = DataAllocBitmap::from_region_image(DATA_TAG, DATA_BLOCKS, &on_disk).unwrap();
+    assert!(!pages.is_set(g.start), "the page carries the RAM clear");
+    assert_eq!(
+        holding.queued_deltas(),
+        1,
+        "still queued — deferred, not lost"
+    );
+    assert!(
+        holding.stats().deltas_deferred >= 1,
+        "the deferral is counted"
+    );
+    // The window frees: the next cycle's re-kick journals the queue.
+    for adm in held {
+        core.release(adm);
+    }
+    vol.checkpoint_now().await.unwrap();
+    wait_until("the deferred CLEAR journaled", || {
+        holding.queued_deltas() == 0
+    })
+    .await;
+    shutdown(&routed).await;
+    reset_process_state();
+}
+
+/// Review round 2, Issue 23 (reviewer-reproduced) — the FIRST hold of a
+/// data volume's lease is SEEDED from the allocator's derived truth at
+/// that instant (every block below the cursor that is not on the free
+/// list — the refcount map's population plus every in-limbo, quarantined
+/// or grace-held offset — reads SET; the free list's blocks read CLEAR and
+/// the list is drained into the bitmap): arming a POPULATED volume with
+/// freed-and-reused history re-grants no live block, `block_claim_
+/// anomalies` stays flat, the C6/C8 oracle reads clean; and on an armed
+/// allocator the flat free-list-first pass is UNREACHABLE — a block
+/// planted on the local list is never handed out (the bitmap IS the free
+/// list).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn arming_a_populated_volume_seeds_the_bitmap_and_never_regrants_a_live_block() {
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    reset_process_state();
+    let a = data_allocator(DATA_ID).await;
+    // The pre-arm era: five blocks minted by the shipped loop, two freed
+    // (they land on the local free list), one of those reused, one more
+    // freed — three live, two free below the cursor.
+    let mut minted = Vec::new();
+    for _ in 0..5 {
+        minted.push(a.allocate_block().await.unwrap() / a.chunk_size());
+    }
+    for b in [minted[1], minted[3]] {
+        assert!(a.begin_free(b * a.chunk_size()));
+        a.finish_free(b * a.chunk_size());
+    }
+    let reused = a.allocate_block().await.unwrap() / a.chunk_size();
+    assert!(
+        reused == minted[1] || reused == minted[3],
+        "the shipped loop reuses the list"
+    );
+    assert!(a.begin_free(minted[0] * a.chunk_size()));
+    a.finish_free(minted[0] * a.chunk_size());
+    let live: std::collections::BTreeSet<u64> = a
+        .tracked_offsets()
+        .into_iter()
+        .map(|(o, _)| o / a.chunk_size())
+        .collect();
+    assert_eq!(live.len(), 3);
+    assert_eq!(a.free_blocks_count(), 2);
+    let uris = format_stamped_set(dir.path(), 2).await;
+    let routed = open_armed(&uris).await;
+    let anomalies0 = squeezefs::fuse_client::METRICS
+        .block_claim_anomalies
+        .load(Ordering::Relaxed);
+    assert_eq!(
+        alloc_lease::arm_symmetric_allocation(&routed, &[Arc::clone(&a)])
+            .await
+            .unwrap(),
+        1
+    );
+    let holding = alloc_lease::holding(DATA_TAG).expect("held");
+    assert_eq!(
+        holding.bitmap.population(),
+        live.len() as u64,
+        "the first hold is seeded from the derived truth"
+    );
+    for b in &live {
+        assert!(holding.bitmap.is_set(*b), "live block {b} reads CLEAR");
+    }
+    assert_eq!(
+        a.free_blocks_count(),
+        0,
+        "the local list drained into the bitmap"
+    );
+    // The seeded pages are on the device BEFORE the record named them.
+    let vol = Arc::clone(&routed.volumes[slot0_of(&routed)]);
+    let on_disk = vol
+        .read_alloc_bitmap_image(&holding.pages, DATA_BLOCKS)
+        .await
+        .unwrap();
+    assert_eq!(
+        DataAllocBitmap::from_region_image(DATA_TAG, DATA_BLOCKS, &on_disk)
+            .unwrap()
+            .set_blocks(),
+        live.iter().copied().collect::<Vec<_>>()
+    );
+    // The first armed mints: blocks the derived allocator holds FREE (the
+    // two freed ones, then fresh), never a live one, no anomaly.
+    let mut armed = std::collections::BTreeSet::new();
+    for _ in 0..8 {
+        armed.insert(a.allocate_block().await.unwrap() / a.chunk_size());
+    }
+    assert!(
+        armed.is_disjoint(&live),
+        "a live block was re-granted: {armed:?} ∩ {live:?}"
+    );
+    assert_eq!(
+        squeezefs::fuse_client::METRICS
+            .block_claim_anomalies
+            .load(Ordering::Relaxed),
+        anomalies0
+    );
+    // The oracle: SET ≡ referenced ∪ open grants, nothing referenced clear.
+    let referenced: std::collections::BTreeSet<u64> = a
+        .tracked_offsets()
+        .into_iter()
+        .map(|(o, _)| o / a.chunk_size())
+        .collect();
+    let d = holding
+        .bitmap
+        .drift(&referenced, &holding.ledger.open_ranges());
+    assert!(d.loss.is_empty(), "{:?}", d.loss);
+    assert!(d.leak.is_empty(), "{:?}", d.leak);
+    assert_eq!(DATA_ALLOC_BITMAP_DRIFT.load(Ordering::Relaxed), 0);
+    // The gate: a LIVE block planted on the local free list (the seam that
+    // would make the flat pass hand it out) is never minted armed.
+    let planted = *live.iter().next().unwrap();
+    a.test_plant_free_list(planted);
+    for _ in 0..4 {
+        let b = a.allocate_block().await.unwrap() / a.chunk_size();
+        assert_ne!(
+            b, planted,
+            "the free-list-first pass ran on an armed allocator"
+        );
+        assert!(holding.bitmap.is_set(b));
+    }
+    shutdown(&routed).await;
+    reset_process_state();
+}
+
+/// Review round 2, Issue 24 — the parked-leave refusal is SET-WIDE: on a
+/// 2-volume set every volume's `shutdown()` refuses (the latch outlives
+/// the gate word `close_at_leave` clears), so every page stays `Live` and
+/// the next open of this identity recovers each region as own residue.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_parked_leave_is_refused_on_every_volume_of_the_set() {
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    reset_process_state();
+    let uris = format_stamped_set(dir.path(), 2).await;
+    let routed = open_armed(&uris).await;
+    for i in 0..3 {
+        routed
+            .create(ROOT_INO, &format!("f{i}"), libc::S_IFREG | 0o644, 0, 0)
+            .await
+            .unwrap();
+    }
+    assert_eq!(
+        park_gate::fence_at_t_self(FenceClass::SymmetricAppender, 1_000, "manager dead"),
+        TSelfAction::Parked
+    );
+    for v in &routed.volumes {
+        match v.shutdown().await {
+            Err(KvError::Busy(m)) => assert!(m.contains("PARKED"), "{m}"),
+            other => panic!(
+                "{}: a parked appender's leave was admitted: {other:?}",
+                v.device_path().display()
+            ),
+        }
+    }
+    assert!(park_gate::leave_refused());
+    drop(routed);
+    park_gate::test_reset();
+    test_clear_holdings();
+    // Every region was left `Live`: the same identity's open recovers each
+    // as own residue.
+    let again = open_armed(&uris).await;
+    for v in &again.volumes {
+        let s = v.appender_stats().expect("forest volume");
+        assert!(
+            s.self_recoveries >= 1,
+            "{}: the region was released at the refused leave",
+            v.device_path().display()
+        );
+    }
+    assert!(again.lookup(ROOT_INO, "f2").await.is_ok());
+    shutdown(&again).await;
     reset_process_state();
 }
 

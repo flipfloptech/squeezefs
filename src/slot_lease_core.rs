@@ -125,11 +125,28 @@ pub enum CommitVerdict {
 /// (`meta_kv_leaf_lease_refusals` keeps its must-stay-0 meaning); before
 /// the tokens, every commit admitted between the door and the flush
 /// failed EINVAL on a legal schedule.
+///
+/// **The structural verdict** (PR 4 review round 4, Issue 25): the SMO
+/// task's own moves read [`Self::verdict_structural`], which admits a
+/// slot mid-handover (the departing holder's flush) AND — on the
+/// MANAGER — a slot nobody leases: an unleased slot tree's structure is
+/// the manager's to maintain (KD-SYM-2/3 — its root lives in tree 0, its
+/// SMOs journal in the manager's ring), while a slot ANOTHER appender
+/// leases (`foreign`, installed from the manager's table) is refused
+/// there as it is for content — the belt behind the sweep's own filter.
 #[derive(Debug)]
 pub struct LeaseGate {
     armed: AtomicBool,
+    /// This mount holds the manager lease (every PR-4 arm; PR 12's
+    /// non-manager appender arms without it and maintains only what it
+    /// leases).
+    manager: AtomicBool,
     leased: Box<[AtomicU64]>,
     releasing: Box<[AtomicU64]>,
+    /// Slots another appender leases — the manager's table projected
+    /// (`install_foreign`, rebuilt whole at every grant/release that
+    /// moves a slot to or from a wire appender).
+    foreign: Box<[AtomicU64]>,
     inflight: Box<[AtomicU32]>,
 }
 
@@ -150,8 +167,10 @@ impl LeaseGate {
     pub fn with_namespace(slots: usize) -> Self {
         Self {
             armed: AtomicBool::new(false),
+            manager: AtomicBool::new(false),
             leased: (0..GATE_WORDS).map(|_| AtomicU64::new(0)).collect(),
             releasing: (0..GATE_WORDS).map(|_| AtomicU64::new(0)).collect(),
+            foreign: (0..GATE_WORDS).map(|_| AtomicU64::new(0)).collect(),
             inflight: (0..slots).map(|_| AtomicU32::new(0)).collect(),
         }
     }
@@ -220,6 +239,42 @@ impl LeaseGate {
         self.armed.load(Ordering::Relaxed)
     }
 
+    /// This mount is the volume's MANAGER (KD-SYM-3): the structure of a
+    /// slot nobody leases is its to maintain. Set at the manager's arm;
+    /// PR 12's non-manager appender never sets it.
+    pub fn arm_as_manager(&self) {
+        self.manager.store(true, Ordering::Release);
+    }
+
+    /// Whether this mount maintains the unleased slot trees.
+    #[inline]
+    pub fn is_manager(&self) -> bool {
+        self.manager.load(Ordering::Relaxed)
+    }
+
+    /// Install the slots ANOTHER appender leases, whole — each word is
+    /// stored atomically, so a reader between two words sees every slot
+    /// in either its old or its new state, never a torn word.
+    pub fn install_foreign(&self, slots: &[Slot]) {
+        let mut words = vec![0u64; GATE_WORDS];
+        for s in slots {
+            let (w, bit) = Self::index(*s);
+            if let Some(word) = words.get_mut(w) {
+                *word |= bit;
+            }
+        }
+        for (w, word) in words.into_iter().enumerate() {
+            self.foreign[w].store(word, Ordering::Release);
+        }
+    }
+
+    /// Whether another appender leases `slot`.
+    #[inline]
+    pub fn is_foreign(&self, slot: Slot) -> bool {
+        let (w, bit) = Self::index(slot);
+        self.foreign[w].load(Ordering::Acquire) & bit != 0
+    }
+
     /// Publish a lease of `slot` to the commit path.
     pub fn grant(&self, slot: Slot) {
         let (w, bit) = Self::index(slot);
@@ -281,6 +336,29 @@ impl LeaseGate {
         }
         if self.releasing[w].load(Ordering::Acquire) & bit != 0 {
             return CommitVerdict::Releasing;
+        }
+        CommitVerdict::Allowed
+    }
+
+    /// The verdict on the SMO task's OWN moves (an SMO's leftover overlay
+    /// into its successor, a parent's pointer flips) — see the type docs:
+    /// a slot this mount leases is admitted whether or not a handover is
+    /// in flight (flush-then-transfer IS the departing holder flushing);
+    /// a slot nobody leases is admitted on the MANAGER (its structure to
+    /// maintain — KD-SYM-2/3) and refused elsewhere; a slot another
+    /// appender leases is refused — the sweep filters it first, so a
+    /// refusal here is the belt (`meta_kv_leaf_lease_refusals`).
+    #[inline]
+    pub fn verdict_structural(&self, slot: Slot) -> CommitVerdict {
+        if !self.is_armed() {
+            return CommitVerdict::Unarmed;
+        }
+        let (w, bit) = Self::index(slot);
+        if self.leased[w].load(Ordering::Acquire) & bit != 0 {
+            return CommitVerdict::Allowed;
+        }
+        if self.foreign[w].load(Ordering::Acquire) & bit != 0 || !self.is_manager() {
+            return CommitVerdict::NotLeased;
         }
         CommitVerdict::Allowed
     }

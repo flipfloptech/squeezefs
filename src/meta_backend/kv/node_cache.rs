@@ -1692,14 +1692,17 @@ impl CachedNode {
 
     /// [`Self::apply_locked`] for the serialized SMO task's OWN moves —
     /// an SMO's leftover overlay into its successor, a parent's pointer
-    /// flips: the flush pass of the slot's lessee. Admits a slot
-    /// mid-handover (`Releasing`): flush-then-transfer IS the departing
-    /// holder flushing — its compactions and splits are the release's
-    /// own work, and the door has already drained every user commit the
-    /// third gate state exists to refuse (PR 4 review round 3: a tree
-    /// with a pending SMO at the handover's flush failed the release on
-    /// this gate). Every other refusal — a reader, a foreign interior, a
-    /// slot this mount does not lease — is unchanged.
+    /// flips. Reads [`crate::slot_lease_core::LeaseGate::verdict_structural`]:
+    /// a slot mid-handover is admitted (flush-then-transfer IS the
+    /// departing holder flushing — its compactions and splits are the
+    /// release's own work, and the door has already drained every user
+    /// commit the third gate state exists to refuse; PR 4 review round 3),
+    /// and on the MANAGER a slot nobody leases is admitted (an unleased
+    /// slot tree's structure is the manager's to maintain — KD-SYM-2/3;
+    /// review round 4, Issue 25: the merge / heap-full recovery sweep was
+    /// refused on every released tree and the must-stay-0 gauge counted
+    /// on a legal schedule). A slot another appender leases is refused
+    /// here as for content; a reader and a foreign interior are unchanged.
     pub fn apply_locked_structural(
         &self,
         guard: &mut NodeDirty,
@@ -1768,11 +1771,17 @@ impl CachedNode {
         let slot = self.forest_slot.load(Ordering::Relaxed);
         if slot != u32::MAX {
             use crate::slot_lease_core::CommitVerdict;
-            match self.lease.verdict(slot) {
+            // The SMO task's own moves read the STRUCTURAL verdict (see
+            // `apply_locked_structural` / `LeaseGate::verdict_structural`
+            // — the departing holder's flush, the manager's maintenance
+            // of an unleased tree); content reads the commit verdict.
+            let verdict = if structural {
+                self.lease.verdict_structural(slot)
+            } else {
+                self.lease.verdict(slot)
+            };
+            match verdict {
                 CommitVerdict::Unarmed | CommitVerdict::Allowed => {}
-                // The departing holder's own flush (an SMO's moves) is
-                // the release's work — see `apply_locked_structural`.
-                CommitVerdict::Releasing if structural => {}
                 verdict @ (CommitVerdict::NotLeased | CommitVerdict::Releasing) => {
                     super::META_KV_LEAF_LEASE_REFUSALS.fetch_add(1, Ordering::Relaxed);
                     return Err(KvError::Corrupt(format!(
@@ -1780,8 +1789,12 @@ impl CachedNode {
                          has exactly one writer-cacher, its lessee (design-symmetric-metadata \
                          §5.4.1; meta_kv_leaf_lease_refusals)",
                         self.addr,
-                        match verdict {
-                            CommitVerdict::NotLeased => "this mount does not lease the slot",
+                        match (verdict, structural) {
+                            (CommitVerdict::NotLeased, true) =>
+                                "another appender leases the slot (or this mount is not the \
+                                 manager of its unleased trees)",
+                            (CommitVerdict::NotLeased, false) =>
+                                "this mount does not lease the slot",
                             _ => "the slot is mid-handover (flush-then-transfer)",
                         }
                     )));

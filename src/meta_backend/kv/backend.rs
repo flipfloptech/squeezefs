@@ -3541,6 +3541,9 @@ impl KvMetaBackend {
         // cold start — Issue 7): a handover is priced before the first
         // one runs, a ship before the first one is served.
         plane.seed_n_floor_inputs();
+        // The D0 winner IS the manager (KD-SYM-3): the unleased slot
+        // trees' structure is this mount's to maintain.
+        plane.gate.arm_as_manager();
         plane.gate.arm();
         // The membership carriage (§5.9): every member's renewal grant
         // now names the slots it leases here.
@@ -3749,13 +3752,48 @@ impl KvMetaBackend {
         // contribution to the process table is MERGED with the other
         // armed volumes' and S8's (review round 2, Issue 13 — the
         // wholesale store clobbered them).
-        let foreign: Vec<u16> = plane
-            .table
-            .held_outside(&in_process)
+        let foreign_forest = plane.table.held_outside(&in_process);
+        // The gate's structural belt reads the same set (review round 4,
+        // Issue 25): a tree another appender leases is never this
+        // mount's to maintain, whatever the sweep's filter missed.
+        plane.gate.install_foreign(&foreign_forest);
+        let foreign: Vec<u16> = foreign_forest
             .into_iter()
             .filter_map(|s| self.routing_slot_of_forest(s).ok())
             .collect();
         crate::dlm_slot::install_lease_foreign_slots(self.volume_uuid(), Some(&foreign));
+    }
+
+    /// Whether this mount MAINTAINS `tree`'s structure — the merge sweep's,
+    /// the heap-full recovery's, the D4 arm's and the census's ONE filter
+    /// (review round 4, Issue 25): a flat volume's trees and tree 0
+    /// always; a slot tree this mount leases (an in-process region's SMOs
+    /// scope to its ring and grant); an UNLEASED slot tree on the manager
+    /// (KD-SYM-2/3 — its root lives in tree 0, its SMOs journal in ring 0);
+    /// never a tree another appender leases — skipped (counted by
+    /// [`Self::maintainable_trees`] on `merge_sweep_foreign_skips`), a
+    /// refusal at the gate being the belt.
+    fn maintains_slot(&self, slot: Option<super::record::ForestSlot>) -> bool {
+        let (Some(slot), Some(plane)) = (slot, self.slot_leases()) else {
+            return true;
+        };
+        plane.gate.is_leased(slot) || (!plane.gate.is_foreign(slot) && plane.gate.is_manager())
+    }
+
+    /// [`Self::all_trees`] filtered by [`Self::maintains_slot`]; every
+    /// tree left out is counted on `merge_sweep_foreign_skips`.
+    fn maintainable_trees(&self) -> Vec<Arc<KvTree>> {
+        let mut out = Vec::new();
+        for t in self.all_trees() {
+            if self.maintains_slot(t.forest_slot()) {
+                out.push(t);
+            } else if let Some(plane) = self.slot_leases() {
+                plane
+                    .merge_sweep_foreign_skips
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        out
     }
 
     /// This volume's superblock uuid as one word — the process-global
@@ -6803,11 +6841,18 @@ impl KvMetaBackend {
                     set.capacity
                 )));
             }
-            // The lowest Free (or blank) page of the chain; none ⇒ grow it.
+            // The lowest Free (or blank) page of the chain whose id NO
+            // in-process region object holds — a released declared region
+            // keeps its id in `set.regions`, and a wire joiner handed that
+            // id would be routed as the in-process region (its leases
+            // adopted into a released region whose ring extents are back
+            // in the heap; PR 4 review round 4, found by Issue 25's pin);
+            // none ⇒ grow the chain.
             let free = entries.iter().skip(1).find(|e| {
-                e.page
-                    .as_ref()
-                    .is_none_or(|p| p.state == AppenderState::Free)
+                set.region(e.appender_id).is_none()
+                    && e.page
+                        .as_ref()
+                        .is_none_or(|p| p.state == AppenderState::Free)
             });
             let mut claimed: Vec<u64> = Vec::new();
             let (id, dir_offsets, prior) = match free {
@@ -11350,6 +11395,13 @@ impl KvMetaBackend {
             if n.level() != 0 || n.state().is_superseded() {
                 return;
             }
+            // A leaf of a tree another appender leases is not this
+            // mount's to compact or merge (Issue 25): out of the census
+            // the arm consumes, so the published candidates stay exact
+            // against the sweep's own filter (`merge_candidates_audit`).
+            if !self.maintains_slot(n.forest_slot()) {
+                return;
+            }
             let snap = n.snapshot();
             let (total, distinct) = snap.indexed_record_census();
             out.leaves += 1;
@@ -11359,10 +11411,15 @@ impl KvMetaBackend {
                 out.candidates.push((n.tree_id(), n.addr()));
             }
             // §4.6a (e): the underfull face — the sweep's own predicate
-            // (`KvTree::is_merge_candidate`, one source of truth).
+            // (`KvTree::is_merge_candidate`, one source of truth). The
+            // owning tree is the one whose header id AND forest slot the
+            // node carries: every slot tree's header id is 0, so the id
+            // alone named the first slot tree for every guest leaf, whose
+            // `owns` then read false — no guest tree ever had a merge
+            // candidate in this census (found by Issue 25's pin).
             if trees
                 .iter()
-                .find(|t| t.tree_id() == n.tree_id())
+                .find(|t| t.tree_id() == n.tree_id() && t.forest_slot() == n.forest_slot())
                 .is_some_and(|t| t.is_merge_candidate(n))
             {
                 out.merge_candidates.push((n.tree_id(), n.addr()));
@@ -11392,13 +11449,19 @@ impl KvMetaBackend {
         forced_retirement: bool,
         deadline: Option<std::time::Instant>,
     ) -> std::result::Result<VolumeMergeSweep, KvError> {
-        let trees = self.all_trees();
+        // The trees this mount MAINTAINS (Issue 25): a tree another
+        // appender leases is skipped, never refused — and never a lap
+        // member, so it cannot leave the lap incomplete for ever. The lap
+        // is keyed by tree IDENTITY (`VolumeLap::key`), so a tree that
+        // joins or leaves the set mid-lap (a mint, a grant, a release)
+        // shifts nobody's progress.
+        let trees = self.maintainable_trees();
         let mut report = VolumeMergeSweep::default();
         let mut lap = self.merge_lap.lock().expect("merge lap").clone();
-        lap.done.resize(trees.len(), false);
         let mut all_done = true;
-        for (i, tree) in trees.iter().enumerate() {
-            if lap.done[i] {
+        for tree in &trees {
+            let key = VolumeLap::key(tree);
+            if lap.done.contains(&key) {
                 continue;
             }
             let sweep = match tree.merge_underfull(smo, forced_retirement, deadline).await {
@@ -11419,7 +11482,7 @@ impl KvMetaBackend {
             report.root_collapses += sweep.outcome.root_collapses;
             report.space_refused |= sweep.space_refused;
             if sweep.lap_complete {
-                lap.done[i] = true;
+                lap.done.insert(key);
                 lap.candidates += sweep.candidates;
             } else {
                 // The budget is spent or a merge was refused: the next
@@ -11429,7 +11492,7 @@ impl KvMetaBackend {
                 break;
             }
         }
-        if all_done && lap.done.iter().all(|d| *d) {
+        if all_done && trees.iter().all(|t| lap.done.contains(&VolumeLap::key(t))) {
             report.lap_complete = true;
             report.candidates = lap.candidates;
             // The tail the count was taken under: a later tail advance
@@ -11461,7 +11524,8 @@ impl KvMetaBackend {
         let _smo = self.smo.lock().await;
         let gauge_tail = self.merge_candidates_tail.load(Ordering::Relaxed);
         let census_tail = self.cache.durable_tail();
-        let trees = self.all_trees();
+        // The trees the sweep maintains — the gauge's own population.
+        let trees = self.maintainable_trees();
         MergeCandidatesAudit {
             gauge: self.merge_candidates.load(Ordering::Relaxed),
             gauge_tail,
@@ -11593,13 +11657,23 @@ pub struct DeadBsetCensus {
     pub merge_candidates: Vec<(u8, u64)>,
 }
 
-/// A volume's merge lap across its trees (`KvMetaBackend::run_merge_sweep`):
-/// per tree (in `all_trees` order) whether its lap completed since the last
-/// publish, and the exact candidates the completed trees reported.
+/// A volume's merge lap across the trees it maintains
+/// (`KvMetaBackend::run_merge_sweep`): the trees whose lap completed since
+/// the last publish — keyed by identity, `(header tree id, forest slot)`,
+/// so the set may change between calls — and the exact candidates the
+/// completed trees reported.
 #[derive(Debug, Default, Clone)]
 pub(super) struct VolumeLap {
-    pub(super) done: Vec<bool>,
+    pub(super) done: std::collections::BTreeSet<(u8, Option<super::record::ForestSlot>)>,
     pub(super) candidates: u64,
+}
+
+impl VolumeLap {
+    /// A tree's lap key: its header id and its forest slot (every slot
+    /// tree carries header id 0 — the slot is what tells them apart).
+    pub(super) fn key(tree: &KvTree) -> (u8, Option<super::record::ForestSlot>) {
+        (tree.tree_id(), tree.forest_slot())
+    }
 }
 
 /// [`KvMetaBackend::merge_candidates_audit`]'s answer: the gauge and a
@@ -15406,6 +15480,11 @@ impl KvMetaBackend {
             TreeSet::Forest { forest, .. } => {
                 let node = self.cache.try_get(addr)?;
                 if node.tree_id() != tree_id {
+                    return None;
+                }
+                // A leaf of a tree another appender leases is not this
+                // mount's to compact (Issue 25) — a stale census entry.
+                if !self.maintains_slot(node.forest_slot()) {
                     return None;
                 }
                 forest.tree_for_node(&node).ok()

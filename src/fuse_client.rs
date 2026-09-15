@@ -13803,6 +13803,10 @@ impl SqueezefsFilesystem {
                 // gauges (Issue 14), `manager_verb_refusals` counts witness
                 // contradictions ALONE.
                 metrics.insert("slot_door_parks".into(), lease(&|s| s.door_parks));
+                metrics.insert(
+                    "merge_sweep_foreign_skips".into(),
+                    lease(&|s| s.merge_sweep_foreign_skips),
+                );
                 metrics.insert("slot_door_refusals".into(), lease(&|s| s.door_refusals));
                 metrics.insert(
                     "slot_acquire_refusals".into(),

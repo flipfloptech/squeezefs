@@ -879,15 +879,16 @@ async fn all_parties_down_after_a_foreign_unlink_the_next_mount_rolls_forward() 
     fsck_clean(&uris).await;
 }
 
-// ---------------------------------------------------------------------------
-// §5.6.4 — the set-wide directory-rename lock (KD-SYM-14).
-// ---------------------------------------------------------------------------
-
-/// Two initiators, disjoint ancestor views, concurrent `rename(a/b →
-/// c/d/e)` and `rename(c → a/b/f)`: under the set-wide lock they
-/// serialize, the ancestor check runs on EXACT data, and exactly ONE
-/// completes — the other refuses `EINVAL` (POSIX: the target is inside
-/// the source) — so no directory is ever its own ancestor.
+/// KD-SYM-14's pin (review round 1, Issue 5 — the first pin was hollow:
+/// one identity took the lock `already`, and the two renames shared
+/// `I{b}` so 4a serialized them). Here the two initiators are DISTINCT
+/// lock identities (the second takes the lease under a wire joiner's id
+/// through `TEST_DIR_RENAME_IDENTITY_ONCE`) and their 4a guard sets are
+/// DISJOINT — no shared ino, no shared stripe, forced — so only the
+/// set-wide lease stands between them and a cycle: `a/b → c/d/e` against
+/// `root/c → a/b/x/y`. Exactly one completes; the loser waited on `Busy`
+/// (`dir_rename_lock_wait_ns` grows) and refuses `EINVAL` under the
+/// lease; every directory's chain still reaches the root.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn two_nodes_cannot_rename_directories_into_a_cycle() {
     let dir = tempfile::tempdir().unwrap();
@@ -896,39 +897,127 @@ async fn two_nodes_cannot_rename_directories_into_a_cycle() {
     let (a, c) = (dirs[0], dirs[1]);
     let routed = open_under(&uris, true, Some(THREE_HOLDERS)).await;
     let holders = Holders::stand_up(&routed, &[1, 2]).await;
+    let vol = Arc::clone(&routed.volumes[0]);
+    let (mut joiner, other_identity) =
+        wire_joiner(&holders.host.endpoint().to_string(), 5, 0).await;
     let b = routed
         .create(a, "b", libc::S_IFDIR | 0o755, 0, 0)
         .await
         .unwrap()
         .ino;
-    let d = routed
-        .create(c, "d", libc::S_IFDIR | 0o755, 0, 0)
-        .await
-        .unwrap()
-        .ino;
+    let dlm = vol.dlm();
+    let local = |ino: u64| routed.route_ino(ino).1;
+    // r1 = rename(a, "b", d, "e"): guards I{a} I{d} I{b} D{a,b} D{d,e}.
+    // r2 = rename(root, "shared1", x, "y"): guards I{root} I{x} I{c}
+    // D{root,shared1} D{x,y}. Mint `x` and `d` until every inode stripe of
+    // one set avoids the other's, then pick "e"/"y" off both sets' dentry
+    // stripes.
+    let fixed_i: Vec<usize> = [a, b, ROOT_INO, c]
+        .iter()
+        .map(|i| dlm.inode_stripe(local(*i)))
+        .collect();
+    let (mut x, mut d) = (0u64, 0u64);
+    for k in 0.. {
+        x = routed
+            .create(b, &format!("x{k}"), libc::S_IFDIR | 0o755, 0, 0)
+            .await
+            .unwrap()
+            .ino;
+        d = routed
+            .create(c, &format!("d{k}"), libc::S_IFDIR | 0o755, 0, 0)
+            .await
+            .unwrap()
+            .ino;
+        let r1_i = [
+            dlm.inode_stripe(local(a)),
+            dlm.inode_stripe(local(d)),
+            dlm.inode_stripe(local(b)),
+        ];
+        let r2_i = [
+            dlm.inode_stripe(local(ROOT_INO)),
+            dlm.inode_stripe(local(x)),
+            dlm.inode_stripe(local(c)),
+        ];
+        if r1_i.iter().all(|s| !r2_i.contains(s)) {
+            break;
+        }
+        assert!(
+            k < 64,
+            "could not mint disjoint inode stripes in 64 tries: {fixed_i:?}"
+        );
+    }
+    let (x_name, d_name) = (
+        names_in(&routed, b).await.pop().unwrap(),
+        names_in(&routed, c)
+            .await
+            .into_iter()
+            .find(|n| n.starts_with('d'))
+            .unwrap(),
+    );
+    let taken: Vec<usize> = vec![
+        dlm.dentry_stripe(local(a), "b"),
+        dlm.dentry_stripe(local(ROOT_INO), "shared1"),
+    ];
+    let e_name = (0u64..)
+        .map(|i| format!("e{i}"))
+        .find(|n| !taken.contains(&dlm.dentry_stripe(local(d), n)))
+        .unwrap();
+    let y_name = (0u64..)
+        .map(|i| format!("y{i}"))
+        .find(|n| {
+            let st = dlm.dentry_stripe(local(x), n);
+            !taken.contains(&st) && st != dlm.dentry_stripe(local(d), &e_name)
+        })
+        .unwrap();
+    let _ = (x_name, d_name);
     let before = cross_owner_stats();
-    let r1 = {
-        let routed = Arc::clone(&routed);
-        tokio::spawn(async move { routed.rename(a, "b", d, "e", 0).await })
-    };
+    // r2 runs under the OTHER identity and holds the lease across its
+    // shipped steps (held 300 ms each at the holder) — long enough for r1
+    // to arrive and park on `Busy`.
+    crossvol_tx::TEST_XV_SERVE_HOLD_MS.store(300, Ordering::SeqCst);
+    crossvol_tx::TEST_DIR_RENAME_IDENTITY_ONCE.store(other_identity, Ordering::SeqCst);
     let r2 = {
         let routed = Arc::clone(&routed);
-        tokio::spawn(async move { routed.rename(ROOT_INO, "shared1", b, "f", 0).await })
+        let y = y_name.clone();
+        tokio::spawn(async move { routed.rename(ROOT_INO, "shared1", x, &y, 0).await })
+    };
+    let mut held = false;
+    for _ in 0..200 {
+        if vol.dir_rename_record().await.unwrap().map(|r| r.holder) == Some(other_identity) {
+            held = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    assert!(held, "r2 took the set-wide lease under the other identity");
+    let t_r1 = std::time::Instant::now();
+    let r1 = {
+        let routed = Arc::clone(&routed);
+        let e = e_name.clone();
+        tokio::spawn(async move { routed.rename(a, "b", d, &e, 0).await })
     };
     let (r1, r2) = (r1.await.unwrap(), r2.await.unwrap());
-    let ok = usize::from(r1.is_ok()) + usize::from(r2.is_ok());
-    assert_eq!(ok, 1, "exactly one completes: {r1:?} / {r2:?}");
-    let refused = match (r1, r2) {
-        (Err(e), Ok(())) | (Ok(()), Err(e)) => e,
-        other => panic!("{other:?}"),
-    };
+    crossvol_tx::TEST_XV_SERVE_HOLD_MS.store(0, Ordering::SeqCst);
+    assert!(r2.is_ok(), "the lease holder completes: {r2:?}");
+    let refused = r1.expect_err("the second initiator refuses under the lease");
     assert_eq!(
         refused.to_errno(),
         libc::EINVAL,
         "the loser refuses EINVAL — the target lies inside the source: {refused}"
     );
+    let after = cross_owner_stats();
+    assert!(
+        after.dir_rename_lock_wait_ns_sum - before.dir_rename_lock_wait_ns_sum >= 200_000_000,
+        "the loser WAITED on the contended lease (r1 wall {:?})",
+        t_r1.elapsed()
+    );
+    assert_eq!(
+        after.dir_rename_lock_acquires - before.dir_rename_lock_acquires,
+        2,
+        "both directory renames took the set-wide lock"
+    );
     // No cycle: every directory's parent chain reaches the root.
-    for d0 in [a, b, c, d] {
+    for d0 in [a, b, c, d, x] {
         let mut cur = d0;
         let mut hops = 0;
         while cur != ROOT_INO {
@@ -941,12 +1030,11 @@ async fn two_nodes_cannot_rename_directories_into_a_cycle() {
             assert!(hops < 16, "a cycle: {d0} never reaches the root");
         }
     }
-    let after = cross_owner_stats();
-    assert_eq!(
-        after.dir_rename_lock_acquires - before.dir_rename_lock_acquires,
-        2,
-        "both directory renames took the set-wide lock"
-    );
+    assert!(vol.dir_rename_record().await.unwrap().is_none(), "released");
+    assert!(matches!(
+        joiner.dir_rename_unlock(other_identity).await.unwrap(),
+        ManagerReply::DirRenameUnlocked { already: true }
+    ));
     assert_closed("cycle");
     holders.tear_down();
     shutdown(&routed).await;

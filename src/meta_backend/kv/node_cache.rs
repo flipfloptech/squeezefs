@@ -96,10 +96,7 @@
 use super::bset::BsetView;
 use super::checkpoint::{LedgerRecord, TreeRoot};
 use super::epoch_core::{NodeEnv, UNARMED_EPOCH};
-use super::node::{
-    encode_bset_frame, load_node, page_holds_live_frame, AppendDest, LoadedNode, NodeLayout,
-    BSET_FRAME_LEN, NODE_PAGE,
-};
+use super::node::{encode_bset_frame, load_node, AppendDest, LoadedNode, NodeLayout, NODE_PAGE};
 use super::node_state_core::NodeState;
 use super::record::{
     fold_forward, fold_newest_first, Folded, FoldedHead, Record, RecordKind, RecordRef,
@@ -2249,7 +2246,8 @@ impl CachedNode {
         // was 37 % of the serial create path once threshold wakes made
         // freezes per-bset-worth frequent (§4.6 pt 1, PR K7).
         let bset_len = u32::from_le_bytes([frame[20], frame[21], frame[22], frame[23]]) as usize;
-        let bset_image = frame.slice(BSET_FRAME_LEN..BSET_FRAME_LEN + bset_len);
+        let frame_hdr = layout.frame_len();
+        let bset_image = frame.slice(frame_hdr..frame_hdr + bset_len);
         let cur = self.snapshot.load();
         let base = Arc::new(cur.base.extend_with(bset_image)?);
         // The last fallible step succeeded — the freeze WILL publish
@@ -2567,6 +2565,35 @@ pub struct NodeCache {
     /// CLEAR of the slot by a post-condition, not by a fixed cycle count.
     /// Latch-free (one `fetch_max`); empty on every unarmed mount.
     slot_frontiers: scc::HashMap<super::record::ForestSlot, Arc<AtomicU64>>,
+    /// The §5.8.2 frame-fence source a symmetric-forest mount installs
+    /// (design-symmetric-metadata, PR 5): the stamp a write to a slot's
+    /// node carries and the screen input a load of one reads. `None` on
+    /// every flat volume (v1 frames — never consulted) and on a forest
+    /// mount with no lease plane (the manager's `(0, 0)` stamp, rule 3
+    /// alone at loads).
+    frame_fence: OnceLock<Arc<dyn FrameFenceSource>>,
+}
+
+/// The lease plane's answers for the §5.8.2 frame screen and the frame
+/// stamp (design-symmetric-metadata, PR 5): `stamp_for` = the `(appender,
+/// g)` a write to a node of `slot` carries NOW (the lessee's region and
+/// the slot's lease generation; `(0, 0)` for the manager's structure);
+/// `screen_for` = the current generation and the recorded tail of one
+/// leaf, read for a load. ONE accessor family — PR 10's recovery driver
+/// reads the same screen through the backend's face of it.
+pub trait FrameFenceSource: Send + Sync {
+    /// The stamp the next write to a node of `slot` (`None` = unstamped:
+    /// tree 0 / a flat tree) carries.
+    fn stamp_for(&self, slot: Option<super::record::ForestSlot>) -> super::node::FrameStamp;
+    /// The screen input for a load of node `addr` in `slot`; `None` = no
+    /// plane answers for the slot (rule 3 alone).
+    fn screen_for<'a>(
+        &'a self,
+        slot: super::record::ForestSlot,
+        addr: u64,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Option<super::node::FrameScreen>> + Send + 'a>,
+    >;
 }
 
 impl std::fmt::Debug for NodeCache {
@@ -2596,7 +2623,64 @@ impl NodeCache {
             dying_leaf_floors: std::sync::Mutex::new(std::collections::BTreeMap::new()),
             slot_tails: ArcSwap::from_pointee(std::collections::BTreeMap::new()),
             slot_frontiers: scc::HashMap::new(),
+            frame_fence: OnceLock::new(),
         })
+    }
+
+    /// Install the §5.8.2 frame-fence source (the symmetric plane's arm;
+    /// PR 5) — once per mount, like the purge sink; a second install is
+    /// refused (the plane arms once). Consulted only on a v2 layout — a
+    /// flat volume's cache never reads it.
+    pub fn install_frame_fence(&self, source: Arc<dyn FrameFenceSource>) -> bool {
+        self.frame_fence.set(source).is_ok()
+    }
+
+    /// The stamp a write to `node` carries: the installed fence's answer
+    /// for the node's slot, else the manager's `(0, 0)`. A flat layout
+    /// ignores it (`NodeLayout::stamped` is the identity there).
+    fn frame_stamp_for(&self, node: &CachedNode) -> super::node::FrameStamp {
+        if !self.cfg.layout.symmetric_frames() {
+            return super::node::FrameStamp::default();
+        }
+        match self.frame_fence.get() {
+            Some(src) => src.stamp_for(node.forest_slot()),
+            None => super::node::FrameStamp::default(),
+        }
+    }
+
+    /// The write layout for `node`: the volume's layout with the node's
+    /// slot stamp (the SMO writers' input — a successor image is written
+    /// under the same stamp an append to the node would carry).
+    pub fn write_layout_for(&self, node: &CachedNode) -> NodeLayout {
+        self.cfg.layout.stamped(self.frame_stamp_for(node))
+    }
+
+    /// The write layout for a node of `slot` that is not yet cached (a
+    /// fresh root / a lazy mint).
+    pub fn write_layout_for_slot(&self, slot: Option<super::record::ForestSlot>) -> NodeLayout {
+        if !self.cfg.layout.symmetric_frames() {
+            return self.cfg.layout;
+        }
+        let stamp = match self.frame_fence.get() {
+            Some(src) => src.stamp_for(slot),
+            None => super::node::FrameStamp::default(),
+        };
+        self.cfg.layout.stamped(stamp)
+    }
+
+    /// The §5.8.2 screen input for a load of `addr` in `slot` (`None` on
+    /// a flat layout, an unstamped node, or with no fence installed).
+    async fn frame_screen_for(
+        &self,
+        slot: Option<super::record::ForestSlot>,
+        addr: u64,
+    ) -> Option<super::node::FrameScreen> {
+        if !self.cfg.layout.symmetric_frames() {
+            return None;
+        }
+        let slot = slot?;
+        let src = self.frame_fence.get()?;
+        src.screen_for(slot, addr).await
     }
 
     /// Note that a record of slot `slot`'s tree was journaled below ring
@@ -3133,6 +3217,22 @@ impl NodeCache {
     /// pre-SMO parent snapshot can reach one — it must restart from the
     /// tree root through current snapshots (see [`super::tree`]).
     pub async fn load(&self, addr: u64) -> Result<Option<Arc<CachedNode>>, KvError> {
+        self.load_for_slot(addr, None).await
+    }
+
+    /// [`Self::load`] for a node the caller knows to belong to slot tree
+    /// `slot` (a `KvTree`'s traversal): on a forest volume the load runs
+    /// under the §5.8.2 frame screen for that slot (the lessee's current
+    /// generation + the leaf's recorded tail through the installed
+    /// [`FrameFenceSource`]); the loaded node is stamped with the slot
+    /// BEFORE it is published, so the flush pass and the write layout see
+    /// it from its first mapping. `None` = an unstamped load (rule 3
+    /// alone) — the flat volume's one and only path.
+    pub async fn load_for_slot(
+        &self,
+        addr: u64,
+        slot: Option<super::record::ForestSlot>,
+    ) -> Result<Option<Arc<CachedNode>>, KvError> {
         loop {
             if let Some(node) = self.map.read_async(&addr, |_, v| v.clone()).await {
                 // The same lazy staleness gate as `try_get`: a stale-stamped
@@ -3190,8 +3290,15 @@ impl NodeCache {
             // classified against.
             let snap = self.env.epoch.load_snapshot();
             let reader_mode = snap.epoch != UNARMED_EPOCH;
+            let screen = self.frame_screen_for(slot, addr).await;
             let loaded = retry_racing_reader_load(reader_mode, addr, || {
-                load_node(&self.cfg.path, &self.cfg.layout, addr, snap.tail)
+                super::node::load_node_screened(
+                    &self.cfg.path,
+                    &self.cfg.layout,
+                    addr,
+                    snap.tail,
+                    screen.as_ref(),
+                )
             })
             .await?;
             // Re-check after the read: a retire during our load means the
@@ -3210,6 +3317,9 @@ impl NodeCache {
                 self.env.clone(),
                 self.lease.clone(),
             )?;
+            if let Some(slot) = slot {
+                node.stamp_forest_slot(slot);
+            }
             if node.level() > 0 {
                 node.pin(); // §4.5: interior nodes always pinned.
             } else if node.tree_id() == super::record::TREE_BLOCK_MAP {
@@ -3457,20 +3567,47 @@ impl NodeCache {
         // Solo volumes have no peers by construction and pay nothing: the
         // probe is behind `is_solo()`, which is word 0 on every shipped
         // mount.
+        // The frame this append writes carries the slot's fencing stamp
+        // on a forest volume (design-symmetric-metadata §5.8.2 — the
+        // writing appender + the slot's lease generation; a flat layout's
+        // `stamped` is the identity).
+        let layout = self.cfg.layout.stamped(self.frame_stamp_for(node));
         if !self.env.gate.load().is_solo() {
             let page =
                 crate::uring_fs::read_at(&self.cfg.path, node.addr() + tail as u64, NODE_PAGE)
                     .await
                     .map_err(KvError::Io)?;
-            if page_holds_live_frame(&page, node.node_seq()) {
-                super::META_KV_NODE_PARTITION_REFUSALS.fetch_add(1, Ordering::Relaxed);
-                return Err(KvError::Corrupt(format!(
-                    "foreign append detected at node {:#x} offset {tail}: the destination page \
-                     already holds a verified frame of this incarnation, so a peer appender \
-                     wrote into a node we cache — appending here would overwrite its acked \
-                     records (spec §6.2 closing: two writers must never cache the same node)",
-                    node.addr()
-                )));
+            match super::node::probe_tail_page(&page, node.node_seq(), &layout) {
+                super::node::TailPage::Clear => {}
+                super::node::TailPage::Ours => {
+                    super::META_KV_NODE_PARTITION_REFUSALS.fetch_add(1, Ordering::Relaxed);
+                    return Err(KvError::Corrupt(format!(
+                        "foreign append detected at node {:#x} offset {tail}: the destination \
+                         page already holds a verified frame of this incarnation, so a peer \
+                         appender wrote into a node we cache — appending here would overwrite \
+                         its acked records (spec §6.2 closing: two writers must never cache \
+                         the same node)",
+                        node.addr()
+                    )));
+                }
+                // §5.8.2 residual class (ii)'s after-the-fact face: a
+                // frame under ANOTHER (appender, g) at our remembered
+                // tail — a zombie predecessor of the slot wrote where we
+                // append next. Loud; the append refuses rather than bury
+                // the evidence under our frame.
+                super::node::TailPage::Foreign(stamp) => {
+                    super::META_KV_FOREIGN_FRAME_OVERWRITE_DETECTED.fetch_add(1, Ordering::Relaxed);
+                    return Err(KvError::Corrupt(format!(
+                        "foreign frame at node {:#x} offset {tail}: appender {} at slot \
+                         generation {} wrote at this lessee's remembered tail (stamp in force \
+                         {:?}) — a zombie's append after the slot moved \
+                         (foreign_frame_overwrite_detected, design-symmetric-metadata §5.8.2)",
+                        node.addr(),
+                        stamp.appender_id,
+                        stamp.g,
+                        layout.frame_stamp()
+                    )));
+                }
             }
         }
         let dest = AppendDest {
@@ -3480,7 +3617,7 @@ impl NodeCache {
         };
         match super::node::append_bset(
             &self.cfg.path,
-            &self.cfg.layout,
+            &layout,
             &dest,
             &frozen.records,
             frozen.horizon,

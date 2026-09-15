@@ -694,9 +694,10 @@ impl KvTree {
         };
         let addr = cache.extent_addr(extent);
         let node_seq = seq.fetch_add(1, Ordering::AcqRel) + 1;
+        // A fresh root is written under its slot's stamp (§5.8.2).
         write_node(
             &cache.config().path,
-            &cache.config().layout,
+            &cache.write_layout_for_slot(forest_slot),
             &NodeWriteParams {
                 node_addr: addr,
                 node_seq,
@@ -915,12 +916,16 @@ impl KvTree {
             }
             let node = match self.cache.try_get(addr) {
                 Some(n) => n,
-                None => self.cache.load(addr).await?.ok_or_else(|| {
-                    KvError::Corrupt(format!(
-                        "tree {} (slot {:?}): routed node {addr:#x} is on a retired extent",
-                        self.tree_id, self.forest_slot
-                    ))
-                })?,
+                None => self
+                    .cache
+                    .load_for_slot(addr, self.forest_slot)
+                    .await?
+                    .ok_or_else(|| {
+                        KvError::Corrupt(format!(
+                            "tree {} (slot {:?}): routed node {addr:#x} is on a retired extent",
+                            self.tree_id, self.forest_slot
+                        ))
+                    })?,
             };
             if node.level() == 0 {
                 continue;
@@ -983,7 +988,11 @@ impl KvTree {
             let root = self.root();
             let Some(mut cur) = (match self.cache.try_get(root.addr) {
                 Some(n) => Some(n),
-                None => self.cache.load(root.addr).await?,
+                None => {
+                    self.cache
+                        .load_for_slot(root.addr, self.forest_slot)
+                        .await?
+                }
             }) else {
                 dbg_reasons[0] += 1;
                 continue 'restart; // root extent retired: racing root swap
@@ -1012,7 +1021,11 @@ impl KvTree {
                 let (child_addr, child_seq) = decode_interior_value(&ptr)?;
                 let child = match self.cache.try_get(child_addr) {
                     Some(n) => Some(n),
-                    None => self.cache.load(child_addr).await?,
+                    None => {
+                        self.cache
+                            .load_for_slot(child_addr, self.forest_slot)
+                            .await?
+                    }
                 };
                 let Some(child) = child else {
                     dbg_reasons[3] += 1;
@@ -1679,10 +1692,12 @@ impl KvTree {
         out: &mut MaintenanceOutcome,
         forced_retirement: bool,
     ) -> Result<(), KvError> {
-        // This tree's SMOs are its lessee's: its ring, its grant (§5.2.3).
+        // This tree's SMOs are its lessee's: its ring, its grant (§5.2.3)
+        // — and its frame stamp (§5.8.2): every successor image is written
+        // under the slot's `(appender, g)`.
         ctx.scope_to(self.forest_slot);
         let cfg = self.cache.config();
-        let layout = &cfg.layout;
+        let layout = &self.cache.write_layout_for(node);
         let durable_tail = self.durable_tail();
 
         // ---- Step 1: build successors from the frozen snapshot, no locks.
@@ -2849,7 +2864,9 @@ impl KvTree {
         forced_retirement: bool,
     ) -> Result<Option<Arc<CachedNode>>, KvError> {
         let cfg = self.cache.config();
-        let layout = &cfg.layout;
+        // The merged successor is written under the pair's slot stamp
+        // (§5.8.2 — both siblings are one tree's).
+        let layout = &self.cache.write_layout_for(left);
         let durable_tail = self.durable_tail();
 
         // ---- Step 0: admission, side-effect free.

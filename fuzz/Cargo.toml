@@ -179,3 +179,12 @@ path = "fuzz_targets/data_alloc_bitmap_page.rs"
 test = false
 doc = false
 bench = false
+
+# --- symmetric metadata PR 5: the bset frame v2 + the screen ---------------
+
+[[bin]]
+name = "bset_frame_v2"
+path = "fuzz_targets/bset_frame_v2.rs"
+test = false
+doc = false
+bench = false

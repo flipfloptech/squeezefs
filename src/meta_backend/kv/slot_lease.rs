@@ -339,6 +339,13 @@ pub struct SlotLeasePlane {
     /// refusal is the belt behind this filter). 0 on a solo mount.
     pub merge_sweep_foreign_skips: AtomicU64,
     pub phases: HandoverPhases,
+    /// PR 5 — the §5.8.2 frame screen's per-slot tails cache: `slot →
+    /// (g_current the set was read at, the tails record's g, leaf addr →
+    /// recorded tail)`. Filled from tree 0's `slot_tails:{s}` at the first
+    /// screened load of a slot under a generation and reused until the
+    /// generation moves — one record read per slot per lease generation,
+    /// never per load (`KvMetaBackend::frame_screen_for`).
+    pub frame_tails: scc::HashMap<ForestSlot, Arc<(u32, u32, std::collections::HashMap<u64, u32>)>>,
 }
 
 impl Drop for SlotLeasePlane {
@@ -410,6 +417,7 @@ impl SlotLeasePlane {
             ceiling_overflows: AtomicU64::new(0),
             region_releases: AtomicU64::new(0),
             phases: HandoverPhases::default(),
+            frame_tails: scc::HashMap::new(),
         }
     }
 

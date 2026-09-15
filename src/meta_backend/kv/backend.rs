@@ -2203,8 +2203,11 @@ impl KvMetaBackend {
             .await?,
         );
 
-        // 5a. Node cache + trees from the ledger roots.
-        let layout = NodeLayout::new(sb.node_size as usize)?;
+        // 5a. Node cache + trees from the ledger roots. Bit 17 selects the
+        // v2 stamped bset frame (design-symmetric-metadata §5.8.2, PR 5);
+        // a bit-17-absent volume's layout is the shipped v1, byte for
+        // byte.
+        let layout = Self::node_layout_for(&sb)?;
         let cache = NodeCache::new(NodeCacheConfig {
             path: path.to_path_buf(),
             layout,
@@ -2878,6 +2881,19 @@ impl KvMetaBackend {
         &self.sb
     }
 
+    /// The node layout `sb` describes: the v2 stamped bset frame under
+    /// incompat bit 17 (design-symmetric-metadata §5.8.2), the shipped v1
+    /// frame otherwise — the ONE place the frame version is decided for a
+    /// mounted volume (the builder decides it for a fresh image, the
+    /// conversion for a relayout).
+    pub fn node_layout_for(sb: &SuperblockV3) -> std::result::Result<NodeLayout, KvError> {
+        if sb.symmetric_forest_stamped() {
+            NodeLayout::new_symmetric(sb.node_size as usize)
+        } else {
+            NodeLayout::new(sb.node_size as usize)
+        }
+    }
+
     /// The Appender family's snapshot (design-symmetric-metadata §11) —
     /// `None` on a bit-17-absent volume, where no region exists.
     pub fn appender_stats(&self) -> Option<super::appender::AppenderStats> {
@@ -2913,6 +2929,78 @@ impl KvMetaBackend {
             .as_ref()
             .filter(|a| a.is_partitioned())
             .map_or(0, |a| a.region_of_slot(slot))
+    }
+
+    // -----------------------------------------------------------------
+    // PR 5 — the §5.8.2 frame fence: the stamp a write carries, the
+    // screen a load reads (design-symmetric-metadata; the ONE accessor
+    // PR 10's recovery driver reads the same screen through).
+    // -----------------------------------------------------------------
+
+    /// The `(appender, g)` a write to a node of `slot` carries NOW: the
+    /// slot's journaling region and its lease generation off the armed
+    /// plane's table (`Unleased { g }` for a tree the manager maintains);
+    /// `(0, 0)` for tree 0 and on an unarmed forest (the manager's
+    /// structural stamp).
+    pub fn frame_stamp_for_slot(
+        &self,
+        slot: Option<super::record::ForestSlot>,
+    ) -> super::node::FrameStamp {
+        let Some(slot) = slot else {
+            return super::node::FrameStamp::default();
+        };
+        let g = match self.slot_leases() {
+            Some(plane) => match plane.table.resolve(slot) {
+                crate::slot_lease_core::Resolved::Unleased { g } => g,
+                crate::slot_lease_core::Resolved::Holder { g, .. } => g,
+            },
+            None => 0,
+        };
+        super::node::FrameStamp {
+            appender_id: self.region_of_slot(slot),
+            g,
+        }
+    }
+
+    /// The §5.8.2 screen input for a load of leaf `addr` in `slot`: the
+    /// slot's current generation, the tail the last release recorded for
+    /// the leaf (tree 0's `slot_tails:{s}`, read through the fence's
+    /// per-slot cache — one record read per slot per generation, never
+    /// per load), and the substrate's fence posture. `None` on an unarmed
+    /// forest (rule 3 alone) and on a flat volume.
+    pub async fn frame_screen_for(
+        &self,
+        slot: super::record::ForestSlot,
+        addr: u64,
+    ) -> std::result::Result<Option<super::node::FrameScreen>, KvError> {
+        let Some(plane) = self.slot_leases() else {
+            return Ok(None);
+        };
+        let g_current = match plane.table.resolve(slot) {
+            crate::slot_lease_core::Resolved::Unleased { g } => g,
+            crate::slot_lease_core::Resolved::Holder { g, .. } => g,
+        };
+        let tails = match plane.frame_tails.read_sync(&slot, |_, v| Arc::clone(v)) {
+            Some(cached) if cached.0 == g_current => cached,
+            _ => {
+                let (tails_g, set) = match self.slot_tails(slot).await? {
+                    Some((g, tails)) => (g, tails.into_iter().collect()),
+                    None => (0, std::collections::HashMap::new()),
+                };
+                let fresh = Arc::new((g_current, tails_g, set));
+                let _ = plane.frame_tails.remove_sync(&slot);
+                let _ = plane.frame_tails.insert_sync(slot, Arc::clone(&fresh));
+                fresh
+            }
+        };
+        Ok(Some(super::node::FrameScreen {
+            g_current,
+            recorded_tail: tails.2.get(&addr).map(|t| (tails.1, *t)),
+            pr_fenced: self
+                .appenders
+                .as_ref()
+                .is_some_and(|a| a.stats().meta_pr_wero),
+        }))
     }
 
     /// The region a cached node's floor clamps and whose ring its SMOs
@@ -3643,6 +3731,14 @@ impl KvMetaBackend {
         // The D0 winner IS the manager (KD-SYM-3): the unleased slot
         // trees' structure is this mount's to maintain.
         plane.gate.arm_as_manager();
+        // PR 5 — the §5.8.2 frame fence: from here every slot tree's
+        // frame carries `(region, g)` and every screened load reads the
+        // slot's generation + recorded tails (installed before the gate
+        // arms, so no armed write precedes its stamp).
+        if let Ok(weak) = self.conveyor_identity() {
+            self.cache
+                .install_frame_fence(Arc::new(SlotFrameFence { be: weak }));
+        }
         plane.gate.arm();
         // The membership carriage (§5.9): every member's renewal grant
         // now names the slots it leases here.
@@ -14241,6 +14337,51 @@ struct SpilledChainedFull {
     fresh_key: String,
     /// RES-9 custody for the fresh blob until the naming commit lands.
     guard: super::indirect_map::IndirectBlobGuard,
+}
+
+/// The armed plane's `FrameFenceSource` (PR 5, design-symmetric-metadata
+/// §5.8.2): answers the node cache's stamp and screen questions off the
+/// backend's lease table and tree 0. Holds the backend WEAKLY (the cache
+/// is the backend's; a strong reference would be a cycle) — a dropped
+/// backend answers the manager's stamp and no screen.
+struct SlotFrameFence {
+    be: Weak<KvMetaBackend>,
+}
+
+impl super::node_cache::FrameFenceSource for SlotFrameFence {
+    fn stamp_for(&self, slot: Option<super::record::ForestSlot>) -> super::node::FrameStamp {
+        match self.be.upgrade() {
+            Some(be) => be.frame_stamp_for_slot(slot),
+            None => super::node::FrameStamp::default(),
+        }
+    }
+
+    fn screen_for<'a>(
+        &'a self,
+        slot: super::record::ForestSlot,
+        addr: u64,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Option<super::node::FrameScreen>> + Send + 'a>,
+    > {
+        Box::pin(async move {
+            let be = self.be.upgrade()?;
+            match be.frame_screen_for(slot, addr).await {
+                Ok(s) => s,
+                Err(e) => {
+                    // A screen that cannot be read is no screen: the load
+                    // runs rule 3 alone (never a refused load — the
+                    // record read's failure is logged, and the plane's
+                    // next read retries).
+                    log::warn!(
+                        "meta volume {}: frame screen for slot {slot} node {addr:#x} could not \
+                         read tree 0's tails ({e}); the load runs unscreened (rule 3 only)",
+                        be.path.display()
+                    );
+                    None
+                }
+            }
+        })
+    }
 }
 
 struct QueuedTx {

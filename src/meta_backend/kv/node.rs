@@ -135,15 +135,82 @@ pub const NODE_HEADER_FIXED_LEN: usize = 40;
 
 /// Bset frame magic (`"KBSF"`).
 pub const BSET_FRAME_MAGIC: u32 = u32::from_le_bytes(*b"KBSF");
-/// Current bset frame version.
+/// The bset frame version every bit-17-absent volume writes and reads.
 pub const BSET_FRAME_VERSION: u16 = 1;
-/// Fixed bset-frame header length: `magic: u32 | version: u16 |
+/// Fixed bset-frame header length (v1): `magic: u32 | version: u16 |
 /// reserved: u16 | node_seq_at_write: u64 | padded_len: u32 | bset_len: u32 |
 /// checksum: u64`, little-endian. The checksum is xxh3_64 over the first
 /// 24 bytes; the embedded bset image carries its own checksum (§4.3), and
 /// the zero padding to `padded_len` is deliberately **not** covered — a torn
 /// append may legitimately truncate padding without damaging the bset.
 pub const BSET_FRAME_LEN: usize = 32;
+/// The bset frame version a symmetric-forest volume (incompat bit 17)
+/// writes and reads (design-symmetric-metadata §5.8.2): v1's fields plus
+/// `appender_id: u32 | g: u32` before the checksum — the writing
+/// appender and the SLOT's lease generation at the write, the fencing
+/// stamp the loader screens by position and monotonicity.
+pub const BSET_FRAME_VERSION_V2: u16 = 2;
+/// Fixed bset-frame header length (v2): the checksum is xxh3_64 over the
+/// first 32 bytes.
+pub const BSET_FRAME_V2_LEN: usize = 40;
+
+/// The fencing stamp a v2 frame carries: the appender that wrote it and
+/// the writing slot's lease generation `g` (design-symmetric-metadata
+/// §5.8.2 — a slot's generations are ONE sequence, which is why the stamp
+/// is the slot's `g` and never the appender's `dlm_term`). `(0, 0)` is the
+/// manager's structural stamp for tree 0, the native slot tree and every
+/// unleased tree it maintains.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Hash)]
+pub struct FrameStamp {
+    pub appender_id: u32,
+    pub g: u32,
+}
+
+/// Which frame the layout writes and admits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FrameFormat {
+    /// The shipped 32 B frame — every bit-17-absent volume, byte for byte.
+    V1,
+    /// The 40 B stamped frame — every bit-17 volume, with the stamp the
+    /// next write carries.
+    V2(FrameStamp),
+}
+
+/// The lessee-side input to the §5.8.2 frame screen for ONE leaf: the
+/// slot's CURRENT lease generation, the tail the last release recorded
+/// for this leaf (with the generation it was recorded at), and whether the
+/// substrate fences (rule 1 lands on `appender_fence_breach` under a device
+/// fence, on `foreign_frames_screened` otherwise).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FrameScreen {
+    pub g_current: u32,
+    /// `(g at the release that recorded it, tail offset)` — `None` when no
+    /// release ever recorded this leaf (a leaf minted after the last
+    /// release, or a slot never released).
+    pub recorded_tail: Option<(u32, u32)>,
+    pub pr_fenced: bool,
+}
+
+impl FrameScreen {
+    /// The three-rule verdict on one frame at node-relative offset `pos`
+    /// (design §5.8.2): `Some(rule)` names the rule that classified the
+    /// frame FOREIGN, `None` keeps it. `prev_g` is the generation of the
+    /// nearest earlier frame in the same log (rule 3's input).
+    pub fn foreign_rule(&self, stamp: FrameStamp, pos: usize, prev_g: Option<u32>) -> Option<u8> {
+        if stamp.g > self.g_current {
+            return Some(1);
+        }
+        if let Some((tails_g, tail)) = self.recorded_tail {
+            if stamp.g <= tails_g && pos >= tail as usize {
+                return Some(2);
+            }
+        }
+        if prev_g.is_some_and(|p| stamp.g < p) {
+            return Some(3);
+        }
+        None
+    }
+}
 
 /// Format-knob floor: 64 KiB (design §5.1 `--meta-node-kib`).
 pub const MIN_NODE_SIZE: usize = 64 * 1024;
@@ -182,12 +249,14 @@ pub fn record_value_cap(node_size: usize) -> usize {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct NodeLayout {
     node_size: usize,
+    frame: FrameFormat,
 }
 
 impl NodeLayout {
     /// Validate `node_size`: within `[MIN_NODE_SIZE, MAX_NODE_SIZE]` and a
     /// multiple of [`NODE_PAGE`]; anything else is a format bug, rejected
-    /// with [`KvError::Corrupt`].
+    /// with [`KvError::Corrupt`]. The layout of every bit-17-ABSENT volume:
+    /// v1 frames, byte-identical to the shipped format.
     pub fn new(node_size: usize) -> Result<Self, KvError> {
         if !(MIN_NODE_SIZE..=MAX_NODE_SIZE).contains(&node_size) || node_size % NODE_PAGE != 0 {
             return Err(KvError::Corrupt(format!(
@@ -195,7 +264,64 @@ impl NodeLayout {
                  [{MIN_NODE_SIZE}, {MAX_NODE_SIZE}]"
             )));
         }
-        Ok(Self { node_size })
+        Ok(Self {
+            node_size,
+            frame: FrameFormat::V1,
+        })
+    }
+
+    /// The layout of a symmetric-forest volume (incompat bit 17): v2
+    /// frames, the manager's `(0, 0)` stamp until [`Self::stamped`] names
+    /// the writing appender and slot generation. A v1 frame is foreign on
+    /// this layout (forward-only — no field volume carries bit 17, and a
+    /// pre-PR-5 stamped image is a test artefact, never a mount).
+    pub fn new_symmetric(node_size: usize) -> Result<Self, KvError> {
+        let mut l = Self::new(node_size)?;
+        l.frame = FrameFormat::V2(FrameStamp::default());
+        Ok(l)
+    }
+
+    /// This layout with `stamp` as the stamp the next write carries — a
+    /// per-write copy (the layout is `Copy`), so one volume layout serves
+    /// every slot's writes without a second parameter at every write
+    /// site. A no-op on a v1 layout: the shipped frame carries no stamp.
+    pub fn stamped(self, stamp: FrameStamp) -> Self {
+        match self.frame {
+            FrameFormat::V1 => self,
+            FrameFormat::V2(_) => Self {
+                frame: FrameFormat::V2(stamp),
+                ..self
+            },
+        }
+    }
+
+    /// Does this layout write (and admit only) the v2 stamped frame?
+    pub fn symmetric_frames(&self) -> bool {
+        matches!(self.frame, FrameFormat::V2(_))
+    }
+
+    /// The frame version this layout writes and admits.
+    pub fn frame_version(&self) -> u16 {
+        match self.frame {
+            FrameFormat::V1 => BSET_FRAME_VERSION,
+            FrameFormat::V2(_) => BSET_FRAME_VERSION_V2,
+        }
+    }
+
+    /// The frame header length this layout writes and walks.
+    pub fn frame_len(&self) -> usize {
+        match self.frame {
+            FrameFormat::V1 => BSET_FRAME_LEN,
+            FrameFormat::V2(_) => BSET_FRAME_V2_LEN,
+        }
+    }
+
+    /// The stamp the next write carries (`None` on a v1 layout).
+    pub fn frame_stamp(&self) -> Option<FrameStamp> {
+        match self.frame {
+            FrameFormat::V1 => None,
+            FrameFormat::V2(s) => Some(s),
+        }
     }
 
     /// The validated node size in bytes.
@@ -219,7 +345,7 @@ impl NodeLayout {
     /// accounting — a fold at-or-under this rewrites 1:1, above it splits)
     /// and the heap admission's projection of the same decision.
     pub fn fold_capacity(&self) -> usize {
-        self.node_size - NODE_PAGE - BSET_FRAME_LEN - super::bset::BSET_HEADER_LEN
+        self.node_size - NODE_PAGE - self.frame_len() - super::bset::BSET_HEADER_LEN
     }
 
     /// The SMO's per-part fill target on a split: parts fill to ¾ of
@@ -288,7 +414,7 @@ impl NodeLayout {
         if bytes == 0 {
             0
         } else {
-            page_align(BSET_FRAME_LEN + super::bset::BSET_HEADER_LEN + bytes)
+            page_align(self.frame_len() + super::bset::BSET_HEADER_LEN + bytes)
         }
     }
 }
@@ -453,6 +579,9 @@ pub struct LoadedNode {
     bset_ranges: Vec<Range<usize>>,
     tail_offset: usize,
     dropped_tail_bsets: u64,
+    /// Frames the §5.8.2 screen classified FOREIGN at this load (0 on
+    /// every v1 layout and every un-screened load).
+    foreign_frames_screened: u64,
 }
 
 impl std::fmt::Debug for LoadedNode {
@@ -465,6 +594,7 @@ impl std::fmt::Debug for LoadedNode {
             .field("bsets", &self.bset_ranges.len())
             .field("tail_offset", &self.tail_offset)
             .field("dropped_tail_bsets", &self.dropped_tail_bsets)
+            .field("foreign_frames_screened", &self.foreign_frames_screened)
             .finish()
     }
 }
@@ -515,6 +645,13 @@ impl LoadedNode {
     /// (also accumulated in [`super::META_KV_NODE_DROPPED_TAIL_BSETS`]).
     pub fn dropped_tail_bsets(&self) -> u64 {
         self.dropped_tail_bsets
+    }
+
+    /// Frames the §5.8.2 screen classified FOREIGN at THIS load (also
+    /// accumulated in [`super::META_KV_FOREIGN_FRAMES_SCREENED`] /
+    /// [`super::META_KV_APPENDER_FENCE_BREACH`] by rule).
+    pub fn foreign_frames_screened(&self) -> u64 {
+        self.foreign_frames_screened
     }
 
     /// The append destination continuing this node's log.
@@ -586,20 +723,31 @@ pub fn encode_bset_frame(
     let bset = build_bset(records, journal_seq_horizon)?;
     let bset_len = u32::try_from(bset.len())
         .map_err(|_| KvError::Corrupt(format!("bset image length {} exceeds u32", bset.len())))?;
-    let padded_len = page_align(BSET_FRAME_LEN + bset.len());
+    let frame_len = layout.frame_len();
+    let padded_len = page_align(frame_len + bset.len());
     let padded_len_u32 = u32::try_from(padded_len)
         .map_err(|_| KvError::Corrupt(format!("padded frame length {padded_len} exceeds u32")))?;
 
     let mut out = vec![0u8; padded_len];
     out[0..4].copy_from_slice(&BSET_FRAME_MAGIC.to_le_bytes());
-    out[4..6].copy_from_slice(&BSET_FRAME_VERSION.to_le_bytes());
+    out[4..6].copy_from_slice(&layout.frame_version().to_le_bytes());
     // bytes 6..8: reserved, zero.
     out[8..16].copy_from_slice(&node_seq_at_write.to_le_bytes());
     out[16..20].copy_from_slice(&padded_len_u32.to_le_bytes());
     out[20..24].copy_from_slice(&bset_len.to_le_bytes());
-    let sum = xxhash_rust::xxh3::xxh3_64(&out[..24]);
-    out[24..32].copy_from_slice(&sum.to_le_bytes());
-    out[BSET_FRAME_LEN..BSET_FRAME_LEN + bset.len()].copy_from_slice(&bset);
+    match layout.frame_stamp() {
+        None => {
+            let sum = xxhash_rust::xxh3::xxh3_64(&out[..24]);
+            out[24..32].copy_from_slice(&sum.to_le_bytes());
+        }
+        Some(stamp) => {
+            out[24..28].copy_from_slice(&stamp.appender_id.to_le_bytes());
+            out[28..32].copy_from_slice(&stamp.g.to_le_bytes());
+            let sum = xxhash_rust::xxh3::xxh3_64(&out[..32]);
+            out[32..40].copy_from_slice(&sum.to_le_bytes());
+        }
+    }
+    out[frame_len..frame_len + bset.len()].copy_from_slice(&bset);
     Ok(out)
 }
 
@@ -608,6 +756,8 @@ struct FrameHeader {
     node_seq_at_write: u64,
     padded_len: usize,
     bset_len: usize,
+    /// The v2 fencing stamp (`None` on a v1 frame).
+    stamp: Option<FrameStamp>,
 }
 
 /// Outcome of inspecting one 4 KiB-aligned frame slot.
@@ -639,62 +789,115 @@ enum FrameProbe {
 }
 
 /// Inspect the frame slot at `buf[pos..]` (caller guarantees at least
-/// [`BSET_FRAME_LEN`] readable bytes). Branches only on checksum-verified
-/// bytes (§4.5).
-fn probe_frame(buf: &[u8], pos: usize, node_seq: u64) -> FrameProbe {
-    let hdr = &buf[pos..pos + BSET_FRAME_LEN];
+/// `layout.frame_len()` readable bytes). Branches only on checksum-verified
+/// bytes (§4.5). The layout decides the ONE frame version admitted: a v2
+/// frame on a v1 layout and a v1 frame on a v2 layout are both `Garbage`
+/// (a foreign version), so a bit-17-absent volume reads exactly as
+/// shipped and a forest volume never mistakes an unstamped frame for a
+/// stamped one.
+fn probe_frame(buf: &[u8], pos: usize, node_seq: u64, layout: &NodeLayout) -> FrameProbe {
+    let frame_len = layout.frame_len();
+    let hdr = &buf[pos..pos + frame_len];
     let magic = u32::from_le_bytes([hdr[0], hdr[1], hdr[2], hdr[3]]);
     if magic != BSET_FRAME_MAGIC {
         return FrameProbe::CleanEnd;
     }
-    let stored = u64::from_le_bytes(hdr[24..32].try_into().expect("8-byte slice"));
-    if stored != xxhash_rust::xxh3::xxh3_64(&hdr[..24]) {
+    let checked = frame_len - 8;
+    let stored = u64::from_le_bytes(hdr[checked..frame_len].try_into().expect("8-byte slice"));
+    if stored != xxhash_rust::xxh3::xxh3_64(&hdr[..checked]) {
         return FrameProbe::Garbage;
     }
     let version = u16::from_le_bytes([hdr[4], hdr[5]]);
-    if version != BSET_FRAME_VERSION {
+    if version != layout.frame_version() {
         return FrameProbe::Garbage;
     }
     let node_seq_at_write = u64::from_le_bytes(hdr[8..16].try_into().expect("8-byte slice"));
     if node_seq_at_write != node_seq {
         return FrameProbe::StaleIncarnation;
     }
+    let stamp = layout.symmetric_frames().then(|| FrameStamp {
+        appender_id: u32::from_le_bytes([hdr[24], hdr[25], hdr[26], hdr[27]]),
+        g: u32::from_le_bytes([hdr[28], hdr[29], hdr[30], hdr[31]]),
+    });
     FrameProbe::Frame(FrameHeader {
         node_seq_at_write,
         padded_len: u32::from_le_bytes([hdr[16], hdr[17], hdr[18], hdr[19]]) as usize,
         bset_len: u32::from_le_bytes([hdr[20], hdr[21], hdr[22], hdr[23]]) as usize,
+        stamp,
     })
 }
 
-/// Whether `page` (≥ [`BSET_FRAME_LEN`] bytes of a node's log area at a
-/// 4 KiB boundary) already holds a **checksum-verified frame of this node
-/// incarnation** — the multi-appender foreign-append probe (pre-RC
-/// engineering spec §6.2 closing / §6.3): a peer that appended into a node
-/// whose log tail we remember would otherwise be silently overwritten by
-/// our next append, which writes at that remembered offset and only checks
-/// the node incarnation. Branches only on verified bytes, exactly like the
-/// §4.5 classifier: garbage, a clean end, and a previous incarnation's
-/// residue are all "not a peer's frame".
+/// What the destination page of an append already holds — the
+/// multi-appender foreign-append probe's answer (pre-RC engineering spec
+/// §6.2 closing / §6.3; design-symmetric-metadata §5.8.2 on a forest).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TailPage {
+    /// No checksum-verified frame of this incarnation: garbage, a clean
+    /// end, or a previous incarnation's residue — free to append.
+    Clear,
+    /// A verified frame of this incarnation under OUR stamp (or any
+    /// stamp on a v1 layout): a peer of our identity appended into a node
+    /// we cache — the pre-forest partition class.
+    Ours,
+    /// A verified frame of this incarnation under ANOTHER stamp: a
+    /// foreign appender (a zombie predecessor of the slot, on a non-PR
+    /// substrate) wrote at our remembered tail — `foreign_frame_
+    /// overwrite_detected`, the after-the-fact face of §5.8.2's residual
+    /// class (ii).
+    Foreign(FrameStamp),
+}
+
+/// Classify `page` (≥ `layout.frame_len()` bytes of a node's log area at a
+/// 4 KiB boundary) for an append about to land there: a peer that
+/// appended into a node whose log tail we remember would otherwise be
+/// silently overwritten by our next append, which writes at that
+/// remembered offset and only checks the node incarnation. Branches only
+/// on verified bytes, exactly like the §4.5 classifier.
 ///
 /// Only [`super::node_cache::NodeCache::append_frozen`] calls it, and only
 /// on a partitioned volume — a solo volume has no peers by construction and
 /// pays no extra device read.
-pub fn page_holds_live_frame(page: &[u8], node_seq: u64) -> bool {
-    if page.len() < BSET_FRAME_LEN {
-        return false;
+pub fn probe_tail_page(page: &[u8], node_seq: u64, layout: &NodeLayout) -> TailPage {
+    if page.len() < layout.frame_len() {
+        return TailPage::Clear;
     }
-    matches!(probe_frame(page, 0, node_seq), FrameProbe::Frame(_))
+    match probe_frame(page, 0, node_seq, layout) {
+        FrameProbe::Frame(f) => match (f.stamp, layout.frame_stamp()) {
+            (Some(found), Some(ours)) if found != ours => TailPage::Foreign(found),
+            _ => TailPage::Ours,
+        },
+        _ => TailPage::Clear,
+    }
 }
 
 /// Validate a same-incarnation frame's geometry against its container
 /// (§9 bounds rule): 4 KiB-multiple `padded_len` within the extent, a bset
 /// no smaller than its header and no larger than the frame.
-fn frame_geometry_ok(f: &FrameHeader, pos: usize, node_size: usize) -> bool {
+fn frame_geometry_ok(f: &FrameHeader, pos: usize, node_size: usize, frame_len: usize) -> bool {
     f.padded_len >= NODE_PAGE
         && f.padded_len % NODE_PAGE == 0
         && f.padded_len <= node_size - pos
         && f.bset_len >= BSET_HEADER_LEN
-        && BSET_FRAME_LEN + f.bset_len <= f.padded_len
+        && frame_len + f.bset_len <= f.padded_len
+}
+
+/// The checksummed 4 KiB header page for `params` under `layout` — the
+/// ONE header encoder ([`write_node`]'s first page; the fuzz target
+/// `bset_frame_v2` builds constructive logs from it without I/O).
+pub fn encode_header_page(
+    layout: &NodeLayout,
+    params: &NodeWriteParams<'_>,
+) -> Result<Vec<u8>, KvError> {
+    NodeHeader {
+        node_addr: params.node_addr,
+        node_seq: params.node_seq,
+        tree_id: params.tree_id,
+        level: params.level,
+        node_size: layout.node_size() as u32,
+        min_key: params.min_key.to_vec(),
+        max_key: params.max_key.to_vec(),
+    }
+    .encode_page()
 }
 
 /// Write a fresh node image — header page plus, when `base_records` is
@@ -729,16 +932,7 @@ pub async fn write_node(
             )));
         }
     }
-    let header = NodeHeader {
-        node_addr: params.node_addr,
-        node_seq: params.node_seq,
-        tree_id: params.tree_id,
-        level: params.level,
-        node_size: layout.node_size() as u32,
-        min_key: params.min_key.to_vec(),
-        max_key: params.max_key.to_vec(),
-    };
-    let mut image = header.encode_page()?;
+    let mut image = encode_header_page(layout, params)?;
     let horizon = if base_records.is_empty() {
         0
     } else {
@@ -761,8 +955,8 @@ pub async fn write_node(
     Ok(WrittenNode {
         node_addr: params.node_addr,
         node_seq: params.node_seq,
-        min_key: header.min_key,
-        max_key: header.max_key,
+        min_key: params.min_key.to_vec(),
+        max_key: params.max_key.to_vec(),
         record_count: base_records.len(),
         bytes_written,
         journal_seq_horizon: horizon,
@@ -826,6 +1020,22 @@ pub async fn load_node(
     node_addr: u64,
     durable_tail: u64,
 ) -> Result<LoadedNode, KvError> {
+    load_node_screened(path, layout, node_addr, durable_tail, None).await
+}
+
+/// [`load_node`] under the §5.8.2 frame screen (design-symmetric-metadata;
+/// PR 5): on a v2 layout every same-incarnation frame is judged by
+/// `screen`'s three rules and the walk STOPS at the first foreign one
+/// (the frames behind it are not this lessee's log). `None` — every v1
+/// load, and a v2 load with no lease plane to answer for the slot —
+/// applies rule 3 alone (monotone `g` within one log needs no input).
+pub async fn load_node_screened(
+    path: impl AsRef<Path>,
+    layout: &NodeLayout,
+    node_addr: u64,
+    durable_tail: u64,
+    screen: Option<&FrameScreen>,
+) -> Result<LoadedNode, KvError> {
     check_addr_alignment(node_addr)?;
     let node_size = layout.node_size();
     let buf = uring_fs::read_at(path, node_addr, node_size).await?;
@@ -836,7 +1046,7 @@ pub async fn load_node(
             buf.len()
         )));
     }
-    verify_node_extent(buf, layout, node_addr, durable_tail)
+    verify_node_extent_screened(buf, layout, node_addr, durable_tail, screen)
 }
 
 /// The **pure** half of [`load_node`]: everything after the device read —
@@ -854,7 +1064,20 @@ pub fn verify_node_extent(
     node_addr: u64,
     durable_tail: u64,
 ) -> Result<LoadedNode, KvError> {
+    verify_node_extent_screened(buf, layout, node_addr, durable_tail, None)
+}
+
+/// [`verify_node_extent`] under the §5.8.2 frame screen (see
+/// [`load_node_screened`]).
+pub fn verify_node_extent_screened(
+    buf: Bytes,
+    layout: &NodeLayout,
+    node_addr: u64,
+    durable_tail: u64,
+    screen: Option<&FrameScreen>,
+) -> Result<LoadedNode, KvError> {
     let node_size = layout.node_size();
+    let frame_len = layout.frame_len();
     if buf.len() != node_size {
         return Err(KvError::Corrupt(format!(
             "node extent length {} != node_size {node_size}",
@@ -887,15 +1110,20 @@ pub fn verify_node_extent(
     let mut bset_ranges: Vec<Range<usize>> = Vec::new();
     let mut pos = NODE_PAGE;
     let mut torn_stop = false; // an identifiable-but-invalid unit at `pos`
+                               // The §5.8.2 screen's state: the nearest earlier frame's `g` (rule 3)
+                               // and where a FOREIGN frame stopped the walk (the overwrite diagnosis
+                               // below reads it). Only a v2 layout produces stamps.
+    let mut prev_g: Option<u32> = None;
+    let mut screened_at: Option<(usize, FrameStamp, u8)> = None;
     while pos < node_size {
-        match probe_frame(&buf, pos, header.node_seq) {
+        match probe_frame(&buf, pos, header.node_seq, layout) {
             FrameProbe::CleanEnd | FrameProbe::StaleIncarnation => break,
             FrameProbe::Garbage => {
                 torn_stop = true;
                 break;
             }
             FrameProbe::Frame(f) => {
-                if !frame_geometry_ok(&f, pos, node_size) {
+                if !frame_geometry_ok(&f, pos, node_size, frame_len) {
                     // A checksum-verified same-incarnation frame lying about
                     // its geometry cannot be a tear (a torn prefix breaks
                     // the checksum): writer bug or real corruption.
@@ -905,7 +1133,19 @@ pub fn verify_node_extent(
                         f.node_seq_at_write, f.padded_len, f.bset_len
                     )));
                 }
-                let bset_start = pos + BSET_FRAME_LEN;
+                if let Some(stamp) = f.stamp {
+                    // Rule 3 needs no plane; rules 1–2 read the screen.
+                    let rule = match screen {
+                        Some(sc) => sc.foreign_rule(stamp, pos, prev_g),
+                        None => prev_g.filter(|p| stamp.g < *p).map(|_| 3u8),
+                    };
+                    if let Some(rule) = rule {
+                        screened_at = Some((pos, stamp, rule));
+                        break;
+                    }
+                    prev_g = Some(stamp.g);
+                }
+                let bset_start = pos + frame_len;
                 match BsetView::parse(&buf[bset_start..bset_start + f.bset_len]) {
                     Ok(_) => {
                         bset_ranges.push(bset_start..bset_start + f.bset_len);
@@ -922,6 +1162,63 @@ pub fn verify_node_extent(
         }
     }
 
+    // The screen's verdict (§5.8.2): a foreign frame ends this lessee's
+    // log at `pos`; it is counted by rule and class, and the stride scan
+    // below looks PAST it for frames of the current generation — the
+    // residual class (ii) shape (a zombie wrote at a position the
+    // successor had already written): acked loss, refused loud rather
+    // than served with a hole.
+    let mut screened = 0u64;
+    if let Some((at, stamp, rule)) = screened_at {
+        screened = 1;
+        let pr_fenced = screen.is_some_and(|s| s.pr_fenced);
+        if rule == 1 && pr_fenced {
+            super::META_KV_APPENDER_FENCE_BREACH.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            crate::note_invariant_tripwire(
+                "meta_kv_appender_fence_breach",
+                &format!(
+                    "node {node_addr:#x}: a frame at offset {at} carries slot generation {} \
+                     ABOVE the current lease generation {} (appender {}) on a DEVICE-FENCED \
+                     substrate — a write the reservation should have rejected",
+                    stamp.g,
+                    screen.map_or(0, |s| s.g_current),
+                    stamp.appender_id
+                ),
+            );
+        } else {
+            super::META_KV_FOREIGN_FRAMES_SCREENED
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            log::warn!(
+                "node {node_addr:#x}: bset frame at offset {at} (appender {}, slot generation \
+                 {}) screened FOREIGN by rule {rule} (design-symmetric-metadata §5.8.2; the \
+                 lessee's current generation is {}) — the log ends before it",
+                stamp.appender_id,
+                stamp.g,
+                screen.map_or(0, |s| s.g_current),
+            );
+        }
+        let g_current = screen.map(|s| s.g_current);
+        let mut probe = at.saturating_add(NODE_PAGE);
+        while probe + frame_len <= node_size {
+            if let FrameProbe::Frame(f) = probe_frame(&buf, probe, header.node_seq, layout) {
+                if frame_geometry_ok(&f, probe, node_size, frame_len)
+                    && f.stamp.is_some_and(|s| Some(s.g) == g_current)
+                {
+                    super::META_KV_FOREIGN_FRAME_OVERWRITE_DETECTED
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    return Err(KvError::Corrupt(format!(
+                        "node {node_addr:#x}: a foreign frame (appender {}, g {}) at offset \
+                         {at} sits BEFORE this lessee's own frame at offset {probe} — a zombie \
+                         overwrote an acked frame (foreign_frame_overwrite_detected, design \
+                         §5.8.2 residual class (ii)); refusing to serve the log with a hole",
+                        stamp.appender_id, stamp.g
+                    )));
+                }
+            }
+            probe += NODE_PAGE;
+        }
+    }
+
     // Diagnosis pass (§4.5): scan the remainder at 4 KiB strides for
     // same-incarnation bsets that DO verify. horizon ≤ durable_tail ⇒
     // checkpoint-covered data after a tear ⇒ fail the node loud; otherwise
@@ -931,28 +1228,31 @@ pub fn verify_node_extent(
     // positions — the seq-space law) a larger horizon satisfies `≤` less
     // often, so the domain gap can only make this tripwire QUIETER — its
     // sensitivity, never a load's safety (the walk above branched on no
-    // seq).
+    // seq). A screened stop is the screen's stop, not a tear: nothing past
+    // a foreign frame is this log's.
     let mut dropped = u64::from(torn_stop);
-    let mut probe = pos.saturating_add(NODE_PAGE);
-    while probe + BSET_FRAME_LEN <= node_size {
-        if let FrameProbe::Frame(f) = probe_frame(&buf, probe, header.node_seq) {
-            if frame_geometry_ok(&f, probe, node_size) {
-                let bset_start = probe + BSET_FRAME_LEN;
-                if let Ok(view) = BsetView::parse(&buf[bset_start..bset_start + f.bset_len]) {
-                    let horizon = view.journal_seq_horizon();
-                    if horizon <= durable_tail {
-                        return Err(KvError::CheckpointCoveredBsetAfterTear {
-                            node_addr,
-                            bset_offset: probe,
-                            horizon,
-                            durable_tail,
-                        });
+    if screened_at.is_none() {
+        let mut probe = pos.saturating_add(NODE_PAGE);
+        while probe + frame_len <= node_size {
+            if let FrameProbe::Frame(f) = probe_frame(&buf, probe, header.node_seq, layout) {
+                if frame_geometry_ok(&f, probe, node_size, frame_len) {
+                    let bset_start = probe + frame_len;
+                    if let Ok(view) = BsetView::parse(&buf[bset_start..bset_start + f.bset_len]) {
+                        let horizon = view.journal_seq_horizon();
+                        if horizon <= durable_tail {
+                            return Err(KvError::CheckpointCoveredBsetAfterTear {
+                                node_addr,
+                                bset_offset: probe,
+                                horizon,
+                                durable_tail,
+                            });
+                        }
+                        dropped += 1;
                     }
-                    dropped += 1;
                 }
             }
+            probe += NODE_PAGE;
         }
-        probe += NODE_PAGE;
     }
 
     if dropped > 0 {
@@ -965,6 +1265,7 @@ pub fn verify_node_extent(
         bset_ranges,
         tail_offset: pos,
         dropped_tail_bsets: dropped,
+        foreign_frames_screened: screened,
     })
 }
 
@@ -1036,19 +1337,29 @@ pub fn residue_seq_ceiling(buf: &[u8]) -> u64 {
             ceiling = h.node_seq;
         }
     }
+    // Both frame versions are residue candidates (a reclaimed extent's
+    // previous life may be either layout's); each is verified over its
+    // own checked span.
     let mut pos = NODE_PAGE;
-    while pos + BSET_FRAME_LEN <= buf.len() {
-        let hdr = &buf[pos..pos + BSET_FRAME_LEN];
+    while pos + BSET_FRAME_V2_LEN <= buf.len() {
+        let hdr = &buf[pos..pos + BSET_FRAME_V2_LEN];
         let magic = u32::from_le_bytes([hdr[0], hdr[1], hdr[2], hdr[3]]);
         if magic == BSET_FRAME_MAGIC {
-            let stored = u64::from_le_bytes([
-                hdr[24], hdr[25], hdr[26], hdr[27], hdr[28], hdr[29], hdr[30], hdr[31],
-            ]);
-            if stored == xxhash_rust::xxh3::xxh3_64(&hdr[..24]) {
-                let stamp = u64::from_le_bytes([
-                    hdr[8], hdr[9], hdr[10], hdr[11], hdr[12], hdr[13], hdr[14], hdr[15],
-                ]);
-                ceiling = ceiling.max(stamp);
+            let version = u16::from_le_bytes([hdr[4], hdr[5]]);
+            let checked = match version {
+                BSET_FRAME_VERSION => Some(BSET_FRAME_LEN - 8),
+                BSET_FRAME_VERSION_V2 => Some(BSET_FRAME_V2_LEN - 8),
+                _ => None,
+            };
+            if let Some(checked) = checked {
+                let stored =
+                    u64::from_le_bytes(hdr[checked..checked + 8].try_into().expect("8-byte slice"));
+                if stored == xxhash_rust::xxh3::xxh3_64(&hdr[..checked]) {
+                    let stamp = u64::from_le_bytes([
+                        hdr[8], hdr[9], hdr[10], hdr[11], hdr[12], hdr[13], hdr[14], hdr[15],
+                    ]);
+                    ceiling = ceiling.max(stamp);
+                }
             }
         }
         pos += NODE_PAGE;
@@ -1085,7 +1396,7 @@ pub async fn compact_node(
     if !folded.is_empty() {
         let image_len = NODE_PAGE
             + page_align(
-                BSET_FRAME_LEN
+                layout.frame_len()
                     + BSET_HEADER_LEN
                     + folded
                         .iter()

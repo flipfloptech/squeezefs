@@ -47,7 +47,10 @@ use squeezefs::meta_backend::kv::forest::{
     interior_journal_key, split_interior_journal_key, INTERIOR_JOURNAL_SLOT_LEN,
 };
 use squeezefs::meta_backend::kv::journal::{decode_entry_payload, encode_entry_payload};
-use squeezefs::meta_backend::kv::node::{verify_node_extent, NodeLayout};
+use squeezefs::meta_backend::kv::node::{
+    encode_bset_frame, encode_header_page, verify_node_extent, verify_node_extent_screened,
+    FrameScreen, FrameStamp, NodeLayout, NodeWriteParams, NODE_PAGE,
+};
 use squeezefs::meta_backend::kv::record::{
     classify_refused_key, decode_dentry_key, decode_inode_key, decode_readdir_cookie,
     decode_xattr_key, dentry_key, forest_key, forest_key_kind, forest_key_slot, forest_slot_of_ino,
@@ -357,6 +360,117 @@ proptest! {
                 for i in 0..node.bset_count() {
                     prop_assert!(node.bset(i).is_ok());
                 }
+            }
+        }
+    }
+
+    /// The bset frame v2 grammar + the §5.8.2 screen are total on a
+    /// forest layout (the `bset_frame_v2` fuzz target's arms 1–2 on
+    /// stable): arbitrary bytes, screened and not, and on the flat layout
+    /// beside it.
+    #[test]
+    fn bset_frame_v2_walk_never_panics(
+        seed in prop::collection::vec(any::<u8>(), 0..2048),
+        g_current in any::<u32>(),
+        tail_g in any::<u32>(),
+        tail_frame in 0u8..15,
+        has_tail in any::<bool>(),
+        pr_fenced in any::<bool>(),
+    ) {
+        const NODE_SIZE: usize = 64 * 1024;
+        let v2 = NodeLayout::new_symmetric(NODE_SIZE).expect("64 KiB node size");
+        let v1 = NodeLayout::new(NODE_SIZE).expect("64 KiB node size");
+        let screen = FrameScreen {
+            g_current,
+            recorded_tail: has_tail.then_some((tail_g, (u32::from(tail_frame) + 1) * NODE_PAGE as u32)),
+            pr_fenced,
+        };
+        let mut buf = vec![0u8; NODE_SIZE];
+        let n = seed.len().min(NODE_SIZE);
+        buf[..n].copy_from_slice(&seed[..n]);
+        let claimed = u64::from_le_bytes(buf[8..16].try_into().unwrap()) & !0xFFF;
+        for addr in [0u64, claimed] {
+            for (layout, sc) in [(&v2, Some(&screen)), (&v2, None), (&v1, None)] {
+                if let Ok(node) = verify_node_extent_screened(
+                    bytes::Bytes::from(buf.clone()),
+                    layout,
+                    addr,
+                    0,
+                    sc,
+                ) {
+                    prop_assert!(node.tail_offset() <= NODE_SIZE);
+                    for i in 0..node.bset_count() {
+                        prop_assert!(node.bset(i).is_ok());
+                    }
+                }
+            }
+        }
+    }
+
+    /// A constructive v2 log's screened walk equals the pure rule function
+    /// applied frame by frame (the fuzz target's arm 3): the screen is ONE
+    /// function, and every loader applies exactly it.
+    #[test]
+    fn bset_frame_v2_screen_matches_the_rule_function(
+        frames in prop::collection::vec((0u8..4, 0u8..4), 1..8),
+        g_current in 0u32..4,
+        tail_g in 0u32..4,
+        tail_frame in 0u8..8,
+        has_tail in any::<bool>(),
+    ) {
+        const NODE_SIZE: usize = 64 * 1024;
+        let v2 = NodeLayout::new_symmetric(NODE_SIZE).expect("64 KiB node size");
+        let screen = FrameScreen {
+            g_current,
+            recorded_tail: has_tail.then_some((tail_g, (u32::from(tail_frame) + 1) * NODE_PAGE as u32)),
+            pr_fenced: false,
+        };
+        let node_seq = 0x5EED_u64;
+        let mut image = vec![0u8; NODE_SIZE];
+        let header = encode_header_page(
+            &v2,
+            &NodeWriteParams {
+                node_addr: 0,
+                node_seq,
+                tree_id: TREE_INODES,
+                level: 0,
+                min_key: b"",
+                max_key: &[0xFF; 16],
+            },
+        )
+        .unwrap();
+        image[..NODE_PAGE].copy_from_slice(&header);
+        let mut pos = NODE_PAGE;
+        let mut kept = 0usize;
+        let mut stop: Option<u8> = None;
+        let mut prev_g = None;
+        for (i, (a, g)) in frames.iter().enumerate() {
+            let stamp = FrameStamp { appender_id: u32::from(*a), g: u32::from(*g) };
+            let rec = Record::put(inode_key(i as u64 + 1).to_vec(), i as u64 + 1, vec![1u8; 16]);
+            let frame = encode_bset_frame(&v2.stamped(stamp), node_seq, &[rec], 1).unwrap();
+            image[pos..pos + frame.len()].copy_from_slice(&frame);
+            if stop.is_none() {
+                match screen.foreign_rule(stamp, pos, prev_g) {
+                    Some(r) => stop = Some(r),
+                    None => {
+                        kept += 1;
+                        prev_g = Some(stamp.g);
+                    }
+                }
+            }
+            pos += frame.len();
+        }
+        match verify_node_extent_screened(bytes::Bytes::from(image), &v2, 0, 0, Some(&screen)) {
+            Ok(node) => {
+                prop_assert_eq!(node.bset_count(), kept);
+                prop_assert_eq!(node.foreign_frames_screened(), u64::from(stop.is_some()));
+            }
+            Err(e) => {
+                prop_assert!(
+                    stop.is_some() && e.to_string().contains("foreign_frame_overwrite_detected"),
+                    "{}",
+                    e
+                );
             }
         }
     }

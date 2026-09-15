@@ -266,6 +266,32 @@ pub static META_KV_REPLAY_EXTENT_VIOLATIONS: AtomicU64 = AtomicU64::new(0);
 /// Surfaced as `meta_kv_leaf_lease_refusals`.
 pub static META_KV_LEAF_LEASE_REFUSALS: AtomicU64 = AtomicU64::new(0);
 
+/// Bset frames the §5.8.2 screen classified FOREIGN at a load on a
+/// symmetric-forest volume (design-symmetric-metadata, PR 5): a frame
+/// past its slot's recorded tail under an older lease generation (rule
+/// 2), a frame whose generation is lower than an earlier frame's in the
+/// same log (rule 3), or — on a non-PR substrate — a frame above the
+/// current generation (rule 1). Every one is a zombie's append the walk
+/// cut the log at; 0 on every PR substrate by construction, 0 on every
+/// flat volume (v1 frames carry no stamp). Surfaced as
+/// `foreign_frames_screened`.
+pub static META_KV_FOREIGN_FRAMES_SCREENED: AtomicU64 = AtomicU64::new(0);
+
+/// **Must-stay-0 tripwire** (§5.8.2 rule 1 on a DEVICE-FENCED substrate):
+/// a frame stamped with a slot generation ABOVE the current lease
+/// generation — a write the reservation should have rejected. Surfaced as
+/// `appender_fence_breach`.
+pub static META_KV_APPENDER_FENCE_BREACH: AtomicU64 = AtomicU64::new(0);
+
+/// **Must-stay-0 on PR**: the after-the-fact face of §5.8.2's residual
+/// class (ii) — a foreign frame found at a position this lessee had
+/// already written (the destination-page probe at an append, or a
+/// screened frame with this lessee's own frames behind it at a load):
+/// a zombie overwrote an acked frame on a non-PR substrate. The load
+/// refuses loud; the append refuses loud. Surfaced as
+/// `foreign_frame_overwrite_detected`.
+pub static META_KV_FOREIGN_FRAME_OVERWRITE_DETECTED: AtomicU64 = AtomicU64::new(0);
+
 /// DUR-4 law 2 engagements: bitmap page images whose requested generation
 /// tied or trailed the page's newest on-disk copy and were RAISED above it
 /// (`alloc_ext::write_dirty_pages`). The shape it was written for is a

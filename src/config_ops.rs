@@ -5604,7 +5604,11 @@ async fn inspect_for_symmetric(path: &str, ordered: &[String]) -> Result<SymInsp
             .or_default()
             .push(Record::put(fkey, 0, value));
     }
-    let layout = NodeLayout::new(sb.node_size as usize)?;
+    // The forest is written with the v2 stamped frame (bit 17's frame,
+    // design-symmetric-metadata §5.8.2), so the plan prices the build's
+    // own geometry — the tie `extents_needed ≡ extents_written` holds
+    // only if both read one layout.
+    let layout = NodeLayout::new_symmetric(sb.node_size as usize)?;
     let slots = forest_slots_of(&flat, stamp);
     let mut planned_nodes = 0u64;
     for slot in &slots {
@@ -6521,7 +6525,9 @@ async fn convert_volume_to_forest(
     // slot whose stamp carries a cursor but whose records are gone —
     // tree 0 is the cursor's durable home, §5.1.8), tree 0, the
     // directory, appender 0's page in the zeroed fixed ring, the bitmap.
-    let layout = NodeLayout::new(sb.node_size as usize)?;
+    // The forest's frames are v2 under the manager's `(0, 0)` stamp
+    // (§5.8.2) — the layout the stamped volume's every later open reads.
+    let layout = NodeLayout::new_symmetric(sb.node_size as usize)?;
     let mut writer = TreeWriter::new(p, &layout, sb.heap.start, &alloc, seq_floor);
     let mut control: Vec<Record> = Vec::new();
     let mut native_root: Option<RootPtr> = None;
@@ -6745,6 +6751,9 @@ async fn finish_forest_conversion(
             &[],
         )
         .await?;
+        // The OLD trees are the flat layout's (v1 frames): the walk that
+        // frees them reads them under the layout they were written with,
+        // whatever sector 0 now says.
         let layout = NodeLayout::new(sb.node_size as usize)?;
         let cache = NodeCache::new(NodeCacheConfig {
             path: p.to_path_buf(),

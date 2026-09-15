@@ -567,10 +567,17 @@ impl ImageBuilder {
 
         // Generation-namespaced (uuid-derived) so heap extents reused
         // across a quick reformat never chain the dead generation's
-        // tail bsets — see [`node_seq_base`].
+        // tail bsets — see [`node_seq_base`]. A forest image is written
+        // with the v2 stamped frame under the manager's `(0, 0)` stamp
+        // (design-symmetric-metadata §5.8.2); a flat image keeps v1.
+        let layout = if symmetric {
+            NodeLayout::new_symmetric(self.layout.node_size())?
+        } else {
+            self.layout
+        };
         let mut writer = TreeWriter::new(
             path,
-            &self.layout,
+            &layout,
             sb.heap.start,
             &alloc,
             node_seq_base(self.cfg.uuid),

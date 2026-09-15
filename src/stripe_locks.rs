@@ -308,6 +308,13 @@ impl StripeCensus {
     pub fn stamp(&self, stripe: usize, key: u64) {
         self.holders[stripe].store(key, Ordering::Relaxed);
     }
+
+    /// The stripe's last-acquirer word (0 = never acquired) — the
+    /// contended arm's debug line names it.
+    #[inline]
+    pub fn last_acquirer(&self, stripe: usize) -> u64 {
+        self.holders[stripe].load(Ordering::Relaxed)
+    }
 }
 
 /// The classification itself over any last-holder `word` (the block

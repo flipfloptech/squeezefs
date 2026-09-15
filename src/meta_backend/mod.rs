@@ -1674,7 +1674,19 @@ impl RoutedMetaBackend {
                 .collect();
             let d: Vec<(Ino, &str, dlm::LockMode)> =
                 dents.iter().map(|(l, n, m)| (*l, n.as_str(), *m)).collect();
+            log::debug!(
+                "cross-owner guards: serving scope {scope:#x} for '{client}' on volume {v_idx} — \
+                 taking {} inode + {} dentry guard(s) (stripes {stripes:?})",
+                inos.len(),
+                d.len()
+            );
+            let t0 = std::time::Instant::now();
             let guards = dlm.lock_many(&inos, &d).await;
+            log::debug!(
+                "cross-owner guards: scope {scope:#x} for '{client}' on volume {v_idx} parked in \
+                 {:?}",
+                t0.elapsed()
+            );
             crossvol_tx::park_guards(client, scope, guards, stripes);
         }
         Ok(())

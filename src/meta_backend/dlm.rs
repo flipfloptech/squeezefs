@@ -133,11 +133,22 @@ impl DlmLockManager {
         hold_timed: bool,
     ) -> DlmGuard {
         let cell = class.locks.get_by_index(index).clone();
+        // The contended arm's tape (debug-gated, one line per parked
+        // acquire): the stripe, the mode and the stripe's LAST acquirer,
+        // so a wire stall parked on a 4a stripe names who holds it.
+        let contended = |what: &str| {
+            log::debug!(
+                "dlm: {what} stripe {index} (key {key:#x}) contended — last acquirer \
+                 {:#x}; parking",
+                class.census.last_acquirer(index)
+            );
+        };
         let inner = match mode {
             LockMode::Shared => match cell.try_read_owned() {
                 Ok(g) => DlmGuardInner::Shared { _g: g },
                 Err(cell) => {
                     class.census.classify_contended(index, key);
+                    contended("shared");
                     let t0 = std::time::Instant::now();
                     let g = cell.read_owned().await;
                     crate::fuse_client::lock_phase_record(
@@ -151,6 +162,7 @@ impl DlmLockManager {
                 Ok(g) => DlmGuardInner::Exclusive { _g: g },
                 Err(cell) => {
                     class.census.classify_contended(index, key);
+                    contended("exclusive");
                     let t0 = std::time::Instant::now();
                     let g = cell.write_owned().await;
                     crate::fuse_client::lock_phase_record(

@@ -883,6 +883,12 @@ where
                 done_at: lane.done_at,
                 observed_at,
             };
+            log::debug!(
+                "owner dispatch '{site}' hopped: queue {:?}, run {:?}, wake {:?}",
+                lane.picked_at.saturating_duration_since(submitted_at),
+                lane.done_at.saturating_duration_since(lane.picked_at),
+                observed_at.saturating_duration_since(lane.done_at)
+            );
             stamps.record();
             (Ok(out), stamps)
         }

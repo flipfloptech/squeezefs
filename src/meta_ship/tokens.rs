@@ -1744,8 +1744,9 @@ fn now_ms() -> u64 {
 /// owner's published number.
 const DELEG_PARK_DEFAULT_MS: u64 = 1_000;
 
-/// Freshness slack over two park rounds: scheduling + one RTT of grace.
-const DELEG_FRESH_SLACK_MS: u64 = 2_000;
+/// Freshness slack over two park rounds: scheduling + one RTT of grace
+/// (the token plane's recall channel reads the same law).
+pub(super) const DELEG_FRESH_SLACK_MS: u64 = 2_000;
 
 // The `dlm_delegation` family (design §13). Client-face counters live
 // here; the owner-face counters (grants issued, declines, timeouts) are

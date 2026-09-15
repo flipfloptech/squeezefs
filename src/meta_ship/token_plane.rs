@@ -1055,9 +1055,6 @@ impl Drop for TokenServe {
 /// added per entry.
 const TOKEN_ENTRY_BYTES: u64 = 128;
 
-/// Freshness slack over two park rounds (the S10 channel's law).
-const CHANNEL_FRESH_SLACK_MS: u64 = 2_000;
-
 /// The reader's side of the token plane for ONE volume.
 pub struct TokenReaderPlane {
     cfg: TokenClientConfig,
@@ -1182,7 +1179,8 @@ impl TokenReaderPlane {
         let age = self
             .now_ms()
             .saturating_sub(self.channel_last_round_ms.load(Ordering::Acquire));
-        age <= self.channel_park_ms.load(Ordering::Relaxed) * 2 + CHANNEL_FRESH_SLACK_MS
+        age <= self.channel_park_ms.load(Ordering::Relaxed) * 2
+            + super::tokens::DELEG_FRESH_SLACK_MS
     }
 
     fn serve_gate(&self) -> Result<()> {

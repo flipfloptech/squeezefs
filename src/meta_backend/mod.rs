@@ -1971,7 +1971,7 @@ impl RoutedMetaBackend {
 
     /// [`Self::pick_mint_slot`] for a child of `parent` — the create
     /// path's face: on an armed volume the gather arm first
-    /// ([`Self::gather_mint_slot`]), then the bounded parent-slot affinity
+    /// (`gather_mint_slot`), then the bounded parent-slot affinity
     /// policy with its overflow arm (one more rotor slot from the
     /// manager, up to `2 × M`); everywhere else the shared rotor verbatim.
     pub async fn pick_mint_slot_for(&self, volume_idx: usize, parent: Ino) -> u64 {

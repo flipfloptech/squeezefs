@@ -7,17 +7,17 @@
 //! the owner's LOCAL KEY ino — [`crate::meta_backend::RoutedMetaBackend`]'s
 //! `forest_ref_ops`), and the packer packs per `(writer, slot, data
 //! volume)`, so `refcount(b)` for a block nobody cloned is ONE range probe
-//! in one slot tree ([`super::KvMetaBackend::block_ref_probe`]). A block
+//! in one slot tree ([`crate::meta_backend::kv::backend::KvMetaBackend::block_ref_probe`]). A block
 //! referenced from TWO slots arises only through clone/reflink and goes
 //! through the **shared-block index**:
 //!
 //! ```text
-//! tree 0 of the index HOME volume ([`index_home_volume`]):
+//! tree 0 of the index HOME volume ([`index_home_volume`](crate::meta_backend::kv::shared_refs::index_home_volume)):
 //!   key   b"shared_ref:" ‖ vol_tag ‖ block_idx ‖ owner_ino ‖ block_index   (the 28 B ref key)
 //!   value version: u8 ‖ reserved × 3
 //! ```
 //!
-//! **The home** is resolved behind ONE function ([`index_home_volume`]):
+//! **The home** is resolved behind ONE function ([`index_home_volume`](crate::meta_backend::kv::shared_refs::index_home_volume)):
 //! in PR 7 it is volume 0's tree 0 — the manager's control plane (the
 //! records ride `write_control_entry`, the manager's one control-entry
 //! writer, in ring 0's USER class). PR 8 re-points it to the data
@@ -28,14 +28,14 @@
 //!
 //! **The protocol** (§5.4.4): `MarkShared { F, b }` sets the SHARED bit on
 //! F's reference at F's holder under F's 4a guard (an own-ring tx —
-//! [`super::KvMetaBackend::mark_block_ref_shared`]; absent ⇒ `Gone`, the
+//! [`crate::meta_backend::kv::backend::KvMetaBackend::mark_block_ref_shared`]; absent ⇒ `Gone`, the
 //! cloner aborts); `ShareBlock { b, source, target }` writes BOTH inos'
-//! index entries at the home (idempotent — [`super::KvMetaBackend::share_block`]);
+//! index entries at the home (idempotent — [`crate::meta_backend::kv::backend::KvMetaBackend::share_block`]);
 //! the cloner publishes its layout with its own reference SHARED
 //! (`BlockRefOp::taken_shared`, one tx — a clone of a clone inherits the
 //! bit); a terminal free of a SHARED block is never decided locally:
 //! `ReleaseShared { b, ino }` at the home deletes the releaser's entry and
-//! answers from what remains ([`super::KvMetaBackend::release_shared`]),
+//! answers from what remains ([`crate::meta_backend::kv::backend::KvMetaBackend::release_shared`]),
 //! GC'ing an entry whose ino no longer holds a reference (the "C dies
 //! after step 2" window). **Ordering law**: a reference is published only
 //! after its SHARED mark is durable at the owner — step 1 acks after its
@@ -43,7 +43,7 @@
 //!
 //! **C16** (§5.8.5, report-only): a SHARED-flagged reference without an
 //! index entry — on the source OR the target ino — or an index entry
-//! whose ino holds no SHARED reference ([`super::KvMetaBackend::shared_index_scan`]
+//! whose ino holds no SHARED reference ([`crate::meta_backend::kv::backend::KvMetaBackend::shared_index_scan`]
 //! is fsck's input; `fsck_shared_index_drift` the gauge).
 
 use super::super::block_refs::{

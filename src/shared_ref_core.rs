@@ -11,14 +11,14 @@
 //! too and stand down on it:
 //!
 //! * **patch** (`BlockAllocator::begin_patch_sole_owner`): retire the
-//!   incarnation word, [`crate::patch_clone_core::cross_word_fence`], then
+//!   incarnation word, `patch_clone_core::cross_word_fence`, then
 //!   `refcount == 1 && !is_shared` — a marked block is never patched in
 //!   place (`patch_ineligible_shared`), whatever its count reads.
 //! * **owner free** (`BackendRouter::free_block_verdict`): a release that
 //!   would be terminal reads the mark after the same fence; a marked
 //!   block's terminal verdict is never taken locally — the shared index's
 //!   holder decides from the index (`ReleaseShared`).
-//! * **cloner**: [`mark`] (a store), the fence, then the pin
+//! * **cloner**: [`mark`](crate::shared_ref_core::mark) (a store), the fence, then the pin
 //!   (`refcount_core::try_acquire`), the fence, the incarnation snapshot
 //!   — the shipped `pin_block_validated` sequence with the mark ahead of
 //!   it.
@@ -70,7 +70,7 @@ pub fn clear(word: &AtomicU32) {
 }
 
 /// Read the mark. Callers on the "sole owner" decision paths interpose
-/// [`crate::patch_clone_core::cross_word_fence`] between their own store
+/// `patch_clone_core::cross_word_fence` between their own store
 /// (the incarnation retire, the refcount release) and this load.
 pub fn is_shared(word: &AtomicU32) -> bool {
     word.load(Ordering::Acquire) == SHARED

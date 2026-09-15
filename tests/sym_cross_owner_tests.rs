@@ -2323,8 +2323,8 @@ async fn a_local_step_outside_its_scopes_keys_trips_the_invariant_tripwire() {
 /// The served insert's `child` is screened (review round 1, Issue 8a):
 /// a step naming a child with no inode record in a slot nobody leases is
 /// refused (`EINVAL`, `xv_cross_owner_steps_rejected`) and plants no
-/// dentry; a scope whose parked guards do not cover the step's keys
-/// never lets it apply unguarded (`Take`, not `Covered` — Issue 8b).
+/// dentry. (The coverage-checked `Covered` verdict has its own pin,
+/// `a_step_outside_its_scopes_parked_keys_takes_its_own_guards_and_parks`.)
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_served_insert_naming_an_unmintable_child_is_refused_and_plants_nothing() {
     use squeezefs::meta_ship::{MetaCall, MetaOp, PeerOwner};

@@ -3055,15 +3055,17 @@ impl KvMetaBackend {
     /// the tokens its batch's objects hold before it applies, and every
     /// terminal free runs under the free-grace recall gate. Idempotent.
     pub fn arm_token_holder(&self) -> Arc<crate::meta_ship::token_plane::TokenHolderPlane> {
-        let plane = self
-            .tokens_holder
-            .get_or_init(|| Arc::new(crate::meta_ship::token_plane::TokenHolderPlane::new()));
-        // The gate's reader-class law: a free bypasses the ring only when
-        // every live reader of the set is a token client of this holder.
-        crate::free_grace::install_token_client_probe(Arc::new(
-            crate::meta_ship::token_plane::is_token_client,
-        ));
-        crate::free_grace::arm_recall_gate();
+        let plane = self.tokens_holder.get_or_init(|| {
+            // The gate's reader-class law: a free bypasses the ring only
+            // when every live reader of the set is a token client of this
+            // holder. One holder counted per armed volume; the clean leave
+            // (`shutdown`) uncounts it.
+            crate::free_grace::install_token_client_probe(Arc::new(
+                crate::meta_ship::token_plane::is_token_client,
+            ));
+            crate::free_grace::arm_recall_gate();
+            Arc::new(crate::meta_ship::token_plane::TokenHolderPlane::new())
+        });
         Arc::clone(plane)
     }
 
@@ -12255,6 +12257,13 @@ impl KvMetaBackend {
                  pages stay Live — the next mount of this identity recovers its own residue)",
                 self.path.display()
             );
+        }
+        // PR 5: this volume's token holder leaves — one holder fewer on
+        // the process-wide recall gate (it clears with the last one).
+        // Nothing of this volume frees past this point, and a departed
+        // holder's readers are the membership plane's to evict.
+        if self.tokens_holder.get().is_some() {
+            crate::free_grace::disarm_recall_gate();
         }
         // D0: release the Write Exclusive reservation after the final
         // barrier (nothing of ours writes past this point), then the

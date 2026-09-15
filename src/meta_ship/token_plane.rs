@@ -545,8 +545,9 @@ impl TokenHolderPlane {
         &self.lane
     }
 
-    /// Install a lease oracle (the contracts; the mount installs the
-    /// membership owner's).
+    /// Install a lease oracle — the contracts' seam. The mount installs
+    /// none: the default verdict reads the installed membership owner
+    /// (`membership::installed_owner`) directly.
     pub fn install_lease_oracle(&self, oracle: Arc<LeaseOracle>) {
         *self.lease_oracle.write() = Some(oracle);
     }
@@ -938,44 +939,9 @@ impl TokenHolderPlane {
     }
 
     /// `dlm_token_recall_fanout` p50 / p99 off the log-bucket histogram
-    /// (the bucket's upper bound).
+    /// (its own bucket law — `QueueDepthHistogram::percentile`).
     fn fanout_percentile(&self, pct: u64) -> u64 {
-        const UPPER: [u64; 15] = [
-            0,
-            1,
-            2,
-            4,
-            8,
-            16,
-            32,
-            64,
-            128,
-            256,
-            512,
-            1024,
-            2048,
-            4096,
-            u64::MAX,
-        ];
-        let counts: Vec<u64> = self
-            .fanout
-            .buckets
-            .iter()
-            .map(|b| b.load(Ordering::Relaxed))
-            .collect();
-        let total: u64 = counts.iter().sum();
-        if total == 0 {
-            return 0;
-        }
-        let target = (total * pct).div_ceil(100).max(1);
-        let mut seen = 0u64;
-        for (i, c) in counts.iter().enumerate() {
-            seen += c;
-            if seen >= target {
-                return UPPER[i];
-            }
-        }
-        UPPER[14]
+        self.fanout.percentile(pct)
     }
 
     /// `dlm_token_recall_rtt_ns` (send / drain / ack / total).

@@ -4072,6 +4072,10 @@ pub fn reset_for_test() {
 /// Set while THIS writer's read-token plane is armed (a holder recalls
 /// before every conflicting commit).
 static RECALL_GATE: AtomicBool = AtomicBool::new(false);
+/// Armed holders in the process (one per armed volume): the gate is set
+/// by the first arm and cleared by the LAST leave — a set's frees run
+/// under the gate while any of its volumes holds tokens.
+static RECALL_GATE_HOLDERS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 /// Frees that bypassed the ring because every reader's recall was acked
 /// (or expired with its lease) before the freeing publish committed.
 static RECALL_GATED_FREES: AtomicU64 = AtomicU64::new(0);
@@ -4112,15 +4116,27 @@ pub enum RecallGate {
     Deferred,
 }
 
-/// Arm the recall gate (the token holder's arm on a writer).
+/// Arm the recall gate — one holder more (the token holder's arm on a
+/// writer, once per armed volume).
 pub fn arm_recall_gate() {
+    RECALL_GATE_HOLDERS.fetch_add(1, Ordering::AcqRel);
     RECALL_GATE.store(true, Ordering::Release);
 }
 
-/// Disarm (the leave / a test's teardown).
+/// One holder fewer (the armed volume's clean leave — the writer's
+/// `shutdown`; a test's teardown): the gate clears with the LAST one,
+/// and the timeout window with it.
 pub fn disarm_recall_gate() {
-    RECALL_GATE.store(false, Ordering::Release);
-    RECALL_UNACKED_UNTIL_MS.store(0, Ordering::Relaxed);
+    let before = RECALL_GATE_HOLDERS.load(Ordering::Acquire);
+    let left = if before == 0 {
+        0
+    } else {
+        RECALL_GATE_HOLDERS.fetch_sub(1, Ordering::AcqRel) - 1
+    };
+    if left == 0 {
+        RECALL_GATE.store(false, Ordering::Release);
+        RECALL_UNACKED_UNTIL_MS.store(0, Ordering::Relaxed);
+    }
 }
 
 /// Is the recall gate armed?
@@ -4216,6 +4232,7 @@ pub fn test_open_recall_window_ms(ms: u64) {
 
 fn reset_recall_gate_for_test() {
     RECALL_GATE.store(false, Ordering::Relaxed);
+    RECALL_GATE_HOLDERS.store(0, Ordering::Relaxed);
     RECALL_UNACKED_UNTIL_MS.store(0, Ordering::Relaxed);
     RECALL_GATED_FREES.store(0, Ordering::Relaxed);
     TIMEOUT_DEFERRALS.store(0, Ordering::Relaxed);

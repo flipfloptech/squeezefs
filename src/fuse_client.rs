@@ -5336,6 +5336,42 @@ impl QueueDepthHistogram {
         }
         serde_json::Value::Object(map)
     }
+
+    /// Bucket `i`'s inclusive upper bound — the ONE statement of the
+    /// bucket law [`Self::record`] and [`Self::to_json`]'s labels encode
+    /// (`0`, `1`, `2`, then `2^(i-1)` up to 4096; the last is open).
+    pub fn upper_bound(i: usize) -> u64 {
+        match i {
+            0 => 0,
+            1 => 1,
+            2 => 2,
+            i if i >= 14 => u64::MAX,
+            i => 1u64 << (i - 1),
+        }
+    }
+
+    /// The `pct`-th percentile as its bucket's upper bound (0 with no
+    /// samples).
+    pub fn percentile(&self, pct: u64) -> u64 {
+        let counts: Vec<u64> = self
+            .buckets
+            .iter()
+            .map(|b| b.load(Ordering::Relaxed))
+            .collect();
+        let total: u64 = counts.iter().sum();
+        if total == 0 {
+            return 0;
+        }
+        let target = (total * pct).div_ceil(100).max(1);
+        let mut seen = 0u64;
+        for (i, c) in counts.iter().enumerate() {
+            seen += c;
+            if seen >= target {
+                return Self::upper_bound(i);
+            }
+        }
+        Self::upper_bound(self.buckets.len() - 1)
+    }
 }
 
 /// Process-wide counters (P3-1). All updates are `Relaxed` atomics — no locks on the hot path.

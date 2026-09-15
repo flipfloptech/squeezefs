@@ -858,7 +858,15 @@ async fn a_token_is_recalled_before_the_conflicting_commit_lands() {
     assert_eq!(seen.ino, b.ino);
     plane.stop().await;
     host.shutdown();
+    // The holder's clean leave DISARMS the process-wide recall gate
+    // (review round 1, Issue 20 — the leave is `disarm_recall_gate`'s
+    // production caller): armed while the volume holds tokens, off after.
+    assert!(free_grace::recall_gate_armed());
     shutdown(&writer).await;
+    assert!(
+        !free_grace::recall_gate_armed(),
+        "the last holder's leave clears the gate"
+    );
 }
 
 /// **The first-touch grant ∥ pass race** (review round 1, Issue 2 — the

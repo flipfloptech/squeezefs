@@ -1461,6 +1461,7 @@ fn arb_manager_reply() -> impl Strategy<Value = ManagerReply> {
         (any::<u32>(), any::<u32>())
             .prop_map(|(appender_id, g)| ManagerReply::Holder { appender_id, g }),
         any::<u32>().prop_map(|g| ManagerReply::Unleased { g }),
+        "[ -~]{0,64}".prop_map(|reason| ManagerReply::Deferred { reason }),
     ]
 }
 

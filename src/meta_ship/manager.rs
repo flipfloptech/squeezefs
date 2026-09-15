@@ -71,6 +71,14 @@ pub const STATUS_REFUSED: u16 = 48;
 /// buggy/hostile-peer class; review round 1 Issue 2). The body is still
 /// a [`ManagerReplyFrame`] carrying [`ManagerReply::Refused`].
 pub const STATUS_REJECTED: u16 = 49;
+/// Frame status: the verb's answer is "not now" — the durable state is
+/// healthy, nothing was written, and the requester RETRIES (a grant of an
+/// unleased slot whose records ring 0's window still held after the
+/// bounded clearing cycles, `KvError::GrantDeferred`; review round 6,
+/// Issue 30 / round 7, Issue 32). Distinct from a witness refusal and a
+/// rejection so a peer retries without parsing a reason; the body is a
+/// [`ManagerReplyFrame`] carrying [`ManagerReply::Deferred`].
+pub const STATUS_DEFERRED: u16 = 50;
 
 /// The KD-MW-2 appender identity on the wire.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -291,6 +299,12 @@ pub enum ManagerReply {
     Refused {
         reason: String,
     },
+    /// Not now: the verb could not be served on this schedule (a grant
+    /// deferred behind ring 0's window), nothing was written, the volume
+    /// is healthy — retry. `reason` names the schedule.
+    Deferred {
+        reason: String,
+    },
 }
 
 /// One reply frame.
@@ -508,18 +522,26 @@ impl ManagerService {
                     .map(|already| ManagerReply::Released { already }),
                 ManagerCall::ResolveSlot { slot } => self.volume.manager_resolve_slot_wire(*slot),
             };
-        let (reply, refusal, rejected) = match served {
-            Ok(reply) => (reply, false, false),
-            Err(e) => {
-                let rejected = matches!(e, crate::meta_backend::kv::KvError::Rejected(_));
-                (
-                    ManagerReply::Refused {
-                        reason: e.to_string(),
-                    },
-                    true,
-                    rejected,
-                )
-            }
+        let (reply, status) = match served {
+            Ok(reply) => (reply, STATUS_OK),
+            Err(e @ crate::meta_backend::kv::KvError::Rejected(_)) => (
+                ManagerReply::Refused {
+                    reason: e.to_string(),
+                },
+                STATUS_REJECTED,
+            ),
+            Err(e @ crate::meta_backend::kv::KvError::GrantDeferred { .. }) => (
+                ManagerReply::Deferred {
+                    reason: e.to_string(),
+                },
+                STATUS_DEFERRED,
+            ),
+            Err(e) => (
+                ManagerReply::Refused {
+                    reason: e.to_string(),
+                },
+                STATUS_REFUSED,
+            ),
         };
         let execute_ns = t_execute.elapsed().as_nanos() as u64;
         let t_reply = Instant::now();
@@ -543,23 +565,16 @@ impl ManagerService {
             frame.call.name(),
             frame.request_id,
             (admit_ns + execute_ns + reply_ns) / 1000,
-            if rejected {
-                " — REJECTED"
-            } else if refusal {
-                " — REFUSED"
-            } else {
-                ""
+            match status {
+                STATUS_REJECTED => " — REJECTED",
+                STATUS_DEFERRED => " — DEFERRED",
+                STATUS_REFUSED => " — REFUSED",
+                _ => "",
             }
         );
         RpcResponse {
             id: req.id,
-            status: if rejected {
-                STATUS_REJECTED
-            } else if refusal {
-                STATUS_REFUSED
-            } else {
-                STATUS_OK
-            },
+            status,
             body,
         }
     }
@@ -700,7 +715,7 @@ impl ManagerClient {
         })?;
         let resp = self.rpc.call(VERB_MANAGER_CALL, body).await?;
         match resp.status {
-            STATUS_OK | STATUS_REFUSED | STATUS_REJECTED => {}
+            STATUS_OK | STATUS_REFUSED | STATUS_REJECTED | STATUS_DEFERRED => {}
             other => {
                 return Err(SqueezefsError::InvalidOperation(format!(
                     "manager refused the frame with status {other}: {}",
@@ -786,6 +801,8 @@ impl ManagerClient {
         {
             ManagerReply::SlotsGranted { slots, already } => Ok((slots, already)),
             ManagerReply::Refused { reason } => Err(SqueezefsError::InvalidOperation(reason)),
+            // The retry class, typed by its errno: nothing was written.
+            ManagerReply::Deferred { reason } => Err(SqueezefsError::refused(libc::EAGAIN, reason)),
             other => Err(SqueezefsError::InvalidOperation(format!(
                 "AcquireSlots answered {other:?}"
             ))),
@@ -793,7 +810,7 @@ impl ManagerClient {
     }
 
     /// `AcquireSlot` for `appender_id` — `Ok(reply)` is one of
-    /// `SlotsGranted` / `SlotRefused`.
+    /// `SlotsGranted` / `SlotRefused` / `Deferred` (the retry class).
     pub async fn acquire_slot(&mut self, appender_id: u32, slot: u16) -> Result<ManagerReply> {
         match self
             .call(ManagerCall::AcquireSlot { appender_id, slot })

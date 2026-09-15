@@ -376,6 +376,9 @@ enum ArbReply {
     Refused {
         reason: String,
     },
+    Deferred {
+        reason: String,
+    },
     SlotsGranted {
         slots: Vec<(u16, u32, ArbWords)>,
         already: bool,
@@ -435,6 +438,7 @@ impl From<ArbReply> for ManagerReply {
             ArbReply::Granted { runs } => ManagerReply::Granted { runs },
             ArbReply::Returned { cleared, already } => ManagerReply::Returned { cleared, already },
             ArbReply::Refused { reason } => ManagerReply::Refused { reason },
+            ArbReply::Deferred { reason } => ManagerReply::Deferred { reason },
         }
     }
 }

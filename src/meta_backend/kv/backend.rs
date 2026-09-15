@@ -4377,6 +4377,19 @@ impl KvMetaBackend {
         })
     }
 
+    /// The forest slot a slot-tree node's records name: the first key the
+    /// codec routes, in append order across its bsets — content keys and
+    /// interior separators alike are forest keys of the slot (`ino ‖ kind
+    /// ‖ rest`); the rightmost separator `KEY_SPACE_MAX` routes nowhere and
+    /// is skipped. `None` for a node with no routable record (an empty
+    /// root) — it names no slot.
+    fn node_records_slot(node: &super::node::LoadedNode) -> Option<super::record::ForestSlot> {
+        (0..node.bset_count()).find_map(|i| {
+            let view = node.bset(i).ok()?;
+            (0..view.len()).find_map(|j| super::record::forest_key_slot(view.record(j).key).ok())
+        })
+    }
+
     /// Whether `id` names an appender this manager knows: one of its own
     /// regions or a `Live` directory page (`OfferSlot`'s `to`).
     async fn appender_known(
@@ -4842,14 +4855,28 @@ impl KvMetaBackend {
                 .iter()
                 .fold(0u64, |n, s| n.saturating_add(s.len));
             let cfg = self.cache.config();
-            let bounds = ReleaseWordBounds {
-                seq_floor_recorded: lease.words.seq_floor,
-                seq_floor_max: release_seq_floor_bound(
+            // The derived bound presumes the appender's OWN checkpoint
+            // writes its page (`head_hint` ≥ its head, `seq_offset` in
+            // force) — PR 12's obligation (review round 6, Issue 31). Until
+            // it lands only the join and the manager's slot-only rewrites
+            // touch a wire appender's page: `head_hint` is the join-time
+            // `start` for ever and a legitimate release past two laps would
+            // be refused on it. A page no appender checkpoint ever wrote
+            // (`ckpt_seq == 0` — every checkpoint's page write stamps its
+            // seq, ≥ 1) bounds the floor by the sane cap alone.
+            let seq_floor_max = if page.ckpt_seq == 0 {
+                super::appender::SEQ_FRONTIER_SANE_MAX
+            } else {
+                release_seq_floor_bound(
                     page.seq_offset,
                     granted_floor_max,
                     page.head_hint,
                     ring_len,
-                ),
+                )
+            };
+            let bounds = ReleaseWordBounds {
+                seq_floor_recorded: lease.words.seq_floor,
+                seq_floor_max,
                 cursor_recorded: lease.words.cursor,
                 cursor_max: crate::meta_backend::GUEST_NS_BASE,
                 root_recorded: lease.words.root,
@@ -4872,19 +4899,36 @@ impl KvMetaBackend {
             if words.root != lease.words.root {
                 // The second witness: the address holds a node image whose
                 // incarnation stamp is the word's (a lessee's SMO wrote it
-                // and flushed before the release).
-                match super::node::read_node_header(&self.path, words.root.0).await {
-                    Ok(h) if h.node_seq == words.root.1 && h.tree_id == 0 => {}
-                    Ok(h) => {
+                // and flushed before the release) AND whose records name
+                // the released slot (review round 6, Issue 32 — a holder of
+                // A and B must not release A with B's root; every slot
+                // tree's header carries tree id 0 and a root's key bounds
+                // are the sentinels, so the slot is read off the node's
+                // records: one extent read, once per moved-root release).
+                // `durable_tail` 0: the node is another ring's, so no
+                // torn tail of it is a checkpoint violation here.
+                let node =
+                    match super::node::load_node(&self.path, &cfg.layout, words.root.0, 0).await {
+                        Ok(n) => n,
+                        Err(e) => {
+                            return Err(reject(format!(
+                                "root {:#x} holds no readable node: {e}",
+                                words.root.0
+                            )));
+                        }
+                    };
+                let h = node.header();
+                if h.node_seq != words.root.1 || h.tree_id != 0 {
+                    return Err(reject(format!(
+                        "root {:#x} holds a node stamped seq {} (tree id {}), not the word's \
+                         seq {}",
+                        words.root.0, h.node_seq, h.tree_id, words.root.1
+                    )));
+                }
+                if let Some(named) = Self::node_records_slot(&node) {
+                    if named != fslot {
                         return Err(reject(format!(
-                            "root {:#x} holds a node stamped seq {} (tree id {}), not the \
-                             word's seq {}",
-                            words.root.0, h.node_seq, h.tree_id, words.root.1
-                        )));
-                    }
-                    Err(e) => {
-                        return Err(reject(format!(
-                            "root {:#x} holds no readable node header: {e}",
+                            "root {:#x} holds slot {named}'s records, not slot {fslot}'s",
                             words.root.0
                         )));
                     }

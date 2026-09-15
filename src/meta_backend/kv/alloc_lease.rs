@@ -385,7 +385,10 @@ struct QueuedDelta {
 pub struct AllocHolding {
     pub vol_tag: u64,
     pub term: u64,
-    pub home_vol: u16,
+    /// The holder's home volume ordinal (the record's `home_vol`; the
+    /// shared-block index's home follows it — `shared_refs::index_home_
+    /// volume_for`).
+    home_vol: std::sync::atomic::AtomicU16,
     /// The HOME backend — the one whose ring the deltas journal into and
     /// whose device carries the pages; `write_data_alloc_pages` acts only
     /// on the backend this points at (review round 1, Issue 3).
@@ -435,6 +438,18 @@ impl AllocHolding {
     /// `true` ⇔ `be` is this holding's home backend.
     pub fn is_homed_on(&self, be: &KvMetaBackend) -> bool {
         std::ptr::eq(self.home.as_ptr(), be)
+    }
+
+    /// The holder's home volume ordinal.
+    pub fn home_vol(&self) -> u16 {
+        self.home_vol.load(Ordering::Acquire)
+    }
+
+    /// TEST seam (review round 4, Issue 34): a holder homed on another
+    /// volume — what PR 12's join ladder mints — so the index-home
+    /// resolver's re-point is distinguishable from PR 7's default.
+    pub fn test_set_home_vol(&self, home_vol: u16) {
+        self.home_vol.store(home_vol, Ordering::Release);
     }
 
     /// **Carve for `writer`** (the holder's `BlockGrant`): bits SET and
@@ -696,6 +711,79 @@ static COORDINATOR: once_cell::sync::Lazy<arc_swap::ArcSwapOption<std::sync::Wea
 /// arm); `None` withdraws it.
 pub fn install_coordinator_volume(vol0: Option<&Arc<KvMetaBackend>>) {
     COORDINATOR.store(vol0.map(|v| Arc::new(Arc::downgrade(v))));
+}
+
+/// A 1-bit-per-block set over one data volume (review round 4, Issue 31):
+/// the durable reference population the arm reads — the mount's scan
+/// handed over, or the arm's own — never a `BTreeSet`/`Vec` of it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BlockBits {
+    words: Vec<u64>,
+    blocks: u64,
+    population: u64,
+}
+
+impl BlockBits {
+    /// An empty set over `blocks` blocks.
+    pub fn new(blocks: u64) -> Self {
+        Self {
+            words: vec![0; blocks.div_ceil(64) as usize],
+            blocks,
+            population: 0,
+        }
+    }
+
+    /// Set `block` (out of range ignored — a reference to a block past the
+    /// derived capacity is the census's finding, never the seed's).
+    pub fn set(&mut self, block: u64) {
+        if block >= self.blocks {
+            return;
+        }
+        let w = &mut self.words[(block / 64) as usize];
+        let bit = 1u64 << (block % 64);
+        if *w & bit == 0 {
+            *w |= bit;
+            self.population += 1;
+        }
+    }
+
+    /// `true` ⇔ set.
+    pub fn is_set(&self, block: u64) -> bool {
+        block < self.blocks && self.words[(block / 64) as usize] & (1u64 << (block % 64)) != 0
+    }
+
+    /// Bits set.
+    pub fn population(&self) -> u64 {
+        self.population
+    }
+
+    /// `true` ⇔ nothing set.
+    pub fn is_empty(&self) -> bool {
+        self.population == 0
+    }
+}
+
+/// The mount's own by-block scan, handed to the arm per data volume
+/// (`recover_durable_block_refs` → [`note_mount_seed`]) so the arm reads
+/// the ledger ONCE per mount (Issue 31). Taken by the arm; a stale entry
+/// (a mount that never armed) is overwritten by the next mount's seed.
+static MOUNT_SEEDS: once_cell::sync::Lazy<
+    parking_lot::Mutex<std::collections::BTreeMap<u64, BlockBits>>,
+> = once_cell::sync::Lazy::new(|| parking_lot::Mutex::new(std::collections::BTreeMap::new()));
+
+/// The mount path's durable-refs seed for data volume `vol_tag`: the
+/// referenced block indices, folded into one bitset over `blocks`.
+pub fn note_mount_seed(vol_tag: u64, blocks: u64, refs: impl IntoIterator<Item = u64>) {
+    let mut bits = BlockBits::new(blocks);
+    for b in refs {
+        bits.set(b);
+    }
+    MOUNT_SEEDS.lock().insert(vol_tag, bits);
+}
+
+/// Take the mount's seed for `vol_tag` (the arm's one consumer).
+pub fn take_mount_seed(vol_tag: u64) -> Option<BlockBits> {
+    MOUNT_SEEDS.lock().remove(&vol_tag)
 }
 
 /// One metadata volume's heap geometry as the manager validates a wire
@@ -1283,7 +1371,7 @@ impl KvMetaBackend {
         let holding = Arc::new(AllocHolding {
             vol_tag,
             term,
-            home_vol: crate::park_gate::home_volume(),
+            home_vol: std::sync::atomic::AtomicU16::new(crate::park_gate::home_volume()),
             home: Arc::downgrade(self),
             bitmap,
             ledger: BlockGrantLedger::new(),
@@ -1633,6 +1721,9 @@ impl KvMetaBackend {
             if holding.queued_deltas() > 0 {
                 holding.kick_journaler();
             }
+            // The maintained population against the popcount, once per
+            // cycle (Issue 33) — the one place the scan runs.
+            holding.bitmap.population_drift_check();
             holding
                 .bitmap
                 .write_dirty_pages(self.device_path(), holding.page_base(), ckpt_seq)
@@ -2039,19 +2130,31 @@ pub async fn arm_symmetric_allocation(
         // on a forest — `block_ref_scan`'s law) is read here, O(refs) once
         // per data volume at the arm, and is also the loss check's second
         // witness below.
-        let mut durable: std::collections::BTreeSet<u64> = std::collections::BTreeSet::new();
-        for kv in &routed.volumes {
-            for r in kv.block_ref_scan(vol_tag).await.map_err(|e| {
-                crate::error::SqueezefsError::InvalidOperation(format!(
-                    "symmetric allocation arm: data volume '{}' ({vol_tag:#018x}): the durable \
-                     reference scan on {} failed: {e}",
-                    alloc.volume_id(),
-                    kv.device_path().display()
-                ))
-            })? {
-                durable.insert(r.block_idx);
+        // ONE pass, ONE bitset (review round 4, Issue 31): the mount's own
+        // scan (`recover_durable_block_refs` hands its per-volume index
+        // list here through `note_mount_seed`) is reused when present;
+        // otherwise the ledger is walked once, straight into the bit words
+        // — never a `BTreeSet`/`Vec` of the population (8 GiB at a full
+        // PiB); O(refs) time, 1 bit per block of RAM.
+        let durable = match take_mount_seed(vol_tag) {
+            Some(bits) => bits,
+            None => {
+                let mut bits = BlockBits::new(blocks);
+                for kv in &routed.volumes {
+                    for r in kv.block_ref_scan(vol_tag).await.map_err(|e| {
+                        crate::error::SqueezefsError::InvalidOperation(format!(
+                            "symmetric allocation arm: data volume '{}' ({vol_tag:#018x}): the \
+                             durable reference scan on {} failed: {e}",
+                            alloc.volume_id(),
+                            kv.device_path().display()
+                        ))
+                    })? {
+                        bits.set(r.block_idx);
+                    }
+                }
+                bits
             }
-        }
+        };
         if derived.highest == 0 && !durable.is_empty() {
             return Err(crate::error::SqueezefsError::InvalidOperation(format!(
                 "symmetric allocation arm: data volume '{}' ({vol_tag:#018x}): the allocator \
@@ -2060,15 +2163,10 @@ pub async fn arm_symmetric_allocation(
                  not run; refusing to seed the allocation bitmap from an empty truth (every live \
                  block would be re-granted)",
                 alloc.volume_id(),
-                durable.len()
+                durable.population()
             )));
         }
-        let seed: Vec<u64> = derived
-            .set_blocks()
-            .chain(durable.iter().copied())
-            .collect::<std::collections::BTreeSet<u64>>()
-            .into_iter()
-            .collect();
+        let seed = || (0..blocks).filter(|b| derived.is_set(*b) || durable.is_set(*b));
         let holding = acquire_and_hold(vol0, me, home_vol, vol_tag, blocks, &seed)
             .await
             .map_err(|e| {
@@ -2091,11 +2189,7 @@ pub async fn arm_symmetric_allocation(
                 after.population()
             )));
         }
-        let loss: Vec<u64> = derived
-            .set_blocks()
-            .chain(durable.iter().copied())
-            .filter(|b| !holding.bitmap.is_set(*b))
-            .collect();
+        let loss: Vec<u64> = seed().filter(|b| !holding.bitmap.is_set(*b)).collect();
         if !loss.is_empty() {
             let report = crate::data_alloc_bitmap::DriftReport {
                 loss: loss.clone(),
@@ -2124,7 +2218,7 @@ pub async fn arm_symmetric_allocation(
              bitmap",
             alloc.volume_id(),
             derived.population(),
-            durable.len()
+            durable.population()
         );
         log::info!(
             "symmetric allocation arm: data volume '{}' leased at term {} ({} block(s), pages \
@@ -2140,13 +2234,13 @@ pub async fn arm_symmetric_allocation(
 }
 
 /// One data volume's acquire-and-hold ladder on the in-process manager.
-async fn acquire_and_hold(
+async fn acquire_and_hold<I: Iterator<Item = u64>>(
     vol0: &Arc<KvMetaBackend>,
     me: AppenderIdentity,
     home_vol: u16,
     vol_tag: u64,
     blocks: u64,
-    derived_set: &[u64],
+    seed: &impl Fn() -> I,
 ) -> Result<Arc<AllocHolding>, KvError> {
     // Bounded: one same-node takeover + one deferred retry at most.
     for _attempt in 0..4 {
@@ -2169,14 +2263,14 @@ async fn acquire_and_hold(
                         vol_tag,
                         rec.blocks,
                         rec.term,
-                        derived_set,
+                        seed(),
                     )
                     .await;
                 }
                 return vol0.rehold_alloc_lease(vol_tag, &rec).await;
             }
             Ok(g) if g.term == 1 => {
-                return hold_seeded_and_publish(vol0, me, vol_tag, blocks, 1, derived_set).await;
+                return hold_seeded_and_publish(vol0, me, vol_tag, blocks, 1, seed()).await;
             }
             Ok(g) => {
                 // A successor: copy the RECOVERED predecessor pages.
@@ -2271,10 +2365,10 @@ async fn hold_seeded_and_publish(
     vol_tag: u64,
     blocks: u64,
     term: u64,
-    derived_set: &[u64],
+    seed: impl IntoIterator<Item = u64>,
 ) -> Result<Arc<AllocHolding>, KvError> {
     let holding = vol0
-        .hold_alloc_lease_seeded(vol_tag, blocks, term, derived_set.iter().copied())
+        .hold_alloc_lease_seeded(vol_tag, blocks, term, seed)
         .await?;
     publish_holding(vol0, me, vol_tag, term, &holding).await?;
     Ok(holding)

@@ -104,7 +104,7 @@ pub const fn index_home_volume() -> usize {
 /// join ladder's; until then a non-holder reaches the default home.
 pub fn index_home_volume_for(vol_tag: u64) -> usize {
     crate::meta_backend::kv::alloc_lease::holding(vol_tag)
-        .map(|h| usize::from(h.home_vol))
+        .map(|h| usize::from(h.home_vol()))
         .unwrap_or_else(index_home_volume)
 }
 

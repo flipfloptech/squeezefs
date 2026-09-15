@@ -4552,6 +4552,14 @@ impl BackendRouter {
         }
         for (alloc, indices) in per_volume {
             alloc.seed_from_durable_refs(&indices).await;
+            // Symmetric PR 8 (review round 4, Issue 31): the SAME scan is
+            // the allocation arm's durable witness — handed over as one
+            // bitset so the arm never walks the ledger a second time.
+            crate::meta_backend::kv::alloc_lease::note_mount_seed(
+                crate::meta_backend::kv::block_refs::volume_tag(alloc.volume_id()),
+                alloc.capacity_bytes() / alloc.chunk_size().max(1),
+                indices.iter().copied(),
+            );
         }
         // DLM S9 blocker #3: the derived cursor is now seeded, so the lane
         // floors can be raised past every index a predecessor of this lane

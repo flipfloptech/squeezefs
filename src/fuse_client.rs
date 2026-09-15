@@ -13949,7 +13949,7 @@ impl SqueezefsFilesystem {
                                     serde_json::json!({
                                         "vol_tag": format!("{:#018x}", h.vol_tag),
                                         "term": h.term,
-                                        "home_vol": h.home_vol,
+                                        "home_vol": h.home_vol(),
                                     })
                                 })
                                 .collect(),

@@ -393,6 +393,8 @@ pub struct DataAllocBitmap {
     pages: u64,
     page_states: Box<[PageState]>,
     dirty: Box<[AtomicU64]>,
+    /// The maintained SET population (Issue 33).
+    population: AtomicU64,
     set_bits: AtomicU64,
     clear_bits: AtomicU64,
 }
@@ -430,6 +432,7 @@ impl DataAllocBitmap {
             dirty,
             set_bits: AtomicU64::new(0),
             clear_bits: AtomicU64::new(0),
+            population: AtomicU64::new(0),
         }
     }
 
@@ -480,6 +483,7 @@ impl DataAllocBitmap {
                 let off = (block - first) as usize;
                 if bits[off / 8] & (1 << (off % 8)) != 0 {
                     me.words[(block / 64) as usize].fetch_or(1 << (block % 64), Ordering::Relaxed);
+                    me.population.fetch_add(1, Ordering::Relaxed);
                 }
             }
             me.page_states[page as usize]
@@ -535,6 +539,7 @@ impl DataAllocBitmap {
         let newly = prev & (1 << (block % 64)) == 0;
         if newly {
             self.set_bits.fetch_add(1, Ordering::Relaxed);
+            self.population.fetch_add(1, Ordering::Relaxed);
             self.mark_dirty(block);
         }
         newly
@@ -550,6 +555,7 @@ impl DataAllocBitmap {
         let was = prev & (1 << (block % 64)) != 0;
         if was {
             self.clear_bits.fetch_add(1, Ordering::Relaxed);
+            self.population.fetch_sub(1, Ordering::Relaxed);
             self.mark_dirty(block);
         }
         was
@@ -569,12 +575,47 @@ impl DataAllocBitmap {
         (start..end).filter(|b| self.clear(*b)).count() as u64
     }
 
-    /// Bits set (allocated + granted).
+    /// Bits set (allocated + granted) — the MAINTAINED counter, O(1)
+    /// (review round 4, Issue 33: the popcount sat on the allocation
+    /// funnel through the grace valve's supply term — a 32 MiB scan per
+    /// allocation at 1 PiB). Moved at every `set` / `clear` (the runs and
+    /// the replay go through them), seeded by the region loader, checked
+    /// against [`Self::population_scan`] at every checkpoint page write.
     pub fn population(&self) -> u64 {
+        self.population.load(Ordering::Acquire)
+    }
+
+    /// The popcount over every word — O(blocks / 64), the drift check's
+    /// second witness (never on the funnel; `population_scans` counts
+    /// every call so a pin can assert the funnel performs none).
+    pub fn population_scan(&self) -> u64 {
+        POPULATION_SCANS.fetch_add(1, Ordering::Relaxed);
         self.words
             .iter()
             .map(|w| u64::from(w.load(Ordering::Relaxed).count_ones()))
             .sum()
+    }
+
+    /// The checkpoint's drift check: the maintained counter against the
+    /// popcount. A disagreement is a runtime invariant violation
+    /// (`invariant_tripwires` — a mutation path that bypassed `set` /
+    /// `clear`); the counter is RE-SYNCED to the scan so the supply term
+    /// never drifts for the volume's life. Returns `(counter, scanned)`.
+    pub fn population_drift_check(&self) -> (u64, u64) {
+        let counted = self.population();
+        let scanned = self.population_scan();
+        if counted != scanned {
+            crate::note_invariant_tripwire(
+                "data_alloc_population_drift",
+                &format!(
+                    "data allocation bitmap of volume {:#018x}: maintained population {counted} \
+                     != popcount {scanned} — re-synced",
+                    self.vol_tag
+                ),
+            );
+            self.population.store(scanned, Ordering::Release);
+        }
+        (counted, scanned)
     }
 
     /// Cumulative bits set / cleared since construction (the
@@ -924,6 +965,15 @@ pub fn test_clear_replayed_deltas() {
 // ---------------------------------------------------------------------------
 // The process gauges (the Allocation-lease family, §11)
 // ---------------------------------------------------------------------------
+
+/// Full-bitmap popcounts performed (`population_scan`) — the pin's
+/// witness that the allocation funnel performs none (Issue 33).
+pub static POPULATION_SCANS: AtomicU64 = AtomicU64::new(0);
+
+/// See [`POPULATION_SCANS`].
+pub fn population_scans() -> u64 {
+    POPULATION_SCANS.load(Ordering::Relaxed)
+}
 
 /// `data_alloc_bitmap_drift` — loss-direction findings (must-stay-0).
 pub static DATA_ALLOC_BITMAP_DRIFT: AtomicU64 = AtomicU64::new(0);

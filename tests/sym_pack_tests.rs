@@ -14,8 +14,8 @@
 mod common;
 
 use common::sym::{
-    data_file, format_flat_member, format_stamped_member, ino_in_slot, mount_data, open_under,
-    shutdown, slot_of_global, Knobs, SEAM,
+    data_file, format_flat_member, format_stamped_member, format_stamped_set, ino_in_slot,
+    mount_data, open_under, shutdown, slot_of_global, Knobs, SEAM,
 };
 use squeezefs::fuse_client::METRICS;
 use squeezefs::meta_backend::kv::block_refs::{volume_tag, BlockRef, BlockRefOp};
@@ -249,7 +249,11 @@ async fn an_armed_set_packs_per_slot_and_an_unarmed_mount_keeps_pk2s_one_scope()
         };
         let sa = rig.router.pack_scope_of(a);
         let sb = rig.router.pack_scope_of(b);
-        assert_eq!(sa, slot_of_global(&rig.routed, a));
+        assert_eq!(
+            sa,
+            squeezefs::routing::pack_scope_key(0, slot_of_global(&rig.routed, a)),
+            "the scope is (meta volume, forest slot)"
+        );
         assert_ne!(sa, sb, "two slots, two scopes");
         assert_eq!(rig.router.pack_scope_of(a2), sa);
         let slot = squeezefs::routing::pack_slot_len(16 * 1024);
@@ -334,6 +338,46 @@ async fn an_armed_set_packs_per_slot_and_an_unarmed_mount_keeps_pk2s_one_scope()
         );
         rig.shutdown().await;
     }
+}
+
+/// The NATIVE forest slot is `0` on EVERY meta volume (a converted set's
+/// pre-arm inos sit there on each), so a scope of the slot alone would
+/// pool two volumes' natives into one pack block whose references live in
+/// two slot trees — law 1 broken. The scope carries the meta volume: two
+/// native inos of two volumes take two scopes, two native inos of one
+/// volume one (review round 1, Issue 7).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn two_meta_volumes_native_inos_never_share_a_pack_scope() {
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    let uris = format_stamped_set(dir.path(), &["meta0", "meta1"]).await;
+    let data = data_file();
+    let rig = mount_data(&uris, data.path(), &Knobs::armed()).await;
+    assert_eq!(rig.routed.volumes.len(), 2);
+    // A raw local ino (no guest bits) IS a volume's native-slot ino.
+    let n0 = rig.routed.make_global_ino(9, 0);
+    let n0b = rig.routed.make_global_ino(10, 0);
+    let n1 = rig.routed.make_global_ino(9, 1);
+    assert_eq!(rig.routed.route_ino(n0).0, 0);
+    assert_eq!(rig.routed.route_ino(n1).0, 1);
+    assert_eq!(slot_of_global(&rig.routed, n0), NATIVE_FOREST_SLOT);
+    assert_eq!(slot_of_global(&rig.routed, n1), NATIVE_FOREST_SLOT);
+    let (s0, s0b, s1) = (
+        rig.router.pack_scope_of(n0),
+        rig.router.pack_scope_of(n0b),
+        rig.router.pack_scope_of(n1),
+    );
+    assert_eq!(s0, s0b, "one volume's natives: one scope");
+    assert_ne!(s0, s1, "two volumes' natives: two scopes");
+    assert_eq!(
+        s0,
+        squeezefs::routing::pack_scope_key(0, NATIVE_FOREST_SLOT)
+    );
+    assert_eq!(
+        s1,
+        squeezefs::routing::pack_scope_key(1, NATIVE_FOREST_SLOT)
+    );
+    rig.shutdown().await;
 }
 
 /// **The design's pin** (`a_pack_block_whose_slot_is_handed_over_keeps_its_

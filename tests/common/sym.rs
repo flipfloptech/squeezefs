@@ -2,6 +2,12 @@
 //! nodes, a 1 MiB fixed ring, one stamped member, the plane armed through
 //! the registered knob and the non-PR lab opt-in). Every knob is
 //! process-global — a suite serializes its tests on [`SEAM`].
+//!
+//! `allow(dead_code)` is the SHARED-FIXTURE exception to the repo's
+//! dead-code law (the only one under `tests/`): every consumer binary
+//! compiles this module whole and uses a subset, so the lint fires per
+//! binary on items another binary needs. Nothing here is unused by the
+//! set of its consumers; a fixture no suite calls is deleted, not kept.
 
 #![allow(dead_code)]
 
@@ -41,6 +47,24 @@ pub async fn format_stamped_member(dir: &std::path::Path, name: &str) -> String 
     std::env::remove_var("SQUEEZEFS_TEST_STAMP_SYMMETRIC");
     r.expect("format stamped member");
     p.display().to_string()
+}
+
+/// A SET of `names.len()` members formatted under the bit-17 seam (one
+/// plan, one stamp per member — the routed open needs the members to
+/// agree on the slot map).
+pub async fn format_stamped_set(dir: &std::path::Path, names: &[&str]) -> Vec<String> {
+    let plan = plan_meta_slot_set(names.len()).expect("derived plan");
+    let mut uris = Vec::with_capacity(names.len());
+    std::env::set_var("SQUEEZEFS_TEST_STAMP_SYMMETRIC", "1");
+    for (i, name) in names.iter().enumerate() {
+        let p = dir.join(name);
+        std::fs::File::create(&p).unwrap().set_len(VOL_LEN).unwrap();
+        let r = format_v3_stamped(&p, VOL_LEN, &set_opts(), plan.stamps[i].clone()).await;
+        r.expect("format stamped set member");
+        uris.push(p.display().to_string());
+    }
+    std::env::remove_var("SQUEEZEFS_TEST_STAMP_SYMMETRIC");
+    uris
 }
 
 /// One member formatted FLAT (the seam cleared).
@@ -239,6 +263,26 @@ impl DataRig {
             .ino
     }
 
+    /// A file created under `parent` (the parent-slot affinity puts a
+    /// fresh directory's children in ITS slot).
+    pub async fn mk_file_in(&self, parent: u64, name: &str) -> u64 {
+        use squeezefs::meta_backend::Metadata;
+        self.routed
+            .create(parent, name, libc::S_IFREG | 0o644, 1000, 1000)
+            .await
+            .expect("create")
+            .ino
+    }
+
+    pub async fn mk_dir(&self, name: &str) -> u64 {
+        use squeezefs::meta_backend::Metadata;
+        self.routed
+            .create(1, name, libc::S_IFDIR | 0o755, 1000, 1000)
+            .await
+            .expect("mkdir")
+            .ino
+    }
+
     /// A file whose forest slot differs from `not`'s (the rotor spreads
     /// children of `/` over 64 slots; two creates land apart, but the
     /// contract states it rather than presumes it).
@@ -306,6 +350,216 @@ impl DataRig {
     }
 
     pub async fn shutdown(self) {
+        shutdown(&self.routed).await;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The FUSE-layer rig: the routed set behind an in-process
+// `SqueezefsFilesystem` (the `pack_tenant_ops_tests` fixture's shape) —
+// real staged writes with rider extents, the clone through
+// `copy_file_range`, SETATTR(size) truncates.
+// ---------------------------------------------------------------------------
+
+use fuse3::raw::{Filesystem, Request};
+use squeezefs::fuse_client::SqueezefsFilesystem;
+use std::ffi::OsStr;
+
+pub struct FuseRig {
+    pub fs: Arc<SqueezefsFilesystem>,
+    pub routed: Arc<RoutedMetaBackend>,
+    pub alloc: Arc<BlockAllocator>,
+    _staging: TempDir,
+}
+
+pub fn req() -> Request {
+    Request {
+        unique: 1,
+        uid: 1000,
+        gid: 1000,
+        pid: 4321,
+        ..Default::default()
+    }
+}
+
+/// Deterministic bytes (the packing rows' pattern).
+pub fn pattern(idx: usize, len: usize) -> Vec<u8> {
+    (0..len)
+        .map(|i| {
+            (idx.wrapping_mul(131)
+                .wrapping_add(i.wrapping_mul(7))
+                .wrapping_add(i >> 8)
+                % 251) as u8
+        })
+        .collect()
+}
+
+/// Mount the set behind the FUSE layer with a staging ring of `ring`
+/// bytes (a small ring makes the staged-clone spill reachable).
+pub async fn mount_fuse(
+    uris: &[String],
+    data: &std::path::Path,
+    knobs: &Knobs,
+    ring: &str,
+) -> FuseRig {
+    let routed = open_under(uris, knobs).await;
+    let dlm = DlmClient::new().unwrap();
+    let nvme = Arc::new(NvmeBlockDev::new(data.to_str().unwrap()));
+    let alloc = Arc::new(BlockAllocator::new(DATA_VOL).await.unwrap());
+    alloc.set_capacity_bytes(DATA_LEN);
+    let staging = tempdir().unwrap();
+    let cache = TieredCache::new(
+        vec![staging.path().to_path_buf()],
+        Some("64MB"),
+        Some("64MB"),
+        Some("16MB"),
+        Some(ring),
+        alloc.clone(),
+        nvme.clone(),
+        None,
+    )
+    .await
+    .unwrap();
+    let router = DataRouter::new(dlm.clone(), cache, alloc.clone(), nvme);
+    let mut fs = SqueezefsFilesystem::new(router, dlm, 1000, 1000);
+    fs.router.set_meta_backend(routed.clone());
+    fs.meta_backend = Some(routed.clone());
+    fs.router.arm_shared_refs().await.expect("arm shared refs");
+    FuseRig {
+        fs: Arc::new(fs),
+        routed,
+        alloc,
+        _staging: staging,
+    }
+}
+
+impl FuseRig {
+    pub fn vol(&self) -> &Arc<squeezefs::meta_backend::kv::backend::KvMetaBackend> {
+        &self.routed.volumes[0]
+    }
+
+    pub fn tag(&self) -> u64 {
+        squeezefs::meta_backend::kv::block_refs::volume_tag(DATA_VOL)
+    }
+
+    pub fn token(&self, ino: u64) -> u64 {
+        self.fs.router.dlm.get_fencing_token_ino(ino)
+    }
+
+    pub async fn create(&self, name: &str) -> u64 {
+        self.fs
+            .create(req(), 1, OsStr::new(name), libc::S_IFREG | 0o644, 0)
+            .await
+            .unwrap()
+            .attr
+            .ino
+    }
+
+    pub async fn write_at(&self, ino: u64, off: u64, data: &[u8]) {
+        let written = self
+            .fs
+            .write(
+                req(),
+                ino,
+                0,
+                off,
+                bytes::Bytes::copy_from_slice(data),
+                0,
+                0,
+            )
+            .await
+            .unwrap_or_else(|e| panic!("write ino {ino} off {off} failed: {e:?}"))
+            .written;
+        assert_eq!(written as usize, data.len(), "short write at {off}");
+    }
+
+    pub async fn read(&self, ino: u64, len: usize) -> Vec<u8> {
+        self.fs
+            .read(req(), ino, 0, 0, len as u32, 0)
+            .await
+            .unwrap_or_else(|e| panic!("read ino {ino} failed: {e:?}"))
+            .data
+            .to_vec()
+    }
+
+    /// A ring-RESIDENT staged file: the base image plus a 2 KiB rider at
+    /// `rider_off` (the W2 record pins the entry in the ring — the
+    /// promotion skips it, so the ring stays full of it).
+    pub async fn resident_staged(&self, name: &str, len: usize, tag: usize) -> (u64, String) {
+        let ino = self.create(name).await;
+        self.write_at(ino, 0, &pattern(tag, len)).await;
+        self.write_at(ino, 64 * 1024, &pattern(tag + 7, 2048)).await;
+        let m = self.fs.router.metadata_cache.get(&ino).expect("RAM layout");
+        assert_eq!(m.file_type, "staged", "fixture premise: staged layout");
+        let fid = m.file_id.as_deref().expect("file_id").to_string();
+        assert!(
+            self.fs.router.cache.nvme.read_staged(&fid).is_some(),
+            "fixture premise: ring-resident"
+        );
+        (ino, fid)
+    }
+
+    /// Fill the ring with `files` rider-pinned staged files of `len` bytes
+    /// (no residency premise — a filler past the cap spills through the
+    /// write path's own escalation; what matters is that the ring is FULL
+    /// of live custody when the next stage arrives).
+    pub async fn fill_ring(&self, files: usize, len: usize, tag: usize) {
+        for i in 0..files {
+            let ino = self.create(&format!("filler_{tag}_{i}")).await;
+            self.write_at(ino, 0, &pattern(tag + i, len)).await;
+            self.write_at(ino, 4096, &pattern(tag ^ 0x0F, 2048)).await;
+        }
+    }
+
+    /// The composed image `resident_staged` wrote.
+    pub fn composed(tag: usize, len: usize) -> Vec<u8> {
+        let mut want = pattern(tag, len);
+        let rider = pattern(tag + 7, 2048);
+        want[64 * 1024..64 * 1024 + rider.len()].copy_from_slice(&rider);
+        want
+    }
+
+    /// Whole-file `copy_file_range` into an EMPTY destination — the clone
+    /// fast path (`DataRouter::clone_file`).
+    pub async fn clone_whole(
+        &self,
+        src: u64,
+        dst: u64,
+        len: usize,
+    ) -> squeezefs::error::Result<()> {
+        let copied = self
+            .fs
+            .copy_file_range(req(), src, 0, 0, dst, 0, 0, len as u64, 0)
+            .await
+            .map_err(|e| squeezefs::error::SqueezefsError::InvalidOperation(format!("{e:?}")))?
+            .copied;
+        assert_eq!(copied as usize, len, "the whole file cloned");
+        Ok(())
+    }
+
+    pub async fn mapping0(&self, ino: u64) -> Option<String> {
+        self.fs
+            .router
+            .fetch_metadata(&squeezefs::keys::inode_path(ino))
+            .await
+            .unwrap_or_else(|e| panic!("layout of ino {ino}: {e:?}"))
+            .block_map
+            .as_ref()
+            .and_then(|bm| bm.get(&0).cloned())
+    }
+
+    pub async fn drift(&self) -> Vec<(String, u64, u32, u32)> {
+        self.fs
+            .router
+            .backend_router
+            .verify_durable_block_refs(&self.routed)
+            .await
+            .expect("C8 oracle")
+    }
+
+    pub async fn shutdown(self) {
+        self.fs.router.seal_open_packs().await;
+        self.fs.router.backend_router.reclaim_drain().await;
         shutdown(&self.routed).await;
     }
 }

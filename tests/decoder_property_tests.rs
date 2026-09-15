@@ -1419,13 +1419,16 @@ fn arb_manager_call() -> impl Strategy<Value = ManagerCall> {
                 block_idx,
                 refs,
             }),
-        (any::<u64>(), any::<u64>(), prop::option::of(any::<u64>())).prop_map(
-            |(vol_tag, block_idx, owner_ino)| ManagerCall::ReleaseShared {
+        (
+            any::<u64>(),
+            any::<u64>(),
+            prop::option::of((any::<u64>(), any::<u32>())),
+        )
+            .prop_map(|(vol_tag, block_idx, owner)| ManagerCall::ReleaseShared {
                 vol_tag,
                 block_idx,
-                owner_ino,
-            }
-        ),
+                owner,
+            }),
     ]
 }
 

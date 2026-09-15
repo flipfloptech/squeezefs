@@ -609,6 +609,37 @@ async fn the_w1_predicate_confirms_sole_ownership_in_the_inos_slot_tree_on_an_ar
             "two durable references: the patch is refused whatever RAM reads"
         );
         assert_eq!(BLOCK_REF_PROBES.load(Ordering::Relaxed), probes + 1);
+        // **The SHARED-flag clause** (review round 1, Issue 1): a SOLE
+        // reference that carries the durable SHARED bit — marked at the
+        // BACKEND so the RAM mark this mount's W1 predicate reads stays
+        // ABSENT, the shape a mark that landed elsewhere leaves — refuses
+        // the patch: the durable flag is the authority, the RAM mark an
+        // accelerator.
+        let g = rig.mk_file("g").await;
+        let g_off = rig.publish_block(g, 0).await;
+        let (_v, g_local) = rig.routed.route_ino(g);
+        let g_ref = BlockRef {
+            vol_tag: rig.tag(),
+            block_idx: g_off / rig.alloc.chunk_size(),
+            owner_ino: g_local,
+            block_index: 0,
+        };
+        assert!(rig.router.sole_owner_durably(g, &rig.alloc, g_off).await);
+        assert_eq!(
+            rig.vol().mark_block_ref_shared(&g_ref).await.unwrap(),
+            MarkOutcome::Marked
+        );
+        assert!(!rig.alloc.is_shared(g_off), "premise: no RAM mark");
+        assert_eq!(rig.alloc.refcount(g_off), Some(1), "premise: RAM count 1");
+        assert!(
+            rig.alloc.begin_patch_sole_owner(g_off),
+            "premise: the RAM predicate alone would patch"
+        );
+        rig.alloc.publish_block(g_off);
+        assert!(
+            !rig.router.sole_owner_durably(g, &rig.alloc, g_off).await,
+            "one reference under a durable SHARED bit is not sole ownership"
+        );
         rig.shutdown().await;
     }
     {
@@ -624,6 +655,437 @@ async fn the_w1_predicate_confirms_sole_ownership_in_the_inos_slot_tree_on_an_ar
         );
         rig.shutdown().await;
     }
+}
+
+/// **The staged-source clone under a FULL staging ring** (review round
+/// 1, Issue 2 — the shipped FIND-RW5-A arm on an armed set): the clone's
+/// refused destination stage escalates to a durable spill — a FRESH
+/// block the SOURCE never referenced — so there is nothing to share and
+/// the protocol must not run over it (a `MarkShared` on it answered `Gone`
+/// and aborted every such clone `ENOENT`, then double-released the landed
+/// site). The clone succeeds, reads back exact, the spilled block carries
+/// ONE reference (the dest's, unshared), no mark, no index, C8 and C16
+/// clean, and every gauge of the protocol is untouched.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_staged_source_clone_under_a_full_ring_spills_and_succeeds_on_an_armed_set() {
+    use common::sym::{mount_fuse, FuseRig};
+    use squeezefs::fuse_client::METRICS;
+    let dir = tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    let uris = vec![format_stamped_member(dir.path(), "meta0").await];
+    let data = data_file();
+    // A 4 MiB ring: one 700 KiB resident source + fillers fill it.
+    let rig = mount_fuse(&uris, data.path(), &Knobs::armed(), "4MB").await;
+    let img_len = 700 * 1024;
+    let (src, src_fid) = rig.resident_staged("spill_src", img_len, 3).await;
+    rig.fill_ring(6, img_len, 50).await;
+    assert!(
+        rig.fs.router.cache.nvme.read_staged(&src_fid).is_some(),
+        "premise: the rider keeps the source ring-resident under the fill"
+    );
+    let dst = rig.create("spill_dst").await;
+    let spills = METRICS.staged_spill_escalations.load(Ordering::Relaxed);
+    let marks = MARK_SHARED_CALLS.load(Ordering::Relaxed);
+    let shares = SHARE_BLOCK_CALLS.load(Ordering::Relaxed);
+    rig.clone_whole(src, dst, img_len)
+        .await
+        .expect("a staged clone never surfaces StorageFull, armed or not");
+    assert_eq!(
+        METRICS.staged_spill_escalations.load(Ordering::Relaxed),
+        spills + 1,
+        "premise: the clone took the durable-spill escalation"
+    );
+    assert_eq!(rig.read(dst, img_len).await, FuseRig::composed(3, img_len));
+    let mapping = rig.mapping0(dst).await.expect("the spill landed a mapping");
+    let (_be, offset) = rig
+        .fs
+        .router
+        .backend_router
+        .split_block_key(squeezefs::routing::clean_block_key_ref(&mapping))
+        .expect("the spilled block's offset");
+    let alloc = &rig.alloc;
+    let block_idx = offset / alloc.chunk_size();
+    assert_eq!(
+        rig.vol()
+            .block_ref_count(rig.tag(), block_idx)
+            .await
+            .unwrap(),
+        1,
+        "one durable reference: the dest's (the open pack's own pin is RAM-only)"
+    );
+    assert!(
+        !alloc.is_shared(offset),
+        "a fresh copy is nobody's shared block"
+    );
+    let (_v, dst_local) = rig.routed.route_ino(dst);
+    assert_eq!(
+        rig.vol()
+            .block_ref_flags(&BlockRef {
+                vol_tag: rig.tag(),
+                block_idx,
+                owner_ino: dst_local,
+                block_index: 0,
+            })
+            .await
+            .unwrap(),
+        Some(false),
+        "the dest's reference stands, unshared"
+    );
+    assert_eq!(MARK_SHARED_CALLS.load(Ordering::Relaxed), marks, "no mark");
+    assert_eq!(
+        SHARE_BLOCK_CALLS.load(Ordering::Relaxed),
+        shares,
+        "no index"
+    );
+    assert!(rig.drift().await.is_empty(), "C8 clean");
+    assert!(
+        shared_refs::shared_index_drift(&rig.routed, rig.tag())
+            .await
+            .unwrap()
+            .is_empty(),
+        "C16 clean"
+    );
+    rig.shutdown().await;
+}
+
+/// **A same-slot clone of an UNSHARED block is the shipped clone** (review
+/// round 1, Issue 5): both references live in ONE slot tree, so the
+/// population is exact there and the index has nothing to say — no mark,
+/// no index entry, no SHARED bit, and the W1 predicate keeps its RAM
+/// count law (2 → refuse; after the clone's release, 1 → patch again). A
+/// same-slot clone of a SHARED source (a clone of a cross-slot clone) is
+/// the other case: the block's population is already cross-slot, so the
+/// protocol runs and the new reference inherits the bit and its entry.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_same_slot_clone_of_an_unshared_block_runs_no_protocol_and_a_shared_source_does() {
+    let dir = tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    let uris = vec![format_stamped_member(dir.path(), "meta0").await];
+    let data = data_file();
+    // The static 1 MiB affinity ceiling (PR 4's fixture): a fresh
+    // directory's children bind to its slot.
+    let rig = mount(&uris, data.path(), &Knobs::armed().affinity_mb("1")).await;
+    let d = rig.mk_dir("d").await;
+    let a = rig.mk_file_in(d, "a").await;
+    let b = rig.mk_file_in(d, "b").await;
+    assert_eq!(
+        slot_of_global(&rig.routed, a),
+        slot_of_global(&rig.routed, b),
+        "premise: a fresh directory's children share its slot"
+    );
+    let offset = rig.publish_block(a, 0).await;
+    let marks = MARK_SHARED_CALLS.load(Ordering::Relaxed);
+    let shares = SHARE_BLOCK_CALLS.load(Ordering::Relaxed);
+    rig.clone(a, b).await.expect("same-slot clone");
+    assert_eq!(MARK_SHARED_CALLS.load(Ordering::Relaxed), marks, "no mark");
+    assert_eq!(
+        SHARE_BLOCK_CALLS.load(Ordering::Relaxed),
+        shares,
+        "no index"
+    );
+    assert_eq!(flag(&rig, a, offset, 0).await, Some(false));
+    assert_eq!(flag(&rig, b, offset, 0).await, Some(false));
+    assert!(index_owners(&rig, offset).await.is_empty());
+    assert!(!rig.alloc.is_shared(offset));
+    assert_eq!(rig.alloc.refcount(offset), Some(2));
+    assert_eq!(
+        probe(&rig, offset, Some(slot_of_global(&rig.routed, a))).await,
+        2
+    );
+    // The W1 law on the same-slot pair: two references refuse; the
+    // clone's truncate-to-zero releases its reference (the layout tx) and
+    // frees its RAM pin — the durable count reads 1 and W1 is back.
+    assert!(!rig.router.sole_owner_durably(a, &rig.alloc, offset).await);
+    rig.router
+        .truncate_layout(b, 0, rig.token(b))
+        .await
+        .expect("truncate the clone to zero");
+    assert_eq!(rig.alloc.refcount(offset), Some(1));
+    assert!(
+        rig.router.sole_owner_durably(a, &rig.alloc, offset).await,
+        "the surviving same-slot owner regains W1 — nothing was ever marked"
+    );
+    assert!(rig.drift().await.is_empty());
+    // A cross-slot clone marks a; a further SAME-slot clone of a (a → c,
+    // c beside a) inherits the sharing: the block's population is already
+    // cross-slot, so c is marked, indexed and flagged.
+    let far = rig
+        .mk_file_apart("far", slot_of_global(&rig.routed, a))
+        .await;
+    rig.clone(a, far).await.expect("cross-slot clone");
+    assert_eq!(flag(&rig, a, offset, 0).await, Some(true));
+    let c = rig.mk_file_in(d, "c").await;
+    assert_eq!(
+        slot_of_global(&rig.routed, c),
+        slot_of_global(&rig.routed, a)
+    );
+    let shares = SHARE_BLOCK_CALLS.load(Ordering::Relaxed);
+    rig.clone(a, c)
+        .await
+        .expect("same-slot clone of a shared source");
+    assert!(
+        SHARE_BLOCK_CALLS.load(Ordering::Relaxed) > shares,
+        "indexed"
+    );
+    assert_eq!(flag(&rig, c, offset, 0).await, Some(true));
+    assert_eq!(index_owners(&rig, offset).await, {
+        let mut v = vec![a, far, c];
+        v.sort_unstable();
+        v
+    });
+    assert!(rig.drift().await.is_empty());
+    assert!(c16(&rig).await.is_empty());
+    rig.shutdown().await;
+}
+
+/// Drain ring 0's USER admission budget into `held` (every byte a user
+/// commit or an index entry would need is taken), returning the holds.
+fn hold_user_budget(
+    vol: &squeezefs::meta_backend::kv::backend::KvMetaBackend,
+) -> Vec<squeezefs::meta_backend::kv::journal_core::Admission> {
+    use squeezefs::meta_backend::kv::journal_core::AdmissionClass;
+    let ring = vol.journal_ring();
+    let mut held = Vec::new();
+    for chunk in [256 * 1024u64, 16 * 1024, 1024, 64] {
+        while let Some(a) = ring.try_admit(chunk, AdmissionClass::User) {
+            held.push(a);
+        }
+    }
+    held
+}
+
+/// **A full ring 0 PARKS the index writers, never fails them** (review
+/// round 1, Issue 3): `ShareBlock` on the USER clone path and
+/// `ReleaseShared` on the FREE path admit their control entry PARKING,
+/// before the verb mutex (PR 4's door law) — under a ring whose user
+/// budget is entirely held, a clone waits for the budget and completes,
+/// and a shared block's release waits and lands (the reference released,
+/// the closure held), where a `Try` admission failed the clone and leaked
+/// the reference.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_full_ring_0_parks_the_index_writers_and_never_fails_or_leaks() {
+    let dir = tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    let uris = vec![format_stamped_member(dir.path(), "meta0").await];
+    let data = data_file();
+    let rig = mount(&uris, data.path(), &Knobs::armed()).await;
+    let src = rig.mk_file("src").await;
+    let dst = rig
+        .mk_file_apart("dst", slot_of_global(&rig.routed, src))
+        .await;
+    let offset = rig.publish_block(src, 0).await;
+    let stalls = rig.vol().journal_full_stalls();
+    // The clone under a held-full ring: its `ShareBlock` (and its layout
+    // commit) park; the budget returns 400 ms later; the clone completes.
+    let held = hold_user_budget(rig.vol());
+    assert!(!held.is_empty(), "premise: the user budget was drainable");
+    let releaser = {
+        let vol = Arc::clone(rig.vol());
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+            for a in held {
+                vol.journal_ring().core().release(a);
+            }
+        })
+    };
+    let t0 = std::time::Instant::now();
+    tokio::time::timeout(std::time::Duration::from_secs(30), rig.clone(src, dst))
+        .await
+        .expect("a parked clone is never stranded")
+        .expect("a clone under a busy ring completes after admission — never fails");
+    releaser.await.unwrap();
+    assert!(
+        t0.elapsed() >= std::time::Duration::from_millis(300),
+        "the clone waited for the budget (parked), not failed fast"
+    );
+    assert!(
+        rig.vol().journal_full_stalls() > stalls,
+        "premise: ring 0 parked"
+    );
+    assert_eq!(flag(&rig, src, offset, 0).await, Some(true));
+    assert_eq!(flag(&rig, dst, offset, 0).await, Some(true));
+    assert_eq!(index_owners(&rig, offset).await.len(), 2);
+    assert_eq!(rig.alloc.refcount(offset), Some(2));
+    // The index writer ITSELF under a held-full ring (the clone above
+    // reaches it only after its own parked commit returned the budget):
+    // `ShareBlock` parks on its admission and lands — never a `Try`
+    // refusal.
+    let third = rig.mk_file("third").await;
+    let held = hold_user_budget(rig.vol());
+    assert!(!held.is_empty());
+    let releaser = {
+        let vol = Arc::clone(rig.vol());
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+            for a in held {
+                vol.journal_ring().core().release(a);
+            }
+        })
+    };
+    let t1 = std::time::Instant::now();
+    let shared = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        rig.vol().share_block(&[BlockRef {
+            vol_tag: rig.tag(),
+            block_idx: offset / rig.alloc.chunk_size(),
+            owner_ino: third,
+            block_index: 0,
+        }]),
+    )
+    .await
+    .expect("a parked ShareBlock is never stranded")
+    .expect("ShareBlock under a full ring parks, never fails");
+    releaser.await.unwrap();
+    assert_eq!(shared, (1, 0));
+    assert!(
+        t1.elapsed() >= std::time::Duration::from_millis(300),
+        "the index write waited for the budget (parked), not failed fast"
+    );
+    assert_eq!(index_owners(&rig, offset).await.len(), 3);
+    // The FREE path under a held-full ring: the release parks and lands —
+    // the reference is released (`Held { remaining }` at the home), never
+    // leaked, and the closure `RAM count == entries the home keeps` holds.
+    let held = hold_user_budget(rig.vol());
+    assert!(!held.is_empty());
+    let releaser = {
+        let vol = Arc::clone(rig.vol());
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+            for a in held {
+                vol.journal_ring().core().release(a);
+            }
+        })
+    };
+    let releases = RELEASE_SHARED_CALLS.load(Ordering::Relaxed);
+    let failures = shared_refs::SHARED_RELEASE_FAILURES.load(Ordering::Relaxed);
+    let terminal = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        rig.router
+            .backend_router
+            .free_block_verdict(&offset.to_string()),
+    )
+    .await
+    .expect("a parked release is never stranded")
+    .expect("a shared block's release under a busy ring lands — never fails");
+    releaser.await.unwrap();
+    assert!(!terminal, "the clone still stands: nonterminal");
+    assert_eq!(RELEASE_SHARED_CALLS.load(Ordering::Relaxed), releases + 1);
+    assert_eq!(
+        shared_refs::SHARED_RELEASE_FAILURES.load(Ordering::Relaxed),
+        failures,
+        "no discarded failure"
+    );
+    assert_eq!(
+        rig.alloc.refcount(offset),
+        Some(1),
+        "the reference was released"
+    );
+    assert!(rig.drift().await.is_empty());
+    assert!(c16(&rig).await.is_empty());
+    rig.shutdown().await;
+}
+
+/// **A legal passthrough truncate-shrink keeps the durable SHARED bit**
+/// (review round 1, Issue 4): the clip re-describes the SAME reference
+/// (`bk:0:len → bk:0:len'`), which arrived as a released + a taken op
+/// over one record and re-Put it from scratch — flags 0 — so a healthy
+/// clone-then-shrink tripped C16 (`EntryWithoutFlag`) for ever. Now the
+/// pair cancels: the record survives with its bit, both inos stay SHARED
+/// and indexed, C8/C16 clean, and the source's later release still ships
+/// to the home (`Held`, never a local terminal free).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_truncate_shrink_of_a_clone_shared_tenant_keeps_the_durable_shared_bit() {
+    let dir = tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    let uris = vec![format_stamped_member(dir.path(), "meta0").await];
+    let data = data_file();
+    let rig = mount(&uris, data.path(), &Knobs::armed()).await;
+    let src = rig.mk_file("tenant").await;
+    let dst = rig
+        .mk_file_apart("clone", slot_of_global(&rig.routed, src))
+        .await;
+    // A promoted tenant: a staged layout whose `block_map[0]` is the
+    // size-carrying mapping `offset:0:65536` of a block this ino owns.
+    let offset = rig.alloc.allocate_block().await.expect("allocate");
+    rig.alloc.publish_block(offset);
+    let block_idx = offset / rig.alloc.chunk_size();
+    let len = 64 * 1024u64;
+    let layout = squeezefs::layout_wire::LayoutMetadata {
+        file_type: "staged".into(),
+        size: len,
+        file_id: Some("tenant-src".into()),
+        block_map: Some(std::collections::HashMap::from([(
+            0u32,
+            format!("{offset}:0:{len}"),
+        )])),
+        ..Default::default()
+    };
+    rig.routed
+        .set_layout_and_size(
+            src,
+            &bincode::serialize(&layout).unwrap(),
+            len,
+            &[BlockRefOp::taken(BlockRef {
+                vol_tag: rig.tag(),
+                block_idx,
+                owner_ino: src,
+                block_index: 0,
+            })],
+        )
+        .await
+        .unwrap();
+    rig.clone(src, dst)
+        .await
+        .expect("clone the promoted tenant");
+    assert_eq!(flag(&rig, src, offset, 0).await, Some(true));
+    assert_eq!(flag(&rig, dst, offset, 0).await, Some(true));
+    assert_eq!(rig.alloc.refcount(offset), Some(2));
+    // The passthrough shrink: one re-description, no reference moves.
+    rig.router
+        .truncate_layout(src, len / 2, rig.token(src))
+        .await
+        .expect("truncate-shrink");
+    let clipped = rig
+        .router
+        .fetch_metadata(&squeezefs::keys::inode_path(src))
+        .await
+        .unwrap();
+    assert_eq!(
+        clipped.block_map.as_ref().and_then(|m| m.get(&0).cloned()),
+        Some(format!("{offset}:0:{}", len / 2)),
+        "premise: the mapping was re-described in place"
+    );
+    assert_eq!(
+        flag(&rig, src, offset, 0).await,
+        Some(true),
+        "the re-described reference keeps its SHARED bit"
+    );
+    assert_eq!(flag(&rig, dst, offset, 0).await, Some(true));
+    assert_eq!(index_owners(&rig, offset).await, {
+        let mut v = vec![src, dst];
+        v.sort_unstable();
+        v
+    });
+    assert!(rig.drift().await.is_empty(), "C8 clean");
+    assert!(c16(&rig).await.is_empty(), "C16 clean after a legal shrink");
+    assert_eq!(rig.alloc.refcount(offset), Some(2), "no reference moved");
+    // The source's release ships to the home: `Held` (the clone stands),
+    // the block stays allocated and marked.
+    let releases = RELEASE_SHARED_CALLS.load(Ordering::Relaxed);
+    let terminal = rig
+        .router
+        .backend_router
+        .free_block_verdict(&format!("{offset}:0:{}", len / 2))
+        .await
+        .unwrap();
+    assert!(
+        !terminal,
+        "a shared block's release is never locally terminal"
+    );
+    assert_eq!(RELEASE_SHARED_CALLS.load(Ordering::Relaxed), releases + 1);
+    assert_eq!(rig.alloc.refcount(offset), Some(1));
+    assert!(rig.alloc.is_shared(offset));
+    rig.shutdown().await;
 }
 
 /// The three verbs ride the manager wire (the S8 listener, the volume
@@ -669,6 +1131,12 @@ async fn the_clone_verbs_ride_the_manager_wire() {
         .await
         .unwrap();
     assert_eq!(reply, ManagerReply::Marked { already: false });
+    // The served mark sets the RAM mark on the serving mount beside the
+    // durable bit (the W1 accelerator; the durable flag is the authority).
+    assert!(
+        rig.alloc.is_shared(offset),
+        "the wire mark reaches the RAM mark"
+    );
     let reply = client
         .mark_shared(BlockRef {
             vol_tag: rig.tag(),
@@ -679,7 +1147,52 @@ async fn the_clone_verbs_ride_the_manager_wire() {
         .await
         .unwrap();
     assert_eq!(reply, ManagerReply::SharedGone);
+    // The served `ShareBlock` SCREENS its words against durable state
+    // (review round 1, Issue 17): an ino without a SHARED reference to the
+    // block rejects the WHOLE frame — nothing indexed, counted on
+    // `manager_verb_rejected`.
     let ghost = rig.mk_file("ghost").await;
+    let rejected = |rig: &Rig| {
+        rig.vol()
+            .appender_stats()
+            .expect("armed")
+            .manager_verb_rejected
+    };
+    let rejected_before = rejected(&rig);
+    assert!(
+        client
+            .share_block(rig.tag(), idx, &[(src, 0), (ghost, 0)])
+            .await
+            .is_err(),
+        "an ino holding no reference to the block is rejected"
+    );
+    assert_eq!(rejected(&rig), rejected_before + 1);
+    assert!(
+        index_owners(&rig, offset).await.is_empty(),
+        "nothing written"
+    );
+    // The ghost takes an UNSHARED reference: still rejected (MarkShared
+    // precedes ShareBlock).
+    let (_gv, ghost_local) = rig.routed.route_ino(ghost);
+    let ghost_ref = BlockRef {
+        vol_tag: rig.tag(),
+        block_idx: idx,
+        owner_ino: ghost_local,
+        block_index: 0,
+    };
+    rig.vol()
+        .commit_block_refs(ghost_local, &[BlockRefOp::taken(ghost_ref)])
+        .await
+        .unwrap();
+    assert!(client
+        .share_block(rig.tag(), idx, &[(src, 0), (ghost, 0)])
+        .await
+        .is_err());
+    // Marked over the wire too: the frame's every word confirmed, indexed.
+    assert_eq!(
+        client.mark_shared(ghost_ref).await.unwrap(),
+        ManagerReply::Marked { already: false }
+    );
     assert_eq!(
         client
             .share_block(rig.tag(), idx, &[(src, 0), (ghost, 0)])
@@ -688,10 +1201,11 @@ async fn the_clone_verbs_ride_the_manager_wire() {
         (2, 0)
     );
     assert_eq!(index_owners(&rig, offset).await.len(), 2);
-    // The wire release of the ghost's entry: one remains (the source's).
+    // The wire release of the ghost's ONE entry — keyed `(ino, block_index)`
+    // (Issue 9): one remains (the source's).
     assert_eq!(
         client
-            .release_shared(rig.tag(), idx, Some(ghost))
+            .release_shared(rig.tag(), idx, Some((ghost, 0)))
             .await
             .unwrap(),
         (true, 1)
